@@ -11,7 +11,7 @@ Design philosophy: the compiler frontend only handles
 ## 🎬 Video
 
 <div align="center">
-https://github.com/user-attachments/assets/cb2bed00-aba9-4005-b769-26c162110fdb
+<video src="https://github.com/user-attachments/assets/cb2bed00-aba9-4005-b769-26c162110fdb" controls width="100%"></video>
 </div>
 
 ---
