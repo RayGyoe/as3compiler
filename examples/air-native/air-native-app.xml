@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+  <id>demo.as3.native</id>
+  <versionNumber>1.0</versionNumber>
+  <filename>air-native</filename>
+  <initialWindow>
+    <content>main.swf</content>
+    <title>Native AS3 Demo</title>
+    <visible>true</visible>
+    <width>1000</width>
+    <height>680</height>
+    <resizable>true</resizable>
+
+
+    <requestedDisplayResolution>high</requestedDisplayResolution> 
+  </initialWindow>
+</application>

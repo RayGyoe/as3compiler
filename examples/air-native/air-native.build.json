@@ -1,0 +1,65 @@
+{
+  "target": "native",
+  "c-compiler": "clang",
+  "opt": "-O2",
+  "sources": [
+    "../../vendor/skia_glue.cc",
+    "../../vendor/window_glue.cc"
+  ],
+  "include-paths": [
+    "../../vendor/skia",
+    "../../vendor/sdl2/arm64/include"
+  ],
+  "link-libs": [
+    "skia",
+    "skparagraph",
+    "skshaper",
+    "skunicode",
+    "skottie",
+    "sksg",
+    "svg",
+    "skresources",
+    "bentleyottmann",
+    "skcms",
+    "wuffs",
+    "png",
+    "jpeg",
+    "webp",
+    "webp_sse41",
+    "dng_sdk",
+    "piex",
+    "expat",
+    "freetype2",
+    "harfbuzz",
+    "icu",
+    "zlib",
+    "z",
+    "SDL2",
+    "objc"
+  ],
+  "link-paths": [
+    "../../vendor/skia/lib",
+    "../../vendor/sdl2/arm64/lib"
+  ],
+  "frameworks": [
+    "CoreFoundation",
+    "CoreGraphics",
+    "CoreText",
+    "CoreServices",
+    "ApplicationServices",
+    "ImageIO",
+    "Accelerate",
+    "CoreVideo",
+    "Cocoa",
+    "Carbon",
+    "IOKit",
+    "Metal",
+    "QuartzCore"
+  ],
+  "defines": [
+    "ASC_USE_SKIA=1",
+    "ASC_USE_WINDOW=1",
+    "ASC_DISPLAY_HIGH=1"
+  ],
+  "objects": []
+}

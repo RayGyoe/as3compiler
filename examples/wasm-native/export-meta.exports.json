@@ -1,0 +1,46 @@
+{
+  "wasm": "export-meta.wasm",
+  "exports": [
+    {
+      "name": "add",
+      "symbol": "add",
+      "returnType": "int",
+      "params": [
+        {
+          "name": "a",
+          "type": "int"
+        },
+        {
+          "name": "b",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "multiply",
+      "symbol": "mul",
+      "returnType": "int",
+      "params": [
+        {
+          "name": "a",
+          "type": "int"
+        },
+        {
+          "name": "b",
+          "type": "int"
+        }
+      ]
+    },
+    {
+      "name": "twice",
+      "symbol": "mathlib_Calc_twice",
+      "returnType": "int",
+      "params": [
+        {
+          "name": "a",
+          "type": "int"
+        }
+      ]
+    }
+  ]
+}

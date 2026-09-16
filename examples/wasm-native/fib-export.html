@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WASM 导出函数直调 · fib</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #8b93a3;
+    --ok: #2fbf71;
+    --accent: #4c8dff;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  .wrap { max-width: 780px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .sub code, .cmd code { background: #232833; padding: 1px 6px; border-radius: 4px; font-family: var(--mono); }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px; margin-bottom: 16px;
+  }
+  .cmd {
+    background: #0b0d11; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; font-family: var(--mono); font-size: 12.5px;
+    white-space: pre-wrap; word-break: break-word; color: #a7e3ff; margin: 10px 0 0;
+  }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 10px 18px; font-size: 14px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .result { margin-top: 16px; font-family: var(--mono); font-size: 14px; line-height: 1.7; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+  .row .label { color: var(--muted); }
+  .row .val { text-align: right; }
+  .bar { height: 14px; background: var(--border); border-radius: 7px; overflow: hidden; margin: 8px 0 4px; }
+  .bar > div { height: 100%; border-radius: 7px; transition: width .3s ease; }
+  .bar.js > div { background: #f0a25c; }
+  .bar.wasm > div { background: var(--ok); }
+  .bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .speedup { color: var(--ok); font-weight: 700; }
+  .err { color: #ef5350; }
+  .badge {
+    display: inline-block; font-size: 11px; font-weight: 600; color: var(--ok);
+    border: 1px solid var(--ok); border-radius: 10px; padding: 0 8px; margin-left: 8px;
+  }
+  h2 { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WASM 导出函数直调 · fib</h1>
+  <p class="sub">
+    与 Emscripten 的 <code>Module.cwrap</code> 不同，本项目的 <code>as-aot --target wasm</code>
+    默认产出 WASI 命令模块（只导出 <code>_start</code>）。加 <code>--export fib</code> 即可把顶层
+    函数导出，让 JS 直接 <code>instance.exports.fib(40)</code> 调用——无需 <code>_start</code>、
+    无需捕获 stdout、且可反复调用（<code>_start</code> 只能执行一次）。
+  </p>
+
+  <div class="panel">
+    <h2>编译命令</h2>
+    <pre class="cmd">as-aot fib.as --target wasm --export fib -o fib-export</pre>
+  </div>
+
+  <div class="panel">
+    <button id="btn">开始测试</button>
+    <div class="result" id="result">点击后加载 fib-export.wasm，直接调用导出的 <code>fib</code> 函数。</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---------- 最小 WASI import 桩 ----------
+// fib 是纯函数（只做整数递归，不触碰 libc），因此绝不会调用任何 WASI import。
+// 这里给所有 import 一个空桩以满足 WebAssembly.instantiate 的 import 集合；
+// 若未来函数意外调用到某个 import，会在此抛错暴露问题。
+class WasiExit extends Error {
+  constructor(code) { super("wasi exit " + code); this.code = code; }
+}
+const wasiStub = new Proxy({}, {
+  get(target, prop) {
+    if (prop === "proc_exit") return (code) => { throw new WasiExit(code); };
+    return () => 0;
+  },
+});
+
+// ---------- 原生 JS 递归斐波那契（与 fib.as 同算法） ----------
+function jsFib(n) {
+  if (n < 2) return n;
+  return jsFib(n - 1) + jsFib(n - 2);
+}
+
+const $ = (id) => document.getElementById(id);
+
+async function runTest() {
+  const btn = $("btn");
+  const result = $("result");
+  btn.disabled = true;
+  result.innerHTML = "加载 fib-export.wasm 中…";
+
+  const N = 40;
+  try {
+    const resp = await fetch("fib-export.wasm");
+    if (!resp.ok) throw new Error("HTTP " + resp.status + "（请在本目录启动静态服务器后访问本页）");
+
+    const bytes = await resp.arrayBuffer();
+    const mod = new WebAssembly.Module(bytes);
+    const exportList = WebAssembly.Module.exports(mod);
+    // 注意：instantiate(Module, imports) 直接 resolve 为 Instance（不是 {module, instance}）；
+    // 只有 instantiate(bufferSource, imports) 才 resolve 为 {module, instance}。
+    const instance = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasiStub });
+
+    // 直接拿到导出的 fib 函数（无需 _start / stdout）
+    const fib = instance.exports.fib;
+    if (typeof fib !== "function") {
+      throw new Error("导出表里没有 fib 函数（请用 --export fib 重新编译）");
+    }
+
+    // 1) 导出表
+    const exportsStr = exportList.map((e) => e.kind + ":" + e.name).join(", ");
+
+    // 2) 直接调用（可反复调用，验证可重入）
+    const t0 = performance.now();
+    const r1 = fib(N);
+    const t1 = performance.now();
+    const wasmTime = t1 - t0;
+    const r2 = fib(N);
+    const r10 = fib(10);
+
+    // 3) 原生 JS 对照
+    jsFib(25); // 预热 JIT
+    const t2 = performance.now();
+    const jsRes = jsFib(N);
+    const t3 = performance.now();
+    const jsTime = t3 - t2;
+
+    const speedup = wasmTime > 0 ? (jsTime / wasmTime).toFixed(1) : "∞";
+    const max = Math.max(jsTime, wasmTime);
+
+    result.innerHTML = `
+      <div class="row"><span class="label">导出表</span><span class="val">${exportsStr}</span></div>
+      <div class="row" style="margin-top:10px">
+        <span class="label">直调 <code>fib(40)</code></span>
+        <span class="val">${r1}（${wasmTime.toFixed(2)} ms）<span class="badge">直接调用</span></span>
+      </div>
+      <div class="row">
+        <span class="label">再次调用 <code>fib(40)</code></span>
+        <span class="val">${r2}<span class="badge">可重入</span></span>
+      </div>
+      <div class="row">
+        <span class="label"><code>fib(10)</code></span>
+        <span class="val">${r10}</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <span class="label">计算结果（JS / WASM）</span>
+        <span class="val">${jsRes} / ${r1}</span>
+      </div>
+      <div class="bar-label"><span>原生 JS</span><span>${jsTime.toFixed(2)} ms</span></div>
+      <div class="bar js"><div style="width:${(jsTime / max * 100).toFixed(1)}%"></div></div>
+      <div class="bar-label"><span>WebAssembly 直调</span><span>${wasmTime.toFixed(2)} ms</span></div>
+      <div class="bar wasm"><div style="width:${(wasmTime / max * 100).toFixed(1)}%"></div></div>
+      <div class="row" style="margin-top:10px">
+        <span class="label">结论</span>
+        <span class="val speedup">WASM 比 JS 快 ${speedup} 倍 · 无需 _start / stdout</span>
+      </div>
+    `;
+  } catch (e) {
+    result.innerHTML = '<span class="err">失败：' + String(e && e.message ? e.message : e) + "</span>";
+  }
+
+  btn.disabled = false;
+}
+
+$("btn").addEventListener("click", runTest);
+</script>
+</body>
+</html>

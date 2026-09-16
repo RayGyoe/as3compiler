@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+
+# Generated build artifacts: AS source -> C -> native executable / wasm
+*.c
+*.o
+*.wasm
+build/
+
+# Compiled example executables (extensionless, generated from the same-named .as).
+# Keep the .as sources and the build-manifest / exporter configs.
+examples/*
+!examples/*.as
+!examples/*.json
+!examples/*/
+
+# Compiled executables under example subdirectories.
+examples/air-native/air-native
+examples/wasm-native/demo
+examples/stage12/Greeter
+
+# Benchmark executables: *_asc (AS3-compiled) and *_c (handwritten C baseline).
+benchmarks/*/*_asc
+benchmarks/*/*_c

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+  <id>bench.strings</id>
+  <versionNumber>1.0</versionNumber>
+  <filename>strings_air</filename>
+  <initialWindow>
+    <content>strings_air.swf</content>
+    <visible>false</visible>
+  </initialWindow>
+</application>

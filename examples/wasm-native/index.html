@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>as-aot wasm 功能可用性自检</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #8b93a3;
+    --ok: #2fbf71;
+    --fail: #ef5350;
+    --accent: #4c8dff;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+  .panel h2 {
+    font-size: 14px; margin: 0 0 12px; color: var(--muted);
+    font-weight: 600; text-transform: uppercase; letter-spacing: .4px;
+  }
+  .checks { display: flex; flex-direction: column; gap: 8px; }
+  .check {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 13px;
+  }
+  .badge {
+    width: 18px; height: 18px; border-radius: 50%; flex: 0 0 18px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; color: #0f1115;
+  }
+  .badge.ok { background: var(--ok); }
+  .badge.fail { background: var(--fail); }
+  .badge.idle { background: var(--muted); }
+  .desc { color: var(--muted); }
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .file-label {
+    display: inline-block; background: var(--border); color: var(--text);
+    border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  .file-label input { display: none; }
+  pre {
+    background: #0b0d11; border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; overflow: auto; font-family: var(--mono); font-size: 13px;
+    line-height: 1.5; margin: 0; white-space: pre-wrap; word-break: break-word;
+    max-height: 460px;
+  }
+  .err { color: var(--fail); }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 10px; font-family: var(--mono); }
+  code { font-family: var(--mono); color: var(--accent); }
+  details { margin-top: 14px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>as-aot wasm 功能可用性自检</h1>
+  <p class="sub">
+    在浏览器中加载并运行由 <code>as-aot --target wasm</code> 编译出的 WASI
+    <code>.wasm</code>，验证 WebAssembly 环境与编译器产物是否可用。
+  </p>
+
+  <div class="panel">
+    <h2>环境检测</h2>
+    <div class="checks" id="checks">
+      <div class="check"><span class="badge idle" id="c-wasm">?</span><span id="c-wasm-t">WebAssembly 可用</span></div>
+      <div class="check"><span class="badge idle" id="c-eh">?</span><span id="c-eh-t">异常处理提案（try/catch 需）</span></div>
+      <div class="check"><span class="badge idle" id="c-load">?</span><span id="c-load-t">WASI 模块加载与实例化</span></div>
+      <div class="check"><span class="badge idle" id="c-run">?</span><span id="c-run-t">_start 执行（退出码）</span></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>运行</h2>
+    <div class="toolbar">
+      <button id="btn-run">运行 demo.wasm</button>
+      <label class="file-label">选择其他 .wasm<input type="file" id="file" accept=".wasm,application/wasm"></label>
+    </div>
+    <div class="meta" id="meta">未运行</div>
+  </div>
+
+  <div class="panel">
+    <h2>程序输出（stdout）</h2>
+    <pre id="out">（点击「运行 demo.wasm」开始）</pre>
+  </div>
+
+  <div class="panel" id="errpanel" style="display:none">
+    <h2>stderr / 错误</h2>
+    <pre id="err" class="err"></pre>
+  </div>
+
+  <details>
+    <summary>参考：demo.as 的预期输出</summary>
+    <pre id="expected">== as-aot wasm self-test ==
+hello wasm
+6 * 7 = 42
+pi ~= 3.14159
+ok = true
+concat: wasm rocks 42 times
+10 / 4 = 2.5
+7 % 4 = 3
+n is big
+sum 0..4 = 10
+array len: 4
+array join: 10-20-30-40
+a[1]: 20
+vector len: 2
+vector join: 5,6
+sqrt(16) = 4
+pow(2,10) = 1024
+floor(3.7) = 3
+round(3.5) = 4
+abs(-5) = 5
+Rex says woof
+add5(7) = 12
+== done ==</pre>
+  </details>
+</div>
+
+<script>
+"use strict";
+
+// ---------- 最小 WASI Preview 1 shim ----------
+// 把 WASI 命令模块（导入 wasi_snapshot_preview1.*）接到浏览器运行时上：
+// fd_write -> 捕获 stdout/stderr，clock_time_get -> Date.now()，其余文件系统
+// 系统调用返回「未实现 / 无 preopen」，因为本自检程序不做文件 I/O。
+//
+// 关键点：wasm 线性内存会在增长时替换底层 ArrayBuffer，因此必须每次通过
+// instance.exports.memory.buffer 取最新视图，不能缓存 DataView。
+
+const decoder = new TextDecoder();
+let mem = null;               // WebAssembly.Memory（.buffer 可能随增长失效）
+const view = () => new DataView(mem.buffer);
+
+function makeWasi(host) {
+  return {
+    // clock_id 0 = realtime；写入 64 位纳秒（little-endian）
+    clock_time_get: (clockId, precision, timePtr) => {
+      view().setBigUint64(timePtr, BigInt(Date.now()) * 1000000n, true);
+      return 0;
+    },
+    fd_close: () => 0,
+    // __wasi_fdstat_t：u8 filetype@0、u16 flags@2、u64 rights_base@8、u64 rights_inheriting@16
+    fd_fdstat_get: (fd, bufPtr) => {
+      const dv = view();
+      dv.setUint8(bufPtr, 2);                 // CHARACTER_DEVICE
+      dv.setUint16(bufPtr + 2, 0, true);      // flags
+      dv.setBigUint64(bufPtr + 8, 0n, true);  // rights_base
+      dv.setBigUint64(bufPtr + 16, 0n, true); // rights_inheriting
+      return 0;
+    },
+    // 无 preopened 目录：返回 EBADF，让 wasi-libc 的 preopen 扫描就此结束
+    fd_prestat_get: () => 8,                  // EBADF
+    fd_prestat_dir_name: () => 8,             // EBADF
+    fd_seek: (fd, offset, whence, newoffsetPtr) => {
+      view().setBigUint64(newoffsetPtr, offset, true);
+      return 0;
+    },
+    fd_write: (fd, iovs, iovsLen, nwrittenPtr) => {
+      const dv = view();
+      const chunks = [];
+      let written = 0;
+      for (let i = 0; i < iovsLen; i++) {
+        const ptr = dv.getUint32(iovs + i * 8, true);       // iovec.buf
+        const len = dv.getUint32(iovs + i * 8 + 4, true);   // iovec.buf_len
+        chunks.push(new Uint8Array(mem.buffer, ptr, len).slice());
+        written += len;
+      }
+      const text = decoder.decode(concatBytes(chunks));
+      if (fd === 1) host.stdout += text;
+      else if (fd === 2) host.stderr += text;
+      dv.setUint32(nwrittenPtr, written, true);
+      return 0;
+    },
+    path_create_directory: () => 52,   // ENOSYS
+    path_remove_directory: () => 52,   // ENOSYS
+    path_unlink_file: () => 52,        // ENOSYS
+    proc_exit: (code) => { throw new WasiExit(code); },
+  };
+}
+
+function concatBytes(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+
+class WasiExit extends Error {
+  constructor(code) { super("wasi exit " + code); this.code = code; }
+}
+
+// ---------- UI 状态 ----------
+const $ = (id) => document.getElementById(id);
+const setBadge = (id, ok, text) => {
+  const b = $(id);
+  b.className = "badge " + (ok === null ? "idle" : ok ? "ok" : "fail");
+  b.textContent = ok === null ? "?" : ok ? "✓" : "✗";
+  if (text !== undefined) $(id + "-t").textContent = text;
+};
+const resetBadges = () => {
+  setBadge("c-wasm", null, "WebAssembly 可用");
+  setBadge("c-eh", null, "异常处理提案（try/catch 需）");
+  setBadge("c-load", null, "WASI 模块加载与实例化");
+  setBadge("c-run", null, "_start 执行（退出码）");
+};
+
+// ---------- 环境检测 ----------
+const wasmAvailable = typeof WebAssembly === "object"
+  && typeof WebAssembly.instantiate === "function";
+setBadge("c-wasm", wasmAvailable, wasmAvailable ? "WebAssembly 可用" : "WebAssembly 不可用");
+const ehAvailable = typeof WebAssembly.Exception === "function";
+setBadge("c-eh", ehAvailable,
+  ehAvailable ? "异常处理提案已支持" : "异常处理提案不支持（含 try/catch 的程序无法运行）");
+
+// ---------- 加载与运行 ----------
+async function runWasm(buffer, label) {
+  resetBadges();
+  $("out").textContent = "";
+  $("err").textContent = "";
+  $("errpanel").style.display = "none";
+  $("meta").textContent = "加载 " + label + " …";
+
+  const host = { stdout: "", stderr: "" };
+  try {
+    const { instance } = await WebAssembly.instantiate(buffer, {
+      wasi_snapshot_preview1: makeWasi(host),
+    });
+    mem = instance.exports.memory;
+    if (!mem || typeof instance.exports._start !== "function") {
+      setBadge("c-load", false, "WASI 模块缺少 memory/_start 导出");
+      $("meta").textContent = "该模块不是 WASI 命令模块（缺少 memory 或 _start 导出）";
+      return;
+    }
+    setBadge("c-load", true, "WASI 模块加载与实例化");
+
+    let exitCode = 0;
+    try {
+      instance.exports._start();
+    } catch (e) {
+      if (e instanceof WasiExit) exitCode = e.code;
+      else throw e;
+    }
+    setBadge("c-run", exitCode === 0, "_start 执行（退出码 " + exitCode + "）");
+    $("meta").textContent = "退出码 " + exitCode +
+      " · 输出 " + host.stdout.length + " 字节";
+  } catch (e) {
+    setBadge("c-load", false, "WASI 模块加载失败");
+    setBadge("c-run", false, "_start 执行失败");
+    host.stderr += String(e && e.message ? e.message : e) + "\n";
+    $("meta").textContent = "运行失败";
+  }
+
+  $("out").textContent = host.stdout || "（无输出）";
+  if (host.stderr) {
+    $("err").textContent = host.stderr;
+    $("errpanel").style.display = "";
+  }
+}
+
+$("btn-run").addEventListener("click", async () => {
+  const btn = $("btn-run");
+  btn.disabled = true;
+  try {
+    const resp = await fetch("demo.wasm");
+    if (!resp.ok) throw new Error("HTTP " + resp.status + "（请在本目录启动静态服务器后访问本页）");
+    await runWasm(await resp.arrayBuffer(), "demo.wasm");
+  } catch (e) {
+    resetBadges();
+    setBadge("c-load", false, "demo.wasm 加载失败");
+    $("meta").textContent = "加载失败：" + (e && e.message ? e.message : e);
+    $("err").textContent = String(e && e.message ? e.message : e) + "\n";
+    $("errpanel").style.display = "";
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("file").addEventListener("change", async (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  const buf = await f.arrayBuffer();
+  await runWasm(buf, f.name);
+  ev.target.value = "";
+});
+</script>
+</body>
+</html>

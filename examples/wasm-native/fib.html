@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WASM 性能对比 · 递归 fib(40)</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #8b93a3;
+    --ok: #2fbf71;
+    --accent: #4c8dff;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px; margin-bottom: 16px;
+  }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 10px 18px; font-size: 14px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .result { margin-top: 16px; font-family: var(--mono); font-size: 14px; line-height: 1.7; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+  .row .label { color: var(--muted); }
+  .row .val { text-align: right; }
+  .bar { height: 14px; background: var(--border); border-radius: 7px; overflow: hidden; margin: 8px 0 4px; }
+  .bar > div { height: 100%; border-radius: 7px; transition: width .3s ease; }
+  .bar.js > div { background: #f0a25c; }
+  .bar.wasm > div { background: var(--ok); }
+  .bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .speedup { color: var(--ok); font-weight: 700; }
+  .out {
+    background: #0b0d11; border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; font-family: var(--mono); font-size: 13px; white-space: pre-wrap;
+    word-break: break-word; margin: 0; color: var(--text);
+  }
+  .err { color: #ef5350; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WebAssembly 性能对比 · 递归 fib(40)</h1>
+  <p class="sub">
+    同一算法（朴素递归斐波那契）分别在原生 JavaScript 与
+    <code>as-aot --target wasm</code> 编译产物上运行，对比耗时。
+  </p>
+
+  <div class="panel">
+    <button id="btn">开始测试</button>
+    <div class="result" id="result">点击「开始测试」后，先加载 fib.wasm 再运行对比。</div>
+  </div>
+
+  <div class="panel" id="outpanel" style="display:none">
+    <h2 style="margin:0 0 10px;color:var(--muted);font-size:14px">WASM 程序输出（stdout）</h2>
+    <pre class="out" id="out"></pre>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---------- 最小 WASI Preview 1 shim ----------
+// 与 index.html 一致：把 WASI 命令模块接到浏览器运行时，fd_write 捕获 stdout。
+// wasm 线性内存增长会替换底层 ArrayBuffer，因此每次用最新 buffer 取 DataView。
+const decoder = new TextDecoder();
+let mem = null;
+const view = () => new DataView(mem.buffer);
+
+class WasiExit extends Error {
+  constructor(code) { super("wasi exit " + code); this.code = code; }
+}
+
+function makeWasi(host) {
+  return {
+    clock_time_get: (clockId, precision, timePtr) => {
+      view().setBigUint64(timePtr, BigInt(Date.now()) * 1000000n, true);
+      return 0;
+    },
+    fd_close: () => 0,
+    fd_fdstat_get: (fd, bufPtr) => {
+      const dv = view();
+      dv.setUint8(bufPtr, 2);
+      dv.setUint16(bufPtr + 2, 0, true);
+      dv.setBigUint64(bufPtr + 8, 0n, true);
+      dv.setBigUint64(bufPtr + 16, 0n, true);
+      return 0;
+    },
+    fd_prestat_get: () => 8,
+    fd_prestat_dir_name: () => 8,
+    fd_seek: (fd, offset, whence, newoffsetPtr) => {
+      view().setBigUint64(newoffsetPtr, offset, true);
+      return 0;
+    },
+    fd_write: (fd, iovs, iovsLen, nwrittenPtr) => {
+      const dv = view();
+      const chunks = [];
+      let written = 0;
+      for (let i = 0; i < iovsLen; i++) {
+        const ptr = dv.getUint32(iovs + i * 8, true);
+        const len = dv.getUint32(iovs + i * 8 + 4, true);
+        chunks.push(new Uint8Array(mem.buffer, ptr, len).slice());
+        written += len;
+      }
+      const text = decoder.decode(concatBytes(chunks));
+      if (fd === 1) host.stdout += text;
+      else if (fd === 2) host.stderr += text;
+      dv.setUint32(nwrittenPtr, written, true);
+      return 0;
+    },
+    path_create_directory: () => 52,
+    path_remove_directory: () => 52,
+    path_unlink_file: () => 52,
+    proc_exit: (code) => { throw new WasiExit(code); },
+  };
+}
+
+function concatBytes(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+
+// ---------- 原生 JS 递归斐波那契（与 fib.as 同算法） ----------
+function jsFib(n) {
+  if (n < 2) return n;
+  return jsFib(n - 1) + jsFib(n - 2);
+}
+
+// ---------- 主流程 ----------
+const $ = (id) => document.getElementById(id);
+
+async function runTest() {
+  const btn = $("btn");
+  const result = $("result");
+  btn.disabled = true;
+  result.innerHTML = "加载 fib.wasm 中…";
+
+  const N = 40;
+  let wasm, host;
+  try {
+    host = { stdout: "", stderr: "" };
+    const resp = await fetch("fib.wasm");
+    if (!resp.ok) throw new Error("HTTP " + resp.status + "（请在本目录启动静态服务器后访问本页）");
+    const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), {
+      wasi_snapshot_preview1: makeWasi(host),
+    });
+    mem = instance.exports.memory;
+    if (!mem || typeof instance.exports._start !== "function") {
+      throw new Error("fib.wasm 不是 WASI 命令模块（缺少 memory/_start 导出）");
+    }
+    wasm = instance.exports;
+  } catch (e) {
+    result.innerHTML = '<span class="err">加载失败：' + String(e && e.message ? e.message : e) + "</span>";
+    btn.disabled = false;
+    return;
+  }
+
+  // 预热原生 JS（WASI 命令模块的 _start 只能调用一次，无法预热；
+  // 其 libc 初始化开销为微秒级，对 260ms 量级的 fib(40) 可忽略）
+  jsFib(25);
+
+  // 1) 原生 JS 计时
+  const t0 = performance.now();
+  const jsRes = jsFib(N);
+  const t1 = performance.now();
+  const jsTime = t1 - t0;
+
+  // 2) WASM 计时（单次 _start）
+  const t2 = performance.now();
+  const exitCode = runStart(wasm, host);
+  const t3 = performance.now();
+  const wasmTime = t3 - t2;
+
+  const wasmRes = (host.stdout.trim().match(/-?\d+/) || ["?"])[0];
+  const speedup = wasmTime > 0 ? (jsTime / wasmTime).toFixed(1) : "∞";
+  const max = Math.max(jsTime, wasmTime);
+
+  result.innerHTML = `
+    <div class="row"><span class="label">计算结果（JS / WASM）</span><span class="val">${jsRes} / ${wasmRes}</span></div>
+    <div class="bar-label"><span>原生 JS</span><span>${jsTime.toFixed(2)} ms</span></div>
+    <div class="bar js"><div style="width:${(jsTime / max * 100).toFixed(1)}%"></div></div>
+    <div class="bar-label"><span>WebAssembly</span><span>${wasmTime.toFixed(2)} ms</span></div>
+    <div class="bar wasm"><div style="width:${(wasmTime / max * 100).toFixed(1)}%"></div></div>
+    <div class="row" style="margin-top:10px">
+      <span class="label">结论</span>
+      <span class="val speedup">WASM 比 JS 快 ${speedup} 倍</span>
+    </div>
+    <div class="row"><span class="label">WASM 退出码</span><span class="val">${exitCode}</span></div>
+  `;
+
+  if (host.stdout) {
+    $("outpanel").style.display = "";
+    $("out").textContent = host.stdout;
+  }
+  if (host.stderr) {
+    $("outpanel").style.display = "";
+    $("out").textContent += "\n[stderr]\n" + host.stderr;
+  }
+
+  btn.disabled = false;
+}
+
+function runStart(wasm, host) {
+  let exitCode = 0;
+  try {
+    wasm._start();
+  } catch (e) {
+    if (e instanceof WasiExit) exitCode = e.code;
+    else { host.stderr += String(e && e.message ? e.message : e) + "\n"; }
+  }
+  return exitCode;
+}
+
+$("btn").addEventListener("click", runTest);
+</script>
+</body>
+</html>

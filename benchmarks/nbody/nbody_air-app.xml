@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+  <id>bench.nbody</id>
+  <versionNumber>1.0</versionNumber>
+  <filename>nbody_air</filename>
+  <initialWindow>
+    <content>nbody_air.swf</content>
+    <visible>false</visible>
+  </initialWindow>
+</application>
