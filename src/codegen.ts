@@ -13,10 +13,16 @@ export interface CodegenResult {
   exports: ExportedSymbol[];
 }
 
-export function generateC(program: Program): CodegenResult {
+export interface CodegenOptions {
+  // Injected at compile time as Capabilities.version (single source of truth is
+  // package.json — the compiled binary has no package.json to read at runtime).
+  asAotVersion?: string;
+}
+
+export function generateC(program: Program, options: CodegenOptions = {}): CodegenResult {
   const symbols = new SymbolTable();
   symbols.collect(program);
-  const emitter = new Emitter(program, symbols);
+  const emitter = new Emitter(program, symbols, options.asAotVersion ?? '');
   const c = emitter.run();
   return { c, exports: [...symbols.exports] };
 }

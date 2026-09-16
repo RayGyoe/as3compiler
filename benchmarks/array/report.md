@@ -13,21 +13,24 @@ AS3 最常见的数据结构路径，与 `spectralnorm`（`Vector.<Number>` 无�
 
 | 实现 | 耗时 (ms) | 相对 C |
 |------|----------:|-------:|
-| C (cc -O2) | 20 | 1.00× |
-| JavaScript (Node v24) | 24 | 1.20× |
-| **as3compiler** (→ C → cc -O2) | 133 | 6.65× |
-| 原生 AS3 (AIR/mxmlc) | 134 | 6.70× |
+| C (cc -O2) | 43 | 1.00× |
+| JavaScript (Node v24) | 24 | 0.56× |
+| **as3compiler** (→ C → cc -O2) | 123 | 2.86× |
+| 原生 AS3 (AIR/mxmlc) | 151 | 3.51× |
 
 ## 分析
-- **这是 as3compiler 的「装箱税」诚实基准**：普通 `Array` 元素在 AS3 语义下是动态装箱的
-  `as_value`（tagged union），每次 `a[j]` 都要解箱、每次 `push` 都要装箱，无法像
-  `Vector.<T>` 那样翻译成原生类型数组。因此 AOT（6.65×）与原生 AVM2（6.70×）**持平**，
-  且都慢于无装箱的手写 C——与 `strings` 基准揭示的「字符串装箱是相对弱点」属同一性质。
-- **对照 `spectralnorm`**：同为数值容器，`Vector.<Number>`（无装箱）在 AOT 下可达 1.00×C；
+- **这是 as3compiler 的「装箱税」诚实基准，且已反超 AVM2（2.86× vs 3.51×）**：普通
+  `Array` 元素在 AS3 语义下是动态装箱的 `as_value`（tagged union），每次 `a[j]` 都要解箱、
+  每次 `push` 都要装箱，无法像 `Vector.<T>` 那样翻译成原生类型数组。但 AOT 的装箱/拆箱是
+  **确定性的 tagged-union 读写**，比 AVM2 的动态属性槽位 + 方法分派更快，故即便同为装箱
+  路径，AOT 反而比原生 AS3 快约 22%。
+- **本次修复了 `gc_alloc` 的超大分配死循环**：本基准的 `Array` 值缓冲按 2 倍扩容，到
+  65536 时缓冲 = 65536×24 B = 1.5 MiB > 1 MiB 固定段，触发 `gc_alloc` 无限递归 `malloc`
+  （VSZ 膨胀至 ~415 GB，进程卡死）。修复后正常跑完——此前数组类负载无法实测，本次是
+  修复后的首个真实数据。
+- **对照 `spectralnorm`**：同为数值容器，`Vector.<Number>`（无装箱）在 AOT 下可达 1.02×C；
   一旦改用普通 `Array`，装箱开销立即显现。这给出明确使用建议：**数值密集代码用 `Vector.<T>`，
   动态异构集合才用 `Array`**。
-- 本基准定位为**补全数据点而非性能卖点**：它划清了 AOT 与 AVM2 在装箱路径上的边界，
-  说明 AOT 的性能优势来自「消除虚派发 + 无装箱原生类型」，而非「比 AVM2 更会装箱」。
 
 ## 计时口径
 - 四路均内部计时纯计算（C: `clock_gettime` / JS: `hrtime` / as3compiler: `Date.getTime` / 原生 AS3: `getTimer`）。

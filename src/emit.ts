@@ -43,6 +43,9 @@ export class Emitter {
 
   private program: Program;
   private symbols: SymbolTable;
+  // Compile-time injected AS-AOT version (Capabilities.version). Empty when the
+  // CLI does not supply one (e.g. library tests that call generateC directly).
+  private asAotVersion: string;
   private anonFuncs: { name: string; params: Param[]; returnType: ASType; body: Block; captures: { name: string; type: CType }[] }[] = [];
   private anonIndex = new Map<object, string>();
   private vectorSpecs = new Map<string, CType>();
@@ -74,9 +77,10 @@ export class Emitter {
   // Non-const static fields whose initializer must run at runtime (in main).
   private staticFieldInits: { cname: string; fname: string; f: FieldInfo }[] = [];
 
-  constructor(program: Program, symbols: SymbolTable) {
+  constructor(program: Program, symbols: SymbolTable, asAotVersion = '') {
     this.program = program;
     this.symbols = symbols;
+    this.asAotVersion = asAotVersion;
   }
 
   // ---------- top level ----------
@@ -3030,28 +3034,37 @@ export class Emitter {
     this.line('static void ASC_window_on_redraw(void) { ASC_window_render(); }');
     this.line('static void ASC_window_on_frame(void) { Stage_dispatchFrame((void*)ASC_win_stage); }');
     // Stage.frameRate drives the event-loop cadence: 1000/frameRate ms per tick.
-    // frameRate <= 0 (unset) follows the primary display's refresh rate (vsync
-    // cadence); if that cannot be read, fall back to a 120 Hz default. A huge
-    // frameRate (e.g. 1000) yields a ~1 ms sleep, letting ENTER_FRAME run near
-    // the CPU's limit just like adl.
+    // frameRate <= 0 (unset) follows the display's refresh rate (vsync cadence);
+    // if that cannot be read, fall back to a 120 Hz default. A huge frameRate
+    // (e.g. 1000) yields a ~1 ms sleep, letting ENTER_FRAME run near the CPU's
+    // limit just like adl. With vsync on, an explicit frameRate above the display
+    // refresh rate is capped to that rate — a monitor cannot present faster than
+    // it refreshes, and pacing above it just beats (e.g. 120 vs 50) and jitters
+    // the frame interval, which is what made delta-time animation stutter.
     this.line('static double ASC_window_on_frame_delay(void) {');
     this.indent++;
     this.line('double fr = ASC_win_stage->frame_rate;');
+    this.line('double rr = as_window_display_refresh();');
     this.line('if (fr <= 0.0) {');
     this.indent++;
-    this.line('double rr = as_window_display_refresh();');
     this.line('if (rr > 0.0) return 1000.0 / rr;');
     this.line('return 1000.0 / 120.0;');
     this.indent--;
     this.line('}');
+    this.line('if (rr > 0.0 && fr > rr) return 1000.0 / rr;');
     this.line('return 1000.0 / fr;');
     this.indent--;
     this.line('}');
     // Rebuild the surface at the window's new physical size. Without this the
     // blit would resample a stale bitmap across the new drawable — the visible
     // "content deforms while dragging the window" bug that NO_SCALE must prevent.
-    this.line('static void* ASC_window_on_resize(int lw, int lh, int pw, int ph) {');
+    // `scale` is the device pixel ratio computed by window_glue.cc from SDL's own
+    // size queries (macOS contentsScaleFactor); use it verbatim — do NOT re-derive
+    // pw/lw here, which can be stale while the window straddles two displays with
+    // different backing scales (Retina 2x vs external 1x).
+    this.line('static void* ASC_window_on_resize(int lw, int lh, int pw, int ph, double scale) {');
     this.indent++;
+    this.line('if (lw <= 0 || lh <= 0 || pw <= 0 || ph <= 0) return NULL;');
     this.line('if (ASC_win_surface != NULL) as_skia_surface_delete(ASC_win_surface);');
     this.line('ASC_win_surface = NULL; ASC_win_canvas = NULL;');
     this.line('void* s = as_skia_surface_new(pw, ph);');
@@ -3059,6 +3072,14 @@ export class Emitter {
     this.line('ASC_win_surface = s;');
     this.line('ASC_win_canvas = as_skia_surface_canvas(s);');
     this.line('ASC_win_lw = lw; ASC_win_lh = lh;');
+    // The device pixel ratio can change when the window is dragged onto a monitor
+    // with a different backing scale (e.g. 2x Retina -> 1x external). Use the
+    // scale handed in by the glue layer (authoritative, from SDL) rather than
+    // recomputing pw/lw, which is what made the content appear enlarged/cropped
+    // and zeroed stageWidth/stageHeight during a cross-display drag.
+    this.line('if (scale <= 0.0) scale = 1.0;');
+    this.line('ASC_win_scale = scale;');
+    this.line('ASC_win_stage->stage_scale = scale;');
     this.line('ASC_window_render();');
     // AIR fires Event.RESIZE on the stage after the new size is in effect, so an
     // app that relayouts on resize (the NO_SCALE idiom) sees the updated values.
@@ -4712,6 +4733,11 @@ export class Emitter {
     if (expr.object.kind === 'Var' && expr.object.name === 'System') {
       return this.emitSystemConst(expr.property);
     }
+    // flash.system.Capabilities static read-only environment info (same final
+    // static-readonly-class pattern as System; version is injected at compile time).
+    if (expr.object.kind === 'Var' && expr.object.name === 'Capabilities') {
+      return this.emitCapabilitiesConst(expr.property);
+    }
     // Math.PI / Math.E
     if (expr.object.kind === 'Var' && expr.object.name === 'Math') {
       return this.emitMathConst(expr.property);
@@ -5148,6 +5174,36 @@ export class Emitter {
       case 'privateMemory': return { code: 'as_system_private_memory()', type: { kind: 'number' } };
       default:
         throw new CodegenError(`unknown System constant '${name}'`);
+    }
+  }
+
+  // flash.system.Capabilities static read-only environment info. Capabilities is
+  // `final` with no instantiable ClassInfo (same pattern as System): each getter
+  // maps to a compile-time constant, a conditional-compile helper, or a fixed
+  // desktop-native value. `version` is the injected AS-AOT version (package.json
+  // read at codegen time); os/cpuArchitecture use #ifdef; screenResolution* are
+  // 0 in headless builds (no SDL2 window backend) and the real display otherwise.
+  private emitCapabilitiesConst(name: string): { code: string; type: CType } {
+    switch (name) {
+      case 'version': return { code: `"AS-AOT ${this.escapeCString(this.asAotVersion)}"`, type: { kind: 'string' } };
+      case 'os': return { code: 'as_cap_os()', type: { kind: 'string' } };
+      case 'cpuArchitecture': return { code: 'as_cap_cpu_arch()', type: { kind: 'string' } };
+      case 'cpuAddressSize': return { code: '(int)(sizeof(void*) * 8)', type: { kind: 'int' } };
+      case 'supports64BitProcesses': return { code: '(sizeof(void*) == 8)', type: { kind: 'bool' } };
+      case 'supports32BitProcesses': return { code: '(sizeof(void*) == 4)', type: { kind: 'bool' } };
+      case 'playerType': return { code: '"Desktop"', type: { kind: 'string' } };
+      case 'manufacturer': return { code: '"AS-AOT"', type: { kind: 'string' } };
+      case 'isDebugger': return { code: 'false', type: { kind: 'bool' } };
+      case 'touchscreenType': return { code: '"none"', type: { kind: 'string' } };
+      case 'language': return { code: 'as_cap_language()', type: { kind: 'string' } };
+      case 'screenResolutionX': return { code: 'as_cap_screen_resolution_x()', type: { kind: 'int' } };
+      case 'screenResolutionY': return { code: 'as_cap_screen_resolution_y()', type: { kind: 'int' } };
+      case 'screenDPI': return { code: 'as_cap_screen_dpi()', type: { kind: 'number' } };
+      case 'screenColor': return { code: '"color"', type: { kind: 'string' } };
+      case 'pixelAspectRatio': return { code: '1.0', type: { kind: 'number' } };
+      case 'hasAudio': return { code: 'true', type: { kind: 'bool' } };
+      default:
+        throw new CodegenError(`unknown Capabilities constant '${name}'`);
     }
   }
 

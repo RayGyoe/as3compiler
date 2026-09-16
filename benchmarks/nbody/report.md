@@ -13,15 +13,15 @@
 
 | 实现 | 耗时 (ms) | 相对 C |
 |------|----------:|-------:|
-| C (cc -O2) | 188 | 1.00× |
-| JavaScript (Node v24) | 341 | 1.81× |
-| **as3compiler** (→ C → cc -O2) | 198 | 1.05× |
-| 原生 AS3 (AIR/mxmlc) | 1289 | 6.86× |
+| C (cc -O2) | 191 | 1.00× |
+| JavaScript (Node v24) | 346 | 1.81× |
+| **as3compiler** (→ C → cc -O2) | 221 | 1.16× |
+| 原生 AS3 (AIR/mxmlc) | 1300 | 6.81× |
 
 ## 分析
-- **as3compiler 1.05×**：`Vector.<Body>` 元素为对象指针，字段访问生成 `bodies[i]->vx`
+- **as3compiler 1.16×**：`Vector.<Body>` 元素为对象指针，字段访问生成 `bodies[i]->vx`
   直接内存访问；仅比 C 的连续结构体数组略慢（多一层指针解引用）。
-- **原生 AS3 6.86×**：AVM2 的 `Vector` 索引返回 + 对象字段访问均有动态开销。
+- **原生 AS3 6.81×**：AVM2 的 `Vector` 索引返回 + 对象字段访问均有动态开销。
 
 ## 计时口径
 - 四路均内部计时纯计算（C: `clock_gettime` / JS: `hrtime` / as3compiler: `Date.getTime` / 原生 AS3: `getTimer`）。

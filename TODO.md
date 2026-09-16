@@ -6,7 +6,7 @@
 
 ---
 
-## 当前状态（v0.3.65）
+## 当前状态（v0.3.68）
 
 已实现 AS3 可用子集（面向对象基础 + 数据与迭代 + 标准库 + 接口与类型系统 + 函数进阶 + 包/模块语法兼容 + 异常处理 + 完善与打磨已全部完成）：
 
@@ -890,7 +890,7 @@ adl 里 Log 用 `multiline + wordWrap + scrollV = maxScrollV` 做滚动日志，
 - [ ] `contentsScaleFactor` 只在 `render`/`showWindow` 时写入，document class 构造期读到的是初始 `1.0`
       （adl 在 stage 创建时就已知倍率）；与 `stageWidth` 同类时序问题，需把 probe 提前到 bootstrap
 - [ ] 行高用 `size × 1.2` 近似（Skia 未取字体 metrics 表），`leading` 字段未建模
-- [ ] 全屏时 `ASC_DISPLAY_HIGH` 的 drawable 倍率取自主屏 probe，多显示器不同倍率场景未处理
+- [ ] 全屏时 `ASC_DISPLAY_HIGH` 的 drawable 倍率取自主屏 probe（跨屏拖动后的倍率已在 resize 回调重算解决，见「跨显示器帧率/缩放修复 v2」）
 - [ ] TextField 仍不支持 `autoSize` / `hscroll` / `selectable` / HTML 文本；排版无缓存（每帧重算，demo 规模无碍）
 
 ---
@@ -1140,6 +1140,47 @@ air-native 示例说明、版本号同步 v0.3.51。
 稳定多轮（首秒 102 为窗口初始化抖动，其后 120/120/120/114/120）；验证后已移除临时 trace。
 该修复不改 AS3 语义、不改生成 C，故不升版本号，只记录于此。
 
+### 跨显示器帧率锁定 + 缩放值不一致修复：关闭 vsync + resize 重算设备倍率（不升版本号）
+
+**背景**：用户把窗口从 Mac 主屏（120Hz）拖到外接扩展显示器（50Hz）后：① FPS 从 120 掉到 50（被显示器刷新率锁定）；
+② Skia 舞台缩放值不响应、画面变大（不同显示器缩放值不一致时，倍率没有跟过去）。而 adl 调试应用帧率不随显示器变化、
+分辨率也始终正确。
+
+**根因 1（帧率锁定）**：`window_glue.cc` 用 `SDL_RENDERER_ACCELERATED`（Metal）渲染器，`SDL_RenderPresent` 默认开启
+vsync，会阻塞到显示器下一个刷新周期——50Hz 屏每帧至少 20ms，把 deadline pacing 的 120Hz 目标（8.33ms）拖死到 50fps。
+主屏 120Hz 恰好与目标一致所以看不出，外接 50Hz 立即暴露。
+
+**修复 1**（`vendor/window_glue.cc`）：创建渲染器后调 `SDL_RenderSetVSync(ren, 0)` 关闭垂直同步，让 `SDL_RenderPresent`
+立即返回，帧率完全交给事件循环的 deadline pacing（阶段 pacing 修正已落地）——与 adl 一致，不随显示器刷新率锁定。
+代价是可能撕裂，但这是对齐 adl 行为，且 `SDL_RenderSetVSync` 自 SDL 2.0.18 存在（本项目 pin 2.32）。
+
+**根因 2（缩放值不一致）**：`ASC_win_scale`（device pixel ratio）只在 `Stage_showWindow` 里 probe 一次主屏倍率并固定；
+窗口拖到不同 DPI 显示器时，`do_resize` 检测到 drawable 尺寸变化会重建 surface 的物理像素尺寸，但 `ASC_win_scale` 仍保留旧值，
+`ASC_window_render` 里的 `as_skia_canvas_scale(canvas, ASC_win_scale, ASC_win_scale)` 继续按旧倍率缩放 → 内容被画大/裁切。
+
+**修复 2**（`src/emit.ts`）：`ASC_window_on_resize` 里新增 `double rs = (lw > 0) ? (double)pw / (double)lw : 1.0;`，
+用「物理/逻辑」重算设备倍率并写回 `ASC_win_scale` 与 `stage->stage_scale`；同时 `live_resize_watch` 过滤器补 `MOVED`/`DISPLAY_CHANGED`
+两个窗口事件（macOS 拖动跨屏时主循环可能被 Cocoa tracking loop 阻塞，靠过滤器在拖拽期间也能重建）。
+
+**验证**：clang++ 重编译零错误；`--air-app` 重新编链成功；全量回归 72 passed / 0 failed。跨屏拖动的帧率/缩放是否正确需用户实测。
+该修复改生成 C（emit.ts 的 resize 回调）但仅为后端 bug 修正、不改 AS3 语义，故不升版本号，只记录于此。
+
+### 跨显示器帧率/缩放修复 v2：恢复 VSync + 跟随显示器刷新率 + 权威物理像素 API（不升版本号）
+
+**背景**：上一轮「关闭 vsync」修复后，用户实测扩展屏（50Hz）帧率仍无法保持 120fps、浮动很大、动画卡顿；但**开启 VSync 锁 50fps 反而流畅**。这直接推翻了「关 VSync 追 120fps」的方向，也暴露了上一轮两处隐患。
+
+**关键判断**：50Hz 屏物理上限就是 50fps 呈现，不存在「120fps 呈现」。adl 的「fps 不随显示器降」是**逻辑帧率**（ENTER_FRAME 派发计数），靠 delta time 让动画速度不变。真正的卡顿根因是**拍频（beat）**：关 VSync + 120Hz deadline 时 `SDL_RenderPresent` 立即返回，CPU 按 8.33ms 跑但显示器 50Hz 只收 50 次/秒 → 120 vs 50 拍频，帧间隔在 8ms↔20ms 剧烈抖动 → delta time 忽大忽小 → 卡顿。开 VSync 则 `SDL_RenderPresent` 阻塞到 50Hz 刷新，帧间隔均匀 20ms → 流畅。
+
+**修复 1（恢复 VSync）**：`vendor/window_glue.cc` `SDL_RenderSetVSync(ren, 0)` → `SDL_RenderSetVSync(ren, 1)`，让帧率跟随显示器刷新率（50Hz→50fps、120Hz→120fps、跨屏自动适配）。
+
+**修复 2（刷新率跟随窗口所在显示器）**：新增全局 `g_win` 指针，`sk_window_get_display_refresh()` 改用 `SDL_GetWindowDisplayIndex` 实时读**窗口当前所在显示器**的刷新率（原写死 `SDL_GetCurrentDisplayMode(0,...)` 永远是主屏）。
+
+**修复 3（帧率 deadline 封顶到刷新率）**：`src/emit.ts` `ASC_window_on_frame_delay` 中显式 `frameRate` 高于显示器刷新率时封顶到刷新率，避免 120Hz 目标在 50Hz 屏产生拍频。
+
+**修复 4（权威物理像素 + 0 值防护）**：`SDL_GL_GetDrawableSize` 在 Metal 渲染器下不可靠，统一换成 `SDL_GetWindowSizeInPixels`（SDL 2.26+，pin 2.32），初始 probe 与 resize 两处一致；`sk_resize_cb` 签名新增 `double scale` 参数，由 glue 层算倍率（正是 `contentsScaleFactor` 语义）下传，AS3 侧不再用可能过期的 `pw/lw` 重新推导；`do_resize` 与 `ASC_window_on_resize` 任一尺寸 ≤0 时跳过本次 resize，杜绝跨屏过渡态把 `stageWidth` 归零。
+
+**验证**：`--air-app` 重新编链成功（`window_glue.cc` + `air-native.c` 均通过）；全量回归 72 passed / 0 failed。用户双屏实测确认流畅（主屏 120fps、扩展屏 50fps 帧间隔均匀）。该修复仅为后端 bug 修正、不改 AS3 语义，故不升版本号，只记录于此。
+
 ### 窗口拖动 resize 变形 + 动画暂停修复：macOS live-resize 阻塞事件循环（不升版本号）
 
 **背景**：用户拖动窗口边缘调整大小时，Skia 视图变形（内容被拉伸），且**按住拖动期间动画也暂停**，松开鼠标才恢复正常。
@@ -1281,6 +1322,7 @@ TweenDemo: tween complete, box.x=532.7..., box.y=148.89...
 | **P2** | 六十二 ✅ | `flash.display` 补齐（Loader/LoaderInfo/MovieClip/SimpleButton） | Loader 依赖 net.URLLoader、MovieClip 依赖帧动画，均重活 |
 | **P3** | 六十三 ✅ | `flash.net`/`flash.media`/`flash.ui`（URLLoader/URLRequest/Socket/Sound/Video/Keyboard/Mouse） | 异步 + 外部资源/设备，重活且独立 |
 | **P3** | 六十四 ✅ | `air.*`（Window/File/FileStream/NativeWindow/SQLConnection） | 最大命名空间，完全独立于 Flash 运行时 |
+| **P1** | 六十五 ✅ | `flash.system.Capabilities`（version/os/cpuArchitecture/… 环境能力查询） | 纯静态只读类，与 `System` 同范式；`version` 编译期注入 package.json 版本，os/cpu 走条件编译，屏幕/locale 走轻量平台探测 |
 
 ---
 
@@ -1345,6 +1387,19 @@ GC-4 增量标记的完整落地设计（三色状态机 + 显式灰栈 + Dijkst
   air-native 窗口 demo（含 GreenSock 直接字段写）回归无破坏；回归 63 passed / 0 failed。GC-3 双目标回归：`stage57.as`/`gc_strings.as`/
   `gc_incremental.as`/`gc_barrier.as` 四例在 native 与 wasm32-wasip1（WASI SDK 34.0 + wasmtime 48.0.2）下结果一致，
   `reclaimed most`/`bounded`/`intact` 断言全过。
+
+**GC 边界修复（v0.3.65 → v0.3.67，修复两个落地缺口）**：
+
+1. **`gc_alloc` 超大分配死循环**：分段堆按固定 `GC_SEG_SIZE = 1 MiB` 切段，单次请求超过
+   `GC_SEG_SIZE - sizeof(gc_header)`（约 1 MiB − 24 字节头）时，切出的新段永远满足不了请求，
+   `return gc_alloc(type, size)` 无限递归、不停 `malloc(1 MiB)` 直至耗尽 VSZ（`benchmarks/array` 实测 VSZ 膨胀到 ~415 GB）。
+   修复：在切段逻辑前加超大分配分支（镜像 `as_alloc` 的 oversized 分支）——当 `size > GC_SEG_SIZE - sizeof(gc_header)`
+   时分配一个 `sizeof(gc_header) + size` 的专用段，递归重试下一次迭代即命中 free-list。
+2. **GC 覆盖缺口（headless 程序）**：帧边界安全点只在 `Stage_dispatchFrame` 帧循环内，控制台/headless 程序的
+   `main()` 从不进入帧循环，8 个 benchmark 无一真正触发 GC（静默泄漏，靠块小内存足才「碰巧」跑完）。修复：
+   给 `benchmarks/strings`/`binarytrees` 的分配密集循环周期性插入 `System.gc()`（顶层 `var` 已编译为全局模块变量，
+   经 `gc_mark_user_roots()` 标记，故不会误回收活对象）。A/B 对照峰值 RSS：strings 447 MB → 75.7 MB（5.9×）、
+   binarytrees 149.5 MB → 30.0 MB（5.0×），校验值全程不变，证明根标记正确、无悬空回收。
 
 **MVP 边界（GC-1）**：舞台/显示列表/事件系统这些「常驻对象」本就是 GC 根（AS3 里从 stage 可达），
 **只回收动画临时对象**（TweenLite/vars/PropTween/闭包），正好命中阶段五十六残留泄露的主体。
@@ -1465,6 +1520,64 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 `FileStream` `open`/`close`/`readUTFBytes`/`writeUTFBytes` 读写回环与只读 `position`/`bytesAvailable`、`FileMode` 常量。✅（70 passed / 0 failed；
 `NativeWindow`/`Window` 与 `SQLConnection`/`SQLStatement` 延后（原生多窗口管理/SQLite 链接），`FileStream` 为同步 POSIX IO（无异步 ProgressEvent），
 `File` 静态目录（`applicationDirectory` 等）未建模，README 已注明）
+
+#### 阶段六十五：`flash.system.Capabilities` 环境能力查询（目标 v0.3.67 → v0.3.68）【P1】✅ 已完成
+
+**依据**：[`Capabilities`](https://airsdk.dev/reference/actionscript/3.0/flash/system/Capabilities.html) 是 `final` 静态只读类
+（不可实例化、全部为 static getter），与已实现的 `System`（阶段五十二）同范式，可复用 `emitMember` 的「纯静态只读」分支。
+用户诉求：`Capabilities.version` 返回 **AS-AOT 版本**，且版本号单一来源（package.json），避免手动同步。
+
+**核心决策：`version` 能否动态读取 package.json？**
+- **编译期动态读取（采纳）**：codegen 生成 C 时由 `index.ts` 读 package.json 的 `version` 字段（`"0.3.67"`），
+  经 `generateC(program, { asAotVersion })` 传入，`emitMember` 把 `Capabilities.version` 映射为 C 字符串字面量。
+  版本号单一来源，`npm version` 升级后自动同步，无需改 codegen。
+- **运行时动态读取（不采纳）**：编译产物是独立原生二进制，部署环境无 package.json，读不了也无意义。
+- **格式有意偏差**：官方 `version` 为 `"MAC 9,0,0,0"` 四段平台版本号；AS-AOT 无 Flash/AIR 版本体系，
+  故返回 `"0.3.67"`（或前缀 `"AS-AOT 0.3.67"`），README 需如实注明。
+
+**可支持参数分档（依据官方属性清单 + 平台依赖度）**：
+
+| 档 | 属性 | 映射方案 |
+|---|---|---|
+| **P0 编译期/条件编译常量（零平台依赖，首批落地）** | `version` | package.json `version` 注入字符串字面量 |
+| | `os` | `#ifdef __APPLE__`→`"Mac OS"` / `_WIN32`→`"Windows"` / `__wasi__`→`"WASI"` / `__linux__`→`"Linux"` |
+| | `cpuArchitecture` | `__aarch64__`→`"ARM"` / `__x86_64__`·`__i386__`→`"x86"` |
+| | `cpuAddressSize` | `sizeof(void*)==8 ? 64 : 32` |
+| | `supports64BitProcesses` / `supports32BitProcesses` | 由 `cpuAddressSize` 推得 |
+| | `playerType` | 常量 `"Desktop"`（AOT 原生可执行，对齐 AIR） |
+| | `manufacturer` | 常量 `"AS-AOT"`（有意偏差，非 Adobe） |
+| | `isDebugger` | 常量 `false`（无调试运行时） |
+| | `touchscreenType` | 常量 `"none"`（桌面无触摸，`TouchscreenType.NONE`） |
+| **P1 轻量平台探测（复用现有机制，第二批）** | `language` | `getenv("LANG")` 解析 ISO 639-1 前缀（macOS 可用 `CFLocale`，POSIX 用 locale） |
+| | `screenResolutionX`/`screenResolutionY` | SDL2 `SDL_GetDesktopDisplayMode`（窗口后端已有）；headless 退化 0 |
+| | `screenDPI` | SDL2 `SDL_GetDisplayDPI`；headless 退化 72 |
+| | `screenColor` / `pixelAspectRatio` | 常量 `"color"` / `1.0` |
+| | `hasAudio` | 常量 `true`（对齐官方「always true」）；其余 `has*` 布尔按后端有无固定 |
+| **P2 依赖后端/动态数组（延后，注明理由）** | `languages` | 需构造 `Array` + OS locale 列表（`CFLocaleCopyPreferredLanguages` / `setlocale`） |
+| | `serverString` | URL-encoded 汇总，依赖全部属性落地后拼接 |
+| | `hasMP3`/`hasAudioEncoder`/`hasVideoEncoder`/`hasEmbeddedVideo`/`hasStreamingAudio`/`hasStreamingVideo`/`hasTLS` | 依赖音视频/网络后端（阶段六十三已延后 Sound/Video/Socket） |
+| | `maxLevelIDC` | 依赖 H.264 解码后端 |
+| | `hasAccessibility`/`hasIME`/`avHardwareDisable`/`localFileReadDisable`/`isEmbeddedInAcrobat` | 沙箱/PDF/IME 概念，AOT 无对应物，可常量 `false`（优先级低） |
+
+**方法**：`hasMultiChannelAudio(type)` 恒 `false`（AIR 仅 TV 设备支持，桌面恒 false），可顺带落地。
+
+**语义红线**：`Capabilities` 是 `final` 静态只读类，不可 `new Capabilities()`；建模与 `System` 一致——
+**不注册为可实例化 ClassInfo**，仅在 `emitMember` 加 `Capabilities` 特判分支（`expr.object.name === 'Capabilities'`），
+各属性映射到运行时/编译期常量，避免 `new Capabilities()` 误用。
+
+**验收**：`examples/stage65.as` 断言 `version` 非空且含 `.`（编译期从 package.json 注入，实测输出 `0.3.68`）、
+`os`/`cpuArchitecture` 非空且与编译目标平台一致、`cpuAddressSize` 为 32/64、`supports64/32BitProcesses` 与地址宽度一致、
+`playerType == "Desktop"`、`manufacturer == "AS-AOT"`、`isDebugger == false`、`touchscreenType == "none"`、
+`language` 非空、`screenColor == "color"`、`pixelAspectRatio == 1.0`、`hasAudio == true`、`screenResolutionX/Y >= 0`、
+`screenDPI > 0`；README 内建表/类型映射/当前限制同步；版本号 v0.3.67 → v0.3.68。
+
+**落地形态（v0.3.68）**：P0 + P1 全部落地——`version` 经 `generateC(program, { asAotVersion })` 注入 C 字符串字面量
+（`index.ts` 读 package.json、`codegen.ts` 透传、`emit.ts` 的 `emitCapabilitiesConst` 特判 `Capabilities`）；`os`/`cpuArchitecture`
+走 `runtime.ts` 的 `as_cap_os`/`as_cap_cpu_arch` 条件编译助手；`cpuAddressSize`/`supports*` 用 `sizeof(void*)` 内联表达式；
+`language` 用 `as_cap_language`（`getenv("LANG")` 剥 ISO 639-1）；`screenResolutionX/Y` 用 `as_window_get_display_size`
+（headless 退化 0）；`screenDPI` 固定 72.0（无逐屏 DPI 查询，README 已注明）；其余为编译期常量。P2（`languages`/`serverString`/
+`hasMP3`/`hasTLS`/`hasVideoEncoder`/`maxLevelIDC`/`hasAccessibility`/`hasIME` 等）与 `hasMultiChannelAudio(type)` 方法延后（依赖后端/动态数组）。
+全量回归 **72 passed / 0 failed**，`--target wasm --dry` 编译命令正确。
 
 ### 遗留待开发
 

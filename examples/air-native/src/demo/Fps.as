@@ -2,8 +2,10 @@ package demo {
   import flash.display.Sprite;
   import flash.events.Event;
   import flash.system.System;
+  import flash.system.Capabilities;
   import flash.text.TextField;
   import flash.text.TextFormat;
+  import flash.text.TextFieldAutoSize;
   import flash.utils.getTimer;
   /**
    * Simplified FPS meter — replaces Mr.doob's Stats, which leaned on APIs this
@@ -22,7 +24,8 @@ package demo {
 
     public function Fps() {
       text = new TextField();
-      text.width = 260;
+      text.width = 360;
+      //text.autoSize = TextFieldAutoSize.LEFT;
       text.height = 20;
       text.background = true;
       text.backgroundColor = 0x000033;
@@ -46,9 +49,10 @@ package demo {
       if (now - last >= 1000) {
         // Memory stats in MiB (1 MiB = 1048576 bytes). int() truncates the
         // Number division so the string concat emits a clean integer.
-        text.text = "FPS:" + frames
+        text.text = "  FPS:" + frames
           + "  MEM:" + int(System.totalMemory / 1048576) + "MB"
-          + "  PRIV:" + int(System.privateMemory / 1048576) + "MB";
+          + "  PRIV:" + int(System.privateMemory / 1048576) + "MB"
+          + "  RUNTIME:"+ Capabilities.version + "  ";
         frames = 0;
         last = now;
       }

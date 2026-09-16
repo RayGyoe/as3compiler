@@ -184,6 +184,21 @@ rendering and runs the whole mark + sweep before resuming.
   visible freezes. **This is the inherent defect of mark-sweep**; adl doesn't jank because AVM2 uses
   incremental + generational GC; the only correct way to eliminate pauses is **incremental marking** (see §6).
 
+> **Landing addendum (after GC-1~GC-4 implementation)**: the actual allocator did not use the "single linked
+> list traversal" assumed in this section, but a **segmented heap + free-list** (`GC_SEG_SIZE = 1 MiB` per
+> segment, first-fit + splitting + coalescing), with the live-object list `gc_all` and the free list maintained
+> separately. This introduces an **oversized-allocation boundary**: when a single request has
+> `size > GC_SEG_SIZE - sizeof(gc_header)` (about 1 MiB − 24-byte header), splitting fixed segments can never
+> satisfy it, causing `gc_alloc` to recurse infinitely and `malloc(1 MiB)` repeatedly until VSZ is exhausted —
+> the fix mirrors `as_alloc`'s oversized branch: allocate a dedicated `sizeof(gc_header) + size` segment, so the
+> next retry hits the free-list (`benchmarks/array`'s hang was caused by this).
+>
+> **Trigger-timing correction**: the frame-boundary safe point only exists in programs with a
+> `Stage_dispatchFrame` frame loop; headless/console programs' `main()` never enters the frame loop, so the safe
+> point never fires and GC becomes purely manual — unless user code explicitly calls `System.gc()`, the heap only
+> grows and never reclaims (a silent leak, not a crash). Allocation-intensive console benchmarks therefore need
+> periodic `System.gc()` inserted inside their loops to actually trigger reclamation.
+
 ### 4.2 Root Set = Shadow Stack (`emit.ts` codegen, largest workload + largest risk)
 
 Precise GC doesn't scan the call stack; instead the **compiler explicitly registers** "every local variable /

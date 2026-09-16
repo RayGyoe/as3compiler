@@ -158,6 +158,17 @@ typedef struct gc_header {
 - 风险：阈值调大或常驻对象累积后，停顿可达几十~上百 ms，变成可见冻结。**这是 mark-sweep 的固有缺陷**，
   adl 不卡是因为 AVM2 用增量 + 分代 GC；消除停顿的唯一正解是**增量标记**（见 §6）。
 
+> **落地补充（GC-1~GC-4 实现后）**：实际分配器未采用本节设想的「单链表遍历」，而是**分段堆 + free-list**
+> （`GC_SEG_SIZE = 1 MiB` 每段，first-fit + 切分 + 合扇），活对象链 `gc_all` 与空闲链分开维护。由此引出一个
+> **超大分配边界**：当单次请求 `size > GC_SEG_SIZE - sizeof(gc_header)`（约 1 MiB − 24 字节头）时，按固定段切分
+> 永远满足不了请求，会导致 `gc_alloc` 无限递归、不停 `malloc(1 MiB)` 直到耗尽 VSZ——修复方案是镜像 `as_alloc`
+> 的 oversized 分支：为 `size` 分配一个 `sizeof(gc_header) + size` 的专用段，下一次重试即命中 free-list
+> （`benchmarks/array` 死循环即由此引发）。
+>
+> **触发时机补正**：帧边界安全点只存在于有 `Stage_dispatchFrame` 帧循环的程序；headless/控制台程序的 `main()`
+> 从不进入帧循环，安全点永不触发，GC 沦为纯手动——用户代码不显式调 `System.gc()` 就只增不回收（静默泄漏而非崩溃）。
+> 分配密集的控制台基准因此需在循环内周期性插 `System.gc()` 才能真正触发回收。
+
 ### 4.2 根集合 = Shadow Stack（`emit.ts` codegen，最大工作量 + 最大风险）
 
 精确 GC 不扫描调用栈，改为**编译器显式登记**「每个函数当前可能持指针的局部变量/形参/临时值」。
