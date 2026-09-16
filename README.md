@@ -5,7 +5,17 @@ Compile ActionScript 3 source code **ahead-of-time (AOT) into native machine cod
 Design philosophy: the compiler frontend only handles
 `lexing → parsing → generating readable C`, delegating optimization and machine-code generation entirely to mature C compilers — no reinventing the wheel.
 
-![air-native demo](.github/air-native.mp4)
+
+---
+
+## 🎬 Video
+
+<div align="center">
+https://github.com/user-attachments/assets/cb2bed00-aba9-4005-b769-26c162110fdb
+</div>
+
+---
+
 
 ## Compilation pipeline
 
