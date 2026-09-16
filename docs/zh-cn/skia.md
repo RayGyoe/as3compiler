@@ -235,6 +235,22 @@ vendor/skia/
 > 这正是本项目「前端只翻译、优化交给成熟库」铁律的延续：**我们连窗口和像素都不用自研**，Skia 负责像素，
 > SDL2 负责窗口与输入（已落地：阶段三十九窗口上屏 + 阶段四十鼠标事件桥接，见 [`compile.md`](compile.md) §6），我们只负责把 AS3 语义翻译过去。
 
+### 6.4 版本选型结论（为什么 SDL 用 2.32、Skia 用 m124）
+
+**SDL：2.32.10 就是当前 SDL2 主线，不旧。** 见 [`compile.md`](compile.md) §6（窗口后端）。项目 pin 的是
+SDL2 而非 SDL3，理由：SDL3（2025-01 首发 3.2.0）太新，社区生态/教程/第三方绑定 90% 仍在 SDL2；对「单窗口
++ 把 Skia 表面 blit 上屏」的轻量场景无实质收益；且 SDL3 移除了 `SDL_CreateRGBSurface`、改了渲染器接口、
+把 `SDL_Event` 改成 union，`window_glue.cc` 里的 `SDL_CreateRGBSurfaceFrom`/`SDL_RenderCopy`/
+`SDL_GetWindowSizeInPixels`/`SDL_RenderSetVSync` 全都要重写。这些能力（尤其 `SDL_GetWindowSizeInPixels`，
+SDL 2.26 才加入）正是修复跨屏倍率 bug 的依赖，说明 2.32 对本项目够用且恰好支持所需。我们是源码编译 arm64
+静态库（`configure --host=arm64-apple-darwin --disable-shared`），版本自控，无需追一个刚满一年的新大版本。
+
+**Skia：m124 确实旧（约 1.5 年），但有具体原因。** 根本原因是环境受限：本机缺 `gn`/`ninja` 且磁盘不足以
+从源码编译，只能吃 Aseprite 官方钉死的预编译 milestone（§6.1）。次要原因：Skia 无稳定 API/ABI，milestone
+每 4~6 周滚动、接口频繁变动，升级意味着重写整层 `skia_glue.cc`；而 m124 已含所需全部模块
+（`SkParagraph`/`Skottie`/GPU 后端）。**升级触发条件**：只有当确需新 milestone 才有的特性（如某个新
+`SkImageFilter`、新字体引擎行为）时，才补 `gn`/`ninja` 环境从源码自编译最新版，并重测整个胶水层。
+
 ---
 
 ## 7. 多目标：native 与 wasm

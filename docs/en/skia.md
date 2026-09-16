@@ -263,6 +263,28 @@ AS3 event system, see [`compile.md`](compile.md) §6).
 > (landed: stage thirty-nine window blit + stage forty mouse-event bridge, see [`compile.md`](compile.md) §6),
 > and we only translate AS3 semantics over.
 
+### 6.4 Version Selection Conclusion (why SDL 2.32 and Skia m124)
+
+**SDL: 2.32.10 is the current SDL2 mainline, not old.** See [`compile.md`](compile.md) §6 (window backend).
+The project pins SDL2 rather than SDL3, for these reasons: SDL3 (first 3.2.0 in 2025-01) is too new — 90% of
+the community ecosystem/tutorials/third-party bindings are still on SDL2; for a lightweight "single window +
+blit a Skia surface to screen" scenario it brings no real benefit; and SDL3 removed `SDL_CreateRGBSurface`,
+changed the renderer interface, and turned `SDL_Event` into a union — `SDL_CreateRGBSurfaceFrom`/
+`SDL_RenderCopy`/`SDL_GetWindowSizeInPixels`/`SDL_RenderSetVSync` in `window_glue.cc` would all need
+rewriting. These capabilities (especially `SDL_GetWindowSizeInPixels`, added in SDL 2.26) are exactly what
+fixing the cross-display scale bug depends on, showing that 2.32 is sufficient and happens to support what we
+need. We compile the arm64 static library from source (`configure --host=arm64-apple-darwin --disable-shared`),
+so the version is self-controlled and there is no reason to chase a new major version that is barely a year old.
+
+**Skia: m124 is genuinely old (~1.5 years), but for concrete reasons.** The root cause is environmental
+constraints: the local machine lacks `gn`/`ninja` and lacks enough disk to compile from source, so we can only
+consume the prebuilt milestone pinned by the Aseprite official release (§6.1). Secondary reasons: Skia has no
+stable API/ABI, milestones roll every 4~6 weeks with frequent interface changes, so an upgrade means rewriting
+the entire `skia_glue.cc`; and m124 already contains all the modules we need (`SkParagraph`/`Skottie`/GPU
+backends). **Upgrade trigger**: only when a feature that exists only in a newer milestone is actually needed
+(e.g. a new `SkImageFilter`, a new font-engine behavior), should we add the `gn`/`ninja` environment and
+self-compile the latest from source, then retest the whole glue layer.
+
 ---
 
 ## 7. Multi-target: native and wasm
