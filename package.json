@@ -1,6 +1,6 @@
 {
   "name": "as3compiler",
-  "version": "0.3.67",
+  "version": "0.3.68",
   "description": "A minimal ActionScript 3 subset compiler that transpiles AS to C and produces a native executable.",
   "type": "module",
   "bin": {

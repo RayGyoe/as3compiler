@@ -33,6 +33,11 @@ static int g_display_h = 0;
 // treats an unset (<=0) frameRate as "follow the display": the event-loop
 // cadence then mirrors the monitor's vsync rate.
 static double g_display_refresh = 0.0;
+// The currently-shown window (NULL before the first window opens). Used to query
+// the refresh rate of whichever display the window actually sits on, so a
+// cross-display drag re-paces the event loop to the monitor the window is on
+// instead of always mirroring the primary display.
+static SDL_Window* g_win = NULL;
 
 // ---------- HiDPI probing ----------
 
@@ -64,10 +69,9 @@ double sk_window_probe_scale(int w, int h, int highdpi, int* pw, int* ph) {
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h,
         SDL_WINDOW_HIDDEN | SDL_WINDOW_ALLOW_HIGHDPI);
     if (probe != NULL) {
-      // SDL_GL_GetDrawableSize is SDL2's accessor for the physical pixel size of a
-      // window's backing store; it works for non-GL windows too (the Cocoa backend
-      // fills it from the layer's contentsSize * contentsScale).
-      SDL_GL_GetDrawableSize(probe, &dw, &dh);
+      // SDL_GetWindowSizeInPixels (SDL 2.26+, pinned 2.32) is the authoritative
+      // physical-pixel accessor for the backing store, even on a Metal renderer.
+      SDL_GetWindowSizeInPixels(probe, &dw, &dh);
       SDL_DestroyWindow(probe);
     }
   }
@@ -91,9 +95,21 @@ int sk_window_get_display_size(int* w, int* h) {
   return (g_display_w > 0 && g_display_h > 0) ? 1 : 0;
 }
 
-// Query the primary display's refresh rate in Hz. Returns 0 when it cannot be
-// determined (caller falls back to a compiler-side default).
+// Query the refresh rate (Hz) of the display the window currently occupies.
+// Returns 0 when it cannot be determined (caller falls back to a compiler-side
+// default). Cross-display drags change the answer, so this queries live against
+// the window's current display rather than caching the primary's rate — that is
+// what let a 120 Hz target beat against a 50 Hz external monitor and jitter the
+// frame interval. Before any window exists (headless probing) it falls back to
+// the primary display.
 double sk_window_get_display_refresh(void) {
+  if (g_win != NULL) {
+    int idx = SDL_GetWindowDisplayIndex(g_win);
+    if (idx >= 0) {
+      SDL_DisplayMode dm;
+      if (SDL_GetCurrentDisplayMode(idx, &dm) == 0) return (double)dm.refresh_rate;
+    }
+  }
   if (g_display_refresh <= 0.0) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return 0.0;
     SDL_DisplayMode dm;
@@ -114,12 +130,16 @@ typedef void (*sk_wheel_cb)(double x, double y, double delta);
 typedef void (*sk_redraw_cb)(void);
 typedef void (*sk_frame_cb)(void);
 typedef double (*sk_frame_delay_cb)(void);
-// Invoked after the window changed size. The AS3 side rebuilds its offscreen
-// surface at the new *physical* pixel size, re-renders the tree into it, and
-// returns the new surface pointer (NULL on failure, meaning "keep the old
-// one"). Ownership stays with the AS3 side, which also frees the previous
-// surface. This is what keeps a resized window from stretching the content.
-typedef void* (*sk_resize_cb)(int logicalW, int logicalH, int physW, int physH);
+// Invoked after the window changed size or moved to a display with a different
+// backing scale. The AS3 side rebuilds its offscreen surface at the new
+// *physical* pixel size, re-renders the tree into it, and returns the new
+// surface pointer (NULL on failure, meaning "keep the old one"). Ownership
+// stays with the AS3 side, which also frees the previous surface. This is what
+// keeps a resized window from stretching the content. `scale` is the device
+// pixel ratio (macOS contentsScaleFactor) computed by this glue layer from
+// SDL's own size queries — the AS3 side must use it verbatim rather than
+// re-deriving it from physW/logicalW, which can be stale during a cross-display
+typedef void* (*sk_resize_cb)(int logicalW, int logicalH, int physW, int physH, double scale);
 
 // Blit the Skia pixel buffer into a persistent streaming texture and present it.
 // The pixel format note from sk_window_show below applies here too; the masks are
@@ -170,11 +190,23 @@ struct WinCtx {
 static int do_resize(WinCtx* c) {
   int nw = 0, nh = 0, npw = 0, nph = 0;
   SDL_GetWindowSize(c->win, &nw, &nh);
-  SDL_GL_GetDrawableSize(c->win, &npw, &nph);
-  if (npw <= 0 || nph <= 0) { npw = nw; nph = nh; }
+  // SDL_GetWindowSizeInPixels is the authoritative drawable size (SDL 2.26+,
+  // pinned 2.32) — it reports physical pixels even for a Metal renderer,
+  // whereas SDL_GL_GetDrawableSize can return the logical size or 0 on a
+  // non-GL backend. During a cross-display drag macOS briefly reports a 0 or
+  // transitional size while it re-syncs the backing scale; rebuilding the
+  // surface from that bogus size is exactly what zeroed stageWidth/stageHeight
+  // and distorted the picture. Skip until both are sane.
+  SDL_GetWindowSizeInPixels(c->win, &npw, &nph);
+  if (nw <= 0 || nh <= 0 || npw <= 0 || nph <= 0) return 0;
   if (npw == c->pw && nph == c->ph) return 0;
+  // Device pixel ratio (contentsScaleFactor) = physical / logical. Compute it
+  // here from SDL's own queries — the single reliable source — and hand it to
+  // the AS3 side instead of letting it re-derive pw/lw (which can disagree
+  // while the window straddles two displays with different scales).
+  double scale = (double)npw / (double)nw;
   if (c->on_resize != NULL) {
-    void* ns = c->on_resize(nw, nh, npw, nph);
+    void* ns = c->on_resize(nw, nh, npw, nph, scale);
     if (ns != NULL) {
       c->surface = ns;
       if (!sk_surface_peek_pixels(c->surface, &c->pixels, &c->rowBytes)) return -1;
@@ -198,7 +230,9 @@ static int SDLCALL live_resize_watch(void* userdata, SDL_Event* e) {
   Uint8 we = e->window.event;
   if (we != SDL_WINDOWEVENT_SIZE_CHANGED &&
       we != SDL_WINDOWEVENT_RESIZED &&
-      we != SDL_WINDOWEVENT_EXPOSED) return 1;
+      we != SDL_WINDOWEVENT_EXPOSED &&
+      we != SDL_WINDOWEVENT_MOVED &&
+      we != SDL_WINDOWEVENT_DISPLAY_CHANGED) return 1;
   c->in_watch = 1;
   int rres = do_resize(c);
   if (rres >= 0 && c->on_redraw != NULL) {
@@ -260,6 +294,7 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   SDL_Window* win = SDL_CreateWindow(
       title ? title : "AS3", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
       w, h, winFlags);
+  g_win = win;
   if (win == NULL) {
     fprintf(stderr, "window_glue: SDL_CreateWindow failed: %s\n", SDL_GetError());
     SDL_Quit();
@@ -281,6 +316,17 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
     SDL_Quit();
     return 0;
   }
+
+  // Enable vsync so SDL_RenderPresent blocks until the display's next refresh.
+  // The monitor can only show 50 frames/sec on a 50 Hz panel — no amount of
+  // CPU-side pacing can change that. Disabling vsync and chasing a 120 Hz target
+  // there just makes the logical frame rate beat against the 50 Hz refresh
+  // (120 vs 50), jittering the frame interval so delta-time animation stutters.
+  // With vsync on the present step enforces an even interval equal to the refresh
+  // period, and the event-loop pacer caps its deadline to that same rate — the
+  // cadence stays uniform (and smooth) on every display. SDL_RenderSetVSync has
+  // existed since SDL 2.0.18; we pin 2.32.
+  SDL_RenderSetVSync(ren, 1);
 
   // Window render state lives in a single context shared with the live-resize
   // event filter (see WinCtx above).

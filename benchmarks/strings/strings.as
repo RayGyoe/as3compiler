@@ -10,6 +10,8 @@ for (var i:int = 0; i < 300000; i++) {
   checksum += joined.indexOf("fox");
   checksum += joined.toUpperCase().length;
   checksum += joined.split("quick").join("slow").lastIndexOf("o");
+  // 触发 GC 回收，验证 mark/sweep 在大量临时字符串下的正确性（不误回收根、结果不变）。
+  if ((i % 50000) == 0) { System.gc(); }
 }
 var t1:Number = new Date().getTime();
 

@@ -236,14 +236,24 @@ static void* gc_alloc(int type, size_t size) {
             return body;
         }
     }
-    // Out of free blocks: carve a fresh segment.
+    // Out of free blocks: carve a fresh segment. A fixed 1 MiB segment only
+    // yields blocks up to GC_SEG_SIZE - sizeof(gc_header); a larger request can
+    // never be satisfied by it, so recursing below would loop forever, malloc'ing
+    // 1 MiB segments until virtual address space is exhausted (array's 1.5 MiB
+    // value-array growth hit exactly this). Mirror as_alloc's oversized branch:
+    // allocate a dedicated segment sized to the request so the recursive retry
+    // finds a free block of sufficient size on the next pass.
+    size_t seg_size = GC_SEG_SIZE;
+    if (size > GC_SEG_SIZE - sizeof(gc_header)) {
+        seg_size = sizeof(gc_header) + size;
+    }
     gc_seg* s = (gc_seg*)malloc(sizeof(gc_seg));
-    s->base = (char*)malloc(GC_SEG_SIZE);
-    s->size = GC_SEG_SIZE;
+    s->base = (char*)malloc(seg_size);
+    s->size = seg_size;
     s->next = gc_segs;
     gc_segs = s;
     gc_header* h = (gc_header*)s->base;
-    h->size = GC_SEG_SIZE - sizeof(gc_header);
+    h->size = seg_size - sizeof(gc_header);
     h->next = gc_free;
     gc_free = h;
     return gc_alloc(type, size);
@@ -2819,7 +2829,7 @@ extern int sk_window_show(void* surface, int w, int h, int pw, int ph, const cha
                           void (*on_redraw)(void),
                           void (*on_frame)(void),
                           double (*on_frame_delay)(void),
-                          void* (*on_resize)(int, int, int, int));
+                          void* (*on_resize)(int, int, int, int, double));
 extern double sk_window_probe_scale(int w, int h, int highdpi, int* pw, int* ph);
 extern int sk_window_get_display_size(int* w, int* h);
 extern double sk_window_get_display_refresh(void);
@@ -2861,7 +2871,7 @@ static inline int as_skia_surface_show_window(void* s, int w, int h, int pw, int
                                               void (*on_redraw)(void),
                                               void (*on_frame)(void),
                                               double (*on_frame_delay)(void),
-                                              void* (*on_resize)(int, int, int, int)) {
+                                              void* (*on_resize)(int, int, int, int, double)) {
 #ifdef ASC_USE_WINDOW
     return sk_window_show(s, w, h, pw, ph, title, fullscreen, on_mouse, on_wheel, on_redraw, on_frame, on_frame_delay, on_resize);
 #else
@@ -2922,7 +2932,7 @@ static inline void as_skia_paint_set_drop_shadow(void* p, double dx, double dy, 
 static inline void as_skia_paint_set_glow(void* p, double sx, double sy, unsigned rgb, double a) { (void)p; (void)sx; (void)sy; (void)rgb; (void)a; }
 static inline void as_skia_canvas_save_layer_paint(void* c, void* p) { (void)c; (void)p; }
 static inline void as_skia_canvas_save_layer_paint_bounds(void* c, void* p, double l, double t, double r, double b) { (void)c; (void)p; (void)l; (void)t; (void)r; (void)b; }
-static inline int as_skia_surface_show_window(void* s, int w, int h, int pw, int ph, const char* title, int fullscreen, void (*on_mouse)(double, double, const char*), void (*on_wheel)(double, double, double), void (*on_redraw)(void), void (*on_frame)(void), double (*on_frame_delay)(void), void* (*on_resize)(int, int, int, int)) { (void)s; (void)w; (void)h; (void)pw; (void)ph; (void)title; (void)fullscreen; (void)on_mouse; (void)on_wheel; (void)on_redraw; (void)on_frame; (void)on_frame_delay; (void)on_resize; return 0; }
+static inline int as_skia_surface_show_window(void* s, int w, int h, int pw, int ph, const char* title, int fullscreen, void (*on_mouse)(double, double, const char*), void (*on_wheel)(double, double, double), void (*on_redraw)(void), void (*on_frame)(void), double (*on_frame_delay)(void), void* (*on_resize)(int, int, int, int, double)) { (void)s; (void)w; (void)h; (void)pw; (void)ph; (void)title; (void)fullscreen; (void)on_mouse; (void)on_wheel; (void)on_redraw; (void)on_frame; (void)on_frame_delay; (void)on_resize; return 0; }
 static inline int as_window_get_display_size(int* w, int* h) { if (w) *w = 0; if (h) *h = 0; return 0; }
 static inline double as_window_device_scale(int w, int h, int* pw, int* ph) { if (pw) *pw = w; if (ph) *ph = h; (void)w; (void)h; return 1.0; }
 static inline double as_window_display_refresh(void) { return 0.0; }
@@ -3076,5 +3086,62 @@ static void as_system_gc(void) {
 // No trailing newline is added — AIR outputs exactly the given string.
 static void as_system_output(const char* s) {
     fputs(s, stdout);
+}
+
+// ---------- flash.system.Capabilities environment info ----------
+// Capabilities is a 'final' static read-only class (no instantiable ClassInfo);
+// these helpers back its static getters. os/cpuArchitecture are conditional-
+// compile constants; version is injected at codegen time from package.json (NOT
+// a runtime lookup — the compiled binary has no package.json to read).
+static const char* as_cap_os(void) {
+#ifdef __APPLE__
+    return "Mac OS";
+#elif defined(_WIN32)
+    return "Windows";
+#elif defined(__wasi__)
+    return "WASI";
+#else
+    return "Linux";
+#endif
+}
+static const char* as_cap_cpu_arch(void) {
+#if defined(__aarch64__) || defined(__arm__)
+    return "ARM";
+#elif defined(__x86_64__) || defined(__i386__)
+    return "x86";
+#else
+    return "Unknown";
+#endif
+}
+// ISO 639-1 language from the process locale (LANG, then LC_ALL). AIR reports a
+// bare two-letter code ("en", "zh", ...); the POSIX locale's region/encoding
+// suffix ("en_US.UTF-8") is stripped. Falls back to "en" when unset.
+static const char* as_cap_language(void) {
+    const char* lang = getenv("LANG");
+    if (!lang) lang = getenv("LC_ALL");
+    if (!lang || !lang[0]) return "en";
+    static char out[8];
+    int i = 0;
+    while (lang[i] && lang[i] != '_' && lang[i] != '.' && lang[i] != '-' && i < 7) { out[i] = lang[i]; i++; }
+    out[i] = '\\0';
+    return out;
+}
+// Primary display resolution. Backed by the SDL2 window backend's display query;
+// headless (pure-C, no ASC_USE_WINDOW) builds report 0.
+static int as_cap_screen_resolution_x(void) {
+    int w = 0, h = 0;
+    as_window_get_display_size(&w, &h);
+    return w;
+}
+static int as_cap_screen_resolution_y(void) {
+    int w = 0, h = 0;
+    as_window_get_display_size(&w, &h);
+    return h;
+}
+// DPI: AIR reports the primary display's dots-per-inch. The window backend does
+// not expose a per-display DPI query, so this is a fixed 72 (AIR's standard
+// fallback) — a documented subset, not a real physical-DPI read.
+static double as_cap_screen_dpi(void) {
+    return 72.0;
 }
 `;

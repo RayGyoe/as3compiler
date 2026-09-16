@@ -34,7 +34,10 @@ for (var d:int = 4; d <= maxDepth; d += 2) {
   for (var i:int = 0; i < n; i++) {
     var t:Node = make(d);
     sum += check(t);
+    // 周期性触发 GC 回收，验证 Node 树在持续分配压力下能被正确标记与回收。
+    if ((i % 2048) == 0) { System.gc(); }
   }
+  System.gc();
 }
 var l:int = check(longLived);
 var t1:Number = new Date().getTime();

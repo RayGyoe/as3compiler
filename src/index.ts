@@ -149,7 +149,7 @@ function main(): void {
   console.log(`[1/4] read        ${inputLabel}`);
   console.log('[2/4] parse       tokenize + AST');
   console.log('[3/4] codegen     emit C source');
-  const { c, exports } = generateC(program);
+  const { c, exports } = generateC(program, { asAotVersion: readAsAotVersion() });
   writeFileSync(cPath, c);
 
   // [WasmExport] declarations are auto-exported: append their C symbols (or alias
@@ -208,6 +208,19 @@ function main(): void {
       const runRes = spawnSync(outPath, [], { stdio: 'inherit' });
       if (runRes.status !== 0) process.exit(runRes.status ?? 1);
     }
+  }
+}
+
+// Read the compiler's own version from package.json (single source of truth),
+// injected at codegen time as Capabilities.version. Falls back to an empty string
+// if the file is missing or unreadable, so library use never throws.
+function readAsAotVersion(): string {
+  try {
+    const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), '../package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    return typeof pkg.version === 'string' ? pkg.version : '';
+  } catch {
+    return '';
   }
 }
 
