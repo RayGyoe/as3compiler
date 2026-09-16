@@ -5,7 +5,7 @@
 设计思路：编译器前端只负责
 `词法 → 语法 → 生成可读的 C`，优化与机器码生成全部交给成熟的 C 编译器，不重复造轮子。
 
-<video src=".github/air-native.mp4"></video>
+![air-native demo](.github/air-native.mp4)
 
 ## 编译管线
 

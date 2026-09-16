@@ -5,7 +5,7 @@ Compile ActionScript 3 source code **ahead-of-time (AOT) into native machine cod
 Design philosophy: the compiler frontend only handles
 `lexing → parsing → generating readable C`, delegating optimization and machine-code generation entirely to mature C compilers — no reinventing the wheel.
 
-<video src=".github/air-native.mp4"></video>
+![air-native demo](.github/air-native.mp4)
 
 ## Compilation pipeline
 
@@ -122,7 +122,7 @@ Path-like fields resolve relative to the manifest file's directory. Example at
 ## Semantic authority sources
 
 Before implementing new features, consult the authoritative specification to confirm real AS3 semantics, never reverse-engineering from memory or C behavior. The complete tiered list,
-red-line comparisons, and decision divergences are in [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md). Core sources:
+red-line comparisons, and decision divergences are in [`docs/en/as3-semantics.md`](docs/en/as3-semantics.md). Core sources:
 
 - **ES4 draft specification** (syntax/type system/coercion canon): `http://archives.ecma-international.org/2006/misc/es4lang-Jan06.pdf`
 - **AVM2 Overview** (object model trait/slot/dispatch semantics, borrowing semantics only, not generating ABC): `http://hackipedia.org/raw/File%20formats/Containers/F4V,%20Flash%20Video/ActionScript%20Virtual%20Machine%202%20(AVM2)%20Overview%20by%20Adobe%20(2007-05).pdf`
