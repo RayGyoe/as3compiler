@@ -4,9 +4,10 @@
 // MovieClip models a looping frame timeline (currentFrame/totalFrames + play/stop/
 // gotoAndPlay/gotoAndStop) driven by the as_mc_* frame pool; headless examples
 // pump it with tickMovieClips(). totalFrames is writable here (no symbol timeline).
-// SimpleButton is a four-state InteractiveObject bundle. Loader.load(url) is a
-// synchronous simulation (real async URLLoader is stage 63): it records the URL on
-// contentLoaderInfo and dispatches INIT then COMPLETE.
+// SimpleButton is a four-state InteractiveObject bundle. Loader.load(url)
+// records the URL on contentLoaderInfo, dispatches INIT synchronously, and
+// defers COMPLETE to the next frame tick (as_set_timeout(0)) — matching the async
+// contract shared with stage 63's URLLoader.
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 
@@ -82,7 +83,9 @@ loader.contentLoaderInfo.addEventListener(LoaderInfo.INIT, onLoaderInit);
 loader.contentLoaderInfo.addEventListener(LoaderInfo.COMPLETE, onLoaderComplete);
 loader.load("test.swf");
 check(loader.contentLoaderInfo.url == "test.swf", "load records url");
-check(initFired, "load dispatches INIT");
-check(completeFired, "load dispatches COMPLETE");
+check(initFired, "load dispatches INIT synchronously");
+check(!completeFired, "load does not dispatch COMPLETE synchronously");
+tickTimers();
+check(completeFired, "load dispatches COMPLETE on the next tick");
 
 trace("stage62: all flash.display additions assertions passed");

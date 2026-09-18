@@ -139,7 +139,8 @@ enum {
     GCT_CLOSURE = 4,     // as_closure (function value)
     GCT_CLASS = 5,       // user/builtin class instance (vtable + as_prop reflection)
     GCT_VALUE_ARRAY = 6, // as_value[] buffer (array.data / object.vals / dict.vals)
-    GCT_PTR_ARRAY = 7    // void*[] / char*[] buffer (dict.keys / object.keys)
+    GCT_PTR_ARRAY = 7,   // void*[] / char*[] buffer (dict.keys / object.keys)
+    GCT_CUSTOM = 8       // user-supplied mark callback in the body's first word
 };
 
 #define GC_SEG_SIZE (1u << 20)          // 1 MiB per segment
@@ -363,7 +364,7 @@ static char* as_str_from_bool(bool b) {
 }
 
 typedef struct { void* vtable; } as_object_header;
-typedef struct { const char* name; void* super; void** ifaces; void* props; void* methods; } as_vtable_header;
+typedef struct { const char* name; void* super; void** ifaces; void* props; void* methods; int dyn_offset; } as_vtable_header;
 
 // Reflection table entry: one reflectable field of a class. 'type' encodes the
 // boxed storage kind (1 number, 2 bool, 3 string, 4 int, 5 uint, 6 ref, 7 any);
@@ -994,7 +995,7 @@ static as_array* as_array_sort_cb(as_array* a, as_fn cb) { as_array_sort_impl(a,
 // associative map. It carries a vtable header (pointing at as_object_vt) so the
 // dynamic-access runtime (as_dyn_get/set) can tell a dynamic record apart from a
 // real class instance by walking the same vtable layout used by every object.
-static as_vtable_header as_object_vt = { "Object", NULL, NULL, NULL, NULL };
+static as_vtable_header as_object_vt = { "Object", NULL, NULL, NULL, NULL, -1 };
 
 typedef struct {
     void* vtable;
@@ -1119,8 +1120,15 @@ static as_value as_dyn_get(void* obj, const char* key) {
         }
         vt = ((as_vtable_header*)vt)->super;
     }
-    if (((as_object_header*)obj)->vtable == (void*)&as_object_vt) {
+    as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
+    if (hv == &as_object_vt) {
         return as_object_get((as_object*)obj, key);
+    }
+    // Dynamic class instance: undeclared keys live in the _dyn slot table; its
+    // byte offset within the struct is recorded in the vtable (dyn_offset >= 0).
+    if (hv->dyn_offset >= 0) {
+        as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
+        return dyn == NULL ? as_v_null() : as_object_get(dyn, key);
     }
     return as_v_null();
 }
@@ -1149,8 +1157,14 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
         }
         vt = ((as_vtable_header*)vt)->super;
     }
-    if (((as_object_header*)obj)->vtable == (void*)&as_object_vt) {
+    as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
+    if (hv == &as_object_vt) {
         as_object_set((as_object*)obj, key, v);
+        return;
+    }
+    if (hv->dyn_offset >= 0) {
+        as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
+        if (dyn != NULL) as_object_set(dyn, key, v);
     }
 }
 
@@ -1547,6 +1561,10 @@ static void gc_scan(gc_header* h) {
             }
             vt = ((as_vtable_header*)vt)->super;
         }
+        // Dynamic class instances also carry an _dyn as_object* slot table; its
+        // byte offset is recorded on the object's own vtable (dyn_offset >= 0).
+        as_vtable_header* hv = (as_vtable_header*)((as_object_header*)b)->vtable;
+        if (hv->dyn_offset >= 0) gc_mark_ptr(*(void**)((char*)b + hv->dyn_offset));
         break;
     }
     case GCT_VALUE_ARRAY: {
@@ -1559,6 +1577,14 @@ static void gc_scan(gc_header* h) {
         int n = (int)(h->size / sizeof(void*));
         void** arr = (void**)b;
         for (int i = 0; i < n; i++) gc_mark_ptr(arr[i]);
+        break;
+    }
+    case GCT_CUSTOM: {
+        // The object body's first word is a 'void (*mark)(void* self)' callback
+        // (monomorphized Vector / closure-env structs). gc_alloc zeroes the body,
+        // so a NULL callback is a safe no-op until the constructor installs it.
+        void (**mark)(void*) = (void(**)(void*))b;
+        if (*mark) (*mark)(b);
         break;
     }
     }
@@ -1759,6 +1785,51 @@ static char* as_str_fromCharCodes(int n, const int* codes) {
         else if (c < 0x800) { r[p++] = (char)(0xC0 | (c >> 6)); r[p++] = (char)(0x80 | (c & 0x3F)); }
         else if (c < 0x10000) { r[p++] = (char)(0xE0 | (c >> 12)); r[p++] = (char)(0x80 | ((c >> 6) & 0x3F)); r[p++] = (char)(0x80 | (c & 0x3F)); }
         else { r[p++] = (char)(0xF0 | (c >> 18)); r[p++] = (char)(0x80 | ((c >> 12) & 0x3F)); r[p++] = (char)(0x80 | ((c >> 6) & 0x3F)); r[p++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    r[p] = 0;
+    return r;
+}
+// URL percent-encoding (application/x-www-form-urlencoded). encode leaves
+// unreserved chars [A-Za-z0-9-_.~] alone and escapes everything else as %XX;
+// decode reverses %XX (invalid sequences are left verbatim).
+static bool as_url_is_unreserved(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c == '-' || c == '_' || c == '.' || c == '~';
+}
+static int as_url_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+static char* as_url_encode(const char* s) {
+    if (s == NULL) return (char*)"";
+    size_t n = strlen(s);
+    char* r = as_str_alloc(n * 3 + 1);
+    int p = 0;
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (as_url_is_unreserved((char)c)) r[p++] = (char)c;
+        else { r[p++] = '%'; r[p++] = hex[c >> 4]; r[p++] = hex[c & 0xF]; }
+    }
+    r[p] = 0;
+    return r;
+}
+static char* as_url_decode(const char* s) {
+    if (s == NULL) return (char*)"";
+    size_t n = strlen(s);
+    char* r = as_str_alloc(n + 1);
+    int p = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2 < n && isxdigit((unsigned char)s[i+1]) && isxdigit((unsigned char)s[i+2])) {
+            int hi = as_url_hexval(s[i+1]);
+            int lo = as_url_hexval(s[i+2]);
+            r[p++] = (char)((hi << 4) | lo);
+            i += 2;
+        } else {
+            r[p++] = s[i];
+        }
     }
     r[p] = 0;
     return r;
@@ -2728,6 +2799,7 @@ extern void sk_canvas_restore(void* canvas);
 extern void sk_canvas_translate(void* canvas, double x, double y);
 extern void sk_canvas_rotate(void* canvas, double degrees);
 extern void sk_canvas_scale(void* canvas, double sx, double sy);
+extern void sk_canvas_concat(void* canvas, double a, double b, double c, double d, double tx, double ty);
 extern void sk_canvas_save_layer_alpha(void* canvas, double alpha);
 extern void sk_canvas_draw_rect(void* canvas, double x, double y, double w, double h, void* paint);
 extern void sk_canvas_draw_circle(void* canvas, double cx, double cy, double r, void* paint);
@@ -2796,6 +2868,7 @@ static inline void as_skia_canvas_clip_rect(void* c, double x, double y, double 
 static inline void as_skia_canvas_translate(void* c, double x, double y) { sk_canvas_translate(c, x, y); }
 static inline void as_skia_canvas_rotate(void* c, double deg) { sk_canvas_rotate(c, deg); }
 static inline void as_skia_canvas_scale(void* c, double sx, double sy) { sk_canvas_scale(c, sx, sy); }
+static inline void as_skia_canvas_concat(void* c, double a, double b, double cc, double d, double tx, double ty) { sk_canvas_concat(c, a, b, cc, d, tx, ty); }
 static inline void as_skia_canvas_save_layer_alpha(void* c, double a) { sk_canvas_save_layer_alpha(c, a); }
 static inline void as_skia_canvas_save(void* c) { sk_canvas_save(c); }
 static inline void as_skia_canvas_restore(void* c) { sk_canvas_restore(c); }
@@ -2907,6 +2980,7 @@ static inline void as_skia_canvas_clip_rect(void* c, double x, double y, double 
 static inline void as_skia_canvas_translate(void* c, double x, double y) { (void)c; (void)x; (void)y; }
 static inline void as_skia_canvas_rotate(void* c, double deg) { (void)c; (void)deg; }
 static inline void as_skia_canvas_scale(void* c, double sx, double sy) { (void)c; (void)sx; (void)sy; }
+static inline void as_skia_canvas_concat(void* c, double a, double b, double cc, double d, double tx, double ty) { (void)c; (void)a; (void)b; (void)cc; (void)d; (void)tx; (void)ty; }
 static inline void as_skia_canvas_save_layer_alpha(void* c, double a) { (void)c; (void)a; }
 static inline void as_skia_canvas_save(void* c) { (void)c; }
 static inline void as_skia_canvas_restore(void* c) { (void)c; }
@@ -3086,6 +3160,7 @@ static void as_system_gc(void) {
 // No trailing newline is added — AIR outputs exactly the given string.
 static void as_system_output(const char* s) {
     fputs(s, stdout);
+    fflush(stdout);
 }
 
 // ---------- flash.system.Capabilities environment info ----------

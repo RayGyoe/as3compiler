@@ -903,6 +903,23 @@ class Parser {
       const args = this.parseArgList();
       return { kind: 'NewDynamic', classExpr, args };
     }
+    // Vector literal: `new <T>[...]` (AS3's compact Vector construction syntax).
+    if (this.at('<')) {
+      this.next(); // '<'
+      const elem = this.parseType();
+      this.expect('>');
+      this.expect('[');
+      const elements: Expr[] = [];
+      if (!this.at(']')) {
+        elements.push(this.parseExpression());
+        while (this.at(',')) {
+          this.next();
+          elements.push(this.parseExpression());
+        }
+      }
+      this.expect(']');
+      return { kind: 'VectorLit', elem, elements };
+    }
     let className = this.expectIdent().value;
     // new Vector.<T>() — generic element type argument.
     if (className === 'Vector' && this.at('.') && this.peek(1).value === '<') {

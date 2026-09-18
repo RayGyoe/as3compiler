@@ -43,7 +43,10 @@ package demo {
       FilterDisplayDemos.run();
       FilterDisplayDemos.visualize(stage);
       NetUiDemos.run();
+      NetUiDemos.visualize(stage);
       FileDemos.run();
+      FileDemos.visualize(stage);
+      GeometryDemos.visualize(stage);
 
       stage.addChild(new TweenDemo());
 

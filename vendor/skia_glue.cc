@@ -87,6 +87,17 @@ void sk_canvas_scale(void* canvas, double sx, double sy) {
   ((SkCanvas*)canvas)->scale((SkScalar)sx, (SkScalar)sy);
 }
 
+// Concat an AS3 Matrix [a b c d tx ty] onto the current canvas transform.
+// AS3 maps x' = a*x + c*y + tx, y' = b*x + d*y + ty, which is Skia's
+// row-major setAll(scaleX, skewX, transX, skewY, scaleY, transY, 0, 0, 1).
+void sk_canvas_concat(void* canvas, double a, double b, double c, double d, double tx, double ty) {
+  SkMatrix m;
+  m.setAll((SkScalar)a, (SkScalar)c, (SkScalar)tx,
+           (SkScalar)b, (SkScalar)d, (SkScalar)ty,
+           0, 0, 1);
+  ((SkCanvas*)canvas)->concat(m);
+}
+
 // Offscreen-only alpha/blend approximation: a saveLayerAlpha isolates the
 // subtree so a partial DisplayObject.alpha multiplies the whole subtree (stage
 // 37 acceptance). Full SkBlendMode plumbing is a later sub-stage.
