@@ -129,4 +129,21 @@ var tr:Transform = new Transform();
 check(tr.matrix != null && tr.colorTransform != null, "Transform matrix/colorTransform non-null");
 check(near(tr.matrix.a, 1) && near(tr.colorTransform.redMultiplier, 1), "Transform identity defaults");
 
+// --- DisplayObject.transform wiring (Transform.matrix applied to the Skia canvas) ---
+var s:Stage = new Stage();
+var sp:Shape = new Shape();
+sp.graphics.beginFill(0x00CC00, 1.0);
+sp.graphics.drawRect(0, 0, 50, 50);
+sp.graphics.endFill();
+// transform defaults to an identity matrix (Transform holder, unit matrix)
+check(sp.transform != null, "DisplayObject.transform non-null");
+check(near(sp.transform.matrix.a, 1) && near(sp.transform.matrix.d, 1) && near(sp.transform.matrix.tx, 0), "transform identity default");
+// mutate the matrix and read it back through the same reference
+sp.transform.matrix.translate(30, 40);
+check(near(sp.transform.matrix.tx, 30) && near(sp.transform.matrix.ty, 40), "transform.matrix.translate read-back");
+sp.transform.matrix.scale(2, 2);
+check(near(sp.transform.matrix.a, 2), "transform.matrix.scale read-back");
+s.addChild(sp);
+s.render(100, 100, "stage58.png");
+
 trace("stage58: all flash.geom assertions passed");

@@ -184,6 +184,26 @@ export class Emitter {
     }
   }
 
+  // Whether a Vector element type is a GC-managed reference (string/object/interface)
+  // vs. a scalar value (int/uint/number/bool). Reference elements need their data
+  // array GC-traced; scalar elements' data is a plain (non-GC) value buffer.
+  private vectorElemIsPtr(elem: CType): boolean {
+    return elem.kind === 'string' || elem.kind === 'object' || elem.kind === 'interface';
+  }
+
+  // How a captured CType must be traced from a closure environment: 'ptr' for a
+  // raw object/string/function pointer (gc_mark_ptr), 'value' for a boxed
+  // as_value (gc_mark_value), or null for a scalar needing no tracing.
+  private captureMarkKind(t: CType): 'ptr' | 'value' | null {
+    switch (t.kind) {
+      case 'string': case 'object': case 'interface': case 'array':
+      case 'vector': case 'record': case 'dict': case 'function':
+      case 'regexp': case 'class': return 'ptr';
+      case 'any': return 'value';
+      default: return null;
+    }
+  }
+
   // C expression turning a Vector element value into its string form (for join).
   private vectorElemToStr(elem: CType, expr: string): string {
     switch (elem.kind) {
@@ -285,6 +305,9 @@ export class Emitter {
       this.line('void** ifaces;');
       this.line('void* props;');
       this.line('void* methods;');
+      // Byte offset of the `_dyn` slot table (dynamic classes only), -1 otherwise.
+      // Mirrors as_vtable_header.dyn_offset so a class vtable can be cast to it.
+      this.line('int dyn_offset;');
       for (const [mname, m] of info.methods) {
         this.line(`${this.methodPtrField(m, mname)};`);
       }
@@ -298,6 +321,10 @@ export class Emitter {
       for (const [fname, f] of info.fields) {
         this.line(`${this.cTypeName(f.type)} ${fname};`);
       }
+      // Dynamic classes (AS3 `dynamic class`) carry a runtime slot table for
+      // arbitrary undeclared string-keyed properties. Its byte offset is emitted
+      // into the vtable so as_dyn_get/set can reach it.
+      if (info.isDynamic) this.line('as_object* _dyn;');
       this.indent--;
       this.line('};');
       this.line('');
@@ -325,10 +352,12 @@ export class Emitter {
       this.line('};');
       this.line('');
     }
-    // Vector.<T> monomorphized structs: contiguous element array + length/capacity.
+    // Vector.<T> monomorphized structs: a GCT_CUSTOM mark callback (so the GC
+    // can trace element pointers for reference element types), then the
+    // contiguous element array + length/capacity.
     for (const [, elem] of this.vectorSpecs) {
       const key = this.vectorCName(elem);
-      this.line(`typedef struct { ${this.cTypeName(elem)}* data; int length; int capacity; } as_vector_${key};`);
+      this.line(`typedef struct { void (*mark)(void*); ${this.cTypeName(elem)}* data; int length; int capacity; } as_vector_${key};`);
     }
     if (this.vectorSpecs.size > 0) this.line('');
   }
@@ -373,6 +402,7 @@ export class Emitter {
       const ec = this.cTypeName(elem);
       this.line(`as_vector_${key}* as_vector_${key}_new(void);`);
       this.line(`as_vector_${key}* as_vector_${key}_new_sized(int n);`);
+      this.line(`as_vector_${key}* as_vector_${key}_make(int n, ${ec}* items);`);
       this.line(`void as_vector_${key}_push(as_vector_${key}* v, ${ec} e);`);
       this.line(`${ec} as_vector_${key}_pop(as_vector_${key}* v);`);
       this.line(`${ec} as_vector_${key}_get(as_vector_${key}* v, int i);`);
@@ -380,6 +410,14 @@ export class Emitter {
       this.line(`int as_vector_${key}_indexOf(as_vector_${key}* v, ${ec} e);`);
       this.line(`char* as_vector_${key}_join(as_vector_${key}* v, const char* sep);`);
       this.line(`void as_vector_${key}_setLength(as_vector_${key}* v, int n);`);
+      this.line(`as_vector_${key}* as_vector_${key}_slice(as_vector_${key}* v, int from, int to);`);
+      this.line(`as_vector_${key}* as_vector_${key}_concat(as_vector_${key}* a, as_vector_${key}* b);`);
+      this.line(`as_vector_${key}* as_vector_${key}_splice(as_vector_${key}* v, int start, int deleteCount, ${ec}* items, int itemCount);`);
+      this.line(`void as_vector_${key}_forEach(as_vector_${key}* v, as_fn cb);`);
+      this.line(`as_vector_${key}* as_vector_${key}_map(as_vector_${key}* v, as_fn cb);`);
+      this.line(`as_vector_${key}* as_vector_${key}_filter(as_vector_${key}* v, as_fn cb);`);
+      this.line(`as_vector_${key}* as_vector_${key}_sort(as_vector_${key}* v, as_fn cb);`);
+      this.line(`as_vector_${key}* as_vector_${key}_reverse(as_vector_${key}* v);`);
     }
     if (this.symbols.classes.size > 0 || this.symbols.funcs.size > 0 || this.vectorSpecs.size > 0) this.line('');
   }
@@ -410,7 +448,10 @@ export class Emitter {
       const ifaceArr = info.implements.length > 0 ? `${name}_ifaces` : 'NULL';
       const props = this.hasOwnProps(name) ? `${name}_props` : 'NULL';
       const methods = this.hasOwnMethods(name) ? `${name}_methods` : 'NULL';
-      const entries: string[] = [`"${name}"`, superVt, ifaceArr, props, methods];
+      // Dynamic classes record the byte offset of their `_dyn` slot table here
+      // (struct has the field only when isDynamic); non-dynamic classes use -1.
+      const dynOffset = info.isDynamic ? `(int)offsetof(${name}, _dyn)` : '-1';
+      const entries: string[] = [`"${name}"`, superVt, ifaceArr, props, methods, dynOffset];
       for (const [mname, m] of info.methods) {
         entries.push(`${m.owner}_${mname}`);
       }
@@ -864,6 +905,7 @@ export class Emitter {
       case 'New': this.noteType(e.className); for (const a of e.args) this.walkExpr(a); break;
       case 'NewDynamic': this.walkExpr(e.classExpr); for (const a of e.args) this.walkExpr(a); break;
       case 'ArrayLit': for (const el of e.elements) this.walkExpr(el); break;
+      case 'VectorLit': this.noteType(`Vector.<${e.elem}>`); for (const el of e.elements) this.walkExpr(el); break;
       case 'Index': this.walkExpr(e.object); this.walkExpr(e.index); break;
       case 'ObjectLit': for (const f of e.fields) this.walkExpr(f.value); break;
       case 'FunctionExpr': {
@@ -932,14 +974,29 @@ export class Emitter {
     for (const fn of this.anonFuncs) {
       if (fn.captures.length === 0) continue;
       const fields = fn.captures.map((c) => `${this.cTypeName(c.type)} ${c.name};`).join(' ');
-      this.line(`typedef struct { ${fields} } ${fn.name}_env;`);
+      this.line(`typedef struct { void (*mark)(void*); ${fields} } ${fn.name}_env;`);
     }
     for (const fn of this.anonFuncs) {
       if (fn.captures.length === 0) continue;
       const params = fn.captures.map((c) => `${this.cTypeName(c.type)} ${c.name}`).join(', ');
+      // GC mark callback for the captured environment: trace each captured field
+      // that carries a GC pointer (raw object/string) or a boxed as_value. The
+      // env is a GCT_CUSTOM object so gc_scan dispatches to this callback, which
+      // keeps any object/string the closure captured alive.
+      this.line(`static void ${fn.name}_env_mark(void* self) {`);
+      this.indent++;
+      this.line(`${fn.name}_env* e = (${fn.name}_env*)self;`);
+      for (const c of fn.captures) {
+        const k = this.captureMarkKind(c.type);
+        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${c.name});`);
+        else if (k === 'value') this.line(`gc_mark_value(e->${c.name});`);
+      }
+      this.indent--;
+      this.line('}');
       this.line(`static ${fn.name}_env* ${fn.name}_env_make(${params}) {`);
       this.indent++;
-      this.line(`${fn.name}_env* e = (${fn.name}_env*)malloc(sizeof(${fn.name}_env));`);
+      this.line(`${fn.name}_env* e = (${fn.name}_env*)gc_alloc(GCT_CUSTOM, sizeof(${fn.name}_env));`);
+      this.line(`e->mark = ${fn.name}_env_mark;`);
       for (const c of fn.captures) this.line(`e->${c.name} = ${c.name};`);
       this.line('return e;');
       this.indent--;
@@ -1483,6 +1540,8 @@ export class Emitter {
     this.line('o->rotation = 0.0;');
     this.line('o->scaleX = 1.0; o->scaleY = 1.0;');
     this.line('o->filters = NULL;');
+    this.line('o->transform = Transform_new();');
+    this.line('gc_write_barrier((void*)o->transform);');
     this.indent--;
     this.line('}');
     this.line('DisplayObject* DisplayObject_new(void) {');
@@ -1878,6 +1937,17 @@ export class Emitter {
     this.line('Loader* Loader_new(void) { Loader* o = (Loader*)gc_alloc(GCT_CLASS, sizeof(Loader)); o->vtable = &Loader_vt; Loader_ctor(o); return o; }');
     this.line('DisplayObject* Loader_get_content(void* _this) { return ((Loader*)_this)->content; }');
     this.line('LoaderInfo* Loader_get_contentLoaderInfo(void* _this) { return ((Loader*)_this)->contentLoaderInfo; }');
+    // Async completion thunk: fires COMPLETE on contentLoaderInfo on a later frame
+    // tick (AIR dispatches load completion asynchronously, so listeners registered
+    // after load() still receive it).
+    this.line('static as_value Loader__complete(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)args; (void)argc;');
+    this.line('Loader* o = (Loader*)env;');
+    this.line('EventDispatcher_dispatchEvent((void*)o->contentLoaderInfo, (Event*)Event_new((char*)"complete", false, false));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
     this.line('void Loader_load(void* _this, char* url) {');
     this.indent++;
     this.line('Loader* o = (Loader*)_this;');
@@ -1885,16 +1955,18 @@ export class Emitter {
     this.line('li->url = url; gc_write_barrier((void*)url);');
     this.line('li->bytesLoaded = 0; li->bytesTotal = 0;');
     this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"init", false, false));');
-    this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"complete", false, false));');
+    this.line('as_set_timeout(as_fn_make(Loader__complete, (void*)o), 0.0);');
     this.indent--;
     this.line('}');
     this.line('');
     // ---- flash.net / flash.ui (stage 63): URLRequest / URLLoader / Keyboard / Mouse ----
     //
-    // as_read_file: synchronous whole-file read into a malloc'd buffer (NUL-
-    // terminated). URLLoader.data holds this buffer; it is NOT GC-tracked (like
-    // ByteArray.pixels), so gc_scan skips it via gc_in_heap(). Returns NULL on
-    // failure and sets *out_len to -1.
+    // as_read_file: synchronous whole-file read into a GC-managed String buffer
+    // (NUL-terminated via as_str_alloc). URLLoader.data holds this buffer and is
+    // therefore GC-tracked — a GC cycle that runs between load() and the deferred
+    // COMPLETE dispatch cannot collect it because the URLLoader instance (and its
+    // `data` field) is reachable from the pending timer's closure env. Returns
+    // NULL on failure and sets *out_len to -1.
     this.line('static char* as_read_file(const char* path, int* out_len) {');
     this.indent++;
     this.line('FILE* f = fopen(path, "rb");');
@@ -1903,7 +1975,7 @@ export class Emitter {
     this.line('long sz = ftell(f);');
     this.line('fseek(f, 0, SEEK_SET);');
     this.line('if (sz < 0) sz = 0;');
-    this.line('char* buf = (char*)malloc((size_t)sz + 1);');
+    this.line('char* buf = as_str_alloc((size_t)sz + 1);');
     this.line('if (sz > 0) { size_t n = fread(buf, 1, (size_t)sz, f); sz = (long)n; }');
     this.line('buf[sz] = \'\\0\';');
     this.line('fclose(f);');
@@ -1924,9 +1996,10 @@ export class Emitter {
     this.line('}');
     this.line('URLRequest* URLRequest_new(char* url) { URLRequest* o = (URLRequest*)gc_alloc(GCT_CLASS, sizeof(URLRequest)); o->vtable = &URLRequest_vt; URLRequest_ctor(o, url); return o; }');
     this.line('');
-    // URLLoader: synchronous local-file load. The URL is treated as a filesystem
-    // path; on success the file text lands in data and COMPLETE is dispatched, on
-    // failure IO_ERROR is dispatched (both through the EventDispatcher path).
+    // URLLoader: asynchronous local-file load. The URL is treated as a filesystem
+    // path; the file is read synchronously but COMPLETE/IO_ERROR are deferred to a
+    // later frame tick via setTimeout(0), so listeners registered after load() still
+    // fire (AIR's async contract). data holds the GC-managed file text.
     this.line('void URLLoader_ctor(URLLoader* o) {');
     this.indent++;
     this.line('EventDispatcher_ctor((EventDispatcher*)o);');
@@ -1934,18 +2007,87 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('URLLoader* URLLoader_new(void) { URLLoader* o = (URLLoader*)gc_alloc(GCT_CLASS, sizeof(URLLoader)); o->vtable = &URLLoader_vt; URLLoader_ctor(o); return o; }');
+    this.line('static as_value URLLoader__finish(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)args; (void)argc;');
+    this.line('URLLoader* o = (URLLoader*)env;');
+    this.line('if (o->data != NULL) EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
+    this.line('else EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"ioError", false, false));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
     this.line('void URLLoader_load(void* _this, URLRequest* request) {');
     this.indent++;
     this.line('URLLoader* o = (URLLoader*)_this;');
-    this.line('if (request == NULL || request->url == NULL) { EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"ioError", false, false)); return; }');
+    this.line('o->data = NULL;');
+    this.line('if (request != NULL && request->url != NULL) {');
+    this.indent++;
     this.line('int len = 0;');
     this.line('char* buf = as_read_file(request->url, &len);');
-    this.line('if (buf == NULL || len < 0) { EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"ioError", false, false)); return; }');
-    this.line('o->data = buf;');
-    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
+    this.line('if (buf != NULL && len >= 0) { o->data = buf; gc_write_barrier((void*)buf); }');
+    this.indent--;
+    this.line('}');
+    this.line('as_set_timeout(as_fn_make(URLLoader__finish, (void*)o), 0.0);');
     this.indent--;
     this.line('}');
     this.line('void URLLoader_close(void* _this) { (void)_this; }');
+    this.line('');
+    // URLVariables: dynamic class (AS3 `dynamic class`). Arbitrary string-keyed
+    // properties live in the `_dyn` slot table (see the dynamic-class mechanism);
+    // toString() serializes them as a URL-encoded query string (key=value&...),
+    // insertion-ordered for deterministic output.
+    this.line('void URLVariables_ctor(URLVariables* o, char* source) {');
+    this.indent++;
+    this.line('Object_ctor((Object*)o);');
+    this.line('o->_dyn = as_object_new();');
+    this.line('gc_write_barrier((void*)o->_dyn);');
+    this.line('if (source != NULL && *source != \'\\0\') {');
+    this.indent++;
+    this.line('char* s = as_str_alloc(strlen(source) + 1);');
+    this.line('strcpy(s, source);');
+    this.line('char* p = s;');
+    this.line('while (*p != \'\\0\') {');
+    this.indent++;
+    this.line('char* eq = strchr(p, \'=\');');
+    this.line('char* amp = strchr(p, \'&\');');
+    this.line('if (eq == NULL || (amp != NULL && amp < eq)) break;');
+    this.line('*eq = \'\\0\';');
+    this.line('char* val = eq + 1;');
+    this.line('if (amp != NULL) { *amp = \'\\0\'; amp++; }');
+    this.line('as_object_set(o->_dyn, p, as_v_str(as_url_decode(val)));');
+    this.line('if (amp == NULL) break;');
+    this.line('p = amp;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('URLVariables* URLVariables_new(char* source) { URLVariables* o = (URLVariables*)gc_alloc(GCT_CLASS, sizeof(URLVariables)); o->vtable = &URLVariables_vt; URLVariables_ctor(o, source); return o; }');
+    this.line('char* URLVariables_toString(void* _this) {');
+    this.indent++;
+    this.line('URLVariables* o = (URLVariables*)_this;');
+    this.line('as_object* d = o->_dyn;');
+    this.line('if (d == NULL || d->length == 0) return (char*)"";');
+    this.line('size_t total = 0;');
+    this.line('for (int i = 0; i < d->length; i++) total += strlen(d->keys[i]) + strlen(as_v_str_val(d->vals[i])) + 2;');
+    this.line('char* out = as_str_alloc(total + 1);');
+    this.line('char* p = out;');
+    this.line('for (int i = 0; i < d->length; i++) {');
+    this.indent++;
+    this.line('char* k = d->keys[i];');
+    this.line('char* v = as_url_encode(as_v_str_val(d->vals[i]));');
+    this.line('size_t kl = strlen(k), vl = strlen(v);');
+    this.line('memcpy(p, k, kl); p += kl;');
+    this.line('*p++ = \'=\';');
+    this.line('memcpy(p, v, vl); p += vl;');
+    this.line('if (i < d->length - 1) *p++ = \'&\';');
+    this.indent--;
+    this.line('}');
+    this.line('*p = \'\\0\';');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
     this.line('');
     // Keyboard / Mouse: static-only classes (never instantiated), but they still
     // need concrete ctor/new so any reference links cleanly (like the stage-41
@@ -1971,6 +2113,15 @@ export class Emitter {
     this.line('return as_str_concat(tmp, b);');
     this.indent--;
     this.line('}');
+    // AIR File static directory shortcuts, resolved from the process environment.
+    // applicationDirectory is the app's own directory (mapped to the CWD in this
+    // subset); userDirectory/desktopDirectory/documentsDirectory read $HOME and
+    // append the standard sub-path.
+    this.line('static char* as_home_dir(void) { char* h = getenv("HOME"); return (h == NULL || *h == \'\\0\') ? (char*)"." : h; }');
+    this.line('static char* as_app_dir(void) { return (char*)"."; }');
+    this.line('static char* as_user_dir(void) { return as_home_dir(); }');
+    this.line('static char* as_desktop_dir(void) { return as_path_join(as_home_dir(), "Desktop"); }');
+    this.line('static char* as_documents_dir(void) { return as_path_join(as_home_dir(), "Documents"); }');
     this.line('static void as_mkdirs(const char* p) {');
     this.indent++;
     this.line('if (p == NULL || *p == \'\\0\') return;');
@@ -2019,13 +2170,34 @@ export class Emitter {
     this.line('o->_handle = (void*)fopen(file->nativePath, mode);');
     this.indent--;
     this.line('}');
+    // Async completion thunk for openAsync: reports the full byte count via a
+    // ProgressEvent.PROGRESS then Event.COMPLETE on a later frame tick (AIR reads
+    // the file asynchronously and fires these before the data is consumed).
+    this.line('static as_value FileStream__async(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)args; (void)argc;');
+    this.line('FileStream* o = (FileStream*)env;');
+    this.line('unsigned total = 0;');
+    this.line('FILE* f = (FILE*)o->_handle;');
+    this.line('if (f != NULL) { long cur = ftell(f); fseek(f, 0, SEEK_END); total = (unsigned)ftell(f); fseek(f, cur, SEEK_SET); }');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ProgressEvent_new((char*)"progress", false, false, total, total));');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('void FileStream_openAsync(void* _this, File* file, char* fileMode) {');
+    this.indent++;
+    this.line('FileStream_open(_this, file, fileMode);');
+    this.line('as_set_timeout(as_fn_make(FileStream__async, (void*)_this), 0.0);');
+    this.indent--;
+    this.line('}');
     this.line('void FileStream_close(void* _this) { FileStream* o = (FileStream*)_this; if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; } }');
     this.line('char* FileStream_readUTFBytes(void* _this, unsigned length) {');
     this.indent++;
     this.line('FileStream* o = (FileStream*)_this;');
     this.line('FILE* f = (FILE*)o->_handle;');
     this.line('if (f == NULL) return NULL;');
-    this.line('char* buf = (char*)malloc((size_t)length + 1);');
+    this.line('char* buf = as_str_alloc((size_t)length + 1);');
     this.line('size_t n = fread(buf, 1, (size_t)length, f);');
     this.line('buf[n] = \'\\0\';');
     this.line('return buf;');
@@ -2785,6 +2957,15 @@ export class Emitter {
     this.line('as_skia_canvas_translate(canvas, o->x, o->y);');
     this.line('as_skia_canvas_rotate(canvas, o->rotation);');
     this.line('as_skia_canvas_scale(canvas, o->scaleX, o->scaleY);');
+    // DisplayObject.transform.matrix: concat the user Matrix after the built-in
+    // x/y/rotation/scale so both views of the same transform compose (AS3 applies
+    // the concat matrix as an additional local transform).
+    this.line('if (o->transform != NULL && o->transform->matrix != NULL) {');
+    this.indent++;
+    this.line('Matrix* m = o->transform->matrix;');
+    this.line('as_skia_canvas_concat(canvas, m->a, m->b, m->c, m->d, m->tx, m->ty);');
+    this.indent--;
+    this.line('}');
     this.line('if (o->filters != NULL && o->filters->length > 0) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
@@ -3123,9 +3304,21 @@ export class Emitter {
       const ec = this.cTypeName(elem);
       const def = this.defaultInit(elem);
       const defExpr = def.startsWith('{') ? `(${ec})${def}` : def;
+      const isPtr = this.vectorElemIsPtr(elem);
+      // GC mark callback: trace the data buffer. For reference elements the data
+      // is a GCT_PTR_ARRAY whose children the GC scans; for scalar elements the
+      // data is a plain malloc'd value buffer, which gc_mark_ptr skips (outside
+      // the GC segment range).
+      this.line(`static void as_vector_${key}_mark(void* self) {`);
+      this.indent++;
+      this.line(`as_vector_${key}* v = (as_vector_${key}*)self;`);
+      this.line('gc_mark_ptr(v->data);');
+      this.indent--;
+      this.line('}');
       this.line(`as_vector_${key}* as_vector_${key}_new(void) {`);
       this.indent++;
-      this.line(`as_vector_${key}* v = (as_vector_${key}*)malloc(sizeof(as_vector_${key}));`);
+      this.line(`as_vector_${key}* v = (as_vector_${key}*)gc_alloc(GCT_CUSTOM, sizeof(as_vector_${key}));`);
+      this.line(`v->mark = as_vector_${key}_mark;`);
       this.line('v->data = NULL; v->length = 0; v->capacity = 0;');
       this.line('return v;');
       this.indent--;
@@ -3134,11 +3327,19 @@ export class Emitter {
       this.indent++;
       this.line('if (v->length == v->capacity) {');
       this.indent++;
-      this.line('v->capacity = v->capacity ? v->capacity * 2 : 4;');
-      this.line(`v->data = (${ec}*)realloc(v->data, v->capacity * sizeof(${ec}));`);
+      if (isPtr) {
+        this.line('int cap = v->capacity ? v->capacity * 2 : 4;');
+        this.line(`${ec}* nd = (${ec}*)gc_alloc(GCT_PTR_ARRAY, (size_t)cap * sizeof(${ec}));`);
+        this.line(`if (v->data != NULL && v->length > 0) memcpy(nd, v->data, (size_t)v->length * sizeof(${ec}));`);
+        this.line('v->data = nd; v->capacity = cap;');
+      } else {
+        this.line('v->capacity = v->capacity ? v->capacity * 2 : 4;');
+        this.line(`v->data = (${ec}*)realloc(v->data, v->capacity * sizeof(${ec}));`);
+      }
       this.indent--;
       this.line('}');
       this.line('v->data[v->length++] = e;');
+      if (isPtr) this.line('gc_write_barrier((void*)e);');
       this.indent--;
       this.line('}');
       this.line(`${ec} as_vector_${key}_pop(as_vector_${key}* v) {`);
@@ -3163,6 +3364,13 @@ export class Emitter {
       this.indent++;
       this.line(`as_vector_${key}* v = as_vector_${key}_new();`);
       this.line(`for (int i = 0; i < n; i++) as_vector_${key}_push(v, ${defExpr});`);
+      this.line('return v;');
+      this.indent--;
+      this.line('}');
+      this.line(`as_vector_${key}* as_vector_${key}_make(int n, ${ec}* items) {`);
+      this.indent++;
+      this.line(`as_vector_${key}* v = as_vector_${key}_new();`);
+      this.line(`for (int i = 0; i < n; i++) as_vector_${key}_push(v, items[i]);`);
       this.line('return v;');
       this.indent--;
       this.line('}');
@@ -3205,9 +3413,156 @@ export class Emitter {
       this.indent++;
       this.line('if (n < 0) { as_throw(RangeError_new("Vector length cannot be negative")); return; }');
       this.line('if (n < v->length) { v->length = n; return; }');
-      this.line(`while (v->capacity < n) { v->capacity = v->capacity ? v->capacity * 2 : 4; v->data = (${ec}*)realloc(v->data, v->capacity * sizeof(${ec})); }`);
+      if (isPtr) {
+        this.line(`if (v->capacity < n) { ${ec}* nd = (${ec}*)gc_alloc(GCT_PTR_ARRAY, (size_t)n * sizeof(${ec})); if (v->data != NULL && v->length > 0) memcpy(nd, v->data, (size_t)v->length * sizeof(${ec})); v->data = nd; v->capacity = n; }`);
+      } else {
+        this.line(`while (v->capacity < n) { v->capacity = v->capacity ? v->capacity * 2 : 4; v->data = (${ec}*)realloc(v->data, v->capacity * sizeof(${ec})); }`);
+      }
       this.line(`for (int i = v->length; i < n; i++) v->data[i] = ${defExpr};`);
       this.line('v->length = n;');
+      this.indent--;
+      this.line('}');
+      // ---- higher-order / sequence methods ----
+      // Box/unbox reuse the same as_value representation the Array higher-order
+      // methods use, so Vector callbacks receive (element, index, vector) exactly
+      // like Array callbacks receive (element, index, array). A temporary is used
+      // for the unboxed element so interface unboxes (which contain a comma in
+      // their struct literal) never break the push() argument list.
+      const boxElem = (expr: string): string => this.boxExpr({ code: expr, type: elem });
+      const unboxElem = (expr: string): string => this.unboxAny({ code: expr, type: { kind: 'any' } as CType }, elem);
+      const defaultCmp = (a: string, b: string): string => {
+        if (elem.kind === 'string') return `strcmp(${a}, ${b})`;
+        if (elem.kind === 'object') return `strcmp(as_obj_to_str((void*)(${a})), as_obj_to_str((void*)(${b})))`;
+        if (elem.kind === 'interface') return `strcmp(as_obj_to_str(${a}.obj), as_obj_to_str(${b}.obj))`;
+        return `((${a}) > (${b}) ? 1 : ((${a}) < (${b}) ? -1 : 0))`;
+      };
+      this.line(`static void as_vector_${key}_ensure(as_vector_${key}* v, int need) {`);
+      this.indent++;
+      this.line('if (need <= v->capacity) return;');
+      this.line('int cap = v->capacity ? v->capacity : 4;');
+      this.line('while (cap < need) cap *= 2;');
+      if (isPtr) {
+        this.line(`${ec}* nd = (${ec}*)gc_alloc(GCT_PTR_ARRAY, (size_t)cap * sizeof(${ec}));`);
+        this.line(`if (v->data != NULL && v->length > 0) memcpy(nd, v->data, (size_t)v->length * sizeof(${ec}));`);
+        this.line('v->data = nd;');
+      } else {
+        this.line(`v->data = (${ec}*)realloc(v->data, (size_t)cap * sizeof(${ec}));`);
+      }
+      this.line('v->capacity = cap;');
+      this.indent--;
+      this.line('}');
+      this.line(`as_vector_${key}* as_vector_${key}_slice(as_vector_${key}* v, int from, int to) {`);
+      this.indent++;
+      this.line('if (from < 0) from = 0;');
+      this.line('if (to > v->length) to = v->length;');
+      this.line('int n = to - from;');
+      this.line(`as_vector_${key}* r = as_vector_${key}_new();`);
+      this.line('if (n <= 0) return r;');
+      this.line(`for (int i = 0; i < n; i++) as_vector_${key}_push(r, v->data[from + i]);`);
+      this.line('return r;');
+      this.indent--;
+      this.line('}');
+      this.line(`as_vector_${key}* as_vector_${key}_concat(as_vector_${key}* a, as_vector_${key}* b) {`);
+      this.indent++;
+      this.line(`as_vector_${key}* r = as_vector_${key}_new();`);
+      this.line(`for (int i = 0; i < a->length; i++) as_vector_${key}_push(r, a->data[i]);`);
+      this.line(`for (int i = 0; i < b->length; i++) as_vector_${key}_push(r, b->data[i]);`);
+      this.line('return r;');
+      this.indent--;
+      this.line('}');
+      this.line(`as_vector_${key}* as_vector_${key}_splice(as_vector_${key}* v, int start, int deleteCount, ${ec}* items, int itemCount) {`);
+      this.indent++;
+      this.line('if (start < 0) start = 0;');
+      this.line('if (start > v->length) start = v->length;');
+      this.line('if (deleteCount < 0) deleteCount = 0;');
+      this.line('if (deleteCount > v->length - start) deleteCount = v->length - start;');
+      this.line(`as_vector_${key}* removed = as_vector_${key}_new();`);
+      this.line(`for (int i = 0; i < deleteCount; i++) as_vector_${key}_push(removed, v->data[start + i]);`);
+      this.line('int tail = v->length - start - deleteCount;');
+      this.line('int delta = itemCount - deleteCount;');
+      this.line(`if (delta > 0) as_vector_${key}_ensure(v, v->length + delta);`);
+      this.line(`if (tail > 0) memmove(&v->data[start + itemCount], &v->data[start + deleteCount], (size_t)tail * sizeof(${ec}));`);
+      this.line('for (int i = 0; i < itemCount; i++) { v->data[start + i] = items[i];' + (isPtr ? ' gc_write_barrier((void*)items[i]);' : '') + ' }');
+      this.line('v->length += delta;');
+      this.line('return removed;');
+      this.indent--;
+      this.line('}');
+      this.line(`void as_vector_${key}_forEach(as_vector_${key}* v, as_fn cb) {`);
+      this.indent++;
+      this.line('for (int i = 0; i < v->length; i++) {');
+      this.indent++;
+      this.line(`as_value args[3] = { ${boxElem('v->data[i]')}, as_v_num((double)i), as_v_obj((void*)v) };`);
+      this.line('cb->fn(cb->env, args, 3);');
+      this.indent--;
+      this.line('}');
+      this.indent--;
+      this.line('}');
+      this.line(`as_vector_${key}* as_vector_${key}_map(as_vector_${key}* v, as_fn cb) {`);
+      this.indent++;
+      this.line(`as_vector_${key}* r = as_vector_${key}_new();`);
+      this.line('for (int i = 0; i < v->length; i++) {');
+      this.indent++;
+      this.line(`as_value args[3] = { ${boxElem('v->data[i]')}, as_v_num((double)i), as_v_obj((void*)v) };`);
+      this.line('as_value res = cb->fn(cb->env, args, 3);');
+      this.line(`${ec} tmp = ${unboxElem('res')};`);
+      this.line(`as_vector_${key}_push(r, tmp);`);
+      this.indent--;
+      this.line('}');
+      this.line('return r;');
+      this.indent--;
+      this.line('}');
+      this.line(`as_vector_${key}* as_vector_${key}_filter(as_vector_${key}* v, as_fn cb) {`);
+      this.indent++;
+      this.line(`as_vector_${key}* r = as_vector_${key}_new();`);
+      this.line('for (int i = 0; i < v->length; i++) {');
+      this.indent++;
+      this.line(`as_value args[3] = { ${boxElem('v->data[i]')}, as_v_num((double)i), as_v_obj((void*)v) };`);
+      this.line('as_value res = cb->fn(cb->env, args, 3);');
+      this.line(`if (as_v_truthy(res)) as_vector_${key}_push(r, v->data[i]);`);
+      this.indent--;
+      this.line('}');
+      this.line('return r;');
+      this.indent--;
+      this.line('}');
+      this.line(`as_vector_${key}* as_vector_${key}_sort(as_vector_${key}* v, as_fn cb) {`);
+      this.indent++;
+      this.line('for (int i = 1; i < v->length; i++) {');
+      this.indent++;
+      this.line(`${ec} key = v->data[i];`);
+      this.line('int j = i - 1;');
+      this.line('while (j >= 0) {');
+      this.indent++;
+      this.line('int c;');
+      this.line('if (cb != NULL) {');
+      this.indent++;
+      this.line(`as_value args[2] = { ${boxElem('v->data[j]')}, ${boxElem('key')} };`);
+      this.line('double d = as_v_num_val(cb->fn(cb->env, args, 2));');
+      this.line('c = d < 0.0 ? -1 : (d > 0.0 ? 1 : 0);');
+      this.indent--;
+      this.line('} else {');
+      this.indent++;
+      this.line(`c = ${defaultCmp('v->data[j]', 'key')};`);
+      this.indent--;
+      this.line('}');
+      this.line('if (c <= 0) break;');
+      this.line('v->data[j + 1] = v->data[j];');
+      this.line('j--;');
+      this.indent--;
+      this.line('}');
+      this.line('v->data[j + 1] = key;');
+      this.indent--;
+      this.line('}');
+      this.line('return v;');
+      this.indent--;
+      this.line('}');
+      this.line(`as_vector_${key}* as_vector_${key}_reverse(as_vector_${key}* v) {`);
+      this.indent++;
+      this.line('for (int i = 0, j = v->length - 1; i < j; i++, j--) {');
+      this.indent++;
+      this.line(`${ec} t = v->data[i]; v->data[i] = v->data[j]; v->data[j] = t;`);
+      this.indent--;
+      this.line('}');
+      this.line('return v;');
       this.indent--;
       this.line('}');
       this.line('');
@@ -3949,6 +4304,10 @@ export class Emitter {
         for (const el of e.elements) this.sequenceValueExpr(el, true, guaranteed);
         return;
       }
+      case 'VectorLit': {
+        for (const el of e.elements) this.sequenceValueExpr(el, true, guaranteed);
+        return;
+      }
       case 'Index': {
         this.sequenceValueExpr(e.object, true, guaranteed);
         this.sequenceValueExpr(e.index, true, guaranteed);
@@ -4051,6 +4410,9 @@ export class Emitter {
 
       case 'ArrayLit':
         return this.emitArrayLit(expr);
+
+      case 'VectorLit':
+        return this.emitVectorLit(expr);
 
       case 'Index':
         return this.emitIndex(expr);
@@ -4203,6 +4565,7 @@ export class Emitter {
       case 'New': return e.args.some((a) => this.usesArgumentsExpr(a));
       case 'NewDynamic': return this.usesArgumentsExpr(e.classExpr) || e.args.some((a) => this.usesArgumentsExpr(a));
       case 'ArrayLit': return e.elements.some((el) => this.usesArgumentsExpr(el));
+      case 'VectorLit': return e.elements.some((el) => this.usesArgumentsExpr(el));
       case 'Index': return this.usesArgumentsExpr(e.object) || this.usesArgumentsExpr(e.index);
       case 'ObjectLit': return e.fields.some((f) => this.usesArgumentsExpr(f.value));
       case 'FunctionExpr': case 'Num': case 'Str': case 'Bool': case 'Null': case 'RegExp': return false;
@@ -4518,6 +4881,18 @@ export class Emitter {
           const code = this.convert(v, paramType);
           return { code: `${s.owner}_set_${target.property}(${obj.code}, ${code})`, type: { kind: 'void' } };
         }
+        // Dynamic class (AS3 `dynamic class`): an undeclared member write lands in
+        // the runtime slot table via as_dyn_set (falls back to the `_dyn` record).
+        if (cinfo?.isDynamic && !cinfo.fields.has(target.property)) {
+          const key = `"${this.escapeCString(target.property)}"`;
+          if (expr.op === '=') {
+            const v = this.emitExpr(expr.value);
+            return { code: `as_dyn_set((void*)(${obj.code}), ${key}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          }
+          const op = COMPOUND_BASE[expr.op];
+          const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
+          return { code: `as_dyn_set((void*)(${obj.code}), ${key}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+        }
       }
     }
 
@@ -4738,6 +5113,13 @@ export class Emitter {
     if (expr.object.kind === 'Var' && expr.object.name === 'Capabilities') {
       return this.emitCapabilitiesConst(expr.property);
     }
+    // flash.filesystem.File static directory shortcuts (applicationDirectory /
+    // desktopDirectory / documentsDirectory / userDirectory), resolved at runtime
+    // from the process environment rather than a compile-time path.
+    if (expr.object.kind === 'Var' && expr.object.name === 'File') {
+      const c = this.emitFileStaticDir(expr.property);
+      if (c) return c;
+    }
     // Math.PI / Math.E
     if (expr.object.kind === 'Var' && expr.object.name === 'Math') {
       return this.emitMathConst(expr.property);
@@ -4831,6 +5213,11 @@ export class Emitter {
       }
       return { code: `as_fn_make(${obj.type.className}_${expr.property}__bound, (void*)(${obj.code}))`, type: { kind: 'function' } };
     }
+    // Dynamic class (AS3 `dynamic class`): an undeclared member read resolves at
+    // runtime through the slot table (falls back to the `_dyn` record).
+    if (cinfo?.isDynamic) {
+      return { code: `as_dyn_get((void*)(${obj.code}), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
+    }
     throw new CodegenError(`undefined field '${expr.property}' on class '${obj.type.className}'`);
   }
 
@@ -4840,6 +5227,7 @@ export class Emitter {
     if (obj.type.kind !== 'vector') throw new CodegenError('not a Vector');
     const elem = obj.type.elem;
     const key = this.vectorCName(elem);
+    const ec = this.cTypeName(elem);
     const v = obj.code;
     switch (method) {
       case 'push': {
@@ -4858,6 +5246,53 @@ export class Emitter {
         const sep = args.length >= 1 ? this.emitExpr(args[0]).code : '","';
         return { code: `as_vector_${key}_join(${v}, ${sep})`, type: { kind: 'string' } };
       }
+      case 'slice': {
+        const from = args.length >= 1 ? this.convert(this.emitExpr(args[0]), { kind: 'int' }) : '0';
+        const to = args.length >= 2 ? this.convert(this.emitExpr(args[1]), { kind: 'int' }) : `(${v}->length)`;
+        return { code: `as_vector_${key}_slice(${v}, ${from}, ${to})`, type: obj.type };
+      }
+      case 'concat': {
+        if (args.length !== 1) throw new CodegenError('Vector.concat expects 1 argument');
+        const b = this.emitExpr(args[0]);
+        if (b.type.kind !== 'vector') throw new CodegenError('Vector.concat expects a Vector argument');
+        return { code: `as_vector_${key}_concat(${v}, ${b.code})`, type: obj.type };
+      }
+      case 'splice': {
+        const start = args.length >= 1 ? this.convert(this.emitExpr(args[0]), { kind: 'int' }) : '0';
+        const delCount = args.length >= 2 ? this.convert(this.emitExpr(args[1]), { kind: 'int' }) : '0';
+        const rest = args.slice(2);
+        let itemsExpr = 'NULL';
+        if (rest.length > 0) {
+          const items = rest.map((e) => this.convert(this.emitExpr(e), elem));
+          itemsExpr = `(${ec}[${rest.length}]){ ${items.join(', ')} }`;
+        }
+        return { code: `as_vector_${key}_splice(${v}, ${start}, ${delCount}, ${itemsExpr}, ${rest.length})`, type: obj.type };
+      }
+      case 'forEach': {
+        if (args.length !== 1) throw new CodegenError('Vector.forEach expects 1 argument');
+        const cb = this.emitExpr(args[0]);
+        if (cb.type.kind !== 'function') throw new CodegenError('Vector.forEach expects a Function argument');
+        return { code: `as_vector_${key}_forEach(${v}, ${cb.code})`, type: { kind: 'void' } };
+      }
+      case 'map': {
+        if (args.length !== 1) throw new CodegenError('Vector.map expects 1 argument');
+        const cb = this.emitExpr(args[0]);
+        if (cb.type.kind !== 'function') throw new CodegenError('Vector.map expects a Function argument');
+        return { code: `as_vector_${key}_map(${v}, ${cb.code})`, type: obj.type };
+      }
+      case 'filter': {
+        if (args.length !== 1) throw new CodegenError('Vector.filter expects 1 argument');
+        const cb = this.emitExpr(args[0]);
+        if (cb.type.kind !== 'function') throw new CodegenError('Vector.filter expects a Function argument');
+        return { code: `as_vector_${key}_filter(${v}, ${cb.code})`, type: obj.type };
+      }
+      case 'sort': {
+        const cb = args.length >= 1 ? this.emitExpr(args[0]) : null;
+        if (cb && cb.type.kind !== 'function') throw new CodegenError('Vector.sort expects a Function argument');
+        return { code: `as_vector_${key}_sort(${v}, ${cb ? cb.code : 'NULL'})`, type: obj.type };
+      }
+      case 'reverse':
+        return { code: `as_vector_${key}_reverse(${v})`, type: obj.type };
       default:
         throw new CodegenError(`unsupported Vector method '${method}'`);
     }
@@ -5204,6 +5639,19 @@ export class Emitter {
       case 'hasAudio': return { code: 'true', type: { kind: 'bool' } };
       default:
         throw new CodegenError(`unknown Capabilities constant '${name}'`);
+    }
+  }
+
+  // flash.filesystem.File static directory shortcuts, resolved at runtime from the
+  // process environment. Returns null for a non-directory member so the caller
+  // falls through to ordinary static-field resolution.
+  private emitFileStaticDir(name: string): { code: string; type: CType } | null {
+    switch (name) {
+      case 'applicationDirectory': return { code: 'File_new(as_app_dir())', type: { kind: 'object', className: 'File' } };
+      case 'desktopDirectory': return { code: 'File_new(as_desktop_dir())', type: { kind: 'object', className: 'File' } };
+      case 'documentsDirectory': return { code: 'File_new(as_documents_dir())', type: { kind: 'object', className: 'File' } };
+      case 'userDirectory': return { code: 'File_new(as_user_dir())', type: { kind: 'object', className: 'File' } };
+      default: return null;
     }
   }
 
@@ -5728,6 +6176,25 @@ export class Emitter {
     return {
       code: `as_array_make(${n}, (as_value[${n}]){ ${items.join(', ')} })`,
       type: { kind: 'array' },
+    };
+  }
+
+  // `new <T>[...]` builds a monomorphized Vector.<T> from an element literal.
+  // Elements are converted to the element C type (no boxing — the Vector holds
+  // raw typed values), then handed to the per-specialization make helper.
+  private emitVectorLit(expr: Extract<Expr, { kind: 'VectorLit' }>): { code: string; type: CType } {
+    const vt = resolveType(`Vector.<${expr.elem}>`);
+    if (vt.kind !== 'vector') throw new CodegenError('invalid Vector literal element type');
+    const key = this.vectorCName(vt.elem);
+    const ec = this.cTypeName(vt.elem);
+    if (expr.elements.length === 0) {
+      return { code: `as_vector_${key}_new()`, type: vt };
+    }
+    const n = expr.elements.length;
+    const items = expr.elements.map((e) => this.convert(this.emitExpr(e), vt.elem));
+    return {
+      code: `as_vector_${key}_make(${n}, (${ec}[${n}]){ ${items.join(', ')} })`,
+      type: vt,
     };
   }
 

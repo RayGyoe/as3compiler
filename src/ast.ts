@@ -85,6 +85,7 @@ export type Expr =
   | { kind: 'New'; className: string; args: Expr[] }
   | { kind: 'NewDynamic'; classExpr: Expr; args: Expr[] }
   | { kind: 'ArrayLit'; elements: Expr[] }
+  | { kind: 'VectorLit'; elem: ASType; elements: Expr[] }
   | { kind: 'Index'; object: Expr; index: Expr }
   | { kind: 'ObjectLit'; fields: { name: string; value: Expr }[] }
   | { kind: 'FunctionExpr'; params: Param[]; returnType: ASType; body: Block }

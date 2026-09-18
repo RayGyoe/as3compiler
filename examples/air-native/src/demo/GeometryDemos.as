@@ -3,12 +3,24 @@ package demo {
   import flash.geom.Rectangle;
   import flash.geom.Matrix;
   import flash.geom.ColorTransform;
+  import flash.geom.Transform;
+  import flash.display.Shape;
+  import flash.display.Sprite;
+  import flash.display.Stage;
+  import flash.text.TextField;
+  import flash.text.TextFormat;
 
   /**
    * Stage 58 — flash.geom 2D value/reference types.
    * Verifies Point / Rectangle / Matrix / ColorTransform / Transform against
    * the AS3 semantics implemented by as-aot (reference types, add/subtract
    * return new objects while offset/normalize mutate `this`).
+   *
+   * DisplayObject.transform is verified here too: the transform holder is read
+   * from a DisplayObject (never `new Transform()`, which real AIR forbids), the
+   * Matrix is mutated via the portable get→mutate→set-back pattern (AIR's
+   * Transform.matrix getter returns a copy), and the composed matrix is applied
+   * to the Skia canvas on render.
    */
   public class GeometryDemos {
     public static function run():void {
@@ -120,7 +132,97 @@ package demo {
       cta.concat(ctb);
       Assert.check(Assert.near(cta.redMultiplier, 2) && Assert.near(cta.redOffset, 20), "ColorTransform.concat");
 
+      // --- DisplayObject.transform ---
+      // The holder is obtained from a DisplayObject; real AIR forbids `new
+      // Transform()`, so this keeps the demo compiling under both mxmlc and as-aot.
+      var sp:Shape = new Shape();
+      sp.graphics.beginFill(0x00CC00, 1.0);
+      sp.graphics.drawRect(0, 0, 50, 50);
+      sp.graphics.endFill();
+      Assert.check(sp.transform != null && sp.transform is Transform, "DisplayObject.transform non-null Transform");
+
+      // Identity default: a unit matrix held in the transform.
+      var idm:Matrix = sp.transform.matrix;
+      Assert.check(Assert.near(idm.a, 1) && Assert.near(idm.d, 1) && Assert.near(idm.tx, 0) && Assert.near(idm.ty, 0), "transform.matrix identity default");
+
+      // Portable mutation: AIR's Transform.matrix getter returns a copy, so the
+      // canonical way to change the transform is get → mutate → set back. as-aot
+      // stores the same Matrix reference, so this pattern is equivalent on both.
+      var trm:Matrix = sp.transform.matrix;
+      trm.translate(30, 40);
+      sp.transform.matrix = trm;
+      var readBack:Matrix = sp.transform.matrix;
+      Assert.check(Assert.near(readBack.tx, 30) && Assert.near(readBack.ty, 40), "transform.matrix translate read-back");
+
+      var scm:Matrix = sp.transform.matrix;
+      scm.scale(2, 2);
+      sp.transform.matrix = scm;
+      readBack = sp.transform.matrix;
+      Assert.check(Assert.near(readBack.a, 2) && Assert.near(readBack.d, 2), "transform.matrix scale read-back");
+
+      // colorTransform is also held (identity multipliers, zero offsets).
+      Assert.check(sp.transform.colorTransform != null, "transform.colorTransform non-null");
+
       Log.out("GeometryDemos: all flash.geom assertions passed");
+    }
+
+    /**
+     * Visual check: four filled squares, each driven by a different
+     * DisplayObject.transform.matrix. The matrix is composed after the built-in
+     * x/y/rotation/scale so both adl (Flash renderer) and as-aot (Skia canvas
+     * concat) rasterize the identical affine transform.
+     */
+    public static function visualize(stage:Stage):void {
+      var holder:Sprite = new Sprite();
+      holder.x = 560;
+      holder.y = 460;
+
+      addLabel(holder, "identity", 0);
+      holder.addChild(transformBox(0x999999, 0));
+
+      addLabel(holder, "rotate(30deg)", 90);
+      var rot:Shape = transformBox(0xFF3366, 90);
+      var rm:Matrix = rot.transform.matrix;
+      rm.rotate(30 * Math.PI / 180);
+      rot.transform.matrix = rm;
+      holder.addChild(rot);
+
+      addLabel(holder, "scale(1.6,1.6)", 180);
+      var sc:Shape = transformBox(0x33CC66, 180);
+      var sm:Matrix = sc.transform.matrix;
+      sm.scale(1.6, 1.6);
+      sc.transform.matrix = sm;
+      holder.addChild(sc);
+
+      addLabel(holder, "skew(0.4,0)", 270);
+      var sk:Shape = transformBox(0x3366FF, 270);
+      var km:Matrix = sk.transform.matrix;
+      km.c = 0.4;
+      sk.transform.matrix = km;
+      holder.addChild(sk);
+
+      stage.addChild(holder);
+    }
+
+    private static function transformBox(color:uint, x:Number):Shape {
+      var s:Shape = new Shape();
+      s.graphics.beginFill(color);
+      s.graphics.drawRect(0, 0, 44, 44);
+      s.graphics.endFill();
+      s.x = x;
+      s.y = 18;
+      return s;
+    }
+
+    private static function addLabel(holder:Sprite, text:String, x:Number):void {
+      var t:TextField = new TextField();
+      t.defaultTextFormat = new TextFormat("_sans", 9, 0x666666);
+      t.text = text;
+      t.x = x;
+      t.y = 0;
+      t.width = 90;
+      t.height = 16;
+      holder.addChild(t);
     }
   }
 }

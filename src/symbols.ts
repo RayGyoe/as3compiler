@@ -51,6 +51,10 @@ export interface ClassInfo {
   constructor: ConstructorInfo;
   superClass: string | null;
   isFinal: boolean;
+  // Dynamic class: instances may gain arbitrary string-keyed properties at
+  // runtime (AS3 `dynamic class`). The struct gets an extra `as_object* _dyn`
+  // slot table and undeclared member access routes through as_dyn_get/set.
+  isDynamic?: boolean;
   implements: string[];
   packageName: string | null;
 }
@@ -398,6 +402,7 @@ export class SymbolTable {
         ['scaleX', dof({ kind: 'number' })],
         ['scaleY', dof({ kind: 'number' })],
         ['filters', dof({ kind: 'array' })],
+        ['transform', dof({ kind: 'object', className: 'Transform' })],
       ]),
       methods: new Map(),
       staticFields: new Map(),
@@ -745,6 +750,26 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // URLVariables: a dynamic class (AS3 `dynamic class URLVariables extends
+    // Object`). Arbitrary string-keyed properties are stored in a runtime
+    // `as_object* _dyn` slot table (see the dynamic-class mechanism: isDynamic
+    // + vtable dyn_offset + as_dyn_get/set fallback), and toString() serializes
+    // them as a URL-encoded query string (key=value&...).
+    this.classMap.set('URLVariables', {
+      fields: new Map(),
+      methods: new Map([
+        ['toString', { returnType: { kind: 'string' }, params: [], owner: 'URLVariables', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [{ name: 'source', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }] },
+      superClass: 'Object',
+      isFinal: false,
+      isDynamic: true,
+      implements: [],
+    });
     // Keyboard: a class of static key-code constants (uint, matching AIR's Keyboard
     // constants) plus a read-only isAccessible flag. Only a representative subset of
     // the full AIR key-code table is mapped.
@@ -848,6 +873,10 @@ export class SymbolTable {
       ]),
       methods: new Map([
         ['open', fsmeth({ kind: 'void' }, [
+          { name: 'file', type: 'File', defaultValue: null, isRest: false },
+          { name: 'fileMode', type: 'String', defaultValue: null, isRest: false },
+        ])],
+        ['openAsync', fsmeth({ kind: 'void' }, [
           { name: 'file', type: 'File', defaultValue: null, isRest: false },
           { name: 'fileMode', type: 'String', defaultValue: null, isRest: false },
         ])],

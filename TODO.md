@@ -6,7 +6,7 @@
 
 ---
 
-## 当前状态（v0.3.68）
+## 当前状态（v0.3.70）
 
 已实现 AS3 可用子集（面向对象基础 + 数据与迭代 + 标准库 + 接口与类型系统 + 函数进阶 + 包/模块语法兼容 + 异常处理 + 完善与打磨已全部完成）：
 
@@ -36,6 +36,8 @@
 > 依据对 [Ruffle](https://github.com/ruffle-rs/ruffle)（Adobe Flash 开源重实现，其 AS3/AVM2 事件与显示列表实现为社区公认最忠实）的评估，排除 Flash 运行时后的下一块大缺口是 **GUI 与事件系统**（`flash.events.*` 事件流 / `flash.display.*` 显示列表 / 交互命中测试）。Ruffle **不可移植、不可链接**（Rust + `gc_arena` 分代 GC + `Gc<'gc>` 生命周期，C 无对应物），但作为**语义权威参照**价值极高——故新增**阶段三十三~三十五**（v0.3.33 → v0.3.35，**已完成**），把 Ruffle 的事件流算法翻译为 C 运行时助手（`RUNTIME_PREAMBLE` 内、`as_` 前缀），渲染仍按阶段二十九走 skia/cairo 链接。语义对照与映射草案见 [`docs/zh-cn/as3-docs/mapping.md`](docs/zh-cn/as3-docs/mapping.md)，上游源码快照见同目录 `events.rs` / `interactive.rs` / `avm2_events.rs` / `event_object.rs`。
 >
 > 渲染后端（`flash.display.*` 的真实光栅化）另做专项调研，见 [`docs/zh-cn/skia.md`](docs/zh-cn/skia.md)：Skia 定位为**纯光栅化后端**（管「画」），与事件/视图系统（管「谁在上面、谁先响应」）**正交**，二者经 `DisplayObject.render()` 汇聚；Skia 是 C++20 库、**无 C API**，需 C++ 胶水层（`skia_glue.cc`，`extern "C"`）桥接生成的 `.c`。据此新增**阶段三十六~三十八**（v0.3.36 → v0.3.38，**代码层已完成**）：Skia 胶水层 + 构建集成 → `Shape`/`Bitmap` 渲染落地 → `TextField` 文本排版。
+>
+> 纯 AS 项目把图片等资源打进 **SWC**（ZIP 归档），原图不可得时需解析 SWC 提取资源显示 UI。专项调研见 [`docs/zh-cn/swc.md`](docs/zh-cn/swc.md)：SWC 资源**不在 ZIP 顶层**，而是嵌在 `library.swf`（CWS）里以 SWF tag 存放（位图 → `DefineBitsLossless2`/`DefineBitsJPEG2`，经 `SymbolClass` 映射到 `BitmapData` 子类）；「解析 SWC 拿资源」= ZIP 解包 → 解压 SWF → 扫描 tag → 提取像素/JPEG 字节，**编译期**（Node 侧零依赖）完成并嵌入产物，运行时解码复用 Skia。**暂缓开发，后续由用户决定是否实现**（草案见「遗留待开发」表 SWC 资源提取项）。
 >
 > 在离屏 PNG 渲染闭环（阶段三十六~三十八）跑通后，新增**阶段三十九**（v0.3.40）：**SDL2 窗口化后端**——
 > `Stage.showWindow(width, height, title)` 把离屏 Skia surface 的像素经 `vendor/window_glue.cc` 上屏到 arm64 SDL2 窗口
@@ -308,8 +310,8 @@ AS3 的类型安全数组 `Vector`，比 `Array` 更强（元素类型固定、�
 补齐 as3-gaps.md §3.3 的 P1 功能缺失。
 
 - [x] **`join` / `indexOf`**、`.length` 赋值（收缩/增长填充默认值）：新增 `as_vector_<T>_join`/`_indexOf`/`_setLength` 单态化助手
-- [x] **`new Vector.<T>(length, fixed)`** 带参构造：新增 `_new_sized`；字面量 `new <T>[...]` 仍延后（README 未列入）
-- [ ] （后续）`splice / slice / concat / forEach / sort / filter / map`
+- [x] **`new Vector.<T>(length, fixed)`** 带参构造：新增 `_new_sized`
+- [x] **字面量 `new <T>[...]`** 与 **`splice` / `slice` / `concat` / `forEach` / `sort` / `filter` / `map` / `reverse`**：阶段六十六（v0.3.69）补齐（`examples/stage66.as`）
 
 **验收**：`v.join(",")`、`v.indexOf(x)`、`v.length = n` 收缩正确，`new Vector.<int>(3, true)` 构造可用。✅（`examples/stage17.as`）
 
@@ -1323,6 +1325,8 @@ TweenDemo: tween complete, box.x=532.7..., box.y=148.89...
 | **P3** | 六十三 ✅ | `flash.net`/`flash.media`/`flash.ui`（URLLoader/URLRequest/Socket/Sound/Video/Keyboard/Mouse） | 异步 + 外部资源/设备，重活且独立 |
 | **P3** | 六十四 ✅ | `air.*`（Window/File/FileStream/NativeWindow/SQLConnection） | 最大命名空间，完全独立于 Flash 运行时 |
 | **P1** | 六十五 ✅ | `flash.system.Capabilities`（version/os/cpuArchitecture/… 环境能力查询） | 纯静态只读类，与 `System` 同范式；`version` 编译期注入 package.json 版本，os/cpu 走条件编译，屏幕/locale 走轻量平台探测 |
+| **P1** | 六十六 ✅ | `Vector.<T>` 高阶/序列方法（slice/concat/splice/forEach/map/filter/sort/reverse）+ 字面量 `new <T>[...]` + 闭包 env/`as_vector` 迁 GC | 补齐 Vector 与 Array 方法对等、GC 遗留 malloc 收尾；回调复用 as_value 装箱/解箱路径 |
+| **P1** | 六十七 ✅ | 三子系统 deferred 收尾（动态类建模/异步事件调度/`DisplayObject.transform` 接线） | 动态类机制落地 `URLVariables`；无网络后端用 `setTimeout(0)` 模拟异步 IO；`transform` 接线到 Skia canvas |
 
 ---
 
@@ -1371,7 +1375,7 @@ GC-4 增量标记的完整落地设计（三色状态机 + 显式灰栈 + Dijkst
 - **迁移分配点**：`as_array_*`/`as_fn_make`/`as_object_*`/`as_dict_*`/`as_str_*` 的 `as_alloc`/`malloc` → `gc_alloc`；
   emit 里所有 `(Type*)malloc(sizeof(Type))` 类实例 factory → `gc_alloc(GCT_CLASS, ...)`；字符串 GC-2 起走
   `as_str_alloc()`（`gc_alloc(GCT_STRING, n)`）。仅剩字节缓冲（`ByteArray` grow/compress/uncompress、`BitmapData.pixels`）
-  与 `as_vector`/闭包 env 等少量散落 malloc 暂未迁移。
+  （闭包 env 与 `as_vector` 已于 v0.3.69 迁入 GC，见阶段六十六）。
 - **GC-4 增量标记**：`gc_inc` 三色状态机（IDLE/MARK/SWEEP）+ 显式灰栈（`grey`/`grey_top`/`grey_cap`，非递归）+ 每帧预算
   `gc_inc.budget=500`；`gc_step()` 每帧推进固定预算的 mark/sweep 切片，单帧停顿 O(budget)。Dijkstra 写屏障
   `gc_write_barrier`/`gc_write_barrier_value`（仅 MARK 期生效，灰化白引用）注入点：setter（`as_array_set`/`as_array_push`/
@@ -1426,7 +1430,7 @@ DisplacementMapFilter / NativeWindow / Matrix / Rectangle 都使用 Point 对象
 - [x] **Rectangle**：`x`/`y`/`width`/`height`；只读 `top`/`bottom`/`left`/`right` getter；`intersection`/`union`/`contains`/`containsPoint`/`containsRect`/`intersects`/`equals`/`inflate`/`offset`/`clone`/`setEmpty`/`isEmpty`/`toString`
 - [x] **Matrix**：`a`/`b`/`c`/`d`/`tx`/`ty` 六 Number 字段 + `identity`/`translate`/`scale`/`rotate`/`concat`/`invert`/`transformPoint`/`deltaTransformPoint`/`createBox`/`createGradientBox`
 - [x] **ColorTransform**：`redMultiplier`/`greenMultiplier`/`blueMultiplier`/`alphaMultiplier`（默认 1）/`redOffset`/`greenOffset`/`blueOffset`/`alphaOffset`（默认 0）+ `concat`
-- [x] **Transform**：访问 `colorTransform`/`matrix`（持恒等 Matrix/ColorTransform）；`DisplayObject.transform` 接线（Matrix 作用于 Skia canvas 变换）留待后续阶段
+- [x] **Transform**：访问 `colorTransform`/`matrix`（持恒等 Matrix/ColorTransform）；`DisplayObject.transform` 接线（Matrix 作用于 Skia canvas 变换）于**阶段六十七**落地（`sk_canvas_concat`）
 
 **语义红线（AS3 vs C）**：这些是**引用类型**（`new Point()` 返回对象引用），C 侧用 struct + 指针；
 `add`/`subtract` 返回新对象不修改 this（与 `offset`/`normalize` 的原地修改区分）；`interpolate` 的 `f` 越接近 1 越靠近 `pt1`
@@ -1500,26 +1504,25 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 **依据**：异步网络/音视频/键盘鼠标状态查询，独立于几何/事件基础，重活。
 
-- [x] `flash.net`：**URLLoader**（`load()`/`data`/`close`，同步本地文件读取，成功派发 COMPLETE、失败派发 IOErrorEvent.IO_ERROR）、**URLRequest**（`url`/`method`/`data`/`contentType`）
+- [x] `flash.net`：**URLLoader**（`load()`/`data`/`close`，异步本地文件读取（COMPLETE/IO_ERROR 下一帧 tick），`data` 为 GC 跟踪字符串）、**URLVariables**（`dynamic class`，未声明字符串键属性 + `toString()` 序列化）、**URLRequest**（`url`/`method`/`data`/`contentType`）
 - [ ] `flash.media`：**Sound**（`load`/`play`，依赖后端解码）、**SoundChannel**、**Video**（延后：音频/视频解码后端）
 - [x] `flash.ui`：**Keyboard**（键码常量子集 + `isAccessible`）、**Mouse**（静态 `hide`/`show` + 只读 `cursor`/`supportsCursor`/`supportsNativeCursor`）
 
-**验收**：`examples/stage63.as`（离屏）断言 `URLRequest` 值束与默认 `method`、`URLLoader` 同步读文件成功/失败两路事件、`Keyboard` 键码常量与 `isAccessible`、`Mouse` 静态方法。✅（69 passed / 0 failed；
-`URLVariables`/`Socket`、`Sound`/`SoundChannel`/`Video`、`ContextMenu` 延后（依赖动态属性建模/网络套接字/音视频解码/原生菜单后端），
-`URLLoader` 为同步本地文件读（非异步 HTTP），`data` 为 `malloc` 非 GC 跟踪，README 已注明）
+**验收**：`examples/stage63.as`（离屏）断言 `URLRequest` 值束与默认 `method`、`URLLoader` 异步读文件成功/失败两路事件（`tickTimers()` 泵）、`URLVariables` 动态属性 + `toString()`、`Keyboard` 键码常量与 `isAccessible`、`Mouse` 静态方法。✅（73 passed / 0 failed；
+`Socket`、`Sound`/`SoundChannel`/`Video`、`ContextMenu` 延后（依赖网络套接字/音视频解码/原生菜单后端），
+`URLLoader` 为异步本地文件读（`as_set_timeout(0)` 模拟异步，非真实 HTTP），README 已注明）
 
 #### 阶段六十四：`air.*` 桌面运行时（目标 v0.3.64 → v0.3.65）【P3】✅ 已完成
 
 **依据**：AIR 是 Flash 之外最大的独立命名空间，完全独立于显示/事件体系，重活且工作量大，排最后。
 
 - [ ] **Window**/**NativeWindow**（对应 `window_glue.cc` 的多窗口/原生窗口管理，延后：原生多窗口与 Stage/SDL2 单窗口模型重叠）
-- [x] **File**/**FileStream**（`open`/`read`/`write`，POSIX 文件 IO；异步版本派发 ProgressEvent 未实现）/ **FileMode**（常量）
+- [x] **File**/**FileStream**（`open`/`openAsync`（异步 PROGRESS+COMPLETE）/`read`/`write`，POSIX 文件 IO；静态目录 `applicationDirectory`/`desktopDirectory`/`documentsDirectory`/`userDirectory`）/ **FileMode**（常量）
 - [ ] **SQLConnection**/**SQLStatement**（依赖 SQLite 链接，延后）
 
-**验收**：`examples/stage64.as`（离屏）断言 `File` 路径束与 `exists`/`isDirectory`/`resolvePath`/`createDirectory`/`deleteFile`/`deleteDirectory`、
-`FileStream` `open`/`close`/`readUTFBytes`/`writeUTFBytes` 读写回环与只读 `position`/`bytesAvailable`、`FileMode` 常量。✅（70 passed / 0 failed；
-`NativeWindow`/`Window` 与 `SQLConnection`/`SQLStatement` 延后（原生多窗口管理/SQLite 链接），`FileStream` 为同步 POSIX IO（无异步 ProgressEvent），
-`File` 静态目录（`applicationDirectory` 等）未建模，README 已注明）
+**验收**：`examples/stage64.as`（离屏）断言 `File` 路径束与 `exists`/`isDirectory`/`resolvePath`/`createDirectory`/`deleteFile`/`deleteDirectory` + 静态目录、
+`FileStream` `open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` 读写回环与只读 `position`/`bytesAvailable`、`FileMode` 常量。✅（73 passed / 0 failed；
+`NativeWindow`/`Window` 与 `SQLConnection`/`SQLStatement` 延后（原生多窗口管理/SQLite 链接），README 已注明）
 
 #### 阶段六十五：`flash.system.Capabilities` 环境能力查询（目标 v0.3.67 → v0.3.68）【P1】✅ 已完成
 
@@ -1579,12 +1582,39 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 `hasMP3`/`hasTLS`/`hasVideoEncoder`/`maxLevelIDC`/`hasAccessibility`/`hasIME` 等）与 `hasMultiChannelAudio(type)` 方法延后（依赖后端/动态数组）。
 全量回归 **72 passed / 0 failed**，`--target wasm --dry` 编译命令正确。
 
+#### 阶段六十六：`Vector.<T>` 高阶/序列方法补齐 + GC 遗留 malloc 收尾（目标 v0.3.68 → v0.3.69）【P1】✅ 已完成
+
+- [x] **`Vector.<T>` 方法补齐**：`slice`/`concat`/`splice`/`forEach`/`map`/`filter`/`sort`/`reverse`（此前仅 `push`/`pop`/`join`/`indexOf`/`.length`），对齐 Array 已有高阶方法；回调复用 `as_value` 装箱/解箱路径，`(element, index, vector)` 三参布局与 Array 一致；`sort` 默认数值排序（int/uint/Number/Boolean）或字符串排序（String），object/interface 回退 `as_obj_to_str` 字符串比较，亦可传自定义比较函数
+- [x] **`Vector.<T>` 字面量 `new <T>[...]`**：新增 AST `VectorLit` 节点 + `parseNew` 的 `<` 分支 + `emitVectorLit`，去糖为 `as_vector_<key>_make(n, items)` 单态化助手（`new <T>[]` 空字面量 → `_new()`）
+- [x] **`as_vector` 迁 GC**：单态化 struct 加 `void (*mark)(void*)` 回调首字段，`gc_alloc(GCT_CUSTOM, ...)` 分配；引用元素（string/object/interface）data 用 `GCT_PTR_ARRAY`（GC 扫描子指针 + 写屏障），标量元素 data 仍 `realloc`（无指针）；新增 `GCT_CUSTOM` tag，`gc_scan` 经回调分派标记
+- [x] **闭包 env 迁 GC**：`env_make` 从 `malloc` 改 `gc_alloc(GCT_CUSTOM, ...)`，按捕获字段 CType 生成 mark 回调（raw 指针 → `gc_mark_ptr`、boxed `as_value` → `gc_mark_value`、标量跳过），修复闭包逃逸后捕获对象/字符串被 GC 误收的悬空隐患
+- **验收**：`examples/stage66.as` 断言式回归；全量回归 **73 passed / 0 failed**
+
+---
+
+#### 阶段六十七：三子系统 deferred 项收尾（动态类建模 + 异步 IO + transform 接线）（目标 v0.3.69 → v0.3.70）【P1】✅ 已完成
+
+**依据**：阶段五十八/六十三/六十四各遗留一项依赖“更基础设施”的延后项，现补足：
+动态类建模（URLVariables 需要）、无网络后端的异步事件调度（URLLoader/Loader/FileStream 需要）、
+显示对象 transform 接线（DisplayObject.transform 需要）。
+
+- [x] **通用动态类机制（`dynamic class`）**：`ClassInfo.isDynamic` 标志 + 动态类 struct 尾部 `as_object* _dyn` 槽表；`as_vtable_header` 新增第 6 字段 `int dyn_offset`（非动态为 -1，动态类经 `offsetof` 记录 `_dyn` 字节偏移）；`as_dyn_get`/`as_dyn_set` 在 super 链 props 未命中后回退 `_dyn` 槽表；`gc_scan` 的 GCT_CLASS 分支额外标记 `_dyn` 指针；emit.ts 成员读写对动态类未声明属性路由到 `as_dyn_set`/`as_dyn_get`
+- [x] **`URLVariables`**：注册为 `extends Object` 的 `dynamic class`，ctor 参数 `source` 可空（解析 `k=v&...` 到 `_dyn`）；`toString()` 把 `_dyn` 序列化为 query string（`as_url_encode`/`as_url_decode` 运行时助手）
+- [x] **异步事件调度（无网络后端）**：`URLLoader.load`/`Loader.load`/`FileStream.openAsync` 改用 `as_set_timeout(as_fn_make(thunk, obj), 0.0)` 把 COMPLETE/IO_ERROR/INIT/PROGRESS 延迟到下一帧 tick——`load()` 返回后注册的监听器仍能收到事件；`data`/`readUTFBytes` 由 `malloc` 改 `as_str_alloc`（GC 跟踪）
+- [x] **`File` 静态目录**：emitMember 特殊分支（仿 Capabilities 模式）+ `getenv("HOME")` 运行时 helper，落地 `applicationDirectory`（CWD `"."`）/`userDirectory`/`desktopDirectory`/`documentsDirectory`
+- [x] **`DisplayObject.transform` 接线**：`DisplayObject` 加 `transform` 字段（`Transform*`，ctor 初始化 + 写屏障），`as_render_object` 在 translate/rotate/scale 后调用新增 `sk_canvas_concat`（`SkMatrix::setAll(a,c,tx,b,d,ty,0,0,1)` + `concat`），Matrix 真正作用于 Skia canvas 变换
+
+**验收**：`examples/stage58.as`/`stage62.as`/`stage63.as`/`stage64.as` 更新断言（transform 矩阵读回与渲染、Loader/URLLoader 异步 `tickTimers()` 泵、URLVariables 动态属性 + 序列化、File 静态目录 + FileStream `openAsync`）；全量回归 **73 passed / 0 failed**
+
+---
+
 ### 遗留待开发
 
 | 遗留项 | 说明 | 建议 |
 |--------|------|------|
-| 字符串 arena 泄漏 | ✅ 已解决（GC-2）：字符串拼接/转换/`split`/`substring` 已迁入 `gc_alloc(GCT_STRING, ...)`，`gc_strings.as` 验证回收归零 | 仅剩字节缓冲（`ByteArray` grow/compress/uncompress、`BitmapData.pixels`）与 `as_vector`/闭包 env 等散落 malloc 待迁（见 [`docs/zh-cn/gc.md`](docs/zh-cn/gc.md)） |
+| 字符串 arena 泄漏 | ✅ 已解决（GC-2）：字符串拼接/转换/`split`/`substring` 已迁入 `gc_alloc(GCT_STRING, ...)`，`gc_strings.as` 验证回收归零 | 仅剩字节缓冲（`ByteArray` grow/compress/uncompress、`BitmapData.pixels`）待迁（见 [`docs/zh-cn/gc.md`](docs/zh-cn/gc.md)）；`as_vector`/闭包 env 已于 v0.3.69 迁入 GC（阶段六十六） |
 | WASI 运行时验证（GC-3） | ✅ 已完成：native + wasm32-wasip1 双目标回归通过（WASI SDK 34.0 + wasmtime 48.0.2），`reclaimed most`/`bounded`/`intact` 断言全过 | GC 核心纯 C 可移植，平台耦合已用 `#ifdef __wasi__` 隔离（见 [`compile.md`](docs/zh-cn/compile.md) §3.3） |
+| SWC 资源提取 | 已调研（[`docs/zh-cn/swc.md`](docs/zh-cn/swc.md)，基于 `temp/skin.swc` 解包实测）：SWC 资源嵌于 `library.swf`（CWS）的 SWF tag（`DefineBitsLossless2`/`DefineBitsJPEG2` + `SymbolClass` → `BitmapData` 子类），提取链路 = ZIP 解包 → CWS 解压 → tag 扫描 → 像素/JPEG 字节 | **暂缓，后续用户决定再实现**（草案：阶段六十六~六十八 = `src/swc.ts` 提取器 → 资源类注册 + 像素嵌入 → CLI/清单接入） |
 
 ---
 
