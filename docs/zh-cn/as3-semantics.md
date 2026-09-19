@@ -51,7 +51,7 @@ AGENTS.md §2.4 语义红线（已定的硬性决策）
 
 ## 2. AS3 语义决策速查（与红线对照）
 
-以下为 AS3 语义中「必须忠实实现」的高危点，直接对应 AGENTS.md §2.4 红线表（状态截至 v0.3.67）。
+以下为 AS3 语义中「必须忠实实现」的高危点，直接对应 AGENTS.md §2.4 红线表（状态截至 v0.3.77）。
 
 | AS3 语义 | 规范出处 | 我们的红线 | 状态 |
 |---------|---------|-----------|------|
@@ -65,7 +65,7 @@ AGENTS.md §2.4 语义红线（已定的硬性决策）
 | `switch` 仅 `int`/`uint` 原生 fall-through，其余降级 `if/else` | ES4 draft + AS3 参考 | 非整型判别式降级严格相等链 | ✅ 已实现 |
 | 方法闭包**正确绑定 `this`**（提取 `obj.method` 得到永久绑定 `obj` 的闭包） | ES4 draft | `as_fn_make(..., __bound, (void*)obj)` 绑定接收者 | ✅ 已实现（emit.ts 方法值/闭包） |
 | 类默认**密封**（sealed），`dynamic class` 才允许 expando | ES4 draft + AVM2 | 类固定 shape（字段平铺 + vtable） | ✅ 已实现（未支持 `dynamic`） |
-| 数值强制转换：`int↔uint↔Number` 回绕、`Number→int` 截断 | ES4 draft + ECMA-262 §9 | `toInt32Expr`/`toUint32Expr` 对应 AS3 `ToInt32`/`ToUint32` | ✅ 已实现（emit.ts 位运算/强制转换） |
+| 数值强制转换：`int↔uint↔Number` 回绕、`Number→int` 截断；`NaN`/`±Infinity` → 0 | ES4 draft + ECMA-262 §9 | `as_to_int32`/`as_to_uint32` 对应 AS3 `ToInt32`/`ToUint32`（NaN/Inf → 0，避开 C `(int)` 强转 NaN 的 UB） | ✅ 已实现（emit.ts 位运算/强制转换 + runtime.ts 助手） |
 
 ---
 

@@ -68,13 +68,105 @@ const interfaceNames = new Set<string>();
 // short class/interface name -> sanitized fully-qualified name (C identifier).
 const typeAlias = new Map<string, string>();
 
+// Full C reserved-word table: C keywords plus libc/libm/POSIX/stdio/string.h/
+// dirent/sys*/time.h/setjmp symbols that the generated C links against (Skia/
+// SDL2/libc/libm). This is far wider than the C-keyword-only set the emitter
+// previously guarded, so common AS3 identifiers like `index`/`time`/`log`/`data`
+// (frequent variable/field/method names) can no longer collide with library
+// symbols at file scope. See docs/zh-cn/c-naming.md §4.
+export const C_RESERVED = new Set<string>([
+  // C keywords + extensions
+  'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do',
+  'double', 'else', 'enum', 'extern', 'float', 'for', 'goto', 'if', 'inline',
+  'int', 'long', 'register', 'restrict', 'return', 'short', 'signed', 'sizeof',
+  'static', 'struct', 'switch', 'typedef', 'union', 'unsigned', 'void',
+  'volatile', 'while', '_Bool', '_Complex', '_Imaginary', 'asm', 'typeof', 'main',
+  // type names / macros
+  'NULL', 'NAN', 'INFINITY', 'bool', 'true', 'false', 'unix', 'linux',
+  // stdio
+  'stdin', 'stdout', 'stderr', 'FILE', 'EOF', 'printf', 'fprintf', 'putchar',
+  'puts', 'fputs', 'fgetc', 'fputc', 'getc', 'putc', 'getchar', 'scanf', 'sscanf',
+  'fscanf', 'snprintf', 'sprintf', 'vsnprintf', 'vsprintf', 'vprintf', 'vfprintf',
+  'fopen', 'freopen', 'fclose', 'fread', 'fwrite', 'fseek', 'fseeko', 'ftell',
+  'ftello', 'rewind', 'perror', 'tmpfile', 'tmpnam', 'setbuf', 'setvbuf', 'fflush',
+  'ungetc', 'feof', 'ferror', 'clearerr', 'fileno', 'fdopen', 'popen', 'pclose',
+  // stdlib
+  'exit', 'abort', 'atexit', 'getenv', 'calloc', 'malloc', 'realloc', 'free',
+  'memcpy', 'memmove', 'memset', 'strlen', 'memchr', 'memcmp', 'memccpy', 'swab',
+  'random', 'srandom', 'rand', 'srand', 'system', 'abs', 'labs', 'div', 'ldiv',
+  'qsort', 'bsearch', 'atoi', 'atol', 'atof', 'gets', 'remove', 'rename',
+  'strtol', 'strtoul', 'strtoll', 'strtoull', 'strtod', 'strtof', 'strtold',
+  'mblen', 'mbtowc', 'wctomb', 'mbstowcs', 'wcstombs', 'realpath', 'mkstemp',
+  'mkdtemp', 'mktemp', 'setenv', 'unsetenv', 'putenv', 'posix_memalign',
+  'aligned_alloc', 'arc4random', 'valloc', 'alloca',
+  // math / libm
+  'log', 'log2', 'log10', 'log1p', 'pow', 'sqrt', 'cbrt', 'exp', 'exp2', 'expm1',
+  'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2', 'sinh', 'cosh', 'tanh',
+  'fabs', 'floor', 'ceil', 'round', 'trunc', 'fmod', 'hypot', 'remainder',
+  'acosh', 'asinh', 'atanh', 'erf', 'erfc', 'tgamma', 'lgamma', 'fmax', 'fmin',
+  'fma', 'fdim', 'copysign', 'nearbyint', 'rint', 'lrint', 'llrint', 'lround',
+  'llround', 'frexp', 'ldexp', 'modf', 'scalbn', 'scalbln', 'ilogb', 'logb',
+  'nan', 'nanf', 'nextafter', 'nexttoward', 'remquo', 'j0', 'j1', 'jn', 'y0',
+  'y1', 'yn', 'gamma', 'drem', 'finite', 'significand',
+  // unistd / POSIX
+  'fork', 'sleep', 'usleep', 'sync', '_exit', 'pipe', 'dup', 'dup2', 'pause',
+  'alarm', 'getpid', 'getppid', 'open', 'link', 'unlink', 'access', 'kill',
+  'raise', 'read', 'write', 'close', 'signal', 'time', 'lseek', 'chdir', 'fchdir',
+  'getcwd', 'isatty', 'ttyname', 'execv', 'execve', 'execvp', 'execl', 'execlp',
+  'execle', 'getuid', 'geteuid', 'getgid', 'getegid', 'setuid', 'setgid', 'seteuid',
+  'setegid', 'getpgrp', 'setpgid', 'setsid', 'getsid', 'truncate', 'ftruncate',
+  'rmdir', 'chown', 'fchown', 'lchown', 'readlink', 'symlink', 'nice', 'crypt',
+  'encrypt', 'brk', 'sbrk', 'gethostname', 'sethostname', 'getlogin', 'fsync',
+  'fdatasync', 'pread', 'pwrite', 'environ', 'getopt', 'optarg', 'optind', 'opterr',
+  'optopt', 'confstr', 'pathconf', 'fpathconf', 'sysconf', 'chroot', 'vfork',
+  'daemon', 'setgroups', 'getgroups',
+  // string.h / strings.h (legacy BSD aliases)
+  'index', 'rindex', 'bcopy', 'bzero', 'bcmp', 'ffs', 'ffsl', 'ffsll', 'fls',
+  'flsl', 'flsll', 'strcasecmp', 'strncasecmp', 'strcpy', 'strncpy', 'strcat',
+  'strncat', 'strcmp', 'strncmp', 'strchr', 'strrchr', 'strstr', 'strtok', 'strdup',
+  'strndup', 'strerror', 'strspn', 'strcspn', 'strpbrk', 'strcoll', 'strxfrm',
+  'strsep', 'stpcpy', 'stpncpy', 'strnlen', 'strlcpy', 'strlcat',
+  // dirent / sys/mman / sys/stat / sys/wait / signal / setjmp
+  'opendir', 'readdir', 'closedir', 'rewinddir', 'seekdir', 'telldir', 'scandir',
+  'alphasort', 'dirfd', 'fdopendir', 'mmap', 'munmap', 'mprotect', 'madvise',
+  'msync', 'mlock', 'munlock', 'mlockall', 'munlockall', 'mincore', 'shm_open',
+  'shm_unlink', 'stat', 'fstat', 'lstat', 'fstatat', 'chmod', 'fchmod', 'fchmodat',
+  'mkdir', 'mkdirat', 'mkfifo', 'mknod', 'umask', 'futimens', 'utimensat', 'wait',
+  'waitpid', 'wait3', 'wait4', 'sigaction', 'sigaddset', 'sigdelset', 'sigemptyset',
+  'sigfillset', 'sigismember', 'sigprocmask', 'sigsuspend', 'sigpending', 'sigwait',
+  'killpg', 'psignal', 'setjmp', 'longjmp', '_setjmp', '_longjmp', 'sigsetjmp',
+  'siglongjmp', 'errno',
+  // time.h
+  'clock', 'times', 'gmtime', 'localtime', 'mktime', 'ctime', 'asctime', 'strftime',
+  'strptime', 'difftime', 'timegm', 'timelocal', 'tzset', 'daylight', 'timezone',
+  'tzname', 'nanosleep', 'clock_gettime', 'clock_settime', 'clock_getres',
+  'ctime_r', 'asctime_r', 'gmtime_r', 'localtime_r', 'gettimeofday',
+]);
+
+// Sanitize an AS3 identifier into a valid, collision-free C identifier. Prefixes
+// `_` incrementally until the name is neither a C reserved word nor (when a
+// `used` set is supplied) already emitted in this translation unit — Porffor's
+// `exit -> _exit -> __exit` loop. The `used` set (P2) makes distinct AS3 names
+// map to distinct C names even when the reserved table alone would alias them
+// (e.g. `exit` and `_exit` both want `__exit`).
+export function sanitizeCIdent(name: string, used?: Set<string>): string {
+  let out = name;
+  while (C_RESERVED.has(out) || (used !== undefined && used.has(out))) out = '_' + out;
+  if (used !== undefined) used.add(out);
+  return out;
+}
+
 export function sanitizePkg(pkg: string): string {
   return pkg.replace(/\./g, '_');
 }
 
 // Fully-qualified C identifier for a namespaced type: `foo.bar.Baz` -> `foo_bar_Baz`.
+// The result is sanitized so a package-less class named after a libc/libm symbol
+// (e.g. `index`, `log`) cannot collide with the linked libraries. Package-prefixed
+// names (`foo_bar_Baz`) are already collision-free.
 export function qualifiedName(name: string, pkg: string | null): string {
-  return pkg ? `${sanitizePkg(pkg)}_${name}` : name;
+  const base = pkg ? `${sanitizePkg(pkg)}_${name}` : name;
+  return sanitizeCIdent(base);
 }
 
 // Human-readable name for a resolved C type, used in the export manifest so the
@@ -403,6 +495,7 @@ export class SymbolTable {
         ['scaleY', dof({ kind: 'number' })],
         ['filters', dof({ kind: 'array' })],
         ['transform', dof({ kind: 'object', className: 'Transform' })],
+        ['cacheAsBitmap', dof({ kind: 'bool' })],
       ]),
       methods: new Map(),
       staticFields: new Map(),
@@ -411,9 +504,11 @@ export class SymbolTable {
         ['root', dog({ kind: 'object', className: 'DisplayObject' })],
         ['stage', dog({ kind: 'object', className: 'Stage' })],
         ['filters', dog({ kind: 'array' })],
+        ['cacheAsBitmap', dog({ kind: 'bool' })],
       ]),
       setters: new Map([
         ['filters', dos('Array')],
+        ['cacheAsBitmap', dos('Boolean')],
       ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
@@ -829,8 +924,8 @@ export class SymbolTable {
     // "file://" form. exists/isDirectory are read-only *properties* (real AIR:
     // getter access f.exists, not f.exists()) probing via stat(); createDirectory
     // runs mkdir; deleteFile/deleteDirectory run remove(); resolvePath joins a
-    // child. applicationStorageDirectory is a static read-only File for the
-    // writable app-storage location (mapped to the CWD in this subset).
+    // child. applicationStorageDirectory (handled at codegen time like the other
+    // File static directory shortcuts) resolves a writable per-app storage dir.
     const filefld = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'File', isStatic: false, isConst: false });
     const filegetr = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'File', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     const filemeth = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'File', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
@@ -844,9 +939,7 @@ export class SymbolTable {
         ['deleteFile', filemeth({ kind: 'void' }, [])],
         ['deleteDirectory', filemeth({ kind: 'void' }, [])],
       ]),
-      staticFields: new Map([
-        ['applicationStorageDirectory', { type: { kind: 'object', className: 'File' }, init: { kind: 'New', className: 'File', args: [{ kind: 'Str', value: '.' }] }, visibility: 'public', owner: 'File', isStatic: true, isConst: false }],
-      ]),
+      staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map([
         ['url', filegetr({ kind: 'string' })],
@@ -931,6 +1024,7 @@ export class SymbolTable {
     constClass('StageScaleMode', { EXACT_FIT: 'exactFit', SHOW_ALL: 'showAll', NO_BORDER: 'noBorder', NO_SCALE: 'noScale' });
     constClass('StageQuality', { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', BEST: 'best' });
     constClass('StageDisplayState', { NORMAL: 'normal', FULL_SCREEN: 'fullScreen', FULL_SCREEN_INTERACTIVE: 'fullScreenInteractive' });
+    constClass('TextFieldAutoSize', { NONE: 'none', LEFT: 'left', RIGHT: 'right', CENTER: 'center' });
     // built-in mouse/keyboard/focus event types (flash.events). Each extends Event,
     // so the base fields (type/bubbles/cancelable/target/...) are inherited.
     const mef = (t: CType, owner: string): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
@@ -1471,6 +1565,7 @@ export class SymbolTable {
         ['color', tff({ kind: 'uint' }, 'TextFormat')],
         ['bold', tff({ kind: 'bool' }, 'TextFormat')],
         ['italic', tff({ kind: 'bool' }, 'TextFormat')],
+        ['leading', tff({ kind: 'number' }, 'TextFormat')],
       ]),
       methods: new Map(),
       staticFields: new Map(),
@@ -1483,6 +1578,7 @@ export class SymbolTable {
         { name: 'color', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         { name: 'bold', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
         { name: 'italic', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        { name: 'leading', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
       ] },
       superClass: 'Object',
       isFinal: false,
@@ -1500,9 +1596,14 @@ export class SymbolTable {
         ['background', txf({ kind: 'bool' })],
         ['backgroundColor', txf({ kind: 'uint' })],
         ['scrollV', txf({ kind: 'int' })],
+        ['hscroll', txf({ kind: 'bool' })],
+        ['selectable', txf({ kind: 'bool' })],
+        ['autoSize', txf({ kind: 'string' })],
       ]),
       methods: new Map([
         ['appendText', txm({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
+        ['setSelection', txm({ kind: 'void' }, [{ name: 'begin', type: 'int', defaultValue: null, isRest: false }, { name: 'end', type: 'int', defaultValue: null, isRest: false }])],
+        ['setTextFormat', txm({ kind: 'void' }, [{ name: 'format', type: 'TextFormat', defaultValue: null, isRest: false }, { name: 'begin', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false }, { name: 'end', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false }])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1511,13 +1612,23 @@ export class SymbolTable {
         ['textHeight', txg({ kind: 'number' }, 'textHeight')],
         ['maxScrollV', txg({ kind: 'int' }, 'maxScrollV')],
         ['numLines', txg({ kind: 'int' }, 'numLines')],
+        ['maxScrollH', txg({ kind: 'int' }, 'maxScrollH')],
+        ['scrollH', txg({ kind: 'int' }, 'scrollH')],
+        ['selectionBeginIndex', txg({ kind: 'int' }, 'selectionBeginIndex')],
+        ['selectionEndIndex', txg({ kind: 'int' }, 'selectionEndIndex')],
+        ['caretIndex', txg({ kind: 'int' }, 'caretIndex')],
+        ['htmlText', txg({ kind: 'string' }, 'htmlText')],
       ]),
-      setters: new Map(),
+      setters: new Map([
+        ['htmlText', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['scrollH', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'int', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
       constructor: { params: [] },
       superClass: 'InteractiveObject',
       isFinal: false,
       implements: [],
     });
+
     // flash.geom (stage 58): pure 2D value/reference types. Point/Rectangle/
     // Matrix/ColorTransform hold only Number fields (no GC pointers), so their
     // structs are plain `double` bundles. Transform holds Matrix/ColorTransform

@@ -11,6 +11,7 @@ package demo {
   import flash.display.Stage;
   import flash.text.TextField;
   import flash.text.TextFormat;
+  import flash.text.TextFieldAutoSize;
 
   /**
    * Stage 63 — flash.net / flash.ui.
@@ -110,6 +111,8 @@ package demo {
       t.y = 600;
       t.width = 520;
       t.height = 60;
+      //t.autoSize = TextFieldAutoSize.LEFT;
+      t.wordWrap = true;
       t.background = true;
       t.backgroundColor = 0x102030;
       t.defaultTextFormat = new TextFormat("_sans", 11, 0xDDEFFF);

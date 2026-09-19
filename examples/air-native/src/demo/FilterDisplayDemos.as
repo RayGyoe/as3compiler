@@ -144,16 +144,19 @@ package demo {
       addLabel(holder, "BlurFilter(8,8,2)", 140);
       var blur:Shape = makeBox(0xFF3366, 140);
       blur.filters = [new BlurFilter(8, 8, 2)];
+      //blur.cacheAsBitmap = true;
       holder.addChild(blur);
 
       addLabel(holder, "DropShadowFilter", 280);
       var shadow:Shape = makeBox(0x33CC66, 280);
       shadow.filters = [new DropShadowFilter(6, 45, 0x000000, 0.8, 8, 8, 2, 3)];
+      //shadow.cacheAsBitmap = true;
       holder.addChild(shadow);
 
       addLabel(holder, "GlowFilter", 420);
       var glow:Shape = makeBox(0x3366FF, 420);
       glow.filters = [new GlowFilter(0x00FFFF, 0.9, 12, 12, 2, 2)];
+      //glow.cacheAsBitmap = true;
       holder.addChild(glow);
 
       stage.addChild(holder);

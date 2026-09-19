@@ -1,0 +1,364 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00000000000000000000013 /* air-native.c in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000F /* air-native.c */; };
+		A00000000000000000000014 /* skia_glue.cc in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000010 /* skia_glue.cc */; };
+		A00000000000000000000015 /* window_glue.cc in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000011 /* window_glue.cc */; };
+		A00000000000000000000016 /* metal_glue.mm in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000012 /* metal_glue.mm */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A0000000000000000000000F /* air-native.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = "air-native.c"; path = "/Users/ray.lei/Documents/as3compiler-aot/as3compiler/examples/air-native/air-native.c"; sourceTree = "<absolute>"; };
+		A00000000000000000000010 /* skia_glue.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = "skia_glue.cc"; path = "/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia_glue.cc"; sourceTree = "<absolute>"; };
+		A00000000000000000000011 /* window_glue.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = "window_glue.cc"; path = "/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/window_glue.cc"; sourceTree = "<absolute>"; };
+		A00000000000000000000012 /* metal_glue.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = "metal_glue.mm"; path = "/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/metal_glue.mm"; sourceTree = "<absolute>"; };
+		A00000000000000000000008 /* air-native.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "air-native.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A00000000000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A00000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000000F /* air-native.c */,
+				A00000000000000000000010 /* skia_glue.cc */,
+				A00000000000000000000011 /* window_glue.cc */,
+				A00000000000000000000012 /* metal_glue.mm */,
+				A00000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000008 /* air-native.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A00000000000000000000004 /* air-native */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A0000000000000000000000A /* Build configuration list for PBXNativeTarget "air-native" */;
+			buildPhases = (
+				A00000000000000000000005 /* Sources */,
+				A00000000000000000000006 /* Frameworks */,
+				A00000000000000000000007 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = air-native;
+			productName = air-native;
+			productReference = A00000000000000000000008 /* air-native.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A00000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1500;
+			};
+			buildConfigurationList = A00000000000000000000009 /* Build configuration list for PBXProject "air-native" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A00000000000000000000002;
+			productRefGroup = A00000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A00000000000000000000004 /* air-native */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A00000000000000000000007 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A00000000000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000013 /* air-native.c in Sources */,
+				A00000000000000000000014 /* skia_glue.cc in Sources */,
+				A00000000000000000000015 /* window_glue.cc in Sources */,
+				A00000000000000000000016 /* metal_glue.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A0000000000000000000000B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = NO;
+				CLANG_ENABLE_OBJC_ARC = NO;
+				COPY_PHASE_STRIP = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = c99;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		A0000000000000000000000C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = NO;
+				CLANG_ENABLE_OBJC_ARC = NO;
+				COPY_PHASE_STRIP = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = c99;
+				GCC_OPTIMIZATION_LEVEL = s;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		A0000000000000000000000D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CLANG_CXX_LIBRARY = "libc++";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = air-native.xcodeproj/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				GCC_OPTIMIZATION_LEVEL = 2;
+				HEADER_SEARCH_PATHS = (
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia",
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/arm64/include",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia/lib/macos-arm64",
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/arm64/lib",
+				);
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"ASC_USE_SKIA=1",
+					"ASC_USE_WINDOW=1",
+					"ASC_DISPLAY_HIGH=1",
+					"ASC_RENDER_METAL=1",
+				);
+				OTHER_LDFLAGS = (
+					"-lm",
+					"-lz",
+					"-lskia",
+					"-lskparagraph",
+					"-lskshaper",
+					"-lskunicode",
+					"-lskottie",
+					"-lsksg",
+					"-lsvg",
+					"-lskresources",
+					"-lbentleyottmann",
+					"-lskcms",
+					"-lwuffs",
+					"-lpng",
+					"-ljpeg",
+					"-lwebp",
+					"-lwebp_sse41",
+					"-ldng_sdk",
+					"-lpiex",
+					"-lexpat",
+					"-lfreetype2",
+					"-lharfbuzz",
+					"-licu",
+					"-lzlib",
+					"-lz",
+					"-lSDL2",
+					"-lobjc",
+					"-framework",
+					"CoreFoundation",
+					"-framework",
+					"CoreGraphics",
+					"-framework",
+					"CoreText",
+					"-framework",
+					"CoreServices",
+					"-framework",
+					"ApplicationServices",
+					"-framework",
+					"ImageIO",
+					"-framework",
+					"Accelerate",
+					"-framework",
+					"CoreVideo",
+					"-framework",
+					"Cocoa",
+					"-framework",
+					"Carbon",
+					"-framework",
+					"IOKit",
+					"-framework",
+					"Metal",
+					"-framework",
+					"QuartzCore",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.air-native;
+				PRODUCT_NAME = air-native;
+			};
+			name = Debug;
+		};
+		A0000000000000000000000E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CLANG_CXX_LIBRARY = "libc++";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = air-native.xcodeproj/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				GCC_OPTIMIZATION_LEVEL = 2;
+				HEADER_SEARCH_PATHS = (
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia",
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/arm64/include",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia/lib/macos-arm64",
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/arm64/lib",
+				);
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"ASC_USE_SKIA=1",
+					"ASC_USE_WINDOW=1",
+					"ASC_DISPLAY_HIGH=1",
+					"ASC_RENDER_METAL=1",
+				);
+				OTHER_LDFLAGS = (
+					"-lm",
+					"-lz",
+					"-lskia",
+					"-lskparagraph",
+					"-lskshaper",
+					"-lskunicode",
+					"-lskottie",
+					"-lsksg",
+					"-lsvg",
+					"-lskresources",
+					"-lbentleyottmann",
+					"-lskcms",
+					"-lwuffs",
+					"-lpng",
+					"-ljpeg",
+					"-lwebp",
+					"-lwebp_sse41",
+					"-ldng_sdk",
+					"-lpiex",
+					"-lexpat",
+					"-lfreetype2",
+					"-lharfbuzz",
+					"-licu",
+					"-lzlib",
+					"-lz",
+					"-lSDL2",
+					"-lobjc",
+					"-framework",
+					"CoreFoundation",
+					"-framework",
+					"CoreGraphics",
+					"-framework",
+					"CoreText",
+					"-framework",
+					"CoreServices",
+					"-framework",
+					"ApplicationServices",
+					"-framework",
+					"ImageIO",
+					"-framework",
+					"Accelerate",
+					"-framework",
+					"CoreVideo",
+					"-framework",
+					"Cocoa",
+					"-framework",
+					"Carbon",
+					"-framework",
+					"IOKit",
+					"-framework",
+					"Metal",
+					"-framework",
+					"QuartzCore",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.air-native;
+				PRODUCT_NAME = air-native;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A00000000000000000000009 /* Build configuration list for PBXProject "air-native" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A0000000000000000000000B /* Debug */,
+				A0000000000000000000000C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A0000000000000000000000A /* Build configuration list for PBXNativeTarget "air-native" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A0000000000000000000000D /* Debug */,
+				A0000000000000000000000E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A00000000000000000000001 /* Project object */;
+}

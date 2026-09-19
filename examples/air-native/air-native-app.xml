@@ -10,8 +10,17 @@
     <width>1000</width>
     <height>680</height>
     <resizable>true</resizable>
-
-
+    <renderMode>direct</renderMode>
     <requestedDisplayResolution>high</requestedDisplayResolution> 
   </initialWindow>
+  <embedFonts>
+    <font>
+      <fontPath>fonts/MiSans-Regular.ttf</fontPath>
+      <fontName>MiSans</fontName>
+    </font>
+    <font>
+      <fontPath>fonts/Arial.ttf</fontPath>
+      <fontName>Arial</fontName>
+    </font>
+  </embedFonts>
 </application>

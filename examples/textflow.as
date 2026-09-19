@@ -1,10 +1,11 @@
 // textflow.as — TextField line layout: hard breaks, single-line mode, and the
-// scrollV / maxScrollV viewport math (stage 44).
+// scrollV / maxScrollV viewport math (stage 38/44).
 //
-// Assertions are written so they hold in BOTH build flavors: with Skia linked the
-// word wrapper measures real glyph advances, while the pure-C stub measures 0 and
-// therefore never soft-wraps. Everything asserted here depends only on explicit
-// newlines and on line height, so it is stable either way.
+// Assertions are written to hold in BOTH build flavors. With Skia linked the
+// line height is the font's real ascent+descent (via SkParagraph); the pure-C
+// stub falls back to size * 1.2. Every assertion below depends only on hard
+// newlines and on the *relationship* lineHeight = textHeight / numLines, which
+// is stable either way.
 
 var tf:TextField = new TextField();
 tf.multiline = true;
@@ -28,16 +29,27 @@ if (tf.numLines != 1) throw new Error("single-line field must not break, got " +
 tf.multiline = true;
 
 // --- viewport math -----------------------------------------------------------
-// Line height is 1.2 * size = 14.4, so a 60px-tall field shows 4 lines.
+// 10 hard-wrapped lines in a 60px-tall field: only part is visible. The line
+// height is derived at runtime as textHeight / numLines (single style, no
+// leading), so the math holds whether Skia measures the real font or the
+// pure-C stub approximates size * 1.2.
 tf.text = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
 if (tf.numLines != 10) throw new Error("expected 10 lines, got " + tf.numLines);
-// maxScrollV is the top line that still fills the viewport: 10 - 4 + 1 = 7.
-if (tf.maxScrollV != 7) throw new Error("expected maxScrollV 7, got " + tf.maxScrollV);
+
+var lineHeight:Number = tf.textHeight / tf.numLines;
+var visible:int = int(tf.height / lineHeight);
+if (visible < 1) visible = 1;
+var expectedMax:int = 10 - visible + 1;
+if (tf.maxScrollV != expectedMax) {
+  throw new Error("expected maxScrollV " + expectedMax + ", got " + tf.maxScrollV);
+}
 
 // Setting scrollV = maxScrollV is the log-tailing idiom: the newest line lands at
 // the BOTTOM of the box rather than being scrolled up to the top.
 tf.scrollV = tf.maxScrollV;
-if (tf.scrollV != 7) throw new Error("scrollV should stick to 7, got " + tf.scrollV);
+if (tf.scrollV != expectedMax) {
+  throw new Error("scrollV should stick to " + expectedMax + ", got " + tf.scrollV);
+}
 
 // A field that fits its content cannot scroll at all.
 tf.height = 400;
@@ -51,11 +63,10 @@ if (tf.numLines != before + 1) {
   throw new Error("appendText should add a line: " + before + " -> " + tf.numLines);
 }
 
-// --- textHeight tracks the layout -------------------------------------------
-// 11 lines * 14.4 = 158.4; independent of the font, so valid without Skia too.
-var expected:Number = tf.numLines * 12 * 1.2;
-if (tf.textHeight < expected - 0.01 || tf.textHeight > expected + 0.01) {
-  throw new Error("textHeight " + tf.textHeight + " != " + expected);
+// --- textHeight tracks the layout; the line height stays constant ------------
+var lineHeight2:Number = tf.textHeight / tf.numLines;
+if (lineHeight2 < lineHeight - 0.01 || lineHeight2 > lineHeight + 0.01) {
+  throw new Error("line height drifted: " + lineHeight + " -> " + lineHeight2);
 }
 
 trace("textflow: numLines/maxScrollV/scrollV/appendText/textHeight OK");

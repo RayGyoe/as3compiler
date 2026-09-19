@@ -14,6 +14,14 @@
 import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve, dirname, relative } from 'node:path';
 
+// A single <font> entry under <embedFonts>. AIR uses these for StageText custom
+// fonts: <fontPath> is the ttf relative to the app root, <fontName> is the name
+// StageText references it by (which need not equal the ttf's internal family).
+export interface EmbedFont {
+  path: string;
+  name: string;
+}
+
 export interface AirAppInfo {
   id: string;
   versionNumber: string;
@@ -25,6 +33,8 @@ export interface AirAppInfo {
   width: number;
   height: number;
   displayResolution: string;
+  renderMode: string;
+  fonts: EmbedFont[];
 }
 
 export class AirAppError extends Error {}
@@ -55,6 +65,23 @@ function childText(xml: string, name: string): string | null {
   return m ? m[1].trim() : null;
 }
 
+// Parse <embedFonts> into [{ path, name }]. AIR nests it as
+//   <embedFonts><font><fontPath>ttf/x.ttf</fontPath><fontName>x</fontName></font>…</embedFonts>
+// with any number of <font> children. Empty (the common case) yields [].
+function parseEmbedFonts(xml: string): EmbedFont[] {
+  const wrap = xml.match(/<embedFonts\b[^>]*>([\s\S]*?)<\/embedFonts>/);
+  if (!wrap) return [];
+  const fonts: EmbedFont[] = [];
+  const re = /<font\b[^>]*>([\s\S]*?)<\/font>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(wrap[1])) !== null) {
+    const path = childText(m[1], 'fontPath');
+    const name = childText(m[1], 'fontName');
+    if (path) fonts.push({ path, name: name ?? path });
+  }
+  return fonts;
+}
+
 export function parseAirApp(xml: string): AirAppInfo {
   const id = childText(xml, 'id') ?? '';
   const versionNumber = childText(xml, 'versionNumber') ?? '';
@@ -71,11 +98,18 @@ export function parseAirApp(xml: string): AirAppInfo {
   // AIR's default is "standard" (1x, blurry on Retina); "high" renders at the
   // device's native resolution.
   const resolutionStr = (childText(iwXml, 'requestedDisplayResolution') ?? 'standard').toLowerCase();
+  // <renderMode> selects the GPU/CPU split (see airsdk.dev initialWindow):
+  //   auto   (default) — currently falls back to CPU mode.
+  //   cpu    — hardware acceleration is not used (software raster + putImageData).
+  //   direct — composition on CPU, blit via GPU (software raster + WebGL blit).
+  //   gpu    — full hardware-accelerated composition (Ganesh; not yet wired).
+  const renderMode = (childText(iwXml, 'renderMode') ?? 'auto').toLowerCase();
 
   const visible = visibleStr.toLowerCase() !== 'false';
   const resizable = resizableStr.toLowerCase() !== 'false';
   const width = parseInt(widthStr, 10);
   const height = parseInt(heightStr, 10);
+  const fonts = parseEmbedFonts(xml);
 
   if (!id || !filename) {
     throw new AirAppError('air-app.xml is missing <id> or <filename>');
@@ -83,7 +117,7 @@ export function parseAirApp(xml: string): AirAppInfo {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     throw new AirAppError('air-app.xml <initialWindow> width/height must be positive integers');
   }
-  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr };
+  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, fonts };
 }
 
 // Short name of a fully-qualified class: `demo.Main` -> `Main`.
@@ -128,9 +162,57 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
 // Build the manifest object (kebab-case fields, matching build.ts's Manifest).
 // `vendorRel` is the path from the manifest's directory to as3compiler/vendor,
 // so all Skia/SDL2 paths resolve correctly regardless of where the app.xml lives.
-export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean): Record<string, unknown> {
+//
+// `web` switches the manifest to the browser backend (--target wasm --package web):
+// the same generated .c links against web_glue.cc (canvas + rAF frame driver) and
+// the wasm build of Skia, with no SDL2/objc/Cocoa — those are native-only and wasm-ld
+// cannot find them (`-lobjc`). The AIR <initialWindow> visible/resizable/highdpi
+// flags still shape defines, but the window-backend specifics differ per target.
+export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, fonts: EmbedFont[]): Record<string, unknown> {
+  // Browser backend: skia_glue.cc + web_glue.cc, the wasm Skia library set, no
+  // SDL2/Cocoa/frameworks. Mirrors examples/web/hello-web.build.json. The wasm
+  // Skia build omits the native-only animation/image codecs (skottie/svg/...), so
+  // the library list is the wasm subset; zlib comes from Emscripten's USE_ZLIB.
+  if (web) {
+    const defines = ['ASC_USE_SKIA=1', 'ASC_USE_WINDOW=1'];
+    // ASC_DISPLAY_HIGH mirrors <requestedDisplayResolution>high: the offscreen
+    // surface is sized in physical pixels (window.devicePixelRatio) and the canvas
+    // CSS box stays at logical size, so a Retina display presents 1:1 instead of
+    // the browser stretching a 1x bitmap into blur — the same flag as the native
+    // backend, just resolved via window.devicePixelRatio instead of SDL's probe.
+    if (visible && highDpi) defines.push('ASC_DISPLAY_HIGH=1');
+    // <renderMode> maps to the Skia backend in skia_glue.cc / web_glue.cc.
+    // Efficiency-first (not AIR's "direct = CPU compose + GPU blit" split):
+    //   cpu/auto — pure software raster + putImageData (the default; no define).
+    //   direct/gpu — full Ganesh GPU rasterization: Skia composes on the GPU
+    //     (GrDirectContext + WebGL2) so the whole render loop is hardware
+    //     accelerated, not just the final blit.
+    if (renderMode === 'direct' || renderMode === 'gpu') defines.push('ASC_RENDER_GPU=1');
+    return {
+      target: 'wasm',
+      package: 'web',
+      opt: '-O2',
+      sources: [`${vendorRel}/skia_glue.cc`, `${vendorRel}/web_glue.cc`],
+      'include-paths': [`${vendorRel}/skia`],
+      'link-libs': [
+        'skia', 'skparagraph', 'skshaper', 'skunicode', 'skcms', 'wuffs',
+        'png', 'jpeg', 'webp', 'webp_sse41', 'freetype2', 'harfbuzz', 'icu',
+      ],
+      'link-paths': [`${vendorRel}/skia/lib/wasm`],
+      defines,
+      // The browser has no system fonts; the page fetches these at runtime and
+      // injects them into Skia's custom font manager (see html5-web.md §3). The
+      // list comes from the descriptor's <embedFonts> <fontPath> entries (relative
+      // to the app.xml dir), so swapping/adding fonts is a descriptor edit, not a
+      // code edit. With no <embedFonts>, fall back to the bundled Arial.ttf.
+      'font-urls': fonts.length > 0 ? fonts.map((f) => f.path) : ['fonts/Arial.ttf'],
+      objects: [],
+    };
+  }
+
   const skiaSrc = `${vendorRel}/skia_glue.cc`;
   const winSrc = `${vendorRel}/window_glue.cc`;
+  const mtlSrc = `${vendorRel}/metal_glue.mm`;
   const sources = visible ? [skiaSrc, winSrc] : [skiaSrc];
   const defines = visible ? ['ASC_USE_SKIA=1', 'ASC_USE_WINDOW=1'] : ['ASC_USE_SKIA=1'];
   // ASC_WINDOW_FIXED mirrors AIR's <resizable>false</resizable>: the window is
@@ -140,6 +222,18 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // for a native-resolution drawable and the offscreen surface is sized in physical
   // pixels, so text is not stretched by the compositor (the "blurry" symptom).
   if (visible && highDpi) defines.push('ASC_DISPLAY_HIGH=1');
+  // <renderMode> direct/gpu maps to the native Metal backend (ASC_RENDER_METAL):
+  // the window's Skia composition runs on the GPU through GrDirectContext(Metal)
+  // + SDL_Metal_CreateView/CAMetalLayer instead of the CPU raster surface + SDL
+  // blit. The Metal glue (metal_glue.mm) is Objective-C++, so it is added to the
+  // source set only when the GPU path is requested. Offscreen PNG export and
+  // cacheAsBitmap stay CPU-raster regardless (Metal drawables are one-shot and
+  // cannot back a persistent offscreen surface).
+  const gpu = renderMode === 'direct' || renderMode === 'gpu';
+  if (visible && gpu) {
+    defines.push('ASC_RENDER_METAL=1');
+    sources.push(mtlSrc);
+  }
   const linkLibs = [
     'skia', 'skparagraph', 'skshaper', 'skunicode', 'skottie', 'sksg', 'svg',
     'skresources', 'bentleyottmann', 'skcms', 'wuffs', 'png', 'jpeg', 'webp',
@@ -161,7 +255,7 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
     sources,
     'include-paths': [`${vendorRel}/skia`, `${vendorRel}/sdl2/arm64/include`],
     'link-libs': linkLibs,
-    'link-paths': [`${vendorRel}/skia/lib`, `${vendorRel}/sdl2/arm64/lib`],
+    'link-paths': [`${vendorRel}/skia/lib/macos-arm64`, `${vendorRel}/sdl2/arm64/lib`],
     frameworks,
     defines,
     objects: [],
@@ -177,8 +271,9 @@ export interface PreparedAirApp {
 
 // Orchestrate the `--air-app` migration: parse the descriptor, collect every
 // .as under <app.xml dir>/src, resolve the main class, and write the generated
-// build manifest next to the descriptor.
-export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string): PreparedAirApp {
+// build manifest next to the descriptor. `web` selects the browser backend
+// (--target wasm --package web) so the manifest links the right glue + libraries.
+export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean): PreparedAirApp {
   const xml = readFileSync(appXmlPath, 'utf8');
   const info = parseAirApp(xml);
   const dir = dirname(resolve(appXmlPath));
@@ -223,7 +318,7 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
 
   const vendorRel = relative(dir, vendorAbs).replace(/\\/g, '/');
   const manifestPath = resolve(dir, `${info.filename}.build.json`);
-  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high'), null, 2) + '\n');
+  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, info.fonts), null, 2) + '\n');
 
   return { info, mainClass, asFiles, manifestPath };
 }

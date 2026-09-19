@@ -131,6 +131,7 @@ package demo {
       t.width = 980;
       t.height = 20;
       t.background = true;
+      t.wordWrap = true;
       t.backgroundColor = 0x201810;
       t.defaultTextFormat = new TextFormat("_sans", 11, 0xFFEEDD);
       t.text = "flash.filesystem (stage 64)  userDirectory=" + File.userDirectory.nativePath
