@@ -81,6 +81,7 @@ Options:
   --run          run the compiled output after building
   --cc <name>    C compiler to use (default: cc)
   --target <t>   native (default) | wasm (WASI)
+  --package <p>  raw (default) | xcode-project (macOS .app) | android-project | web (browser)
   --manifest <f> build manifest JSON (extra sources / include / link libs)
   --air-app <xml> AIR app descriptor: generate bootstrap + build manifest
   --main-class <n> main class for --air-app (default: infer src/**/Main.as)
@@ -202,10 +203,13 @@ as-aot --air-app examples/air-native/air-native-app.xml
 
 # 显式指定主类（app.xml 不含 document class；缺省扫描 src/**/Main.as 推断）
 as-aot --air-app examples/air-native/air-native-app.xml --main-class demo.Main
+
+# 同一 AIR 项目直接编到浏览器（--target wasm --package web）：自动切到 web 后端
+as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package web
 ```
 
 流程：解析 `<id>/<filename>/<initialWindow>`（`title`/`width`/`height`/`visible`/`resizable`/
-`requestedDisplayResolution`）→
+`requestedDisplayResolution`/`renderMode`）→
 生成等价 `boot-gui.as` 的引导代码（`new Stage()` → 预设 `stageWidth/stageHeight` → `new Main()` →
 `addChild` → `showWindow`；`visible=false` 时改用离屏 `render` 出 PNG）→ 递归扫描 `src/**/*.as`
 （跳过反向域名第三方库目录 `com/org/net`，但显式回加 air-native demo 实际用到的 GreenSock 核心
@@ -213,12 +217,27 @@ as-aot --air-app examples/air-native/air-native-app.xml --main-class demo.Main
 在 app.xml 同目录写出 `<filename>.build.json`（链接 Skia + SDL2）→ 编链出 `<filename>` 可执行
 （产物名可用 `-o` 覆盖）。
 
+**web 目标**（`--air-app ... --target wasm --package web`）下，`--air-app` 适配器自动切换到
+浏览器后端：构建清单改用 `web_glue.cc`（替换 `window_glue.cc`）+ wasm 版 Skia
+（`vendor/skia/lib/wasm`），去掉 SDL2/`objc`/Cocoa 等 macOS 框架，字体由 app.xml 的
+`<embedFonts>` 提供（读每个 `<font><fontPath>` 生成 `font-urls` 运行时注入，缺省时回退到
+`fonts/Arial.ttf`；wasm 沙箱无系统字体，见 [`html5-web.md`](html5-web.md) §4）。其余流程
+（解析 app.xml、扫描 src、生成引导代码）与 native 一致，产物为 `<filename>.html` + `.js` + `.wasm`。
+
 对齐 adl 的三个关键行为：
 - `<resizable>false</resizable>` → 构建清单加 `ASC_WINDOW_FIXED=1`，窗口创建时不加
   `SDL_WINDOW_RESIZABLE`，得到与 adl 一致的固定尺寸窗口。
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → 构建清单加 `ASC_DISPLAY_HIGH=1`，
   窗口开 `SDL_WINDOW_ALLOW_HIGHDPI` 且 surface 按设备倍率创建物理像素（Retina 不模糊）；`standard`
   或缺省保持 1x（与 adl 一致，会被合成器拉伸）。
+- `<renderMode>` 控制 GPU/CPU 渲染分工：`direct`/`gpu` → 构建清单加 GPU define，后端把 Skia
+  surface 从 `SkSurfaces::Raster` 换成 Ganesh `GrDirectContext`，整帧在 GPU 上合成（效率优先，不对齐
+  AIR 官方「direct = CPU 合成 + GPU blit」的分割）。web 目标走 WebGL2，加 `ASC_RENDER_GPU=1`，present
+  仅为 `GrDirectContext::flush`；native 目标走 Metal（`GrDirectContext(Metal)` + `SDL_Metal_CreateView`
+  /`CAMetalLayer`），加 `ASC_RENDER_METAL=1` 并额外链接 `vendor/metal_glue.mm`（Objective-C++），每帧从
+  `CAMetalLayer` 取一次性 drawable、包成 `GrBackendRenderTarget` 渲染、`flushAndSubmit` 后
+  `presentDrawable`+`commit`。`cpu`/`auto`（缺省）保持纯软件 raster（web 用 `putImageData`，native 用
+  SDL streaming texture）。
 - 引导代码在 `new Main()` **之前**预设 `stage.stageWidth/stageHeight`，使 document class 构造时
   `trace(stage.stageWidth, stage.stageHeight)` 返回窗口尺寸（如 `1000 680`），而非 adl 之外的 `0 0`。
 
@@ -230,6 +249,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `target` | `"native" \| "wasm"` | 目标平台，默认 `native` |
+| `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | 分发形态，默认 `raw`（§6）；`web` 要求 `target=wasm`，产出浏览器产物（见 [`html5-web.md`](html5-web.md)） |
 | `c-compiler` | string | C 编译器，默认 `cc` |
 | `opt` | string | 优化标志，默认 `-O2` |
 | `sources` | string[] | 额外 C/C++ 源文件（与生成的 `.c` 一起编译） |
@@ -239,6 +259,11 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `defines` | string[] | 预处理宏（→ `-D`） |
 | `objects` | string[] | 预编译 `.o` 直接加入链接 |
 | `frameworks` | string[] | macOS 框架（→ `-framework X`，Skia 的 CoreText/CoreGraphics 后端需要） |
+| `font-urls` | string[] | 字体字节流 URL 列表（`--package web` 时写入 `index.html`，运行时网络加载注入 Skia；见 [`html5-web.md`](html5-web.md) §4） |
+| `bundle-id` | string | 应用标识（`--package xcode-project` 填 `Info.plist` 的 `CFBundleIdentifier`，缺省 `com.example.<product>`） |
+| `display-name` | string | 应用显示名（填 `CFBundleName`，缺省取产物名） |
+| `icon` | string | 图标 `.icns` 路径（相对清单目录解析，拷入 `Resources` + 填 `CFBundleIconFile`） |
+| `deployment-target` | string | macOS 最低系统版本（填 `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） |
 
 路径类字段（`sources` / `include-paths` / `link-paths` / `objects`）**相对清单文件所在目录解析**
 （与 TypePHP 的 YAML 路径规则一致）。示例见
@@ -255,7 +280,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
     "sksg", "svg", "skresources", "bentleyottmann", "skcms", "wuffs",
     "png", "jpeg", "webp", "webp_sse41", "dng_sdk", "piex", "expat",
     "freetype2", "harfbuzz", "icu", "zlib", "z"],
-  "link-paths": ["../vendor/skia/lib"],
+  "link-paths": ["../vendor/skia/lib/macos-arm64"],
   "frameworks": ["CoreFoundation", "CoreGraphics", "CoreText", "CoreServices",
     "ApplicationServices", "ImageIO", "Accelerate"],
   "defines": ["ASC_USE_SKIA=1"],
@@ -270,8 +295,10 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 
 | 目标 | 编译命令 | 产物 |
 |---|---|---|
-| `native`（默认） | `cc -O2 -lm -o <out> <c> [sources] -I... -D... [objects] -L... -l... [-framework X]` | Mach-O / ELF / PE 可执行 |
-| `wasm` | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 -o <out>.wasm <c> ...` | WASI `.wasm` |
+| `native`（默认，`--package raw`） | `cc -O2 -lm -lz -o <out> <c> [sources] -I... -D... [objects] -L... -l... [-framework X]` | Mach-O / ELF / PE 可执行 |
+| `wasm`（`--package raw`） | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 -o <out>.wasm <c> ...` | WASI `.wasm` |
+| `native` + `--package xcode-project` | 生成 `.xcodeproj`（§6.5），由 Xcode/xcodebuild 驱动 | macOS `.app` bundle（`Contents/MacOS/<bin>` + `Info.plist`） |
+| `wasm` + `--package web` | `emcc`（Emscripten，需 `EMSDK_HOME`）编译 C/C++ 源 + 链接 wasm 版 Skia，`INVOKE_RUN=0` | `.wasm` + `.js` + `index.html`（浏览器 HTML5 渲染，见 [`html5-web.md`](html5-web.md)） |
 
 平台耦合点已隔离到 `runtime.ts` 的 `RUNTIME_PREAMBLE`，用 `#ifdef __wasi__` 条件编译。
 当前唯一的平台差异是 `as_now_ms()`：
@@ -282,7 +309,208 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 > 本机若为 Apple clang（无 `wasm32-wasip1` target）且未装 WASI SDK，则 wasm 只能 `--dry`
 > 验证命令，实际编译需先装工具链（见 §2）。
 
-## 6. 窗口化（SDL2 后端）
+## 6. 编译后端与分发形态
+
+> 本节回答一个问题：`--target native` 已经能产出裸可执行文件，那 `.app` / `.dmg` /
+> Windows `.exe` / Xcode 工程 / Android 工程该怎么做——是继续平铺成 `--target` 的一堆取值，
+> 还是拆开？结论：**拆成两个正交维度**。其中 `xcode-project` 已实现（§6.5），其余为规划。
+
+现有管线的心智模型是「一份 AS → 一份可读 C → 一个裸可执行文件」。这些产物里，一半是
+「换编译后端」，另一半是「编译完之后怎么组织」，两者不应混在同一个 `--target` 里。
+
+### 6.1 两个正交维度
+
+| 维度 | 参数 | 管什么 | 底层动作 |
+|---|---|---|---|
+| 编译后端 | `--target` | 机器码 ABI：用哪个 clang triple、链接哪个 sysroot/SDK | 改变 `cc/clang` 的编译命令 |
+| 分发形态 | `--package` | 编译结果之后如何组织（bundle、镜像、工程文件） | build 层的**后处理步骤** |
+
+**维度 A：`--target`（编译后端）**，保留现有语义，只扩取值：
+
+| 取值 | 含义 | 底层 |
+|---|---|---|
+| `native`（默认） | 宿主系统可执行 | 现有 `cc -O2 -lm -lz` |
+| `wasm` | WASI `.wasm` | 现有 |
+| `ios`（规划） | iOS / 模拟器 | `clang --target=arm64-apple-ios / arm64-apple-ios-simulator` + iPhone SDK |
+| `android`（规划） | Android | NDK clang `--target=aarch64-linux-android` + NDK sysroot |
+
+**维度 B：`--package`（分发形态）**：
+
+| 取值 | 产物 | 说明 | 状态 |
+|---|---|---|---|
+| `raw`（默认） | 裸可执行 / 裸 `.wasm` | 保持现状，零行为变化（CLI 快速验证、本地调试用） | 已实现 |
+| `xcode-project` | `.xcodeproj`（或 CMake 工程） | 生成 macOS application 工程骨架 + 构建脚本，交给 Xcode 构建/调试/签名 | **已实现（macOS application，§6.5）** |
+| `android-project` | Gradle + NDK 工程 | 生成 `build.gradle` + `CMakeLists.txt` + JNI/native-activity 桥 | 规划 |
+| `web` | `.wasm` + `.js` + `index.html` | 用 emcc 产出浏览器 HTML5 渲染页面（`target=wasm`，见 §6.6 与 [`html5-web.md`](html5-web.md)） | **已实现（§6.6）** |
+
+**目标用户定位：`xcode-project` / `android-project` 只服务 IDE 开发者**，因此这两个形态
+**不提供 `app` / `dmg`**；`web` 与 `raw` 一样是「一次编译调用 + 后处理」（emcc 编译 + 生成
+`index.html`），面向直接产出浏览器可加载的最终产物。
+
+- `app` / `dmg` 走的是「`build.ts` 直接调 `cc/clang` + `codesign` + `hdiutil` 一键产出最终产物」的
+  **脚本路线**，面向 CI / 快速出包 / 无人工介入；`xcode-project` 走的是「生成工程，让 Xcode 驱动」
+  的 **IDE 路线**，面向长期开发、断点调试、签名上架。两者是**并列的两条路**，最终都通向 `.app`，
+  但不是「高级形态取代低级形态」的包含关系。
+- 既然只服务 IDE 开发者，脚本路线（`app` / `dmg`）整体砍掉，分发形态收敛为 `raw` + 两个工程生成器 + `web`。
+
+**`xcode-project` 当前产出 macOS application**：`--package xcode-project` 现阶段只支持
+`--target native`（macOS application）；iOS/Android 的工程生成器尚未实现。将来升到 multiplatform 时，
+平台范围交给 manifest 的 `deployment-targets`、由 Xcode 的 destination 选择，`--target` 不再为工程定死
+平台——但目前仍停在 macOS-only（SDL2/Skia 静态库仅有 macOS arm64 构建）。
+
+### 6.2 为什么这么分
+
+1. **`xcode-project` / `android-project` 不是「一次 cc 调用」，而是「生成工程文件」**。编译后端仍
+   产出 Mach-O / ELF，工程生成器负责把编译命令 + 依赖库 + 资源组织成 `.xcodeproj` / Gradle 工程
+   骨架。因此它们应作为 build 层**独立于编译命令的生成步骤**，而不是塞进 `cc/clang` 的编译参数。
+2. **Windows `.exe` 连新参数都不需要**。native 在 Windows 本来就是 PE 可执行文件，唯一的小坑是
+   现在 `-o app` 不自动补 `.exe` 扩展名（`index.ts` 只在 wasm 分支补后缀）。按 host OS 补默认
+   扩展名即可，不是新形态。
+3. **工程元数据走 manifest，不平铺 CLI flag**。工程生成器需要大量元数据：bundle id、图标、
+   签名证书、min SDK、权限、资源目录……这些**不是参数，是工程配置**。项目里已有对标 TypePHP
+   `project.yml` 的 manifest 机制（见 §4），应扩展 manifest 承载这些字段，而非平铺成一堆 CLI flag。
+
+### 6.3 推荐的 CLI 形态
+
+```bash
+# 现有行为不变
+as-aot examples/hello.as --run
+
+# macOS 工程（编译后端 native + 生成 .xcodeproj，已实现）
+as-aot src/Main.as --target native --package xcode-project --manifest macos.json
+
+# iOS 工程（换后端 + 生成工程，复杂元数据走 manifest；规划中）
+as-aot src/Main.as --target ios     --package xcode-project --manifest ios.json
+
+# Android 工程（规划中）
+as-aot src/Main.as --target android --package android-project --manifest android.json
+```
+
+### 6.4 manifest 扩展字段（部分已实现）
+
+复杂工程元数据在 `§4` 构建清单上追加（kebab-case，路径类字段相对清单目录解析）。macOS application
+（`xcode-project`）相关的四个字段已实现并用于 §6.5：
+
+| 字段 | 说明 | 状态 |
+|---|---|---|
+| `bundle-id` | 应用标识（填 `CFBundleIdentifier`，缺省 `com.example.<product>`） | ✅ 已实现 |
+| `display-name` | 应用显示名（填 `CFBundleName`，缺省取产物名） | ✅ 已实现 |
+| `icon` | 图标 `.icns` 路径（拷入 `Resources` + 填 `CFBundleIconFile`） | ✅ 已实现 |
+| `deployment-target` | macOS 最低系统版本（填 `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） | ✅ 已实现 |
+| `permissions` | Android `AndroidManifest.xml` 权限 / iOS `Info.plist` 用途描述 | 规划 |
+| `resources` | 需拷贝进 bundle / 工程资源目录的额外文件 | 规划 |
+| `ndk-abi` | Android 目标 ABI 列表（如 `arm64-v8a`） | 规划 |
+| `signing-identity` | 代码签名证书（macOS/iOS 的 `codesign`，当前用 ad-hoc `-`） | 规划 |
+
+落地顺序：`xcode-project`（macOS application）已完成 → 下一步 `android-project`（工程生成器最重）→
+再补 multiplatform destination 与正式签名。
+
+### 6.5 `xcode-project`（已实现，macOS application）
+
+`--target native --package xcode-project` 把生成的**可读 C** + 构建清单里的额外源、头文件路径、
+链接库、framework、宏定义组织成一个 macOS **application** `.xcodeproj`（产物是 `.app` bundle），交给
+IDE 开发者打开、构建、断点调试——是「生成工程」步骤，而非一次 `cc` 调用：
+
+```bash
+as-aot src/Main.as --target native --package xcode-project -o build/Main
+# 生成 build/Main.xcodeproj + build/Main/Info.plist + 共享 scheme
+
+open build/Main.xcodeproj                          # 打开工程
+# 或命令行构建（无需打开 Xcode）
+xcodebuild -project build/Main.xcodeproj -scheme Main -configuration Debug build
+# 产物是 build/…/Debug/Main.app（Contents/MacOS/Main + Contents/Info.plist + 资源）
+open build/…/Debug/Main.app                        # 双击/命令行启动正式 App
+```
+
+从「命令行工具」到「application」的升级，让产物从「裸 Mach-O」变成有 bundle 身份、Dock 图标、菜单栏、
+可签名上架的正式 macOS App。生成的 AS3 C 仍是 `int main(void)`——SDL2 事件循环（`ASC_USE_WINDOW=1`）
+从 `main` 里跑，bundle + `Info.plist` 只给进程加上 App 身份，运行行为与 raw 一致。
+
+实现要点（`src/xcode-project.ts`）：
+
+- **目标类型**：`com.apple.product-type.application`（`wrapper.application`），`buildPhases` 含
+  Sources + Frameworks + **Resources** 三段；产物 `Contents/MacOS/<bin>` + `Contents/Info.plist`。
+- **`Info.plist` 生成**：写 `<outDir>/<product>/Info.plist`，`CFBundleIdentifier`/`CFBundleExecutable`/
+  `LSMinimumSystemVersion` 用 `$(PRODUCT_BUNDLE_IDENTIFIER)`/`$(EXECUTABLE_NAME)`/
+  `$(MACOSX_DEPLOYMENT_TARGET)` 注入，与构建设置保持同步；`CFBundleName` 填 `display-name`（缺省产物名），
+  `CFBundleIconFile` 只在 manifest 提供 `icon` 时写出。
+- **应用元数据从 manifest 读**（§6.4）：`bundle-id`/`display-name`/`icon`/`deployment-target` 四个字段
+  分别落入 `PRODUCT_BUNDLE_IDENTIFIER`/`CFBundleName`/Resources phase + `CFBundleIconFile`/
+  `MACOSX_DEPLOYMENT_TARGET`；`icon` 为绝对路径 file ref 加入 Resources phase，构建时拷入
+  `Contents/Resources/`。
+- **ad-hoc 签名**：`CODE_SIGN_STYLE = Manual` + `CODE_SIGN_IDENTITY = "-"`，让 `xcodebuild` 无需
+  provisioning profile 或 Apple ID 即可产出可运行的 `.app`（ad-hoc 签名）；正式上架再在 manifest 加
+  `signing-identity`（§6.4 规划）。
+- **编译配置镜像 raw 链接**：`OTHER_LDFLAGS` 恒含 `-lm -lz`，再拼 manifest 的 `link-libs`/`objects`/
+  `frameworks`；`HEADER_SEARCH_PATHS`/`LIBRARY_SEARCH_PATHS` 镜像 `include-paths`/`link-paths`；
+  `GCC_PREPROCESSOR_DEFINITIONS` 镜像 `defines`；`GCC_OPTIMIZATION_LEVEL` 从 `--opt` 的 `-O{0,1,2,3,s}`
+  映射。路径类字段按绝对路径写入，保证 Xcode 从任意工作目录都能解析。
+- **关闭 `-fmodules`（关键）**：生成的 C 使用裸类型名（`Point`/`Rectangle`…），会与 macOS SDK 的
+  `MacTypes.h` 里的 `Point` 冲突。raw `cc` 默认不启用 `-fmodules` 所以没事；Xcode 默认启用，会让 SDK
+  的 `Point` 遮蔽生成的 struct，导致 `no member named 'x' in 'struct Point'`。因此工程里显式
+  `CLANG_ENABLE_MODULES = NO`，保证与命令行构建语义一致。
+- **C/C++ 分层**：生成 `.c` 保持 C99（`GCC_C_LANGUAGE_STANDARD = c99`），C++ 胶水层（`skia_glue.cc` 等）
+  用 C++17（`CLANG_CXX_LANGUAGE_STANDARD = "c++17"` + `CLANG_CXX_LIBRARY = "libc++"`），由文件扩展名
+  自动分派编译器。
+- **共享 scheme**：生成 `xcshareddata/xcschemes/<NAME>.xcscheme`（`BuildableName = <NAME>.app`），使
+  `xcodebuild -scheme NAME` 无需打开 Xcode 即可解析。
+
+#### 6.5.1 智能合并（保护 Xcode 手改）
+
+工程生成器默认**不覆盖**已存在的 `.xcodeproj`。IDE 开发者会在 Xcode 里手改 build settings、scheme、
+添加文件/资源；重新编译代码时若整个工程被重建，这些手改就会丢失。因此采用**对象级智能合并**：
+
+- **第一次运行**（工程不存在）：完整生成 `.xcodeproj` + `Info.plist` + 共享 scheme，并把「我们管理的
+  源文件集合」（生成的 `.c` + manifest 的 `sources`）记录进工程内的 `.as3aot-managed.json` sidecar。
+- **后续运行**（工程已存在）：解析现有 `project.pbxproj`（`src/pbxproj.ts`），**只增删我们管理的源文件**
+  （对比 sidecar 里的旧集合与本次新集合），其余对象——用户手改的 build settings、scheme、自己加的
+  文件/资源——原样保留。
+  - 源文件列表未变 → 完全不写文件，打印 `unchanged; hand edits preserved`。
+  - 源文件列表变了（新增/删除了 `.c` 或 manifest `sources`）→ 就地更新，打印
+    `source list updated; hand edits preserved`。
+- **识别依据是绝对路径**：只有 `sourceTree = "<absolute>"` 的 file ref 才会被管理；用户手加的
+  相对路径文件不受影响。Xcode 的 `/* 注释 */` 会被解析器丢弃（纯可读性提示，不参与语义），下次
+  Xcode 保存时自动重新生成。
+- 工程里额外生成 `.as3aot-managed.json`（记录受管源文件集合），Xcode 忽略该文件，不会影响构建。
+
+若用户确需整体重建工程，删除 `.xcodeproj` 后重跑即可。
+
+### 6.6 `web`（已实现，浏览器 HTML5 渲染）
+
+`--target wasm --package web` 把生成的**可读 C** + C++ 胶水层用 Emscripten `emcc` 编成浏览器
+产物（`.wasm` + `.js` + `index.html`），在 `<canvas>` 里跑 Skia CPU 光栅 + 事件循环：
+
+```bash
+export EMSDK_HOME=/path/to/emsdk   # emcc 位于 $EMSDK_HOME/upstream/emscripten/emcc
+
+as-aot examples/web/hello-web.as \
+  --manifest examples/web/hello-web.build.json
+# 产物：hello-web.html + hello-web.js + hello-web.wasm
+```
+
+浏览器不能 `file://` 直接加载 wasm，需经 HTTP 服务（`python3 -m http.server`）打开 `.html`。
+
+与 native 清单（§4）的差异：
+
+- **`package = "web"`** 且 `target = "wasm"`（`web` 硬性要求 wasm）。
+- **新增 `font-urls`**：字体字节流 URL 列表，写入 `index.html` 的引导脚本，运行时 `fetch` + 注入
+  Skia（wasm 沙箱无系统字体，见 [`html5-web.md`](html5-web.md) §4）。
+- **不链接 `zlib`**：web 链接加 `-s USE_ZLIB=1`，Emscripten 同时提供 zlib 头文件与符号；显式
+  `-l zlib` 反而可能冲突。
+
+实现要点（`src/build.ts` 的 `buildWebCompileSteps()` + `src/index.ts` 的 `writeWebIndex()`）：
+
+- **emcc 定位**：`EMSDK_HOME` 指向 emsdk 根目录，emcc 为其 `upstream/emscripten/emcc`。
+- **C/C++ 分层**：生成的 `.c` 走 C 路径；`skia_glue.cc`/`web_glue.cc` 走 `-std=c++17`。
+- **`SK_TRIVIAL_ABI` 匹配**：wasm 版 `libskia.a` 以 `is_trivial_abi=true` 编译，C++ 胶水层必须带
+  `-D SK_TRIVIAL_ABI=[[clang::trivial_abi]]`，否则运行期 `unreachable` 崩溃（`build.ts` 已自动加）。
+- **`EXPORTED_FUNCTIONS`**：显式导出 `_main`/`_malloc`/`_free`/`_sk_fontmgr_register_data`（字体
+  注入引导脚本依赖；漏掉会让字体注入静默失败或无人启动 main）。
+- **`INVOKE_RUN=0`**：JS 在字体注入完成后才调 `Module._main()`。
+
+完整架构、字体注入流程与已知限制见 [`html5-web.md`](html5-web.md)。
+
+## 7. 窗口化（SDL2 后端）
 
 `--target native` 下有三种构建形态，由**源码 + 构建清单**共同决定（GUI 开关不在 `--target`，而在
 源码里的 `Stage.showWindow(...)` 与清单里的 `ASC_USE_WINDOW=1` 宏）：
@@ -363,12 +591,15 @@ Retina 高清渲染（`ASC_DISPLAY_HIGH=1`）：
   （adl 实测：1 delta = 1 行、`scrollV -= delta`、钳制 `[1,maxScrollV]`），再派发冒泡 `MouseEvent.MOUSE_WHEEL`。
   示例见 `examples/wheel.as`（纯 C 回归，用 `stage.dispatchWheel(...)` 直接驱动）。
 
-> 窗口化产物仍是 Mach-O 可执行文件（可直接命令行运行并弹窗）；要“双击可运行”的 macOS `.app` 打包
-> （`MyApp.app/Contents/MacOS/...` + `Info.plist`）是后续打包脚本层，不是编译器参数。
+> 窗口化产物在 `raw` 形态下仍是 Mach-O 可执行文件（可直接命令行运行并弹窗）；要“双击可运行”的
+> macOS `.app` 打包（`MyApp.app/Contents/MacOS/...` + `Info.plist`）用 `--package xcode-project`
+> 生成 application 工程（§6.5），由 Xcode 构建出 `.app` bundle。
 
-## 7. 相关文档
+## 8. 相关文档
 
 - [`README-CN.md`](../../README-CN.md) — 项目总览、支持的语言子集、类型映射、当前限制
 - [`TODO.md`](../../TODO.md) — 分阶段路线图（阶段二十九为「构建清单 + 多目标后端」）
 - [`as3-semantics.md`](as3-semantics.md) — AS3 语义保真红线与规范来源
+- [`html5-web.md`](html5-web.md) — 浏览器渲染目标（`--target wasm --package web`）的实现与使用
+- [`skia.md`](skia.md) — 渲染后端（Skia 光栅化 + wasm 字体注入）
 - [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md) — 开发规范（§2.9 构建与链接）

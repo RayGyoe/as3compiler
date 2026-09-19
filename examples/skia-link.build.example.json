@@ -29,7 +29,7 @@
     "zlib",
     "z"
   ],
-  "link-paths": ["../vendor/skia/lib"],
+  "link-paths": ["../vendor/skia/lib/macos-arm64"],
   "frameworks": [
     "CoreFoundation",
     "CoreGraphics",

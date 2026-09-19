@@ -1,0 +1,38 @@
+{
+  "target": "wasm",
+  "package": "web",
+  "opt": "-O2",
+  "sources": [
+    "../../vendor/skia_glue.cc",
+    "../../vendor/web_glue.cc"
+  ],
+  "include-paths": [
+    "../../vendor/skia"
+  ],
+  "link-libs": [
+    "skia",
+    "skparagraph",
+    "skshaper",
+    "skunicode",
+    "skcms",
+    "wuffs",
+    "png",
+    "jpeg",
+    "webp",
+    "webp_sse41",
+    "freetype2",
+    "harfbuzz",
+    "icu"
+  ],
+  "link-paths": [
+    "../../vendor/skia/lib/wasm"
+  ],
+  "defines": [
+    "ASC_USE_SKIA=1",
+    "ASC_USE_WINDOW=1"
+  ],
+  "font-urls": [
+    "fonts/Arial.ttf"
+  ],
+  "objects": []
+}

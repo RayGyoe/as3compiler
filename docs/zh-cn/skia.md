@@ -81,7 +81,7 @@ Skia 的一切围绕 `SkCanvas`（画布）组织。绘制调用 `canvas->drawRe
   "sources": ["../vendor/skia_glue.cc"],
   "include-paths": ["../vendor/skia/include"],
   "link-libs": ["skia", "skparagraph"],
-  "link-paths": ["../vendor/skia/lib"],
+  "link-paths": ["../vendor/skia/lib/macos-arm64"],
   "defines": ["ASC_USE_SKIA=1"],
   "objects": []
 }
@@ -255,11 +255,16 @@ SDL 2.26 才加入）正是修复跨屏倍率 bug 的依赖，说明 2.32 对本
 
 ## 7. 多目标：native 与 wasm
 
-- **native**：Skia 静态链接 `libskia.a`（CPU raster 或 GPU），产出 Mach-O/ELF/PE。
-- **wasm**：Skia 官方有 **CanvasKit**（`modules/canvaskit`，Skia + WebAssembly 的 JS 绑定产物），但那是
-  JS 生态；我们要的是 C ABI，做法是**用 wasm32 工具链把 Skia + 我们的胶水层一起编成 WASI**。注意 Skia
-  的 wasm 构建通常面向 emscripten（CanvasKit 路径），WASI 的适配成本高于 native——**首期只保证 native
-  渲染链路跑通**，wasm 渲染延后（`--target wasm` 阶段仍只支持无 GUI 的程序）。这符合「分阶段、先跑通主链」。
+- **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。
+- **wasm（浏览器，`--target wasm --package web`）**：用 Emscripten 把 Skia + 胶水层一起编成
+  wasm32 静态库（`vendor/skia/lib/wasm/`），经 emcc 链接产出 `.wasm` + `.js` + `index.html`。
+  字体后端由 CoreText 切换为 `SkFontMgr_New_Custom_Data()`（运行时注入字体数据），窗口层由 SDL2
+  切换为 canvas + `requestAnimationFrame`。实现与约束详见 [`html5-web.md`](html5-web.md)。
+- **wasm（WASI，`--target wasm --package raw`）**：仍是无 GUI 的命令行 `.wasm`，不含渲染。
+
+> 曾评估「用 WASI 工具链适配 Skia」的路径（Skia 官方 wasm 面向 emscripten/CanvasKit，WASI 适配
+> 成本高）。现已改用 emscripten 直接产出浏览器产物，绕开 WASI 适配：`--package web` 已端到端验证
+> 通过（蓝色矩形 + `TextField` 文字 + 运行时字体注入，无运行期崩溃）。
 
 ---
 
@@ -272,19 +277,22 @@ SDL 2.26 才加入）正是修复跨屏倍率 bug 的依赖，说明 2.32 对本
 2. **完整排版（SkParagraph，`modules/skparagraph`）**：支持换行、左右对齐、字间距、多段落、富文本样式。
    对应 AS3 `TextField` 的 `wordWrap`/`multiline`/`textWidth`/`textHeight`/`autoSize`/`htmlText`。
 
-**决策修正（阶段四十四实际落地）**：原计划用 SkParagraph，实际落地是 **`SkFont` 测量 + 自研贪心换行**
-（`runtime.ts` 的 `as_text_wrap`），理由与阶段二十四~二十七自研正则引擎同源——**语义漂移**：
+**决策修正（阶段三十八 → v0.3.73 升级）**：阶段三十八最初用 **`SkFont` 测量 + 自研贪心换行**
+（`runtime.ts` 的 `as_text_wrap`）跑通多行，理由是 SkParagraph 的 UAX#14 换行与 AIR `wordWrap` 语义漂移。
+后于 v0.3.73 升级为 **SkParagraph（`modules/skparagraph`）完整排版**，理由：
 
-- AS3 `wordWrap` 只在**空格**处断行，超宽的单字整词溢出（不拆分）；SkParagraph 走 UAX#14 Unicode
-  换行算法，可在任意字符边界（连字符/CJK 字间）断行，直接拿来与 AIR 行为不一致。
+- 自研贪心换行逐 word `SkFont` 测量、每帧重算无缓存，性能与正确性（行高近似 `size × 1.2`、无 shaping）
+  都受限制；SkParagraph 由 HarfBuzz 一次 shaping + UAX#14 断行，`getHeight()`/`getLongestLine()` 提供真实
+  行高与 textWidth，段落级对齐/字间距天然可用。
+- 语义漂移收敛为两个边缘情况：SkParagraph 会在超长单词/连字符处断行，AIR `wordWrap` 仅空格断行、
+  超长单词整词溢出；CJK 逐字断行两者一致。已在注释/文档记录为已知限制。
 - AIR 的 `maxScrollV`/`scrollV` 是「视口行」语义（`numLines - visibleLines + 1`，`scrollV = maxScrollV`
-  让最新行贴底），属于显示列表/裁剪层逻辑，SkParagraph 不提供。
-- 重要的是**没有自研光栅化**：字形测量（`sk_text_measure_n`）与绘制（`sk_canvas_draw_text_n` →
-  `drawSimpleText`）仍全部交给 Skia，自研的只是「在哪断行」这一层 AS3 语义，符合 §2.9 铁律。
+  让最新行贴底），仍由运行时层计算；SkParagraph 只负责「排」与「画」，符合 §2.9 铁律。
+- 同样**没有自研光栅化**：shaping/断行/绘制全部交给 SkParagraph，自研的只有「缓存失效 key」这一层。
 
-SkParagraph 仍留给真正的富文本需求（`htmlText`、多 `TextFormat` 区间样式、对齐/字间距/多段落），
-列为后续子阶段。当前未做：`autoSize`/`hscroll`/`selectable`/`leading`，行高用 `size × 1.2` 近似而非字体
-metrics 表；排版无缓存（每帧重算，demo 规模无碍）。断言式回归见 `examples/textflow.as`。
+SkParagraph 的富文本能力（`htmlText`、多 `TextFormat` 区间样式、对齐/字间距/多段落）仍待后续子阶段
+（当前落地单一 `defaultTextFormat` 扁平样式）。当前未做：`autoSize`/`hscroll`/`selectable`/`leading`。
+断言式回归见 `examples/textflow.as`。
 
 ---
 
@@ -306,8 +314,8 @@ Skia 的 `SkCodec`（`include/codec`）+ `SkImage::MakeFromEncoded` 覆盖 PNG/J
 |---------|------|------|
 | **阶段三十六** | v0.3.36 | **Skia 胶水层 + 构建集成**：`vendor/skia` 引入、`skia_glue.cc` 最小 `extern "C"` 面（surface/canvas/paint/path/color/matrix）、`build.ts` 支持 `.cc` 编译驱动与 `-lskia` 链接、`as_skia_*` 运行时助手、离屏 CPU raster 输出 PNG 的端到端 demo |
 | **阶段三十七** | v0.3.37 | **`flash.display` 渲染落地**：`Shape`/`Graphics` → `SkPath`+`SkPaint`（fill/stroke/渐变）、`Bitmap`/`BitmapData` → `SkImage`（含 `setPixel/getPixel/draw`）、`DisplayObject` 变换（translate/rotate/scale/alpha/blendMode）、递归渲染 + 深度序 |
-| **阶段三十八** | v0.3.38 | **`TextField` 文本渲染**：`SkFont` + `drawString` 单行直绘，`TextFormat` 样式（font/size/color/bold/italic），背景矩形；多行排版当时未做 |
-| **阶段四十四** | v0.3.45 | **`TextField` 多行排版 + Retina 高清**：`as_text_wrap` 硬换行/`wordWrap` 贪心软换行（Skia 实测宽度）、`clip` 裁剪、`numLines`/`maxScrollV`/`scrollV` 视口数学；`sk_canvas_draw_text_n`/`sk_text_measure_n` 按长度接口；`ASC_DISPLAY_HIGH` 走 `ALLOW_HIGHDPI` + drawable probe；修复 `sk_font()` 每次重建 CoreText FontMgr 导致的多行首帧卡死 |
+| **阶段三十八** | v0.3.38 → v0.3.73 | **`TextField` 文本渲染**：单行 `SkFont` + `drawString` 直绘、`TextFormat` 样式（font/size/color/bold/italic）；多行排版先自研贪心换行（v0.3.45）后升级 SkParagraph（v0.3.73，`sk_textlayout_*` 桥接，HarfBuzz shaping + UAX#14 断行 + 真实行高 + 缓存）、`clip` 裁剪、`numLines`/`maxScrollV`/`scrollV` 视口数学；修复 `sk_font()` 每次重建 CoreText FontMgr 导致的多行首帧卡死 |
+| **阶段四十四** | v0.3.45 | **Retina 高清渲染**：`ASC_DISPLAY_HIGH` 走 `ALLOW_HIGHDPI` + drawable probe，surface 按物理像素创建、纹理 1:1 上屏不再重采样 |
 
 > 阶段三十六是「接 Skia」的关键卡点，它验证「生成的 C 能通过胶水层调用 Skia 并产出正确像素」。
 > 建议先把它做成**最小可行闭环**（画一个 `Shape` 的矩形 → 输出 PNG → 断言像素），再铺开阶段三十七/三十八。
@@ -322,8 +330,8 @@ Skia 的 `SkCodec`（`include/codec`）+ `SkImage::MakeFromEncoded` 覆盖 PNG/J
 | **C++20 要求** | 需 clang，且本机 Apple clang 版本要够新 | 文档写明最低版本；`build.ts` 检测 C++ 编译器 |
 | **无 C API** | 必须维护胶水层，Skia API 升级会牵动 glue | glue 只暴露最小面；按需加函数，不做全面封装 |
 | **体积/启动** | 静态链接后二进制明显变大 | 教学编译器可接受；GPU 后端可减少 CPU 光栅化成本 |
-| **wasm 适配** | Skia 的 wasm 面向 emscripten，WASI 适配成本高 | 首期只做 native 渲染，wasm GUI 延后 |
-| **文本排版** | SkParagraph 是独立库，体量与复杂度都不小，且其 UAX#14 换行与 AIR `wordWrap`（仅按空格断行）语义漂移 | 阶段四十四用 `SkFont` 测量 + 自研贪心换行覆盖 `multiline`/`wordWrap`/`scrollV`；SkParagraph 留给 `htmlText`/富文本 |
+| **wasm 适配** | Skia 的 wasm 面向 emscripten，WASI 适配成本高 | 改用 emscripten 直接产出浏览器产物（`--package web`），已端到端验证；见 [`html5-web.md`](html5-web.md) |
+| **文本排版** | SkParagraph 是独立库，体量与复杂度都不小，且其 UAX#14 换行与 AIR `wordWrap`（仅按空格断行）在超长单词/连字符处语义漂移 | 阶段三十八先自研贪心换行，v0.3.73 升级 SkParagraph（漂移收敛为两个边缘情况，已记录为已知限制）；富文本 `htmlText`/多 `TextFormat` 区间样式留后续 |
 
 **边界声明（与项目哲学一致）**：Skia 只解决「画」，**不解决** AS3 显示列表层级、事件捕获/冒泡、命中
 三态机、焦点、tab 序——这些仍是阶段三十三~三十五的 C 运行时职责（Ruffle 语义参照）。Skia 不是

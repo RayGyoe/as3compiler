@@ -3,7 +3,7 @@
 
 import type { Program, Stmt, Expr, ASType, Param, ClassMember, Block } from './ast.ts';
 import { RUNTIME_PREAMBLE } from './runtime.ts';
-import { resolveType, CodegenError, qualifiedName } from './symbols.ts';
+import { resolveType, CodegenError, qualifiedName, sanitizeCIdent } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 
 // Compound assignment operator -> underlying binary operator.
@@ -12,34 +12,35 @@ const COMPOUND_BASE: Record<string, string> = {
   '<<=': '<<', '>>=': '>>', '>>>=': '>>>', '&=': '&', '|=': '|', '^=': '^',
 };
 
-// C reserved keywords. AS3 method/field names that collide with one (e.g.
-// Rectangle.union) must be mangled to a valid C identifier; appending '_' keeps
-// the name recognizable and guarantees no clash with the AS3 surface.
-const C_KEYWORDS = new Set([
-  'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do',
-  'double', 'else', 'enum', 'extern', 'float', 'for', 'goto', 'if', 'inline',
-  'int', 'long', 'register', 'restrict', 'return', 'short', 'signed', 'sizeof',
-  'static', 'struct', 'switch', 'typedef', 'union', 'unsigned', 'void',
-  'volatile', 'while', '_Bool', '_Complex', '_Imaginary',
-]);
-
-function cIdent(name: string): string {
-  return C_KEYWORDS.has(name) ? name + '_' : name;
-}
-
 export class Emitter {
   private out: string[] = [];
   private indent = 0;
   private scopes: Map<string, CType>[] = [];
   private currentClass: string | null = null;
   private suppressBreak = 0;
-  private labels: { asName: string; cName: string }[] = [];
+  private labels: { asName: string; cName: string; tryDepth: number }[] = [];
+  // try/finally exception-stack hygiene (stage 76 follow-up): each open try
+  // block is tracked so that control flow leaving it early (return/break/
+  // continue) pops the jmp stack and runs any pending finally body before
+  // jumping out. `active` marks frames whose `as_jmp_depth++` is still on the
+  // stack (i.e. while emitting the try body); `finallyBody` is the not-yet-run
+  // finally block, nulled once the inline finally starts emitting.
+  private tryFrames: { active: boolean; finallyBody: Block | null }[] = [];
+  // Entry try-depth of the nearest breakable (loop/switch) and continuable
+  // (loop) context, used to unwind try frames when break/continue jumps out.
+  private breakTargets: number[] = [];
+  private continueTargets: number[] = [];
   private tmpCounter = 0;
   private currentReturnType: CType | null = null;
   // module-level (file-scope) variables: AS3 top-level `var`/`const` are hoisted
   // to C file-scope globals so free functions and main() both see them.
   private moduleScope = new Map<string, CType>();
   private moduleConsts = new Set<string>();
+  // C-identifier sanitization (stage 76): maps an AS3 method/field/local/param
+  // name to its mangled C name (cached so declaration and every reference agree),
+  // and tracks every emitted name so distinct AS3 names stay distinct (P2).
+  private cNameCache = new Map<string, string>();
+  private usedCIdentifiers = new Set<string>();
 
   private program: Program;
   private symbols: SymbolTable;
@@ -104,7 +105,45 @@ export class Emitter {
     this.emitExportWrappers();
     this.emitGCRoots();
     this.emitMain();
+    this.staticizeTopLevelFunctions();
     return this.out.join('\n') + '\n';
+  }
+
+  // Mark every top-level (file-scope) function that is not reachable from main
+  // or exported as `static`, so clang -O2 can dead-strip it. This is the whole
+  // of the size optimization: built-in class method bodies (Date_ctor,
+  // ByteArray_compress, ...) are emitted as global symbols; a global symbol can
+  // never be dead-code-eliminated because clang must assume another translation
+  // unit might reference it. Making them `static` lets -O2 build a complete
+  // call graph from `main` and drop every builtin a program never touches
+  // (hello.as: 165 KB -> ~34 KB). vtable / reflection tables are already
+  // `static`, so once their referencing method bodies vanish they vanish too —
+  // no manual dependency graph or per-class tree-shaking needed. Only `main`
+  // and [WasmExport] symbols stay global (wasm export table / cross-TU glue).
+  private staticizeTopLevelFunctions(): void {
+    const exported = new Set<string>(['main']);
+    for (const e of this.symbols.exports) {
+      exported.add(e.symbol);
+      if (e.alias) exported.add(e.alias);
+    }
+    const lines = this.out.join('\n').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.trimStart() !== line) continue; // indented: inside a function body
+      const s = line.trim();
+      if (
+        s === '' ||
+        s.startsWith('static ') || s.startsWith('typedef ') || s.startsWith('extern ') ||
+        s.startsWith('struct ') || s.startsWith('#') || s.startsWith('//') ||
+        s.startsWith('/*') || s.startsWith('*')
+      ) continue;
+      // File-scope function definition/declaration: `return-type name(`.
+      const m = line.match(/^([A-Za-z_][A-Za-z0-9_ *]*?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+      if (!m) continue;
+      if (exported.has(m[2])) continue;
+      lines[i] = 'static ' + line;
+    }
+    this.out = lines;
   }
 
   // ---------- helpers ----------
@@ -265,6 +304,17 @@ export class Emitter {
     this.scopes[this.scopes.length - 1].set(name, t);
   }
 
+  // Sanitize a method/field/local/param name to a collision-free C identifier.
+  // Cached so the same AS3 name always maps to the same C name (declaration and
+  // every reference agree); `usedCIdentifiers` keeps distinct names distinct (P2).
+  private cIdent(name: string): string {
+    const cached = this.cNameCache.get(name);
+    if (cached !== undefined) return cached;
+    const c = sanitizeCIdent(name, this.usedCIdentifiers);
+    this.cNameCache.set(name, c);
+    return c;
+  }
+
   private tmpName(prefix: string): string {
     return `_${prefix}${this.tmpCounter++}`;
   }
@@ -319,12 +369,57 @@ export class Emitter {
       this.indent++;
       this.line(`${name}_vtable* vtable;`);
       for (const [fname, f] of info.fields) {
-        this.line(`${this.cTypeName(f.type)} ${fname};`);
+        this.line(`${this.cTypeName(f.type)} ${this.cIdent(fname)};`);
+        // cacheAsBitmap backing store: when the AS3-visible cacheAsBitmap flag is
+        // set, as_render_cached bakes the subtree into an offscreen surface and
+        // caches the SkImage here. Emitted immediately after cacheAsBitmap in
+        // every DisplayObject subclass (the field is inheritance-flattened), so
+        // the offset stays layout-identical when a subclass pointer is cast to
+        // DisplayObject* for rendering. C-runtime only (not AS3-visible).
+        if (fname === 'cacheAsBitmap') {
+          this.line('void* _cache_image;');
+          this.line('double _cache_w;');
+          this.line('double _cache_h;');
+          this.line('int _cache_valid;');
+          // Incremental-redraw state (auto cacheAsBitmap): _auto_fp is the
+          // subtree content fingerprint from the last frame (see
+          // as_render_fingerprint), _auto_still counts consecutive frames with an
+          // unchanged fingerprint, and _auto_baked marks the subtree as currently
+          // baked into _cache_image. A static subtree that stays unchanged for
+          // ASC_AUTO_BAKE_FRAMES frames is baked automatically — no manual
+          // cacheAsBitmap toggle — and re-baked the instant the fingerprint moves.
+          this.line('uint32_t _auto_fp;');
+          this.line('int _auto_still;');
+          this.line('int _auto_baked;');
+        }
       }
       // Dynamic classes (AS3 `dynamic class`) carry a runtime slot table for
       // arbitrary undeclared string-keyed properties. Its byte offset is emitted
       // into the vtable so as_dyn_get/set can reach it.
       if (info.isDynamic) this.line('as_object* _dyn;');
+      // TextField caches its laid-out SkParagraph so repaints and property reads
+      // (textWidth/textHeight/numLines/maxScrollV) reuse one layout instead of
+      // re-measuring every frame. The cache key is the text pointer plus every
+      // property that affects layout/color (width/size/bold/italic/color); any
+      // change rebuilds the paragraph. These fields are C-runtime only — they
+      // are not AS3-visible members.
+      if (name === 'TextField') {
+        this.line('void* _para;');
+        this.line('const char* _para_text;');
+        this.line('double _para_w;');
+        this.line('double _para_size;');
+        this.line('int _para_bold;');
+        this.line('int _para_italic;');
+        this.line('unsigned _para_color;');
+        this.line('int _para_collapse;');
+        this.line('double _para_leading;');
+        this.line('int _sel_begin;');
+        this.line('int _sel_end;');
+        this.line('int _sel_caret;');
+        this.line('as_array* _runs;');
+        this.line('int _html_dirty;');
+        this.line('int _scroll_h;');
+      }
       this.indent--;
       this.line('};');
       this.line('');
@@ -423,7 +518,7 @@ export class Emitter {
   }
 
   private paramDecls(params: Param[]): string {
-    return params.map((p) => `${this.cTypeName(resolveType(p.type))} ${p.name}`).join(', ');
+    return params.map((p) => `${this.cTypeName(resolveType(p.type))} ${this.cIdent(p.name)}`).join(', ');
   }
 
   // Function-pointer field declaration for a vtable slot. The receiver is a
@@ -431,7 +526,7 @@ export class Emitter {
   private methodPtrField(m: MethodInfo, name: string): string {
     const params = m.params.map((p) => this.cTypeName(resolveType(p.type))).join(', ');
     const args = params ? `void*, ${params}` : 'void*';
-    return `${this.cTypeName(m.returnType)} (*${cIdent(name)})(${args})`;
+    return `${this.cTypeName(m.returnType)} (*${this.cIdent(name)})(${args})`;
   }
 
   // Static vtable instance per class, filled with the implementing function for
@@ -505,7 +600,13 @@ export class Emitter {
       this.indent++;
       for (const [fname, f] of info.fields) {
         if (f.owner !== name) continue;
-        this.line(`{ "${this.escapeCString(fname)}", ${this.propTypeTag(f.type)}, offsetof(${name}, ${fname}) },`);
+        this.line(`{ "${this.escapeCString(fname)}", ${this.propTypeTag(f.type)}, offsetof(${name}, ${this.cIdent(fname)}) },`);
+      }
+      // TextField holds GC-managed rich-text runs (an as_array of TextFormat
+      // object refs) that is not an AS3-visible member, so it is marked here
+      // explicitly rather than via a declared field.
+      if (name === 'TextField') {
+        this.line(`{ "_runs", 6, offsetof(TextField, _runs) },`);
       }
       this.line('{ NULL, 0, 0 }');
       this.indent--;
@@ -953,7 +1054,7 @@ export class Emitter {
     for (const b of this.boundMethods.values()) {
       this.emitThunk(
         `${b.cname}_${b.mname}__bound`,
-        `(((${b.cname}*)env)->vtable->${cIdent(b.mname)})`,
+        `(((${b.cname}*)env)->vtable->${this.cIdent(b.mname)})`,
         b.m.params,
         b.m.returnType,
         `((${b.cname}*)env)`,
@@ -973,12 +1074,12 @@ export class Emitter {
     // closure environment structs and heap-allocating constructors
     for (const fn of this.anonFuncs) {
       if (fn.captures.length === 0) continue;
-      const fields = fn.captures.map((c) => `${this.cTypeName(c.type)} ${c.name};`).join(' ');
+      const fields = fn.captures.map((c) => `${this.cTypeName(c.type)} ${this.cIdent(c.name)};`).join(' ');
       this.line(`typedef struct { void (*mark)(void*); ${fields} } ${fn.name}_env;`);
     }
     for (const fn of this.anonFuncs) {
       if (fn.captures.length === 0) continue;
-      const params = fn.captures.map((c) => `${this.cTypeName(c.type)} ${c.name}`).join(', ');
+      const params = fn.captures.map((c) => `${this.cTypeName(c.type)} ${this.cIdent(c.name)}`).join(', ');
       // GC mark callback for the captured environment: trace each captured field
       // that carries a GC pointer (raw object/string) or a boxed as_value. The
       // env is a GCT_CUSTOM object so gc_scan dispatches to this callback, which
@@ -988,8 +1089,8 @@ export class Emitter {
       this.line(`${fn.name}_env* e = (${fn.name}_env*)self;`);
       for (const c of fn.captures) {
         const k = this.captureMarkKind(c.type);
-        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${c.name});`);
-        else if (k === 'value') this.line(`gc_mark_value(e->${c.name});`);
+        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${this.cIdent(c.name)});`);
+        else if (k === 'value') this.line(`gc_mark_value(e->${this.cIdent(c.name)});`);
       }
       this.indent--;
       this.line('}');
@@ -997,7 +1098,7 @@ export class Emitter {
       this.indent++;
       this.line(`${fn.name}_env* e = (${fn.name}_env*)gc_alloc(GCT_CUSTOM, sizeof(${fn.name}_env));`);
       this.line(`e->mark = ${fn.name}_env_mark;`);
-      for (const c of fn.captures) this.line(`e->${c.name} = ${c.name};`);
+      for (const c of fn.captures) this.line(`e->${this.cIdent(c.name)} = ${this.cIdent(c.name)};`);
       this.line('return e;');
       this.indent--;
       this.line('}');
@@ -1156,7 +1257,9 @@ export class Emitter {
     // convert through C's localtime() (AS3 getMonth/getDay are 0-based, matching
     // tm_mon/tm_wday). Constructors: () = now, (ms) = epoch ms, (string) = parsed,
     // (year, month, day, ...) = local calendar components.
-    this.line('void Date_ctor(Date* o) { o->time = as_now_ms(); }');
+    // `time` is a libc symbol (time.h), so the emitted struct field is sanitized
+    // to `_time`; these hand-written accessors must use the same mangled name.
+    this.line('void Date_ctor(Date* o) { o->_time = as_now_ms(); }');
     this.line('Date* Date_new(void) {');
     this.indent++;
     this.line('Date* o = (Date*)gc_alloc(GCT_CLASS, sizeof(Date));');
@@ -1169,7 +1272,7 @@ export class Emitter {
     this.indent++;
     this.line('Date* o = (Date*)gc_alloc(GCT_CLASS, sizeof(Date));');
     this.line('o->vtable = &Date_vt;');
-    this.line('o->time = ms;');
+    this.line('o->_time = ms;');
     this.line('return o;');
     this.indent--;
     this.line('}');
@@ -1194,7 +1297,7 @@ export class Emitter {
     this.indent++;
     this.line('Date* o = (Date*)gc_alloc(GCT_CLASS, sizeof(Date));');
     this.line('o->vtable = &Date_vt;');
-    this.line('o->time = Date_mkms(year, mon, day, hour, min, sec, ms);');
+    this.line('o->_time = Date_mkms(year, mon, day, hour, min, sec, ms);');
     this.line('return o;');
     this.indent--;
     this.line('}');
@@ -1210,8 +1313,8 @@ export class Emitter {
     this.line('return Date_mkms(year, mon - 1, day, hour, min, sec, 0);');
     this.indent--;
     this.line('}');
-    this.line('static struct tm* Date_tm(Date* o) { time_t t = (time_t)(o->time / 1000.0); return localtime(&t); }');
-    this.line('double Date_getTime(void* _this) { return ((Date*)_this)->time; }');
+    this.line('static struct tm* Date_tm(Date* o) { time_t t = (time_t)(o->_time / 1000.0); return localtime(&t); }');
+    this.line('double Date_getTime(void* _this) { return ((Date*)_this)->_time; }');
     this.line('int Date_getFullYear(void* _this) { return Date_tm((Date*)_this)->tm_year + 1900; }');
     this.line('int Date_getMonth(void* _this) { return Date_tm((Date*)_this)->tm_mon; }');
     this.line('int Date_getDate(void* _this) { return Date_tm((Date*)_this)->tm_mday; }');
@@ -1231,7 +1334,7 @@ export class Emitter {
     this.line('}');
     this.line('char* Date_toUTCString(void* _this) {');
     this.indent++;
-    this.line('time_t t = (time_t)(((Date*)_this)->time / 1000.0);');
+    this.line('time_t t = (time_t)(((Date*)_this)->_time / 1000.0);');
     this.line('struct tm* g = gmtime(&t);');
     this.line('static const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};');
     this.line('static const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};');
@@ -1542,6 +1645,13 @@ export class Emitter {
     this.line('o->filters = NULL;');
     this.line('o->transform = Transform_new();');
     this.line('gc_write_barrier((void*)o->transform);');
+    this.line('o->cacheAsBitmap = false;');
+    this.line('o->_cache_image = NULL;');
+    this.line('o->_cache_w = 0.0; o->_cache_h = 0.0;');
+    this.line('o->_cache_valid = 0;');
+    this.line('o->_auto_fp = 0;');
+    this.line('o->_auto_still = 0;');
+    this.line('o->_auto_baked = 0;');
     this.indent--;
     this.line('}');
     this.line('DisplayObject* DisplayObject_new(void) {');
@@ -1574,6 +1684,18 @@ export class Emitter {
     // these filters to the object's subtree (see as_render_filtered below).
     this.line('as_array* DisplayObject_get_filters(void* _this) { return ((DisplayObject*)_this)->filters; }');
     this.line('void DisplayObject_set_filters(void* _this, as_array* value) { DisplayObject* o = (DisplayObject*)_this; o->filters = value; if (value != NULL) gc_write_barrier((void*)value); }');
+    // cacheAsBitmap: toggling invalidates the baked subtree so the next frame
+    // re-bakes (AIR lets apps force a refresh by clearing + re-setting the flag).
+    this.line('bool DisplayObject_get_cacheAsBitmap(void* _this) { return ((DisplayObject*)_this)->cacheAsBitmap; }');
+    this.line('void DisplayObject_set_cacheAsBitmap(void* _this, bool value) {');
+    this.indent++;
+    this.line('DisplayObject* o = (DisplayObject*)_this;');
+    this.line('if (o->cacheAsBitmap == value) return;');
+    this.line('o->cacheAsBitmap = value;');
+    this.line('if (o->_cache_image != NULL) { as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('o->_cache_valid = 0;');
+    this.indent--;
+    this.line('}');
     this.line('');
     // InteractiveObject: DisplayObject + mouse/focus interaction flags.
     this.line('void InteractiveObject_ctor(InteractiveObject* o) {');
@@ -2134,6 +2256,23 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('');
+    // Writable per-app storage (AIR applicationStorageDirectory). A bundled .app is
+    // launched with a non-writable CWD (Xcode runs it with CWD="/"), so "." is not
+    // a safe write target; resolve a stable directory under $HOME and create it.
+    this.line('static char* as_app_storage_dir(void) {');
+    this.indent++;
+    this.line('char* home = as_home_dir();');
+    this.line('char* base = NULL;');
+    this.line('#ifdef __APPLE__');
+    this.line('base = as_path_join(home, "Library/Application Support/as3aot/Local Store");');
+    this.line('#else');
+    this.line('base = as_path_join(home, ".as3aot");');
+    this.line('#endif');
+    this.line('as_mkdirs(base);');
+    this.line('return base;');
+    this.indent--;
+    this.line('}');
+    this.line('');
     // File: a filesystem path bundle. url is "file://" + nativePath.
     this.line('void File_ctor(File* o, char* path) {');
     this.indent++;
@@ -2268,9 +2407,37 @@ export class Emitter {
     // Stage.dispatchMouse(x, y, type): non-standard test hook that hit-tests the
     // tree and dispatches a bubbling MouseEvent from the deepest target, so
     // capture/target/bubble runs against the ancestor chain.
+    // It also drives TextField text selection: mouseDown on a selectable field
+    // starts a drag (caret placed at the hit index), mouseMove extends the
+    // selection, mouseUp ends it. drag_tf is a C static, not a GC root — it only
+    // lives between mouseDown and mouseUp, where no GC safe point runs.
+    this.line('static int as_tf_index_at(TextField* tf, double x, double y);');
     this.line('void Stage_dispatchMouse(void* _this, double x, double y, char* type) {');
     this.indent++;
     this.line('void* target = as_pick_hit(_this, x, y);');
+    this.line('static TextField* drag_tf = NULL;');
+    this.line('if (strcmp(type, "mouseDown") == 0) {');
+    this.indent++;
+    this.line('drag_tf = NULL;');
+    this.line('if (target != NULL && as_is(target, &TextField_vt) && ((TextField*)target)->selectable) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)target;');
+    this.line('int idx = as_tf_index_at(tf, x, y);');
+    this.line('tf->_sel_begin = idx; tf->_sel_end = idx; tf->_sel_caret = idx;');
+    this.line('drag_tf = tf;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('} else if (strcmp(type, "mouseMove") == 0 && drag_tf != NULL) {');
+    this.indent++;
+    this.line('int idx = as_tf_index_at(drag_tf, x, y);');
+    this.line('drag_tf->_sel_end = idx; drag_tf->_sel_caret = idx;');
+    this.indent--;
+    this.line('} else if (strcmp(type, "mouseUp") == 0) {');
+    this.indent++;
+    this.line('drag_tf = NULL;');
+    this.indent--;
+    this.line('}');
     this.line('if (target == NULL) return;');
     this.line('DisplayObject* o = (DisplayObject*)target;');
     this.line('MouseEvent* evt = MouseEvent_new(type, true, false, x - o->x, y - o->y, NULL, false, false, false, false, 0.0);');
@@ -2640,55 +2807,150 @@ export class Emitter {
     this.line('}');
     this.line('');
     // ---- flash.text (stage 38) ----
-    this.line('void TextFormat_ctor(TextFormat* o, char* font, double size, unsigned color, bool bold, bool italic) {');
+    this.line('void TextFormat_ctor(TextFormat* o, char* font, double size, unsigned color, bool bold, bool italic, double leading) {');
     this.indent++;
-    this.line('o->font = font; o->size = size; o->color = color; o->bold = bold; o->italic = italic;');
+    this.line('o->font = font; o->size = size; o->color = color; o->bold = bold; o->italic = italic; o->leading = leading;');
     this.line('gc_write_barrier((void*)font);');
     this.indent--;
     this.line('}');
-    this.line('TextFormat* TextFormat_new(char* font, double size, unsigned color, bool bold, bool italic) {');
+    this.line('TextFormat* TextFormat_new(char* font, double size, unsigned color, bool bold, bool italic, double leading) {');
     this.indent++;
     this.line('TextFormat* o = (TextFormat*)gc_alloc(GCT_CLASS, sizeof(TextFormat));');
     this.line('o->vtable = &TextFormat_vt;');
-    this.line('TextFormat_ctor(o, font, size, color, bold, italic);');
+    this.line('TextFormat_ctor(o, font, size, color, bold, italic, leading);');
     this.line('return o;');
     this.indent--;
     this.line('}');
     this.line('void TextField_ctor(TextField* o) {');
     this.indent++;
     this.line('InteractiveObject_ctor((InteractiveObject*)o);');
+    // AIR: a TextField defaults to 100×100 (unlike other DisplayObjects, which
+    // start at 0×0). The render path clips text to (width,height), so leaving
+    // height at 0 would clip every glyph away when the field is positioned
+    // without an explicit size.
+    this.line('o->width = 100.0; o->height = 100.0;');
     this.line('o->text = NULL;');
-    this.line('o->defaultTextFormat = TextFormat_new(NULL, 12.0, 0x000000u, false, false);');
+    this.line('o->defaultTextFormat = TextFormat_new(NULL, 12.0, 0x000000u, false, false, 0.0);');
     this.line('o->multiline = false;');
     this.line('o->wordWrap = false;');
     this.line('o->background = false;');
     this.line('o->backgroundColor = 0xFFFFFFFFu;');
     this.line('o->scrollV = 1;');
+    this.line('o->_scroll_h = 0;');
+    this.line('o->hscroll = false;');
+    this.line('o->selectable = true;');
+    this.line('o->autoSize = (char*)"none";');
+    this.line('o->_para = NULL;');
+    this.line('o->_para_text = NULL;');
+    this.line('o->_para_w = 0.0;');
+    this.line('o->_para_size = 0.0;');
+    this.line('o->_para_bold = 0;');
+    this.line('o->_para_italic = 0;');
+    this.line('o->_para_color = 0u;');
+    this.line('o->_para_collapse = 0;');
+    this.line('o->_para_leading = 0.0;');
+    this.line('o->_sel_begin = -1;');
+    this.line('o->_sel_end = -1;');
+    this.line('o->_sel_caret = -1;');
+    this.line('o->_runs = NULL;');
+    this.line('o->_html_dirty = 0;');
     this.indent--;
     this.line('}');
     this.line('TextField* TextField_new(void) { TextField* o = (TextField*)gc_alloc(GCT_CLASS, sizeof(TextField)); o->vtable = &TextField_vt; TextField_ctor(o); return o; }');
-    // --- TextField text layout (stage 44) ---
-    // AIR breaks text into display lines: '\n' always starts a new line, and with
-    // wordWrap a line additionally breaks at the last space that still fits width.
-    // Line height is approximated as 1.2 * size (what a 12px _typewriter yields in
-    // AIR, ~15px) because the offscreen Skia path has no font metric table here.
-    this.line('static void as_tf_layout(TextField* tf, AsLines* L) {');
+    // --- TextField text layout (SkParagraph, stage 38/44) ---
+    // TextField lays its text out through SkParagraph (modules/skparagraph), which
+    // shapes with HarfBuzz and breaks lines per UAX#14 — replacing the earlier
+    // self-built greedy word-wrap. The laid-out Paragraph is cached on the object
+    // and keyed on (text pointer, width, size, bold, italic, color): repaints and
+    // property reads reuse one layout instead of re-measuring every frame, and a
+    // width change re-flows automatically (AIR re-wraps when width changes too).
+    // scrollV/maxScrollV remain a viewport-line concern (numLines - visibleLines +
+    // 1) computed from SkParagraph's line metrics; SkParagraph does not model it.
+    this.line('static void* as_tf_paragraph(TextField* tf) {');
     this.indent++;
-    this.line('as_lines_reset(L);');
-    this.line('if (tf->text == NULL) return;');
+    this.line('if (tf->text == NULL || tf->defaultTextFormat == NULL) return NULL;');
     this.line('TextFormat* fmt = tf->defaultTextFormat;');
-    this.line('double size = (fmt != NULL) ? fmt->size : 12.0;');
-    this.line('int bold = (fmt != NULL && fmt->bold) ? 1 : 0;');
-    this.line('int italic = (fmt != NULL && fmt->italic) ? 1 : 0;');
-    // A single-line field keeps '\n' inline instead of breaking (AIR behavior).
-    this.line('if (!tf->multiline) { as_lines_push(L, 0, (int)strlen(tf->text)); return; }');
-    this.line('as_text_wrap(tf->text, tf->wordWrap ? tf->width : 0.0, size, bold, italic, tf->wordWrap ? 1 : 0, L);');
+    this.line('double size = fmt->size;');
+    this.line('int bold = fmt->bold ? 1 : 0;');
+    this.line('int italic = fmt->italic ? 1 : 0;');
+    this.line('double leading = fmt->leading;');
+    // wordWrap wraps whenever a positive width is set, independent of multiline
+    // (AIR wraps a wordWrap=true field even when multiline stays false — the
+    // official wordWrap example sets only wordWrap). multiline instead controls
+    // whether explicit '\n' hard breaks are honored (collapse), not whether the
+    // field auto-wraps.
+    this.line('double w = (tf->wordWrap && tf->width > 0.0) ? tf->width : 0.0;');
+    this.line('int collapse = tf->multiline ? 0 : 1;');
+    this.line('int hasRuns = (tf->_runs != NULL && tf->_runs->length > 0);');
+    this.line('if (tf->_para != NULL && tf->_para_text == tf->text && tf->_para_w == w &&');
+    this.line('    tf->_para_size == size && tf->_para_bold == bold && tf->_para_italic == italic &&');
+    this.line('    tf->_para_color == fmt->color && tf->_para_collapse == collapse && tf->_para_leading == leading &&');
+    this.line('    hasRuns == 0) {');
+    this.indent++;
+    this.line('return tf->_para;');
+    this.indent--;
+    this.line('}');
+    this.line('as_skia_textlayout_delete(tf->_para);');
+    this.line('if (hasRuns) {');
+    this.indent++;
+    // Build a stack sk_text_run[] from the _runs array. Each run is stored as
+    // three consecutive as_value slots: begin (num), end (num), TextFormat (obj).
+    // A stack cap keeps this allocation out of the GC heap (hot render path).
+    this.line('int n = tf->_runs->length / 3;');
+    this.line('if (n > 32) n = 32;');
+    this.line('sk_text_run runs[32];');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('int b = as_v_int_val(tf->_runs->data[i * 3]);');
+    this.line('int e = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
+    this.line('TextFormat* rf = (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]);');
+    this.line('if (rf == NULL) continue;');
+    this.line('runs[i].start = (unsigned)b;');
+    this.line('runs[i].end = (unsigned)e;');
+    this.line('runs[i].family = rf->font;');
+    this.line('runs[i].size = rf->size;');
+    this.line('runs[i].bold = rf->bold ? 1 : 0;');
+    this.line('runs[i].italic = rf->italic ? 1 : 0;');
+    this.line('runs[i].color = rf->color;');
+    this.line('runs[i].leading = rf->leading;');
+    this.indent--;
+    this.line('}');
+    this.line('tf->_para = as_skia_textlayout_new_runs(tf->text, runs, n, w, 0, collapse);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('tf->_para = as_skia_textlayout_new_leading(tf->text, fmt->font, size, bold, italic, fmt->color, leading, w, 0, collapse);');
+    this.indent--;
+    this.line('}');
+    this.line('tf->_para_text = tf->text;');
+    this.line('tf->_para_w = w;');
+    this.line('tf->_para_size = size;');
+    this.line('tf->_para_bold = bold;');
+    this.line('tf->_para_italic = italic;');
+    this.line('tf->_para_color = fmt->color;');
+    this.line('tf->_para_collapse = collapse;');
+    this.line('tf->_para_leading = leading;');
+    this.line('return tf->_para;');
     this.indent--;
     this.line('}');
     this.line('static double as_tf_line_height(TextField* tf) {');
     this.indent++;
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para != NULL) {');
+    this.indent++;
+    this.line('int n = as_skia_textlayout_line_count(para);');
+    this.line('double h = as_skia_textlayout_height(para);');
+    // Average line height = total height / line count. For a single-style
+    // paragraph with AIR's default leading=0 this equals each line's
+    // ascent+descent, and it is exactly consistent with textHeight/numLines so
+    // the viewport math (visible = height / lineHeight) has no float mismatch.
+    this.line('if (n > 0 && h > 0.0) return h / (double)n;');
+    this.indent--;
+    this.line('}');
     this.line('double size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
-    this.line('return size * 1.2;');
+    this.line('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;');
+    this.line('if (lead < 0.0) lead = 0.0;');
+    this.line('return size * 1.2 + lead;');
     this.indent--;
     this.line('}');
     this.line('static int as_tf_visible_lines(TextField* tf) {');
@@ -2701,31 +2963,58 @@ export class Emitter {
     this.line('}');
     this.line('static int as_tf_line_count(TextField* tf) {');
     this.indent++;
-    this.line('AsLines L; as_tf_layout(tf, &L); int n = L.count; as_lines_free(&L); return n;');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para != NULL) {');
+    this.indent++;
+    this.line('int n = as_skia_textlayout_line_count(para);');
+    this.line('return (n < 1) ? 1 : n;');
+    this.indent--;
+    this.line('}');
+    // Pure-C fallback (no Skia linked): count explicit '\n' hard breaks. A
+    // single-line field never breaks (AIR keeps it on one line).
+    this.line('if (tf->text == NULL) return 0;');
+    this.line('if (!tf->multiline) return 1;');
+    this.line('int n = 1;');
+    this.line('for (const char* p = tf->text; *p; p++) if (*p == \'\\n\') n++;');
+    this.line('return n;');
+    this.indent--;
+    this.line('}');
+    // autoSize != "none" makes the field shrink/grow to hug its text: width to
+    // textWidth and height to textHeight (plus a small 2px gutter on each side
+    // matching the paint origin). LEFT/RIGHT/CENTER only differ in anchoring,
+    // which the renderer handles via the alignment already carried by the layout.
+    // Word-wrapping depends on width, so autoSize re-flows: we first size height
+    // from the current wrap width, then width from textWidth, then height once
+    // more. This is called after every property read / render that needs it.
+    this.line('static void as_tf_apply_autosize(TextField* tf) {');
+    this.indent++;
+    this.line('if (tf->autoSize == NULL || strcmp(tf->autoSize, "none") == 0) return;');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para == NULL) return;');
+    this.line('double tw = as_skia_textlayout_max_width(para);');
+    this.line('double th = as_skia_textlayout_height(para);');
+    this.line('tf->width = tw + 4.0;');
+    this.line('tf->height = th + 4.0;');
     this.indent--;
     this.line('}');
     this.line('double TextField_get_textWidth(void* _this) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
-    this.line('if (tf->text == NULL || tf->defaultTextFormat == NULL) return 0.0;');
-    this.line('TextFormat* fmt = tf->defaultTextFormat;');
-    this.line('AsLines L; as_tf_layout(tf, &L);');
-    this.line('double max = 0.0;');
-    this.line('for (int i = 0; i < L.count; i++) {');
-    this.indent++;
-    this.line('double w = as_skia_text_measure_n(tf->text + L.items[i].start, L.items[i].len, fmt->size, fmt->bold, fmt->italic);');
-    this.line('if (w > max) max = w;');
-    this.indent--;
-    this.line('}');
-    this.line('as_lines_free(&L);');
-    this.line('return max;');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para == NULL) return 0.0;');
+    this.line('return as_skia_textlayout_max_width(para);');
     this.indent--;
     this.line('}');
     this.line('double TextField_get_textHeight(void* _this) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
-    this.line('if (tf->defaultTextFormat == NULL) return 0.0;');
-    this.line('return (double)as_tf_line_count(tf) * as_tf_line_height(tf);');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para != NULL) return as_skia_textlayout_height(para);');
+    // Pure-C fallback (no Skia linked): line count × approximated line height.
+    this.line('double size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
+    this.line('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;');
+    this.line('if (lead < 0.0) lead = 0.0;');
+    this.line('return (double)as_tf_line_count(tf) * (size * 1.2 + lead);');
     this.indent--;
     this.line('}');
     this.line('int TextField_get_numLines(void* _this) { return as_tf_line_count((TextField*)_this); }');
@@ -2740,7 +3029,233 @@ export class Emitter {
     this.line('return (m < 1) ? 1 : m;');
     this.indent--;
     this.line('}');
-    // --- flash.geom (stage 58) ---
+    // maxScrollH is the horizontal scroll extent in pixels: the widest line minus
+    // the box width (plus a small gutter). It is 0 unless hscroll is on and the
+    // text actually overflows — AIR clips (not wraps) a wordWrap=false field and
+    // lets scrollH pan it.
+    this.line('int TextField_get_maxScrollH(void* _this) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('if (!tf->hscroll) return 0;');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para == NULL) return 0;');
+    this.line('double tw = as_skia_textlayout_max_width(para);');
+    this.line('double over = tw + 4.0 - tf->width;');
+    this.line('return (over > 0.0) ? (int)(over + 0.999) : 0;');
+    this.indent--;
+    this.line('}');
+    // Map a stage-space point to a caret index in the field's paragraph. The
+    // point is converted to paragraph coordinates: subtract the field's stage
+    // position, undo the paint-origin gutter (2px), and add back the current
+    // scroll offset. SkParagraph returns a UTF-16 code unit; for the ASCII text
+    // this runtime models UTF-16 == UTF-8 byte offset, so the index is directly
+    // compatible with the _sel_* byte offsets. scrollV is clamped like the renderer.
+    this.line('static int as_tf_index_at(TextField* tf, double x, double y) {');
+    this.indent++;
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para == NULL) return 0;');
+    this.line('double lh = as_tf_line_height(tf);');
+    this.line('int vis = as_tf_visible_lines(tf);');
+    this.line('int lc = as_tf_line_count(tf);');
+    this.line('int maxs = lc - vis + 1; if (maxs < 1) maxs = 1;');
+    this.line('int top = tf->scrollV; if (top < 1) top = 1; if (top > maxs) top = maxs;');
+    this.line('double scrollY = (double)(top - 1) * lh;');
+    this.line('int maxsh = TextField_get_maxScrollH((void*)tf);');
+    this.line('int leftpx = tf->hscroll ? tf->_scroll_h : 0;');
+    this.line('if (leftpx < 0) leftpx = 0; if (leftpx > maxsh) leftpx = maxsh;');
+    this.line('double lx = x - tf->x + (double)leftpx - 2.0;');
+    this.line('double ly = y - tf->y + scrollY - 2.0;');
+    this.line('int idx = as_skia_textlayout_glyph_position_at(para, lx, ly);');
+    this.line('if (idx < 0) idx = 0;');
+    this.line('if (tf->text != NULL) { int len = (int)strlen(tf->text); if (idx > len) idx = len; }');
+    this.line('return idx;');
+    this.indent--;
+    this.line('}');
+    // scrollH is clamped to [0, maxScrollH] on assignment (AIR semantics): a
+    // field that fits cannot pan, and scrollH past the overflow extent sticks.
+    this.line('int TextField_get_scrollH(void* _this) { return ((TextField*)_this)->_scroll_h; }');
+    this.line('void TextField_set_scrollH(void* _this, int value) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('int m = TextField_get_maxScrollH(_this);');
+    this.line('if (value < 0) value = 0;');
+    this.line('if (value > m) value = m;');
+    this.line('tf->_scroll_h = value;');
+    this.indent--;
+    this.line('}');
+    // Selection indices are UTF-16 code-unit offsets per AS3, but the runtime
+    // stores strings as UTF-8 bytes and every string index (charAt/substring/
+    // indexOf) is a byte offset. For ASCII text the two coincide, so we report
+    // byte offsets — exact for ASCII, a documented subset limitation otherwise.
+    this.line('int TextField_get_selectionBeginIndex(void* _this) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('if (tf->_sel_begin < 0) return TextField_get_caretIndex(_this);');
+    this.line('return tf->_sel_begin;');
+    this.indent--;
+    this.line('}');
+    this.line('int TextField_get_selectionEndIndex(void* _this) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('if (tf->_sel_end < 0) return TextField_get_caretIndex(_this);');
+    this.line('return tf->_sel_end;');
+    this.indent--;
+    this.line('}');
+    this.line('int TextField_get_caretIndex(void* _this) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('return (tf->_sel_caret < 0) ? 0 : tf->_sel_caret;');
+    this.indent--;
+    this.line('}');
+    this.line('void TextField_setSelection(void* _this, int begin, int end) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('int len = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
+    this.line('if (begin < 0) begin = 0;');
+    this.line('if (end < 0) end = 0;');
+    this.line('if (begin > len) begin = len;');
+    this.line('if (end > len) end = len;');
+    this.line('tf->_sel_begin = begin;');
+    this.line('tf->_sel_end = end;');
+    this.line('tf->_sel_caret = end;');
+    this.indent--;
+    this.line('}');
+    this.line('void TextField_setTextFormat(void* _this, TextFormat* format, int begin, int end) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('if (format == NULL) return;');
+    this.line('int len = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
+    this.line('if (begin < 0) begin = 0;');
+    this.line('if (end < 0 || end > len) end = len;');
+    this.line('if (begin > end) { int t = begin; begin = end; end = t; }');
+    this.line('if (tf->_runs == NULL) tf->_runs = as_array_new();');
+    this.line('as_array_push(tf->_runs, as_v_num((double)begin));');
+    this.line('as_array_push(tf->_runs, as_v_num((double)end));');
+    this.line('as_array_push(tf->_runs, as_v_obj((void*)format));');
+    this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL;');
+    this.indent--;
+    this.line('}');
+    // htmlText setter: parse a small HTML subset into plain text + style runs.
+    // Supported tags: <font color="#RRGGBB" size="N" face="...">, <b>, <i>, <u>,
+    // <p>, <br> (and self-closing <br/>). Everything else is stripped and its
+    // inner text is kept. The result reuses setTextFormat's run encoding (three
+    // as_value slots per run: begin, end, TextFormat object), so as_tf_paragraph
+    // lays it out through sk_textlayout_new_runs exactly like setTextFormat runs.
+    this.line('static void as_tf_html_emit_run(TextField* tf, int begin, int end, char* face, double size, unsigned color, bool bold, bool italic, bool underline) {');
+    this.indent++;
+    this.line('(void)underline; // underline not yet modeled by the TextStyle subset');
+    this.line('if (begin >= end) return;');
+    this.line('if (tf->_runs == NULL) tf->_runs = as_array_new();');
+    this.line('TextFormat* f = TextFormat_new(face, size, color, bold, italic, 0.0);');
+    this.line('as_array_push(tf->_runs, as_v_num((double)begin));');
+    this.line('as_array_push(tf->_runs, as_v_num((double)end));');
+    this.line('as_array_push(tf->_runs, as_v_obj((void*)f));');
+    this.indent--;
+    this.line('}');
+    this.line('static int as_tf_html_parse_hex(const char* s) {');
+    this.indent++;
+    this.line('int v = 0;');
+    this.line('for (int i = 0; i < 6 && s[i]; i++) {');
+    this.indent++;
+    this.line('char c = s[i];');
+    this.line('int d = (c >= \'0\' && c <= \'9\') ? c - \'0\' : (c >= \'a\' && c <= \'f\') ? c - \'a\' + 10 : (c >= \'A\' && c <= \'F\') ? c - \'A\' + 10 : 0;');
+    this.line('v = v * 16 + d;');
+    this.indent--;
+    this.line('}');
+    this.line('return v;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_tf_html_set(TextField* tf, char* html) {');
+    this.indent++;
+    this.line('if (tf->_runs != NULL) { as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_runs = NULL; }');
+    this.line('if (html == NULL) { tf->text = NULL; return; }');
+    // Build plain text (newline normalization) into a GC string, tracking byte
+    // offsets, while accumulating runs from the tags encountered.
+    this.line('size_t n = strlen(html);');
+    this.line('char* out = as_str_alloc(n + 1);');
+    this.line('int opos = 0;');
+    this.line('char* face = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->font : NULL;');
+    this.line('double size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
+    this.line('unsigned color = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->color : 0x000000u;');
+    this.line('bool bold = false, italic = false, underline = false;');
+    this.line('int runStart = 0;');
+    this.line('int i = 0;');
+    this.line('while (i < (int)n) {');
+    this.indent++;
+    this.line('if (html[i] != \'<\') {');
+    this.indent++;
+    this.line('out[opos++] = html[i++];');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    // Find the closing '>', then dispatch on the tag name.
+    this.line('int j = i + 1;');
+    this.line('while (j < (int)n && html[j] != \'>\') j++;');
+    this.line('if (j >= (int)n) { out[opos++] = html[i++]; continue; }');
+    this.line('int tagLen = j - (i + 1);');
+    this.line('char tag[64];');
+    this.line('int tl = tagLen < 63 ? tagLen : 63;');
+    this.line('memcpy(tag, html + i + 1, (size_t)tl);');
+    this.line('tag[tl] = 0;');
+    this.line('int closing = (tagLen > 0 && tag[0] == \'/\');');
+    this.line('char* name = closing ? tag + 1 : tag;');
+    this.line('int nl = 0;');
+    this.line('while (name[nl] && name[nl] != \' \' && name[nl] != \'/\' && name[nl] != \'=\' ) nl++;');
+    this.line('char nm[24]; int k = 0; while (k < nl && k < 23) { nm[k] = name[k]; k++; } nm[k] = 0;');
+    // Flush the run ending here BEFORE any style/break change.
+    this.line('#define AS_TF_FLUSH() do { as_tf_html_emit_run(tf, runStart, opos, face, size, color, bold, italic, underline); runStart = opos; } while (0)');
+    this.line('if (strcmp(nm, "br") == 0) {');
+    this.indent++;
+    this.line('AS_TF_FLUSH();');
+    this.line('out[opos++] = \'\\n\';');
+    this.indent--;
+    this.line('} else if (strcmp(nm, "p") == 0) {');
+    this.indent++;
+    this.line('AS_TF_FLUSH();');
+    this.line('if (opos > 0 && out[opos - 1] != \'\\n\') out[opos++] = \'\\n\';');
+    this.indent--;
+    this.line('} else if (strcmp(nm, "b") == 0) { AS_TF_FLUSH(); bold = !closing; }');
+    this.line('else if (strcmp(nm, "i") == 0) { AS_TF_FLUSH(); italic = !closing; }');
+    this.line('else if (strcmp(nm, "u") == 0) { AS_TF_FLUSH(); underline = !closing; }');
+    this.line('else if (strcmp(nm, "font") == 0 && !closing) {');
+    this.indent++;
+    this.line('AS_TF_FLUSH();');
+    this.line('char* s = tag + nl;');
+    this.line('while (*s) {');
+    this.indent++;
+    this.line('while (*s == \' \' || *s == \'/\') s++;');
+    this.line('if (strncmp(s, "color=", 6) == 0) { s += 6; if (*s == \'"\') s++; if (*s == \'#\') s++; color = (unsigned)as_tf_html_parse_hex(s); }');
+    this.line('else if (strncmp(s, "size=", 5) == 0) { s += 5; if (*s == \'"\') s++; size = atof(s); if (size < 1.0) size = 1.0; }');
+    this.line('else if (strncmp(s, "face=", 5) == 0) { s += 5; if (*s == \'"\') s++; char* e = s; while (*e && *e != \'"\' && *e != \' \' && *e != \'/\') e++; int fl = (int)(e - s); face = as_str_alloc((size_t)fl + 1); memcpy(face, s, (size_t)fl); face[fl] = 0; s = e; }');
+    // Advance past the just-parsed attribute value. A bare '"' (the closing
+    // quote of an attribute) must be skipped too, otherwise the outer `while (*s)`
+    // re-examines it, matches no branch, and spins forever on the same quote.
+    this.line('while (*s && *s != \' \' && *s != \'"\') s++;');
+    this.line('if (*s == \'"\') s++;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('} else if (strcmp(nm, "font") == 0 && closing) {');
+    this.indent++;
+    this.line('AS_TF_FLUSH();');
+    this.line('face = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->font : NULL;');
+    this.line('size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
+    this.line('color = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->color : 0x000000u;');
+    this.indent--;
+    this.line('}');
+    this.line('#undef AS_TF_FLUSH');
+    this.line('i = j + 1;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('as_tf_html_emit_run(tf, runStart, opos, face, size, color, bold, italic, underline);');
+    this.line('out[opos] = 0;');
+    this.line('tf->text = out;');
+    this.indent--;
+    this.line('}');
+    this.line('void TextField_set_htmlText(void* _this, char* value) { as_tf_html_set((TextField*)_this, value); }');
+    this.line('char* TextField_get_htmlText(void* _this) { return ((TextField*)_this)->text; }');
     // Point/Rectangle/Matrix/ColorTransform hold only double fields, so they are
     // plain value bundles (no GC pointers); Transform holds Matrix/ColorTransform
     // object references and is marked via its prop table.
@@ -2883,6 +3398,41 @@ export class Emitter {
     // independent; a partial alpha uses saveLayerAlpha so it multiplies the subtree.
     this.line('static void as_render_object_content(void* canvas, DisplayObject* o);');
     this.line('static void as_render_filtered(void* canvas, DisplayObject* o, as_array* filters, int idx);');
+    this.line('static void as_filters_expand(as_array* filters, double* l, double* t, double* r, double* b);');
+    this.line('');
+    // Transform a local-coordinate AABB by a DisplayObject's full transform —
+    // user Matrix first, then scale, rotate, translate — matching the order
+    // as_render_object applies to the Skia canvas (concat(matrix) AFTER
+    // scale/rotate/translate). Returns the enclosing AABB of the 4 transformed
+    // corners so rotated/scaled/skewed children (via either the built-in fields
+    // or transform.matrix) are never clipped by a bake surface or filter
+    // saveLayer. The old code ignored transform.matrix entirely, which clipped
+    // the GeometryDemos rotate(30deg)/scale/skew boxes.
+    this.line('static void as_bounds_xform(double* l, double* t, double* r, double* b, double x, double y, double rotation, double sx, double sy, Matrix* m) {');
+    this.indent++;
+    this.line('double a = 1.0, mb = 0.0, c = 0.0, d = 1.0, tx = 0.0, ty = 0.0;');
+    this.line('if (m != NULL) { a = m->a; mb = m->b; c = m->c; d = m->d; tx = m->tx; ty = m->ty; }');
+    this.line('double rad = rotation * 3.14159265358979323846 / 180.0;');
+    this.line('double cs = cos(rad), sn = sin(rad);');
+    this.line('double px[4] = { *l, *r, *l, *r };');
+    this.line('double py[4] = { *t, *t, *b, *b };');
+    this.line('double minx = 1e300, miny = 1e300, maxx = -1e300, maxy = -1e300;');
+    this.line('for (int i = 0; i < 4; i++) {');
+    this.indent++;
+    this.line('double qx = px[i], qy = py[i];');
+    this.line('double mx = a * qx + c * qy + tx;');
+    this.line('double my = mb * qx + d * qy + ty;');
+    this.line('mx *= sx; my *= sy;');
+    this.line('double rx = mx * cs - my * sn;');
+    this.line('double ry = mx * sn + my * cs;');
+    this.line('rx += x; ry += y;');
+    this.line('if (rx < minx) minx = rx; if (rx > maxx) maxx = rx;');
+    this.line('if (ry < miny) miny = ry; if (ry > maxy) maxy = ry;');
+    this.indent--;
+    this.line('}');
+    this.line('*l = minx; *t = miny; *r = maxx; *b = maxy;');
+    this.indent--;
+    this.line('}');
     this.line('');
     // Tight local-coordinate bounds for filter saveLayers: the filtered subtree's
     // backing store is limited to the object's own extent (+ blur spread) instead
@@ -2911,6 +3461,39 @@ export class Emitter {
     this.line('TextField* tf = (TextField*)o;');
     this.line('*l = 0.0; *t = 0.0; *r = tf->width; *b = tf->height;');
     this.line('return 1;');
+    this.indent--;
+    this.line('}');
+    // Containers: union of child bounds. Each child's local AABB is transformed
+    // by its full transform (matrix -> scale -> rotate -> translate) via
+    // as_bounds_xform, so rotated/scaled/skewed children — including transform.matrix
+    // — are never clipped.
+    this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('int found = 0;');
+    this.line('if (c->children != NULL) {');
+    this.indent++;
+    this.line('for (int i = 0; i < c->children->length; i++) {');
+    this.indent++;
+    this.line('DisplayObject* ch = (DisplayObject*)as_v_obj_val(c->children->data[i]);');
+    this.line('if (ch == NULL || !ch->visible) continue;');
+    this.line('double cl, ct, cr, cb;');
+    this.line('if (!as_render_bounds(ch, &cl, &ct, &cr, &cb)) continue;');
+    this.line('if (ch->filters != NULL && ch->filters->length > 0) as_filters_expand(ch->filters, &cl, &ct, &cr, &cb);');
+    this.line('Matrix* cm = (ch->transform != NULL) ? ch->transform->matrix : NULL;');
+    this.line('as_bounds_xform(&cl, &ct, &cr, &cb, ch->x, ch->y, ch->rotation, ch->scaleX, ch->scaleY, cm);');
+    this.line('if (!found) { *l = cl; *t = ct; *r = cr; *b = cb; found = 1; }');
+    this.line('else {');
+    this.indent++;
+    this.line('if (cl < *l) *l = cl; if (ct < *t) *t = ct;');
+    this.line('if (cr > *r) *r = cr; if (cb > *b) *b = cb;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('return found;');
     this.indent--;
     this.line('}');
     this.line('return 0;');
@@ -2949,6 +3532,199 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('');
+    // ---- incremental redraw: auto cacheAsBitmap (dirty-free fingerprint) ----
+    // DisplayObject x/y/rotation/scaleX/scaleY/alpha/visible are plain fields
+    // (written directly by generated code, no setter), so they cannot be cheaply
+    // intercepted. Instead of a push dirty flag we compute, each frame, a
+    // recursive *content fingerprint* of the subtree: the object's transform +
+    // its type-specific content (Shape path generation id + paints, Bitmap image,
+    // TextField text/format) + its filters + the recursive fingerprints of its
+    // children. A subtree whose fingerprint is unchanged for ASC_AUTO_BAKE_FRAMES
+    // consecutive frames is treated as static and auto-baked into _cache_image
+    // (reusing the cacheAsBitmap path), so subsequent frames emit a single
+    // drawImage instead of re-walking the subtree. The instant the fingerprint
+    // moves the bake is dropped and the normal path resumes. This is the render-
+    // side equivalent of a dirty flag and mirrors cacheAsBitmap's semantics:
+    // while baked, intra-subtree changes are not tracked until the fingerprint
+    // differs (which any visible change does).
+    this.line('#define ASC_AUTO_BAKE_FRAMES 3');
+    // Device pixel ratio of the current render pass. The render entry points set
+    // it (Stage_render -> its local scale, ASC_window_render -> ASC_win_scale);
+    // as_render_cached reads it to bake cacheAsBitmap/auto-bake offscreen surfaces
+    // at *physical* resolution so the baked image stays crisp when blitted onto a
+    // canvas that has already been scaled by the device ratio (Retina 2x).
+    this.line('static double ASC_render_scale = 1.0;');
+    this.line('');
+    this.line('static inline uint32_t as_fp_u32(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }');
+    this.line('static inline uint32_t as_fp_i32(uint32_t h, int v) { return (h ^ (uint32_t)v) * 16777619u; }');
+    this.line('static inline uint32_t as_fp_ptr(uint32_t h, const void* p) { return (h ^ (uint32_t)(uintptr_t)p) * 16777619u; }');
+    this.line('static inline uint32_t as_fp_bool(uint32_t h, bool v) { return (h ^ (v ? 1u : 0u)) * 16777619u; }');
+    this.line('static inline uint32_t as_fp_dbl(uint32_t h, double v) {');
+    this.indent++;
+    this.line('uint64_t b; memcpy(&b, &v, sizeof b);');
+    this.line('h = as_fp_u32(h, (uint32_t)b); h = as_fp_u32(h, (uint32_t)(b >> 32));');
+    this.line('return h;');
+    this.indent--;
+    this.line('}');
+    this.line('static uint32_t as_render_fp(DisplayObject* o);');
+    this.line('static uint32_t as_render_fp(DisplayObject* o) {');
+    this.indent++;
+    this.line('uint32_t h = 2166136261u;');
+    this.line('if (o == NULL) return h;');
+    this.line('h = as_fp_dbl(h, o->x); h = as_fp_dbl(h, o->y);');
+    this.line('h = as_fp_dbl(h, o->rotation); h = as_fp_dbl(h, o->scaleX); h = as_fp_dbl(h, o->scaleY);');
+    this.line('h = as_fp_dbl(h, o->alpha); h = as_fp_bool(h, o->visible);');
+    this.line('if (o->transform != NULL && o->transform->matrix != NULL) {');
+    this.indent++;
+    this.line('Matrix* m = o->transform->matrix;');
+    this.line('h = as_fp_dbl(h, m->a); h = as_fp_dbl(h, m->b); h = as_fp_dbl(h, m->c);');
+    this.line('h = as_fp_dbl(h, m->d); h = as_fp_dbl(h, m->tx); h = as_fp_dbl(h, m->ty);');
+    this.indent--;
+    this.line('}');
+    this.line('if (as_is(o, &Shape_vt)) {');
+    this.indent++;
+    this.line('Graphics* g = ((Shape*)o)->graphics;');
+    this.line('if (g != NULL) {');
+    this.indent++;
+    this.line('if (g->path != NULL) h = as_fp_u32(h, as_skia_path_generation_id(g->path));');
+    this.line('h = as_fp_ptr(h, g->fill); h = as_fp_ptr(h, g->stroke);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('} else if (as_is(o, &Bitmap_vt)) {');
+    this.indent++;
+    this.line('BitmapData* bd = ((Bitmap*)o)->bitmapData;');
+    this.line('if (bd != NULL) h = as_fp_ptr(h, bd->image);');
+    this.indent--;
+    this.line('} else if (as_is(o, &TextField_vt)) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)o;');
+    this.line('h = as_fp_ptr(h, tf->text); h = as_fp_ptr(h, tf->defaultTextFormat);');
+    this.line('if (tf->defaultTextFormat != NULL) {');
+    this.indent++;
+    this.line('TextFormat* f = tf->defaultTextFormat;');
+    this.line('h = as_fp_ptr(h, f->font); h = as_fp_dbl(h, f->size); h = as_fp_u32(h, f->color);');
+    this.line('h = as_fp_bool(h, f->bold); h = as_fp_bool(h, f->italic); h = as_fp_dbl(h, f->leading);');
+    this.indent--;
+    this.line('}');
+    this.line('h = as_fp_dbl(h, tf->width); h = as_fp_dbl(h, tf->height);');
+    this.line('h = as_fp_bool(h, tf->background); h = as_fp_u32(h, tf->backgroundColor);');
+    this.line('h = as_fp_i32(h, tf->scrollV); h = as_fp_bool(h, tf->hscroll);');
+    this.line('h = as_fp_bool(h, tf->multiline); h = as_fp_bool(h, tf->wordWrap);');
+    this.indent--;
+    this.line('}');
+    this.line('if (o->filters != NULL) {');
+    this.indent++;
+    this.line('h = as_fp_i32(h, o->filters->length);');
+    this.line('for (int i = 0; i < o->filters->length; i++) {');
+    this.indent++;
+    this.line('void* f = as_v_obj_val(o->filters->data[i]);');
+    this.line('if (as_is(f, &BlurFilter_vt)) {');
+    this.indent++;
+    this.line('h = as_fp_dbl(h, ((BlurFilter*)f)->blurX); h = as_fp_dbl(h, ((BlurFilter*)f)->blurY);');
+    this.line('h = as_fp_i32(h, ((BlurFilter*)f)->quality);');
+    this.indent--;
+    this.line('} else if (as_is(f, &DropShadowFilter_vt)) {');
+    this.indent++;
+    this.line('DropShadowFilter* ds = (DropShadowFilter*)f;');
+    this.line('h = as_fp_dbl(h, ds->distance); h = as_fp_dbl(h, ds->angle); h = as_fp_u32(h, ds->color);');
+    this.line('h = as_fp_dbl(h, ds->alpha); h = as_fp_dbl(h, ds->blurX); h = as_fp_dbl(h, ds->blurY);');
+    this.line('h = as_fp_dbl(h, ds->strength); h = as_fp_i32(h, ds->quality);');
+    this.line('h = as_fp_bool(h, ds->inner); h = as_fp_bool(h, ds->knockout); h = as_fp_bool(h, ds->hideObject);');
+    this.indent--;
+    this.line('} else if (as_is(f, &GlowFilter_vt)) {');
+    this.indent++;
+    this.line('GlowFilter* gf = (GlowFilter*)f;');
+    this.line('h = as_fp_u32(h, gf->color); h = as_fp_dbl(h, gf->alpha); h = as_fp_dbl(h, gf->blurX);');
+    this.line('h = as_fp_dbl(h, gf->blurY); h = as_fp_dbl(h, gf->strength); h = as_fp_i32(h, gf->quality);');
+    this.line('h = as_fp_bool(h, gf->inner); h = as_fp_bool(h, gf->knockout);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('if (c->children != NULL) {');
+    this.indent++;
+    this.line('for (int i = 0; i < c->children->length; i++) h = as_fp_u32(h, as_render_fp((DisplayObject*)as_v_obj_val(c->children->data[i])));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // Update the auto-bake state from this frame's fingerprint. Unchanged =>
+    // count a still frame; changed => reset and, if we were baked, drop the bake
+    // (invalidate the cache so the normal path resumes). When the still counter
+    // exactly reaches the threshold and the object has deterministic bounds, mark
+    // it auto-baked; objects without bounds (empty containers) reset so they only
+    // retry the bounds probe every ASC_AUTO_BAKE_FRAMES frames, not every frame.
+    this.line('if (h == o->_auto_fp) { o->_auto_still++; }');
+    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked) { o->_auto_baked = 0; o->_cache_valid = 0; } }');
+    this.line('if (o->visible && !o->cacheAsBitmap && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES) {');
+    this.indent++;
+    this.line('double bl, bt, br, bb;');
+    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) o->_auto_baked = 1; else o->_auto_still = 0;');
+    this.indent--;
+    this.line('}');
+    this.line('return h;');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // cacheAsBitmap: bake the subtree (content + own filters) into an offscreen
+    // surface sized to its tight bounds, snapshot it to an SkImage, and draw that
+    // image every frame instead of re-walking the subtree. The bake is keyed on
+    // the bounds size; toggling cacheAsBitmap off/on (via the setter) invalidates
+    // it. Objects without deterministic bounds (empty containers) fall through to
+    // the normal path.
+    this.line('static void as_render_cached(void* canvas, DisplayObject* o) {');
+    this.indent++;
+    this.line('double bl = 0.0, bt = 0.0, br = 0.0, bb = 0.0;');
+    this.line('if (!as_render_bounds(o, &bl, &bt, &br, &bb)) {');
+    this.indent++;
+    this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(canvas, o, o->filters, o->filters->length - 1);');
+    this.line('else as_render_object_content(canvas, o);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('if (o->filters != NULL && o->filters->length > 0) as_filters_expand(o->filters, &bl, &bt, &br, &bb);');
+    this.line('int lw = (int)ceil(br - bl); int lh = (int)ceil(bb - bt);');
+    this.line('if (lw <= 0 || lh <= 0) { as_render_object_content(canvas, o); return; }');
+    // Bake at physical resolution: the destination canvas is already scaled by the
+    // device ratio, so a 1x logical-sized surface would be magnified (blurry) when
+    // blitted back. Multiply the surface size by ASC_render_scale and scale the
+    // bake canvas the same way, then draw at *logical* size on the scaled canvas.
+    this.line('double sc = ASC_render_scale; if (sc < 1.0) sc = 1.0;');
+    this.line('int pw = (int)ceil((double)lw * sc); int ph = (int)ceil((double)lh * sc);');
+    this.line('if (!o->_cache_valid || o->_cache_image == NULL || o->_cache_w != (double)pw || o->_cache_h != (double)ph) {');
+    this.indent++;
+    this.line('if (o->_cache_image != NULL) { as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('void* surface = as_skia_surface_bake_new(pw, ph);');
+    this.line('if (surface != NULL) {');
+    this.indent++;
+    this.line('void* c2 = as_skia_surface_canvas(surface);');
+    this.line('as_skia_canvas_clear_transparent(c2);');
+    this.line('as_skia_canvas_scale(c2, sc, sc);');
+    this.line('as_skia_canvas_translate(c2, -bl, -bt);');
+    this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(c2, o, o->filters, o->filters->length - 1);');
+    this.line('else as_render_object_content(c2, o);');
+    this.line('o->_cache_image = as_skia_surface_make_snapshot(surface);');
+    this.line('as_skia_surface_delete(surface);');
+    this.line('o->_cache_w = (double)pw; o->_cache_h = (double)ph;');
+    this.line('o->_cache_valid = 1;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('if (o->_cache_image != NULL) {');
+    this.indent++;
+    this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bl, bt, (double)lw, (double)lh);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('');
     this.line('static void as_render_object(void* canvas, DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL || !o->visible) return;');
@@ -2966,7 +3742,11 @@ export class Emitter {
     this.line('as_skia_canvas_concat(canvas, m->a, m->b, m->c, m->d, m->tx, m->ty);');
     this.indent--;
     this.line('}');
-    this.line('if (o->filters != NULL && o->filters->length > 0) {');
+    this.line('if (o->cacheAsBitmap || o->_auto_baked) {');
+    this.indent++;
+    this.line('as_render_cached(canvas, o);');
+    this.indent--;
+    this.line('} else if (o->filters != NULL && o->filters->length > 0) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
     this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) {');
@@ -3070,25 +3850,38 @@ export class Emitter {
     this.line('}');
     this.line('if (tf->text != NULL && tf->defaultTextFormat != NULL) {');
     this.indent++;
-    this.line('TextFormat* fmt = tf->defaultTextFormat;');
-    this.line('AsLines L; as_tf_layout(tf, &L);');
+    this.line('as_tf_apply_autosize(tf);');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para != NULL) {');
+    this.indent++;
     this.line('double lh = as_tf_line_height(tf);');
     this.line('int vis = as_tf_visible_lines(tf);');
-    this.line('int maxs = L.count - vis + 1; if (maxs < 1) maxs = 1;');
+    this.line('int lc = as_tf_line_count(tf);');
+    this.line('int maxs = lc - vis + 1; if (maxs < 1) maxs = 1;');
     this.line('int top = tf->scrollV; if (top < 1) top = 1; if (top > maxs) top = maxs;');
-    this.line('void* paint = as_skia_paint_fill(fmt->color, 1.0);');
+    this.line('double scrollY = (double)(top - 1) * lh;');
+    // Horizontal scroll: hscroll=false clips at width (no pan); hscroll=true lets
+    // scrollH pan within [0, maxScrollH].
+    this.line('int maxsh = TextField_get_maxScrollH((void*)tf);');
+    this.line('int leftpx = tf->hscroll ? tf->_scroll_h : 0;');
+    this.line('if (leftpx < 0) leftpx = 0; if (leftpx > maxsh) leftpx = maxsh;');
+    this.line('double scrollX = (double)leftpx;');
     this.line('as_skia_canvas_save(canvas);');
     this.line('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, tf->width, tf->height);');
-    this.line('for (int i = top - 1; i < L.count && i < (top - 1) + vis; i++) {');
+    // Selection highlight (drawn behind the glyphs, paragraph-relative).
+    this.line('if (tf->_sel_begin >= 0 && tf->_sel_end > tf->_sel_begin) {');
     this.indent++;
-    this.line('double baseline = 2.0 + (double)(i - (top - 1)) * lh + fmt->size * 0.8;');
-    this.line('as_skia_canvas_draw_text_n(canvas, tf->text + L.items[i].start, L.items[i].len,');
-    this.line('    2.0, baseline, fmt->size, fmt->bold, fmt->italic, paint);');
+    this.line('double rl[16], rt[16], rr[16], rb[16];');
+    this.line('int nr = as_skia_textlayout_rects_for_range(para, tf->_sel_begin, tf->_sel_end, rl, rt, rr, rb, 16);');
+    this.line('void* hp = as_skia_paint_fill(0x4D90FEu, 0.35);');
+    this.line('for (int i = 0; i < nr; i++) { as_skia_canvas_draw_rect(canvas, 2.0 - scrollX + rl[i], 2.0 - scrollY + rt[i], rr[i] - rl[i], rb[i] - rt[i], hp); }');
+    this.line('as_skia_paint_delete(hp);');
     this.indent--;
     this.line('}');
+    this.line('as_skia_textlayout_paint(para, canvas, 2.0 - scrollX, 2.0 - scrollY);');
     this.line('as_skia_canvas_restore(canvas);');
-    this.line('as_skia_paint_delete(paint);');
-    this.line('as_lines_free(&L);');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -3120,6 +3913,8 @@ export class Emitter {
     this.line('st->stage_w = (int)width; st->stage_h = (int)height; st->stage_scale = scale;');
     this.line('as_skia_canvas_scale(canvas, scale, scale);');
     this.line('as_skia_canvas_clear(canvas, st->stage_color);');
+    this.line('ASC_render_scale = scale;');
+    this.line('as_render_fp((DisplayObject*)_this);');
     this.line('as_render_object(canvas, (DisplayObject*)_this);');
     this.line('as_skia_surface_save_png(surface, path);');
     this.line('as_skia_surface_delete(surface);');
@@ -3139,6 +3934,10 @@ export class Emitter {
     this.line('static double ASC_win_scale = 1.0;');   // device pixel ratio (2.0 on Retina)
     this.line('static int ASC_win_design_w = 0, ASC_win_design_h = 0;');  // size passed to showWindow
     this.line('static int ASC_win_lw = 0, ASC_win_lh = 0;');              // current logical window size
+    // Physical drawable size (Metal mode: the size passed to sk_mtl_begin_frame,
+    // which re-sizes the CAMetalLayer and acquires the one-shot drawable each
+    // frame). CPU raster mode derives it on demand instead.
+    this.line('static int ASC_win_pw = 0, ASC_win_ph = 0;');
     this.line('static double ASC_win_cx = 1.0, ASC_win_cy = 1.0;');       // content scale (scaleMode)
     this.line('static double ASC_win_ox = 0.0, ASC_win_oy = 0.0;');       // content offset (align)
     // stageWidth/stageHeight follow AIR: under NO_SCALE they track the real window
@@ -3158,7 +3957,14 @@ export class Emitter {
     this.line('static void ASC_window_render(void) {');
     this.indent++;
     this.line('Stage* st = ASC_win_stage;');
-    this.line('if (ASC_win_canvas == NULL || st == NULL) return;');
+    this.line('#ifdef ASC_RENDER_METAL');
+    this.line('void* canvas = as_skia_mtl_begin_frame(ASC_win_pw, ASC_win_ph);');
+    this.line('if (canvas == NULL) return;');
+    this.line('#else');
+    this.line('void* canvas = ASC_win_canvas;');
+    this.line('if (canvas == NULL) return;');
+    this.line('#endif');
+    this.line('if (st == NULL) return;');
     this.line('double cx = 1.0, cy = 1.0;');
     this.line('const char* sm = st->scale_mode;');
     this.line('int dw = ASC_win_design_w, dh = ASC_win_design_h;');
@@ -3186,13 +3992,18 @@ export class Emitter {
     this.line('}');
     this.line('ASC_win_cx = cx; ASC_win_cy = cy; ASC_win_ox = ox; ASC_win_oy = oy;');
     this.line('ASC_window_apply_stage_size();');
-    this.line('as_skia_canvas_clear(ASC_win_canvas, st->stage_color);');
-    this.line('as_skia_canvas_save(ASC_win_canvas);');
-    this.line('as_skia_canvas_scale(ASC_win_canvas, ASC_win_scale, ASC_win_scale);');
-    this.line('as_skia_canvas_translate(ASC_win_canvas, ox, oy);');
-    this.line('as_skia_canvas_scale(ASC_win_canvas, cx, cy);');
-    this.line('as_render_object(ASC_win_canvas, (DisplayObject*)st);');
-    this.line('as_skia_canvas_restore(ASC_win_canvas);');
+    this.line('as_skia_canvas_clear(canvas, st->stage_color);');
+    this.line('as_skia_canvas_save(canvas);');
+    this.line('as_skia_canvas_scale(canvas, ASC_win_scale, ASC_win_scale);');
+    this.line('as_skia_canvas_translate(canvas, ox, oy);');
+    this.line('as_skia_canvas_scale(canvas, cx, cy);');
+    this.line('ASC_render_scale = ASC_win_scale;');
+    this.line('as_render_fp((DisplayObject*)st);');
+    this.line('as_render_object(canvas, (DisplayObject*)st);');
+    this.line('as_skia_canvas_restore(canvas);');
+    this.line('#ifdef ASC_RENDER_METAL');
+    this.line('as_skia_mtl_flush();');
+    this.line('#endif');
     this.indent--;
     this.line('}');
     this.line('static void ASC_window_on_mouse(double x, double y, const char* type) {');
@@ -3246,6 +4057,21 @@ export class Emitter {
     this.line('static void* ASC_window_on_resize(int lw, int lh, int pw, int ph, double scale) {');
     this.indent++;
     this.line('if (lw <= 0 || lh <= 0 || pw <= 0 || ph <= 0) return NULL;');
+    this.line('#ifdef ASC_RENDER_METAL');
+    // Metal: there is no persistent surface to rebuild — the drawable is re-acquired
+    // per frame and sized in sk_mtl_begin_frame from ASC_win_pw/ph. on_resize only
+    // updates the stage dimensions + device scale and fires Event.RESIZE; the next
+    // on_redraw re-renders at the new size. The return value is ignored.
+    this.line('ASC_win_lw = lw; ASC_win_lh = lh;');
+    this.line('ASC_win_pw = pw; ASC_win_ph = ph;');
+    this.line('if (scale <= 0.0) scale = 1.0;');
+    this.line('ASC_win_scale = scale;');
+    this.line('ASC_win_stage->stage_scale = scale;');
+    this.line('ASC_window_apply_stage_size();');
+    this.line('Event* revt = Event_new((char*)"resize", false, false);');
+    this.line('EventDispatcher_dispatchEvent((void*)ASC_win_stage, revt);');
+    this.line('return NULL;');
+    this.line('#else');
     this.line('if (ASC_win_surface != NULL) as_skia_surface_delete(ASC_win_surface);');
     this.line('ASC_win_surface = NULL; ASC_win_canvas = NULL;');
     this.line('void* s = as_skia_surface_new(pw, ph);');
@@ -3267,11 +4093,26 @@ export class Emitter {
     this.line('Event* revt = Event_new((char*)"resize", false, false);');
     this.line('EventDispatcher_dispatchEvent((void*)ASC_win_stage, revt);');
     this.line('return s;');
+    this.line('#endif');
     this.indent--;
     this.line('}');
     this.line('void Stage_showWindow(void* _this, double width, double height, char* title) {');
     this.indent++;
     this.line('Stage* st = (Stage*)_this;');
+    this.line('#ifdef ASC_RENDER_METAL');
+    // Metal: no persistent surface is created up front. The window backend builds
+    // the CAMetalLayer + GrDirectContext and calls on_resize to report the initial
+    // drawable size, then on_redraw acquires a one-shot drawable every frame.
+    this.line('ASC_win_stage = st;');
+    this.line('ASC_win_scale = 1.0;');
+    this.line('st->stage_scale = 1.0;');
+    this.line('ASC_win_design_w = (int)width; ASC_win_design_h = (int)height;');
+    this.line('ASC_win_lw = (int)width; ASC_win_lh = (int)height;');
+    this.line('ASC_win_pw = (int)width; ASC_win_ph = (int)height;');
+    this.line('int fullscreen = (st->display_state != NULL && strcmp(st->display_state, "fullScreen") == 0) ? 1 : 0;');
+    this.line('as_skia_surface_show_window_metal((int)width, (int)height, title, fullscreen, ASC_window_on_mouse, ASC_window_on_wheel, ASC_window_on_redraw, ASC_window_on_frame, ASC_window_on_frame_delay, ASC_window_on_resize);');
+    this.line('ASC_win_stage = NULL;');
+    this.line('#else');
     // The surface must be created at the drawable's physical pixel size *before* the
     // window exists, otherwise SDL resamples a logical-sized texture onto a Retina
     // drawable and everything looks blurry (AIR's "standard" resolution).
@@ -3293,6 +4134,7 @@ export class Emitter {
     // current rather than the pointer we started with.
     this.line('if (ASC_win_surface != NULL) as_skia_surface_delete(ASC_win_surface);');
     this.line('ASC_win_surface = NULL; ASC_win_canvas = NULL;');
+    this.line('#endif');
     this.indent--;
     this.line('}');
     this.line('');
@@ -3577,7 +4419,7 @@ export class Emitter {
         (m): m is Extract<ClassMember, { kind: 'Constructor' }> => m.kind === 'Constructor',
       );
       const params = this.paramDecls(info.constructor.params);
-      const paramNames = info.constructor.params.map((p) => p.name).join(', ');
+      const paramNames = info.constructor.params.map((p) => this.cIdent(p.name)).join(', ');
 
       // init: super() (explicit or implicit) -> own field defaults -> constructor
       // body (no allocation, no vtable write). Inherited fields are NOT re-init'd
@@ -3611,7 +4453,7 @@ export class Emitter {
       for (const [fname, f] of info.fields) {
         if (f.owner !== name) continue; // inherited fields are set by super()
         const init = f.init ? this.convert(this.emitExpr(f.init), f.type) : this.defaultInit(f.type);
-        this.line(`o->${fname} = ${init};`);
+        this.line(`o->${this.cIdent(fname)} = ${init};`);
       }
       if (ctor) {
         const stmts = hasExplicitSuper ? ctorBody.slice(1) : ctorBody;
@@ -3812,7 +4654,7 @@ export class Emitter {
         const ctype = stmt.type !== null ? resolveType(stmt.type) : this.emitExpr(stmt.init!).type;
         this.declareVar(stmt.name, ctype);
         const e = this.emitExpr(stmt.init!);
-        this.line(`${this.constTypeName(ctype)} ${stmt.name} = ${this.convert(e, ctype)};`);
+        this.line(`${this.constTypeName(ctype)} ${this.cIdent(stmt.name)} = ${this.convert(e, ctype)};`);
         break;
       }
       case 'ExprStmt': {
@@ -3866,13 +4708,15 @@ export class Emitter {
         }
         const idx = this.tmpName('i');
         this.pushScope();
+        this.breakTargets.push(this.tryFrames.length);
+        this.continueTargets.push(this.tryFrames.length);
         if (isDict) {
           // Dictionary keys are object references; a declared loop var is boxed
           // (`var key:* in dict`), an existing `Object` var receives the pointer.
           if (stmt.declares) this.declareVar(stmt.varName, { kind: 'any' });
           this.line(`for (int ${idx} = 0; ${idx} < (${it.code})->length; ${idx}++) {`);
           this.indent++;
-          this.line(`${stmt.declares ? `as_value ${stmt.varName} = ` : `${stmt.varName} = `}${stmt.declares ? 'as_v_obj' : ''}((${it.code})->keys[${idx}]);`);
+          this.line(`${stmt.declares ? `as_value ${this.cIdent(stmt.varName)} = ` : `${this.cIdent(stmt.varName)} = `}${stmt.declares ? 'as_v_obj' : ''}((${it.code})->keys[${idx}]);`);
           this.emitStmt(stmt.body);
           this.indent--;
           this.line('}');
@@ -3883,7 +4727,7 @@ export class Emitter {
           if (stmt.declares) this.declareVar(stmt.varName, { kind: 'string' });
           this.line(`for (int ${idx} = 0; ${idx} < (${objCode})->length; ${idx}++) {`);
           this.indent++;
-          this.line(`${stmt.declares ? `char* ${stmt.varName} = ` : `${stmt.varName} = `}(${objCode})->keys[${idx}];`);
+          this.line(`${stmt.declares ? `char* ${this.cIdent(stmt.varName)} = ` : `${this.cIdent(stmt.varName)} = `}(${objCode})->keys[${idx}];`);
           this.emitStmt(stmt.body);
           this.indent--;
           this.line('}');
@@ -3891,11 +4735,13 @@ export class Emitter {
           if (stmt.declares) this.declareVar(stmt.varName, { kind: 'int' });
           this.line(`for (int ${idx} = 0; ${idx} < (${it.code})->length; ${idx}++) {`);
           this.indent++;
-          this.line(`${stmt.declares ? `int ${stmt.varName} = ` : `${stmt.varName} = `}${idx};`);
+          this.line(`${stmt.declares ? `int ${this.cIdent(stmt.varName)} = ` : `${this.cIdent(stmt.varName)} = `}${idx};`);
           this.emitStmt(stmt.body);
           this.indent--;
           this.line('}');
         }
+        this.continueTargets.pop();
+        this.breakTargets.pop();
         this.popScope();
         break;
       }
@@ -3906,20 +4752,24 @@ export class Emitter {
         }
         const idx = this.tmpName('i');
         this.pushScope();
+        this.breakTargets.push(this.tryFrames.length);
+        this.continueTargets.push(this.tryFrames.length);
         this.line(`for (int ${idx} = 0; ${idx} < (${arr.code})->length; ${idx}++) {`);
         this.indent++;
         if (stmt.varType === null) {
           this.declareVar(stmt.varName, { kind: 'any' });
-          this.line(`as_value ${stmt.varName} = as_array_get(${arr.code}, ${idx});`);
+          this.line(`as_value ${this.cIdent(stmt.varName)} = as_array_get(${arr.code}, ${idx});`);
         } else {
           const elemType = resolveType(stmt.varType);
           this.declareVar(stmt.varName, elemType);
           const elem = { code: `as_array_get(${arr.code}, ${idx})`, type: { kind: 'any' } as CType };
-          this.line(`${this.cTypeName(elemType)} ${stmt.varName} = ${this.convert(elem, elemType)};`);
+          this.line(`${this.cTypeName(elemType)} ${this.cIdent(stmt.varName)} = ${this.convert(elem, elemType)};`);
         }
         this.emitStmt(stmt.body);
         this.indent--;
         this.line('}');
+        this.continueTargets.pop();
+        this.breakTargets.pop();
         this.popScope();
         break;
       }
@@ -3937,8 +4787,10 @@ export class Emitter {
         if (stmt.label) {
           const lbl = this.findLabel(stmt.label);
           if (!lbl) throw new CodegenError(`undefined label '${stmt.label}'`);
+          this.emitUnwind(lbl.tryDepth);
           this.line(`goto ${lbl.cName}__end;`);
         } else if (this.suppressBreak === 0) {
+          this.emitUnwind(this.breakTargets[this.breakTargets.length - 1]);
           this.line('break;');
         }
         break;
@@ -3947,15 +4799,17 @@ export class Emitter {
         if (stmt.label) {
           const lbl = this.findLabel(stmt.label);
           if (!lbl) throw new CodegenError(`undefined label '${stmt.label}'`);
+          this.emitUnwind(lbl.tryDepth);
           this.line(`goto ${lbl.cName}__continue;`);
         } else {
+          this.emitUnwind(this.continueTargets[this.continueTargets.length - 1]);
           this.line('continue;');
         }
         break;
       }
       case 'Label': {
         const cName = this.tmpName('lbl');
-        this.labels.push({ asName: stmt.name, cName });
+        this.labels.push({ asName: stmt.name, cName, tryDepth: this.tryFrames.length });
         const cont = `${cName}__continue`;
         if (stmt.body.kind === 'While') this.emitWhile(stmt.body, cont);
         else if (stmt.body.kind === 'For') this.emitFor(stmt.body, cont);
@@ -3970,8 +4824,19 @@ export class Emitter {
           this.sequenceValueExpr(stmt.value, true, true);
           const e = this.emitExpr(stmt.value);
           const code = this.currentReturnType ? this.convert(e, this.currentReturnType) : e.code;
-          this.line(`return ${code};`);
+          if (this.tryFrames.length === 0) {
+            this.line(`return ${code};`);
+          } else {
+            // AS3 evaluates the return value first, then runs any pending finally
+            // blocks, then returns. Capture the value, unwind try frames, return.
+            const retType = this.currentReturnType ?? e.type;
+            const t = this.tmpName('ret');
+            this.line(`${this.cTypeName(retType)} ${t} = ${code};`);
+            this.emitUnwind(0);
+            this.line(`return ${t};`);
+          }
         } else {
+          if (this.tryFrames.length > 0) this.emitUnwind(0);
           this.line('return;');
         }
         break;
@@ -4003,16 +4868,50 @@ export class Emitter {
   }
 
   // Resolve an AS label name to the most recent matching active label.
-  private findLabel(name: string): { asName: string; cName: string } | null {
+  private findLabel(name: string): { asName: string; cName: string; tryDepth: number } | null {
     for (let i = this.labels.length - 1; i >= 0; i--) {
       if (this.labels[i].asName === name) return this.labels[i];
     }
     return null;
   }
 
+  // Emit cleanup for every open try frame above `targetDepth` (innermost first):
+  // pop the jmp stack for still-active frames and re-run any pending finally
+  // body. Used by return/break/continue that exit a try block before its inline
+  // `as_jmp_depth--` / finally code is reached. Re-running the finally here (in
+  // a nested C block so its locals stay isolated) keeps AS3's guarantee that
+  // `finally` always runs, even when a return/break/continue jumps out of the try.
+  private emitUnwind(targetDepth: number): void {
+    for (let i = this.tryFrames.length - 1; i >= targetDepth; i--) {
+      const f = this.tryFrames[i];
+      if (f.active) this.line('as_jmp_depth--;');
+      const fb = f.finallyBody;
+      if (fb) {
+        // Temporarily mark this frame as already-unwound so a return/break/
+        // continue *inside* the finally body does not re-run it (which would
+        // double-pop the jmp stack); restore afterward for later exits.
+        const savedActive = f.active;
+        f.active = false;
+        f.finallyBody = null;
+        this.line('{');
+        this.indent++;
+        this.pushScope();
+        this.emitBlockBody(fb);
+        this.popScope();
+        this.indent--;
+        this.line('}');
+        f.active = savedActive;
+        f.finallyBody = fb;
+      }
+    }
+  }
+
   // Emit loop statements with an optional `continue` label placed at the end of
   // the loop body (where C loops naturally jump back to the condition/update).
   private emitWhile(stmt: Extract<Stmt, { kind: 'While' }>, continueLabel: string | null): void {
+    const depth = this.tryFrames.length;
+    this.breakTargets.push(depth);
+    this.continueTargets.push(depth);
     const c = this.emitExpr(stmt.cond);
     this.line(`while (${this.condExpr(c)}) {`);
     this.indent++;
@@ -4020,9 +4919,14 @@ export class Emitter {
     if (continueLabel) this.line(`${continueLabel}: ;`);
     this.indent--;
     this.line('}');
+    this.continueTargets.pop();
+    this.breakTargets.pop();
   }
 
   private emitDoWhile(stmt: Extract<Stmt, { kind: 'DoWhile' }>, continueLabel: string | null): void {
+    const depth = this.tryFrames.length;
+    this.breakTargets.push(depth);
+    this.continueTargets.push(depth);
     this.line('do {');
     this.indent++;
     this.emitStmt(stmt.body);
@@ -4030,10 +4934,15 @@ export class Emitter {
     this.indent--;
     const c = this.emitExpr(stmt.cond);
     this.line(`} while (${this.condExpr(c)});`);
+    this.continueTargets.pop();
+    this.breakTargets.pop();
   }
 
   private emitFor(stmt: Extract<Stmt, { kind: 'For' }>, continueLabel: string | null): void {
     this.pushScope();
+    const depth = this.tryFrames.length;
+    this.breakTargets.push(depth);
+    this.continueTargets.push(depth);
     let init = '';
     if (stmt.init) {
       if (stmt.init.kind === 'VarDecl') {
@@ -4050,6 +4959,8 @@ export class Emitter {
     if (continueLabel) this.line(`${continueLabel}: ;`);
     this.indent--;
     this.line('}');
+    this.continueTargets.pop();
+    this.breakTargets.pop();
     this.popScope();
   }
 
@@ -4074,12 +4985,19 @@ export class Emitter {
   // `try { ... } catch (e:Error) { ... } finally { ... }` — setjmp/longjmp-based.
   // The handler is pushed onto a global stack so nested try blocks and throws
   // inside catch/finally re-enter the correct outer handler. `finally` always
-  // runs (on normal completion and on a caught/uncaught throw); if the exception
-  // is still pending afterward (a finally-only try, or a throw inside finally),
-  // it is rethrown to the outer handler.
+  // runs — on normal completion, on a caught/uncaught throw, and on an early
+  // return/break/continue out of the try (the last handled by `emitUnwind` in
+  // the Return/Break/Continue cases, which also pops the jmp stack). If the
+  // exception is still pending afterward (a finally-only try, or a throw inside
+  // finally), it is rethrown to the outer handler.
   private emitTry(stmt: Extract<Stmt, { kind: 'Try' }>): void {
     const env = this.tmpName('env');
     const ret = this.tmpName('ex');
+    const frame: { active: boolean; finallyBody: Block | null } = {
+      active: false,
+      finallyBody: stmt.finallyBody ?? null,
+    };
+    this.tryFrames.push(frame);
     this.line('{');
     this.indent++;
     this.line(`jmp_buf ${env};`);
@@ -4087,7 +5005,9 @@ export class Emitter {
     this.line(`if (${ret} == 0) {`);
     this.indent++;
     this.line(`as_jmp_stack[as_jmp_depth++] = &${env};`);
+    frame.active = true;
     this.emitBlockBody(stmt.tryBody);
+    frame.active = false;
     this.line('as_jmp_depth--;');
     this.indent--;
     this.line('} else {');
@@ -4109,7 +5029,7 @@ export class Emitter {
       this.line(`if (as_is(as_exception, &${catchTypeName}_vt)) {`);
       this.indent++;
       this.declareVar(stmt.catchVar, { kind: 'object', className: catchTypeName });
-      this.line(`${catchTypeName}* ${stmt.catchVar} = (${catchTypeName}*)as_exception;`);
+      this.line(`${catchTypeName}* ${this.cIdent(stmt.catchVar)} = (${catchTypeName}*)as_exception;`);
       this.line('as_exception = NULL;');
       this.emitBlockBody(stmt.catchBody);
       this.indent--;
@@ -4119,15 +5039,20 @@ export class Emitter {
       this.line('}');
     }
     if (stmt.finallyBody) {
+      // The finally is now running inline, so a return/break/continue inside it
+      // must not re-run it (its try frame is already popped).
+      frame.finallyBody = null;
       this.emitBlockBody(stmt.finallyBody);
     }
     this.line(`if (${ret} != 0 && as_exception != NULL) as_throw(as_exception);`);
     this.indent--;
     this.line('}');
+    this.tryFrames.pop();
   }
 
   // Integer switch maps to a native C switch (supports fall-through and break).
   private emitSwitchIntegral(stmt: Extract<Stmt, { kind: 'Switch' }>, disc: { code: string; type: CType }): void {
+    this.breakTargets.push(this.tryFrames.length);
     this.line(`switch (${disc.code}) {`);
     this.indent++;
     for (const c of stmt.cases) {
@@ -4143,6 +5068,7 @@ export class Emitter {
     }
     this.indent--;
     this.line('}');
+    this.breakTargets.pop();
   }
 
   // Non-integer switch (string/Number/bool) lowers to an if/else chain using strict
@@ -4193,9 +5119,9 @@ export class Emitter {
     if (init) {
       const e = this.emitExpr(init);
       const code = this.convert(e, ctype);
-      return `${this.cTypeName(ctype)} ${name} = ${code}`;
+      return `${this.cTypeName(ctype)} ${this.cIdent(name)} = ${code}`;
     }
-    return `${this.cTypeName(ctype)} ${name} = ${this.defaultInit(ctype)}`;
+    return `${this.cTypeName(ctype)} ${this.cIdent(name)} = ${this.defaultInit(ctype)}`;
   }
 
   // ---------- expressions ----------
@@ -4450,12 +5376,12 @@ export class Emitter {
     }
     // Captured variable inside a closure: read through the environment pointer.
     if (this.currentClosureCaptures?.has(name)) {
-      return { code: `env->${name}`, type: this.currentClosureCaptures.get(name)! };
+      return { code: `env->${this.cIdent(name)}`, type: this.currentClosureCaptures.get(name)! };
     }
     // Local (block-scoped) variables shadow class members and module globals.
     for (let i = this.scopes.length - 1; i >= 0; i--) {
       const lt = this.scopes[i].get(name);
-      if (lt !== undefined) return { code: name, type: lt };
+      if (lt !== undefined) return { code: this.cIdent(name), type: lt };
     }
     // Unqualified identifier inside a method falls back to a field (this->name),
     // a static field (Class_name), or a getter.
@@ -4466,7 +5392,7 @@ export class Emitter {
         if (!this.symbols.isAccessible(f.visibility, f.owner, this.currentClass)) {
           throw new CodegenError(`field '${name}' is not accessible here`);
         }
-        return { code: `this->${name}`, type: f.type };
+        return { code: `this->${this.cIdent(name)}`, type: f.type };
       }
       const sf = cinfo?.staticFields.get(name);
       if (sf) {
@@ -4580,7 +5506,7 @@ export class Emitter {
       this.line('as_array* arguments = as_array_new();');
       return;
     }
-    const items = params.map((p) => this.boxExpr({ code: p.name, type: resolveType(p.type) }));
+    const items = params.map((p) => this.boxExpr({ code: this.cIdent(p.name), type: resolveType(p.type) }));
     this.line(`as_array* arguments = as_array_make(${params.length}, (as_value[${params.length}]){ ${items.join(', ')} });`);
   }
 
@@ -4992,7 +5918,7 @@ export class Emitter {
         if (!m) throw new CodegenError(`undefined method '${callee.property}' on interface '${obj.type.name}'`);
         const args = this.emitArgs(m.params, expr.args);
         const callArgs = args ? ', ' + args : '';
-        return { code: `(${obj.code}.vt->${cIdent(callee.property)}(${obj.code}.obj${callArgs}))`, type: m.returnType };
+        return { code: `(${obj.code}.vt->${this.cIdent(callee.property)}(${obj.code}.obj${callArgs}))`, type: m.returnType };
       }
       if (obj.type.kind !== 'object') {
         throw new CodegenError(`cannot call method '${callee.property}' on non-object type`);
@@ -5014,7 +5940,7 @@ export class Emitter {
       const args = this.emitArgs(m.params, expr.args);
       const callArgs = args ? ', ' + args : '';
       return {
-        code: `(${obj.code}->vtable->${cIdent(callee.property)}(${obj.code}${callArgs}))`,
+        code: `(${obj.code}->vtable->${this.cIdent(callee.property)}(${obj.code}${callArgs}))`,
         type: m.returnType,
       };
     }
@@ -5032,7 +5958,7 @@ export class Emitter {
           }
           const args = this.emitArgs(m.params, expr.args);
           const callArgs = args ? ', ' + args : '';
-          return { code: `(this->vtable->${cIdent(callee.name)}(this${callArgs}))`, type: m.returnType };
+          return { code: `(this->vtable->${this.cIdent(callee.name)}(this${callArgs}))`, type: m.returnType };
         }
       }
       const builtin = this.emitGlobalCall(callee.name, expr.args);
@@ -5114,8 +6040,9 @@ export class Emitter {
       return this.emitCapabilitiesConst(expr.property);
     }
     // flash.filesystem.File static directory shortcuts (applicationDirectory /
-    // desktopDirectory / documentsDirectory / userDirectory), resolved at runtime
-    // from the process environment rather than a compile-time path.
+    // applicationStorageDirectory / desktopDirectory / documentsDirectory /
+    // userDirectory), resolved at runtime from the process environment rather than
+    // a compile-time path.
     if (expr.object.kind === 'Var' && expr.object.name === 'File') {
       const c = this.emitFileStaticDir(expr.property);
       if (c) return c;
@@ -5193,7 +6120,7 @@ export class Emitter {
       if (!this.symbols.isAccessible(f.visibility, f.owner, this.currentClass)) {
         throw new CodegenError(`field '${expr.property}' is not accessible here`);
       }
-      return { code: `(${obj.code}->${cIdent(expr.property)})`, type: f.type };
+      return { code: `(${obj.code}->${this.cIdent(expr.property)})`, type: f.type };
     }
     // getter accessor: obj.prop -> ClassName_get_prop(obj)
     const g = cinfo?.getters.get(expr.property);
@@ -5648,6 +6575,7 @@ export class Emitter {
   private emitFileStaticDir(name: string): { code: string; type: CType } | null {
     switch (name) {
       case 'applicationDirectory': return { code: 'File_new(as_app_dir())', type: { kind: 'object', className: 'File' } };
+      case 'applicationStorageDirectory': return { code: 'File_new(as_app_storage_dir())', type: { kind: 'object', className: 'File' } };
       case 'desktopDirectory': return { code: 'File_new(as_desktop_dir())', type: { kind: 'object', className: 'File' } };
       case 'documentsDirectory': return { code: 'File_new(as_documents_dir())', type: { kind: 'object', className: 'File' } };
       case 'userDirectory': return { code: 'File_new(as_user_dir())', type: { kind: 'object', className: 'File' } };
@@ -6345,7 +7273,7 @@ export class Emitter {
       case 'uint': return `((int)(${e.code}))`;
       case 'any': return `as_v_int_val(${e.code})`;
       case 'bool': return `(${e.code} ? 1 : 0)`;
-      default: return `((int)(${e.code}))`;
+      default: return `as_to_int32(${e.code})`;
     }
   }
 
@@ -6355,7 +7283,7 @@ export class Emitter {
       case 'uint': return e.code;
       case 'int': return `((unsigned int)(${e.code}))`;
       case 'any': return `as_v_uint_val(${e.code})`;
-      default: return `((unsigned int)(${e.code}))`;
+      default: return `as_to_uint32(${e.code})`;
     }
   }
 
@@ -6395,8 +7323,8 @@ export class Emitter {
     if (this.isRefType(e.type) && (target.kind === 'int' || target.kind === 'uint' || target.kind === 'number' || target.kind === 'bool')) {
       throw new CodegenError(`cannot convert ${this.describeType(e.type)} to ${target.kind}`);
     }
-    if (target.kind === 'int') return `((int)(${e.code}))`;
-    if (target.kind === 'uint') return `((unsigned int)(${e.code}))`;
+    if (target.kind === 'int') return e.type.kind === 'number' ? `as_to_int32(${e.code})` : `((int)(${e.code}))`;
+    if (target.kind === 'uint') return e.type.kind === 'number' ? `as_to_uint32(${e.code})` : `((unsigned int)(${e.code}))`;
     if (target.kind === 'number') return `((double)(${e.code}))`;
     if (target.kind === 'bool') return `((bool)(${e.code}))`;
     if (target.kind === 'object') {

@@ -6,6 +6,7 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <math.h>
 #include <ctype.h>
 #include <setjmp.h>
@@ -437,9 +438,37 @@ static void gc_write_barrier_value(as_value v) {
 // GC mark of a boxed value (declared here, after as_value is defined).
 static void gc_mark_value(as_value v);
 
+// AS3 ToInt32 / ToUint32 (ECMA-262 §9.5, the source of int(x) / implicit
+// Number→int coercion). NaN and ±Infinity map to 0; finite values truncate
+// toward zero and wrap into the 32-bit signed/unsigned range. C's (int) cast
+// is undefined behaviour for NaN/Infinity (wasm traps, x86 yields garbage), so
+// the AS3 number→int coercion must route through these helpers to stay
+// deterministic across the native/wasm/web backends.
+static int as_to_int32(double v) {
+    if (isnan(v) || isinf(v)) return 0;
+    // Fast path: values already inside the int32 range are well-defined under
+    // C's (int) cast (it truncates toward zero, exactly AS3's ToInt32 for
+    // in-range values) and lower to a single cvttsd2si. Only out-of-range
+    // values need the truncate-then-wrap slow path.
+    if (v >= -2147483648.0 && v <= 2147483647.0) return (int)v;
+    double t = v < 0.0 ? ceil(v) : floor(v);   // truncate toward zero
+    double m = fmod(t, 4294967296.0);          // wrap into [0, 2^32)
+    if (m < 0.0) m += 4294967296.0;
+    return (m >= 2147483648.0) ? (int)(m - 4294967296.0) : (int)m;
+}
+static unsigned as_to_uint32(double v) {
+    if (isnan(v) || isinf(v)) return 0;
+    // Same fast path for the unsigned range.
+    if (v >= 0.0 && v <= 4294967295.0) return (unsigned)v;
+    double t = v < 0.0 ? ceil(v) : floor(v);
+    double m = fmod(t, 4294967296.0);
+    if (m < 0.0) m += 4294967296.0;
+    return (unsigned)m;
+}
+
 static double as_v_num_val(as_value v)  { return v.num; }
-static int as_v_int_val(as_value v)     { return (int)v.num; }
-static unsigned as_v_uint_val(as_value v) { return (unsigned)v.num; }
+static int as_v_int_val(as_value v)     { return as_to_int32(v.num); }
+static unsigned as_v_uint_val(as_value v) { return as_to_uint32(v.num); }
 static bool as_v_bool_val(as_value v)   { return v.num != 0.0; }
 // AS3 truthiness for condition contexts (if/while/?:/&&/||): null and undefined
 // are falsy; numbers/booleans are tested by non-zero; empty string is falsy;
@@ -1479,6 +1508,7 @@ static void as_throw(void* e) {
     as_exception = e;
     if (as_jmp_depth == 0) {
         fprintf(stderr, "Uncaught exception: %s\\n", as_error_message(e));
+        fflush(stderr);
         exit(1);
     }
     longjmp(*as_jmp_stack[as_jmp_depth - 1], 1);
@@ -2788,12 +2818,31 @@ static as_value as_json_parse(char* s) {
 // generated C. They are compiled in only when ASC_USE_SKIA is defined (via a
 // build manifest "defines"), so pure-C builds stay link-clean. The stage-37
 // DisplayObject.render() will drive these through as_skia_* semantic wrappers.
+// sk_text_run is defined unconditionally (a plain C struct, no Skia symbols)
+// because the TextField runtime references it even in pure-C builds.
+typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; } sk_text_run;
 #ifdef ASC_USE_SKIA
 extern void* sk_surface_raster_new(int w, int h);
+#ifdef ASC_RENDER_GPU
+extern void* sk_surface_gpu_new(int w, int h);
+extern void sk_gr_flush(void);
+#endif
+#ifdef ASC_RENDER_METAL
+// Native Metal GPU backend (metal_glue.mm). A CAMetalDrawable is one-shot, so the
+// window render loop acquires a fresh surface each frame via sk_mtl_begin_frame,
+// renders into its canvas, then sk_mtl_flush presents the drawable. Unlike the
+// web sk_surface_gpu_new (persistent FBO 0), these are frame-scoped and are only
+// linked for native builds where air-app.ts adds ASC_RENDER_METAL.
+extern int sk_mtl_init(void* layer);
+extern void sk_mtl_destroy(void);
+extern void* sk_mtl_begin_frame(int w, int h);
+extern void sk_mtl_flush(void);
+#endif
 extern void* sk_surface_canvas(void* surface);
 extern void* sk_surface_make_snapshot(void* surface);
 extern void sk_surface_delete(void* surface);
 extern void sk_canvas_clear(void* canvas, unsigned rgb);
+extern void sk_canvas_clear_transparent(void* canvas);
 extern void sk_canvas_save(void* canvas);
 extern void sk_canvas_restore(void* canvas);
 extern void sk_canvas_translate(void* canvas, double x, double y);
@@ -2823,6 +2872,7 @@ extern void sk_path_add_rect(void* path, double x, double y, double w, double h)
 extern void sk_path_add_circle(void* path, double cx, double cy, double r);
 extern void sk_path_close(void* path);
 extern int sk_path_get_bounds(void* path, double* l, double* t, double* r, double* b);
+extern uint32_t sk_path_generation_id(void* path);
 extern int sk_image_encode_png(void* image, const char* path);
 extern void sk_image_delete(void* image);
 extern void sk_paint_set_linear_gradient(void* paint, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1);
@@ -2832,6 +2882,19 @@ extern void sk_canvas_draw_text(void* canvas, const char* text, double x, double
 extern void sk_canvas_draw_text_n(void* canvas, const char* text, int len, double x, double y, double size, int bold, int italic, void* paint);
 extern double sk_text_measure(const char* text, double size, int bold, int italic);
 extern double sk_text_measure_n(const char* text, int len, double size, int bold, int italic);
+extern void* sk_textlayout_new(const char* text, const char* family, double size, int bold, int italic, unsigned color, double width, int align, int collapseNewlines);
+extern void* sk_textlayout_new_leading(const char* text, const char* family, double size, int bold, int italic, unsigned color, double leading, double width, int align, int collapseNewlines);
+extern double sk_textlayout_height(void* para);
+extern double sk_textlayout_max_width(void* para);
+extern int sk_textlayout_line_count(void* para);
+extern void sk_textlayout_paint(void* para, void* canvas, double x, double y);
+extern void sk_textlayout_delete(void* para);
+extern int sk_textlayout_glyph_position_at(void* para, double x, double y);
+extern int sk_textlayout_rects_for_range(void* para, int start, int end, double* lefts, double* tops, double* rights, double* bottoms, int max_rects);
+// A single styled run of a rich-text paragraph (field order/layout must match
+// struct sk_text_run in vendor/skia_glue.cc). Ranges are UTF-8 byte offsets into
+// the (collapseNewlines-normalized) text, half-open [start, end).
+extern void* sk_textlayout_new_runs(const char* text, const sk_text_run* runs, int run_count, double width, int align, int collapseNewlines);
 extern void sk_paint_set_image_filter_blur(void* paint, double sigmaX, double sigmaY);
 extern void sk_paint_set_image_filter_drop_shadow(void* paint, double dx, double dy, double sigmaX, double sigmaY, unsigned rgb, double alpha);
 extern void sk_paint_set_image_filter_glow(void* paint, double sigmaX, double sigmaY, unsigned rgb, double alpha);
@@ -2841,9 +2904,26 @@ extern void sk_canvas_save_layer_paint_bounds(void* canvas, void* paint, double 
 // as_skia_* semantic wrappers: the entry points DisplayObject.render() drives.
 // They are static inline so they emit no symbol unless actually called, keeping
 // pure-C (ASC_USE_SKIA undefined) builds link-clean.
-static inline void* as_skia_surface_new(int w, int h) { return sk_surface_raster_new(w, h); }
+static inline void* as_skia_surface_new(int w, int h) {
+#ifdef ASC_RENDER_GPU
+    return sk_surface_gpu_new(w, h);
+#else
+    return sk_surface_raster_new(w, h);
+#endif
+}
+// Offscreen bake surface (cacheAsBitmap / auto-bake): ALWAYS a CPU raster surface,
+// independent of the window backend. Baking into the GPU FBO 0 (web) or a one-shot
+// Metal drawable is wrong — the bake needs a persistent, sized offscreen surface
+// whose initial contents are undefined on GPU backends but must be cleared to
+// transparent. Raster surfaces always start zeroed, so this keeps the transparent
+// padding invariant (§ AGENTS.md: cacheAsBitmap stays CPU-raster regardless).
+static inline void* as_skia_surface_bake_new(int w, int h) {
+    return sk_surface_raster_new(w, h);
+}
 static inline void* as_skia_surface_canvas(void* s) { return sk_surface_canvas(s); }
 static inline void as_skia_surface_delete(void* s) { sk_surface_delete(s); }
+static inline void* as_skia_surface_make_snapshot(void* s) { return sk_surface_make_snapshot(s); }
+static inline void as_skia_image_delete(void* img) { sk_image_delete(img); }
 static inline void as_skia_surface_save_png(void* s, const char* path) {
     void* img = sk_surface_make_snapshot(s);
     if (img) { sk_image_encode_png(img, path); sk_image_delete(img); }
@@ -2861,6 +2941,7 @@ static inline void* as_skia_paint_stroke(unsigned rgb, double alpha, double widt
 }
 static inline void as_skia_paint_delete(void* p) { sk_paint_delete(p); }
 static inline void as_skia_canvas_clear(void* c, unsigned rgb) { sk_canvas_clear(c, rgb); }
+static inline void as_skia_canvas_clear_transparent(void* c) { sk_canvas_clear_transparent(c); }
 static inline void as_skia_canvas_draw_rect(void* c, double x, double y, double w, double h, void* p) { sk_canvas_draw_rect(c, x, y, w, h, p); }
 static inline void as_skia_canvas_draw_circle(void* c, double cx, double cy, double r, void* p) { sk_canvas_draw_circle(c, cx, cy, r, p); }
 static inline void as_skia_canvas_draw_path(void* c, void* path, void* paint) { sk_canvas_draw_path(c, path, paint); }
@@ -2882,6 +2963,7 @@ static inline void as_skia_path_add_rect(void* p, double x, double y, double w, 
 static inline void as_skia_path_add_circle(void* p, double cx, double cy, double r) { sk_path_add_circle(p, cx, cy, r); }
 static inline void as_skia_path_close(void* p) { sk_path_close(p); }
 static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { return sk_path_get_bounds(p, l, t, r, b); }
+static inline unsigned as_skia_path_generation_id(void* p) { return sk_path_generation_id(p); }
 static inline void as_skia_paint_set_linear_gradient(void* p, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1) { sk_paint_set_linear_gradient(p, x0, y0, x1, y1, rgb0, a0, rgb1, a1); }
 static inline void* as_skia_image_from_file(const char* path) { return sk_image_from_file(path); }
 static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh) { sk_canvas_draw_image_rect(c, img, dx, dy, dw, dh); }
@@ -2889,6 +2971,16 @@ static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, do
 static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, double x, double y, double sz, int bold, int italic, void* p) { sk_canvas_draw_text_n(c, t, len, x, y, sz, bold, italic, p); }
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { return sk_text_measure(t, sz, bold, italic); }
 static inline double as_skia_text_measure_n(const char* t, int len, double sz, int bold, int italic) { return sk_text_measure_n(t, len, sz, bold, italic); }
+static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { return sk_textlayout_new(t, fam, sz, bold, italic, color, w, align, collapse); }
+static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double w, int align, int collapse) { return sk_textlayout_new_leading(t, fam, sz, bold, italic, color, leading, w, align, collapse); }
+static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* runs, int n, double w, int align, int collapse) { return sk_textlayout_new_runs(t, runs, n, w, align, collapse); }
+static inline double as_skia_textlayout_height(void* p) { return sk_textlayout_height(p); }
+static inline double as_skia_textlayout_max_width(void* p) { return sk_textlayout_max_width(p); }
+static inline int as_skia_textlayout_line_count(void* p) { return sk_textlayout_line_count(p); }
+static inline void as_skia_textlayout_paint(void* p, void* c, double x, double y) { sk_textlayout_paint(p, c, x, y); }
+static inline void as_skia_textlayout_delete(void* p) { sk_textlayout_delete(p); }
+static inline int as_skia_textlayout_glyph_position_at(void* p, double x, double y) { return sk_textlayout_glyph_position_at(p, x, y); }
+static inline int as_skia_textlayout_rects_for_range(void* p, int s, int e, double* l, double* t, double* r, double* b, int max) { return sk_textlayout_rects_for_range(p, s, e, l, t, r, b, max); }
 static inline void as_skia_paint_set_blur(void* p, double sx, double sy) { sk_paint_set_image_filter_blur(p, sx, sy); }
 static inline void as_skia_paint_set_drop_shadow(void* p, double dx, double dy, double sx, double sy, unsigned rgb, double a) { sk_paint_set_image_filter_drop_shadow(p, dx, dy, sx, sy, rgb, a); }
 static inline void as_skia_paint_set_glow(void* p, double sx, double sy, unsigned rgb, double a) { sk_paint_set_image_filter_glow(p, sx, sy, rgb, a); }
@@ -2906,6 +2998,18 @@ extern int sk_window_show(void* surface, int w, int h, int pw, int ph, const cha
 extern double sk_window_probe_scale(int w, int h, int highdpi, int* pw, int* ph);
 extern int sk_window_get_display_size(int* w, int* h);
 extern double sk_window_get_display_refresh(void);
+#ifdef ASC_RENDER_METAL
+// Native Metal window backend: no surface is passed in or handed back — the
+// drawable is re-acquired every frame inside on_redraw, so on_resize only
+// reports the new stage dims/scale (its return value is ignored).
+extern int sk_window_show_metal(int w, int h, const char* title, int fullscreen,
+                                void (*on_mouse)(double, double, const char*),
+                                void (*on_wheel)(double, double, double),
+                                void (*on_redraw)(void),
+                                void (*on_frame)(void),
+                                double (*on_frame_delay)(void),
+                                void* (*on_resize)(int, int, int, int, double));
+#endif
 #endif
 // How many physical pixels a logical w*h window draws into. Returns the device
 // scale (2.0 on a Retina display when <requestedDisplayResolution>high is in
@@ -2952,6 +3056,39 @@ static inline int as_skia_surface_show_window(void* s, int w, int h, int pw, int
     (void)on_mouse; (void)on_wheel; (void)on_redraw; (void)on_frame; (void)on_frame_delay; (void)on_resize; return 0;
 #endif
 }
+// Present the Metal GPU window and run its event loop. This is the ASC_RENDER_METAL
+// analogue of as_skia_surface_show_window: no surface crosses the boundary because
+// the drawable is re-acquired per frame. When ASC_RENDER_METAL is not defined this
+// is a safe no-op (and never emitted by the render loop).
+static inline int as_skia_surface_show_window_metal(int w, int h,
+                                                    const char* title, int fullscreen,
+                                                    void (*on_mouse)(double, double, const char*),
+                                                    void (*on_wheel)(double, double, double),
+                                                    void (*on_redraw)(void),
+                                                    void (*on_frame)(void),
+                                                    double (*on_frame_delay)(void),
+                                                    void* (*on_resize)(int, int, int, int, double)) {
+#ifdef ASC_RENDER_METAL
+    return sk_window_show_metal(w, h, title, fullscreen, on_mouse, on_wheel, on_redraw, on_frame, on_frame_delay, on_resize);
+#else
+    (void)w; (void)h; (void)title; (void)fullscreen;
+    (void)on_mouse; (void)on_wheel; (void)on_redraw; (void)on_frame; (void)on_frame_delay; (void)on_resize; return 0;
+#endif
+}
+// Begin a Metal frame: acquire the next one-shot drawable and return its canvas
+// (or NULL). Paired with as_skia_mtl_flush which presents it. No-op otherwise.
+static inline void* as_skia_mtl_begin_frame(int w, int h) {
+#ifdef ASC_RENDER_METAL
+    return sk_mtl_begin_frame(w, h);
+#else
+    (void)w; (void)h; return NULL;
+#endif
+}
+static inline void as_skia_mtl_flush(void) {
+#ifdef ASC_RENDER_METAL
+    sk_mtl_flush();
+#endif
+}
 // Query the primary display resolution (Stage.fullScreenWidth/fullScreenHeight).
 // Returns 0 (and writes 0) when the SDL2 window backend is not linked in.
 static inline int as_window_get_display_size(int* w, int* h) {
@@ -2966,13 +3103,17 @@ static inline int as_window_get_display_size(int* w, int* h) {
 // (they are dead code unless the program uses those classes); these no-op
 // stubs let that code compile and link without a Skia toolchain.
 static inline void* as_skia_surface_new(int w, int h) { (void)w; (void)h; return NULL; }
+static inline void* as_skia_surface_bake_new(int w, int h) { (void)w; (void)h; return NULL; }
 static inline void* as_skia_surface_canvas(void* s) { (void)s; return NULL; }
 static inline void as_skia_surface_delete(void* s) { (void)s; }
+static inline void* as_skia_surface_make_snapshot(void* s) { (void)s; return NULL; }
+static inline void as_skia_image_delete(void* img) { (void)img; }
 static inline void as_skia_surface_save_png(void* s, const char* path) { (void)s; (void)path; }
 static inline void* as_skia_paint_fill(unsigned rgb, double alpha) { (void)rgb; (void)alpha; return NULL; }
 static inline void* as_skia_paint_stroke(unsigned rgb, double alpha, double width) { (void)rgb; (void)alpha; (void)width; return NULL; }
 static inline void as_skia_paint_delete(void* p) { (void)p; }
 static inline void as_skia_canvas_clear(void* c, unsigned rgb) { (void)c; (void)rgb; }
+static inline void as_skia_canvas_clear_transparent(void* c) { (void)c; }
 static inline void as_skia_canvas_draw_rect(void* c, double x, double y, double w, double h, void* p) { (void)c; (void)x; (void)y; (void)w; (void)h; (void)p; }
 static inline void as_skia_canvas_draw_circle(void* c, double cx, double cy, double r, void* p) { (void)c; (void)cx; (void)cy; (void)r; (void)p; }
 static inline void as_skia_canvas_draw_path(void* c, void* path, void* paint) { (void)c; (void)path; (void)paint; }
@@ -2994,6 +3135,7 @@ static inline void as_skia_path_add_rect(void* p, double x, double y, double w, 
 static inline void as_skia_path_add_circle(void* p, double cx, double cy, double r) { (void)p; (void)cx; (void)cy; (void)r; }
 static inline void as_skia_path_close(void* p) { (void)p; }
 static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { (void)p; (void)l; (void)t; (void)r; (void)b; return 0; }
+static inline unsigned as_skia_path_generation_id(void* p) { (void)p; return 0u; }
 static inline void as_skia_paint_set_linear_gradient(void* p, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1) { (void)p; (void)x0; (void)y0; (void)x1; (void)y1; (void)rgb0; (void)a0; (void)rgb1; (void)a1; }
 static inline void* as_skia_image_from_file(const char* path) { (void)path; return NULL; }
 static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh) { (void)c; (void)img; (void)dx; (void)dy; (void)dw; (void)dh; }
@@ -3001,6 +3143,16 @@ static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, do
 static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, double x, double y, double sz, int bold, int italic, void* p) { (void)c; (void)t; (void)len; (void)x; (void)y; (void)sz; (void)bold; (void)italic; (void)p; }
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { (void)t; (void)sz; (void)bold; (void)italic; return 0.0; }
 static inline double as_skia_text_measure_n(const char* t, int len, double sz, int bold, int italic) { (void)t; (void)len; (void)sz; (void)bold; (void)italic; return 0.0; }
+static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)w; (void)align; (void)collapse; return NULL; }
+static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; return NULL; }
+static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)runs; (void)n; (void)w; (void)align; (void)collapse; return NULL; }
+static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
+static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }
+static inline int as_skia_textlayout_line_count(void* p) { (void)p; return 0; }
+static inline void as_skia_textlayout_paint(void* p, void* c, double x, double y) { (void)p; (void)c; (void)x; (void)y; }
+static inline void as_skia_textlayout_delete(void* p) { (void)p; }
+static inline int as_skia_textlayout_glyph_position_at(void* p, double x, double y) { (void)p; (void)x; (void)y; return -1; }
+static inline int as_skia_textlayout_rects_for_range(void* p, int s, int e, double* l, double* t, double* r, double* b, int max) { (void)p; (void)s; (void)e; (void)l; (void)t; (void)r; (void)b; (void)max; return 0; }
 static inline void as_skia_paint_set_blur(void* p, double sx, double sy) { (void)p; (void)sx; (void)sy; }
 static inline void as_skia_paint_set_drop_shadow(void* p, double dx, double dy, double sx, double sy, unsigned rgb, double a) { (void)p; (void)dx; (void)dy; (void)sx; (void)sy; (void)rgb; (void)a; }
 static inline void as_skia_paint_set_glow(void* p, double sx, double sy, unsigned rgb, double a) { (void)p; (void)sx; (void)sy; (void)rgb; (void)a; }
@@ -3011,95 +3163,6 @@ static inline int as_window_get_display_size(int* w, int* h) { if (w) *w = 0; if
 static inline double as_window_device_scale(int w, int h, int* pw, int* ph) { if (pw) *pw = w; if (ph) *ph = h; (void)w; (void)h; return 1.0; }
 static inline double as_window_display_refresh(void) { return 0.0; }
 #endif
-
-// ---------- TextField text layout (stage 44) ----------
-// AIR's TextField breaks text into display lines: an explicit newline always
-// starts a new line, and with wordWrap set a line additionally breaks at the last
-// space that still fits the field width. Widths are measured with the same Skia
-// font used to draw, so the wrap points match what is rendered. A single word
-// wider than the field overflows on its own line rather than being split — that
-// is AIR's behavior too (wordWrap breaks on spaces, never mid-word).
-//
-// A laid-out line is a (start,len) slice *into* the original string, never a copy:
-// AS3 strings come from as_alloc (a bump allocator whose blocks are never freed
-// individually), so copying each line would either leak on every repaint or crash
-// when free() meets an arena pointer. Offsets keep layout allocation-free apart
-// from the index array, which this layer owns.
-typedef struct {
-  int start;
-  int len;
-} AsLine;
-
-typedef struct {
-  AsLine* items;
-  int count;
-  int cap;
-} AsLines;
-
-static void as_lines_push(AsLines* L, int start, int len) {
-  if (L->count == L->cap) {
-    L->cap = L->cap ? L->cap * 2 : 16;
-    L->items = (AsLine*)realloc(L->items, sizeof(AsLine) * (size_t)L->cap);
-  }
-  L->items[L->count].start = start;
-  L->items[L->count].len = len;
-  L->count++;
-}
-
-static void as_lines_reset(AsLines* L) {
-  L->items = NULL; L->count = 0; L->cap = 0;
-}
-
-static void as_lines_free(AsLines* L) {
-  free(L->items);
-  as_lines_reset(L);
-}
-
-// Break the [start,end) half-open slice (no newlines inside) into wrapped lines.
-static void as_text_wrap_segment(const char* text, int start, int end, double maxW,
-                                 double size, int bold, int italic, AsLines* out) {
-  double spaceW = as_skia_text_measure_n(" ", 1, size, bold, italic);
-  int i = start;
-  int lineStart = i;
-  int lastEnd = i;
-  double x = 0.0;
-  if (i >= end) { as_lines_push(out, start, 0); return; }
-  while (i < end) {
-    while (i < end && text[i] == ' ') i++;          // skip inter-word spaces
-    if (i >= end) break;
-    int ws = i;
-    while (i < end && text[i] != ' ') i++;
-    double wordW = as_skia_text_measure_n(text + ws, i - ws, size, bold, italic);
-    double next = (x > 0.0) ? (x + spaceW + wordW) : wordW;
-    if (x > 0.0 && next > maxW) {                   // this word no longer fits
-      as_lines_push(out, lineStart, lastEnd - lineStart);
-      lineStart = ws; x = wordW;
-    } else {
-      x = next;
-    }
-    lastEnd = i;
-  }
-  as_lines_push(out, lineStart, lastEnd - lineStart);
-}
-
-static void as_text_wrap(const char* text, double maxW, double size, int bold, int italic,
-                         int wordWrap, AsLines* out) {
-  as_lines_reset(out);
-  if (text == NULL) return;
-  int n = (int)strlen(text);
-  int start = 0;
-  for (;;) {
-    int nl = start;
-    while (nl < n && text[nl] != '\\n') nl++;
-    if (wordWrap && maxW > 0.0) {
-      as_text_wrap_segment(text, start, nl, maxW, size, bold, italic, out);
-    } else {
-      as_lines_push(out, start, nl - start);
-    }
-    if (nl >= n) break;
-    start = nl + 1;
-  }
-}
 
 // ---------- flash.system.System memory stats ----------
 // There is no AVM2 GC heap in this runtime: totalMemory/freeMemory are a

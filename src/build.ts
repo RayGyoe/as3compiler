@@ -13,8 +13,16 @@ import { resolve, dirname } from 'node:path';
 
 export type Target = 'native' | 'wasm';
 
+// 分发形态（§6 设计）：编译后端产出裸产物之后，如何组织成工程/包。与
+// `target`（机器码 ABI）正交——同一个 package 形态对所有 target 后端复用。
+// 只服务 IDE 开发者，故只有工程生成器（raw 保持现状），没有 app/dmg 脚本路线。
+// `web` 是浏览器页面（.wasm + .js 胶水 + index.html），与 `xcode-project`（macOS
+// 工程）同层级，都只是「如何组织产物」；它要求 target=wasm（emcc 后端）。
+export type Package = 'raw' | 'xcode-project' | 'android-project' | 'web';
+
 export interface BuildConfig {
   target: Target;
+  package: Package;
   cCompiler: string;
   opt: string;
   // extra C/C++ source files compiled together with the generated .c
@@ -33,12 +41,25 @@ export interface BuildConfig {
   // function `function fib(n:int):int` lowers to a same-named C global, which is
   // exported here — the AOT analogue of Emscripten's cwrap/ccall.
   exports: string[];
+  // Font byte-stream URLs (--package web only): the browser fetches these at
+  // runtime and injects them into Skia's custom FreeType font manager, since the
+  // wasm sandbox has no system fonts to enumerate (§html5-web). Empty = render
+  // text as nothing (no font) until the host supplies one.
+  fontUrls: string[];
+  // Application-bundle metadata (--package xcode-project, §6): these shape the
+  // generated macOS .app's Info.plist / build settings. They are *project
+  // configuration*, not CLI flags — carried by the build manifest.
+  bundleId: string;          // e.g. com.example.app (fills CFBundleIdentifier)
+  displayName: string;       // human-readable app name (fills CFBundleName)
+  icon: string | null;       // .icns path (fills CFBundleIconFile); null = none
+  deploymentTarget: string;  // macOS minimum version (fills LSMinimumSystemVersion)
   dry: boolean;
 }
 
 export function defaultBuildConfig(): BuildConfig {
   return {
     target: 'native',
+    package: 'raw',
     cCompiler: 'cc',
     opt: '-O2',
     sources: [],
@@ -49,6 +70,11 @@ export function defaultBuildConfig(): BuildConfig {
     objects: [],
     frameworks: [],
     exports: [],
+    fontUrls: [],
+    bundleId: '',
+    displayName: '',
+    icon: null,
+    deploymentTarget: '12.0',
     dry: false,
   };
 }
@@ -59,6 +85,7 @@ export function defaultBuildConfig(): BuildConfig {
 // same kebab-case names as TypePHP where they overlap.
 interface Manifest {
   target?: 'native' | 'wasm';
+  package?: 'raw' | 'xcode-project' | 'android-project' | 'web';
   'c-compiler'?: string;
   opt?: string;
   sources?: string[];
@@ -69,6 +96,11 @@ interface Manifest {
   objects?: string[];
   frameworks?: string[];
   exports?: string[];
+  'font-urls'?: string[];
+  'bundle-id'?: string;
+  'display-name'?: string;
+  icon?: string;
+  'deployment-target'?: string;
 }
 
 export function loadManifest(path: string): Manifest {
@@ -98,6 +130,7 @@ export function loadManifest(path: string): Manifest {
 export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: string): BuildConfig {
   const next: BuildConfig = { ...cfg };
   if (m.target) next.target = m.target;
+  if (m.package) next.package = m.package;
   if (m['c-compiler']) next.cCompiler = m['c-compiler'];
   if (m.opt) next.opt = m.opt;
   if (m.sources) next.sources = [...cfg.sources, ...m.sources.map((p) => resolveFromManifest(manifestPath, p))];
@@ -108,6 +141,11 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m.objects) next.objects = [...cfg.objects, ...m.objects.map((p) => resolveFromManifest(manifestPath, p))];
   if (m.frameworks) next.frameworks = [...cfg.frameworks, ...m.frameworks];
   if (m.exports) next.exports = [...cfg.exports, ...m.exports];
+  if (m['font-urls']) next.fontUrls = [...cfg.fontUrls, ...m['font-urls']];
+  if (m['bundle-id']) next.bundleId = m['bundle-id'];
+  if (m['display-name']) next.displayName = m['display-name'];
+  if (m.icon) next.icon = resolveFromManifest(manifestPath, m.icon);
+  if (m['deployment-target']) next.deploymentTarget = m['deployment-target'];
   return next;
 }
 
@@ -156,9 +194,11 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
   return [cc, ...args];
 }
 
-// A source file compiled as C++ (Skia glue layer, etc.).
+// A source file compiled as C++ (Skia glue layer, etc.). Objective-C++ (.mm)
+// is included so the native Metal backend (metal_glue.mm) can mix C++ Skia
+// calls with CAMetalLayer/MTLDevice ObjC objects under clang++.
 function isCppSource(path: string): boolean {
-  return /\.(cc|cpp|cxx)$/i.test(path);
+  return /\.(cc|cpp|cxx|mm)$/i.test(path);
 }
 
 // Derive the C++ driver from the configured C compiler (cc -> c++, clang ->
@@ -253,9 +293,12 @@ export function wasmToolchainError(cfg: BuildConfig): string | null {
   return null;
 }
 
-// Run the compiler and propagate failure. Returns true on success.
-export function runCompile(argv: string[]): boolean {
-  const res = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' });
+// Run the compiler and propagate failure. Returns true on success. `extraEnv`
+// (e.g. the Emscripten toolchain's PATH) is merged over the inherited
+// environment rather than replacing it, so unrelated env vars survive.
+export function runCompile(argv: string[], extraEnv?: Record<string, string>): boolean {
+  const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
+  const res = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', env });
   if (res.stderr) process.stderr.write(res.stderr);
   if (res.status !== 0) {
     if (!res.stderr) process.stderr.write(`compilation failed: ${argv.join(' ')}\n`);
@@ -268,4 +311,126 @@ export function runCompile(argv: string[]): boolean {
 // that YAML paths are relative to the YAML file location).
 export function resolveFromManifest(manifestPath: string, p: string): string {
   return resolve(dirname(manifestPath), p);
+}
+
+// ---------- web target (Emscripten) ----------
+//
+// `--target wasm --package web` produces a browser page (.wasm + .js glue +
+// index.html) instead of the WASI command module that `--target wasm` (raw)
+// produces. The frontend still only translates AS -> C; Emscripten is the
+// browser host's compile backend, exactly as wasi clang is the WASI backend and
+// cc/clang is the native backend (§2.9). The toolchain is located the same way
+// as the WASI SDK: an EMSDK_HOME env var pointing at an Emscripten SDK root
+// (which contains upstream/emscripten/emcc).
+
+function emsdkHome(): string | null {
+  return process.env.EMSDK_HOME || process.env.EMSDK || null;
+}
+
+function emccPath(): string {
+  const home = emsdkHome();
+  return home ? `${home}/upstream/emscripten/emcc` : 'emcc';
+}
+
+// emcc is a Python driver that shells out to clang/node; those live in the
+// emsdk's bin dir, so prepend it (and the emscripten dir) to PATH for the
+// child process. Returns undefined when no SDK is configured (then emcc must
+// already be on PATH).
+function webCompileEnv(): Record<string, string> | undefined {
+  const home = emsdkHome();
+  if (!home) return undefined;
+  const emccDir = `${home}/upstream/emscripten`;
+  const binDir = `${home}/upstream/bin`;
+  return { PATH: `${emccDir}:${binDir}:${process.env.PATH || ''}` };
+}
+
+// Probe whether the Emscripten toolchain is usable: emcc must exist and be able
+// to run its version check (which fails without a working node/python driver).
+export function webToolchainError(): string | null {
+  const cc = emccPath();
+  const res = spawnSync(cc, ['--version'], { encoding: 'utf8', env: webCompileEnv() });
+  if (res.error) return `emcc not found: ${cc}`;
+  if (res.status !== 0) {
+    const first = (res.stderr || '').trim().split('\n')[0];
+    return `emcc not usable${first ? ` — ${first}` : ''}`;
+  }
+  return null;
+}
+
+// The env (PATH) handed to every emcc child process for a web build.
+export function webCompileStepsEnv(): Record<string, string> | undefined {
+  return webCompileEnv();
+}
+
+// Build the full set of Emscripten compiler invocations for `--package web`.
+// Structure mirrors buildCompileSteps: compile the generated .c (C99 compound
+// literals, so it must stay on the C path) and any C++ glue sources separately,
+// then link everything with emcc (which auto-links libc++). The output is
+// `<base>.html` plus Emscripten's `<base>.js` + `<base>.wasm` sidecars.
+//
+// Emscripten link flags:
+//   -s ALLOW_MEMORY_GROWTH=1  — Skia raster needs more than the default 16 MB;
+//   -s USE_ZLIB=1             — RUNTIME_PREAMBLE uses <zlib.h> (ByteArray);
+//   (SUPPORT_LONGJMP is left at its default: Emscripten 3.x emulates
+//   setjmp/longjmp for AS3 throw/try/catch without extra flags.)
+export function buildWebCompileSteps(cfg: BuildConfig, cPath: string, base: string): string[][] {
+  const emcc = emccPath();
+  const cppFiles = cfg.sources.filter(isCppSource);
+  const cFiles = [cPath, ...cfg.sources.filter((s) => !isCppSource(s))];
+  const objOf = (src: string): string => src.replace(/\.[^.]+$/, '.o');
+
+  const compileCommon: string[] = [cfg.opt];
+  for (const d of cfg.defines) compileCommon.push('-D', d);
+  for (const p of cfg.includePaths) compileCommon.push('-I', p);
+  // USE_ZLIB must be on the *compile* steps too (not just the link): the
+  // generated .c's RUNTIME_PREAMBLE does `#include <zlib.h>` and emcc only
+  // adds that header's include path when USE_ZLIB is set.
+  compileCommon.push('-s', 'USE_ZLIB=1');
+
+  const steps: string[][] = [];
+  for (const f of cFiles) {
+    steps.push([emcc, '-c', ...compileCommon, f, '-o', objOf(f)]);
+  }
+  // Skia is a C++17 codebase; pin the level for the glue layer exactly as the
+  // native build does. The generated .c above stays C and must not see -std=c++17.
+  // SK_TRIVIAL_ABI must match the wasm libskia.a's build: the wasm build sets
+  // is_trivial_abi=true (gn/BUILDCONFIG.gn default for non-official builds), which
+  // compiles sk_sp with [[clang::trivial_abi]]. If the glue layer omits it, every
+  // Skia call has an ABI mismatch (wasm-ld warns, and it *crashes* at runtime,
+  // not compile time) — see docs/zh-cn/html5-web.md §3.4.
+  for (const f of cppFiles) {
+    steps.push([emcc, '-c', '-std=c++17', ...compileCommon, '-D', 'SK_TRIVIAL_ABI=[[clang::trivial_abi]]', f, '-o', objOf(f)]);
+  }
+
+  const linkArgs: string[] = [emcc, cfg.opt];
+  for (const f of cFiles) linkArgs.push(objOf(f));
+  for (const f of cppFiles) linkArgs.push(objOf(f));
+  for (const o of cfg.objects) linkArgs.push(o);
+  for (const p of cfg.linkPaths) linkArgs.push('-L', p);
+  for (const l of cfg.linkLibs) linkArgs.push('-l', l);
+  linkArgs.push('-s', 'ALLOW_MEMORY_GROWTH=1');
+  linkArgs.push('-s', 'USE_ZLIB=1');
+  // MAX_WEBGL_VERSION=2 enables WebGL2 support in Emscripten's generated JS glue.
+  // The Ganesh GPU backend (GrGLInterfaces::MakeWebGL) links against the WebGL2
+  // function pointers Emscripten exposes under <GLES3/gl32.h>; without this flag
+  // those symbols are undefined at link time and the renderMode=gpu path cannot
+  // build. It is harmless for the cpu path (the JS glue simply never requests a
+  // WebGL2 context unless the app asks for one).
+  linkArgs.push('-s', 'MAX_WEBGL_VERSION=2');
+  // Export the runtime entry points the generated index.html calls from JS:
+  // _malloc/_free to copy fetched font bytes into wasm memory before injecting
+  // them, and _sk_fontmgr_register_data (already EMSCRIPTEN_KEEPALIVE, listed
+  // here for clarity). _main is always exported. Without _malloc/_free the
+  // font-injection code in index.html fails with "Module._malloc is not a
+  // function" and text renders as nothing.
+  linkArgs.push('-s', 'EXPORTED_FUNCTIONS=["_main","_malloc","_free","_sk_fontmgr_register_data"]');
+  // Defer running main() so the host can fetch fonts and inject them before the
+  // first render (see the generated index.html's onRuntimeInitialized). The
+  // index.html is generated by index.ts, not emcc, so emit the JS+wasm sidecars
+  // only (-o base.js) and skip emcc's default HTML shell.
+  linkArgs.push('-s', 'INVOKE_RUN=0');
+  linkArgs.push('-o', `${base}.js`);
+  steps.push(linkArgs);
+
+  return steps;
 }

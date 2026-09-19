@@ -1,0 +1,8 @@
+{
+  "sources": [
+    "/Users/ray.lei/Documents/as3compiler-aot/as3compiler/examples/air-native/air-native.c",
+    "/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/metal_glue.mm",
+    "/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia_glue.cc",
+    "/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/window_glue.cc"
+  ]
+}

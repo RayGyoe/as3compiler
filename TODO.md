@@ -6,7 +6,7 @@
 
 ---
 
-## 当前状态（v0.3.70）
+## 当前状态（v0.3.89）
 
 已实现 AS3 可用子集（面向对象基础 + 数据与迭代 + 标准库 + 接口与类型系统 + 函数进阶 + 包/模块语法兼容 + 异常处理 + 完善与打磨已全部完成）：
 
@@ -39,6 +39,8 @@
 >
 > 纯 AS 项目把图片等资源打进 **SWC**（ZIP 归档），原图不可得时需解析 SWC 提取资源显示 UI。专项调研见 [`docs/zh-cn/swc.md`](docs/zh-cn/swc.md)：SWC 资源**不在 ZIP 顶层**，而是嵌在 `library.swf`（CWS）里以 SWF tag 存放（位图 → `DefineBitsLossless2`/`DefineBitsJPEG2`，经 `SymbolClass` 映射到 `BitmapData` 子类）；「解析 SWC 拿资源」= ZIP 解包 → 解压 SWF → 扫描 tag → 提取像素/JPEG 字节，**编译期**（Node 侧零依赖）完成并嵌入产物，运行时解码复用 Skia。**暂缓开发，后续由用户决定是否实现**（草案见「遗留待开发」表 SWC 资源提取项）。
 >
+> `flash.display3D.*`（Stage3D，可编程 GPU 3D 管线，唯一图元是三角形）另做专项调研，见 [`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)：结论是**可实现且非架构推翻**，是对现有 GPU 基础设施的一次有边界扩展（复用在 `metal_glue.mm` 上新增裸 `MTLBuffer`/渲染通道/MSL），核心难点是 **AGAL 字节码 → MSL/GLSL 的翻译**（有 Ruffle/开源 AGAL→GLSL 成熟参照）。**暂缓开发，后续由用户决定是否实现**（草案见「遗留待开发」表 display3D 项）。
+>
 > 在离屏 PNG 渲染闭环（阶段三十六~三十八）跑通后，新增**阶段三十九**（v0.3.40）：**SDL2 窗口化后端**——
 > `Stage.showWindow(width, height, title)` 把离屏 Skia surface 的像素经 `vendor/window_glue.cc` 上屏到 arm64 SDL2 窗口
 > 并进入事件循环，让带 UI 的 AS3 真正编译为可弹出的原生窗口程序（而非命令行产 PNG 即退出）。窗口/输入交给 SDL2、
@@ -65,11 +67,30 @@
 > `ASC_WINDOW_FIXED=1` 定义创建固定尺寸窗口（与 adl 一致，去除硬编码的 `SDL_WINDOW_RESIZABLE`）；引导代码在 `new Main()`
 > 前预设 `stageWidth/stageHeight`，使 document class 构造时 `trace(stage.stageWidth, stage.stageHeight)` 返回窗口尺寸而非 `0 0`。
 >
-> 继续对齐 adl，新增**阶段四十四**（目标 v0.3.45）：**Retina 高清渲染与 TextField 多行滚动**——解析
+> 继续对齐 adl，新增**阶段四十四**（目标 v0.3.45）：**Retina 高清渲染**——解析
 > `<requestedDisplayResolution>`，`high` 时经 `ASC_DISPLAY_HIGH=1` 开 SDL `ALLOW_HIGHDPI` 并按设备倍率创建
-> 物理像素 surface（消除文字被合成器拉伸的模糊）；TextField 补齐硬换行 + `wordWrap` 软换行 + `clip` 裁剪，
-> `numLines`/`maxScrollV`/`scrollV` 按 AIR 视口语义落地（`scrollV = maxScrollV` 贴底），使 `Log` 的滚动日志
-> 与 adl 一致。顺带修复 `sk_font()` 每次绘制重建 CoreText FontMgr 导致的多行首帧卡死。
+> 物理像素 surface（消除文字被合成器拉伸的模糊）。TextField 的多行排版（硬换行 + `wordWrap` 软换行 + `clip` 裁剪、
+> `numLines`/`maxScrollV`/`scrollV` 按 AIR 视口语义落地、`scrollV = maxScrollV` 贴底）及 `sk_font()` 多行首帧卡死修复
+> 均已并入**阶段三十八**（`TextField` 文本渲染）。
+>
+> 阶段三十八收尾升级（目标 v0.3.72）：**`TextField` 排版改用 SkParagraph**——将 v0.3.45 的自研贪心换行
+> （`as_text_wrap` 按空格断行、每帧重算无缓存、行高 `size × 1.2` 近似）替换为 Skia 官方 `modules/skparagraph`
+> （HarfBuzz shaping + UAX#14 断行 + 真实行高 + 段落级对齐），`skia_glue.cc` 加 `sk_textlayout_*` 桥接、`emit.ts`
+> 加布局缓存（text/width/样式失效 key，宽度变化自动重排），纯 C 回退保留（`numLines` 硬换行计数）。已知限制：
+> UAX#14 在超长单词/连字符处断行与 AIR `wordWrap` 仅空格断行漂移，CJK 逐字断行两者一致。富文本（`htmlText`、
+> 多 `TextFormat` 区间样式）、`autoSize`/`hscroll`/`selectable`/`leading` 已于阶段七十二落地（v0.3.78）。
+>
+> 阶段七十一（`--target wasm --package web`，v0.3.76）之后，继续推进到 v0.3.87：
+> 阶段七十二 **TextField 富文本与排版扩展**（`autoSize`/`hscroll`/`scrollH`/`maxScrollH`/`selectable`/选区/`leading`/
+> `htmlText` + `setTextFormat` 区间样式，v0.3.78）→ 阶段七十三 **`DisplayObject.cacheAsBitmap`** 子树位图缓存
+> （v0.3.79）→ 阶段七十四 **增量重绘自动 cacheAsBitmap**（渲染层指纹 dirty 检测 + 静止子树自动烘焙，v0.3.80）→
+> 阶段七十五 **native Metal 渲染后端**（`renderMode=direct/gpu` → `ASC_RENDER_METAL`，v0.3.83）→ v0.3.84 **修复 web GPU flush 未提交**（`sk_gr_flush` 由 `flush()` 改为 `flushAndSubmit(GrSyncCpu::kNo)`，否则 GL 后端不调 `glFlush`、FBO 0 呈现未初始化品红/碎片化，与 Metal 后端「flush 只记录、submit 才提交」的教训一致）→ 阶段七十六 **C 标识符命名冲突处理**（完整保留字表 + sanitize 全覆盖，v0.3.87）→ 阶段七十七 **try/finally 提前退出的异常栈卫生**（return/break/continue 跳出 try 前回退 `as_jmp_depth` + 运行 pending finally，v0.3.88）→ 阶段七十八 **体积优化 static 化**（内建类方法体/thunk/prototype 加 `static`，`-O2` 自动 tree-shake，hello 165 KB→34 KB，v0.3.89）。
+>
+> 依据对 [Porffor](https://github.com/CanadaHonk/porffor)（架构与 as3compiler 几乎同构的「JS → 可读 C → 原生」AOT）
+> `compiler/render.js` 完整 C 保留字表的评估，新增**阶段七十六**（v0.3.87，已完成）：**C 标识符命名冲突处理**——
+> 把当前仅覆盖「C 语言关键字 + 方法/字段名」的 `cIdent` 扩展为覆盖 libc/libm/POSIX 高频符号的完整保留字表，
+> 并把 sanitize 覆盖到类名/局部变量/形参/模块变量，消除链接 Skia/SDL2/libc 后的符号冲突隐患（如 `index`/`time`/`data`）。
+> 完整方案与分档见 [`docs/zh-cn/c-naming.md`](docs/zh-cn/c-naming.md)。
 
 - 类型：`int / uint / Number / Boolean / String / void / Array / Function / 类名 / 接口名`
 - 字面量：整型、浮点、十六进制（`0xFF`）、字符串（单/双引号）、`true`/`false`、`null`、`Infinity`/`NaN`、数组字面量 `[...]`、对象字面量 `{ ... }`
@@ -646,17 +667,69 @@ GUI 的骨架：`DisplayObject` / `DisplayObjectContainer` / `Stage`，为下一
 
 ---
 
-### 阶段三十八：`TextField` 文本渲染（目标 v0.3.38）
+### 阶段三十八：`TextField` 文本渲染（目标 v0.3.38 → v0.3.72）
 
 补齐 GUI 的文本：`TextField` 用 Skia 的文本能力，不自研排版（`skia.md` §8）。
 
+**单行渲染（v0.3.38）**
+
 - [x] **`SkFont` 基础字形**：`TextField.text` 单行文本 → `SkFont`（`setEmbolden`/`setSkewX` 近似 bold/italic）+ `drawString`
 - [x] **`TextFormat` 样式**：`font`/`size`/`color`/`bold`/`italic` → `SkFont`/`SkPaint`（`SkTypeface` 字体家族选择为后续子阶段）
-- [ ] **`SkParagraph` 完整排版**（后续子阶段）：`wordWrap`/`multiline`/`autoSize`/`textWidth`/`textHeight`/对齐/多段落（链接 `libskparagraph.a`）
 
-> 为控制体量，可先上 `SkFont` 单行方案，把完整排版（SkParagraph）列为后续子阶段（`skia.md` §8）。
+**多行排版（v0.3.45，对齐 adl）**
 
-**验收**：`TextField` 渲染文本为正确字形，`TextFormat` 样式生效；多行换行/对齐（SkParagraph）输出正确（`examples/stage38.as`）。
+adl 里 Log 用 `multiline + wordWrap + scrollV = maxScrollV` 做滚动日志，单行 `drawString` 直绘只能看到第一行。
+首版排版方案不用 SkParagraph（其 UAX#14 换行与 AIR `wordWrap` 仅按空格断行语义漂移），改用 `SkFont` 测量 + 自研
+贪心换行（与阶段二十四~二十七自研正则引擎同理，字形测量/绘制仍全部交给 Skia）；后于 v0.3.72 升级 SkParagraph
+（见下文），以下条目保留为历史记录。
+
+- [x] `runtime.ts` 新增文本排版层：`AsLine{start,len}` / `AsLines` + `as_text_wrap` / `as_text_wrap_segment`
+      （硬换行 + 按空格贪心软换行，宽度用 `as_skia_text_measure_n` 实测，与实际绘制同一字体）
+- [x] **排版只记偏移不复制字符串**：AS3 字符串来自 `as_alloc` bump allocator，逐行 `as_str_slice` 复制再 `free()`
+      会命中「free 非 malloc 指针」崩溃（实测 `malloc: pointer being freed was not allocated`），
+      偏移方案同时避免每次重绘重复分配
+- [x] `skia_glue.cc` 加 `sk_canvas_draw_text_n`（`drawSimpleText` 带字节长度，切片无需重新 `\0` 结尾）
+      与 `sk_canvas_clip_rect`（把行裁进字段框）
+- [x] `emit.ts`：`as_tf_layout` / `as_tf_line_height` / `as_tf_visible_lines` / `as_tf_line_count`，
+      `numLines` 新 getter，`textWidth` 改为逐行取最大宽度，`textHeight = numLines × lineHeight`，
+      `maxScrollV = numLines - visibleLines + 1`（clamp ≥ 1），渲染按 `scrollV` 定位顶行并裁剪
+- [x] **AS3 语义要点**（已写入注释）：`maxScrollV` 是「仍能填满视口的最大顶行号」而非 `numLines`，
+      所以 `scrollV = maxScrollV` 让最新一行贴在框**底部**（滚动日志惯用法），而不是被滚到顶部；
+      `multiline=false` 时换行符不分行；`wordWrap` 只在空格处断行，超长单词整词溢出
+
+**顺带修复的性能阻塞（多行渲染暴露）**
+
+- [x] `skia_glue.cc` 的 `sk_font()` 原先**每次调用**都 `SkFontMgr_New_CoreText` + 枚举排序全部系统字体
+      （`CTFontManagerCopyAvailableFontFamilyNames`）。单行时每帧 1 次无感，多行后每帧几十次 →
+      首帧卡死数十秒（lldb 栈证实卡在字体枚举）。改为 `static sk_sp<SkTypeface>` 缓存，只初始化一次；
+      空闲 CPU 由 19.5% 降到 0.1%
+
+**SkParagraph 完整排版（v0.3.72）**
+
+自研贪心换行按空格断行、逐 word `SkFont` 测量、每帧重算无缓存；改用 Skia 官方 `modules/skparagraph`
+（`libskparagraph.a` 已随链接清单引入），由 HarfBuzz shaping + UAX#14 断行 + 段落级对齐/字间距，一次
+`layout` 复用缓存。
+
+- [x] `skia_glue.cc` 加 `sk_textlayout_new`（FontCollection 单例 + `TextStyle`/`ParagraphStyle` + `layout`）/
+      `_height` / `_max_width` / `_line_count` / `_paint` / `_delete` 桥接，字体家族/字号/颜色/粗斜传入
+- [x] `emit.ts`：`as_tf_paragraph` 替换 `as_tf_layout`，TextField struct 缓存 `_para` 句柄 + 失效 key（text
+      指针/width/size/bold/italic/color/collapse），重绘与属性读取复用一次布局；行高改 `getHeight()/lineNumber()`
+      真实 ascent+descent（不再 `size × 1.2`）；`textWidth = getLongestLine()`、`textHeight = getHeight()`
+- [x] `multiline=false` 单行模式把 `\n` 折叠为空格（AIR 单行不分行，SkParagraph 否则总把 `\n` 当硬换行）
+- [x] 纯 C 回退：`numLines` 硬换行计数、`textHeight = numLines × size × 1.2`，无 Skia 构建的断言语义不变
+- [x] `examples/textflow.as` 断言改基于运行时行高（`textHeight/numLines`）的关系式，纯 C / Skia 双构建通过
+
+**验收**：`examples/stage38.as` 单行渲染正确字形 + `TextFormat` 样式生效；`examples/textflow.as` 断言
+`numLines` / `maxScrollV` / `scrollV` / `appendText` / `textHeight`，在纯 C、Skia 离屏、Skia+Window+HiDPI
+三种构建下均通过；`examples/air-native` 窗口内 Log 显示 Array/ByteArray/JSON 全部行、顶部 Date 段已滚出、
+底部 `=== All demos complete ===` 完整贴底。
+
+**遗留（待实现）**：
+
+- [x] **富文本排版**（多 `TextFormat` 区间样式、`htmlText`）——`setTextFormat` 与 `htmlText`（`<font>`/`<b>`/`<i>`/`<u>`/`<p>`/`<br>` 子集）已落地，走 `ParagraphBuilder` 多 run 样式；对齐/字间距/多段落仍待后续
+- [x] TextField 已支持 `autoSize` / `hscroll` / `selectable` / HTML 文本
+- [x] `leading` 字段已建模（`TextFormat.leading` 经 `StrutStyle` 接线）
+- [ ] `_para` 缓存随 TextField 被 GC 回收时 C++ 侧 paragraph 不释放（UI 对象长生命周期，影响有限）
 
 ---
 
@@ -833,12 +906,10 @@ SDL2（arm64 静态库），符合「前端只翻译、窗口/像素交给成熟
 
 ---
 
-### 阶段四十四：Retina 高清渲染与 TextField 多行滚动（目标 v0.3.45）
+### 阶段四十四：Retina 高清渲染（目标 v0.3.45）
 
-对齐 adl 的两处可见差异：窗口文字模糊（`requestedDisplayResolution` 未处理）、Log 文本不换行不滚动
-（TextField 仍是单行渲染）。**已完成（v0.3.45）**。
-
-**差异 1：Retina 模糊 —— `<requestedDisplayResolution>high</requestedDisplayResolution>`**
+对齐 adl 的可见差异：窗口文字模糊（`requestedDisplayResolution` 未处理）。**已完成（v0.3.45）**。
+（TextField 多行排版内容已并入阶段三十八，见上文。）
 
 根因：SDL2 默认不给窗口原生分辨率的 drawable（drawable 尺寸 == 逻辑尺寸），Skia 按逻辑点出的帧被
 macOS 合成器拉伸 2x 上屏 → 文字发虚。AIR 的 `high` 正是「按设备原生分辨率渲染」，`standard` 才允许拉伸。
@@ -855,45 +926,13 @@ macOS 合成器拉伸 2x 上屏 → 文字发虚。AIR 的 `high` 正是「按�
 - [x] 验证：`screencapture -l<windowid>` 抓得 **2000×1424**（窗口 1000×712 逻辑 × 2），文字边缘锐利；
       离屏 `render` 出 **2000×1360** PNG
 
-**差异 2：TextField 不换行、不滚动**
-
-adl 里 Log 用 `multiline + wordWrap + scrollV = maxScrollV` 做滚动日志，我们此前 `drawString` 单行直绘、
-`maxScrollV` 恒返回 1，只能看到第一行。
-
-- [x] `runtime.ts` 新增文本排版层：`AsLine{start,len}` / `AsLines` + `as_text_wrap` / `as_text_wrap_segment`
-      （硬换行 + 按空格贪心软换行，宽度用 `as_skia_text_measure_n` 实测，与实际绘制同一字体）
-- [x] **排版只记偏移不复制字符串**：AS3 字符串来自 `as_alloc` bump allocator，逐行 `as_str_slice` 复制再 `free()`
-      会命中「free 非 malloc 指针」崩溃（实测 `malloc: pointer being freed was not allocated`），
-      偏移方案同时避免每次重绘重复分配
-- [x] `skia_glue.cc` 加 `sk_canvas_draw_text_n`（`drawSimpleText` 带字节长度，切片无需重新 `\0` 结尾）
-      与 `sk_canvas_clip_rect`（把行裁进字段框）
-- [x] `emit.ts`：`as_tf_layout` / `as_tf_line_height` / `as_tf_visible_lines` / `as_tf_line_count`，
-      `numLines` 新 getter，`textWidth` 改为逐行取最大宽度，`textHeight = numLines × lineHeight`，
-      `maxScrollV = numLines - visibleLines + 1`（clamp ≥ 1），渲染按 `scrollV` 定位顶行并裁剪
-- [x] **AS3 语义要点**（已写入注释）：`maxScrollV` 是「仍能填满视口的最大顶行号」而非 `numLines`，
-      所以 `scrollV = maxScrollV` 让最新一行贴在框**底部**（滚动日志惯用法），而不是被滚到顶部；
-      `multiline=false` 时换行符不分行；`wordWrap` 只在空格处断行，超长单词整词溢出
-- [x] 验证：`examples/air-native` 窗口内 Log 显示 Array/ByteArray/JSON 全部行、顶部 Date 段已滚出、
-      底部 `=== All demos complete ===` 完整贴底
-
-**顺带修复的性能阻塞（多行渲染暴露）**
-
-- [x] `skia_glue.cc` 的 `sk_font()` 原先**每次调用**都 `SkFontMgr_New_CoreText` + 枚举排序全部系统字体
-      （`CTFontManagerCopyAvailableFontFamilyNames`）。单行时每帧 1 次无感，多行后每帧几十次 →
-      首帧卡死数十秒（lldb 栈证实卡在字体枚举）。改为 `static sk_sp<SkTypeface>` 缓存，只初始化一次；
-      空闲 CPU 由 19.5% 降到 0.1%
-
-**验收**：`examples/textflow.as` 断言 `numLines` / `maxScrollV` / `scrollV` / `appendText` / `textHeight`，
-在纯 C、Skia 离屏、Skia+Window+HiDPI 三种构建下均通过；`--air-app` 产物截图为 2x 物理像素且文字清晰；
-回归 53 passed / 0 failed。
+**验收**：`--air-app` 产物截图为 2x 物理像素且文字清晰；回归 53 passed / 0 failed。
 
 **遗留**：
 
 - [ ] `contentsScaleFactor` 只在 `render`/`showWindow` 时写入，document class 构造期读到的是初始 `1.0`
       （adl 在 stage 创建时就已知倍率）；与 `stageWidth` 同类时序问题，需把 probe 提前到 bootstrap
-- [ ] 行高用 `size × 1.2` 近似（Skia 未取字体 metrics 表），`leading` 字段未建模
 - [ ] 全屏时 `ASC_DISPLAY_HIGH` 的 drawable 倍率取自主屏 probe（跨屏拖动后的倍率已在 resize 回调重算解决，见「跨显示器帧率/缩放修复 v2」）
-- [ ] TextField 仍不支持 `autoSize` / `hscroll` / `selectable` / HTML 文本；排版无缓存（每帧重算，demo 规模无碍）
 
 ---
 
@@ -1327,6 +1366,7 @@ TweenDemo: tween complete, box.x=532.7..., box.y=148.89...
 | **P1** | 六十五 ✅ | `flash.system.Capabilities`（version/os/cpuArchitecture/… 环境能力查询） | 纯静态只读类，与 `System` 同范式；`version` 编译期注入 package.json 版本，os/cpu 走条件编译，屏幕/locale 走轻量平台探测 |
 | **P1** | 六十六 ✅ | `Vector.<T>` 高阶/序列方法（slice/concat/splice/forEach/map/filter/sort/reverse）+ 字面量 `new <T>[...]` + 闭包 env/`as_vector` 迁 GC | 补齐 Vector 与 Array 方法对等、GC 遗留 malloc 收尾；回调复用 as_value 装箱/解箱路径 |
 | **P1** | 六十七 ✅ | 三子系统 deferred 收尾（动态类建模/异步事件调度/`DisplayObject.transform` 接线） | 动态类机制落地 `URLVariables`；无网络后端用 `setTimeout(0)` 模拟异步 IO；`transform` 接线到 Skia canvas |
+| **P1** | 六十八 ✅ | 增量重绘自动 `cacheAsBitmap`（渲染层指纹 dirty 检测 + 静止子树自动烘焙） | 对齐 adl 性能（native 单线程全量重绘 CPU 占用为 adl 3 倍）；`DisplayObject` 变换字段直接写无法拦截，改渲染入口每帧递归指纹，静止子树自动烘焙跳过 Skia 命令生成 |
 
 ---
 
@@ -1608,6 +1648,287 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 ---
 
+#### 阶段六十八：`--package xcode-project` 工程生成器（macOS）（目标 v0.3.70 → v0.3.71）✅ 已完成
+
+**依据**：`compile.md` §6 的「编译后端 vs 分发形态」正交拆分设计——`--target` 只承载机器码 ABI，
+`--package` 承载编译后的组织形态；只服务 IDE 开发者，故 `--package` 只做工程生成器（`raw` + `xcode-project`
++ `android-project`），不做 `app`/`dmg` 脚本路线。本阶段落地第一个工程生成器：`xcode-project`（macOS）。
+
+- [x] **`Package` 类型与配置**：`build.ts` 新增 `type Package = 'raw' | 'xcode-project' | 'android-project'`；
+  `BuildConfig.package`（默认 `raw`）+ manifest `package` 字段 + CLI `--package` 参数，均走「CLI beats manifest」合并
+- [x] **`src/xcode-project.ts` 生成器**：把生成的**可读 C** + manifest 的 `sources`/`include-paths`/`link-libs`/
+  `link-paths`/`defines`/`objects`/`frameworks` 组织成 `.xcodeproj`（`project.pbxproj` + 共享 scheme）；目标类型
+  `com.apple.product-type.tool`（macOS 命令行工具），与 raw `cc -O2` 产物同构
+- [x] **编译配置镜像 raw 链接**：`OTHER_LDFLAGS` 恒含 `-lm -lz` 再拼 `link-libs`/`objects`/`frameworks`；
+  `HEADER_SEARCH_PATHS`/`LIBRARY_SEARCH_PATHS`/`GCC_PREPROCESSOR_DEFINITIONS` 分别镜像三类路径/宏；
+  `GCC_OPTIMIZATION_LEVEL` 从 `--opt` 的 `-O{0,1,2,3,s}` 映射；路径按绝对路径写入，任意工作目录可解析
+- [x] **关闭 `-fmodules`（关键语义修复）**：生成 C 的裸类型名（`Point`/`Rectangle`…）会与 macOS SDK 的
+  `MacTypes.h` 里的 `Point` 冲突；Xcode 默认启用 `-fmodules` 会让 SDK `Point` 遮蔽生成 struct（
+  `no member named 'x' in 'struct Point'`），故工程显式 `CLANG_ENABLE_MODULES = NO`，与命令行构建语义一致
+- [x] **C/C++ 分层**：生成 `.c` 保持 C99（`GCC_C_LANGUAGE_STANDARD = c99`），C++ 胶水层（`skia_glue.cc` 等）
+  C++17（`CLANG_CXX_LANGUAGE_STANDARD = "c++17"` + `CLANG_CXX_LIBRARY = "libc++"`），按扩展名自动分派
+
+**验收**：`as-aot examples/hello.as --target native --package xcode-project` 生成工程后，
+`xcodebuild -project ... -scheme Hello build` 成功，产物运行输出与 raw 一致；GUI 工程
+（`examples/window.as` + Skia/SDL2 manifest，含 13 个 framework + C++ 胶水层）同样 `xcodebuild` 构建成功；
+全量回归 **73 passed / 0 failed**。
+
+---
+
+#### 阶段六十九：`--package xcode-project` 升级为 macOS application（目标 v0.3.71 → v0.3.72）✅ 已完成
+
+**依据**：上一阶段（六十八）的 xcode-project 是 `com.apple.product-type.tool`（命令行工具），产物与 raw
+的裸 Mach-O 运行时等价，无法兑现「IDE 开发者上架路线」的 App 身份（无 bundle、无 Info.plist、不能签名
+上架、Dock 无正式图标）。本阶段把目标类型升级为 `com.apple.product-type.application`，产物变成 `.app`
+bundle，让 xcode-project 真正与 raw 分道扬镳。
+
+- [x] **application 目标类型**：`productType` 由 `tool` 改 `application`（`wrapper.application`），
+  `buildPhases` 增补 **Resources** 段；产物 `Contents/MacOS/<bin>` + `Contents/Info.plist` +
+  `Contents/Resources/` + `PkgInfo`；共享 scheme 的 `BuildableName` 改为 `<NAME>.app`
+- [x] **`Info.plist` 生成**：`generateXcodeProject` 额外写 `<outDir>/<product>/Info.plist`；
+  `CFBundleIdentifier`/`CFBundleExecutable`/`LSMinimumSystemVersion` 用 `$(PRODUCT_BUNDLE_IDENTIFIER)`/
+  `$(EXECUTABLE_NAME)`/`$(MACOSX_DEPLOYMENT_TARGET)` 注入与构建设置同步；`CFBundleName` 填 `display-name`
+- [x] **manifest 应用元数据**：`build.ts` 新增 `bundleId`/`displayName`/`icon`/`deploymentTarget` 四字段 +
+  manifest 键 `bundle-id`/`display-name`/`icon`/`deployment-target`，走「CLI beats manifest」合并；
+  分别落入 `PRODUCT_BUNDLE_IDENTIFIER`/`CFBundleName`/Resources phase + `CFBundleIconFile`/
+  `MACOSX_DEPLOYMENT_TARGET`；`icon`（绝对路径 file ref）拷入 `Contents/Resources/`
+- [x] **ad-hoc 签名**：`CODE_SIGN_STYLE = Manual` + `CODE_SIGN_IDENTITY = "-"`，`xcodebuild` 无需
+  provisioning profile / Apple ID 即产出可运行的 `.app`（ad-hoc）；正式上架待 manifest `signing-identity`
+- [x] **运行语义不变**：生成的 AS3 C 仍是 `int main(void)`，SDL2 事件循环（`ASC_USE_WINDOW=1`）从 `main`
+  跑，bundle + Info.plist 只加 App 身份，不改变运行行为
+
+**验收**：`as-aot examples/hello.as --target native --package xcode-project -o .../hello` 生成工程后
+`xcodebuild` 构建出 `hello.app`（`codesign -dv` 显示 ad-hoc 签名、`Identifier=com.example.hello`），运行
+二进制输出与 raw 一致；GUI 工程（`examples/window.as` + Skia/SDL2 manifest）同样构建出 `window.app`
+（arm64 Mach-O）；manifest `bundle-id`/`display-name`/`icon`/`deployment-target` 四字段经实测注入
+`Info.plist` 与 build settings（`CFBundleName`/`PRODUCT_BUNDLE_IDENTIFIER`/`MACOSX_DEPLOYMENT_TARGET`/
+`CFBundleIconFile` + `Contents/Resources/AppIcon.icns`）；全量回归 **73 passed / 0 failed**。
+
+---
+
+#### 阶段七十：`xcode-project` 智能合并（保护 Xcode 手改）（目标 v0.3.72 → v0.3.73）✅ 已完成
+
+**依据**：IDE 开发者会在 Xcode 里手改 build settings、scheme、添加文件/资源；而每次改代码重新
+`node src/index.ts ... --package xcode-project` 若整个重建 `.xcodeproj`，这些手改会被抹掉。本阶段把
+工程生成器改为**对象级智能合并**：工程已存在时只增删我们管理的源文件，其余对象原样保留。
+
+- [x] **`src/pbxproj.ts`**：最小 OpenStep plist 解析器 + 序列化器（注释/引号串/数组/字典/裸原子），
+  round-trip 幂等、`plutil -lint` 通过；提供 `asDict`/`asArray`/`scalarText`/`dictEntry` 查询助手。
+- [x] **sidecar 清单**：工程内写 `.as3aot-managed.json` 记录受管源文件集合（生成的 `.c` + manifest
+  `sources` 绝对路径），作为下次 diff 的基准；Xcode 忽略该文件。
+- [x] **智能合并**：工程存在时解析现有 `project.pbxproj`，对比 sidecar 旧集合与本次新集合，
+  **只增删 `sourceTree = "<absolute>"` 的 file ref + 对应 build file**，用户手改的 build settings、
+  scheme、自加的相对路径文件全部保留；源文件列表未变则不写文件（`unchanged`）。
+- [x] **ID 冲突规避**：合并路径用 `freshOid(used)` 避开已存在的 object ID（共享计数器按进程重置）。
+- [x] **结果分派**：`index.ts` 区分 `create`（首次生成）/`merge`（就地合并，changed/unchanged）打印。
+
+**验收**：对 `examples/air-native`（`--air-app` + Skia/SDL2 manifest）验证——手改
+`INFOPLIST_KEY_CFBundleDisplayName` 后重跑，`unchanged` 时手改完整保留；改 `visible=false`（移除
+`window_glue.cc`）→ `source list updated` 且 window_glue 引用归零、手改仍在；改回后 window_glue 恢复；
+`xcodebuild` 构建 merge 后的工程 **BUILD SUCCEEDED**；round-trip 幂等 + `plutil -lint` OK；全量回归
+**73 passed / 0 failed**。
+
+---
+
+#### 阶段七十一：`--target wasm --package web` 浏览器渲染目标（目标 v0.3.75 → v0.3.76）✅ 已完成
+
+**依据**：`--target` 定机器码 ABI、`--package` 定分发形态，二者正交。浏览器页面（`.wasm` + `.js` +
+`index.html`）是「如何组织产物」，与 `xcode-project` 同层级，故新增 `--package web`（要求 `target=wasm`）。
+用 Emscripten 把 wasm 版 Skia + C++ 胶水层编成浏览器产物，在 `<canvas>` 里跑 CPU 光栅 + 帧循环。
+
+- [x] **wasm 版 Skia 静态库**：用 Emscripten 3.1.44 + GN/ninja 重编 Skia m124（`is_trivial_abi=true`、
+  `skia_enable_fontmgr_custom_empty/embedded=true`），16 个 `.a` 放入 `vendor/skia/lib/wasm/`（头文件共享、库按平台分目录）。
+- [x] **字体后端切换**：`skia_glue.cc` 加 `#ifdef __EMSCRIPTEN__` 分支——`SkFontMgr_New_Custom_Data()` +
+  `EMSCRIPTEN_KEEPALIVE` 导出的 `sk_fontmgr_register_data()`；`#else` 保持 CoreText。
+- [x] **窗口层切换**：新 `vendor/web_glue.cc`——canvas blit（`putImageData` premultiplied alpha）+
+  `emscripten_set_main_loop` 帧驱动 + 鼠标/wheel 输入 + `devicePixelRatio` probe；保持与 `window_glue.cc` 相同
+  的 `extern "C"` 签名，生成的 `.c` 零改动。
+- [x] **构建接入**：`build.ts` 加 `Package='web'`、`font-urls` 字段、`buildWebCompileSteps()`；web 链接参数
+  `-s ALLOW_MEMORY_GROWTH=1 -s USE_ZLIB=1 -s INVOKE_RUN=0 -s EXPORTED_FUNCTIONS=["_main","_malloc","_free","_sk_fontmgr_register_data"]`。
+- [x] **ABI 匹配**：wasm 版 libskia.a 以 `is_trivial_abi=true` 编译，C++ glue 编译时自动加
+  `-D SK_TRIVIAL_ABI=[[clang::trivial_abi]]`（否则运行期 `unreachable` 崩溃）。
+- [x] **字体注入**：`index.ts` 的 `writeWebIndex()` 生成 HTML——`onRuntimeInitialized` 里 `fetch`
+  `font-urls` → `_malloc`/`HEAPU8.set` → `_sk_fontmgr_register_data` → `_free` → `_main()`。
+- [x] **TextField 默认尺寸修复（emit.ts）**：`TextField_ctor` 加 `width=100; height=100`（AIR 语义），
+  此前继承 DisplayObject 的 0×0 导致 `clip_rect(0,0,w,0)` 裁掉所有文字（native/web 都受益）。
+
+**验收**：`examples/web/hello-web.as` 端到端构建 → 真实浏览器（CDP）canvas 720×480、蓝色矩形 300×160
+精确匹配、`TextField` 文字逐字渲染、字体运行时注入成功、无运行期崩溃；native 回归（`stage38.as`/
+`window.as`）编译运行无破坏。详见 [`docs/zh-cn/html5-web.md`](docs/zh-cn/html5-web.md)。
+
+---
+
+#### 阶段七十二：TextField 富文本与排版扩展（目标 v0.3.76 → v0.3.78）✅ 已完成
+
+**依据**：阶段三十八（`TextField` 排版）遗留的「富文本（`htmlText`、多 `TextFormat` 区间样式）、`autoSize`/
+`hscroll`/`selectable`/`leading`」等 AIR 交互/富文本能力，对照 AIR SDK
+[`TextField`](https://airsdk.dev/reference/actionscript/3.0/flash/text/TextField.html) 官方参考补齐。
+
+- [x] **`autoSize`**：`TextFieldAutoSize.NONE/LEFT/RIGHT/CENTER` 常量类；按 `textWidth`/`textHeight` 回填尺寸
+- [x] **水平滚动**：`hscroll`/`scrollH`/`maxScrollH`（水平滚动 + 渲染偏移）
+- [x] **`selectable` 与选区**：`setSelection`/`selectionBeginIndex`/`selectionEndIndex`/`caretIndex` + 鼠标拖选 + 选中高亮渲染
+- [x] **`leading`**：`TextFormat.leading` 行间距经 SkParagraph `StrutStyle` 接线
+- [x] **HTML 文本/多 `TextFormat` 区间富文本**：`htmlText` 解析 `<font>`/`<b>`/`<i>`/`<u>`/`<p>`/`<br>` 子集 + `setTextFormat` 区间样式
+
+**语义红线**：选区索引按 **UTF-8 字节偏移**建模（与运行时 `strlen` 字符串模型一致，ASCII 精确，非 ASCII 为已知限制）；
+布局断言写成对真实字体（`textWidth`/`maxScrollH` 用范围/关系断言）与纯 C stub（`size×1.2` 近似）双构建均成立。
+
+**验收**：`examples/textrich.as`（autoSize/hscroll/selectable/选区/leading/htmlText/setTextFormat）与
+`examples/textflow.as`（布局基线：硬换行/单行模式/`scrollV`/`maxScrollV` 视口数学）双构建断言全过。
+
+---
+
+#### 阶段七十三：`DisplayObject.cacheAsBitmap` 子树位图缓存（目标 v0.3.78 → v0.3.79）✅ 已完成
+
+**依据**：对齐 adl 性能——把显示对象子树烘焙到离屏 surface、snapshot 成 `SkImage` 后每帧仅 `drawImage` 一次
+（不再逐对象递归发绘制命令）。
+
+- [x] **`cacheAsBitmap` 标志**：`DisplayObject` 基类字段 + getter/setter，默认 false，跨所有子类（`Shape`/`TextField`/`Stage`/`Sprite`/`Bitmap`）继承
+- [x] **烘焙路径**：toggle 为 true 时把子树（内容 + 自身滤镜）烘焙进 `_cache_image`；false 时失效；烘焙结果与直接递归渲染**逐像素一致**
+- [x] **渲染接线**：`as_render_object` 对已烘焙对象单发 `drawImage` 替代子树递归命令生成
+
+**语义红线**：烘焙后子树内部变化不追踪（直到 toggle 或指纹失效重烘焙）；toggle 失效安全（无 stale 图像）。
+
+**验收**：`examples/stage67.as`（get/set 语义 + 跨子类继承）与 `examples/cacheasbitmap.as`（烘焙容器子树
+rect+circle+text，开关前后 PNG 语义一致、无错误）离屏断言全过。
+
+---
+
+#### 阶段七十四：增量重绘自动 `cacheAsBitmap`（渲染层指纹 dirty 检测，目标 v0.3.79 → v0.3.80）✅ 已完成
+
+**依据**：native 单线程全量重绘 CPU 占用为 adl 3 倍，需对齐性能。`DisplayObject` 的 `x`/`y`/`rotation`/`scaleX`/
+`scaleY`/`alpha`/`visible` 是字段直接写、无 setter，**不采用 push dirty 标记**，改为渲染入口每帧递归计算子树
+**内容指纹**。
+
+- [x] **内容指纹**：`as_render_fingerprint` 递归计算子树指纹 = 自身变换 + 类型内容（`SkPath` generation id / `Bitmap`
+  image / `TextField` text+format）+ 滤镜字段 + 子节点指纹递归；纯整数/指针异或（FNV-1a），开销远低于 Skia 命令生成
+- [x] **自动烘焙**：连续 `ASC_AUTO_BAKE_FRAMES`（=3）帧指纹不变即视为静止、自动烘焙进 `_cache_image`（复用
+  cacheAsBitmap 路径）；指纹一变化立即失效重烘焙
+- [x] **空容器重试节流**：无边界空容器每 `ASC_AUTO_BAKE_FRAMES` 帧重试一次 bounds 探测，避免每帧重算
+
+**语义红线**：是「渲染层 dirty 检测」而非 setter 拦截，语义与 cacheAsBitmap 一致（烘焙后子树内部变化不追踪直到指纹变化）。
+
+**验收**：`examples/autobake.as` 断言自动烘焙输出与首帧（直接递归）逐像素一致、子树变异后失效重烘焙反映变化。
+
+---
+
+#### 阶段七十五：native Metal 渲染后端（`renderMode=direct/gpu`，目标 v0.3.80 → v0.3.83）✅ 已完成
+
+**依据**：web 目标（阶段七十一）已有 `renderMode=direct/gpu` → `ASC_RENDER_GPU=1` 的 Ganesh GPU 光栅化路径，
+native 目标此前始终走 CPU raster + SDL streaming texture blit。本阶段补齐 native 的 GPU 后端：Skia Ganesh
+**Metal** 后端，整帧在 GPU 上合成。
+
+- [x] **Skia m124 源码重编（含 Metal 符号）**：`build-tools/skia-src` 是完整 Skia m124 源码仓库（`bin/gn` + ninja），
+  gn gen 出 native arm64 + `skia_use_metal=true` 配置，ninja 编译产出含 705 个 Metal 符号（`GrDirectContexts::MakeMetal` 等）
+  的 `libskia.a` 及全部传递依赖库，替换 `vendor/skia/lib/macos-arm64/`
+- [x] **`metal_glue.mm`（Objective-C++ 胶水层）**：`SDL_Metal_CreateView`/`SDL_Metal_GetLayer` 取 CAMetalLayer →
+  `GrDirectContext(Metal)` → 每帧 `[layer nextDrawable]` 取一次性 drawable → 包成 `GrBackendRenderTarget` →
+  `flushAndSubmit` → `presentDrawable` + `commit`
+- [x] **构建接入**：`build.ts` 识别 `.mm` 源（clang++ 编译，链接 Metal/QuartzCore framework）；`air-app.ts` native
+  分支把 `renderMode=direct/gpu` 映射为 `ASC_RENDER_METAL=1` 并加 `metal_glue.mm` 源
+- [x] **渲染循环分支**：`emit.ts` 加 `ASC_RENDER_METAL` 条件编译分支——Metal 无持久 surface，窗口后端在
+  `sk_window_show_metal` 里建 CAMetalLayer + GrDirectContext，每帧 `sk_mtl_begin_frame` 重新获取 drawable
+
+**语义红线（关键坑）**：
+- **`flush()` 只记录命令，必须 `flushAndSubmit()` 才真正提交**——否则 drawable 保持未初始化的品红色（金属层默认色）；
+- **`is_trivial_abi` 必须与 official build 一致（=false）**——否则 `sk_sp` 用 `[[clang::trivial_abi]]` 编译，与
+  native glue 层（无 `SK_TRIVIAL_ABI` 宏）ABI 不匹配 → 运行期 Bus error；
+- **Metal drawable 为一次性**，无法支撑持久离屏 surface——离屏 PNG 导出与 `cacheAsBitmap` 仍走 CPU raster；
+- 效率优先，不对齐 AIR 的「direct = CPU 合成 + GPU blit」。
+
+**验收**：`air-native-app.xml`（`<renderMode>direct</renderMode>`）编译链接成功（`.c` 含 `ASC_RENDER_METAL=1` +
+`metal_glue.mm`）；窗口版运行全部 demo 断言通过、无崩溃、无 Bus error、Metal 整帧 GPU 合成（无品红/白屏）；
+离屏 `air-native-offscreen` 与全量 `test.ts` 回归 **78 passed / 0 failed**。
+
+---
+
+#### 阶段七十六：C 标识符命名冲突处理（完整保留字表 + sanitize 全覆盖）（v0.3.87）✅ 已完成
+
+**依据**：[Porffor](https://github.com/CanadaHonk/porffor)（架构与 as3compiler 几乎同构的「JS → 可读 C → 原生」AOT）
+在 `compiler/render.js` 用一张远超 C 关键字的 `cReservedNames` 集合（libc/libm/POSIX/unistd/stdio/string.h/dirent/sys*/time.h/setjmp）
+加「逐级加前缀」的 `sanitize()`（`exit → _exit → __exit`，并用 `sanitizeUsed` 防两两重名）解决同一问题。
+as3compiler 当前只在 `src/emit.ts` 的 `C_KEYWORDS`（仅 C 语言关键字）里防 `cIdent` 命中，且只覆盖**方法/字段名**——
+类名（`symbols.ts` `qualifiedName`）、局部变量/形参（`emit.ts` `declareVar`）均不做保留字检查。
+链接 Skia/SDL2/libc/libm 后，AS3 高频名 `index`/`time`/`data`/`log`/`read`/`write`/`close`/`exit`/`free` 会撞库符号
+（`index` 是 `strchr` 的 legacy 别名，最隐蔽；阶段六十八已实际遇到 Xcode `-fmodules` 下 SDK `Point` 遮蔽生成 struct，当时用
+`CLANG_ENABLE_MODULES = NO` 规避、未从命名层根治）。完整方案与分档见 [`docs/zh-cn/c-naming.md`](docs/zh-cn/c-naming.md)。
+
+- [x] **P0：`C_KEYWORDS` 扩展为完整保留字表**——覆盖 `c-naming.md` §4 中 ★ 标出的 libc/libm/POSIX 高频符号
+      （`index`/`time`/`exit`/`free`/`read`/`write`/`close`/`open`/`log`/`sin`/`cos` 等）；`cIdent` 由「单次追加 `_`」改为
+      「逐级加前缀」循环，防 `exit → _exit` 仍冲突
+- [x] **P1：sanitize 覆盖到类名 / 局部变量 / 形参 / 模块变量**——`symbols.ts` `qualifiedName`/`sanitizePkg` 与
+      `emit.ts` `declareVar` 统一走同一套 `sanitize`（现状类名 `Point`、局部变量 `var index` 均未受保护）
+- [x] **P2：`sanitizeUsed` 已用名集合 + C23 `bool`/`true`/`false` 处理**——保证编译产物内 C 标识符两两不重名
+
+**语义红线（关键坑）**：
+- **保留 AS3 侧拼写不变**：sanitize 只作用于 C 标识符发射层；源码、符号表、props 反射表（`as_prop.name` 字符串）仍用原始
+  AS3 名，否则 `o.union` / `for-in` 遍历 key / `toString` 输出的字段名会漂移
+- **`index` 是最优先级坑**：历史代码里已有的 `index` 字段在引入完整表后会**改变生成的 C**，需回归 `examples/` 全量 + `benchmarks/`
+  确认无破坏
+
+**验收**：新增 `examples/stage76.as`（定义 `class` 含 `union`/`index`/`time`/`log`/`data` 等方法/字段名 + `var index` 局部变量 + 名为
+`index` 的类/包名，断言 AS3 侧拼写不变、编译链接无符号冲突、运行输出正确）；回归 `examples/` 全量 + `benchmarks/` 无破坏；
+README-CN.md 同步「当前限制」；版本号 v0.3.86 → v0.3.87。
+
+---
+
+#### 阶段七十七：try/finally 提前退出的异常栈卫生（return/break/continue 回退 `as_jmp_depth` + 运行 pending finally）（v0.3.88）✅ 已完成
+
+**依据**：实证发现 setjmp/longjmp 异常处理的一个真实 P0 语义 bug——`try { return; } catch (e:Error) {}` 里
+`emit.ts` 的 Return 发射只有 `return ...`，没有先回退 `as_jmp_depth`，导致 `as_jmp_depth++` 无配对的 `--`（深度永久 +1），
+而 `_env` 是栈上 `jmp_buf`，函数返回后失效却仍残留在 `as_jmp_stack[0]`；此后任何一次 `as_throw` 都会
+`longjmp(*as_jmp_stack[as_jmp_depth-1])` 到已销毁栈帧（未定义行为/崩溃）。同源缺口：`try { return } finally {...}` 里
+finally 被 return 直接跳走；`break`/`continue` 跳出 try 也会漏 `as_jmp_depth--`。对标 Porffor 的 `render.js` K.Return case
+（`if (activeTryDepth !== 0) emit('porf_try_depth -= N')`）。
+
+- [x] **P0：return 跳出 try 前回退异常栈 + 运行 finally**——`emit.ts` 新增 `tryFrames` 栈（`active` 标记当前是否在
+      try body 内、`finallyBody` 记录尚未运行的 finally 块）；Return/Break/Continue 发射前调 `emitUnwind(targetDepth)`
+      逐帧 `as_jmp_depth--`（仅 active）+ 内嵌重发 pending finally（嵌套 C 块隔离局部变量，防 return/break/continue
+      在 finally 内重复回退）
+- [x] **P1：break/continue 跨 try 边界同样回退**——循环/switch 入口记录 `tryFrames.length`（`breakTargets`/
+      `continueTargets`/label `tryDepth`），非抑制 break/continue 先 `emitUnwind(目标深度)` 再跳转
+- [x] **P2：返回值语义**——AS3 先求值返回表达式、再运行 finally、再 return：有 try 作用域时把值捕获进临时变量
+      （`T _ret = ...;`）→ `emitUnwind(0)` → `return _ret`，保证 finally 对局部变量的副作用不会被提前返回跳过
+
+**语义红线（关键坑）**：
+- **return 值求值顺序**：`return f()` 中 `f()` 的副作用必须在 finally 之前发生，故值先捕获到临时变量再 unwind
+- **finally 重发的局部变量隔离**：重发 finally 与内联发射同一 C 作用域，须用嵌套 `{}` + `pushScope`/`popScope` 隔离
+  （`cIdent` 缓存会令同名 `var` 映射到同一 C 名，否则重声明冲突）
+- **catch 内 return 不重发 finally**：catch 分支运行时帧已 pop（`else` 分支 `as_jmp_depth--`），但 finally 仍未运行，
+  故 `frame.active=false` + `finallyBody` 待发——两状态解耦才能同时处理 try body 内 return（active+finally）与
+  catch 内 return（仅 finally）
+
+**验收**：新增 `examples/stage77.as`（覆盖 return/break/continue 跳出 try + finally 运行、嵌套 finally 顺序、
+return-in-catch、return-in-finally 覆盖返回值，并紧随提前 return 后 throw 验证异常栈平衡）；回归 `examples/` 全量无破坏；
+版本号 v0.3.87 → v0.3.88。
+
+---
+
+#### 阶段七十八：体积优化 static 化（内建类方法体/thunk/prototype 加 `static`，`-O2` 自动 tree-shake）（v0.3.89）✅ 已完成
+
+**依据**：实测发现产物二进制的体积大头不是 `RUNTIME_PREAMBLE`（其函数早就是 `static`，`-O2` 已消未引用的），
+而是 **内建类方法体 + thunk 被发射成全局符号**（`nm` 里 443 个 `T`）。全局符号 clang 必须假设「其他编译单元可能
+引用」，`-O2` 无法做 DCE；而 vtable/props/methods 反射表本就是 `static`、被全局方法体引用，于是「方法体→反射表」
+整条链全部存活。`hello.as` 二进制 165 KB 里几乎全是没碰过的 `ByteArray_compress`/`Date_ctor`/`MovieClip_play` 等死代码。
+
+**方案**：放弃早期「按需发射 + AST 引用扫描 + fixpoint + 内建类横向依赖边表」的重方案（`p0-tree-shaking.md`，已删），
+改为 **把非导出的文件作用域函数统一标 `static`**，让 `-O2` 从 `main` 出发做完整调用图分析、自动剪枝：
+`main` 不碰 `Date` → `Date_new` 不可达 → `Date_vt` 不可达 → `Date_methods`/`Date_props`/`Date_getTime`/thunk 全消。
+横向引用（`Transform_ctor→Matrix_new`、`Shape_ctor→Graphics_new`、`Stage_dispatchFrame→MovieClip/Timer` 等非继承调用）
+由 `-O2` 的调用图分析自动覆盖，无需任何依赖边表。
+
+- [x] **P0：`emit.ts` 新增 `staticizeTopLevelFunctions()`**——`run()` 发射完 `main` 后，逐行识别「顶格 `返回类型 函数名(`」
+      的函数定义/声明加 `static`（跳过 `static`/`typedef`/`extern`/`struct`/预处理/注释/缩进行），`main` 与
+      `[WasmExport]` 导出符号（`symbol` + 别名 wrapper）保持全局（wasm 导出表 / 跨编译单元可见所需）
+- [x] **P1：多目标与 glue 层不受影响**——`air-native` 的 Skia/SDL2/Metal glue 经**函数指针回调**生成的 `.c`，不要求
+      `.c` 内部符号全局；全量链接验证通过
+
+**验收**：`hello.as` 二进制 165 KB → 34 KB（-80%），全局 text 符号 443 → 2，输出逐字一致；`node test.ts` 全量回归
+80 passed / 0 failed（含 `air-native` 全量 Skia/SDL2 链接、`wasm-native` 导出、GUI 窗口示例）；文档同步
+[`docs/zh-cn/size-optimization.md`](docs/zh-cn/size-optimization.md)，删除 `p0`/`p1`/`p2` 三个草案；版本号 v0.3.88 → v0.3.89。
+
+---
+
 ### 遗留待开发
 
 | 遗留项 | 说明 | 建议 |
@@ -1615,6 +1936,7 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 | 字符串 arena 泄漏 | ✅ 已解决（GC-2）：字符串拼接/转换/`split`/`substring` 已迁入 `gc_alloc(GCT_STRING, ...)`，`gc_strings.as` 验证回收归零 | 仅剩字节缓冲（`ByteArray` grow/compress/uncompress、`BitmapData.pixels`）待迁（见 [`docs/zh-cn/gc.md`](docs/zh-cn/gc.md)）；`as_vector`/闭包 env 已于 v0.3.69 迁入 GC（阶段六十六） |
 | WASI 运行时验证（GC-3） | ✅ 已完成：native + wasm32-wasip1 双目标回归通过（WASI SDK 34.0 + wasmtime 48.0.2），`reclaimed most`/`bounded`/`intact` 断言全过 | GC 核心纯 C 可移植，平台耦合已用 `#ifdef __wasi__` 隔离（见 [`compile.md`](docs/zh-cn/compile.md) §3.3） |
 | SWC 资源提取 | 已调研（[`docs/zh-cn/swc.md`](docs/zh-cn/swc.md)，基于 `temp/skin.swc` 解包实测）：SWC 资源嵌于 `library.swf`（CWS）的 SWF tag（`DefineBitsLossless2`/`DefineBitsJPEG2` + `SymbolClass` → `BitmapData` 子类），提取链路 = ZIP 解包 → CWS 解压 → tag 扫描 → 像素/JPEG 字节 | **暂缓，后续用户决定再实现**（草案：阶段六十六~六十八 = `src/swc.ts` 提取器 → 资源类注册 + 像素嵌入 → CLI/清单接入） |
+| display3D（Stage3D） | 已调研（[`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)）：可实现且非架构推翻，复用 `metal_glue.mm` 新增裸 `MTLBuffer`/渲染通道/MSL；核心难点是 AGAL 字节码 → MSL/GLSL 翻译（有 Ruffle/开源 AGAL→GLSL 参照） | **暂缓，后续用户决定再实现**（草案：`Matrix3D`/`Vector3D` 前置 → AGAL 内核 → `Context3D` 骨架 → Metal 端到端三角形 → AGAL2/3 加固，详见 display3d.md §6） |
 
 ---
 
@@ -1629,7 +1951,8 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 - 阶段二十四~二十七依据 AIR SDK [`RegExp`](https://airsdk.dev/reference/actionscript/3.0/RegExp.html) 官方参考规划：攻关正则引擎。最终方案为**内嵌自研 ES3 回溯正则 VM**（`RUNTIME_PREAMBLE` 内纯 C 零依赖）——AS3 正则本质是 ECMAScript 正则（ES3 语法），回溯 VM 语义匹配度最高，支持 `i/m/s/g/x` 五 flag、捕获/非捕获组、反向引用、前瞻、惰性/贪婪量词、字符类与转义；`\w \d \s` 内嵌 ASCII 表（正好是 ES3 语义），`g` 由 `exec`/`test` 适配层状态机处理，`x`（extended）flag 由 `as_re_x_strip` 前端预处理剥离空白与 `#` 注释。正则引擎直接内嵌于生成的 `.c` 前导（不引入 QuickJS libregexp——其 ES2020+ 语义与 ES3 正则存在漂移，自研回溯 VM 才能精确匹配 ES3 语义）。`isXMLName` 仍有意延后（需 XML/E4X 支持，非正则范畴）。
 - 阶段三十三~三十五依据对 [Ruffle](https://github.com/ruffle-rs/ruffle) 事件/显示列表源码的评估规划：攻关 GUI 与事件系统。Ruffle **不可移植、不可链接**（Rust + `gc_arena` GC + `Gc<'gc>`，C 无对应物），但作为**语义权威参照**价值极高。语义对照与「事件流 → C 运行时助手」映射草案见 [`docs/zh-cn/as3-docs/mapping.md`](docs/zh-cn/as3-docs/mapping.md)，上游源码快照（`events.rs` / `interactive.rs` / `avm2_events.rs` / `event_object.rs` / `event.rs` / `event_dispatcher.rs`）存于同目录 `as3-docs/`。渲染仍按阶段二十九走 skia/cairo 链接（「前端不重复造轮子」铁律），Ruffle 补齐的是「事件流/命中测试/焦点」的**语义**那一半，不贡献像素。
 - 阶段三十六~三十八依据 [`docs/zh-cn/skia.md`](docs/zh-cn/skia.md) 的渲染后端专项调研规划：攻关 `flash.display.*` 的真实光栅化。Skia 定位为**纯光栅化后端**（管「画」），与事件/视图系统（管「谁在上面、谁先响应」）**正交**，二者经 `DisplayObject.render()` 汇聚。关键结论：Skia 是 C++20 库、**无 C API**，需 C++ 胶水层（`skia_glue.cc`）桥接生成的 `.c`；首期用离屏 CPU raster（输出 PNG）跑通最小闭环，再逐步落地 `Shape`/`Bitmap`/`TextField`（SkParagraph）。
+- `flash.display3D.*`（Stage3D）的对齐另做专项调研，见 [`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)：结论是**可实现且非架构推翻**（对现有 GPU 基础设施的有边界扩展），核心难点是 AGAL 字节码 → MSL/GLSL 翻译（Ruffle/开源 AGAL→GLSL 作参照）；`VideoTexture`/压缩纹理明确排除，首期收敛 baseline profile（AGAL1 + 非压缩纹理）以覆盖 Starling。**暂缓，待用户决定是否投入**。
 - 阶段三十九依据 [`docs/zh-cn/compile.md`](docs/zh-cn/compile.md) §6（窗口化 SDL2 后端）与 [`docs/zh-cn/skia.md`](docs/zh-cn/skia.md) §6.3 落地：把离屏 CPU raster 升级为真实原生窗口。窗口/输入交给 SDL2（arm64 静态库，`vendor/sdl2/arm64/libSDL2.a`），Skia 负责像素，`vendor/window_glue.cc` 负责窗口 + 事件循环 + 上屏；`Stage.showWindow` 经 `ASC_USE_WINDOW` 条件编译，未定义时 no-op（纯 C 构建不受影响）。
 - 阶段四十把 SDL2 鼠标输入桥接回 AS3 事件系统：`window_glue.cc` 用函数指针回调（`on_mouse`/`on_redraw`）解耦（胶水层不知道生成的 C 函数名），`emit.ts` 发射 `ASC_window_on_mouse`（→ `Stage_dispatchMouse` 命中测试 + 冒泡）与 `ASC_window_on_redraw`（重新光栅化 + 上屏）。同步修复 `as_pick_hit` 对纯 `DisplayObject`（`Shape`/`Bitmap`）的越界读（改用 `as_is` 类型判定）。
-- 阶段四十三~四十四是「对齐 adl」的连续小阶段，依据 adl 实测行为与 [AIR Stage 参考](https://airsdk.dev/reference/actionscript/3.0/flash/display/Stage.html) / [TextField 参考](https://airsdk.dev/reference/actionscript/3.0/flash/text/TextField.html)：四十三补 `<resizable>` 与 stage 尺寸时序；四十四补 `<requestedDisplayResolution>` 的 Retina 渲染（`SDL_WINDOW_ALLOW_HIGHDPI` + `SDL_GL_GetDrawableSize` probe，surface 按物理像素创建）与 TextField 多行排版（`numLines`/`maxScrollV` 视口数学、`wordWrap` 按空格贪心断行、`clip` 裁剪）。排版层刻意只记录 `(start,len)` 偏移而不复制字符串——AS3 字符串由 `as_alloc` bump allocator 分配，逐行复制后 `free()` 会命中非 malloc 指针。
+- 阶段四十三~四十四是「对齐 adl」的连续小阶段，依据 adl 实测行为与 [AIR Stage 参考](https://airsdk.dev/reference/actionscript/3.0/flash/display/Stage.html) / [TextField 参考](https://airsdk.dev/reference/actionscript/3.0/flash/text/TextField.html)：四十三补 `<resizable>` 与 stage 尺寸时序；四十四补 `<requestedDisplayResolution>` 的 Retina 渲染（`SDL_WINDOW_ALLOW_HIGHDPI` + `SDL_GL_GetDrawableSize` probe，surface 按物理像素创建）。TextField 多行排版（`numLines`/`maxScrollV` 视口数学、`wordWrap` 按空格贪心断行、`clip` 裁剪）已归入阶段三十八；排版层刻意只记录 `(start,len)` 偏移而不复制字符串——AS3 字符串由 `as_alloc` bump allocator 分配，逐行复制后 `free()` 会命中非 malloc 指针。
 - 阶段四十五修复窗口缩放控制与滚轮：变形根因是 `SDL_RenderCopy` 的 dst=NULL 拉伸 + 未处理 `SDL_WINDOWEVENT_SIZE_CHANGED`；滚轮根因是 `emit.ts` 漏传 `on_wheel`。落地 `scaleMode`/`align` 的真实画布变换与 `Stage_dispatchWheel`（adl 实测 1 delta = 1 行）。adl 探针改存 `tools/adl-probe/`（用 `System.output()` 直写 stdout 取回语义，见阶段四十四探针）。

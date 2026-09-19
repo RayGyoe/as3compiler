@@ -17,7 +17,7 @@ package demo {
       field.y = 20;
       field.multiline = true;
       field.wordWrap = true;
-      field.width = 600;
+      field.width = 400;
       field.height = 400;
       field.background = true;
       field.backgroundColor = 0x1E1E1E;

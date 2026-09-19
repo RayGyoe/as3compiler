@@ -42,6 +42,8 @@ package demo {
       TimerDemos.run();
       FilterDisplayDemos.run();
       FilterDisplayDemos.visualize(stage);
+      CacheBitmapDemos.run();
+      CacheBitmapDemos.visualize(stage);
       NetUiDemos.run();
       NetUiDemos.visualize(stage);
       FileDemos.run();

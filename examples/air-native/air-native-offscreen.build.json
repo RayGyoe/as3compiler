@@ -35,7 +35,7 @@
     "z"
   ],
   "link-paths": [
-    "../../vendor/skia/lib",
+    "../../vendor/skia/lib/macos-arm64",
     "../../vendor/sdl2/arm64/lib"
   ],
   "frameworks": [

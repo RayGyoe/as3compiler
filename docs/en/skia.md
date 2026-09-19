@@ -91,7 +91,7 @@ unspoken:
   "sources": ["../vendor/skia_glue.cc"],
   "include-paths": ["../vendor/skia/include"],
   "link-libs": ["skia", "skparagraph"],
-  "link-paths": ["../vendor/skia/lib"],
+  "link-paths": ["../vendor/skia/lib/macos-arm64"],
   "defines": ["ASC_USE_SKIA=1"],
   "objects": []
 }
@@ -289,13 +289,18 @@ self-compile the latest from source, then retest the whole glue layer.
 
 ## 7. Multi-target: native and wasm
 
-- **native**: Skia static-link `libskia.a` (CPU raster or GPU), producing Mach-O/ELF/PE.
-- **wasm**: Skia officially has **CanvasKit** (`modules/canvaskit`, the JS-binding artifact of Skia +
-  WebAssembly), but that's the JS ecosystem; we want the C ABI, so the approach is **to compile Skia + our
-  glue layer together into WASI using a wasm32 toolchain**. Note Skia's wasm build generally targets emscripten
-  (the CanvasKit path), and WASI adaptation costs more than native — **first phase only ensures the native
-  rendering chain runs**, wasm rendering deferred (`--target wasm` still only supports GUI-less programs). This
-  matches "stage by stage, run the main chain first".
+- **native**: Skia static-link `libskia.a` (CPU raster), producing Mach-O/ELF/PE.
+- **wasm (browser, `--target wasm --package web`)**: use Emscripten to build Skia + the glue layer into a
+  wasm32 static library (`vendor/skia/lib/wasm/`), linked by emcc into `.wasm` + `.js` + `index.html`. The font
+  backend switches from CoreText to `SkFontMgr_New_Custom_Data()` (runtime font-data injection), and the window
+  layer switches from SDL2 to canvas + `requestAnimationFrame`. Implementation and constraints are in
+  [`html5-web.md`](html5-web.md).
+- **wasm (WASI, `--target wasm --package raw`)**: still a GUI-less command-line `.wasm`, no rendering.
+
+> A "WASI-toolchain adaptation of Skia" path was evaluated (Skia's official wasm targets emscripten/CanvasKit,
+> and WASI adaptation costs more). This is now bypassed by producing browser artifacts directly via emscripten:
+> `--package web` is verified end-to-end (blue rectangle + `TextField` text + runtime font injection, no runtime
+> crash).
 
 ---
 
@@ -310,24 +315,27 @@ self-compile the latest from source, then retest the whole glue layer.
    spacing, multiple paragraphs, rich-text styles. Corresponds to AS3 `TextField`'s `wordWrap`/`multiline`/
    `textWidth`/`textHeight`/`autoSize`/`htmlText`.
 
-**Decision correction (actual landing in stage forty-four)**: originally planned to use SkParagraph, but the
-actual landing is **`SkFont` measurement + self-built greedy wrapping** (`as_text_wrap` in `runtime.ts`), for
-the same reason as stages twenty-four~twenty-seven self-built the regex engine — **semantic drift**:
+**Decision correction (stage thirty-eight → v0.3.73 upgrade)**: stage thirty-eight first landed **`SkFont`
+measurement + self-built greedy wrapping** (`as_text_wrap` in `runtime.ts`) for multiline, citing UAX#14's
+semantic drift from AIR `wordWrap`. At v0.3.73 this was upgraded to **SkParagraph (`modules/skparagraph`)
+full typesetting**, because:
 
-- AS3 `wordWrap` only breaks at **spaces**; an over-wide single word overflows whole (not split); SkParagraph
-  uses the UAX#14 Unicode line-breaking algorithm, which can break at any character boundary (hyphen/CJK
-  inter-character), inconsistent with AIR behavior if taken directly.
+- The self-built greedy wrapper measured every word with `SkFont` and recomputed each frame with no cache,
+  limiting both performance and correctness (line height approximated as `size × 1.2`, no shaping);
+  SkParagraph shapes once with HarfBuzz + breaks per UAX#14, and `getHeight()`/`getLongestLine()` give the
+  real line height and textWidth, with paragraph-level alignment/letter spacing available for free.
+- The semantic drift narrows to two edge cases: SkParagraph breaks at over-long words and hyphens, while AIR
+  `wordWrap` breaks only at spaces and lets an over-long word overflow whole; CJK per-character breaking is
+  the same in both. Recorded as a known limitation in comments and docs.
 - AIR's `maxScrollV`/`scrollV` is "viewport line" semantics (`numLines - visibleLines + 1`, `scrollV =
-  maxScrollV` pins the latest line to the bottom), belonging to the display-list/clip-layer logic, which
-  SkParagraph does not provide.
-- Importantly **no self-built rasterization**: glyph measurement (`sk_text_measure_n`) and drawing
-  (`sk_canvas_draw_text_n` → `drawSimpleText`) are still all handed to Skia; self-built is only the
-  "where to break" layer of AS3 semantics, consistent with the §2.9 iron rule.
+  maxScrollV` pins the latest line to the bottom), still computed by the runtime layer; SkParagraph only
+  "lays out" and "paints", consistent with the §2.9 iron rule.
+- Similarly **no self-built rasterization**: shaping/breaking/drawing are all handed to SkParagraph;
+  self-built is only the cache-invalidation key.
 
-SkParagraph is still reserved for real rich-text needs (`htmlText`, multiple `TextFormat` range styles,
-alignment/letter spacing/multiple paragraphs), listed as a later sub-stage. Not currently done:
-`autoSize`/`hscroll`/`selectable`/`leading`, line height approximated as `size × 1.2` instead of font-metrics
-tables; no typesetting cache (recomputed each frame, fine at demo scale). Assertion-based regression at
+SkParagraph's rich-text abilities (`htmlText`, multiple `TextFormat` range styles, alignment/letter spacing/
+multiple paragraphs) remain a later sub-stage (the current landing is a single flat `defaultTextFormat` style).
+Not currently done: `autoSize`/`hscroll`/`selectable`/`leading`. Assertion-based regression at
 `examples/textflow.as`.
 
 ---
@@ -352,8 +360,8 @@ thirty-five:
 |---------|------|------|
 | **Stage thirty-six** | v0.3.36 | **Skia glue layer + build integration**: `vendor/skia` import, `skia_glue.cc` minimal `extern "C"` surface (surface/canvas/paint/path/color/matrix), `build.ts` supports `.cc` compile driver and `-lskia` link, `as_skia_*` runtime helpers, end-to-end offscreen CPU raster → PNG demo |
 | **Stage thirty-seven** | v0.3.37 | **`flash.display` rendering landing**: `Shape`/`Graphics` → `SkPath`+`SkPaint` (fill/stroke/gradient), `Bitmap`/`BitmapData` → `SkImage` (including `setPixel/getPixel/draw`), `DisplayObject` transforms (translate/rotate/scale/alpha/blendMode), recursive rendering + depth order |
-| **Stage thirty-eight** | v0.3.38 | **`TextField` text rendering**: `SkFont` + `drawString` single-line direct draw, `TextFormat` styles (font/size/color/bold/italic), background rectangle; multiline typesetting not done at the time |
-| **Stage forty-four** | v0.3.45 | **`TextField` multiline typesetting + Retina hi-DPI**: `as_text_wrap` hard break/`wordWrap` greedy soft wrap (Skia-measured width), `clip` clipping, `numLines`/`maxScrollV`/`scrollV` viewport math; `sk_canvas_draw_text_n`/`sk_text_measure_n` by-length interface; `ASC_DISPLAY_HIGH` via `ALLOW_HIGHDPI` + drawable probe; fix `sk_font()` rebuilding CoreText FontMgr every time causing multiline first-frame hang |
+| **Stage thirty-eight** | v0.3.38 → v0.3.73 | **`TextField` text rendering**: single-line `SkFont` + `drawString` direct draw, `TextFormat` styles (font/size/color/bold/italic); multiline typesetting first self-built greedy wrapping (v0.3.45) then upgraded to SkParagraph (v0.3.73, `sk_textlayout_*` bridge, HarfBuzz shaping + UAX#14 breaking + real line height + cache), `clip` clipping, `numLines`/`maxScrollV`/`scrollV` viewport math; fix `sk_font()` rebuilding CoreText FontMgr every time causing multiline first-frame hang |
+| **Stage forty-four** | v0.3.45 | **Retina hi-DPI rendering**: `ASC_DISPLAY_HIGH` via `ALLOW_HIGHDPI` + drawable probe, surface created at physical pixel size and texture uploaded 1:1 without resampling |
 
 > Stage thirty-six is the key gate for "connecting Skia"; it verifies "the generated C can call Skia through
 > the glue layer and produce correct pixels". It's recommended to first make it a **minimum viable closed
@@ -370,8 +378,8 @@ thirty-five:
 | **C++20 requirement** | needs clang, and the local Apple clang must be new enough | document the minimum version; `build.ts` detects the C++ compiler |
 | **No C API** | must maintain the glue layer; Skia API upgrades ripple into glue | glue only exposes the minimal surface; add functions on demand, no full wrapping |
 | **Footprint/startup** | static linking noticeably enlarges the binary | acceptable for a teaching compiler; GPU backend reduces CPU rasterization cost |
-| **wasm adaptation** | Skia's wasm targets emscripten, WASI adaptation cost high | first phase only native rendering, wasm GUI deferred |
-| **Text typesetting** | SkParagraph is a separate library, both footprint and complexity are significant, and its UAX#14 wrapping semantically drifts from AIR `wordWrap` (break only at spaces) | stage forty-four uses `SkFont` measurement + self-built greedy wrapping to cover `multiline`/`wordWrap`/`scrollV`; SkParagraph reserved for `htmlText`/rich text |
+| **wasm adaptation** | Skia's wasm targets emscripten, WASI adaptation cost high | use emscripten to produce browser artifacts directly (`--package web`), verified end-to-end; see [`html5-web.md`](html5-web.md) |
+| **Text typesetting** | SkParagraph is a separate library, both footprint and complexity are significant, and its UAX#14 wrapping semantically drifts from AIR `wordWrap` (break only at spaces) at over-long words/hyphens | stage thirty-eight first self-built greedy wrapping, v0.3.73 upgraded to SkParagraph (drift narrowed to two edge cases, recorded as a known limitation); rich text `htmlText`/multiple `TextFormat` range styles left for later |
 
 **Boundary statement (consistent with project philosophy)**: Skia only solves "drawing"; it does **not** solve
 AS3 display-list hierarchy, event capture/bubble, hit three-state machine, focus, tab order — these remain the

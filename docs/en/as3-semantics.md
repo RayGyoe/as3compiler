@@ -58,7 +58,7 @@ semantics.
 ## 2. AS3 Semantic Decision Quick Reference (Against Red Lines)
 
 The following are the high-risk points in AS3 semantics that "must be faithfully implemented", directly
-corresponding to the AGENTS.md §2.4 red-line table (status as of v0.3.67).
+corresponding to the AGENTS.md §2.4 red-line table (status as of v0.3.77).
 
 | AS3 semantics | Spec source | Our red line | Status |
 |---------|---------|-----------|------|
@@ -72,7 +72,7 @@ corresponding to the AGENTS.md §2.4 red-line table (status as of v0.3.67).
 | `switch` falls through natively only for `int`/`uint`; others degrade to `if/else` | ES4 draft + AS3 reference | Non-integer discriminants degrade to strict-equality chain | ✅ Implemented |
 | Method closures **correctly bind `this`** (extracting `obj.method` yields a closure permanently bound to `obj`) | ES4 draft | `as_fn_make(..., __bound, (void*)obj)` binds the receiver | ✅ Implemented (emit.ts method value / closure) |
 | Classes are **sealed** by default; only `dynamic class` allows expando | ES4 draft + AVM2 | Classes have a fixed shape (flattened fields + vtable) | ✅ Implemented (`dynamic` not supported) |
-| Numeric coercion: `int↔uint↔Number` wrapping, `Number→int` truncation | ES4 draft + ECMA-262 §9 | `toInt32Expr`/`toUint32Expr` map to AS3 `ToInt32`/`ToUint32` | ✅ Implemented (emit.ts bitwise/coercion) |
+| Numeric coercion: `int↔uint↔Number` wrapping, `Number→int` truncation; `NaN`/`±Infinity` → 0 | ES4 draft + ECMA-262 §9 | `as_to_int32`/`as_to_uint32` map to AS3 `ToInt32`/`ToUint32` (NaN/Inf → 0, avoiding the UB of the C `(int)` cast on NaN) | ✅ Implemented (emit.ts bitwise/coercion + runtime.ts helper) |
 
 ---
 

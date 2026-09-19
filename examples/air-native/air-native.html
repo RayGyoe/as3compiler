@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>air-native</title>
+<style>
+  body { margin: 0; background: #0f1115; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  canvas { background: #000; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+<script>
+// 字体字节流 URL（网络加载 + 全量覆盖）：wasm 沙箱无系统字体，这些字体在
+// main() 运行前 fetch 并注入 Skia 的自定义 FreeType 字体管理器。
+var FONT_URLS = ["fonts/MiSans-Regular.ttf","fonts/Arial.ttf"];
+var Module = {
+  canvas: document.getElementById('canvas'),
+  onRuntimeInitialized: async function() {
+    for (var i = 0; i < FONT_URLS.length; i++) {
+      try {
+        var resp = await fetch(FONT_URLS[i]);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var bytes = new Uint8Array(await resp.arrayBuffer());
+        var ptr = Module._malloc(bytes.length);
+        Module.HEAPU8.set(bytes, ptr);
+        Module._sk_fontmgr_register_data(ptr, bytes.length);
+        Module._free(ptr);
+      } catch (e) {
+        console.warn('font load failed: ' + FONT_URLS[i], e);
+      }
+    }
+    Module._main();
+  }
+};
+</script>
+<script src="air-native.js"></script>
+</body>
+</html>

@@ -16,12 +16,21 @@
 // of SDL's main wrapping here.
 #define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
+#ifdef ASC_RENDER_METAL
+#include <SDL2/SDL_metal.h>
+#endif
 #include <cstdio>
 #include <cstdint>
 
 extern "C" {
 
 int sk_surface_peek_pixels(void* surface, void** pixels, int* rowBytes);
+#ifdef ASC_RENDER_METAL
+// Native Metal GPU backend (metal_glue.mm). A CAMetalDrawable is one-shot, so
+// the window loop acquires a fresh surface each frame, renders, then presents.
+int sk_mtl_init(void* layer);
+void sk_mtl_destroy(void);
+#endif
 
 // Cached primary-display size so Stage.fullScreenWidth/fullScreenHeight can be
 // read without holding SDL initialized. Populated lazily here and refreshed
@@ -462,5 +471,154 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   SDL_Quit();
   return 1;
 }
+
+#ifdef ASC_RENDER_METAL
+// Metal GPU window backend: the same event loop as sk_window_show above, but the
+// presentation path is completely different. Instead of a persistent CPU raster
+// surface that is peeked and blitted through an SDL streaming texture, the
+// window owns a CAMetalLayer (via SDL_Metal_CreateView + SDL_Metal_GetLayer) and
+// a GrDirectContext(Metal) (via metal_glue.mm). Every frame on_redraw re-acquires
+// a one-shot drawable, rasterizes the tree into it on the GPU, and presents it
+// — no CPU pixel round-trip. There is no surface to pass in or hand back on
+// resize: the drawable is rebuilt per frame and sized from the window's own
+// physical dimensions, so on_resize only has to update the AS3-side stage
+// dimensions and device scale (its return value is ignored).
+int sk_window_show_metal(int w, int h, const char* title, int fullscreen,
+                         sk_mouse_cb on_mouse, sk_wheel_cb on_wheel,
+                         sk_redraw_cb on_redraw, sk_frame_cb on_frame,
+                         sk_frame_delay_cb on_frame_delay, sk_resize_cb on_resize) {
+  ensure_video();
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    fprintf(stderr, "window_glue: SDL_Init failed: %s\n", SDL_GetError());
+    return 0;
+  }
+
+  SDL_DisplayMode dm;
+  if (SDL_GetCurrentDisplayMode(0, &dm) == 0) {
+    g_display_w = dm.w; g_display_h = dm.h;
+    g_display_refresh = (double)dm.refresh_rate;
+  }
+
+  Uint32 winFlags = SDL_WINDOW_SHOWN;
+#ifndef ASC_WINDOW_FIXED
+  winFlags |= SDL_WINDOW_RESIZABLE;
+#endif
+#ifdef ASC_DISPLAY_HIGH
+  winFlags |= SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
+  SDL_Window* win = SDL_CreateWindow(
+      title ? title : "AS3", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+      w, h, winFlags);
+  g_win = win;
+  if (win == NULL) {
+    fprintf(stderr, "window_glue: SDL_CreateWindow failed: %s\n", SDL_GetError());
+    SDL_Quit();
+    return 0;
+  }
+  if (fullscreen) SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+
+  // Attach a CAMetalLayer-backed view and hand its layer to the Metal backend.
+  SDL_MetalView view = SDL_Metal_CreateView(win);
+  if (view == NULL) {
+    fprintf(stderr, "window_glue: SDL_Metal_CreateView failed: %s\n", SDL_GetError());
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return 0;
+  }
+  void* layer = SDL_Metal_GetLayer(view);
+  if (layer == NULL || !sk_mtl_init(layer)) {
+    fprintf(stderr, "window_glue: Metal backend init failed\n");
+    SDL_Metal_DestroyView(view);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return 0;
+  }
+
+  // Report the initial physical size + device scale to the AS3 side so its
+  // first frame is sized correctly. SDL_GetWindowSizeInPixels is authoritative
+  // for the drawable backing (matches CAMetalLayer.drawableSize).
+  int lw = w, lh = h, pw = w, ph = h;
+  SDL_GetWindowSize(win, &lw, &lh);
+  SDL_GetWindowSizeInPixels(win, &pw, &ph);
+  double scale = (lw > 0) ? (double)pw / (double)lw : 1.0;
+  if (on_resize) on_resize(lw, lh, pw, ph, scale);
+
+  int running = 1;
+  SDL_Event e;
+  double next_tick = (double)SDL_GetTicks();
+  while (running) {
+    int dirty = 0;
+    // Poll the size every frame so a resize (including a cross-display HiDPI
+    // change) re-sizes the next drawable and updates the AS3-side stage dims.
+    int nw = 0, nh = 0, npw = 0, nph = 0;
+    SDL_GetWindowSize(win, &nw, &nh);
+    SDL_GetWindowSizeInPixels(win, &npw, &nph);
+    if (nw > 0 && nh > 0 && npw > 0 && nph > 0 && (npw != pw || nph != ph)) {
+      double ns = (double)npw / (double)nw;
+      if (on_resize) on_resize(nw, nh, npw, nph, ns);
+      pw = npw; ph = nph;
+    }
+    while (SDL_PollEvent(&e)) {
+      switch (e.type) {
+        case SDL_QUIT:
+          running = 0;
+          break;
+        case SDL_WINDOWEVENT:
+          if (e.window.event == SDL_WINDOWEVENT_EXPOSED) dirty = 1;
+          break;
+        case SDL_MOUSEBUTTONDOWN:
+          if (e.button.button == SDL_BUTTON_LEFT && on_mouse) {
+            on_mouse((double)e.button.x, (double)e.button.y, "mouseDown");
+            dirty = 1;
+          }
+          break;
+        case SDL_MOUSEBUTTONUP:
+          if (e.button.button == SDL_BUTTON_LEFT && on_mouse) {
+            on_mouse((double)e.button.x, (double)e.button.y, "mouseUp");
+            on_mouse((double)e.button.x, (double)e.button.y, "click");
+            dirty = 1;
+          }
+          break;
+        case SDL_MOUSEWHEEL: {
+          if (on_wheel) {
+            int mx = 0, my = 0;
+            SDL_GetMouseState(&mx, &my);
+            on_wheel((double)mx, (double)my, (double)e.wheel.y);
+            dirty = 1;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    if (on_frame) {
+      on_frame();
+      dirty = 1;
+    }
+    // on_redraw acquires the drawable, rasterizes, and presents in one call.
+    if (dirty && on_redraw) on_redraw();
+    // Honor Stage.frameRate via the same rolling-deadline pacing as the CPU path.
+    double interval = on_frame_delay ? on_frame_delay() : 16.0;
+    double now = (double)SDL_GetTicks();
+    if (interval > 0.0) {
+      if (now < next_tick) {
+        SDL_Delay((Uint32)(next_tick - now));
+        now = (double)SDL_GetTicks();
+      }
+      next_tick += interval;
+      if (next_tick < now) next_tick = now;
+    } else {
+      next_tick = now;
+    }
+  }
+
+  sk_mtl_destroy();
+  SDL_Metal_DestroyView(view);
+  SDL_DestroyWindow(win);
+  SDL_Quit();
+  return 1;
+}
+#endif  // ASC_RENDER_METAL
 
 }  // extern "C"
