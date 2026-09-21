@@ -23,8 +23,10 @@ const failed: string[] = [];
 const SKIP_FILES = new Set(['boot-gui.as']);
 // Third-party library directories (e.g. com/greensock) ship with full AIR apps
 // but depend on features outside this compiler's subset; they are not part of
-// the regression suite's input.
-const SKIP_DIRS = new Set(['com', 'org', 'net']);
+// the regression suite's input. `shmup-stage3d` is the stage 79-83 end-to-end
+// acceptance demo — it needs the full Stage3D/Context3D surface (plus the `package {}`
+// no-name form) that lands across stages 80-83, so it is skipped until then.
+const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d']);
 // GreenSock core files that air-native's TweenDemo actually reaches. Only these
 // are pulled in; the rest of com/greensock (easing/loading/other plugins) stays
 // outside the subset and is not compiled.
@@ -53,21 +55,28 @@ function collectAsFiles(path: string): string[] {
   return out.sort();
 }
 
+// Per-example timeout (ms). A compiler regression that hangs (e.g. a parser
+// infinite loop) must fail loudly instead of freezing the whole suite, so each
+// example is killed after this budget.
+const EXAMPLE_TIMEOUT_MS = 60_000;
+
 function runExample(label: string, args: string[]): void {
   try {
-    execFileSync('node', ['src/index.ts', ...args, '--run'], { cwd: root, stdio: 'pipe' });
+    execFileSync('node', ['src/index.ts', ...args, '--run'], { cwd: root, stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS });
     console.log(`PASS  ${label}`);
     pass++;
   } catch (err) {
-    const e = err as { stdout?: Buffer; stderr?: Buffer };
+    const e = err as { stdout?: Buffer; stderr?: Buffer; signal?: string };
     console.log(`FAIL  ${label}`);
     if (e.stdout) process.stdout.write(e.stdout.toString());
     if (e.stderr) process.stderr.write(e.stderr.toString());
+    if (e.signal === 'SIGTERM') console.log(`  (timed out after ${EXAMPLE_TIMEOUT_MS}ms)`);
     failed.push(label);
   }
 }
 
 for (const e of entries) {
+  if (SKIP_DIRS.has(e.name)) continue;
   if (e.isDirectory()) {
     // Multi-file example: compile every .as in the subdirectory (recursively) as one unit.
     const subDir = join(dir, e.name);

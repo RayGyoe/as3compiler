@@ -140,7 +140,7 @@ enum {
     GCT_CLOSURE = 4,     // as_closure (function value)
     GCT_CLASS = 5,       // user/builtin class instance (vtable + as_prop reflection)
     GCT_VALUE_ARRAY = 6, // as_value[] buffer (array.data / object.vals / dict.vals)
-    GCT_PTR_ARRAY = 7,   // void*[] / char*[] buffer (dict.keys / object.keys)
+    GCT_PTR_ARRAY = 7,   // void*[] / char*[] buffer (object.keys)
     GCT_CUSTOM = 8       // user-supplied mark callback in the body's first word
 };
 
@@ -470,6 +470,31 @@ static double as_v_num_val(as_value v)  { return v.num; }
 static int as_v_int_val(as_value v)     { return as_to_int32(v.num); }
 static unsigned as_v_uint_val(as_value v) { return as_to_uint32(v.num); }
 static bool as_v_bool_val(as_value v)   { return v.num != 0.0; }
+// AS3 global conversion functions int(x)/uint(x)/Number(x) applied to a dynamic
+// 'any' value. Unlike the 'as' type-checked casts (as_v_as_*), these COERCE: a
+// String operand parses its decimal text, a Boolean maps to 1/0. The value-path
+// (non-string) mirrors the static unboxers; the string path is what makes
+// uint(someArray[0]) on a string element (e.g. AGALMiniAssembler's register
+// index) yield the parsed number instead of a silent 0.
+static double as_v_to_number(as_value v) {
+    if (v.tag == 3) return atof((char*)v.ptr);
+    if (v.tag == 2) return v.num;         // bool: 1.0 or 0.0
+    if (v.tag == 1) return v.num;
+    return 0.0;                           // null/undefined/object/array -> 0
+}
+static int as_v_to_int(as_value v) {
+    if (v.tag == 3) return as_to_int32(atof((char*)v.ptr));
+    if (v.tag == 2) return v.num != 0.0 ? 1 : 0;
+    if (v.tag == 1) return as_to_int32(v.num);
+    return 0;
+}
+static unsigned as_v_to_uint(as_value v) {
+    if (v.tag == 3) return as_to_uint32(atof((char*)v.ptr));
+    if (v.tag == 2) return v.num != 0.0 ? 1u : 0u;
+    if (v.tag == 1) return as_to_uint32(v.num);
+    return 0u;
+}
+
 // AS3 truthiness for condition contexts (if/while/?:/&&/||): null and undefined
 // are falsy; numbers/booleans are tested by non-zero; empty string is falsy;
 // objects/arrays are truthy when non-null.
@@ -1241,12 +1266,16 @@ static as_array* as_array_sortOn(as_array* a, const char* field, int options) {
 }
 
 // ---------- Dictionary ----------
-// AS3 flash.utils.Dictionary: an associative map keyed by OBJECT REFERENCE (not
-// string). Values are boxed as_value. Weak keys (the ctor bool) are accepted but
-// not modeled — keys are strongly held for the program lifetime (documented
-// subset limitation; the arena already grants program-lifetime semantics).
+// AS3 flash.utils.Dictionary: an associative map keyed by STRICT EQUALITY (===).
+// String/number/bool keys compare by value; object keys compare by reference.
+// Keys are therefore stored as boxed as_value and compared with as_v_eq (which
+// does strcmp for strings, pointer identity for objects) rather than raw pointer
+// identity — the AGALMiniAssembler keys OPMAP/REGMAP/SAMPLEMAP by string
+// ("mov"/"dp4"/"va"…), where value comparison is required. Weak keys (the ctor
+// bool) are accepted but not modeled — keys are strongly held for the program
+// lifetime (documented subset limitation).
 typedef struct {
-    void** keys;
+    as_value* keys;
     as_value* vals;
     int length;
     int capacity;
@@ -1260,17 +1289,17 @@ static as_dict* as_dict_new(void) {
     d->capacity = 0;
     return d;
 }
-static int as_dict_find(as_dict* d, void* key) {
+static int as_dict_find(as_dict* d, as_value key) {
     for (int i = 0; i < d->length; i++) {
-        if (d->keys[i] == key) return i;
+        if (as_v_eq(d->keys[i], key)) return i;
     }
     return -1;
 }
-static as_value as_dict_get(as_dict* d, void* key) {
+static as_value as_dict_get(as_dict* d, as_value key) {
     int i = as_dict_find(d, key);
     return i < 0 ? as_v_null() : d->vals[i];
 }
-static as_value as_dict_set(as_dict* d, void* key, as_value v) {
+static as_value as_dict_set(as_dict* d, as_value key, as_value v) {
     int i = as_dict_find(d, key);
     if (i >= 0) {
         d->vals[i] = v;
@@ -1281,10 +1310,10 @@ static as_value as_dict_set(as_dict* d, void* key, as_value v) {
         int cap = d->capacity == 0 ? 8 : d->capacity * 2;
         // GC cannot realloc in place; allocate fresh parallel arrays and copy.
         // The old arrays become garbage and are reclaimed by the next sweep.
-        void** nk = (void**)gc_alloc(GCT_PTR_ARRAY, sizeof(void*) * (size_t)cap);
+        as_value* nk = (as_value*)gc_alloc(GCT_VALUE_ARRAY, sizeof(as_value) * (size_t)cap);
         as_value* nv = (as_value*)gc_alloc(GCT_VALUE_ARRAY, sizeof(as_value) * (size_t)cap);
         if (d->length > 0) {
-            memcpy(nk, d->keys, sizeof(void*) * (size_t)d->length);
+            memcpy(nk, d->keys, sizeof(as_value) * (size_t)d->length);
             memcpy(nv, d->vals, sizeof(as_value) * (size_t)d->length);
         }
         d->keys = nk;
@@ -1294,14 +1323,14 @@ static as_value as_dict_set(as_dict* d, void* key, as_value v) {
     d->keys[d->length] = key;
     d->vals[d->length] = v;
     d->length++;
-    gc_write_barrier(key);
+    gc_write_barrier_value(key);
     gc_write_barrier_value(v);
     return v;
 }
-static bool as_dict_has(as_dict* d, void* key) {
+static bool as_dict_has(as_dict* d, as_value key) {
     return as_dict_find(d, key) >= 0;
 }
-static bool as_dict_del(as_dict* d, void* key) {
+static bool as_dict_del(as_dict* d, as_value key) {
     int i = as_dict_find(d, key);
     if (i < 0) return false;
     for (int j = i; j < d->length - 1; j++) {
@@ -2028,6 +2057,14 @@ static void as_re_bits_add_esc(unsigned char* bits, int e) {
               as_re_bits_add(bits, '\\r'); as_re_bits_add(bits, '\\f'); as_re_bits_add(bits, '\\v'); break;
     case 'S': as_re_bits_add(bits, ' '); as_re_bits_add(bits, '\\t'); as_re_bits_add(bits, '\\n');
               as_re_bits_add(bits, '\\r'); as_re_bits_add(bits, '\\f'); as_re_bits_add(bits, '\\v'); as_re_bits_invert(bits); break;
+    // Control-character escapes inside a class (backslash-n/r/t/f/v/0) map to
+    // their control bytes, not the literal letters n/r/t/f/v/0.
+    case 'n': as_re_bits_add(bits, '\\n'); break;
+    case 'r': as_re_bits_add(bits, '\\r'); break;
+    case 't': as_re_bits_add(bits, '\\t'); break;
+    case 'f': as_re_bits_add(bits, '\\f'); break;
+    case 'v': as_re_bits_add(bits, '\\v'); break;
+    case '0': as_re_bits_add(bits, '\\0'); break;
     default: as_re_bits_add(bits, e); break;
     }
 }
@@ -2172,6 +2209,13 @@ static int as_re_comp_escape(as_re_comp* c) {
     case 'B': return as_re_emit(re, AS_RE_NBOUND, 0, 0, 0);
     case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
         return as_re_emit(re, AS_RE_BACKREF, e - '0', 0, 0);
+    // Control-character escapes outside a class (backslash-n/r/t/f/v) match the
+    // control byte, not the literal letter.
+    case 'n': return as_re_emit(re, AS_RE_CHAR, '\\n', 0, 0);
+    case 'r': return as_re_emit(re, AS_RE_CHAR, '\\r', 0, 0);
+    case 't': return as_re_emit(re, AS_RE_CHAR, '\\t', 0, 0);
+    case 'f': return as_re_emit(re, AS_RE_CHAR, '\\f', 0, 0);
+    case 'v': return as_re_emit(re, AS_RE_CHAR, '\\v', 0, 0);
     default:
         return as_re_emit(re, AS_RE_CHAR, e, 0, 0);
     }
@@ -2837,6 +2881,7 @@ extern int sk_mtl_init(void* layer);
 extern void sk_mtl_destroy(void);
 extern void* sk_mtl_begin_frame(int w, int h);
 extern void sk_mtl_flush(void);
+extern void sk_mtl_draw_texture(void* canvas, void* mtlTexture, int w, int h, double dx, double dy, double dw, double dh);
 #endif
 extern void* sk_surface_canvas(void* surface);
 extern void* sk_surface_make_snapshot(void* surface);
@@ -2877,7 +2922,9 @@ extern int sk_image_encode_png(void* image, const char* path);
 extern void sk_image_delete(void* image);
 extern void sk_paint_set_linear_gradient(void* paint, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1);
 extern void* sk_image_from_file(const char* path);
+extern void* sk_image_decode_rgba(const char* path, int* width, int* height);
 extern void sk_canvas_draw_image_rect(void* canvas, void* image, double dx, double dy, double dw, double dh);
+extern void sk_canvas_draw_bgra(void* canvas, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh);
 extern void sk_canvas_draw_text(void* canvas, const char* text, double x, double y, double size, int bold, int italic, void* paint);
 extern void sk_canvas_draw_text_n(void* canvas, const char* text, int len, double x, double y, double size, int bold, int italic, void* paint);
 extern double sk_text_measure(const char* text, double size, int bold, int italic);
@@ -2966,7 +3013,9 @@ static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double*
 static inline unsigned as_skia_path_generation_id(void* p) { return sk_path_generation_id(p); }
 static inline void as_skia_paint_set_linear_gradient(void* p, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1) { sk_paint_set_linear_gradient(p, x0, y0, x1, y1, rgb0, a0, rgb1, a1); }
 static inline void* as_skia_image_from_file(const char* path) { return sk_image_from_file(path); }
+static inline void* as_skia_image_decode_rgba(const char* path, int* width, int* height) { return sk_image_decode_rgba(path, width, height); }
 static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh) { sk_canvas_draw_image_rect(c, img, dx, dy, dw, dh); }
+static inline void as_skia_canvas_draw_bgra(void* c, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh) { sk_canvas_draw_bgra(c, bgra, w, h, dx, dy, dw, dh); }
 static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, double y, double sz, int bold, int italic, void* p) { sk_canvas_draw_text(c, t, x, y, sz, bold, italic, p); }
 static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, double x, double y, double sz, int bold, int italic, void* p) { sk_canvas_draw_text_n(c, t, len, x, y, sz, bold, italic, p); }
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { return sk_text_measure(t, sz, bold, italic); }
@@ -3089,6 +3138,13 @@ static inline void as_skia_mtl_flush(void) {
     sk_mtl_flush();
 #endif
 }
+static inline void as_skia_mtl_draw_texture(void* c, void* tex, int w, int h, double dx, double dy, double dw, double dh) {
+#ifdef ASC_RENDER_METAL
+    sk_mtl_draw_texture(c, tex, w, h, dx, dy, dw, dh);
+#else
+    (void)c; (void)tex; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh;
+#endif
+}
 // Query the primary display resolution (Stage.fullScreenWidth/fullScreenHeight).
 // Returns 0 (and writes 0) when the SDL2 window backend is not linked in.
 static inline int as_window_get_display_size(int* w, int* h) {
@@ -3138,7 +3194,9 @@ static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double*
 static inline unsigned as_skia_path_generation_id(void* p) { (void)p; return 0u; }
 static inline void as_skia_paint_set_linear_gradient(void* p, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1) { (void)p; (void)x0; (void)y0; (void)x1; (void)y1; (void)rgb0; (void)a0; (void)rgb1; (void)a1; }
 static inline void* as_skia_image_from_file(const char* path) { (void)path; return NULL; }
+static inline void* as_skia_image_decode_rgba(const char* path, int* width, int* height) { (void)path; (void)width; (void)height; return NULL; }
 static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh) { (void)c; (void)img; (void)dx; (void)dy; (void)dw; (void)dh; }
+static inline void as_skia_canvas_draw_bgra(void* c, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh) { (void)c; (void)bgra; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh; }
 static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, double y, double sz, int bold, int italic, void* p) { (void)c; (void)t; (void)x; (void)y; (void)sz; (void)bold; (void)italic; (void)p; }
 static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, double x, double y, double sz, int bold, int italic, void* p) { (void)c; (void)t; (void)len; (void)x; (void)y; (void)sz; (void)bold; (void)italic; (void)p; }
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { (void)t; (void)sz; (void)bold; (void)italic; return 0.0; }
@@ -3281,5 +3339,510 @@ static int as_cap_screen_resolution_y(void) {
 // fallback) — a documented subset, not a real physical-DPI read.
 static double as_cap_screen_dpi(void) {
     return 72.0;
+}
+
+// ===== AGAL translator (stage 80) =====
+// Parses AGAL1/2/3 bytecode (7-byte header + variable-length instruction
+// tokens) and emits readable MSL (Metal) or GLSL ES (WebGL) source. Pure C
+// string processing, no GPU framework — the MSL *compile* (newLibraryWithSource)
+// is wired separately in stage 82. Validation errors return NULL and set
+// as_agal_errmsg. Bytecode is little-endian per the AGAL spec.
+static const char* as_agal_errmsg = NULL;
+
+static unsigned as_agal_u32(const unsigned char* p) {
+    return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+
+// Register types (8-bit field in dest/source tokens). Per the official
+// AGALMiniAssembler the type code is *shader-relative*, not globally unique:
+// va=0, vc=1, vt=2, op/vo=3, varying(vi/i/v)=4, fs=5, od/fd=6, iid=7 — and
+// fragment registers reuse the same codes (fc=1, ft=2, oc/fo=3, vs=5). The
+// translator disambiguates vertex-vs-fragment via the agal_is_frag flag.
+#define AGAL_VA 0  // vertex attribute
+#define AGAL_VC 1  // constant (vertex vc / fragment fc)
+#define AGAL_VT 2  // temporary (vertex vt / fragment ft)
+#define AGAL_OP 3  // output (vertex op / fragment oc)
+#define AGAL_V  4  // varying
+#define AGAL_FS 5  // texture sampler (vertex vs / fragment fs)
+#define AGAL_OD 6  // fragment depth output
+#define AGAL_IID 7 // instance id
+
+// Shader stage for the translation in flight (0 = vertex, 1 = fragment).
+static int agal_is_frag = 0;
+
+static const char* const agal_op_name[0x2f] = {
+    "mov","add","sub","mul","div","rcp","min","max","frc","sqt","rsq","pow","log","exp","nrm","sin",
+    "cos","crs","dp3","dp4","abs","neg","sat","m33","m44","m34","ddx","ddy","ife","ine","ifg","ifl",
+    "els","eif",0,0,0,0,0,"kil","tex","sge","slt","sgn","seq","sne","tld"
+};
+
+// Operand counts and no-destination flags for the OFFICIAL AGALMiniAssembler
+// bytecode. The opcode token is the BARE opcode number (0x00..0x2e) — it does
+// NOT encode hasDst/hasSrc1/hasSrc2 bits in bits 8..10 (that was a hand-rolled
+// assumption in the stage-82 example, not the real bytecode). The operand count
+// is implied by the opcode (numRegister); OP_NO_DEST marks opcodes whose first
+// operand is a source rather than a destination (ife/ine/ifg/ifl/els/eif/kil),
+// matching the assembler's isDest = j==0 && !(flags & OP_NO_DEST) rule.
+static const unsigned char agal_op_nreg[0x2f] = {
+    2,3,3,3,3, 2,3,3,2,2, 2,3,2,2,2, 2,2,3,3,3, 2,2,2,3,3, 3,2,2,2,2, 2,2,0,0,0, 0,0,0,0,1, 3,3,3,2,3, 3,3
+};
+static const unsigned char agal_op_nodest[0x2f] = {
+    0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,1,1, 1,1,1,1,0, 0,0,0,0,1, 0,0,0,0,0, 0,0
+};
+
+// A decoded instruction (max 200/1024/2048 per program by profile; we cap at
+// 200 here to mirror the AGAL1 baseline).
+typedef struct {
+    unsigned op;
+    unsigned dst, s1lo, s1hi, s2lo, s2hi;
+} agal_instr;
+
+static const char agal_swz[4] = { 'x', 'y', 'z', 'w' };
+
+// Decode an 8-bit swizzle field into a 4-char suffix (identity .xyzw is
+// collapsed by the caller).
+static void agal_swizzle(unsigned swz, char* out) {
+    out[0] = agal_swz[swz & 3];
+    out[1] = agal_swz[(swz >> 2) & 3];
+    out[2] = agal_swz[(swz >> 4) & 3];
+    out[3] = agal_swz[(swz >> 6) & 3];
+}
+
+// Register access name. MSL uses array-indexed uniforms/attributes (vc[i],
+// va[i], fc[i]); GLSL ES uses individual named uniforms/attributes.
+static void agal_reg_name(char* out, int type, int num, int target) {
+    switch (type) {
+        case AGAL_VA: // vertex attribute (vertex only)
+            if (target == 0) sprintf(out, "in.a%d", num); else sprintf(out, "va%d", num); break;
+        case AGAL_VC: // constant: vc in vertex, fc in fragment
+            if (agal_is_frag) { if (target == 0) sprintf(out, "fc[%d]", num); else sprintf(out, "fc%d", num); }
+            else { if (target == 0) sprintf(out, "vc[%d]", num); else sprintf(out, "vc%d", num); }
+            break;
+        case AGAL_VT: // temporary: vt in vertex, ft in fragment
+            sprintf(out, agal_is_frag ? "ft%d" : "vt%d", num); break;
+        case AGAL_OP: // output: op in vertex, oc in fragment
+            if (agal_is_frag) strcpy(out, target == 0 ? "oc" : "gl_FragColor");
+            else strcpy(out, target == 0 ? "op" : "gl_Position");
+            break;
+        case AGAL_V:  // varying
+            // Vertex: local temp v%d copied to out.varying%d; fragment: read from
+            // the [[stage_in]] struct (in.v%d) — Metal requires varying inputs to
+            // arrive via [[stage_in]], not as bare [[user(locn)]] parameters.
+            if (agal_is_frag && target == 0) sprintf(out, "in.v%d", num);
+            else sprintf(out, "v%d", num); break;
+        case AGAL_FS: // texture sampler
+            sprintf(out, "fs%d", num); break;
+        case AGAL_OD: // fragment depth output
+            strcpy(out, target == 0 ? "od" : "gl_FragDepth"); break;
+        default: sprintf(out, "r%d", num); break;
+    }
+}
+
+// Source expression: register name + swizzle suffix (collapsed for identity).
+static void agal_src_expr(char* out, int type, int num, unsigned swz, int target) {
+    char reg[40]; agal_reg_name(reg, type, num, target);
+    char sw[5]; agal_swizzle(swz, sw); sw[4] = 0;
+    if (strcmp(sw, "xyzw") == 0) strcpy(out, reg);
+    else sprintf(out, "%s.%s", reg, sw);
+}
+
+// Destination expression: register name (write-mask applied by the emitter).
+static void agal_dst_name(char* out, int type, int num, int target) {
+    agal_reg_name(out, type, num, target);
+}
+
+// Append a translated instruction body. Emits one statement per written
+// component (so write-masks are fully expanded).
+static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int target) {
+    const char* v4 = target == 0 ? "float4" : "vec4";
+    for (int k = 0; k < n; k++) {
+        unsigned op = ins[k].op;
+        unsigned dst = ins[k].dst, s1lo = ins[k].s1lo, s1hi = ins[k].s1hi, s2lo = ins[k].s2lo, s2hi = ins[k].s2hi;
+        int hasDst = (dst != 0);
+        int hasSrc1 = (s1lo != 0 || s1hi != 0);
+        int hasSrc2 = (s2lo != 0 || s2hi != 0);
+        char dname[40] = "", s1[48] = "", s2[48] = "";
+        char s1b[40] = "", s2b[40] = "";
+        char sw1[5] = "xyzw", sw2[5] = "xyzw";
+        int dtype = 0, dnum = 0, dmask = 0xF;
+        int t1 = 0, n1 = 0; unsigned w1 = 0xE4;
+        int t2 = 0, n2 = 0; unsigned w2 = 0xE4;
+        int isTexOp = (op == 0x28 || op == 0x2e);
+        if (hasDst) { dtype = (int)((dst >> 24) & 0xFF); dnum = (int)(dst & 0xFFFF); dmask = (int)((dst >> 16) & 0xF); agal_dst_name(dname, dtype, dnum, target); }
+        if (hasSrc1) { t1 = (int)(s1hi & 0xFF); n1 = (int)(s1lo & 0xFFFF); w1 = (s1lo >> 24) & 0xFF; agal_reg_name(s1b, t1, n1, target); agal_swizzle(w1, sw1); sw1[4] = 0; agal_src_expr(s1, t1, n1, w1, target); }
+        if (hasSrc2) {
+            if (isTexOp) { // sampler token: [num:16][lod:8][0:8][samplerbits:32], type fixed FS, no swizzle
+                t2 = AGAL_FS; n2 = (int)(s2lo & 0xFFFF); agal_reg_name(s2b, t2, n2, target); strcpy(s2, s2b); strcpy(sw2, "xyzw");
+            } else { t2 = (int)(s2hi & 0xFF); n2 = (int)(s2lo & 0xFFFF); w2 = (s2lo >> 24) & 0xFF; agal_reg_name(s2b, t2, n2, target); agal_swizzle(w2, sw2); sw2[4] = 0; agal_src_expr(s2, t2, n2, w2, target); }
+        }
+        as_json_buf_append_cstr(b, "    ");
+        // Control flow (AGAL2): no destination register.
+        if (op == 0x1c || op == 0x1d || op == 0x1e || op == 0x1f || op == 0x20 || op == 0x21) {
+            char t[64];
+            if (op == 0x1c) sprintf(t, "if (%s.x == %s.x) {\\n", s1, s2);
+            else if (op == 0x1d) sprintf(t, "if (%s.x != %s.x) {\\n", s1, s2);
+            else if (op == 0x1e) sprintf(t, "if (%s.x >= %s.x) {\\n", s1, s2);
+            else if (op == 0x1f) sprintf(t, "if (%s.x < %s.x) {\\n", s1, s2);
+            else if (op == 0x20) sprintf(t, "} else {\\n");
+            else sprintf(t, "}\\n");
+            as_json_buf_append_cstr(b, t);
+            continue;
+        }
+        // kill/discard (fragment only).
+        if (op == 0x27) { char t[64]; sprintf(t, "if (%s.x < 0.0) %s;\\n", s1, target == 0 ? "discard_fragment()" : "discard"); as_json_buf_append_cstr(b, t); continue; }
+        // Matrix×vector: src2..src2+N-1 form the matrix (m33=3 rows, m44=4, m34=3).
+        if (op == 0x17 || op == 0x18 || op == 0x19) {
+            int rows = (op == 0x18) ? 4 : 3;
+            char mrow[4][48]; for (int r = 0; r < rows; r++) agal_reg_name(mrow[r], t2, n2 + r, target);
+            for (int r = 0; r < rows; r++) { char t[200]; sprintf(t, "    %s.%c = dot(%s, %s(%s.x, %s.y, %s.z, %s.w));\\n", dname, agal_swz[r], s1, v4, mrow[r], mrow[r], mrow[r], mrow[r]); as_json_buf_append_cstr(b, t); }
+            continue;
+        }
+        // Partial write-mask: decompose per-channel using the *decoded* swizzle
+        // component, so 'mov vt0.xy, va1.zw' emits 'vt0.x = va[1].z; vt0.y = va[1].w;'
+        // rather than an opaque '.zwzw.x' re-swizzle.
+        if (dmask != 0xF && dmask != 0) {
+            for (int c = 0; c < 4; c++) {
+                if (!(dmask & (1 << c))) continue;
+                char ch = agal_swz[c], c1 = sw1[c], c2 = sw2[c];
+                char rhs[128]; rhs[0] = 0;
+                if (op == 0x00) sprintf(rhs, "%s.%c", s1b, c1);
+                else if (op >= 0x01 && op <= 0x04) { const char* o = op == 0x01 ? "+" : op == 0x02 ? "-" : op == 0x03 ? "*" : "/"; sprintf(rhs, "%s.%c %s %s.%c", s1b, c1, o, s2b, c2); }
+                else if (op == 0x05) sprintf(rhs, "1.0 / %s.%c", s1b, c1);
+                else if (op == 0x06) sprintf(rhs, "min(%s.%c, %s.%c)", s1b, c1, s2b, c2);
+                else if (op == 0x07) sprintf(rhs, "max(%s.%c, %s.%c)", s1b, c1, s2b, c2);
+                else if (op == 0x08) sprintf(rhs, "fract(%s.%c)", s1b, c1);
+                else if (op == 0x09) sprintf(rhs, "sqrt(%s.%c)", s1b, c1);
+                else if (op == 0x0a) sprintf(rhs, "1.0 / sqrt(%s.%c)", s1b, c1);
+                else if (op == 0x0b) sprintf(rhs, "pow(%s.%c, %s.%c)", s1b, c1, s2b, c2);
+                else if (op == 0x0c) sprintf(rhs, "log2(%s.%c)", s1b, c1);
+                else if (op == 0x0d) sprintf(rhs, "exp2(%s.%c)", s1b, c1);
+                else if (op == 0x0f) sprintf(rhs, "sin(%s.%c)", s1b, c1);
+                else if (op == 0x10) sprintf(rhs, "cos(%s.%c)", s1b, c1);
+                // dp3/dp4 produce a scalar dot product, so a partial write-mask
+                // (e.g. 'dp4 op.x, va0, vc0') must still emit the full dot for the
+                // masked component — otherwise the instruction is silently dropped.
+                else if (op == 0x12) sprintf(rhs, "dot(%s.xyz, %s.xyz)", s1, s2);
+                else if (op == 0x13) sprintf(rhs, "dot(%s, %s)", s1, s2);
+                else if (op == 0x14) sprintf(rhs, "abs(%s.%c)", s1b, c1);
+                else if (op == 0x15) sprintf(rhs, "-%s.%c", s1b, c1);
+                else if (op == 0x16) sprintf(rhs, "clamp(%s.%c, 0.0, 1.0)", s1b, c1);
+                else if (op == 0x1a) sprintf(rhs, "dfdx(%s.%c)", s1b, c1);
+                else if (op == 0x1b) sprintf(rhs, "dfdy(%s.%c)", s1b, c1);
+                else if (op == 0x28) sprintf(rhs, target == 0 ? "%s.sample(smp, %s.xy).%c" : "texture2D(%s, %s.xy).%c", s2b, s1, c1);
+                else if (op == 0x29) sprintf(rhs, "(%s.%c >= %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
+                else if (op == 0x2a) sprintf(rhs, "(%s.%c < %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
+                else if (op == 0x2c) sprintf(rhs, "(%s.%c == %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
+                else if (op == 0x2d) sprintf(rhs, "(%s.%c != %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
+                if (rhs[0] == 0) continue;
+                char t[192]; sprintf(t, "    %s.%c = %s;\\n", dname, ch, rhs); as_json_buf_append_cstr(b, t);
+            }
+            continue;
+        }
+        // Full-mask: build a full-float4 RHS expression.
+        char rhs[256]; rhs[0] = 0;
+        if (op == 0x00) sprintf(rhs, "%s", s1);
+        else if (op >= 0x01 && op <= 0x04) { const char* o = op == 0x01 ? "+" : op == 0x02 ? "-" : op == 0x03 ? "*" : "/"; sprintf(rhs, "%s %s %s", s1, o, s2); }
+        else if (op == 0x05) sprintf(rhs, "1.0 / %s", s1);
+        else if (op == 0x06) sprintf(rhs, "min(%s, %s)", s1, s2);
+        else if (op == 0x07) sprintf(rhs, "max(%s, %s)", s1, s2);
+        else if (op == 0x08) sprintf(rhs, "fract(%s)", s1);
+        else if (op == 0x09) sprintf(rhs, "sqrt(%s)", s1);
+        else if (op == 0x0a) sprintf(rhs, "1.0 / sqrt(%s)", s1);
+        else if (op == 0x0b) sprintf(rhs, "pow(%s, %s)", s1, s2);
+        else if (op == 0x0c) sprintf(rhs, "log2(%s)", s1);
+        else if (op == 0x0d) sprintf(rhs, "exp2(%s)", s1);
+        else if (op == 0x0e) sprintf(rhs, "normalize(%s)", s1);
+        else if (op == 0x0f) sprintf(rhs, "sin(%s)", s1);
+        else if (op == 0x10) sprintf(rhs, "cos(%s)", s1);
+        else if (op == 0x11) sprintf(rhs, "%s(cross(%s.xyz, %s.xyz), 1.0)", v4, s1, s2);
+        else if (op == 0x12) sprintf(rhs, "%s(dot(%s.xyz, %s.xyz))", v4, s1, s2);
+        else if (op == 0x13) sprintf(rhs, "%s(dot(%s, %s))", v4, s1, s2);
+        else if (op == 0x14) sprintf(rhs, "abs(%s)", s1);
+        else if (op == 0x15) sprintf(rhs, "-%s", s1);
+        else if (op == 0x16) sprintf(rhs, "clamp(%s, 0.0, 1.0)", s1);
+        else if (op == 0x1a) sprintf(rhs, "dfdx(%s)", s1);
+        else if (op == 0x1b) sprintf(rhs, "dfdy(%s)", s1);
+        else if (op == 0x28) sprintf(rhs, target == 0 ? "%s.sample(smp, %s.xy)" : "texture2D(%s, %s.xy)", s2, s1);
+        else if (op == 0x29) sprintf(rhs, "(%s >= %s) ? %s(1.0) : %s(0.0)", s1, s2, v4, v4);
+        else if (op == 0x2a) sprintf(rhs, "(%s < %s) ? %s(1.0) : %s(0.0)", s1, s2, v4, v4);
+        else if (op == 0x2c) sprintf(rhs, "(%s == %s) ? %s(1.0) : %s(0.0)", s1, s2, v4, v4);
+        else if (op == 0x2d) sprintf(rhs, "(%s != %s) ? %s(1.0) : %s(0.0)", s1, s2, v4, v4);
+        if (rhs[0] == 0) continue;
+        char t[300]; sprintf(t, "    %s = %s;\\n", dname, rhs); as_json_buf_append_cstr(b, t);
+    }
+}
+
+// Track which registers are referenced, so the emitted shader only declares
+// those. Indexed by logical register class (0..7 = type code), each a 256-bit
+// usage bitmap (8×u32). Constant/temporary/output classes are shared between
+// vertex and fragment (vc=fc=1, vt=ft=2, op=oc=3), disambiguated by agal_is_frag.
+static int agal_used[8][8];
+static void agal_mark_use(int type, int num) { if (type >= 0 && type < 8 && num >= 0 && num < 256) agal_used[type][num / 32] |= (1u << (num % 32)); }
+static int agal_is_used(int type, int num) { return (type >= 0 && type < 8 && num >= 0 && num < 256) ? ((agal_used[type][num / 32] >> (num % 32)) & 1u) : 0; }
+
+static char* as_agal_translate(const unsigned char* bytes, int len, int target) {
+    as_agal_errmsg = NULL;
+    if (len < 7) { as_agal_errmsg = "AGAL: bytecode too short for header"; return NULL; }
+    if (bytes[0] != 0xA0) { as_agal_errmsg = "AGAL: bad magic (expected 0xA0)"; return NULL; }
+    if (bytes[5] != 0xA1) { as_agal_errmsg = "AGAL: bad program type marker (expected 0xA1)"; return NULL; }
+    unsigned version = as_agal_u32(bytes + 1);
+    if (version < 1 || version > 3) { as_agal_errmsg = "AGAL: unsupported version"; return NULL; }
+    int isFragment = bytes[6] & 1;
+    agal_is_frag = isFragment;
+    memset(agal_used, 0, sizeof(agal_used));
+    agal_instr ins[200];
+    int n = 0, pos = 7;
+    // The official AGALMiniAssembler emits each instruction as a fixed 192-bit
+    // (24-byte) slot: 32-bit opcode + up to 160 bits of operands, zero-padded.
+    // Operand counts are NOT encoded in the opcode token (see agal_op_nreg), so
+    // the trailing zero-padding must be skipped to reach the next instruction.
+    while (pos + 24 <= len) {
+        if (n >= 200) { as_agal_errmsg = "AGAL: too many instructions (limit 200)"; return NULL; }
+        int inst_start = pos;
+        unsigned op_tok = as_agal_u32(bytes + pos); pos += 4;
+        int op = op_tok & 0xFF;
+        if (op > 0x2e || agal_op_name[op] == NULL) { as_agal_errmsg = "AGAL: invalid opcode"; return NULL; }
+        int nreg = agal_op_nreg[op];
+        int hasDst = (nreg >= 1) && !agal_op_nodest[op];
+        int hasSrc1 = nreg >= (hasDst ? 2 : 1);
+        int hasSrc2 = nreg >= (hasDst ? 3 : 2);
+        agal_instr* I = &ins[n];
+        memset(I, 0, sizeof(*I));
+        I->op = (unsigned)op;
+        if (hasDst) { I->dst = as_agal_u32(bytes + pos); pos += 4; int t = (I->dst >> 24) & 0xFF, num = I->dst & 0xFFFF; agal_mark_use(t, num); }
+        if (hasSrc1) { I->s1lo = as_agal_u32(bytes + pos); I->s1hi = as_agal_u32(bytes + pos + 4); pos += 8; agal_mark_use(I->s1hi & 0xFF, I->s1lo & 0xFFFF); }
+        if (hasSrc2) { I->s2lo = as_agal_u32(bytes + pos); I->s2hi = as_agal_u32(bytes + pos + 4); pos += 8; if (op == 0x28 || op == 0x2e) agal_mark_use(AGAL_FS, I->s2lo & 0xFFFF); else agal_mark_use(I->s2hi & 0xFF, I->s2lo & 0xFFFF); }
+        pos = inst_start + 24; // skip the fixed-size padding to the next slot
+        n++;
+    }
+    if (n == 0) { as_agal_errmsg = "AGAL: empty program"; return NULL; }
+    as_json_buf b; as_json_buf_init(&b);
+    if (target == 0) {
+        // ---- MSL ----
+        as_json_buf_append_cstr(&b, "#include <metal_stdlib>\\nusing namespace metal;\\n\\n");
+        if (!isFragment) {
+            as_json_buf_append_cstr(&b, "struct VSIn {\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VA, i)) { char t[64]; sprintf(t, "  float4 a%d [[attribute(%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, "};\\nstruct VSOut {\\n  float4 position [[position]];\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[64]; sprintf(t, "  float4 varying%d [[user(locn%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, "};\\n\\nvertex VSOut vs_main(\\n  VSIn in [[stage_in]],\\n  constant float4* vc [[buffer(0)]]\\n) {\\n  VSOut out;\\n  float4 op;\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 vt%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[32]; sprintf(t, "  float4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+        } else {
+            as_json_buf_append_cstr(&b, "struct FSIn {\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[64]; sprintf(t, "  float4 v%d [[user(locn%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, "};\\nfragment float4 fs_main(\\n  FSIn in [[stage_in]],\\n  constant float4* fc [[buffer(0)]]");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[48]; sprintf(t, ",\\n  texture2d<float> fs%d [[texture(%d)]]", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, ",\\n  sampler smp [[sampler(0)]]\\n) {\\n  float4 oc;\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 ft%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+        }
+        agal_emit_body(&b, ins, n, target);
+        if (!isFragment) {
+            as_json_buf_append_cstr(&b, "  out.position = op;\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[48]; sprintf(t, "  out.varying%d = v%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, "  return out;\\n");
+        } else {
+            as_json_buf_append_cstr(&b, "  return oc;\\n");
+        }
+        as_json_buf_append_cstr(&b, "}\\n");
+    } else {
+        // ---- GLSL ES ----
+        as_json_buf_append_cstr(&b, "precision mediump float;\\n");
+        for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VC, i)) { char t[40]; sprintf(t, "uniform vec4 %s%d;\\n", isFragment ? "fc" : "vc", i); as_json_buf_append_cstr(&b, t); }
+        for (int i = 0; i < 256; i++) if (agal_is_used(isFragment ? AGAL_V : AGAL_VA, i)) { char t[48]; sprintf(t, "%s vec4 %s%d;\\n", isFragment ? "varying" : "attribute", isFragment ? "v" : "va", i); as_json_buf_append_cstr(&b, t); }
+        if (isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[40]; sprintf(t, "uniform sampler2D fs%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+        as_json_buf_append_cstr(&b, "void main() {\\n");
+        for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  vec4 %s%d;\\n", isFragment ? "ft" : "vt", i); as_json_buf_append_cstr(&b, t); }
+        if (!isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[32]; sprintf(t, "  vec4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+        agal_emit_body(&b, ins, n, target);
+        as_json_buf_append_cstr(&b, "}\\n");
+    }
+    char* out = as_str_alloc(b.len + 1);
+    memcpy(out, b.buf, b.len + 1);
+    free(b.buf);
+    return out;
+}
+
+// ---------- Stage3D raw Metal bridge (stage 82) ----------
+// Exposes vendor/stage3d_glue.mm's offscreen programmable pipeline (MTLBuffer
+// vertex/index, MTLTexture, MSL-compiled AGAL programs, MTLRenderPassDescriptor
+// render-to-texture) to the generated C. The glue is Objective-C++, so these
+// extern "C" symbols are only linked for native builds where air-app.ts (or a
+// build manifest) adds ASC_RENDER_STAGE3D. The as_s3d_* wrappers below no-op in
+// pure-C builds, keeping the Context3D state machine link-clean without Metal.
+//
+// Vertex/constant data crosses the boundary as double (AS3 Vector.<Number>); the
+// glue converts to float32 for the GPU. Index data is uint32 (Vector.<uint>).
+// Textures cross as ARGB uint32 (BitmapData.pixels) and are converted to BGRA.
+#ifdef ASC_RENDER_STAGE3D
+extern void* s3d_create(int width, int height);
+extern void s3d_destroy(void* ctx);
+extern int s3d_resize(void* ctx, int width, int height);
+extern int s3d_upload_vertex(void* ctx, int stream, const double* data, int numVertices, int components);
+extern int s3d_upload_index(void* ctx, const uint32_t* data, int numIndices);
+extern int s3d_upload_constants(void* ctx, int isFragment, const double* data, int count);
+extern void* s3d_upload_texture(void* ctx, int unit, int width, int height, const uint32_t* argb);
+extern int s3d_compile(void* ctx, const char* vs_msl, const char* fs_msl, char* errbuf, int errbuf_size);
+extern void s3d_clear(void* ctx, float r, float g, float b, float a);
+extern void s3d_set_blend(void* ctx, const char* sourceFactor, const char* destFactor);
+extern void s3d_set_instance_count(void* ctx, int n);
+extern int s3d_draw(void* ctx, int numTriangles);
+extern int s3d_readback(void* ctx, uint8_t* out);
+extern int s3d_width(void* ctx);
+extern int s3d_height(void* ctx);
+extern void* s3d_create_render_texture(void* ctx, int width, int height);
+extern void s3d_set_render_target(void* ctx, void* tex);
+extern int s3d_bind_texture(void* ctx, int unit, void* tex);
+extern int s3d_readback_render(void* ctx, uint8_t* out);
+extern void s3d_destroy_texture(void* tex);
+extern void* s3d_get_render_target(void* ctx);
+#endif
+
+static inline void* as_s3d_create(int w, int h) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_create(w, h);
+#else
+    (void)w; (void)h; return NULL;
+#endif
+}
+static inline void as_s3d_destroy(void* ctx) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_destroy(ctx);
+#else
+    (void)ctx;
+#endif
+}
+static inline int as_s3d_resize(void* ctx, int w, int h) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_resize(ctx, w, h);
+#else
+    (void)ctx; (void)w; (void)h; return 0;
+#endif
+}
+static inline int as_s3d_upload_vertex(void* ctx, int stream, const double* data, int numVertices, int components) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_upload_vertex(ctx, stream, data, numVertices, components);
+#else
+    (void)ctx; (void)stream; (void)data; (void)numVertices; (void)components; return 0;
+#endif
+}
+static inline int as_s3d_upload_index(void* ctx, const uint32_t* data, int numIndices) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_upload_index(ctx, data, numIndices);
+#else
+    (void)ctx; (void)data; (void)numIndices; return 0;
+#endif
+}
+static inline int as_s3d_upload_constants(void* ctx, int isFragment, const double* data, int count) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_upload_constants(ctx, isFragment, data, count);
+#else
+    (void)ctx; (void)isFragment; (void)data; (void)count; return 0;
+#endif
+}
+static inline void* as_s3d_upload_texture(void* ctx, int unit, int w, int h, const uint32_t* argb) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_upload_texture(ctx, unit, w, h, argb);
+#else
+    (void)ctx; (void)unit; (void)w; (void)h; (void)argb; return NULL;
+#endif
+}
+static inline int as_s3d_compile(void* ctx, const char* vs, const char* fs, char* errbuf, int errbuf_size) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_compile(ctx, vs, fs, errbuf, errbuf_size);
+#else
+    (void)ctx; (void)vs; (void)fs; (void)errbuf; (void)errbuf_size; return 0;
+#endif
+}
+static inline void as_s3d_clear(void* ctx, float r, float g, float b, float a) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_clear(ctx, r, g, b, a);
+#else
+    (void)ctx; (void)r; (void)g; (void)b; (void)a;
+#endif
+}
+static inline void as_s3d_set_blend(void* ctx, const char* source, const char* dest) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_blend(ctx, source, dest);
+#else
+    (void)ctx; (void)source; (void)dest;
+#endif
+}
+static inline void as_s3d_set_instance_count(void* ctx, int n) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_instance_count(ctx, n);
+#else
+    (void)ctx; (void)n;
+#endif
+}
+static inline int as_s3d_draw(void* ctx, int numTriangles) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_draw(ctx, numTriangles);
+#else
+    (void)ctx; (void)numTriangles; return 0;
+#endif
+}
+static inline int as_s3d_readback(void* ctx, uint8_t* out) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_readback(ctx, out);
+#else
+    (void)ctx; (void)out; return 0;
+#endif
+}
+static inline int as_s3d_width(void* ctx) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_width(ctx);
+#else
+    (void)ctx; return 0;
+#endif
+}
+static inline int as_s3d_height(void* ctx) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_height(ctx);
+#else
+    (void)ctx; return 0;
+#endif
+}
+static inline void* as_s3d_create_render_texture(void* ctx, int w, int h) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_create_render_texture(ctx, w, h);
+#else
+    (void)ctx; (void)w; (void)h; return NULL;
+#endif
+}
+static inline void as_s3d_set_render_target(void* ctx, void* tex) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_render_target(ctx, tex);
+#else
+    (void)ctx; (void)tex;
+#endif
+}
+static inline int as_s3d_bind_texture(void* ctx, int unit, void* tex) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_bind_texture(ctx, unit, tex);
+#else
+    (void)ctx; (void)unit; (void)tex; return 0;
+#endif
+}
+static inline int as_s3d_readback_render(void* ctx, uint8_t* out) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_readback_render(ctx, out);
+#else
+    (void)ctx; (void)out; return 0;
+#endif
+}
+static inline void as_s3d_destroy_texture(void* tex) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_destroy_texture(tex);
+#else
+    (void)tex;
+#endif
+}
+static inline void* as_s3d_get_render_target(void* ctx) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_get_render_target(ctx);
+#else
+    (void)ctx; return NULL;
+#endif
 }
 `;

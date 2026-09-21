@@ -3,7 +3,7 @@
 
 import type { Program, Stmt, Expr, ASType, Param, ClassMember, Block } from './ast.ts';
 import { RUNTIME_PREAMBLE } from './runtime.ts';
-import { resolveType, CodegenError, qualifiedName, sanitizeCIdent } from './symbols.ts';
+import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 
 // Compound assignment operator -> underlying binary operator.
@@ -16,6 +16,14 @@ export class Emitter {
   private out: string[] = [];
   private indent = 0;
   private scopes: Map<string, CType>[] = [];
+  // Function-scoped locals (AS3 `var` is hoisted to the enclosing function, not
+  // the enclosing block). While emitting a function body this points at the scope
+  // frame created for that function, so `var` declarations land there and stay
+  // visible to sibling blocks (`if (x) { var k:int = 1; } for (k = 0; ...)`).
+  private functionScope: Map<string, CType> | null = null;
+  // Names already hoisted to the function top for the current function; their
+  // in-body `var` sites emit a plain assignment instead of a re-declaration.
+  private hoistedLocals: Set<string> = new Set();
   private currentClass: string | null = null;
   private suppressBreak = 0;
   private labels: { asName: string; cName: string; tryDepth: number }[] = [];
@@ -90,6 +98,7 @@ export class Emitter {
     this.line(RUNTIME_PREAMBLE.trimEnd());
     this.line('');
     this.collectFunctionValues(); // also gathers Vector.<T> specializations
+    this.noteBuiltinVectorSpecs();
     this.emitTypedefs();
     this.emitStructs();
     this.emitPrototypes();
@@ -272,6 +281,26 @@ export class Emitter {
     }
   }
 
+  // Register a Vector.<T> specialization referenced by a resolved CType.
+  private noteCType(t: CType): void {
+    if (t.kind === 'vector') this.vectorSpecs.set(ctypeToString(t), t.elem);
+  }
+
+  // Built-in class method/field signatures can reference Vector.<T> that no user
+  // code mentions directly (e.g. Matrix3D.rawData -> Vector.<Number>, decompose ->
+  // Vector.<Vector3D>). Register those specializations so their struct + helpers
+  // are emitted (the per-specialization helpers are `static`, so -O2 still dead-
+  // strips the ones a program never reaches).
+  private noteBuiltinVectorSpecs(): void {
+    for (const [, info] of this.symbols.classes) {
+      for (const f of info.fields.values()) this.noteCType(f.type);
+      for (const m of info.methods.values()) { this.noteCType(m.returnType); for (const p of m.params) this.noteCType(resolveType(p.type)); }
+      for (const m of info.getters.values()) this.noteCType(m.returnType);
+      for (const m of info.setters.values()) for (const p of m.params) this.noteCType(resolveType(p.type));
+      for (const m of info.staticMethods.values()) { this.noteCType(m.returnType); for (const p of m.params) this.noteCType(resolveType(p.type)); }
+    }
+  }
+
   private escapeCString(s: string): string {
     let r = '';
     for (const ch of s) {
@@ -302,6 +331,70 @@ export class Emitter {
   private popScope(): void { this.scopes.pop(); }
   private declareVar(name: string, t: CType): void {
     this.scopes[this.scopes.length - 1].set(name, t);
+  }
+
+  // ---------- function-scoped `var` hoisting ----------
+
+  // Emit hoisted C declarations for every typed `var`/`for(var ...)` in `body`
+  // (not descending into nested functions/classes). AS3 declares these at the
+  // enclosing *function*, so a `var` inside an `if` block must be visible in a
+  // sibling `for` loop. C locals are block-scoped, so we hoist the declaration
+  // to the function top and leave the initializer (if any) as a plain assignment
+  // at the original site via emitVarDecl.
+  private hoistFunctionLocals(body: Stmt[]): void {
+    this.hoistedLocals = new Set();
+    this.collectHoistedVars(body);
+    if (this.hoistedLocals.size === 0) return;
+    // Emit declarations in first-seen order (function scope is a Map, insertion-
+    // ordered), so `int a`/`int b` read top-down exactly as the source declares.
+    for (const name of this.hoistedLocals) {
+      const t = this.functionScope!.get(name)!;
+      this.line(`${this.cTypeName(t)} ${this.cIdent(name)} = ${this.defaultInit(t)};`);
+    }
+  }
+
+  private collectHoistedVars(stmts: Stmt[]): void {
+    for (const s of stmts) this.collectHoistedVarsStmt(s);
+  }
+
+  private hoistVar(name: string, type: ASType | null): void {
+    // Untyped `var x = expr` needs the expression's type, which only emitExpr
+    // can infer; those stay block-scoped in place (they never appear in the
+    // cross-block patterns AS3 hoisting exists for). Typed vars are hoisted.
+    if (type === null) return;
+    if (!this.hoistedLocals.has(name)) {
+      this.hoistedLocals.add(name);
+      this.functionScope!.set(name, resolveType(type));
+    }
+  }
+
+  private collectHoistedVarsStmt(s: Stmt): void {
+    switch (s.kind) {
+      case 'VarDecl': this.hoistVar(s.name, s.type); break;
+      case 'VarDecls': for (const d of s.decls) this.hoistVar(d.name, d.type); break;
+      case 'Block': this.collectHoistedVars(s.body); break;
+      case 'If': this.collectHoistedVarsStmt(s.then); if (s.else) this.collectHoistedVarsStmt(s.else); break;
+      case 'While': this.collectHoistedVarsStmt(s.body); break;
+      case 'DoWhile': this.collectHoistedVarsStmt(s.body); break;
+      case 'For':
+        if (s.init && s.init.kind === 'VarDecl') this.hoistVar(s.init.name, s.init.type);
+        this.collectHoistedVarsStmt(s.body);
+        break;
+      // for-in / for-each-in declare their loop var in a block-local scope (the
+      // var's type depends on the iterable, resolved at emit time), but any `var`
+      // *inside* their bodies is still function-scoped and must be hoisted.
+      case 'ForIn': this.collectHoistedVarsStmt(s.body); break;
+      case 'ForEachIn': this.collectHoistedVarsStmt(s.body); break;
+      case 'Switch': for (const c of s.cases) this.collectHoistedVars(c.body); break;
+      case 'Try':
+        this.collectHoistedVars(s.tryBody.body);
+        if (s.catchBody) this.collectHoistedVars(s.catchBody.body);
+        if (s.finallyBody) this.collectHoistedVars(s.finallyBody.body);
+        break;
+      case 'Label': this.collectHoistedVarsStmt(s.body); break;
+      // Do not descend into nested functions/classes (their vars are their own).
+      default: break;
+    }
   }
 
   // Sanitize a method/field/local/param name to a collision-free C identifier.
@@ -344,6 +437,15 @@ export class Emitter {
   }
 
   private emitStructs(): void {
+    // Vector.<T> monomorphized structs: a GCT_CUSTOM mark callback (so the GC
+    // can trace element pointers for reference element types), then the
+    // contiguous element array + length/capacity. Emitted FIRST so vtable slots
+    // (e.g. Matrix3D.transformVectors -> as_vector_number*) can reference them.
+    for (const [, elem] of this.vectorSpecs) {
+      const key = this.vectorCName(elem);
+      this.line(`typedef struct { void (*mark)(void*); ${this.cTypeName(elem)}* data; int length; int capacity; } as_vector_${key};`);
+    }
+    if (this.vectorSpecs.size > 0) this.line('');
     for (const [name, info] of this.symbols.classes) {
       this.line(`// class ${name}`);
       // vtable struct: `super` chain for runtime type checks (`is`/`as`), then
@@ -392,33 +494,41 @@ export class Emitter {
           this.line('int _auto_still;');
           this.line('int _auto_baked;');
         }
+        // TextField caches its laid-out SkParagraph so repaints and property
+        // reads (textWidth/textHeight/numLines/maxScrollV) reuse one layout
+        // instead of re-measuring every frame. These fields are C-runtime only
+        // (not AS3-visible). `textColor` is TextField's LAST declared field, so
+        // emitting the cache right after it keeps the same offset in every
+        // TextField subclass (GameGUI extends TextField): the TextField_* bodies
+        // read these slots through a `TextField*` cast, and a subclass's own
+        // fields must not shift them.
+        if (fname === 'textColor' && this.symbols.isSubclassOf(name, 'TextField')) {
+          this.line('void* _para;');
+          this.line('const char* _para_text;');
+          this.line('double _para_w;');
+          this.line('double _para_size;');
+          this.line('int _para_bold;');
+          this.line('int _para_italic;');
+          this.line('unsigned _para_color;');
+          this.line('int _para_collapse;');
+          this.line('double _para_leading;');
+          this.line('int _sel_begin;');
+          this.line('int _sel_end;');
+          this.line('int _sel_caret;');
+          this.line('as_array* _runs;');
+          this.line('int _html_dirty;');
+          this.line('int _scroll_h;');
+        }
       }
       // Dynamic classes (AS3 `dynamic class`) carry a runtime slot table for
       // arbitrary undeclared string-keyed properties. Its byte offset is emitted
       // into the vtable so as_dyn_get/set can reach it.
       if (info.isDynamic) this.line('as_object* _dyn;');
-      // TextField caches its laid-out SkParagraph so repaints and property reads
-      // (textWidth/textHeight/numLines/maxScrollV) reuse one layout instead of
-      // re-measuring every frame. The cache key is the text pointer plus every
-      // property that affects layout/color (width/size/bold/italic/color); any
-      // change rebuilds the paragraph. These fields are C-runtime only — they
-      // are not AS3-visible members.
-      if (name === 'TextField') {
-        this.line('void* _para;');
-        this.line('const char* _para_text;');
-        this.line('double _para_w;');
-        this.line('double _para_size;');
-        this.line('int _para_bold;');
-        this.line('int _para_italic;');
-        this.line('unsigned _para_color;');
-        this.line('int _para_collapse;');
-        this.line('double _para_leading;');
-        this.line('int _sel_begin;');
-        this.line('int _sel_end;');
-        this.line('int _sel_caret;');
-        this.line('as_array* _runs;');
-        this.line('int _html_dirty;');
-        this.line('int _scroll_h;');
+      // Matrix3D keeps its 16 column-major doubles in a C-runtime-only array (the
+      // class declares no AS3-visible fields; rawData is a getter/setter). Emitted
+      // here so the layout is stable and all Matrix3D_* bodies can read `o->_m`.
+      if (this.symbols.isSubclassOf(name, 'Matrix3D')) {
+        this.line('double _m[16];');
       }
       this.indent--;
       this.line('};');
@@ -447,14 +557,6 @@ export class Emitter {
       this.line('};');
       this.line('');
     }
-    // Vector.<T> monomorphized structs: a GCT_CUSTOM mark callback (so the GC
-    // can trace element pointers for reference element types), then the
-    // contiguous element array + length/capacity.
-    for (const [, elem] of this.vectorSpecs) {
-      const key = this.vectorCName(elem);
-      this.line(`typedef struct { void (*mark)(void*); ${this.cTypeName(elem)}* data; int length; int capacity; } as_vector_${key};`);
-    }
-    if (this.vectorSpecs.size > 0) this.line('');
   }
 
   private emitPrototypes(): void {
@@ -474,7 +576,7 @@ export class Emitter {
       // static methods (no receiver)
       for (const [mname, m] of info.staticMethods) {
         if (m.owner !== cname) continue;
-        this.line(`${this.cTypeName(m.returnType)} ${cname}_${mname}(${this.paramDecls(m.params)});`);
+        this.line(`${this.cTypeName(m.returnType)} ${cname}_${mname}_static(${this.paramDecls(m.params)});`);
       }
       // getters / setters
       for (const [mname, m] of info.getters) {
@@ -498,7 +600,7 @@ export class Emitter {
       this.line(`as_vector_${key}* as_vector_${key}_new(void);`);
       this.line(`as_vector_${key}* as_vector_${key}_new_sized(int n);`);
       this.line(`as_vector_${key}* as_vector_${key}_make(int n, ${ec}* items);`);
-      this.line(`void as_vector_${key}_push(as_vector_${key}* v, ${ec} e);`);
+      this.line(`int as_vector_${key}_push(as_vector_${key}* v, ${ec} e);`);
       this.line(`${ec} as_vector_${key}_pop(as_vector_${key}* v);`);
       this.line(`${ec} as_vector_${key}_get(as_vector_${key}* v, int i);`);
       this.line(`void as_vector_${key}_set(as_vector_${key}* v, int i, ${ec} e);`);
@@ -703,18 +805,36 @@ export class Emitter {
     for (const [cname, info] of this.symbols.classes) {
       for (const [fname, f] of info.staticFields) {
         if (f.owner !== cname) continue;
-        if (f.isConst) {
-          this.currentClass = cname;
+        this.currentClass = cname;
+        if (f.isConst && this.isConstExpr(f.init)) {
           const init = f.init ? this.convert(this.emitExpr(f.init), f.type) : this.defaultInit(f.type);
           this.line(`static ${this.constTypeName(f.type)} ${cname}_${fname} = ${init};`);
-          this.currentClass = null;
         } else {
+          // Mutable static slot with a default; the initializer (when present)
+          // runs in main(). This covers both non-const fields and AS3 `const`
+          // fields whose initializer needs runtime evaluation (e.g.
+          // `static const Dictionary = new Dictionary()` or a RegExp literal) —
+          // C's `static const` demands a compile-time constant, so such a slot is
+          // declared non-const and written once before any use.
           this.line(`static ${this.cTypeName(f.type)} ${cname}_${fname} = ${this.defaultInit(f.type)};`);
           if (f.init) this.staticFieldInits.push({ cname, fname, f });
         }
+        this.currentClass = null;
       }
     }
     if (this.symbols.classes.size > 0) this.line('');
+  }
+
+  // True when `e` is a C compile-time constant expression (safe as a `static
+  // const` initializer). Only literal leaves qualify: object/array/dict/regexp/
+  // function literals, `new X()`, calls and string concatenation all compile to
+  // runtime calls and therefore need main()-time initialization.
+  private isConstExpr(e: Expr | null): boolean {
+    if (e === null) return false;
+    switch (e.kind) {
+      case 'Num': case 'Str': case 'Bool': case 'Null': return true;
+      default: return false;
+    }
   }
 
   // GC permanent user roots (stage 57): emit gc_mark_user_roots(), which marks
@@ -752,7 +872,7 @@ export class Emitter {
     for (const [cname, info] of this.symbols.classes) {
       for (const [fname, f] of info.staticFields) {
         if (f.owner !== cname) continue;
-        if (f.isConst) continue; // const = compile-time literal, never a GC object
+        if (f.isConst && this.isConstExpr(f.init)) continue; // compile-time literal const, never a GC object
         const m = this.gcMarkExpr(`${cname}_${fname}`, f.type);
         if (m) this.line(m);
       }
@@ -1065,7 +1185,7 @@ export class Emitter {
     for (const s of this.staticMethodRefs.values()) {
       this.emitThunk(
         `${s.cname}_${s.mname}__call`,
-        `${s.cname}_${s.mname}`,
+        `${s.cname}_${s.mname}_static`,
         s.m.params,
         s.m.returnType,
         null,
@@ -1120,6 +1240,7 @@ export class Emitter {
     for (const fn of this.anonFuncs) {
       const rt = resolveType(fn.returnType);
       this.pushScope();
+      this.functionScope = this.scopes[this.scopes.length - 1];
       for (const p of fn.params) this.declareVar(p.name, resolveType(p.type));
       this.currentReturnType = rt;
       if (fn.captures.length === 0) {
@@ -1130,11 +1251,14 @@ export class Emitter {
         this.currentClosureCaptures = new Map(fn.captures.map((c) => [c.name, c.type]));
       }
       this.indent++;
+      this.hoistFunctionLocals(fn.body.body);
       this.emitBlockBody(fn.body);
       this.indent--;
       this.line('}');
       this.line('');
       this.currentClosureCaptures = null;
+      this.functionScope = null;
+      this.hoistedLocals = new Set();
       this.popScope();
       this.currentReturnType = null;
       if (fn.captures.length === 0) {
@@ -1215,6 +1339,20 @@ export class Emitter {
     // built-in Object.toString(): the default string form of any object is its runtime class name.
     this.line('char* Object_toString(void* _this) { return as_obj_to_str(_this); }');
     this.line('');
+    // Stage3D on-screen compositing (stage 82 P2): Context3D.present() exposes the
+    // offscreen Metal render target for ASC_window_render to composite behind the
+    // 2D display list (AIR puts Stage3D behind the display list). On the GPU Metal
+    // path this is a direct GPU→GPU blit (ASC_stage3d_tex); on the CPU raster path
+    // the target is read back into ASC_stage3d_pixels and drawn as BGRA. Declared up
+    // here (before the Context3D_* method definitions below) so Context3D_present
+    // can reference them. Static storage duration zero-initializes them to NULL/0,
+    // matching the "no Stage3D content yet" state.
+    this.line('static uint8_t* ASC_stage3d_pixels;');
+    this.line('static void* ASC_stage3d_tex;');
+    this.line('static int ASC_stage3d_w;');
+    this.line('static int ASC_stage3d_h;');
+    this.line('static int ASC_stage3d_ready;');
+    this.line('');
     // built-in Object: no fields to initialize, but every subclass's implicit
     // super() lands here, so it needs a real (empty) constructor definition.
     this.line('void Object_ctor(Object* o) { (void)o; }');
@@ -1223,7 +1361,11 @@ export class Emitter {
     // Stage 41 constant classes are pure static-String holders and are never
     // instantiated, but they still need concrete (empty) ctor/new definitions
     // so any reference links cleanly.
-    for (const cc of ['StageAlign', 'StageScaleMode', 'StageQuality', 'StageDisplayState']) {
+    for (const cc of ['StageAlign', 'StageScaleMode', 'StageQuality', 'StageDisplayState',
+      'Context3DBlendFactor', 'Context3DBufferUsage', 'Context3DClearMask', 'Context3DCompareMode',
+      'Context3DFillMode', 'Context3DMipFilter', 'Context3DProfile', 'Context3DProgramType',
+      'Context3DRenderMode', 'Context3DStencilAction', 'Context3DTextureFilter', 'Context3DTextureFormat',
+      'Context3DTriangleFace', 'Context3DVertexBufferFormat', 'Context3DWrapMode']) {
       this.line(`void ${cc}_ctor(${cc}* o) { Object_ctor((Object*)o); }`);
       this.line(`${cc}* ${cc}_new(void) { ${cc}* o = (${cc}*)gc_alloc(GCT_CLASS, sizeof(${cc})); o->vtable = &${cc}_vt; ${cc}_ctor(o); return o; }`);
     }
@@ -1302,7 +1444,7 @@ export class Emitter {
     this.indent--;
     this.line('}');
     // Date.parse: accept "YYYY/MM/DD" / "YYYY-MM-DD" with an optional time part.
-    this.line('double Date_parse(char* s) {');
+    this.line('double Date_parse_static(char* s) {');
     this.indent++;
     this.line('int year = 0, mon = 0, day = 1, hour = 0, min = 0, sec = 0;');
     this.line('int n = sscanf(s, "%d/%d/%d %d:%d:%d", &year, &mon, &day, &hour, &min, &sec);');
@@ -1399,6 +1541,79 @@ export class Emitter {
     this.line('if (m < 0) { if (re->global) re->lastIndex = 0; return false; }');
     this.line('if (re->global) re->lastIndex = end;');
     this.line('return true;');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // ---- dynamic string method dispatch ----
+    // A method invoked on a dynamically-typed (`*`) value that happens to be a
+    // string at runtime. Strings are raw char* (no vtable), so as_dyn_call would
+    // dereference the string data as an object header and crash. as_any_call
+    // routes tag-3 receivers here; every method reuses the static string helpers.
+    // match/search/replace accept either a RegExp object (tag 4) or a String
+    // pattern (tag 3) per AS3 semantics.
+    this.line('static as_value as_str_dyn_call(char* s, const char* name, as_value* args, int argc) {');
+    this.indent++;
+    this.line('if (strcmp(name, "match") == 0) {');
+    this.indent++;
+    this.line('as_regex* re = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->compiled : as_regex_compile(as_v_str_val(args[0]), "");');
+    this.line('int global = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->global : 0;');
+    this.line('return as_v_arr((void*)as_str_match_regex(s, re, global));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(name, "search") == 0) {');
+    this.indent++;
+    this.line('as_regex* re = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->compiled : as_regex_compile(as_v_str_val(args[0]), "");');
+    this.line('return as_v_num((double)as_str_search_regex(s, re));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(name, "replace") == 0) {');
+    this.indent++;
+    this.line('if (args[0].tag == 4) {');
+    this.indent++;
+    this.line('RegExp* re = (RegExp*)args[0].ptr;');
+    this.line('return as_v_str(as_str_replace_regex(s, re->compiled, argc >= 2 ? as_v_str_val(args[1]) : "", re->global));');
+    this.indent--;
+    this.line('}');
+    this.line('return as_v_str(as_str_replace(s, as_v_str_val(args[0]), argc >= 2 ? as_v_str_val(args[1]) : ""));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(name, "charAt") == 0) return as_v_str(as_str_charAt(s, as_v_int_val(args[0])));');
+    this.line('if (strcmp(name, "charCodeAt") == 0) return as_v_num((double)as_str_charCodeAt(s, as_v_int_val(args[0])));');
+    this.line('if (strcmp(name, "indexOf") == 0) return as_v_num((double)as_str_indexOf(s, as_v_str_val(args[0])));');
+    this.line('if (strcmp(name, "lastIndexOf") == 0) return as_v_num((double)as_str_lastIndexOf(s, as_v_str_val(args[0])));');
+    this.line('if (strcmp(name, "substring") == 0) {');
+    this.indent++;
+    this.line('int from = as_v_int_val(args[0]);');
+    this.line('int to = argc >= 2 ? as_v_int_val(args[1]) : (int)strlen(s);');
+    this.line('return as_v_str(as_str_substring(s, from, to));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(name, "substr") == 0) {');
+    this.indent++;
+    this.line('int from = as_v_int_val(args[0]);');
+    this.line('int len = argc >= 2 ? as_v_int_val(args[1]) : (int)strlen(s);');
+    this.line('return as_v_str(as_str_substr(s, from, len));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(name, "slice") == 0) {');
+    this.indent++;
+    this.line('int from = as_v_int_val(args[0]);');
+    this.line('int to = argc >= 2 ? as_v_int_val(args[1]) : (int)strlen(s);');
+    this.line('return as_v_str(as_str_slice(s, from, to));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(name, "split") == 0) return as_v_arr((void*)as_str_split(s, as_v_str_val(args[0])));');
+    this.line('if (strcmp(name, "toUpperCase") == 0) return as_v_str(as_str_toUpper(s));');
+    this.line('if (strcmp(name, "toLowerCase") == 0) return as_v_str(as_str_toLower(s));');
+    this.line('if (strcmp(name, "toString") == 0 || strcmp(name, "valueOf") == 0) return as_v_str(s);');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    this.line('static as_value as_any_call(as_value v, const char* name, as_value* args, int argc) {');
+    this.indent++;
+    this.line('if (v.tag == 3) return as_str_dyn_call((char*)v.ptr, name, args, argc);');
+    this.line('return as_dyn_call(v.ptr, name, args, argc);');
     this.indent--;
     this.line('}');
     this.line('');
@@ -1859,6 +2074,7 @@ export class Emitter {
     this.line('o->stage_focus_rect = false;');
     this.line('o->show_default_context_menu = true;');
     this.line('o->tab_children = true;');
+    this.line('o->stage3ds = NULL;');
     this.indent--;
     this.line('}');
     this.line('Stage* Stage_new(void) { Stage* o = (Stage*)gc_alloc(GCT_CLASS, sizeof(Stage)); o->vtable = &Stage_vt; Stage_ctor(o); return o; }');
@@ -2041,19 +2257,22 @@ export class Emitter {
     this.line('void LoaderInfo_ctor(LoaderInfo* o) {');
     this.indent++;
     this.line('EventDispatcher_ctor((EventDispatcher*)o);');
-    this.line('o->bytesLoaded = 0; o->bytesTotal = 0; o->url = NULL;');
+    this.line('o->bytesLoaded = 0; o->bytesTotal = 0; o->url = NULL; o->loader = NULL;');
     this.indent--;
     this.line('}');
     this.line('LoaderInfo* LoaderInfo_new(void) { LoaderInfo* o = (LoaderInfo*)gc_alloc(GCT_CLASS, sizeof(LoaderInfo)); o->vtable = &LoaderInfo_vt; LoaderInfo_ctor(o); return o; }');
     this.line('');
     // Loader: a DisplayObjectContainer holding loaded content. contentLoaderInfo is
-    // created at construction (never null, matching AIR). load(url) is a synchronous
-    // simulation — real async URLRequest/URLLoader arrives in stage 63.
+    // created at construction (never null, matching AIR) and its `loader` field
+    // back-references this Loader (AS3 LoaderInfo.loader), write-barriered so the
+    // cycle Loader <-> LoaderInfo is correctly traced by the GC.
     this.line('void Loader_ctor(Loader* o) {');
     this.indent++;
     this.line('DisplayObjectContainer_ctor((DisplayObjectContainer*)o);');
     this.line('o->content = NULL; o->contentLoaderInfo = LoaderInfo_new();');
     this.line('gc_write_barrier((void*)o->contentLoaderInfo);');
+    this.line('o->contentLoaderInfo->loader = o;');
+    this.line('gc_write_barrier((void*)o);');
     this.indent--;
     this.line('}');
     this.line('Loader* Loader_new(void) { Loader* o = (Loader*)gc_alloc(GCT_CLASS, sizeof(Loader)); o->vtable = &Loader_vt; Loader_ctor(o); return o; }');
@@ -2070,16 +2289,31 @@ export class Emitter {
     this.line('return as_v_null();');
     this.indent--;
     this.line('}');
-    this.line('void Loader_load(void* _this, char* url) {');
+    this.line('void Loader_load(void* _this, URLRequest* request) {');
     this.indent++;
     this.line('Loader* o = (Loader*)_this;');
     this.line('LoaderInfo* li = o->contentLoaderInfo;');
+    this.line('char* url = (request != NULL) ? request->url : NULL;');
     this.line('li->url = url; gc_write_barrier((void*)url);');
     this.line('li->bytesLoaded = 0; li->bytesTotal = 0;');
+    // Decode the image into a Bitmap content synchronously: AS3's Loader sets
+    // `content` to a Bitmap whose bitmapData holds the decoded pixels when loading
+    // a PNG/JPEG. The decode runs in load() (not the deferred COMPLETE thunk) so
+    // completeHandler can read loader.content as soon as COMPLETE fires.
+    this.line('if (url != NULL) {');
+    this.indent++;
+    this.line('BitmapData* bd = BitmapData_new(0, 0, true, 0);');
+    this.line('BitmapData_loadFile((void*)bd, url);');
+    this.line('Bitmap* bmp = Bitmap_new(bd);');
+    this.line('o->content = (DisplayObject*)bmp;');
+    this.line('gc_write_barrier((void*)bmp);');
+    this.indent--;
+    this.line('}');
     this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"init", false, false));');
     this.line('as_set_timeout(as_fn_make(Loader__complete, (void*)o), 0.0);');
     this.indent--;
     this.line('}');
+    this.line('void Loader_unload(void* _this) { Loader* o = (Loader*)_this; o->content = NULL; }');
     this.line('');
     // ---- flash.net / flash.ui (stage 63): URLRequest / URLLoader / Keyboard / Mouse ----
     //
@@ -2219,8 +2453,8 @@ export class Emitter {
     this.line('void Mouse_ctor(Mouse* o) { Object_ctor((Object*)o); }');
     this.line('Mouse* Mouse_new(void) { Mouse* o = (Mouse*)gc_alloc(GCT_CLASS, sizeof(Mouse)); o->vtable = &Mouse_vt; Mouse_ctor(o); return o; }');
     this.line('static bool as_mouse_visible = true;');
-    this.line('void Mouse_hide(void) { as_mouse_visible = false; }');
-    this.line('void Mouse_show(void) { as_mouse_visible = true; }');
+    this.line('void Mouse_hide_static(void) { as_mouse_visible = false; }');
+    this.line('void Mouse_show_static(void) { as_mouse_visible = true; }');
     this.line('');
     // ---- flash.filesystem (stage 64): File / FileStream / FileMode ----
     // POSIX filesystem probes. stat() works for both files and directories and is
@@ -2549,7 +2783,85 @@ export class Emitter {
     this.line('((unsigned*)bd->pixels)[y * bd->width + x] = 0xFF000000u | (color & 0xFFFFFFu);');
     this.indent--;
     this.line('}');
-    this.line('void BitmapData_loadFile(void* _this, char* path) { ((BitmapData*)_this)->image = as_skia_image_from_file(path); }');
+    this.line('void BitmapData_loadFile(void* _this, char* path) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    // Decode the file into an ARGB pixel buffer and adopt the image's real
+    // dimensions (AS3 loadFile adopts the source image size). On failure the
+    // constructor's blank buffer and size are left untouched.
+    this.line('int w = 0, h = 0;');
+    this.line('void* px = as_skia_image_decode_rgba(path, &w, &h);');
+    this.line('if (px != NULL) { if (bd->pixels != NULL) free(bd->pixels); bd->pixels = px; bd->width = w; bd->height = h; }');
+    // Keep the SkImage view for the display-list Bitmap render path as well.
+    this.line('bd->image = as_skia_image_from_file(path);');
+    this.indent--;
+    this.line('}');
+    // fillRect: fill a rectangular region with an ARGB color. The color's alpha is
+    // honored only when the bitmap is transparent (opaque bitmaps force 0xFF), mirroring
+    // the BitmapData constructor's fillColor semantics.
+    this.line('void BitmapData_fillRect(void* _this, Rectangle* rect, unsigned color) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('if (bd->pixels == NULL || rect == NULL) return;');
+    this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
+    this.line('int w = (int)rect->width, h = (int)rect->height;');
+    this.line('if (x0 < 0) { w += x0; x0 = 0; } if (y0 < 0) { h += y0; y0 = 0; }');
+    this.line('if (x0 + w > bd->width) w = bd->width - x0;');
+    this.line('if (y0 + h > bd->height) h = bd->height - y0;');
+    this.line('if (w <= 0 || h <= 0) return;');
+    this.line('unsigned a = bd->transparent ? (color >> 24) : 0xFFu;');
+    this.line('unsigned argb = (a << 24) | (color & 0xFFFFFFu);');
+    this.line('unsigned* p = (unsigned*)bd->pixels;');
+    this.line('for (int y = y0; y < y0 + h; y++) for (int x = x0; x < x0 + w; x++) p[y * bd->width + x] = argb;');
+    this.indent--;
+    this.line('}');
+    // draw: composite `source` into this bitmap under an affine matrix. AS3 semantics:
+    // the matrix maps source-space into destination-space, so each destination pixel
+    // samples source via the INVERSE transform (pixel-center mapping). smoothing toggles
+    // nearest-neighbor vs bilinear. colorTransform multiplies+offsets channels when given;
+    // blendMode is only ever "normal" (null) in practice. Used by the shmup mipmap chain.
+    this.line('void BitmapData_draw(void* _this, BitmapData* source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('if (source == NULL || source->pixels == NULL || bd->pixels == NULL) return;');
+    this.line('if (blendMode != NULL && strcmp(blendMode, "normal") != 0) { as_throw(Error_new((char*)"BitmapData.draw: blendMode not implemented")); return; }');
+    this.line('int cx0 = 0, cy0 = 0, cx1 = bd->width, cy1 = bd->height;');
+    this.line('if (clipRect != NULL) { cx0 = (int)clipRect->x; cy0 = (int)clipRect->y; cx1 = cx0 + (int)clipRect->width; cy1 = cy0 + (int)clipRect->height; if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0; if (cx1 > bd->width) cx1 = bd->width; if (cy1 > bd->height) cy1 = bd->height; }');
+    this.line('double a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;');
+    this.line('if (matrix != NULL) { a = matrix->a; b = matrix->b; c = matrix->c; d = matrix->d; tx = matrix->tx; ty = matrix->ty; }');
+    this.line('double det = a * d - b * c;');
+    this.line('double ia = 1, ib = 0, ic = 0, id = 1, itx = 0, ity = 0;');
+    this.line('if (det != 0.0) { ia = d / det; ic = -c / det; itx = (c * ty - d * tx) / det; ib = -b / det; id = a / det; ity = (b * tx - a * ty) / det; }');
+    this.line('const unsigned* sp = (const unsigned*)source->pixels;');
+    this.line('unsigned* dp = (unsigned*)bd->pixels;');
+    this.line('int sw = source->width, sh = source->height;');
+    this.line('double rm = 1, gm = 1, bm = 1, am = 1, ro = 0, go = 0, bo = 0, ao = 0;');
+    this.line('if (ct != NULL) { rm = ct->redMultiplier; gm = ct->greenMultiplier; bm = ct->blueMultiplier; am = ct->alphaMultiplier; ro = ct->redOffset; go = ct->greenOffset; bo = ct->blueOffset; ao = ct->alphaOffset; }');
+    this.line('for (int dy = cy0; dy < cy1; dy++) { for (int dx = cx0; dx < cx1; dx++) {');
+    this.indent++;
+    this.line('double scx = ia * (dx + 0.5) + ic * (dy + 0.5) + itx;');
+    this.line('double scy = ib * (dx + 0.5) + id * (dy + 0.5) + ity;');
+    this.line('unsigned sr = 0, sg = 0, sb = 0, sa = 0;');
+    this.line('if (!smoothing) { int sx = (int)floor(scx), sy = (int)floor(scy); if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) { dp[dy * bd->width + dx] = 0u; continue; } unsigned c = sp[sy * sw + sx]; sr = (c >> 16) & 0xFF; sg = (c >> 8) & 0xFF; sb = c & 0xFF; sa = c >> 24; }');
+    this.line('else { double u = scx - 0.5, v = scy - 0.5; int x0 = (int)floor(u), y0 = (int)floor(v); double fx = u - x0, fy = v - y0; unsigned c00 = 0, c10 = 0, c01 = 0, c11 = 0;');
+    this.indent++;
+    this.line('if (x0 >= 0 && y0 >= 0 && x0 < sw && y0 < sh) c00 = sp[y0 * sw + x0];');
+    this.line('if (x0 + 1 >= 0 && y0 >= 0 && x0 + 1 < sw && y0 < sh) c10 = sp[y0 * sw + x0 + 1];');
+    this.line('if (x0 >= 0 && y0 + 1 >= 0 && x0 < sw && y0 + 1 < sh) c01 = sp[(y0 + 1) * sw + x0];');
+    this.line('if (x0 + 1 >= 0 && y0 + 1 >= 0 && x0 + 1 < sw && y0 + 1 < sh) c11 = sp[(y0 + 1) * sw + x0 + 1];');
+    this.line('double w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;');
+    this.line('sa = (unsigned)((c00 >> 24) * w00 + (c10 >> 24) * w10 + (c01 >> 24) * w01 + (c11 >> 24) * w11 + 0.5);');
+    this.line('sr = (unsigned)(((c00 >> 16) & 0xFF) * w00 + ((c10 >> 16) & 0xFF) * w10 + ((c01 >> 16) & 0xFF) * w01 + ((c11 >> 16) & 0xFF) * w11 + 0.5);');
+    this.line('sg = (unsigned)(((c00 >> 8) & 0xFF) * w00 + ((c10 >> 8) & 0xFF) * w10 + ((c01 >> 8) & 0xFF) * w01 + ((c11 >> 8) & 0xFF) * w11 + 0.5);');
+    this.line('sb = (unsigned)((c00 & 0xFF) * w00 + (c10 & 0xFF) * w10 + (c01 & 0xFF) * w01 + (c11 & 0xFF) * w11 + 0.5);');
+    this.indent--;
+    this.line('}');
+    this.line('if (ct != NULL) { double rr = (sr * rm + ro), gg = (sg * gm + go), bb = (sb * bm + bo), aa = (sa * am + ao); if (rr < 0) rr = 0; if (rr > 255) rr = 255; if (gg < 0) gg = 0; if (gg > 255) gg = 255; if (bb < 0) bb = 0; if (bb > 255) bb = 255; if (aa < 0) aa = 0; if (aa > 255) aa = 255; sr = (unsigned)rr; sg = (unsigned)gg; sb = (unsigned)bb; sa = (unsigned)aa; }');
+    this.line('dp[dy * bd->width + dx] = (sa << 24) | (sr << 16) | (sg << 8) | sb;');
+    this.indent--;
+    this.line('} }');
+    this.indent--;
+    this.line('}');
     this.line('void Bitmap_ctor(Bitmap* o, BitmapData* bitmapData) {');
     this.indent++;
     this.line('DisplayObject_ctor((DisplayObject*)o);');
@@ -2663,37 +2975,40 @@ export class Emitter {
     this.line('o->data = (void*)nd; o->capacity = cap;');
     this.indent--;
     this.line('}');
+    // Endianness: ByteArray defaults to big-endian; `endian = Endian.LITTLE_ENDIAN`
+    // (a string constant) flips the byte order of multi-byte put/get primitives.
+    // The string is compared once per op; AGAL assembly writes at setup time, not
+    // per-frame, so the strcmp cost is irrelevant.
+    this.line('static int as_ba_little(ByteArray* o) { return o->endian != NULL && strcmp(o->endian, "littleEndian") == 0; }');
     this.line('static void as_ba_put_u16(ByteArray* o, unsigned v) {');
     this.indent++;
     this.line('unsigned char* d = (unsigned char*)o->data;');
-    this.line('d[o->length++] = (unsigned char)((v >> 8) & 0xFF);');
-    this.line('d[o->length++] = (unsigned char)(v & 0xFF);');
+    this.line('if (as_ba_little(o)) { d[o->length++] = (unsigned char)(v & 0xFF); d[o->length++] = (unsigned char)((v >> 8) & 0xFF); }');
+    this.line('else { d[o->length++] = (unsigned char)((v >> 8) & 0xFF); d[o->length++] = (unsigned char)(v & 0xFF); }');
     this.indent--;
     this.line('}');
     this.line('static void as_ba_put_u32(ByteArray* o, unsigned v) {');
     this.indent++;
     this.line('unsigned char* d = (unsigned char*)o->data;');
-    this.line('d[o->length++] = (unsigned char)((v >> 24) & 0xFF);');
-    this.line('d[o->length++] = (unsigned char)((v >> 16) & 0xFF);');
-    this.line('d[o->length++] = (unsigned char)((v >> 8) & 0xFF);');
-    this.line('d[o->length++] = (unsigned char)(v & 0xFF);');
+    this.line('if (as_ba_little(o)) { d[o->length++] = (unsigned char)(v & 0xFF); d[o->length++] = (unsigned char)((v >> 8) & 0xFF); d[o->length++] = (unsigned char)((v >> 16) & 0xFF); d[o->length++] = (unsigned char)((v >> 24) & 0xFF); }');
+    this.line('else { d[o->length++] = (unsigned char)((v >> 24) & 0xFF); d[o->length++] = (unsigned char)((v >> 16) & 0xFF); d[o->length++] = (unsigned char)((v >> 8) & 0xFF); d[o->length++] = (unsigned char)(v & 0xFF); }');
     this.indent--;
     this.line('}');
     this.line('static unsigned as_ba_get_u16(ByteArray* o) {');
     this.indent++;
     this.line('unsigned char* d = (unsigned char*)o->data;');
-    this.line('unsigned v = ((unsigned)d[o->position] << 8) | (unsigned)d[o->position + 1];');
+    this.line('unsigned v = as_ba_little(o) ? ((unsigned)d[o->position] | ((unsigned)d[o->position + 1] << 8)) : (((unsigned)d[o->position] << 8) | (unsigned)d[o->position + 1]);');
     this.line('o->position += 2; return v;');
     this.indent--;
     this.line('}');
     this.line('static unsigned as_ba_get_u32(ByteArray* o) {');
     this.indent++;
     this.line('unsigned char* d = (unsigned char*)o->data;');
-    this.line('unsigned v = ((unsigned)d[o->position] << 24) | ((unsigned)d[o->position + 1] << 16) | ((unsigned)d[o->position + 2] << 8) | (unsigned)d[o->position + 3];');
+    this.line('unsigned v = as_ba_little(o) ? ((unsigned)d[o->position] | ((unsigned)d[o->position + 1] << 8) | ((unsigned)d[o->position + 2] << 16) | ((unsigned)d[o->position + 3] << 24)) : (((unsigned)d[o->position] << 24) | ((unsigned)d[o->position + 1] << 16) | ((unsigned)d[o->position + 2] << 8) | (unsigned)d[o->position + 3]);');
     this.line('o->position += 4; return v;');
     this.indent--;
     this.line('}');
-    this.line('void ByteArray_ctor(ByteArray* o) { o->data = NULL; o->length = 0; o->capacity = 0; o->position = 0; }');
+    this.line('void ByteArray_ctor(ByteArray* o) { o->data = NULL; o->length = 0; o->capacity = 0; o->position = 0; o->endian = (char*)"bigEndian"; }');
     this.line('ByteArray* ByteArray_new(void) { ByteArray* o = (ByteArray*)gc_alloc(GCT_CLASS, sizeof(ByteArray)); o->vtable = &ByteArray_vt; ByteArray_ctor(o); return o; }');
     this.line('void ByteArray_writeByte(void* _this, int v) {');
     this.indent++;
@@ -2709,6 +3024,11 @@ export class Emitter {
     this.line('void ByteArray_writeInt(void* _this, int v) {');
     this.indent++;
     this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow(o, 4); as_ba_put_u32(o, (unsigned)v);');
+    this.indent--;
+    this.line('}');
+    this.line('void ByteArray_writeUnsignedInt(void* _this, unsigned v) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow(o, 4); as_ba_put_u32(o, v);');
     this.indent--;
     this.line('}');
     this.line('void ByteArray_writeFloat(void* _this, double v) {');
@@ -2766,6 +3086,15 @@ export class Emitter {
     this.line('int ByteArray_get_bytesAvailable(void* _this) {');
     this.indent++;
     this.line('ByteArray* o = (ByteArray*)_this; int a = o->length - o->position; return a > 0 ? a : 0;');
+    this.indent--;
+    this.line('}');
+    // ByteArray[index] reads the byte at an absolute index (does not advance
+    // `position`); out-of-range returns 0, matching AS3's undefined->NaN->0.
+    this.line('int ByteArray_get_index(void* _this, int i) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this;');
+    this.line('if (i < 0 || i >= o->length || o->data == NULL) return 0;');
+    this.line('return (int)((unsigned char*)o->data)[i];');
     this.indent--;
     this.line('}');
     this.line('void ByteArray_clear(void* _this) { ByteArray* o = (ByteArray*)_this; o->length = 0; o->position = 0; }');
@@ -2840,6 +3169,9 @@ export class Emitter {
     this.line('o->hscroll = false;');
     this.line('o->selectable = true;');
     this.line('o->autoSize = (char*)"none";');
+    // textColor defaults to 0 (black). A non-zero value overrides the
+    // defaultTextFormat color at render time (see as_tf_paragraph).
+    this.line('o->textColor = 0u;');
     this.line('o->_para = NULL;');
     this.line('o->_para_text = NULL;');
     this.line('o->_para_w = 0.0;');
@@ -2874,6 +3206,9 @@ export class Emitter {
     this.line('int bold = fmt->bold ? 1 : 0;');
     this.line('int italic = fmt->italic ? 1 : 0;');
     this.line('double leading = fmt->leading;');
+    // textColor (default 0 = black) overrides defaultTextFormat.color for plain
+    // text; a field keeps fmt->color when textColor is left at its default.
+    this.line('unsigned color = (tf->textColor != 0u) ? tf->textColor : fmt->color;');
     // wordWrap wraps whenever a positive width is set, independent of multiline
     // (AIR wraps a wordWrap=true field even when multiline stays false — the
     // official wordWrap example sets only wordWrap). multiline instead controls
@@ -2884,7 +3219,7 @@ export class Emitter {
     this.line('int hasRuns = (tf->_runs != NULL && tf->_runs->length > 0);');
     this.line('if (tf->_para != NULL && tf->_para_text == tf->text && tf->_para_w == w &&');
     this.line('    tf->_para_size == size && tf->_para_bold == bold && tf->_para_italic == italic &&');
-    this.line('    tf->_para_color == fmt->color && tf->_para_collapse == collapse && tf->_para_leading == leading &&');
+    this.line('    tf->_para_color == color && tf->_para_collapse == collapse && tf->_para_leading == leading &&');
     this.line('    hasRuns == 0) {');
     this.indent++;
     this.line('return tf->_para;');
@@ -2919,7 +3254,7 @@ export class Emitter {
     this.indent--;
     this.line('} else {');
     this.indent++;
-    this.line('tf->_para = as_skia_textlayout_new_leading(tf->text, fmt->font, size, bold, italic, fmt->color, leading, w, 0, collapse);');
+    this.line('tf->_para = as_skia_textlayout_new_leading(tf->text, fmt->font, size, bold, italic, color, leading, w, 0, collapse);');
     this.indent--;
     this.line('}');
     this.line('tf->_para_text = tf->text;');
@@ -2927,7 +3262,7 @@ export class Emitter {
     this.line('tf->_para_size = size;');
     this.line('tf->_para_bold = bold;');
     this.line('tf->_para_italic = italic;');
-    this.line('tf->_para_color = fmt->color;');
+    this.line('tf->_para_color = color;');
     this.line('tf->_para_collapse = collapse;');
     this.line('tf->_para_leading = leading;');
     this.line('return tf->_para;');
@@ -3263,10 +3598,10 @@ export class Emitter {
     this.line('void Point_ctor(Point* o, double x, double y) { o->x = x; o->y = y; }');
     this.line('Point* Point_new(double x, double y) { Point* o = (Point*)gc_alloc(GCT_CLASS, sizeof(Point)); o->vtable = &Point_vt; Point_ctor(o, x, y); return o; }');
     this.line('double Point_get_length(void* _this) { Point* p = (Point*)_this; return sqrt(p->x * p->x + p->y * p->y); }');
-    this.line('double Point_distance(Point* pt1, Point* pt2) { double dx = pt1->x - pt2->x, dy = pt1->y - pt2->y; return sqrt(dx * dx + dy * dy); }');
+    this.line('double Point_distance_static(Point* pt1, Point* pt2) { double dx = pt1->x - pt2->x, dy = pt1->y - pt2->y; return sqrt(dx * dx + dy * dy); }');
     // AS3 quirk: the closer f is to 1, the closer the result is to pt1 (not pt2).
-    this.line('Point* Point_interpolate(Point* pt1, Point* pt2, double f) { return Point_mk(pt2->x + f * (pt1->x - pt2->x), pt2->y + f * (pt1->y - pt2->y)); }');
-    this.line('Point* Point_polar(double len, double angle) { return Point_mk(len * cos(angle), len * sin(angle)); }');
+    this.line('Point* Point_interpolate_static(Point* pt1, Point* pt2, double f) { return Point_mk(pt2->x + f * (pt1->x - pt2->x), pt2->y + f * (pt1->y - pt2->y)); }');
+    this.line('Point* Point_polar_static(double len, double angle) { return Point_mk(len * cos(angle), len * sin(angle)); }');
     this.line('Point* Point_add(void* _this, Point* v) { Point* p = (Point*)_this; return Point_mk(p->x + v->x, p->y + v->y); }');
     this.line('Point* Point_subtract(void* _this, Point* v) { Point* p = (Point*)_this; return Point_mk(p->x - v->x, p->y - v->y); }');
     this.line('void Point_offset(void* _this, double dx, double dy) { Point* p = (Point*)_this; p->x += dx; p->y += dy; }');
@@ -3284,6 +3619,10 @@ export class Emitter {
     this.line('double Rectangle_get_bottom(void* _this) { Rectangle* r = (Rectangle*)_this; return r->y + r->height; }');
     this.line('double Rectangle_get_left(void* _this) { return ((Rectangle*)_this)->x; }');
     this.line('double Rectangle_get_right(void* _this) { Rectangle* r = (Rectangle*)_this; return r->x + r->width; }');
+    this.line('void Rectangle_set_left(void* _this, double value) { ((Rectangle*)_this)->x = value; }');
+    this.line('void Rectangle_set_top(void* _this, double value) { ((Rectangle*)_this)->y = value; }');
+    this.line('void Rectangle_set_right(void* _this, double value) { Rectangle* r = (Rectangle*)_this; r->width = value - r->x; }');
+    this.line('void Rectangle_set_bottom(void* _this, double value) { Rectangle* r = (Rectangle*)_this; r->height = value - r->y; }');
     this.line('bool Rectangle_isEmpty(void* _this) { Rectangle* r = (Rectangle*)_this; return r->width <= 0.0 || r->height <= 0.0; }');
     this.line('void Rectangle_setEmpty(void* _this) { Rectangle* r = (Rectangle*)_this; r->x = r->y = r->width = r->height = 0.0; }');
     this.line('Rectangle* Rectangle_intersection(void* _this, Rectangle* b) { Rectangle* a = (Rectangle*)_this; double x1 = fmax(a->x, b->x), y1 = fmax(a->y, b->y); double x2 = fmin(a->x + a->width, b->x + b->width), y2 = fmin(a->y + a->height, b->y + b->height); if (x2 < x1 || y2 < y1) return Rectangle_mk(0.0, 0.0, 0.0, 0.0); return Rectangle_mk(x1, y1, x2 - x1, y2 - y1); }');
@@ -3324,6 +3663,623 @@ export class Emitter {
     // DisplayObject.transform is deferred to a later stage.
     this.line('void Transform_ctor(Transform* o) { o->matrix = Matrix_new(1.0, 0.0, 0.0, 1.0, 0.0, 0.0); o->colorTransform = ColorTransform_new(1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0); }');
     this.line('Transform* Transform_new(void) { Transform* o = (Transform*)gc_alloc(GCT_CLASS, sizeof(Transform)); o->vtable = &Transform_vt; Transform_ctor(o); return o; }');
+    this.line('');
+    // --- Vector3D (flash.geom stage 79): 4-component vector, pure double bundle. ---
+    // Geometric ops (length/normalize/dot/cross/distance/angle) use the x/y/z
+    // components only; w is the homogeneous coordinate. add/subtract/scaleBy/
+    // negate are 4-component.
+    this.line('static Vector3D* Vector3D_mk(double x, double y, double z, double w) { Vector3D* v = (Vector3D*)gc_alloc(GCT_CLASS, sizeof(Vector3D)); v->vtable = &Vector3D_vt; v->x = x; v->y = y; v->z = z; v->w = w; return v; }');
+    this.line('void Vector3D_ctor(Vector3D* o, double x, double y, double z, double w) { o->x = x; o->y = y; o->z = z; o->w = w; }');
+    this.line('Vector3D* Vector3D_new(double x, double y, double z, double w) { Vector3D* o = (Vector3D*)gc_alloc(GCT_CLASS, sizeof(Vector3D)); o->vtable = &Vector3D_vt; Vector3D_ctor(o, x, y, z, w); return o; }');
+    this.line('Vector3D* Vector3D_add(void* _this, Vector3D* a) { Vector3D* v = (Vector3D*)_this; return Vector3D_mk(v->x + a->x, v->y + a->y, v->z + a->z, v->w + a->w); }');
+    this.line('Vector3D* Vector3D_subtract(void* _this, Vector3D* a) { Vector3D* v = (Vector3D*)_this; return Vector3D_mk(v->x - a->x, v->y - a->y, v->z - a->z, v->w - a->w); }');
+    this.line('void Vector3D_scaleBy(void* _this, double s) { Vector3D* v = (Vector3D*)_this; v->x *= s; v->y *= s; v->z *= s; v->w *= s; }');
+    this.line('void Vector3D_negate(void* _this) { Vector3D* v = (Vector3D*)_this; v->x = -v->x; v->y = -v->y; v->z = -v->z; v->w = -v->w; }');
+    this.line('double Vector3D_normalize(void* _this) { Vector3D* v = (Vector3D*)_this; double l = sqrt(v->x * v->x + v->y * v->y + v->z * v->z); if (l == 0.0) { v->x = v->y = v->z = 0.0; v->w = 1.0; return 0.0; } double s = 1.0 / l; v->x *= s; v->y *= s; v->z *= s; v->w = 1.0; return l; }');
+    this.line('double Vector3D_dotProduct(void* _this, Vector3D* a) { Vector3D* v = (Vector3D*)_this; return v->x * a->x + v->y * a->y + v->z * a->z; }');
+    this.line('Vector3D* Vector3D_crossProduct(void* _this, Vector3D* a) { Vector3D* v = (Vector3D*)_this; return Vector3D_mk(v->y * a->z - v->z * a->y, v->z * a->x - v->x * a->z, v->x * a->y - v->y * a->x, 1.0); }');
+    this.line('double Vector3D_get_length(void* _this) { Vector3D* v = (Vector3D*)_this; return sqrt(v->x * v->x + v->y * v->y + v->z * v->z); }');
+    this.line('double Vector3D_get_lengthSquared(void* _this) { Vector3D* v = (Vector3D*)_this; return v->x * v->x + v->y * v->y + v->z * v->z; }');
+    this.line('double Vector3D_distance_static(Vector3D* a, Vector3D* b) { double dx = a->x - b->x, dy = a->y - b->y, dz = a->z - b->z; return sqrt(dx * dx + dy * dy + dz * dz); }');
+    this.line('double Vector3D_angleBetween_static(Vector3D* a, Vector3D* b) { double dot = a->x * b->x + a->y * b->y + a->z * b->z; double la = sqrt(a->x * a->x + a->y * a->y + a->z * a->z), lb = sqrt(b->x * b->x + b->y * b->y + b->z * b->z); if (la == 0.0 || lb == 0.0) return 0.0; double c = dot / (la * lb); if (c > 1.0) c = 1.0; if (c < -1.0) c = -1.0; return acos(c); }');
+    this.line('Vector3D* Vector3D_clone(void* _this) { Vector3D* v = (Vector3D*)_this; return Vector3D_mk(v->x, v->y, v->z, v->w); }');
+    this.line('bool Vector3D_equals(void* _this, Vector3D* o, bool allFour) { Vector3D* v = (Vector3D*)_this; if (allFour) return v->x == o->x && v->y == o->y && v->z == o->z && v->w == o->w; return v->x == o->x && v->y == o->y && v->z == o->z; }');
+    this.line('char* Vector3D_toString(void* _this) { Vector3D* v = (Vector3D*)_this; char* b = as_str_alloc(96); snprintf(b, 96, "Vector3D(%s, %s, %s)", as_str_from_double(v->x), as_str_from_double(v->y), as_str_from_double(v->z)); return b; }');
+    this.line('');
+    // --- Matrix3D helpers: column-major 4x4 (element _m[c*4+r] == M[r][c]). ---
+    this.line('static void as_mat3d_identity(double* out) { static const double I[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; memcpy(out, I, sizeof(I)); }');
+    this.line('static void as_mat3d_mul(const double* a, const double* b, double* out) {');
+    this.indent++;
+    this.line('for (int c = 0; c < 4; c++)');
+    this.indent++;
+    this.line('for (int r = 0; r < 4; r++) {');
+    this.indent++;
+    this.line('double s = 0.0;');
+    this.line('for (int k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];');
+    this.line('out[c * 4 + r] = s;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.indent--;
+    this.line('}');
+    this.line('static int as_mat3d_invert4(const double* m, double* out) {');
+    this.indent++;
+    this.line('double a[16]; memcpy(a, m, sizeof(a));');
+    this.line('double b[16]; as_mat3d_identity(b);');
+    this.line('for (int i = 0; i < 4; i++) {');
+    this.indent++;
+    this.line('int pivot = i;');
+    this.line('for (int r = i + 1; r < 4; r++) if (fabs(a[i * 4 + r]) > fabs(a[i * 4 + pivot])) pivot = r;');
+    this.line('if (fabs(a[i * 4 + pivot]) < 1e-12) return 0;');
+    this.line('if (pivot != i) for (int c = 0; c < 4; c++) { double ta = a[c * 4 + i]; a[c * 4 + i] = a[c * 4 + pivot]; a[c * 4 + pivot] = ta; double tb = b[c * 4 + i]; b[c * 4 + i] = b[c * 4 + pivot]; b[c * 4 + pivot] = tb; }');
+    this.line('double pv = a[i * 4 + i];');
+    this.line('for (int c = 0; c < 4; c++) { a[c * 4 + i] /= pv; b[c * 4 + i] /= pv; }');
+    this.line('for (int r = 0; r < 4; r++) {');
+    this.indent++;
+    this.line('if (r == i) continue;');
+    this.line('double f = a[i * 4 + r];');
+    this.line('if (f == 0.0) continue;');
+    this.line('for (int c = 0; c < 4; c++) { a[c * 4 + r] -= f * a[c * 4 + i]; b[c * 4 + r] -= f * b[c * 4 + i]; }');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('memcpy(out, b, sizeof(b));');
+    this.line('return 1;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_mat3d_translation(double x, double y, double z, double* out) { as_mat3d_identity(out); out[12] = x; out[13] = y; out[14] = z; }');
+    this.line('static void as_mat3d_rotation(double degrees, double ax, double ay, double az, double* out) {');
+    this.indent++;
+    this.line('double rad = degrees * 3.14159265358979323846 / 180.0;');
+    this.line('double len = sqrt(ax * ax + ay * ay + az * az);');
+    this.line('if (len < 1e-12) { as_mat3d_identity(out); return; }');
+    this.line('double ux = ax / len, uy = ay / len, uz = az / len;');
+    this.line('double c = cos(rad), s = sin(rad), t = 1.0 - c;');
+    this.line('out[0] = c + ux * ux * t; out[1] = uy * ux * t + uz * s; out[2] = uz * ux * t - uy * s; out[3] = 0.0;');
+    this.line('out[4] = ux * uy * t - uz * s; out[5] = c + uy * uy * t; out[6] = uz * uy * t + ux * s; out[7] = 0.0;');
+    this.line('out[8] = ux * uz * t + uy * s; out[9] = uy * uz * t - ux * s; out[10] = c + uz * uz * t; out[11] = 0.0;');
+    this.line('out[12] = 0.0; out[13] = 0.0; out[14] = 0.0; out[15] = 1.0;');
+    this.indent--;
+    this.line('}');
+    this.line('static Matrix3D* Matrix3D_mk(const double* m) { Matrix3D* o = (Matrix3D*)gc_alloc(GCT_CLASS, sizeof(Matrix3D)); o->vtable = &Matrix3D_vt; memcpy(o->_m, m, 16 * sizeof(double)); return o; }');
+    this.line('void Matrix3D_ctor(Matrix3D* o, as_vector_number* v) { as_mat3d_identity(o->_m); if (v != NULL) { int n = v->length < 16 ? v->length : 16; for (int i = 0; i < n; i++) o->_m[i] = v->data[i]; } }');
+    this.line('Matrix3D* Matrix3D_new(as_vector_number* v) { Matrix3D* o = (Matrix3D*)gc_alloc(GCT_CLASS, sizeof(Matrix3D)); o->vtable = &Matrix3D_vt; Matrix3D_ctor(o, v); return o; }');
+    this.line('void Matrix3D_identity(void* _this) { as_mat3d_identity(((Matrix3D*)_this)->_m); }');
+    // AS3 semantics: append(lhs) = lhs * this (pre-multiply, applied AFTER existing
+    // transforms); prepend(rhs) = this * rhs (post-multiply, applied BEFORE). The
+    // matrices are column-major, so as_mat3d_mul(a,b,out) == out = a * b.
+    this.line('void Matrix3D_append(void* _this, Matrix3D* lhs) { Matrix3D* m = (Matrix3D*)_this; double r[16]; as_mat3d_mul(lhs->_m, m->_m, r); memcpy(m->_m, r, sizeof(r)); }');
+    this.line('void Matrix3D_prepend(void* _this, Matrix3D* rhs) { Matrix3D* m = (Matrix3D*)_this; double r[16]; as_mat3d_mul(m->_m, rhs->_m, r); memcpy(m->_m, r, sizeof(r)); }');
+    this.line('bool Matrix3D_invert(void* _this) { Matrix3D* m = (Matrix3D*)_this; double r[16]; if (!as_mat3d_invert4(m->_m, r)) return false; memcpy(m->_m, r, sizeof(r)); return true; }');
+    this.line('void Matrix3D_transpose(void* _this) { Matrix3D* m = (Matrix3D*)_this; for (int r = 0; r < 4; r++) for (int c = r + 1; c < 4; c++) { double t = m->_m[c * 4 + r]; m->_m[c * 4 + r] = m->_m[r * 4 + c]; m->_m[r * 4 + c] = t; } }');
+    this.line('Vector3D* Matrix3D_transformVector(void* _this, Vector3D* v) { Matrix3D* m = (Matrix3D*)_this; return Vector3D_mk(m->_m[0] * v->x + m->_m[4] * v->y + m->_m[8] * v->z + m->_m[12] * v->w, m->_m[1] * v->x + m->_m[5] * v->y + m->_m[9] * v->z + m->_m[13] * v->w, m->_m[2] * v->x + m->_m[6] * v->y + m->_m[10] * v->z + m->_m[14] * v->w, m->_m[3] * v->x + m->_m[7] * v->y + m->_m[11] * v->z + m->_m[15] * v->w); }');
+    this.line('Vector3D* Matrix3D_deltaTransformVector(void* _this, Vector3D* v) { Matrix3D* m = (Matrix3D*)_this; return Vector3D_mk(m->_m[0] * v->x + m->_m[4] * v->y + m->_m[8] * v->z, m->_m[1] * v->x + m->_m[5] * v->y + m->_m[9] * v->z, m->_m[2] * v->x + m->_m[6] * v->y + m->_m[10] * v->z, 0.0); }');
+    this.line('void Matrix3D_transformVectors(void* _this, as_vector_number* vin, as_vector_number* vout) { Matrix3D* m = (Matrix3D*)_this; int n = vin->length / 3; for (int i = 0; i < n; i++) { double x = vin->data[i * 3], y = vin->data[i * 3 + 1], z = vin->data[i * 3 + 2]; vout->data[i * 3] = m->_m[0] * x + m->_m[4] * y + m->_m[8] * z + m->_m[12]; vout->data[i * 3 + 1] = m->_m[1] * x + m->_m[5] * y + m->_m[9] * z + m->_m[13]; vout->data[i * 3 + 2] = m->_m[2] * x + m->_m[6] * y + m->_m[10] * z + m->_m[14]; } }');
+    // appendTranslation = T * this (translate AFTER): only the last column shifts.
+    this.line('void Matrix3D_appendTranslation(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[12] += x; m->_m[13] += y; m->_m[14] += z; }');
+    // prependTranslation = this * T (translate BEFORE): shift by the current basis.
+    this.line('void Matrix3D_prependTranslation(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[12] += m->_m[0] * x + m->_m[4] * y + m->_m[8] * z; m->_m[13] += m->_m[1] * x + m->_m[5] * y + m->_m[9] * z; m->_m[14] += m->_m[2] * x + m->_m[6] * y + m->_m[10] * z; }');
+    // appendScale = S * this (scale AFTER): scales the ROWS (each row of _m).
+    this.line('void Matrix3D_appendScale(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[0] *= x; m->_m[4] *= x; m->_m[8] *= x; m->_m[12] *= x; m->_m[1] *= y; m->_m[5] *= y; m->_m[9] *= y; m->_m[13] *= y; m->_m[2] *= z; m->_m[6] *= z; m->_m[10] *= z; m->_m[14] *= z; }');
+    // prependScale = this * S (scale BEFORE): scales the COLUMNS of _m.
+    this.line('void Matrix3D_prependScale(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[0] *= x; m->_m[1] *= x; m->_m[2] *= x; m->_m[3] *= x; m->_m[4] *= y; m->_m[5] *= y; m->_m[6] *= y; m->_m[7] *= y; m->_m[8] *= z; m->_m[9] *= z; m->_m[10] *= z; m->_m[11] *= z; }');
+    this.line('void Matrix3D_appendRotation(void* _this, double degrees, Vector3D* axis, Vector3D* pivot) {');
+    this.indent++;
+    this.line('Matrix3D* m = (Matrix3D*)_this;');
+    this.line('double R[16]; as_mat3d_rotation(degrees, axis->x, axis->y, axis->z, R);');
+    this.line('if (pivot == NULL) { double r[16]; as_mat3d_mul(R, m->_m, r); memcpy(m->_m, r, sizeof(r)); }');
+    this.line('else { double Tp[16], Tm[16], t1[16], t2[16]; as_mat3d_translation(pivot->x, pivot->y, pivot->z, Tp); as_mat3d_translation(-pivot->x, -pivot->y, -pivot->z, Tm); as_mat3d_mul(Tp, R, t1); as_mat3d_mul(t1, Tm, t2); as_mat3d_mul(t2, m->_m, t1); memcpy(m->_m, t1, sizeof(t1)); }');
+    this.indent--;
+    this.line('}');
+    this.line('void Matrix3D_prependRotation(void* _this, double degrees, Vector3D* axis, Vector3D* pivot) {');
+    this.indent++;
+    this.line('Matrix3D* m = (Matrix3D*)_this;');
+    this.line('double R[16]; as_mat3d_rotation(degrees, axis->x, axis->y, axis->z, R);');
+    this.line('if (pivot == NULL) { double r[16]; as_mat3d_mul(m->_m, R, r); memcpy(m->_m, r, sizeof(r)); }');
+    this.line('else { double Tp[16], Tm[16], t1[16], t2[16]; as_mat3d_translation(pivot->x, pivot->y, pivot->z, Tp); as_mat3d_translation(-pivot->x, -pivot->y, -pivot->z, Tm); as_mat3d_mul(Tp, R, t1); as_mat3d_mul(t1, Tm, t2); as_mat3d_mul(m->_m, t2, t1); memcpy(m->_m, t1, sizeof(t1)); }');
+    this.indent--;
+    this.line('}');
+    this.line('void Matrix3D_pointAt(void* _this, Vector3D* pos, Vector3D* at, Vector3D* up) {');
+    this.indent++;
+    this.line('Matrix3D* m = (Matrix3D*)_this;');
+    this.line('double zx = pos->x - at->x, zy = pos->y - at->y, zz = pos->z - at->z;');
+    this.line('double zl = sqrt(zx * zx + zy * zy + zz * zz);');
+    this.line('if (zl == 0.0) { as_mat3d_identity(m->_m); return; }');
+    this.line('zx /= zl; zy /= zl; zz /= zl;');
+    this.line('double xx = up->y * zz - up->z * zy, xy = up->z * zx - up->x * zz, xz = up->x * zy - up->y * zx;');
+    this.line('double xl = sqrt(xx * xx + xy * xy + xz * xz);');
+    this.line('if (xl == 0.0) { as_mat3d_identity(m->_m); return; }');
+    this.line('xx /= xl; xy /= xl; xz /= xl;');
+    this.line('double yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;');
+    this.line('m->_m[0] = xx; m->_m[1] = xy; m->_m[2] = xz; m->_m[3] = 0.0;');
+    this.line('m->_m[4] = yx; m->_m[5] = yy; m->_m[6] = yz; m->_m[7] = 0.0;');
+    this.line('m->_m[8] = zx; m->_m[9] = zy; m->_m[10] = zz; m->_m[11] = 0.0;');
+    this.line('m->_m[12] = pos->x; m->_m[13] = pos->y; m->_m[14] = pos->z; m->_m[15] = 1.0;');
+    this.indent--;
+    this.line('}');
+    this.line('void Matrix3D_interpolate(void* _this, Matrix3D* a, Matrix3D* b, double p) { Matrix3D* m = (Matrix3D*)_this; for (int i = 0; i < 16; i++) m->_m[i] = a->_m[i] + (b->_m[i] - a->_m[i]) * p; }');
+    this.line('Matrix3D* Matrix3D_interpolate_static(Matrix3D* a, Matrix3D* b, double p) { Matrix3D* o = (Matrix3D*)gc_alloc(GCT_CLASS, sizeof(Matrix3D)); o->vtable = &Matrix3D_vt; for (int i = 0; i < 16; i++) o->_m[i] = a->_m[i] + (b->_m[i] - a->_m[i]) * p; return o; }');
+    this.line('Matrix3D* Matrix3D_identity_static(void) { Matrix3D* o = (Matrix3D*)gc_alloc(GCT_CLASS, sizeof(Matrix3D)); o->vtable = &Matrix3D_vt; as_mat3d_identity(o->_m); return o; }');
+    this.line('void Matrix3D_copyFrom(void* _this, Matrix3D* src) { memcpy(((Matrix3D*)_this)->_m, src->_m, 16 * sizeof(double)); }');
+    this.line('Matrix3D* Matrix3D_clone(void* _this) { return Matrix3D_mk(((Matrix3D*)_this)->_m); }');
+    this.line('as_vector_number* Matrix3D_get_rawData(void* _this) { Matrix3D* m = (Matrix3D*)_this; as_vector_number* v = as_vector_number_new(); for (int i = 0; i < 16; i++) as_vector_number_push(v, m->_m[i]); return v; }');
+    this.line('void Matrix3D_set_rawData(void* _this, as_vector_number* v) { Matrix3D* m = (Matrix3D*)_this; int n = v->length < 16 ? v->length : 16; for (int i = 0; i < n; i++) m->_m[i] = v->data[i]; }');
+    this.line('as_vector_Vector3D* Matrix3D_decompose(void* _this, char* orientation) {');
+    this.indent++;
+    this.line('(void)orientation;');
+    this.line('Matrix3D* m = (Matrix3D*)_this;');
+    this.line('Vector3D* tr = Vector3D_mk(m->_m[12], m->_m[13], m->_m[14], 0.0);');
+    this.line('double sx = sqrt(m->_m[0] * m->_m[0] + m->_m[1] * m->_m[1] + m->_m[2] * m->_m[2]);');
+    this.line('double sy = sqrt(m->_m[4] * m->_m[4] + m->_m[5] * m->_m[5] + m->_m[6] * m->_m[6]);');
+    this.line('double sz = sqrt(m->_m[8] * m->_m[8] + m->_m[9] * m->_m[9] + m->_m[10] * m->_m[10]);');
+    this.line('Vector3D* sc = Vector3D_mk(sx, sy, sz, 0.0);');
+    this.line('double r00 = sx == 0.0 ? 1.0 : m->_m[0] / sx, r10 = sx == 0.0 ? 0.0 : m->_m[1] / sx, r20 = sx == 0.0 ? 0.0 : m->_m[2] / sx;');
+    this.line('double r01 = sy == 0.0 ? 0.0 : m->_m[4] / sy, r11 = sy == 0.0 ? 1.0 : m->_m[5] / sy, r21 = sy == 0.0 ? 0.0 : m->_m[6] / sy;');
+    this.line('double r02 = sz == 0.0 ? 0.0 : m->_m[8] / sz, r12 = sz == 0.0 ? 0.0 : m->_m[9] / sz, r22 = sz == 0.0 ? 1.0 : m->_m[10] / sz;');
+    this.line('double syv = r02 > 1.0 ? 1.0 : (r02 < -1.0 ? -1.0 : r02);');
+    this.line('double ry = asin(syv);');
+    this.line('double rx = atan2(-r12, r22);');
+    this.line('double rz = atan2(-r01, r00);');
+    this.line('Vector3D* rot = Vector3D_mk(rx, ry, rz, 0.0);');
+    this.line('as_vector_Vector3D* out = as_vector_Vector3D_new();');
+    this.line('as_vector_Vector3D_push(out, tr); as_vector_Vector3D_push(out, rot); as_vector_Vector3D_push(out, sc);');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    this.line('bool Matrix3D_recompose(void* _this, as_vector_Vector3D* components, char* orientation) {');
+    this.indent++;
+    this.line('(void)orientation;');
+    this.line('if (components->length < 3) return false;');
+    this.line('Vector3D* tr = as_vector_Vector3D_get(components, 0);');
+    this.line('Vector3D* rot = as_vector_Vector3D_get(components, 1);');
+    this.line('Vector3D* sc = as_vector_Vector3D_get(components, 2);');
+    this.line('Matrix3D* m = (Matrix3D*)_this;');
+    this.line('double cx = cos(rot->x), sx = sin(rot->x), cy = cos(rot->y), sy = sin(rot->y), cz = cos(rot->z), sz = sin(rot->z);');
+    this.line('double r00 = cy * cz, r01 = -cy * sz, r02 = sy;');
+    this.line('double r10 = cx * sz + sx * sy * cz, r11 = cx * cz - sx * sy * sz, r12 = -sx * cy;');
+    this.line('double r20 = sx * sz - cx * sy * cz, r21 = sx * cz + cx * sy * sz, r22 = cx * cy;');
+    this.line('m->_m[0] = r00 * sc->x; m->_m[1] = r10 * sc->x; m->_m[2] = r20 * sc->x; m->_m[3] = 0.0;');
+    this.line('m->_m[4] = r01 * sc->y; m->_m[5] = r11 * sc->y; m->_m[6] = r21 * sc->y; m->_m[7] = 0.0;');
+    this.line('m->_m[8] = r02 * sc->z; m->_m[9] = r12 * sc->z; m->_m[10] = r22 * sc->z; m->_m[11] = 0.0;');
+    this.line('m->_m[12] = tr->x; m->_m[13] = tr->y; m->_m[14] = tr->z; m->_m[15] = 1.0;');
+    this.line('return true;');
+    this.indent--;
+    this.line('}');
+    this.line('char* Matrix3D_toString(void* _this) { Matrix3D* m = (Matrix3D*)_this; char* b = as_str_alloc(320); int p = snprintf(b, 320, "Matrix3D("); for (int i = 0; i < 16; i++) p += snprintf(b + p, 320 - p, "%s%s", i == 0 ? "" : ", ", as_str_from_double(m->_m[i])); snprintf(b + p, 320 - p, ")"); return b; }');
+    this.line('');
+    // AGALTranslator.translate(bytes, target): stage-80 bridge over the runtime
+    // AGAL -> MSL/GLSL translator (as_agal_translate). `target` is "msl" (default)
+    // or "glsl". Validation errors throw Error with the translator's message.
+    this.line('char* AGALTranslator_translate_static(ByteArray* bytes, char* target) {');
+    this.indent++;
+    this.line('int t = (target != NULL && strcmp(target, "glsl") == 0) ? 1 : 0;');
+    this.line('char* r = as_agal_translate((const unsigned char*)bytes->data, bytes->length, t);');
+    this.line('if (r == NULL) { as_throw(Error_new((char*)as_agal_errmsg)); return NULL; }');
+    this.line('return r;');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // ===== flash.display3D (stage 81): resource classes + Context3D state machine
+    // + Stage3D slot. CPU-side only; the GPU upload/draw lands in stage 82. =====
+    this.line('void VertexBuffer3D_ctor(VertexBuffer3D* o) { Object_ctor((Object*)o); o->numVertices = 0; o->data32PerVertex = 0; o->data = NULL; o->startVertex = 0; }');
+    this.line('VertexBuffer3D* VertexBuffer3D_new(void) { VertexBuffer3D* o = (VertexBuffer3D*)gc_alloc(GCT_CLASS, sizeof(VertexBuffer3D)); o->vtable = &VertexBuffer3D_vt; VertexBuffer3D_ctor(o); return o; }');
+    this.line('void VertexBuffer3D_uploadFromVector(void* _this, as_vector_number* data, int startVertex, int numVertices) {');
+    this.indent++;
+    this.line('VertexBuffer3D* o = (VertexBuffer3D*)_this;');
+    this.line('o->data = data; gc_write_barrier((void*)data);');
+    this.line('o->startVertex = startVertex;');
+    this.line('if (numVertices > 0) o->numVertices = numVertices;');
+    this.indent--;
+    this.line('}');
+    this.line('void VertexBuffer3D_dispose(void* _this) { VertexBuffer3D* o = (VertexBuffer3D*)_this; o->data = NULL; }');
+    this.line('void IndexBuffer3D_ctor(IndexBuffer3D* o) { Object_ctor((Object*)o); o->numIndices = 0; o->data = NULL; o->startIndex = 0; }');
+    this.line('IndexBuffer3D* IndexBuffer3D_new(void) { IndexBuffer3D* o = (IndexBuffer3D*)gc_alloc(GCT_CLASS, sizeof(IndexBuffer3D)); o->vtable = &IndexBuffer3D_vt; IndexBuffer3D_ctor(o); return o; }');
+    this.line('void IndexBuffer3D_uploadFromVector(void* _this, as_vector_uint* data, int startIndex, int numIndices) {');
+    this.indent++;
+    this.line('IndexBuffer3D* o = (IndexBuffer3D*)_this;');
+    this.line('o->data = data; gc_write_barrier((void*)data);');
+    this.line('o->startIndex = startIndex;');
+    this.line('if (numIndices > 0) o->numIndices = numIndices;');
+    this.indent--;
+    this.line('}');
+    this.line('void IndexBuffer3D_dispose(void* _this) { IndexBuffer3D* o = (IndexBuffer3D*)_this; o->data = NULL; }');
+    this.line('void Program3D_ctor(Program3D* o) { Object_ctor((Object*)o); o->vertexProgram = NULL; o->fragmentProgram = NULL; }');
+    this.line('Program3D* Program3D_new(void) { Program3D* o = (Program3D*)gc_alloc(GCT_CLASS, sizeof(Program3D)); o->vtable = &Program3D_vt; Program3D_ctor(o); return o; }');
+    this.line('void Program3D_upload(void* _this, ByteArray* vertexProgram, ByteArray* fragmentProgram) {');
+    this.indent++;
+    this.line('Program3D* o = (Program3D*)_this;');
+    this.line('o->vertexProgram = vertexProgram; gc_write_barrier((void*)vertexProgram);');
+    this.line('o->fragmentProgram = fragmentProgram; gc_write_barrier((void*)fragmentProgram);');
+    this.indent--;
+    this.line('}');
+    this.line('void Program3D_dispose(void* _this) { Program3D* o = (Program3D*)_this; o->vertexProgram = NULL; o->fragmentProgram = NULL; }');
+    this.line('void TextureBase_ctor(TextureBase* o) { Object_ctor((Object*)o); }');
+    this.line('TextureBase* TextureBase_new(void) { TextureBase* o = (TextureBase*)gc_alloc(GCT_CLASS, sizeof(TextureBase)); o->vtable = &TextureBase_vt; TextureBase_ctor(o); return o; }');
+    this.line('void TextureBase_dispose(void* _this) { (void)_this; }');
+    this.line('void Texture_ctor(Texture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; o->gpu = NULL; }');
+    this.line('Texture* Texture_new(void) { Texture* o = (Texture*)gc_alloc(GCT_CLASS, sizeof(Texture)); o->vtable = &Texture_vt; Texture_ctor(o); return o; }');
+    this.line('void Texture_uploadFromBitmapData(void* _this, BitmapData* bitmapData, unsigned int miplevel) {');
+    this.indent++;
+    this.line('Texture* o = (Texture*)_this;');
+    // Our GPU texture is a single-level (mipmapped:NO) BGRA8 surface, so only
+    // level 0 is stored and later uploaded in Context3D_submit. Higher mip levels
+    // (the demo's halving loop) are ignored rather than overwriting the full-res
+    // sprite sheet with a smaller mip.
+    this.line('if (miplevel != 0) return;');
+    // Invalidate any cached GPU handle: a new bitmap means the texture content
+    // changed, so Context3D_submit must re-upload instead of binding the stale
+    // MTLTexture created for the previous bitmap.
+    this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
+    this.line('o->bitmapData = bitmapData; gc_write_barrier((void*)bitmapData);');
+    this.line('if (bitmapData != NULL) { o->width = bitmapData->width; o->height = bitmapData->height; }');
+    this.indent--;
+    this.line('}');
+    this.line('void Texture_dispose(void* _this) { Texture* o = (Texture*)_this; o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
+    // CubeTexture (stage 83): six faces as a CPU descriptor. uploadFromBitmapData
+    // records the source per face; the GPU cube target is a future follow-up.
+    this.line('void CubeTexture_ctor(CubeTexture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->face0 = o->face1 = o->face2 = o->face3 = o->face4 = o->face5 = NULL; }');
+    this.line('CubeTexture* CubeTexture_new(void) { CubeTexture* o = (CubeTexture*)gc_alloc(GCT_CLASS, sizeof(CubeTexture)); o->vtable = &CubeTexture_vt; CubeTexture_ctor(o); return o; }');
+    this.line('void CubeTexture_uploadFromBitmapData(void* _this, BitmapData* bitmapData, unsigned int side, unsigned int miplevel) {');
+    this.indent++;
+    this.line('CubeTexture* o = (CubeTexture*)_this;');
+    this.line('(void)miplevel;');
+    this.line('if (bitmapData != NULL) { o->width = bitmapData->width; o->height = bitmapData->height; }');
+    this.line('switch (side) {');
+    for (let i = 0; i < 6; i++) this.line(`case ${i}: o->face${i} = bitmapData; break;`);
+    this.line('default: break;');
+    this.line('}');
+    this.line('gc_write_barrier((void*)bitmapData);');
+    this.indent--;
+    this.line('}');
+    this.line('void CubeTexture_dispose(void* _this) { CubeTexture* o = (CubeTexture*)_this; o->face0 = o->face1 = o->face2 = o->face3 = o->face4 = o->face5 = NULL; }');
+    // RectangleTexture (stage 83): NPOT 2D descriptor (uploadFromBitmapData).
+    this.line('void RectangleTexture_ctor(RectangleTexture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; }');
+    this.line('RectangleTexture* RectangleTexture_new(void) { RectangleTexture* o = (RectangleTexture*)gc_alloc(GCT_CLASS, sizeof(RectangleTexture)); o->vtable = &RectangleTexture_vt; RectangleTexture_ctor(o); return o; }');
+    this.line('void RectangleTexture_uploadFromBitmapData(void* _this, BitmapData* bitmapData) {');
+    this.indent++;
+    this.line('RectangleTexture* o = (RectangleTexture*)_this;');
+    this.line('o->bitmapData = bitmapData; gc_write_barrier((void*)bitmapData);');
+    this.line('if (bitmapData != NULL) { o->width = bitmapData->width; o->height = bitmapData->height; }');
+    this.indent--;
+    this.line('}');
+    this.line('void RectangleTexture_dispose(void* _this) { RectangleTexture* o = (RectangleTexture*)_this; o->bitmapData = NULL; }');
+    this.line('');
+    this.line('// ---- Context3D: CPU state machine + optional Stage3D GPU backend. ----');
+    this.line('void Context3D_ctor(Context3D* o) {');
+    this.indent++;
+    this.line('Object_ctor((Object*)o);');
+    this.line('o->backBufferWidth = 0; o->backBufferHeight = 0; o->antiAlias = 0; o->enableDepthAndStencil = false;');
+    this.line('o->blendSource = NULL; o->blendDest = NULL;');
+    this.line('o->depthTestOn = false; o->depthCompare = NULL; o->cullMode = NULL;');
+    this.line('o->program = NULL; o->indexBuffer = NULL; o->vc = NULL; o->fc = NULL;');
+    this.line('o->gpu = NULL;');
+    this.line('o->clearR = 0.0; o->clearG = 0.0; o->clearB = 0.0; o->clearA = 1.0;');
+    for (let i = 0; i < 8; i++) this.line(`o->vb${i} = NULL; o->vbOff${i} = 0; o->vbFmt${i} = NULL; o->tex${i} = NULL;`);
+    this.indent--;
+    this.line('}');
+    this.line('Context3D* Context3D_new(void) { Context3D* o = (Context3D*)gc_alloc(GCT_CLASS, sizeof(Context3D)); o->vtable = &Context3D_vt; Context3D_ctor(o); return o; }');
+    this.line('void Context3D_configureBackBuffer(void* _this, unsigned int width, unsigned int height, unsigned int antiAlias, bool enableDepthAndStencil) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('o->backBufferWidth = (int)width; o->backBufferHeight = (int)height; o->antiAlias = (int)antiAlias; o->enableDepthAndStencil = enableDepthAndStencil;');
+    // Lazily create the offscreen GPU context on first configureBackBuffer, or
+    // resize it on a later call (window resize). Pure-C builds: gpu stays NULL.
+    this.line('if (o->gpu == NULL) o->gpu = as_s3d_create((int)width, (int)height);');
+    this.line('else as_s3d_resize(o->gpu, (int)width, (int)height);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_clear(void* _this, double red, double green, double blue, double alpha) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('o->clearR = red; o->clearG = green; o->clearB = blue; o->clearA = alpha;');
+    this.line('as_s3d_clear(o->gpu, (float)red, (float)green, (float)blue, (float)alpha);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_present(void* _this) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('if (o->gpu == NULL) return;');
+    // present() = "the frame is done, show it". On the GPU Metal path, expose the
+    // offscreen render target for a direct GPU→GPU composite (no CPU readback, no
+    // CPU→GPU re-upload — the latter leaked a blit command buffer per frame). On
+    // the CPU raster path, read it back into the global BGRA8 buffer that
+    // ASC_window_render composites behind the 2D display list.
+    this.line('int w = as_s3d_width(o->gpu), h = as_s3d_height(o->gpu);');
+    this.line('if (w <= 0 || h <= 0) return;');
+    this.line('#ifdef ASC_RENDER_METAL');
+    this.line('ASC_stage3d_tex = as_s3d_get_render_target(o->gpu);');
+    this.line('ASC_stage3d_w = w; ASC_stage3d_h = h;');
+    this.line('#else');
+    this.line('if (ASC_stage3d_pixels == NULL || ASC_stage3d_w != w || ASC_stage3d_h != h) {');
+    this.indent++;
+    this.line('if (ASC_stage3d_pixels != NULL) free(ASC_stage3d_pixels);');
+    this.line('ASC_stage3d_pixels = (uint8_t*)malloc((size_t)w * (size_t)h * 4);');
+    this.line('ASC_stage3d_w = w; ASC_stage3d_h = h;');
+    this.indent--;
+    this.line('}');
+    this.line('as_s3d_readback_render(o->gpu, ASC_stage3d_pixels);');
+    this.line('#endif');
+    this.line('ASC_stage3d_ready = 1;');
+    this.indent--;
+    this.line('}');
+    // Context3D_submit: the single GPU sync point shared by drawTriangles and
+    // drawTrianglesInstanced. Uploads bound streams/constants/textures, compiles
+    // the Program3D (AGAL bytecode -> MSL -> MTLRenderPipelineState) on first
+    // use, then submits one clear+draw+commit with the given instance count.
+    this.line('void Context3D_submit(Context3D* o, IndexBuffer3D* indexBuffer, int numTriangles, int numInstances) {');
+    this.indent++;
+    this.line('if (o->gpu == NULL) { (void)numTriangles; (void)numInstances; (void)indexBuffer; return; }');
+    // Upload vertex streams va0..va7 from the bound VertexBuffer3D (double data).
+    for (let i = 0; i < 8; i++) {
+      this.line(`if (o->vb${i} != NULL && o->vb${i}->data != NULL) {`);
+      this.indent++;
+      this.line(`int n = o->vb${i}->data32PerVertex;`);
+      this.line(`int sv = o->vb${i}->startVertex;`);
+      this.line(`as_s3d_upload_vertex(o->gpu, ${i}, o->vb${i}->data->data + (size_t)sv * n, o->vb${i}->numVertices, n);`);
+      this.indent--;
+      this.line('}');
+    }
+    // Upload the index buffer (Vector.<uint> is uint32).
+    this.line('if (indexBuffer != NULL && indexBuffer->data != NULL) as_s3d_upload_index(o->gpu, indexBuffer->data->data + indexBuffer->startIndex, indexBuffer->numIndices - indexBuffer->startIndex);');
+    // Upload vertex/fragment constants (double -> float4 arrays).
+    this.line('if (o->vc != NULL && o->vc->length > 0) as_s3d_upload_constants(o->gpu, 0, o->vc->data, o->vc->length);');
+    this.line('if (o->fc != NULL && o->fc->length > 0) as_s3d_upload_constants(o->gpu, 1, o->fc->data, o->fc->length);');
+    // Upload textures fs0..fs7 from their source BitmapData (ARGB pixels), or
+    // bind a render-to-texture MTLTexture directly (optimizeForRenderToTexture).
+    for (let i = 0; i < 8; i++) {
+      this.line(`if (o->tex${i} != NULL) {`);
+      this.indent++;
+      this.line(`if (o->tex${i}->gpu != NULL) as_s3d_bind_texture(o->gpu, ${i}, o->tex${i}->gpu);`);
+      this.line(`else if (o->tex${i}->bitmapData != NULL && o->tex${i}->bitmapData->pixels != NULL) o->tex${i}->gpu = as_s3d_upload_texture(o->gpu, ${i}, o->tex${i}->width, o->tex${i}->height, (const uint32_t*)o->tex${i}->bitmapData->pixels);`);
+      this.indent--;
+      this.line('}');
+    }
+    // Propagate blend factors to the GPU context BEFORE the lazy pipeline
+    // compile below — Metal bakes the blend state into MTLRenderPipelineState,
+    // so the factors set via setBlendFactors must be visible when s3d_compile
+    // builds the pipeline (the demo sets them right before drawTriangles).
+    this.line('as_s3d_set_blend(o->gpu, o->blendSource, o->blendDest);');
+    // Compile the program lazily (keyed on the Program3D pointer; the demo keeps
+    // one program per batch with a stable vertex layout).
+    this.line('if (o->program != NULL && o->program != o->gpuProgram) {');
+    this.indent++;
+    this.line('ByteArray* vp = o->program->vertexProgram;');
+    this.line('ByteArray* fp = o->program->fragmentProgram;');
+    this.line('if (vp != NULL && fp != NULL && vp->data != NULL && fp->data != NULL) {');
+    this.indent++;
+    this.line('char* vs = as_agal_translate((const unsigned char*)vp->data, vp->length, 0);');
+    this.line('char* fs = as_agal_translate((const unsigned char*)fp->data, fp->length, 0);');
+    this.line('if (vs == NULL || fs == NULL) { as_throw(Error_new((char*)as_agal_errmsg)); return; }');
+    this.line('char errbuf[512];');
+    this.line('if (!as_s3d_compile(o->gpu, vs, fs, errbuf, (int)sizeof(errbuf))) { as_throw(Error_new(errbuf)); return; }');
+    this.line('o->gpuProgram = o->program;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('as_s3d_set_instance_count(o->gpu, numInstances);');
+    this.line('as_s3d_draw(o->gpu, numTriangles);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_drawTriangles(void* _this, IndexBuffer3D* indexBuffer, int firstIndex, int numTriangles) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('o->indexBuffer = indexBuffer; gc_write_barrier((void*)indexBuffer);');
+    this.line('(void)firstIndex;');
+    this.line('Context3D_submit(o, indexBuffer, numTriangles, 1);');
+    this.indent--;
+    this.line('}');
+    // drawTrianglesInstanced (AGAL3): same geometry, numInstances copies drawn.
+    this.line('void Context3D_drawTrianglesInstanced(void* _this, IndexBuffer3D* indexBuffer, int firstIndex, int numTriangles, int numInstances) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('o->indexBuffer = indexBuffer; gc_write_barrier((void*)indexBuffer);');
+    this.line('(void)firstIndex;');
+    this.line('Context3D_submit(o, indexBuffer, numTriangles, numInstances);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_setProgram(void* _this, Program3D* program) { Context3D* o = (Context3D*)_this; o->program = program; gc_write_barrier((void*)program); }');
+    this.line('void Context3D_setBlendFactors(void* _this, char* sourceFactor, char* destinationFactor) { Context3D* o = (Context3D*)_this; o->blendSource = sourceFactor; o->blendDest = destinationFactor; }');
+    this.line('void Context3D_setProgramConstantsFromMatrix(void* _this, char* programType, int firstRegister, Matrix3D* matrix, bool transposedMatrix) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('bool isVertex = strcmp(programType, "vertex") == 0;');
+    this.line('as_vector_number* dst = isVertex ? o->vc : o->fc;');
+    this.line('if (dst == NULL) { dst = as_vector_number_new(); if (isVertex) { o->vc = dst; } else { o->fc = dst; } gc_write_barrier((void*)dst); }');
+    this.line('int base = firstRegister * 4;');
+    this.line('if (dst->length < base + 16) as_vector_number_setLength(dst, base + 16);');
+    this.line('double* m = matrix->_m;');
+    // AIR semantics: rawData is column-major (every 4 elements = a column).
+    // m44/dp4 compute dest.c = dot(src1, src2[c]), i.e. vc_c must hold the matrix ROW c
+    // (including translation in its 4th component) for the transform to apply translation.
+    // So transposedMatrix=true means "copy in transposed order" = put each math row into a register;
+    // the default false copies rawData directly (each register = a column).
+    this.line('if (transposedMatrix) { for (int row = 0; row < 4; row++) for (int col = 0; col < 4; col++) dst->data[base + row * 4 + col] = m[col * 4 + row]; }');
+    this.line('else { for (int i = 0; i < 16; i++) dst->data[base + i] = m[i]; }');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_setTextureAt(void* _this, int first, Texture* texture) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('switch (first) {');
+    for (let i = 0; i < 8; i++) this.line(`case ${i}: o->tex${i} = texture; break;`);
+    this.line('default: break;');
+    this.line('}');
+    this.line('gc_write_barrier((void*)texture);');
+    this.indent--;
+    this.line('}');
+    // setCubeTextureAt / setRectangleTextureAt record the texture as a CPU
+    // reference (the demo does not sample cube/rectangle textures).
+    this.line('void Context3D_setCubeTextureAt(void* _this, int first, CubeTexture* texture) { Context3D* o = (Context3D*)_this; (void)o; (void)first; gc_write_barrier((void*)texture); }');
+    this.line('void Context3D_setRectangleTextureAt(void* _this, int first, RectangleTexture* texture) { Context3D* o = (Context3D*)_this; (void)o; (void)first; gc_write_barrier((void*)texture); }');
+    // setProgramConstantsFromVector uploads numRegisters*4 doubles to vc/fc.
+    this.line('void Context3D_setProgramConstantsFromVector(void* _this, char* programType, int firstRegister, as_vector_number* data, int numRegisters) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('bool isVertex = strcmp(programType, "vertex") == 0;');
+    this.line('as_vector_number* dst = isVertex ? o->vc : o->fc;');
+    this.line('if (dst == NULL) { dst = as_vector_number_new(); if (isVertex) { o->vc = dst; } else { o->fc = dst; } gc_write_barrier((void*)dst); }');
+    this.line('int base = firstRegister * 4;');
+    this.line('int n = numRegisters * 4;');
+    this.line('if (n < 0) n = 0;');
+    this.line('if (dst->length < base + n) as_vector_number_setLength(dst, base + n);');
+    this.line('for (int i = 0; i < n; i++) dst->data[base + i] = (i < data->length) ? data->data[i] : 0.0;');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_setVertexBufferAt(void* _this, int index, VertexBuffer3D* buffer, int bufferOffset, char* format) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('switch (index) {');
+    for (let i = 0; i < 8; i++) this.line(`case ${i}: o->vb${i} = buffer; o->vbOff${i} = bufferOffset; o->vbFmt${i} = format; break;`);
+    this.line('default: break;');
+    this.line('}');
+    this.line('gc_write_barrier((void*)buffer);');
+    this.indent--;
+    this.line('}');
+    this.line('VertexBuffer3D* Context3D_createVertexBuffer(void* _this, int numVertices, int data32PerVertex) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('VertexBuffer3D* b = VertexBuffer3D_new();');
+    this.line('b->numVertices = numVertices; b->data32PerVertex = data32PerVertex;');
+    this.line('return b;');
+    this.indent--;
+    this.line('}');
+    this.line('IndexBuffer3D* Context3D_createIndexBuffer(void* _this, int numIndices) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('IndexBuffer3D* b = IndexBuffer3D_new();');
+    this.line('b->numIndices = numIndices;');
+    this.line('return b;');
+    this.indent--;
+    this.line('}');
+    this.line('Program3D* Context3D_createProgram(void* _this) { (void)_this; return Program3D_new(); }');
+    this.line('Texture* Context3D_createTexture(void* _this, int width, int height, char* format, bool optimizeForRenderToTexture) {');
+    this.indent++;
+    this.line('Context3D* ctx = (Context3D*)_this;');
+    this.line('Texture* t = Texture_new();');
+    this.line('t->width = width; t->height = height; t->format = format;');
+    // optimizeForRenderToTexture=true allocates a render-target MTLTexture up
+    // front (setRenderToTexture binds it); false leaves gpu=NULL (sampler-only,
+    // uploaded later via uploadFromBitmapData).
+    this.line('if (optimizeForRenderToTexture) t->gpu = as_s3d_create_render_texture(ctx->gpu, width, height);');
+    this.line('return t;');
+    this.indent--;
+    this.line('}');
+    this.line('CubeTexture* Context3D_createCubeTexture(void* _this, int size, char* format, bool optimizeForRenderToTexture) {');
+    this.indent++;
+    this.line('(void)_this; (void)optimizeForRenderToTexture;');
+    this.line('CubeTexture* t = CubeTexture_new();');
+    this.line('t->width = size; t->height = size; t->format = format;');
+    this.line('return t;');
+    this.indent--;
+    this.line('}');
+    this.line('RectangleTexture* Context3D_createRectangleTexture(void* _this, int width, int height, char* format, bool optimizeForRenderToTexture) {');
+    this.indent++;
+    this.line('(void)_this; (void)optimizeForRenderToTexture;');
+    this.line('RectangleTexture* t = RectangleTexture_new();');
+    this.line('t->width = width; t->height = height; t->format = format;');
+    this.line('return t;');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_setDepthTest(void* _this, bool depthMask, char* passCompareMode) { Context3D* o = (Context3D*)_this; o->depthTestOn = depthMask; o->depthCompare = passCompareMode; }');
+    this.line('void Context3D_setCulling(void* _this, char* triangleFaceToCull) { Context3D* o = (Context3D*)_this; o->cullMode = triangleFaceToCull; }');
+    this.line('void Context3D_dispose(void* _this) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('o->program = NULL; o->indexBuffer = NULL; o->vc = NULL; o->fc = NULL;');
+    for (let i = 0; i < 8; i++) this.line(`o->vb${i} = NULL; o->tex${i} = NULL;`);
+    this.line('o->gpuProgram = NULL;');
+    this.line('as_s3d_destroy(o->gpu); o->gpu = NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_drawToBitmapData(void* _this, BitmapData* destination) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    // Read the last committed frame (BGRA row bytes) and convert to BitmapData
+    // ARGB pixels. Pure-C: destination is cleared to black.
+    this.line('if (destination == NULL) return;');
+    this.line('if (o->gpu != NULL && destination->pixels != NULL) {');
+    this.indent++;
+    this.line('uint8_t* rgba = (uint8_t*)malloc((size_t)o->backBufferWidth * o->backBufferHeight * 4);');
+    this.line('if (rgba != NULL) {');
+    this.indent++;
+    this.line('if (as_s3d_readback_render(o->gpu, rgba)) {');
+    this.indent++;
+    this.line('for (int y = 0; y < o->backBufferHeight; y++) {');
+    this.indent++;
+    this.line('for (int x = 0; x < o->backBufferWidth; x++) {');
+    this.indent++;
+    this.line('int idx = y * o->backBufferWidth + x;');
+    this.line('uint8_t b = rgba[idx * 4 + 0];');
+    this.line('uint8_t g = rgba[idx * 4 + 1];');
+    this.line('uint8_t r = rgba[idx * 4 + 2];');
+    this.line('uint8_t a = rgba[idx * 4 + 3];');
+    this.line('((uint32_t*)destination->pixels)[idx] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('free(rgba);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('memset(destination->pixels, 0, (size_t)destination->width * destination->height * 4);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // setRenderToTexture redirects the offscreen target to an in-heap texture
+    // (render-to-texture). drawTriangles then renders into that MTLTexture; the
+    // texture can later be sampled via setTextureAt (s3d_bind_texture) or read
+    // back with drawToBitmapData (s3d_readback_render).
+    this.line('void Context3D_setRenderToTexture(void* _this, Texture* texture, bool enableDepthAndStencil) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('(void)enableDepthAndStencil;');
+    this.line('as_s3d_set_render_target(o->gpu, (texture != NULL) ? texture->gpu : NULL);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_setRenderToBackBuffer(void* _this) {');
+    this.indent++;
+    this.line('as_s3d_set_render_target(((Context3D*)_this)->gpu, NULL);');
+    this.indent--;
+    this.line('}');
+    this.line('char* Context3D_get_driverInfo(void* _this) { Context3D* o = (Context3D*)_this; return o->gpu != NULL ? (char*)"Metal (Stage3D)" : (char*)"Software (state machine)"; }');
+    this.line('char* Context3D_get_profile(void* _this) { (void)_this; return (char*)"baseline"; }');
+    this.line('void Context3D_set_enableErrorChecking(void* _this, bool value) { (void)_this; (void)value; }');
+    this.line('');
+    this.line('// ---- Stage3D: per-display slot; lazily creates a Context3D on request. ----');
+    this.line('void Stage3D_ctor(Stage3D* o) {');
+    this.indent++;
+    this.line('EventDispatcher_ctor((EventDispatcher*)o);');
+    this.line('o->x = 0.0; o->y = 0.0; o->visible = true; o->context3d = NULL; o->renderMode = NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('Stage3D* Stage3D_new(void) { Stage3D* o = (Stage3D*)gc_alloc(GCT_CLASS, sizeof(Stage3D)); o->vtable = &Stage3D_vt; Stage3D_ctor(o); return o; }');
+    this.line('void Stage3D_requestContext3D(void* _this, char* renderMode) {');
+    this.indent++;
+    this.line('Stage3D* o = (Stage3D*)_this;');
+    this.line('o->renderMode = renderMode;');
+    this.line('if (o->context3d == NULL) { o->context3d = Context3D_new(); gc_write_barrier((void*)o->context3d); }');
+    this.line('EventDispatcher_dispatchEvent((EventDispatcher*)o, Event_new((char*)"context3DCreate", false, false));');
+    this.indent--;
+    this.line('}');
+    this.line('Context3D* Stage3D_get_context3D(void* _this) { return ((Stage3D*)_this)->context3d; }');
+    this.line('void Stage3D_set_x(void* _this, double value) { ((Stage3D*)_this)->x = value; }');
+    this.line('void Stage3D_set_y(void* _this, double value) { ((Stage3D*)_this)->y = value; }');
+    this.line('void Stage3D_set_visible(void* _this, bool value) { ((Stage3D*)_this)->visible = value; }');
+    this.line('as_vector_Stage3D* Stage_get_stage3Ds(void* _this) {');
+    this.indent++;
+    this.line('Stage* s = (Stage*)_this;');
+    this.line('if (s->stage3ds == NULL) { s->stage3ds = as_vector_Stage3D_new(); gc_write_barrier((void*)s->stage3ds); as_vector_Stage3D_push(s->stage3ds, Stage3D_new()); }');
+    this.line('return s->stage3ds;');
+    this.indent--;
+    this.line('}');
     this.line('');
     // Stage.dispatchWheel(x, y, delta): native-backend hook (like dispatchMouse) that
     // the SDL2 event loop calls for every wheel notch. Emitted here — after the
@@ -3997,6 +4953,24 @@ export class Emitter {
     this.line('as_skia_canvas_scale(canvas, ASC_win_scale, ASC_win_scale);');
     this.line('as_skia_canvas_translate(canvas, ox, oy);');
     this.line('as_skia_canvas_scale(canvas, cx, cy);');
+    // Composite the Stage3D frame behind the 2D display list (AIR puts Stage3D
+    // behind). The back buffer is in logical stage resolution, so draw it at
+    // (0,0,w,h) in the same scaled space the display list renders in. GPU Metal
+    // path blits the render-target texture directly; CPU path draws the readback
+    // BGRA buffer.
+    this.line('#ifdef ASC_RENDER_METAL');
+    this.line('if (ASC_stage3d_ready && ASC_stage3d_tex != NULL) {');
+    this.indent++;
+    this.line('as_skia_mtl_draw_texture(canvas, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_w, (double)ASC_stage3d_h);');
+    this.indent--;
+    this.line('}');
+    this.line('#else');
+    this.line('if (ASC_stage3d_ready && ASC_stage3d_pixels != NULL) {');
+    this.indent++;
+    this.line('as_skia_canvas_draw_bgra(canvas, ASC_stage3d_pixels, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_w, (double)ASC_stage3d_h);');
+    this.indent--;
+    this.line('}');
+    this.line('#endif');
     this.line('ASC_render_scale = ASC_win_scale;');
     this.line('as_render_fp((DisplayObject*)st);');
     this.line('as_render_object(canvas, (DisplayObject*)st);');
@@ -4165,7 +5139,7 @@ export class Emitter {
       this.line('return v;');
       this.indent--;
       this.line('}');
-      this.line(`void as_vector_${key}_push(as_vector_${key}* v, ${ec} e) {`);
+      this.line(`int as_vector_${key}_push(as_vector_${key}* v, ${ec} e) {`);
       this.indent++;
       this.line('if (v->length == v->capacity) {');
       this.indent++;
@@ -4182,6 +5156,7 @@ export class Emitter {
       this.line('}');
       this.line('v->data[v->length++] = e;');
       if (isPtr) this.line('gc_write_barrier((void*)e);');
+      this.line('return v->length;');
       this.indent--;
       this.line('}');
       this.line(`${ec} as_vector_${key}_pop(as_vector_${key}* v) {`);
@@ -4440,10 +5415,12 @@ export class Emitter {
       this.indent++;
       if (ctor) {
         this.pushScope();
+        this.functionScope = this.scopes[this.scopes.length - 1];
         this.declareVar('this', { kind: 'object', className: name });
         for (const p of ctor.params) this.declareVar(p.name, resolveType(p.type));
         this.line(`${name}* this = o;`);
         this.currentClass = name;
+        this.hoistFunctionLocals(ctorBody);
       }
       if (hasExplicitSuper) {
         this.emitStmt(ctorBody[0]);
@@ -4461,6 +5438,8 @@ export class Emitter {
         this.emitBlockBody({ kind: 'Block', body: stmts });
         this.currentClass = null;
         this.currentArgs = null;
+        this.functionScope = null;
+        this.hoistedLocals = new Set();
         this.popScope();
       }
       this.indent--;
@@ -4490,13 +5469,15 @@ export class Emitter {
         this.currentIsStatic = m.isStatic;
         this.currentReturnType = returnType;
         this.pushScope();
+        this.functionScope = this.scopes[this.scopes.length - 1];
         this.declareVar('this', { kind: 'object', className: cname });
         for (const p of m.params) this.declareVar(p.name, resolveType(p.type));
         const params = this.paramDecls(m.params);
 
         if (m.isStatic) {
-          this.line(`${this.cTypeName(returnType)} ${cname}_${m.name}(${params}) {`);
+          this.line(`${this.cTypeName(returnType)} ${cname}_${m.name}_static(${params}) {`);
           this.indent++;
+          this.hoistFunctionLocals(m.body.body);
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
           this.indent--;
@@ -4506,6 +5487,7 @@ export class Emitter {
           this.line(`${this.cTypeName(returnType)} ${cname}_get_${m.name}(void* _this) {`);
           this.indent++;
           this.line(`${cname}* this = (${cname}*)_this;`);
+          this.hoistFunctionLocals(m.body.body);
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
           this.indent--;
@@ -4515,6 +5497,7 @@ export class Emitter {
           this.line(`void ${cname}_set_${m.name}(void* _this${params ? ', ' + params : ''}) {`);
           this.indent++;
           this.line(`${cname}* this = (${cname}*)_this;`);
+          this.hoistFunctionLocals(m.body.body);
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
           this.indent--;
@@ -4524,12 +5507,15 @@ export class Emitter {
           this.line(`${this.cTypeName(returnType)} ${cname}_${m.name}(void* _this${params ? ', ' + params : ''}) {`);
           this.indent++;
           this.line(`${cname}* this = (${cname}*)_this;`);
+          this.hoistFunctionLocals(m.body.body);
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
           this.indent--;
           this.line('}');
           this.line('');
         }
+        this.functionScope = null;
+        this.hoistedLocals = new Set();
         this.popScope();
         this.currentClass = null;
         this.currentIsStatic = false;
@@ -4542,15 +5528,19 @@ export class Emitter {
       if (stmt.kind !== 'FuncDecl') continue;
       const f = this.symbols.getFunc(stmt.name)!;
       this.pushScope();
+      this.functionScope = this.scopes[this.scopes.length - 1];
       for (const p of stmt.params) this.declareVar(p.name, resolveType(p.type));
       this.currentReturnType = f.returnType;
       this.line(`${this.cTypeName(f.returnType)} ${stmt.name}(${this.paramDecls(stmt.params)}) {`);
       this.indent++;
+      this.hoistFunctionLocals(stmt.body.body);
       this.emitArgsIfUsed(stmt.body, stmt.params);
       this.emitBlockBody(stmt.body);
       this.indent--;
       this.line('}');
       this.line('');
+      this.functionScope = null;
+      this.hoistedLocals = new Set();
       this.popScope();
       this.currentReturnType = null;
       this.currentArgs = null;
@@ -4573,11 +5563,13 @@ export class Emitter {
       const ctype = v.type !== null ? resolveType(v.type) : (v.init ? this.emitExpr(v.init).type : { kind: 'int' });
       this.moduleScope.set(v.name, ctype);
       const cn = this.moduleCName(v.name);
-      if (v.isConst) {
+      if (v.isConst && this.isConstExpr(v.init)) {
         this.moduleConsts.add(v.name);
         const e = this.emitExpr(v.init!);
         this.line(`static ${this.constTypeName(ctype)} ${cn} = ${this.convert(e, ctype)};`);
       } else {
+        // Mutable file-scope slot; a var's (or runtime-init const's) initializer
+        // runs in main() (emitTopLevel) in source order.
         this.line(`static ${this.cTypeName(ctype)} ${cn} = ${this.defaultInit(ctype)};`);
       }
     }
@@ -4627,7 +5619,17 @@ export class Emitter {
       }
       return;
     }
-    if (stmt.kind === 'ConstDecl' && this.moduleScope.has(stmt.name)) return;
+    if (stmt.kind === 'ConstDecl' && this.moduleScope.has(stmt.name)) {
+      // A runtime-initialized const (e.g. `const d = new Dictionary()`) still
+      // needs its initializer to run once in main(); compile-time-literal const
+      // was already initialized at file scope.
+      if (!this.isConstExpr(stmt.init)) {
+        const e = this.emitExpr(stmt.init!);
+        const ctype = this.moduleScope.get(stmt.name)!;
+        this.line(`${this.moduleCName(stmt.name)} = ${this.convert(e, ctype)};`);
+      }
+      return;
+    }
     this.emitStmt(stmt);
   }
 
@@ -4638,14 +5640,14 @@ export class Emitter {
       case 'VarDecl': {
         if (stmt.init) this.sequenceValueExpr(stmt.init, true, true);
         const d = this.emitVarDecl(stmt.name, stmt.type, stmt.init);
-        this.line(`${d};`);
+        if (d) this.line(`${d};`);
         break;
       }
       case 'VarDecls': {
         for (const d of stmt.decls) {
           if (d.init) this.sequenceValueExpr(d.init, true, true);
           const e = this.emitVarDecl(d.name, d.type, d.init);
-          this.line(`${e};`);
+          if (e) this.line(`${e};`);
         }
         break;
       }
@@ -4711,12 +5713,18 @@ export class Emitter {
         this.breakTargets.push(this.tryFrames.length);
         this.continueTargets.push(this.tryFrames.length);
         if (isDict) {
-          // Dictionary keys are object references; a declared loop var is boxed
-          // (`var key:* in dict`), an existing `Object` var receives the pointer.
+          // Dictionary keys are boxed as_value. `for (var key:* in dict)` declares
+          // an `any` loop var that keeps the box; an existing typed loop var
+          // (`for (tgt:Object in dict)`) must unbox the key to its declared type.
           if (stmt.declares) this.declareVar(stmt.varName, { kind: 'any' });
           this.line(`for (int ${idx} = 0; ${idx} < (${it.code})->length; ${idx}++) {`);
           this.indent++;
-          this.line(`${stmt.declares ? `as_value ${this.cIdent(stmt.varName)} = ` : `${this.cIdent(stmt.varName)} = `}${stmt.declares ? 'as_v_obj' : ''}((${it.code})->keys[${idx}]);`);
+          if (stmt.declares) {
+            this.line(`as_value ${this.cIdent(stmt.varName)} = (${it.code})->keys[${idx}];`);
+          } else {
+            const keyVal = { code: `(${it.code})->keys[${idx}]`, type: { kind: 'any' } as CType };
+            this.line(`${this.cIdent(stmt.varName)} = ${this.unboxAny(keyVal, this.emitVar(stmt.varName).type)};`);
+          }
           this.emitStmt(stmt.body);
           this.indent--;
           this.line('}');
@@ -5114,6 +6122,15 @@ export class Emitter {
       ctype = this.emitExpr(init).type;
     } else {
       ctype = { kind: 'int' };
+    }
+    // A hoisted (function-scoped) var is already declared at the function top;
+    // emit only the assignment here so the C declaration isn't duplicated inside
+    // a block where it would be invisible to sibling scopes.
+    if (this.hoistedLocals.has(name)) {
+      if (!init) return '';
+      const e = this.emitExpr(init);
+      const code = this.convert(e, ctype);
+      return `${this.cIdent(name)} = ${code}`;
     }
     this.declareVar(name, ctype);
     if (init) {
@@ -5761,8 +6778,11 @@ export class Emitter {
           const cinfo = this.symbols.getClass(cname)!;
           const sf = cinfo.staticFields.get(target.property);
           if (sf) {
-            const v = this.emitExpr(expr.value);
-            const code = this.convert(v, sf.type);
+            // Compound assignment folds the old value in (`C.f += v` =>
+            // `C.f = C.f OP v`), matching AS3 semantics.
+            const code = expr.op === '='
+              ? this.convert(this.emitExpr(expr.value), sf.type)
+              : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), sf.type);
             return { code: `(${sf.owner}_${target.property} = ${code})`, type: sf.type };
           }
         }
@@ -5802,9 +6822,13 @@ export class Emitter {
         const cinfo = this.symbols.getClass(obj.type.className);
         const s = cinfo?.setters.get(target.property);
         if (s) {
-          const v = this.emitExpr(expr.value);
           const paramType = resolveType(s.params[0].type);
-          const code = this.convert(v, paramType);
+          // Compound assignment reads the current value through the getter and
+          // folds it in (`obj.prop += v` => `set(obj, get(obj) OP v)`) instead of
+          // discarding the old value.
+          const code = expr.op === '='
+            ? this.convert(this.emitExpr(expr.value), paramType)
+            : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
           return { code: `${s.owner}_set_${target.property}(${obj.code}, ${code})`, type: { kind: 'void' } };
         }
         // Dynamic class (AS3 `dynamic class`): an undeclared member write lands in
@@ -5888,7 +6912,7 @@ export class Emitter {
               throw new CodegenError(`static method '${callee.property}' is not accessible here`);
             }
             const args = this.emitArgs(sm.params, expr.args);
-            return { code: `${sm.owner}_${callee.property}(${args})`, type: sm.returnType };
+            return { code: `${sm.owner}_${callee.property}_static(${args})`, type: sm.returnType };
           }
           throw new CodegenError(`undefined static method '${callee.property}' on class '${callee.object.name}'`);
         }
@@ -5959,6 +6983,20 @@ export class Emitter {
           const args = this.emitArgs(m.params, expr.args);
           const callArgs = args ? ', ' + args : '';
           return { code: `(this->vtable->${this.cIdent(callee.name)}(this${callArgs}))`, type: m.returnType };
+        }
+      }
+      // Bare static-method call from within the same class (e.g. `init()` called
+      // by the constructor, or a static helper called by an instance method).
+      // AS3 resolves these to the class's static method without a receiver.
+      if (this.currentClass) {
+        const cinfo = this.symbols.getClass(this.currentClass);
+        const sm = cinfo?.staticMethods.get(callee.name);
+        if (sm) {
+          if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
+            throw new CodegenError(`static method '${callee.name}' is not accessible here`);
+          }
+          const args = this.emitArgs(sm.params, expr.args);
+          return { code: `${sm.owner}_${callee.name}_static(${args})`, type: sm.returnType };
         }
       }
       const builtin = this.emitGlobalCall(callee.name, expr.args);
@@ -6106,10 +7144,13 @@ export class Emitter {
       // an `any` that is an object at runtime (e.g. a nested object literal).
       return { code: `as_object_get(((as_object*)as_v_obj_val(${obj.code})), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
-    // AS3's root `Object` is dynamic: `o.name` on an Object-typed value is a
-    // runtime key lookup (JSON.parse results, generic records, ...).
+    // AS3's root `Object` is dynamic: `o.name` on an Object-typed value may be a
+    // record slot lookup (JSON.parse results, generic records) OR a reflectable
+    // field of a real class instance held as Object (e.g. e.currentTarget.loader).
+    // as_dyn_get walks the vtable super chain for a field first, then falls back to
+    // the record slot table — a strict superset of as_object_get.
     if (obj.type.kind === 'object' && (obj.type as { className: string }).className === 'Object') {
-      return { code: `as_object_get(((as_object*)${obj.code}), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
+      return { code: `as_dyn_get((void*)(${obj.code}), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
     if (obj.type.kind !== 'object') {
       throw new CodegenError(`cannot access property '${expr.property}' on non-object type`);
@@ -6158,9 +7199,14 @@ export class Emitter {
     const v = obj.code;
     switch (method) {
       case 'push': {
-        if (args.length !== 1) throw new CodegenError('Vector.push expects 1 argument');
-        const a = this.convert(this.emitExpr(args[0]), elem);
-        return { code: `as_vector_${key}_push(${v}, ${a})`, type: { kind: 'int' } };
+        // AS3 Vector.push is variadic (push(a, b, c, ...)) and returns the new
+        // length. Multiple args are sequenced left-to-right via the comma
+        // operator; each push returns the running length, so the expression's
+        // value is the final length (matching AS3).
+        if (args.length === 0) throw new CodegenError('Vector.push expects at least 1 argument');
+        const pushes = args.map((a) => `as_vector_${key}_push(${v}, ${this.convert(this.emitExpr(a), elem)})`);
+        const code = pushes.length === 1 ? pushes[0] : `(${pushes.join(', ')})`;
+        return { code, type: { kind: 'int' } };
       }
       case 'pop':
         return { code: `as_vector_${key}_pop(${v})`, type: elem };
@@ -6387,14 +7433,20 @@ export class Emitter {
         if (arg.type.kind === 'object' && arg.type.className === 'RegExp') {
           return { code: `as_str_match_regex(${s}, ${arg.code}->compiled, ${arg.code}->global)`, type: { kind: 'array' } };
         }
-        throw new CodegenError('String.match requires a RegExp argument');
+        // String.match(pattern) also accepts a String, implicitly converted to a
+        // RegExp (the string is the raw regex pattern, not a literal substring).
+        const pat = arg.type.kind === 'string' ? arg.code : this.toStringExpr(arg);
+        return { code: `as_str_match_regex(${s}, as_regex_compile(${pat}, ""), 0)`, type: { kind: 'array' } };
       }
       case 'search': {
         const arg = this.emitExpr(args[0]);
         if (arg.type.kind === 'object' && arg.type.className === 'RegExp') {
           return { code: `as_str_search_regex(${s}, ${arg.code}->compiled)`, type: { kind: 'int' } };
         }
-        throw new CodegenError('String.search requires a RegExp argument');
+        // String.search(pattern) also accepts a String, implicitly converted to a
+        // RegExp (e.g. line.search("//") finds the literal "//" comment marker).
+        const pat = arg.type.kind === 'string' ? arg.code : this.toStringExpr(arg);
+        return { code: `as_str_search_regex(${s}, as_regex_compile(${pat}, ""))`, type: { kind: 'int' } };
       }
       case 'replace': {
         const arg = this.emitExpr(args[0]);
@@ -6487,12 +7539,13 @@ export class Emitter {
         return { code: `as_fn_apply_v(${obj.code}, ${argsBox})`, type: { kind: 'any' } };
       }
       // Dynamically-typed method dispatch: obj.method(args...) where the object's
-      // static type is `*`. Resolved at runtime through the vtable method tables.
+      // static type is `*`. Resolved at runtime through the vtable method tables
+      // (or the string-method table when the receiver is a string).
       default: {
         const items = args.map((a) => this.boxExpr(this.emitExpr(a)));
         const n = args.length;
         const arr = n > 0 ? `(as_value[${n}]){ ${items.join(', ')} }` : 'NULL';
-        return { code: `as_dyn_call(as_v_obj_val(${obj.code}), "${this.escapeCString(method)}", ${arr}, ${n})`, type: { kind: 'any' } };
+        return { code: `as_any_call(${obj.code}, "${this.escapeCString(method)}", ${arr}, ${n})`, type: { kind: 'any' } };
       }
     }
   }
@@ -6686,6 +7739,7 @@ export class Emitter {
       case 'String': return { code: this.toStringExpr(e0!), type: { kind: 'string' } };
       case 'Number': {
         if (e0!.type.kind === 'string') return { code: `atof(${e0!.code})`, type: { kind: 'number' } };
+        if (e0!.type.kind === 'any') return { code: `as_v_to_number(${e0!.code})`, type: { kind: 'number' } };
         return { code: this.toNumberExpr(e0!), type: { kind: 'number' } };
       }
       case 'Boolean': {
@@ -6693,14 +7747,17 @@ export class Emitter {
           return { code: `(${e0!.code} != NULL && strlen(${e0!.code}) > 0)`, type: { kind: 'bool' } };
         }
         if (e0!.type.kind === 'bool') return { code: e0!.code, type: { kind: 'bool' } };
+        if (e0!.type.kind === 'any') return { code: `as_v_truthy(${e0!.code})`, type: { kind: 'bool' } };
         return { code: `((${this.toNumberExpr(e0!)}) != 0.0)`, type: { kind: 'bool' } };
       }
       case 'int': {
         if (e0!.type.kind === 'string') return { code: `atoi(${e0!.code})`, type: { kind: 'int' } };
+        if (e0!.type.kind === 'any') return { code: `as_v_to_int(${e0!.code})`, type: { kind: 'int' } };
         return { code: `((int)(${this.toNumberExpr(e0!)}))`, type: { kind: 'int' } };
       }
       case 'uint': {
         if (e0!.type.kind === 'string') return { code: `((unsigned int)atoi(${e0!.code}))`, type: { kind: 'uint' } };
+        if (e0!.type.kind === 'any') return { code: `as_v_to_uint(${e0!.code})`, type: { kind: 'uint' } };
         return { code: `((unsigned int)(${this.toNumberExpr(e0!)}))`, type: { kind: 'uint' } };
       }
       case 'encodeURI': {
@@ -6894,9 +7951,7 @@ export class Emitter {
     // Dictionary keys are object references, not strings: `delete dict[key]`.
     if (obj.type.kind === 'dict') {
       const key = this.emitExpr((t as { index: Expr }).index);
-      const keyRef = key.type.kind === 'object' || key.type.kind === 'interface'
-        ? `(void*)(${key.code})`
-        : `(void*)as_v_obj_val(${this.boxExpr(key)})`;
+      const keyRef = this.boxExpr(key);
       return { code: `as_dict_del(${obj.code}, ${keyRef})`, type: { kind: 'bool' } };
     }
     if (obj.type.kind === 'record') objCode = obj.code;
@@ -6917,9 +7972,7 @@ export class Emitter {
     const key = this.emitExpr(expr.key);
     // Dictionary membership: key is an object reference, not a string.
     if (obj.type.kind === 'dict') {
-      const keyRef = key.type.kind === 'object' || key.type.kind === 'interface'
-        ? `(void*)(${key.code})`
-        : `(void*)as_v_obj_val(${this.boxExpr(key)})`;
+      const keyRef = this.boxExpr(key);
       return { code: `as_dict_has(${obj.code}, ${keyRef})`, type: { kind: 'bool' } };
     }
     const keyStr = key.type.kind === 'string' ? key.code : this.toStringExpr(key);
@@ -6992,8 +8045,14 @@ export class Emitter {
     const rt = resolveType(expr.typeName as ASType);
     const fqn = rt.kind === 'object' ? rt.className : expr.typeName;
     if (!this.symbols.hasClass(fqn)) throw new CodegenError(`unknown type '${expr.typeName}'`);
+    // `as` never throws in AS3 — a failed cast yields null. A dynamically-typed
+    // `any` is instance-checked at runtime; a primitive (string/number/int/uint/
+    // bool) can never be a class instance, so the cast is statically null.
+    if (o.type.kind === 'any') {
+      return { code: `(as_v_is_inst(${o.code}, &${fqn}_vt) ? ((${fqn}*)as_v_obj_val(${o.code})) : NULL)`, type: { kind: 'object', className: fqn } };
+    }
     if (o.type.kind !== 'object' && o.type.kind !== 'null') {
-      throw new CodegenError(`'as' on non-object type is not supported`);
+      return { code: 'NULL', type: { kind: 'object', className: fqn } };
     }
     const code = `(as_is(${o.code}, &${fqn}_vt) ? ((${fqn}*)(${o.code})) : NULL)`;
     return { code, type: { kind: 'object', className: fqn } };
@@ -7034,6 +8093,14 @@ export class Emitter {
     if (expr.className === 'Dictionary') {
       if (expr.args.length > 1) throw new CodegenError('new Dictionary() takes at most (weakKeys)');
       return { code: 'as_dict_new()', type: { kind: 'dict' } };
+    }
+    // new String(x) / new Number(x) / new Boolean(x) / new int(x) / new uint(x):
+    // AS3 primitive-wrapper constructors, semantically identical to the conversion
+    // functions String(x)/Number(x)/... (primitives are modeled directly here, not
+    // as boxed wrapper objects). Delegated to emitGlobalCall.
+    if (expr.className === 'String' || expr.className === 'Number' || expr.className === 'Boolean' || expr.className === 'int' || expr.className === 'uint') {
+      if (expr.args.length !== 1) throw new CodegenError(`new ${expr.className}() takes exactly 1 argument`);
+      return this.emitGlobalCall(expr.className, expr.args)!;
     }
     const vt = resolveType(expr.className);
     if (vt.kind !== 'object') throw new CodegenError(`unknown class '${expr.className}'`);
@@ -7083,7 +8150,7 @@ export class Emitter {
     if (args.length === 1) {
       const e = this.emitExpr(args[0]);
       if (e.type.kind === 'string') {
-        return { code: `Date_new_ms(Date_parse(${e.code}))`, type: t };
+        return { code: `Date_new_ms(Date_parse_static(${e.code}))`, type: t };
       }
       return { code: `Date_new_ms(${this.convert(e, { kind: 'number' })})`, type: t };
     }
@@ -7153,6 +8220,12 @@ export class Emitter {
       const idx = this.convert(this.emitExpr(expr.index), { kind: 'int' });
       return { code: `as_array_get(${obj.code}, ${idx})`, type: { kind: 'any' } };
     }
+    // ByteArray[index] reads a byte at an absolute index (AGALMiniAssembler's
+    // `agalcode[index].toString(16)` debug path).
+    if (obj.type.kind === 'object' && obj.type.className === 'ByteArray') {
+      const idx = this.convert(this.emitExpr(expr.index), { kind: 'int' });
+      return { code: `ByteArray_get_index((void*)(${obj.code}), ${idx})`, type: { kind: 'int' } };
+    }
     // Dictionary: obj[key] where key is an OBJECT REFERENCE (not a string).
     if (obj.type.kind === 'dict') {
       const key = this.emitExpr(expr.index);
@@ -7181,13 +8254,11 @@ export class Emitter {
     throw new CodegenError('index access on non-array type');
   }
 
-  // Dictionary keys are object references; the boxed form recovers the raw ptr.
+  // Dictionary keys are boxed and compared by strict equality (===): string
+  // keys by value, object keys by reference. Boxing the key lets as_dict_find
+  // use as_v_eq instead of raw pointer identity.
   private dictKeyRef(key: { code: string; type: CType }): string {
-    switch (key.type.kind) {
-      case 'any': return `as_v_obj_val(${key.code})`;
-      case 'interface': return `(void*)(${key.code}.obj)`;
-      default: return `(void*)(${key.code})`;
-    }
+    return this.boxExpr(key);
   }
 
   // Turn an expression that must denote an Array into the `as_array*` C code
@@ -7316,6 +8387,10 @@ export class Emitter {
       return e.code;
     }
     if (target.kind === 'any') return this.boxExpr(e);
+    // Passing/assigning a null literal to a String-typed slot yields a null
+    // string (NULL), not the literal "null" (that is the String(null)
+    // conversion-function result, emitted only by toStringExpr in trace/concat).
+    if (target.kind === 'string' && e.type.kind === 'null') return 'NULL';
     if (target.kind === 'string') return this.toStringExpr(e);
     // Reference types cannot implicitly convert to numeric/bool scalars in AS3.
     // This guards `var x; x = "hello";` (x inferred as int) from silently

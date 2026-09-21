@@ -22,9 +22,11 @@
 #include "include/core/SkSurface.h"
 #include "include/core/SkCanvas.h"
 #include "include/core/SkColorSpace.h"
+#include "include/core/SkImage.h"
 #include "include/gpu/GrDirectContext.h"
 #include "include/gpu/GrBackendSurface.h"
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"
 #include "include/gpu/ganesh/mtl/GrMtlBackendContext.h"
 #include "include/gpu/ganesh/mtl/GrMtlDirectContext.h"
 #include "include/gpu/ganesh/mtl/GrMtlTypes.h"
@@ -127,6 +129,12 @@ void* sk_mtl_begin_frame(int width, int height) {
   if (g_context == nullptr || g_layer == nil) return nullptr;
   if (width <= 0 || height <= 0) return nullptr;
 
+  // nextDrawable returns an autoreleased (+0) CAMetalDrawable; with no pool in
+  // the C++ loop that +0 reference would leak every frame. Wrap the frame in an
+  // explicit @autoreleasepool (the CFRetain below keeps the drawable alive past
+  // the pool for present in sk_mtl_flush).
+  @autoreleasepool {
+
   // The drawable size is set from SDL's own physical-pixel query (see
   // window_glue.cc), so the surface always matches the backing store even across
   // a HiDPI change. nextDrawable respects this size on subsequent frames.
@@ -161,6 +169,7 @@ void* sk_mtl_begin_frame(int width, int height) {
   // autoreleased at the end of the runloop turn). Released in sk_mtl_flush.
   g_drawable = (id<CAMetalDrawable>)CFRetain((CFTypeRef)drawable);
   return (void*)g_surface->getCanvas();
+  }  // @autoreleasepool
 }
 
 // Submit all queued Ganesh work to the GPU and present the current drawable.
@@ -171,6 +180,12 @@ void* sk_mtl_begin_frame(int width, int height) {
 // flushAndSubmit, then hand the drawable to a command buffer for present+commit,
 // then release it (the drawable is one-shot).
 void sk_mtl_flush(void) {
+  // Skia's Ganesh Metal backend allocates autoreleased MTLCommandBuffer/encoder
+  // objects inside flushAndSubmit, and the present command buffer below is also
+  // autoreleased. The C++ SDL loop has no autorelease pool, so without an
+  // explicit pool every frame leaks Metal command objects (the air-native slow
+  // leak). Drain the whole frame here.
+  @autoreleasepool {
   if (g_context && g_surface) {
     g_context->flushAndSubmit(g_surface.get(), GrSyncCpu::kNo);
   }
@@ -179,11 +194,36 @@ void sk_mtl_flush(void) {
     [commandBuffer presentDrawable:g_drawable];
     [commandBuffer commit];
   }
+  }
   if (g_drawable) {
     CFRelease((CFTypeRef)g_drawable);
     g_drawable = nil;
   }
   if (g_surface) g_surface.reset();
+}
+
+// Draw an externally-owned MTLTexture directly onto the current Metal canvas — a
+// GPU→GPU composite with no CPU readback and no CPU→GPU upload. Used to composite
+// the Stage3D offscreen render target behind the 2D display list. The texture is
+// borrowed (Skia wraps, does not own); its contents are re-rendered in place every
+// frame by the Stage3D context, so this samples the LIVE texture. Unlike the old
+// readback + RasterFromPixmapCopy path, there is no per-frame CPU→GPU upload and
+// therefore no per-frame blit command buffer — the shmup residual leak's root
+// cause (AGXG14XFamilyCommandBuffer / BlitContext × 1/frame).
+void sk_mtl_draw_texture(void* canvas, void* mtlTexture, int w, int h,
+                         double dx, double dy, double dw, double dh) {
+  if (canvas == nullptr || mtlTexture == nullptr || g_context == nullptr) return;
+  if (w <= 0 || h <= 0) return;
+  id<MTLTexture> tex = (id<MTLTexture>)mtlTexture;
+  GrMtlTextureInfo info;
+  info.fTexture.retain((GrMTLHandle)tex);
+  GrBackendTexture backendTex(w, h, skgpu::Mipmapped::kNo, info);
+  sk_sp<SkImage> img = SkImages::BorrowTextureFrom(
+      g_context.get(), backendTex, kTopLeft_GrSurfaceOrigin,
+      kBGRA_8888_SkColorType, kPremul_SkAlphaType, nullptr);
+  if (!img) return;
+  SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
+  ((SkCanvas*)canvas)->drawImageRect(img.get(), dst, SkSamplingOptions());
 }
 
 }  // extern "C"

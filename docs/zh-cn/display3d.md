@@ -58,10 +58,12 @@ Stage3D 的着色器是 **AGAL（Adobe 图形汇编语言）二进制字节码**
 
 - **结构**：magic `0xa0` + version + program type + shader type，之后是一串 32-bit token
   （`opcode | dest | src1 | src2 | swizzle/mask`），≤200 指令/程序。
-- **寄存器模型**：`va0-7`（attribute）、`vc0-127/27`（constant）、`vt0-7`（temp）、`op/oc`（output）、
-  `v0-7`（varying）、`fs0-7`（sampler）。
-- **指令集**：约 28 条（`mov/add/sub/mul/div/rcp/min/max/frc/sqt/rsq/pow/log/exp/nrm/sin/cos/dp3/dp4/crs/m33/m34/m44/abs/neg/sat/kil/tex` 等），
-  带 swizzle 与 write-mask。
+- **寄存器模型**（按 version 分档，详见 AGALMiniAssembler `initregmap`）：`va`（attribute，v1/v2=7、v3=15）、
+  `vc`（vertex constant，v1=127、v2/v3=249）、`vt`（temp，v1=7、v2/v3=25）、`op/oc`（output）、
+  `v`（varying，v1=7、v2/v3=9）、`fc`（fragment constant，v1=27、v2=63、v3=199）、`ft`（v1=7、v2/v3=25）、
+  `fo`（v1=0 仅 `oc`、v2/v3=3 即 MRT）、`fd`（v2/v3 深度输出）、`fs`（sampler）；AGAL3 独有 `iid`（实例化）、`vs`（顶点纹理采样）。
+- **指令集**：约 28 条基础指令（`mov/add/sub/mul/div/rcp/min/max/frc/sqt/rsq/pow/log/exp/nrm/sin/cos/dp3/dp4/crs/m33/m34/m44/abs/neg/sat/kil/tex` 等），
+  带 swizzle 与 write-mask；AGAL2 扩展控制流（`ife/ine/ifg/ifl/els/eif`）+ 导数（`ddx/ddy`）+ MRT；AGAL3 扩展实例化与顶点纹理采样。
 
 **翻译方案是成熟且确定性的**：
 - native：AGAL → **MSL**（`newLibraryWithSource` 编译），寄存器映射为 `float4`、`tex` 映射为 `texture2d.sample()`。
@@ -114,13 +116,56 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 | 阶段 | 目标 |
 |---|---|
 | **A 前置** | `Matrix3D` + `Vector3D` + `Vector.<Number/uint/float>` 补全（纯逻辑，风险低） |
-| **B AGAL 内核** | AGAL1 字节码解析器 + 校验器 + →MSL/GLSL 翻译器（**最硬的一步**，单独一阶段） |
+| **B AGAL 内核** | AGAL 字节码解析器（AGAL1/2/3）+ 校验器 + →MSL/GLSL 翻译器（**最硬的一步**，单独一阶段） |
 | **C Context3D 骨架** | `Stage3D` + `Context3D` 状态机 + `VertexBuffer3D`/`IndexBuffer3D`/`Program3D`/`Texture`(BGRA/RGBA) + `drawTriangles`，`enableErrorChecking=false` 走异步 |
 | **D 端到端** | Metal 裸管线落地，跑通「彩色三角形」demo，再铺开 blend/depth/stencil/cull/scissor/render-to-texture |
-| **E 对齐加固** | `drawToBitmapData`、`setRenderToTexture`、CubeTexture/RectangleTexture、AGAL2(MRT)/AGAL3(实例化) |
+| **E 对齐加固** | `drawToBitmapData`、`setRenderToTexture`、CubeTexture/RectangleTexture、AGAL2/3 的 GPU 端到端上屏（MRT render pass / 实例化） |
 
-**首期可收敛到 baseline profile（AGAL1 + 非压缩 2D/cube 纹理 + 无实例化/MRT）**——这正好覆盖 Stage3D 的最大
+**内核翻译器支持 AGAL1/2/3 三代；首期 `Context3D.profile` 收敛到 baseline（AGAL1 能力 + 非压缩 2D/cube 纹理 + 无实例化/MRT）**——这正好覆盖 Stage3D 的最大
 真实消费者 **Starling**（2D-on-GPU 框架）。
+
+### 6.1 最终验收 demo：`examples/shmup-stage3d`
+
+> 该 demo 是阶段七十九~八十三的**最终端到端验收目标**——全部落地后，本项目应能把它从 `.as`
+> 编译为原生可执行文件并跑出与 `mxmlc + adl` 一致的画面。
+
+**来源与结构**：Christer Kaitila 的「Stage3D Shoot-em-up Tutorial」（tutsplus 教程，Starling 前身的
+批处理 sprite 引擎）。共约 1806 行 AS3：
+
+| 文件 | 职责 |
+|---|---|
+| `Main.as` | 入口：`requestContext3D` → `CONTEXT3D_CREATE` → ENTER_FRAME 渲染循环 |
+| `LiteSpriteStage.as` | Stage3D 渲染器：`configureBackBuffer` + `Matrix3D` 模型视图矩阵 + 批处理驱动 |
+| `LiteSpriteBatch.as` | 单次 `drawTriangles` 批量绘制全部 sprite（每帧重传顶点） |
+| `LiteSpriteSheet.as` | 图集纹理：`createTexture(BGRA)` + `uploadFromBitmapData` + 逐级 mipmap 生成 |
+| `Entity.as` / `EntityManager.as` | 实体对象池（`Vector` splice 复用） |
+| `GameGUI.as` | 2D GUI（`Sprite` 显示列表层，与 Stage3D 层并存） |
+| `com/adobe/utils/AGALMiniAssembler.as` | 纯 AS3 工具类（818 行）：字符串 AGAL → 位打包 `ByteArray` |
+
+**该 demo 覆盖的 Stage3D API 面**（即验收清单，缺一不可）：
+
+- `Stage3D`：`requestContext3D(Context3DRenderMode.AUTO)`、`context3D`、`CONTEXT3D_CREATE` 事件、`x`/`y` 定位
+- `Context3D`：`configureBackBuffer`、`clear`、`present`、`drawTriangles`、`setProgram`、
+  `setBlendFactors(ONE, ONE_MINUS_SOURCE_ALPHA)`、`setProgramConstantsFromMatrix(VERTEX, transpose)`、
+  `setTextureAt`、`setVertexBufferAt`（**多顶点流**：stream 0 = `FLOAT_3` 位置/alpha，stream 1 = `FLOAT_2` UV）、
+  `createVertexBuffer`、`createIndexBuffer`、`createProgram`、`createTexture`
+- `Program3D.upload`（vertex + fragment 两份 AGAL 字节码）
+- `VertexBuffer3D` / `IndexBuffer3D.uploadFromVector`
+- `Texture.uploadFromBitmapData`（BGRA + 多级 mipmap）
+- `Matrix3D.appendTranslation` / `appendScale`
+- **AGAL1 着色器**（`AGALMiniAssembler.assemble` 默认 `version=1`）：`dp4`/`mov`/`tex`/`mul` + swizzle + sampler options
+- 隐式依赖：`Vector.<Number/uint/T>`、`Rectangle`/`Point`/`Matrix`、`BitmapData`、`getTimer`
+
+**与阶段的对应关系**：
+
+- 该 demo 的着色器是 **AGAL1**（`assemble` 未传 `version` 参数），**恰好落在 baseline 收敛范围内**——
+  阶段七十九（`Matrix3D`/`Vector3D`）+ 八十（AGAL 内核，覆盖 AGAL1 指令）+ 八十一（`Context3D` 状态机）+
+  八十二（Metal 端到端）全部完成后即可编译运行，无需等阶段八十三的 MRT/实例化。
+- 它**不依赖** AGAL2/3 特性（无 `ife`/`ddx`/MRT/`iid`），因此是验证「baseline 是否闭环」的精确探针；
+  阶段八十三（AGAL2/3 上屏）的验收另行用专门 demo 覆盖。
+- `build-and-run.sh` 用 `mxmlc -swf-version=13` + `adl`（`renderMode=direct`）编译运行，
+  符合 AGENTS.md §2.4 的「以 `mxmlc` 为参考编译器、同一份 `.as` 对照验证」约定——本项目编译它时，
+  以该脚本产出的画面/行为为基准对照。
 
 ---
 
@@ -132,7 +177,7 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 | 压缩纹理（ATF/DXT/PVRTC） | ❌ 依赖专用编解码，**排除**（或只支持运行时无压缩回退） |
 | `driverInfo`/`totalGPUMemory`/`profile` 精确上报 | 部分可做，语义近似即可 |
 | `enableErrorChecking=true` 的同步抛错 | 可选，先只做 `false` 异步路径 |
-| AGAL2/AGAL3（MRT/实例化） | 延后；AGAL3 的 `iid` 寄存器可用 Metal instancing 对应 |
+| AGAL2/AGAL3 的 GPU 端到端上屏（MRT/实例化） | 翻译在内核阶段（阶段八十）已覆盖；Metal 侧的 MRT `[[color(i)]]`、AGAL3 `iid` → `[[instance_id]]` 上屏延后到阶段八十三 |
 
 ---
 

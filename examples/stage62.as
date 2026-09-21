@@ -81,7 +81,7 @@ function onLoaderInit(e:Event):void { initFired = true; }
 function onLoaderComplete(e:Event):void { completeFired = true; }
 loader.contentLoaderInfo.addEventListener(LoaderInfo.INIT, onLoaderInit);
 loader.contentLoaderInfo.addEventListener(LoaderInfo.COMPLETE, onLoaderComplete);
-loader.load("test.swf");
+loader.load(new URLRequest("test.swf"));
 check(loader.contentLoaderInfo.url == "test.swf", "load records url");
 check(initFired, "load dispatches INIT synchronously");
 check(!completeFired, "load does not dispatch COMPLETE synchronously");

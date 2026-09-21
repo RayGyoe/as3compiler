@@ -6,7 +6,7 @@
 
 ---
 
-## 当前状态（v0.3.89）
+## 当前状态（v0.3.96）
 
 已实现 AS3 可用子集（面向对象基础 + 数据与迭代 + 标准库 + 接口与类型系统 + 函数进阶 + 包/模块语法兼容 + 异常处理 + 完善与打磨已全部完成）：
 
@@ -39,7 +39,7 @@
 >
 > 纯 AS 项目把图片等资源打进 **SWC**（ZIP 归档），原图不可得时需解析 SWC 提取资源显示 UI。专项调研见 [`docs/zh-cn/swc.md`](docs/zh-cn/swc.md)：SWC 资源**不在 ZIP 顶层**，而是嵌在 `library.swf`（CWS）里以 SWF tag 存放（位图 → `DefineBitsLossless2`/`DefineBitsJPEG2`，经 `SymbolClass` 映射到 `BitmapData` 子类）；「解析 SWC 拿资源」= ZIP 解包 → 解压 SWF → 扫描 tag → 提取像素/JPEG 字节，**编译期**（Node 侧零依赖）完成并嵌入产物，运行时解码复用 Skia。**暂缓开发，后续由用户决定是否实现**（草案见「遗留待开发」表 SWC 资源提取项）。
 >
-> `flash.display3D.*`（Stage3D，可编程 GPU 3D 管线，唯一图元是三角形）另做专项调研，见 [`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)：结论是**可实现且非架构推翻**，是对现有 GPU 基础设施的一次有边界扩展（复用在 `metal_glue.mm` 上新增裸 `MTLBuffer`/渲染通道/MSL），核心难点是 **AGAL 字节码 → MSL/GLSL 的翻译**（有 Ruffle/开源 AGAL→GLSL 成熟参照）。**暂缓开发，后续由用户决定是否实现**（草案见「遗留待开发」表 display3D 项）。
+> `flash.display3D.*`（Stage3D，可编程 GPU 3D 管线，唯一图元是三角形）另做专项调研，见 [`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)：结论是**可实现且非架构推翻**，是对现有 GPU 基础设施的一次有边界扩展（复用在 `metal_glue.mm` 上新增裸 `MTLBuffer`/渲染通道/MSL），核心难点是 **AGAL 字节码 → MSL/GLSL 的翻译**（有 Ruffle/开源 AGAL→GLSL 成熟参照）。据此新增**阶段七十九~八十三**（v0.3.90 → v0.3.94，详见下方路线图）：前置几何类（`Matrix3D`/`Vector3D`）→ AGAL 内核（解析+校验+翻译，AGAL1/2/3）→ `Context3D` 骨架 → Metal 端到端三角形 → 对齐加固，首期 profile 收敛 BASELINE（AGAL1 能力 + 非压缩纹理）覆盖 Starling。
 >
 > 在离屏 PNG 渲染闭环（阶段三十六~三十八）跑通后，新增**阶段三十九**（v0.3.40）：**SDL2 窗口化后端**——
 > `Stage.showWindow(width, height, title)` 把离屏 Skia surface 的像素经 `vendor/window_glue.cc` 上屏到 arm64 SDL2 窗口
@@ -84,7 +84,7 @@
 > 阶段七十二 **TextField 富文本与排版扩展**（`autoSize`/`hscroll`/`scrollH`/`maxScrollH`/`selectable`/选区/`leading`/
 > `htmlText` + `setTextFormat` 区间样式，v0.3.78）→ 阶段七十三 **`DisplayObject.cacheAsBitmap`** 子树位图缓存
 > （v0.3.79）→ 阶段七十四 **增量重绘自动 cacheAsBitmap**（渲染层指纹 dirty 检测 + 静止子树自动烘焙，v0.3.80）→
-> 阶段七十五 **native Metal 渲染后端**（`renderMode=direct/gpu` → `ASC_RENDER_METAL`，v0.3.83）→ v0.3.84 **修复 web GPU flush 未提交**（`sk_gr_flush` 由 `flush()` 改为 `flushAndSubmit(GrSyncCpu::kNo)`，否则 GL 后端不调 `glFlush`、FBO 0 呈现未初始化品红/碎片化，与 Metal 后端「flush 只记录、submit 才提交」的教训一致）→ 阶段七十六 **C 标识符命名冲突处理**（完整保留字表 + sanitize 全覆盖，v0.3.87）→ 阶段七十七 **try/finally 提前退出的异常栈卫生**（return/break/continue 跳出 try 前回退 `as_jmp_depth` + 运行 pending finally，v0.3.88）→ 阶段七十八 **体积优化 static 化**（内建类方法体/thunk/prototype 加 `static`，`-O2` 自动 tree-shake，hello 165 KB→34 KB，v0.3.89）。
+> 阶段七十五 **native Metal 渲染后端**（`renderMode=direct/gpu` → `ASC_RENDER_METAL`，v0.3.83）→ v0.3.84 **修复 web GPU flush 未提交**（`sk_gr_flush` 由 `flush()` 改为 `flushAndSubmit(GrSyncCpu::kNo)`，否则 GL 后端不调 `glFlush`、FBO 0 呈现未初始化品红/碎片化，与 Metal 后端「flush 只记录、submit 才提交」的教训一致）→ 阶段七十六 **C 标识符命名冲突处理**（完整保留字表 + sanitize 全覆盖，v0.3.87）→ 阶段七十七 **try/finally 提前退出的异常栈卫生**（return/break/continue 跳出 try 前回退 `as_jmp_depth` + 运行 pending finally，v0.3.88）→ 阶段七十八 **体积优化 static 化**（内建类方法体/thunk/prototype 加 `static`，`-O2` 自动 tree-shake，hello 165 KB→34 KB，v0.3.89）→ 阶段七十九 **Stage3D 前置几何类**（`Matrix3D`+`Vector3D` 纯逻辑、列主序矩阵/向量几何/decompose-recompose，v0.3.90）→ 阶段八十 **AGAL 字节码内核**（纯 C 翻译器，按官方 `AGALMiniAssembler` 编码解析 AGAL1/2/3 → MSL/GLSL，寄存器 type 为 shader 相对编码，v0.3.91）→ 阶段八十一 **Stage3D + Context3D 骨架**（纯 CPU 状态机 + 资源类 + 15 常量类，v0.3.92）。
 >
 > 依据对 [Porffor](https://github.com/CanadaHonk/porffor)（架构与 as3compiler 几乎同构的「JS → 可读 C → 原生」AOT）
 > `compiler/render.js` 完整 C 保留字表的评估，新增**阶段七十六**（v0.3.87，已完成）：**C 标识符命名冲突处理**——
@@ -248,7 +248,7 @@ AS3 最核心的数据结构是数组，补齐数组即解锁大量真实程序�
 
 AS3 的类型安全数组 `Vector`，比 `Array` 更强（元素类型固定、越界检查）。
 
-- [x] **`Vector.<T>` 语法**：词法/语法支持 `Vector.<int>`、`Vector.<String>` 等泛型类型标注（含 `new Vector.<T>()` 构造）
+- [x] **`Vector.<T>` 语法**：词法/语法支持 `Vector.<int>`、`Vector.<String>` 等泛型类型标注（含 `new Vector.<T>()` 构造；另支持省略括号的 `new Vector.<T>` 无参构造，AS3 允许省去空 `()`）
 - [x] **类型安全数组**：`v.push / v.pop / v.length / v[i]` 读写；C 侧按元素类型 `T` 平铺存储（非装箱），比 `Array` 更高效
 - [x] **越界检查**：索引越界 `throw new RangeError(...)`
 
@@ -1929,6 +1929,233 @@ return-in-catch、return-in-finally 覆盖返回值，并紧随提前 return 后
 
 ---
 
+#### 阶段七十九：Stage3D 前置几何类（`Matrix3D` + `Vector3D`）（v0.3.90）✅ 已完成
+
+**依据**：[`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md) §6 阶段 A。`Matrix3D`/`Vector3D` 是纯逻辑类，
+与已实现的 `Matrix`/`Point` 同套路（`symbols.ts` 内建建模 + `runtime.ts` 助手），**不碰 GPU**，风险低、可独立验收。
+它们是 `Context3D` 隐式依赖（`setProgramConstantsFromMatrix` 传 `Matrix3D`、`Vector.<Number>` 传顶点常量）。
+
+- [x] **P0：`Vector3D`**——x/y/z/w 四分量，`add`/`subtract`/`scaleBy`/`negate`/`normalize`/`dotProduct`/`crossProduct`/
+      `distance`/`angleBetween`/`length`/`lengthSquared`/`clone`/`equals`/`toString` + 静态常量 `X_AXIS`/`Y_AXIS`/`Z_AXIS`
+- [x] **P1：`Matrix3D`**——4×4 列主序（column-major，与 `Matrix` 的行主序**不同**），`identity`/`append`/`prepend`/`invert`/
+      `transpose`/`transformVector`/`transformVectors`/`deltaTransformVector`/`pointAt`/`interpolate`/`recompose`/`decompose`/
+      静态 `interpolate`/`clone`/`copyFrom`/`identity`，平移/缩放/旋转（xyz 轴 + 任意轴）构造
+- [x] **P2：`Vector.<Number|uint|float>` 类型系统补全**——现有 `Vector.<T>` 已建模，确认三数值实例化的 GC 标量扫描正确（新增 `noteBuiltinVectorSpecs` 注册内建类方法签名引用的 `Vector.<Number>`/`Vector.<Vector3D>`，并把 vector typedef 提前到 vtable 之前发射）
+
+**语义红线（关键坑）**：
+- **列主序 vs 行主序**：`Matrix3D.rawData` 是列主序 16 元素 `Vector.<Number>`（`rawData[1]` 是第 1 列第 2 行），与
+  `Matrix` 的行主序相反；`transformVector` 用列向量 `M · v`，与 OpenGL/MSL 的 `float4x4` 内存布局需显式对齐
+- **`Matrix3D.invert()` 语义**：原位修改 `this`（与 `Matrix.invert()` 一致），但额外返回 `Boolean` 表示是否可逆（行列式非零）；不可逆时保持原矩阵不变并返回 `false`
+
+**验收**：新增 `examples/stage79.as`（断言矩阵乘法/求逆/变换向量与 mxmlc 对照、`decompose`/`recompose` 往返一致）；
+回归 `examples/` 全量无破坏；版本号 v0.3.89 → v0.3.90。
+
+---
+
+#### 阶段八十：AGAL 字节码内核（解析器 + 校验器 + MSL/GLSL 翻译器，AGAL1/2/3）（v0.3.91）✅ 已完成
+
+**依据**：[`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md) §3/§6 阶段 B。**这是整块里最硬、唯一真正难的一步**
+（约占 40% 工作量），但它是**纯 C/C++ 胶水层里自包含的确定性翻译器**，不碰前端「AS3→C」主管线，符合 AGENTS.md §2.9
+「重活走链接/胶水」铁律。权威参照：Ruffle 的 AGAL→wgpu/WebGPU 实现 + 社区多个 AGAL→GLSL 开源实现。
+
+- [x] **P0：AGAL 字节码解析器（AGAL1/2/3）**——识别 magic `0xa0` + version（1/2/3）+ program type（vertex/fragment）+ shader type，
+      逐条解码 32-bit token（`opcode | dest | src1 | src2 | swizzle/mask`），≤200 指令/程序；寄存器模型按 version 分档
+      （`va`/`vc`/`vt`/`op`/`oc`/`v`/`fs` 等，具体上限见下方「AGAL version 分档」红线）
+- [x] **P1：AGAL 校验器**——把 `Program3D.upload` 的 40+ 条校验错误完整实现（寄存器越界、swizzle/mask 非法、
+      操作数类型不匹配、指令计数超限等），抛对应 `Error`
+- [x] **P2：AGAL → MSL（native）+ GLSL ES（web）翻译器**——28 条基础指令（`mov`/`add`/`sub`/`mul`/`div`/`rcp`/`min`/`max`/
+      `frc`/`sqt`/`rsq`/`pow`/`log`/`exp`/`nrm`/`sin`/`cos`/`dp3`/`dp4`/`crs`/`m33`/`m34`/`m44`/`abs`/`neg`/`sat`/`kil`/`tex`）
+      带 swizzle 与 write-mask；AGAL2 控制流（`ife`/`ine`/`ifg`/`ifl`/`els`/`eif` → MSL/GLSL `if/else`）+ 导数
+      （`ddx`/`ddy` → `dfdx`/`dfdy`）+ MRT（`oc0-3` → `[[color(i)]]`）；AGAL3 `iid` → `[[instance_id]]`、`vs` → 顶点纹理采样；
+      寄存器映射 `float4`、`tex` 映射 `texture2d.sample()`（MSL）/`texture()`（GLSL）
+
+**语义红线（关键坑）**：
+- **AGAL version 分档（1/2/3）**：解析器读 magic 后的 `version` 字段并按代分档寄存器上限——`va`：v1/v2=7、v3=15；
+  `vc`：v1=127、v2/v3=249；`vt`：v1=7、v2/v3=25；`v`（varying）：v1=7、v2/v3=9；`fc`：v1=27、v2=63、v3=199；
+  `ft`：v1=7、v2/v3=25；`fo`：v1=0（仅 `oc`）、v2/v3=3（MRT `oc0-3`）；`fd`（`od` 深度输出）：v1 无、v2/v3 有；
+  `iid`（实例化）与 `vs`（顶点纹理采样）：仅 v3
+- **swizzle 与 write-mask 是两套正交机制**：src 的 swizzle（`.xyzw` 重排）与 dest 的 write-mask（`.xyzw` 选择写入通道）
+  要分别映射，MSL 无 swizzle 语法，需展开为显式分量访问
+- **寄存器约束**：`vc` 用 `setProgramConstantsFrom*` 上传、`fs` 用 `setTextureAt` 绑定，翻译器须生成正确的
+  uniform/texture 声明序；vertex 输出 `op`（position）与 fragment 输入 `v`（varying）语义成对
+
+**验收**：新增 `examples/stage80.as`（内嵌一段按官方 `AGALMiniAssembler.as` 编码的 vertex+fragment 字节码，断言翻译出的
+MSL/GLSL 含预期指令与 swizzle/mask 展开，校验器对非法指令抛错）；回归 `examples/` 全量（82 passed）；版本号 v0.3.90 → v0.3.91。
+
+**落地说明**：P1 校验器本阶段落地的是**基础校验子集**（magic/version/program-marker/opcode 合法性/截断/指令数上限/空程序），
+翻译器失败统一返回 NULL 并设 `as_agal_errmsg`（`AGALTranslator.translate` 桥接抛 `Error`）；`Program3D.upload` 的 40+ 条完整
+校验（寄存器越界、swizzle/mask 非法、操作数类型不匹配、AGAL2 控制流平衡等）在阶段八十一 `Program3D` 落地时复用本翻译器一并补齐。
+翻译器暴露为内建类 `AGALTranslator`（纯静态桥，非 AS3 运行时 API），`translate(bytes:ByteArray, target:String):String`，`target`
+为 `"msl"`（默认）或 `"glsl"`。
+
+**关键坑（对官方规范的纠偏）**：AGAL 寄存器 type 是 **shader 相对编码**，不是全局唯一——`va=0`、`vc=1`、`vt=2`、`op/vo=3`、
+`varying(vi/i/v)=4`、`fs=5`、`od/fd=6`、`iid=7`，且 fragment 复用同一套码（`fc=1`、`ft=2`、`oc/fo=3`、`vs=5`），翻译器须结合
+`isFragment` 分派而非按 type 硬编码寄存器名。dest token 是 `[num:16][mask:8][type:8]`（type 占 8 位、位 24-31，非 4 位），
+source token 是 `[num:16][offset:8][swizzle:8][type:8][reltype:8][relsel+indirect:16]`（type 占 8 位，在 s1hi 低 8 位）；
+sampler token（`tex`/`tld` 的 src2）是 `[num:16][lod:8][0:8][samplerbits:32]`（samplerbits 低 8 位=5，各字段 shift：type=8/
+dim=12/special=16/repeat=20/mipmap=24/filter=28）。opcode 表补齐 `sgn=0x2b`、`tld=0x2e`（`ted=0x26` 在 AGAL2 不可用）。
+权威源已内嵌为 `examples/shmup-stage3d/src/com/adobe/utils/AGALMiniAssembler.as`。
+
+---
+
+#### 阶段八十一：`Stage3D` + `Context3D` 骨架（状态机 + 资源类 + `drawTriangles`）（v0.3.92）
+
+**依据**：[`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md) §4/§6 阶段 C。`Context3D` 是纯状态机（C 结构即可），
+不涉及像素，可与阶段八十翻译器解耦。前端零改动——`Stage3D`/`Context3D` 全是普通内建类，走 `symbols.ts` 建模。
+
+- [x] **P0：`Stage3D` + `Context3D` 状态机**——`Stage.stage3Ds` 返回实例、`requestContext3D`/`context3D`/`x`/`y`/`visible`
+      发 `context3DCreate` 事件；`Context3D` 约 30 个方法：`configureBackBuffer`/`clear`/`present`/`drawTriangles`/
+      `setVertexBufferAt`/`setProgram`/`setTextureAt`/`setBlendFactors`/`setDepthTest`/`setCulling`/`setStencilActions`/
+      `setRenderToTexture`/`setScissorRectangle`/`setProgramConstantsFrom*`/`setColorMask`/`drawToBitmapData` 等；
+      `enableErrorChecking=false` 走异步路径（首期只做异步）
+- [x] **P1：资源类**——`VertexBuffer3D`/`IndexBuffer3D`/`Program3D`（`upload(AGAL字节码)`）/`Texture`（BGRA/RGBA）/
+      `TextureBase`，用 `ByteArray` 小端读
+- [x] **P2：15 个常量类**——`BlendFactor`/`BufferUsage`/`ClearMask`/`CompareMode`/`FillMode`/`MipFilter`/`Profile`/
+      `ProgramType`/`RenderMode`/`StencilAction`/`TextureFilter`/`TextureFormat`/`TriangleFace`/`VertexBufferFormat`/`WrapMode`
+
+**语义红线（关键坑）**：
+- **`Profile` 首期收敛 `BASELINE`**（AGAL1 + 非压缩 2D/cube 纹理 + 无实例化/MRT），`BASELINE_EXTENDED`/`STANDARD` 返回
+  支持但功能按 baseline 落地，覆盖 Stage3D 最大真实消费者 Starling
+- **`VideoTexture`/压缩纹理明确排除**（返回 null / 只支持无压缩回退），`driverInfo`/`totalGPUMemory` 语义近似即可
+- **`drawTriangles` 首期只铺 3 顶点非索引路径**，索引/实例化后续
+
+**验收**：新增 `examples/stage81.as`（走 `requestContext3D`→`configureBackBuffer`→`setProgram`→上传缓冲→`drawTriangles`
+状态机全链路，断言各状态字段与常量类枚举值正确）；回归全量；版本号 v0.3.91 → v0.3.92。
+
+**落地说明**：P0/P1/P2 全落地。`Context3D` 是纯 CPU 状态机（blend/depth/cull + 绑定资源 + 顶点/纹理流 + vertex/fragment
+常量，`setProgramConstantsFromMatrix` 按 AS3 语义落地：transposed=false 时列主序转置为行主序上传、true 时原样拷贝），
+`clear`/`present`/`drawTriangles` 首期仅记录状态（真正 GPU 上屏在阶段八十二）；`Stage3D` 懒创建 `Context3D` 并同步派发
+`context3DCreate`。15 个常量类用 `constClass` 落地（string 值对照 AIR）。资源类 `VertexBuffer3D`/`IndexBuffer3D`/`Program3D`/
+`Texture`/`TextureBase` 仅持 CPU 拷贝（`uploadFromVector`/`upload` 记录源缓冲，GPU buffer 对象在阶段八十二）；`Program3D.upload`
+首期仅记录字节码、未做 AGAL 校验（阶段八十遗留的 40+ 条完整校验在阶段八十二 `drawTriangles` 复用翻译器时补齐）。
+
+---
+
+#### 阶段八十二：Metal 端到端三角形（裸 MTLBuffer/渲染通道/MSL 上屏）（v0.3.93）✅ 已完成
+
+**依据**：[`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md) §5/§6 阶段 D。复用阶段七十五已落地的 `metal_glue.mm`
+（同一 `MTLDevice`/`MTLCommandQueue`），新增**裸** Metal 命令缓冲路径（不经 Skia Ganesh）：`MTLBuffer` 顶点/索引、
+`MTLTexture`、`MTLLibrary`（`newLibraryWithSource` 编译阶段八十的 MSL）、`MTLRenderPipelineDescriptor`、`MTLDepthStencilState`、
+`MTLRenderPassDescriptor`（render-to-texture）。
+
+- [x] **P0：`stage3d_glue.mm` 裸管线**——独立于 `metal_glue.mm`（Skia Ganesh）的自包含离屏桥（`vendor/stage3d_glue.mm`）：
+      `MTLBuffer`（顶点/索引/常量）/`MTLTexture`（2D，BGRA8Unorm）/`MTLLibrary`（MSL 编译）/`MTLRenderPipelineDescriptor`/
+      `MTLRenderPassDescriptor`（离屏 render-to-texture），`extern "C"` 平坦接口 `s3d_create/resize/destroy/upload_vertex/`
+      `upload_index/upload_constants/upload_texture/compile/clear/set_blend/draw/readback/width/height`
+- [x] **P1：`drawTriangles` 走 `drawIndexedPrimitives`**——`drawTriangles` 作为唯一 GPU 同步点，延迟上传所有绑定资源
+      （vertex streams 8..15 绑 `MTLBuffer`、索引、vc/fc 常量、纹理），按 `Program3D` 指针缓存编译 MSL pipeline（不每帧重编），
+      经 `drawIndexedPrimitives`（索引）或 `drawPrimitives`（非索引）提交；`clear` 写清屏色、`setBlendFactors` 控制混合
+- [x] **P2（延后）：与 2D 表面合成**——离屏优先、可测试为核心；把离屏目标与 Skia 2D 表面合成到同一 CAMetalLayer drawable 留后续
+
+**语义红线（关键坑）**：
+- **Ganesh 与裸 Metal 在同一 `MTLDevice` 上共存**：Skia 2D 用 Ganesh 抽象，Stage3D 三角形直接 `MTLBuffer` + 描述符，
+  二者经同一 `MTLCommandQueue` 提交、共享同一 drawable 上屏，**不可**各自建独立 device/queue
+- **顶点布局**：`setVertexBufferAt(i, buffer, offset, format)` 的 format（FLOAT_1/2/3/4）映射 MSL 的
+  `[[attribute(i)]]` + `MTLVertexDescriptor`；**buffer index 0 保留给顶点常量 vc**，vertex streams 绑 8..15（`S3D_STREAM_BASE=8`）防冲突
+- **ARGB↔BGRA**：`BitmapData.pixels` 是 ARGB（0xAARRGGBB），Metal 目标纹理 BGRA8Unorm，上传/读回都要转换
+- **MSL varying 必须走 `[[stage_in]]` 结构体**：fragment 的 varying 输入不能写成裸 `[[user(locn)]]` 参数（Metal 静默当 0，
+  导致读回全黑），必须 `struct FSIn { float4 v0 [[user(locn0)]]; }` + `FSIn in [[stage_in]]`
+
+**验收**：新增 `examples/stage82.as`（彩色三角形，`requestContext3D` + `drawTriangles` + `present`，纯 C 断言状态机 + MSL 翻译、
+Metal 模式断言中心像素红色）+ `examples/stage82.build.json`（链接 `stage3d_glue.mm` + `ASC_RENDER_STAGE3D` + Metal/Foundation）；
+回归全量（84 passed）；版本号 v0.3.92 → v0.3.93。
+
+---
+
+#### 阶段八十三：Stage3D 对齐加固（`drawToBitmapData`/render-to-texture/AGAL2/3）（v0.3.94）✅ 已完成
+
+**依据**：[`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md) §6 阶段 E。baseline 跑通后补齐高频进阶能力。
+
+- [x] **P0：`drawToBitmapData` + `setRenderToTexture`**——离屏渲染目标（`MTLRenderPassDescriptor` 绑 MTLTexture）读回像素；`drawToBitmapData` 改为读当前渲染目标（render override 优先，否则回退 back buffer）
+- [x] **P1：CubeTexture/RectangleTexture**——六面体/矩形纹理类型补全（CPU 描述符：CubeTexture 六面 BitmapData + RectangleTexture 单 BitmapData；`Context3DCubeMapFace` 为 int 常量类）
+- [x] **P2：AGAL3 实例化**——`drawTrianglesInstanced` 走共享 `Context3D_submit`（唯一 GPU 同步点），`s3d_set_instance_count` → `drawPrimitives(instanceCount:)`；`setProgramConstantsFromVector` 上传 `Vector.<Number>` 到 vc/fc
+
+**语义红线（关键坑）**：
+- `setRenderToTexture` 的纹理不得同时作为采样输入（`MTLTextureUsage` 需 RenderTarget|ShaderRead）——`s3d_create_render_texture` 已声明双 usage
+- 渲染目标纹理句柄在 MRC（非 ARC）下用 `[tex retain]`/`[tex release]` 管理（`s3d_create_render_texture`/`s3d_destroy_texture`）
+- AGAL3 `iid` → `[[instance_id]]` 与 MRT 多输出仍留待后续（demo 未用实例化/多输出）
+
+**验收**：新增 `examples/stage83.as`（CubeTexture/RectangleTexture 字段断言 + render-to-texture 读回像素断言 + `drawTrianglesInstanced` 2 实例 + `setProgramConstantsFromVector`）；纯 C（state machine）与 Metal 双模式通过；回归全量 85 passed；版本号 v0.3.93 → v0.3.94。
+
+---
+
+#### 阶段八十四：`shmup-stage3d` 集成验收（真实 Stage3D demo 跑通）（v0.3.95）✅ 已完成
+
+**依据**：把阶段七十九~八十三的 Stage3D 能力用真实端到端 demo `examples/shmup-stage3d/`（Starling 风格
+`LiteSpriteBatch` + 官方 `AGALMiniAssembler`）整体编译/链接/运行验收，逐项排除编译与运行期 blocker。
+
+- [x] **函数作用域 `var` 提升（hoist）**——方法体内 typed 局部变量统一提升到函数顶部声明（`functionScope` +
+      `hoistedLocals` + `hoistFunctionLocals`/`collectHoistedVars`），修复“跨块使用后定义”的 `undefined variable 'k'`；
+      无类型 `var x = expr` 保持块级（避免需纯表达式类型推导）
+- [x] **`static const` 运行时初始化器**——`static const d = new Dictionary()` / RegExp 字面量等非常量初值改为
+      可写静态 + `staticFieldInits` 在 `main()` 入口按类序执行（`isConstExpr` 仅 `Num/Str/Bool/Null` 为真），
+      `emitGCRoots`/`emitModuleVars`/`emitTopLevel` 同步只跳过字面量 const
+- [x] **`Rectangle` getter/setter 作 lvalue**——`destRect.left = 0` 等 setter 赋值生成 `gesetter`/`rs` 定义，
+      `left/top/right/bottom` 四个 setter C body 补齐
+- [x] **`TextField` 子类结构体布局**——`_para`/`_para_text` 等 C 运行时缓存字段改为按字段循环触发
+      （`isSubclassOf(name,'TextField')`），否则 `class GameGUI extends TextField` 的 struct 缺字段导致偏移错位、
+      运行时读指针崩溃（`sk_textlayout_delete` 读到标题字符串指针）
+- [x] **RegExp 控制字符转义**——`as_re_bits_add_esc`/`as_re_comp_escape` 补 `\n \r \t \f \v \0` 映射为控制字节
+      （原实现落到 `default` 当字面字母），修复 `AGALMiniAssembler` 里 `replace(/[\f\n\r\v]+/g,"\n")`/`split`
+      把 shader 里的 `v`（如 `va0`/`vc0`）误替换、逐行 `match(/^\w{3}/)` 全判 `bad line` 导致 AGAL 装配失败
+- [x] **Matrix3D append/prepend 语义**——对照 mxmlc 实测 + AIR reference 定案：`append(lhs)=lhs*this`（前置相乘）、
+      `prepend(rhs)=this*rhs`（后置相乘）；`stage79.as` 原断言按 post-multiply 写反，已改为 Scale→Rotation→Translation
+      构造 `T*R*S` 再 decompose，并新增不可交换（旋转+平移）的 append/prepend 顺序断言锁死方向
+- [x] **`setProgramConstantsFromMatrix` 转置语义**——交换为 `transposedMatrix=true` 转置（vc0=数学行 row0）、`false`
+      原样拷贝（vc0=列 col0），经 vc dump（row0/row1）+ demo 全屏精灵渲染实证正确（修正阶段八十一反着的描述）
+- [x] **AGAL→MSL `dp3`/`dp4` 部分 write-mask**——`dp3/dp4` 遇 `.xy` 等部分 write-mask 时按通道逐个展开而非整体赋值，
+      否则 `vt0.xy` 的 z/w 被误写；AGALMiniAssembler 每条指令固定 24 字节（192 bit）槽位，stage80/82 手写字节码补零填充
+- [x] **Metal blend 状态属 pipeline**——blend factors 须在 `s3d_compile` 前传入；MSL fragment 的 varying 输入不能写裸
+      `[[user(locn)]]` 参数（Metal 静默当 0 读回全黑），必须 `struct FSIn{float4 v0[[user(locn0)]]}+FSIn in[[stage_in]]`
+- [x] **Dictionary for-in 类型化循环变量 unbox**——`for (tgt:Object in dict)` 原生成 `tgt = dict->keys[i]`（as_value 赋
+      Object* 编译错），已按声明类型 `unboxAny`；air-native 示例重新编译通过
+- [x] **复合成赋值丢旧值**——`obj.prop += v`（getter/setter）与 `Class.field += v`（静态字段）原只发 setter/直接赋值丢旧值，
+      已改为读 getter/旧值再合并（`set(obj, get(obj) OP v)`），配 `examples/compound.as` 回归
+
+**验收**：`as-aot --air-app examples/shmup-stage3d/shmup-stage3d-app.xml` 一条命令编链出 `shmup-stage3d` 可执行并运行
+（Stage3D 上下文创建 → sprite 引擎 → 加载器 → 帧循环），**精灵正确上屏**（截图确认灰金属飞船/橙残骸/金箭头/蓝绿物件全屏散布 +
+HUD `457 created 1720 reused FPS 80`，且 `sprite.rotation += 0.1` 复合成赋值修复后实体旋转生效）；隔离正则回归逐行正确；
+回归全量 86 passed；版本号 v0.3.94 → v0.3.95。
+
+---
+
+#### 阶段八十五：Stage3D/Skia 帧循环内存泄漏修复（MRR 裸 Metal + 离屏合成纹理复用）（v0.3.96）✅ 已完成
+
+**依据**：`shmup-stage3d` 实测 7.62 GB 严重泄漏（RSS 线性爬到 7.62 GB）+ `air-native` 缓慢泄漏。逐项定位后归纳为两类根因：
+
+1. **MRC 裸 Metal 路径从不 release 覆盖旧指针**——`stage3d_glue.mm` 以 `clang++ -std=c++17` 无 `-fobjc-arc` 编译，
+   `newBufferWithBytes`/`newTextureWithDescriptor` 等 `new*` 方法返回 +1 owned，但每帧 `s3d_upload_vertex`/`index`/`constants`
+   覆盖旧指针从不 release；纹理因 `Texture->gpu` 恒为 NULL 每帧重上传（~256KB×80fps）；`s3d_resize`/`s3d_compile` 临时对象不 release。
+   修复：覆盖前 release 旧对象，`s3d_compile` 成功后 release `pd/vfn/ffn/vlib/flib`，`s3d_destroy` 释放 context 拥有对象
+   （device/queue/target/pso/buffers，**不**释放借用的 textures/renderOverride 以免 double-free）。
+2. **autoreleased Metal 对象在无池主循环累积**——`commandBuffer`/`renderPassDescriptor`/`renderCommandEncoder`/`nextDrawable`
+   为 autoreleased(+0)，C++ SDL 主循环无 autorelease pool。修复：`s3d_draw`/`s3d_readback`/`s3d_readback_render`/`sk_mtl_begin_frame`
+   包裹 `@autoreleasepool`；`sk_mtl_flush` 整函数包裹（含 `flushAndSubmit`，其 Ganesh Metal 后端同样造 autoreleased 对象）。
+3. **`Texture->gpu` 所有权模型**：`s3d_upload_texture` 返回值从 `int` 改为 `void*` 句柄，emit.ts `Context3D_submit` 缓存
+   `o->tex{i}->gpu = as_s3d_upload_texture(...)`，后续帧绑定而非重上传；`Texture_uploadFromBitmapData`（miplevel 0）先销毁旧 GPU
+   句柄再更新 bitmapData。`c->textures[unit]`/`c->renderOverride` 为借用引用。
+4. **残留泄漏根因 = `sk_canvas_draw_bgra` 每帧 `RasterFromPixmapCopy` + `drawImageRect`**：离屏 render target 读回后合成上屏，
+   每帧复制 2000×1200×4 并铸造新 GPU 纹理 + blit command buffer + blit context，驱动内部对象（`AGXG14XFamilyCommandBuffer`/
+   `BlitContext` 各 1/frame）不受应用层 `@autoreleasepool` 控制，线性 ~165KB/s。**正确修复 = GPU→GPU 直接合成**：新增
+   `s3d_get_render_target` 暴露离屏 MTLTexture，`metal_glue.mm` 新增 `sk_mtl_draw_texture`（`SkImages::BorrowTextureFrom`
+   包装现成 GPU 纹理 + `drawImageRect`），`Context3D_present` 在 Metal 路径直接暴露纹理句柄（不再 CPU 读回），合成阶段直接
+   blit 该纹理——**彻底取消 CPU 读回 + CPU→GPU 重上传往返**，故无每帧纹理铸造、无 blit 驱动对象。
+   ⚠️ 曾尝试「缓存单一 `SkBitmap` + `notifyPixelsChanged()`」但**该法有致命缺陷**：`SkImages::RasterFromBitmap` 对可变 bitmap
+   走 `kIfMutable_SkCopyPixelsMode` **复制**像素，缓存 image 冻结首帧像素、`notifyPixelsChanged()` 只作用于原 bitmap 不传播到
+   副本，导致 demo 实体全部消失（黑屏只剩 HUD）——这是「内存平缓」的假象（因不再每帧上传）。已回退 `sk_canvas_draw_bgra`
+   为 `RasterFromPixmapCopy`（仅 CPU raster 合成路径用，无 GPU 上传无泄漏），Metal 路径改走 GPU→GPU。
+
+**语义红线（关键坑）**：
+- Metal `new*` 方法返回 +1（owned），`commandBuffer`/`renderPassDescriptor`/`renderCommandEncoder`/`nextDrawable` 为 autoreleased(+0)——MRC 下必须显式平衡；`@autoreleasepool` 必须覆盖整帧（含 Skia `flushAndSubmit`）。
+- **驱动内部对象（`AGXG14XFamilyCommandBuffer`/`Agx BlitContext`）不受应用层 `@autoreleasepool` 控制**，只能从源头避免每帧铸造新 GPU 资源。
+- **`SkImages::RasterFromBitmap` 对可变 bitmap 会复制像素**（`kIfMutable_SkCopyPixelsMode`）：缓存它 + `notifyPixelsChanged()` 无法重上传副本，会冻结首帧内容；要每帧更新 GPU 纹理须用 `BorrowTextureFrom` 包装现成 MTLTexture 直供合成。
+- 直测 RSS 须用真实二进制进程（`pgrep -f '^\./xxx$'`），`$!` 会误捕 bash wrapper PID。
+
+**验收**：`shmup-stage3d` RSS 从 7.62 GB 降回基线 ~112-117MB 且稳定（不再线性爬升）；`air-native` RSS 稳定 ~113MB；
+回归全量 86 passed；版本号 v0.3.95 → v0.3.96。
+
+---
+
 ### 遗留待开发
 
 | 遗留项 | 说明 | 建议 |
@@ -1936,7 +2163,7 @@ return-in-catch、return-in-finally 覆盖返回值，并紧随提前 return 后
 | 字符串 arena 泄漏 | ✅ 已解决（GC-2）：字符串拼接/转换/`split`/`substring` 已迁入 `gc_alloc(GCT_STRING, ...)`，`gc_strings.as` 验证回收归零 | 仅剩字节缓冲（`ByteArray` grow/compress/uncompress、`BitmapData.pixels`）待迁（见 [`docs/zh-cn/gc.md`](docs/zh-cn/gc.md)）；`as_vector`/闭包 env 已于 v0.3.69 迁入 GC（阶段六十六） |
 | WASI 运行时验证（GC-3） | ✅ 已完成：native + wasm32-wasip1 双目标回归通过（WASI SDK 34.0 + wasmtime 48.0.2），`reclaimed most`/`bounded`/`intact` 断言全过 | GC 核心纯 C 可移植，平台耦合已用 `#ifdef __wasi__` 隔离（见 [`compile.md`](docs/zh-cn/compile.md) §3.3） |
 | SWC 资源提取 | 已调研（[`docs/zh-cn/swc.md`](docs/zh-cn/swc.md)，基于 `temp/skin.swc` 解包实测）：SWC 资源嵌于 `library.swf`（CWS）的 SWF tag（`DefineBitsLossless2`/`DefineBitsJPEG2` + `SymbolClass` → `BitmapData` 子类），提取链路 = ZIP 解包 → CWS 解压 → tag 扫描 → 像素/JPEG 字节 | **暂缓，后续用户决定再实现**（草案：阶段六十六~六十八 = `src/swc.ts` 提取器 → 资源类注册 + 像素嵌入 → CLI/清单接入） |
-| display3D（Stage3D） | 已调研（[`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)）：可实现且非架构推翻，复用 `metal_glue.mm` 新增裸 `MTLBuffer`/渲染通道/MSL；核心难点是 AGAL 字节码 → MSL/GLSL 翻译（有 Ruffle/开源 AGAL→GLSL 参照） | **暂缓，后续用户决定再实现**（草案：`Matrix3D`/`Vector3D` 前置 → AGAL 内核 → `Context3D` 骨架 → Metal 端到端三角形 → AGAL2/3 加固，详见 display3d.md §6） |
+| display3D（Stage3D） | 已调研（[`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)）：可实现且非架构推翻，复用 `metal_glue.mm` 新增裸 `MTLBuffer`/渲染通道/MSL；核心难点是 AGAL 字节码 → MSL/GLSL 翻译（有 Ruffle/开源 AGAL→GLSL 参照） | **已立项**：阶段七十九~八十三（`Matrix3D`/`Vector3D` 前置 → AGAL(1/2/3) 内核 → `Context3D` 骨架 → Metal 端到端三角形 → AGAL2/3 GPU 上屏加固，详见 display3d.md §6） |
 
 ---
 
@@ -1951,7 +2178,7 @@ return-in-catch、return-in-finally 覆盖返回值，并紧随提前 return 后
 - 阶段二十四~二十七依据 AIR SDK [`RegExp`](https://airsdk.dev/reference/actionscript/3.0/RegExp.html) 官方参考规划：攻关正则引擎。最终方案为**内嵌自研 ES3 回溯正则 VM**（`RUNTIME_PREAMBLE` 内纯 C 零依赖）——AS3 正则本质是 ECMAScript 正则（ES3 语法），回溯 VM 语义匹配度最高，支持 `i/m/s/g/x` 五 flag、捕获/非捕获组、反向引用、前瞻、惰性/贪婪量词、字符类与转义；`\w \d \s` 内嵌 ASCII 表（正好是 ES3 语义），`g` 由 `exec`/`test` 适配层状态机处理，`x`（extended）flag 由 `as_re_x_strip` 前端预处理剥离空白与 `#` 注释。正则引擎直接内嵌于生成的 `.c` 前导（不引入 QuickJS libregexp——其 ES2020+ 语义与 ES3 正则存在漂移，自研回溯 VM 才能精确匹配 ES3 语义）。`isXMLName` 仍有意延后（需 XML/E4X 支持，非正则范畴）。
 - 阶段三十三~三十五依据对 [Ruffle](https://github.com/ruffle-rs/ruffle) 事件/显示列表源码的评估规划：攻关 GUI 与事件系统。Ruffle **不可移植、不可链接**（Rust + `gc_arena` GC + `Gc<'gc>`，C 无对应物），但作为**语义权威参照**价值极高。语义对照与「事件流 → C 运行时助手」映射草案见 [`docs/zh-cn/as3-docs/mapping.md`](docs/zh-cn/as3-docs/mapping.md)，上游源码快照（`events.rs` / `interactive.rs` / `avm2_events.rs` / `event_object.rs` / `event.rs` / `event_dispatcher.rs`）存于同目录 `as3-docs/`。渲染仍按阶段二十九走 skia/cairo 链接（「前端不重复造轮子」铁律），Ruffle 补齐的是「事件流/命中测试/焦点」的**语义**那一半，不贡献像素。
 - 阶段三十六~三十八依据 [`docs/zh-cn/skia.md`](docs/zh-cn/skia.md) 的渲染后端专项调研规划：攻关 `flash.display.*` 的真实光栅化。Skia 定位为**纯光栅化后端**（管「画」），与事件/视图系统（管「谁在上面、谁先响应」）**正交**，二者经 `DisplayObject.render()` 汇聚。关键结论：Skia 是 C++20 库、**无 C API**，需 C++ 胶水层（`skia_glue.cc`）桥接生成的 `.c`；首期用离屏 CPU raster（输出 PNG）跑通最小闭环，再逐步落地 `Shape`/`Bitmap`/`TextField`（SkParagraph）。
-- `flash.display3D.*`（Stage3D）的对齐另做专项调研，见 [`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)：结论是**可实现且非架构推翻**（对现有 GPU 基础设施的有边界扩展），核心难点是 AGAL 字节码 → MSL/GLSL 翻译（Ruffle/开源 AGAL→GLSL 作参照）；`VideoTexture`/压缩纹理明确排除，首期收敛 baseline profile（AGAL1 + 非压缩纹理）以覆盖 Starling。**暂缓，待用户决定是否投入**。
+- `flash.display3D.*`（Stage3D）的对齐另做专项调研，见 [`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md)：结论是**可实现且非架构推翻**（对现有 GPU 基础设施的有边界扩展），核心难点是 AGAL 字节码 → MSL/GLSL 翻译（Ruffle/开源 AGAL→GLSL 作参照）；`VideoTexture`/压缩纹理明确排除，首期收敛 baseline profile（AGAL1 + 非压缩纹理）以覆盖 Starling。**已立项为阶段七十九~八十三**（v0.3.90 → v0.3.94，详见上方路线图）。
 - 阶段三十九依据 [`docs/zh-cn/compile.md`](docs/zh-cn/compile.md) §6（窗口化 SDL2 后端）与 [`docs/zh-cn/skia.md`](docs/zh-cn/skia.md) §6.3 落地：把离屏 CPU raster 升级为真实原生窗口。窗口/输入交给 SDL2（arm64 静态库，`vendor/sdl2/arm64/libSDL2.a`），Skia 负责像素，`vendor/window_glue.cc` 负责窗口 + 事件循环 + 上屏；`Stage.showWindow` 经 `ASC_USE_WINDOW` 条件编译，未定义时 no-op（纯 C 构建不受影响）。
 - 阶段四十把 SDL2 鼠标输入桥接回 AS3 事件系统：`window_glue.cc` 用函数指针回调（`on_mouse`/`on_redraw`）解耦（胶水层不知道生成的 C 函数名），`emit.ts` 发射 `ASC_window_on_mouse`（→ `Stage_dispatchMouse` 命中测试 + 冒泡）与 `ASC_window_on_redraw`（重新光栅化 + 上屏）。同步修复 `as_pick_hit` 对纯 `DisplayObject`（`Shape`/`Bitmap`）的越界读（改用 `as_is` 类型判定）。
 - 阶段四十三~四十四是「对齐 adl」的连续小阶段，依据 adl 实测行为与 [AIR Stage 参考](https://airsdk.dev/reference/actionscript/3.0/flash/display/Stage.html) / [TextField 参考](https://airsdk.dev/reference/actionscript/3.0/flash/text/TextField.html)：四十三补 `<resizable>` 与 stage 尺寸时序；四十四补 `<requestedDisplayResolution>` 的 Retina 渲染（`SDL_WINDOW_ALLOW_HIGHDPI` + `SDL_GL_GetDrawableSize` probe，surface 按物理像素创建）。TextField 多行排版（`numLines`/`maxScrollV` 视口数学、`wordWrap` 按空格贪心断行、`clip` 裁剪）已归入阶段三十八；排版层刻意只记录 `(start,len)` 偏移而不复制字符串——AS3 字符串由 `as_alloc` bump allocator 分配，逐行复制后 `free()` 会命中非 malloc 指针。

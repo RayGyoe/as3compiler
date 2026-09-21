@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+  <id>demo.as3.shmup</id>
+  <versionNumber>1.0</versionNumber>
+  <filename>shmup-stage3d</filename>
+  <initialWindow>
+    <content>main.swf</content>
+    <title>Stage3D Shmup Demo</title>
+    <visible>true</visible>
+    <width>1000</width>
+    <height>600</height>
+    <resizable>true</resizable>
+    <!-- Stage3D requires the direct render mode in AIR. -->
+    <renderMode>direct</renderMode>
+    <requestedDisplayResolution>high</requestedDisplayResolution>
+  </initialWindow>
+</application>
