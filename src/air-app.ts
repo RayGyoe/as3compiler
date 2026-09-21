@@ -57,6 +57,30 @@ const GREEN_SOCK_CORE = [
   'com/greensock/easing/Quad.as',
   'com/greensock/easing/Cubic.as',
 ];
+// Adobe's AGALMiniAssembler (com/adobe/utils) is the official AGAL1 assembler that
+// Stage3D demos drive to build their shader binaries. It sits in a reverse-DNS
+// third-party dir (skipped by the src walk) but is a hard dependency of those
+// demos, so it is re-added explicitly — same pattern as GREEN_SOCK_CORE.
+const ADOBE_UTILS_CORE = [
+  'com/adobe/utils/AGALMiniAssembler.as',
+];
+
+// Stage3D usage detector: the generated manifest must link stage3d_glue.mm +
+// define ASC_RENDER_STAGE3D (the offscreen Metal triangle pipeline), otherwise
+// Context3D falls back to a no-op software state machine and the demo renders
+// nothing but the 2D display list (the "white screen" symptom). Detect it by
+// scanning for the flash.display3D import, the unambiguous marker that a project
+// drives the programmable pipeline.
+function detectStage3D(asFiles: string[]): boolean {
+  for (const f of asFiles) {
+    try {
+      if (readFileSync(f, 'utf8').includes('flash.display3D')) return true;
+    } catch {
+      // unreadable file: skip
+    }
+  }
+  return false;
+}
 
 // Extract the text of a single element by name (no nested same-name elements in
 // the AIR descriptor subset we read).
@@ -168,7 +192,7 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
 // the wasm build of Skia, with no SDL2/objc/Cocoa — those are native-only and wasm-ld
 // cannot find them (`-lobjc`). The AIR <initialWindow> visible/resizable/highdpi
 // flags still shape defines, but the window-backend specifics differ per target.
-export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, fonts: EmbedFont[]): Record<string, unknown> {
+export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, fonts: EmbedFont[]): Record<string, unknown> {
   // Browser backend: skia_glue.cc + web_glue.cc, the wasm Skia library set, no
   // SDL2/Cocoa/frameworks. Mirrors examples/web/hello-web.build.json. The wasm
   // Skia build omits the native-only animation/image codecs (skottie/svg/...), so
@@ -248,6 +272,17 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
     linkLibs.push('SDL2', 'objc');
     frameworks.push('CoreVideo', 'Cocoa', 'Carbon', 'IOKit', 'Metal', 'QuartzCore');
   }
+  // Stage3D (flash.display3D): link the offscreen Metal triangle pipeline
+  // (stage3d_glue.mm) and define ASC_RENDER_STAGE3D so the as_s3d_* wrappers stop
+  // being no-ops. Without this the demo runs Context3D as a software state machine
+  // and never produces GPU pixels (the "white screen" symptom). Native-only — the
+  // web backend would need a WebGL pipeline that is not yet implemented.
+  if (usesStage3D) {
+    sources.push(`${vendorRel}/stage3d_glue.mm`);
+    defines.push('ASC_RENDER_STAGE3D=1');
+    if (!frameworks.includes('Metal')) frameworks.push('Metal');
+    if (!frameworks.includes('Foundation')) frameworks.push('Foundation');
+  }
   return {
     target: 'native',
     'c-compiler': 'clang',
@@ -299,6 +334,10 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
     const p = resolve(srcDir, rel);
     if (existsSync(p)) asFiles.push(p);
   }
+  for (const rel of ADOBE_UTILS_CORE) {
+    const p = resolve(srcDir, rel);
+    if (existsSync(p)) asFiles.push(p);
+  }
   if (asFiles.length === 0) {
     throw new AirAppError(`no .as sources found under ${srcDir}`);
   }
@@ -318,7 +357,8 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
 
   const vendorRel = relative(dir, vendorAbs).replace(/\\/g, '/');
   const manifestPath = resolve(dir, `${info.filename}.build.json`);
-  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, info.fonts), null, 2) + '\n');
+  const usesStage3D = !web && detectStage3D(asFiles);
+  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.fonts), null, 2) + '\n');
 
   return { info, mainClass, asFiles, manifestPath };
 }

@@ -5,7 +5,8 @@
   "sources": [
     "../../vendor/skia_glue.cc",
     "../../vendor/window_glue.cc",
-    "../../vendor/metal_glue.mm"
+    "../../vendor/metal_glue.mm",
+    "../../vendor/stage3d_glue.mm"
   ],
   "include-paths": [
     "../../vendor/skia",
@@ -55,13 +56,15 @@
     "Carbon",
     "IOKit",
     "Metal",
-    "QuartzCore"
+    "QuartzCore",
+    "Foundation"
   ],
   "defines": [
     "ASC_USE_SKIA=1",
     "ASC_USE_WINDOW=1",
     "ASC_DISPLAY_HIGH=1",
-    "ASC_RENDER_METAL=1"
+    "ASC_RENDER_METAL=1",
+    "ASC_RENDER_STAGE3D=1"
   ],
   "objects": []
 }

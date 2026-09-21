@@ -8,6 +8,22 @@ import type {
 
 const TYPE_KEYWORDS = new Set(['int', 'uint', 'Number', 'Boolean', 'String', 'void', 'Array', 'Function']);
 
+// Splice a file-top-level bare `{ ... }` block's body into the enclosing program
+// body so class/interface/function declarations it wraps become top-level
+// symbols. Recursive: a bare block may nest another bare block.
+function flattenTopLevelBlocks(body: Stmt[]): Stmt[] {
+  const out: Stmt[] = [];
+  for (const s of body) {
+    if (s.kind === 'Block') {
+      for (const inner of flattenTopLevelBlocks(s.body)) out.push(inner);
+    } else {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+
 const BIN_PREC: Record<string, number> = {
   '||': 1,
   '&&': 2,
@@ -83,6 +99,27 @@ class Parser {
     return this.next();
   }
 
+  // Whether a line terminator separates the previously consumed token from the
+  // current token. AS3 automatic semicolon insertion (ASI, ECMA-262 §7.9) uses
+  // this to decide whether a statement may omit its trailing `;`. The lexer only
+  // increments `line` on `\n` (which also covers `\r\n`), so comparing line
+  // numbers detects the common newline cases.
+  private hadLineTerminator(): boolean {
+    if (this.pos === 0) return false;
+    return this.peek().line > this.tokens[this.pos - 1].line;
+  }
+
+  // Consume a statement-terminating `;`, applying ASI: the `;` may be omitted when
+  // the next token is `}`, end-of-input, or separated from the previous token by a
+  // line terminator. Otherwise it is a syntax error.
+  private consumeSemicolon(): void {
+    if (this.at(';')) { this.next(); return; }
+    if (this.at('}')) return;               // `}` terminates the statement (rule 1)
+    if (this.peek().kind === 'eof') return; // end-of-input terminates (rule 2)
+    if (this.hadLineTerminator()) return;   // newline before offending token (rule 1)
+    throw new ParseError(`expected ';' but found '${this.peek().value}'`, this.peek());
+  }
+
   private parseType(): ASType {
     // `*` is AS3's untyped type, which this subset models as the dynamic `any`.
     if (this.at('*')) { this.next(); return 'any'; }
@@ -114,7 +151,13 @@ class Parser {
         body.push(this.parseStatement());
       }
     }
-    return { body, imports: this.imports };
+    // AS3 allows a bare `{ ... }` block at file top level to wrap helper class
+    // declarations (e.g. Adobe's AGALMiniAssembler.as). At module scope a bare
+    // block is a pure scope container with no runtime effect, so we splice its
+    // body into the top level — class/interface/function declarations then land
+    // directly in program.body where symbol collection and code emission expect
+    // them. Only top-level blocks are flattened (never those inside functions).
+    return { body: flattenTopLevelBlocks(body), imports: this.imports };
   }
 
   // `import a.b.C;` or `import a.b.*;` — record the imported qualified name for
@@ -133,12 +176,17 @@ class Parser {
 
   // `package a.b.c { ... }` — parse the qualified name, then parse the body with
   // that namespace attached to its declarations (for cross-file resolution).
+  // AS3 also allows an unnamed package (`package { ... }`), which is the default
+  // package; its name is the empty string.
   private parsePackage(body: Stmt[]): void {
     this.expect('package');
-    let pkg = this.expectIdent().value;
-    while (this.at('.')) {
-      this.next();
-      pkg += '.' + this.expectIdent().value;
+    let pkg = '';
+    if (!this.at('{')) {
+      pkg = this.expectIdent().value;
+      while (this.at('.')) {
+        this.next();
+        pkg += '.' + this.expectIdent().value;
+      }
     }
     this.expect('{');
     const saved = this.currentPackage;
@@ -146,6 +194,13 @@ class Parser {
     while (!this.at('}') && this.peek().kind !== 'eof') {
       if (this.atIdent('import')) {
         this.parseImport();
+      } else if (this.at('[')) {
+        // Flash metadata at package level ([SWF(...)], [Frame(...)], etc.). These
+        // configure the .swf (size/framerate/background) and have no runtime
+        // effect for the AOT translation, so they are parsed and discarded. At
+        // package level a leading '[' is always metadata (there is no array-literal
+        // statement here), so we consume it unconditionally instead of backtracking.
+        this.parseMetadataIfPresent(false);
       } else {
         body.push(this.parseStatement());
       }
@@ -223,7 +278,7 @@ class Parser {
 
     // fall through: expression statement
     const expr = this.parseExpression();
-    this.expect(';');
+    this.consumeSemicolon();
     return { kind: 'ExprStmt', expr };
   }
 
@@ -232,7 +287,7 @@ class Parser {
   // followed by a declaration keyword (e.g. an array literal expression
   // statement) restores the token position and returns [] so the caller parses it
   // as an expression instead.
-  private parseMetadataIfPresent(): Metadata[] {
+  private parseMetadataIfPresent(requireDecl = true): Metadata[] {
     const saved = this.pos;
     if (!this.at('[') || this.peek(1).kind !== 'ident') return [];
     const list: Metadata[] = [];
@@ -245,10 +300,24 @@ class Parser {
           this.next();
           if (!this.at(')')) {
             do {
+              // Flash metadata uses either positional args (`[WasmExport("x")]`) or
+              // named args (`[SWF(width = "1000")]`, `[Embed(source="a.png")]`).
+              // Both are collected as raw strings for later filtering; the `key =`
+              // prefix is dropped so the value is what gets recorded.
               const a = this.next();
-              if (a.kind === 'str' || a.kind === 'ident') args.push(a.value);
-              else throw new ParseError(`expected metadata argument but found '${a.value}'`, a);
-            } while (this.at(','));
+              if (a.kind === 'str' || a.kind === 'ident') {
+                if (this.at('=')) {
+                  this.next(); // '=' (drop the key)
+                  const v = this.next();
+                  if (v.kind === 'str' || v.kind === 'ident') args.push(v.value);
+                  else throw new ParseError(`expected metadata value but found '${v.value}'`, v);
+                } else {
+                  args.push(a.value);
+                }
+              } else {
+                throw new ParseError(`expected metadata argument but found '${a.value}'`, a);
+              }
+            } while (this.at(',') && (this.next(), true));
           }
           this.expect(')');
         }
@@ -256,7 +325,7 @@ class Parser {
         list.push({ name, args });
       }
       const nxt = this.peek();
-      if (!(nxt.kind === 'ident' && METADATA_DECL.has(nxt.value))) {
+      if (requireDecl && !(nxt.kind === 'ident' && METADATA_DECL.has(nxt.value))) {
         this.pos = saved;
         return [];
       }
@@ -309,7 +378,7 @@ class Parser {
       this.next();
       decls.push(this.parseVarDeclarator());
     }
-    this.expect(';');
+    this.consumeSemicolon();
     return decls.length === 1 ? { kind: 'VarDecl', ...decls[0] } : { kind: 'VarDecls', decls };
   }
 
@@ -323,7 +392,7 @@ class Parser {
     }
     this.expect('='); // const must have an initializer
     const init = this.parseExpression();
-    this.expect(';');
+    this.consumeSemicolon();
     return { kind: 'ConstDecl', name, type, init };
   }
 
@@ -357,7 +426,7 @@ class Parser {
     this.expect('(');
     const cond = this.parseExpression();
     this.expect(')');
-    this.expect(';');
+    this.consumeSemicolon();
     return { kind: 'DoWhile', cond, body };
   }
 
@@ -393,16 +462,19 @@ class Parser {
   private parseBreak(): Stmt {
     this.expect('break');
     let label: string | null = null;
-    if (!this.at(';')) label = this.expectIdent().value;
-    this.expect(';');
+    // Restricted production `break [no LineTerminator here] Identifier` — a label
+    // is only attached when it is on the same line as `break`.
+    if (!this.at(';') && !this.hadLineTerminator()) label = this.expectIdent().value;
+    this.consumeSemicolon();
     return { kind: 'Break', label };
   }
 
   private parseContinue(): Stmt {
     this.expect('continue');
     let label: string | null = null;
-    if (!this.at(';')) label = this.expectIdent().value;
-    this.expect(';');
+    // Restricted production `continue [no LineTerminator here] Identifier`.
+    if (!this.at(';') && !this.hadLineTerminator()) label = this.expectIdent().value;
+    this.consumeSemicolon();
     return { kind: 'Continue', label };
   }
 
@@ -476,15 +548,25 @@ class Parser {
   private parseReturn(): Stmt {
     this.expect('return');
     let value: Expr | null = null;
-    if (!this.at(';')) value = this.parseExpression();
-    this.expect(';');
+    // Restricted production `return [no LineTerminator here] Expression` — a value
+    // on the next line is a separate statement, not the return value.
+    if (!this.at(';') && !this.at('}') && this.peek().kind !== 'eof' && !this.hadLineTerminator()) {
+      value = this.parseExpression();
+    }
+    this.consumeSemicolon();
     return { kind: 'Return', value };
   }
 
   private parseThrow(): Stmt {
     this.expect('throw');
+    // Restricted production `throw [no LineTerminator here] Expression` — a line
+    // terminator after `throw` is a syntax error (there is no valid `throw;`
+    // form for ASI to fall back to).
+    if (this.hadLineTerminator()) {
+      throw new ParseError("a line terminator is not allowed after 'throw'", this.peek());
+    }
     const value = this.parseExpression();
-    this.expect(';');
+    this.consumeSemicolon();
     return { kind: 'Throw', value };
   }
 
@@ -522,14 +604,14 @@ class Parser {
     this.expect('super');
     if (this.at('(')) {
       const args = this.parseArgList();
-      this.expect(';');
+      this.consumeSemicolon();
       return { kind: 'SuperCall', args };
     }
     // super.method(...) used as an expression statement
     this.expect('.');
     const method = this.expectIdent().value;
     const args = this.parseArgList();
-    this.expect(';');
+    this.consumeSemicolon();
     return { kind: 'ExprStmt', expr: { kind: 'SuperMethod', method, args } };
   }
 
@@ -635,7 +717,7 @@ class Parser {
         if (this.at(':')) { this.next(); type = this.parseType(); }
         let init: Expr | null = null;
         if (this.at('=')) { this.next(); init = this.parseExpression(); }
-        this.expect(';');
+        this.consumeSemicolon();
         members.push({ kind: 'Field', name: fName, type, init, visibility, isStatic, isConst });
       } else if (this.atIdent('function')) {
         this.expect('function');
@@ -650,6 +732,11 @@ class Parser {
         const params = this.parseParams();
         // A method whose name matches the class name is the constructor (AS3 rule).
         if (mName === name && !isGetter && !isSetter) {
+          // A constructor may carry an explicit `:void` return type annotation.
+          if (this.at(':')) {
+            this.next();
+            this.parseType();
+          }
           const body = this.parseBlock();
           members.push({ kind: 'Constructor', params, body });
         } else {
@@ -683,7 +770,7 @@ class Parser {
         this.next();
         returnType = this.parseType();
       }
-      this.expect(';');
+      this.consumeSemicolon();
       methods.push({ name: mName, params, returnType });
     }
     this.expect('}');
@@ -796,7 +883,7 @@ class Parser {
         const index = this.parseExpression();
         this.expect(']');
         expr = { kind: 'Index', object: expr, index };
-      } else if (this.at('++') || this.at('--')) {
+      } else if ((this.at('++') || this.at('--')) && !this.hadLineTerminator()) {
         const op = this.next().value as '++';
         expr = { kind: 'Update', op, target: expr, prefix: false };
       } else {
@@ -922,14 +1009,19 @@ class Parser {
     }
     let className = this.expectIdent().value;
     // new Vector.<T>() — generic element type argument.
+    let isGenericVector = false;
     if (className === 'Vector' && this.at('.') && this.peek(1).value === '<') {
       this.next(); // '.'
       this.next(); // '<'
       const elem = this.parseType();
       this.expect('>');
       className = `Vector.<${elem}>`;
+      isGenericVector = true;
     }
-    const args = this.parseArgList();
+    // AS3 permits `new Vector.<T>` without the trailing `()` (the arg list is
+    // optional for the generic Vector constructor form). Every other `new X`
+    // still requires the parens.
+    const args = (isGenericVector && !this.at('(')) ? [] : this.parseArgList();
     return { kind: 'New', className, args };
   }
 

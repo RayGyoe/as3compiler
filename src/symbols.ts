@@ -420,6 +420,7 @@ export class SymbolTable {
         ['TAB_ENABLED_CHANGE', evc('tabEnabledChange')],
         ['TAB_INDEX_CHANGE', evc('tabIndexChange')],
         ['UNLOAD', evc('unload')],
+        ['CONTEXT3D_CREATE', evc('context3DCreate')],
       ]),
       staticMethods: new Map(),
       getters: new Map(),
@@ -590,6 +591,7 @@ export class SymbolTable {
         ['stage_focus_rect', stgf({ kind: 'bool' })],
         ['show_default_context_menu', stgf({ kind: 'bool' })],
         ['tab_children', stgf({ kind: 'bool' })],
+        ['stage3ds', stgf({ kind: 'vector', elem: { kind: 'object', className: 'Stage3D' } })],
       ]),
       methods: new Map([
         ['dispatchMouse', { returnType: { kind: 'void' }, params: [
@@ -642,6 +644,7 @@ export class SymbolTable {
         ['allowsFullScreen', stgg({ kind: 'bool' })],
         ['allowsFullScreenInteractive', stgg({ kind: 'bool' })],
         ['contentsScaleFactor', stgg({ kind: 'number' })],
+        ['stage3Ds', stgg({ kind: 'vector', elem: { kind: 'object', className: 'Stage3D' } })],
       ]),
       setters: new Map([
         ['stageWidth', stgs('int')],
@@ -751,6 +754,11 @@ export class SymbolTable {
         ['bytesLoaded', lif({ kind: 'uint' })],
         ['bytesTotal', lif({ kind: 'uint' })],
         ['url', lif({ kind: 'string' })],
+        // Back-reference to the owning Loader (AS3 LoaderInfo.loader). Set by
+        // Loader_ctor; NULL when the LoaderInfo is constructed standalone. Stored
+        // as a field (not a getter) so e.currentTarget.loader's dynamic access
+        // (as_dyn_get) finds it in the props reflection table.
+        ['loader', lif({ kind: 'object', className: 'Loader' })],
       ]),
       methods: new Map(),
       staticFields: new Map([
@@ -780,7 +788,8 @@ export class SymbolTable {
         ['contentLoaderInfo', ldf({ kind: 'object', className: 'LoaderInfo' })],
       ]),
       methods: new Map([
-        ['load', { returnType: { kind: 'void' }, params: [{ name: 'url', type: 'String', defaultValue: null, isRest: false }], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['load', { returnType: { kind: 'void' }, params: [{ name: 'request', type: 'URLRequest', defaultValue: null, isRest: false }], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['unload', { returnType: { kind: 'void' }, params: [], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1020,6 +1029,15 @@ export class SymbolTable {
         superClass: 'Object', isFinal: false, implements: [],
       });
     };
+    const intConstClass = (name: string, consts: Record<string, number>): void => {
+      const sf = new Map<string, FieldInfo>();
+      for (const [k, v] of Object.entries(consts)) sf.set(k, { type: { kind: 'int' }, init: { kind: 'Num', value: v, isInt: true }, visibility: 'public', owner: name, isStatic: true, isConst: true });
+      this.classMap.set(name, {
+        fields: new Map(), methods: new Map(), staticFields: sf, staticMethods: new Map(),
+        getters: new Map(), setters: new Map(), constructor: { params: [] },
+        superClass: 'Object', isFinal: false, implements: [],
+      });
+    };
     constClass('StageAlign', { TOP: 'T', BOTTOM: 'B', LEFT: 'L', RIGHT: 'R', TOP_LEFT: 'TL', TOP_RIGHT: 'TR', BOTTOM_LEFT: 'BL', BOTTOM_RIGHT: 'BR' });
     constClass('StageScaleMode', { EXACT_FIT: 'exactFit', SHOW_ALL: 'showAll', NO_BORDER: 'noBorder', NO_SCALE: 'noScale' });
     constClass('StageQuality', { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', BEST: 'best' });
@@ -1174,6 +1192,7 @@ export class SymbolTable {
     this.classMap.set('ErrorEvent', {
       fields: new Map([
         ['text', mef({ kind: 'string' }, 'ErrorEvent')],
+        ['errorID', mef({ kind: 'int' }, 'ErrorEvent')],
       ]),
       methods: new Map(),
       staticFields: new Map([
@@ -1366,6 +1385,18 @@ export class SymbolTable {
           { name: 'color', type: 'uint', defaultValue: null, isRest: false },
         ])],
         ['loadFile', bdm({ kind: 'void' }, [{ name: 'path', type: 'String', defaultValue: null, isRest: false }])],
+        ['fillRect', bdm({ kind: 'void' }, [
+          { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
+          { name: 'color', type: 'uint', defaultValue: null, isRest: false },
+        ])],
+        ['draw', bdm({ kind: 'void' }, [
+          { name: 'source', type: 'BitmapData', defaultValue: null, isRest: false },
+          { name: 'matrix', type: 'Matrix', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'colorTransform', type: 'ColorTransform', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'blendMode', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'clipRect', type: 'Rectangle', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'smoothing', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
         ['applyFilter', bdm({ kind: 'void' }, [
           { name: 'sourceBitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
           { name: 'sourceRect', type: 'Rectangle', defaultValue: null, isRest: false },
@@ -1529,11 +1560,13 @@ export class SymbolTable {
         ['length', bayf({ kind: 'int' })],
         ['capacity', bayf({ kind: 'int' })],
         ['position', bayf({ kind: 'int' })],
+        ['endian', bayf({ kind: 'string' })],
       ]),
       methods: new Map([
         ['writeByte', baym({ kind: 'void' }, [{ name: 'v', type: 'int', defaultValue: null, isRest: false }])],
         ['writeShort', baym({ kind: 'void' }, [{ name: 'v', type: 'int', defaultValue: null, isRest: false }])],
         ['writeInt', baym({ kind: 'void' }, [{ name: 'v', type: 'int', defaultValue: null, isRest: false }])],
+        ['writeUnsignedInt', baym({ kind: 'void' }, [{ name: 'v', type: 'uint', defaultValue: null, isRest: false }])],
         ['writeFloat', baym({ kind: 'void' }, [{ name: 'v', type: 'Number', defaultValue: null, isRest: false }])],
         ['writeUTFBytes', baym({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
         ['readByte', baym({ kind: 'int' }, [])],
@@ -1556,6 +1589,8 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // flash.utils.Endian — string constants for ByteArray.endian.
+    constClass('Endian', { BIG_ENDIAN: 'bigEndian', LITTLE_ENDIAN: 'littleEndian' });
     // flash.text — stage 38.
     const tff = (t: CType, owner: string): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
     this.classMap.set('TextFormat', {
@@ -1599,6 +1634,7 @@ export class SymbolTable {
         ['hscroll', txf({ kind: 'bool' })],
         ['selectable', txf({ kind: 'bool' })],
         ['autoSize', txf({ kind: 'string' })],
+        ['textColor', txf({ kind: 'uint' })],
       ]),
       methods: new Map([
         ['appendText', txm({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
@@ -1637,6 +1673,7 @@ export class SymbolTable {
     const gefield = (owner: string) => (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
     const gemethod = (owner: string) => (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     const gegetter = (owner: string) => (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const gesetter = (owner: string) => (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
     const gestatic = (owner: string) => (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false });
     const geptParam = (name: string): Param => ({ name, type: 'Point', defaultValue: null, isRest: false });
     // Point: x/y Number, `length` read-only, static distance/interpolate/polar.
@@ -1679,6 +1716,7 @@ export class SymbolTable {
       const rf = gefield('Rectangle');
       const rm = gemethod('Rectangle');
       const rg = gegetter('Rectangle');
+      const rs = gesetter('Rectangle');
       const rp = (name: string): Param => ({ name, type: 'Rectangle', defaultValue: null, isRest: false });
       this.classMap.set('Rectangle', {
         fields: new Map([['x', rf({ kind: 'number' })], ['y', rf({ kind: 'number' })], ['width', rf({ kind: 'number' })], ['height', rf({ kind: 'number' })]]),
@@ -1705,7 +1743,14 @@ export class SymbolTable {
           ['left', rg({ kind: 'number' })],
           ['right', rg({ kind: 'number' })],
         ]),
-        setters: new Map(),
+        // flash.geom.Rectangle exposes top/bottom/left/right as getter/setter
+        // pairs: `left`/`top` move the origin, `right`/`bottom` resize the span.
+        setters: new Map([
+          ['top', rs('Number')],
+          ['bottom', rs('Number')],
+          ['left', rs('Number')],
+          ['right', rs('Number')],
+        ]),
         constructor: { params: [gegnum('x', 0), gegnum('y', 0), gegnum('width', 0), gegnum('height', 0)] },
         superClass: 'Object',
         isFinal: false,
@@ -1790,6 +1835,474 @@ export class SymbolTable {
         implements: [],
       });
     }
+    // Vector3D (flash.geom): a 4-component vector, a pure double bundle like Point.
+    // add/subtract/crossProduct/clone return NEW vectors; scaleBy/negate/normalize
+    // mutate `this`; normalize returns the pre-normalization length.
+    {
+      const vf = gefield('Vector3D');
+      const vm = gemethod('Vector3D');
+      const vg = gegetter('Vector3D');
+      const vs = gestatic('Vector3D');
+      const v3 = (name: string): Param => ({ name, type: 'Vector3D', defaultValue: null, isRest: false });
+      const v3num = (v: number): Expr => ({ kind: 'Num', value: v, isInt: true });
+      const v3axis = (x: number, y: number, z: number): Expr => ({ kind: 'New', className: 'Vector3D', args: [v3num(x), v3num(y), v3num(z), v3num(0)] });
+      const v3static = (x: number, y: number, z: number): FieldInfo => ({ type: { kind: 'object', className: 'Vector3D' }, init: v3axis(x, y, z), visibility: 'public', owner: 'Vector3D', isStatic: true, isConst: false });
+      this.classMap.set('Vector3D', {
+        fields: new Map([
+          ['x', vf({ kind: 'number' })], ['y', vf({ kind: 'number' })], ['z', vf({ kind: 'number' })], ['w', vf({ kind: 'number' })],
+        ]),
+        methods: new Map([
+          ['add', vm({ kind: 'object', className: 'Vector3D' }, [v3('a')])],
+          ['subtract', vm({ kind: 'object', className: 'Vector3D' }, [v3('a')])],
+          ['scaleBy', vm({ kind: 'void' }, [gegnum('s', 0)])],
+          ['negate', vm({ kind: 'void' }, [])],
+          ['normalize', vm({ kind: 'number' }, [])],
+          ['dotProduct', vm({ kind: 'number' }, [v3('a')])],
+          ['crossProduct', vm({ kind: 'object', className: 'Vector3D' }, [v3('a')])],
+          ['clone', vm({ kind: 'object', className: 'Vector3D' }, [])],
+          ['equals', vm({ kind: 'bool' }, [v3('toCompare'), { name: 'allFour', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
+          ['toString', vm({ kind: 'string' }, [])],
+        ]),
+        staticFields: new Map([
+          ['X_AXIS', v3static(1, 0, 0)],
+          ['Y_AXIS', v3static(0, 1, 0)],
+          ['Z_AXIS', v3static(0, 0, 1)],
+        ]),
+        staticMethods: new Map([
+          ['distance', vs({ kind: 'number' }, [v3('pt1'), v3('pt2')])],
+          ['angleBetween', vs({ kind: 'number' }, [v3('a'), v3('b')])],
+        ]),
+        getters: new Map([
+          ['length', vg({ kind: 'number' })],
+          ['lengthSquared', vg({ kind: 'number' })],
+        ]),
+        setters: new Map(),
+        constructor: { params: [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0), gegnum('w', 0)] },
+        superClass: 'Object',
+        isFinal: false,
+        implements: [],
+      });
+    }
+    // Matrix3D (flash.geom): a 4x4 column-major matrix. The 16 doubles live in a
+    // C-runtime-only `_m[16]` array (emitted by emitStructs for name === 'Matrix3D');
+    // `rawData` is the only AS3-visible accessor and materializes a Vector.<Number>
+    // on read (a copy, matching the AVM2 rawData getter).
+    {
+      const mm = gemethod('Matrix3D');
+      const ms = gestatic('Matrix3D');
+      const m3 = (name: string): Param => ({ name, type: 'Matrix3D', defaultValue: null, isRest: false });
+      const v3p = (name: string): Param => ({ name, type: 'Vector3D', defaultValue: null, isRest: false });
+      const vnum = (): CType => ({ kind: 'vector', elem: { kind: 'number' } });
+      const vv3 = (): CType => ({ kind: 'vector', elem: { kind: 'object', className: 'Vector3D' } });
+      const orient = { name: 'orientation', type: 'String' as ASType, defaultValue: { kind: 'Str', value: 'eulerAngles' } as Expr, isRest: false };
+      this.classMap.set('Matrix3D', {
+        fields: new Map(),
+        methods: new Map([
+          ['identity', mm({ kind: 'void' }, [])],
+          ['append', mm({ kind: 'void' }, [m3('lhs')])],
+          ['prepend', mm({ kind: 'void' }, [m3('rhs')])],
+          ['invert', mm({ kind: 'bool' }, [])],
+          ['transpose', mm({ kind: 'void' }, [])],
+          ['transformVector', mm({ kind: 'object', className: 'Vector3D' }, [v3p('v')])],
+          ['transformVectors', mm({ kind: 'void' }, [{ name: 'vin', type: 'Vector.<Number>', defaultValue: null, isRest: false }, { name: 'vout', type: 'Vector.<Number>', defaultValue: null, isRest: false }])],
+          ['deltaTransformVector', mm({ kind: 'object', className: 'Vector3D' }, [v3p('v')])],
+          ['pointAt', mm({ kind: 'void' }, [v3p('pos'), v3p('at'), v3p('up')])],
+          ['interpolate', mm({ kind: 'void' }, [m3('thisMat'), m3('toMat'), gegnum('percent', 0)])],
+          ['recompose', mm({ kind: 'bool' }, [{ name: 'components', type: 'Vector.<Vector3D>', defaultValue: null, isRest: false }, orient])],
+          ['decompose', mm(vv3(), [orient])],
+          ['copyFrom', mm({ kind: 'void' }, [m3('sourceMatrix3D')])],
+          ['clone', mm({ kind: 'object', className: 'Matrix3D' }, [])],
+          ['appendTranslation', mm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
+          ['prependTranslation', mm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
+          ['appendScale', mm({ kind: 'void' }, [gegnum('xScale', 0), gegnum('yScale', 0), gegnum('zScale', 0)])],
+          ['prependScale', mm({ kind: 'void' }, [gegnum('xScale', 0), gegnum('yScale', 0), gegnum('zScale', 0)])],
+          ['appendRotation', mm({ kind: 'void' }, [gegnum('degrees', 0), v3p('axis'), { name: 'pivotPoint', type: 'Vector3D', defaultValue: { kind: 'Null' }, isRest: false }])],
+          ['prependRotation', mm({ kind: 'void' }, [gegnum('degrees', 0), v3p('axis'), { name: 'pivotPoint', type: 'Vector3D', defaultValue: { kind: 'Null' }, isRest: false }])],
+          ['toString', mm({ kind: 'string' }, [])],
+        ]),
+        staticFields: new Map(),
+        staticMethods: new Map([
+          ['interpolate', ms({ kind: 'object', className: 'Matrix3D' }, [m3('thisMat'), m3('toMat'), gegnum('percent', 0)])],
+          ['identity', ms({ kind: 'object', className: 'Matrix3D' }, [])],
+        ]),
+        getters: new Map([['rawData', { returnType: vnum(), params: [], owner: 'Matrix3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }]]),
+        setters: new Map([['rawData', { returnType: { kind: 'void' }, params: [{ name: 'v', type: 'Vector.<Number>', defaultValue: null, isRest: false }], owner: 'Matrix3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }]]),
+        constructor: { params: [{ name: 'v', type: 'Vector.<Number>', defaultValue: { kind: 'Null' }, isRest: false }] },
+        superClass: 'Object',
+        isFinal: false,
+        implements: [],
+      });
+    }
+    // flash.display3D.AGALTranslator (stage 80): a pure-static bridge over the
+    // runtime AGAL bytecode -> MSL/GLSL translator. Not part of the AS3 runtime
+    // surface — it is the compiler's test/verification hook for the AGAL kernel,
+    // reused later by Program3D.upload (stage 81).
+    {
+      this.classMap.set('AGALTranslator', {
+        fields: new Map(),
+        methods: new Map(),
+        staticFields: new Map(),
+        staticMethods: new Map([
+          ['translate', { returnType: { kind: 'string' }, params: [
+            { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'target', type: 'String', defaultValue: null, isRest: false },
+          ], owner: 'AGALTranslator', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+        ]),
+        getters: new Map(),
+        setters: new Map(),
+        constructor: { params: [] },
+        superClass: 'Object',
+        isFinal: false,
+        implements: [],
+      });
+    }
+    // ===== flash.display3D (stage 81): Stage3D + Context3D skeleton + resource
+    // classes + 15 constant classes. Pure CPU-side state machine and containers
+    // (no GPU); the Metal/WebGL upload + draw are wired in stage 82. =====
+
+    // --- 15 constant classes: pure static-String holders, never instantiated. ---
+    constClass('Context3DBlendFactor', { ONE: 'one', ZERO: 'zero', SOURCE_ALPHA: 'sourceAlpha', SOURCE_COLOR: 'sourceColor', ONE_MINUS_SOURCE_ALPHA: 'oneMinusSourceAlpha', ONE_MINUS_SOURCE_COLOR: 'oneMinusSourceColor', DESTINATION_ALPHA: 'destinationAlpha', DESTINATION_COLOR: 'destinationColor', ONE_MINUS_DESTINATION_ALPHA: 'oneMinusDestinationAlpha', ONE_MINUS_DESTINATION_COLOR: 'oneMinusDestinationColor' });
+    constClass('Context3DBufferUsage', { STATIC_DRAW: 'staticDraw', DYNAMIC_DRAW: 'dynamicDraw' });
+    constClass('Context3DClearMask', { COLOR: 'color', DEPTH: 'depth', STENCIL: 'stencil', ALL: 'all' });
+    constClass('Context3DCompareMode', { ALWAYS: 'always', NEVER: 'never', LESS: 'less', LESS_EQUAL: 'lessEqual', EQUAL: 'equal', GREATER_EQUAL: 'greaterEqual', GREATER: 'greater', NOT_EQUAL: 'notEqual' });
+    constClass('Context3DFillMode', { NONE: 'none', SOLID: 'solid' });
+    constClass('Context3DMipFilter', { NONE: 'none', NEAREST: 'nearest', LINEAR: 'linear' });
+    constClass('Context3DProfile', { BASELINE: 'baseline', BASELINE_EXTENDED: 'baselineExtended', BASELINE_CONSTRAINED: 'baselineConstrained', STANDARD: 'standard', STANDARD_CONSTRAINED: 'standardConstrained', STANDARD_EXTENDED: 'standardExtended' });
+    constClass('Context3DProgramType', { VERTEX: 'vertex', FRAGMENT: 'fragment' });
+    constClass('Context3DRenderMode', { AUTO: 'auto', SOFTWARE: 'software' });
+    constClass('Context3DStencilAction', { KEEP: 'keep', DECREMENT_SATURATE: 'decrementSaturate', DECREMENT_WRAP: 'decrementWrap', INCREMENT_SATURATE: 'incrementSaturate', INCREMENT_WRAP: 'incrementWrap', INVERT: 'invert', REPLACE: 'replace', SET: 'set', ZERO: 'zero' });
+    constClass('Context3DTextureFilter', { NEAREST: 'nearest', LINEAR: 'linear' });
+    constClass('Context3DTextureFormat', { BGRA: 'bgra', RGBA: 'rgba', COMPRESSED: 'compressed', COMPRESSED_ALPHA: 'compressedAlpha', BGR_PACKED: 'bgrPacked', BGRA_PACKED: 'bgraPacked' });
+    constClass('Context3DTriangleFace', { BACK: 'back', FRONT: 'front', FRONT_AND_BACK: 'frontAndBack', NONE: 'none' });
+    constClass('Context3DVertexBufferFormat', { BYTES_4: 'bytes4', FLOAT_1: 'float1', FLOAT_2: 'float2', FLOAT_3: 'float3', FLOAT_4: 'float4' });
+    constClass('Context3DWrapMode', { CLAMP: 'clamp', REPEAT: 'repeat' });
+    intConstClass('Context3DCubeMapFace', { POSITIVE_X: 0, NEGATIVE_X: 1, POSITIVE_Y: 2, NEGATIVE_Y: 3, POSITIVE_Z: 4, NEGATIVE_Z: 5 });
+
+    // --- resource classes: CPU copies of uploaded data; GPU objects in stage 82. ---
+    {
+      const vbf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'VertexBuffer3D', isStatic: false, isConst: false });
+      const vbm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'VertexBuffer3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      this.classMap.set('VertexBuffer3D', {
+        fields: new Map([
+          ['numVertices', vbf({ kind: 'int' })],
+          ['data32PerVertex', vbf({ kind: 'int' })],
+          ['data', vbf({ kind: 'vector', elem: { kind: 'number' } })],
+          ['startVertex', vbf({ kind: 'int' })],
+        ]),
+        methods: new Map([
+          ['uploadFromVector', vbm({ kind: 'void' }, [
+            { name: 'data', type: 'Vector.<Number>', defaultValue: null, isRest: false },
+            { name: 'startVertex', type: 'int', defaultValue: null, isRest: false },
+            { name: 'numVertices', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['dispose', vbm({ kind: 'void' }, [])],
+        ]),
+        staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
+        constructor: { params: [] }, superClass: 'Object', isFinal: false, implements: [],
+      });
+    }
+    {
+      const ibf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'IndexBuffer3D', isStatic: false, isConst: false });
+      const ibm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'IndexBuffer3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      this.classMap.set('IndexBuffer3D', {
+        fields: new Map([
+          ['numIndices', ibf({ kind: 'int' })],
+          ['data', ibf({ kind: 'vector', elem: { kind: 'uint' } })],
+          ['startIndex', ibf({ kind: 'int' })],
+        ]),
+        methods: new Map([
+          ['uploadFromVector', ibm({ kind: 'void' }, [
+            { name: 'data', type: 'Vector.<uint>', defaultValue: null, isRest: false },
+            { name: 'startIndex', type: 'int', defaultValue: null, isRest: false },
+            { name: 'numIndices', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['dispose', ibm({ kind: 'void' }, [])],
+        ]),
+        staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
+        constructor: { params: [] }, superClass: 'Object', isFinal: false, implements: [],
+      });
+    }
+    {
+      const prf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Program3D', isStatic: false, isConst: false });
+      const prm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Program3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      this.classMap.set('Program3D', {
+        fields: new Map([
+          ['vertexProgram', prf({ kind: 'object', className: 'ByteArray' })],
+          ['fragmentProgram', prf({ kind: 'object', className: 'ByteArray' })],
+        ]),
+        methods: new Map([
+          ['upload', prm({ kind: 'void' }, [
+            { name: 'vertexProgram', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'fragmentProgram', type: 'ByteArray', defaultValue: null, isRest: false },
+          ])],
+          ['dispose', prm({ kind: 'void' }, [])],
+        ]),
+        staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
+        constructor: { params: [] }, superClass: 'Object', isFinal: false, implements: [],
+      });
+    }
+    this.classMap.set('TextureBase', {
+      fields: new Map(),
+      methods: new Map([['dispose', { returnType: { kind: 'void' }, params: [], owner: 'TextureBase', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }]]),
+      staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
+      constructor: { params: [] }, superClass: 'Object', isFinal: false, implements: [],
+    });
+    {
+      const txf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Texture', isStatic: false, isConst: false });
+      const txm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Texture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      this.classMap.set('Texture', {
+        fields: new Map([
+          ['width', txf({ kind: 'int' })],
+          ['height', txf({ kind: 'int' })],
+          ['format', txf({ kind: 'string' })],
+          // Source BitmapData retained for the GPU upload (s3d_upload_texture).
+          // Pure-C builds keep it as a plain reference (no pixels are copied).
+          ['bitmapData', txf({ kind: 'object', className: 'BitmapData' })],
+          // Opaque MTLTexture handle for render-to-texture (optimizeForRenderToTexture).
+          // NULL for sampler-only textures (uploadFromBitmapData).
+          ['gpu', txf({ kind: 'null' })],
+        ]),
+        methods: new Map([
+          ['uploadFromBitmapData', txm({ kind: 'void' }, [
+            { name: 'bitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
+            { name: 'miplevel', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          ])],
+          ['dispose', txm({ kind: 'void' }, [])],
+        ]),
+        staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
+        constructor: { params: [] }, superClass: 'TextureBase', isFinal: false, implements: [],
+      });
+
+      // CubeTexture (stage 83): six square faces sharing one size. Held as a CPU
+      // descriptor (width/height + per-face BitmapData source); the GPU cube
+      // target is a future follow-up (the demo does not use cube sampling).
+      const cuf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'CubeTexture', isStatic: false, isConst: false });
+      const cum = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'CubeTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      this.classMap.set('CubeTexture', {
+        fields: new Map([
+          ['width', cuf({ kind: 'int' })],
+          ['height', cuf({ kind: 'int' })],
+          ['format', cuf({ kind: 'string' })],
+          ['face0', cuf({ kind: 'object', className: 'BitmapData' })],
+          ['face1', cuf({ kind: 'object', className: 'BitmapData' })],
+          ['face2', cuf({ kind: 'object', className: 'BitmapData' })],
+          ['face3', cuf({ kind: 'object', className: 'BitmapData' })],
+          ['face4', cuf({ kind: 'object', className: 'BitmapData' })],
+          ['face5', cuf({ kind: 'object', className: 'BitmapData' })],
+        ]),
+        methods: new Map([
+          ['uploadFromBitmapData', cum({ kind: 'void' }, [
+            { name: 'bitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
+            { name: 'side', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'miplevel', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          ])],
+          ['dispose', cum({ kind: 'void' }, [])],
+        ]),
+        staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
+        constructor: { params: [] }, superClass: 'TextureBase', isFinal: false, implements: [],
+      });
+
+      // RectangleTexture (stage 83): non-power-of-two 2D texture, clamp-only,
+      // no mipmaps. CPU descriptor mirroring Texture (uploadFromBitmapData).
+      const rtf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'RectangleTexture', isStatic: false, isConst: false });
+      const rtm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'RectangleTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      this.classMap.set('RectangleTexture', {
+        fields: new Map([
+          ['width', rtf({ kind: 'int' })],
+          ['height', rtf({ kind: 'int' })],
+          ['format', rtf({ kind: 'string' })],
+          ['bitmapData', rtf({ kind: 'object', className: 'BitmapData' })],
+        ]),
+        methods: new Map([
+          ['uploadFromBitmapData', rtm({ kind: 'void' }, [
+            { name: 'bitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
+          ])],
+          ['dispose', rtm({ kind: 'void' }, [])],
+        ]),
+        staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
+        constructor: { params: [] }, superClass: 'TextureBase', isFinal: false, implements: [],
+      });
+    }
+
+    // --- Context3D: pure state machine (blend/depth/cull + bound resources). ---
+    {
+      const c3f = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Context3D', isStatic: false, isConst: false });
+      const c3m = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Context3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      const c3g = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Context3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      const c3fields = new Map<string, FieldInfo>([
+        ['backBufferWidth', c3f({ kind: 'int' })],
+        ['backBufferHeight', c3f({ kind: 'int' })],
+        ['antiAlias', c3f({ kind: 'int' })],
+        ['enableDepthAndStencil', c3f({ kind: 'bool' })],
+        ['blendSource', c3f({ kind: 'string' })],
+        ['blendDest', c3f({ kind: 'string' })],
+        ['depthTestOn', c3f({ kind: 'bool' })],
+        ['depthCompare', c3f({ kind: 'string' })],
+        ['cullMode', c3f({ kind: 'string' })],
+        ['program', c3f({ kind: 'object', className: 'Program3D' })],
+        ['indexBuffer', c3f({ kind: 'object', className: 'IndexBuffer3D' })],
+        ['vc', c3f({ kind: 'vector', elem: { kind: 'number' } })],
+        ['fc', c3f({ kind: 'vector', elem: { kind: 'number' } })],
+        // Opaque S3DContext* handle (nil in pure-C builds). The generated C never
+        // dereferences it — it is passed back verbatim to every as_s3d_* call.
+        ['gpu', c3f({ kind: 'null' })],
+        // Last Program3D compiled to a Metal pipeline (drawTriangles caches on
+        // the pointer so the MSL compile runs once per program, not per frame).
+        ['gpuProgram', c3f({ kind: 'object', className: 'Program3D' })],
+        ['clearR', c3f({ kind: 'number' })],
+        ['clearG', c3f({ kind: 'number' })],
+        ['clearB', c3f({ kind: 'number' })],
+        ['clearA', c3f({ kind: 'number' })],
+      ]);
+      for (let i = 0; i < 8; i++) {
+        c3fields.set(`vb${i}`, c3f({ kind: 'object', className: 'VertexBuffer3D' }));
+        c3fields.set(`vbOff${i}`, c3f({ kind: 'int' }));
+        c3fields.set(`vbFmt${i}`, c3f({ kind: 'string' }));
+        c3fields.set(`tex${i}`, c3f({ kind: 'object', className: 'Texture' }));
+      }
+      this.classMap.set('Context3D', {
+        fields: c3fields,
+        methods: new Map([
+          ['configureBackBuffer', c3m({ kind: 'void' }, [
+            { name: 'width', type: 'uint', defaultValue: null, isRest: false },
+            { name: 'height', type: 'uint', defaultValue: null, isRest: false },
+            { name: 'antiAlias', type: 'uint', defaultValue: null, isRest: false },
+            { name: 'enableDepthAndStencil', type: 'Boolean', defaultValue: null, isRest: false },
+          ])],
+          ['clear', c3m({ kind: 'void' }, [
+            { name: 'red', type: 'Number', defaultValue: null, isRest: false },
+            { name: 'green', type: 'Number', defaultValue: null, isRest: false },
+            { name: 'blue', type: 'Number', defaultValue: null, isRest: false },
+            { name: 'alpha', type: 'Number', defaultValue: null, isRest: false },
+          ])],
+          ['present', c3m({ kind: 'void' }, [])],
+          ['drawTriangles', c3m({ kind: 'void' }, [
+            { name: 'indexBuffer', type: 'IndexBuffer3D', defaultValue: null, isRest: false },
+            { name: 'firstIndex', type: 'int', defaultValue: null, isRest: false },
+            { name: 'numTriangles', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['setProgram', c3m({ kind: 'void' }, [{ name: 'program', type: 'Program3D', defaultValue: null, isRest: false }])],
+          ['setBlendFactors', c3m({ kind: 'void' }, [
+            { name: 'sourceFactor', type: 'String', defaultValue: null, isRest: false },
+            { name: 'destinationFactor', type: 'String', defaultValue: null, isRest: false },
+          ])],
+          ['setProgramConstantsFromMatrix', c3m({ kind: 'void' }, [
+            { name: 'programType', type: 'String', defaultValue: null, isRest: false },
+            { name: 'firstRegister', type: 'int', defaultValue: null, isRest: false },
+            { name: 'matrix', type: 'Matrix3D', defaultValue: null, isRest: false },
+            { name: 'transposedMatrix', type: 'Boolean', defaultValue: null, isRest: false },
+          ])],
+          ['setTextureAt', c3m({ kind: 'void' }, [
+            { name: 'first', type: 'int', defaultValue: null, isRest: false },
+            { name: 'texture', type: 'Texture', defaultValue: null, isRest: false },
+          ])],
+          ['setVertexBufferAt', c3m({ kind: 'void' }, [
+            { name: 'index', type: 'int', defaultValue: null, isRest: false },
+            { name: 'buffer', type: 'VertexBuffer3D', defaultValue: null, isRest: false },
+            { name: 'bufferOffset', type: 'int', defaultValue: null, isRest: false },
+            { name: 'format', type: 'String', defaultValue: null, isRest: false },
+          ])],
+          ['createVertexBuffer', c3m({ kind: 'object', className: 'VertexBuffer3D' }, [
+            { name: 'numVertices', type: 'int', defaultValue: null, isRest: false },
+            { name: 'data32PerVertex', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['createIndexBuffer', c3m({ kind: 'object', className: 'IndexBuffer3D' }, [
+            { name: 'numIndices', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['createProgram', c3m({ kind: 'object', className: 'Program3D' }, [])],
+          ['createTexture', c3m({ kind: 'object', className: 'Texture' }, [
+            { name: 'width', type: 'int', defaultValue: null, isRest: false },
+            { name: 'height', type: 'int', defaultValue: null, isRest: false },
+            { name: 'format', type: 'String', defaultValue: null, isRest: false },
+            { name: 'optimizeForRenderToTexture', type: 'Boolean', defaultValue: null, isRest: false },
+          ])],
+          ['createCubeTexture', c3m({ kind: 'object', className: 'CubeTexture' }, [
+            { name: 'size', type: 'int', defaultValue: null, isRest: false },
+            { name: 'format', type: 'String', defaultValue: null, isRest: false },
+            { name: 'optimizeForRenderToTexture', type: 'Boolean', defaultValue: null, isRest: false },
+          ])],
+          ['createRectangleTexture', c3m({ kind: 'object', className: 'RectangleTexture' }, [
+            { name: 'width', type: 'int', defaultValue: null, isRest: false },
+            { name: 'height', type: 'int', defaultValue: null, isRest: false },
+            { name: 'format', type: 'String', defaultValue: null, isRest: false },
+            { name: 'optimizeForRenderToTexture', type: 'Boolean', defaultValue: null, isRest: false },
+          ])],
+          ['setCubeTextureAt', c3m({ kind: 'void' }, [
+            { name: 'first', type: 'int', defaultValue: null, isRest: false },
+            { name: 'texture', type: 'CubeTexture', defaultValue: null, isRest: false },
+          ])],
+          ['setRectangleTextureAt', c3m({ kind: 'void' }, [
+            { name: 'first', type: 'int', defaultValue: null, isRest: false },
+            { name: 'texture', type: 'RectangleTexture', defaultValue: null, isRest: false },
+          ])],
+          ['drawTrianglesInstanced', c3m({ kind: 'void' }, [
+            { name: 'indexBuffer', type: 'IndexBuffer3D', defaultValue: null, isRest: false },
+            { name: 'firstIndex', type: 'int', defaultValue: null, isRest: false },
+            { name: 'numTriangles', type: 'int', defaultValue: null, isRest: false },
+            { name: 'numInstances', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['setProgramConstantsFromVector', c3m({ kind: 'void' }, [
+            { name: 'programType', type: 'String', defaultValue: null, isRest: false },
+            { name: 'firstRegister', type: 'int', defaultValue: null, isRest: false },
+            { name: 'data', type: 'Vector.<Number>', defaultValue: null, isRest: false },
+            { name: 'numRegisters', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['setDepthTest', c3m({ kind: 'void' }, [
+            { name: 'depthMask', type: 'Boolean', defaultValue: null, isRest: false },
+            { name: 'passCompareMode', type: 'String', defaultValue: null, isRest: false },
+          ])],
+          ['setCulling', c3m({ kind: 'void' }, [{ name: 'triangleFaceToCull', type: 'String', defaultValue: null, isRest: false }])],
+          ['dispose', c3m({ kind: 'void' }, [])],
+          ['drawToBitmapData', c3m({ kind: 'void' }, [
+            { name: 'destination', type: 'BitmapData', defaultValue: null, isRest: false },
+          ])],
+          ['setRenderToTexture', c3m({ kind: 'void' }, [
+            { name: 'texture', type: 'Texture', defaultValue: null, isRest: false },
+            { name: 'enableDepthAndStencil', type: 'Boolean', defaultValue: null, isRest: false },
+          ])],
+          ['setRenderToBackBuffer', c3m({ kind: 'void' }, [])],
+        ]),
+        staticFields: new Map(), staticMethods: new Map(),
+        getters: new Map([
+          ['driverInfo', c3g({ kind: 'string' })],
+          ['profile', c3g({ kind: 'string' })],
+        ]),
+        setters: new Map([
+          ['enableErrorChecking', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Boolean', defaultValue: null, isRest: false }], owner: 'Context3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ]),
+        constructor: { params: [] }, superClass: 'Object', isFinal: false, implements: [],
+      });
+    }
+
+    // --- Stage3D: per-display slot; lazily creates a Context3D on request. ---
+    {
+      const s3f = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Stage3D', isStatic: false, isConst: false });
+      const s3m = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Stage3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      const s3g = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Stage3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      const s3s = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'Stage3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+      this.classMap.set('Stage3D', {
+        fields: new Map([
+          ['x', s3f({ kind: 'number' })],
+          ['y', s3f({ kind: 'number' })],
+          ['visible', s3f({ kind: 'bool' })],
+          ['context3d', s3f({ kind: 'object', className: 'Context3D' })],
+          ['renderMode', s3f({ kind: 'string' })],
+        ]),
+        methods: new Map([
+          ['requestContext3D', s3m({ kind: 'void' }, [{ name: 'renderMode', type: 'String', defaultValue: null, isRest: false }])],
+        ]),
+        staticFields: new Map(), staticMethods: new Map(),
+        getters: new Map([
+          ['context3D', s3g({ kind: 'object', className: 'Context3D' })],
+        ]),
+        setters: new Map([
+          ['x', s3s('Number')],
+          ['y', s3s('Number')],
+          ['visible', s3s('Boolean')],
+        ]),
+        constructor: { params: [] }, superClass: 'EventDispatcher', isFinal: false, implements: [],
+      });
+    }
     // pass 1: register class shells with their superclass link.
     for (const stmt of program.body) {
       if (stmt.kind === 'ClassDecl') {
@@ -1838,7 +2351,7 @@ export class SymbolTable {
               if (!m.isStatic) throw new CodegenError(`[WasmExport] cannot be applied to instance method '${cname}.${m.name}': only static methods (and top-level functions) are callable from JS`);
               if (m.isGetter || m.isSetter) throw new CodegenError(`[WasmExport] cannot be applied to getter/setter '${cname}.${m.name}'`);
               this.exportList.push({
-                symbol: `${cname}_${m.name}`,
+                symbol: `${cname}_${m.name}_static`,
                 alias: we.args[0] ?? null,
                 returnType: resolveType(m.returnType),
                 params: m.params.map((p) => ({ name: p.name, type: resolveType(p.type) })),

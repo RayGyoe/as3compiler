@@ -1,0 +1,14 @@
+{
+  "target": "native",
+  "opt": "-O2",
+  "sources": [
+    "../vendor/stage3d_glue.mm"
+  ],
+  "defines": [
+    "ASC_RENDER_STAGE3D=1"
+  ],
+  "frameworks": [
+    "Metal",
+    "Foundation"
+  ]
+}

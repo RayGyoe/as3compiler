@@ -17,6 +17,7 @@
 #include "include/core/SkPaint.h"
 #include "include/core/SkPath.h"
 #include "include/core/SkImage.h"
+#include "include/core/SkBitmap.h"
 #include "include/core/SkData.h"
 #include "include/core/SkPixmap.h"
 #include "include/core/SkFont.h"
@@ -405,10 +406,63 @@ void* sk_image_from_file(const char* path) {
   return image.release();  // caller owns one ref (or NULL on decode failure)
 }
 
+// Decode an image file into a freshly malloc'd ARGB (0xAARRGGBB) uint32 buffer,
+// returning the buffer (caller frees) or NULL on failure. *width/*height receive
+// the image dimensions. This mirrors AS3 BitmapData's `pixels` layout so
+// BitmapData_loadFile can populate the CPU pixel buffer directly (the raw bytes
+// Skia hands back are RGBA, so each pixel is swizzled to ARGB here).
+void* sk_image_decode_rgba(const char* path, int* width, int* height) {
+  auto data = SkData::MakeFromFileName(path);
+  if (!data) return nullptr;
+  auto image = SkImages::DeferredFromEncodedData(data);
+  if (!image) return nullptr;
+  int w = image->width(), h = image->height();
+  if (w <= 0 || h <= 0) return nullptr;
+  size_t n = (size_t)w * (size_t)h;
+  uint32_t* buf = (uint32_t*)malloc(n * 4);
+  if (!buf) return nullptr;
+  // Unpremultiplied (straight) alpha matches AS3's ARGB semantics.
+  SkImageInfo info = SkImageInfo::Make(w, h, kRGBA_8888_SkColorType, kUnpremul_SkAlphaType);
+  uint8_t* tmp = (uint8_t*)malloc(n * 4);
+  if (!tmp) { free(buf); return nullptr; }
+  if (!image->readPixels(info, tmp, (size_t)w * 4, 0, 0)) { free(tmp); free(buf); return nullptr; }
+  for (size_t i = 0; i < n; i++) {
+    uint8_t r = tmp[i * 4 + 0], g = tmp[i * 4 + 1], b = tmp[i * 4 + 2], a = tmp[i * 4 + 3];
+    buf[i] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+  }
+  free(tmp);
+  *width = w; *height = h;
+  return buf;
+}
+
 void sk_canvas_draw_image_rect(void* canvas, void* image,
                                double dx, double dy, double dw, double dh) {
   SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
   ((SkCanvas*)canvas)->drawImageRect((SkImage*)image, dst, SkSamplingOptions());
+}
+
+// Draw a tightly packed BGRA8 pixel buffer (width*height*4 bytes, B,G,R,A byte
+// order) scaled into the destination rect. Used to composite the Stage3D
+// offscreen render target (an MTLPixelFormatBGRA8Unorm texture read back via
+// s3d_readback_render) onto the window canvas so Stage3D content actually
+// reaches the screen (stage 82 P2). The pixels are premultiplied — a Metal
+// render target produces premultiplied alpha when blending is enabled, and the
+// opaque clear-color regions (alpha=255) are unaffected either way.
+//
+// NOTE: this is the CPU-raster compositing path only. On the GPU Metal backend
+// the Stage3D render target is blitted directly as a GPU texture
+// (sk_mtl_draw_texture), avoiding the CPU round-trip entirely. RasterFromPixmapCopy
+// is deliberately used here (not a cached SkBitmap): a cached image would freeze
+// the first frame's pixels, and the copy has no cost on a CPU raster canvas
+// (there is no per-frame GPU texture upload to leak).
+void sk_canvas_draw_bgra(void* canvas, const uint8_t* bgra, int w, int h,
+                         double dx, double dy, double dw, double dh) {
+  if (canvas == nullptr || bgra == nullptr || w <= 0 || h <= 0) return;
+  SkImageInfo info = SkImageInfo::Make(w, h, kBGRA_8888_SkColorType, kPremul_SkAlphaType);
+  sk_sp<SkImage> image = SkImages::RasterFromPixmapCopy(SkPixmap(info, bgra, (size_t)w * 4));
+  if (!image) return;
+  SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
+  ((SkCanvas*)canvas)->drawImageRect(image.get(), dst, SkSamplingOptions());
 }
 
 // ---------- text ----------
