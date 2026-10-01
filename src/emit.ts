@@ -6,9 +6,86 @@ import { RUNTIME_PREAMBLE } from './runtime.ts';
 import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 
+// Declarations owned by the module (top-level script) scope: AS3 hoists every
+// `var`/`const` written anywhere in the top-level statement tree — including one
+// inside a block, an `if`, a `switch` case, a `try`, or a `for` init — into the
+// single script scope, so they all share one slot (`for (var i…) {}` then
+// `trace(i)` must see the loop's last value, not an undeclared name). Returns them
+// in source order, first declaration of a name winning (a script-scope name has
+// exactly one C global). Used by `emitModuleVars` to declare the C globals and by
+// the closure walk (`scriptVarNames`) so a free variable that is a module global is
+// read/written directly instead of being captured by value — the two must agree,
+// or a closure would silently read a stale snapshot.
+//
+// for-in / for-each-in loop vars ARE hoisted too, but their C type is not written
+// in the source: it follows from the iterable (an Array yields `int` indices, a
+// dynamic object yields `char*` keys, a Dictionary/`Object` yields boxed values).
+// The decl therefore carries the loop descriptor instead of a type, and
+// `emitModuleVars` resolves it with the same rule the emit sites use
+// (`loopVarType`) — the two must agree, exactly like `scriptVarNames` must agree
+// with `emitModuleVars`. Function-scope loop vars stay block-local (the
+// convention `collectHoistedVarsStmt` uses). Nested functions/classes own their
+// scopes and are not descended into.
+export type ScriptDecl = {
+  name: string;
+  type: ASType | null;
+  init: Expr | null;
+  isConst: boolean;
+  loop?: { kind: 'in' | 'each'; iterable: Expr; declared: ASType | null };
+};
+
+function collectScriptDecls(body: Stmt[]): ScriptDecl[] {
+  const decls: ScriptDecl[] = [];
+  const seen = new Set<string>();
+  const push = (name: string, type: ASType | null, init: Expr | null, isConst: boolean, loop?: ScriptDecl['loop']): void => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    decls.push(loop ? { name, type, init, isConst, loop } : { name, type, init, isConst });
+  };
+  const walk = (stmts: Stmt[]): void => {
+    for (const s of stmts) {
+      switch (s.kind) {
+        case 'VarDecl': push(s.name, s.type, s.init, false); break;
+        case 'VarDecls': for (const d of s.decls) push(d.name, d.type, d.init, false); break;
+        case 'ConstDecl': push(s.name, s.type, s.init, true); break;
+        case 'ConstDecls': for (const d of s.decls) push(d.name, d.type, d.init, true); break;
+        case 'Block': walk(s.body); break;
+        case 'If': walk([s.then]); if (s.else) walk([s.else]); break;
+        case 'While': case 'DoWhile': walk([s.body]); break;
+        case 'For':
+          if (s.init && s.init.kind === 'VarDecl') push(s.init.name, s.init.type, s.init.init, false);
+          walk([s.body]);
+          break;
+        case 'ForIn':
+          if (s.declares) push(s.varName, null, null, false, { kind: 'in', iterable: s.iterable, declared: null });
+          walk([s.body]);
+          break;
+        case 'ForEachIn':
+          if (s.declares) push(s.varName, null, null, false, { kind: 'each', iterable: s.iterable, declared: s.varType });
+          walk([s.body]);
+          break;
+        case 'Switch': for (const c of s.cases) walk(c.body); break;
+        case 'Try':
+          walk(s.tryBody.body);
+          if (s.catchBody) walk(s.catchBody.body);
+          if (s.finallyBody) walk(s.finallyBody.body);
+          break;
+        case 'Label': walk([s.body]); break;
+        default: break; // FuncDecl/ClassDecl/InterfaceDecl/leaf statements
+      }
+    }
+  };
+  walk(body);
+  return decls;
+}
+
+function collectScriptVars(body: Stmt[]): Set<string> {
+  return new Set(collectScriptDecls(body).map((d) => d.name));
+}
+
 // Compound assignment operator -> underlying binary operator.
 const COMPOUND_BASE: Record<string, string> = {
-  '+=': '+', '-=': '-', '*=': '*', '/=': '/',
+  '+=': '+', '-=': '-', '*=': '*', '/=': '/', '%=': '%',
   '<<=': '<<', '>>=': '>>', '>>>=': '>>>', '&=': '&', '|=': '|', '^=': '^',
 };
 
@@ -25,6 +102,7 @@ export class Emitter {
   // in-body `var` sites emit a plain assignment instead of a re-declaration.
   private hoistedLocals: Set<string> = new Set();
   private currentClass: string | null = null;
+  private currentMethod: string | null = null;
   private suppressBreak = 0;
   private labels: { asName: string; cName: string; tryDepth: number }[] = [];
   // try/finally exception-stack hygiene (stage 76 follow-up): each open try
@@ -37,7 +115,12 @@ export class Emitter {
   // Entry try-depth of the nearest breakable (loop/switch) and continuable
   // (loop) context, used to unwind try frames when break/continue jumps out.
   private breakTargets: number[] = [];
-  private continueTargets: number[] = [];
+  // A continuable loop records its entry try-depth, plus — when the loop was
+  // rewritten around a sequenced condition/update (see `emitWhile`) — the C label
+  // that an unlabelled `continue` must `goto` instead of jumping to the C loop's
+  // back edge (the update prelude/statements sit behind it). `used` lets the label
+  // be emitted only when some `continue` actually targets it.
+  private continueTargets: { depth: number; label: string | null; used: boolean }[] = [];
   private tmpCounter = 0;
   private currentReturnType: CType | null = null;
   // module-level (file-scope) variables: AS3 top-level `var`/`const` are hoisted
@@ -52,29 +135,115 @@ export class Emitter {
 
   private program: Program;
   private symbols: SymbolTable;
-  // Compile-time injected AS-AOT version (Capabilities.version). Empty when the
-  // CLI does not supply one (e.g. library tests that call generateC directly).
-  private asAotVersion: string;
-  private anonFuncs: { name: string; params: Param[]; returnType: ASType; body: Block; captures: { name: string; type: CType }[] }[] = [];
+  private anonFuncs: { name: string; asName: string | null; params: Param[]; returnType: ASType; body: Block; captures: { name: string; type: CType }[]; cname: string | null; isStatic: boolean; depth: number; methodName: string | null }[] = [];
   private anonIndex = new Map<object, string>();
+  private anonSeq = 0;
   private vectorSpecs = new Map<string, CType>();
   // closure analysis state (pass 1 pre-scan)
   private funcVars: Map<string, CType>[] = [];
   private anonCaptures = new Map<object, { name: string; type: CType }[]>();
   private currentAnonLocal: Map<string, CType> | null = null;
   private currentAnonRefs: { name: string; type: CType }[] | null = null;
+  // Whether the anonymous function currently being walked references the enclosing
+  // class's instance state (a bare `this` or an unqualified instance-method call),
+  // and therefore must capture `this` in its environment.
+  private currentAnonNeedsThis = false;
   // closure emit state (pass 2): non-null while emitting a capturing anon body
   private currentClosureCaptures: Map<string, CType> | null = null;
+  // The nested function currently being emitted (its unique C name and arity),
+  // so a recursive self-reference inside its own body resolves to a closure over
+  // the current `env` rather than recursively rebuilding the env.
+  private currentFuncCName: string | null = null;
+  // AS3 name of the function expression whose body is being emitted (null for
+  // anonymous ones). A reference to this name inside its own body denotes the
+  // function itself (`as_fn_make(currentFuncCName__call, env, arity)`), which is
+  // how a named function expression recurses.
+  private currentFuncAsName: string | null = null;
+  // Walk-time counterpart of currentFuncAsName: the name of the named function
+  // expression currently being scanned. References to it are the function itself,
+  // so they must not be recorded as free variables or class-member references.
+  private walkSelfName: string | null = null;
+  private currentFuncArity = 0;
+  // Closures currently being built (to break mutual recursion between sibling
+  // nested functions, e.g. onLoadComplete <-> cleanup). A self/mutual reference
+  // encountered while building yields NULL rather than recursing forever.
+  private buildingClosures = new Set<string>();
+  // Mutually-recursive sibling closure groups (a shared cell breaks the cycle).
+  // Keyed by each member's unique C name -> the group's shared cell info. The
+  // cell holds one `as_fn` slot per member plus the merged free-variable captures,
+  // so every sibling reads vars and sibling function values from the SAME cell
+  // (function identity is shared, satisfying removeEventListener's === match).
+  private closureGroups = new Map<string, { cellName: string; cellLocal: string; members: string[]; varCaps: { name: string; type: CType }[] }>();
+  // Groups keyed by the defining method (`class:method`), so the enclosing body
+  // emission can declare the cell locals it must lazily initialize.
+  private closureGroupsByMethod = new Map<string, { cellName: string; cellLocal: string; members: string[]; varCaps: { name: string; type: CType }[] }[]>();
+  // While emitting the ENCLOSING function body (not a closure body), maps each
+  // boxed (heap-shared) captured local variable name to its cell storage location.
+  // AS3 closures capture variables by reference; a closure that mutates `numComplete`
+  // or reads a `queue` assigned after closure creation must see the SAME storage as
+  // the enclosing body, so these captured locals live in the shared closure cell
+  // rather than as plain C locals (which the old snapshot model captured by value).
+  private enclosingCaptured = new Map<string, { type: CType; cell: string; field: string }>();
+  // ---------- closure activation cells (capture by reference) ----------
+  // AS3 closes over variables, not values: a `var` local (or parameter) of a
+  // function is a single slot shared by that activation and every nested closure.
+  // The env-snapshot model copied the value at closure-creation time, so a local
+  // assigned AFTER the closure was created (Starling's AtfTextureFactory does
+  // `texture = Texture.fromData(...)` after installing the onReady closure) was
+  // still seen as null by the closure (`onComplete(name, null)` -> the asset was
+  // never registered). To match AVM2 each function body whose `var` locals are
+  // captured by a directly nested closure gets a heap-allocated *activation cell*:
+  // the enclosing body accesses those locals as `cellN->x` and every closure that
+  // needs them captures the cell POINTER (`env->cellN->x`), so both sides share one
+  // storage regardless of when the assignment happens.
+  //
+  // Keyed by the function's body statement array (stable AST identity, identical
+  // between the walk and emit passes). A frame is pushed only for real functions
+  // (methods, free functions, nested functions/expressions) — never for the
+  // top-level script, whose vars are module globals with their own storage.
+  private walkFnBodyStack: Stmt[][] = [];
+  private walkFnBody: Stmt[] | null = null;
+  private fnBodyParent = new Map<Stmt[], Stmt[] | null>();
+  private fnBodyVars = new Map<Stmt[], Map<string, CType>>();
+  private fnBodyKids = new Map<Stmt[], string[]>();
+  private fnBodyClass = new Map<Stmt[], string | null>();
+  // Post-walk result: per function body that owns a cell, the cell's C names and
+  // the captured locals it stores.
+  private fnBodyCells = new Map<Stmt[], { cellName: string; cellLocal: string; members: string[]; varCaps: { name: string; type: CType }[] }>();
+  // Per closure: which of its captures resolve through a cell (`name -> cellLocal`)
+  // and which cell pointers its env must carry (its own needs plus every
+  // descendant's, so the pointer can be threaded down at each creation site).
+  private closureCellEnv = new Map<string, { resolve: Map<string, string>; ptrs: { cellLocal: string; cellName: string }[] }>();
+  // Emission state: the body currently being emitted (set by hoistFunctionLocals)
+  // and, while emitting a closure body, the name -> cellLocal resolution map.
+  private currentEmitFnBody: Stmt[] | null = null;
+  private currentClosureCells: Map<string, string> | null = null;
   // bound-method state: an unqualified identifier inside an instance method that
   // names one of the class's methods is `this.method` used as a value (e.g. passed
   // to addEventListener). Each such reference needs a thunk that captures `this`
   // and dispatches through the vtable.
   private boundMethods = new Map<string, { cname: string; mname: string; m: MethodInfo }>();
+  // `super.method` used as a Function value (`super.addVertices.apply(this, args)`).
+  // Unlike `this.method` (which must dispatch virtually, so an override still runs),
+  // `super.method` is statically resolved to the SUPERCLASS implementation. The bound
+  // thunk therefore calls `Owner_method` directly instead of going through the vtable;
+  // a vtable call here would re-enter the overriding method and recurse forever.
+  private superBoundMethods = new Map<string, { owner: string; mname: string; m: MethodInfo }>();
+  // Nested function declarations (a `function foo()` statement inside a method or
+  // function body): AS3 treats these as named closures, so each is recorded with
+  // its captured free variables during pass 1 and resolved to a closure value
+  // when referenced by bare name in emitVar. Keyed by a globally-unique C name
+  // (AS3 function-scoped names collide across classes/methods, so a bare-name
+  // key would overwrite earlier records); `nestedFuncByAsName` maps the
+  // source-level name (qualified by the defining class) back to that unique key.
+  private nestedFuncs = new Map<string, { captures: { name: string; type: CType }[]; params: Param[]; asName: string; methodName: string | null }>();
+  private nestedFuncByAsName = new Map<string, string>();
   // static-method-as-value state: `ClassName.method` referenced as a Function value
   // (e.g. `var f:Function = TweenLite.killTweensOf`) needs a non-capturing thunk.
   private staticMethodRefs = new Map<string, { cname: string; mname: string; m: MethodInfo }>();
   private currentWalkClass: string | null = null;
   private currentWalkIsStatic = false;
+  private currentWalkMethod: string | null = null;
   private currentIsStatic = false;
   // AS3 `arguments` object: the enclosing function's formal parameters, non-null
   // while emitting a method/free-function body (so `arguments` resolves).
@@ -85,11 +254,20 @@ export class Emitter {
   private hoistedAssigns = new Map<Expr, { tmp: string; type: CType }>();
   // Non-const static fields whose initializer must run at runtime (in main).
   private staticFieldInits: { cname: string; fname: string; f: FieldInfo }[] = [];
+  // Classes that own at least one runtime-initialized static field. A read or
+  // write of one of their static fields must first run `C_cinit()` (AS3 lazy
+  // class initialization), so eager-initialization order can never read NULL.
+  private cinitClasses = new Set<string>();
 
-  constructor(program: Program, symbols: SymbolTable, asAotVersion = '') {
+  // C names of classes declared in the compiled source (as opposed to built-ins
+  // registered directly in the symbol table). Only these get a generated
+  // `_new_default` definition, so emitClassRegistry may only reference it for
+  // them; a built-in with all-optional params keeps the NULL factory.
+  private userClasses = new Set<string>();
+
+  constructor(program: Program, symbols: SymbolTable) {
     this.program = program;
     this.symbols = symbols;
-    this.asAotVersion = asAotVersion;
   }
 
   // ---------- top level ----------
@@ -97,19 +275,30 @@ export class Emitter {
   run(): string {
     this.line(RUNTIME_PREAMBLE.trimEnd());
     this.line('');
+    for (const s of this.program.body) {
+      if (s.kind === 'ClassDecl') this.userClasses.add(qualifiedName(s.name, s.packageName));
+    }
     this.collectFunctionValues(); // also gathers Vector.<T> specializations
     this.noteBuiltinVectorSpecs();
     this.emitTypedefs();
     this.emitStructs();
     this.emitPrototypes();
+    this.emitSealedPropErrors();
+    this.emitForwardDecls();
     this.emitModuleVars();
     this.emitFunctionValues();
     this.emitPropTables();
     this.emitMethodThunks();
+    this.emitGetterThunks();
     this.emitMethodTables();
+    this.emitGetterTables();
+    this.emitSetterThunks();
+    this.emitSetterTables();
     this.emitInterfaceVtables();
     this.emitVtables();
+    this.emitClassRegistry();
     this.emitStaticFields();
+    this.emitStaticInits();
     this.emitDefinitions();
     this.emitExportWrappers();
     this.emitGCRoots();
@@ -180,19 +369,35 @@ export class Emitter {
       case 'class': return 'as_class*';
       case 'dict': return 'as_dict*';
       case 'regexp': return 'as_regex*';
+      case 'xml': return 'as_xml_node*';
+      case 'xmllist': return 'as_xml_list*';
       case 'void': return 'void';
     }
   }
 
-  // const-declared type. AS3's `const String` means the *reference* is immutable,
-  // not the character buffer (strings are stored as writable `char*` buffers).
-  // C's `const char*` (pointee-qualified) would force a discarded-qualifier
-  // warning when passed to `char*` params (e.g. Event_ENTER_FRAME ->
-  // addEventListener(char* type)); `char* const` (pointer-qualified) preserves
-  // the AS3 semantics and drops cleanly at call sites.
+  // const-declared type. AS3's `const X` means the *reference* is immutable, not
+  // the object it points to (for reference types) or its character buffer (for
+  // strings). C's `const X*` (pointee-qualified) would wrongly freeze the target
+  // object's members (`const Node* n; n->next = ...` fails) and, for strings,
+  // force a discarded-qualifier warning at `char*` call sites. `X* const`
+  // (pointer-qualified) matches AS3: the pointer itself can't be reassigned, but
+  // the pointee stays writable.
   private constTypeName(t: CType): string {
-    if (t.kind === 'string') return 'char* const';
-    return `const ${this.cTypeName(t)}`;
+    switch (t.kind) {
+      case 'string': return 'char* const';
+      case 'object': return `${t.className}* const`;
+      case 'array': return 'as_array* const';
+      case 'vector': return `as_vector_${this.vectorCName(t.elem)}* const`;
+      case 'record': return 'as_object* const';
+      case 'class': return 'as_class* const';
+      case 'dict': return 'as_dict* const';
+      case 'regexp': return 'as_regex* const';
+      case 'xml': return 'as_xml_node* const';
+      case 'xmllist': return 'as_xml_list* const';
+      case 'function': return 'as_fn const';
+      case 'interface': return `const ${this.cTypeName(t)}`; // struct value: freeze the {obj, vt} pair, not the pointee
+      default: return `const ${this.cTypeName(t)}`; // int/uint/number/bool/any/null/void
+    }
   }
 
   private defaultInit(t: CType): string {
@@ -213,8 +418,34 @@ export class Emitter {
       case 'class': return 'NULL';
       case 'dict': return 'NULL';
       case 'regexp': return 'NULL';
+      case 'xml': return 'NULL';
+      case 'xmllist': return 'NULL';
       case 'void': return '';
     }
+  }
+
+  // Whether a constructor body (recursively) contains a `super(...)` call. AS3
+  // permits `super()` inside a conditional/loop as long as every non-throwing path
+  // calls it; the top-level `findIndex` alone misses those, so this walks nested
+  // statements too (but not nested function/class bodies, whose `super` is unrelated).
+  private containsSuperCall(stmts: Stmt[]): boolean {
+    for (const s of stmts) {
+      if (s.kind === 'SuperCall') return true;
+      switch (s.kind) {
+        case 'Block': if (this.containsSuperCall(s.body)) return true; break;
+        case 'If': if (this.containsSuperCallStmt(s.then)) return true; if (s.else && this.containsSuperCallStmt(s.else)) return true; break;
+        case 'While': case 'DoWhile': case 'For': case 'ForIn': case 'ForEachIn': if (this.containsSuperCallStmt(s.body)) return true; break;
+        case 'Switch': for (const c of s.cases) if (this.containsSuperCall(c.body)) return true; break;
+        case 'Label': if (this.containsSuperCallStmt(s.body)) return true; break;
+        case 'Try': if (this.containsSuperCall(s.tryBody.body)) return true; if (s.catchBody && this.containsSuperCall(s.catchBody.body)) return true; if (s.finallyBody && this.containsSuperCall(s.finallyBody.body)) return true; break;
+        default: break;
+      }
+    }
+    return false;
+  }
+
+  private containsSuperCallStmt(s: Stmt): boolean {
+    return this.containsSuperCall([s]);
   }
 
   // Stable C name fragment for a Vector element type (used to build the
@@ -228,7 +459,12 @@ export class Emitter {
       case 'string': return 'string';
       case 'object': return elem.className;
       case 'interface': return elem.name;
-      default: throw new CodegenError('unsupported Vector element type');
+      case 'array': return 'array';
+      case 'function': return 'function';
+      case 'xml': return 'xml';
+      case 'xmllist': return 'xmllist';
+      case 'vector': return 'vector_' + this.vectorCName(elem.elem);
+      default: throw new CodegenError('unsupported Vector element type: ' + elem.kind);
     }
   }
 
@@ -236,7 +472,11 @@ export class Emitter {
   // vs. a scalar value (int/uint/number/bool). Reference elements need their data
   // array GC-traced; scalar elements' data is a plain (non-GC) value buffer.
   private vectorElemIsPtr(elem: CType): boolean {
-    return elem.kind === 'string' || elem.kind === 'object' || elem.kind === 'interface';
+    // Interface values are stored BY VALUE as `{ obj, vt }` structs, not as raw
+    // pointers (their obj member is a pointer, but the element itself is not).
+    return elem.kind === 'string' || elem.kind === 'object' ||
+           elem.kind === 'array' || elem.kind === 'function' || elem.kind === 'vector' ||
+           elem.kind === 'xml' || elem.kind === 'xmllist';
   }
 
   // How a captured CType must be traced from a closure environment: 'ptr' for a
@@ -246,10 +486,24 @@ export class Emitter {
     switch (t.kind) {
       case 'string': case 'object': case 'interface': case 'array':
       case 'vector': case 'record': case 'dict': case 'function':
-      case 'regexp': case 'class': return 'ptr';
+      case 'regexp': case 'class': case 'xml': case 'xmllist': return 'ptr';
       case 'any': return 'value';
       default: return null;
     }
+  }
+
+  // Hoist the collection expression of a for-in / for-each loop into a temporary.
+  // AS3 evaluates that expression exactly once, but the generated loop inlines it
+  // into the condition, so a call with side effects would run on every iteration:
+  // Starling's `for each (var name:String in getTextureNames(prefix, sNames))`
+  // re-appends to the very vector it iterates, so the bound grew forever (an
+  // infinite loop inside AssetManager.getTextures -> MovieScene never opened).
+  // The temp captures the collection object once, while `->length` on it stays
+  // live, matching AVM2 (elements pushed by the body are still visited).
+  private hoistCollection(e: { code: string; type: CType }): string {
+    const tmp = this.tmpName('coll');
+    this.line(`${this.cTypeName(e.type)} ${tmp} = ${e.code};`);
+    return tmp;
   }
 
   // C expression turning a Vector element value into its string form (for join).
@@ -262,13 +516,23 @@ export class Emitter {
       case 'string': return `(${expr} ? ${expr} : "null")`;
       case 'object': return `as_obj_to_str((void*)(${expr}))`;
       case 'interface': return `as_obj_to_str(${expr}.obj)`;
-      default: throw new CodegenError('unsupported Vector element type for join');
+      case 'xml': return `as_xml_to_string(${expr})`;
+      case 'xmllist': return `as_xml_list_to_string(${expr})`;
+      case 'function': return '"function Function() {}"';
+      case 'vector': return '"[object Vector]"';
+      case 'array': return `as_array_join(${expr}, ",")`;
+      case 'dict': return '"[object Dictionary]"';
+      case 'regexp': return '"[object RegExp]"';
+      case 'class': return '"[class]"';
+      case 'record': return '"[object Object]"';
+      default: throw new CodegenError('unsupported Vector element type for join: ' + elem.kind);
     }
   }
 
   // C expression testing whether two Vector element values are equal (for indexOf).
   private vectorElemEq(elem: CType, a: string, b: string): string {
     if (elem.kind === 'string') return `strcmp(${a}, ${b}) == 0`;
+    if (elem.kind === 'interface') return `(${a}.obj == ${b}.obj && ${a}.vt == ${b}.vt)`;
     return `${a} == ${b}`;
   }
 
@@ -276,14 +540,14 @@ export class Emitter {
   // once, monomorphized to the element type.
   private noteType(t: ASType | null): void {
     if (t && t.startsWith('Vector.<')) {
-      const ct = resolveType(t);
-      if (ct.kind === 'vector') this.vectorSpecs.set(t, ct.elem);
+      const ct = this.rt(t);
+      if (ct.kind === 'vector') this.vectorSpecs.set(this.vectorCName(ct.elem), ct.elem);
     }
   }
 
   // Register a Vector.<T> specialization referenced by a resolved CType.
   private noteCType(t: CType): void {
-    if (t.kind === 'vector') this.vectorSpecs.set(ctypeToString(t), t.elem);
+    if (t.kind === 'vector') this.vectorSpecs.set(this.vectorCName(t.elem), t.elem);
   }
 
   // Built-in class method/field signatures can reference Vector.<T> that no user
@@ -294,10 +558,12 @@ export class Emitter {
   private noteBuiltinVectorSpecs(): void {
     for (const [, info] of this.symbols.classes) {
       for (const f of info.fields.values()) this.noteCType(f.type);
-      for (const m of info.methods.values()) { this.noteCType(m.returnType); for (const p of m.params) this.noteCType(resolveType(p.type)); }
+      for (const m of info.methods.values()) { this.noteCType(m.returnType); for (const p of m.params) this.noteCType(resolveType(p.type, info.importAlias)); }
       for (const m of info.getters.values()) this.noteCType(m.returnType);
-      for (const m of info.setters.values()) for (const p of m.params) this.noteCType(resolveType(p.type));
-      for (const m of info.staticMethods.values()) { this.noteCType(m.returnType); for (const p of m.params) this.noteCType(resolveType(p.type)); }
+      for (const m of info.setters.values()) for (const p of m.params) this.noteCType(resolveType(p.type, info.importAlias));
+      for (const m of info.staticGetters?.values() ?? []) this.noteCType(m.returnType);
+      for (const m of info.staticSetters?.values() ?? []) for (const p of m.params) this.noteCType(resolveType(p.type, info.importAlias));
+      for (const m of info.staticMethods.values()) { this.noteCType(m.returnType); for (const p of m.params) this.noteCType(resolveType(p.type, info.importAlias)); }
     }
   }
 
@@ -343,14 +609,105 @@ export class Emitter {
   // at the original site via emitVarDecl.
   private hoistFunctionLocals(body: Stmt[]): void {
     this.hoistedLocals = new Set();
+    // Identify the body currently being emitted so its activation cell (if any)
+    // can be introduced and referenced by name inside it.
+    this.currentEmitFnBody = body;
     this.collectHoistedVars(body);
+    // Populate the boxed captured-local set after the hoisted vars are known, so
+    // only `var`-locals (not params / untyped block locals) get reference cells.
+    this.buildEnclosingCaptured();
+    // The activation cell holds the captured locals of this body; allocate it up
+    // front (before any closure in the body can be created) so the enclosing body
+    // and every closure share one storage, whichever side assigns first.
+    this.emitActivationCell();
     if (this.hoistedLocals.size === 0) return;
     // Emit declarations in first-seen order (function scope is a Map, insertion-
     // ordered), so `int a`/`int b` read top-down exactly as the source declares.
     for (const name of this.hoistedLocals) {
+      // Captured locals live in the shared closure cell (reference semantics),
+      // not as plain C locals — skip the local declaration so the enclosing body
+      // and its closures read/write the same heap storage.
+      if (this.enclosingCaptured.has(name)) continue;
       const t = this.functionScope!.get(name)!;
       this.line(`${this.cTypeName(t)} ${this.cIdent(name)} = ${this.defaultInit(t)};`);
     }
+  }
+
+  // Populate `enclosingCaptured` with the boxed (heap-shared) captured locals of
+  // the function currently being emitted. AS3 closures capture by reference, so a
+  // captured `var` local assigned after closure creation (or mutated inside a
+  // closure) must share storage with the enclosing body; it therefore lives in the
+  // shared closure cell. Only typed `var` locals are boxed — `this` and function
+  // parameters are never reassigned (a parameter reassignment is legal but rare;
+  // it falls back to snapshot) and keep a by-value seed.
+  private buildEnclosingCaptured(): void {
+    this.enclosingCaptured = new Map();
+    // A closure body resolves its captures via `env->name` (currentClosureCaptures),
+    // not the enclosing cell — do not box here.
+    if (this.currentClosureCaptures === null) {
+      const key = `${this.currentClass ?? ''}:${this.currentMethod ?? ''}`;
+      const groups = this.closureGroupsByMethod.get(key);
+      if (groups) {
+        for (const g of groups) {
+          for (const c of g.varCaps) {
+            if (c.name === 'this') continue;
+            if (!this.hoistedLocals.has(c.name)) continue;
+            this.enclosingCaptured.set(c.name, { type: c.type, cell: g.cellLocal, field: this.cIdent(c.name) });
+          }
+        }
+      }
+    }
+    // This body's own activation cell (captured var-locals shared with closures).
+    // Applies inside closure bodies too: a nested function's own captured local
+    // must be shared with the closures defined in it (Starling's
+    // AtfTextureFactory.createTexture assigns `texture` after installing the
+    // onReady closure, and that closure must observe the assignment).
+    const cell = this.currentEmitFnBody !== null ? this.fnBodyCells.get(this.currentEmitFnBody) : undefined;
+    if (cell) {
+      for (const f of cell.varCaps) {
+        if (!this.hoistedLocals.has(f.name)) continue;
+        this.enclosingCaptured.set(f.name, { type: f.type, cell: cell.cellLocal, field: this.cIdent(f.name) });
+      }
+    }
+  }
+
+  // Emit (declare + allocate) the activation cell of the body being emitted. The
+  // allocator zero-fills the struct and sets Number fields to NaN, matching AS3's
+  // default value for an unassigned local.
+  private emitActivationCell(): void {
+    const body = this.currentEmitFnBody;
+    if (body === null) return;
+    const cell = this.fnBodyCells.get(body);
+    if (!cell) return;
+    this.declareVar(cell.cellLocal, { kind: 'object', className: cell.cellName });
+    this.line(`${cell.cellName}* ${this.cIdent(cell.cellLocal)} = ${cell.cellName}_alloc();`);
+  }
+
+  // Eagerly allocate each mutually-recursive closure group's shared cell and seed
+  // its non-boxed captures (`this`, function params) from the enclosing scope. The
+  // boxed captured locals are default-initialized by the allocator and written by
+  // the enclosing body via `cell->field` (reference semantics).
+  private emitClosureCellLocals(): void {
+    const key = `${this.currentClass ?? ''}:${this.currentMethod ?? ''}`;
+    const groups = this.closureGroupsByMethod.get(key);
+    if (!groups) return;
+    for (const g of groups) {
+      this.line(`${g.cellName}* ${g.cellLocal} = ${g.cellName}_alloc();`);
+      // Seed non-boxed captures (this + function params) from the current scope.
+      for (const c of g.varCaps) {
+        if (this.enclosingCaptured.has(c.name)) continue;
+        const v = this.emitVar(c.name);
+        this.line(`${g.cellLocal}->${this.cIdent(c.name)} = ${v.code};`);
+      }
+    }
+  }
+
+  // The environment struct name for a nested function: a group member's impl
+  // takes the shared cell as its environment; a plain capturing closure takes
+  // its own `_nfXX_env` struct.
+  private closureEnvType(fn: { name: string }): string {
+    const g = this.closureGroups.get(fn.name);
+    return g ? g.cellName : `${fn.name}_env`;
   }
 
   private collectHoistedVars(stmts: Stmt[]): void {
@@ -364,7 +721,7 @@ export class Emitter {
     if (type === null) return;
     if (!this.hoistedLocals.has(name)) {
       this.hoistedLocals.add(name);
-      this.functionScope!.set(name, resolveType(type));
+      this.functionScope!.set(name, this.rt(type));
     }
   }
 
@@ -412,14 +769,39 @@ export class Emitter {
     return `_${prefix}${this.tmpCounter++}`;
   }
 
+  // Resolve a source type name in the CURRENT class's import context (so short
+  // names like `Sprite`/`Rectangle` pick the class imported by this file, not the
+  // global alias table). Falls back to the global table when not inside a class.
+  private rt(t: ASType | null): CType {
+    const alias = this.currentClass ? this.symbols.getClass(this.currentClass)?.importAlias : null;
+    return resolveType(t, alias);
+  }
+
   // Resolve a short class name written in source (e.g. `Log` in package `demo`)
   // to its fully-qualified C identifier (`demo.Log`) via the same alias table
   // resolveType uses. Built-ins and package-less classes map to themselves.
   private resolveClassName(name: string): string {
-    const t = resolveType(name);
+    const t = this.rt(name);
     if (t.kind === 'object') return t.className;
     if (t.kind === 'interface') return t.name;
     return name;
+  }
+
+  // Flatten a dot-separated member chain (`a.b.c.d`) into [a, b, c, d] when it is
+  // rooted at a Var (the package's first segment in a fully-qualified reference
+  // like `starling.events.Event.ROOT_CREATED`). Returns null for anything else.
+  private flattenDotChain(expr: Expr): string[] | null {
+    const names: string[] = [];
+    let cur: Expr = expr;
+    while (cur.kind === 'Member') {
+      names.unshift(cur.property);
+      cur = cur.object;
+    }
+    if (cur.kind === 'Var') {
+      names.unshift(cur.name);
+      return names;
+    }
+    return null;
   }
 
   // ---------- declarations ----------
@@ -441,11 +823,26 @@ export class Emitter {
     // can trace element pointers for reference element types), then the
     // contiguous element array + length/capacity. Emitted FIRST so vtable slots
     // (e.g. Matrix3D.transformVectors -> as_vector_number*) can reference them.
-    for (const [, elem] of this.vectorSpecs) {
-      const key = this.vectorCName(elem);
+    // Iterate in sorted order so a nested vector's element type (which itself is
+    // a vector typedef) is defined before the vector whose data points at it.
+    for (const [key, elem] of [...this.vectorSpecs.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
       this.line(`typedef struct { void (*mark)(void*); ${this.cTypeName(elem)}* data; int length; int capacity; } as_vector_${key};`);
     }
     if (this.vectorSpecs.size > 0) this.line('');
+    // Interface reference structs must be complete before any class struct whose
+    // field holds an interface value (AS3 fields typed as an interface are stored
+    // by value as the `{ obj, vt }` pair). The class struct loop below can
+    // therefore embed `ITextCompositor _compositor;` — without this the field is
+    // an incomplete type (forward-declared typedef only).
+    for (const [name] of this.symbols.interfaces) {
+      this.line(`struct ${name} {`);
+      this.indent++;
+      this.line('void* obj;');
+      this.line(`${name}_vtable* vt;`);
+      this.indent--;
+      this.line('};');
+    }
+    if (this.symbols.interfaces.size > 0) this.line('');
     for (const [name, info] of this.symbols.classes) {
       this.line(`// class ${name}`);
       // vtable struct: `super` chain for runtime type checks (`is`/`as`), then
@@ -457,11 +854,23 @@ export class Emitter {
       this.line('void** ifaces;');
       this.line('void* props;');
       this.line('void* methods;');
+      this.line('void* getters;');
+      // Reflection table of OWN setters (`setters` mirrors the runtime
+      // as_vtable_header field of the same name). Without it a dynamic write
+      // (`obj[name] = v`, e.g. the Juggler tweening an accessor-backed property
+      // like `alpha`/`rotationX`) cannot reach the setter implementation.
+      this.line('void* setters;');
       // Byte offset of the `_dyn` slot table (dynamic classes only), -1 otherwise.
       // Mirrors as_vtable_header.dyn_offset so a class vtable can be cast to it.
       this.line('int dyn_offset;');
-      for (const [mname, m] of info.methods) {
-        this.line(`${this.methodPtrField(m, mname)};`);
+      // AS3 fully-qualified class name ("包::类"), mirrors as_vtable_header.fqn so
+      // getQualifiedClassName can return the human-readable name rather than the
+      // sanitized C identifier in `name`.
+      this.line('const char* fqn;');
+      for (const slot of info.vtableSlots ?? []) {
+        if (slot.kind === 'method') this.line(`${this.methodPtrField(slot.info, slot.name)};`);
+        else if (slot.kind === 'getter') this.line(`${this.getterPtrField(slot.info, slot.name)};`);
+        else this.line(`${this.setterPtrField(slot.info, slot.name)};`);
       }
       this.indent--;
       this.line('};');
@@ -512,6 +921,7 @@ export class Emitter {
           this.line('unsigned _para_color;');
           this.line('int _para_collapse;');
           this.line('double _para_leading;');
+          this.line('int _para_align;');
           this.line('int _sel_begin;');
           this.line('int _sel_end;');
           this.line('int _sel_caret;');
@@ -530,12 +940,48 @@ export class Emitter {
       if (this.symbols.isSubclassOf(name, 'Matrix3D')) {
         this.line('double _m[16];');
       }
+      // SharedObject keeps its persisted attribute table (a GC object, so the
+      // props reflection table marks it — see emitPropTables), the storage file
+      // path, and the client callback target in C-runtime-only slots. data / size
+      // / client / objectEncoding are AS3 accessors, so no AS3-visible field is
+      // declared (AIR's data is read-only and mxmlc rejects `so.data = x`).
+      if (this.symbols.isSubclassOf(name, 'SharedObject')) {
+        this.line('char* name;');
+        this.line('char* path;');
+        this.line('as_object* _data;');
+        this.line('void* _client;');
+        this.line('unsigned int _objectEncoding;');
+        this.line('double _fps;');
+      }
+      // URLStream owns its transfer: `_job` is the live streaming job (a plain
+      // malloc structure, NOT traced by the GC), and `_buf`/`_buf_pos` are the
+      // remainder copied out of it when the load completes, so reads keep working
+      // after the job retires. `_buf` is a GC ByteArray and is marked through the
+      // props table (see emitPropTables); `_job` must never be — pointer-tagging
+      // a malloc block would send gc_scan into non-heap memory.
+      if (name === 'URLStream') {
+        this.line('void* _job;');
+        this.line('void* _buf;');
+        this.line('int _buf_pos;');
+      }
+      // flash.net sockets: `_sock` is a BORROWED handle to the transport owned by
+      // RUNTIME_PREAMBLE's socket registry (see the socket seam). Not AS3-visible
+      // — the AS3 surface is the getters, and close() drops the handle. It must
+      // never be a GC pointer: the registry owns the as_sock's lifetime.
+      if (this.symbols.isSubclassOf(name, 'Socket') || name === 'XMLSocket' || name === 'ServerSocket') {
+        this.line('void* _sock;');
+        // A closed ServerSocket cannot be reopened (the reference says to create a
+        // new instance), but the object still has to answer a later bind() with the
+        // documented error instead of quietly rebinding to a new port.
+        if (name === 'ServerSocket') this.line('int _closed;');
+      }
       this.indent--;
       this.line('};');
       this.line('');
     }
-    // interface vtables (method function pointers only) and reference structs
-    // (a pair of object pointer + interface vtable).
+    // interface vtables (method function pointers only). The reference struct
+    // (`struct X { void* obj; X_vtable* vt; }`) is emitted BEFORE the class
+    // structs above so class fields can embed interface values by value.
     for (const [name, info] of this.symbols.interfaces) {
       this.line(`struct ${name}_vtable {`);
       this.indent++;
@@ -545,38 +991,94 @@ export class Emitter {
       this.line('void* props;');
       this.line('void* methods;');
       for (const [mname, m] of info.methods) {
-        this.line(`${this.methodPtrField(m, mname)};`);
+        this.line(`${this.methodPtrField(m, mname, info.importAlias)};`);
       }
-      this.indent--;
-      this.line('};');
-      this.line(`struct ${name} {`);
-      this.indent++;
-      this.line('void* obj;');
-      this.line(`${name}_vtable* vt;`);
       this.indent--;
       this.line('};');
       this.line('');
     }
   }
 
+  // Runtime errors for property access on a SEALED (non-dynamic) class instance.
+  // AS3 raises ReferenceError #1056 on `obj.newProp = v` and #1069 on reading a
+  // missing property. These are emitted right after the prototypes (rather than
+  // living in RUNTIME_PREAMBLE) because they construct Error objects, and the
+  // Error class hierarchy is defined after the preamble; the preamble's
+  // as_dyn_get / as_dyn_set reach them through the prototypes declared there.
+  private emitSealedPropErrors(): void {
+    this.line('// Rewrite a "pkg::Name" fully-qualified class name to the dotted "pkg.Name"');
+    this.line('// form AIR uses in its error messages. Error path only, and the single static');
+    this.line('// buffer makes it non-reentrant (it is consumed within one call).');
+    this.line('static char* as_fqn_dotted(const char* fqn) {');
+    this.indent++;
+    this.line('if (fqn == NULL) return (char*)"Object";');
+    this.line('const char* sep = strstr(fqn, "::");');
+    this.line('if (sep == NULL) return (char*)fqn;');
+    this.line('static char buf[512];');
+    this.line('size_t n = (size_t)(sep - fqn); if (n > 500) n = 500;');
+    this.line('memcpy(buf, fqn, n);');
+    this.line("buf[n] = '.';");
+    this.line('size_t rest = strlen(sep + 2); if (rest > 510 - n) rest = 510 - n;');
+    this.line('memcpy(buf + n + 1, sep + 2, rest);');
+    this.line('buf[n + 1 + rest] = 0;');
+    this.line('return buf;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_throw_sealed_set(const char* key, const char* fqn) {');
+    this.indent++;
+    this.line('const char* parts[5];');
+    this.line('parts[0] = "Error #1056: Cannot create property ";');
+    this.line('parts[1] = key;');
+    this.line('parts[2] = " on ";');
+    this.line('parts[3] = as_fqn_dotted(fqn);');
+    this.line('parts[4] = ".";');
+    this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1056));');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_throw_sealed_get(const char* key, const char* fqn) {');
+    this.indent++;
+    this.line('const char* parts[5];');
+    this.line('parts[0] = "Error #1069: Property ";');
+    this.line('parts[1] = key;');
+    this.line('parts[2] = " not found on ";');
+    this.line('parts[3] = as_fqn_dotted(fqn);');
+    this.line('parts[4] = " and there is no default value.";');
+    this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1069));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('');
+  }
+
   private emitPrototypes(): void {
     // constructors (init + new)
     for (const [name, info] of this.symbols.classes) {
-      const params = this.paramDecls(info.constructor.params);
+      const params = this.paramDecls(info.constructor.params, info.importAlias);
       this.line(`void ${name}_ctor(${name}* o${params ? ', ' + params : ''});`);
       this.line(`${name}* ${name}_new(${params || 'void'});`);
+      // Classes that are constructible with no arguments (every parameter has a
+      // default) but whose constructor still takes parameters need a genuine
+      // no-argument entry point for the reflection factory.
+      const cparams = info.constructor.params;
+      if (cparams.length > 0 && cparams.every((p) => p.defaultValue !== null || p.isRest) && this.userClasses.has(name)) {
+        this.line(`${name}* ${name}_new_default(void);`);
+      }
     }
+    // Dynamic class instantiation (`new (classRef)()`). Declared here because its
+    // definition lives in emitClassRegistry, which runs AFTER emitFunctionValues
+    // (closure bodies may already contain `new (expr as Class)()`).
+    this.line('static as_value as_dyn_new(as_class* c);');
     // methods
     for (const [cname, info] of this.symbols.classes) {
       for (const [mname, m] of info.methods) {
         if (m.owner !== cname) continue; // inherited methods are declared under their owner
-        const p = this.paramDecls(m.params);
+        const p = this.paramDecls(m.params, info.importAlias);
         this.line(`${this.cTypeName(m.returnType)} ${cname}_${mname}(void* _this${p ? ', ' + p : ''});`);
       }
       // static methods (no receiver)
       for (const [mname, m] of info.staticMethods) {
         if (m.owner !== cname) continue;
-        this.line(`${this.cTypeName(m.returnType)} ${cname}_${mname}_static(${this.paramDecls(m.params)});`);
+        this.line(`${this.cTypeName(m.returnType)} ${cname}_${mname}_static(${this.paramDecls(m.params, info.importAlias)});`);
       }
       // getters / setters
       for (const [mname, m] of info.getters) {
@@ -585,8 +1087,19 @@ export class Emitter {
       }
       for (const [mname, m] of info.setters) {
         if (m.owner !== cname) continue;
-        const p = this.paramDecls(m.params);
+        const p = this.paramDecls(m.params, info.importAlias);
         this.line(`void ${cname}_set_${mname}(void* _this${p ? ', ' + p : ''});`);
+      }
+      // static getters / setters use a `_static` suffix so they cannot collide
+      // with an instance getter/setter of the same name.
+      for (const [mname, m] of info.staticGetters ?? []) {
+        if (m.owner !== cname) continue;
+        this.line(`${this.cTypeName(m.returnType)} ${cname}_get_${mname}_static(void* _this);`);
+      }
+      for (const [mname, m] of info.staticSetters ?? []) {
+        if (m.owner !== cname) continue;
+        const p = this.paramDecls(m.params, info.importAlias);
+        this.line(`void ${cname}_set_${mname}_static(void* _this${p ? ', ' + p : ''});`);
       }
     }
     // free functions
@@ -601,7 +1114,10 @@ export class Emitter {
       this.line(`as_vector_${key}* as_vector_${key}_new_sized(int n);`);
       this.line(`as_vector_${key}* as_vector_${key}_make(int n, ${ec}* items);`);
       this.line(`int as_vector_${key}_push(as_vector_${key}* v, ${ec} e);`);
+      this.line(`int as_vector_${key}_push_all(as_vector_${key}* v, as_array* a);`);
       this.line(`${ec} as_vector_${key}_pop(as_vector_${key}* v);`);
+      this.line(`${ec} as_vector_${key}_shift(as_vector_${key}* v);`);
+      this.line(`int as_vector_${key}_unshift(as_vector_${key}* v, ${ec} e);`);
       this.line(`${ec} as_vector_${key}_get(as_vector_${key}* v, int i);`);
       this.line(`void as_vector_${key}_set(as_vector_${key}* v, int i, ${ec} e);`);
       this.line(`int as_vector_${key}_indexOf(as_vector_${key}* v, ${ec} e);`);
@@ -610,6 +1126,8 @@ export class Emitter {
       this.line(`as_vector_${key}* as_vector_${key}_slice(as_vector_${key}* v, int from, int to);`);
       this.line(`as_vector_${key}* as_vector_${key}_concat(as_vector_${key}* a, as_vector_${key}* b);`);
       this.line(`as_vector_${key}* as_vector_${key}_splice(as_vector_${key}* v, int start, int deleteCount, ${ec}* items, int itemCount);`);
+      this.line(`${ec} as_vector_${key}_removeAt(as_vector_${key}* v, int index);`);
+      this.line(`void as_vector_${key}_insertAt(as_vector_${key}* v, int index, ${ec} e);`);
       this.line(`void as_vector_${key}_forEach(as_vector_${key}* v, as_fn cb);`);
       this.line(`as_vector_${key}* as_vector_${key}_map(as_vector_${key}* v, as_fn cb);`);
       this.line(`as_vector_${key}* as_vector_${key}_filter(as_vector_${key}* v, as_fn cb);`);
@@ -619,42 +1137,224 @@ export class Emitter {
     if (this.symbols.classes.size > 0 || this.symbols.funcs.size > 0 || this.vectorSpecs.size > 0) this.line('');
   }
 
-  private paramDecls(params: Param[]): string {
-    return params.map((p) => `${this.cTypeName(resolveType(p.type))} ${this.cIdent(p.name)}`).join(', ');
+  private paramDecls(params: Param[], importAlias?: Map<string, string> | null): string {
+    const resolve = (t: ASType | null): CType => importAlias !== undefined ? resolveType(t, importAlias) : this.rt(t);
+    return params.map((p) => `${this.cTypeName(resolve(p.type))} ${this.cIdent(p.name)}`).join(', ');
+  }
+
+  // Forward-declare every class vtable and static field so bodies emitted before
+  // their definitions (anonymous-function thunks in emitFunctionValues, which run
+  // before emitVtables/emitStaticFields) can reference them. Anonymous closures
+  // capture `env->this` and may do `is`/`as` against `&Bitmap_vt`, compare a Touch
+  // against `TouchPhase_BEGAN`, or read a static const — all of which need a
+  // declaration to precede the closure body.
+  private emitForwardDecls(): void {
+    for (const [name] of this.symbols.classes) {
+      this.line(`static ${name}_vtable ${name}_vt;`);
+    }
+    for (const [cname, info] of this.symbols.classes) {
+      for (const [fname, f] of info.staticFields) {
+        if (f.owner !== cname) continue;
+        const t = f.isConst && this.isConstExpr(f.init) ? this.constTypeName(f.type) : this.cTypeName(f.type);
+        this.line(`static ${t} ${cname}_${fname};`);
+      }
+    }
+    // Interface vtables (per class implementing the interface) are also referenced
+    // before their definitions by anonymous-function bodies and interface value
+    // construction, so forward-declare them too.
+    for (const [cname, cinfo] of this.symbols.classes) {
+      for (const iname of cinfo.implements) {
+        this.line(`static ${iname}_vtable ${cname}_${iname}_vt;`);
+      }
+    }
+    if (this.symbols.classes.size > 0) this.line('');
   }
 
   // Function-pointer field declaration for a vtable slot. The receiver is a
   // `void*` so an overriding method keeps the same signature as the overridden one.
-  private methodPtrField(m: MethodInfo, name: string): string {
-    const params = m.params.map((p) => this.cTypeName(resolveType(p.type))).join(', ');
+  private methodPtrField(m: MethodInfo, name: string, importAlias?: Map<string, string> | null): string {
+    const alias = importAlias ?? this.symbols.getClass(m.owner)?.importAlias;
+    const params = m.params.map((p) => this.cTypeName(resolveType(p.type, alias))).join(', ');
     const args = params ? `void*, ${params}` : 'void*';
     return `${this.cTypeName(m.returnType)} (*${this.cIdent(name)})(${args})`;
+  }
+
+  // Function-pointer field for a vtable GETTER slot. Getter signature is receiver
+  // only (`RetType (*get_name)(void* _this)`); the `get_` prefix keeps the field
+  // name distinct from the method slot of the same AS name (and a `set_` slot).
+  private getterPtrField(g: MethodInfo, name: string): string {
+    return `${this.cTypeName(g.returnType)} (*get_${this.cIdent(name)})(void* _this)`;
+  }
+
+  // Function-pointer field for a vtable SETTER slot. Setter signature is receiver
+  // plus one value parameter (`void (*set_name)(void* _this, ParamType value)`).
+  private setterPtrField(s: MethodInfo, name: string, importAlias?: Map<string, string> | null): string {
+    const alias = importAlias ?? this.symbols.getClass(s.owner)?.importAlias;
+    const params = s.params.map((p) => this.cTypeName(resolveType(p.type, alias))).join(', ');
+    const args = params ? `void* _this, ${params}` : 'void* _this';
+    return `void (*set_${this.cIdent(name)})(${args})`;
+  }
+
+  // Emit a setter CALL for an instance or static setter. Instance setters are
+  // VIRTUAL: dispatch through the runtime object's vtable so a base-typed
+  // reference reaches an overriding subclass setter. Static setters call the
+  // `_static` implementation directly (objCode is `NULL`). `super.property = v`
+  // bypasses this helper (it must call the resolved superclass setter statically).
+  private setterCallCode(owner: string, property: string, isStatic: boolean, objCode: string, valueCode: string): string {
+    if (isStatic) return `${owner}_set_${property}_static(${objCode}, ${valueCode})`;
+    return `(${objCode}->vtable->set_${this.cIdent(property)}(${objCode}, ${valueCode}))`;
   }
 
   // Static vtable instance per class, filled with the implementing function for
   // each method slot (inherited methods point at their owner's implementation).
   private emitVtables(): void {
-    // Forward-declare every class vtable so subclass initializers can reference
-    // their superclass vtable regardless of declaration order.
-    for (const [name] of this.symbols.classes) {
-      this.line(`static ${name}_vtable ${name}_vt;`);
-    }
-    if (this.symbols.classes.size > 0) this.line('');
     for (const [name, info] of this.symbols.classes) {
       const superVt = info.superClass ? `&${info.superClass}_vt` : 'NULL';
       const ifaceArr = info.implements.length > 0 ? `${name}_ifaces` : 'NULL';
       const props = this.hasOwnProps(name) ? `${name}_props` : 'NULL';
       const methods = this.hasOwnMethods(name) ? `${name}_methods` : 'NULL';
+      const getters = this.hasOwnGetters(name) ? `${name}_getters` : 'NULL';
+      const setters = this.hasOwnSetters(name) ? `${name}_setters` : 'NULL';
       // Dynamic classes record the byte offset of their `_dyn` slot table here
       // (struct has the field only when isDynamic); non-dynamic classes use -1.
       const dynOffset = info.isDynamic ? `(int)offsetof(${name}, _dyn)` : '-1';
-      const entries: string[] = [`"${name}"`, superVt, ifaceArr, props, methods, dynOffset];
-      for (const [mname, m] of info.methods) {
-        entries.push(`${m.owner}_${mname}`);
+      // AS3 fully-qualified name: user classes carry `fqn` ("包::类"); built-ins
+      // (no package) fall back to the sanitized C name, which equals the short name
+      // since built-in class names are not C reserved words.
+      const fqn = info.fqn ?? name;
+      const entries: string[] = [`"${name}"`, superVt, ifaceArr, props, methods, getters, setters, dynOffset, `"${this.escapeCString(fqn)}"`];
+      for (const slot of info.vtableSlots ?? []) {
+        if (slot.kind === 'method') entries.push(`${slot.info.owner}_${slot.name}`);
+        else if (slot.kind === 'getter') entries.push(`${slot.info.owner}_get_${slot.name}`);
+        else entries.push(`${slot.info.owner}_set_${slot.name}`);
       }
       this.line(`static ${name}_vtable ${name}_vt = { ${entries.join(', ')} };`);
     }
     if (this.symbols.classes.size > 0) this.line('');
+  }
+
+  // flash.utils.getDefinitionByName registry: a NULL-terminated table of user
+  // classes (those with an AS3 fqn) mapped to their vtable + no-arg factory. The
+  // dynamic `new (classRef)()` path only supports no-arg constructors, so classes
+  // with REQUIRED constructor args register a NULL factory (their name can still
+  // round-trip getQualifiedClassName -> getDefinitionByName, just not be `new`ed).
+  // A class whose parameters are all optional is constructible with no arguments
+  // and registers the generated `Foo_new_default` wrapper instead.
+  // Built-ins (no packageName -> fqn undefined) are deliberately excluded, so
+  // getDefinitionByName("flash.display.Sprite") throws ReferenceError — matching
+  // the subset's lack of an AIR built-in definition table.
+  // The no-argument factory expression registered for `name` in
+  // as_class_registry, or 'NULL' when the class cannot be constructed with no
+  // arguments. AS3 permits `new Foo()` iff every constructor parameter has a
+  // default, so this MUST be keyed on the count of REQUIRED parameters, not the
+  // total (a bug that made `new (Object(x).constructor as Class)()` dereference
+  // a NULL pointer for all-optional-parameter classes).
+  private ctorFactoryExpr(name: string): string {
+    const info = this.symbols.classes.get(name);
+    const params = info ? info.constructor.params : [];
+    const required = params.filter((p) => p.defaultValue === null && !p.isRest).length;
+    if (required !== 0) return 'NULL';
+    if (params.length === 0) return `(void*(*)(void))${name}_new`;
+    return this.userClasses.has(name) ? `(void*(*)(void))${name}_new_default` : 'NULL';
+  }
+
+  private emitClassRegistry(): void {
+    // Dynamic class instantiation (`new (classRef)()`). Only the argument-less
+    // form is representable in this subset: a class whose constructor has
+    // REQUIRED parameters registers a NULL factory, which AS3 reports as
+    // ArgumentError #1063 ("Argument count mismatch") — never a null call.
+    this.line('static as_value as_dyn_new(as_class* c) {');
+    this.indent++;
+    this.line('if (c == NULL || c->factory == NULL) {');
+    this.indent++;
+    this.line('as_throw(ArgumentError_new((char*)"Error #1063: Argument count mismatch", 0));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('return as_v_obj(c->factory());');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    const entries: string[] = [];
+    const clsDecls: string[] = [];
+    for (const [name, info] of this.symbols.classes) {
+      if (info.fqn === undefined) continue;
+      const factory = this.ctorFactoryExpr(name);
+      entries.push(`{ "${this.escapeCString(info.fqn)}", { &${name}_vt, ${factory} } }`);
+      // A named class object so a bare class name used as a Class value
+      // (e.g. `new Starling(Game, ...)`) can be referenced directly.
+      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, ${factory} };`);
+    }
+    if (entries.length === 0) return;
+    this.line('// ---------- flash.utils.getDefinitionByName registry ----------');
+    this.line('typedef struct { const char* fqn; as_class cls; } as_class_reg;');
+    for (const d of clsDecls) this.line(d);
+    this.line('static as_class_reg as_class_registry[] = {');
+    this.indent++;
+    for (const e of entries) this.line(e + ',');
+    this.line('{ NULL, { NULL, NULL } }'); // sentinel
+    this.indent--;
+    this.line('};');
+    this.line('');
+    // Compare a lookup name against a registry FQN, normalizing '::' to '.' so
+    // both "flash.display::Sprite" and "flash.display.Sprite" match (AS3 accepts
+    // either separator in getDefinitionByName; getQualifiedClassName emits '::').
+    this.line('static int as_fqn_match(const char* lookup, const char* fqn) {');
+    this.indent++;
+    this.line('while (*lookup && *fqn) {');
+    this.indent++;
+    this.line('char a = *lookup, b = *fqn;');
+    this.line('if (a == \':\' && lookup[1] == \':\') { a = \'.\'; lookup += 2; } else { lookup++; }');
+    this.line('if (b == \':\' && fqn[1] == \':\') { b = \'.\'; fqn += 2; } else { fqn++; }');
+    this.line('if (a != b) return 0;');
+    this.indent--;
+    this.line('}');
+    this.line('return *lookup == *fqn;');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_get_definition_by_name(const char* name) {');
+    this.indent++;
+    this.line('if (name == NULL) { as_throw(ReferenceError_new((char*)"No definition found", 0)); return as_v_null(); }');
+    this.line('for (int i = 0; as_class_registry[i].fqn != NULL; i++) {');
+    this.indent++;
+    this.line('if (as_fqn_match(name, as_class_registry[i].fqn)) return as_v_obj((void*)&as_class_registry[i].cls);');
+    this.indent--;
+    this.line('}');
+    this.line('as_throw(ReferenceError_new((char*)"No definition found", 0));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    // Object.constructor: the Class reference of an object instance. Reads the
+    // vtable's fqn and matches it against as_class_registry.
+    this.line('static as_value as_v_class_of(as_value v) {');
+    this.indent++;
+    this.line('if (v.tag != 4 || v.ptr == NULL) return as_v_null();');
+    this.line('void* vt = ((as_object_header*)v.ptr)->vtable;');
+    this.line('if (vt == NULL) return as_v_null();');
+    this.line('const char* fqn = ((as_vtable_header*)vt)->fqn;');
+    this.line('for (int i = 0; as_class_registry[i].fqn != NULL; i++) {');
+    this.indent++;
+    this.line('if (fqn != NULL && strcmp(fqn, as_class_registry[i].fqn) == 0) return as_v_obj((void*)&as_class_registry[i].cls);');
+    this.indent--;
+    this.line('}');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    // `x is Class`: a Class reference boxed as an object points into the static
+    // as_class_registry (never the GC heap), so pointer identity over the registry
+    // distinguishes it from a real instance.
+    this.line('static bool as_v_is_class(as_value v) {');
+    this.indent++;
+    this.line('if (v.tag != 4 || v.ptr == NULL) return false;');
+    this.line('for (int i = 0; as_class_registry[i].fqn != NULL; i++) {');
+    this.indent++;
+    this.line('if ((void*)&as_class_registry[i].cls == v.ptr) return true;');
+    this.indent--;
+    this.line('}');
+    this.line('return false;');
+    this.indent--;
+    this.line('}');
+    this.line('');
   }
 
   // Whether a class declares any of its own (non-inherited) instance fields that
@@ -662,6 +1362,14 @@ export class Emitter {
   private hasOwnProps(name: string): boolean {
     const info = this.symbols.classes.get(name);
     if (!info) return false;
+    // SharedObject declares no AS3-visible fields (data/size/client are
+    // accessors), yet its persisted attribute table is a GC object held in a
+    // C-runtime-only slot that the GC must trace (emitPropTables adds it).
+    if (name === 'SharedObject') return true;
+    // URLStream likewise: its live job handle and its post-completion remainder
+    // buffer are C-runtime-only slots (the AS3 surface is bytesAvailable /
+    // connected / read*), and `_buf` must be traced by the GC.
+    if (name === 'URLStream') return true;
     for (const [fname, f] of info.fields) if (f.owner === name) return true;
     return false;
   }
@@ -672,6 +1380,22 @@ export class Emitter {
     const info = this.symbols.classes.get(name);
     if (!info) return false;
     for (const [mname, m] of info.methods) if (m.owner === name) return true;
+    return false;
+  }
+
+  // Whether a class declares any of its own (non-inherited) instance getters that
+  // are reflectable via dynamic obj["prop"] reads.
+  private hasOwnGetters(name: string): boolean {
+    const info = this.symbols.classes.get(name);
+    if (!info) return false;
+    for (const [gname, g] of info.getters) if (g.owner === name) return true;
+    return false;
+  }
+
+  private hasOwnSetters(name: string): boolean {
+    const info = this.symbols.classes.get(name);
+    if (!info) return false;
+    for (const [sname, s] of info.setters) if (s.owner === name) return true;
     return false;
   }
 
@@ -702,13 +1426,26 @@ export class Emitter {
       this.indent++;
       for (const [fname, f] of info.fields) {
         if (f.owner !== name) continue;
-        this.line(`{ "${this.escapeCString(fname)}", ${this.propTypeTag(f.type)}, offsetof(${name}, ${this.cIdent(fname)}) },`);
+        this.line(`{ "${this.escapeCString(f.name ?? fname)}", ${this.propTypeTag(f.type)}, offsetof(${name}, ${this.cIdent(fname)}) },`);
       }
       // TextField holds GC-managed rich-text runs (an as_array of TextFormat
       // object refs) that is not an AS3-visible member, so it is marked here
       // explicitly rather than via a declared field.
       if (name === 'TextField') {
         this.line(`{ "_runs", 6, offsetof(TextField, _runs) },`);
+      }
+      // SharedObject's persisted table (a GC object) and its client callback
+      // target live in C-runtime-only slots; type 6 makes gc_scan follow them.
+      if (name === 'SharedObject') {
+        this.line(`{ "_data", 6, offsetof(SharedObject, _data) },`);
+        this.line(`{ "_client", 6, offsetof(SharedObject, _client) },`);
+      }
+      // URLStream's remainder buffer is a GC ByteArray held in a C-runtime-only
+      // slot, so it is marked here. `_job` is deliberately absent: it is a
+      // malloc'd structure, not a GC object (gc_in_heap would reject it, but
+      // listing it would also expose it to dynamic obj[key] access).
+      if (name === 'URLStream') {
+        this.line(`{ "_buf", 6, offsetof(URLStream, _buf) },`);
       }
       this.line('{ NULL, 0, 0 }');
       this.indent--;
@@ -728,7 +1465,7 @@ export class Emitter {
       for (const [mname, m] of info.methods) {
         if (m.owner !== cname) continue;
         const argCodes = m.params.map((p, i) =>
-          this.unboxAny({ code: `args[${i}]`, type: { kind: 'any' } as CType }, resolveType(p.type)),
+          this.unboxAny({ code: `args[${i}]`, type: { kind: 'any' } as CType }, resolveType(p.type, info.importAlias)),
         );
         const callArgs = argCodes.join(', ');
         const receiver = `(${cname}*)_this`;
@@ -770,6 +1507,93 @@ export class Emitter {
     if (any) this.line('');
   }
 
+  // Per-class getter reflection thunks: a boxed calling thunk per OWN getter.
+  // The thunk shares the as_method signature (void* _this, as_value* args, argc)
+  // so the getter table reuses the as_method type; it ignores args/argc, calls
+  // the typed getter implementation, and boxes its return value. Inherited
+  // getters are reached by walking the vtable super chain in as_dyn_get.
+  private emitGetterThunks(): void {
+    let any = false;
+    for (const [cname, info] of this.symbols.classes) {
+      for (const [gname, g] of info.getters) {
+        if (g.owner !== cname) continue;
+        this.line(`as_value ${cname}_get_${gname}__dyn(void* _this, as_value* args, int argc) {`);
+        this.indent++;
+        this.line('(void)args; (void)argc;');
+        this.line(`return ${this.boxExpr({ code: `${cname}_get_${gname}(_this)`, type: g.returnType })};`);
+        this.indent--;
+        this.line('}');
+        this.line('');
+        any = true;
+      }
+    }
+    if (any) this.line('');
+  }
+
+  // Per-class setter reflection thunks: a boxed calling thunk per OWN setter, with
+  // the same as_method signature as the getter thunks. as_dyn_set uses these to
+  // forward a dynamic write (`obj[key] = v`) to the setter implementation;
+  // inherited setters are reached by walking the vtable super chain.
+  private emitSetterThunks(): void {
+    let any = false;
+    for (const [cname, info] of this.symbols.classes) {
+      for (const [sname, s] of info.setters) {
+        if (s.owner !== cname) continue;
+        const paramType = resolveType(s.params[0].type, info.importAlias);
+        this.line(`as_value ${cname}_set_${sname}__dyn(void* _this, as_value* args, int argc) {`);
+        this.indent++;
+        this.line('(void)argc;');
+        this.line(`${cname}_set_${sname}(_this, ${this.unboxAny({ code: 'args[0]', type: { kind: 'any' } as CType }, paramType)});`);
+        this.line('return as_v_null();');
+        this.indent--;
+        this.line('}');
+        this.line('');
+        any = true;
+      }
+    }
+    if (any) this.line('');
+  }
+
+  // Per-class setter reflection tables: a NULL-terminated as_method[] mapping each
+  // OWN setter name to its thunk.
+  private emitSetterTables(): void {
+    let any = false;
+    for (const [name, info] of this.symbols.classes) {
+      if (!this.hasOwnSetters(name)) continue;
+      this.line(`static as_method ${name}_setters[] = {`);
+      this.indent++;
+      for (const [sname, s] of info.setters) {
+        if (s.owner !== name) continue;
+        this.line(`{ "${this.escapeCString(sname)}", ${name}_set_${sname}__dyn },`);
+      }
+      this.line('{ NULL, NULL }');
+      this.indent--;
+      this.line('};');
+      any = true;
+    }
+    if (any) this.line('');
+  }
+
+  // Per-class getter reflection tables: a NULL-terminated as_method[] (getter
+  // thunks reuse the as_method type) mapping each OWN getter name to its thunk.
+  private emitGetterTables(): void {
+    let any = false;
+    for (const [name, info] of this.symbols.classes) {
+      if (!this.hasOwnGetters(name)) continue;
+      this.line(`static as_method ${name}_getters[] = {`);
+      this.indent++;
+      for (const [gname, g] of info.getters) {
+        if (g.owner !== name) continue;
+        this.line(`{ "${this.escapeCString(gname)}", ${name}_get_${gname}__dyn },`);
+      }
+      this.line('{ NULL, NULL }');
+      this.indent--;
+      this.line('};');
+      any = true;
+    }
+    if (any) this.line('');
+  }
+
   // Per-class, per-interface vtable instance wiring each interface method to
   // the class's implementation, plus the class's interface-vtable pointer array
   // (used by as_iface_lookup for runtime `any -> interface` recovery).
@@ -782,8 +1606,17 @@ export class Emitter {
         const intf = this.symbols.interfaces.get(iname)!;
         const entries: string[] = [`"${iname}"`, 'NULL', 'NULL', 'NULL', 'NULL'];
         for (const mname of intf.methods.keys()) {
-          const m = cinfo.methods.get(mname)!;
-          entries.push(`${m.owner}_${mname}`);
+          const im = intf.methods.get(mname)!;
+          if (im.isGetter) {
+            const g = cinfo.getters.get(mname)!;
+            entries.push(`${g.owner}_get_${mname}`);
+          } else if (im.isSetter) {
+            const s = cinfo.setters.get(mname)!;
+            entries.push(`${s.owner}_set_${mname}`);
+          } else {
+            const m = cinfo.methods.get(mname)!;
+            entries.push(`${m.owner}_${mname}`);
+          }
         }
         this.line(`static ${iname}_vtable ${cname}_${iname}_vt = { ${entries.join(', ')} };`);
         ifaceEntries.push(`(void*)&${cname}_${iname}_vt`);
@@ -817,7 +1650,10 @@ export class Emitter {
           // C's `static const` demands a compile-time constant, so such a slot is
           // declared non-const and written once before any use.
           this.line(`static ${this.cTypeName(f.type)} ${cname}_${fname} = ${this.defaultInit(f.type)};`);
-          if (f.init) this.staticFieldInits.push({ cname, fname, f });
+          if (f.init) {
+            this.staticFieldInits.push({ cname, fname, f });
+            this.cinitClasses.add(cname);
+          }
         }
         this.currentClass = null;
       }
@@ -868,6 +1704,11 @@ export class Emitter {
     this.line('static void gc_mark_user_roots(void) {');
     this.indent++;
     this.line('gc_mark_ptr((void*)ASC_win_stage);');
+    this.line('gc_mark_ptr((void*)ASC_native_app);');
+    // flash.net.URLRequestDefaults.userAgent is a settable static String, so it can
+    // hold a GC string after `URLRequestDefaults.userAgent = ...`. (The other six
+    // URLRequestDefaults members are bool/Number and cannot hold a pointer.)
+    this.line('gc_mark_ptr((void*)as_urld_user_agent);');
     this.line('for (int i = 0; i < as_ef_count; i++) gc_mark_ptr(as_ef_objs[i]);');
     for (const [cname, info] of this.symbols.classes) {
       for (const [fname, f] of info.staticFields) {
@@ -912,6 +1753,8 @@ export class Emitter {
       case 'class':
       case 'dict':
       case 'regexp':
+      case 'xml':
+      case 'xmllist':
         return true;
       default:
         return false;
@@ -937,12 +1780,24 @@ export class Emitter {
   private collectFunctionValues(): void {
     this.anonFuncs = [];
     this.anonIndex.clear();
+    this.anonSeq = 0;
     this.anonCaptures.clear();
     this.funcVars = [new Map()];
+    this.scriptVarNames = collectScriptVars(this.program.body);
     this.currentAnonLocal = null;
     this.currentAnonRefs = null;
+    this.walkFnBodyStack = [];
+    this.walkFnBody = null;
+    this.fnBodyParent.clear();
+    this.fnBodyVars.clear();
+    this.fnBodyKids.clear();
+    this.fnBodyClass.clear();
+    this.fnBodyCells.clear();
+    this.closureCellEnv.clear();
     this.walkStmts(this.program.body);
     this.funcVars = [];
+    // Decide the activation cells once every closure's captures are known.
+    this.buildVarCells();
   }
 
   private walkStmts(stmts: Stmt[]): void {
@@ -964,32 +1819,421 @@ export class Emitter {
     return undefined;
   }
 
+  // Free-variable capture lookup: like `lookupFuncVar`, but a name that the
+  // module (top-level script) scope owns resolves to its C global instead of being
+  // captured. `scriptVarNames` mirrors exactly the declarations `emitModuleVars`
+  // hoists into `moduleScope`, so a name is either a global or a captured local —
+  // never both. A top-level `var` captured by value froze at closure-creation time
+  // (a closure assigning it wrote its own env copy; see
+  // examples/reg-closure-ref.as case 1). Names that stay outside `moduleScope`
+  // (e.g. a top-level `for (var i…)`) keep the legacy by-value capture.
+  private lookupCaptureVar(name: string): CType | undefined {
+    for (let i = this.funcVars.length - 1; i >= 1; i--) {
+      const t = this.funcVars[i].get(name);
+      if (t) return t;
+    }
+    if (this.scriptVarNames.has(name)) return undefined;
+    return this.funcVars[0].get(name);
+  }
+
+  // Best-effort static type of an expression during the walk (pass 1). Used only
+  // to record bound-method thunks for `obj.member.method` shapes (e.g.
+  // `painter.context.drawToBitmapData`), where the receiver is a getter result
+  // rather than a simple local. Returns null when the type cannot be pinned down
+  // statically; the emit pass still handles the full resolution.
+  private walkInferType(e: Expr): CType | null {
+    switch (e.kind) {
+      case 'Var': {
+        const t = this.lookupFuncVar(e.name);
+        if (t) return t;
+        if (e.name === 'this' && this.currentWalkClass) {
+          return { kind: 'object', className: this.currentWalkClass };
+        }
+        if (this.currentWalkClass) {
+          const cinfo = this.symbols.getClass(this.currentWalkClass);
+          const f = this.symbols.fieldSlot(this.currentWalkClass, e.name);
+          if (f) return f.type;
+          const g = cinfo?.getters.get(e.name);
+          if (g) return g.returnType;
+          const sg = cinfo?.staticGetters?.get(e.name);
+          if (sg) return sg.returnType;
+          const sf = cinfo?.staticFields.get(e.name);
+          if (sf) return sf.type;
+        }
+        return null;
+      }
+      case 'Member': {
+        const ot = this.walkInferType(e.object);
+        if (ot?.kind === 'object') {
+          const cinfo = this.symbols.getClass(ot.className);
+          const f = this.symbols.fieldSlot(ot.className, e.property);
+          if (f) return f.type;
+          const g = cinfo?.getters.get(e.property);
+          if (g) return g.returnType;
+        } else if (ot?.kind === 'interface') {
+          const iinfo = this.symbols.interfaces.get(ot.name);
+          const im = iinfo?.methods.get(e.property);
+          if (im) return im.returnType;
+        }
+        return null;
+      }
+      default:
+        return null;
+    }
+  }
+
+  // Look up a name in every frame strictly below `local` (the enclosing scopes of
+  // the function currently being analyzed). Used for free-variable capture: a
+  // closure may reference variables any number of lexical levels up (not just the
+  // immediately enclosing function), so the analysis must walk the whole chain.
+  // Module-scope names are resolved as C globals, not captured (see
+  // `lookupCaptureVar`).
+  private lookupEnclosingVar(name: string, local: Map<string, CType>): CType | undefined {
+    const idx = this.funcVars.lastIndexOf(local);
+    for (let i = idx - 1; i >= 1; i--) {
+      const t = this.funcVars[i].get(name);
+      if (t) return t;
+    }
+    if (this.scriptVarNames.has(name)) return undefined;
+    return this.funcVars[0].get(name);
+  }
+
+  // A closure nested inside the one currently being analyzed may itself capture a
+  // variable that lives several scopes up (e.g. `texture` referenced by the
+  // innermost closure of a 3-deep nest). The inner closure's environment is built
+  // at the point where it is *created* (inside the outer closure's body), so the
+  // outer closure must transitively capture that variable into its own env too —
+  // otherwise emit-time `emitVar('texture')` for the inner env finds nothing.
+  private propagateNestedCaptures(local: Map<string, CType>, seen: Map<string, CType>, nestedStart: number): void {
+    const nested = [...this.anonCaptures.values()].slice(nestedStart);
+    for (const caps of nested) {
+      for (const c of caps) {
+        // `this` is not a lexical variable, so a nested closure that captured it
+        // must cause THIS closure to capture it too — its body constructs the
+        // nested closure's env (`_fn41_env_make(..., this)`) and therefore needs
+        // the receiver in scope.
+        if (c.name === 'this') {
+          if (this.currentWalkClass && !this.currentWalkIsStatic) this.currentAnonNeedsThis = true;
+          continue;
+        }
+        if (!local.has(c.name) && !seen.has(c.name) && this.lookupEnclosingVar(c.name, local)) {
+          seen.set(c.name, c.type);
+        }
+      }
+    }
+  }
+
+  // Sibling nested functions declared in the SAME method share one lexical scope
+  // in AS3. When one references another (`onIoError` calls `cleanup`, which reads
+  // `loaderInfo`), the referenced function's captured variables must also be
+  // visible while building the referencing function's env — otherwise emitVar
+  // throws `undefined variable`. Merge every sibling's captures into one shared
+  // set and assign it uniformly (redundant fields are harmless; correctness
+  // requires that no referenced variable is missing).
+  private mergeNestedGroup(groupStart: number): void {
+    const group = this.anonFuncs.slice(groupStart);
+    if (group.length === 0) return;
+    // Merge only the OUTERMOST sibling functions in this method (same minimum
+    // depth). A nested function and its inner anonymous function are NOT merged —
+    // the inner closure's free variables are locals of the outer function, which
+    // must resolve through the outer function's own scope, not its env.
+    const minDepth = Math.min(...group.map((f) => f.depth));
+    const siblings = group.filter((f) => f.depth === minDepth);
+    if (siblings.length <= 1) return;
+    // AS3 names of the outermost siblings. A function-typed capture is a
+    // *sibling reference* only when its name matches one of these (e.g.
+    // `onLoadError` inside `onLoadComplete`). A function-typed capture of a
+    // parameter/local (`onComplete:Function`) is a plain value capture, NOT a
+    // sibling reference — it must stay in the env as a normal `as_fn` field.
+    const siblingAsNames = new Set<string>();
+    for (const fn of siblings) {
+      const nf = this.nestedFuncs.get(fn.name);
+      if (nf) siblingAsNames.add(nf.asName);
+    }
+    const isSiblingRef = (c: { name: string; type: CType }) => c.type.kind === 'function' && siblingAsNames.has(c.name);
+    const hasSiblingRef = siblings.some((fn) => fn.captures.some((c) => isSiblingRef(c)));
+
+    if (hasSiblingRef) {
+      // Mutually-recursive sibling group: share a single cell holding one `as_fn`
+      // slot per sibling plus the merged plain captures (variables / objects /
+      // `this` AND function-typed params). Each sibling's impl takes the cell as
+      // its environment, so a reference to a sibling function reads `env->member`
+      // (shared identity — required for removeEventListener's `listener === handler`
+      // match) and every variable read hits the same captured value. Inlining each
+      // sibling's `as_fn_make(...)` at its use site (the old model) exploded into an
+      // N-deep cross-product and, for cycles, fell back to NULL via buildingClosures,
+      // causing a listener->fn NULL deref.
+      const plainCaps: { name: string; type: CType }[] = [];
+      const seen = new Set<string>();
+      for (const fn of siblings) for (const c of fn.captures) {
+        if (isSiblingRef(c)) continue;
+        if (!seen.has(c.name)) { seen.add(c.name); plainCaps.push(c); }
+      }
+      const idx = this.anonSeq++;
+      const cellName = `_cell${idx}`;
+      const cellLocal = `cell${idx}`;
+      const members = siblings.map((f) => f.name);
+      const memberSlots = members.map((m) => ({ name: m, type: { kind: 'function' } as CType }));
+      const captures = [...memberSlots, ...plainCaps];
+      for (const fn of siblings) fn.captures = captures;
+      const info = { cellName, cellLocal, members, varCaps: plainCaps };
+      for (const fn of siblings) this.closureGroups.set(fn.name, info);
+      const methodKey = `${this.currentWalkClass ?? ''}:${this.currentWalkMethod ?? ''}`;
+      const list = this.closureGroupsByMethod.get(methodKey) ?? [];
+      list.push(info);
+      this.closureGroupsByMethod.set(methodKey, list);
+    } else {
+      // No sibling references another sibling as a function value. Keep the old
+      // model: each fn keeps its own function-typed captures (params/locals like
+      // `onComplete:Function`) and shares only the non-function captures. (This
+      // avoids forcing every sibling to capture a param only one of them uses.)
+      const mergedVars = new Map<string, CType>();
+      for (const fn of siblings) for (const c of fn.captures) {
+        if (c.type.kind !== 'function' && !mergedVars.has(c.name)) mergedVars.set(c.name, c.type);
+      }
+      const mergedVarCaps = [...mergedVars.entries()].map(([name, type]) => ({ name, type }));
+      for (const fn of siblings) {
+        const ownFuncs = fn.captures.filter((c) => c.type.kind === 'function');
+        fn.captures = [...ownFuncs, ...mergedVarCaps];
+      }
+    }
+    for (const fn of siblings) {
+      const nf = this.nestedFuncs.get(fn.name);
+      if (nf) nf.captures = fn.captures;
+    }
+    // Sync the merged captures back into `anonCaptures` (keyed by the FunctionExpr
+    // AST node). `emitFunctionValues` builds the env struct / make signature from
+    // `fn.captures`, but the make CALL SITE in `emitExpr` reads `anonCaptures.get(expr)`;
+    // without this sync the env struct gains merged fields while the call passes only
+    // the original ones (`_fn1_env_make(this)` vs `_fn1_env_make(scaleFactor, this)`).
+    for (const fn of siblings) {
+      for (const [expr, name] of this.anonIndex) {
+        if (name === fn.name) this.anonCaptures.set(expr, fn.captures);
+      }
+    }
+  }
+
+  // Pre-scan a function body for every `var`/`const`/loop-variable declaration and
+  // register it in the current funcVars frame BEFORE walking the body. AS3's `var`
+  // is function-scoped (hoisted), so a `var texture` declared *after* a closure
+  // that references `texture` must still be captured by that closure — a plain
+  // sequential walk would miss it.
+  private collectWalkFuncVars(stmts: Stmt[]): void {
+    for (const s of stmts) this.collectWalkFuncVarsStmt(s);
+  }
+  private collectWalkFuncVarsStmt(s: Stmt): void {
+    const frame = this.funcVars[this.funcVars.length - 1];
+    switch (s.kind) {
+      case 'VarDecl': frame.set(s.name, this.rt(s.type)); break;
+      case 'VarDecls': for (const d of s.decls) frame.set(d.name, this.rt(d.type)); break;
+      case 'ConstDecl': frame.set(s.name, this.rt(s.type)); break;
+      case 'ConstDecls': for (const d of s.decls) frame.set(d.name, this.rt(d.type)); break;
+      case 'Block': this.collectWalkFuncVars(s.body); break;
+      case 'If': this.collectWalkFuncVarsStmt(s.then); if (s.else) this.collectWalkFuncVarsStmt(s.else); break;
+      case 'While': this.collectWalkFuncVarsStmt(s.body); break;
+      case 'DoWhile': this.collectWalkFuncVarsStmt(s.body); break;
+      case 'For': if (s.init) this.collectWalkFuncVarsStmt(s.init); this.collectWalkFuncVarsStmt(s.body); break;
+      case 'ForIn': if (s.declares) frame.set(s.varName, { kind: 'string' }); this.collectWalkFuncVarsStmt(s.body); break;
+      case 'ForEachIn': if (s.declares) frame.set(s.varName, s.varType === null ? { kind: 'any' } : this.rt(s.varType)); this.collectWalkFuncVarsStmt(s.body); break;
+      case 'Switch': for (const c of s.cases) this.collectWalkFuncVars(c.body); break;
+      case 'Try':
+        this.collectWalkFuncVars(s.tryBody.body);
+        if (s.catchBody) this.collectWalkFuncVars(s.catchBody.body);
+        if (s.finallyBody) this.collectWalkFuncVars(s.finallyBody.body);
+        break;
+      case 'Label': this.collectWalkFuncVarsStmt(s.body); break;
+      // A nested function declaration's name is hoisted into the enclosing
+      // function scope (usable as a value), but its body has its own scope.
+      case 'FuncDecl': frame.set(s.name, { kind: 'function' }); break;
+      // Nested class declarations have their own scope: do not descend.
+      default: break;
+    }
+  }
+
+  // ---------- closure activation cells (capture by reference) ----------
+
+  private noteFnBodyVar(name: string, type: CType): void {
+    const b = this.walkFnBody;
+    if (b === null) return;
+    let m = this.fnBodyVars.get(b);
+    if (!m) {
+      m = new Map();
+      this.fnBodyVars.set(b, m);
+    }
+    m.set(name, type);
+  }
+
+  // Push a real function body (method / free function / nested function or
+  // anonymous function). The top-level script body is deliberately NOT pushed:
+  // its vars are module globals, which already have stable shared storage.
+  private pushWalkFnBody(body: Stmt[]): void {
+    this.fnBodyParent.set(body, this.walkFnBody);
+    this.fnBodyClass.set(body, this.currentWalkClass);
+    this.walkFnBody = body;
+    this.walkFnBodyStack.push(body);
+  }
+
+  private popWalkFnBody(): void {
+    this.walkFnBodyStack.pop();
+    this.walkFnBody = this.walkFnBodyStack[this.walkFnBodyStack.length - 1] ?? null;
+  }
+
+  private addFnBodyKid(parentBody: Stmt[] | null, closureName: string): void {
+    if (parentBody === null) return;
+    const kids = this.fnBodyKids.get(parentBody) ?? [];
+    kids.push(closureName);
+    this.fnBodyKids.set(parentBody, kids);
+  }
+
+  // Post-walk analysis: decide which function bodies need an activation cell and
+  // how every closure reaches the cells it uses.
+  private buildVarCells(): void {
+    // A name already owned by a sibling group's cell keeps that storage; boxing it
+    // twice would split the two views (the group cell is the env of its members).
+    // The check must be per *function body*: the same source-level name (`texture`)
+    // belongs to different functions at different scopes, so a group elsewhere in
+    // the program must not veto this body's own cell.
+    const byName = new Map(this.anonFuncs.map((f) => [f.name, f]));
+    const bodyGroupOwned = (body: Stmt[]): Set<string> => {
+      const owned = new Set<string>();
+      for (const kid of this.fnBodyKids.get(body) ?? []) {
+        const g = this.closureGroups.get(kid);
+        if (g) for (const c of g.varCaps) owned.add(c.name);
+      }
+      return owned;
+    };
+    const ownerCell = (from: Stmt[] | null, name: string): Stmt[] | null => {
+      for (let b = from; b !== null; b = this.fnBodyParent.get(b) ?? null) {
+        const c = this.fnBodyCells.get(b);
+        if (c && c.varCaps.some((f) => f.name === name)) return b;
+      }
+      return null;
+    };
+
+    // Pass A — create a cell per function body whose typed locals are captured by a
+    // closure created directly in that body. Locals captured only by a deeper
+    // closure are reached by threading the cell pointer through the levels between.
+    for (const body of [...this.fnBodyVars.keys()]) {
+      const vars = this.fnBodyVars.get(body)!;
+      const groupOwned = bodyGroupOwned(body);
+      const fields: { name: string; type: CType }[] = [];
+      const seen = new Set<string>();
+      for (const kid of this.fnBodyKids.get(body) ?? []) {
+        if (this.closureGroups.has(kid)) continue;
+        const fn = byName.get(kid);
+        if (!fn) continue;
+        for (const c of fn.captures) {
+          if (c.name === 'this' || seen.has(c.name)) continue;
+          if (groupOwned.has(c.name)) continue;
+          if (!vars.has(c.name)) continue;
+          seen.add(c.name);
+          fields.push({ name: c.name, type: vars.get(c.name)! });
+        }
+      }
+      if (fields.length === 0) continue;
+      const idx = this.anonSeq++;
+      this.fnBodyCells.set(body, { cellName: `_cell${idx}`, cellLocal: `cell${idx}`, members: [], varCaps: fields });
+    }
+
+    // Pass B — per closure, map the captures that resolve through a cell and collect
+    // the cell pointers its env must carry (its own needs plus every descendant's,
+    // so the pointer can be threaded down at each nested creation site).
+    // `anonFuncs` is in post-order, so descendants are always handled first.
+    const neededByFn = new Map<string, Set<Stmt[]>>();
+    for (const fn of this.anonFuncs) {
+      const info: { resolve: Map<string, string>; ptrs: { cellLocal: string; cellName: string }[] } = { resolve: new Map(), ptrs: [] };
+      this.closureCellEnv.set(fn.name, info);
+      // A sibling-group member's env IS the group cell (it already holds those
+      // captures as fields), so it must not be re-routed through another cell.
+      if (this.closureGroups.has(fn.name)) continue;
+      const createdIn = this.fnBodyParent.get(fn.body.body) ?? null;
+      const needed = new Set<Stmt[]>();
+      for (const c of fn.captures) {
+        const cellBody = ownerCell(createdIn, c.name);
+        if (cellBody === null) continue;
+        info.resolve.set(c.name, this.fnBodyCells.get(cellBody)!.cellLocal);
+        needed.add(cellBody);
+      }
+      for (const kid of this.fnBodyKids.get(fn.body.body) ?? []) {
+        for (const b of neededByFn.get(kid) ?? []) needed.add(b);
+      }
+      neededByFn.set(fn.name, needed);
+      const own = this.fnBodyCells.get(fn.body.body);
+      for (const b of needed) {
+        const cell = this.fnBodyCells.get(b)!;
+        if (own && own.cellName === cell.cellName) continue;
+        info.ptrs.push({ cellLocal: cell.cellLocal, cellName: cell.cellName });
+      }
+    }
+
+    // Pass C — inject the cell-pointer captures into each closure's capture list.
+    // The env struct / make signature / creation site are all driven by that list,
+    // so the pointer is then produced by the ordinary `emitVar(cellLocal)` path
+    // (the enclosing body's cell local, or `env->cellLocal` one level in).
+    for (const fn of this.anonFuncs) {
+      if (this.closureGroups.has(fn.name)) continue;
+      const info = this.closureCellEnv.get(fn.name)!;
+      if (info.ptrs.length === 0) continue;
+      const extra = info.ptrs.map((p) => ({ name: p.cellLocal, type: { kind: 'object', className: p.cellName } as CType }));
+      fn.captures = fn.captures.concat(extra);
+      const nf = this.nestedFuncs.get(fn.name);
+      if (nf) nf.captures = nf.captures.concat(extra);
+      for (const [expr, name] of this.anonIndex) {
+        if (name === fn.name) this.anonCaptures.set(expr, fn.captures);
+      }
+    }
+  }
+
   private walkStmt(s: Stmt): void {
     switch (s.kind) {
       case 'VarDecl': {
-        const vt = resolveType(s.type);
+        const vt = this.rt(s.type);
         this.funcVars[this.funcVars.length - 1].set(s.name, vt);
         if (this.currentAnonLocal) this.currentAnonLocal.set(s.name, vt);
+        // Typed locals are the ones `hoistFunctionLocals` hoists, so they are the
+        // only candidates for activation-cell storage (see fnBodyVars).
+        if (s.type !== null) this.noteFnBodyVar(s.name, vt);
         this.noteType(s.type);
         if (s.init) this.walkExpr(s.init);
         break;
       }
       case 'VarDecls': {
         for (const d of s.decls) {
-          const vt = resolveType(d.type);
+          const vt = this.rt(d.type);
           this.funcVars[this.funcVars.length - 1].set(d.name, vt);
           if (this.currentAnonLocal) this.currentAnonLocal.set(d.name, vt);
+          if (d.type !== null) this.noteFnBodyVar(d.name, vt);
           this.noteType(d.type);
           if (d.init) this.walkExpr(d.init);
         }
         break;
       }
+      // `const` locals are deliberately NOT registered as activation-cell
+      // candidates (no `noteFnBodyVar`): AS3 `const` is an immutable binding, so
+      // capturing it *by value* is semantically identical to capturing it by
+      // reference -- and it must not become a cell field. Cell fields are written
+      // by the declaring body through `cell->field`, but `const` is block-scoped
+      // and never hoisted (see `collectHoistedVarsStmt`), so the declaring body has
+      // no such write to make. Registering it only in `fnBodyVars` therefore made
+      // `buildVarCells` allocate a cell field that stayed NULL (gc_alloc zeroes the
+      // struct) while every closure in the body read `env->cellN->name` -> SIGSEGV
+      // on the first dereference (Demo's CustomHitTestScene `const texts`).
       case 'ConstDecl': {
-        const vt = resolveType(s.type);
+        const vt = this.rt(s.type);
         this.funcVars[this.funcVars.length - 1].set(s.name, vt);
         if (this.currentAnonLocal) this.currentAnonLocal.set(s.name, vt);
         this.noteType(s.type);
         this.walkExpr(s.init!);
+        break;
+      }
+      case 'ConstDecls': {
+        for (const d of s.decls) {
+          const vt = this.rt(d.type);
+          this.funcVars[this.funcVars.length - 1].set(d.name, vt);
+          if (this.currentAnonLocal) this.currentAnonLocal.set(d.name, vt);
+          this.noteType(d.type);
+          if (d.init) this.walkExpr(d.init);
+        }
         break;
       }
       case 'ExprStmt': this.walkExpr(s.expr); break;
@@ -1007,10 +2251,68 @@ export class Emitter {
       case 'Try': this.noteType(s.catchType); this.walkStmts(s.tryBody.body); if (s.catchBody) this.walkStmts(s.catchBody.body); if (s.finallyBody) this.walkStmts(s.finallyBody.body); break;
       case 'FuncDecl': {
         this.noteType(s.returnType);
-        this.funcVars.push(new Map(s.params.map((p) => [p.name, resolveType(p.type)])));
-        this.walkParams(s.params);
-        this.walkStmts(s.body.body);
-        this.funcVars.pop();
+        if (this.funcVars.length === 1) {
+          // Top-level free function: no enclosing lexical scope to capture.
+          this.funcVars.push(new Map(s.params.map((p) => [p.name, this.rt(p.type)])));
+          this.walkParams(s.params);
+          this.collectWalkFuncVars(s.body.body);
+          this.pushWalkFnBody(s.body.body);
+          const groupStart = this.anonFuncs.length;
+          this.walkStmts(s.body.body);
+          this.mergeNestedGroup(groupStart);
+          this.popWalkFnBody();
+          this.funcVars.pop();
+        } else {
+          // Nested function declaration: a named closure. Register its name in the
+          // enclosing scope (AS3 hoists it), then run the same free-variable
+          // analysis as an anonymous FunctionExpr so it captures enclosing vars.
+          const name = s.name;
+          const depth = this.funcVars.length;
+          this.funcVars[this.funcVars.length - 1].set(name, { kind: 'function' });
+          this.funcVars.push(new Map(s.params.map((p) => [p.name, this.rt(p.type)])));
+          const local = this.funcVars[this.funcVars.length - 1];
+          const savedLocal = this.currentAnonLocal;
+          const savedRefs = this.currentAnonRefs;
+          const savedNeedsThis = this.currentAnonNeedsThis;
+          this.currentAnonLocal = local;
+          this.currentAnonRefs = [];
+          this.currentAnonNeedsThis = false;
+          this.walkParams(s.params);
+          this.collectWalkFuncVars(s.body.body);
+          const nestedStart = this.anonCaptures.size;
+          const parentBody = this.walkFnBody;
+          this.pushWalkFnBody(s.body.body);
+          this.walkStmts(s.body.body);
+          this.popWalkFnBody();
+          const seen = new Map<string, CType>();
+          for (const r of this.currentAnonRefs) {
+            // A recursive nested function references its own name (`setTimeout(fn, 1)`);
+            // that is NOT a capture — the name is the function itself, resolved at emit
+            // time to a self-referential closure, not stored in its own env.
+            if (r.name === name) continue;
+            if (!local.has(r.name) && this.lookupEnclosingVar(r.name, local)) seen.set(r.name, r.type);
+          }
+          this.propagateNestedCaptures(local, seen, nestedStart);
+          if (this.currentAnonNeedsThis && this.currentWalkClass && !this.currentWalkIsStatic) {
+            seen.set('this', { kind: 'object', className: this.currentWalkClass } as CType);
+          }
+          const captures = [...seen.entries()].map(([n, t]) => ({ name: n, type: t }));
+          this.currentAnonLocal = savedLocal;
+          this.currentAnonRefs = savedRefs;
+          this.currentAnonNeedsThis = savedNeedsThis;
+          // Globally-unique C name: a bare function name is function-scoped in AS3,
+          // so two different classes (or two methods in one class) may each declare
+          // a `function onLoadComplete()`. Keying nestedFuncs / anonFuncs by the bare
+          // name would overwrite the earlier record and collide in C. The unique name
+          // is what emitVar resolves through nestedFuncByAsName.
+          const uniqueName = `_nf${this.anonSeq++}`;
+          const methodName = this.currentWalkMethod;
+          this.nestedFuncs.set(uniqueName, { captures, params: s.params, asName: name, methodName });
+          this.nestedFuncByAsName.set(`${this.currentWalkClass ?? ''}:${methodName ?? ''}:${name}`, uniqueName);
+          this.anonFuncs.push({ name: uniqueName, asName: null, params: s.params, returnType: s.returnType, body: s.body, captures, cname: this.currentWalkClass, isStatic: this.currentWalkIsStatic, depth, methodName });
+          this.addFnBodyKid(parentBody, uniqueName);
+          this.funcVars.pop();
+        }
         break;
       }
       case 'ClassDecl': {
@@ -1026,14 +2328,22 @@ export class Emitter {
             const isStatic = m.kind === 'Method' ? m.isStatic : false;
             const saved = this.currentWalkClass;
             const savedStatic = this.currentWalkIsStatic;
+            const savedMethod = this.currentWalkMethod;
             this.currentWalkClass = cname;
             this.currentWalkIsStatic = isStatic;
-            this.funcVars.push(new Map(m.params.map((p) => [p.name, resolveType(p.type)])));
+            this.currentWalkMethod = m.name;
+            this.funcVars.push(new Map(m.params.map((p) => [p.name, this.rt(p.type)])));
             this.walkParams(m.params);
+            this.collectWalkFuncVars(m.body.body);
+            this.pushWalkFnBody(m.body.body);
+            const groupStart = this.anonFuncs.length;
             this.walkStmts(m.body.body);
+            this.mergeNestedGroup(groupStart);
+            this.popWalkFnBody();
             this.funcVars.pop();
             this.currentWalkClass = saved;
             this.currentWalkIsStatic = savedStatic;
+            this.currentWalkMethod = savedMethod;
           }
         }
         break;
@@ -1050,9 +2360,17 @@ export class Emitter {
     switch (e.kind) {
       case 'Num': case 'Str': case 'Bool': case 'Null': break;
       case 'Var': {
+        // The name of the enclosing named function expression, referenced inside its
+        // own body, is the function itself — not a free variable and not a class
+        // member/method reference. Resolved at emit time (see currentFuncAsName).
+        if (e.name === this.walkSelfName) break;
         if (this.currentAnonRefs) {
-          const t = this.lookupFuncVar(e.name);
+          const t = this.lookupCaptureVar(e.name);
           if (t) this.currentAnonRefs.push({ name: e.name, type: t });
+          // A bare `this` reference inside an anon body captures the receiver.
+          if (e.name === 'this' && this.currentWalkClass && !this.currentWalkIsStatic) {
+            this.currentAnonNeedsThis = true;
+          }
         }
         // Bound-method / static-method reference: an unqualified identifier inside
         // a method that names one of the class's methods (and is not shadowed by a
@@ -1060,21 +2378,32 @@ export class Emitter {
         // so the thunk is emitted in emitFunctionValues before any body uses it.
         if (this.currentWalkClass && !this.lookupFuncVar(e.name)) {
           const cinfo = this.symbols.getClass(this.currentWalkClass);
-          if (this.currentWalkIsStatic) {
-            const sm = cinfo?.staticMethods.get(e.name);
-            if (sm) {
-              const key = `${this.currentWalkClass}:${e.name}`;
-              if (!this.staticMethodRefs.has(key)) {
-                this.staticMethodRefs.set(key, { cname: this.currentWalkClass, mname: e.name, m: sm });
-              }
-            }
-          } else {
+          if (!this.currentWalkIsStatic) {
             const m = cinfo?.methods.get(e.name);
             if (m) {
+              // An unqualified instance-method name inside an anon body (either as
+              // a call target `loadAssets(...)` or a value) reaches `this.method`,
+              // so the closure must capture `this`.
+              if (this.currentAnonRefs) this.currentAnonNeedsThis = true;
               const key = `${this.currentWalkClass}:${e.name}`;
               if (!this.boundMethods.has(key)) {
                 this.boundMethods.set(key, { cname: this.currentWalkClass, mname: e.name, m });
               }
+            }
+            // An unqualified field/getter reference (`_starling`) inside an anon
+            // body also reaches `this.field` / `this.getter`, so the closure must
+            // capture `this` just like a bare method name does.
+            if (!this.currentAnonNeedsThis && (cinfo?.fields.has(e.name) || cinfo?.getters.has(e.name))) {
+              if (this.currentAnonRefs) this.currentAnonNeedsThis = true;
+            }
+          }
+          // A bare identifier naming a static method is `Class.method` used as a
+          // value in ANY context (static methods carry no receiver).
+          const sm = cinfo?.staticMethods.get(e.name);
+          if (sm) {
+            const key = `${sm.owner}:${e.name}`;
+            if (!this.staticMethodRefs.has(key)) {
+              this.staticMethodRefs.set(key, { cname: sm.owner, mname: e.name, m: sm });
             }
           }
         }
@@ -1097,15 +2426,16 @@ export class Emitter {
             const cinfo = this.symbols.getClass(cname)!;
             const sm = cinfo.staticMethods.get(e.property);
             if (sm) {
-              const key = `${cname}:${e.property}`;
+              const key = `${sm.owner}:${e.property}`;
               if (!this.staticMethodRefs.has(key)) {
-                this.staticMethodRefs.set(key, { cname, mname: e.property, m: sm });
+                this.staticMethodRefs.set(key, { cname: sm.owner, mname: e.property, m: sm });
               }
             }
           } else if (e.object.name === 'this' && this.currentWalkClass && !this.currentWalkIsStatic) {
             // `this.method` referenced as a Function value (e.g. a callback passed
             // to setTimeout / TweenLite.onComplete). Record it so the bound-method
             // thunk is emitted before any body uses it.
+            if (this.currentAnonRefs) this.currentAnonNeedsThis = true;
             const cinfo = this.symbols.getClass(this.currentWalkClass);
             const m = cinfo?.methods.get(e.property);
             if (m) {
@@ -1114,46 +2444,138 @@ export class Emitter {
                 this.boundMethods.set(key, { cname: this.currentWalkClass, mname: e.property, m });
               }
             }
+          } else {
+            // `localVar.method` / `getter.method` referenced as a Function value
+            // where the receiver is an object-typed local/parameter/getter (e.g.
+            // RenderUtil's `executeFunc(stage3D.requestContext3D, ...)` or
+            // `setTimeout(base.dispatchEvent, ...)`). Bind the receiver and emit a
+            // thunk just like `this.method`; walkInferType resolves the receiver's
+            // static type (locals, fields, getters, statics).
+            const t = this.walkInferType(e.object);
+            if (t?.kind === 'object') {
+              const cinfo = this.symbols.getClass(t.className);
+              const m = cinfo?.methods.get(e.property);
+              if (m) {
+                const key = `${t.className}:${e.property}`;
+                if (!this.boundMethods.has(key)) {
+                  this.boundMethods.set(key, { cname: t.className, mname: e.property, m });
+                }
+              }
+            }
+          }
+        }
+        // `obj.member.method` referenced as a Function value (e.g.
+        // `painter.context.drawToBitmapData`). Infer the receiver type and record a
+        // bound-method thunk; the emit pass already resolves the getter chain.
+        if (e.object.kind === 'Member') {
+          const t = this.walkInferType(e.object);
+          if (t?.kind === 'object') {
+            const cinfo = this.symbols.getClass(t.className);
+            const m = cinfo?.methods.get(e.property);
+            if (m) {
+              const key = `${t.className}:${e.property}`;
+              if (!this.boundMethods.has(key)) {
+                this.boundMethods.set(key, { cname: t.className, mname: e.property, m });
+              }
+            }
           }
         }
         this.walkExpr(e.object);
         break;
       }
+      case 'AttrAccess': this.walkExpr(e.object); break;
+      case 'Filter': this.walkExpr(e.object); this.walkExpr(e.value); break;
       case 'SuperMethod': for (const a of e.args) this.walkExpr(a); break;
+      case 'SuperProperty': {
+        // `super.method` used as a value: record the static (superclass) target so
+        // the direct-call thunk is emitted in emitFunctionValues before any body
+        // references it.
+        if (this.currentWalkClass) {
+          const cinfo = this.symbols.getClass(this.currentWalkClass);
+          const sinfo = cinfo?.superClass ? this.symbols.getClass(cinfo.superClass) : undefined;
+          const sm = sinfo?.methods.get(e.property);
+          if (sm) {
+            const key = `${sm.owner}:${e.property}`;
+            if (!this.superBoundMethods.has(key)) {
+              this.superBoundMethods.set(key, { owner: sm.owner, mname: e.property, m: sm });
+            }
+          }
+        }
+        break;
+      }
       case 'Is': this.walkExpr(e.obj); break;
       case 'As': this.walkExpr(e.obj); break;
       case 'In': this.walkExpr(e.key); this.walkExpr(e.object); break;
-      case 'New': this.noteType(e.className); for (const a of e.args) this.walkExpr(a); break;
+      case 'New': {
+        // `new assetClass()`: if the identifier is not a known class but names a
+        // Class-typed variable in the enclosing scope, it is dynamic instantiation
+        // and the variable must be captured like any other free variable.
+        if (this.currentAnonRefs) {
+          const vt = this.rt(e.className);
+          if (vt.kind !== 'object' || !this.symbols.hasClass(vt.className)) {
+            const t = this.lookupFuncVar(e.className);
+            if (t && t.kind === 'class') this.currentAnonRefs.push({ name: e.className, type: t });
+          }
+        }
+        this.noteType(e.className);
+        for (const a of e.args) this.walkExpr(a);
+        break;
+      }
       case 'NewDynamic': this.walkExpr(e.classExpr); for (const a of e.args) this.walkExpr(a); break;
       case 'ArrayLit': for (const el of e.elements) this.walkExpr(el); break;
       case 'VectorLit': this.noteType(`Vector.<${e.elem}>`); for (const el of e.elements) this.walkExpr(el); break;
       case 'Index': this.walkExpr(e.object); this.walkExpr(e.index); break;
       case 'ObjectLit': for (const f of e.fields) this.walkExpr(f.value); break;
       case 'FunctionExpr': {
-        const name = `_fn${this.anonFuncs.length}`;
+        const name = `_fn${this.anonSeq++}`;
+        const depth = this.funcVars.length;
         this.anonIndex.set(e, name);
         // Free-variable analysis: push this anonymous function's own scope, walk
         // its body collecting Var references, then keep those that resolve to the
         // enclosing function scope (captured variables).
-        this.funcVars.push(new Map(e.params.map((p) => [p.name, resolveType(p.type)])));
+        this.funcVars.push(new Map(e.params.map((p) => [p.name, this.rt(p.type)])));
         const local = this.funcVars[this.funcVars.length - 1];
-        const outer = this.funcVars[this.funcVars.length - 2];
+        // A NAMED function expression binds its own name into its own scope only
+        // (recursive self-reference). Declaring it here, in the function's own
+        // frame, makes references resolve as locals — so they are not captured as
+        // free variables and, because the frame is popped below, the name never
+        // leaks into the enclosing scope (per AS3/ES3).
+        if (e.name !== null) local.set(e.name, { kind: 'function' });
         const savedLocal = this.currentAnonLocal;
         const savedRefs = this.currentAnonRefs;
+        const savedNeedsThis = this.currentAnonNeedsThis;
+        const savedWalkSelfName = this.walkSelfName;
+        this.walkSelfName = e.name;
         this.currentAnonLocal = local;
         this.currentAnonRefs = [];
+        this.currentAnonNeedsThis = false;
         this.noteType(e.returnType);
         this.walkParams(e.params);
+        const nestedStart = this.anonCaptures.size;
+        const parentBody = this.walkFnBody;
+        this.pushWalkFnBody(e.body.body);
         this.walkStmts(e.body.body);
+        this.popWalkFnBody();
         const seen = new Map<string, CType>();
         for (const r of this.currentAnonRefs) {
-          if (!local.has(r.name) && outer.has(r.name)) seen.set(r.name, r.type);
+          if (!local.has(r.name) && this.lookupEnclosingVar(r.name, local)) seen.set(r.name, r.type);
+        }
+        this.propagateNestedCaptures(local, seen, nestedStart);
+        // A closure defined in an instance method that reaches the receiver (bare
+        // `this`, `this.method`, or an unqualified instance-method call) captures
+        // `this` into its environment, so emit-time `this`/bare-method dispatch
+        // resolves through env->this.
+        if (this.currentAnonNeedsThis && this.currentWalkClass && !this.currentWalkIsStatic) {
+          seen.set('this', { kind: 'object', className: this.currentWalkClass } as CType);
         }
         const captures = [...seen.entries()].map(([n, t]) => ({ name: n, type: t }));
         this.anonCaptures.set(e, captures);
         this.currentAnonLocal = savedLocal;
         this.currentAnonRefs = savedRefs;
-        this.anonFuncs.push({ name, params: e.params, returnType: e.returnType, body: e.body, captures });
+        this.currentAnonNeedsThis = savedNeedsThis;
+        this.walkSelfName = savedWalkSelfName;
+        this.anonFuncs.push({ name, asName: e.name, params: e.params, returnType: e.returnType, body: e.body, captures, cname: this.currentWalkClass, isStatic: this.currentWalkIsStatic, depth, methodName: this.currentWalkMethod });
+        this.addFnBodyKid(parentBody, name);
         this.funcVars.pop();
         break;
       }
@@ -1180,6 +2602,17 @@ export class Emitter {
         `((${b.cname}*)env)`,
       );
     }
+    // `super.method` bound thunks: the superclass implementation is called directly
+    // (no vtable), matching AS3's statically-resolved `super` semantics.
+    for (const s of this.superBoundMethods.values()) {
+      this.emitThunk(
+        `${s.owner}_${s.mname}__superbound`,
+        `${s.owner}_${s.mname}`,
+        s.m.params,
+        s.m.returnType,
+        `((${s.owner}*)env)`,
+      );
+    }
     // Static-method-as-value thunks: `ClassName.method` used as a Function value.
     // No receiver; the static method is called directly.
     for (const s of this.staticMethodRefs.values()) {
@@ -1192,13 +2625,40 @@ export class Emitter {
       );
     }
     // closure environment structs and heap-allocating constructors
+    // Shared cells for mutually-recursive sibling groups come first: one struct
+    // holding an `as_fn` slot per member plus the merged variable captures, so a
+    // sibling reference reads the same (identity-stable) function value.
+    const cellGroups = [...new Map([...this.closureGroupsByMethod.values()].flat().map((g) => [g.cellName, g])).values()];
+    // Activation cells for captured var-locals (members: none, varCaps: the locals)
+    // are structurally identical to a group cell, so they ride the same emission.
+    for (const c of this.fnBodyCells.values()) cellGroups.push(c);
+    for (const g of cellGroups) {
+      const fields = g.members
+        .map((m) => `as_fn ${m};`)
+        .concat(g.varCaps.map((c) => `${this.cTypeName(c.type)} ${this.cIdent(c.name)};`))
+        .join(' ');
+      this.line(`typedef struct { void (*mark)(void*); ${fields} } ${g.cellName};`);
+    }
+    for (const g of cellGroups) {
+      this.line(`static void ${g.cellName}_mark(void* self) {`);
+      this.indent++;
+      this.line(`${g.cellName}* e = (${g.cellName}*)self;`);
+      for (const m of g.members) this.line(`gc_mark_ptr((void*)e->${m});`);
+      for (const c of g.varCaps) {
+        const k = this.captureMarkKind(c.type);
+        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${this.cIdent(c.name)});`);
+        else if (k === 'value') this.line(`gc_mark_value(e->${this.cIdent(c.name)});`);
+      }
+      this.indent--;
+      this.line('}');
+    }
     for (const fn of this.anonFuncs) {
-      if (fn.captures.length === 0) continue;
+      if (fn.captures.length === 0 || this.closureGroups.has(fn.name)) continue;
       const fields = fn.captures.map((c) => `${this.cTypeName(c.type)} ${this.cIdent(c.name)};`).join(' ');
       this.line(`typedef struct { void (*mark)(void*); ${fields} } ${fn.name}_env;`);
     }
     for (const fn of this.anonFuncs) {
-      if (fn.captures.length === 0) continue;
+      if (fn.captures.length === 0 || this.closureGroups.has(fn.name)) continue;
       const params = fn.captures.map((c) => `${this.cTypeName(c.type)} ${this.cIdent(c.name)}`).join(', ');
       // GC mark callback for the captured environment: trace each captured field
       // that carries a GC pointer (raw object/string) or a boxed as_value. The
@@ -1227,36 +2687,77 @@ export class Emitter {
     // prototypes first so a nested anonymous function's thunk resolves before
     // its enclosing body references it.
     for (const fn of this.anonFuncs) {
-      const rt = resolveType(fn.returnType);
+      const rt = this.rt(fn.returnType);
       if (fn.captures.length === 0) {
         this.line(`${this.cTypeName(rt)} ${fn.name}(${this.paramDecls(fn.params)});`);
       } else {
         const p = this.paramDecls(fn.params);
-        this.line(`${this.cTypeName(rt)} ${fn.name}__impl(${fn.name}_env* env${p ? ', ' + p : ''});`);
+        this.line(`${this.cTypeName(rt)} ${fn.name}__impl(${this.closureEnvType(fn)}* env${p ? ', ' + p : ''});`);
       }
       this.line(`as_value ${fn.name}__call(void* env, as_value* args, int argc);`);
     }
+    // Eager cell allocators: allocate the shared cell, fill each member's `as_fn`
+    // slot, and default-initialize the captured variables. Boxed captured locals
+    // are written later by the enclosing body via `cell->field` (reference
+    // semantics), so they start at their AS3 defaults here (gc_alloc zeroes them;
+    // Number defaults to NaN).
+    for (const g of cellGroups) {
+      this.line(`static ${g.cellName}* ${g.cellName}_alloc(void) {`);
+      this.indent++;
+      this.line(`${g.cellName}* e = (${g.cellName}*)gc_alloc(GCT_CUSTOM, sizeof(${g.cellName}));`);
+      this.line(`e->mark = ${g.cellName}_mark;`);
+      for (const m of g.members) {
+        const nf = this.nestedFuncs.get(m);
+        if (nf) this.line(`e->${m} = as_fn_make(${m}__call, (void*)e, ${this.requiredArity(nf.params)});`);
+      }
+      for (const c of g.varCaps) {
+        if (c.type.kind === 'number') this.line(`e->${this.cIdent(c.name)} = NAN;`);
+      }
+      this.line('return e;');
+      this.indent--;
+      this.line('}');
+    }
     if (this.anonFuncs.length > 0) this.line('');
     for (const fn of this.anonFuncs) {
-      const rt = resolveType(fn.returnType);
+      const rt = this.rt(fn.returnType);
       this.pushScope();
       this.functionScope = this.scopes[this.scopes.length - 1];
-      for (const p of fn.params) this.declareVar(p.name, resolveType(p.type));
+      for (const p of fn.params) this.declareVar(p.name, this.rt(p.type));
       this.currentReturnType = rt;
       if (fn.captures.length === 0) {
         this.line(`${this.cTypeName(rt)} ${fn.name}(${this.paramDecls(fn.params)}) {`);
       } else {
         const p = this.paramDecls(fn.params);
-        this.line(`${this.cTypeName(rt)} ${fn.name}__impl(${fn.name}_env* env${p ? ', ' + p : ''}) {`);
+        this.line(`${this.cTypeName(rt)} ${fn.name}__impl(${this.closureEnvType(fn)}* env${p ? ', ' + p : ''}) {`);
         this.currentClosureCaptures = new Map(fn.captures.map((c) => [c.name, c.type]));
+        this.currentClosureCells = this.closureCellEnv.get(fn.name)?.resolve ?? null;
       }
       this.indent++;
+      // Restore the enclosing class context so a bare instance-method call or
+      // `this` inside the closure resolves against the defining class (with
+      // env->this as the receiver; see emitVar / emitCall).
+      const savedClass = this.currentClass;
+      const savedIsStatic = this.currentIsStatic;
+      const savedMethod = this.currentMethod;
+      this.currentClass = fn.cname;
+      this.currentIsStatic = fn.isStatic;
+      this.currentMethod = fn.methodName;
       this.hoistFunctionLocals(fn.body.body);
+      this.currentFuncCName = fn.name;
+      this.currentFuncAsName = fn.asName;
+      this.currentFuncArity = this.requiredArity(fn.params);
       this.emitBlockBody(fn.body);
+      this.currentFuncCName = null;
+      this.currentFuncAsName = null;
+      this.currentFuncArity = 0;
+      this.currentClass = savedClass;
+      this.currentIsStatic = savedIsStatic;
+      this.currentMethod = savedMethod;
       this.indent--;
       this.line('}');
       this.line('');
       this.currentClosureCaptures = null;
+      this.currentClosureCells = null;
       this.functionScope = null;
       this.hoistedLocals = new Set();
       this.popScope();
@@ -1264,19 +2765,53 @@ export class Emitter {
       if (fn.captures.length === 0) {
         this.emitThunk(`${fn.name}__call`, fn.name, fn.params, rt, null);
       } else {
-        this.emitThunk(`${fn.name}__call`, `${fn.name}__impl`, fn.params, rt, `((${fn.name}_env*)env)`);
+        this.emitThunk(`${fn.name}__call`, `${fn.name}__impl`, fn.params, rt, `((${this.closureEnvType(fn)}*)env)`);
       }
     }
     if (this.symbols.funcs.size > 0 || this.anonFuncs.length > 0) this.line('');
+  }
+
+  // AS3 Function.length: the number of REQUIRED parameters (all parameters
+  // before the first optional/rest one). Starling's execute() reads func.length
+  // to decide how many arguments to pass and pads the rest with null, so the
+  // emitted closure arity must be this count — not the total declared parameter
+  // count — or a thunk with default-valued String params will receive a padded
+  // as_v_null() and unbox it to the literal "null" (see emitThunk's argc>i guard).
+  private requiredArity(params: Param[]): number {
+    let n = 0;
+    for (const p of params) {
+      if (p.defaultValue !== null || p.isRest) break;
+      n++;
+    }
+    return n;
   }
 
   // A calling thunk: unbox each argument from the as_value[] list, call the
   // typed implementation, and box the result back into as_value. `envArg` is the
   // environment expression passed first for capturing closures (null otherwise).
   private emitThunk(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null): void {
-    const argCodes = params.map((p, i) =>
-      this.unboxAny({ code: `args[${i}]`, type: { kind: 'any' } as CType }, resolveType(p.type)),
-    );
+    const argCodes: string[] = [];
+    for (let i = 0; i < params.length; i++) {
+      const p = params[i];
+      if (p.isRest) {
+        // A rest parameter (`...args`) is the callee's Array of all trailing boxed
+        // arguments. In the uniform thunk signature those trailing values are the
+        // tail of the caller's contiguous as_value[] list, so as_array_make copies
+        // args[i..argc-1] directly (no per-arg unbox).
+        argCodes.push(`as_array_make((argc > ${i} ? argc - ${i} : 0), (argc > ${i} ? &args[${i}] : NULL))`);
+        break;
+      }
+      const unboxArg = this.unboxAny({ code: `args[${i}]`, type: { kind: 'any' } as CType }, this.rt(p.type));
+      if (p.defaultValue !== null) {
+        // An optional argument the caller may omit: fall back to its default value
+        // when argc <= i. Otherwise the thunk reads args[i] out of bounds (args may
+        // be NULL, e.g. `onAssetLoaded()` with `name:String=null`).
+        const defCode = this.convert(this.emitExpr(p.defaultValue), this.rt(p.type));
+        argCodes.push(`(argc > ${i} ? ${unboxArg} : ${defCode})`);
+      } else {
+        argCodes.push(unboxArg);
+      }
+    }
     this.line(`as_value ${name}(void* env, as_value* args, int argc) {`);
     this.indent++;
     if (envArg === null) this.line('(void)env;');
@@ -1313,15 +2848,15 @@ export class Emitter {
         return codes.join(', ');
       }
       if (i < args.length) {
-        codes.push(this.convert(this.emitExpr(args[i]), resolveType(p.type)));
+        codes.push(this.convert(this.emitExpr(args[i]), this.rt(p.type)));
       } else if (p.defaultValue !== null) {
-        codes.push(this.convert(this.emitExpr(p.defaultValue), resolveType(p.type)));
+        codes.push(this.convert(this.emitExpr(p.defaultValue), this.rt(p.type)));
       } else {
         throw new CodegenError(`missing argument for parameter '${p.name}'`);
       }
     }
     if (args.length > params.length) {
-      throw new CodegenError(`too many arguments (expected ${params.length}, got ${args.length})`);
+      throw new CodegenError(`too many arguments (expected ${params.length}, got ${args.length}) for ${params.map((p) => p.name).join(',')}`);
     }
     return codes.join(', ');
   }
@@ -1338,12 +2873,29 @@ export class Emitter {
   private emitDefinitions(): void {
     // built-in Object.toString(): the default string form of any object is its runtime class name.
     this.line('char* Object_toString(void* _this) { return as_obj_to_str(_this); }');
+    // Object.hasOwnProperty(name): AS3 semantics (verified against AIR's adl on a
+    // base class with a field, a getter, a writer and a method, plus a derived
+    // class): 'hasOwnProperty' is TRUE for every *trait declared on the instance's
+    // class or any superclass* — fields, accessors (getter OR setter) and methods
+    // alike — because AS3 instance traits are inherited into the instance's own
+    // trait set. It is only false for names with no trait at all (or, for a
+    // dynamic object, no dynamic slot). Delegates to the runtime trait walk shared
+    // with the `in` operator so the two can never disagree; Starling's
+    // Juggler.tween validates tweenable properties through this method, which is
+    // how accessor-backed names like Sprite3D.rotationX become tweenable.
+    this.line('bool Object_hasOwnProperty(void* _this, char* name) {');
+    this.indent++;
+    this.line('if (_this == NULL || name == NULL) return false;');
+    this.line('return as_dyn_has(_this, name);');
+    this.indent--;
+    this.line('}');
     this.line('');
     // Stage3D on-screen compositing (stage 82 P2): Context3D.present() exposes the
-    // offscreen Metal render target for ASC_window_render to composite behind the
-    // 2D display list (AIR puts Stage3D behind the display list). On the GPU Metal
-    // path this is a direct GPU→GPU blit (ASC_stage3d_tex); on the CPU raster path
-    // the target is read back into ASC_stage3d_pixels and drawn as BGRA. Declared up
+    // offscreen render target for ASC_window_render to composite behind the 2D
+    // display list (AIR puts Stage3D behind the display list). On both GPU paths
+    // this is a direct GPU→GPU blit (ASC_stage3d_tex: an MTLTexture natively, a GL
+    // texture wrapped as a GrBackendTexture on the web); on the CPU raster path the
+    // target is read back into ASC_stage3d_pixels and drawn as BGRA. Declared up
     // here (before the Context3D_* method definitions below) so Context3D_present
     // can reference them. Static storage duration zero-initializes them to NULL/0,
     // matching the "no Stage3D content yet" state.
@@ -1352,6 +2904,17 @@ export class Emitter {
     this.line('static int ASC_stage3d_w;');
     this.line('static int ASC_stage3d_h;');
     this.line('static int ASC_stage3d_ready;');
+    // The Stage3D back buffer's size in *stage* units (what Context3D was asked to
+    // configure). Under HiDPI these are smaller than the actual render target
+    // (ASC_stage3d_w/h), which AIR allocates at device resolution — the compositor
+    // draws the target into this logical rect (analogous to stage3D.x/y +
+    // configureBackBuffer's width/height in AIR).
+    this.line('static int ASC_stage3d_lw;');
+    this.line('static int ASC_stage3d_lh;');
+    // Forward declaration: the window backend owns the definition (with the rest
+    // of the ASC_win_* state further down). Context3D_configureBackBuffer needs the
+    // device pixel ratio to honour wantsBestResolution, so it must be visible here.
+    this.line('static double ASC_win_scale;');
     this.line('');
     // built-in Object: no fields to initialize, but every subclass's implicit
     // super() lands here, so it needs a real (empty) constructor definition.
@@ -1370,31 +2933,64 @@ export class Emitter {
       this.line(`${cc}* ${cc}_new(void) { ${cc}* o = (${cc}*)gc_alloc(GCT_CLASS, sizeof(${cc})); o->vtable = &${cc}_vt; ${cc}_ctor(o); return o; }`);
     }
     this.line('');
-    // built-in Error: constructor copies the message into the message field.
-    this.line('void Error_ctor(Error* o, char* message) { o->message = message; gc_write_barrier((void*)message); }');
-    this.line('Error* Error_new(char* message) {');
+    // built-in Error: constructor copies the message into the message field. The
+    // second `id` parameter (AS3 Error(message, id)) is accepted and discarded —
+    // Starling's Error subclasses call `super(message, id)`.
+    this.line('void Error_ctor(Error* o, char* message, int id) { o->message = message; o->errorID = id; gc_write_barrier((void*)message); }');
+    this.line('Error* Error_new(char* message, int id) {');
     this.indent++;
     this.line('Error* o = (Error*)gc_alloc(GCT_CLASS, sizeof(Error));');
     this.line('o->vtable = &Error_vt;');
-    this.line('Error_ctor(o, message);');
+    this.line('Error_ctor(o, message, id);');
     this.line('return o;');
     this.indent--;
     this.line('}');
     this.line('');
     // built-in Error subclasses: identical { vtable; message } layout, but each
     // has its own vtable instance so `catch (e:TypeError)` can match precisely.
-    for (const sub of ['TypeError', 'RangeError', 'ArgumentError', 'SyntaxError']) {
-      this.line(`void ${sub}_ctor(${sub}* o, char* message) { o->message = message; gc_write_barrier((void*)message); }`);
-      this.line(`${sub}* ${sub}_new(char* message) {`);
+    for (const sub of ['TypeError', 'RangeError', 'ArgumentError', 'SyntaxError', 'ReferenceError', 'IllegalOperationError', 'IllegalArgumentError', 'SecurityError', 'EOFError', 'IOError']) {
+      // The id is STORED, not discarded: AIR's errorID is how code tells a
+      // parameter error (#2007) from an EOF (#2030) without parsing the message,
+      // and these subclasses share Error's layout (see emitStructs).
+      this.line(`void ${sub}_ctor(${sub}* o, char* message, int id) { o->message = message; o->errorID = id; gc_write_barrier((void*)message); }`);
+      this.line(`${sub}* ${sub}_new(char* message, int id) {`);
       this.indent++;
       this.line(`${sub}* o = (${sub}*)gc_alloc(GCT_CLASS, sizeof(${sub}));`);
       this.line(`o->vtable = &${sub}_vt;`);
-      this.line(`${sub}_ctor(o, message);`);
+      this.line(`${sub}_ctor(o, message, id);`);
       this.line('return o;');
       this.indent--;
       this.line('}');
       this.line('');
     }
+    // XML parse wrapper: as_xml_parse returns NULL on malformed input; the AS3
+    // `new XML(bytes)` constructor must throw an Error instead of silently
+    // degrading. Emitted here (not in RUNTIME_PREAMBLE) because it calls the
+    // generated Error_new.
+    this.line('static as_xml_node* as_xml_parse_checked(const char* src, int len) {');
+    this.indent++;
+    this.line('as_xml_node* n = as_xml_parse(src, len);');
+    this.line('if (n == NULL) as_throw(Error_new((char*)"XML parse error", 0));');
+    this.line('return n;');
+    this.indent--;
+    this.line('}');
+    // Single-evaluation entry points: `new XML(expr)` must evaluate `expr` exactly
+    // once (AS3 evaluates the argument once). Passing the value through one helper
+    // argument avoids re-emitting a side-effecting expression such as
+    // `new XML(bytes.readUTF())` — readUTF advances `position`, so a second read
+    // yields the empty tail instead of the payload.
+    this.line('static as_xml_node* as_xml_parse_str_checked(const char* src) {');
+    this.indent++;
+    this.line('return as_xml_parse_checked(src, src == NULL ? 0 : (int)strlen(src));');
+    this.indent--;
+    this.line('}');
+    this.line('static as_xml_node* as_xml_parse_bytes_checked(ByteArray* bytes) {');
+    this.indent++;
+    this.line('if (bytes == NULL) return as_xml_parse_checked("", 0);');
+    this.line('return as_xml_parse_checked(bytes->data == NULL ? "" : (const char*)bytes->data, (int)bytes->length);');
+    this.indent--;
+    this.line('}');
+    this.line('');
     // built-in Date: stores milliseconds since the epoch; calendar accessors
     // convert through C's localtime() (AS3 getMonth/getDay are 0-based, matching
     // tm_mon/tm_wday). Constructors: () = now, (ms) = epoch ms, (string) = parsed,
@@ -1443,6 +3039,9 @@ export class Emitter {
     this.line('return o;');
     this.indent--;
     this.line('}');
+    // Font.enumerateFonts: the demo does not enumerate device fonts, so return
+    // an empty array (SystemUtil.isEmbeddedFont consequently always answers false).
+    this.line('as_array* Font_enumerateFonts_static(bool enumerateDeviceFonts) { (void)enumerateDeviceFonts; return as_array_new(); }');
     // Date.parse: accept "YYYY/MM/DD" / "YYYY-MM-DD" with an optional time part.
     this.line('double Date_parse_static(char* s) {');
     this.indent++;
@@ -1502,7 +3101,7 @@ export class Emitter {
     this.line('o->dotall = (flags != NULL && strchr(flags, \'s\') != NULL);');
     this.line('o->extended = (flags != NULL && strchr(flags, \'x\') != NULL);');
     this.line('o->compiled = as_regex_compile(pattern, flags);');
-    this.line('if (o->compiled->err) as_throw(SyntaxError_new((char*)o->compiled->errmsg));');
+    this.line('if (o->compiled->err) as_throw(SyntaxError_new((char*)o->compiled->errmsg, 0));');
     this.indent--;
     this.line('}');
     this.line('RegExp* RegExp_new(char* pattern, char* flags) {');
@@ -1579,8 +3178,8 @@ export class Emitter {
     this.line('}');
     this.line('if (strcmp(name, "charAt") == 0) return as_v_str(as_str_charAt(s, as_v_int_val(args[0])));');
     this.line('if (strcmp(name, "charCodeAt") == 0) return as_v_num((double)as_str_charCodeAt(s, as_v_int_val(args[0])));');
-    this.line('if (strcmp(name, "indexOf") == 0) return as_v_num((double)as_str_indexOf(s, as_v_str_val(args[0])));');
-    this.line('if (strcmp(name, "lastIndexOf") == 0) return as_v_num((double)as_str_lastIndexOf(s, as_v_str_val(args[0])));');
+    this.line('if (strcmp(name, "indexOf") == 0) return as_v_num((double)as_str_indexOf_from(s, as_v_str_val(args[0]), argc >= 2 ? as_v_int_val(args[1]) : 0));');
+    this.line('if (strcmp(name, "lastIndexOf") == 0) return as_v_num((double)as_str_lastIndexOf_from(s, as_v_str_val(args[0]), argc >= 2 ? as_v_int_val(args[1]) : 0x7FFFFFFF));');
     this.line('if (strcmp(name, "substring") == 0) {');
     this.indent++;
     this.line('int from = as_v_int_val(args[0]);');
@@ -1843,6 +3442,32 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('');
+    // flash.desktop.NativeApplication: a single global EventDispatcher-backed
+    // singleton (window activate/deactivate events). Lazily constructed and
+    // registered as a GC permanent root.
+    this.line('void NativeApplication_ctor(NativeApplication* o) { EventDispatcher_ctor((EventDispatcher*)o); }');
+    this.line('NativeApplication* NativeApplication_new(void) {');
+    this.indent++;
+    this.line('NativeApplication* o = (NativeApplication*)gc_alloc(GCT_CLASS, sizeof(NativeApplication));');
+    this.line('o->vtable = &NativeApplication_vt;');
+    this.line('NativeApplication_ctor(o);');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    this.line('static NativeApplication* ASC_native_app = NULL;');
+    this.line('NativeApplication* NativeApplication_get_nativeApplication_static(void* _this) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('if (ASC_native_app == NULL) ASC_native_app = NativeApplication_new();');
+    this.line('return ASC_native_app;');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // flash.ui.Multitouch: inputMode is a global string (default "none").
+    this.line('static char* ASC_multitouch_input_mode = (char*)"none";');
+    this.line('char* Multitouch_get_inputMode_static(void* _this) { (void)_this; return ASC_multitouch_input_mode; }');
+    this.line('void Multitouch_set_inputMode_static(void* _this, char* value) { (void)_this; ASC_multitouch_input_mode = value; }');
+    this.line('');
     // ---- flash.display display list (stage 34) ----
     // DisplayObject: EventDispatcher + transform properties. Fields are laid out
     // { vtable; listeners; parent; name; x; y; width; height; visible; alpha;
@@ -1886,11 +3511,18 @@ export class Emitter {
     this.line('return o;');
     this.indent--;
     this.line('}');
+    // The single window's Stage, set when the Stage is constructed (before the
+    // document class runs). DisplayObject_get_stage falls back to it for a
+    // not-yet-attached root object, so the main class's `stage` is non-null inside
+    // its constructor — matching Flash, where the document class's `stage` is set
+    // before its constructor runs.
+    this.line('static Stage* ASC_root_stage = NULL;');
     this.line('Stage* DisplayObject_get_stage(void* _this) {');
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)_this;');
     this.line('while (o->parent != NULL) o = (DisplayObject*)o->parent;');
-    this.line("return (o->vtable != NULL && strcmp(o->vtable->name, \"Stage\") == 0) ? (Stage*)o : NULL;");
+    this.line("if (o->vtable != NULL && strcmp(o->vtable->name, \"Stage\") == 0) return (Stage*)o;");
+    this.line('return ASC_root_stage;');
     this.indent--;
     this.line('}');
     this.line('');
@@ -2062,6 +3694,7 @@ export class Emitter {
     this.line('void Stage_ctor(Stage* o) {');
     this.indent++;
     this.line('DisplayObjectContainer_ctor((DisplayObjectContainer*)o);');
+    this.line('ASC_root_stage = o;');
     this.line('o->stage_w = 0;');
     this.line('o->stage_h = 0;');
     this.line('o->stage_color = 0xFFFFFFu;');
@@ -2107,6 +3740,7 @@ export class Emitter {
     this.line('bool Stage_get_allowsFullScreen(void* _this) { (void)_this; return true; }');
     this.line('bool Stage_get_allowsFullScreenInteractive(void* _this) { (void)_this; return true; }');
     this.line('double Stage_get_contentsScaleFactor(void* _this) { return ((Stage*)_this)->stage_scale; }');
+    this.line('double Stage_get_browserZoomFactor(void* _this) { (void)_this; return 1.0; }');
     this.line('');
     this.line('void Sprite_ctor(Sprite* o) { DisplayObjectContainer_ctor((DisplayObjectContainer*)o); }');
     this.line('Sprite* Sprite_new(void) { Sprite* o = (Sprite*)gc_alloc(GCT_CLASS, sizeof(Sprite)); o->vtable = &Sprite_vt; Sprite_ctor(o); return o; }');
@@ -2116,6 +3750,7 @@ export class Emitter {
     this.indent++;
     this.line('Event_ctor((Event*)o, type, bubbles, cancelable);');
     this.line('o->localX = localX; o->localY = localY;');
+    this.line('o->stageX = 0.0; o->stageY = 0.0;');
     this.line('o->relatedObject = relatedObject;');
     this.line('gc_write_barrier((void*)relatedObject);');
     this.line('o->ctrlKey = ctrlKey; o->altKey = altKey; o->shiftKey = shiftKey;');
@@ -2169,10 +3804,24 @@ export class Emitter {
     this.line('ProgressEvent* ProgressEvent_new(char* type, bool bubbles, bool cancelable, unsigned int bytesLoaded, unsigned int bytesTotal) { ProgressEvent* o = (ProgressEvent*)gc_alloc(GCT_CLASS, sizeof(ProgressEvent)); o->vtable = &ProgressEvent_vt; ProgressEvent_ctor(o, type, bubbles, cancelable, bytesLoaded, bytesTotal); return o; }');
     this.line('void ErrorEvent_ctor(ErrorEvent* o, char* type, bool bubbles, bool cancelable, char* text) { Event_ctor((Event*)o, type, bubbles, cancelable); o->text = text; gc_write_barrier((void*)text); }');
     this.line('ErrorEvent* ErrorEvent_new(char* type, bool bubbles, bool cancelable, char* text) { ErrorEvent* o = (ErrorEvent*)gc_alloc(GCT_CLASS, sizeof(ErrorEvent)); o->vtable = &ErrorEvent_vt; ErrorEvent_ctor(o, type, bubbles, cancelable, text); return o; }');
-    this.line('void IOErrorEvent_ctor(IOErrorEvent* o, char* type, bool bubbles, bool cancelable, char* text) { ErrorEvent_ctor((ErrorEvent*)o, type, bubbles, cancelable, text); }');
+    this.line('void IOErrorEvent_ctor(IOErrorEvent* o, char* type, bool bubbles, bool cancelable, char* text) { ErrorEvent_ctor((ErrorEvent*)o, type, bubbles, cancelable, text); o->errorID = 0; }');
     this.line('IOErrorEvent* IOErrorEvent_new(char* type, bool bubbles, bool cancelable, char* text) { IOErrorEvent* o = (IOErrorEvent*)gc_alloc(GCT_CLASS, sizeof(IOErrorEvent)); o->vtable = &IOErrorEvent_vt; IOErrorEvent_ctor(o, type, bubbles, cancelable, text); return o; }');
     this.line('void DataEvent_ctor(DataEvent* o, char* type, bool bubbles, bool cancelable, char* data) { Event_ctor((Event*)o, type, bubbles, cancelable); o->data = data; gc_write_barrier((void*)data); }');
     this.line('DataEvent* DataEvent_new(char* type, bool bubbles, bool cancelable, char* data) { DataEvent* o = (DataEvent*)gc_alloc(GCT_CLASS, sizeof(DataEvent)); o->vtable = &DataEvent_vt; DataEvent_ctor(o, type, bubbles, cancelable, data); return o; }');
+    // HTTPStatusEvent (flash.events, AIR): a response that carries a status line
+    // reports it before PROGRESS/COMPLETE. `status` is set here; responseURL /
+    // responseHeaders / redirected are filled by the URLLoader thunk through
+    // URLLoader__statusEvent once the response header block has been parsed.
+    this.line('void HTTPStatusEvent_ctor(HTTPStatusEvent* o, char* type, bool bubbles, bool cancelable, int status) {');
+    this.indent++;
+    this.line('Event_ctor((Event*)o, type, bubbles, cancelable);');
+    this.line('o->status = status;');
+    this.line('o->responseURL = (char*)"";');
+    this.line('o->responseHeaders = as_array_new(); gc_write_barrier((void*)o->responseHeaders);');
+    this.line('o->redirected = false;');
+    this.indent--;
+    this.line('}');
+    this.line('HTTPStatusEvent* HTTPStatusEvent_new(char* type, bool bubbles, bool cancelable, int status) { HTTPStatusEvent* o = (HTTPStatusEvent*)gc_alloc(GCT_CLASS, sizeof(HTTPStatusEvent)); o->vtable = &HTTPStatusEvent_vt; HTTPStatusEvent_ctor(o, type, bubbles, cancelable, status); return o; }');
     this.line('');
     // ---- flash.utils.Timer (stage 60) ----
     // Repeating timer. start() registers into the runtime's as_rep_timers pool;
@@ -2191,7 +3840,7 @@ export class Emitter {
     this.line('}');
     this.line('Timer* Timer_new(double delay, int repeatCount) { Timer* o = (Timer*)gc_alloc(GCT_CLASS, sizeof(Timer)); o->vtable = &Timer_vt; Timer_ctor(o, delay, repeatCount); return o; }');
     this.line('double Timer_get_delay(void* _this) { return ((Timer*)_this)->delay; }');
-    this.line('void Timer_set_delay(void* _this, double value) { if (isnan(value) || isinf(value) || value < 0) { as_throw(RangeError_new((char*)"The delay specified is negative or not a finite number")); return; } ((Timer*)_this)->delay = value; }');
+    this.line('void Timer_set_delay(void* _this, double value) { if (isnan(value) || isinf(value) || value < 0) { as_throw(RangeError_new((char*)"The delay specified is negative or not a finite number", 0)); return; } ((Timer*)_this)->delay = value; }');
     this.line('int Timer_get_repeatCount(void* _this) { return ((Timer*)_this)->repeatCount; }');
     this.line('void Timer_set_repeatCount(void* _this, int value) { ((Timer*)_this)->repeatCount = value; }');
     this.line('int Timer_get_currentCount(void* _this) { return ((Timer*)_this)->currentCount; }');
@@ -2225,6 +3874,11 @@ export class Emitter {
     this.line('void MovieClip_ctor(MovieClip* o) {');
     this.indent++;
     this.line('Sprite_ctor((Sprite*)o);');
+    // MovieClip is a DYNAMIC class in AS3 (adl-verified: `mc.foo = 1` succeeds and
+    // `mc.foo` reads back, whereas the same on a Sprite is ReferenceError #1056).
+    // Arbitrary keys therefore need the `_dyn` slot table allocated up front.
+    this.line('o->_dyn = as_object_new();');
+    this.line('gc_write_barrier((void*)o->_dyn);');
     this.line('o->currentFrame = 0; o->totalFrames = 1; o->playing = false;');
     this.indent--;
     this.line('}');
@@ -2233,7 +3887,7 @@ export class Emitter {
     this.line('int MovieClip_get_totalFrames(void* _this) { return ((MovieClip*)_this)->totalFrames; }');
     // totalFrames is writable in this subset (no symbol timeline); a value < 1 is
     // rejected like AIR rejects an empty timeline.
-    this.line('void MovieClip_set_totalFrames(void* _this, int value) { if (value < 1) { as_throw(RangeError_new((char*)"The totalFrames specified is less than 1")); return; } ((MovieClip*)_this)->totalFrames = value; }');
+    this.line('void MovieClip_set_totalFrames(void* _this, int value) { if (value < 1) { as_throw(RangeError_new((char*)"The totalFrames specified is less than 1", 0)); return; } ((MovieClip*)_this)->totalFrames = value; }');
     this.line('void MovieClip__on_frame(void* obj) { MovieClip* o = (MovieClip*)obj; if (!o->playing) return; o->currentFrame++; if (o->currentFrame > o->totalFrames) o->currentFrame = 1; }');
     this.line('void MovieClip_play(void* _this) { MovieClip* o = (MovieClip*)_this; o->playing = true; as_mc_add(o, MovieClip__on_frame); }');
     this.line('void MovieClip_stop(void* _this) { MovieClip* o = (MovieClip*)_this; o->playing = false; as_mc_cancel(o); }');
@@ -2261,6 +3915,10 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('LoaderInfo* LoaderInfo_new(void) { LoaderInfo* o = (LoaderInfo*)gc_alloc(GCT_CLASS, sizeof(LoaderInfo)); o->vtable = &LoaderInfo_vt; LoaderInfo_ctor(o); return o; }');
+    // AS3 LoaderInfo.content: the loaded content (a Bitmap for image loads),
+    // reached through the back-referenced owning Loader. Returns NULL when the
+    // LoaderInfo is standalone or no content has been loaded yet.
+    this.line('DisplayObject* LoaderInfo_get_content(void* _this) { LoaderInfo* o = (LoaderInfo*)_this; return (o->loader != NULL) ? o->loader->content : NULL; }');
     this.line('');
     // Loader: a DisplayObjectContainer holding loaded content. contentLoaderInfo is
     // created at construction (never null, matching AIR) and its `loader` field
@@ -2278,15 +3936,78 @@ export class Emitter {
     this.line('Loader* Loader_new(void) { Loader* o = (Loader*)gc_alloc(GCT_CLASS, sizeof(Loader)); o->vtable = &Loader_vt; Loader_ctor(o); return o; }');
     this.line('DisplayObject* Loader_get_content(void* _this) { return ((Loader*)_this)->content; }');
     this.line('LoaderInfo* Loader_get_contentLoaderInfo(void* _this) { return ((Loader*)_this)->contentLoaderInfo; }');
-    // Async completion thunk: fires COMPLETE on contentLoaderInfo on a later frame
-    // tick (AIR dispatches load completion asynchronously, so listeners registered
-    // after load() still receive it).
-    this.line('static as_value Loader__complete(void* env, as_value* args, int argc) {');
+    // Completion thunk, run on the AS3 thread inside a frame boundary: adopt the
+    // staged decode result as `content`, publish the byte counts on the
+    // LoaderInfo and only then dispatch COMPLETE. Shared by load() (decode a URL)
+    // and loadBytes() (decode an in-memory ByteArray) — both produce a Bitmap.
+    // Before, the decode ran inside load()/loadBytes() and `content` was already
+    // set when those returned; AIR leaves it null until COMPLETE.
+    this.line('static void Loader__imageFinish(void* job) {');
     this.indent++;
-    this.line('(void)args; (void)argc;');
-    this.line('Loader* o = (Loader*)env;');
-    this.line('EventDispatcher_dispatchEvent((void*)o->contentLoaderInfo, (Event*)Event_new((char*)"complete", false, false));');
-    this.line('return as_v_null();');
+    this.line('Loader* o = (Loader*)as_job_obj(job);');
+    this.line('LoaderInfo* li = o->contentLoaderInfo;');
+    this.line('int err = as_job_error(job);');
+    this.line('li->bytesLoaded = as_job_total(job);');
+    this.line('li->bytesTotal = as_job_total(job);');
+    this.line('if (err != 0) {');
+    this.indent++;
+    this.line('const char* msg = as_job_error_text(job, (char*)"Loader: network URLs are not supported in this build (no HTTP backend linked; see docs/zh-cn/flash-net.md)", (char*)"Loader load failed");');
+    // AIR reports a URL that cannot be read as IOErrorEvent.IO_ERROR on the
+    // LoaderInfo, never as COMPLETE, and it reports an undecodable payload
+    // (Loader.loadBytes with a non-image) as an IO_ERROR too. Neither may fall
+    // through to a Bitmap: publishing a 0x0 content would be a silently wrong
+    // result.
+    //
+    // The event carries AIR's NUMBER as well as its sentence (2035 local file
+    // not found / 2036 transport or HTTP >= 400 / 2124 undecodable payload):
+    // code branches on e.errorID, and a bare id=0 with a hand-written sentence
+    // told the caller nothing it could test against.
+    this.line('int eid = as_job_loader_ioerror_id(job);');
+    this.line('if (eid != 0) msg = as_ioerror_text(li->url, eid, as_job_err_detail(job));');
+    this.line('IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, (char*)msg);');
+    this.line('ev->errorID = eid;');
+    this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)ev);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('BitmapData* bd = BitmapData_new(0, 0, true, 0);');
+    this.line('int w = as_job_width(job), h = as_job_height(job);');
+    this.line('void* px = as_job_pixels(job);');
+    // The glue returns a malloc'd ARGB buffer (it cannot call into the GC heap);
+    // move it into a GC-owned buffer so `pixels` has exactly one owner and is
+    // reclaimed with the BitmapData instead of leaking per decoded image. A
+    // decode failure (err == AS_JOB_ERR_DECODE) leaves the blank buffer in
+    // place, which keeps this subset's pre-existing decode-failure behaviour.
+    // Ownership: the staged buffer is NOT freed here - the job still owns it and
+    // as_job_retire() releases it when the frame boundary retires the job. The
+    // BitmapData's OWN previous buffer is likewise never free()d (it is a GC
+    // buffer); this bitmap is built 0x0 so there is nothing to drop, but the
+    // rule is why no free(bd->pixels) appears here -- see BitmapData_loadFile.
+    this.line('if (px != NULL && w > 0 && h > 0) { unsigned* gcpx = (unsigned*)gc_alloc(GCT_BYTES, sizeof(unsigned) * (size_t)(w * h)); memcpy(gcpx, px, sizeof(unsigned) * (size_t)(w * h)); bd->pixels = (void*)gcpx; gc_write_barrier(bd->pixels); bd->width = w; bd->height = h; }');
+    // BitmapData_loadFile also keeps an SkImage view for the display-list Bitmap
+    // render path; reproduce that here. The SkImage is a deferred (lazy) wrapper,
+    // so this is a cheap wrap, not a second decode.
+    // The display-list Bitmap draws from an SkImage view (as_render_object_content),
+    // not from the CPU pixel buffer. A local load re-opens the file by name; a
+    // fetched http(s):// URL has no file to name, so its view is built from the
+    // encoded bytes the job still holds (AS_JOB_IMAGE_URL keeps them for exactly
+    // this reason). Payload first, file second: an in-memory payload is the more
+    // specific answer whenever there is one.
+    this.line('const void* enc = as_job_bytes(job);');
+    this.line('unsigned enc_len = as_job_len(job);');
+    this.line('if (enc != NULL && enc_len > 0) bd->image = as_skia_image_from_bytes(enc, enc_len);');
+    this.line('else if (li->url != NULL) bd->image = as_skia_image_from_file(li->url);');
+    this.line('Bitmap* bmp = Bitmap_new(bd);');
+    this.line('o->content = (DisplayObject*)bmp;');
+    this.line('gc_write_barrier((void*)bmp);');
+    // AIR adds the loaded content as the Loader's OWN child (loader.numChildren
+    // == 1, and the content's parent is the Loader). That is not a cosmetic
+    // detail: a Loader is a DisplayObjectContainer and the renderer walks
+    // containers' children, so content that is only reachable through
+    // loader.content draws nothing at all. It also makes the content dispatch
+    // addedToStage when the Loader is already on the stage, like AIR.
+    this.line('DisplayObjectContainer_addChildAt((void*)o, (DisplayObject*)bmp, 0);');
+    this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"complete", false, false));');
     this.indent--;
     this.line('}');
     this.line('void Loader_load(void* _this, URLRequest* request) {');
@@ -2296,98 +4017,1411 @@ export class Emitter {
     this.line('char* url = (request != NULL) ? request->url : NULL;');
     this.line('li->url = url; gc_write_barrier((void*)url);');
     this.line('li->bytesLoaded = 0; li->bytesTotal = 0;');
-    // Decode the image into a Bitmap content synchronously: AS3's Loader sets
-    // `content` to a Bitmap whose bitmapData holds the decoded pixels when loading
-    // a PNG/JPEG. The decode runs in load() (not the deferred COMPLETE thunk) so
-    // completeHandler can read loader.content as soon as COMPLETE fires.
-    this.line('if (url != NULL) {');
-    this.indent++;
-    this.line('BitmapData* bd = BitmapData_new(0, 0, true, 0);');
-    this.line('BitmapData_loadFile((void*)bd, url);');
-    this.line('Bitmap* bmp = Bitmap_new(bd);');
-    this.line('o->content = (DisplayObject*)bmp;');
-    this.line('gc_write_barrier((void*)bmp);');
-    this.indent--;
-    this.line('}');
+    // AIR nulls `content` for the duration of the load and dispatches Event.INIT
+    // synchronously; the decode + COMPLETE arrive via the job's finish thunk.
+    this.line('o->content = NULL; gc_write_barrier((void*)o->content);');
+    // The transport is chosen from the URL inside the runtime (a local path is a
+    // file read, http(s):// is the HTTP job), so this line stays one call.
+    this.line('if (url != NULL) as_async_submit_image((void*)o, Loader__imageFinish, url);');
     this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"init", false, false));');
-    this.line('as_set_timeout(as_fn_make(Loader__complete, (void*)o), 0.0);');
     this.indent--;
     this.line('}');
-    this.line('void Loader_unload(void* _this) { Loader* o = (Loader*)_this; o->content = NULL; }');
+    // unload() detaches the content the way AIR does: the loaded child leaves the
+    // Loader's child list (and so stops rendering) and content goes back to null.
+    this.line('void Loader_unload(void* _this) { Loader* o = (Loader*)_this; if (o->content != NULL) DisplayObjectContainer_removeChild((void*)o, o->content); o->content = NULL; }');
+    this.line('void Loader_loadBytes(void* _this, ByteArray* bytes, LoaderContext* context) {');
+    this.indent++;
+    this.line('Loader* o = (Loader*)_this;');
+    this.line('(void)context;');
+    this.line('LoaderInfo* li = o->contentLoaderInfo;');
+    this.line('li->url = NULL; gc_write_barrier(NULL);');
+    this.line('li->bytesLoaded = 0; li->bytesTotal = 0;');
+    this.line('o->content = NULL; gc_write_barrier((void*)o->content);');
+    // Decode the byte buffer into a Bitmap content, mirroring Loader_load(): AIR
+    // also decodes loadBytes into a Bitmap, so the COMPLETE handler can read
+    // loader.content as Bitmap without a NULL deref. The bytes are copied into
+    // the job at submit time, so the caller may clear/dispose the ByteArray (as
+    // Starling's AssetManager does) while the decode is still in flight.
+    this.line('as_async_submit_bytes(AS_JOB_DECODE, (void*)o, Loader__imageFinish, (bytes != NULL) ? bytes->data : NULL, (bytes != NULL) ? (size_t)bytes->length : 0);');
+    this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"init", false, false));');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // flash.system.LoaderContext: plain value bundle (stage 93). The constructor
+    // takes a single optional checkPolicyFile; imageDecodingPolicy defaults to
+    // "onDemand" (the AIR default). No policy engine — the demo only reads/writes
+    // the fields.
+    this.line('void LoaderContext_ctor(LoaderContext* o, bool checkPolicyFile) {');
+    this.indent++;
+    this.line('Object_ctor((Object*)o);');
+    this.line('o->checkPolicyFile = checkPolicyFile;');
+    this.line('o->imageDecodingPolicy = (char*)"onDemand";');
+    this.indent--;
+    this.line('}');
+    this.line('LoaderContext* LoaderContext_new(bool checkPolicyFile) {');
+    this.indent++;
+    this.line('LoaderContext* o = (LoaderContext*)gc_alloc(GCT_CLASS, sizeof(LoaderContext));');
+    this.line('o->vtable = &LoaderContext_vt;');
+    this.line('LoaderContext_ctor(o, checkPolicyFile);');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // ---- flash.media (stage 93): Sound / SoundChannel / SoundTransform ----
+    // Audio playback is a no-op in this subset (no audio backend); the objects
+    // exist so Starling's SoundFactory/AssetManager compile. `play` returns a
+    // fresh SoundChannel, `loadCompressed...` / `stop` are no-ops.
+    this.line('void SoundTransform_ctor(SoundTransform* o, double volume, double pan) { o->volume = volume; o->pan = pan; }');
+    this.line('SoundTransform* SoundTransform_new(double volume, double pan) { SoundTransform* o = (SoundTransform*)gc_alloc(GCT_CLASS, sizeof(SoundTransform)); o->vtable = &SoundTransform_vt; SoundTransform_ctor(o, volume, pan); return o; }');
+    this.line('void Sound_ctor(Sound* o) { EventDispatcher_ctor((EventDispatcher*)o); }');
+    this.line('Sound* Sound_new(void) { Sound* o = (Sound*)gc_alloc(GCT_CLASS, sizeof(Sound)); o->vtable = &Sound_vt; Sound_ctor(o); return o; }');
+    this.line('SoundChannel* Sound_play(void* _this, double startTime, int loops, SoundTransform* transform) { (void)_this; (void)startTime; (void)loops; (void)transform; return SoundChannel_new(); }');
+    this.line('void Sound_loadCompressedDataFromByteArray(void* _this, ByteArray* bytes, unsigned int length) { (void)_this; (void)bytes; (void)length; }');
+    this.line('void SoundChannel_ctor(SoundChannel* o) { EventDispatcher_ctor((EventDispatcher*)o); }');
+    this.line('SoundChannel* SoundChannel_new(void) { SoundChannel* o = (SoundChannel*)gc_alloc(GCT_CLASS, sizeof(SoundChannel)); o->vtable = &SoundChannel_vt; SoundChannel_ctor(o); return o; }');
+    this.line('void SoundChannel_stop(void* _this) { (void)_this; }');
+    this.line('void Camera_ctor(Camera* o) { EventDispatcher_ctor((EventDispatcher*)o); }');
+    this.line('Camera* Camera_new(void) { Camera* o = (Camera*)gc_alloc(GCT_CLASS, sizeof(Camera)); o->vtable = &Camera_vt; Camera_ctor(o); return o; }');
+    this.line('Camera* Camera_getCamera_static(char* name) { (void)name; return NULL; }');
     this.line('');
     // ---- flash.net / flash.ui (stage 63): URLRequest / URLLoader / Keyboard / Mouse ----
     //
-    // as_read_file: synchronous whole-file read into a GC-managed String buffer
-    // (NUL-terminated via as_str_alloc). URLLoader.data holds this buffer and is
-    // therefore GC-tracked — a GC cycle that runs between load() and the deferred
-    // COMPLETE dispatch cannot collect it because the URLLoader instance (and its
-    // `data` field) is reachable from the pending timer's closure env. Returns
-    // NULL on failure and sets *out_len to -1.
-    this.line('static char* as_read_file(const char* path, int* out_len) {');
-    this.indent++;
-    this.line('FILE* f = fopen(path, "rb");');
-    this.line('if (f == NULL) { if (out_len) *out_len = -1; return NULL; }');
-    this.line('fseek(f, 0, SEEK_END);');
-    this.line('long sz = ftell(f);');
-    this.line('fseek(f, 0, SEEK_SET);');
-    this.line('if (sz < 0) sz = 0;');
-    this.line('char* buf = as_str_alloc((size_t)sz + 1);');
-    this.line('if (sz > 0) { size_t n = fread(buf, 1, (size_t)sz, f); sz = (long)n; }');
-    this.line('buf[sz] = \'\\0\';');
-    this.line('fclose(f);');
-    this.line('if (out_len) *out_len = (int)sz;');
-    this.line('return buf;');
-    this.indent--;
-    this.line('}');
+    // Note: the staged read buffer used to be produced here by as_read_file (a
+    // GC-heap string buffer). It moved into the runtime job table
+    // (as_job_read_file) because a worker thread must never allocate from the GC
+    // heap; the finish thunk copies the payload into a GC string instead.
     this.line('');
-    // URLRequest: load-request value bundle. method defaults to "GET"; data is
-    // boxed `any` (null by default); contentType defaults to null.
+    // URLRequest: the value bundle for one HTTP request. Stage 89·48 declares the
+    // full AIR property surface, so method/data/requestHeaders are real state
+    // instead of write-only decorations (the old deviation: requestHeaders/
+    // authenticate/cacheResponse/... did not exist at all).
+    // The six members URLRequestDefaults mirrors are "initialized from the
+    // URLRequestDefaults.X property" (official docs), read here through that
+    // class's static accessors so the AIR default is observable.
     this.line('void URLRequest_ctor(URLRequest* o, char* url) {');
     this.indent++;
     this.line('o->url = url; gc_write_barrier((void*)url);');
     this.line('o->method = (char*)"GET";');
     this.line('o->data = as_v_null();');
+    // contentType stays NULL on a fresh URLRequest -- adl-measured. The MIME string
+    // the AS3 reference prints as "the default value" is the WIRE default for a
+    // request that carries a body (as_http_effective_ctype, runtime.ts), not the
+    // property value; writing it here made req.contentType disagree with AIR.
     this.line('o->contentType = NULL;');
+    // Adobe's own example calls `request.requestHeaders.push(new URLRequestHeader(...))`
+    // on a freshly built request, so this must be a usable empty Array, not NULL.
+    this.line('o->requestHeaders = as_array_new(); gc_write_barrier((void*)o->requestHeaders);');
+    this.line('o->authenticate = URLRequestDefaults_get_authenticate_static(NULL);');
+    this.line('o->cacheResponse = URLRequestDefaults_get_cacheResponse_static(NULL);');
+    this.line('o->followRedirects = URLRequestDefaults_get_followRedirects_static(NULL);');
+    this.line('o->idleTimeout = URLRequestDefaults_get_idleTimeout_static(NULL);');
+    this.line('o->manageCookies = URLRequestDefaults_get_manageCookies_static(NULL);');
+    this.line('o->useCache = URLRequestDefaults_get_useCache_static(NULL);');
+    this.line('o->userAgent = URLRequestDefaults_get_userAgent_static(NULL); gc_write_barrier((void*)o->userAgent);');
+    // SWZ digest: real state, but inert here (this subset has no signed-file
+    // cache and does not implement SWZ loading, so nothing consumes it).
+    this.line('o->digest = NULL;');
     this.indent--;
     this.line('}');
     this.line('URLRequest* URLRequest_new(char* url) { URLRequest* o = (URLRequest*)gc_alloc(GCT_CLASS, sizeof(URLRequest)); o->vtable = &URLRequest_vt; URLRequest_ctor(o, url); return o; }');
-    this.line('');
-    // URLLoader: asynchronous local-file load. The URL is treated as a filesystem
-    // path; the file is read synchronously but COMPLETE/IO_ERROR are deferred to a
-    // later frame tick via setTimeout(0), so listeners registered after load() still
-    // fire (AIR's async contract). data holds the GC-managed file text.
-    this.line('void URLLoader_ctor(URLLoader* o) {');
+    this.line('URLRequestMethod* URLRequestMethod_new(void) { URLRequestMethod* o = (URLRequestMethod*)gc_alloc(GCT_CLASS, sizeof(URLRequestMethod)); o->vtable = &URLRequestMethod_vt; Object_ctor((Object*)o); return o; }');
+    // URLRequestHeader: one name/value HTTP request header. AIR declares both
+    // fields as public vars and defaults the constructor to ""/"".
+    this.line('void URLRequestHeader_ctor(URLRequestHeader* o, char* name, char* value) {');
     this.indent++;
-    this.line('EventDispatcher_ctor((EventDispatcher*)o);');
-    this.line('o->data = NULL; o->dataFormat = (char*)"text";');
+    this.line('Object_ctor((Object*)o);');
+    this.line('o->name = name; gc_write_barrier((void*)name);');
+    this.line('o->value = value; gc_write_barrier((void*)value);');
     this.indent--;
     this.line('}');
-    this.line('URLLoader* URLLoader_new(void) { URLLoader* o = (URLLoader*)gc_alloc(GCT_CLASS, sizeof(URLLoader)); o->vtable = &URLLoader_vt; URLLoader_ctor(o); return o; }');
-    this.line('static as_value URLLoader__finish(void* env, as_value* args, int argc) {');
+    this.line('URLRequestHeader* URLRequestHeader_new(char* name, char* value) { URLRequestHeader* o = (URLRequestHeader*)gc_alloc(GCT_CLASS, sizeof(URLRequestHeader)); o->vtable = &URLRequestHeader_vt; URLRequestHeader_ctor(o, name, value); return o; }');
+    this.line('');
+    // URLRequestDefaults: static defaults backing the six URLRequest properties
+    // that AIR documents as "initialized from the URLRequestDefaults.X property".
+    // Backed by file-scope C globals instead of AS3 static fields: a declared
+    // static field is read through the lazy `<Class>_cinit()` guard, whereas
+    // URLRequest_ctor must read these reliably and in any order. The globals are
+    // GC roots (userAgent can hold a GC string after an assignment).
+    this.line('static bool as_urld_authenticate = true;');
+    this.line('static bool as_urld_cache_response = true;');
+    this.line('static bool as_urld_follow_redirects = true;');
+    this.line('static double as_urld_idle_timeout = 0.0;');
+    this.line('static bool as_urld_manage_cookies = true;');
+    this.line('static bool as_urld_use_cache = true;');
+    // Lazily resolved: as_user_agent_default() is not a constant expression, so it
+    // cannot initialize a file-scope pointer. Reading through the accessor keeps
+    // the OS-derived default invisible until first use (matching AIR, where the
+    // default is "the same user agent string that is used by Flash Player", which
+    // differs per OS).
+    this.line('static char* as_urld_user_agent = NULL;');
+    this.line('bool URLRequestDefaults_get_authenticate_static(void* _this) { (void)_this; return as_urld_authenticate; }');
+    this.line('void URLRequestDefaults_set_authenticate_static(void* _this, bool value) { (void)_this; as_urld_authenticate = value; }');
+    this.line('bool URLRequestDefaults_get_cacheResponse_static(void* _this) { (void)_this; return as_urld_cache_response; }');
+    this.line('void URLRequestDefaults_set_cacheResponse_static(void* _this, bool value) { (void)_this; as_urld_cache_response = value; }');
+    this.line('bool URLRequestDefaults_get_followRedirects_static(void* _this) { (void)_this; return as_urld_follow_redirects; }');
+    this.line('void URLRequestDefaults_set_followRedirects_static(void* _this, bool value) { (void)_this; as_urld_follow_redirects = value; }');
+    this.line('double URLRequestDefaults_get_idleTimeout_static(void* _this) { (void)_this; return as_urld_idle_timeout; }');
+    this.line('void URLRequestDefaults_set_idleTimeout_static(void* _this, double value) { (void)_this; as_urld_idle_timeout = value; }');
+    this.line('bool URLRequestDefaults_get_manageCookies_static(void* _this) { (void)_this; return as_urld_manage_cookies; }');
+    this.line('void URLRequestDefaults_set_manageCookies_static(void* _this, bool value) { (void)_this; as_urld_manage_cookies = value; }');
+    this.line('bool URLRequestDefaults_get_useCache_static(void* _this) { (void)_this; return as_urld_use_cache; }');
+    this.line('void URLRequestDefaults_set_useCache_static(void* _this, bool value) { (void)_this; as_urld_use_cache = value; }');
+    this.line('char* URLRequestDefaults_get_userAgent_static(void* _this) { (void)_this; if (as_urld_user_agent == NULL) as_urld_user_agent = as_user_agent_default(); return as_urld_user_agent; }');
+    this.line('void URLRequestDefaults_set_userAgent_static(void* _this, char* value) { (void)_this; as_urld_user_agent = value; gc_write_barrier((void*)value); }');
+    this.line('void URLRequestDefaults_ctor(URLRequestDefaults* o) { Object_ctor((Object*)o); }');
+    this.line('URLRequestDefaults* URLRequestDefaults_new(void) { URLRequestDefaults* o = (URLRequestDefaults*)gc_alloc(GCT_CLASS, sizeof(URLRequestDefaults)); o->vtable = &URLRequestDefaults_vt; URLRequestDefaults_ctor(o); return o; }');
+    this.line('');
+    // URL slicing for useRedirectedURL. Three independent cuts of a URL string:
+    //   domain : [0, end of "scheme://host[:port]") — everything before the first
+    //            '/' that follows the scheme, or the whole string when there is no
+    //            path (the bare-directory shape LoaderInfo.url has, which is what
+    //            AIR's own useRedirectedURL example passes in);
+    //   dir    : [0, last '/'] inclusive — the "entire url, minus the filename";
+    //   file   : the remainder after the last '/'.
+    this.line('static size_t as_url_domain_end(const char* url) {');
     this.indent++;
-    this.line('(void)args; (void)argc;');
-    this.line('URLLoader* o = (URLLoader*)env;');
-    this.line('if (o->data != NULL) EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
-    this.line('else EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"ioError", false, false));');
-    this.line('return as_v_null();');
+    this.line('if (url == NULL) return 0;');
+    this.line('const char* p = url;');
+    this.line('const char* scheme = strstr(url, "://");');
+    this.line('if (scheme != NULL) p = scheme + 3;');
+    this.line('const char* slash = strchr(p, \'/\');');
+    this.line('return (slash == NULL) ? strlen(url) : (size_t)(slash - url);');
+    this.indent--;
+    this.line('}');
+    this.line('static size_t as_url_dir_end(const char* url) {');
+    this.indent++;
+    this.line('if (url == NULL) return 0;');
+    this.line('const char* last = strrchr(url, \'/\');');
+    this.line('return (last == NULL) ? 0 : (size_t)(last - url + 1);');
+    this.indent--;
+    this.line('}');
+    // URLRequest.useRedirectedURL: point a follow-up request at the server a first
+    // request was redirected to. AIR 3.8. Documented semantics, in order:
+    //   1. substitute the source URL's DOMAIN into this URL (wholeURL=false), or the
+    //      source URL's "entire url minus the filename" (wholeURL=true), keeping
+    //      this URL's own path/filename;
+    //   2. THEN search for `pattern` in the resulting URL and replace it with
+    //      `replace` (a String pattern replaces the first occurrence; a RegExp
+    //      pattern follows String.replace's own global/ignoreCase flags).
+    // AIR additionally short-circuits when this URL's domain is already a prefix of
+    // the source domain (an undocumented implementation detail); this subset always
+    // applies the documented substitution, which is equivalent for the substantive
+    // case and simpler to reason about (see docs/zh-cn/flash-net.md §3.1).
+    this.line('void URLRequest_useRedirectedURL(void* _this, URLRequest* sourceRequest, bool wholeURL, as_value pattern, char* replace) {');
+    this.indent++;
+    this.line('URLRequest* o = (URLRequest*)_this;');
+    this.line('if (o->url == NULL || sourceRequest == NULL || sourceRequest->url == NULL) return;');
+    this.line('size_t keep = wholeURL ? as_url_dir_end(o->url) : as_url_domain_end(o->url);');
+    this.line('size_t take = wholeURL ? as_url_dir_end(sourceRequest->url) : as_url_domain_end(sourceRequest->url);');
+    this.line('char* head = as_str_alloc(take + 1);');
+    this.line('memcpy(head, sourceRequest->url, take); head[take] = \'\\0\';');
+    this.line('char* out = as_str_concat(head, o->url + keep);');
+    // Step 2: pattern replacement, applied to the URL the substitution produced.
+    this.line('if (pattern.tag == 3) { if (replace != NULL) out = as_str_replace(out, (char*)as_v_str_val(pattern), replace); }');
+    this.line('else if (as_v_is_inst(pattern, (void*)&RegExp_vt)) {');
+    this.indent++;
+    this.line('RegExp* re = (RegExp*)pattern.ptr;');
+    this.line('if (replace != NULL && re->compiled != NULL && !re->compiled->err) out = as_str_replace_regex(out, re->compiled, replace, re->global);');
+    this.indent--;
+    this.line('}');
+    this.line('o->url = out; gc_write_barrier((void*)out);');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // URLLoader: asynchronous local-file load. The URL is treated as a filesystem
+    // path; the file is read synchronously but OPEN/PROGRESS/COMPLETE/IO_ERROR are
+    // deferred to a later frame tick via the async job table, so listeners
+    // registered after load() still fire (AIR's async contract). `data` is boxed
+    // `as_value`: a GC-managed String for the default text format, a ByteArray when
+    // dataFormat == "binary" (Starling's DataLoader relies on this to hand raw
+    // bytes to asset factories), or a URLVariables when dataFormat == "variables".
+    this.line('void URLLoader_ctor(URLLoader* o, URLRequest* request) {');
+    this.indent++;
+    this.line('EventDispatcher_ctor((EventDispatcher*)o);');
+    this.line('o->data = as_v_null(); o->dataFormat = (char*)"text";');
+    // AIR: bytesLoaded/bytesTotal read 0 while a load is in progress and only carry
+    // the byte count once it completes (the documented reason a caller should read
+    // ProgressEvent.bytesLoaded/bytesTotal instead of these properties).
+    this.line('o->bytesLoaded = 0; o->bytesTotal = 0;');
+    // AIR: a request handed to the constructor starts the load immediately
+    // ("If specified, the load operation begins immediately").
+    this.line('if (request != NULL) URLLoader_load((void*)o, request);');
+    this.indent--;
+    this.line('}');
+    this.line('URLLoader* URLLoader_new(URLRequest* request) { URLLoader* o = (URLLoader*)gc_alloc(GCT_CLASS, sizeof(URLLoader)); o->vtable = &URLLoader_vt; URLLoader_ctor(o, request); return o; }');
+    // Job completion, run on the AS3 thread inside a frame boundary: publish the
+    // staged payload into `data` and only then dispatch PROGRESS + COMPLETE. The
+    // ordering is the point: `data` stays null until this thunk runs, matching
+    // AIR, whereas it used to be filled inside load() (one frame early).
+    // Header block -> Array of URLRequestHeader (AIR's HTTPStatusEvent shape). The
+    // runtime carries the raw "Name: Value\r\n" block (it cannot construct a
+    // generated class), so the split lives here where URLRequestHeader_new is in
+    // scope. A line without a ':' is skipped.
+    this.line('static as_array* URLLoader__parseHeaders(const char* block) {');
+    this.indent++;
+    this.line('as_array* arr = as_array_new();');
+    this.line('if (block == NULL) return arr;');
+    this.line('const char* p = block;');
+    this.line('while (*p != \'\\0\') {');
+    this.indent++;
+    this.line('const char* nl = p; while (*nl != \'\\0\' && *nl != \'\\n\') nl++;');
+    this.line('int n = (int)(nl - p); while (n > 0 && p[n - 1] == \'\\r\') n--;');
+    this.line('if (n > 0) {');
+    this.indent++;
+    this.line('char* line = as_str_alloc((size_t)n + 1);');
+    this.line('memcpy(line, p, (size_t)n); line[n] = \'\\0\';');
+    this.line('char* colon = strchr(line, \':\');');
+    this.line('if (colon != NULL) { *colon = \'\\0\'; char* val = colon + 1; while (*val == \' \' || *val == \'\\t\') val++; as_array_push(arr, as_v_obj((void*)URLRequestHeader_new(line, val))); }');
+    this.indent--;
+    this.line('}');
+    this.line('p = (*nl == \'\\0\') ? nl : nl + 1;');
+    this.indent--;
+    this.line('}');
+    this.line('return arr;');
+    this.indent--;
+    this.line('}');
+    // Two status events, because AIR fills them differently (measured with adl):
+    //   * httpStatus        - status ONLY: responseURL null, responseHeaders an
+    //                         EMPTY array, redirected false. It is also the one
+    //                         dispatched for non-HTTP loads, with status 0.
+    //   * httpResponseStatus - the full payload (status + responseURL +
+    //                         responseHeaders + redirected).
+    // responseURL is copied into a GC string there: the job's effective-URL buffer
+    // is malloc'd and freed when the job retires, so a raw pointer assigned to an
+    // AS3 String would dangle the moment the thunk returns (that produced a
+    // garbled responseURL on the first try).
+    this.line('static HTTPStatusEvent* URLLoader__httpStatusEvent(char* type, int status) {');
+    this.indent++;
+    this.line('HTTPStatusEvent* e = HTTPStatusEvent_new(type, false, false, status);');
+    this.line('e->responseURL = NULL;');
+    this.line('e->responseHeaders = as_array_new(); gc_write_barrier((void*)e->responseHeaders);');
+    this.line('e->redirected = false;');
+    this.line('return e;');
+    this.indent--;
+    this.line('}');
+    this.line('static HTTPStatusEvent* URLLoader__httpResponseEvent(char* type, int status, char* url, as_array* hdrs, bool redirected) {');
+    this.indent++;
+    this.line('HTTPStatusEvent* e = HTTPStatusEvent_new(type, false, false, status);');
+    this.line('char* u = as_str_alloc(strlen(url) + 1); strcpy(u, url);');
+    this.line('e->responseURL = u; gc_write_barrier((void*)u);');
+    this.line('e->responseHeaders = hdrs; gc_write_barrier((void*)hdrs);');
+    this.line('e->redirected = redirected;');
+    this.line('return e;');
+    this.indent--;
+    this.line('}');
+    // Serialize a URLRequest into the pieces the network seam takes, on the AS3
+    // thread. Both loaders share it because the rule it enforces is easy to break
+    // twice: a worker thread must never walk a GC Array or call anything that
+    // allocates from the GC heap, so requestHeaders (an Array of
+    // URLRequestHeader) and `data` (String | URLVariables | ByteArray) are turned
+    // into plain byte/char buffers here, before the job is published. The two
+    // pointers that may reference GC strings ('url', 'headers') stay valid because
+    // the submit strdup's them immediately.
+    this.line('typedef struct net_req { const char* method; const char* url; const char* headers; const void* body; size_t body_len; } net_req;');
+    this.line('static void net__prepare_request(URLRequest* request, net_req* r) {');
+    this.indent++;
+    this.line('r->method = (request->method != NULL) ? request->method : "GET";');
+    this.line('r->headers = (const char*)"";');
+    this.line('if (request->requestHeaders != NULL) {');
+    this.indent++;
+    this.line('for (int i = 0; i < request->requestHeaders->length; i++) {');
+    this.indent++;
+    this.line('URLRequestHeader* h = (URLRequestHeader*)as_v_obj_val(request->requestHeaders->data[i]);');
+    this.line('if (h == NULL || h->name == NULL) continue;');
+    this.line('char* line = as_str_concat(as_str_concat(h->name, (char*)": "), (h->value != NULL) ? h->value : (char*)"");');
+    this.line('r->headers = as_str_concat(as_str_concat((char*)r->headers, line), (char*)"\\r\\n");');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('char* payload = NULL;');
+    this.line('const void* raw_body = NULL;');
+    this.line('size_t raw_body_len = 0;');
+    this.line('if (request->data.tag != 0 && request->data.tag != 5) {');
+    this.indent++;
+    this.line('if (as_v_is_inst(request->data, &URLVariables_vt)) payload = URLVariables_toString(as_v_obj_val(request->data));');
+    this.line('else if (as_v_is_inst(request->data, &ByteArray_vt)) { ByteArray* b = (ByteArray*)as_v_obj_val(request->data); raw_body = (b != NULL) ? b->data : NULL; raw_body_len = (b != NULL) ? (size_t)b->length : 0; }');
+    this.line('else payload = as_v_str_val(request->data);');
+    this.indent--;
+    this.line('}');
+    // GET folds data into the query string (url?data or url&data); POST and every
+    // other verb send it as the body. AIR behaves the same, and it is what makes
+    // `method` observable at all.
+    this.line('r->url = request->url;');
+    this.line('r->body = NULL;');
+    this.line('r->body_len = 0;');
+    this.line('if (strcmp(r->method, "GET") == 0) {');
+    this.indent++;
+    this.line('if (payload != NULL) { const char* sep = (strchr(request->url, \'?\') != NULL) ? "&" : "?"; r->url = as_str_concat(as_str_concat(request->url, sep), payload); }');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('if (payload != NULL) { r->body = payload; r->body_len = strlen(payload); }');
+    this.line('else if (raw_body != NULL) { r->body = raw_body; r->body_len = raw_body_len; }');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // flash.net.navigateToURL / sendToURL: hand the request's URL to the OS. Both
+    // are fire-and-forget — the URL is opened outside this process, so there is no
+    // response and no event to dispatch (which is precisely what sendToURL's
+    // documentation makes its only difference). The `window` parameter only means
+    // something to the browser plugin (target frame name); a desktop AIR app hands
+    // the URL to the OS handler either way, so it is accepted and ignored.
+    this.line('static void URLRequest__navigate(URLRequest* request, char* window) {');
+    this.indent++;
+    this.line('(void)window;');
+    // AIR's parameter validation, verbatim from adl: a null request and a request
+    // whose url is null are two DIFFERENT TypeErrors (#2007), not one generic
+    // complaint and not a silent no-op.
+    this.line('if (request == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter request must be non-null.", 2007)); return; }');
+    this.line('if (request->url == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter url must be non-null.", 2007)); return; }');
+    this.line('if (!as_open_external(request->url)) { as_throw(Error_new((char*)"Error #2032: The navigateToURL operation could not be completed.", 2032)); return; }');
+    this.indent--;
+    this.line('}');
+    this.line('static void URLRequest__sendToURL(URLRequest* request) { URLRequest__navigate(request, NULL); }');
+    // Publish the staged payload into `data`, honouring dataFormat. Shared by the
+    // success path (payload bytes) and the failure path (no bytes): AIR does not
+    // leave `data` null after a failed load — it becomes an EMPTY String or
+    // ByteArray (adl: data=String len=0 / ByteArray len=0), which is what callers
+    // that switch on dataFormat expect.
+    this.line('static void URLLoader__publish(URLLoader* o, const unsigned char* src, unsigned n, int binary) {');
+    this.indent++;
+    this.line('if (binary) {');
+    this.indent++;
+    // BINARY: raw bytes into a ByteArray. The staged buffer is NOT NUL-terminated
+    // and may hold embedded NULs (PNG/ATF/MP3), so it is copied by length rather
+    // than as a string.
+    this.line('ByteArray* ba = ByteArray_new();');
+    this.line('ba->data = (void*)gc_alloc(GCT_BYTES, (size_t)(n > 0 ? n : 1));');
+    this.line('ba->capacity = (int)n; ba->length = (int)n;');
+    this.line('if (n > 0) memcpy(ba->data, src, (size_t)n);');
+    this.line('gc_write_barrier((void*)ba->data);');
+    this.line('o->data = as_v_obj((void*)ba);');
+    this.indent--;
+    this.line('} else if (o->dataFormat != NULL && strcmp(o->dataFormat, "variables") == 0) {');
+    this.indent++;
+    // VARIABLES: decode the payload into a URLVariables object (the read side of
+    // URLVariables.toString) — the one dataFormat where data is neither String nor
+    // ByteArray, matching AIR.
+    this.line('char* vs = as_str_alloc((size_t)n + 1);');
+    this.line('if (n > 0) memcpy(vs, src, (size_t)n);');
+    this.line('vs[n] = \'\\0\';');
+    this.line('o->data = as_v_obj((void*)URLVariables_new(vs));');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    // TEXT: copied into a GC-managed string buffer so the string owns its data
+    // (the job buffer is freed when the job retires).
+    this.line('char* s = as_str_alloc((size_t)n + 1);');
+    this.line('if (n > 0) memcpy(s, src, (size_t)n);');
+    this.line('s[n] = \'\\0\';');
+    this.line('o->data = as_v_str(s);');
+    this.indent--;
+    this.line('}');
+    this.line('gc_write_barrier_value(o->data);');
+    this.indent--;
+    this.line('}');
+    this.line('static int URLLoader__isBinary(URLLoader* o) { return o->dataFormat != NULL && strcmp(o->dataFormat, "binary") == 0; }');
+    // The events AIR raises WHILE a transfer is in flight, shared by URLLoader and
+    // URLStream (adl measures the same sequence for both):
+    //
+    //   open                once the request reached the transport
+    //   httpResponseStatus  once a response head arrived — the ONLY event carrying
+    //                       responseHeaders / responseURL / redirected
+    //   progress            per recorded watermark, with Content-Length as
+    //                       bytesTotal (0 when the response did not state one)
+    //
+    // Driven from as_async_tick (see as_net_pre_events there) so a streaming caller
+    // really does get PROGRESS while a slow body is still arriving, and called again
+    // by the finish thunk: every step is guarded by a flag on the job, so a load
+    // that completed before any tick still reports the same events, in the same
+    // order, exactly once.
+    this.line('static void as_net_pre_events(void* job) {');
+    this.indent++;
+    this.line('void* obj = as_job_obj(job);');
+    this.line('if (obj == NULL) return;');
+    this.line('if (!as_job_sent_open(job) && as_job_started(job)) {');
+    this.indent++;
+    this.line('as_job_set_sent_open(job);');
+    this.line('EventDispatcher_dispatchEvent(obj, (Event*)Event_new((char*)"open", false, false));');
+    this.indent--;
+    this.line('}');
+    this.line('if (!as_job_sent_status(job)) {');
+    this.indent++;
+    this.line('int st = as_job_status(job);');
+    this.line('if (st > 0) {');
+    this.indent++;
+    this.line('as_job_set_sent_status(job);');
+    this.line('as_array* hdrs = URLLoader__parseHeaders(as_job_headers(job));');
+    this.line('EventDispatcher_dispatchEvent(obj, (Event*)URLLoader__httpResponseEvent((char*)"httpResponseStatus", st, (char*)as_job_eff_url(job), hdrs, as_job_redirected(job) != 0));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('unsigned expected = as_job_expected_total(job);');
+    this.line('unsigned sent = as_job_marks_sent(job);');
+    this.line('unsigned mc = (unsigned)as_job_mark_count(job);');
+    this.line('while (sent < mc) {');
+    this.indent++;
+    this.line('unsigned loaded = as_job_mark(job, (int)sent);');
+    this.line('sent++;');
+    this.line('as_job_set_marks_sent(job, sent);');
+    this.line('as_job_set_last_progress(job, loaded);');
+    this.line('EventDispatcher_dispatchEvent(obj, (Event*)ProgressEvent_new((char*)"progress", false, false, loaded, expected));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // Job completion, run on the AS3 thread inside a frame boundary.
+    //
+    // The event order and payloads here follow what `adl` actually does (measured
+    // with temp/air-probe, see docs/zh-cn/flash-net.md §6.7), not what the docs
+    // suggest at a glance:
+    //
+    //   OPEN                      only when the request reached the transport (a
+    //                             refused connection still opens; a missing LOCAL
+    //                             file never opens, and an unlinked backend issues
+    //                             no request at all)
+    //   httpResponseStatus        if a response head arrived: the ONLY event that
+    //                             carries responseHeaders / responseURL / redirected
+    //   progress (replayed)       the watermarks the backend recorded
+    //   [data published]          so a PROGRESS listener still sees data == null
+    //   httpStatus                status only — and it fires even for a non-HTTP
+    //                             load, with status 0
+    //   complete | ioError(#2032) a non-2xx response (status >= 300) is an ERROR
+    //                             response, and AIR's terminal for it depends on
+    //                             the CALLER: if that object registered an
+    //                             HTTP_RESPONSE_STATUS listener, the error body is
+    //                             a successful load (COMPLETE); if not, AIR
+    //                             reports ioError #2032. Everything BEFORE the
+    //                             terminal — progress, the published body,
+    //                             bytesLoaded/bytesTotal, httpStatus — is
+    //                             IDENTICAL on both branches (the error body is
+    //                             published either way). Not a transport failure
+    //                             either way; ioError #2032 is not reserved for
+    //                             refused connections/DNS/TLS.
+    //                             Measured controlled (same URL, same server, only
+    //                             the listener toggled) in temp/httpstatus-probe;
+    //                             see docs/zh-cn/flash-net.md §6.2.
+    this.line('static void URLLoader__finish(void* job) {');
+    this.indent++;
+    this.line('URLLoader* o = (URLLoader*)as_job_obj(job);');
+    // Whatever is still owed from the in-flight sequence (OPEN, httpResponseStatus,
+    // the PROGRESS watermarks): a fast local read gets all of it here, a slow body
+    // already got it from as_async_tick. Same order either way.
+    this.line('as_net_pre_events(job);');
+    // A failure names its cause. "Unsupported" is what an http(s):// load reports
+    // when no HTTP backend is linked (phase G of the design doc): it must NOT be
+    // the same text a missing local file produces, or the caller cannot tell a
+    // typo from an unimplemented transport.
+    this.line('if (as_job_failed(job)) {');
+    this.indent++;
+    // A failure names its cause AND AIR's number (2032 "Stream Error" for both
+    // URLLoader and URLStream - measured against adl; a bare id=0 is not
+    // something a caller can branch on). "Unsupported" keeps the build-level
+    // text instead: an http(s):// load with no HTTP backend linked (phase G of
+    // the design doc) has no AIR counterpart, so it reports no number.
+    this.line('char* msg = as_job_error_text(job, (char*)"URLLoader: network URLs are not supported in this build (no HTTP backend linked; see docs/zh-cn/flash-net.md)", (char*)"URLLoader load failed");');
+    this.line('int eid = (as_job_error(job) == AS_JOB_ERR_UNSUPPORTED) ? 0 : 2032;');
+    this.line('if (eid != 0) msg = as_ioerror_text(as_job_path(job), eid, as_job_err_detail(job));');
+    // AIR dispatches a status-0 httpStatus before the ioError and leaves `data` an
+    // EMPTY value rather than null (probe 8: data=String len=0 on a failed load).
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)URLLoader__httpStatusEvent((char*)"httpStatus", 0));');
+    this.line('URLLoader__publish(o, NULL, 0, URLLoader__isBinary(o));');
+    this.line('IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, msg);');
+    this.line('ev->errorID = eid;');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('unsigned total = as_job_len(job);');
+    this.line('unsigned btotal = as_job_expected_total(job);');
+    // The final PROGRESS. It is skipped when the last watermark already reported
+    // the full length (a chunked body's last mark IS the total, and AIR does not
+    // repeat it), and emitted when there was no watermark at all (a local read) or
+    // the last one fell short. bytesTotal is Content-Length — or a local file's
+    // size — and 0 when the response did not state one: AIR reports 160000/0 for a
+    // chunked body rather than inventing a total.
+    // A zero-length body reports NO progress at all: AIR emits
+    // open;httpStatus(200);complete for a 200 with an empty body (and
+    // open;httpStatus(404);ioError for an empty 404) — measured with a fresh
+    // server in temp/httpstatus-probe2. Hence the total > 0 guard.
+    this.line('if (total > 0 && (as_job_marks_sent(job) == 0 || as_job_last_progress(job) != total)) {');
+    this.indent++;
+    this.line('as_job_set_last_progress(job, total);');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ProgressEvent_new((char*)"progress", false, false, total, btotal));');
+    this.indent--;
+    this.line('}');
+    this.line('o->bytesLoaded = total; o->bytesTotal = btotal;');
+    this.line('URLLoader__publish(o, as_job_bytes(job), total, as_job_is_binary(job));');
+    // Published after PROGRESS and before COMPLETE: the two counters are documented
+    // as 0 for the whole duration of a load, so a PROGRESS listener reading
+    // loader.bytesTotal still sees 0 and uses event.bytesLoaded/bytesTotal.
+    this.line('int st = as_job_status(job);');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)URLLoader__httpStatusEvent((char*)"httpStatus", st));');
+    // AIR's terminal split for a non-2xx response (see the event-order note above
+    // and docs/zh-cn/flash-net.md §6.2): with a HTTP_RESPONSE_STATUS listener the
+    // error body completes; without one the very same transfer ends in
+    // ioError #2032. `hasEventListener` is the same predicate AIR uses — it counts
+    // a listener in either phase — and status 0 (a local read, a non-HTTP load)
+    // must NOT take this branch, hence the >= 300 test rather than "!= 200".
+    this.line('if (st >= 300 && !EventDispatcher_hasEventListener((void*)o, (char*)"httpResponseStatus")) {');
+    this.indent++;
+    this.line('IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, as_ioerror_text(as_job_path(job), 2032, NULL));');
+    this.line('ev->errorID = 2032;');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('void URLLoader_load(void* _this, URLRequest* request) {');
     this.indent++;
     this.line('URLLoader* o = (URLLoader*)_this;');
-    this.line('o->data = NULL;');
-    this.line('if (request != NULL && request->url != NULL) {');
+    this.line('o->data = as_v_null();');
+    // A new load restarts the byte counters (AIR: 0 for as long as it is in flight).
+    this.line('o->bytesLoaded = 0; o->bytesTotal = 0;');
+    // AIR validates the parameters instead of quietly doing nothing: load(null) and
+    // load(new URLRequest(null)) are two distinct TypeErrors (#2007, verified with
+    // adl). Silently returning would leave the caller waiting for an event that can
+    // never arrive.
+    this.line('if (request == NULL) as_throw(TypeError_new((char*)"Error #2007: Parameter request must be non-null.", 2007));');
+    this.line('if (request->url == NULL) as_throw(TypeError_new((char*)"Error #2007: Parameter url must be non-null.", 2007));');
+    this.line('const char* url = request->url;');
+    this.line('int binary = (o->dataFormat != NULL && strcmp(o->dataFormat, "binary") == 0);');
+    // http(s):// is not a path: it goes to the network seam. The backend decides
+    // whether the transfer can happen at all (native + ASC_HAVE_CURL) and reports
+    // AS_JOB_ERR_UNSUPPORTED otherwise — the URL is never handed to fopen(), which
+    // used to make a remote URL indistinguishable from a missing local file.
+    this.line('if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {');
     this.indent++;
-    this.line('int len = 0;');
-    this.line('char* buf = as_read_file(request->url, &len);');
-    this.line('if (buf != NULL && len >= 0) { o->data = buf; gc_write_barrier((void*)buf); }');
+    this.line('net_req r; net__prepare_request(request, &r);');
+    // Tagged as a flash.net target so the frame-boundary pre-pass dispatches this
+    // load's OPEN / HTTP_RESPONSE_STATUS / PROGRESS while it is still in flight.
+    this.line('void* j = as_async_submit_http((void*)o, URLLoader__finish, (char*)r.url, r.method, request->userAgent, request->contentType, (char*)r.headers, r.body, r.body_len, binary, request->followRedirects ? 1 : 0, request->idleTimeout, request->manageCookies ? 1 : 0);');
+    this.line('if (j != NULL) as_job_set_net_events(j);');
+    this.indent--;
+    this.line('return;');
+    this.line('}');
+    // A file:// URL (File.url) is opened from the local filesystem: strip the
+    // scheme so fopen sees a plain path (e.g. "file://./assets/x.png" ->
+    // "./assets/x.png").
+    this.line('const char* path = url;');
+    this.line('if (strncmp(path, "file://", 7) == 0) path += 7;');
+    // The read runs on a worker thread (native) or inline (web/WASI), but either
+    // way the payload is staged and published only by URLLoader__finish at a
+    // frame boundary, so several load() calls issued in one frame overlap.
+    this.line('void* j = as_async_submit(binary ? AS_JOB_READ_BYTES : AS_JOB_READ_TEXT, (void*)o, URLLoader__finish, path, NULL, binary);');
+    this.line('if (j != NULL) as_job_set_net_events(j);');
     this.indent--;
     this.line('}');
-    this.line('as_set_timeout(as_fn_make(URLLoader__finish, (void*)o), 0.0);');
+    // AIR: "Any load operation in progress is immediately terminated. If no URL is
+    // currently being streamed, an invalid stream error is thrown." The cancel
+    // marks the pending job dead, so its finish thunk never runs and no OPEN /
+    // PROGRESS / COMPLETE / IO_ERROR reaches a listener after close() — which is
+    // the entire point of the call (it used to be an empty function).
+    this.line('void URLLoader_close(void* _this) {');
+    this.indent++;
+    this.line('URLLoader* o = (URLLoader*)_this;');
+    // AIR's message for URLLoader.close() is word-for-word the URLStream one
+    // (measured with adl: id 2029, "This URLStream object does not have a stream
+    // opened.") — the two classes share that text.
+    this.line('if (!as_async_cancel((void*)o)) as_throw(Error_new((char*)"Error #2029: This URLStream object does not have a stream opened.", 2029));');
     this.indent--;
     this.line('}');
-    this.line('void URLLoader_close(void* _this) { (void)_this; }');
     this.line('');
+    // ---- flash.net.URLStream (stage 89·51, phase F) ----
+    // The streaming counterpart of URLLoader: the same HTTP seam, but the body is
+    // appended into the job as it arrives, so bytesAvailable/read* can see data
+    // while a slow transfer is still running instead of after a full buffering.
+    //
+    // A URLStream owns its job (`_job`), which makes the object responsible for the
+    // handle's whole lifetime: close() cancels AND drops it, and URLStream__finish
+    // copies the unconsumed remainder onto the object (`_buf`/`_buf_pos`) before
+    // dispatching, because the job (and with it the live buffer) is freed by the
+    // async tick the moment the thunk returns (phase 3 of as_async_tick). Reading
+    // through those two slots instead of the job is what keeps every read* method
+    // working after COMPLETE and after the job has been retired.
+    this.line('static int URLStream__little(URLStream* o) { return o->endian != NULL && strcmp(o->endian, "littleEndian") == 0; }');
+    // IDataInput promises EOFError when there is not enough data to satisfy a
+    // read; AIR's text is fixed at #2030.
+    this.line('static void URLStream__eof(void) { as_throw(EOFError_new((char*)"Error #2030: End of file was encountered.", 2030)); }');
+    // AIR's exact wording and id, taken from adl: every operation that needs a
+    // stream (bytesAvailable, read*, close) throws this same Error #2029 when the
+    // object was never loaded or was closed.
+    this.line('static void URLStream__not_open(void) { as_throw(Error_new((char*)"Error #2029: This URLStream object does not have a stream opened.", 2029)); }');
+    // bytesAvailable: the live job while one exists, else the copied-out remainder.
+    this.line('int URLStream__avail(URLStream* o) {');
+    this.indent++;
+    this.line('if (o->_job != NULL) return (int)as_stream_available(o->_job);');
+    this.line('if (o->_buf != NULL) { ByteArray* b = (ByteArray*)o->_buf; return b->length - o->_buf_pos; }');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
+    // The two failure modes AIR distinguishes: "not open at all" (never loaded, or
+    // after close()) is a plain Error, while "open but no more data right now" is
+    // EOFError. `_buf != NULL` is what separates them: it is set as soon as the
+    // stream has opened, even when nothing is left to read.
+    this.line('static int URLStream__poll(URLStream* o) {');
+    this.indent++;
+    this.line('if (o->_job == NULL && o->_buf == NULL) { URLStream__not_open(); return 0; }');
+    this.line('return URLStream__avail(o);');
+    this.indent--;
+    this.line('}');
+    // One byte from whichever source is live, or -1 when none is buffered.
+    this.line('static int URLStream__get(URLStream* o) {');
+    this.indent++;
+    this.line('if (o->_job != NULL) return as_stream_get_byte(o->_job);');
+    this.line('if (o->_buf != NULL) { ByteArray* b = (ByteArray*)o->_buf; if (o->_buf_pos >= b->length) return -1; return (int)((unsigned char*)b->data)[o->_buf_pos++]; }');
+    this.line('return -1;');
+    this.indent--;
+    this.line('}');
+    this.line('static int URLStream__read(URLStream* o, void* dst, int n) {');
+    this.indent++;
+    this.line('if (o->_job != NULL) return as_stream_read(o->_job, dst, n);');
+    this.line('if (o->_buf != NULL) {');
+    this.indent++;
+    this.line('ByteArray* b = (ByteArray*)o->_buf;');
+    this.line('int avail = b->length - o->_buf_pos;');
+    this.line('int k = (n < avail) ? n : avail;');
+    this.line('if (k > 0) memcpy(dst, (unsigned char*)b->data + o->_buf_pos, (size_t)k);');
+    this.line('o->_buf_pos += k;');
+    this.line('return k;');
+    this.indent--;
+    this.line('}');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
+    // A read of a fixed number of bytes either finds them all or throws: AIR's
+    // read* are non-blocking and never wait for the rest of a chunk.
+    this.line('static int URLStream__need(URLStream* o, int n) { return URLStream__poll(o) >= n; }');
+    // Multi-byte integers honour `endian` exactly like ByteArray does.
+    this.line('static unsigned long long URLStream__uint(URLStream* o, int nbytes) {');
+    this.indent++;
+    this.line('unsigned char buf[8];');
+    this.line('if (!URLStream__need(o, nbytes)) { URLStream__eof(); return 0; }');
+    this.line('URLStream__read(o, buf, nbytes);');
+    this.line('unsigned long long v = 0;');
+    this.line('if (URLStream__little(o)) { for (int i = nbytes - 1; i >= 0; i--) v = (v << 8) | buf[i]; }');
+    this.line('else { for (int i = 0; i < nbytes; i++) v = (v << 8) | buf[i]; }');
+    this.line('return v;');
+    this.indent--;
+    this.line('}');
+    this.line('void URLStream_ctor(URLStream* o) {');
+    this.indent++;
+    this.line('EventDispatcher_ctor((EventDispatcher*)o);');
+    this.line('o->endian = (char*)"bigEndian";');
+    // ObjectEncoding.AMF3: URLStream.readObject is the only consumer and AMF is
+    // not implemented in this subset, so this is only the documented default.
+    this.line('o->objectEncoding = 3;');
+    this.line('o->_job = NULL; o->_buf = NULL; o->_buf_pos = 0;');
+    this.indent--;
+    this.line('}');
+    this.line('URLStream* URLStream_new(void) { URLStream* o = (URLStream*)gc_alloc(GCT_CLASS, sizeof(URLStream)); o->vtable = &URLStream_vt; URLStream_ctor(o); return o; }');
+    // "Has a stream" is _job != NULL (a live transfer) OR _buf != NULL (the
+    // buffered result of a finished one). adl's state machine, measured:
+    //   never loaded / after close()  -> bytesAvailable THROWS #2029
+    //   after ioError                 -> 0, reads give EOFError #2030 (the stream
+    //                                    is still "opened", just empty)
+    //   after COMPLETE                -> the unconsumed remainder, still readable
+    //   (and `connected` stays true in all three of the last cases — AIR does not
+    //   close the stream when a download ends, only close() does)
+    this.line('static bool URLStream__open(URLStream* o) { return o->_job != NULL || o->_buf != NULL; }');
+    this.line('unsigned URLStream_get_bytesAvailable(void* _this) { URLStream* o = (URLStream*)_this; if (!URLStream__open(o)) URLStream__not_open(); return (unsigned)URLStream__avail(o); }');
+    this.line('bool URLStream_get_connected(void* _this) { return URLStream__open((URLStream*)_this); }');
+    this.line('void URLStream_close(void* _this) {');
+    this.indent++;
+    this.line('URLStream* o = (URLStream*)_this;');
+    // AIR: "No data can be read from the stream after close()". The handle is
+    // dropped HERE and not merely cancelled: the cancelled job is retired by the
+    // next tick (phase 3 of as_async_tick), so a surviving `_job` would dangle the
+    // moment a listener on this thread touched it.
+    this.line('if (!URLStream__open(o)) { URLStream__not_open(); return; }');
+    this.line('if (o->_job != NULL) as_async_cancel((void*)o);');
+    this.line('o->_job = NULL;');
+    this.line('o->_buf = NULL; o->_buf_pos = 0;');
+    this.indent--;
+    this.line('}');
+    // Completion thunk, on the AS3 thread inside a frame boundary. The remainder
+    // is copied out BEFORE the terminal events so a listener (or code after the
+    // load) can keep reading; the watermarks recorded by the worker's write
+    // callback are replayed as PROGRESS, exactly as URLLoader does.
+    this.line('static void URLStream__drain(URLStream* o) {');
+    this.indent++;
+    this.line('if (o->_job == NULL) return;');
+    this.line('unsigned n = (unsigned)as_stream_available(o->_job);');
+    this.line('ByteArray* b = ByteArray_new();');
+    this.line('if (n > 0) {');
+    this.indent++;
+    this.line('b->data = (void*)gc_alloc(GCT_BYTES, (size_t)n);');
+    this.line('as_stream_read(o->_job, b->data, (int)n);');
+    this.line('b->capacity = (int)n; b->length = (int)n;');
+    this.line('gc_write_barrier((void*)b->data);');
+    this.indent--;
+    this.line('}');
+    this.line('o->_buf = (void*)b; o->_buf_pos = 0;');
+    this.line('gc_write_barrier((void*)b);');
+    this.line('o->_job = NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('static void URLStream__finish(void* job) {');
+    this.indent++;
+    this.line('URLStream* o = (URLStream*)as_job_obj(job);');
+    this.line('as_net_pre_events(job);');
+    this.line('unsigned total = as_job_len(job);');
+    // bytesTotal is Content-Length (or a local file size) and stays 0 when the
+    // response did not state one — AIR reports 768/0 for /drip (probe 9).
+    this.line('unsigned btotal = as_job_expected_total(job);');
+    this.line('if (as_job_failed(job)) {');
+    this.indent++;
+    this.line('char* msg = as_job_error_text(job, (char*)"URLStream: this transport is not supported in this build (only http(s):// streams have a backend; see docs/zh-cn/flash-net.md)", (char*)"URLStream load failed");');
+    // Same AIR number as URLLoader puts on its ioError (2032 "Stream Error"),
+    // measured against adl; the unsupported-transport state keeps its own text
+    // and no number, like URLLoader's.
+    this.line('int eid = (as_job_error(job) == AS_JOB_ERR_UNSUPPORTED) ? 0 : 2032;');
+    this.line('if (eid != 0) msg = as_ioerror_text(as_job_path(job), eid, as_job_err_detail(job));');
+    // The stream is drained first, which also leaves the "opened but empty" state
+    // AIR is in after a failed load: disconnected-looking but connected==true and
+    // reads reported as EOFError, not as the #2029 of a stream that never opened.
+    // A status-0 httpStatus precedes the error here too (probe 9: a refused
+    // connection gives open;httpStatus(0);ioError).
+    this.line('URLStream__drain(o);');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)URLLoader__httpStatusEvent((char*)"httpStatus", 0));');
+    this.line('IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, msg);');
+    this.line('ev->errorID = eid;');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    // Terminal for a non-2xx HTTP status: same AIR rule as URLLoader (the
+    // caller's HTTP_RESPONSE_STATUS listener decides COMPLETE vs ioError #2032),
+    // applied to the stream side. The body is drained into the stream on both
+    // branches — a stream that ends in ioError still holds the error payload.
+    this.line('URLStream__drain(o);');
+    // Zero-length body: no progress event, same rule as URLLoader (and the same
+    // measurement: temp/httpstatus-probe2 cases I/J).
+    this.line('if (total > 0 && (as_job_marks_sent(job) == 0 || as_job_last_progress(job) != total)) {');
+    this.indent++;
+    this.line('as_job_set_last_progress(job, total);');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ProgressEvent_new((char*)"progress", false, false, total, btotal));');
+    this.indent--;
+    this.line('}');
+    this.line('int st = as_job_status(job);');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)URLLoader__httpStatusEvent((char*)"httpStatus", st));');
+    // AIR's terminal split for a non-2xx response (see the event-order note above
+    // and docs/zh-cn/flash-net.md §6.2): with a HTTP_RESPONSE_STATUS listener the
+    // error body completes; without one the very same transfer ends in
+    // ioError #2032. `hasEventListener` is the same predicate AIR uses — it counts
+    // a listener in either phase — and status 0 (a local read, a non-HTTP load)
+    // must NOT take this branch, hence the >= 300 test rather than "!= 200".
+    this.line('if (st >= 300 && !EventDispatcher_hasEventListener((void*)o, (char*)"httpResponseStatus")) {');
+    this.indent++;
+    this.line('IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, as_ioerror_text(as_job_path(job), 2032, NULL));');
+    this.line('ev->errorID = 2032;');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('void URLStream_load(void* _this, URLRequest* request) {');
+    this.indent++;
+    this.line('URLStream* o = (URLStream*)_this;');
+    // AIR: a second load() restarts the stream; the previous transfer is dropped
+    // (cancelled AND the handle forgotten, for the reason close() explains).
+    this.line('if (o->_job != NULL) { as_async_cancel((void*)o); o->_job = NULL; }');
+    this.line('o->_buf = NULL; o->_buf_pos = 0;');
+    // AIR validates the parameters instead of quietly doing nothing: load(null) and
+    // load(new URLRequest(null)) are two distinct TypeErrors (#2007, verified with
+    // adl). Silently returning would leave the caller waiting for an event that can
+    // never arrive.
+    this.line('if (request == NULL) as_throw(TypeError_new((char*)"Error #2007: Parameter request must be non-null.", 2007));');
+    this.line('if (request->url == NULL) as_throw(TypeError_new((char*)"Error #2007: Parameter url must be non-null.", 2007));');
+    this.line('const char* url = request->url;');
+    this.line('if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) { o->_job = as_async_submit_unsupported((void*)o, URLStream__finish, url); if (o->_job != NULL) as_job_set_net_events(o->_job); return; }');
+    this.line('net_req r; net__prepare_request(request, &r);');
+    this.line('o->_job = as_async_submit_http_stream((void*)o, URLStream__finish, r.url, r.method, request->userAgent, request->contentType, (char*)r.headers, r.body, r.body_len, request->followRedirects ? 1 : 0, request->idleTimeout, request->manageCookies ? 1 : 0);');
+    this.line('if (o->_job != NULL) as_job_set_net_events(o->_job);');
+    this.indent--;
+    this.line('}');
+    this.line('bool URLStream_readBoolean(void* _this) { URLStream* o = (URLStream*)_this; if (URLStream__poll(o) <= 0) { URLStream__eof(); return false; } return URLStream__get(o) != 0; }');
+    this.line('int URLStream_readByte(void* _this) { URLStream* o = (URLStream*)_this; if (URLStream__poll(o) <= 0) { URLStream__eof(); return 0; } return (int)(signed char)URLStream__get(o); }');
+    this.line('unsigned URLStream_readUnsignedByte(void* _this) { URLStream* o = (URLStream*)_this; if (URLStream__poll(o) <= 0) { URLStream__eof(); return 0; } return (unsigned)URLStream__get(o); }');
+    this.line('int URLStream_readShort(void* _this) { return (int)(short)URLStream__uint((URLStream*)_this, 2); }');
+    this.line('unsigned URLStream_readUnsignedShort(void* _this) { return (unsigned)URLStream__uint((URLStream*)_this, 2); }');
+    this.line('int URLStream_readInt(void* _this) { return (int)URLStream__uint((URLStream*)_this, 4); }');
+    this.line('unsigned URLStream_readUnsignedInt(void* _this) { return (unsigned)URLStream__uint((URLStream*)_this, 4); }');
+    this.line('double URLStream_readFloat(void* _this) { unsigned long long v = URLStream__uint((URLStream*)_this, 4); unsigned bits = (unsigned)v; float f; memcpy(&f, &bits, 4); return (double)f; }');
+    this.line('double URLStream_readDouble(void* _this) { unsigned long long v = URLStream__uint((URLStream*)_this, 8); double d; memcpy(&d, &v, 8); return d; }');
+    // readUTF: a 16-bit byte length (honouring `endian`) followed by the bytes.
+    this.line('char* URLStream_readUTF(void* _this) {');
+    this.indent++;
+    this.line('URLStream* o = (URLStream*)_this;');
+    this.line('if (!URLStream__need(o, 2)) { URLStream__eof(); return (char*)""; }');
+    this.line('unsigned n = (unsigned)URLStream__uint(o, 2);');
+    this.line('if (!URLStream__need(o, (int)n)) { URLStream__eof(); return (char*)""; }');
+    this.line('char* s = as_str_alloc((size_t)n + 1);');
+    this.line('if (n > 0) URLStream__read(o, s, (int)n);');
+    this.line('s[n] = 0; return s;');
+    this.indent--;
+    this.line('}');
+    this.line('char* URLStream_readUTFBytes(void* _this, unsigned length) {');
+    this.indent++;
+    this.line('URLStream* o = (URLStream*)_this;');
+    this.line('if (!URLStream__need(o, (int)length)) { URLStream__eof(); return (char*)""; }');
+    this.line('char* s = as_str_alloc((size_t)length + 1);');
+    this.line('if (length > 0) URLStream__read(o, s, (int)length);');
+    this.line('s[length] = 0; return s;');
+    this.indent--;
+    this.line('}');
+    // charSet is ignored exactly like ByteArray.readMultiByte in this subset: the
+    // bytes are passed through as UTF-8 (see docs/zh-cn/flash-net.md).
+    this.line('char* URLStream_readMultiByte(void* _this, unsigned length, char* charSet) { (void)charSet; return URLStream_readUTFBytes(_this, length); }');
+    this.line('void URLStream_readBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {');
+    this.indent++;
+    this.line('URLStream* o = (URLStream*)_this;');
+    this.line('if (bytes == NULL) return;');
+    this.line('unsigned avail = (unsigned)URLStream__poll(o);');
+    this.line('if (length == 0) length = avail;');
+    // AIR: a shortfall is an error, not a partial read (length == 0 means "all
+    // available" and can therefore never fall short).
+    this.line('if (length > avail) { URLStream__eof(); return; }');
+    this.line('unsigned need = offset + length;');
+    this.line('if ((int)bytes->capacity < (int)need) {');
+    this.indent++;
+    // The destination ByteArray is grown by hand rather than through
+    // as_ba_grow: that helper lives with the ByteArray block, which is emitted
+    // later, and its exact slack policy is not part of this contract.
+    this.line('unsigned char* nd = (unsigned char*)gc_alloc(GCT_BYTES, need > 0 ? need : 1);');
+    this.line('if (bytes->data != NULL && bytes->length > 0) memcpy(nd, bytes->data, (size_t)bytes->length);');
+    this.line('bytes->data = nd; bytes->capacity = (int)need;');
+    this.line('gc_write_barrier((void*)nd);');
+    this.indent--;
+    this.line('}');
+    this.line('if (length > 0) URLStream__read(o, (unsigned char*)bytes->data + offset, (int)length);');
+    this.line('if ((int)need > bytes->length) bytes->length = (int)need;');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // ---- flash.net.Socket / ServerSocket / XMLSocket / SecureSocket (stage 89·54) ----
+    //
+    // Every AS3-visible behaviour below is measured from adl, not inferred from the
+    // documentation: temp/air-probe/Probe11.as and air-probe11-result.txt. The
+    // measurements that shape the code:
+    //
+    //   * EVERY operation on a socket that is not open throws IOError #2002
+    //     "Operation attempted on invalid socket." — including bytesAvailable and
+    //     bytesPending, which are getters, and close() itself. No exceptions.
+    //   * a connect() that the transport refuses does NOT throw: it dispatches
+    //     ioError errorID=2031 text="Error #2031: Socket Error. URL: <host>"
+    //     (the URL is the host alone, with no port). An unresolvable host reports
+    //     the same id with that host.
+    //   * connect(null, port) throws TypeError #1009; a port outside 0..65535
+    //     throws SecurityError #2003 "Invalid socket port number specified."
+    //   * a read that cannot be satisfied throws EOFError #2030, never a partial
+    //     read.
+    //   * writes BUFFER: writeUTFBytes("hello") leaves bytesPending = 5 and only
+    //     flush() (or this runtime's automatic flush at the frame boundary) hands
+    //     them to the transport; OutputProgressEvent then reports what is left.
+    //   * socketData carries bytesLoaded = the whole chunk, bytesTotal = 0.
+    //   * close() dispatches nothing; the PEER's close is what raises Event.CLOSE.
+    //   * a Socket object is reusable: connect() after close() connects again.
+    //   * the transport lives in an as_sock owned by the runtime's registry (see
+    //     the socket seam in RUNTIME_PREAMBLE). `_sock` is a borrowed pointer in a
+    //     C-runtime-only slot; the AS3 object drops it the moment it closes, and
+    //     the registry keeps the object alive as a GC root until then.
+    this.line('static void Socket__invalid(void) { as_throw(IOError_new((char*)"Error #2002: Operation attempted on invalid socket.", 2002)); }');
+    this.line('static void Socket__eof(void) { as_throw(EOFError_new((char*)"Error #2030: End of file was encountered.", 2030)); }');
+    // "Open" is what #2002 is reported against: a socket that has been connect()ed
+    // and not closed. A connect that is still in flight counts as open, because AIR
+    // buffers a write issued before the handshake finishes (the write buffer is
+    // independent of the transport); reads on it simply find nothing yet.
+    this.line('static int Socket__live(void* o) { as_sock* s = (as_sock*)((Socket*)o)->_sock; if (s == NULL) return 0; int st = as_sock_state_of(s); return !as_sock_is_dead(s) && (st == AS_SOCK_CONNECTING || st == AS_SOCK_CONNECTED); }');
+    this.line('static int Socket__connected(void* o) { as_sock* s = (as_sock*)((Socket*)o)->_sock; return s != NULL && !as_sock_is_dead(s) && as_sock_state_of(s) == AS_SOCK_CONNECTED; }');
+    this.line('static int Socket__avail(void* o) { as_sock* s = (as_sock*)((Socket*)o)->_sock; return s == NULL ? 0 : as_sock_avail(s); }');
+    this.line('static int Socket__read(void* o, void* dst, int n) { as_sock* s = (as_sock*)((Socket*)o)->_sock; return s == NULL ? 0 : as_sock_read(s, dst, n); }');
+    // The liveness check lives in here rather than in each reader: a read on a
+    // socket that was never opened must report IOError #2002, while a read that
+    // merely has no data yet reports EOFError #2030. as_throw never returns, so
+    // the caller's EOF fallback is unreachable on the #2002 path.
+    this.line('static int Socket__need(void* o, int n) { if (!Socket__live(o)) { Socket__invalid(); return 0; } return Socket__avail(o) >= n; }');
+    this.line('static int Socket__little(void* o) { char* e = ((Socket*)o)->endian; return e != NULL && strcmp(e, "littleEndian") == 0; }');
+    // Writes go through the write buffer; the #2002 check happens here so every
+    // write* method reports the same error the reference runtime does.
+    this.line('static void Socket__write(void* o, const void* p, int n) {');
+    this.indent++;
+    this.line('if (!Socket__live(o)) { Socket__invalid(); return; }');
+    this.line('as_sock_write((as_sock*)((Socket*)o)->_sock, p, n);');
+    this.indent--;
+    this.line('}');
+    // Fixed-width integer reads, honouring `endian` the way ByteArray does.
+    this.line('static unsigned long long Socket__uint(void* o, int nbytes, int little) {');
+    this.indent++;
+    this.line('unsigned char buf[8];');
+    this.line('if (!Socket__need(o, nbytes)) { Socket__eof(); return 0; }');
+    this.line('Socket__read(o, buf, nbytes);');
+    this.line('unsigned long long v = 0;');
+    this.line('if (little) { for (int i = nbytes - 1; i >= 0; i--) v = (v << 8) | (unsigned)buf[i]; }');
+    this.line('else { for (int i = 0; i < nbytes; i++) v = (v << 8) | (unsigned)buf[i]; }');
+    this.line('return v;');
+    this.indent--;
+    this.line('}');
+    this.line('static void Socket__put(void* o, unsigned long long v, int nbytes, int little) {');
+    this.indent++;
+    this.line('unsigned char buf[8];');
+    this.line('for (int i = 0; i < nbytes; i++) buf[little ? i : (nbytes - 1 - i)] = (unsigned char)((v >> (8 * i)) & 0xff);');
+    this.line('Socket__write(o, buf, nbytes);');
+    this.indent--;
+    this.line('}');
+    this.line('// Socket_connect() is defined below but the constructor calls it, so the');
+    this.line('// signature is declared here (the ctor\'s host-connect path is the same code).');
+    this.line('void Socket_connect(void* _this, char* host, int port);');
+    this.line('// Socket: constructor. AIR connects when a host was supplied, and the documented');
+    this.line('// advice to prefer the no-argument form then connect() is about listener setup');
+    this.line('// order, not about the constructor being different.');
+    this.line('void Socket_ctor(Socket* o, char* host, int port) {');
+    this.line('    EventDispatcher_ctor((EventDispatcher*)o);');
+    this.line('    o->endian = (char*)"bigEndian";');
+    this.line('    o->objectEncoding = 3;');
+    this.line('    o->timeout = 20000;');
+    this.line('    o->tcpNoDelay = false;');
+    this.line('    o->_sock = NULL;');
+    this.line('    gc_write_barrier((void*)o->endian);');
+    this.line('    if (host != NULL) Socket_connect((void*)o, host, port);');
+    this.line('}');
+    this.line('Socket* Socket_new(char* host, int port) { Socket* o = (Socket*)gc_alloc(GCT_CLASS, sizeof(Socket)); o->vtable = &Socket_vt; Socket_ctor(o, host, port); return o; }');
+    this.line('// connect(): synchronous validation, asynchronous result. The port check comes');
+    this.line('// first — a bad port is rejected even when the host is fine.');
+    this.line('void Socket_connect(void* _this, char* host, int port) {');
+    this.line('    Socket* o = (Socket*)_this;');
+    this.line('    if (host == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }');
+    this.line('    if (port < 0 || port > 65535) { as_throw(SecurityError_new((char*)"Error #2003: Invalid socket port number specified.", 2003)); return; }');
+    this.line('    if (o->_sock == NULL) {');
+    this.line('        o->_sock = (void*)as_sock_new(0);');
+    this.line('        if (o->_sock == NULL) return;');
+    this.line('    }');
+    this.line('    as_sock* s = (as_sock*)o->_sock;');
+    this.line('    as_sock_set_timeout(s, o->timeout);');
+    this.line('    as_sock_set_obj(s, (void*)o);');
+    this.line('    as_sock_connect(s, host, port);');
+    this.line('    as_sock_set_no_delay(s, o->tcpNoDelay ? 1 : 0);');
+    this.line('}');
+    this.line('void Socket_close(void* _this) {');
+    this.line('    Socket* o = (Socket*)_this;');
+    this.line('    if (o->_sock == NULL) { Socket__invalid(); return; }');
+    this.line('    as_sock_close((as_sock*)o->_sock);');
+    this.line('    o->_sock = NULL;');
+    this.line('}');
+    this.line('void Socket_flush(void* _this) {');
+    this.line('    Socket* o = (Socket*)_this;');
+    this.line('    if (!Socket__live(o)) { Socket__invalid(); return; }');
+    this.line('    as_sock_try_flush((as_sock*)o->_sock);');
+    this.line('}');
+    this.line('unsigned Socket_get_bytesAvailable(void* _this) {');
+    this.line('    if (!Socket__live(_this)) { Socket__invalid(); return 0; }');
+    this.line('    return (unsigned)Socket__avail(_this);');
+    this.line('}');
+    this.line('unsigned Socket_get_bytesPending(void* _this) {');
+    this.line('    if (!Socket__live(_this)) { Socket__invalid(); return 0; }');
+    this.line('    return (unsigned)as_sock_pending((as_sock*)((Socket*)_this)->_sock);');
+    this.line('}');
+    this.line('bool Socket_get_connected(void* _this) { return Socket__connected(_this) != 0; }');
+    this.line('char* Socket_get_localAddress(void* _this) { as_sock* s = (as_sock*)((Socket*)_this)->_sock; return s == NULL ? NULL : (char*)as_sock_local_addr(s); }');
+    this.line('int Socket_get_localPort(void* _this) { as_sock* s = (as_sock*)((Socket*)_this)->_sock; return s == NULL ? 0 : as_sock_local_port(s); }');
+    this.line('char* Socket_get_remoteAddress(void* _this) { as_sock* s = (as_sock*)((Socket*)_this)->_sock; return s == NULL ? NULL : (char*)as_sock_remote_addr(s); }');
+    this.line('int Socket_get_remotePort(void* _this) { as_sock* s = (as_sock*)((Socket*)_this)->_sock; return s == NULL ? 0 : as_sock_remote_port(s); }');
+    this.line('// ---- IDataInput read side -------------------------------------------------');
+    this.line('bool Socket_readBoolean(void* _this) { return Socket__uint(_this, 1, 0) != 0; }');
+    this.line('int Socket_readByte(void* _this) { return (int)(signed char)Socket__uint(_this, 1, 0); }');
+    this.line('unsigned Socket_readUnsignedByte(void* _this) { return (unsigned)Socket__uint(_this, 1, 0); }');
+    this.line('int Socket_readShort(void* _this) { return (int)(short)Socket__uint(_this, 2, Socket__little(_this)); }');
+    this.line('unsigned Socket_readUnsignedShort(void* _this) { return (unsigned)Socket__uint(_this, 2, Socket__little(_this)); }');
+    this.line('int Socket_readInt(void* _this) { return (int)(int32_t)Socket__uint(_this, 4, Socket__little(_this)); }');
+    this.line('unsigned Socket_readUnsignedInt(void* _this) { return (unsigned)Socket__uint(_this, 4, Socket__little(_this)); }');
+    this.line('double Socket_readFloat(void* _this) {');
+    this.line('    unsigned char buf[4]; float f = 0.0f;');
+    this.line('    if (!Socket__need(_this, 4)) { Socket__eof(); return 0.0; }');
+    this.line('    Socket__read(_this, buf, 4);');
+    this.line('    if (Socket__little(_this)) { unsigned char r[4]; for (int i = 0; i < 4; i++) r[i] = buf[3 - i]; memcpy(&f, r, 4); }');
+    this.line('    else memcpy(&f, buf, 4);');
+    this.line('    return (double)f;');
+    this.line('}');
+    this.line('double Socket_readDouble(void* _this) {');
+    this.line('    unsigned char buf[8]; double d = 0.0;');
+    this.line('    if (!Socket__need(_this, 8)) { Socket__eof(); return 0.0; }');
+    this.line('    Socket__read(_this, buf, 8);');
+    this.line('    if (Socket__little(_this)) { unsigned char r[8]; for (int i = 0; i < 8; i++) r[i] = buf[7 - i]; memcpy(&d, r, 8); }');
+    this.line('    else memcpy(&d, buf, 8);');
+    this.line('    return d;');
+    this.line('}');
+    this.line('// A read of n bytes into a fresh GC string. Bytes are copied verbatim: this');
+    this.line('// subset\'s String is a UTF-8 byte sequence (same rule as ByteArray.readUTFBytes).');
+    this.line('static char* Socket__str(Socket* o, int n) {');
+    this.line('    if (!Socket__live((void*)o)) { Socket__invalid(); return as_str_alloc(1); }');
+    this.line('    if (n < 0) n = 0;');
+    this.line('    if (Socket__avail(o) < n) { Socket__eof(); return as_str_alloc(1); }');
+    this.line('    char* s = as_str_alloc((size_t)n + 1);');
+    this.line('    if (n > 0) Socket__read((void*)o, s, n);');
+    this.line('    s[n] = \'\\0\';');
+    this.line('    return s;');
+    this.line('}');
+    this.line('char* Socket_readUTFBytes(void* _this, unsigned length) { return Socket__str((Socket*)_this, (int)length); }');
+    this.line('// readUTF: an unsigned 16-bit byte count, then that many bytes.');
+    this.line('char* Socket_readUTF(void* _this) {');
+    this.line('    Socket* o = (Socket*)_this;');
+    this.line('    unsigned n = (unsigned)Socket__uint(o, 2, 0);');
+    this.line('    return Socket__str(o, (int)n);');
+    this.line('}');
+    this.line('// readMultiByte ignores charSet exactly like ByteArray.readMultiByte does in this');
+    this.line('// subset (docs/zh-cn/flash-net.md section 3.1).');
+    this.line('char* Socket_readMultiByte(void* _this, unsigned length, char* charSet) { (void)charSet; return Socket__str((Socket*)_this, (int)length); }');
+    this.line('void Socket_readBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {');
+    this.line('    Socket* o = (Socket*)_this;');
+    this.line('    if (!Socket__live(o)) { Socket__invalid(); return; }');
+    this.line('    unsigned avail = (unsigned)Socket__avail(o);');
+    this.line('    unsigned n = (length == 0 || length > avail) ? avail : length;');
+    this.line('    if (offset + n > (unsigned)bytes->capacity) {');
+    this.line('        int need = (int)(offset + n);');
+    this.line('        void* nd = gc_alloc(GCT_BYTES, (size_t)(need > 0 ? need : 1));');
+    this.line('        if (bytes->data != NULL && bytes->length > 0) memcpy(nd, bytes->data, (size_t)bytes->length);');
+    this.line('        bytes->data = nd; bytes->capacity = need;');
+    this.line('        gc_write_barrier((void*)nd);');
+    this.line('    }');
+    this.line('    if (n > 0) Socket__read(o, (unsigned char*)bytes->data + offset, (int)n);');
+    this.line('    if ((int)(offset + n) > bytes->length) bytes->length = (int)(offset + n);');
+    this.line('}');
+    this.line('// ---- IDataOutput write side ----------------------------------------------');
+    this.line('void Socket_writeBoolean(void* _this, bool value) { Socket__put(_this, value ? 1 : 0, 1, 0); }');
+    this.line('void Socket_writeByte(void* _this, int value) { Socket__put(_this, (unsigned)(value & 0xff), 1, 0); }');
+    this.line('void Socket_writeShort(void* _this, int value) { Socket__put(_this, (unsigned)(value & 0xffff), 2, Socket__little(_this)); }');
+    this.line('void Socket_writeInt(void* _this, int value) { Socket__put(_this, (unsigned)value & 0xffffffffu, 4, Socket__little(_this)); }');
+    this.line('void Socket_writeUnsignedInt(void* _this, unsigned value) { Socket__put(_this, (unsigned long long)value, 4, Socket__little(_this)); }');
+    this.line('void Socket_writeFloat(void* _this, double value) {');
+    this.line('    float f = (float)value; unsigned char buf[4];');
+    this.line('    memcpy(buf, &f, 4);');
+    this.line('    if (Socket__little(_this)) { unsigned char r[4]; for (int i = 0; i < 4; i++) r[i] = buf[3 - i]; Socket__write(_this, r, 4); }');
+    this.line('    else Socket__write(_this, buf, 4);');
+    this.line('}');
+    this.line('void Socket_writeDouble(void* _this, double value) {');
+    this.line('    unsigned char buf[8];');
+    this.line('    memcpy(buf, &value, 8);');
+    this.line('    if (Socket__little(_this)) { unsigned char r[8]; for (int i = 0; i < 8; i++) r[i] = buf[7 - i]; Socket__write(_this, r, 8); }');
+    this.line('    else Socket__write(_this, buf, 8);');
+    this.line('}');
+    this.line('void Socket_writeUTFBytes(void* _this, char* value) {');
+    this.line('    if (value == NULL) value = (char*)"";');
+    this.line('    Socket__write(_this, value, (int)strlen(value));');
+    this.line('}');
+    this.line('// writeUTF prefixes the byte count. Like ByteArray.writeUTF in this subset, a');
+    this.line('// string longer than 65535 bytes wraps the count rather than throwing the');
+    this.line('// RangeError AIR documents (same documented leniency, see flash-net.md section 3.1).');
+    this.line('void Socket_writeUTF(void* _this, char* value) {');
+    this.line('    if (value == NULL) value = (char*)"";');
+    this.line('    Socket__put(_this, (unsigned)strlen(value) & 0xffff, 2, 0);');
+    this.line('    Socket__write(_this, value, (int)strlen(value));');
+    this.line('}');
+    this.line('void Socket_writeMultiByte(void* _this, char* value, char* charSet) { (void)charSet; Socket_writeUTFBytes(_this, value); }');
+    this.line('void Socket_writeBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {');
+    this.line('    if (!Socket__live(_this)) { Socket__invalid(); return; }');
+    this.line('    if (bytes == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }');
+    this.line('    unsigned total = (unsigned)bytes->length;');
+    this.line('    if (offset > total) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return; }');
+    this.line('    unsigned n = (length == 0 || offset + length > total) ? (total - offset) : length;');
+    this.line('    if (n > 0) Socket__write(_this, (unsigned char*)bytes->data + offset, (int)n);');
+    this.line('}');
+    this.line('');
+    // ---- flash.net.ServerSocket (stage 89·54) ----
+    //
+    // bind() is the only place a listening transport is created, so it is also
+    // where a previously bound one is released — the reference lets bind() move
+    // the socket to a different port, and the example code closes the object
+    // instead because a CLOSED ServerSocket cannot be reopened. That last rule is
+    // enforced here with `_closed`: after close() a later bind() reports the same
+    // IOError #2002 the reference's listen()-on-closed measurement produced.
+    this.line('void ServerSocket_ctor(ServerSocket* o) {');
+    this.line('    EventDispatcher_ctor((EventDispatcher*)o);');
+    this.line('    o->_sock = NULL;');
+    this.line('    o->_closed = 0;');
+    this.line('}');
+    this.line('ServerSocket* ServerSocket_new(void) { ServerSocket* o = (ServerSocket*)gc_alloc(GCT_CLASS, sizeof(ServerSocket)); o->vtable = &ServerSocket_vt; ServerSocket_ctor(o); return o; }');
+    this.line('void ServerSocket_bind(void* _this, int localPort, char* localAddress) {');
+    this.line('    ServerSocket* o = (ServerSocket*)_this;');
+    this.line('    if (o->_closed) { Socket__invalid(); return; }');
+    this.line('    if (o->_sock != NULL) { as_sock_close((as_sock*)o->_sock); o->_sock = NULL; }');
+    this.line('    o->_sock = (void*)as_sock_new(1);');
+    this.line('    if (o->_sock == NULL) return;');
+    this.line('    as_sock* s = (as_sock*)o->_sock;');
+    this.line('    as_sock_set_obj(s, (void*)o);');
+    this.line('    // AIR\'s port 0 is "next available"; a bind that fails leaves `bound` false,');
+    this.line('    // which is the documented way to detect it.');
+    this.line('    as_sock_bind(s, localAddress, localPort);');
+    this.line('}');
+    this.line('void ServerSocket_listen(void* _this, int backlog) {');
+    this.line('    ServerSocket* o = (ServerSocket*)_this;');
+    this.line('    as_sock* s = (as_sock*)o->_sock;');
+    this.line('    if (s == NULL || as_sock_is_dead(s) || !as_sock_is_bound(s)) { Socket__invalid(); return; }');
+    this.line('    if (!as_sock_listen(s, backlog)) Socket__invalid();');
+    this.line('}');
+    this.line('void ServerSocket_close(void* _this) {');
+    this.line('    ServerSocket* o = (ServerSocket*)_this;');
+    this.line('    if (o->_sock == NULL) { Socket__invalid(); return; }');
+    this.line('    as_sock_close((as_sock*)o->_sock);');
+    this.line('    o->_sock = NULL;');
+    this.line('    o->_closed = 1;');
+    this.line('}');
+    this.line('bool ServerSocket_get_bound(void* _this) { as_sock* s = (as_sock*)((ServerSocket*)_this)->_sock; return s != NULL && !as_sock_is_dead(s) && as_sock_local_port(s) > 0; }');
+    this.line('bool ServerSocket_get_listening(void* _this) { as_sock* s = (as_sock*)((ServerSocket*)_this)->_sock; return s != NULL && !as_sock_is_dead(s) && as_sock_is_listening(s); }');
+    this.line('char* ServerSocket_get_localAddress(void* _this) { as_sock* s = (as_sock*)((ServerSocket*)_this)->_sock; if (s == NULL || as_sock_local_port(s) <= 0) return NULL; return (char*)as_sock_local_addr(s); }');
+    this.line('int ServerSocket_get_localPort(void* _this) { as_sock* s = (as_sock*)((ServerSocket*)_this)->_sock; return s == NULL ? 0 : as_sock_local_port(s); }');
+    this.line('bool ServerSocket_get_isSupported_static(void* _this) { (void)_this; return true; }');
+    this.line('');
+    // ---- flash.net.XMLSocket (stage 89·54) ----
+    //
+    // XMLSocket is the NUL-terminated-message protocol over the same transport.
+    // adl measured its framing exactly: send() appends the terminator itself
+    // (a 5-byte string arrives as 6 bytes) and sends IMMEDIATELY, with no
+    // flush(); an inbound message is delivered as DataEvent.DATA with a String
+    // payload, one event per terminator; and a message split across frames is
+    // assembled rather than reported early.
+    this.line('void XMLSocket_ctor(XMLSocket* o, char* host, int port) {');
+    this.line('    EventDispatcher_ctor((EventDispatcher*)o);');
+    this.line('    o->timeout = 20000;');
+    this.line('    o->_sock = NULL;');
+    this.line('    if (host != NULL) XMLSocket_connect((void*)o, host, port);');
+    this.line('}');
+    this.line('XMLSocket* XMLSocket_new(char* host, int port) { XMLSocket* o = (XMLSocket*)gc_alloc(GCT_CLASS, sizeof(XMLSocket)); o->vtable = &XMLSocket_vt; XMLSocket_ctor(o, host, port); return o; }');
+    this.line('void XMLSocket_connect(void* _this, char* host, int port) {');
+    this.line('    XMLSocket* o = (XMLSocket*)_this;');
+    this.line('    if (host == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }');
+    this.line('    if (port < 0 || port > 65535) { as_throw(SecurityError_new((char*)"Error #2003: Invalid socket port number specified.", 2003)); return; }');
+    this.line('    if (o->_sock == NULL) {');
+    this.line('        o->_sock = (void*)as_sock_new(0);');
+    this.line('        if (o->_sock == NULL) return;');
+    this.line('    }');
+    this.line('    as_sock* s = (as_sock*)o->_sock;');
+    this.line('    as_sock_set_timeout(s, o->timeout);');
+    this.line('    as_sock_set_obj(s, (void*)o);');
+    this.line('    as_sock_connect(s, host, port);');
+    this.line('}');
+    this.line('void XMLSocket_close(void* _this) {');
+    this.line('    XMLSocket* o = (XMLSocket*)_this;');
+    this.line('    if (o->_sock == NULL) { Socket__invalid(); return; }');
+    this.line('    as_sock_close((as_sock*)o->_sock);');
+    this.line('    o->_sock = NULL;');
+    this.line('}');
+    this.line('bool XMLSocket_get_connected(void* _this) {');
+    this.line('    as_sock* s = (as_sock*)((XMLSocket*)_this)->_sock;');
+    this.line('    return s != NULL && !as_sock_is_dead(s) && as_sock_state_of(s) == AS_SOCK_CONNECTED;');
+    this.line('}');
+    // send(): the terminator is part of the wire format, so this is where it is
+    // appended. The reference types the parameter Object and AIR accepts an XML
+    // value or a String (stringifying anything else, measured: 42 becomes "42"),
+    // so the slot is dynamic and the coercion is the same one an implicit
+    // String conversion uses. A null argument raises the #1009 a null connect()
+    // host raises (measured) rather than sending the literal "null".
+    this.line('void XMLSocket_send(void* _this, as_value object) {');
+    this.line('    XMLSocket* o = (XMLSocket*)_this;');
+    this.line('    if (!XMLSocket_get_connected(o)) { Socket__invalid(); return; }');
+    this.line('    if (object.tag == 0 || object.tag == 5) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }');
+    this.line('    char* text = as_coerce_str(object);');
+    this.line('    if (text == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }');
+    this.line('    as_sock* s = (as_sock*)o->_sock;');
+    this.line('    int n = (int)strlen(text);');
+    this.line('    if (n > 0) as_sock_write(s, text, n);');
+    this.line('    as_sock_write(s, "", 1);');
+    this.line('    as_sock_try_flush(s);');
+    this.line('}');
+    // Hand over every complete NUL-terminated message as a DataEvent. The scan
+    // consumes nothing until a terminator is found, so a message that arrives
+    // split across frames stays buffered until it is whole.
+    this.line('static int XMLSocket__deliver(XMLSocket* o) {');
+    this.line('    int sent = 0;');
+    this.line('    for (;;) {');
+    this.line('        as_sock* s = (as_sock*)o->_sock;');
+    this.line('        if (s == NULL) break;');
+    this.line('        int at = as_sock_index_of(s, 0);');
+    this.line('        if (at < 0) break;');
+    this.line('        char* msg = as_str_alloc((size_t)at + 1);');
+    this.line('        if (at > 0) as_sock_read(s, msg, at);');
+    this.line('        msg[at] = \'\\0\';');
+    this.line('        unsigned char nul = 0;');
+    this.line('        as_sock_read(s, &nul, 1);');
+    this.line('        EventDispatcher_dispatchEvent((void*)o, (Event*)DataEvent_new((char*)"data", false, false, msg));');
+    this.line('        sent++;');
+    this.line('        if (as_sock_is_dead(s)) break;');
+    this.line('    }');
+    this.line('    return sent;');
+    this.line('}');
+    this.line('');
+    // ---- flash.net.SecureSocket (stage 89·54) ----
+    //
+    // TLS is NOT implemented, and the class says so instead of silently handing
+    // the app a plaintext connection: isSupported is false and connect()
+    // dispatches the socket ioError. SecureSocket.isSupported is the documented
+    // way to feature-detect TLS, so an app that checks it takes its own fallback,
+    // and an app that does not still fails loudly. What is missing is the TLS
+    // state machine over the non-blocking transport plus AIR's
+    // serverCertificateValidate handshake (the app validates untrusted certs);
+    // it is recorded in TODO.md's leftover table, not papered over here.
+    this.line('static char* Socket__ioerror_text(const char* url);');
+    this.line('static IOErrorEvent* Socket__ioerror_event(const char* url);');
+    this.line('void SecureSocket_ctor(SecureSocket* o) {');
+    this.line('    Socket_ctor((Socket*)o, NULL, 0);');
+    this.line('}');
+    this.line('SecureSocket* SecureSocket_new(void) { SecureSocket* o = (SecureSocket*)gc_alloc(GCT_CLASS, sizeof(SecureSocket)); o->vtable = &SecureSocket_vt; SecureSocket_ctor(o); return o; }');
+    this.line('void SecureSocket_connect(void* _this, char* host, int port) {');
+    this.line('    SecureSocket* o = (SecureSocket*)_this;');
+    this.line('    if (host == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }');
+    this.line('    if (port < 0 || port > 65535) { as_throw(SecurityError_new((char*)"Error #2003: Invalid socket port number specified.", 2003)); return; }');
+    this.line('    EventDispatcher_dispatchEvent((void*)o, (Event*)Socket__ioerror_event(host));');
+    this.line('}');
+    this.line('bool SecureSocket_get_isSupported_static(void* _this) { (void)_this; return false; }');
+    this.line('char* SecureSocket_get_serverCertificateStatus(void* _this) { (void)_this; return (char*)"unknown"; }');
+    this.line('void SecureSocket_addBinaryChainBuildingCertificate(void* _this, ByteArray* certificate, bool trusted) { (void)_this; (void)certificate; (void)trusted; }');
+    this.line('');
+    // ---- the AS3 side of the socket seam ----
+    //
+    // as_sock_dispatch() is the second half of the frame-boundary pump (the first
+    // half, as_sock_pump, lives in RUNTIME_PREAMBLE and knows nothing about AS3).
+    // It walks the registry, turning raised flags into events, and is called from
+    // as_async_tick — so socket events arrive on the same frame boundary as every
+    // other asynchronous event in this runtime. It is also what keeps AIR's
+    // "everything is dispatched between frames" model intact: nothing here runs
+    // on a worker thread.
+    //
+    // Three rules keep a listener from breaking the walk:
+    //   * a socket the pump marked dead is skipped, so close() from inside an
+    //     earlier dispatch cannot deliver an event for a socket that is gone;
+    //   * a flag is cleared BEFORE its event is dispatched, so a re-entrant tick
+    //     (a listener calling tickTimers) cannot replay it;
+    //   * nothing is freed here. close() only marks dead; as_sock_reap() at the
+    //     tail — which refuses to run while as_sock_dispatching is set — frees.
+    //
+    // The order is fixed: CONNECT, then ACCEPT, then DATA, then OUTPUT, then
+    // ERROR, then CLOSE. DATA before CLOSE is required — the last chunk of a
+    // connection must be readable before the close event retires the socket.
+    this.line('// flash.events.ServerSocketConnectEvent / OutputProgressEvent: the two event');
+    this.line('// classes the socket layer introduces. Both extend Event (hand-written like the');
+    this.line('// other flash.events subclasses in this file, stage 59).');
+    this.line('void ServerSocketConnectEvent_ctor(ServerSocketConnectEvent* o, char* type, bool bubbles, bool cancelable, Socket* socket) {');
+    this.line('    Event_ctor((Event*)o, type, bubbles, cancelable);');
+    this.line('    o->socket = socket;');
+    this.line('    gc_write_barrier((void*)socket);');
+    this.line('}');
+    this.line('ServerSocketConnectEvent* ServerSocketConnectEvent_new(char* type, bool bubbles, bool cancelable, Socket* socket) {');
+    this.line('    ServerSocketConnectEvent* o = (ServerSocketConnectEvent*)gc_alloc(GCT_CLASS, sizeof(ServerSocketConnectEvent));');
+    this.line('    o->vtable = &ServerSocketConnectEvent_vt;');
+    this.line('    ServerSocketConnectEvent_ctor(o, type, bubbles, cancelable, socket);');
+    this.line('    return o;');
+    this.line('}');
+    this.line('void OutputProgressEvent_ctor(OutputProgressEvent* o, char* type, bool bubbles, bool cancelable, double bytesPending, double bytesTotal) {');
+    this.line('    Event_ctor((Event*)o, type, bubbles, cancelable);');
+    this.line('    o->bytesPending = bytesPending;');
+    this.line('    o->bytesTotal = bytesTotal;');
+    this.line('}');
+    this.line('OutputProgressEvent* OutputProgressEvent_new(char* type, bool bubbles, bool cancelable, double bytesPending, double bytesTotal) {');
+    this.line('    OutputProgressEvent* o = (OutputProgressEvent*)gc_alloc(GCT_CLASS, sizeof(OutputProgressEvent));');
+    this.line('    o->vtable = &OutputProgressEvent_vt;');
+    this.line('    OutputProgressEvent_ctor(o, type, bubbles, cancelable, bytesPending, bytesTotal);');
+    this.line('    return o;');
+    this.line('}');
+    this.line('');
+    // AIR pairs the message with errorID 2031 (measured; the text alone is not
+    // enough — code reads the number). `id` is fixed: every transport failure a
+    // connect attempt produces reports 2031, and no other socket failure has a
+    // measured id yet (see the leftover table in TODO.md).
+    this.line('static IOErrorEvent* Socket__ioerror_event(const char* url) {');
+    this.line('    IOErrorEvent* e = IOErrorEvent_new((char*)"ioError", false, false, Socket__ioerror_text(url));');
+    this.line('    e->errorID = 2031;');
+    this.line('    return e;');
+    this.line('}');
+    this.line('static char* Socket__ioerror_text(const char* url) {');
+    this.line('    size_t n = strlen(url == NULL ? "" : url) + 48;');
+    this.line('    char* t = as_str_alloc(n);');
+    this.line('    snprintf(t, n, "Error #2031: Socket Error. URL: %s", url == NULL ? "" : url);');
+    this.line('    return t;');
+    this.line('}');
+    this.line('int as_sock_dispatch(void) {');
+    this.line('    int total = 0;');
+    this.line('    as_sock_dispatching = 1;');
+    this.line('    int n = as_sock_count_all();');
+    this.line('    for (int i = 0; i < n; i++) {');
+    this.line('        as_sock* s = as_sock_at(i);');
+    this.line('        if (as_sock_is_dead(s)) continue;');
+    this.line('        int ev = as_sock_events_of(s);');
+    this.line('        void* obj = as_sock_obj_of(s);');
+    this.line('        if (obj == NULL) continue;');
+    this.line('        if (ev & AS_SOCK_EV_CONNECT) {');
+    this.line('            as_sock_clear_events(s, AS_SOCK_EV_CONNECT);');
+    this.line('            EventDispatcher_dispatchEvent(obj, (Event*)Event_new((char*)"connect", false, false));');
+    this.line('            total++;');
+    this.line('            if (as_sock_is_dead(s)) continue;');
+    this.line('            ev = as_sock_events_of(s);');
+    this.line('        }');
+    this.line('        if (ev & AS_SOCK_EV_ACCEPT) {');
+    this.line('            as_sock_clear_events(s, AS_SOCK_EV_ACCEPT);');
+    this.line('            as_sock* c = as_sock_take_accepted(s);');
+    this.line('            if (c != NULL) {');
+    this.line('                Socket* peer = Socket_new(NULL, 0);');
+    this.line('                peer->_sock = (void*)c;');
+    this.line('                as_sock_set_obj(c, (void*)peer);');
+    this.line('                // ONE event, a ServerSocketConnectEvent: its type is');
+    this.line('                // ServerSocketConnectEvent.CONNECT === Event.CONNECT === "connect"');
+    this.line('                // and it extends Event, so a single dispatch reaches listeners');
+    this.line('                // registered for either constant (measured on adl).');
+    this.line('                EventDispatcher_dispatchEvent(obj, (Event*)ServerSocketConnectEvent_new((char*)"connect", false, false, peer));');
+    this.line('                total++;');
+    this.line('            }');
+    this.line('            if (as_sock_is_dead(s)) continue;');
+    this.line('            ev = as_sock_events_of(s);');
+    this.line('        }');
+    this.line('        if (ev & AS_SOCK_EV_DATA) {');
+    this.line('            as_sock_clear_events(s, AS_SOCK_EV_DATA);');
+    this.line('            if (as_is(obj, &XMLSocket_vt)) {');
+    this.line('                total += XMLSocket__deliver((XMLSocket*)obj);');
+    this.line('            } else {');
+    this.line('                // bytesTotal stays 0: a socket has no declared length (measured).');
+    this.line('                EventDispatcher_dispatchEvent(obj, (Event*)ProgressEvent_new((char*)"socketData", false, false, (unsigned)as_sock_avail(s), 0));');
+    this.line('                total++;');
+    this.line('            }');
+    this.line('            if (as_sock_is_dead(s)) continue;');
+    this.line('            ev = as_sock_events_of(s);');
+    this.line('        }');
+    this.line('        if (ev & AS_SOCK_EV_OUTPUT) {');
+    this.line('            as_sock_clear_events(s, AS_SOCK_EV_OUTPUT);');
+    this.line('            if (!as_is(obj, &XMLSocket_vt)) {');
+    this.line('                EventDispatcher_dispatchEvent(obj, (Event*)OutputProgressEvent_new((char*)"outputProgress", false, false, (double)as_sock_pending(s), 0.0));');
+    this.line('                total++;');
+    this.line('            }');
+    this.line('            if (as_sock_is_dead(s)) continue;');
+    this.line('            ev = as_sock_events_of(s);');
+    this.line('        }');
+    this.line('        if (ev & AS_SOCK_EV_ERROR) {');
+    this.line('            as_sock_clear_events(s, AS_SOCK_EV_ERROR);');
+    this.line('            EventDispatcher_dispatchEvent(obj, (Event*)Socket__ioerror_event(as_sock_url(s)));');
+    this.line('            total++;');
+    this.line('            if (as_sock_is_dead(s)) continue;');
+    this.line('            ev = as_sock_events_of(s);');
+    this.line('        }');
+    this.line('        if (ev & AS_SOCK_EV_CLOSE) {');
+    this.line('            as_sock_clear_events(s, AS_SOCK_EV_CLOSE);');
+    this.line('            EventDispatcher_dispatchEvent(obj, (Event*)Event_new((char*)"close", false, false));');
+    this.line('            total++;');
+    this.line('        }');
+    this.line('    }');
+    this.line('    as_sock_dispatching = 0;');
+    this.line('    as_sock_reap();');
+    this.line('    return total;');
+    this.line('}');
+    this.line('');
+
     // URLVariables: dynamic class (AS3 `dynamic class`). Arbitrary string-keyed
     // properties live in the `_dyn` slot table (see the dynamic-class mechanism);
     // toString() serializes them as a URL-encoded query string (key=value&...),
@@ -2397,8 +5431,22 @@ export class Emitter {
     this.line('Object_ctor((Object*)o);');
     this.line('o->_dyn = as_object_new();');
     this.line('gc_write_barrier((void*)o->_dyn);');
-    this.line('if (source != NULL && *source != \'\\0\') {');
+    // AIR: the constructor decodes any non-null argument, so it is the same
+    // operation as the public decode() and is delegated to it.
+    this.line('URLVariables_decode((void*)o, source);');
+    this.indent--;
+    this.line('}');
+    this.line('URLVariables* URLVariables_new(char* source) { URLVariables* o = (URLVariables*)gc_alloc(GCT_CLASS, sizeof(URLVariables)); o->vtable = &URLVariables_vt; URLVariables_ctor(o, source); return o; }');
+    // URLVariables.decode(source): split "a=1&b=2" into dynamic properties. The
+    // source is copied first because the scan writes NULs into the buffer as it
+    // walks and the argument string may be caller-owned. Keys are NOT URL-decoded,
+    // values are — that asymmetry is AIR's (the constructor always behaved so).
+    // AIR throws Error for a pair that is not URL-encoded; this subset decodes
+    // leniently instead (docs/zh-cn/flash-net.md §3.1).
+    this.line('void URLVariables_decode(void* _this, char* source) {');
     this.indent++;
+    this.line('URLVariables* o = (URLVariables*)_this;');
+    this.line('if (source == NULL || *source == \'\\0\') return;');
     this.line('char* s = as_str_alloc(strlen(source) + 1);');
     this.line('strcpy(s, source);');
     this.line('char* p = s;');
@@ -2417,9 +5465,6 @@ export class Emitter {
     this.line('}');
     this.indent--;
     this.line('}');
-    this.indent--;
-    this.line('}');
-    this.line('URLVariables* URLVariables_new(char* source) { URLVariables* o = (URLVariables*)gc_alloc(GCT_CLASS, sizeof(URLVariables)); o->vtable = &URLVariables_vt; URLVariables_ctor(o, source); return o; }');
     this.line('char* URLVariables_toString(void* _this) {');
     this.indent++;
     this.line('URLVariables* o = (URLVariables*)_this;');
@@ -2456,6 +5501,10 @@ export class Emitter {
     this.line('void Mouse_hide_static(void) { as_mouse_visible = false; }');
     this.line('void Mouse_show_static(void) { as_mouse_visible = true; }');
     this.line('');
+    // Forward declaration: FileStream_readBytes/writeBytes (below) call as_ba_grow,
+    // which is defined in the ByteArray section further down. Since it is static,
+    // it needs a prototype before the first call site.
+    this.line('static void as_ba_grow(ByteArray* o, int extra);');
     // ---- flash.filesystem (stage 64): File / FileStream / FileMode ----
     // POSIX filesystem probes. stat() works for both files and directories and is
     // available on native POSIX and WASI alike.
@@ -2518,10 +5567,41 @@ export class Emitter {
     this.line('char* File_get_url(void* _this) { File* o = (File*)_this; return (o->nativePath == NULL) ? (char*)"file://" : as_str_concat((char*)"file://", o->nativePath); }');
     this.line('bool File_get_exists(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_exists(o->nativePath); }');
     this.line('bool File_get_isDirectory(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_is_dir(o->nativePath); }');
+    // isHidden: on POSIX a file is hidden when its basename starts with a dot
+    // (matches the .DS_Store filtering the demo relies on).
+    this.line('bool File_get_isHidden(void* _this) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('if (o->nativePath == NULL) return false;');
+    this.line('const char* base = o->nativePath;');
+    this.line('for (const char* p = o->nativePath; *p; p++) if (*p == \'/\') base = p + 1;');
+    this.line('return base[0] == \'.\';');
+    this.indent--;
+    this.line('}');
     this.line('File* File_resolvePath(void* _this, char* path) { File* o = (File*)_this; return (o->nativePath == NULL) ? File_new(path) : File_new(as_path_join(o->nativePath, path)); }');
     this.line('void File_createDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) as_mkdirs(o->nativePath); }');
     this.line('void File_deleteFile(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) remove(o->nativePath); }');
     this.line('void File_deleteDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) remove(o->nativePath); }');
+    // getDirectoryListing: list a directory's children as File objects (skipping
+    // . and ..), used by AssetManager to recursively enqueue folder contents.
+    this.line('as_array* File_getDirectoryListing(void* _this) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('as_array* result = as_array_new();');
+    this.line('if (o->nativePath == NULL) return result;');
+    this.line('DIR* d = opendir(o->nativePath);');
+    this.line('if (d == NULL) return result;');
+    this.line('struct dirent* e;');
+    this.line('while ((e = readdir(d)) != NULL) {');
+    this.indent++;
+    this.line('if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;');
+    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->nativePath, e->d_name))));');
+    this.indent--;
+    this.line('}');
+    this.line('closedir(d);');
+    this.line('return result;');
+    this.indent--;
+    this.line('}');
     this.line('');
     // FileStream: a FILE* handle + open/close/read/write. AIR FileMode strings are
     // mapped to C fopen modes.
@@ -2543,25 +5623,30 @@ export class Emitter {
     this.line('o->_handle = (void*)fopen(file->nativePath, mode);');
     this.indent--;
     this.line('}');
-    // Async completion thunk for openAsync: reports the full byte count via a
-    // ProgressEvent.PROGRESS then Event.COMPLETE on a later frame tick (AIR reads
-    // the file asynchronously and fires these before the data is consumed).
-    this.line('static as_value FileStream__async(void* env, as_value* args, int argc) {');
+    // Completion thunk for openAsync, run on the AS3 thread inside a frame
+    // boundary: adopt the opened handle, then report the byte count via a
+    // ProgressEvent.PROGRESS followed by Event.COMPLETE (AIR reads the file into
+    // an input buffer asynchronously and fires both before the data is consumed).
+    // The handle is published here and not in openAsync(), so a read attempted
+    // before COMPLETE sees no bytes available - which is what AIR's unbuffered
+    // stream does too.
+    this.line('static void FileStream__openFinish(void* job) {');
     this.indent++;
-    this.line('(void)args; (void)argc;');
-    this.line('FileStream* o = (FileStream*)env;');
-    this.line('unsigned total = 0;');
-    this.line('FILE* f = (FILE*)o->_handle;');
-    this.line('if (f != NULL) { long cur = ftell(f); fseek(f, 0, SEEK_END); total = (unsigned)ftell(f); fseek(f, cur, SEEK_SET); }');
+    this.line('FileStream* o = (FileStream*)as_job_obj(job);');
+    this.line('if (as_job_failed(job)) { EventDispatcher_dispatchEvent((void*)o, (Event*)IOErrorEvent_new((char*)"ioError", false, false, (char*)"FileStream open failed")); return; }');
+    this.line('unsigned total = as_job_total(job);');
+    this.line('o->_handle = as_job_take_handle(job);');
     this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ProgressEvent_new((char*)"progress", false, false, total, total));');
     this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
-    this.line('return as_v_null();');
     this.indent--;
     this.line('}');
     this.line('void FileStream_openAsync(void* _this, File* file, char* fileMode) {');
     this.indent++;
-    this.line('FileStream_open(_this, file, fileMode);');
-    this.line('as_set_timeout(as_fn_make(FileStream__async, (void*)_this), 0.0);');
+    this.line('FileStream* o = (FileStream*)_this;');
+    // AIR closes an already-open file before opening the new one, and delivers no
+    // further events for it.
+    this.line('if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; }');
+    this.line('as_async_submit(AS_JOB_FS_OPEN, (void*)o, FileStream__openFinish, (file != NULL) ? file->nativePath : NULL, fileMode, 0);');
     this.indent--;
     this.line('}');
     this.line('void FileStream_close(void* _this) { FileStream* o = (FileStream*)_this; if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; } }');
@@ -2596,6 +5681,237 @@ export class Emitter {
     this.line('return (unsigned)(end - cur);');
     this.indent--;
     this.line('}');
+    this.line('void FileStream_readBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {');
+    this.indent++;
+    this.line('FileStream* o = (FileStream*)_this;');
+    this.line('FILE* f = (FILE*)o->_handle;');
+    this.line('if (f == NULL || bytes == NULL) return;');
+    this.line('if (length == 0) {');
+    this.indent++;
+    this.line('long cur = ftell(f); fseek(f, 0, SEEK_END); long end = ftell(f); fseek(f, cur, SEEK_SET);');
+    this.line('length = (unsigned)(end - cur);');
+    this.indent--;
+    this.line('}');
+    this.line('as_ba_grow(bytes, (int)(offset + length));');
+    this.line('size_t n = fread((unsigned char*)bytes->data + offset, 1, (size_t)length, f);');
+    this.line('if ((int)(offset + n) > bytes->length) bytes->length = (int)(offset + n);');
+    this.indent--;
+    this.line('}');
+    this.line('void FileStream_writeBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {');
+    this.indent++;
+    this.line('FileStream* o = (FileStream*)_this;');
+    this.line('FILE* f = (FILE*)o->_handle;');
+    this.line('if (f == NULL || bytes == NULL) return;');
+    this.line('if (length == 0) length = (unsigned)(bytes->length - (int)offset);');
+    this.line('if ((int)(offset + length) > bytes->length) length = (unsigned)(bytes->length - (int)offset);');
+    this.line('if (length > 0) fwrite((unsigned char*)bytes->data + offset, 1, (size_t)length, f);');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // ---- flash.net.SharedObject (stage 89·40) ----
+    // Local shared objects, persisted as JSON under applicationStorageDirectory:
+    //   <storage>/[<localPath>/]<name>.json
+    // AIR stores an AMF3 ".sol" container under the per-application Local Store;
+    // this subset has a JSON codec but no AMF3 encoder, so the byte format (and
+    // therefore the exact size values) differ while the observable semantics do
+    // not. Only the local half is implemented — getRemote/connect/send need a
+    // Flash Media Server, so they throw instead of silently doing nothing.
+    this.line('static unsigned int ASC_so_default_encoding = 3u;');
+    this.line('static bool ASC_so_prevent_backup = false;');
+    // mkdir -p for the parent directory of a storage file. A shared-object name
+    // may itself contain slashes (AIR example: getLocal("work/addresses")), and
+    // a non-null localPath becomes a subdirectory.
+    this.line('static void as_so_mkparent(const char* p) {');
+    this.indent++;
+    this.line('if (p == NULL) return;');
+    this.line('const char* slash = NULL;');
+    this.line('for (const char* s = p; *s != \'\\0\'; s++) if (*s == \'/\') slash = s;');
+    this.line('if (slash == NULL || slash == p) return;');
+    this.line('size_t n = (size_t)(slash - p);');
+    this.line('char* dir = as_alloc(n + 1);');
+    this.line('memcpy(dir, p, n); dir[n] = \'\\0\';');
+    this.line('as_mkdirs(dir);');
+    this.indent--;
+    this.line('}');
+    this.line('static char* as_so_path(const char* name, const char* localPath) {');
+    this.indent++;
+    this.line('char* base = as_app_storage_dir();');
+    this.line('if (localPath != NULL && localPath[0] != \'\\0\') base = as_path_join(base, localPath);');
+    this.line('return as_path_join(base, as_str_concat(name == NULL ? (char*)"" : name, (char*)".json"));');
+    this.indent--;
+    this.line('}');
+    // Whole-file read into arena memory (NULL when the file does not exist).
+    this.line('static char* as_so_load_text(const char* p) {');
+    this.indent++;
+    this.line('FILE* f = fopen(p, "rb");');
+    this.line('if (f == NULL) return NULL;');
+    this.line('size_t cap = 4096, len = 0, n = 0;');
+    this.line('char* buf = as_alloc(cap);');
+    this.line('while ((n = fread(buf + len, 1, cap - len - 1, f)) > 0) {');
+    this.indent++;
+    this.line('len += n;');
+    this.line('if (len + 1 >= cap) { char* nb = as_alloc(cap * 2); memcpy(nb, buf, len); buf = nb; cap *= 2; }');
+    this.indent--;
+    this.line('}');
+    this.line('fclose(f);');
+    this.line('buf[len] = \'\\0\';');
+    this.line('return buf;');
+    this.indent--;
+    this.line('}');
+    this.line('void SharedObject_ctor(SharedObject* o) {');
+    this.indent++;
+    this.line('EventDispatcher_ctor((EventDispatcher*)o);');
+    this.line('o->name = NULL;');
+    this.line('o->path = NULL;');
+    this.line('o->_data = as_object_new();');
+    // AIR invokes callback methods on `client`; the default is the shared object
+    // itself (adl-verified: so.client == so).
+    this.line('o->_client = (void*)o;');
+    this.line('o->_objectEncoding = ASC_so_default_encoding;');
+    this.line('o->_fps = 0.0;');
+    this.indent--;
+    this.line('}');
+    this.line('SharedObject* SharedObject_new(void) { SharedObject* o = (SharedObject*)gc_alloc(GCT_CLASS, sizeof(SharedObject)); o->vtable = &SharedObject_vt; SharedObject_ctor(o); return o; }');
+    // Build an instance for a storage path, loading the persisted table when the
+    // file exists. A file that parses to a non-object top level is treated as
+    // empty (as_json_parse skips malformed input rather than reporting it).
+    this.line('static SharedObject* as_so_make(char* name, char* path) {');
+    this.indent++;
+    this.line('SharedObject* o = (SharedObject*)gc_alloc(GCT_CLASS, sizeof(SharedObject));');
+    this.line('o->vtable = &SharedObject_vt;');
+    this.line('SharedObject_ctor(o);');
+    this.line('o->name = name; gc_write_barrier((void*)name);');
+    this.line('o->path = path; gc_write_barrier((void*)path);');
+    this.line('char* text = as_so_load_text(path);');
+    this.line('if (text != NULL && text[0] != \'\\0\') {');
+    this.indent++;
+    this.line('as_value v = as_json_parse(text);');
+    this.line('if (v.tag == 4 && v.ptr != NULL) { o->_data = (as_object*)v.ptr; gc_write_barrier((void*)o->_data); }');
+    this.indent--;
+    this.line('}');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    // flush-all for the exit hook: AIR writes every local shared object when the
+    // application closes, so data set without an explicit flush() still persists
+    // (adl-verified: a .sol appears after the app exits even when flush() was
+    // never called). An object with an empty table is skipped, so clear() keeps
+    // its observable effect of removing the backing file.
+    this.line('static int as_so_flush(SharedObject* o);');
+    this.line('static void as_so_flush_all(void) {');
+    this.indent++;
+    this.line('if (SharedObject__cache == NULL) return;');
+    this.line('for (int i = 0; i < SharedObject__cache->length; i++) {');
+    this.indent++;
+    this.line('SharedObject* c = (SharedObject*)as_v_obj_val(SharedObject__cache->data[i]);');
+    this.line('if (c == NULL || c->path == NULL || c->_data == NULL || c->_data->length == 0) continue;');
+    this.line('as_so_flush(c);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // getLocal: one instance per resolved path per process (AIR returns the same
+    // reference for the same name — adl-verified), so two handles to one name
+    // cannot diverge. The cache is a declared static field, hence a GC root.
+    this.line('SharedObject* SharedObject_getLocal_static(char* name, char* localPath, bool secure) {');
+    this.indent++;
+    this.line('(void)secure;  // this subset has no encrypted local store');
+    this.line('if (name == NULL || name[0] == \'\\0\') { as_throw(Error_new((char*)"SharedObject.getLocal: the name parameter must be a non-empty String", 0)); return NULL; }');
+    this.line('char* path = as_so_path(name, localPath);');
+    this.line('if (SharedObject__cache == NULL) { SharedObject__cache = as_array_new(); atexit(as_so_flush_all); }');
+    this.line('for (int i = 0; i < SharedObject__cache->length; i++) {');
+    this.indent++;
+    this.line('SharedObject* c = (SharedObject*)as_v_obj_val(SharedObject__cache->data[i]);');
+    this.line('if (c != NULL && c->path != NULL && strcmp(c->path, path) == 0) return c;');
+    this.indent--;
+    this.line('}');
+    this.line('SharedObject* so = as_so_make(name, path);');
+    this.line('as_array_push(SharedObject__cache, as_v_obj((void*)so));');
+    this.line('return so;');
+    this.indent--;
+    this.line('}');
+    this.line('Object* SharedObject_get_data(void* _this) { SharedObject* o = (SharedObject*)_this; return (Object*)o->_data; }');
+    // size: the byte count of the persisted representation, i.e. the size of the
+    // file flush() writes (AIR: the AMF3 ".sol", which carries a 16-byte header
+    // plus the object name — adl reports 48 bytes for {value:12345}, of which 15
+    // are the AMF payload; ours is the JSON text, so the numbers are smaller but
+    // follow the same rule). AIR reports the projected size even before the first
+    // flush (adl: size=48 with no file on disk yet), so this measures the current
+    // table instead of stat()ing the file.
+    this.line('unsigned int SharedObject_get_size(void* _this) {');
+    this.indent++;
+    this.line('SharedObject* o = (SharedObject*)_this;');
+    this.line('return (unsigned int)strlen(as_json_stringify(as_v_obj((void*)o->_data)));');
+    this.indent--;
+    this.line('}');
+    this.line('Object* SharedObject_get_client(void* _this) { return (Object*)((SharedObject*)_this)->_client; }');
+    this.line('void SharedObject_set_client(void* _this, Object* value) { SharedObject* o = (SharedObject*)_this; o->_client = (void*)value; gc_write_barrier((void*)value); }');
+    this.line('unsigned int SharedObject_get_objectEncoding(void* _this) { return ((SharedObject*)_this)->_objectEncoding; }');
+    this.line('void SharedObject_set_objectEncoding(void* _this, unsigned int value) { ((SharedObject*)_this)->_objectEncoding = value; }');
+    // fps only throttles how often changes are uploaded to a server; a local
+    // object has no server, so the value is stored and otherwise unused.
+    this.line('void SharedObject_set_fps(void* _this, double value) { ((SharedObject*)_this)->_fps = value; }');
+    this.line('unsigned int SharedObject_get_defaultObjectEncoding_static(void* _this) { (void)_this; return ASC_so_default_encoding; }');
+    this.line('void SharedObject_set_defaultObjectEncoding_static(void* _this, unsigned int value) { (void)_this; ASC_so_default_encoding = value; }');
+    this.line('bool SharedObject_get_preventBackup_static(void* _this) { (void)_this; return ASC_so_prevent_backup; }');
+    this.line('void SharedObject_set_preventBackup_static(void* _this, bool value) { (void)_this; ASC_so_prevent_backup = value; }');
+    // flush: synchronously write the table and report the AIR status string.
+    // AIR can return "pending" when the request is queued; a local write either
+    // succeeds or fails, and a failed write is reported as a thrown Error rather
+    // than a silent "pending".
+    this.line('static int as_so_flush(SharedObject* o) {');
+    this.indent++;
+    this.line('if (o->path == NULL) return 1;');
+    this.line('as_so_mkparent(o->path);');
+    this.line('char* json = as_json_stringify(as_v_obj((void*)o->_data));');
+    this.line('FILE* f = fopen(o->path, "wb");');
+    this.line('if (f == NULL) return 0;');
+    this.line('fwrite(json, 1, strlen(json), f);');
+    this.line('fclose(f);');
+    this.line('return 1;');
+    this.indent--;
+    this.line('}');
+    this.line('char* SharedObject_flush(void* _this, int minDiskSpace) {');
+    this.indent++;
+    this.line('(void)minDiskSpace;');
+    this.line('if (!as_so_flush((SharedObject*)_this)) { as_throw(Error_new((char*)"SharedObject.flush: cannot write the storage file", 0)); return (char*)"pending"; }');
+    this.line('return (char*)"flushed";');
+    this.indent--;
+    this.line('}');
+    // clear: purge the table and delete the backing file (AIR does both), while
+    // leaving the object usable — a later flush recreates the file.
+    this.line('void SharedObject_clear(void* _this) {');
+    this.indent++;
+    this.line('SharedObject* o = (SharedObject*)_this;');
+    this.line('o->_data = as_object_new();');
+    this.line('gc_write_barrier((void*)o->_data);');
+    this.line('if (o->path != NULL) remove(o->path);');
+    this.indent--;
+    this.line('}');
+    // close: AIR documents it as affecting remote objects only (adl-verified: a
+    // local object keeps its data, its file and stays usable), so this is a no-op.
+    this.line('void SharedObject_close(void* _this) { (void)_this; }');
+    // setDirty exists so the server can be told which property changed; a local
+    // object tracks dirtiness itself and flush() writes the whole table.
+    this.line('void SharedObject_setDirty(void* _this, char* propertyName) { (void)_this; (void)propertyName; }');
+    this.line('void SharedObject_setProperty(void* _this, char* propertyName, as_value value) {');
+    this.indent++;
+    this.line('SharedObject* o = (SharedObject*)_this;');
+    this.line('if (propertyName == NULL) return;');
+    this.line('as_object_set(o->_data, propertyName, value);');
+    this.indent--;
+    this.line('}');
+    // Remote half: no Flash Media Server exists in this runtime, so these fail
+    // loudly (a message the caller can act on) instead of pretending to work.
+    this.line('SharedObject* SharedObject_getRemote_static(char* name, char* remotePath, as_value persistence, bool secure) {');
+    this.indent++;
+    this.line('(void)name; (void)remotePath; (void)persistence; (void)secure;');
+    this.line('as_throw(Error_new((char*)"SharedObject.getRemote requires a Flash Media Server connection, which this AOT runtime does not provide (only local shared objects are supported)", 0));');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('void SharedObject_connect(void* _this, as_value myConnection, as_value params) { (void)_this; (void)myConnection; (void)params; as_throw(Error_new((char*)"SharedObject.connect requires a Flash Media Server connection, which this AOT runtime does not provide", 0)); }');
+    this.line('void SharedObject_send(void* _this, as_array* arguments) { (void)_this; (void)arguments; as_throw(Error_new((char*)"SharedObject.send requires a Flash Media Server connection, which this AOT runtime does not provide", 0)); }');
     this.line('');
     // Inside-out hit test (Ruffle interactive.rs Avm2MousePick). mouseChildren=true
     // means children are tested first (reverse depth = topmost first) and a hit
@@ -2606,6 +5922,15 @@ export class Emitter {
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)obj;');
     this.line('return x >= o->x && x <= o->x + o->width && y >= o->y && y <= o->y + o->height;');
+    this.indent--;
+    this.line('}');
+    // Sprite.hitTestPoint(x, y, shapeFlag): true when the point falls inside the
+    // sprite's untransformed bounds (shapeFlag is accepted but ignored — this
+    // subset has no vector-shape hit mask, matching the bounds-only as_obj_hit).
+    this.line('bool Sprite_hitTestPoint(void* _this, double x, double y, bool shapeFlag) {');
+    this.indent++;
+    this.line('(void)shapeFlag;');
+    this.line('return as_obj_hit(_this, x, y);');
     this.indent--;
     this.line('}');
     this.line('static void* as_pick_hit(void* obj, double x, double y) {');
@@ -2672,9 +5997,17 @@ export class Emitter {
     this.line('drag_tf = NULL;');
     this.indent--;
     this.line('}');
-    this.line('if (target == NULL) return;');
+    // Starling listens for mouse events on the *native stage* (it then hit-tests
+    // its own Stage3D display tree via TouchProcessor). AIR dispatches these stage
+    // mouse events regardless of whether a native display-list object was hit, so
+    // a miss must NOT drop the event — fall back to the stage itself so Starling's
+    // onTouch still fires. localX/localY stay target-relative; stageX/stageY are
+    // the global (stage-space) coordinates Starling reads.
+    this.line('if (target == NULL) target = _this;');
     this.line('DisplayObject* o = (DisplayObject*)target;');
     this.line('MouseEvent* evt = MouseEvent_new(type, true, false, x - o->x, y - o->y, NULL, false, false, false, false, 0.0);');
+    this.line('evt->stageX = x;');
+    this.line('evt->stageY = y;');
     this.line('EventDispatcher_dispatchEvent(target, (Event*)evt);');
     this.indent--;
     this.line('}');
@@ -2729,6 +6062,7 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('void Graphics_drawRect(void* _this, double x, double y, double w, double h) { as_skia_path_add_rect(((Graphics*)_this)->path, x, y, w, h); }');
+    this.line('void Graphics_drawRoundRect(void* _this, double x, double y, double w, double h, double ew, double eh) { (void)ew; (void)eh; as_skia_path_add_rect(((Graphics*)_this)->path, x, y, w, h); }');
     this.line('void Graphics_drawCircle(void* _this, double x, double y, double r) { as_skia_path_add_circle(((Graphics*)_this)->path, x, y, r); }');
     this.line('void Graphics_clear(void* _this) {');
     this.indent++;
@@ -2752,9 +6086,13 @@ export class Emitter {
     this.line('o->image = NULL; o->pixels = NULL;');
     this.line('if (width > 0 && height > 0) {');
     this.indent++;
-    this.line('o->pixels = (void*)malloc(sizeof(unsigned) * (size_t)(width * height));');
+    // GC heap, not malloc: `pixels` is a GC-traced field (the props table tags it
+    // type 6), so the buffer is reclaimed with its owner. Zeros come free from
+    // gc_alloc; the fill loop below overwrites them anyway.
+    this.line('o->pixels = (void*)gc_alloc(GCT_BYTES, sizeof(unsigned) * (size_t)(width * height));');
     this.line('unsigned a = transparent ? (fillColor >> 24) : 0xFFu;');
     this.line('unsigned argb = (a << 24) | (fillColor & 0xFFFFFFu);');
+    this.line('gc_write_barrier(o->pixels);');
     this.line('unsigned* p = (unsigned*)o->pixels;');
     this.line('for (int i = 0; i < width * height; i++) p[i] = argb;');
     this.indent--;
@@ -2790,8 +6128,19 @@ export class Emitter {
     // dimensions (AS3 loadFile adopts the source image size). On failure the
     // constructor's blank buffer and size are left untouched.
     this.line('int w = 0, h = 0;');
-    this.line('void* px = as_skia_image_decode_rgba(path, &w, &h);');
-    this.line('if (px != NULL) { if (bd->pixels != NULL) free(bd->pixels); bd->pixels = px; bd->width = w; bd->height = h; }');
+    this.line('void* px = as_skia_image_decode_argb(path, &w, &h);');
+    // Same ownership move as Loader_loadBytes: glue malloc -> GC byte buffer.
+    // The OLD buffer is only dropped, never free()d: `pixels` lives on the GC
+    // heap (stage 89-42), and free() on a GC pointer corrupts the GC free list
+    // (exactly the rule BitmapData_dispose documents). This used to read
+    // `free(bd->pixels);`, which abort()ed on the very first successful loadFile
+    // over a user-constructed BitmapData -- `new BitmapData(1,1)` gives pixels a
+    // real GC block, and freeing it wedges the allocator. It stayed hidden
+    // because no regression ever exercised a SUCCESSFUL loadFile (every probe fed
+    // it an undecodable file, which leaves this branch untaken), and because
+    // Loader__imageFinish's twin call is a no-op free(NULL) -- its BitmapData is
+    // built with 0x0, where the constructor leaves pixels NULL.
+    this.line('if (px != NULL) { unsigned* gcpx = (unsigned*)gc_alloc(GCT_BYTES, sizeof(unsigned) * (size_t)(w * h)); memcpy(gcpx, px, sizeof(unsigned) * (size_t)(w * h)); free(px); bd->pixels = (void*)gcpx; gc_write_barrier(bd->pixels); bd->width = w; bd->height = h; }');
     // Keep the SkImage view for the display-list Bitmap render path as well.
     this.line('bd->image = as_skia_image_from_file(path);');
     this.indent--;
@@ -2820,11 +6169,15 @@ export class Emitter {
     // samples source via the INVERSE transform (pixel-center mapping). smoothing toggles
     // nearest-neighbor vs bilinear. colorTransform multiplies+offsets channels when given;
     // blendMode is only ever "normal" (null) in practice. Used by the shmup mipmap chain.
+    // `source` is either a real BitmapData or, through the IBitmapDrawable signature, a
+    // TextField (Starling's TrueTypeCompositor rasterizes native text via draw(TextField)).
+    this.line('static void as_render_object_content(void* canvas, DisplayObject* o);');
+    this.line('static void as_tf_apply_autosize(TextField* tf);');
     this.line('void BitmapData_draw(void* _this, BitmapData* source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {');
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
-    this.line('if (source == NULL || source->pixels == NULL || bd->pixels == NULL) return;');
-    this.line('if (blendMode != NULL && strcmp(blendMode, "normal") != 0) { as_throw(Error_new((char*)"BitmapData.draw: blendMode not implemented")); return; }');
+    this.line('if (source == NULL || bd->pixels == NULL) return;');
+    this.line('if (blendMode != NULL && strcmp(blendMode, "normal") != 0) { as_throw(Error_new((char*)"BitmapData.draw: blendMode not implemented", 0)); return; }');
     this.line('int cx0 = 0, cy0 = 0, cx1 = bd->width, cy1 = bd->height;');
     this.line('if (clipRect != NULL) { cx0 = (int)clipRect->x; cy0 = (int)clipRect->y; cx1 = cx0 + (int)clipRect->width; cy1 = cy0 + (int)clipRect->height; if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0; if (cx1 > bd->width) cx1 = bd->width; if (cy1 > bd->height) cy1 = bd->height; }');
     this.line('double a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;');
@@ -2832,9 +6185,42 @@ export class Emitter {
     this.line('double det = a * d - b * c;');
     this.line('double ia = 1, ib = 0, ic = 0, id = 1, itx = 0, ity = 0;');
     this.line('if (det != 0.0) { ia = d / det; ic = -c / det; itx = (c * ty - d * tx) / det; ib = -b / det; id = a / det; ity = (b * tx - a * ty) / det; }');
-    this.line('const unsigned* sp = (const unsigned*)source->pixels;');
+    // A TextField source has a completely different struct layout than BitmapData,
+    // so it cannot be sampled as `source->pixels`. Rasterize it into a temporary
+    // straight-ARGB buffer first (see below), then fall through to the same
+    // inverse-mapping sampling loop as a plain BitmapData.
+    this.line('const unsigned* sp;');
+    this.line('int sw = 0, sh = 0;');
+    this.line('unsigned* owned = NULL;');
+    this.line('if (as_is(source, &TextField_vt)) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)source;');
+    this.line('as_tf_apply_autosize(tf);');
+    this.line('sw = (int)ceil(tf->width); if (sw < 1) sw = 1;');
+    this.line('sh = (int)ceil(tf->height); if (sh < 1) sh = 1;');
+    this.line('void* surface = as_skia_surface_bake_new(sw, sh);');
+    this.line('if (surface == NULL) return;');
+    this.line('void* canvas = as_skia_surface_canvas(surface);');
+    this.line('as_skia_canvas_clear_transparent(canvas);');
+    this.line('as_render_object_content(canvas, (DisplayObject*)tf);');
+    this.line('owned = (unsigned*)malloc(sizeof(unsigned) * (size_t)(sw * sh));');
+    this.line('if (owned == NULL) { as_skia_surface_delete(surface); return; }');
+    // Read the baked TextField back into the runtime's straight-ARGB layout. The
+    // channel order is settled inside skia_glue (which requests kBGRA_8888
+    // explicitly, because Skia's own kN32 is BGRA on Windows but RGBA on macOS
+    // and Linux); deciding it here instead swapped red and blue on macOS.
+    this.line('if (!as_skia_surface_read_argb(surface, owned, sw, sh)) { free(owned); as_skia_surface_delete(surface); return; }');
+    this.line('as_skia_surface_delete(surface);');
+    this.line('sp = owned;');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('if (source->pixels == NULL) return;');
+    this.line('sp = (const unsigned*)source->pixels;');
+    this.line('sw = source->width; sh = source->height;');
+    this.indent--;
+    this.line('}');
     this.line('unsigned* dp = (unsigned*)bd->pixels;');
-    this.line('int sw = source->width, sh = source->height;');
     this.line('double rm = 1, gm = 1, bm = 1, am = 1, ro = 0, go = 0, bo = 0, ao = 0;');
     this.line('if (ct != NULL) { rm = ct->redMultiplier; gm = ct->greenMultiplier; bm = ct->blueMultiplier; am = ct->alphaMultiplier; ro = ct->redOffset; go = ct->greenOffset; bo = ct->blueOffset; ao = ct->alphaOffset; }');
     this.line('for (int dy = cy0; dy < cy1; dy++) { for (int dx = cx0; dx < cx1; dx++) {');
@@ -2860,6 +6246,7 @@ export class Emitter {
     this.line('dp[dy * bd->width + dx] = (sa << 24) | (sr << 16) | (sg << 8) | sb;');
     this.indent--;
     this.line('} }');
+    this.line('if (owned != NULL) free(owned);');
     this.indent--;
     this.line('}');
     this.line('void Bitmap_ctor(Bitmap* o, BitmapData* bitmapData) {');
@@ -2941,7 +6328,7 @@ export class Emitter {
     this.line('if (dst == NULL || source == NULL || source->pixels == NULL || dst->pixels == NULL || filter == NULL || sourceRect == NULL || destPoint == NULL) return;');
     this.line('int blurX = 0, blurY = 0, quality = 1;');
     this.line('if (as_is(filter, &BlurFilter_vt)) { BlurFilter* b = (BlurFilter*)filter; blurX = (int)b->blurX; blurY = (int)b->blurY; quality = b->quality; }');
-    this.line('else if (as_is(filter, &DropShadowFilter_vt) || as_is(filter, &GlowFilter_vt)) { as_throw(Error_new((char*)"applyFilter: DropShadowFilter/GlowFilter rasterization not implemented")); return; }');
+    this.line('else if (as_is(filter, &DropShadowFilter_vt) || as_is(filter, &GlowFilter_vt)) { as_throw(Error_new((char*)"applyFilter: DropShadowFilter/GlowFilter rasterization not implemented", 0)); return; }');
     this.line('else { return; }');
     this.line('int sx = (int)sourceRect->x, sy = (int)sourceRect->y;');
     this.line('int sw = (int)sourceRect->width, sh = (int)sourceRect->height;');
@@ -2960,6 +6347,83 @@ export class Emitter {
     this.line('free(region); free(blurred);');
     this.indent--;
     this.line('}');
+    // perlinNoise: fill the bitmap with a deterministic hash-based grayscale noise
+    // (an approximation of the Perlin/fractal noise AIR generates; the demo only
+    // needs a textured source for DisplacementMapFilter, not an exact match).
+    this.line('void BitmapData_perlinNoise(void* _this, double baseX, double baseY, unsigned numOctaves, int randomSeed, bool stitch, bool fractalNoise) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('(void)baseX; (void)baseY; (void)numOctaves; (void)stitch; (void)fractalNoise;');
+    this.line('if (bd->pixels == NULL) return;');
+    this.line('unsigned* p = (unsigned*)bd->pixels;');
+    this.line('unsigned seed = (unsigned)randomSeed;');
+    this.line('for (int y = 0; y < bd->height; y++) {');
+    this.indent++;
+    this.line('for (int x = 0; x < bd->width; x++) {');
+    this.indent++;
+    this.line('unsigned h = seed + ((unsigned)x * 73856093u) ^ ((unsigned)y * 19349663u);');
+    this.line('h = (h ^ (h >> 13)) * 1274126177u;');
+    this.line('h = h ^ (h >> 16);');
+    this.line('unsigned g = h & 0xFFu;');
+    this.line('p[(size_t)y * bd->width + x] = 0xFF000000u | (g << 16) | (g << 8) | g;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // dispose: release the raw pixel buffer and the decoded SkImage view (AS3 frees
+    // the bitmap's pixel memory; the object is unusable afterward).
+    this.line('void BitmapData_dispose(void* _this) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('if (bd == NULL) return;');
+    // dispose() drops the pixel buffer instead of free()ing it: the buffer lives
+    // on the GC heap now (free() on it would corrupt the GC's free list). AIR
+    // releases the memory immediately; here the next collection reclaims it.
+    this.line('bd->pixels = NULL;');
+    this.line('if (bd->image != NULL) { as_skia_image_delete(bd->image); bd->image = NULL; }');
+    this.indent--;
+    this.line('}');
+    // setPixels(rect, inputByteArray): copy 32-bit ARGB pixel values out of the
+    // byte array into this bitmap's rectangle. AIR's contract is "32-bit ARGB
+    // pixel values", and ByteArray is BIG-endian by default, so a
+    // writeUnsignedInt(0xAARRGGBB) lands in the array as A,R,G,B bytes -- read
+    // them in that order. Composing the word from individual bytes keeps this
+    // endian-independent (a raw 32-bit load would not be).
+    this.line('void BitmapData_setPixels(void* _this, Rectangle* rect, ByteArray* ba) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('if (bd == NULL || bd->pixels == NULL || rect == NULL || ba == NULL || ba->data == NULL) return;');
+    this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
+    this.line('int w = (int)rect->width, h = (int)rect->height;');
+    this.line('unsigned char* src = (unsigned char*)ba->data;');
+    this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
+    this.line('int px = x0 + x, py = y0 + y;');
+    this.line('if (px < 0 || py < 0 || px >= bd->width || py >= bd->height) continue;');
+    this.line('int i = (y * w + x) * 4;');
+    this.line('unsigned a = src[i], r = src[i + 1], g = src[i + 2], b = src[i + 3];');
+    this.line('((unsigned*)bd->pixels)[py * bd->width + px] = (a << 24) | (r << 16) | (g << 8) | b;');
+    this.line('} }');
+    this.indent--;
+    this.line('}');
+    // copyPixels: blit a source rectangle into this bitmap at destPoint.
+    this.line('void BitmapData_copyPixels(void* _this, BitmapData* src, Rectangle* srcRect, Point* dest, BitmapData* alphaBmp, Point* alphaPt, bool mergeAlpha) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('(void)alphaBmp; (void)alphaPt; (void)mergeAlpha;');
+    this.line('if (bd == NULL || bd->pixels == NULL || src == NULL || src->pixels == NULL || srcRect == NULL || dest == NULL) return;');
+    this.line('int sx0 = (int)srcRect->x, sy0 = (int)srcRect->y;');
+    this.line('int w = (int)srcRect->width, h = (int)srcRect->height;');
+    this.line('int dx0 = (int)dest->x, dy0 = (int)dest->y;');
+    this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
+    this.line('int sx = sx0 + x, sy = sy0 + y, dx = dx0 + x, dy = dy0 + y;');
+    this.line('if (sx < 0 || sy < 0 || sx >= src->width || sy >= src->height) continue;');
+    this.line('if (dx < 0 || dy < 0 || dx >= bd->width || dy >= bd->height) continue;');
+    this.line('((unsigned*)bd->pixels)[dy * bd->width + dx] = ((unsigned*)src->pixels)[sy * src->width + sx];');
+    this.line('} }');
+    this.indent--;
+    this.line('}');
     this.line('');
     // ---- flash.utils.ByteArray (stage 36 runtime support) ----
     // Big-endian byte buffer. as_ba_grow doubles capacity as needed (arena-backed,
@@ -2970,28 +6434,84 @@ export class Emitter {
     this.line('if (need <= o->capacity) return;');
     this.line('int cap = o->capacity > 0 ? o->capacity : 16;');
     this.line('while (cap < need) cap *= 2;');
-    this.line('unsigned char* nd = (unsigned char*)as_alloc((size_t)cap);');
+    this.line('unsigned char* nd = (unsigned char*)gc_alloc(GCT_BYTES, (size_t)cap);');
     this.line('if (o->data != NULL && o->length > 0) memcpy(nd, o->data, (size_t)o->length);');
-    this.line('o->data = (void*)nd; o->capacity = cap;');
+    // The old buffer is simply dropped: it is GC-managed now, so a later
+    // collection reclaims it (arena storage here was the documented leak).
+    // Barrier: `o` may be BLACK (allocated during an incremental cycle) and
+    // `nd` is fresh/white, so the write must be visible to the marker.
+    this.line('o->data = (void*)nd; o->capacity = cap; gc_write_barrier((void*)nd);');
+    this.indent--;
+    this.line('}');
+    // AS3 write* semantics write at the current `position` cursor and advance it
+    // (auto-extending `length`), unlike the append-to-length model above which
+    // serves the absolute-offset callers (FileStream.readBytes / readBytes).
+    // Mixing the two is what previously made VertexData.set numVertices loop
+    // forever: `while (bytesAvailable) writeUnsignedInt(0)` relies on writes
+    // advancing `position` so bytesAvailable (=length-position) shrinks to 0.
+    this.line('static void as_ba_grow_pos(ByteArray* o, int extra) {');
+    this.indent++;
+    this.line('int need = o->position + extra;');
+    this.line('if (need <= o->capacity) return;');
+    this.line('int cap = o->capacity > 0 ? o->capacity : 16;');
+    this.line('while (cap < need) cap *= 2;');
+    this.line('unsigned char* nd = (unsigned char*)gc_alloc(GCT_BYTES, (size_t)cap);');
+    this.line('if (o->data != NULL && o->length > 0) memcpy(nd, o->data, (size_t)o->length);');
+    // The old buffer is simply dropped: it is GC-managed now, so a later
+    // collection reclaims it (arena storage here was the documented leak).
+    // Barrier: `o` may be BLACK (allocated during an incremental cycle) and
+    // `nd` is fresh/white, so the write must be visible to the marker.
+    this.line('o->data = (void*)nd; o->capacity = cap; gc_write_barrier((void*)nd);');
     this.indent--;
     this.line('}');
     // Endianness: ByteArray defaults to big-endian; `endian = Endian.LITTLE_ENDIAN`
     // (a string constant) flips the byte order of multi-byte put/get primitives.
     // The string is compared once per op; AGAL assembly writes at setup time, not
     // per-frame, so the strcmp cost is irrelevant.
-    this.line('static int as_ba_little(ByteArray* o) { return o->endian != NULL && strcmp(o->endian, "littleEndian") == 0; }');
+    // Endianness of a ByteArray. `endian` is a String, so testing it costs a
+    // strcmp -- and readFloat/writeFloat/readUnsignedInt test it per ELEMENT.
+    // In the Starling benchmark that put a strcmp on every float of every
+    // vertex copied by VertexData.copyTo: measured as the single hottest leaf
+    // in the process (26% of the main thread). Strings are immutable, so a
+    // pointer-keyed cache is always correct -- the same pointer can never mean
+    // a different endianness. Two slots cover the littleEndian / bigEndian
+    // pair without eviction churn (the NULL default is slot-filled too).
+    this.line('static int as_ba_little(ByteArray* o) {');
+    this.indent++;
+    this.line('static const char* ba_key[2] = { NULL, NULL };');
+    this.line('static int ba_val[2] = { 0, 0 };');
+    this.line('if (ba_key[0] == o->endian) return ba_val[0];');
+    this.line('if (ba_key[1] == o->endian) return ba_val[1];');
+    this.line('int v = o->endian != NULL && strcmp(o->endian, "littleEndian") == 0;');
+    this.line('ba_key[1] = ba_key[0]; ba_val[1] = ba_val[0];');
+    this.line('ba_key[0] = o->endian; ba_val[0] = v;');
+    this.line('return v;');
+    this.indent--;
+    this.line('}');
+    // Host byte order, so bulk copies can memcpy whenever the ByteArray's
+    // endianness already agrees with the machine's.
+    this.line('static int as_host_little(void) { unsigned x = 1; return *(unsigned char*)&x == 1; }');
     this.line('static void as_ba_put_u16(ByteArray* o, unsigned v) {');
     this.indent++;
-    this.line('unsigned char* d = (unsigned char*)o->data;');
-    this.line('if (as_ba_little(o)) { d[o->length++] = (unsigned char)(v & 0xFF); d[o->length++] = (unsigned char)((v >> 8) & 0xFF); }');
-    this.line('else { d[o->length++] = (unsigned char)((v >> 8) & 0xFF); d[o->length++] = (unsigned char)(v & 0xFF); }');
+    this.line('unsigned char* d = (unsigned char*)o->data; int p = o->position;');
+    this.line('if (as_ba_little(o)) { d[p++] = (unsigned char)(v & 0xFF); d[p++] = (unsigned char)((v >> 8) & 0xFF); }');
+    this.line('else { d[p++] = (unsigned char)((v >> 8) & 0xFF); d[p++] = (unsigned char)(v & 0xFF); }');
+    this.line('o->position = p; if (p > o->length) o->length = p;');
     this.indent--;
     this.line('}');
     this.line('static void as_ba_put_u32(ByteArray* o, unsigned v) {');
     this.indent++;
-    this.line('unsigned char* d = (unsigned char*)o->data;');
-    this.line('if (as_ba_little(o)) { d[o->length++] = (unsigned char)(v & 0xFF); d[o->length++] = (unsigned char)((v >> 8) & 0xFF); d[o->length++] = (unsigned char)((v >> 16) & 0xFF); d[o->length++] = (unsigned char)((v >> 24) & 0xFF); }');
-    this.line('else { d[o->length++] = (unsigned char)((v >> 24) & 0xFF); d[o->length++] = (unsigned char)((v >> 16) & 0xFF); d[o->length++] = (unsigned char)((v >> 8) & 0xFF); d[o->length++] = (unsigned char)(v & 0xFF); }');
+    this.line('unsigned char* d = (unsigned char*)o->data; int p = o->position;');
+    // Host-order fast path (like the bulk memcpy in uploadFromByteArray): when
+    // the ByteArray's endianness already matches the machine, the AS3 byte
+    // sequence is exactly the in-memory word, so one 32-bit store replaces four
+    // shifted byte stores. Observable bytes are unchanged either way -- see
+    // examples/reg-bytearray-endian.as. readFloat/writeFloat dominate the
+    // Starling vertex-batch copy, so this is on the per-frame hot path.
+    this.line('if (as_ba_little(o) == as_host_little()) { memcpy(d + p, &v, 4); p += 4; }');
+    this.line('else if (as_ba_little(o)) { d[p++] = (unsigned char)(v & 0xFF); d[p++] = (unsigned char)((v >> 8) & 0xFF); d[p++] = (unsigned char)((v >> 16) & 0xFF); d[p++] = (unsigned char)((v >> 24) & 0xFF); }');
+    this.line('else { d[p++] = (unsigned char)((v >> 24) & 0xFF); d[p++] = (unsigned char)((v >> 16) & 0xFF); d[p++] = (unsigned char)((v >> 8) & 0xFF); d[p++] = (unsigned char)(v & 0xFF); }');
+    this.line('o->position = p; if (p > o->length) o->length = p;');
     this.indent--;
     this.line('}');
     this.line('static unsigned as_ba_get_u16(ByteArray* o) {');
@@ -3003,8 +6523,10 @@ export class Emitter {
     this.line('}');
     this.line('static unsigned as_ba_get_u32(ByteArray* o) {');
     this.indent++;
-    this.line('unsigned char* d = (unsigned char*)o->data;');
-    this.line('unsigned v = as_ba_little(o) ? ((unsigned)d[o->position] | ((unsigned)d[o->position + 1] << 8) | ((unsigned)d[o->position + 2] << 16) | ((unsigned)d[o->position + 3] << 24)) : (((unsigned)d[o->position] << 24) | ((unsigned)d[o->position + 1] << 16) | ((unsigned)d[o->position + 2] << 8) | (unsigned)d[o->position + 3]);');
+    this.line('unsigned char* d = (unsigned char*)o->data; unsigned v;');
+    this.line('if (as_ba_little(o) == as_host_little()) memcpy(&v, d + o->position, 4);');
+    this.line('else if (as_ba_little(o)) v = ((unsigned)d[o->position] | ((unsigned)d[o->position + 1] << 8) | ((unsigned)d[o->position + 2] << 16) | ((unsigned)d[o->position + 3] << 24));');
+    this.line('else v = (((unsigned)d[o->position] << 24) | ((unsigned)d[o->position + 1] << 16) | ((unsigned)d[o->position + 2] << 8) | (unsigned)d[o->position + 3]);');
     this.line('o->position += 4; return v;');
     this.indent--;
     this.line('}');
@@ -3012,36 +6534,50 @@ export class Emitter {
     this.line('ByteArray* ByteArray_new(void) { ByteArray* o = (ByteArray*)gc_alloc(GCT_CLASS, sizeof(ByteArray)); o->vtable = &ByteArray_vt; ByteArray_ctor(o); return o; }');
     this.line('void ByteArray_writeByte(void* _this, int v) {');
     this.indent++;
-    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow(o, 1);');
-    this.line('((unsigned char*)o->data)[o->length++] = (unsigned char)(v & 0xFF);');
+    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow_pos(o, 1);');
+    this.line('((unsigned char*)o->data)[o->position++] = (unsigned char)(v & 0xFF);');
+    this.line('if (o->position > o->length) o->length = o->position;');
     this.indent--;
     this.line('}');
     this.line('void ByteArray_writeShort(void* _this, int v) {');
     this.indent++;
-    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow(o, 2); as_ba_put_u16(o, (unsigned)v);');
+    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow_pos(o, 2); as_ba_put_u16(o, (unsigned)v);');
     this.indent--;
     this.line('}');
     this.line('void ByteArray_writeInt(void* _this, int v) {');
     this.indent++;
-    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow(o, 4); as_ba_put_u32(o, (unsigned)v);');
+    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow_pos(o, 4); as_ba_put_u32(o, (unsigned)v);');
     this.indent--;
     this.line('}');
     this.line('void ByteArray_writeUnsignedInt(void* _this, unsigned v) {');
     this.indent++;
-    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow(o, 4); as_ba_put_u32(o, v);');
+    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow_pos(o, 4); as_ba_put_u32(o, v);');
     this.indent--;
     this.line('}');
     this.line('void ByteArray_writeFloat(void* _this, double v) {');
     this.indent++;
-    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow(o, 4);');
+    this.line('ByteArray* o = (ByteArray*)_this; as_ba_grow_pos(o, 4);');
     this.line('float f = (float)v; unsigned bits; memcpy(&bits, &f, 4); as_ba_put_u32(o, bits);');
     this.indent--;
     this.line('}');
     this.line('void ByteArray_writeUTFBytes(void* _this, char* s) {');
     this.indent++;
     this.line('ByteArray* o = (ByteArray*)_this; if (s == NULL) return;');
-    this.line('int n = (int)strlen(s); as_ba_grow(o, n);');
-    this.line('memcpy((unsigned char*)o->data + o->length, s, (size_t)n); o->length += n;');
+    this.line('int n = (int)strlen(s); as_ba_grow_pos(o, n);');
+    this.line('memcpy((unsigned char*)o->data + o->position, s, (size_t)n); o->position += n;');
+    this.line('if (o->position > o->length) o->length = o->position;');
+    this.indent--;
+    this.line('}');
+    // writeUTF = a 16-bit byte length (respecting `endian`, like readUTF) followed
+    // by the raw UTF-8 bytes, so readUTF round-trips it.
+    this.line('void ByteArray_writeUTF(void* _this, char* value) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this; if (value == NULL) value = (char*)"";');
+    this.line('int n = (int)strlen(value); as_ba_grow_pos(o, n + 2);');
+    this.line('as_ba_put_u16(o, (unsigned)n);');
+    this.line('if (n > 0) memcpy((unsigned char*)o->data + o->position, value, (size_t)n);');
+    this.line('o->position += n;');
+    this.line('if (o->position > o->length) o->length = o->position;');
     this.indent--;
     this.line('}');
     this.line('int ByteArray_readByte(void* _this) {');
@@ -3072,6 +6608,69 @@ export class Emitter {
     this.line('unsigned bits = as_ba_get_u32(o); float f; memcpy(&f, &bits, 4); return (double)f;');
     this.indent--;
     this.line('}');
+    this.line('unsigned ByteArray_readUnsignedByte(void* _this) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this;');
+    this.line('if (o->position >= o->length) return 0;');
+    this.line('return (unsigned)((unsigned char*)o->data)[o->position++];');
+    this.indent--;
+    this.line('}');
+    this.line('unsigned ByteArray_readUnsignedShort(void* _this) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this;');
+    this.line('if (o->position + 2 > o->length) return 0;');
+    this.line('return as_ba_get_u16(o);');
+    this.indent--;
+    this.line('}');
+    this.line('unsigned ByteArray_readUnsignedInt(void* _this) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this;');
+    this.line('if (o->position + 4 > o->length) return 0;');
+    this.line('return as_ba_get_u32(o);');
+    this.indent--;
+    this.line('}');
+    this.line('double ByteArray_readDouble(void* _this) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this;');
+    this.line('if (o->position + 8 > o->length) return 0.0;');
+    this.line('unsigned hi = as_ba_get_u32(o); unsigned lo = as_ba_get_u32(o);');
+    this.line('unsigned long long bits = ((unsigned long long)hi << 32) | lo;');
+    this.line('double r; memcpy(&r, &bits, 8); return r;');
+    this.indent--;
+    this.line('}');
+    this.line('char* ByteArray_readUTF(void* _this) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this;');
+    this.line('if (o->position + 2 > o->length) return (char*)"";');
+    this.line('unsigned n = as_ba_get_u16(o);');
+    this.line('if (o->position + (int)n > o->length) n = (unsigned)(o->length - o->position);');
+    this.line('char* r = (char*)as_str_alloc((size_t)n + 1);');
+    this.line('if (n > 0) memcpy(r, (unsigned char*)o->data + o->position, (size_t)n);');
+    this.line('r[n] = 0; o->position += (int)n; return r;');
+    this.indent--;
+    this.line('}');
+    this.line('void ByteArray_readBytes(void* _this, ByteArray* dst, unsigned offset, unsigned length) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this; if (dst == NULL) return;');
+    this.line('if (length == 0) length = (unsigned)(o->length - o->position);');
+    this.line('if (o->position + (int)length > o->length) length = (unsigned)(o->length - o->position);');
+    this.line('as_ba_grow(dst, (int)(offset + length));');
+    this.line('if (length > 0) memcpy((unsigned char*)dst->data + offset, (unsigned char*)o->data + o->position, (size_t)length);');
+    this.line('if ((int)(offset + length) > dst->length) dst->length = (int)(offset + length);');
+    this.line('o->position += (int)length;');
+    this.indent--;
+    this.line('}');
+    this.line('void ByteArray_writeBytes(void* _this, ByteArray* src, unsigned offset, unsigned length) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this; if (src == NULL) return;');
+    this.line('if (length == 0) length = (unsigned)(src->length - (int)offset);');
+    this.line('if ((int)(offset + length) > src->length) length = (unsigned)(src->length - (int)offset);');
+    this.line('as_ba_grow_pos(o, (int)length);');
+    this.line('if (length > 0) memcpy((unsigned char*)o->data + o->position, (unsigned char*)src->data + offset, (size_t)length);');
+    this.line('o->position += (int)length;');
+    this.line('if (o->position > o->length) o->length = o->position;');
+    this.indent--;
+    this.line('}');
     this.line('char* ByteArray_readUTFBytes(void* _this, int n) {');
     this.indent++;
     this.line('ByteArray* o = (ByteArray*)_this;');
@@ -3086,6 +6685,35 @@ export class Emitter {
     this.line('int ByteArray_get_bytesAvailable(void* _this) {');
     this.indent++;
     this.line('ByteArray* o = (ByteArray*)_this; int a = o->length - o->position; return a > 0 ? a : 0;');
+    this.indent--;
+    this.line('}');
+    // ByteArray.length is an accessor in AS3, not a plain slot: assigning it
+    // resizes the buffer (growing zero-fills, shrinking truncates and pulls
+    // `position` back to the new end). Treating it as a field let Starling's
+    // VertexData.set numVertices claim a length larger than the backing buffer,
+    // and the next write overran the allocation (SIGSEGV in as_ba_grow_pos).
+    this.line('int ByteArray_get_length(void* _this) { return ((ByteArray*)_this)->length; }');
+    this.line('void ByteArray_set_length(void* _this, unsigned value) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this; int n = (int)value;');
+    this.line('if (n < 0 || (unsigned)n != value) { as_throw(RangeError_new((char*)"The length property of a ByteArray cannot be negative", 0)); return; }');
+    this.line('if (n > o->capacity) {');
+    this.indent++;
+    this.line('int cap = o->capacity > 0 ? o->capacity : 16;');
+    this.line('while (cap < n && cap < 0x40000000) cap *= 2;');
+    this.line('if (cap < n) { as_throw(RangeError_new((char*)"ByteArray length is too large", 0)); return; }');
+    this.line('unsigned char* nd = (unsigned char*)gc_alloc(GCT_BYTES, (size_t)cap);');
+    this.line('if (o->data != NULL && o->length > 0) memcpy(nd, o->data, (size_t)o->length);');
+    this.line('if (n > o->length) memset(nd + o->length, 0, (size_t)(n - o->length));');
+    this.line('o->data = (void*)nd; o->capacity = cap; gc_write_barrier((void*)nd);');
+    this.indent--;
+    this.line('} else if (n > o->length && o->data != NULL) {');
+    this.indent++;
+    this.line('memset((unsigned char*)o->data + o->length, 0, (size_t)(n - o->length));');
+    this.indent--;
+    this.line('}');
+    this.line('o->length = n;');
+    this.line('if (o->position > n) o->position = n;');
     this.indent--;
     this.line('}');
     // ByteArray[index] reads the byte at an absolute index (does not advance
@@ -3105,10 +6733,10 @@ export class Emitter {
     this.line('(void)o; // no zlib on WASI: compress is a documented no-op');
     this.line('#else');
     this.line('uLongf dst = compressBound((uLong)o->length);');
-    this.line('unsigned char* tmp = (unsigned char*)as_alloc((size_t)dst);');
+    this.line('unsigned char* tmp = (unsigned char*)gc_alloc(GCT_BYTES, (size_t)dst);');
     this.line('if (compress(tmp, &dst, (const unsigned char*)o->data, (uLong)o->length) == Z_OK) {');
     this.indent++;
-    this.line('o->data = (void*)tmp; o->length = (int)dst; o->capacity = (int)dst; o->position = 0;');
+    this.line('o->data = (void*)tmp; o->length = (int)dst; o->capacity = (int)dst; o->position = 0; gc_write_barrier((void*)tmp);');
     this.indent--;
     this.line('}');
     this.line('#endif');
@@ -3123,10 +6751,11 @@ export class Emitter {
     this.line('uLongf cap = (uLong)o->length * 4 + 64;');
     this.line('for (int attempt = 0; attempt < 8; attempt++) {');
     this.indent++;
-    this.line('unsigned char* out = (unsigned char*)as_alloc((size_t)cap);');
+    this.line('unsigned char* out = (unsigned char*)gc_alloc(GCT_BYTES, (size_t)cap);');
     this.line('uLongf dst = cap;');
     this.line('int rc = uncompress(out, &dst, (const unsigned char*)o->data, (uLong)o->length);');
-    this.line('if (rc == Z_OK) { o->data = (void*)out; o->length = (int)dst; o->capacity = (int)dst; o->position = 0; break; }');
+    // A failed attempt's buffer is dropped (GC garbage); only the successful one is installed.
+    this.line('if (rc == Z_OK) { o->data = (void*)out; o->length = (int)dst; o->capacity = (int)dst; o->position = 0; gc_write_barrier((void*)out); break; }');
     this.line('if (rc != Z_BUF_ERROR) break;');
     this.line('cap *= 2;');
     this.indent--;
@@ -3138,7 +6767,7 @@ export class Emitter {
     // ---- flash.text (stage 38) ----
     this.line('void TextFormat_ctor(TextFormat* o, char* font, double size, unsigned color, bool bold, bool italic, double leading) {');
     this.indent++;
-    this.line('o->font = font; o->size = size; o->color = color; o->bold = bold; o->italic = italic; o->leading = leading;');
+    this.line('o->font = font; o->size = size; o->color = color; o->bold = bold; o->italic = italic; o->underline = false; o->align = NULL; o->leading = leading; o->kerning = false; o->letterSpacing = 0.0;');
     this.line('gc_write_barrier((void*)font);');
     this.indent--;
     this.line('}');
@@ -3181,6 +6810,7 @@ export class Emitter {
     this.line('o->_para_color = 0u;');
     this.line('o->_para_collapse = 0;');
     this.line('o->_para_leading = 0.0;');
+    this.line('o->_para_align = 0;');
     this.line('o->_sel_begin = -1;');
     this.line('o->_sel_end = -1;');
     this.line('o->_sel_caret = -1;');
@@ -3198,6 +6828,19 @@ export class Emitter {
     // width change re-flows automatically (AIR re-wraps when width changes too).
     // scrollV/maxScrollV remain a viewport-line concern (numLines - visibleLines +
     // 1) computed from SkParagraph's line metrics; SkParagraph does not model it.
+    // flash.text.TextFormat.align (TextFormatAlign.LEFT/CENTER/RIGHT/JUSTIFY),
+    // mapped to SkParagraph's TextAlign enum (kLeft=0, kRight=1, kCenter=2,
+    // kJustify=3). Starling's own TextFormat.horizontalAlign is copied onto the
+    // native field's `align` by TextFormat.toNativeFormat.
+    this.line('static int as_tf_align_index(TextFormat* fmt) {');
+    this.indent++;
+    this.line('if (fmt == NULL || fmt->align == NULL) return 0;');
+    this.line('if (strcmp(fmt->align, "center") == 0) return 2;');
+    this.line('if (strcmp(fmt->align, "right") == 0) return 1;');
+    this.line('if (strcmp(fmt->align, "justify") == 0) return 3;');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
     this.line('static void* as_tf_paragraph(TextField* tf) {');
     this.indent++;
     this.line('if (tf->text == NULL || tf->defaultTextFormat == NULL) return NULL;');
@@ -3214,12 +6857,40 @@ export class Emitter {
     // official wordWrap example sets only wordWrap). multiline instead controls
     // whether explicit '\n' hard breaks are honored (collapse), not whether the
     // field auto-wraps.
-    this.line('double w = (tf->wordWrap && tf->width > 0.0) ? tf->width : 0.0;');
+    //
+    // The usable width is width - 4, NOT width: AIR lays text out inside a 2px
+    // inset on each side, so a candidate line exactly as wide as the field still
+    // wraps. Measured against adl 51.4.1 with a Verdana-24 run of ink 124.945px:
+    // AIR keeps it on one line only from width 129 (= ceil(ink + 4)); laying out
+    // against the un-inset width wrapped at 125, i.e. one word later than AIR
+    // exactly at the boundary. Same inset autoSize/maxScrollH already assume
+    // (width = textWidth + 4, below) — only the wrap threshold forgot it.
+    this.line('double w = 0.0;');
+    this.line('if (tf->wordWrap && tf->width > 0.0) {');
+    this.indent++;
+    this.line('w = tf->width - 4.0;');
+    // A field narrower than its own inset leaves no usable width. Clamp above 0
+    // rather than let it go <= 0: the glue reads width <= 0 as "no wrapping" (it
+    // substitutes 1e9), which would silently turn a very narrow field into a
+    // non-wrapping one instead of wrapping every word.
+    this.line('if (w < 1.0) w = 1.0;');
+    this.indent--;
+    this.line('}');
     this.line('int collapse = tf->multiline ? 0 : 1;');
+    // Horizontal alignment. SkParagraph can only align within a layout width, so
+    // it must stay kLeft when there is none (the glue substitutes 1e9 for a zero
+    // width, and centering inside 1e9 would shove the text far to the right);
+    // as_tf_align_dx below applies the alignment as a block shift in that case.
+    // AIR honours horizontalAlign on a non-wrapping field too -- that is exactly
+    // how Starling's TrueTypeCompositor centers native text (it draws the field
+    // into a bitmap sized to textWidth and offsets by (width - textWidth) / 2).
+    this.line('int align = as_tf_align_index(tf->defaultTextFormat);');
+    this.line('int layoutAlign = (w > 0.0) ? align : 0;');
     this.line('int hasRuns = (tf->_runs != NULL && tf->_runs->length > 0);');
     this.line('if (tf->_para != NULL && tf->_para_text == tf->text && tf->_para_w == w &&');
     this.line('    tf->_para_size == size && tf->_para_bold == bold && tf->_para_italic == italic &&');
     this.line('    tf->_para_color == color && tf->_para_collapse == collapse && tf->_para_leading == leading &&');
+    this.line('    tf->_para_align == layoutAlign &&');
     this.line('    hasRuns == 0) {');
     this.indent++;
     this.line('return tf->_para;');
@@ -3250,11 +6921,11 @@ export class Emitter {
     this.line('runs[i].leading = rf->leading;');
     this.indent--;
     this.line('}');
-    this.line('tf->_para = as_skia_textlayout_new_runs(tf->text, runs, n, w, 0, collapse);');
+    this.line('tf->_para = as_skia_textlayout_new_runs(tf->text, runs, n, w, layoutAlign, collapse);');
     this.indent--;
     this.line('} else {');
     this.indent++;
-    this.line('tf->_para = as_skia_textlayout_new_leading(tf->text, fmt->font, size, bold, italic, color, leading, w, 0, collapse);');
+    this.line('tf->_para = as_skia_textlayout_new_leading(tf->text, fmt->font, size, bold, italic, color, leading, w, layoutAlign, collapse);');
     this.indent--;
     this.line('}');
     this.line('tf->_para_text = tf->text;');
@@ -3265,7 +6936,27 @@ export class Emitter {
     this.line('tf->_para_color = color;');
     this.line('tf->_para_collapse = collapse;');
     this.line('tf->_para_leading = leading;');
+    this.line('tf->_para_align = layoutAlign;');
     this.line('return tf->_para;');
+    this.indent--;
+    this.line('}');
+    // Horizontal-align offset for a field with no layout width (wordWrap off):
+    // SkParagraph had no box to align within, so shift the whole block here. AIR
+    // still centers/right-aligns inside the field's box even without wrapping --
+    // Starling's TrueTypeCompositor depends on it. The 2px text inset AIR keeps on
+    // the left and right edges cancels out for centering and is subtracted for
+    // right alignment.
+    this.line('static double as_tf_align_dx(TextField* tf) {');
+    this.indent++;
+    this.line('if (tf->defaultTextFormat == NULL) return 0.0;');
+    this.line('if (tf->wordWrap && tf->width > 0.0) return 0.0;');
+    this.line('int a = as_tf_align_index(tf->defaultTextFormat);');
+    this.line('if (a != 1 && a != 2) return 0.0;');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para == NULL) return 0.0;');
+    this.line('double tw = as_skia_textlayout_max_width(para);');
+    this.line('if (a == 2) return (tf->width - 4.0 - tw) / 2.0;');
+    this.line('return tf->width - 4.0 - tw;');
     this.indent--;
     this.line('}');
     this.line('static double as_tf_line_height(TextField* tf) {');
@@ -3500,6 +7191,27 @@ export class Emitter {
     this.line('return v;');
     this.indent--;
     this.line('}');
+    // Attribute-value reader for the HTML subset. AIR quotes attribute values with
+    // EITHER quote style (`color="#ff0000"` and `color=\'#ff0000\'` are equally
+    // valid), so the value must be delimited by the quote that actually opened it.
+    // Returns the position just past the value (and past its closing quote) so the
+    // caller's scan resumes at the next separator.
+    this.line('static char* as_tf_html_attr_value(char* s, char* out, int cap) {');
+    this.indent++;
+    this.line('char q = 0;');
+    this.line('if (*s == \'"\' || *s == \'\\\'\') q = *s++;');
+    this.line('int n = 0;');
+    this.line('while (*s && n < cap - 1) {');
+    this.indent++;
+    this.line('if (q != 0) { if (*s == q) { s++; break; } }');
+    this.line('else if (*s == \' \' || *s == \'"\' || *s == \'\\\'\' || *s == \'/\') break;');
+    this.line('out[n++] = *s++;');
+    this.indent--;
+    this.line('}');
+    this.line('out[n] = 0;');
+    this.line('return s;');
+    this.indent--;
+    this.line('}');
     this.line('static void as_tf_html_set(TextField* tf, char* html) {');
     this.indent++;
     this.line('if (tf->_runs != NULL) { as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_runs = NULL; }');
@@ -3559,14 +7271,16 @@ export class Emitter {
     this.line('while (*s) {');
     this.indent++;
     this.line('while (*s == \' \' || *s == \'/\') s++;');
-    this.line('if (strncmp(s, "color=", 6) == 0) { s += 6; if (*s == \'"\') s++; if (*s == \'#\') s++; color = (unsigned)as_tf_html_parse_hex(s); }');
-    this.line('else if (strncmp(s, "size=", 5) == 0) { s += 5; if (*s == \'"\') s++; size = atof(s); if (size < 1.0) size = 1.0; }');
-    this.line('else if (strncmp(s, "face=", 5) == 0) { s += 5; if (*s == \'"\') s++; char* e = s; while (*e && *e != \'"\' && *e != \' \' && *e != \'/\') e++; int fl = (int)(e - s); face = as_str_alloc((size_t)fl + 1); memcpy(face, s, (size_t)fl); face[fl] = 0; s = e; }');
-    // Advance past the just-parsed attribute value. A bare '"' (the closing
-    // quote of an attribute) must be skipped too, otherwise the outer `while (*s)`
-    // re-examines it, matches no branch, and spins forever on the same quote.
-    this.line('while (*s && *s != \' \' && *s != \'"\') s++;');
-    this.line('if (*s == \'"\') s++;');
+    this.line('if (strncmp(s, "color=", 6) == 0) { char v[32]; s = as_tf_html_attr_value(s + 6, v, 32); color = (unsigned)as_tf_html_parse_hex(v[0] == \'#\' ? v + 1 : v); }');
+    this.line('else if (strncmp(s, "size=", 5) == 0) { char v[32]; s = as_tf_html_attr_value(s + 5, v, 32); size = atof(v); if (size < 1.0) size = 1.0; }');
+    this.line('else if (strncmp(s, "face=", 5) == 0) { char v[128]; s = as_tf_html_attr_value(s + 5, v, 128); int fl = (int)strlen(v); face = as_str_alloc((size_t)fl + 1); memcpy(face, v, (size_t)fl); face[fl] = 0; }');
+    // Advance past the just-parsed attribute value. A recognised value was already
+    // consumed by as_tf_html_attr_value (together with its closing quote, single or
+    // double); for an unrecognised token both quote kinds must be skipped, otherwise
+    // the outer `while (*s)` re-examines the same quote, matches no branch, and spins
+    // forever on it.
+    this.line('while (*s && *s != \' \' && *s != \'"\' && *s != \'\\\'\') s++;');
+    this.line('if (*s == \'"\' || *s == \'\\\'\') s++;');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -3587,6 +7301,26 @@ export class Emitter {
     this.line('as_tf_html_emit_run(tf, runStart, opos, face, size, color, bold, italic, underline);');
     this.line('out[opos] = 0;');
     this.line('tf->text = out;');
+    this.indent--;
+    this.line('}');
+    // ".text = ..." setter: a plain-text assignment replaces the whole content, so
+    // the cached SkParagraph and any rich-text runs a previous htmlText /
+    // setTextFormat installed are dropped (AIR semantics: the new content is laid
+    // out from defaultTextFormat alone). Without this a field that once used
+    // htmlText keeps replaying those runs on ALL later plain text — Starling's
+    // TrueTypeCompositor reuses one static native TextField for every text it
+    // composes, so entering a scene with HTML text silently re-sized every
+    // plain-text label drawn afterwards (textHeight 29 -> 38 at the same font).
+    // `_runs` is a GC array, so dropping the reference is enough to retire it.
+    this.line('void TextField_set_text(void* _this, char* value) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('as_skia_textlayout_delete(tf->_para);');
+    this.line('tf->_para = NULL;');
+    this.line('tf->_para_text = NULL;');
+    this.line('tf->_runs = NULL;');
+    this.line('tf->text = value;');
+    this.line('gc_write_barrier((void*)value);');
     this.indent--;
     this.line('}');
     this.line('void TextField_set_htmlText(void* _this, char* value) { as_tf_html_set((TextField*)_this, value); }');
@@ -3625,6 +7359,7 @@ export class Emitter {
     this.line('void Rectangle_set_bottom(void* _this, double value) { Rectangle* r = (Rectangle*)_this; r->height = value - r->y; }');
     this.line('bool Rectangle_isEmpty(void* _this) { Rectangle* r = (Rectangle*)_this; return r->width <= 0.0 || r->height <= 0.0; }');
     this.line('void Rectangle_setEmpty(void* _this) { Rectangle* r = (Rectangle*)_this; r->x = r->y = r->width = r->height = 0.0; }');
+    this.line('void Rectangle_setTo(void* _this, double x, double y, double width, double height) { Rectangle* r = (Rectangle*)_this; r->x = x; r->y = y; r->width = width; r->height = height; }');
     this.line('Rectangle* Rectangle_intersection(void* _this, Rectangle* b) { Rectangle* a = (Rectangle*)_this; double x1 = fmax(a->x, b->x), y1 = fmax(a->y, b->y); double x2 = fmin(a->x + a->width, b->x + b->width), y2 = fmin(a->y + a->height, b->y + b->height); if (x2 < x1 || y2 < y1) return Rectangle_mk(0.0, 0.0, 0.0, 0.0); return Rectangle_mk(x1, y1, x2 - x1, y2 - y1); }');
     this.line('Rectangle* Rectangle_union(void* _this, Rectangle* b) { Rectangle* a = (Rectangle*)_this; double x1 = fmin(a->x, b->x), y1 = fmin(a->y, b->y); double x2 = fmax(a->x + a->width, b->x + b->width), y2 = fmax(a->y + a->height, b->y + b->height); return Rectangle_mk(x1, y1, x2 - x1, y2 - y1); }');
     this.line('bool Rectangle_contains(void* _this, double x, double y) { Rectangle* r = (Rectangle*)_this; return x >= r->x && x < r->x + r->width && y >= r->y && y < r->y + r->height; }');
@@ -3635,23 +7370,28 @@ export class Emitter {
     this.line('void Rectangle_inflate(void* _this, double dx, double dy) { Rectangle* r = (Rectangle*)_this; r->x -= dx; r->width += 2.0 * dx; r->y -= dy; r->height += 2.0 * dy; }');
     this.line('void Rectangle_offset(void* _this, double dx, double dy) { Rectangle* r = (Rectangle*)_this; r->x += dx; r->y += dy; }');
     this.line('Rectangle* Rectangle_clone(void* _this) { Rectangle* r = (Rectangle*)_this; return Rectangle_mk(r->x, r->y, r->width, r->height); }');
+    this.line('void Rectangle_copyFrom(void* _this, Rectangle* src) { Rectangle* r = (Rectangle*)_this; r->x = src->x; r->y = src->y; r->width = src->width; r->height = src->height; }');
     this.line('char* Rectangle_toString(void* _this) { Rectangle* r = (Rectangle*)_this; char* b = as_str_alloc(96); snprintf(b, 96, "(x=%s, y=%s, w=%s, h=%s)", as_str_from_double(r->x), as_str_from_double(r->y), as_str_from_double(r->width), as_str_from_double(r->height)); return b; }');
     this.line('');
     this.line('static Matrix* Matrix_mk(double a, double b, double c, double d, double tx, double ty) { Matrix* m = (Matrix*)gc_alloc(GCT_CLASS, sizeof(Matrix)); m->vtable = &Matrix_vt; m->a = a; m->b = b; m->c = c; m->d = d; m->tx = tx; m->ty = ty; return m; }');
     this.line('void Matrix_ctor(Matrix* o, double a, double b, double c, double d, double tx, double ty) { o->a = a; o->b = b; o->c = c; o->d = d; o->tx = tx; o->ty = ty; }');
     this.line('Matrix* Matrix_new(double a, double b, double c, double d, double tx, double ty) { Matrix* o = (Matrix*)gc_alloc(GCT_CLASS, sizeof(Matrix)); o->vtable = &Matrix_vt; Matrix_ctor(o, a, b, c, d, tx, ty); return o; }');
     this.line('void Matrix_identity(void* _this) { Matrix* m = (Matrix*)_this; m->a = 1.0; m->b = 0.0; m->c = 0.0; m->d = 1.0; m->tx = 0.0; m->ty = 0.0; }');
-    this.line('void Matrix_translate(void* _this, double dx, double dy) { Matrix* m = (Matrix*)_this; m->tx += m->a * dx + m->c * dy; m->ty += m->b * dx + m->d * dy; }');
-    this.line('void Matrix_scale(void* _this, double sx, double sy) { Matrix* m = (Matrix*)_this; m->a *= sx; m->b *= sx; m->c *= sy; m->d *= sy; }');
-    this.line('void Matrix_rotate(void* _this, double angle) { Matrix* m = (Matrix*)_this; double c = cos(angle), s = sin(angle); double a1 = m->a * c + m->c * s, b1 = m->b * c + m->d * s; double c1 = -m->a * s + m->c * c, d1 = -m->b * s + m->d * c; m->a = a1; m->b = b1; m->c = c1; m->d = d1; }');
-    // concat = this * m (apply m first, then this); matrix product is non-commutative.
-    this.line('void Matrix_concat(void* _this, Matrix* q) { Matrix* m = (Matrix*)_this; double a1 = m->a * q->a + m->c * q->b, b1 = m->b * q->a + m->d * q->b; double c1 = m->a * q->c + m->c * q->d, d1 = m->b * q->c + m->d * q->d; double tx1 = m->a * q->tx + m->c * q->ty + m->tx, ty1 = m->b * q->tx + m->d * q->ty + m->ty; m->a = a1; m->b = b1; m->c = c1; m->d = d1; m->tx = tx1; m->ty = ty1; }');
-    this.line('void Matrix_invert(void* _this) { Matrix* m = (Matrix*)_this; double det = m->a * m->d - m->b * m->c; if (det == 0.0) { as_throw(Error_new((char*)"Matrix cannot be inverted")); return; } double na = m->d / det, nb = -m->b / det, nc = -m->c / det, nd = m->a / det; double ntx = (m->c * m->ty - m->d * m->tx) / det, nty = (m->b * m->tx - m->a * m->ty) / det; m->a = na; m->b = nb; m->c = nc; m->d = nd; m->tx = ntx; m->ty = nty; }');
+    this.line('void Matrix_translate(void* _this, double dx, double dy) { Matrix* m = (Matrix*)_this; m->tx += dx; m->ty += dy; }');
+    // AS3 Matrix uses row-vector convention: p' = p * M, so x' = a*x + c*y + tx, y' = b*x + d*y + ty.
+    // scale(sx,sy) = concat(Matrix(sx,0,0,sy,0,0)) => a*=sx; b*=sy; c*=sx; d*=sy; tx*=sx; ty*=sy.
+    this.line('void Matrix_scale(void* _this, double sx, double sy) { Matrix* m = (Matrix*)_this; m->a *= sx; m->b *= sy; m->c *= sx; m->d *= sy; m->tx *= sx; m->ty *= sy; }');
+    this.line('void Matrix_rotate(void* _this, double angle) { Matrix* m = (Matrix*)_this; double c = cos(angle), s = sin(angle); double a1 = m->a * c - m->b * s, b1 = m->a * s + m->b * c; double c1 = m->c * c - m->d * s, d1 = m->c * s + m->d * c; double tx1 = m->tx * c - m->ty * s, ty1 = m->tx * s + m->ty * c; m->a = a1; m->b = b1; m->c = c1; m->d = d1; m->tx = tx1; m->ty = ty1; }');
+    // concat = this * m in row-vector form (apply this first, then m to a point).
+    this.line('void Matrix_concat(void* _this, Matrix* q) { Matrix* m = (Matrix*)_this; double a1 = m->a * q->a + m->b * q->c, b1 = m->a * q->b + m->b * q->d; double c1 = m->c * q->a + m->d * q->c, d1 = m->c * q->b + m->d * q->d; double tx1 = m->tx * q->a + m->ty * q->c + q->tx, ty1 = m->tx * q->b + m->ty * q->d + q->ty; m->a = a1; m->b = b1; m->c = c1; m->d = d1; m->tx = tx1; m->ty = ty1; }');
+    this.line('void Matrix_invert(void* _this) { Matrix* m = (Matrix*)_this; double det = m->a * m->d - m->b * m->c; if (det == 0.0) { as_throw(Error_new((char*)"Matrix cannot be inverted", 0)); return; } double na = m->d / det, nb = -m->b / det, nc = -m->c / det, nd = m->a / det; double ntx = (m->c * m->ty - m->d * m->tx) / det, nty = (m->b * m->tx - m->a * m->ty) / det; m->a = na; m->b = nb; m->c = nc; m->d = nd; m->tx = ntx; m->ty = nty; }');
     this.line('Point* Matrix_transformPoint(void* _this, Point* p) { Matrix* m = (Matrix*)_this; return Point_mk(m->a * p->x + m->c * p->y + m->tx, m->b * p->x + m->d * p->y + m->ty); }');
     this.line('Point* Matrix_deltaTransformPoint(void* _this, Point* p) { Matrix* m = (Matrix*)_this; return Point_mk(m->a * p->x + m->c * p->y, m->b * p->x + m->d * p->y); }');
     this.line('void Matrix_createBox(void* _this, double sx, double sy, double rotation, double tx, double ty) { Matrix* m = (Matrix*)_this; m->a = cos(rotation) * sx; m->b = sin(rotation) * sx; m->c = -sin(rotation) * sy; m->d = cos(rotation) * sy; m->tx = tx; m->ty = ty; }');
     this.line('void Matrix_createGradientBox(void* _this, double width, double height, double rotation, double tx, double ty) { Matrix* m = (Matrix*)_this; m->a = width / 1638.4; m->d = height / 1638.4; if (rotation != 0.0) { double c = cos(rotation), s = sin(rotation); m->b = s * m->d; m->c = -s * m->a; m->a *= c; m->d *= c; } else { m->b = 0.0; m->c = 0.0; } m->tx = tx + width / 2.0; m->ty = ty + height / 2.0; }');
     this.line('Matrix* Matrix_clone(void* _this) { Matrix* m = (Matrix*)_this; return Matrix_mk(m->a, m->b, m->c, m->d, m->tx, m->ty); }');
+    this.line('void Matrix_copyFrom(void* _this, Matrix* src) { Matrix* m = (Matrix*)_this; m->a = src->a; m->b = src->b; m->c = src->c; m->d = src->d; m->tx = src->tx; m->ty = src->ty; }');
+    this.line('void Matrix_setTo(void* _this, double a, double b, double c, double d, double tx, double ty) { Matrix* m = (Matrix*)_this; m->a = a; m->b = b; m->c = c; m->d = d; m->tx = tx; m->ty = ty; }');
     this.line('char* Matrix_toString(void* _this) { Matrix* m = (Matrix*)_this; char* b = as_str_alloc(160); snprintf(b, 160, "(a=%s, b=%s, c=%s, d=%s, tx=%s, ty=%s)", as_str_from_double(m->a), as_str_from_double(m->b), as_str_from_double(m->c), as_str_from_double(m->d), as_str_from_double(m->tx), as_str_from_double(m->ty)); return b; }');
     this.line('');
     this.line('void ColorTransform_ctor(ColorTransform* o, double rm, double gm, double bm, double am, double ro, double go, double bo, double ao) { o->redMultiplier = rm; o->greenMultiplier = gm; o->blueMultiplier = bm; o->alphaMultiplier = am; o->redOffset = ro; o->greenOffset = go; o->blueOffset = bo; o->alphaOffset = ao; }');
@@ -3683,6 +7423,8 @@ export class Emitter {
     this.line('double Vector3D_distance_static(Vector3D* a, Vector3D* b) { double dx = a->x - b->x, dy = a->y - b->y, dz = a->z - b->z; return sqrt(dx * dx + dy * dy + dz * dz); }');
     this.line('double Vector3D_angleBetween_static(Vector3D* a, Vector3D* b) { double dot = a->x * b->x + a->y * b->y + a->z * b->z; double la = sqrt(a->x * a->x + a->y * a->y + a->z * a->z), lb = sqrt(b->x * b->x + b->y * b->y + b->z * b->z); if (la == 0.0 || lb == 0.0) return 0.0; double c = dot / (la * lb); if (c > 1.0) c = 1.0; if (c < -1.0) c = -1.0; return acos(c); }');
     this.line('Vector3D* Vector3D_clone(void* _this) { Vector3D* v = (Vector3D*)_this; return Vector3D_mk(v->x, v->y, v->z, v->w); }');
+    this.line('void Vector3D_setTo(void* _this, double x, double y, double z) { Vector3D* v = (Vector3D*)_this; v->x = x; v->y = y; v->z = z; }');
+    this.line('void Vector3D_project(void* _this) { Vector3D* v = (Vector3D*)_this; if (v->w != 0.0) { v->x /= v->w; v->y /= v->w; v->z /= v->w; } }');
     this.line('bool Vector3D_equals(void* _this, Vector3D* o, bool allFour) { Vector3D* v = (Vector3D*)_this; if (allFour) return v->x == o->x && v->y == o->y && v->z == o->z && v->w == o->w; return v->x == o->x && v->y == o->y && v->z == o->z; }');
     this.line('char* Vector3D_toString(void* _this) { Vector3D* v = (Vector3D*)_this; char* b = as_str_alloc(96); snprintf(b, 96, "Vector3D(%s, %s, %s)", as_str_from_double(v->x), as_str_from_double(v->y), as_str_from_double(v->z)); return b; }');
     this.line('');
@@ -3756,10 +7498,15 @@ export class Emitter {
     this.line('Vector3D* Matrix3D_transformVector(void* _this, Vector3D* v) { Matrix3D* m = (Matrix3D*)_this; return Vector3D_mk(m->_m[0] * v->x + m->_m[4] * v->y + m->_m[8] * v->z + m->_m[12] * v->w, m->_m[1] * v->x + m->_m[5] * v->y + m->_m[9] * v->z + m->_m[13] * v->w, m->_m[2] * v->x + m->_m[6] * v->y + m->_m[10] * v->z + m->_m[14] * v->w, m->_m[3] * v->x + m->_m[7] * v->y + m->_m[11] * v->z + m->_m[15] * v->w); }');
     this.line('Vector3D* Matrix3D_deltaTransformVector(void* _this, Vector3D* v) { Matrix3D* m = (Matrix3D*)_this; return Vector3D_mk(m->_m[0] * v->x + m->_m[4] * v->y + m->_m[8] * v->z, m->_m[1] * v->x + m->_m[5] * v->y + m->_m[9] * v->z, m->_m[2] * v->x + m->_m[6] * v->y + m->_m[10] * v->z, 0.0); }');
     this.line('void Matrix3D_transformVectors(void* _this, as_vector_number* vin, as_vector_number* vout) { Matrix3D* m = (Matrix3D*)_this; int n = vin->length / 3; for (int i = 0; i < n; i++) { double x = vin->data[i * 3], y = vin->data[i * 3 + 1], z = vin->data[i * 3 + 2]; vout->data[i * 3] = m->_m[0] * x + m->_m[4] * y + m->_m[8] * z + m->_m[12]; vout->data[i * 3 + 1] = m->_m[1] * x + m->_m[5] * y + m->_m[9] * z + m->_m[13]; vout->data[i * 3 + 2] = m->_m[2] * x + m->_m[6] * y + m->_m[10] * z + m->_m[14]; } }');
-    // appendTranslation = T * this (translate AFTER): only the last column shifts.
-    this.line('void Matrix3D_appendTranslation(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[12] += x; m->_m[13] += y; m->_m[14] += z; }');
-    // prependTranslation = this * T (translate BEFORE): shift by the current basis.
-    this.line('void Matrix3D_prependTranslation(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[12] += m->_m[0] * x + m->_m[4] * y + m->_m[8] * z; m->_m[13] += m->_m[1] * x + m->_m[5] * y + m->_m[9] * z; m->_m[14] += m->_m[2] * x + m->_m[6] * y + m->_m[10] * z; }');
+    // appendTranslation = T * this (translate AFTER). T pre-multiplies, so each
+    // row r in {0,1,2} gains t_r * (old row 3) — NOT just the last column. For an
+    // affine matrix (row 3 == [0,0,0,1]) this degenerates to shifting only _m[12..14].
+    this.line('void Matrix3D_appendTranslation(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[0] += x * m->_m[3]; m->_m[4] += x * m->_m[7]; m->_m[8] += x * m->_m[11]; m->_m[12] += x * m->_m[15]; m->_m[1] += y * m->_m[3]; m->_m[5] += y * m->_m[7]; m->_m[9] += y * m->_m[11]; m->_m[13] += y * m->_m[15]; m->_m[2] += z * m->_m[3]; m->_m[6] += z * m->_m[7]; m->_m[10] += z * m->_m[11]; m->_m[14] += z * m->_m[15]; }');
+    // prependTranslation = this * T (translate BEFORE). Only the last column c=3
+    // changes: new _m[12+r] = dot(row r, (x,y,z)) + _m[12+r], for ALL four rows —
+    // the w-row (r=3) must be updated too, else a perspective matrix keeps
+    // _m[15]=0 and the w-coordinate collapses (Starling projection SIGSEGV/blank).
+    this.line('void Matrix3D_prependTranslation(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[12] += m->_m[0] * x + m->_m[4] * y + m->_m[8] * z; m->_m[13] += m->_m[1] * x + m->_m[5] * y + m->_m[9] * z; m->_m[14] += m->_m[2] * x + m->_m[6] * y + m->_m[10] * z; m->_m[15] += m->_m[3] * x + m->_m[7] * y + m->_m[11] * z; }');
     // appendScale = S * this (scale AFTER): scales the ROWS (each row of _m).
     this.line('void Matrix3D_appendScale(void* _this, double x, double y, double z) { Matrix3D* m = (Matrix3D*)_this; m->_m[0] *= x; m->_m[4] *= x; m->_m[8] *= x; m->_m[12] *= x; m->_m[1] *= y; m->_m[5] *= y; m->_m[9] *= y; m->_m[13] *= y; m->_m[2] *= z; m->_m[6] *= z; m->_m[10] *= z; m->_m[14] *= z; }');
     // prependScale = this * S (scale BEFORE): scales the COLUMNS of _m.
@@ -3802,6 +7549,8 @@ export class Emitter {
     this.line('Matrix3D* Matrix3D_interpolate_static(Matrix3D* a, Matrix3D* b, double p) { Matrix3D* o = (Matrix3D*)gc_alloc(GCT_CLASS, sizeof(Matrix3D)); o->vtable = &Matrix3D_vt; for (int i = 0; i < 16; i++) o->_m[i] = a->_m[i] + (b->_m[i] - a->_m[i]) * p; return o; }');
     this.line('Matrix3D* Matrix3D_identity_static(void) { Matrix3D* o = (Matrix3D*)gc_alloc(GCT_CLASS, sizeof(Matrix3D)); o->vtable = &Matrix3D_vt; as_mat3d_identity(o->_m); return o; }');
     this.line('void Matrix3D_copyFrom(void* _this, Matrix3D* src) { memcpy(((Matrix3D*)_this)->_m, src->_m, 16 * sizeof(double)); }');
+    this.line('void Matrix3D_copyRawDataTo(void* _this, as_vector_number* v, unsigned int index, bool transpose) { Matrix3D* m = (Matrix3D*)_this; if (v == NULL) return; for (int i = 0; i < 16; i++) { double val = transpose ? m->_m[(i % 4) * 4 + (i / 4)] : m->_m[i]; int j = (int)index + i; if (j < v->length) v->data[j] = val; } }');
+    this.line('void Matrix3D_copyRawDataFrom(void* _this, as_vector_number* v, unsigned int index, bool transpose) { Matrix3D* m = (Matrix3D*)_this; if (v == NULL) return; for (int i = 0; i < 16; i++) { int j = (int)index + i; double val = (j < v->length) ? v->data[j] : 0.0; if (transpose) m->_m[(i % 4) * 4 + (i / 4)] = val; else m->_m[i] = val; } }');
     this.line('Matrix3D* Matrix3D_clone(void* _this) { return Matrix3D_mk(((Matrix3D*)_this)->_m); }');
     this.line('as_vector_number* Matrix3D_get_rawData(void* _this) { Matrix3D* m = (Matrix3D*)_this; as_vector_number* v = as_vector_number_new(); for (int i = 0; i < 16; i++) as_vector_number_push(v, m->_m[i]); return v; }');
     this.line('void Matrix3D_set_rawData(void* _this, as_vector_number* v) { Matrix3D* m = (Matrix3D*)_this; int n = v->length < 16 ? v->length : 16; for (int i = 0; i < n; i++) m->_m[i] = v->data[i]; }');
@@ -3855,35 +7604,135 @@ export class Emitter {
     this.indent++;
     this.line('int t = (target != NULL && strcmp(target, "glsl") == 0) ? 1 : 0;');
     this.line('char* r = as_agal_translate((const unsigned char*)bytes->data, bytes->length, t);');
-    this.line('if (r == NULL) { as_throw(Error_new((char*)as_agal_errmsg)); return NULL; }');
+    this.line('if (r == NULL) { as_throw(Error_new((char*)as_agal_errmsg, 0)); return NULL; }');
     this.line('return r;');
     this.indent--;
     this.line('}');
     this.line('');
     // ===== flash.display3D (stage 81): resource classes + Context3D state machine
     // + Stage3D slot. CPU-side only; the GPU upload/draw lands in stage 82. =====
-    this.line('void VertexBuffer3D_ctor(VertexBuffer3D* o) { Object_ctor((Object*)o); o->numVertices = 0; o->data32PerVertex = 0; o->data = NULL; o->startVertex = 0; }');
+    this.line('void VertexBuffer3D_ctor(VertexBuffer3D* o) { Object_ctor((Object*)o); o->numVertices = 0; o->data32PerVertex = 0; o->raw = NULL; o->startVertex = 0; }');
     this.line('VertexBuffer3D* VertexBuffer3D_new(void) { VertexBuffer3D* o = (VertexBuffer3D*)gc_alloc(GCT_CLASS, sizeof(VertexBuffer3D)); o->vtable = &VertexBuffer3D_vt; VertexBuffer3D_ctor(o); return o; }');
+    // Vertex payload storage: one 32-bit word per component, in the order the
+    // upload produced them (absolute vertex index * stride + component offset).
+    // AS3's Vector.<Number> upload goes through float32 (that is what the GPU
+    // receives), so the double is narrowed here once and the submit path never
+    // re-widens/re-narrows it. Element storage is pledged separately for
+    // word-only buffers, so this is 4 bytes per component where the old
+    // data+rawBits double pair kept 16.
+    this.line('static unsigned* VertexBuffer3D_words(VertexBuffer3D* o, int need) {');
+    this.indent++;
+    this.line('if (o->raw == NULL) { as_vector_uint* v = as_vector_uint_new(); o->raw = v; gc_write_barrier((void*)v); }');
+    this.line('if (o->raw->length < need) as_vector_uint_setLength(o->raw, need);');
+    this.line('return o->raw->data;');
+    this.indent--;
+    this.line('}');
     this.line('void VertexBuffer3D_uploadFromVector(void* _this, as_vector_number* data, int startVertex, int numVertices) {');
     this.indent++;
     this.line('VertexBuffer3D* o = (VertexBuffer3D*)_this;');
-    this.line('o->data = data; gc_write_barrier((void*)data);');
-    this.line('o->startVertex = startVertex;');
-    this.line('if (numVertices > 0) o->numVertices = numVertices;');
+    this.line('if (data == NULL || numVertices <= 0) return;');
+    this.line('int stride = o->data32PerVertex;');
+    this.line('if (stride <= 0) return;');
+    // Clamp to the source vector: both indices are absolute vertex indices into
+    // the caller's Vector (uploadFromByteArray works the same way).
+    this.line('int avail = (data->length - startVertex * stride) / stride;');
+    this.line('if (avail < numVertices) numVertices = avail;');
+    this.line('if (numVertices <= 0) return;');
+    this.line('unsigned* dst = VertexBuffer3D_words(o, startVertex * stride + numVertices * stride);');
+    this.line('double* src = data->data + (size_t)startVertex * (size_t)stride;');
+    this.line('int n = numVertices * stride;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('float f = (float)src[i];');
+    this.line('memcpy(dst + startVertex * stride + i, &f, 4);');
     this.indent--;
     this.line('}');
-    this.line('void VertexBuffer3D_dispose(void* _this) { VertexBuffer3D* o = (VertexBuffer3D*)_this; o->data = NULL; }');
+    this.line('o->startVertex = startVertex;');
+    this.line('o->numVertices = numVertices;');
+    this.indent--;
+    this.line('}');
+    this.line('void VertexBuffer3D_dispose(void* _this) { VertexBuffer3D* o = (VertexBuffer3D*)_this; o->raw = NULL; }');
+    // uploadFromByteArray (stage 87): Starling's VertexData stores vertices as
+    // little-endian float32 in a ByteArray (not Vector.<Number>). Copy the words
+    // straight out of the ByteArray (a single memcpy when its endianness matches
+    // the host's) -- no per-element float decode, because the submit path now
+    // interprets the word according to the attribute format.
+    this.line('void VertexBuffer3D_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, int startVertex, int numVertices) {');
+    this.indent++;
+    this.line('VertexBuffer3D* o = (VertexBuffer3D*)_this;');
+    this.line('if (data == NULL || data->data == NULL) return;');
+    this.line('int stride = o->data32PerVertex;');
+    this.line('if (stride <= 0) return;');
+    this.line('int count = numVertices * stride;');
+    this.line('int avail = data->length - (int)byteArrayOffset;');
+    this.line('int maxCount = avail >= 0 ? avail / 4 : 0;');
+    this.line('if (count > maxCount) count = maxCount;');
+    this.line('if (count <= 0) return;');
+    this.line('int uploaded = count / stride;');
+    this.line('if (uploaded <= 0) return;');
+    this.line('unsigned* dst = VertexBuffer3D_words(o, startVertex * stride + count);');
+    this.line('unsigned char* src = (unsigned char*)data->data + byteArrayOffset;');
+    this.line('unsigned* out = dst + (size_t)startVertex * (size_t)stride;');
+    this.line('if (as_ba_little(data) == as_host_little()) {');
+    this.indent++;
+    this.line('memcpy(out, src, (size_t)count * 4);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('for (int i = 0; i < count; i++) out[i] = ((unsigned)src[i*4] << 24) | ((unsigned)src[i*4+1] << 16) | ((unsigned)src[i*4+2] << 8) | (unsigned)src[i*4+3];');
+    this.indent--;
+    this.line('}');
+    this.line('o->startVertex = startVertex;');
+    this.line('o->numVertices = uploaded;');
+    this.indent--;
+    this.line('}');
     this.line('void IndexBuffer3D_ctor(IndexBuffer3D* o) { Object_ctor((Object*)o); o->numIndices = 0; o->data = NULL; o->startIndex = 0; }');
     this.line('IndexBuffer3D* IndexBuffer3D_new(void) { IndexBuffer3D* o = (IndexBuffer3D*)gc_alloc(GCT_CLASS, sizeof(IndexBuffer3D)); o->vtable = &IndexBuffer3D_vt; IndexBuffer3D_ctor(o); return o; }');
     this.line('void IndexBuffer3D_uploadFromVector(void* _this, as_vector_uint* data, int startIndex, int numIndices) {');
     this.indent++;
     this.line('IndexBuffer3D* o = (IndexBuffer3D*)_this;');
-    this.line('o->data = data; gc_write_barrier((void*)data);');
+    this.line('if (data == NULL || numIndices <= 0) return;');
+    // AS3 copies the data into the buffer; aliasing the caller's Vector would let a
+    // later in-place upload mutate an object the AS3 program still owns. Keep our
+    // own copy, indexed by absolute index like uploadFromByteArray.
+    this.line('if (o->data == NULL) { o->data = as_vector_uint_new(); gc_write_barrier((void*)o->data); }');
+    this.line('int need = startIndex + numIndices;');
+    this.line('if (o->data->length < need) as_vector_uint_setLength(o->data, need);');
+    this.line('for (int i = 0; i < numIndices; i++) o->data->data[startIndex + i] = data->data[i];');
     this.line('o->startIndex = startIndex;');
-    this.line('if (numIndices > 0) o->numIndices = numIndices;');
+    this.line('o->numIndices = numIndices;');
     this.indent--;
     this.line('}');
     this.line('void IndexBuffer3D_dispose(void* _this) { IndexBuffer3D* o = (IndexBuffer3D*)_this; o->data = NULL; }');
+    // uploadFromByteArray (stage 87): Starling's IndexData stores indices as
+    // little-endian uint16 (INDEX_SIZE=2) in a ByteArray; widen to uint32 so the
+    // submit path (MTLIndexTypeUInt32) reads the same layout as uploadFromVector.
+    // Reused across uploads for the same reason as the vertex buffer.
+    this.line('void IndexBuffer3D_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, int startIndex, int numIndices) {');
+    this.indent++;
+    this.line('IndexBuffer3D* o = (IndexBuffer3D*)_this;');
+    this.line('if (data == NULL || data->data == NULL) return;');
+    this.line('int count = numIndices;');
+    this.line('int avail = data->length - (int)byteArrayOffset;');
+    this.line('int maxCount = avail >= 0 ? avail / 2 : 0;');
+    this.line('if (count > maxCount) count = maxCount;');
+    this.line('if (count <= 0) return;');
+    this.line('int need = startIndex + count;');
+    this.line('if (o->data == NULL) { o->data = as_vector_uint_new(); gc_write_barrier((void*)o->data); }');
+    this.line('if (o->data->length < need) as_vector_uint_setLength(o->data, need);');
+    this.line('unsigned char* src = (unsigned char*)data->data + byteArrayOffset;');
+    this.line('int little = as_ba_little(data);');
+    this.line('unsigned int* dst = o->data->data + startIndex;');
+    this.line('for (int i = 0; i < count; i++) {');
+    this.indent++;
+    this.line('unsigned v = little ? ((unsigned)src[i*2] | ((unsigned)src[i*2+1] << 8)) : (((unsigned)src[i*2] << 8) | (unsigned)src[i*2+1]);');
+    this.line('dst[i] = (unsigned int)v;');
+    this.indent--;
+    this.line('}');
+    this.line('o->startIndex = startIndex;');
+    this.line('o->numIndices = count;');
+    this.indent--;
+    this.line('}');
     this.line('void Program3D_ctor(Program3D* o) { Object_ctor((Object*)o); o->vertexProgram = NULL; o->fragmentProgram = NULL; }');
     this.line('Program3D* Program3D_new(void) { Program3D* o = (Program3D*)gc_alloc(GCT_CLASS, sizeof(Program3D)); o->vtable = &Program3D_vt; Program3D_ctor(o); return o; }');
     this.line('void Program3D_upload(void* _this, ByteArray* vertexProgram, ByteArray* fragmentProgram) {');
@@ -3897,25 +7746,94 @@ export class Emitter {
     this.line('void TextureBase_ctor(TextureBase* o) { Object_ctor((Object*)o); }');
     this.line('TextureBase* TextureBase_new(void) { TextureBase* o = (TextureBase*)gc_alloc(GCT_CLASS, sizeof(TextureBase)); o->vtable = &TextureBase_vt; TextureBase_ctor(o); return o; }');
     this.line('void TextureBase_dispose(void* _this) { (void)_this; }');
-    this.line('void Texture_ctor(Texture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; o->gpu = NULL; }');
+    this.line('void VideoTexture_ctor(VideoTexture* o) { TextureBase_ctor((TextureBase*)o); o->videoWidth = 0; o->videoHeight = 0; }');
+    this.line('VideoTexture* VideoTexture_new(void) { VideoTexture* o = (VideoTexture*)gc_alloc(GCT_CLASS, sizeof(VideoTexture)); o->vtable = &VideoTexture_vt; VideoTexture_ctor(o); return o; }');
+    this.line('void VideoTexture_dispose(void* _this) { (void)_this; }');
+    this.line('void VideoTexture_attachCamera(void* _this, Object* camera) { (void)_this; (void)camera; }');
+    this.line('void VideoTexture_attachNetStream(void* _this, Object* netStream) { (void)_this; (void)netStream; }');
+    this.line('void Texture_ctor(Texture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; o->gpu = NULL; o->ctx = NULL; }');
     this.line('Texture* Texture_new(void) { Texture* o = (Texture*)gc_alloc(GCT_CLASS, sizeof(Texture)); o->vtable = &Texture_vt; Texture_ctor(o); return o; }');
     this.line('void Texture_uploadFromBitmapData(void* _this, BitmapData* bitmapData, unsigned int miplevel) {');
     this.indent++;
     this.line('Texture* o = (Texture*)_this;');
     // Our GPU texture is a single-level (mipmapped:NO) BGRA8 surface, so only
-    // level 0 is stored and later uploaded in Context3D_submit. Higher mip levels
-    // (the demo's halving loop) are ignored rather than overwriting the full-res
-    // sprite sheet with a smaller mip.
+    // level 0 is stored and later uploaded. Higher mip levels (the demo's halving
+    // loop) are ignored rather than overwriting the full-res sprite sheet with a
+    // smaller mip.
     this.line('if (miplevel != 0) return;');
     // Invalidate any cached GPU handle: a new bitmap means the texture content
-    // changed, so Context3D_submit must re-upload instead of binding the stale
-    // MTLTexture created for the previous bitmap.
+    // changed.
     this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
     this.line('o->bitmapData = bitmapData; gc_write_barrier((void*)bitmapData);');
     this.line('if (bitmapData != NULL) { o->width = bitmapData->width; o->height = bitmapData->height; }');
+    // Upload NOW, exactly like AIR's synchronous uploadFromBitmapData. Starling
+    // rasterizes each text field into a BitmapData, hands it to
+    // Texture.fromBitmapData and immediately calls bitmapData.dispose(); an upload
+    // deferred to the next Context3D_submit would read the freed pixel buffer (the
+    // text texture then never got uploaded -- the sampler kept whatever the
+    // previous draw had left on that unit, so button labels rendered as garbage
+    // slices of the sprite atlas). The bitmapData reference above is kept only for
+    // the pre-upload fallback below and for onRestore-style re-uploads.
+    this.line('if (o->ctx != NULL && bitmapData != NULL && bitmapData->pixels != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, (const uint32_t*)bitmapData->pixels);');
     this.indent--;
     this.line('}');
-    this.line('void Texture_dispose(void* _this) { Texture* o = (Texture*)_this; o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
+    this.line('void Texture_dispose(void* _this) { Texture* o = (Texture*)_this; o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; as_s3d_destroy_texture(o->gpu); o->gpu = NULL; o->ctx = NULL; }');
+    // ATF (Adobe Texture Format) decoding lives in as_atf_decode_dxt (runtime):
+    // the container is parsed, the DXT record of mip level 0 is decoded to ARGB
+    // and handed on as an ordinary bitmap-sourced texture. AIR would bind the
+    // block-compressed payload directly; our backend only takes unpacked BGRA8
+    // pixels, so the decode is mandatory -- otherwise the texture stays empty and
+    // every quad sampling it draws as a flat block.
+    // The async contract still holds: AIR fires TEXTURE_READY once the upload
+    // completes, and Starling's AtfTextureFactory registers an onTextureReady
+    // listener before calling this. Dispatching on the next frame tick (rather
+    // than synchronously) also lets Texture.fromData return first, so the
+    // factory's `texture` local is assigned before its onReady closure reads it.
+    this.line('static as_value Texture__textureReady(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)args; (void)argc;');
+    this.line('EventDispatcher_dispatchEvent((EventDispatcher*)env, Event_new((char*)"textureReady", false, false));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('void Texture_uploadCompressedTextureFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, bool async) {');
+    this.indent++;
+    this.line('Texture* o = (Texture*)_this;');
+    this.line('int aw = 0, ah = 0;');
+    this.line('unsigned* px = NULL;');
+    this.line('if (data != NULL && data->data != NULL && (size_t)byteArrayOffset < (size_t)data->length)');
+    this.line('  px = as_atf_decode_dxt((const unsigned char*)data->data + byteArrayOffset, (int)((size_t)data->length - byteArrayOffset), &aw, &ah);');
+    this.line('if (px != NULL) {');
+    this.indent++;
+    // Reuse the ordinary BitmapData path: a Texture sampled by Context3D_submit
+    // either has a GPU handle or a bitmapData holding its pixels in ARGB, and the
+    // ATF decode produces exactly the latter. BitmapData_ctor mallocs and fills
+    // the buffer, so copy in the decoded pixels and release our temporary.
+    this.line('BitmapData* bd = BitmapData_new(aw, ah, true, 0);');
+    this.line('if (bd != NULL && bd->pixels != NULL) {');
+    this.indent++;
+    this.line('memcpy(bd->pixels, px, sizeof(unsigned) * (size_t)aw * (size_t)ah);');
+    this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
+    this.line('o->bitmapData = bd; gc_write_barrier((void*)bd);');
+    this.line('o->width = aw; o->height = ah;');
+    // Upload eagerly, like Texture_uploadFromBitmapData: mip level 0 only, the
+    // upload is synchronous and the GPU handle is cached on the texture.
+    this.line('if (o->ctx != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, aw, ah, (const uint32_t*)bd->pixels);');
+    this.indent--;
+    this.line('}');
+    this.line('free(px);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    // Never fail silently: an undecodable ATF would otherwise render as an empty
+    // texture with no diagnostic at all (the original pink-square symptom). AIR
+    // throws ArgumentError for containers it cannot hand to the GPU.
+    this.line('as_throw(ArgumentError_new((char*)"Error #3680: ATF data is not in a supported format (only raw DXT containers are decoded)", 0));');
+    this.indent--;
+    this.line('}');
+    this.line('if (async) as_set_timeout(as_fn_make(Texture__textureReady, _this, 0), 0.0);');
+    this.indent--;
+    this.line('}');
     // CubeTexture (stage 83): six faces as a CPU descriptor. uploadFromBitmapData
     // records the source per face; the GPU cube target is a future follow-up.
     this.line('void CubeTexture_ctor(CubeTexture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->face0 = o->face1 = o->face2 = o->face3 = o->face4 = o->face5 = NULL; }');
@@ -3934,16 +7852,23 @@ export class Emitter {
     this.line('}');
     this.line('void CubeTexture_dispose(void* _this) { CubeTexture* o = (CubeTexture*)_this; o->face0 = o->face1 = o->face2 = o->face3 = o->face4 = o->face5 = NULL; }');
     // RectangleTexture (stage 83): NPOT 2D descriptor (uploadFromBitmapData).
-    this.line('void RectangleTexture_ctor(RectangleTexture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; }');
+    // Layout-identical to Texture (vtable, width, height, format, bitmapData, gpu)
+    // so Context3D_submit can read ->gpu/->bitmapData through a Texture* without
+    // reading past the struct end (see symbols.ts RectangleTexture field comment).
+    this.line('void RectangleTexture_ctor(RectangleTexture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; o->gpu = NULL; o->ctx = NULL; }');
     this.line('RectangleTexture* RectangleTexture_new(void) { RectangleTexture* o = (RectangleTexture*)gc_alloc(GCT_CLASS, sizeof(RectangleTexture)); o->vtable = &RectangleTexture_vt; RectangleTexture_ctor(o); return o; }');
     this.line('void RectangleTexture_uploadFromBitmapData(void* _this, BitmapData* bitmapData) {');
     this.indent++;
     this.line('RectangleTexture* o = (RectangleTexture*)_this;');
+    // Invalidate the cached GPU handle, then upload eagerly -- same contract as
+    // Texture_uploadFromBitmapData (the caller may dispose the bitmap right away).
+    this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
     this.line('o->bitmapData = bitmapData; gc_write_barrier((void*)bitmapData);');
     this.line('if (bitmapData != NULL) { o->width = bitmapData->width; o->height = bitmapData->height; }');
+    this.line('if (o->ctx != NULL && bitmapData != NULL && bitmapData->pixels != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, (const uint32_t*)bitmapData->pixels);');
     this.indent--;
     this.line('}');
-    this.line('void RectangleTexture_dispose(void* _this) { RectangleTexture* o = (RectangleTexture*)_this; o->bitmapData = NULL; }');
+    this.line('void RectangleTexture_dispose(void* _this) { RectangleTexture* o = (RectangleTexture*)_this; o->bitmapData = NULL; as_s3d_destroy_texture(o->gpu); o->gpu = NULL; o->ctx = NULL; }');
     this.line('');
     this.line('// ---- Context3D: CPU state machine + optional Stage3D GPU backend. ----');
     this.line('void Context3D_ctor(Context3D* o) {');
@@ -3954,40 +7879,73 @@ export class Emitter {
     this.line('o->depthTestOn = false; o->depthCompare = NULL; o->cullMode = NULL;');
     this.line('o->program = NULL; o->indexBuffer = NULL; o->vc = NULL; o->fc = NULL;');
     this.line('o->gpu = NULL;');
+    this.line('o->stencilFace = NULL; o->stencilCompare = NULL; o->stencilBothPass = NULL; o->stencilDepthFail = NULL; o->stencilDepthPassStencilFail = NULL; o->stencilRefValue = 0;');
+    this.line('o->scissorOn = false; o->scissorX = 0.0; o->scissorY = 0.0; o->scissorW = 0.0; o->scissorH = 0.0;');
+    this.line('o->maxBackBufferWidth = 16384; o->maxBackBufferHeight = 16384;');
     this.line('o->clearR = 0.0; o->clearG = 0.0; o->clearB = 0.0; o->clearA = 1.0;');
     for (let i = 0; i < 8; i++) this.line(`o->vb${i} = NULL; o->vbOff${i} = 0; o->vbFmt${i} = NULL; o->tex${i} = NULL;`);
     this.indent--;
     this.line('}');
     this.line('Context3D* Context3D_new(void) { Context3D* o = (Context3D*)gc_alloc(GCT_CLASS, sizeof(Context3D)); o->vtable = &Context3D_vt; Context3D_ctor(o); return o; }');
-    this.line('void Context3D_configureBackBuffer(void* _this, unsigned int width, unsigned int height, unsigned int antiAlias, bool enableDepthAndStencil) {');
+    this.line('void Context3D_configureBackBuffer(void* _this, unsigned int width, unsigned int height, unsigned int antiAlias, bool enableDepthAndStencil, bool wantsBestResolution, bool wantsBestResolutionOnBrowserZoom) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
-    this.line('o->backBufferWidth = (int)width; o->backBufferHeight = (int)height; o->antiAlias = (int)antiAlias; o->enableDepthAndStencil = enableDepthAndStencil;');
+    this.line('(void)wantsBestResolutionOnBrowserZoom;');
+    // AIR's wantsBestResolution asks for a back buffer at the display's native
+    // resolution: the runtime allocates width*devicePixelRatio by
+    // height*devicePixelRatio and reports that as backBufferWidth/Height
+    // (verified against adl: configureBackBuffer(640,1048,...,true) on a 2x
+    // display gives backBufferWidth=1280/backBufferHeight=2096). Starling relies
+    // on exactly this: it passes contentScaleFactor != 1.0 as wantsBestResolution
+    // and then sets its projection, text textureScale and painter scale factor
+    // from that same factor (Starling.Painter.configureBackBuffer). Ignoring the
+    // flag left the render target at 1x while Starling laid everything out for
+    // 2x — the scene was rasterized at half resolution and then upscaled by the
+    // compositor, i.e. visibly blurry next to adl.
+    this.line('double bbScale = 1.0;');
+    this.line('if (wantsBestResolution && ASC_win_scale > 1.0) bbScale = ASC_win_scale;');
+    this.line('int bbw = (int)((double)width * bbScale);');
+    this.line('int bbh = (int)((double)height * bbScale);');
+    this.line('if (bbw < 1) bbw = 1; if (bbh < 1) bbh = 1;');
+    // backBufferWidth/Height mirror AIR: the size of the allocated buffer (device
+    // pixels), not the requested size. drawToBitmapData/maxBackBuffer checks see
+    // the real buffer size because of this.
+    this.line('o->backBufferWidth = bbw; o->backBufferHeight = bbh; o->antiAlias = (int)antiAlias; o->enableDepthAndStencil = enableDepthAndStencil;');
+    // The compositor needs the logical (stage-unit) size to place the target in
+    // the display list — see ASC_stage3d_lw/lh.
+    this.line('ASC_stage3d_lw = (int)width; ASC_stage3d_lh = (int)height;');
     // Lazily create the offscreen GPU context on first configureBackBuffer, or
     // resize it on a later call (window resize). Pure-C builds: gpu stays NULL.
-    this.line('if (o->gpu == NULL) o->gpu = as_s3d_create((int)width, (int)height);');
-    this.line('else as_s3d_resize(o->gpu, (int)width, (int)height);');
+    this.line('if (o->gpu == NULL) o->gpu = as_s3d_create(bbw, bbh);');
+    this.line('else as_s3d_resize(o->gpu, bbw, bbh);');
     this.indent--;
     this.line('}');
-    this.line('void Context3D_clear(void* _this, double red, double green, double blue, double alpha) {');
+    this.line('void Context3D_clear(void* _this, double red, double green, double blue, double alpha, double depth, unsigned int stencil, unsigned int mask) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
     this.line('o->clearR = red; o->clearG = green; o->clearB = blue; o->clearA = alpha;');
-    this.line('as_s3d_clear(o->gpu, (float)red, (float)green, (float)blue, (float)alpha);');
+    // The mask bits select which attachments the next draw clears
+    // (COLOR=1/DEPTH=2/STENCIL=4 — AIR's Context3DClearMask, verified with adl).
+    // Starling relies on this: it clears once per frame, and the stencil must
+    // survive the following masked draws to hold the mask shape. The depth and
+    // stencil VALUES matter too — Starling clears the stencil to 127
+    // (Painter.DEFAULT_STENCIL_VALUE), which its mask passes compare against.
+    this.line('as_s3d_clear(o->gpu, (float)red, (float)green, (float)blue, (float)alpha, (float)depth, stencil, (int)(mask & 7u));');
     this.indent--;
     this.line('}');
     this.line('void Context3D_present(void* _this) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
     this.line('if (o->gpu == NULL) return;');
-    // present() = "the frame is done, show it". On the GPU Metal path, expose the
-    // offscreen render target for a direct GPU→GPU composite (no CPU readback, no
-    // CPU→GPU re-upload — the latter leaked a blit command buffer per frame). On
-    // the CPU raster path, read it back into the global BGRA8 buffer that
-    // ASC_window_render composites behind the 2D display list.
+    // present() = "the frame is done, show it". On the GPU paths (Metal native,
+    // WebGL2 web) expose the offscreen render target's backend texture for a
+    // direct GPU→GPU composite (no CPU readback, no CPU→GPU re-upload — the
+    // latter leaked a blit command buffer per frame on Metal). On the CPU raster
+    // path, read it back into the global BGRA8 buffer that ASC_window_render
+    // composites behind the 2D display list.
     this.line('int w = as_s3d_width(o->gpu), h = as_s3d_height(o->gpu);');
     this.line('if (w <= 0 || h <= 0) return;');
-    this.line('#ifdef ASC_RENDER_METAL');
+    this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_GPU)');
     this.line('ASC_stage3d_tex = as_s3d_get_render_target(o->gpu);');
     this.line('ASC_stage3d_w = w; ASC_stage3d_h = h;');
     this.line('#else');
@@ -4003,6 +7961,22 @@ export class Emitter {
     this.line('ASC_stage3d_ready = 1;');
     this.indent--;
     this.line('}');
+    // Per-frame vertex de-interleave scratch (Context3D_submit). A cached buffer
+    // instead of malloc/free per bound stream per frame: the *transient* peak is what
+    // the allocator keeps as high-water RSS in a long-running app (measured: live malloc
+    // stays flat at ~17 MB while the Starling scene cycle's RSS climbs; see gc.md §6.14).
+    // Reuse is safe because as_s3d_upload_vertex copies synchronously -- the pointer
+    // never outlives the call.
+    this.line('static double* s3d_submit_scratch = NULL;');
+    this.line('static size_t s3d_submit_scratch_cap = 0;');
+    this.line('static double* s3d_submit_scratch_get(size_t need) {');
+    this.line('  if (need > s3d_submit_scratch_cap) {');
+    this.line('    free(s3d_submit_scratch);');
+    this.line('    s3d_submit_scratch = (double*)malloc(need * sizeof(double));');
+    this.line('    s3d_submit_scratch_cap = s3d_submit_scratch != NULL ? need : 0;');
+    this.line('  }');
+    this.line('  return s3d_submit_scratch;');
+    this.line('}');
     // Context3D_submit: the single GPU sync point shared by drawTriangles and
     // drawTrianglesInstanced. Uploads bound streams/constants/textures, compiles
     // the Program3D (AGAL bytecode -> MSL -> MTLRenderPipelineState) on first
@@ -4010,18 +7984,59 @@ export class Emitter {
     this.line('void Context3D_submit(Context3D* o, IndexBuffer3D* indexBuffer, int numTriangles, int numInstances) {');
     this.indent++;
     this.line('if (o->gpu == NULL) { (void)numTriangles; (void)numInstances; (void)indexBuffer; return; }');
-    // Upload vertex streams va0..va7 from the bound VertexBuffer3D (double data).
+    // Upload vertex streams va0..va7 from the bound VertexBuffer3D. Starling
+    // packs position/texCoords/color into ONE interleaved buffer (stride =
+    // data32PerVertex) and binds that same buffer at several attribute indices
+    // with different offsets/formats via setVertexBufferAt. s3d_upload_vertex
+    // wants a contiguous non-interleaved component array, so de-interleave each
+    // attribute here: stride = data32PerVertex, base offset = vbOff{i} (32-bit
+    // units), component count derived from the format string.
+    // Color is "bytes4": 4 big-endian RGBA bytes stored in one 32-bit word; each
+    // byte is normalized to [0,1] so the float4 register matches Stage3D's
+    // bytes4 semantics (and Starling's premultiplied-alpha pipeline).
     for (let i = 0; i < 8; i++) {
-      this.line(`if (o->vb${i} != NULL && o->vb${i}->data != NULL) {`);
+      this.line(`if (o->vb${i} != NULL && o->vb${i}->raw != NULL) {`);
       this.indent++;
-      this.line(`int n = o->vb${i}->data32PerVertex;`);
+      this.line(`int stride = o->vb${i}->data32PerVertex;`);
+      this.line(`int off = o->vbOff${i};`);
       this.line(`int sv = o->vb${i}->startVertex;`);
-      this.line(`as_s3d_upload_vertex(o->gpu, ${i}, o->vb${i}->data->data + (size_t)sv * n, o->vb${i}->numVertices, n);`);
+      this.line(`int nv = o->vb${i}->numVertices;`);
+      this.line(`const char* fmt = o->vbFmt${i};`);
+      this.line(`int comp = 4; if (fmt != NULL) { if (strcmp(fmt, "float1") == 0) comp = 1; else if (strcmp(fmt, "float2") == 0) comp = 2; else if (strcmp(fmt, "float3") == 0) comp = 3; }`);
+      this.line(`int isBytes4 = (fmt != NULL && strcmp(fmt, "bytes4") == 0);`);
+      this.line(`double* tmp = s3d_submit_scratch_get((size_t)nv * (size_t)comp);`);
+      this.line(`for (int v = 0; v < nv; v++) {`);
+      this.indent++;
+      this.line(`if (isBytes4) {`);
+      this.indent++;
+      // bytes4 packs four normalized bytes in ONE 32-bit word -- read the word
+      // as it was uploaded, no double round trip.
+      this.line(`unsigned w = o->vb${i}->raw->data[(size_t)(sv + v) * stride + off];`);
+      this.line(`tmp[v * 4 + 0] = (double)(w & 0xFF) / 255.0;`);
+      this.line(`tmp[v * 4 + 1] = (double)((w >> 8) & 0xFF) / 255.0;`);
+      this.line(`tmp[v * 4 + 2] = (double)((w >> 16) & 0xFF) / 255.0;`);
+      this.line(`tmp[v * 4 + 3] = (double)((w >> 24) & 0xFF) / 255.0;`);
+      this.indent--;
+      this.line(`} else {`);
+      this.indent++;
+      // floatN: the stored word is the float32 the GPU receives, so widen it
+      // without ever having kept a double of it alive in the heap.
+      this.line(`for (int c = 0; c < comp; c++) {`);
+      this.indent++;
+      this.line(`float f; memcpy(&f, &o->vb${i}->raw->data[(size_t)(sv + v) * stride + off + c], 4);`);
+      this.line(`tmp[v * comp + c] = (double)f;`);
+      this.indent--;
+      this.line(`}`);
+      this.indent--;
+      this.line(`}`);
+      this.indent--;
+      this.line(`}`);
+      this.line(`as_s3d_upload_vertex(o->gpu, ${i}, tmp, nv, comp);`);
       this.indent--;
       this.line('}');
     }
     // Upload the index buffer (Vector.<uint> is uint32).
-    this.line('if (indexBuffer != NULL && indexBuffer->data != NULL) as_s3d_upload_index(o->gpu, indexBuffer->data->data + indexBuffer->startIndex, indexBuffer->numIndices - indexBuffer->startIndex);');
+    this.line('if (indexBuffer != NULL && indexBuffer->data != NULL) as_s3d_upload_index(o->gpu, indexBuffer->data->data + indexBuffer->startIndex, indexBuffer->numIndices);');
     // Upload vertex/fragment constants (double -> float4 arrays).
     this.line('if (o->vc != NULL && o->vc->length > 0) as_s3d_upload_constants(o->gpu, 0, o->vc->data, o->vc->length);');
     this.line('if (o->fc != NULL && o->fc->length > 0) as_s3d_upload_constants(o->gpu, 1, o->fc->data, o->fc->length);');
@@ -4048,11 +8063,11 @@ export class Emitter {
     this.line('ByteArray* fp = o->program->fragmentProgram;');
     this.line('if (vp != NULL && fp != NULL && vp->data != NULL && fp->data != NULL) {');
     this.indent++;
-    this.line('char* vs = as_agal_translate((const unsigned char*)vp->data, vp->length, 0);');
-    this.line('char* fs = as_agal_translate((const unsigned char*)fp->data, fp->length, 0);');
-    this.line('if (vs == NULL || fs == NULL) { as_throw(Error_new((char*)as_agal_errmsg)); return; }');
+    this.line('char* vs = as_agal_translate((const unsigned char*)vp->data, vp->length, ASC_AGAL_TARGET);');
+    this.line('char* fs = as_agal_translate((const unsigned char*)fp->data, fp->length, ASC_AGAL_TARGET);');
+    this.line('if (vs == NULL || fs == NULL) { as_throw(Error_new((char*)as_agal_errmsg, 0)); return; }');
     this.line('char errbuf[512];');
-    this.line('if (!as_s3d_compile(o->gpu, vs, fs, errbuf, (int)sizeof(errbuf))) { as_throw(Error_new(errbuf)); return; }');
+    this.line('if (!as_s3d_compile(o->gpu, vs, fs, errbuf, (int)sizeof(errbuf))) { as_throw(Error_new(errbuf, 0)); return; }');
     this.line('o->gpuProgram = o->program;');
     this.indent--;
     this.line('}');
@@ -4113,7 +8128,19 @@ export class Emitter {
     // reference (the demo does not sample cube/rectangle textures).
     this.line('void Context3D_setCubeTextureAt(void* _this, int first, CubeTexture* texture) { Context3D* o = (Context3D*)_this; (void)o; (void)first; gc_write_barrier((void*)texture); }');
     this.line('void Context3D_setRectangleTextureAt(void* _this, int first, RectangleTexture* texture) { Context3D* o = (Context3D*)_this; (void)o; (void)first; gc_write_barrier((void*)texture); }');
+    // setSamplerStateAt(sampler, wrap, filter, mipfilter) — AIR's Context3DWrapMode /
+    // Context3DTextureFilter / Context3DMipFilter names. The AGAL->MSL translator
+    // emits one shared sampler (`sampler smp [[sampler(0)]]`) for every fragment
+    // program, so per-unit state is recorded but the state of the lowest bound
+    // texture unit decides the sampler bound at index 0 (see the glue).
+    this.line('void Context3D_setSamplerStateAt(void* _this, int sampler, char* wrap, char* filter, char* mipfilter) { Context3D* o = (Context3D*)_this; as_s3d_set_sampler_state(o->gpu, sampler, wrap, filter, mipfilter); }');
     // setProgramConstantsFromVector uploads numRegisters*4 doubles to vc/fc.
+    // AIR's signature is `(... data:Vector.<Number>, numRegisters:int = -1)`, where
+    // -1 means "take the register count from the vector" (Starling relies on it:
+    // BlurFilter/ColorMatrixFilter pass only the data vector). Treating -1 as a
+    // literal count multiplies it out to a negative length that clamps to zero,
+    // silently uploading NO constants -- a blur whose fc0 weights stay 0 draws
+    // pure black (the filtered image vanished).
     this.line('void Context3D_setProgramConstantsFromVector(void* _this, char* programType, int firstRegister, as_vector_number* data, int numRegisters) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
@@ -4121,8 +8148,9 @@ export class Emitter {
     this.line('as_vector_number* dst = isVertex ? o->vc : o->fc;');
     this.line('if (dst == NULL) { dst = as_vector_number_new(); if (isVertex) { o->vc = dst; } else { o->fc = dst; } gc_write_barrier((void*)dst); }');
     this.line('int base = firstRegister * 4;');
-    this.line('int n = numRegisters * 4;');
+    this.line('int n = (numRegisters < 0) ? (((int)(data != NULL ? data->length : 0)) & ~3) : numRegisters * 4;');
     this.line('if (n < 0) n = 0;');
+    this.line('if (data == NULL) n = 0;');
     this.line('if (dst->length < base + n) as_vector_number_setLength(dst, base + n);');
     this.line('for (int i = 0; i < n; i++) dst->data[base + i] = (i < data->length) ? data->data[i] : 0.0;');
     this.indent--;
@@ -4137,17 +8165,17 @@ export class Emitter {
     this.line('gc_write_barrier((void*)buffer);');
     this.indent--;
     this.line('}');
-    this.line('VertexBuffer3D* Context3D_createVertexBuffer(void* _this, int numVertices, int data32PerVertex) {');
+    this.line('VertexBuffer3D* Context3D_createVertexBuffer(void* _this, int numVertices, int data32PerVertex, char* bufferUsage) {');
     this.indent++;
-    this.line('(void)_this;');
+    this.line('(void)_this; (void)bufferUsage;');
     this.line('VertexBuffer3D* b = VertexBuffer3D_new();');
     this.line('b->numVertices = numVertices; b->data32PerVertex = data32PerVertex;');
     this.line('return b;');
     this.indent--;
     this.line('}');
-    this.line('IndexBuffer3D* Context3D_createIndexBuffer(void* _this, int numIndices) {');
+    this.line('IndexBuffer3D* Context3D_createIndexBuffer(void* _this, int numIndices, char* bufferUsage) {');
     this.indent++;
-    this.line('(void)_this;');
+    this.line('(void)_this; (void)bufferUsage;');
     this.line('IndexBuffer3D* b = IndexBuffer3D_new();');
     this.line('b->numIndices = numIndices;');
     this.line('return b;');
@@ -4163,6 +8191,8 @@ export class Emitter {
     // front (setRenderToTexture binds it); false leaves gpu=NULL (sampler-only,
     // uploaded later via uploadFromBitmapData).
     this.line('if (optimizeForRenderToTexture) t->gpu = as_s3d_create_render_texture(ctx->gpu, width, height);');
+    // Hand the texture its context so uploadFromBitmapData can upload eagerly.
+    this.line('t->ctx = ctx->gpu;');
     this.line('return t;');
     this.indent--;
     this.line('}');
@@ -4176,17 +8206,69 @@ export class Emitter {
     this.line('}');
     this.line('RectangleTexture* Context3D_createRectangleTexture(void* _this, int width, int height, char* format, bool optimizeForRenderToTexture) {');
     this.indent++;
-    this.line('(void)_this; (void)optimizeForRenderToTexture;');
+    this.line('Context3D* ctx = (Context3D*)_this;');
+    // Same contract as createTexture: optimizeForRenderToTexture=true allocates a
+    // render-target MTLTexture up front (Starling's FragmentFilter renders its
+    // offscreen passes into such a texture through setRenderToTexture); false
+    // leaves gpu=NULL for a later uploadFromBitmapData.
     this.line('RectangleTexture* t = RectangleTexture_new();');
     this.line('t->width = width; t->height = height; t->format = format;');
+    this.line('if (optimizeForRenderToTexture) t->gpu = as_s3d_create_render_texture(ctx->gpu, width, height);');
+    this.line('t->ctx = ctx->gpu;');
     this.line('return t;');
     this.indent--;
     this.line('}');
-    this.line('void Context3D_setDepthTest(void* _this, bool depthMask, char* passCompareMode) { Context3D* o = (Context3D*)_this; o->depthTestOn = depthMask; o->depthCompare = passCompareMode; }');
-    this.line('void Context3D_setCulling(void* _this, char* triangleFaceToCull) { Context3D* o = (Context3D*)_this; o->cullMode = triangleFaceToCull; }');
-    this.line('void Context3D_dispose(void* _this) {');
+    // VideoTexture: a video-backed texture. No video decoder in this subset; the
+    // object exists so Starling's ConcreteVideoTexture can hold/attach a base,
+    // so this allocates an empty VideoTexture (videoWidth/videoHeight default 0).
+    this.line('VideoTexture* Context3D_createVideoTexture(void* _this) { (void)_this; return VideoTexture_new(); }');
+    this.line('void Context3D_setDepthTest(void* _this, bool depthMask, char* passCompareMode) { Context3D* o = (Context3D*)_this; o->depthTestOn = depthMask; o->depthCompare = passCompareMode; as_s3d_set_depth(o->gpu, depthMask ? 1 : 0, passCompareMode); }');
+    // Context3DTriangleFace -> MTLCullMode. AIR's naming: "back"/"front"/"none"/
+    // "frontAndBack" (culling frontAndBack would drop everything, which is what
+    // AIR does too, so it maps to Front-and-Back culling respectively = cull all).
+    this.line('void Context3D_setCulling(void* _this, char* triangleFaceToCull) { Context3D* o = (Context3D*)_this; o->cullMode = triangleFaceToCull; as_s3d_set_cull(o->gpu, triangleFaceToCull); }');
+    // setStencilActions records the stencil front/back compare mode + three actions
+    // (both-pass / depth-fail / depth-pass-stencil-fail) and forwards them to the
+    // glue, which turns them into a cached MTLDepthStencilState. Starling's
+    // Paintter.drawMask/eraseMask drive masking entirely through this call plus
+    // setStencilReferenceValue: the mask shape is rendered with INCREMENT_SATURATE
+    // (or DECREMENT for an inverted mask) and the masked content is then drawn with
+    // compareMode EQUAL against the incremented reference value.
+    this.line('void Context3D_setStencilActions(void* _this, char* triangleFace, char* compareMode, char* actionOnBothPass, char* actionOnDepthFail, char* actionOnDepthPassStencilFail) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
+    this.line('o->stencilFace = triangleFace; o->stencilCompare = compareMode;');
+    this.line('o->stencilBothPass = actionOnBothPass; o->stencilDepthFail = actionOnDepthFail; o->stencilDepthPassStencilFail = actionOnDepthPassStencilFail;');
+    this.line('as_s3d_set_stencil(o->gpu, triangleFace, compareMode, actionOnBothPass, actionOnDepthFail, actionOnDepthPassStencilFail);');
+    this.indent--;
+    this.line('}');
+    // setScissorRectangle(null) disables scissoring. The rectangle is in stage
+    // (logical) units; the render target is at device resolution, so scale by
+    // backBuffer/logical before handing it to Metal (MTLScissorRect is also
+    // top-left origin, same as Stage3D, so no flip is needed).
+    this.line('void Context3D_setScissorRectangle(void* _this, Rectangle* rectangle) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('double sc = (ASC_stage3d_lw > 0) ? (double)o->backBufferWidth / (double)ASC_stage3d_lw : 1.0;');
+    this.line('if (rectangle == NULL) { o->scissorOn = false; o->scissorX = 0.0; o->scissorY = 0.0; o->scissorW = 0.0; o->scissorH = 0.0; as_s3d_set_scissor(o->gpu, 0, 0, 0, 0, 0); }');
+    this.line('else { o->scissorOn = true; o->scissorX = rectangle->x; o->scissorY = rectangle->y; o->scissorW = rectangle->width; o->scissorH = rectangle->height;');
+    this.line('  as_s3d_set_scissor(o->gpu, 1, (int)(rectangle->x * sc), (int)(rectangle->y * sc), (int)(rectangle->width * sc), (int)(rectangle->height * sc)); }');
+    this.indent--;
+    this.line('}');
+    // setStencilReferenceValue stores the 8-bit reference plus the read/write masks
+    // (all three go to the GPU: Starling increments/decrements the reference while
+    // drawing/erasing a mask, then compares the content against it with EQUAL).
+    this.line('void Context3D_setStencilReferenceValue(void* _this, unsigned int referenceValue, unsigned int readMask, unsigned int writeMask) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('o->stencilRefValue = (int)(referenceValue & 0xFFu);');
+    this.line('as_s3d_set_stencil_ref(o->gpu, referenceValue, readMask, writeMask);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_dispose(void* _this, bool recreate) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('(void)recreate;');
     this.line('o->program = NULL; o->indexBuffer = NULL; o->vc = NULL; o->fc = NULL;');
     for (let i = 0; i < 8; i++) this.line(`o->vb${i} = NULL; o->tex${i} = NULL;`);
     this.line('o->gpuProgram = NULL;');
@@ -4237,20 +8319,66 @@ export class Emitter {
     // (render-to-texture). drawTriangles then renders into that MTLTexture; the
     // texture can later be sampled via setTextureAt (s3d_bind_texture) or read
     // back with drawToBitmapData (s3d_readback_render).
-    this.line('void Context3D_setRenderToTexture(void* _this, Texture* texture, bool enableDepthAndStencil) {');
+    this.line('void Context3D_setRenderToTexture(void* _this, Texture* texture, bool enableDepthAndStencil, int antiAlias, int surfaceSelector) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
-    this.line('(void)enableDepthAndStencil;');
-    this.line('as_s3d_set_render_target(o->gpu, (texture != NULL) ? texture->gpu : NULL);');
+    this.line('(void)antiAlias; (void)surfaceSelector;');
+    // enableDepthAndStencil asks for a depth/stencil surface matching the render
+    // target (Metal rejects a pass whose depth attachment has a different size).
+    this.line('as_s3d_set_render_target(o->gpu, (texture != NULL) ? texture->gpu : NULL, enableDepthAndStencil ? 1 : 0);');
     this.indent--;
     this.line('}');
     this.line('void Context3D_setRenderToBackBuffer(void* _this) {');
     this.indent++;
-    this.line('as_s3d_set_render_target(((Context3D*)_this)->gpu, NULL);');
+    this.line('as_s3d_set_render_target(((Context3D*)_this)->gpu, NULL, 0);');
     this.indent--;
     this.line('}');
-    this.line('char* Context3D_get_driverInfo(void* _this) { Context3D* o = (Context3D*)_this; return o->gpu != NULL ? (char*)"Metal (Stage3D)" : (char*)"Software (state machine)"; }');
+    // driverInfo reflects the compile-time backend, not the runtime gpu pointer:
+    // `gpu` is created lazily in configureBackBuffer (after CONTEXT3D_CREATE), so
+    // reading it here would report "Software" at trace time and make Starling's
+    // profile-retry loop reject every profile as a software fallback.
+    //
+    // The probe must be ASC_RENDER_STAGE3D, NOT ASC_RENDER_METAL: the two are
+    // independent backends. ASC_RENDER_METAL only means the *window* composes on
+    // the GPU via CAMetalLayer (metal_glue.mm); it does not wire Context3D to a
+    // device. Context3D itself renders on the GPU iff stage3d_glue.mm is linked,
+    // which is exactly ASC_RENDER_STAGE3D — that macro is what turns the as_s3d_*
+    // wrappers from no-ops into real Metal calls. Using ASC_RENDER_METAL reported
+    // "Software" for a Stage3D-only build (stage82/83 build.json define only
+    // ASC_RENDER_STAGE3D) and would conversely report "Metal" for an air-native
+    // build whose Context3D is a pure-C state machine.
+    this.line('char* Context3D_get_driverInfo(void* _this) { (void)_this;');
+    this.indent++;
+    this.line('#if defined(ASC_S3D_GLSL)');
+    // Web backend: stage3d_webgl.cc drives the WebGL2 pipeline.
+    this.line('return (char*)"WebGL2 (Stage3D)";');
+    this.line('#elif defined(ASC_RENDER_STAGE3D)');
+    this.line('return (char*)"Metal (Stage3D)";');
+    this.line('#else');
+    this.line('return (char*)"Software (state machine)";');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
     this.line('char* Context3D_get_profile(void* _this) { (void)_this; return (char*)"baseline"; }');
+    // totalGPUMemory: AIR reports how much GPU memory this context holds. We do not
+    // account for every buffer, so report the one allocation we always know — the
+    // back buffer (BGRA8 + 4 bytes/pixel) — plus the depth/stencil surface when the
+    // build has one. Approximate, but the API is used for display only (Starling's
+    // stats box) and must be present: `"totalGPUMemory" in context` gates a row.
+    this.line('double Context3D_get_totalGPUMemory(void* _this) {');
+    this.indent++;
+    this.line('Context3D* o = (Context3D*)_this;');
+    this.line('double bytes = (double)o->backBufferWidth * (double)o->backBufferHeight * 4.0;');
+    this.line('#if defined(ASC_RENDER_DEPTH_STENCIL)');
+    this.line('bytes += (double)o->backBufferWidth * (double)o->backBufferHeight * 8.0;');
+    this.line('#endif');
+    this.line('return bytes;');
+    this.indent--;
+    this.line('}');
+    // maxBackBufferWidth/Height: the platform back-buffer size limit (16384 for
+    // AIR 64-bit desktop). configureBackBuffer clamps to this upper bound.
+    this.line('int Context3D_get_maxBackBufferWidth(void* _this) { return ((Context3D*)_this)->maxBackBufferWidth; }');
+    this.line('int Context3D_get_maxBackBufferHeight(void* _this) { return ((Context3D*)_this)->maxBackBufferHeight; }');
     this.line('void Context3D_set_enableErrorChecking(void* _this, bool value) { (void)_this; (void)value; }');
     this.line('');
     this.line('// ---- Stage3D: per-display slot; lazily creates a Context3D on request. ----');
@@ -4261,12 +8389,26 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('Stage3D* Stage3D_new(void) { Stage3D* o = (Stage3D*)gc_alloc(GCT_CLASS, sizeof(Stage3D)); o->vtable = &Stage3D_vt; Stage3D_ctor(o); return o; }');
+    // AIR creates the Context3D asynchronously: requestContext3D() returns
+    // immediately and dispatches context3DCreate on a later frame. Firing it
+    // synchronously would dispatch CONTEXT3D_CREATE -> ROOT_CREATED while the
+    // Starling constructor is still on the stack, so app code that registers its
+    // ROOT_CREATED listener AFTER `new Starling(...)` would miss it (white screen).
+    // We therefore create the context object eagerly (so stage3D.context3D is
+    // readable) but defer the event to the next frame tick.
+    this.line('static as_value Stage3D__contextReady(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)args; (void)argc;');
+    this.line('EventDispatcher_dispatchEvent((EventDispatcher*)env, Event_new((char*)"context3DCreate", false, false));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
     this.line('void Stage3D_requestContext3D(void* _this, char* renderMode) {');
     this.indent++;
     this.line('Stage3D* o = (Stage3D*)_this;');
     this.line('o->renderMode = renderMode;');
     this.line('if (o->context3d == NULL) { o->context3d = Context3D_new(); gc_write_barrier((void*)o->context3d); }');
-    this.line('EventDispatcher_dispatchEvent((EventDispatcher*)o, Event_new((char*)"context3DCreate", false, false));');
+    this.line('as_set_timeout(as_fn_make(Stage3D__contextReady, (void*)o, 0), 0.0);');
     this.indent--;
     this.line('}');
     this.line('Context3D* Stage3D_get_context3D(void* _this) { return ((Stage3D*)_this)->context3d; }');
@@ -4325,7 +8467,19 @@ export class Emitter {
     // only permanent roots (static fields, stage, event registry, timers) are
     // live. Each frame advances the incremental mark/sweep by a fixed budget
     // (GC-4) so the pause stays bounded instead of growing with the heap.
+    // The two ASC_FRAME_STATS probes time the slice and the whole frame so a
+    // stutter can be attributed to the collector or to the allocator.
+    this.line('const double asc_frame_t0 = as_now_ms();');
+    // gc_step() also marks the collector frame-driven, which is what retires
+    // gc_alloc's non-GUI allocation trigger (see gc_frame_driven in the preamble).
     this.line('gc_step();');
+    this.line('as_dbg_frame(as_now_ms() - asc_frame_t0);');
+    // Collect finished asynchronous IO/decode jobs before anything else this
+    // frame: their finish thunks dispatch PROGRESS/COMPLETE, which user code
+    // (AssetManager chains) reacts to by queueing the next load. Doing it first
+    // means a job that completed while the last frame was rendering is visible
+    // to listeners in this frame, matching AIR's "as soon as possible" delivery.
+    this.line('as_async_tick();');
     // Fire due setTimeout/clearTimeout timers first (AIR drives timers on the
     // same frame clock as ENTER_FRAME), then advance playing MovieClips, then
     // broadcast the enterFrame event.
@@ -4822,6 +8976,9 @@ export class Emitter {
     this.line('int leftpx = tf->hscroll ? tf->_scroll_h : 0;');
     this.line('if (leftpx < 0) leftpx = 0; if (leftpx > maxsh) leftpx = maxsh;');
     this.line('double scrollX = (double)leftpx;');
+    // Block shift for horizontalAlign when the paragraph carries none itself
+    // (non-wrapping field): AIR centers/right-aligns inside the field box anyway.
+    this.line('double alignDx = as_tf_align_dx(tf);');
     this.line('as_skia_canvas_save(canvas);');
     this.line('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, tf->width, tf->height);');
     // Selection highlight (drawn behind the glyphs, paragraph-relative).
@@ -4830,11 +8987,11 @@ export class Emitter {
     this.line('double rl[16], rt[16], rr[16], rb[16];');
     this.line('int nr = as_skia_textlayout_rects_for_range(para, tf->_sel_begin, tf->_sel_end, rl, rt, rr, rb, 16);');
     this.line('void* hp = as_skia_paint_fill(0x4D90FEu, 0.35);');
-    this.line('for (int i = 0; i < nr; i++) { as_skia_canvas_draw_rect(canvas, 2.0 - scrollX + rl[i], 2.0 - scrollY + rt[i], rr[i] - rl[i], rb[i] - rt[i], hp); }');
+    this.line('for (int i = 0; i < nr; i++) { as_skia_canvas_draw_rect(canvas, 2.0 + alignDx - scrollX + rl[i], 2.0 - scrollY + rt[i], rr[i] - rl[i], rb[i] - rt[i], hp); }');
     this.line('as_skia_paint_delete(hp);');
     this.indent--;
     this.line('}');
-    this.line('as_skia_textlayout_paint(para, canvas, 2.0 - scrollX, 2.0 - scrollY);');
+    this.line('as_skia_textlayout_paint(para, canvas, 2.0 + alignDx - scrollX, 2.0 - scrollY);');
     this.line('as_skia_canvas_restore(canvas);');
     this.indent--;
     this.line('}');
@@ -4954,20 +9111,30 @@ export class Emitter {
     this.line('as_skia_canvas_translate(canvas, ox, oy);');
     this.line('as_skia_canvas_scale(canvas, cx, cy);');
     // Composite the Stage3D frame behind the 2D display list (AIR puts Stage3D
-    // behind). The back buffer is in logical stage resolution, so draw it at
-    // (0,0,w,h) in the same scaled space the display list renders in. GPU Metal
-    // path blits the render-target texture directly; CPU path draws the readback
-    // BGRA buffer.
+    // behind). The render target may be larger than the stage-unit rect it covers
+    // (HiDPI/+wantsBestResolution), so the source size and the destination rect
+    // are passed separately. Both GPU backends blit the render-target texture
+    // directly (Metal: MTLTexture; web: the GL texture wrapped as a
+    // GrBackendTexture); the CPU path draws the readback BGRA buffer.
     this.line('#ifdef ASC_RENDER_METAL');
     this.line('if (ASC_stage3d_ready && ASC_stage3d_tex != NULL) {');
     this.indent++;
-    this.line('as_skia_mtl_draw_texture(canvas, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_w, (double)ASC_stage3d_h);');
+    // Source rect = the real render target (device pixels when wantsBestResolution
+    // scaled it); dest rect = its logical footprint in stage units, which the canvas
+    // scale above turns back into device pixels 1:1.
+    this.line('as_skia_mtl_draw_texture(canvas, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_lw, (double)ASC_stage3d_lh);');
+    this.indent--;
+    this.line('}');
+    this.line('#elif defined(ASC_RENDER_GPU)');
+    this.line('if (ASC_stage3d_ready && ASC_stage3d_tex != NULL) {');
+    this.indent++;
+    this.line('as_skia_gl_draw_texture(canvas, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_lw, (double)ASC_stage3d_lh);');
     this.indent--;
     this.line('}');
     this.line('#else');
     this.line('if (ASC_stage3d_ready && ASC_stage3d_pixels != NULL) {');
     this.indent++;
-    this.line('as_skia_canvas_draw_bgra(canvas, ASC_stage3d_pixels, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_w, (double)ASC_stage3d_h);');
+    this.line('as_skia_canvas_draw_bgra(canvas, ASC_stage3d_pixels, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_lw, (double)ASC_stage3d_lh);');
     this.indent--;
     this.line('}');
     this.line('#endif');
@@ -5121,14 +9288,29 @@ export class Emitter {
       const def = this.defaultInit(elem);
       const defExpr = def.startsWith('{') ? `(${ec})${def}` : def;
       const isPtr = this.vectorElemIsPtr(elem);
-      // GC mark callback: trace the data buffer. For reference elements the data
-      // is a GCT_PTR_ARRAY whose children the GC scans; for scalar elements the
-      // data is a plain malloc'd value buffer, which gc_mark_ptr skips (outside
-      // the GC segment range).
+      // GC mark callback: trace the data buffer. Reference elements live in a
+      // GCT_PTR_ARRAY whose children the GC scans; scalar/boxed/interface elements
+      // live in a GCT_RAW leaf, which the GC does not scan at all — hence the
+      // explicit per-element tracing below.
       this.line(`static void as_vector_${key}_mark(void* self) {`);
       this.indent++;
       this.line(`as_vector_${key}* v = (as_vector_${key}*)self;`);
       this.line('gc_mark_ptr(v->data);');
+      // Interface elements are stored BY VALUE as `{ obj, vt }` structs in a
+      // buffer the GC does not scan, so the scan of `data` above sees nothing
+      // live: the element's `obj` pointer (a real GC object) must be traced
+      // explicitly or the collector recycles objects that are still referenced
+      // from the vector (e.g. every Tween/DelayedCall sitting in a
+      // Juggler._objects). Same rule as an interface-typed field.
+      if (elem.kind === 'interface') {
+        this.line('for (int i = 0; i < v->length; i++) gc_mark_ptr((void*)v->data[i].obj);');
+      }
+      // `*`/any elements live in a buffer of boxed as_value slots that the GC does
+      // not scan, so any object/string reachable only through `Vector.<*>` would be
+      // swept while still referenced. Trace the boxed slots explicitly.
+      if (elem.kind === 'any') {
+        this.line('for (int i = 0; i < v->length; i++) gc_mark_value(v->data[i]);');
+      }
       this.indent--;
       this.line('}');
       this.line(`as_vector_${key}* as_vector_${key}_new(void) {`);
@@ -5139,42 +9321,115 @@ export class Emitter {
       this.line('return v;');
       this.indent--;
       this.line('}');
-      this.line(`int as_vector_${key}_push(as_vector_${key}* v, ${ec} e) {`);
+      // Grow the element storage to `cap` elements (a no-op when it already fits).
+      // The payload lives on the GC heap like everything else the Vector owns:
+      // with malloc/realloc it would outlive every reference to it, so a Vector the
+      // collector reclaims (or whose `data` a grow replaces) leaks its whole buffer
+      // for the rest of the process. That is unbounded in practice — Starling
+      // re-uploads a multi-MB VertexBuffer3D on every frame, which leaked ~1 MB per
+      // batched object in the Benchmark scene (14 GB within 23 s).
+      // Reference elements use GCT_PTR_ARRAY, whose elements the GC scans; scalar /
+      // boxed / interface elements use the GCT_RAW leaf, and `_mark` above traces
+      // the object references those hold (`*` boxes and interface `obj` members).
+      this.line(`static void as_vector_${key}_grow(as_vector_${key}* v, int cap) {`);
       this.indent++;
-      this.line('if (v->length == v->capacity) {');
-      this.indent++;
-      if (isPtr) {
-        this.line('int cap = v->capacity ? v->capacity * 2 : 4;');
-        this.line(`${ec}* nd = (${ec}*)gc_alloc(GCT_PTR_ARRAY, (size_t)cap * sizeof(${ec}));`);
-        this.line(`if (v->data != NULL && v->length > 0) memcpy(nd, v->data, (size_t)v->length * sizeof(${ec}));`);
-        this.line('v->data = nd; v->capacity = cap;');
-      } else {
-        this.line('v->capacity = v->capacity ? v->capacity * 2 : 4;');
-        this.line(`v->data = (${ec}*)realloc(v->data, v->capacity * sizeof(${ec}));`);
-      }
+      this.line('if (cap <= v->capacity) return;');
+      // Big payloads round up to a power-of-two element count. The allocator
+      // segregates big blocks by size class, and equal-sized requests are what
+      // let a freed buffer be handed straight back: Starling rebuilds a
+      // multi-MB VertexBuffer3D each frame and its element count drifts by a
+      // few hundred per frame, so exact sizing meant every frame carved a new
+      // segment and never reused the previous one. Small payloads keep exact
+      // sizes (rounding them would waste memory for no reuse benefit).
+      this.line(`if ((size_t)cap * sizeof(${ec}) >= GC_BIG_CLASS) { int p2 = 1; while (p2 > 0 && p2 < cap) p2 <<= 1; if (p2 > 0) cap = p2; }`);
+      this.line(`${ec}* nd = (${ec}*)gc_alloc(${isPtr ? 'GCT_PTR_ARRAY' : 'GCT_RAW'}, (size_t)cap * sizeof(${ec}));`);
+      this.line(`if (v->data != NULL && v->length > 0) memcpy(nd, v->data, (size_t)v->length * sizeof(${ec}));`);
+      this.line('v->data = nd;');
+      this.line('v->capacity = cap;');
+      this.line('gc_write_barrier((void*)nd);');
+      if (isPtr) this.line('for (int i = 0; i < v->length; i++) gc_write_barrier((void*)v->data[i]);');
       this.indent--;
       this.line('}');
+      this.line(`int as_vector_${key}_push(as_vector_${key}* v, ${ec} e) {`);
+      this.indent++;
+      this.line(`if (v->length == v->capacity) as_vector_${key}_grow(v, v->capacity ? v->capacity * 2 : 4);`);
       this.line('v->data[v->length++] = e;');
       if (isPtr) this.line('gc_write_barrier((void*)e);');
+      else if (elem.kind === 'interface') this.line('gc_write_barrier((void*)e.obj);');
       this.line('return v->length;');
       this.indent--;
       this.line('}');
+      // Spread-push: vec.push.apply(vec, argsArray) (Starling idiom). Unboxes each
+      // array element and pushes it into this vector.
+      {
+        let ux: string;
+        switch (elem.kind) {
+          case 'int': ux = 'as_v_int_val(a->data[i])'; break;
+          case 'uint': ux = 'as_v_uint_val(a->data[i])'; break;
+          case 'number': ux = 'as_v_num_val(a->data[i])'; break;
+          case 'bool': ux = 'as_v_bool_val(a->data[i])'; break;
+          case 'string': ux = 'as_v_str_val(a->data[i])'; break;
+          case 'object': ux = `((${elem.className}*)as_v_obj_val(a->data[i]))`; break;
+          case 'interface': ux = `((${elem.name}){ (void*)as_v_obj_val(a->data[i]), (${elem.name}_vtable*)as_iface_lookup(as_v_obj_val(a->data[i]), "${elem.name}") })`; break;
+          case 'array': ux = '((as_array*)as_v_obj_val(a->data[i]))'; break;
+          case 'vector': ux = `((as_vector_${this.vectorCName((elem as any).elem)}*)as_v_obj_val(a->data[i]))`; break;
+          case 'record': ux = '((as_object*)as_v_obj_val(a->data[i]))'; break;
+          case 'dict': ux = '((as_dict*)as_v_obj_val(a->data[i]))'; break;
+          case 'class': ux = '((as_class*)as_v_obj_val(a->data[i]))'; break;
+          case 'function': ux = '((as_fn)as_v_obj_val(a->data[i]))'; break;
+          default: ux = 'a->data[i]'; break;
+        }
+        this.line(`int as_vector_${key}_push_all(as_vector_${key}* v, as_array* a) {`);
+        this.indent++;
+        this.line('if (a == NULL) return v->length;');
+        this.line(`for (int i = 0; i < a->length; i++) as_vector_${key}_push(v, ${ux});`);
+        this.line('return v->length;');
+        this.indent--;
+        this.line('}');
+      }
       this.line(`${ec} as_vector_${key}_pop(as_vector_${key}* v) {`);
       this.indent++;
-      this.line(`if (v->length == 0) { as_throw(RangeError_new("Vector index out of bounds")); return ${defExpr}; }`);
+      this.line(`if (v->length == 0) { as_throw(RangeError_new("Vector index out of bounds", 0)); return ${defExpr}; }`);
       this.line('return v->data[--v->length];');
+      this.indent--;
+      this.line('}');
+      this.line(`${ec} as_vector_${key}_shift(as_vector_${key}* v) {`);
+      this.indent++;
+      this.line(`if (v->length == 0) { as_throw(RangeError_new("Vector index out of bounds", 0)); return ${defExpr}; }`);
+      this.line(`${ec} e = v->data[0];`);
+      this.line('for (int i = 1; i < v->length; i++) v->data[i - 1] = v->data[i];');
+      this.line('v->length--;');
+      this.line('return e;');
+      this.indent--;
+      this.line('}');
+      this.line(`int as_vector_${key}_unshift(as_vector_${key}* v, ${ec} e) {`);
+      this.indent++;
+      this.line(`if (v->length == v->capacity) as_vector_${key}_grow(v, v->capacity ? v->capacity * 2 : 4);`);
+      this.line('for (int i = v->length; i > 0; i--) v->data[i] = v->data[i - 1];');
+      this.line('v->data[0] = e;');
+      this.line('v->length++;');
+      if (isPtr) this.line('gc_write_barrier((void*)e);');
+      else if (elem.kind === 'interface') this.line('gc_write_barrier((void*)e.obj);');
+      this.line('return v->length;');
       this.indent--;
       this.line('}');
       this.line(`${ec} as_vector_${key}_get(as_vector_${key}* v, int i) {`);
       this.indent++;
-      this.line(`if (i < 0 || i >= v->length) { as_throw(RangeError_new("Vector index out of bounds")); return ${defExpr}; }`);
+      this.line(`if (i < 0 || i >= v->length) { as_throw(RangeError_new("Vector index out of bounds", 0)); return ${defExpr}; }`);
       this.line('return v->data[i];');
       this.indent--;
       this.line('}');
       this.line(`void as_vector_${key}_set(as_vector_${key}* v, int i, ${ec} e) {`);
       this.indent++;
-      this.line(`if (i < 0 || i >= v->length) { as_throw(RangeError_new("Vector index out of bounds")); return; }`);
+      this.line(`if (i < 0 || i > v->length) { as_throw(RangeError_new("Vector index out of bounds", 0)); return; }`);
+      // AS3 `vec[vec.length] = x` appends (grows the Vector by one), unlike a plain
+      // C array write. An index equal to the current length is therefore routed
+      // through push (which grows the buffer and applies the write barrier), and
+      // only strictly-out-of-range indices throw.
+      this.line(`if (i == v->length) { as_vector_${key}_push(v, e); return; }`);
       this.line('v->data[i] = e;');
+      if (isPtr) this.line('gc_write_barrier((void*)e);');
+      else if (elem.kind === 'interface') this.line('gc_write_barrier((void*)e.obj);');
       this.indent--;
       this.line('}');
       this.line(`as_vector_${key}* as_vector_${key}_new_sized(int n) {`);
@@ -5228,13 +9483,17 @@ export class Emitter {
       this.line('}');
       this.line(`void as_vector_${key}_setLength(as_vector_${key}* v, int n) {`);
       this.indent++;
-      this.line('if (n < 0) { as_throw(RangeError_new("Vector length cannot be negative")); return; }');
+      this.line('if (n < 0) { as_throw(RangeError_new("Vector length cannot be negative", 0)); return; }');
       this.line('if (n < v->length) { v->length = n; return; }');
-      if (isPtr) {
-        this.line(`if (v->capacity < n) { ${ec}* nd = (${ec}*)gc_alloc(GCT_PTR_ARRAY, (size_t)n * sizeof(${ec})); if (v->data != NULL && v->length > 0) memcpy(nd, v->data, (size_t)v->length * sizeof(${ec})); v->data = nd; v->capacity = n; }`);
-      } else {
-        this.line(`while (v->capacity < n) { v->capacity = v->capacity ? v->capacity * 2 : 4; v->data = (${ec}*)realloc(v->data, v->capacity * sizeof(${ec})); }`);
-      }
+      // Growth is amortised from whatever capacity already exists, but a vector
+      // that has never allocated (capacity 0) must not climb the doubling
+      // ladder: Starling rebuilds a multi-MB Vector.<Number> in one
+      // setLength() call per frame (VertexBuffer3D), so 4, 8, ... up to the
+      // full size would allocate and copy every rung only to discard it. Start
+      // at n: one allocation, and later pushes still double from there.
+      this.line('int cap = v->capacity ? v->capacity : n;');
+      this.line('while (cap < n) cap *= 2;');
+      this.line(`as_vector_${key}_grow(v, cap);`);
       this.line(`for (int i = v->length; i < n; i++) v->data[i] = ${defExpr};`);
       this.line('v->length = n;');
       this.indent--;
@@ -5256,16 +9515,11 @@ export class Emitter {
       this.line(`static void as_vector_${key}_ensure(as_vector_${key}* v, int need) {`);
       this.indent++;
       this.line('if (need <= v->capacity) return;');
-      this.line('int cap = v->capacity ? v->capacity : 4;');
+      // Same reasoning as setLength: a fresh vector allocates exactly what the
+      // caller needs instead of walking a doubling ladder to reach it.
+      this.line('int cap = v->capacity ? v->capacity : need;');
       this.line('while (cap < need) cap *= 2;');
-      if (isPtr) {
-        this.line(`${ec}* nd = (${ec}*)gc_alloc(GCT_PTR_ARRAY, (size_t)cap * sizeof(${ec}));`);
-        this.line(`if (v->data != NULL && v->length > 0) memcpy(nd, v->data, (size_t)v->length * sizeof(${ec}));`);
-        this.line('v->data = nd;');
-      } else {
-        this.line(`v->data = (${ec}*)realloc(v->data, (size_t)cap * sizeof(${ec}));`);
-      }
-      this.line('v->capacity = cap;');
+      this.line(`as_vector_${key}_grow(v, cap);`);
       this.indent--;
       this.line('}');
       this.line(`as_vector_${key}* as_vector_${key}_slice(as_vector_${key}* v, int from, int to) {`);
@@ -5299,9 +9553,32 @@ export class Emitter {
       this.line('int delta = itemCount - deleteCount;');
       this.line(`if (delta > 0) as_vector_${key}_ensure(v, v->length + delta);`);
       this.line(`if (tail > 0) memmove(&v->data[start + itemCount], &v->data[start + deleteCount], (size_t)tail * sizeof(${ec}));`);
-      this.line('for (int i = 0; i < itemCount; i++) { v->data[start + i] = items[i];' + (isPtr ? ' gc_write_barrier((void*)items[i]);' : '') + ' }');
+      const itemBarrier = isPtr ? ' gc_write_barrier((void*)items[i]);'
+        : (elem.kind === 'interface' ? ' gc_write_barrier((void*)items[i].obj);' : '');
+      this.line('for (int i = 0; i < itemCount; i++) { v->data[start + i] = items[i];' + itemBarrier + ' }');
       this.line('v->length += delta;');
       this.line('return removed;');
+      this.indent--;
+      this.line('}');
+      this.line(`${ec} as_vector_${key}_removeAt(as_vector_${key}* v, int index) {`);
+      this.indent++;
+      this.line('if (index < 0 || index >= v->length) index = v->length - 1;');
+      this.line(`${ec} removed = v->data[index];`);
+      this.line('if (index < v->length - 1) memmove(&v->data[index], &v->data[index + 1], (size_t)(v->length - index - 1) * sizeof(' + ec + '));');
+      this.line('v->length--;');
+      this.line('return removed;');
+      this.indent--;
+      this.line('}');
+      this.line(`void as_vector_${key}_insertAt(as_vector_${key}* v, int index, ${ec} e) {`);
+      this.indent++;
+      this.line('if (index < 0) index = 0;');
+      this.line('if (index > v->length) index = v->length;');
+      this.line(`as_vector_${key}_ensure(v, v->length + 1);`);
+      this.line(`if (index < v->length) memmove(&v->data[index + 1], &v->data[index], (size_t)(v->length - index) * sizeof(${ec}));`);
+      const insertBarrier = isPtr ? ' gc_write_barrier((void*)e);'
+        : (elem.kind === 'interface' ? ' gc_write_barrier((void*)e.obj);' : '');
+      this.line(`v->data[index] = e;${insertBarrier}`);
+      this.line('v->length++;');
       this.indent--;
       this.line('}');
       this.line(`void as_vector_${key}_forEach(as_vector_${key}* v, as_fn cb) {`);
@@ -5390,6 +9667,7 @@ export class Emitter {
       if (stmt.kind !== 'ClassDecl') continue;
       const name = qualifiedName(stmt.name, stmt.packageName);
       const info = this.symbols.getClass(name)!;
+      this.currentClass = name; // so paramDecls / declareVar resolve types in this file's import context
       const ctor = stmt.members.find(
         (m): m is Extract<ClassMember, { kind: 'Constructor' }> => m.kind === 'Constructor',
       );
@@ -5400,7 +9678,12 @@ export class Emitter {
       // body (no allocation, no vtable write). Inherited fields are NOT re-init'd
       // here: the superclass constructor already set their AS3 defaults.
       const ctorBody = ctor ? ctor.body.body : [];
-      const hasExplicitSuper = ctorBody.length > 0 && ctorBody[0].kind === 'SuperCall';
+      // AS3 allows local variable declarations before super() (as long as they
+      // do not read `this`/`super`); find the super() call anywhere in the body,
+      // not necessarily as the first statement.
+      const superIdx = ctorBody.findIndex((s) => s.kind === 'SuperCall');
+      const hasNestedSuper = superIdx < 0 && this.containsSuperCall(ctorBody);
+      const hasExplicitSuper = superIdx >= 0 || hasNestedSuper;
       // AS3 rule: a subclass whose superclass constructor takes required args
       // must call super(...) explicitly (the implicit super() passes no args).
       if (!hasExplicitSuper && info.superClass) {
@@ -5413,30 +9696,56 @@ export class Emitter {
       }
       this.line(`void ${name}_ctor(${name}* o${params ? ', ' + params : ''}) {`);
       this.indent++;
+      // Dynamic class (`dynamic class`, or any subclass of one): arbitrary
+      // undeclared keys live in the instance's own `_dyn` slot table, so it must
+      // exist before the first body statement (as_dyn_set writes through it).
+      // Allocated here rather than after super() because a class may legally set
+      // properties on `this` before calling super().
+      if (info.isDynamic) {
+        this.line('o->_dyn = as_object_new();');
+        this.line('gc_write_barrier((void*)o->_dyn);');
+      }
       if (ctor) {
         this.pushScope();
         this.functionScope = this.scopes[this.scopes.length - 1];
         this.declareVar('this', { kind: 'object', className: name });
-        for (const p of ctor.params) this.declareVar(p.name, resolveType(p.type));
+        for (const p of ctor.params) this.declareVar(p.name, this.rt(p.type));
         this.line(`${name}* this = o;`);
-        this.currentClass = name;
         this.hoistFunctionLocals(ctorBody);
       }
-      if (hasExplicitSuper) {
-        this.emitStmt(ctorBody[0]);
+      // gc_alloc zeroes the instance, so every non-`Number` field already holds
+      // its AS3 default (null/0/false/0.0). Only `Number` fields default to NaN,
+      // which is NOT the zero bit pattern, so seed them here — BEFORE super() and
+      // any constructor body statement — so a field default cannot clobber an
+      // assignment that ran before super() (the `o->_bounds = NULL` bug). Field
+      // *initializers* (`= value`) still run after super(), per AS3.
+      for (const [fname, f] of info.fields) {
+        if (f.owner !== name) continue;
+        if (!f.init && f.type.kind === 'number') this.line(`o->${this.cIdent(fname)} = NAN;`);
+      }
+      if (hasNestedSuper) {
+        // `super()` is inside a nested conditional/loop. Field *defaults* were
+        // seeded above; the body (containing super()) is emitted verbatim below.
+        // Field initializers (rare in this shape) follow the body, an
+        // approximation only hit by classes with both a nested super() and a
+        // field initializer.
+      } else if (superIdx >= 0) {
+        for (const s of ctorBody.slice(0, superIdx)) this.emitStmt(s);
+        this.emitStmt(ctorBody[superIdx]);
       } else if (info.superClass) {
         this.line(`${info.superClass}_ctor((${info.superClass}*)o);`);
       }
+      // Field initializers run after super() (AS3). Defaults are already seeded.
       for (const [fname, f] of info.fields) {
         if (f.owner !== name) continue; // inherited fields are set by super()
-        const init = f.init ? this.convert(this.emitExpr(f.init), f.type) : this.defaultInit(f.type);
-        this.line(`o->${this.cIdent(fname)} = ${init};`);
+        if (f.init) {
+          this.line(`o->${this.cIdent(fname)} = ${this.convert(this.emitExpr(f.init), f.type)};`);
+        }
       }
       if (ctor) {
-        const stmts = hasExplicitSuper ? ctorBody.slice(1) : ctorBody;
+        const stmts = superIdx >= 0 ? ctorBody.slice(superIdx + 1) : ctorBody;
         this.emitArgsIfUsed({ kind: 'Block', body: stmts }, ctor.params);
         this.emitBlockBody({ kind: 'Block', body: stmts });
-        this.currentClass = null;
         this.currentArgs = null;
         this.functionScope = null;
         this.hoistedLocals = new Set();
@@ -5456,6 +9765,21 @@ export class Emitter {
       this.indent--;
       this.line('}');
       this.line('');
+      // No-arg entry point for reflection (`Object(this).constructor as Class`
+      // + `new actualClass()`). AS3 semantics: `new Foo()` is legal whenever
+      // every parameter has a default; this wrapper supplies those defaults so
+      // the registry never stores a NULL factory for such a class. Emitted here
+      // (not in emitClassRegistry) because the default expressions must be
+      // converted in this class's import context.
+      const cparams = info.constructor.params;
+      if (cparams.length > 0 && cparams.every((p) => p.defaultValue !== null || p.isRest)) {
+        const defaults = cparams
+          .map((p) => (p.isRest ? `as_array_new()` : this.convert(this.emitExpr(p.defaultValue!), this.rt(p.type))))
+          .join(', ');
+        this.line(`${name}* ${name}_new_default(void) { return ${name}_new(${defaults}); }`);
+        this.line('');
+      }
+      this.currentClass = null;
     }
     // methods (instance / static / getter / setter)
     for (const stmt of this.program.body) {
@@ -5463,21 +9787,52 @@ export class Emitter {
       for (const m of stmt.members) {
         if (m.kind !== 'Method') continue;
         const cname = qualifiedName(stmt.name, stmt.packageName);
-        const returnType = resolveType(m.returnType);
-        this.line(`// ${cname}.${m.name}`);
+        // Set the class context BEFORE resolving the return type and parameter
+        // types: `rt` keys off `currentClass.importAlias` so short names like
+        // `Rectangle` resolve through THIS class's imports. Resolving first would
+        // use the previous class's (or the global) alias and could pull in a
+        // same-short-name user class instead of the built-in flash.geom.Rectangle.
         this.currentClass = cname;
+        const returnType = this.rt(m.returnType);
+        this.line(`// ${cname}.${m.name}`);
+        this.currentMethod = m.name;
         this.currentIsStatic = m.isStatic;
         this.currentReturnType = returnType;
         this.pushScope();
         this.functionScope = this.scopes[this.scopes.length - 1];
         this.declareVar('this', { kind: 'object', className: cname });
-        for (const p of m.params) this.declareVar(p.name, resolveType(p.type));
+        for (const p of m.params) this.declareVar(p.name, this.rt(p.type));
         const params = this.paramDecls(m.params);
 
-        if (m.isStatic) {
+        if (m.isStatic && m.isGetter) {
+          // Static getter: no `this` receiver; `_this` is unused. The `_static`
+          // suffix distinguishes it from an instance getter of the same name.
+          this.line(`${this.cTypeName(returnType)} ${cname}_get_${m.name}_static(void* _this) {`);
+          this.indent++;
+          this.line('(void)_this;');
+          this.hoistFunctionLocals(m.body.body);
+          this.emitClosureCellLocals();
+          this.emitArgsIfUsed(m.body, m.params);
+          this.emitBlockBody(m.body);
+          this.indent--;
+          this.line('}');
+          this.line('');
+        } else if (m.isStatic && m.isSetter) {
+          this.line(`void ${cname}_set_${m.name}_static(void* _this${params ? ', ' + params : ''}) {`);
+          this.indent++;
+          this.line('(void)_this;');
+          this.hoistFunctionLocals(m.body.body);
+          this.emitClosureCellLocals();
+          this.emitArgsIfUsed(m.body, m.params);
+          this.emitBlockBody(m.body);
+          this.indent--;
+          this.line('}');
+          this.line('');
+        } else if (m.isStatic) {
           this.line(`${this.cTypeName(returnType)} ${cname}_${m.name}_static(${params}) {`);
           this.indent++;
           this.hoistFunctionLocals(m.body.body);
+          this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
           this.indent--;
@@ -5488,6 +9843,7 @@ export class Emitter {
           this.indent++;
           this.line(`${cname}* this = (${cname}*)_this;`);
           this.hoistFunctionLocals(m.body.body);
+          this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
           this.indent--;
@@ -5498,6 +9854,7 @@ export class Emitter {
           this.indent++;
           this.line(`${cname}* this = (${cname}*)_this;`);
           this.hoistFunctionLocals(m.body.body);
+          this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
           this.indent--;
@@ -5508,6 +9865,7 @@ export class Emitter {
           this.indent++;
           this.line(`${cname}* this = (${cname}*)_this;`);
           this.hoistFunctionLocals(m.body.body);
+          this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
           this.indent--;
@@ -5518,6 +9876,7 @@ export class Emitter {
         this.hoistedLocals = new Set();
         this.popScope();
         this.currentClass = null;
+        this.currentMethod = null;
         this.currentIsStatic = false;
         this.currentReturnType = null;
         this.currentArgs = null;
@@ -5529,11 +9888,12 @@ export class Emitter {
       const f = this.symbols.getFunc(stmt.name)!;
       this.pushScope();
       this.functionScope = this.scopes[this.scopes.length - 1];
-      for (const p of stmt.params) this.declareVar(p.name, resolveType(p.type));
+      for (const p of stmt.params) this.declareVar(p.name, this.rt(p.type));
       this.currentReturnType = f.returnType;
       this.line(`${this.cTypeName(f.returnType)} ${stmt.name}(${this.paramDecls(stmt.params)}) {`);
       this.indent++;
       this.hoistFunctionLocals(stmt.body.body);
+      this.emitClosureCellLocals();
       this.emitArgsIfUsed(stmt.body, stmt.params);
       this.emitBlockBody(stmt.body);
       this.indent--;
@@ -5552,15 +9912,19 @@ export class Emitter {
   // var gets a default initializer and its actual init runs in main() in source
   // order (preserving AS3 top-level sequential execution semantics).
   private emitModuleVars(): void {
-    const vars: { name: string; type: ASType | null; init: Expr | null; isConst: boolean }[] = [];
-    for (const stmt of this.program.body) {
-      if (stmt.kind === 'VarDecl') vars.push({ name: stmt.name, type: stmt.type, init: stmt.init, isConst: false });
-      else if (stmt.kind === 'ConstDecl') vars.push({ name: stmt.name, type: stmt.type, init: stmt.init, isConst: true });
-    }
+    // Every declaration held by the script scope, wherever it is written in the
+    // top-level tree (see collectScriptDecls): AS3 gives the script one scope, so a
+    // `var` inside a top-level block/`if`/`for` init shares the same slot as a
+    // top-level one and survives the block.
+    const vars = collectScriptDecls(this.program.body);
     if (vars.length === 0) return;
 
     for (const v of vars) {
-      const ctype = v.type !== null ? resolveType(v.type) : (v.init ? this.emitExpr(v.init).type : { kind: 'int' });
+      const ctype = v.type !== null
+        ? this.rt(v.type)
+        : v.loop
+          ? this.loopVarType(v.loop.kind, this.emitExpr(v.loop.iterable).type, v.loop.declared)
+          : (v.init ? this.emitExpr(v.init).type : { kind: 'int' });
       this.moduleScope.set(v.name, ctype);
       const cn = this.moduleCName(v.name);
       if (v.isConst && this.isConstExpr(v.init)) {
@@ -5583,18 +9947,99 @@ export class Emitter {
     return `g_${name}`;
   }
 
+  // C type of a loop variable, derived from the iterable's C type. This is the
+  // ONE place the rule lives, so `emitModuleVars` (which must declare the C
+  // global before main) and the for-in/for-each emit sites cannot drift apart:
+  //   for-in     : Array -> int index; dynamic object -> char* key; Dictionary -> boxed key
+  //   for-each-in: element/value type — the source annotation wins when present
+  //                (`for each (var s:Sprite in list)`), otherwise the iterable decides
+  private loopVarType(kind: 'in' | 'each', it: CType, declared: ASType | null): CType {
+    if (kind === 'in') {
+      if (it.kind === 'dict') return { kind: 'any' };
+      if (it.kind === 'array') return { kind: 'int' };
+      return { kind: 'string' }; // record / dynamic Object keys
+    }
+    if (declared !== null) return this.rt(declared);
+    if (it.kind === 'vector') return it.elem;
+    if (it.kind === 'xmllist') return { kind: 'xml' };
+    return { kind: 'any' }; // Dictionary value, dynamic-object value, Array element
+  }
+
+  // True when a loop variable is a script-scope global rather than a block-local:
+  // AS3 gives the script exactly one scope, so `for (var k in o) {}` at top level
+  // must leave `k` visible to the statements that follow it.
+  private isModuleLoopVar(name: string): boolean {
+    return this.functionScope === null && this.moduleScope.has(name);
+  }
+
+  // Emit a per-class lazy initializer (`C_cinit`) for every class that owns a
+  // runtime-initialized static field. AS3 initializes a class's statics on its
+  // first access; mirroring that lazily (instead of eagerly in main() in
+  // declaration order) sidesteps the classic static-init-order hazard, where one
+  // class's static field reads another class's still-NULL static field either
+  // directly (`FilterEffect.VERTEX_FORMAT` -> `Effect.VERTEX_FORMAT`) or through
+  // a static method (`VertexDataFormat.fromString` -> `sFormats`). Cross-class
+  // reads call the other class's `_cinit` first (see `sfRead`), so dependencies
+  // resolve recursively; the `_cinit_done` flag breaks cycles like AVM2 does.
+  private emitStaticInits(): void {
+    if (this.staticFieldInits.length === 0) return;
+    const byClass = new Map<string, { cname: string; fname: string; f: FieldInfo }[]>();
+    for (const si of this.staticFieldInits) {
+      if (!byClass.has(si.cname)) byClass.set(si.cname, []);
+      byClass.get(si.cname)!.push(si);
+    }
+    for (const cname of byClass.keys()) {
+      this.line(`static bool ${cname}_cinit_done = false;`);
+      this.line(`static void ${cname}_cinit(void);`);
+    }
+    this.line('');
+    for (const [cname, inits] of byClass) {
+      this.line(`static void ${cname}_cinit(void) {`);
+      this.indent++;
+      this.line(`if (${cname}_cinit_done) return;`);
+      this.line(`${cname}_cinit_done = true;`);
+      for (const si of inits) {
+        // Emit each initializer in its declaring class's static context, so
+        // protected members resolve and short types map via its imports.
+        this.currentClass = cname;
+        const init = this.convert(this.emitExpr(si.f.init!), si.f.type);
+        this.line(`${si.cname}_${si.fname} = ${init};`);
+        this.currentClass = null;
+      }
+      this.indent--;
+      this.line('}');
+      this.line('');
+    }
+  }
+
+  // Read a static field, running the declaring class's `_cinit` first when the
+  // field is runtime-initialized (so a read can never observe an uninitialized
+  // NULL/default slot). Compile-time-literal consts are emitted at file scope
+  // and need no guard.
+  private sfRead(owner: string, name: string): string {
+    if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${owner}_${name})`;
+    return `${owner}_${name}`;
+  }
+
+  // Write a static field, running the declaring class's `_cinit` first for the
+  // same reason as `sfRead` (a `static var`'s initializer must run before any
+  // write can overwrite it).
+  private sfWrite(owner: string, name: string, value: string): string {
+    if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${owner}_${name} = ${value})`;
+    return `(${owner}_${name} = ${value})`;
+  }
+
   private emitMain(): void {
     this.line('int main(void) {');
     this.indent++;
     this.pushScope();
-    // Run runtime static-field initializers in class-declaration order (each in
-    // its declaring class's static context, so protected members resolve).
-    for (const si of this.staticFieldInits) {
-      this.currentClass = si.cname;
-      const init = this.convert(this.emitExpr(si.f.init!), si.f.type);
-      this.line(`${si.cname}_${si.fname} = ${init};`);
-      this.currentClass = null;
-    }
+    // Record this frame as the top of the stack: a collection forced from inside
+    // AS3 code (System.gc()) conservatively treats everything between the
+    // scanning frame and here as roots (see gc_mark_stack in the preamble).
+    this.line('GC_NOTE_STACK_BASE();');
+    // Static fields initialize lazily on first access (see emitStaticInits), so
+    // main() only runs module-level variable initializers and top-level
+    // statements; the demo bootstrap's static reads trigger each class's cinit.
     for (const stmt of this.program.body) {
       this.emitTopLevel(stmt);
     }
@@ -5613,6 +10058,10 @@ export class Emitter {
     // needs nothing — its constant initializer lives at file scope).
     if (stmt.kind === 'VarDecl' && this.moduleScope.has(stmt.name)) {
       if (stmt.init) {
+        // Same sequencing pass `emitStmt` runs for a function-local initializer:
+        // this path bypasses `emitVarDecl`, so without it a module-level
+        // `var r = box.get().m();` would inline `get()` twice (see hoistImpure).
+        this.sequenceValueExpr(stmt.init, true, true);
         const e = this.emitExpr(stmt.init);
         const ctype = this.moduleScope.get(stmt.name)!;
         this.line(`${this.moduleCName(stmt.name)} = ${this.convert(e, ctype)};`);
@@ -5624,9 +10073,31 @@ export class Emitter {
       // needs its initializer to run once in main(); compile-time-literal const
       // was already initialized at file scope.
       if (!this.isConstExpr(stmt.init)) {
+        this.sequenceValueExpr(stmt.init!, true, true);
         const e = this.emitExpr(stmt.init!);
         const ctype = this.moduleScope.get(stmt.name)!;
         this.line(`${this.moduleCName(stmt.name)} = ${this.convert(e, ctype)};`);
+      }
+      return;
+    }
+    if (stmt.kind === 'ConstDecls') {
+      // Multi-declarator module-level const: emit each runtime-initialized member.
+      let anyRuntime = false;
+      for (const d of stmt.decls) {
+        if (this.moduleScope.has(d.name) && !this.isConstExpr(d.init)) {
+          anyRuntime = true;
+          break;
+        }
+      }
+      if (anyRuntime) {
+        for (const d of stmt.decls) {
+          if (this.moduleScope.has(d.name) && !this.isConstExpr(d.init)) {
+            this.sequenceValueExpr(d.init!, true, true);
+            const e = this.emitExpr(d.init!);
+            const ctype = this.moduleScope.get(d.name)!;
+            this.line(`${this.moduleCName(d.name)} = ${this.convert(e, ctype)};`);
+          }
+        }
       }
       return;
     }
@@ -5653,14 +10124,50 @@ export class Emitter {
       }
       case 'ConstDecl': {
         if (stmt.init) this.sequenceValueExpr(stmt.init, true, true);
-        const ctype = stmt.type !== null ? resolveType(stmt.type) : this.emitExpr(stmt.init!).type;
+        // A const in the script scope (even inside a block in the top-level tree)
+        // lives in a file-scope slot emitted by emitModuleVars: a compile-time
+        // literal const is already initialized there, a runtime-initialized one
+        // (e.g. `const d = new Dictionary()`) needs one assignment here.
+        if (this.functionScope === null && this.moduleScope.has(stmt.name)) {
+          if (!this.isConstExpr(stmt.init)) {
+            const ctype = this.moduleScope.get(stmt.name)!;
+            const e = this.emitExpr(stmt.init!);
+            this.line(`${this.moduleCName(stmt.name)} = ${this.convert(e, ctype)};`);
+          }
+          break;
+        }
+        const ctype = stmt.type !== null ? this.rt(stmt.type) : this.emitExpr(stmt.init!).type;
         this.declareVar(stmt.name, ctype);
         const e = this.emitExpr(stmt.init!);
         this.line(`${this.constTypeName(ctype)} ${this.cIdent(stmt.name)} = ${this.convert(e, ctype)};`);
         break;
       }
+      case 'ConstDecls': {
+        for (const d of stmt.decls) {
+          if (d.init) this.sequenceValueExpr(d.init, true, true);
+          if (this.functionScope === null && this.moduleScope.has(d.name)) {
+            if (!this.isConstExpr(d.init)) {
+              const ctype = this.moduleScope.get(d.name)!;
+              const e = this.emitExpr(d.init!);
+              this.line(`${this.moduleCName(d.name)} = ${this.convert(e, ctype)};`);
+            }
+            continue;
+          }
+          const ctype = d.type !== null ? this.rt(d.type) : this.emitExpr(d.init!).type;
+          this.declareVar(d.name, ctype);
+          const e = this.emitExpr(d.init!);
+          this.line(`${this.constTypeName(ctype)} ${this.cIdent(d.name)} = ${this.convert(e, ctype)};`);
+        }
+        break;
+      }
       case 'ExprStmt': {
         this.sequenceValueExpr(stmt.expr, false, true);
+        // A getter/setter update (`prop++`) was already expanded into a getter
+        // read + setter write by sequenceValueExpr; emitExpr would only reproduce
+        // the invalid `get_prop(...)++` rvalue.
+        if (stmt.expr.kind === 'Update' && this.resolveUpdateSetter(stmt.expr.target)) {
+          break;
+        }
         const e = this.emitExpr(stmt.expr);
         // A write-barrier field assignment's comma expression carries a value that
         // is intentionally discarded in statement position; (void) silences clang's
@@ -5699,7 +10206,12 @@ export class Emitter {
         this.emitFor(stmt, null);
         break;
       case 'ForIn': {
+        // A `var` here is a script-scope global at top level (AS3 has one script
+        // scope), so emit into the hoisted global `g_x` instead of declaring a
+        // block-local; `emitModuleVars` already emitted its C declaration.
+        const modVar = stmt.declares && this.isModuleLoopVar(stmt.varName);
         const it = this.emitExpr(stmt.iterable);
+        it.code = this.hoistCollection(it);
         // for-in iterates array indices (int), Dictionary object keys, or
         // dynamic-object string keys.
         const isRecord = it.type.kind === 'record' || it.type.kind === 'any'
@@ -5711,16 +10223,17 @@ export class Emitter {
         const idx = this.tmpName('i');
         this.pushScope();
         this.breakTargets.push(this.tryFrames.length);
-        this.continueTargets.push(this.tryFrames.length);
+        this.continueTargets.push({ depth: this.tryFrames.length, label: null, used: false });
         if (isDict) {
           // Dictionary keys are boxed as_value. `for (var key:* in dict)` declares
           // an `any` loop var that keeps the box; an existing typed loop var
           // (`for (tgt:Object in dict)`) must unbox the key to its declared type.
-          if (stmt.declares) this.declareVar(stmt.varName, { kind: 'any' });
+          if (stmt.declares && !modVar) this.declareVar(stmt.varName, { kind: 'any' });
           this.line(`for (int ${idx} = 0; ${idx} < (${it.code})->length; ${idx}++) {`);
           this.indent++;
           if (stmt.declares) {
-            this.line(`as_value ${this.cIdent(stmt.varName)} = (${it.code})->keys[${idx}];`);
+            const lhs = modVar ? this.moduleCName(stmt.varName) : `as_value ${this.cIdent(stmt.varName)}`;
+            this.line(`${lhs} = (${it.code})->keys[${idx}];`);
           } else {
             const keyVal = { code: `(${it.code})->keys[${idx}]`, type: { kind: 'any' } as CType };
             this.line(`${this.cIdent(stmt.varName)} = ${this.unboxAny(keyVal, this.emitVar(stmt.varName).type)};`);
@@ -5732,18 +10245,24 @@ export class Emitter {
           const objCode = it.type.kind === 'record'
             ? it.code
             : `((as_object*)${it.type.kind === 'any' ? `as_v_obj_val(${it.code})` : it.code})`;
-          if (stmt.declares) this.declareVar(stmt.varName, { kind: 'string' });
+          if (stmt.declares && !modVar) this.declareVar(stmt.varName, { kind: 'string' });
           this.line(`for (int ${idx} = 0; ${idx} < (${objCode})->length; ${idx}++) {`);
           this.indent++;
-          this.line(`${stmt.declares ? `char* ${this.cIdent(stmt.varName)} = ` : `${this.cIdent(stmt.varName)} = `}(${objCode})->keys[${idx}];`);
+          const recLhs = stmt.declares
+            ? (modVar ? this.moduleCName(stmt.varName) : `char* ${this.cIdent(stmt.varName)}`)
+            : this.cIdent(stmt.varName);
+          this.line(`${recLhs} = (${objCode})->keys[${idx}];`);
           this.emitStmt(stmt.body);
           this.indent--;
           this.line('}');
         } else {
-          if (stmt.declares) this.declareVar(stmt.varName, { kind: 'int' });
+          if (stmt.declares && !modVar) this.declareVar(stmt.varName, { kind: 'int' });
           this.line(`for (int ${idx} = 0; ${idx} < (${it.code})->length; ${idx}++) {`);
           this.indent++;
-          this.line(`${stmt.declares ? `int ${this.cIdent(stmt.varName)} = ` : `${this.cIdent(stmt.varName)} = `}${idx};`);
+          const arrLhs = stmt.declares
+            ? (modVar ? this.moduleCName(stmt.varName) : `int ${this.cIdent(stmt.varName)}`)
+            : this.cIdent(stmt.varName);
+          this.line(`${arrLhs} = ${idx};`);
           this.emitStmt(stmt.body);
           this.indent--;
           this.line('}');
@@ -5754,24 +10273,139 @@ export class Emitter {
         break;
       }
       case 'ForEachIn': {
+        const modVar = stmt.declares && this.isModuleLoopVar(stmt.varName);
         const arr = this.emitExpr(stmt.iterable);
-        if (arr.type.kind !== 'array') {
-          throw new CodegenError('for-each-in requires an Array');
+        arr.code = this.hoistCollection(arr);
+        // XMLList iteration: `for each (child in xml.children)` walks the list's
+        // items (each an XML node), mirroring the Array loop below.
+        if (arr.type.kind === 'xmllist') {
+          const idx = this.tmpName('i');
+          this.pushScope();
+          this.breakTargets.push(this.tryFrames.length);
+          this.continueTargets.push({ depth: this.tryFrames.length, label: null, used: false });
+          this.line(`for (int ${idx} = 0; ${idx} < (${arr.code})->length; ${idx}++) {`);
+          this.indent++;
+          const elem = { code: `(${arr.code}->items[${idx}])`, type: { kind: 'xml' } as CType };
+          if (stmt.declares) {
+            const elemType = this.loopVarType('each', arr.type, stmt.varType);
+            if (!modVar) this.declareVar(stmt.varName, elemType);
+            const lhs = modVar ? this.moduleCName(stmt.varName) : `${this.cTypeName(elemType)} ${this.cIdent(stmt.varName)}`;
+            this.line(`${lhs} = ${this.convert(elem, elemType)};`);
+          } else {
+            const existing = this.emitVar(stmt.varName);
+            this.line(`${existing.code} = ${this.convert(elem, existing.type)};`);
+          }
+          this.emitStmt(stmt.body);
+          this.indent--;
+          this.line('}');
+          this.continueTargets.pop();
+          this.breakTargets.pop();
+          this.popScope();
+          break;
+        }
+        if (arr.type.kind !== 'array' && arr.type.kind !== 'vector' && arr.type.kind !== 'dict' && arr.type.kind !== 'record' && !(arr.type.kind === 'object' && arr.type.className === 'Object')) {
+          throw new CodegenError('for-each-in requires an Array, Vector, Dictionary, Object or XMLList');
+        }
+        if (arr.type.kind === 'vector') {
+          const key = this.vectorCName(arr.type.elem);
+          const idx = this.tmpName('i');
+          this.pushScope();
+          this.breakTargets.push(this.tryFrames.length);
+          this.continueTargets.push({ depth: this.tryFrames.length, label: null, used: false });
+          this.line(`for (int ${idx} = 0; ${idx} < (${arr.code})->length; ${idx}++) {`);
+          this.indent++;
+          const elem = { code: `as_vector_${key}_get(${arr.code}, ${idx})`, type: arr.type.elem };
+          if (stmt.declares) {
+            const elemType = this.loopVarType('each', arr.type, stmt.varType);
+            if (!modVar) this.declareVar(stmt.varName, elemType);
+            const lhs = modVar ? this.moduleCName(stmt.varName) : `${this.cTypeName(elemType)} ${this.cIdent(stmt.varName)}`;
+            this.line(`${lhs} = ${this.convert(elem, elemType)};`);
+          } else {
+            const existing = this.emitVar(stmt.varName);
+            this.line(`${existing.code} = ${this.convert(elem, existing.type)};`);
+          }
+          this.emitStmt(stmt.body);
+          this.indent--;
+          this.line('}');
+          this.continueTargets.pop();
+          this.breakTargets.pop();
+          this.popScope();
+          break;
+        }
+        if (arr.type.kind === 'dict') {
+          // Dictionary iteration walks its values (AS3 for-each-in over a
+          // Dictionary yields the values, not the keys).
+          const idx = this.tmpName('i');
+          this.pushScope();
+          this.breakTargets.push(this.tryFrames.length);
+          this.continueTargets.push({ depth: this.tryFrames.length, label: null, used: false });
+          this.line(`for (int ${idx} = 0; ${idx} < (${arr.code})->length; ${idx}++) {`);
+          this.indent++;
+          const elem = { code: `(${arr.code}->vals[${idx}])`, type: { kind: 'any' } as CType };
+          if (stmt.declares) {
+            const elemType = this.loopVarType('each', arr.type, stmt.varType);
+            if (!modVar) this.declareVar(stmt.varName, elemType);
+            const lhs = modVar ? this.moduleCName(stmt.varName) : `${this.cTypeName(elemType)} ${this.cIdent(stmt.varName)}`;
+            this.line(`${lhs} = ${this.convert(elem, elemType)};`);
+          } else {
+            const existing = this.emitVar(stmt.varName);
+            this.line(`${existing.code} = ${this.unboxAny(elem, existing.type)};`);
+          }
+          this.emitStmt(stmt.body);
+          this.indent--;
+          this.line('}');
+          this.continueTargets.pop();
+          this.breakTargets.pop();
+          this.popScope();
+          break;
+        }
+        if (arr.type.kind === 'record' || (arr.type.kind === 'object' && arr.type.className === 'Object')) {
+          // for-each-in over a dynamic object (record literal or `Object`)
+          // iterates its dynamic slot VALUES (AS3 for-each semantics).
+          const objCode = arr.type.kind === 'record' ? arr.code : `((as_object*)${arr.code})`;
+          const idx = this.tmpName('i');
+          this.pushScope();
+          this.breakTargets.push(this.tryFrames.length);
+          this.continueTargets.push({ depth: this.tryFrames.length, label: null, used: false });
+          this.line(`for (int ${idx} = 0; ${idx} < (${objCode})->length; ${idx}++) {`);
+          this.indent++;
+          const elem = { code: `(${objCode}->vals[${idx}])`, type: { kind: 'any' } as CType };
+          if (stmt.declares) {
+            const elemType = this.loopVarType('each', arr.type, stmt.varType);
+            if (!modVar) this.declareVar(stmt.varName, elemType);
+            const lhs = modVar ? this.moduleCName(stmt.varName) : `${this.cTypeName(elemType)} ${this.cIdent(stmt.varName)}`;
+            this.line(`${lhs} = ${this.convert(elem, elemType)};`);
+          } else {
+            const existing = this.emitVar(stmt.varName);
+            this.line(`${existing.code} = ${this.unboxAny(elem, existing.type)};`);
+          }
+          this.emitStmt(stmt.body);
+          this.indent--;
+          this.line('}');
+          this.continueTargets.pop();
+          this.breakTargets.pop();
+          this.popScope();
+          break;
         }
         const idx = this.tmpName('i');
         this.pushScope();
         this.breakTargets.push(this.tryFrames.length);
-        this.continueTargets.push(this.tryFrames.length);
+        this.continueTargets.push({ depth: this.tryFrames.length, label: null, used: false });
         this.line(`for (int ${idx} = 0; ${idx} < (${arr.code})->length; ${idx}++) {`);
         this.indent++;
-        if (stmt.varType === null) {
-          this.declareVar(stmt.varName, { kind: 'any' });
-          this.line(`as_value ${this.cIdent(stmt.varName)} = as_array_get(${arr.code}, ${idx});`);
+        const elem = { code: `as_array_get(${arr.code}, ${idx})`, type: { kind: 'any' } as CType };
+        if (stmt.declares) {
+          const elemType = this.loopVarType('each', arr.type, stmt.varType);
+          if (!modVar) this.declareVar(stmt.varName, elemType);
+          const lhs = modVar ? this.moduleCName(stmt.varName) : `${this.cTypeName(elemType)} ${this.cIdent(stmt.varName)}`;
+          this.line(`${lhs} = ${this.convert(elem, elemType)};`);
         } else {
-          const elemType = resolveType(stmt.varType);
-          this.declareVar(stmt.varName, elemType);
-          const elem = { code: `as_array_get(${arr.code}, ${idx})`, type: { kind: 'any' } as CType };
-          this.line(`${this.cTypeName(elemType)} ${this.cIdent(stmt.varName)} = ${this.convert(elem, elemType)};`);
+          // No `var`: iterate into an already-declared variable. Its type comes
+          // from the enclosing scope (not the loop annotation), and an `any` loop
+          // var keeps the box while a typed one unboxes the element. The C name
+          // must come from emitVar (a module-level var is `g_x`, not `x`).
+          const existing = this.emitVar(stmt.varName);
+          this.line(`${existing.code} = ${this.unboxAny(elem, existing.type)};`);
         }
         this.emitStmt(stmt.body);
         this.indent--;
@@ -5810,8 +10444,17 @@ export class Emitter {
           this.emitUnwind(lbl.tryDepth);
           this.line(`goto ${lbl.cName}__continue;`);
         } else {
-          this.emitUnwind(this.continueTargets[this.continueTargets.length - 1]);
-          this.line('continue;');
+          // `continue` must re-run the loop's condition (and, for a `for`, its
+          // update). A rewritten loop puts those behind a label, so an unlabelled
+          // continue jumps there rather than to the C loop's own back edge.
+          const tgt = this.continueTargets[this.continueTargets.length - 1];
+          this.emitUnwind(tgt.depth);
+          if (tgt.label) {
+            tgt.used = true;
+            this.line(`goto ${tgt.label};`);
+          } else {
+            this.line('continue;');
+          }
         }
         break;
       }
@@ -5916,15 +10559,51 @@ export class Emitter {
 
   // Emit loop statements with an optional `continue` label placed at the end of
   // the loop body (where C loops naturally jump back to the condition/update).
+  //
+  // AS3 evaluates the loop condition (and a `for`'s update) **once per
+  // iteration** — and in C some forms mention a sub-expression several times
+  // (`p.get().n > 0` expands to `p->vtable->get_n(p->vtable->get(p), …)`, so
+  // `get()` runs twice). `sequenceValueExpr` fixes that by hoisting the impure
+  // operand into a temp, but its prelude must run *inside* the loop: a prelude
+  // statement before the loop would freeze the value across iterations and break
+  // `while (a.x = f())`. So when — and only when — the sequencing pass actually
+  // has something to hoist, the loop is rewritten around the controls:
+  //
+  //   while (cond) body      ->  for (;;) { <cond prelude> if (!(cond)) break; body }
+  //   do body while (cond)   ->  for (;;) { body; <cond prelude> if (!(cond)) break; }
+  //   for (init; cond; upd)  ->  for (init; ;) { <cond prelude> if (!(cond)) break;
+  //                                                body; <upd prelude> <upd>; }
+  //
+  // The condition/update leave the C header, so an unlabelled `continue` can no
+  // longer reach them by falling off the body — it `goto`s the label placed in
+  // front of them instead (recorded in `continueTargets`). Loops with nothing to
+  // hoist keep the readable `while (cond)` / `for (a; b; c)` form.
   private emitWhile(stmt: Extract<Stmt, { kind: 'While' }>, continueLabel: string | null): void {
     const depth = this.tryFrames.length;
     this.breakTargets.push(depth);
-    this.continueTargets.push(depth);
+    const prelude = this.captureSequence(stmt.cond, true, true);
     const c = this.emitExpr(stmt.cond);
-    this.line(`while (${this.condExpr(c)}) {`);
+    if (prelude.length === 0) {
+      this.continueTargets.push({ depth, label: null, used: false });
+      this.line(`while (${this.condExpr(c)}) {`);
+      this.indent++;
+      this.emitStmt(stmt.body);
+      if (continueLabel) this.line(`${continueLabel}: ;`);
+      this.indent--;
+      this.line('}');
+      this.continueTargets.pop();
+      this.breakTargets.pop();
+      return;
+    }
+    const tgt = { depth, label: this.tmpName('cont'), used: false };
+    this.continueTargets.push(tgt);
+    this.line('for (;;) {');
     this.indent++;
+    this.emitLines(prelude);
+    this.line(`if (!(${this.condExpr(c)})) break;`);
     this.emitStmt(stmt.body);
     if (continueLabel) this.line(`${continueLabel}: ;`);
+    if (tgt.used) this.line(`${tgt.label}: ;`);
     this.indent--;
     this.line('}');
     this.continueTargets.pop();
@@ -5934,14 +10613,33 @@ export class Emitter {
   private emitDoWhile(stmt: Extract<Stmt, { kind: 'DoWhile' }>, continueLabel: string | null): void {
     const depth = this.tryFrames.length;
     this.breakTargets.push(depth);
-    this.continueTargets.push(depth);
-    this.line('do {');
+    const prelude = this.captureSequence(stmt.cond, true, true);
+    const c = this.emitExpr(stmt.cond);
+    if (prelude.length === 0) {
+      this.continueTargets.push({ depth, label: null, used: false });
+      this.line('do {');
+      this.indent++;
+      this.emitStmt(stmt.body);
+      if (continueLabel) this.line(`${continueLabel}: ;`);
+      this.indent--;
+      this.line(`} while (${this.condExpr(c)});`);
+      this.continueTargets.pop();
+      this.breakTargets.pop();
+      return;
+    }
+    // A `continue` must re-test the condition, so the check moves to the end of
+    // an unconditional loop body (after the label).
+    const tgt = { depth, label: this.tmpName('cont'), used: false };
+    this.continueTargets.push(tgt);
+    this.line('for (;;) {');
     this.indent++;
     this.emitStmt(stmt.body);
     if (continueLabel) this.line(`${continueLabel}: ;`);
+    if (tgt.used) this.line(`${tgt.label}: ;`);
+    this.emitLines(prelude);
+    this.line(`if (!(${this.condExpr(c)})) break;`);
     this.indent--;
-    const c = this.emitExpr(stmt.cond);
-    this.line(`} while (${this.condExpr(c)});`);
+    this.line('}');
     this.continueTargets.pop();
     this.breakTargets.pop();
   }
@@ -5950,21 +10648,67 @@ export class Emitter {
     this.pushScope();
     const depth = this.tryFrames.length;
     this.breakTargets.push(depth);
-    this.continueTargets.push(depth);
+    // The `for` init runs exactly once, so it gets the same sequencing pass a
+    // normal statement would (an impure method receiver or `x.f = v` in the init
+    // would otherwise appear twice in the emitted C). It is emitted first, so the
+    // condition/update capture below sees the loop variables in scope.
     let init = '';
     if (stmt.init) {
       if (stmt.init.kind === 'VarDecl') {
+        if (stmt.init.init) this.sequenceValueExpr(stmt.init.init, true, true);
         init = this.emitVarDecl(stmt.init.name, stmt.init.type, stmt.init.init);
+      } else if (stmt.init.kind === 'VarDecls') {
+        // C for-init admits only one declaration (or one type with comma
+        // declarators). Multi-declarator AS3 `for (var i:int=0, len:int=n; ...)`
+        // may mix types, so emit each declarator as a standalone statement before
+        // the loop and leave the for-init empty. All share the loop's pushed scope.
+        for (const d of stmt.init.decls) if (d.init) this.sequenceValueExpr(d.init, true, true);
+        const decls = stmt.init.decls.map((d) => this.emitVarDecl(d.name, d.type, d.init)).filter(Boolean);
+        for (const d of decls) this.line(`${d};`);
+        init = '';
       } else if (stmt.init.kind === 'ExprStmt') {
+        this.sequenceValueExpr(stmt.init.expr, true, true);
         init = this.emitExpr(stmt.init.expr).code;
       }
     }
+    // The condition and update run *per iteration*; their preludes are captured
+    // here and placed inside the loop body (never before it — that would freeze
+    // the side effects; see `emitWhile`). An update's value is discarded, so it
+    // takes the statement-level `valueCtx = false` pass that `ExprStmt` uses.
+    const condPrelude = stmt.cond ? this.captureSequence(stmt.cond, true, true) : [];
+    const updPrelude = stmt.update ? this.captureSequence(stmt.update, false, true) : [];
     const cond = stmt.cond ? this.condExpr(this.emitExpr(stmt.cond)) : '';
-    const update = stmt.update ? this.emitExpr(stmt.update).code : '';
-    this.line(`for (${init}; ${cond}; ${update}) {`);
+    if (condPrelude.length === 0 && updPrelude.length === 0) {
+      this.continueTargets.push({ depth, label: null, used: false });
+      const update = stmt.update ? this.emitExpr(stmt.update).code : '';
+      this.line(`for (${init}; ${cond}; ${update}) {`);
+      this.indent++;
+      this.emitStmt(stmt.body);
+      if (continueLabel) this.line(`${continueLabel}: ;`);
+      this.indent--;
+      this.line('}');
+      this.continueTargets.pop();
+      this.breakTargets.pop();
+      this.popScope();
+      return;
+    }
+    const tgt = { depth, label: this.tmpName('cont'), used: false };
+    this.continueTargets.push(tgt);
+    this.line(`for (${init}; ;) {`);
     this.indent++;
+    this.emitLines(condPrelude);
+    if (cond) this.line(`if (!(${cond})) break;`);
     this.emitStmt(stmt.body);
     if (continueLabel) this.line(`${continueLabel}: ;`);
+    if (tgt.used) this.line(`${tgt.label}: ;`);
+    this.emitLines(updPrelude);
+    // A getter/setter `prop++` update was already expanded into a getter read +
+    // setter write by the sequencing pass; emitExpr would only reproduce the
+    // invalid `get_prop(...)++` rvalue (same rule as the `ExprStmt` case).
+    if (stmt.update && !(stmt.update.kind === 'Update' && this.resolveUpdateSetter(stmt.update.target))) {
+      const e = this.emitExpr(stmt.update);
+      this.line(e.discard ? `(void)(${e.code});` : `${e.code};`);
+    }
     this.indent--;
     this.line('}');
     this.continueTargets.pop();
@@ -5972,21 +10716,40 @@ export class Emitter {
     this.popScope();
   }
 
+  // Run the sequencing pass for an expression whose evaluation must happen
+  // *inside* a loop body, intercepting any prelude statements it emits so the
+  // caller can place them at the right point. The generated lines are captured
+  // from the output buffer rather than recomputed, so this can never drift from
+  // `sequenceValueExpr`'s actual notion of "needs hoisting".
+  private captureSequence(e: Expr, valueCtx: boolean, guaranteed: boolean): string[] {
+    const start = this.out.length;
+    this.sequenceValueExpr(e, valueCtx, guaranteed);
+    if (this.out.length === start) return [];
+    return this.out.splice(start);
+  }
+
+  // Re-emit captured prelude lines one indent level deeper than they were
+  // generated (every line carries its full indent, so a uniform shift is exact).
+  private emitLines(lines: string[]): void {
+    for (const l of lines) this.out.push(l === '' ? '' : '  ' + l);
+  }
+
   // `throw expr` — AS3 throws an Error (or any value). We normalize everything
   // to an Error object: Error values pass through, strings are wrapped, and
   // other primitives are stringified first.
   private emitThrow(stmt: Extract<Stmt, { kind: 'Throw' }>): void {
+    this.sequenceValueExpr(stmt.value, true, true);
     const e = this.emitExpr(stmt.value);
     // Any Error subclass (Error/TypeError/RangeError/ArgumentError) passes through
     // as-is; other values are wrapped into a fresh Error.
     if (e.type.kind === 'object' && this.symbols.isSubclassOf(e.type.className, 'Error')) {
       this.line(`as_throw(${e.code});`);
     } else if (e.type.kind === 'string') {
-      this.line(`as_throw(Error_new(${e.code}));`);
+      this.line(`as_throw(Error_new(${e.code}, 0));`);
     } else if (e.type.kind === 'object') {
-      this.line(`as_throw(Error_new(as_obj_to_str((void*)(${e.code}))));`);
+      this.line(`as_throw(Error_new(as_obj_to_str((void*)(${e.code})), 0));`);
     } else {
-      this.line(`as_throw(Error_new(${this.toStringExpr(e)}));`);
+      this.line(`as_throw(Error_new(${this.toStringExpr(e)}, 0));`);
     }
   }
 
@@ -6064,11 +10827,18 @@ export class Emitter {
     this.line(`switch (${disc.code}) {`);
     this.indent++;
     for (const c of stmt.cases) {
+      // A bare `case X:` / `default:` must be followed by a *statement*, and in
+      // C11 a declaration is not one. The sequencing pass (`hoistImpure`) may put
+      // a leading declaration right after the label and there is no way to know
+      // that in advance, so the label always gets an empty statement. Native
+      // clang silently accepts `label: int x = ...` as a C23 extension
+      // (-Wc23-extensions), but the wasm frontend rejects it with "expected
+      // expression" — the generated C must be valid C11, not extension-dependent.
       if (c.test === null) {
-        this.line('default:');
+        this.line('default: ;');
       } else {
         const t = this.emitExpr(c.test);
-        this.line(`case ${t.code}:`);
+        this.line(`case ${t.code}: ;`);
       }
       this.indent++;
       for (const s of c.body) this.emitStmt(s);
@@ -6115,9 +10885,22 @@ export class Emitter {
 
   // Returns declaration text without trailing semicolon.
   private emitVarDecl(name: string, type: ASType | null, init: Expr | null): string {
+    // A declaration in the script scope keeps the module-scope slot even when it is
+    // written inside a block, an `if`, a `for` init or a `switch` case (AS3 hoists
+    // the whole top-level tree into the one script scope — see collectScriptDecls).
+    // emitModuleVars already emitted the C global, so emit only the assignment:
+    // declaring a C local here would hide the global from sibling blocks and from
+    // main()'s later statements (`for (var i…) {}` then `trace(i)` used to fail with
+    // "undefined variable 'i' at top level").
+    if (this.functionScope === null && this.moduleScope.has(name)) {
+      if (!init) return ''; // already default-initialized at file scope
+      const ctype = this.moduleScope.get(name)!;
+      const e = this.emitExpr(init);
+      return `${this.moduleCName(name)} = ${this.convert(e, ctype)}`;
+    }
     let ctype: CType;
     if (type !== null) {
-      ctype = resolveType(type);
+      ctype = this.rt(type);
     } else if (init) {
       ctype = this.emitExpr(init).type;
     } else {
@@ -6130,7 +10913,9 @@ export class Emitter {
       if (!init) return '';
       const e = this.emitExpr(init);
       const code = this.convert(e, ctype);
-      return `${this.cIdent(name)} = ${code}`;
+      // A boxed captured local has no C local of its own — assign through the
+      // shared closure cell (reference semantics).
+      return `${this.emitVar(name).code} = ${code}`;
     }
     this.declareVar(name, ctype);
     if (init) {
@@ -6159,10 +10944,226 @@ export class Emitter {
   // when the enclosing statement runs. We deliberately do not hoist inside
   // short-circuit RHS, conditional branches, or nested functions — those may not
   // execute, so hoisting would change semantics.
+  // Identify a setter assignment target and return enough info to emit the
+  // write (used by sequenceValueExpr to give setter assignments a value when they
+  // appear in chained-assignment RHS position, since the setter itself is void).
+  private resolveInstanceSetter(target: Expr): { owner: string; property: string; paramType: CType; objCode: string; isStatic: boolean } | null {
+    if (target.kind !== 'Member') return null;
+    // static setter: ClassName.prop = v
+    if (target.object.kind === 'Var') {
+      const cname = this.resolveClassName(target.object.name);
+      if (this.symbols.hasClass(cname)) {
+        const cinfo = this.symbols.getClass(cname)!;
+        const ss = cinfo.staticSetters?.get(target.property);
+        if (ss) {
+          return { owner: ss.owner, property: target.property, paramType: this.rt(ss.params[0].type), objCode: 'NULL', isStatic: true };
+        }
+      }
+    }
+    const obj = this.emitExpr(target.object);
+    if (obj.type.kind === 'object') {
+      const cinfo = this.symbols.getClass(obj.type.className);
+      const s = cinfo?.setters.get(target.property);
+      if (s) return { owner: s.owner, property: target.property, paramType: this.rt(s.params[0].type), objCode: obj.code, isStatic: false };
+    }
+    return null;
+  }
+
+  // Like resolveInstanceSetter, but for an unqualified bare setter name (`scaleX =
+  // scaleY = value` inside a setter body), where the target is a Var, not a Member.
+  private resolveBareSetter(target: Expr): { owner: string; property: string; paramType: CType; objCode: string; isStatic: boolean } | null {
+    if (target.kind !== 'Var' || !this.currentClass) return null;
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      if (this.scopes[i].has(target.name)) return null;
+    }
+    const cinfo = this.symbols.getClass(this.currentClass);
+    if (!this.currentIsStatic) {
+      const s = cinfo?.setters.get(target.name);
+      if (s) {
+        return { owner: s.owner, property: target.name, paramType: this.rt(s.params[0].type), objCode: this.emitVar('this').code, isStatic: false };
+      }
+    }
+    const ss = cinfo?.staticSetters?.get(target.name);
+    if (ss) {
+      return { owner: ss.owner, property: target.name, paramType: this.rt(ss.params[0].type), objCode: 'NULL', isStatic: true };
+    }
+    return null;
+  }
+
+  // Setter target of an update expression (`prop++` / `obj.prop++`), where the
+  // getter returns an rvalue so the read-modify-write must be expanded.
+  private resolveUpdateSetter(target: Expr): { owner: string; property: string; paramType: CType; objCode: string; isStatic: boolean } | null {
+    if (target.kind === 'Var') return this.resolveBareSetter(target);
+    if (target.kind === 'Member') return this.resolveInstanceSetter(target);
+    return null;
+  }
+
+  // A plain static FIELD (not a getter/setter) used as an lvalue — either a bare
+  // name inside a class or a `Class.field` reference. Unlike `resolveUpdateSetter`,
+  // which returns setter call info, this returns the field's C symbol so the
+  // caller can emit a true lvalue (`++` / `=`), wrapping the class's `_cinit`
+  // call around the operation rather than turning the lvalue into a comma rvalue.
+  private resolveStaticFieldTarget(target: Expr): { owner: string; name: string } | null {
+    if (target.kind === 'Var' && this.currentClass) {
+      for (let i = this.scopes.length - 1; i >= 0; i--) {
+        if (this.scopes[i].has(target.name)) return null;
+      }
+      const cinfo = this.symbols.getClass(this.currentClass);
+      // Mirror emitVar's precedence: an instance field or getter shadows a
+      // static field for an unqualified name, so those are not static lvalues.
+      if (cinfo?.fields.has(target.name) || cinfo?.getters.has(target.name)) return null;
+      const sf = cinfo?.staticFields.get(target.name);
+      if (sf && !this.symbols.isAccessible(sf.visibility, sf.owner, this.currentClass)) {
+        throw new CodegenError(`static field '${target.name}' is not accessible here`);
+      }
+      return sf ? { owner: sf.owner, name: target.name } : null;
+    }
+    if (target.kind === 'Member' && target.object.kind === 'Var') {
+      const cname = this.resolveClassName(target.object.name);
+      if (this.symbols.hasClass(cname)) {
+        const sf = this.symbols.getClass(cname)!.staticFields.get(target.property);
+        if (sf) return { owner: sf.owner, name: target.property };
+      }
+    }
+    return null;
+  }
+
+  // True when a bare-identifier assignment target resolves to a field of a
+  // GC-managed object (an instance field `this->x`, a captured closure variable
+  // `env->x`, or a boxed enclosing cell `cell->x`) rather than a C stack local,
+  // module variable, or static field. The former must go through the write
+  // barrier when storing a GC pointer (a BLACK object must not gain a WHITE
+  // reference unobserved); the latter are roots or dead at the frame-boundary
+  // safe point and need none. Mirrors emitVar's resolution precedence.
+  private resolvesToHeapField(target: Expr): boolean {
+    if (target.kind !== 'Var') return false;
+    const name = target.name;
+    // Captured closure variable: read/written through the closure env struct.
+    if (this.currentClosureCaptures?.has(name)) return true;
+    // Boxed captured local in the enclosing function: shared closure cell slot.
+    if (this.enclosingCaptured.has(name)) return true;
+    // A C stack local shadows any field of the same name.
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      if (this.scopes[i].has(name)) return false;
+    }
+    if (this.currentClass) {
+      const cinfo = this.symbols.getClass(this.currentClass);
+      if (cinfo?.fields.has(name)) return true;
+    }
+    return false;
+  }
+
+  // True when an expression is guaranteed side-effect-free and safe to duplicate
+  // in the emitted C (a bare variable/literal, or a field/index chain whose base
+  // is itself pure). Method/function calls, `new`, assignments and updates are
+  // impure: they may allocate, mutate state, or (for `pop()`/`shift()`) consume an
+  // element, so evaluating them twice is a bug.
+  private isPureExpr(e: Expr): boolean {
+    switch (e.kind) {
+      case 'Var':
+      case 'Num':
+      case 'Str':
+      case 'Bool':
+      case 'Null':
+        return true;
+      case 'Member':
+        return this.isPureExpr(e.object);
+      case 'Index':
+        return this.isPureExpr(e.object) && this.isPureExpr(e.index);
+      case 'Unary':
+        // `!`, unary `-`/`+`/`~` read their operand only (no side effects).
+        return this.isPureExpr(e.operand);
+      case 'Typeof':
+        return this.isPureExpr(e.operand);
+      case 'Binary': {
+        // Arithmetic/comparison/bitwise AND logical `&&`/`||` are all pure (no
+        // side effects) when both operands are. Even though `&&`/`||` short-circuit,
+        // they merely select one operand's value, so if both operands are pure the
+        // whole expression can be re-evaluated safely — and *must* be considered
+        // pure here, otherwise a pure `a || b` nested inside another `&&`/`||` would
+        // get hoisted to an unconditional statement, breaking the outer short-circuit
+        // (e.g. `false && (o.x > 0 || o.y > 0)` would deref `o` even though the
+        // whole guard is dead).
+        return this.isPureExpr(e.left) && this.isPureExpr(e.right);
+      }
+      default:
+        return false;
+    }
+  }
+
+  // True for expressions that compile to a single C atom — a variable (incl. `this`)
+  // or a literal. `&&`/`||` emit their left operand twice (once as the condition,
+  // once as the branch value), which is free for an atom but otherwise both grows
+  // the emitted expression (2^n along a left-nested `a && b && c …` chain) and
+  // re-evaluates it. Everything else is hoisted to a temp by sequenceValueExpr.
+  private isAtomicExpr(e: Expr): boolean {
+    return e.kind === 'Var' || e.kind === 'Num' || e.kind === 'Str'
+        || e.kind === 'Bool' || e.kind === 'Null';
+  }
+
+  // Capture a sub-expression that is mentioned more than once in the C text of a
+  // single AS3 operation, so that it runs exactly once — AS3 evaluates every
+  // operand once, left to right, and a call repeated twice is observable
+  // (`box.get().label = "Z"` ran the getter three times: store, write barrier,
+  // value; `h.getFn()()` ran it twice: closure + env).
+  //
+  // Impure operands only: a pure operand costs nothing to repeat. Only when the
+  // operand is *guaranteed* to run — inside a short-circuited `&&`/`||` branch a
+  // prelude statement would evaluate it even when the branch is skipped (see the
+  // `guaranteed` discussion in sequenceValueExpr).
+  private hoistImpure(e: Expr, guaranteed: boolean): void {
+    if (!guaranteed || this.hoistedAssigns.has(e) || this.isPureExpr(e)) return;
+    this.sequenceValueExpr(e, true, guaranteed);
+    if (this.hoistedAssigns.has(e)) return; // the recursion already captured it
+    const v = this.emitExpr(e);
+    const tmp = this.tmpName('once');
+    this.line(`${this.cTypeName(v.type)} ${tmp} = ${v.code};`);
+    this.hoistedAssigns.set(e, { tmp, type: v.type });
+  }
+
+  // The store half of a container-element update, `x[i] = Number(x[i]) ± 1`, built
+  // as an AST the ordinary Assign path can emit (used by the `Update` handling in
+  // sequenceValueExpr and emitExpr). `Number(...)` is the ToNumber that the
+  // increment operator itself performs.
+  private indexUpdateStore(target: Expr, op: string): Expr {
+    return {
+      kind: 'Assign',
+      op: '=',
+      target,
+      value: {
+        kind: 'Binary',
+        op: op === '++' ? '+' : '-',
+        left: this.toNumberAst(target),
+        right: { kind: 'Num', value: 1, isInt: true },
+      },
+    };
+  }
+
+  // `Number(x)` — the ToNumber the increment operator performs on its operand. It
+  // must be a real conversion, not the raw unbox for the operand's static type: a
+  // container element typed `any` may hold the STRING "5", and `a[i]++` has to
+  // yield 5 and store 6 (ES3 §11.3.1), not read the union's numeric field.
+  private toNumberAst(x: Expr): Expr {
+    return { kind: 'Call', callee: { kind: 'Var', name: 'Number' }, args: [x] };
+  }
+
   private sequenceValueExpr(e: Expr, valueCtx: boolean, guaranteed: boolean): void {
     switch (e.kind) {
       case 'Assign': {
         if (valueCtx && guaranteed && e.target.kind === 'Var') {
+          // A bare setter name (`scaleX = scaleY = value`) is a Var target whose
+          // setter call returns void; hoist the RHS value instead of the setter.
+          const bst = this.resolveBareSetter(e.target);
+          if (bst) {
+            this.sequenceValueExpr(e.value, true, guaranteed);
+            const v = this.emitExpr(e.value);
+            const cv = this.convert(v, bst.paramType);
+            const tmp = this.tmpName('seq');
+            this.line(`${this.cTypeName(bst.paramType)} ${tmp} = ${cv};`);
+            this.line(this.setterCallCode(bst.owner, bst.property, bst.isStatic, bst.objCode, tmp) + ';');
+            this.hoistedAssigns.set(e, { tmp, type: bst.paramType });
+            return;
+          }
           // The whole assignment is emitted as one standalone statement (which is
           // UB-free on its own); its RHS side effects are captured there, so we do
           // not recurse into the value.
@@ -6172,11 +11173,116 @@ export class Emitter {
           this.hoistedAssigns.set(e, { tmp, type: asg.type });
           return;
         }
+        // Setter assignment used as a value (`a.x = a.y = 0`, or a COMPOUND write
+        // `t = obj.prop += v`): the setter returns void but the assignment
+        // expression's value is the RHS (for a compound write, `get() OP v`).
+        // Evaluate that value into a temp, call the setter, and let later
+        // references read the temp.
+        if (valueCtx && guaranteed) {
+          // Capture an impure receiver before `resolveInstanceSetter` reads it: the
+          // setter call mentions it twice (vtable lookup + `this` argument) and it
+          // must also run *before* the RHS, which is the AS3 left-to-right order
+          // (this prelude used to be skipped entirely, so a loop condition like
+          // `while (q.get().n = v)` ran `get()` twice per evaluation).
+          if (e.target.kind === 'Member' || e.target.kind === 'AttrAccess') {
+            this.hoistImpure(e.target.object, guaranteed);
+          }
+          const st = this.resolveInstanceSetter(e.target);
+          if (st) {
+            // Recurse into the RHS first so a nested chained setter assignment
+            // (`a.x = a.y = a.z = 0`) is hoisted to a temp too; emitExpr then
+            // reads that temp instead of the inner void setter call.
+            this.sequenceValueExpr(e.value, true, guaranteed);
+            // A compound write's value is `get() OP rhs` — the same expression the
+            // setter argument is built from in emitAssign. Its type (not the
+            // setter's parameter type) is the expression's value type: `+=` on a
+            // String property yields the concatenated String.
+            const v = e.op === '=' ? this.emitExpr(e.value)
+              : this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[e.op], left: e.target, right: e.value });
+            const tmp = this.tmpName('seq');
+            const tmpType = e.op === '=' ? st.paramType : v.type;
+            this.line(`${this.cTypeName(tmpType)} ${tmp} = ${this.convert(v, tmpType)};`);
+            this.line(this.setterCallCode(st.owner, st.property, st.isStatic, st.objCode, this.convert({ code: tmp, type: tmpType }, st.paramType)) + ';');
+            this.hoistedAssigns.set(e, { tmp, type: tmpType });
+            return;
+          }
+        }
+        // Vector element chained assignment (`v[0] = v[2] = 0`): as_vector_set
+        // returns void; the assignment expression's value is the RHS.
+        if (valueCtx && guaranteed && e.op === '=' && e.target.kind === 'Index') {
+          const obj = this.emitExpr(e.target.object);
+          if (obj.type.kind === 'vector') {
+            this.sequenceValueExpr(e.value, true, guaranteed);
+            const idx = this.convert(this.emitExpr(e.target.index), { kind: 'int' });
+            const v = this.emitExpr(e.value);
+            const ev = this.convert(v, obj.type.elem);
+            const tmp = this.tmpName('seq');
+            this.line(`${this.cTypeName(obj.type.elem)} ${tmp} = ${ev};`);
+            this.line(`as_vector_${this.vectorCName(obj.type.elem)}_set(${obj.code}, ${idx}, ${tmp});`);
+            this.hoistedAssigns.set(e, { tmp, type: obj.type.elem });
+            return;
+          }
+        }
+        // A member write mentions the receiver three times in the emitted C
+        // (`x->f = v`, the GC write barrier on the same lvalue, and the value of
+        // the assignment expression), so an impure receiver is captured once.
+        if (e.target.kind === 'Member' || e.target.kind === 'AttrAccess') {
+          this.hoistImpure(e.target.object, guaranteed);
+        }
         this.sequenceValueExpr(e.target, false, guaranteed);
         this.sequenceValueExpr(e.value, true, guaranteed);
         return;
       }
       case 'Update': {
+        // getter/setter property `prop++` / `obj.prop++`: the getter returns an
+        // rvalue, so the read-modify-write expands to a getter read + setter write
+        // (and, when the value is consumed, a result temp). Both the getter read
+        // and the setter call mention the receiver, so an impure one is captured
+        // first — and *before* `resolveUpdateSetter`, which bakes the receiver's C
+        // text into `objCode` (`obj.get().n++` used to run `get()` four times).
+        if (e.target.kind === 'Member' || e.target.kind === 'AttrAccess') {
+          this.hoistImpure(e.target.object, guaranteed);
+        }
+        const us = this.resolveUpdateSetter(e.target);
+        if (us) {
+          // A value context that cannot be pre-evaluated (guaranteed false: a `?:`
+          // or `&&` branch) is left entirely to emitExpr, which folds the
+          // read-modify-write into one expression so the branch stays conditional —
+          // emitting the store here would run it even when the branch is not taken.
+          if (valueCtx && !guaranteed) return;
+          const oldv = this.emitExpr(e.target);
+          if (valueCtx && guaranteed) {
+            const oldTmp = this.tmpName('upd');
+            this.line(`${this.cTypeName(oldv.type)} ${oldTmp} = ${oldv.code};`);
+            const newCode = `(${oldTmp} ${e.op === '++' ? '+' : '-'} 1)`;
+            this.line(this.setterCallCode(us.owner, us.property, us.isStatic, us.objCode, this.convert({ code: newCode, type: oldv.type }, us.paramType)) + ';');
+            const resTmp = this.tmpName('upd');
+            this.line(`${this.cTypeName(oldv.type)} ${resTmp} = ${e.prefix ? newCode : oldTmp};`);
+            this.hoistedAssigns.set(e, { tmp: resTmp, type: oldv.type });
+            return;
+          }
+          const newCode = `(${oldv.code} ${e.op === '++' ? '+' : '-'} 1)`;
+          this.line(this.setterCallCode(us.owner, us.property, us.isStatic, us.objCode, this.convert({ code: newCode, type: oldv.type }, us.paramType)) + ';');
+          return;
+        }
+        if (valueCtx && guaranteed && e.target.kind === 'Index') {
+          // Container element `x[i]++` / `++x[i]` (Array / Vector / Dictionary /
+          // dynamic object / plain record): the element is reached through a runtime
+          // accessor, so there is no C lvalue to increment — `as_array_get(a, i)++`
+          // does not even compile. The increment expands to a read-modify-write
+          // through the Assign path, which knows how each container kind is read and
+          // written, with the operator's own ToNumber applied to the read (ES3
+          // §11.3.1/§11.4.1 define `++` as ToNumber(v) ± 1; a plain `v + 1` would
+          // concatenate for a String element).
+          const oldTmp = this.tmpName('upd');
+          const num: CType = { kind: 'number' };
+          this.line(`${this.cTypeName(num)} ${oldTmp} = ${this.convert(this.emitExpr(this.toNumberAst(e.target)), num)};`);
+          this.line(this.emitAssign(this.indexUpdateStore(e.target, e.op)).code + ';');
+          const resTmp = this.tmpName('upd');
+          this.line(`${this.cTypeName(num)} ${resTmp} = ${e.prefix ? `(${oldTmp} ${e.op === '++' ? '+' : '-'} 1)` : oldTmp};`);
+          this.hoistedAssigns.set(e, { tmp: resTmp, type: num });
+          return;
+        }
         if (valueCtx && guaranteed && e.target.kind === 'Var') {
           const upd = this.emitExpr(e);
           const tmp = this.tmpName('seq');
@@ -6184,12 +11290,48 @@ export class Emitter {
           this.hoistedAssigns.set(e, { tmp, type: upd.type });
           return;
         }
+        // `x.f++` reads and writes the receiver (and runs the write barrier); the
+        // receiver was already captured at the top of this case.
         this.sequenceValueExpr(e.target, false, guaranteed);
         return;
       }
       case 'Binary': {
+        // `&&`/`||` return the value of one operand (AS3/JS semantics) and are
+        // emitted as `(cond(left) ? ... : ...)`. The left operand is read twice
+        // there (once for the condition, once as a branch value), so when it has
+        // side effects it must be hoisted to a temp and evaluated exactly once.
+        //
+        // Any non-atom left operand is hoisted for the same reason, even when it is
+        // pure: a chain like `a && b && c` nests left-associatively, so re-emitting
+        // the left subtree in both slots doubles the emitted code at every level
+        // (2^n), and at runtime re-evaluates that subtree as many times. Hoisting to
+        // a temp makes both linear (RenderState.copyFrom's 6-term guard used to emit
+        // 32 identical `as_str_eq` calls, MatrixUtil.isIdentity3D's 16-term chain
+        // 65535 `as_vector_number_get` calls). Boolean operands are exempt in
+        // emitBinary, which collapses them to a plain C `&&`/`||` (no duplication at
+        // all); the temp is still harmless there. Only hoisted when the operand is
+        // guaranteed to run — inside a short-circuited branch a prelude statement
+        // would evaluate it even when the branch is skipped (see `guaranteed`).
+        // `==`/`!=` read an operand twice in the interface form
+        // (`a.obj == b.obj && a.vt == b.vt`), so an impure operand is captured
+        // once; the scalar/string/value forms read each operand once and are
+        // unaffected by the extra temp.
+        if (e.op === '==' || e.op === '!=' || e.op === '===' || e.op === '!==') {
+          this.hoistImpure(e.left, guaranteed);
+          this.hoistImpure(e.right, guaranteed);
+        }
+        const logical = e.op === '&&' || e.op === '||';
+        if (logical && (!this.isPureExpr(e.left) || (guaranteed && !this.isAtomicExpr(e.left)))) {
+          this.sequenceValueExpr(e.left, true, guaranteed);
+          const l = this.emitExpr(e.left);
+          const tmp = this.tmpName('sc');
+          this.line(`${this.cTypeName(l.type)} ${tmp} = ${l.code};`);
+          this.hoistedAssigns.set(e.left, { tmp, type: l.type });
+          this.sequenceValueExpr(e.right, true, false);
+          return;
+        }
         this.sequenceValueExpr(e.left, true, guaranteed);
-        const g2 = (e.op === '&&' || e.op === '||') ? false : guaranteed;
+        const g2 = logical ? false : guaranteed;
         this.sequenceValueExpr(e.right, true, g2);
         return;
       }
@@ -6212,20 +11354,66 @@ export class Emitter {
         return;
       }
       case 'Call': {
+        // A method call whose receiver has side effects (e.g. `pool.pop().reset()`)
+        // is emitted by emitCall with the receiver code duplicated — once for the
+        // vtable lookup and once as the `this` argument. Hoist such a receiver to a
+        // temp so it is evaluated exactly once: evaluating `pop()` twice would pop
+        // two elements and throw on an empty pool.
+        //
+        // The hoist is only safe when the call is *guaranteed* to run. Inside a
+        // short-circuited `&&`/`||` (guaranteed=false), hoisting the receiver to a
+        // standalone prelude statement would evaluate it even when the branch is
+        // skipped — e.g. `p in plugins && (plugin = new (...)).onInitTween(...)`
+        // must NOT run `new (...)` when `p in plugins` is false. There we leave
+        // the receiver inline so the surrounding ternary short-circuits it.
+        if (e.callee.kind === 'Member' && !this.isPureExpr(e.callee.object) && guaranteed) {
+          this.sequenceValueExpr(e.callee.object, true, guaranteed);
+          const recv = this.emitExpr(e.callee.object);
+          const tmp = this.tmpName('recv');
+          this.line(`${this.cTypeName(recv.type)} ${tmp} = ${recv.code};`);
+          this.hoistedAssigns.set(e.callee.object, { tmp, type: recv.type });
+          for (const a of e.args) this.hoistImpure(a, guaranteed);
+          return;
+        }
+        // A call through a value (`getFn()()`, `arr[i]()`) mentions the callee twice
+        // (the closure and its environment pointer).
+        if (e.callee.kind !== 'Var' && e.callee.kind !== 'Member') this.hoistImpure(e.callee, guaranteed);
         this.sequenceValueExpr(e.callee, true, guaranteed);
-        for (const a of e.args) this.sequenceValueExpr(a, true, guaranteed);
+        // Arguments are evaluated once, left to right, before the call; several
+        // built-in calls inline an argument more than once in their C form
+        // (`s.replace(h.mkRe(), x)` reads `->compiled` and `->global`,
+        // `Boolean(getS())` reads the string twice), so capture impure ones.
+        for (const a of e.args) this.hoistImpure(a, guaranteed);
         return;
       }
       case 'SuperMethod': {
         for (const a of e.args) this.sequenceValueExpr(a, true, guaranteed);
         return;
       }
+      case 'SuperProperty': {
+        return; // a pure field/getter access on the superclass — no side effects
+      }
       case 'Member': {
+        // A getter read emits `obj->vtable->get_x(obj)` — the receiver twice.
+        this.hoistImpure(e.object, guaranteed);
         this.sequenceValueExpr(e.object, true, guaranteed);
+        return;
+      }
+      case 'AttrAccess': {
+        this.hoistImpure(e.object, guaranteed);
+        this.sequenceValueExpr(e.object, true, guaranteed);
+        return;
+      }
+      case 'Filter': {
+        this.sequenceValueExpr(e.object, true, guaranteed);
+        this.sequenceValueExpr(e.value, true, guaranteed);
         return;
       }
       case 'Is':
       case 'As': {
+        // `x as T` tests the operand and then converts it, so the emitted C mentions
+        // it twice; capture an impure operand once.
+        this.hoistImpure(e.obj, guaranteed);
         this.sequenceValueExpr(e.obj, true, guaranteed);
         return;
       }
@@ -6270,6 +11458,11 @@ export class Emitter {
   }
 
   private emitExpr(expr: Expr): { code: string; type: CType; discard?: boolean } {
+    // A node hoisted by sequenceValueExpr (e.g. an impure method-call receiver or
+    // a chained assignment) has already been evaluated into a temp by a prelude
+    // statement; return that temp instead of re-emitting the side effects.
+    const hoisted = this.hoistedAssigns.get(expr);
+    if (hoisted) return { code: hoisted.tmp, type: hoisted.type };
     switch (expr.kind) {
       case 'Num': {
         if (expr.isInt) return { code: String(expr.value), type: { kind: 'int' } };
@@ -6310,7 +11503,57 @@ export class Emitter {
       case 'Update': {
         const hoisted = this.hoistedAssigns.get(expr);
         if (hoisted) return { code: hoisted.tmp, type: hoisted.type };
+        // A plain static field `C.f++` / `f++` keeps the field as a true lvalue
+        // but must run `C_cinit()` first; `(C_cinit(), C.f++)` is valid where a
+        // comma-wrapped lvalue (`(C_cinit(), C.f)++`) would not be.
+        const sf = this.resolveStaticFieldTarget(expr.target);
+        if (sf) {
+          const raw = `${sf.owner}_${sf.name}`;
+          const upd = expr.prefix ? `${expr.op}${raw}` : `${raw}${expr.op}`;
+          const o = this.emitExpr(expr.target);
+          return {
+            code: this.cinitClasses.has(sf.owner) ? `(${sf.owner}_cinit(), ${upd})` : `(${upd})`,
+            type: o.type,
+          };
+        }
         const o = this.emitExpr(expr.target);
+        // Increment/decrement of a NON-lvalue target that sequenceValueExpr could
+        // not hoist: an Index element (`x[i]++` — a runtime accessor, never a C
+        // lvalue) or a getter/setter property. This shape reaches here from a
+        // value context that must not be pre-evaluated (a `?:`/`&&` branch), so
+        // the read-modify-write is folded into ONE C expression whose side effects
+        // stay inside that branch: `(t = read, store, t)` for the postfix form
+        // (the value is the pre-increment read) and `(t = read, store, t ± 1)` for
+        // the prefix form. The scratch variable is declared here — the enclosing
+        // statement is emitted only after this expression's text is built, so the
+        // declaration lands ahead of it — and deliberately left uninitialized, so
+        // the branch that is not taken leaves no side effect behind.
+        if (expr.target.kind === 'Index') {
+          const num: CType = { kind: 'number' };
+          const sign = expr.op === '++' ? '+' : '-';
+          const t = this.tmpName('upd');
+          this.line(`${this.cTypeName(num)} ${t};`);
+          const read = this.convert(this.emitExpr(this.toNumberAst(expr.target)), num);
+          const store = this.emitAssign(this.indexUpdateStore(expr.target, expr.op));
+          return {
+            code: `((${t} = ${read}), ${store.code}, ${expr.prefix ? `(${t} ${sign} 1)` : t})`,
+            type: num,
+          };
+        }
+        const us2 = this.resolveUpdateSetter(expr.target);
+        if (us2) {
+          // Getter/setter property `obj.prop++` in a branch that cannot be
+          // pre-evaluated: the getter read is not a C lvalue either.
+          const t = this.tmpName('upd');
+          this.line(`${this.cTypeName(o.type)} ${t};`);
+          const sign = expr.op === '++' ? '+' : '-';
+          const call = this.setterCallCode(us2.owner, us2.property, us2.isStatic, us2.objCode,
+            this.convert({ code: `(${t} ${sign} 1)`, type: o.type }, us2.paramType));
+          return {
+            code: `((${t} = ${o.code}), ${call}, ${expr.prefix ? `(${t} ${sign} 1)` : t})`,
+            type: o.type,
+          };
+        }
         const code = expr.prefix ? `(${expr.op}${o.code})` : `(${o.code}${expr.op})`;
         return { code, type: o.type };
       }
@@ -6325,8 +11568,11 @@ export class Emitter {
         return { code: `(${this.condExpr(c)} ? ${t} : ${e})`, type };
       }
 
-      case 'Assign':
+      case 'Assign': {
+        const hoisted = this.hoistedAssigns.get(expr);
+        if (hoisted) return { code: hoisted.tmp, type: hoisted.type };
         return this.emitAssign(expr);
+      }
 
       case 'Call':
         return this.emitCall(expr);
@@ -6334,8 +11580,17 @@ export class Emitter {
       case 'Member':
         return this.emitMember(expr);
 
+      case 'AttrAccess':
+        return this.emitAttrAccess(expr);
+
+      case 'Filter':
+        return this.emitFilter(expr);
+
       case 'SuperMethod':
         return this.emitSuperMethod(expr);
+
+      case 'SuperProperty':
+        return this.emitSuperProperty(expr);
 
       case 'Is':
         return this.emitIs(expr);
@@ -6366,12 +11621,14 @@ export class Emitter {
       case 'FunctionExpr': {
         const name = this.anonIndex.get(expr)!;
         const captures = this.anonCaptures.get(expr) ?? [];
+        const anonFn = this.anonFuncs.find((f) => f.name === name);
+        const arity = anonFn ? this.requiredArity(anonFn.params) : 0;
         if (captures.length === 0) {
-          return { code: `as_fn_make(${name}__call, NULL)`, type: { kind: 'function' } };
+          return { code: `as_fn_make(${name}__call, NULL, ${arity})`, type: { kind: 'function' } };
         }
         // Capture each free variable's current value into a heap-allocated env.
         const vals = captures.map((c) => this.emitVar(c.name).code).join(', ');
-        return { code: `as_fn_make(${name}__call, ${name}_env_make(${vals}))`, type: { kind: 'function' } };
+        return { code: `as_fn_make(${name}__call, ${name}_env_make(${vals}), ${arity})`, type: { kind: 'function' } };
       }
 
       case 'RegExp': {
@@ -6385,6 +11642,11 @@ export class Emitter {
   private emitVar(name: string): { code: string; type: CType } {
     if (name === 'this') {
       if (!this.currentClass) throw new CodegenError("'this' used outside a class method");
+      // Inside a closure that captured `this`, the receiver lives in the env
+      // (the closure body has no `this` parameter of its own).
+      if (this.currentClosureCaptures?.has('this')) {
+        return { code: `env->${this.cIdent('this')}`, type: this.currentClosureCaptures.get('this')! };
+      }
       return { code: 'this', type: { kind: 'object', className: this.currentClass } };
     }
     // AS3 global `undefined` constant (boxed as_value with a dedicated tag).
@@ -6393,7 +11655,20 @@ export class Emitter {
     }
     // Captured variable inside a closure: read through the environment pointer.
     if (this.currentClosureCaptures?.has(name)) {
-      return { code: `env->${this.cIdent(name)}`, type: this.currentClosureCaptures.get(name)! };
+      const t = this.currentClosureCaptures.get(name)!;
+      // Capture by reference: a captured var-local that owns an activation cell is
+      // reached through the cell the env carries, so assignments made by the
+      // enclosing body after this closure was created are visible here too.
+      const cell = this.currentClosureCells?.get(name);
+      if (cell !== undefined) return { code: `env->${this.cIdent(cell)}->${this.cIdent(name)}`, type: t };
+      return { code: `env->${this.cIdent(name)}`, type: t };
+    }
+    // Boxed captured local in the enclosing function: read through the shared
+    // closure cell so the enclosing body and its closures see the same storage
+    // (reference semantics — a closure mutating `numComplete` propagates back).
+    if (this.enclosingCaptured.has(name)) {
+      const cap = this.enclosingCaptured.get(name)!;
+      return { code: `${cap.cell}->${cap.field}`, type: cap.type };
     }
     // Local (block-scoped) variables shadow class members and module globals.
     for (let i = this.scopes.length - 1; i >= 0; i--) {
@@ -6403,27 +11678,40 @@ export class Emitter {
     // Unqualified identifier inside a method falls back to a field (this->name),
     // a static field (Class_name), or a getter.
     if (this.currentClass) {
+      const self = this.emitVar('this').code;
       const cinfo = this.symbols.getClass(this.currentClass);
-      const f = cinfo?.fields.get(name);
+      const f = this.symbols.fieldSlot(this.currentClass, name);
       if (f) {
         if (!this.symbols.isAccessible(f.visibility, f.owner, this.currentClass)) {
           throw new CodegenError(`field '${name}' is not accessible here`);
         }
-        return { code: `this->${this.cIdent(name)}`, type: f.type };
+        return { code: `${self}->${this.cIdent(f.cName ?? name)}`, type: f.type };
       }
       const sf = cinfo?.staticFields.get(name);
       if (sf) {
         if (!this.symbols.isAccessible(sf.visibility, sf.owner, this.currentClass)) {
           throw new CodegenError(`static field '${name}' is not accessible here`);
         }
-        return { code: `${sf.owner}_${name}`, type: sf.type };
+        return { code: this.sfRead(sf.owner, name), type: sf.type };
       }
       const g = cinfo?.getters.get(name);
       if (g) {
         if (!this.symbols.isAccessible(g.visibility, g.owner, this.currentClass)) {
           throw new CodegenError(`getter '${name}' is not accessible here`);
         }
-        return { code: `${g.owner}_get_${name}(this)`, type: g.returnType };
+        // Instance getter dispatch is VIRTUAL (a subclass may override `get foo()`
+        // and a base-typed reference must reach the runtime object's override).
+        // Dispatch through the vtable slot rather than statically to g.owner.
+        return { code: `(${self}->vtable->get_${this.cIdent(name)}(${self}))`, type: g.returnType };
+      }
+      // A bare identifier naming a static getter (`useDoubleBuffering` inside a
+      // static or instance method) reaches `Class.prop`, not `this.prop`.
+      const sg = cinfo?.staticGetters?.get(name);
+      if (sg) {
+        if (!this.symbols.isAccessible(sg.visibility, sg.owner, this.currentClass)) {
+          throw new CodegenError(`static getter '${name}' is not accessible here`);
+        }
+        return { code: `${sg.owner}_get_${name}_static(NULL)`, type: sg.returnType };
       }
       // A method referenced by its bare name is `this.method` used as a value
       // (e.g. passed as a listener). Bind the receiver in a thunk.
@@ -6433,18 +11721,17 @@ export class Emitter {
           if (!this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) {
             throw new CodegenError(`method '${name}' is not accessible here`);
           }
-          return { code: `as_fn_make(${this.currentClass}_${name}__bound, (void*)this)`, type: { kind: 'function' } };
+          return { code: `as_fn_make(${this.currentClass}_${name}__bound, (void*)${self}, ${this.requiredArity(m.params)})`, type: { kind: 'function' } };
         }
-      } else {
-        // In a static context, a bare identifier naming a static method is
-        // `Class.method` used as a value (no receiver).
-        const sm = cinfo?.staticMethods.get(name);
-        if (sm) {
-          if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
-            throw new CodegenError(`static method '${name}' is not accessible here`);
-          }
-          return { code: `as_fn_make(${sm.owner}_${name}__call, NULL)`, type: { kind: 'function' } };
+      }
+      // A bare identifier naming a static method is `Class.method` used as a value
+      // in ANY context (static methods carry no receiver).
+      const sm = cinfo?.staticMethods.get(name);
+      if (sm) {
+        if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
+          throw new CodegenError(`static method '${name}' is not accessible here`);
         }
+        return { code: `as_fn_make(${sm.owner}_${name}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
       }
     }
     // Module-level (top-level) variables are only visible outside class methods,
@@ -6455,8 +11742,59 @@ export class Emitter {
     }
     // A free function used as a value (var f:Function = foo).
     const func = this.symbols.getFunc(name);
-    if (func) return { code: `as_fn_make(${name}__call, NULL)`, type: { kind: 'function' } };
-    throw new CodegenError(`undefined variable '${name}'`);
+    if (func) return { code: `as_fn_make(${name}__call, NULL, ${this.requiredArity(func.params)})`, type: { kind: 'function' } };
+    // A recursive nested function references its own name (`setTimeout(fn, 1)`);
+    // that resolves to a closure over the CURRENT env, not a rebuilt env (which
+    // would recurse forever). Only relevant while emitting that function's body.
+    if (name === this.currentFuncCName || (this.currentFuncAsName !== null && name === this.currentFuncAsName)) {
+      const envArg = this.currentClosureCaptures ? 'env' : 'NULL';
+      return { code: `as_fn_make(${this.currentFuncCName}__call, ${envArg}, ${this.currentFuncArity})`, type: { kind: 'function' } };
+    }
+    // A nested function declaration used as a value: build its closure by
+    // capturing the enclosing variables recorded during pass 1. Resolve the
+    // source-level name to the defining class's unique C name (nested function
+    // names are function-scoped, so they can legitimately repeat across classes).
+    const nfKey = this.nestedFuncByAsName.get(`${this.currentClass ?? ''}:${this.currentMethod ?? ''}:${name}`);
+    const nf = nfKey !== undefined ? this.nestedFuncs.get(nfKey) : undefined;
+    if (nf) {
+      // A mutually-recursive sibling group member's function value lives in the
+      // shared cell (identity-stable, so `removeEventListener(..., handler)`
+      // still matches). Inside a sibling body `env` IS the cell; in the enclosing
+      // method body the cell local is lazily initialized once on first reference
+      // (after any prior variable assignments, e.g. `profiles = [...]`).
+      const group = this.closureGroups.get(nfKey);
+      if (group) {
+        if (this.currentClosureCaptures) return { code: `env->${nfKey}`, type: { kind: 'function' } };
+        // The cell is eagerly allocated in emitClosureCellLocals; the member's
+        // `as_fn` slot is already populated by `<cell>_alloc`, so read it directly
+        // (identity-stable for removeEventListener's `listener === handler` match).
+        return { code: `${group.cellLocal}->${nfKey}`, type: { kind: 'function' } };
+      }
+      if (nf.captures.length === 0) return { code: `as_fn_make(${nfKey}__call, NULL, ${this.requiredArity(nf.params)})`, type: { kind: 'function' } };
+      // Mutual recursion between sibling nested functions (onLoadComplete <->
+      // cleanup) would otherwise rebuild each other's env forever. Break the
+      // cycle by yielding NULL for a closure that is already being built. This
+      // is a pragmatic AOT-subset approximation; see the known-limitations note.
+      if (this.buildingClosures.has(nfKey)) return { code: 'NULL', type: { kind: 'function' } };
+      this.buildingClosures.add(nfKey);
+      try {
+        const vals = nf.captures.map((c) => this.emitVar(c.name).code).join(', ');
+        return { code: `as_fn_make(${nfKey}__call, ${nfKey}_env_make(${vals}), ${this.requiredArity(nf.params)})`, type: { kind: 'function' } };
+      } finally {
+        this.buildingClosures.delete(nfKey);
+      }
+    }
+    // A bare class name used as a Class value (`new Starling(Game, ...)`, or a
+    // `Class`-typed argument): resolve to the named class object emitted by
+    // emitClassRegistry. Only user classes (which have an `_cls` object) qualify.
+    const clsName = this.resolveClassName(name);
+    if (this.symbols.hasClass(clsName)) {
+      const clsInfo = this.symbols.getClass(clsName)!;
+      if (clsInfo.fqn !== undefined) {
+        return { code: `&${clsName}_cls`, type: { kind: 'class' } };
+      }
+    }
+    throw new CodegenError(`undefined variable '${name}'` + (this.currentClass ? ` in class ${this.currentClass}` : ' at top level') + (this.currentClosureCaptures ? ` (closure captures: [${[...this.currentClosureCaptures.keys()].join(', ')}])` : ''));
   }
 
   // Whether a statement/expression tree references AS3's `arguments` object.
@@ -6471,6 +11809,7 @@ export class Emitter {
       case 'VarDecl': return s.init ? this.usesArgumentsExpr(s.init) : false;
       case 'VarDecls': return s.decls.some((d) => (d.init ? this.usesArgumentsExpr(d.init) : false));
       case 'ConstDecl': return this.usesArgumentsExpr(s.init);
+      case 'ConstDecls': return s.decls.some((d) => (d.init ? this.usesArgumentsExpr(d.init) : false));
       case 'ExprStmt': return this.usesArgumentsExpr(s.expr);
       case 'Block': return this.usesArgumentsStmts(s.body);
       case 'If': return this.usesArgumentsExpr(s.cond) || this.usesArgumentsStmt(s.then) || (s.else ? this.usesArgumentsStmt(s.else) : false);
@@ -6501,7 +11840,10 @@ export class Emitter {
       case 'Assign': return this.usesArgumentsExpr(e.target) || this.usesArgumentsExpr(e.value);
       case 'Call': return this.usesArgumentsExpr(e.callee) || e.args.some((a) => this.usesArgumentsExpr(a));
       case 'Member': return this.usesArgumentsExpr(e.object);
+      case 'AttrAccess': return this.usesArgumentsExpr(e.object);
+      case 'Filter': return this.usesArgumentsExpr(e.object) || this.usesArgumentsExpr(e.value);
       case 'SuperMethod': return e.args.some((a) => this.usesArgumentsExpr(a));
+      case 'SuperProperty': return false;
       case 'Is': return this.usesArgumentsExpr(e.obj);
       case 'As': return this.usesArgumentsExpr(e.obj);
       case 'In': return this.usesArgumentsExpr(e.key) || this.usesArgumentsExpr(e.object);
@@ -6523,7 +11865,7 @@ export class Emitter {
       this.line('as_array* arguments = as_array_new();');
       return;
     }
-    const items = params.map((p) => this.boxExpr({ code: this.cIdent(p.name), type: resolveType(p.type) }));
+    const items = params.map((p) => this.boxExpr({ code: this.cIdent(p.name), type: this.rt(p.type) }));
     this.line(`as_array* arguments = as_array_make(${params.length}, (as_value[${params.length}]){ ${items.join(', ')} });`);
   }
 
@@ -6546,9 +11888,18 @@ export class Emitter {
         const rs = r.type.kind === 'string' ? r.code : this.toStringExpr(r);
         return { code: `as_str_concat(${ls}, ${rs})`, type: { kind: 'string' } };
       }
-      // dynamic operand: unbox to Number and add.
-      if (l.type.kind === 'any' || r.type.kind === 'any') {
-        return { code: `(${this.toNumberExpr(l)} + ${this.toNumberExpr(r)})`, type: { kind: 'number' } };
+      // dynamic operand: the runtime tag decides concatenation vs numeric add
+      // (AS3/ES3 ToPrimitive — a String, or an object that stringifies, on either
+      // side means concatenation). Both operands are boxed and the result is boxed,
+      // hence the `any` result type. A statically-typed String operand is already
+      // handled above, but a *dynamic* one cannot be: `var a:Array=["x","y"];
+      // a[0]+a[1]` used to emit `as_v_to_number(a[0]) + as_v_to_number(a[1])` = 0
+      // instead of "xy", and `d + 1` with `d:*` holding "x" gave 1 instead of "x1".
+      // The `null` operand rides along: AS3 coerces null to 0 numerically (and to
+      // "null" when the other side is a String, handled above), whereas
+      // emitArith would emit `(NULL + 1)` — a compile error in C.
+      if (l.type.kind === 'any' || r.type.kind === 'any' || l.type.kind === 'null' || r.type.kind === 'null') {
+        return { code: `as_add_v(${this.boxExpr(l)}, ${this.boxExpr(r)})`, type: { kind: 'any' } };
       }
       return this.emitArith(l, r, '+');
     }
@@ -6568,8 +11919,13 @@ export class Emitter {
       if (l.type.kind === 'any' || r.type.kind === 'any') {
         return { code: `fmod(${this.toNumberExpr(l)}, ${this.toNumberExpr(r)})`, type: { kind: 'number' } };
       }
-      if (l.type.kind === 'int' && r.type.kind === 'int') return { code: `(${l.code} % ${r.code})`, type: { kind: 'int' } };
-      if (l.type.kind === 'uint' && r.type.kind === 'uint') return { code: `(${l.code} % ${r.code})`, type: { kind: 'uint' } };
+      // Both operands int/uint: AS3's `%` is int/uint-typed here, but C's `%` is
+      // UB on a zero divisor (and on INT_MIN % -1), so both go through the
+      // guarded helpers — see as_int_rem/as_uint_rem for the adl-probed values.
+      if (l.type.kind === 'int' && r.type.kind === 'int') return { code: `as_int_rem(${l.code}, ${r.code})`, type: { kind: 'int' } };
+      if (l.type.kind === 'uint' && r.type.kind === 'uint') return { code: `as_uint_rem(${l.code}, ${r.code})`, type: { kind: 'uint' } };
+      // Mixed/Number operands: AS3's remainder is Number here, and fmod matches
+      // it exactly (including NaN for a zero divisor, and truncation toward zero).
       return { code: `fmod(${this.convert(l, { kind: 'number' })}, ${this.convert(r, { kind: 'number' })})`, type: { kind: 'number' } };
     }
 
@@ -6585,18 +11941,63 @@ export class Emitter {
     }
 
     if (op === '&&' || op === '||') {
-      const lb = l.type.kind === 'any' ? `as_v_truthy(${l.code})` : l.code;
-      const rb = r.type.kind === 'any' ? `as_v_truthy(${r.code})` : r.code;
-      return { code: `(${lb} ${op} ${rb})`, type: { kind: 'bool' } };
+      // Fast path: with both operands statically Boolean, C's `&&`/`||` already has
+      // AS3's value semantics — a false left yields `false`, which *is* the left
+      // operand's value, and a truthy left yields the right operand — and it
+      // short-circuits, evaluating each operand exactly once. The general ternary
+      // below would instead emit the left operand twice, which is exponential along
+      // a left-nested chain (`a && b && c`, the shape of nearly every AS3 guard:
+      // `if (x != null && x.parent != null && …)`).
+      if (l.type.kind === 'bool' && r.type.kind === 'bool') {
+        return { code: `(${l.code} ${op} ${r.code})`, type: { kind: 'bool' } };
+      }
+      // AS3's `&&`/`||` return the VALUE of one operand (like JS), not a C bool:
+      // `a || b` yields `a` when truthy else `b`; `a && b` yields `b` when `a` is
+      // truthy else `a`. A plain C `&&`/`||` here would collapse object references
+      // (`_parent || _maskee`) to `bool` and corrupt the result. The left operand
+      // is hoisted to a temp by sequenceValueExpr when impure, so it is evaluated
+      // exactly once (the ternary short-circuits the right operand as AS3 does).
+      const lc = this.condExpr(l);
+      const numeric = (t: CType) => t.kind === 'int' || t.kind === 'uint' || t.kind === 'number';
+      // Compatible branches unify to a concrete C type; a mixed guard idiom
+      // (`bool && object`) has a dynamically-typed result, so both branches are
+      // boxed to as_value and the result is typed `any`.
+      const compatible =
+        l.type.kind === 'any' || r.type.kind === 'any' ||
+        l.type.kind === r.type.kind ||
+        (numeric(l.type) && numeric(r.type));
+      let type: CType;
+      let lt: string;
+      let rt: string;
+      if (compatible) {
+        type = this.unifyType(l.type, r.type);
+        lt = this.convert(l, type);
+        rt = this.convert(r, type);
+      } else {
+        type = { kind: 'any' };
+        lt = this.boxExpr(l);
+        rt = this.boxExpr(r);
+      }
+      return op === '||'
+        ? { code: `(${lc} ? ${lt} : ${rt})`, type }
+        : { code: `(${lc} ? ${rt} : ${lt})`, type };
     }
 
     // comparison
-    if (op === '==' || op === '!=') {
+    if (op === '==' || op === '!=' || op === '===' || op === '!==') {
       if (l.type.kind === 'any' || r.type.kind === 'any') {
-        const cmp = `as_v_eq(${this.boxExpr(l)}, ${this.boxExpr(r)})`;
-        return { code: op === '!=' ? `(!${cmp})` : cmp, type: { kind: 'bool' } };
+        // Strict equality (`===`/`!==`) dispatches on tag only; loose (`==`/`!=`)
+        // treats undefined == null and cross-tag coercion via as_v_eq.
+        const cmp = op === '===' || op === '!=='
+          ? `as_v_seq(${this.boxExpr(l)}, ${this.boxExpr(r)})`
+          : `as_v_eq(${this.boxExpr(l)}, ${this.boxExpr(r)})`;
+        return { code: (op === '!=' || op === '!==') ? `(!${cmp})` : cmp, type: { kind: 'bool' } };
       }
-      const code = this.emitEquality(l, r, op);
+      // Statically-typed operands: `===` differs from `==` only in AS3's implicit
+      // coercion (absent here since both sides are already the same C type), so the
+      // generated C is identical. `emitEquality` only inspects `!=`; strict `!==`
+      // collapses to the same negated comparison.
+      const code = this.emitEquality(l, r, op === '!==' ? '!=' : op);
       return { code, type: { kind: 'bool' } };
     }
     // < <= > >=
@@ -6648,6 +12049,20 @@ export class Emitter {
   ): string {
     const isNull = (t: CType) => t.kind === 'null';
     const neg = op === '!=' ? '!' : '';
+    // Interface values are `{ obj, vt }` structs; `== null` tests the underlying
+    // object reference, and interface-to-interface identity compares both fields.
+    if (l.type.kind === 'interface' || r.type.kind === 'interface') {
+      if (isNull(l.type) || isNull(r.type)) {
+        const iv = l.type.kind === 'interface' ? l : r;
+        return `${neg}(${iv.code}.obj == NULL)`;
+      }
+      if (l.type.kind === 'interface' && r.type.kind === 'interface') {
+        return `${neg}(${l.code}.obj == ${r.code}.obj && ${l.code}.vt == ${r.code}.vt)`;
+      }
+      const iv = l.type.kind === 'interface' ? l : r;
+      const other = l.type.kind === 'interface' ? r : l;
+      return `${neg}(${iv.code}.obj == (void*)(${other.code}))`;
+    }
     if (l.type.kind === 'string' || r.type.kind === 'string') {
       if (isNull(l.type) || isNull(r.type)) {
         const s = isNull(l.type) ? r.code : l.code;
@@ -6658,7 +12073,7 @@ export class Emitter {
       // crashing on strcmp(NULL, ...).
       const ls = l.type.kind === 'string' ? l.code : this.toStringExpr(l);
       const rs = r.type.kind === 'string' ? r.code : this.toStringExpr(r);
-      return `${neg}(strcmp(${ls}, ${rs}) == 0)`;
+      return `${neg}as_str_eq(${ls}, ${rs})`;
     }
     // AS3 `==` on objects is reference identity. When the two static classes
     // differ (e.g. Object* vs EventDispatcher*), cast both to void* so C's
@@ -6684,14 +12099,57 @@ export class Emitter {
       case 'record': return '"[object Object]"';
       case 'any': return `as_v_str_val(${e.code})`;
       case 'function': return '"function"';
+      case 'class': return '"[class]"';
+      // XML/XMLList stringify to their markup (XML.toString()).
+      case 'xml': return `as_xml_to_string(${e.code})`;
+      case 'xmllist': return `as_xml_list_to_string(${e.code})`;
+      // Dictionary/RegExp have no recoverable source text here (as_regex keeps only
+      // compiled instructions); render the class form used by vectorElemToStr.
+      case 'dict': return '"[object Dictionary]"';
+      case 'regexp': return '"[object RegExp]"';
       case 'void': return '""';
+      default: throw new CodegenError(`toStringExpr: unhandled operand type '${(e.type as CType).kind}'`);
     }
+  }
+
+  // Logical assignment (`a ||= b` / `a &&= b`): short-circuits and writes only
+  // when the LHS is falsy / truthy, mirroring AS3's `a || (a = b)` / `a && (a = b)`.
+  // The LHS is read twice (test + write), which is only safe for a simple variable
+  // (the sole shape Starling uses); an addressable target would need a temporary to
+  // avoid duplicating a getter/index side effect.
+  private emitLogicalAssign(expr: Extract<Expr, { kind: 'Assign' }>): { code: string; type: CType; discard?: boolean } {
+    const target = expr.target;
+    // Member field (`obj.field ||= v`): read the field's addressable l-value and
+    // short-circuit against it. The receiver is a simple variable in Starling, so
+    // no temporary is needed to preserve receiver side effects.
+    if (target.kind === 'Var' || target.kind === 'Member') {
+      const t = this.emitExpr(target);
+      // AS3 truthiness: boxed `any` dispatches on tag; interface values test the
+      // underlying object reference; every other C type's native truthiness
+      // (non-zero / non-NULL) already matches AS3.
+      const truthy = this.condExpr(t);
+      const v = this.convert(this.emitExpr(expr.value), t.type);
+      const store = this.gcWriteAssign(t.code, t.type, v);
+      const write = store ?? `(${t.code} = ${v})`;
+      if (expr.op === '||=') {
+        return { code: `(${truthy} ? ${t.code} : ${write})`, type: t.type, discard: true };
+      }
+      return { code: `(${truthy} ? ${write} : ${t.code})`, type: t.type, discard: true };
+    }
+    throw new CodegenError(`logical assignment ${expr.op} only supports a simple variable or field target`);
   }
 
   private emitAssign(expr: Extract<Expr, { kind: 'Assign' }>): { code: string; type: CType; discard?: boolean } {
     const hoisted = this.hoistedAssigns.get(expr);
     if (hoisted) return { code: hoisted.tmp, type: hoisted.type };
     const target = expr.target;
+
+    // Logical assignment (`||=` / `&&=`): short-circuits and writes only when the
+    // LHS is falsy / truthy. Deferred to a dedicated emitter (cannot fold through
+    // COMPOUND_BASE because `||`/`&&` in emitBinary return a bool, not a value).
+    if (expr.op === '||=' || expr.op === '&&=') {
+      return this.emitLogicalAssign(expr);
+    }
 
     // a[i] = v  (and a[i] += v etc.)
     if (target.kind === 'Index') {
@@ -6744,7 +12202,12 @@ export class Emitter {
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
         return { code: `as_object_set(${obj.code}, ${keyStr}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
       }
-      if (obj.type.kind === 'object' && obj.type.className === 'Object') {
+      // Any class instance supports obj[key] = value dynamic write: route through
+      // as_dyn_set, which walks the vtable super chain for a reflectable field
+      // named `key` (and falls back to the record/_dyn slot table for dynamic
+      // objects). AS3's `obj[key] = v` is reflection-based, not limited to
+      // `dynamic class` receivers (e.g. `tween[property] = value` in Juggler).
+      if (obj.type.kind === 'object') {
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
           return { code: `as_dyn_set((void*)(${obj.code}), ${keyStr}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
@@ -6765,6 +12228,33 @@ export class Emitter {
       throw new CodegenError('index write on non-dynamic type');
     }
 
+    // super.prop = v (and super.prop OP= v): write a superclass field or setter.
+    if (target.kind === 'SuperProperty') {
+      if (!this.currentClass) throw new CodegenError("'super' used outside a class method");
+      const info = this.symbols.getClass(this.currentClass)!;
+      if (!info.superClass) throw new CodegenError(`class '${this.currentClass}' has no superclass`);
+      const superInfo = this.symbols.getClass(info.superClass)!;
+      const f = this.symbols.fieldSlot(info.superClass, target.property);
+      if (f) {
+        const code = expr.op === '='
+          ? this.convert(this.emitExpr(expr.value), f.type)
+          : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), f.type);
+        const lv = `this->${this.cIdent(f.cName ?? target.property)}`;
+        const store = this.gcWriteAssign(lv, f.type, code);
+        if (store) return { code: store, type: f.type, discard: true };
+        return { code: `(${lv} = ${code})`, type: f.type };
+      }
+      const s = superInfo.setters.get(target.property);
+      if (s) {
+        const paramType = this.rt(s.params[0].type);
+        const code = expr.op === '='
+          ? this.convert(this.emitExpr(expr.value), paramType)
+          : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
+        return { code: `${s.owner}_set_${target.property}(this, ${code})`, type: { kind: 'void' } };
+      }
+      throw new CodegenError(`undefined property '${target.property}' on superclass '${info.superClass}'`);
+    }
+
     if (target.kind !== 'Var' && target.kind !== 'Member') {
       throw new CodegenError('invalid assignment target');
     }
@@ -6783,7 +12273,19 @@ export class Emitter {
             const code = expr.op === '='
               ? this.convert(this.emitExpr(expr.value), sf.type)
               : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), sf.type);
-            return { code: `(${sf.owner}_${target.property} = ${code})`, type: sf.type };
+            return { code: this.sfWrite(sf.owner, target.property, code), type: sf.type };
+          }
+          // Static setter: `Class.prop = v` -> `Class_set_prop_static(NULL, v)`.
+          const ss = cinfo.staticSetters?.get(target.property);
+          if (ss) {
+            if (!this.symbols.isAccessible(ss.visibility, ss.owner, this.currentClass)) {
+              throw new CodegenError(`static setter '${target.property}' is not accessible here`);
+            }
+            const paramType = this.rt(ss.params[0].type);
+            const code = expr.op === '='
+              ? this.convert(this.emitExpr(expr.value), paramType)
+              : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
+            return { code: `${ss.owner}_set_${target.property}_static(NULL, ${code})`, type: { kind: 'void' } };
           }
         }
       }
@@ -6794,16 +12296,50 @@ export class Emitter {
         const n = this.convert(this.emitExpr(expr.value), { kind: 'int' });
         return { code: `as_vector_${this.vectorCName(obj.type.elem)}_setLength(${obj.code}, ${n})`, type: { kind: 'void' } };
       }
-      if (obj.type.kind === 'record' || obj.type.kind === 'any') {
-        const objCode = obj.type.kind === 'record' ? obj.code : `((as_object*)as_v_obj_val(${obj.code}))`;
+      if (obj.type.kind === 'record') {
         const key = `"${this.escapeCString(target.property)}"`;
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
-          return { code: `as_object_set(${objCode}, ${key}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          return { code: `as_object_set(${obj.code}, ${key}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
-        return { code: `as_object_set(${objCode}, ${key}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+        return { code: `as_object_set(${obj.code}, ${key}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+      }
+      // AS3 Array is dynamic: writing an undeclared property stores an ordinary
+      // named property, never an element. Excludes `length`, which the language
+      // gives real resize semantics (unsupported here, so it still errors loudly
+      // rather than silently landing in the named-property table).
+      if (obj.type.kind === 'array' && target.property !== 'length') {
+        const key = `"${this.escapeCString(target.property)}"`;
+        if (expr.op === '=') {
+          const v = this.emitExpr(expr.value);
+          return { code: `as_array_prop_set(${obj.code}, ${key}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+        }
+        const op = COMPOUND_BASE[expr.op];
+        const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
+        return { code: `as_array_prop_set(${obj.code}, ${key}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+      }
+      // `d.prop = v` where `d` is dynamically typed (`*`): the receiver's runtime
+      // tag decides how the write lands, so this must go through as_any_set
+      // (tag 4 object → as_dyn_set: vtable field/setter reflection, then a
+      // record-slot fallback; tag 6 array → index write; anything else → no-op).
+      // The previous code cast the box unconditionally to `as_object*` and called
+      // as_object_set, i.e. it treated the receiver as an anonymous record: on a
+      // sealed class instance the vtable pointer was read as a props table and on
+      // an Array the element buffer was written as one — `d.unknown = 5` on a
+      // sealed instance segfaulted, and `d.bar = 8` on an Array silently corrupted
+      // it (d.length became garbage), stage 89-33. This mirrors the read path
+      // (as_any_get) and the `d["k"] = v` path (as_any_set).
+      if (obj.type.kind === 'any') {
+        const key = `"${this.escapeCString(target.property)}"`;
+        if (expr.op === '=') {
+          const v = this.emitExpr(expr.value);
+          return { code: `as_any_set(${obj.code}, ${key}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+        }
+        const op = COMPOUND_BASE[expr.op];
+        const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
+        return { code: `as_any_set(${obj.code}, ${key}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
       }
       // AS3 root Object is dynamic: obj.prop = v on an Object-typed value is a
       // reflective field write (falls back to a record slot for plain records).
@@ -6822,14 +12358,14 @@ export class Emitter {
         const cinfo = this.symbols.getClass(obj.type.className);
         const s = cinfo?.setters.get(target.property);
         if (s) {
-          const paramType = resolveType(s.params[0].type);
+          const paramType = this.rt(s.params[0].type);
           // Compound assignment reads the current value through the getter and
           // folds it in (`obj.prop += v` => `set(obj, get(obj) OP v)`) instead of
           // discarding the old value.
           const code = expr.op === '='
             ? this.convert(this.emitExpr(expr.value), paramType)
             : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
-          return { code: `${s.owner}_set_${target.property}(${obj.code}, ${code})`, type: { kind: 'void' } };
+          return { code: this.setterCallCode(s.owner, target.property, false, obj.code, code), type: { kind: 'void' } };
         }
         // Dynamic class (AS3 `dynamic class`): an undeclared member write lands in
         // the runtime slot table via as_dyn_set (falls back to the `_dyn` record).
@@ -6846,6 +12382,53 @@ export class Emitter {
       }
     }
 
+    // Bare-identifier setter assignment (`nativeOverlayBlocksTouches = true` or a
+    // static `useDoubleBuffering = true`). An unqualified name that names a setter
+    // (and is not shadowed by a local) writes through the setter; without this,
+    // `emitExpr` resolves the bare name to the getter and we'd emit an rvalue into
+    // `=` ("expression is not assignable").
+    if (target.kind === 'Var' && this.currentClass) {
+      let isLocal = false;
+      for (let i = this.scopes.length - 1; i >= 0; i--) {
+        if (this.scopes[i].has(target.name)) { isLocal = true; break; }
+      }
+      if (!isLocal) {
+        const cinfo = this.symbols.getClass(this.currentClass);
+        if (!this.currentIsStatic) {
+          const s = cinfo?.setters.get(target.name);
+          if (s) {
+            const self = this.emitVar('this').code;
+            const paramType = this.rt(s.params[0].type);
+            const code = expr.op === '='
+              ? this.convert(this.emitExpr(expr.value), paramType)
+              : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
+            return { code: this.setterCallCode(s.owner, target.name, false, self, code), type: { kind: 'void' } };
+          }
+        }
+        const ss = cinfo?.staticSetters?.get(target.name);
+        if (ss) {
+          const paramType = this.rt(ss.params[0].type);
+          const code = expr.op === '='
+            ? this.convert(this.emitExpr(expr.value), paramType)
+            : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
+          return { code: `${ss.owner}_set_${target.name}_static(NULL, ${code})`, type: { kind: 'void' } };
+        }
+      }
+    }
+
+    // Bare-identifier static-FIELD assignment (`sCurrent = null` where `sCurrent`
+    // is `static var sCurrent`). The field must remain an lvalue, so fold the
+    // class's `_cinit` around the whole assignment (sfWrite) instead of wrapping
+    // the read into a comma expression and assigning into it.
+    const sfTarget = this.resolveStaticFieldTarget(target);
+    if (sfTarget) {
+      const ft = this.emitExpr(target).type;
+      const code = expr.op === '='
+        ? this.convert(this.emitExpr(expr.value), ft)
+        : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), ft);
+      return { code: this.sfWrite(sfTarget.owner, sfTarget.name, code), type: ft };
+    }
+
     const t = this.emitExpr(target);
     const v = this.emitExpr(expr.value);
 
@@ -6854,8 +12437,11 @@ export class Emitter {
       // Direct field write of a pointer/boxed slot (o.field = v) needs a write
       // barrier during incremental marking (GC-4): a BLACK object must not gain
       // a direct WHITE reference unobserved. Local/global variable slots are
-      // covered by roots at the safe point and need no barrier.
-      if (target.kind === 'Member') {
+      // covered by roots at the safe point and need no barrier. A bare-identifier
+      // target can also name an instance field / captured closure slot (e.g. a
+      // setter body's `_name = value`), so those heap-field writes need the same
+      // barrier as an explicit `o.field = v`.
+      if (target.kind === 'Member' || this.resolvesToHeapField(target)) {
         const store = this.gcWriteAssign(t.code, t.type, code);
         if (store) return { code: store, type: t.type, discard: true };
       }
@@ -6866,6 +12452,10 @@ export class Emitter {
     const op = COMPOUND_BASE[expr.op];
     const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
     const code = this.convert(combined, t.type);
+    if (target.kind === 'Member' || this.resolvesToHeapField(target)) {
+      const store = this.gcWriteAssign(t.code, t.type, code);
+      if (store) return { code: store, type: t.type, discard: true };
+    }
     return { code: `(${t.code} = ${code})`, type: t.type };
   }
 
@@ -6888,6 +12478,19 @@ export class Emitter {
       if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'output') {
         const a = this.emitExpr(expr.args[0]);
         return { code: `as_system_output(${a.code})`, type: { kind: 'void' } };
+      }
+      // System.pauseForGCIfCollectionImminent(n): a GC hint; no-op under AOT
+      // (the managed heap is precise and incrementally collected at frame
+      // boundaries, so there is no stop-the-world collection to forestall).
+      if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'pauseForGCIfCollectionImminent') {
+        return { code: '(void)0', type: { kind: 'void' } };
+      }
+      // System.disposeXML(xml): AIR hint to release an XML object early. Our GC
+      // reclaims XML automatically, so it is a no-op (the argument is still
+      // evaluated to preserve any side effects).
+      if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'disposeXML') {
+        const a = this.emitExpr(expr.args[0]);
+        return { code: `(void)(${a.code})`, type: { kind: 'void' } };
       }
       // Math.abs(...) etc.
       if (callee.object.kind === 'Var' && callee.object.name === 'Math') {
@@ -6917,7 +12520,31 @@ export class Emitter {
           throw new CodegenError(`undefined static method '${callee.property}' on class '${callee.object.name}'`);
         }
       }
+      // vec.push.apply(vec, argsArray) / arr.push.apply(arr, argsArray): Starling's
+      // spread-push idiom. vec.push is a bound variadic method; apply spreads an
+      // Array of values into it.
+      if (callee.property === 'apply' && callee.object.kind === 'Member' && callee.object.property === 'push') {
+        const target = this.emitExpr(callee.object.object);
+        const argsArray = this.emitExpr(expr.args[1]);
+        if (target.type.kind === 'vector') {
+          return { code: `as_vector_${this.vectorCName(target.type.elem)}_push_all(${target.code}, ${argsArray.code})`, type: { kind: 'int' } };
+        }
+      }
       const obj = this.emitExpr(callee.object);
+      // Function.apply(thisArg, argsArray) / Function.call(thisArg, ...args) on a
+      // statically-typed Function value (a bound method reference or a closure).
+      // `thisArg` is redundant for already-bound methods but matches AS3.
+      if (obj.type.kind === 'function' && callee.property === 'apply') {
+        if (expr.args.length !== 2) throw new CodegenError('Function.apply expects (thisArg, argsArray)');
+        const argsBox = this.boxExpr(this.emitExpr(expr.args[1]));
+        return { code: `as_fn_apply_v(as_v_fn((void*)${obj.code}), ${argsBox})`, type: { kind: 'any' } };
+      }
+      if (obj.type.kind === 'function' && callee.property === 'call') {
+        const items = expr.args.slice(1).map((a) => this.boxExpr(this.emitExpr(a)));
+        const n = items.length;
+        const arr = n > 0 ? `(as_value[${n}]){ ${items.join(', ')} }` : 'NULL';
+        return { code: `as_fn_call_dyn(as_v_fn((void*)${obj.code}), ${arr}, ${n})`, type: { kind: 'any' } };
+      }
       if (obj.type.kind === 'array') {
         return this.emitArrayMethod(obj, callee.property, expr.args);
       }
@@ -6936,6 +12563,9 @@ export class Emitter {
       if (obj.type.kind === 'any') {
         return this.emitAnyMethod(obj, callee.property, expr.args);
       }
+      if (obj.type.kind === 'xml' || obj.type.kind === 'xmllist') {
+        return this.emitXmlMethod(obj, callee.property, expr.args);
+      }
       if (obj.type.kind === 'interface') {
         const intf = this.symbols.interfaces.get(obj.type.name)!;
         const m = intf.methods.get(callee.property);
@@ -6948,7 +12578,14 @@ export class Emitter {
         throw new CodegenError(`cannot call method '${callee.property}' on non-object type`);
       }
       const cinfo = this.symbols.getClass(obj.type.className);
-      const m = cinfo?.methods.get(callee.property);
+      let m = cinfo?.methods.get(callee.property);
+      // Inherited method: AS3 dispatches through the vtable, so a method declared
+      // on a superclass (e.g. Object.hasOwnProperty) is callable on any subclass
+      // even when its static type does not redeclare it.
+      if (!m) {
+        const found = this.symbols.findMethod(obj.type.className, callee.property);
+        if (found) m = found.m;
+      }
       // `Object` is the dynamic-record convention (as_object*); a method call on
       // it is resolved at runtime through as_dyn_call (returns null when absent).
       if (!m && obj.type.className === 'Object') {
@@ -6978,11 +12615,14 @@ export class Emitter {
         const m = cinfo?.methods.get(callee.name);
         if (m) {
           if (!this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) {
-            throw new CodegenError(`method '${callee.name}' is not accessible here`);
+            throw new CodegenError(`method '${callee.name}' is not accessible here` + (this.currentClass ? ` in class ${this.currentClass}` : ''));
           }
           const args = this.emitArgs(m.params, expr.args);
           const callArgs = args ? ', ' + args : '';
-          return { code: `(this->vtable->${this.cIdent(callee.name)}(this${callArgs}))`, type: m.returnType };
+          // The receiver is `this` normally, or `env->this` when this call site
+          // lives inside a closure that captured the enclosing `this`.
+          const self = this.emitVar('this').code;
+          return { code: `(${self}->vtable->${this.cIdent(callee.name)}(${self}${callArgs}))`, type: m.returnType };
         }
       }
       // Bare static-method call from within the same class (e.g. `init()` called
@@ -7005,7 +12645,7 @@ export class Emitter {
       // a known user class/interface is a checked cast (semantically `expr as
       // Type`). Guard with hasClass so plain free functions are never misread.
       if (expr.args.length === 1) {
-        const ct = resolveType(callee.name);
+        const ct = this.rt(callee.name);
         if (ct.kind === 'interface' || (ct.kind === 'object' && this.symbols.hasClass(ct.className))) {
           return { code: this.convert(this.emitExpr(expr.args[0]), ct), type: ct };
         }
@@ -7066,6 +12706,37 @@ export class Emitter {
     return `printf("${fmt}"${vals.length ? ', ' + vals.join(', ') : ''})`;
   }
 
+  // E4X attribute access: expr.@name reads the named attribute as a String
+  // (XML) or the first matching item's attribute (XMLList). E4X returns an
+  // XMLList, but Starling only reads it in a scalar String context, so the
+  // emitter narrows it to String (documented in e4x.md).
+  private emitAttrAccess(expr: Extract<Expr, { kind: 'AttrAccess' }>): { code: string; type: CType } {
+    const o = this.emitExpr(expr.object);
+    const attr = this.escapeCString(expr.name);
+    if (o.type.kind === 'xml') {
+      return { code: `as_xml_attr(${o.code}, "${attr}")`, type: { kind: 'string' } };
+    }
+    if (o.type.kind === 'xmllist') {
+      return { code: `as_xml_list_attr(${o.code}, "${attr}")`, type: { kind: 'string' } };
+    }
+    throw new CodegenError(`'@' attribute access on non-XML type ${o.type.kind}`);
+  }
+
+  // E4X filter predicate: expr.(@attr == value) keeps only the items whose named
+  // attribute equals (or, for !=, differs from) the given string. Returns an
+  // XMLList. Starling uses only `==` here (asset metadata extraction).
+  private emitFilter(expr: Extract<Expr, { kind: 'Filter' }>): { code: string; type: CType } {
+    const o = this.emitExpr(expr.object);
+    if (o.type.kind !== 'xmllist' && o.type.kind !== 'xml') {
+      throw new CodegenError(`E4X filter '.(...)' requires an XML/XMLList receiver, got ${o.type.kind}`);
+    }
+    const attr = this.escapeCString(expr.attr);
+    const v = this.emitExpr(expr.value);
+    const vStr = v.type.kind === 'string' ? v.code : this.toStringExpr(v);
+    const op = expr.op === '!=' ? 1 : 0;
+    return { code: `as_xml_filter(${o.code}, "${attr}", ${vStr}, ${op})`, type: { kind: 'xmllist' } };
+  }
+
   private emitMember(expr: Extract<Expr, { kind: 'Member' }>): { code: string; type: CType } {
     // flash.system.System static read-only memory stats (System is final and has
     // no instantiable class, so it is handled here like Math/Number constants).
@@ -7100,6 +12771,44 @@ export class Emitter {
       if (!c) throw new CodegenError(`undefined constant '${expr.object.name}.${expr.property}'`);
       return c;
     }
+    // Fully-qualified static reference: `pkg.subpkg.Class.CONST` / `.staticMethod`.
+    // The parser emits a nested Member chain rooted at a Var holding the package's
+    // first segment; flatten it and resolve the longest class prefix, the trailing
+    // segment being a static member of that class (e.g. `starling.events.Event.ROOT_CREATED`).
+    const chain = this.flattenDotChain(expr);
+    if (chain && chain.length >= 2) {
+      for (let split = chain.length - 1; split >= 1; split--) {
+        const cname = this.resolveClassName(chain.slice(0, split).join('.'));
+        if (!this.symbols.hasClass(cname)) continue;
+        const cinfo = this.symbols.getClass(cname)!;
+        const memberName = chain[split];
+        const sf = cinfo.staticFields.get(memberName);
+        if (sf) {
+          if (!this.symbols.isAccessible(sf.visibility, sf.owner, this.currentClass)) {
+            throw new CodegenError(`static field '${memberName}' is not accessible here`);
+          }
+          // Only return when this static member is the FINAL chain segment. When
+          // it is an intermediate segment (e.g. `Vector3D.X_AXIS.x`), the static
+          // field's value is an object that still has a trailing `.x` field to
+          // read — fall through to the normal member path below instead.
+          if (split === chain.length - 1) {
+            return { code: this.sfRead(sf.owner, memberName), type: sf.type };
+          }
+          break;
+        }
+        const sm = cinfo.staticMethods.get(memberName);
+        if (sm) {
+          if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
+            throw new CodegenError(`static method '${memberName}' is not accessible here`);
+          }
+          if (split === chain.length - 1) {
+            return { code: `as_fn_make(${sm.owner}_${memberName}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+          }
+          break;
+        }
+        break; // a known class prefix but unknown member: not an FQN static ref
+      }
+    }
     // static field access: ClassName.field
     if (expr.object.kind === 'Var') {
       const cname = this.resolveClassName(expr.object.name);
@@ -7110,7 +12819,15 @@ export class Emitter {
           if (!this.symbols.isAccessible(sf.visibility, sf.owner, this.currentClass)) {
             throw new CodegenError(`static field '${expr.property}' is not accessible here`);
           }
-          return { code: `${sf.owner}_${expr.property}`, type: sf.type };
+          return { code: this.sfRead(sf.owner, expr.property), type: sf.type };
+        }
+        // Static getter accessor: `Class.prop` -> `Class_get_prop_static(NULL)`.
+        const sg = cinfo.staticGetters?.get(expr.property);
+        if (sg) {
+          if (!this.symbols.isAccessible(sg.visibility, sg.owner, this.currentClass)) {
+            throw new CodegenError(`static getter '${expr.property}' is not accessible here`);
+          }
+          return { code: `${sg.owner}_get_${expr.property}_static(NULL)`, type: sg.returnType };
         }
         // Static method referenced as a Function value (`var f:Function = Foo.bar`).
         const sm = cinfo.staticMethods.get(expr.property);
@@ -7118,7 +12835,7 @@ export class Emitter {
           if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
             throw new CodegenError(`static method '${expr.property}' is not accessible here`);
           }
-          return { code: `as_fn_make(${sm.owner}_${expr.property}__call, NULL)`, type: { kind: 'function' } };
+          return { code: `as_fn_make(${sm.owner}_${expr.property}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
         }
         throw new CodegenError(`undefined static field '${expr.property}' on class '${cname}'`);
       }
@@ -7133,6 +12850,18 @@ export class Emitter {
     if (obj.type.kind === 'vector' && expr.property === 'length') {
       return { code: `(${obj.code}->length)`, type: { kind: 'int' } };
     }
+    if (obj.type.kind === 'function' && expr.property === 'length') {
+      // AS3 Function.length is the declared parameter count.
+      return { code: `(${obj.code}->arity)`, type: { kind: 'int' } };
+    }
+    // E4X child navigation: xml.child / xmlList.child return the matching
+    // child nodes as an XMLList (a structural navigation, not a field read).
+    if (obj.type.kind === 'xml') {
+      return { code: `as_xml_children(${obj.code}, "${this.escapeCString(expr.property)}")`, type: { kind: 'xmllist' } };
+    }
+    if (obj.type.kind === 'xmllist') {
+      return { code: `as_xml_list_children(${obj.code}, "${this.escapeCString(expr.property)}")`, type: { kind: 'xmllist' } };
+    }
     if (obj.type.kind === 'record') {
       return { code: `as_object_get(${obj.code}, "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
@@ -7141,8 +12870,13 @@ export class Emitter {
       return { code: `as_any_length(${obj.code})`, type: { kind: 'int' } };
     }
     if (obj.type.kind === 'any') {
-      // an `any` that is an object at runtime (e.g. a nested object literal).
-      return { code: `as_object_get(((as_object*)as_v_obj_val(${obj.code})), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
+      // an `any` that is an object at runtime. as_any_get dispatches on the box
+      // tag: object (4) → as_dyn_get (field reflection + record-slot fallback),
+      // array (6) → index. Using as_object_get here would misread a class
+      // instance's vtable as a record slot table — e.g. `event.target.content
+      // .bitmapData` in BitmapTextureFactory, where `event.target` is a LoaderInfo
+      // held as `*`.
+      return { code: `as_any_get(${obj.code}, "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
     // AS3's root `Object` is dynamic: `o.name` on an Object-typed value may be a
     // record slot lookup (JSON.parse results, generic records) OR a reflectable
@@ -7150,26 +12884,62 @@ export class Emitter {
     // as_dyn_get walks the vtable super chain for a field first, then falls back to
     // the record slot table — a strict superset of as_object_get.
     if (obj.type.kind === 'object' && (obj.type as { className: string }).className === 'Object') {
+      if (expr.property === 'constructor') {
+        // Object.constructor: the runtime Class reference of the receiver (used
+        // for polymorphic cloning: `Object(this).constructor as Class`).
+        return { code: `as_v_as_class(as_v_class_of(as_v_obj((void*)(${obj.code}))))`, type: { kind: 'class' } };
+      }
       return { code: `as_dyn_get((void*)(${obj.code}), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
+    }
+    if (obj.type.kind === 'interface') {
+      const iname = (obj.type as { name: string }).name;
+      const iinfo = this.symbols.interfaces.get(iname);
+      const im = iinfo?.methods.get(expr.property);
+      if (im) {
+        if (im.isGetter) {
+          return { code: `${obj.code}.vt->${this.cIdent(expr.property)}(${obj.code}.obj)`, type: im.returnType };
+        }
+        if (im.isSetter) {
+          throw new CodegenError(`setter '${expr.property}' used as a value on interface '${iname}'`);
+        }
+        // Interface method referenced as a Function value.
+        return { code: `as_fn_make(${iname}_${this.cIdent(expr.property)}__bound, (void*)(${obj.code}.obj), ${this.requiredArity(im.params)})`, type: { kind: 'function' } };
+      }
+      throw new CodegenError(`undefined member '${expr.property}' on interface '${iname}'`);
+    }
+    if (obj.type.kind === 'array' && expr.property !== 'length') {
+      // AS3 Array is dynamic: every property other than the modelled members
+      // (`length`) is an ordinary named property. AIR stores `a.bar = 8` beside
+      // the elements without touching them, so read it from the named-property
+      // table (null when absent) — previously a loud compile error.
+      return { code: `as_array_prop_get(${obj.code}, "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
     if (obj.type.kind !== 'object') {
       throw new CodegenError(`cannot access property '${expr.property}' on non-object type`);
     }
+    // Object.constructor: the runtime Class reference of the receiver (used for
+    // polymorphic cloning: `Object(this).constructor as Class`). `Object(x)`
+    // returns x unchanged for reference types, so this fires for any object class.
+    if (expr.property === 'constructor') {
+      return { code: `as_v_as_class(as_v_class_of(as_v_obj((void*)(${obj.code}))))`, type: { kind: 'class' } };
+    }
     const cinfo = this.symbols.getClass(obj.type.className);
-    const f = cinfo?.fields.get(expr.property);
+    const f = this.symbols.fieldSlot(obj.type.className, expr.property);
     if (f) {
       if (!this.symbols.isAccessible(f.visibility, f.owner, this.currentClass)) {
         throw new CodegenError(`field '${expr.property}' is not accessible here`);
       }
-      return { code: `(${obj.code}->${this.cIdent(expr.property)})`, type: f.type };
+      return { code: `(${obj.code}->${this.cIdent(f.cName ?? expr.property)})`, type: f.type };
     }
-    // getter accessor: obj.prop -> ClassName_get_prop(obj)
+    // getter accessor: obj.prop -> dispatch through the runtime object's vtable
+    // (virtual): a base-typed reference (`Texture`) must reach an overriding
+    // subclass getter (`ConcreteTexture.get root()`), not the base getter.
     const g = cinfo?.getters.get(expr.property);
     if (g) {
       if (!this.symbols.isAccessible(g.visibility, g.owner, this.currentClass)) {
         throw new CodegenError(`getter '${expr.property}' is not accessible here`);
       }
-      return { code: `${g.owner}_get_${expr.property}(${obj.code})`, type: g.returnType };
+      return { code: `(${obj.code}->vtable->get_${this.cIdent(expr.property)}(${obj.code}))`, type: g.returnType };
     }
     // A method referenced as a Function value (`this.onDone`, `obj.callback`).
     // Bind the receiver; the thunk dispatches through the runtime object's vtable
@@ -7179,14 +12949,37 @@ export class Emitter {
       if (!this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) {
         throw new CodegenError(`method '${expr.property}' is not accessible here`);
       }
-      return { code: `as_fn_make(${obj.type.className}_${expr.property}__bound, (void*)(${obj.code}))`, type: { kind: 'function' } };
+      return { code: `as_fn_make(${obj.type.className}_${expr.property}__bound, (void*)(${obj.code}), ${this.requiredArity(m.params)})`, type: { kind: 'function' } };
     }
     // Dynamic class (AS3 `dynamic class`): an undeclared member read resolves at
     // runtime through the slot table (falls back to the `_dyn` record).
     if (cinfo?.isDynamic) {
       return { code: `as_dyn_get((void*)(${obj.code}), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
-    throw new CodegenError(`undefined field '${expr.property}' on class '${obj.type.className}'`);
+    throw new CodegenError(`undefined field '${expr.property}' on class '${obj.type.className}' (obj=${obj.code}, in ${this.currentClass})`);
+  }
+
+  // Built-in XML / XMLList methods (E4X navigation). XML exposes localName()/
+  // toString()/length(); XMLList exposes length()/toString(). @attr and .child
+  // are handled in emitMember (they are postfix operators, not method calls).
+  private emitXmlMethod(obj: { code: string; type: CType }, method: string, args: Expr[]): { code: string; type: CType } {
+    if (args.length !== 0) throw new CodegenError(`${method}() takes no arguments`);
+    switch (method) {
+      case 'localName':
+        if (obj.type.kind !== 'xml') throw new CodegenError('localName() only on XML');
+        return { code: `as_xml_local_name(${obj.code})`, type: { kind: 'string' } };
+      case 'toString':
+        if (obj.type.kind === 'xml') return { code: `as_xml_to_string(${obj.code})`, type: { kind: 'string' } };
+        return { code: `as_xml_list_to_string(${obj.code})`, type: { kind: 'string' } };
+      case 'length':
+        if (obj.type.kind === 'xmllist') return { code: `(${obj.code}->length)`, type: { kind: 'int' } };
+        return { code: '1', type: { kind: 'int' } }; // XML.length() is always 1
+      case 'namespace':
+        // E4X namespace objects are transparent; return NULL as a placeholder.
+        return { code: 'NULL', type: { kind: 'object', className: 'Namespace' } };
+      default:
+        throw new CodegenError(`unsupported XML/XMLList method '${method}'`);
+    }
   }
 
   // Built-in Vector.<T> methods: push/pop (element type is enforced at compile
@@ -7210,10 +13003,34 @@ export class Emitter {
       }
       case 'pop':
         return { code: `as_vector_${key}_pop(${v})`, type: elem };
+      case 'shift':
+        return { code: `as_vector_${key}_shift(${v})`, type: elem };
+      case 'unshift': {
+        if (args.length === 0) throw new CodegenError('Vector.unshift expects at least 1 argument');
+        // AS3 Vector.unshift is variadic; the args keep their left-to-right order
+        // at the front, so insert from last to first to preserve it.
+        const items = args.map((a) => this.convert(this.emitExpr(a), elem));
+        if (items.length === 1) {
+          return { code: `as_vector_${key}_unshift(${v}, ${items[0]})`, type: { kind: 'int' } };
+        }
+        const calls = [...items].reverse().map((it) => `as_vector_${key}_unshift(${v}, ${it})`);
+        return { code: `(${calls.join(', ')})`, type: { kind: 'int' } };
+      }
       case 'indexOf': {
         if (args.length !== 1) throw new CodegenError('Vector.indexOf expects 1 argument');
         const e = this.convert(this.emitExpr(args[0]), elem);
         return { code: `as_vector_${key}_indexOf(${v}, ${e})`, type: { kind: 'int' } };
+      }
+      case 'removeAt': {
+        if (args.length !== 1) throw new CodegenError('Vector.removeAt expects 1 argument');
+        const idx = this.convert(this.emitExpr(args[0]), { kind: 'int' });
+        return { code: `as_vector_${key}_removeAt(${v}, ${idx})`, type: elem };
+      }
+      case 'insertAt': {
+        if (args.length !== 2) throw new CodegenError('Vector.insertAt expects 2 arguments');
+        const idx = this.convert(this.emitExpr(args[0]), { kind: 'int' });
+        const item = this.convert(this.emitExpr(args[1]), elem);
+        return { code: `as_vector_${key}_insertAt(${v}, ${idx}, ${item})`, type: { kind: 'void' } };
       }
       case 'join': {
         const sep = args.length >= 1 ? this.emitExpr(args[0]).code : '","';
@@ -7225,7 +13042,9 @@ export class Emitter {
         return { code: `as_vector_${key}_slice(${v}, ${from}, ${to})`, type: obj.type };
       }
       case 'concat': {
-        if (args.length !== 1) throw new CodegenError('Vector.concat expects 1 argument');
+        // Vector.concat() with no arguments returns a shallow copy (AS3).
+        if (args.length === 0) return { code: `as_vector_${key}_slice(${v}, 0, ${v}->length)`, type: obj.type };
+        if (args.length !== 1) throw new CodegenError('Vector.concat expects 0 or 1 argument');
         const b = this.emitExpr(args[0]);
         if (b.type.kind !== 'vector') throw new CodegenError('Vector.concat expects a Vector argument');
         return { code: `as_vector_${key}_concat(${v}, ${b.code})`, type: obj.type };
@@ -7260,9 +13079,14 @@ export class Emitter {
         return { code: `as_vector_${key}_filter(${v}, ${cb.code})`, type: obj.type };
       }
       case 'sort': {
+        // AS3 Vector.sort accepts either a comparator Function or sort-option
+        // flags (Array.CASEINSENSITIVE == 1, etc.). For flags (or no arg) we
+        // fall back to the element's default compare; a comparator is honored.
         const cb = args.length >= 1 ? this.emitExpr(args[0]) : null;
-        if (cb && cb.type.kind !== 'function') throw new CodegenError('Vector.sort expects a Function argument');
-        return { code: `as_vector_${key}_sort(${v}, ${cb ? cb.code : 'NULL'})`, type: obj.type };
+        if (cb && cb.type.kind === 'function') {
+          return { code: `as_vector_${key}_sort(${v}, ${cb.code})`, type: obj.type };
+        }
+        return { code: `as_vector_${key}_sort(${v}, NULL)`, type: obj.type };
       }
       case 'reverse':
         return { code: `as_vector_${key}_reverse(${v})`, type: obj.type };
@@ -7276,23 +13100,38 @@ export class Emitter {
     const a = obj.code;
     switch (method) {
       case 'push': {
-        if (args.length !== 1) throw new CodegenError('push expects 1 argument');
-        const v = this.boxExpr(this.emitExpr(args[0]));
-        return { code: `as_array_push(${a}, ${v})`, type: { kind: 'int' } };
+        // AS3 Array.push is variadic: append every argument in order, return the
+        // new length.
+        if (args.length === 0) return { code: `${a}->length`, type: { kind: 'int' } };
+        const vals = args.map((arg) => `as_array_push(${a}, ${this.boxExpr(this.emitExpr(arg))})`);
+        return { code: `(${vals.join(', ')})`, type: { kind: 'int' } };
       }
       case 'pop':
         return { code: `as_array_pop(${a})`, type: { kind: 'any' } };
       case 'shift':
         return { code: `as_array_shift(${a})`, type: { kind: 'any' } };
       case 'unshift': {
-        if (args.length !== 1) throw new CodegenError('unshift expects 1 argument');
-        const v = this.boxExpr(this.emitExpr(args[0]));
-        return { code: `as_array_unshift(${a}, ${v})`, type: { kind: 'int' } };
+        // AS3 Array.unshift is variadic: prepend every argument (rightmost first),
+        // return the new length.
+        if (args.length === 0) return { code: `${a}->length`, type: { kind: 'int' } };
+        const vals = args.map((arg) => `as_array_unshift(${a}, ${this.boxExpr(this.emitExpr(arg))})`);
+        return { code: `(${vals.reverse().join(', ')})`, type: { kind: 'int' } };
       }
       case 'indexOf': {
         if (args.length !== 1) throw new CodegenError('indexOf expects 1 argument');
         const v = this.boxExpr(this.emitExpr(args[0]));
         return { code: `as_array_indexOf(${a}, ${v})`, type: { kind: 'int' } };
+      }
+      case 'insertAt': {
+        if (args.length !== 2) throw new CodegenError('Array.insertAt expects 2 arguments');
+        const idx = this.convert(this.emitExpr(args[0]), { kind: 'int' });
+        const v = this.boxExpr(this.emitExpr(args[1]));
+        return { code: `as_array_insertAt(${a}, ${idx}, ${v})`, type: { kind: 'void' } };
+      }
+      case 'removeAt': {
+        if (args.length !== 1) throw new CodegenError('Array.removeAt expects 1 argument');
+        const idx = this.convert(this.emitExpr(args[0]), { kind: 'int' });
+        return { code: `as_array_removeAt(${a}, ${idx})`, type: { kind: 'any' } };
       }
       case 'join': {
         const sep = args.length >= 1 ? this.emitExpr(args[0]).code : '","';
@@ -7304,6 +13143,8 @@ export class Emitter {
         return { code: `as_array_slice(${a}, ${from}, ${to})`, type: { kind: 'array' } };
       }
       case 'concat': {
+        // Array.concat() with no arguments returns a shallow copy (AS3).
+        if (args.length === 0) return { code: `as_array_slice(${a}, 0, ${a}->length)`, type: { kind: 'array' } };
         if (args.length !== 1) throw new CodegenError('concat expects 1 argument');
         const b = this.emitExpr(args[0]);
         if (b.type.kind === 'array') return { code: `as_array_concat(${a}, ${b.code})`, type: { kind: 'array' } };
@@ -7405,8 +13246,20 @@ export class Emitter {
     switch (method) {
       case 'charAt': return { code: `as_str_charAt(${s}, ${argInt(0)})`, type: { kind: 'string' } };
       case 'charCodeAt': return { code: `as_str_charCodeAt(${s}, ${argInt(0)})`, type: { kind: 'int' } };
-      case 'indexOf': return { code: `as_str_indexOf(${s}, ${argStr(0)})`, type: { kind: 'int' } };
-      case 'lastIndexOf': return { code: `as_str_lastIndexOf(${s}, ${argStr(0)})`, type: { kind: 'int' } };
+      // AS3's optional startIndex on both search methods: omitting it must mean
+      // the documented default, and a THIRD argument is a mistake the compiler
+      // reports rather than drops (AGENTS.md §2.5). The defaults (0 and 0x7FFFFFFF)
+      // are what adl uses; see as_str_indexOf_from in the runtime preamble.
+      case 'indexOf': {
+        if (args.length > 2) throw new CodegenError('String.indexOf expects 1 or 2 arguments');
+        const from = args.length >= 2 ? argInt(1) : '0';
+        return { code: `as_str_indexOf_from(${s}, ${argStr(0)}, ${from})`, type: { kind: 'int' } };
+      }
+      case 'lastIndexOf': {
+        if (args.length > 2) throw new CodegenError('String.lastIndexOf expects 1 or 2 arguments');
+        const from = args.length >= 2 ? argInt(1) : '0x7FFFFFFF';
+        return { code: `as_str_lastIndexOf_from(${s}, ${argStr(0)}, ${from})`, type: { kind: 'int' } };
+      }
       case 'substring': {
         const from = argInt(0);
         const to = args.length >= 2 ? argInt(1) : `(int)strlen(${s})`;
@@ -7467,6 +13320,7 @@ export class Emitter {
         return { code: `as_str_concat_n(${parts.length}, (const char*[]){ ${parts.join(', ')} })`, type: { kind: 'string' } };
       }
       case 'valueOf': return { code: s, type: { kind: 'string' } };
+      case 'toString': return { code: s, type: { kind: 'string' } };
       case 'localeCompare': return { code: `as_str_localeCompare(${s}, ${argStr(0)})`, type: { kind: 'int' } };
       // Locale case folding is simplified to ASCII toUpper/toLower (no locale table).
       case 'toLocaleLowerCase': return { code: `as_str_toLower(${s})`, type: { kind: 'string' } };
@@ -7595,12 +13449,13 @@ export class Emitter {
   // flash.system.Capabilities static read-only environment info. Capabilities is
   // `final` with no instantiable ClassInfo (same pattern as System): each getter
   // maps to a compile-time constant, a conditional-compile helper, or a fixed
-  // desktop-native value. `version` is the injected AS-AOT version (package.json
-  // read at codegen time); os/cpuArchitecture use #ifdef; screenResolution* are
+  // desktop-native value. `version` is a fixed AIR-compatible "50,0,0,0" (via
+  // as_cap_version); the AS-AOT marker is `manufacturer` = "AS-AOT". os/
+  // cpuArchitecture use #ifdef; screenResolution* are
   // 0 in headless builds (no SDL2 window backend) and the real display otherwise.
   private emitCapabilitiesConst(name: string): { code: string; type: CType } {
     switch (name) {
-      case 'version': return { code: `"AS-AOT ${this.escapeCString(this.asAotVersion)}"`, type: { kind: 'string' } };
+      case 'version': return { code: 'as_cap_version()', type: { kind: 'string' } };
       case 'os': return { code: 'as_cap_os()', type: { kind: 'string' } };
       case 'cpuArchitecture': return { code: 'as_cap_cpu_arch()', type: { kind: 'string' } };
       case 'cpuAddressSize': return { code: '(int)(sizeof(void*) * 8)', type: { kind: 'int' } };
@@ -7715,14 +13570,47 @@ export class Emitter {
       // it as a package-level function; this subset treats it as a global built-in
       // (like parseInt) so frame counters can time themselves without importing it.
       case 'getTimer': return { code: 'as_getTimer()', type: { kind: 'int' } };
+      // flash.utils.getQualifiedClassName(value:*): String — AS3 fully-qualified
+      // class name ("包::类"). The value is boxed to as_value and dispatched at
+      // runtime: primitives map to canonical names, objects/Classes read the
+      // vtable `fqn` slot (both carry the class vtable as their first field).
+      case 'getQualifiedClassName': {
+        return { code: `as_get_qualified_class_name(${this.boxExpr(e0!)})`, type: { kind: 'string' } };
+      }
+      // flash.utils.getDefinitionByName(name:String): Object — returns a Class
+      // reference boxed as an object (tag 4); `... as Class` unboxes it back to
+      // as_class* for `new (classRef)()`. Throws ReferenceError when no public
+      // definition matches (Starling's SystemUtil catches this to detect AIR).
+      case 'getDefinitionByName': {
+        const s = e0!.type.kind === 'string' ? e0!.code : this.toStringExpr(e0!);
+        return { code: `as_get_definition_by_name(${s})`, type: { kind: 'any' } };
+      }
+      // flash.utils.describeType(value:*):XML — build a minimal <type name="fqn"/>
+      // DOM tree from a Class reference. Starling's AssetManager reads @name plus
+      // constant/variable nodes of type "Class" (empty here: the demo passes File
+      // values, never Class). Returns a real XML so @name/.child/.(pred) all work.
+      case 'describeType': {
+        const arg = this.emitExpr(args[0]);
+        const cls = `as_v_as_class(${this.boxExpr(arg)})`;
+        return { code: `as_describe_type(${cls})`, type: { kind: 'xml' } };
+      }
       // flash.utils.setTimeout(closure, delay, ...): schedule a Function call after
       // 'delay' ms and return a uint timer id (0 when the closure is null). The
       // closure is a boxed function value; unboxed to as_fn for the runtime helper.
+      // Trailing boxed args are passed through so callbacks like
+      // setTimeout(base.dispatchEvent, 1, new Event(...)) dispatch with that event.
       case 'setTimeout': {
         const fne = this.emitExpr(args[0]);
         const fn = fne.type.kind === 'function' ? fne.code : `((as_fn)as_v_obj_val(${this.boxExpr(fne)}))`;
         const delay = this.toNumberExpr(this.emitExpr(args[1]));
-        return { code: `as_set_timeout(${fn}, ${delay})`, type: { kind: 'uint' } };
+        if (args.length <= 2) {
+          return { code: `as_set_timeout(${fn}, ${delay})`, type: { kind: 'uint' } };
+        }
+        const extras = args.slice(2);
+        const items = extras.map((a) => this.boxExpr(this.emitExpr(a)));
+        const n = items.length;
+        const arr = `(as_value[${n}]){ ${items.join(', ')} }`;
+        return { code: `as_set_timeout_args(${fn}, ${delay}, ${n}, ${arr})`, type: { kind: 'uint' } };
       }
       // flash.utils.clearTimeout(id): cancel a scheduled timer (no-op if already
       // fired or unknown).
@@ -7732,10 +13620,40 @@ export class Emitter {
       // tickTimers(): headless test hook — pumps the timer queue once (as_timer_tick).
       // In window builds timers are driven by the frame loop; offscreen examples call
       // this to advance flash.utils.Timer / setTimeout deterministically.
-      case 'tickTimers': return { code: 'as_timer_tick()', type: { kind: 'void' } };
+      // tickTimers(): headless test hook - pumps the async IO jobs and the timer
+      // queue once. as_async_tick_wait() (rather than the frame boundary's
+      // non-blocking as_async_tick) is what keeps the examples deterministic:
+      // one call is enough to observe COMPLETE even when the work ran on a
+      // worker thread.
+      case 'tickTimers': return { code: '(as_async_tick_wait(), as_timer_tick())', type: { kind: 'void' } };
+      // tickFrame(): the NON-blocking variant of tickTimers — exactly one frame
+      // boundary (as_async_tick + as_timer_tick), with no wait for the workers.
+      // Streaming reads (URLStream.bytesAvailable) are only observable across
+      // frames while a transfer is still running, which tickTimers' drain-then-wait
+      // semantics can never show; this is the headless equivalent of the real
+      // frame loop for that case. Callers that need determinism use tickTimers.
+      case 'tickFrame': return { code: '(as_async_tick(), as_timer_tick())', type: { kind: 'void' } };
       // tickMovieClips(): headless test hook — advances every playing MovieClip by
       // one frame (as_mc_tick). In window builds clips are driven by the frame loop.
       case 'tickMovieClips': return { code: 'as_mc_tick()', type: { kind: 'void' } };
+      // flash.net.navigateToURL(request, window="_blank"): opens the URL in the
+      // system's default handler. Nothing is fetched by this process and no event
+      // is dispatched; a target with no launcher (WASI) reports AIR's #2032.
+      case 'navigateToURL': {
+        const req = this.emitExpr(args[0]!);
+        const rc = req.type.kind === 'any' ? `(URLRequest*)as_v_obj_val(${req.code})` : `((URLRequest*)(${req.code}))`;
+        if (args.length < 2) return { code: `URLRequest__navigate(${rc}, NULL)`, type: { kind: 'void' } };
+        const win = this.emitExpr(args[1]!);
+        const wc = win.type.kind === 'any' ? `as_v_str_val(${win.code})` : win.code;
+        return { code: `URLRequest__navigate(${rc}, ${wc})`, type: { kind: 'void' } };
+      }
+      // flash.net.sendToURL(request): navigateToURL minus the response, which here
+      // is the same call — the response never existed.
+      case 'sendToURL': {
+        const req = this.emitExpr(args[0]!);
+        const rc = req.type.kind === 'any' ? `(URLRequest*)as_v_obj_val(${req.code})` : `((URLRequest*)(${req.code}))`;
+        return { code: `URLRequest__sendToURL(${rc})`, type: { kind: 'void' } };
+      }
       case 'String': return { code: this.toStringExpr(e0!), type: { kind: 'string' } };
       case 'Number': {
         if (e0!.type.kind === 'string') return { code: `atof(${e0!.code})`, type: { kind: 'number' } };
@@ -7748,6 +13666,17 @@ export class Emitter {
         }
         if (e0!.type.kind === 'bool') return { code: e0!.code, type: { kind: 'bool' } };
         if (e0!.type.kind === 'any') return { code: `as_v_truthy(${e0!.code})`, type: { kind: 'bool' } };
+        // AS3's rule is "false for null/undefined/0/NaN/empty string, true
+        // otherwise" — a *non-null reference* is therefore true, NOT
+        // `ToNumber(v) != 0` (which gave false for every object). Verified against
+        // AIR: Boolean({}) / Boolean([]) / Boolean(new Sprite()) / Boolean(iface)
+        // are all `true` while int(obj) is 0 and Number(obj) is NaN.
+        if (e0!.type.kind === 'null') return { code: 'false', type: { kind: 'bool' } };
+        if (e0!.type.kind === 'interface') return { code: `(${e0!.code}.obj != NULL)`, type: { kind: 'bool' } };
+        if (e0!.type.kind === 'dict' || e0!.type.kind === 'class' || this.isRefType(e0!.type)) {
+          return { code: `(${e0!.code} != NULL)`, type: { kind: 'bool' } };
+        }
+        if (e0!.type.kind === 'number') return { code: `as_num_truthy(${e0!.code})`, type: { kind: 'bool' } };
         return { code: `((${this.toNumberExpr(e0!)}) != 0.0)`, type: { kind: 'bool' } };
       }
       case 'int': {
@@ -7785,6 +13714,11 @@ export class Emitter {
         return { code: `as_uri_decode(${s})`, type: { kind: 'string' } };
       }
       // Built-in constructor calls without `new`.
+      case 'XML': {
+        if (e0!.type.kind !== 'string') throw new CodegenError('XML() expects a String argument');
+        // one helper argument => the operand is evaluated exactly once
+        return { code: `as_xml_parse_str_checked(${e0!.code})`, type: { kind: 'xml' } };
+      }
       case 'Array': return this.emitArrayConstructor(args);
       // flash.geom value types constructible without `new` (Point(x, y) etc.).
       case 'Point':
@@ -7806,6 +13740,8 @@ export class Emitter {
           case 'record':
           case 'function':
           case 'regexp':
+          case 'xml':
+          case 'xmllist':
             return { code: e.code, type: e.type };
           case 'any':
             return { code: e.code, type: { kind: 'any' } };
@@ -7842,11 +13778,42 @@ export class Emitter {
     };
   }
 
+  // `super.property` read: resolve against the superclass's fields/getters (and
+  // static fields). Instance fields live at the same offset in the subclass
+  // struct (inherited layout), so `super.prop` reads `this->prop`.
+  private emitSuperProperty(expr: Extract<Expr, { kind: 'SuperProperty' }>): { code: string; type: CType } {
+    if (!this.currentClass) throw new CodegenError("'super' used outside a class method");
+    const info = this.symbols.getClass(this.currentClass)!;
+    if (!info.superClass) throw new CodegenError(`class '${this.currentClass}' has no superclass`);
+    const superInfo = this.symbols.getClass(info.superClass)!;
+    const f = this.symbols.fieldSlot(info.superClass, expr.property);
+    if (f) return { code: `this->${this.cIdent(f.cName ?? expr.property)}`, type: f.type };
+    const g = superInfo.getters.get(expr.property);
+    if (g) return { code: `${g.owner}_get_${expr.property}(this)`, type: g.returnType };
+    const sf = superInfo.staticFields.get(expr.property);
+    if (sf) return { code: this.sfRead(sf.owner, expr.property), type: sf.type };
+    // super.method referenced as a Function value (`super.addVertices.apply(...)`),
+    // bound to `this` with the superclass implementation. This MUST bypass the
+    // vtable: `super.m` denotes the superclass method, so dispatching virtually
+    // would re-enter an override of `m` in the current class (infinite recursion
+    // for the common `super.m.apply(this, args)` delegation pattern).
+    const sm = superInfo.methods.get(expr.property);
+    if (sm) return { code: `as_fn_make(${sm.owner}_${expr.property}__superbound, (void*)this, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+    throw new CodegenError(`undefined property '${expr.property}' on superclass '${info.superClass}'`);
+  }
+
   // `obj is Type`: runtime subtype check via the vtable `super` chain. For
   // interfaces we use a compile-time check against the static type's implements list.
   // AS3 primitive type names that participate in `is`/`as` runtime checks.
   private isScalarTypeName(name: string): boolean {
     return name === 'int' || name === 'uint' || name === 'Number' || name === 'Boolean' || name === 'String';
+  }
+
+  // The Object *root* type (as opposed to a concrete subclass): its slots can
+  // hold auto-boxed scalars/arrays/functions, so every `is`/`as` test on it must
+  // be a runtime check rather than a static fold.
+  private isObjectRoot(t: CType): boolean {
+    return t.kind === 'object' && t.className === 'Object';
   }
 
   private isScalarCType(t: CType): boolean {
@@ -7886,6 +13853,22 @@ export class Emitter {
       if (o.type.kind === 'any') {
         return { code: this.runtimeScalarIs(o.code, expr.typeName), type: { kind: 'bool' } };
       }
+      // An `Object`-typed slot auto-boxes scalars in AS3 ('var d:Object = "x"'),
+      // so the check must be a runtime test on the box's vtable identity — the
+      // same representation `as` unboxes. Folding to `false` here silently drops
+      // a live check: Starling's 'Tween.reset' tests 'transition is String' on its
+      // Object-typed parameter, and the folded false made every default
+      // ("linear") transition throw at runtime.
+      if (this.isObjectRoot(o.type)) {
+        const raw = `(void*)(${o.code})`;
+        switch (expr.typeName) {
+          // int/uint/Number share one boxed representation (documented limitation).
+          case 'Number': case 'int': case 'uint': return { code: `as_is_number_obj(${raw})`, type: { kind: 'bool' } };
+          case 'String': return { code: `as_is_string_obj(${raw})`, type: { kind: 'bool' } };
+          // A boxed Boolean lives in the same as_number wrapper; mirror `as Boolean`.
+          case 'Boolean': return { code: `(as_is_bool_obj(${raw}) || (as_is_number_obj(${raw}) && as_number_obj_val(${raw}) != 0.0))`, type: { kind: 'bool' } };
+        }
+      }
       return { code: 'false', type: { kind: 'bool' } };
     }
     // Object root: every class instance is an Object.
@@ -7894,24 +13877,82 @@ export class Emitter {
       if (o.type.kind === 'any') return { code: `as_v_is_object(${o.code})`, type: { kind: 'bool' } };
       return { code: 'false', type: { kind: 'bool' } };
     }
-    if (this.symbols.hasInterface(expr.typeName)) {
+    // `x is Function`: Function values carry their own box tag (as_v_fn), distinct
+    // from plain objects, so typeof/`is` can tell them apart from objects.
+    if (expr.typeName === 'Function') {
+      if (o.type.kind === 'function') return { code: 'true', type: { kind: 'bool' } };
+      if (o.type.kind === 'any') return { code: `as_v_is_fn(${o.code})`, type: { kind: 'bool' } };
+      if (this.isObjectRoot(o.type)) return { code: `as_is_fn_obj((void*)(${o.code}))`, type: { kind: 'bool' } };
+      return { code: 'false', type: { kind: 'bool' } };
+    }
+    // `x is Array`: a boxed array carries its own tag (as_v_arr), distinct from
+    // plain objects, so `is` can tell arrays apart from objects at runtime.
+    if (expr.typeName === 'Array') {
+      if (o.type.kind === 'array') return { code: 'true', type: { kind: 'bool' } };
+      if (o.type.kind === 'any') return { code: `as_v_is_array(${o.code})`, type: { kind: 'bool' } };
+      return { code: 'false', type: { kind: 'bool' } };
+    }
+    // `x is Class`: a Class reference is boxed as an object (tag 4) but points to a
+    // static as_class entry in the registry, so distinguish it by pointer identity.
+    if (expr.typeName === 'Class') {
+      if (o.type.kind === 'class') return { code: 'true', type: { kind: 'bool' } };
+      if (o.type.kind === 'any') return { code: `as_v_is_class(${o.code})`, type: { kind: 'bool' } };
+      if (o.type.kind === 'object') return { code: `as_v_is_class(as_v_obj((void*)(${o.code})))`, type: { kind: 'bool' } };
+      return { code: 'false', type: { kind: 'bool' } };
+    }
+    // `x is XML` / `x is XMLList`: XML is a dedicated boxed C type (not a class).
+    // A statically-known xml/xmllist passes; an `any` is checked against the
+    // runtime vtable (XML values are tag-4 objects with a distinct vtable).
+    if (expr.typeName === 'XML' || expr.typeName === 'XMLList') {
+      const rt2 = this.rt(expr.typeName as ASType);
+      if (o.type.kind === 'xml' || o.type.kind === 'xmllist') {
+        return { code: o.type.kind === rt2.kind ? 'true' : 'false', type: { kind: 'bool' } };
+      }
+      if (o.type.kind === 'any') {
+        const vt = rt2.kind === 'xml' ? 'as_xml_vt' : 'as_xml_list_vt';
+        return { code: `as_is(as_v_obj_val(${o.code}), &${vt})`, type: { kind: 'bool' } };
+      }
+      return { code: 'false', type: { kind: 'bool' } };
+    }
+    // `x is Vector.<T>`: Vector is a monomorphic value type; the check is true
+    // only when the static element type matches (a boxed `any` cannot recover the
+    // element type at runtime, so it is always false).
+    if (expr.typeName.startsWith('Vector.<')) {
+      const rt = this.rt(expr.typeName as ASType);
+      if (o.type.kind === 'vector') {
+        const ok = o.type.elem.kind === rt.elem.kind
+          && (o.type.elem.kind !== 'object' || o.type.elem.className === rt.elem.className);
+        return { code: ok ? 'true' : 'false', type: { kind: 'bool' } };
+      }
+      return { code: 'false', type: { kind: 'bool' } };
+    }
+    // Resolve the target type name to a CType first, so `x is IAnimatable`
+    // matches the interface's FQN key (interfaces are keyed by FQN, not the
+    // source-level short name).
+    const it = this.rt(expr.typeName as ASType);
+    if (it.kind === 'interface') {
       if (o.type.kind === 'object') {
         const cinfo = this.symbols.getClass(o.type.className);
-        const impl = cinfo ? cinfo.implements.includes(expr.typeName) : false;
+        const impl = cinfo ? cinfo.implements.includes(it.name) : false;
         return { code: impl ? 'true' : 'false', type: { kind: 'bool' } };
       }
       if (o.type.kind === 'interface') {
-        return { code: o.type.name === expr.typeName ? 'true' : 'false', type: { kind: 'bool' } };
+        return { code: o.type.name === it.name ? 'true' : 'false', type: { kind: 'bool' } };
       }
       return { code: 'false', type: { kind: 'bool' } };
     }
     // Resolve a short class name (e.g. `TweenCore` in package com.greensock.core)
     // to its FQN before the vtable reference and runtime subtype check.
-    const rt = resolveType(expr.typeName as ASType);
+    const rt = this.rt(expr.typeName as ASType);
     const fqn = rt.kind === 'object' ? rt.className : expr.typeName;
     if (!this.symbols.hasClass(fqn)) throw new CodegenError(`unknown type '${expr.typeName}'`);
     if (o.type.kind === 'any') {
       return { code: `as_v_is_inst(${o.code}, &${fqn}_vt)`, type: { kind: 'bool' } };
+    }
+    if (o.type.kind === 'interface') {
+      // An interface reference wraps a concrete object + interface vtable; `is`
+      // tests the wrapped object against the target class vtable.
+      return { code: `as_is(${o.code}.obj, &${fqn}_vt)`, type: { kind: 'bool' } };
     }
     if (o.type.kind !== 'object' && o.type.kind !== 'null') {
       throw new CodegenError(`'is' on non-object type is not supported`);
@@ -7930,12 +13971,23 @@ export class Emitter {
       case 'int': case 'uint': case 'number': return lit('number');
       case 'bool': return lit('boolean');
       case 'string': return lit('string');
-      case 'function': return lit('function');
-      case 'object': case 'interface': case 'array': case 'vector':
-      case 'record': case 'regexp': case 'class': return lit('object');
+      // A `function` slot is an as_fn pointer that may legitimately hold NULL, and
+      // AIR reports typeof(null) == "object" (typeof inspects the value, not the
+      // declared slot type). Folding to "function" unconditionally got
+      // `var f:Function = null; typeof f` wrong.
+      case 'function': return { code: `(${o.code} == NULL ? "object" : "function")`, type: { kind: 'string' } };
+      // Object / interface slots are statically typed but hold values of any
+      // dynamic type (autoboxed primitives, Function wrappers, class instances),
+      // so typeof must dispatch on the runtime vtable -- folding to "object"
+      // here would be wrong for e.g. `var o:Object = someFunction`.
+      case 'object': case 'interface':
+        return { code: `as_ptr_typeof((void*)${o.code})`, type: { kind: 'string' } };
+      case 'array': case 'vector': case 'record': case 'dict':
+      case 'regexp': case 'class': case 'xml': case 'xmllist': return lit('object');
       case 'null': return lit('object'); // AS3: typeof null == "object"
       case 'any': return { code: `as_v_typeof(${o.code})`, type: { kind: 'string' } };
       case 'void': return lit('undefined');
+      default: throw new CodegenError('typeof: unsupported operand type');
     }
   }
 
@@ -7976,24 +14028,27 @@ export class Emitter {
       return { code: `as_dict_has(${obj.code}, ${keyRef})`, type: { kind: 'bool' } };
     }
     const keyStr = key.type.kind === 'string' ? key.code : this.toStringExpr(key);
-    let objCode: string;
     if (obj.type.kind === 'record') {
-      objCode = obj.code;
-    } else if (obj.type.kind === 'any') {
-      objCode = `((as_object*)as_v_obj_val(${obj.code}))`;
-    } else if (obj.type.kind === 'object' && obj.type.className === 'Object') {
-      objCode = `((as_object*)${obj.code})`;
-    } else {
-      throw new CodegenError(`'in' requires a dynamic Object, found ${obj.type.kind}`);
+      return { code: `as_object_has(${obj.code}, ${keyStr})`, type: { kind: 'bool' } };
     }
-    return { code: `as_object_has(${objCode}, ${keyStr})`, type: { kind: 'bool' } };
+    if (obj.type.kind === 'any') {
+      // A boxed value: could be a record or a class instance, so route through the
+      // vtable-aware membership check (falls back to record slot lookup).
+      return { code: `as_dyn_has(as_v_obj_val(${obj.code}), ${keyStr})`, type: { kind: 'bool' } };
+    }
+    if (obj.type.kind === 'object') {
+      // Class instance: `in` reflects fields/getters/methods (and _dyn slots for
+      // dynamic classes), matching AS3 member semantics.
+      return { code: `as_dyn_has(${obj.code}, ${keyStr})`, type: { kind: 'bool' } };
+    }
+    throw new CodegenError(`'in' requires a dynamic Object, found ${obj.type.kind}`);
   }
 
   private emitAs(expr: Extract<Expr, { kind: 'As' }>): { code: string; type: CType } {
     const o = this.emitExpr(expr.obj);
     // Primitive scalar `as` casts.
     if (this.isScalarTypeName(expr.typeName)) {
-      const targetType = resolveType(expr.typeName as ASType);
+      const targetType = this.rt(expr.typeName as ASType);
       if (this.scalarIsCompatible(o.type, expr.typeName)) {
         return { code: this.convert(o, targetType), type: targetType };
       }
@@ -8006,6 +14061,19 @@ export class Emitter {
           case 'String': return { code: `as_v_as_string(${o.code})`, type: targetType };
         }
       }
+      // `obj as Number` where obj is an Object-typed reference: if the slot holds
+      // a boxed Number (auto-boxed scalar), recover its value; otherwise AS3 yields
+      // null (NaN when read as Number).
+      if (o.type.kind === 'object' && (o.type as { className: string }).className === 'Object') {
+        const raw = `(void*)(${o.code})`;
+        switch (expr.typeName) {
+          case 'Number': return { code: `(as_is_number_obj(${raw}) ? as_number_obj_val(${raw}) : NAN)`, type: targetType };
+          case 'int': return { code: `(as_is_number_obj(${raw}) ? as_to_int32(as_number_obj_val(${raw})) : 0)`, type: targetType };
+          case 'uint': return { code: `(as_is_number_obj(${raw}) ? as_to_uint32(as_number_obj_val(${raw})) : 0)`, type: targetType };
+          case 'Boolean': return { code: `(as_is_bool_obj(${raw}) ? as_bool_obj_val(${raw}) : (as_is_number_obj(${raw}) && as_number_obj_val(${raw}) != 0.0))`, type: targetType };
+          case 'String': return { code: `(as_is_string_obj(${raw}) ? as_string_obj_val(${raw}) : NULL)`, type: targetType };
+        }
+      }
       return { code: this.defaultInit(targetType), type: targetType };
     }
     // Object root: object/interface/null cast to Object*; scalars -> NULL.
@@ -8015,12 +14083,35 @@ export class Emitter {
       }
       return { code: 'NULL', type: { kind: 'object', className: 'Object' } };
     }
+    // `x as Vector.<T>`: succeeds only when the static type already matches the
+    // target element type (Vector is monomorphic; a boxed `any` cannot recover its
+    // element type, so it casts to NULL).
+    if (expr.typeName.startsWith('Vector.<')) {
+      const rt = this.rt(expr.typeName as ASType);
+      if (o.type.kind === 'vector') {
+        const ok = o.type.elem.kind === rt.elem.kind
+          && (o.type.elem.kind !== 'object' || o.type.elem.className === rt.elem.className);
+        return ok ? { code: o.code, type: rt } : { code: 'NULL', type: rt };
+      }
+      // Object-typed slot holding a Vector at runtime (`data as Vector.<Touch>`):
+      // the Object* already aliases the Vector, so cast it back.
+      if (o.type.kind === 'object') {
+        return { code: `((as_vector_${this.vectorCName((rt as { elem: CType }).elem)}*)(${o.code}))`, type: rt };
+      }
+      return { code: 'NULL', type: rt };
+    }
     // `x as Array`: a dynamically-typed array (or already-Array) is unboxed to
     // as_array*; any other value yields NULL.
     if (expr.typeName === 'Array') {
       if (o.type.kind === 'any') return { code: `((as_array*)as_v_obj_val(${o.code}))`, type: { kind: 'array' } };
       if (o.type.kind === 'array') return { code: o.code, type: { kind: 'array' } };
       return { code: 'NULL', type: { kind: 'array' } };
+    }
+    // `x as Dictionary`: unbox a dynamically-held Dictionary; else NULL.
+    if (expr.typeName === 'Dictionary') {
+      if (o.type.kind === 'any') return { code: `((as_dict*)as_v_obj_val(${o.code}))`, type: { kind: 'dict' } };
+      if (o.type.kind === 'dict') return { code: o.code, type: { kind: 'dict' } };
+      return { code: 'NULL', type: { kind: 'dict' } };
     }
     // `x as Class`: unbox a dynamically-held class reference; any other value
     // yields NULL. This enables `new (plugins[p] as Class)()`.
@@ -8029,20 +14120,50 @@ export class Emitter {
       if (o.type.kind === 'class') return { code: o.code, type: { kind: 'class' } };
       return { code: 'NULL', type: { kind: 'class' } };
     }
-    if (this.symbols.hasInterface(expr.typeName)) {
+    // `x as Function`: unbox a dynamically-held function value; any other value
+    // yields NULL.
+    if (expr.typeName === 'Function') {
+      if (o.type.kind === 'any') return { code: `as_v_as_fn(${o.code})`, type: { kind: 'function' } };
+      if (o.type.kind === 'function') return { code: o.code, type: { kind: 'function' } };
+      // Object-typed slot: a Function stored there is a boxed Function wrapper,
+      // so the cast recovers the wrapped closure (mirrors `obj as String`).
+      if (this.isObjectRoot(o.type)) {
+        const raw = `(void*)(${o.code})`;
+        return { code: `(as_is_fn_obj(${raw}) ? as_fn_obj_val(${raw}) : NULL)`, type: { kind: 'function' } };
+      }
+      return { code: 'NULL', type: { kind: 'function' } };
+    }
+    // `x as XML` / `x as XMLList`: XML is a dedicated boxed C type (not a class),
+    // so resolve the dedicated kind. A statically xml/xmllist value passes
+    // through; an object/any is cast to the target pointer (AS3 `as` never
+    // throws — a non-XML yields null at runtime, approximated here by the cast).
+    if (expr.typeName === 'XML' || expr.typeName === 'XMLList') {
+      const rt2 = this.rt(expr.typeName as ASType);
+      if (o.type.kind === 'xml' || o.type.kind === 'xmllist') return { code: o.code, type: rt2 };
+      const c = rt2.kind === 'xml' ? 'as_xml_node*' : 'as_xml_list*';
+      // An `any` holding an XML/XMLList box (tag-4 object) unboxes to the node
+      // pointer; a statically-scalar value cannot be XML so it yields NULL.
+      if (o.type.kind === 'any') return { code: `((${c})as_v_obj_val(${o.code}))`, type: rt2 };
+      return { code: `((${c})(${o.code}))`, type: rt2 };
+    }
+    // Resolve the target type name first (interfaces are keyed by FQN, so the
+    // source-level short name must go through rt()/resolveType).
+    const it = this.rt(expr.typeName as ASType);
+    if (it.kind === 'interface') {
+      const iname = it.name;
       if (o.type.kind === 'object') {
         const cinfo = this.symbols.getClass(o.type.className);
-        const impl = cinfo ? cinfo.implements.includes(expr.typeName) : false;
-        if (!impl) return { code: '{ NULL, NULL }', type: { kind: 'interface', name: expr.typeName } };
-        return { code: `(${expr.typeName}){ (void*)(${o.code}), &${o.type.className}_${expr.typeName}_vt }`, type: { kind: 'interface', name: expr.typeName } };
+        const impl = cinfo ? cinfo.implements.includes(iname) : false;
+        if (!impl) return { code: `(${iname}){ NULL, NULL }`, type: { kind: 'interface', name: iname } };
+        return { code: `(${iname}){ (void*)(${o.code}), &${o.type.className}_${iname}_vt }`, type: { kind: 'interface', name: iname } };
       }
       if (o.type.kind === 'interface') {
-        const code = o.type.name === expr.typeName ? o.code : '{ NULL, NULL }';
-        return { code, type: { kind: 'interface', name: expr.typeName } };
+        const code = o.type.name === iname ? o.code : `(${iname}){ NULL, NULL }`;
+        return { code, type: { kind: 'interface', name: iname } };
       }
-      return { code: '{ NULL, NULL }', type: { kind: 'interface', name: expr.typeName } };
+      return { code: `(${iname}){ NULL, NULL }`, type: { kind: 'interface', name: iname } };
     }
-    const rt = resolveType(expr.typeName as ASType);
+    const rt = this.rt(expr.typeName as ASType);
     const fqn = rt.kind === 'object' ? rt.className : expr.typeName;
     if (!this.symbols.hasClass(fqn)) throw new CodegenError(`unknown type '${expr.typeName}'`);
     // `as` never throws in AS3 — a failed cast yields null. A dynamically-typed
@@ -8051,6 +14172,13 @@ export class Emitter {
     if (o.type.kind === 'any') {
       return { code: `(as_v_is_inst(${o.code}, &${fqn}_vt) ? ((${fqn}*)as_v_obj_val(${o.code})) : NULL)`, type: { kind: 'object', className: fqn } };
     }
+    // Interface value cast to a class (`graphicsData as GraphicsSolidFill`): the
+    // interface value carries the underlying object pointer in `.obj`, so the
+    // runtime check targets that pointer.
+    if (o.type.kind === 'interface') {
+      const code = `(as_is(${o.code}.obj, &${fqn}_vt) ? ((${fqn}*)(${o.code}.obj)) : NULL)`;
+      return { code, type: { kind: 'object', className: fqn } };
+    }
     if (o.type.kind !== 'object' && o.type.kind !== 'null') {
       return { code: 'NULL', type: { kind: 'object', className: fqn } };
     }
@@ -8058,9 +14186,55 @@ export class Emitter {
     return { code, type: { kind: 'object', className: fqn } };
   }
 
+  // Look up a Class-typed variable/param by name (used by `new assetClass()`,
+  // where the identifier is a Class reference rather than a literal class name).
+  // Returns its emitted reference, or null if the name is not a Class in scope.
+  private lookupClassVar(name: string): { code: string; type: CType } | null {
+    if (this.currentClosureCaptures?.has(name)) {
+      const t = this.currentClosureCaptures.get(name)!;
+      return t.kind === 'class' ? { code: `env->${this.cIdent(name)}`, type: t } : null;
+    }
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      const lt = this.scopes[i].get(name);
+      if (lt !== undefined) return lt.kind === 'class' ? { code: this.cIdent(name), type: lt } : null;
+    }
+    // A Class-typed instance field (`private var _rootClass:Class`) is `this->_rootClass`.
+    if (this.currentClass) {
+      const cinfo = this.symbols.getClass(this.currentClass);
+      const f = this.symbols.fieldSlot(this.currentClass, name);
+      if (f && f.type.kind === 'class') {
+        return { code: `this->${this.cIdent(f.cName ?? name)}`, type: f.type };
+      }
+      const sf = cinfo?.staticFields.get(name);
+      if (sf && sf.type.kind === 'class') {
+        return { code: this.sfRead(sf.owner, name), type: sf.type };
+      }
+    }
+    if (this.currentClass === null) {
+      const mt = this.moduleScope.get(name);
+      if (mt !== undefined) return mt.kind === 'class' ? { code: this.moduleCName(name), type: mt } : null;
+    }
+    return null;
+  }
+
+  // Like lookupClassVar, but returns an Object/any-typed variable holding a Class
+  // reference at runtime (AS3 `if (asset is Class) asset = new asset()`). Used by
+  // `new asset()` where `asset` is statically Object but dynamically a Class.
+  private lookupObjectVar(name: string): { code: string; type: CType } | null {
+    if (this.currentClosureCaptures?.has(name)) {
+      const t = this.currentClosureCaptures.get(name)!;
+      return (t.kind === 'object' || t.kind === 'any') ? { code: `env->${this.cIdent(name)}`, type: t } : null;
+    }
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      const lt = this.scopes[i].get(name);
+      if (lt !== undefined) return (lt.kind === 'object' || lt.kind === 'any') ? { code: this.cIdent(name), type: lt } : null;
+    }
+    return null;
+  }
+
   private emitNew(expr: Extract<Expr, { kind: 'New' }>): { code: string; type: CType } {
     if (expr.className.startsWith('Vector.<')) {
-      const vt = resolveType(expr.className);
+      const vt = this.rt(expr.className);
       if (vt.kind !== 'vector') throw new CodegenError(`invalid Vector type '${expr.className}'`);
       if (expr.args.length === 0) {
         return { code: `as_vector_${this.vectorCName(vt.elem)}_new()`, type: vt };
@@ -8094,6 +14268,23 @@ export class Emitter {
       if (expr.args.length > 1) throw new CodegenError('new Dictionary() takes at most (weakKeys)');
       return { code: 'as_dict_new()', type: { kind: 'dict' } };
     }
+    // new XML(source): parse a String or ByteArray into a DOM node. Malformed
+    // input throws an Error (as_xml_parse_checked), matching AS3's TypeError.
+    if (expr.className === 'XML') {
+      if (expr.args.length !== 1) throw new CodegenError('new XML() takes exactly 1 argument');
+      const e = this.emitExpr(expr.args[0]);
+      let parse: string;
+      // the helpers below take the operand once, so `new XML(expr)` evaluates
+      // `expr` exactly once even when it is a side-effecting call
+      if (e.type.kind === 'string') {
+        parse = `as_xml_parse_str_checked(${e.code})`;
+      } else if (e.type.kind === 'object' && (e.type as { className: string }).className === 'ByteArray') {
+        parse = `as_xml_parse_bytes_checked(${e.code})`;
+      } else {
+        throw new CodegenError('new XML() expects a String or ByteArray argument');
+      }
+      return { code: parse, type: { kind: 'xml' } };
+    }
     // new String(x) / new Number(x) / new Boolean(x) / new int(x) / new uint(x):
     // AS3 primitive-wrapper constructors, semantically identical to the conversion
     // functions String(x)/Number(x)/... (primitives are modeled directly here, not
@@ -8102,12 +14293,34 @@ export class Emitter {
       if (expr.args.length !== 1) throw new CodegenError(`new ${expr.className}() takes exactly 1 argument`);
       return this.emitGlobalCall(expr.className, expr.args)!;
     }
-    const vt = resolveType(expr.className);
-    if (vt.kind !== 'object') throw new CodegenError(`unknown class '${expr.className}'`);
+    const vt = this.rt(expr.className);
+    if (vt.kind !== 'object' || !this.symbols.hasClass(vt.className)) {
+      // `new assetClass()`: the identifier names a Class-typed variable, not a
+      // literal class name — dynamic class instantiation.
+      const ref = this.lookupClassVar(expr.className);
+      if (ref) {
+        if (expr.args.length > 0) throw new CodegenError('dynamic class instantiation only supports no-arg constructors');
+        return { code: `as_dyn_new((as_class*)(void*)(${ref.code}))`, type: { kind: 'any' } };
+      }
+      // `new asset()` where `asset` is an Object/any-typed variable that holds a
+      // Class reference at runtime (AS3 `if (asset is Class) asset = new asset()`).
+      const ov = this.lookupObjectVar(expr.className);
+      if (ov) {
+        if (expr.args.length > 0) throw new CodegenError('dynamic class instantiation only supports no-arg constructors');
+        return { code: `as_dyn_new((as_class*)(void*)(${ov.code}))`, type: { kind: 'any' } };
+      }
+      throw new CodegenError(`unknown class '${expr.className}'`);
+    }
     const cname = vt.className;
     const cinfo = this.symbols.getClass(cname);
     if (!cinfo) throw new CodegenError(`unknown class '${cname}'`);
-    const args = this.emitArgs(cinfo.constructor.params, expr.args);
+    let args: string;
+    try {
+      args = this.emitArgs(cinfo.constructor.params, expr.args);
+    } catch (e) {
+      if (e instanceof CodegenError) throw new CodegenError(`${e.message} (constructor of ${cname}, args=${expr.args.length}, params=[${cinfo.constructor.params.map((p) => `${p.name}${p.defaultValue !== null ? '?' : ''}`).join(', ')}])`);
+      throw e;
+    }
     return { code: `${cname}_new(${args})`, type: { kind: 'object', className: cname } };
   }
 
@@ -8119,7 +14332,7 @@ export class Emitter {
     if (expr.args.length > 0) throw new CodegenError('dynamic class instantiation only supports no-arg constructors');
     const c = this.emitExpr(expr.classExpr);
     if (c.type.kind !== 'class') throw new CodegenError('dynamic instantiation requires a Class reference');
-    return { code: `as_v_obj((${c.code})->factory())`, type: { kind: 'any' } };
+    return { code: `as_dyn_new((as_class*)(void*)(${c.code}))`, type: { kind: 'any' } };
   }
 
   // Shared path for `new Array(...)` and the no-`new` call `Array(...)`. AS3's
@@ -8178,7 +14391,7 @@ export class Emitter {
   // Elements are converted to the element C type (no boxing — the Vector holds
   // raw typed values), then handed to the per-specialization make helper.
   private emitVectorLit(expr: Extract<Expr, { kind: 'VectorLit' }>): { code: string; type: CType } {
-    const vt = resolveType(`Vector.<${expr.elem}>`);
+    const vt = this.rt(`Vector.<${expr.elem}>`);
     if (vt.kind !== 'vector') throw new CodegenError('invalid Vector literal element type');
     const key = this.vectorCName(vt.elem);
     const ec = this.cTypeName(vt.elem);
@@ -8211,6 +14424,19 @@ export class Emitter {
   // known Array, or an `any` (e.g. an array nested inside another array), in
   // which case we unbox it to as_array* at runtime.
   private emitIndex(expr: Extract<Expr, { kind: 'Index' }>): { code: string; type: CType } {
+    // `ClassName["staticMember"]` dynamic static access (e.g. Context3D["supportsVideoTexture"]):
+    // resolve the string key against the class's static fields/getters.
+    if (expr.object.kind === 'Var' && expr.index.kind === 'Str') {
+      const cname = this.resolveClassName(expr.object.name);
+      if (this.symbols.hasClass(cname)) {
+        const cinfo = this.symbols.getClass(cname)!;
+        const prop = expr.index.value;
+        const sf = cinfo.staticFields.get(prop);
+        if (sf) return { code: this.sfRead(sf.owner, prop), type: sf.type };
+        const sg = cinfo.staticGetters?.get(prop);
+        if (sg) return { code: `${sg.owner}_get_${prop}_static(NULL)`, type: sg.returnType };
+      }
+    }
     const obj = this.emitExpr(expr.object);
     if (obj.type.kind === 'vector') {
       const idx = this.convert(this.emitExpr(expr.index), { kind: 'int' });
@@ -8238,9 +14464,10 @@ export class Emitter {
       const keyStr = key.type.kind === 'string' ? key.code : this.toStringExpr(key);
       return { code: `as_object_get(${obj.code}, ${keyStr})`, type: { kind: 'any' } };
     }
-    // AS3 root Object is dynamic: obj[key] may be a record slot OR a reflectable
-    // field of a real class instance. Route through the runtime reflection helper.
-    if (obj.type.kind === 'object' && obj.type.className === 'Object') {
+    // Any class instance supports obj[key] dynamic access: route through the
+    // runtime reflection helper, which walks the vtable super chain for a field
+    // named `key` (and falls back to the record/_dyn slot table for dynamic objects).
+    if (obj.type.kind === 'object') {
       const key = this.emitExpr(expr.index);
       const keyStr = key.type.kind === 'string' ? key.code : this.toStringExpr(key);
       return { code: `as_dyn_get((void*)(${obj.code}), ${keyStr})`, type: { kind: 'any' } };
@@ -8271,9 +14498,17 @@ export class Emitter {
   }
 
   // Turn a condition expression into a C boolean test. Dynamically-typed (`any`)
-  // values are tested for AS3 truthiness; all other types are already bool/int.
+  // values are tested for AS3 truthiness; interface values are `{ obj, vt }` value
+  // structs, whose truthiness is the underlying object reference being non-NULL;
+  // all other types are already bool/int.
   private condExpr(e: { code: string; type: CType }): string {
-    return e.type.kind === 'any' ? `as_v_truthy(${e.code})` : e.code;
+    if (e.type.kind === 'any') return `as_v_truthy(${e.code})`;
+    if (e.type.kind === 'interface') return `(${e.code}.obj != NULL)`;
+    // A statically-number-typed condition must not rely on C's own test: `if (d)`
+    // calls NaN true, while AS3 calls it false (`if (0/0)` must not run). The
+    // helper also keeps the operand mentioned exactly once.
+    if (e.type.kind === 'number') return `as_num_truthy(${e.code})`;
+    return e.code;
   }
 
   // Box a value expression into `as_value` (dynamic type).
@@ -8287,13 +14522,25 @@ export class Emitter {
       case 'array': return `as_v_arr((void*)(${e.code}))`;
       case 'vector': return `as_v_obj((void*)(${e.code}))`;
       case 'record': return `as_v_obj((void*)(${e.code}))`;
-      case 'object': return `as_v_obj((void*)(${e.code}))`;
+      case 'object': {
+        const cls = (e.type as { className: string }).className;
+        // The Object root can hold an auto-boxed scalar (Number/String); when it
+        // does, the boxed as_value must carry the primitive tag so '==' and
+        // 'is String'/'is Number' work downstream. Concrete subclasses box as the
+        // plain object reference.
+        return cls === 'Object' ? `as_obj_to_value((void*)(${e.code}))` : `as_v_obj((void*)(${e.code}))`;
+      }
       case 'interface': return `as_v_obj(${e.code}.obj)`;
       case 'function': return `as_v_fn((void*)(${e.code}))`;
       case 'class': return `as_v_obj((void*)(${e.code}))`;
       case 'dict': return `as_v_obj((void*)(${e.code}))`;
+      case 'xml': return `as_v_obj((void*)(${e.code}))`;
+      case 'xmllist': return `as_v_obj((void*)(${e.code}))`;
       case 'null': return 'as_v_null()';
       case 'void': return 'as_v_null()';
+      // A RegExp value boxes as a plain object reference (tag 4), like XML/dict.
+      case 'regexp': return `as_v_obj((void*)(${e.code}))`;
+      default: throw new CodegenError(`boxExpr: unhandled type '${(e.type as CType).kind}'`);
     }
   }
 
@@ -8304,14 +14551,22 @@ export class Emitter {
       case 'uint': return `as_v_uint_val(${e.code})`;
       case 'number': return `as_v_num_val(${e.code})`;
       case 'bool': return `as_v_bool_val(${e.code})`;
-      case 'string': return `as_v_str_val(${e.code})`;
+      case 'string': return `as_coerce_str(${e.code})`;
       case 'array': return `((as_array*)as_v_obj_val(${e.code}))`;
       case 'vector': {
         const ve = target as { elem: CType };
         return `((as_vector_${this.vectorCName(ve.elem)}*)as_v_obj_val(${e.code}))`;
       }
       case 'record': return `((as_object*)as_v_obj_val(${e.code}))`;
-      case 'object': return `((${(target as { className: string }).className}*)as_v_obj_val(${e.code}))`;
+      case 'object': {
+        const cls = (target as { className: string }).className;
+        // Any->Object unboxing must AUTOBOX primitives: a dynamic member read
+        // (properties[property] in Starling's Juggler.tween) hands back an
+        // as_value carrying a primitive tag, and reinterpreting that as a
+        // pointer yields a dangling Object* (observed as 'rotationX = NaN').
+        if (cls === 'Object') return `((Object*)as_value_to_obj(${e.code}))`;
+        return `((${cls}*)as_v_obj_val(${e.code}))`;
+      }
       case 'interface': {
         const iname = (target as { name: string }).name;
         return `(${iname}){ (void*)as_v_obj_val(${e.code}), (${iname}_vtable*)as_iface_lookup(as_v_obj_val(${e.code}), "${iname}") }`;
@@ -8319,6 +14574,8 @@ export class Emitter {
       case 'function': return `((as_fn)as_v_obj_val(${e.code}))`;
       case 'class': return `((as_class*)as_v_obj_val(${e.code}))`;
       case 'dict': return `((as_dict*)as_v_obj_val(${e.code}))`;
+      case 'xml': return `((as_xml_node*)as_v_obj_val(${e.code}))`;
+      case 'xmllist': return `((as_xml_list*)as_v_obj_val(${e.code}))`;
       case 'null': return 'NULL';
       case 'any': return e.code;
       case 'void': return e.code;
@@ -8360,7 +14617,7 @@ export class Emitter {
 
   // Convert a value expression to the target type where a C cast is required.
   private isRefType(t: CType): boolean {
-    return t.kind === 'string' || t.kind === 'object' || t.kind === 'array' || t.kind === 'vector' || t.kind === 'record' || t.kind === 'interface' || t.kind === 'function' || t.kind === 'regexp';
+    return t.kind === 'string' || t.kind === 'object' || t.kind === 'array' || t.kind === 'vector' || t.kind === 'record' || t.kind === 'interface' || t.kind === 'function' || t.kind === 'regexp' || t.kind === 'xml' || t.kind === 'xmllist';
   }
 
   private describeType(t: CType): string {
@@ -8404,10 +14661,35 @@ export class Emitter {
     if (target.kind === 'bool') return `((bool)(${e.code}))`;
     if (target.kind === 'object') {
       if (e.type.kind === 'null') return 'NULL';
-      return `((${(target as { className: string }).className}*)(${e.code}))`;
+      const cls = (target as { className: string }).className;
+      // AS3 auto-boxes a scalar stored into an Object-typed slot (`var data:Object
+      // = 3.14`) into a boxed Number, recovered later by `data as Number`. Only the
+      // Object root can hold a boxed scalar — a concrete class target would be a
+      // type error, so those keep the raw pointer cast.
+      if (cls === 'Object' && (e.type.kind === 'number' || e.type.kind === 'int' || e.type.kind === 'uint')) {
+        const d = e.type.kind === 'number' ? e.code : `((double)(${e.code}))`;
+        return `((Object*)as_number_new(${d}))`;
+      }
+      // AS3's String is an Object subclass: 'var data:Object = "hi"' must store a
+      // boxed String (round-tripped by as_obj_to_value / 'data as String'), not a
+      // raw char* reinterpret-cast into an Object* (which would be a dangling
+      // pointer with no vtable).
+      if (cls === 'Object' && e.type.kind === 'bool') {
+        return `((Object*)as_boolean_new(${e.code}))`;
+      }
+      if (cls === 'Object' && e.type.kind === 'string') {
+        return `((Object*)as_string_new(${e.code}))`;
+      }
+      // AS3's Function is an Object subclass too: 'var data:Object = myFunc' must
+      // store a boxed Function (round-tripped by as_obj_to_value / 'data as
+      // Function'), not a raw closure pointer that has no vtable header.
+      if (cls === 'Object' && e.type.kind === 'function') {
+        return `((Object*)as_function_new(${e.code}))`;
+      }
+      return `((${cls}*)(${e.code}))`;
     }
     if (target.kind === 'interface') {
-      if (e.type.kind === 'null') return '{ NULL, NULL }';
+      if (e.type.kind === 'null') return `(${(target as { name: string }).name}){ NULL, NULL }`;
       if (e.type.kind === 'object') {
         const cls = (e.type as { className: string }).className;
         const iname = (target as { name: string }).name;

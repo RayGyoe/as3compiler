@@ -64,7 +64,8 @@
     "ASC_USE_WINDOW=1",
     "ASC_DISPLAY_HIGH=1",
     "ASC_RENDER_METAL=1",
-    "ASC_RENDER_STAGE3D=1"
+    "ASC_RENDER_STAGE3D=1",
+    "ASC_RENDER_DEPTH_STENCIL=1"
   ],
   "objects": []
 }

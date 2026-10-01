@@ -109,6 +109,19 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 > **裸** Metal 命令缓冲」，而非再走 Ganesh——Ganesh 是 Skia 的 2D 抽象，Stage3D 的三角形管线要直接 `MTLBuffer` +
 > `MTLRenderPipelineDescriptor`，两者在同一 `MTLDevice` 上共存、经同一 `MTLCommandQueue` 提交，最后共享一个 drawable 上屏。
 
+> **落地现状（native = 阶段八十二~八十三，web = 阶段八十九·三十）**：没有塞进 `metal_glue.mm`/`web_glue.cc`，
+> 而是各自独立的自包含胶水文件，暴露**同一套平坦 `s3d_*` C 签名**：
+>
+> | 目标 | 文件 | 着色器 | 构建开关 |
+> |---|---|---|---|
+> | native (macOS) | `vendor/stage3d_glue.mm` | 裸 Metal，AGAL→MSL | `ASC_RENDER_STAGE3D=1` |
+> | web | `vendor/stage3d_webgl.cc` | WebGL2/GLES3，AGAL→GLSL ES | `ASC_RENDER_STAGE3D=1` + `ASC_S3D_GLSL=1`（有 `<depthAndStencil>` 时再加 `ASC_RENDER_DEPTH_STENCIL=1`） |
+>
+> 因此生成的 C 里的 `Context3D` 状态机、`as_s3d_*` 包装器、AGAL 翻译器调用点**两端完全相同**，
+> 着色器语言只由构建期 `ASC_AGAL_TARGET` 选择。web 侧的 GL↔AS3 语义差异（Y 轴翻转、BGRA 交换、
+> 逐寄存器 uniform、FBO/模板、CPU 读回上屏及其代价）见 [`html5-web.md`](html5-web.md) §3.3。
+> 是否挂载后端由 `src/air-app.ts` 的 `detectStage3D(files)` 扫源码自动判定（native 与 web 都适用）。
+
 ---
 
 ## 6. 建议的分阶段路线（对应现有「阶段XX」约定）
@@ -174,8 +187,8 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 | 项 | 判断 |
 |---|---|
 | `VideoTexture` | ❌ 依赖 `NetStream`/`Camera`（视频解码），**排除**，返回 null |
-| 压缩纹理（ATF/DXT/PVRTC） | ❌ 依赖专用编解码，**排除**（或只支持运行时无压缩回退） |
-| `driverInfo`/`totalGPUMemory`/`profile` 精确上报 | 部分可做，语义近似即可 |
+| 压缩纹理（ATF/DXT/PVRTC） | ⚠️ **部分**（阶段八十九·二十一）：ATF 容器的 `format 3/5`（裸 DXT1/DXT5）已实现——运行时 `as_atf_decode_dxt` 在 CPU 解码为直通-alpha ARGB 后走普通纹理上传路径（不预乘，与 adl 把裸 DXT5 交给 GPU 一致；mip 1+ 未解码、只取 level 0）；ETC1/PVRTC、cubemap 与 `format 0xc/0xd`（JPEG-XR 有损）仍**响亮报错**（`Error #3680`），不静默出空图 |
+| `driverInfo`/`totalGPUMemory`/`profile` 精确上报 | `driverInfo` 已按「上下文级后端」上报：链接了 `stage3d_glue.mm`（`ASC_RENDER_STAGE3D`）即 `"Metal (Stage3D)"`，否则 `"Software (state machine)"`（**不看**只表示窗口合成后端的 `ASC_RENDER_METAL`）；`profile` 固定 `"baseline"`；`totalGPUMemory` 已实现但为**近似值**（阶段八十九·二十一：后台缓冲 BGRA8 字节数 + 有深度模板时再加 D32S8 字节数）——它必须存在，因为 Starling `StatsDisplay.supportsGpuMem` 用 `"totalGPUMemory" in context` 探测并据此增删整个 HUD 行 |
 | `enableErrorChecking=true` 的同步抛错 | 可选，先只做 `false` 异步路径 |
 | AGAL2/AGAL3 的 GPU 端到端上屏（MRT/实例化） | 翻译在内核阶段（阶段八十）已覆盖；Metal 侧的 MRT `[[color(i)]]`、AGAL3 `iid` → `[[instance_id]]` 上屏延后到阶段八十三 |
 

@@ -25,10 +25,11 @@ const KEYWORDS = new Set([
   'Function',
   'package', 'import',
   'throw', 'try', 'catch', 'finally',
+  'namespace', 'use',
 ]);
 
-const MULTI_SYMBOLS = ['==', '!=', '<=', '>=', '&&', '||', '+=', '-=', '*=', '/=', '++', '--', '...', '>>>=', '<<=', '>>=', '&=', '|=', '^=', '>>>', '<<', '>>'];
-const SINGLE_SYMBOLS = new Set('+-*/%<>=!(){}[];,. :?&|^~'.replace(/ /g, ''));
+const MULTI_SYMBOLS = ['===', '!==', '==', '!=', '<=', '>=', '||=', '&&=', '&&', '||', '+=', '-=', '*=', '/=', '%=', '++', '--', '...', '>>>=', '<<=', '>>=', '&=', '|=', '^=', '>>>', '<<', '>>', '::'];
+const SINGLE_SYMBOLS = new Set('+-*/%<>=!(){}[];,. :?&|^~@'.replace(/ /g, ''));
 
 // Keywords that precede an operand (so a following `/` is a regex literal, not
 // division): `return /re/`, `case /re/:`, `throw /re/`, `new /re/` (uncommon).
@@ -62,10 +63,20 @@ export class LexError extends Error {
 }
 
 export function lex(source: string): Token[] {
+  // Strip a leading UTF-8 BOM (EF BB BF) so it is not read as a stray identifier
+  // character (BitmapFont.as ships with one).
+  if (source.charCodeAt(0) === 0xfeff) source = source.slice(1);
   const tokens: Token[] = [];
   let i = 0;
   let line = 1;
   let col = 1;
+  // Generic angle-bracket depth. `<` opens a generic parameter list only when it
+  // follows `.` (Vector.<T>) or `new` (new <T>[]); a `<` after an operand is the
+  // less-than operator. While depth > 0, a `>` is the list's closing bracket and
+  // must NOT merge with a following `=`/`>` into `>=`/`>>`/`>>>` (those are real
+  // operators only at depth 0), so `Vector.<String>=null` and nested
+  // `Vector.<Vector.<T>>` lex correctly.
+  let angleDepth = 0;
 
   const advance = (): string => {
     const ch = source[i++];
@@ -89,15 +100,24 @@ export function lex(source: string): Token[] {
       while (i < source.length && source[i] !== '\n') advance();
       continue;
     }
-    // block comment; AS3 block comments nest
+    // block comment. AS3 block comments do NOT nest — verified against the
+    // reference compiler: `/** glob: img/*.png */` inside a package compiles under
+    // mxmlc, so the `/*` inside is ordinary text. Nesting therefore diverges from
+    // AIR and, worse, fails SILENTLY: a doc comment that mentions a `*.png` glob
+    // swallowed every line up to the next `*/`, and when the braces happened to
+    // balance afterwards the rest of the file compiled as if it did not exist.
+    // The comment now ends at the first `*/`, and running off the end is a loud
+    // error instead of an unterminated comment that eats the file.
     if (ch === '/' && peek(1) === '*') {
+      const cLine = line;
+      const cCol = col;
       advance(); advance();
-      let depth = 1;
-      while (i < source.length && depth > 0) {
-        if (source[i] === '/' && peek(1) === '*') { advance(); advance(); depth++; }
-        else if (source[i] === '*' && peek(1) === '/') { advance(); advance(); depth--; }
-        else advance();
+      let closed = false;
+      while (i < source.length) {
+        if (source[i] === '*' && peek(1) === '/') { advance(); advance(); closed = true; break; }
+        advance();
       }
+      if (!closed) throw new LexError('unterminated block comment', cLine, cCol);
       continue;
     }
 
@@ -201,7 +221,23 @@ export function lex(source: string): Token[] {
 
     // multi-char symbols
     let matched = false;
+    // Inside a generic parameter list, `>` closes the bracket: emit it alone and
+    // leave any following `=`/`>` for the next iteration (so `Vector.<T>=null`
+    // and `Vector.<Vector.<T>>` don't collapse into `>=`/`>>`).
+    if (angleDepth > 0 && ch === '>') {
+      advance();
+      tokens.push({ kind: 'symbol', value: '>', line: startLine, col: startCol });
+      angleDepth--;
+      continue;
+    }
     for (const sym of MULTI_SYMBOLS) {
+      // `:*=` — the `*` is AS3's untyped type annotation and `=` is a default
+      // value separator, but the lexer would otherwise merge them into the
+      // `*=` compound-assignment token. A `*=` following `:` can never be a
+      // compound assignment (its left operand would have to be a value), so we
+      // skip it here and let the single-char branch emit `*`, with `=` handled
+      // on the next iteration.
+      if (sym === '*=' && tokens.length > 0 && tokens[tokens.length - 1].value === ':') continue;
       if (source.startsWith(sym, i)) {
         for (let k = 0; k < sym.length; k++) advance();
         tokens.push({ kind: 'symbol', value: sym, line: startLine, col: startCol });
@@ -214,6 +250,9 @@ export function lex(source: string): Token[] {
     // single-char symbols
     if (SINGLE_SYMBOLS.has(ch)) {
       advance();
+      // A `<` after `.` (Vector.<) or `new` (new <T>[]) opens a generic list.
+      const prev = tokens[tokens.length - 1];
+      if (ch === '<' && prev && (prev.value === '.' || prev.value === 'new')) angleDepth++;
       tokens.push({ kind: 'symbol', value: ch, line: startLine, col: startCol });
       continue;
     }

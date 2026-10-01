@@ -24,7 +24,7 @@ package demo {
 
     public function Fps() {
       text = new TextField();
-      text.width = 360;
+      text.width = 420;
       //text.autoSize = TextFieldAutoSize.LEFT;
       text.height = 20;
       text.background = true;
@@ -52,7 +52,8 @@ package demo {
         text.text = "  FPS:" + frames
           + "  MEM:" + int(System.totalMemory / 1048576) + "MB"
           + "  PRIV:" + int(System.privateMemory / 1048576) + "MB"
-          + "  RUNTIME:"+ Capabilities.version + "  ";
+          + "  VERSION:"+ Capabilities.version + "  "
+          + "  RUNTIME:"+ Capabilities.manufacturer + "  ";
         frames = 0;
         last = now;
       }

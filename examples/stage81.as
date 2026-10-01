@@ -11,7 +11,13 @@ check(Context3DBlendFactor.SOURCE_ALPHA == "sourceAlpha", "BlendFactor.SOURCE_AL
 check(Context3DBlendFactor.ONE_MINUS_SOURCE_ALPHA == "oneMinusSourceAlpha", "BlendFactor.ONE_MINUS_SOURCE_ALPHA");
 check(Context3DBufferUsage.STATIC_DRAW == "staticDraw", "BufferUsage.STATIC_DRAW");
 check(Context3DBufferUsage.DYNAMIC_DRAW == "dynamicDraw", "BufferUsage.DYNAMIC_DRAW");
-check(Context3DClearMask.ALL == "all", "ClearMask.ALL");
+// Context3DClearMask is a uint bitmask, not a String: clear(..., mask) uses it as
+// a bit set of the attachments to clear. adl-verified values (temp/refcheck/Mask.as):
+// COLOR=1, DEPTH=2, STENCIL=4, ALL=7.
+check(Context3DClearMask.COLOR == 1, "ClearMask.COLOR");
+check(Context3DClearMask.DEPTH == 2, "ClearMask.DEPTH");
+check(Context3DClearMask.STENCIL == 4, "ClearMask.STENCIL");
+check(Context3DClearMask.ALL == 7, "ClearMask.ALL");
 check(Context3DCompareMode.LESS_EQUAL == "lessEqual", "CompareMode.LESS_EQUAL");
 check(Context3DProgramType.VERTEX == "vertex", "ProgramType.VERTEX");
 check(Context3DProgramType.FRAGMENT == "fragment", "ProgramType.FRAGMENT");
@@ -39,7 +45,10 @@ function onCreated(e:Event):void { created = true; }
 s3d.addEventListener(Event.CONTEXT3D_CREATE, onCreated);
 check(!created, "not created before request");
 s3d.requestContext3D(Context3DRenderMode.AUTO);
-check(created, "CONTEXT3D_CREATE dispatched synchronously");
+// AIR dispatches context3DCreate asynchronously (on a later frame tick); the
+// context object itself is created eagerly so stage3D.context3D is immediately
+// readable. Asserting the event fires synchronously here would encode a bug.
+check(!created, "CONTEXT3D_CREATE is dispatched asynchronously (matches AIR)");
 
 var ctx:Context3D = s3d.context3D;
 check(ctx != null, "context3D lazily created");
@@ -77,11 +86,19 @@ ctx.setTextureAt(0, tex);
 ctx.setBlendFactors(Context3DBlendFactor.ONE, Context3DBlendFactor.ONE_MINUS_SOURCE_ALPHA);
 ctx.setDepthTest(false, Context3DCompareMode.LESS);
 ctx.setCulling(Context3DTriangleFace.FRONT);
+ctx.setStencilActions(Context3DTriangleFace.FRONT_AND_BACK, Context3DCompareMode.EQUAL,
+                     Context3DStencilAction.INCREMENT_SATURATE);
+ctx.setStencilReferenceValue(127);
+ctx.setSamplerStateAt(0, Context3DWrapMode.CLAMP, Context3DTextureFilter.LINEAR, Context3DMipFilter.MIPNONE);
+ctx.setScissorRectangle(new Rectangle(0, 0, 64, 64));
+ctx.setScissorRectangle(null);
+check(true, "stencil/sampler/scissor forwarding paths compile + accept args");
 
 var mvp:Matrix3D = new Matrix3D();
 mvp.appendScale(2, 2, 1);
 ctx.setProgramConstantsFromMatrix(Context3DProgramType.VERTEX, 0, mvp, false);
 
+ctx.clear(0.0, 0.0, 0.0, 1.0, 1.0, 127, Context3DClearMask.ALL);
 ctx.clear(0.0, 0.0, 0.0, 1.0);
 ctx.drawTriangles(ib, 0, 2);
 ctx.present();

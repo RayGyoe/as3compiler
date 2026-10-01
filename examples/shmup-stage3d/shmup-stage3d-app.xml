@@ -12,6 +12,7 @@
     <resizable>true</resizable>
     <!-- Stage3D requires the direct render mode in AIR. -->
     <renderMode>direct</renderMode>
+    <depthAndStencil>true</depthAndStencil>
     <requestedDisplayResolution>high</requestedDisplayResolution>
   </initialWindow>
 </application>

@@ -75,23 +75,156 @@ static void present_frame(void) {
 #endif
 }
 
+// Display-refresh estimate from the rAF grid.
+//
+// The browser calls main_loop once per display refresh, but exposes no API for
+// that rate: sk_window_get_display_refresh() returns 0 on web (there is no
+// browser analogue of SDL_GetDisplayMode), so on_frame_delay never learns the
+// panel's period and the pacer has to infer it. The interval between two
+// consecutive callbacks *is* the refresh period, because rAF fires on the
+// compositor's vsync grid.
+//
+// Estimator: median of the last kRafRing intervals. A median (not a mean/EMA)
+// is what makes this robust — a long callback (GC pause, first-frame font
+// raster, tab switch, a dragged window) inflates one or two samples and cannot
+// move the median, whereas an EMA would be dragged off for a second or more and
+// mis-pick the divisor for that whole window.
+static const int kRafRing = 16;
+static double g_raf_ring[kRafRing];
+static int g_raf_ring_n = 0;   // valid samples so far
+static int g_raf_ring_i = 0;   // next write slot
+static double g_raf_prev_ms = 0.0;
+
+// Median interval between rAF callbacks, or 0.0 while still warming up.
+static double raf_period_ms(void) {
+  if (g_raf_ring_n == 0) return 0.0;
+  double sorted[kRafRing];
+  for (int i = 0; i < g_raf_ring_n; i++) sorted[i] = g_raf_ring[i];
+  for (int i = 1; i < g_raf_ring_n; i++) {   // insertion sort, n <= 16
+    double v = sorted[i];
+    int j = i - 1;
+    while (j >= 0 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j--; }
+    sorted[j + 1] = v;
+  }
+  return sorted[g_raf_ring_n / 2];
+}
+
+// Counts rAF ticks since the last presented frame (see the pacer below).
+static int g_tick = 0;
+
+// Frame diagnostics — compile-time opt-in (`-D ASC_FRAME_STATS=1`), the web
+// counterpart of runtime.ts's ASC_FRAME_STATS runtime probe. Publishes a
+// per-second summary on window.__ascFrameStats so a harness can read the
+// achieved cadence, the callback count, how many callbacks the pacer dropped
+// and the time actually spent in on_frame + on_redraw + present. Compiled out
+// entirely by default, so the shipped wasm carries no probe.
+#ifdef ASC_FRAME_STATS
+static double g_fs_t0 = 0.0;
+static int g_fs_frames = 0;
+static int g_fs_loopcalls = 0;
+static int g_fs_skips = 0;
+static double g_fs_render_ms = 0.0;
+#endif
+
 // One frame: advance the frame clock (ENTER_FRAME + timers), then re-rasterize
 // (reflecting any listener-driven mutation) and present. requestAnimationFrame
 // replaces SDL_PollEvent as the frame driver; the browser caps the cadence at
 // the display refresh rate, so a very high Stage.frameRate simply saturates it.
 static void main_loop(void) {
-  // Frame pacing: honor Stage.frameRate via on_frame_delay (ms/frame); the
-  // rolling deadline absorbs render time so the loop sustains the requested rate
-  // up to the rAF ceiling (see the SDL2 backend's equivalent comment).
   double now = emscripten_get_now();
-  static double next_tick = 0.0;
-  double interval = g_on_frame_delay ? g_on_frame_delay() : 16.0;
-  if (interval > 0.0 && now < next_tick) return;
-  if (interval > 0.0) next_tick = now + interval; else next_tick = now;
 
+  // Update the refresh estimate from consecutive callback timestamps. Samples
+  // outside 1..100 ms are implausible for a vsync grid (a 1000 Hz panel up to a
+  // 10 Hz one) so they are dropped rather than polluting the window — this is
+  // also what keeps a tab-switch stall (~seconds) out of the estimate.
+  if (g_raf_prev_ms > 0.0) {
+    double d = now - g_raf_prev_ms;
+    if (d >= 1.0 && d <= 100.0) {
+      g_raf_ring[g_raf_ring_i] = d;
+      g_raf_ring_i = (g_raf_ring_i + 1) % kRafRing;
+      if (g_raf_ring_n < kRafRing) g_raf_ring_n++;
+    }
+  }
+  g_raf_prev_ms = now;
+
+  double interval = g_on_frame_delay ? g_on_frame_delay() : 16.0;
+#ifdef ASC_FRAME_STATS
+  g_fs_loopcalls++;
+#endif
+
+  // Frame pacing on a vsync-driven loop.
+  //
+  // One rAF tick is one vsync, so the only clock the compositor honors is the
+  // tick itself. Pace in *whole ticks*: render every `skip`-th callback, with
+  // skip chosen so skip x refresh is as close as possible to the requested
+  // interval (Stage.frameRate -> 1000/fr ms).
+  //
+  // Do NOT compare the requested interval against the raw callback timestamp
+  // ("is now past the deadline?"). rAF timestamps jitter around the true vsync
+  // — measured on this machine's 120 Hz panel: p50 8.30 ms, p95 9.30 ms for a
+  // 8.333 ms period. With `next_tick = now + interval`, a callback landing a few
+  // hundred microseconds early fails that test, so its tick is dropped and the
+  // next one (a full vsync later) is taken; the loop then alternates drop/take
+  // and delivers HALF the rate. Measured on the 120 Hz panel with
+  // Stage.frameRate = 120: rAF fired 120x/s but the old pacer presented 66 fps,
+  // discarding 55 callbacks/s.
+  //
+  // This mirrors the native SDL2 backend, whose present step is also vsync-bound
+  // (see the comment there: "an explicit frameRate above the display refresh
+  // rate is capped to that rate"). A target rate the panel cannot represent
+  // (e.g. 24 fps on a 60 Hz panel, needing 2.5 vsyncs) rounds to the nearest
+  // achievable divisor, so a request never lands more than half a vsync from its
+  // target.
+  int skip = 1;
+  if (interval > 0.0) {
+    double rp = raf_period_ms();
+    if (rp > 0.0) {
+      skip = (int)(interval / rp + 0.5);
+      if (skip < 1) skip = 1;   // target above the refresh rate: every vsync
+    }
+  }
+  if (g_tick >= skip) g_tick = 0;
+  int render_now = (g_tick == 0);
+  g_tick++;
+  if (!render_now) {
+#ifdef ASC_FRAME_STATS
+    g_fs_skips++;
+#endif
+    return;
+  }
+
+#ifdef ASC_FRAME_STATS
+  double t_frame0 = emscripten_get_now();
+#endif
   if (g_on_frame) g_on_frame();
   if (g_on_redraw) g_on_redraw();
   present_frame();
+#ifdef ASC_FRAME_STATS
+  double t_frame1 = emscripten_get_now();
+  g_fs_render_ms += (t_frame1 - t_frame0);
+  g_fs_frames++;
+  if (g_fs_t0 == 0.0) g_fs_t0 = t_frame1;
+  if (t_frame1 - g_fs_t0 >= 1000.0) {
+    EM_ASM({
+      var p = {};
+      p.frames = $0;
+      p.loopcalls = $1;
+      p.skips = $2;
+      p.renderMs = $3;
+      p.spanMs = $4;
+      p.intervalMs = $5;
+      p.rafPeriodMs = $6;
+      p.skip = $7;
+      p.fps = $0 / ($4 / 1000.0);
+      window.__ascFrameStats = p;
+      if (!window.__ascFrameStatsAll) window.__ascFrameStatsAll = [];
+      window.__ascFrameStatsAll.push(p);
+    }, g_fs_frames, g_fs_loopcalls, g_fs_skips, g_fs_render_ms, t_frame1 - g_fs_t0,
+       interval, raf_period_ms(), skip);
+    g_fs_frames = 0; g_fs_loopcalls = 0; g_fs_skips = 0;
+    g_fs_render_ms = 0.0; g_fs_t0 = t_frame1;
+  }
+#endif
 }
 
 // Left-button pointer input. Coordinates are CSS pixels relative to the canvas,
@@ -144,8 +277,11 @@ int sk_window_get_display_size(int* w, int* h) {
   return (dw > 0 && dh > 0) ? 1 : 0;
 }
 
-// The browser exposes no physical display refresh rate; return 0 so the frame
-// pacer falls back to its compiler-side default (see ASC_window_on_frame_delay).
+// The browser exposes no physical display refresh rate, so return 0 and let the
+// frame pacer derive it itself: main_loop measures the rAF callback interval and
+// paces in whole vsync ticks (see the pacer comment there). Returning a rate
+// would not help — the AS3-side deadline pacer has no way to express "every Nth
+// vsync", which is the only pacing a compositor honors.
 double sk_window_get_display_refresh(void) { return 0.0; }
 
 // Present the Skia raster surface in the canvas and run the rAF frame loop until

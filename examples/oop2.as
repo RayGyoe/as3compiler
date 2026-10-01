@@ -4,7 +4,7 @@ const GLOBAL_MAX:int = 100;
 trace("global const:", GLOBAL_MAX);
 
 class Counter {
-  const LIMIT:int = 10;
+  static const LIMIT:int = 10;
   static var total:int = 0;
   var _count:int;
 

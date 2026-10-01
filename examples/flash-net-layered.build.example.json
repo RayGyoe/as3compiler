@@ -1,0 +1,14 @@
+{
+  "target": "native",
+  "c-compiler": "cc",
+  "opt": "-O2",
+  "targets": {
+    "native": {
+      "link-libs": ["curl", "nghttp2", "z"],
+      "link-paths": ["../vendor/curl/lib/macos-arm64"],
+      "include-paths": ["../vendor/curl/include"],
+      "frameworks": ["CoreFoundation", "CoreServices", "Security", "SystemConfiguration"],
+      "defines": ["ASC_HAVE_CURL"]
+    }
+  }
+}

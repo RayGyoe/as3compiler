@@ -30,14 +30,14 @@ const BIN_PREC: Record<string, number> = {
   '|': 3,
   '^': 4,
   '&': 5,
-  '==': 6, '!=': 6,
+  '==': 6, '!=': 6, '===': 6, '!==': 6,
   '<': 7, '<=': 7, '>': 7, '>=': 7,
   '<<': 8, '>>': 8, '>>>': 8,
   '+': 9, '-': 9,
   '*': 10, '/': 10, '%': 10,
 };
 
-const ASSIGN_OPS = new Set(['=', '+=', '-=', '*=', '/=', '<<=', '>>=', '>>>=', '&=', '|=', '^=']);
+const ASSIGN_OPS = new Set(['=', '+=', '-=', '*=', '/=', '%=', '<<=', '>>=', '>>>=', '&=', '|=', '^=', '||=', '&&=']);
 
 // Keywords that may immediately follow bracket metadata ([WasmExport] function...,
 // [WasmExport] class..., [WasmExport] static function..., ...). Used to tell a
@@ -133,8 +133,25 @@ class Parser {
       this.expect('>');
       return `Vector.<${elem}>`;
     }
-    // A bare identifier used as a type is treated as a class name (object type).
-    return t.value;
+    // Fully-qualified class name: `flash.display3D.textures.Texture`. A bare
+    // identifier is a short class name (object type) resolved later.
+    let name = t.value;
+    while (this.at('.') && this.peek(1).kind === 'ident') {
+      this.next();
+      name += '.' + this.expectIdent().value;
+    }
+    return name;
+  }
+
+  // A dot-separated qualified name (`flash.display3D.textures.Texture`), used for
+  // `is`/`as` target type names where a full package path is required.
+  private parseQualifiedName(): string {
+    let name = this.expectIdent().value;
+    while (this.at('.') && this.peek(1).kind === 'ident') {
+      this.next();
+      name += '.' + this.expectIdent().value;
+    }
+    return name;
   }
 
   // ---- program ----
@@ -225,14 +242,17 @@ class Parser {
     const metadata = this.parseMetadataIfPresent();
     if (metadata.length > 0) {
       if (this.atIdent('function')) return this.parseFuncDecl(metadata);
-      if (this.atIdent('class')) return this.parseClassDecl(false, metadata);
+      if (this.atIdent('class')) return this.parseClassDecl(false, metadata, false);
       if (this.atIdent('interface')) return this.parseInterfaceDecl();
       if (this.atIdent('final') || this.atIdent('public') || this.atIdent('internal') || this.atIdent('dynamic')) {
         let isFinal = false;
+        let isDynamic = false;
         while (this.atIdent('final') || this.atIdent('public') || this.atIdent('internal') || this.atIdent('dynamic')) {
-          if (this.next().value === 'final') isFinal = true;
+          const mod = this.next().value;
+          if (mod === 'final') isFinal = true;
+          else if (mod === 'dynamic') isDynamic = true;
         }
-        if (this.atIdent('class')) return this.parseClassDecl(isFinal, metadata);
+        if (this.atIdent('class')) return this.parseClassDecl(isFinal, metadata, isDynamic);
         if (this.atIdent('interface')) return this.parseInterfaceDecl();
       }
       throw new ParseError(`metadata must precede a function/class/interface declaration`, this.peek());
@@ -251,20 +271,27 @@ class Parser {
       if (t.value === 'return') return this.parseReturn();
       if (t.value === 'throw') return this.parseThrow();
       if (t.value === 'try') return this.parseTry();
-      if (t.value === 'super') return this.parseSuperStmt();
+      if (t.value === 'super' && this.peek(1).value === '(') return this.parseSuperStmt();
+      if (t.value === 'use') return this.parseUseNamespace();
+      if (t.value === 'namespace') return this.parseNamespaceDecl();
       if (t.value === 'function') return this.parseFuncDecl();
-      if (t.value === 'class') return this.parseClassDecl(false);
+      if (t.value === 'class') return this.parseClassDecl(false, [], false);
       if (t.value === 'interface') return this.parseInterfaceDecl();
       // class/interface modifiers: `public`, `internal`, `dynamic`, `final`.
-      // Visibility is governed by the package context; dynamic is a runtime
-      // trait we do not model, so both are consumed and ignored here.
+      // Visibility is governed by the package context; `final` and `dynamic`
+      // are real traits and are recorded on the ClassDecl.
       if (t.value === 'final' || t.value === 'public' || t.value === 'internal' || t.value === 'dynamic') {
         let isFinal = false;
+        let isDynamic = false;
         while (this.atIdent('final') || this.atIdent('public') || this.atIdent('internal') || this.atIdent('dynamic')) {
-          if (this.next().value === 'final') isFinal = true;
+          const mod = this.next().value;
+          if (mod === 'final') isFinal = true;
+          else if (mod === 'dynamic') isDynamic = true;
         }
-        if (this.atIdent('class')) return this.parseClassDecl(isFinal);
+        if (this.atIdent('class')) return this.parseClassDecl(isFinal, [], isDynamic);
         if (this.atIdent('interface')) return this.parseInterfaceDecl();
+        if (this.atIdent('namespace')) return this.parseNamespaceDecl();
+        if (this.atIdent('function')) return this.parseFuncDecl();
       }
     }
 
@@ -384,16 +411,22 @@ class Parser {
 
   private parseConstDeclStmt(): Stmt {
     this.expect('const');
-    const name = this.expectIdent().value;
-    let type: ASType | null = null;
-    if (this.at(':')) {
-      this.next();
-      type = this.parseType();
-    }
-    this.expect('='); // const must have an initializer
-    const init = this.parseExpression();
+    const decls: { name: string; type: ASType | null; init: Expr | null }[] = [];
+    do {
+      const name = this.expectIdent().value;
+      let type: ASType | null = null;
+      if (this.at(':')) {
+        this.next();
+        type = this.parseType();
+      }
+      this.expect('='); // const must have an initializer
+      const init = this.parseExpression();
+      decls.push({ name, type, init });
+      if (this.at(',')) this.next();
+      else break;
+    } while (true);
     this.consumeSemicolon();
-    return { kind: 'ConstDecl', name, type, init };
+    return decls.length === 1 ? { kind: 'ConstDecl', ...decls[0] } : { kind: 'ConstDecls', decls };
   }
 
   private parseIf(): Stmt {
@@ -481,11 +514,14 @@ class Parser {
   private parseFor(): Stmt {
     this.expect('for');
 
-    // for-each-in: `for each (var v in arr)` — iterates values.
+    // for-each-in: `for each (var v in arr)` / `for each (v in arr)` — iterates
+    // values. The `var` (and thus the declaration) is optional: `for each (touch
+    // in touches)` iterates an already-declared variable.
     if (this.atIdent('each')) {
       this.next();
       this.expect('(');
-      this.expect('var');
+      let declares = false;
+      if (this.atIdent('var')) { this.next(); declares = true; }
       const varName = this.expectIdent().value;
       let varType: ASType | null = null;
       if (this.at(':')) { this.next(); varType = this.parseType(); }
@@ -493,7 +529,7 @@ class Parser {
       const iterable = this.parseExpression();
       this.expect(')');
       const body = this.parseStatement();
-      return { kind: 'ForEachIn', varName, varType, iterable, body };
+      return { kind: 'ForEachIn', varName, varType, declares, iterable, body };
     }
 
     this.expect('(');
@@ -524,9 +560,14 @@ class Parser {
     if (this.at(';')) {
       this.next();
     } else if (this.atIdent('var')) {
-      const d = this.parseVarDeclCore();
+      this.next();
+      const decls = [this.parseVarDeclarator()];
+      while (this.at(',')) {
+        this.next();
+        decls.push(this.parseVarDeclarator());
+      }
       this.expect(';');
-      init = { kind: 'VarDecl', ...d };
+      init = decls.length === 1 ? { kind: 'VarDecl', ...decls[0] } : { kind: 'VarDecls', decls };
     } else {
       const e = this.parseExpression();
       this.expect(';');
@@ -602,17 +643,9 @@ class Parser {
 
   private parseSuperStmt(): Stmt {
     this.expect('super');
-    if (this.at('(')) {
-      const args = this.parseArgList();
-      this.consumeSemicolon();
-      return { kind: 'SuperCall', args };
-    }
-    // super.method(...) used as an expression statement
-    this.expect('.');
-    const method = this.expectIdent().value;
     const args = this.parseArgList();
     this.consumeSemicolon();
-    return { kind: 'ExprStmt', expr: { kind: 'SuperMethod', method, args } };
+    return { kind: 'SuperCall', args };
   }
 
   private parseArgList(): Expr[] {
@@ -673,7 +706,7 @@ class Parser {
     return { kind: 'FuncDecl', name, params, returnType, body, metadata };
   }
 
-  private parseClassDecl(isFinal: boolean, metadata: Metadata[] = []): Stmt {
+  private parseClassDecl(isFinal: boolean, metadata: Metadata[] = [], isDynamic = false): Stmt {
     this.expect('class');
     const name = this.expectIdent().value;
     let superClass: string | null = null;
@@ -691,6 +724,15 @@ class Parser {
     this.expect('{');
     const members: ClassMember[] = [];
     while (!this.at('}') && this.peek().kind !== 'eof') {
+      // `use namespace starling_internal;` opens a namespace for the rest of the
+      // class body. Transparent in AOT (no visibility enforcement) — dropped.
+      if (this.atIdent('use')) {
+        this.next(); // use
+        this.expect('namespace');
+        this.expectIdent(); // namespace name
+        this.consumeSemicolon();
+        continue;
+      }
       // Class members may carry their own metadata ([WasmExport] static function...).
       const memberMetadata = this.parseMetadataIfPresent();
       let visibility: Visibility = 'public';
@@ -705,6 +747,8 @@ class Parser {
           this.next(); isFinal = true;
         } else if (this.atIdent('override')) {
           this.next(); // override is handled implicitly via the vtable slot
+        } else if (this.isNamespaceModifier()) {
+          this.next(); // namespace qualifier (e.g. starling_internal) — dropped
         } else {
           break;
         }
@@ -724,7 +768,10 @@ class Parser {
         let isGetter = false;
         let isSetter = false;
         let mName = this.expectIdent().value;
-        if (mName === 'get' || mName === 'set') {
+        // `get`/`set` are accessor keywords only when followed by a property
+        // name (an identifier). When followed by `(` they are ordinary method
+        // names, e.g. `public function get(styleType:Class):MeshBatch`.
+        if ((mName === 'get' || mName === 'set') && this.peek().kind === 'ident') {
           isGetter = mName === 'get';
           isSetter = mName === 'set';
           mName = this.expectIdent().value;
@@ -753,7 +800,7 @@ class Parser {
       }
     }
     this.expect('}');
-    return { kind: 'ClassDecl', name, packageName: this.currentPackage, superClass, members, isFinal, implements: implementsList, metadata };
+    return { kind: 'ClassDecl', name, packageName: this.currentPackage, superClass, members, isFinal, isDynamic, implements: implementsList, metadata, imports: this.imports.slice(), fileId: null };
   }
 
   private parseInterfaceDecl(): Stmt {
@@ -763,7 +810,18 @@ class Parser {
     const methods: InterfaceMethod[] = [];
     while (!this.at('}') && this.peek().kind !== 'eof') {
       this.expect('function');
-      const mName = this.expectIdent().value;
+      let isGetter = false;
+      let isSetter = false;
+      let mName = this.expectIdent().value;
+      // Interface getter/setter (`function get targetBounds():Rectangle;`). A
+      // `get`/`set` followed by an identifier is an accessor declaration; the
+      // accessor flag is preserved so the class-side vtable wiring can match a
+      // getter/setter implementation.
+      if ((mName === 'get' || mName === 'set') && this.peek().kind === 'ident') {
+        isGetter = mName === 'get';
+        isSetter = mName === 'set';
+        mName = this.expectIdent().value;
+      }
       const params = this.parseParams();
       let returnType: ASType = 'void';
       if (this.at(':')) {
@@ -771,10 +829,10 @@ class Parser {
         returnType = this.parseType();
       }
       this.consumeSemicolon();
-      methods.push({ name: mName, params, returnType });
+      methods.push({ name: mName, params, returnType, isGetter, isSetter });
     }
     this.expect('}');
-    return { kind: 'InterfaceDecl', name, packageName: this.currentPackage, methods };
+    return { kind: 'InterfaceDecl', name, packageName: this.currentPackage, methods, imports: this.imports.slice(), fileId: null };
   }
 
   // ---- expressions ----
@@ -821,7 +879,9 @@ class Parser {
         const prec = 7;
         if (prec < minPrec) break;
         this.next();
-        const typeName = this.expectIdent().value;
+        // The target may be a scalar, a fully-qualified class name, or a generic
+        // `Vector.<T>` (e.g. `data as Vector.<Touch>`); parseType handles all three.
+        const typeName = this.parseType();
         left = t.value === 'is'
           ? { kind: 'Is', obj: left, typeName }
           : { kind: 'As', obj: left, typeName };
@@ -866,9 +926,45 @@ class Parser {
     let expr = this.parsePrimary();
     while (true) {
       if (this.at('.')) {
-        this.next();
-        const prop = this.expectIdent().value;
-        expr = { kind: 'Member', object: expr, property: prop };
+        if (this.peek(1).value === '@') {
+          // E4X attribute access: expr.@name (only valid on XML/XMLList).
+          this.next(); // '.'
+          this.next(); // '@'
+          const attr = this.expectIdent().value;
+          expr = { kind: 'AttrAccess', object: expr, name: attr };
+        } else if (this.peek(1).value === '(') {
+          // E4X filter predicate: expr.(@attr == value). Starling uses only the
+          // @attr == "str" form (asset metadata extraction), so the predicate is
+          // compiled down to an attribute-name / comparison pair rather than a
+          // general predicate expression.
+          this.next(); // '.'
+          this.next(); // '('  (the filter operator)
+          this.expect('@');
+          const attr = this.expectIdent().value;
+          const opTok = this.next();
+          if (opTok.value !== '==' && opTok.value !== '!=') {
+            throw new ParseError(`unsupported E4X filter operator '${opTok.value}' (expected == or !=)`, opTok);
+          }
+          const value = this.parseExpression();
+          this.expect(')');
+          expr = { kind: 'Filter', object: expr, attr, op: opTok.value, value };
+        } else {
+          this.next();
+          const prop = this.expectIdent().value;
+          expr = { kind: 'Member', object: expr, property: prop };
+        }
+      } else if (this.at('::')) {
+        // `ns::member` (custom namespace qualification): namespaces are transparent
+        // in the AOT translation (no visibility enforcement), so the qualifier is
+        // dropped. `A.ns::m` -> `A.m` (static/member access); `A.B.ns::m` -> `A.B.m`;
+        // a bare `ns::m` -> `m` (an unqualified member of the current class).
+        this.next(); // '::'
+        const member = this.expectIdent().value;
+        if (expr.kind === 'Member') {
+          expr = { kind: 'Member', object: expr.object, property: member };
+        } else {
+          expr = { kind: 'Var', name: member };
+        }
       } else if (this.at('(')) {
         this.next();
         const args: Expr[] = [];
@@ -969,7 +1065,17 @@ class Parser {
     this.expect('{');
     const fields: { name: string; value: Expr }[] = [];
     while (!this.at('}')) {
-      const name = this.expectIdent().value;
+      // AS3 object literals allow both identifier keys (`{ x: 1 }`) and string
+      // keys (`{ "bytes4": 4 }`), the latter used by Starling's format-size
+      // tables.
+      const keyTok = this.peek();
+      let name: string;
+      if (keyTok.kind === 'str') {
+        this.next();
+        name = keyTok.value;
+      } else {
+        name = this.expectIdent().value;
+      }
       this.expect(':');
       const value = this.parseExpression();
       fields.push({ name, value });
@@ -1017,6 +1123,12 @@ class Parser {
       this.expect('>');
       className = `Vector.<${elem}>`;
       isGenericVector = true;
+    } else {
+      // Fully-qualified class name: `new flash.display3D.textures.Texture(...)`.
+      while (this.at('.') && this.peek(1).kind === 'ident') {
+        this.next();
+        className += '.' + this.expectIdent().value;
+      }
     }
     // AS3 permits `new Vector.<T>` without the trailing `()` (the arg list is
     // optional for the generic Vector constructor form). Every other `new X`
@@ -1037,10 +1149,19 @@ class Parser {
     return { kind: 'New', className: `Vector.<${elem}>`, args };
   }
 
-  // Anonymous function expression: `function(params):ret { body }`. An unannotated
-  // return type defaults to `any` (AS3's `*`), so `return expr` boxes the value.
+  // Function expression: `function [name](params):ret { body }`. AS3 allows an
+  // optional name (ES3 semantics): the name is bound ONLY inside the function's
+  // own body — it supports recursive self-reference and does not leak into the
+  // enclosing scope. An unannotated return type defaults to `any` (AS3's `*`), so
+  // `return expr` boxes the value.
   private parseFunctionExpr(): Expr {
     this.expect('function');
+    let name: string | null = null;
+    // A name is present iff an identifier (not a keyword) is directly followed by
+    // '(' — distinguishing `function f(` from `function (`.
+    if (this.peek().kind === 'ident' && !isKeyword(this.peek().value) && this.peek(1).value === '(') {
+      name = this.next().value;
+    }
     const params = this.parseParams();
     let returnType: ASType = 'any';
     if (this.at(':')) {
@@ -1048,14 +1169,51 @@ class Parser {
       returnType = this.parseType();
     }
     const body = this.parseBlock();
-    return { kind: 'FunctionExpr', params, returnType, body };
+    return { kind: 'FunctionExpr', name, params, returnType, body };
   }
 
   private parseSuperExpr(): Expr {
     this.expect('super');
     this.expect('.');
-    const method = this.expectIdent().value;
-    const args = this.parseArgList();
-    return { kind: 'SuperMethod', method, args };
+    const name = this.expectIdent().value;
+    // `super.method(...)` is a super method call; `super.property` is a field/
+    // getter/setter access on the superclass (read or write).
+    if (this.at('(')) {
+      const args = this.parseArgList();
+      return { kind: 'SuperMethod', method: name, args };
+    }
+    return { kind: 'SuperProperty', property: name };
+  }
+
+  // `[public] namespace name;` — declares a custom namespace (Starling's
+  // `starling_internal`). Namespaces only gate compile-time visibility, which the
+  // AOT translation does not enforce, so the declaration is consumed and dropped.
+  private parseNamespaceDecl(): Stmt {
+    this.expect('namespace');
+    this.expectIdent(); // namespace name
+    this.consumeSemicolon();
+    return { kind: 'Block', body: [] };
+  }
+
+  // `use namespace name;` — opens a namespace for the current scope. Transparent
+  // in the AOT translation (no visibility enforcement); consumed and dropped.
+  private parseUseNamespace(): Stmt {
+    this.expect('use');
+    this.expect('namespace');
+    this.expectIdent(); // namespace name
+    this.consumeSemicolon();
+    return { kind: 'Block', body: [] };
+  }
+
+  // A namespace qualifier immediately before a class member (e.g.
+  // `starling_internal function f()`): an identifier that is not a modifier
+  // keyword, directly followed by a member-declaration keyword. Namespaces are
+  // transparent in AOT, so the qualifier is recognised and dropped.
+  private isNamespaceModifier(): boolean {
+    const t = this.peek();
+    if (t.kind !== 'ident' || isKeyword(t.value)) return false;
+    const nxt = this.peek(1).value;
+    return nxt === 'function' || nxt === 'var' || nxt === 'const' ||
+      nxt === 'static' || nxt === 'override' || nxt === 'get' || nxt === 'set';
   }
 }
