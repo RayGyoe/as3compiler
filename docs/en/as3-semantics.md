@@ -58,11 +58,12 @@ semantics.
 ## 2. AS3 Semantic Decision Quick Reference (Against Red Lines)
 
 The following are the high-risk points in AS3 semantics that "must be faithfully implemented", directly
-corresponding to the AGENTS.md §2.4 red-line table (status as of v0.3.77).
+corresponding to the AGENTS.md §2.4 red-line table (imported incrementally from the Chinese original; the newest row added here is from v0.3.127).
 
 | AS3 semantics | Spec source | Our red line | Status |
 |---------|---------|-----------|------|
 | `/` is always `Number` (`int/int` is also floating-point) | ES4 draft + ECMA-262 §9 | Always promote to `double` before dividing | ✅ Implemented |
+| `%`'s **zero divisor** is defined (AVM2 `OP_remainder` does not trap): `5 % 0` yields **`NaN`** (a `Number`), while `var r:int = 5 % 0` yields **`0`** (NaN coerced to 0 on `int` receipt); `INT_MIN % -1` yields **`0`**; with a non-zero divisor `int % int` **is `int`** (`(7 % 3) is int` == true), `-7%3=-1`, `7%-3=1` | ES4 draft + AVM2; measured with adl (AIR 51.4.1, divisor taken from an array element to keep it opaque to the compiler) | `int % int` → `as_int_rem`, `uint % uint` → `as_uint_rem` (`b==0` → 0, `INT_MIN % -1` → 0); mixed/`Number` operands go through `fmod` (`fmod(x,0)` is itself NaN, matching AS3) | ✅ Implemented (stage eighty-nine / thirty-one) |
 | `+` auto-boxes to string concatenation when a string is involved | ES4 draft | Go through `as_str_concat`/`as_str_from_*` | ✅ Implemented |
 | String `==/!=` is value comparison | ES4 draft | `strcmp` | ✅ Implemented |
 | `Number` uninitialized default = **`NaN`** | ES4 draft + AVM2 | `defaultInit`'s `number` branch outputs `NAN` | ✅ Implemented (emit.ts `defaultInit`) |
@@ -82,6 +83,7 @@ corresponding to the AGENTS.md §2.4 red-line table (status as of v0.3.77).
 |------|---------|-----------|------|
 | `var x;` (untyped, no initializer) default type | `*` (any) / `undefined` | Untyped still treated as `int` (`symbols.ts` convention); explicit `*` is modeled as `any` (`as_value` boxing) | **Keep as-is** — untyped defaults to `int` is a minimal convention; but since stage fifteen, assigning a reference type to an inferred `int` throws `CodegenError` instead of silently truncating |
 | `Number` default value | `NaN` | ✅ Fixed (`defaultInit` outputs `NAN`) | No action needed |
+| `%` zero divisor with the result landing in a **dynamic** type use site (`var x:* = a % 0`) | `NaN` (a `Number`) | the guarded int/uint `0` (before the guard it was UB: `-O2` folds to the dividend `5`, and wasm traps) | **Keep as-is** — emitting `NaN` would require turning `int % int` into `double` wholesale, but then `7 % 3 is int` would become false (adl measures it **true**), making the static type less faithful; a zero divisor is itself an app defect, and AS3 also yields 0 at int/uint receipt sites (including `var r:int = 5 % 0`) |
 
 ---
 

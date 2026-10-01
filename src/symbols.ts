@@ -21,11 +21,26 @@ export type CType =
   | { kind: 'class' }
   | { kind: 'dict' }
   | { kind: 'regexp' }
+  | { kind: 'xml' }
+  | { kind: 'xmllist' }
   | { kind: 'void' };
 
-export interface FieldInfo { type: CType; init: Expr | null; visibility: Visibility; owner: string; isStatic: boolean; isConst: boolean; }
+// `name` is the AS3 member name; `cName` is the C storage slot it occupies in
+// the flattened struct. They differ only when a field shadows an inherited field
+// of the same name: AS3 scopes a private member to its declaring class, so the
+// two declarations are DISTINCT slots that must not be collapsed into one C
+// member (see expandInheritance). `cName` is undefined until flattening runs for
+// its class, since `name` alone cannot tell whether a collision will occur.
+export interface FieldInfo { type: CType; init: Expr | null; visibility: Visibility; owner: string; isStatic: boolean; isConst: boolean; name?: string; cName?: string; }
 export interface MethodInfo { returnType: CType; params: Param[]; owner: string; visibility: Visibility; isStatic: boolean; isFinal: boolean; isGetter: boolean; isSetter: boolean; metadata?: Metadata[]; }
 export interface FuncInfo { returnType: CType; params: Param[]; metadata?: Metadata[]; }
+
+// A single ordered slot in a class vtable. Methods, getters, and setters share one
+// flattened list so overrides replace an inherited slot in place and new members
+// append — this keeps a subclass vtable layout-identical (prefix-stable) to its
+// superclass vtable, which is what lets a base-typed reference (`Texture* t`)
+// dispatch a virtual getter/setter to the runtime subclass implementation.
+export interface VtableSlot { kind: 'method' | 'getter' | 'setter'; name: string; info: MethodInfo; }
 
 // A function/method marked [WasmExport] that must be exposed in the .wasm export
 // table. `symbol` is the generated C symbol name; `alias` is the optional
@@ -40,14 +55,27 @@ export interface ExportedSymbol {
   params: { name: string; type: CType }[];
 }
 export interface ConstructorInfo { params: Param[]; }
-export interface InterfaceInfo { methods: Map<string, MethodInfo>; }
+export interface InterfaceInfo { methods: Map<string, MethodInfo>; importAlias?: Map<string, string>; }
 export interface ClassInfo {
+  // Instance storage slots, keyed by C member name (see FieldInfo.cName). Exactly
+  // one entry per DECLARATION, so a shadowing field appears under its own
+  // mangled key next to the inherited slot it shadows. Use `fieldSlot()` to look
+  // a slot up by AS3 name.
   fields: Map<string, FieldInfo>;
+  // AS3 instance-field name → key into `fields`. Built by expandInheritance for
+  // every class so a shadowed name resolves to the innermost declaration.
+  fieldKeys?: Map<string, string>;
   methods: Map<string, MethodInfo>;
   staticFields: Map<string, FieldInfo>;
   staticMethods: Map<string, MethodInfo>;
   getters: Map<string, MethodInfo>;
   setters: Map<string, MethodInfo>;
+  // Static getters/setters are kept separate from instance ones so a class may
+  // declare `get context()` (instance) and `static get context()` together — AS3
+  // allows the same name in both namespaces, but a single Map keyed by name
+  // would let one silently overwrite the other.
+  staticGetters?: Map<string, MethodInfo>;
+  staticSetters?: Map<string, MethodInfo>;
   constructor: ConstructorInfo;
   superClass: string | null;
   isFinal: boolean;
@@ -57,6 +85,25 @@ export interface ClassInfo {
   isDynamic?: boolean;
   implements: string[];
   packageName: string | null;
+  // AS3 fully-qualified class name (`包::类`, e.g. "starling.display::DisplayObject").
+  // Filled at registration for user classes (so getQualifiedClassName can return
+  // it without reverse-engineering the sanitized C name); undefined for built-ins
+  // (which have no package, and are also excluded from the getDefinitionByName
+  // registry). Doubles as the "user class" marker for that registry.
+  fqn?: string;
+  // Import-aware short-name -> C class key resolution for THIS class's file.
+  // Populated from the `import` statements preceding the class, so that
+  // `flash.display.Sprite` and `starling.display.Sprite` can coexist across files
+  // even though the global typeAlias short-name table can only hold one of them.
+  importAlias?: Map<string, string>;
+  // Source-file identifier (set in --air-app mode): a per-file anonymous-namespace
+  // key used for same-file `internal` visibility.
+  fileId?: string;
+  // Unified ordered vtable slot list (methods + getters + setters), flattened
+  // super-first in expandInheritance. Used by the emitter to declare vtable struct
+  // function-pointer fields and to fill the static vtable instance in the same
+  // order. See VtableSlot.
+  vtableSlots?: VtableSlot[];
 }
 
 export class CodegenError extends Error {}
@@ -190,16 +237,18 @@ export function ctypeToString(t: CType): string {
     case 'class': return 'Class';
     case 'dict': return 'Dictionary';
     case 'regexp': return 'RegExp';
+    case 'xml': return 'XML';
+    case 'xmllist': return 'XMLList';
     case 'void': return 'void';
   }
 }
 
-export function resolveType(t: ASType | null): CType {
+export function resolveType(t: ASType | null, importAlias?: Map<string, string> | null): CType {
   if (t === null) return { kind: 'int' };
   // Vector.<T> — type-safe generic array (encoded as the string "Vector.<T>").
   if (t.startsWith('Vector.<')) {
     const inner = t.slice('Vector.<'.length, -1);
-    return { kind: 'vector', elem: resolveType(inner as ASType) };
+    return { kind: 'vector', elem: resolveType(inner as ASType, importAlias) };
   }
   switch (t) {
     case 'int': return { kind: 'int' };
@@ -212,13 +261,58 @@ export function resolveType(t: ASType | null): CType {
     case 'Function': return { kind: 'function' };
     case 'Class': return { kind: 'class' };
     case 'Dictionary': return { kind: 'dict' };
+    case 'XML': return { kind: 'xml' };
+    case 'XMLList': return { kind: 'xmllist' };
     case 'any': return { kind: 'any' };
     default: {
-      const fqn = typeAlias.get(t) ?? t;
+      // Import-aware resolution: a short name imported via `import a.b.C` (or
+      // `a.b.*`) resolves to that specific class before the global short-name
+      // alias table, so `flash.display.Sprite` and `starling.display.Sprite` can
+      // coexist across files.
+      let fqn = importAlias?.get(t) ?? typeAlias.get(t);
+      if (fqn === undefined) {
+        const dot = t.lastIndexOf('.');
+        if (dot >= 0) {
+          const pkg = t.slice(0, dot);
+          const short = t.slice(dot + 1);
+          // flash.* built-in classes are keyed by their SHORT name in classMap
+          // ('Stage', not 'flash_display_Stage'); user classes are keyed by the
+          // sanitized C FQN (dots -> underscores).
+          fqn = pkg.startsWith('flash.') ? short : qualifiedName(short, pkg);
+        } else {
+          fqn = t;
+        }
+      }
       if (interfaceNames.has(fqn)) return { kind: 'interface', name: fqn };
       return { kind: 'object', className: fqn };
     }
   }
+}
+
+// Build an import-aware short-name -> C class-key map for one file's `import`
+// list. Handles `import a.b.C;` (short "C" -> C key of a.b.C) and
+// `import a.b.*;` (every known class in package a.b). flash.* built-ins are keyed
+// by their short name; user classes by their sanitized FQN.
+function buildImportAlias(imports: string[], classMap: Map<string, ClassInfo>): Map<string, string> {
+  const alias = new Map<string, string>();
+  for (const imp of imports) {
+    if (imp.endsWith('.*')) {
+      const pkg = imp.slice(0, -2);
+      for (const [cname, info] of classMap) {
+        if (info.packageName === pkg && info.fqn) {
+          alias.set(info.fqn.split('::').pop()!, cname);
+        }
+      }
+      continue;
+    }
+    const dot = imp.lastIndexOf('.');
+    const short = dot >= 0 ? imp.slice(dot + 1) : imp;
+    const pkg = dot >= 0 ? imp.slice(0, dot) : '';
+    // flash.* built-ins are keyed by short name; everything else by FQN.
+    const cname = pkg.startsWith('flash.') ? short : qualifiedName(short, pkg);
+    alias.set(short, cname);
+  }
+  return alias;
 }
 
 // Pass 1 of the generator: collect all class/function symbols so forward
@@ -250,17 +344,21 @@ export class SymbolTable {
       if (stmt.kind === 'InterfaceDecl') {
         const iname = fqn(stmt.name, stmt.packageName);
         interfaceNames.add(iname);
+        const importAlias = buildImportAlias(stmt.imports, this.classMap);
         const methods = new Map<string, MethodInfo>();
         for (const m of stmt.methods) {
-          methods.set(m.name, { returnType: resolveType(m.returnType), params: m.params, owner: iname, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+          methods.set(m.name, { returnType: resolveType(m.returnType, importAlias), params: m.params, owner: iname, visibility: 'public', isStatic: false, isFinal: false, isGetter: m.isGetter, isSetter: m.isSetter });
         }
-        this.interfaceMap.set(iname, { methods });
+        this.interfaceMap.set(iname, { methods, importAlias });
       }
     }
     // pass 0.5: inject the built-in Object root class (every class's implicit base).
     this.classMap.set('Object', {
       fields: new Map(),
-      methods: new Map([['toString', { returnType: { kind: 'string' }, params: [], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }]]),
+      methods: new Map([
+        ['toString', { returnType: { kind: 'string' }, params: [], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['hasOwnProperty', { returnType: { kind: 'bool' }, params: [{ name: 'name', type: 'String', defaultValue: null, isRest: false }], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
@@ -270,22 +368,104 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
-    // inject the built-in Error class (used by throw/catch).
-    this.classMap.set('Error', {
-      fields: new Map([['message', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'Error', isStatic: false, isConst: false }]]),
+    // flash.display graphics-data classes (stage 93): Starling's Canvas legacy
+    // drawGraphicsData path. Modeled as plain value bundles + an empty marker
+    // interface; only the field reads/writes Canvas performs are needed.
+    interfaceNames.add('IGraphicsData');
+    this.interfaceMap.set('IGraphicsData', { methods: new Map() });
+    const gsff = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'GraphicsSolidFill', isStatic: false, isConst: false });
+    this.classMap.set('GraphicsSolidFill', {
+      fields: new Map([
+        ['color', gsff({ kind: 'uint' })],
+        ['alpha', gsff({ kind: 'number' })],
+      ]),
       methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
       setters: new Map(),
-      constructor: { params: [{ name: 'message', type: 'String', defaultValue: { kind: 'Str', value: 'Error' }, isRest: false }] },
+      constructor: { params: [
+        { name: 'color', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        { name: 'alpha', type: 'Number', defaultValue: { kind: 'Num', value: 1, isInt: false }, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: ['IGraphicsData'],
+    });
+    const gpathf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'GraphicsPath', isStatic: false, isConst: false });
+    this.classMap.set('GraphicsPath', {
+      fields: new Map([
+        ['commands', gpathf({ kind: 'vector', elem: { kind: 'int' } })],
+        ['data', gpathf({ kind: 'vector', elem: { kind: 'number' } })],
+        ['winding', gpathf({ kind: 'string' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'commands', type: 'Vector.<int>', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'data', type: 'Vector.<Number>', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'winding', type: 'String', defaultValue: { kind: 'Str', value: 'evenOdd' }, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: ['IGraphicsData'],
+    });
+    this.classMap.set('GraphicsEndFill', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: ['IGraphicsData'],
+    });
+    this.classMap.set('GraphicsPathCommand', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['MOVE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 1, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
+        ['LINE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 2, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
+        ['CURVE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 3, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
+        ['WIDE_MOVE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 4, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
+        ['WIDE_LINE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 5, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
+        ['CUBIC_CURVE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 6, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // inject the built-in Error class (used by throw/catch).
+    this.classMap.set('Error', {
+      fields: new Map([
+        ['message', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'Error', isStatic: false, isConst: false }],
+        ['errorID', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'Error', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'message', type: 'String', defaultValue: { kind: 'Str', value: 'Error' }, isRest: false },
+        { name: 'id', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+      ] },
       superClass: 'Object',
       isFinal: false,
       implements: [],
     });
     // built-in Error subclasses: share Error's { vtable; message } layout, but
     // each has its own vtable so `catch (e:TypeError)` can match precisely.
-    for (const sub of ['TypeError', 'RangeError', 'ArgumentError', 'SyntaxError']) {
+    for (const sub of ['TypeError', 'RangeError', 'ArgumentError', 'SyntaxError', 'ReferenceError', 'IllegalOperationError', 'IllegalArgumentError', 'SecurityError', 'EOFError', 'IOError']) {
       this.classMap.set(sub, {
         fields: new Map(),
         methods: new Map(),
@@ -293,7 +473,10 @@ export class SymbolTable {
         staticMethods: new Map(),
         getters: new Map(),
         setters: new Map(),
-        constructor: { params: [{ name: 'message', type: 'String', defaultValue: { kind: 'Str', value: sub }, isRest: false }] },
+        constructor: { params: [
+          { name: 'message', type: 'String', defaultValue: { kind: 'Str', value: sub }, isRest: false },
+          { name: 'id', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ] },
         superClass: 'Error',
         isFinal: false,
         implements: [],
@@ -420,7 +603,28 @@ export class SymbolTable {
         ['TAB_ENABLED_CHANGE', evc('tabEnabledChange')],
         ['TAB_INDEX_CHANGE', evc('tabIndexChange')],
         ['UNLOAD', evc('unload')],
+        ['BROWSER_ZOOM_CHANGE', evc('browserZoomChange')],
         ['CONTEXT3D_CREATE', evc('context3DCreate')],
+        ['TEXTURE_READY', evc('textureReady')],
+        ['TEXTURES_RESTORED', evc('texturesRestored')],
+        ['CONTEXT', evc('context')],
+        ['ERROR', evc('error')],
+        ['FATAL_ERROR', evc('fatalError')],
+        ['IO_ERROR', evc('ioError')],
+        ['KEY_DOWN', evc('keyDown')],
+        ['KEY_UP', evc('keyUp')],
+        ['MOUSE_DOWN', evc('mouseDown')],
+        ['MOUSE_MOVE', evc('mouseMove')],
+        ['MOUSE_UP', evc('mouseUp')],
+        ['PARSE_ERROR', evc('parseError')],
+        ['PROGRESS', evc('progress')],
+        ['RENDER_COMPLETE', evc('renderComplete')],
+        ['SECURITY_ERROR', evc('securityError')],
+        ['TIMER', evc('timer')],
+        ['TOUCH', evc('touch')],
+        ['TOUCH_BEGIN', evc('touchBegin')],
+        ['TOUCH_END', evc('touchEnd')],
+        ['TOUCH_MOVE', evc('touchMove')],
       ]),
       staticMethods: new Map(),
       getters: new Map(),
@@ -473,6 +677,25 @@ export class SymbolTable {
       setters: new Map(),
       constructor: { params: [] },
       superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.desktop.NativeApplication: AIR's native-application singleton (window
+    // activate/deactivate notifications). AOT keeps one global instance reachable
+    // through the static `nativeApplication` getter; it inherits the EventDispatcher
+    // listener table so addEventListener works for ACTIVATE/DEACTIVATE.
+    this.classMap.set('NativeApplication', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      staticGetters: new Map([
+        ['nativeApplication', { returnType: { kind: 'object', className: 'NativeApplication' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
       isFinal: false,
       implements: [],
     });
@@ -644,6 +867,7 @@ export class SymbolTable {
         ['allowsFullScreen', stgg({ kind: 'bool' })],
         ['allowsFullScreenInteractive', stgg({ kind: 'bool' })],
         ['contentsScaleFactor', stgg({ kind: 'number' })],
+        ['browserZoomFactor', stgg({ kind: 'number' })],
         ['stage3Ds', stgg({ kind: 'vector', elem: { kind: 'object', className: 'Stage3D' } })],
       ]),
       setters: new Map([
@@ -668,7 +892,13 @@ export class SymbolTable {
     // an empty DisplayObjectContainer subclass so hit-testing has a target type).
     this.classMap.set('Sprite', {
       fields: new Map(),
-      methods: new Map(),
+      methods: new Map([
+        ['hitTestPoint', { returnType: { kind: 'bool' }, params: [
+          { name: 'x', type: 'Number', defaultValue: null, isRest: false },
+          { name: 'y', type: 'Number', defaultValue: null, isRest: false },
+          { name: 'shapeFlag', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ], owner: 'Sprite', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
@@ -714,6 +944,7 @@ export class SymbolTable {
       ]),
       constructor: { params: [] },
       superClass: 'Sprite',
+      isDynamic: true,
       isFinal: false,
       implements: [],
     });
@@ -748,6 +979,7 @@ export class SymbolTable {
     // plain fields; COMPLETE/INIT/OPEN/UNLOAD mirror Event, PROGRESS/IO_ERROR mirror
     // ProgressEvent/IOErrorEvent (same string values).
     const lif = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'LoaderInfo', isStatic: false, isConst: false });
+    const lig = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'LoaderInfo', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     const lic = (owner: string, value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true });
     this.classMap.set('LoaderInfo', {
       fields: new Map([
@@ -770,7 +1002,12 @@ export class SymbolTable {
         ['IO_ERROR', lic('LoaderInfo', 'ioError')],
       ]),
       staticMethods: new Map(),
-      getters: new Map(),
+      getters: new Map([
+        // AS3 LoaderInfo.content returns the loaded content (a DisplayObject — for
+        // image loads, a Bitmap). The content is stored on the owning Loader and
+        // reached via the back-reference set in Loader_ctor.
+        ['content', lig({ kind: 'object', className: 'DisplayObject' })],
+      ]),
       setters: new Map(),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
@@ -789,6 +1026,7 @@ export class SymbolTable {
       ]),
       methods: new Map([
         ['load', { returnType: { kind: 'void' }, params: [{ name: 'request', type: 'URLRequest', defaultValue: null, isRest: false }], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['loadBytes', { returnType: { kind: 'void' }, params: [{ name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false }, { name: 'context', type: 'LoaderContext', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
         ['unload', { returnType: { kind: 'void' }, params: [], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
@@ -803,22 +1041,176 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
-    // flash.net / flash.ui (stage 63): URLRequest / URLLoader / Keyboard / Mouse.
-    // Socket / Sound / SoundChannel / Video / ContextMenu / URLVariables are
-    // deferred — they need network/audio/video backends or dynamic property
-    // modeling outside this subset (documented in README/todo).
+    // flash.media (stage 93): Sound / SoundChannel / SoundTransform. Starling's
+    // MovieClip / AssetManager / SoundFactory reference these as types and call
+    // play() / loadCompressedDataFromByteArray(). Audio playback is a no-op stub
+    // (no audio backend in this subset) — the objects exist so the demo compiles;
+    // `play` returns a fresh SoundChannel, `loadCompressed...` is a no-op.
+    // Socket / Video / ContextMenu / URLVariables remain deferred (documented in
+    // README/todo).
+    const stf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'SoundTransform', isStatic: false, isConst: false });
+    this.classMap.set('SoundTransform', {
+      fields: new Map([
+        ['volume', stf({ kind: 'number' })],
+        ['pan', stf({ kind: 'number' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'volume', type: 'Number', defaultValue: { kind: 'Num', value: 1, isInt: false }, isRest: false },
+        { name: 'pan', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    const sndm = (ret: CType, params: Param[] = []): MethodInfo => ({ returnType: ret, params, owner: 'Sound', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    this.classMap.set('Sound', {
+      fields: new Map(),
+      methods: new Map([
+        ['play', sndm({ kind: 'object', className: 'SoundChannel' }, [
+          { name: 'startTime', type: 'Number', defaultValue: null, isRest: false },
+          { name: 'loops', type: 'int', defaultValue: null, isRest: false },
+          { name: 'transform', type: 'SoundTransform', defaultValue: null, isRest: false },
+        ])],
+        ['loadCompressedDataFromByteArray', sndm({ kind: 'void' }, [
+          { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'length', type: 'uint', defaultValue: null, isRest: false },
+        ])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    const sctm = (ret: CType, params: Param[] = []): MethodInfo => ({ returnType: ret, params, owner: 'SoundChannel', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    this.classMap.set('SoundChannel', {
+      fields: new Map(),
+      methods: new Map([
+        ['stop', sctm({ kind: 'void' })],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.media.Camera: Starling's Texture.fromCamera / ConcreteTexture.attachCamera
+    // reference it as a type (and Camera.getCamera() as a factory). No camera backend
+    // in this subset — the object exists so those signatures compile; getCamera is a
+    // no-op returning NULL (the demo never triggers the camera path).
+    this.classMap.set('Camera', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map([
+        ['getCamera', { returnType: { kind: 'object', className: 'Camera' }, params: [{ name: 'name', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'Camera', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.system (stage 93): LoaderContext / ImageDecodingPolicy. Starling
+    // passes a LoaderContext to Loader.loadBytes to request on-load decoding;
+    // these are modeled as a plain value bundle + string constants (no actual
+    // policy engine — the demo only reads/writes the fields).
+    const lcf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'LoaderContext', isStatic: false, isConst: false });
+    this.classMap.set('LoaderContext', {
+      fields: new Map([
+        ['checkPolicyFile', lcf({ kind: 'bool' })],
+        ['imageDecodingPolicy', lcf({ kind: 'string' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'checkPolicyFile', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    this.classMap.set('ImageDecodingPolicy', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['ON_LOAD', { type: { kind: 'string' }, init: { kind: 'Str', value: 'onLoad' }, visibility: 'public', owner: 'ImageDecodingPolicy', isStatic: true, isConst: true }],
+        ['ON_DEMAND', { type: { kind: 'string' }, init: { kind: 'Str', value: 'onDemand' }, visibility: 'public', owner: 'ImageDecodingPolicy', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.net / flash.ui (stage 63, extended in stage 89·48): URLRequest /
+    // URLLoader / Keyboard / Mouse.
     //
-    // URLRequest: a load-request value bundle. method defaults to "GET"; data/
-    // contentType default to null (data is `any`, boxed as as_value).
+    // URLRequest is "all of the information in a single HTTP request" (AIR). The
+    // stage-63 subset declared only url/method/data/contentType and treated
+    // method/data/contentType as write-only decorations; stage 89·48 declares the
+    // FULL documented property surface so the values are real instance state (and
+    // so a later HTTP client has something to read).
+    //
+    // Defaults are the adl-measured ones: method = "GET", contentType = NULL, and
+    // data = NULL. contentType is the trap -- the AS3 reference lists its default
+    // as "application/x-www-form-urlencoded", but that string describes what adl
+    // sends on the WIRE for a body-carrying request, not what the getter returns
+    // (a local capture server, adl 51.3.4: POST with an unset contentType goes out
+    // application/x-www-form-urlencoded while `req.contentType` reads NULL; a POST
+    // with no body sends no Content-Type at all). requestHeaders = an empty Array
+    // (Adobe's own example calls `request.requestHeaders.push(header)` on a fresh
+    // object), and the six properties that URLRequestDefaults mirrors are
+    // "initialized from the URLRequestDefaults.<name> property" per the official
+    // docs (they default to that class's defaults, so the observable result is the
+    // AIR one unless the app changes the defaults). data is `any` (boxed as_value).
     const rqf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'URLRequest', isStatic: false, isConst: false });
+    const rqm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'URLRequest', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     this.classMap.set('URLRequest', {
       fields: new Map([
         ['url', rqf({ kind: 'string' })],
         ['method', rqf({ kind: 'string' })],
         ['data', rqf({ kind: 'any' })],
         ['contentType', rqf({ kind: 'string' })],
+        // AIR-only properties (application security sandbox).
+        ['requestHeaders', rqf({ kind: 'array' })],
+        ['authenticate', rqf({ kind: 'bool' })],
+        ['cacheResponse', rqf({ kind: 'bool' })],
+        ['followRedirects', rqf({ kind: 'bool' })],
+        ['idleTimeout', rqf({ kind: 'number' })],
+        ['manageCookies', rqf({ kind: 'bool' })],
+        ['useCache', rqf({ kind: 'bool' })],
+        ['userAgent', rqf({ kind: 'string' })],
+        // SWZ digest for the Flash Player cache; kept as inert state (this runtime
+        // has no signed-file cache and does not implement SWZ loading).
+        ['digest', rqf({ kind: 'string' })],
       ]),
-      methods: new Map(),
+      methods: new Map([
+        // AIR 3.8. `pattern` is `*` because AIR accepts a String or a RegExp.
+        ['useRedirectedURL', rqm({ kind: 'void' }, [
+          { name: 'sourceRequest', type: 'URLRequest', defaultValue: null, isRest: false },
+          { name: 'wholeURL', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          { name: 'pattern', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'replace', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
@@ -830,16 +1222,25 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
-    // URLLoader: an EventDispatcher that synchronously reads a local file (the URL
-    // treated as a filesystem path) and dispatches COMPLETE (or IO_ERROR on
+    // URLLoader: an EventDispatcher that asynchronously reads a local file (the
+    // URL treated as a filesystem path) and dispatches COMPLETE (or IO_ERROR on
     // failure). data is the file text; dataFormat defaults to "text". Real async
-    // HTTP/Socket loading is deferred.
+    // HTTP/Socket loading is deferred (see docs/zh-cn/flash-net.md).
+    //
+    // Stage 89·48 completes the documented contract around that local read:
+    //   * bytesLoaded/bytesTotal exist (0 = "in progress", populated at complete);
+    //   * the constructor takes an optional URLRequest and begins the load
+    //     immediately when one is given (AIR: "If specified, the load operation
+    //     begins immediately");
+    //   * dataFormat = VARIABLES decodes the payload into a URLVariables object.
     const ulf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'URLLoader', isStatic: false, isConst: false });
     const ulm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'URLLoader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     this.classMap.set('URLLoader', {
       fields: new Map([
-        ['data', ulf({ kind: 'string' })],
+        ['data', ulf({ kind: 'any' })],
         ['dataFormat', ulf({ kind: 'string' })],
+        ['bytesLoaded', ulf({ kind: 'uint' })],
+        ['bytesTotal', ulf({ kind: 'uint' })],
       ]),
       methods: new Map([
         ['load', ulm({ kind: 'void' }, [{ name: 'request', type: 'URLRequest', defaultValue: null, isRest: false }])],
@@ -849,8 +1250,402 @@ export class SymbolTable {
       staticMethods: new Map(),
       getters: new Map(),
       setters: new Map(),
+      constructor: { params: [
+        { name: 'request', type: 'URLRequest', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // URLStream: the streaming counterpart of URLLoader (IDataInput read side).
+    // `endian`/`objectEncoding` are the interface's read-write properties, kept as
+    // plain fields (that is what IDataInput specifies: a settable property, not a
+    // method). `bytesAvailable`/`connected` are read-only and go through getters.
+    // IDataInput is NOT in `implements`: this subset registers interfaces by hand
+    // and nothing here needs interface-typed dispatch.
+    const usf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'URLStream', isStatic: false, isConst: false });
+    const usm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'URLStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const usg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'URLStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const u_byte = (ret: CType): MethodInfo => usm(ret, []);
+    const u_len = (name: string): Param => ({ name, type: 'uint', defaultValue: null, isRest: false });
+    this.classMap.set('URLStream', {
+      fields: new Map([
+        ['endian', usf({ kind: 'string' })],
+        ['objectEncoding', usf({ kind: 'uint' })],
+      ]),
+      methods: new Map([
+        ['load', usm({ kind: 'void' }, [{ name: 'request', type: 'URLRequest', defaultValue: null, isRest: false }])],
+        ['close', usm({ kind: 'void' }, [])],
+        ['readBoolean', u_byte({ kind: 'bool' })],
+        ['readByte', u_byte({ kind: 'int' })],
+        ['readUnsignedByte', u_byte({ kind: 'uint' })],
+        ['readShort', u_byte({ kind: 'int' })],
+        ['readUnsignedShort', u_byte({ kind: 'uint' })],
+        ['readInt', u_byte({ kind: 'int' })],
+        ['readUnsignedInt', u_byte({ kind: 'uint' })],
+        ['readFloat', u_byte({ kind: 'number' })],
+        ['readDouble', u_byte({ kind: 'number' })],
+        ['readUTF', u_byte({ kind: 'string' })],
+        ['readUTFBytes', usm({ kind: 'string' }, [u_len('length')])],
+        ['readMultiByte', usm({ kind: 'string' }, [u_len('length'), { name: 'charSet', type: 'String', defaultValue: null, isRest: false }])],
+        ['readBytes', usm({ kind: 'void' }, [
+          { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          { name: 'length', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['bytesAvailable', usg({ kind: 'uint' })],
+        ['connected', usg({ kind: 'bool' })],
+      ]),
+      setters: new Map(),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // ---- flash.net.Socket / ServerSocket / XMLSocket / SecureSocket (stage 89·54) ----
+    //
+    // The member list follows the ActionScript 3.0 reference class-for-class.
+    // Socket implements IDataInput/IDataOutput, so its typed read side is the
+    // same set URLStream exposes and its write side the same set ByteArray
+    // exposes — a Socket that could write but not read (or vice versa) would be
+    // useless for every documented echo pattern. The one deliberate gap is
+    // readObject/writeObject: this subset has no AMF codec (ByteArray lacks the
+    // pair too), and inventing one would be a silent semantic lie. See
+    // docs/zh-cn/flash-net.md §7.
+    //
+    // `endian`/`objectEncoding`/`tcpNoDelay`/`timeout` are plain settable
+    // properties (that is how the reference declares them), so they stay fields;
+    // everything read-only is a getter, matching URIStream and the reference.
+    // mef/mec/meBool are declared further down collect() and a `const` arrow is in
+    // its temporal dead zone here, so the socket block spells its literals out.
+    const skf = (t: CType, owner: string): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
+    const skc = (owner: string, value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true });
+    const skBool = (name: string, def: boolean): Param => ({ name, type: 'Boolean', defaultValue: { kind: 'Bool', value: def }, isRest: false });
+    const skm = (owner: string, ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const skg = (owner: string, ret: CType): MethodInfo => ({ returnType: ret, params: [], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const sk_byte = (owner: string, ret: CType): MethodInfo => skm(owner, ret, []);
+    const sk_len = (name: string): Param => ({ name, type: 'uint', defaultValue: null, isRest: false });
+    const sk_num = (name: string): Param => ({ name, type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false });
+    const sk_readMethods = (owner: string): Map<string, MethodInfo> => new Map([
+      ['readBoolean', sk_byte(owner, { kind: 'bool' })],
+      ['readByte', sk_byte(owner, { kind: 'int' })],
+      ['readUnsignedByte', sk_byte(owner, { kind: 'uint' })],
+      ['readShort', sk_byte(owner, { kind: 'int' })],
+      ['readUnsignedShort', sk_byte(owner, { kind: 'uint' })],
+      ['readInt', sk_byte(owner, { kind: 'int' })],
+      ['readUnsignedInt', sk_byte(owner, { kind: 'uint' })],
+      ['readFloat', sk_byte(owner, { kind: 'number' })],
+      ['readDouble', sk_byte(owner, { kind: 'number' })],
+      ['readUTF', sk_byte(owner, { kind: 'string' })],
+      ['readUTFBytes', skm(owner, { kind: 'string' }, [sk_len('length')])],
+      ['readMultiByte', skm(owner, { kind: 'string' }, [sk_len('length'), { name: 'charSet', type: 'String', defaultValue: null, isRest: false }])],
+      ['readBytes', skm(owner, { kind: 'void' }, [
+        { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+        sk_num('offset'),
+        sk_num('length'),
+      ])],
+    ]);
+    this.classMap.set('Socket', {
+      fields: new Map([
+        ['endian', skf({ kind: 'string' }, 'Socket')],
+        ['objectEncoding', skf({ kind: 'uint' }, 'Socket')],
+        ['timeout', skf({ kind: 'int' }, 'Socket')],
+        ['tcpNoDelay', skf({ kind: 'bool' }, 'Socket')],
+      ]),
+      methods: new Map([
+        ['connect', skm('Socket', { kind: 'void' }, [
+          { name: 'host', type: 'String', defaultValue: null, isRest: false },
+          { name: 'port', type: 'int', defaultValue: null, isRest: false },
+        ])],
+        ['close', skm('Socket', { kind: 'void' }, [])],
+        ['flush', skm('Socket', { kind: 'void' }, [])],
+        ...sk_readMethods('Socket'),
+        ['writeBoolean', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'Boolean', defaultValue: null, isRest: false }])],
+        ['writeByte', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'int', defaultValue: null, isRest: false }])],
+        ['writeShort', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'int', defaultValue: null, isRest: false }])],
+        ['writeInt', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'int', defaultValue: null, isRest: false }])],
+        ['writeUnsignedInt', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }])],
+        ['writeFloat', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }])],
+        ['writeDouble', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }])],
+        ['writeUTF', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
+        ['writeUTFBytes', skm('Socket', { kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
+        ['writeMultiByte', skm('Socket', { kind: 'void' }, [
+          { name: 'value', type: 'String', defaultValue: null, isRest: false },
+          { name: 'charSet', type: 'String', defaultValue: null, isRest: false },
+        ])],
+        ['writeBytes', skm('Socket', { kind: 'void' }, [
+          { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+          sk_num('offset'),
+          sk_num('length'),
+        ])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['bytesAvailable', skg('Socket', { kind: 'uint' })],
+        ['bytesPending', skg('Socket', { kind: 'uint' })],
+        ['connected', skg('Socket', { kind: 'bool' })],
+        ['localAddress', skg('Socket', { kind: 'string' })],
+        ['localPort', skg('Socket', { kind: 'int' })],
+        ['remoteAddress', skg('Socket', { kind: 'string' })],
+        ['remotePort', skg('Socket', { kind: 'int' })],
+      ]),
+      setters: new Map(),
+      // Socket() and Socket(host, port) are both documented, and AIR's ctor with a
+      // host connects immediately. The port is required once the host is given.
+      constructor: { params: [
+        { name: 'host', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'port', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+      ] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // SecureSocket: TLS on top of Socket. The TLS half is not implemented yet,
+    // and the class reports that honestly (isSupported = false, connect()
+    // dispatches the socket ioError) rather than falling back to a plaintext
+    // connection behind the app's back.
+    this.classMap.set('SecureSocket', {
+      fields: new Map(),
+      methods: new Map([
+        ['connect', skm('SecureSocket', { kind: 'void' }, [
+          { name: 'host', type: 'String', defaultValue: null, isRest: false },
+          { name: 'port', type: 'int', defaultValue: null, isRest: false },
+        ])],
+        ['addBinaryChainBuildingCertificate', skm('SecureSocket', { kind: 'void' }, [
+          { name: 'certificate', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'trusted', type: 'Boolean', defaultValue: null, isRest: false },
+        ])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['serverCertificateStatus', skg('SecureSocket', { kind: 'string' })],
+      ]),
+      setters: new Map(),
+      staticGetters: new Map([
+        ['isSupported', { returnType: { kind: 'bool' }, params: [], owner: 'SecureSocket', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      constructor: { params: [] },
+      superClass: 'Socket',
+      isFinal: false,
+      implements: [],
+    });
+    // XMLSocket: NUL-terminated messages over the same transport. `connected` and
+    // `timeout` are its only state; everything else is connect/close/send.
+    this.classMap.set('XMLSocket', {
+      fields: new Map([
+        ['timeout', skf({ kind: 'int' }, 'XMLSocket')],
+      ]),
+      methods: new Map([
+        ['connect', skm('XMLSocket', { kind: 'void' }, [
+          { name: 'host', type: 'String', defaultValue: null, isRest: false },
+          { name: 'port', type: 'int', defaultValue: null, isRest: false },
+        ])],
+        ['close', skm('XMLSocket', { kind: 'void' }, [])],
+        // `send(object:Object)` in the reference; the runtime accepts a String or
+        // an XML value (and stringifies anything else, measured), so the slot is
+        // dynamic rather than a String — a String slot would reject an XML
+        // argument the reference accepts.
+        ['send', skm('XMLSocket', { kind: 'void' }, [{ name: 'object', type: 'any', defaultValue: null, isRest: false }])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['connected', skg('XMLSocket', { kind: 'bool' })],
+      ]),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'host', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'port', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+      ] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // ServerSocket: the listening side. Its ctor takes nothing, bind() chooses the
+    // address, listen() starts accepting; the reference has no accept() method —
+    // a connection is delivered as ServerSocketConnectEvent.CONNECT whose `socket`
+    // property is the connected Socket.
+    this.classMap.set('ServerSocket', {
+      fields: new Map(),
+      methods: new Map([
+        ['bind', skm('ServerSocket', { kind: 'void' }, [
+          { name: 'localPort', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          { name: 'localAddress', type: 'String', defaultValue: { kind: 'Str', value: '0.0.0.0' }, isRest: false },
+        ])],
+        ['listen', skm('ServerSocket', { kind: 'void' }, [
+          { name: 'backlog', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
+        ['close', skm('ServerSocket', { kind: 'void' }, [])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['bound', skg('ServerSocket', { kind: 'bool' })],
+        ['listening', skg('ServerSocket', { kind: 'bool' })],
+        ['localAddress', skg('ServerSocket', { kind: 'string' })],
+        ['localPort', skg('ServerSocket', { kind: 'int' })],
+      ]),
+      setters: new Map(),
+      staticGetters: new Map([
+        ['isSupported', { returnType: { kind: 'bool' }, params: [], owner: 'ServerSocket', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.events.ServerSocketConnectEvent / OutputProgressEvent. Both extend
+    // Event; the first carries the accepted Socket, the second the socket's
+    // remaining write backlog.
+    this.classMap.set('ServerSocketConnectEvent', {
+      fields: new Map([
+        ['socket', skf({ kind: 'object', className: 'Socket' }, 'ServerSocketConnectEvent')],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['CONNECT', skc('ServerSocketConnectEvent', 'connect')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        skBool('bubbles', false),
+        skBool('cancelable', false),
+        { name: 'socket', type: 'Socket', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
+    this.classMap.set('OutputProgressEvent', {
+      fields: new Map([
+        ['bytesPending', skf({ kind: 'number' }, 'OutputProgressEvent')],
+        ['bytesTotal', skf({ kind: 'number' }, 'OutputProgressEvent')],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['OUTPUT_PROGRESS', skc('OutputProgressEvent', 'outputProgress')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        skBool('bubbles', false),
+        skBool('cancelable', false),
+        { name: 'bytesPending', type: 'Number', defaultValue: { kind: 'Num', value: 0 }, isRest: false },
+        { name: 'bytesTotal', type: 'Number', defaultValue: { kind: 'Num', value: 0 }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
+    // URLRequestMethod: the six documented HTTP method constants (final class,
+    // pure String holders). Without it there was no way to spell "POST" besides a
+    // raw string literal — the single most misleading gap for the old dead
+    // URLRequest.method field. Built inline rather than via the `constClass`
+    // helper below: that helper is declared later in collect() and a `const`
+    // arrow function is in its temporal dead zone here.
+    const urmsf = new Map<string, FieldInfo>();
+    for (const m of ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS']) {
+      urmsf.set(m, { type: { kind: 'string' }, init: { kind: 'Str', value: m }, visibility: 'public', owner: 'URLRequestMethod', isStatic: true, isConst: true });
+    }
+    this.classMap.set('URLRequestMethod', {
+      fields: new Map(), methods: new Map(), staticFields: urmsf, staticMethods: new Map(),
+      getters: new Map(), setters: new Map(), constructor: { params: [] },
+      superClass: 'Object', isFinal: false, implements: [],
+    });
+    // URLRequestHeader: one name/value HTTP request header (AIR: `public var`
+    // fields, constructor defaults to ""/""). AIR's restricted-header list and the
+    // cumulative length limit only apply OUTSIDE the application security sandbox,
+    // which this desktop runtime is equivalent to, so no runtime check is made and
+    // arbitrary headers are accepted (see docs/zh-cn/flash-net.md section 4.4).
+    const urhf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'URLRequestHeader', isStatic: false, isConst: false });
+    this.classMap.set('URLRequestHeader', {
+      fields: new Map([
+        ['name', urhf({ kind: 'string' })],
+        ['value', urhf({ kind: 'string' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'name', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
+        { name: 'value', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // URLRequestDefaults: static defaults for URLRequest properties (AIR 1.0).
+    // Modeled as static getters/setters backed by C globals (the SharedObject
+    // `defaultObjectEncoding` pattern) rather than static fields: a declared
+    // static field with a literal initializer would be emitted as a plain C
+    // initializer carrying the value, but its AS3 read would also route through
+    // the lazy `<Class>_cinit()` guard — and URLRequest_ctor has to read these
+    // default values reliably at (C-level) construction time. Hand-written
+    // accessors keep the defaults observable with no initialization ordering.
+    // `userAgent` is the one member whose setter can store a GC string, so its
+    // backing global is registered as a permanent GC root (see emitGCRoots).
+    // Deferred: setLoginCredentialsForHost (needs an authenticating HTTP stack).
+    const urdsg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'URLRequestDefaults', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false });
+    const urdss = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'URLRequestDefaults', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: true });
+    const urdGet = new Map<string, MethodInfo>([
+      ['authenticate', urdsg({ kind: 'bool' })],
+      ['cacheResponse', urdsg({ kind: 'bool' })],
+      ['followRedirects', urdsg({ kind: 'bool' })],
+      ['idleTimeout', urdsg({ kind: 'number' })],
+      ['manageCookies', urdsg({ kind: 'bool' })],
+      ['useCache', urdsg({ kind: 'bool' })],
+      ['userAgent', urdsg({ kind: 'string' })],
+    ]);
+    const urdSet = new Map<string, MethodInfo>([
+      ['authenticate', urdss('Boolean')],
+      ['cacheResponse', urdss('Boolean')],
+      ['followRedirects', urdss('Boolean')],
+      ['idleTimeout', urdss('Number')],
+      ['manageCookies', urdss('Boolean')],
+      ['useCache', urdss('Boolean')],
+      ['userAgent', urdss('String')],
+    ]);
+    this.classMap.set('URLRequestDefaults', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      staticGetters: urdGet,
+      staticSetters: urdSet,
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+
+    // URLLoaderDataFormat: string constants describing URLLoader.dataFormat.
+    this.classMap.set('URLLoaderDataFormat', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['TEXT', { type: { kind: 'string' }, init: { kind: 'Str', value: 'text' }, visibility: 'public', owner: 'URLLoaderDataFormat', isStatic: true, isConst: true }],
+        ['BINARY', { type: { kind: 'string' }, init: { kind: 'Str', value: 'binary' }, visibility: 'public', owner: 'URLLoaderDataFormat', isStatic: true, isConst: true }],
+        ['VARIABLES', { type: { kind: 'string' }, init: { kind: 'Str', value: 'variables' }, visibility: 'public', owner: 'URLLoaderDataFormat', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
       isFinal: false,
       implements: [],
     });
@@ -863,6 +1658,12 @@ export class SymbolTable {
       fields: new Map(),
       methods: new Map([
         ['toString', { returnType: { kind: 'string' }, params: [], owner: 'URLVariables', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // URLVariables.decode(source): split a URL-encoded query string into
+        // dynamic properties. The constructor already calls it for a non-null
+        // argument; exposing it lets a caller re-decode into an existing instance.
+        // AIR throws Error when a name/value pair is not URL-encoded; this subset
+        // decodes leniently instead (documented in docs/zh-cn/flash-net.md §3.1).
+        ['decode', { returnType: { kind: 'void' }, params: [{ name: 'source', type: 'String', defaultValue: null, isRest: false }], owner: 'URLVariables', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -904,13 +1705,12 @@ export class SymbolTable {
       implements: [],
     });
     // Mouse: static hide()/show() toggle a runtime visibility flag; cursor is a
-    // read-only string ("auto" — the real AIR default) in this subset (SDL cursor API
-    // is not wired).
+    // writable static String (AS3 `public static var cursor:String = "auto"`).
     this.classMap.set('Mouse', {
       fields: new Map(),
       methods: new Map(),
       staticFields: new Map([
-        ['cursor', { type: { kind: 'string' }, init: { kind: 'Str', value: 'auto' }, visibility: 'public', owner: 'Mouse', isStatic: true, isConst: true }],
+        ['cursor', { type: { kind: 'string' }, init: { kind: 'Str', value: 'auto' }, visibility: 'public', owner: 'Mouse', isStatic: true, isConst: false }],
         ['supportsCursor', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'Mouse', isStatic: true, isConst: true }],
         ['supportsNativeCursor', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'Mouse', isStatic: true, isConst: true }],
       ]),
@@ -920,6 +1720,43 @@ export class SymbolTable {
       ]),
       getters: new Map(),
       setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.ui.Multitouch / MultitouchInputMode (AIR input-mode constants). The
+    // inputMode getter/setter wrap a global string (default "none") so
+    // `Multitouch.inputMode == MultitouchInputMode.TOUCH_POINT` behaves.
+    this.classMap.set('MultitouchInputMode', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['NONE', { type: { kind: 'string' }, init: { kind: 'Str', value: 'none' }, visibility: 'public', owner: 'MultitouchInputMode', isStatic: true, isConst: true }],
+        ['TOUCH_POINT', { type: { kind: 'string' }, init: { kind: 'Str', value: 'touchPoint' }, visibility: 'public', owner: 'MultitouchInputMode', isStatic: true, isConst: true }],
+        ['GESTURE', { type: { kind: 'string' }, init: { kind: 'Str', value: 'gesture' }, visibility: 'public', owner: 'MultitouchInputMode', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    this.classMap.set('Multitouch', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      staticGetters: new Map([
+        ['inputMode', { returnType: { kind: 'string' }, params: [], owner: 'Multitouch', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map(),
+      staticSetters: new Map([
+        ['inputMode', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'Multitouch', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
       constructor: { params: [] },
       superClass: 'Object',
       isFinal: false,
@@ -947,6 +1784,7 @@ export class SymbolTable {
         ['createDirectory', filemeth({ kind: 'void' }, [])],
         ['deleteFile', filemeth({ kind: 'void' }, [])],
         ['deleteDirectory', filemeth({ kind: 'void' }, [])],
+        ['getDirectoryListing', filemeth({ kind: 'array' }, [])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -954,6 +1792,7 @@ export class SymbolTable {
         ['url', filegetr({ kind: 'string' })],
         ['exists', filegetr({ kind: 'bool' })],
         ['isDirectory', filegetr({ kind: 'bool' })],
+        ['isHidden', filegetr({ kind: 'bool' })],
       ]),
       setters: new Map(),
       constructor: { params: [
@@ -962,6 +1801,9 @@ export class SymbolTable {
       superClass: 'EventDispatcher',
       isFinal: false,
       implements: [],
+      // flash.filesystem::File must round-trip getQualifiedClassName so the
+      // Starling AssetManager can distinguish it from unsupported asset types.
+      fqn: 'flash.filesystem::File',
     });
     // FileStream: a POSIX FILE* wrapper. open() maps an AIR FileMode string
     // ("read"/"write"/"append"/"update") to a C fopen mode and keeps the handle
@@ -985,6 +1827,16 @@ export class SymbolTable {
         ['close', fsmeth({ kind: 'void' }, [])],
         ['readUTFBytes', fsmeth({ kind: 'string' }, [{ name: 'length', type: 'uint', defaultValue: null, isRest: false }])],
         ['writeUTFBytes', fsmeth({ kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
+        ['readBytes', fsmeth({ kind: 'void' }, [
+          { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          { name: 'length', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
+        ['writeBytes', fsmeth({ kind: 'void' }, [
+          { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          { name: 'length', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1043,6 +1895,103 @@ export class SymbolTable {
     constClass('StageQuality', { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', BEST: 'best' });
     constClass('StageDisplayState', { NORMAL: 'normal', FULL_SCREEN: 'fullScreen', FULL_SCREEN_INTERACTIVE: 'fullScreenInteractive' });
     constClass('TextFieldAutoSize', { NONE: 'none', LEFT: 'left', RIGHT: 'right', CENTER: 'center' });
+    constClass('AntiAliasType', { NORMAL: 'normal', ADVANCED: 'advanced' });
+    constClass('TextFormatAlign', { LEFT: 'left', RIGHT: 'right', CENTER: 'center', JUSTIFY: 'justify' });
+    constClass('TouchPhase', { BEGAN: 'began', MOVED: 'moved', ENDED: 'ended', STATIONARY: 'stationary', HOVER: 'hover' });
+    constClass('MouseCursor', { AUTO: 'auto', ARROW: 'arrow', BUTTON: 'button', HAND: 'hand', IBEAM: 'ibeam' });
+    // ---- flash.net.SharedObject (stage 89·40) ----
+    // Local shared objects persisted under applicationStorageDirectory. AIR's own
+    // container is an AMF3 ".sol" file; this subset persists JSON through the
+    // existing JSON codec, so the byte format differs while the AS3 semantics
+    // (data / flush / clear / size / instance identity) are preserved. Only the
+    // local half is implemented: getRemote/connect/send need a Flash Media
+    // Server, so they fail loudly instead of silently pretending (see emit.ts).
+    // AIR values confirmed with adl 51.4.1: ObjectEncoding.AMF0=0, AMF3=3,
+    // DEFAULT=3, defaultObjectEncoding=3, preventBackup=false, and
+    // SharedObjectFlushStatus.FLUSHED="flushed" / PENDING="pending".
+    intConstClass('ObjectEncoding', { AMF0: 0, AMF3: 3, DEFAULT: 3 });
+    constClass('SharedObjectFlushStatus', { FLUSHED: 'flushed', PENDING: 'pending' });
+    const sog = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'SharedObject', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const sos = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'SharedObject', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+    const som = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'SharedObject', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const sosm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'SharedObject', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false });
+    const sosg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'SharedObject', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false });
+    const soss = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'SharedObject', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: true });
+    this.classMap.set('SharedObject', {
+      // No AS3-visible instance fields: data/size/client/objectEncoding are
+      // accessors and the persisted table lives in a C-runtime-only slot that the
+      // props reflection table marks for the GC (see emit.ts emitPropTables).
+      fields: new Map(),
+      methods: new Map([
+        ['flush', som({ kind: 'string' }, [{ name: 'minDiskSpace', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false }])],
+        ['clear', som({ kind: 'void' }, [])],
+        ['close', som({ kind: 'void' }, [])],
+        // connect/send target a remote object; the C bodies throw. Parameters are
+        // typed '*' because NetConnection is not part of the subset.
+        ['connect', som({ kind: 'void' }, [
+          { name: 'myConnection', type: 'any', defaultValue: null, isRest: false },
+          { name: 'params', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        // send's rest parameter is typed Array so the typed call path (which
+        // materialises the trailing arguments with as_array_make) and the C
+        // signature agree; the body throws.
+        ['send', som({ kind: 'void' }, [{ name: 'arguments', type: 'Array', defaultValue: null, isRest: true }])],
+        ['setDirty', som({ kind: 'void' }, [{ name: 'propertyName', type: 'String', defaultValue: null, isRest: false }])],
+        ['setProperty', som({ kind: 'void' }, [
+          { name: 'propertyName', type: 'String', defaultValue: null, isRest: false },
+          { name: 'value', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+      ]),
+      // _cache holds the already-handed-out instances so repeated getLocal() calls
+      // for one name return the SAME object (AIR behaviour, adl-verified). As a
+      // declared static field it is a GC permanent root, so a cached object can
+      // never be collected while the process still hands it out.
+      staticFields: new Map([
+        ['_cache', { type: { kind: 'array' }, init: null, visibility: 'private', owner: 'SharedObject', isStatic: true, isConst: false }],
+      ]),
+      staticMethods: new Map([
+        ['getLocal', sosm({ kind: 'object', className: 'SharedObject' }, [
+          { name: 'name', type: 'String', defaultValue: null, isRest: false },
+          { name: 'localPath', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'secure', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
+        ['getRemote', sosm({ kind: 'object', className: 'SharedObject' }, [
+          { name: 'name', type: 'String', defaultValue: null, isRest: false },
+          { name: 'remotePath', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'persistence', type: 'any', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          { name: 'secure', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
+      ]),
+      getters: new Map([
+        ['data', sog({ kind: 'object', className: 'Object' })],
+        ['size', sog({ kind: 'uint' })],
+        ['client', sog({ kind: 'object', className: 'Object' })],
+        ['objectEncoding', sog({ kind: 'uint' })],
+      ]),
+      // data is read-only in AIR (mxmlc rejects `so.data = x`), so it has no
+      // setter here either. fps is write-only (it only throttles uploads to a
+      // server, which does not exist for a local object).
+      setters: new Map([
+        ['client', sos('Object')],
+        ['objectEncoding', sos('uint')],
+        ['fps', sos('Number')],
+      ]),
+      staticGetters: new Map([
+        ['defaultObjectEncoding', sosg({ kind: 'uint' })],
+        ['preventBackup', sosg({ kind: 'bool' })],
+      ]),
+      staticSetters: new Map([
+        ['defaultObjectEncoding', soss('uint')],
+        ['preventBackup', soss('Boolean')],
+      ]),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+      // AIR reports flash.net::SharedObject, and the sealed-property error message
+      // for an undeclared property (ReferenceError #1056) quotes this form.
+      fqn: 'flash.net::SharedObject',
+    });
     // built-in mouse/keyboard/focus event types (flash.events). Each extends Event,
     // so the base fields (type/bubbles/cancelable/target/...) are inherited.
     const mef = (t: CType, owner: string): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
@@ -1052,6 +2001,8 @@ export class SymbolTable {
       fields: new Map([
         ['localX', mef({ kind: 'number' }, 'MouseEvent')],
         ['localY', mef({ kind: 'number' }, 'MouseEvent')],
+        ['stageX', mef({ kind: 'number' }, 'MouseEvent')],
+        ['stageY', mef({ kind: 'number' }, 'MouseEvent')],
         ['relatedObject', mef({ kind: 'object', className: 'Object' }, 'MouseEvent')],
         ['ctrlKey', mef({ kind: 'bool' }, 'MouseEvent')],
         ['altKey', mef({ kind: 'bool' }, 'MouseEvent')],
@@ -1092,10 +2043,50 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // flash.events.TouchEvent (stage 93): multi-touch input. Fields model the
+    // touch-point state Starling reads (stageX/Y, touchPointID, pressure, size,
+    // primary flag); static constants are the event-type strings.
+    const tef = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'TouchEvent', isStatic: false, isConst: false });
+    const tec = (value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner: 'TouchEvent', isStatic: true, isConst: true });
+    this.classMap.set('TouchEvent', {
+      fields: new Map([
+        ['stageX', tef({ kind: 'number' })],
+        ['stageY', tef({ kind: 'number' })],
+        ['touchPointID', tef({ kind: 'int' })],
+        ['pressure', tef({ kind: 'number' })],
+        ['sizeX', tef({ kind: 'number' })],
+        ['sizeY', tef({ kind: 'number' })],
+        ['isPrimaryTouchPoint', tef({ kind: 'bool' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['TOUCH_BEGIN', tec('touchBegin')],
+        ['TOUCH_MOVE', tec('touchMove')],
+        ['TOUCH_END', tec('touchEnd')],
+        ['TOUCH_OVER', tec('touchOver')],
+        ['TOUCH_OUT', tec('touchOut')],
+        ['TOUCH_ROLL_OVER', tec('touchRollOver')],
+        ['TOUCH_ROLL_OUT', tec('touchRollOut')],
+        ['TOUCH_TAP', tec('touchTap')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
     this.classMap.set('KeyboardEvent', {
       fields: new Map([
         ['keyCode', mef({ kind: 'int' }, 'KeyboardEvent')],
         ['charCode', mef({ kind: 'int' }, 'KeyboardEvent')],
+        ['keyLocation', mef({ kind: 'int' }, 'KeyboardEvent')],
+        ['ctrlKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
+        ['altKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
+        ['shiftKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
       ]),
       methods: new Map(),
       staticFields: new Map([
@@ -1174,6 +2165,9 @@ export class SymbolTable {
       methods: new Map(),
       staticFields: new Map([
         ['PROGRESS', mec('ProgressEvent', 'progress')],
+        // flash.net.Socket raises this, not PROGRESS: see the socket section in
+        // emit.ts. Same shape, different type string.
+        ['SOCKET_DATA', mec('ProgressEvent', 'socketData')],
       ]),
       staticMethods: new Map(),
       getters: new Map(),
@@ -1212,6 +2206,8 @@ export class SymbolTable {
       implements: [],
     });
     this.classMap.set('IOErrorEvent', {
+      // `errorID` is inherited from ErrorEvent (already registered above), which is
+      // also the field AIR's asynchronous socket failures report the number in.
       fields: new Map(),
       methods: new Map(),
       staticFields: new Map([
@@ -1248,6 +2244,53 @@ export class SymbolTable {
         { name: 'data', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
       ] },
       superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.events.HTTPStatusEvent / SecurityErrorEvent (AIR): HTTPStatusEvent adds
+    // status/responseURL/responseHeaders; SecurityErrorEvent only adds a constant
+    // (text is inherited from ErrorEvent).
+    this.classMap.set('HTTPStatusEvent', {
+      fields: new Map([
+        ['status', mef({ kind: 'int' }, 'HTTPStatusEvent')],
+        ['responseURL', mef({ kind: 'string' }, 'HTTPStatusEvent')],
+        ['responseHeaders', mef({ kind: 'array' }, 'HTTPStatusEvent')],
+        ['redirected', mef({ kind: 'bool' }, 'HTTPStatusEvent')],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['HTTP_STATUS', mec('HTTPStatusEvent', 'httpStatus')],
+        ['HTTP_RESPONSE_STATUS', mec('HTTPStatusEvent', 'httpResponseStatus')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', false),
+        meBool('cancelable', false),
+        { name: 'status', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
+    this.classMap.set('SecurityErrorEvent', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['SECURITY_ERROR', mec('SecurityErrorEvent', 'securityError')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', false),
+        meBool('cancelable', false),
+        { name: 'text', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
+      ] },
+      superClass: 'ErrorEvent',
       isFinal: false,
       implements: [],
     });
@@ -1322,6 +2365,7 @@ export class SymbolTable {
           { name: 'matrix', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false },
         ])],
         ['drawRect', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0)])],
+        ['drawRoundRect', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0), gnum('ellipseWidth', 0), gnum('ellipseHeight', 0)])],
         ['drawCircle', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('radius', 0)])],
         ['clear', gpm({ kind: 'void' }, [])],
       ]),
@@ -1353,7 +2397,7 @@ export class SymbolTable {
     // loadFile hook) used by render().
     const bmpf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Bitmap', isStatic: false, isConst: false });
     this.classMap.set('Bitmap', {
-      fields: new Map([['bitmapData', bmpf({ kind: 'object', className: 'BitmapData' })]]),
+      fields: new Map([['bitmapData', bmpf({ kind: 'object', className: 'BitmapData' })], ['smoothing', bmpf({ kind: 'bool' })]]),
       methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1403,6 +2447,27 @@ export class SymbolTable {
           { name: 'destPoint', type: 'Point', defaultValue: null, isRest: false },
           { name: 'filter', type: 'BitmapFilter', defaultValue: null, isRest: false },
         ])],
+        ['perlinNoise', bdm({ kind: 'void' }, [
+          { name: 'baseX', type: 'Number', defaultValue: null, isRest: false },
+          { name: 'baseY', type: 'Number', defaultValue: null, isRest: false },
+          { name: 'numOctaves', type: 'uint', defaultValue: null, isRest: false },
+          { name: 'randomSeed', type: 'int', defaultValue: null, isRest: false },
+          { name: 'stitch', type: 'Boolean', defaultValue: null, isRest: false },
+          { name: 'fractalNoise', type: 'Boolean', defaultValue: null, isRest: false },
+        ])],
+        ['dispose', bdm({ kind: 'void' }, [])],
+        ['setPixels', bdm({ kind: 'void' }, [
+          { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
+          { name: 'inputByteArray', type: 'ByteArray', defaultValue: null, isRest: false },
+        ])],
+        ['copyPixels', bdm({ kind: 'void' }, [
+          { name: 'sourceBitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
+          { name: 'sourceRect', type: 'Rectangle', defaultValue: null, isRest: false },
+          { name: 'destPoint', type: 'Point', defaultValue: null, isRest: false },
+          { name: 'alphaBitmapData', type: 'BitmapData', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'alphaPoint', type: 'Point', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'mergeAlpha', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1416,6 +2481,26 @@ export class SymbolTable {
         { name: 'transparent', type: 'Boolean', defaultValue: { kind: 'Bool', value: true }, isRest: false },
         { name: 'fillColor', type: 'uint', defaultValue: { kind: 'Num', value: 4294967295, isInt: true }, isRest: false },
       ] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.display.BitmapDataChannel: uint channel selectors used by
+    // BitmapData.copyChannel / DisplacementMapFilter componentX/Y.
+    const bdc = (value: number): FieldInfo => ({ type: { kind: 'uint' }, init: { kind: 'Num', value, isInt: true }, visibility: 'public', owner: 'BitmapDataChannel', isStatic: true, isConst: true });
+    this.classMap.set('BitmapDataChannel', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['RED', bdc(1)],
+        ['GREEN', bdc(2)],
+        ['BLUE', bdc(4)],
+        ['ALPHA', bdc(8)],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
       superClass: 'Object',
       isFinal: false,
       implements: [],
@@ -1557,6 +2642,9 @@ export class SymbolTable {
     this.classMap.set('ByteArray', {
       fields: new Map([
         ['data', bayf({ kind: 'null' })],
+        // `length` stays a physical slot (the generated struct needs it) but is
+        // resolved through the accessor pair below, exactly like
+        // DisplayObject.cacheAsBitmap.
         ['length', bayf({ kind: 'int' })],
         ['capacity', bayf({ kind: 'int' })],
         ['position', bayf({ kind: 'int' })],
@@ -1569,11 +2657,27 @@ export class SymbolTable {
         ['writeUnsignedInt', baym({ kind: 'void' }, [{ name: 'v', type: 'uint', defaultValue: null, isRest: false }])],
         ['writeFloat', baym({ kind: 'void' }, [{ name: 'v', type: 'Number', defaultValue: null, isRest: false }])],
         ['writeUTFBytes', baym({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
+        ['writeUTF', baym({ kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
+        ['writeBytes', baym({ kind: 'void' }, [
+          { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          { name: 'length', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
         ['readByte', baym({ kind: 'int' }, [])],
+        ['readUnsignedByte', baym({ kind: 'uint' }, [])],
         ['readShort', baym({ kind: 'int' }, [])],
+        ['readUnsignedShort', baym({ kind: 'uint' }, [])],
         ['readInt', baym({ kind: 'int' }, [])],
+        ['readUnsignedInt', baym({ kind: 'uint' }, [])],
         ['readFloat', baym({ kind: 'number' }, [])],
+        ['readDouble', baym({ kind: 'number' }, [])],
+        ['readUTF', baym({ kind: 'string' }, [])],
         ['readUTFBytes', baym({ kind: 'string' }, [{ name: 'n', type: 'int', defaultValue: null, isRest: false }])],
+        ['readBytes', baym({ kind: 'void' }, [
+          { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          { name: 'length', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
         ['compress', baym({ kind: 'void' }, [])],
         ['uncompress', baym({ kind: 'void' }, [])],
         ['clear', baym({ kind: 'void' }, [])],
@@ -1582,8 +2686,13 @@ export class SymbolTable {
       staticMethods: new Map(),
       getters: new Map([
         ['bytesAvailable', bayg({ kind: 'int' })],
+        // `length` is an accessor on ByteArray: reading it is trivial, assigning
+        // it must resize the backing buffer (see ByteArray_set_length).
+        ['length', bayg({ kind: 'int' })],
       ]),
-      setters: new Map(),
+      setters: new Map([
+        ['length', baym({ kind: 'void' }, [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }])],
+      ]),
       constructor: { params: [] },
       superClass: 'Object',
       isFinal: false,
@@ -1600,7 +2709,11 @@ export class SymbolTable {
         ['color', tff({ kind: 'uint' }, 'TextFormat')],
         ['bold', tff({ kind: 'bool' }, 'TextFormat')],
         ['italic', tff({ kind: 'bool' }, 'TextFormat')],
+        ['underline', tff({ kind: 'bool' }, 'TextFormat')],
         ['leading', tff({ kind: 'number' }, 'TextFormat')],
+        ['align', tff({ kind: 'string' }, 'TextFormat')],
+        ['kerning', tff({ kind: 'bool' }, 'TextFormat')],
+        ['letterSpacing', tff({ kind: 'number' }, 'TextFormat')],
       ]),
       methods: new Map(),
       staticFields: new Map(),
@@ -1619,6 +2732,73 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // flash.text.StyleSheet: Starling only passes it through as a nullable value
+    // (no CSS parsing is exercised), so it is modeled as a bare Object subclass.
+    this.classMap.set('StyleSheet', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.net.NetStream: only its dynamic `client` slot is exercised (Starling
+    // reads/writes stream.client to inject an onMetaData handler).
+    this.classMap.set('NetStream', {
+      fields: new Map([
+        ['client', { type: { kind: 'object', className: 'Object' }, init: null, visibility: 'public', owner: 'NetStream', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.xml.Namespace: E4X namespace objects are transparent in the AOT
+    // translation (`ns::member` qualifiers are dropped), so Namespace is modeled
+    // as a bare Object subclass whose value is never meaningfully read.
+    this.classMap.set('Namespace', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.text.Font: only enumerateFonts() and the per-font string metadata are
+    // exercised (Starling's SystemUtil.isEmbeddedFont probes the device font list).
+    this.classMap.set('Font', {
+      fields: new Map([
+        ['fontName', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'Font', isStatic: false, isConst: false }],
+        ['fontStyle', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'Font', isStatic: false, isConst: false }],
+        ['fontType', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'Font', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map([
+        ['enumerateFonts', { returnType: { kind: 'array' }, params: [{ name: 'enumerateDeviceFonts', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }], owner: 'Font', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    constClass('FontStyle', { REGULAR: 'regular', BOLD: 'bold', ITALIC: 'italic', BOLD_ITALIC: 'boldItalic' });
+    constClass('GradientType', { LINEAR: 'linear', RADIAL: 'radial' });
     const txf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'TextField', isStatic: false, isConst: false });
     const txg = (ret: CType, name: string): MethodInfo => ({ returnType: ret, params: [], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     const txm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
@@ -1635,6 +2815,9 @@ export class SymbolTable {
         ['selectable', txf({ kind: 'bool' })],
         ['autoSize', txf({ kind: 'string' })],
         ['textColor', txf({ kind: 'uint' })],
+        ['embedFonts', txf({ kind: 'bool' })],
+        ['antiAliasType', txf({ kind: 'string' })],
+        ['styleSheet', txf({ kind: 'object', className: 'StyleSheet' })],
       ]),
       methods: new Map([
         ['appendText', txm({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
@@ -1656,6 +2839,11 @@ export class SymbolTable {
         ['htmlText', txg({ kind: 'string' }, 'htmlText')],
       ]),
       setters: new Map([
+        // `text` stays a FIELD so reads stay a plain `tf->text` load, but writes go
+        // through a setter: AIR's `.text = ...` replaces the whole content, dropping
+        // any rich-text runs a previous htmlText / setTextFormat installed. As a raw
+        // field write it silently kept replaying them (see emit.ts TextField_set_text).
+        ['text', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
         ['htmlText', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
         ['scrollH', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'int', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
       ]),
@@ -1731,6 +2919,8 @@ export class SymbolTable {
           ['inflate', rm({ kind: 'void' }, [gegnum('dx', 0), gegnum('dy', 0)])],
           ['offset', rm({ kind: 'void' }, [gegnum('dx', 0), gegnum('dy', 0)])],
           ['clone', rm({ kind: 'object', className: 'Rectangle' }, [])],
+          ['copyFrom', rm({ kind: 'void' }, [rp('sourceRect')])],
+          ['setTo', rm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('width', 0), gegnum('height', 0)])],
           ['setEmpty', rm({ kind: 'void' }, [])],
           ['isEmpty', rm({ kind: 'bool' }, [])],
           ['toString', rm({ kind: 'string' }, [])],
@@ -1777,6 +2967,8 @@ export class SymbolTable {
           ['createBox', mm({ kind: 'void' }, [gegnum('scaleX', 0), gegnum('scaleY', 0), gegnum('rotation', 0), gegnum('tx', 0), gegnum('ty', 0)])],
           ['createGradientBox', mm({ kind: 'void' }, [gegnum('width', 0), gegnum('height', 0), gegnum('rotation', 0), gegnum('tx', 0), gegnum('ty', 0)])],
           ['clone', mm({ kind: 'object', className: 'Matrix' }, [])],
+          ['copyFrom', mm({ kind: 'void' }, [mp('sourceMatrix')])],
+          ['setTo', mm({ kind: 'void' }, [gegnum('a', 0), gegnum('b', 0), gegnum('c', 0), gegnum('d', 0), gegnum('tx', 0), gegnum('ty', 0)])],
           ['toString', mm({ kind: 'string' }, [])],
         ]),
         staticFields: new Map(),
@@ -1860,6 +3052,8 @@ export class SymbolTable {
           ['dotProduct', vm({ kind: 'number' }, [v3('a')])],
           ['crossProduct', vm({ kind: 'object', className: 'Vector3D' }, [v3('a')])],
           ['clone', vm({ kind: 'object', className: 'Vector3D' }, [])],
+          ['setTo', vm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
+          ['project', vm({ kind: 'void' }, [])],
           ['equals', vm({ kind: 'bool' }, [v3('toCompare'), { name: 'allFour', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
           ['toString', vm({ kind: 'string' }, [])],
         ]),
@@ -1911,6 +3105,16 @@ export class SymbolTable {
           ['recompose', mm({ kind: 'bool' }, [{ name: 'components', type: 'Vector.<Vector3D>', defaultValue: null, isRest: false }, orient])],
           ['decompose', mm(vv3(), [orient])],
           ['copyFrom', mm({ kind: 'void' }, [m3('sourceMatrix3D')])],
+          ['copyRawDataTo', mm({ kind: 'void' }, [
+            { name: 'vector', type: 'Vector.<Number>', defaultValue: null, isRest: false },
+            { name: 'index', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'transpose', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          ])],
+          ['copyRawDataFrom', mm({ kind: 'void' }, [
+            { name: 'vector', type: 'Vector.<Number>', defaultValue: null, isRest: false },
+            { name: 'index', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'transpose', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          ])],
           ['clone', mm({ kind: 'object', className: 'Matrix3D' }, [])],
           ['appendTranslation', mm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
           ['prependTranslation', mm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
@@ -1963,10 +3167,14 @@ export class SymbolTable {
     // --- 15 constant classes: pure static-String holders, never instantiated. ---
     constClass('Context3DBlendFactor', { ONE: 'one', ZERO: 'zero', SOURCE_ALPHA: 'sourceAlpha', SOURCE_COLOR: 'sourceColor', ONE_MINUS_SOURCE_ALPHA: 'oneMinusSourceAlpha', ONE_MINUS_SOURCE_COLOR: 'oneMinusSourceColor', DESTINATION_ALPHA: 'destinationAlpha', DESTINATION_COLOR: 'destinationColor', ONE_MINUS_DESTINATION_ALPHA: 'oneMinusDestinationAlpha', ONE_MINUS_DESTINATION_COLOR: 'oneMinusDestinationColor' });
     constClass('Context3DBufferUsage', { STATIC_DRAW: 'staticDraw', DYNAMIC_DRAW: 'dynamicDraw' });
-    constClass('Context3DClearMask', { COLOR: 'color', DEPTH: 'depth', STENCIL: 'stencil', ALL: 'all' });
+    // AIR's Context3DClearMask is a uint bitfield (verified against adl:
+    // COLOR=1, DEPTH=2, STENCIL=4, ALL=7) — clear(r,g,b,a,depth,stencil,mask)
+    // takes those bits. Modelling them as strings made the mask argument coerce
+    // to garbage, so the clear-mask semantics were silently lost.
+    intConstClass('Context3DClearMask', { COLOR: 1, DEPTH: 2, STENCIL: 4, ALL: 7 });
     constClass('Context3DCompareMode', { ALWAYS: 'always', NEVER: 'never', LESS: 'less', LESS_EQUAL: 'lessEqual', EQUAL: 'equal', GREATER_EQUAL: 'greaterEqual', GREATER: 'greater', NOT_EQUAL: 'notEqual' });
     constClass('Context3DFillMode', { NONE: 'none', SOLID: 'solid' });
-    constClass('Context3DMipFilter', { NONE: 'none', NEAREST: 'nearest', LINEAR: 'linear' });
+    constClass('Context3DMipFilter', { MIPNONE: 'mipnone', MIPNEAREST: 'mipnearest', MIPLINEAR: 'miplinear' });
     constClass('Context3DProfile', { BASELINE: 'baseline', BASELINE_EXTENDED: 'baselineExtended', BASELINE_CONSTRAINED: 'baselineConstrained', STANDARD: 'standard', STANDARD_CONSTRAINED: 'standardConstrained', STANDARD_EXTENDED: 'standardExtended' });
     constClass('Context3DProgramType', { VERTEX: 'vertex', FRAGMENT: 'fragment' });
     constClass('Context3DRenderMode', { AUTO: 'auto', SOFTWARE: 'software' });
@@ -1986,12 +3194,26 @@ export class SymbolTable {
         fields: new Map([
           ['numVertices', vbf({ kind: 'int' })],
           ['data32PerVertex', vbf({ kind: 'int' })],
-          ['data', vbf({ kind: 'vector', elem: { kind: 'number' } })],
+          // Vertex payload as raw 32-bit GPU words (Vector.<uint>), one per
+          // component. A vertex buffer is bytes on the GPU: the attribute format
+          // chosen at setVertexBufferAt decides how a word is read (floatN ->
+          // float32, bytes4 -> four normalized bytes). Keeping the words
+          // themselves is both smaller and more honest than the previous pair of
+          // Vector.<Number> (one holding the widened float VALUE, one its bit
+          // pattern as a double): 16 bytes per component of information that
+          // fits in 4, and 96% of the benchmark's live heap was those buffers.
+          ['raw', vbf({ kind: 'vector', elem: { kind: 'uint' } })],
           ['startVertex', vbf({ kind: 'int' })],
         ]),
         methods: new Map([
           ['uploadFromVector', vbm({ kind: 'void' }, [
             { name: 'data', type: 'Vector.<Number>', defaultValue: null, isRest: false },
+            { name: 'startVertex', type: 'int', defaultValue: null, isRest: false },
+            { name: 'numVertices', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['uploadFromByteArray', vbm({ kind: 'void' }, [
+            { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: null, isRest: false },
             { name: 'startVertex', type: 'int', defaultValue: null, isRest: false },
             { name: 'numVertices', type: 'int', defaultValue: null, isRest: false },
           ])],
@@ -2013,6 +3235,12 @@ export class SymbolTable {
         methods: new Map([
           ['uploadFromVector', ibm({ kind: 'void' }, [
             { name: 'data', type: 'Vector.<uint>', defaultValue: null, isRest: false },
+            { name: 'startIndex', type: 'int', defaultValue: null, isRest: false },
+            { name: 'numIndices', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['uploadFromByteArray', ibm({ kind: 'void' }, [
+            { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: null, isRest: false },
             { name: 'startIndex', type: 'int', defaultValue: null, isRest: false },
             { name: 'numIndices', type: 'int', defaultValue: null, isRest: false },
           ])],
@@ -2045,7 +3273,23 @@ export class SymbolTable {
       fields: new Map(),
       methods: new Map([['dispose', { returnType: { kind: 'void' }, params: [], owner: 'TextureBase', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }]]),
       staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
-      constructor: { params: [] }, superClass: 'Object', isFinal: false, implements: [],
+      constructor: { params: [] }, superClass: 'EventDispatcher', isFinal: false, implements: [],
+    });
+    // flash.display3D.textures.VideoTexture: a video-backed base texture. Its
+    // videoWidth/videoHeight expose the decoded frame size (read-only in AIR; the
+    // AOT subset models them as plain int fields defaulting to 0).
+    this.classMap.set('VideoTexture', {
+      fields: new Map([
+        ['videoWidth', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'VideoTexture', isStatic: false, isConst: false }],
+        ['videoHeight', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'VideoTexture', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map([
+        ['dispose', { returnType: { kind: 'void' }, params: [], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['attachCamera', { returnType: { kind: 'void' }, params: [{ name: 'camera', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['attachNetStream', { returnType: { kind: 'void' }, params: [{ name: 'netStream', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
+      constructor: { params: [] }, superClass: 'TextureBase', isFinal: false, implements: [],
     });
     {
       const txf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Texture', isStatic: false, isConst: false });
@@ -2061,11 +3305,22 @@ export class SymbolTable {
           // Opaque MTLTexture handle for render-to-texture (optimizeForRenderToTexture).
           // NULL for sampler-only textures (uploadFromBitmapData).
           ['gpu', txf({ kind: 'null' })],
+          // Opaque S3DContext handle, set by Context3D_createTexture. uploadBitmapData
+          // needs it to upload EAGERLY (see Texture_uploadFromBitmapData) -- AIR's
+          // uploadFromBitmapData is synchronous, so the caller is free to dispose the
+          // source BitmapData right after; deferring the upload to the next
+          // Context3D_submit would then read a freed pixel buffer.
+          ['ctx', txf({ kind: 'null' })],
         ]),
         methods: new Map([
           ['uploadFromBitmapData', txm({ kind: 'void' }, [
             { name: 'bitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
             { name: 'miplevel', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          ])],
+          ['uploadCompressedTextureFromByteArray', txm({ kind: 'void' }, [
+            { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'async', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           ])],
           ['dispose', txm({ kind: 'void' }, [])],
         ]),
@@ -2112,6 +3367,15 @@ export class SymbolTable {
           ['height', rtf({ kind: 'int' })],
           ['format', rtf({ kind: 'string' })],
           ['bitmapData', rtf({ kind: 'object', className: 'BitmapData' })],
+          // Opaque MTLTexture handle, mirroring Texture. NPOT atlas/background
+          // textures are RectangleTexture; Starling binds their `base` through
+          // setTextureAt (typed Texture*), so this field MUST sit at the same
+          // trailing offset as Texture.gpu — otherwise Context3D_submit reads
+          // past the RectangleTexture struct and binds garbage to Metal
+          // (SIGSEGV in setFragmentTexture). Layout-identical to Texture.
+          ['gpu', rtf({ kind: 'null' })],
+          // Same eager-upload context handle as Texture (layout-identical).
+          ['ctx', rtf({ kind: 'null' })],
         ]),
         methods: new Map([
           ['uploadFromBitmapData', rtm({ kind: 'void' }, [
@@ -2153,6 +3417,25 @@ export class SymbolTable {
         ['clearG', c3f({ kind: 'number' })],
         ['clearB', c3f({ kind: 'number' })],
         ['clearA', c3f({ kind: 'number' })],
+        // Stencil/scissor state (stage 87): recorded by setStencilActions /
+        // setStencilReferenceValue / setScissorRectangle for the CPU state
+        // machine. Like setDepthTest/setCulling, these are NOT yet propagated to
+        // the offscreen Metal pipeline (which has no depth/stencil attachment).
+        ['stencilFace', c3f({ kind: 'string' })],
+        ['stencilCompare', c3f({ kind: 'string' })],
+        ['stencilBothPass', c3f({ kind: 'string' })],
+        ['stencilDepthFail', c3f({ kind: 'string' })],
+        ['stencilDepthPassStencilFail', c3f({ kind: 'string' })],
+        ['stencilRefValue', c3f({ kind: 'int' })],
+        ['scissorOn', c3f({ kind: 'bool' })],
+        ['scissorX', c3f({ kind: 'number' })],
+        ['scissorY', c3f({ kind: 'number' })],
+        ['scissorW', c3f({ kind: 'number' })],
+        ['scissorH', c3f({ kind: 'number' })],
+        // System back-buffer size limit (AIR 64-bit desktop = 16384). Returns the
+        // platform limit; configureBackBuffer clamps to this upper bound.
+        ['maxBackBufferWidth', c3f({ kind: 'int' })],
+        ['maxBackBufferHeight', c3f({ kind: 'int' })],
       ]);
       for (let i = 0; i < 8; i++) {
         c3fields.set(`vb${i}`, c3f({ kind: 'object', className: 'VertexBuffer3D' }));
@@ -2168,12 +3451,17 @@ export class SymbolTable {
             { name: 'height', type: 'uint', defaultValue: null, isRest: false },
             { name: 'antiAlias', type: 'uint', defaultValue: null, isRest: false },
             { name: 'enableDepthAndStencil', type: 'Boolean', defaultValue: null, isRest: false },
+            { name: 'wantsBestResolution', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+            { name: 'wantsBestResolutionOnBrowserZoom', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           ])],
           ['clear', c3m({ kind: 'void' }, [
             { name: 'red', type: 'Number', defaultValue: null, isRest: false },
             { name: 'green', type: 'Number', defaultValue: null, isRest: false },
             { name: 'blue', type: 'Number', defaultValue: null, isRest: false },
             { name: 'alpha', type: 'Number', defaultValue: null, isRest: false },
+            { name: 'depth', type: 'Number', defaultValue: { kind: 'Num', value: 1, isInt: false }, isRest: false },
+            { name: 'stencil', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'mask', type: 'uint', defaultValue: { kind: 'Num', value: 4294967295, isInt: true }, isRest: false },
           ])],
           ['present', c3m({ kind: 'void' }, [])],
           ['drawTriangles', c3m({ kind: 'void' }, [
@@ -2196,18 +3484,26 @@ export class SymbolTable {
             { name: 'first', type: 'int', defaultValue: null, isRest: false },
             { name: 'texture', type: 'Texture', defaultValue: null, isRest: false },
           ])],
+          ['setSamplerStateAt', c3m({ kind: 'void' }, [
+            { name: 'sampler', type: 'int', defaultValue: null, isRest: false },
+            { name: 'wrap', type: 'String', defaultValue: null, isRest: false },
+            { name: 'filter', type: 'String', defaultValue: null, isRest: false },
+            { name: 'mipfilter', type: 'String', defaultValue: null, isRest: false },
+          ])],
           ['setVertexBufferAt', c3m({ kind: 'void' }, [
             { name: 'index', type: 'int', defaultValue: null, isRest: false },
             { name: 'buffer', type: 'VertexBuffer3D', defaultValue: null, isRest: false },
-            { name: 'bufferOffset', type: 'int', defaultValue: null, isRest: false },
-            { name: 'format', type: 'String', defaultValue: null, isRest: false },
+            { name: 'bufferOffset', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'format', type: 'String', defaultValue: { kind: 'Str', value: 'float4' }, isRest: false },
           ])],
           ['createVertexBuffer', c3m({ kind: 'object', className: 'VertexBuffer3D' }, [
             { name: 'numVertices', type: 'int', defaultValue: null, isRest: false },
             { name: 'data32PerVertex', type: 'int', defaultValue: null, isRest: false },
+            { name: 'bufferUsage', type: 'String', defaultValue: { kind: 'Str', value: 'staticDraw' }, isRest: false },
           ])],
           ['createIndexBuffer', c3m({ kind: 'object', className: 'IndexBuffer3D' }, [
             { name: 'numIndices', type: 'int', defaultValue: null, isRest: false },
+            { name: 'bufferUsage', type: 'String', defaultValue: { kind: 'Str', value: 'staticDraw' }, isRest: false },
           ])],
           ['createProgram', c3m({ kind: 'object', className: 'Program3D' }, [])],
           ['createTexture', c3m({ kind: 'object', className: 'Texture' }, [
@@ -2227,6 +3523,7 @@ export class SymbolTable {
             { name: 'format', type: 'String', defaultValue: null, isRest: false },
             { name: 'optimizeForRenderToTexture', type: 'Boolean', defaultValue: null, isRest: false },
           ])],
+          ['createVideoTexture', c3m({ kind: 'object', className: 'VideoTexture' }, [])],
           ['setCubeTextureAt', c3m({ kind: 'void' }, [
             { name: 'first', type: 'int', defaultValue: null, isRest: false },
             { name: 'texture', type: 'CubeTexture', defaultValue: null, isRest: false },
@@ -2245,27 +3542,58 @@ export class SymbolTable {
             { name: 'programType', type: 'String', defaultValue: null, isRest: false },
             { name: 'firstRegister', type: 'int', defaultValue: null, isRest: false },
             { name: 'data', type: 'Vector.<Number>', defaultValue: null, isRest: false },
-            { name: 'numRegisters', type: 'int', defaultValue: null, isRest: false },
+            { name: 'numRegisters', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false },
           ])],
           ['setDepthTest', c3m({ kind: 'void' }, [
             { name: 'depthMask', type: 'Boolean', defaultValue: null, isRest: false },
             { name: 'passCompareMode', type: 'String', defaultValue: null, isRest: false },
           ])],
           ['setCulling', c3m({ kind: 'void' }, [{ name: 'triangleFaceToCull', type: 'String', defaultValue: null, isRest: false }])],
-          ['dispose', c3m({ kind: 'void' }, [])],
+          ['dispose', c3m({ kind: 'void' }, [
+            { name: 'recreate', type: 'Boolean', defaultValue: { kind: 'Bool', value: true }, isRest: false },
+          ])],
           ['drawToBitmapData', c3m({ kind: 'void' }, [
             { name: 'destination', type: 'BitmapData', defaultValue: null, isRest: false },
           ])],
           ['setRenderToTexture', c3m({ kind: 'void' }, [
             { name: 'texture', type: 'Texture', defaultValue: null, isRest: false },
-            { name: 'enableDepthAndStencil', type: 'Boolean', defaultValue: null, isRest: false },
+            { name: 'enableDepthAndStencil', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+            { name: 'antiAlias', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'surfaceSelector', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
           ])],
           ['setRenderToBackBuffer', c3m({ kind: 'void' }, [])],
+          // setStencilActions: 5 params, all trailing three default to "keep"
+          // (AIR semantics; Starling's Painter calls with 2-3 args).
+          ['setStencilActions', c3m({ kind: 'void' }, [
+            { name: 'triangleFace', type: 'String', defaultValue: { kind: 'Str', value: 'frontAndBack' }, isRest: false },
+            { name: 'compareMode', type: 'String', defaultValue: { kind: 'Str', value: 'always' }, isRest: false },
+            { name: 'actionOnBothPass', type: 'String', defaultValue: { kind: 'Str', value: 'keep' }, isRest: false },
+            { name: 'actionOnDepthFail', type: 'String', defaultValue: { kind: 'Str', value: 'keep' }, isRest: false },
+            { name: 'actionOnDepthPassStencilFail', type: 'String', defaultValue: { kind: 'Str', value: 'keep' }, isRest: false },
+          ])],
+          // setScissorRectangle(null) disables scissoring.
+          ['setScissorRectangle', c3m({ kind: 'void' }, [
+            { name: 'rectangle', type: 'Rectangle', defaultValue: { kind: 'Null' }, isRest: false },
+          ])],
+          ['setStencilReferenceValue', c3m({ kind: 'void' }, [
+            { name: 'referenceValue', type: 'uint', defaultValue: null, isRest: false },
+            { name: 'readMask', type: 'uint', defaultValue: { kind: 'Num', value: 255, isInt: true }, isRest: false },
+            { name: 'writeMask', type: 'uint', defaultValue: { kind: 'Num', value: 255, isInt: true }, isRest: false },
+          ])],
         ]),
-        staticFields: new Map(), staticMethods: new Map(),
+        staticFields: new Map([
+          ['supportsVideoTexture', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'Context3D', isStatic: true, isConst: true }],
+        ]), staticMethods: new Map(),
         getters: new Map([
           ['driverInfo', c3g({ kind: 'string' })],
           ['profile', c3g({ kind: 'string' })],
+          // AIR exposes CL_totalGPUMemory as a read-only Number; Starling's
+          // StatsDisplay probes it with `"totalGPUMemory" in context` and drops
+          // the whole "gpu memory" row when the probe fails, so the property must
+          // exist (an approximation is fine, a missing property is not).
+          ['totalGPUMemory', c3g({ kind: 'number' })],
+          ['maxBackBufferWidth', c3g({ kind: 'int' })],
+          ['maxBackBufferHeight', c3g({ kind: 'int' })],
         ]),
         setters: new Map([
           ['enableErrorChecking', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Boolean', defaultValue: null, isRest: false }], owner: 'Context3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
@@ -2303,7 +3631,18 @@ export class SymbolTable {
         constructor: { params: [] }, superClass: 'EventDispatcher', isFinal: false, implements: [],
       });
     }
-    // pass 1: register class shells with their superclass link.
+    // flash.* built-in classes are keyed by their SHORT name and carry no source
+    // import list, so their method parameter types ('Event', 'Rectangle', ...) must
+    // resolve to the built-in short name — NOT the global typeAlias entry, which a
+    // same-named user class (e.g. starling.events.Event) overrides. Give each
+    // built-in an import alias mapping every built-in short name to itself so
+    // emit-time param resolution (paramDecls) picks the built-in type.
+    const builtinAlias = new Map<string, string>();
+    for (const n of this.classMap.keys()) if (this.classMap.get(n)!.packageName === undefined) builtinAlias.set(n, n);
+    for (const n of builtinAlias.keys()) this.classMap.get(n)!.importAlias = builtinAlias;
+    // pass 1: register class shells. superclass/implements are deferred to pass 1.5
+    // (after every class is registered) so wildcard imports can expand against the
+    // full classMap and per-file import context resolves short-name clashes.
     for (const stmt of program.body) {
       if (stmt.kind === 'ClassDecl') {
         const cname = fqn(stmt.name, stmt.packageName);
@@ -2315,12 +3654,45 @@ export class SymbolTable {
           getters: new Map(),
           setters: new Map(),
           constructor: { params: [] },
-          superClass: stmt.superClass ? (typeAlias.get(stmt.superClass) ?? stmt.superClass) : 'Object',
+          superClass: 'Object',
           isFinal: stmt.isFinal,
-          implements: stmt.implements.map((i) => typeAlias.get(i) ?? i),
+          isDynamic: stmt.isDynamic,
+          implements: [],
           packageName: stmt.packageName,
+          fqn: stmt.packageName ? `${stmt.packageName}::${stmt.name}` : stmt.name,
+          fileId: stmt.fileId ?? undefined,
         };
         this.classMap.set(cname, info);
+      }
+    }
+    // pass 1.5: resolve superclass + implements with per-file import context.
+    for (const stmt of program.body) {
+      if (stmt.kind === 'ClassDecl') {
+        const cname = fqn(stmt.name, stmt.packageName);
+        const info = this.classMap.get(cname)!;
+        const importAlias = buildImportAlias(stmt.imports, this.classMap);
+        info.importAlias = importAlias;
+        if (stmt.superClass) {
+          info.superClass = resolveType(stmt.superClass, importAlias).className;
+        }
+        info.implements = stmt.implements.map((i) => {
+          const t = resolveType(i, importAlias);
+          return t.kind === 'interface' ? t.name : (t.kind === 'object' ? t.className : i);
+        });
+      }
+    }
+    // pass 1.6: a class extending a dynamic class is itself dynamic in AS3 (the
+    // trait is inherited, not just declared), so propagate it along the super
+    // chain to a fixpoint. This runs for built-ins too, which is what makes a
+    // user subclass of `MovieClip` (a `dynamic class`) dynamic as AIR has it.
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const info of this.classMap.values()) {
+        if (info.isDynamic) continue;
+        if (this.classMap.get(info.superClass)?.isDynamic) {
+          info.isDynamic = true;
+          changed = true;
+        }
       }
     }
     // pass 2: direct fields / constructor / methods.
@@ -2330,9 +3702,11 @@ export class SymbolTable {
         const info = this.classMap.get(cname)!;
         for (const m of stmt.members) {
           if (m.kind === 'Field') {
-            const f: FieldInfo = { type: resolveType(m.type), init: m.init, visibility: m.visibility, owner: cname, isStatic: m.isStatic, isConst: m.isConst };
-            // const fields are implicitly class-level (static) in AS3.
-            if (m.isStatic || m.isConst) info.staticFields.set(m.name, f);
+            const f: FieldInfo = { name: m.name, type: resolveType(m.type, info.importAlias), init: m.init, visibility: m.visibility, owner: cname, isStatic: m.isStatic, isConst: m.isConst };
+            // Only `static` makes a field class-level in AS3. A bare `const` is an
+            // instance constant (each instance carries its own immutable value),
+            // e.g. `private const _textures:Vector.<Texture>`.
+            if (m.isStatic) info.staticFields.set(m.name, f);
             else info.fields.set(m.name, f);
           } else if (m.kind === 'Constructor') {
             info.constructor = { params: m.params };
@@ -2340,7 +3714,7 @@ export class SymbolTable {
         }
         for (const m of stmt.members) {
           if (m.kind === 'Method') {
-            const mi: MethodInfo = { returnType: resolveType(m.returnType), params: m.params, owner: cname, visibility: m.visibility, isStatic: m.isStatic, isFinal: m.isFinal, isGetter: m.isGetter, isSetter: m.isSetter, metadata: m.metadata };
+            const mi: MethodInfo = { returnType: resolveType(m.returnType, info.importAlias), params: m.params, owner: cname, visibility: m.visibility, isStatic: m.isStatic, isFinal: m.isFinal, isGetter: m.isGetter, isSetter: m.isSetter, metadata: m.metadata };
             // [WasmExport] on a method: only static methods lower to a `this`-free
             // C function callable from JS. Instance methods carry a leading
             // `void* _this` (plus GC-heap construction JS cannot perform) and
@@ -2353,11 +3727,13 @@ export class SymbolTable {
               this.exportList.push({
                 symbol: `${cname}_${m.name}_static`,
                 alias: we.args[0] ?? null,
-                returnType: resolveType(m.returnType),
-                params: m.params.map((p) => ({ name: p.name, type: resolveType(p.type) })),
+                returnType: resolveType(m.returnType, info.importAlias),
+                params: m.params.map((p) => ({ name: p.name, type: resolveType(p.type, info.importAlias) })),
               });
             }
-            if (m.isGetter) info.getters.set(m.name, mi);
+            if (m.isGetter && m.isStatic) (info.staticGetters ??= new Map()).set(m.name, mi);
+            else if (m.isGetter) info.getters.set(m.name, mi);
+            else if (m.isSetter && m.isStatic) (info.staticSetters ??= new Map()).set(m.name, mi);
             else if (m.isSetter) info.setters.set(m.name, mi);
             else if (m.isStatic) info.staticMethods.set(m.name, mi);
             else info.methods.set(m.name, mi);
@@ -2388,7 +3764,9 @@ export class SymbolTable {
         const intf = this.interfaceMap.get(iname);
         if (!intf) throw new CodegenError(`unknown interface '${iname}'`);
         for (const mname of intf.methods.keys()) {
-          if (!info.methods.has(mname)) {
+          const im = intf.methods.get(mname)!;
+          const impl = im.isGetter ? info.getters.get(mname) : im.isSetter ? info.setters.get(mname) : info.methods.get(mname);
+          if (!impl) {
             throw new CodegenError(`class '${name}' does not implement method '${mname}' of interface '${iname}'`);
           }
         }
@@ -2400,6 +3778,69 @@ export class SymbolTable {
   getFunc(name: string): FuncInfo | undefined { return this.funcMap.get(name); }
   hasClass(name: string): boolean { return this.classMap.has(name); }
   hasInterface(name: string): boolean { return this.interfaceMap.has(name); }
+
+  // Walk the superclass chain looking for a method/field/getter declared on the
+  // class or any ancestor (AS3 dispatches through the vtable, so an inherited
+  // method is still callable via `obj.method()` even when the receiver's static
+  // class does not declare it — e.g. `tween.hasOwnProperty(name)` inherited from
+  // Object). Returns the owning ClassInfo + the member, or undefined.
+  findMethod(cls: string, name: string): { owner: string; m: MethodInfo } | undefined {
+    let cur: string | null = cls;
+    const seen = new Set<string>();
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      const info = this.classMap.get(cur);
+      if (info) {
+        const m = info.methods.get(name);
+        if (m) return { owner: cur, m };
+        cur = info.superClass;
+      } else break;
+    }
+    return undefined;
+  }
+  // Look up an instance field's storage slot by AS3 name in one class's flattened
+  // map. The map is keyed by C slot name, so a name that shadows an inherited
+  // field (which owns a mangled slot) is translated through `fieldKeys` first.
+  fieldSlot(cls: string, name: string): FieldInfo | undefined {
+    const info = this.classMap.get(cls);
+    if (!info) return undefined;
+    const key = info.fieldKeys?.get(name);
+    if (key !== undefined) return info.fields.get(key);
+    return info.fields.get(name);
+  }
+
+  findField(cls: string, name: string): { owner: string; f: FieldInfo } | undefined {
+    let cur: string | null = cls;
+    const seen = new Set<string>();
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      const info = this.classMap.get(cur);
+      if (info) {
+        const f = this.fieldSlot(cur, name);
+        if (f) return { owner: cur, f };
+        cur = info.superClass;
+      } else break;
+    }
+    return undefined;
+  }
+
+  // The C member name of a field slot: `cName` once flattening named it, else the
+  // AS3 name itself (unshadowed fields are stored under their own name).
+  static fieldCName(f: FieldInfo, fallback: string): string { return f.cName ?? fallback; }
+  findGetter(cls: string, name: string): { owner: string; g: MethodInfo } | undefined {
+    let cur: string | null = cls;
+    const seen = new Set<string>();
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      const info = this.classMap.get(cur);
+      if (info) {
+        const g = info.getters.get(name);
+        if (g) return { owner: cur, g };
+        cur = info.superClass;
+      } else break;
+    }
+    return undefined;
+  }
 
   isSubclassOf(cls: string, base: string): boolean {
     let cur: string | null = cls;
@@ -2416,8 +3857,22 @@ export class SymbolTable {
     if (visibility === 'private') return owner === from;
     if (visibility === 'internal') {
       // visible within the same package (both top-level => null package).
-      const ownerPkg = this.classMap.get(owner)?.packageName ?? null;
-      const fromPkg = this.classMap.get(from)?.packageName ?? null;
+      const ownerInfo = this.classMap.get(owner);
+      const fromInfo = this.classMap.get(from);
+      const ownerPkg = ownerInfo?.packageName ?? null;
+      const fromPkg = fromInfo?.packageName ?? null;
+      // Same file (--air-app mode): a file's members see each other's internal
+      // members even across a package-block boundary (Starling puts helper classes
+      // like `AssetPostProcessor` after the `package { }` block of the same file).
+      if (ownerInfo?.fileId && ownerInfo.fileId === fromInfo?.fileId) return true;
+      // AS3 §5.1 places top-level definitions OUTSIDE any `package { ... }` block
+      // (e.g. Starling's `class AssetPostProcessor` after the AssetManager package
+      // block) into a per-file anonymous namespace visible only within that file.
+      // We don't track file boundaries in single-file mode, so a null-package
+      // owner's internal member is treated as visible everywhere: in practice these
+      // are in-file helper classes whose sole consumer is the same file's
+      // named-package class.
+      if (ownerPkg === null) return true;
       return ownerPkg === fromPkg;
     }
     // protected: accessible within the declaring class or a subclass
@@ -2426,23 +3881,62 @@ export class SymbolTable {
 
   private expandInheritance(name: string, visiting: Set<string> = new Set()): void {
     const info = this.classMap.get(name)!;
-    if (info.superClass === null) return;
+    if (info.superClass === null) {
+      // Base class (Object): the vtable slot list is just its own members.
+      info.vtableSlots = this.buildVtableSlots([], info.methods, info.getters, info.setters);
+      return;
+    }
     if (visiting.has(name)) throw new CodegenError(`circular inheritance involving '${name}'`);
     const superInfo = this.classMap.get(info.superClass);
     if (!superInfo) throw new CodegenError(`unknown superclass '${info.superClass}' of '${name}'`);
     if (superInfo.isFinal) throw new CodegenError(`cannot inherit from final class '${info.superClass}'`);
+    // Capture own members BEFORE flattening: expandInheritance overwrites
+    // info.methods/getters/setters with the flattened (super-first) maps below,
+    // but the vtable slot merge needs only the OWN members so overrides replace
+    // an inherited slot in place and new members append.
+    const ownMethods = info.methods;
+    const ownGetters = info.getters;
+    const ownSetters = info.setters;
     visiting.add(name);
     this.expandInheritance(info.superClass, visiting);
     visiting.delete(name);
-
+    const superInfo2 = this.classMap.get(info.superClass)!;
+    // Flatten inherited members into this class's maps (super-first order; own
+    // members override in place via Map.set preserving insertion position).
+    //
+    // Fields are the exception: their map is keyed by C SLOT name, and a field
+    // whose name collides with an inherited field gets its own mangled slot
+    // instead of overwriting the inherited entry. AS3 scopes a private member to
+    // its declaring class, so `private var _mask` in a subclass and `_mask` in
+    // its superclass are two distinct slots: methods of the base see the base's
+    // (reached through a base-typed pointer, hence the inherited slot must keep
+    // its name and offset in every subclass struct), while methods of the
+    // subclass see their own. Collapsing both onto one C member silently aliased
+    // them — a scene's own `_mask` became the stage mask of its DisplayObject
+    // base and stencil-clipped every sibling drawn after it.
     const fields = new Map<string, FieldInfo>();
-    for (const [f, v] of superInfo.fields) fields.set(f, v);
-    for (const [f, v] of info.fields) fields.set(f, v);
+    for (const [k, v] of superInfo2.fields) fields.set(k, v);
+    const fieldKeys = new Map<string, string>(superInfo2.fieldKeys ?? []);
+    for (const [k, v] of info.fields) {
+      // `f.owner === name` selects THIS class's own declarations: on a repeated
+      // flatten of an already-flattened class (expandInheritance has no memo) the
+      // iteration also sees inherited entries, which must not be re-processed.
+      if (v.owner !== name) continue;
+      const as3 = v.name ?? k;
+      let slot = v.cName;
+      if (slot === undefined) {
+        slot = fieldKeys.has(as3) ? `${as3}__${name.replace(/[^A-Za-z0-9_]/g, '_')}` : as3;
+        v.cName = slot;
+      }
+      fields.set(slot, v);
+      fieldKeys.set(as3, slot);
+    }
     info.fields = fields;
+    info.fieldKeys = fieldKeys;
 
     const methods = new Map<string, MethodInfo>();
-    for (const [m, v] of superInfo.methods) methods.set(m, v);
-    for (const [m, v] of info.methods) {
+    for (const [m, v] of superInfo2.methods) methods.set(m, v);
+    for (const [m, v] of ownMethods) {
       const overridden = methods.get(m);
       if (overridden && overridden.isFinal) {
         throw new CodegenError(`cannot override final method '${m}' of '${overridden.owner}'`);
@@ -2452,26 +3946,61 @@ export class SymbolTable {
     info.methods = methods;
 
     const staticFields = new Map<string, FieldInfo>();
-    for (const [f, v] of superInfo.staticFields) staticFields.set(f, v);
+    for (const [f, v] of superInfo2.staticFields) staticFields.set(f, v);
     for (const [f, v] of info.staticFields) staticFields.set(f, v);
     info.staticFields = staticFields;
 
     const staticMethods = new Map<string, MethodInfo>();
-    for (const [m, v] of superInfo.staticMethods) staticMethods.set(m, v);
+    for (const [m, v] of superInfo2.staticMethods) staticMethods.set(m, v);
     for (const [m, v] of info.staticMethods) staticMethods.set(m, v);
     info.staticMethods = staticMethods;
 
     const getters = new Map<string, MethodInfo>();
-    for (const [m, v] of superInfo.getters) getters.set(m, v);
-    for (const [m, v] of info.getters) getters.set(m, v);
+    for (const [m, v] of superInfo2.getters) getters.set(m, v);
+    for (const [m, v] of ownGetters) getters.set(m, v);
     info.getters = getters;
 
     const setters = new Map<string, MethodInfo>();
-    for (const [m, v] of superInfo.setters) setters.set(m, v);
-    for (const [m, v] of info.setters) setters.set(m, v);
+    for (const [m, v] of superInfo2.setters) setters.set(m, v);
+    for (const [m, v] of ownSetters) setters.set(m, v);
     info.setters = setters;
 
+    const staticGetters = new Map<string, MethodInfo>();
+    for (const [m, v] of superInfo2.staticGetters ?? []) staticGetters.set(m, v);
+    for (const [m, v] of info.staticGetters ?? []) staticGetters.set(m, v);
+    info.staticGetters = staticGetters;
+
+    const staticSetters = new Map<string, MethodInfo>();
+    for (const [m, v] of superInfo2.staticSetters ?? []) staticSetters.set(m, v);
+    for (const [m, v] of info.staticSetters ?? []) staticSetters.set(m, v);
+    info.staticSetters = staticSetters;
+
     // interfaces are inherited: a subclass implements its superclass's interfaces too.
-    info.implements = [...new Set([...superInfo.implements, ...info.implements])];
+    info.implements = [...new Set([...superInfo2.implements, ...info.implements])];
+
+    // Unified vtable slot list: start from the superclass's (already flattened)
+    // slots so inherited members keep their byte offset, then merge own members
+    // (override in place, append new) in the same kind order (method -> getter ->
+    // setter). This guarantees prefix-stable vtable layout across the chain.
+    info.vtableSlots = this.buildVtableSlots(superInfo2.vtableSlots ?? [], ownMethods, ownGetters, ownSetters);
+  }
+
+  // Build a prefix-stable vtable slot list: superclass slots first, then OWN
+  // members merged in place (an own member with the same kind+name as an inherited
+  // slot replaces it; anything new appends). ownMethods/getters/setters must be
+  // the OWN (pre-flattening) member maps of the class being built.
+  private buildVtableSlots(superSlots: VtableSlot[], ownMethods: Map<string, MethodInfo>, ownGetters: Map<string, MethodInfo>, ownSetters: Map<string, MethodInfo>): VtableSlot[] {
+    const slots: VtableSlot[] = [...superSlots];
+    const merge = (kind: VtableSlot['kind'], map: Map<string, MethodInfo>): void => {
+      for (const [mname, m] of map) {
+        const idx = slots.findIndex((s) => s.kind === kind && s.name === mname);
+        if (idx >= 0) slots[idx] = { kind, name: mname, info: m };
+        else slots.push({ kind, name: mname, info: m });
+      }
+    };
+    merge('method', ownMethods);
+    merge('getter', ownGetters);
+    merge('setter', ownSetters);
+    return slots;
   }
 }

@@ -121,6 +121,93 @@ directly onto the canvas. The pixels are premultiplied alpha: **opaque pixels ar
 pixels have a color shift (a difference between canvas semantics and Skia's premultiplied) — a known limitation
 (§6).
 
+### 3.2 Stage3D (WebGL2) Backend + GPU-Direct Presentation
+
+**Why it is required**: Starling renders **entirely** through `Context3D` (`drawTriangles` → offscreen render
+target → a final `present` that blits the render target onto the stage). Without a Stage3D backend the
+`as_s3d_*` wrappers all degrade to no-ops (no `ASC_RENDER_STAGE3D`) and `Context3D_present` blits an empty
+image — a blank page with no error at all. So "compile the Starling demo to web" implies "a web Stage3D
+backend must exist".
+
+| Concern | Notes |
+|---|---|
+| Backend | `vendor/stage3d_webgl.cc` (WebGL2/GLES3), implementing the **exact same flat `s3d_*` C API** as `stage3d_glue.mm` |
+| Shader language | chosen at build time by `ASC_AGAL_TARGET`: Metal emits MSL (target 0), web emits GLSL ES (target 1, `ASC_S3D_GLSL`) |
+| Build manifest | `ASC_RENDER_STAGE3D=1` + `ASC_S3D_GLSL=1` (link `vendor/stage3d_webgl.cc`); add `ASC_RENDER_DEPTH_STENCIL=1` when the app descriptor has `<depthAndStencil>` |
+| Detection | `detectStage3D(files)` in `src/air-app.ts` scans the sources; **both the native and web** targets use it |
+| Shared | the `Context3D` state machine, the `as_s3d_*` wrappers and the AGAL-translator call sites in the generated C are **identical on both ends** (backend differences live only in those two glue files) |
+
+**WebGL vs AS3/Metal differences (handled explicitly)**:
+
+1. **Y axis**: GL's render-target row 0 is at the **bottom**, AS3/Metal/`BitmapData` row 0 is at the **top**.
+   The GLSL vertex stage appends `gl_Position.y = -gl_Position.y;` — texture sampling keeps `v=0` = top
+   (matching AS3) and `glReadPixels` row order also aligns directly with the Skia canvas. Winding flips with
+   it, so GL keeps the default `GL_CCW` as front-facing (matching AS3's `Clockwise`).
+2. **Pixel byte order**: AS3's `uint32` pixel word is `0xAARRGGBB` (straight alpha) while GL's `RGBA8` needs a
+   BGRA↔RGBA swap on upload/readback.
+3. **Per-register constants**: `vc0..vcN`/`fc0..fcN` are each a `uniform vec4`, uploaded per register with
+   `glUniform4fv`.
+4. **Attribute slots**: `glBindAttribLocation(prog, i, "va<i>")` before linking, so `setVertexBufferAt(stream i)`
+   == GL attribute i with no lookup.
+5. **Depth/stencil**: a lazily created offscreen FBO (RGBA8 color + optional `DEPTH24_STENCIL8` renderbuffer),
+   with `glStencilFuncSeparate`/`glStencilOpSeparate` for `frontAndBack`.
+6. **Sampler state**: GL stores filter/wrap state **on the texture object**, so it is cached per texture object
+   (key = GL texture name) to avoid six `glTexParameteri` calls per draw.
+7. **Coexistence with Ganesh**: a **single shared WebGL2 context** (Emscripten's GL calls all target the current
+   context), so every `s3d_*` entry that touches GL calls `sk_gr_reset_context()` (a cheap dirty-flag mark);
+   otherwise Ganesh would reuse GL state we changed.
+8. **WebGL2 lacks `glGetTexLevelParameteriv`**: `GL_TEXTURE_WIDTH` is unavailable, so render-target texture
+   sizes are bookkept in an `S3DRtTex{id,width,height}` registry (`s3d_destroy_texture` removes them in sync).
+9. **Full-mask form of the AGAL compare instructions** (stage eighty-nine / thirty-two): MSL emits
+   `select(float4(0.0), float4(1.0), a >= b)` while GLSL ES 1.00 has no `select`, leaving
+   `mix(vec4(0.0), vec4(1.0), vec4(greaterThanEqual(a, b)))` as the only option — `mix(genType, genType, genType)`
+   is a legal ES 1.00 §8.3 overload and `vec4(bvec4)` (component-wise bool→float construction) is spelled out by
+   §5.4.2; conversely `mix(vec4, vec4, bvec4)` is an **ES 3.00-only** overload and does not compile under our
+   GLSL (no `#version` directive, so it is compiled as ES 1.00). ⚠️ Implementation-wise these two targets **must
+   not** share "one `sprintf` with a ternary format string": the two formats consume a different number of varargs
+   (MSL 4, GLSL 5) while the argument list is fixed, so it silently mis-reads into
+   `v0(greaterThanEqual(v0, vec4))` (`vec4` is a bare identifier) → `')' : syntax error`, killing all four opcodes
+   (`sge`/`slt`/`seq`/`sne`) on web — this is exactly what crashed Starling's "Switch Filter" (stage eighty-nine /
+   thirty-two). Each target needs its own `sprintf` call.
+
+**Presentation path (GPU-direct, stage eighty-nine / thirty-one)**: under
+`#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_GPU)`, `Context3D_present` takes the render-target handle
+(`ASC_stage3d_tex = as_s3d_get_render_target`); Metal goes through `as_skia_mtl_draw_texture` and GL goes
+through `sk_gl_draw_texture(canvas, texId, w, h, dx, dy, dw, dh)`. The latter wraps the render target's GL
+texture into a `GrBackendTexture` with `GrBackendTextures::MakeGL` (`GL_TEXTURE_2D` / `kRGBA_8888`) and, after
+`SkImages::BorrowTextureFrom` (`kTopLeft_GrSurfaceOrigin` / `kPremul`), `drawImageRect`s it straight into the
+Skia canvas, **no longer `glReadPixels`ing back to memory**. The readback path (`as_s3d_readback_render` +
+`as_skia_canvas_draw_bgra`) is kept as the fallback when `ASC_RENDER_GPU` is undefined.
+
+One pitfall on the way: **Ganesh resets the sampler state on the texture object when it samples an external
+texture**, while `stage3d_webgl.cc` caches filter/wrap state per texture object to avoid six `glTexParameteri`
+calls per draw. So `skia_glue.cc` exposes `sk_gr_set_texture_dirty_hook`, which calls back into
+`s3d_sampler_cache_invalidate()` after `drawImageRect` to clear every live context's
+`texStateN`/`samplerStateSet` — otherwise the next frame's draw assumes the GL parameters were already set and
+silently skips them.
+
+**Verification (`examples/air-starling-demo`)**: the page console shows
+`[Starling] Context ready. Display Driver: WebGL2 (Stage3D)` (a non-Stage3D build prints
+`Metal (Stage3D)` / `Software (state machine)` on the same line). All 12 scenes (Textures / Multitouch /
+TextFields / Animations / Custom hit-test / Movie Clip / Filters / Blend Modes / Render Texture / Benchmark /
+Masks / Sprite 3D) are entered one by one and match the AIR `adl` reference; the demo's white area is its own
+stage background, not a defect. Because stage coordinates == canvas CSS coordinates 1:1 (`noScale`, no offset),
+synthetic clicks in stage coordinates land correctly (e.g. Back button centre = (160, 467)).
+The GLSL target's shape is pinned by `examples/stage80.as` (which also asserts the full-mask compare form
+`ft5 = mix(vec4(0.0), vec4(1.0), vec4(greaterThanEqual(v0, v0)));` and the partial-mask component-ternary form).
+
+**Performance (same `-D ASC_FRAME_STATS=1` basis)**: on a 120 Hz panel the build measures **120 fps / 0
+discards**. With the readback+upload stage temporarily removed, the same scene costs only **0.047 ms/frame** —
+i.e. **CPU readback + upload used to be ~98% of the frame cost** (a 640×960 render target = 2.4 MB read back
+per frame). **After switching to GPU-direct (stage eighty-nine / thirty-one, same-session A/B)**: `renderMs`
+goes from **3.21 ms → 0.12–0.15 ms per frame (~23×)**, and it is **pixel-identical outside the `showStats`
+overlay box `(0,0,180,82)`**. (The `Benchmark` scene stalling at 0 objects on web is still the demo's own
+logic: it only adds objects once the measured fps is ≥ 99% of the target, independent of the render backend.)
+
+⚠️ Before comparing screenshots, make sure the canvas's CSS position is on an **integer** pixel: at a half
+pixel (e.g. x=272.5) the compositor resamples the canvas into the capture and two walks of the same code show
+a ~9–13 mean "phantom difference".
+
 ## 4. Fonts: Network Loading + Runtime Injection
 
 The wasm sandbox has no system fonts to enumerate, and the `CoreText` backend is unavailable. The web font
@@ -185,18 +272,41 @@ wrap 2^32), and `emit.ts`'s `convert`/`toInt32Expr`/`toUint32Expr` always use th
 sources, replacing all `(int)`/`(unsigned int)` casts. This guarantees that native/wasm/web all produce the
 same `Number→int` result for the same AS3 (e.g. `t.repeatCount = NaN` uniformly stores 0).
 
+Integer `%` is the same family (stage eighty-nine / thirty-one): AS3 defines the **zero divisor** (`5 % 0`
+yields `NaN` as a `Number`, `0` when received by an `int`; `INT_MIN % -1` yields `0`), while C's integer `%`
+is **undefined behavior** there — `-O2` silently folds it to the dividend and wasm **traps**
+(`integer divide by zero`, exit 134). `emit.ts` therefore routes `int % int` → `as_int_rem` and
+`uint % uint` → `as_uint_rem` (`b==0` → 0, `INT_MIN % -1` → 0); mixed/`Number` operands keep `fmod`, which is
+already NaN for a zero divisor. See `as3-semantics.md` §2/§3 for the one narrow divergence at dynamic use
+sites (`var x:* = a % 0`).
+
 ## 6. Known Limitations
 
 1. **Depends on network and font size**: fonts are `fetch`ed at runtime, unavailable offline/intranet; a full
    CJK font is large, and the first render waits for the download + FreeType scan to finish (large `.ttc`
    collections scan slowly; the example uses a 773KB Arial to demo English — for CJK, replace with a smaller
    glyph subset as needed).
+   - **The font is downloaded once** (stage eighty-nine / fifty-eight): the bytes come from the page's `fetch`,
+     so the copy a `preload-paths` root would sweep into the wasm FS is never read. `--air-app` therefore also
+     lists those fonts under `preload-excludes` (→ `emcc --exclude-file`), which takes them back out of
+     `<base>.data` — and **only** them: bitmap fonts (`.fnt` + atlas) are opened by the app through `File` and
+     stay in the image. Measured: `url-test.data` 7.9 MB → 4.5 KB, Starling exactly −`Ubuntu-R.ttf` (359668 B),
+     with text and asset loading unchanged on both.
 2. **Semi-transparent presentation has a color shift**: premultiplied alpha blitted directly to canvas — opaque
    is exact, semi-transparent has a shift (§3.1).
 3. **`emscripten_set_main_loop` blocks**: same as the SDL event loop, the frame loop is driven by the browser,
    and the program does not return from `stage.showWindow` until the page is closed.
 4. **WASI combination unchanged**: `--target wasm --package raw` is still a WASI command module without
    rendering; browser rendering only goes through `--package web`.
+5. **Stage3D presentation is now GPU-direct** (§3.2, stage eighty-nine / thirty-one): `sk_gl_draw_texture` wraps
+   the render target's GL texture into a `GrBackendTexture` and draws it straight into the canvas, **no longer
+   `glReadPixels`ing back to memory every frame**. Measured `renderMs` drops from 3.21 ms to 0.12–0.15 ms
+   (**~23×**) and the cost no longer grows linearly with the target area (the earlier 1280×2160 `Canvas3D` =
+   11 MB/frame ≈ 13 ms is no longer a problem). The readback path is kept as the fallback when
+   `ASC_RENDER_GPU` is undefined (the two are pixel-identical apart from one `showStats` overlay).
+   ⚠️ The one mandatory companion: Ganesh sampling an external texture changes that texture's sampler state,
+   so `sk_gr_set_texture_dirty_hook` must invalidate `stage3d_webgl.cc`'s per-texture sampler cache after
+   drawing (otherwise filter/wrap are silently skipped).
 
 ## 7. Toolchain Reuse
 

@@ -2,19 +2,20 @@
 //
 // Capabilities is a `final` static read-only class (same pattern as System): no
 // instantiable class, each getter maps to a compile-time constant, a conditional-
-// compile helper, or a fixed desktop-native value. `version` is the AS-AOT version
-// injected at codegen time from package.json (single source of truth). screen size
+// compile helper, or a fixed desktop-native value. `version` is a fixed AIR-compatible
+// "<platform-prefix> 50,0,0,0" (the AS-AOT marker lives in `manufacturer`). screen size
 // is 0 in headless builds (no SDL2 window backend) and the real display otherwise.
 // Deferred (platform/backend dependent): languages, serverString, hasMP3/hasTLS/
 // hasVideoEncoder, maxLevelIDC, hasAccessibility/hasIME, and hasMultiChannelAudio.
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 
-// --- version: compile-time injected from package.json, prefixed with "AS-AOT " ---
+// --- version: fixed AIR-compatible "<platform-prefix> 50,0,0,0" (AS-AOT marker is `manufacturer`) ---
 var v:String = Capabilities.version;
 check(v != null && v.length > 0, "version is non-empty");
-check(v.indexOf("AS-AOT ") == 0, "version starts with AS-AOT prefix: " + v);
-check(v.indexOf(".") > 0, "version looks like a semver: " + v);
+check(v.charAt(3) == " ", "version has platform prefix + space at index 3: " + v);
+check(v.indexOf(",") > 0, "version has comma-separated fields: " + v);
+check(parseInt(v.substr(4).split(",").shift()) >= 19, "version major >= 19: " + v);
 
 // --- os / cpuArchitecture: conditional-compile constants ---
 check(Capabilities.os != null && Capabilities.os.length > 0, "os non-empty");

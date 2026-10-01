@@ -9,6 +9,12 @@
 // in a runtime slot table and toString() serializes them as a query string.
 // Keyboard is a static key-code constant table; Mouse is static hide/show plus a
 // read-only cursor flag.
+//
+// Stage 89·48 completed the URLLoader/URLRequest surface; the full new API is
+// covered by examples/http-request-api.as and examples/urlloader-contract.as.
+// Stage 89·69 put contentType back to NULL: that IS AIR's default (adl-measured),
+// and the MIME string the reference lists is the wire default for a body-carrying
+// request, not the property value.
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 
@@ -45,7 +51,7 @@ bad.load(new URLRequest("/nonexistent/does/not/exist.txt"));
 check(!failed, "load does not dispatch IO_ERROR synchronously");
 tickTimers();
 check(failed, "load dispatches IO_ERROR on the next tick");
-check(bad.data == null, "failed load leaves data null");
+check(bad.data != null && bad.data == "", "failed load publishes an EMPTY value, not null (AIR)");
 
 // --- URLVariables: dynamic properties + toString serialization ---
 var vars:URLVariables = new URLVariables();

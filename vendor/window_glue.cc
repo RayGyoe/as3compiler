@@ -400,6 +400,12 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
           }
           // SIZE_CHANGED/RESIZED are handled by live_resize_watch during pump.
           break;
+        case SDL_MOUSEMOTION:
+          if (on_mouse) {
+            on_mouse((double)e.motion.x, (double)e.motion.y, "mouseMove");
+            dirty = 1;
+          }
+          break;
         case SDL_MOUSEBUTTONDOWN:
           if (e.button.button == SDL_BUTTON_LEFT && on_mouse) {
             on_mouse((double)e.button.x, (double)e.button.y, "mouseDown");
@@ -565,6 +571,12 @@ int sk_window_show_metal(int w, int h, const char* title, int fullscreen,
           break;
         case SDL_WINDOWEVENT:
           if (e.window.event == SDL_WINDOWEVENT_EXPOSED) dirty = 1;
+          break;
+        case SDL_MOUSEMOTION:
+          if (on_mouse) {
+            on_mouse((double)e.motion.x, (double)e.motion.y, "mouseMove");
+            dirty = 1;
+          }
           break;
         case SDL_MOUSEBUTTONDOWN:
           if (e.button.button == SDL_BUTTON_LEFT && on_mouse) {

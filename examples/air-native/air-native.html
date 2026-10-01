@@ -12,11 +12,27 @@
 <body>
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
 <script>
+// 页面级错误收集：wasm 加载失败、Promise 抛错都会落到这里，供人和自动化读取
+// （window.__ascErrors）。运行期错误如果只出现在控制台，自动化验收就看不见。
+window.__ascErrors = [];
+window.addEventListener('error', function (ev) { window.__ascErrors.push('error: ' + String(ev.message || ev.error)); });
+window.addEventListener('unhandledrejection', function (ev) { window.__ascErrors.push('unhandled rejection: ' + String(ev.reason)); });
 // 字体字节流 URL（网络加载 + 全量覆盖）：wasm 沙箱无系统字体，这些字体在
 // main() 运行前 fetch 并注入 Skia 的自定义 FreeType 字体管理器。
 var FONT_URLS = ["fonts/MiSans-Regular.ttf","fonts/Arial.ttf"];
 var Module = {
   canvas: document.getElementById('canvas'),
+  // trace() reaches stdout as printf, and these hooks keep it two ways: the
+  // browser console for a human, and window.__ascStdout for automation (the web
+  // verification harness reads assertions from there — a wasm page has no stdout).
+  print: function(line) {
+    (window.__ascStdout || (window.__ascStdout = [])).push(line);
+    console.log(line);
+  },
+  printErr: function(line) {
+    (window.__ascStderr || (window.__ascStderr = [])).push(line);
+    console.error(line);
+  },
   onRuntimeInitialized: async function() {
     for (var i = 0; i < FONT_URLS.length; i++) {
       try {
@@ -31,7 +47,19 @@ var Module = {
         console.warn('font load failed: ' + FONT_URLS[i], e);
       }
     }
-    Module._main();
+    // main() ends by calling emscripten_set_main_loop(..., simulateInfiniteLoop=1),
+    // which hands control back to the browser's rAF loop by unwinding the wasm
+    // stack -- its JS implementation returns by throwing the sentinel string
+    // 'unwind'. Emscripten's own run()/callMain() swallows that sentinel, but
+    // this page calls _main() directly from an async function, so an unswallowed
+    // 'unwind' shows up as a bogus "Uncaught (in promise)" in the console (and
+    // would mask any real throw from main()). Swallow exactly that sentinel;
+    // rethrow everything else so genuine failures stay visible.
+    try {
+      Module._main();
+    } catch (e) {
+      if (e !== 'unwind') throw e;
+    }
   }
 };
 </script>

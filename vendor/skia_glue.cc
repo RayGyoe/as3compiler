@@ -24,6 +24,15 @@
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkTypeface.h"
 #include "include/core/SkSpan.h"
+// E1 (opt-in, native-only): the SVG rasterizer needs the stream adapter and the
+// svg module. Both are guarded by ASC_USE_SVG -- see the forward declarations in
+// the bitmap/image section for why this is an opt-in enhancement.
+#ifdef ASC_USE_SVG
+#include "include/core/SkStream.h"
+#include "include/core/SkSize.h"
+#include "modules/svg/include/SkSVGDOM.h"
+#include "modules/svg/include/SkSVGSVG.h"
+#endif
 // Font backend is the one platform-coupled piece of the whole raster layer:
 // native (macOS) enumerates installed system fonts via CoreText; the wasm/web
 // sandbox has no system fonts to enumerate, so it injects TTF/OTF byte streams
@@ -47,6 +56,7 @@
 #include "include/gpu/GrBackendSurface.h"
 #include "include/gpu/GrDirectContext.h"
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"
 #include "include/gpu/ganesh/gl/GrGLMakeWebGLInterface.h"
 #include "include/gpu/ganesh/gl/GrGLDirectContext.h"
 #include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
@@ -157,6 +167,66 @@ void* sk_surface_gpu_new(int width, int height) {
 // uninitialized magenta slivers and half-drawn, misplaced tiles.
 void sk_gr_flush(void) {
   if (g_gr_context) g_gr_context->flushAndSubmit(GrSyncCpu::kNo);
+}
+
+// Mark Ganesh's cached GL state stale after external code (the Stage3D WebGL
+// backend in stage3d_webgl.cc, which binds its own FBO/VAO/program on the shared
+// WebGL2 context) has touched it. Skia caches "what is currently bound", so
+// without this the next Ganesh op would draw with the wrong program/texture/attrib
+// state. Setting the dirty bit is cheap — the state is re-established lazily on
+// Ganesh's next operation, unlike flushAndSubmit which would force a submission.
+void sk_gr_reset_context(void) {
+  if (g_gr_context) g_gr_context->resetContext();
+}
+
+// Ganesh applies sampler state to the *texture object* it samples (GL keeps
+// filter/wrap per texture, not per sampler object), so after Skia samples a
+// texture that the Stage3D backend also binds, the backend's "this texture is
+// already LINEAR/CLAMP" cache is stale. sk_gl_draw_texture therefore fires a
+// hook so the Stage3D glue can drop that cache; stage3d_webgl.cc registers its
+// invalidator from s3d_create. A callback (rather than a direct call) keeps
+// skia_glue.cc from depending on the Stage3D glue, which is absent from
+// non-Stage3D web builds (air-native).
+static void (*g_gr_texture_dirty_hook)(void) = nullptr;
+
+void sk_gr_set_texture_dirty_hook(void (*fn)(void)) {
+  g_gr_texture_dirty_hook = fn;
+}
+
+// Draw an externally-owned GL texture directly onto the current Ganesh canvas —
+// the GPU→GPU counterpart of sk_mtl_draw_texture, used to composite the Stage3D
+// offscreen render target behind the 2D display list with no CPU readback and no
+// CPU→GPU re-upload. The texture is borrowed (Skia wraps, does not own it) and
+// Stage3D re-renders into it in place every frame, so this samples the LIVE
+// texture rather than a snapshot.
+//
+// The render target is GL_TEXTURE_2D / GL_RGBA8 (what stage3d_webgl.cc
+// allocates) and holds the image TOP-DOWN: the Stage3D vertex program negates
+// clip-space Y, so row 0 of the render target is the visual top — the same
+// layout as Metal's textures and as Skia's own canvas — hence
+// kTopLeft_GrSurfaceOrigin. (FBO 0 is the opposite case: GL's row 0 is the
+// bottom row there, which is why sk_surface_gpu_new wraps it kBottomLeft.)
+void sk_gl_draw_texture(void* canvas, unsigned textureId, int w, int h,
+                        double dx, double dy, double dw, double dh) {
+  if (canvas == nullptr || textureId == 0 || g_gr_context == nullptr) return;
+  if (w <= 0 || h <= 0) return;
+  GrGLTextureInfo glInfo;
+  glInfo.fTarget = 0x0DE1;  // GL_TEXTURE_2D
+  glInfo.fID = textureId;
+  glInfo.fFormat = 0x8058;  // GL_RGBA8 — must match the attached texture's internal format
+  GrBackendTexture backendTex = GrBackendTextures::MakeGL(
+      w, h, skgpu::Mipmapped::kNo, glInfo);
+  if (!backendTex.isValid()) return;
+  sk_sp<SkImage> img = SkImages::BorrowTextureFrom(
+      g_gr_context.get(), backendTex, kTopLeft_GrSurfaceOrigin,
+      kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr);
+  if (!img) return;
+  SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
+  ((SkCanvas*)canvas)->drawImageRect(img.get(), dst, SkSamplingOptions());
+  // Ganesh may retune this texture's GL filter/wrap while executing the draw
+  // above (during the next flushAndSubmit), which invalidates the Stage3D
+  // backend's per-texture sampler cache — tell it to re-apply on next use.
+  if (g_gr_texture_dirty_hook) g_gr_texture_dirty_hook();
 }
 #endif  // __EMSCRIPTEN__
 
@@ -398,39 +468,153 @@ void sk_canvas_save_layer_paint_bounds(void* canvas, void* paint,
 
 // ---------- bitmap / image ----------
 
+// E1 (opt-in, native-only): SVG is NOT an SkCodec format, so the whole
+// DeferredFromEncodedData pipeline that serves PNG/JPEG/GIF/WebP/BMP/ICO has
+// nothing to say about it -- Loader.load("x.svg") reports the same #2124
+// "unknown type" AIR does (verified against adl 51.4.1). Rendering one means a
+// different pipeline: parse to an SkSVGDOM and rasterize through a canvas.
+//
+// That makes it an ENHANCEMENT (AIR never supported SVG at all), and per
+// AGENTS.md §1.5 enhancements are opt-in: the declarations below only exist
+// when the build defines ASC_USE_SVG, so the default build keeps AIR's behavior
+// byte for byte. Implementations live further down, next to the font manager
+// (an SVG with <text> renders with the same platform fonts as TextField).
+//
+// Native only: vendor/skia/lib/wasm ships no svg/sksg/expat static libraries at
+// all, so a web build that defines ASC_USE_SVG fails at link time instead of
+// silently dropping the feature.
+#ifdef ASC_USE_SVG
+static bool sk_svg_header(const void* data, size_t len);
+static sk_sp<SkImage> sk_svg_to_image(const void* data, size_t len, int* outW, int* outH);
+static void* sk_svg_to_argb(const void* data, size_t len, int* width, int* height);
+#endif
+
 void* sk_image_from_file(const char* path) {
   auto data = SkData::MakeFromFileName(path);
   if (!data) return nullptr;
   // m124: SkImage::MakeFromEncoded -> SkImages::DeferredFromEncodedData.
   auto image = SkImages::DeferredFromEncodedData(data);
+#ifdef ASC_USE_SVG
+  // Only after the codec path has definitively failed: SVG is the fallback for
+  // "not an encoded image", never a competing decoder for one.
+  if (!image && sk_svg_header(data->data(), data->size())) {
+    image = sk_svg_to_image(data->data(), data->size(), nullptr, nullptr);
+  }
+#endif
   return image.release();  // caller owns one ref (or NULL on decode failure)
+}
+
+// SkImage view of an image that is already in memory, i.e. one that arrived over
+// the network (Loader.load of an http(s):// URL) rather than from a file. The
+// bytes are COPIED into the SkData: the caller's buffer belongs to the async job
+// and is released when the job retires, while a deferred SkImage can outlive it
+// (the display-list Bitmap keeps the view for as long as it is on the stage, and
+// the actual pixel decode happens lazily, at first draw).
+void* sk_image_from_bytes(const void* data, size_t len) {
+  if (data == nullptr || len == 0) return nullptr;
+  auto skdata = SkData::MakeWithCopy(data, len);
+  if (!skdata) return nullptr;
+  auto image = SkImages::DeferredFromEncodedData(skdata);
+#ifdef ASC_USE_SVG
+  if (!image && sk_svg_header(data, len)) {
+    image = sk_svg_to_image(data, len, nullptr, nullptr);
+  }
+#endif
+  return image.release();  // caller owns one ref (or NULL on decode failure)
+}
+
+// ---- Skia -> runtime pixel boundary ----
+//
+// The runtime's canonical BitmapData layout is a uint32 holding 0xAARRGGBB with
+// straight (un-premultiplied) alpha. Skia's own native layout, kN32_SkColorType,
+// differs BY PLATFORM (BGRA on Windows, RGBA on macOS/Linux -- see
+// SkColorType.h + SK_PMCOLOR_BYTE_ORDER in SkTypes.h), so the generated C must
+// never assume a byte order of a Skia surface. Every read-back therefore requests
+// kBGRA_8888 EXPLICITLY and the host-endian interpretation is settled here, in
+// one place, where Skia does the channel conversion for us: on a little-endian
+// host a BGRA byte sequence read as a uint32 already IS 0xAARRGGBB, so the
+// explicit request alone fixes the order with no per-pixel pass.
+//
+// (Assuming a BGRA-equivalent order on the generated-C side is exactly what
+// swapped red and blue in BitmapData.draw(TextField) -- see
+// examples/bitmapdraw-channel.as.)
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+// Big-endian host: bytes B,G,R,A interpret as 0xBBGGRRAA, so compose the ARGB
+// word explicitly. No such target exists today; kept for correctness.
+static void sk_bgra_readback_to_argb(uint32_t* buf, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    uint32_t p = buf[i];
+    buf[i] = ((p & 0xFFu) << 24) | (((p >> 8) & 0xFFu) << 16) |
+             (((p >> 16) & 0xFFu) << 8) | ((p >> 24) & 0xFFu);
+  }
+}
+#else
+// Little-endian host: BGRA bytes already read as 0xAARRGGBB, nothing to do.
+static void sk_bgra_readback_to_argb(uint32_t*, size_t) {}
+#endif
+
+// Read a surface back into the runtime's straight-ARGB (0xAARRGGBB) uint32
+// buffer (`dst` holds width*height words). kUnpremul yields AS3's straight-alpha
+// semantics in the same step, so no manual un-premultiply pass is needed.
+int sk_surface_read_argb(void* surface, uint32_t* dst, int width, int height) {
+  if (surface == nullptr || dst == nullptr || width <= 0 || height <= 0) return 0;
+  SkImageInfo info = SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kUnpremul_SkAlphaType);
+  if (!((SkSurface*)surface)->readPixels(info, dst, (size_t)width * 4, 0, 0)) return 0;
+  sk_bgra_readback_to_argb(dst, (size_t)width * (size_t)height);
+  return 1;
 }
 
 // Decode an image file into a freshly malloc'd ARGB (0xAARRGGBB) uint32 buffer,
 // returning the buffer (caller frees) or NULL on failure. *width/*height receive
 // the image dimensions. This mirrors AS3 BitmapData's `pixels` layout so
-// BitmapData_loadFile can populate the CPU pixel buffer directly (the raw bytes
-// Skia hands back are RGBA, so each pixel is swizzled to ARGB here).
-void* sk_image_decode_rgba(const char* path, int* width, int* height) {
+// BitmapData_loadFile can populate the CPU pixel buffer directly.
+void* sk_image_decode_argb(const char* path, int* width, int* height) {
   auto data = SkData::MakeFromFileName(path);
   if (!data) return nullptr;
   auto image = SkImages::DeferredFromEncodedData(data);
+#ifdef ASC_USE_SVG
+  if (!image && sk_svg_header(data->data(), data->size())) {
+    return sk_svg_to_argb(data->data(), data->size(), width, height);
+  }
+#endif
   if (!image) return nullptr;
   int w = image->width(), h = image->height();
   if (w <= 0 || h <= 0) return nullptr;
   size_t n = (size_t)w * (size_t)h;
   uint32_t* buf = (uint32_t*)malloc(n * 4);
   if (!buf) return nullptr;
-  // Unpremultiplied (straight) alpha matches AS3's ARGB semantics.
-  SkImageInfo info = SkImageInfo::Make(w, h, kRGBA_8888_SkColorType, kUnpremul_SkAlphaType);
-  uint8_t* tmp = (uint8_t*)malloc(n * 4);
-  if (!tmp) { free(buf); return nullptr; }
-  if (!image->readPixels(info, tmp, (size_t)w * 4, 0, 0)) { free(tmp); free(buf); return nullptr; }
-  for (size_t i = 0; i < n; i++) {
-    uint8_t r = tmp[i * 4 + 0], g = tmp[i * 4 + 1], b = tmp[i * 4 + 2], a = tmp[i * 4 + 3];
-    buf[i] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+  // Decode straight into the ARGB buffer -- no staging copy, no per-pixel loop:
+  // kBGRA_8888 + little-endian is already 0xAARRGGBB, and kUnpremul gives AS3's
+  // straight alpha.
+  SkImageInfo info = SkImageInfo::Make(w, h, kBGRA_8888_SkColorType, kUnpremul_SkAlphaType);
+  if (!image->readPixels(info, buf, (size_t)w * 4, 0, 0)) { free(buf); return nullptr; }
+  sk_bgra_readback_to_argb(buf, n);
+  *width = w; *height = h;
+  return buf;
+}
+
+// Decode an image from an in-memory byte buffer (ByteArray / Loader.loadBytes)
+// into a freshly malloc'd ARGB uint32 buffer, mirroring sk_image_decode_argb.
+// Returns NULL on failure and sets *width/*height on success.
+void* sk_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) {
+  if (data == nullptr || len == 0) return nullptr;
+  auto skdata = SkData::MakeWithCopy(data, len);
+  if (!skdata) return nullptr;
+  auto image = SkImages::DeferredFromEncodedData(skdata);
+#ifdef ASC_USE_SVG
+  if (!image && sk_svg_header(data, len)) {
+    return sk_svg_to_argb(data, len, width, height);
   }
-  free(tmp);
+#endif
+  if (!image) return nullptr;
+  int w = image->width(), h = image->height();
+  if (w <= 0 || h <= 0) return nullptr;
+  size_t n = (size_t)w * (size_t)h;
+  uint32_t* buf = (uint32_t*)malloc(n * 4);
+  if (!buf) return nullptr;
+  SkImageInfo info = SkImageInfo::Make(w, h, kBGRA_8888_SkColorType, kUnpremul_SkAlphaType);
+  if (!image->readPixels(info, buf, (size_t)w * 4, 0, 0)) { free(buf); return nullptr; }
+  sk_bgra_readback_to_argb(buf, n);
   *width = w; *height = h;
   return buf;
 }
@@ -508,6 +692,86 @@ static sk_sp<SkFontMgr> sk_platform_fontmgr() {
   return cached;
 }
 #endif
+
+#ifdef ASC_USE_SVG
+// SVG's own default viewport when the document declares no width/height (the
+// SVG spec's replaced-element default, 300x150). AIR has no SVG support whose
+// behavior could be copied here, so the spec's number is the honest choice.
+#define SK_SVG_DEFAULT_W 300
+#define SK_SVG_DEFAULT_H 150
+
+// Cheap sniff, run only AFTER the codec path has already failed. "Not an
+// encoded image" is a normal outcome (any non-image payload), so the SVG test
+// must not cost a parse attempt on data that is plainly not XML: an SVG/XML
+// payload starts with '<' once leading whitespace and a UTF-8 BOM are skipped.
+static bool sk_svg_header(const void* data, size_t len) {
+  if (data == nullptr || len == 0) return false;
+  const unsigned char* p = (const unsigned char*)data;
+  size_t i = 0;
+  if (len >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) i = 3;
+  while (i < len && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' || p[i] == '\r')) i++;
+  return i < len && p[i] == '<';
+}
+
+// Rasterize an SVG document to a premultiplied N32 image, or null when it cannot
+// be parsed. Sizes to the document's own width/height when it declares one,
+// otherwise to the spec default above. The same font manager the rest of the
+// raster layer uses is handed to the parser, so <text> renders with platform
+// fonts instead of vanishing.
+static sk_sp<SkImage> sk_svg_to_image(const void* data, size_t len, int* outW, int* outH) {
+  auto skdata = SkData::MakeWithCopy(data, len);
+  if (!skdata) return nullptr;
+  auto stream = SkMemoryStream::Make(skdata);
+  if (!stream) return nullptr;
+  // The Builder form is what this Skia revision exposes: MakeFromStream(str)
+  // alone would leave the font manager unset, and an SVG's <text> then renders
+  // as nothing at all (documented on Builder::setFontManager).
+  auto dom = SkSVGDOM::Builder().setFontManager(sk_platform_fontmgr()).make(*stream);
+  if (!dom) return nullptr;
+
+  SkSize intrinsic = dom->containerSize();
+  SkScalar w = intrinsic.width();
+  SkScalar h = intrinsic.height();
+  if (!(w > 0)) w = SK_SVG_DEFAULT_W;
+  if (!(h > 0)) h = SK_SVG_DEFAULT_H;
+  dom->setContainerSize(SkSize::Make(w, h));
+
+  SkImageInfo info = SkImageInfo::Make(SkScalarRoundToInt(w), SkScalarRoundToInt(h),
+                                       kN32_SkColorType, kPremul_SkAlphaType);
+  auto surface = SkSurfaces::Raster(info);
+  if (!surface) return nullptr;
+  // An SVG has no background of its own; start transparent so a document that
+  // paints nothing (or only part of the viewport) does not read back as opaque
+  // black, which is what an uninitialized surface would give.
+  surface->getCanvas()->clear(SK_ColorTRANSPARENT);
+  dom->render(surface->getCanvas());
+  auto image = surface->makeImageSnapshot();
+  if (!image) return nullptr;
+  if (outW) *outW = image->width();
+  if (outH) *outH = image->height();
+  return image;
+}
+
+// Adapter for the BitmapData-side entry points: rasterize, then copy into the
+// runtime's straight-ARGB (0xAARRGGBB) uint32 layout exactly as the codec
+// decoders do (kBGRA_8888 + kUnpremul + the one endianness settle), so an SVG
+// BitmapData is indistinguishable from a PNG one to everything downstream.
+static void* sk_svg_to_argb(const void* data, size_t len, int* width, int* height) {
+  sk_sp<SkImage> image = sk_svg_to_image(data, len, nullptr, nullptr);
+  if (!image) return nullptr;
+  int w = image->width(), h = image->height();
+  if (w <= 0 || h <= 0) return nullptr;
+  size_t n = (size_t)w * (size_t)h;
+  uint32_t* buf = (uint32_t*)malloc(n * 4);
+  if (!buf) return nullptr;
+  SkImageInfo info = SkImageInfo::Make(w, h, kBGRA_8888_SkColorType, kUnpremul_SkAlphaType);
+  if (!image->readPixels(info, buf, (size_t)w * 4, 0, 0)) { free(buf); return nullptr; }
+  sk_bgra_readback_to_argb(buf, n);
+  if (width) *width = w;
+  if (height) *height = h;
+  return buf;
+}
+#endif  // ASC_USE_SVG
 
 // The CoreText font manager enumerates and sorts every installed font family on
 // construction, so it must be created once, not per draw call: a multi-line

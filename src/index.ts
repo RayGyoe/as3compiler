@@ -5,14 +5,14 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { dirname, resolve, basename } from 'node:path';
+import { dirname, resolve, basename, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parser.ts';
 import { generateC, type ExportedSymbol } from './codegen.ts';
 import { ctypeToString } from './symbols.ts';
 import type { Program } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, buildCompileSteps, runCompile, wasmToolchainError, buildWebCompileSteps, webToolchainError, webCompileStepsEnv } from './build.ts';
-import type { BuildConfig, Target, Package } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, wasmToolchainError, buildWebCompileSteps, webToolchainError, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures } from './build.ts';
+import type { BuildConfig, Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp } from './air-app.ts';
 import { generateXcodeProject } from './xcode-project.ts';
 
@@ -28,7 +28,7 @@ interface Options {
 
 function parseArgs(argv: string[]): Options {
   const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, overrides: {} };
-  const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'exports', v: string): void => {
+  const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'features' | 'exports' | 'frameworks' | 'sources', v: string): void => {
     (opts.overrides[key] ??= [] as string[]).push(v);
   };
   for (let i = 0; i < argv.length; i++) {
@@ -43,10 +43,32 @@ function parseArgs(argv: string[]): Options {
     else if (a === '--air-app') opts.airApp = argv[++i];
     else if (a === '--main-class') opts.mainClass = argv[++i];
     else if (a === '--opt') opts.overrides.opt = argv[++i];
+    else if (a === '--lto') opts.overrides.lto = true;
+    else if (a === '--pgo') {
+      const v = argv[++i];
+      if (v !== 'generate' && v !== 'use') {
+        throw new Error(`--pgo expects 'generate' or 'use' (got ${v === undefined ? 'nothing' : `'${v}'`})`);
+      }
+      opts.overrides.pgo = v;
+    }
+    else if (a === '--pgo-dir') opts.overrides.pgoDir = argv[++i];
     else if (a === '-I') push('includePaths', argv[++i]);
     else if (a === '-L') push('linkPaths', argv[++i]);
     else if (a === '-l') push('linkLibs', argv[++i]);
     else if (a === '-D') push('defines', argv[++i]);
+    // --features <a,b>: named enhancement switches (AIR supersets, §1.5).
+    // Repeatable and/or comma-separated; `none` clears. Stored raw here — the
+    // `none`-vs-absent distinction is resolved in main(), because it decides
+    // whether the generated manifest's persisted set is kept or wiped.
+    else if (a === '--features') {
+      const v = argv[++i];
+      if (v === undefined) {
+        throw new Error(`--features expects a comma-separated list (e.g. --features svg; --features none to clear)`);
+      }
+      for (const f of v.split(',').map((s) => s.trim()).filter((s) => s !== '')) push('features', f);
+    }
+    else if (a === '--framework') push('frameworks', argv[++i]);
+    else if (a === '--source') push('sources', argv[++i]);
     else if (a === '--export') push('exports', argv[++i]);
     else if (a === '--help' || a === '-h') {
       console.log(usage());
@@ -81,21 +103,61 @@ function usage(): string {
     '  -L <dir>       library search path (repeatable)',
     '  -l <lib>       link library (repeatable)',
     '  -D <macro>     preprocessor define (repeatable)',
+  '  --features <list> enable an AIR-superset enhancement (comma-separated, repeatable;',
+  '                 `none` clears). Default builds stay AIR-identical.',
+  `                 known: ${knownFeatures().join(', ')} (see docs/zh-cn/enhancements.md)`,
+  '  --framework <n> link a macOS framework (repeatable; distinct from clang -F, which is a search path)',
+    '  --source <f>   extra C/C++ source to compile and link (repeatable)',
     '  --export <name> export a C symbol into the .wasm export table (repeatable)',
     '  --opt <flags>  optimization flags (default: -O2)',
+    '  --lto          add -flto to every compile step and the link step (E12)',
+    '  --pgo <phase>  profile-guided optimization: generate | use (E12; pair with --pgo-dir)',
+    '  --pgo-dir <d>  profile directory for --pgo (the two phases must name the same one)',
     '  --dry          emit C and print the compile command without compiling',
     '  -h, --help     show this help',
   ].join('\n');
 }
 
+// --features resolution. The three outcomes are deliberately distinct:
+//   null → the flag was absent, so the manifest's persisted set stands (this is
+//          what makes a once-chosen feature stick across --air-app runs);
+//   []   → `--features none`, i.e. wipe the persisted set;
+//   set  → exactly these features, replacing the persisted one (not appending —
+//          a feature is a set membership, and append would make "svg was on, I
+//          want only lottie" inexpressible).
+// Duplicates are dropped: `--features svg --features svg` or a comma-list that
+// repeats a name must not emit its macro twice.
+function resolveFeatures(raw: string[] | undefined): string[] | null {
+  if (!raw) return null;
+  const hasNone = raw.includes('none');
+  if (hasNone && raw.length > 1) {
+    throw new Error(
+      `--features 'none' cannot be combined with other names (got '${raw.join(',')}'): 'none' clears every feature`
+    );
+  }
+  return hasNone ? [] : [...new Set(raw)];
+}
+
 function main(): void {
   const opts = parseArgs(process.argv.slice(2));
 
+  // Resolve --features to the explicit set for THIS invocation, keeping "absent"
+  // (null → keep whatever the manifest persists) distinct from "clear" ([] →
+  // `--features none`). Runs before --air-app below, because the adapter writes
+  // the set into the generated manifest: if it read a stale set it would undo the
+  // user's choice on the very next run.
+  const explicitFeatures = resolveFeatures(opts.overrides.features);
+
   // Build config: manifest first, then CLI overrides win (TypePHP's rule).
+  // `loadedManifest`/`loadedManifestPath` are kept past the base merge so the
+  // per-target overlay can be applied once the effective target is known.
   const cfg = defaultBuildConfig();
+  let loadedManifest: Manifest | null = null;
+  let loadedManifestPath: string | null = null;
   if (opts.manifest) {
-    const m = loadManifest(opts.manifest);
-    Object.assign(cfg, applyManifest(cfg, m, opts.manifest));
+    loadedManifest = loadManifest(opts.manifest);
+    loadedManifestPath = opts.manifest;
+    Object.assign(cfg, applyManifest(cfg, loadedManifest, opts.manifest));
   }
 
   // Read + parse all AS3 input. Two modes:
@@ -111,16 +173,56 @@ function main(): void {
     const vendorAbs = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
     // --package web selects the browser backend for the generated manifest; the
     // window backend (SDL2/Cocoa) is native-only and cannot link under wasm-ld.
-    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web');
-    const m = loadManifest(air.manifestPath);
-    Object.assign(cfg, applyManifest(cfg, m, air.manifestPath));
+    // `opts.output` reaches the adapter because the web preload set must not sweep
+    // this build's own output dir into the page's FS image (see findPreloadPaths).
+    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output);
+    // The adapter reports what it can see but must not silently ship (e.g. a web
+    // build whose text has no font to draw with). Yellow, not red: the build is
+    // still usable, but the output would be wrong in a way the user cannot guess.
+    for (const w of air.warnings) process.stderr.write(`\x1b[33mwarning: ${w}\x1b[0m\n`);
+    loadedManifest = loadManifest(air.manifestPath);
+    loadedManifestPath = air.manifestPath;
+    Object.assign(cfg, applyManifest(cfg, loadedManifest, air.manifestPath));
 
     program = { body: [], imports: [] };
     const boot = parse(generateBootstrap(air.info, air.mainClass));
     program.body.push(...boot.body);
     program.imports.push(...boot.imports);
+    const srcDir = resolve(dirname(opts.airApp), 'src');
     for (const f of air.asFiles) {
       const p = parse(readFileSync(f, 'utf8'));
+      const rel = relative(srcDir, f).replace(/\\/g, '/');
+      const fileId = rel.replace(/\.as$/i, '').replace(/[^A-Za-z0-9_]/g, '_');
+      // Every top-level class/interface declared in this file (for same-file
+      // visibility below).
+      const fileClasses: { name: string; packageName: string | null }[] = [];
+      for (const stmt of p.body) {
+        if (stmt.kind === 'ClassDecl' || stmt.kind === 'InterfaceDecl') {
+          fileClasses.push({ name: stmt.name, packageName: stmt.packageName });
+        }
+      }
+      // AS3 §5.1: a definition outside any `package { }` block lives in a per-file
+      // anonymous namespace. Give those a unique file-scoped package so their C
+      // keys can't collide with built-ins (e.g. Polygon.as's `class Rectangle` vs
+      // `flash.geom.Rectangle`). Every class records its source file for
+      // same-file internal visibility.
+      for (const stmt of p.body) {
+        if (stmt.kind === 'ClassDecl' || stmt.kind === 'InterfaceDecl') {
+          stmt.fileId = fileId;
+          if (stmt.packageName === null) stmt.packageName = fileId;
+        }
+      }
+      // Same-file visibility: a file's members are visible to each other without
+      // an explicit import. Append every same-file class's FQN to each class's
+      // import list so the import-aware resolver can see them.
+      for (const stmt of p.body) {
+        if (stmt.kind === 'ClassDecl' || stmt.kind === 'InterfaceDecl') {
+          for (const fc of fileClasses) {
+            const fqnStr = fc.packageName === null ? `${fileId}.${fc.name}` : `${fc.packageName}.${fc.name}`;
+            if (!stmt.imports.includes(fqnStr)) stmt.imports.push(fqnStr);
+          }
+        }
+      }
       program.body.push(...p.body);
       program.imports.push(...p.imports);
     }
@@ -140,13 +242,30 @@ function main(): void {
     inputLabel = opts.inputs.join(', ');
   }
 
+  // Per-target overlay (阶段八十九·五十): a single manifest may declare
+  // `targets.<name>` blocks that REPLACE the shared top-level build fields for
+  // one target — e.g. link curl natively but drop it for wasm. Applied here,
+  // after the base manifest merge but before the CLI overrides, so the block is
+  // selected by the *final* target (`--target` can change it) while CLI flags
+  // still beat both the base manifest and any layer (TypePHP's rule).
+  if (loadedManifest && loadedManifestPath) {
+    const effectiveTarget = (opts.overrides.target ?? cfg.target) as Target;
+    Object.assign(cfg, applyManifestOverlay(cfg, loadedManifest, loadedManifestPath, effectiveTarget));
+  }
+
   // CLI overrides win over the manifest (both --manifest and --air-app).
   if (opts.overrides.target) cfg.target = opts.overrides.target;
   if (opts.overrides.package) cfg.package = opts.overrides.package;
   if (opts.overrides.cCompiler) cfg.cCompiler = opts.overrides.cCompiler;
   if (opts.overrides.opt) cfg.opt = opts.overrides.opt;
+  if (opts.overrides.lto !== undefined) cfg.lto = opts.overrides.lto;
+  if (opts.overrides.pgo) cfg.pgo = opts.overrides.pgo;
+  if (opts.overrides.pgoDir) cfg.pgoDir = opts.overrides.pgoDir;
   if (opts.overrides.dry) cfg.dry = true;
-  for (const k of ['includePaths', 'linkLibs', 'linkPaths', 'defines', 'exports'] as const) {
+  // Unlike -D (which appends to the manifest's defines), --features REPLACES the
+  // set: see resolveFeatures for why.
+  if (explicitFeatures) cfg.features = explicitFeatures;
+  for (const k of ['includePaths', 'linkLibs', 'linkPaths', 'defines', 'exports', 'frameworks', 'sources'] as const) {
     const extra = opts.overrides[k];
     if (extra) cfg[k].push(...extra);
   }
@@ -159,15 +278,26 @@ function main(): void {
   if (!VALID_TARGETS.includes(cfg.target)) {
     throw new Error(`unknown --target '${cfg.target}' (expected: native | wasm; write \`wasm\` without a dot)`);
   }
+  // A feature the backend cannot link must fail here, in the project's own words,
+  // not as an unresolved-symbol dump from the linker.
+  validateFeatures(cfg.features, cfg.target);
   if (!VALID_PACKAGES.includes(cfg.package)) {
     throw new Error(`unknown --package '${cfg.package}' (expected: raw | xcode-project | android-project | web)`);
   }
 
   console.log(`== as-aot: AS3 subset -> C -> ${cfg.target} ==`);
+  // An enhancement that is ON must never be silent (§1.5): it is what separates
+  // this artifact from what `adl` would do with the same input, so name it and
+  // show the macro that carries it.
+  if (cfg.features.length > 0) {
+    const macros = featureMacros(cfg.features);
+    console.log(`== enhancements: ${cfg.features.join(', ')} (${macros.map((m) => `-D ${m}`).join(' ')}) ==`);
+    console.log('   ^ AIR superset: adl rejects these inputs; a default build stays AIR-identical');
+  }
   console.log(`[1/4] read        ${inputLabel}`);
   console.log('[2/4] parse       tokenize + AST');
   console.log('[3/4] codegen     emit C source');
-  const { c, exports } = generateC(program, { asAotVersion: readAsAotVersion() });
+  const { c, exports } = generateC(program);
   writeFileSync(cPath, c);
 
   // [WasmExport] declarations are auto-exported: append their C symbols (or alias
@@ -296,19 +426,6 @@ function main(): void {
   }
 }
 
-// Read the compiler's own version from package.json (single source of truth),
-// injected at codegen time as Capabilities.version. Falls back to an empty string
-// if the file is missing or unreadable, so library use never throws.
-function readAsAotVersion(): string {
-  try {
-    const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), '../package.json');
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-    return typeof pkg.version === 'string' ? pkg.version : '';
-  } catch {
-    return '';
-  }
-}
-
 // Run a .wasm under whatever WASI runtime is installed. There is no single
 // blessed runtime the way there is for native binaries, so probe a shortlist.
 function runWasm(wasmPath: string): void {
@@ -368,11 +485,27 @@ function writeWebIndex(base: string, fontUrls: string[]): string {
 <body>
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
 <script>
+// 页面级错误收集：wasm 加载失败、Promise 抛错都会落到这里，供人和自动化读取
+// （window.__ascErrors）。运行期错误如果只出现在控制台，自动化验收就看不见。
+window.__ascErrors = [];
+window.addEventListener('error', function (ev) { window.__ascErrors.push('error: ' + String(ev.message || ev.error)); });
+window.addEventListener('unhandledrejection', function (ev) { window.__ascErrors.push('unhandled rejection: ' + String(ev.reason)); });
 // 字体字节流 URL（网络加载 + 全量覆盖）：wasm 沙箱无系统字体，这些字体在
 // main() 运行前 fetch 并注入 Skia 的自定义 FreeType 字体管理器。
 var FONT_URLS = ${fontArray};
 var Module = {
   canvas: document.getElementById('canvas'),
+  // trace() reaches stdout as printf, and these hooks keep it two ways: the
+  // browser console for a human, and window.__ascStdout for automation (the web
+  // verification harness reads assertions from there — a wasm page has no stdout).
+  print: function(line) {
+    (window.__ascStdout || (window.__ascStdout = [])).push(line);
+    console.log(line);
+  },
+  printErr: function(line) {
+    (window.__ascStderr || (window.__ascStderr = [])).push(line);
+    console.error(line);
+  },
   onRuntimeInitialized: async function() {
     for (var i = 0; i < FONT_URLS.length; i++) {
       try {
@@ -387,7 +520,19 @@ var Module = {
         console.warn('font load failed: ' + FONT_URLS[i], e);
       }
     }
-    Module._main();
+    // main() ends by calling emscripten_set_main_loop(..., simulateInfiniteLoop=1),
+    // which hands control back to the browser's rAF loop by unwinding the wasm
+    // stack -- its JS implementation returns by throwing the sentinel string
+    // 'unwind'. Emscripten's own run()/callMain() swallows that sentinel, but
+    // this page calls _main() directly from an async function, so an unswallowed
+    // 'unwind' shows up as a bogus "Uncaught (in promise)" in the console (and
+    // would mask any real throw from main()). Swallow exactly that sentinel;
+    // rethrow everything else so genuine failures stay visible.
+    try {
+      Module._main();
+    } catch (e) {
+      if (e !== 'unwind') throw e;
+    }
   }
 };
 </script>
@@ -405,5 +550,6 @@ try {
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
   process.stderr.write(`\x1b[31m${msg}\x1b[0m\n`);
+  if (err instanceof Error && err.stack) process.stderr.write(err.stack + '\n');
   process.exit(1);
 }

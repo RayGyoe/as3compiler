@@ -72,10 +72,25 @@ Key division of labor (see [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md)
   - When not installed, an actual `--target wasm` compile reports a clear "WASI toolchain missing" message
     (with install instructions) instead of leaking clang's low-level `'stdio.h' file not found`; `--dry` can
     still preview the compile command.
-  - AS3 exceptions (`throw`/`try`/`catch`/`finally`) map to `setjmp`/`longjmp` in the generated C; WASI does
-    not support them by default, so wasm compilation appends `-mllvm -wasm-enable-sjlj` (the WebAssembly
-    exception-handling proposal). The resulting artifact requires an exception-handling-capable runtime such
-    as wasmtime/wasmer; wasm3 does not support this proposal.
+  - AS3 exceptions (`throw`/`try`/`catch`/`finally`) map to `setjmp`/`longjmp` in the generated C, and on
+    WASI that machinery rides on the WebAssembly exception-handling proposal, so a wasm compile appends three
+    switches:
+    - `-mllvm -wasm-enable-sjlj` — LLVM lowers `setjmp`/`longjmp` to `__wasm_setjmp`/`__wasm_longjmp`
+      (`longjmp` throws a tag; the frame that called `setjmp` catches it). wasip1's libc has no such symbols;
+    - `-mllvm -wasm-use-legacy-eh=false` — use the **standard** EH instructions (`try_table`). The lowering
+      defaults to the legacy `try`, which wasmtime rejects by default (`legacy_exceptions feature required
+      for try instruction`) and which browsers never implemented;
+    - `-lsetjmp`, placed after the objects — wasi-libc keeps `__wasm_setjmp`/`__wasm_longjmp`/
+      `__wasm_setjmp_test` in a **separate** `libsetjmp.a`, not in libc.a.
+    The latter two are added only when the build layer finds `lib/wasm32-wasip1/libsetjmp.a` in the sysroot;
+    without it the historical flags are kept and a program that really needs exceptions still fails **loudly**
+    (`wasm-ld: undefined symbol __wasm_setjmp`) rather than degrading silently.
+  - The artifact needs a runtime with the **standard** exception-handling proposal: wasmtime ≥ 24 works out of
+    the box, as do Chrome/Edge 119+, Firefox 131+ and Safari 18.4+; wasm3 and legacy-EH-only runtimes cannot
+    run programs with exceptions (programs without exceptions are unaffected — see below).
+  - Programs without exceptions are **byte-for-byte** as before: `-lsetjmp` is a static archive, so unreferenced
+    members never enter the artifact (`examples/hello.as` produces an identical code section with or without
+    the new switches).
 
 ## 3. Command-line Usage
 
@@ -208,6 +223,83 @@ as-aot app.as -I vendor/include -L vendor/lib -l skia -D USE_SKIA=1
 as-aot app.as --manifest examples/skia-link.build.example.json
 ```
 
+#### 3.4.1 Named enhancement switches (`--features` / manifest `features`)
+
+One level above `-D`: it turns on an **AIR-superset capability** by name instead of making the user
+spell out the macro behind it. The name states what it is (an enhancement, not AIR behavior); the
+macro is resolved by the compiler.
+
+```bash
+as-aot app.as --air-app app.xml --features svg      # same as -D ASC_USE_SVG=1
+as-aot app.as --air-app app.xml --features none     # clear (also clears a persisted choice)
+```
+
+| Name | Macro | Targets | Notes |
+|---|---|---|---|
+| `svg` | `ASC_USE_SVG=1` | `native` only | see §3.4.2 |
+
+The manifest field of the same name is a **string array** and means the same thing:
+
+```json
+{ "features": ["svg"] }
+```
+
+Three rules, all in service of *never being silent* (AGENTS.md §1.5):
+
+- **Off by default**: without it the artifact is **byte-for-byte** what it was, matching `adl`.
+  When on, the build prints `== enhancements: svg (-D ASC_USE_SVG=1) ==` and says the build is an
+  AIR superset.
+- **An unknown name is an error**, not ignored: `--features lottie` reports
+  `unknown feature 'lottie' (known: svg)` and exits **before generating any code**. Only channels
+  that actually exist end to end are registered -- offering a switch that does nothing would give
+  the user something that looks enabled and is not compiled in. `--features none` may not be
+  combined with other names.
+- **Unsupported target is an error**: `--target wasm --features svg` reports
+  `feature 'svg' is not available with --target wasm` rather than leaving
+  `undefined symbol: sk_svg_*` to the linker.
+
+`--features` vs `-D`: `-D` **appends** a macro, `--features` **replaces** the whole enhancement set --
+"svg was on, I want only something else" can only be expressed by replacement.
+
+#### 3.4.1.1 `--air-app` persists the enhancement choice
+
+`--air-app` **rewrites** the generated `<filename>.build.json` in full on every run (it is a build
+artifact derived from app.xml plus the src scan). A chosen enhancement therefore has to survive that
+rewrite, otherwise "turn SVG on" could only ever be expressed by repeating the flag every time --
+which is the reason this switch exists.
+
+- `--features svg` writes `"features": ["svg"]` into the generated manifest; **a later run without
+  the flag keeps it**, and prints `enhancements carried over from ...: svg` (**not silent**).
+- To turn it off: `--features none` (clears, and persists the clear).
+- Only `features` is carried over: every other field is a function of the descriptor and sources, and
+  resurrecting a stale generated value (a dropped define, an old link library) would be a silently
+  wrong build.
+
+#### 3.4.2 SVG decoding is an opt-in macro (`ASC_USE_SVG`)
+
+Encoded images (PNG/JPEG/GIF/BMP/WebP/ICO) need no macro -- both Skia builds already carry those
+codecs. **SVG is different**: it is not an `SkCodec` format (it goes through a separate
+`SkSVGDOM` parse -> `SkSurface` rasterize path), and AIR's `Loader` **never supported SVG**, so per
+§1.5 it is opt-in:
+
+```bash
+# native: one command (libsvg/libsksg/libexpat are already in the manifest's link-libs)
+as-aot app.as --air-app app.xml --features svg
+
+# equivalent spelling (the named switch is just resolving this macro for you)
+as-aot app.as --air-app app.xml -D ASC_USE_SVG=1
+```
+
+| Build | `Loader.load("x.svg")` |
+|---|---|
+| default | `ioError #2124 Error #2124: Loaded file is an unknown type.` -- verbatim what `adl` says |
+| `--features svg` (= `-D ASC_USE_SVG=1`) | decodes (`<text>` renders via `SkFontMgr`; a document with no absolute size uses the spec default 300x150) |
+
+**Not supported on web**: `vendor/skia/lib/wasm` has no `libsvg.a`/`libsksg.a`/`libexpat.a` (the wasm
+`args.gn` sets `skia_use_expat=false`, which gates the whole svg target), so defining the macro fails at
+**link time** -- an explicit error, never a silent downgrade. Supporting it means changing the wasm
+`args.gn` and **rebuilding wasm Skia**. See [`enhancements.md`](enhancements.md) §4.1.
+
 ### 3.5 AIR Application Descriptor (--air-app)
 
 Parse an AIR `app.xml`, automatically generate bootstrap startup code + build manifest, and migrate a
@@ -274,20 +366,26 @@ kebab-case.
 | `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | Distribution form, default `raw` (§6); `web` requires `target=wasm`, producing browser artifacts (see [`html5-web.md`](html5-web.md)) |
 | `c-compiler` | string | C compiler, default `cc` |
 | `opt` | string | Optimization flags, default `-O2` |
+| `lto` | boolean | Default `false`. When `true`, adds `-flto` to **every compile step and the link step** (see §4.1); leaving it unset keeps the command and the artifact byte-for-byte what they were |
+| `pgo` | `"generate" \| "use"` | Phase of profile-guided optimization, off by default. `generate` builds an **instrumented** binary (running it writes profile data); `use` rebuilds with the data from the same directory (see §4.1) |
+| `pgo-dir` | string | Profile directory shared by the two `pgo` phases (relative to the manifest dir). Clang reads `<dir>/default.profdata`, so both phases **must name the same one** |
 | `sources` | string[] | Extra C/C++ source files (compiled together with the generated `.c`) |
 | `include-paths` | string[] | Header search paths (→ `-I`) |
 | `link-libs` | string[] | Libraries to link (→ `-l`) |
 | `link-paths` | string[] | Library search paths (→ `-L`) |
 | `defines` | string[] | Preprocessor macros (→ `-D`) |
+| `features` | string[] | **Named enhancement switches** (§3.4.1), e.g. `["svg"]`. Empty by default. An unknown name is an error; when on, the build banner names it, and when off the artifact matches `adl`. On the CLI `--features` **replaces** the whole set (`-D` is the one that appends) |
 | `objects` | string[] | Precompiled `.o` added directly to the link |
 | `frameworks` | string[] | macOS frameworks (→ `-framework X`, needed for Skia's CoreText/CoreGraphics backend) |
 | `font-urls` | string[] | Font byte-stream URL list (`--package web` writes it into `index.html`, network-loaded and injected into Skia at runtime; see [`html5-web.md`](html5-web.md) §4) |
+| `preload-paths` | string[] | Data roots packed into the wasm FS image, `src@dest` or a bare path (`--package web` only; the browser sandbox starts with an empty FS, so `File`/`FileStream` would see nothing at all) |
+| `preload-excludes` | string[] | Host paths or fnmatch patterns **removed** from that image (→ `emcc --exclude-file`; also `--package web` only). A directory preload has no per-file opt-out, so files that must not ship are named here instead; patterns match the **host path** the preload walk yields (absolute), so they resolve relative to the manifest dir too. A path containing `*?[` is a PATTERN, not a literal (`weird[1].png` drops the unrelated `weird1.png`); escape it as `[[]` `[]]` `[*]` `[?]` to match literally. A pattern that matches nothing is silently ignored. `--air-app` uses it to pull the page-fetched fonts back out of the FS (see [`html5-web.md`](html5-web.md) §6) |
 | `bundle-id` | string | app identifier (`--package xcode-project` fills `Info.plist`'s `CFBundleIdentifier`, default `com.example.<product>`) |
 | `display-name` | string | app display name (fills `CFBundleName`, default product name) |
 | `icon` | string | `.icns` path (relative to manifest dir, copied into `Resources` + fills `CFBundleIconFile`) |
 | `deployment-target` | string | macOS minimum version (fills `MACOSX_DEPLOYMENT_TARGET`, default `12.0`) |
 
-Path-type fields (`sources` / `include-paths` / `link-paths` / `objects`) resolve **relative to the directory
+Path-type fields (`sources` / `include-paths` / `link-paths` / `objects` / `preload-excludes`) resolve **relative to the directory
 containing the manifest file** (same as TypePHP's YAML path rule). See
 [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json):
 
@@ -312,6 +410,60 @@ containing the manifest file** (same as TypePHP's YAML path rule). See
 
 **Priority**: CLI arguments override same-named manifest fields (mirroring TypePHP's "CLI beats YAML").
 Merge order: default config → manifest → CLI overrides.
+
+### 4.1 Link-time and profile-guided optimization (`lto` / `pgo`)
+
+These two are **build-level switches, not language features**: the frontend still only translates AS into
+readable C and hand-writes no optimization at all (§1.1); `-flto` and the profile data are consumed by the
+system `cc/clang -O2 -flto`. They therefore sit at the same layer as `opt` and are settable both from the
+manifest and from the CLI (`--lto` / `--pgo` / `--pgo-dir`). **Both default to off** — unset, the artifact is
+exactly what it was.
+
+```bash
+# LTO only (one command)
+as-aot Main.as --air-app app.xml --lto
+
+# PGO: instrument -> run to collect -> merge -> rebuild with the profile
+as-aot bench.as --pgo generate --pgo-dir prof -o bench.gen
+./bench.gen                                    # run writes prof/default_*.profraw
+llvm-profdata merge -o prof/default.profdata prof/*.profraw
+as-aot bench.as --lto --pgo use --pgo-dir prof -o bench
+```
+
+The manifest spelling is equivalent:
+
+```json
+{ "opt": "-O2", "lto": true, "pgo": "use", "pgo-dir": "prof" }
+```
+
+Points that matter:
+
+- **`-flto` must be on the compile steps AND the link step**: the compile step emits bitcode, and the
+  cross-module inlining happens at link time. Emitting it on only one side does not error — it just
+  **silently does nothing** — so `perfFlags()` is the single source and all four command builders take it from
+  there, with per-step assertions plus a reverse control (drop any step and the suite fails immediately).
+- **Both phases must name the same `pgo-dir`**: clang's directory form reads `<dir>/default.profdata`. A
+  missing profile is a **hard build error** (`Error in reading profile ...: No such file or directory`), never a
+  silent fallback to an unprofiled build.
+- **No `-fprofile-correction` is emitted**: that is a GCC flag; clang only warns
+  `not supported [-Wignored-optimization-argument]` and ignores it, so emitting it would add noise to every
+  PGO build for nothing.
+- **Valid on both backends**: native (`cc`/`clang`) and web (`emcc`) both accept `-flto`, and the suite
+  asserts it on **every step** of each. The `--target wasm` (raw WASI) path passes the flags through as well,
+  but **no WASI SDK is installed on this machine, so it is untested there**.
+
+Measured (`temp/perf/`, a call-heavy 900k-iteration loop, median of five runs):
+
+| Build | Checksum | Wall time | Artifact |
+|---|---|---|---|
+| `-O2` (default) | −1664902176 | ~30.6 ms | 33464 B |
+| `-O2 -flto` | −1664902176 | ~25.6 ms | 33456 B |
+| `-O2 -flto -fprofile-use` | −1664902176 | ~25.5 ms | 33464 B |
+
+All three checksums are **identical** (faster, not different), and `-flto` is about 16% faster on this
+single-translation-unit call-heavy workload. Layering PGO on top showed no measurable gain here (within
+noise) — this workload's branches are simple, and PGO pays off on programs with **many branches / indirect
+calls**; it should not be sold as a general speedup.
 
 ## 5. Multi-target Backends
 

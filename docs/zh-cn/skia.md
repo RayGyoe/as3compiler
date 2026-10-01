@@ -59,6 +59,36 @@ Skia 的一切围绕 `SkCanvas`（画布）组织。绘制调用 `canvas->drawRe
 
 **坐标系**：Skia 原点在左上、**y 轴向下**——与 Flash 的显示坐标系一致，翻译时无需翻转。
 
+### 2.1 像素字节序边界：`kN32` 因平台而异（务必显式指定）
+
+`BitmapData.pixels` 在运行时里是 `uint32` 数组，存的是**数值** `0xAARRGGBB`（straight alpha）。而 Skia 的
+「原生」格式 `kN32_SkColorType` 只是**平台相关**别名：
+
+| 平台 | `SK_R32_SHIFT` | `kN32` 的内存字节序 |
+|------|----------------|----------------------|
+| Windows | 16 | B,G,R,A（`kBGRA_8888`） |
+| macOS / Linux | 0 | R,G,B,A（`kRGBA_8888`） |
+
+（依据 `include/core/SkTypes.h` 的 `SK_R32_SHIFT` + `SK_PMCOLOR_BYTE_ORDER(R,G,B,A)` 展开，与
+`include/core/SkColorType.h` 的 `kN32_SkColorType` 定义。）
+
+因此**生成的 C 绝不能假设 Skia surface / `SkBitmap` 的字节序**——「看起来像 BGRA」只在 Windows 成立。
+所有「Skia ↔ 运行时」的读回都统一请求 `kBGRA_8888` + `kUnpremul`，端序解析收敛在 `skia_glue.cc` 一处：
+小端主机上 B,G,R,A 的字节序列按 `uint32` 读出**已经就是** `0xAARRGGBB`，于是「显式指定」这一件事就把
+通道序定死了、无需逐像素循环；`kUnpremul` 同时给出 AS3 的 straight alpha，省掉手工反预乘。只有大端主机
+才需要显式重组（`__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__` 分支，当前无此目标）。
+
+历史教训：`BitmapData.draw(TextField)` 的读回曾直接按 `q[0]=B, q[2]=R` 取通道（把 `kN32` 当成 BGRA），
+在 macOS 上把红蓝互换（红背景 `TextField` 被读成蓝色）。回归：`examples/bitmapdraw-channel.as`。
+
+同类边界还有两处，处理原则一致：
+
+- **图像解码**（`sk_image_decode_argb` / `sk_image_decode_bytes_argb`）：`readPixels` 直接写进 ARGB 缓冲，
+  不再经临时缓冲 + 逐像素 swizzle。
+- **Stage3D 纹理上传**（`stage3d_glue.mm` 的 `s3d_upload_texture`）：目标是 `MTLPixelFormatBGRA8Unorm`，
+  小端下与运行时缓冲字节序**天然一致**，直接 `replaceRegion` 即可（旧代码那次 malloc + swizzle 在小端上
+  是逐字节空转）。
+
 ---
 
 ## 3. 关键决策：Skia 没有 C API，必须加 C++ 胶水层
@@ -286,13 +316,51 @@ SDL 2.26 才加入）正是修复跨屏倍率 bug 的依赖，说明 2.32 对本
   行高与 textWidth，段落级对齐/字间距天然可用。
 - 语义漂移收敛为两个边缘情况：SkParagraph 会在超长单词/连字符处断行，AIR `wordWrap` 仅空格断行、
   超长单词整词溢出；CJK 逐字断行两者一致。已在注释/文档记录为已知限制。
+- **第三处漂移（阶段八十九·二十八发现，阶段八十九·六十六修复）——断行阈值少减 4px 内边距**：字号/字体一致时
+  两者**逐词墨迹宽度完全相同**（Starling demo `TextFields` 场景第三字段实测：`... or centered. Embedded fonts`
+  五个词的墨迹宽度 AOT/AIR 均为 25/32/154/178/81 px、词间距也一致），差异只在**断点本身**：Skia 侧 6 词行宽
+  591 px（按字段 600 px 排版）故把 `are` 留在第一行，AIR 却在 5 词处换行。
+  当时把它归因于「AIR 把**行尾空格**算进候选宽度」——**这个归因是错的**。阶段八十九·六十六做了受控扫描
+  （`temp/tfwrap/`，同一组 TextField 只扫字段宽度，读 `numLines`，第一个 `numLines == 1` 的宽度即阈值）：
+
+  | 文本 | AIR 阈值 | 修前 | 修后 |
+  |---|---|---|---|
+  | `"Multitouch"`（无空格） | 129 | 125 | **129** |
+  | `"Multitouch "`（1 个尾空格） | 129 | 125 | **129** |
+  | `"Multi touch"`（词间空格） | 138 | 134 | **138** |
+  | `"Multitouch  "`（2 个尾空格） | 129 | 125 | **129** |
+  | `"Multitouch Multitouch"` | 263 | 259 | **263** |
+  | `"Multitouch  Multitouch"` | 271 | 267 | **271** |
+
+  尾空格的有无/多少**完全不影响 AIR 的阈值**（三档 0/1/2 个尾空格都是 129），所以「行尾空格」不是原因。
+  真因是**可用宽度要减掉 AIR 的 2px 内边距**：阈值恒为 `ceil(ink + 4)`——`124.945+4→129`、`133.383+4→138`、
+  `258.328+4→263`、`266.766+4→271`，六项**逐值命中**。修前我们按未减内边距的字段宽度排版，故边界上晚一个词。
+  这个 4px 不是新约定：`autoSize`（`width = textWidth + 4`）与 `maxScrollH`（`over = textWidth + 4 - width`）
+  早已按它写，**只有断行阈值一处漏减**。修复见阶段八十九·六十六，`test.ts` 有 `[textwrap]` 结构钉子。
+  > 另注：`textWidth` 对带尾空格的文本，AIR 含尾空格（`"Multitouch "` = 133）、我们不含（恒 124.945）。
+  > 这是**另一个**独立的口径差异，**不影响断行**（见上表），已按 §1.5 记入 `TODO.md` 遗留表。
 - AIR 的 `maxScrollV`/`scrollV` 是「视口行」语义（`numLines - visibleLines + 1`，`scrollV = maxScrollV`
   让最新行贴底），仍由运行时层计算；SkParagraph 只负责「排」与「画」，符合 §2.9 铁律。
 - 同样**没有自研光栅化**：shaping/断行/绘制全部交给 SkParagraph，自研的只有「缓存失效 key」这一层。
 
-SkParagraph 的富文本能力（`htmlText`、多 `TextFormat` 区间样式、对齐/字间距/多段落）仍待后续子阶段
-（当前落地单一 `defaultTextFormat` 扁平样式）。当前未做：`autoSize`/`hscroll`/`selectable`/`leading`。
-断言式回归见 `examples/textflow.as`。
+SkParagraph 的富文本能力（`htmlText`、多 `TextFormat` 区间样式、对齐/字间距/多段落）均已落地：`htmlText`
+解析 `<font>`/`<b>`/`<i>`/`<u>`/`<p>`/`<br>` 子集并生成「字节区间 + `TextFormat`」run 列表，`setTextFormat`
+以同样机制追加 run；`sk_textlayout_new_runs` 按 run 顺序 `pushStyle`/`addText`/`pop`，run 之间的间隙回落到
+段落默认样式（= `runs[0]` 的字体/字号，颜色取自 `defaultTextFormat`）。`autoSize`/`hscroll`/`selectable`/`leading`
+亦已落地，断言式回归见 `examples/textrich.as`（`examples/textflow.as` 为布局基线）。
+
+**两条与 AIR 对齐的语义细节（阶段八十九·二十八修复）**：
+
+1. **`.text = ...` 替换整段内容**：AIR 的 `.text` 赋值会丢弃此前 `htmlText`/`setTextFormat` 装入的 run，新文本
+   仅按 `defaultTextFormat` 排版。AOT 早期把 `text` 建模为裸字段（直接结构体写），run 列表得以残留——而 Starling
+   `TrueTypeCompositor` **复用同一个静态原生 `TextField`**（`sNativeTextField`），于是某个字段用过 HTML 富文本后，
+   后续**所有**纯文本排版都会重放那些 run（实测 demo 按钮标签 `Back` 从 29 px 高变 38 px 高、切换场景后仍不复原）。
+   现改为 `text` 保留字段槽（读仍是 `tf->text`）**同时**注册 setter：`TextField_set_text` 清空 `_runs`、释放
+   `_para` 排版缓存后再写入（见 `src/symbols.ts` 的 `TextField` setters、`src/emit.ts` 的 `TextField_set_text`）。
+2. **属性值单/双引号等价**：AIR HTML 子集允许 `color='#ff0000'` 与 `color="#ff0000"` 两种引号。早期解析只认 `"`，
+   于是单引号值**从引号本身开始**取值：`size='30'` 被 `atof` 读成 0 后落到 1.0 下限、`color='#208080'` 被
+   `as_tf_html_parse_hex` 当成 `2080` 读成错误的深蓝（Starling demo 里 `basic` 显示为绿、`HTML` 显示为青）。
+   现由 `as_tf_html_attr_value(s, out, cap)` 按「开引号种类」定界（并支持无引号裸值）。
 
 ---
 
@@ -302,6 +370,30 @@ Skia 的 `SkCodec`（`include/codec`）+ `SkImage::MakeFromEncoded` 覆盖 PNG/J
 对应 AS3 的 `Loader`/`BitmapData.loadBytes` 图像加载。解码依赖 libpng/libjpeg-turbo/libwebp（§6.2）。
 `ByteArray` 二进制运行时（`flash.utils.ByteArray`）是前置依赖，尚未实现（阶段三十~三十二只补了纯逻辑
 内建，`ByteArray` 仍在排除清单），故图片解码排在 ByteArray 之后。
+
+### 9.1 实际支持面（实测）与 SVG 的独立通道
+
+上面写的「PNG/JPEG/WebP/GIF 等」**实测面比预期宽**：两端 Skia 都编入了
+`skia_use_libwebp_decode=true` + `skia_use_wuffs=true`，而 wuffs **同时**覆盖 BMP / ICO，
+故 `Loader` 实际可解的编码格式是 **PNG / JPEG / GIF / BMP / WebP / ICO 六种**，全部走同一条
+`SkImages::DeferredFromEncodedData` → `SkCodec`（阶段八十九·六十三实测，两端一致）。
+**QOI 不在内**——`SkQoiCodec` 未编入（`args.gn` 无 `skia_use_qoi`）。
+
+**SVG 是唯一的例外，它有自己的一条通道**（阶段八十九·六十五，native，opt-in；开启方式为具名开关
+`--features svg`，即定义 `ASC_USE_SVG`，见 [`compile.md`](compile.md) §3.4.2）：
+SVG **不是 `SkCodec` 格式**，`DeferredFromEncodedData` 对它必然返回 null，所以它在四个解码入口
+（`sk_image_from_file` / `sk_image_from_bytes` / `sk_image_decode_argb` / `sk_image_decode_bytes_argb`）
+里都是**「codec 失败之后」的回退**：
+
+```
+SkSVGDOM::Builder().setFontManager(sk_platform_fontmgr()).make(stream)
+→ setContainerSize(文档自身尺寸，缺省用规范默认 300×150)
+→ SkSurfaces::Raster(N32/premul) + clear(TRANSPARENT) + render → SkImage / ARGB
+```
+
+两个要点：**`setFontManager` 不设则 `<text>` 一个字都不画**（实测字形像素 97 → 0）；
+**wasm 侧无 `libsvg.a`/`libsksg.a`/`libexpat.a`**（`skia_use_expat=false` 把 svg 目标整体门掉），
+故 web 不支持 SVG，定义宏即链接期报错。默认构建不含该宏，行为与 AIR 逐字同构（`#2124`）。
 
 ---
 

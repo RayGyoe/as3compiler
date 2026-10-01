@@ -67,9 +67,21 @@ ActionScript 源码 (.as)
     sysroot 位于 `$WASI_SDK_HOME/share/wasi-sysroot`。
   - 未安装时，`--target wasm` 的实际编译会报出明确的「WASI 工具链缺失」提示（含安装指引），
     而非泄漏 clang 底层的 `'stdio.h' file not found`；`--dry` 仍可预览编译命令。
-  - AS3 异常（`throw`/`try`/`catch`/`finally`）在生成 C 里映射为 `setjmp`/`longjmp`；WASI 默认
-    不支持，因此 wasm 编译会附加 `-mllvm -wasm-enable-sjlj`（WebAssembly 异常处理提案）。
-    运行产物需 wasmtime/wasmer 等支持异常处理的运行时，wasm3 不支持该提案。
+  - AS3 异常（`throw`/`try`/`catch`/`finally`）在生成 C 里映射为 `setjmp`/`longjmp`，WASI 上这套要走
+    WebAssembly 异常处理提案，因此 wasm 编译会附加三个开关：
+    - `-mllvm -wasm-enable-sjlj`：让 LLVM 把 `setjmp`/`longjmp` 降到 `__wasm_setjmp`/`__wasm_longjmp`
+      （`longjmp` 抛 tag，`setjmp` 所在帧 `catch` 回来）——wasip1 的 libc 里根本没有这两个符号；
+    - `-mllvm -wasm-use-legacy-eh=false`：改用**标准** EH 指令（`try_table`）。该降级默认发旧版 `try`，
+      wasmtime 默认特性下会拒编（`legacy_exceptions feature required for try instruction`），浏览器也从未实现旧版；
+    - `-lsetjmp`（置于目标文件之后）：wasi-libc 把 `__wasm_setjmp`/`__wasm_longjmp`/`__wasm_setjmp_test`
+      放在**单独的** `libsetjmp.a`（不在 libc.a 里）。
+    后两项由构建层探测 sysroot 是否带 `lib/wasm32-wasip1/libsetjmp.a` 决定是否追加；缺库时不追加，
+    真用到异常仍会**响亮报错**（`wasm-ld: undefined symbol __wasm_setjmp`）而非静默降级。
+  - 运行产物需支持**标准**异常处理提案的运行时：wasmtime ≥ 24 开箱即用，浏览器 Chrome/Edge 119+、
+    Firefox 131+、Safari 18.4+ 亦支持；wasm3 与只实现旧版 EH 的运行时跑不了带异常的程序
+    （无异常的程序不受影响——见下）。
+  - 无异常的程序与从前**逐字节等价**：`-lsetjmp` 是静态库，未被引用的成员不会进产物（`examples/hello.as`
+    加开关前后 `.wasm` 代码段完全相同）。
 
 ## 3. 命令行用法
 
@@ -89,6 +101,8 @@ Options:
   -L <dir>       library search path (repeatable)
   -l <lib>       link library (repeatable)
   -D <macro>     preprocessor define (repeatable)
+  --framework <n> link a macOS framework (repeatable; distinct from clang -F, which is a search path)
+  --source <f>   extra C/C++ source to compile and link (repeatable)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
   --dry          emit C and print the compile command without compiling
@@ -189,9 +203,160 @@ as-aot export-meta.as --target wasm
 # 命令行声明 include 路径 / 库路径 / 库 / 宏定义（均可重复）
 as-aot app.as -I vendor/include -L vendor/lib -l skia -D USE_SKIA=1
 
+# macOS 系统框架（如 static curl 需要的 Security / SystemConfiguration）与附加 C 源
+as-aot app.as -I vendor/curl/include -L vendor/curl/lib/macos-arm64 \
+  -l curl -l nghttp2 -l z -D ASC_HAVE_CURL \
+  --framework Security --framework SystemConfiguration --source vendor/sysproxy_glue.c
+
 # 或走构建清单（推荐，可版本化复用）
 as-aot app.as --manifest examples/skia-link.build.example.json
 ```
+
+#### 3.4.1 `flash.net` 的网络后端是 **opt-in 宏**，不是默认行为
+
+`http(s)://` 的传输后端**不默认链接**：不声明宏时构建仍是零依赖、自包含、无网络，
+且远程 URL 会派**可区分**的诚实 `ioError`（与「文件不存在」不共用文案）。两个宏各管一目标：
+
+| 目标 | 宏 | 额外需要 | 拿到的能力 |
+|---|---|---|---|
+| native | `ASC_HAVE_CURL` | `link-libs: ["curl"]`（系统 libcurl 或 §3.4.4 的静态 `vendor/curl`） | `URLLoader`/`URLStream` 真传输（HTTP/1.1 + TLS + 重定向），`navigateToURL` 拉起系统浏览器，`Socket`/`ServerSocket`/`XMLSocket`（`ASC_SOCK_POSIX`，默认开） |
+| web（`--package web`） | `ASC_HAVE_FETCH` | 无（浏览器内置 `fetch`） | 同上（受 CORS/受限头/不透明重定向约束，见 [`html5-web.md`](html5-web.md) §6 第 10 条） |
+| wasm32-wasip1 | —（无后端） | — | preview1 无 socket 原语，如实报 `ioError` |
+
+> **`--air-app` 是自动挂载的例外。** 手写 `.as` 工程按上表显式 opt-in；而 AIR 项目走
+> `--air-app` 时，网络依赖**从源码推断**——`src/air-app.ts` 的 `detectNetworking()` 扫
+> `src/**/*.as` 是否出现 `URLRequest`（与 `detectStage3D` 同一形态，零配置），
+> 命中即把 native 的 `-l curl -l nghttp2` + `vendor/curl/{include,lib}` 路径 +
+> `Security`/`SystemConfiguration` + `ASC_HAVE_CURL=1` 写进生成的清单；web 目标改写
+> `ASC_HAVE_FETCH=1`（浏览器里唯一可用的 HTTP 客户端就是页面自己的 `fetch()`）。原因是
+> `--air-app` **每次运行都会重写 `<filename>.build.json`**，手改清单活不过下一次构建，
+> 所以链接集必须由生成器给出（阶段八十九·五十五）。漏掉它的症状不是编译失败，而是
+> 「编译过、跑得动，但每次请求都落可区分的诚实 `ioError`」（`AS_JOB_ERR_UNSUPPORTED`）。
+> 不碰网络的 AIR 项目保持零依赖默认形态；native 下 `vendor/curl` 缺失时**立即报错**并
+> 给出 `build-tools/curl-src/build-static.sh`，不静默退化。判据选 `URLRequest` 而**不是**
+> `import flash.net.*`：该包还装着 `SharedObject`/`FileReference`/`LocalConnection` 这些
+> 从不碰 HTTP 的类，按包名匹配会白白给 1.4 MB 静态 curl 进链接集，还会在本机没建
+> `vendor/curl` 时把一个用本地存储的 app 卡在报错上。
+
+同目标的**附加开关**（默认全关，逐项 opt-in）：
+
+| 宏 | 默认 | 效果 |
+|---|---|---|
+| `ASC_HTTP2` | 关（钉 HTTP/1.1） | 允许 TLS 协商 h2。**默认关是保真选择**：h2 会规范化响应头名并省略连接级头，AS3 侧可见（AIR 的传输本就是 HTTP/1.1） |
+| `ASC_SYSTEM_PROXY` | 关 | 读 macOS 系统代理（`SCDynamicStoreCopyProxies`）并交给 libcurl。**必须配 `--source vendor/sysproxy_glue.c`**：`<SystemConfiguration/SystemConfiguration.h>` 会牵入 `MacTypes.h` 的 `struct Point`，与生成 C 的 `flash.geom.Point` 结构体冲突，故该系统调用只能待在独立编译单元（生成 C 里只留 `extern` 声明） |
+| `ASC_SOCK_POSIX` | **开**（POSIX 目标自动定义） | TCP 套接字底座（`Socket`/`ServerSocket`/`XMLSocket`）。无 POSIX socket 的目标（WASI/Web/Windows）自动退化：如实派 `ioError` |
+| `ASC_HAVE_FETCH` | 关（web 目标） | 浏览器 `fetch` 后端 |
+
+环境变量代理（`http_proxy`/`https_proxy`/`all_proxy`，大小写皆可）**无需宏**：libcurl 原生消费它们，
+且 seam 会在检测到这些变量时跳过系统代理查询（避免两套代理设定互相覆盖）。
+
+一份清单服务三目标用 `targets` 覆盖块（§4.1）：
+
+```json
+{
+  "link-libs": ["curl"],
+  "defines": ["ASC_HAVE_CURL"],
+  "targets": {
+    "wasm": { "link-libs": [], "defines": [] }
+  }
+}
+```
+
+#### 3.4.2 具名增强开关（`--features` / 清单 `features`）
+
+比 `-D` 高一层：把「一个 AIR 超集能力」当作**具名开关**打开，而不是让用户手写它背后的宏。
+名字只声明它是什么（增强、非 AIR 行为），宏由编译器解析。
+
+```bash
+as-aot app.as --air-app app.xml --features svg      # 等于 -D ASC_USE_SVG=1
+as-aot app.as --air-app app.xml --features none     # 清空（见下：会把持久化的选择一并清掉）
+```
+
+| 名字 | 宏 | 可用目标 | 说明 |
+|---|---|---|---|
+| `svg` | `ASC_USE_SVG=1` | 仅 `native` | 见 §3.4.3 |
+
+清单里同名字段是一份**字符串数组**，语义与 CLI 一致：
+
+```json
+{ "features": ["svg"] }
+```
+
+规则（三条都是为了**不静默**，AGENTS.md §1.5）：
+
+- **默认全关**：不开时产物与以前**逐字节相同**，与 `adl` 同构。开了会打印一行
+  `== enhancements: svg (-D ASC_USE_SVG=1) ==`，并在提示里写明它是 AIR 超集。
+- **未知名字报错**，不静默忽略：`--features lottie` 会报 `unknown feature 'lottie' (known: svg)`
+  并在**生成任何代码之前**退出（清单里也已实现的能力才会被登记，登记了却没实现的开关
+  等于给用户一个「看着开了、实际没编进去」的东西）。`--features none` 不能与其它名字同用。
+- **目标不支持就报错**：`--target wasm --features svg` 直接报
+  `feature 'svg' is not available with --target wasm`，而不是把 `undefined symbol: sk_svg_*` 留给链接器。
+
+`--features` 与 `-D` 的区别：`-D` 是**追加**一条宏，`--features` 是**替换**整个增强集合——
+「本来开着 svg、我只想要别的」这种话只有替换语义能表达。
+
+#### 3.4.2.1 `--air-app` 会**持久化**增强选择
+
+`--air-app` 每次运行都会**整份重写**生成的 `<filename>.build.json`（它是从 app.xml + src 扫描
+推导出的构建产物）。所以一个被选中的增强必须能挺过这次重写，否则「打开 SVG」只能靠每次都在
+命令行重复——这正是本开关存在的理由。
+
+- `--features svg` 会把 `"features": ["svg"]` 写进生成的清单；**下次不带参数运行仍然生效**，
+  并打印 `enhancements carried over from ...: svg`（**不是静默**）。
+- 要关掉：`--features none`（清空并同样持久）。
+- 只有 `features` 会被继承：其它字段都是描述符与源码的函数，复活一个过期的生成值
+  （一个已被去掉的宏、一个旧的链接库）就是一次静默的错误构建。
+
+#### 3.4.3 图片解码的 SVG 通道也是 opt-in 宏（`ASC_USE_SVG`）
+
+编码图片（PNG/JPEG/GIF/BMP/WebP/ICO）无需任何宏——两端 Skia 本就编入了对应 codec。
+**SVG 不同**：它不是 `SkCodec` 格式，走的是独立通道（`SkSVGDOM` 解析 → `SkSurface` 光栅化），
+且 AIR 的 `Loader` **从不支持 SVG**，故按 §1.5 做成 **opt-in**：
+
+```bash
+# native：一条命令（libsvg/libsksg/libexpat 已在清单的 link-libs 里）
+as-aot app.as --air-app app.xml --features svg
+
+# 等价写法（具名开关只是替你把这条宏解析出来）
+as-aot app.as --air-app app.xml -D ASC_USE_SVG=1
+```
+
+| 构建 | `Loader.load("x.svg")` |
+|---|---|
+| 默认 | `ioError #2124 Error #2124: Loaded file is an unknown type.` —与 `adl` 逐字相同 |
+| `--features svg`（= `-D ASC_USE_SVG=1`） | 解码成功（`<text>` 经 `SkFontMgr` 正常出字；无绝对尺寸的文档按规范默认 300×150） |
+
+**web 不支持**：`vendor/skia/lib/wasm` 里没有 `libsvg.a`/`libsksg.a`/`libexpat.a`（wasm `args.gn` 的
+`skia_use_expat=false` 把 svg 目标整体门掉），定义该宏会在**链接期**失败——显式报错，不静默降级。
+要支持须改 wasm `args.gn` 并**重编 wasm Skia**。详见 [`enhancements.md`](enhancements.md) §4.1 与
+[`skia.md`](skia.md) §9.1。
+
+#### 3.4.4 静态自包含（`vendor/curl`）
+
+`link-libs: ["curl"]` 会**动态链接系统 libcurl**（macOS 上是 `/usr/lib/libcurl.4.dylib`），产物不再是
+单文件自包含。要自包含：`build-tools/curl-src/build-static.sh` 从源码编出 `libcurl.a`/`libnghttp2.a`/`libz.a`
+落 `vendor/curl/{include,lib/macos-arm64}`，清单指过去即可（[`examples/flash-net-layered.build.example.json`](../../examples/flash-net-layered.build.example.json)
+就是这种形态）：
+
+```json
+{
+  "target": "native",
+  "targets": {
+    "native": {
+      "link-libs": ["curl", "nghttp2", "z"],
+      "link-paths": ["../vendor/curl/lib/macos-arm64"],
+      "include-paths": ["../vendor/curl/include"],
+      "frameworks": ["CoreFoundation", "CoreServices", "Security", "SystemConfiguration"],
+      "defines": ["ASC_HAVE_CURL"]
+    }
+  }
+}
+```
+
+> `frameworks` 字段等价于 CLI 的 `--framework`（链接 `-framework <名>`）。`libz.a` 与系统 `libz`
+> 同名，靠**库搜索路径顺序**保证静态命中（可能看到 `ld: warning: ignoring duplicate libraries: '-lz'`
+> 的提示，无副作用）。验收口径：`otool -L` 的输出里**不应**出现 `libcurl.4.dylib`/`libz.dylib`。
+> **默认构建（不声明这些宏/库）完全不受影响**。
 
 ### 3.5 AIR 应用描述符（--air-app）
 
@@ -220,9 +385,26 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 **web 目标**（`--air-app ... --target wasm --package web`）下，`--air-app` 适配器自动切换到
 浏览器后端：构建清单改用 `web_glue.cc`（替换 `window_glue.cc`）+ wasm 版 Skia
 （`vendor/skia/lib/wasm`），去掉 SDL2/`objc`/Cocoa 等 macOS 框架，字体由 app.xml 的
-`<embedFonts>` 提供（读每个 `<font><fontPath>` 生成 `font-urls` 运行时注入，缺省时回退到
-`fonts/Arial.ttf`；wasm 沙箱无系统字体，见 [`html5-web.md`](html5-web.md) §4）。其余流程
-（解析 app.xml、扫描 src、生成引导代码）与 native 一致，产物为 `<filename>.html` + `.js` + `.wasm`。
+`<embedFonts>` 提供（读每个 `<font><fontPath>` 生成 `font-urls` 运行时注入；没写
+`<embedFonts>` 时自动扫 app 目录下的 `.ttf/.otf/.ttc`，`findAppFonts()`，无需改描述符）。
+其余流程（解析 app.xml、扫描 src、生成引导代码）与 native 一致，产物为 `<filename>.html`
++ `.js` + `.wasm`。
+
+**字体告警（与网络自动挂载同理，因为失败是静默的）**：wasm 沙箱没有可枚举的系统字体，
+只认页面注入的字体；一个用了 `flash.text` 却在 app 目录里一个字体都找不到的 app，
+`font-urls` 会是空列表，于是 TextField 的**背景照画、字形全无**——编译成功、页面能跑，
+只是文字不见（native/adl 用 CoreText 枚举已装字体，不受影响，所以这是 web 独有的坑）。
+适配器扫 `src/**/*.as` 里的 `flash.text`（`detectText()`）判定该 app 是否画字，命中且
+`font-urls` 为空时打一条黄字警告到 stderr，点明症状与两种修法（自己放一个字体，或写
+`<embedFonts>`）。不抛错：其余部分（布局、位图）预览正常，且拦下构建并不会让字体出现。
+详见 [`html5-web.md`](html5-web.md) §4 与 §6 第 1 条。
+
+**网络传输自动挂载**：AIR 项目不需要手写 curl 参数。适配器扫 `src/**/*.as` 里的 `URLRequest`
+判定该 app 是否联网（`detectNetworking()`，与 `detectStage3D` 同形），命中即把静态
+`vendor/curl` 的 `-I/-L` 路径 + `-l curl -l nghttp2` + `Security`/`SystemConfiguration` 写进
+native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1`。这是必需的自动化而非便利：
+清单每次构建都会重新生成，手改不可能保留。不碰网络的 app 不受影响（仍为零依赖默认形态）。
+（`ASC_HAVE_CURL` 本身仍是 opt-in 宏，设计理由见 §3.4.1。）
 
 对齐 adl 的三个关键行为：
 - `<resizable>false</resizable>` → 构建清单加 `ASC_WINDOW_FIXED=1`，窗口创建时不加
@@ -252,20 +434,27 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | 分发形态，默认 `raw`（§6）；`web` 要求 `target=wasm`，产出浏览器产物（见 [`html5-web.md`](html5-web.md)） |
 | `c-compiler` | string | C 编译器，默认 `cc` |
 | `opt` | string | 优化标志，默认 `-O2` |
+| `lto` | boolean | 布尔，默认 `false`。为 `true` 时向**每个编译步骤与链接步骤**都加 `-flto`（见 §4.2）；不设时命令行与产物与以前**逐字节相同** |
+| `pgo` | `"generate" \| "use"` | 分阶段优化（PGO）的阶段，默认不启用。`generate` 构建**插桩**产物（运行后会写剖析数据），`use` 用同一目录的剖析数据重编（见 §4.2） |
+| `pgo-dir` | string | `pgo` 两阶段共用的剖析目录（相对清单目录解析）。clang 从该目录读 `<dir>/default.profdata`，故两阶段**必须同名** |
 | `sources` | string[] | 额外 C/C++ 源文件（与生成的 `.c` 一起编译） |
 | `include-paths` | string[] | 头文件搜索路径（→ `-I`） |
 | `link-libs` | string[] | 链接库（→ `-l`） |
 | `link-paths` | string[] | 库搜索路径（→ `-L`） |
 | `defines` | string[] | 预处理宏（→ `-D`） |
+| `features` | string[] | **具名增强开关**（§3.4.2），如 `["svg"]`。默认空。未知名字报错；开了会在构建横幅里点名，不开则产物与 `adl` 同构。`--features` 在 CLI 侧是**替换**整个集合（`-D` 才是追加） |
 | `objects` | string[] | 预编译 `.o` 直接加入链接 |
 | `frameworks` | string[] | macOS 框架（→ `-framework X`，Skia 的 CoreText/CoreGraphics 后端需要） |
 | `font-urls` | string[] | 字体字节流 URL 列表（`--package web` 时写入 `index.html`，运行时网络加载注入 Skia；见 [`html5-web.md`](html5-web.md) §4） |
+| `preload-paths` | string[] | 打进 wasm FS 镜像的数据根，`src@dest` 或裸路径（`--package web` 专属；浏览器沙箱初始 FS 为空，`File`/`FileStream` 会一文件都看不到） |
+| `preload-excludes` | string[] | 从上述镜像里**排除**的宿主路径或 fnmatch 模式（→ `emcc --exclude-file`，同样是 `--package web` 专属）。emcc 的目录 preload 没有逐文件开关，只能反向命名要排除的文件；模式匹配的是 preload 遍历产出的**宿主路径**（绝对），故同样相对清单目录解析。**路径里含 `*?[` 时它是模式而非字面量**（`weird[1].png` 会排掉无关的 `weird1.png`），要按字面排除需转义为 `[[]` `[]]` `[*]` `[?]`；无命中的模式静默忽略。`--air-app` 用它把已由页面 `fetch` 的字体撤出 FS（见 [`html5-web.md`](html5-web.md) §6），并自动排除 `-o` 指向的**本次构建输出目录**——否则 `-o temp/<x>` 会把正在写的 `.c`/`.o`/产物自己也 preload 进镜像（Flappy-Starling 实测 1.9 MB → 36 MB）；未指定 `-o` 时不做任何猜测 |
 | `bundle-id` | string | 应用标识（`--package xcode-project` 填 `Info.plist` 的 `CFBundleIdentifier`，缺省 `com.example.<product>`） |
 | `display-name` | string | 应用显示名（填 `CFBundleName`，缺省取产物名） |
 | `icon` | string | 图标 `.icns` 路径（相对清单目录解析，拷入 `Resources` + 填 `CFBundleIconFile`） |
 | `deployment-target` | string | macOS 最低系统版本（填 `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） |
+| `targets` | `{ native?, wasm? }` | **按目标覆盖块**（§4.1）：顶层字段为公共默认，`targets.<目标>` 块对**匹配的目标**整体替换其声明的字段，使一份清单可服务链接集互斥的多目标 |
 
-路径类字段（`sources` / `include-paths` / `link-paths` / `objects`）**相对清单文件所在目录解析**
+路径类字段（`sources` / `include-paths` / `link-paths` / `objects` / `preload-excludes`）**相对清单文件所在目录解析**
 （与 TypePHP 的 YAML 路径规则一致）。示例见
 [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json)：
 
@@ -289,16 +478,99 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 ```
 
 **优先级**：CLI 参数覆盖清单同名字段（对标 TypePHP 的「CLI beats YAML」）。
-合并顺序：默认配置 → 清单 → CLI 覆盖。
+合并顺序：默认配置 → 清单顶层 → 清单 `targets.<最终目标>`（§4.1）→ CLI 覆盖。
+
+### 4.1 按目标分层（`targets`）
+
+顶层字段是**公共默认**；`targets.<目标>` 块只对**匹配的目标**生效，并把块内声明的字段**整体替换**（replace，而非追加）同名顶层值。这样**一份清单**就能服务链接集互斥的多目标——典型场景是 `flash.net` 的 HTTP 后端：native 链接 curl，而 WASI preview1 没有 socket/TLS，`-lcurl` 会让 `wasm-ld` 直接失败（`unable to find library -lcurl`），必须为 wasm 去掉它。
+
+示例 [`examples/flash-net-layered.build.example.json`](../../examples/flash-net-layered.build.example.json)
+（当前形态：native 指静态 `vendor/curl`，wasm 无块故不加任何 curl 相关字段）：
+
+```json
+{
+  "target": "native",
+  "opt": "-O2",
+  "targets": {
+    "native": {
+      "link-libs": ["curl", "nghttp2", "z"],
+      "link-paths": ["../vendor/curl/lib/macos-arm64"],
+      "include-paths": ["../vendor/curl/include"],
+      "frameworks": ["CoreFoundation", "CoreServices", "Security", "SystemConfiguration"],
+      "defines": ["ASC_HAVE_CURL"]
+    }
+  }
+}
+```
+
+- `as-aot app.as --manifest m.json`（默认 native）→ 链接 `-l curl -l nghttp2 -l z -D ASC_HAVE_CURL` + 四个 `-framework`；
+- `as-aot app.as --manifest m.json --target wasm`（wasm）→ **两者都不加**（无 `native` 块匹配）。
+
+规则：
+
+- 块内**省略**的字段沿用顶层默认；要**去掉**一个顶层共享库，就在该目标块里写 `"link-libs": []`——**replace 语义才能「减」**（append 只能「加」，无法剔除）。
+- 块可选择的目标只有 `native` / `wasm`，**未知目标名报错**；块内**不允许** `target`/`package`（目标由选择它的块决定，不可在块内重定义）或嵌套 `targets`；块内**未知字段报错**（AGENTS.md §2.5，防拼写错误被静默忽略）。
+- 块内路径类字段（`sources`/`include-paths`/`link-paths`/`objects`/`icon`）与顶层一样**相对清单目录解析**。
+- 覆盖块由**最终目标**（含 CLI `--target` 的影响）选择，且**先于** CLI 覆盖应用，故 CLI 的 `-l/-I/-L/-D` 仍叠加在分层结果之上——「CLI beats 清单」不变。
+
+### 4.2 链接时优化与分阶段优化（`lto` / `pgo`）
+
+这两项是**构建层开关，不是语言特性**：前端仍然只把 AS 翻译成可读的 C，一行优化都不手写（§1.1）；
+`-flto` 与剖析数据都由系统的 `cc/clang -O2 -flto` 消费。故它们与 `opt` 同层，两处都可
+由构建清单或 CLI（`--lto` / `--pgo` / `--pgo-dir`）指定，**默认全关**——不设时产物与以前完全一致。
+
+```bash
+# 只开 LTO（一条命令）
+as-aot Main.as --air-app app.xml --lto
+
+# PGO：先插桩 → 运行以采集 → 合并剖析 → 用剖析重编
+as-aot bench.as --pgo generate --pgo-dir prof -o bench.gen
+./bench.gen                                    # 运行写入 prof/default_*.profraw
+llvm-profdata merge -o prof/default.profdata prof/*.profraw
+as-aot bench.as --lto --pgo use --pgo-dir prof -o bench
+```
+
+清单写法等价：
+
+```json
+{ "opt": "-O2", "lto": true, "pgo": "use", "pgo-dir": "prof" }
+```
+
+要点：
+
+- **`-flto` 必须同时在编译步与链接步上**：编译步产出 bitcode，跨模块内联发生在链接步。只加一侧
+  不会报错，只会**静默地不生效**——所以 `perfFlags()` 是单一来源，四个命令构造器都从它取，
+  回归里有逐步骤断言 + 反向对照（把任一步漏掉，测试立刻失败）。
+- **两阶段必须同名 `pgo-dir`**：clang 的目录形式读 `<dir>/default.profdata`。剖析文件不存在时
+  构建**硬报错**（`Error in reading profile ...: No such file or directory`），不会静默退回无剖析构建。
+- **不发 `-fprofile-correction`**：那是 GCC 的标志；clang 收到只会警告
+  `not supported [-Wignored-optimization-argument]` 然后忽略，发了等于每次 PGO 构建都多一条噪声。
+- **两端都有效**：native（`cc`/`clang`）与 web（`emcc`）都接受 `-flto`，回归对两侧的**每一步**都有断言。
+  `--target wasm`（WASI 裸产物）路径同样把标志送进命令，但**本机未安装 WASI SDK，未实测**。
+
+实测（`temp/perf/`，调用密集的 900k 次循环，五次取中位）：
+
+| 构建 | 校验和 | 墙钟 | 产物 |
+|---|---|---|---|
+| `-O2`（默认） | −1664902176 | ~30.6 ms | 33464 B |
+| `-O2 -flto` | −1664902176 | ~25.6 ms | 33456 B |
+| `-O2 -flto -fprofile-use` | −1664902176 | ~25.5 ms | 33464 B |
+
+三者校验和**完全相同**（只提速、不改语义），`-flto` 在这一单编译单元的调用密集负载上约快 16%；
+再叠 PGO 在本例无可测增益（已在噪声内）——本负载分支简单，PGO 的收益面是**分支多 / 间接调用多**的程序，
+不宜把它当普适提升。
 
 ## 5. 多目标后端
 
 | 目标 | 编译命令 | 产物 |
 |---|---|---|
 | `native`（默认，`--package raw`） | `cc -O2 -lm -lz -o <out> <c> [sources] -I... -D... [objects] -L... -l... [-framework X]` | Mach-O / ELF / PE 可执行 |
-| `wasm`（`--package raw`） | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 -o <out>.wasm <c> ...` | WASI `.wasm` |
+| `wasm`（`--package raw`） | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 -mllvm -wasm-use-legacy-eh=false -o <out>.wasm <c> ... -lsetjmp` | WASI `.wasm` |
 | `native` + `--package xcode-project` | 生成 `.xcodeproj`（§6.5），由 Xcode/xcodebuild 驱动 | macOS `.app` bundle（`Contents/MacOS/<bin>` + `Info.plist`） |
 | `wasm` + `--package web` | `emcc`（Emscripten，需 `EMSDK_HOME`）编译 C/C++ 源 + 链接 wasm 版 Skia，`INVOKE_RUN=0` | `.wasm` + `.js` + `index.html`（浏览器 HTML5 渲染，见 [`html5-web.md`](html5-web.md)） |
+
+> 需要按目标区分链接库/宏（如 native 链接 curl、wasm 不能）时，用清单的 `targets` 块
+> （§4.1）——一份清单即可覆盖上表多个后端，不必为每个目标维护一份清单。
 
 平台耦合点已隔离到 `runtime.ts` 的 `RUNTIME_PREAMBLE`，用 `#ifdef __wasi__` 条件编译。
 当前唯一的平台差异是 `as_now_ms()`：
@@ -524,6 +796,28 @@ as-aot examples/web/hello-web.as \
 核心机制：`ASC_USE_WINDOW=1` 决定 `Stage.showWindow(...)` 是「真正弹窗进入事件循环」还是「退化为
 no-op」（见下文 `runtime.ts` 的条件编译）。因此同一个 `.as` 换 manifest 即可在「离屏 PNG」与「GUI
 窗口」间切换，无需改源码。
+
+> **两个 GPU 宏不可混用**（混用会误判 `Context3D.driverInfo` 的后端）：
+>
+> | 宏 | 含义 | 由谁定义 |
+> |---|---|---|
+> | `ASC_RENDER_METAL` | **窗口合成**走 Metal：`metal_glue.mm` 的 `CAMetalLayer` + Ganesh，整帧在 GPU 上合成（2D 上屏用） | `air-app.ts` 在 `<renderMode>direct/gpu` + 可见窗口时加入 |
+> | `ASC_RENDER_STAGE3D` | **Stage3D 的 `Context3D` 接到真实 GPU**：链接 `stage3d_glue.mm`，`as_s3d_*` 包装器从 no-op 变为真实 Metal 调用 | 构建清单（`usesStage3D` 时由 `air-app.ts` 加入） |
+>
+> 二者**互相独立**：只定义前者时 `Context3D` 仍是纯 C 状态机（`driverInfo` 返回 `"Software (state machine)"`）；
+> 只定义后者时窗口仍走 CPU raster（如 `examples/stage82.build.json`）。既是 GPU 窗口又用 Stage3D 的工程
+> （Starling、shmup）两个都要给。
+
+**帧率诊断旋钮**（用 `-D` 追加，默认不编译进产物）：
+
+| 旋钮 | 目标 | 形态 | 说明 |
+|---|---|---|---|
+| `ASC_FRAME_STATS` | native | 运行时 env（`getenv`） | 每 512 帧打印帧时 `p50/p95/p99/max` + GC 占比 + RSS/段数（见 [`gc.md`](gc.md)） |
+| `ASC_FRAME_STATS` | **web** | **编译期 define**（`-D ASC_FRAME_STATS=1`） | 浏览器无 env；每秒把 `frames`/`loopcalls`/`skips`/`renderMs`/`rafPeriodMs`/`skip` 发到 `window.__ascFrameStats`（见 [`html5-web.md`](html5-web.md) §3.2） |
+
+web 侧的 `loopcalls` 与 `frames` 之差直接区分「rAF 本身慢（刷新率上限）」与「节拍缺陷」：
+后者是 120 Hz 屏上只跑 66 fps 的根因（时间戳截止期节拍在 rAF 抖动下丢/取交替、速率减半），
+已修为整 tick 节拍（[`html5-web.md`](html5-web.md) §3.2）。
 
 `--target native` 默认产出的是**命令行可执行文件**（离屏 CPU raster → PNG 后退出）。要在 macOS
 上弹出一个真正的原生窗口并进入事件循环，用 `Stage.showWindow(width, height, title)`，它把离屏

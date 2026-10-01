@@ -29,6 +29,7 @@ export type Stmt =
   | { kind: 'VarDecl'; name: string; type: ASType | null; init: Expr | null }
   | { kind: 'VarDecls'; decls: { name: string; type: ASType | null; init: Expr | null }[] }
   | { kind: 'ConstDecl'; name: string; type: ASType | null; init: Expr | null }
+  | { kind: 'ConstDecls'; decls: { name: string; type: ASType | null; init: Expr | null }[] }
   | { kind: 'ExprStmt'; expr: Expr }
   | { kind: 'Block'; body: Stmt[] }
   | { kind: 'If'; cond: Expr; then: Stmt; else: Stmt | null }
@@ -36,7 +37,7 @@ export type Stmt =
   | { kind: 'DoWhile'; cond: Expr; body: Stmt }
   | { kind: 'For'; init: Stmt | null; cond: Expr | null; update: Expr | null; body: Stmt }
   | { kind: 'ForIn'; varName: string; declares: boolean; iterable: Expr; body: Stmt }
-  | { kind: 'ForEachIn'; varName: string; varType: ASType | null; iterable: Expr; body: Stmt }
+  | { kind: 'ForEachIn'; varName: string; varType: ASType | null; declares: boolean; iterable: Expr; body: Stmt }
   | { kind: 'Switch'; disc: Expr; cases: SwitchCase[] }
   | { kind: 'Break'; label: string | null }
   | { kind: 'Continue'; label: string | null }
@@ -46,8 +47,8 @@ export type Stmt =
   | { kind: 'Throw'; value: Expr }
   | { kind: 'Try'; tryBody: Block; catchVar: string | null; catchType: ASType | null; catchBody: Block | null; finallyBody: Block | null }
   | { kind: 'FuncDecl'; name: string; params: Param[]; returnType: ASType; body: Block; metadata: Metadata[] }
-  | { kind: 'ClassDecl'; name: string; packageName: string | null; superClass: string | null; members: ClassMember[]; isFinal: boolean; implements: string[]; metadata: Metadata[] }
-  | { kind: 'InterfaceDecl'; name: string; packageName: string | null; methods: InterfaceMethod[] };
+  | { kind: 'ClassDecl'; name: string; packageName: string | null; superClass: string | null; members: ClassMember[]; isFinal: boolean; isDynamic: boolean; implements: string[]; metadata: Metadata[]; imports: string[]; fileId: string | null }
+  | { kind: 'InterfaceDecl'; name: string; packageName: string | null; methods: InterfaceMethod[]; imports: string[]; fileId: string | null };
 
 export interface SwitchCase {
   test: Expr | null; // null marks the `default` clause
@@ -56,7 +57,7 @@ export interface SwitchCase {
 
 export type Visibility = 'public' | 'private' | 'protected' | 'internal';
 
-export interface InterfaceMethod { name: string; params: Param[]; returnType: ASType; }
+export interface InterfaceMethod { name: string; params: Param[]; returnType: ASType; isGetter: boolean; isSetter: boolean; }
 
 export type ClassMember =
   | { kind: 'Field'; name: string; type: ASType | null; init: Expr | null; visibility: Visibility; isStatic: boolean; isConst: boolean }
@@ -78,7 +79,10 @@ export type Expr =
   | { kind: 'Assign'; op: string; target: Expr; value: Expr }
   | { kind: 'Call'; callee: Expr; args: Expr[] }
   | { kind: 'Member'; object: Expr; property: string }
+  | { kind: 'AttrAccess'; object: Expr; name: string }
+  | { kind: 'Filter'; object: Expr; attr: string; op: string; value: Expr }
   | { kind: 'SuperMethod'; method: string; args: Expr[] }
+  | { kind: 'SuperProperty'; property: string }
   | { kind: 'Is'; obj: Expr; typeName: string }
   | { kind: 'As'; obj: Expr; typeName: string }
   | { kind: 'In'; key: Expr; object: Expr }
@@ -88,7 +92,7 @@ export type Expr =
   | { kind: 'VectorLit'; elem: ASType; elements: Expr[] }
   | { kind: 'Index'; object: Expr; index: Expr }
   | { kind: 'ObjectLit'; fields: { name: string; value: Expr }[] }
-  | { kind: 'FunctionExpr'; params: Param[]; returnType: ASType; body: Block }
+  | { kind: 'FunctionExpr'; name: string | null; params: Param[]; returnType: ASType; body: Block }
   | { kind: 'RegExp'; pattern: string; flags: string };
 
 export interface Program {

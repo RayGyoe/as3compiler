@@ -36,10 +36,24 @@
 #import <CoreFoundation/CoreFoundation.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 
 // ARC is intentionally off for this file (matching Skia's own window tooling),
 // so every ObjC object retained here is balanced by a manual release.
 extern "C" {
+
+// Frame counter for the ASC_S3D_STATS probe: bumped once per presented frame so
+// the probe can report frame rate and ms/frame. stage3d_glue.mm prints its own
+// draw-side line; the two rates (frames/s and draws/s) together give
+// draws/frame and ms/frame for each bucket without a shared symbol.
+static long asc_dbg_frames = 0;
+static double asc_dbg_t_first = 0.0;
+static double asc_dbg_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
 
 // Process-wide Metal state. The layer is handed in by window_glue.cc (which got
 // it from SDL_Metal_GetLayer); it is owned by the SDL_MetalView and outlives the
@@ -139,9 +153,6 @@ void* sk_mtl_begin_frame(int width, int height) {
   // window_glue.cc), so the surface always matches the backing store even across
   // a HiDPI change. nextDrawable respects this size on subsequent frames.
   g_layer.drawableSize = CGSizeMake((CGFloat)width, (CGFloat)height);
-  fprintf(stderr, "metal_glue: begin_frame w=%d h=%d layerScale=%g drawableSize=%gx%g\n",
-          width, height, (double)g_layer.contentsScale,
-          (double)g_layer.drawableSize.width, (double)g_layer.drawableSize.height);
 
   if (g_surface) g_surface.reset();
   if (g_drawable) {
@@ -152,9 +163,6 @@ void* sk_mtl_begin_frame(int width, int height) {
   id<CAMetalDrawable> drawable = [g_layer nextDrawable];
   if (drawable == nil) return nullptr;
   if (drawable.texture == nil) return nullptr;
-  fprintf(stderr, "metal_glue: drawable.texture=%lux%lu (requested %dx%d)\n",
-          (unsigned long)drawable.texture.width, (unsigned long)drawable.texture.height,
-          width, height);
 
   GrMtlTextureInfo fbInfo;
   fbInfo.fTexture.retain((GrMTLHandle)drawable.texture);
@@ -168,6 +176,18 @@ void* sk_mtl_begin_frame(int width, int height) {
   // Retain the drawable so it survives until present (it would otherwise be
   // autoreleased at the end of the runloop turn). Released in sk_mtl_flush.
   g_drawable = (id<CAMetalDrawable>)CFRetain((CFTypeRef)drawable);
+  if (getenv("ASC_S3D_STATS")) {
+    asc_dbg_frames++;
+    const double now = asc_dbg_now_ms();
+    if (asc_dbg_t_first == 0.0) asc_dbg_t_first = now;
+    if (asc_dbg_frames % 600 == 0) {
+      const double el = (now - asc_dbg_t_first) / 1000.0;
+      fprintf(stderr, "sk_stats t=%.1fs frames=%ld fps=%.1f ms/frame=%.2f\n", el,
+              asc_dbg_frames, el > 0.0 ? (double)asc_dbg_frames / el : 0.0,
+              el > 0.0 ? 1000.0 * el / (double)asc_dbg_frames : 0.0);
+      fflush(stderr);
+    }
+  }
   return (void*)g_surface->getCanvas();
   }  // @autoreleasepool
 }

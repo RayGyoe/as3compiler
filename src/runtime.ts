@@ -11,7 +11,29 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #include <ctype.h>
 #include <setjmp.h>
 #include <time.h>
+// dlfcn.h (and Dl_info/dladdr above) is POSIX; wasi-libc ships the header but
+// not the Apple/POSIX symbol-probe API, so the include is skipped there.
+#ifndef __wasi__
+#include <dlfcn.h>
+#endif
 #include <sys/stat.h>
+#include <dirent.h>
+// Emscripten glue (EM_ASM / EM_ASM_INT / EM_JS / UTF8ToString / HEAPU8). Needed
+// by the web target regardless of the network backend: navigateToURL alone uses
+// EM_ASM to call window.open, and the fetch backend adds the rest.
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+// navigateToURL / sendToURL hand a URL to the platform's default handler by
+// spawning it (fork+exec, see as_open_external); that needs <unistd.h> for
+// fork/execlp/dup2, <fcntl.h> for the /dev/null the child detaches onto, and
+// <signal.h> for SIGCHLD. WASI has none of them (there is no process to hand
+// the URL to) and Windows uses ShellExecuteA instead.
+#if !defined(__wasi__) && !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#endif
 // flash.system.System.privateMemory reads the real process resident size. The
 // query API differs per platform: Mach on Apple, PSAPI on Windows, getrusage on
 // Linux/other POSIX; WASI has no process-memory API so it degrades (see
@@ -19,6 +41,9 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_init.h>
+// malloc_zone_pressure_relief: the macOS allocator only returns freed pages to
+// the OS when asked (see gc_trim_os below).
+#include <malloc/malloc.h>
 #elif defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -35,6 +60,18 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 // abstracted behind as_now_ms() below and falls back to second precision there.
 #ifndef __wasi__
 #include <sys/time.h>
+#endif
+
+// __builtin_return_address is a no-op *error* on non-Emscripten wasm (LLVM:
+// "Non-Emscripten WebAssembly hasn't implemented __builtin_return_address").
+// Every use of it names a caller for the ASC_GC_STATS / ASC_GC_AUDIT_STRICT
+// diagnostics, never program-visible behaviour, so WASI substitutes a null
+// address -- gc_dbg_sym already renders that as "?" (and as a bare address
+// where dladdr is unavailable).
+#ifdef __wasi__
+#define ASC_RETURN_ADDRESS(n) ((void*)0)
+#else
+#define ASC_RETURN_ADDRESS(n) __builtin_return_address(n)
 #endif
 
 // Wall-clock milliseconds since epoch. Native uses gettimeofday for real ms
@@ -60,12 +97,80 @@ static int as_getTimer(void) {
     return (int)(as_now_ms() - as_start_ms);
 }
 
+// ---------- external URL launcher (flash.net.navigateToURL / sendToURL) ----------
+// AIR hands the URL to the platform's default handler — the system browser for
+// http/https, the mail client for mailto, the file manager for file. The URL is
+// therefore never fetched by this process and no response can ever be reported,
+// which is exactly the behaviour sendToURL documents as its only difference from
+// navigateToURL. Returns 1 when the launcher was started, 0 when this target has
+// none (the caller turns that into AIR's #2032 IOError rather than silence).
+//
+// fork+exec, not system(): the URL comes from application input, and going through
+// a shell would turn navigateToURL(userInput) into a command-injection hole (a URL
+// containing a semicolon and an rm -rf would run). One argv entry, no shell.
+static int as_open_external(const char* url) {
+    if (url == NULL || url[0] == '\\0') return 0;
+#ifdef __EMSCRIPTEN__
+    // Web: a real new tab/window. Being popup-blocked outside a user gesture is
+    // the browser's documented behaviour, not something this layer can fix.
+    EM_ASM({ window.open(UTF8ToString($0), '_blank'); }, url);
+    return 1;
+#elif defined(_WIN32)
+    return (int)(ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL) > (HINSTANCE)32);
+#elif defined(__wasi__)
+    return 0;  // WASI Preview 1 has no process to launch
+#else
+    static int as_child_reaping = 0;
+    if (!as_child_reaping) {
+        // The launcher exits immediately and this process never calls waitpid,
+        // so SIG_IGN is what keeps it from lingering as a zombie.
+        as_child_reaping = 1;
+        signal(SIGCHLD, SIG_IGN);
+    }
+#ifdef __APPLE__
+    const char* launcher = "open";
+#else
+    const char* launcher = "xdg-open";
+#endif
+    // Seam for headless verification and custom environments: point the launcher at
+    // another program (the probe uses a recorder script so a test can assert the
+    // URL was passed through verbatim without opening a real browser).
+    const char* override = getenv("ASC_OPEN_LAUNCHER");
+    if (override != NULL && override[0] != '\\0') launcher = override;
+    pid_t pid = fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        // The child must not inherit this process's descriptors: the launcher
+        // can outlive the app from the shell's point of view, and holding the
+        // app's stdout/stderr open that long is how a terminal hangs on exit.
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2);
+            if (devnull > 2) close(devnull);
+        }
+        execlp(launcher, launcher, url, (char*)NULL);
+        _exit(127);
+    }
+    return 1;
+#endif
+}
+
 // Byte-buffer arena: bump-allocate raw byte storage (ByteArray.data, BitmapData
 // pixels, zlib scratch) that is NOT a GC-managed AS3 String. AS3 strings now
 // live on the GC heap (see as_str_alloc), so this arena no longer grows with
 // string concatenation. Byte buffers grow by doubling and old buffers are not
 // reclaimed (a documented subset limitation); they are not the animation leak
 // source addressed in stage 57.
+// Forward declaration: as_alloc's ASC_GC_STATS probe (below) uses this, and the
+// definition sits with the GC probes (dladdr + return address -> symbol/offset).
+static const char* gc_dbg_sym(const void* ra, unsigned long* off);
+static size_t gc_heap_used_bytes(void);
+static size_t gc_heap_total_bytes(void);
+// ASC_GC_AUDIT corruption gate (defined with the rest of the audit code below):
+// forward-declared because as_alloc/gc_alloc -- which run before it in the
+// preamble -- call it to validate a bookkeeping word before trusting it.
+static void gc_audit_gate(const char* what, const void* p);
+
 #define AS_ARENA_SEG_CAP (1u << 22)
 typedef struct as_arena_seg { struct as_arena_seg* next; size_t used; char* buf; } as_arena_seg;
 static as_arena_seg* as_arena_head = NULL;
@@ -77,6 +182,17 @@ static size_t as_heap_bytes = 0;
 static char* as_alloc(size_t n) {
     if (n == 0) n = 1;
     n = (n + 7) & ~(size_t)7;  // align to 8 bytes for embedded structs
+    // ASC_GC_STATS probe: a megabyte-scale arena request is a big buffer (a
+    // ByteArray / Vector payload). The arena never releases memory, so a
+    // repeated growth here is permanent RSS; log the requesting caller (via
+    // dladdr + atos) instead of guessing which helper asked for it.
+    if (n >= (1u << 20) && getenv("ASC_GC_STATS") != NULL) {
+        unsigned long as_dbg_off = 0;
+        const char* as_dbg_sym = gc_dbg_sym(ASC_RETURN_ADDRESS(0), &as_dbg_off);
+        fprintf(stderr, "as_big size=%.1fMB caller=%s+0x%lx\\n",
+                (double)n / 1048576.0, as_dbg_sym, as_dbg_off);
+        fflush(stderr);
+    }
     if (n > AS_ARENA_SEG_CAP) { as_heap_bytes += n; return (char*)malloc(n); }  // single oversized allocation
     if (as_arena_head == NULL || as_arena_head->used + n > AS_ARENA_SEG_CAP) {
         as_arena_seg* s = (as_arena_seg*)malloc(sizeof(as_arena_seg));
@@ -117,35 +233,76 @@ static size_t as_arena_cap_bytes(void) {
 // The heap grows in fixed segments and a free-list reuses swept blocks.
 //
 // Root set = 'permanent' roots only (see gc_mark_internal_roots + the emitted
-// gc_mark_user_roots): the GC runs at a frame-boundary safe point where all
-// user frame callbacks have returned, so there are no live stack temporaries
-// to register. Objects reachable only from the display list / static fields /
-// event registry / timer table stay alive; transient animation objects become
-// unreachable and are swept.
+// gc_mark_user_roots), because the incremental collector runs at a frame-boundary
+// safe point where all user frame callbacks have returned and there are no live
+// stack temporaries to register. Objects reachable only from the display list /
+// static fields / event registry / timer table stay alive; transient animation
+// objects become unreachable and are swept.
+//
+// A collection can also be forced while AS3 frames ARE on the stack (System.gc()
+// from user code, or Stage.dispatchFrame() called from AS3). Those cases add the
+// live C stack conservatively to the root set — see gc_mark_stack.
 typedef struct gc_header {
     struct gc_header* next;  // free-list (when idle) or all-objects list (when live)
-    int type;                // GCT_* tag, drives mark traversal
+    int type;                // GCT_* tag, drives mark traversal (0 = free block)
     int color;               // 0 white / 1 grey / 2 black (three-color, GC-4 ready)
     size_t size;             // object body bytes
 } gc_header;
 
-typedef struct gc_seg { struct gc_seg* next; char* base; size_t size; } gc_seg;
+typedef struct gc_seg {
+    struct gc_seg* next;
+    char* base;
+    size_t size;
+    // Free bytes in this segment, counting each free *block's* header too:
+    // free_bytes == size means every byte of the segment is on a free list, i.e.
+    // the segment holds no live object (see gc_release_empty_segs). Maintained
+    // incrementally by the allocator and the sweeper, so the check is exact
+    // without walking anything.
+    size_t free_bytes;
+    int reap;      // scratch flag for the release pass (1 = wholly free)
+    // Scrub fields for the ASC_GC_AUDIT cross-check below: recompute the live
+    // footprint by walking gc_all and compare it against free_bytes. Written
+    // only in audit mode. audit_ghost is the same sum over blocks whose type is
+    // already 0 (freed but still linked), which the release decision must not
+    // mistake for live data.
+    size_t audit_live;
+    size_t audit_ghost;
+} gc_seg;
 
-// GC object type tags.
+// GC object type tags. The values are deliberately offset by a magic constant:
+// the conservative stack scan (gc_mark_stack) may be handed a word pointing into
+// the middle of an object (e.g. a char* walking a string body), and reading a
+// payload word as h->type then falls outside the GCT_* range, so a stray stack
+// word can never be mistaken for a real object header. Free blocks carry 0.
+#define GCT_TAG_BASE 0x47430000  // 'G','C' marker in the two high bytes
 enum {
-    GCT_STRING = 0,      // bare char*, a leaf
-    GCT_ARRAY = 1,       // as_array
-    GCT_OBJECT = 2,      // as_object (record literal)
-    GCT_DICT = 3,        // as_dict (Dictionary)
-    GCT_CLOSURE = 4,     // as_closure (function value)
-    GCT_CLASS = 5,       // user/builtin class instance (vtable + as_prop reflection)
-    GCT_VALUE_ARRAY = 6, // as_value[] buffer (array.data / object.vals / dict.vals)
-    GCT_PTR_ARRAY = 7,   // void*[] / char*[] buffer (object.keys)
-    GCT_CUSTOM = 8       // user-supplied mark callback in the body's first word
+    GCT_STRING = GCT_TAG_BASE + 0,      // bare char*, a leaf
+    GCT_ARRAY = GCT_TAG_BASE + 1,       // as_array
+    GCT_OBJECT = GCT_TAG_BASE + 2,      // as_object (record literal)
+    GCT_DICT = GCT_TAG_BASE + 3,        // as_dict (Dictionary)
+    GCT_CLOSURE = GCT_TAG_BASE + 4,     // as_closure (function value)
+    GCT_CLASS = GCT_TAG_BASE + 5,       // user/builtin class instance (vtable + as_prop)
+    GCT_VALUE_ARRAY = GCT_TAG_BASE + 6, // as_value[] buffer (array.data / object.vals)
+    GCT_PTR_ARRAY = GCT_TAG_BASE + 7,   // void*[] / char*[] buffer (object.keys)
+    GCT_CUSTOM = GCT_TAG_BASE + 8,      // user-supplied mark callback in body word 0
+    GCT_XML = GCT_TAG_BASE + 9,         // as_xml_node (E4X DOM element)
+    GCT_XML_LIST = GCT_TAG_BASE + 10,   // as_xml_list (E4X node list)
+    GCT_NUMBER = GCT_TAG_BASE + 11,     // as_number (boxed Number stored in an Object slot)
+    GCT_STRING_OBJ = GCT_TAG_BASE + 12, // as_string (boxed String stored in an Object slot)
+    GCT_FUNCTION_OBJ = GCT_TAG_BASE + 13, // as_function (boxed Function in an Object slot)
+    GCT_BOOLEAN = GCT_TAG_BASE + 14,    // as_boolean (boxed Boolean stored in an Object slot)
+    GCT_RAW = GCT_TAG_BASE + 15,        // raw payload buffer (monomorphized Vector.<T> element storage)
+    GCT_BYTES = GCT_TAG_BASE + 16       // raw BYTE buffer held by a GC object (ByteArray.data / BitmapData.pixels)
 };
 
 #define GC_SEG_SIZE (1u << 20)          // 1 MiB per segment
 #define GC_MIN_BLOCK (sizeof(gc_header) + 8)
+#define GC_BIG_CLASS (256u << 10)       // size-class boundary: big payloads vs objects
+// Segment size for carving blocks that serve *small* requests. A fresh segment
+// becomes one free block (minus the request), so it must itself belong to the
+// small class -- otherwise every small allocation would carve 1 MiB and leave
+// the leftover unusable for the small list, i.e. one segment per allocation.
+#define GC_SMALL_SEG_SIZE (64u << 10)
 
 // Three-color states (GC-4 incremental marking). gc_header.color is one of these.
 #define GC_WHITE 0  // not yet reached by the mark phase
@@ -178,46 +335,335 @@ static gc_inc_state gc_inc = { GC_IDLE, NULL, 0, 0, 500, NULL, NULL };
 static gc_header* gc_new = NULL;
 
 static gc_seg* gc_segs = NULL;
-static gc_header* gc_free = NULL;       // free blocks, first-fit
+static gc_header* gc_free = NULL;       // small free blocks (< GC_BIG_CLASS), first-fit
+// Big blocks live on their own list. Keeping them out of the small-object walk
+// costs nothing when looking for a big block (and vice versa), whereas one
+// shared list would have to *skip* every block of the other class on every
+// allocation. Without the split list, a freed multi-MB payload gets whittled
+// down by the small allocations that follow it in sweep order: it stops being
+// able to serve the next multi-MB request, which then carves a fresh segment
+// even though megabytes sit unused in the free list. Starling re-uploads a
+// multi-MB VertexBuffer3D every frame (Effect.uploadVertexData), so that
+// whittling reserved ~1 GB of segments for a ~60 MB working set.
+static gc_header* gc_free_big = NULL;
+
+// Which free list serves a request (or holds a block) of this size.
+static gc_header** gc_free_for(size_t size) {
+    return size >= GC_BIG_CLASS ? &gc_free_big : &gc_free;
+}
 static gc_header* gc_all = NULL;        // live objects, sweep walks this
 static size_t gc_bytes_allocated = 0;   // bytes since last collect (trigger)
+// Cached value of gc_trigger() for the offscreen (per-allocation) check. That
+// check runs on every single allocation, and gc_trigger() sums 24 decay
+// counters, so recomputing it there is pure overhead: measured on binarytrees,
+// 98 ms when the floor is computed vs 87 ms when ASC_GC_THRESHOLD short-circuits
+// the sum. The threshold only needs refreshing when the live set materially
+// changes, which is at a collection -- gc_finish_cycle clears this to 0 to force
+// a recompute (the floor is never 0, so 0 is a safe "stale" sentinel).
+static size_t gc_trigger_next = 0;
 static size_t gc_threshold = (1u << 20); // collect when allocated exceeds this
+// Has a frame safe point ever run? gc_step() is only ever entered from the
+// emitted Stage_dispatchFrame (one call per dispatched frame), so the first
+// entry reports "this program is frame-driven" and gc_alloc then leaves
+// collection to that sliced path. Until then -- a plain script, a server loop, a
+// WASI run, anything without a display list -- nothing would ever advance the
+// collector and the heap would grow with the program's allocation total, so
+// gc_alloc itself fires a stop-the-world collection on the threshold (see the
+// trigger in gc_alloc). Both properties are needed: without the flag a GUI build
+// would lose GC-4's bounded per-frame pause, and without the gc_alloc trigger an
+// offscreen build would never collect at all.
+static bool gc_frame_driven = false;
+
+// Probe helpers for the ASC_GC_STATS logging below: dladdr() turns a runtime
+// return address into a symbol + offset, so the caller can be named with
+// atos -o <binary> (0x100000000 + off) instead of guessed at.
+//
+// Dl_info/dladdr are POSIX-with-Apple-extension; wasi-libc declares dlfcn.h but
+// has neither, and the probe only feeds the ASC_GC_STATS diagnostics (not any
+// program-visible behaviour), so WASI degrades to a bare address instead of
+// failing to compile the whole preamble.
+#ifdef __wasi__
+static const char* gc_dbg_sym(const void* ra, unsigned long* off) {
+    if (off) *off = (unsigned long)(uintptr_t)ra;
+    return "?";
+}
+#else
+static const char* gc_dbg_sym(const void* ra, unsigned long* off) {
+    Dl_info di;
+    if (dladdr(ra, &di) != 0) {
+        if (off) *off = (unsigned long)((const char*)ra - (const char*)di.dli_fbase);
+        return di.dli_sname ? di.dli_sname : "?";
+    }
+    if (off) *off = 0;
+    return "?";
+}
+#endif
+
+// ASC_GC_STATS per-type heap accounting. gc_heap_used_bytes() sums every block
+// still linked in gc_all, i.e. live objects *plus* garbage the sweeper has not
+// reached yet -- so a multi-hundred-MB "heap" can mean either a big live set or
+// a collector that cannot keep up with the allocation rate. Splitting the same
+// total by GCT type (updated on allocation and on sweep-free) tells those two
+// apart and names the type responsible, which is what drives the fix.
+static double gc_dbg_type_bytes[24];
+static long gc_dbg_type_count[24];
+// O(1) totals of the counters above: bytes/objects currently linked in gc_all
+// (live plus not-yet-swept garbage). gc_heap_used_bytes() walks the whole list,
+// which is far too expensive to do per frame, and these two numbers are exactly
+// what the adaptive budget/threshold below need.
+static size_t gc_dbg_inuse_bytes(void) {
+    double t = 0;
+    for (int i = 0; i < 24; i++) t += gc_dbg_type_bytes[i];
+    return (size_t)(t < 0 ? 0 : t);
+}
+static size_t gc_dbg_inuse_count(void) {
+    long t = 0;
+    for (int i = 0; i < 24; i++) t += gc_dbg_type_count[i];
+    return (size_t)(t < 0 ? 0 : t);
+}
+static const char* gc_type_name(int type) {
+    switch (type) {
+        case GCT_STRING: return "string";
+        case GCT_ARRAY: return "array";
+        case GCT_OBJECT: return "object";
+        case GCT_DICT: return "dict";
+        case GCT_CLOSURE: return "closure";
+        case GCT_CLASS: return "instance";
+        case GCT_VALUE_ARRAY: return "value_array";
+        case GCT_PTR_ARRAY: return "ptr_array";
+        case GCT_CUSTOM: return "custom";
+        case GCT_XML: return "xml";
+        case GCT_XML_LIST: return "xml_list";
+        case GCT_NUMBER: return "boxed_num";
+        case GCT_STRING_OBJ: return "boxed_str";
+        case GCT_FUNCTION_OBJ: return "boxed_fn";
+        case GCT_BOOLEAN: return "boxed_bool";
+        case GCT_RAW: return "raw";
+        case GCT_BYTES: return "bytes";
+        default: return "?";
+    }
+}
+static void gc_dbg_dump(const char* tag) {
+    if (getenv("ASC_GC_STATS") == NULL) return;
+    static double last = 0.0;
+    const double now = as_now_ms();
+    if (now - last < 500.0) return;
+    last = now;
+    double total = 0;
+    char line[512];
+    size_t segs = 0, freeblocks = 0, freebytes = 0;
+    for (gc_seg* s = gc_segs; s != NULL; s = s->next) segs++;
+    for (gc_header* h = gc_free; h != NULL; h = h->next) { freeblocks++; freebytes += h->size; }
+    for (gc_header* h = gc_free_big; h != NULL; h = h->next) { freeblocks++; freebytes += h->size; }
+    int n = snprintf(line, sizeof(line),
+                     "gc_heap t=%.1fs %s total=%.0fMB resv=%.0fMB segs=%zu freeblk=%zu freeb=%.0fMB | ",
+                     now / 1000.0, tag, gc_heap_used_bytes() / 1048576.0,
+                     gc_heap_total_bytes() / 1048576.0, segs, freeblocks, freebytes / 1048576.0);
+    for (int i = 0; i < 24; i++) {
+        if (gc_dbg_type_bytes[i] <= 0) continue;
+        total += gc_dbg_type_bytes[i];
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "%s=%.1fMB/%ld ",
+                      gc_type_name(GCT_TAG_BASE + i), gc_dbg_type_bytes[i] / 1048576.0,
+                      gc_dbg_type_count[i]);
+        if (n > (int)sizeof(line) - 64) break;
+    }
+    fprintf(stderr, "%s\\n", line);
+    fflush(stderr);
+}
 
 static gc_header* gc_hdr(void* p) {
     return (gc_header*)((char*)p - sizeof(gc_header));
 }
 
+// Segment lookup table. gc_segs is the creation-ordered linked list (used to
+// iterate/dump/release segments), but answering "is this word inside the GC
+// heap?" by walking it is O(#segments): the benchmark holds ~1100 segments, and
+// gc_in_heap runs for *every* child pointer the marker follows, every word of
+// the conservative stack scan and every write-barrier store. Inlined into
+// gc_scan it was measured at 33% of the whole main-thread frame budget (the
+// mark of the 30k-object display list alone is millions of lookups). So keep a
+// second, base-sorted view of the same segments and answer in O(log n) -- with a
+// one-entry cache in front, which makes the common case (many pointers into one
+// recently touched segment) a couple of compares. 1 MiB segments are few enough
+// that the sorted base array stays cache-resident.
+typedef struct { char* base; size_t size; gc_seg* seg; } gc_seg_range;
+static gc_seg_range* gc_seg_ranges = NULL;
+static size_t gc_seg_range_n = 0, gc_seg_range_cap = 0;
+static gc_seg_range* gc_seg_cache = NULL;   // last successful lookup
+
+// Register a freshly carved segment (kept sorted by address, insertion sort:
+// segments are created rarely compared to the lookups above).
+static void gc_seg_range_add(gc_seg* seg) {
+    char* base = seg->base;
+    // Any insert invalidates the lookup cache: realloc may move the array, and
+    // the shift below renumbers entries (the cache is a pointer into it).
+    gc_seg_cache = NULL;
+    if (gc_seg_range_n == gc_seg_range_cap) {
+        gc_seg_range_cap = gc_seg_range_cap == 0 ? 64 : gc_seg_range_cap * 2;
+        gc_seg_ranges = (gc_seg_range*)realloc(gc_seg_ranges, gc_seg_range_cap * sizeof(gc_seg_range));
+    }
+    size_t i = gc_seg_range_n++;
+    while (i > 0 && gc_seg_ranges[i - 1].base > base) {
+        gc_seg_ranges[i] = gc_seg_ranges[i - 1];
+        i--;
+    }
+    gc_seg_ranges[i].base = base;
+    gc_seg_ranges[i].size = seg->size;
+    gc_seg_ranges[i].seg = seg;
+}
+
+// Drop a segment that is about to be returned to the OS.
+static void gc_seg_range_del(char* base) {
+    for (size_t i = 0; i < gc_seg_range_n; i++) {
+        if (gc_seg_ranges[i].base == base) {
+            // Clear the cache unconditionally, not just when it points at the
+            // entry being removed: the memmove below shifts every later entry
+            // down one slot, so a cached pointer at index j > i now describes
+            // what used to be entry j+1 (and, once j is the last slot, holds a
+            // duplicate of a *released* segment whose gc_seg is freed). The
+            // lookup would then either credit free_bytes to a freed segment
+            // struct or answer gc_in_heap for an address the heap no longer
+            // owns -- both silent corruption.
+            gc_seg_cache = NULL;
+            memmove(&gc_seg_ranges[i], &gc_seg_ranges[i + 1],
+                    (gc_seg_range_n - i - 1) * sizeof(gc_seg_range));
+            gc_seg_range_n--;
+            return;
+        }
+    }
+}
+
+// The segment containing p, or NULL. Addresses between segments are gaps (each
+// segment is its own malloc chunk), so a binary search on the base is exact.
+static gc_seg_range* gc_seg_find(const void* p) {
+    if (gc_seg_cache != NULL && (const char*)p >= gc_seg_cache->base
+        && (const char*)p < gc_seg_cache->base + gc_seg_cache->size) return gc_seg_cache;
+    size_t lo = 0, hi = gc_seg_range_n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (gc_seg_ranges[mid].base <= (const char*)p) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0) return NULL;
+    gc_seg_range* r = &gc_seg_ranges[lo - 1];
+    if ((const char*)p >= r->base + r->size) return NULL;
+    gc_seg_cache = r;
+    return r;
+}
+
 static bool gc_in_heap(void* p) {
     if (p == NULL) return false;
-    for (gc_seg* s = gc_segs; s != NULL; s = s->next) {
-        if ((char*)p >= s->base && (char*)p < s->base + s->size) return true;
-    }
-    return false;
+    // The body of an object always sits sizeof(gc_header) past its block start,
+    // and every caller reads the header at p - sizeof(gc_header). A word landing
+    // on (or just past) a segment base -- which the conservative stack scan can
+    // hand us, since segment bases get spilled to the stack -- would make that
+    // read fall into the unmapped gap *before* the segment and fault (SIGBUS).
+    // Requiring the header itself to be inside the segment keeps the gate safe:
+    // the first object body is at base + sizeof(gc_header), so nothing valid is
+    // rejected.
+    gc_seg_range* r = gc_seg_find(p);
+    return r != NULL && (char*)p >= r->base + sizeof(gc_header);
 }
 
 // Push a grey object onto the incremental mark work stack (defined later, near
 // the mark phase; forward-declared so gc_alloc's allocation barrier can use it).
 static void gc_grey_push(gc_header* h);
+// Collection entry points used by gc_alloc's non-GUI trigger below. Both live
+// after the mark/sweep code as well, so they need the same treatment.
+static size_t gc_trigger(void);
+static void gc_collect(void);
 
 // Allocate a GC object of the given type. Returns the object body (header hidden
 // before it). The body is zeroed so uninitialized array slots read as tag 0
 // (null) during mark, never a stale pointer.
 static void* gc_alloc(int type, size_t size) {
+    // ASC_GC_AUDIT: gc_all is written only by this function and by the sweeper,
+    // so a non-heap value here was stored by unrelated code (a wild store). The
+    // report's call chain is the statement that ran right after that store.
+    gc_audit_gate("gc_all", gc_all);
+    // Non-GUI trigger: no frame has ever been dispatched, so nothing else will
+    // ever call gc_step() -- collect here, once the allocation total crosses the
+    // (adaptive) threshold. This runs *before* the new object exists, so the
+    // sweep can never see it as unreachable garbage.
+    //
+    // Stop-the-world rather than a sliced cycle is deliberate: there is no frame
+    // deadline to protect, and the total work is the same, so slicing would only
+    // add state to a path that must be correct from an arbitrary call site. A
+    // collection from here is the same kind of operation as the already-supported
+    // System.gc() (which can fire while AS3 frames are live): gc_mark_roots runs
+    // the conservative C-stack scan, which mirrors the callee-saved registers via
+    // setjmp, so live locals of every caller frame stay roots (see gc_midframe.as).
+    // The scan needs a stack base, and main records one (GC_NOTE_STACK_BASE) as its
+    // first statement -- before any AS3 statement can allocate.
+    if (!gc_frame_driven && gc_inc.state == GC_IDLE) {
+        if (gc_trigger_next == 0) gc_trigger_next = gc_trigger();
+        if (gc_bytes_allocated >= gc_trigger_next) gc_collect();
+    }
     if (size == 0) size = 1;
     size = (size + 7) & ~(size_t)7;
+    // ASC_GC_STATS probe: a multi-megabyte request is either a legitimate large
+    // payload (a big ByteArray/Vector) or a capacity computation gone wrong. Log
+    // every one of them with the return address of the caller, so "atos -o
+    // <binary> -l <load addr> <ra>" names the responsible helper instead of
+    // guessing. Kept behind the env var: it also pins the request address so the
+    // log shows whether sizes double (pathological growth) or are one-shot.
+    static long gc_dbg_n = 0;
+    if (type == GCT_RAW && size >= (64u << 10) && getenv("ASC_GC_STATS") != NULL && (gc_dbg_n++ % 50) == 0) {
+        size_t segs = 0;
+        unsigned long gc_dbg_off = 0;
+        for (gc_seg* s = gc_segs; s != NULL; s = s->next) segs++;
+        unsigned long gc_dbg_off2 = 0;
+        const char* gc_dbg_up = gc_dbg_sym(ASC_RETURN_ADDRESS(1), &gc_dbg_off2);
+        fprintf(stderr, "gc_big type=%d size=%.1fMB segs=%zu since_collect=%.1fMB caller=%s+0x%lx up=%s+0x%lx\\n",
+                type, (double)size / 1048576.0, segs,
+                (double)gc_bytes_allocated / 1048576.0,
+                gc_dbg_sym(ASC_RETURN_ADDRESS(0), &gc_dbg_off), gc_dbg_off,
+                gc_dbg_up, gc_dbg_off2);
+        fflush(stderr);
+    }
+    // Big blocks (>= GC_BIG_CLASS) are kept away from small requests and vice
+    // versa. Without this, a freed multi-MB payload is whittled down by the
+    // small allocations that follow it in sweep order: it stops being able to
+    // serve the next multi-MB request, which then carves a fresh segment even
+    // though megabytes sit unused in the free list. Starling re-uploads a
+    // multi-MB VertexBuffer3D every frame (Effect.uploadVertexData), so that
+    // whittling reserved ~1 GB of segments for a ~60 MB working set.
+    gc_header** head = gc_free_for(size);
     gc_header* prev = NULL;
-    for (gc_header* h = gc_free; h != NULL; prev = h, h = h->next) {
+    for (gc_header* h = *head; h != NULL; prev = h, h = h->next) {
+        gc_audit_gate("free-list node", h);
         if (h->size >= size) {
-            if (prev) prev->next = h->next; else gc_free = h->next;
+            if (prev) prev->next = h->next; else *head = h->next;
             size_t remain = h->size - size;
             if (remain >= GC_MIN_BLOCK) {
                 gc_header* rest = (gc_header*)((char*)h + sizeof(gc_header) + size);
                 rest->size = remain - sizeof(gc_header);
-                rest->next = gc_free;
-                gc_free = rest;
+                gc_header** rl = gc_free_for(rest->size);
+                rest->next = *rl;
+                rest->type = 0;   // fresh free block: not an object header
+                *rl = rest;
                 h->size = size;
             }
+            // Charge the segment that owns this block: the block's footprint
+            // (header + payload) leaves the free pool, and the split-off
+            // remainder is still free, so the net change is exactly this block.
+            // The charge must use the block's *actual* size and therefore comes
+            // after the split above: whenever the remainder is smaller than
+            // GC_MIN_BLOCK it is not split off and stays part of this block, and
+            // charging the requested size instead would leave that difference in
+            // free_bytes forever. free_bytes can then climb above the segment's
+            // true free space, and the release pass's "this segment holds
+            // nothing" test (free_bytes == size) becomes true while live
+            // objects are still in it. The segment is then handed back to the OS
+            // (malloc reuse overwrites the live objects; gc_all itself was later
+            // seen holding a plain double), which is the "second benchmark run"
+            // SIGSEGV.
+            gc_seg_range* _sr = gc_seg_find(h);
+            if (_sr != NULL) _sr->seg->free_bytes -= sizeof(gc_header) + h->size;
             h->type = type;
+            {
+                int _k = type - GCT_TAG_BASE;
+                if (_k >= 0 && _k < 24) { gc_dbg_type_bytes[_k] += (double)h->size; gc_dbg_type_count[_k]++; }
+            }
             // Allocation barrier: while a cycle is in progress, new objects are
             // born BLACK on a side list (gc_new) so they survive this cycle and
             // never disturb the sweep walk. Writes into these new objects must
@@ -245,19 +691,39 @@ static void* gc_alloc(int type, size_t size) {
     // value-array growth hit exactly this). Mirror as_alloc's oversized branch:
     // allocate a dedicated segment sized to the request so the recursive retry
     // finds a free block of sufficient size on the next pass.
-    size_t seg_size = GC_SEG_SIZE;
-    if (size > GC_SEG_SIZE - sizeof(gc_header)) {
+    size_t seg_size = size >= GC_BIG_CLASS ? GC_SEG_SIZE : GC_SMALL_SEG_SIZE;
+    if (size > seg_size - sizeof(gc_header)) {
         seg_size = sizeof(gc_header) + size;
     }
     gc_seg* s = (gc_seg*)malloc(sizeof(gc_seg));
     s->base = (char*)malloc(seg_size);
     s->size = seg_size;
+    s->free_bytes = seg_size;   // one free block covering the whole segment
+    s->reap = 0;
     s->next = gc_segs;
     gc_segs = s;
+    gc_seg_range_add(s);
     gc_header* h = (gc_header*)s->base;
     h->size = seg_size - sizeof(gc_header);
-    h->next = gc_free;
-    gc_free = h;
+    // Split the fresh block down to the requested size before retrying. The
+    // retry walks the free list, and a brand new 1 MiB segment is a *big* block
+    // -- a small request would skip it (see the size-class check above) and
+    // recurse until the address space is gone. Splitting serves this request in
+    // one allocation and leaves any leftover in the free list as a big block for
+    // the next big request.
+    if (h->size > size && h->size - size >= GC_MIN_BLOCK) {
+        gc_header* rest = (gc_header*)((char*)h + sizeof(gc_header) + size);
+        rest->size = h->size - size - sizeof(gc_header);
+        gc_header** rl = gc_free_for(rest->size);
+        rest->next = *rl;
+        rest->type = 0;   // fresh free block: not an object header
+        *rl = rest;
+        h->size = size;
+    }
+    gc_header** hl = gc_free_for(h->size);
+    h->next = *hl;
+    h->type = 0;   // fresh free block: not an object header
+    *hl = h;
     return gc_alloc(type, size);
 }
 
@@ -304,13 +770,30 @@ static char* as_str_alloc(size_t n) {
     return (char*)gc_alloc(GCT_STRING, n);
 }
 
+// AS3 string concatenation. A String-typed slot may hold NULL (the AS3 default for
+// an unset String field, and null itself), and ES3's ToString(null) is the four
+// characters "null" — which is exactly what the reference implementation prints
+// when an HTTPStatusEvent.responseURL is null: it shows up as url=null
+// (air-probe #8). Reading NULL straight into strlen() crashed instead, so
+// substitute there.
 static char* as_str_concat(const char* a, const char* b) {
+    if (a == NULL) a = "null";
+    if (b == NULL) b = "null";
     size_t la = strlen(a), lb = strlen(b);
     char* r = as_str_alloc(la + lb + 1);
     memcpy(r, a, la);
     memcpy(r + la, b, lb);
     r[la + lb] = 0;
     return r;
+}
+
+// Null-safe String equality (AS3 ==/!= on String). A String-typed slot may
+// hold NULL (the AS3 default for an unset String field), and strcmp(NULL, ...)
+// would crash; two NULLs compare equal, a NULL never equals a non-NULL string.
+static bool as_str_eq(const char* a, const char* b) {
+    if (a == b) return true;
+    if (a == NULL || b == NULL) return false;
+    return strcmp(a, b) == 0;
 }
 static char* as_str_from_int(int v) {
     char* r = as_str_alloc(32);
@@ -365,7 +848,7 @@ static char* as_str_from_bool(bool b) {
 }
 
 typedef struct { void* vtable; } as_object_header;
-typedef struct { const char* name; void* super; void** ifaces; void* props; void* methods; int dyn_offset; } as_vtable_header;
+typedef struct { const char* name; void* super; void** ifaces; void* props; void* methods; void* getters; void* setters; int dyn_offset; const char* fqn; } as_vtable_header;
 
 // Reflection table entry: one reflectable field of a class. 'type' encodes the
 // boxed storage kind (1 number, 2 bool, 3 string, 4 int, 5 uint, 6 ref, 7 any);
@@ -413,11 +896,18 @@ static as_value as_v_null(void)     { as_value v = {0, 0.0, NULL}; return v; }
 static as_value as_v_num(double d)  { as_value v = {1, d, NULL}; return v; }
 static as_value as_v_bool(bool b)   { as_value v = {2, b ? 1.0 : 0.0, NULL}; return v; }
 static as_value as_v_str(char* s)   { as_value v = {3, 0.0, (void*)s}; return v; }
-static as_value as_v_obj(void* o)   { as_value v = {4, 0.0, o}; return v; }
-static as_value as_v_arr(void* a)   { as_value v = {6, 0.0, a}; return v; }
+// Pointer kinds normalize a NULL pointer to the null literal (tag 0). AS3 has
+// exactly one null, so any *-typed expression that evaluates to null must box
+// as tag 0, otherwise x == null is false. A ternary joining an object branch
+// with null (e.g.  n <= 3 ? new Probe(n) : null  ) boxes the join as
+// as_v_obj(NULL); without normalization the classic idiom
+// while ((v = src.next()) != null) would never terminate, because tag 4 with a
+// NULL ptr is not equal to tag 0 with a NULL ptr under as_v_eq.
+static as_value as_v_obj(void* o)   { if (o == NULL) return as_v_null(); as_value v = {4, 0.0, o}; return v; }
+static as_value as_v_arr(void* a)   { if (a == NULL) return as_v_null(); as_value v = {6, 0.0, a}; return v; }
 // Function values need their own tag so typeof can distinguish them from plain
 // objects (AS3: typeof function == "function"). The ptr is the as_fn closure.
-static as_value as_v_fn(void* f)    { as_value v = {7, 0.0, f}; return v; }
+static as_value as_v_fn(void* f)    { if (f == NULL) return as_v_null(); as_value v = {7, 0.0, f}; return v; }
 
 // Write barrier (GC-4 incremental marking, Dijkstra insertion barrier). During
 // MARK the mutator runs between gc_step slices; a write of a still-WHITE pointer
@@ -466,6 +956,31 @@ static unsigned as_to_uint32(double v) {
     return (unsigned)m;
 }
 
+// AS3 '%' (AVM2's OP_remainder) on two ints/uints is total — defined for every
+// divisor — while C's '%' is undefined behaviour in two cases:
+//   1. divisor 0      (wasm srem/urem trap by spec; native raises SIGFPE;
+//                      -O2 may instead fold the expression to an arbitrary value)
+//   2. INT_MIN % -1   (the quotient overflows: signed overflow is UB in C)
+// The adl (AIR 51) reference values, probed with mxmlc+adl on an opaque zero:
+//   int  '5 % 0'  -> NaN   (a *Number*: AVM2's remainder widens on a zero divisor)
+//   uint '5 % 0'  -> NaN
+//   int  'INT_MIN % -1' -> 0
+//   'var r:int = 5 % 0' -> 0   (an int-typed use coerces NaN to 0)
+// ASC types 'int % int' as int (adl reports '(7 % 3) is int' == true), so the
+// guarded int/uint result below is exactly AS3's in every context where the
+// value is consumed as the int/uint the compiler assigned the expression to —
+// including the zero-divisor case, where AS3 itself coerces NaN to 0. The one
+// unavoidable divergence is a *dynamically* typed use of a zero-divisor result
+// ('var x:* = a % 0'): AIR yields NaN there, we yield the int 0, because the
+// NaN case cannot be represented in the expression's static C type without
+// turning every 'i % n' into a double. See docs/zh-cn/as3-semantics.md.
+static int as_int_rem(int a, int b) {
+    return (b == 0 || (a == (-2147483647 - 1) && b == -1)) ? 0 : a % b;
+}
+static unsigned as_uint_rem(unsigned a, unsigned b) {
+    return b == 0 ? 0u : a % b;
+}
+
 static double as_v_num_val(as_value v)  { return v.num; }
 static int as_v_int_val(as_value v)     { return as_to_int32(v.num); }
 static unsigned as_v_uint_val(as_value v) { return as_to_uint32(v.num); }
@@ -498,12 +1013,19 @@ static unsigned as_v_to_uint(as_value v) {
 // AS3 truthiness for condition contexts (if/while/?:/&&/||): null and undefined
 // are falsy; numbers/booleans are tested by non-zero; empty string is falsy;
 // objects/arrays are truthy when non-null.
+// AS3 truthiness of a Number: NaN and +-0 are false, everything else true.
+// C's own "if (d)" would call NaN true (NaN != 0 is true), so both the boxed
+// path (as_v_truthy) and the statically-number-typed path (condExpr) must use
+// this test — otherwise "if (0/0)" and Boolean(NaN) diverge from AIR, which
+// reports false for both.
+static bool as_num_truthy(double x) { return x != 0.0 && !isnan(x); }
+
 static bool as_v_truthy(as_value v) {
     switch (v.tag) {
         case 0:
         case 5: return false;
         case 1:
-        case 2: return v.num != 0.0;
+        case 2: return as_num_truthy(v.num);
         case 3: return v.ptr != NULL && ((char*)v.ptr)[0] != 0;
         case 4:
         case 6:
@@ -550,6 +1072,20 @@ static char* as_v_str_val(as_value v) {
         default: return "";
     }
 }
+// Coerce a boxed dynamic value to an AS3 String reference (implicit coercion
+// into a typed String slot). null/undefined become the null String (NULL),
+// strings pass through, numbers/bools stringify. Distinct from as_v_str_val,
+// which is the display form used by trace/concat (null renders as "null").
+static char* as_coerce_str(as_value v) {
+    switch (v.tag) {
+        case 3: return (char*)v.ptr;
+        case 1: return as_str_from_double(v.num);
+        case 2: return as_str_from_bool(v.num != 0.0);
+        case 0:
+        case 5: return NULL;
+        default: return as_v_str_val(v);
+    }
+}
 // Primitive is checks on boxed values. Scalars box into as_value where all
 // numerics share tag 1, so int/uint/Number are not distinguished at runtime
 // (documented subset limitation).
@@ -557,6 +1093,8 @@ static bool as_v_is_number(as_value v) { return v.tag == 1; }
 static bool as_v_is_bool(as_value v)   { return v.tag == 2; }
 static bool as_v_is_string(as_value v) { return v.tag == 3; }
 static bool as_v_is_object(as_value v) { return v.tag == 4 || v.tag == 6; }
+static bool as_v_is_fn(as_value v)     { return v.tag == 7; }
+static bool as_v_is_array(as_value v)  { return v.tag == 6; }
 // Boxed 'any' instance-of check against a concrete class vtable. Only object/
 // array tags carry a vtable pointer; all other boxed values are not instances.
 static bool as_v_is_inst(as_value v, void* target_vt) {
@@ -586,6 +1124,22 @@ static bool as_v_eq(as_value a, as_value b) {
         default: return false;
     }
 }
+// AS3 strict equality (===): no coercion, so differing tags (including
+// undefined vs null) are never equal. Same-tag comparison mirrors as_v_eq.
+static bool as_v_seq(as_value a, as_value b) {
+    if (a.tag != b.tag) return false;
+    switch (a.tag) {
+        case 0:
+        case 5: return true;
+        case 1: return a.num == b.num;
+        case 2: return (a.num != 0.0) == (b.num != 0.0);
+        case 3: return strcmp((char*)a.ptr, (char*)b.ptr) == 0;
+        case 4:
+        case 6:
+        case 7: return a.ptr == b.ptr;
+        default: return false;
+    }
+}
 
 // ---------- function values ----------
 // A function value is a pointer to a closure record: a thunk (unboxing as_value[]
@@ -595,12 +1149,14 @@ typedef as_value (*as_fn_impl)(void* env, as_value* args, int argc);
 typedef struct {
     as_fn_impl fn;
     void* env;
+    int arity;   // AS3 Function.length: the declared parameter count
 } as_closure;
 typedef as_closure* as_fn;
-static as_fn as_fn_make(as_fn_impl fn, void* env) {
+static as_fn as_fn_make(as_fn_impl fn, void* env, int arity) {
     as_fn f = (as_fn)gc_alloc(GCT_CLOSURE, sizeof(as_closure));
     f->fn = fn;
     f->env = env;
+    f->arity = arity;
     return f;
 }
 
@@ -616,6 +1172,8 @@ typedef struct {
     double deadline;
     as_fn fn;
     int alive;
+    as_value* args;   // NULL when argc==0; GC-managed GCT_VALUE_ARRAY buffer
+    int argc;
 } as_timer;
 
 static as_timer* as_timers = NULL;
@@ -623,7 +1181,12 @@ static int as_timer_count = 0;
 static int as_timer_cap = 0;
 static unsigned int as_timer_next_id = 1;
 
-static unsigned int as_set_timeout(as_fn fn, double delay) {
+// flash.utils.setTimeout(closure, delay, ...args): schedule a Function call after
+// 'delay' ms, passing the boxed trailing 'args' to the closure when it fires.
+// Returns a uint timer id (0 when the closure is null). The args are copied into
+// a GC-managed value-array buffer so any object references survive a collection
+// between scheduling and firing.
+static unsigned int as_set_timeout_args(as_fn fn, double delay, int argc, as_value* args) {
     if (fn == NULL || fn->fn == NULL) return 0;
     if (as_timer_count == as_timer_cap) {
         as_timer_cap = as_timer_cap == 0 ? 8 : as_timer_cap * 2;
@@ -634,7 +1197,20 @@ static unsigned int as_set_timeout(as_fn fn, double delay) {
     t->deadline = as_now_ms() + delay;
     t->fn = fn;
     t->alive = 1;
+    t->argc = argc;
+    t->args = NULL;
+    if (argc > 0) {
+        t->args = (as_value*)gc_alloc(GCT_VALUE_ARRAY, sizeof(as_value) * (size_t)argc);
+        for (int i = 0; i < argc; i++) {
+            t->args[i] = args[i];
+            gc_write_barrier_value(args[i]);
+        }
+    }
     return t->id;
+}
+
+static unsigned int as_set_timeout(as_fn fn, double delay) {
+    return as_set_timeout_args(fn, delay, 0, NULL);
 }
 
 static void as_clear_timeout(unsigned int id) {
@@ -656,8 +1232,10 @@ static void as_timer_tick(void) {
         as_timer* t = &as_timers[i];
         if (t->alive && now >= t->deadline) {
             as_fn f = t->fn;
+            as_value* args = t->args;
+            int argc = t->argc;
             t->alive = 0;
-            f->fn(f->env, NULL, 0);
+            f->fn(f->env, args, argc);
         }
     }
     as_rep_timer_tick();
@@ -775,16 +1353,42 @@ typedef struct {
 static as_class* as_v_as_class(as_value v) {
     return (v.tag == 4 || v.tag == 6) ? (as_class*)as_v_obj_val(v) : NULL;
 }
+static void* as_v_as_fn(as_value v) {
+    return (v.tag == 7) ? v.ptr : NULL;
+}
 
 // ---------- dynamic array ----------
-// AS3 Array is a dynamically-growing, heterogeneously-typed sequence.
+// AS3 Array is a dynamically-growing, heterogeneously-typed sequence. It is also
+// a DYNAMIC object: a.bar = 8 stores an ordinary named property (leaving
+// a.length and the numeric elements untouched), which is why non-index keys
+// need their own slot table — they must never be folded onto element 0.
+// (struct as_object_s is declared here and defined with the record type below.)
+struct as_object_s;
 typedef struct {
     as_value* data;
     int length;
     int capacity;
     int index;      // RegExp exec/match result: match start position
     char* input;    // RegExp exec/match result: the input string
+    struct as_object_s* props; // named (non-index) properties: a.bar, a["bar"]
 } as_array;
+
+// AS3 array index keys are canonical non-negative decimal integers WITHOUT leading
+// zeros: "0", "1", "42" are indices; "01", "-1", "1.0", "" and "bar" are not
+// (they address dynamic named properties instead). Returning the index iff the
+// key is canonical is what keeps a["01"] from aliasing a[1].
+static bool as_array_index_key(const char* key, int* out) {
+    if (key == NULL || key[0] == '\\0') return false;
+    if (key[0] == '0' && key[1] != '\\0') return false; // leading zero
+    long v = 0;
+    for (const char* p = key; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        v = v * 10 + (*p - '0');
+        if (v > 0x7fffffffL) return false;
+    }
+    *out = (int)v;
+    return true;
+}
 
 static as_array* as_array_new(void) {
     as_array* a = (as_array*)gc_alloc(GCT_ARRAY, sizeof(as_array));
@@ -793,6 +1397,7 @@ static as_array* as_array_new(void) {
     a->capacity = 0;
     a->index = 0;
     a->input = NULL;
+    a->props = NULL;
     return a;
 }
 static as_array* as_array_make(int n, as_value* items) {
@@ -803,6 +1408,7 @@ static as_array* as_array_make(int n, as_value* items) {
     for (int i = 0; i < n; i++) a->data[i] = items[i];
     a->index = 0;
     a->input = NULL;
+    a->props = NULL;
     return a;
 }
 
@@ -849,6 +1455,14 @@ static void as_array_ensure(as_array* a, int need) {
         memcpy(nd, a->data, sizeof(as_value) * a->length);
     a->data = nd;
     a->capacity = cap;
+    // The fresh block is born BLACK while a cycle is in progress (allocation
+    // barrier), so the sweep will not free it -- but a black object is never
+    // scanned this cycle either, which means the pointers copied into it would
+    // be invisible to the marker and any object reachable ONLY through the new
+    // buffer would be swept WHILE STILL REFERENCED. Re-grey every copied slot
+    // (a no-op outside MARK): the write barrier is what keeps "no black object
+    // points at a white object" true for fresh blocks.
+    for (int i = 0; i < a->length; i++) gc_write_barrier_value(nd[i]);
 }
 static as_value as_array_get(as_array* a, int i) {
     if (i < 0 || i >= a->length) return as_v_null();
@@ -957,6 +1571,28 @@ static as_array* as_array_splice(as_array* a, int start, int deleteCount, as_val
     return removed;
 }
 
+// Array.insertAt(index, value): Starling's extension method. Inserts value at
+// index (clamped to [0, length]), shifting the tail right by one.
+static void as_array_insertAt(as_array* a, int index, as_value v) {
+    if (index < 0) index = 0;
+    if (index > a->length) index = a->length;
+    as_array_ensure(a, a->length + 1);
+    for (int i = a->length; i > index; i--) a->data[i] = a->data[i - 1];
+    a->data[index] = v;
+    a->length++;
+    gc_write_barrier_value(v);
+}
+
+// Array.removeAt(index): Starling's extension method. Removes the element at
+// index and returns it (or null when out of range).
+static as_value as_array_removeAt(as_array* a, int index) {
+    if (index < 0 || index >= a->length) return as_v_null();
+    as_value v = a->data[index];
+    for (int i = index; i < a->length - 1; i++) a->data[i] = a->data[i + 1];
+    a->length--;
+    return v;
+}
+
 // Array higher-order methods (map/filter) and sorting (sort/reverse). Callbacks
 // are as_fn closure pointers invoked with AS3's (element, index, array)
 // argument layout; sort shares one stable insertion-sort core across three
@@ -1049,9 +1685,575 @@ static as_array* as_array_sort_cb(as_array* a, as_fn cb) { as_array_sort_impl(a,
 // associative map. It carries a vtable header (pointing at as_object_vt) so the
 // dynamic-access runtime (as_dyn_get/set) can tell a dynamic record apart from a
 // real class instance by walking the same vtable layout used by every object.
-static as_vtable_header as_object_vt = { "Object", NULL, NULL, NULL, NULL, -1 };
+static as_vtable_header as_object_vt = { "Object", NULL, NULL, NULL, NULL, NULL, NULL, -1, "Object" };
 
+// ---------- boxed Number (Object slot holding a scalar) ----------
+// AS3's Object is the universal base AND auto-boxes scalars: 'var data:Object =
+// 3.14' stores a boxed Number, recovered by 'data as Number'. Object-typed slots
+// are represented as raw 'Object*' pointers, so a Number (a bare double) cannot
+// be stored there without boxing. This leaf object wraps the double behind the
+// same vtable header as every other object, so as_object_class_name reads
+// "Number" and 'as Number' can recover the value by checking the vtable identity.
+typedef struct as_number {
+    void* vtable;               // &as_number_vt (Object subclass)
+    double value;
+} as_number;
+
+static as_vtable_header as_number_vt = { "Number", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Number" };
+
+static as_number* as_number_new(double value) {
+    as_number* n = (as_number*)gc_alloc(GCT_NUMBER, sizeof(as_number));
+    n->vtable = (void*)&as_number_vt;
+    n->value = value;
+    return n;
+}
+
+static bool as_is_number_obj(void* obj) {
+    if (obj == NULL) return false;
+    return ((as_object_header*)obj)->vtable == (void*)&as_number_vt;
+}
+
+static double as_number_obj_val(void* obj) {
+    return obj == NULL ? 0.0 : ((as_number*)obj)->value;
+}
+
+// ---------- boxed String (Object slot holding a String) ----------
+// Mirrors boxed Number: AS3's String is a final Object subclass, so 'var data:
+// Object = "hello"' stores a boxed String, recovered by 'data as String'. A bare
+// char* (this runtime's String representation) cannot live in an Object* slot, so
+// it is wrapped behind the same vtable header. The wrapped char* is itself a
+// GCT_STRING leaf (or a non-heap literal) and is traced in gc_scan.
+typedef struct as_string {
+    void* vtable;               // &as_string_vt (Object subclass)
+    char* value;                // the wrapped GCT_STRING char*
+} as_string;
+
+static as_vtable_header as_string_vt = { "String", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "String" };
+
+static as_string* as_string_new(char* value) {
+    as_string* s = (as_string*)gc_alloc(GCT_STRING_OBJ, sizeof(as_string));
+    s->vtable = (void*)&as_string_vt;
+    s->value = value;
+    gc_write_barrier((void*)value);
+    return s;
+}
+
+static bool as_is_string_obj(void* obj) {
+    if (obj == NULL) return false;
+    return ((as_object_header*)obj)->vtable == (void*)&as_string_vt;
+}
+
+static char* as_string_obj_val(void* obj) {
+    return obj == NULL ? NULL : ((as_string*)obj)->value;
+}
+
+// ---------- boxed Function (Object slot holding a Function) ----------
+// Mirrors boxed Number/String: AS3's Function is an Object subclass, so 'var
+// data:Object = myFunc' stores a Function object recovered by 'data as Function'.
+// A bare as_fn closure has no vtable header, so it is wrapped behind the same
+// header as every other object; 'is Function'/'as Function' then identify it by
+// vtable identity. The wrapped closure is a GCT_CLOSURE and is traced in gc_scan.
 typedef struct {
+    void* vtable;               // &as_function_vt (Object subclass)
+    as_fn value;                // the wrapped closure
+} as_function;
+
+static as_vtable_header as_function_vt = { "Function", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Function" };
+
+static as_function* as_function_new(as_fn value) {
+    as_function* f = (as_function*)gc_alloc(GCT_FUNCTION_OBJ, sizeof(as_function));
+    f->vtable = (void*)&as_function_vt;
+    f->value = value;
+    gc_write_barrier((void*)value);
+    return f;
+}
+
+static bool as_is_fn_obj(void* obj) {
+    if (obj == NULL) return false;
+    return ((as_object_header*)obj)->vtable == (void*)&as_function_vt;
+}
+
+static as_fn as_fn_obj_val(void* obj) {
+    return obj == NULL ? NULL : ((as_function*)obj)->value;
+}
+
+// ---------- boxed Boolean (Object slot holding a Boolean) ----------
+// Mirrors boxed Number/String/Function: AS3's Boolean is an Object subclass, so
+// 'var data:Object = true' stores a Boolean object. Without this box a
+// primitive bool stored into an Object* slot would be a raw 0/1 reinterpreted as
+// a pointer (dangling, no vtable) — the same bug class that made
+// 'properties[property] as Number' return NaN.
+typedef struct as_boolean {
+    void* vtable;               // &as_boolean_vt (Object subclass)
+    bool value;
+} as_boolean;
+
+static as_vtable_header as_boolean_vt = { "Boolean", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Boolean" };
+
+static as_boolean* as_boolean_new(bool value) {
+    as_boolean* b = (as_boolean*)gc_alloc(GCT_BOOLEAN, sizeof(as_boolean));
+    b->vtable = (void*)&as_boolean_vt;
+    b->value = value;
+    return b;
+}
+
+static bool as_is_bool_obj(void* obj) {
+    if (obj == NULL) return false;
+    return ((as_object_header*)obj)->vtable == (void*)&as_boolean_vt;
+}
+
+static bool as_bool_obj_val(void* obj) {
+    return obj == NULL ? false : ((as_boolean*)obj)->value;
+}
+
+// Auto-box an as_value into an Object* slot: AS3's primitive-to-Object conversion.
+// A primitive (new String/number/boolean) stored into an Object-typed location
+// becomes a boxed object, so a later 'obj as Number' / 'obj as String' recovers
+// it (and as_obj_to_value unwraps it again). Reading a *dynamic member* that holds
+// a primitive ('properties[property]' in Starling's Juggler.tween, where
+// properties is a literal like { rotationX: 2*Math.PI }) relies on this: the
+// as_value coming back from as_dyn_get carries the primitive tag, not a pointer.
+static void* as_value_to_obj(as_value v) {
+    switch (v.tag) {
+        case 1: return (void*)as_number_new(v.num);
+        case 2: return (void*)as_boolean_new(v.num != 0.0);
+        case 3: return (void*)as_string_new((char*)v.ptr);
+        case 7: return (void*)as_function_new((as_fn)v.ptr);
+        case 4: case 6: return v.ptr;   // already an object / array reference
+        default: return NULL;           // null (tag 0) or void
+    }
+}
+
+// Convert an Object* reference to a boxed as_value. The Object root can hold an
+// auto-boxed scalar (Number/String) or a wrapped Function, which must round-trip
+// to its own tag (1/3/7) rather than the generic object tag (4) so that '==',
+// 'typeof' and 'is String'/'is Number'/'is Function' on the downstream as_value
+// behave per AS3. Every other object — including NULL — boxes as the ordinary
+// object/null value.
+static as_value as_obj_to_value(void* obj) {
+    if (obj == NULL) return as_v_null();
+    if (as_is_number_obj(obj)) return as_v_num(as_number_obj_val(obj));
+    if (as_is_bool_obj(obj)) return as_v_bool(as_bool_obj_val(obj));
+    if (as_is_string_obj(obj)) return as_v_str(as_string_obj_val(obj));
+    if (as_is_fn_obj(obj)) return as_v_fn((void*)as_fn_obj_val(obj));
+    return as_v_obj(obj);
+}
+
+// ---------- E4X XML (flash.xml.XML / XMLList) ----------
+// Starling's resource pipeline (TextureAtlas/BitmapFont/AssetManager) consumes
+// atlas/font XML — well-formed element/attribute/text documents without DTD/
+// entity/namespace/CDATA. A hand-written recursive-descent parser builds a DOM
+// tree (as_xml_node); the E4X navigation (@attr / .child / .(pred)) is a thin
+// layer over that tree. XML and XMLList are Object subclasses (first field is a
+// vtable) so is-XML / as-XML reuse the vtable subtype check and
+// getQualifiedClassName reads the vtable 'fqn' slot.
+
+typedef struct as_xml_node {
+    void* vtable;               // &as_xml_vt (Object subclass)
+    char* name;                 // element name (localName); NULL for text nodes
+    char* text;                 // trimmed direct text content (NULL when empty)
+    char** attr_names;          // GCT_PTR_ARRAY of GCT_STRING names
+    char** attr_vals;           // GCT_PTR_ARRAY of GCT_STRING values
+    int attr_count;
+    struct as_xml_node** children; // GCT_PTR_ARRAY of as_xml_node*
+    int child_count;
+} as_xml_node;
+
+typedef struct as_xml_list {
+    void* vtable;               // &as_xml_list_vt
+    as_xml_node** items;        // GCT_PTR_ARRAY of as_xml_node*
+    int length;
+} as_xml_list;
+
+static as_vtable_header as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML" };
+static as_vtable_header as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList" };
+
+static as_xml_node* as_xml_node_new(char* name) {
+    as_xml_node* n = (as_xml_node*)gc_alloc(GCT_XML, sizeof(as_xml_node));
+    n->vtable = (void*)&as_xml_vt;
+    n->name = name;
+    return n;
+}
+
+static as_xml_list* as_xml_list_new(as_xml_node** items, int length) {
+    as_xml_list* l = (as_xml_list*)gc_alloc(GCT_XML_LIST, sizeof(as_xml_list));
+    l->vtable = (void*)&as_xml_list_vt;
+    l->items = items;
+    l->length = length;
+    return l;
+}
+
+// Growable pointer buffer used by the parser to accumulate children (as_xml_node*)
+// and attributes (char*) before the node's final arrays are sized exactly.
+typedef struct { void** items; int length; int cap; } as_xml_buf;
+static void as_xml_buf_push(as_xml_buf* b, void* p) {
+    if (b->length == b->cap) {
+        b->cap = b->cap == 0 ? 4 : b->cap * 2;
+        void** nb = (void**)gc_alloc(GCT_PTR_ARRAY, sizeof(void*) * (size_t)b->cap);
+        if (b->length > 0) memcpy(nb, b->items, sizeof(void*) * (size_t)b->length);
+        b->items = nb;
+        // Fresh block born BLACK during a cycle: re-grey the copied pointers,
+        // otherwise the parser's child/attribute nodes are invisible to the
+        // marker and get swept while the (not yet published) node still needs
+        // them. See as_array_ensure for the full rationale.
+        for (int i = 0; i < b->length; i++) gc_write_barrier(nb[i]);
+    }
+    b->items[b->length++] = p;
+    gc_write_barrier(p);
+}
+
+// Parser cursor over the raw XML text.
+typedef struct { const char* s; int i; int n; } as_xml_sc;
+
+// Scan an XML name (letters/digits/_/-/./:). Returns a GC string or NULL.
+static char* as_xml_sc_name(as_xml_sc* sc) {
+    int start = sc->i;
+    while (sc->i < sc->n) {
+        unsigned char c = (unsigned char)sc->s[sc->i];
+        if (isalnum(c) || c == '_' || c == '-' || c == '.' || c == ':') sc->i++;
+        else break;
+    }
+    if (sc->i == start) return NULL;
+    char* r = as_str_alloc((size_t)(sc->i - start) + 1);
+    memcpy(r, sc->s + start, (size_t)(sc->i - start));
+    r[sc->i - start] = 0;
+    return r;
+}
+static void as_xml_sc_ws(as_xml_sc* sc) {
+    while (sc->i < sc->n) {
+        unsigned char c = (unsigned char)sc->s[sc->i];
+        if (c == ' ' || c == '\\t' || c == '\\r' || c == '\\n') sc->i++;
+        else break;
+    }
+}
+// Scan a quoted attribute value; returns a GC string or NULL (unterminated).
+static char* as_xml_sc_attrval(as_xml_sc* sc) {
+    if (sc->i >= sc->n) return NULL;
+    char q = sc->s[sc->i];
+    if (q != '"' && q != '\\'') return NULL;
+    sc->i++;
+    int start = sc->i;
+    while (sc->i < sc->n && sc->s[sc->i] != q) sc->i++;
+    if (sc->i >= sc->n) return NULL;
+    char* r = as_str_alloc((size_t)(sc->i - start) + 1);
+    memcpy(r, sc->s + start, (size_t)(sc->i - start));
+    r[sc->i - start] = 0;
+    sc->i++; // closing quote
+    return r;
+}
+
+// Trim leading/trailing whitespace in place; returns the trimmed start pointer.
+static char* as_xml_trim(char* s) {
+    if (!s) return NULL;
+    while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\\t' || s[n-1] == '\\r' || s[n-1] == '\\n')) n--;
+    s[n] = 0;
+    return s;
+}
+
+static as_xml_node* as_xml_sc_element(as_xml_sc* sc);
+
+// Parse one element (caller has consumed nothing; *sc points at '<').
+static as_xml_node* as_xml_sc_element(as_xml_sc* sc) {
+    sc->i++; // '<'
+    char* name = as_xml_sc_name(sc);
+    if (!name) return NULL;
+    as_xml_node* node = as_xml_node_new(name);
+
+    // attributes
+    as_xml_buf anames = { NULL, 0, 0 };
+    as_xml_buf avals = { NULL, 0, 0 };
+    for (;;) {
+        as_xml_sc_ws(sc);
+        int c = sc->i < sc->n ? (unsigned char)sc->s[sc->i] : -1;
+        if (c == '>') { sc->i++; break; }
+        if (c == '/') {
+            if (sc->i + 1 < sc->n && sc->s[sc->i + 1] == '>') { sc->i += 2; node->child_count = 0; node->children = NULL; goto as_xml_done_attrs; }
+            return NULL;
+        }
+        if (c < 0) return NULL;
+        char* an = as_xml_sc_name(sc);
+        if (!an) return NULL;
+        as_xml_sc_ws(sc);
+        if (sc->i >= sc->n || sc->s[sc->i] != '=') return NULL;
+        sc->i++;
+        as_xml_sc_ws(sc);
+        char* av = as_xml_sc_attrval(sc);
+        if (!av) return NULL;
+        as_xml_buf_push(&anames, (void*)an);
+        as_xml_buf_push(&avals, (void*)av);
+    }
+
+    // children / text until the matching close tag
+    as_xml_buf children = { NULL, 0, 0 };
+    char* text = NULL;
+    size_t textlen = 0;
+    for (;;) {
+        if (sc->i >= sc->n) return NULL; // unterminated
+        if (sc->s[sc->i] == '<') {
+            if (sc->i + 1 < sc->n && sc->s[sc->i + 1] == '/') {
+                sc->i += 2;
+                as_xml_sc_name(sc);
+                as_xml_sc_ws(sc);
+                if (sc->i < sc->n && sc->s[sc->i] == '>') sc->i++;
+                break;
+            }
+            if (sc->i + 1 < sc->n && sc->s[sc->i + 1] == '?') {
+                sc->i += 2;
+                while (sc->i + 1 < sc->n && !(sc->s[sc->i] == '?' && sc->s[sc->i + 1] == '>')) sc->i++;
+                if (sc->i + 1 < sc->n) sc->i += 2;
+                continue;
+            }
+            if (sc->i + 1 < sc->n && sc->s[sc->i + 1] == '!') {
+                // comment / CDATA / DOCTYPE
+                if (sc->n - sc->i >= 4 && strncmp(sc->s + sc->i, "<!--", 4) == 0) {
+                    sc->i += 4;
+                    while (sc->i + 2 < sc->n && !(sc->s[sc->i] == '-' && sc->s[sc->i + 1] == '-' && sc->s[sc->i + 2] == '>')) sc->i++;
+                    if (sc->i + 2 < sc->n) sc->i += 3;
+                    continue;
+                }
+                if (sc->n - sc->i >= 9 && strncmp(sc->s + sc->i, "<![CDATA[", 9) == 0) {
+                    sc->i += 9;
+                    int start = sc->i;
+                    while (sc->i + 2 < sc->n && !(sc->s[sc->i] == ']' && sc->s[sc->i + 1] == ']' && sc->s[sc->i + 2] == '>')) sc->i++;
+                    int tlen = sc->i - start;
+                    if (tlen > 0) {
+                        char* merged = as_str_alloc(textlen + (size_t)tlen + 1);
+                        if (textlen > 0) memcpy(merged, text, textlen);
+                        memcpy(merged + textlen, sc->s + start, (size_t)tlen);
+                        merged[textlen + tlen] = 0;
+                        text = merged;
+                        textlen += (size_t)tlen;
+                    }
+                    if (sc->i + 2 < sc->n) sc->i += 3;
+                    continue;
+                }
+                // <!DOCTYPE ...> or any <!...> declaration: skip to '>'
+                sc->i += 2;
+                while (sc->i < sc->n && sc->s[sc->i] != '>') sc->i++;
+                if (sc->i < sc->n) sc->i++;
+                continue;
+            }
+            // child element
+            as_xml_node* child = as_xml_sc_element(sc);
+            if (!child) return NULL;
+            as_xml_buf_push(&children, (void*)child);
+        } else {
+            int start = sc->i;
+            while (sc->i < sc->n && sc->s[sc->i] != '<') sc->i++;
+            int tlen = sc->i - start;
+            if (tlen > 0) {
+                char* piece = as_str_alloc((size_t)tlen + 1);
+                memcpy(piece, sc->s + start, (size_t)tlen);
+                piece[tlen] = 0;
+                char* merged = as_str_alloc(textlen + (size_t)tlen + 1);
+                if (textlen > 0) memcpy(merged, text, textlen);
+                memcpy(merged + textlen, piece, (size_t)tlen);
+                merged[textlen + tlen] = 0;
+                text = merged;
+                textlen += (size_t)tlen;
+            }
+        }
+    }
+    // Install children and trimmed text.
+    node->child_count = children.length;
+    node->children = (as_xml_node**)children.items;
+    node->text = as_xml_trim(text);
+    if (node->text && node->text[0] == 0) node->text = NULL;
+
+as_xml_done_attrs:
+    node->attr_count = anames.length;
+    node->attr_names = (char**)anames.items;
+    node->attr_vals = (char**)avals.items;
+    return node;
+}
+
+// Parse a complete XML document. Returns the root node, or NULL on malformed
+// input (the caller throws an AS3 Error — see emitNew for new XML(...)).
+static as_xml_node* as_xml_parse(const char* src, int len) {
+    if (!src) return NULL;
+    as_xml_sc sc = { src, 0, len };
+    as_xml_node* root = NULL;
+    while (sc.i < sc.n) {
+        if (sc.s[sc.i] == '<') {
+            if (sc.i + 1 < sc.n && (sc.s[sc.i + 1] == '?' || sc.s[sc.i + 1] == '!')) {
+                // leading XML declaration / DOCTYPE
+                if (sc.s[sc.i + 1] == '?') {
+                    sc.i += 2;
+                    while (sc.i + 1 < sc.n && !(sc.s[sc.i] == '?' && sc.s[sc.i + 1] == '>')) sc.i++;
+                    if (sc.i + 1 < sc.n) sc.i += 2;
+                } else {
+                    sc.i += 2;
+                    while (sc.i < sc.n && sc.s[sc.i] != '>') sc.i++;
+                    if (sc.i < sc.n) sc.i++;
+                }
+                continue;
+            }
+            root = as_xml_sc_element(&sc);
+            if (!root) return NULL;
+        } else {
+            unsigned char c = (unsigned char)sc.s[sc.i];
+            if (c == ' ' || c == '\\t' || c == '\\r' || c == '\\n') { sc.i++; continue; }
+            return NULL; // stray text before root element
+        }
+    }
+    return root;
+}
+
+// ---------- E4X navigation helpers ----------
+static char* as_xml_local_name(as_xml_node* n) { return n ? n->name : NULL; }
+
+// @attr: return the attribute value, or the empty string when absent (E4X's
+// undefined attribute stringifies to "", matching AS3's implicit toString).
+static char* as_xml_attr(as_xml_node* n, const char* name) {
+    if (!n) return "";
+    for (int i = 0; i < n->attr_count; i++) {
+        if (strcmp(n->attr_names[i], name) == 0) return n->attr_vals[i];
+    }
+    return "";
+}
+
+// .child: all direct children whose name matches (empty name = all children).
+static as_xml_list* as_xml_children(as_xml_node* n, const char* name) {
+    if (!n || n->child_count == 0) return as_xml_list_new(NULL, 0);
+    as_xml_buf buf = { NULL, 0, 0 };
+    for (int i = 0; i < n->child_count; i++) {
+        as_xml_node* c = n->children[i];
+        if (!c->name) continue;
+        if (name == NULL || name[0] == 0 || strcmp(c->name, name) == 0) as_xml_buf_push(&buf, (void*)c);
+    }
+    return as_xml_list_new((as_xml_node**)buf.items, buf.length);
+}
+
+// Flatten a list's children of a given name across all its nodes (.a.b).
+static as_xml_list* as_xml_list_children(as_xml_list* l, const char* name) {
+    as_xml_buf buf = { NULL, 0, 0 };
+    if (l) {
+        for (int i = 0; i < l->length; i++) {
+            as_xml_list* sub = as_xml_children(l->items[i], name);
+            for (int j = 0; j < sub->length; j++) as_xml_buf_push(&buf, (void*)sub->items[j]);
+        }
+    }
+    return as_xml_list_new((as_xml_node**)buf.items, buf.length);
+}
+
+// @attr on a list: the attribute of the first matching item (E4X list.@attr
+// returns an XMLList, but Starling only reads it in a scalar String context).
+static char* as_xml_list_attr(as_xml_list* l, const char* name) {
+    if (!l) return "";
+    for (int i = 0; i < l->length; i++) {
+        char* v = as_xml_attr(l->items[i], name);
+        if (v[0] != 0) return v;
+    }
+    return "";
+}
+
+// .( @attr == value ): keep the items whose named attribute equals the given
+// string (neq=1 inverts to !=). Starling uses this only as @attr == "str".
+static as_xml_list* as_xml_filter(as_xml_list* l, const char* attr, const char* value, int neq) {
+    as_xml_buf buf = { NULL, 0, 0 };
+    if (l) {
+        for (int i = 0; i < l->length; i++) {
+            const char* av = as_xml_attr(l->items[i], attr);
+            int cmp = strcmp(av, value);
+            if (neq ? (cmp != 0) : (cmp == 0)) as_xml_buf_push(&buf, (void*)l->items[i]);
+        }
+    }
+    return as_xml_list_new((as_xml_node**)buf.items, buf.length);
+}
+
+// flash.utils.describeType(value:*):XML — build a minimal <type name="fqn"/> DOM
+// tree describing a Class reference. Starling's AssetManager reads typeXml.@name
+// plus constant/variable nodes of type "Class"; the demo enqueues File values
+// (never Class), so those child lists stay empty — only @name is structurally
+// needed there. The tree is a real as_xml_node, so @name / .child / .(pred) all
+// operate on it exactly as on parsed XML.
+static as_xml_node* as_describe_type(as_class* cls) {
+    const char* fqn = "Object";
+    if (cls && cls->vtable) {
+        const char* f = ((as_vtable_header*)cls->vtable)->fqn;
+        if (f) fqn = f;
+    }
+    as_xml_node* n = as_xml_node_new((char*)"type");
+    as_xml_buf anames = { NULL, 0, 0 };
+    as_xml_buf avals = { NULL, 0, 0 };
+    as_xml_buf_push(&anames, (void*)"name");
+    as_xml_buf_push(&avals, (void*)(char*)fqn);
+    n->attr_count = anames.length;
+    n->attr_names = (char**)anames.items;
+    n->attr_vals = (char**)avals.items;
+    return n;
+}
+
+// Serialize an element back to XML text (best-effort, for toString()).
+// Grow a char* buffer in place (reallocating via as_str_alloc when full) and
+// append a length-delimited chunk. Used by the serializer below; a plain helper
+// avoids a function-like macro, whose line-continuation backslashes would be
+// mangled by the JS template-string layer that holds this preamble.
+static void as_xml_append(char** outp, size_t* lenp, size_t* capp, const char* chunk, size_t sz) {
+    char* out = *outp;
+    size_t len = *lenp;
+    size_t cap = *capp;
+    if (len + sz + 1 > cap) {
+        while (len + sz + 1 > cap) cap *= 2;
+        char* nb = as_str_alloc(cap);
+        memcpy(nb, out, len);
+        nb[len] = 0;
+        out = nb;
+    }
+    memcpy(out + len, chunk, sz);
+    len += sz;
+    out[len] = 0;
+    *outp = out;
+    *lenp = len;
+    *capp = cap;
+}
+
+static char* as_xml_to_string(as_xml_node* n) {
+    if (!n) return "";
+    if (!n->name) return n->text ? n->text : "";
+    // <name attr="v" ...>...</name>
+    size_t cap = 64;
+    char* out = as_str_alloc(cap);
+    size_t len = 0;
+    char q[2]; q[0] = '"'; q[1] = 0;
+    char eq[2]; eq[0] = '='; eq[1] = 0;
+    as_xml_append(&out, &len, &cap, "<", 1);
+    as_xml_append(&out, &len, &cap, n->name, strlen(n->name));
+    for (int i = 0; i < n->attr_count; i++) {
+        as_xml_append(&out, &len, &cap, " ", 1);
+        as_xml_append(&out, &len, &cap, n->attr_names[i], strlen(n->attr_names[i]));
+        as_xml_append(&out, &len, &cap, eq, 1);
+        as_xml_append(&out, &len, &cap, q, 1);
+        as_xml_append(&out, &len, &cap, n->attr_vals[i], strlen(n->attr_vals[i]));
+        as_xml_append(&out, &len, &cap, q, 1);
+    }
+    if (n->child_count == 0 && !n->text) {
+        as_xml_append(&out, &len, &cap, "/>", 2);
+        return out;
+    }
+    as_xml_append(&out, &len, &cap, ">", 1);
+    for (int i = 0; i < n->child_count; i++) {
+        char* cs = as_xml_to_string(n->children[i]);
+        as_xml_append(&out, &len, &cap, cs, strlen(cs));
+    }
+    if (n->text) as_xml_append(&out, &len, &cap, n->text, strlen(n->text));
+    as_xml_append(&out, &len, &cap, "</", 2);
+    as_xml_append(&out, &len, &cap, n->name, strlen(n->name));
+    as_xml_append(&out, &len, &cap, ">", 1);
+    return out;
+}
+
+// Serialize a list to text by concatenating each node's serialization.
+static char* as_xml_list_to_string(as_xml_list* l) {
+    if (!l || l->length == 0) return "";
+    char* out = (char*)"";
+    for (int i = 0; i < l->length; i++) out = as_str_concat(out, as_xml_to_string(l->items[i]));
+    return out;
+}
+
+typedef struct as_object_s {
     void* vtable;
     char** keys;
     as_value* vals;
@@ -1102,11 +2304,54 @@ static char* as_v_typeof(as_value v) {
         case 1: return "number";
         case 2: return "boolean";
         case 3: return "string";
-        case 4: return "object";
+        // A Function value sitting in an Object-typed slot is autoboxed into an
+        // as_function (as_value_to_obj), so its dynamic type is still "function"
+        // -- AS3 reports typeof(f) == "function" for every function value.
+        case 4: return (v.ptr != NULL && ((as_object_header*)v.ptr)->vtable == (void*)&as_function_vt)
+                       ? "function" : "object";
         case 6: return "object";
         case 7: return "function";
         case 0: return "object"; // AS3: typeof null == "object" (ES3 quirk)
         default: return "undefined";
+    }
+}
+
+// typeof for a value held in an Object/interface slot: the slot only knows the
+// *static* type, but AS3's typeof inspects the *dynamic* one. Primitives and
+// Function values stored in such a slot are autoboxed (as_value_to_obj), so
+// they must map back to their primitive names instead of the generic "object".
+static char* as_ptr_typeof(void* p) {
+    if (p == NULL) return "object";
+    void* vt = ((as_object_header*)p)->vtable;
+    if (vt == (void*)&as_number_vt)   return "number";
+    if (vt == (void*)&as_boolean_vt)  return "boolean";
+    if (vt == (void*)&as_string_vt)   return "string";
+    if (vt == (void*)&as_function_vt) return "function";
+    return "object";
+}
+
+// flash.utils.getQualifiedClassName(value:*):String — AS3 fully-qualified class
+// name ("包::类", e.g. "starling.display::DisplayObject"). Primitives map to the
+// canonical name strings; object instances and Class references both carry the
+// class vtable as their first field (as_object_header / as_class), so both read
+// the vtable's 'fqn' slot. NOTE: int/uint are boxed as number (tag 1) by boxExpr,
+// so getQualifiedClassName(5) yields "Number" rather than "int" — a documented
+// precision limit (Starling never reflects primitives, so it is moot there).
+static char* as_get_qualified_class_name(as_value v) {
+    switch (v.tag) {
+        case 0: return "null";
+        case 1: return "Number";   // int/uint box into number (see note above)
+        case 2: return "Boolean";
+        case 3: return "String";
+        case 5: return "void";     // undefined
+        case 6: return "Array";
+        case 7: return "Function";
+        case 4: {
+            if (v.ptr == NULL) return "null";
+            void* vt = ((as_object_header*)v.ptr)->vtable;
+            return (char*)(vt ? ((as_vtable_header*)vt)->fqn : "Object");
+        }
+        default: return "Object";
     }
 }
 static as_value as_object_set(as_object* o, const char* key, as_value v) {
@@ -1129,6 +2374,10 @@ static as_value as_object_set(as_object* o, const char* key, as_value v) {
         o->keys = nk;
         o->vals = nv;
         o->capacity = cap;
+        // Both blocks are born BLACK during a cycle (allocation barrier): re-grey
+        // the copied keys/values so properties reachable only through the new
+        // parallel arrays are not swept while still referenced.
+        for (int i = 0; i < o->length; i++) { gc_write_barrier((void*)nk[i]); gc_write_barrier_value(nv[i]); }
     }
     o->keys[o->length] = (char*)key;
     o->vals[o->length] = v;
@@ -1150,6 +2399,14 @@ static as_object* as_object_make(int n, char** keys, as_value* vals) {
 // found and the object is a dynamic record (as_object_vt), it falls back to the
 // record's string-keyed slot table. Used by obj[key] where the receiver's static
 // type is 'Object'.
+//
+// Error #1056 / #1069 are raised for SEALED class instances. Their messages are
+// built by helpers emitted later in the file (they construct Error objects, whose
+// class definitions follow this preamble), so they are prototyped here. AIR's text:
+//   "Error #1056: Cannot create property <key> on <qualified class>."
+//   "Error #1069: Property <key> not found on <qualified class> and there is no default value."
+static void as_throw_sealed_set(const char* key, const char* fqn);
+static as_value as_throw_sealed_get(const char* key, const char* fqn);
 static as_value as_dyn_get(void* obj, const char* key) {
     if (obj == NULL) return as_v_null();
     void* vt = ((as_object_header*)obj)->vtable;
@@ -1174,6 +2431,33 @@ static as_value as_dyn_get(void* obj, const char* key) {
         }
         vt = ((as_vtable_header*)vt)->super;
     }
+    // Getter reflection: dynamic obj["prop"] reaches read-only properties
+    // (File.exists / File.isDirectory / File.isHidden / File.url) that are not
+    // declared fields. The getter thunk shares the as_method signature and boxes
+    // its typed return value.
+    vt = ((as_object_header*)obj)->vtable;
+    while (vt != NULL) {
+        as_method* getters = (as_method*)((as_vtable_header*)vt)->getters;
+        if (getters != NULL) {
+            for (int i = 0; getters[i].name != NULL; i++) {
+                if (strcmp(getters[i].name, key) == 0) return getters[i].fn(obj, NULL, 0);
+            }
+        }
+        vt = ((as_vtable_header*)vt)->super;
+    }
+    // Method reflection: dynamic obj["method"] used as a Function value (e.g.
+    // asset["getDirectoryListing"]()) returns a bound-method closure whose env is
+    // the receiver, so as_fn_call_dyn invokes the real implementation.
+    vt = ((as_object_header*)obj)->vtable;
+    while (vt != NULL) {
+        as_method* methods = (as_method*)((as_vtable_header*)vt)->methods;
+        if (methods != NULL) {
+            for (int i = 0; methods[i].name != NULL; i++) {
+                if (strcmp(methods[i].name, key) == 0) return as_v_fn(as_fn_make(methods[i].fn, obj, -1));
+            }
+        }
+        vt = ((as_vtable_header*)vt)->super;
+    }
     as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
     if (hv == &as_object_vt) {
         return as_object_get((as_object*)obj, key);
@@ -1184,7 +2468,47 @@ static as_value as_dyn_get(void* obj, const char* key) {
         as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
         return dyn == NULL ? as_v_null() : as_object_get(dyn, key);
     }
-    return as_v_null();
+    // Sealed class instance: the property does not exist and AS3 has no default
+    // value for it, so the read is a runtime error (ReferenceError #1069) — not a
+    // silent null/undefined. (Only a *dynamic* receiver falls through to the
+    // slot table above; Object records were handled even earlier.)
+    return as_throw_sealed_get(key, hv->fqn);
+}
+
+// 'key in obj' membership test for class instances (sealed or dynamic), used by
+// the 'in' operator when the right operand is statically a class/interface
+// reference. Walks fields, getters, and methods across the super chain; a plain
+// record (Object) checks its slot table; dynamic classes check their _dyn table.
+static bool as_dyn_has(void* obj, const char* key) {
+    if (obj == NULL) return false;
+    void* vt = ((as_object_header*)obj)->vtable;
+    while (vt != NULL) {
+        as_prop* props = (as_prop*)((as_vtable_header*)vt)->props;
+        if (props != NULL)
+            for (int i = 0; props[i].name != NULL; i++)
+                if (strcmp(props[i].name, key) == 0) return true;
+        as_method* getters = (as_method*)((as_vtable_header*)vt)->getters;
+        if (getters != NULL)
+            for (int i = 0; getters[i].name != NULL; i++)
+                if (strcmp(getters[i].name, key) == 0) return true;
+        as_method* methods = (as_method*)((as_vtable_header*)vt)->methods;
+        if (methods != NULL)
+            for (int i = 0; methods[i].name != NULL; i++)
+                if (strcmp(methods[i].name, key) == 0) return true;
+        // Setter-only accessors are traits too (hasOwnProperty must see them).
+        as_method* setters = (as_method*)((as_vtable_header*)vt)->setters;
+        if (setters != NULL)
+            for (int i = 0; setters[i].name != NULL; i++)
+                if (strcmp(setters[i].name, key) == 0) return true;
+        vt = ((as_vtable_header*)vt)->super;
+    }
+    as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
+    if (hv == &as_object_vt) return as_object_has((as_object*)obj, key);
+    if (hv->dyn_offset >= 0) {
+        as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
+        return dyn != NULL && as_object_has(dyn, key);
+    }
+    return false;
 }
 
 static void as_dyn_set(void* obj, const char* key, as_value v) {
@@ -1211,6 +2535,21 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
         }
         vt = ((as_vtable_header*)vt)->super;
     }
+    // Setter reflection: a dynamic write (obj[key] = v) must reach accessors, not
+    // just fields. Starling's Juggler tweens accessor-backed properties
+    // (DisplayObject.alpha/x/y/scaleX, Sprite3D.rotationX...) through an
+    // Object-typed target, so without this branch every such tween silently did
+    // nothing. A getter without a setter stays read-only, as in AS3.
+    vt = ((as_object_header*)obj)->vtable;
+    while (vt != NULL) {
+        as_method* setters = (as_method*)((as_vtable_header*)vt)->setters;
+        if (setters != NULL) {
+            for (int i = 0; setters[i].name != NULL; i++) {
+                if (strcmp(setters[i].name, key) == 0) { setters[i].fn(obj, &v, 1); return; }
+            }
+        }
+        vt = ((as_vtable_header*)vt)->super;
+    }
     as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
     if (hv == &as_object_vt) {
         as_object_set((as_object*)obj, key, v);
@@ -1219,7 +2558,26 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
     if (hv->dyn_offset >= 0) {
         as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
         if (dyn != NULL) as_object_set(dyn, key, v);
+        return;
     }
+    // Sealed class instance: creating a new property is a runtime error in AS3
+    // (ReferenceError #1056). Previously this was a silent no-op, so
+    // d.unknown = 5 on a sealed instance quietly discarded the write.
+    as_throw_sealed_set(key, hv->fqn);
+}
+
+
+// Named (non-index) property access on an Array. AIR's Array is dynamic, so
+// a.bar = 8 stores an ordinary named property beside the elements; the table is
+// allocated lazily, since the vast majority of arrays never carry one.
+static as_value as_array_prop_get(as_array* a, const char* key) {
+    return (a == NULL || a->props == NULL) ? as_v_null() : as_object_get(a->props, key);
+}
+static void as_array_prop_set(as_array* a, const char* key, as_value v) {
+    if (a == NULL) return;
+    if (a->props == NULL) a->props = as_object_new();
+    as_object_set(a->props, key, v);
+    gc_write_barrier((void*)a->props);
 }
 
 // Dynamically-typed ('any') index read: dispatch on the boxed value's runtime
@@ -1227,7 +2585,14 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
 static as_value as_any_get(as_value box, const char* key) {
     switch (box.tag) {
         case 4: return as_dyn_get(as_v_obj_val(box), key);
-        case 6: return as_array_get((as_array*)as_v_obj_val(box), (int)strtol(key, NULL, 10));
+        case 6: {
+            as_array* arr = (as_array*)as_v_obj_val(box);
+            int i;
+            if (as_array_index_key(key, &i)) return as_array_get(arr, i);
+            // Non-index key on a dynamically-typed Array reference: a named
+            // dynamic property (a.bar), NOT element 0 (strtol("bar") == 0).
+            return as_array_prop_get(arr, key);
+        }
         case 3: return as_v_str((char*)key);
         default: return as_v_null();
     }
@@ -1235,9 +2600,38 @@ static as_value as_any_get(as_value box, const char* key) {
 static void as_any_set(as_value box, const char* key, as_value v) {
     switch (box.tag) {
         case 4: as_dyn_set(as_v_obj_val(box), key, v); break;
-        case 6: as_array_set((as_array*)as_v_obj_val(box), (int)strtol(key, NULL, 10), v); break;
+        case 6: {
+            as_array* arr = (as_array*)as_v_obj_val(box);
+            int i;
+            if (as_array_index_key(key, &i)) { as_array_set(arr, i, v); break; }
+            // a.bar = 8 stores a named dynamic property; it must not touch
+            // a[0] (strtol("bar") == 0) nor change a.length.
+            as_array_prop_set(arr, key, v);
+            break;
+        }
         default: break;
     }
+}
+
+// The + operator when a dynamically-typed operand decides the semantics: ES3
+// ToPrimitive with the default hint, i.e. if either operand's *runtime* value is a
+// String -- or an object (whose default-hint conversion goes through toString,
+// which yields a String) -- the operands concatenate; otherwise they add
+// numerically. The emitter handles the case where one side is *statically* a
+// String (as_str_concat); this helper covers any+any and any+statically-non-string,
+// where only the box tag knows: var a:Array = ["x","y"]; a[0] + a[1] must be "xy"
+// (it used to emit as_v_to_number(..) + as_v_to_number(..) = 0), and d + 1 with
+// d:* holding "x" must be "x1" (it used to be 1).
+// Object/array boxes render through as_v_str_val ("object"/"[Array]"), the same
+// display form the static-String path and trace use -- i.e. the concat-vs-add
+// *decision* matches AS3 ToPrimitive, while their text is this subset's
+// simplification rather than AS3's toString()/join (see README current limits).
+// null/undefined coerce to 0 in the numeric branch, matching as_v_to_number.
+static as_value as_add_v(as_value a, as_value b) {
+    bool a_obj = a.tag == 3 || a.tag == 4 || a.tag == 6 || a.tag == 7;
+    bool b_obj = b.tag == 3 || b.tag == 4 || b.tag == 6 || b.tag == 7;
+    if (a_obj || b_obj) return as_v_str(as_str_concat(as_v_str_val(a), as_v_str_val(b)));
+    return as_v_num(as_v_to_number(a) + as_v_to_number(b));
 }
 
 // Array.sortOn(field, options): sort objects in place by a named property. The
@@ -1319,6 +2713,9 @@ static as_value as_dict_set(as_dict* d, as_value key, as_value v) {
         d->keys = nk;
         d->vals = nv;
         d->capacity = cap;
+        // Fresh blocks born BLACK during a cycle: re-grey the copied keys/values
+        // (see as_array_ensure) so Dictionary entries are not swept white.
+        for (int i = 0; i < d->length; i++) { gc_write_barrier_value(nk[i]); gc_write_barrier_value(nv[i]); }
     }
     d->keys[d->length] = key;
     d->vals[d->length] = v;
@@ -1358,12 +2755,32 @@ static int as_str_indexOf(const char* s, const char* sub) {
     const char* p = strstr(s, sub);
     return p ? (int)(p - s) : -1;
 }
-static int as_str_lastIndexOf(const char* s, const char* sub) {
+// AS3 String.indexOf(value, startIndex=0) / lastIndexOf(value, startIndex=0x7FFFFFFF).
+// The optional startIndex is NOT decoration: walking a string line by line means
+// s.indexOf(newline, i), and dropping the bound silently returns the FIRST
+// occurrence instead of the next one after i — a wrong answer, not a missing
+// feature (a real defect until stage 89·53; found by the HTTP/2 probe).
+//
+// Exact semantics, pinned against adl (temp/air-probe/Probe10.as):
+//   indexOf    clamps start to [0, len] and takes the first match AT OR AFTER it;
+//              an empty needle matches at the clamped position
+//              ("abcabc".indexOf("bc",99) = -1, .indexOf("",9) = 6, .indexOf("bc",-3) = 1)
+//   lastIndexOf clamps down to len, but a NEGATIVE start returns -1 outright — it
+//              is not clamped to 0 ("abcabc".lastIndexOf("a",-1) = -1)
+static int as_str_indexOf_from(const char* s, const char* sub, int from) {
     int slen = (int)strlen(s);
+    if (from < 0) from = 0;
+    if (from > slen) from = slen;
+    const char* p = strstr(s + from, sub);
+    return p ? (int)(p - s) : -1;
+}
+static int as_str_lastIndexOf_from(const char* s, const char* sub, int from) {
+    if (from < 0) return -1;
+    int slen = (int)strlen(s);
+    if (from > slen) from = slen;
     int sublen = (int)strlen(sub);
-    if (sublen == 0) return slen;
-    for (int i = slen - sublen; i >= 0; i--) {
-        if (strncmp(s + i, sub, sublen) == 0) return i;
+    for (int i = from; i >= 0; i--) {
+        if (strncmp(s + i, sub, (size_t)sublen) == 0) return i;
     }
     return -1;
 }
@@ -1554,12 +2971,276 @@ static void gc_grey_push(gc_header* h) {
     gc_inc.grey[gc_inc.grey_top++] = h;
 }
 
+// ---------- ASC_GC_AUDIT: dangling-reference detector (diagnostic) ----------
+// A precise collector's worst failure mode is silent: a live object keeps a
+// pointer to a block the sweep already returned to a free list. Nothing fails
+// at that moment -- the freed block still holds its old bytes, so the stale
+// pointer keeps 'working' -- and the corruption only shows up much later, when
+// the block has been handed to a new owner. In the Starling benchmark that cost
+// an afternoon: a Mesh's '_style' pointer began reading a double (the reused
+// block now held a numeric payload) and the process died in
+// BatchProcessor.addMesh on the *second* ramp, a full minute after the object
+// had been freed.
+//
+// This mode reports the bug at the moment the collector first sees it: every
+// pointer offered to the marker is classified, and one that lands on a free
+// block (type 0) or inside a segment the release pass handed back to the OS is
+// reported together with its *holder* -- the object (AS3 class name plus the
+// reflecting-table property, when there is one) or the root slot it came from.
+// Free blocks are remembered in a ring so the report can also name what the
+// freed object *was*. Off by default; ASC_GC_AUDIT=1 enables it (see
+// docs/zh-cn/gc.md).
+#define GC_AUDIT_FREED_RING 65536
+static gc_header* gc_audit_freed[GC_AUDIT_FREED_RING];
+static int gc_audit_freed_type[GC_AUDIT_FREED_RING];
+static size_t gc_audit_freed_size[GC_AUDIT_FREED_RING];
+static void* gc_audit_freed_vt[GC_AUDIT_FREED_RING];
+static int gc_audit_freed_pos = 0;
+static int gc_audit_reports = 0;
+// Separate budgets: the free_bytes drift lines are numerous and only
+// informative in bulk, while a DANGLING/RELEASING report IS the finding --
+// it must never be crowded out by drift noise (crowding out is exactly what
+// hid the first diagnosis).
+static int gc_audit_drift_reports = 0;
+static int gc_audit_release_reports = 0;
+static int gc_audit_mode_cache = -1;
+// Holder of the pointer currently being examined: the object whose fields
+// gc_scan is walking (NULL while a root slot is being offered), plus the
+// reflecting-table property name / array slot being read from it.
+static gc_header* gc_audit_holder = NULL;
+static const char* gc_audit_prop = NULL;
+static int gc_audit_slot = -1;
+
+static bool gc_audit_on(void) {
+    if (gc_audit_mode_cache < 0) {
+        const char* e = getenv("ASC_GC_AUDIT");
+        const char* s = getenv("ASC_GC_AUDIT_STRICT");
+        gc_audit_mode_cache = ((e != NULL && e[0] != '0') || (s != NULL && s[0] != '0')) ? 1 : 0;
+    }
+    return gc_audit_mode_cache != 0;
+}
+
+// ASC_GC_AUDIT_STRICT turns "this invariant is broken" into a non-zero exit
+// instead of a report line, so an ordinary regression example can assert the
+// heap invariants by simply running: no report is printed while the invariants
+// hold, and any violation aborts. Used by examples/gc_seg_reap.as (see test.ts),
+// which is the regression for the segment-release accounting bug described at
+// gc_audit_seg_account below.
+static int gc_audit_strict_cache = -1;
+static bool gc_audit_strict(void) {
+    if (gc_audit_strict_cache < 0) {
+        const char* s = getenv("ASC_GC_AUDIT_STRICT");
+        gc_audit_strict_cache = (s != NULL && s[0] != '0') ? 1 : 0;
+    }
+    return gc_audit_strict_cache != 0;
+}
+static void gc_audit_fail(void) {
+    if (!gc_audit_strict()) return;
+    fprintf(stderr, "[gc-audit] STRICT: heap invariant violated (see the report above)\\n");
+    fflush(stderr);
+    abort();
+}
+
+// Name an object *type* the way a reader can act on it: an AS3 qualified class
+// name when the block was a class instance, the GCT tag otherwise.
+static const char* gc_audit_type_name(int type, void* vt) {
+    static char buf[128];
+    if (type == GCT_CLASS && vt != NULL) {
+        const char* fqn = ((as_vtable_header*)vt)->fqn;
+        if (fqn != NULL) return fqn;
+    }
+    snprintf(buf, sizeof(buf), "GCT tag %d", type - GCT_TAG_BASE);
+    return buf;
+}
+
+// Record a block the sweeper is about to free, so a later dangling reference to
+// it can be named. Called *before* the header is overwritten with type 0.
+static void gc_audit_note_freed(gc_header* h) {
+    if (!gc_audit_on()) return;
+    int i = gc_audit_freed_pos;
+    gc_audit_freed[i] = h;
+    gc_audit_freed_type[i] = h->type;
+    gc_audit_freed_size[i] = h->size;
+    gc_audit_freed_vt[i] = h->type == GCT_CLASS
+        ? ((as_object_header*)((char*)h + sizeof(gc_header)))->vtable : NULL;
+    gc_audit_freed_pos = (i + 1) % GC_AUDIT_FREED_RING;
+}
+
+// Cross-check the release pass against the truth, by walking the all-objects
+// list instead of trusting the incremental free_bytes counter.
+//
+// gc_release_empty_segs decides to hand a segment back when free_bytes == size,
+// i.e. "every byte of it is on a free list". That is only a proof of emptiness
+// while the counter is exact. It was not: handing out a free block whose
+// remainder is smaller than GC_MIN_BLOCK skipped the split but still charged
+// only the requested size, so free_bytes crept above the segment's true free
+// space, the test could pass while live objects were still in the segment, and
+// the chunk was freed -- the objects survived as memory the next malloc user
+// owned (a MeshStyle whose vtable word turned into a double; gc_all itself was
+// later seen holding the double 0.9872449040412903, i.e. the benchmark's
+// _container.scale). The allocator now charges the block's actual size, and
+// this cross-check is what keeps that invariant honest: audit mode only, one
+// O(live objects) walk per release pass, silent while the accounting is exact.
+static void gc_audit_seg_account(void) {
+    for (gc_seg* s = gc_segs; s != NULL; s = s->next) { s->audit_live = 0; s->audit_ghost = 0; }
+    for (gc_header* h = gc_all; h != NULL; h = h->next) {
+        gc_seg_range* r = gc_seg_find(h);
+        if (r == NULL) continue;
+        // A free block (type 0) linked in gc_all is a *ghost*: the sweeper unlinks
+        // a block as it frees it, so gc_all pointing at one means the chain was
+        // re-linked without being unlinked -- and once a block sits in gc_all and
+        // in a free list at the same time, everything downstream (free_bytes,
+        // segment release, double frees) is unsound. Counted separately from real
+        // live bytes because the fix is completely different.
+        if (h->type == 0) {
+            r->seg->audit_ghost += sizeof(gc_header) + h->size;
+            if (gc_audit_release_reports++ < 32) {
+                bool in_fl = false;
+                for (gc_header* f = gc_free; f != NULL && !in_fl; f = f->next) if (f == h) in_fl = true;
+                for (gc_header* f = gc_free_big; f != NULL && !in_fl; f = f->next) if (f == h) in_fl = true;
+                fprintf(stderr, "[gc-audit] GHOST: gc_all holds a FREE block %p size=%zu in seg=%p (next=%p free_list=%s)\\n",
+                        (void*)h, h->size, (void*)r->seg->base, (void*)h->next, in_fl ? "YES" : "no");
+                fflush(stderr);
+                gc_audit_fail();
+            }
+        } else {
+            r->seg->audit_live += sizeof(gc_header) + h->size;
+        }
+    }
+    for (gc_seg* s = gc_segs; s != NULL; s = s->next) {
+        size_t truth_free = s->size - s->audit_live - s->audit_ghost;
+        if (s->free_bytes != truth_free) {
+            if (gc_audit_drift_reports++ < 8) {
+                fprintf(stderr, "[gc-audit] free_bytes DRIFT seg=%p size=%zu free_bytes=%zu live=%zu ghost=%zu (truth=%zu) delta=%ld reap=%d\\n",
+                        (void*)s->base, s->size, s->free_bytes, s->audit_live, s->audit_ghost, truth_free,
+                        (long)s->free_bytes - (long)truth_free, s->reap);
+                fflush(stderr);
+                gc_audit_fail();
+            }
+        }
+        if (s->reap && s->audit_live != 0) {
+            if (gc_audit_release_reports++ < 32) {
+                fprintf(stderr, "[gc-audit] RELEASING segment %p with %zu LIVE bytes (free_bytes=%zu size=%zu):",
+                        (void*)s->base, s->audit_live, s->free_bytes, s->size);
+                int shown = 0;
+                for (gc_header* h = gc_all; h != NULL && shown < 6; h = h->next) {
+                    if ((char*)h >= s->base && (char*)h < s->base + s->size) {
+                        void* vt = h->type == GCT_CLASS
+                            ? ((as_object_header*)((char*)h + sizeof(gc_header)))->vtable : NULL;
+                        fprintf(stderr, " %s(%zu)", gc_audit_type_name(h->type, vt), h->size);
+                        shown++;
+                    }
+                }
+                fprintf(stderr, "\\n");
+                fflush(stderr);
+                gc_audit_fail();
+            }
+        }
+    }
+}
+
+// The corruption gate: a heap bookkeeping word (gc_all, a free-list node, a
+// sweep cursor) must always be a real block inside a live segment. A *double*
+// sitting in one of them means a wild store already happened -- and this gate
+// runs at the top of every allocation and every sweep step, so the call chain
+// it reports is the code that ran *right after* the stray store, which is where
+// the C source can be read directly. (Written for the "second benchmark run"
+// crash: gc_all held 0x3fef9782a0000000 == the double 0.9872449040412903, a
+// value the benchmark had just computed as _container.scale, i.e. a stray
+// double store into a pointer slot.)
+static int gc_audit_gate_reports = 0;
+// Is this a *block header* address inside a live segment? gc_in_heap() is not
+// usable here: it insists the address sit past the first block header, because
+// its callers pass object *bodies* (and that guard is what keeps a word landing
+// on a segment base from faulting on the header read). The values this gate
+// checks are headers, and the first header sits exactly at the segment base.
+static bool gc_audit_is_block(const void* p) {
+    gc_seg_range* r = gc_seg_find(p);
+    return r != NULL && (const char*)p >= r->base && (const char*)p < r->base + r->size;
+}
+static void gc_audit_gate_frame(int i, const void* ra) {
+    unsigned long off = 0;
+    const char* sym = gc_dbg_sym(ra, &off);
+    fprintf(stderr, "                 frame %d: %s+0x%lx\\n", i, sym, off);
+}
+static void gc_audit_gate(const char* what, const void* p) {
+    if (p == NULL || !gc_audit_on() || gc_audit_is_block(p)) return;
+    if (gc_audit_gate_reports++ >= 8) return;
+    fprintf(stderr, "[gc-audit] %s holds NON-HEAP value %p (as double %.17g)\\n",
+            what, p, *(const double*)&p);
+    // the frame chain needs a constant index, so it is spelled out; the
+    // deepest frames are the AS3 method that was running.
+    gc_audit_gate_frame(0, ASC_RETURN_ADDRESS(0));
+    gc_audit_gate_frame(1, ASC_RETURN_ADDRESS(1));
+    gc_audit_gate_frame(2, ASC_RETURN_ADDRESS(2));
+    gc_audit_gate_frame(3, ASC_RETURN_ADDRESS(3));
+    fflush(stderr);
+    gc_audit_fail();
+}
+
+static void gc_audit_where(void) {
+    if (gc_audit_holder == NULL) {
+        fprintf(stderr, "                 held by: a root slot (static field / module var / registry / stack)\\n");
+        return;
+    }
+    gc_header* h = gc_audit_holder;
+    if (h->type == GCT_CLASS) {
+        const char* fqn = ((as_vtable_header*)((as_object_header*)((char*)h + sizeof(gc_header)))->vtable)->fqn;
+        fprintf(stderr, "                 held by: object of class %s", fqn ? fqn : "?");
+    } else {
+        fprintf(stderr, "                 held by: object with GCT tag %d", h->type - GCT_TAG_BASE);
+    }
+    if (gc_audit_prop != NULL) fprintf(stderr, " prop=\\"%s\\"", gc_audit_prop);
+    if (gc_audit_slot >= 0) fprintf(stderr, " slot=%d", gc_audit_slot);
+    fprintf(stderr, "\\n");
+}
+
+// Classify one pointer the marker was offered.
+static void gc_audit_check(void* p) {
+    if (!gc_audit_on()) return;   // resolves (and caches) the env var on first use
+    if (p == NULL) return;
+    if (gc_in_heap(p)) {
+        gc_header* h = gc_hdr(p);
+        if (h->type != 0) return;
+        if (gc_audit_reports++ < 32) {
+            int old_type = -1; size_t old_size = 0; void* old_vt = NULL;
+            for (int i = 0; i < GC_AUDIT_FREED_RING; i++) {
+                if (gc_audit_freed[i] == h && gc_audit_freed_type[i] != 0) {
+                    old_type = gc_audit_freed_type[i];
+                    old_size = gc_audit_freed_size[i];
+                    old_vt = gc_audit_freed_vt[i];
+                    break;
+                }
+            }
+            if (old_type >= 0) {
+                fprintf(stderr, "[gc-audit] DANGLING reference to SWEPT block %p (was %s, %zu bytes)\\n",
+                        (void*)h, gc_audit_type_name(old_type, old_vt), old_size);
+            } else {
+                fprintf(stderr, "[gc-audit] DANGLING reference to SWEPT block %p (not in the freed ring)\\n",
+                        (void*)h);
+            }
+            gc_audit_where();
+            fflush(stderr);
+        }
+        return;
+    }
+    // Pointers outside the heap are NOT inspected any further. A "was this
+    // address inside a segment we handed back?" test is unsound by
+    // construction: malloc immediately reuses a released chunk, so the arena
+    // (ByteArray.data, BitmapData.pixels) legitimately owns those addresses
+    // right after the release, and every such report was a false positive that
+    // drowned the real ones. Address-range history is therefore not consulted;
+    // the sound signals are the SWEPT-block ring above (keyed on an exact block
+    // address), the GHOST/DRIFT/RELEASING accounting, and gc_audit_gate.
+}
+
 // Mark one pointer: if it points into the GC heap and is still white, colour it
 // grey and queue it for scanning. Non-heap pointers (string literals, static
 // vtables) are skipped by the address-range check. Non-recursive: the mark is
 // driven by draining the grey stack (gc_step / gc_collect), which is what makes
 // it resumable across frames.
 static void gc_mark_ptr(void* p) {
+    if (gc_audit_mode_cache != 0) gc_audit_check(p);
     if (p == NULL || !gc_in_heap(p)) return;
     gc_header* h = gc_hdr(p);
     if (h->color == GC_WHITE) {
@@ -1576,13 +3257,35 @@ static void gc_mark_value(as_value v) {
 // Scan one object's child pointers, greying (and queuing) any white child.
 static void gc_scan(gc_header* h) {
     char* b = (char*)h + sizeof(gc_header);
+    // Expose the object being scanned to the dangling-reference detector, which
+    // reports it as the *holder* of any pointer that turns out to point at a
+    // swept block (see ASC_GC_AUDIT above).
+    gc_header* _prev_holder = gc_audit_holder;
+    gc_audit_holder = h;
+    gc_audit_prop = NULL;
+    gc_audit_slot = -1;
     switch (h->type) {
     case GCT_STRING:
         break;  // leaf
+    case GCT_NUMBER:
+        break;  // leaf (boxed double carries no child pointers)
+    case GCT_BOOLEAN:
+        break;  // leaf (boxed bool carries no child pointers)
+    case GCT_STRING_OBJ: {
+        as_string* s = (as_string*)b;
+        gc_mark_ptr(s->value);
+        break;
+    }
+    case GCT_FUNCTION_OBJ: {
+        as_function* f = (as_function*)b;
+        gc_mark_ptr((void*)f->value);
+        break;
+    }
     case GCT_ARRAY: {
         as_array* a = (as_array*)b;
         gc_mark_ptr(a->data);
         gc_mark_ptr(a->input);
+        gc_mark_ptr(a->props);
         break;
     }
     case GCT_OBJECT: {
@@ -1611,6 +3314,7 @@ static void gc_scan(gc_header* h) {
             if (props != NULL) {
                 for (int i = 0; props[i].name != NULL; i++) {
                     char* base = b;
+                    gc_audit_prop = props[i].name;
                     switch (props[i].type) {
                     case 3: gc_mark_ptr(*(char**)(base + props[i].offset)); break;
                     case 6: gc_mark_ptr(*(void**)(base + props[i].offset)); break;
@@ -1629,15 +3333,29 @@ static void gc_scan(gc_header* h) {
     case GCT_VALUE_ARRAY: {
         int n = (int)(h->size / sizeof(as_value));
         as_value* arr = (as_value*)b;
-        for (int i = 0; i < n; i++) gc_mark_value(arr[i]);
+        for (int i = 0; i < n; i++) { gc_audit_slot = i; gc_mark_value(arr[i]); }
         break;
     }
     case GCT_PTR_ARRAY: {
         int n = (int)(h->size / sizeof(void*));
         void** arr = (void**)b;
-        for (int i = 0; i < n; i++) gc_mark_ptr(arr[i]);
+        for (int i = 0; i < n; i++) { gc_audit_slot = i; gc_mark_ptr(arr[i]); }
         break;
     }
+    case GCT_RAW:
+        // Leaf: a monomorphized Vector's element storage for scalar / boxed
+        // element types (double/int/uint/bool/'*'/interface). The bytes hold no
+        // pointers the GC could follow -- '*' and interface elements are traced
+        // by that vector's own GCT_CUSTOM mark callback -- so nothing to scan here.
+        break;
+    case GCT_BYTES:
+        // Leaf: a raw byte buffer (ByteArray.data, BitmapData.pixels, …). Bytes
+        // never hold pointers worth following, and the buffer is reachable only
+        // because some class field points at it (the field is what gc_scan
+        // follows). Kept distinct from GCT_RAW so the ASC_GC_STATS type
+        // accounting can tell a per-frame Vector payload apart from a
+        // never-freed byte buffer -- that split is what a leak hunt needs.
+        break;
     case GCT_CUSTOM: {
         // The object body's first word is a 'void (*mark)(void* self)' callback
         // (monomorphized Vector / closure-env structs). gc_alloc zeroes the body,
@@ -1646,15 +3364,41 @@ static void gc_scan(gc_header* h) {
         if (*mark) (*mark)(b);
         break;
     }
+    case GCT_XML: {
+        // DOM node: name/text are GCT_STRING leaves; attr_names/attr_vals/children
+        // are GCT_PTR_ARRAY buffers whose element pointers (attr name/value
+        // strings, child nodes) are themselves traced when the buffer is scanned.
+        as_xml_node* n = (as_xml_node*)b;
+        gc_mark_ptr(n->name);
+        gc_mark_ptr(n->text);
+        gc_mark_ptr(n->attr_names);
+        gc_mark_ptr(n->attr_vals);
+        gc_mark_ptr(n->children);
+        break;
     }
+    case GCT_XML_LIST: {
+        as_xml_list* l = (as_xml_list*)b;
+        gc_mark_ptr(l->items);
+        break;
+    }
+    }
+    gc_audit_holder = _prev_holder;
+    gc_audit_prop = NULL;
+    gc_audit_slot = -1;
 }
 
-// Permanent roots owned by the runtime itself: the setTimeout timer table and
-// the in-flight exception. (The event registry and stage live in generated code
-// and are marked by gc_mark_user_roots.)
+// Permanent roots owned by the runtime itself: the setTimeout timer table,
+// the in-flight IO jobs, the registered sockets and the in-flight exception.
+// (The event registry and stage live in generated code and are marked by
+// gc_mark_user_roots.) Both walks are defined further down with their tables.
+static void as_async_mark_roots(void);
+static void as_sock_mark_roots(void);
 static void gc_mark_internal_roots(void) {
     for (int i = 0; i < as_timer_count; i++) {
-        if (as_timers[i].alive) gc_mark_ptr(as_timers[i].fn);
+        if (as_timers[i].alive) {
+            gc_mark_ptr(as_timers[i].fn);
+            gc_mark_ptr(as_timers[i].args);
+        }
     }
     for (int i = 0; i < as_rep_timer_count; i++) {
         if (as_rep_timers[i].alive) gc_mark_ptr(as_rep_timers[i].obj);
@@ -1662,7 +3406,78 @@ static void gc_mark_internal_roots(void) {
     for (int i = 0; i < as_mc_count; i++) {
         if (as_mcs[i].alive) gc_mark_ptr(as_mcs[i].obj);
     }
+    as_async_mark_roots();
+    as_sock_mark_roots();
     gc_mark_ptr(as_exception);
+}
+
+// ---------- conservative stack roots for mid-frame collections ----------
+// The collector keeps no shadow stack: generated functions do not register
+// their pointer-holding locals, because the incremental collector runs at the
+// frame-boundary safe point (Stage_dispatchFrame) where every AS3 frame has
+// already returned and the root set really is permanent roots alone.
+//
+// A collection can, however, be forced while AS3 frames are still live:
+// System.gc() called from user code, or Stage.dispatchFrame() called from AS3.
+// Any GC object then referenced ONLY by a C local/register of a live generated
+// function is invisible to the precise marker — the in-flight event being
+// dispatched by EventDispatcher.dispatchEventWith is exactly such a local. The
+// sweep would free it, and the emitter's own Event_toPool_static(event) line --
+// which runs after dispatchEvent returns -- would push the freed Event into
+// Event.sEventPool; the next fromPool() popped freed memory and called a NULL
+// vtable slot => SIGSEGV (the Starling demo crash this guards against).
+//
+// Such a collection therefore adds the live stack region to the roots
+// conservatively (Boehm style): every aligned word in [current SP, stack top]
+// is offered to gc_mark_ptr, which ignores anything that is not the exact body
+// address of a real object (gc_is_object). The top is main()'s frame
+// (GC_NOTE_STACK_BASE at the head of main); dead space below the scanning frame
+// belongs to calls that already returned, so it is never scanned. setjmp()
+// materializes the callee-saved registers into the stack, which is the other
+// half of a conservative root set — a live local can sit in a register with no
+// stack slot of its own.
+//
+// This stays out of the hot path: the emitted Stage_dispatchFrame's safe point
+// is entered from the C/Objective-C frame loop, so its scan window is only the
+// run-loop frames above it (the previous frame's dead callback frames are below
+// the scanning frame and thus skipped), and gc_mark_roots runs once per cycle.
+static char* gc_stack_top = NULL;   // highest live stack address (main's frame)
+
+static void gc_note_stack_base(void* p) { gc_stack_top = (char*)p; }
+// Captures a word *in the caller's own frame*, so the recorded top brackets every
+// frame the caller (directly or indirectly) will run.
+#define GC_NOTE_STACK_BASE() do { char _gc_sp_marker; gc_note_stack_base(&_gc_sp_marker); } while (0)
+
+// Is 'p' the exact body address of a live-or-not-yet-swept GC object? A stack
+// word can also point *into* an object (e.g. a char* walking a string body);
+// treating such an interior address as a body would read a payload word as a
+// header and could dispatch into garbage (GCT_CUSTOM calls a mark callback taken
+// from the "body"). The GCT_* tags carry a magic prefix and free blocks carry 0,
+// so the tag check alone rejects every interior/stale word.
+// The upper size bound is deliberately far above GC_SEG_SIZE: a payload larger
+// than one segment (e.g. a multi-MB Vector.<Number>) gets a dedicated oversized
+// segment, and rejecting those here would let the stack scan miss a large buffer
+// that is still in use. The tag + colour checks are what reject garbage words.
+static bool gc_is_object(void* p) {
+    if (!gc_in_heap(p)) return false;
+    gc_header* h = gc_hdr(p);
+    return h->type >= GCT_STRING && h->type <= GCT_BYTES
+        && h->color >= GC_WHITE && h->color <= GC_BLACK
+        && h->size >= sizeof(void*) && h->size <= (size_t)(1u << 30);
+}
+
+// Offer every word of the live stack region to the marker. Registered as a root
+// source by gc_mark_roots.
+static void gc_mark_stack(void) {
+    if (gc_stack_top == NULL) return;   // no recorded frame (no emitted main)
+    jmp_buf jb;
+    setjmp(jb);   // spill callee-saved registers onto the stack so they are scanned
+    char* lo = (char*)(((uintptr_t)&jb + sizeof(void*) - 1) & ~(uintptr_t)(sizeof(void*) - 1));
+    for (char* p = lo; p < gc_stack_top; p += sizeof(void*)) {
+        void* w;
+        memcpy(&w, p, sizeof(void*));   // words are not guaranteed pointer-aligned
+        if (gc_is_object(w)) gc_mark_ptr(w);
+    }
 }
 
 // Mark every root (internal + registered slots + generated user roots).
@@ -1670,6 +3485,7 @@ static void gc_mark_roots(void) {
     gc_mark_internal_roots();
     for (int i = 0; i < gc_root_count; i++) gc_mark_ptr(*gc_roots[i]);
     gc_mark_user_roots();
+    gc_mark_stack();
 }
 
 // Drain the grey stack to completion (stop-the-world mark finish).
@@ -1688,11 +3504,21 @@ static void gc_mark_drain(void) {
 static bool gc_sweep_step(size_t budget) {
     while (budget-- > 0 && gc_inc.sweep_cursor != NULL) {
         gc_header* h = gc_inc.sweep_cursor;
+        gc_audit_gate("sweep cursor", h);
         gc_header* next = h->next;
         if (h->color == GC_WHITE) {
             if (gc_inc.sweep_prev) gc_inc.sweep_prev->next = next; else gc_all = next;
-            h->next = gc_free;
-            gc_free = h;
+            gc_header** fl = gc_free_for(h->size);
+            gc_audit_note_freed(h);   // remember it for the ASC_GC_AUDIT detector
+            h->next = *fl;
+            {
+                int _k = h->type - GCT_TAG_BASE;
+                if (_k >= 0 && _k < 24) { gc_dbg_type_bytes[_k] -= (double)h->size; gc_dbg_type_count[_k]--; }
+            }
+            gc_seg_range* _sr = gc_seg_find(h);
+            if (_sr != NULL) _sr->seg->free_bytes += sizeof(gc_header) + h->size;
+            h->type = 0;   // free block: never a plausible object header again
+            *fl = h;
         } else {
             h->color = GC_WHITE;   // black -> white for the next cycle
             gc_inc.sweep_prev = h;
@@ -1700,6 +3526,111 @@ static bool gc_sweep_step(size_t budget) {
         gc_inc.sweep_cursor = next;
     }
     return gc_inc.sweep_cursor == NULL;
+}
+
+// Ask the OS allocator to give back the pages it is merely holding empty.
+//
+// free() is not enough on macOS: the malloc zones keep freed chunks resident, so
+// RSS sits at the high-water mark of the process even after the GC released
+// every empty segment and the arena stopped using a buffer. Measured with 'heap'
+// in the benchmark at 33k objects: 167 MB actually allocated inside 388 MB of
+// reserved zone space, of which 263 MB was 'empty' (freed) and still resident --
+// i.e. most of the reported RSS. malloc_zone_pressure_relief() is exactly the
+// API for this (it is what the system itself calls under memory pressure); it
+// walks the zones and madvises their free pages away. Called at the same
+// rate-limited point as the segment release, so it costs a few ms per second at
+// worst and nothing on platforms without the concept (WASI/Windows).
+static void gc_trim_os(void) {
+#ifdef __APPLE__
+    malloc_zone_pressure_relief(NULL, 0);
+#endif
+}
+
+// How often to look for wholly-free segments to hand back to the OS. The pass
+// is O(segments + free blocks); at a 500 ms cadence that is a fraction of a
+// percent of the frame budget while keeping RSS within half a second of the
+// live set.
+#define GC_RELEASE_MS 500.0
+static double gc_release_last = -1e30;
+
+// Cadence of the release pass above, overridable for diagnostics: ASC_GC_RELEASE
+// gives the interval in milliseconds, and 0 disables the pass entirely (which is
+// how a suspected interaction with the release path gets ruled in or out
+// without a rebuild).
+static double gc_release_interval(void) {
+    static double cached = -1.0;
+    static bool resolved = false;
+    if (!resolved) {
+        const char* e = getenv("ASC_GC_RELEASE");
+        cached = e != NULL ? strtod(e, NULL) : GC_RELEASE_MS;
+        resolved = true;
+    }
+    return cached;
+}
+
+// Return segments that went entirely free to the OS. A segment is releasable
+// only when every byte of it sits on a free list (free_bytes == size), which
+// means it holds no live object, so no pointer into it can exist anywhere.
+//
+// Without this, RSS stays at the *high-water mark* of the GC heap forever: the
+// allocator never gives a chunk back, so a ramp that once needed 400 MB of
+// segments keeps 400 MB resident even after the garbage is collected. Measured
+// in the Starling benchmark at the moment of writing: 43 MB live inside 414 MB
+// reserved segments / 613 MB RSS -- i.e. most of the RSS was *empty* segments.
+//
+// Two passes: flag the empty segments (cheap, O(#segments), and the common case
+// finds nothing and stops), then walk the two free lists once and unlink the
+// blocks that belong to them before freeing the chunks themselves.
+static void gc_release_empty_segs(void) {
+    const double interval = gc_release_interval();
+    if (interval <= 0.0) return;   // ASC_GC_RELEASE=0: keep every segment mapped
+    const double now = as_now_ms();
+    if (now - gc_release_last < interval) return;
+    gc_release_last = now;
+    gc_trim_os();
+    int any = 0;
+    for (gc_seg* s = gc_segs; s != NULL; s = s->next) {
+        s->reap = (s->free_bytes == s->size);
+        if (s->reap) any = 1;
+    }
+    // ASC_GC_AUDIT: before acting on those flags, verify them against gc_all.
+    if (gc_audit_on()) gc_audit_seg_account();
+    if (!any) return;
+    // Unlink every free block living in a doomed segment. A block belongs to at
+    // most one list, and the lists are rebuilt in place, so this is one walk of
+    // each.
+    gc_header** lists[2];
+    lists[0] = &gc_free;
+    lists[1] = &gc_free_big;
+    for (int li = 0; li < 2; li++) {
+        gc_header* prev = NULL;
+        gc_header* h = *lists[li];
+        while (h != NULL) {
+            gc_header* next = h->next;
+            gc_seg_range* r = gc_seg_find(h);
+            if (r != NULL && r->seg->reap) {
+                if (prev) prev->next = next; else *lists[li] = next;
+            } else {
+                prev = h;
+            }
+            h = next;
+        }
+    }
+    // Now drop the segments: unlink from the creation list and the lookup table,
+    // then give the chunk back. free() of a >= 128 KB chunk munmaps it, so this
+    // is what makes RSS follow the live set down again.
+    gc_seg** sp = &gc_segs;
+    while (*sp != NULL) {
+        gc_seg* s = *sp;
+        if (!s->reap) { sp = &s->next; continue; }
+        *sp = s->next;
+        gc_seg_range_del(s->base);
+        free(s->base);
+        free(s);
+    }
+    // The chunk free above only hands the pages to the allocator; ask the OS
+    // again so this pass actually shows up in RSS.
+    gc_trim_os();
 }
 
 // Finish a collection cycle: splice the side-list of objects allocated during
@@ -1715,21 +3646,115 @@ static void gc_finish_cycle(void) {
         gc_new = NULL;
     }
     gc_bytes_allocated = 0;
+    gc_trigger_next = 0;   // live set just changed: refresh the cached trigger
     gc_inc.state = GC_IDLE;
+    gc_release_empty_segs();
+    gc_dbg_dump("cycle_end");
 }
 
 // One incremental slice, called every frame at the Stage_dispatchFrame safe
 // point. Advances the MARK and SWEEP phases by a fixed object budget so the
 // per-frame GC pause stays O(budget) instead of growing with the heap.
+
+// Per-frame work budget for one GC slice. gc_inc.budget (500 objects) bounds
+// the pause but says nothing about throughput: with a ~100k-object heap a whole
+// cycle needs hundreds of frames, and every frame in between allocates fresh
+// garbage, so the heap balloons far beyond its live set. ASC_GC_BUDGET
+// overrides the slice size so the throughput/latency trade-off can be measured
+// instead of guessed (see docs/zh-cn/gc.md).
+// A fixed 500-object slice bounds the pause but says nothing about throughput.
+// An incremental cycle that needs hundreds of frames never finishes: every frame
+// in between allocates more garbage, so the heap (and RSS) balloons far beyond
+// the live set -- the measured failure mode was a 900 MB heap for a ~30 MB live
+// set, with the ramp collapsing when the collector finally ran. Scale the slice
+// so a cycle completes in roughly GC_CYCLE_FRAMES frames, keeping the per-frame
+// work proportional to the heap instead of unbounded in time.
+// The slice is bounded at both ends: a floor of gc_inc.budget keeps progress on
+// tiny heaps, and the cap keeps the *pause* bounded -- an arbitrarily large
+// slice makes the collector's per-frame share grow with the heap, which costs
+// more frame time than it saves (measured: an uncapped slice/12 dropped the
+// frame rate steadily from 120 to 47 fps, while a capped slice held 120 fps).
+#define GC_SLICE_CAP 8000
+#define GC_CYCLE_FRAMES 16
+static size_t gc_budget(void) {
+    static size_t override_budget = 0;
+    static bool resolved = false;
+    if (!resolved) {
+        const char* e = getenv("ASC_GC_BUDGET");
+        override_budget = e ? (size_t)strtoul(e, NULL, 10) : 0;
+        resolved = true;
+    }
+    if (override_budget != 0) return override_budget;
+    size_t adaptive = gc_dbg_inuse_count() / GC_CYCLE_FRAMES + gc_inc.budget;
+    return adaptive > GC_SLICE_CAP ? GC_SLICE_CAP : adaptive;
+}
+
+// The two callers of gc_trigger() want opposite things, so the *floor* differs
+// even though the adaptive term does not:
+//
+//   - Frame-driven (gc_step): a collection is a slice of the frame budget, so
+//     the cycle must start early and get spread out; a small floor keeps tiny
+//     heaps prompt and gc_budget() bounds the resulting pause.
+//   - Non-GUI (the stop-the-world call in gc_alloc): there is no frame deadline,
+//     and the measured cost of one collection is dominated by *re-marking the
+//     live set*, which is independent of how much garbage accumulated since the
+//     last one (binarytrees: drain 1.05 ms/collection at every threshold, 154
+//     collections => 166 ms of pure mark time). That makes total GC time
+//     (#collections x constant), so the only lever is to collect less often.
+//
+// Hence the non-GUI floor is 8 MiB. Measured on the two allocation-heavy console
+// benchmarks (median of 3): binarytrees 1 MiB => 287 ms, 4 MiB => 120 ms,
+// 8 MiB => 97 ms, 12 MiB => 88 ms (saturates), 16 MiB => 88 ms; strings
+// 258 => 229 ms. 8 MiB therefore captures 96% of the available win at half the
+// memory of 16 MiB (binarytrees peak RSS 9 => 15 MB, vs 23 MB at 16 MiB), and it
+// keeps gc_bytes.as's RSS assertion passing untouched. The ceiling on this knob
+// is real: examples/gc_alloc_threshold.as churns ~17.8 MB in total, so a floor at
+// or above that never fires during it and the regression stops testing the
+// trigger at all. Past ~12 MiB neither benchmark gains any more. The adaptive
+// inuse/8 term takes over for large live sets, where the floor no longer matters.
+// ASC_GC_THRESHOLD still overrides either floor (and is how a memory-tight
+// target -- WASI, embedded -- lowers it).
+#define GC_NONGUI_FLOOR (8u << 20)
+
+// Collection trigger: start a cycle once this many bytes have been allocated
+// since the previous one. Scaling it with the heap keeps the collector's share
+// of the frame roughly constant (collect when garbage is ~1/8 of the heap)
+// instead of restarting a cycle on a large heap before the previous one could
+// finish. The floor keeps small heaps prompt -- 1 MiB when a frame loop will
+// slice the cycle, 8 MiB offscreen (see the rationale above).
+static size_t gc_trigger(void) {
+    static size_t override_threshold = 0;
+    static bool resolved = false;
+    if (!resolved) {
+        const char* e = getenv("ASC_GC_THRESHOLD");
+        override_threshold = e ? (size_t)strtoul(e, NULL, 10) : 0;
+        resolved = true;
+    }
+    if (override_threshold != 0) return override_threshold;
+    size_t adaptive = gc_dbg_inuse_bytes() / 8;
+    size_t floor = gc_frame_driven ? gc_threshold : GC_NONGUI_FLOOR;
+    return adaptive > floor ? adaptive : floor;
+}
+
 static void gc_step(void) {
+    // Reaching this at all means a frame safe point exists (Stage_dispatchFrame is
+    // gc_step()'s only caller), which is what makes the incremental path -- and
+    // its bounded per-frame pause -- the right one for this program. From here on
+    // gc_alloc stops triggering its own stop-the-world collections.
+    gc_frame_driven = true;
     if (gc_inc.state == GC_IDLE) {
-        if (gc_bytes_allocated < gc_threshold) return;
+        // Segment release / allocator trim is rate-limited and idempotent, so it
+        // also runs here (every frame) rather than only at a cycle end: a scene
+        // that stopped allocating never ends another cycle, and RSS would then
+        // stay at the high-water mark forever after the ramp is over.
+        gc_release_empty_segs();
+        if (gc_bytes_allocated < gc_trigger()) return;
         gc_inc.state = GC_MARK;
         gc_inc.grey_top = 0;  // fresh mark; a previous cycle drains to empty first
         gc_mark_roots();
     }
     if (gc_inc.state == GC_MARK) {
-        size_t n = gc_inc.budget;
+        size_t n = gc_budget();
         while (n-- > 0 && gc_inc.grey_top > 0) {
             gc_header* g = gc_inc.grey[--gc_inc.grey_top];
             gc_scan(g);
@@ -1742,9 +3767,10 @@ static void gc_step(void) {
         }
     }
     if (gc_inc.state == GC_SWEEP) {
-        if (gc_sweep_step(gc_inc.budget)) gc_finish_cycle();
+        if (gc_sweep_step(gc_budget())) gc_finish_cycle();
     }
 }
+
 
 // Stop-the-world collection (System.gc() and offscreen leak checks): mark to
 // completion in one shot, then sweep atomically. Works from any gc_step state.
@@ -2032,8 +4058,11 @@ static int as_re_emit_atom(as_regex* re, const as_re_ins* atom, int n, int atomB
     for (int i = 0; i < n; i++) {
         as_re_ins ins = atom[i];
         if (ins.op == AS_RE_SPLIT || ins.op == AS_RE_JMP) {
-            if (ins.a >= atomBase && ins.a < atomBase + n) ins.a += delta;
-            if (ins.b >= atomBase && ins.b < atomBase + n) ins.b += delta;
+            // Remap targets within the atom, INCLUDING the exit sentinel at
+            // atomBase+n (a group's trailing JMP jumps to one-past-the-atom;
+            // after unrolling that exit must point one-past-the-copy instead).
+            if (ins.a >= atomBase && ins.a <= atomBase + n) ins.a += delta;
+            if (ins.b >= atomBase && ins.b <= atomBase + n) ins.b += delta;
         }
         as_re_emit(re, ins.op, ins.a, ins.b, ins.neg);
     }
@@ -2867,9 +4896,14 @@ static as_value as_json_parse(char* s) {
 typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; } sk_text_run;
 #ifdef ASC_USE_SKIA
 extern void* sk_surface_raster_new(int w, int h);
+extern int sk_surface_peek_pixels(void* surface, void** pixels, int* rowBytes);
 #ifdef ASC_RENDER_GPU
 extern void* sk_surface_gpu_new(int w, int h);
 extern void sk_gr_flush(void);
+// GPU→GPU composite of the Stage3D render target (see skia_glue.cc). Only the web
+// GPU build has a Ganesh context to wrap the texture into, so the wrapper below
+// no-ops elsewhere.
+extern void sk_gl_draw_texture(void* canvas, unsigned textureId, int w, int h, double dx, double dy, double dw, double dh);
 #endif
 #ifdef ASC_RENDER_METAL
 // Native Metal GPU backend (metal_glue.mm). A CAMetalDrawable is one-shot, so the
@@ -2922,7 +4956,13 @@ extern int sk_image_encode_png(void* image, const char* path);
 extern void sk_image_delete(void* image);
 extern void sk_paint_set_linear_gradient(void* paint, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1);
 extern void* sk_image_from_file(const char* path);
-extern void* sk_image_decode_rgba(const char* path, int* width, int* height);
+extern void* sk_image_from_bytes(const void* data, size_t len);
+extern void* sk_image_decode_argb(const char* path, int* width, int* height);
+extern void* sk_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height);
+// Read a surface back into the runtime's straight-ARGB (0xAARRGGBB) uint32 buffer.
+// Channel order is resolved in skia_glue (kN32 differs by platform), so generated
+// C never assumes a byte order of a Skia surface.
+extern int sk_surface_read_argb(void* surface, uint32_t* dst, int width, int height);
 extern void sk_canvas_draw_image_rect(void* canvas, void* image, double dx, double dy, double dw, double dh);
 extern void sk_canvas_draw_bgra(void* canvas, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh);
 extern void sk_canvas_draw_text(void* canvas, const char* text, double x, double y, double size, int bold, int italic, void* paint);
@@ -2970,6 +5010,7 @@ static inline void* as_skia_surface_bake_new(int w, int h) {
 static inline void* as_skia_surface_canvas(void* s) { return sk_surface_canvas(s); }
 static inline void as_skia_surface_delete(void* s) { sk_surface_delete(s); }
 static inline void* as_skia_surface_make_snapshot(void* s) { return sk_surface_make_snapshot(s); }
+static inline int as_skia_surface_peek_pixels(void* s, void** pixels, int* rowBytes) { return sk_surface_peek_pixels(s, pixels, rowBytes); }
 static inline void as_skia_image_delete(void* img) { sk_image_delete(img); }
 static inline void as_skia_surface_save_png(void* s, const char* path) {
     void* img = sk_surface_make_snapshot(s);
@@ -3013,9 +5054,25 @@ static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double*
 static inline unsigned as_skia_path_generation_id(void* p) { return sk_path_generation_id(p); }
 static inline void as_skia_paint_set_linear_gradient(void* p, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1) { sk_paint_set_linear_gradient(p, x0, y0, x1, y1, rgb0, a0, rgb1, a1); }
 static inline void* as_skia_image_from_file(const char* path) { return sk_image_from_file(path); }
-static inline void* as_skia_image_decode_rgba(const char* path, int* width, int* height) { return sk_image_decode_rgba(path, width, height); }
+// SkImage view of an image already in memory (Loader.load of an http(s)://
+// URL). A file view is impossible there: the payload was never a file, so it
+// must not be re-opened by name, or the display-list Bitmap would render
+// nothing at all.
+static inline void* as_skia_image_from_bytes(const void* data, size_t len) { return sk_image_from_bytes(data, len); }
+static inline void* as_skia_image_decode_argb(const char* path, int* width, int* height) { return sk_image_decode_argb(path, width, height); }
+static inline void* as_skia_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) { return sk_image_decode_bytes_argb(data, len, width, height); }
+static inline int as_skia_surface_read_argb(void* s, uint32_t* dst, int w, int h) { return sk_surface_read_argb(s, dst, w, h); }
 static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh) { sk_canvas_draw_image_rect(c, img, dx, dy, dw, dh); }
 static inline void as_skia_canvas_draw_bgra(void* c, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh) { sk_canvas_draw_bgra(c, bgra, w, h, dx, dy, dw, dh); }
+// Composite the Stage3D render target straight from its GL texture — the web
+// counterpart of as_skia_mtl_draw_texture (no CPU readback, no re-upload).
+static inline void as_skia_gl_draw_texture(void* c, void* tex, int w, int h, double dx, double dy, double dw, double dh) {
+#ifdef ASC_RENDER_GPU
+    sk_gl_draw_texture(c, (unsigned)(uintptr_t)tex, w, h, dx, dy, dw, dh);
+#else
+    (void)c; (void)tex; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh;
+#endif
+}
 static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, double y, double sz, int bold, int italic, void* p) { sk_canvas_draw_text(c, t, x, y, sz, bold, italic, p); }
 static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, double x, double y, double sz, int bold, int italic, void* p) { sk_canvas_draw_text_n(c, t, len, x, y, sz, bold, italic, p); }
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { return sk_text_measure(t, sz, bold, italic); }
@@ -3163,6 +5220,7 @@ static inline void* as_skia_surface_bake_new(int w, int h) { (void)w; (void)h; r
 static inline void* as_skia_surface_canvas(void* s) { (void)s; return NULL; }
 static inline void as_skia_surface_delete(void* s) { (void)s; }
 static inline void* as_skia_surface_make_snapshot(void* s) { (void)s; return NULL; }
+static inline int as_skia_surface_peek_pixels(void* s, void** pixels, int* rowBytes) { (void)s; (void)pixels; (void)rowBytes; return 0; }
 static inline void as_skia_image_delete(void* img) { (void)img; }
 static inline void as_skia_surface_save_png(void* s, const char* path) { (void)s; (void)path; }
 static inline void* as_skia_paint_fill(unsigned rgb, double alpha) { (void)rgb; (void)alpha; return NULL; }
@@ -3194,9 +5252,13 @@ static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double*
 static inline unsigned as_skia_path_generation_id(void* p) { (void)p; return 0u; }
 static inline void as_skia_paint_set_linear_gradient(void* p, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1) { (void)p; (void)x0; (void)y0; (void)x1; (void)y1; (void)rgb0; (void)a0; (void)rgb1; (void)a1; }
 static inline void* as_skia_image_from_file(const char* path) { (void)path; return NULL; }
-static inline void* as_skia_image_decode_rgba(const char* path, int* width, int* height) { (void)path; (void)width; (void)height; return NULL; }
+static inline void* as_skia_image_from_bytes(const void* data, size_t len) { (void)data; (void)len; return NULL; }
+static inline void* as_skia_image_decode_argb(const char* path, int* width, int* height) { (void)path; (void)width; (void)height; return NULL; }
+static inline void* as_skia_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) { (void)data; (void)len; (void)width; (void)height; return NULL; }
+static inline int as_skia_surface_read_argb(void* s, uint32_t* dst, int w, int h) { (void)s; (void)dst; (void)w; (void)h; return 0; }
 static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh) { (void)c; (void)img; (void)dx; (void)dy; (void)dw; (void)dh; }
 static inline void as_skia_canvas_draw_bgra(void* c, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh) { (void)c; (void)bgra; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh; }
+static inline void as_skia_gl_draw_texture(void* c, void* tex, int w, int h, double dx, double dy, double dw, double dh) { (void)c; (void)tex; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh; }
 static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, double y, double sz, int bold, int italic, void* p) { (void)c; (void)t; (void)x; (void)y; (void)sz; (void)bold; (void)italic; (void)p; }
 static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, double x, double y, double sz, int bold, int italic, void* p) { (void)c; (void)t; (void)len; (void)x; (void)y; (void)sz; (void)bold; (void)italic; (void)p; }
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { (void)t; (void)sz; (void)bold; (void)italic; return 0.0; }
@@ -3221,6 +5283,2264 @@ static inline int as_window_get_display_size(int* w, int* h) { if (w) *w = 0; if
 static inline double as_window_device_scale(int w, int h, int* pw, int* ph) { if (pw) *pw = w; if (ph) *ph = h; (void)w; (void)h; return 1.0; }
 static inline double as_window_display_refresh(void) { return 0.0; }
 #endif
+
+// ---------- asynchronous IO jobs (stage 89-45) ----------
+// AIR performs URLLoader / FileStream.openAsync / Loader work *off* the AS3
+// thread and dispatches the completion events on the AS3 thread at a frame
+// boundary. That is what makes those APIs asynchronous in the only way a
+// single-threaded AS3 program can observe:
+//   1. the call returns immediately (multiple requests can be in flight at
+//      once, and several are processed concurrently),
+//   2. the loaded state (URLLoader.data, Loader.content) stays null/undefined
+//      until the completion event fires,
+//   3. a progress event reports the byte counts before COMPLETE.
+// This runtime models all three with one job table and two execution
+// strategies, so the observable contract is identical on every target:
+//   * ASC_ASYNC_THREADS (native POSIX): a small worker pool runs the blocking
+//     read / image decode; the frame boundary drains *finished* jobs only, so a
+//     frame never waits for IO. Jobs submitted in the same frame run
+//     concurrently, like AIR.
+//   * otherwise (WASI / wasm / web / Windows): the work runs inline at submit
+//     time, but the result is still staged and only becomes AS3-visible when
+//     the frame boundary runs the job's finish thunk. Event ordering is
+//     unchanged; only the frame time differs (see docs/zh-cn/as3-semantics.md
+//     section 3, decision-divergence table).
+//
+// Two invariants keep the threaded path safe:
+//   A. A worker thread NEVER touches the GC heap (gc_alloc has no locks and the
+//      collector assumes a single mutator thread). Every staged result lives in
+//      plain malloc memory, and every input a worker needs (path string, fopen
+//      mode, byte payload) is copied out of the GC heap at submit time, on the
+//      AS3 thread.
+//   B. The AS3 target of an in-flight job is marked as a root, so it cannot be
+//      collected before its completion fires - AIR likewise keeps an otherwise
+//      unreferenced FileStream alive until its pending read completes.
+//   C. The table itself (as_jobs/as_job_count/as_job_cap, plus j->dead and j->obj)
+//      belongs to the AS3 thread. The only cross-thread handoff is j->state plus
+//      the staged result fields, and every access to those happens under
+//      as_job_lock. In particular a job becomes visible to the workers only in
+//      as_job_publish(), once every input field is filled: a worker claiming a
+//      half-built job would fopen() a NULL path and report a spurious IO error
+//      (that failure mode was observed before publishing was split out).
+//
+// Staging is also what fixes the event contract: today URLLoader.data and
+// Loader.content are filled inside load(), i.e. before COMPLETE. With the
+// staging buffer the assignment happens in the finish thunk, which is the first
+// moment AS3 code is allowed to see it.
+//
+// Jobs are individually malloc'd and referenced through a growable pointer
+// array, so submitting a job never moves an existing one: a worker holding a
+// job pointer stays valid even while the table grows or the AS3 thread retires
+// other entries.
+
+#define AS_JOB_READ_TEXT   1
+#define AS_JOB_READ_BYTES  2
+#define AS_JOB_IMAGE       3
+#define AS_JOB_FS_OPEN     4
+#define AS_JOB_DECODE      5
+#define AS_JOB_HTTP        6
+// Streaming variant of AS_JOB_HTTP (URLStream): identical transfer, but the body
+// is appended into the job buffer as it arrives instead of being published once
+// at the end, so AS3 can read it while the load is still in flight.
+#define AS_JOB_HTTP_STREAM 7
+// A job that exists only to deliver an asynchronous failure: the transport asked
+// for has no backend in this build (e.g. URLStream over a non-http(s) URL). It is
+// a job rather than a direct event so the failure still arrives at a frame
+// boundary, like every other load outcome — AIR never reports from load() itself.
+#define AS_JOB_UNSUPPORTED  8
+// Loader.load of an http(s):// URL: fetch the payload over HTTP and then decode
+// it, exactly like AS_JOB_IMAGE decodes a local file. It is a separate kind
+// because the fetch needs the HTTP transport (and its staging fields: status,
+// headers, redirects), while AS_JOB_IMAGE is a plain file read — feeding a URL
+// to fopen() is the silently-wrong behaviour the network seam exists to avoid.
+#define AS_JOB_IMAGE_URL   9
+
+#define AS_JOB_QUEUED 0
+#define AS_JOB_RUNNING 1
+#define AS_JOB_DONE 2
+// Thunk collected and about to run (or running) on the AS3 thread. The job stays
+// in the table in this state on purpose: see as_async_tick.
+#define AS_JOB_FINISHING 3
+
+// Failure kinds. The distinction is observable: a URL that cannot be read is an
+// IOErrorEvent (AIR never reports COMPLETE for it), while bytes that cannot be
+// decoded still complete with a blank Bitmap in this subset.
+#define AS_JOB_ERR_IO 1
+#define AS_JOB_ERR_DECODE 2
+// The URL asked for a transport this build has no backend for (see the network
+// seam below). Kept distinct from AS_JOB_ERR_IO on purpose: the URLLoader thunk
+// turns it into an ioError whose text names the real cause, so an http(s):// URL
+// is never confused with a missing local file.
+#define AS_JOB_ERR_UNSUPPORTED 3
+
+typedef struct as_job {
+    int kind;
+    int state;      // AS_JOB_QUEUED / RUNNING / DONE
+    int dead;       // 1 = superseded by a newer request for the same target
+    int error;
+    void* obj;      // AS3 target (URLLoader / Loader / FileStream); a GC root
+    void (*finish)(void* job);  // runs on the AS3 thread inside a frame boundary
+    const unsigned char* bytes; // staged read payload (malloc), NULL when none
+    size_t len;
+    // Capacity of 'bytes' for AS_JOB_HTTP_STREAM, whose buffer grows on the worker
+    // thread as chunks arrive (the other kinds size it once, at submit time).
+    size_t bytes_cap;
+    void* pixels;   // staged decoded ARGB (malloc), NULL when none
+    int width, height;
+    unsigned total; // byte count reported via bytesLoaded / bytesTotal
+    void* handle;   // fopen result for AS_JOB_FS_OPEN (ownership: see retire)
+    char* path;     // malloc copies of the inputs, so workers never read GC memory
+    char* mode;
+    int binary;
+    // HTTP staging (AS_JOB_HTTP): 'path' is the URL, 'mode' the method, and the
+    // response body lands in 'bytes'. Unlike the file jobs, the request body is a
+    // second buffer (the file jobs' input is a path, not data), so it needs its
+    // own malloc copy; 'status' is the response code (0 when there was none).
+    unsigned char* body;
+    size_t body_len;
+    char* user_agent;
+    char* content_type;
+    // Request headers from URLRequest.requestHeaders, pre-joined on the AS3
+    // thread as "Name: Value" header lines (a worker must never walk a GC Array).
+    char* request_headers;
+    int follow_redirects;
+    double idle_timeout;
+    // URLRequest.manageCookies (default true, from URLRequestDefaults). AIR's
+    // cookie store is per application and shared by every request, so the native
+    // backend keeps ONE process-wide jar and this flag is what opts a single
+    // transfer in or out of it (stage 89·53).
+    int manage_cookies;
+    int status;
+    // Read cursor for AS_JOB_HTTP_STREAM: bytes before 'consumed' have already
+    // been handed to AS3, so bytesAvailable is (len - consumed). Writes happen on
+    // the worker (as_stream_append) and reads on the AS3 thread; both take
+    // as_job_lock when threads are available.
+    size_t consumed;
+    // Response metadata (stage 89·51, phases C/D). 'headers' is the raw final
+    // response header block; the thunk parses it into URLRequestHeader objects
+    // (the runtime cannot construct a generated class). 'eff_url' is the URL
+    // after redirects (AIR's HTTPStatusEvent.responseURL), 'redirected' whether
+    // any redirect was followed, and 'expected_total' the Content-Length (0 when
+    // the response did not carry one — AIR: bytesTotal is then indeterminate).
+    unsigned char* headers;
+    size_t headers_len;
+    char* eff_url;
+    int redirected;
+    unsigned expected_total;
+    // Did the transfer actually START? AIR dispatches Event.OPEN only when the
+    // request reaches the transport: a refused connection still opens (verified
+    // with adl: open;httpStatus(0);ioError), while a missing LOCAL file never
+    // opens at all (adl: httpStatus(0);ioError — no open). A build with no
+    // network backend issues no request either, so it does not open.
+    int started;
+    // PROGRESS watermarks recorded by the transfer and replayed by the thunk.
+    unsigned* marks;
+    int mark_count;
+    int mark_cap;
+    int mark_oom;   // the watermark list hit its bound (or ran out of memory)
+    // Identity of this job allocation. Only the web backend needs it: it hands the
+    // raw pointer to JS and takes entries back after an arbitrary delay, and
+    // malloc may hand the SAME address to a later job. Comparing the serial turns
+    // that ABA race into a dropped entry rather than a body delivered to the
+    // wrong loader.
+    unsigned serial;
+    // Set when as_job_run only STARTS the transfer (the web fetch): the inline
+    // strategy must not mark such a job done, because completion arrives later,
+    // from the JS pump at a subsequent frame boundary.
+    int pending_async;
+    // Backend-supplied failure detail (the browser's fetch error text). AIR's
+    // ioError carries a text, and without this every web failure would look
+    // alike — a CORS refusal, an offline browser and a dead server included.
+    char* err_text;
+    // Which bookkeeping 'started'/'status'/'marks' are for, and how much of it has
+    // already been dispatched. AIR raises OPEN when the request reaches the
+    // transport, HTTP_RESPONSE_STATUS when the head arrives and PROGRESS per data
+    // chunk — i.e. WHILE the transfer runs, not all at completion — so the events
+    // have to be tracked across frames (see as_net_pre_events in the generated
+    // code and the pre-pass in as_async_tick). 'net_events' marks a job whose
+    // target is a flash.net URLLoader/URLStream; the flags make the dispatch
+    // idempotent so a finish thunk that runs before any tick still reports the
+    // same sequence, once.
+    int net_events;
+    int sent_open;
+    int sent_status;
+    unsigned marks_sent;
+    unsigned last_progress;
+} as_job;
+
+static as_job** as_jobs = NULL;
+static int as_job_count = 0;
+static int as_job_cap = 0;
+// Guards against a thunk re-entering the frame boundary (see as_async_tick).
+static int as_async_in_tick = 0;
+
+static char* as_job_strdup(const char* s) {
+    if (s == NULL) return NULL;
+    size_t n = strlen(s) + 1;
+    char* p = (char*)malloc(n);
+    if (p != NULL) memcpy(p, s, n);
+    return p;
+}
+
+// Appends to a streaming job's buffer under the job lock. Defined after the lock
+// exists (see the streaming section below); forward-declared here because both
+// backends append through it from above (the curl write callback, the web pump).
+static int as_stream_append(as_job* j, const void* p, size_t n);
+
+// Raised by the generated code: the events AIR dispatches WHILE a flash.net
+// transfer is in flight (OPEN / HTTP_RESPONSE_STATUS / PROGRESS). It lives in the
+// generated code because it has to construct generated classes (the header array),
+// and it is declared here because as_async_tick is what drives it. Defined in
+// emit.ts; idempotent, so the finish thunk calls it too.
+static void as_net_pre_events(void* job);
+
+// Record a byte-count watermark on the job, so the finish thunk can replay the
+// PROGRESS events AS3 never saw (see as_job.marks). Bounded on purpose: PROGRESS
+// is a notification (the data is still unavailable while it fires), so a close
+// sample is faithful. Shared by the native curl callback and the web fetch pump
+// so both backends produce exactly the same event sequence.
+static void as_job_mark_append(as_job* j, unsigned loaded) {
+    if (j->mark_oom) return;
+    if (j->mark_count == j->mark_cap) {
+        int cap = (j->mark_cap == 0) ? 16 : j->mark_cap * 2;
+        if (cap > 4096) { j->mark_oom = 1; return; }
+        unsigned* grown = (unsigned*)realloc(j->marks, (size_t)cap * sizeof(unsigned));
+        if (grown == NULL) { j->mark_oom = 1; return; }
+        j->marks = grown;
+        j->mark_cap = cap;
+    }
+    j->marks[j->mark_count++] = loaded;
+}
+
+// Allocate a job. It is deliberately NOT visible to the workers until
+// as_job_publish(): a worker that claimed a half-built job would fopen() a NULL
+// path and report a spurious IO error, so every input field is filled first and
+// publishing is a separate, final step.
+static as_job* as_job_alloc(int kind, void* obj, void (*finish)(void*)) {
+    as_job* j = (as_job*)calloc(1, sizeof(as_job));
+    if (j == NULL) return NULL;
+    static unsigned as_job_serial_next = 0;
+    j->serial = ++as_job_serial_next;
+    j->kind = kind;
+    j->obj = obj;
+    j->finish = finish;
+    return j;
+}
+
+// Grow the pointer array. Must run under as_job_lock (threaded path): a worker
+// iterating as_jobs in as_job_claim_locked must never see the block that
+// realloc() just freed. Returns 0 when out of memory.
+static int as_job_grow(void) {
+    if (as_job_count < as_job_cap) return 1;
+    int cap = as_job_cap == 0 ? 8 : as_job_cap * 2;
+    as_job** grown = (as_job**)realloc(as_jobs, (size_t)cap * sizeof(as_job*));
+    if (grown == NULL) return 0;
+    as_jobs = grown;
+    as_job_cap = cap;
+    return 1;
+}
+
+// Read a whole file into a malloc buffer. Deliberately NOT as_read_file(): that
+// one allocates from the GC heap, which a worker thread must never touch. The
+// buffer is NUL-terminated so the text path can copy it straight into a string.
+static unsigned char* as_job_read_file(const char* path, size_t* out_len, unsigned* out_total) {
+    if (out_len != NULL) *out_len = 0;
+    if (out_total != NULL) *out_total = 0;
+    if (path == NULL) return NULL;
+    FILE* f = fopen(path, "rb");
+    if (f == NULL) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) sz = 0;
+    unsigned char* buf = (unsigned char*)malloc((size_t)sz + 1);
+    size_t n = 0;
+    if (buf != NULL) {
+        if (sz > 0) n = fread(buf, 1, (size_t)sz, f);
+        buf[n] = '\\0';
+    }
+    fclose(f);
+    if (out_len != NULL) *out_len = n;
+    if (out_total != NULL) *out_total = (unsigned)n;
+    return buf;
+}
+
+// ---- Network seam (docs/zh-cn/flash-net.md §4.1.1) --------------------------
+//
+// There is no single library that covers native + web + WASI: browsers forbid
+// raw TCP and WASI preview1 has no sockets at all, so the transport is a seam
+// with one backend per target rather than one portable HTTP library. Each backend
+// is OPT-IN and named by the build layer through a define:
+//
+//   ASC_HAVE_CURL   native: libcurl (manifest: link-libs ["curl"] +
+//                   defines ["ASC_HAVE_CURL"], see docs/zh-cn/compile.md)
+//   ASC_HAVE_FETCH  web (Emscripten): the page's own fetch(), which is the only
+//                   HTTP client a browser sandbox permits
+//   ASC_HTTP2       native: ask for HTTP/2 over TLS (ALPN, automatic 1.1
+//                   fallback). OFF by default — see the CURLOPT_HTTP_VERSION
+//                   note in as_http_perform.
+//   ASC_SYSTEM_PROXY native + macOS: fall back to the operating system's proxy
+//                   configuration when no *_proxy variable is exported (what
+//                   AIR does: there is no AS3 proxy API). Needs
+//                   -framework SystemConfiguration.
+//
+// Keeping both opt-in is what preserves the default build's zero-dependency,
+// self-contained shape. With no backend the http(s):// path still runs —
+// through the async job table, so the async contract holds — but as_job_run
+// reports AS_JOB_ERR_UNSUPPORTED. That is phase G of the design doc: an honest,
+// *distinguishable* failure instead of feeding the URL to fopen() and reporting
+// the same generic error a missing file produces.
+#if defined(ASC_HAVE_CURL) && !defined(__wasi__) && !defined(__EMSCRIPTEN__)
+#define ASC_HTTP_BACKEND 1
+#include <pthread.h>
+#include <curl/curl.h>
+#elif defined(ASC_HAVE_FETCH) && defined(__EMSCRIPTEN__)
+#define ASC_HTTP_WEB 1
+#endif
+
+#if defined(ASC_HTTP_BACKEND) || defined(ASC_HTTP_WEB)
+// The Content-Type this transfer must actually declare, or NULL. This is NOT
+// URLRequest.contentType -- that property stays NULL on a fresh request, exactly
+// as adl reports it. The AS3 docs print "application/x-www-form-urlencoded" as
+// the property's default value, but a local capture server shows adl uses it as
+// the WIRE default instead: a request that carries a body and declared no (or an
+// empty) content type goes out with that MIME string, while req.contentType
+// still reads back NULL. Conflating the two is what made our property value
+// disagree with AIR (and broke an example that asserts the real default).
+// Measured rule (adl 51.3.4, POST/GET to a local logging server):
+//   POST body, contentType unset      -> application/x-www-form-urlencoded
+//   POST body, contentType = ""       -> application/x-www-form-urlencoded
+//   POST body, contentType set        -> that value, verbatim
+//   POST with NO body (Content-Length 0) -> no Content-Type at all
+//   GET (data folded into the query string) -> no Content-Type at all
+// So the trigger is "has a body", not "is a POST"; both backends share this one
+// helper so the wire behaviour cannot drift between them.
+static const char* as_http_effective_ctype(const as_job* j) {
+    if (j->body == NULL || j->body_len == 0) return NULL;
+    if (j->content_type != NULL && j->content_type[0] != '\\0') return j->content_type;
+    return "application/x-www-form-urlencoded";
+}
+#endif
+
+// Is this load input an http(s):// URL rather than a local path? Loader.load
+// accepts both, and the two need different transports — which is why the job
+// kind (not just the path) is chosen at submit time, in as_async_submit_image.
+// Only the two web schemes count: file:// and an app:// style asset URL are
+// local reads, and anything else has no transport here.
+static int as_job_is_remote_url(const char* p) {
+    if (p == NULL) return 0;
+    return (strncmp(p, "http://", 7) == 0) || (strncmp(p, "https://", 8) == 0);
+}
+
+#ifdef ASC_HTTP_BACKEND
+// libcurl callbacks: both run on a worker thread, so they must never touch the
+// GC heap — everything accumulates in plain malloc buffers that the finish
+// thunk copies out afterwards.
+typedef struct as_http_sink { unsigned char* buf; size_t len; size_t cap; int oom; } as_http_sink;
+
+static int as_http_sink_append(as_http_sink* s, const void* p, size_t n) {
+    if (s->oom) return 0;
+    if (s->len + n + 1 > s->cap) {
+        size_t cap = (s->cap == 0) ? 4096 : s->cap;
+        while (cap < s->len + n + 1) cap *= 2;
+        unsigned char* grown = (unsigned char*)realloc(s->buf, cap);
+        if (grown == NULL) { s->oom = 1; return 0; }
+        s->buf = grown;
+        s->cap = cap;
+    }
+    if (n > 0) memcpy(s->buf + s->len, p, n);
+    s->len += n;
+    s->buf[s->len] = '\\0';
+    return 1;
+}
+
+// Per-transfer context. URLLoader cannot see the payload while the load runs
+// (the job publishes only at a frame boundary), so the body callback records a
+// bounded list of byte-count watermarks and the thunk replays them as PROGRESS
+// events — that is what turns "one event at the very end" into the documented
+// OPEN -> (PROGRESS)* -> COMPLETE sequence. PROGRESS is a notification only
+// (data is still unavailable), so a bounded sample is faithful.
+typedef struct as_http_ctx {
+    as_http_sink body;
+    as_http_sink hdr;
+    // The job this transfer belongs to: the PROGRESS watermarks and (for a
+    // URLStream) the live buffer both live on it, so both backends record them
+    // the same way.
+    as_job* job;
+    // Non-NULL for a URLStream transfer: the body is appended straight into this
+    // job's growable buffer (visible to AS3 while the transfer runs), instead of
+    // accumulating in 'body' for a single publish at completion.
+    as_job* stream;
+} as_http_ctx;
+
+static size_t as_http_on_data(char* ptr, size_t size, size_t nmemb, void* userp) {
+    as_http_ctx* c = (as_http_ctx*)userp;
+    size_t n = size * nmemb;
+    if (c->stream != NULL) {
+        // URLStream: bytes go straight into the job buffer so AS3 can read them
+        // while the transfer is still in flight.
+        if (!as_stream_append(c->stream, ptr, n)) return 0;
+        as_job_mark_append(c->job, (unsigned)c->stream->len);
+        return n;
+    }
+    if (!as_http_sink_append(&c->body, ptr, n)) return 0;
+    as_job_mark_append(c->job, (unsigned)c->body.len);
+    return n;
+}
+
+// Header callback. A line beginning "HTTP/" opens a new header block, so the
+// buffer resets there: every intermediate redirect response is dropped and what
+// the thunk parses is the FINAL response's header block — which is what AIR
+// reports in HTTPStatusEvent.responseHeaders.
+static size_t as_http_on_header(char* ptr, size_t size, size_t nmemb, void* userp) {
+    as_http_ctx* c = (as_http_ctx*)userp;
+    size_t n = size * nmemb;
+    if (n >= 5 && strncmp(ptr, "HTTP/", 5) == 0) {
+        c->hdr.len = 0;
+        if (c->hdr.buf != NULL) c->hdr.buf[0] = '\\0';
+    } else if (!as_http_sink_append(&c->hdr, ptr, n)) {
+        return 0;
+    }
+    return n;
+}
+
+// Append each "Name: Value" line of a pre-joined header block to a
+// curl header list. Scanned by hand rather than with strtok_r so the code stays
+// clear of platform differences. Line breaks are matched by numeric code (10 for
+// LF, 13 for CR) because this preamble is a TS template literal, where a plain
+// backslash escape would be expanded before the C compiler ever sees it.
+static struct curl_slist* as_http_add_headers(struct curl_slist* list, const char* block) {
+    const char* p = block;
+    while (*p != '\\0') {
+        const char* nl = p;
+        while (*nl != '\\0' && *nl != 10) nl++;
+        size_t n = (size_t)(nl - p);
+        if (n > 0 && p[n - 1] == 13) n--;
+        if (n > 0) {
+            char* line = (char*)malloc(n + 1);
+            if (line != NULL) {
+                memcpy(line, p, n);
+                line[n] = '\\0';
+                list = curl_slist_append(list, line);
+                free(line);
+            }
+        }
+        p = (*nl == '\\0') ? nl : nl + 1;
+    }
+    return list;
+}
+
+// ---- Transport policy: cookie jar / proxy / HTTP version (stage 89·53) ------
+//
+// Three knobs that decide HOW a transfer is carried out, as opposed to what is
+// sent and what comes back. Each one is tied either to an AS3 input that exists
+// or to an explicit opt-in define, because two of them trade AIR fidelity for
+// reach:
+//
+//   cookie jar     URLRequest.manageCookies (a real AIR property, default true)
+//   proxy          system configuration (AIR uses it; there is no AS3 API) /
+//                  the classic *_proxy variables, which libcurl honours itself
+//   HTTP/2         ASC_HTTP2 define — NOT the default (see below)
+
+// The cookie jar. AIR keeps ONE cookie store per application and feeds every
+// request from it, so a Set-Cookie on the login POST is already visible to the
+// follow-up GET — no explicit handling in the .as code. libcurl keeps cookies on
+// the easy handle, so sharing them across transfers means a CURLSH. The lock
+// callbacks are not optional here: the transfers run on the worker pool, and two
+// threads touching the same cookie list without them is a data race.
+static pthread_mutex_t as_http_share_locks[CURL_LOCK_DATA_LAST];
+static CURLSH* as_http_share = NULL;
+static pthread_once_t as_http_share_once = PTHREAD_ONCE_INIT;
+
+static void as_http_share_lock(CURL* handle, curl_lock_data data, curl_lock_access access, void* userptr) {
+    (void)handle; (void)access; (void)userptr;
+    pthread_mutex_lock(&as_http_share_locks[data]);
+}
+
+static void as_http_share_unlock(CURL* handle, curl_lock_data data, void* userptr) {
+    (void)handle; (void)userptr;
+    pthread_mutex_unlock(&as_http_share_locks[data]);
+}
+
+static void as_http_share_make(void) {
+    int i;
+    for (i = 0; i < (int)CURL_LOCK_DATA_LAST; i++) pthread_mutex_init(&as_http_share_locks[i], NULL);
+    as_http_share = curl_share_init();
+    if (as_http_share != NULL) {
+        curl_share_setopt(as_http_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+        curl_share_setopt(as_http_share, CURLSHOPT_LOCKFUNC, as_http_share_lock);
+        curl_share_setopt(as_http_share, CURLSHOPT_UNLOCKFUNC, as_http_share_unlock);
+    }
+}
+
+// Lazily built, exactly once, on whichever worker gets here first. Safe because
+// pthread_once serialises it and because curl_global_init has already run (it is
+// called from as_job_publish on the AS3 thread, before any job is claimable).
+static CURLSH* as_http_share_get(void) {
+    pthread_once(&as_http_share_once, as_http_share_make);
+    return as_http_share;
+}
+
+// Does the environment already carry a proxy setting? libcurl reads these itself
+// on every transfer, so when one is present the OS must not override it (an
+// explicit 'http_proxy=... ./app' is a deliberate instruction, and it is also how
+// the proxy path is tested).
+static int as_http_env_proxy_set(void) {
+    static const char* names[6] = { "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY" };
+    int i;
+    for (i = 0; i < 6; i++) { const char* v = getenv(names[i]); if (v != NULL && v[0] != '\\0') return 1; }
+    return 0;
+}
+
+#ifdef ASC_SYSTEM_PROXY
+// The operating system's proxy configuration, read by a host-side helper in
+// vendor/sysproxy_glue.c. It CANNOT be written here: the SystemConfiguration (and
+// even CoreFoundation) headers pull in MacTypes.h, which defines struct Point —
+// exactly the name the flash.geom.Point class of this file compiles to. Keeping
+// the Apple headers in a separate translation unit is what lets the generated C
+// stay header-free and self-contained.
+//
+// Returns 1 when the OS has a proxy configured for this URL; both out buffers are
+// NUL-terminated "host:port" / comma-separated bypass lists, or empty.
+extern int as_sysproxy_get(const char* url, char* proxy, int proxy_cap, char* noproxy, int noproxy_cap);
+#endif
+
+// The blocking transfer, called from as_job_run — i.e. on a worker thread
+// whenever ASC_ASYNC_THREADS is set (it is, on every POSIX native target), so
+// the AS3 thread never blocks on the network. A 4xx/5xx is NOT a curl error:
+// the status is carried out and the thunk decides what AIR would dispatch.
+// Shared by URLLoader (ctx->stream == NULL: one body buffer, published at the
+// end) and URLStream (ctx->stream != NULL: appended live into the job).
+static void as_http_perform(as_job* j, as_http_ctx* ctx) {
+    CURL* h = curl_easy_init();
+    if (h == NULL) { j->error = AS_JOB_ERR_IO; return; }
+    struct curl_slist* hdrs = NULL;
+    const char* method = (j->mode != NULL) ? j->mode : "GET";
+    int is_post = (strcmp(method, "POST") == 0);
+    int has_body = (j->body != NULL && j->body_len > 0);
+    curl_easy_setopt(h, CURLOPT_URL, j->path);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, as_http_on_data);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, ctx);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, as_http_on_header);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, ctx);
+    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, j->follow_redirects ? 1L : 0L);
+    curl_easy_setopt(h, CURLOPT_MAXREDIRS, 20L);
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, 30L);
+#ifdef ASC_HTTP2
+    // Opt-in HTTP/2 over TLS: ALPN offers h2 first, and libcurl silently falls
+    // back to 1.1 when the server does not. It is NOT the default because AIR's
+    // transport is HTTP/1.1 and HTTP/2 rewrites something AS3 can see —
+    // HTTPStatusEvent.responseHeaders comes back with lower-cased names, no
+    // connection-level headers, and server-chosen ordering. Defaulting to 1.1 is
+    // what keeps a header-inspecting .as program byte-identical to adl.
+    curl_easy_setopt(h, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+#else
+    // Pin 1.1 explicitly rather than leaving it to libcurl: with an nghttp2-
+    // enabled build the library default is "h2 for https", which would make the
+    // transport depend on how libcurl was compiled instead of on AIR's behaviour.
+    curl_easy_setopt(h, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+#endif
+    // Cookie jar, gated by URLRequest.manageCookies. "" means "in-memory engine,
+    // no file": nothing is expected to survive the process, matching AIR's
+    // per-application jar. The share makes it ONE jar: a cookie stored by an
+    // earlier request (any URLLoader/URLStream) is sent by this one.
+    if (j->manage_cookies) {
+        CURLSH* share = as_http_share_get();
+        if (share != NULL) curl_easy_setopt(h, CURLOPT_SHARE, share);
+        curl_easy_setopt(h, CURLOPT_COOKIEFILE, "");
+    }
+#ifdef ASC_SYSTEM_PROXY
+    // Proxy. When the environment says nothing, consult the OS configuration;
+    // when it does, libcurl's own env handling already applies and must not be
+    // overridden. Fixed-size stack buffers: a proxy URL and a bypass list are
+    // small, and this runs per transfer.
+    if (!as_http_env_proxy_set()) {
+        char proxy[512];
+        char noproxy[2048];
+        proxy[0] = '\\0';
+        noproxy[0] = '\\0';
+        if (as_sysproxy_get(j->path, proxy, (int)sizeof(proxy), noproxy, (int)sizeof(noproxy))) {
+            if (proxy[0] != '\\0') curl_easy_setopt(h, CURLOPT_PROXY, proxy);
+            if (noproxy[0] != '\\0') curl_easy_setopt(h, CURLOPT_NOPROXY, noproxy);
+        }
+    }
+#endif
+    if (j->idle_timeout > 0.0) {
+        // AIR's idleTimeout is "time waiting for a response after the connection
+        // is established"; libcurl's low-speed pair is the closest equivalent.
+        long secs = (long)(j->idle_timeout / 1000.0);
+        if (secs < 1) secs = 1;
+        curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, secs);
+    }
+    if (j->user_agent != NULL) curl_easy_setopt(h, CURLOPT_USERAGENT, j->user_agent);
+    if (is_post) {
+        // POST carries the payload as the body; GET (and everything else) is a
+        // plain request whose query string URLLoader_load already folded in.
+        curl_easy_setopt(h, CURLOPT_POST, 1L);
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, (j->body != NULL) ? (const char*)j->body : "");
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)j->body_len);
+    } else if (strcmp(method, "GET") != 0) {
+        // PUT/DELETE/HEAD/OPTIONS and any custom verb need an explicit method;
+        // HEAD additionally suppresses the body (CURLOPT_NOBODY).
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+        if (strcmp(method, "HEAD") == 0) curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+        if (has_body) {
+            curl_easy_setopt(h, CURLOPT_POSTFIELDS, (const char*)j->body);
+            curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)j->body_len);
+        }
+    }
+    const char* ctype = as_http_effective_ctype(j);
+    if (ctype != NULL) {
+        char ct[512];
+        snprintf(ct, sizeof(ct), "Content-Type: %s", ctype);
+        hdrs = curl_slist_append(hdrs, ct);
+    } else if (is_post) {
+        // libcurl invents "Content-Type: application/x-www-form-urlencoded" for
+        // every POST it issues; adl sends NO Content-Type when the request carries
+        // no body (measured: POST with Content-Length 0 arrives header-less). An
+        // empty-valued entry is how a libcurl default header is switched off.
+        hdrs = curl_slist_append(hdrs, "Content-Type:");
+    }
+    if (j->request_headers != NULL && j->request_headers[0] != '\\0') {
+        hdrs = as_http_add_headers(hdrs, j->request_headers);
+    }
+    if (hdrs != NULL) curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+    CURLcode rc = curl_easy_perform(h);
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    long redirects = 0;
+    curl_easy_getinfo(h, CURLINFO_REDIRECT_COUNT, &redirects);
+    // CURLINFO_EFFECTIVE_URL returns a pointer OWNED BY THE HANDLE — it is only
+    // valid until curl_easy_cleanup, so it must be copied out before the cleanup
+    // below (a use-after-cleanup here produced a garbage responseURL).
+    char* eff = NULL;
+    curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, &eff);
+    char* eff_copy = as_job_strdup(eff);
+    curl_off_t clen = -1;
+    curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &clen);
+    if (hdrs != NULL) curl_slist_free_all(hdrs);
+    curl_easy_cleanup(h);
+    if (rc != CURLE_OK || ctx->body.oom || ctx->hdr.oom) {
+        free(eff_copy);
+        free(ctx->body.buf);
+        free(ctx->hdr.buf);
+        ctx->body.buf = NULL;
+        // A stream keeps whatever it already received (AIR leaves partial
+        // content readable after an IO error); only the error is recorded.
+        j->error = AS_JOB_ERR_IO;
+        return;
+    }
+    j->status = (int)status;
+    if (ctx->stream == NULL) {
+        j->bytes = ctx->body.buf;
+        j->len = ctx->body.len;
+    }
+    j->total = (unsigned)j->len;
+    j->expected_total = (clen >= 0 && clen <= 0xFFFFFFFFLL) ? (unsigned)clen : 0;
+    j->headers = ctx->hdr.buf;
+    j->headers_len = ctx->hdr.len;
+    j->eff_url = eff_copy;
+    j->redirected = (redirects > 0) ? 1 : 0;
+}
+
+static void as_http_run(as_job* j) {
+    as_http_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.job = j;
+    // The request is issued from here on, so the load counts as started: AIR
+    // still dispatches OPEN for a refused connection (adl: open;httpStatus(0);ioError).
+    j->started = 1;
+    as_http_perform(j, &ctx);
+}
+
+// URLStream: the body is appended live into the job (ctx.stream), so AS3 can
+// read it while the transfer runs. Same option/response handling as URLLoader.
+static void as_http_stream_run(as_job* j) {
+    as_http_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.job = j;
+    ctx.stream = j;
+    j->started = 1;
+    as_http_perform(j, &ctx);
+}
+#elif defined(ASC_HTTP_WEB)
+// The web backend: the page's own fetch(), driven from the same job table.
+//
+// A browser has no threads and no sockets, so this backend does not "run" the
+// job the way curl does: as_job_run() only STARTS the fetch (j->pending_async
+// keeps the inline publish from declaring it finished), and the JS promise
+// records the outcome — body chunks first, then the terminal status — into a
+// JS-side queue. as_web_fetch_pump(), called once per frame from as_async_tick,
+// drains that queue into the job. Polling is what keeps the C side free of
+// JS glue wiring: the alternative, exporting a C callback to the page, would
+// mean touching EXPORTED_FUNCTIONS in build.ts and EMSCRIPTEN_KEEPALIVE here,
+// and the one frame of latency the queue costs is invisible because every event
+// a job produces is dispatched at a frame boundary anyway.
+//
+// Queue entry kinds. The queue is a single ordered list on purpose: a body chunk
+// must land in the streaming buffer before the terminal entry that follows it.
+#define AS_WEB_CHUNK 1
+#define AS_WEB_DONE 2
+#define AS_WEB_ERROR 3
+
+// Locate a job by the raw pointer JS handed back. The pointer is never
+// dereferenced blind: it is compared against the live table (and the serial,
+// which is what makes a reused malloc address harmless) before use, so a
+// cancelled or long-gone job simply drops its late entries.
+static as_job* as_job_find(void* p, unsigned serial) {
+    for (int i = 0; i < as_job_count; i++) {
+        if ((void*)as_jobs[i] == p && as_jobs[i]->serial == serial) return as_jobs[i];
+    }
+    return NULL;
+}
+
+// Start the transfer. Everything the JS side needs is already copied into the
+// job (URL, method, headers, body) by as_async_submit_http on the AS3 thread, so
+// nothing here can observe a moving GC heap.
+EM_JS(void, as_web_fetch_go, (unsigned job, unsigned serial, const char* url, const char* method, const char* headers, const char* ctype, const char* body, int body_len, int follow, int streaming), {
+  var Q = globalThis.__ascHttpQ || (globalThis.__ascHttpQ = []);
+  var A = globalThis.__ascHttpActive || (globalThis.__ascHttpActive = {});
+  var key = job + ':' + serial;
+  var CRLF = String.fromCharCode(13) + String.fromCharCode(10);
+  var push = function (o) { o.job = job; o.serial = serial; Q.push(o); };
+  var fail = function (text) { push({ kind: 3, text: text }); };
+  var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  A[key] = ctl;
+  var opts = { method: UTF8ToString(method), redirect: follow ? 'follow' : 'manual', headers: {} };
+  if (ctl) opts.signal = ctl.signal;
+  // URLRequest.contentType is a HEADER on the wire: the curl backend turns it
+  // into one (see as_http_perform) and the browser invents nothing on its own --
+  // the Content-Type fetch picks by itself only applies to a string/Blob body,
+  // never to the Uint8Array passed here. It applies to a request that HAS a body,
+  // exactly as in the curl backend. Applied BEFORE the explicit header block so
+  // URLRequest.requestHeaders still wins.
+  // (Measured against the real endpoint: the same JSON body with no
+  // Content-Type is answered "platform ... is required"; with it, a token.)
+  if (ctype) {
+    var ctv = UTF8ToString(ctype);
+    if (ctv.length > 0) opts.headers['Content-Type'] = ctv;
+  }
+  var block = headers ? UTF8ToString(headers) : "";
+  if (block.length > 0) {
+    var lines = block.split(CRLF);
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (!line) continue;
+      var c = line.indexOf(':');
+      if (c > 0) opts.headers[line.substring(0, c).trim()] = line.substring(c + 1).trim();
+    }
+  }
+  if (body_len > 0) opts.body = HEAPU8.slice(body, body + body_len);
+  fetch(UTF8ToString(url), opts).then(function (r) {
+    delete A[key];
+    if (r.type === 'opaqueredirect') {
+      // followRedirects=false and the server answered 3xx: the browser refuses to
+      // expose a redirect it did not follow, so there is no status, no header and
+      // no body to report. Say exactly that rather than dressing it up as a 0.
+      fail('the server redirected and followRedirects is false, but a browser does not expose an unfollowed redirect response (no status, no headers, no body are readable)');
+      return null;
+    }
+    var hstr = "";
+    r.headers.forEach(function (v, k) { hstr += k + ': ' + v + CRLF; });
+    var cl = parseInt(r.headers.get('content-length'), 10);
+    var meta = { kind: 2, status: r.status, url: r.url, redirected: r.redirected, headers: hstr, clen: isNaN(cl) ? 0 : cl, text: "" };
+    if (!streaming || !r.body) {
+      return r.arrayBuffer().then(function (ab) { meta.buf = new Uint8Array(ab); push(meta); });
+    }
+    // URLStream: deliver the body as it arrives, so bytesAvailable grows while
+    // the transfer is still running (that is the whole point of the class).
+    var reader = r.body.getReader();
+    var pull = function () {
+      return reader.read().then(function (res) {
+        if (res.done) { push(meta); return; }
+        push({ kind: 1, buf: res.value });
+        return pull();
+      });
+    };
+    return pull();
+  }).catch(function (e) {
+    delete A[key];
+    if (e && e.name === 'AbortError') return;   // close() cancelled it: no event
+    // The browser deliberately hides WHY a cross-origin fetch failed (a CORS
+    // refusal and a dead host look identical), so the text names both.
+    fail('fetch failed (' + (e && e.message ? e.message : String(e)) + '); for a cross-origin URL this is usually a missing Access-Control-Allow-Origin header');
+  });
+});
+
+EM_JS(void, as_web_fetch_stop, (unsigned job, unsigned serial), {
+  var A = globalThis.__ascHttpActive;
+  var key = job + ':' + serial;
+  if (!A || !A[key]) return;
+  if (A[key]) A[key].abort();
+  delete A[key];
+});
+
+// Copy one string field of the entry under the pump's cursor into malloc'd
+// memory. The UTF-8 length is taken first and the buffer sized exactly.
+//
+// The bytes are encoded with TextEncoder rather than Emscripten's stringToUTF8:
+// the JS library functions are only linked into the build when COMPILED code
+// calls them, so reaching for one from an EM_ASM body is a runtime
+// ReferenceError (observed: "stringToUTF8 is not defined"). TextEncoder is a
+// browser built-in and needs nothing from the Emscripten library.
+static char* as_web_take_jsstr(const char* key) {
+    int n = EM_ASM_INT({
+        var e = globalThis.__ascCur;
+        var s = e ? e[UTF8ToString($0)] : 0;
+        return s ? new TextEncoder().encode(s).length : 0;
+    }, key);
+    char* out = (char*)malloc((size_t)n + 1);
+    if (out == NULL) return NULL;
+    if (n > 0) {
+        EM_ASM({
+            var e = globalThis.__ascCur;
+            var b = new TextEncoder().encode(e[UTF8ToString($1)]);
+            HEAPU8.set(b.subarray(0, $2), $0);
+        }, (unsigned)(uintptr_t)out, key, n);
+    }
+    out[n] = '\\0';
+    return out;
+}
+
+// Drain one entry: bytes first (a chunk must reach the live buffer, and a
+// terminal body must be staged, before the job is marked done), then the
+// metadata. Returns 0 when the queue is empty.
+static int as_web_fetch_pump(void) {
+    int consumed = 0;
+    for (;;) {
+        int kind = EM_ASM_INT({
+            var Q = globalThis.__ascHttpQ;
+            if (!Q || Q.length === 0) { globalThis.__ascCur = null; return 0; }
+            globalThis.__ascCur = Q.shift();
+            return globalThis.__ascCur.kind;
+        });
+        if (kind == 0) break;
+        consumed++;
+        unsigned jobp = (unsigned)EM_ASM_INT({ return globalThis.__ascCur.job; });
+        unsigned serial = (unsigned)EM_ASM_INT({ return globalThis.__ascCur.serial; });
+        as_job* j = as_job_find((void*)(uintptr_t)jobp, serial);
+        int n = EM_ASM_INT({ var e = globalThis.__ascCur; return (e && e.buf) ? e.buf.length : 0; });
+        unsigned char* buf = NULL;
+        if (n > 0) {
+            buf = (unsigned char*)malloc((size_t)n + 1);
+            if (buf != NULL) {
+                buf[n] = 0;
+                EM_ASM({ var e = globalThis.__ascCur; HEAPU8.set(e.buf, $0); }, (unsigned)(uintptr_t)buf);
+            }
+        }
+        // A cancelled job is skipped, not resurrected: its stream buffer and its
+        // loader are already gone.
+        if (j != NULL && !j->dead) {
+            if (kind == AS_WEB_CHUNK) {
+                if (j->kind == AS_JOB_HTTP_STREAM && buf != NULL) {
+                    if (as_stream_append(j, buf, (size_t)n)) as_job_mark_append(j, (unsigned)j->len);
+                }
+                // A URLLoader job has no live buffer to append to; its whole body
+                // arrives with the terminal entry (JS only streams for a stream).
+            } else if (kind == AS_WEB_DONE) {
+                j->status = EM_ASM_INT({ return globalThis.__ascCur.status; });
+                j->redirected = EM_ASM_INT({ return globalThis.__ascCur.redirected ? 1 : 0; });
+                j->expected_total = (unsigned)EM_ASM_INT({ return globalThis.__ascCur.clen; });
+                if (j->kind != AS_JOB_HTTP_STREAM) {
+                    j->bytes = buf;
+                    j->len = (size_t)n;
+                    buf = NULL;   // ownership moved into the job (retire frees it)
+                }
+                j->total = (unsigned)j->len;
+                j->headers = (unsigned char*)as_web_take_jsstr("headers");
+                j->headers_len = (j->headers != NULL) ? strlen((char*)j->headers) : 0;
+                j->eff_url = as_web_take_jsstr("url");
+                j->error = 0;
+                j->state = AS_JOB_DONE;
+                // A remote image is the one job kind whose payload is needed
+                // AFTER the transport stage, and the decode normally happens
+                // inside as_job_run -- which on web only started the fetch. Do
+                // it here instead, on the AS3 thread at the frame boundary: there
+                // is no worker to hide it on, and the cost is bounded by one
+                // image per job (a few ms for a photo-sized PNG).
+                if (j->kind == AS_JOB_IMAGE_URL) {
+                    int w = 0, h = 0;
+                    void* px = (j->len > 0) ? as_skia_image_decode_bytes_argb(j->bytes, j->len, &w, &h) : NULL;
+                    if (px == NULL) {
+                        // Same treatment as the curl branch's failed decode: drop
+                        // the payload, keep the received byte count, and let the
+                        // thunk report AS3's "unknown type".
+                        free((void*)j->bytes);
+                        j->bytes = NULL;
+                        j->len = 0;
+                        j->error = AS_JOB_ERR_DECODE;
+                    } else {
+                        j->pixels = px;
+                        j->width = w;
+                        j->height = h;
+                    }
+                }
+            } else {
+                j->error = AS_JOB_ERR_IO;
+                j->err_text = as_web_take_jsstr("text");
+                j->state = AS_JOB_DONE;
+            }
+        }
+        free(buf);
+        EM_ASM({ globalThis.__ascCur = null; });
+    }
+    return consumed;
+}
+
+static void as_http_run(as_job* j) {
+    const char* method = (j->mode != NULL) ? j->mode : "GET";
+    j->pending_async = 1;
+    j->started = 1;
+    as_web_fetch_go((unsigned)(uintptr_t)j, j->serial, j->path, method, j->request_headers, as_http_effective_ctype(j), (const char*)j->body, (int)j->body_len, j->follow_redirects, 0);
+}
+
+// URLStream over fetch: same start, but the body is streamed chunk by chunk into
+// the job's live buffer (see the reader loop in as_web_fetch_go).
+static void as_http_stream_run(as_job* j) {
+    const char* method = (j->mode != NULL) ? j->mode : "GET";
+    j->pending_async = 1;
+    j->started = 1;
+    as_web_fetch_go((unsigned)(uintptr_t)j, j->serial, j->path, method, j->request_headers, as_http_effective_ctype(j), (const char*)j->body, (int)j->body_len, j->follow_redirects, 1);
+}
+#else
+// No backend in this build: fail with a distinguishable error, never a silent
+// success and never a hang.
+static void as_http_run(as_job* j) {
+    j->error = AS_JOB_ERR_UNSUPPORTED;
+}
+static void as_http_stream_run(as_job* j) {
+    j->error = AS_JOB_ERR_UNSUPPORTED;
+}
+#endif
+
+// The blocking payload, run either on a worker thread or inline (see the two
+// execution strategies above). Never allocates from the GC heap, never fires an
+// event: its only job is to fill the staging fields.
+static void as_job_run(as_job* j) {
+    switch (j->kind) {
+        case AS_JOB_READ_TEXT:
+        case AS_JOB_READ_BYTES: {
+            j->bytes = as_job_read_file(j->path, &j->len, &j->total);
+            if (j->bytes == NULL) { j->error = AS_JOB_ERR_IO; break; }
+            // A local read knows its total up front, and AIR reports it as
+            // bytesTotal (adl: progress(2883/2883) for a 2883-byte file). HTTP
+            // without Content-Length stays indeterminate (0) instead.
+            j->expected_total = (unsigned)j->len;
+            j->started = 1;
+            break;
+        }
+        case AS_JOB_IMAGE:
+        case AS_JOB_IMAGE_URL:
+        case AS_JOB_DECODE: {
+            unsigned char* buf = (unsigned char*)j->bytes;
+            size_t n = j->len;
+            // AS_JOB_IMAGE_URL keeps its fetched payload on the job: the finish
+            // thunk still needs the encoded bytes to build the display-list
+            // SkImage (there is no file to re-open by name).
+            int keep_encoded = 0;
+            if (j->kind == AS_JOB_IMAGE_URL) {
+#if defined(ASC_HTTP_BACKEND)
+                // The same transport URLLoader uses, run here on the worker: one
+                // body buffer, published at the end. A 4xx/5xx is not a curl
+                // error, so a 404 body reaches the decoder and fails there —
+                // which is what AIR reports too ("unknown type").
+                as_http_ctx ctx;
+                memset(&ctx, 0, sizeof(ctx));
+                ctx.job = j;
+                as_http_perform(j, &ctx);
+                if (j->error != 0) break;
+                buf = (unsigned char*)j->bytes;
+                n = j->len;
+                keep_encoded = 1;
+#elif defined(ASC_HTTP_WEB)
+                // Browser target: there are no worker threads, so the fetch
+                // cannot complete here the way curl does. Start it and leave the
+                // job RUNNING -- as_http_run sets pending_async, so as_job_publish
+                // does not mark it DONE and no thunk runs yet. as_web_fetch_pump
+                // decodes the payload when the terminal entry lands, staging
+                // exactly the pair the curl branch stages: pixels for the
+                // BitmapData and the encoded bytes the display image is built
+                // from. Without this a remote Loader.load on web reported the
+                // "no HTTP backend" ioError even though the build HAS one.
+                as_http_run(j);
+                break;
+#else
+                // No HTTP backend in this build: report the missing transport
+                // (the LoaderInfo ioError names it) instead of decoding nothing.
+                j->error = AS_JOB_ERR_UNSUPPORTED;
+                break;
+#endif
+            } else if (j->kind == AS_JOB_IMAGE) {
+                // Read the file here, on the worker: the AS3 thread must not pay
+                // for the blocking read. AS_JOB_DECODE already holds its payload,
+                // copied out of the GC heap at submit time.
+                buf = as_job_read_file(j->path, &n, &j->total);
+                if (buf == NULL) { j->error = AS_JOB_ERR_IO; break; }
+            }
+            int w = 0, h = 0;
+            void* px = (n > 0) ? as_skia_image_decode_bytes_argb(buf, n, &w, &h) : NULL;
+            // The encoded bytes are only needed to decode; free them right away
+            // rather than pinning the whole file until the next frame boundary.
+            // (Exception: a fetched payload, which the finish thunk still needs.)
+            if (!keep_encoded) { free(buf); j->bytes = NULL; j->len = 0; }
+            if (px == NULL) { j->error = AS_JOB_ERR_DECODE; break; }
+            j->pixels = px;
+            j->width = w;
+            j->height = h;
+            break;
+        }
+        case AS_JOB_FS_OPEN: {
+            if (j->path == NULL) { j->error = AS_JOB_ERR_IO; break; }
+            const char* mode = (j->mode != NULL) ? j->mode : "rb";
+            if (strcmp(mode, "write") == 0) mode = "wb";
+            else if (strcmp(mode, "append") == 0) mode = "ab";
+            else if (strcmp(mode, "update") == 0) mode = "r+b";
+            void* h = (void*)fopen(j->path, mode);
+            if (h == NULL) { j->error = AS_JOB_ERR_IO; break; }
+            j->handle = h;
+            long cur = ftell((FILE*)h);
+            fseek((FILE*)h, 0, SEEK_END);
+            j->total = (unsigned)ftell((FILE*)h);
+            fseek((FILE*)h, cur, SEEK_SET);
+            break;
+        }
+        case AS_JOB_HTTP: {
+            as_http_run(j);
+            break;
+        }
+        case AS_JOB_HTTP_STREAM: {
+            as_http_stream_run(j);
+            break;
+        }
+        case AS_JOB_UNSUPPORTED: {
+            j->error = AS_JOB_ERR_UNSUPPORTED;
+            break;
+        }
+        default: j->error = AS_JOB_ERR_IO; break;
+    }
+}
+
+// POSIX targets get real threads. WASI Preview 1 has no thread primitives at
+// all, and Emscripten threads need -pthread plus SharedArrayBuffer and COOP/COEP
+// response headers (which the demo's plain static server does not send) while on
+// web the assets are already packed into the in-memory FS, so there is nothing
+// left to overlap. Windows is excluded because this preamble has no Win32 thread
+// path yet. Those targets keep the inline strategy.
+#if !defined(__wasi__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)
+#define ASC_ASYNC_THREADS 1
+#endif
+
+#ifdef ASC_ASYNC_THREADS
+#include <pthread.h>
+
+// Four workers: enough that the asset fan-out of a loader queue overlaps, small
+// enough not to oversubscribe a laptop. Claiming is first-come; there is no
+// priority, matching AIR's internal queue.
+#define AS_ASYNC_WORKERS 4
+
+static pthread_t as_worker_ids[AS_ASYNC_WORKERS];
+static pthread_mutex_t as_job_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t as_job_wake = PTHREAD_COND_INITIALIZER;
+static int as_workers_started = 0;
+
+// Requires as_job_lock held.
+static as_job* as_job_claim_locked(void) {
+    for (int i = 0; i < as_job_count; i++) {
+        as_job* j = as_jobs[i];
+        if (j != NULL && j->state == AS_JOB_QUEUED && !j->dead) {
+            j->state = AS_JOB_RUNNING;
+            return j;
+        }
+    }
+    return NULL;
+}
+
+static void* as_job_worker(void* arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&as_job_lock);
+        as_job* j = as_job_claim_locked();
+        while (j == NULL) {
+            pthread_cond_wait(&as_job_wake, &as_job_lock);
+            j = as_job_claim_locked();
+        }
+        pthread_mutex_unlock(&as_job_lock);
+        as_job_run(j);
+        pthread_mutex_lock(&as_job_lock);
+        j->state = AS_JOB_DONE;
+        pthread_cond_broadcast(&as_job_wake);
+        pthread_mutex_unlock(&as_job_lock);
+    }
+    return NULL;
+}
+
+static void as_async_start_workers(void) {
+    if (as_workers_started) return;
+    as_workers_started = 1;
+    for (int i = 0; i < AS_ASYNC_WORKERS; i++) pthread_create(&as_worker_ids[i], NULL, as_job_worker, NULL);
+}
+#endif // ASC_ASYNC_THREADS
+
+// Publish a fully built job. This is the instant a worker may claim it, so it
+// is also the only place the table is mutated: the supersede scan, the grow and
+// the append all happen under as_job_lock, and the wakeup is broadcast after the
+// job is in. Returns 0 when it could not be published (out of memory): nothing
+// was started, so no event may fire and the caller drops the job silently.
+static int as_job_publish(as_job* j) {
+#ifdef ASC_HTTP_BACKEND
+    // curl_global_init is not thread-safe and must run before any worker thread
+    // touches libcurl. Every as_job_publish happens on the AS3 thread, so a plain
+    // static guard is enough.
+    static int as_curl_ready = 0;
+    if (!as_curl_ready) { as_curl_ready = 1; curl_global_init(CURL_GLOBAL_DEFAULT); }
+#endif
+#ifdef ASC_ASYNC_THREADS
+    as_async_start_workers();
+    pthread_mutex_lock(&as_job_lock);
+#endif
+    // A target that already has a job in flight is superseded: AIR restarts the
+    // load when load()/openAsync() is called again, and the stale job must not
+    // dispatch an event when it lands.
+    for (int i = 0; i < as_job_count; i++) {
+        as_job* old = as_jobs[i];
+        if (old != NULL && old->obj == j->obj) old->dead = 1;
+    }
+    if (!as_job_grow()) {
+#ifdef ASC_ASYNC_THREADS
+        pthread_mutex_unlock(&as_job_lock);
+#endif
+        return 0;
+    }
+    as_jobs[as_job_count++] = j;
+#ifdef ASC_ASYNC_THREADS
+    pthread_cond_broadcast(&as_job_wake);
+    pthread_mutex_unlock(&as_job_lock);
+#else
+    // Inline strategy: the payload runs here and now, so the job is already
+    // finished when publish returns and the frame boundary only runs the thunk.
+    // A job that merely STARTED its transfer (web fetch) is the exception: it
+    // stays RUNNING until the JS pump delivers the response at a later frame,
+    // otherwise the thunk would run on a job with no status and no body.
+    as_job_run(j);
+    if (!j->pending_async) j->state = AS_JOB_DONE;
+#endif
+    return 1;
+}
+
+static void as_job_retire(as_job* j);
+static void as_job_release(as_job* j);
+
+// Submit a file job for 'obj'. 'finish' runs on the AS3 thread inside a frame
+// boundary and is skipped entirely when the job was superseded.
+// Returns the job (NULL when nothing could be started) so the generated code can
+// tag a flash.net target with as_job_set_net_events; every other caller ignores it.
+static void* as_async_submit(int kind, void* obj, void (*finish)(void*), const char* path, const char* mode, int binary) {
+    as_job* j = as_job_alloc(kind, obj, finish);
+    if (j == NULL) return NULL;  // out of memory: nothing was started, no event fires
+    j->path = as_job_strdup(path);
+    j->mode = as_job_strdup(mode);
+    j->binary = binary;
+    if (!as_job_publish(j)) { as_job_retire(j); as_job_release(j); return NULL; }
+    return (void*)j;
+}
+
+// Submit a job whose input is an in-memory payload (Loader.loadBytes). The bytes
+// are copied out of the GC heap NOW, on the AS3 thread: a worker must never read
+// GC memory, and the caller is free to dispose of the ByteArray afterwards
+// (Starling does exactly that once the LoaderInfo COMPLETE arrives). A failed
+// copy is reported as an IO error rather than as silence, so the caller still
+// gets an ioError instead of a load that never finishes.
+static void as_async_submit_bytes(int kind, void* obj, void (*finish)(void*), const void* data, size_t len) {
+    as_job* j = as_job_alloc(kind, obj, finish);
+    if (j == NULL) return;
+    j->total = (unsigned)len;
+    j->len = len;
+    if (data != NULL && len > 0) {
+        unsigned char* copy = (unsigned char*)malloc(len);
+        if (copy == NULL) j->error = AS_JOB_ERR_IO;
+        else {
+            memcpy(copy, data, len);
+            j->bytes = copy;
+        }
+    }
+    if (!as_job_publish(j)) { as_job_retire(j); as_job_release(j); }
+}
+
+// Submit an HTTP job. Every input is copied out of the GC heap NOW, on the AS3
+// thread: a worker must never read GC memory, and the URLRequest (plus any
+// payload string) may be collected immediately after load() returns. An OOM here
+// means nothing was started, so no event fires — same contract as as_async_submit.
+static void* as_async_submit_http(void* obj, void (*finish)(void*), const char* url, const char* method, const char* user_agent, const char* content_type, const char* request_headers, const void* body, size_t body_len, int binary, int follow_redirects, double idle_timeout, int manage_cookies) {
+    as_job* j = as_job_alloc(AS_JOB_HTTP, obj, finish);
+    if (j == NULL) return NULL;
+    j->path = as_job_strdup(url);
+    j->mode = as_job_strdup(method);
+    j->user_agent = as_job_strdup(user_agent);
+    j->content_type = as_job_strdup(content_type);
+    j->request_headers = as_job_strdup(request_headers);
+    j->binary = binary;
+    j->follow_redirects = follow_redirects;
+    j->idle_timeout = idle_timeout;
+    j->manage_cookies = manage_cookies;
+    if (body != NULL && body_len > 0) {
+        unsigned char* copy = (unsigned char*)malloc(body_len);
+        if (copy == NULL) { as_job_retire(j); as_job_release(j); return NULL; }
+        memcpy(copy, body, body_len);
+        j->body = copy;
+        j->body_len = body_len;
+    }
+    if (!as_job_publish(j)) { as_job_retire(j); as_job_release(j); return NULL; }
+    return (void*)j;
+}
+
+// Submit an image load for 'obj' (Loader.load). The transport is picked from the
+// URL: a local path is the pre-existing file read, while http(s):// goes through
+// the HTTP transport — so the two are different job kinds rather than one kind
+// that guesses. Redirects are followed and the process-wide cookie jar applies,
+// both matching what AIR's Loader does (an image URL that 301s is normal, and the
+// image request belongs to the same session as the app's other requests).
+static void* as_async_submit_image(void* obj, void (*finish)(void*), const char* url) {
+    if (!as_job_is_remote_url(url)) return as_async_submit(AS_JOB_IMAGE, obj, finish, url, NULL, 0);
+    as_job* j = as_job_alloc(AS_JOB_IMAGE_URL, obj, finish);
+    if (j == NULL) return NULL;  // out of memory: nothing was started, no event fires
+    j->path = as_job_strdup(url);
+    j->follow_redirects = 1;
+    j->manage_cookies = 1;
+    if (!as_job_publish(j)) { as_job_retire(j); as_job_release(j); return NULL; }
+    return (void*)j;
+}
+
+// Retire a finished (or superseded) job: release the staging buffers and the
+// slot. A FILE* still held by a superseded FS_OPEN job is closed here, because
+// its finish thunk never ran and nothing else took ownership.
+static void as_job_retire(as_job* j) {
+    if (j->kind == AS_JOB_FS_OPEN && j->handle != NULL) {
+        fclose((FILE*)j->handle);
+        j->handle = NULL;
+    }
+    free((void*)j->bytes);
+    free(j->pixels);
+    free(j->path);
+    free(j->mode);
+    free(j->body);
+    free(j->user_agent);
+    free(j->content_type);
+    free(j->request_headers);
+    free(j->headers);
+    free(j->eff_url);
+    free(j->marks);
+    free(j->err_text);
+    j->err_text = NULL;
+    j->bytes = NULL;
+    j->pixels = NULL;
+    j->obj = NULL;
+}
+
+static void as_job_release(as_job* j) {
+    free(j);
+}
+
+// ---- flash.net.Socket / ServerSocket / XMLSocket : the socket seam ----------
+//
+// TCP in flash.net is a DIFFERENT shape from the HTTP job machinery above: a
+// socket is long-lived, the app writes to it and receives from it over many
+// frames, and a connection can arrive from a peer (ServerSocket). The HTTP jobs
+// are one-shot and run on the worker pool, so reusing them for sockets would
+// mean a thread per connection plus a cross-thread handoff of the receive
+// buffer.
+//
+// This seam instead keeps every socket on the AS3 thread and NON-BLOCKING, and
+// pumps the whole set once per frame from as_async_tick: connect() returns
+// immediately (AIR: "connected" is still false right after connect() returns),
+// incoming bytes are drained into a per-socket buffer, and the events that the
+// pump raises are dispatched at the same frame boundary that already delivers
+// every other event. No locks, no shadow buffers, and a listener that calls
+// close() mid-dispatch cannot free the socket under the dispatcher (close()
+// only marks it dead; reap happens at the end of the pump).
+//
+// The AS3-visible behaviour (which errors, their ids and texts, the exact event
+// order, when writes reach the network, the NUL framing of XMLSocket) is
+// measured from adl, not guessed: temp/air-probe/Probe11.as and
+// air-probe11-result.txt; see docs/zh-cn/flash-net.md §7.
+//
+// Targets: POSIX native has sockets. WASI preview 1 has none, Emscripten's
+// browser target cannot open raw TCP, and Windows has no path here yet, so those
+// get a seam that always fails with "unsupported" — the AS3 side then reports
+// the documented ioError instead of silently doing nothing.
+
+#if !defined(__wasi__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
+#define ASC_SOCK_POSIX 1
+#endif
+
+// Socket states. ERRORED and IDLE both mean "no fd"; the difference is that
+// ERRORED still owes the caller an ioError.
+#define AS_SOCK_IDLE       0
+#define AS_SOCK_CONNECTING 1
+#define AS_SOCK_CONNECTED  2
+#define AS_SOCK_ERRORED    3
+
+// Events the pump raises and the dispatch pass consumes, in this order: a
+// connection that arrives and is closed in the same frame must still hand its
+// bytes over before the close.
+#define AS_SOCK_EV_CONNECT 1
+#define AS_SOCK_EV_ACCEPT  2
+#define AS_SOCK_EV_DATA    4
+#define AS_SOCK_EV_OUTPUT  8
+#define AS_SOCK_EV_ERROR   16
+#define AS_SOCK_EV_CLOSE   32
+
+// as_sock is malloc'd, never allocated from the GC heap: it holds raw fd state
+// and byte buffers, and the GC would have to be taught to trace them. The AS3
+// object is instead registered as a ROOT while the socket lives (see
+// as_sock_mark_roots), which is what keeps the target alive.
+typedef struct as_sock {
+    int fd;                 // -1 when there is no open descriptor
+    int state;
+    int is_server;
+    int dead;               // close() called: raise nothing more, reap at the pump tail
+    int err;                // errno of the failure behind AS_SOCK_ERRORED (0 = none)
+    int unsupported;        // the target has no socket backend at all
+    int listening;          // listen() has been called on this bound server socket
+    void* obj;              // the AS3 Socket / ServerSocket / XMLSocket instance
+    unsigned char* rbuf;    // bytes received and not yet read by AS3
+    int rlen, rpos, rcap;
+    unsigned char* wbuf;    // bytes written by AS3 and not yet accepted by the transport
+    size_t wlen, wpos, wcap;
+    int events;             // AS_SOCK_EV_* raised by the pump, consumed by dispatch
+    unsigned timeout_ms;    // connect() budget (Socket.timeout, default 20000)
+    double started_ms;      // when the connect attempt began
+    char local_addr[64];
+    int local_port;
+    char remote_addr[64];
+    int remote_port;
+    char url[256];          // the host a failed connect named, for the ioError text
+    struct as_sock* accepted;   // server: a peer accepted this pump, not yet dispatched
+    int accepted_ready;
+} as_sock;
+
+// The registry. Grows by realloc, entries are never removed mid-pump (close()
+// only sets dead), so a listener that opens a socket from inside a dispatch can
+// never invalidate the pointer the pump is walking.
+static as_sock** as_socks = NULL;
+static int as_sock_count = 0;
+static int as_sock_cap = 0;
+static int as_sock_dispatching = 0;
+
+static int as_sock_in_table(as_sock* s) {
+    for (int i = 0; i < as_sock_count; i++) if (as_socks[i] == s) return 1;
+    return 0;
+}
+
+static as_sock* as_sock_new(int is_server) {
+    if (as_sock_count >= as_sock_cap) {
+        int cap = as_sock_cap == 0 ? 8 : as_sock_cap * 2;
+        as_sock** grown = (as_sock**)realloc(as_socks, (size_t)cap * sizeof(as_sock*));
+        if (grown == NULL) return NULL;
+        as_socks = grown;
+        as_sock_cap = cap;
+    }
+    as_sock* s = (as_sock*)calloc(1, sizeof(as_sock));
+    if (s == NULL) return NULL;
+    s->fd = -1;
+    s->state = AS_SOCK_IDLE;
+    s->is_server = is_server;
+    s->timeout_ms = 20000;
+#ifdef ASC_SOCK_POSIX
+    s->unsupported = 0;
+#else
+    s->unsupported = 1;
+#endif
+    as_socks[as_sock_count++] = s;
+    return s;
+}
+
+// Drop the descriptor but KEEP the raised events: a failure that already
+// queued an ioError must still be dispatchable after the fd is gone.
+static void as_sock_drop_fd(as_sock* s) {
+    if (s->fd >= 0) close(s->fd);
+    s->fd = -1;
+    s->state = AS_SOCK_IDLE;
+    s->listening = 0;               // a dropped fd is not accepting connections
+}
+
+// close(): AIR dispatches no close event for this (only the peer's close does),
+// so the socket is marked dead and the pending events are discarded.
+static void as_sock_close(as_sock* s) {
+    if (s == NULL) return;
+    if (s->accepted != NULL) { as_sock_close(s->accepted); s->accepted = NULL; s->accepted_ready = 0; }
+    as_sock_drop_fd(s);
+    s->dead = 1;
+    s->events = 0;                  // no event of any kind follows an explicit close()
+}
+
+static void as_sock_free(as_sock* s) {
+    if (s->accepted != NULL) { as_sock_close(s->accepted); s->accepted = NULL; }
+    if (s->fd >= 0) close(s->fd);
+    free(s->rbuf);
+    free(s->wbuf);
+    free(s);
+}
+
+// Free the dead entries. Only ever called at the end of the pump, never while a
+// dispatch is in progress.
+static void as_sock_reap(void) {
+    if (as_sock_dispatching) return;
+    for (int i = 0; i < as_sock_count; ) {
+        as_sock* s = as_socks[i];
+        if (s != NULL && s->dead) {
+            as_sock_free(s);
+            for (int k = i; k + 1 < as_sock_count; k++) as_socks[k] = as_socks[k + 1];
+            as_sock_count--;
+            continue;
+        }
+        i++;
+    }
+}
+
+static int as_sock_count_all(void) { return as_sock_count; }
+static as_sock* as_sock_at(int i) { return (i >= 0 && i < as_sock_count) ? as_socks[i] : NULL; }
+static int as_sock_is_dead(as_sock* s) { return s == NULL || s->dead; }
+static int as_sock_state_of(as_sock* s) { return s->state; }
+static int as_sock_is_listening(as_sock* s) { return s != NULL && s->is_server && s->listening; }
+// Bound = has a local address and port. listen() requires this, and it stays true
+// until the socket is closed (bound and listening are separate states, which is
+// why ServerSocket.bound and .listening are separate properties).
+static int as_sock_is_bound(as_sock* s) { return s != NULL && s->is_server && s->fd >= 0 && s->local_port > 0; }
+static int as_sock_events_of(as_sock* s) { return s->events; }
+static void as_sock_clear_events(as_sock* s, int bits) { s->events &= ~bits; }
+static int as_sock_errno_of(as_sock* s) { return s->err; }
+static int as_sock_is_unsupported(as_sock* s) { return s->unsupported; }
+static void as_sock_set_obj(as_sock* s, void* obj) { s->obj = obj; }
+static void* as_sock_obj_of(as_sock* s) { return s->obj; }
+static void as_sock_set_timeout(as_sock* s, unsigned ms) { s->timeout_ms = ms; }
+// The text of AIR's socket ioError is "Error #2031: Socket Error. URL: <host>"
+// (measured); the host is what the connect attempt was given.
+static const char* as_sock_url(as_sock* s) { return s->url; }
+static unsigned as_sock_timeout(as_sock* s) { return s->timeout_ms; }
+static int as_sock_avail(as_sock* s) { return s->rlen - s->rpos; }
+static int as_sock_pending(as_sock* s) { return (int)(s->wlen - s->wpos); }
+static const char* as_sock_local_addr(as_sock* s) { return s->local_addr[0] != 0 ? s->local_addr : NULL; }
+static int as_sock_local_port(as_sock* s) { return s->local_port; }
+static const char* as_sock_remote_addr(as_sock* s) { return s->remote_addr[0] != 0 ? s->remote_addr : NULL; }
+static int as_sock_remote_port(as_sock* s) { return s->remote_port; }
+static void as_sock_set_no_delay(as_sock* s, int on) {
+#ifdef ASC_SOCK_POSIX
+    if (s == NULL || s->fd < 0) return;
+    int v = on ? 1 : 0;
+    setsockopt(s->fd, IPPROTO_TCP, TCP_NODELAY, &v, sizeof(v));
+#endif
+}
+
+// Format a sockaddr into the text AIR reports (localAddress/remoteAddress).
+static void as_sock_fill_addr(const struct sockaddr_storage* ss, char* out, size_t cap, int* port) {
+#ifdef ASC_SOCK_POSIX
+    out[0] = 0;
+    if (port != NULL) *port = 0;
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in* v4 = (const struct sockaddr_in*)ss;
+        inet_ntop(AF_INET, &v4->sin_addr, out, (socklen_t)cap);
+        if (port != NULL) *port = (int)ntohs(v4->sin_port);
+    } else if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6* v6 = (const struct sockaddr_in6*)ss;
+        inet_ntop(AF_INET6, &v6->sin6_addr, out, (socklen_t)cap);
+        if (port != NULL) *port = (int)ntohs(v6->sin6_port);
+    }
+#endif
+}
+
+// Remember the addresses the OS assigned, so localPort/remotePort read back the
+// real values (AIR reports them once the connection is up).
+static void as_sock_capture_addrs(as_sock* s) {
+#ifdef ASC_SOCK_POSIX
+    struct sockaddr_storage ss;
+    socklen_t len = (socklen_t)sizeof(ss);
+    if (s->fd >= 0 && getsockname(s->fd, (struct sockaddr*)&ss, &len) == 0) {
+        as_sock_fill_addr(&ss, s->local_addr, sizeof(s->local_addr), &s->local_port);
+    }
+    len = (socklen_t)sizeof(ss);
+    if (s->fd >= 0 && getpeername(s->fd, (struct sockaddr*)&ss, &len) == 0) {
+        as_sock_fill_addr(&ss, s->remote_addr, sizeof(s->remote_addr), &s->remote_port);
+    }
+#endif
+}
+
+static void as_sock_fail(as_sock* s, int e) { s->err = e; s->state = AS_SOCK_ERRORED; s->events |= AS_SOCK_EV_ERROR; as_sock_drop_fd(s); }
+
+// start a connect. Returns nothing: every failure (unresolvable host, refused
+// port, bad port) becomes an ioError event, which is what adl does for a host
+// that was supplied ("an error event is dispatched if a host was specified").
+static void as_sock_connect(as_sock* s, const char* host, int port) {
+    if (s == NULL) return;
+    // AIR: "If the socket is already connected, the existing connection is closed
+    // first" — silently, with no close event.
+    if (s->accepted != NULL) { as_sock_close(s->accepted); s->accepted = NULL; }
+    if (s->fd >= 0) as_sock_drop_fd(s);
+    s->rlen = s->rpos = 0;
+    s->wlen = s->wpos = 0;
+    s->remote_addr[0] = 0;
+    s->remote_port = 0;
+    snprintf(s->url, sizeof(s->url), "%s", host);
+    if (s->unsupported) { as_sock_fail(s, 0); return; }  // no socket backend on this target
+#ifdef ASC_SOCK_POSIX
+    {
+        char portstr[16];
+        snprintf(portstr, sizeof(portstr), "%d", port);
+        struct addrinfo hints;
+        struct addrinfo* res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        // Resolution is synchronous: the OS resolver caches, and a socket must be
+        // usable without a worker thread (see the seam note above).
+        int rc = getaddrinfo(host, portstr, &hints, &res);
+        if (rc != 0 || res == NULL) { as_sock_fail(s, EADDRNOTAVAIL); if (res != NULL) freeaddrinfo(res); return; }
+        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (fd < 0) { as_sock_fail(s, errno); freeaddrinfo(res); return; }
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        s->fd = fd;
+        int cr = connect(fd, res->ai_addr, res->ai_addrlen);
+        freeaddrinfo(res);
+        if (cr == 0) {
+            // A loopback connect completes inline, but AIR reports
+            // connected=false and dispatches Event.CONNECT only at the next frame
+            // boundary. So the state machine stays CONNECTING and the pump's
+            // SO_ERROR check (which returns 0 for this socket) is what promotes it
+            // — one code path for both the inline and the EINPROGRESS case, and no
+            // way for the connected flag to flip before the event is delivered.
+            s->state = AS_SOCK_CONNECTING;
+            s->started_ms = as_now_ms();
+            return;
+        }
+        if (errno == EINPROGRESS || errno == EALREADY) {
+            s->state = AS_SOCK_CONNECTING;
+            s->started_ms = as_now_ms();
+            return;
+        }
+        as_sock_fail(s, errno);
+    }
+#endif
+}
+
+// ServerSocket.bind(): binds and remembers the port the OS assigned (port 0 asks
+// for an ephemeral one). listening stays false until listen().
+static int as_sock_bind(as_sock* s, const char* host, int port) {
+    if (s == NULL) return 0;
+    if (s->fd >= 0) as_sock_drop_fd(s);
+    if (s->unsupported) return 0;
+#ifdef ASC_SOCK_POSIX
+    {
+        struct addrinfo hints;
+        struct addrinfo* res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_PASSIVE;
+        char portstr[16];
+        snprintf(portstr, sizeof(portstr), "%d", port);
+        const char* node = (host != NULL && host[0] != 0) ? host : NULL;
+        if (getaddrinfo(node, portstr, &hints, &res) != 0 || res == NULL) { if (res != NULL) freeaddrinfo(res); return 0; }
+        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (fd < 0) { freeaddrinfo(res); return 0; }
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        if (bind(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); freeaddrinfo(res); return 0; }
+        freeaddrinfo(res);
+        s->fd = fd;
+        s->state = AS_SOCK_IDLE;
+        s->listening = 0;           // bind() alone does not accept connections
+        as_sock_capture_addrs(s);
+        return 1;
+    }
+#else
+    return 0;
+#endif
+}
+
+static int as_sock_listen(as_sock* s, int backlog) {
+    if (s == NULL || s->fd < 0) return 0;
+#ifdef ASC_SOCK_POSIX
+    if (listen(s->fd, backlog > 0 ? backlog : 128) != 0) return 0;
+    s->listening = 1;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+// Accept one pending connection. The child is a normal non-blocking as_sock in
+// the CONNECTED state; its AS3 object is created by the dispatch pass (which is
+// where Socket_new is in scope).
+static void as_sock_accept_one(as_sock* s) {
+    if (s == NULL || s->fd < 0 || s->accepted_ready) return;
+#ifdef ASC_SOCK_POSIX
+    struct sockaddr_storage ss;
+    socklen_t len = (socklen_t)sizeof(ss);
+    int fd = accept(s->fd, (struct sockaddr*)&ss, &len);
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    as_sock* c = as_sock_new(0);
+    if (c == NULL) { close(fd); return; }
+    c->fd = fd;
+    c->state = AS_SOCK_CONNECTED;
+    c->timeout_ms = s->timeout_ms;
+    as_sock_capture_addrs(c);
+    s->accepted = c;
+    s->accepted_ready = 1;
+    s->events |= AS_SOCK_EV_ACCEPT;
+#endif
+}
+
+// Take the accepted child: the dispatch pass creates the AS3 object and then
+// calls this, so exactly one dispatcher ever owns it.
+static as_sock* as_sock_take_accepted(as_sock* s) {
+    if (s == NULL) return NULL;
+    as_sock* c = s->accepted;
+    s->accepted = NULL;
+    s->accepted_ready = 0;
+    return c;
+}
+
+// Buffer writes. AIR buffers them and only flush() (or the automatic flush
+// between frames on some platforms — macOS and this runtime) pushes them to the
+// transport; bytesPending is exactly this buffer's remainder.
+static void as_sock_write(as_sock* s, const void* data, int len) {
+    if (s == NULL) return;
+    if (len <= 0) return;
+    if (s->wlen > s->wpos) {
+        if (s->wpos > 0) { memmove(s->wbuf, s->wbuf + s->wpos, s->wlen - s->wpos); s->wlen -= s->wpos; s->wpos = 0; }
+    } else {
+        s->wlen = s->wpos = 0;
+    }
+    if (s->wlen + (size_t)len > s->wcap) {
+        size_t cap = s->wcap == 0 ? 256 : s->wcap;
+        while (cap < s->wlen + (size_t)len) cap *= 2;
+        unsigned char* grown = (unsigned char*)realloc(s->wbuf, cap);
+        if (grown == NULL) return;
+        s->wbuf = grown;
+        s->wcap = cap;
+    }
+    memcpy(s->wbuf + s->wlen, data, (size_t)len);
+    s->wlen += (size_t)len;
+}
+
+// Push as much of the write buffer as the transport accepts right now.
+static void as_sock_try_flush(as_sock* s) {
+    if (s == NULL || s->fd < 0) return;
+    if (s->wlen <= s->wpos) { s->wlen = s->wpos = 0; return; }
+#ifdef ASC_SOCK_POSIX
+    for (;;) {
+        ssize_t n = send(s->fd, s->wbuf + s->wpos, s->wlen - s->wpos, 0);
+        if (n > 0) {
+            s->wpos += (size_t)n;
+            if (s->wpos >= s->wlen) { s->wlen = s->wpos = 0; }
+            s->events |= AS_SOCK_EV_OUTPUT;
+            if (s->wlen == 0) return;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        if (n < 0) { as_sock_fail(s, errno); return; }
+        return;
+    }
+#endif
+}
+
+// Copy out of the receive buffer. The AS3 side has already checked
+// bytesAvailable, so this only ever moves what is there.
+static int as_sock_read(as_sock* s, void* dst, int n) {
+    if (s == NULL) return 0;
+    int avail = s->rlen - s->rpos;
+    int k = (n < avail) ? n : avail;
+    if (k > 0) memcpy(dst, s->rbuf + s->rpos, (size_t)k);
+    s->rpos += k;
+    if (s->rpos >= s->rlen) { s->rpos = s->rlen = 0; }
+    return k;
+}
+
+// Drain the descriptor into the receive buffer. POLLIN only promises SOME data;
+// this keeps pulling until the kernel says there is no more, so one frame hands
+// over a whole chunk (the adl run shows bytesLoaded = the whole echo).
+static void as_sock_drain(as_sock* s) {
+#ifdef ASC_SOCK_POSIX
+    for (;;) {
+        if (s->rcap - s->rlen < 4096) {
+            if (s->rpos > 0) { memmove(s->rbuf, s->rbuf + s->rpos, (size_t)(s->rlen - s->rpos)); s->rlen -= s->rpos; s->rpos = 0; }
+            if (s->rcap - s->rlen < 4096) {
+                int cap = s->rcap == 0 ? 8192 : s->rcap * 2;
+                unsigned char* grown = (unsigned char*)realloc(s->rbuf, (size_t)cap);
+                if (grown == NULL) return;
+                s->rbuf = grown;
+                s->rcap = cap;
+            }
+        }
+        ssize_t n = recv(s->fd, s->rbuf + s->rlen, (size_t)(s->rcap - s->rlen), 0);
+        if (n > 0) { s->rlen += (int)n; s->events |= AS_SOCK_EV_DATA; continue; }
+        if (n == 0) {
+            // The peer closed. Bytes received in this same pass are already
+            // buffered, so the dispatch order DATA-then-CLOSE still lets a
+            // listener read them (adl: socketData, then close).
+            s->events |= AS_SOCK_EV_CLOSE;
+            as_sock_drop_fd(s);
+            return;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        as_sock_fail(s, errno);
+        return;
+    }
+#endif
+}
+
+// The frame-boundary pump: one non-blocking poll of every live descriptor, then
+// the state machine that turns readiness into events.
+static void as_sock_pump(int wait_ms) {
+    if (as_sock_count == 0) return;
+#ifdef ASC_SOCK_POSIX
+    static struct pollfd* pfds = NULL;
+    static as_sock** owners = NULL;
+    static int cap = 0;
+    int n = 0;
+    for (int i = 0; i < as_sock_count; i++) {
+        as_sock* s = as_socks[i];
+        if (s == NULL || s->dead || s->fd < 0) continue;
+        if (n >= cap) {
+            int grow = cap == 0 ? 8 : cap * 2;
+            struct pollfd* np = (struct pollfd*)realloc(pfds, (size_t)grow * sizeof(struct pollfd));
+            as_sock** no = (as_sock**)realloc(owners, (size_t)grow * sizeof(as_sock*));
+            if (np == NULL || no == NULL) { free(np != NULL ? np : pfds); break; }
+            pfds = np;
+            owners = no;
+            cap = grow;
+        }
+        pfds[n].fd = s->fd;
+        pfds[n].events = POLLIN;
+        if (s->state == AS_SOCK_CONNECTING || s->wlen > s->wpos) pfds[n].events |= POLLOUT;
+        pfds[n].revents = 0;
+        owners[n] = s;
+        n++;
+    }
+    if (n > 0) poll(pfds, (nfds_t)n, wait_ms);
+    for (int i = 0; i < n; i++) {
+        as_sock* s = owners[i];
+        short re = pfds[i].revents;
+        if (s == NULL || s->dead || re == 0) continue;
+        if (s->is_server) {
+            if (re & POLLIN) as_sock_accept_one(s);
+            continue;
+        }
+        if (s->state == AS_SOCK_CONNECTING) {
+            if (re & (POLLOUT | POLLERR | POLLHUP)) {
+                int e = 0;
+                socklen_t elen = (socklen_t)sizeof(e);
+                if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &e, &elen) != 0) e = errno;
+                if (e == 0) {
+                    s->state = AS_SOCK_CONNECTED;
+                    as_sock_capture_addrs(s);
+                    s->events |= AS_SOCK_EV_CONNECT;
+                } else {
+                    as_sock_fail(s, e);
+                }
+            }
+            continue;
+        }
+        if (s->state == AS_SOCK_CONNECTED) {
+            if (re & POLLOUT) as_sock_try_flush(s);
+            if (re & POLLIN) as_sock_drain(s);
+            if (s->state == AS_SOCK_CONNECTED && (re & (POLLERR | POLLHUP)) && !(re & POLLIN)) {
+                // A hangup without readable data: nothing left to read.
+                s->events |= AS_SOCK_EV_CLOSE;
+                as_sock_drop_fd(s);
+            }
+        }
+    }
+    // Connect budget. Checked after the poll so a slow-but-successful connect is
+    // never failed by a timeout that elapsed during the same wait.
+    {
+        double now = as_now_ms();
+        for (int i = 0; i < as_sock_count; i++) {
+            as_sock* s = as_socks[i];
+            if (s == NULL || s->dead || s->state != AS_SOCK_CONNECTING) continue;
+            if (s->timeout_ms > 0 && (now - s->started_ms) > (double)s->timeout_ms) {
+                as_sock_fail(s, ETIMEDOUT);
+            }
+        }
+    }
+#endif
+    as_sock_reap();
+}
+
+// In-flight = something the frame loop can still make progress on without the
+// app doing anything: a connect attempt, or output not yet handed to the
+// transport. Only the test hook (as_async_tick_wait) waits on this.
+static int as_sock_in_flight(void) {
+    for (int i = 0; i < as_sock_count; i++) {
+        as_sock* s = as_socks[i];
+        if (s == NULL || s->dead) continue;
+        if (s->state == AS_SOCK_CONNECTING) return 1;
+        if (s->wlen > s->wpos) return 1;
+    }
+    return 0;
+}
+
+static int as_sock_any(void) { return as_sock_count > 0; }
+
+// Offset of the first 'ch' among the UNREAD bytes, or -1. XMLSocket uses it to
+// find a NUL-terminated message without copying the buffer out first.
+static int as_sock_index_of(as_sock* s, int ch) {
+    if (s == NULL) return -1;
+    for (int i = s->rpos; i < s->rlen; i++) if (s->rbuf[i] == (unsigned char)ch) return i - s->rpos;
+    return -1;
+}
+
+// The AS3 objects behind live sockets are permanent roots: the as_sock struct
+// itself is malloc'd, so nothing else would keep a Socket that the app forgot to
+// reference alive while its events are still pending.
+static void as_sock_mark_roots(void) {
+    for (int i = 0; i < as_sock_count; i++) {
+        as_sock* s = as_socks[i];
+        if (s == NULL) continue;
+        if (s->obj != NULL) gc_mark_ptr(s->obj);
+        if (s->accepted != NULL && s->accepted->obj != NULL) gc_mark_ptr(s->accepted->obj);
+    }
+}
+
+// Drain the completed jobs. Called only at the frame boundary, on the AS3
+// thread. The table is scanned under as_job_lock - workers write j->state under
+// that same lock - but the thunks run with the lock RELEASED: they dispatch AS3
+// events and a listener may chain another load (Starling: URLLoader COMPLETE ->
+// Loader.loadBytes), which publishes under the lock again. Holding the lock
+// across a dispatch would deadlock.
+//
+// A picked job is marked AS_JOB_FINISHING and deliberately left IN the table
+// until its thunk has run. The table is what as_async_mark_roots walks, and a
+// thunk allocates (BitmapData / Bitmap), which can trigger a collection from
+// gc_alloc before the target has been published back to AS3. Taking the job out
+// of the table up front would therefore unroot an otherwise unreferenced target
+// mid-thunk and let the sweep zero it - that was an observed crash (a Loader
+// whose contentLoaderInfo had been wiped to NULL), not a theoretical one.
+//
+// Up to 16 passes, because a thunk may publish a job that is already finished on
+// the inline targets, so a whole load chain still completes within one tick.
+// Returns the number of thunks run.
+static int as_sock_dispatch(void);    // defined with the AS3 Socket section (needs Socket_new)
+
+static int as_async_tick_with(int sock_wait_ms) {
+    // A thunk dispatches AS3 events and a listener may call the frame-boundary
+    // hook again (tickTimers is AS3-callable). This pass already drains everything
+    // the nested one could, so it reports "nothing done" instead of walking the
+    // same jobs twice.
+    if (as_async_in_tick) return 0;
+    as_async_in_tick = 1;
+
+    // Sockets first: a connect that completed, or bytes that arrived, since the
+    // last frame dispatch in THIS frame — the same promise the job path makes.
+    // sock_wait_ms is 0 at a real frame boundary (never block a frame) and 10 in
+    // the test hook, where the caller is waiting for a socket to make progress.
+    int sock_events = 0;
+    if (as_sock_any()) {
+        as_sock_pump(sock_wait_ms);
+        sock_events = as_sock_dispatch();
+    }
+
+#ifdef ASC_HTTP_WEB
+    // The web fetch backend delivers its results through a JS queue, so this is
+    // where an in-flight browser request becomes a finished job. Draining before
+    // the jobs are picked is what let a fetch that completed since the last frame
+    // dispatch in THIS frame.
+    as_web_fetch_pump();
+#endif
+
+    // Pre-pass: raise the in-flight events of the transfers that are still running.
+    // AIR does not batch a load's whole event sequence to its completion, and a
+    // streaming consumer needs PROGRESS (and the bytes behind it) as they arrive —
+    // this is the frame at which that happens. The pointers are collected under the
+    // lock but the events are dispatched with it RELEASED: a listener may submit the
+    // next request, and as_async_submit takes the same lock.
+    {
+        as_job* live[8];
+        int ln = 0;
+#ifdef ASC_ASYNC_THREADS
+        pthread_mutex_lock(&as_job_lock);
+#endif
+        for (int i = 0; i < as_job_count && ln < (int)(sizeof(live) / sizeof(live[0])); i++) {
+            as_job* j = as_jobs[i];
+            if (j != NULL && j->state == AS_JOB_RUNNING && j->net_events && !j->dead) live[ln++] = j;
+        }
+#ifdef ASC_ASYNC_THREADS
+        pthread_mutex_unlock(&as_job_lock);
+#endif
+        for (int i = 0; i < ln; i++) as_net_pre_events((void*)live[i]);
+    }
+
+    int finished = 0;
+    for (int pass = 0; pass < 16; pass++) {
+        as_job* ready[8];
+        int n = 0;
+
+        // Phase 1 (locked): pick the thunks that are due.
+#ifdef ASC_ASYNC_THREADS
+        pthread_mutex_lock(&as_job_lock);
+#endif
+        for (int i = 0; i < as_job_count; i++) {
+            as_job* j = as_jobs[i];
+            if (j == NULL || j->state != AS_JOB_DONE) continue;
+            if (j->dead || j->finish == NULL) continue;  // superseded: dropped in phase 3
+            if (n < (int)(sizeof(ready) / sizeof(ready[0]))) { ready[n++] = j; j->state = AS_JOB_FINISHING; }
+        }
+#ifdef ASC_ASYNC_THREADS
+        pthread_mutex_unlock(&as_job_lock);
+#endif
+
+        // Phase 2 (lock released): publish the staged results.
+        for (int i = 0; i < n; i++) {
+            if (ready[i]->finish != NULL) ready[i]->finish((void*)ready[i]);
+        }
+
+        // Phase 3 (locked): drop the jobs whose thunk has run, plus the superseded
+        // ones. A superseded FS_OPEN still closes the handle it opened: its thunk
+        // never ran, so nothing else took ownership.
+#ifdef ASC_ASYNC_THREADS
+        pthread_mutex_lock(&as_job_lock);
+#endif
+        int keep = 0;
+        for (int i = 0; i < as_job_count; i++) {
+            as_job* j = as_jobs[i];
+            if (j == NULL) continue;
+            if (j->state == AS_JOB_FINISHING) { as_job_retire(j); as_job_release(j); continue; }
+            if (j->state == AS_JOB_DONE && (j->dead || j->finish == NULL)) {
+                if (j->kind == AS_JOB_FS_OPEN && j->handle != NULL) { fclose((FILE*)j->handle); j->handle = NULL; }
+                as_job_retire(j);
+                as_job_release(j);
+                continue;
+            }
+            as_jobs[keep++] = j;
+        }
+        as_job_count = keep;
+#ifdef ASC_ASYNC_THREADS
+        pthread_mutex_unlock(&as_job_lock);
+#endif
+
+        finished += n;
+        if (n == 0) break;
+    }
+
+    as_async_in_tick = 0;
+    return finished + sock_events;
+}
+
+// The frame boundary's entry point: never blocks.
+static int as_async_tick(void) { return as_async_tick_with(0); }
+
+// Test hook (tickTimers): wait for the workers to drain the queue, then drain
+// the completed jobs, so one call is enough to observe COMPLETE - exactly the
+// deterministic behaviour the headless examples relied on before threading.
+// Looped because a finish thunk may submit the next link of a load chain.
+static void as_async_tick_wait(void) {
+    for (int pass = 0; pass < 16; pass++) {
+#ifdef ASC_ASYNC_THREADS
+        pthread_mutex_lock(&as_job_lock);
+        for (;;) {
+            int pending = 0;
+            for (int i = 0; i < as_job_count; i++) {
+                as_job* j = as_jobs[i];
+                if (j != NULL && !j->dead && (j->state == AS_JOB_QUEUED || j->state == AS_JOB_RUNNING)) { pending = 1; break; }
+            }
+            if (!pending) break;
+            pthread_cond_wait(&as_job_wake, &as_job_lock);
+        }
+        pthread_mutex_unlock(&as_job_lock);
+#endif
+        // The 10 ms socket wait is what makes a loopback round trip (connect ->
+        // write -> peer echo -> socketData) land inside one tickTimers() call
+        // instead of depending on how fast the host spins.
+        if (as_async_tick_with(10) == 0 && !as_sock_in_flight()) break;
+    }
+}
+
+// Job accessors: generated code reads staged results through these instead of
+// poking the struct, so the staging layout stays a runtime detail.
+static void* as_job_obj(void* job) { return ((as_job*)job)->obj; }
+static int as_job_failed(void* job) { return ((as_job*)job)->error; }
+static int as_job_error(void* job) { return ((as_job*)job)->error; }
+// The text an ioError carries. A backend that knows more than the error kind
+// supplies its own detail (the web fetch error names CORS and the failed URL
+// class), otherwise the cause picks between the two fixed texts the caller
+// passed: the unsupported-transport one (phase G) and its own generic one.
+static char* as_job_error_text(void* job, char* unsupported_text, char* generic_text) {
+    as_job* j = (as_job*)job;
+    if (j->err_text != NULL) return j->err_text;
+    if (j->error == AS_JOB_ERR_UNSUPPORTED) return unsupported_text;
+    return generic_text;
+}
+// The backend's own failure detail, or NULL when it has none. The web fetch
+// fills it (it names CORS and the tainted response); every native path leaves it
+// NULL. Kept separate from as_job_error_text because AIR's ioError text is a
+// fixed sentence per number and this is an EXTRA fact that sentence cannot carry.
+static char* as_job_err_detail(void* job) { return ((as_job*)job)->err_text; }
+static const char* as_job_path(void* job) { const char* p = ((as_job*)job)->path; return (p != NULL) ? p : ""; }
+// AIR attaches a NUMBER and a matching sentence to every internally generated
+// ioError, and AS3 code branches on the number (e.errorID == 2032). The pairs we
+// emit are MEASURED against adl 51.4.1 on the same failure matrix, because AIR's
+// documentation never lists them; the matrix lives in
+// docs/zh-cn/flash-net.md §6.7.5:
+//
+//   Loader    local file not found .......... 2035 "URL Not Found"
+//   Loader    HTTP >= 400, or transport .... 2036 "Load Never Completed"
+//   Loader    payload is not an image ....... 2124 "Loaded file is an unknown type"
+//   URLLoader / URLStream, any failure ...... 2032 "Stream Error"
+//   Socket, any failure ..................... 2031 "Socket Error"
+//
+// The text is that sentence plus the offending URL - the shape every one of those
+// measurements shows. The detail argument, when a backend supplied one, is
+// appended in parentheses rather than replacing the sentence: AIR has no
+// counterpart for it, but discarding it would make a CORS block look like a dead
+// server.
+static char* as_ioerror_text(const char* url, int id, const char* detail) {
+    const char* desc;
+    switch (id) {
+        case 2032: desc = "Stream Error"; break;
+        case 2035: desc = "URL Not Found"; break;
+        case 2036: desc = "Load Never Completed"; break;
+        case 2124: desc = "Loaded file is an unknown type"; break;
+        default: return NULL;  // no measured AIR pair (build-level diagnostics)
+    }
+    const char* u = (url != NULL) ? url : "";
+    size_t n = strlen(u) + strlen(desc) + 40;
+    if (detail != NULL) n += strlen(detail) + 3;
+    char* t = as_str_alloc(n);
+    if (detail != NULL) snprintf(t, n, "Error #%d: %s. URL: %s (%s)", id, desc, u, detail);
+    else                snprintf(t, n, "Error #%d: %s. URL: %s", id, desc, u);
+    return t;
+}
+// Which number a failed Loader image load reports. The job's error KIND is not
+// enough to decide it: a 4xx/5xx body also reaches the decoder and fails there,
+// and AIR reports that as a load that never completed (2036), not as an
+// undecodable payload (2124). The staged HTTP status is what separates them.
+// Returns 0 only for the build-level "no transport in this build" state, for
+// which AIR has no counterpart.
+static int as_job_loader_ioerror_id(void* job) {
+    as_job* j = (as_job*)job;
+    if (j->error == AS_JOB_ERR_UNSUPPORTED) return 0;
+    if (j->error == AS_JOB_ERR_DECODE) return (j->status >= 400) ? 2036 : 2124;
+    return as_job_is_remote_url(j->path) ? 2036 : 2035;
+}
+static const unsigned char* as_job_bytes(void* job) { return ((as_job*)job)->bytes; }
+static unsigned as_job_len(void* job) { return (unsigned)((as_job*)job)->len; }
+static unsigned as_job_total(void* job) { return ((as_job*)job)->total; }
+static int as_job_is_binary(void* job) { return ((as_job*)job)->binary; }
+static int as_job_status(void* job) { return ((as_job*)job)->status; }
+static const char* as_job_headers(void* job) { return (const char*)((as_job*)job)->headers; }
+static const char* as_job_eff_url(void* job) { const char* u = ((as_job*)job)->eff_url; return (u != NULL) ? u : ""; }
+static int as_job_redirected(void* job) { return ((as_job*)job)->redirected; }
+static unsigned as_job_expected_total(void* job) { return ((as_job*)job)->expected_total; }
+static int as_job_started(void* job) { return ((as_job*)job)->started; }
+static void as_job_set_net_events(void* job) { ((as_job*)job)->net_events = 1; }
+static int as_job_sent_open(void* job) { return ((as_job*)job)->sent_open; }
+static void as_job_set_sent_open(void* job) { ((as_job*)job)->sent_open = 1; }
+static int as_job_sent_status(void* job) { return ((as_job*)job)->sent_status; }
+static void as_job_set_sent_status(void* job) { ((as_job*)job)->sent_status = 1; }
+static unsigned as_job_marks_sent(void* job) { return ((as_job*)job)->marks_sent; }
+static void as_job_set_marks_sent(void* job, unsigned n) { ((as_job*)job)->marks_sent = n; }
+static unsigned as_job_last_progress(void* job) { return ((as_job*)job)->last_progress; }
+static void as_job_set_last_progress(void* job, unsigned n) { ((as_job*)job)->last_progress = n; }
+static int as_job_mark_count(void* job) { return ((as_job*)job)->mark_count; }
+static unsigned as_job_mark(void* job, int i) { as_job* j = (as_job*)job; return (i >= 0 && i < j->mark_count) ? j->marks[i] : 0u; }
+static void* as_job_pixels(void* job) { return ((as_job*)job)->pixels; }
+static int as_job_width(void* job) { return ((as_job*)job)->width; }
+static int as_job_height(void* job) { return ((as_job*)job)->height; }
+// TAKE (not get) an AS_JOB_FS_OPEN's handle: the FILE* changes owner here, so
+// the job must stop pointing at it. as_job_retire() closes whatever is still in
+// the job, and the AS3 FileStream closes the handle itself (the demo closes it
+// from its own COMPLETE listener), so handing out a COPY closed one FILE*
+// twice. Measured on web as a hard trap -- "Uncaught RuntimeError: table index
+// is out of bounds", with the symbolised stack fclose <- as_job_retire <-
+// Stage_dispatchFrame: emscripten's fclose ends in an indirect call through the
+// stream's own function pointer, and the freed stream's slot no longer holds a
+// valid table index. Native corrupts the heap silently instead (the double free
+// goes unnoticed by libmalloc), which is why only the browser build reported it.
+// Ownership rules for the other staged results are the opposite and stay as they
+// are: pixels/bytes are COPIED into the GC heap by the thunk and the job keeps
+// owning its malloc'd buffer.
+//
+// (No backticks anywhere in this preamble: it is a TS template literal, so one
+// would end the string and the C below would be parsed as TypeScript.)
+static void* as_job_take_handle(void* job) {
+    as_job* j = (as_job*)job;
+    void* h = j->handle;
+    j->handle = NULL;
+    return h;
+}
+
+// Permanent-root walk for in-flight jobs (invariant B above).
+static void as_async_mark_roots(void) {
+    for (int i = 0; i < as_job_count; i++) {
+        as_job* j = as_jobs[i];
+        if (j != NULL && j->obj != NULL) gc_mark_ptr(j->obj);
+    }
+}
+
+// Cancel every in-flight job targeting 'obj' (URLLoader.close / URLStream.close).
+// A cancelled job is marked dead exactly like a superseded one, and the existing
+// machinery does the rest: phase 1 of as_async_tick skips dead jobs, so no OPEN /
+// PROGRESS / COMPLETE / IO_ERROR is dispatched after close(), and phase 3 retires
+// them. Only a job that is still live counts as cancelable:
+//   * already dead  - a previous close() (or a superseding load) terminated it, so
+//                     there is no stream left to close and the caller must report
+//                     AIR's "invalid stream error";
+//   * AS_JOB_FINISHING - its thunk is running on this very thread (close() called
+//                     from one of its own listeners), i.e. a stream does exist but
+//                     the terminal events are already being delivered. Reported as
+//                     present, but not marked (phase 3 retires it by state anyway).
+// No lock is taken: by the ownership rule above, the job table and j->dead belong
+// to the AS3 thread, and close() is an AS3 call (as_async_mark_roots walks the
+// same table the same way). Returns 1 when a load was actually pending.
+static int as_async_cancel(void* obj) {
+    int found = 0;
+    for (int i = 0; i < as_job_count; i++) {
+        as_job* j = as_jobs[i];
+        if (j == NULL || j->obj != obj) continue;
+        if (j->dead) continue;
+        found = 1;
+        if (j->state != AS_JOB_FINISHING) j->dead = 1;
+#ifdef ASC_HTTP_WEB
+        // Stop the browser from downloading a response nobody will read. The
+        // AbortError the abort produces is swallowed in JS (see as_web_fetch_go),
+        // so a cancelled load dispatches nothing at all.
+        if (j->pending_async) as_web_fetch_stop((unsigned)(uintptr_t)j, j->serial);
+#endif
+    }
+    return found;
+}
+
+// ---------- URLStream incremental reads (stage 89·51, phase F) ----------
+// A streaming job's body grows on the worker thread while AS3 reads it on the
+// AS3 thread, so both sides take as_job_lock. On targets without threads the
+// transfer already ran to completion inside as_job_publish (inline strategy), so
+// the lock compiles out and every access is trivially ordered.
+static int as_stream_append(as_job* j, const void* p, size_t n) {
+#ifdef ASC_ASYNC_THREADS
+    pthread_mutex_lock(&as_job_lock);
+#endif
+    int ok = 1;
+    if (j->len + n + 1 > j->bytes_cap) {
+        size_t cap = (j->bytes_cap == 0) ? 4096 : j->bytes_cap;
+        while (cap < j->len + n + 1) cap *= 2;
+        unsigned char* grown = (unsigned char*)realloc((void*)j->bytes, cap);
+        if (grown == NULL) ok = 0;
+        else { j->bytes = grown; j->bytes_cap = cap; }
+    }
+    if (ok && n > 0) {
+        memcpy((void*)(j->bytes + j->len), p, n);
+        j->len += n;
+        ((unsigned char*)j->bytes)[j->len] = 0;
+    }
+#ifdef ASC_ASYNC_THREADS
+    pthread_mutex_unlock(&as_job_lock);
+#endif
+    return ok;
+}
+
+// bytesAvailable: bytes received but not yet handed to AS3. Zero once the job is
+// gone, which is what URLStream reports after COMPLETE once the remainder has
+// been drained, and after close().
+static unsigned as_stream_available(void* job) {
+    as_job* j = (as_job*)job;
+    if (j == NULL) return 0u;
+#ifdef ASC_ASYNC_THREADS
+    pthread_mutex_lock(&as_job_lock);
+#endif
+    size_t n = (j->len > j->consumed) ? (j->len - j->consumed) : 0;
+#ifdef ASC_ASYNC_THREADS
+    pthread_mutex_unlock(&as_job_lock);
+#endif
+    return (unsigned)n;
+}
+
+// Copies up to 'n' unconsumed bytes into 'dst' and advances the read cursor. The
+// return value is what was actually copied, which may be short of 'n' (a
+// non-blocking read never waits for bytes that have not arrived): the emitted
+// read* methods turn a shortfall into EOFError where AIR does.
+static int as_stream_read(void* job, void* dst, int n) {
+    as_job* j = (as_job*)job;
+    if (j == NULL || n <= 0) return 0;
+#ifdef ASC_ASYNC_THREADS
+    pthread_mutex_lock(&as_job_lock);
+#endif
+    size_t avail = (j->len > j->consumed) ? (j->len - j->consumed) : 0;
+    size_t k = ((size_t)n < avail) ? (size_t)n : avail;
+    if (k > 0 && dst != NULL) memcpy(dst, j->bytes + j->consumed, k);
+    j->consumed += k;
+#ifdef ASC_ASYNC_THREADS
+    pthread_mutex_unlock(&as_job_lock);
+#endif
+    return (int)k;
+}
+
+// One byte, or -1 when nothing is buffered (the caller raises EOFError).
+static int as_stream_get_byte(void* job) {
+    unsigned char b = 0;
+    if (as_stream_read(job, &b, 1) != 1) return -1;
+    return (int)b;
+}
+
+// 1 while the job is neither finished nor being torn down. 'connected' reports
+// this; it never blocks, so it can go stale the instant a transfer ends.
+static int as_stream_connected(void* job) {
+    as_job* j = (as_job*)job;
+    if (j == NULL) return 0;
+    return (j->state == AS_JOB_QUEUED || j->state == AS_JOB_RUNNING) ? 1 : 0;
+}
+
+// Submit a URLStream transfer. Unlike as_async_submit_http the return value is
+// the live job: URLStream owns the handle so it can read the body incrementally
+// and, on close(), let the ordinary cancel machinery kill the transfer. NULL
+// means the job could not be published (out of memory) — nothing was started.
+static void* as_async_submit_http_stream(void* obj, void (*finish)(void*), const char* url, const char* method, const char* user_agent, const char* content_type, const char* request_headers, const void* body, size_t body_len, int follow_redirects, double idle_timeout, int manage_cookies) {
+    as_job* j = as_job_alloc(AS_JOB_HTTP_STREAM, obj, finish);
+    if (j == NULL) return NULL;
+    j->path = as_job_strdup(url);
+    j->mode = as_job_strdup((method != NULL) ? method : "GET");
+    j->binary = 1;
+    if (user_agent != NULL) j->user_agent = as_job_strdup(user_agent);
+    if (content_type != NULL) j->content_type = as_job_strdup(content_type);
+    if (request_headers != NULL) j->request_headers = as_job_strdup(request_headers);
+    if (body != NULL && body_len > 0) {
+        j->body = (unsigned char*)malloc(body_len);
+        if (j->body != NULL) { memcpy(j->body, body, body_len); j->body_len = body_len; }
+    }
+    j->follow_redirects = follow_redirects;
+    j->idle_timeout = idle_timeout;
+    j->manage_cookies = manage_cookies;
+    if (!as_job_publish(j)) { as_job_release(j); return NULL; }
+    return j;
+}
+
+// Publish an already-doomed job so the caller's finish thunk still runs at a
+// frame boundary and can report AS_JOB_ERR_UNSUPPORTED. Returns the live job (or
+// NULL when nothing could be published) exactly like the streaming submit.
+static void* as_async_submit_unsupported(void* obj, void (*finish)(void*), const char* url) {
+    as_job* j = as_job_alloc(AS_JOB_UNSUPPORTED, obj, finish);
+    if (j == NULL) return NULL;
+    j->path = as_job_strdup(url);
+    j->binary = 1;
+    if (!as_job_publish(j)) { as_job_release(j); return NULL; }
+    return j;
+}
 
 // ---------- flash.system.System memory stats ----------
 // There is no AVM2 GC heap in this runtime: totalMemory/freeMemory are a
@@ -3271,9 +7591,75 @@ static double as_system_private_memory(void) {
     return 0.0;
 #endif
 }
+// ASC_FRAME_STATS: per-frame timing probe (diagnostic, env-gated). Records every
+// frame interval plus the time gc_step() spent inside that frame, then prints a
+// percentile summary together with RSS. A visible stutter has two candidate
+// causes and this separates them by measurement instead of by guess: a long
+// gc_step (the incremental slice is too big for the frame) or a long frame with
+// a *short* gc_step (allocator storm -- a fresh multi-MB segment is mmap'd,
+// zero-filled and copied, i.e. thousands of first-touch page faults per frame).
+#define AS_DBG_FRAME_CAP 512
+static double as_dbg_frame_ms[AS_DBG_FRAME_CAP];
+static double as_dbg_gc_ms[AS_DBG_FRAME_CAP];
+static double as_dbg_sort_ms[AS_DBG_FRAME_CAP];
+static int as_dbg_frame_n = 0;
+static double as_dbg_prev_ms = 0.0;
+static int as_dbg_frame_on = -1;
+static size_t as_dbg_free_bytes = 0;
+static int as_dbg_cmp(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+static void as_dbg_frame(double gc_ms) {
+    if (as_dbg_frame_on < 0) as_dbg_frame_on = getenv("ASC_FRAME_STATS") != NULL ? 1 : 0;
+    if (!as_dbg_frame_on) return;
+    const double now = as_now_ms();
+    if (as_dbg_prev_ms > 0.0 && as_dbg_frame_n < AS_DBG_FRAME_CAP) {
+        as_dbg_frame_ms[as_dbg_frame_n] = now - as_dbg_prev_ms;
+        as_dbg_gc_ms[as_dbg_frame_n] = gc_ms;
+        as_dbg_frame_n++;
+    }
+    as_dbg_prev_ms = now;
+    if (as_dbg_frame_n < AS_DBG_FRAME_CAP) return;
+    int n = as_dbg_frame_n;
+    double gc_max = 0.0, gc_sum = 0.0, frame_sum = 0.0;
+    int worst = 0;
+    for (int i = 0; i < n; i++) {
+        as_dbg_sort_ms[i] = as_dbg_frame_ms[i];
+        frame_sum += as_dbg_frame_ms[i];
+        gc_sum += as_dbg_gc_ms[i];
+        if (as_dbg_gc_ms[i] > gc_max) gc_max = as_dbg_gc_ms[i];
+        if (as_dbg_frame_ms[i] > as_dbg_frame_ms[worst]) worst = i;
+    }
+    qsort(as_dbg_sort_ms, (size_t)n, sizeof(double), as_dbg_cmp);
+    int over8 = 0, over17 = 0;
+    for (int i = 0; i < n; i++) {
+        if (as_dbg_frame_ms[i] > 8.0) over8++;
+        if (as_dbg_frame_ms[i] > 17.0) over17++;
+    }
+    size_t segs = 0, freeb = 0;
+    for (gc_seg* s = gc_segs; s != NULL; s = s->next) segs++;
+    for (gc_header* h = gc_free; h != NULL; h = h->next) freeb += h->size;
+    for (gc_header* h = gc_free_big; h != NULL; h = h->next) freeb += h->size;
+    as_dbg_free_bytes = freeb;
+    fprintf(stderr, "FRAME n=%d p50=%.2f p95=%.2f p99=%.2f max=%.2f(worstgc=%.2f) over8ms=%d over17ms=%d | gcmax=%.2f gcavg=%.2f gcshare=%.1f%% | rss=%.0fMB heaptotal=%.0fMB inuse=%.0fMB/%ldobj segs=%zu freeb=%.0fMB\\n",
+            n, as_dbg_sort_ms[n / 2], as_dbg_sort_ms[n * 95 / 100], as_dbg_sort_ms[n * 99 / 100],
+            as_dbg_sort_ms[n - 1], as_dbg_gc_ms[worst], over8, over17,
+            gc_max, gc_sum / (double)n, frame_sum > 0 ? 100.0 * gc_sum / frame_sum : 0.0,
+            as_system_private_memory() / 1048576.0, gc_heap_total_bytes() / 1048576.0,
+            (double)gc_dbg_inuse_bytes() / 1048576.0, gc_dbg_inuse_count(), segs,
+            (double)as_dbg_free_bytes / 1048576.0);
+    fflush(stderr);
+    as_dbg_frame_n = 0;
+}
+
 // System.gc(): force a stop-the-world collection. AIR exposes this for manual
 // GC; the frame loop instead calls gc_step() incrementally at the safe point,
 // but this lets offscreen scripts trigger a full collection inside a loop.
+// Unlike the frame loop it runs *inside* live AS3 frames, so the live C stack is
+// added to the root set conservatively (see gc_mark_stack) — otherwise objects
+// referenced only by stack locals of the calling chain would be swept underneath
+// their users.
 static void as_system_gc(void) {
     gc_collect();
 }
@@ -3300,6 +7686,39 @@ static const char* as_cap_os(void) {
     return "Linux";
 #endif
 }
+// AIR-compatible Capabilities.version: "<platform-prefix> <major>,<minor>,<build>,<internal>".
+// Starling's SystemUtil reads substr(0,3) for the platform and substr(4) for the
+// comma-separated version, then parseInt(split(",").shift()) to gate on major >= 19.
+// The prefix must therefore be a 3-char uppercase platform code, and the version is a
+// fixed AIR-compatible "50,0,0,0" (Adobe AIR's final major is 50). The AS-AOT marker
+// deliberately does NOT live here — it lives in Capabilities.manufacturer ("AS-AOT"),
+// because version's fixed-offset parsing breaks on any extra token. AIR's platform set
+// is MAC/WIN/LNX (desktop), AND/IOS/TVO (mobile/tv) plus our WAS (WASI); only desktop +
+// WASI are wired into build.ts today, mobile branches are reserved. On Apple platforms
+// __APPLE__ is true for macOS and iOS/tvOS, so TargetConditionals.h distinguishes them.
+static char* as_cap_version(void) {
+#ifdef __APPLE__
+  #include <TargetConditionals.h>
+  #if TARGET_OS_TV
+    const char* p = "TVO";
+  #elif TARGET_OS_IPHONE
+    const char* p = "IOS";
+  #else
+    const char* p = "MAC";
+  #endif
+#elif defined(_WIN32)
+    const char* p = "WIN";
+#elif defined(__ANDROID__)
+    const char* p = "AND";
+#elif defined(__wasi__)
+    const char* p = "WAS";
+#else
+    const char* p = "LNX";
+#endif
+    static char buf[64];
+    snprintf(buf, sizeof(buf), "%s 50,0,0,0", p);
+    return buf;
+}
 static const char* as_cap_cpu_arch(void) {
 #if defined(__aarch64__) || defined(__arm__)
     return "ARM";
@@ -3307,6 +7726,29 @@ static const char* as_cap_cpu_arch(void) {
     return "x86";
 #else
     return "Unknown";
+#endif
+}
+// Default user-agent string for flash.net requests (URLRequestDefaults.userAgent,
+// and therefore every URLRequest constructed from it). AIR documents the default
+// as "the same user agent string that is used by Flash Player, which is different
+// on Mac, Linux, and Windows", so this mirrors the Flash/AIR shape: an
+// AppleWebKit token plus an AdobeAIR/<version> token, with the version taken from
+// the same AIR-compatible "50,0,0,0" that as_cap_version reports (=> AdobeAIR/50.0).
+// The OS token is a fixed representative string per OS family, not a live
+// OS-version probe; it is a UA string, observable only by servers that sniff it.
+// WASI has no OS of its own, so it reuses the Linux token.
+static char* as_user_agent_default(void) {
+#ifdef __APPLE__
+  #include <TargetConditionals.h>
+  #if TARGET_OS_TV || TARGET_OS_IPHONE
+    return (char*)"Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) AdobeAIR/50.0";
+  #else
+    return (char*)"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) AdobeAIR/50.0";
+  #endif
+#elif defined(_WIN32)
+    return (char*)"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) AdobeAIR/50.0";
+#else
+    return (char*)"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) AdobeAIR/50.0";
 #endif
 }
 // ISO 639-1 language from the process locale (LANG, then LC_ALL). AIR reports a
@@ -3375,6 +7817,20 @@ static const char* const agal_op_name[0x2f] = {
     "cos","crs","dp3","dp4","abs","neg","sat","m33","m44","m34","ddx","ddy","ife","ine","ifg","ifl",
     "els","eif",0,0,0,0,0,"kil","tex","sge","slt","sgn","seq","sne","tld"
 };
+
+// Set when an instruction cannot be translated faithfully. Translation then
+// fails loudly (the caller throws) instead of emitting a shader that silently
+// drops the instruction -- a missing instruction renders as wrong pixels, which
+// is far harder to trace back than a failed compile.
+static char agal_err_buf[128];
+static void agal_unsupported(unsigned op) {
+    if (as_agal_errmsg != NULL) return;  // keep the first diagnostic
+    if (op < 0x2f && agal_op_name[op] != NULL)
+        snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL: opcode '%s' (0x%02x) is not translated to MSL/GLSL yet", agal_op_name[op], op);
+    else
+        snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL: opcode 0x%02x is not translated to MSL/GLSL yet", op);
+    as_agal_errmsg = agal_err_buf;
+}
 
 // Operand counts and no-destination flags for the OFFICIAL AGALMiniAssembler
 // bytecode. The opcode token is the BARE opcode number (0x00..0x2e) — it does
@@ -3516,6 +7972,8 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 else if (op == 0x0b) sprintf(rhs, "pow(%s.%c, %s.%c)", s1b, c1, s2b, c2);
                 else if (op == 0x0c) sprintf(rhs, "log2(%s.%c)", s1b, c1);
                 else if (op == 0x0d) sprintf(rhs, "exp2(%s.%c)", s1b, c1);
+                else if (op == 0x0e) sprintf(rhs, "normalize(%s).%c", s1, c1);
+                else if (op == 0x11) sprintf(rhs, "cross(%s.xyz, %s.xyz).%c", s1, s2, c1);
                 else if (op == 0x0f) sprintf(rhs, "sin(%s.%c)", s1b, c1);
                 else if (op == 0x10) sprintf(rhs, "cos(%s.%c)", s1b, c1);
                 // dp3/dp4 produce a scalar dot product, so a partial write-mask
@@ -3528,12 +7986,16 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 else if (op == 0x16) sprintf(rhs, "clamp(%s.%c, 0.0, 1.0)", s1b, c1);
                 else if (op == 0x1a) sprintf(rhs, "dfdx(%s.%c)", s1b, c1);
                 else if (op == 0x1b) sprintf(rhs, "dfdy(%s.%c)", s1b, c1);
-                else if (op == 0x28) sprintf(rhs, target == 0 ? "%s.sample(smp, %s.xy).%c" : "texture2D(%s, %s.xy).%c", s2b, s1, c1);
+                // tex: MSL needs the sampler that matches the *sampled register*, so
+                // the two targets need a different vararg count -- keep them as two
+                // separate sprintf calls (a ternary format string would mis-read the
+                // tail, see the compare-op note below).
+                else if (op == 0x28) { if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s.xy).%c", s2b, n2, s1, c1); else sprintf(rhs, "texture2D(%s, %s.xy).%c", s2b, s1, c1); }
                 else if (op == 0x29) sprintf(rhs, "(%s.%c >= %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2a) sprintf(rhs, "(%s.%c < %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2c) sprintf(rhs, "(%s.%c == %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2d) sprintf(rhs, "(%s.%c != %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
-                if (rhs[0] == 0) continue;
+                if (rhs[0] == 0) { agal_unsupported(op); continue; }
                 char t[192]; sprintf(t, "    %s.%c = %s;\\n", dname, ch, rhs); as_json_buf_append_cstr(b, t);
             }
             continue;
@@ -3562,12 +8024,33 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         else if (op == 0x16) sprintf(rhs, "clamp(%s, 0.0, 1.0)", s1);
         else if (op == 0x1a) sprintf(rhs, "dfdx(%s)", s1);
         else if (op == 0x1b) sprintf(rhs, "dfdy(%s)", s1);
-        else if (op == 0x28) sprintf(rhs, target == 0 ? "%s.sample(smp, %s.xy)" : "texture2D(%s, %s.xy)", s2, s1);
-        else if (op == 0x29) sprintf(rhs, "(%s >= %s) ? %s(1.0) : %s(0.0)", s1, s2, v4, v4);
-        else if (op == 0x2a) sprintf(rhs, "(%s < %s) ? %s(1.0) : %s(0.0)", s1, s2, v4, v4);
-        else if (op == 0x2c) sprintf(rhs, "(%s == %s) ? %s(1.0) : %s(0.0)", s1, s2, v4, v4);
-        else if (op == 0x2d) sprintf(rhs, "(%s != %s) ? %s(1.0) : %s(0.0)", s1, s2, v4, v4);
-        if (rhs[0] == 0) continue;
+        else if (op == 0x28) { if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s.xy)", s2b, n2, s1); else sprintf(rhs, "texture2D(%s, %s.xy)", s2b, s1); }
+        // Compare instructions: sge/slt/seq/sne produce a per-component 0.0/1.0
+        // mask. The operands are float4 (or 4-component swizzles), so the natural
+        // 'cond ? v4(1.0) : v4(0.0)' is invalid in BOTH targets -- MSL needs a
+        // scalar condition and GLSL a bool (not bvecN) condition. select()/mix()
+        // take the vector condition directly.
+        //
+        // These MUST be two separate sprintf calls rather than ONE sprintf with a
+        // ternary format string: the two formats consume a different number of
+        // varargs (MSL 4, GLSL 5) while the argument list is fixed, so the
+        // untaken branch's formats silently mis-read the tail ('mix(..., v0,
+        // s2, v4)' instead of 'mix(..., v4, s1, s2)'), producing 'v0(lessThan(
+        // v1, vec4))' -- a GLSL syntax error that killed every full-mask compare
+        // on the web target (Starling's CompositeFilter, i.e. the demo's "Switch
+        // Filter" button, was the only scene that hit it).
+        //
+        // GLSL side: mix(vec4, vec4, vec4) is legal ES 1.00 (§8.3), and the bvec4
+        // -> vec4 conversion is spelled out by ES 1.00 §5.4.2 ("If the basic type
+        // of a parameter to a constructor does not match ... the scalar
+        // construction rules are used to convert", cf. 'vec4(ivec4)'). mix() with
+        // a bvecN condition, by contrast, only exists in ES 3.00 -- and our GLSL
+        // is emitted as ES 1.00 (no #version directive), so it would not compile.
+        else if (op == 0x29) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s >= %s)", v4, v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(greaterThanEqual(%s, %s)))", v4, v4, v4, s1, s2); }
+        else if (op == 0x2a) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s < %s)", v4, v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(lessThan(%s, %s)))", v4, v4, v4, s1, s2); }
+        else if (op == 0x2c) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s == %s)", v4, v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(equal(%s, %s)))", v4, v4, v4, s1, s2); }
+        else if (op == 0x2d) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s != %s)", v4, v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(notEqual(%s, %s)))", v4, v4, v4, s1, s2); }
+        if (rhs[0] == 0) { agal_unsupported(op); continue; }
         char t[300]; sprintf(t, "    %s = %s;\\n", dname, rhs); as_json_buf_append_cstr(b, t);
     }
 }
@@ -3611,7 +8094,15 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         I->op = (unsigned)op;
         if (hasDst) { I->dst = as_agal_u32(bytes + pos); pos += 4; int t = (I->dst >> 24) & 0xFF, num = I->dst & 0xFFFF; agal_mark_use(t, num); }
         if (hasSrc1) { I->s1lo = as_agal_u32(bytes + pos); I->s1hi = as_agal_u32(bytes + pos + 4); pos += 8; agal_mark_use(I->s1hi & 0xFF, I->s1lo & 0xFFFF); }
-        if (hasSrc2) { I->s2lo = as_agal_u32(bytes + pos); I->s2hi = as_agal_u32(bytes + pos + 4); pos += 8; if (op == 0x28 || op == 0x2e) agal_mark_use(AGAL_FS, I->s2lo & 0xFFFF); else agal_mark_use(I->s2hi & 0xFF, I->s2lo & 0xFFFF); }
+        if (hasSrc2) { I->s2lo = as_agal_u32(bytes + pos); I->s2hi = as_agal_u32(bytes + pos + 4); pos += 8; if (op == 0x28 || op == 0x2e) agal_mark_use(AGAL_FS, I->s2lo & 0xFFFF); else { agal_mark_use(I->s2hi & 0xFF, I->s2lo & 0xFFFF);
+            // Matrix x vector (m33/m34/m44) reads src2..src2+rows-1 as consecutive
+            // registers, so the extra rows the instruction touches must be marked as
+            // used too. The MSL target declares one whole constant float4* vc array
+            // and never noticed, but the GLSL target declares ONE uniform per
+            // register (uniform vec4 vc0; vc1; ...): an unmarked row is undeclared
+            // and the shader fails to compile ("vc1: undeclared identifier").
+            int mrows = (op == 0x18) ? 4 : ((op == 0x17 || op == 0x19) ? 3 : 0);
+            for (int r = 1; r < mrows; r++) agal_mark_use(I->s2hi & 0xFF, (I->s2lo & 0xFFFF) + r); } }
         pos = inst_start + 24; // skip the fixed-size padding to the next slot
         n++;
     }
@@ -3633,10 +8124,19 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[64]; sprintf(t, "  float4 v%d [[user(locn%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
             as_json_buf_append_cstr(&b, "};\\nfragment float4 fs_main(\\n  FSIn in [[stage_in]],\\n  constant float4* fc [[buffer(0)]]");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[48]; sprintf(t, ",\\n  texture2d<float> fs%d [[texture(%d)]]", i, i); as_json_buf_append_cstr(&b, t); }
-            as_json_buf_append_cstr(&b, ",\\n  sampler smp [[sampler(0)]]\\n) {\\n  float4 oc;\\n");
+            // One sampler per texture register the program samples. Metal keeps no
+            // filter/wrap/mip state on the texture object itself, so a single shared
+            // sampler (the pre-stage-89-39 shape) forced every unit to use one
+            // state -- setSamplerStateAt could only ever be observed for the lowest
+            // bound unit. Each smpN is bound at sampler index N by the draw encoder
+            // (vendor/stage3d_glue.mm for native Metal, where Metal also *requires*
+            // every [[sampler(N)]] the shader declares to have state bound).
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[48]; sprintf(t, ",\\n  sampler smp%d [[sampler(%d)]]", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, "\\n) {\\n  float4 oc;\\n");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 ft%d;\\n", i); as_json_buf_append_cstr(&b, t); }
         }
         agal_emit_body(&b, ins, n, target);
+        if (as_agal_errmsg != NULL) { free(b.buf); return NULL; }
         if (!isFragment) {
             as_json_buf_append_cstr(&b, "  out.position = op;\\n");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[48]; sprintf(t, "  out.varying%d = v%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
@@ -3646,15 +8146,36 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         }
         as_json_buf_append_cstr(&b, "}\\n");
     } else {
-        // ---- GLSL ES ----
-        as_json_buf_append_cstr(&b, "precision mediump float;\\n");
+        // ---- GLSL ES 1.00 (WebGL2 accepts ES 1.00 sources) ----
+        // Precision: highp everywhere. ES 3.00 (and therefore WebGL2) guarantees
+        // highp in fragment shaders, and Starling's programs do matrix math on
+        // stage coordinates whose magnitude exceeds mediump's usable range.
+        if (isFragment && agal_is_used(AGAL_OD, 0))
+            as_json_buf_append_cstr(&b, "#extension GL_EXT_frag_depth : enable\\n");
+        as_json_buf_append_cstr(&b, "precision highp float;\\n");
         for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VC, i)) { char t[40]; sprintf(t, "uniform vec4 %s%d;\\n", isFragment ? "fc" : "vc", i); as_json_buf_append_cstr(&b, t); }
+        // Attributes (vertex) and varyings. ES 1.00 has no [[stage_in]] struct, so
+        // the vertex stage declares v0..vN as varying at file scope (the MSL path
+        // uses local temps copied into out.varyingN instead) and the fragment stage
+        // reads the same declarations; they must match exactly or the varying is
+        // undefined.
         for (int i = 0; i < 256; i++) if (agal_is_used(isFragment ? AGAL_V : AGAL_VA, i)) { char t[48]; sprintf(t, "%s vec4 %s%d;\\n", isFragment ? "varying" : "attribute", isFragment ? "v" : "va", i); as_json_buf_append_cstr(&b, t); }
+        if (!isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[40]; sprintf(t, "varying vec4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
         if (isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[40]; sprintf(t, "uniform sampler2D fs%d;\\n", i); as_json_buf_append_cstr(&b, t); }
         as_json_buf_append_cstr(&b, "void main() {\\n");
         for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  vec4 %s%d;\\n", isFragment ? "ft" : "vt", i); as_json_buf_append_cstr(&b, t); }
-        if (!isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[32]; sprintf(t, "  vec4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
         agal_emit_body(&b, ins, n, target);
+        if (as_agal_errmsg != NULL) { free(b.buf); return NULL; }
+        // Orientation: AS3 (and Metal, and every AIR backend) stores render-target
+        // row 0 at the TOP of the image -- which is also how BitmapData pixels are
+        // laid out, hence how texture coordinate v=0 is defined. GL stores row 0 at
+        // the BOTTOM. Negating clip-space Y makes every GL render target (back
+        // buffer and render textures) top-down like Metal's, keeps texture
+        // sampling consistent with uploads, and makes a glReadPixels buffer start
+        // at the image's top row for Skia. It also flips triangle winding, so the
+        // GL backend keeps GL's default CCW front faces (Metal needed CW).
+        if (!isFragment)
+            as_json_buf_append_cstr(&b, "  gl_Position.y = -gl_Position.y;\\n");
         as_json_buf_append_cstr(&b, "}\\n");
     }
     char* out = as_str_alloc(b.len + 1);
@@ -3662,6 +8183,17 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
     free(b.buf);
     return out;
 }
+
+// Shader language handed to the AGAL translator must match the linked Stage3D
+// glue: stage3d_glue.mm compiles MSL (target 0), stage3d_webgl.cc compiles GLSL
+// ES (target 1). Web build manifests set ASC_S3D_GLSL alongside the GL glue.
+#ifndef ASC_AGAL_TARGET
+#ifdef ASC_S3D_GLSL
+#define ASC_AGAL_TARGET 1
+#else
+#define ASC_AGAL_TARGET 0
+#endif
+#endif
 
 // ---------- Stage3D raw Metal bridge (stage 82) ----------
 // Exposes vendor/stage3d_glue.mm's offscreen programmable pipeline (MTLBuffer
@@ -3682,22 +8214,148 @@ extern int s3d_upload_vertex(void* ctx, int stream, const double* data, int numV
 extern int s3d_upload_index(void* ctx, const uint32_t* data, int numIndices);
 extern int s3d_upload_constants(void* ctx, int isFragment, const double* data, int count);
 extern void* s3d_upload_texture(void* ctx, int unit, int width, int height, const uint32_t* argb);
+extern void* s3d_texture_from_pixels(void* ctx, int width, int height, const uint32_t* argb);
 extern int s3d_compile(void* ctx, const char* vs_msl, const char* fs_msl, char* errbuf, int errbuf_size);
-extern void s3d_clear(void* ctx, float r, float g, float b, float a);
+extern void s3d_clear(void* ctx, float r, float g, float b, float a, float depth, unsigned int stencil, int maskBits);
 extern void s3d_set_blend(void* ctx, const char* sourceFactor, const char* destFactor);
 extern void s3d_set_instance_count(void* ctx, int n);
+// Stage3D state machine (applied by the glue when the next draw is encoded).
+extern void s3d_set_depth(void* ctx, int depthMask, const char* compareMode);
+extern void s3d_set_cull(void* ctx, const char* face);
+extern void s3d_set_stencil(void* ctx, const char* face, const char* compare, const char* bothPass, const char* depthFail, const char* dpFail);
+extern void s3d_set_stencil_ref(void* ctx, unsigned int ref, unsigned int readMask, unsigned int writeMask);
+extern void s3d_set_sampler_state(void* ctx, int unit, const char* wrap, const char* filter, const char* mipfilter);
+extern void s3d_set_scissor(void* ctx, int on, int x, int y, int w, int h);
 extern int s3d_draw(void* ctx, int numTriangles);
 extern int s3d_readback(void* ctx, uint8_t* out);
 extern int s3d_width(void* ctx);
 extern int s3d_height(void* ctx);
 extern void* s3d_create_render_texture(void* ctx, int width, int height);
-extern void s3d_set_render_target(void* ctx, void* tex);
+extern void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil);
 extern int s3d_bind_texture(void* ctx, int unit, void* tex);
 extern int s3d_readback_render(void* ctx, uint8_t* out);
 extern void s3d_destroy_texture(void* tex);
 extern void* s3d_get_render_target(void* ctx);
 #endif
 
+// ---- ATF (Adobe Texture Format) ----
+// AIR's uploadCompressedTextureFromByteArray hands the container straight to the
+// GPU, which decodes the block-compressed payload (S3TC) in hardware. Our
+// backend takes plain BGRA8 pixels, so we parse the container and decode the DXT
+// record of mip level 0 on the CPU -- the same fallback AIR itself uses on
+// devices without S3TC. Without this the texture stays empty and every quad
+// sampling it renders as a flat (often pink) block.
+//
+// Container layout, two header generations (Adobe's "ATF file format" article;
+// mirrored by openfl's display3D/_internal/ATFReader.hx and Ruffle's
+// render/src/atf.rs):
+//   legacy: "ATF" | u24 length | tdata | wLog2 | hLog2 | mipCount
+//   modern: "ATF" | 00 00 FF 02 .. (byte 6 == 0xFF):
+//           "ATF" | u8 | u8 | 0xFF | version | u32BE length
+//                 | tdata | wLog2 | hLog2 | mipCount
+// tdata's high bit is the cubemap flag, its low 7 bits are the ATF format:
+// 3 = RAW_COMPRESSED (DXT1), 5 = RAW_COMPRESSED_ALPHA (DXT5). Each mip level
+// then holds one length-prefixed record per GPU format (DXT, ETC1, PVRTC[4],
+// ETC2 -- 4 only from version 3 on). We decode the DXT record, which is what the
+// desktop GL/Metal path of AIR binds. Length prefixes are u24 for version 0 and
+// u32BE otherwise.
+static inline int as_atf_u24(const unsigned char* p) { return (p[0] << 16) | (p[1] << 8) | p[2]; }
+static inline int as_atf_u32(const unsigned char* p) { return ((int)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
+// 5-6-5 -> 8-8-8, replicating the high bits into the low ones.
+static inline void as_dxt_unpack565(int c, int* r, int* g, int* b) {
+    int rr = (c >> 11) & 31, gg = (c >> 5) & 63, bb = c & 31;
+    *r = (rr << 3) | (rr >> 2); *g = (gg << 2) | (gg >> 4); *b = (bb << 3) | (bb >> 2);
+}
+// Decode one 4x4 block of a DXT1 (8-byte) or DXT5 (16-byte) block into ARGB.
+static void as_dxt_block(const unsigned char* blk, int dxt5, unsigned* out) {
+    int a[16], i;
+    if (dxt5) {
+        // 8 bytes of alpha: two endpoints plus 16 3-bit indices (48 bits).
+        int a0 = blk[0], a1 = blk[1];
+        unsigned long long ai = 0;
+        for (i = 0; i < 6; i++) ai |= (unsigned long long)blk[2 + i] << (8 * i);
+        int pal[8];
+        pal[0] = a0; pal[1] = a1;
+        if (a0 > a1) { for (i = 1; i < 7; i++) pal[1 + i] = ((7 - i) * a0 + i * a1) / 7; }
+        else { for (i = 1; i < 5; i++) pal[1 + i] = ((5 - i) * a0 + i * a1) / 5; pal[6] = 0; pal[7] = 255; }
+        for (i = 0; i < 16; i++) a[i] = pal[(int)((ai >> (3 * i)) & 7)];
+    } else {
+        // DXT1 carries only 1-bit alpha; the transparent code is index 3 in the
+        // 3-colour (c0 <= c1) mode, which is also how the fourth palette entry
+        // below is defined.
+        for (i = 0; i < 16; i++) a[i] = 255;
+    }
+    const unsigned char* cp = blk + (dxt5 ? 8 : 0);
+    int c0 = cp[0] | (cp[1] << 8), c1 = cp[2] | (cp[3] << 8);
+    unsigned idx = (unsigned)cp[4] | ((unsigned)cp[5] << 8) | ((unsigned)cp[6] << 16) | ((unsigned)cp[7] << 24);
+    int pr[4], pg[4], pb[4];
+    as_dxt_unpack565(c0, &pr[0], &pg[0], &pb[0]);
+    as_dxt_unpack565(c1, &pr[1], &pg[1], &pb[1]);
+    if (c0 > c1) {
+        pr[2] = (2 * pr[0] + pr[1] + 1) / 3; pg[2] = (2 * pg[0] + pg[1] + 1) / 3; pb[2] = (2 * pb[0] + pb[1] + 1) / 3;
+        pr[3] = (2 * pr[1] + pr[0] + 1) / 3; pg[3] = (2 * pg[1] + pg[0] + 1) / 3; pb[3] = (2 * pb[1] + pb[0] + 1) / 3;
+    } else {
+        // 3-colour mode: index 2 averages the endpoints, index 3 is transparent
+        // black. DXT1 gets its only alpha from that index; DXT5 takes alpha from
+        // its own block, so the colour still resolves to black there.
+        pr[2] = (pr[0] + pr[1]) / 2; pg[2] = (pg[0] + pg[1]) / 2; pb[2] = (pb[0] + pb[1]) / 2;
+        pr[3] = 0; pg[3] = 0; pb[3] = 0;
+        if (!dxt5) for (i = 0; i < 16; i++) if (((idx >> (2 * i)) & 3) == 3) a[i] = 0;
+    }
+    for (i = 0; i < 16; i++) {
+        int ci = (int)((idx >> (2 * i)) & 3);
+        out[i] = ((unsigned)a[i] << 24) | ((unsigned)pr[ci] << 16) | ((unsigned)pg[ci] << 8) | (unsigned)pb[ci];
+    }
+}
+// Decode the DXT record of mip level 0. Returns a malloc'd ARGB buffer (the
+// caller owns it) or NULL when the container is not one we can decode.
+static unsigned* as_atf_decode_dxt(const unsigned char* data, int len, int* outW, int* outH) {
+    if (data == NULL || len < 16) return NULL;
+    if (data[0] != 'A' || data[1] != 'T' || data[2] != 'F') return NULL;
+    int version, pos;
+    if (data[6] == 0xFF) { version = data[7]; pos = 12; }
+    else { version = 0; pos = 6; }
+    int tdata = data[pos++];
+    if (tdata >> 7) return NULL;                       // cubemap: six faces unsupported
+    int fmt = tdata & 0x7F;
+    if (fmt != 3 && fmt != 5) return NULL;             // JPEG-XR / lossy variants unsupported
+    int w = 1 << data[pos++], h = 1 << data[pos++], mips = data[pos++];
+    if (w <= 0 || h <= 0 || mips < 1) return NULL;
+    int recs = (version < 3) ? 3 : 4;
+    // Only level 0 is consumed: our texture handle is single-level (no mipmaps).
+    const unsigned char* dxt = NULL;
+    int dxtLen = 0, gi;
+    for (gi = 0; gi < recs; gi++) {
+        int n = (version == 0) ? as_atf_u24(data + pos) : as_atf_u32(data + pos);
+        pos += (version == 0) ? 3 : 4;
+        if (n < 0 || pos + n > len) return NULL;
+        if (gi == 0) { dxt = data + pos; dxtLen = n; }
+        pos += n;
+    }
+    int dxt5 = (fmt == 5);
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    if (dxt == NULL || dxtLen < bw * bh * (dxt5 ? 16 : 8)) return NULL;
+    unsigned* px = (unsigned*)malloc(sizeof(unsigned) * (size_t)w * (size_t)h);
+    if (px == NULL) return NULL;
+    int by, bx;
+    for (by = 0; by < bh; by++) {
+        for (bx = 0; bx < bw; bx++) {
+            unsigned blk[16];
+            int x, y;
+            as_dxt_block(dxt + ((size_t)by * bw + bx) * (dxt5 ? 16 : 8), dxt5, blk);
+            for (y = 0; y < 4; y++) {
+                int py = by * 4 + y;
+                if (py >= h) break;
+                for (x = 0; x < 4; x++) {
+                    int pxx = bx * 4 + x;
+                    if (pxx < w) px[(size_t)py * w + pxx] = blk[y * 4 + x];
+                }
+            }
+        }
+    }
+    *outW = w; *outH = h;
+    return px;
+}
 static inline void* as_s3d_create(int w, int h) {
 #ifdef ASC_RENDER_STAGE3D
     return s3d_create(w, h);
@@ -3740,6 +8398,13 @@ static inline int as_s3d_upload_constants(void* ctx, int isFragment, const doubl
     (void)ctx; (void)isFragment; (void)data; (void)count; return 0;
 #endif
 }
+static inline void* as_s3d_texture_from_pixels(void* ctx, int w, int h, const uint32_t* argb) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_texture_from_pixels(ctx, w, h, argb);
+#else
+    (void)ctx; (void)w; (void)h; (void)argb; return NULL;
+#endif
+}
 static inline void* as_s3d_upload_texture(void* ctx, int unit, int w, int h, const uint32_t* argb) {
 #ifdef ASC_RENDER_STAGE3D
     return s3d_upload_texture(ctx, unit, w, h, argb);
@@ -3754,11 +8419,11 @@ static inline int as_s3d_compile(void* ctx, const char* vs, const char* fs, char
     (void)ctx; (void)vs; (void)fs; (void)errbuf; (void)errbuf_size; return 0;
 #endif
 }
-static inline void as_s3d_clear(void* ctx, float r, float g, float b, float a) {
+static inline void as_s3d_clear(void* ctx, float r, float g, float b, float a, float depth, unsigned int stencil, int maskBits) {
 #ifdef ASC_RENDER_STAGE3D
-    s3d_clear(ctx, r, g, b, a);
+    s3d_clear(ctx, r, g, b, a, depth, stencil, maskBits);
 #else
-    (void)ctx; (void)r; (void)g; (void)b; (void)a;
+    (void)ctx; (void)r; (void)g; (void)b; (void)a; (void)depth; (void)stencil; (void)maskBits;
 #endif
 }
 static inline void as_s3d_set_blend(void* ctx, const char* source, const char* dest) {
@@ -3773,6 +8438,51 @@ static inline void as_s3d_set_instance_count(void* ctx, int n) {
     s3d_set_instance_count(ctx, n);
 #else
     (void)ctx; (void)n;
+#endif
+}
+// Depth test / culling / stencil / sampler / scissor state. Like as_s3d_set_blend
+// these only record state in the glue; it is applied when the next draw is
+// encoded (Stage3D is a state machine: set* then drawTriangles).
+static inline void as_s3d_set_depth(void* ctx, int depthMask, const char* compareMode) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_depth(ctx, depthMask, compareMode);
+#else
+    (void)ctx; (void)depthMask; (void)compareMode;
+#endif
+}
+static inline void as_s3d_set_cull(void* ctx, const char* face) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_cull(ctx, face);
+#else
+    (void)ctx; (void)face;
+#endif
+}
+static inline void as_s3d_set_stencil(void* ctx, const char* face, const char* compare, const char* bothPass, const char* depthFail, const char* dpFail) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_stencil(ctx, face, compare, bothPass, depthFail, dpFail);
+#else
+    (void)ctx; (void)face; (void)compare; (void)bothPass; (void)depthFail; (void)dpFail;
+#endif
+}
+static inline void as_s3d_set_stencil_ref(void* ctx, unsigned int ref, unsigned int readMask, unsigned int writeMask) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_stencil_ref(ctx, ref, readMask, writeMask);
+#else
+    (void)ctx; (void)ref; (void)readMask; (void)writeMask;
+#endif
+}
+static inline void as_s3d_set_sampler_state(void* ctx, int unit, const char* wrap, const char* filter, const char* mipfilter) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_sampler_state(ctx, unit, wrap, filter, mipfilter);
+#else
+    (void)ctx; (void)unit; (void)wrap; (void)filter; (void)mipfilter;
+#endif
+}
+static inline void as_s3d_set_scissor(void* ctx, int on, int x, int y, int w, int h) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_set_scissor(ctx, on, x, y, w, h);
+#else
+    (void)ctx; (void)on; (void)x; (void)y; (void)w; (void)h;
 #endif
 }
 static inline int as_s3d_draw(void* ctx, int numTriangles) {
@@ -3810,11 +8520,11 @@ static inline void* as_s3d_create_render_texture(void* ctx, int w, int h) {
     (void)ctx; (void)w; (void)h; return NULL;
 #endif
 }
-static inline void as_s3d_set_render_target(void* ctx, void* tex) {
+static inline void as_s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil) {
 #ifdef ASC_RENDER_STAGE3D
-    s3d_set_render_target(ctx, tex);
+    s3d_set_render_target(ctx, tex, enableDepthAndStencil);
 #else
-    (void)ctx; (void)tex;
+    (void)ctx; (void)tex; (void)enableDepthAndStencil;
 #endif
 }
 static inline int as_s3d_bind_texture(void* ctx, int unit, void* tex) {

@@ -5,9 +5,12 @@
 // gotoAndPlay/gotoAndStop) driven by the as_mc_* frame pool; headless examples
 // pump it with tickMovieClips(). totalFrames is writable here (no symbol timeline).
 // SimpleButton is a four-state InteractiveObject bundle. Loader.load(url)
-// records the URL on contentLoaderInfo, dispatches INIT synchronously, and
-// defers COMPLETE to the next frame tick (as_set_timeout(0)) — matching the async
-// contract shared with stage 63's URLLoader.
+// records the URL on contentLoaderInfo, nulls `content`, dispatches INIT
+// synchronously and defers the outcome to the next frame tick: COMPLETE (with a
+// Bitmap content) for a URL that can be read, IO_ERROR for one that cannot —
+// AIR's LoaderInfo.complete is dispatched "when data has loaded successfully",
+// so a failed load never reports COMPLETE. Same async contract as stage 63's
+// URLLoader, through the shared async IO job table (as_async_submit).
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 
@@ -81,11 +84,43 @@ function onLoaderInit(e:Event):void { initFired = true; }
 function onLoaderComplete(e:Event):void { completeFired = true; }
 loader.contentLoaderInfo.addEventListener(LoaderInfo.INIT, onLoaderInit);
 loader.contentLoaderInfo.addEventListener(LoaderInfo.COMPLETE, onLoaderComplete);
+
+// A URL that cannot be read: air dispatches IO_ERROR, never COMPLETE
+// (LoaderInfo.complete = "dispatched when data has loaded successfully").
+// stage 89-45: the read now runs as an async job and the outcome is staged, so
+// `content` also stays null until the event fires.
+var loaderIoError:Boolean = false;
+function onLoaderIoError(e:IOErrorEvent):void { loaderIoError = true; }
+loader.contentLoaderInfo.addEventListener(LoaderInfo.IO_ERROR, onLoaderIoError);
 loader.load(new URLRequest("test.swf"));
 check(loader.contentLoaderInfo.url == "test.swf", "load records url");
+check(loader.contentLoaderInfo.bytesLoaded == 0 && loader.contentLoaderInfo.bytesTotal == 0, "bytes stay 0 while loading");
+check(loader.content == null, "content stays null until the event fires");
 check(initFired, "load dispatches INIT synchronously");
 check(!completeFired, "load does not dispatch COMPLETE synchronously");
 tickTimers();
-check(completeFired, "load dispatches COMPLETE on the next tick");
+check(!completeFired, "an unreadable URL never reports COMPLETE");
+check(loaderIoError, "an unreadable URL reports IO_ERROR on the next tick");
+
+// A readable URL whose payload is not an image: the read succeeds but the decode
+// cannot, and AIR reports that as IOErrorEvent.IO_ERROR (#2124 "Loaded file is an
+// unknown type") - never as COMPLETE with an empty Bitmap. Decoding a real image
+// needs the Skia backend, which the headless --run build does not link, so this
+// is the deterministic outcome in every build; the decoded-content path is
+// covered by the Skia-backed demo (examples/air-starling-demo).
+var okLoader:Loader = new Loader();
+var okComplete:Boolean = false;
+var okDecodeError:Boolean = false;
+function onOkComplete(e:Event):void { okComplete = true; }
+function onOkDecodeError(e:IOErrorEvent):void { okDecodeError = true; }
+okLoader.contentLoaderInfo.addEventListener(LoaderInfo.COMPLETE, onOkComplete);
+okLoader.contentLoaderInfo.addEventListener(LoaderInfo.IO_ERROR, onOkDecodeError);
+okLoader.load(new URLRequest("examples/stage62.as"));
+check(okLoader.content == null, "readable URL: content null right after load");
+check(!okComplete && !okDecodeError, "readable URL: no terminal event is synchronous");
+tickTimers();
+check(!okComplete, "a non-image payload never reports COMPLETE");
+check(okDecodeError, "a non-image payload reports IO_ERROR on the next tick");
+check(okLoader.content == null, "a failed decode leaves content null instead of an empty Bitmap");
 
 trace("stage62: all flash.display additions assertions passed");

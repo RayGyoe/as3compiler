@@ -256,7 +256,7 @@ change surface and highest regression risk, hence split into its own sub-stage.
 |---|---|---|---|
 | **GC-1** | GC heap + Mark-Sweep + Shadow Stack roots, **native first** | array / object(record) / dict / closure / user-class instances | `examples/stage57.as` long-loop `new` of many objects; `System.totalMemory` doesn't grow linearly per round; window demo MEM stable over long runs; old examples regression-free |
 | **GC-2** | strings into GC | strings | memory stable after frequent `trace`/`text.text` concatenation |
-| **GC-3** | WASI target verification + long-run regression | (same) | reclaims under `--target wasm` too; native+wasm long runs with zero dangling |
+| **GC-3** | WASI target verification + long-run regression | (same) | reclaims under `--target wasm` too; native+wasm long runs with zero dangling (⚠️ this acceptance can only be reproduced with examples whose exception machinery `-O2` eliminates: once `setjmp`/`longjmp` lands on a reachable path, the wasi-sdk 34 sysroot lacks `__wasm_setjmp`/`__c_longjmp` etc. and the **link fails** — see `compile.md` §2 and the `TODO.md` leftover table) |
 | **GC-4** | optional optimization: generational / write barrier + **incremental marking** | — | no significant frame-rate drop; after heap growth, **pause time no longer grows linearly with heap** (incremental marking spreads mark across frames, each frame only does a small slice — the correct way to eliminate jank; generational only reduces scan volume, doesn't eliminate pauses) |
 
 **MVP boundary (GC-1)**: stage/display list/event system — these "resident objects" are GC roots anyway (in
