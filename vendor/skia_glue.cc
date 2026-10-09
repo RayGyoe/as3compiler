@@ -16,6 +16,7 @@
 #include "include/core/SkCanvas.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPath.h"
+#include "include/core/SkStrokeRec.h"
 #include "include/core/SkImage.h"
 #include "include/core/SkBitmap.h"
 #include "include/core/SkData.h"
@@ -24,6 +25,12 @@
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkTypeface.h"
 #include "include/core/SkSpan.h"
+// Multi-stop gradients + bitmap-fill shaders (swc.md §9 E). SkGradientShader is the
+// only extra include the rich-fill path needs; SkImageShader comes with SkImage.h.
+#include "include/effects/SkGradientShader.h"
+#include <map>
+#include <string>
+#include <cstring> // strcmp: the AS3 BlendMode name -> SkBlendMode table
 // E1 (opt-in, native-only): the SVG rasterizer needs the stream adapter and the
 // svg module. Both are guarded by ASC_USE_SVG -- see the forward declarations in
 // the bitmap/image section for why this is an opt-in enhancement.
@@ -66,6 +73,7 @@
 #include "include/effects/SkGradientShader.h"
 #include "include/effects/SkImageFilters.h"
 #include "include/core/SkColorFilter.h"
+#include "include/effects/SkColorMatrix.h"
 #include "include/encode/SkPngEncoder.h"
 
 // SkParagraph (modules/skparagraph) is the full text-layout engine used for
@@ -313,11 +321,37 @@ void sk_canvas_draw_path(void* canvas, void* path, void* paint) {
   ((SkCanvas*)canvas)->drawPath(*(SkPath*)path, *(SkPaint*)paint);
 }
 
+// Total canvas scale: device units per logical unit of the CURRENT transform
+// (i.e. the product of every ancestor scale, the object's own scale and the
+// render pass's device pixel ratio). A screen-space 1px line (TextField's
+// border) is drawn in local coordinates, so its local thickness must be
+// 1 / scale to stay one *pixel* wide no matter how the object is scaled --
+// measured on adl 51.4.1: a bordered field keeps a 1px outline at scale 2,
+// scaleX=2/scaleY=1 and scale 0.5 alike. Column norms so a rotated matrix
+// reports the scale along each (rotated) axis rather than the raw matrix
+// entries.
+void sk_canvas_total_scale(void* canvas, double* sx, double* sy) {
+  const SkMatrix& m = ((SkCanvas*)canvas)->getTotalMatrix();
+  double a = (double)m.getScaleX(), b = (double)m.getSkewY();
+  double c = (double)m.getSkewX(),  d = (double)m.getScaleY();
+  *sx = sqrt(a * a + b * b);
+  *sy = sqrt(c * c + d * d);
+}
+
 // Intersect the current clip with a rectangle — used by TextField to keep
 // wrapped lines inside the field box when the text is scrolled (stage 44).
 void sk_canvas_clip_rect(void* canvas, double x, double y, double w, double h) {
   ((SkCanvas*)canvas)->clipRect(
       SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)w, (SkScalar)h));
+}
+
+// Clip the canvas to an arbitrary path -- the clipDepth mask of a DefineSprite
+// (swc.md §9 E-4). The path is already in the canvas' current space (the baker
+// composed the mask matrix into the masked child's local pixels), so this is a
+// plain intersect.
+void sk_canvas_clip_path(void* canvas, void* path, int antialias) {
+  ((SkCanvas*)canvas)->clipPath(*(const SkPath*)path, SkClipOp::kIntersect,
+                                antialias != 0);
 }
 
 // ---------- paint ----------
@@ -337,8 +371,49 @@ void sk_paint_set_color(void* paint, unsigned rgb) {
   ((SkPaint*)paint)->setColor(c);
 }
 
+// Straight 8-bit ARGB from a packed word. `sk_paint_set_color` + `sk_paint_set_alpha`
+// cannot express this exactly: alpha would have to round-trip through a double
+// (128/255.0*255.0 = 127.999... -> 127), which no baked SWC fill may do.
+void sk_paint_set_color_argb(void* paint, unsigned argb) {
+  SkPaint* p = (SkPaint*)paint;
+  p->setColor(SkColorSetARGB((argb >> 24) & 0xFF, (argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF));
+  p->setAlpha((uint8_t)((argb >> 24) & 0xFF));
+}
+
 void sk_paint_set_alpha(void* paint, double alpha) {
   ((SkPaint*)paint)->setAlpha((uint8_t)(alpha * 255.0));
+}
+
+// ---------- AS3 BlendMode (DisplayObject.blendMode, incl. baked SWC placements) ----------
+//
+// AS3 names a mix mode with a string (flash.display.BlendMode). The renderer
+// reaches this by putting the object's subtree into a saveLayer whose paint
+// carries the mode: the layer is composited with the parent only once, with the
+// requested operator, which is what AIR's per-object blend does.
+//
+// Returns 1 when the caller must open that layer, 0 when the object composites
+// normally (nothing to isolate). "layer" is NOT a mix operator -- AS3 defines it
+// as pure group isolation, so it returns 1 with plain kSrcOver: children are
+// precomposited before they reach the parent, exactly like AIR's LAYER.
+//
+// The modes AIR defines but Skia has no operator for (subtract / invert / alpha /
+// erase) return 0 rather than an approximation; the baker reports the ones it
+// meets instead of silently rendering them as normal (docs/zh-cn/swc.md §9.2 F4).
+int sk_paint_set_blend(void* paint, const char* name) {
+  if (name == NULL) return 0;
+  SkBlendMode m;
+  if (strcmp(name, "layer") == 0) m = SkBlendMode::kSrcOver;
+  else if (strcmp(name, "multiply") == 0) m = SkBlendMode::kMultiply;
+  else if (strcmp(name, "screen") == 0) m = SkBlendMode::kScreen;
+  else if (strcmp(name, "lighten") == 0) m = SkBlendMode::kLighten;
+  else if (strcmp(name, "darken") == 0) m = SkBlendMode::kDarken;
+  else if (strcmp(name, "difference") == 0) m = SkBlendMode::kDifference;
+  else if (strcmp(name, "add") == 0) m = SkBlendMode::kPlus;
+  else if (strcmp(name, "overlay") == 0) m = SkBlendMode::kOverlay;
+  else if (strcmp(name, "hardlight") == 0) m = SkBlendMode::kHardLight;
+  else return 0;
+  ((SkPaint*)paint)->setBlendMode(m);
+  return 1;
 }
 
 void sk_paint_set_fill(void* paint)   { ((SkPaint*)paint)->setStyle(SkPaint::kFill_Style); }
@@ -375,6 +450,52 @@ void sk_path_add_circle(void* path, double cx, double cy, double r) {
   ((SkPath*)path)->addCircle((SkScalar)cx, (SkScalar)cy, (SkScalar)r);
 }
 void sk_path_close(void* path) { ((SkPath*)path)->close(); }
+// Append `src` transformed by the affine [a, b, c, d, tx, ty] (AS3 convention:
+// x' = a*x + c*y + tx). Used to place a mask shape's outline into the masked
+// child's local pixel space without duplicating the geometry.
+void sk_path_add_transformed(void* dst, void* src, double a, double b, double c, double d, double tx, double ty) {
+  ((SkPath*)dst)->addPath(*(const SkPath*)src,
+                          SkMatrix::MakeAll((SkScalar)a, (SkScalar)c, (SkScalar)tx,
+                                            (SkScalar)b, (SkScalar)d, (SkScalar)ty,
+                                            0, 0, 1));
+}
+
+// Fill rule for Graphics fills: AIR paints (and therefore hit-tests) a fill as
+// EVEN-ODD. Measured on adl 51.4.1 with the hit-test probe (temp/editprobe/Ed21
+// §E): one beginFill followed by drawRect(0,0,40,40) and drawRect(10,10,20,20)
+// -- two same-direction nested subpaths -- leaves the inner 20x20 area OUTSIDE
+// the shape (shapeFlag=true misses it), which nonzero winding would fill. Two
+// *separate* beginFill/endFill groups stay fully filled (§E2), matching the
+// single-path model here only for non-overlapping subpaths (documented subset).
+void sk_path_set_even_odd(void* path, int evenOdd) {
+  ((SkPath*)path)->setFillType(evenOdd ? SkPathFillType::kEvenOdd : SkPathFillType::kWinding);
+}
+
+// Is the point inside the filled area? Uses the path's own fill type, so this is
+// exactly the region the renderer paints.
+int sk_path_contains(void* path, double x, double y) {
+  return ((SkPath*)path)->contains((SkScalar)x, (SkScalar)y) ? 1 : 0;
+}
+
+// Is the point inside the STROKED band of the path? AIR's lineStyle defaults are
+// round caps and round joints (`CapsStyle.ROUND`/`JointStyle.ROUND`), and the hit
+// region is the painted band: measured with a 10px stroke-only line, a point 4.5px
+// perpendicular from the centreline hits while 5.5px misses, and a point 2px past
+// the endpoint still hits (round cap) -- temp/editprobe/Ed24 §7. getFillPath builds
+// the same outline the stroke renderer would, so flattening, joins and caps all
+// agree with what is drawn.
+int sk_path_stroke_contains(void* path, double width, double x, double y) {
+  SkPaint p;
+  p.setStyle(SkPaint::kStroke_Style);
+  p.setStrokeWidth((SkScalar)width);
+  p.setStrokeCap(SkPaint::kRound_Cap);
+  p.setStrokeJoin(SkPaint::kRound_Join);
+  SkStrokeRec rec(p);
+  rec.setStrokeParams(SkPaint::kRound_Cap, SkPaint::kRound_Join, 4.0f);
+  SkPath dst;
+  if (!rec.applyToPath(&dst, *(SkPath*)path)) return 0;
+  return dst.contains((SkScalar)x, (SkScalar)y) ? 1 : 0;
+}
 
 // Bounding box of a path in its own coordinate space (already cached by Skia, so
 // this is O(1)). Returns 0 when the path is empty so callers can fall back to an
@@ -410,6 +531,113 @@ void sk_paint_set_linear_gradient(void* paint,
   ((SkPaint*)paint)->setShader(shader);
 }
 
+// ---------- rich fills: multi-stop gradients, bitmap shaders, stroke params ----
+// (swc.md §9 E)
+
+// SWF gradient/focal spread: 0 pad, 1 reflect, 2 repeat.
+static SkTileMode sk_tile_from_spread(int spread) {
+  switch (spread) {
+    case 1:  return SkTileMode::kMirror;
+    case 2:  return SkTileMode::kRepeat;
+    default: return SkTileMode::kClamp;
+  }
+}
+
+// SWF gradient space is a unit construct spanning [-16384, 16384] along the
+// gradient axis (Ruffle's swf_to_gl_matrix divides the axis by 32768 and
+// recentres by +0.5, which is the same statement). Everything the shader needs is
+// therefore authored in that space and placed by the SWF matrix, so one code path
+// covers linear/radial/focal. The matrix arrives as lm[6] = SWF matrix / 20 (the
+// SWF matrix maps gradient space -> twips; our shape space is pixels).
+#define AS_SWC_GRAD_EXTENT 16384.0
+
+static void sk_lm_from6(SkMatrix* m, const double* lm) {
+  m->setAll((SkScalar)lm[0], (SkScalar)lm[2], (SkScalar)lm[4],
+            (SkScalar)lm[1], (SkScalar)lm[3], (SkScalar)lm[5],
+            0.0f, 0.0f, 1.0f);
+}
+
+// kind: 0 linear, 1 radial, 2 focal. Returns 1 when a shader was installed.
+int sk_paint_set_gradient(void* paint, int kind, const double* lm,
+                          const unsigned* argb, const double* pos, int count,
+                          int spread, double focal) {
+  if (count > 32) count = 32;
+  if (count < 2) return 0;
+  SkColor cols[32];
+  SkScalar ps[32];
+  for (int i = 0; i < count; i++) {
+    cols[i] = (SkColor)argb[i];
+    ps[i] = (SkScalar)pos[i];
+  }
+  SkMatrix m;
+  sk_lm_from6(&m, lm);
+  const SkTileMode tm = sk_tile_from_spread(spread);
+  sk_sp<SkShader> sh;
+  if (kind == 1) {
+    sh = SkGradientShader::MakeRadial(SkPoint::Make(0.0f, 0.0f),
+                                      (SkScalar)AS_SWC_GRAD_EXTENT,
+                                      cols, ps, count, tm, 0, &m);
+  } else if (kind == 2) {
+    // The focal point sits at (focal, 0) in the normalised [-1,1] space, i.e.
+    // focal * 16384 along the gradient axis. Skia's two-point conical is the
+    // same construction (a point-radius circle morphing into the outer circle).
+    double f = focal;
+    if (f > 0.999) f = 0.999;
+    if (f < -0.999) f = -0.999;
+    sh = SkGradientShader::MakeTwoPointConical(
+        SkPoint::Make((SkScalar)(f * AS_SWC_GRAD_EXTENT), 0.0f), 0.0f,
+        SkPoint::Make(0.0f, 0.0f), (SkScalar)AS_SWC_GRAD_EXTENT,
+        cols, ps, count, tm, 0, &m);
+  } else {
+    SkPoint pts[2] = { SkPoint::Make((SkScalar)-AS_SWC_GRAD_EXTENT, 0.0f),
+                       SkPoint::Make((SkScalar)AS_SWC_GRAD_EXTENT, 0.0f) };
+    sh = SkGradientShader::MakeLinear(pts, cols, ps, count, tm, 0, &m);
+  }
+  if (!sh) return 0;
+  ((SkPaint*)paint)->setShader(std::move(sh));
+  return 1;
+}
+
+// Bitmap fills: the SWF bitmap matrix maps the bitmap's PIXEL rect (0,0)-(w,h)
+// onto the shape, so lm[6] = that matrix / 20 lands the image directly (verified
+// against the skin: a 46x46 bitmap with matrix scale 20 covers exactly 920 twips).
+// `repeat` false = CLIPPED, i.e. decal tile mode (SWF fill types 0x41/0x43).
+int sk_paint_set_bitmap_shader(void* paint, void* image, const double* lm,
+                              int repeat, int smooth) {
+  if (image == nullptr) return 0;
+  SkMatrix m;
+  sk_lm_from6(&m, lm);
+  // SWF bitmap fills are either repeating (0x40/0x42) or CLIPPED (0x41/0x43).
+  // "Clipped" means the bitmap is painted once and the area outside its own rect
+  // stays empty, so the non-repeating mode must be kDecal (transparent outside),
+  // never kClamp -- clamping smears the border pixels over the rest of the shape.
+  // skin.swc shape #815 (a 1416x402 filmstrip whose bitmap covers only the first
+  // 375 px) is the canary: with kClamp we repainted the whole strip while adl
+  // painted the covered part only.
+  const SkTileMode tm = repeat ? SkTileMode::kRepeat : SkTileMode::kDecal;
+  const SkSamplingOptions so =
+      smooth ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNearest)
+             : SkSamplingOptions(SkFilterMode::kNearest, SkMipmapMode::kNone);
+  auto sh = ((SkImage*)image)->makeShader(tm, tm, so, &m);
+  if (!sh) return 0;
+  ((SkPaint*)paint)->setShader(std::move(sh));
+  return 1;
+}
+
+// SWF stroke caps: 0 round, 1 butt, 2 square; joins: 0 round, 1 bevel, 2 miter.
+void sk_paint_set_stroke_params(void* paint, int cap, int join, double miter) {
+  SkPaint::Cap c = SkPaint::kButt_Cap;
+  if (cap == 0) c = SkPaint::kRound_Cap;
+  else if (cap == 2) c = SkPaint::kSquare_Cap;
+  SkPaint::Join j = SkPaint::kMiter_Join;
+  if (join == 0) j = SkPaint::kRound_Join;
+  else if (join == 1) j = SkPaint::kBevel_Join;
+  SkPaint* p = (SkPaint*)paint;
+  p->setStrokeCap(c);
+  p->setStrokeJoin(j);
+  if (miter > 0.0) p->setStrokeMiter((SkScalar)miter);
+}
+
 // ---------- image filters (stage 61: DisplayObject.filters rendering) ----------
 
 // Each filter is attached to a SkPaint whose only role is carrying the
@@ -422,12 +650,46 @@ void sk_paint_set_image_filter_blur(void* paint, double sigmaX, double sigmaY) {
   ((SkPaint*)paint)->setImageFilter(std::move(f));
 }
 
+// AS3 `strength` scales the imprint AFTER the blur, without a pre-clamp at
+// alpha 1.0. Measured on adl (temp/filterprobe): a DropShadow with colour alpha 1
+// gives fringe darkness 0.106 at strength 0.5 and 0.431 at strength 2 — four
+// times as dark, i.e. min(1, silhouette * alpha * strength); clamping the colour
+// alpha first would have flattened strength 2 to the silhouette's 0.212, and
+// GlowFilter alpha 0.5 x strength 2 renders exactly like strength 1 (also
+// measured), so the product is what counts. Skia's colour matrices carry
+// unpremultiplied channels, so an alpha row of `strength` saturates at 1.0 on
+// its own — the same min(1, ...) AIR exhibits.
+static sk_sp<SkImageFilter> sk_alpha_scale_after(float strength, sk_sp<SkImageFilter> inner) {
+  if (strength == 1.0f || inner == nullptr) return inner;
+  float m[20] = {1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,strength,0};
+  return SkImageFilters::ColorFilter(SkColorFilters::Matrix(m), std::move(inner));
+}
+
+// Two regimes, both exact, because Skia's DropShadow composites the SOURCE too and
+// the strength scale must therefore never touch the source:
+//   * alpha*strength <= 1 and the source is wanted: bake the whole imprint into the
+//     shadow colour and let Skia composite the source itself (the caller draws
+//     nothing on top). Scaling this filter's output instead would scale the source
+//     as well — measured: a baked SWC shadow (colour alpha 0.5, strength 0.539) washed
+//     an entire 425x124 bar down to alpha 137/255, i.e. exactly the strength factor.
+//   * otherwise (the imprint would exceed 1, or the source is not wanted): shadow
+//     only, scaled after the blur, with the caller painting the source itself — the
+//     saturating case AIR exhibits (alpha 1, strength 2 -> fringe 0.431, not 0.212).
 void sk_paint_set_image_filter_drop_shadow(void* paint, double dx, double dy,
                                            double sigmaX, double sigmaY,
-                                           unsigned rgb, double alpha) {
-  SkColor c = sk_argb(rgb, alpha);
-  auto f = SkImageFilters::DropShadow((SkScalar)dx, (SkScalar)dy,
-                                      (SkScalar)sigmaX, (SkScalar)sigmaY, c, nullptr);
+                                           unsigned rgb, double alpha,
+                                           double strength, int drawSource) {
+  if (drawSource != 0 && alpha * strength <= 1.0) {
+    auto f = SkImageFilters::DropShadow((SkScalar)dx, (SkScalar)dy,
+                                        (SkScalar)sigmaX, (SkScalar)sigmaY,
+                                        sk_argb(rgb, alpha * strength), nullptr);
+    ((SkPaint*)paint)->setImageFilter(std::move(f));
+    return;
+  }
+  auto f = SkImageFilters::DropShadowOnly((SkScalar)dx, (SkScalar)dy,
+                                          (SkScalar)sigmaX, (SkScalar)sigmaY,
+                                          sk_argb(rgb, alpha), nullptr);
+  f = sk_alpha_scale_after((float)strength, std::move(f));
   ((SkPaint*)paint)->setImageFilter(std::move(f));
 }
 
@@ -436,7 +698,8 @@ void sk_paint_set_image_filter_drop_shadow(void* paint, double dx, double dy,
 // The caller draws the unfiltered body on top afterwards, so only the blurred
 // fringe peeks out around the edge — exactly what an outer GlowFilter shows.
 void sk_paint_set_image_filter_glow(void* paint, double sigmaX, double sigmaY,
-                                    unsigned rgb, double alpha) {
+                                    unsigned rgb, double alpha,
+                                    double strength) {
   float ga = (float)alpha;
   float m[20] = {
     0, 0, 0, 0, (float)((rgb >> 16) & 0xFF),
@@ -447,7 +710,44 @@ void sk_paint_set_image_filter_glow(void* paint, double sigmaX, double sigmaY,
   auto cf = SkColorFilters::Matrix(m);
   auto colorFilter = SkImageFilters::ColorFilter(std::move(cf), nullptr);
   auto blur = SkImageFilters::Blur((SkScalar)sigmaX, (SkScalar)sigmaY, std::move(colorFilter));
+  // The strength scale MUST come after the blur, not in the matrix above. The
+  // silhouette is fully opaque inside the shape, so scaling alpha by a strength
+  // above 1 before blurring saturates immediately and changes nothing — measured:
+  // glow strength 1 and 2 gave identical fringe coverage, while adl's 2 was
+  // exactly twice the strength-1 darkness. After the blur the fringe alpha is
+  // still below 1 and scales linearly (see sk_alpha_scale_after).
+  blur = sk_alpha_scale_after((float)strength, std::move(blur));
   ((SkPaint*)paint)->setImageFilter(std::move(blur));
+}
+
+// A full 4x5 colour matrix (SkColorMatrix row-major order; the translation column
+// is in 0..1 units because Skia's matrices carry unpremultiplied 0..1 channels).
+// Applied to a saveLayer paint, it re-colours the whole composited subtree on
+// restore — that is how an AS3 ColorTransform is rendered: per-paint application
+// would multiply alpha twice wherever a sprite's own geometry overlaps.
+void sk_paint_set_color_matrix(void* paint, const float* m20) {
+  SkColorMatrix m;
+  // fMat is private; setRowMajor is the public row-major setter.
+  m.setRowMajor(m20);
+  ((SkPaint*)paint)->setColorFilter(SkColorFilters::Matrix(m));
+}
+
+// A paint that maps every colour to opaque BLACK, keeping only alpha. Painting it
+// as a saveLayer paint re-colours that layer on composite, so re-drawing the
+// SAME text layout through it yields black glyphs with the original coverage in
+// their antialiased edges — no second SkParagraph needed. This is how a focused
+// TextField's selected glyphs are drawn: adl paints them pure (0,0,0) on the
+// selection band whatever the field's colours are (measured, SelFocus probe).
+void* sk_paint_black_keep_alpha(void) {
+  SkPaint* p = new SkPaint();
+  float m[20] = {
+    0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0,
+    0, 0, 0, 1, 0,
+  };
+  p->setColorFilter(SkColorFilters::Matrix(m));
+  return (void*)p;
 }
 
 // saveLayer with an explicit paint (null bounds = auto-extend to the clip). The
@@ -467,6 +767,43 @@ void sk_canvas_save_layer_paint_bounds(void* canvas, void* paint,
 }
 
 // ---------- bitmap / image ----------
+
+// E3 / E4 (opt-in): the extra SKCodec formats our Skia build happens to carry
+// are NOT formats AIR decodes -- adl 51.4.1 answers #2124 ("not a recognized
+// image format") for BMP, WebP, ICO and every camera RAW/DNG file alike. A
+// superset capability must be opt-in (AGENTS.md §1.5 / enhancements.md §1.2d),
+// so the DEFAULT build refuses those families here and the ordinary #2124 path
+// reports exactly what adl reports. Two named switches open them:
+//
+//   -D ASC_ALLOW_EXTRA_FORMATS=1  -> WebP / BMP / ICO   (--features formats)
+//   -D ASC_ALLOW_RAW_FORMATS=1    -> camera RAW / DNG    (--features raw)
+//
+// The test is a magic-byte sniff, not a codec probe: it costs a few compares on
+// every load and never parses the file twice. The signatures cannot collide with
+// the formats AIR does support (PNG 89 50 4E 47, JPEG FF D8, GIF "GIF8"):
+//   RIFF....WEBP | BM | 00 00 01 00 (ICO) | TIFF "II*\0" / "MM\0*" (DNG/CR2/...)
+// WBMP (SkWbmpCodec is compiled in) is deliberately NOT gated: its header is a
+// bare multi-byte type field with no reliable magic, so it keeps the codec's
+// behaviour -- stated here rather than guessed at (see docs §4.3).
+static bool sk_extra_format_refused(const void* data, size_t len) {
+    const unsigned char* p = (const unsigned char*)data;
+    if (p == nullptr || len < 4) return false;
+#ifndef ASC_ALLOW_EXTRA_FORMATS
+    if (len >= 12 && p[0] == 'R' && p[1] == 'I' && p[2] == 'F' && p[3] == 'F'
+        && p[8] == 'W' && p[9] == 'E' && p[10] == 'B' && p[11] == 'P') return true;
+    if (p[0] == 'B' && p[1] == 'M') return true;
+    if (p[0] == 0 && p[1] == 0 && p[2] == 1 && p[3] == 0) return true;   // ICO
+    if (p[0] == 0 && p[1] == 0 && p[2] == 2 && p[3] == 0) return true;   // CUR
+#endif
+#ifndef ASC_ALLOW_RAW_FORMATS
+    // Every TIFF-based raw container (DNG, CR2, NEF, ARW, ORF, RW2, PEF, SRW...)
+    // starts with a TIFF header; RAF is the one non-TIFF exception.
+    if (p[0] == 'I' && p[1] == 'I' && p[2] == 42 && p[3] == 0) return true;
+    if (p[0] == 'M' && p[1] == 'M' && p[2] == 0 && p[3] == 42) return true;
+    if (len >= 16 && memcmp(p, "FUJIFILMCCD-RAW", 15) == 0) return true;
+#endif
+    return false;
+}
 
 // E1 (opt-in, native-only): SVG is NOT an SkCodec format, so the whole
 // DeferredFromEncodedData pipeline that serves PNG/JPEG/GIF/WebP/BMP/ICO has
@@ -489,9 +826,28 @@ static sk_sp<SkImage> sk_svg_to_image(const void* data, size_t len, int* outW, i
 static void* sk_svg_to_argb(const void* data, size_t len, int* width, int* height);
 #endif
 
+// SkImage view of a runtime pixel buffer: the exact INVERSE of the read-back
+// below (sk_image_decode_argb / sk_surface_read_argb). `px` holds width*height
+// uint32 words in the runtime's canonical 0xAARRGGBB straight-alpha layout, which
+// on a little-endian host is byte-for-byte kBGRA_8888 -- so the explicit color
+// type is all that is needed, exactly like the read-back direction, and
+// kUnpremul states that the alpha in the buffer is straight. Used by
+// Graphics.beginBitmapFill, whose source is a live BitmapData rather than an
+// encoded file. Always a COPY: the caller's buffer keeps ownership (it may be
+// rewritten by the next BitmapData.fillRect) and lives in the GC heap.
+void* sk_image_from_argb(const void* px, int w, int h) {
+  if (px == nullptr || w <= 0 || h <= 0) return nullptr;
+  SkImageInfo info = SkImageInfo::Make(w, h, kBGRA_8888_SkColorType, kUnpremul_SkAlphaType);
+  sk_sp<SkImage> image = SkImages::RasterFromPixmapCopy(SkPixmap(info, px, (size_t)w * 4));
+  return image.release();  // caller owns one ref (or NULL on failure)
+}
+
 void* sk_image_from_file(const char* path) {
   auto data = SkData::MakeFromFileName(path);
   if (!data) return nullptr;
+  // E3/E4: an AIR-unknown format family is refused before any decode, so the
+  // caller reports the same #2124 adl does (see sk_extra_format_refused).
+  if (sk_extra_format_refused(data->data(), data->size())) return nullptr;
   // m124: SkImage::MakeFromEncoded -> SkImages::DeferredFromEncodedData.
   auto image = SkImages::DeferredFromEncodedData(data);
 #ifdef ASC_USE_SVG
@@ -512,6 +868,7 @@ void* sk_image_from_file(const char* path) {
 // the actual pixel decode happens lazily, at first draw).
 void* sk_image_from_bytes(const void* data, size_t len) {
   if (data == nullptr || len == 0) return nullptr;
+  if (sk_extra_format_refused(data, len)) return nullptr;   // E3/E4, see above
   auto skdata = SkData::MakeWithCopy(data, len);
   if (!skdata) return nullptr;
   auto image = SkImages::DeferredFromEncodedData(skdata);
@@ -571,6 +928,7 @@ int sk_surface_read_argb(void* surface, uint32_t* dst, int width, int height) {
 void* sk_image_decode_argb(const char* path, int* width, int* height) {
   auto data = SkData::MakeFromFileName(path);
   if (!data) return nullptr;
+  if (sk_extra_format_refused(data->data(), data->size())) return nullptr;   // E3/E4
   auto image = SkImages::DeferredFromEncodedData(data);
 #ifdef ASC_USE_SVG
   if (!image && sk_svg_header(data->data(), data->size())) {
@@ -598,6 +956,7 @@ void* sk_image_decode_argb(const char* path, int* width, int* height) {
 // Returns NULL on failure and sets *width/*height on success.
 void* sk_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) {
   if (data == nullptr || len == 0) return nullptr;
+  if (sk_extra_format_refused(data, len)) return nullptr;   // E3/E4
   auto skdata = SkData::MakeWithCopy(data, len);
   if (!skdata) return nullptr;
   auto image = SkImages::DeferredFromEncodedData(skdata);
@@ -623,6 +982,20 @@ void sk_canvas_draw_image_rect(void* canvas, void* image,
                                double dx, double dy, double dw, double dh) {
   SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
   ((SkCanvas*)canvas)->drawImageRect((SkImage*)image, dst, SkSamplingOptions());
+}
+
+// Draw one SUB-RECT of an image into a destination rect. Nine-slice scaling needs
+// this: the 8 border pieces reuse their source pixels unchanged while the middle
+// piece stretches, which a whole-image drawImageRect cannot express (swc.md §9 F).
+void sk_canvas_draw_image_src_rect(void* canvas, void* image,
+                                   double sx, double sy, double sw, double sh,
+                                   double dx, double dy, double dw, double dh) {
+  SkRect src = SkRect::MakeXYWH((SkScalar)sx, (SkScalar)sy, (SkScalar)sw, (SkScalar)sh);
+  SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
+  // kStrict stops the stretched middle band from sampling across its border into
+  // the piece next to it (the src-rect overload has no default constraint).
+  ((SkCanvas*)canvas)->drawImageRect((SkImage*)image, src, dst, SkSamplingOptions(),
+                                     nullptr, SkCanvas::kStrict_SrcRectConstraint);
 }
 
 // Draw a tightly packed BGRA8 pixel buffer (width*height*4 bytes, B,G,R,A byte
@@ -787,6 +1160,131 @@ static const sk_sp<SkTypeface>& sk_default_typeface() {
   return cached;
 }
 
+// AIR's three "device font" aliases are not font families: they are generic
+// names the Flash runtime resolves to installed faces itself. CoreText has never
+// heard of "_typewriter", so handing it through verbatim made SkParagraph fall
+// back to the system default -- a PROPORTIONAL face -- and a "_typewriter" field
+// measured 113.26 px per 10 "W" glyphs instead of 72 (adl 51.4.1, size 12),
+// i.e. every metric of a typewriter field was wrong by ~40%. The faces below are
+// the ones whose adl-measured ADVANCES match AIR's aliases exactly:
+//   "_typewriter" -> Monaco            (7.2 px/char monospace; adl line height 15)
+//   "_sans"       -> Helvetica         (10W=113, 10i=26.5, 10*=46.5 -- identical)
+//   "_serif"      -> Times New Roman   (10W=113, 10i=33, 10*=60 -- identical)
+//   ""/NULL       -> Times             (AIR's default format font, reported as
+//                                       "Times Roman"; adl single-line height 12
+//                                       matches Times' 12, not Times New Roman's 14)
+// Named families pass through untouched -- our CoreText advances already match
+// AIR's for Courier / Courier New / Menlo / Monaco / Helvetica / Arial / Times
+// New Roman / Geneva (measured; table in docs/zh-cn/skia.md). The residual
+// per-face line-height skew (ours runs up to 1 px taller: Monaco 16 vs adl 15,
+// Arial 14 vs 13.5) is SkParagraph's ascent+descent rounding and is recorded as
+// a known deviation rather than papered over with a fudge factor.
+// Typeface lookup keyed by (family, weight, slant), cached: the CSS font family
+// names of a TextField never change at runtime, and CoreText's matchFamilyStyle
+// is the expensive part of building a paragraph (it walks the installed family
+// list). Misses are cached too -- an unknown family must fall back to the same
+// face every time, not re-resolve per frame.
+static const char* sk_family_alias(const char* family);
+
+static sk_sp<SkTypeface> sk_match_typeface(const char* family, int bold, int italic) {
+  static std::map<std::string, sk_sp<SkTypeface>> cache;
+  SkString key;
+  key.printf("%s|%d|%d", family ? family : "", bold ? 1 : 0, italic ? 1 : 0);
+  auto it = cache.find(std::string(key.c_str()));
+  if (it != cache.end()) return it->second;
+  sk_sp<SkFontMgr> mgr = sk_platform_fontmgr();
+  SkFontStyle style(bold ? SkFontStyle::kBold_Weight : SkFontStyle::kNormal_Weight,
+                    SkFontStyle::kNormal_Width,
+                    italic ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant);
+  sk_sp<SkTypeface> tf = mgr ? mgr->matchFamilyStyle(sk_family_alias(family), style) : nullptr;
+  cache[std::string(key.c_str())] = tf;
+  return tf;
+}
+
+// AIR rounds each half of the line box to the nearest 0.5 (measured: Helvetica
+// ascent 9.24 -> 9 and descent 2.76 -> 3, Times New Roman 10.6875 -> 10.5 and
+// 2.59375 -> 2.5) and never adds the font's own line gap, while Skia reports
+// ceil-ish(ascent + descent + lineGap) -- Monaco's 16.002 px line gap pushed a
+// 12 px line to 16 where AIR says 15. Rounding the halves reproduces every adl
+// named-face line height exactly (Courier 12, Courier New 13.5, Menlo 14,
+// Monaco 15, Times 12, Times New Roman 13, Arial 13.5, Helvetica 12, Geneva 15).
+static double sk_round_half(double v) { return floor(v * 2.0 + 0.5) / 2.0; }
+
+// AIR's line box for a face: round_half(ascent) + round_half(descent), plus the
+// raw Skia sums needed to drive Skia's height-override path. Skia computes the
+// line box as `rawSum * (StrutStyle::height * fontSize / rawFull)` where rawSum
+// excludes the face's line gap but rawFull includes it, so the strut height must
+// be pre-multiplied by rawFull/rawSum to land on AIR's number (Monaco's gap of
+// 1.002 px otherwise silently shortens a 12 px line by a whole pixel).
+struct SkAirLineMetrics {
+  double model;    // AIR: rhalf(ascent) + rhalf(descent)
+  double asc;      // AIR: rhalf(ascent)
+  double desc;     // AIR: rhalf(descent)
+  double rawSum;   // Skia: -fAscent + fDescent
+  double rawFull;  // Skia: -fAscent + fDescent + fLeading (the override divisor)
+};
+
+static SkAirLineMetrics sk_air_line_metrics(const char* family, double size, int bold, int italic) {
+  SkAirLineMetrics out{0.0, 0.0, 0.0, 0.0, 0.0};
+  if (size <= 0.0) return out;
+  sk_sp<SkTypeface> tf = sk_match_typeface(family, bold, italic);
+  SkFont font(tf, (SkScalar)size);
+  SkFontMetrics m;
+  font.getMetrics(&m);
+  out.asc = sk_round_half(-m.fAscent);
+  out.desc = sk_round_half(m.fDescent);
+  out.model = out.asc + out.desc;
+  out.rawSum = -m.fAscent + m.fDescent;
+  out.rawFull = out.rawSum + m.fLeading;
+  return out;
+}
+
+static double sk_air_line_height(const char* family, double size, int bold, int italic) {
+  return sk_air_line_metrics(family, size, bold, italic).model;
+}
+
+// AIR's line box, applied to every paragraph: per-line height =
+// round_half(ascent) + round_half(descent) + leading, with `leading` in PIXELS
+// (TextFormat.leading; AIR adds px, never an em multiple -- measured, see
+// docs/zh-cn/skia.md). SkParagraph instead reports ceil-ish(ascent+descent+
+// lineGap) and reads StrutStyle::leading as an em multiple of the font size.
+// Forcing a strut with an explicit height override makes Skia scale the face's
+// ascent/descent to exactly AIR's box, and dividing the px leading by the size
+// converts it back to the em multiple Skia expects. leading may be negative
+// (AIR: a negative leading shrinks the box, adl 15-3 = 12), so the guard is on
+// the resulting height, not on the sign.
+static void sk_set_air_strut(skia::textlayout::ParagraphStyle& ps, const char* family, double size,
+                             int bold, int italic, double leading) {
+  using namespace skia::textlayout;
+  SkAirLineMetrics am = sk_air_line_metrics(family, size, bold, italic);
+  if (size <= 0.0 || am.model <= 0.0 || am.rawSum <= 0.0) return;
+  double box = am.model + leading;  // AIR's per-line height, px leading included
+  if (box <= 0.0) return;
+  StrutStyle strut;
+  strut.setStrutEnabled(true);
+  strut.setFontSize((SkScalar)size);
+  strut.setFontFamilies({ SkString(sk_family_alias(family)) });
+  // Skia scales the raw metrics by (height * fontSize / rawFull); pre-multiply so
+  // the resulting box before the strut leading is exactly the intended one.
+  // Negative leading cannot go through StrutStyle::leading (Skia clamps a
+  // negative value to 0 -- ParagraphImpl.cpp), so it is folded into the height
+  // instead; a positive one stays a leading so the ascent keeps its AIR ratio.
+  const double boxHeight = (leading < 0.0) ? box : am.model;
+  strut.setHeight((SkScalar)(boxHeight * am.rawFull / (am.rawSum * size)));
+  strut.setHeightOverride(true);
+  strut.setForceStrutHeight(true);
+  if (leading > 0.0) strut.setLeading((SkScalar)(leading / size));
+  ps.setStrutStyle(strut);
+}
+
+static const char* sk_family_alias(const char* family) {
+  if (family == nullptr || family[0] == 0) return "Times";
+  if (strcmp(family, "_typewriter") == 0) return "Monaco";
+  if (strcmp(family, "_sans") == 0) return "Helvetica";
+  if (strcmp(family, "_serif") == 0) return "Times New Roman";
+  return family;
+}
+
 static SkFont sk_font(double size, int bold, int italic) {
   SkFont font;
   font.setSize((SkScalar)size);
@@ -861,6 +1359,26 @@ static sk_sp<skia::textlayout::FontCollection>& sk_textlayout_collection() {
 // hyphenated token can break mid-word where AIR wordWrap would keep it whole and
 // let it overflow. Recorded as a known limitation (skia.md §8); the common
 // "break at spaces" and CJK per-character breaking both match AIR.
+// TextField.text stores a CR (0x0D) for every Return line break AIR inserts, but
+// Skia's paragraph breaks lines only on LF (0x0A): a CR is treated as an ordinary
+// control character, which silently laid every "line" of a multiline field out on
+// ONE visual line (measured: a 6-line field reported numLines 1 and textHeight of a
+// single line). Normalizing CR -> LF keeps the byte length identical (both are one
+// byte), so every UTF-16 index elsewhere in the pipeline stays valid. With
+// collapseNewlines (single-line field) both breaks become spaces instead, mirroring
+// AIR's own single-line collapse.
+static const char* sk_textlayout_normalize(const char* text, int collapseNewlines, std::string& buf) {
+  for (const char* p = text; *p; p++) {
+    if (*p != '\r' && *p != '\n') continue;
+    buf.assign(text);
+    for (auto& c : buf) {
+      if (c == '\r' || c == '\n') c = collapseNewlines ? ' ' : '\n';
+    }
+    return buf.c_str();
+  }
+  return text;
+}
+
 void* sk_textlayout_new(const char* text, const char* family, double size, int bold, int italic,
                         unsigned color, double width, int align, int collapseNewlines) {
   if (text == NULL) return nullptr;
@@ -872,20 +1390,16 @@ void* sk_textlayout_new(const char* text, const char* family, double size, int b
   ts.setFontStyle(SkFontStyle(bold ? SkFontStyle::kBold_Weight : SkFontStyle::kNormal_Weight,
                               SkFontStyle::kNormal_Width,
                               italic ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
-  if (family && family[0]) ts.setFontFamilies({ SkString(family) });
+  ts.setFontFamilies({ SkString(sk_family_alias(family)) });
 
   ParagraphStyle ps;
   ps.setTextStyle(ts);
   ps.setTextAlign((TextAlign)align);
+  sk_set_air_strut(ps, family, size, bold, italic, 0.0);
   auto builder = ParagraphBuilder::make(ps, sk_textlayout_collection());
 
-  std::string collapsed;
-  const char* t = text;
-  if (collapseNewlines && strchr(text, '\n')) {
-    collapsed.assign(text);
-    for (auto& c : collapsed) if (c == '\n') c = ' ';
-    t = collapsed.c_str();
-  }
+  std::string normbuf;
+  const char* t = sk_textlayout_normalize(text, collapseNewlines, normbuf);
   builder->addText(t);
   auto para = builder->Build();
 
@@ -915,29 +1429,18 @@ void* sk_textlayout_new_leading(const char* text, const char* family, double siz
   ts.setFontStyle(SkFontStyle(bold ? SkFontStyle::kBold_Weight : SkFontStyle::kNormal_Weight,
                               SkFontStyle::kNormal_Width,
                               italic ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
-  if (family && family[0]) ts.setFontFamilies({ SkString(family) });
+  ts.setFontFamilies({ SkString(sk_family_alias(family)) });
 
   ParagraphStyle ps;
   ps.setTextStyle(ts);
   ps.setTextAlign((TextAlign)align);
-  if (leading > 0.0) {
-    StrutStyle strut;
-    strut.setStrutEnabled(true);
-    strut.setFontSize((SkScalar)size);
-    strut.setLeading((SkScalar)leading);
-    strut.setForceStrutHeight(true);
-    if (family && family[0]) strut.setFontFamilies({ SkString(family) });
-    ps.setStrutStyle(strut);
-  }
+  // AIR's TextFormat.leading is in pixels and is added to the line box; the
+  // strut helper converts it for Skia (see sk_set_air_strut).
+  sk_set_air_strut(ps, family, size, bold, italic, leading);
   auto builder = ParagraphBuilder::make(ps, sk_textlayout_collection());
 
-  std::string collapsed;
-  const char* t = text;
-  if (collapseNewlines && strchr(text, '\n')) {
-    collapsed.assign(text);
-    for (auto& c : collapsed) if (c == '\n') c = ' ';
-    t = collapsed.c_str();
-  }
+  std::string normbuf;
+  const char* t = sk_textlayout_normalize(text, collapseNewlines, normbuf);
   builder->addText(t);
   auto para = builder->Build();
 
@@ -976,35 +1479,28 @@ void* sk_textlayout_new_runs(const char* text, const sk_text_run* runs, int run_
     ts.setFontStyle(SkFontStyle(r.bold ? SkFontStyle::kBold_Weight : SkFontStyle::kNormal_Weight,
                                 SkFontStyle::kNormal_Width,
                                 r.italic ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
-    if (r.family && r.family[0]) ts.setFontFamilies({ SkString(r.family) });
+    ts.setFontFamilies({ SkString(sk_family_alias(r.family)) });
     return ts;
   };
 
   ParagraphStyle ps;
   ps.setTextStyle(mkStyle(runs[0]));
   ps.setTextAlign((TextAlign)align);
-  // Uniform paragraph leading from the first run that sets it.
-  for (int i = 0; i < run_count; i++) {
-    if (runs[i].leading > 0.0) {
-      StrutStyle strut;
-      strut.setStrutEnabled(true);
-      strut.setFontSize((SkScalar)runs[i].size);
-      strut.setLeading((SkScalar)runs[i].leading);
-      strut.setForceStrutHeight(true);
-      if (runs[i].family && runs[i].family[0]) strut.setFontFamilies({ SkString(runs[i].family) });
-      ps.setStrutStyle(strut);
-      break;
+  // One line box for the whole paragraph: AIR gives a TextField a single line
+  // height (htmlText runs with different sizes all share it), so the strut is
+  // taken from the first run that sets a leading, else from the first run.
+  {
+    int leadIdx = 0;
+    for (int i = 0; i < run_count; i++) {
+      if (runs[i].leading != 0.0) { leadIdx = i; break; }
     }
+    sk_set_air_strut(ps, runs[leadIdx].family, runs[leadIdx].size,
+                     runs[leadIdx].bold ? 1 : 0, runs[leadIdx].italic ? 1 : 0, runs[leadIdx].leading);
   }
   auto builder = ParagraphBuilder::make(ps, sk_textlayout_collection());
 
-  std::string collapsed;
-  const char* t = text;
-  if (collapseNewlines && strchr(text, '\n')) {
-    collapsed.assign(text);
-    for (auto& c : collapsed) if (c == '\n') c = ' ';
-    t = collapsed.c_str();
-  }
+  std::string normbuf;
+  const char* t = sk_textlayout_normalize(text, collapseNewlines, normbuf);
 
   // Emit runs in order; the builder applies each run's style to its [start,end)
   // slice. Gaps between runs fall back to the paragraph default style.
@@ -1042,16 +1538,24 @@ int sk_textlayout_glyph_position_at(void* para, double x, double y) {
 // [start, end), returning the number of rects written (capped at max_rects). Each
 // rect is 4 doubles: left, top, right, bottom (paragraph-relative). These are
 // used to paint the selection highlight. Tight height per run, tight width.
-int sk_textlayout_rects_for_range(void* para, int start, int end,
+// Rects covering a selection range, in *pages*: `skip` drops that many leading
+// rects so a caller with a small fixed buffer can walk the whole range.
+// A long selection spans one rect per line, so a single 16-rect call would only
+// ever paint the first 16 lines (measured on adl 51.4.1: AIR highlights every
+// visible selected line — the demo's scrolled trace field showed *no* highlight
+// at all when Cmd+A selected ~90 lines, because those 16 rects sat above the
+// scroll window and were clipped away).
+int sk_textlayout_rects_for_range(void* para, int start, int end, int skip,
                                   double* lefts, double* tops, double* rights, double* bottoms,
                                   int max_rects) {
-  if (para == NULL || max_rects <= 0) return 0;
+  if (para == NULL || max_rects <= 0 || skip < 0) return 0;
   using namespace skia::textlayout;
   auto p = (Paragraph*)para;
   auto boxes = p->getRectsForRange((unsigned)start, (unsigned)end,
                                    RectHeightStyle::kTight, RectWidthStyle::kTight);
-  int n = 0;
+  int n = 0, i = 0;
   for (auto& b : boxes) {
+    if (i++ < skip) continue;
     if (n >= max_rects) break;
     lefts[n] = (double)b.rect.fLeft;
     tops[n] = (double)b.rect.fTop;
@@ -1060,6 +1564,38 @@ int sk_textlayout_rects_for_range(void* para, int start, int end,
     n++;
   }
   return n;
+}
+
+// Caret rectangle for a text index: where the text insertion point sits when it
+// is at `index`, as a paragraph-relative box (x = the caret line's left edge,
+// y/h = that line's tight top and height). Used to place the IME composition
+// preview and to tell the OS where the composing text is, so the candidate
+// window follows the caret. Returns 1 on success, 0 when no box can be derived
+// (NULL paragraph, or an index outside the laid-out text).
+//
+// A zero-width range is what the caret "is", but Skia may report no box for one,
+// so ask for the character box at the index and fall back to the previous
+// character's box (caret at the end of a line/paragraph). NOTE: the index is a
+// UTF-16 offset into the paragraph, whereas the generated C indexes text by
+// UTF-8 BYTE (the documented divergence) — identical for ASCII.
+int sk_textlayout_caret_rect(void* para, int index, double* x, double* y, double* h) {
+  if (para == NULL) return 0;
+  using namespace skia::textlayout;
+  auto p = (Paragraph*)para;
+  unsigned i = (index > 0) ? (unsigned)index : 0u;
+  auto boxes = p->getRectsForRange(i, i + 1u, RectHeightStyle::kTight, RectWidthStyle::kTight);
+  int use_right = 0;
+  if (boxes.empty()) {
+    if (i == 0) return 0;
+    boxes = p->getRectsForRange(i - 1u, i, RectHeightStyle::kTight, RectWidthStyle::kTight);
+    if (boxes.empty()) return 0;
+    use_right = 1;
+  }
+  auto& r = boxes.front().rect;
+  if (x) *x = (double)(use_right ? r.fRight : r.fLeft);
+  if (y) *y = (double)r.fTop;
+  if (h) *h = (double)(r.fBottom - r.fTop);
+  return 1;
 }
 
 // Total height of the laid-out paragraph (sum of every line's ascent+descent).
@@ -1074,6 +1610,88 @@ double sk_textlayout_max_width(void* para) {
 
 int sk_textlayout_line_count(void* para) {
   return (int)((skia::textlayout::Paragraph*)para)->lineNumber();
+}
+
+// Per-VISUAL-line metrics: the UTF-16 index range of every line (soft-wrapped
+// lines included, which lineNumber() alone cannot describe) plus its top/bottom y
+// in paragraph coordinates. TextField's page/arrow keys and the caret's
+// scroll-into-view need exactly this: one call turns "which line is the caret on,
+// where does line k start/end, how tall is it" into array lookups instead of
+// re-deriving the wrap from character advances. Fixed caller buffers, capped at
+// `cap` lines; returns how many were written.
+int sk_textlayout_line_metrics(void* para, int* starts, int* ends, double* tops, double* bottoms, int cap) {
+  if (para == NULL || cap <= 0) return 0;
+  using namespace skia::textlayout;
+  auto p = (Paragraph*)para;
+  std::vector<LineMetrics> lm;
+  p->getLineMetrics(lm);
+  int n = 0;
+  for (auto& m : lm) {
+    if (n >= cap) break;
+    if (starts) starts[n] = (int)m.fStartIndex;
+    if (ends) ends[n] = (int)m.fEndIndex;
+    if (tops) tops[n] = (double)m.fBaseline - (double)m.fAscent;
+    if (bottoms) bottoms[n] = (double)m.fBaseline + (double)m.fDescent;
+    n++;
+  }
+  return n;
+}
+
+// Per-line box for TextField.getLineMetrics: the line's advance width and its
+// left offset inside the paragraph come straight from the line box, while the
+// ascent/descent split has to be rebuilt to AIR's model. AIR reports
+// `ascent + descent + leading == height` with the ascent/descent INDEPENDENT of
+// the leading (measured: leading 0 -> 12/3 h15, leading 4 -> 12/3 h19, leading
+// -3 -> h12 at 12 px Monaco), while Skia folds the line's leading into the
+// baseline offset. The line stride (distance between consecutive baselines, or
+// the paragraph height for a single line) is what the renderer lays out with, so
+// stripping the leading back out of both the stride and the baseline reproduces
+// AIR's split on the adl-measured cases (Monaco 12 px: 12/3 h15 exactly;
+// temp/metricprobe/metric6-adl.txt vs metric6-aot.txt).
+int sk_textlayout_line_box(void* para, int idx, double leading, const char* family, double size,
+                           int bold, int italic,
+                           double* ascent, double* descent, double* left, double* width) {
+  if (para == NULL || idx < 0) return 0;
+  using namespace skia::textlayout;
+  std::vector<LineMetrics> lm;
+  ((Paragraph*)para)->getLineMetrics(lm);
+  int n = (int)lm.size();
+  if (idx >= n) {
+    // An empty field still has one line (AIR: numLines == 1) and reports the
+    // default format's font metrics with width 0 -- Skia has no line box to read
+    // then, so fall back to the AIR model of the face the field is set in.
+    if (idx != 0 || n != 0) return 0;
+    SkAirLineMetrics am = sk_air_line_metrics(family, size, bold, italic);
+    if (am.model <= 0.0) return 0;
+    if (ascent) *ascent = am.asc;
+    if (descent) *descent = am.desc;
+    if (left) *left = 0.0;
+    if (width) *width = 0.0;
+    return 1;
+  }
+  double stride = (n > 1) ? (lm[n - 1].fBaseline - lm[0].fBaseline) / (double)(n - 1)
+                          : (double)((Paragraph*)para)->getHeight();
+  LineMetrics& m = lm[idx];
+  double asc = (double)m.fBaseline - (double)idx * stride - leading;
+  double desc = stride - leading - asc;
+  if (leading < 0.0) {
+    // A negative leading is folded into the strut height (Skia clamps
+    // StrutStyle::leading to 0), which drags the baseline up with it -- the
+    // stride-derived split then drifts (Monaco 12, leading -3: 12.6/2.4 instead
+    // of AIR's 12/3). AIR keeps ascent/descent independent of the leading, so for
+    // this one case take the AIR model of the face directly (measured,
+    // temp/metricprobe/Lead7.as: asc 12 / desc 3 at every leading).
+    SkAirLineMetrics am = sk_air_line_metrics(family, size, bold, italic);
+    if (am.model > 0.0) {
+      asc = am.asc;
+      desc = am.desc;
+    }
+  }
+  if (ascent) *ascent = asc;
+  if (descent) *descent = desc;
+  if (left) *left = (double)m.fLeft;
+  if (width) *width = (double)m.fWidth;
+  return 1;
 }
 
 void sk_textlayout_paint(void* para, void* canvas, double x, double y) {

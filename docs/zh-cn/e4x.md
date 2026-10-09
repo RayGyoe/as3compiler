@@ -120,11 +120,11 @@ E4X 是 ES4 规范的产物，AS3 完全继承。翻译时必须显式处理的�
 
 | 层 | 状态 |
 |---|---|
-| `lexer.ts` | ✅ `@` 已识别为后置运算符（E4X 属性访问）；`<` 无 XML 字面量模式（Starling 实测未用到裸 XML 字面量，**无需加**） |
-| `parser.ts` | ✅ 支持 `expr.@attr`、`.child` E4X 导航、`.(pred)` 过滤谓词、`XML`/`XMLList` 类型注解 |
+| `lexer.ts` | ✅ `@` 已识别为后置运算符（E4X 属性访问）；✅ **XML 字面量**模式（阶段一百零六 落地 `<a b="1">…</a>`：递归 name-stack 配平、注释/CDATA/PI、`{expr}` 插值**响亮拒绝**；阶段一百零八 修掉「兄弟元素之间的文本未跳过 ⇒ 缩进过的多行字面量报 `unterminated regular expression`」的扫描缺陷） |
+| `parser.ts` | ✅ `expr.@attr`、`.child` E4X 导航、`.(pred)` 过滤谓词、**后代轴** `x..name`/`x..*`（阶段一百零六）、**计算名两轴** `x.ns::[expr]`（孩子轴）与 `x.@[expr]`（属性轴）（阶段一百零八，`ns` 限定词按「命名空间编译期透明」折叠丢弃）、`XML`/`XMLList` 类型注解 |
 | `symbols.ts` | ✅ `XML`/`XMLList` 已建模（`kind:'xml'/'xmllist'`）；`System.disposeXML` 已建模 |
-| `emit.ts` | ✅ `describeType` 真实现 `as_describe_type`（`<type name="包::类"/>` XML 树，非 Class 退回 `<type name="Object"/>`） |
-| `runtime.ts` | ✅ 内嵌 `as_xml_parse` 极小 DOM 解析器 + `as_xml_attr`/`as_xml_children`/`as_xml_filter`/`as_describe_type` 全套助手 |
+| `emit.ts` | ✅ `describeType` 真实现 `as_describe_type`（`<type name="包::类"/>` XML 树，非 Class 退回 `<type name="Object"/>`）；✅ 计算名按接收者分派（xml/xmllist → `as_xml_*`，Proxy/动态对象属性轴 → `as_dyn_get`，其余接收者**响亮** `CodegenError`） |
+| `runtime.ts` | ✅ 内嵌 `as_xml_parse` 极小 DOM 解析器 + `as_xml_attr`/`as_xml_children`/`as_xml_filter`/`as_xml_descendants`/`as_xml_list_*`/`as_describe_type` 全套助手；**孩子轴按「本地名」比对**（`as_xml_local()`，阶段一百零八） |
 
 ---
 
@@ -140,8 +140,23 @@ E4X 是 ES4 规范的产物，AS3 完全继承。翻译时必须显式处理的�
 | 九十二 | E4X 过滤谓词 `.(@attr == value)` | 待递增 | `stage92.as` |
 | 九十三 | `describeType` 的 XML 输出 | 待递增 | `stage93.as` |
 
-> 剩余的 E4X 高级特性（XML 字面量、`{}` 内嵌、命名空间字面量、`..` 后代轴、`+`/`+=` XML 拼接）**明确不在范围内**，
-> Starling 实测未用到。
+> **修正（阶段一百零八）**：上面这行旧结论**已过时** —— XML 字面量与 `..` 后代轴在**阶段一百零六** 落地（见 §4 表），`ns::[expr]`/`@[expr]` 计算名与命名空间前缀处理在**阶段一百零八** 落地。仍未实现：
+> ① **命名空间建模**（限定词透明 ⇒ 同局部名不同 uri 无法区分，`Namespace` 值只是占位）；② `..*` **不计文本节点**（AIR 计，`5.desc-any` 我们 2 / AIR 4）；③ **一般过滤谓词** `.(<expr>)`（只支持 `.(@attr ==/!= value)` 形态）；④ `+`/`+=` 的 XML 拼接。
+> 均已在 `TODO.md` 遗留表登记。
+
+---
+
+## 4b. 计算名与命名空间（阶段一百零八，`adl 51.4.1` 值日志 `temp/nsbracket/`）
+
+`x.ns::[expr]`（孩子轴，给 `XMLList`）与 `x.@[expr]`（属性轴，给 `String`）是 **DAE/COLLADA 解析的惯用法**（away3d `DAEParser.as:982` / `:1046`）。实测口径：
+
+| 形态 | `adl` | 说明 |
+|---|---|---|
+| `x.ns::[name]` | 匹配**命名空间相符**的孩子 | 无前缀的孩子 + 外来 ns 得 **0**；`ns::["nope"]` 得 0 |
+| `x[name]`（无限定） | **0**（对带前缀的节点） | 与 `ns::[name]` **不是**同一件事 |
+| `@[expr]` | **等价于** `@字面量` | `@[at]`/`@["kind"]` 有值，`@["nope"]` 是 `""`，`@id == @["id"]` 为 true |
+
+**本子集的近似**：`ns` 限定词与节点前缀都是「编译期透明」——孩子轴比的是**局部名**（`as_xml_local()` 取最后一个 `:` 之后），故 `x.ns::["item"]` 在 `<n:item>` 上得 **2（= AIR）**，但 `x.item`（无限定）**也给 2**（AIR 为 0）。`toString()` 仍逐字回写 `<n:item>`（存储带前缀），`localName()` 报 `item`（与 AIR 一致）。写探针时只能用 `xml.namespace()` 取命名空间对象（`new Namespace(prefix, uri)` 未实现）。
 
 ---
 

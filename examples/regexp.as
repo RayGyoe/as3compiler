@@ -96,7 +96,9 @@ try {
 trace(caught);                                 // true
 
 // --- String.replace with repl:Function ---
-trace("abc".replace(/b/, function(match:String):String { return "X"; }) == "aXc");  // true
-trace("a1b2".replace(/\d/g, function(match:String):String { return "(" + match + ")"; }) == "a(1)b(2)");  // true
-trace("John Smith".replace(/(\w+) (\w+)/, function(match:String, first:String, last:String):String { return last + ", " + first; }) == "Smith, John");  // true
+// An AIR replacer Function always receives (match, [groups...], offset, wholeString);
+// a shorter signature raises #1063 (measured on adl 51.4.1, temp/pkgA/rep).
+trace("abc".replace(/b/, function(match:String, offset:int, input:String):String { return "X"; }) == "aXc");  // true
+trace("a1b2".replace(/\d/g, function(match:String, offset:int, input:String):String { return "(" + match + ")"; }) == "a(1)b(2)");  // true
+trace("John Smith".replace(/(\w+) (\w+)/, function(match:String, first:String, last:String, offset:int, whole:String):String { return last + ", " + first; }) == "Smith, John");  // true
 trace("abc".replace(/b/, function(match:String, offset:int, input:String):String { return "[" + input + "@" + offset + "]"; }) == "a[abc@1]c");  // true

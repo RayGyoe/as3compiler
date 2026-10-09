@@ -138,11 +138,68 @@ sp.graphics.endFill();
 // transform defaults to an identity matrix (Transform holder, unit matrix)
 check(sp.transform != null, "DisplayObject.transform non-null");
 check(near(sp.transform.matrix.a, 1) && near(sp.transform.matrix.d, 1) && near(sp.transform.matrix.tx, 0), "transform identity default");
-// mutate the matrix and read it back through the same reference
-sp.transform.matrix.translate(30, 40);
+// AIR's Transform.matrix getter hands back a *copy*: mutating the returned
+// Matrix does not reach the DisplayObject, so the portable way to change the
+// transform is get → mutate → set back. (Verified against adl; see the
+// transform.matrix section of docs/zh-cn/as3-semantics.md.)
+var copy:Matrix = sp.transform.matrix;
+copy.tx = 999;
+check(near(sp.transform.matrix.tx, 0), "transform.matrix getter returns a copy");
+var tm:Matrix = sp.transform.matrix;
+tm.translate(30, 40);
+sp.transform.matrix = tm;
 check(near(sp.transform.matrix.tx, 30) && near(sp.transform.matrix.ty, 40), "transform.matrix.translate read-back");
-sp.transform.matrix.scale(2, 2);
+// The setter decomposes into the object's own x/y/rotation/scaleX/scaleY, so
+// the fields move with the matrix (AIR keeps one transform, viewed two ways).
+check(near(sp.x, 30) && near(sp.y, 40), "transform.matrix setter feeds x/y");
+var sm:Matrix = sp.transform.matrix;
+sm.scale(2, 2);
+sp.transform.matrix = sm;
 check(near(sp.transform.matrix.a, 2), "transform.matrix.scale read-back");
+
+// Rotation is about the object's own origin, so the object moves and the artwork
+// does not. Measured on adl 51.4.1: assigning get()->rotate(30deg) to a Shape at
+// (90,18) leaves x=68.94228634059948, y=60.58845726811989, rotation=30.
+var rsh:Shape = new Shape();
+rsh.x = 90;
+rsh.y = 18;
+var rm:Matrix = rsh.transform.matrix;
+rm.rotate(30 * Math.PI / 180);
+rsh.transform.matrix = rm;
+check(near(rsh.x, 68.94228634059948) && near(rsh.y, 60.58845726811989), "transform.matrix rotate moves x/y, not the artwork");
+check(near(rsh.rotation, 30) && near(rsh.scaleX, 1) && near(rsh.scaleY, 1), "rotate decomposes to rotation 30 / unit scale");
+check(near(rsh.transform.matrix.a, Math.cos(30 * Math.PI / 180)), "rotate read-back keeps the matrix");
+
+// A skew is what rotation + scale cannot express, so it is kept in the residual
+// rather than dropped. adl reports the same gauge (scaleY = hypot(0.4, 1)).
+var ksh:Shape = new Shape();
+ksh.x = 270;
+ksh.y = 18;
+var km:Matrix = ksh.transform.matrix;
+km.c = 0.4;
+ksh.transform.matrix = km;
+check(near(ksh.x, 270) && near(ksh.y, 18), "skew setter leaves x/y alone");
+check(near(ksh.scaleY, 1.0770329636405618), "skew folds into scaleY (adl gauge)");
+check(near(ksh.transform.matrix.c, 0.4), "skew survives the round trip");
+
+// Zero-determinant matrix: no unique decomposition, but it still round-trips.
+// adl reports x=7, y=8, rotation 0, scaleX 0, scaleY 0 for this assignment.
+var zsh:Shape = new Shape();
+zsh.transform.matrix = new Matrix(0, 0, 0, 0, 7, 8);
+check(near(zsh.x, 7) && near(zsh.y, 8), "singular matrix keeps x/y");
+check(near(zsh.rotation, 0) && near(zsh.scaleX, 0) && near(zsh.scaleY, 0), "singular matrix decomposes to zero scale");
+var zb:Matrix = zsh.transform.matrix;
+check(near(zb.a, 0) && near(zb.b, 0) && near(zb.c, 0) && near(zb.d, 0) && near(zb.tx, 7) && near(zb.ty, 8), "singular matrix round-trips");
+
+// A write used as a value is an ordinary property write in AIR, so it yields the
+// assigned Matrix — including in a chain.
+var vsh:Shape = new Shape();
+var vm:Matrix = new Matrix(3, 0, 0, 3, 1, 2);
+var vgot:Matrix = (vsh.transform.matrix = vm);
+check(vgot == vm && near(vsh.x, 1) && near(vsh.scaleX, 3), "valued transform.matrix write yields the matrix");
+var wsh:Shape = new Shape();
+wsh.transform.matrix = vsh.transform.matrix = new Matrix(4, 0, 0, 4, 9, 10);
+check(near(wsh.x, 9) && near(vsh.x, 9), "chained transform.matrix write reaches both targets");
 s.addChild(sp);
 s.render(100, 100, "stage58.png");
 

@@ -33,7 +33,7 @@
     },
     {
       "name": "twice",
-      "symbol": "mathlib_Calc_twice",
+      "symbol": "mathlib_Calc_twice_static",
       "returnType": "int",
       "params": [
         {

@@ -106,12 +106,20 @@ Options:
   --manifest <f> build manifest JSON (extra sources / include / link libs)
   --air-app <xml> AIR app descriptor: generate bootstrap + build manifest
   --main-class <n> main class for --air-app (default: infer src/**/Main.as)
+  --all-sources  --air-app: compile every .as under src/ instead of the main class
+                 reachable closure (see §3.5; pre-阶段一百二十四 behaviour)
   -I <dir>       include path (repeatable)
   -L <dir>       library search path (repeatable)
   -l <lib>       link library (repeatable)
   -D <macro>     preprocessor define (repeatable)
+  --framework <n> link a macOS framework (repeatable; distinct from clang -F, which is a search path)
+  --source <f>   extra C/C++ source to compile and link (repeatable)
+  --swc <f>      .swc library: bake its named bitmap resources, vector shapes and
+                 display tree at compile time (repeatable; see docs/zh-cn/swc.md §5/§6/§9)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
+  --debug-info   keep DWARF: add -g to every backend and stop stripping it from the
+                 default wasm build (default: off — artifacts carry no debug info; see §4.3)
   --dry          emit C and print the compile command without compiling
   -h, --help     show this help
 ```
@@ -156,6 +164,20 @@ as-aot examples/hello.as --target wasm --dry
 `wasmtime → wasmer → wasm3`, and errors out if none is installed. Because the wasm artifact declares the
 exception-handling feature (see §2), it requires wasmtime/wasmer to run; wasm3 does not support the
 exception-handling proposal.
+
+#### WASI imports the host stub must provide
+
+The generated `.wasm` is a WASI module, so the host (browser / custom runtime) must provide functions for its
+**entire** import set, otherwise `WebAssembly.instantiate` fails outright (measured in a browser as
+`function import requires a callable`). The current runtime reads `getenv` for GC/IO debug switches and uses
+`fopen` for file jobs, so every wasm module imports **18** `wasi_snapshot_preview1` functions, including
+`environ_get`/`environ_sizes_get` and the filesystem family
+(`path_open`/`fd_read`/`fd_readdir`/`path_filestat_get`/`fd_fdstat_set_flags`). When running a program in the
+browser that **does not touch files/environment**, these stubs may honestly return "empty environment /
+`EBADF` / `ENOENT`" — see the **per-entry explicit stubs** in `examples/wasm-native/fib.html` and
+`index.html`, or the **Proxy wildcard stub** in `fib-export.html` and `export-meta.html` (the latter is immune
+to changes in the import set). To list a given `.wasm`'s actual import set:
+`node temp/regen/imports.mjs <file.wasm>`.
 
 #### Exporting functions for direct JS calls
 
@@ -219,68 +241,130 @@ The frontend only translates; heavy lifting like graphics (skia/cairo/SDL) and r
 # Declare include paths / library paths / libraries / macro defines on the command line (all repeatable)
 as-aot app.as -I vendor/include -L vendor/lib -l skia -D USE_SKIA=1
 
+# macOS system frameworks (e.g. Security / SystemConfiguration needed by static curl) and extra C sources
+as-aot app.as -I vendor/curl/include -L vendor/curl/lib/macos-arm64 \
+  -l curl -l nghttp2 -l z -D ASC_HAVE_CURL \
+  --framework Security --framework SystemConfiguration --source vendor/sysproxy_glue.c
+
 # Or use a build manifest (recommended; versionable and reusable)
 as-aot app.as --manifest examples/skia-link.build.example.json
 ```
 
-#### 3.4.1 Named enhancement switches (`--features` / manifest `features`)
+#### 3.4.1 The `flash.net` network backend is an **opt-in macro**, not the default
+
+The transport backend for `http(s)://` is **not linked by default**: without declaring the macro the build
+remains zero-dependency, self-contained and network-free, and a remote URL dispatches a **distinguishable**
+honest `ioError` (sharing no wording with "file does not exist"). The two macros each govern one target:
+
+| Target | Macro | Also needs | Capability gained |
+|---|---|---|---|
+| native | `ASC_HAVE_CURL` | `link-libs: ["curl"]` (system libcurl or the static `vendor/curl` of §3.4.4) | real transport for `URLLoader`/`URLStream` (HTTP/1.1 + TLS + redirects), `navigateToURL` launches the system browser, `Socket`/`ServerSocket`/`XMLSocket` (`ASC_SOCK_POSIX`, on by default) |
+| web (`--package web`) | `ASC_HAVE_FETCH` | none (the browser's built-in `fetch`) | as above (subject to CORS/forbidden headers/opaque redirects, see [`html5-web.md`](html5-web.md) §6 item 10) |
+| wasm32-wasip1 | — (no backend) | — | preview1 has no socket primitives; honestly reports `ioError` |
+
+> **`--air-app` is the auto-mounted exception.** A hand-written `.as` project opts in explicitly per the
+> table above; but for an AIR project going through `--air-app`, the network dependency is **inferred from
+> source** — `src/air-app.ts`'s `detectNetworking()` scans whether `src/**/*.as` mentions `URLRequest` (the
+> same shape as `detectStage3D`, zero configuration), and on a hit writes the native
+> `-l curl -l nghttp2` + `vendor/curl/{include,lib}` paths + `Security`/`SystemConfiguration` +
+> `ASC_HAVE_CURL=1` into the generated manifest; for the web target it writes `ASC_HAVE_FETCH=1` (the only
+> usable HTTP client in a browser is the page's own `fetch()`). The reason is that `--air-app` **rewrites
+> `<filename>.build.json` on every run**, so a hand-edited manifest does not survive the next build, and the
+> link set must therefore come from the generator (stage eighty-nine / fifty-five). The symptom of missing it
+> is not a compile failure but "it compiles and runs, yet every request lands the distinguishable honest
+> `ioError`" (`AS_JOB_ERR_UNSUPPORTED`). An AIR project that does not touch the network keeps the
+> zero-dependency default form; under native, a missing `vendor/curl` **errors out immediately** and points
+> to `build-tools/curl-src/build-static.sh`, rather than degrading silently. The criterion is `URLRequest`
+> and **not** `import flash.net.*`: that package also holds `SharedObject`/`FileReference`/`LocalConnection`
+> and other classes that never touch HTTP, so matching by package name would needlessly pull 1.4 MB of
+> static curl into the link set, and would also stall an app that uses local storage on an error when
+> `vendor/curl` has not been built locally.
+
+**Per-target extra switches** (all off by default, opted in item by item):
+
+| Macro | Default | Effect |
+|---|---|---|
+| `ASC_HTTP2` | off (pinned to HTTP/1.1) | allows TLS to negotiate h2. **Off by default is the fidelity choice**: h2 normalizes response header names and omits connection-level headers, both visible on the AS3 side (AIR's transport is HTTP/1.1 to begin with) |
+| `ASC_SYSTEM_PROXY` | off | reads the macOS system proxy (`SCDynamicStoreCopyProxies`) and hands it to libcurl. **Must be paired with `--source vendor/sysproxy_glue.c`**: `<SystemConfiguration/SystemConfiguration.h>` drags in `MacTypes.h`'s `struct Point`, which conflicts with the generated C's `flash.geom.Point` struct, so that system call can only live in a separate translation unit (the generated C keeps only an `extern` declaration) |
+| `ASC_SOCK_POSIX` | **on** (auto-defined for POSIX targets) | the TCP socket base (`Socket`/`ServerSocket`/`XMLSocket`). Targets without POSIX sockets (WASI/Web/Windows) degrade automatically: honestly dispatching `ioError` |
+| `ASC_HAVE_FETCH` | off (web target) | the browser `fetch` backend |
+
+Environment-variable proxies (`http_proxy`/`https_proxy`/`all_proxy`, either case) need **no macro**: libcurl
+consumes them natively, and the seam skips the system-proxy query when these variables are detected (avoiding
+two proxy configurations overriding each other).
+
+To serve three targets with one manifest, use the `targets` override block (§4.1):
+
+```json
+{
+  "link-libs": ["curl"],
+  "defines": ["ASC_HAVE_CURL"],
+  "targets": {
+    "wasm": { "link-libs": [], "defines": [] }
+  }
+}
+```
+
+#### 3.4.2 Named enhancement switches (`--features` / manifest `features`)
 
 One level above `-D`: it turns on an **AIR-superset capability** by name instead of making the user
-spell out the macro behind it. The name states what it is (an enhancement, not AIR behavior); the
+hand-write the macro behind it. The name only declares what it is (an enhancement, non-AIR behavior); the
 macro is resolved by the compiler.
 
 ```bash
-as-aot app.as --air-app app.xml --features svg      # same as -D ASC_USE_SVG=1
-as-aot app.as --air-app app.xml --features none     # clear (also clears a persisted choice)
+as-aot app.as --air-app app.xml --features svg      # equivalent to -D ASC_USE_SVG=1
+as-aot app.as --air-app app.xml --features none     # clear (see below: this clears the persisted choice too)
 ```
 
-| Name | Macro | Targets | Notes |
+| Name | Macro | Available targets | Description |
 |---|---|---|---|
-| `svg` | `ASC_USE_SVG=1` | `native` only | see §3.4.2 |
+| `svg` | `ASC_USE_SVG=1` | `native` only | see §3.4.3 |
+| `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | `native` / `wasm` | extra image formats WebP / BMP / ICO (AIR reports `#2124` for them, hence **denied by default** — see §3.4.3.1) |
+| `raw` | `ASC_ALLOW_RAW_FORMATS=1` | `native` only | camera RAW / DNG (denied by default — see §3.4.3.1; the web-side Skia has no piex/dng_sdk archive, so it errors when the target is unsupported) |
 
-The manifest field of the same name is a **string array** and means the same thing:
+The same-named field in the manifest is a **string array** with CLI-identical semantics:
 
 ```json
 { "features": ["svg"] }
 ```
 
-Three rules, all in service of *never being silent* (AGENTS.md §1.5):
+Rules (all three exist to **not be silent**, AGENTS.md §1.5):
 
-- **Off by default**: without it the artifact is **byte-for-byte** what it was, matching `adl`.
-  When on, the build prints `== enhancements: svg (-D ASC_USE_SVG=1) ==` and says the build is an
-  AIR superset.
-- **An unknown name is an error**, not ignored: `--features lottie` reports
-  `unknown feature 'lottie' (known: svg)` and exits **before generating any code**. Only channels
-  that actually exist end to end are registered -- offering a switch that does nothing would give
-  the user something that looks enabled and is not compiled in. `--features none` may not be
+- **All off by default**: when not enabled the artifact is **byte-for-byte identical** to before and
+  isomorphic with `adl`. When enabled it prints a line
+  `== enhancements: svg (-D ASC_USE_SVG=1) ==` and states in the hint that it is an AIR superset.
+- **An unknown name errors**, not silently ignored: `--features lottie` reports
+  `unknown feature 'lottie' (known: formats, raw, svg)` and exits **before generating any code** (only
+  capabilities already implemented in the manifest are registered; a registered-but-unimplemented switch
+  would give the user something that "looks enabled but was never compiled in"). `--features none` cannot be
   combined with other names.
-- **Unsupported target is an error**: `--target wasm --features svg` reports
-  `feature 'svg' is not available with --target wasm` rather than leaving
-  `undefined symbol: sk_svg_*` to the linker.
+- **An unsupported target errors**: `--target wasm --features svg` directly reports
+  `feature 'svg' is not available with --target wasm`, rather than leaving `undefined symbol: sk_svg_*` to the
+  linker.
 
-`--features` vs `-D`: `-D` **appends** a macro, `--features` **replaces** the whole enhancement set --
-"svg was on, I want only something else" can only be expressed by replacement.
+The difference between `--features` and `-D`: `-D` **appends** one macro, while `--features` **replaces** the
+whole enhancement set — only replace semantics can express "svg was on, but I want only something else".
 
-#### 3.4.1.1 `--air-app` persists the enhancement choice
+#### 3.4.2.1 `--air-app` **persists** the enhancement choice
 
-`--air-app` **rewrites** the generated `<filename>.build.json` in full on every run (it is a build
-artifact derived from app.xml plus the src scan). A chosen enhancement therefore has to survive that
-rewrite, otherwise "turn SVG on" could only ever be expressed by repeating the flag every time --
-which is the reason this switch exists.
+`--air-app` **rewrites in full** the generated `<filename>.build.json` on every run (it is a build artifact
+derived from app.xml + a src scan). So a chosen enhancement must survive that rewrite, otherwise "turn on SVG"
+could only be repeated on the command line every time — exactly the reason this switch exists.
 
-- `--features svg` writes `"features": ["svg"]` into the generated manifest; **a later run without
-  the flag keeps it**, and prints `enhancements carried over from ...: svg` (**not silent**).
-- To turn it off: `--features none` (clears, and persists the clear).
-- Only `features` is carried over: every other field is a function of the descriptor and sources, and
-  resurrecting a stale generated value (a dropped define, an old link library) would be a silently
-  wrong build.
+- `--features svg` writes `"features": ["svg"]` into the generated manifest; **the next run without the flag
+  still takes effect**, and prints `enhancements carried over from ...: svg` (**not silent**).
+- To turn it off: `--features none` (clears and persists likewise).
+- Only `features` is inherited: the other fields are functions of the descriptor and the source, and
+  reviving a stale generated value (a macro that has been removed, an old link library) would be a silent
+  incorrect build.
 
-#### 3.4.2 SVG decoding is an opt-in macro (`ASC_USE_SVG`)
+#### 3.4.3 Image decoding's SVG channel is also an opt-in macro (`ASC_USE_SVG`)
 
-Encoded images (PNG/JPEG/GIF/BMP/WebP/ICO) need no macro -- both Skia builds already carry those
-codecs. **SVG is different**: it is not an `SkCodec` format (it goes through a separate
-`SkSVGDOM` parse -> `SkSurface` rasterize path), and AIR's `Loader` **never supported SVG**, so per
-§1.5 it is opt-in:
+Of encoded images, **only PNG/JPEG/GIF need no macro** — they are formats AIR supports (`adl` decodes them).
+For BMP/WebP/ICO, both sides' Skia has the corresponding codec compiled in, but AIR reports `#2124` for them,
+hence **denied by default, requiring an explicit switch** (`--features formats`, see §3.4.3.1).
+**SVG is different**: it is not a `SkCodec` format but goes through an independent channel (`SkSVGDOM` parse →
+`SkSurface` rasterize), and AIR's `Loader` **never supported SVG**, so by §1.5 it is made **opt-in**:
 
 ```bash
 # native: one command (libsvg/libsksg/libexpat are already in the manifest's link-libs)
@@ -292,13 +376,70 @@ as-aot app.as --air-app app.xml -D ASC_USE_SVG=1
 
 | Build | `Loader.load("x.svg")` |
 |---|---|
-| default | `ioError #2124 Error #2124: Loaded file is an unknown type.` -- verbatim what `adl` says |
-| `--features svg` (= `-D ASC_USE_SVG=1`) | decodes (`<text>` renders via `SkFontMgr`; a document with no absolute size uses the spec default 300x150) |
+| default | `ioError #2124 Error #2124: Loaded file is an unknown type.` — word-for-word identical to `adl` |
+| `--features svg` (= `-D ASC_USE_SVG=1`) | decodes successfully (`<text>` renders normally via `SkFontMgr`; a document with no absolute size defaults to 300×150 per spec) |
 
 **Not supported on web**: `vendor/skia/lib/wasm` has no `libsvg.a`/`libsksg.a`/`libexpat.a` (the wasm
-`args.gn` sets `skia_use_expat=false`, which gates the whole svg target), so defining the macro fails at
-**link time** -- an explicit error, never a silent downgrade. Supporting it means changing the wasm
-`args.gn` and **rebuilding wasm Skia**. See [`enhancements.md`](enhancements.md) §4.1.
+`args.gn`'s `skia_use_expat=false` gates the whole svg target out), so defining the macro fails at **link
+time** — an explicit error, not a silent degradation. Supporting it would require changing the wasm
+`args.gn` and **rebuilding wasm Skia**. See [`enhancements.md`](enhancements.md) §4.1 and
+[`skia.md`](skia.md) §9.1.
+
+#### 3.4.3.1 Image formats and camera RAW are **denied by default** (`formats` / `raw`)
+
+Two more instances of the same reasoning: our Skia ships more codecs than AIR, and "more" must be opt-in
+(AGENTS.md §1.5) — otherwise the default artifact would be **broader than AIR**: inputs `adl` would reject
+would be accepted by us, exactly the shape forbidden by criterion (d).
+
+| Input | Default build | Switch |
+|---|---|---|
+| PNG / JPEG / GIF | decodes normally (same as AIR) | not needed |
+| **BMP / WebP / ICO** | `ioError #2124 Error #2124: Loaded file is an unknown type.` (word-for-word identical to `adl`) | `--features formats` (= `-D ASC_ALLOW_EXTRA_FORMATS=1`, available on both targets) |
+| **camera RAW / DNG / CR2 / NEF / ARW / ORF / RW2… / RAF** | same `#2124` | `--features raw` (= `-D ASC_ALLOW_RAW_FORMATS=1`, **native only**) |
+| SVG | same `#2124` | `--features svg` (§3.4.3) |
+
+The implementation is a **magic-number interception** in the glue layer (`vendor/skia_glue.cc`'s
+`sk_extra_format_refused`, checked by all four decode entry points): `RIFF....WEBP`, `BM`, `ICO/CUR`, a TIFF
+header (`II*\0`/`MM\0*`, the common header of TIFF-family RAW such as DNG/CR2/NEF/ARW/ORF/RW2), and
+`FUJIFILMCCD-RAW` (RAF). On a hit it is treated as a decode failure, so it **automatically** takes the
+existing `#2124` path at the layer above — the error reported stays consistent with `adl` without separate
+maintenance. On a miss (an unrecognized header) it is still handed to Skia as before, with the same behavior
+as always.
+
+`--features raw --target wasm` is **rejected up front** (`the wasm Skia has no piex/dng_sdk archive ...`);
+`--features formats` is available on both targets. `WBMP` (`SkWbmpCodec` is compiled in) is **deliberately
+not intercepted**: its header is a bare multi-byte type field with no reliable magic number, and rather than
+guess a criterion that might hit real formats by mistake, it is recorded here honestly.
+
+#### 3.4.4 Static self-containment (`vendor/curl`)
+
+`link-libs: ["curl"]` **dynamically links the system libcurl** (on macOS `/usr/lib/libcurl.4.dylib`), so the
+artifact is no longer a single self-contained file. For self-containment,
+`build-tools/curl-src/build-static.sh` builds `libcurl.a`/`libnghttp2.a`/`libz.a` from source into
+`vendor/curl/{include,lib/macos-arm64}`, and the manifest just points there
+([`examples/flash-net-layered.build.example.json`](../../examples/flash-net-layered.build.example.json) is
+exactly this shape):
+
+```json
+{
+  "target": "native",
+  "targets": {
+    "native": {
+      "link-libs": ["curl", "nghttp2", "z"],
+      "link-paths": ["../vendor/curl/lib/macos-arm64"],
+      "include-paths": ["../vendor/curl/include"],
+      "frameworks": ["CoreFoundation", "CoreServices", "Security", "SystemConfiguration"],
+      "defines": ["ASC_HAVE_CURL"]
+    }
+  }
+}
+```
+
+> The `frameworks` field is equivalent to the CLI's `--framework` (links `-framework <name>`). `libz.a` has
+> the same name as the system `libz`, and a static hit is ensured by **library search-path order** (you may
+> see a `ld: warning: ignoring duplicate libraries: '-lz'` notice, with no side effects). Acceptance
+> criterion: the output of `otool -L` **should not** contain `libcurl.4.dylib`/`libz.dylib`.
+> **The default build (not declaring these macros/libraries) is entirely unaffected.**
 
 ### 3.5 AIR Application Descriptor (--air-app)
 
@@ -326,15 +467,71 @@ by the air-native demo) →
 write `<filename>.build.json` in the same directory as app.xml (linking Skia + SDL2) →
 compile/link into the `<filename>` executable (output name overridable with `-o`).
 
+#### 3.5.1 Compile face = the main class's transitive closure (阶段一百二十四)
+
+Which `.as` files `--air-app` compiles is decided by the **class-reference closure from the main class**
+(`src/reach.ts`), matching `mxmlc`/`adl`: AIR links only the transitive closure reachable from the
+document class — `mxmlc -link-report` measures **158/162/171/171/175/246** defs for the six away3d
+demos, while `src/` holds **485** files of which **198** are reached by no demo. `--air-app` used to
+compile the whole tree, over-approximating AIR: other demos' `[Embed]` assets were bundled **and
+survived into the binary**, and a broken `[Embed]` in an unreachable class failed our build where
+`adl` was fine.
+
+Closure edges are the **class-name references** in the source: `new X`, type annotations (including a
+`Vector.<T>` element type), `extends`/`implements`, `is`/`as` targets, `catch (e:T)`, parameter and
+return types, and **bare identifiers** (which covers `X.staticM()`). Resolution **deliberately
+over-approximates** — an unresolved short name maps to **every** candidate of that name — so our
+closure is a superset of AIR's (otherwise pruning would itself be a new fidelity gap). Always kept:
+the main class, `[WasmExport]`-marked classes (JS entry points with no AS3 reference), and files
+carrying **non-class top-level statements** (module statements / free functions), which are emitted
+for the whole program and cannot be pruned per class.
+
+Classes referenced **only by a `getDefinitionByName("…")` string** are not kept, matching AIR (mxmlc
+cannot resolve the string either). The class registry `as_class_registry[]` stays eager (it also
+serves `is Class`, `new x()`, `getDefinitionByName` and the GC roots) — what shrinks is the
+**emission** face, not the runtime table.
+
+To restore the old whole-tree face:
+
+```bash
+as-aot --air-app app.xml --all-sources     # compile every .as under src/ (pre-阶段一百二十四 behaviour)
+```
+
+Measured (away3d `Basic_SkyBox`, same sources, `--all-sources` vs default): sources **485 → 165**,
+`[Embed]` assets **40 → 6**, generated `.c` **31,324,486 → 9,105,166 B (−71%)**, binary
+**34,134,472 → 25,456,904 B (−25%)**, full build **37.03 → 15.94 s (−57%)**. The build log reports the
+result: `(main Basic_SkyBox, 165/485 sources reachable from Basic_SkyBox)`, and the per-demo asset
+count equals AIR's **for every demo** (6/2/0/2/1/27). Design, soundness argument and per-mechanism
+evidence: `src/reach.ts` header and the `unit: reach/*` groups.
+
 **Web target** (under `--air-app ... --target wasm --package web`): the `--air-app` adapter automatically
 switches to the browser backend — the build manifest switches to `web_glue.cc` (replacing `window_glue.cc`)
 + the wasm build of Skia (`vendor/skia/lib/wasm`), drops the macOS frameworks SDL2/`objc`/Cocoa, and fonts are
 provided by `app.xml`'s `<embedFonts>` (reads each `<font><fontPath>` to generate `font-urls` for runtime
-injection, falling back to `fonts/Arial.ttf` when absent; the wasm sandbox has no system fonts, see
-[`html5-web.md`](html5-web.md) §4). The rest of the flow (parsing app.xml, scanning src, generating bootstrap
-code) is identical to native, and the artifacts are `<filename>.html` + `.js` + `.wasm`.
+injection; when no `<embedFonts>` is written it automatically scans the app directory for `.ttf/.otf/.ttc`,
+`findAppFonts()`, with no descriptor change needed). The rest of the flow (parsing app.xml, scanning src,
+generating bootstrap code) is identical to native, and the artifacts are `<filename>.html` + `.js` + `.wasm`.
 
-Four key behaviors aligned with adl:
+**Font warning (same reasoning as the network auto-mount: the failure is silent)**: the wasm sandbox has no
+enumerable system fonts and only recognizes fonts injected by the page; an app that uses `flash.text` but has
+no font at all in its app directory will get an empty `font-urls` list, so the TextField's **background is
+still drawn while every glyph is missing** — it compiles and the page runs, only the text is invisible
+(native/adl enumerate installed fonts via CoreText and are unaffected, so this is a web-only pitfall). The
+adapter scans `src/**/*.as` for `flash.text` (`detectText()`) to decide whether the app draws text, and on a
+hit with an empty `font-urls` prints a yellow warning to stderr, naming the symptom and the two fixes (drop
+in a font yourself, or write `<embedFonts>`). It does not throw: the rest (layout, bitmaps) previews fine, and
+blocking the build would not make the font appear. See [`html5-web.md`](html5-web.md) §4 and §6 item 1.
+
+**Network transport auto-mount**: an AIR project does not need hand-written curl arguments. The adapter scans
+`src/**/*.as` for `URLRequest` to decide whether the app uses the network (`detectNetworking()`, the same
+shape as `detectStage3D`), and on a hit writes the static `vendor/curl`'s `-I/-L` paths +
+`-l curl -l nghttp2` + `Security`/`SystemConfiguration` into the native manifest and defines
+`ASC_HAVE_CURL=1`; the web target defines `ASC_HAVE_FETCH=1` instead. This is required automation rather than
+convenience: the manifest is regenerated on every build, so a hand edit cannot survive. An app that does not
+touch the network is unaffected (still the zero-dependency default form).
+(`ASC_HAVE_CURL` itself is still an opt-in macro; the design rationale is in §3.4.1.)
+
+Three key behaviors aligned with adl:
 - `<resizable>false</resizable>` → build manifest adds `ASC_WINDOW_FIXED=1`; window creation omits
   `SDL_WINDOW_RESIZABLE`, yielding a fixed-size window consistent with adl.
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → build manifest adds `ASC_DISPLAY_HIGH=1`;
@@ -350,6 +547,19 @@ Four key behaviors aligned with adl:
   it into a `GrBackendRenderTarget` to render, and after `flushAndSubmit` doing `presentDrawable`+`commit`.
   `cpu`/`auto` (default) keep pure software raster (web uses `putImageData`, native uses an SDL streaming
   texture).
+  - **`ASC_RENDER_METAL` applies to every window** (stage eighty-nine / seventy-five): the main window
+    always goes through Metal; at runtime `new NativeWindow()` also defaults to Metal — AIR's
+    `NativeWindowRenderMode.AUTO` is exactly "use the GPU when there is one". Backend state
+    (layer/drawable/surface) is **slotted per window**, sharing only
+    `MTLDevice`/`MTLCommandQueue`/`GrDirectContext`; opening N windows means N per-window Metal
+    initializations (log `metal_glue: window <id> layer bounds=…`).
+  - To get a software window in the same build, set `NativeWindowInitOptions.renderMode = "cpu"` (the main
+    window has no such knob; it is fixed by app.xml). Measured (two secondary windows): changing only this
+    one line in the same binary took CPU from an average **32.8% → 14.0%**.
+  - **Stage3D/StageVideo only composite inside Metal windows**: AIR's documentation explicitly says software
+    windows do not support StageVideo/Stage3D compositing, and under a Metal build there is no CPU readback
+    buffer (exposing the render-target texture is precisely to save the per-frame readback) — handled as AIR
+    behaves, not a silent degradation.
 - The bootstrap code presets `stage.stageWidth/stageHeight` **before** `new Main()`, so that during document
   class construction `trace(stage.stageWidth, stage.stageHeight)` returns the window size (e.g. `1000 680`)
   rather than `0 0` outside adl.
@@ -366,27 +576,30 @@ kebab-case.
 | `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | Distribution form, default `raw` (§6); `web` requires `target=wasm`, producing browser artifacts (see [`html5-web.md`](html5-web.md)) |
 | `c-compiler` | string | C compiler, default `cc` |
 | `opt` | string | Optimization flags, default `-O2` |
-| `lto` | boolean | Default `false`. When `true`, adds `-flto` to **every compile step and the link step** (see §4.1); leaving it unset keeps the command and the artifact byte-for-byte what they were |
-| `pgo` | `"generate" \| "use"` | Phase of profile-guided optimization, off by default. `generate` builds an **instrumented** binary (running it writes profile data); `use` rebuilds with the data from the same directory (see §4.1) |
+| `debug-info` | boolean | Whether to keep debug info, default `false`. By default artifacts carry **no DWARF** on any of the three backends (the wasm link therefore adds `-Wl,--strip-debug`, see §4.3); setting `true` adds `-g` to all three and stops stripping wasm (CLI `--debug-info`) |
+| `lto` | boolean | Default `false`. When `true`, adds `-flto` to **every compile step and the link step** (see §4.2); leaving it unset keeps the command and the artifact byte-for-byte what they were |
+| `pgo` | `"generate" \| "use"` | Phase of profile-guided optimization, off by default. `generate` builds an **instrumented** binary (running it writes profile data); `use` rebuilds with the data from the same directory (see §4.2) |
 | `pgo-dir` | string | Profile directory shared by the two `pgo` phases (relative to the manifest dir). Clang reads `<dir>/default.profdata`, so both phases **must name the same one** |
 | `sources` | string[] | Extra C/C++ source files (compiled together with the generated `.c`) |
+| `swc-paths` | string[] | `.swc` libraries (paths resolve relative to the manifest dir). Both halves are processed at **compile time**: **named bitmap resources** are extracted (`DefineBitsLossless/2` de-premultiplied and re-encoded as PNG, `DefineBitsJPEG2/3` copied byte-for-byte) and synthesized as `dynamic class X extends BitmapData` (constructor `(width, height)` but the **arguments are ignored**), while the **vector shapes and display tree** (`DefineShape*`/`DefineSprite`/`PlaceObject*`, `clipDepth` masks, `PlaceObject3` visibility, the **nine-slice** `DefineScalingGrid`, the **button four states** `DefineButton2`) are baked into runtime drawing calls and their exported symbols synthesized as AST classes. Thus both reference paths work — `new logo(0, 0)` and `getDefinitionByName("logo")`; the asset bytes are embedded into the generated `.c` and decoded by Skia at runtime (zero new runtime API on the vector side). Implementation and measurements: [`swc.md`](swc.md) §5/§6/§9; semantics/limits: [`swc.md`](swc.md) §10 |
 | `include-paths` | string[] | Header search paths (→ `-I`) |
 | `link-libs` | string[] | Libraries to link (→ `-l`) |
 | `link-paths` | string[] | Library search paths (→ `-L`) |
 | `defines` | string[] | Preprocessor macros (→ `-D`) |
-| `features` | string[] | **Named enhancement switches** (§3.4.1), e.g. `["svg"]`. Empty by default. An unknown name is an error; when on, the build banner names it, and when off the artifact matches `adl`. On the CLI `--features` **replaces** the whole set (`-D` is the one that appends) |
+| `features` | string[] | **Named enhancement switches** (§3.4.2), e.g. `["svg"]`. Empty by default. An unknown name is an error; when on, the build banner names it, and when off the artifact matches `adl`. On the CLI `--features` **replaces** the whole set (`-D` is the one that appends) |
 | `objects` | string[] | Precompiled `.o` added directly to the link |
 | `frameworks` | string[] | macOS frameworks (→ `-framework X`, needed for Skia's CoreText/CoreGraphics backend) |
 | `font-urls` | string[] | Font byte-stream URL list (`--package web` writes it into `index.html`, network-loaded and injected into Skia at runtime; see [`html5-web.md`](html5-web.md) §4) |
 | `preload-paths` | string[] | Data roots packed into the wasm FS image, `src@dest` or a bare path (`--package web` only; the browser sandbox starts with an empty FS, so `File`/`FileStream` would see nothing at all) |
-| `preload-excludes` | string[] | Host paths or fnmatch patterns **removed** from that image (→ `emcc --exclude-file`; also `--package web` only). A directory preload has no per-file opt-out, so files that must not ship are named here instead; patterns match the **host path** the preload walk yields (absolute), so they resolve relative to the manifest dir too. A path containing `*?[` is a PATTERN, not a literal (`weird[1].png` drops the unrelated `weird1.png`); escape it as `[[]` `[]]` `[*]` `[?]` to match literally. A pattern that matches nothing is silently ignored. `--air-app` uses it to pull the page-fetched fonts back out of the FS (see [`html5-web.md`](html5-web.md) §6) |
+| `preload-excludes` | string[] | Host paths or fnmatch patterns **removed** from that image (→ `emcc --exclude-file`; also `--package web` only). A directory preload has no per-file opt-out, so files that must not ship are named here instead; patterns match the **host path** the preload walk yields (absolute), so they resolve relative to the manifest dir too. A path containing `*?[` is a PATTERN, not a literal (`weird[1].png` drops the unrelated `weird1.png`); escape it as `[[]` `[]]` `[*]` `[?]` to match literally. A pattern that matches nothing is silently ignored. `--air-app` uses it to pull the page-fetched fonts back out of the FS (see [`html5-web.md`](html5-web.md) §6), and automatically excludes the **current build's output directory** pointed to by `-o` — otherwise `-o temp/<x>` would preload the very `.c`/`.o`/artifact being written into the image (measured on Flappy-Starling: 1.9 MB → 36 MB); with no `-o` specified it makes no guesses at all |
 | `bundle-id` | string | app identifier (`--package xcode-project` fills `Info.plist`'s `CFBundleIdentifier`, default `com.example.<product>`) |
 | `display-name` | string | app display name (fills `CFBundleName`, default product name) |
 | `icon` | string | `.icns` path (relative to manifest dir, copied into `Resources` + fills `CFBundleIconFile`) |
 | `deployment-target` | string | macOS minimum version (fills `MACOSX_DEPLOYMENT_TARGET`, default `12.0`) |
+| `targets` | `{ native?, wasm? }` | **Per-target override block** (§4.1): top-level fields are the shared default, and the `targets.<target>` block **replaces wholesale** the fields it declares for the **matching target**, letting one manifest serve multiple targets with mutually exclusive link sets |
 
-Path-type fields (`sources` / `include-paths` / `link-paths` / `objects` / `preload-excludes`) resolve **relative to the directory
-containing the manifest file** (same as TypePHP's YAML path rule). See
+Path-type fields (`sources` / `swc-paths` / `include-paths` / `link-paths` / `objects` / `preload-excludes`)
+resolve **relative to the directory containing the manifest file** (same as TypePHP's YAML path rule). See
 [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json):
 
 ```json
@@ -409,9 +622,56 @@ containing the manifest file** (same as TypePHP's YAML path rule). See
 ```
 
 **Priority**: CLI arguments override same-named manifest fields (mirroring TypePHP's "CLI beats YAML").
-Merge order: default config → manifest → CLI overrides.
+Merge order: default config → manifest top level → manifest `targets.<final target>` (§4.1) → CLI overrides.
 
-### 4.1 Link-time and profile-guided optimization (`lto` / `pgo`)
+### 4.1 Per-target layering (`targets`)
+
+Top-level fields are the **shared default**; the `targets.<target>` block takes effect only for the
+**matching target** and **replaces wholesale** (replace, not append) the same-named top-level values. This
+lets **one manifest** serve multiple targets with mutually exclusive link sets — the typical scenario being
+`flash.net`'s HTTP backend: native links curl, whereas WASI preview1 has no socket/TLS and `-lcurl` would make
+`wasm-ld` fail outright (`unable to find library -lcurl`), so it must be removed for wasm.
+
+Example [`examples/flash-net-layered.build.example.json`](../../examples/flash-net-layered.build.example.json)
+(current shape: native points at the static `vendor/curl`; wasm has no block so no curl-related field is
+added):
+
+```json
+{
+  "target": "native",
+  "opt": "-O2",
+  "targets": {
+    "native": {
+      "link-libs": ["curl", "nghttp2", "z"],
+      "link-paths": ["../vendor/curl/lib/macos-arm64"],
+      "include-paths": ["../vendor/curl/include"],
+      "frameworks": ["CoreFoundation", "CoreServices", "Security", "SystemConfiguration"],
+      "defines": ["ASC_HAVE_CURL"]
+    }
+  }
+}
+```
+
+- `as-aot app.as --manifest m.json` (native by default) → links `-l curl -l nghttp2 -l z -D ASC_HAVE_CURL` +
+  the four `-framework`;
+- `as-aot app.as --manifest m.json --target wasm` (wasm) → **neither is added** (no `native` block matches).
+
+Rules:
+
+- Fields **omitted** in the block fall back to the top-level default; to **remove** a top-level shared library,
+  write `"link-libs": []` in that target's block — **only replace semantics can "subtract"** (append can only
+  "add", never drop).
+- The only selectable targets are `native` / `wasm`, and **an unknown target name errors**; inside the block
+  **`target`/`package` are not allowed** (the target is decided by the block selecting it, and cannot be
+  redefined inside) nor nested `targets`; **an unknown field inside the block errors** (AGENTS.md §2.5, to
+  keep typos from being silently ignored).
+- Path-type fields inside the block (`sources`/`include-paths`/`link-paths`/`objects`/`icon`) resolve
+  **relative to the manifest dir**, like the top level.
+- The override block is selected by the **final target** (including the effect of CLI `--target`) and is
+  applied **before** the CLI overrides, so the CLI's `-l/-I/-L/-D` still stack on top of the layered result —
+  "CLI beats manifest" is unchanged.
+
+### 4.2 Link-time and profile-guided optimization (`lto` / `pgo`)
 
 These two are **build-level switches, not language features**: the frontend still only translates AS into
 readable C and hand-writes no optimization at all (§1.1); `-flto` and the profile data are consumed by the
@@ -465,14 +725,52 @@ single-translation-unit call-heavy workload. Layering PGO on top showed no measu
 noise) — this workload's branches are simple, and PGO pays off on programs with **many branches / indirect
 calls**; it should not be sold as a general speedup.
 
+### 4.3 Debug info (`debug-info`)
+
+Also a **build-level switch** orthogonal to `opt`/`lto`/`pgo`, but pointing the other way: it governs
+**whether the artifact carries a debug section**. It defaults to `false`, meaning "no DWARF on any of the
+three backends", consistent with C-toolchain convention:
+
+| Backend | DWARF by default? | Why |
+|---|---|---|
+| native (`cc -O2`) | no | clang emits no `.debug_*` without `-g` (the executable has only a regular symbol table) |
+| web (`emcc -O2`) | no | emcc strips on its own under `-O2` (a trivial program measures 2010 B with 0 custom sections; only with `-g` does it reach 28243 B) |
+| wasm (WASI raw) | **yes, hence explicitly stripped by default** | wasi-sdk's `libc.a` **ships DWARF** and `wasm-ld` keeps it by default — a trivial `printf` drags in ~62 KB of debug section |
+
+So with `debugInfo=false`, **only the wasm link** needs the mirror-image `-Wl,--strip-debug` (native/web need
+no compensating flag). Using `--strip-debug` rather than `--strip-all` is deliberate: it removes only
+`.debug_*` and keeps the `name` section (function names) ⇒ even without debug info, a trap still prints a
+**symbolized stack**, losing only source line numbers / variable-level info.
+
+```bash
+# default: wasm artifact 133 KB (fib.wasm, with 288 KB of debug section stripped)
+as-aot examples/wasm-native/fib.as --target wasm
+
+# keep debug info: -g on all three, wasm no longer stripped (fib.wasm ~640 KB)
+as-aot examples/wasm-native/fib.as --target wasm --debug-info
+```
+
+With `debugInfo=true`, `-g` is added to **every compile step** (not just the link), so DWARF covers the `.c`
+we generated ourselves — browser DevTools can source-step through the C that the AS3 lowered to
+(`llvm-dwarfdump --debug-line` will show the file name of our generated `.c`).
+Manifest spelling: `{ "debug-info": true }`, overridable per target by `targets.<target>` (§4.1).
+
+> The default behavior of not emitting `-g` on native/web is **completely unchanged**; the suite has an
+> assertion for the **default command** of each of the three backends (`[debuginfo]`), and a reverse control
+> proves they really pin down this policy.
+
 ## 5. Multi-target Backends
 
 | Target | Compile command | Artifact |
 |---|---|---|
-| `native` (default) | `cc -O2 -lm -o <out> <c> [sources] -I... -D... [objects] -L... -l... [-framework X]` | Mach-O / ELF / PE executable |
-| `wasm` | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 -o <out>.wasm <c> ...` | WASI `.wasm` |
+| `native` (default, `--package raw`) | `cc -O2 -lm -lz -o <out> <c> [sources] -I... -D... [objects] -L... -l... [-framework X]` | Mach-O / ELF / PE executable |
+| `wasm` (`--package raw`) | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 [-g] -mllvm -wasm-use-legacy-eh=false [-Wl,--strip-debug] -o <out>.wasm <c> ... -lsetjmp` | WASI `.wasm` (debug section stripped by default; `--debug-info` removes `-Wl,--strip-debug` and adds `-g`, see §4.3) |
 | `native` + `--package xcode-project` | generates `.xcodeproj` (§6.5), driven by Xcode/xcodebuild | macOS `.app` bundle (`Contents/MacOS/<bin>` + `Info.plist`) |
 | `wasm` + `--package web` | `emcc` (Emscripten, requires `EMSDK_HOME`) compiles C/C++ sources + links the wasm Skia, `INVOKE_RUN=0` | `.wasm` + `.js` + `index.html` (browser HTML5 rendering, see [`html5-web.md`](html5-web.md)) |
+
+> When link libraries/macros must differ per target (e.g. native links curl while wasm cannot), use the
+> manifest's `targets` block (§4.1) — one manifest then covers several backends from the table above, with no
+> need to maintain one manifest per target.
 
 Platform coupling points are isolated in `runtime.ts`'s `RUNTIME_PREAMBLE`, using `#ifdef __wasi__`
 conditional compilation. The only current platform difference is `as_now_ms()`:
@@ -488,7 +786,7 @@ conditional compilation. The only current platform difference is `as_now_ms()`:
 > This section answers: `--target native` already produces a bare executable, so how should `.app` /
 > `.dmg` / Windows `.exe` / Xcode projects / Android projects be handled — by flattening them into more
 > `--target` values, or by splitting them out? Conclusion: **split into two orthogonal dimensions**. The
-> `xcode-project` form is implemented (as a macOS application target).
+> `xcode-project` form is implemented (§6.5); the rest are planned.
 
 The current pipeline's mental model is "one AS → one readable C → one bare executable". Half of those
 artifacts are "switching the compile backend"; the other half are "how to organize after compiling". These
@@ -542,12 +840,15 @@ macOS-only today (the SDL2/Skia static libraries only have macOS arm64 builds).
 1. **`xcode-project` / `android-project` are "generate project files", not "one cc invocation"**. The compile
    backend still produces Mach-O / ELF; the project generator organizes the compile command + dependencies +
    resources into an `.xcodeproj` / Gradle skeleton. So they are an independent generation step in the build
-   layer, not compile arguments.
-2. **Windows `.exe` needs no new argument**. `native` on Windows is already a PE executable; the only small
-   gap is that `-o app` does not auto-append `.exe` (only the wasm branch appends a suffix).
+   layer, rather than being stuffed into `cc/clang`'s compile arguments.
+2. **Windows `.exe` needs no new argument at all**. `native` on Windows is already a PE executable; the only
+   small gap is that `-o app` does not auto-append `.exe` (`index.ts` only appends a suffix in the wasm
+   branch). Appending the default extension by host OS is enough; it is not a new form.
 3. **Project metadata goes into the manifest, not flattened into CLI flags**. The generator needs a lot of
-   metadata — bundle id, icon, signing, min SDK, permissions, resources — these are *configuration*, not
-   *arguments*, carried by the existing manifest (see §4).
+   metadata: bundle id, icon, signing identity, min SDK, permissions, resource directory… these are **not
+   arguments, they are project configuration**. The project already has a manifest mechanism analogous to
+   TypePHP's `project.yml` (see §4), which should be extended to carry these fields rather than flattening
+   them into a pile of CLI flags.
 
 ### 6.3 Recommended CLI form
 
@@ -555,7 +856,7 @@ macOS-only today (the SDL2/Skia static libraries only have macOS arm64 builds).
 # unchanged behavior
 as-aot examples/hello.as --run
 
-# macOS application project (implemented)
+# macOS application project (compile backend native + generate .xcodeproj; implemented)
 as-aot src/Main.as --target native --package xcode-project --manifest macos.json
 
 # iOS project (switch backend + generate project, complex metadata via manifest; planned)
@@ -576,10 +877,10 @@ the manifest directory). The four macOS application (`xcode-project`) fields are
 | `display-name` | display name (fills `CFBundleName`, default product name) | ✅ implemented |
 | `icon` | `.icns` path (copied into `Resources` + fills `CFBundleIconFile`) | ✅ implemented |
 | `deployment-target` | macOS minimum version (fills `MACOSX_DEPLOYMENT_TARGET`, default `12.0`) | ✅ implemented |
-| `permissions` | Android manifest permissions / iOS Info.plist usage descriptions | planned |
-| `resources` | extra files to copy into the bundle / project resources | planned |
+| `permissions` | Android `AndroidManifest.xml` permissions / iOS `Info.plist` usage descriptions | planned |
+| `resources` | extra files to copy into the bundle / project resource directory | planned |
 | `ndk-abi` | Android target ABI list (e.g. `arm64-v8a`) | planned |
-| `signing-identity` | code-signing identity (currently ad-hoc `-`) | planned |
+| `signing-identity` | code-signing identity (`codesign` for macOS/iOS; currently ad-hoc `-`) | planned |
 
 Landing order: `xcode-project` (macOS application) is done → next `android-project` (the heaviest project
 generator) → then multiplatform destination and formal signing.
@@ -599,13 +900,13 @@ open build/Main.xcodeproj                          # open the project
 # or build from the command line (no need to open Xcode)
 xcodebuild -project build/Main.xcodeproj -scheme Main -configuration Debug build
 # the artifact is build/…/Debug/Main.app (Contents/MacOS/Main + Contents/Info.plist + resources)
-open build/…/Debug/Main.app                        # launch the real App
+open build/…/Debug/Main.app                        # double-click / command-line launch
 ```
 
 Upgrading from "command-line tool" to "application" turns the artifact from a bare Mach-O into a real macOS
 App with bundle identity, Dock icon, menu bar, and sign-for-distribution capability. The generated AS3 C is
-still `int main(void)` — the SDL2 event loop (`ASC_USE_WINDOW=1`) runs from `main`; the bundle + `Info.plist`
-only add an app identity, and runtime behavior is identical to raw.
+still `int main(void)` — the SDL2 event loop (`ASC_USE_WINDOW=1`) runs from `main`, and the bundle +
+`Info.plist` only add an app identity, with runtime behavior identical to raw.
 
 Implementation notes (`src/xcode-project.ts`):
 
@@ -618,21 +919,24 @@ Implementation notes (`src/xcode-project.ts`):
   provides `icon`.
 - **App metadata from the manifest** (§6.4): `bundle-id`/`display-name`/`icon`/`deployment-target` fall into
   `PRODUCT_BUNDLE_IDENTIFIER`/`CFBundleName`/Resources phase + `CFBundleIconFile`/`MACOSX_DEPLOYMENT_TARGET`;
-  `icon` (absolute-path file ref) is copied into `Contents/Resources/`.
+  `icon` (absolute-path file ref) is added to the Resources phase and copied into `Contents/Resources/` at
+  build time.
 - **Ad-hoc signing**: `CODE_SIGN_STYLE = Manual` + `CODE_SIGN_IDENTITY = "-"`, so `xcodebuild` produces a
   runnable `.app` with no provisioning profile or Apple ID (ad-hoc); formal distribution adds
   `signing-identity` in the manifest (§6.4, planned).
 - **Compile config mirrors the raw link**: `OTHER_LDFLAGS` always contains `-lm -lz` then the manifest's
   `link-libs`/`objects`/`frameworks`; `HEADER_SEARCH_PATHS`/`LIBRARY_SEARCH_PATHS` mirror
   `include-paths`/`link-paths`; `GCC_PREPROCESSOR_DEFINITIONS` mirrors `defines`; `GCC_OPTIMIZATION_LEVEL` is
-  mapped from `--opt`'s `-O{0,1,2,3,s}`. Path-type fields are written as absolute paths.
+  mapped from `--opt`'s `-O{0,1,2,3,s}`. Path-type fields are written as absolute paths so Xcode resolves them
+  from any working directory.
 - **Disable `-fmodules` (critical)**: the generated C uses bare type names (`Point`/`Rectangle`…) that collide
-  with macOS SDK types (e.g. `MacTypes.h`'s `Point`). Raw `cc` is fine because Apple clang does not enable
-  `-fmodules` by default; Xcode does, and would let the SDK's `Point` shadow the generated struct (causing
-  `no member named 'x' in 'struct Point'`). So the project explicitly sets `CLANG_ENABLE_MODULES = NO`.
+  with macOS SDK types (e.g. `MacTypes.h`'s `Point`). Raw `cc` is fine because `-fmodules` is off by default;
+  Xcode enables it by default and would let the SDK's `Point` shadow the generated struct, causing
+  `no member named 'x' in 'struct Point'`. So the project explicitly sets `CLANG_ENABLE_MODULES = NO` to
+  guarantee semantics identical to the command-line build.
 - **C/C++ layering**: the generated `.c` stays C99 (`GCC_C_LANGUAGE_STANDARD = c99`); C++ glue layers
   (`skia_glue.cc` etc.) use C++17 (`CLANG_CXX_LANGUAGE_STANDARD = "c++17"` + `CLANG_CXX_LIBRARY = "libc++"`),
-  dispatched by file extension.
+  with the compiler dispatched by file extension.
 - **Shared scheme**: generates `xcshareddata/xcschemes/<NAME>.xcscheme` (`BuildableName = <NAME>.app`) so
   `xcodebuild -scheme NAME` resolves without opening Xcode.
 
@@ -712,6 +1016,37 @@ Core mechanism: `ASC_USE_WINDOW=1` decides whether `Stage.showWindow(...)` actua
 the event loop, or degrades to a no-op (see the conditional compilation in `runtime.ts` below). So the same
 `.as` can switch between "offscreen PNG" and "GUI window" simply by changing the manifest, without modifying
 source.
+
+> **The offscreen row links Skia only**: no `window_glue.cc` in `sources`, no `SDL2` in `link-libs`, and no
+> SDL2 include/library path (with `ASC_USE_WINDOW` undefined, `Stage.showWindow()` degrades to a no-op).
+> Both documented manifests are backed by `build/DocumentedLinkSets` in `test/unit/build.ts`, which compiles
+> the generated C once using the manifest's **own `defines`**: if a combination the docs advertise stops
+> compiling, the suite goes red (which is exactly what happened on 2026-10-06, when the offscreen row lacked
+> `AS_CURSOR_*` and failed silently — now fixed by defining those kinds once, outside every backend branch).
+
+> **The two GPU macros must not be mixed up** (mixing them misjudges `Context3D.driverInfo`'s backend):
+>
+> | Macro | Meaning | Defined by |
+> |---|---|---|
+> | `ASC_RENDER_METAL` | **window compositing** goes through Metal: `metal_glue.mm`'s `CAMetalLayer` + Ganesh, compositing the whole frame on the GPU (for 2D on-screen). **One state per window** (slotted by window id, sharing only device/queue/context); both the main window and a runtime `NativeWindow` use it (the latter unless `renderMode="cpu"`) | `air-app.ts` adds it under `<renderMode>direct/gpu` + a visible window |
+> | `ASC_RENDER_STAGE3D` | **Stage3D's `Context3D` connected to the real GPU**: links `stage3d_glue.mm`, and the `as_s3d_*` wrappers change from no-ops to real Metal calls | the build manifest (`air-app.ts` adds it when `usesStage3D`) |
+>
+> The two are **mutually independent**: defining only the former leaves `Context3D` a pure C state machine
+> (`driverInfo` returns `"Software (state machine)"`); defining only the latter leaves the window on CPU
+> raster (e.g. `examples/stage82.build.json`). A project that is both a GPU window and uses Stage3D (Starling,
+> shmup) needs both.
+
+**Frame-rate diagnostic knobs** (appended with `-D`, not compiled into the artifact by default):
+
+| Knob | Target | Form | Description |
+|---|---|---|---|
+| `ASC_FRAME_STATS` | native | runtime env (`getenv`) | every 512 frames prints frame-time `p50/p95/p99/max` + GC share + RSS/segment count (see [`gc.md`](gc.md)) |
+| `ASC_FRAME_STATS` | **web** | **compile-time define** (`-D ASC_FRAME_STATS=1`) | browsers have no env; every second it posts `frames`/`loopcalls`/`skips`/`renderMs`/`rafPeriodMs`/`skip` to `window.__ascFrameStats` (see [`html5-web.md`](html5-web.md) §3.2) |
+
+On the web side, the difference between `loopcalls` and `frames` directly distinguishes "rAF itself is slow
+(refresh-rate ceiling)" from "a cadence defect": the latter is the root cause of only reaching 66 fps on a
+120 Hz screen (a timestamp-deadline cadence dropping/gaining alternately under rAF jitter, halving the rate),
+now fixed as a whole-tick cadence ([`html5-web.md`](html5-web.md) §3.2).
 
 `--target native` by default produces a **command-line executable** (offscreen CPU raster → PNG, then exit).
 To pop a real native window on macOS and enter the event loop, use `Stage.showWindow(width, height, title)`;
@@ -798,10 +1133,10 @@ Key implementation points:
 
 ## 8. Related Documents
 
-- [`README.md`](../../README.md) — project overview, supported language subset, type mapping, current
-  limitations
+- [`README-CN.md`](../../README-CN.md) — project overview, supported language subset, type mapping
 - [`TODO.md`](../../TODO.md) — staged roadmap (stage twenty-nine is "build manifest + multi-target backend")
 - [`as3-semantics.md`](as3-semantics.md) — AS3 semantic-fidelity red lines and specification sources
 - [`html5-web.md`](html5-web.md) — browser rendering target (`--target wasm --package web`) implementation and usage
+- [`win32.md`](win32.md) — Windows native backend (`<architecture>` bit width, `vendor/build-windows-deps.ps1`, Skia D3D12 direct GPU, first-run checklist)
 - [`skia.md`](skia.md) — rendering backend (Skia rasterization + wasm font injection)
 - [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md) — development conventions (§2.9 build & link)

@@ -36,6 +36,19 @@
 `web` 硬性要求 `target=wasm`（`src/index.ts` 分派时校验）；`--target wasm --package raw`
 保持现状（WASI 命令行模块，`examples/wasm-native/` 的 shim 即加载它）。
 
+**产物是成套的（构建失败不会回滚已写出的中间产物）**：一次成功的 web 构建写出
+`.html`/`.js`/`.wasm`（app 目录被预打包进 FS 时还有 `<base>.data`）**同一批**产物。若在**链接期**失败
+（例如后端少一个 `s3d_*` 入口：`undefined symbol`），已写出的 `.c`/`.data` 会留在磁盘上，而 `.wasm`
+仍是**上一次成功**的版本 ⇒ 页面就变成「素材全部解不开、白屏卡在加载」（旧 wasm 按新 `.data` 的偏移
+读资源）。见到构建报错后请**重跑到成功**，不要继续用旧页面。另：**浏览器会静默复用旧的
+`.js`/`.wasm`**（不重新校验）—— 核对新构建时换端口或加查询串，否则看到的可能是上个月的产物。
+
+**相对资源 URL 以页面所在目录为基准**：`--air-app` 生成清单里的字体/素材条目（`assets/fonts/Ubuntu-R.ttf`、
+`assets/textures/2x/…`）与 app 的 `File.applicationDirectory.resolvePath("assets/…")` 都按**页面所在目录**
+解析，因此这类项目必须**就地**构建（`-o` 指向 app 目录）；产物挪到别处会素材/字体 404，典型现象是
+「按钮皮肤在、文字全无」。`--air-app` 还会把 app 目录整体 `preload` 进 `<base>.data`（字体另经
+`preload-excludes` 排除，见 §6.1）。
+
 ## 2. 快速开始
 
 ```bash
@@ -501,6 +514,16 @@ try { Module._main(); } catch (e) { if (e !== 'unwind') throw e; }
     - **无 `file://`**：web 沙箱下相对/文件路径无对应物，非 http 的 URL 直接诚实报错。
 11. **`navigateToURL` 在 web 上只能制 `window.open`**：不是系统浏览器进程，弹窗拦截策略
     由浏览器决定；无启动器的 WASI 目标如实报 `Error #2032`（见 `flash-net.md` §6.6）。
+12. **web 渲染后端固定为 WebGL2，未使用 WebGPU**（2026-10-08 复核，结论维持）。wasm 版 Skia
+    只编了 Ganesh/WebGL（`out/wasm/args.gn`：`skia_use_webgpu=false`、`skia_enable_graphite=false`、
+    `skia_use_dawn=false`、`skia_use_webgl=true`），且 `vendor/skia/lib/wasm/libskia.a` 里
+    **Dawn 符号为 0**；Stage3D 后端是 `stage3d_webgl.cc`（WebGL2 + GLSL ES），构建固定
+    `-s MAX_WEBGL_VERSION=2`。**这不是性能妥协**：瓶颈是 rAF / 面板刷新率，GPU 路径单帧仅占
+    帧预算 **1.35%**（余量 ≈74×；Stage3D 上屏 GPU 直连后 `renderMs` 0.12~0.15 ms），换 WebGPU
+    换不到 fps。真要上须换 Skia 引擎（Ganesh **无** WebGPU 后端 ⇒ 迁 **Graphite + Dawn**）+ 为
+    wasm32 拉 Dawn 重编 + 升级 Emscripten（现 3.1.44）+ 新增第三个 Stage3D 后端；且 WebGPU 用
+    **WGSL**，与原生着色器直通在 web 侧的目标 GLSL ES 不同路。判定依据与重启的量化触发条件
+    见 `TODO.md` 阶段八十九·二十九（WebGPU 判定复核）。
 
 ## 7. 工具链复用
 

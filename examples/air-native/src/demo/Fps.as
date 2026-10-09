@@ -26,10 +26,10 @@ package demo {
       text = new TextField();
       text.width = 420;
       //text.autoSize = TextFieldAutoSize.LEFT;
-      text.height = 20;
+      text.height = 18;
       text.background = true;
       text.backgroundColor = 0x000033;
-      text.defaultTextFormat = new TextFormat("_sans", 11, 0xffff00);
+      text.defaultTextFormat = new TextFormat("_sans", text.height / 2, 0xffff00);
       text.mouseEnabled = false;
       addChild(text);
 

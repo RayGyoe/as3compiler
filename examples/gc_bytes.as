@@ -122,9 +122,13 @@ for (var r:int = 0; r < 20; r++) {
   System.gc();
 }
 live.position = 0;
-expect(live.readInt() == 0x0A0B0C0D, "a live ByteArray keeps its first word across collections (got " + live.readInt() + ")");
+// Capture the word once: re-reading it inside the message would run off the end
+// (AIR throws EOFError #2030 there -- measured on adl 51.4.1).
+var firstWord:int = live.readInt();
+expect(firstWord == 0x0A0B0C0D, "a live ByteArray keeps its first word across collections (got " + firstWord + ")");
 live.position = 4 * 24999;
-expect(live.readInt() == 0x0A0B0C0D + 24999, "a live ByteArray keeps its last word (got " + live.readInt() + ")");
+var lastWord:int = live.readInt();
+expect(lastWord == 0x0A0B0C0D + 24999, "a live ByteArray keeps its last word (got " + lastWord + ")");
 expect(live2.getPixel(0, 0) == 0x010203, "a live BitmapData keeps its first pixel (got " + live2.getPixel(0, 0) + ")");
 expect(live2.getPixel(10, 20) == 0xABCDEF, "a live BitmapData keeps a middle pixel (got " + live2.getPixel(10, 20) + ")");
 expect(live2.getPixel(511, 511) == 0x123456, "a live BitmapData keeps its last pixel (got " + live2.getPixel(511, 511) + ")");

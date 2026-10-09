@@ -1,0 +1,42 @@
+# Regression gate.
+#
+# The suite is `node test.ts`: the example end-to-end layer (compile -> link ->
+# run every example under examples/) plus the unit groups in test/unit/*, both as
+# node:test cases. Until now nothing ran it automatically — the 500+ assertions
+# only helped when someone remembered to type the command, which is exactly how a
+# broken trunk survives.
+#
+# Runner choice: arm64 macOS. The vendored third-party libs (vendor/sdl2,
+# vendor/skia) ship macOS arm64 artifacts only and the window backends are
+# Cocoa/Metal; the default link line also carries `-l iconv` (a macOS libiconv),
+# which an Ubuntu runner does not provide. macos-14 is arm64 and is the faithful
+# environment.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: macos-14
+    # The full example suite compiles + links + runs every example; it is minutes,
+    # not seconds. A compiler regression that hangs is bounded by this.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node >= 22.6 is required: src/ is run as .ts directly through Node's
+      # native type-stripping (no build step, no third-party test framework).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Full regression (examples + unit groups)
+        run: node test.ts

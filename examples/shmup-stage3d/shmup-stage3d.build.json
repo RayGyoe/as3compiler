@@ -10,7 +10,8 @@
   ],
   "include-paths": [
     "../../vendor/skia",
-    "../../vendor/sdl2/arm64/include"
+    "../../vendor/sdl2/arm64/include",
+    "../../vendor/curl/include"
   ],
   "link-libs": [
     "skia",
@@ -37,11 +38,14 @@
     "zlib",
     "z",
     "SDL2",
-    "objc"
+    "objc",
+    "curl",
+    "nghttp2"
   ],
   "link-paths": [
     "../../vendor/skia/lib/macos-arm64",
-    "../../vendor/sdl2/arm64/lib"
+    "../../vendor/sdl2/arm64/lib",
+    "../../vendor/curl/lib/macos-arm64"
   ],
   "frameworks": [
     "CoreFoundation",
@@ -57,6 +61,8 @@
     "IOKit",
     "Metal",
     "QuartzCore",
+    "Security",
+    "SystemConfiguration",
     "Foundation"
   ],
   "defines": [
@@ -64,8 +70,10 @@
     "ASC_USE_WINDOW=1",
     "ASC_DISPLAY_HIGH=1",
     "ASC_RENDER_METAL=1",
+    "ASC_HAVE_CURL=1",
     "ASC_RENDER_STAGE3D=1",
     "ASC_RENDER_DEPTH_STENCIL=1"
   ],
+  "features": [],
   "objects": []
 }

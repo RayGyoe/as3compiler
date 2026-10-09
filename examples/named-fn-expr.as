@@ -22,11 +22,24 @@ check(peek() == 2, "body-local name usable inside its own body");
 check(shadowed == 1, "outer name of the same spelling is unaffected, got " + shadowed);
 
 // --- 4) the shape Starling/AIR code uses: named callbacks passed as arguments ---
+// A Function value is arity-checked at the call: AIR raises #1063 when a closure
+// is invoked with fewer arguments than its declared parameter list (measured on
+// adl 51.4.1, temp/pkgA/arity + arity2: 'Expected <required>, got <argc>').
 var log:String = "";
 var run:Function = function run(onDone:Function):void { onDone(); };
 run(function onComplete():void { log += "C"; });
-run(function onError(e:Error):void { log += "E"; });
-check(log == "CE", "named callbacks as arguments, got '" + log + "'");
+// A callback that declares a parameter must RECEIVE it: 'onError()' below would
+// be #1063, so the caller passes the Error it promised.
+var handle:Function = function handle(onErr:Function):void { onErr(new Error("boom")); };
+handle(function onError(e:Error):void { log += "E" + (e.errorID == 0 ? "!" : "?"); });
+check(log == "CE!", "named callbacks as arguments, got '" + log + "'");
+
+// --- 4b) the mismatched call is an error, and nothing of the callback runs ---
+var caught:String = "";
+try { run(function onBad(e:Error):void { log += "B"; }); }
+catch (e:Error) { caught = "" + e.errorID; }
+check(caught == "1063", "a 0-arg call of a 1-param callback raises #1063, got '" + caught + "'");
+check(log == "CE!", "the aborted call added nothing, got '" + log + "'");
 
 // --- 5) the name is reachable from a nested closure inside the body ---
 var deep:Function = function d(n:int):int {

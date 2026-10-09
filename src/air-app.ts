@@ -35,6 +35,10 @@ export interface AirAppInfo {
   displayResolution: string;
   renderMode: string;
   depthAndStencil: boolean;
+  // <architecture> — the bit width of the Windows captive app, "32" or "64".
+  // AIR's default is 32 when the element is absent (airsdk.dev
+  // application#architecture), so that is what a descriptor without it means.
+  architecture: string;
   fonts: EmbedFont[];
 }
 
@@ -142,6 +146,23 @@ function detectText(asFiles: string[]): boolean {
   return false;
 }
 
+// Audio (flash.media) is delivered by a backend the build layer chooses, exactly
+// like the network transport: vendor/audio_glue.c (miniaudio) is compiled into
+// the app and ASC_HAVE_AUDIO turns the as_audio_* seam from "no backend" into a
+// real device. The generated C is byte-identical either way — without the define
+// play() honestly returns null and areSoundsInaccessible() is true rather than
+// pretending to play (src/runtime.ts).
+function detectAudio(asFiles: string[]): boolean {
+  for (const f of asFiles) {
+    try {
+      if (readFileSync(f, 'utf8').includes('flash.media')) return true;
+    } catch {
+      // unreadable file: skip
+    }
+  }
+  return false;
+}
+
 // Extract the text of a single element by name (no nested same-name elements in
 // the AIR descriptor subset we read).
 function childText(xml: string, name: string): string | null {
@@ -167,11 +188,20 @@ function parseEmbedFonts(xml: string): EmbedFont[] {
 }
 
 export function parseAirApp(xml: string): AirAppInfo {
-  const id = childText(xml, 'id') ?? '';
-  const versionNumber = childText(xml, 'versionNumber') ?? '';
-  const filename = childText(xml, 'filename') ?? '';
+  // Comments are dropped before any element is read. They are legal anywhere in
+  // an AIR descriptor, and the SDK's own descriptor template comments whole
+  // element examples out (`<!-- <width></width> -->`, `<!-- <visible></visible> -->`,
+  // `<!-- <renderMode></renderMode> -->` …). childText matches with a plain regex,
+  // so a tag name spelled inside a comment would be read as a live element: an
+  // empty <width> then parses to NaN and trips the width/height check below, i.e.
+  // a descriptor AIR accepts verbatim would be rejected here. Comments carry no
+  // descriptor data, so comment-free descriptors parse exactly as before.
+  const doc = xml.replace(/<!--[\s\S]*?-->/g, '');
+  const id = childText(doc, 'id') ?? '';
+  const versionNumber = childText(doc, 'versionNumber') ?? '';
+  const filename = childText(doc, 'filename') ?? '';
 
-  const iw = xml.match(/<initialWindow\b[^>]*>([\s\S]*?)<\/initialWindow>/);
+  const iw = doc.match(/<initialWindow\b[^>]*>([\s\S]*?)<\/initialWindow>/);
   const iwXml = iw ? iw[1] : '';
   const content = childText(iwXml, 'content') ?? '';
   const title = childText(iwXml, 'title') ?? '';
@@ -192,12 +222,21 @@ export function parseAirApp(xml: string): AirAppInfo {
   // content loads (required for Context3D.configureBackBuffer's matching
   // enableDepthAndStencil flag). Only valid when renderMode is direct/gpu.
   const depthAndStencil = (childText(iwXml, 'depthAndStencil') ?? 'false').toLowerCase() === 'true';
+  // <architecture> is a direct child of <application>, NOT of <initialWindow>,
+  // and it exists for the Windows captive app only: it picks 32- or 64-bit. AIR's
+  // documented default is 32 — which is also what the project's own descriptor
+  // carries. Any other value is a descriptor AIR itself rejects, so it is an
+  // error rather than a silently-ignored fallback (§2.5).
+  const architectureStr = (childText(doc, 'architecture') ?? '32').trim();
+  if (architectureStr !== '32' && architectureStr !== '64') {
+    throw new AirAppError(`air-app.xml <architecture> must be "32" or "64" (got "${architectureStr}")`);
+  }
 
   const visible = visibleStr.toLowerCase() !== 'false';
   const resizable = resizableStr.toLowerCase() !== 'false';
   const width = parseInt(widthStr, 10);
   const height = parseInt(heightStr, 10);
-  const fonts = parseEmbedFonts(xml);
+  const fonts = parseEmbedFonts(doc);
 
   if (!id || !filename) {
     throw new AirAppError('air-app.xml is missing <id> or <filename>');
@@ -205,7 +244,7 @@ export function parseAirApp(xml: string): AirAppInfo {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     throw new AirAppError('air-app.xml <initialWindow> width/height must be positive integers');
   }
-  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, fonts };
+  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, architecture: architectureStr, fonts };
 }
 
 // Short name of a fully-qualified class: `demo.Main` -> `Main`.
@@ -259,7 +298,7 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
 // the wasm build of Skia, with no SDL2/objc/Cocoa — those are native-only and wasm-ld
 // cannot find them (`-lobjc`). The AIR <initialWindow> visible/resizable/highdpi
 // flags still shape defines, but the window-backend specifics differ per target.
-export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, depthAndStencil: boolean, fonts: EmbedFont[], preloadPaths: string[], preloadExcludes: string[], appFontUrls: string[], usesNetworking: boolean, features: string[] = []): Record<string, unknown> {
+export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, depthAndStencil: boolean, fonts: EmbedFont[], preloadPaths: string[], preloadExcludes: string[], appFontUrls: string[], usesNetworking: boolean, usesAudio: boolean, architecture: string, features: string[] = []): Record<string, unknown> {
   // Browser backend: skia_glue.cc + web_glue.cc, the wasm Skia library set, no
   // SDL2/Cocoa/frameworks. Mirrors examples/web/hello-web.build.json. The wasm
   // Skia build omits the native-only animation/image codecs (skottie/svg/...), so
@@ -348,7 +387,31 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   const skiaSrc = `${vendorRel}/skia_glue.cc`;
   const winSrc = `${vendorRel}/window_glue.cc`;
   const mtlSrc = `${vendorRel}/metal_glue.mm`;
+  const d3dSrc = `${vendorRel}/d3d_glue.cc`;
   const sources = visible ? [skiaSrc, winSrc] : [skiaSrc];
+
+  // ---- Native platform profile -------------------------------------------------
+  // The native app is built for the host OS: there is no cross-compilation, because
+  // the vendor libraries themselves are host artifacts (build-windows-deps.ps1
+  // writes windows-<arch> on Windows, build-static.sh writes macos-arm64 on macOS).
+  // So the running compiler's platform IS the target's.
+  //   * macOS   — flat `macos-arm64` directories, Cocoa/Metal frameworks, libobjc;
+  //   * Windows — `windows-<arch>` directories (built by build-windows-deps.ps1,
+  //     named after AIR's own wording), D3D12/Win32 system libraries, and NO
+  //     `-framework` at all (that flag does not exist in lld-link).
+  // <architecture> chooses x64 vs x86 on Windows and is inert elsewhere.
+  // What DOES need care: the `-l` stems. gn names an archive `<target>.lib` on
+  // Windows but `lib<target>.a` on POSIX, while clang resolves `-l<stem>` to
+  // `<stem>.lib` on the MSVC target and `lib<stem>.a` on macOS. So every target
+  // whose NAME already starts with `lib` needs the prefix spelled out on Windows
+  // only: target `libpng` is reached by `-lpng` on macOS but `-llibpng` on Windows
+  // (its file is `libpng.lib`). Measured, not guessed: `gn gen` with
+  // target_os="win" emits `build libpng: phony ./libpng.lib` and
+  // `build skia: phony ./skia.lib`.
+  const onWin = process.platform === 'win32';
+  const winArch = architecture === '32' ? 'x86' : 'x64';
+  const libDir = onWin ? `windows-${winArch}` : 'macos-arm64';
+  const sdlDir = onWin ? `windows-${winArch}` : 'arm64';
   const defines = visible ? ['ASC_USE_SKIA=1', 'ASC_USE_WINDOW=1'] : ['ASC_USE_SKIA=1'];
   // ASC_WINDOW_FIXED mirrors AIR's <resizable>false</resizable>: the window is
   // created without SDL_WINDOW_RESIZABLE, matching adl's fixed-size window.
@@ -357,33 +420,82 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // for a native-resolution drawable and the offscreen surface is sized in physical
   // pixels, so text is not stretched by the compositor (the "blurry" symptom).
   if (visible && highDpi) defines.push('ASC_DISPLAY_HIGH=1');
-  // <renderMode> direct/gpu maps to the native Metal backend (ASC_RENDER_METAL):
-  // the window's Skia composition runs on the GPU through GrDirectContext(Metal)
-  // + SDL_Metal_CreateView/CAMetalLayer instead of the CPU raster surface + SDL
-  // blit. The Metal glue (metal_glue.mm) is Objective-C++, so it is added to the
-  // source set only when the GPU path is requested. Offscreen PNG export and
-  // cacheAsBitmap stay CPU-raster regardless (Metal drawables are one-shot and
-  // cannot back a persistent offscreen surface).
+  // `linkLibs` is declared here, before every `linkLibs.push` below: the <renderMode>
+  // block a few lines down pushes the GPU backend's libraries, and a `const` in
+  // the temporal dead zone would throw the moment that branch runs. The macOS
+  // branch only pushes `defines`/`sources`, so this ordering trap is invisible on
+  // macOS and only fires on Windows — it was caught by running the real pipeline
+  // with process.platform faked to "win32".
+  // `winLib` spells out the `lib` prefix for the third-party targets whose name
+  // already carries it (png/jpeg/webp/webp_sse41 are literally named `lib*` in
+  // Skia's BUILD.gn), because their Windows archive is `libpng.lib` etc.
+  const winLib = (name: string): string => (onWin ? `lib${name}` : name);
+  const linkLibs: string[] = [
+    'skia', 'skparagraph', 'skshaper', 'skunicode', 'skottie', 'sksg', 'svg',
+    'skresources', 'bentleyottmann', 'skcms', 'wuffs',
+    winLib('png'), winLib('jpeg'), winLib('webp'), winLib('webp_sse41'),
+    'dng_sdk', 'piex', 'expat', 'freetype2', 'harfbuzz', 'icu',
+    'zlib',
+  ];
+  // <renderMode> direct/gpu maps to the native window-on-GPU backend. The switch
+  // the *generated C* and window_glue.cc key off is ASC_RENDER_WINGPU, which is
+  // backend-neutral ("this window's Skia composition runs on the GPU"); the
+  // concrete backend is then named by ASC_RENDER_METAL (macOS, Objective-C++
+  // metal_glue.mm + SDL_Metal_CreateView/CAMetalLayer) or ASC_RENDER_D3D (Windows,
+  // C++ d3d_glue.cc + our own ID3D12 swapchain on the SDL window's HWND). Splitting
+  // the two keeps the generated C and the window glue free of per-backend branches.
+  // Whichever backend is picked replaces the CPU raster surface + SDL blit for the
+  // window; offscreen PNG export and cacheAsBitmap stay CPU-raster regardless (GPU
+  // window surfaces are frame-scoped and cannot back a persistent offscreen one).
+  // Under <renderMode>auto the glue decides at runtime from what is actually linked
+  // (see window_glue.cc): no ASC_RENDER_WINGPU means the GPU path is not compiled
+  // in at all.
   const gpu = renderMode === 'direct' || renderMode === 'gpu';
   if (visible && gpu) {
-    defines.push('ASC_RENDER_METAL=1');
-    sources.push(mtlSrc);
+    defines.push('ASC_RENDER_WINGPU=1');
+    if (onWin) {
+      defines.push('ASC_RENDER_D3D=1');
+      sources.push(d3dSrc);
+      // Skia's Ganesh D3D12 backend lists these three as its own link libraries
+      // (Skia BUILD.gn, `if (skia_use_direct3d)`); an import-lib consumer of that
+      // static archive must resolve them too.
+      linkLibs.push('d3d12', 'dxgi', 'd3dcompiler');
+      // The D3D backend's allocator lives in its own archive: Skia's
+      // `deps += [ //third_party/d3d12allocator ]` builds a separate target, so
+      // skia.lib carries undefined D3D12MemAlloc* symbols. On macOS the
+      // equivalent Metal backend needs no extra archive, which is why this is
+      // Windows-only. (Confirmed in the gn-generated Windows build.ninja:
+      // `build d3d12allocator: phony ./d3d12allocator.lib`.)
+      linkLibs.push('d3d12allocator');
+    } else {
+      defines.push('ASC_RENDER_METAL=1');
+      sources.push(mtlSrc);
+    }
   }
-  const linkLibs = [
-    'skia', 'skparagraph', 'skshaper', 'skunicode', 'skottie', 'sksg', 'svg',
-    'skresources', 'bentleyottmann', 'skcms', 'wuffs', 'png', 'jpeg', 'webp',
-    'webp_sse41', 'dng_sdk', 'piex', 'expat', 'freetype2', 'harfbuzz', 'icu',
-    'zlib', 'z',
-  ];
-  const includePaths = [`${vendorRel}/skia`, `${vendorRel}/sdl2/arm64/include`];
-  const linkPaths = [`${vendorRel}/skia/lib/macos-arm64`, `${vendorRel}/sdl2/arm64/lib`];
-  const frameworks = [
+  // `z` is the macOS *system* zlib (libz.dylib, reached as z.lib there). Windows
+  // ships no such library — Skia's own `zlib` target above is what resolves there.
+  if (!onWin) linkLibs.push('z');
+  const includePaths = [`${vendorRel}/skia`, `${vendorRel}/sdl2/${sdlDir}/include`];
+  const linkPaths = [`${vendorRel}/skia/lib/${libDir}`, `${vendorRel}/sdl2/${sdlDir}/lib`];
+  const frameworks = onWin ? [] : [
     'CoreFoundation', 'CoreGraphics', 'CoreText', 'CoreServices',
     'ApplicationServices', 'ImageIO', 'Accelerate',
   ];
   if (visible) {
-    linkLibs.push('SDL2', 'objc');
-    frameworks.push('CoreVideo', 'Cocoa', 'Carbon', 'IOKit', 'Metal', 'QuartzCore');
+    linkLibs.push('SDL2');
+    if (onWin) {
+      // SDL2 is linked statically, so every Win32/COM import lib its backends
+      // reference is ours to supply (SDL2's own CMakeLists puts these in
+      // INTERFACE_LINK_LIBRARIES for the static build; with a bare archive we
+      // restate them). Direct3D/DXGI come from the <renderMode> branch above.
+      linkLibs.push('user32', 'gdi32', 'winmm', 'imm32', 'ole32', 'oleaut32',
+                    'version', 'uuid', 'advapi32', 'setupapi', 'shell32', 'dinput8');
+    } else {
+      // libobjc is the NSWindow border shim in window_glue.cc (SDL_GetWindowBordersSize
+      // is unimplemented by the Cocoa driver); there is no libobjc on Windows.
+      linkLibs.push('objc');
+      frameworks.push('CoreVideo', 'Cocoa', 'Carbon', 'IOKit', 'Metal', 'QuartzCore');
+    }
   }
   // Network transport (flash.net / a remote Loader.load): link the static curl
   // built into vendor/curl by build-tools/curl-src/build-static.sh and define
@@ -396,10 +508,18 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // framing library (only exercised when ASC_HTTP2 is also defined).
   if (usesNetworking) {
     includePaths.push(`${vendorRel}/curl/include`);
-    linkPaths.push(`${vendorRel}/curl/lib/macos-arm64`);
+    linkPaths.push(`${vendorRel}/curl/lib/${libDir}`);
     linkLibs.push('curl', 'nghttp2');
     defines.push('ASC_HAVE_CURL=1');
-    frameworks.push('Security', 'SystemConfiguration');
+    if (onWin) {
+      // curl was built with CURL_USE_SCHANNEL (Windows TLS, the counterpart of
+      // macOS SecureTransport): Schannel itself, the Winsock stack its threaded
+      // resolver uses, and the CNG/CryptoAPI entry points it calls. nghttp2 is
+      // linked above like on macOS.
+      linkLibs.push('crypt32', 'ws2_32', 'secur32', 'bcrypt', 'iphlpapi');
+    } else {
+      frameworks.push('Security', 'SystemConfiguration');
+    }
   }
   // Stage3D (flash.display3D): link the offscreen Metal triangle pipeline
   // (stage3d_glue.mm) and define ASC_RENDER_STAGE3D so the as_s3d_* wrappers stop
@@ -408,6 +528,23 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // its own backend (stage3d_webgl.cc, WebGL2) wired the same way in the `web`
   // branch above.
   if (usesStage3D) {
+    // Stage3D needs a *per-backend* shader pipeline: stage3d_glue.mm translates
+    // AGAL to MSL and drives Metal, stage3d_webgl.cc emits GLSL ES for WebGL2. A
+    // third one (AGAL -> HLSL on D3D12) does not exist yet, so on Windows this is
+    // refused outright rather than wired to the *.mm above (which cannot compile
+    // there) or left unwired: ASC_RENDER_STAGE3D absent turns every as_s3d_*
+    // wrapper into a no-op, i.e. a black stage with a 2D overlay -- exactly the
+    // "compiles but the result is wrong" outcome AGENTS.md 2.5 forbids. This is
+    // the one blocker between a Windows build of the Starling demo and a window
+    // that draws it; registered in TODO.md.
+    if (onWin) {
+      throw new AirAppError(
+        'Stage3D on the Windows native backend is not implemented yet: it needs an ' +
+        'AGAL -> HLSL pipeline (vendor/stage3d_d3d.cc) alongside stage3d_glue.mm ' +
+        '(Metal) and stage3d_webgl.cc (WebGL2). Build with --target wasm, or remove ' +
+        'the Stage3D usage, until that backend lands (see TODO.md).'
+      );
+    }
     sources.push(`${vendorRel}/stage3d_glue.mm`);
     defines.push('ASC_RENDER_STAGE3D=1');
     // <depthAndStencil>true</depthAndStencil> allocates the depth/stencil buffer at
@@ -419,6 +556,19 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
     if (depthAndStencil) defines.push('ASC_RENDER_DEPTH_STENCIL=1');
     if (!frameworks.includes('Metal')) frameworks.push('Metal');
     if (!frameworks.includes('Foundation')) frameworks.push('Foundation');
+  }
+  // Audio (flash.media, see detectAudio): compile vendor/audio_glue.c into the app
+  // and define ASC_HAVE_AUDIO, which is what turns the as_audio_* seam from "no
+  // backend" into a real CoreAudio device (src/runtime.ts). The glue carries the
+  // 4 MB MINIAUDIO_IMPLEMENTATION in its own translation unit, so the generated C
+  // stays a single readable file. CoreAudio/AudioToolbox are miniaudio's macOS
+  // backend; CoreFoundation is already in the list above.
+  if (usesAudio) {
+    sources.push(`${vendorRel}/audio_glue.c`);
+    defines.push('ASC_HAVE_AUDIO=1');
+    for (const fw of ['CoreAudio', 'AudioToolbox']) {
+      if (!frameworks.includes(fw)) frameworks.push(fw);
+    }
   }
   return {
     target: 'native',
@@ -623,6 +773,7 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // never wrote. The failure is explicit and one command away from fixed, which
   // is the §2.5 rule applied to the build layer rather than the frontend.
   const usesNetworking = detectNetworking(asFiles);
+  const usesAudio = detectAudio(asFiles);
   if (usesNetworking && !web && !existsSync(resolve(vendorAbs, 'curl', 'include', 'curl', 'curl.h'))) {
     throw new AirAppError(
       `this app uses flash.net / URLRequest, so its build must link the HTTP transport, but the static curl tree is missing:\n` +
@@ -638,6 +789,18 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // previews correctly in every other respect (layout, bitmaps), and failing the
   // build would not make the font appear.
   const warnings: string[] = [];
+  // A web build has no audio backend yet (the glue's miniaudio build is
+  // CoreAudio/AudioToolbox, native-only). The wasm side keeps answering honestly
+  // — play() null, areSoundsInaccessible() true — so this is a missing capability,
+  // not a wrong result; §1.5 says name it rather than let it be discovered at
+  // runtime. Not a hard error: the app is complete in every other respect.
+  if (web && usesAudio) {
+    warnings.push(
+      `this app uses flash.media, but the web build has no audio backend yet, so nothing will play:\n` +
+      `  play() returns null and SoundMixer.areSoundsInaccessible() is true (the app can branch on it)\n` +
+      `  native builds link the CoreAudio backend automatically; see docs/zh-cn/audio.md`
+    );
+  }
   if (web && fontUrls.length === 0 && detectText(asFiles)) {
     warnings.push(
       `this app draws text (flash.text) but its web build resolves no font, so every TextField will render blank:\n` +
@@ -664,7 +827,7 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   const effectiveFeatures = features ?? persistedFeatures;
   const keptFromManifest = features === null && persistedFeatures.length > 0;
 
-  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, effectiveFeatures), null, 2) + '\n');
+  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, usesAudio, info.architecture, effectiveFeatures), null, 2) + '\n');
   if (keptFromManifest) {
     // Not silent (§1.5): the artifact about to be built is NOT an AIR-identical
     // default, and the reason is a setting from a previous run.

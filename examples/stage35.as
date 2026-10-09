@@ -3,10 +3,20 @@
 var stage:Stage = new Stage();
 
 // --- hit test picks the deepest child, then bubbles to ancestors ---
+// Stage 94·5 made `width`/`height` real derived accessors (AIR semantics: they
+// measure the CONTENT, and assigning them SCALES). An empty Sprite therefore has
+// no extent — and assigning a size to one collapses its scale to 0 — so each hit
+// target now paints its own rectangle through the new Sprite.graphics.
 var outer:Sprite = new Sprite();
-outer.x = 0; outer.y = 0; outer.width = 200; outer.height = 200;
+outer.x = 0; outer.y = 0;
+outer.graphics.beginFill(0x3366CC);
+outer.graphics.drawRect(0, 0, 200, 200);
+outer.graphics.endFill();
 var inner:Sprite = new Sprite();
-inner.x = 50; inner.y = 50; inner.width = 100; inner.height = 100;
+inner.x = 50; inner.y = 50;
+inner.graphics.beginFill(0x66CC33);
+inner.graphics.drawRect(0, 0, 100, 100);
+inner.graphics.endFill();
 stage.addChild(outer);
 outer.addChild(inner);
 
@@ -17,10 +27,16 @@ stage.dispatchMouse(100, 100, "click");
 
 // --- mouseChildren=false absorbs the child's click (target becomes parent) ---
 var p:Sprite = new Sprite();
-p.x = 0; p.y = 0; p.width = 100; p.height = 100;
+p.x = 0; p.y = 0;
+p.graphics.beginFill(0x3366CC);
+p.graphics.drawRect(0, 0, 100, 100);
+p.graphics.endFill();
 p.mouseChildren = false;
 var child:Sprite = new Sprite();
-child.x = 10; child.y = 10; child.width = 50; child.height = 50;
+child.x = 10; child.y = 10;
+child.graphics.beginFill(0x66CC33);
+child.graphics.drawRect(0, 0, 50, 50);
+child.graphics.endFill();
 p.addChild(child);
 child.addEventListener("click", function(e:MouseEvent):void { trace("child SHOULD NOT fire"); });
 p.addEventListener("click", function(e:MouseEvent):void { trace("parent absorbs, target is p:", e.target == p); });
@@ -30,7 +46,10 @@ stage.dispatchMouse(20, 20, "click");
 
 // --- visible=false is skipped by the hit test (exclusive coordinates) ---
 var hidden:Sprite = new Sprite();
-hidden.x = 500; hidden.y = 500; hidden.width = 10; hidden.height = 10;
+hidden.x = 500; hidden.y = 500;
+hidden.graphics.beginFill(0xCC3333);
+hidden.graphics.drawRect(0, 0, 10, 10);
+hidden.graphics.endFill();
 hidden.visible = false;
 hidden.addEventListener("click", function(e:MouseEvent):void { trace("hidden SHOULD NOT fire"); });
 stage.addChild(hidden);

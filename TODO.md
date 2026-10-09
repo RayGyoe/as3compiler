@@ -6,7 +6,7 @@
 
 ---
 
-## 当前状态（v0.4.25）
+## 当前状态（v0.4.52）
 
 > 下面这段是**早期子集**（阶段一~十三）的能力摘要，现仍准确但已远非全集；完整能力面见
 > [`README-CN.md`](README-CN.md) 的「支持子集」与路线图里 阶段三十三 之后的各阶段条目
@@ -1456,6 +1456,7 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 - [x] `flash.net`：**URLLoader**（`load()`/`data`/`close`，异步本地文件读取（COMPLETE/IO_ERROR 下一帧 tick），`data` 为 GC 跟踪字符串）、**URLVariables**（`dynamic class`，未声明字符串键属性 + `toString()` 序列化）、**URLRequest**（`url`/`method`/`data`/`contentType`）
 - [ ] `flash.media`：**Sound**（`load`/`play`，依赖后端解码）、**SoundChannel**、**Video**（延后：音频/视频解码后端）
+  - **2026-10-06 音频调研完成并立项**（[`docs/zh-cn/audio.md`](docs/zh-cn/audio.md) / [`docs/en/audio.md`](docs/en/audio.md)，**阶段九十六**）：现状是阶段九十三留下的**空壳**（`play()` 恒返回空 `SoundChannel`、`loadCompressedDataFromByteArray`/`stop` 为 no-op），全仓无音频后端与解码器。**关键实测**：vendored SDL2 未编 CoreAudio（`libSDL2.a` 只含 `SDL_dummyaudio.o`，`nm` 零 AudioUnit 符号）⇒ `SDL_OpenAudioDevice` 会成功返回但**永不发声**，故后端点需另选。已裁决后端 = **miniaudio**（单头文件、一处覆盖 CoreAudio + Emscripten Web Audio、内置 MP3 解码）、范围 = **A~D 全量**（`[Embed]` 缺口独立延后）。属**补遗留**非增强。
 - [x] `flash.ui`：**Keyboard**（键码常量子集 + `isAccessible`）、**Mouse**（静态 `hide`/`show` + 只读 `cursor`/`supportsCursor`/`supportsNativeCursor`）
 
 **验收**：`examples/stage63.as`（离屏）断言 `URLRequest` 值束与默认 `method`、`URLLoader` 异步读文件成功/失败两路事件（`tickTimers()` 泵）、`URLVariables` 动态属性 + `toString()`、`Keyboard` 键码常量与 `isAccessible`、`Mouse` 静态方法。✅（73 passed / 0 failed；
@@ -1466,7 +1467,7 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 **依据**：AIR 是 Flash 之外最大的独立命名空间，完全独立于显示/事件体系，重活且工作量大，排最后。
 
-- [ ] **Window**/**NativeWindow**（对应 `window_glue.cc` 的多窗口/原生窗口管理，延后：原生多窗口与 Stage/SDL2 单窗口模型重叠）
+- [ ] **Window**/**NativeWindow**（对应 `window_glue.cc` 的多窗口/原生窗口管理，**2026-10-02 已实现**——多窗口运行时注册表、每窗独立 `Stage` 与 `Event.CLOSE` 见 **阶段八十九·七十一**，其关闭窗口崩溃的布局缺陷见 **阶段八十九·七十二**；`Window`（`flash.desktop` 的包装）仍延后）
 - [x] **File**/**FileStream**（`open`/`openAsync`（异步 PROGRESS+COMPLETE）/`read`/`write`，POSIX 文件 IO；静态目录 `applicationDirectory`/`desktopDirectory`/`documentsDirectory`/`userDirectory`）/ **FileMode**（常量）
 - [ ] **SQLConnection**/**SQLStatement**（依赖 SQLite 链接，延后）
 
@@ -2195,12 +2196,12 @@ HUD `457 created 1720 reused FPS 80`，且 `sprite.rotation += 0.1` 复合成赋
 | `Error` 子类 `super(message, id)` 二参 | symbols `Error`/`TypeError`/`RangeError`/`ArgumentError`/`SyntaxError`/`ReferenceError` 补第二可选参 `id`；emit 所有 `*_new`/`*_ctor` 调用点补 `id` 实参（13 处硬编码 `_new` 调用 + 3 处 `throw`） |
 
 **语义红线（关键坑）**：
-- `\|\|=`/`&&=` 必须排在 `\|\|`/`&&` 之前：`MULTI_SYMBOLS` 顺序匹配，`\|\|` 在前会把 `\|\|=` 抢先拆成 `\|\|` + `=` → `unexpected token '='`。
+- `||=`/`&&=` 必须排在 `||`/`&&` 之前：`MULTI_SYMBOLS` 顺序匹配，`||` 在前会把 `||=` 抢先拆成 `||` + `=` → `unexpected token '='`。
 - 全限定名需归一化：classMap key 是 `sanitizePkg` 后的下划线 FQN（`flash_display3D_textures_Texture`），点分名是 `flash.display3D.textures.Texture`，`resolveType` 不做归一化则 `hasClass` 恒失败 → `unknown class`。
 - `for each` 无 `var` 迭代进 module 变量时，C 名必须是 `g_x`（`emitVar` 返回）而非 `x`（`cIdent`），否则 `undeclared identifier`。
 - namespace 透明化后 `ns::method()` → 普通方法调用、`Class.ns::static()` → 静态调用，无运行时可见性语义（AOT 编译期已定序，符合 AS3 编译期解析命名空间的本质）。
 
-**验收**：新增 `examples/stage88.as`（9 特性全覆盖：字符串键 / `\|\|=`·`&&=` / for each 无 var / `:*=` / `new <T>[]` / Error 二参 /
+**验收**：新增 `examples/stage88.as`（9 特性全覆盖：字符串键 / `||=`·`&&=` / for each 无 var / `:*=` / `new <T>[]` / Error 二参 /
 super.property / 全限定名 / namespace 三形态）；回归全量 89 passed / 0 failed；版本号 v0.3.98 → v0.3.99。
 
 ---
@@ -2223,7 +2224,7 @@ super.property / 全限定名 / namespace 三形态）；回归全量 89 passed 
 | 接口 getter `function get targetBounds():T;` | AST `InterfaceMethod` 加 `isGetter`/`isSetter` 字段；symbols 接口方法保留标记，接口实现验证时 getter 查 `info.getters`、setter 查 `info.setters`；emit `emitInterfaceVtables` 对 getter 生成 `Class_get_name`、setter 生成 `Class_set_name` 槽位 |
 
 **语义红线（关键坑）**：
-- `===`/`!==` 必须排在 `==`/`!=` 之前，否则 `===` 被抢先拆成 `==`+`=` → `unexpected token '='`（与 `\|\|=` 先于 `\|\|` 同款教训）。
+- `===`/`!==` 必须排在 `==`/`!=` 之前，否则 `===` 被抢先拆成 `==`+`=` → `unexpected token '='`（与 `||=` 先于 `||` 同款教训）。
 - 接口 getter 存于类的 `getters` map（非 `methods` map），接口实现验证与 vtable 槽位都必须按 `isGetter`/`isSetter` 分派查对应 map，否则 `class 'X' does not implement method 'y'` 误报。
 - `Vector.<T>` 是单态值类型，`as`/`is` 只能靠静态元素类型判断（无法从 boxed `any` 恢复元素类型），boxed 值一律判 false/NULL。
 
@@ -2305,7 +2306,7 @@ super.property / 全限定名 / namespace 三形态）；回归全量 89 passed 
 | 构造器字段默认值清空错（`o->_bounds = NULL`） | 字段默认初始化在 `super()` 之后发射，但 AS3 允许 `super()` 前有赋值语句（`Quad` 构造器先 `_bounds = new Rectangle(...)` 再 `super(...)`），默认值把先前赋值清空 | `gc_alloc` 已 memset 清零，非 `Number` 字段默认值（NULL/0/false）无需重写；仅 `Number`（NaN，非零位模式）在构造器最前（super 前）补 `= NAN`，字段**内联初始化器**仍在 super 后发射 |
 | `_parent \|\| _maskee` 被译成 C 布尔（SIGSEGV） | `emitBinary` 把 AS3 的 `&&`/`\|\|` 直接译成 C 布尔运算符，返回 `bool`；但 AS3（如 JS）的 `&&`/`\|\|` 返回**操作数值**（对象引用 `_parent \|\| _maskee` 返回第一个非 null 的 DisplayObject），C 布尔会把它折叠成 `bool` 再强转指针 | `emitBinary` 的 `&&`/`\|\|` 改发值语义三目：`a\|\|b → (cond(a)?a:b)`、`a&&b → (cond(a)?b:a)`，结果类型 `unifyType`；混合守卫惯用法（`bool && object`）两分支装箱为 `any`；`sequenceValueExpr` 对左操作数非纯时 hoist（避免三目里二次求值） |
 
-**语义红线（关键坑）**：AS3 `&&`/`\|\|` 返回操作数值而非布尔（对象引用的「null 合并」惯用法 `_parent \|\| _maskee` 不能译成 C 布尔）；方法调用接收者必须是单一求值（vtable 查找与 `this` 实参复用同一表达式会二次求值）；字段默认值在 `gc_alloc` memset 后已就位，只有 `Number` 的 NaN 需要显式补；`context3DCreate` 在 AIR 里是异步派发（下一帧），同步派发会打乱 `new Starling(...)` 后注册监听器的时序。
+**语义红线（关键坑）**：AS3 `&&`/`||` 返回操作数值而非布尔（对象引用的「null 合并」惯用法 `_parent || _maskee` 不能译成 C 布尔）；方法调用接收者必须是单一求值（vtable 查找与 `this` 实参复用同一表达式会二次求值）；字段默认值在 `gc_alloc` memset 后已就位，只有 `Number` 的 NaN 需要显式补；`context3DCreate` 在 AIR 里是异步派发（下一帧），同步派发会打乱 `new Starling(...)` 后注册监听器的时序。
 
 **遗留（下一阶段，E4X/XML 阻塞）**：demo 现已从白屏推进到 `ROOT_CREATED → loadAssets → onLoadProgress=1 → onLoadComplete`，随后在 `MainMenu` 构造 `new Button(Game.assets.getTexture("button"))` 抛 `Texture 'upState' cannot be null`——`button` 是 `atlas.png`+`atlas.xml` 的子纹理，其注册依赖 `TextureAtlas` 解析 `atlas.xml`（`new XML(bytes)` / `.localName()` / `xml.@imagePath` / 子节点遍历），而 E4X/XML 已立项为阶段九十~九十三（见 `docs/zh-cn/e4x.md`），尚未落地。这是下一步的既定工作，非本次白屏修复范畴。
 
@@ -2913,6 +2914,7 @@ MeshStyle 的 vtable 字写成 double，于是 `addMesh`/BENCH 探针在任意�
 - **产物干净**：出厂构建（不带 `-D ASC_FRAME_STATS`）的 `air-native.js` 中 `__ascFrameStats` 出现 **0 次**；页面加载后 `typeof window.__ascFrameStatsAll === 'undefined'`，而 canvas 正常渲染 2000×1360（`dpr=2`）、`document.title = "Native AS3 Demo"`。
 - 无回归：`node test.ts` **103 passed / 0 failed**。demo 源码、`air-native-app.xml`、`air-native.build.json` 均为原状（`git status` 只有预期内的 `air-native.js` 重建）。版本号 v0.3.124 → v0.3.125。
 - **口径定案（不升版本号）**：「跟随 vsync、帧率量化到刷新率整数分之一」与 native 阶段六十一/六十二 一脉相承，是**设计决策**而非待开发项——它与 AIR `adl` 的「`frameRate` 是逻辑帧率、FPS 读数不随显示器刷新率降低」口径**天然不同**，差异与理由已并入 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §3 决策分歧点（**维持现状**），不再在 `### 遗留待开发` 表中占位。
+- **WebGPU 判定复核（2026-10-08，v0.4.89 复核，结论维持 · 无代码改动、不升版本号）**：用户复问「web 版用 WebGL 是否支持 WebGPU、性能会更好吗」，逐项重测后**维持**上述判定，且被阶段八十九·三十一 **加强**。① **仍不支持**——wasm 版 Skia 未编任何 WebGPU 路径（`build-tools/skia-src/out/wasm/args.gn`：`skia_use_webgpu=false` / `skia_enable_graphite=false` / `skia_use_dawn=false` / `skia_use_webgl=true` / `skia_enable_ganesh=true`），二进制侧复核一致：`nm -g vendor/skia/lib/wasm/libskia.a | grep -c dawn` = **0**、`GrDirectContext` = 306（只有 Ganesh）；web 侧 `vendor/stage3d_webgl.cc` 的 webgpu 提及 = **0**，构建固定 `-s MAX_WEBGL_VERSION=2`（`src/build.ts:873`）。② **不会更快**——瓶颈是 rAF/面板刷新率而非渲染器：修后 GPU 路径 120 Hz 屏 **120 fps / 0 丢弃 / 单帧 0.113 ms = 帧预算 1.35%（余量 ≈74×）**，且阶段八十九·三十一 把 Stage3D 上屏改 GPU 直连后 `renderMs` **3.21 → 0.12~0.15 ms（≈23×）**；50 Hz 屏那行证明软件层越不过面板。WebGPU 的真实增量在**每 draw call 的 CPU 开销**与 **compute**（外部 A/B ≈3× / ≈50×；「轻量 2D 场景四大 API 几乎无差距」），与本仓负载画像不匹配。③ **真要上的代价**——不是换后端而是换 Skia 引擎：Ganesh **无** WebGPU 后端（只有 GL/Vulkan/Metal/D3D）⇒ 须迁到 **Graphite + Dawn**，并为 wasm32 拉 Dawn 重编 + 升级 Emscripten（现 **3.1.44**，其 WebGPU 支持不成熟） + 新增第三个 Stage3D 后端（`stage3d_webgpu.cc`）；且 WebGPU 用 **WGSL**，与增强项 E6 在 web 侧的目标 **GLSL ES** 不同路。**重启评估的量化触发条件（用 `renderMs` 量，不靠感觉）**：`renderMs` 逼近帧预算、或 draw call 涨到几千/帧且 CPU 受限、或出现需要 compute / 多线程录制的 AS3 负载。观察点（**非 WebGPU 机会**，文档已归因 demo 逻辑）：Starling `Benchmark` 在 web 上「对象数停在 0」。
 
 ---
 
@@ -4573,7 +4575,7 @@ AOT 侧由 `temp/httpstatus-aot/httpstatus-aot.as` 编译运行。
 > 改成 `ThreadingHTTPServer` + HTTP/1.0 并在每次测量前**健康检查**后才拿到全矩阵。
 > **仪器不可信时结论一定不可信**（与 §6.7.4 修 `netprobe2_server.py` 同一条教训）。
 
-#### 阶段八十九·六十三：多格式图片解码实测 —— E3（v0.4.18 → v0.4.19，零代码）
+#### 阶段八十九·六十三：多格式图片解码实测 —— E3（v0.4.18 → v0.4.19，零代码）  → **注意：其默认行为已于阶段九十四·二十五改为「默认拒绝 + `--features formats`」**
 
 **范围**：用户立项的 `### 增强待做` 第二梯队第一项。立项时记为「成本最低的一项，先实测」，
 实测结论就是**不需要写任何代码**。
@@ -4962,55 +4964,3094 @@ job 继续持有自己那份 malloc 缓冲、由 retire 释放。两条规则一
 
 ---
 
+#### 阶段八十九·七十一：AIR 多窗口 `NativeWindow` 家族 + `flash.display.Screen`（v0.4.25 → v0.4.26）
+
+**立项根据**：`examples/air-native` 新增的 `NtWindow.as`/`windowTest.as` 把「AIR 多窗口」从**从未立项**变成**硬编译阻塞**——
+`node ../../src/index.ts --air-app ./air-native-app.xml --target native` 直接报 `unknown superclass 'NativeWindow' of 'demo_windowTest'`，
+而 `mxmlc + adl 51.4.1` 能真的开出第二个窗口（截图存档）。按 AGENTS.md §1.5 判据（`adl` 能跑对、我们跑不出）这两项是**遗留**而非增强，
+原在 `### 遗留待开发`，本阶段**移出**并落地。
+
+**一、先采权威语义再动手**（`temp/nw-probe/`，`mxmlc` 编译探针 + `adl` 实跑 + 截图）：
+
+| 量 | `adl 51.4.1` 实测 | 说明 |
+|---|---|---|
+| `new NativeWindow(opts)` 返回时 | `visible=false`、`active=false`、`closed=false`、`title=""` | **构造器即开窗**，但要显式置 `visible` 才出现 |
+| 默认几何 | 框 400×232、客户区 400×200，**居中于显示器**（1800×1169 → 700,469） | 32pt = macOS 标题栏，属框的一部分 |
+| `NativeWindowInitOptions` | `standard`/`normal`/`auto`/`transparent=false`/`maximizable=minimizable=resizable=true`/`owner=null` | 八个默认值逐个对齐 |
+| 每窗 `stage` | `!= null`，`scaleMode="showAll"`、`align=""`；`frameRate` 读回的是**应用级**当前值（默认 24；实测把主窗口设为 4 后新窗口也报 4） | 新窗口**没有**自己的帧率——阶段八十九·七十三 更正（原记录把它读成「每窗的 24fps 默认值」；初始窗口启动时读 0 是 vsync 口径，不是另一个值） |
+| `x/y/width/height` | 是 `bounds` 的**代理**（设 `x=100` 只动 `bounds.x`） | 不是 Sprite 那种变换偏移 |
+| `close()` | 调用后**立即读 `closed` 仍为 `false`**，约 500 ms 后才 `true` 且派发 `Event.CLOSE` | 异步收尾，**不得在调用点同步销毁** |
+| 静态面 | `isSupported`/`supportsTransparency`=true、`supportsMenu`/`supportsNotification`=false | 并有 `NativeWindow.stage`（静态）等 mxmlc 报未定义的成员——按「不存在」建模 |
+| 常量类 | 小写字符串（`STANDARD="standard"`、`NONE="none"`、`AUTO`/`DIRECT`、`MINIMIZED`…） | `NativeWindowResize.NONE` 是**空串**（其余是 `StageAlign` 那套 `T`/`BR` 码） |
+| `Screen` | `mainScreen.bounds`=`0,0 1800x1169`、`visibleBounds`=`47,39 1753x1130`、`colorDepth=32` | `bounds`（完整模式）与 `visibleBounds`（可用区）是**两个不同的量** |
+| `Screen` 引用语义 | `Screen.screens[0] == Screen.mainScreen` → **false** | 每次访问返回**新的包装对象**，不能缓存单例返回 |
+| `getScreensForRectangle` | 单参静态方法（**没有** `getScreens()`），按 `bounds` 做**半开区间**相交 | 零面积/仅贴边 → 匹配不到 |
+| `new Screen()` | `Error #2012: Screen$ class cannot be instantiated.` | 不可构造 |
+
+**二、运行时从「单窗口」改造成「窗口注册表」**（`vendor/window_glue.cc` + 生成的 `ASCWin`）：
+
+- glue 侧 `#define SK_MAX_WINDOWS 16` + `WinCtx g_wins[]`：每窗一个 `SDL_Window`、自己的渲染器/流纹理、自己的 `visible`/`dirty`/`destroy_pending`，
+  以及**从 `NSWindow` 量出的边框**；`sk_run_loop` 逐窗派发 `on_frame`（各按自己的 `on_frame_delay` 配速）与 `on_redraw`/present；
+  `sk_service_destroy` 在**每轮循环开头**收尾上一帧请求关闭的窗口。
+- **槽位 0 保留给主窗口**（`sk_alloc_slot_ex(is_main)`）：`new Main()` 跑在 `showWindow` **之前**，文档类构造器里 `new NativeWindow()`
+  本来会抢走槽 0，让主窗口变成「第二个窗口」。
+- 生成的 C 侧 `#define ASC_MAX_WINDOWS 16` + `ASCWin ASC_wins[]`（**与 glue 的常量必须相等**，回归钉子盯着这一条）：
+  每窗存 `Stage*`、表面/画布、设计尺寸/逻辑尺寸/像素尺寸、`scale`、渲染变换（`cx/cy/ox/oy`）、全部窗口属性与 `closed`。
+- **`NativeWindow` 对象只持一个 `int _win`**，其余**一律反查表格**（不镜像任何 AS3 字段）。这不是审美问题：镜像字段在 OS
+  改窗口之后就是陈旧数据——本轮实测正是 `alwaysInFront` 的 getter 读镜像字段、setter 只写 glue（两份状态立刻分叉）；
+  早期还因为一个手写的 `used` 存活标志与 glue 不同步，把 `Event.CLOSE` 整个吞掉。**表格 + 单一 id 之后这类 bug 不再可能**。
+
+**三、本阶段最贵的缺陷：副窗口**没有**回调，是个「黑色但各项属性都正确」的窗口**
+
+- 现象：第二窗口开出来了（标题、位置、尺寸、`visible`/`active` 全对，与 `adl` 逐项一致），但**内容是纯黑**。
+- 定位（临时插桩，非猜测）：在 glue 的 present 前后打印 `id`/`tex`/`pixels` 后，日志只有 `DBG redraw id=0`——
+  **`id=1` 一次 redraw 都没有**，也**没有** `attach`。对照 glue 源码：`on_redraw`/`on_frame`/`on_mouse`/`on_close`/`on_resize`
+  这一套回调**只在 `sk_window_show`/`sk_window_show_metal`（主窗口路径）里赋值**，`sk_window_create` 从来没装过 ⇒
+  `c->on_redraw == NULL` ⇒ 永不光栅化、永不 present；`on_frame == NULL` ⇒ 副窗口的 `Stage` 永不 tick；`on_mouse == NULL` ⇒
+  窗口内点击无响应；`on_resize == NULL` ⇒ `do_resize()` 会在**不重新取像素指针**的情况下重建纹理（越界读的隐患）。
+- 修法（把「创建即带回调」写成签名的一部分，而不是「先创建后安装」）：`sk_window_create` 增加七个回调参数并与
+  `sk_window_show*` 对称赋值；`runtime.ts` 的 `as_window_create` 透传它们；生成的 `NativeWindow_ctor` 传入
+  `ASC_window_on_mouse/wheel/redraw/frame/frame_delay/resize/close`。**副作用是好的**：把回调从调用点拿掉不再是
+  「能编译的黑窗」，而是**编译失败**（签名要求七个实参）；只剩「显式传 `NULL`」这一种劣化方式，而它被钉子钉住。
+- **教训（写进回归注释）**：这个缺陷**只有「它被画出来了吗」这一条探针能发现**——`bounds`/`title`/`visible`/`active`/`closed`
+  全部与 `adl` 一致。故 `[native-window]` 的第一组断言就是「七个回调都在创建点传入」+「glue 确实安装它们」。
+
+**四、`Screen` 的四个「想当然就会错」的点**（每条一个钉子）：① getter 必须**新建**包装对象；② `bounds` 与 `visibleBounds`
+是两个查询（`SDL_GetDisplayBounds` vs `SDL_GetDisplayUsableBounds`）；③ 匹配用 `bounds` 且**半开**；④ 不可构造
+（`#2012` 原文）。另：缓存的 `Rectangle` 必须进 props 反射表，否则一次 GC 就能收掉活着的 `bounds`。
+
+**五、验收**：
+
+| 检查项 | 结果 |
+|---|---|
+| AOT 探针 vs `adl`（`temp/nwtest/`，同机同刻） | 逐行一致：默认值/几何/`stage` 三属性/`x,y` 代理/`close` 延迟/常量类/静态面（唯一差异是探针自己多打的几行，以及 `adl` 探针里 `*0.5 ^ 0` 的 int32 取整） |
+| 端到端点击验收（`examples/air-native`） | 激活窗口后真鼠标点击红块 → `new windowTest()` → 开出「Test Open Widnow」第二窗口，`bounds=600,379 600x410`、`stage=600x378`、**内容为白**（截图 `temp/nwtest/final-second.png`） |
+| web 目标 | `--target wasm --package web` 下 `NativeWindow` 构造器抛 `#2012`（`sk_window_create` 返回 `-1`），页面不崩（`ascErrors: []`） |
+| 全量回归 | `node test.ts` **125 passed / 0 failed**、退出码 0（本阶段前那一项 FAIL 即 `unknown superclass 'NativeWindow'`） |
+| 新增钉子 | `[native-window]` **26/26**、`[screen]` 全部 PASS |
+| 反向对照 | **3 个变异全部被捕获且 `process.exit(1)` 生效**：① 调用点传 `NULL` 替代 `ASC_window_on_close` → 对应钉子 FAIL；② glue 的 `SK_MAX_WINDOWS` 从 16 改 8 → 常量一致性钉子 FAIL；③ `NativeWindow_close` 顺手把 `w->closed = 1` → 「延迟收尾」钉子 FAIL |
+
+**六、实施过程中实测暴露的 4 个新缺口（已记入 `### 遗留待开发`）**：`Sprite.graphics` 不存在
+（`s.graphics.beginFill(...)` → 编译期 `undefined field 'graphics' on class 'Sprite'`，验收用例被迫改成「Sprite 当命中目标 +
+Shape 子对象绘图」）；`Shape`/`Bitmap` 的 `width`/`height` 是纯字段（AIR 由内容边界推导且只读）——「只画不设尺寸」即
+`0x0` 不可点（改写前的 `NtWindow.as` 正是这种写法）；`as_pick_hit` 递归时不做父→子坐标变换（只有 `x/y` 已是绝对坐标的对象可点，
+本轮红块坐标因此直接放在命中对象上）；`NativeWindow` 家族**剩余**方法/事件/属性面（`startMove`/`startResize`/`owner` setter/通知/菜单/
+`Stage.nativeWindow`/`NativeApplication.openedWindows`/`ACTIVATE`·`DEACTIVATE` 与 MOVING…CLOSING 事件族）。
+
+**七、顺手修掉一个测试基建缺陷（治本）**：`test.ts` 的目录型示例（`examples/air-native`）会把产物写进**示例源码树**
+（发现时留着 `examples/air-native/src/demo/ArrayDemos` 与 `.c` 两个孤儿）。现改为统一输出到 `temp/regress-out/<label>-<seq>`
+（`SCRATCH` + `scratchOut(label)`），并新增 `[no-src-litter]` 钉子：每个目录型示例运行前后快照 `readdirSync`，**多出任何文件即 FAIL**。
+既有的两个孤儿已删除。
+
+**八、一个次要发现（非缺陷，记录备查）**：发射器给每个构造器参数固定命名 `o`（`Main_ctor(Main* o)`），故构造器里写
+`var o:...` 会被参数静默遮蔽——**非法 AS3**（`mxmlc` 报错），我们的 codegen 接受并在生成 C 上报错。属「宽松」而非「错误翻译」。
+
+**文档**：本条目；`README-CN.md`（支持表补 `NativeWindow` 家族 + `Screen`、`flash.filesystem` 一节的「NativeWindow 延后」表述更正、
+「当前限制」新增多窗口条目）；`TODO.md` `### 遗留待开发`（移出 2 项、新增 4 项，状态改为 14 项）。版本 → **v0.4.26**。
+
+---
+
+#### 阶段八十九·七十二：关闭 `NativeWindow` 第二窗口即崩溃 —— 超类被错标为 `Object`（应为 `EventDispatcher`）（v0.4.26 → v0.4.27）
+
+**立项根据**：阶段八十九·七十一 落地的验收用例（`examples/air-native` 的 `NtWindow` 点击 → 第二窗口「Test Open Widnow」）**开窗全对、关窗即崩**。
+用户提交的崩溃报告（macOS 26.6.2 / arm64）：
+
+```
+Exception Type: EXC_BAD_ACCESS (SIGSEGV)   KERN_INVALID_ADDRESS at 0x0000000000000020
+0  EventDispatcher_dispatchEvent + 96
+1  ASC_window_on_close + 140
+2  sk_service_destroy() + 200
+3  sk_run_loop() + 168
+4  sk_window_show_metal + 564
+5  Stage_showWindow + 232
+6  main + 552
+```
+
+**一、根因：`NativeWindow` 的 `superClass` 写成了 `Object`**
+
+AIR 里 `flash.display.NativeWindow extends EventDispatcher`（窗口要能派发 `Event.CLOSE`/`ACTIVATE` 并接受 `addEventListener`），
+而 `src/symbols.ts` 注册时写的是 `superClass: 'Object'`。超类决定**结构体布局**，于是：
+
+```c
+// 错：{vtable; int _win}                // 对：{vtable; as_object* listeners; Object* parent; int _win;}
+```
+
+而 `EventDispatcher_dispatchEvent()` 按 `EventDispatcher` 的布局读字段——`listeners` 在偏移 **8**、`parent` 在偏移 **16**：
+
+| 读 | 想要 | 实际拿到（`Object` 超类时） |
+|---|---|---|
+| `((EventDispatcher*)obj)->listeners` | 监听器表 | **`_win`（一个 int，如 `1`）**——被当成 `as_object*` 用 |
+| `((EventDispatcher*)obj)->parent` | 父对象 | **越过 16 字节分配之外**（`sizeof` 只有 `{vtable, _win}` = 16） |
+
+`as_disp_parent()` 拿这个越界指针当父链往下走，很快解引用到 `0x20`（NULL + 偏移）⇒ `KERN_INVALID_ADDRESS at 0x20`。
+崩溃点 `+96` 正是 `dispatchEvent` 开头那几行（取 `event->target` / 建祖先链）。
+
+**二、为什么一路没被拦住：所有派发点都是 `void*`**
+
+`ASC_window_on_close` 里是 `EventDispatcher_dispatchEvent(w->window, …)`，而 `ASCWin.window` 是 `void*`（表格字段）；
+另一个同类派发点是 ENTER_FRAME 注册表 `EventDispatcher_dispatchEvent(as_ef_objs[i], evt)`——同样是 `void*`。
+**C 编译器在两处都无法做类型检查**，所以这个错误只能由「布局断言」或「真点一次关闭按钮」发现。
+顺带被这次错标一起削掉的还有：窗口的 `addEventListener`/`removeEventListener`/`hasEventListener`/`willTrigger`/`dispatchEvent`
+在 vtable 里**根本不存在**（AIR 有），以及 GC 的 props 反射链不含 `EventDispatcher_props` ⇒ **窗口自己的监听器表从不被标记**
+（一个挂着监听的窗口，其监听器对象随时可能被回收）。
+
+**三、修法（两处，缺一不可）**
+
+1. `src/symbols.ts`：`NativeWindow` 的 `superClass` 改为 `'EventDispatcher'`（字段布局、vtable 祖先链、GC props 链三件事同时归位）。
+2. `src/emit.ts` 的 `NativeWindow_ctor`：**补上** `EventDispatcher_ctor((EventDispatcher*)o);`。
+   自动生成的自定义类构造器会调父构造器，但内置类的手写构造器**不会**——只改超类而不补这一行，`listeners`/`parent`
+   就是分配里的残留字节，等于换了种方式的同一个崩溃（故两处缺一不可）。
+
+**三之补、顺带修好的两件事（同一根因）**：窗口从此刻起有了真正的监听器 API（`addEventListener`/`dispatchEvent` 等在 vtable 里出现），
+且 GC 的 props 反射链经过 `EventDispatcher_props` ⇒ **窗口自己的监听器表会被标记**（之前挂着监听的窗口，其监听器对象可能被静默回收）。
+
+**四、验收**：
+
+| 检查项 | 结果 |
+|---|---|
+| 反向对照（把修复从**生成的 C** 里手工还原成缺陷形态再编） | **复现出与用户报告逐帧一致的崩溃**：同一条栈（`EventDispatcher_dispatchEvent` ← `ASC_window_on_close` ← `sk_service_destroy` ← `sk_run_loop` ← `sk_window_show_metal`）、同样的 `exception codes 0x1, 0x20` / `KERN_INVALID_ADDRESS at 0x20`；harness 判定 FAIL、`exit=1` |
+| 修复后真鼠标验收（激活窗口 → 点红块开第二窗口 → 点它的关闭按钮） | 第二窗口内容探针 `(255,255,255)`（**已绘制、非纯黑**）、点关闭后进程**存活**、第二窗口消失、主窗口仍在 ⇒ `PASS`（harness `temp/nwfix/drive_close.py`，一次跑完盖两个缺陷的判据，退出码 0；用法与两条必踩坑见该目录 `README.md`） |
+| 新钉子 | `[native-window]` **26 → 31** 项：布局（`listeners`+`parent` 在 `_win` **之前**）、vtable 超类、构造器先建基类部分、`Event.CLOSE` 走基类派发器、以及**全程序扫描**（凡 vtable 里带 `EventDispatcher_dispatchEvent` 的类，其结构体必须带 `listeners`+`parent`；测试程序里 **35** 个类） |
+| 反向对照（**钉子本身**） | 把源码改回 `Object` 超类并删掉基类构造调用 → 3 条钉子 FAIL、`node test.ts` **exit=1**；还原 → `exit=0`、全文 0 条 `FAIL` |
+| 全量回归 | `node test.ts` **125 passed / 0 failed / 125 total**、`exit=0`（含 `[screen]` 全绿） |
+| 端到端（`examples/air-native`） | 重建并跑通全部 demo；单窗口路径零回归 |
+
+**五、教训（已写进 `checkNativeWindow` 的注释）**：**「超类」在本项目里不是文档措辞而是布局契约**。
+凡把 `void*` 目标交给 `EventDispatcher_dispatchEvent`（窗口表、ENTER_FRAME 注册表、定时器表）的地方，C 编译器一律沉默，
+所以「AIR 里它继承谁」必须与 `struct` 前缀一起被钉子钉住——本阶段补的全程序扫描就是这个不变式的通用形式。
+配套的 harness 也补上了：**开窗 + 关窗**要作为一对动作验收（阶段八十九·七十一 只验了「开出来且不是纯黑」）。
+新 harness 落在 `temp/nwfix/`（`drive_close.py` + `README.md` + 两次反向对照的结果存档）。
+
+**六、顺手修掉一处过时指针**：`TODO.md` 路线图里「`Window`/`NativeWindow` … 2026-10-02 正式立项 → 见 `### 遗留待开发` 的『AIR 多窗口』行」——
+该项已被阶段八十九·七十一 实现并从遗留表移出，指针改指本阶段家族条目。
+
+**文档**：本条目；`README-CN.md`（支持表的 `NativeWindow` 家族补「继承 `EventDispatcher`」与监听器可用性、当前限制版本号）；版本 → **v0.4.27**。
+
+---
+
+#### 阶段八十九·七十三：`Stage.frameRate` 是**应用级单值**，帧循环只跑**一个应用帧**（多窗口帧率叠加）（v0.4.27 → v0.4.28）
+
+**立项根据**：用户截图（主窗口 `FPS:170`、两个副窗口各 `FPS:168`）并提问：「为什么每开一个窗口默认 fps 是 24，总帧率会叠加这个数？」——
+现象是**开得越多、每个窗口上的读数越高**，这只有一种解释：帧派发是按窗口数重复的。
+
+**一、诊断（全部实测，不靠推测）**
+
+| 事实 | 证据 |
+|---|---|
+| AIR 的 `Stage.frameRate` **不是一个 Stage 的属性，而是整个应用一个值** | AS3 语言参考（`Stage.frameRate` 变更影响所有 `Stage`）；**adl 51.4.1 实测**：把主窗口 `stage.frameRate` 设为 `4` 后，新开的 `NativeWindow.stage.frameRate` 读回**也是 4**。所谓「新窗口默认 24」只是**当时的应用默认值**，不是每窗常量 |
+| 我们第一处偏离：新窗口自带帧率 | `NativeWindow_ctor` 里硬写 `w->stage->frame_rate = 24.0;` |
+| 我们第二处偏离：帧派发按窗口重复 | `Stage_dispatchFrame(void* _this)` 第一句是 `(void)_this;`——它**忽略传入的 Stage**，向**进程级**的 ENTER_FRAME 注册表 `as_ef_objs` 广播；而 glue 的 `sk_run_loop` 是**每窗口一次** `on_frame`。于是 N 个窗口 = 每帧 N 次广播（连带 N 次 `gc_step()` / `as_async_tick()` / `as_timer_tick()` / `as_mc_tick()`） |
+| 数字对得上 | 主窗口 120 fps + 2×24 = **168**（用户截图里的两个副窗口读数）；截图里 170 是同一现象的另一种量测 |
+
+**二、双端对照 harness**：`temp/fpsprobe/`（`adl-app.xml` + `aot-app.xml` 共用同一份 `Main.as`/`MyWin.as`，探针把每个窗口的
+`stage.frameRate` 与自己的 `ENTER_FRAME` 帧数按行写文件——注意 `FileStream_writeUTFBytes` 是缓冲 `fwrite`，故探针每行 open/append/close）。
+逐行对照 `result-adl-run4.txt` / `result-aot-run5.txt`：**修复后与 adl 逐行一致**（`FR=4` 继承、把 W1 设 12 → 主窗口也报 12、把主窗口设 24 → W1 也报 24、稳态 24/24 而非 36/36）。
+唯一差异仍是既定的 vsync 口径：启动首帧我们读 `mainFR=0`、adl 读 24（见 `docs/zh-cn/as3-semantics.md` §3）。
+
+**三、修复**
+
+- **语义层**：`Stage` 去掉 `frame_rate` 字段（`symbols.ts`）；生成 C 里改成**一个** `static double ASC_app_frame_rate`，`Stage_get_frameRate`/`Stage_set_frameRate` 两个访问器**代理**它（任一 `Stage` 写入即全局生效）；`NativeWindow_ctor` 不再写 24（新窗口天然继承）。
+- **帧循环**：`vendor/window_glue.cc` 的 `sk_run_loop` 改为**一个应用帧**——一个滚动 deadline（`g_app_next`）、**一次** `on_frame`（由任一可见活窗口持时钟，主窗口关掉后时钟自动转移）、随后把所有可见窗口标脏、只呈现脏窗口；删除 per-window 的 `next[]` 与逐窗 tick。
+
+**四、验收**
+
+| 项 | 结果 |
+|---|---|
+| 多窗口探针（`temp/fpsprobe/multi/`，1 主窗口 + 2 副窗口，主窗口 `frameRate=120`） | 稳态 **`main=119 w1=119 w2=119`**（修复前同场景是 120 + 24×2 的叠加），新窗口 `W1/W2 opened FR=0`（启动首帧的 vsync 口径） |
+| 新钉子 | `[native-window]` **31 → 36** 项：帧率是**一个应用级值**（无 `Stage.frame_rate` 字段、有 `ASC_app_frame_rate` 定义、无 `->frame_rate`）、两个访问器都代理它、节拍读应用值、**事件循环只跑一个应用帧**（`sk_run_loop` 函数体内 `on_frame(` 恰好 1 次、`on_frame_delay(` 恰好 1 次、无 `double next[SK_MAX_WINDOWS]`）、该帧把每个可见窗口标脏 |
+| 反向对照（钉子本身） | ① 在 glue 循环里恢复逐窗 `on_frame`；② 在 `NativeWindow_ctor` 里恢复 `ASC_app_frame_rate = 24.0;` ⇒ 恰好这 2 条钉子 FAIL、`node test.ts` **exit=1**；还原 → `exit=0` |
+| 全量回归 | `node test.ts` **125 passed / 0 failed / 125 total**、`exit=0` |
+
+**五、顺带更正的过时记录**：阶段八十九·七十一 的 adl 对照表把 `frameRate=24` 记成了「每窗的默认值」，本轮按实测更正为
+「读回的是**应用级**当前值」；`README-CN.md`、`src/emit.ts` 的同源说法一并改掉（三处）。
+
+**文档**：本条目；`README-CN.md`（`Stage.frameRate` 与 `NativeWindow` 家族两处）；`docs/zh-cn/as3-semantics.md` §3（应用级单值 + 每 tick 一个应用帧）；
+`src/emit.ts` / `src/symbols.ts` / `vendor/window_glue.cc` 的注释。版本 → **v0.4.28**。
+
+---
+
+#### 阶段八十九·七十四：`-O2` 的 `examples/air-native` 启动约 1 秒即 SIGSEGV —— vendored Skia 头与预编译库的**对象布局不一致**（v0.4.28 → v0.4.29）
+
+**立项根据**：阶段八十九·七十三 改完帧循环后回归，**`-O2` 的 demo 5/5~8/8 崩**（`-O0` 一切正常），崩点固定在日志
+`FileStream openAsync: PROGRESS(bytesLoaded=11) + COMPLETE` 之后约 1 秒。
+
+**一、定位链（每一步都有实测判据）**
+
+| 步 | 手段 | 结论 |
+|---|---|---|
+| 1 | 先验「是不是本次改动引入」：把帧率改动与 glue 改动**分别**回退再编 | 回退 glue、保留帧率改动 ⇒ **5/5 存活**；两者都回退 ⇒ 存活；两者都保留 ⇒ 崩 ⇒ **是 glue 的循环形状**暴露了它（单窗口下这次改动语义上是 no-op，故不是它写错） |
+| 2 | 崩溃栈与现场 | 早先：`SDL_UpdateTexture_REAL +24` ← `sk_run_loop()`；后来：`sk_run_loop+1352` 读 `c->used`，`x26 = x28*160 + g_wins` ⇒ **callee-saved 的循环寄存器 `x28` 被污染**（污染值是 7/11/12 之类的小整数或野地址，随构建漂移） |
+| 3 | 排除 jmp 栈：给 `as_jmp_stack[as_jmp_depth++]` 加 `JMPOVERFLOW`/`JMPDEPTH` 探针 | 未触发（永不 ≥16）；在渲染入口检查 `as_jmp_depth != 0` ⇒ 恒 0 ⇒ **与 try/catch 的 `longjmp` 无关** |
+| 4 | 确认 `x28` 到底该不该跨调用存活 | `clang -O2 -S` 汇编：`stp x28, x27, [sp, #48]` + `.cfi_offset w28, -96` ⇒ **Darwin arm64 上 x28 是 callee-saved**，被改就是**有 callee 违反 ABI** |
+| 5 | 内联汇编探针（`mov %0, x28`；**只在检测到变化时打印**，把扰动降到最低）逐层下钻 | `on_redraw` → `as_skia_mtl_begin_frame` 变化；继续在 `sk_mtl_begin_frame` 内部逐点打 ⇒ **内部各点都「未变化」**，只有「返回后」变化 ⇒ 只能是它**保存 x28 的栈槽被写坏**（epilogue 从被污染的槽里恢复） |
+| 6 | 反汇编该函数 | 全函数**只有一处** `ldp x28, x27, [sp, #0x140]`（正常出口），且 clang 的 canary 在 `sp+0x138`——**紧邻保存 x28 的槽** ⇒ 该函数帧内某处**越界写 16 字节**正好砸在上面两个槽 |
+| 7 | 真因 | `vendor/skia/include/gpu/GrBackendSurface.h` 是**旧一版 m124**：`kMaxSubclassSize` 为 64/160/160；编出 `libskia.a` 的那棵树（`build-tools/skia-src`）是 **80/176/176** ⇒ 栈上 `GrBackendRenderTarget` 我们按 **160** 留位、库按 **176** 写 ⇒ 库的构造器**越界写 16 字节**。另 `vendor/skia/include/gpu/vk/VulkanTypes.h` 也落后（缺 `fComponents` 等字段） |
+
+**二、为什么只在 `-O2`、且「扰动一下就看不见」**：只有在 `-O2` 下循环才把索引/基址放进 `x28` 跨 `on_redraw` 存活（`-O0` 全在栈上）；
+而任何加打印/加计数/改帧布局的构建都会改变栈上对象的位置与寄存器分配——早先的 `DIAG`/`SIGSEGV-handler`/`counter` 三个探针构建「全都存活」正是这个原因（**同一缺陷被扰动掩盖**，不是修好了）。
+
+**三、修复**：把两份 vendored 头**逐字节对齐**到 `build-tools/skia-src`（`diff -rq vendor/skia/include build-tools/skia-src/include` 现在为空）。
+这既是修崩溃，也是拆掉一颗**面向所有 `GrBackendRenderTarget`/`GrBackendTexture`/`GrBackendFormat` 栈用法的地雷**（阶段八十九·六十九 的 `VulkanTypes` 字段同理）。
+
+**四、验收**
+
+| 项 | 结果 |
+|---|---|
+| 修复后 `-O2` 连续运行 | **5/5 存活**（修复前 5/5~8/8 崩） |
+| 反向对照（把两份头换回旧版再编） | **5/5 CRASHED** —— 因果关系成立 |
+| 新钉子 | 新增 `[skia-abi]` **3** 项：vendored 头里的 `kMaxSubclassSize` 必须是库用的值（`= 80` 一次、`= 176` 两次）、`VulkanTypes.h` 必须带布局所隐含的字段、**并且与「编出库的那棵树」逐字节一致**（`build-tools/skia-src` 不在时打 `SKIP` 并 pin 字面值） |
+| 反向对照（钉子本身） | 换回旧头 ⇒ 3 条钉子 FAIL、`node test.ts` **exit=1**；换回 ⇒ 3 条 PASS、`exit=0` |
+| 全量回归 | `node test.ts` **125 passed / 0 failed / 125 total**、`exit=0`（含 `[native-window]` 36 项、`[skia-abi]` 3 项） |
+| 端到端（真鼠标） | `python3 temp/nwfix/drive_close.py` ⇒ 第二窗口开出且**非纯黑**、点关闭后进程存活、主窗口仍在、`RESULT: PASS`（`exit=0`） |
+
+**五、教训**：**预编译库的头文件不是文档，是 ABI 契约**——`vendor/skia` 的头与 `build-tools/skia-src` 的头**必须一起升**，
+「同一个 milestone（m124）」不足以说明布局一致（同 milestone 内上游也改过 `kMaxSubclassSize`）。这类缺陷的症状是
+**寄存器/栈被写坏**而不是「画错」，且**任何扰动都会掩盖它**，所以既要钉住版本，也要在「只在 `-O2` 崩」时先怀疑 ABI 而不是优化器。
+
+**文档**：本条目；`docs/zh-cn/skia.md` 新增「vendored 头必须与预编译库同版本」一节（含具体数值与症状）。版本 → **v0.4.29**。
+
+---
+
+#### 阶段八十九·七十五：多窗口 GPU —— 运行期 `NativeWindow` 也走 Metal（v0.4.29 → v0.4.30）
+
+**立项根据**：用户提问「air-native 是 gpu 加速的吗？我多开几个窗口 cpu 显示高。gpu 从监控上没看到有什么用量」。
+
+**一、诊断（代码 + 实测，两者互相印证）**
+
+- 主窗口**确实**是 Metal：`<renderMode>direct</renderMode>` → `air-app.ts` 加 `ASC_RENDER_METAL=1` → 生成 C 的
+  `Stage_showWindow` 里 `w->is_metal = 1` → `sk_window_show_metal()`（`SDL_Metal_CreateView` +
+  `GrDirectContext(Metal)`，每帧取一次性 drawable 直接用 Skia Ganesh 画）。
+- 运行期 `new NativeWindow()` **全走 CPU 光栅 + 整帧 `SDL_UpdateTexture`**：`sk_window_create()` 只调
+  `sk_attach_cpu()`，从不建 `SDL_MetalView`；`metal_glue.mm` 是**进程级单例**（`g_layer`/`g_context`/`g_drawable`/
+  `g_surface` 都是 `static`），设计上只服务一个窗口； `NativeWindowInitOptions.renderMode` 只被存取
+  （`ASCWin.render_mode`），**没有任何代码用它选后端**。
+- **决定性证据**：日志 `metal_glue: layer bounds=…` 开 3 个窗口也只出现 **1 次**。
+- **成本量级**：副窗 600×410 @2x = 1200×820 ⇒ 3.9 MB/帧/窗口，应用帧率 ~116 fps ⇒ 每窗 ~470 MB/s 的
+  CPU 光栅 + 上传（GPU 那边只有「贴一张纹理」的 blit）。实测每多一窗 **+12~14% CPU**：0/1/2/3 窗 = 9.8 / 23.3 / 36.3 / 44.0%。
+
+**二、修复（四层，全链路同一把钥匙 `id`）**
+
+1. `vendor/metal_glue.mm`：全局单例 → `g_mtl[SK_MTL_MAX_WINDOWS(16)]` 分槽（`CAMetalLayer`/一次性 drawable/`SkSurface`
+   每窗一份），`MTLDevice`/`MTLCommandQueue`/`GrDirectContext` 仍**共享**（Skia 要求它们比 context 活得久），
+   第一个 GPU 窗口惰性创建、最后一个槽释放时拆掉。入口全带 id：`sk_mtl_init(int win_id, void* layer)`、
+   `sk_mtl_destroy(win_id)`、`sk_mtl_begin_frame(win_id,w,h)`、`sk_mtl_flush(win_id)`。
+2. `vendor/window_glue.cc`：新增 `sk_attach_metal(WinCtx*, int id)`（`SDL_Metal_CreateView` +
+   `SDL_Metal_GetLayer` + `sk_mtl_init`，并把 view 记在 `c->metal_view`）；`sk_window_create()` 新增 `int gpu`
+   形参，`if (!attached && !sk_attach_cpu(c))`；`#ifndef ASC_RENDER_METAL gpu = 0;`（**没有后端的构建不造自称 Metal 的窗口**）；
+   `sk_service_destroy()` 先 `sk_mtl_destroy(i)` + `SDL_Metal_DestroyView(c->metal_view)` 再 `SDL_DestroyWindow`
+   （layer 的生命周期挂在 view 上）。
+3. 生成 C（`src/emit.ts`）：`NativeWindow_ctor` 从 `options->renderMode` 算 `gpu`（`strcmp(rm,"cpu") != 0`，
+   仅 `ASC_RENDER_METAL` 下），交给 `as_window_create` 并记 `w->is_metal = gpu`；**Metal 窗口不建 CPU surface**
+   （drawable 每帧取），但缩放仍从 `as_window_get_pixel_size` 读；`ASC_window_render` 的
+   `as_skia_mtl_begin_frame(id, w->pw, w->ph)` / `as_skia_mtl_flush(id)` **带 id**（共享一份 layer 会让第二窗画进第一窗）；
+   Stage3D 合成改成 `w->is_metal && …`；`ASC_window_on_resize` 对 Metal 窗口只更新尺寸、不分配 surface。
+   `src/runtime.ts` 前导（extern + wrapper + 纯 C stub **三处**）与 `vendor/web_glue.cc` 的 stub 同步加 `gpu`。
+4. 两个踩坑（都已钉死）：① `.mm` 里的参数**不能叫 `id`**——它遮蔽 Objective-C++ 的 `id` **类型关键字**，
+   函数体内 `id<CAMetalDrawable>` 被解析成比较表达式（实测 11 处编译错误），参数名统一用 `win_id`；
+   ② `as_window_create` 在前导里有**两份定义**（Skia 版 + 纯 C stub 版），只改一份时编译期是
+   「too many arguments to function call, expected 13, have 14」——由全量回归的纯 C stub 构建路径捕获。
+
+**三、验收**
+
+| 项 | 结果 |
+|---|---|
+| 每窗 Metal 初始化 | 真点击开 2 / 3 窗 ⇒ 日志 `metal_glue: window 0/1/2 layer bounds=…` 共 3 / 4 行（**修复前恒 1 行**） |
+| 「它被画出来了吗」 | 每窗截图**非纯黑**（non-black 0.999）+ 红块在场；主窗口 2000×1424、副窗 1200×820（均 2x）；副窗可见 `FPS:120` 叠层与 TweenDemo 动画 |
+| CPU（同一二进制只改 `renderMode`，2 副窗） | auto→GPU **14.0%** 平均 / 26.5% 峰值；`renderMode="cpu"` **32.8%** / 37.6%（修复前 36.3% / 48.1%） |
+| K 扫描（GPU） | 0/1/2/3 窗 = **6.9 / 11.2 / 14.0 / 16.1%** 平均（修复前 9.8 / 23.3 / 36.3 / 44.0）＝每窗 **+2.3~3.5%** 而非 +12~14% |
+| 反向对照 ①（隔离后端变量） | 同构建 `renderMode="cpu"` ⇒ 只 1 行 metal 日志、CPU 回到 32.8%，且窗口照常渲染（**CPU 路径无回归**） |
+| 反向对照 ②（钉子本身） | 把 emit.ts 的 gpu 选择改回恒 0 ⇒ `[native-window]` 2 条钉子 FAIL、`node test.ts` exit=1；改回 ⇒ PASS、exit=0 |
+| 全量回归 | `node test.ts` **125 passed / 0 failed**（345 条钉子，含 `[native-window]` **54** 条，本阶段新增 15 条） |
+
+**四、语义边界（不静默降级）**：Metal 构建下 `renderMode="cpu"` 的窗口**不合成 Stage3D/StageVideo**——
+AIR 文档明确软件窗口不支持 StageVideo/Stage3D 合成，且该构建本就没有 CPU 回读缓冲（把渲染目标暴露为纹理
+正是为了省掉每次回读）。所以 cpu 模式窗口少画 Stage3D 是**对齐 AIR**，不是缺口。
+
+**五、教训**：① 「后端能力」不能是**进程级单例**——只要状态私有于窗口，多窗口就是自然结果，反之就会被迫
+让第二个窗口降级，而且降级得很安静（API 全对、只有「画出来了吗」能发现）。② 同一份构建里要留**反向对照**
+（`renderMode="cpu"`），否则「CPU 降了」无法归因到后端。③ Objective-C++ 里 `id` 是关键字，别拿它当参数名。
+
+**文档**：本条目；`docs/zh-cn/skia.md` §6.6（per-window 状态表、共享/私有边界、两个踩坑）；
+`docs/zh-cn/compile.md` 的 `<renderMode>` 一节与 GPU 宏对照表；`README-CN.md`「当前限制」多窗口条目；
+探针 `temp/gpuprobe/`（README + `ab_run.py` 一键 A/B + `verify_metal.py` 逐窗非黑校验）。版本 → **v0.4.30**。
+
+---
+
+### 阶段八十九·七十六：`transform.matrix` 语义保真 + 可选文本选中刷新/光标（v0.4.30 → v0.4.31）✅ 已完成
+
+**触发**：用户对 `examples/air-native` 的两张 adl / AOT 截图逐处比对，报 3 个不忠实点（D1 旋转/缩放/斜切行的四个方块位置不同；D2 选中高亮要滚动才出现；D3 可选文本上没有 I-beam 光标）。
+
+**D1 根因（不是「旋转中心」而是 `transform.matrix` 的语义）**：AIR 每个 `DisplayObject` 只有**一个** transform，`x/y/rotation/scaleX/scaleY` 与 `transform.matrix` 是它**两种视图**；我们此前把 `transform.matrix` 当 `Transform` 自己的裸槽——读恒为写进去的那份矩阵、写不影响字段，于是 `get → rotate(30deg) → set` 只把图形转了、对象仍停在原处（adl 会把对象挪到 `(68.94228634059948, 60.58845726811989)`）。双端探针（`temp/xformcmp/Probe.as`，**25 例 T1–T25**，`AdlProbe.as` + `probe-app.xml` 走 `mxmlc`+`adl` 写 `/tmp/xform_adl.txt`）逐例实测出 adl 的完整口径：getter **返回拷贝**（改它不动对象）、setter 按 `rotation=atan2(b,a)` / `scaleX=hypot(a,b)` / `scaleY=hypot(c,d)`（行列式为负取负）分解，赋值当值/链式赋值都**产出被赋的矩阵**。修复 = `X.transform.matrix` 的读写改走**合成/分解访问器对**（`DisplayObject_get/set_transform_matrix`），旋转/缩放表达不了的 skew 留在残余槽（渲染合成顺序 `translate → rotate → scale → concat(残余)` 与 AIR 完全同序，故分解后重新渲染逐像素一致）；字段、渲染器、命中测试**一行未动**。
+
+**D2 根因**：选中状态**有**记录（`[DBG]` 实测 down→drag 索引都对了），但自动烘焙（增量重绘的指纹机制）漏了 `_sel_begin/_sel_end/_scroll_h/_runs` 与 `textColor`/`autoSize`/`defaultTextFormat.align`，指纹不变 ⇒ 永不重烘焙（手工补指纹即立刻出现高亮）。修复 = 指纹补齐这 7 项。
+
+**D3 根因**：`SDL_CreateSystemCursor`/`SDL_SetCursor` 全工程无引用，`Mouse.cursor` 只被存下来从未施加。修复 = 新增 glue seam `sk_window_set_cursor(id, kind)`（native 实现 + web 空实现），生成侧 `ASC_window_update_cursor` 在**鼠标事件分发之后**采样（监听器当帧写 `Mouse.cursor` 或改 `selectable` 能当帧生效）：`"auto"` 走 `as_pick_hit`（可选中 `TextField` → I-beam，其余 → 箭头），显式名映射 SDL 系统光标（`button` 因 SDL2 无对应物回落箭头），指针离开窗口恢复箭头。
+
+**验证证据（可复现）**：① 探针逐字段比对 `temp/xformcmp/cmp_probe.py` — **180 个字段全部一致**（容差：adl 把 `x/y` 量化到 1/20 px（twips）、分解走单精度，故 x/y ±0.05、旋转/缩放 ±2e-4），仅 5 处**已知分歧**（见下遗留表）；② demo 行像素比对（`cap_row.py` 同窗口同裁切）— gray/pink/green/blue 四个色块 bbox **逐值相同**，绿色 6114 px 完全相等；③ 选中：`drive_selprobe.py` 拖拽后**当帧**出现高亮（bbox `(44,180,463,275)`，26440 px），不滚动、且不可选对照组无高亮；④ 光标：`cursor_test.py` 全屏连光标截图 — 可选文本上 I-beam、不可选上箭头（`temp/xformcmp/sel_out2/cursor-side-by-side.png`）；⑤ 回归：`node test.ts` **125 例全通 + 新增 `[xform]` 21 项钉子**；`examples/stage58.as` 补 9 条执行级断言（getter 拷贝、rotate 挪对象、skew 进 scaleY、零行列式往返、赋值当值/链式）。
+
+**过程中修掉的三个真问题**（都不是表面现象）：① 非 Skia 构建**编译失败**——`AS_CURSOR_*` 与 `as_window_set_cursor` 只加在运行期前导的 Skia 分支，纯 C 分支缺符号（探针构建直接报 9 个错），已在前导的 `#else` 分支同步补齐；② **赋值表达式被当值用**——`a = b.transform.matrix = m` 生成 `(Matrix*)(void 表达式)` 非法 C（原实现只在语句位可用），新增 `transformMatrixTarget` 统一形状判定 + 值上下文的临时变量提升；③ 我自己第一版**奇异分支公式把行列布局搞反**（AS3 的 `(a,b,c,d)` 是行 1=`(a,c)`、行 2=`(b,d)`），T25 暴露渲染不精确后按 `L·残余 = M` 重新推导为三个子分支（`sy==0` / `sx==0 且 c==0` / 无分解形式整体寄存）。
+
+**文档**：`README-CN.md`「当前限制」新条 + 「支持子集」的 `transform` / `Mouse.cursor` 两处就地更新；本条目；遗留两项见下表（访问链别名 + 两个无分解形式的矩阵）。版本 → **v0.4.31**。
+
+> **决策口径（§1.5）**：adl 的 `x/y` **twips 量化（1/20 px）** 不复刻——`68.94228634059948` 在 adl 会以 `68.9` 回来，那是 avmplus 的内部存储口径而非 AS3 规范语义；我们保留全精度并**在验证中用容差**而非降级实现。
+
+---
+
+### 阶段八十九·七十七：键盘/焦点/复制保真 + 选中高亮口径（v0.4.31 → v0.4.32）✅ 已完成
+
+**触发**：用户报 `examples/air-native` 的文本框「只能从前往后复制，不能从后面的文字往前选？选中的文字也无法复制？」——两个可观测缺陷：(1) 反向拖拽不出高亮；(2) 选中的文字按 `Cmd+C` 复制不出来。
+
+**口径来源（先实测再动手，全部在 `adl 51.4.1` 上闭环）**：新建探针 `temp/xformcmp/seldir/SelKey3.as`（两个可选中 `TextField` + 一个 `Sprite` 命中目标 + 空舞台区域；`FileStream` 逐条写 `/tmp/selkey3.txt`）与驱动 `drive_selkey3.py`（**同一份源码两端跑**，动作间插分隔键 `z` 消歧，剪贴板由外部 `pbpaste` 读）。adl 侧第 12 轮实测（`adl_run3.txt`）：
+
+| 测点 | adl 实测 |
+|---|---|
+| 点击字段 | `focusIn`（phase 2→3、`bubbles=true`、`relatedObject=null`），`focus=text`，点击处设插入点 |
+| 拖拽选中 | `[4,14)`（字符索引随字体度量而定） |
+| Cmd+A | `selb=0 sele=21 caret=21`，**零键事件**（被吞） |
+| Cmd+C | **零键事件**（被吞）但剪贴板得到 `text[4,14)` = `'EFGHIJ abc'`；**选区保留** |
+| Ctrl+C | **照常派发**（`kc=67 cc=99 ctrl=true`），剪贴板**不变** |
+| Cmd+X / Cmd+V | 被吞、无动作 |
+| 字段→字段 | `focusOut(text, rel=text2)` → `focusIn(text2, rel=text)`（旧选区保留） |
+| 点 Sprite / 空白 | `focusOut(..., rel=null)` + `focus=null`；空白处无事件 |
+| `stage.focus = t` | 派发 `focusIn(text, rel=null)`；此后 `Cmd+C` 能复制该字段**保留的**选区 |
+| 无焦点时按键 | 事件目标是 **stage**（`KC=81` 的 keyDown 在 `focus=null` 时 `tgt=stage`） |
+
+**选中高亮口径（推翻上一轮的猜想）**：第 10 轮（`SelFocus.as`，5 个不同底色字段轮流获焦）实测——高亮**只画在获焦的那一个字段**上；填充**恒为不透明 `0xB5D5FF`（181,213,255）**，在 `0x1E1E1E`/`0xFFFFFF`/`0x808080` 三种底色上取到**同一个值**（⇒ 不透明填充而非叠加混合；此前脚本里「`0x4D90FE` @35% 叠底」的判据是错的，已就地改正）；被选中的字形**恒为纯黑**。故第 9 轮「未获焦字段程序化 `setSelection` 也出高亮」的读数是**误读**（截图里的暗色轮廓是把标题栏算进偏移后的错位采样）。
+
+**实现**：① 反向拖拽——`Stage_dispatchMouse` 的 mouseDown 记 `drag_anchor`，mouseMove 归一化成 `lo=min/hi=max` 并同步 `_sel_caret`（两向拖拽给出**同一个选区**）；② 高亮渲染——`selVis = (as_focus_obj == tf) && 选区非空`，填充 `0xB5D5FF` 不透明，选中字形走「同一个 `SkParagraph` 布局在**强制黑**的 `saveLayer` 里按选区矩形裁剪重画一遍」（新增 glue `sk_paint_black_keep_alpha`：`SkColorFilters::Matrix` 把 RGB 清零、保留 alpha）——不重排第二份布局，度量与抗锯齿边缘因而与原文字**逐像素同源**；③ 焦点模型——`as_focus_obj` 全局（GC 永久根）+ `as_focus_dispatch`/`as_set_focus`（`focusOut` 先、`focusIn` 后，`relatedObject` = 链的另一端）+ 点击字段获焦 / 点击其它清空 + `Stage.focus` 读写访问器；④ 键盘传输——`window_glue.cc` 新增 `on_key` 回调（`SK_MOD_*` 位掩码 + `sk_air_keycode`/`sk_us_char` 映射到 **AIR 的编号**：字母 keyCode 用大写、Delete=46/charCode=127、Cmd=15 且 `ctrlKey=true`…），生成侧 `ASC_window_on_key`→`Stage_dispatchKey`（无焦点时目标取 stage）；⑤ 复制/全选——`Stage_dispatchKey` 先判**加速键位**（macOS=Cmd、其它=Ctrl，单一比特，故生成 C 与平台无关）：命中 `A`/`C`/`X`/`V` 时**吞掉事件**（`A`→全选、`C`→复制），并要求有焦点且 `selectable`；剪贴板走 glue 的 `sk_clipboard_set_text/get_text`（SDL 剪贴板）。
+
+**实测两处「不是我们想的那样」并当场纠正**：
+1. **AIR 不过滤自动重复**。上一轮「按住 `a` 1.5 s 只收 1 次 keyDown ⇒ AIR 过滤重复」的结论是**测法导致的假象**：`reptap.py`（`CGEventTap` 监听系统事件流）证明 System Events 的 `key down` **根本不产生系统自动重复**（2 s 内系统层只发 1 次 keyDown）。改用 `repeat_probe.py` 主动合成「1 次正常 + 8 次带 `kCGKeyboardEventAutorepeat=1`」的 keyDown 后，`adl` **9 次全收** ⇒ 过滤是错的，`window_glue.cc` 里的 `e.key.repeat == 0` 判断已删除（注释写明测法与出处）。
+2. **SDL 的修饰键状态来自「修饰键按下」而非事件 flag**。驱动最初只给字母事件挂 `CGEventSetFlags(CMD)`（adl 直接读 `NSEvent.flags`，因此 adl 侧照常带修饰键），而 SDL 的 `keysym.mod` 报 **0** ⇒ 我们这端 `Cmd+C` 不成立、事件被照常派发、也复制不出东西。加 `SK_KEY_TRACE` 定位后，驱动改为**真的按下/抬起修饰键本身**（Cmd=55/Ctrl=59/Shift=56/Opt=58，与真实硬件同序）。真实用户永远是这个序列，故行为一致；「只挂 flag 不带修饰键按键」是我们 harness 的假象，已写进驱动注释。
+
+**补一轮（用户看的正是 demo 的 trace 面板，必须在那块字段上验收）**：探针 `t3` 复现 demo 的形态——长文本 + `wordWrap` + 滚到底（宽 400、高 400、40 行），第 13 轮两端实测：反向拖 `(350,200)→(30,200)` 与正向拖同一路径给出**同一个选区**（adl `(826,870)` / 我们 `(581,626)`，Cmd+C 分别 44 / 45 字符 ✓），跨行反向拖 adl `(732,1745)`/我们 `(487,1753)`（1013 / 1266 字符 ✓），Cmd+A + Cmd+C 两端都是全文 1950 ✓。**由此挖出一个真 bug 并修掉——选区高亮只取 16 个 rect**：一行一个 rect，于是「选区超过 16 行」时只画前 16 行；字段又滚到底部 ⇒ 那 16 行全在视口之上被裁掉 ⇒ **整屏看不到高亮**（用户 `Cmd+A` 的现场，实测修前只有 70053 高亮像素、且都在视口外；`adl` 同时是 426890 且覆盖整个可见区）。修法：glue 的 `sk_textlayout_rects_for_range` 增加 `skip` 分页参数，生成侧（填充与「黑字重画」两处）按 16 个一页循环取完整段的 rect；修后 274075 像素、覆盖 772 行像素高，与 adl 的 780 行一致（`temp/xformcmp/seldir/round13/cmp_t3_selectall.png` 上=adl 下=AOT 并排对照）。**demo 端到端**（`temp/xformcmp/demo_verify.py`）：在用户那份 `examples/air-native` 上反向拖 8802 高亮像素 == 正向拖 8802 ✓、Cmd+C 复制出该行 48 字符切片 ✓、Cmd+A 高亮 0 → 152353 ✓。**harness 教训已写进驱动**：投事件前必须确认目标进程真的在前台（曾有一次前台仍是 Sublime Text，不检查就会产出一堆「假的失败」；`NSWorkspace` 与 `osascript` 两个口径都要看）；`air-native` 跑完会再开一个 `NtWindow`，它会盖在主窗口上并抢焦点，令合成拖拽偶发丢事件（同脚本重跑即干净）。
+
+**验证证据（可复现）**：① 同一驱动两端跑，逐项对照（`temp/xformcmp/seldir/{adl_run3.txt,aot_run4.txt}`）——焦点事件序列（含 phase/currentTarget/target/`relatedObject`/`bubbles`）、`Cmd+A`、`Cmd+C`（含**精确子串**）、`Ctrl+C` 派发但不复制、`Cmd+X/V` 吞掉、点 Sprite/空白、`stage.focus` 赋值后仍可复制、失焦不清选区：**全部一致**；② 高亮：`drive_sel_bidir.py`（判据同步改为不透明 `0xB5D5FF` 族）在 AOT 端给出**前向 == 反向**的同一 bbox `(44,180,463,275)` / 25768 px，不可选对照组恒无高亮，adl 端同样「前向 == 反向」（`temp/xformcmp/sel_bidir_{adl2,aot2}/`）；③ 回归 `node test.ts` **125 例全通**；④ 保真修复附带的 `FileStream` 立即落盘（`setvbuf(_IONBF)`）由探针本身证明（此前 AOT 侧读到的日志文件恒为 0 字节，adl 侧可读）。
+
+**登记为遗留（下表新增 6 行）**：web 键盘/剪贴板未接线、`type='input'` 的键入/粘贴/剪切与方向键编辑、非 US 布局与 Option 组合字符、渲染管线色彩管理（sRGB→P3，**所有非灰颜色**偏移）、字体度量偏小（行距 12 vs 15、前进 5.3 vs 6.6）。**文档**：`README-CN.md` 的 `selectable` 段与 `Stage.focus` 就地更新 + 「当前限制」新增 3 条；版本 → **v0.4.32**。
+
+> **判据（§1.5）**：`adl` 能跑对而我们跑不出 ⇒ **遗留**（上表 6 行全是这一类，无一是「AIR 本来不支持」的增强）。反向拖拽、复制、焦点、加速键均已对齐到 `adl`，只在「我们做得更少」的四个面上如实记账。
+
+---
+
+#### 阶段九十四·一：`Proxy` / `flash_proxy` 命名空间（v0.4.32 → v0.4.33）✅ 已完成
+
+**触发**：`talkmed-meeting-aot-gap-report.md` §3-L1 / §5-P1.7（`talkmed-meeting-desktop-app` 的编译缺口分析）。工程里 **6 个文件 `extends Proxy`、5 个文件用 `flash_proxy` 命名空间限定**（`com/greensock/TweenProxy*.as`、`VarsCore.as`、`com/vsdevelop/rendering/DisplayContainer.as`）；GSAP（431 处 import）的 `TweenProxy` 分支是**编译期硬阻塞**。
+
+**现状**：`symbols.ts` **无 `Proxy` 类**；lexer/parser 无 `flash_proxy` 命名空间限定语法。全工程 grep「Proxy」只命中 `runtime.ts:6223` 一处**无关**的 HTTP 代理注释，无任何实现。
+
+**AIR 语义（须先实测，不得凭 C 行为反推——AGENTS.md §2.4）**：用 `mxmlc + adl 51.4.1` 采全语义面：
+
+| 待测点 | 为什么要测 |
+|---|---|
+| 10 个 `flash_proxy` 方法的**接管边界**（`getProperty`/`setProperty`/`deleteProperty`/`hasProperty`/`getPropertyKeys`/`callProperty`/`isAttribute`/`nextName`/`nextValue`/`nextNameIndex`） | 决定「哪些操作走 Proxy、哪些仍走真槽」——这是实现的地基 |
+| **只实现部分方法**时的行为（`extends Proxy` 但未覆盖某个操作） | AIR 是抛 `#1006`/`#1056` 一类，还是回落真槽？决定我们要不要生成守卫 |
+| `isAttribute` 与 **E4X** 的交互（`@attr` 读写是否也走 Proxy） | 我们 E4X 已落地（阶段九十~九十三），交互面必须一起钉死 |
+| `getPropertyKeys` 的顺序与 `for-in`/`Object.keys` 的关系 | Proxy 的枚举是**三元组**（`nextNameIndex`/`nextName`/`nextValue`），不是一次取键数组 |
+| `callProperty` 的接管范围（`Function.apply`、`obj["m"]()` 动态调用） | GSAP 大量动态方法调用 |
+| `Proxy` 作为**基类**：`is Proxy`/`as Proxy`/vtable super 链 | 与既有 vtable 派发打通 |
+
+**实现要点**：① `symbols.ts` 注册 `Proxy` 内建类（`superClass: 'Object'`，标记 `dynamic` 语义——与阶段八十九·三十六 的 `dynamic class` 建模同一套）；② lexer 识别 `flash_proxy` 命名空间限定（`flash_proxy function getProperty(...)`），parser 侧走既有的通用元数据/限定符解析；③ codegen：当目标类的 super 链含 `Proxy` 且属性未命中静态槽时，`as_dyn_get/set/del/has` 与 `for-in` **先查 `flash_proxy` 方法、无方法再回落既有反射表**——即 Proxy 是**接管**（intercept）而不是替换 `as_dyn_*`（这条边界决定改动范围，实现时须写成注释）；④ `callProperty` 的 `args:Array` 复用既有的 `as_array arguments` 预扫描机制（§2.4 红线表最后一行）。
+
+**验收**：① 新 `examples/stage94a.as`——`extends Proxy` + 全 10 方法最小实现，覆盖 `get`/`set`/`delete`/`in`/`for-in`/`obj["m"]()` 各一条断言；② **双端同源**探针（同一份 `.as` 跑 `adl` 与 AOT，逐条 diff，沿用 `temp/xformcmp/seldir/` 的两段式手法）；③ 真实用例：GSAP 的 `TweenProxy.as` 编译通过；④ `node test.ts` 全通 + 新增 `[proxy]` 钉子。**判据（§1.5）**：`adl` 能跑 ⇒ **遗留**（非增强）。
+
+**实施结果（2026-10-03）**：
+
+① **特性表按实测更正一处**：`Proxy` 的十个拦截器**不是** `getPropertyKeys`，而是 **`getDescendants`**——由 `airglobal.abc` 的 `describeType(Proxy)` 转储（`temp/proxyprobe/proxy-traits.txt`）钉死，文档里广传的 `getPropertyKeys` 是 AS2/旧文档串味。十个方法**全部声明在 `flash_proxy` 命名空间**（不是 public）。
+
+② **实现**（3 个文件，无新依赖）：`symbols.ts` 注册内建 `Proxy`（`superClass: 'Object'`、`isProxy: true`、**非** dynamic，AIR 同此）+ `PROXY_NS_METHODS` 十名集合 + `MethodInfo.isProxyNs`；`parser.ts` 把类成员上的**命名空间限定符记进 `Method.ns`**（此前一律丢弃：`flash_proxy` 与 `starling_internal` 都只是被跳过的标识符）；`emit.ts` vtable 加 `int is_proxy`、方法反射表键在 `isProxyNs` 时改为 `flash_proxy::<name>`、`emitCall`/`emitMember` 拒绝把 `flash_proxy` 方法当普通成员解析、`for-in`/`for-each`/`delete`/`@attr`/动态调用各自接上接管路径；`runtime.ts` 新增 `as_is_proxy` / `as_proxy_invoke`（沿 super 链查 `flash_proxy::<name>`）/ `as_proxy_get_miss|set_miss|has_miss|del_miss|call` / `as_proxy_next_index|name|value` / `as_proxy_descendants` / `as_proxy_to_str` / `as_proxy_throw`，并把 `as_dyn_get/set/has/del/call`、`as_v_str_val`、`as_obj_to_str` 的 Proxy 分支接上。
+
+③ **AIR 语义（全部实测，非推测）**：接管面 = 「动态」访问（点读写/`delete`/`in`/点号调用/`String()`/枚举/`@attr` → 十个拦截器），**真槽（字段/getter/方法）优先**；拦截器**只认 `flash_proxy` 命名空间**——`override flash_proxy function getProperty` 才是拦截器，**公有命名空间的同名方法不是**（实测：`p.foo` 仍抛基类 `#2088`，而 `p.getProperty("x")` 是普通调用返回 `PUB:x`）；未覆盖的操作由基类实现抛对应编号的 `Error`（`#2088` get / `#2089` set / `#2090` callProperty / `#2091` has / `#2092` delete / `#2093` getDescendants / `#2105` nextNameIndex / `#2106` nextName / `#2107` nextValue，**无一是 `TypeError`**），`#2090` 还覆盖 `new Proxy()` 与「以公有命名空间访问 `flash_proxy` 方法」；`p["m"](1,2)` 取到非函数值抛 `TypeError #1006`；`callProperty` 收到的是**扁平参数数组**（`rest.length` = 实参个数）；`isAttribute` 在 AIR 里**从不被派发**（`p.@attr` 走的是 `getProperty`）——故以 id 0 占位且不可达，**不发明编号**。
+
+④ **验证证据（可复现）**：①`temp/proxyprobe/` 里 5 份 AOT 探针 + 同源 `adl` 工程（`src/AotMain.as` + `src/probe/{FullProxy,PartialProxy,BareProxy,RealProxy,L2}.as`）逐条**双端对照**：读/写/删/`in`/点号调用/`String()`/`p["m"]`/for-in/for-each/`@attr`、部分实现时的错误号序列（`#2092`/`#2091`/`#2105`）、裸子类的六个操作、真槽优先（字段/getter/方法/`is Proxy`/`hasOwnProperty`）、命名空间区分（`p.getProperty("x")`→`callProperty` 结果 vs `p["getProperty"]`→`getProperty`）、公有命名空间反向对照（`#2088` + `PUB:x` + `typeof(pp["getProperty"])==="function"`）——**AOT 输出与 `adl` 逐条相同**；②`examples/proxy.as` **41 条断言**（含 4 组反向对照：真槽不被接管、公有命名空间不是拦截器、裸/部分子类的错误号、非函数调用抛 `#1006`）编译运行 **exit 0**；③回归 `node test.ts` **126 例全通**（`PASS proxy.as`），方法表键改名、vtable 新增字段、`as_fn_call_dyn` 签名变更均无破坏。
+
+⑤ **本阶段顺带修掉一处既有静默**：动态取到非函数值再调用此前**静默返回 `null`**（`as_fn_call_dyn` 的非函数分支），现按 AIR 抛 `TypeError #1006`——这是 `p["m"](1,2)` 的必经路径，也是任何 `Function` 槽为空时的正确行为。
+
+**登记为遗留（下表新增 3 行）**：枚举/点号接管只对**静态类型**为 Proxy 子类的接收者发射（`*` 接收者回落记录槽）、拦截器收到的 `name` 是**原始 String**而非 `adl` 的装箱 String、`getDescendants` 因 `..` 语法不在子集而不可达。**文档**：`README-CN.md` 的「当前限制」新增 Proxy 条目 + 「支持子集」根类行补 `flash.utils.Proxy` + 示例清单新增 `examples/proxy.as`；版本 → **v0.4.33**。
+
+> **判据（§1.5）**：三行遗留全是「`adl` 能跑对、我们跑不出/不忠实」⇒ **遗留**（非增强）；`new Proxy()` / `#2090` / 装箱键名之外的行为均已对齐 `adl`。
+
+---
+
+#### 阶段九十四·二：`with` 语句（v0.4.33 → v0.4.34）✅ 已完成
+
+**触发**：`talkmed-meeting-aot-gap-report.md` §3-L1。工程 **3 处 `with`**：`MeetingWindow.as:180`、`OpenGLVideoRootView.as:44`、`OpenGLVideo.as:260`。
+
+**现状**：`ast.ts` 无对应节点、parser 无 `with`（全工程 grep `WithStmt`/`parseWith` = 0 命中）。
+
+**AIR 语义（须先实测）**：`with (obj) { … }` 在作用域链里插入一个**对象作用域**，以下每一条都必须用 `adl` 钉死而非凭语法直觉：
+
+| 待测点 | 关键分歧 |
+|---|---|
+| 未限定标识符的解析顺序（对象属性 vs 外层词法作用域，谁先） | AIR 是**对象作用域插入在当前作用域之内层**；搞反会让同名变量取错值 |
+| 属性**不存在**时 | 抛 `ReferenceError #1069`？还是静默回落外层作用域？（若抛，就必须生成 `as_dyn_has` 守卫 + 抛错路径，**不得静默回落**） |
+| `with` 块内**声明**的 `var`/`function` 落哪一层 | AIR 里仍归函数体顶层 ⇒ 与既有「顶层整树 `var` 提升」（阶段八十九·三十四）口径核对 |
+| `this` 在块内是否改变 | AIR 不变（`with` 只影响标识符解析） |
+| 嵌套 `with` 的查找顺序 | 内层对象优先，逐层外推 |
+| 与 `dynamic`/`Proxy` 对象的交互 | **与阶段九十四·一 联动**：Proxy 的 `hasProperty` 决定「属性存不存在」，两阶段需同批核对 |
+
+**实现要点**：① `ast.ts` 新增 `With` 节点（`{ kind:'With', obj:Expr, body:Stmt }`）——按 §2.2「先改 AST」；② parser 加 `parseWith()`，复用现有原语（`expect`/`parseExpression`/`parseStatement`），不做任何语义判断；③ codegen 在语义层维护**对象作用域栈**（并入 §2.3 的栈式符号表，不新增全局可变表）：未限定标识符解析时先查栈顶对象（生成 `as_dyn_has` 判定 + 条件回落），命中即 `as_dyn_get`。**这一步不能简化为文本替换**——它是真正的名字解析。
+
+**验收**：① 新 `examples/stage94b.as`（属性命中/未命中/嵌套 `with`/块内 `var` 声明位置/`this` 不变/与 `dynamic` 对象联动）；② adl 双端同源逐条 diff；③ 工程那 3 处 `with` 的实际形态编译通过；④ `node test.ts` 全通 + 新增 `[with]` 钉子。**判据（§1.5）**：`adl` 能跑 ⇒ **遗留**。
+
+**完成（2026-10-03）**：`with` 已落地并**与 `adl 51.4.1` 逐条实测对齐**（探针 `temp/withprobe/`：`adl` 与 AOT 两份输出的 w1~w24/x2~x13/y1~y7/z1~z4 编号与取值全同）。落地形态：接收者**只求值一次**进 C 局部；**静态类型接收者**走编译期成员解析——把 `name` 脱糖成普通 `Member` 节点（`{kind:'Member', object:{kind:'Var',name:<tmp>}, property:name}`），因此字段/getter/setter/方法绑定/GC 写屏障**全部复用既有成员路径**，发射出**无分支 C**；**`*`/`Object`（记录槽）/动态类/`Proxy`** 接收者发射运行时 `(as_dyn_has(o,"k") ? as_dyn_get/set/call/del(o,"k") : <词法回落>)` 三元（`Proxy` 因此天然走拦截器协议）。名字解析顺序、缺失穿透（读与**写**都穿透）、体内 `var` 局部性、`this` 不变、嵌套内层优先、`delete` 解析到对象、`#1009`/`#1010`/`#1074`/`#1065` 四个错误路径均由 `adl` 实测钉死（错误编号与异常类一致）。实现里定位并修掉 3 个真缺陷：①`Object` 静态类型接收者必须走运行时记录槽路径；②只读属性判定用错（`fieldSlot(...) !== null`，应为 `!== undefined`）导致 `#1074` 永不触发；③词法回落 thunk 一度把整个语句的作用域都关掉，使**调用实参与赋值右值**看不到 with 作用域（实测 `w2/w3` 必须看到）——改为**一次性**的 `suppressWithName`/`suppressWithCallee` 标志，只豁免被重解析的那**一个**名字。另修一处**既有 UB**（同批发现）：记录槽 vtable（`as_object_vt`）此前是短的前缀结构，而生成类 vtable 在其后追加了 `toString`/`hasOwnProperty` 两槽 ⇒ `({k:1}).hasOwnProperty("k")` 与 `props.hasOwnProperty(name)`（`VarsCore` 风格写法）会**跳垃圾函数指针**（实测 bus error）；现统一为 `as_object_vtable` 全结构并补齐 `as_object_own_has_own_property`/各装箱 `toString`。**收尾**：`examples/with.as`（27 条断言）纳入回归、`node test.ts` **126 例全通**、`README-CN.md` 当前限制新增 `with` 条目 + 语句行补 `with` + 示例清单补 `examples/with.as`；**新增 5 行遗留**（见下表）。版本 → **v0.4.34**。
+
+---
+
+#### 阶段九十四·三：`flash.utils.getQualifiedSuperclassName` + `setInterval` / `clearInterval`（v0.4.34 → v0.4.35）✅ 已完成
+
+**触发**：`talkmed-meeting-aot-gap-report.md` §3-L2-2（`flash.utils` 全局函数缺三项）。
+
+**现状（grep 实测）**：
+
+| API | 现状 | 位置 |
+|---|---|---|
+| `getQualifiedClassName` | **已落地**（阶段八十六） | `emit.ts:14638` 发射点 + `runtime.ts:2333` `as_qualified_class_name`（读 vtable `fqn` 槽） |
+| `getQualifiedSuperclassName` | **未注册**（grep 0 命中） | — |
+| `setTimeout` / `clearTimeout` | **已落地**（阶段五十一；`emit.ts:14663/14678` 分派 + `runtime.ts:1179` `as_timers` 表） | 含 `this.method` 函数值与 `as_set_timeout_args` |
+| `setInterval` / `clearInterval` | **未注册**（grep 0 命中） | — |
+
+**AIR 语义（须先实测）**：
+- `getQualifiedSuperclassName(v)`：`Object` 的**超类**给什么（`null` 还是 `"Object"`）？对**接口类型**/`int`/`null`/原始值各给什么？`'::'` 分隔与 `flash.filesystem::File` 的往返口径须与 `getQualifiedClassName` 一致（后者实测见阶段八十六）。大概率是「沿 vtable super 链取上一层 `fqn`」的纯函数，但**四个边界值必须实测**。
+- `setInterval(closure, delay, ...args)`：返回值（`uint`）与 `setTimeout` 是否**共用同一 id 空间**；**重复间隔的时序语义**（固定间隔 from-start 还是 from-completion）；`clearInterval` 在本轮回调内调用是否停掉后续全部；**`clearInterval` 能否取消 `setTimeout` 的 id、`clearTimeout` 能否取消 `setInterval` 的 id**（AIR 里两者常共用一张表——**这一条直接决定实现形态**）；与既有 `Timer`（阶段六十）两张表的执行顺序。
+
+**实现要点**：① `emit.ts` 的全局函数分派（`getTimer`/`setTimeout` 同处）新增 3 个分支；② `getQualifiedSuperclassName` 复用 `as_qualified_class_name` 的 vtable 遍历，取上一层 `fqn`（`Object` 层按实测给值）；③ `setInterval`/`clearInterval` 复用阶段五十一 的 `as_timers` 表——若实测「共用 id 空间/可互换」成立，则只加一个「重复」位 + 到期重挂；若否，则新增第二条定时器泵并在帧边界按实测顺序执行。
+
+**验收**：① 新 `examples/stage94c.as`——超类名 6 例（类/接口/原始值/`null`/`Object`/多层继承）；interval 的 id 互操作、`clearInterval` 自停、与 `setTimeout` 混用；② adl 双端同源逐条 diff，且**记录时序**（固定 tick 下回调次数序列，而非只看最终态）；③ `node test.ts` 全通 + 新增 `[qscn]`/`[interval]` 钉子。**判据（§1.5）**：三项 `adl` 均有 ⇒ **遗留**。
+
+**完成（2026-10-03）**：三项均已落地，语义全部来自 `adl 51.4.1` 实测（探针 `temp/qscnprobe/`、`temp/intervalprobe/`、`temp/mixprobe/`）。
+
+- **`getQualifiedSuperclassName(v)`**：`emitGlobalCall` 新增分派 → runtime `as_get_qualified_superclass_name`（按 box tag 分派后**沿 vtable 走恰好一层 `super`**）。实测边界全对齐：多层链 `Leaf→Mid→Base→Object→null`；**无超类给 AS3 `null`**（`Object` 本身 / 接口 / 普通对象 `{}` / `null` / `undefined`，`typeof` = `"object"`、`=== null` 为真）；装箱原始类型 / `Array` / `Function` → `"Object"`（装箱 vtable `super` 指向 `as_object_vt`，故自然落到该分支）；限定名与 `getQualifiedClassName` 同口径（`scenes::SceneBase` 保留包前缀，实测）。返回类型声明为 **String**（`NULL` == AS3 `null`，字符串助手全部 NULL 安全），故 `== "包::类"`、`.indexOf()`、`.length` 都是静态字符串操作（示例已钉）。
+- **`setInterval`/`clearInterval`**：复用阶段五十一 的 `as_timers` 表 —— 实测「**共用一张表 + 一个 id 计数器**」成立（id 跨两者 `1,2,3…`），故只加了 `int repeat; double delay;` 两列 + `as_set_interval_args`（委托 `as_set_timeout_args` 后翻 `repeat` 位），`clearInterval` 直接复用 `as_clear_timeout` ⇒ **两者互为取消**（实测：`clearInterval(timeoutId)` 不触发、`clearTimeout(intervalId)` 不触发）、未知/0 id 静默空操作。时序按实测建模：**回调结束后**再排下一次（50ms 回调配 20ms 间隔 ⇒ 间隔 ≈69ms），且每个 tick 至多触发一次（延迟 0/1ms 的间隔实测也是每帧一次）；在自身回调里 `clearInterval` 停掉后续全部 tick（`alive == 2`「正在触发」标记 + 回调后按 id 重找槽位，回调里 realloc 表也安全）。失败面按实测补齐：**负/NaN 延迟 → `RangeError #2066`**（实测 `setInterval(-5)`/`setTimeout(-5)`/`NaN` 三者同号，且该次调用**不消耗 id** —— 已在 `as_set_timeout_args` 入口守卫），**`null` 闭包不报错、仍消耗 id、永不回调**（实测 `setTimeout(null,100)` 返回 `1`，与旧实现返回 `0` 不同，已改）。同泵顺序 = 注册（id）顺序（实测 `T`/`I` 两种注册顺序各自保序）。
+- **收尾**：`examples/stage94c.as`（**36 条断言**）纳入回归；`test.ts` 新增 **`[qscn]` 13 项 + `[interval]` 16 项**钉子（钉运行时助手形态、emit 分派、String 类型化、以及示例里的实测边界）；`node test.ts` **128 例全通**；`README-CN.md` 的「内建」行补两个 API、「当前限制」新增条目、示例清单补 `examples/stage94c.as`。**登记 1 行遗留**（反射 API 的内建类短名/`int` 装箱成 `Number`/接口与内建类 Class 值不可表达 —— 与阶段八十六 条目同源，见下表）。版本 → **v0.4.35**。
+
+---
+
+#### 阶段九十四·四：`ByteArray` 多字节 / 布尔 / AMF 对象读写（v0.4.35 → v0.4.36）✅ 已完成
+
+**触发**：`talkmed-meeting-aot-gap-report.md` §3-L2-3——`ByteArray` 是工程**第 2 高频** import（214 处），缺的 6 个方法会在**协议层/加密层/资源层同时爆雷**；报告把它列为 L2 里**性价比最高**的补齐项。
+
+**现状（`src/symbols.ts` 的 `ByteArray` 方法表，grep 实测）**：
+
+| 方法 | `ByteArray` | `Socket` / `URLStream` | 工程调用次数 |
+|---|---|---|---|
+| `readMultiByte` / `writeMultiByte` | **未注册** | 已有（`charSet` 被忽略） | 15 / 24 |
+| `readBoolean` / `writeBoolean` | **未注册** | 已有（`Socket`） | 1 / 1 |
+| `readObject` / `writeObject` | **未注册** | 未实现 | 3 / 5 |
+
+**顺带要纠正一处既存注释**：`emit.ts:5438` 与 `emit.ts:5634` 都写着「charSet is ignored exactly like `ByteArray.readMultiByte` in this subset」——**但 `ByteArray` 根本没有 `readMultiByte`**（`symbols.ts` 方法表里不存在）。注释把 `Socket`/`URLStream` 的行为挂到了一个不存在的 `ByteArray` 方法名下，本子阶段落地时**就地改正**，避免以讹传讹。
+
+**与遗留表的关系**：`readObject`/`writeObject` 已在**遗留表「AMF 编解码」独立行**登记（AMF0/AMF3 双版本 + 引用表 + trait + 别名注册表）。本子阶段与该行**同源**，应**合并为一个实现**（`ByteArray` 读写对 + `URLStream` 复用），而非两处各写一份；落地后该遗留行随之移出。
+
+**AIR 语义（须先实测，`charSet` 是重点）**：
+- `readMultiByte(length, charSet)` 的 `charSet` **不是摆设**：AIR 支持 `"utf-8"` / `"unicode"`（UTF-16）/ `"gbk"` / 系统代码页别名等；**未知 `charSet` 的失败模式**（抛错号？静默按 latin-1？）必须实测。
+- 编码字节序（UTF-16 的 BOM 与 `endian` 属性是否相关）、**非法/截断的多字节序列**的行为。
+- `writeMultiByte` 对代理对 `"\u{1F600}"`、`charSet="unicode"` 的字节输出，与 `adl` **逐字节**对照。
+- `readBoolean`/`writeBoolean`：**非 0 是否即 true**（`0xFF`/`0x80`/`0x01` 三值）、写入是 1 字节还是 4 字节。
+- `readObject`/`writeObject`：默认 `ObjectEncoding`、引用表、`trait` 形状、`registerClassAlias` 交互——现有探针只测到空 `URLStream.readObject()` 抛 `#2029`，**语义面远未采全**。
+
+**实现要点**：① `symbols.ts` 的 `ByteArray` 方法表补 6 项 + `emit.ts` 补 `ByteArray_*` 发射点；② `readMultiByte`/`writeMultiByte` 走**真正的编码器**——按 §2.9「链接而非内嵌」，GBK 等字符集**优先链接系统 `iconv`/CoreFoundation 转换器**，不自研字符集表；`utf-8`/`unicode` 可先用既有的 `as_str` 与手写 UTF-16 路径；③ AMF 编解码器实现一次、`ByteArray` 与 `URLStream` 共用。
+
+**验收**：① 新 `examples/stage94d.as`（`utf-8`/`unicode`/`gbk` 往返 + 代理对 + 非法序列 + 布尔三值 + AMF3 对象图 round-trip）；② adl 双端**逐字节**对照（`ByteArray` dump 比对，而非只比字符串）；③ `com.hurlant`（Crypto）/ `as3swf` 的最小用例编译并运行通过；④ `node test.ts` 全通 + 新增 `[bytearray]` 钉子；⑤ 遗留表「AMF 编解码」行移出并并入本子阶段。**判据（§1.5）**：6 个方法 `adl` 全有 ⇒ **遗留**。
+
+**完成（2026-10-03）**：`ByteArray` 的 6 个方法全部落地，并**与 `adl 51.4.1` 逐字节对齐**（探针 `temp/amfprobe/`：`AmfMain`/`Amf2Main`/`HdrMain`/`DtoMain`/`mb` 五支 `adl` 程序 + AOT 对照 `aot.as`~`aot5.as`）。落地形态：
+
+- **多字节（`readMultiByte`/`writeMultiByte`）**：`utf-8` 在本运行时内校验/拷贝（非法首字节与截断尾**丢弃**，与 `adl` 的有损行为一致）；`unicode`/`utf-16` **恒为 UTF-16LE、无 BOM、`endian` 属性无效**（实测 `Aé中` 在 BE/LE 下都是 `41 00 e9 00 2d 4e`，`utf-16be` 才强制大端）；其余代码页走**系统 `iconv`**（native 构建 `link-libs` 追加 `iconv`，仅 darwin；`__EMSCRIPTEN__`/`__wasi__` 下 `AS_HAVE_ICONV=0`，非 UTF-8/16 字符集**响亮抛错**）；`""`/未知字符集回落 **OS 传统编码**（Apple `MACINTOSH`、其余 `CP1252`，实测与 `adl` 的 `é`→`8e`/`中`→`3f` 一致）；目标字符集表达不了的字符**手写 `'?'`**（实测 macOS `//TRANSLIT` 会给出 `'e` 而非 `adl` 的 `3f`，故**不用** `//TRANSLIT`）。
+- **布尔（`readBoolean`/`writeBoolean`）**：写 **1 字节**；读**非零即真**（`0xFF`/`0x80`/`0x01` 实测皆 true）；两者越界都抛 `EOFError #2030`（`as_throw_eof`），这是本子集**首次**引入「读越界即抛错」的 IDataInput 口径。
+- **AMF3 编解码器（写 + 读）**：编解码器**放在 `runtime.ts` 前导**（而非 `emit.ts`），因为它需要多行 C；而生成期事实（每类的 trait 成员表、`Date`/`ByteArray` 构造器、`getDefinitionByName` 注册表）通过**钩子**（`as_amf_members_hook`/`as_amf_class_hook`/`as_amf_date_hook`/`as_amf_ba_out_hook`/`as_amf_vec_hook` 及两个 `_new_hook`）由新增的生成函数 `as_amf_wire()` 在 `main` 顶部装配——前导**早于**生成段发出，不能直接命名 `Error`/`ByteArray`/`Date`，故错误以**错误码**（`as_amf_err{code,detail}`）返回、由生成段的 `as_amf_throw_err` 映射成带类型的抛出。
+- **AMF3 线格式（全部实测，含三处决定性发现）**：①**动态键、trait 类名与 trait 成员名用「裸 U29S」（无 `0x06` 标记）**，只有字符串**值**带 `0x06`，二者共用字符串表；②**trait 类名不进字符串表**（实测同一次写入里字段值 `"b"` 的引用下标是 2 而非 3）；③**纯稠密数组不写关联段终止符**（`[1,2,3]` = `09 07 01 04 01 04 02 04 03`），`01` 只在 `assoc > 0` 时补；④`Date` = `08` + 内联 U29O `01` + 8 字节大端毫秒；⑤判读侧 **U29O 位序 = bit0 内联对象 / bit1 内联 trait / bit2 externalizable / bit3 DYNAMIC / bit4+ 成员数**（用**手工构造的字节流**喂 `adl` 反推：`bit3` 的 0 成员对象读回 `{k:"v"}`，`bit2` 或 `bit2+3` 都被 AIR 自己以 `#2173` 拒绝——此前把动态位写成 bit2 是错的）；⑥`Vector.<int>[1,2]` = `0d 05 00 <大端 int> <大端 int>`。AMF0 语义也已采全（number/`00`+double、ECMA 数组 `08`、typed object `10`、Date `0b`），但**本子阶段只实现 AMF3**，`objectEncoding != AMF3` 时**响亮抛错**（不静默按 AMF3 写）。
+- **反射对接与三处既有 UB 修复（本子阶段的必要前置）**：`getQualifiedClassName`/`getQualifiedSuperclassName` 曾在 `Vector`/`Dictionary`（无 vtable 前导的 GC 体）上**段错误**——新增 `as_heap_kind()`（`gc_in_heap` + `gc_hdr(p)->type`）按 GC 类型分派；`as_dyn_get/set/has/del` 在**经 `*` 接收者**触达 `Dictionary`/`Array` 时同样段错误——新增 `as_dyn_kind()` 路由到 `as_dict_*`/`as_array_prop_*`。**并且**：`Vector.<T>` 是 `{mark,data,length,capacity}` 的**单态化结构体**（`GCT_CUSTOM`），**不是** `as_array`，写入侧原先按 `as_array` 读 `props` 会越界 ⇒ 改为按 **mark 回调指针**识别每个特化（`as_amf_vec_impl`），未知元素类型**响亮报错**。
+- **顺带修掉的三个子集缺口（都由真实第三方代码首次触达）**：①**`ByteArray` 的整数下标写** `ba[i] = v`——AVM2 给 `ByteArray` 一个**下标写**语义（不是动态属性表，故 AIR 在此**不抛** `#1056`，而本子集此前抛）：实测 `adl` 后按 `ToUint32` 取低字节（`300`→`44`、`-1`→`255`、`1.7`→`1`、`"x"`→`0`、`true`→`1`、`null`→`0`）、写到 `length` 处**自动扩展并零填充**、**不动 `position`**；新增 `ByteArray_set_index` 并接进 `emitAssign` 的索引分支。②**`new C` 省略参数列表**（`new ByteArray;`——`parser.ts` 的 `parseNew` 此前只对 `Vector.<T>` 放行，现按 AS3 语法对**所有** `new X` 放行）。③**`a[i] ||= v` / `a[i] &&= v`**（索引目标的短路赋值——`emitLogicalAssign` 此前只支持简单变量/字段目标；现按「接收者/索引/右值必须无副作用」的前提复用既有索引读写路径，副作用目标仍**响亮报 `CodegenError`**）。
+- **真实第三方代码验收（本子阶段的最强证据）**：把工程里的 `com.hurlant.crypto.hash.MD5`（`Documents/TalkMED/ActionScript-Lib/`，逐行未改）与 `IHash` 一起编译并与驱动链接运行，`md5("abc")` 得到 `900150983cd24fb0d6963f7d28e17f72`（**与 RFC 1321 一致**）——它正好同时用到 `new ByteArray;`、`src[src.length] = 0`、`x[i] ||= 0`、`readUnsignedInt`/`writeUnsignedInt`，是本子阶段「`ByteArray` 深度」补齐后**第一段跑通的真实加密库代码**（探针留在 `temp/hurlant/`）。
+- **收尾**：`examples/stage94d.as`（**67 条断言**，全部对应 `adl` 实测字节）纳入回归；`test.ts` 新增 **`[amf]` 19 条** + **`[bytearray]` 9 条**钉子（iconv 门控、UTF-16LE、`'?'` 手写、OS 回落、`#2030`、iconv 仅 darwin 链接、`objectEncoding` 默认、裸 U29S、trait 类名不入表、动态位 bit3、Vector 按 mark 探测、大端标量、AMF0 拒绝、别名沿超类链、下标写按 `ToUint32` 截断/扩展零填充/不动游标、`new C` 省略括号、`a[i] ||=` 与其副作用拒绝、示例 golden）；`node test.ts` **129 例全通**；`README-CN.md` 内建行 + 语句行（`new C`/`a[i] ||=`）+ 当前限制新增条目 + 示例清单；**遗留表新增 8 行、AMF 行由「未开始」改为「部分完成」**（见下）。版本 → **v0.4.36**。
+
+---
+
+#### 阶段九十四·五：A 批遗留攻坚（`ByteArray` 收口 / `as Object` / `Function` 成员 / `Vector` 反射名 / AMF 成员序）（v0.4.36 → v0.4.37）✅ 已完成
+
+**触发**：阶段九十四·四 收尾时遗留表里 6 项「低成本机械补齐」候选——互不同源，但都属「`adl` 可逐字/逐字节对照、改动面小」的同一类账，一次性批量收口，避免零散返工。
+
+**本批 6 项（全部 `adl 51.4.1` 实测驱动）**：
+
+| # | 遗留项 | 结论 | 证据（探针 / 钉子） |
+|---|---|---|---|
+| A1 | 更早的 `ByteArray` 读方法**越界不抛** `#2030` | **已修**：`emit.ts` 里 **17 个**读点全部接上 `as_throw_eof()`（`EOFError`/`#2030`），与阶段九十四·四 新引入的 IDataInput 口径统一；`com.hurlant` 这类按字节读的代码已同步核对（`temp/hurlant/` 仍通过） | `examples/stage94d.as` + `test.ts` `[bytearray]` |
+| A2 | `ByteArray` **负索引**下标写口径未实测 | **已实测并对齐**：`b[-1]` **读**抛 `#1069`（`as_throw_sealed_get`）、`b[-1] = 5` **写**抛 `#1056`（`as_throw_sealed_set`）；**写**越界（`b[b.length]` 及更远）自动**扩展并零填充**、**不动 `position`** | `temp/a2probe/`；`examples/stage94d.as` |
+| A3 | `x as Object` **丢记录动态属性** | **已修**：`emitAs` 的 `Object` 分支原先对任何非对象操作数直接返回字面 `NULL`（`({k:"v"}) as Object` → `NULL.k`）；现改为复用 `convert(o, Object)`——静态显式 `as` 与隐式 `var o:Object = n` 两条路**共用同一实现**，口径不会漂 | `temp/a3probe/`（`n as Object` → `5` 且 `qc=int`；`null`/`undefined as Object` → `null`；记录/数组保留成员；`(5 as Object) == 5` → true）；`test.ts` `[cast]` 5 条 |
+| A4 | `with` 对象上的 **`Function` 值成员**不能以 `fn()` 调用 | **已修，且发现原行前提有误**：`cb.fn()` **点号调用同样是硬错误**（`undefined method 'fn' on class 'Cb'`），并非「与既有 `cb.fn()` 发射相同」。现 `emitCall` 的 Member 分支与 `withCallFrom` 的 sealed 分支都在报错前先 `findField`：**Function 类型**字段走 `emitFunctionCall`，非 Function 字段**保持响亮报错** | `temp/a4probe/`；`test.ts` `[fncall]` 5 条 |
+| A5 | `getQualifiedClassName(Vector.<T>)` 给 `"Array"` | **已修**：`Vector.<T>` 是 `GCT_CUSTOM` 单态结构体（无 vtable，首字是 per-spec `mark` 指针）；新增两个运行时**钩子** `as_vec_fqn_hook`/`as_vec_super_fqn_hook` + 生成函数 `as_vec_fqn_impl`/`as_vec_super_fqn_impl`/`as_vec_fqn_wire`，由 `as_get_qualified_class_name`/`…superclass_name` 在 `GCT_CUSTOM` 时查询（`Array`/`Object` 旧口径只在**非**自定义堆对象时保留） | `temp/a5probe/`（int/uint/Number/String/Boolean/Object/Array/嵌套/`pkg::Thing`/接口 逐类对照）；`test.ts` `[vecfqn]` 8 条 |
+| A6 | AMF **trait 成员序**与 AIR 不一致 | **实测定案：不可对齐（非缺陷）**——见下 | `temp/a6probe/`；`test.ts` `[amforder]` 2 条；`docs/zh-cn/as3-semantics.md` §3 |
+
+**A4 的 `this` 发现（顺带更正一条既有口径的前提）**：`adl 51.4.1` 三行对照实测（`temp/a4probe/`）——① `cb.fn()`；② `with (cb) { fn() }`；③ 裸 `fn()`。①② 都把 `this` 绑到**接收者**（连顶层普通函数也如此），③ 不绑（`this` 是全局对象）。本子集的闭包在**创建点**词法捕获 `this`（`env->this`），呼叫点无法重绑 ⇒ 本子阶段让 ①② **可编译可调用**（净收益），但 `this` 仍是闭包自己的；该差异已作为**新遗留行**登记（含 `call`/`apply` 的 `thisArg` 同源问题），**未静默吞掉**。
+
+**A6：为什么这条不是缺陷（三次受控实验，`temp/a6probe/`）**：
+
+1. **不是声明序**：把同一组四个成员**反序声明**（`Rev{d,c,b,a}`），`adl` 的 `describeType` 与 AMF trait 序与正序的 `Big{a,b,c,d}` **逐字相同**（都是 `a c b d`）⇒ 顺序只由「成员**名字集合**」决定。
+2. **不是运行期随机**：同一个 SWF 连跑三次，顺序完全一致 ⇒ 由**构建产物**决定。
+3. **是编译期布局产物**：源码**只加一个未被引用的类**，顺序不变；但加 **3 个无关的、被 `registerClassAlias` 引用的类**后，**未被触碰**的 `Mix` 的序从 `n1 u1 s1 o1 s2 i2 i1 b1` 漂到 `o1 n1 s1 u1 i2 b1 i1 s2`；把源码还原重建，序又复原。
+
+⇒ 这是 AVM2 内部 trait/多重名表布局的副产品（连 `adl` 自己都无法在源码演进中保持稳定），**不是语义规则，没有可对齐的目标**；AMF 互通也不依赖它（trait 自带成员名）。故**移出遗留表**、写入 `docs/zh-cn/as3-semantics.md` §3 决策分歧点；本实现的**声明序**（`Quad_amf_members[] = { "a", "b", "c", "d", NULL }`）作为**本方口径**钉住。⚠️ 由此**收窄** 阶段九十四·四 的「与 `adl` 逐字节一致」：应读作「**trait 成员名/值的编码形态**逐字节一致」。
+
+**本批净效果**：新 `examples/stage94e.as`（`[cast]`+`[fncall]`+`[vecfqn]`+`[amforder]` 四组断言，含 A6 的字节级 golden）纳入回归；`test.ts` 新增 **20 条**钉子（5+5+8+2）；`node test.ts` **130 例全通**（阶段九十四·四 的 129 + 本批）；遗留表**移出 6 行、新增 3 行**（`Vector.<*>` 不支持、Function 值的 `this` 重绑、`ByteArray` 正索引越界读给 `0`）；`README-CN.md` 当前限制 + 示例清单；`docs/zh-cn/as3-semantics.md` §3 新增决策分歧点。版本 → **v0.4.37**。
+
+---
+
+#### 阶段九十四·六：C 批遗留攻坚 · C1（`DisplayObject` 几何与命中测试）（v0.4.37 → v0.4.38）✅ 已完成
+
+**触发**：C 批的条目都是「AIR 已定义、我们跑不出」的**可见缺陷**（§1.5 的硬判据），按依赖顺序先做 C1（显示层几何）——它是 C2（输入簇：可编辑文本的命中 / 插入点 / 选区）的地基：插入点、选区高亮、`getCharIndexAtPoint` 全都建立在「舞台坐标 → 对象局部坐标」的同一套变换上。
+
+**四条 C1 行全部实测定案（`adl 51.4.1`，探针 `temp/c1probe/` 4 个 + `temp/c1probe/click/` 真鼠标点击 1 个）**：
+
+| 项 | 原行主张 | 实测结论 |
+|---|---|---|
+| C1-1 | `Sprite`/`MovieClip` 没有 `graphics` | **已修**：`Sprite`/`MovieClip`/`Shape` 都有 `graphics`。实现为**惰性 getter**（私有 `_graphics`，`Sprite_get_graphics` 首次访问才 `Graphics_new()`）——`Shape_ctor` 那种「每实例无条件分配」会给 Starling 的每个容器都加一次分配 |
+| C1-2 | `Shape`/`Bitmap` 的 `width`/`height` 是**存储槽**、赋值**无效**、只读 | **已修，且原行前提错了一半**：`width`/`height` 是**派生访问器**（内容包围盒经自身变换），但赋值**不是无效**——AIR 是**缩放**（`scaleX = scaleX * value / cur`；实测 50 宽 + `width=100` → `scaleX=2`、`width` 报 100、`getRect` 仍 50 宽）。两个方向都实现：读走内容派生、写走缩放；空内容（或 `NaN`）写 → `scaleX=0` |
+| C1-3 | `as_pick_hit` 不做父→子坐标变换（只有绝对坐标对象可点） | **已修**：改为**变换感知**——`as_mat_*` 合成父链矩阵逐层折算，命中判定走内容的**局部包围盒**；`as_local_point` 同时供 `hitTestPoint`、`MouseEvent.localX/localY`、`as_tf_index_at` 复用 |
+| C1-4 | setter 的语义（原行未覆盖，本轮实测补） | **与 C1-2 同一对访问器**：setter 是**缩放**（`scaleX = scaleX * value / cur`），空内容或 `NaN` → `scaleX = 0`；`TextField` 例外（写真实字段）。`test.ts` 的 `[geometry]` 有 2 条钉子钉住这一对 |
+
+**关键实现选择（都是实测倒逼的，不是设计喜好）**：
+
+- **`Graphics` 自持 CPU 侧路径包围盒**（`_bl/_bt/_br/_bb/_has_b`，每次 `moveTo/lineTo/curveTo/drawRect/drawRoundRect/drawCircle` 更新，含控制点，对齐 `SkPath::getBounds()`）：这样 `width`/`height`/命中测试在**纯 C（无 Skia）构建**下也测得对——Skia 桩返回 0，实测直接暴露（`FAIL: shape 50x30 width (got 0, want 50)`）；且每次读 `width` 不必调 Skia。
+- **描边计入 `width/height`，但不计入命中**：实测「0→100 的线 + 10px 描边 → 110×10」（`getRect=(0,0,100,0)`）。门控条件是 `strokeWidth > 0.0` 而非 `g->stroke != NULL`——纯 C 构建里 Skia paint 是 NULL，用 paint 判会漏描边（`FAIL: stroke-only line width (got 100, want 110)`）。
+- **`TextField` 把尺寸存进私有 `_fieldWidth`/`_fieldHeight`**：`DisplayObject` 的字段一旦改成 getter，字段解析优先级（`fieldSlot` 先于 getter）就要求 TextField 保留真存储——getter 报「字段 × `scaleX`」（实测 123@scaleX2 → 246），setter 写字段（实测 `width=200` 后 `scaleX` 仍 2、报 400）。
+- **不可见子节点计入包围盒，但不渲染**：实测「隐藏子节点仍撑宽父容器」；`as_bounds_walk` 计入、`as_render_bounds` 跳过。两处口径不同，已分别注释。
+
+**本批净效果**：新 `examples/stage94f.as`（覆盖宽度/高度派生与缩放、描边、旋转/矩阵 AABB、容器并集、`Sprite`/`MovieClip.graphics`、`Bitmap`/`TextField` 尺寸、变换感知命中）纳入回归；`test.ts` 新增 `[geometry]` 钉子 **18 条**；`node test.ts` **131 例全通**（含 `[geometry]`、`[textwrap]`、`[native-window]` 全部钉子，`exit=0`）；`temp/nwtest/drive_demo.py` 真鼠标点击验收（重建 `examples/air-native`）**RESULT: PASS**；遗留表**移出 3 行、新增 2 行**（见下）。
+
+**顺带修掉一个自伤 bug（本轮踩到）**：`as_bounds_walk` 里多写的一处 `this.indent++` 让此后 **188 个文件作用域函数**在生成的 C 里带上缩进，而 `staticizeTopLevelFunctions` 只处理「行首无缩进」的行 ⇒ 这些函数**丢失 `static`**，`-O2` 的调用图裁剪整段失效（体积回涨）。是 `[native-window]` 的 **21 条钉子**在回归里抓出来的（它们匹配 `static void NativeWindow_ctor(...) {`）；已修，钉子全绿。
+
+---
+
+#### 阶段九十四·七：C 批遗留攻坚 · C2（可编辑 `TextField` 与键盘/文本输入）（v0.4.38 → v0.4.39）✅ 已完成
+
+**目标**：把八十九·七十七 留下的四条输入面缺口（可编辑文本的键入/粘贴/剪切、编辑键对插入点与选区的操作、非 US 布局与 Option 组合字符、web 键盘/剪贴板接线）按 `adl 51.4.1` 的真实语义落地。native 侧全做；web 侧按 §1.5 **如实报明未支持**（见遗留表）。
+
+**证据台**：`temp/editprobe/`（探针 `src/Ed1.as`…`Ed4.as` + `src/Def.as`/`Def2.as` 默认值与常量探针，驱动 `drive_ed2.py`/`drive_ed3.py`/`drive_ed4.py`/`drive_min.py`/`drive_shift.py`/`drive_sh3.py`/`drive_dbl.py`；`README.md` 里有归一化配方与逐条结论）。同一驱动**两端跑**（`adl` 与 AOT 产物），日志归一化后逐行 `diff`。
+
+**实测口径（全部来自 `adl`，非推测）**：
+
+| 面 | 实测结论 |
+|---|---|
+| 键入时序 | `keyDown`（cancelable=true）→ `textInput`（cancelable、bubbles、**插入之前**）→ 按 `maxChars` 截断后插入、光标落在插入串之后 → `change`。达 `maxChars` 时 `textInput` 仍带完整载荷、但不插入也不 `change` |
+| `preventDefault` | `keyDown` 被取消 ⇒ 整次 `textInput` 都不派发；`textInput` 被取消 ⇒ 不插入不 `change`；改写 `e.text` 下游监听器看得见，但字段插入的仍是**原始**文本 |
+| 编辑键 | `Backspace`(8) / `Delete`(46, cc=127) / `Home`(36) / `End`(35) / 方向键 37~40；`Home`/`End` 是**整段文本**首/尾（多行也是）；`Up`/`Down` 按**硬行**走并保留列；单行 `Up`/`Down` 不动；有选区时方向键**塌缩到近端**而不是继续跨过 |
+| Shift+Home/End | **不对称**（AIR 自身怪癖）：`Shift+Home` 把选区起点拖到 0 而**光标不动**；`Shift+End` 把选区长到文本尾且**光标落到尾** |
+| Shift+Delete | AIR **完全不动**：keyDown **不派发**（Apple 的「剪切」快捷语义不成立）、文本与选区不变；配对的 keyUp 照常派发 |
+| Cmd 加速键 | `Cmd+A/C/X/V` 吞掉**字母**的 keyDown 与 keyUp（编辑仍发生），但 Cmd 自己的 keyDown 会派发（kc=15, ctrlKey=true）；`Cmd+Z` **不是**加速键（照常派发、无效）；按住 Cmd 期间，方向键/字母的 keyDown 会到、**keyUp 不到**，而 Cmd 自己的 keyUp 会到 |
+| `stage.focus` | 键盘焦点切换派 `focusOut`+`focusIn`，且键盘 `focusIn` **全选**（这正是 Cmd+C 能整段复制的原因） |
+| 鼠标 | 拖拽选区**只在 `type='input'` 生效**（dynamic+selectable 字段拖拽只让光标跟到落点）；**双击选词对两者都生效**，发生在**第二次 mouseDown**（早于 mouseUp/click），词 = 最大非空格串、光标在词尾 |
+| 组合字符 | 走独立的文本通道：`Option+e` → keyDown kc=0/cc=180 后 `textInput "´"`；`Option+8` → `textInput "•"`（UTF-8 三字节而 AIR 的 `caretIndex` 只 +1） |
+| 默认值 | `new TextField()`：`type="dynamic"`、`maxChars=0`、`displayAsPassword=false`、`restrict=null`、**`tabEnabled=false`**（不是 true）、`tabIndex=-1`、`selectable=true`、`autoSize="none"`、`text=""`（**不是 null**）、`width/height=100`；`TextFieldType.INPUT/DYNAMIC="input"/"dynamic"`、`TextEvent.TEXT_INPUT="textInput"`；`stage.tabChildren=true`、`stage.tabEnabled=false` |
+| `tabEnabled` 联动 | `type` **真的变化**时 `tabEnabled` 跟到 `(type == "input")`（dynamic→false、→INPUT→true、→回 dynamic→false）；把同一个值再赋一次**不动**手改过的 `tabEnabled` |
+
+> ⚠️ **本行前半句已被阶段九十四·八 推翻**（见下）：`dynamic + selectable` 字段**同样**支持拖选与 `Cmd+C`；C2 当时只做了一次合成拖拽就下了结论。双击选词发生在第二次 mouseDown、词 = 最大非空格串这两点仍然成立。
+
+**实现**（`vendor/window_glue.cc` / `src/runtime.ts` / `src/symbols.ts` / `src/emit.ts`）：
+
+- **文本通道**：不新增回调（那要改约 15 个签名），而是复用 `on_key` 的**保留类型 `"textInput"`** + 新 `sk_window_text_take(id, buf, cap)` 取字节；glue 收 `SDL_TEXTINPUT`（UTF-8，按 `e.text.windowID` 路由窗口）后置脏位，`ASC_window_on_key` 里排空 → `Stage_dispatchText`。`SDL_StartTextInput()` 在建窗后调用（否则 macOS 不给 `SDL_TEXTINPUT`）。
+- **`"wordSelect"`**：鼠标通道用同一套保留类型技巧（`on_mouse(id,x,y,"wordSelect")`），由 AS3 桥接层拦下并把词选区直接写到字段上，**不会**变成 `MouseEvent`（文本编辑态，与 `MouseEvent.DOUBLE_CLICK` 是两条路；后者走独立的 `"dblclick"` 保留类型，见阶段九十四·十一）。
+- **键盘**：`Stage_dispatchKey` 重写（keyDown 抑制位 `as_key_text_suppressed` 一次性消费、编辑键分派、Shift+Delete 吞掉、Cmd 按住时吞 keyUp）；`as_tf_edit_key` 实现 Home/End/箭头/上下行/Cmd/Option 词跳；`as_tf_word_select` 实现双击选词。
+- **模型**：`TextFieldType` 常量类、`TextEvent`（`text` 槽 + `TEXT_INPUT` + `(type,bubbles,cancelable,text)` 构造）、`TextField` 新槽 `type`/`maxChars`/`displayAsPassword`/`restrict`（`restrict` 是 C 关键字 ⇒ 走 `cIdent` 的 `_restrict`）；`EventDispatcher_dispatchEvent` 返回 `!event->cancelled`。
+- **默认值修正**：`tabEnabled` 由**误读**的 `true` 改回实测的 `false`（探针里 `true` 是它自己设了 `type=INPUT` 的后果）；`text` 由 `NULL` 改为空字符串（AIR 的 `text` 从不是 null；给 NULL 会让 `f.text == ""` 为假、`f.text.length` 解引用空指针）。
+
+**双端对照结果**（归一化 + 全局去重 + 去时间戳后 `diff`）：`Ed2` 最小回合 **0 行差异**、`Ed4`（`textInput` 取消/改写/preventDefault、keyDown preventDefault）**0 行**、`Ed2` 的 `Shift+Home/End` 矩阵 **0 行**、`Ed2` 双击选词（含 dynamic 字段）**0 行**；`Ed2` 全回合剩 30 行（归一化后）**全部落在 Tab/Shift+Tab**（已登记为焦点遍历缺口，及其 `f2` 选区残留级联）——即**这是整轮唯一未对齐点**；`Ed3` 的 53 行差异逐条归入已登记项（多行字符度量、UTF-8 字节索引、Option 组合键 keyDown、PageUp/Down、以及量测台自身 artifact）。
+
+**本批净效果**：新 `examples/stage94g.as`（常量/默认值/选区模型/`TextEvent`/`dispatchEvent` 返回值共 40 余条断言）纳入回归；`test.ts` 新增 `[textinput]` 钉子 **27 条**（发射出的 C + runtime/胶水源码）；遗留表**移出 2 行、改写 2 行、新增 8 行**（见下）。
+
+**量测台不做的断言（如实记账）**：①双击落点在**空格上**的词边界口径未探（`as_tf_word_select` 的实现按「最大非空格串」且已写在注释里）；②驱动注入的修饰键 keyDown 会出现两次（`flagsChanged` + 显式 VK）而 `adl` 一次——是**合成输入的 artifact**（真键盘不会），不登记为语义差异；③双击由驱动以 `clickState=2` 的**一对** down/up 模拟（真实双击是两对，`SDL` 读到的 `clicks` 都是 2）。
+
+---
+
+#### 阶段九十四·八：`TextField` 边框 + 「动态可选文本」拖选修正（v0.4.39 → v0.4.40）✅ 已完成
+
+**触发**：用户报告两条——①`TextField` 不支持 `border` 属性（编译期报错）；②左侧文本**无法选中/复制**了（「仅在 `type='input'` 才能选」）。②是**回归**：C2 依据 `Ed2` 探针的**一次合成拖拽**误判为「dynamic+selectable 不支持拖选」，并按此把 `mouseMove` 加了 `type == 'input'` 门控。
+
+**证据台**：`temp/editprobe/` 新增探针 `src/Ed5.as`（选区逐事件上报：`mouseDown`/`mouseMove`/`mouseUp` 后读 `selectionBeginIndex`/`selectionEndIndex`/`caretIndex`，含 13a/13b/13c 三组**边界**用例）、`src/Ed6.as`（`BitmapData.draw` + 逐像素扫描边框）、`src/Ed7.as`（真窗口四色字段截图）、`tracesrc/Ed8.as`（颜色属性掩码复核）；新工具 `grabwin.py`（窗口截图 → BMP → 按颜色定位像素包围盒）、`cmp_ed5.py`（结构化比较器，按 `(事件名, 目标, local)` 对齐）；`drive_ed5.py` 扩了边界步骤。
+
+**实测口径二（全部来自 `adl 51.4.1`）**：
+
+| 面 | 实测结论 |
+|---|---|
+| dynamic 拖选 | `dynamic + selectable=true` 字段**支持**拖选：mouseMove 期间选区随落点扩展，mouseUp 后 `Cmd+C` 能把选中文本复制走（**推翻 C2 的误判**） |
+| 锚点 | mouseDown 把光标**塌缩**到命中索引并把它设为 anchor；拖拽期 `begin = min(anchor, idx)`、`end = max(anchor, idx)`、`caret = end`（正向/反向给**同一个**选区） |
+| 「点在既有选区内」 | 判据是**半开区间** `idx >= sel_begin && idx < sel_end`（语义等价于按 AIR 的像素高亮矩形 `[x(begin), x(end))` 判定——**左边界在内、右边界在外**）；Ed5 step 8（按 idx==1 边界 → **保留**）、step 11a（按 idx==26 == end → **塌缩**）、step 13b/13c 一致 |
+| `border` 默认 | `false`（`borderColor` 默认 `0x000000`） |
+| 边框几何 | 四条 **1px 完全不透明、无抗锯齿**的实线，落在字段盒的**外沿像素**上：`x∈{0,width}`、`y∈{0,height}`（即覆盖 `0..width` / `0..height` 的边界像素，不是「内缩 1px」）；`BitmapData.draw` 的源面因此是 `width+1 × height+1`（本实现 `as_render_bounds` 同步 +1） |
+| 边框图层 | 画在**背景之上**、文字之下；随 `width`/`height` 赋值跟随；随字段缩放（`scale=2` 时线到 `x=100`/`y=40`） |
+| 边框与度量 | 边框**不影响** `textWidth`/`textHeight`（Ed6：w 100→100、h 30→30、tw 72→72、th 15→15） |
+| 颜色属性 | `backgroundColor`/`textColor`/`borderColor` 都是 **24 位 RGB**：写入**丢弃 alpha 字节**，读回也看不到（`0x8000FF00` → `0xff00`、`0xFFFFFFFF` → `0xffffff`，Ed8 B/G/F 三行）；`backgroundColor` 默认 `0xFFFFFF`（读回 `16777215`） |
+| 跨端封装 | 两侧 `selectionBeginIndex`/`EndIndex` 与 `caretIndex` 逐值相同（`cmp_ed5.py` 结构化比对 **0 处语义差异**；仅剩已登记的**光标落点度量差** 18/23 vs 21/26，及 adl 侧鼠标移动被合并的 harness 差异） |
+
+**实现**（`src/symbols.ts` / `src/emit.ts`）：
+
+- **拖选门控纠正**：删掉 `mouseMove` 的 `type == 'input'` 门控（保留 `selectable`），拖拽锚点/扩展对**所有可选字段**生效；键入仍限 `input`（`as_tf_is_input` 未动）。
+- **半开区间**：`mouseDown` 分支判 `tf->_sel_end > tf->_sel_begin && idx >= tf->_sel_begin && idx < tf->_sel_end` → 记 `drag_anchor = -2` 表示「保留既有选区」，否则塌缩到 `idx`；`mouseUp` 遇 `-2` 才把选区塌缩到释放索引。
+- **双击选词与塌缩的交互**：`drag_tf`/`drag_anchor` **提升为文件作用域 static**，`wordSelect` 桥接里清成 `NULL`/`-1`——否则双击落在既有选区内时 mouseDown 会先置 `-2`，mouseUp 又把刚选中的词塌缩掉。
+- **`border`/`borderColor`**：`TextField` 新增两槽（含反射表项与指纹）；构造器默认 `false`/`0x000000`；渲染在 `background` 门控**之外**、以**四个像素对齐的填充矩形**画出（**不用 `stroke`**——`stroke` 会半覆盖外沿像素，实测与 adl 不符）；`as_render_bounds` 与 `BitmapData.draw` 的源面在 `border` 时 **+1**。
+- **颜色属性掩码**：三个颜色属性加 write-only setter（`& 0xFFFFFFu`）——渲染本就用独立 alpha 参数（`as_skia_paint_fill(rgb, 1.0)`），所以 alpha 只影响**读回**；无掩码时读回 `0x8000FF00` 而 adl 是 `0x0000FF00`。③`backgroundColor` 构造默认 `0xFFFFFFFFu` → `0xFFFFFFu`（adl 读回 `16777215`）。
+
+**双端验证**：`cmp_ed5.py`（Ed5 全步骤）→ **0 处语义差异**；`grabwin.py` 双端窗口截图（Ed7 四字段）——f1 绿（1px 边框于外沿）几何与 adl 一致（`101×31` vs AOT `202×62` @2x）、f2（`border=false`）两端均不可见、f3 边框盖背景、f4（`scale=2`）随缩放；Ed6 的逐像素扫描与 adl 逐值相同。**遗留**：`scale=2` 时线宽差异（adl 恒 1 物理 px 不随对象缩放，我们随 transform 缩放；`scale=1` 两侧完全一致）→ 新增遗留行。
+
+**本批净效果**：新 `examples/stage94h.as`（默认值/读写往返/**掩码**/边框不改文本度量/正交四态）纳入回归；`test.ts` 新增 `[textsel]` 钉子 **14 条**，并把 C2 的 `[textinput]` 陈旧钉子（「非可输入字段的拖拽不选词」）**改写**为「拖选不再门控 `type`，键入仍限 `input`」；`node test.ts` **133 例全通**（阶段九十四·七 的 133 例）；`README-CN.md` 支持矩阵 + 当前限制（新增一条阶段九十四·八）；遗留表**新增 1 行**（缩放边框线宽）、**改口径 1 行**（字体度量行补 Ed5 光标落点证据）。版本 → **v0.4.40**。
+
+---
+
+#### 阶段九十四·九：DisplayObject 几何/坐标 API 族（`getBounds`/`getRect`/`localToGlobal`/`globalToLocal`/`hitTestObject` + `hitTestPoint` 上移）（v0.4.40 → v0.4.41）✅ 已完成
+
+**触发**：`### 遗留待开发` 表中的「几何/坐标 API 族未实现」行（阶段九十四·六 实测登记）——地基（`as_bounds_walk` 内容包围盒、`as_mat_{mul,invert}`、`as_local_point` 父链折算）已铺好，缺的是把它们暴露成 API；且 AIR 把 `hitTestPoint` 放在 `DisplayObject` 上，本子集只挂在 `Sprite`（`Shape` 用不了）。
+
+**证据台**：`temp/geoprobe/`（`GeoMain.as` + `geo-app.xml`，用 `mxmlc` 编、`adl 51.4.1` 跑）；逐值输出留在 `temp/geoprobe/adl_geo.txt`（A/B/C/D/E/F/G/H/I/J/K 共 11 组用例）。
+
+**实测口径（全部来自 `adl 51.4.1`）**：
+
+| 面 | 实测结论 |
+|---|---|
+| `getRect(target)` | 内容包围盒（不含描边）在 **target 坐标系**下的轴对齐矩形；`target == null` ⇒ 对象**自身局部空间**（== `getRect(self)`）；`target == self` ⇒ 精确局部盒（旋转对象也是 `0,0,100,20` 而非带 `cos(90°)` 噪声）；`target = 父` ⇒ 平移到自身 `x/y`；无关对象 ⇒ 经舞台折算；空内容 ⇒ `0,0,0,0` |
+| `getBounds(target)` | 同 `getRect` 但**含描边**：每边外扩 `strokeWidth/2`（`lineStyle(10)` + `drawRect(0,0,30,40)` ⇒ `getRect=0,0,30,40`、`getBounds=-5,-5,40,50`） |
+| `localToGlobal(p)` / `globalToLocal(p)` | 走**完整祖先矩阵链**；返回**新** `Point`、**不改实参**；两次 `getRect` 也返回不同引用 |
+| `null` 点 | `localToGlobal(null)` 抛 **TypeError #2007** |
+| `hitTestObject(obj)` | 两个**舞台空间**包围盒求交，且**含描边**（仅靠 20px 描边擦到的两图形也 true）；跨不同父可用；未上列表可用；**空对象永不相交**（对自己也 false） |
+| `hitTestPoint(x,y)` | 点取**舞台坐标**，属于 **DisplayObject**（`Shape` 也有）；`NaN` ⇒ false |
+| `hitTestPoint(...,true)` | 像素级：`drawCircle` 的 `(2,2)` 在包围盒内但像素外 ⇒ **false**，`(40,40)` 圆内 ⇒ true（⇒ 我们两种都查包围盒，登记为遗留） |
+
+**实现**（`src/symbols.ts` / `src/emit.ts`）：
+
+- **归位 `DisplayObject`**：`getBounds`/`getRect`/`localToGlobal`/`globalToLocal`/`hitTestObject`/`hitTestPoint` 六个方法全挂到 `DisplayObject`（vtable 自动派生）；`Sprite` 的 `hitTestPoint` 删除，C 函数 `Sprite_hitTestPoint` → `DisplayObject_hitTestPoint`（`Shape` 因此可用）。
+- **新助手**：`as_to_stage_matrix(o,...)`（局部→舞台，从 `as_local_point` 拆出，正向方向复用）、`as_rect_xform`（矩形过矩阵后重取 AABB）、`as_rect_to_stage`/`as_rect_from_stage`。
+- **顺修矩阵合成的别名 bug**：原 `as_mat_mul(..., a,b,c,d,tx,ty, &a,&b,&c,&d,&tx,&ty)` 把输入与输出**同名**，`as_mat_mul` 按序写出 ⇒ `*b` 读到已被覆写的 `a`；只在祖先有旋转/斜切时错（顶层对象的父是恒等 `Stage`，故此前不可见）。改为临时量 `na..nty` 再赋值，并用 K 段（祖先旋转）用例钉住。
+- **短接与写屏障**：`target != NULL && target != o` 才做矩阵往返（保 `getRect(self)` 精确）；`hitTestObject` 的空对象早返回；null 点 `as_throw(TypeError_new(..., 2007))`。
+
+**验收**：新 `examples/stage94i.as`（A~H 八组断言，逐条对齐 `adl_geo.txt`，含祖先旋转的 K 段）纳入回归；`test.ts` 的 `[geometry]` 新增 **7 条**钉子（API 归位/`Sprite_hitTestPoint` 消失/别名修复/`getRect` 短接/`hitTestObject` 含描边/两处 `#2007`）；`node test.ts` **134 例全通**；`README-CN.md` 支持矩阵与当前限制同步（新增一条阶段九十四·九）。遗留表**移出 1 行**（几何/坐标 API 族）、**新增 1 行**（`hitTestPoint(...,true)` 像素级）。版本 → **v0.4.41**。
+
+---
+
+#### 阶段九十四·十：可空字符串字段的装箱归一（`as_v_str(NULL)` → `null`）（v0.4.41 → v0.4.42）✅ 已完成
+
+**触发**：`### 遗留待开发` 表的「字符串字段读到 C `NULL` 时装箱为 **tag-3 空指针**而非 AS3 的 `null`」行（阶段九十四·七 实测登记）——`as_v_obj`/`as_v_arr`/`as_v_fn` 三个指针类装箱助手都早已把 NULL 归一到 `as_v_null()`（阶段九十四·一 的注释写明理由：AS3 只有一个 null，否则 `while ((v = src.next()) != null)` 永不终止），唯独 `as_v_str` 漏了这一步。
+
+**实测修正**：该行的原始表述「`new TextField().restrict == null` 在 `adl` 为 true、我们为 false」**不准确**——`restrict` 是静态 `String` 类型，直接比较发出的是 `((g_f->_restrict) == NULL)`（一直都是 true）。真正的差异在**动态**上下文：`var x:* = f.restrict; x == null` 修前为 **false**（tag-3/NULL 指针 vs tag-0），且 `x == ""` / `x.length` 直接**段错误**（`strcmp`/`strlen(NULL)`）；修后为 **true / false / 0**（与 `adl` 一致）。
+
+**实现**（`src/runtime.ts` 一行）：`as_v_str` 增加 `if (s == NULL) return as_v_null();` —— 与三个同类助手的约定对齐，且是**唯一的字符串装箱入口**（`boxExpr` 的 `string` 分支、`as_v_str(...)` 调用点均经它），故一处修复覆盖**全部**可空字符串字段/返回值（`restrict`、未来的 `styleSheet`/`TextFormat.font` 等）。`text` 的「构造时给空字符串」保持不变（AIR 实测 `text` 恒为 `""`）。
+
+**验收**：`examples/stage94g.as` 断言强化（`check(f.restrict == null)` + `check(!(f.restrict == ""))`）；`test.ts` 的 `[textinput]` 新增 **2 条**钉子（`as_v_str` 的 NULL 分支存在、动态装箱经 `as_v_str` 与 `as_v_eq(..., as_v_null())`）；`node test.ts` **134 例全通**；`README-CN.md` 当前限制同步。遗留表**移出 1 行**。版本 → **v0.4.42**。
+
+---
+
+#### 阶段九十四·十一：`MouseEvent.DOUBLE_CLICK` 的派发（v0.4.42 → v0.4.43）✅ 已完成
+
+**触发**：`### 遗留待开发` 表的「`MouseEvent.DOUBLE_CLICK` **从不派发**」行（阶段九十四·七 登记）——`doubleClickEnabled` 早已建模（默认 `false`），C2 的双击选词只是走引擎内部的 `"wordSelect"` 保留类型借道，运行时**从不**产生 `doubleClick` 事件。
+
+**证据台**：`temp/editprobe/src/Ed9.as` + `drive_ed9.py`（四区域 Sprite 矩阵：目标自身开/关、祖先开、默认关）；逐事件输出留在 `temp/editprobe/adl_ed9.txt`（`adl 51.4.1`）与 `aot_ed9.txt`（本编译器），逐行一致。
+
+**实测口径（全部来自 `adl 51.4.1`）**：
+
+| 面 | 实测结论 |
+|---|---|
+| 时序 | 一次双击 = `down,up,click, down,up,doubleClick` —— 第二次 `click` **被替换**为 `doubleClick`（**不是**追加）；三击 = `click,doubleClick,click`（`clickCount==3` 又变回普通 `click`） |
+| 门控 | 落在**命中目标自身**的 `doubleClickEnabled` 上：目标 `s3`（`false`）在祖先 `s1`（`true`）内 ⇒ **无** `doubleClick`；目标 `false` 时第二次仍是普通 `click` |
+| 事件形状 | `doubleClick` \| `bubbles=true cancelable=false`；`target` = 最深命中对象；`localX/localY` = 第二次按下的局部坐标；祖先监听者收到时 `eventPhase==3`（冒泡） |
+| 常量 | `MouseEvent.DOUBLE_CLICK == "doubleClick"`（与 `CLICK` 不同 type） |
+
+**实现**（`vendor/window_glue.cc` + `src/emit.ts`）：
+
+- **glue**（`SDL_MOUSEBUTTONUP`）：第二次点击时用 `e.button.clicks == 2 ? "dblclick" : "click"` 把 `click` 换成保留类型 `"dblclick"`（SDL 的 `clicks` 携带平台点击计数；`clicks==3` 回到 `"click"`，与三击实测一致）。仍先发 `mouseUp`。
+- **AS3 桥接层**（`emit.ts` 的 `ASC_window_on_mouse`）：像 `"wordSelect"` 一样在 `Stage_dispatchMouse` **之前**拦下 `"dblclick"`——`as_pick_hit` 命中后 `as_is(hit, &InteractiveObject_vt)` 守卫（`Shape`/`Bitmap` 是 `DisplayObject` 但**非** `InteractiveObject`，不能直读该字段）再读目标的 `doubleClickEnabled`，决议为 `"doubleClick"` 或 `"click"`。
+
+**验收**：新 `examples/stage94j.as`（常量/默认与读写/`InteractiveObject` 归位/冒泡+相位+`target`/`currentTarget`/事件 flag/与 `CLICK` 互不串台）纳入回归；`test.ts` 新增 `[doubleclick]` **9 条**钉子（glue 的打标与「不再无条件发裸 click」、桥接拦截/`InteractiveObject` 守卫/门控决议、`doubleClickEnabled` 结构体字段与默认 `false`、`DOUBLE_CLICK` 常量）；`node test.ts` **135 例全通**（新增 stage94j）；`README-CN.md` 当前限制同步。遗留表**移出 1 行**（`DOUBLE_CLICK` 从不派发）、**新增 0 行**。版本 → **v0.4.43**。
+
+---
+
+#### 阶段九十四·十二：空接收者的成员访问 —— 段错误 → `TypeError #1009`（v0.4.43 → v0.4.44）✅ 已完成
+
+**触发**：`### 遗留待开发` 表的「空对象（`null`）的属性/方法访问是**段错误**而非 AIR 的 `TypeError #1009`」行（阶段九十四·七 登记；`f.stage.tabChildren` 与 `x.length`（`x` 为 null 字符串）会 SIGSEGV）。
+
+**证据台**：`temp/nullprobe/NullMain.as` + `null-app.xml`，用 `mxmlc` 编译后 `adl 51.4.1` 运行，逐行结果写在 `temp/nullprobe/adl_null.txt`。
+
+**实测口径（全部来自 `adl 51.4.1`）**：
+
+| 面 | 实测结论 |
+|---|---|
+| 读/写/方法调用 | 对 `null` 的**任何**成员访问都抛 `TypeError #1009: Cannot access a property or method of a null object reference.`，与静态类型无关（`Sprite`/`Object`/`Array`/`String`/`*`） |
+| 容器下标 | `a[0]`/`a.length`/`a[0]=v` 在 `a` 为 null 时同样 `#1009`（不是 `undefined`） |
+| `*` 未赋值 | `var y:* = null; y.bar()` → `#1009`（不是 `#1006`） |
+| 函数值调用 | `var f:Function = null; f()` → `TypeError #1006: value is not a function.`（**#1006 而非 #1009**） |
+
+**实现**（`src/runtime.ts` + `src/emit.ts`，纯生成侧，不动运行时内部 C 调用）：
+
+- **两个运行时守卫**（`emit.ts` 前导，紧邻 `as_with_box`）：`as_req_obj(void*)` 空则抛 `#1009`；`as_req_box(as_value)` 对 tag 0/5 抛 `#1009`/`#1010`；另有 `as_req_fn(as_fn,name)` 空则抛 `#1006`（复用已有的 `as_throw_not_function`）。
+- **成员/下标访问点全部加守卫**（`emitMember`/`emitIndex`/`emitAssign`/`emitCall`）：指针接收者（class/Array/Vector/String/record/XML/Dict/Function）经 `as_req_obj`；`*` 经 `as_req_box`（并让 `as_any_call` 入口先 `v = as_req_box(v)`）；函数值调用经 `as_req_fn`。
+- **不做无谓检查**：`this`、`new` 结果、数组/对象/向量字面量、函数表达式、字符串字面量可证明非空，`definitelyNonNull` 跳过守卫（既不误报也不拖慢热路径）。
+
+**验收**：新 `examples/stage94k.as`（A~G 七组：类实例读/写/方法、`Object`、`Array` 下标读/写/`length`、`String` 长度/方法、`Date`、null 函数值 `#1006`、以及非 null 接收者的无回归断言）纳入回归；`test.ts` 新增 `[nullref]` **15 条**钉子（两个守卫的指纹、七类接收者的守卫形状、`as_req_box`/`as_any_call`、以及 `this`/字面量不守卫）；`node test.ts` **136 例全通**；`README-CN.md` 当前限制同步。遗留表**移出 1 行**、**新增 0 行**。版本 → **v0.4.44**。
+
+---
+
+#### 阶段九十四·十三：`Tab`/`Shift+Tab` 焦点遍历（v0.4.44 → v0.4.45）✅ 已完成
+
+**触发**：`### 遗留待开发` 表的「`Tab`/`Shift+Tab` 的**焦点遍历**未实现」行（阶段九十四·七 C2 登记；**这是 Ed2 全回合唯一未对齐点**）。
+
+**证据台**：`temp/editprobe/src/Ed10.as`（a/b[`tabEnabled=false`]/c/d/e 五个输入框 + `box`/`gate`/`reorder` 三个 Sprite）+ `drive_ed10.py`，`adl 51.4.1` 与 AOT 双端各跑一遍，逐行输出在 `temp/editprobe/adl_ed10.txt` / `aot_ed10.txt`（归一化去时间戳后 **85 行对 85 行、0 差异**）。
+
+**实测口径（全部来自 `adl 51.4.1`）**：
+
+| 面 | 实测结论 |
+|---|---|
+| 环 | 显示列表**先序**遍历中 `tabEnabled==true` 的 `InteractiveObject`；`tabEnabled=false` 者被跳过 |
+| 方向 | 两个方向都 wrap（Tab 越过末个 → 首个；Shift+Tab 在首个之前 → 末个） |
+| 焦点为 null | Tab → 首个可聚焦对象，Shift+Tab → 末个 |
+| 锚点 | 焦点为 null 且**此前鼠标按下过某个字段**时，从该字段的显示位置之后继续（`a` 已点过 ⇒ Tab 落到 `c`）；从未点过任何字段则从头/尾开始。**遍历本身不移动锚点** |
+| 时序 | 移动发生在 keyDown **派发之后**；同一次按键的 keyUp 派发给**新**焦点 |
+| `preventDefault()` | 完全抑制移动（keyUp 仍发旧焦点） |
+| 焦点事件 | `focusOut(old, relatedObject=new)` → `focusIn(new, relatedObject=old)`，均 `bubbles=true cancelable=false`、`phase=3`、`currentTarget=stage` |
+
+**实现**（`src/emit.ts` 纯生成侧）：
+
+- `as_tab_scan(DisplayObject*, …)`：先序递归收集可聚焦对象及其显示序号（序号递增，故「下一个/上一个」就是一次扫描）；同时记录焦点与锚点的序号。上限 64 个对象（远超任何真实表单，超出即不再移动）。
+- `as_focus_tab(DisplayObject* root, int dir)`：`focus_ord < 0` 时回落到锚点序号，再按方向取首个更靠后/靠前的可聚焦对象，越界即 wrap，最后交给已有的 `as_set_focus`（它本就派 `focusOut`/`focusIn`）；`root` 取**收到按键的那个 Stage**（多窗口下按窗口遍历，而不是全局根）。
+- `as_tab_anchor`：新增文件作用域静态指针，**只**由 `as_focus_from_mouse_down`（鼠标按下聚焦字段）写入，遍历不改它；并作为**永久 GC 根**登记（与 `as_focus_obj` 同理）。
+- 钩子：`Stage_dispatchKey` 里、keyDown 派发与 `as_key_text_suppressed = evt->cancelled` 之后加一行 `if (keyCode == 9 && !evt->cancelled) { as_focus_tab(...); return; }`——位于 `if (!down) return;` 之后，故 keyUp 永不触发遍历。
+- **新增测试钩子** `Stage.dispatchKey(type, keyCode, charCode, mod)`（`src/symbols.ts`，与 `dispatchMouse`/`dispatchWheel` 同一约定）：`mod` 用运行时的 `ASC_MOD_*` 位掩码（1=ctrl, 2=alt, 4=shift, 8=cmd），headless 示例因此可以驱动键盘与焦点遍历。
+
+**偏离记录**：① `tabIndex` 排序**未实现**——`reorder` 探针（把 `e.tabIndex` 设为 1）下 `adl` 的顺序无法稳定复现，且原遗留行只提「焦点遍历未实现」；② 「焦点为 null 但曾有字段聚焦历史」的锚点在 `adl` 上表现为内部状态相关的边缘差异（同一场景两次测量给出不同落点），按上表的主口径实现并记录。
+
+**验收**：新 `examples/stage94l.as`（A~H 八组：`tabEnabled` 默认值、前进/跳过/wrap、Shift+Tab 反向 wrap、null 焦点从头/尾、锚点续接、`preventDefault` 抑制、keyUp 发往新焦点、非 tabbable 对象充当锚点）纳入回归；`test.ts` 新增 `[tabfocus]` **15 条**钉子（环的先序/filter/不收 `tabIndex`、选取与双向 wrap、锚点回落、按窗口 root、GC 根、钩子在 keyDown 且读 post-dispatch `cancelled`、`dispatchKey` 接线）；`node test.ts` **137 例全通**；`README-CN.md` 当前限制同步。遗留表**移出 1 行**、**新增 1 行**（窗口键盘通道的 Shift 自身键被派发两次）。版本 → **v0.4.45**。
+
+---
+
+#### 阶段九十四·十四：`TextField.restrict` 过滤 + 多行 `Return` 的换行提交（v0.4.45 → v0.4.46）✅ 已完成
+
+**触发**：`### 遗留待开发` 表的「`restrict`/`displayAsPassword` 只存不生效」行（阶段九十四·七 C2 登记）。本阶段只做 `restrict` 的一半（`displayAsPassword` 的遮罩渲染另立一行）。
+
+**证据台**：`temp/editprobe/src/Ed11.as`（4 个不同 `restrict` 的输入框）、`Ed12.as`（8 框模式电池：`A-Z`/`a-z`/`0-9\-`/`\^`/`abc`/`^a`/`""`/`null` + 程序化赋值 + 多字符载荷 + 选区）、`Ed13.as`（多行字段的 `Return`）、`Ed14.as`（选区 + 全拒字符），配 `drive_ed11.py`..`drive_ed14.py`；`adl 51.4.1` 与 AOT 双端各跑一遍，日志 `temp/editprobe/adl_ed1{1,2,3,4}*.txt` / `aot_ed1{1,2,3,4}.txt`。
+
+**实测口径（全部来自 `adl 51.4.1`）**：
+
+| 面 | 实测结论 |
+|---|---|
+| 模式语法 | **允许集**；`-` 是区间、`\` 转义下一个字符；**开头**的 `^` 把整集翻转成**排除集**。`null` = 不过滤、`""` = 什么都不允许（两者**不同**） |
+| 逐字符判定 | 允许则原样插入；否则若**大小写互换**后的字符被允许，就插入**那一个**；两者都不允许才丢弃。`"A-Z"`+`a` → 插入 `A`；`"a-z"`+`Z` → 插入 `z`；`"^a"`+`a` → 插入 `A`（被排除的只是小写形式）；`"^5"`+`5` → 丢弃（数字无第二种大小写） |
+| 时序 | 过滤在 `textInput` **派发之后**（事件载荷永远是**原始**文本，监听器可 `preventDefault` 取消整次输入），在 `splice` 之前 |
+| 作用范围 | **只过滤用户输入**（键入与粘贴同管道）；程序化 `text = "..."` 赋值从不经过滤 |
+| 换行 | CR/LF **绕过**过滤：多行字段 `restrict="0-9"` 时 `Return` 仍插入换行 |
+| 全被丢弃时 | 插入 0 字符 ⇒ **不发 `change`、光标不动**；但**有选区时选区照样被吞掉并派发 `change`**（与 `maxChars` 溢出共用同一条 `splice` 语义） |
+| 多字符载荷 | 粘贴的整串是**一个** `textInput`（载荷未过滤），逐字符过滤后才插入（`"ab5"` 进 `0-9\-` → 只插 `5`） |
+
+**实现**（`src/emit.ts` 纯生成侧）：
+
+- `as_tf_restrict_has(p, c)`：把一个候选字节在**未取反**的模式里做成员判定（左到右解码区间与转义）。匹配是**按字节**的——ASCII 模式会逐个丢弃多字节字符的每个字节，即整字符丢弃，与 adl 的「按字符」判定视觉结果一致。
+- `as_tf_restrict_char(pat, c)`：`NULL` 直接放行；否则按「取反」语义判定，被拒时回退到**大小写互换**的字符，仍被拒则返回 0（丢弃）。
+- `as_tf_insert_text`：`textInput` 派发且未被取消后，`_restrict != NULL` 时先逐字节过滤（CR/LF 直接放行）得到 `ins`，再用 `ins` 走原来的 `splice` + `change` 路径；`_restrict == NULL` 时 `ins` 就是原指针（零开销、行为不变）。
+- **顺手修掉一个真缺口**：`Return` 在多行可编辑字段里原本**插不进换行**——`SDL2/Cocoa` 的文本输入类只实现 `insertText:replacementRange:`、**没有 `insertNewline:`**（`strings vendor/sdl2/arm64/lib/libSDL2.a` 可证），所以真实按键只产生 `SDL_KEYDOWN`、永远没有 `SDL_TEXTINPUT`。现在在 `Stage_dispatchKey` 的 keyDown 分支里对 `keyCode == 13 && tf->multiline` 合成一次 `as_tf_insert_text(tf, "\r")`，与键入走完全同一条管道（被 `preventDefault` 的 keyDown 仍会抑制它）。修后 Ed13 双端**文本逐字一致**（`m1="5\r\r7"`、`m2="x\ry"`）。
+- **新增测试钩子** `Stage.dispatchText(text)`（`src/symbols.ts`）：与 `dispatchMouse`/`dispatchKey`/`dispatchWheel` 同一约定，把一次文本提交喂进 `Stage_dispatchText`，headless 示例因此能驱动「键入」的完整四段时序。
+
+**偏离记录**：多行 `Return` 的 `textInput` **载荷**我们报 `"\r"`、`adl` 报 `"\n"`（结果文本两端一致）；已作为独立遗留行登记。
+
+**验收**：新 `examples/stage94m.as`（A~J 十组：默认值/往返、允许集收放、大小写互换回退、`^` 排除集、区间与转义、`""` vs `null`、程序化赋值不过滤、多字符载荷逐字符过滤、`Return` 绕过过滤、全拒按键吞选区）纳入回归；`test.ts` 新增 `[restrict]` **17 条**钉子；`node test.ts` **138 例全通**；`README-CN.md` 当前限制同步。遗留表**移出 1 行**（`restrict` 那半）、**新增 2 行**（`displayAsPassword` 遮罩、`Return` 载荷口径）。版本 → **v0.4.46**。
+
+---
+
+#### 阶段九十四·十五：视觉行导航 —— `PageUp`/`PageDown` + 软换行的 `Up`/`Down`（v0.4.46 → v0.4.47）✅ 已完成
+
+**触发**：`### 遗留待开发` 表的「`PageUp`/`PageDown` 只是**派发不改动**」与「多行**软换行**（`wordWrap=true`）时 `Up`/`Down` 的 X 列口径缺失」两行（阶段九十四·七 C2 登记）。两行共用一份「**可视行布局**」，本阶段一并落地。
+
+**证据台**：`temp/editprobe/src/Ed15.as`（`h1` = 300×36 多行不换行、6 条硬行、LEN 42；`h2` = 单行；`w1`/`w2` = 两个 `wordWrap=true` 多行字段）+ `drive_ed15.py`（支持 round 1/2；round 2 用 **F1..F7** 裸功能键做程序化命令通道——`Ctrl+<digit>` 会被本机 CJK 输入法提交成字面文本污染被测量字段）。`adl 51.4.1` 与 AOT 双端同序列各跑一遍：`adl_ed15.txt` / `adl_ed15b.txt`（round 2）、`aot_ed15b.txt`；另有 debug 仪表产物 `/tmp/ed15dbg`（源码 `/tmp/ed15dbg.c`）用来排除「点击后光标/scrollV 异常」的假警报。
+
+**实测口径（全部来自 `adl 51.4.1`）**：
+
+| 面 | 实测结论 |
+|---|---|
+| 上下的单位 | **视觉行**（软换行也算一行），不是 CR 分隔的硬行。`w1` 实测 `10 → 22 → 33`、`w2` 实测 `10 → 31 → 52 → 73 → 94 → 115`，全部落在**软换行行首** |
+| 列位（箭头） | **sticky goal 列**：短行上被钳到行尾，但**列位被记住**，再走到长行会恢复（`w1` 上 `10 → 22`（钳）`→ 33`（恢复 10））；首/末行箭头 **no-op**（不钳到文本两端） |
+| 列位（翻页） | 用光标**当前列**（每次重算，不保留 goal）：`h1` 上 `caret 4` → PD → `18`（行 2 第 4 列）→ PD → `35`（行 4 第 4 列） |
+| 翻页步长 | **可见行数**（`fieldHeight / lineHeight`，下限 1）；单行字段可见行数 = 1 |
+| 翻页 clamp | 越过**末行** ⇒ 光标 = **文本尾**（`text.length`）；越过**首行** ⇒ 光标 = **0**（与箭头的 no-op 不同） |
+| 单行字段 | 箭头 **no-op**；翻页键**会动**（`0` ↔ `text.length`），因为它的钳位对象是文本两端而非相邻行 |
+| `scrollV`（方向敏感） | `PageDown` ⇒ `SV = clamp(caretLine + 1, 1, maxScrollV)`（光标行钉视口**顶部**）；`PageUp` ⇒ `SV = clamp(caretLine - visible + 2, 1, maxScrollV)`（钉**底部**）；**箭头**只在光标要越出视口时才滚动（`dir = 0` 的 clamp-only 语义） |
+| Shift + 翻页 | = **扩选**（锚点留原处），与 `Shift+Up/Down` 同义；`h1` 上 `End(42)` 后 `Shift+PageUp` ⇒ `SEL=(30,42)`、`caret=30` |
+| `change` | 翻页键/箭头**不改文本** ⇒ 从不派发 `change` |
+
+**实现**：
+
+- `vendor/skia_glue.cc` 新增 `int sk_textlayout_line_metrics(void* para, int* starts, int* ends, double* tops, double* bottoms, int cap)`：用 `Paragraph::getLineMetrics` 逐**可视行**填 `fStartIndex`/`fEndIndex` 与 `fBaseline ± fAscent/fDescent`（`tops`/`bottoms` 可为 `NULL`），返回写入数——一行表同时供上下移动、翻页、`scrollV` 三处使用。
+- **顺手修掉一个真缺口（CR 不是换行）**：`TextField.text` 里每个 `Return` 都存成 **CR**，而 Skia 段落**只在 LF 断行** ⇒ 修前 `h1`（多行不换行）被 Skia 报成 **1 行**（`numLines=1`、`textHeight=12`），整个多行文本摊在一条视觉行上。新增 `static const char* sk_textlayout_normalize(const char* text, int collapseNewlines, std::string& buf)`（`skia_glue.cc`）：把 **CR(0x0D) → LF**（**保持字节长度 1↔1**，故 UTF-16 的 `fStartIndex` 对 `tf->text` 仍然有效）；`collapseNewlines`（单行字段）时 CR/LF 一律变空格。`sk_textlayout_new` / `_new_leading` / `_new_runs` **三处**统一改用它。修后 `h1` 的 `numLines=6` ✓、`textHeight=72` ✓（与 adl 逐值一致）。
+- `src/runtime.ts`：`sk_textlayout_line_metrics` 的 `extern` 声明 + `as_skia_textlayout_line_metrics` 内联包装 + 无 Skia 时的 `(void)…; return 0;` 桩。
+- `src/emit.ts`（纯生成侧）：`TextField` 新增 `int _goal_col;`（ctor 置 `-1`；`as_tf_set_caret`/`as_tf_extend_caret` 末尾一律清 `-1`，由垂直移动自行恢复）；新增 `as_tf_line_table`（有 Skia 段落取可视行，否则回落 **CR/LF 硬行扫描** + 均匀行高 `n*lh`）、`as_tf_line_of_index`、`as_tf_line_end`（剥掉行尾 CR/LF，保证光标永不落到换行符上）、`as_tf_scroll_caret`（上表的三个方向语义，clamp 在 `[1, MSV]`，`MSV = line_count - visible + 1`）、`as_tf_vmove(tf, dir, step, page, shift)`（单行 + 非翻页直接 return；列位取 goal 或当前列；越界时 `!page` return、翻页钳到文本两端；`shift` 走扩选，否则移动光标；非翻页更新 goal）；`as_tf_line_ud` 退化为 `as_tf_vmove(tf, dir, 1, 0, shift)`。`as_tf_is_edit_key` 纳入 **33/34**；`as_tf_edit_key` 新增 `if (keyCode == 33 || keyCode == 34) { as_tf_vmove(tf, keyCode == 33 ? -1 : 1, as_tf_visible_lines(tf), 1, shift); return; }`，并只对非 38/40 的移动清 `_goal_col`。
+- **纯 C 回落的口径对齐**：`as_tf_line_count` 的桩原本只数 `LF` ⇒ 同一份文本在「有 Skia」与「无 Skia」两种构建下 `numLines` 不同。现同时数 `CR` 与 `LF`（`\n` || `\r`），与 Skia 路径归一化后的结果一致。
+
+**验收**：新 `examples/stage94n.as`（A~H：硬行结构、翻页整段序列（`0→14→31→42` / `42→30→12→0`）、列位保留（`4→18→35`）、短行钳位 + goal 记忆（`9→13→23→30→40` 再逐级回退）、`scrollV` 三向语义、Shift 扩选、单行字段、软换行形状）纳入回归；`test.ts` 把 C2 的陈旧钉子（「`PageUp`/`PageDown` 故意不在编辑键集合里」）**改写**为 6 条新钉子（编辑键集合、可视行表、clamp 与 no-op 分界、goal 列、`scrollV` 三向、CR 归一化）。`node test.ts` **139 例全通**（新增 1 例）；`README-CN.md` 当前限制同步；遗留表**移出 2 行**、**新增 1 行**（列位用字符列而非像素 X goal）。版本 → **v0.4.47**。
+
+**度量耦合（已登记遗留行「字体度量偏小」，本阶段必须显式说明）**：`scrollV`、可见行数、软换行落点**全部**由行高与字符前进驱动——我们 `_typewriter 12` 的 Skia 命中字体与 AIR 的不同（见该遗留行），故**窗口 AOT 下**同样序列的**数值**会与 adl 不同（例：36px 高字段我们 `visible=3`／adl `2`，`w2` 我们的可视行数 `8`／adl `6`），而**规则逐条一致**（round 2 双端逐项核对：列保留、文本两端 clamp、`SV` 三向、页键/箭头边界**全部对齐**）。纯 C 构建的桩行高恰为 `size × 1.2`，与 AIR 的 15/12 比值一致，故 `examples/stage94n.as` 的断言值**逐值等于 adl 实测值**。
+
+
+---
+
+#### 阶段九十四·十六：`displayAsPassword` 遮罩（v0.4.47 → v0.4.48）✅ 已完成
+
+**触发**：遗留行的「`displayAsPassword` 只存不生效（渲染成圆点）」——阶段九十四·七 主动登记、阶段九十四·十四 收窄（`restrict` 那半已完成）。按 AGENTS.md §1.5，先写 `adl 51.4.1` 探针实测口径，再编码。
+
+**证据台**：`temp/editprobe/src/Ed16.as`（11 个字段）+ `drive_ed16.py`（F1..F7 命令通道）+ `ed16-app.xml`（400×520）+ `ed16.build.json`；截图工具 `snapwin.py`（`CGWindowListCreateImage` → PNG）。双端日志 `adl_ed16.txt` / `aot_ed16.txt`，真窗口截图 `snap_ed16_adl_final.png` / `snap_ed16_aot_after-p2-click.png` / `snap_ed16_aot_final.png`。
+
+**adl 实测口径**：
+
+| 面 | 实测结论 |
+|---|---|
+| 遮罩字符 | **星号 `*`**（不是圆点） |
+| 布局 | 遮罩**参与排版**：AIR 把「一个字符一个 `*`」的串交给排版器，`textWidth`/`textHeight`/`numLines`/点击落点/光标与选区几何**全部按星号串度量** |
+| 判据（比例字体才看得出来） | `_sans` 12 的 `"WWWWWWWWWW"` 明文 `textWidth` **113**、遮罩后 **46.5**；同一字段换成 `"iiiiiiiiii"` 遮罩后**也是 46.5** —— 两者量的是**同一个** 10 星号串 |
+| `type='dynamic'` | **同样遮罩**（截图实证） |
+| 换行 | **CR/LF 保留**：多行字段仍是两条视觉行（每行 20 星），遮罩只换可见字符不换断行 |
+| `.text` | 恒为**明文**（键入/程序化赋值都一样），`.text.length` 不变；实测键入后 `p1.text` 是插入后的明文 |
+| 运行时切换 | 正常重排（`displayAsPassword` 可随时开关） |
+| 字符计数口径 | AIR 按 **UTF-16 码元**（`中文ab` 密码 `textWidth` 28.5 ⇒ 4 颗星） |
+| 剪贴板 | 遮罩字段 **`Cmd+C` / `Cmd+X` 均被拒**（剪贴板保持空、`Cmd+X` 连文本也不删）；对照的非遮罩字段同一手势复制出 `abcdefghij`；**`Cmd+A` 仍能选中**（SEL=0,3） |
+| 程序化赋值 | `text = ...` 把**光标与选区钳到新长度**（实测：光标在 7 时赋 `"zz"`，读回 `caretIndex` **2**、`selectionBegin/End` **2,2**） |
+
+**实现（`src/emit.ts`）**：
+
+| 位置 | 改动 |
+|---|---|
+| `TextField` 结构体（`_para_align` 之后） | 新增 `char* _mask;` 与 `const char* _mask_src;`（ctor 置 NULL）——遮罩串是**独立的缓存**，`_mask_src` 记住它对应哪份 `.text` |
+| 新增 `as_tf_layout_text(TextField*)`（在 `as_tf_paragraph` 之前） | 非密码直接返回 `tf->text`；已建且 `_mask_src == tf->text` 才复用；否则 `malloc(n+1)` **逐字节**写入（`\r`/`\n` 原样、其余一律 `'*'`），`free` 旧缓冲后替换并记住 `_mask_src` |
+| `as_tf_paragraph` | 取 `const char* ltext = as_tf_layout_text(tf);`；`hasRuns = (tf->_runs != NULL && tf->_runs->length > 0 && !tf->displayAsPassword);`（**遮罩优先于 `htmlText` runs**）；缓存键改 `tf->_para_text == ltext`；`as_skia_textlayout_new_leading(ltext, ...)`；`tf->_para_text = ltext;` |
+| `as_tf_copy_selection` / `as_tf_cut` | 各加 `if (tf->displayAsPassword) return;`（剪贴板拒绝；Cut 连文本也不删） |
+| `TextField_set_text` | 追加**光标/选区钳位**（`_sel_caret`/`_sel_begin`/`_sel_end` 各与 `strlen(value)` 取小） |
+
+**为什么是「一个字节一个 `*`」而不是「一个字符一个 `*`」**：本运行时的 `String` 是 **UTF-8 字节索引**模型（既有全局口径，见遗留行），若星号串按 UTF-16 码元生成，遮罩串的**字节区间**就与 `.text` 的索引体系对不上，光标/选区/`index_at` 全会错位。故选择与本运行时索引模型自洽：**每字节一颗星**。代价是 **CJK 密码会比 `adl` 多显星**（`中文ab`：adl 4 颗 / 我们 12 颗）——已作为同源偏差登记在「`String` 是 UTF-8 字节索引」行。
+
+**顺带修复的两个真缺口（不新增遗留行）**：① **遮罩字段拒复制/剪切**（`adl` 实测是硬边界，不是我们的选择）；② **程序化 `text = ...` 把光标与选区钳到新长度**（`adl` 实测口径；修前我们的光标会停在越界位置，渲染器随后量出越界矩形）。
+
+**验收**：新 `examples/stage94o.as`（A~F：默认值与往返、遮罩不改文本/长度、遮罩开关不改文本与行结构、赋值钳光标、与 `restrict` 正交、多行遮罩字段的行/光标一致性）纳入回归；`test.ts` `[textinput]` 新增 **6 条**钉子（`as_tf_layout_text` 形状、星号串逐字节 + CR/LF 保留、缓存键改 `ltext`、遮罩优先于 run 表、copy/cut 守卫、赋值钳位）；`node test.ts` **140 例全通**。
+
+**度量耦合（同一遗留行，本阶段证据更刺眼）**：`_typewriter` 12 的**星号前进** adl **7.2 px**（等宽族）而我们 **4.67 px**（回落字体的星号更窄）⇒ 「点击 x=45 落在第几个字符」adl **6**、我们 **9**；`_sans` 12 的星号两侧却几乎一致（adl 46.5 / 我们 46.7 每十颗），说明差距**不是**遮罩算法而是**字体命中**。故窗口 AOT 下的遮罩**几何数值**会与 adl 不同，**语义**（一字符一星、参与排版、明文存储、剪贴板拒绝）逐条一致。
+
+**双端核对（窗口 AOT，链接 Skia）**：`p1`（密码）`TW` 46.7、`p3`（明文对照）54.7、`p8`（密码 W×10）46.7、`p9`（明文 W×10）**113.26 ≈ adl 113**、`p10`（密码 i×10）46.7（与 `p8` 同值 ⇒ 星号串模型一致）；密码字段剪贴板为空、`p3` 复制出 `abcdefghij` ✓；`p6` `TW` 56.04 `LEN` 12（字节）vs adl 28.5 `LEN` 4（**按设计的字节偏差**）；`TH` 12 vs adl 15（既有字体度量缺口）。
+
+**未实测项（已登记）**：带 **`htmlText` run 表**的字段再开遮罩没探过——当前实现让**遮罩优先**（run 表在遮罩生效时强制不参与排版），`adl` 侧未跑，故新登记为遗留行「`displayAsPassword` 与 `htmlText` 的组合未实测」。
+
+---
+
+#### 阶段九十四·十七：输入法合成中态（marked text）预览（v0.4.48 → v0.4.49）✅ 已完成
+
+**触发**：遗留行的「输入法（**IME**）的合成中态（marked text）无建模」（阶段九十四·七 实测登记）。这是 ②「文本编辑补完包」的最后一个子项。
+
+**证据台**：`temp/editprobe/src/Ed17.as`（f1 单行 / f2 多行）+ `drive_ed17.py`（**F1..F9** 命令通道，`VK` 表补 `f8/f9`）+ `ed17-app.xml`，`adl 51.4.1` 实测日志 `/tmp/ed17.txt` 与 `/tmp/d17b..e.txt`；窗口 AOT 侧 `temp/imeprobe/`（`src/Ime.as` + `ime-app.xml` + `ime.build.json` + `drive_ime.py` + `out/ime_aot`），截图 `snap_ime_{1..5}_*.png`，另有**确定性**离屏出图 `/tmp/ime_render_{0..5}.png`（探针每步调 `stage.render(400,140,path)`，不依赖窗口 expose 时序）。
+
+**adl 实测口径（`IME` 静态面）**：
+
+| 面 | 实测结论 |
+|---|---|
+| `IME.isSupported` / `enabled` / `conversionMode` | `true` / 初值 `true` 且可写（`false`→读回 `false`，写回 `true` 生效）/ `"UNKNOWN"` |
+| `setCompositionString` / `doConversion` / `compositionSelectionChanged` | **一律抛 `Error #2063`**（`name="Error"`、`errorID=2063`、`message="Error #2063: Error attempting to execute IME command."`、`is TypeError == false`） |
+| `compositionAbandoned()` | **不抛**（no-op） |
+| `setConversionMode` | **不存在**：抛 `Error #1006`（`name="TypeError"`、`errorID=1006`、文案 `setConversionMode is not a function`） |
+| `IMEConversionMode` | 只有 **8** 个常量（值 == 名字）：`ALPHANUMERIC_FULL`/`ALPHANUMERIC_HALF`/`CHINESE`/`JAPANESE_HIRAGANA`/`JAPANESE_KATAKANA_FULL`/`JAPANESE_KATAKANA_HALF`/`KOREAN`/`UNKNOWN`；已废弃的 `FULL_WIDTH`/`HALF_WIDTH`/`JAPANESE_KATAKANA`/`TO_FULL_WIDTH`/`TO_HALF_WIDTH`/`JAPANESE_KATAKANA_HIRAGANA` **读回 undefined** |
+| mxmlc | **拒绝静态引用** `IME.setConversionMode` / `IMEConversionMode.TO_HALF_WIDTH` / `IME.addEventListener`（「可能未定义」）⇒ AS3 侧只能经**动态引用**触达 |
+
+**本机硬边界（为什么合成期的 `.text` 口径只能「选择」而非「实测」）**：① `TISSelectInputSource(WeType)` 让 python 进程 **SIGTRAP（exit 133）**；② 输入源是**按应用（per-app）**的，TIS 只能改调用者自身，`adl` 拿不到；③ 菜单栏输入法菜单**未启用**（`Ctrl+Space` 旋转也无效）。故**无法把真实输入法接到 adl**，「合成期 AIR 的 `.text` 含不含合成串」**没有实测口径**，本阶段的选择与理由写在 `examples/stage94p.as` 头部并留了遗留行。
+
+**实现口径（已言明为选择）**：合成串是**预览**不是文本 —— `.text`/`caretIndex`/选区/`numLines`/`textWidth` 一概不动、不派发 `change`；绘制层在**光标处**画合成串 + 1px 下划线；平台送**空** marked text = 合成结束（清除预览）；提交走既有 `textInput` 通路（先丢弃预览 → 正常插入，`restrict`/`change`/光标全部沿用已实测路径）；只有 `as_tf_is_input` 字段参与；候选窗矩形经 `SDL_SetTextInputRect` 跟随光标。
+
+**实现（分四层）**：
+
+| 层 | 改动 |
+|---|---|
+| `vendor/window_glue.cc` | `WinCtx` 增 `char edit_text[256]; int edit_start; int edit_len;`；`case SDL_TEXTEDITING:`（**在 `SDL_TEXTINPUT` 之前**）stash → `on_key(id, "textEditing", 0, 0, 0)` → `dirty=1`；新增 `int sk_window_text_edit_take(int id, char* buf, int cap, int* start, int* length)`（一次性 drain，空串有意义）；新增 `void sk_window_set_text_input_rect(int id, double x, double y, double w, double h)`（→ `SDL_SetTextInputRect`） |
+| `vendor/skia_glue.cc` | 新增 `int sk_textlayout_caret_rect(void* para, int index, double* x, double* y, double* h)`（`getRectsForRange(i, i+1, kTight, kTight)`；空则回退 `(i-1, i)` 取 right 边）。**坑**：`RectWidthStyle` 只有 `kTight` |
+| `src/runtime.ts` | extern + `static inline` wrapper + headless stub 三件套（`sk_window_text_edit_take` / `sk_window_set_text_input_rect` / `sk_textlayout_caret_rect`，wrapper 名 `as_skia_textlayout_caret_rect`） |
+| `src/emit.ts` | `TextField` 增 `char* _comp; int _comp_start; int _comp_len;`；`as_tf_set_comp(tf, text, start, length)`（malloc 字节串，定义在 `Stage_dispatchText` 之前）；`Stage_dispatchTextEditing(void* _this, char* text, int start, int length)`（取 `as_focus_obj` + `as_tf_is_input` 守卫、存合成、复刻渲染坐标算 ROI 写 `ASC_ime_roi`）；`Stage_dispatchText` 在 `as_tf_insert_text` **之前**插 `as_tf_set_comp(tf, NULL, -1, 0);`；渲染分支画合成串 + 下划线；`ASC_window_on_key` 增 `"textEditing"` 分支（drain → dispatch → 有 ROI 则 `sk_window_set_text_input_rect`，用 `on_mouse` 变换的逆向） |
+| `src/symbols.ts` | `Stage.methods` 增非标准测试钩子 `['dispatchTextEditing', { returnType: void, params: [text:String, start:int = -1, length:int = 0] }]` |
+
+**实施中顺带修掉的两个真缺口（不新增遗留行，两者都是「渲染指纹漏项」/「索引域错位」族）**：
+
+1. **合成串不在渲染缓存键里** ⇒ 预览**根本不出现**。`as_render_object` 走 `as_render_fingerprint(o)` 自动烘焙缓存：合成串既不进指纹，字段的 `text`/caret/选区又都没动，于是每次都**重放旧图**。实测症状极隐蔽（`temp/imeprobe`：`"ab"` 后合成 `"nihao"` 可见，但在 `"ab你好"` 之后合成 `"shu"` 完全不可见——因为第二次合成前光标/选区/文本恰好都没变）。修法：给指纹加 `h = as_fp_str(h, tf->_comp);`（**内容敏感**哈希：合成缓冲每次 `free`+`malloc`，同长度替换常拿到同一地址，指针哈希不够），并同批补上 **`_sel_caret`**（预览 x 位置）与 **`displayAsPassword`**（遮罩串）——两者同理：改了绘制结果却没进指纹。
+2. **Skia 段落索引是 UTF-16 码元，本运行时的文本索引是 UTF-8 字节** ⇒ CJK 文本上的 Skia 区间查询全部落空。`as_skia_textlayout_caret_rect(para, 8, ...)`（caret 的**字节**位置）在 `"ab你好"`（段落长 **4**）上超界，返回 0 ⇒ 预览被整段跳过。修法：新增 `static int as_tf_utf16_index(TextField* tf, int byteIndex)`（按 UTF-8 前缀数码元：1 字节 1 码元、2/3 字节 1 码元、4 字节 2 码元；遮罩串一字节一星故恒等），并把渲染侧的**光标矩形**与**选区矩形**（高亮 + 黑字两处）都改为先换算再查。
+
+**验收**：新 `examples/stage94p.as`（A~F：合成是预览——不动 `.text`/caret/选区/`numLines`/`textWidth` 且不派 `change`；长合成串不改行结构；提交恰好一次 change 且光标落 7（**字节索引**口径）；取消合成 no-op；无焦点/动态字段 no-op；`restrict` 只管提交且被拒提交**消费选区**；焦点搬家不把预览变成文本）纳入回归；`test.ts` `[textinput]` 新增 **22 条**钉子（glue 的 `SDL_TEXTEDITING` 顺序与缓冲、两个新 glue 入口与 SDL 转发、`sk_textlayout_caret_rect` 与回退、runtime 三件套、`TextField._comp` 三字段、`as_tf_set_comp` 的复制/清空语义、`Stage_dispatchTextEditing` 的守卫与「只存不 splice」、提交前清合成且顺序正确、`"textEditing"` 桥接分支与 ROI 变换、渲染预览块含下划线、指纹两项、UTF-16 换算）；`node test.ts` **141 例全通**。
+
+**窗口 AOT 视觉核对（链接 Skia + Metal）**：`snap_ime_1_compose_nihao.png`（`abnihao` + 下划线）、`snap_ime_2_committed.png`（`ab你好` 无下划线）、`snap_ime_3_compose_shu.png`（`ab你好shu` + 下划线 —— 这一张正是上面两个真缺口的判据）、`snap_ime_4_cancelled.png`（无残留下划线）、`snap_ime_5_f2_compose_wo.png`（`cdwo` + 下划线）；`/tmp/ime.txt` 同时证明 AS3 可见态逐帧不变（`t1/t3/t4` 的 `text`/`caret`/`tw` 均不动）。
+
+**未实现（已登记遗留行）**：`flash.system.IME` / `IMEConversionMode` 类（实测为「`setCompositionString` 恒抛 `#2063`、`setConversionMode` 不存在、8 个常量」⇒ 价值低，本阶段只把实测口径记进本文件）；`IMEEvent` 事件族（mxmlc 禁止 `IME.addEventListener` 静态引用，TextField 路径上唯一可观测的只有提交时的 `TEXT_INPUT`）；web 目标 `compositionstart/update` 未接。
+
+---
+
+#### 阶段九十四·十八：字符串字面量的转义序列解码（v0.4.49 → v0.4.50）✅ 已完成
+
+**触发**：阶段九十四·十七 的 IME 探针顺带发现 `"\u4f60\u597d"` 被当成字面 `u4f60u597d` 塞进字符串（词法器只认识 `\n \t \r \\ \" \'`，其余一律「保留字符本身」）。属 ⑤「语言语义包」的第一个子项：**编译期语义错误**，比功能缺失更致命（AGENTS.md §0）。
+
+**证据台**：`temp/escprobe/`（`Esc.as` + `esc-app.xml`，日志 `/tmp/esc_out.txt`；`Raw.as` 为裸换行用例）。
+
+**adl 51.4.1 实测口径**：
+
+| 面 | 实测结论 |
+|---|---|
+| `"\u4f60\u597d"` | `length` = **2**（UTF-16 码元）、`charCodeAt(0)` = **0x4F60**、`charCodeAt(1)` = **0x597D** ⇒ `\uXXXX` **必须解码**（非法 hex 是编译错误） |
+| `"\x41\x7a"` | = `"Az"`（65 / 122）⇒ `\xXX` 恰好**两位**十六进制 |
+| `"\b\f\v"` | 码元 **8 / 12 / 11** ⇒ 三个都是**单码元**转义 |
+| `"\q\z\8"` | = `"qz8"` ⇒ 未知转义**丢掉反斜杠、保留字符本身** |
+| `"a\<LF>b"` | `length` = **2** = `"ab"` ⇒ `\` + 换行是**续行**（不产生字符） |
+| `"p\0q"` | `length` = **3**、码元 112 / **48** / 113 ⇒ `\0` 是**字符 `'0'`**，**不是** NUL（AS3 弃用了 ES3 的八进制/NUL 转义） |
+| `"\ud83d\ude00"` | `length` = **2** ⇒ 代理对由两个 `\u` 拼出 |
+| 裸换行 | mxmlc **拒绝**字符串里的裸换行（`Raw.as`：「语法错误: 此处应该有一个"分号"或一个"新行"」） |
+
+**实现（`src/lexer.ts` 的字符串 `switch (esc)`）**：新增 `'b'`/`'f'`/`'v'`（8/12/11）；新增 `'u'`（读 **4** 个 hex，非法抛 `LexError('invalid \u escape sequence')`）、`'x'`（**2** 个 hex，非法抛 `LexError('invalid \x escape sequence')`）；新增续行 `case '\n'`（吞掉）与 `case '\r'`（后随 `\n` 则一并吞）；**删除 `case '0'`**（回落 `default` 保留 `'0'`）；字符串读取循环开头加 `if (source[i] === '\n' || source[i] === '\r') throw new LexError('unterminated string literal (line terminator in string)', startLine, startCol);`。解码**在词法器里做完**——生成 C 时字面量只含最终字节，C 编译器看不到任何 `\u`（这正是与 C 的区别所在：C 的 `"\u0000"` 会截断字符串、`"\0"` 是 NUL，二者都与 AS3 相反）。
+
+**验收**：新 `examples/stage94q.as`（A~I：`\uXXXX` 与源里等价 UTF-8 字面量逐字节相等、代理对、`\xXX` 大小写、`\b\f\v` 码元、未知转义、`\0` 是 `'0'`、混排、`\t\n\r\\\"\'` 回归、续行 `\n`/`\r\n`，以及**内嵌 NUL 截断的既定偏差**）纳入回归；`test.ts` `[lexer]` 新增 **12 条**钉子（含 4 条抛错用例：`\u12` / `\u12g4` / `\x4` / 裸换行）；`node test.ts` **142 例全通**（全量回归同时确认裸换行拒绝不会打挂既有示例）。
+
+**已知偏差（已登记遗留行）**：`"\u0000"` 解码出的是真正的 NUL 字节，但本运行时的字符串是 **C 串**（遇 NUL 即止），故 `"a\u0000b".length` 这里是 **1**、AIR 是 **3**。示例把可观测的那一面钉住并写明这是**既定偏差**。
+
+---
+
+#### 阶段九十四·十九：相机 RAW / DNG 解码（E4）—— 实测完成，零代码（v0.4.50 → v0.4.51）✅ 已完成
+
+> **后续（阶段九十四·二十五）**：本轮实测的「默认即解出」已按 §1.5 改为**默认拒绝 + `--features raw`**——此处保留当时的原始记录。
+
+**触发**：`### 增强待做` 的 E4「相机 RAW / DNG 解码」。立项时的判断是「native 侧 `libpiex.a`+`libdng_sdk.a`
+已构建，缺的是新解码通道」；**实测推翻了「缺通道」这一前提**——通道早就通了。
+
+**证据台**：`temp/codec-probe/`（沿用 E1/E3 的同一台）
+- `RawAdl.as` + `raw-adl-app.xml` + `raw-adl.swf`：**AIR 基线**（`mxmlc` 编译、`adl 51.4.1` 跑，输出 `/tmp/raw_adl.txt`）。
+  加载是异步的，故步骤用 `setTimeout` 串联（busy-wait 会卡住帧循环、完成事件永不派发）。
+- `raw-probe.as` + `codec-raw.build.json`（= 默认清单 + `ASC_USE_RAW=1`，仅作对照）：**我们侧**，四条入口 + 反向对照。
+- `img/sample_1mp.dng`（87 KB）、`img/dng_with_preview.dng`（138 KB）：取自本机 Skia 源码树的
+  `build-tools/skia-src/resources/images/`（现成样本，不必自造 DNG）。
+
+**AIR 实测（`adl 51.4.1`，权威判据 §1.5）**：
+
+| 入口 | AIR |
+|---|---|
+| `Loader.load(new URLRequest("file://…/sample_1mp.dng"))` | `ioError #2124 Error #2124: Loaded file is an unknown type.` |
+| `Loader.loadBytes(ByteArray)` | `ioError #2124` |
+| `BitmapData.loadFile(...)` | **方法不存在**：`#1069 Property loadFile not found on flash.display.BitmapData and there is no default value.`（静态引用连 mxmlc 都过不了：「可能未定义」；探针用动态访问触达） |
+| `t.png`（对照） | `ok 37×23 tl=ff0000` |
+
+**我们侧实测（native，**默认清单**、不带任何 `--features`）**：
+
+| 入口 | native 默认构建 | web |
+|---|---|---|
+| `Loader.load` | **`ok 600×338`** | 与 AIR 同报 `#2124` |
+| `Loader.loadBytes` | **`ok 600×338`** | — |
+| `BitmapData.loadFile`（我们自己的 String 通道） | **`ok 600×338`** | — |
+| `dng_with_preview.dng`（`Loader.load` / `loadFile`） | **`ok 600×338`** | — |
+| `BitmapData.draw` 到目标位图（第 4 条入口） | `ok 600×338` | — |
+| `t.png`（反向对照：RAW 通道**不截胡**既有 codec） | `ok 37×23 tl=ff0000` | `ok` |
+| `t.svg`（非 RAW，仍按既有规则） | `ioError #2124` | `ioError #2124` |
+
+**为什么零代码（根因）**：RAW 在 Skia 里是 `SkRawDecoder`（`include/codec/SkRawDecoder.h`），由
+`skia_use_dng_sdk`+`skia_use_piex` 打开；本机 native Skia 正是这么编的，且它在 Skia 的**默认编解码器表**里
+（`SkRawDecoder::IsRaw` 恒真、头文件注明「always checked last」）⇒ 既有的
+`SkImages::DeferredFromEncodedData` 通道**本来就会**把 DNG 交给它。符号证据：
+`nm -gU vendor/skia/lib/macos-arm64/libskia.a | grep SkRawDecoder` → `Decode(sk_sp<SkData>…)` /
+`Decode(unique_ptr<SkStream>…)` / `IsRaw` 三个符号在；`libpiex.a`/`libdng_sdk.a` 早已在链接表里。
+
+**web 侧是天然的诚实缺口（不静默降级，§1.2c）**：`nm -g vendor/skia/lib/wasm/libskia.a | grep -c SkRawDecoder`
+= **0**，且 `vendor/skia/lib/wasm/` 里没有 `libpiex.a`/`libdng_sdk.a`（wasm 的 `args.gn` 没开这两个开关）
+⇒ web 构建对 DNG 与 AIR **逐字相同**地报 `#2124`。要支持须改 `args.gn` 并重编 wasm Skia，属独立工程。
+
+**未实测（按 §1.5 记为「未验证」而非「已支持」）**：只验了 **DNG**。`.cr2`/`.nef`/`.arw` 等其它 RAW 家族
+走同一条 piex 通道，但本机**没有样本**；`SkRawDecoder::IsRaw` 恒真意味着「非 RAW 的其它文件」在这个回退上
+只会多花一次解析尝试（对 `t.png`/`t.svg` 的实测已确认不会误判成功）。
+
+**验收**：无需改一行源码（故此阶段没有 `examples/` 单元——与 E1/E3 同理，它需要 Skia 链接）；证据落在
+`temp/codec-probe/`（`RawAdl.as` AIR 基线 + `raw-probe.as` 我们侧 + `codec-raw.build.json`），
+`docs/zh-cn/enhancements.md` §4.5 与 §3 的 E4 行同步登记为**已完成**。`node test.ts` **142 例全通**（无源码改动）。
+
+**待你裁决（与 E3 同一条，未擅自选择）**：默认构建**就是 AIR 的超集**——对 AIR 会拒绝（`#2124`）的输入我们
+直接解出来。两条路：(a) 保持现状（只增不减，对 AIR 上能跑的程序零影响）并写进文档；(b) 默认拒绝、加显式
+开关才放行（严格同构，但要主动写代码**降低**能力）。已在 `docs/zh-cn/enhancements.md` §4.3 末尾与 §4.5 末尾
+**如实记为待定**。
+
+> **裁决结果（2026-10-04）**：用户选定 **(b) 默认拒绝 + 显式开关**。E3（WebP/BMP/ICO）与 E4（RAW/DNG）
+> 须改为「默认与 AIR 逐字同形（报 `#2124`），`--features` 具名开关才放行」，实现见后续阶段节。
+
+---
+
+#### 阶段九十四·二十：字体度量对齐 AIR（④-A）（v0.4.51 → v0.4.52）✅ 已完成
+
+**背景**：`TextField` 的 `textWidth`/`textHeight`/`numLines`/光标几何**全部**由 SkParagraph 的布局导出，
+所以「命中哪个字面」与「行盒多高」两件事决定了**所有**排版数值。遗留表里那条「字体度量偏小（行距 12 vs 15、
+字符前进 5.3 vs 6.6）」自阶段八十九·七十七 起一直挂着，期间被阶段九十四·七/八/十五/十六 反复追加同源证据
+（点击落点、拖选字符数、`displayAsPassword` 星号宽度、`PageUp` 步长与 `scrollV`）——而它**每次都只被记录、
+从未被修复**。本阶段把它结案。
+
+**证据台 `temp/metricprobe/`**（同一份输入矩阵，两侧各跑一遍，输出可直接 diff）：
+
+| 文件 | 端 | 覆盖 |
+|---|---|---|
+| `Metric.as` / `MetricAot.as` | `adl` / 我们（AOT + Skia） | 12 个字面族 × {10×`W`、10×`i`、10×`*`、10×`0`、10×空格、`abcde`} + 单行/两行 + password + leading 矩阵 |
+| `Metrics2.as` | `adl` | `getLineMetrics(0)`：ascent/descent/leading 的**半像素取整**证据（12 px 与 20 px） |
+| `Metrics3.as` | `adl` | 7 族 × 9 档字号（8…32）→ 通用别名行高的**非线性**证据 |
+| `Metrics4.as` / `Metrics5.as` | `adl` | `TextFormat.leading` 的 **px 语义** + 尾行怪癖（1..4 行 × leading 0/2/4/10/−3） |
+| `adl_metric.txt` / `aot_metric.txt` | — | 两侧原始输出 |
+
+**根因（实测确认，不是推测）**：`_sans`/`_serif`/`_typewriter` **不是字体族名**，是 Flash 运行时要自己解析的
+通用别名；CoreText 不认识 `_typewriter`，原样透传给 SkParagraph 会**静默回落到系统默认比例字体**。于是
+`_typewriter` 12 px 量出 10×`W` = **113.26 px**（等宽体被渲染成比例体，字宽差 40%）、星号 **4.67 px**、行高
+**12 px**，而 `adl` 分别是 **72 / 7.2 / 15**。这解释了全部既有症状（星号变窄、软换行点更早、`visible` 行数更多）。
+
+**实现（四层，全在 Skia 侧，纯 C 构建不受影响）**：
+
+| 层 | 内容 |
+|---|---|
+| 别名字面 | `sk_family_alias()`：`_typewriter`→`Monaco`、`_sans`→`Helvetica`、`_serif`→`Times New Roman`、空/`null`→`Times`（AIR 把空族读回 `"Times Roman"`，其行高 12 与 Times 逐值一致）；具名字体原样透传。**五条** `setFontFamilies` 通路（平铺段、带 leading 的段、多 run 段的 style 与 strut）全部走它，不留未翻译透传 |
+| 字面查找 | `sk_match_typeface()` 按 `(family, bold, italic)` 缓存 `matchFamilyStyle`（CoreText 族表扫描很贵，不能每段重跑） |
+| 行盒模型 | `sk_round_half()` + `SkAirLineMetrics`：`h = round_half(ascent) + round_half(descent) + leading`（**丢弃字体自带 line gap**；`leading` 以 **px** 计）；经 `sk_set_air_strut()` 装 height-override strut 强制之。**两个反直觉点**：①Skia 的因子分母含 line gap 而盒子里不含 ⇒ 高度须**预乘 `rawFull/rawSum`**（漏乘时 Monaco 12 px 精确地短 1.002 px，报 14）；②Skia 把 `StrutStyle::leading < 0` **钳成 0** ⇒ 负 leading 必须折进 height |
+| 字段高 | `TextField_get_textHeight`：AIR 的多行字段**不计尾行 leading**（实测 leading=4、步长 19 时 1..4 行 = 19/34/53/72）⇒ `nl ≥ 2` 时减一次 `leading` |
+
+**验收（逐值，全部对 `adl 51.4.1` 12 px）**：
+
+- 别名字面：`_typewriter` 10×`W`/`i`/`*`/空格 = **72**（= adl 72）、行高 **15**（= adl 15）、密码星号前进 **7.2**（= adl 7.2）——**遗留行里的两个数字（12/15、5.3/6.6）同时消失**。
+- 12 个字面族：字宽**全部逐值相同**（`113.26` vs `113`、`72.01` vs `72` 这类 <0.3 px 的浮点噪声）；行高 **8 族逐值相同**（`Courier` 12、`Menlo` 14、`Monaco` 15、`Helvetica` 12、`Times`/`Times New Roman` 12/13、`Geneva` 15、`_typewriter` 15），2 族残差 0.5 px（`Courier New` 14 vs 13.5、`Arial` 13 vs 13.5）。
+- leading 矩阵：`_typewriter` 12 px × leading {0, 4, −3} × 1..4 行 = **12 个数值逐值相同**（15/30/45/60、19/34/53/72、12/27/39/51）。
+- `test.ts` `[fontmetrics]` **8 条**结构钉子（含 4 条反向：无未翻译透传、旧 `setLeading(leading)` 的 em 尺度错误不得复活、三条 paragraph 通路都得装 strut、尾行修正必须在场），`node test.ts` **142 例全通**。
+- 模型写入 `docs/zh-cn/skia.md` §8，证据台 `temp/metricprobe/README.md`。
+
+**未对齐（登记遗留 2 行，本阶段不再深挖）**：`_sans`/`_serif` 的**行高**（AIR 用自有**非线性**设备字体表：9 档字号实测值已留存，`_typewriter` 在 14 px 起也与 Monaco 分道 ⇒ 无解析字面可复现；我们**不做**插值硬编码表）；`Courier New`/`Arial` 的 0.5 px 残差（Skia 内部半像素取整方向）；`TextField.getLineMetrics()` 未实现（AIR 有，本轮 adl 侧数值全靠它取）—— **此条已于阶段一百零三 / v0.4.76 落地**。
+
+**为什么没有 `examples/` 单元**：度量面需要 Skia 链接，而 headless 示例套件是**纯 C 模式**（无 Skia），
+同 E1/E3/E4 的处理；故以**证据台双向输出 + 结构钉子**替代（这两者都是可复跑、可回归的）。
+
+---
+
+#### 阶段九十四·二十一：TextField 边框是屏幕空间 1px 线（④-C）（v0.4.52 → v0.4.53）✅ 已完成
+
+**背景**：遗留表里这条（阶段九十四·八 登记）已经挂了一轮，且当时就写明「**需要先实测 adl 在非等比
+缩放下是「仍为各自轴上的 1 物理 px」还是「按其中一个轴」**」——本阶段把该矩阵补齐后一次修掉。
+
+**实测（`temp/editprobe/src/Ed7.as`，五个边框字段 + `drive_ed7.py` 窗口像素扫描）**：
+
+| 字段 | 缩放 | adl 包围盒 | adl 每边线宽 |
+|---|---|---|---|
+| 100x30，绿 | 1 | 101x31 | **1 px**（`xruns=[0-0,100-100]`、`yruns=[0-0,30-30]`） |
+| 60x20，品红 | `scaleX=scaleY=2` | 121x41 | **1 px**（`[0-0,120-120]`） |
+| 60x20，青 | `scaleX=2, scaleY=1` | 121x21 | **1 px**，**两个轴各自** 1 px |
+| 60x20，橙 | `scale=0.5` | — | 1 px（颜色被抗锯齿轻微混合成 `FF8200`，故精确色查询需放宽） |
+
+⇒ AIR 的边框是**屏幕空间的 1 px 线**：不随对象缩放，且**按轴**各自保持 1 px（不是按单一因子）。
+
+**修法（三处，全部在渲染侧）**：
+
+| 处 | 内容 |
+|---|---|
+| 胶水层 | 新增 `sk_canvas_total_scale(canvas, &sx, &sy)`：返回**当前变换**的每轴缩放（列范数 `sqrt(a²+b²)`、`sqrt(c²+d²)`，故带旋转时给的是旋转后每轴的尺度，而不是矩阵原始项） |
+| 生成侧（线宽） | `厚度(局部) = ASC_render_scale / 画布总缩放`；`ASC_render_scale` 是本次渲染的物理像素比 ⇒ 结果是 **1 逻辑 px**（`scale=1`、`dpr=1` 时恰好等于旧的 `1.0` 局部单位，故 1× 显示器的观感与旧行为逐像素相同）；四条边各自用 `btx`/`bty`（按轴） |
+| 生成侧（烘焙） | 自动烘焙/`cacheAsBitmap` 的内容是在**离屏面**里重画的，那个画布缩放是烘焙分辨率、回贴时又叠加对象自身缩放 ⇒ 烘焙通道把**目标**画布总缩放发布到 `ASC_bake_ctm_*`（save/restore 支持嵌套烘焙），边框据此度量 |
+
+**验证（Retina 窗口 880x464 = 2× 物理）**：同一二进制三个状态，看 `scale=2` 字段每边线宽 ——
+修前 **4 物理 px**；只改线宽公式仍 **4**（烘焙回贴放大）；线宽公式 + 烘焙发布目标缩放后 **2 物理 px**，
+与 `scale=1` 字段**逐像素同宽** ✓。非等比（`scaleX=2, scaleY=1`）与 `scale=0.5` 也都是 2 物理 px ✓。
+「1 逻辑 px」在 adl 的 1× 捕获里是 1 物理 px、在我们 Retina 里是 2 物理 px —— 这是 **DPI 差异**而非口径
+差异（adl 的窗口被系统放大到 2× 显示时，屏幕上同样是 2 物理 px）。
+
+**被这次实测牵出来的连带缺陷（本阶段只绕开、未修，已登记遗留行）**：烘焙面按 `dpr` 而非**目标画布
+总缩放**分配 ⇒ `scale != 1` 的缓存对象回贴时被放大，内容按 `scale` 倍点采样（字边锯齿）。判据链很干净：
+`scale=2` 的字段线宽 4 px，把自动烘焙关掉（`ASC_AUTO_BAKE_FRAMES` 调大）立刻变 2 px ⇒ 多出的 2 px
+来自烘焙分辨率而不是线宽公式。没顺手修的原因：改烘焙分辨率会让烘焙面随缩放**平方**增长，属内存/清晰度
+取舍（需先定上限），不该在「边框线宽」这一项里悄悄决定。
+
+**验收**：`examples/stage94r.as`（纯 C 回归 —— 像素级不变式只能在窗口里观测，故本示例钉住本次改动
+**不得破坏**的那半边：边框与缩放都不得污染 `width`/`height`（它们是**变换后**的包围盒）、非等比缩放的
+`localToGlobal`/`globalToLocal`/`hitTestPoint` 逐轴正确、`borderColor` 写入仍丢 alpha）；`test.ts`
+`[border1px]` **3 条**结构钉子（胶水接口在场、四条边的 `1.0` 固定厚度不得复活、烘焙必须发布目标缩放）；
+`node test.ts` **143 例全通**；双端截图 `temp/editprobe/snap_ed7_{adl,aot_before,aot_after}.png`。
+
+---
+
+#### 阶段九十四·二十二：`hitTestPoint(x, y, shapeFlag)` 的内容区域判定（④-D）（v0.4.53 → v0.4.54）✅ 已完成
+
+**背景**：遗留行「`hitTestPoint(x,y,true)` 的像素级精确命中未实现」的**前提需要一个更正**。原行按
+阶段九十四·九 的圆探针写成「`shapeFlag=true` 是**像素级**命中」，但本轮把命中矩阵补全后发现：
+`adl` 的 `shapeFlag=true` **不是**逐像素 alpha 测试 —— 全透明的 `BitmapData` 在它自己的矩形内
+**照样命中**、矩形内的透明像素**也命中**；`TextField` 则完全**忽略** `shapeFlag`。它真正的语义是
+**「画出来的内容区域」**（矢量填充 ∪ 描边带、位图/文本字段的矩形、子对象区域的并集）。
+
+**实测（证据台 `temp/editprobe/app8..app10`：Ed18–Ed26 + `hit25_adl.txt`）**：
+
+| 情形 | `shapeFlag=false`（box） | `shapeFlag=true`（region） |
+|---|---|---|
+| 矢量填充 10..30 + 8px 描边（描边 6..34） | **含**描边：x≥5.75 命中 | **含**描边：x≥6.0 命中（严格边界） |
+| 只有描边的线（10px，默认圆头） | 描边外框 | 描边带：垂直 4.5px 命中 / 5.5px 不中；**端点外 2px 仍命中**（圆头） |
+| 一次 fill + 同向嵌套子路径 | 外框 | **内层是洞**（even-odd） |
+| 两个独立 fill 组嵌套 | 外框 | **都填充** |
+| 全透明位图 | 位图矩形 | **位图矩形**（不采样 alpha） |
+| `TextField`（有/无文本/有无边框） | 字段矩形 | **字段矩形**（忽略 `shapeFlag`） |
+| `Sprite` + 两个位图子对象（中间有缝） | 整块外框（缝也命中） | 子对象各自命中、**缝不命中** |
+| `visible=false` / `mouseEnabled=false` / `mouseChildren=false` | **仍命中** | **仍命中** |
+| 空 `Sprite` | 不命中 | 不命中 |
+
+**实现（三处）**：
+
+| 处 | 内容 |
+|---|---|
+| 胶水层 | 新增 `sk_path_contains`（按路径**自己的**填充规则判点）、`sk_path_stroke_contains`（用 `SkStrokeRec::applyToPath` 生成描边轮廓再 `contains`，圆头圆角 = `lineStyle` 默认）、`sk_path_set_even_odd` |
+| 生成侧（判定） | `as_obj_region_hit_local`：自己的 Graphics（填充 ∪ 描边带）→ 位图/`TextField` 的矩形 → 容器**递归**子对象（点逐级换到子对象的局部空间）；`DisplayObject_hitTestPoint` 按 `shapeFlag` 分派 |
+| 生成侧（外框 + 渲染规则） | `as_obj_hit_local` 的 `as_bounds_walk(o, 1, …)` = **含描边**（顺带修掉「仅有描边的 `Shape` 点不到」）；`Graphics_ctor` 统一把路径设为 **even-odd**，使**画出来的区域**与**命中区域**是同一份几何 |
+
+**判据链（为什么敢把填充规则改成 even-odd）**：命中区必须与画出来的区域一致，而 `adl` 侧两者
+**同时**给出「同向嵌套子路径 = 洞」：命中探针 Ed21 §E 说内层不命中，窗口像素探针 Ed26 说内层中心
+是 `FFFFFF`（背景色，即没画）⇒ 一个独立于命中测试的**像素级**证据，故渲染也按 even-odd。
+
+**双端验收（`hit25_adl.txt` vs `hit25_aot.txt`）**：**42 行逐行对照，40 行逐字相同**。差异仅 2 行，
+都在边界那 0.25px 的抗锯齿模糊带里（`x=5.75` 描边外缘外、`x=34` 正落在描边外缘），且 `adl` 自己的
+右边界在三组位图探针里也不自洽（Ed21 §A1 与 Ed23 §A 对同一几何给出不同结果）⇒ 这是**光栅化**的产物
+而不是可抄的规则，按严格几何实现并登记遗留行。
+
+**为什么 `examples/` 单元只能钉住一部分**：headless 套件无 Skia，矢量几何不保留（`path` 为 NULL），
+矢量 region 退化成含描边外框。因此 `examples/stage94s.as` 钉的是**不依赖 Skia 的那三类** ——
+容器的缝（`false` 命中 / `true` 不命中）、位图矩形（全透明也命中、透明象限也命中）、`TextField`
+忽略 flag，外加递归/镜像/空对象/`visible`·`mouseEnabled`·`mouseChildren` 不影响 —— 共 5 组 20 条断言；
+**矢量逐行对照在证据台**（`hit25_{adl,aot}.txt`），并由 `test.ts` `[hitshape]` **6 条**结构钉子守住
+「不采样 alpha、容器递归、含描边外框、按 flag 分派、even-odd」。
+
+---
+
+#### 阶段九十四·二十三：渲染颜色的四个环节逐一测量（④-B）（v0.4.54 → v0.4.55）✅ 已完成
+
+**背景（含一处旧结论的更正）**：阶段八十九·七十七 把「非灰颜色偏移」记成「本管线把 sRGB
+转换到显示器 P3」。本轮按 §1.5 把**四个可比环节**拆开各测一遍，结论反转：偏移在**捕获**段，
+我们的渲染与提交都是逐位精确的。
+
+| 环节 | 测法 | 结果 |
+|---|---|---|
+| ① 我们的光栅 | `BitmapData.draw(TextField)`（glue 新建**离屏**面 → 画 → `as_skia_surface_read_argb` 读回；无窗口/无合成器） | `00FF00`→`ff00`、`FF8000`→`ff8000`、`0000FF`→`ff`、`FF00FF`→`ff00ff` **逐位精确** |
+| ② 提交前的 drawable | 新增 `ASC_MTL_READBACK=<x>,<y>[,<n>]`：`sk_mtl_flush` 里对本窗口 drawable `readPixels` | 物理 (40,40) 连续 3 px = `ff00ff00` **逐位精确** |
+| ③ 我们的窗口捕获 | `screencapture -l` + `probe26b.py`，Metal 与 **CPU** 两个后端各一次 | `00FF00→03FF00`、`00FFFF→03FFFF`、`FF8000→FF8002`、蓝/品红精确；**两个后端逐值完全相同** |
+| ④ `adl` 的窗口捕获 | 同一份 `.as` 经 `mxmlc` + `adl` | 绿/青/蓝/品红精确，**`FF8000→FF7700`（−9 LSB）** |
+
+**结论**：偏移由 `screencapture` 这条通路（窗口服务器 → 显示色彩管理 → PNG）引入，两端共有、
+程度不同；它不是我们的渲染缺陷（①②精确、③两后端一致）。**由此定下两条工具口径**：
+
+- 逐位比较**颜色**必须走①②（离屏 / drawable 读回）；
+- 逐位比较**几何**（边框、命中区、光标矩形）仍可用 `screencapture`，但要带容差
+  （`grabwin.py` 的 `GRAB_TOL`，本管线的固有偏移 ≤ `adl` 的水平）。
+
+**实现（两处，都不改渲染语义）**：`metal_glue.mm` 的 `sk_mtl_init` 给 `CAMetalLayer` 显式
+声明 **sRGB**（`kCGColorSpaceSRGB`）——这是「我们绘制的值就是 sRGB 编码」的正确声明（不声明时
+系统按显示原生空间解释，广色域屏上会过饱和）；并新增 `ASC_MTL_READBACK` 读回钩子（env 门控，
+默认零成本），它是②的判据、也是以后任何「提交值是否正确」问题的现成工具。
+
+**不可观测性（如实记明）**：sRGB 声明对**截图数值**没有影响（去掉前后逐位相同，`snap_ed26_notag.png`），
+故它的依据是语义正确性而非实测差异；广色域屏上**肉眼**是否与 AIR 一致，截图测不出来，登记为遗留行
+（需系统取色器/色度计）。
+
+**验收**：`test.ts` `[colormanage]` 结构钉子（胶水声明 sRGB、读回钩子在 flush 里且 env 门控、
+`no-Skia`/非 Metal 构建不受影响）；证据台 `temp/editprobe/app10/`（`Ed26.as` 同一份源码跑
+adl/AOT、Metal/CPU 四组）+ `ed26_captures.txt`（四张表）、`offscreen_cpu.txt`、`mtl_readback.txt`、
+`snap_ed26_{adl,aot,cpu,notag}.png`；`temp/xformcmp/README.md` §2 旧结论已更正。
+
+**踩坑（写进证据台）**：探针**不要**在 `ENTER_FRAME` 回调里做重活 —— 本阶段第一版探针在那里调
+`stage.render` 导致 `Stage_dispatchFrame` → `as_function_vt` 跳野指针而 **SIGBUS**（崩溃报告
+`~/Library/Logs/DiagnosticReports/ed26_aot-*.ips` 的触发帧即它）；窗口 app 也别用 `trace` 汇报
+（被 `pkill` 打断时 stdout 缓冲会丢），用 `FileStream` 落盘。
+
+---
+
+#### 阶段九十四·二十四：64 位整数 `int64` / `uint64`（E9，增强项）（v0.4.55 → v0.4.56）✅ 已完成
+
+**为什么是增强不是遗留**：判据照 AGENTS.md §1.5——同一份输入 `adl` **能不能跑对**。`adl 51.4.1`
+对 `var x:int64` 连编译都过不去（`mxmlc` 报未知类型），所以「用 64 位类型的源码」不可能是 AIR 合法程序 ⇒
+接受这两个类型名**不可能**改写任何 AIR 已定义行为；opt-in 就是「你得写出来」——不写就与从前逐字节同构。
+
+**做了什么（全部为 new 代码，不改任何既有语义）**：
+
+| 层 | 改动 |
+|---|---|
+| 词法 | 数值字面量后缀：`123L` → int64、`123UL`/`123LU` → uint64（`Token.width`），**数字原文保留**在 `value` 里 |
+| 语法/AST | `ASType` 增 `int64`/`uint64`；`Num` 节点增 `width?`/`raw?` |
+| 语义/类型 | `CType` 增两 kind；`resolveType`、`ctypeToString`、`cTypeName`（`int64_t`/`uint64_t`）、`defaultInit`、`propTypeTag`（自用 tag 8/9） |
+| 表达式 | `emitBinary64`（算术/位运算/移位/比较全族）、`common64`、`to64Expr`；`boxExpr`/`unboxAny`/`toStringExpr`/`toNumberExpr`/`toInt32Expr`/`toUint32Expr`/`condExpr`/`unifyType`/`emitTrace`/`emitTypeof`/`emitAs`/`scalarIsCompatible`/`runtimeScalarIs`/`convert` 全族补位；`int64()`/`uint64()` 两个转换函数；`~` 保 64 位 |
+| 运行时 | `as_value` 的 **anonymous union**（`ptr` 槽复用为 `i64`/`u64`，**零尺寸开销**）；tag 8/9 与 `as_v_i64`/`as_v_u64`；四个值助手（`typeof`→`"number"`、truthy、eq/seq、str_val）全部补位；`as_num_to_i64/u64`（NaN/Inf 守卫）、`as_str_to_i64/u64`（strtoll/strtoull + errno）、`as_i64_to_str`/`as_u64_to_str`（**自带定点十进制**，不依赖 `%lld`）、`as_i64_rem`/`as_u64_rem`（零除数给 0）、`as_cmp_i64u64`（跨符号族数学比较）；反射表三个读者/一个写者补 tag 8/9 |
+| GC | `gc_mark_value`/`gc_write_barrier_value` **保持显式 tag 表**（范围判断会把整数位当堆引用）；prop 扫描器注释言明为何 8/9 缺席 |
+
+**三处 C 未定义边界（红线 §2.4 的落地）**：`%` 零除数（→ 0）、移位量 ≥ 位宽（掩 63）、
+`double → int64` 的 NaN/Inf 强转（守卫 → 0）。**两处响亮拒绝**：`Vector.<int64>`（未单态化）、
+64 位值进 `Object` 槽（会按 double 装箱舍入）——都报编译错误并给替代方案。
+
+**验收**：`examples/stage94t.as`（A~G 七组 50+ 断言：精确性/回绕/掩码移位/跨族比较/转换族与 `is`/`as`/
+容器与 GC/类字段与反射/条件与 switch；**纯 C 构建** ⇒ 天然覆盖 native 与 WASI 两端）；`test.ts`
+`[int64]` **10 条**结构钉子；全量 `node test.ts` = **145 passed, 0 failed, 145 total**（144 → 145）。
+文档：`docs/zh-cn/enhancements.md` §4.7（完整契约表）+ E9 行转「已完成」；`README-CN.md` bullet。
+
+**踩坑（供后续）**：① `runtime.ts` 是**一个大 backtick 模版字面量** —— 插入的 C 注释里出现 backtick（哪怕
+只在 `` ` `` 包一个单词）会立刻截断模版并报 `ERR_INVALID_TYPESCRIPT_SYNTAX`，本轮踩了两次；②
+`as_v_str_val` 的 tag 8/9 **必须**返回 GC 拥有的字符串（`as_str_from_i64`），若返回 `as_i64_to_str` 的
+**共享静态缓冲**，`trace(a, b)` 两个参数会都打印最后一个值（同一 printf 里两次调用的实参求值顺序未定序 →
+两参数同指针）；③ 字面量**必须**按源码原文发射（`INT64_C(...)`），走 `Number()` 会在 2^53 以上先舍入；
+④ `test.ts` 的钉子字符串里带撇号（`C's`）要用 `String.fromCharCode(39)` 拼接，且匹配示例文案时别误加前导引号。
+
+---
+
+#### 阶段九十四·二十五：E3/E4 由「零代码被动放行」改为「默认拒绝 + 具名开关」（v0.4.56 → v0.4.57）✅ 已完成
+
+**触发**：E3（WebP/BMP/ICO）与 E4（相机 RAW/DNG）此前实测为「零代码可用」——我们的 Skia 本来就带
+这些 codec，于是**默认产物比 AIR 宽**：`adl` 对它们一律报 `#2124`，我们却解出来了。这违反
+AGENTS.md §1.5/§1.2d（增强必须 opt-in，默认产物与 AIR 同构）。用户裁决：**改为默认拒绝 + 显式开关**。
+
+**改动（两个新具名开关 + 一处胶水闸门）**：
+
+| 位置 | 改动 |
+|---|---|
+| `vendor/skia_glue.cc` | 新增 `sk_extra_format_refused(data, len)`：**魔数**拦 WebP（`RIFF....WEBP`）/BMP（`BM`）/ICO·CUR（`00 00 01 00` / `00 00 02 00`）/TIFF 系 RAW（`II*\0`、`MM\0*`）/RAF（`FUJIFILMCCD-RAW`）。**四条解码入口全部调用**（`sk_image_from_file`/`sk_image_from_bytes`/`sk_image_decode_argb`/`sk_image_decode_bytes_argb`），命中即返回 NULL ⇒ 自动走既有的 `#2124` 失败路径，**报错文案与 `adl` 无需另行维护就一致**。PNG/JPG/GIF 的魔数不可能撞车。 |
+| `src/build.ts` `FEATURES` | `formats` → `ASC_ALLOW_EXTRA_FORMATS=1`（targets `native`+`wasm`，无额外库依赖）；`raw` → `ASC_ALLOW_RAW_FORMATS=1`（**仅 `native`**，`why` 点名 wasm Skia 缺 piex/dng_sdk 归档 ⇒ `--target wasm --features raw` 前置拒绝，不把 `undefined symbol` 抛给链接器）。同时改掉 FEATURES 顶部那句「登记 E4 会是空开关」的旧注释。 |
+
+**故意不做的事**：`WBMP`（`SkWbmpCodec` 编入了）**不拦**——头部是裸多字节类型字段、无可靠魔数；与其猜一个
+可能误伤真格式的判据，不如如实写明（§1.5：报明而非静默）。`QOI` 仍未编入，不在此列。
+
+**实测（三条命令，`temp/codec-probe/`）**：
+- 默认（`codec-probe.as` + `codec.build.json`）：PNG/JPG/GIF `ok`（尺寸+像素）；**BMP/WebP/ICO/SVG →
+  `ioError #2124 Error #2124: Loaded file is an unknown type.`**（与 `adl` 逐字相同）。
+- `--features formats`：BMP/WebP/ICO → `ok 37×23 tl=ff0000 br=ffff00`；SVG 仍 `#2124`（各开各的）。
+- `--features svg`：SVG → `ok`（闸门不误伤 E1 通路——SVG 是 XML，不匹配任何魔数）。
+- `--features raw`（`raw-probe.as` + `codec-raw.build.json`）：两份 DNG 的四条入口全部 `ok 600×338`；
+  默认清单同一份源码全部 `ioError #2124`（`BitmapData.loadFile` 通道仍 1×1 未变）。
+- `--target wasm --features raw` → `feature 'raw' is not available with --target wasm: the wasm Skia has no
+  piex/dng_sdk archive ...`；`--features nope` → `unknown feature 'nope' (known: formats, raw, svg)`。
+
+**文档**：`docs/zh-cn/enhancements.md` §1.4（开关表补三行 + 新增「默认拒绝」段）、§3 表 E3/E4 行、
+§4.3/§4.5 正文（原「待你裁决 (a)/(b)」两处 → 定案 (b) 并附实测）；`docs/zh-cn/compile.md` §3.4.2 表格
++ 新增 §3.4.3.1（默认拒绝的完整口径、魔数表、三条命令）+ §3.4.3 句首更正（只有 PNG/JPEG/GIF 免宏）；
+`README-CN.md` bullet。
+
+**踩坑**：`temp/codec-probe/codec-raw.build.json` 里遗留了立项期的 `ASC_USE_RAW=1`（还带**尾逗号**导致
+JSON 非法）——那个宏从未被任何代码读取过，正是「登记一个没人读的宏 = 空开关」的例子；本轮删掉并改用
+真正的 `--features raw`。
+
+---
+
+#### 阶段九十四·二十六：`_Noreturn` 修掉 Starling 基准 2× 性能退化（v0.4.57 → v0.4.58）✅ 已完成
+
+**现象**：Starling demo 的 Benchmark 场景（菜单 9 → **Start benchmark**）报告的是它能在 120 Hz 下**顶住的
+峰值对象数**。阶段九十四·十二 … 九十四·二十五 之后只剩 **~22 000**；这些阶段之前是 **~38 000–42 000**。
+等价于「这几轮的改动把渲染热路径的每对象成本翻了一倍」。
+
+**定位（同一份生成 C 上做 A/B，完全不动 AS3 侧）**：`temp/perfreg/` 提供免手驱动（`bench-auto` 让场景自
+启并打印 `BENCH obj=…`），把生成 C 的守卫逐个置空即可隔离变量：
+
+| 变体 | 置空的东西 | 峰值 obj |
+|---|---|---|
+| `rebuild`（对照） | 无 | 21 888 |
+| `v_obj` | `as_req_obj` → `return p;` | **42 144** |
+| `v_box` | `as_req_box` → `return v;` | 22 096 |
+| `v_both` | 两者 | 41 104 |
+| `v_macro` | `as_req_obj` 改成恒内联宏 | 40 992 |
+| `v_noret` | **`as_throw` 上加 `_Noreturn`（即本修复）** | **40 992** |
+| 真实流水线重编 | — | **42 160** |
+
+⇒ 成本**全部**来自阶段九十四·十二 引入的**指针接收者守卫 `as_req_obj`**（`as_req_box` 无关）。
+
+**根因**：`as_req_obj` 被发成一个**函数**，函数体里调 `as_throw`。clang -O2 在**大型热函数里没有内联它**
+（把抛出路径当成普通调用计入了内联代价），于是**每一处**受守卫的成员访问都变成一次**不透明的函数调用**
+——不透明调用迫使优化器在它前后溢出/重载，这正是「每对象成本翻倍」的来源。证据：热函数
+`starling_display_MeshBatch_addMeshAt` 的调用点（`bl`）数，基线 **29** 个 vs `_Noreturn` 版 **3** 个（宏版 11 个）；
+`sample` 也直接采到了 `_as_req_obj` **内部**的 PC（说明是调用而非内联）。反过来，在守卫**确实被内联**的微基准
+（`guard.as`）里它完全测不出开销——这就是它此前一直隐形的原因。
+
+**修复**：`as_throw` 只有两条出口（`exit(1)` 或 `longjmp`），**确实永不返回**。用**标准 C11 的 `_Noreturn`**
+把这个事实写出来（`src/runtime.ts`，一行改动），clang 便能内联守卫，把每处热访问压成 `cmp` + 未命中分支，
+抛出路径留在冷区。**为什么不用宏**：宏会把实参求值两次，而 demo 里有 **300+** 个守卫点的实参本身就是函数调用
+（`Starling_get_current_static(…)`、`Game_get_assets_static(…)`）——双重求值既是语义变化、又是新的不透明调用源。
+`_Noreturn` 保持单次求值、不是 `__attribute__`（符合 §2.6），并顺带改善其余全部 `as_throw*` 错误路径。
+
+**跨后端**：`_Noreturn` 在 native clang（默认 / `-std=c11` / `-std=c17` / `gnu99`）、wasi-sdk clang
+（`--target=wasm32-wasip1`）、`emcc` 下均编译通过（逐条直接验证）。
+
+**回归**：`node test.ts` **145 passed, 0 failed**（新增 `[noreturn]` 结构钉子 **5 条**，含「specifier 必须
+仍然成立」「守卫仍走 `as_throw`」「理由必须留在 specifier 旁」「A/B 数字必须留在证据台」）；`examples/stage94*.as`
+与 `hello`/`with`/`dict` 共 **20 例**编译并运行全通过；`[nullref]` 15 条 + `examples/stage94k.as`（`#1009` 守卫本体）
+继续全绿 ⇒ 语义零变化。
+
+**遗留表**：**不动**——这是**已修缺陷**，不是欠账，也不是增强。
+
+**踩坑**：① `src/runtime.ts` 是模板字面量，插入的注释里**不能有 backtick**（本轮又踩了一次，
+`ERR_INVALID_TYPESCRIPT_SYNTAX`）；② 用 `otool | grep callq` 数调用点是**错的**——ARM64 是 `bl`，而且未链接的
+`.o` 里 `bl` 操作数不解析成符号名，两次都会得到「0 调用」的假阴性；可靠判据是**同函数 `bl` 计数对比**或 `sample`。
+
+**顺带发现（已在本阶段修正，见下）**：当时记为「`--target wasm` 对 `hello.as` 亦报 `call to undeclared function 'close'`
+系 wasi-sdk 34 的工具链漂移」。**该判断是错的**——根因在本仓库自己的 runtime（见 阶段九十四·二十七），
+不是工具链，也不是「新 SDK 更严」：wasi-libc 的 `unistd.h` 一直声明 `close`，只是我们从未把它 include 进来。
+
+---
+
+#### 阶段九十四·二十七：修好 `--target wasm`（WASI 编译 + web 链接双断）与跨后端 seam 钉子（v0.4.58 → v0.4.59）✅ 已完成
+
+**现象（两处独立断裂，都在 wasm 家族）**：
+
+1. **`--target wasm`（WASI）对每一个示例都编不过**——`examples/wasm-native/` 的 `fib.as`/`demo.as`/`export-meta.as`
+   以及 `examples/hello.as`、`socket.as` **无差别**地报：
+   ```
+   error: call to undeclared function 'close'; ISO C99 and later do not support implicit function declarations
+     (×2: as_sock_drop_fd、as_sock_free)
+   warning: declaration of 'struct sockaddr_storage' will not be visible outside of this function [-Wvisibility]
+     (as_sock_fill_addr 的参数类型)
+   ```
+2. **`--target wasm --package web` 链接不过**（`wasm-ld`）：`undefined symbol: sk_window_text_take` /
+   `sk_window_text_edit_take` / `sk_window_set_text_input_rect`（任一挂了窗口的 app，如 Flappy-Starling）。
+
+**根因 1（socket fd 关闭缺平台守卫）**：socket 状态机的 `as_sock_drop_fd`/`as_sock_free` 在**每个**目标都跑
+（它们只碰 `fd` 这个 int 与缓冲区），却直接调 POSIX 的 `close(fd)`；而提供 `close` 的 `<unistd.h>` 所在的
+include 块被 `#if !defined(__wasi__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)` 排除。WASI/Windows 上
+`s->fd` **恒为 -1**（`unsupported=1`，没有后端），这行调用逻辑上永不执行 —— 但 C99+ 里**未声明的函数是硬错误**，
+编译器不看运行期可达性。`-Wvisibility` 同源：`as_sock_fill_addr` 的 `const struct sockaddr_storage*` 参数由
+`<sys/socket.h>` 提供，非 POSIX 目标上是不完整类型。
+
+**修复 1**：新增唯一的平台无关入口 `as_sock_close_fd(int)`——POSIX 下是真 `close()`，其余目标是不做事的 stub——
+并把 `as_sock_drop_fd`/`as_sock_free` 两处调用改走它；`as_sock_fill_addr` 的**整个定义**移入 `ASC_SOCK_POSIX` 守卫
+（其调用方 `as_sock_capture_addrs` 本就在守卫内，故非 POSIX 下既不定义也不调用）。
+
+**根因 2（两个窗口胶水后端分叉）**：生成的 C 在 `ASC_USE_WINDOW` 下**无条件**声明并调用**整族** `sk_window_*`，
+但这族符号由**两个**文件分别实现（native 的 `vendor/window_glue.cc`、web 的 `vendor/web_glue.cc`，两者签名刻意一致）。
+阶段九十四·十七 为 IME 合成态新增了 `sk_window_text_take`/`sk_window_text_edit_take`/`sk_window_set_text_input_rect`，
+只落进了 native 那一份 ⇒ web 的 seam 默默缺了三个符号，直到 `wasm-ld` 才暴露。物证：`examples/Flappy-Starling/
+Flappy-Starling.html`（web）最后一次成功产出是 **10-01**，而 `window_glue.cc` 的改动时间是 **10-04 16:41**。
+
+**修复 2**：在 `vendor/web_glue.cc` 既有 `sk_window_*` stub 家族里补齐这三个（web 端键盘通道整个尚未接线，
+故「无可合成文本可排空 / 无 OS 候选窗可摆」是诚实答案，不是静默降级），并在注释里指向 `sk_window_show` 中
+既有的「web 键盘未接」说明与 TODO.md 登记。
+
+**验证**：
+
+- **WASI**：`examples/wasm-native/{fib,demo,export-meta}.as` 与 `examples/{hello,socket}.as` 全部 `rc=0`、**零告警零错误**；
+  `wasmtime` 运行 `fib` = `102334155`、`demo` 自检 21 行全出、`export-meta` 导出表/`.exports.json` 不变。
+- **native 未破**：`examples/socket.as`（完整 loopback 断言，走真 `close()` 路径）`socket: all flash.net socket assertions passed`；
+  21 个 headless 示例编译并运行全通过。
+- **web 端到端**：Flappy-Starling `--target wasm --package web` `rc=0`，产出 `.wasm`/`.js`/`.html`/`.data` 四件套；
+  浏览器打开后 `document.title` 变为 `Flappy-Starling`、canvas 后备 3200×2000、采样 **64/64** 像素非零（确实在渲染）。
+- **回归**：`node test.ts` **145 passed, 0 failed** + 新增 `[backendparity]` 结构钉子 **7 条**。
+- **反向对照**（把两处修复还原）：`[backendparity]` 中 **3 条**应声变红（「native-only 符号必须是已登记的 Metal-only」
+  「三符号必须两端都实现」「不得再有裸 `close(s->fd)`」）⇒ 钉子真的守得住这条断链，不是摆设。
+
+**遗留表**：**不动**——这是**已修缺陷**，不是欠账，也不是增强。
+
+**跨后端**：修复只涉及条件编译边界，无行为变化 —— native/web/WASI 共享同一份 C，语义面零改动。
+
+**踩坑**：`src/runtime.ts` 是模板字面量，新增注释里**不能有 backtick**（本阶段又踩一次，`ERR_INVALID_TYPESCRIPT_SYNTAX`）。
+
+**顺带发现（已登记，不在本阶段范围）**：web 端键盘/剪贴板仍未接线（`web_glue.cc` 里 `(void)on_key` 与
+`sk_clipboard_*` 空实现的既有说明），本轮只是让**不依赖键盘**的 web 构建重新可链接；键盘通道与 IME 的
+`compositionstart/update` 仍属遗留表既有条目。
+
+#### 阶段九十四·二十八：重生成 `examples/wasm-native/` 产物，并修掉其中暴露的 `--export` 与 `[WasmExport]` 两处缺陷（v0.4.59 → v0.4.60）✅ 已完成
+
+**缘起**：阶段九十四·二十七 修好了 `--target wasm` 的**编译/链接**，用户随之要求把仓库里提交的
+`examples/wasm-native/` 产物用修好的编译器**原地重生成**。重生成本身是一次「把化石接回当前运行时」的
+动作，却在过程中暴露**两处只在「用导出功能」时才触发的真缺陷**——上一阶段让编译通了，但导出功能还断着。
+
+**现象 1（`--export <sym>` 链接失败）**：`as-aot fib.as --target wasm --export fib -o fib-export` 在 `wasm-ld` 阶段报
+`symbol exported via --export not found: fib`。
+
+**根因 1**：阶段七十八 的 `staticizeTopLevelFunctions()` 把非导出的文件作用域函数统一标 `static`（体积手段），
+只放行 `main` 与 `[WasmExport]` 符号——它**不知道 CLI 的 `--export`**，于是 `fib` 被标成 `static`，链接器再也找不到它。
+
+**修复 1**：把 `cfg.exports` 作为 `keepGlobal` 一路穿到 `generateC(program, cfg.exports)` → `Emitter` → staticize 豁免
+（`src/codegen.ts`、`src/emit.ts`、`src/index.ts`）。语义等价（顶多是少 `static` 化一个符号、少删一点代码），
+纯粹是把「CLI 声明的导出」补进既有的豁免名单。
+
+**现象 2（包级 `[WasmExport]` 元数据被吞）**：`export-meta.as` 的 `package mathlib { [WasmExport] function add… }`
+编译成功，但 `export-meta.exports.json` **缺少 `add`/`multiply`**。
+
+**根因 2**：`parser.ts` 的**包体**解析里，遇到 `[` 走的是 `else if (this.at('['))` 分支——它把元数据消费掉后**直接丢弃**，
+没有把语句交回 `parseStatement()`；而**类体**里的元数据走的是另一条（正确的）分支，所以只有**包级顶层函数**中招。
+
+**修复 2**：包体里消费元数据后**回退（rewind）**，当后继 token ∈ `METADATA_DECL` 时让 `parseStatement()` 主持解析（`src/parser.ts`）。
+
+**验证**：
+
+- **`node test.ts` = 145 passed, 0 failed**（新增 `[wasmexport]` 结构钉子 **6 条**）。
+- **反向对照**：还原修复 1（三文件）或修复 2（`parser.ts`）后，`[wasmexport]` 对应钉子应声变红 ⇒ 钉子真的钉住了这两条断链。
+- **产物**：7 个目标（`hello`/`fib`/`fib-export`/`export-meta`/`demo` × wasm，`export-meta`/`demo` × native）全部 `rc=0`；
+  `wasmtime` 跑 `fib`=`102334155`、`demo` 自检 21 行全出、`export-meta` 导出表含 `add,multiply,twice`。
+- **真浏览器端到端**（CDP + 静态服务）四页全过：`fib.html` 出 `102334155`（WASM 246 ms / 快 2.8×）、
+  `index.html` 环境检测 3✓ 且 `_start` 退出码 0（STDOUT 335 B 自检全文）、`export-meta.html` **7/7 断言 PASS**、
+  `fib-export.html` 直调 `fib(40)=102334155` + 可重入 + `fib(10)=55`。
+
+**顺带发现 1（WASI import 集合 11 → 18，需要补 HTML 桩）**：重生成后的 `.wasm` 导入
+`environ_get, environ_sizes_get, fd_fdstat_set_flags, fd_read, fd_readdir, path_filestat_get, path_open` 这 7 个
+**旧 HTML 桩没有**的 import，导致 `fib.html`/`index.html` 的 `instantiate` 直接失败（浏览器实测报
+`Import #0 "wasi_snapshot_preview1" "environ_get": function import requires a callable`）。根因在 `src/runtime.ts`：
+GC/IO 路径里读**调试开关环境变量**（`getenv("ASC_GC_STATS")` 等 14 处）与文件 job（`fopen` 6 处）让 `-O2` **必然**
+保留 `getenv`/`fopen`，从而拉进 environ + 文件系统 import 家族——**这不是缺陷**（native 上开关有用），
+但意味着每个 wasm 模块都带文件系统 import。**处置**：给两个**显式枚举** import 的桩（`fib.html`、`index.html`）
+补齐 7 个诚实桩（environ 空、fd/path 返回 `EBADF`/`ENOENT`）；`export-meta.html`、`fib-export.html` 用的是
+**Proxy 通配桩**，本就免疫，未改。
+
+**顺带发现 2（wasm 体积 3.2×，其中 ~68% 是 DWARF）**：`fib.wasm` 115822 → **421358** B，但 `clang … -Wl,--strip-debug`
+后为 **133145** B ⇒ 真正的**代码**只涨 ~15%（运行时前导的历期增长），其余 **288 KB 是 wasi-sdk-34 的 `libc.a`
+调试段**（`wasm-ld` 默认保留）。`src/build.ts` **当前无 strip 策略**，本阶段只记录、**不改默认行为**
+（是否 strip 是项目级取舍，留给后续决策）。
+
+**遗留表**：**不动**——这两处都是**已修缺陷**（不是欠账、也不是增强）。
+
+**证据台**：`temp/regen/README.md`（before/after 哈希清单、import 差分脚本、根因反查脚本、strip 对照产物、副本备份）。
+
+**踩坑**：`examples/wasm-native/*.html` 是**手写**的加载页（非编译器产物），其中 `fib.html`/`index.html` 是
+**逐条枚举** WASI import 的桩——一旦运行时多引入一个 import 就会静默失效，直到浏览器里才暴露；
+另两页用 Proxy 通配桩，免疫。后续若再改运行时 import 面，需同步检查这两页。
+
+---
+
+#### 阶段九十四·二十九：wasm 默认 `--strip-debug`（三端产物一致）+ `--debug-info` 正向开关（v0.4.60 → v0.4.61）✅ 已完成
+
+**缘起**：阶段九十四·二十八 的「顺带发现 2」——`fib.wasm` 从 115822 涨到 **421358** B、其中 ~288 KB 是
+DWARF，当时记为「**当前无 strip 策略**（待决）」。用户就此提问三件事：①是否给 `--target wasm` 默认加
+`-Wl,--strip-debug`；②其它端是不是也带调试符；③能不能设计一个 `--release true/false` 参数。
+
+**实测回答 ②（三端调试符现状）**——只有 WASI raw 一个例外：
+
+| 目标 | 默认带调试符？ | 实测证据 |
+|---|---|---|
+| native（`cc -O2`） | **否** | `examples/wasm-native/demo` 无 `__DWARF` 段，仅有常规符号表（393 符号） |
+| web（`emcc -O2`） | **否** | 现场编 trivial 程序：`emcc -O2` = **2010 B、0 个 custom section**；加 `-g` 才 = 28243 B（多出 `.debug_info/.debug_line/...`）。提交的 `hello-web.wasm` 亦为 0 个 custom section |
+| wasm raw（`clang --target=wasm32-wasip1 -O2`） | **是** | `fib.wasm` 421 KB 中 **287 KB 是 `.debug_*`** |
+
+根因不是我们的代码，而是 **wasi-sdk 34 的 `libc.a` 自带 DWARF、`wasm-ld` 默认保留**：现场编一个 trivial
+`printf`（3.6 KB code）就拖进 **62 KB** 调试段。⇒ **给 wasm raw 默认 strip 恰好让三端一致**（emcc 在 `-O2`
+下本来就 strip、native 在 `-O2` 下本来就无 DWARF）。另：`-Wl,--strip-debug` **只删 `.debug_*`，`name` 段保留**
+（8 KB 函数名）⇒ trap 仍打印**带函数名的栈**，只丢源码行号/变量级调试。
+
+**设计决定 ③（`--release` → `--debug-info`）**：「release」在本项目里语义重叠——优化等级已由既有 `opt`
+（默认 `-O2`）承担，release 的另一半才是「调试信息」；且 `--release false` 会有「不优化 vs 留调试符」的歧义，
+`true/false` 值解析也是新形态（现有 `--lto`/`--pgo` 都是裸旗标/枚举）。改用**正向调试信息开关**（对应 clang/emcc
+的 `-g`），与 `opt`/`lto`/`pgo` 正交、不重复、无歧义。用户选定此案。
+
+**实现**（`src/build.ts`、`src/index.ts`）：
+
+- `BuildConfig.debugInfo: boolean`（默认 `false`）；清单字段 `debug-info`（含 `targets.<target>` 分层覆盖）。
+- 两个方向各一个助手，四类命令构建器共用、不会漂移：
+  - `debugInfoFlags(cfg)` → 开则 `-g`（**每个编译步**都加，故我们生成的 C 也有行号）；
+  - `wasmStripFlags(cfg)` → **仅 wasm 链接**且关时 `-Wl,--strip-debug`。
+- CLI `--debug-info`（裸旗标，与 `--lto` 同形态），usage 已列。
+- 默认产物：wasm raw 带 `-Wl,--strip-debug`；native 无 `-g`（不变）；web 无 `-g`（不变）。
+
+**验证**：
+
+- **`node test.ts` = 145 passed, 0 failed**（新增 `[debuginfo]` 结构钉子 **13 条**：默认无调试符、wasm 默认 `--strip-debug`
+  且**绝不是** `--strip-all`（保住 name 段）、native/web 默认无 `-g`、三种目标 `--debug-info` 均加 `-g`、native C++ 路径
+  每步都带 `-g`、清单与 `targets` 分层均可达）。
+- **反向对照**：把 `debugInfoFlags`/`wasmStripFlags` 都改为恒空（即特性未接线），`[debuginfo]` **5 条变红**。
+- **实测体积/可运行**（wasi-sdk-34）：默认 `fib.wasm` = **133147 B**（custom 仅 `name/producers/target_features`）、
+  `wasmtime` → `102334155`；`--debug-info` = **639899 B**（含 `.debug_*`，`llvm-dwarfdump --debug-line` 命名
+  **`fib_dbg.c`** ⇒ 可对 AS3 降级出的 C 做源码级调试），同样 `102334155`。
+- **产物重生成**：`examples/wasm-native/` 的 wasm 由 421~428 KB 全体降到 **133~138 KB**（`fib.wasm` 421358→133139、
+  `demo.wasm` 427915→137981、`hello.wasm` 423776→133842 …），native 两个可执行**逐字节不变**（默认未加 `-g`），
+  7 目标全 `rc=0`。
+- **WASI import 面未变**（18 个，`--strip-debug` 不动 import/export/ABI）⇒ 两个显式枚举桩仍 18/18 满足。
+- **真浏览器复验**（CDP + 静态服务）：`fib.html` → `102334155`（退出码 0）、`index.html` → 环境 3✓ + 退出码 0 + 335 B 自检全文。
+
+**遗留表**：**不动**——这是**构建产物形态的策略决定 + 新开关**，不是欠账、也不是 AIR 增强（DWARF 与 AIR 无关）。
+
+**证据台**：`temp/regen/README.md`（§3 副作用 2 由「待决」改写为「已决：默认 strip」；含三端对照实测表与命令）。
+
+---
+
+#### 阶段九十五·一~二：SWC 位图资源提取器 + 资源类嵌入（v0.4.61 → v0.4.62）✅ 已完成
+
+**缘起**：用户就 [`docs/zh-cn/swc.md`](docs/zh-cn/swc.md) 选定首批范围为 **A（位图提取器）+ B（资源类嵌入）+ E（矢量/Graphics）**，
+节奏为「**分步，先打通链路**」——先完成最基础项并跑通 `skin.swc` 验收，再决定下一步。本条目交付 **A + B**（含随范围的 C 收尾），E/F 未做。
+
+**A — `src/swc.ts`（提取器，只读资源、不解析 ABC）**：ZIP 解包（EOCD/中央目录/本地头）→ FWS/CWS 解压
+（`ZWS`/LZMA 无内置解压器，**响亮报错**，属 `swc.md` §10 延后）→ stage header 跳过 → tag 扫描 →
+`DefineBitsLossless/2`(20/36) 解码（fmt 3/4/5；tag20 XRGB 与 tag36 ARGB 区分；行 32 位对齐）→
+**编译期反预乘** `floor(stored*255/A + 1/3)`（§3.2 拟合 AIR 的取值）→ 零依赖 **PNG 重编码器**（IHDR/IDAT/IEND + 自实现 CRC32，
+每行 filter 0）→ `SymbolClass`(76) 解析 → `DefineBitsJPEG2/3`(21/35) 原字节直搬（JPEG3 的 alpha 平面未合成，**发警告**）。
+实测 `temp/skin.swc`：**59 个位图 / 16 个命名资源**；PNG 合计 **14,499 B**（文档估 14,569 B，差 ~0.5%）。
+
+**B — 资源类注册 + 编译期嵌入**：`swcCompileInputs(lib)` 把命名资源合成 `dynamic class X extends flash.display.BitmapData`
+（构造器 `(width:int=0, height:int=0)` 但**实参被忽略**，`super(0,0,true,0)`），追加进 `program.body` 参与符号收集/类型解析/虚表/反射注册表；
+`Emitter` 新增第 4 参 `swcResources`，在 `emitDefinitions` 起始发 `static const unsigned char __res_<cname>[]`（PNG 字节，`\xNN` 转义 C 字面量；
+避开 `\x` 贪婪吃十六进制位与 `??` 三字符组两个坑）与 `BitmapData_adoptEncoded()`（走**既有** `as_skia_image_decode_bytes_argb` →
+GC 堆拷贝 + 写屏障 → `as_skia_image_from_bytes` 留 Skia 视图，**零新增解码器**），并在资源类构造器末尾注入调用。
+接入面：CLI `--swc <f>`（可重复）、清单 `swc-paths`（含 `targets.<target>` 分层）、重复类名**响亮报错**、构建横幅点名资源数。
+
+**验收（`adl 51.4.1` 对照）**：资源类两条引用路都通——`new logo(0,0)` 与 `getDefinitionByName("logo")` + `new cls()` 均得 **100×72**，
+且 `new logo(999,999)` 结果不变（实参被忽略）。像素层分两段核验：
+
+1. **我们写出的 PNG 逐点精确**：用纯解码器（zlib inflate + filter 0，不经 Skia）解开 `encodePng` 输出与 `adl` 真值比对，
+   **322,300 像素 maxChannelDiff=0**。
+2. **AOT 产物 vs `adl` `getPixel32`**：**388,648 像素中 206 个不符（0.053%），全部 maxChannelDiff=1**，且只落在 `logo` 的
+   A∈{143,191} **半透明**像素上（另三张 alpha 只有 0/255，两次取整都是恒等 ⇒ 0 偏差）。根因是 **Skia**
+   `readPixels(kBGRA_8888, kUnpremul)` 对 straight-alpha PNG 先 `SkMulDiv255Round` 预乘、再按 `(v*255+a/2)/a` 反预乘，**两次取整**漂 ±1——
+   库边界行为，不是我们的实现缺陷。**alpha 逐位精确、不透明像素精确**，且在 `swc.md` §11③「允许 ±1 通道偏差」之内。
+   该行§5 原写的「运行时解码逐点对齐」**已按实测改成带此结论的修正段**，§10 另记一条已知限制。
+
+**顺带补齐的 AIR 缺口**：`BitmapData.getPixel32` / `setPixel32` 此前**完全缺失**（`pixels` 一直是 straight ARGB，
+但读不到整个 32 位值；TODO 的 ARGB 契约笔记早已假设它们存在）。本批补上（`setPixel32` 仅对 `transparent` 位图保留 alpha，与 AIR 一致）。
+
+**验证**：`node test.ts` = **146 passed, 0 failed, 146 total**。新增示例单元 `examples/swc-bitmap.as`
+（配套 `examples/swc-bitmap.build.json`，`swc-paths` 指向仓库根 `temp/skin.swc`）：**结构层**（类存在/是 BitmapData/实参被忽略/反射一致）
+在**纯 C 构建**下也断言，**像素层**（100×72、alpha 逐位、不透明像素全值、半透明 RGB ±1）仅在 Skia 构建下断言。
+两处被本批合法失效的源码钉子已改成**自维持**形式：`[svg]`「像素采纳点必带 GC 写屏障」由硬编码 `=== 2` 改为**与
+`bd->pixels = (void*)gcpx;` 采纳点个数相等**；`[wasmexport]` 的 `generateC(program, cfg.exports)` 期望更新为带 `swcResources`。
+
+**遗留表**：`swc.md` §10 新增「运行时解码 ±1 漂移」一条（含根因与为何不做自带 PNG 解码器）；§9 的 E/F
+（矢量 shape 烘焙 + `Graphics` 子路径/样式模型升级；九宫格 + 按钮四态）**仍未开始**。
+另按实测修正 `swc.md` §5.1 一条过强断言：`-O2` **会丢弃未引用的资源字节，但不会丢弃合成的资源类**——
+`hello.as` + `--swc` 实测二进制 130,552 → 195,880 B（+約 65 KB：`__text` +40.5 KB、`__data` +13.3 KB）。
+
+**证据台**：`temp/swc-btest/`（t.as 逐点 dump + t.build.json）、`/tmp/swctruth/*_truth.txt`（`adl` 真值）、
+`temp/swc_probe.mjs` / `temp/swc_accept.ts` / `temp/swc_compare.ts`（A 期脚本）、`temp/swc_dump_png.ts`（导出 PNG 供纯解码器比对）。
+
+---
+
+#### 阶段九十五·三~五：E（矢量 shape + 显示树 + `Graphics` 组模型）+ F（九宫格 + 按钮四态）（v0.4.62 → v0.4.63）✅ 已完成
+
+**缘起**：接续 阶段九十五·一~二（A/B），完成立项时敲定的 **E（矢量/`Graphics`）** 与首期额外纳入的
+**F（九宫格缩放 + 按钮四态）**，即「SWC 皮肤只有位图没有矢量」与「缩放糊/按钮不响应」两个可观测缺口的正面解决。
+
+**E — `DefineShape` 烘焙 + 显示树**：`swc.ts` 解析 `DefineShape`1/2/3/4（样式表按图层分隔；**`NewStyles` 是替换而非追加**，
+实测 98/378 多图层）、`DefineSprite` 时间轴与 `PlaceObject*`（矩阵/颜色变换/`clipDepth`），烘焙为
+「子路径 + 样式索引」；`Graphics` 从「单路径双画笔」升级为**有序绘制组模型**（`as_gdraw` + `as_gflush` +
+`_even_odd` / `_max_sw`，逐组命中判定与指纹），并补齐位图填充 shader、实色/线性渐变、描边 cap/join/miter、
+`SkColorFilters::Matrix` 颜色变换与 `clipDepth` 遮罩（`as_swc_clip_path_new`）。另补 `BitmapData.draw(DisplayObject)`。
+
+**验收（`adl 51.4.1` 对照，`temp/swc-render/`，200 个导出符号）**：矢量 round-trip **378/378**；渲染四档
+（`exact`/`tol16`/`no-struct`/`colour-ok`）结果 **bitmap 3/1/1/1、display（无文本）2/37/37/27、
+display（含文本）0/90/120/23**（含文本两列于 2026-10-06 先后随 阶段九十五·六 与 阶段九十五·七 刷新为 **0/90/120/22** → **0/90/120/23**），
+`params: ours lines 200, adl lines 200, ERR ours/adl 0/0`。
+逐项归因与开放项见 [`docs/zh-cn/swc.md`](docs/zh-cn/swc.md) §9.1 与 §9.2 F4（其中 `vbitemskin` 一处未定位差异已由 阶段九十五·六 结案）。
+
+**F1 — 九宫格缩放（`DefineScalingGrid` 78，实测 22 个）**：烘焙期除 `TWIPS=20` 写入烘焙角色的 `scalingGrid`；
+运行时新助手 `as_render_nine_slice`（自然尺寸烘焙一次 + 9 组 src/dst 条带重组，边框条带在本地单位里**除以缩放**，
+极缩时中段夹到 ≥0）。条带取样走新增的 `sk_canvas_draw_image_src_rect`（`kStrict_SrcRectConstraint`）。
+**关键实测（钉定 AIR 口径）：九宫格只对角色**自己的 `scaleX/scaleY`** 生效，对时间轴 `PlaceObject` 矩阵拉伸不生效**——
+证据两条：① 1× A/B 让 placement 触发 grid 后与 `adl` 的差异面**反向扩大**（42 个 entry 变差）；
+② entry 103（`元件97`）经容器 2× 拉伸的 RAW 逐像素对比，grid **ON** 差 51 px（0.06%）/ ON `nz` 18674 vs adl 18676，
+grid OFF 差 200 px（0.22%）。⇒ `emitSwcPlacement` 永远把 SWF 矩阵写进 `transform.matrix`，不写进对象自身 `x/y/scaleX/scaleY`。
+
+**F2 — 按钮四态（`DefineButton2` 34，实测 29 个全部烘焙）**：`ButtonRecord.states` 位掩码（up/over/down/hit）；
+`as_sbtn_state` 在**绘制时**按实时指针状态选择（down→over→up→over→down→hit 回退），指针状态由
+`Stage_dispatchMouse` 统一写入 ⇒ **SDL 窗口回调与 AS3 测试钩子 `stage.dispatchMouse(x,y,type)` 都能驱动四态**。
+**踩到的坑（已修）**：hover 恒为 0——`as_sbtn_contains` 最初用 `as_pick_hit`，而它只报告 InteractiveObject，
+按钮的 hit 态却是用**普通 `Shape`** 搭的，于是永不命中；改为把点映进 hit 态自身空间后走 `as_obj_region_hit_local`。
+**结果（青三角为判据）**：ours 离屏 `up=4dfcfcfc / over=ffffffff / down=ff00948c / 回退=ffffffff`；
+`adl` 窗口截图 down 态三角 **(0,147,139)=`0x00938b`** ⇒ 差在截图色彩管理漂移内，**四态与 AIR 一致**。
+
+**验证**：`node test.ts` 当时为 **146 passed**（新增 `examples/swc-shape.as` 后为 147）；1× SWC harness 回归逐项复现已接受的基线
+（bitmap 3/1/1/1、display 2/37/37/27、text 0/90/118/21、ours/adl 200 行、ERR 0/0）。
+
+**证据台**：`temp/swc-render/`（E 主 harness，含 `SCALE=` 杠杆与 `rawpng.ts`）、`temp/btnstate/`（F2；
+`off.as` = 离屏确定性四态验收，`gen.ts`/`drive.py` = 窗口版 ours 自驱 + adl 真光标）、`temp/btn_dump.ts`（按钮记录转储）。
+
+**遗留表**：新增两条（AS3 `scale9Grid` 属性未实现；`BitmapData.draw` 对 source 自身变换的处理与 AIR 不同），见下表。
+窗口侧 ours 的 press 那一帧报图未复现（`adl` 侧四态齐全）；同一套 `as_render_object` 在离屏探针中与 AIR 逐像素一致，
+故判为**报图/harness 限制**而非实现缺口，已记在 `swc.md` §9.2。
+
+---
+
+#### 阶段九十五·六：`PlaceObject3` 可见性（`Visible = 0`）—— 结案 §9.1 唯一的未定位差异（v0.4.63 → v0.4.64）✅ 已完成
+
+**缘起**：用户要求「看看 swc 分支还有哪些未实现」⇒ 对 `temp/skin.swc` 做一次全量 tag 普查
+（`temp/swc_census.ts` / `temp/swc_po3*.ts`），并把「解析过但从未出现在产物里」的字段逐个点名。
+
+**发现**：`readSwfPlacement` 把 `PlaceObject3` 的 `Visible` / `FILTERLIST` / `BlendMode` / `BitmapCached`
+**读完就扔**（`SwcPlacement` 里没有这四个字段），而实测**本库的烘焙闭包内就有 63 条**：
+`hasVisible` **38** 条、`FILTERLIST` **13** 条、`BlendMode` **8** 条（值 2=`layer` / 6=`darken`）、
+`BitmapCached` **2** 条——全部落在 214 个导出符号的显示树里，属**违反「绝不静默」的静默丢弃**。
+
+**关键实测（口径先行，`temp/vishidden/` 两侧同一段 body）**：`adl 51.4.1` 对 `Visible = 0` 的处理是
+**建出子件并置 `visible = false`**，不是省略该 placement——
+`vbitemskin`(#293) `adl` 侧 `numChildren = 6`（其中 `c3.visible == false`，藏在 depth 6 的 #286），
+我们修前只有 5 个；`fileitemdoctorskin`(#63) 7（2 隐藏）vs 4；`fileitemskin`(#389) 5（2 隐藏）vs 2；
+`homeskin`(#1121) 7 全可见 = 7 ✓。
+
+**实现**：`SwcPlacement` 加 `hidden`（`hasVisible && Visible == 0`）→ `SwcBakePlacement.hidden` →
+发射侧 `if (p.hidden) c->visible = false;`。渲染侧本就跳过不可见子件，故**像素与「整条跳过」完全一致**，
+而对象树也对齐了 AIR（只跳过的写法能骗过像素对比，但 `numChildren`/`getChildAt(i).visible` 会露馅）。
+
+**收益（1× 全量重测，42 个 entry 变化，全部变好）**：`maxdcS` 在带 `Visible = 0` 的符号上普遍塌下来——
+`fileitemdoctorskin` **205 → 2**、`setupskin` 239 → 31、`mymtskin` 211 → 30、`subtitleskin` 181 → 22、
+`surveyhdskin` 185 → 61、`systemUpdateSkin` 154 → 37、`onlineskin` 73 → 24、`vbitemskin` **76 → 30**；
+结构档 `元件1_3`/`元件2_6` **struct 16 → 0**、`userskin` 4 → 1、`filepreviewskin` 2 → 1。
+汇总 text 档 `no-struct 118 → 120`、`colour-ok 21 → 22`（bitmap/display 两档不动）。
+
+**结案**：`swc.md` §9.1 末条「`vbitemskin` 一处未定位的灰/白差异」根因即此（隐藏对象压在不透明白矩形上：
+覆盖形状相同、只有填色不同，正是 `maxda = 0` 而 `maxdcS = 76` 的 signature）。
+
+**验证**：`node test.ts` = **147 passed, 0 failed**；`examples/swc-shape.as` 新增结构钉子 ⑤
+（`vbitemskin` `numChildren == 6` 且恰有 1 个子件 `visible == false`）；1× harness 回归逐项复现新基线。
+
+**证据台**：`temp/swc_census.ts`（tag 普查）、`temp/swc_po3.ts` / `temp/swc_po3_visible.ts`（逐条 `PlaceObject3`
+属性 + 是否在烘焙闭包内）、`temp/vishidden/`（对象树对照：`numChildren` + 逐子件 `visible`，ours 与 adl 同 body）、
+`temp/swc-render/rep_hidden_{off,on}.txt` 与 `rep_visible_flag.txt`（1× 逐 entry 前后对比）。
+
+**遗留表**：新增三条（`FILTERLIST`/`BlendMode`/`BitmapCached` 静默丢弃；不支持字符类型让子件数偏少；
+placement 矩阵不回填子件自身 `x/y`），见下表。`Visible` 本项**已不是**遗留，故不进表。
+
+---
+
+#### 阶段九十五·七：`PlaceObject3` 的滤镜 / 混合模式 / BitmapCache（v0.4.64 → v0.4.65）✅ 已完成
+
+**缘起**：阶段九十五·六 的普查把 `PlaceObject3` 的四个属性一次点名（`Visible` 已修，其余三项进遗留表）。
+本阶段把 **`FILTERLIST` / `BlendMode` / `BitmapCached`** 三项补齐：它们都是 AIR 已定义行为 ⇒ 遗留缺陷。
+
+**属主（烘焙闭包内，`temp/swc_po3_detail.ts`）**：`FILTERLIST` **13** 条（**11 Glow + 2 DropShadow**）、
+`BlendMode` **8** 条（**7**×值 2 = `layer`、**1**×值 6 = `darken`，`homeskin` depth 2）、`BitmapCached` **2** 条。
+Glow 记录同形：`{color:0xff000000→AS3 color 0/alpha 1, blur 16, strength 0.19921875, quality 1, inner 0,
+knockout 0, composite 1}`；DropShadow 两条：`{color:0x7f000000→color 0/alpha 0.5, blur 10, angle 0,
+distance 0, strength 0.5390625}`。**注意 SWF 的 GLOW/DROPSHADOW 颜色是 RGBA，AS3 只吃 RGB** ⇒
+`0xff000000` 是「黑 + 全不透明」，不是「透明」。`strength` 与 `alpha` 是两个独立量。
+
+**两处 AIR 语义实测（本阶段实质）**：
+
+1. **`strength` 必须在模糊之后乘**，模型 = `min(1, 剪影 × 颜色 alpha × strength)`
+   （`temp/filterprobe/`，40×40 黑矩形 → 逐点 alpha）：Glow 0.2/0.5/1/2 → 4/10/21/42（线性）；
+   `(alpha 0.5, strength 2)` 与 `strength 1` **渲染完全相同**；DropShadow 0.5/2 → 27/110。
+   两次被实测证伪的做法：①忽略 `strength`（每个烘焙光晕满强度作画）；②**模糊之前**把
+   `alpha*strength` 夹到 1（`strength 2` 塌成剪影；剪影不透明 ⇒ 前置 alpha ≥ 1 完全饱和，
+   曾让 `strength 1` 与 `2` 的光晕一模一样）。实现 = glue 的 `sk_alpha_scale_after()`（alpha 行矩阵，包在模糊外）。
+2. **模糊是「直径 `blurX` 的 box 重复 `quality` 次」，不是高斯**：`blur6 q1` 逐点
+   191/148/106/63/21/0（`d ≥ 4` **为 0**，有限支撑）；`blur6 q3` = 3 个 box 叠加。直径 b 的 box 方差
+   `b²/12` ⇒ 实现取 **`sigma = blur * sqrt(quality) / sqrt(12)`**（取代 `blurX/3`，后者对 `quality` 无感）。
+   残留口径（已登记）：Skia 的模糊是 3-box 逼近高斯 ⇒ 中部更陡、尾部更薄
+   （`blur6q1` ours 217/161/94/38/9 vs AIR 191/148/106/63/21）；求真 box 需每层 36~256 抽头的
+   `MatrixConvolution`（非可分离），性能风险大于收益。
+
+**顺带修掉一个真实 bug（Skia 陷阱，必须留痕）**：`strength` 缩放一度套在
+`SkImageFilters::DropShadow` 的**输出**上，而该工厂是「阴影 **+ 源**」的合成结果 ⇒ 源被一起乘了 `strength`。
+症状：1× harness 里两个 DropShadow 符号 `popcontrolskin`/`skin_fla.元件124_72` `struct 0→12/14`、
+`maxda 6→118`；`RAW=29`（popcontrolskin 425×124）逐像素质证 **36.34% 像素不同**，逐格 alpha 图显示整条 bar
+的 alpha 是 **137/255 = 0.537**（该记录 `strength` = **0.539**）。修法 = 按两个**都精确**的区间分流：
+`alpha*strength ≤ 1` 时把整份印记烘进**阴影颜色**并用 `DropShadow`（Skia 自己合成源，调用方不重画源）；
+否则用 `DropShadowOnly` + 模糊后缩放 + 调用方另行画源（复现 AIR 的饱和区间：`alpha 1, strength 2` → 0.431）。
+
+**落地**：`SwcFilter` 三种（0 DropShadow / 1 Blur / 2 Glow），`CompositeSource = 0` → `hideObject`（DropShadow）
+或 C 运行时私有位 `_shadow_only`（Glow 无 AS3 对应字段）；`passes` → `quality`；FilterID 3–7 只跳字节并
+进 `swcBake.notes` **报明**。`BlendMode` → `DisplayObject.blendMode`（String 槽）+ `BlendMode` 常量类，
+`layer` = 纯分组隔离（`saveLayer` + `kSrcOver`），Skia 表达不出的模式返回 0 且**报明**。
+`BitmapCached` → `cacheAsBitmap`；顺带把 `cacheAsBitmap` 改成**私有后备槽 `_cache_flag`**
+（AS3 静态类型的字段读直取 C 槽、绕过访问器 ⇒ 公开槽会让 `c.cacheAsBitmap` 读不到「OR 上 `filters`」语义；
+改后 `temp/attrsprobe/` 的 cache 列与 AIR 逐项一致）。混合层是 `as_render_object` **最外层**包裹
+（ct 与 clipDepth 在其内），还原序 clip → ct → blend。
+
+**验收（1× harness，基线 `temp/swc-render/rep_final.txt`）**：bitmap 3/1/1/1、display（无文本）2/37/37/27
+**两档不动**；含文本档 `tol16/no-struct` 不动、`colour-ok 22 → 23`，`ERR 0/0`。逐符号**一边倒变好、无一处变差**：
+`staticskin` maxdc 93 → 35 / maxda 7 → 3、`popinfoskin` maxdc 185 → 79、`poproomIdsskin` maxdc 100 → 13、
+`popnoticskin` maxdcS 34 → 5、`poppluginskin` maxdcS 10 → 7、`popmiccamskin` maxdcS 4 → 1、
+`popgiftskin` maxdc 38 → 23，且上述两个 DropShadow 符号已回到基线。`temp/filterprobe/` 的 5 条不变量
+（strength 线性 / alpha×strength 等价 / DropShadow 线性 / q1 有限支撑 / 更宽的 blur 影响更远）在 **ours 与 adl 上逐行相同**。
+
+**验证**：`node test.ts` = **147 passed, 0 failed**（新增 in-process `checkFilterRaster()`：σ 公式存在且方差匹配、
+无残留 `blurX / 3.0`、glow/DropShadow 都传 `->strength` 与 σ 助手、glue 在模糊**之后**接强度缩放、运行时暴露 `double st` 包装）。
+`examples/swc-shape.as` 新增 **⑥**（纯结构、不依赖 Skia）：`staticskin` 恰 1 个子件的 Glow（blurX 16、color 0、
+`strength == 0.19921875` 精确比较、quality 1）、`homeskin` 恰 1 个 `darken`、`userskin` 恰 2 个 `layer`、
+`mymtskin` 恰 1 个 `cacheAsBitmap`、`editnickname` 子件 0 的 Glow blurX 17。
+
+**证据台**：`temp/swc_po3_detail.ts`（滤镜/混合/缓存普查）、`temp/filterprobe/`（强度与模糊模型 + 5 条不变量，两侧同跑）、
+`temp/attrsprobe/`（属性指纹逐项对 adl）、`temp/swc-render/pixq.ts`（逐格 alpha 图，定位「整条 bar 掉到 137/255」）。
+
+**遗留表**：从表中移出「`FILTERLIST`/`BlendMode`/`BitmapCached` 静默丢弃」一条；新增四条
+（`inner`/`knockout` 未在光栅路径实现、FilterID 3–7 报明、模糊剖面是高斯近似、
+`BlendMode` 中 Skia 表达不出的模式报明），见下表。
+
+#### 阶段九十五·八：未支持字符的**占位子件** + 子件变换/包围盒对齐（v0.4.65 → v0.4.66）✅ 已完成
+
+**缘起**：阶段九十五·六 的属性普查（以及 `temp/childfx/` 子件树探针）暴露了一族**图像上看不见、
+但 AS3 侧可观测**的缺口：`numChildren`/`getChildAt` 少子件、`child.x/y` 恒 0、`width/height` 与 `adl` 不符。
+它们都是 AIR 已定义行为 ⇒ 遗留缺陷（非增强）。本阶段把三项一次做完（探针：15 个导出符号 / 99 个子件）。
+
+**① 未支持的字符 = 空占位子件（绝不静默）**：`DefineEditText`(37)/`DefineText`(11) 实测 **341 个** ⇒ 烘成
+**空 `TextField`**（`_fieldWidth/_fieldHeight` 取声明 `RECT`）；`DefineMorphShape`(46)/`2`(84) 实测闭包内 **6 个** ⇒
+烘成**空 `Shape`**（AIR 是 `MorphShape`，属 `Shape` 子类）。`numChildren`/索引顺序从此与 AIR 一致
+（`minfo` 6↔6、`fileitemskin` 5↔5、`staticskin` 19↔19、`loginskin` 9↔9）。字形/初始文本/morph 几何
+仍是**已声明缺口**，由 `swcBake.notes` 响亮报明。顺带解析了 `DefineEditText` 第二 flags 字节的
+`AutoSize`（实测本库 341 个**全为 0**，故占位框按 `RECT` 报即与 AIR 无差）。
+
+**② `clipDepth` 遮罩对象是子件**：修前把遮罩字符标 `unsupported` —— 那会让该字符在**任何位置**都不再出现
+（潜在 bug：同一字符被别处当普通子件用时也消失）。改为：遮罩摆放**保留为子件**（AIR：`visible=true`、有自己
+包围盒、从不被绘制），另置 C 运行时私有位 `_mask_object`（`DisplayObject` 构造 `false`），`as_render_object`
+与 `as_pick_hit_m` 见到就跳过；morph/sprite 遮罩无法表达为路径裁剪 ⇒ 一句 `notes` 报明。
+实测 `fileitemskin.c2`：AIR `n=4`（含 `MorphShape` 遮罩）↔ 我们 `n=4`。
+
+**③ placement 平移 → 子件自身 `x/y`（scale 仍留矩阵）**：`emitSwcPlacement` 只把 2×2 写进 `transform.matrix`，
+平移写进子件 `x/y`（文本子件再加 `RECT` 原点：`x = tx + RECT.xmin`）。实测 AIR：非文本子件 `child.x == matrix.tx`
+（`vbitemskin c4 xy=41,23.75`）、`staticskin` 文本子件 `xy=9.25,55.7` ✓ 逐位相同。缩放**必须**留矩阵：
+F1 实测 AIR 的九宫格不认 placement 拉伸（42 个被拉伸的 gridded entry 只有那样才对），且 AIR 仍从矩阵读
+decomposed 值。像素不变（合成 `T(x,y)·R·S·M`）。另修 `as_do_extents`：轴对齐时直接算 `(r-l)*a*scaleX`
+（角点映射会把子件自身 `y` 加上又减回，实测文本子件读成 `19.950000000000003` vs AIR `19.95`）。
+
+**④ Shape 包围盒 = 声明的 SWF `ShapeBounds`**：实测 `#212`(adl `396.45×22.75`)、`#214`(`361.6×17.6`)、
+`#210`(`360×16`) 三者都**逐位等于声明矩形**，而我们的**运行时路径点累积盒**在若干角色上会偏
+（`#212` 曾报 `374.7×1`；它是一组 74 条 hairline 斜线排线，累积盒不稳）。故 `as_bounds_walk` 增第三参 `decl`：
+`decl && g->_clip` 时取 `as_swc_clip` 记下的声明矩形（**不再叠加描边半宽**——声明矩形已含描边），递归透传；
+显示口径传 1（`as_do_extents`/`width`/`height`/`getBounds`/`hitTestObject`），命中测试与 `getRect` 传 0
+（AIR 按绘制区域拾取）。`temp/shbox.ts` 普查：378 个 shape 里声明矩形与「路径并集+描边」有 **116 个**不同
+⇒ 声明矩形才是权威并集。`decl` 只喂 AS3 包围盒读口，**不参与光栅**。
+
+**验收**：
+
+- `temp/childfx/`（`cmp.py`，TOL 1e-6）：**`x/y` 0 处、`numChildren` 0 处不符**（修前 `x/y` 全错）；
+  `width/height` **39 → 35**（证据 `temp/childfx/cmp_item2_final.txt`）。残留：33 处**精度级**
+  （`|Δ| ≤ 0.021px`，AIR 自己的包围盒量化/累积口径；例 `userskin c4` `260×30` vs `260.0006×30.0001`）、
+  3 处 morph 几何缺失（`fileitemskin c2` `221.25×41.65` vs `128.35×19.55`、`元件124_72 c2` `11.75×11.75` vs `0×0`、
+  `元件27_310 c0` `1×18` vs `0×0`）。
+- **1× harness 与修前逐 entry 0 差异**（`temp/swc-render/rep_final.txt` 已刷新）：bitmap 3/1/1/1、
+  display（无文本）2/37/37/27、display（含文本）0/90/120/23、`params 200/200`、`ERR 0/0`。
+  唯一变化是**分桶**：`元件27_310` 的 morph 遮罩现在是子件（morph 属「文本类」判据）⇒ 无文本 40→39、
+  含文本 156→157，各桶计数不变。
+- `examples/swc-shape.as` 新增 **⑦**（纯结构、不依赖 Skia）：`staticskin n=19` + 子件 1 `is TextField &&
+  x==9.25 && y==55.7 && width==79.4 && height==19.95`、`fileitemskin n=5`、`c2 n=4` 且其子件 1 `is Shape`、
+  `loginskin n=9` 且子件 1 `is Shape && visible`、`popchatitem c0 scaleX/scaleY == 1 && transform.matrix.a ==
+  1.497314453125 && .d == 1.1999969482421875`。
+- `node test.ts` = **147 passed, 0 failed**（exit 0）：新增 2 条几何检查（声明盒分支 + 递归透传），
+  并同步 6 处 `as_bounds_walk` 签名断言。
+
+**证据台**：`temp/childfx/`（`gen.ts` + `cmp.py` + 嵌套 `deep()` dump，15 符号 / 99 子件、逐子件对 `adl`）、
+`temp/shbox.ts`（378 个 shape 的声明矩形 vs 路径并集）、`temp/swc-render/`（1× 全量像素）。
+
+**遗留表**：移出「子件数偏少」与「placement 矩阵不回填子件自身 `x/y`」两条（按规则移出、结论并入本条），
+换入 4 条更窄的（占位子件只有空壳、子件 scale 仍读 1、AIR 包围盒量化口径未定案、子件类名身份）。
+
+#### 阶段九十五·九：多帧**时间轴烘焙** + `FrameLabel` + `MovieClip` 时间轴 API（v0.4.67 → v0.4.68）✅ 已完成
+
+**缘起**：阶段九十五 E/F 只烘 `DefineSprite` 的**第 1 帧**，`FrameLabel`(43) 与 `RemoveObject2`(5/28) 根本没解析，
+`MovieClip` 只能报「第 1 帧 + 自己数出来的 `totalFrames`」。本阶段把**逐帧关键帧差值**在编译期烘成静态表，
+运行期时间轴 API 逐项对齐 `adl 51.4.1`（证据台 `temp/tlprobe/`：共享 body 两侧编译，68 行 API 输出 **0 差异**）。
+
+**AIR 实测口径（全部为 `adl` 直读，`temp/tlprobe/adl.txt`）**：`totalFrames` = `ShowFrame` 条数；新建剪辑
+`currentFrame == 1` 且 **`isPlaying == false`**，在显示列表上跨 12 帧也**不自走** ⇒ 皮肤符号的 `stop()` 在 `DoABC` 里
+（我们读不到）⇒ **烘焙剪辑一律停在第 1 帧**（既不发明动画，也让像素 harness 逐位不变）；属性名是 **`isPlaying`**（无 `playing`）；
+`currentLabel`/`currentFrameLabel` = 该帧 `FrameLabel` 名或 `null`；`currentLabels` = `FrameLabel` 数组；
+`gotoAndStop` **前进**就地打增量（子件身份保持）、**后退/回 1** 则**重建**目标帧对象（adl 复现出新的自动实例名）；
+`nextFrame`/`prevFrame` 步进 + **回绕**。
+
+**落地**：① 解析新增 `FrameLabel`(43)（`readSwfCString` → `SwcSprite.labels`）、**`RemoveObject`(5)/`RemoveObject2`(28)**，
+`SwcPlacement` 增加 `visibleFlag` 三态与 `ratio`；② 烘焙 `spriteFrames`（键 = Flash **深度**，非子件索引）：
+帧 1 建 `depth → {charId, matrix}` 状态，逐帧推演「带字符 = 增/替（继承省略的变换）、`Move` 无字符 = 改、
+无 `Move` 无字符 = **删**」，空 op 丢弃并计数报明（本库 270 条只带 morph `Ratio` 的记录）；③ 发射
+`as_swc_tl_total/start/find/put/del/clear/apply` + `as_swc_tl_labelcount/labelat/frameat/label/labelframe`
+（静态 `switch(charId)` + `strcmp`）、`MovieClip` 的 `play/stop/gotoAndPlay/gotoAndStop/nextFrame/prevFrame` 与
+`isPlaying/currentLabel/currentFrameLabel/currentLabels`、新内建类 **`FrameLabel`**、时间轴子件深度 `_tl_depth`
+（0 = 用户 `addChild`）；**无 bake 时全部发空桩**；④ 多帧 sprite 现在实例化为 `MovieClip`（与 AIR 的
+`flash.display::MovieClip` 一致，原先报 `Sprite`）。
+
+**三个「绝不静默」的实测发现**：① **`RemoveObject2` 原先被解析器静默丢弃**（17 条记录）——`toastbtn`(#634) 帧 2 是
+「删深度 2 + 在深度 3 放新字符」，AIR 报 **3** 个子件、我们原先报 **4**；② 标签名误用了**内嵌字节**的 UTF-16 转义
+（`cStringLiteral`）⇒ `FrameLabel.name` 全空而 `currentLabels.length` 正确，改用 `escapeCString`；③ 无 bake 时
+`as_swc_bind` 没有定义 ⇒ **4 个示例链接失败**（正是阶段九十七 验收里记录的那 4 个），补 stub 后全绿。
+
+**烘焙口径**（`temp/tlcheck.ts`）：79 个多帧 sprite、75 个帧 1 后有变化、448 个 op 帧、514 个 op
+（102 增/替、404 改、8 删）；89 条 `FrameLabel`（31 个 sprite）；SWF 原始 17 条 `RemoveObject2` 里 9 条与
+同帧同深度的「重放」折叠成「新建对象」。
+
+**验收**：① 时间轴探针 68 行 API 对 `adl` **0 差异**（`checkbom` 帧 2 的文本子件 `x = 200/20 + RECT.xmin(-2) = 8`
+—— **修改记录同样套文本原点规则**）；② `temp/childfx/` 仍 `x/y` 0 处、`numChildren` 0 处、`width/height` 35 处；
+③ **1× 像素 harness 与 `rep_final.txt` 196 行逐 entry 0 差异**；④ `examples/swc-shape.as` 新增 **⑧** 结构断言
+（`desktopshareitem` 21 帧 / `_up` / `!isPlaying` / 3 条 label、`gotoAndStop("_down")→15`、`nextFrame/prevFrame`
+1↔2、`toastbtn` 帧 2 仍 3 子件、`checkbom` 帧 2 `x==8` 且回退 24、`元件172_339` 3 帧 1 子件）；⑤ `node test.ts`
+全绿（exit 0），新增 `unit: render/SwcTimeline` **11 条 C 文本钉**。
+
+**证据台**：`temp/tlprobe/`（`gen.ts` + `cmp.py` + `adl.txt`/`ours.txt`）、`temp/tlcheck.ts`（烘焙与 op 计数）、
+`temp/tlcensus.ts`、`temp/tldel{,2}.ts`（删记录归因）、`temp/childfx/`、`temp/swc-render/`。
+
+**遗留表**：新增 2 条（时间轴子件 `name` 恒 `null`、每帧 ActionScript/`DoABC` 不执行），并把 morph 时间轴
+`Ratio` 记录被丢弃并入既有 morph 行；烘焙坐标的末位差（≤2 ULP）并入既有「包围盒量化」行。
+
+**同批修掉的前序失败**：阶段九十七 验收里记录的 4 个 `_as_swc_bind` 未定义符号失败（`examples/air-native/`、
+`dyn-prop.as`、`stage62.as`、`stage94f.as`）已由本条修掉（stub 改为 `this.swcBake === undefined` 时发射）。
+
+---
+
+#### 阶段九十六：音频播放（`flash.media`）—— 补齐阶段六十三 延后的 `Sound`（v0.4.68 → v0.4.69）【P2】✅ 已完成
+
+**起因**：阶段六十三 把 `flash.media` 整体延后（依赖音频解码后端），阶段九十三 只留下 `Sound` 的**空壳**。2026-10-06 完成完整调研与裁决，结论见 [`docs/zh-cn/audio.md`](docs/zh-cn/audio.md)（英文 [`docs/en/audio.md`](docs/en/audio.md)）。
+
+**现状是空壳而非「未实现」**：`Sound_play` 恒 `return SoundChannel_new()`、`loadCompressedDataFromByteArray`/`stop` 是 `(void)` no-op ⇒ **能拿到 `SoundChannel` 对象，但一个字节声音都发不出**；全仓无任何音频后端/解码器。
+
+**关键实测（决定了后端不能复用现有 SDL2）**：`vendor/sdl2/arm64/lib/libSDL2.a` 只含 `SDL_dummyaudio.o`（`nm` 零 AudioUnit 符号 / `strings` 无 `coreaudio` / `SDL_AUDIO_DRIVER_COREAUDIO` undef）⇒ `SDL_OpenAudioDevice` 会**成功返回但永不发声**；web 侧 `-sUSE_SDL=2` 会联网拉 **SDL 2.24.2**（本机 emsdk 未装该 port，`cache/ports/` 仅 `zlib`），与 native vendored 的 **2.32** 版本错配，且仓库 web 分支刻意排除 SDL2（`src/air-app.ts:259`「no SDL2/objc/Cocoa」；实测 `Starling-Demo.wasm` 的 SDL 符号数 = **0**）。
+
+**已裁决（2026-10-06）**：
+
+- **后端 = miniaudio**（单头文件；一处实现覆盖 native CoreAudio + web AudioWorklet；内置 MP3/WAV/FLAC 解码。A（miniaudio）/ C（重编 SDL2）在 native 与 web 上的逐项对照见 `audio.md` §4.1）。
+- **范围 = A~D 全量**：
+  - **A** 后端 + 解码骨架：`new Sound()`、`loadCompressedDataFromByteArray`、`play→SoundChannel`、`stop`、`SoundTransform(volume,pan)`；
+  - **B** 语义补齐：`startTime`/`loops`/`position`/`SOUND_COMPLETE`/`SoundMixer.stopAll()`/32 声道上限；
+  - **C** 元数据面：`length`/`bytesTotal`/`bytesLoaded`/`id3` + `OPEN`/`COMPLETE`/`PROGRESS`/`IO_ERROR`/`ID3` + `SoundLoaderContext`；
+  - **D** 高级：`SoundMixer.computeSpectrum`/`Sound.extract`/`sampleData`/`loadPCMFromByteArray`/流式 `Sound.load(URLRequest)`。
+- **`[Embed]` 缺口**（`audio.md` §10）**独立延后**，不并入本阶段。
+- **属「补遗留」非「增强」**（AIR 本来就出声）⇒ **不加 `--features`**；WASI 无后端须**如实报明**，不静默假装成功。
+
+**第一颗钉子：✅ 已钉（2026-10-06 实测，证据台 `temp/audiomini/`）**——30 行探针（`ma_context_init` +
+`ma_device_init` + `ma_device_start` + 播 440 Hz 正弦）在两端**零额外开关**编译并拿到**真实后端**：
+
+| 端 | 编译（零额外开关） | runtime 后端 | 结果 |
+|---|---|---|---|
+| native | `clang -O2 -o probe-native probe.c -lpthread -framework CoreFoundation -framework CoreAudio -framework AudioToolbox` | **`Core Audio`**（4 个播放设备，默认 `MacBook Pro扬声器`） | 三个 init/start 全 `0 (No error)` + `PROBE_OK` |
+| web | `emcc -O2 -o probe-wasm.html probe.c`（**零 `-s` 开关**，4.6 s） | **`Web Audio`**（1 个 `Default Playback Device`） | 同上 + `PROBE_OK` |
+
+⇒ 与上条「SDL2 哑驱动陷阱」正好对照：两端都拿到**真实**后端（不是 null/dummy）⇒ **可直接开工 A 步**。
+（探针产物：`temp/audiomini/probe.c` + `probe-native` + `probe-wasm.{html,js,wasm}` + `probe-{native,wasm}.txt` 存档；
+miniaudio **v0.11.25**，4.1 MB / 95,864 行。）
+
+**落地（2026-10-06，v0.4.69）**：
+
+- **A~D 全量实现**：`Sound`（`play`/`load`/`close`/`loadCompressedDataFromByteArray`/`loadPCMFromByteArray`/`extract`/`length`/`bytesTotal`/`bytesLoaded`/`url`/`id3`/`isBuffering`/`isURLInaccessible`）、`SoundChannel`（`stop`/`position`/`leftPeak`/`rightPeak`/`soundTransform`）、`SoundTransform`（存储四个增益、`pan` 为**派生量**、setter 不夹取）、`SoundMixer`（`bufferTime`/`audioPlaybackMode`/`stopAll`/`areSoundsInaccessible`/`computeSpectrum`/`soundTransform`）、`SoundLoaderContext`、`ID3Info`。**语义逐项按 adl 51.4.1 实测**（口径表：`audio.md` §13）。
+- **后端 = miniaudio v0.11.25**（`vendor/audio_glue.c`，独立 TU，`MINIAUDIO_IMPLEMENTATION` 不污染生成的 C；`as_audio_*` 接缝在 `src/runtime.ts`）。**有无后端生成的 C 逐字节相同**：清单加 `vendor/audio_glue.c` + `ASC_HAVE_AUDIO` 即启用（`src/air-app.ts` 的 `detectAudio` 自动加，web 端不接并**构建期警告**）。线程红线：混音回调只读固定声道槽 + malloc 的 PCM，**绝不碰 GC 堆**，`SOUND_COMPLETE` 只在 AS3 线程帧边界派发。
+- **一个新发现（语义级）**：AS3 算术是 IEEE double、**每一步一次舍入**，而 `-ffp-contract` 默认会把 `1.0 - ltl*ltl` 融成 FMA —— `SoundTransform.pan` 的 1-ULP 漂移（adl `0.2604000000000001`）因此变成 `0.2604`。⇒ `src/build.ts` 新增 `fpFlags()`，四个构建器（native/wasm/web 的编译与链接）一律带 **`-ffp-contract=off`**：这是**语义开关**，不是优化开关。
+- **收尾又补了第 10 轮探针（`gen10.ts`）**：`Sound.load` 的**失败面**——缺失文件与**不可解码的负载**在 adl 上都派 `ioError`、`errorID=2032`、**不派** COMPLETE、也没有 OPEN，但 `url` 读回**非 null**。这轮当场挖出**两个真 bug**：① 我们的 `Sound` `ioError` 事件**没写 `errorID`**（文案里有 2032、事件上是 0）⇒ 补上「事件也带号」，并把 `test/unit/transport.ts` 的「每个 ioError 都带号」计数从 3 收到 **5 个点位**（该断言就是为这类漏写设计的）；② 一个**不是音频的文件**我们会派 `COMPLETE`（空声音），adl 是 `ioError 2032`（AIR 先解码再报完成）⇒ `Sound__finish` 增加解码失败分支。两个 bug 都只被**这一轮**暴露（前 9 轮都喂的是真音频）。
+- **验收证据**：`temp/audioprobe/diffall.sh` → **14 轮 PASS / 0 轮 DIFF / 5 轮 N/A**（两个网络若干字段级归一化见 `divergences.sed`；N/A 的每轮原因写在脚本的轮次表里——adl 自身卡死 VBR / 参考被看门狗截断 / 旧生成器场景被饿死）。另有三支后端级探针逐位对齐：`temp/audiomini/{dectest,id3test,specprobe}.c`（标称帧数、ID3 逐字段、波形峰值）。
+- **示例**：`examples/audio.as` + `examples/audio.build.json`（`test/examples.ts` 的 `EXAMPLE_ARGS` 传入清单）——自带 44100 帧 PCM 音源，**不需要素材文件**，并按 `SoundMixer.areSoundsInaccessible()` 分叉：CI 无声卡时走「如实报明」支路（`play()` 返回 `null`、`computeSpectrum` 数组原样不动），本机有声卡时走真实播放支路，两条支路都已实测通过。
+- **差异清单**：`audio.md` §14（8 条，含 adl 自身在本平台的坏路径：PCM 搬运恒 0、VBR 卡死、`play(length)` 卡死、FFT 整形不可反推）。其中「类实例隐式 `toString` / `Error.name` 缺失」「`SampleDataEvent` 动态音频」两条**与音频无关或属未实现范围**，入下方遗留表。
+- **文档同步**：`audio.md`（zh/en）状态横幅 + §13 实测口径 + §14 差异清单；`README-CN.md` `flash.media` 段。
+- **收尾补记（2026-10-06，demo 帧音效静音定位）**：用户放开 `examples/air-starling-demo` 的 `Sound` 后发现 `adl` 参考与 AOT 产物**都无声且无报错**。定位到**应用侧**一行缺陷：`starling/assets/AssetManager.as` 构造器的 `registerFactory(new SoundFactory())` 被注释掉，mp3 于是落到兜底工厂 `ByteArrayFactory`（优先级 -100、`canHandle` 对任何 `ByteArray` 恒真），被当**裸字节**注册 ⇒ `getSound("wing_flap")` 恒 `null`、`setFrameSound(2, null)` 静默无效。放开该行后两端实测 mixer 均有输出（adl 峰值 0.74→1.46、AOT 0→0.65，且 AOT 探针**未**直接 `playSound`，故的确来自帧音效）。探针 `temp/soundprobe/`（adl，子类化 `Demo` 免手点入 `MovieScene`）+ `temp/demosound/`（AOT 同构）；口径已写入 `audio.md` §13.4（zh/en）。顺手复验 `--air-app` 会因 demo 用到 `flash.media` **自动**写入 `vendor/audio_glue.c`/`ASC_HAVE_AUDIO=1`/`CoreAudio`+`AudioToolbox`，重建后的 `Starling-Demo.build.json` 与用户手改版**逐字节等价**。本行**不在本表**（应用侧修复，非编译器缺口）；过程中另发现两个**编译器**缺口，已登记下方遗留表（`is` 右操作数为 Class 变量；`*` 类型上的 `Vector.length`/下标）。
+
+**验收（按 DoD）**：`examples/audio.as` 通过（`--run`，两条支路各跑一次）；回归 `examples/` 全量 + `test:unit`（收尾实测 `npm run test:unit` **48/48**（后追加 demo 音频复验组 ⇒ **49/49**）、`npm run test:examples` **148/148**，含新增的 `audio.as` 与示例总数 147→148）；
+`README-CN.md` 类型表与限制同步；版本号 **v0.4.69**（v0.4.66 = 阶段九十五·八、v0.4.67 = 阶段九十七、v0.4.68 = 阶段九十五·九）。
+
+---
+
+#### 阶段九十七：测试基础设施 —— examples(E2E) + 单元层 + CI（v0.4.66 → v0.4.67）✅ 已完成
+
+**起因（先更正一个前提）**：「现在只测 examples、该不该建单测」这个前提**不成立**——`test.ts` 3904 行里早有单元层：**536 条 `check()` 断言 / 44 个 `checkXxx(): string[]` 组**（对生成的 C 做源级结构钉）、**39 处 `generateC(parse(src))`** 纯编译器单测、9 处示例 golden 钉；examples 层才是 147 个单元。**真正缺的是三件**：① **无 CI**（`.github/` 只有个 `.DS_Store` + 视频，无 workflow——断杆能活下来就靠这个）；② **无模块边界**（1400+ 行单测挤在一个文件里）；③ **示例结构性测不到的负例缺口**（错误诊断）。
+
+**已落地（2026-10-06）**：
+
+- **框架 = 内置 `node:test`**（AGENTS.md §3.1 禁第三方依赖 ⇒ vitest/jest 不可选；Node v24 原生直跑 `.ts`）。`node test.ts` / `npm test` 仍是文档口径的全量入口，内部改为注册 node:test 用例；新增 `npm run test:unit` / `test:examples` 分层入口。
+- **拆分（逐字搬迁，非重写）**：`test.ts` → **9 行**（仅两条 import）；44 个 `check*` 组 + 辅助 `glueBodyArrow` 搬到 `test/unit/` 的 **10 个模块**（`lexer` 1 / `build` 7 / `transport` 6 / `render` 8 / `display` 4 / `text-input` 5 / `numeric` 2 / `bytearray-amf` 3 / `reflection` 4 / `platform` 5）；examples E2E 搬到 `test/examples.ts`（**一个示例一个用例**，可 `--test-name-pattern` 单跑）；共享 prelude（`root`/`dir`/`EXAMPLE_TIMEOUT_MS`）归 `test/harness.ts`。切片用**顶层锚点**而非花括号计数（`check` 体里满是含花括号的 C 代码字符串/正则，计数必错）；45 块**零重叠零遗漏**。
+- **补诊断缺口**（examples **结构性**测不到——示例套件只跑「必须成功」的程序）：新增 `test/unit/diagnostics.ts`，**22 条**断言钉住 `Lex error at L:C: …` / `Parse error at L:C: …` 的**精确文案 + 行列号**（含负例：`\u`/`\x` 位不足、字符串内裸换行、`expected '}' / ')' / ';' / identifier`），以及语义错误**必须抛错而非静默产出错 C**。每条均为**实测**而非推测（探针 `temp/testrefactor/probe-diag{,2}.ts`）。
+- **CI 落地**：`.github/workflows/test.yml`（**arm64 macOS 运行器**——vendored SDL2/Skia 只有 macOS arm64 产物、窗口后端是 Cocoa/Metal、默认链接带 `-l iconv`，ubuntu 会挂；`setup-node` 取 v24）。注意：CI 首跑会因**未提交在制**的 SWC 改动而红（见验收）。
+
+**验收**：单元层 **45/45 组 + 诊断 3/3 组全绿**；examples 层与改动前基线**逐项一致**（`143 passed, 4 failed, 147 total`）——4 个失败全是 `_as_swc_bind` 未定义符号（`examples/air-native/`、`dyn-prop.as`、`stage62.as`、`stage94f.as`），根因在 `src/emit.ts` 的 `as_swc_bind` 定义分支：stub 只在 `this.swcBake === undefined` 时发，而 `swcBake` 非空但**加载内容不含该符号**的路径漏定义。**该失败与本阶段无关**（`src/` 现有 **9109 行未提交改动**、`src/swc.ts` 整为新文件 ⇒ 阶段九十五 SWC 属在制品），故**不登记遗留表**，交由该阶段收尾。⇒ **已收尾**（阶段九十五·九，v0.4.68：`as_swc_bind` 的 stub 改为 `this.swcBake === undefined` 时发射，4 个示例全绿）。
+
+**收口复测（2026-10-06）**：`node test.ts` ⇒ **195 passed / 0 failed / exit 0**（= 147 个示例单元 + 48 个单元用例；后者含本阶段 44 个搬迁组 + 3 个诊断组，及同期并发落地的 `render/SwcTimeline`）。**其后追加**（2026-10-06 demo 音频复验）：新增 `platform/AudioWiring` 组 ⇒ 单元用例 **49**、`node test.ts` 总计 **197**（= 148 个示例单元 + 49 个单元用例；实跑 `197 passed / 0 failed / exit 0`）。**逐行集合比对**（基线 722 条 `PASS` vs 收口 743 条）：仅 5 条 `[no-src-litter]` 措辞变化（守卫折入目录型用例，断言仍在跑），新增 22 条诊断钉 + 4 个此前失败的示例转绿 ⇒ **零断言丢失**。另把 `[no-src-litter]` 快照由**顶层改为递归**——该守卫的动机事件（`air-native` 的 `ArrayDemos.c` 落进 `src/demo/`）恰好发生在**已存在**的子目录里，顶层快照必然漏报（负向对照已验证：递归快照可见嵌套文件；5 个目录型用例在递归守卫下仍 5/5 绿）。
+---
+
+#### 阶段九十八：`Vector.<*>` 单态化补齐 + `*` 接收者的 Vector 动态访问（v0.4.69 → v0.4.70 → v0.4.71）✅ 已完成
+
+**起因（遗留表两行）**：① `*`（动态）类型上访问 **`Vector` 的 `.length` 与下标**得 `0`/`null`（`Array` 正常），且 `pv.push(..)` **段错误**；② 同源的 `Vector.<*>`（`*` 元素）单态化面（`.length`/下标/`join`/`indexOf`/super 名）未补齐。
+
+**根因（实测定位）**：单态化的 `Vector.<T>` 体是 **GCT_CUSTOM**，其**首字是它的 mark 回调、不是 vtable**。`as_any_get` 的 tag 4 分支只走 `as_dyn_get` ⇒ 落到默认返回（`length`=0、下标=null）；`as_dyn_call`/`as_any_call` 则把那个回调**当 vtable 头解引用** ⇒ `pv.push(..)` 段错误。
+
+**adl 51.4.1 实测口径**（探针 `temp/vecstar/`：`vec-result.txt` C\*、`vec2-result.txt` E/F/G/H、`vecfill-result.txt` 填充值、`vecis-result.txt` `is`/`as`）：
+
+- `pv.length` 可读**也可写**（增长填 `null`、截断）；`pv[i]` 读写皆可；**越界与负索引**的读/写一律 **#1125**（与静态路径同号）；
+- `Vector.<Number>` 的新/增长槽填 **`0`**（`isNaN` false，`new Vector.<Number>(3).join()` = `0,0,0`）—— 与 `var n:Number` 的 `NaN` **不是一回事**；int/uint 填 0、引用/`*` 元素填 `null`；
+- `*` 元素 `Vector.<*>` 的 super 是 **Object**；`<String>/<Object>/<Array>` 的 super 是 `Vector.<*>`；
+- `Vector.<Number> is Vector.<*>` '''= false'''（`is` 按**精确元素名**匹配，不是「是某个 Vector」）；`[1] is Vector.<Number>` = false；
+- `delete vec[0]` 是 **no-op**（`len` 不变、元素不变、`"0" in vec` 仍 true）；`"0" in vec` = true；
+- `v.length = -1` 与 `pv as Vector`（**裸** `Vector`）会让 adl **挂起** ⇒ 不可测，不作口径。
+
+**已落地（2026-10-06）**：
+
+- **九十八·一（v0.4.70）`Vector.<*>` 单态化面**：`src/emit.ts` 6 处补 `any` 元素分支 —— `vectorCName` / `vectorElemReflectName`（`"*"`）/ `vectorElemToStr` / `vectorElemEq`（`as_v_eq`）/ `as_vec_super_fqn_impl`（`*` 与数值族同归 Object）/ `defaultCmp`（排序按 `as_v_str_val`）。
+- **九十八·二（v0.4.71）动态访问（三个生成侧钩子）**：`runtime.ts` 声明 `as_vec_get_hook` / `as_vec_set_hook`（**返回 void**）/ `as_vec_call_hook`，判定复用现成的 `as_dyn_kind() == 3`（GCT_CUSTOM），**故判定不需要生成代码、元素类型只在钩子里用**；`as_dyn_get`/`as_dyn_set`/`as_dyn_call` 三个分派点接钩子，其中 `as_dyn_call` 的绕行必须在 super 链walk **之前**。`emit.ts` 新增 `emitVectorDynAccess()`：按各 spec 的 `mark` 匹配后，**转调同一个单态化助手**（`_get`/`_set`/`_setLength`/`_push`/…），故动态与静态两条路不可能漂移；`as_vec_wire()` 在 `main` 装载，无 Vector 的构建发**空桩**。**两个易漏点**（都已实测踩到）：`pv.length` 读走 `as_any_length`、`pv.join(..)` 走 `as_any_join`（codegen 直发，**绕过** `as_any_get`/`as_any_call`）⇒ 这两处也要 GCT_CUSTOM 分支，否则 `push` 对而 `length`/`join` 错；负索引需专门识别（`as_array_index_key` 把 `-1` 当非下标，会读回 `null` 而不是抛 #1125）。
+- **#1125 错号**：静态路径 4 处 `RangeError_new("Vector index out of bounds", 0)` 的 `errorID` **0 → 1125**（adl 实测 #1125；旧值让 `catch` 里 `e.errorID` 恒为 0）。
+- **`*` 元素槽的 GC 写屏障**：`Vector.<*>` 的槽是**可持 GC 指针的字段**，按 AGENTS.md §2.4 红线在 5 个写点（push/unshift/insertAt/set/splice）补 `gc_write_barrier_value`。**诚实说明**：`gc_alloc` 在标记期**新对象生而黑**（allocation barrier），故本修复关的是「**白**引用写进一个已扫描过的 Vector」这一窄窗口 —— 当前 harness **未能复现**该窗口的误回收（去掉屏障跑 `examples/vector-dynamic.as` + `ASC_GC_AUDIT_STRICT=1` 仍全绿），所以屏障是**依红线而加**，示例钉的是**行为**（4000 个元素穿过 200 帧的自增标记 + `System.gc()` 后完好）而非证明屏障。
+- **填充值修正（实测发现）**：`Vector.<Number>` 的新/增长槽原用 `defaultInit`（`NAN`）⇒ 与 adl 的 `0` 不符；现按元素类型**零值**发射（仅这里改，`var n:Number` 的默认仍是 NaN）。
+
+**验收**：
+
+- 探针 `temp/vecstar/dyn.as` **逐行对上** adl 的 C1–C4/E1–E6/F1–F7/H1–H2（含 `pv.length` 读写、增长填 null、越界/负索引 #1125、`sort`/`reverse`、slice/concat/splice/map/filter/forEach、`Vector.<Object>` 的对象槽 + `System.gc()`）；`vecfill` 与 `vecis` 两轮对照后，**填充值三项全对齐**（`N fill 0,0,0` / `G grow 1,0,0`）。
+- 新增 `examples/vector-dynamic.as`（40 条断言 + 200 帧 ENTER_FRAME 写屏障压力）；新增 `test/unit/vector.ts` **2 组 32 条**（`unit: vector/DynamicAccess` 22 条钉钩子接线/分派面/#1125/示例 golden；`unit: vector/AnyWriteBarrier` 10 条钉 5 个写点 + `*` 槽的 `gc_mark_value` + 填充值）。
+- **性能代价（如实记录）**：`as_dyn_call` 现在多一次 `as_dyn_kind`（带段缓存的二分），微基准（800 万次动态方法调用）**0.047s → 0.052s（+5%）**；这是「动态调用与动态读同价」的代价，与 `as_dyn_get` 既有口径一致。体积：`hello.as` 的 `-O2` 二进制 **+320 B**（分派器在 `as_dyn_call` 不可达时被 `-O2` 自动剪掉）。
+- **仍不忠实（已入遗留表）**：`p is Vector.<Number>` / `p as Vector.<Number>` 对**动态左值**仍失败（我们 false/null，adl true/向量）；裸 `Vector` 类型名报 `CodegenError`；`delete vec[i]`/`"0" in vec` 在静态 Vector 上仍是 codegen 报错。
+
+**文档同步**：`TODO.md` 本节的遗留表行移除/新增；`README-CN.md` 版本号与 Vector 段。`package.json` v0.4.69 → **v0.4.71**（九十八·一 = v0.4.70、九十八·二 = v0.4.71）。
+
+**遗留表**：本阶段移出 2 行（`*` 类型上的 Vector.length/下标；`Vector.<*>`（`any` 元素）**不支持**—— 已落地为 v0.4.70，结论并入上方「九十八·一」），新登记 2 行（`is`/`as` 的 `Vector.<T>` 右操作数、`delete`/`in` 在静态 Vector 上）。
+
+---
+
+#### 阶段九十九：`is` / `as` 的右操作数为**运行时 Class 值**（v0.4.71 → v0.4.72）✅ 已完成
+
+**起因（遗留表一行）**：`is` 的右操作数是 `Class` 类型变量时 codegen 直接中断 —— `var c:Class = String; trace("x" is c);` ⇒ `CodegenError: unknown type 'c'`（`Emitter.emitIs` 只认**类型名**字面量）。这是**语言层**缺口（编译不过），与音频无关，是阶段九十六复验 demo 时撞出来的：`ShapeSkin.findByType(c, cls:Class)` 里的 `ch is cls` 编不过，只能改写成类型字面量。
+
+**根因**：`is`/`as` 的右操作数**不是类型名，而是作用域里的一个表达式**（AS3 先在作用域里解析这个名字）。`Class` 变量/形参/字段持有的是**运行时类对象**，判定必须沿**真实** super 链走，而不是让 `resolveType` 去查类型表。
+
+**adl 51.4.1 实测口径**（探针 `temp/cisprobe/`，`cis-result.txt` A–J 组 + `islit-result.txt` O 组）：
+
+- 子类实例命中**父类**类对象（`new MovieClip() is c`，`c = Sprite` → true）；父类实例**不**命中子类（`new Sprite() is c`，`c = MovieClip` → **false**）；无关类恒 false；`null is c` = **false**；
+- 接口 `Class` 值按 `implements` 判定；`Object` 类值对**任何非 null** 都 true；`Number`/`String`/`Boolean`/`Array` 类值按 box tag 判定；
+- `as`：命中返回**原对象**、未命中 `null`（`null as c` = null、`5 as c` = null）；
+- **右操作数不是类对象**（`Class` 槽为 `null`，或槽里塞了个非 Class 值）⇒ `is` 与 `as` **都** `THROW #1009`，且**先**校验操作数（左值是标量也照样抛）；RHS **只求值一次**；
+- **顺带实测并修掉一处更早的错误折叠**（`islit-result.txt` O1–O27）：`x is Object` 对**除 `null`/`undefined` 外的一切**为真 —— `1 is Object`、`1.5`、`"x"`、`true`、`[1]`、对象字面量、**函数值**、类实例、以及 `*` 槽里的**装箱**值（tag 1/2/3/4/6/7）全 **true**，`null`/`undefined` 才 false；我们旧实现把静态标量/数组/记录/函数一律折成 **false**（`1 is Object` 竟得 false），`as_v_is_object` 也只认 tag 4/6。
+
+**已落地（2026-10-06，v0.4.72）**：
+
+- **运行时助手**（`src/emit.ts` `emitSealedPropErrors()`，`#1009` guard 家族内）：`as_req_class(as_class*)`（NULL ⇒ `TypeError #1009`）、`as_class_is_obj(void* obj, as_class*)`、`as_class_is_val(as_value, as_class*)`（tag 4/6 才取指针，与 `as_v_obj_val` 一致）、`as_class_as_val(as_value, as_class*)`。
+- **`classValueOperand(name)`**：名字含 `.`/`::`/`<` 或**是标量类型名** ⇒ 不当 Class 值（仍走类型名路径）；否则查作用域（`lookupClassVar`：闭包/局部/字段/静态字段/模块变量，与 AS3 作用域优先一致）⇒ 命中则走**动态分支**。
+- **`emitIs`/`emitAs` 的动态分支**（插在**标量折叠之前**，保证同名 `Class` 变量能遮蔽同名类）：`any` 左值走 `_val` 变体；`interface`/`object` 左值走 `as_v_obj((void*)(…))`；其他静态左值用**逗号表达式** `((void)(lhs), (as_req_class(c), false))` —— 左值仍求值、RHS 仍校验 #1009，然后折 `false`/`as_v_null()`。`as` 的结果类型是 **`any`**（AS3 里 `x as C` 是 `*`）。
+- **`is Object` 修正**：`as_v_is_object` 改为 **`v.tag != 0 && v.tag != 5`**（tag 规则即「除 null/undefined 外皆 Object」），`emitIs` 的 `Object` 分支静态值只把 `null`/`void` 折 false，其余折 true。
+
+**验收**：
+
+- 探针 `temp/cprobe1.as`~`cprobe3.as` 逐项对上 `cis-result.txt`：A1–A6（子类/父类/无关/`null`）、B1–B3、G1/G3/G4（`*` 左值按运行时类）、E1/E2 **#1009**、I1/I2；
+- 探针 `temp/cprobe4.as` 对上 `islit-result.txt` **O1–O20 全部一致**（唯一差异见遗留表新增行：`(1 as Object) == 1`）；
+- 新增 `examples/is-class-operand.as`（10 组 60+ `check()` 断言：类变量 RHS 的 super 链、helper/字段/形参、`as` 结果、`*` 左值、异构列表过滤、`#1009`（`try/catch` 验 `errorID`）、标量左值、类型名字面量回归、`is Object` 全表），输出 `is-class-operand: all assertions passed`；
+- 新增 `test/unit/reflection.ts` 的 `unit: reflection/ClassValueOperand`（16 条**源级**钉：`as_class_is_obj`/`as_class_is_val`/`as_class_as_val`/`as_req_class` 的接线与 `#1009` 文案、逗号表达式的求值与折值形态、helper 形参走 `_val`、类型名路径未被污染、`is Object` 静态折叠与 tag 规则、示例 golden）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.72 + 「当前限制」新增本阶段条目（含**未实现**边界）；`package.json` v0.4.71 → **v0.4.72**。
+
+**遗留表**：本阶段把「`is` 右操作数是 Class 类型变量」那行**改写为部分完成** —— **用户类/SWC 类已落地**（v0.4.72），剩余是**内建类/接口不能作 Class 值**（`var c:Class = Object` 报 `undefined variable`，`adl` 合法）；另**新登记 1 行**：`(标量 as Object) == 标量` 比较为假（本阶段 O 组探针实测发现）。
+
+
+---
+
+#### 阶段一百：语义层报错统一带行列号（`CodegenError`）（v0.4.72 → v0.4.73）✅ 已完成
+
+**起因（遗留表一行）**：`class CodegenError extends Error {}` 既无位置**字段**，消息里也无位置（`unknown superclass 'Nope' of 'A'`），而 `LexError`/`ParseError` 两者都有（`Lex error at 1:16: …`）——与 AGENTS.md §2.5「**所有**错误必须带行列号」直接冲突。全仓 **156 处**抛出点（`src/emit.ts` 148 + `src/symbols.ts` 8）。
+
+**方案（先更正原遗留行的前提）**：原行写着「emit 层多数节点已带 token」——**实测不成立**：`ast.ts` 的 `Stmt`/`ClassMember` **完全没有**位置字段，emit 层手里根本没有 token。所以正确顺序是**先让 parser 盖位置、再让语义层取用**：
+
+- **`ast.ts`**：新增 `Pos { line?; col? }`，`Stmt = (…联合…) & Pos`、`ClassMember = (…联合…) & Pos`（可选字段，手工构造的合成节点无需位置）。
+- **`parser.ts`**：`parseStatement()` 拆成「取起始 token → 调 `parseStatementInner()` → 未盖章则盖 `line/col`」的薄包装 —— 这是**唯一**的语句汇聚点（顶层/块/循环体都过它）；`parseClassDecl` 的成员循环用 `markMember()` 盖成员起始 token（含修饰符与 `[metadata]`，故 `[WasmExport] public function f()` 报 **1:11**）。
+- **`symbols.ts`**：新增**当前位置**（`genLine`/`genCol` + `setGenPos()`），`CodegenError` 的构造器**默认读当前位置**并在消息前加 `Codegen error at L:C: `（与另两层同形）；显式传参优先；位置未知时保留裸消息（不臆造位置）。settle 在 pass -1/0/1/1.5/2/3/4 各循环与成员循环里发布，`collect()` 另存 `classPos`（FQN → 位置）供「只见类名」的 `expandInheritance` 使用。
+- **`emit.ts`**：`emitStmt` / `emitTopLevel` / 类与函数定义循环 / 成员循环发布位置；`emitTopLevel` 必须单独补（顶层语句**不**走 `emitStmt`，否则 `var b:* = new Nope();` 报不出位置）。
+- **两处「读消息」的站点必须改用裸消息**（实测踩到）：`withLexical` 的降级回退用 `/^(undefined variable|undefined function) '/` **锚定**消息开头，前缀一来锚点失配 ⇒ `examples/with.as` 直接编译失败（`undefined variable 'a' at top level` 不再被转成 AIR 的运行时 #1065）；构造器参数重抛把消息再包一层 ⇒ 会**双前缀**。故新增 `codegenBareMessage(e)` 剥掉前缀，两处改用它（重抛同时显式传 `e.line/e.col`）。
+
+**验收**：
+
+- 18 个代表性命中（`temp/pos1.mjs`/`pos2.mjs`）：未知父类 `1:1`、循环继承 `1:1`、final 父类 `2:1`、接口未实现 `2:1`、实参多余/缺失 `2:1`、未知类 `1:1`、未知成员 `3:1`、`with` 不支持接收者 `2:1`、`[WasmExport]` 用于实例方法 **`1:11`**、非法 cast/is 目标 `2:1`、`delete`/`in` 不支持 `2:1`、未定义变量 `1:1`；**行号取语句自身**（第 4 行的 `extends Nope` 报 `4:1` 而非 `1:1`）。
+- `test/unit/diagnostics.ts` 的 `unit: diagnostics/Codegen` 从 **6 → 15** 条：原 6 条钉子**翻转**为断言带前缀的消息 + `e.line/e.col` 字段；新增「行号是语句自身而非 1:1」「类成员错误指向成员行」「顶层初始化器错误带顶层行」「重抛消息只有一个前缀」「`codegenBareMessage` 剥离」「`with` 回退仍认得未定义变量错误（不再编译失败）」「**CLI 端到端**：`node src/index.ts bad.as` 退出码 1 且 stderr 含 `Codegen error at 4:1: unknown superclass`」「本组全部错误都带数字行列」。
+- 全量 `npm test` **200 passed / 0 failed**（含被前缀打断后修复的 `examples/with.as`）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.73 + 「当前限制」本条；`package.json` v0.4.72 → **v0.4.73**。
+
+**遗留表**：**移出 1 行**（`CodegenError` 缺 `line`/`col`）。本阶段**无新例**——按 §2.7「负例只钉在 `test/unit/`」，本特性是**报错行为**，断言全部落在 `test/unit/diagnostics.ts`（含 CLI e2e），不新增 `examples/*.as`。
+
+
+---
+
+### 阶段一百零一：`DisplayObject.scale9Grid` 属性（目标 v0.4.74）
+
+> **起因**：九宫格此前只有 SWC 烘焙一条**内部**路径（`DefineScalingGrid` → `_s9_*` → `as_render_nine_slice`），AS3 侧读 `o.scale9Grid` 报「未知成员」。遗留表登记时判断「`as_render_nine_slice` 已能消费 `_s9_*`，只需把 setter 写进去」——**方向对，但边界行为（校验时机、截断、抛错后是否保留、getter 的拷贝语义）必须实测**。
+
+- **adl 51.4.1 实测口径**（`temp/s9probe/s9-result.txt`，两轮探针）：
+  - 默认 **null**；`= null` 是**清除**，读回 null；
+  - **存储截断为整数**（向零）：`(1.5,2.5,3.25,4.75)` → `1,2,3,4`；`(-1.5,-1.5,5.5,5.5)` → `-1,-1,5,5`；
+  - getter **每次返回新的 `Rectangle`**：与传入实例不同（`g1 == r` false）、**两次读也互不相同**（`g1 == g2` false）；setter 是**拷贝**语义（事后改传入的 rect 不影响对象）；
+  - **校验用未截断的原值，且严格要求「严格内含」**：`x > bounds.left && y > bounds.top && x+w < bounds.right && y+h < bounds.bottom`（两侧都是严格不等式）且 `w>0 && h>0`。反例（30×30、内容 (0,0)-(30,30)）：等于 bounds、贴左/上（`x==left`）、贴右/下（`right==30`）、越界、负坐标、零宽/零高、**无内容对象**（bounds 为空）全部抛 `TypeError #2004`；正例：`(1,1,5,5)`、`(24,24,5,5)`、`(23,23,6,6)`、`(1,1,28,28)`。**最易抄错的一处**：`(0.5,0.5,5,5)` **合法**（原值 0.5 > 0，读回 `0,0,5,5`）而 `(0,5,5,5)` 抛错 —— 两者截断后都含 0，说明**校验发生在截断之前**；
+  - **抛错仍然存储**：catch 里读 getter 会拿到那个（截断后的）非法矩形（`THROW 2004 get=40,40,5,5`），且后续一次非法赋值会覆盖前一次的存值；
+  - 内容偏移时内含是相对**内容 bounds**：内容 (10,10)-(40,40) 下 `(15,15,5,5)` 合法、`(10,10,5,5)`（贴内容自身原点）抛错。
+
+- **实现**（`src/symbols.ts` + `src/emit.ts`，复用既有渲染路径）：
+  - `symbols.ts`：`DisplayObject` 加 getter/setter `scale9Grid`（`dog`/`dos`，类型 `Rectangle`）。**没有**加 AS3 字段 —— `_s9x/_s9y/_s9w/_s9h` 是 `emitStructs` 里**逐行发射**的私有 C 槽，再加 AS3 成员会发射出第二份 `double _s9x;`（本阶段第一次尝试就踩到，已回退）。
+  - `emit.ts`：`DisplayObject_get_scale9Grid`（`_s9_on` 为假 → `NULL`，否则 `Rectangle_new(...)` 造**新**对象）+ `DisplayObject_set_scale9Grid`（先 `_s9_valid = 0` 失效烘焙并释放 `_s9_image`，`null` 清两位；否则**先用原值**调 `as_do_s9_valid`、再把 `trunc()` 后的值写槽、最后 `if (!ok) as_throw(ArgumentError_new("Error #2004: One of the parameters is invalid.", 2004))`）。`as_do_s9_valid` 前向声明在访问器旁、定义在 `as_bounds_walk` 声明之后（与 `as_do_extents` 同处），走 `as_bounds_walk(o, 1, 1, ...)`（含描边，与 `getBounds` 口径一致）。
+  - **新增私有位 `_s9_apply`**：把「**有网格**」（`_s9_on`，getter 报的）与「**照九宫格渲染**」（`_s9_apply`，渲染门读的）分开 —— 非法网格按 adl **仍然存储**（getter 必须报出），但不应参与九宫格重组。渲染门 `if (o->_s9_apply && (scaleX != 1 || scaleY != 1))`；SWC 烘焙路径改为同时置两位（`_s9_on = 1; o->_s9_apply = 1;`，实测 22 个缩放网格符号的生成码逐个数到 22 处），ctor 复位两位 ⇒ **SWC 渲染行为不变**。
+  - 访问器与 SWC 绑定共用**同一批槽 + 同一个渲染器**，故不存在第二条九宫格实现。
+
+- **验收**：新增 `examples/scale9grid.as`（40+ 条 `check()` 断言：默认/清除/拷贝语义/两次读不同/两轮截断/9 条非法集/抛错后保留/无内容对象/偏移内容/渲染位与存在位分离），输出 `scale9grid: all assertions passed`。
+- `test/unit/display.ts` 新增 `unit: display/Scale9Grid`（**16 条源级钉子**：声明形状、无重复 C 字段、getter 造新对象、**先校验原值再截断**（顺序钉）、`trunc` 存储、存在位/应用位分离、**抛错在存储之后**（顺序钉）、`null` 清两位、四条严格不等式、退化尺寸与空 bounds、渲染门读 `_s9_apply`、SWC 绑定同时置两位、ctor 复位、反射 setter 的 `as_v_obj_val` 解箱、**真实生成 C**（`generateC`）中的访问器/助手/抛错/渲染门、示例 golden）。
+- 全量 `npm test` **202 passed / 0 failed**（277s；较阶段一百的 200 增 2：新示例 `examples/scale9grid.as` + 新单测组 `unit: display/Scale9Grid`；`examples/swc-shape.as` 走 `--swc` 重新生成后仍通过 ⇒ SWC 九宫格路径无回归）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.74 + 删除「`scale9Grid` 未实现」限制条目（改为已实现说明）；`package.json` v0.4.73 → **v0.4.74**。
+
+**遗留表**：**移出 1 行**（AS3 `scale9Grid` 属性未实现），**新登记 2 行**（动态槽给对象型参数赋错类型**不抛 #1034** 而是静默取垃圾指针 —— 本阶段探针实测；`set` 作标识符被我们的 parser 拒绝 —— 探针副产物）⇒ 69 项（9 部分完成 / 59 未开始 / 1 暂缓）。
+
+---
+
+### 阶段一百零二：`ByteArray` 下标形式的完整语义（目标 v0.4.75）
+
+> **起因**：遗留表登记「`ByteArray` **正越界读**」——`ba[i]` 此前只有「落在 `[0,length)` 时给字节」这一半：静态越界读给 `0`（而 `adl` 给 **`undefined`**），字符串键 `ba["0"]` 直接撞 `cannot convert string to int`，`*` 接收者的下标读写根本没有入口（动态槽走属性表 ⇒ `#1056`/`#1069`，而 AVM2 的**下标形式**不吃属性表）。实为「下标形式」整体缺失，正越界只是其中一个侧面。
+
+- **adl 51.4.1 实测口径**（`temp/baidxprobe/ba-result.txt`，21 行逐行比对；另有 `za-result.txt` 属性表 5 行、`wa-result.txt` 写入值 8 行）：
+  - **区间内**：`b[0]` = 65、`typeof` 为 `"number"`、`is int` / `is Number` 皆 true、`b[0] + 1` = 66；
+  - **正越界读 = `undefined`**（不是 0、不抛错）：`b[3]`（len=3）/`b[9]`/`b[1000000]` 一律 `undefined`，`== null` true、`=== undefined` true、拼字符串得 `"undefined|"`；
+  - **负索引抛 `#1069`**（属性查找 miss）——下标形式**未**变成数组式访问；
+  - **字符串键按键的规范下标文本判定**：`"0"`/`"2"` 是下标（65/200），`"00"`/`"1.5"`/`" 1"`/`"-1"`/`"zz"` **不是**（一律 `#1069`）；而**非下标键走真实属性表**：`b["length"]` = 3（访问器赢，不是 `#1069`）；
+  - `*` / `Object` 接收者同语义（`d[3]` = undefined、`d[-1]` → `#1069`）；`o["zz"]`/`o.zz`/`d["zz"]` 都抛 `#1069`（sealed 类的动态 miss），但 `o[9]` 是 `undefined`（下标形式）；
+  - **写**：`b[5] = 7`（静态）**扩展** buffer、间隙零填充（len 6、`b5=7`、`b3=0`）；动态写 `d2[3] = 5` **也扩展**；动态**非下标键** `d2.zz = 1` → `#1056`；
+  - **写入值走 AS3 的 ToNumber，且装箱字符串会被解析**：`"5"`→5、`300`→44、`-1`→255、`true`→1、`null`→0、`1.7`→1、`"x"`→0（**静态与动态两条路都实测**）；
+  - **`in` 按下标范围**：`"0" in b` true、`"9" in b` false（不是属性表）；`"length" in b` true；
+  - **`delete b[0]` = `false` 且不抛**（静态与动态同）；`*` 接收者的 `.length` 仍是 buffer 长度。
+
+- **实现**：
+  - `src/emit.ts`：`ByteArray_get_index` 返回类型 `int` → **`as_value`**（负索引 `#1069`、越界/无 buffer → `as_v_undefined()`、否则 `as_v_num(低字节)`）；新增 `as_ba_str_index(char* k)`（规范下标文本：空 / 前导零 / 非数字 / 超 `INT_MAX` → -1）与 `ByteArray_get_index_key`（非规范键 → `as_throw_sealed_get`）。
+  - **静态字符串键读改走 `as_dyn_get`**（而不是直接进下标助手）：必须先过真实属性表，否则 `b["length"]` 会被当成下标（实测就是 `#1069`）；`as_dyn_get` 的 ByteArray 钩子只在 props/getters/methods 遍历 miss 之后触发，正好给出「`"zz"` → `#1069`、`"0"` → 下标」。
+  - `src/runtime.ts`：新增 5 个钩子（`as_ba_is_hook` / `as_ba_get_key_hook` / `as_ba_set_key_hook` / `as_ba_has_key_hook` / `as_ba_len_hook`）+ `as_dyn_get/set/has` 三处分派（都在 props 遍历**之后**、sealed 抛错**之前**），`as_any_length` 加 ByteArray 分支（`.length` 直发 `as_any_length`，绕过 `as_dyn_get`）。类体在 runtime 之后发射，故运行时只能经钩子间接调用（与 Vector 钩子同一模式）；`as_ba_wire()` 在 `main` 里无条件调用（`ByteArray_vt` 始终发射）。
+  - **修掉两个顺带发现的缺陷**：①`delete <*>[key]` / `delete <*>.prop` 此前按**记录**（`as_object_del`）解引用 —— 装箱的是**类实例**时把实例当槽表读 → **段错误**；现改走 `as_dyn_del`（记录槽 → 删槽，sealed 类 → false，Proxy → `#2092`），`delete d[0]` = false 与 `adl` 一致；②`ByteArray` 下标**写**的装箱值此前用 `as_v_num_val`（取 box 的数字槽 ⇒ 字符串给 0），现静态路（`any` 操作数）与动态钩子都走 `as_v_to_number` ⇒ `ba[0] = "5"` 写 5（实测）。
+  - **返回值类型 `any` 的消费点**：`emitIndex` 的 ByteArray 分支结果类型改 `{ kind: 'any' }`，故 `b[0] + 1` / `trace(b[3])` / `b[3] == undefined` 全走动态路径（与 `adl` 一致）。
+
+- **验收**：新增 `examples/bytearray-index.as`（50+ 条 `check()`：区间内/is/typeof/越界 undefined 四连/负索引与非规范键 5 条 `#1069`/动态接收者/Object 接收者/静态与动态写扩展零填充/`#1056`/8×2 条写入值 ToNumber/`in` 范围/`delete` 恒 false/属性表不退化），输出 `bytearray-index: all assertions passed; len=3 b2=200`。
+- `test/unit/bytearray-amf.ts` 新增 `unit: bytearray-amf/IndexForm`（**17 条源级钉子**，全部对**真实**生成码复核：`temp/bapins/pins.c`）：reader 返回 `as_value` 的三分支、`as_ba_str_index` 的规范判定逐行、非规范键 `#1069`、静态数值下标 → `ByteArray_get_index`、静态字符串键 → `as_dyn_get`（且**不再**出现 `ByteArray_get_index_key((void*)` 直调）、装箱写值 `as_v_to_number` vs 静态 `((double)(7))`、`delete b[0]` → `((void)(b), false)`、`delete d[0]` → `as_dyn_del(as_v_obj_val(d), as_str_from_int(0))`、`as_any_length`/`as_any_get` 的 `*` 路径、`as_ba_wire` 五钩子 + `main` 调用、示例 golden；并把 `ByteArraySurface` 里钉旧行为（越界 `return 0`）的那条**翻转**为 `return as_v_undefined()`。
+- 全量 `npm test` **204 passed / 0 failed**（较阶段一百零一的 202 增 2：新示例 `examples/bytearray-index.as` + 新单测组 `unit: bytearray-amf/IndexForm`）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.75 + 内建行；`package.json` v0.4.74 → **v0.4.75**。
+
+**遗留表**：**移出 1 行**（`ByteArray` 正越界读），**新登记 3 行**（动态值 `as <原始类型>` 应给 **null**；装箱字符串参与**算术/比较**未走 ES3 ToNumber；静态 `String` 与 `Number` 混算发射非法 C）⇒ 71 项（9 部分完成 / 61 未开始 / 1 暂缓）。
+
+---
+
+### 阶段一百零三：`TextField.getLineMetrics` + `flash.text.TextLineMetrics`（目标 v0.4.76）
+
+> **起因**：遗留表登记「`TextField.getLineMetrics(index)` 未实现」—— AIR 侧阶段九十四·二十 的**所有** ascent/descent/leading 数值都靠它取，我们只能拿 `textHeight`/`numLines` 间接核对。登记时判断「六个字段全部可由现有段落行表导出」（**方向对**），但行盒之外还有三处非平凡：越界语义（抛错还是 `null`）、`leading` 的分摊、`x` 的对齐口径 —— 全部实测后才敢写。
+
+- **adl 51.4.1 实测口径**（`temp/metricprobe/`：`metric6-adl.txt` 22 例逐行、`lead7-adl.txt` leading 矩阵、`align6-adl.txt` 对齐矩阵）：
+  - **越界索引抛 `RangeError #2006`**（`Error #2006: The supplied index is out of bounds.`）—— `index == numLines`、负数、远超范围一律抛，**不是返回 null**（**推翻**阶段九十四·二十 时「返回 null」的猜测）；
+  - **空字段仍是 1 行**：`numLines` 1、`textHeight` 0、`textWidth` 0，`getLineMetrics(0)` 报默认格式的字体度量（`_typewriter` 12 → `12/3/0/h15/w0/x2`，宽 0），`getLineMetrics(1)` → `#2006`；
+  - `ascent`/`descent` = 该行**字体设备度量**，**与 leading 无关**（leading 0/4/10/−3 全为 `12/3`），二者之和等于行高；
+  - `leading` = `TextFormat.leading`，**每一行（含末行）都算**；`height = ascent + descent + leading`（−3 时 `h12 < asc+desc`）；**AIR 自己的 `textHeight` 与各行 `height` 之和不一致**（leading=4 的两行字段 `th=34`，而两行 `height` 都是 19 ⇒ 尾行 leading 不计）；
+  - `x` = 行的左偏移 = **2px 文字内边距** + **逐行**对齐偏移（200px 字段居中 → 89/75、右对齐 → 176/147.5、justify → 2/2；`wordWrap=true` 宽 60 + 居中 → 5/5）；`width` = 该行前进宽（`abc` 21.5 / `defgh` 36），`textWidth` = 最大行宽；
+  - `new TextLineMetrics(x, width, height, ascent, descent, leading)` 构造器可用、**六字段可写**、`toString()` = `[object TextLineMetrics]`。
+
+- **实现**（`vendor/skia_glue.cc` + `src/runtime.ts` + `src/symbols.ts` + `src/emit.ts`）：
+  - `vendor/skia_glue.cc`：`SkAirLineMetrics` 补 `asc`/`desc` 两字段（`round_half(-fAscent)` / `round_half(fDescent)`，`model` 改为二者相加）；新增 **`sk_textlayout_line_box(para, idx, leading, family, size, bold, italic, &asc, &desc, &left, &width)`** —— 有行盒时按**基线步长**反推拆分（`stride = (n>1) ? (lm[n-1].fBaseline - lm[0].fBaseline)/(n-1) : Paragraph::getHeight()`、`asc = fBaseline - idx*stride - leading`、`desc = stride - leading - asc`），**负 leading 改用 AIR 面度量**（Skia 把 `StrutStyle::leading < 0` 钳成 0 并折进盒高，实测拆分漂移到 12.6/2.4），**空段落回退到默认格式的 AIR 面度量**（空字段的幽灵行）。
+  - `src/runtime.ts`：`sk_textlayout_line_box` 的 `extern` 声明 + **Skia / 无 Skia 两处内联桩同步**（无 Skia 时全 `(void)` 返回 0）。
+  - `src/symbols.ts`：新增 `TextLineMetrics` 类（六个 `number` 字段 + 六参 ctor + `superClass: 'Object'`；typedef/struct/vtable/props 表与 TextField vtable 槽由通用机制自动发射），`TextField.methods` 加 `getLineMetrics(index:int) -> TextLineMetrics`。
+  - `src/emit.ts`：`TextField_getLineMetrics`（`as_tf_line_table` 取行数 → 越界 `RangeError_new(#2006)`；`lead` 取自 `defaultTextFormat` 且**不钳位**；`x = 2.0 + left` 再按**逐行**加对齐偏移（`inner = _fieldWidth - 4.0`，`a==2` 居中 / `a==1` 右对齐；**换行字段交给 Skia 自己对齐**故加守卫）；`return TextLineMetrics_new(x, w, asc + desc + lead, asc, desc, lead)`）+ `TextLineMetrics_ctor`/`_new`（GC 堆分配）。**顺带修** `TextField.textHeight`/`textWidth` 的空字段口径：此前空文本分别返回 15 / **−FLT_MAX**（`as_skia_textlayout_height` 给 strut 盒、`getLineMetrics` 给 0 行），现在两条构建路径都返回 0，与 AIR 的 `th=0 tw=0` 一致。
+  - **对齐用「逐行」而非画家的「整块」**：`getLineMetrics.x` 走 `as_tf_align_index` + **本行**宽度；painter 仍用 `as_tf_align_dx`（按最宽行整块平移）—— 后者是**渲染侧**的既有偏差（多行居中时短行偏 ~14px），单独登记（见下），不污染行度量。
+
+- **验收**：新增 `examples/textline.as`（40+ 条 `check()`：ctor 六参顺序与可写、空字段 1 行 / `th=0` / `tw=0`、越界与负索引 `#2006`、两行 `height = asc + desc + lead`、leading 逐行计入、负 leading 折进高度、左侧 2px 内边距、重复调用一致；**字体度量侧用 `if (l0.ascent > 0)` 分支** ⇒ 默认**无 Skia** 回归与链 Skia 的构建**都通过**），输出 `textline: all assertions passed; lines=2 h=15 lead4h=19`（Skia）/ `lines=2 h=0 lead4h=4`（纯 C 桩）。
+- `test/unit/display.ts` 新增 `unit: display/LineMetrics`（**27 条源级钉子**，全部对真实生成码 `temp/tlpins/tl.c` 复核）：符号面（六字段 / 六参 ctor / 返回类型）、越界 `#2006`、`lead` 取自 `defaultTextFormat` 且**函数体内无钳位**（按函数体切片核对，避免与 `textHeight` 纯 C 分支的钳位混淆）、line_box 实参、`x = 2.0 + left`、**逐行**对齐（且体内**不出现** `as_tf_align_dx`）、换行守卫、`TextLineMetrics_new` 实参顺序、ctor 赋值顺序、`gc_alloc(GCT_CLASS)`、vtable/props/动态 shim 三条、glue 的签名 / 空字段回退 / 步长拆分 / 负 leading 分支 / left-width 输出、runtime 的 extern 与**两处**桩、`textHeight`/`textWidth` 空字段守卫、示例的 `#2006` / 逐行 leading / 负 leading / 无 Skia 分支。
+- **Skia 侧逐行对照**：`Lead7Aot` vs `lead7-adl.txt` **8/8 行完全一致**；`Align6Aot` vs `align6-adl.txt` 居中 89.2/74.8（Δ0.2）、右对齐 176.4/147.59（Δ0.4/0.09）、justify 2/2、wrap60 居中 4.796（Δ0.2）；`Metrics6Aot` vs `metric6-adl.txt` 的构造器 / `#2006` / 空字段（`12/3/0/h15/w0/x2`）全对，余差仅为字体前进 ≤0.01px（`21.6 vs 21.5`、`36.01 vs 36`）、`_sans` 行高、Monaco 20px 行高、富文本两处、wrap60 软换行断点 —— 均属已登记的「设备字体表 / 半像素取整」家族（见下）。
+- 全量 `npm test` **206 passed / 0 failed**（较阶段一百零二的 204 增 2：新示例 `examples/textline.as` + 新单测组 `unit: display/LineMetrics`）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.76 + 新 bullet（含已知未对齐项）+ 示例清单条目（并把「字体度量（阶段九十四·二十）无 `examples/` 单元」一条改为**已有**）；`package.json` v0.4.75 → **v0.4.76**。
+
+**遗留表**：**移出 1 行**（`TextField.getLineMetrics` 未实现），**新登记 6 行**（富文本 run 空隙样式；混合字号行盒整段统一；painter 多行**整块**对齐；`TextFormat` 字段/ctor 子集；`null` 实参发射非法 C；文档指向的 Skia 示例清单已不能构建）⇒ **76 项**（9 部分完成 / 66 未开始 / 1 暂缓；71 − 1 + 6，按表内实际行数复核）。
+
+---
+
+### 阶段一百零四：Stage3D **按帧合批**——干掉逐 `drawTriangles` 的 GPU 往返（目标 v0.4.77）
+
+> **起因（用户报障）**：`examples/air-starling-demo` 打开 Starling 自带的 fps 监控（`Starling.showStats`，绿色 stats box）后 **CPU 22% → 44.3%**，同一台机器上 Benchmark 场景的收敛峰值对象数从 ~42800 掉到 ~36700（**−14%**）。问题：是文本渲染费 CPU，还是别的？
+
+- **adl 侧不可达**：`showStats` 是 Starling 的内部开关（`StatsDisplay` + `BitmapFont.MINI`），AIR `adl` 里同样可开，但**本阶段的判据是「我们自己的后端把 Starling 的一帧做了什么放大」**，故全程用 AOT 产物自比（开/关两条曲线），不涉 `adl` 语义。
+- **实测（`temp/fpsstats/`）**：
+  - **文本渲染被排除**：两份 `sample` 火焰里 `sk_textlayout`/`BitmapFont`/`TrueType`/`uploadFromBitmapData`/`drawText`/`Glyph` 采样**全为 0** —— box 每 0.5 s（`UPDATE_INTERVAL`）才重排一次文本，逐帧只多 2 个 `TextField` + 1 个 `Quad` 的 `addMesh`。
+  - **「重复上传场景大顶点缓冲」假说也被否**：给 `s3d_draw` 加 `verts/draw` 探针后，等对象数（≈32.5k）下每帧顶点总流量两路**几乎相同**（OFF `4.16×51758 = 215k`、ON `5.80×37265 = 216k` verts/帧）。
+  - **真差异是 draw 数 × 每条 draw 的 GPU 往返**（等对象数 ≈32.5k）：draw/帧 **4.16 → 5.80**、`wait/draw` **0.48 → 0.42 ms**、每帧阻塞 **2.00 → 2.44 ms**；`ASC_S3D_STATS` 的 `cpu=0.01ms` 两路相同，而 `gpu=0.04ms/draw` 远小于 `wait≈0.5ms/draw` ⇒ 那 0.5 ms 是**纯往返延迟**（CPU/GPU 被 `waitUntilCompleted` 串行化），不是 GPU 吞吐。
+  - **每帧 CPU 成本曲线**（`run_cpu_per_frame.py`，用 `ps -o time=` 逐 0.2 s 采样、阻塞不计入）：OFF ≈ **2.1 ms 基础 + 0.17 µs/对象**（管线 CPU 受限）；ON 同对象数下高出 ~100 µs@2.5k → ~1000 µs@27.5k，即**箱子让每对象成本升 15~20%**。
+  - **Starling 侧机制**：`StatsDisplay.render()` 每帧 `painter.excludeFromCache(this)` + `finishMeshBatch()`。`excludeFromCache` 沿祖先链把 `_tokenFrameID` 置 `0xffffffff`（`DisplayObject.as:678`），于是 `DisplayObjectContainer.render()` 里「上一帧 token 未变 → 整棵子树 `drawFromCache()` 一次 `addMesh` 回放」的快路径对箱子失效 ⇒ 箱子必须**每帧 live 重批**，`finishMeshBatch()` 又打断批次 ⇒ **+1.6 draw/帧**。
+  - **本后端把每 draw 成本放大 ~5 倍**：`s3d_draw` 原来**每条 `drawTriangles` 都新建 `MTLCommandBuffer` → `commit` → `waitUntilCompleted`**，且每条 draw 新建一个 render pass ⇒ CPU/GPU 全串行；AIR 的 `drawTriangles` 是同帧合批提交，多几条 draw 的边际成本远小于此。
+- **实现（按帧合批）**：
+  - `vendor/stage3d_glue.mm`：`S3DContext` 新增 `batch`（一条**跨整帧**的 `MTLCommandBuffer`）。`s3d_draw` 首条 draw 时 `[[c->queue commandBuffer] retain]` 开批（+1 由 flush 释放），后续每条 draw 只**追加**一个 render pass/encoder（逐 draw 的清屏/加载语义、深度模板附加、管线/绑定逻辑**一字未改**），**不再 commit/wait**。新增 **`s3d_flush(ctx)`**：提交并 `waitUntilCompleted`（每帧**唯一**同步点，也是 `ASC_S3D_STATS` 里 `wait=/gpu=` 的记账点）＋ **`s3d_flush_all()`**（遍历 live-context 注册表）。
+  - **为什么推迟等待是安全的**（已写进注释）：所有上传（`newBufferWithBytes`/`newTextureWithDescriptor`）都是**新建对象**而非就地改写，且 **command buffer 会 retain 它引用过的每个资源直到完成** ⇒ 帧内释放 context 自己的 +1 不会提前释放 GPU 还在读的内存；pass 之间的读写冒险由 Metal 在同一条 command buffer 内自动插入屏障（mask/stencil、render-to-texture 的「写后采样」因此仍然正确）。
+  - `s3d_flush` 的**调用点**：`s3d_readback`/`s3d_readback_render`（CPU 要读像素）、`s3d_resize`/`s3d_destroy`（要换/销毁目标）；生成 C 侧在 `Context3D_present`（`as_s3d_flush`，保 AIR「present 返回即完成」契约）与 **`ASC_window_render` 开头**（`as_s3d_flush_all`，Skia 开始合成渲染目标**之前**）——后者是关键：无论 draw 是从 `ENTER_FRAME`、鼠标回调还是定时器发出的，合成器看到的都是**GPU 写已完成**的目标，和旧的逐 draw 等待等价。
+  - `src/runtime.ts`：`as_s3d_flush`/`as_s3d_flush_all` 包装（纯 C 构建编译为空）；`src/emit.ts`：两处调用点。
+  - `vendor/stage3d_webgl.cc`：补 **`s3d_flush`/`s3d_flush_all` = `glFlush()`**，保持两端 `s3d_*` ABI 一致（GL 本来就没有逐 draw 等待——`glDrawElements` 只入队，读回/上屏各自隐含同步）。
+- **验收**：
+  - **容量**：Benchmark 峰值对象数（`ASC_FRAME_STATS=1` + `bench-auto`，各跑两轮）ON/OFF 由 **36752 / 42832（−14.2%）** 变成 **55600 / 59408** 与 **55376 / 58352**（**−6.4% / −5.0%**，两轮极差 ≤1.8%）；即**修掉了约六成的差距**。
+  - **等对象数逐点对照**（`BENCH obj=` 曲线插值）：两路每帧 fps 差落在 ramp 控制器噪声内（\|Δ\| ≤ 0.3 ms/帧，无系统性缺口）。
+  - **探针**：`draws/batch` **7.0（OFF）/ 9.0（ON）**（合批生效）、`wait` **0.91~0.93 ms/帧**（原为 0.48 ms × 7 ≈ **3.5 ms/帧**）、`gpu` **0.34 ms/帧**（整帧 GPU），`cpu` 仍 0.01 ms/draw。
+  - **回归**：`node test.ts` **206 passed / 0 failed**；12 个场景全量扫一遍（`temp/hidpi/sweep_aot.py`）全部存活且画面正确；重点路径按图核验：**Filters 的 Switch Filter**（`aot_filters.py`，Identity→Blur→Glow，render-to-texture 多 pass + 写后采样）正常、**Sprite3D**（3D 立方体六面纹理）正常、**Benchmark**（对象隧道 + `draw calls`/120 fps 读数）正常、**RenderTexture/Masks/TextFields** 正常。
+  - **踩坑（顺带修）**：`temp/hidpi/rebuild.sh` 已过期（缺 `-liconv`），而 **`ld` 失败会删掉输出文件**——探针轮曾把 `examples/air-starling-demo/Starling-Demo` 弄没，已用原版 `.o` + `-liconv` 重链恢复；本轮改走官方路径 `node src/index.ts --air-app examples/air-starling-demo/Demo-app.xml --main-class Demo` 全量重建。
+- **已知残留（已登记遗留表）**：① 尾差 6.4% 主要来自 **jitter**（ON 侧 `p99` 20~22 ms vs OFF 11.6 ms，ramp 控制器因瞬时抖动提前停止加对象），而**整帧 GPU 只占 0.34 ms / 8.33 ms（4%）** ⇒ 把逐 draw 的 render pass 并成「每帧一个 pass」的收益上限仅 ~0.2 ms，故**不做**；② `wait 0.93 ms` 里约 **0.6 ms 是每帧一次的提交往返延迟**，它存在的唯一理由是 **Skia 的 `g_queue` 与 Stage3D 自己的 `newCommandQueue` 是两条队列**——若共用 `metal_glue.mm` 那条进程级 `g_queue`，Metal 的「同队列按提交序执行 + 跨 command buffer 冒险跟踪」即可免掉这次等待（≈7% 帧预算），属跨模块架构改动，另立一行。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.76 → v0.4.77 + 新 bullet；`package.json` v0.4.76 → **v0.4.77**。
+
+**遗留表**：**新登记 1 行**（Stage3D 与 Skia 共用 command queue 可省掉每帧一次提交往返）⇒ **76 项**（9 部分完成 / 66 未开始 / 1 暂缓）。
+
+---
+
+### 阶段一百零五：parser 两处硬缺陷——包内数字元数据**死循环** + `at()` 只比 value **不比 kind**（目标 v0.4.78）✅ 已完成
+
+> **起因**：评估 `talkmed-meeting-desktop-app`（AIR 桌面壳）能否用本编译器构建时，报出两处与语言子集无关的 **parser 硬缺陷** —— 其中一处让工程**入口 `src/Main.as` 解析时永不返回**（CPU 打满、>600 s），即**编译这个工程连第一步都过不去**。两处都是通用缺陷（影响面远超该工程），故单独立阶段修掉（报告：`talkmed-meeting-aot-gap-report-v2.md` §1）。
+
+- **缺陷 1：包体内 `[SWF(...)]` 用不带引号的数字实参 ⇒ 死循环**。触发形态 `package { [SWF(frameRate = 60, backgroundColor = "0x000000")] class A {} }`（`Main.as:105` 即此形）。根因两段：① `parseMetadataIfPresent`（`parser.ts:343`）只收 `str`/`ident` 实参，遇到 `num` 抛 `ParseError` 并**回滚** `pos`；② `parsePackage`（`parser.ts:213`）的 `[` 分支在回滚后**没有任何分支消费这个 `[`**，`while` 原地空转。换 `[SWF(a = "1")]`（字符串值）则正常 —— 这正是此前没被发现的原因。
+- **修法（根因 + 哨兵）**：① 元数据实参改收 `num`（Flash 元数据本来就允许 `[SWF(frameRate = 60)]`），数字值按原始文本记入 `args`；② `parsePackage` 的循环体加**推进哨兵** —— 每轮记 `pos`，分支跑完后若 `pos` 未变即抛带位置的 `ParseError`（`unexpected token '[' in package body`），把「静默挂死」变成「可定位的语法错误」（AGENTS.md §2.5：**永不挂死、永不吞错**；挂死比报错难诊断得多）。
+- **缺陷 2：`at()` 只比 `value` 不比 `kind`**（`parser.ts:80`）。token 的 `value` 不是身份：字符串字面量 `"]"` 的 value 与 `]` 符号**同为 `"]"`** ⇒ `[ "]" ]` 被当成空数组提前闭合（`[ "[" ]` 只是**碰巧**对）。真机命中 `src/com/worlize/websocket/WebSocket.as:178` 的标点分隔符表 `[ "(", ")", …, "[", "]", "?", … ]`（报 `expected identifier but found '?'`）。
+- **修法**：`at()` 按字面量推出**应匹配的 kind** —— 词形态（`function`/`package`/`var`…，本词法器无独立 keyword kind，一律 `ident`）比 `ident`，其余比 `symbol`；非符号字面量（`str`/`num`/`regex`/`eof`）不再可能冒充分隔符。审计过全部 `at(...)`/`expect(...)` 调用点：实参只有符号与标识符两类，无一处依赖旧的宽松比较。
+- **实测（工程闭包 341 文件，逐文件 5 s 硬超时）**：
+  - **修复前**：OK **312** / ERR **28** / **HANG 1**（`src/Main.as`）；其中 ERR 有 2 条是 `_lib_/ActionScript-Lib/...` 的路径漂移 ENOENT（**实质解析失败 26**）。
+  - **修复后**：OK **314** / ERR **27** / **HANG 0**（实质解析失败 **25**；ENOENT 仍 2）。
+  - **逐文件对照（pre-fix parser 副本 vs 修复后，`temp/tkmeet-survey/diff-parsers.ts`）**：仅 **2 处状态变化** —— `src/Main.as` HANG→OK、`com/worlize/websocket/WebSocket.as` ERR→OK；**零处 OK→ERR**（另 2 处为 ENOENT 消息截断差，状态不变）。
+  - 顺带修正报告 v2 的一处**归因错误**：`BigInteger.as` 的失败**不是** E4X `..`（该文件没有 `..`），而是 `y.(y.t++, 0)` 撞上 E4X 过滤谓词分支 `expect('@')`（真缺口是「逗号运算符 + 把 `.(` 当 E4X 过滤」）；真 `..` 命中的是另 4 个文件（`WorkerBase`/`WorkerManager`/`BaseModel`/`JSONEncoder`）。该文件修复前后同状态同文案，故不计入变化。
+- **验收**：`node test.ts` **209 passed / 0 failed**（原 206）。新增回归：`examples/swf-metadata.as`（端到端：`package {}` 体内数字 `[SWF]` 元数据 + 标点字符串表逐项断言，**修复前该示例会挂死**）、`test/unit/parser.ts`（`parser/MetadataBrackets` 5 条 + `parser/SymbolVsString` 8 条 AST 结构钉）、`test/unit/diagnostics.ts` 新增哨兵负例（`Parse error at 1:11: unexpected token '[' in package body`）。
+- **文档同步**：`README-CN.md` 版本号 v0.4.77 → v0.4.78 + 新 bullet；`package.json` v0.4.77 → **v0.4.78**。
+- **遗留表**：**无移出、无新登记**（两处缺陷此前未入表；既有行「`[SWF(width,height,backgroundColor)]` 元数据被解析后**丢弃**」是**另一条**欠账 —— 本阶段只让数字实参**可解析**，元数据仍按原样丢弃，`stage.stageWidth/Height` 的保真问题不动）。⇒ **76 项**（9 部分完成 / 66 未开始 / 1 暂缓）。
+
+---
+
+### 阶段一百零六：talkmed-meeting 语言层缺口 13 项落地 + AIR 值日志对照（目标 v0.4.79）✅ 已完成
+
+**起因**：`talkmed-meeting-aot-gap-report-v2.md` §2 列出 **13 项 AIR 合法、我们拒绝**的语言层缺口（逐项都用 `mxmlc 51.4.1` 验证过合法性），外加评估途中命中的第 14 项（类体裸语句）。本阶段一次落地，并给这批特性建一座 **AIR 值日志裁判台**。
+
+- **落地内容（14 项）**：`??`（优先级 0、短路、左侧仅在必要时提升为装箱临时量）；E4X 后代轴 `x..name`/`x..*`（新增 `Descendants` 节点 + `as_xml_descendants`/`as_xml_list_descendants`，前序、**不含自身**）；E4X XML 字面量 `<a b="1">…</a>`（lexer 递归扫描：name-stack 配平、注释/CDATA/PI/属性、`{expr}` 插值**响亮拒绝**）；`interface I extends A, B`（父接口方法**传递合并** + 环检测 + `unknown parent interface` 报错）与 `implements A, B`；多分支 `catch (e:A) … catch (e:B)`（按源码顺序 `as_is` 匹配、命中即清 `as_exception`、都不中则重抛，7 处 `case 'Try'` 遍历点全部改齐）；对象字面量**数字键** `{0:"a"}`；**省略参数类型**（按规范默认 `*`）；类体 `{...}` 静态初始化块 + **类体裸语句**（第 14 项，真机命中 `TweenMax.as:297`；只在**未读任何修饰符**时接受，`public 3;` 仍是精确报错）；类体内 `import`（容忍并忽略）与多余 `;`；**逗号运算符** `(a, b)`（最低优先级；实参/数组/形参等分隔符上下文改走 `parseAssignment`）；`get`/`set` 可作普通标识符。
+- **AIR 裁判台（`temp/langair/`，README 写在本目录）**：同一份 `cases.as`（47 行**值日志**、无断言）在两端各跑一次逐行 `diff` —— AOT 侧 `node src/index.ts … --run`，AIR 侧 `mxmlc` + `adl`（`LangAir.as` 把日志写 `/tmp/langair_adl.txt`；`cases.as` 被拆成每个定义一个文件，因为 AS3 **不允许嵌套类**、且一个包文件只能有一个外部可见定义）。**唯一分歧**：`5.desc-any` 我们 **2** / AIR **4** —— `<items><item id="1">a</item><item id="2">b</item></items>` 的 `..*` 在 AIR 把**文本节点**也计入（2 元素 + 2 文本节点）；同一结构换成自闭合元素（无文本）两端**都是 2**，这条对照把差异**精确隔离到文本节点**上。该裁判台还**推翻**了「类体静态初始化按源码交错」的直觉（`10.order=abBU`：**先**跑静态字段初始化器（声明顺序），**再**按源码顺序跑类体语句块；`10b.block-before-field=cX` 佐证），并逐字确认 `??` 的短路与假值穿透（`0`/`""`/`false` 不回落）、接口 `is`/`as` 的双向判定、多 catch 顺序、数字键、逗号运算符、`for` 多声明量作用域、类体 `import` 等 46 行。
+- **顺带修掉的正确性缺陷（实测发现，非增强）**：① vtable 结构体元数据成员 `name` 与**同名方法槽**重名（`class Both { function name():String … }` 发射 `…->vtable->name(...)` ⇒ `called object type 'const char *' is not a function or function pointer`），元数据统一改名 `cls_name`/`cls_super`/`cls_ifaces`/`cls_props`/`cls_methods`/… （布局不变，`as_vtable_header` 仍按偏移 0 读类名）；② 接口 `is`/`as` 的**静态折叠不健全**（`IA` 引用实指 `Both` 时 `x is IB` 被折成编译期 `false`）——改为运行时 `as_iface_lookup` + 新助手 `as_v_is_iface`，失败的 `as` 给 `{NULL, NULL}` 以保证 `!= null` 判定正确；③ `for (var c:int = 0, c2:int = 9; …)` 的**多声明量**既未进脚本变量表也未提升（`Codegen error: undefined variable 'c'`）——按 AS3「for-init 的 `var` 是函数作用域」（`mxmlc` 实测）决定提升；④ `??` 的操作数被**重复求值**（`(f() ?? 5) == 5` 调用 `f()` 两次）——`sequenceValueExpr` 顶部加 `hoistedAssigns` 幂等哨兵；⑤ `for` 的 init 表达式按**值上下文**（丢弃值）排序，去掉一个 `-Wunused-value`。
+- **词法顺带修复**：**CR 行终止符**。AS3 的行终止符是 LF / CR / CRLF（`mxmlc` 实测能编 CR-only 文件），而我们的 `//` 注释此前只在 LF 结束 ⇒ 工程里 `src/com/vsdevelop/air/download/DownLoadManage.as`（**301 个 CR、0 个 LF**）的第一条 `//` 注释吞掉整个文件后报 `expected '}' but found '<eof>'`。现 `advance()` 认 CR 且把 CRLF 记为**一次**换行（否则 Windows 行尾的源文件行号会翻倍），注释循环认两种终止符；回归钉在 `test/unit/lexer.ts` 的 `lexer/LineTerminators`（9 条）——**刻意不做成 `examples/*.as`**：被测属性是**输入字节**的行尾形态，签入的示例文件可能被编辑器/VCS 规范化而让回归变成空转。
+- **实测**：`node test.ts` **211 passed / 0 failed**（新增 `examples/lang-superset.as` 端到端断言示例 + 上述单测组）。工程闭包（`closure3.txt`，**709 文件**）逐文件解析 **705 OK / 4 ERR / 0 HANG**（本轮前 703/6；`TweenMax.as` 与 `DownLoadManage.as` 转 OK，**零回归**）；余 4 条 = 2 条一般 E4X 过滤谓词（`JSONEncoder.as:279`、`BigInteger.as:526`）+ 2 条源码路径漂移 ENOENT（`_lib_/ActionScript-Lib/...`）。整闭包 codegen 已推进到新墙 `unknown superclass 'mheader' of 'cn_edoctor_view_meeting_HeaderView'` —— `mheader` **不在工程任何 `.as` 里**，它是 `lib/skin.swc` 的 **SWF 库符号**（catalog `<script name="mheader">`，依赖 `flash.text:TextField`）⇒ 属**结构性**（SWC 库符号作基类）欠账，不是语言层。
+- **残留（已登记进报告，均不属本阶段 13 项）**：`..*` 不计文本节点；一般 E4X 过滤谓词 `.(<expr>)`（只支持 `.(@attr ==/!= value)` 形态）；**省略返回类型仍按 `void`**（规范是 `*`，但改成 `*` 会把今天**响亮的 C 层错误**变成静默 UB，且 709 文件里对「省略返回类型 + 有值 `return`」的依赖实测 **0 处**）；非 `void` 函数的**落空路径**没有默认返回（既有 UB / `-Wreturn-type`，8 处近同发射点）。
+- **文档同步**：`README-CN.md` 版本 v0.4.78 → **v0.4.79**（支持子集表补 `??`/逗号/后代轴/XML 字面量/多 catch/接口多继承/类体语句/省略参数类型/`get`·`set` 标识符/数字键，新增阶段 bullet）；`package.json` v0.4.78 → **v0.4.79**。
+- **遗留表**：**移出 1 行**（`set`/`get` 作标识符被拒 —— 本阶段已落地）、**改写 1 行**（`Proxy.getDescendants` 不可达：`..` 语法已落地，剩下的是「`..` 作用于 Proxy 接收者」的分派，今日是**响亮** `CodegenError("'..' requires an XML or XMLList value")`）、**新登记 0 行**。⇒ **75 项**（9 部分完成 / 65 未开始 / 1 暂缓）。
+
+---
+
+### 阶段一百零七：`--air-app` 描述符读取器**剥 XML 注释**（目标 v0.4.80）✅ 已完成
+
+**起因**：为 Stage3D / 增强 E6「原生着色器直通」建 AIR 参照基线时，给 `examples/away3d-core` 写了 adl 启动脚本，并把描述符**落盘**到 app 根 —— `as-aot --air-app` 读的是**磁盘路径**，且它把描述符所在目录当作 app root（扫 `<描述符目录>/src`、在同目录写 `<filename>.build.json`）。落盘描述符里写了说明注释，随即撞上：`parseAirApp`（`src/air-app.ts`）用**纯正则**提字段、**不剥 XML 注释**，注释里出现的 `<filename>`/`<content>` 字面被当成活标签读走，解析结果是垃圾（`filename` = 注释残文）。
+
+- **可达性（非假想）**：AIR SDK 自带的 `templates/air/descriptor-template.xml` 正是**把整块标签注释掉**的风格 —— `<title>`/`<visible>`/`<width>`/`<height>`/`<renderMode>`/`<depthAndStencil>`/`<name>` 等 **7+ 个 `parseAirApp` 会读的标签**都写在注释里（`<!-- <width></width> -->`）。即：**照官方模板建的 AIR app，喂给 `as-aot --air-app` 会解析错**（本项目自有的 `Demo-app.xml`/`shmup-stage3d-app.xml` 不中招，因为它们的注释里没写标签名 —— 这正是该缺陷此前未被发现的原因）。
+- **失败形态（两态实测）**：① **模板原样**（width/height 只在注释里）⇒ 注释里的空 `<width>` 命中正则 ⇒ `widthStr = ""` ⇒ `parseInt` 得 `NaN` ⇒ 抛 `AirAppError: air-app.xml <initialWindow> width/height must be positive integers` —— **响亮，但归因错误**（真正的问题是「读到了注释」）；② **注释的备选写在活值之前**（`<!-- <filename>Commented.swf</filename> --><filename>live-demo</filename>`）⇒ 取到注释里的值 ⇒ `filename`/`content` 变 `Commented.swf`、`visible` 变 `""`（→ `true`，而活值是 `false`）—— **静默取错值**。证据：`temp/away3d/evidence-prefix-comments.txt`（对钉住的输入跑**修复前**的提取逻辑）。
+- **修法（根因，一处）**：`parseAirApp` 在读任何元素之前先剥注释（`xml.replace(/<!--[\s\S]*?-->/g, '')`），其后的 `childText`、`<initialWindow>` 提取与 `parseEmbedFonts` 一律改用剥离后的文档。XML 注释不携带描述符数据 ⇒ **无注释的描述符解析结果逐字不变**。
+- **验收**：`node test.ts` **212 passed / 0 failed**；新增 `test/unit/build.ts` 的 `air-app/DescriptorComments`（**9 条**，照 SDK 模板形态：注释在前/活值在后 7 条 + 「无活 `<title>` 回落 `<filename>`」1 条 + 「width/height 全被注释 ⇒ 回落 800x600 默认值」1 条）。
+- **文档同步**：`README-CN.md` 版本号 v0.4.79 → **v0.4.80** + 新 bullet；`package.json` v0.4.79 → **v0.4.80**。
+- **遗留表**：**无移出、无新登记**（该缺陷此前未入表）⇒ **75 项**（9 部分完成 / 65 未开始 / 1 暂缓）。
+- **附带产出（不入库）**：`examples/away3d-core/` 的 adl 参照 harness（`build-and-run.sh` + 落盘的 `Basic_SkyBox-app.xml`）—— 该目录整体在 `.gitignore`（与 `url-test`/`air-starling-demo` 同类：本地只读验收克隆），故脚本与描述符均不入库；同时已加入 `test/examples.ts` 的 `SKIP_DIRS`（否则套件会把 478 个 away3d 源文件当一个 dir unit 编译）。
+
+---
+
+### 阶段一百零八：away3d-core 语言层收口 —— 类体多声明符 `var` + E4X 计算名（目标 v0.4.81）✅ 已完成
+
+**起因**：AOT 试编 `examples/away3d-core/Basic_SkyBox-app.xml`（**479 个 `.as`**，阶段一百零七 刚建好的 adl 参照基线）。首次编译就报 `Parse error at 982:44: expected identifier but found '['`，而报错**没有文件名**（多源编译），故先写 `temp/away3d-survey/parse_all.ts` 逐文件解析全树、按消息归组：**475 OK / 4 ERR / 0 HANG**，只有**2 类**语法缺口（均在 2 个类），且都是合法 AS3 被我们**硬拒绝**。
+
+- **缺口①（类体多声明符字段）**：`private var _ambientR:Number = 0, _ambientG:Number = 0, _ambientB:Number = 0;` —— 命中 `materials/methods/BasicAmbientMethod.as:24`、`BasicDiffuseMethod.as:26`（**4 个声明符**）、`BasicSpecularMethod.as:27`，共 **3 处 / 10 个声明符**。同一个语法在**函数体**里全树有 **52 处**（`var w1:Number = qa.w, x1:Number = qa.x, …`）且早已支持 —— 只有**类体**分支没写逗号循环。修法：`parser.ts` 的类成员 `var` 分支改成 `parseVarDeclarator()` 循环，**一个声明符一个 `Field` 成员**（共享语句的可见性/`static`/`const`，各自带自己的类型与初始化器；`const` 同理）。
+- **缺口②（E4X 计算名，两轴）**：`loaders/parsers/DAEParser.as:982` 的 `name? element.ns::[name] : element.children()` 与 `:1046` 的 `parseInt(element.@[name], 10)` —— DAE/COLLADA 解析的惯用法。`ns::[expr]` 与 `@[expr]` 此前都是 `expected identifier but found '['`。新增 AST 节点 **`E4xName{object, index, attr}`**（`attr=false` 孩子轴 / `attr=true` 属性轴）；`ns` 限定词按本子集「自定义命名空间编译期透明」的**既有约定折叠丢弃**（与 `ns::member` 一致：`expr.kind==='Member'` 时取 `expr.object`，裸限定词则 `Var('this')`）。生成期按接收者分派：xml/xmllist 的孩子轴 → `as_xml_children`/`as_xml_list_children`（结果 `XMLList`）、属性轴 → `as_xml_attr`/`as_xml_list_attr`（结果 `String`）；Proxy / 动态对象的属性轴 → `as_dyn_get`；其余接收者**响亮** `CodegenError`（不 `fallback` 到错语义，§2.5）。
+- **语义以 `adl` 为准（`temp/nsbracket/`，20 行值日志两端对照）**：`ns::` **要求命名空间匹配**（无前缀的孩子 + 外来 ns 得 **0**，`ns::["nope"]` 得 0）；`x[name]`（无限定）**不等于** `x.ns::[name]`；`ns::["other"].length()=1`、深链 `deep.ns::[g].ns::["leaf"].length()=2`、`for-each` 得 `"12"`；`@[expr]` **等价于** `@字面量`（`@[at]=7`、`@["kind"]="t"`、`@["nope"]=""`、`@id==@["id"]`）。mxmlc 两形态都接受。
+- **探针连带暴露的两个真缺口（本轮一并修）**：
+  - **③ 词法：多行 XML 字面量根本过不了词法**。`scanXmlLiteral` 只跳过**开标签之后**的文本，兄弟元素之间的文本（`</a>` 后面的换行与缩进）没跳；于是缩进过的字面量扫描失败、回退成 `<` 符号，下一个闭标签的 `/` 被当作**正则起点** ⇒ `Lex error at L:C: unterminated regular expression`——报错指向一个**完全合法**的字面量。现开/闭标签两个分支后统一调 `skipContent()`。
+  - **④ 运行时：XML 节点名带着前缀，孩子轴按全名比对**。节点存的是 `n:item`，而 `as_xml_children` 是 `strcmp(c->name, "item")` ⇒ `ns::[expr]` 在**真实带命名空间的 XML**（正是 DAEParser 的场景）上恒返回**空表**（修前实测 `.length()=0`，`adl` 为 **2**）。若只修 parser，这个「修好的」调用在真 DAE 文件上永远返回空——**空转的修复**。现所有比对点走 `as_xml_local()`（取最后一个 `:` 之后），**存储仍保留前缀**以便 `toString()` 逐字回写 `<n:item>`；`localName()` 随之报 `item`（与 AIR 一致）。
+- **验收**：`node test.ts` **217 passed / 0 failed**（新增 5 个用例）。新增示例 `examples/field-declarators.as`（多声明符字段/常量的**独立槽位**、静态初始化顺序 `derived = base * 2`）与 `examples/e4x-name.as`（按 adl 值日志逐条断言两轴，含深链与 `@[nope]` 空串）；新增单测组 `test/unit/lexer.ts` 的 **`lexer/XmlLiteral`（10 条**：美化多行字面量逐字完整 / 兄弟间文本 / 跨行自闭合 / 前缀属性名 / `<` 与 `Vector.<int>` 不被吞 / `{expr}` 仍响亮拒绝），`test/unit/parser.ts` 的 **`parser/ClassFieldDeclarators`（8 条**：一语句 N 成员、各自类型与初始化器、共享修饰符、`const` 多常量、无类型声明者 `type===null`、单声明符形态不变、类体裸语句仍是 `StaticInit`）与 **`parser/E4xComputedName`（8 条**：两轴的 AST 形状、限定词折叠到 `element`、裸限定词→`this`、`.@name`/`.ns::name`/`x[e]` **三个旧形态逐字不变**），`test/unit/diagnostics.ts` 两条**负例文案**钉（`'@[...]' attribute access on non-XML type int` 与 `E4X computed child access on non-XML type string`，均带 `行:列`）。全树**逐文件重扫 479/479 OK / 0 ERR / 0 HANG**（修前 475/4）。
+- **下一道墙（本轮只报明、未改）**：`Codegen error at 60:3: unsupported Vector element type: class` —— `library/AssetLibrary.as:60` 的 `enableParsers(parserClasses:Vector.<Class>)`（全树 **7 处**）。属**类型模型**面（`vectorCName` 只认具体元素类型含 `*`）而非语言层，已入遗留表。
+- **文档同步**：`README-CN.md` 版本 v0.4.80 → **v0.4.81**（支持子集表补「类体一行多字段」与「E4X 计算名两轴」+ 新 bullet）；`package.json` v0.4.80 → **v0.4.81**。
+- **遗留表**：**新登记 4 行**（`Vector.<Class>` 元素类型不支持 = codegen 首墙；E4X 命名空间未建模（孩子轴按本地名匹配 + `Namespace` 是占位）；XMLList 的 `@attr` 标量上下文给首值而 AIR 给拼接串；类体无类型字段按 `int` 而 AIR 是 `*`），**移出 0 行** ⇒ **79 项**（9 部分完成 / 69 未开始 / 1 暂缓）。
+- **附带产出（不入库）**：`temp/away3d-survey/parse_all.ts`（全树逐文件解析分组）与 `temp/nsbracket/`（adl 值日志探针 + `run_adl.sh`）。另修正 `test/examples.ts` 里 `SKIP_DIRS` 的**过时注释**（它还写着「away3d 的首墙是 `Vector.<T>` 泛型」——泛型早已支持，现墙是 `Vector.<Class>`）。
+
+---
+
+### 阶段一百零九：`Vector.<T>` 类型模型收口 —— `Vector.<Class>`/`<Dictionary>` 元素类型 + **转换 vs 构造**（目标 v0.4.82）✅ 已完成
+
+**起因**：清掉阶段一百零八 遗留表里登记的 **codegen 首墙** —— `library/AssetLibrary.as:60` 的 `enableParsers(parserClasses:Vector.<Class>)`（away3d 全树 **7 处**，另含 `AssetLibraryBundle`/`AssetLoader`/`Loader3D` 的同名方法、`misc/SingleFileLoader.as` 的 `_parsers` 静态字段、`parsers/Parsers.as` 的 `ALL_BUNDLED` 常量）。
+
+- **墙① 元素类型 `class`**：`CodegenError: unsupported Vector element type: class`（`vectorCName` 的 `default`）。修法不是新增 C 类型——`Class` 在类型模型里**已经是** `as_class*`（`symbols.ts` 的 `case 'Class' → {kind:'class'}`），GC 也早已把 `class` 当 `ptr`（`captureMarkKind`/`gc_mark_value`/`boxExpr`/`unboxAny`/`push_all` 全有分支）。真正缺的是**两处判定**：`vectorCName('class') → 'class'`、`vectorElemIsPtr` 把 `class` 计入（元素槽是可持 GC 指针的字段 ⇒ `GCT_PTR_ARRAY` + 写屏障），并补 `vectorElemReflectName('class') → 'Class'`。
+- **墙② 元素类型 `dict`**：越过 ① 后立刻是 `unsupported Vector element type: dict`（`Vector.<Dictionary>`，away3d **2 处**）。同理补 `vectorCName`/`vectorElemIsPtr` 两个分支（`flash.utils::Dictionary` 的反射名**早已**在 `vectorElemReflectName` 里）。
+- **墙③ 默认参数值里的类静态常量（真缺陷，非本项）**：越过 ② 后是 `Codegen error at 788:3: undefined variable 'RADIUS' at top level` —— away3d `tools/commands/SphereMaker.as:42` 的 `radiusMode:int = RADIUS`。根因：**绑定方法 thunk** 由 `emitFunctionValues` 在**类体外**发射，`currentClass` 为 null，默认值表达式里的类静态常量无从解析。修法：`emitThunk` 新增 `ownerClass` 参数，在发射期间**重新进入所属类作用域**（free function 仍传 null），三个调用点（bound / superbound / static-method-ref）各传自己的 owner。
+- **墙④ `Vector.<T>(arrayLike)` 的转换语义（真缺陷 + 本阶段核心）**：越过 ③ 后是 `Codegen error at 614:5: cannot convert array to int`（`Parsers.ALL_BUNDLED = Vector.<Class>([...])`）。根因是 parser 把**无 `new`** 的 `Vector.<T>(...)` **desugar 成了同一个 `New` 节点**（`parseVectorCall`），于是 `Vector.<T>([数组])` 被当成「构造器的长度参数」⇒ 数组转 int 报错。**这两种写法在 AIR 里是两个不同的操作**（见下）。新增 AST 节点 **`VectorCoerce{elem, args}`**，parser 不再 desugar；生成期：静态 `Array` 实参 → `as_vector_<k>_from_array`（元素逐个 unbox，重用既有 `push_all` 的逐 kind 映射，`class`/`dict` 分支已齐）；其余实参 → 运行时 `as_vector_<k>_coerce_any`。
+- **语义以 `adl` 为准**（`temp/vecconv/`，adl 51.4.1，两个探针共 **24 行**值日志）：`Vector.<int>([1,2,3])` **= len 3 拷贝**；`Vector.<int>(someVector)` **= 逐元素转换**（`Number 1.5 → int 1`）；`Vector.<int>({a:1})` = **len 0**（按 array-like 读 `length`）；`Vector.<int>({length:2, 0:7, 1:8})` = len 2 `[7,8]`；`Vector.<int>(new Sprite())` = **ReferenceError #1069**（`Property length not found on flash.display.Sprite`）；`Vector.<int>(Sprite)`（Class 值）= **len 0**；`Vector.<int>(3)` / `(null)` / `("ab")` = **TypeError #1034**；`Vector.<int>()` = **ArgumentError #1112**；而 `new Vector.<int>(3)` = len 3 填 0、`new Vector.<int>([1,2,3])` = **ArgumentError #2005**。
+- **`coerce_any` 的一个通用分支覆盖全部元素类型**：Array（`tag==6`）直接 `from_array`；否则**按 array-like 协议读 `length` + 数字下标**（`as_dyn_get`）——而 Vector 正好通过**已有的动态钩子**回答 `length`/`i`，所以**任意元素类型的 Vector 都不需要成对特化助手**（避免了 n² 个 pair helper）；非堆指针（Class 值）给空向量；密封类实例走 `as_dyn_get` 的 `#1069`（**与 AIR 同源**）；标量/`null`/`undefined` 给 `#1034`。错误文案逐字对齐（含 `#1112` 的**双空格**与字符串操作数的**引号**）：`Error #1034: Type Coercion failed: cannot convert "ab" to __AS3__.vec.Vector.<String>.`。
+- **顺带收掉同族的分歧**：`new Vector.<T>(x)` 的非数值实参以前是**编译错误**（`convert(array→int)`），AIR 是**运行期** `ArgumentError #2005`（`Error #2005: Parameter 0 is of the incorrect type. Should be type uint.`，含 `1.5→len 1` 的合法档）。现非数值/`*` 实参走 `as_vector_<k>_new_arg_check`：数值盒通过并 `as_v_uint_val` 定长，否则抛 `#2005`。
+- **顺带修正一个建立在错误假设上的示例**：`examples/stage28.as` 原有的 `Vector.<int>(2)`（注释写着「无 new 函数式调用（等价 new）」）在 AIR 上**抛 `#1034`**，断言 `length == 2` 是错的。已改为 `new Vector.<int>(2)` + 新的转换断言（并补 `Vector.<Number>([1,2,3])` 的拷贝与 `Vector.<int>(numVec)` 的逐元素转换）。
+- **验收**：`node test.ts` **222 passed / 0 failed**（阶段一百零八 为 217）。新增示例 `examples/vector-coerce.as`（**40 条**断言：`Vector.<Class>` 的 `[ParserA, ParserB]` + `for each` + `indexOf`、`Vector.<Dictionary>`、Array/Vector/`*`/对象字面量的转换与逐元素转换、`length` 协议、以及 `#1034`/`#1112`/`#2005` 三个错误号**与文案**的逐字比对）；新增单测组 `test/unit/vector.ts` 的 **`vector/Coerce`（20 条**：AST 两形态互不混淆、零参形态可解析、`from_array` 快路径、标量走运行时 `coerce_any`、`#1112` 双空格、`length` 经 `as_dyn_get`、元素 kind 门禁、非堆指针给空向量、`new_arg_check` 与 `new_sized` 分流、`Vector.<Class>`/`Vector.<Dictionary>` 的单态化 + `GCT_PTR_ARRAY` + 反射名）与 `test/unit/reflection.ts` 的 **`reflection/ThunkOwnerScope`（3 条**：绑定方法 thunk 能解析类静态常量（修前**直接抛**）、解析到静态字段槽、free function 仍按顶层解析）。
+- **顺带修掉一个 CI 盲区（真缺陷）**：`test/unit.ts` 的 barrel **漏了 `./unit/vector.ts`** —— 阶段九十八·二 写的三个 vector 组（含 `vector/AnyWriteBarrier` 那批「错了就是 SEGFAULT 而非错值」的写屏障钉子）在 `node test.ts` 里**从未跑过**（只有 `node --test test/unit/*.ts` 会跑到）。补进 barrel 后本轮计数从 219 → **222**（+3）。
+- **下一道墙（本轮只报明、未改）**：`Codegen error at 54:4: setter 'sourceSound' used as a value on interface 'away3d_audio_drivers_ISound3DDriver'` —— 接口 **setter 赋值**（`sound3D.sourceSound = …`）的发射，属另一族（接口成员发射），已记入遗留表。**判据已验**：`node src/index.ts --air-app Basic_SkyBox-app.xml --main-class Basic_SkyBox -o /tmp/away3d-skybox.c` 在 `examples/away3d-core/` 下 **479 sources 解析全过、codegen 一路推到上述接口 setter**（0.7 s），即 `Vector.<Class>` 这道墙**确已越过**。
+- **文档同步**：`README-CN.md` 版本 v0.4.81 → **v0.4.82**（支持子集表补「`Vector.<Class>`/`Vector.<Dictionary>` 元素类型」与「`Vector.<T>(arrayLike)` 转换 vs `new` 构造」+ 新 bullet）；`package.json` v0.4.81 → **v0.4.82**。
+- **遗留表**：**移出 1 行**（`Vector.<Class>` 元素类型不支持 —— 本阶段已落地），**新登记 1 行**（接口 setter 作值赋给成员 —— away3d 下一道墙）⇒ **78 项**（9 部分完成 / 68 未开始 / 1 暂缓）。
+- **附带产出（不入库）**：`temp/vecconv/`（adl 值日志探针 + `run_adl.sh`，四个探针共 24 行）、`temp/defval/d.as`（墙③ 的最小复现）、`temp/vecconv/check.as`（转换矩阵的 AOT 侧逐行对照，17 行全中）。
+
+---
+
+### 阶段一百一十：away3d-core 生成 C 的**编译闭合** —— 8 族 C 错误清零 + **Basic_SkyBox 链接成功**（目标 v0.4.83）✅ 已完成
+
+**起因**：阶段一百零九 让 away3d 全树（479 sources）的 **codegen 全过**（`--dry` 完成），但 `--air-app Basic_SkyBox-app.xml` 的**真正构建**卡在 **20 个 C 编译错误**上。本阶段把 C 编译阶段清零：首次构建 `EXIT=1 / 20 error` → 现在 **`EXIT=0` / 0 error**，`Build successful: examples/away3d-core/Basic_SkyBox`（含 Metal/Skia/SDL2/curl 全链）。
+
+**根因与修法（8 族，全部是共享发射路径的真缺陷，不是 away3d 特例）**：
+
+- **① 接口方法返回类型解析过早**（`symbols.ts` pass 0）：`IPath_vtable` 声明 `getSegmentAt` 返回 `IPathSegment*`，而实现 `SegmentedPathBase_getSegmentAt` 按**值**返回接口结构体 ⇒ `incompatible function pointer types`。根因：pass 0 逐文件**边注册接口名边解析方法签名**，而 AS3 允许**免 import** 引用同包类型；`IPath.as` 排在 `IPathSegment.as` 之前 ⇒ `resolveType('IPathSegment')` 那一刻 `interfaceNames` 还没有它 ⇒ 退化成**未知名对象**（指针）。**方法形参**没事（发射期才解析，那时 `interfaceNames` 已满）—— 正是这种不对称暴露了它。修法：pass 0 拆成**两轮**（先登记全部接口名、再解析签名）。
+- **② 嵌套 Vector 的 typedef 顺序**：`as_vector_vector_Vector3D` 引用了**后定义**的 `as_vector_Vector3D` ⇒ `unknown type name`。原按 `localeCompare` 排序 —— **collation 忽略大小写与 `_`**，`vector_vector_Vector3D` 因此排到了 `Vector3D` 前面。修法：按**嵌套深度**（内层先出）+ 逐字码比较。
+- **③ 接口值 ↔ 类指针的转换（两处）**：㈠ 把**接口结构体值**当指针解引用（`(SubMesh*)(renderable)`、`(SkinnedSubGeometry*)(_once)`、`(SpriteSheetAnimationState*)(this->_activeState)`）⇒ 统一改走 `.obj`；㈡ **接口值的构造**用**静态类名**去指 `&<类>_<接口>_vt`，而 `ISubGeometry(this)` 出现在**不实现该接口**的基类 `SubGeometryBase` 里（实现在子类 `SubGeometry`）⇒ 引用了一个**永远不会发射**的 vtable。修法：**声明了该接口**的类走静态配对，其余一律**运行期 `as_iface_lookup`**（沿对象**真实** vtable 的 ifaces 表按接口名查，与 `as` 同路）。
+- **④ 逻辑赋值（`||=`/`&&=`）的写入目标不是 lvalue（4 族）**：㈠ **静态字段**（`Stage3DManager._instances ||= new Dictionary()`）—— 读侧是 `(Cinit(), field)` 逗号式，不可赋值 ⇒ 守卫与写入都用**裸字段名**、cinit 提到整表达式之前；㈡ **访问器对**（`colorTransform ||= new ColorTransform()`）—— 读侧是 **getter 调用**，不可赋值 ⇒ 写入必须走 **setter**（新增 `Symbols.findSetter` 沿 super 链查，与 `findGetter` 对称 —— 原来只在**本类** `setters` 里找，继承来的 `colorTransform`（声明在基类）直接漏掉）；㈢ **裸标识符访问器**（隐式 `this`）走同一条 setter 路径（本地同名变量仍优先）；㈣ 接口接收者的访问器对走**接口 vtable 的 setter 槽**。
+- **⑤ 赋值表达式的**值**：`as_dyn_set`/`as_any_set` 返回 `void`，却被用在值位置（`a.b = c.d = 5`、`?:` 分支）⇒ 新增 `as_dyn_set_v`/`as_any_set_v`（写入并返回该值），8 个发射点改走 `_v`（语句位置无额外代价）。
+- **⑥ 装箱值的一元 `+/-`**：`-a[i]`（`a` 是 `Array`/`*`）发射成 `-as_array_get(...)`（对 `as_value` 结构体取负）⇒ `any` 操作数先 `as_v_num_val` 再取负。
+- **⑦ `new <对象变量>()` 的类指针**：`data:Object` 持有 Class 值时（`SingleFileLoader.parseData` 的 `if (data is Class) data = new data()`）发射成 `(void*)(data)` —— 把**装箱结构体**转成指针 ⇒ `dynNewCode` 改收 `{code,type}`，`any` 源先 `as_v_obj_val` 解箱。
+- **⑧ XMLList 下标读的返回类型**：`as_xml_list_get` 原返回 `as_value`（`undefined`），但发射端把 `list[i]` 标为 `xml`（`as_xml_node*`）⇒ 6 处 `passing 'as_value' to parameter of incompatible type 'as_xml_node *'`。修法：助手返回 **`as_xml_node*`**（越界给 null —— E4X 给 `undefined` 且不抛，本子集 XML 槽就是裸节点指针，两者同一表示，已注明）。
+
+**运行期（下一阶段，非本阶段目标）**：headless 构建（`<visible>false</visible>`，渲染一次到 PNG）**链接成功**并跑到第一个不支持点：`Uncaught exception: Error #1009` —— 用 `dladdr` 打在 `as_req_obj` 守卫上定位到 **`away3d_textures_BitmapCubeTexture_testSize`**，根因是 **`[Embed]` 图片资源未实现**（`EnvPosX` 等 6 张 skybox 贴图的 Class 值为 **null** ⇒ `testSize(null)` 解引用）。已登记为新遗留行，**不是** codegen/编译缺陷。
+
+**验收**：
+- 构建：`cd examples/away3d-core && node ../../src/index.ts --air-app Basic_SkyBox-app.xml --main-class Basic_SkyBox` ⇒ **`EXIT=0`**、`Build successful`（首次 20 error → 0）。
+- 回归：`node test.ts` **222 passed / 0 failed**（含 5 条**陈旧钉子**修正，见下）。
+- **顺带修掉 5 条陈旧单测钉子**（均非本阶段引入，但挡住全绿）：① `display.ts` 光标枚举从 **2** 个分支变 **3** 个（新增「Skia 无窗口」分支）⇒ 计数 2→3；② `vector.ts` 的 `as_vec_index_key` 钉子要求 `{ neg = true; p++; }`，实现早已改成 `atof(key)`（负号照认）⇒ 钉子对齐实现；③ `as_vec_hdr` 钉子漏了后来加的 `bool fixed;`；④ `new_sized(3)` 钉子漏了后来的 `fixed` 形参 ⇒ 改 `new_sized(3, false)`；⑤ `platform.ts` 的 NativeWindow ctor 钉子要求 `EventDispatcher_ctor((EventDispatcher*)o);`，而**本会话**给 EventDispatcher 加了 `target` 形参 ⇒ 改 `, NULL`。
+- **临时诊断钩子已全部还原**：清墙期在 4 条 `CodegenError` 文案里加的 `[in ${this.currentClass}]` / `(obj=…, in …)` 后缀全部去掉（`test/unit/diagnostics.ts` 钉着这些文案格式）。
+- **文档同步**：`README-CN.md` 版本 v0.4.82 → **v0.4.83**；`package.json` v0.4.82 → **v0.4.83**。
+- **遗留表**：**移出 1 行**（接口 setter 作值赋给成员 —— 本阶段已落地）、**新登记 2 行**（`[Embed]` 资源未实现 —— Basic_SkyBox 首个运行期失败；接口**访问器作方法调用**只在接口接收者上支持）⇒ **80 项**（逐行重数：9 部分完成 / 70 未开始 / 1 暂缓；上一轮头计数 78 与实际行数差 1，已校正）。
+- **附带产出（不入库）**：`temp/accprobe/a.as`（访问器作方法调用的最小复现）、`examples/away3d-core/Basic_SkyBox.c/.o`（构建产物，与 `build-and-run.sh` 同形）。
+
+---
+
+### 阶段一百一十一：文档所指向的「Skia 离屏」清单**重新可用** + **回归守卫**（目标 v0.4.84）✅ 已完成
+
+**起因**：清遗留表里 2026-10-06（阶段一百零三）登记的那条「文档指向的 `examples/skia-link.build.example.json` 已不能构建任何示例」。
+
+**复核实测：该行已过期** —— `node src/index.ts examples/hello.as --manifest examples/skia-link.build.example.json` ⇒ **`EXIT=0`**（阶段一百一十 给 Skia **无窗口**分支补的 `AS_CURSOR_*` 桩已把它修好）；`stage36/37/38/41/58` 五个 Skia 示例全部编译+链接+运行成功，PNG 逐像素正确（stage36 红矩形 `0xFF0000` 恰 8000px = 100×80 于 (10,10)、白底 12000px = 200×100 其余全部；stage38 文字用 `0x003399` 出 547px 字形；stage41 满屏 `0x112233`、stage58 绿矩形）。**但真正的缺陷仍在**，本阶段收的就是它：
+
+- **① 枚举被复制在 3 个后端分支里（脆弱性本体）**：`AS_CURSOR_ARROW/IBEAM/HAND/BUTTON` 原先分别定义在 `ASC_USE_WINDOW` 分支、Skia 无窗口分支、纯 C 分支。而生成的 C 的 `ASC_cursor_kind_of_name` 在**每一种**构建里都引用它们，所以任一条分支漏一份就整条清单挂掉——这正是 10 月 6 日静默失效的机制（10 个 `use of undeclared identifier 'AS_CURSOR_*'`）。改为**在所有后端分支之外、无条件定义一次**（`src/runtime.ts` 的 `as_gdraw` 之后、`#ifdef ASC_USE_SKIA` 之前），三个分支只保留各自的 `sk_window_set_cursor` 声明/桩。
+- **② 这两条文档清单没有任何回归覆盖（真正的根因）**：`test/examples.ts` 把**每个**示例都用纯 C 构建（不带清单），所以「Skia 离屏」与「Skia 窗口」这两条文档宣传的 define 组合在 CI 里**从未被编译过一次**。新增单元组 **`build/DocumentedLinkSets`**（`test/unit/build.ts`）：用构建层自己的 `loadManifest`/`applyManifest`/`buildCompileSteps` 取出清单**真实**的 `defines` + `include-paths`，把 `examples/hello.as` 生成的 C **各编译一次**；同时钉住两份清单的形态（离屏那份必须**没有** `ASC_USE_WINDOW`/`window_glue.cc`/`SDL2`，窗口那份**必须**有，两者的 glue/库必须跟随 `ASC_USE_WINDOW`），并自证前提（生成的 C 确实引用了 `AS_CURSOR_IBEAM` + `ASC_cursor_kind_of_name`，否则守卫会空转通过）。生成的 C 只看到平坦 `extern` 声明、**不碰任何 Skia 头**，故**无需链接 Skia**（两例合计约 1.4s），不会把 97 MB 静态 Skia 拉进 CI。
+- **③ 文档自身的清单副本已过期**：`docs/zh-cn/skia.md` / `docs/en/skia.md` 里的片段仍写 `skia_glue.c` 与 `include-paths: ["../vendor/skia/include"]`，还留了一段「`build.ts` 待补 `.cc` 驱动」的注释（阶段三十六 就已实装）。改为**只画形态 + 指向清单本体**（单一权威，不再抄一份等着过期），并补一句「这两条清单由 `build/DocumentedLinkSets` 兜底」。
+
+**验收**：
+
+- **离屏端到端（真链 Skia）**：`stage36/37/38` 以 `--manifest examples/skia-link.build.example.json` 重建重跑 ⇒ **3 个 PNG 与改动前逐字节 `cmp` 相同**；**窗口清单**同样可用：`examples/window_click.as` + `examples/window_click.build.example.json` ⇒ `EXIT=0`、`Build successful`。
+- **回归**：`node test.ts` **223 passed / 0 failed**（阶段一百一十 为 222，+1 即新单元组）；`npm run test:unit` **65/65**（阶段一百一十 为 64）。
+- **守卫有效性（变异验证，防「空转通过」）**：临时注释掉 `#define AS_CURSOR_IBEAM  1` ⇒ `build/DocumentedLinkSets` **两条编译检查同时红**，报的正是当年那句 `error: use of undeclared identifier 'AS_CURSOR_IBEAM'`（`temp/unit-linkset/offscreen.c:31626`）；随后还原并复绿。
+- **钉子同步**：`test/unit/display.ts` 原钉「每个后端分支各定义一次 cursor 枚举（`count === 3`）」改为「**恰好定义一次**（`count === 1`）+ 位置在**所有后端分支之前**」——同一意图（每条后端组合都拿得到枚举）在新形态下由更强的两条不变量保证。
+- **文档同步**：`docs/{zh-cn,en}/skia.md` 清单片段改写；`docs/{zh-cn,en}/compile.md` §7 表格后补「离屏那条只链 Skia（无 `window_glue.cc`/`SDL2`）」+ 守卫说明；`README-CN.md`/`package.json` 版本 v0.4.83 → **v0.4.84**。
+- **遗留表**：**移出 1 行**（文档清单已不能构建 —— 本阶段已落地）、**新登记 0 行** ⇒ **79 项**（`部分完成` 9 / `未开始` 69 / `调研完成 · 实现暂缓` 1）。
+- **附带产出（不入库）**：`temp/skiaoff2/`（离屏重建 + PNG + 运行日志）、`temp/unit-linkset/`（守卫生成的 C 与 `.o`，位于 `temp/` 内）。
+
+---
+
+### 阶段一百一十二：`[Embed]` 资源（图片/字节/声音）+ 让 headless `Basic_SkyBox` **真的渲染**（目标 v0.4.85）✅ 已完成
+
+**起因**：清 2026-10-07（阶段一百一十）登记的遗留行「`[Embed]` 的图片/字节资源未实现 ⇒ 嵌入类 Class 值为 null，运行期 `#1009`」——headless `Basic_SkyBox` 的第一个运行期失败点（`away3d_textures_BitmapCubeTexture_testSize`）。
+
+**① `[Embed]` 落地**（新文件 `src/embed.ts` 约 250 行；`ast.ts` 补 `Metadata.named`/`Field.metadata`；`symbols.ts` 补 `embedFieldInits`；`emit.ts` 补 `emitEmbedResources`）。语义全部以 `adl 51.4.1` 实测为准（`temp/embedprobe`…`embedprobe7`，结论落盘 `temp/embedprobe7/adl.txt`）：
+
+- **种类三态**：图片（png/jpg/jpeg/gif/bmp）⇒ `flash.display.Bitmap` 子类（实例的 `bitmapData` 就是解码后的图）；`mimeType="application/octet-stream"` ⇒ `ByteArray` 子类（内容 = 文件字节原样）；`.mp3`/`audio/mpeg` ⇒ `Sound` 子类。**`mimeType` 覆盖扩展名**（adl 实测：png + octet-stream 得 ByteArray）。未知扩展/mimeType **响亮拒绝**并列出支持集（`.txt`/`.svg`/`.wav`/`application/xml` 与 AIR 一样拒绝）。
+- **字节原样内嵌**（原始文件），运行期交 Skia 解码成**直通 ARGB**（复用 SWC 位图的 `BitmapData_adoptEncoded`，无新增解码代码）。opaque 像素与 AIR **逐像素一致**；半透明像素是**实测过的偏差**（AIR 存的是反预乘后的值）。
+- **与 AIR 同形的细节**：0 参构造器（`new C(0,0)` ⇒ `#1063`）、生成类 `isFinal+isDynamic`、同 `(文件, 种类)` **去重为一个类对象**、`source` 相对声明文件而**前导 `/` 相对 source root**（`--air-app` 为 `<appRoot>/src`）。**唯一差异**：类名字符串（AIR 的 `<file>_<ext>$<hash>` 里的 hash 不可复现，我们的 `Embed_<宿主类>_<字段>` 只影响 `getQualifiedClassName()`）。
+- **落地形态**：`[Embed]` 走与 `swc.ts` 相同的「资源展开前置遍」（只产出 AST + 字节，不产 C 文本、不碰构建，§2.8），新类参与正常符号收集/vtable/类注册表；字段初始化在**符号层**注入（不改 AST）。文档：新 `docs/zh-cn/embed.md`。
+- **验收**：新增 `examples/embed.as` + `examples/embed.build.json`（链 Skia + miniaudio，覆盖三种资源、Class 值同一性、去重、`#1063`、解码像素）+ `test/unit/embed.ts`；`Basic_SkyBox` 构建日志 `embed 8 asset(s)`（6 张 JPEG + 2 个 `pbj`，后者用的正是前导 `/` 规则）。⚠️ **该数字已过期**（当时 `src/` 里只有 main 与引擎源码，兄弟 demo 的 `.as` 是后来才加进去的）：现在的同一命令是 **`embed 40 asset(s)`**——我们按「整包编译」把**全 `src/`** 的 `[Embed]` 都收了进来（含其它 demo 的资源，且会存活进产物），是**已知偏差**，见阶段一百二十二 与 [`docs/zh-cn/embed.md`](docs/zh-cn/embed.md) §7。
+
+**② 三个 Class 值同一性真缺陷**（都被 `Cast.bitmapData(Class)` 这条路径逼出来，各自 adl 实测）：重复的 `as_class` 对象（改为 `as_class_reg` 唯一注册表）、`as_v_is_inst` 把 Class 值当实例、`o.constructor` 在 any 值上取类（`as_v_class_of`）。AIR 的判据：`x is Class` 为真而 `x is Bitmap` 为**假**（实例才是 Bitmap）。
+
+**③ `EventDispatcher_dispatchEvent` 无限递归（真缺陷）**：规则由三组 adl 探针定出——派发给**无人接收**的事件**不动** `event.target`；无目标事件保留**主张者**；已被指向的事件在派发期间换目标、之后还原。
+
+**④ `CubeTexture` GPU 支持 + AGAL `<cube>` 采样**：`s3d_upload_cube_texture`（一张 `MTLTextureTypeCube`，六面按 AGAL 顺序 +X,−X,+Y,−Y,+Z,−Z）、AGAL 采样器维度（`texturecube<float>`/`samplerCube` + `.xyz`）、以及对立方体贴图的**vtable 先于字段**识别（`CubeTexture.face0` 与 `Texture.gpu` **同字偏移**，先读 `->gpu` 会把 `BitmapData*` 当 MTLTexture）。
+
+**⑤ 对象→字符串强转对齐 AIR（根因级，一处修复解开一串）**：`as_obj_to_str` 原先返回 **C 类名**且**不派发**虚 `toString()`；而 away3d 的 AGAL 源码正是靠 `ShaderRegisterElement.toString()`（返回 `"vt0"`）**拼接**出来的 ⇒ 汇编器收到 `away3d_materials_compilation_ShaderRegisterElement`，报 `wrong number of operands. found 6 but expected 3`，我们侧再报 `AGAL: bytecode too short for header`。修法：`as_vtable_header` 补 `toString`/`hasOwnProperty` 槽（与既有 vtable 尾部**逐字对齐**，一个读取器同时服务生成类与预置箱 vtable）、`as_obj_to_str` 派发该槽、无覆写者渲染 AIR 的 `[object <本地类名>]`、`as_v_str_val` 的 object 分支同样派发。adl **12 例逐字对照** ✓，新增 `examples/strcoerce.as`。
+
+**⑥ 立方体贴图「上传时机 + mip」双缺陷（本轮最后一道墙 = 白屏的真根因）**：
+
+- **现象**：窗口**纯白**。`ASC_S3D_STATS` 显示 `draws=240/s tri/draw=806`（真的在画）、`ASC_MTL_READBACK` 读出后缓冲 `00000000`、`mtl_draw_texture` 的源纹理全 0 ⇒ 3D 通道画了但**内容为空**；而「纯白」而非「透明」说明**合成/alpha 语义是对的**（`temp/clearprobe` 实测 AIR 尊重 clear 的 alpha ⇒ 我们的预乘合成正确）。
+- **定位**：探针打在 `Context3D_submit` 的立方体分支上 ⇒ 六面 `width=512` 但 **`pixels=NULL`**（该分支要求六面像素齐备才上传 ⇒ 纹理从未绑定）。
+- **根因 A（上传时机）**：away3d 的 `MipmapGenerator.generateMipMaps` 把**同一张临时位图**逐 mip 上传、随后 `dispose()`（`BitmapData_dispose` 置 `pixels=NULL`）。AIR 是**同步**上传所以无妨；我们把 GPU 上传**延迟**到 submit ⇒ 读到 NULL。修法：`CubeTexture_uploadFromBitmapData` 只收 **mip 0** 并把像素**快照**成面自己的 `BitmapData`（写屏障同步）。2D `Texture` 早有一条同样的 eager 上传（Starling 文本框贴图同一原因），立方体这条路当时漏了。
+- **根因 B（选择器）**：立方体的面是 texture **slice**，必须用带 `bytesPerImage` 的 `replaceRegion:…` 变体；原先发的 2D 变体在立方体上**不存在** ⇒ `NSInvalidArgumentException`（`unrecognized selector`）**硬崩**（编译器只给 warning，属于会漏过的类型错误）。
+- **验收**：窗口截图 = **雪山天空盒 + 环境反射铬环**，与 adl 参照同场景同构图（天空采样 (30,35,35) vs adl (33,37,36)）；新增单元组 **`stage3d/texture-upload`**（`test/unit/stage3d.ts`，9 条）把「同步上传 / 只收 mip 0 / 快照 + 写屏障 / 立方体 `bytesPerImage` / 面序」钉在源级（这些不变量进不了 `examples/`：示例套件是纯 C，无 GPU，错了也不会有任何示例变红）。
+
+**验收汇总**：`node test.ts` **226 passed / 0 failed**（阶段一百一十一 为 223；+3 = 新示例 `embed.as`、新示例 `strcoerce.as`、新单元组 `stage3d/texture-upload`）；`Basic_SkyBox`（479 sources，`--air-app`）全链构建 + 窗口渲染 ✓；adl 逐字对照：字符串强转 12/12、dispatchEvent 三组、embed 资源 8 个。
+
+**遗留表**：**移出 1 行**（`[Embed]` 的图片/字节资源未实现 —— 本阶段已落地）、**新登记 5 行**（内置类名不能作 Class 值 / 顶层 `new <any 变量>()` / 用户函数 `main` 与生成 `main` 冲突 / `Texture`/`CubeTexture` 的 mip 1+ 未上传 / 窗口居中用的是 SDL display 0）⇒ **83 项**。
+
+**附带产出（不入库）**：`temp/skybox-aot/`（Basic_SkyBox 构建/运行/截图 harness `shot.py`、`aot-03.png` 渲染验证图、`run13`–`run18` 定位日志）、`temp/strprobe/`、`temp/dispprobe/`、`temp/clearprobe/`、`temp/embedprobe*`。
+
+---
+
+### 阶段一百一十三：AGAL **采样器标志位**（filter/wrap/mip）+ 立方体 **mip 链** —— 铬环反射走样修复（目标 v0.4.86）✅ 已完成
+
+**起因**：`Basic_SkyBox`（v0.4.85 起真的渲染）的**铬环反射**整片呈「细密网纹」——背景雪山从环身透出的高频噪声，而天空盒正常。三条根因缺一不可：
+
+1. **立方体纹理没有 mip 链**：AIR 的 `BitmapCubeTexture` 经 `MipmapGenerator.generateMipMaps` **逐级**上传；我们为绕开「延迟上传读到已 `dispose()` 的像素」只留 level 0（阶段一百一十二）⇒ **被放大的天空盒无恙、被缩小的环面反射走样**（逐像素欠采样）。
+2. **运行时完全忽略 AGAL `tex` 标志位**：away3d 与 Starling **都从不调用** `setSamplerStateAt`（两棵树各 0 命中），只写 `<cube,linear,miplinear>`（`SkyBoxPass`/`BasicSpecularMethod` 等）一类标志位；旧实现的滤/环绕/mip 全凭自定默认值——**恰好**与 away3d 默认路径一致，只是**看着对**（away3d 的 `useSmoothTextures = false` 分支要 `nearest`，会被静默渲染成双线性）。
+3. 前两条**叠加**才成 bug：即便补了 mip 链，采样器若仍停在 `nomip`，环面依旧走样。
+
+**AIR 实测（51.4.1，探针 `temp/sampprobe/`，13 例 × 2 次回读，逐例独立清屏色 + 版本戳/`md5`）**：
+
+| 结论 | 证据 |
+|---|---|
+| **AGAL 标志位被执行** | 同一程序 `<2d,linear,nomip>` vs `<2d,nearest,nomip>`：2×2 纹理放大后中心**灰**（双线性平均）vs **纯色**（单纹素） |
+| **`setSamplerStateAt` 覆盖标志位** | setProgram **之后**调，结果随显式调用 |
+| **两者是「后写者胜」** | **先**调 `setSamplerStateAt`、再 setProgram ⇒ 结果随 **AGAL 标志位** |
+| **`miplinear` 真按 lod 选层** | uv 平铺 T=1/8/16/64 ⇒ lod = log2(每像素纹素数) = −2/1/2/4 ⇒ 采到 level 0/1/2/4 的**专色**（红/绿/蓝/品红），三线性 |
+| `nomip`/显式 `MIPNONE` 不选层 | 同样平铺下仍为 level 0 |
+| **mip 过滤 + 无 mip 链的纹理 ⇒ AIR 丢弃整个 draw** | 回读整片等于清屏色（AIR 视为无效组合） |
+
+**实现**：
+
+- **立方体 mip 链**（`vendor/stage3d_glue.mm`）：`s3d_upload_cube_texture` 改 `mipmapped:YES`（`MTLTextureUsageShaderRead`），六面照旧只写 level 0，随后新增 `s3d_generate_cube_mips`（blit `generateMipmapsForTexture:` + 同队列 commit/等完成 ⇒ 排在当帧绘制批次**之前**）。选 GPU 生成而非复刻 away3d 的软件 mip：产出同级（盒式滤波），且**不依赖**延迟上传的顺序。
+- **AGAL 标志位 → 采样器状态**（`src/runtime.ts` + `src/symbols.ts` + `src/emit.ts`）：`as_agal_sampler_flags` 按 `AGALMiniAssembler` 的位域（`filter` 28 / `mipmap` 24 / `repeat` 20 / `dim` 12）在 **`Program3D.upload`** 时解出每个采样器寄存器的 `(filter, wrap, mip)`，打包进 `Program3D.samplerUsed/samplerFlags`；**`Context3D_setProgram`** 调 `as_s3d_apply_agal_sampler_state` 写进 GPU 的**同一份**每单元状态（新 `s3d_set_sampler_state_i`，字符串版 `setSamplerStateAt` 改为**委托**它）⇒ 与显式调用天然是「后写者胜」（AIR 语义）。在 setProgram 而非 draw 时应用，正是为了保住与 `setSamplerStateAt` 的**调用顺序**。注意 AGAL 的 filter 位 **1 = linear**，glue 的 **1 = nearest**，跨界取反。
+- **诊断**：新增 `ASC_S3D_DUMP`（**缓存** `getenv`，同 `ASC_S3D_STATS`/`TRACE`），每次 draw 打印每单元采样器状态；兜底默认采样器对「会采样的程序」已不可达。
+
+**验收**：`ASC_S3D_DUMP=1` 下两路 draw 均为 `sampler[0] filter=0 wrap=0 mip=2`（LINEAR/CLAMP/MIPLINEAR，**源自 away3d 的 AGAL**，不再是兜底默认）；环面截图**修复前逐像素网纹 → 修复后与 AIR 同级的连续锐利镜像**（`temp/ringdiag/ab-air-vs-ours.png`；相机用光标归中冻结以取稳定姿态，`temp/ringdiag/mf-*.png` × 8 张全绿）；新增单元组 **`stage3d/agal-sampler-flags`**（9 条：解码器签名/四个位域/线性位取反/应用点/单一存储），并把**立方体 mip 链**钉进 `stage3d/texture-upload`（9 → 11 条）⇒ `node --test --test-name-pattern='stage3d/'` **20/20** ✓（这些不变量进不了 `examples/`：示例套件是纯 C，无 GPU）。文档 `docs/zh-cn/display3d.md` §9.2/§9.5 重写（删掉「`miplinear` 退化为 level 0」的旧简化口径）。
+
+**遗留表**：**新登记 2 行**（mip 过滤 + **无 mip 链**的纹理：AIR **丢整个 draw**、我方按 level 0 画；AGAL→MSL 翻译里临时寄存器 `vtN/ftN/op` **未初始化**即可能被读）、**改写 1 行**（`Texture`/`CubeTexture` 的 mip 1+ 未上传 → **部分完成**：立方体已给整链，2D 仍只收 level 0）⇒ **85 项**。
+
+**附带产出（不入库）**：`temp/ringdiag/`（`shoot.py`/`shoot2.py`：窗口定位 + **光标归中冻结相机** + 区域截屏；`run_and_shoot.sh`；逐张对照图与拼版）、`temp/skybox-aot/relink.sh`（只重编 glue `.mm` 的秒级重链，省掉 ~2 分钟 20 MB 的 C 编译）、`temp/sampprobe/`（adl 采样器语义探针）、`temp/ringdiag/dump2.log`。
+
+---
+
+### 阶段一百一十四：Stage3D 与 Skia **共用一条 `MTLCommandQueue`** —— 环「转着转着烂掉」撕裂修复（目标 v0.4.87）✅ 已完成
+
+**起因**：用户在 `Basic_SkyBox` 连拍里看到环**转着转着烂掉**——环身被**直线**切开、缺口处露出**背景**（雪山/天空），而背景本身**完好**；同一帧整体有时还会出现贯穿画面的**竖直接缝**（场景左右错位）。
+
+**取证（视觉为准）**：`temp/ringdiag/burst.py <窗口标题> <前缀> N --park` 连拍（窗口挪到 (60,60) 并 `activate`，`Quartz` 把光标**归中**以冻结鼠标驱动的相机漂移，再按 Quartz 窗口边界区域截屏）。基线 25 帧里 **11 帧**环被直边切断（`b-051`..`b-075`）；`adl` 同姿态 60 帧连拍**零撕裂**。（数值化探测——列间差分/孤立跳变/移位对齐/降采样天空带——全部被窗口边框与山脊轮廓干扰，**结论：本 bug 只能靠看图判**。）
+
+**根因：Stage3D 离屏目标被**跨队列**读写**。`ASC_window_render` 的顺序是 `as_s3d_flush_all()`（commit + `waitUntilCompleted`）→ `as_skia_mtl_begin_frame`（`nextDrawable`）→ `as_skia_mtl_draw_texture(canvas, ASC_stage3d_tex, …)`（采样**活的** Stage3D 目标）→ `as_skia_mtl_flush`（Ganesh `flushAndSubmit` + `presentDrawable` + commit）。而 `stage3d_glue.mm` 的 `s3d_create` 自建 `[device newCommandQueue]`，Ganesh 侧是 `metal_glue.mm` 的 `g_queue`——**Metal 的冒险跟踪只在单条队列内有效**。于是第 N 帧的合成「读」可以和第 N+1 帧的 Stage3D「写」重叠：**写胜出**，尚未被环形 pass 写到的 tile 停在该帧的天空盒（背景）⇒ 环被**垂直 tile 边界**切开、背景完好。与全部观测**逐条吻合**。
+
+**钉死实验**：在 Ganesh 的提交处临时加环境开关，把 `flushAndSubmit(…, GrSyncCpu::kNo)` 切成 `kYes`（CPU 等 GPU，人工串行化读与下一写）⇒ 同样 25 帧 **11 → 0** 帧被切。竞态确认。（该开关是**实验**而非修复，落地后已删除。）
+
+**实现（共用一条队列，不加 CPU 停顿）**：
+
+- `vendor/metal_glue.mm`：新增进程级 `id<MTLCommandQueue> sk_mtl_shared_queue(void)`（首次用时经 `MTLCreateSystemDefaultDevice()` + `newCommandQueue`，**持有到进程退出、永不释放**）；`sk_mtl_init` 改为取它（不再 `[g_device newCommandQueue]`）；`sk_mtl_destroy` **只置 `g_queue = nil`、不再 release**（仍活着的 Stage3D 上下文还在用它）。
+- `vendor/stage3d_glue.mm`：`__attribute__((weak_import))` 声明该访问器（**headless Stage3D 构建会链接 stage3d_glue 而不链 metal_glue**，此时符号不存在），`s3d_create` 改为 `c->queue = (shared != nil) ? [shared retain] : [device newCommandQueue]`（恒 +1，与 `s3d_destroy` 的 release 配平）。
+- **弃案**：① `GrSyncCpu::kYes` —— 每帧 CPU/GPU 串行，正好吃掉阶段一百零四刚省下的那 0.6 ms；② `MTLSharedEvent` —— 需要一个「合成已读完」的可靠信号，Ganesh 给不出。
+- 目标纹理本身无需改（`MTLStorageModeShared` + `usage = RenderTarget|ShaderRead` + 默认 `MTLHazardTrackingModeTracked`，正是同队列冒险跟踪生效的前提）。
+
+**验收**：共用队列后连拍 **150 + 120 + 120 = 390 帧零切割**（修复前 25 帧里 11 帧被切；`temp/ringdiag/q-all.png` / `f-all.png` / `g-all.png` 每帧环体完整闭合）。新增单元组 **`stage3d/gpu-queue-sharing`**（8 条：访问器存在且只建一次、不随窗口释放、`sk_mtl_init` 改取它、`sk_mtl_destroy` 不 release、弱声明、`s3d_create` 采纳并保留 +1、仅在无共享队列时回落自建）⇒ `node --test --test-name-pattern='stage3d/'` **28/28** ✓；`npm test` 全绿。**回归风险低**：无 Stage3D 的构建不受影响（weak 符号 + 回落），有 Stage3D 的构建少一条队列。
+
+**本轮顺带实测（不改语义，只补证据）**：阶段八十九·六十八 登记的「`[SWF(...)]` 元数据被解析后丢弃」一行还写着「`frameRate` 是否一并生效需另行实测」——现用 `temp/rprobe/`（`Fps.as` + `[SWF(frameRate="60")]`，照 `temp/sampprobe/` 的 `adl` 哨兵看门狗跑）实测 `adl 51.4.1`：**`stage.frameRate = 60`**、3 s 内 `ENTER_FRAME` **169 次（56.1 fps）**，即 AIR 确实按 `[SWF]` 元数据定帧率。我方该 demo 实测 **120 fps**（`ASC_S3D_STATS=1` 的 `draws/s=240` ÷ 每帧 2 个 draw），且 `ASC_app_frame_rate` 初值 `0.0` = 「未设 ⇒ 跟随刷新率」⇒ 本机 120 Hz **两倍于 AIR**。（该行已据此次实测改写，修复仍属「`[SWF]` 元数据透传」那一独立立项。）
+
+**遗留表**：**改写 1 行**（Stage3D/Skia 各持一条 queue → **部分完成**：共用队列已落地且**撕裂随之消失**，剩「`s3d_flush` 只 commit 不 wait」的 ~0.6 ms/帧 性能半）、**改写 1 行**（`[SWF(...)]` 元数据：补上 `frameRate` 的 adl 实测口径与 120 fps 观测）⇒ **85 项**（未开始 73 / 部分完成 **11** / 暂缓 1；**无移出、无新登记**）。
+
+**附带产出（不入库）**：`temp/rprobe/`（`Fps.as`/`app.xml`/`run_adl.sh`：帧率与 `[SWF]` 元数据的 adl 探针）、`temp/ringdiag/q-*.png`/`f-*.png`/`g-*.png` 连拍与拼版。
+
+---
+
+### 阶段一百一十五：AGAL **无目的槽指令的操作数错位**（`Basic_SkyBox` 「环缺失」真根因）+ 帧边界 **commit-only**（目标 v0.4.88）✅ 已完成
+
+> **起因（用户报障）**：阶段一百一十四 修完跨队列撕裂后，用户仍报「旋转到一定角度环就缺失」。
+> 实测确认这是**两条独立缺陷**：两条缝都恰好落在**竖直线**上（AGAL `kil` 的世界 `x=0` 半平面
+> 与跨队列撕裂的 tile 边界），所以此前被当成同一个 bug 修。
+
+- **根因（缺陷 A）**：`AGALMiniAssembler.as` 每条指令固定 **24 字节**（`[opcode:4][dest:4][src1:8][src2:8]`），
+  且**没有目的寄存器时也照样写 4 字节 0 到 dest 槽**（`if ( j == 0 ) { agalcode.writeUnsignedInt( 0 ); }`）。
+  `src/runtime.ts` 的两处槽游走（`as_agal_sampler_flags`、`as_agal_translate`）旧来只在
+  `hasDst` 时跳过它 ⇒ **`kil`/`ife`/`ine`/`ifg`/`ifl` 的每个操作数都早读 4 字节**。away3d
+  `EnvMapMethod.as:129` 的 `kil temp2.w`（语义：「立方体采样 alpha < 0.5（占位纹理）就杀片元」）
+  被解成 `in.v0.xxxx`，判据变成**变换后法线 x < 0** —— 一个世界空间半平面，**投影正好是屏幕中心
+  竖直线**，把环体左侧外表面成片丢掉、只剩内管面（看起来像「小了一圈的椭圆」），且**随旋转角度变化**
+  （哪些法线朝 −x 随环转动）——与用户描述逐条吻合。修法：**无条件** `pos += 4;`（`I->dst` 仍只在
+  `hasDst` 时读），两处都改；不动 `kil` 的 `.x` 比较 —— `agal_src_expr` 已按操作数自身的 swizzle
+  取值，解码对了就是 away3d 的原意。
+- **实现（缺陷 B，阶段一百零四 的「性能半」）**：`s3d_flush` 拆为 `s3d_flush_impl(ctx, wait)` 的
+  两个风味 —— commit+wait（`s3d_readback`/`s3d_readback_render`/`s3d_resize`/`s3d_destroy`，CPU 真要读目标）
+  与 **commit-only**（`s3d_flush_async`：`Context3D.present`、`ASC_window_render` 合成前）。删掉生成 C 侧
+  已无调用点的 `as_s3d_flush` 包装（留下它就成了死代码）。**为什么不 wait**：CPU 等待只为让写对 **CPU**
+  可见，而帧边界要采样这张纹理的是 **GPU 侧合成**，自阶段一百一十四 共用队列起，Metal 按提交序执行同队列
+  command buffer 并为默认 `Tracked` 目标插依赖屏障（Ganesh 自己提交合成 buffer 时**就完全不 wait**）。
+  `s3d_draw` 依旧**从不** flush。web 后端 `stage3d_webgl.cc` 同步补齐 `s3d_flush_async`/`s3d_flush_all_async`
+  （= `glFlush()`）以保持两端 `s3d_*` ABI 一致；`ASC_S3D_STATS` 新增 `commit=` 记账并**银行上一批**
+  以便无等待也能读出 `gpu=`。
+- **验收**：
+  - **逐帧钉死**（临时探针，已撤）：`ASC_DRAW_FLUSH=1`（逐 draw commit+wait+dump 目标）⇒ `d00_12`（仅天空盒）
+    干净、`d01_1600`（+环）**环在目标里就已断裂** ⇒ 与合成/跨帧撕裂无关；`ASC_DUMP_GEO` ⇒ 网格是**完美环面**
+    （R=150/r=60、861 顶点全用到、索引无越界）；修好后同帧 MSL 为 `ft4.w = ft3.w - fc[0].x;` +
+    `if (ft4.wwww.x < 0.0) discard_fragment();`（真实立方图 alpha=1 ⇒ 永不 discard）。
+  - **同帧数值对照**（`temp/ringdiag/cutscan.py`，ref = 同帧天空盒-only dump，背景不可能被漂移污染）：
+    掩码边界贴在屏幕中心列的最长连续行数 **22 → 0**、占掩码行数比例 **0.21 → 0.00**（掩码面积 +39%）。
+  - **连拍 320 帧**（`cap.py`：光标**启动前**预停窗口中心 ⇒ 单次运行背景静止）：**参考无关**竖缝检测器
+    （`spike.py`：每列 `V(x)=|I(x+1)-I(x)|` 行均值，扣左右邻列与同列时间中位数）**max 15.96 / median 5.34 / p90 9.12**，
+    灵敏度自检（贴一条 10px 宽另一姿态竖条）**24.88**；最差 10 帧逐张目视为完整闭合环
+    （`temp/ringdiag/worst10-vs-buggy.png`，同图附修复前断裂帧对照）；拼版 `burst-sheet-a.png` 16 帧全完整。
+  - **阶段一百零四 容量对照**（重编 demo，`ASC_FRAME_STATS=1` + `bench-auto`）：峰值对象数 OFF **61238** /
+    ON **61603**，即 `showStats` 惩罚 **−6.4%/−5.0% → 归零**（p50 8.33/8.15ms，均 120 fps）。
+  - **Starling 12 场景扫**（`temp/hidpi/sweep_aot.py`）：**12/12 `alive=True`**、日志 0 条 `FAILED|Error`、
+    逐格画面正确（`temp/ringdiag/sweep12.png`：Filters 多 pass、BlendModes、RenderTexture、Masks、Sprite3D 立方体等）。
+  - **探针实测**：`ASC_S3D_STATS=1` ⇒ `gpu=0.13ms wait=0.00ms commit=0.01ms per-batch draws/batch=2.0`，
+    即阶段一百零四 账上的 **`wait≈0.93ms/帧` → `commit≈0.01ms/帧`**（8.33ms 预算的 ~11% 归零）。
+  - **回归**：`node test.ts` **230 passed / 0 failed**（229 → 230：新增单元组 `stage3d/agal-operand-slots`
+    与 `stage3d/flush-policy`）；`agal-operand-slots` 已手工回退验证过（回退后 2 条 FAIL）。
+- **踩坑（留给下一轮）**：① 相机 yaw 是鼠标偏移的**累加和**（`camera.rotationY += 0.5*(mouseX − width/2)/800`）
+  ⇒ 跨运行姿态**不可比**，参考图必须来自**同一次运行**，或改用参考无关的量；② **天空盒的云会动** ⇒
+  「相机冻结 ⇒ 背景逐像素不变」不成立；③ 截屏域还叠着窗口服务器的**色彩管理抖动**（单次运行内静止天空角落
+  逐像素 max−min 达 103）⇒ **逐像素掩码类检测在截屏域不可用**；目标纹理 dump 是干净的同帧参考，但
+  **CPU 读回必须自己 flush+wait**，不能当「合成看到了什么」的证人。证据与工具索引见 `temp/ringdiag/notes.md`。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.87 → **v0.4.88** + 两条新 bullet（并回填阶段一百零四 bullet 的残留
+描述「该往返已归零」）；`docs/zh-cn/display3d.md` §3 补 24 字节固定槽与「无目的寄存器也写 dest 槽」的口径
++ §9.9 两风味 flush；`package.json` v0.4.87 → **v0.4.88**。
+
+**遗留表**：**移出 1 行**（Stage3D 与 Skia 各持一条 `MTLCommandQueue` —— 性能半已落地为 v0.4.88，
+共用队列 + 帧边界 commit-only 使该往返归零，结论并入上方阶段节）、**新登记 0 行**（AGAL 无目的槽操作数
+错位缺陷此前未入表，修法见上方阶段节）⇒ **84 项**（未开始 73 / 部分完成 **10** / 暂缓 1）。
+
+---
+
+### 阶段一百一十六：away3d / Starling 的 **web 构建闭合** —— LLVM clang 的括号深度上限 + WebGL 后端的立方体纹理与清屏语义（目标 v0.4.89）✅ 已完成
+
+**范围**：用户报两件事——① `away3d-core` 的 `Basic_SkyBox` **web 版编不出来**；② `air-starling-demo` **web 版卡在加载处**。三处根因互相独立且都只在 web 侧暴露，本阶段全部收掉并做 web 渲染/交互验收。
+
+**一、编译失败：LLVM clang 的 256 层括号深度上限**。`Basic_SkyBox` 的 C 在 `TripleFilteredShadowMapMethod_getPlanarFragmentCode` 处直接 `fatal error: bracket nesting level exceeded maximum of 256`（`Basic_SkyBox.c:240161:3594`）：Away3D 这个着色器构建器把 445 个字符串片段拼成**左嵌套**的 `as_str_concat(a, as_str_concat(b, …))`，嵌套深度 = 项数。**Apple clang 21 容忍、`emcc` 背后的 LLVM clang 17 卡在 256** ⇒ 这条一直是**靠编译器宽容通过**的，只有 web 构建会炸（同一份 C，native 编得过）。修法**不是抬阈值而是换形态**（§1.1 允许的「形态转换」）：`emitExpr` 返回值新增 `concatParts?: string[]`，`+` 的字符串分支在片段累积到 **`STR_CONCAT_FLAT_MIN = 32`** 项以上时改发 `as_str_concat_n(N, (const char*[]){…})`（`src/emit.ts:174`、`emit.ts:19716`）——括号深度**恒定**、一次分配、**保持 AS3 的左到右求值序**（数组按源码顺序摆放）；32 项以内仍发原来的嵌套形态（日常代码生成的 C 一字不变）。新增运行时助手 `as_str_concat_n`（`src/runtime.ts`），**NULL 片段按 AS3 语义当 `"null"`**（量长与拷贝两遍必须用同一替换，否则 `strlen(NULL)` 崩或截断）。验收：`examples/` 里的 80 项拼接 → `as_str_concat_n(80, …)`、括号深度 3；NULL 用例输出与 adl 语义一致。
+
+**二、链接失败：WebGL 后端缺两个入口**。away3d 与 Starling 的 web 构建**共同的死因**是 `undefined symbol: s3d_set_sampler_state_i / s3d_upload_cube_texture`：阶段一百一十三 给 Metal 侧加了「AGAL 采样器标志位」（新 `s3d_set_sampler_state_i`）与「立方体整条 mip 链」（`s3d_generate_cube_mips` + cube 上传路径），`vendor/stage3d_webgl.cc` 没跟上。在 web 胶水里按 Metal 语义补齐：新增 `struct S3DTexTarget{GLuint id; int cube;}` + `texTarget[64]/texTargetN` **注册表**（GL 无法回答「这个纹理对象的 target 是什么」，只能自己记）、`s3d_record_target`/`s3d_tex_gltarget`、`s3d_upload_cube_texture`（6 面 `GL_TEXTURE_CUBE_MAP_POSITIVE_X + face` + `glGenerateMipmap`）、`s3d_set_sampler_state_i`，并把 `s3d_apply_sampler`/draw 循环改成**逐单元按登记的 target 绑定**、**空单元同时清 `GL_TEXTURE_2D` 与 `GL_TEXTURE_CUBE_MAP`**（否则上一次留下的 cube 绑定会被下一个 2D 采样器读到——这是实测到的失效形态，不是「没绑定」）。⇒ **away3d-core web 构建成功**。
+
+**三、渲染 bug：环体变实心黑圆盘**。构建通了之后 `Basic_SkyBox` 的 web 画面是一个**纯黑实心盘**（逐 draw 像素探针：RGB 恒 `(0,0,0,255)`；第 1 帧环体有真实反射色，第 2 帧起天空盒在盘区不画、环体完全不画；黑盘 = **各帧环体轮廓的并集**）。根因是 **`glClear` 受 GL 写掩码管辖**（Metal 的 `loadAction=Clear` 不受）：某 pass 的 `depthWrite=false` 把 `GL_DEPTH_WRITEMASK` 留成 0，下一帧的**延迟深度清屏被静默跳过** ⇒ 上一帧的近深度挡住天空盒（z≈1.0）与之后所有绘制。修法（`vendor/stage3d_webgl.cc` 的 `s3d_draw` 延迟清屏处）：`glDepthMask(GL_TRUE); glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE); glStencilMask(0xFF); glClear(bits);`（各 draw 自带掩码，不泄漏给后续 pass）。修复后天空盒全点着色、环体出现亮反射。
+
+**四、用户②「卡在加载处」的真根因：产物不自洽（非加载逻辑）**。`examples/air-starling-demo/` 里 `.html/.js/.wasm` 停留在 **Sep 28** 的一版，而 `.c/.data/.o/.wasm.o` 是 **Oct 8 01:36** 的（`.data` 与今日重建版 `cmp` 完全一致）：那次构建在 **emcc 链接步失败**（缺上面那两个 `s3d_*`）⇒ `.c/.data` 已写出、`.wasm` 留在旧版；旧 wasm 按**新 `.data` 的偏移**读资源 ⇒ 素材全部解不开 ⇒ `[AssetManager]` 停在加载屏（**白底 + 灰色进度条**，已**精确复现**用户症状）。判据（§1.5）：同输入 `adl` 能跑对 ⇒ **遗留缺陷**（非增强）。修法：**就地**重建（`cd examples/air-starling-demo && node ../../src/index.ts --air-app Demo-app.xml --main-class Demo --package web --target wasm -o Starling-Demo`）⇒ `EXIT=0`、七件产物同一时间戳。**排查坑（已记入文档）**：① 浏览器**静默复用**旧的 `.js`/`.wasm`（不重新校验），端口 8125 的失败是**缓存假象**——换新 origin（8126）后 34→36 行 stdout、素材全成功、0 error；② web 构建的相对资源 URL 以**页面所在目录**为基准，故必须就地构建（挪到 `temp/` 会因 `assets/fonts/Ubuntu-R.ttf` 404 而「按钮皮肤在、文字全无」）；③ 一度误判「就地重建仍失败」，实为 CDP 页缓存（服务端日志里连 `.js/.wasm` 请求都没有）。
+
+**验收**：away3d-core web 版 **正立天空盒（太阳左上、雪山在下）+ 镜面反射圆环**（有孔洞、无黑盘）；Starling web 版（就地重建）菜单 **12 个按钮全部带文字**（Textures/Multitouch/…/Sprite 3D）+ 底部驱动信息 `WebGL2 (Stage3D)`（与 `adl` 参照一致）；CDP 注入点击 → 进入 **TextFields 场景**（desyrel 位图字体与系统文字都在），DevTools Network 确认新 origin 拉了 `html/js(172 kB)/data(2.9 MB)/wasm(8.2 MB)/Ubuntu-R.ttf(360 kB)`。音效（`wing_flap.mp3`）报 `#2068` 属**既有 web 限制**（无音频后端），不阻塞，另立遗留行。
+
+**回归钉子**：新增单元组 **`stage3d/webgl-abi`**（6 条，`test/unit/stage3d.ts`）——核心是「**运行时调用的每个 `s3d_*` 都必须在 WebGL 胶水里定义**」这条**引用⊆定义**的结构不变量（本次缺陷类别正是「生成 C 调用、后端未定义」），外加两个具名入口 + target 注册表 + 空单元清双 target + 清屏前强制三掩码；**模拟缺口的胶水会当场列出那两个符号**（已用 pre-fix 文本验证）。新增 **`test/unit/emit.ts`**（`unit: emit/StringConcatFlat`，5 条）——阈值两侧形态（32 项仍旧嵌套、33 项走 `as_str_concat_n(33, (const char*[]){…})`）、**左到右保序**、**括号深度恒定**、helper 的两遍 NULL 替换；并在 `test/unit.ts` barrel 登记。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.88 → **v0.4.89** + 新增两条 bullet（web 构建闭合的三处根因；**web 产物是「成套」的**及其两条使用者口径，并回填「当前限制」标题版本号）+ 「单元组」计数刷新（62/65 → **72/75**，含新钉的展平形态与后端 seam 两条）；（`docs/zh-cn/html5-web.md` §1 补「产物是成套的（构建失败不回滚中间产物 / 浏览器静默复用旧 `.js`/`.wasm`）」与「相对资源 URL 以页面所在目录为基准」两段；`docs/zh-cn/display3d.md` §9 标题与新增 **§9.10「web 后端的三处对齐」**（target 注册表 / cube mip / 清屏写掩码）；`package.json` v0.4.88 → **v0.4.89**。
+
+**遗留表**：**移出 0 行**、**新登记 2 行**（AGAL `nrm` 的归一化分量数（我方两后端都用 4 分量模长，AGAL/AIR 可能是 xyz）——**待 adl 实测**；web 无音频后端时 `Sound.loadCompressedDataFromByteArray` **抛 `#2068`** 与 `air-app.ts` 警告口径「`play()` 返 null」的差异）⇒ **86 项**（未开始 **75** / 部分完成 **10** / 暂缓 1）。
+
+**回归**：`node test.ts` **232 passed / 0 failed**（含 examples 端到端与全部单元组）。
+
+---
+
+### 阶段一百一十七：Stage3D **程序缓存** —— `Basic_SkyBox` 的 **62 MB/min 内存泄漏**真根因：逐 draw 重编译（目标 v0.4.90）✅ 已完成
+
+**范围**：用户报「运行 `Basic_SkyBox` 内存随时间增长，应该有泄露的地方」。目标平台是 **native macOS / Metal**。定位到的不是「不可达泄漏」，而是**一个随帧数线性增长的活结构**：驱动侧每帧都在新建**从不复用的**管线对象。
+
+**一、实测复现与定性（三个工具合证）**。① **速率**：窗口激活后 `ps -o rss=` 采样 95 s，RSS 177.8 → 278.3 MB，**62.4 MB/min 线性**（`temp/skyboxmem/memtest.py`）。② **归属**：`footprint` 前后差分，增量 **100% 落在 `MALLOC_SMALL`**（+62.0 MB/60 s、+17 个 region，`temp/skyboxmem/memdiff.py`）——**不是** GC 堆（`gc` 曲线平）、**不是** GPU/IOSurface，而是**裸 `malloc`**。③ **是否真泄漏**：`leaks` 只报 304 KB（且全在系统 XPC 侧，与我们的调用栈无关）⇒ **对象仍有引用，不是不可达泄漏**。④ **是谁**：macOS `heap` 在 44 s 时报 **10,790 个 `MTLVertexDescriptor`**（≈ **2 个/帧**）与 **68,706 个 `CFString`**（约 26 MB）——2/帧这个数字指向「每帧建了**两条**管线」。
+
+**二、根因：逐 draw 重编译两条程序 + 重建两条管线**。发射侧的程序守卫是**深度 1** 的（`if (o->program != NULL && o->program != o->gpuProgram)`，即「与**上一次**不同才重编」），而 away3d 的 SkyBox **逐 draw 交替**两套材质（铬环 1600 三角 + 天空盒 12 三角，`ASC_S3D_DUMP=1` 实测：`depth=(less,w=0)` 与 `depth=(lessEqual,w=1)` 相间）⇒ 守卫**每 draw 都命中**，`as_s3d_compile` 每 draw 跑满一次。给胶水加临时计数探针（`AS_S3D_TRACE=1`，每 60 draw 报一行）后一句话钉死：**`compile=7980, make_pso=7980`，而 draw 也是 7980**。每次编译 = 2 个 `MTLLibrary` + 1 个 `MTLRenderPipelineState`，而每条管线都带着**当次新建的 `MTLVertexDescriptor`** 交给 Metal，驱动**管线缓存会一直持有它** ⇒ 单调增长，永不回落。**WebGL 后端同形且更重**：每 draw 编译+链接一次，还附带 **512 次 `glGetUniformLocation` 字符串查找**与一次 `glDeleteProgram`。
+
+**三、修法：程序缓存（「绑定」而非「重编译」），对齐 AIR 的 `Program3D` 语义**（`upload()` 编译一次、`setProgram()` 只绑定）。两后端共用同一形态：`s3d_compile(ctx, key, vs, fs, errbuf, n)` 新增 **Program3D 身份**参数（`emit.ts` 一行：把 `o->program` 当 key 传入，`runtime.ts` 的 wrapper 原样转发）；胶水内 `S3DProgramCache progs[S3D_MAX_PROGRAMS=16]`（LRU）+ `s3d_prog_stash`/`s3d_prog_load` 在切换时于「活程序」与槽位之间**搬移所有权**（**任一时刻只有一处持有**该 lib/fn/pso）；命中即 `return 1`，**一个字都不进驱动编译器**。槽位身份 = **Program3D 指针 + 源码哈希**（FNV-1a 64 位）：同一个 `Program3D` 可以被**重新 `upload`** 新字节码，只比指针会静默复用过期管线。`s3d_destroy` 释放整个缓存。
+
+**四、顺带修掉两处真缺陷**。① `s3d_compile` 的**错误路径泄漏**：`newFunctionWithName:` 失败时 `vlib`/`vfn` 未释放（新加的错误路径 `release` 补齐）。② **wasm32 上 `unsigned long` 是 32 位** —— FNV 常量字面量溢出，**整个 web 构建编译失败**（`-Werror` 的过大字面量）；改 `unsigned long long` / `ULL`。这条只有 web 目标暴露，与阶段一百一十六 同类（同一份文本、两个 64 位假设不同的平台）。
+
+**验收**。① **`make_pso` 7980 → 2**（8040 draw 只建了 2 条管线 = 两套材质），`compile` 降为纯 cache lookup；② **RSS 62.4 MB/min → 0.4 MB/min**，100 s 采样 175.8 → 176.5 MB；10 分钟长跑（600 s）**175.5 → 178.4 MB 后平台化**（`temp/skyboxmem/soak.txt`）；③ 画面逐项复核**无误**：正立天空盒（太阳左上、雪山在下）+ 镜面反射铬环、119 fps（`temp/skyboxmem/fixed-01.png`）；④ **web 版**同一源码重建后渲染同样正确（`temp/webmem/`，本地 8130 端口起 CDP 截图核对）。
+
+**回归钉子**：新增单元组 **`stage3d/program-cache`**（**17 条**，`test/unit/stage3d.ts`）——emitter 传身份 / wrapper 转发（含无后端时的空实现）/ **两后端各自**「同源码 = 绑定而非重编」「槽位身份含源码」「teardown 释放全部槽位」「wasm32 下哈希仍是 64 位（`ULL`，不是 `UL`）」/ **命中判定必须早于第一次驱动编译**（**顺序**才构成修复：Metal 早于 `newLibraryWithSource`、WebGL 早于 `glCreateShader`）。**变异验证**（防空转）：删掉绑定那一行 ⇒ 3 条当场变红；把 `ULL` 改回 `UL` ⇒ web 侧那条变红。**诊断探针保留**：`AS_S3D_TRACE=1` 成为复查该类回归的**一行判据**（`make_pso` 必须跟随**程序数**，而非 **draw 数**）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.89 → **v0.4.90** + 新增一条 bullet（泄漏的三工具定性 + 深度 1 守卫为何被交替材质打穿 + 程序缓存语义）；「单元组」计数 72/75 → **73/76**、`node test.ts` 用例数 232 → **233**；`package.json` v0.4.89 → **v0.4.90**；`docs/zh-cn/display3d.md` §9.11 新增「程序缓存」一节（含 `AS_S3D_TRACE` 探针口径）。
+
+**遗留表**：**移出 0 行**、**新登记 1 行**（每 draw 重建 `MTLDepthStencilState` —— 与本次泄漏同属「逐 draw 驱动对象分配」，但**实测不泄漏**，仅抖动）⇒ **87 项**（未开始 **76** / 部分完成 **10** / 暂缓 1）。本次泄漏的**缺陷类别此前未入表**（它是「深度 1 守卫被交替程序打穿」，不属任何既有行）。
+
+**回归**：`node test.ts` **233 passed / 0 failed**（阶段一百一十六 为 232）。
+
+---
+
+### 阶段一百一十八：talkmed-meeting 闭包重评估 —— 接口访问器一致性 + `extends` 内建类型文案（目标 v0.4.91）✅ 已完成
+
+**范围**：在 v0.4.90 基线上对 `talkmed-meeting-desktop-app` 重跑评估（闭包 / 逐文件解析 / 整闭包 codegen 越墙采样），并把新暴露的语言层缺口收口。本阶段**不改**工程源码，只改编译器；所有语义对照以 `adl 51.4.1` 为裁判。
+
+**一、闭包仪器两处缺陷（先修度量，再谈结论）**。① `lib/feathersui`（**310 个 .as**）是**必需的 source path**，却没写进 `asconfig.json` 的 `source-path`（只列了 `src`、`lib/starling/2.7`、`../ActionScript-Lib`）——**mxmlc 裁判**：不给该路径 ⇒ 报「找不到基类 `StyleNameFunctionTheme` 的定义」；给了 ⇒ 正常写出 87960 字节。旧闭包脚本照抄配置 ⇒ 全部 `feathers.*` 不可解析、闭包**少算**。新增 `closure4.ts` 补上该根 ⇒ 闭包 **709 → 710**（+`StyleNameFunctionTheme`），`feathers_themes_*` 一族墙随之消失。② 逐文件 survey 的「绝对路径列」没被使用，把 `/Users/.../ActionScript-Lib/...` 拼成了 `_lib_/ActionScript-Lib/...` ⇒ 2 条**假 ENOENT**；修正后解析 survey = **708 OK / 2 ERR / 0 HANG**（710 文件，余 2 条为一般 E4X 过滤谓词 `JSONEncoder.as` / `BigInteger.as`，均属既有登记）。
+
+**二、新墙一：接口访问器可由「内建访问器型属性」满足（本阶段核心修复）**。整闭包 codegen 推进到新一类错误：`class 'FileItemRenderers' does not implement method 'y' of interface 'IItemRenderer'`。探针定位到 **pass 4** 的一致性检查只遍历 `methods`/`getters`/`setters`，而**内建属性是普通字段**，于是「继承 `Sprite` 拿 `x`/`y`/`width`/`height` 来满足 `IItemRenderer`」这一**AIR 完全合法**的写法被误判。**AIR 裁判（逐条实测）**：`extends Sprite implements {get/set x}` ⇒ **接受**；用户 `public var x` ⇒ **拒绝**；`extends Point`/`extends Rectangle` ⇒ **拒绝**（它们不是访问器型）；`extends Event` 的 `get type` ⇒ 接受，但 `bubbles`/`cancelable`/`target` ⇒ 拒绝。`DisplayObject` 的 `name`/`x`/`y`/`visible`/`alpha`/`rotation`/`scaleX`/`scaleY`/`filters`/`blendMode`/`transform`（`dof` 助手）与 `InteractiveObject` 的 `mouseEnabled`/`mouseChildren`/`buttonMode`/`doubleClickEnabled`/`tabEnabled`/`tabIndex`/`focusRect`（`iof` 助手）**逐项确认 ACCEPT**。**修法**：`FieldInfo` 新增 `isAccessor?: boolean`（`dof`/`iof` 置位）、pass 4 据此放行；`emitInterfaceVtables` 原用非空断言 `cinfo.getters.get(mname)!`（只放开 pass 4 会**当场崩在发射期**），改写为**按符号名去重**地发射访问器 thunk（`static double C_get_x(void* _this) { return (double)((C*)_this)->x; }`），两个接口共享同一访问器时**只定义一次**、两个 vtable 都指向它（实测 `Two_get_x` 计数 = 1 且两个 vtable 都引用它）。**运行期裁判**：同一份 4 行值日志 + 5 个布尔断言（写到继承来的属性、经接口读回、算术、反向写、`is`）在 AOT 与 `adl` 两端**逐行相同**（`temp/ifacc/`）。
+
+**三、新墙二：`extends <内建类型>` 报「精确限制」而非空名**。`resolveType` 把 `Array`/`String`/`Number`/`Point` 这类**只作类型**的内建映射为**不带 `className`** 的 `CType`，而 superclass 注册处**盲取** `.className` ⇒ `class E extends Array {}` 报的超类名是一字面的 **`undefined`**（`unknown superclass 'undefined' of 'E'`）。现按 kind 分派：接口 ⇒ `cannot extend interface 'I'`；其余非类 ⇒ `unsupported superclass 'Array' of 'E': subclassing built-in types is not implemented`（带行列号）。**`extends Array` 本身仍是缺口**（AIR 合法，闭包内 2 个文件用它：`com.hurlant.util.der.Sequence`、`com.fiCharts.utils.graphic.StyleManager`）——本条只把**误导**改成**响亮**，已入遗留表。
+
+**四、重测后的墙序列（施工后）**：`[0] extends Array`（语言层，已响亮）、`[1..12]` SWC/ANE 库符号（`mheader`/`fl_core_UIComponent`/`datePicker` 族/`ANEVideo`/`uploadskin`/`chatskin`/`onlineskin`/`popchatitem`/`fileitemdoctorskin`/`pluginitemskin` —— **结构性**）、`[13] unknown interface 'IDataInput'`（`TLSSocket extends Socket implements IDataInput, IDataOutput`；本子集把这两个接口的**行为**建模在 `Socket`/`ByteArray` 上，却**从未把它们注册为接口** ⇒ 显式 `implements IDataInput` 报未知接口；**新登记**）。阶段一百一十六 的两类墙（`feathers_themes_*`、接口访问器一致性）**均已消失**。
+
+**五、重测的内建缺口面**（新脚本 `gap5.ts`：只在「**既不在源码类路径、也不在内建注册表**」时才算缺口 —— 初版 `gap4.ts` 只比内建表，把 `feathers.controls.*`/`starling.utils.*` 这些**源码可解析**的类误报成缺口，已作废）：闭包 710 文件 / 显式 import 783 / 不可解析 **282**（其中内建覆盖 124）⇒ **真缺口 158**，拆开 = **ANE 64**（产品边界）+ **`flash.*`/`fl.*` 51** + 其余 4（`adobe.utils.CustomActions`、`org.qrcode.QRCode`、`mx.utils.StringUtil`（`mx.swc` 属**代码型 SWC**）、`starling.core.RenderSupport`）。最后一条经复核**不是编译器缺口**：`starling.core.RenderSupport` 在 Starling **1.x** 才有，工程里的 Starling 2.7 只有 `starling.rendering.Painter` ⇒ 工程侧**版本漂移**（`src/com/vsdevelop/proxy/SViewControl.as` 一个文件）。`flash.*` 按命名空间：`events(9)` / `display(8)` / `desktop(7)` / `system(7)` / `net(6)` / `filters(6)` / `media(2)` / `utils(2)` / `fl.core(2)` / `errors(1)` / `accessibility(1)`。内建注册数 **174**（v0.4.79 为 153；含 `IEventDispatcher` 已注册为内建接口）。
+
+**验收**：① `node test.ts` **235 passed / 0 failed**（阶段一百一十七 为 233；+`examples/iface-builtin-accessor.as` 端到端示例 +1 单元组）；② 新增 `examples/iface-builtin-accessor.as`（5 条断言，含**反向**验证：直接写内建属性后经接口读到同一值）；③ 新增单元组 **`emit/InterfaceAccessorThunk`**（5 条：两条 thunk 形态 + vtable 槽指向 + **去重** + 两接口共享同一 thunk）与 `diagnostics` 三条文案钉（放行形态 / 用户 `var` **仍被拒** / `extends Array` 与 `extends 接口` 的精确文案）；④ AIR 裁判两端**逐行相同**（`temp/ifacc/`）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.90 → **v0.4.91** + 两条 bullet（接口访问器、`extends` 文案）+ 「接口」行补「内建访问器型属性可满足接口访问器」；`package.json` v0.4.90 → **v0.4.91**；评估报告 `talkmed-meeting-aot-gap-report-v2.md` 按 v0.4.91 重写（闭包 710 / 解析 708·2 / 新墙序列 / 缺口面重测）。
+
+**遗留表**：**移出 0 行**、**新登记 2 行**（`extends <内建类型>`（含 `extends Array`）仍不支持；`IDataInput`/`IDataOutput` 未注册为内建接口）⇒ **89 项**（未开始 **78** / 部分完成 **10** / 暂缓 1）。
+
+**回归**：`node test.ts` **235 passed / 0 failed**。
+
+---
+
+### 阶段一百一十九：装箱·转换·比较收口（包 A 六项）+ Array 的 ToPrimitive/ToString + Function 值 #1063（目标 v0.4.92）✅ 已完成
+
+**范围**：从 `### 遗留待开发` 里按「补保真、验收明确、改动小」挑出的**包 A**（6 项）一次性收口，并在做探针时**顺带发现并落地一个独立包**——Array 的 ToPrimitive/ToString 与 Function 值的 `#1063` 参数个数检查。所有语义一律先以 `adl 51.4.1` 实测为准（双端探针 `temp/pkgA/`，harness `probe.py <label> <bodyfile>` 两端各跑一遍并逐行对照，末行打印 `--- N/M lines differ ---`）。
+
+**一、包 A 六项（`### 遗留待开发` 移出 6 行）**
+
+1. **经动态槽给对象型参数赋错类型不抛 `#1034`**（原先**静默把装箱指针当对象解引用** —— §2.4 红线里的「静默错误语义」）。`var d:Object = sprite; d.scale9Grid = 5;` 在 `adl` 上抛 `#1034`，我们原先把数字装箱对象的首址当 `Rectangle*` 读 ⇒ 槽里存进垃圾双精度。修法：**对象解箱的收敛点**带上标签/类型检查（`as_req_inst(ptr, &T_vt, "fqn")`），命中即放行、`null`/`undefined` 允许为 null、其余抛 `#1034`。**证据**：`temp/pkgA/dyn` 探针 **0/6 逐字一致**（含 `flash.geom.Rectangle` / `flash.display.Sprite` / `Array` 三种 fqn 文案）。
+2. **`(标量 as Object) == 标量` 恒为 false**（`adl` 为 true）。`Object`/`interface` 静态类型的相等**不再退化成 C 指针比较**，先装箱再走 `as_v_loose_eq` / `as_v_strict_eq`。**顺带修掉该行的另一半**：`Object` 槽里的 **Array** 原先由 `as_obj_to_value` 按 tag 4 装箱，于是 `==`/`+`/`length` 都**看不见数组**（`var o:Object = [1,2]; o == "1,2"` 给 false）——现 `as_obj_to_value` 用 `as_dyn_kind(obj) == 2` 回 **tag 6**（与既有 `as_v_req_array` 的 tag-4 兜底**同源**），数组在 `Object` 槽里恢复成数组。**证据**：`temp/pkgA/verify` 探针 **0/8**（`(1 as Object) == 1`、`(5 as Object) === 5`、`(["s"] as Object)`、`Object` 槽装 `[1,2]` 的 `== "1,2"` 全对）。
+3. **动态值 `x as <原始类型>` 在类型不符时应给 `null`**（我方给该类型默认值 0/NaN/false）。`as` 对原始类型的要求是「值**本身**就是该类型」，不是「转换后能用」。**证据**：`temp/pkgA/verify` 的 C/C2 行 —— `(u as int)`/`("x" as int)`/`(true as int)`/`("x" as Number)`/`(u as Boolean)`/`(null as int)` 六种**全为 `null`**，且 `var y:int = u as int` 仍是 `0`（赋值处 ToInt32）。
+4. **装箱字符串参与算术/比较未走 ES3 ToNumber**。`var vv:* = "5"` 下我们原先按 `as_v_num_val` 取**数字槽** ⇒ 字符串得 0（`vv*2 = 0`、`vv-1 = -1`）。修法：`toNumberExpr` 与关系比较里 `any` 操作数改走 **`as_v_to_number`**（已含 `atof` 解析与 trim）。**证据**：`temp/pkgA/verify` 的 D/E/F 行 —— `"5"` ⇒ `10 / 4 / 2.5 / true`、`" 6 "*2 = 12` 且 `" 6 " < 6` = false（trim 生效）、`"x"` ⇒ `NaN` 且 `isNaN` = true。
+5. **静态 `String` 与 `Number` 混算发射非法 C**（应像 `mxmlc` 一样**拒绝编译**）。原先落进 `default` 直拼 ⇒ `error: invalid operands to binary expression ('char *' and 'double')`（C 层报错，不是 `CodegenError`）。现抛带行列号的 `CodegenError`：`operator '*' cannot be applied to a String operand: AS3 has no implicit String-to-Number coercion`；`"5" < 6` 仍编译（关系比较在 AS3 里走 ToNumber，`mxmlc` 也接受）。
+6. **`null` 字面量传给 `Number`/`bool` 形参**发射 `(double)(NULL)` / `(bool)(NULL)` ⇒ C 编译失败。现按目标类型归一：`Number` 形参给 ToNumber 结果（0）、`Boolean` 给 false。**证据**：`temp/pkgA/v78` 探针 **0/3**（`takeN(null)` ⇒ `N0`、`takeB(null)` ⇒ `Bfalse`、`var d:Number = null` ⇒ `0`）。
+   - **回归修复（复盘时发现）**：上述归一把 **interface 槽**与 `object`/`function`/`class` **指针槽**并成一类，`null` 一律回 `NULL` —— 但接口是**按值传递的 `{void* obj; void* vt;}` 结构体**，裸 `NULL` 是 C 类型错误。`examples/air-starling-demo` 的 Starling `Juggler`（`_objects[i] = null`，`_objects:Vector.<IAnimatable>`）因此 `clang` 报 **`304 warnings and 2 errors generated`**（`passing 'void *' to parameter of incompatible type 'starling_animation_IAnimatable'`，`error:` 落在 Juggler.as 的两处 `_objects[i] = null`）。现 interface 单独回 `(<Iface>){ NULL, NULL }`，指针槽行为不变。**证据**：`examples/air-starling-demo` native **全量重建 `rc=0`**，C 层 **0 error**（304 warnings 与改前一致，均为既有告警）；新增钉子 `emit/NullLiteralCoercion`（7 条）。
+
+**二、顺带落地：Array 的 ToPrimitive / ToString（新包）**。探针做 `Object`/`any` 走查时撞出一个**段错误**与一整片静默错值：`var a:* = [1,2]; a.toString()` 把 `as_array*` 当**对象指针**传给 `as_dyn_call`，后者去读元素缓冲区当 vtable 头 ⇒ `EXC_BAD_ACCESS`。ES3 里数组本就是「有 ToPrimitive 的对象」：**ToString = `join(",")`**、**ToNumber = 解析那个串**、`==` 标量时**字符串化**。
+- `as_v_str_val` 的 tag 6 ⇒ `as_arr_to_str(v.ptr)`；`as_v_to_number/int/uint` 的 tag 6 ⇒ `as_str_to_number(as_arr_to_str(...))`；`as_v_loose_eq` 新增「数组 vs 标量」分支（字符串侧 `strcmp`、数值侧 ToNumber；`null`/`undefined` 排除在外 —— `[0] == false` 为 false）。
+- `as_any_call` 新增 `if (v.tag == 6) return as_arr_call(...)`（**段错误修复**），并**补回被误删的最后一行** `return as_dyn_call(v.ptr, name, args, argc);`（丢它的后果是 `push` 返回不了新长度、`vector-dynamic.as` 报非 void 警告）。
+- 新增运行时 `as_arr_call`（按名分派 `toString`/`valueOf`/`join`/`push`/`pop`/`shift`/`unshift`/`indexOf`/`insertAt`/`removeAt`/`slice`/`splice`/`reverse`/`concat`/`map`/`filter`/`sort`/`sortOn`）与 `as_join_sep`（**`join(null)` 的分隔符是字符串 `"null"`、`join(undefined)` 才取 `","`** —— ES3 15.4.4.5，实测确认）；`as_array_join` 的 NULL 元素也给出 `"null"`。
+- **证据**：`temp/pkgA/{arrstr,arrnum,arr2,arr3,arr4,arr5,eq}` 七个探针 —— `arrstr` 0/4、`arr2` 0/6、`arr3` 0/6、`arr4` 0/9、`arr5` 0/4、`eq` 0/9；`arrnum` **1/4**，唯一残差是 `Number({})`（对象字面量的 ToPrimitive ⇒ NaN，**已新登记**）。另实测确认 `[[1,2],[3]]` ⇒ `"1,2,3"`（嵌套数组递归字符串化）、`[1,2] == "1,2"`、`[0] == false`。
+
+**三、顺带落地：Function 值的 `#1063` 参数个数检查（新包）**。原先**宽松放行**，而 AIR 会抛 —— 更要命的是它把一个 **1 参闭包的 0 参调用**送进解箱路径（`args` 为 NULL）⇒ **段错误**（lldb：`EXC_BAD_ACCESS ... _fn0__call ... args[0]`）。**AIR 规则（探针 `temp/pkgA/arity{,2,3}` 逐条实测）**：`(a:int)` 用 0 或 2 个实参 ⇒ `#1063`；`(a:int,b:int=2)`（req=1/max=2）0 或 3 个 ⇒ `#1063`，1~2 个 OK；`(a:int=1)`（req=0/max=1）2 个 ⇒ `Expected 0, got 2`；**`()` 与 `(...rest)` 任意个数都放行**（AIR 把 0 参闭包建成变参）。`Expected` = **必需参数个数**（首个可选/rest 之前），与既有的构造器口径一致。
+- 修法：新增 `as_fn_arity_error(qname, expected, argc)`（消息逐字 `Error #1063: Argument count mismatch on <qname>(). Expected <req>, got <argc>.`，`ArgumentError` 编号 1063），`emitThunk`/`emitThunkBody` 增加 `qname` 参数，**非构造器分支**在**任何解箱之前**插守卫（`req == 0 && max == 0` 与 rest 形态整条跳过）。
+- **qname 口径（逐条实测）**：实例方法 `<fqn>/<m>`（`foo::Widget/m`）、静态方法 `<fqn>$/<m>`（`K2$/stat`）、具名函数表达式 `Function/<name>`（`Function/onError`）、顶层函数 `Function/<name>`。**三处不逐字、已登记**：接口/父类接收者 AIR 报**方法定义类**（`InteractiveObject` 上的 `dispatchEvent` 报 `flash.events::EventDispatcher/dispatchEvent`）、匿名闭包 AIR 报 `Function/<file>.as$N:anonymous`（AVM2 内部序号，不可复现）、顶层函数因 `mxmlc` 不接受「包级函数值 + 主类同文件」而**无法构造对照**。
+- 顺带：**接口名不再泄漏 C 标识符** —— 新增 `InterfaceInfo.reflectFqn`（`foo::IFoo` / `flash.events::IEventDispatcher`），`fnQName` 优先取它（原先打印的是 `foo_IFoo/m` 这种 sanitized C 名）。**证据**：`arity2` **0/5**、`arity`/`arity3` 除 qname 外全绿（4 条差全在匿名闭包名）。
+
+**四、验收**：① `node test.ts` **238 passed / 0 failed**（阶段一百一十八 为 235，+3 = 三个新单元组；unit **77 → 80** 组、examples **161** 例、耗时 417.2 s）；② 新增三个单元组 —— `emit/ArrayToPrimitive`（10 条：`as_v_str_val`/`to_number`/`to_int`/`to_uint` 的 tag-6 形态、loose-eq 的数组分支、`as_any_call` 的**两条**（tag 6 分派 **+ 保留的 `as_dyn_call` 兜底**，后一条专防「误删最后一行」复发）、`as_join_sep` 与常量 `null` 折叠）、`emit/FunctionArityQName`（12 条：消息七段与 1063、五种 qname、**守卫在解箱之内**、0 参/rest **不发**守卫、可选参仍封上界、接口**不泄漏 C 键**）与 `emit/NullLiteralCoercion`（7 条：**`Vector.<Iface>[i] = null` 必须发 `(<Iface>){ NULL, NULL }` 且接口元素 setter 按值收结构体**、不存在裸 `NULL` 的接口元素写入、`var x:Iface = null` 的初始化对、`Object`/`String` 槽仍裸 `NULL`、`Number`/`Boolean` 槽归一不变）；③ 双端探针 **17 组**（`vals tonum tonum2 tonum3 dyn eq arrstr arrnum arr2 arr3 arr4 arr5 arity arity2 arity3 verify v78`）；④ `examples/air-starling-demo` native 全量重建通过（本轮回归修复的端到端验收，见包 A 第 6 项）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.91 → **v0.4.92** + 三条 bullet（装箱/转换/比较收口、Array ToPrimitive、Function #1063）；`package.json` v0.4.91 → **v0.4.92**。
+
+**遗留表**：**移出 6 行**、**新登记 3 行**（AIR 数值解析/格式化极值；对象字面量/类实例的 ToPrimitive；Function 值 #1063 的 qname 面）⇒ **86 项**（未开始 **75** / 部分完成 **10** / 暂缓 1）；其后归因时又**新登记 1 行** ⇒ **87 项**（未开始 **76** / 部分完成 **10** / 暂缓 1，见表末行）。
+
+**性能验收（benchmarks 重跑，2026-10-08）**：`AIRSDK_HOME=…/AIRSDK_51.4.1/bin python3 benchmarks/run.py` 三个独立批次（`temp/bench/batch{1,2,3}.txt`；跑前删干净 `~/Library/Application Support/bench.*/Local Store/*_air.log` 以免静默读到上一轮），8 项四路结果一致。**7/8 项与 v0.4.69 基线持平（±3%，噪声内），唯 `oop` +78%（55 → 98 ms）**；C/JS/AIR 三列的批间漂移 ≤4% 证明机器可比（`temp/bench/agg.py`）。归因：本轮 `unboxAny` 给**动态值 → 具名类槽**的赋值补上了 `#1034` 运行时校验（v0.4.69 发射的是未检查的裸 `as_v_obj_val`），而 `oop.as` 的热循环正是一次 `var s:Figure = shapes[j % 192]`。**AIR 确证该检查必需**（`temp/pkgA/arrcoerce` 双端探针 **0/6**：`Array` 里的 `Number`/`String`/对象 ⇒ `#1034`，子类 `MovieClip` ⇒ 通过 ⇒ **必须走祖先链、不能只比较 vtable**，`null` ⇒ 通过）。变体 A/B 归因（`temp/bench/oopattr/`；v0=97.5 / v1 去安全门=89.5 / v2 换回未检查=55 / v3 裸 `%`=97 / v5 平凡函数体=54 / v6 精确-vtable 快路径=98）⇒ **43 ms 全部是检查本身**、安全门仅 8 ms、余 ~35 ms 是**祖先链的两级依赖随机访存**（语义要求，省不掉；精确匹配快路径救不了，因为元素都是子类实例）。**按 §1.5 如实登记为语义代价**，不静默降级；`benchmarks/README.md` 新增「本次结果（编译器 v0.4.92）」一节（含对比表与归因表），`benchmarks/oop/report.md` 重写为「~48 ms 本体 + ~7 ms 全局槽位 + ~43 ms 类型检查 = 98 ms」的三段分解。
+
+**回归**：`node test.ts` **238 passed / 0 failed**（417.2 s）。
+
+**性能归因深挖（`array` / `strings`，2026-10-08）**：承上面 benchmarks 重跑，把两项的差距逐层拆到根因；**两份旧报告的核心机理被实测证伪并已重写**。
+
+- **`array`（5.41× C，119 vs 22 ms）**：根因是 **`int` 累加器被迫走 `double` 域**（`sum:int += a[j]`，`a[j]:*` ⇒ 按 AS3 语义必须发动态加法 ⇒ 每轮 `int→double→int` 往返构成**循环携带依赖链**，约 12 周期），**不是每元素体积/内存带宽**。变体归因（`temp/bench/invest/attr.py` / `array_opt.py` / `array_chain.py`）：**保留全部 24 B 装箱读与 ≈480 MB 搬运、只去掉该往返 ⇒ 119 → 21 ms**（等效带宽 ≈4 → **22.8 GB/s**）；守卫 0 ms、边界检查 3 ms、`as_add_v`/`as_array_get`/`as_v_req_obj`/`as_v_to_number` **全部被 -O2 内联**（`clang -S` 无对应 `bl`）、tag 检查已成位掩码 + 单条 `umaddl`。**纯 C 同写法对照**（同访存、只差往返）：`s = s + a[j]` **30 ms** vs `d = (double)((int)d + a[j])` **116 ms**（3.9×）⇒ 是**纯 C 也一样**的代价。**AIR 自己 133 ms（6.05× C）**，同样付这笔语义代价。**修正**：旧报告把 5.41× 归为「带宽受限」（480 MB ÷ 116 ms ≈ 4.1 GB/s「与 C 同量级」）——该推理被 v1 直接证伪（同访存、去依赖链即 5.5× 提速），旧读数是被**延迟**压出来的。
+- **`strings`（3.04× C，243 vs 80 ms）**：**96% 在 `split().join()` 的分配上**（去 split/join ⇒ 10 ms；零分配下限 ⇒ 0 ms；字符串扫描本身**免费**）。拆到分配器：`as_str_alloc` 改走 arena bump 即 **248 → 152 ms** ⇒ **每次分配 ≈21 ns、合计 ~93 ms、占 38%**；`gc_collect` 加计时实测 **60 次回收、累计 49.8 ms**（源码里写死的 6 次显式 `System.gc()` 只值 ~9 ms，自动触发才是大头）；`gc_alloc` 计数探针 **5,700,645 次**（其中字符串 ≈420 万）。**关掉回收反而慢 3×（733 ms）** ⇒ 单次分配成本的主因是 **free-list first-fit 遍历随表长线性退化**，而它属**运行时实现**（可改 size-class 分级空闲链）、**不是「前端做优化」**，故旧报告「装箱税固有、无头部空间」**过于悲观**。
+- **附带发现并登记一个语义缺陷**（本表末行）：`emit.ts` 的 `unboxAny()` 在 `int`/`uint`/`bool` 三个分支用**原始解箱**（`as_v_int_val`/`as_v_uint_val`/`as_v_bool_val`，只读 `v.num`）而非 AS3 强转 ⇒ 动态值为**字符串**时给 0/false。双端探针 `temp/pkgA/unboxcoerce` **4/8 行不同**（`var b:Boolean=("x":*)` adl true/我们 false；`var i:int=arr[0]`（`"7"`）adl 7/我们 0；`uint`、`obj.k` 同理），复合赋值形态见 `temp/pkgA/intadd`（adl 5/我们 0）；**条件判断与显式 `int()`/`Boolean()` 强制转换均正确**，故面窄。
+
+**回归**：`node test.ts` **238 passed / 0 failed**（417.2 s）。
+
+---
+
+### 阶段一百二十：动态槽强转家族收口（`unboxAny` 原始解箱）+ GC 尺寸分级空闲链（目标 v0.4.93）✅ 已完成
+
+**范围**：两项互不相干的**既有缺陷**——① 从 `### 遗留待开发` 移出末行（`unboxAny` 的 `int`/`uint`/`bool` 分支用原始解箱而非 AS3 强转）；② `benchmarks/strings` 归因时实测出的**运行时分配器退化**（单条 first-fit 空闲链）。两项都以「同一份生成 C 的 A/B」或双端探针逐行对照为验收。
+
+**一、动态槽强转家族（第 ① 项的**扩大范围**）**
+
+遗留表登记的是 `unboxAny()` 的三个分支，实测发现**这是一个族的收敛点**：`unboxAny` 是所有「动态值 → 具体标量槽」的翻译终点，而**任何**动态值落到具体标量槽都要走 AS3 强转（`ToInt32`/`ToUint32`/`ToBoolean`/`ToNumber`/`ToString`），不是「读联合体的数字槽」。故按用户「都修复」的口径**把整族收敛点一次收口**（10 处 `emit.ts` 发射点 + 9 处 `runtime.ts` 助手）：
+
+- `emit.ts`：`unboxAny` 的 `int`/`uint`/`bool` 三分支；`toInt32Expr`/`toUint32Expr` 的 `case 'any'`；`Vector` 的 spread-push 元素、`toVector`、动态 `fixed`/`length` 的写入、动态方法实参；`String` 动态方法的 **10 处** int 实参；`Graphics_beginGradientFill`。
+- `runtime.ts`：`as_dyn_set` 的 `bool`/`int`/`uint`/`Number`/`String` 五类字段写入；`as_array_key_set` 的 `length`；`as_array_filter` 的索引参数；`as_cmp_num`/`as_cmp_cb`/`as_cmp_sorton` 的比较器返回值；Proxy 的 `hasProperty`/`deleteProperty`/`nextNameIndex` 返回值。
+- **原始解箱助手保持不变**（`as_v_int_val`/`as_v_uint_val`/`as_v_bool_val`/`as_v_num_val`）：它们是热路径上「只读联合体数字槽」的正确形态（静态类型已知是数值时用），改它们会**静默改动约百处**调用点；改为在注释里写明适用范围，并用单元钉子（`emit/DynamicSlotCoercion`）把「raw 助手不带 String 分支」与「发射点绝不用 raw 助手」**同时**钉住。
+
+**顺带修掉两个同族缺陷**（都是做探针时实测撞出来的）：
+
+1. **`String` → `int`/`uint`/`Number` 走 ES3 ToNumber**（不是 C 的 `atoi`/`atof` 前缀解析）。实测（`temp/pkgA/intcoerce`，`adl 51.4.1` 双端）：**隐式赋值与显式 `int(s)`/`uint(s)`/`Number(s)` 都是整串 ToNumber** ⇒ `int("10x")` = **0**（我们原先 10）、`int("5abc")` = **0**（原先 5）、`int("0x10")` = **16**（原先 0）、`int(" 7 ")` = 7、`int("")` = 0。修法：`as_v_to_int`/`as_v_to_uint` 的字符串分支改 `as_to_int32/uint32(as_str_to_number(ptr))`，`emit.ts` 的 `int(String)`/`uint(String)`/`Number(String)` 同步。**`Boolean(String)`（非空即 true）与 `parseInt`/`parseFloat`（前缀解析器，另一族）不动**；`as_str_to_i64` 的**十进制前缀**解析也**刻意保留**（`int64` 要走 double 再回来会丢 >2^53 的精确性，属增强取舍），只把已经失真的注释改正。
+2. **数组的字符串数字键**（`a["1"] = 42`）原先**根本不落到元素上** —— `as_dyn_set` 的 `dk == 2`（数字键）分支接了 `as_array_key_set`，字符串键分支没接（`as_any_set` 的 tag 6 同理）。现两处都按「先按 ES3 数组索引规则判定（`"1"` 是索引、`"01"` 不是）、是索引才走 `as_array_key_set`」路由。
+
+**热路径性能护栏（否则 `array` 基准会回退 45%）**：`array.as` 的热循环每轮做一次「动态元素 → `int` 累加器」强转，共 2000 万次。直接把收敛点改成通用强转助手会让 clang **拒绝内联**（`clang -Rpass-missed=inline` 实测：`inline cost: 595`，阈值 **325**；原因是被调的 `as_str_to_number` 大），代价 **116 → 169 ms**；把慢路径拆成独立助手再让单调用者的包装内联也**不行**（clang 对单调用者会**折回合并**，实测无效）。可行形态：让通用助手保持**多调用者**、另加两个**极小包装** `as_v_int_cast`/`as_v_uint_cast`（tag 1/2 直取 `as_to_int32/uint32(v.num)`，其余 tag 转交通用助手），实测 **117–118 ms**（与原始解箱同速），且语义与通用助手**逐 tag 相同**（非数值 tag 一律转交 ⇒ 强转规则只有一份）。
+
+**二、GC 尺寸分级空闲链**
+
+`benchmarks/strings` 的 570 万次 `gc_alloc` 里字符串约占 420 万，而 `gc_alloc` 的空闲链是**单条 first-fit**（从头线性找第一个够大的块）⇒ 表越长越慢（阶段一百一十九 归因：把 `as_str_alloc` 换成 arena bump 即 248 → 152 ms；关掉回收反而慢 3×）。本轮按**尺寸分级**重构空闲链（`runtime.ts`）：
+
+- `gc_free_small[GC_SMALL_CLASSES]`（`GC_SMALL_ALIGN 32`、`GC_SMALL_CLASSES 16`、`GC_SMALL_MAX 512`）+ `gc_free_mid` + `gc_free_big`；`gc_small_class(size) = size / 32`（≥ `GC_SMALL_MAX` 回 −1）、`gc_free_list_for(size)` 按同一规则分类（**释放侧与查找侧共用同一函数**，保证「块必然可被找到」）。
+- `gc_find_block` 从**请求尺寸所属的类**开始**向上爬**（同类内仍做 `h->size >= size` 有界检查）—— 因为块尺寸**不取整**（精确尺寸，`free_bytes` 的段账目与 `gc_release_empty_segs` 的判定逐字不变），同类的块可能比请求小。
+- 4 处手写遍历（审计/统计路径）统一收口到 `li < GC_SMALL_CLASSES + 2`。
+
+**A/B（同一份生成的 C，只改分配器，`temp/sc/`）**：
+
+| 变体 | strings (ms) | binarytrees (ms) |
+|---|---|---|
+| 老的两分链（`free_small` + `free_big`） | 248 / 251 / 273 | 97 / 98 |
+| **尺寸分级（本轮）** | **211 / 211 / 212** | **103 / 104** |
+| 反向实验：分级但**只搜精确类**（不爬类） | — | **442596（7m23s！）** |
+
+三条结论：① 分级让 `strings` 的小分配从「链长线性退化」变成**类内 O(1) 命中**（−15%）；② `binarytrees` **+6%** 是同一容器内的代价（每块分类 + 多链头读取），属可接受的权衡（该基准的箱子尺寸集中，老的单链 LIFO 恰好最省）；③ **爬类是承重的**——反向实验（只搜请求尺寸的精确类、不向上爬）让 `binarytrees` 从 103 ms 变成 **442596 ms（4300×）**，因为它再也复用不到任何偏大的块、只能不断切新段 ⇒ 该设计**不是**随手可去的复杂度。
+
+**三、验收**
+
+- `node test.ts` **240 passed / 0 failed**（unit **80 → 82** 组；新增 `emit/DynamicSlotCoercion` **31** 条、`runtime/GcSizeClasses` **12** 条）。
+- **双端探针 24 组**复核（`temp/pkgA/`）：`unboxcoerce` **4/8 → 0/8**、`coerce2`/`coerce3`/`coerce4`/`coerce5`/`arrkey`/`arr2`~`arr5`/`vals`/`dyn`/`eq`/`verify`/`tonum`/`vecstr`/`arrcoerce`/`cast2` 全 0；`intcoerce` 只剩 `parseInt` 一行、`tonum2` 只剩 `1e308` 打印一行（均已入遗留表）。
+- **顺带修掉一条陈旧单元钉子**（教训重复两次）：`test/unit/display.ts` 的 `display/LineMetrics` 钉的是**旧坐标**（`as_v_int_val(args[0])`）—— `TextField.getLineMetrics` 的 int 形参走动态分派后**必须强转**，已改为 `as_v_int_cast(args[0])`。
+- **benchmarks 8 项四路结果一致**（`temp/bench/v0493.txt`）：`strings` **243 → 210（−14%）**、`array` **119 → 118**（阶段一百一十九 归因里那个「直接调通用助手即 +45%」的回退已被本轮的 cast 包装**归位**） 、`binarytrees` **97 → 103（+6%，见上表）**、`fib` 285、`nbody` 200、`mandelbrot` 120、`spectralnorm` 39、`oop` 91。**跨轮归因只认 >10% 的变化**：本轮 C 列（与本编译器无关）同期漂了 **−0…−9%**（`oop`/`array` 最明显），故 `oop` 的 98 → 91 落在机器漂移内、**不作归因**；`strings` 与 `binarytrees` 两条都有**同 C 的受控 A/B**佐证，才是真实的。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.92 → **v0.4.93** + 两条 bullet（动态槽强转家族 / GC 分级空闲链）+ 单元组计数（80 → 82 组、238 → 240 用例）；`package.json` v0.4.92 → **v0.4.93**；`benchmarks/README.md` 新增「本次结果（编译器 v0.4.93）」一节，`benchmarks/{strings,binarytrees,oop}/report.md` 同步本轮数字与归因。
+
+**遗留表**：**移出 1 行**（`unboxAny` 的 `int`/`uint`/`bool` 原始解箱，已落地）；**新登记 4 行**（本轮探针顺带实测出的同族/邻域缺口：`DisplayObject.name = null` 应抛 `#2007`、越界读 `undefined`、静态 `Array` 的 `in` 与越界键、`parseInt`/`parseFloat` 的 radix/NaN）⇒ **90 项**（未开始 **79** / 部分完成 **10** / 暂缓 1）。
+
+---
+
+### 阶段一百二十一：`System.totalMemory`/`freeMemory` 的 O(n) 堆遍历 —— 「一卡一卡」的真根因（需求方是 stats HUD）（目标 v0.4.94）✅ 已完成
+
+**触发**：用户报「基准数值几次差不多，但动画一卡一卡」，问是不是 GC。
+
+**先证伪 GC（三条独立证据）**：① 探针在**所有**长帧上 `worstgc=0.00`；② `ASC_GC_THRESHOLD=1<<60` 完全关掉回收后卡顿**逐字相同**（`over17ms=17`，峰值反而更高、RSS 涨到 1.8 GB）；③ 把预算/阈值放大到探针**确实**测到 GC（`gcmax=9.93 gcavg=0.53 gcshare=5.7%`）⇒ 探针对 GC 敏感，故阴性结论可信；`sample` 里 `gc_write_barrier` 仅 0.74%、`gc_scan`/`gc_mark`/`gc_sweep` **零采样**。
+
+**定位**：给探针加**帧序号**日志（`SLOWF idx=… dt=… gc=…`，>12 ms 才打）后，长帧是**严格每 30 帧一次**（间隔=30 出现 137 次；`idx mod 30` 单一残差 158 次 vs 均匀期望 10.5）——**确定性周期**而非随机越预算（注意：该 30 帧周期项是 harness 的 `bench-auto` 打开的 `BENCH` 跟踪行造成的，验证方法正是把它关掉：间隔=30 从 140 → **1**；故下面用计时而非周期去定位）。给 `BENCH` 分支做**五段计时**，真凶当场现形：
+
+| 段 | p50 (ms) |
+|---|---|
+| `numChildren` | 0.000 |
+| `numToFixed` | 0.002 |
+| **`totalMemory` + `freeMemory` + `privateMemory`** | **8.423** |
+| 16× `as_str_concat` | 0.151 |
+| `fputs`+`fflush` | 0.011 |
+
+根因：`gc_heap_used_bytes()` 是**遍历 `gc_all` 整条对象链求和**的线性函数（O(存活对象数)），`as_system_total_memory()`/`as_system_free_memory()` 各调它一次。**需求方正是 stats HUD**：`src/starling/core/StatsDisplay.as:118` 的 `_memory = System.totalMemory * B_TO_MB`，`UPDATE_INTERVAL = 0.5` ⇒ 用户按 SPACE 开的白框 **每 0.5 秒**让一帧多花 ~6.4 ms、掉两帧。
+
+**修法**：改为 **O(1) 镜像**——`gc_all_bytes`/`gc_new_bytes` 在两个入链点（`gc_alloc` 的 IDLE / `gc_new` 分支）、两个 `gc_new` 拼接点（`gc_finish_cycle`/`gc_collect`）、一个出链点（sweep 释放）各维护一次；线性遍历**仅保留在 `if (gc_audit_on())` 的交叉校验分支**（照镜子校验，不参与快路径）。镜像的语义定义与遍历**逐字相同**（头 + 载荷），周期内的 `gc_new` 块先计在 `gc_new_bytes`、拼接时并回，故**任何时刻**都等于遍历值（不只是周期间）。
+
+**证据**：
+- **数值逐字不变**：`ASC_GC_AUDIT=1` 下每次 `totalMemory` 调用都与原遍历比对，**278 次比对 0 处不一致**，且无其它 `[gc-audit]` 抱怨。
+- **调用成本**（同一份生成 C 的 A/B）：`BENCH` 分支三段计时 **8.652 → 0.099 ms（p50，87×）**，其中内存三连 **8.423 → 0.013 ms（650×）**；读数不变（`mem=134.1MB` 同量级）。
+- **用户路径 A/B**（`temp/hidpi/jank/hud_probe.py`：激活窗口 → 按 SPACE 开 HUD → 录 `HUDT`）：`StatsDisplay.update()` **p50 6.436 → 0.407 ms**、max 9.479 → 3.972 ms；同段帧分布 p99 **39.15 → 12.66 ms**、`over17ms` **27 → 0**（截图 `temp/hidpi/jank/hud_on.png`：绿框已开、`std memory 50.2` 即该 API 读数）。
+- **回归**：全量 `npm test` **241 passed / 0 failed**（含 6 个既有内存/GC 示例 `gc_bytes`/`gc_alloc_threshold`/`gc_incremental`/`gc_strings`/`stage52`/`stage57`）；新增单元组 `unit: runtime/MemoryQueryO1`（7 项）钉住「快路径不许出现遍历 + 每个链变更点都必须改镜像」，防回归。
+- **顺带（同轮，无帧分布收益）**：`ByteArray` 的逐元素端序助手 `as_ba_put_u32`/`as_ba_get_u32` 改为「探测一次 + 无条件 4 字节 `memcpy` + 可选可移植字节反转（clang 出 `rev`+`csel`）」，并把 `strcmp`/指针缓存填充拆成冷函数 ⇒ 两助手**被完全内联**（`nm` 已无符号）、单次存储从 3 分支 4 条字节写变成 **1 条 `str`**，语义由 `examples/reg-bytearray-endian.as` 钉住。它对帧分布**无影响**（`over17ms` 不变）——真正的收益在本阶段的 O(1) 镜像。
+
+**未修（不在本阶段范围）**：修后 `StatsDisplay.update()` 仍有 **p90 3.1 ms** 的固有成本，来自它自己的 `_values.text` 文本纹理重建（与内存 API 无关，属阶段一百零四 的合批口径）。**不登记为遗留行**（是性能项、不是语义缺口，与 `### 遗留待开发` 的口径不同）；故遗留表项数不变（**92 项**）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.93 → **v0.4.94** + 一条 bullet；`package.json` v0.4.93 → **v0.4.94**；单元组计数 82 → **83 组**、240 → **241 用例**。
+
+---
+
+### 阶段一百二十二：`new <动态 Class 值>` 的操作数收口 + `[Embed]` **打包范围**实测（目标 v0.4.94 → v0.4.95）✅ 已完成
+
+**触发**：用户贴了 `away3d-core/Basic_Stereo` 的失败构建（485 sources、40 embedded assets，停在 `Codegen error at 446:6: dynamic instantiation requires a Class reference`）并问两件事：① `[Embed]` 到底是**按代码里真实内嵌的内容**打包，还是**把所有资源一起**打包？② 这个 demo 为什么编不过？
+
+**Q② 根因（一行代码，三道门）**：`src/Intermediate_MD5Animation.as:446` 是 `AssetLibrary.loadData(new ANIM_CLASSES[i](), null, ANIM_NAMES[i], new MD5AnimParser())`，而 `private const ANIM_CLASSES:Array = [HellKnight_Idle2, …]` 装的是 **`[Embed]` 生成的资源类**。`emitIndex` 对 `Array` 下标的静态类型是 **`any`**，而 `emitNewDynamic` 只在 **`class`** 时放行 ⇒ 直接 `CodegenError`。这是**同一门语言里自相矛盾**：`lookupObjectVar` 与限定静态字段分支（`sf.type.kind` 可能是 `class`/`object`/`any`）早就接受后两种形态，`dynNewCode` 也已按 `any` 发过 `as_v_new_class`。
+
+**修法**：`emitNewDynamic` 的守卫接受 `class` | `object` | `any`，诊断文案用 `describeType` 点名实际操作数类型；`dynNewCode` 按操作数静态形态取类指针——`any` ⇒ 装箱值经 `as_v_new_class` 解箱、`object` ⇒ 裸指针经 `as_new_class_ptr`、`class` ⇒ 指针本身。两个新助手在 `RUNTIME_PREAMBLE`（挨着 `as_v_as_class`）里**失败关闭**：`tag != 4` / `ptr == NULL` / `gc_in_heap(ptr)` 任一命中即 `NULL`，否则必须是**类注册表恒等**（`as_v_is_class`）才给出 `as_class*`。于是 `new x()` 与 `x is Class` 是**同一个谓词**，非 Class 一律 `NULL` 交给既有 `as_dyn_new` 抛 AIR 的 `TypeError #1007`——**绝不会**把普通对象的载荷当 `as_class` 解引用（那会变成野调用）。
+
+**刻意更严的一处（已注释说明）**：静态判为**标量/数组/函数**的操作数（`int`/`String`/`Boolean`/类实例/`Array`/`Function`…）仍在**编译期响亮报错**——`mxmlc 51.4.1` 实测只给 warning 就收（`temp/dynnewop`：`new (n)()`、`new (s)()`、`new (a)()`、`new (f)()`、`new (null)()` 全部编过），故这是**本子集对无意义输入更严**，不是 AIR 定义的行为；`adl` 侧那批形态的 `#1007` 未能复测（空 trace 输出 / `Killed: 9`），故不写进文档当口径。
+
+**Q① 答案（同轮实测，登记为新遗留行）**：**不是**按真实内嵌内容——`--air-app` 的 `walk(srcDir)` 收 `<appRoot>/src` 下**所有** `.as`（`Basic_SkyBox` 与 `Basic_Stereo` 各 485 个），**没有可达性分析** ⇒ **每一个** `[Embed]` 都成为资源：`embed 40 asset(s)` / **4,969,434 B（4.74 MB）**，日志里堂而皇之列着**别的 demo** 的资源（`Basic_SpriteSheetAnimation.testSheet1/testSheet2`）。而且它们**真的存活进产物**：`as_class_registry[]` 引用每个类对象，而 `away3d/utils/Cast.as` 的 `getDefinitionByName` 让 `as_get_definition_by_name` 可达 ⇒ 注册表是活的 ⇒ `-O2` 剪不掉嵌入工厂与字节数组。**判据是二进制字节**：在**不**使用它们的 `Basic_Stereo`（34,134,400 B）里，`road.jpg`/`rockbase_normals.png`/`idle2.md5anim`/`grimnight_posX.png` 各自的 48 字节中段**各出现 1 次**（`Basic_SkyBox` 里同项亦各 1 次，其中三个是它**没用**的）。对照 `mxmlc`/`adl` 的**传递编译**（`-source-path+=src` + `$MAIN_SRC`，只处理可达类的 `[Embed]`）：SWF 体积即证——`Basic_Stereo.swf` **94 KB**（它**自己不声明任何**嵌资源）、`Basic_SkyBox.swf` 746 KB ≈ 它自己的 6 张天空盒（645,180 B）、`Basic_UVAnimation.swf` 421 KB ≈ 它自己的 2 个资源（326,601 B）、`Intermediate_MD5Animation.swf` 2.71 MB；全 40 个会 ≥4.6 MB。**连带后果**：**不可达类里的坏/缺失 `[Embed]` 会让我们编译期失败**（`adl` 构建无恙）——属窄口径的保真缺口，已入遗留表。
+
+**证据**：
+- `Basic_Stereo` **现在编得过**（34,134,400 B，约 36 s），`Basic_SkyBox` 重建（34,150,992 B），两者都启动 10 s 无早退；天空盒**画面复核**：`temp/dynnew-verify/skybox-new2.png`（2048×1600）是雪山天空盒 + 环境反射铬环、`FPS:119`，近黑像素 **0.2%**（若 `[Embed]` 的 `new data()` 路径破了，`SingleFileLoader.parseData` 会 `#1007`、场景无贴图 ⇒ 整屏纯黑，而实测是 99.8% 非黑）——这正是被改动的那条路径（`if (data is Class) data = new data();`）的端到端反证。
+- 新增示例 `examples/dynnew-operand.as`（`test/examples.ts` 自动发现，一示例一用例）：数组元素（字面量索引 + 变量索引）、`Vector.<Class>` 元素、成员链 `new h.list[0]()`、带实参（走 ctor thunk）、`expect1007` 覆盖 String/Number/Boolean/实例/Array/null/数组元素/Vector 元素/Object 静态类型非 Class，以及 `is Class` 与 `new` **判定一致**（`if (candidate is Class) return new (candidate)();`）⇒ `dynnew-operand: all assertions passed`。
+- 新增单元组 `unit: reflection/DynNewOperand`（16 条）钉**源级形态**：`as_v_new_class(as_array_get(`、`as_new_class_ptr((void*)(g_o))`、`Vector.<Class>` 取值不被二次解箱、`is Class` 走注册表恒等、`#1007` 的调用链、以及标量操作数的诊断文案（含 `int`）。
+- **回归**：全量 `npm test` **243 passed / 0 failed**（单元组 84/84）。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.93 →（上阶段）v0.4.94 → **v0.4.95** + 两条 bullet（`new` 的操作数收口；`[Embed]` 打包范围为已知偏差）；`docs/zh-cn/embed.md` 新增 **§7「编译范围：谁的内嵌会被打包」**；`package.json` v0.4.94 → **v0.4.95**；单元组计数 83 → **84 组**、241 → **243 用例**；遗留表 94 → **95 行**（新登记 1 行）。
+
+**遗留表**：**新登记 1 行**（编译范围 = 整个 `src/`，无可达性分析 ⇒ 其它 demo 的 `[Embed]` 被打包并存活进产物 + 不可达类的坏 `[Embed]` 让我们编译期失败）；**移出 0 行**。
+
+---
+
+### 阶段一百二十三：成员解析的**最近声明**规则 —— 本类访问器遮蔽**继承字段**（`Intermediate_MD5Animation` 的 `#1009` 真根因）（目标 v0.4.95 → v0.4.96）✅ 已完成
+
+**触发**：用户报 `away3d-core/Intermediate_MD5Animation` 运行即死——
+`node ../../src/index.ts --air-app ./Intermediate_MD5Animation-app.xml --main-class Intermediate_MD5Animation --target native --run`
+只打一行 `Uncaught exception: Error #1009: Cannot access a property or method of a null object reference.` 便退出（构建本身 `EXIT=0`）。
+
+**一、根因：`fields` 继承扁平化 + 读取侧「先字段、后访问器」的次序，让**祖先的字段**盖住了**本类的 getter**
+
+lldb 断在 `fprintf` 拿到调用链（`-O2` 下符号仍可读）：
+`Intermediate_MD5Animation_init/initObjects` → `ObjectContainer3D_addChild` → `ObjectContainer3D_setParent` →
+`ObjectContainer3D_updateMouseChildren` → `as_req_obj` → `as_throw`。失败源码行是 `src/Intermediate_MD5Animation.as:358`
+的 `redLight.addChild(new Sprite3D(redLightMaterial, 200, 200));`，而生成 C 里 `updateMouseChildren` 发的是
+**`this->parent`（裸结构体字段读）**，不是 `this->vtable->get_parent(this)`。
+
+`updateMouseChildren` 的 AS3 正文（`src/away3d/containers/ObjectContainer3D.as:218`）读的是**访问器** `parent`：
+
+```as3
+if (_parent && !_parent._isRoot) {
+    _ancestorsAllowMouseEnabled = parent._ancestorsAllowMouseEnabled && _parent.mouseChildren;
+} else
+    _ancestorsAllowMouseEnabled = mouseChildren;
+```
+
+`ObjectContainer3D.as:533` 声明 `get parent():ObjectContainer3D`；而我们**内置的 `EventDispatcher`**（`src/symbols.ts`）把
+**显示列表的祖先链接**存成一个**同名字段 `parent`**（AIR 的 `EventDispatcher` 根本没有 `parent`，两者在 AIR 上永不照面）。
+`ClassInfo.fields` 是**继承扁平化**的（含继承成员），`fieldSlot()` 于是返回了**祖先那一条**，而成员读取路径**先查字段、后查访问器**
+⇒ 读出的是「away3d **从不赋值**」的那个槽（away3d 自己的场景图用 `_parent`）⇒ `as_req_obj(NULL)` 抛 `#1009`。
+
+**为什么只有这个 demo 中招**：`Scene3D.as:35` 把 `_sceneGraphRoot._isRoot = true`，于是「挂在 root 下」的对象 `_parent._isRoot` 为真、
+走 `else` 分支、**根本不读 `parent`**——`Basic_SkyBox`/`Basic_Stereo`/`Basic_UVAnimation` 全都只往 root 加子件；
+`Intermediate_MD5Animation` 是唯一做「灯`.addChild(…)`」（父件**非 root**）的 demo，第一次走到就炸。
+
+**二、修法（AS3 规则：最近声明者胜；**只对读取**，setter 不算）**
+
+`src/symbols.ts` 新增 `shadowedForRead(cls, fieldOwner, name)`：从 `cls` 沿 super 链**逐层**走（走到声明该字段的 `fieldOwner` 为止），
+若中间某一层**自己**声明了同名 getter **或方法**即返回真（命名空间代理桩 `isProxyNs` 排除）。**逐层**（而非「只看叶类」）是必须的：
+away3d 大量以中间层静态类型读 `parent`（`Entity`/`Mesh`/`SegmentSet`…，getter 声明在 `ObjectContainer3D`）——
+`Basic_SkyBox` 的 8 处 `Entity` 静态类型读取正属此类。
+
+`src/emit.ts` **五处**解析点接入 —— **三处读取**（成员访问 `obj.prop`、类内裸标识符 `parent`、`Class` 型槽读取）命中即跳过字段、继续走既有 getter/vtable 路径；
+外加 `walkInferType` 的**两处类型推断**（类内裸标识符分支、`ot.member` 分支）同规则。**推断侧也要接的理由**：类型推断与发射必须给出同一个答案，
+否则前导 pass（`_once` 提升、装箱/对象强转的选择）可能按**祖先字段**的类型去强转一个**实际由 getter 读出**的值——这属于「同名解析点必须一致」的闭合，不是新增优化。
+
+**setter 刻意排除**（第一版把它算进去，被回归当场抓住）：内置类把 AIR 的**访问器对**保留为**存储字段**（`DisplayObject.x/y`），故「本类声明了 setter」时
+**没有**祖先 getter 可回落；away3d 的 `View3D` 正是 `override set x` 之后在**自己的 setter 体内读 `x`** ⇒
+把 setter 计入遮蔽会立刻退化成 `Codegen error at 510:4: undefined variable 'x' in class away3d_containers_View3D`。
+语义上这也对：更近的 setter 只支配**写**，而写路径本来就先解析 setter。
+
+**三、证据**
+
+| 证据 | 结果 |
+|---|---|
+| 端到端重建（删掉陈旧 `.o` 后整链重来） | `EXIT=0`（479 sources + Metal/Skia/SDL2/curl），生成 C 里 `updateMouseChildren` 已是 `this->vtable->get_parent(this)`，`bool _sc570`（不再是 `as_value` + `as_dyn_get`） |
+| 运行 12 s 无 `#1009`（此前是启动即死） | 窗口 1024×800@2 = 2048×1600；两张相隔 2 s 的截图差 **37,035** 像素（MD5 骨骼动画在跑）；静态截图：岩石地面 + 夜空天空盒 + 地狱骑士网格，HUD `FR:7/0 A:171 RAM:121.6M POLY:2744 DRIV:Metal`（`temp/md5verify/md5-fix-0{1,2}.png`） |
+| 新增示例 `examples/member-shadow.as`（`test/examples.ts` 自动发现） | 5 节断言：own getter 遮蔽继承字段 + 深子类继承 getter 仍遮蔽 + 未遮蔽继承字段照旧读写 + 显示列表槽仍被 `addChild` 写进 + setter-only override 不遮蔽 ⇒ `member-shadow: all assertions passed` |
+| **反向对照**（临时探针：在 `shadowedForRead` 首行插 `ASC_NO_MEMBER_SHADOW=1` ⇒ 直接 `return false`，即还原旧行为。**探针已在收尾时移除**，复现需按此描述临时插回） | 新示例**必 FAIL**（loud）：`Uncaught exception: FAIL: own getter must shadow the inherited \`parent\` field`，`rc=1` |
+| 新增单元组 `unit: reflection/MemberShadow`（11 条） | 钉源级形态：`o.parent` 与类内裸 `parent` **都**走 `->vtable->get_parent(`、深子类同样、`{ "parent", 12, offsetof(EventDispatcher, parent) },` **仍存**（**不得**靠删槽修）、未遮蔽字段仍直读直写（`->name`，无 `get_name(`）、setter-only 不炸且 setter 仍发射、规则**单点化**（`shadowedForRead` 定义 1 处 + `emit.ts` 5 处调用：3 读取 + 2 类型推断） |
+| **兄弟 demo 零回归（生成 C 全文对照）** | 对 `Basic_SkyBox` 以同一探针做 `--dry` 双跑（`temp/skybox-aot/temp_skybox_{old,new}.c`）⇒ 全文 **12 处 hunk，全部是 `parent` 的读取**，无一处其它语义面被碰到。分类：① 纠正**恒 NULL 的槽读**（`updateMouseChildren`、`dispose`、`HoverController` ×2 处、`Mouse3DManager` 事件冒泡 ×2、`SceneIterator` 的 POST 上行、`Bounds.getParentBounds`、`Mesh.intersect` 的 `localIntersect`、`SegmentSet` 的父件判空）——每一处的新发射**正是 AS3 原文**（`get parent()`；`dispose` 的 `if (parent) parent.removeChild(this);` 旧码因读 NULL 而**静默跳过**）；② 顺带把「按祖先字段绕路动态分派」改成**静态**（`as_dyn_get(parent,"inverseSceneTransform")` → `parent->vtable->get_inverseSceneTransform(parent)`、`as_dyn_call(parent,"removeChild",…)` → `parent->vtable->removeChild(parent, this)`、`Object* parent` 静态类型收成 `ObjectContainer3D*`、比较从 `as_v_loose_eq(as_obj_to_value(…))` 收成 `==`）——动态查找命中的**正是同一个** getter/方法，语义等价、只是不再走反射 |
+| 兄弟 demo 运行期 | `Basic_SkyBox` 重编（**34,134,480 B**）启动 14 s 无异常；截图仍是雪山天空盒 + 环境反射铬环、非黑 **100.0%**、`FPS:114 MEM:13MB PRIV:173MB RUNTIME:AS-AOT`（`temp/md5verify/skybox-fixed-01.png`）。**这几处改动在上述 demo 里不进分支**：`updateMouseChildren` 因 `_isRoot` 走 else；`dispose` 未被调用（`grep dispose` 无）；三个 demo 均**不 new 控制器**（`grep Controller` 无）；`Mouse3DManager`/`Mesh.intersect`/`Bounds` 只在有鼠标输入时进入；`SceneIterator` 只在 `ViewVolume.addStaticsForRegion`（GridView 静态分区）里使用，本批 demo 的 `Scene3D` 用 `NodeBase` |
+| **类型推断侧同规则（零差异证明）** | 这 2 处新守卫的判据是「全文 `cmp`」：对 `Basic_SkyBox`（485 sources）以「有/无这 2 处守卫」双跑 ⇒ 生成的 C **逐字节相同**（262,615 行）；再对**当前树**做一次完整端到端重建（`rc=0`，`temp/guardverify/skybox` **34,134,472 B**）且其 C 与 `--dry` 跑法**逐字节相同**，启动 7 s 无异常、渲染正常（`temp/guardverify/sky_run.png`：雪山天空盒 + 环境反射铬环、HUD `FPS:117 MEM:13MB PRIV:174MB RUNTIME:AS-AOT`）⇒ 推断侧接入对 away3d 语料**零发射差异**，端到端链路（编译→链接→运行→渲染）仍通 |
+| 全量 `node test.ts` | **245 passed / 0 failed**（单元组 85/85） |
+
+> **口径说明（为何这里不用像素比对作回归判据）**：`Basic_SkyBox` 的相机 `rotationY += 0.5*(stage.mouseX-stageWidth/2)/800` **逐帧累加** ⇒
+> 偏航角是**帧数**的函数，两次运行只要帧数不同就整屏不同（实测与阶段一百二十二 的参考图 `temp/dynnew-verify/skybox-new2.png` 粗采样差 **77.3%**、
+> 差异框覆盖整幅，而两者都是正确渲染）。故对兄弟 demo 取「生成 C 的 hunk 枚举 + 执行可达性分析 + 启动/渲染实测」为判据，不取跨运行像素相等。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.95 → **v0.4.96** + 一条 bullet（成员解析的最近声明规则）；
+`docs/zh-cn/as3-semantics.md` 差异表新增一行（继承扁平化 vs 最近声明）；`package.json` v0.4.95 → **v0.4.96**；
+单元组 84 → **85 组**、243 → **245 用例**。
+
+**遗留表**：**新登记 0 行**（本阶段是把**已定义**行为修对，不新增缺口）；**移出 0 行**。
+
+---
+
+### 阶段一百二十四：`--air-app` 编译面 = 主类的**传递闭包** —— 停止过度近似 AIR（目标 v0.4.96 → v0.4.97）✅ 已完成
+
+**触发**：用户就 `TODO.md` 遗留表里的「编译范围 = 整个 `src/`（无可达性分析）」一行提问——**是否需要做触发类闭包？**
+（阶段一百二十二 已把它实测登记，但结论停在「先定口径再动」）。本阶段把口径定死并落地。
+
+**一、口径：收面是「停止过度近似 AIR」，不是增强**（AGENTS.md §1.5 的判据反着读）
+
+AIR 的编译面**本来就是传递闭包**：`mxmlc -link-report` 实测（`temp/linkreport/`，6 个 demo 的 SWF + XML）
+away3d 每个 demo 只链 **158–246** 个 def、六个 demo 合起来只触及 **287** 个不同类，而 `src/` 有 **485** 个 `.as`
+——**其中 198 个不被任何一个 demo 触及**。我们此前一律编译整包（**约 2.8× 过度近似**），代价两处可见：
+
+1. **别的 demo 的 `[Embed]` 被打包并存活进产物**：`Basic_SkyBox` 的构建日志 `embed 40 asset(s)` / **4,969,434 B**，
+   而它自己只需要 6 张天空盒（**645,180 B**）——多出来的 **4,324,254 B（87%）属于别的 demo**。
+2. **不可达类里的坏/缺失 `[Embed]` 让我们编译期失败**，而 `adl` 正常构建（窄口径保真缺口）。
+   （已实测到实例：我们编译了 `away3d.core.pick::PBPickingCollider.RayTriangleKernelClass` 与
+   `away3d.textures::SplatBlendBitmapTexture.NormalizeKernel` 两个 `.pbj` 嵌资源，`mxmlc` **从不处理它们**。）
+
+**为什么修法必须在「发射面」而不是链接期（本阶段最关键的结构发现）**：`main()` 无条件调用 `as_amf_wire()`
+（生成 C 第 262598 行）⇒ 它把 `as_class_registry[]` 的每一项都变成活引用（`.c:138189` → `.c:135427` 的注册表遍历），
+于是**每个类对象、vtable、反射表、嵌入工厂**都被钉住。二进制 `nm` 实测：`as_get_definition_by_name`=0、
+`as_v_is_class`=0、`as_v_class_of`=0，但 **`as_amf_class_impl`=1**、**`as_class_registry`=1**，以及
+`Basic_SpriteSheetAnimation__onEnterFrame` 等 **100 个别的 demo 的方法符号**仍是 `T`。⇒ 类侧 DCE 在链接期**不可能**；
+正确修法是**决定编译哪些 `.as`**（喂给注册表的类更少），**而不是**把注册表变懒——后者会同时打断 `is Class`、
+`new x()`、`getDefinitionByName` 与 GC 根（阶段一百二十二 的「②」正告过这一点，本阶段按它执行）。
+
+**二、实现**
+
+新模块 `src/reach.ts`（662 行，编排在 `src/index.ts` 的 `--air-app` 分支，两趟）：
+
+- **Pass 1 `prepareReachFiles(asFiles, srcDir)`**：读 + 解析 + **重写**每一个源文件（把这段从 `index.ts` 提出来，
+  使闭包与单元测试共用**同一条准备路径**）。重写两条都是 AS3 包规则：**文件作用域匿名命名空间**（顶层 `class X {}`
+  不在任何 `package { }` 里 ⇒ `packageName` 置为**相对 `src/` 的路径 id**，避免与内建类撞键，如 `Polygon.as` 的
+  `class Rectangle` vs `flash.geom.Rectangle`；注意**裸 `package { }` 的 `packageName` 是 `''`**——falsy 但**不是 null**，
+  故不重写，away3d 的 demo 主类正属此类）与**同文件可见性注入**（每个类的 `imports` 追加同文件 FQN）。
+- **Pass 2 `computeReachable(files, mainClassFqn)`**：从文档类出发做类引用闭包，返回 `{kept, dropped, roots, edges}`。
+  **边 = 源码里出现的类名引用**：`new X`（含限定名 `new pkg.X()`）、类型标注（含 `Vector.<T>` 的元素类型，
+  递归拆嵌套）、`extends`/`implements`、`is`/`as` 目标、`catch (e:T)`、参数/返回类型、接口方法签名，以及
+  **裸标识符**（覆盖 `Foo.staticM()` 的短名形式）。**总是保留**：主类、`[WasmExport]` 类/静态方法（无 AS3 引用的
+  JS 入口）、以及带**非类顶层语句**（模块语句/自由函数）的文件——那类代码是整程序发射的，无法按类剪
+  （away3d 树里恰好钉住一个文件：`away3d/debug/Debug.as` 的 `function dotrace(...)`）。**文件粒度**：一个文件里
+  任一顶层类可达即整个文件保留（同文件的兄弟类随之保留，属**超集**方向，安全）。
+- **解析刻意过度近似**：限定名走精确匹配；未解析的短名走**全局同名候选（返回全部）**——因为 `symbols.ts` 的
+  `typeAlias` 是**全局 last-wins** 表，任何一个同名候选都可能是 codegen 的答案。这正是「闭包 ⊇ AIR 闭包」的机制。
+- **walker 用穷尽 switch + `never` 兜底**（3 处），新增 AST 节点会**在这里编译失败**直到 walker 学会它（§2.2 数据优先规则应用到本 walker）。
+- **接线**：闭包结果只用于 ① 决定把哪些文件的 `body`/`imports` 推进 `program`；② 决定对哪些文件跑 `collectEmbeds`
+  （`src/index.ts` 的 `for (const f of keptFiles)` 循环内）。构建日志首行报收面结果：
+  `[1/4] read ... (main Basic_SkyBox, 165/485 sources reachable from Basic_SkyBox)`。
+- **`--all-sources`**：`--air-app` 专属开关，跳过闭包、编译 `src/` 下全部 `.as`（= 本阶段之前的口径），
+  供「源码里引用得不可见」的工程兜底。
+- **一处刻意更严的边界（已实测，不会造成静默漏类）**：**全限定静态成员访问** `a.b.S.staticM()` 在**本编译器里
+  本来就编译不过**——`Member` 链解析成 `Var('a')`，codegen 报 `Codegen error at 4:7: undefined variable 'a'`
+  （实测）；walker 对它只收集到 `a`（解析不到类）⇒ **没有类被静默丢掉**，是**响亮**的 `CodegenError`（§2.5）。
+  这与 codegen 的能力面**一致**，不是新缺口。
+
+**三、验收**
+
+| 证据 | 结果 |
+|---|---|
+| **① 闭包 ⊇ AIR 的闭包**（6 个 away3d demo 逐个对照 `mxmlc -link-report`；脚本 `temp/reachprobe/closure.mjs`） | 保留 165/173/162/169/157/219 个文件 vs AIR 的 158/175/162/171/158/246 个 def；**唯一「AIR 有而我们没有」的是 `away3d.arcane`——那是 `<def/>` 形态的**命名空间**伪定义（`type="ne"`），不是类**（本编译器里命名空间是透明的，正确排除）。「我们比 AIR 多」的全是**同文件内的嵌套/单例辅助类**（`SingletonEnforcer`/`SegRef`/`SubSet`/`OpCode`…），内部 ABC 类 mxmlc 不单列 |
+| **② 同源 A/B 的体积与时间**（`Basic_SkyBox`，同一份源码；`--all-sources` vs 默认） | 源文件 **485 → 165**；嵌资源 **40 → 6**；`.c` **31,324,486 → 9,105,166 B（−71%）**；`.o` 13,829,456 → 3,856,800 B；二进制 **34,134,472 → 25,456,904 B（−25.4%）**；整链构建 **37.03 → 15.94 s（−57%）**。（`-o` 与就地构建的 `.c` **逐字节相同**；二进制差 8 B 纯属产物路径长度，非语义） |
+| **③ 二进制字节判据**（旧口径参考物 = 阶段一百二十三 留下的整包 `Basic_Stereo`，34,134,400 B，**仍在盘上**） | `road.jpg`/`rockbase_normals.png`/`idle2.md5anim`/`grimnight_posX.png` 的 48 字节中段：整包 **各 1 次**（`testSheet1.jpg` 15 次）→ 闭包 **各 0 次**；同时**自己的** 3 张天空盒贴图整包 1 次 → 闭包 **仍 1 次**（该留的留、该走的走） |
+| **④ 逐 demo 的嵌资源数与 AIR 逐个相等** | 6/2/0/2/1/27 对 6/2/0/2/1/27（`Basic_Stereo` 两边都是 **0**——它自己不声明任何嵌资源） |
+| **⑤ 源码级 A/B：闭包产物 vs `--all-sources` 产物**（把「不会漏类」从体积变成**定义性证据**；脚本 `temp/closureverify/cmpfuncs.py`，按函数名对齐后把 codegen 的全局编号临时名归一化） | `Basic_SkyBox`：**「只在闭包产物里出现的函数 = 0 个」**；8111 个共有函数里 **只有 8 个**文本不同，**8 个全部是「本构建里存在哪些类型」的清单表**（`as_amf_members_impl`、`as_vec_{fqn,super_fqn,get,set,call}_impl`、`as_amf_vec_impl`、`gc_mark_user_roots`），且这 8 个**逐行都是整包版本的子集**（`lines-in-closure-not-in-all = 0`）⇒ 收面只删「本构建不存在的类/向量元素类型/静态根」的条目，**没有改任何一行可达代码**。`Intermediate_MD5Animation` 复跑同一结果（10101 个共有函数，同样 8 个清单表、同样 0 处越界） |
+| **⑥ 渲染/行为回归（12 个 `--air-app` 工程全建全跑）** | away3d×6 全链 `rc=0`；`Basic_SkyBox` 雪山天空盒 + 环境反射铬环（非黑 100.0%，`FPS:110 MEM:13MB PRIV:175MB RUNTIME:AS-AOT`）；`Intermediate_MD5Animation` 岩石地面 + 地狱骑士骨骼动画（`POLY:2746 DRIV:Metal`，且**无** `#1009`）；`air-starling-demo` 菜单（12 个场景按钮 + `Metal (Stage3D)`，非黑 97.5%）；`Flappy-Starling` 标题页（99.9%）；`shmup-stage3d` Stage3D 精灵海（`FPS: 80`）；`url-test` 登录 POST + `live_statistics` + 2/2 图入舞台；**`air-native` 的 79 行断言输出与整包构建逐字节相同**（`diff` 空；含两处**先于本阶段即存在**的 `#1034`/`IO_ERROR`，非本阶段引入——整包构建同样打印） |
+| **⑦ 全量回归** | `node test.ts` **253 passed / 0 failed**；`npm run test:unit` **90/90** |
+| **⑧ 新增单元组**（`test/unit/reach.ts`，417 行，5 组 **42 条**） | `unit: reach/{closure,edge,prepare,emit,wiring}`：合成 fixture 把 kept/dropped 集合**全量列清**；**逐机制归因**（删掉主类里某一处引用 ⇒ 断言**恰好**那一个类离开闭包，10 条：`import`+`new`/限定 `new`/通配 import/`Vector.<T>` 元素/`is`/`catch`/静态调用/`implements`/参数与返回类型/同名歧义对）；`import` 单独**不算**边、匿名命名空间不可跨文件达、`[WasmExport]` 是根、自由函数保文件；闭包产物 `generateC` 通过且函数集**是整包的子集**；CLI 接线 6 条（含 `--all-sources` 默认关）。**为什么钉在这里**：examples 套件只跑「必须成功」的程序，且 `away3d-core` 是 gitignore 的 485 文件引擎、被 `test/examples.ts` 跳过——闭包只在 `--air-app` 路径上存在，没有任何既有回归会覆盖它 |
+
+**顺带修掉的一个测试基建缺口**：`test/unit/embed.ts` 写好了却**没被登记**进 `test/unit.ts` 的 barrel
+（该文件与整个 `test/` 目录同属上一阶段未提交的新布局）⇒ `node test.ts`（文档化的全量回归）**一直在静默跳过**它的 3 个 `[Embed]` 组。
+本阶段把它补进 barrel——它与我这次动到的 `collectEmbeds` 收集面**直接相关**，不能留空。
+
+**文档同步**：`README-CN.md` 版本号 v0.4.96 → **v0.4.97**；原「`[Embed]` 打包范围 = 整个 `src/`（已知偏差）」一条**改写**为
+「`--air-app` 的编译面 = 主类的传递闭包」；`--air-app` 那条 bullet 末尾补 `--all-sources` 指引；
+`docs/zh-cn/compile.md` 新增 **§3.5.1**（闭包语义 + 边 + 过度近似 + `--all-sources` + 实测数字）、CLI 清单加 `--all-sources`；
+`docs/en/compile.md` 同步（§3.5.1 + 清单）；`docs/zh-cn/as3-semantics.md` §4 末尾加一条「**像增强但其实不是**：编译面收面是停止过度近似」；
+`AGENTS.md` §2.8 模块表新增 `src/reach.ts` 行；`package.json` v0.4.96 → **v0.4.97**；单元组 85 → **90 组**（+5 reach、+3 补登记的 embed）、245 → **253 用例**。
+
+**遗留表**：**移出 1 行**（「编译范围 = 整个 `src/`（无可达性分析）」—— 已由主类传递闭包收面落地）；**新登记 0 行**。
+
+---
+
+### 阶段一百二十五：`&&`/`||` 短路链的**操作数透传** + 静态 `String` 的**空串真值** —— air-native 的 TweenDemo 崩溃真根因（目标 v0.4.97 → v0.4.98）✅ 已完成
+
+**触发**：用户报 `examples/air-native` 运行后崩溃，输出为
+`TweenDemo: tween complete, box.x=0, box.y=0` 之后接
+`Uncaught exception: Error #1034: Type Coercion failed: cannot convert false to Array.`，
+并问「是不是最近改了数组、里面的 AS 代码没更新」。**不是**（demo 源码未动），是**发射侧**缺陷；
+`box.x=0, box.y=0` 正是崩溃卡死后的表象——修复后同一 demo 的 35 个 tween 全部以真实坐标完成并 `window closed` 干净退出。
+
+**一、真根因（`emit.ts` 的 `&&`/`||` 分支）**：`compatible` 判定原先把「**有一侧是 `any`**」也算作可统一：
+
+```ts
+const compatible =
+  l.type.kind === 'any' || r.type.kind === 'any' ||   // ← 病根
+  l.type.kind === r.type.kind ||
+  (numeric(l.type) && numeric(r.type));
+```
+
+于是 `unifyType(any, Array)` 走 `emit.ts` 那条注释自己写着「`any` 在运行时解箱成具体分支的类型」的分支，
+取了**较窄**的 `Array`；随后 `convert(any → Array)` 把**短路透传的那个操作数**做了解箱 + 运行时类型检查。
+`TweenLite.as:399` 的
+`_overwrite > 1 && this.cachedPT1 && siblings && siblings.length > 1`
+在 `onDone` 一路 `_overwrite` 为假时发出
+
+```c
+as_value _sc1 = (_sc0 ? as_obj_to_value((void*)(g_cachedPT1)) : as_v_bool(_sc0));
+as_array* _sc2 = (as_v_truthy(_sc1) ? g_siblings : as_v_req_array(_sc1, "Array"));  // ← 在这句抛 #1034
+```
+
+注意 `A && B` 那一层（`_sc1`）是对的（统一类型是 `any`，透传原样）——**只有统一到具体指针类型的那些层出错**。
+这解释了为什么崩在 TweenDemo 而不是别处：整条链里只有 `any` 与 `Array` 相邻的那两节命中。
+
+**二、adl 真值表（先取证再改）**：`temp/logicrepro/` 做了 4 轮双端对照（`AirTruth*.as` 跑 `adl` 51.4.1、
+`Probe*.as` 跑本编译器），共 **26 例**，全部逐字一致。工具链三个坑（一并记录，供后来者）——
+① `adl` 的 `<content>` 根类**必须** `extends flash.display.Sprite`，否则 `Error #2023`；
+② `adl` 不支持 `System.exit()`（`#2018`，用户当时贴的就是这条），AIR 原生的退出方式是
+`NativeApplication.nativeApplication.exit()`；
+③ **unpackaged `adl` 的 `trace()` 在 macOS 上到不了 stdout/stderr**，故对照探针改为「写文件 + 抛未捕获 `Error`」双通道
+（异常文本会上 stderr，这正是 `#2018` 当初能被我看到的原因）。
+核心结论（`adl-truth.txt`）：`r1=false(boolean)` —— **假操作数原样透传、绝不被强制转换**；
+`r3len=0(object)`/`r4same=true(object)`/`r5same=true(object)` —— 数组、对象**按同一性**透传。
+
+**三、修复一（透传解箱）**：`compatible` 去掉 `any` 那一款（`any && any` 由「同类」那款覆盖），
+即「只要有一侧是 `any`，静态类型就不能给另一侧做保证，两侧一律 box 成 `as_value`」。
+这与本文件早先（阶段八十九·十四 引入值语义时）自述的设计意图一致——「mixed guard idiom（`bool && object`）
+两分支装盒为 `any`」，是后来加的 `any` 那款违背了它。**同类快路径与 numeric 快路径刻意保留**：
+`bool && bool` → C `&&`、`int && int` → 裸 int 三目、`Object || Object` → 引用三目（不装箱），
+修复后逐条钉住（`test/unit/logical.ts`），因为它们正是这套统一机制存在的理由。
+
+**四、修复二（顺带实测出的邻域缺陷，同族）**：对照探针当场捞到第二个**独立** bug——
+`var s:String=""; s && "hi"` 我们给 `"hi"`，`adl` 给 `""`。AS3 里**空字符串是假值**，
+而 `condExpr` 对静态 `string` **直接落到 `return e.code`**，用 C 的 `char*` 非空判定 —— `""` 是非空指针 ⇒ 判真。
+注意 **boxed 路径本来就是对的**（`as_v_truthy` 的 tag-3 分支为 `v.ptr != NULL && ((char*)v.ptr)[0] != 0`），
+坏的只有静态路径。修法：新增与 `as_num_truthy` 对称的 `as_str_truthy(const char*)`
+（`s != NULL && s[0] != 0`），`condExpr` 的 string 分支改走它。**helper 取参而非内联**是刻意的：
+内联 `s != NULL && s[0] != 0` 会**两次提及操作数**，`if (nextName())` 就会调用两次。
+覆盖全部 `condExpr` 调用点：`if`/`while`/`do-while`/`for` 条件、`!`、`?:`、`&&`/`||`（`adl-truth3.txt` 的 `whilen=0`、
+`calls=1` 与 `adl-truth2.txt` 的 `r11len=0` 逐条对照过）。
+
+**五、验收**
+
+- **① 对照真值表**：4 轮 **26/26** 例与 `adl 51.4.1` **逐字一致**（含 `typeof`、对象同一性、`is int`、单次求值计数）。
+- **② 端到端（既有产物、既有 harness 的 before/after）**：`examples/air-native` 同一命令重建 ——
+  修复前日志 **79 行**、止于第 1 个 tween + `#1034`（app 中断，无 `window closed`）；
+  修复后 **114 行**、35 个 tween 全跑完且 `window closed`；前 77 行**逐字节相同**。
+- **③ 既有回归**：`examples/logical-value.as`（10 组断言）与 `examples/string-truthy.as`（8 组断言）新增；
+  `test/unit/logical.ts` 两个单元组共 **18 条**源级钉子（断言生成的 C 里 `as_v_req_*` **不出现**、
+  逻辑链临时量是 `as_value`、快路径未被破坏、`as_str_truthy` 在全部 `condExpr` 调用点上、helper 单次求值）。
+- **④ 全量回归**：`node test.ts` **257/257**（253 → +2 示例 +2 单元组）、`npm run test:unit` 全绿。
+
+**六、口径**：两条都是 **AIR 已定义行为被修对**，按 AGENTS.md §1.5 的反读**不是增强、也不新增缺口**。
+Numeric 统一（`int && Number` → `double`）这一处：`adl` 实测 `r6=0(number,isint=true)`，我们同为 `isint=true`，
+故 `bool && int` 的 `is int` 也与 AIR 一致（曾担心 numeric 提升会抹掉 int 身份，实测无此问题）。
+
+**文档**：`README-CN.md` 当前限制章新增本条；`docs/zh-cn/as3-semantics.md` §4 加「短路返回值语义 + 空串为假」两条口径；
+`package.json` v0.4.97 → **v0.4.98**；单元组 **90 → 92 组**、用例 **253 → 257**。
+
+**遗留表**：**移出 0 行**、**新登记 1 行**（`new XMLList()` 未注册为可构造内建类 —— 同批探针实测：
+`air-native` 无关，但 `adl 51.4.1` 能 `new XMLList()` 而我们报 `unknown class 'XMLList'`（**响亮**失败，非静默）；
+`XML` 可构造、`XMLList` 只能作类型标注，属不对称）。
+
+---
+
+### 阶段一百二十六：Windows 原生后端（Win32 接线 + SDL2 glue + Skia D3D12 直连 GPU）—— `<architecture>` 与双位宽（目标 v0.4.98 → v0.4.99）✅ 已完成（代码就绪；Windows 侧未实机编译，见下「未验证」）
+
+**范围**：用户立项「Windows 支持」。此前 `--air-app` 在 win32 上产出的清单**根本链接不起来**（`-lm`/`-lz`/`-lobjc`/`-framework`、`lib`-前缀归档名、缺 `<iconv.h>`、以及一个 TDZ 缺陷），且 AIR 描述符里决定位宽的 `<application><architecture>`（`"32"`/`"64"`，**默认 32**）**从未被解析**。本阶段交付：编译器侧完整接线 + `window_glue.cc` 的 D3D 挂载 + `vendor/d3d_glue.cc`（D3D12 直连 GPU 合成）。
+
+**一、`<architecture>` 成为一等参数**（`src/air-app.ts`）：新增 `AirAppInfo.architecture`；`parseAirApp` 校验 `"32"`/`"64"`（缺省 **32**，其余**响亮** `AirAppError`——`"16"` 实测被拒）；`airManifest(...)` 据此选 `vendor/*/windows-x86|windows-x64` 与 triple `i686-pc-windows-msvc`/`x86_64-pc-windows-msvc`。
+
+**二、`-l` 归档名**不是「两端同名」**（实测推翻上一版结论）**：在 macOS 上跑 `gn gen`（`target_os="win" target_cpu="x64"`，假 `C:/fake/...` 目录置于 out 下即可——gn 不重定位绝对路径）拿到**真实** Windows `build.ninja`（`Done. Made 91 targets`，同时证明新增的 `skia_use_direct3d=true` gn 参数集被接受）⇒ Windows 归档是 `<target>.lib` **无 `lib` 前缀**（gn 的 Windows `tool("alink")` 无 `output_prefix`，POSIX 有），故字面名为 `lib*` 的四个目标需 `-llibpng`/`-llibjpeg`/`-llibwebp`/`-llibwebp_sse41`（`winLib()` helper）；`third_party/d3d12allocator` → `d3d12allocator.lib`（Ganesh 的 D3D 后端在 `fMemoryAllocator` 为空时**自建** `GrD3DAMDMemoryAllocator`，见 `GrD3DGpu::Make`）⇒ 已加入 Windows 链接表。
+
+**三、平台条件分支的「本机不可见缺陷」被仿真逼出**：macOS 上永不执行的 `<renderMode>gpu` 分支把 `linkLibs.push` 写在了 `const linkLibs` **声明之前**（TDZ）——用 `Object.defineProperty(process,'platform',{value:'win32'})` 预加载跑**真实管线**才暴露（`ReferenceError: Cannot access 'linkLibs' before initialization`）。**教训**：平台分支必须仿真**另一平台**跑一遍，不能靠「本机跑通」推定。
+
+**四、后端中立的 GPU seam**（把 Metal 专属符号改成中性名）：`ASC_RENDER_WINGPU` ＝「本窗口的 Skia 合成走 GPU」，具体后端由 `ASC_RENDER_METAL`(macOS)/`ASC_RENDER_D3D`(Windows) 指名（`ASC_RENDER_GPU` 已被 web Ganesh 占用）。生成 C 与 runtime 只用 `sk_gpu_init`/`sk_gpu_destroy`/`sk_gpu_begin_frame`/`sk_gpu_flush`/`sk_gpu_draw_texture`、`sk_window_show_gpu`、`as_skia_gpu_*`、`w->is_gpu`；**唯一**的后端分支在 `window_glue.cc`（`sk_attach_gpu`/`sk_window_show_gpu`）。`src/` 内 `is_metal`/`sk_mtl_`/`as_skia_mtl_` 已归零。Stage3D 叠加层**刻意仍守 `ASC_RENDER_METAL`**（只改名 `is_gpu`）——Windows 的 Stage3D 在清单期就报错，且 `ASC_stage3d_tex` 是 `MTLTexture`。
+
+**五、`window_glue.cc` 的 Windows 侧**：`sk_attach_d3d(c, id)` 经 `SDL_GetWindowWMInfo` 取 `info.info.win.window`（非 `SDL_SYSWM_WINDOWS` **响亮**拒绝）交 `sk_gpu_init`；`sk_attach_gpu` 按宏分派、无匹配宏**响亮**报错；`sk_window_show_gpu` 在 D3D 下自持 SDL 循环。`is_metal` → `is_gpu`（8 处）。
+
+**六、`vendor/d3d_glue.cc`（新，~380 行）**：按 Skia m124 **自带参考**（`tools/window/win/D3D12WindowContext_win.cpp` + `D3DTestUtils.cpp::CreateD3DBackendContext`）逐步骤实现——进程级 `IDXGIAdapter1`/`ID3D12Device`/`ID3D12CommandQueue`/`GrDirectContext::MakeDirect3D`（`fMemoryAllocator` **留空**，与 Skia 参考一致，由 `GrD3DGpu::Make` 自建），窗口级 `CreateSwapChainForHwnd`（`FLIP_DISCARD` + `R8G8B8A8_UNORM`，与参考同）＋两条 back buffer 包成 `GrBackendRenderTarget`/`SkSurface` ＋ fence 帧同步 ＋ `ResizeBuffers` 处理；`Present` 前必须**先 `flush(kPresent)` 再 `submit`**（两半都不能省，否则上屏的是**旧** back buffer）；每处 HRESULT 失败都带 `d3d_glue:` 前缀打 stderr。`sk_gpu_draw_texture`（Stage3D 合成用）明确**未实现且出声**（唯一调用者是 Stage3D，Windows 上不可达）。
+
+**七、`<renderMode>direct` 在 Windows 的产物**：`ASC_RENDER_WINGPU=1` + `ASC_RENDER_D3D=1` + `d3d_glue.cc` + `d3d12`/`dxgi`/`d3dcompiler`；macOS 专属的 `metal_glue.mm`/`objc`/Cocoa framework 在 Windows 全部去掉；`src/build.ts` 的 `-lm`/`-lz` 在 win32 归零（`m.lib`/`z.lib` 不存在）；`AS_HAVE_ICONV 0`（与 wasm 一致：非 UTF 字符集**响亮**抛错）。
+
+**八、Windows 依赖构建脚本**（`vendor/build-windows-deps.ps1`）：Skia m124（`skia_use_direct3d=true`，注释写明三个后果）/SDL2 2.32.10/curl 8.11.1/zlib/nghttp2 的 x64 与 **x86** 双位宽产出；x86 墙由 `Repair-SkiaX86Toolchain`（自动探测 `SetEnv.cmd` ＋**最小** gn 补丁把 x86 `env_setup` 包进 `if (clang_win == "")` ＋幂等标记 `ASC-X86-CLANG-PATCH` ＋ CRLF 归一）解决；`Assert-LibBitness` 用 `dumpbin`/`readobj` 认 x64/x86/ARM64/ARM，**错位＝硬失败**（不做「碰巧能跑」）。
+
+**验证（macOS 上能做的全做了）**：① **去机器化验证脚本**——便携 pwsh 解析 `Parser::ParseFile` OK（4238 token / 22 函数）、真实语法错已修（L501 的 `\"` 转义）、4 个 `Invoke-CmakeBuild` 调用点均传 `-Arch`、AST 抽出的 `$old`/`$new` 对**真实** `skia-src/gn/toolchain/BUILD.gn` 命中且**幂等**、`gn format --dry-run` 退出 0；② **COFF 机器字段实验**证明 x86 必须用 `--target=i686-pc-windows-msvc`（`-m32` 在 arm64 主机上产出 **ARMNT**、默认产出 **ARM64**）；③ **win32 仿真跑真实管线**：32/64 两套清单一字段一字段核对（无 `z`/无 `objc`/`frameworks: []`/三处 vendor 路径随位宽切换/`sources` 含 `d3d_glue.cc`）；④ **最终全量回归 `npm test`：258/258 全绿、0 红**（单元 **92 组**、示例 **166 个用例**，含新增的 air-app 链接关口）。
+
+**关于「测试门禁不稳定」的诚实记录**：本阶段开头的几次套件运行（**同一命令、同一代码**）报出过 **3 个不同的红**，而它们在后来的重跑中全部变绿：`example: stage86.as`、`unit: emit/StringConcatFlat`、`unit: reflection/ClassValueOperand`。已排除的假说：① **陈旧产物**——在用例将使用的产物路径上埋一个假二进制，实测被**无条件重建并覆盖**（脚本变回 Mach-O、用例仍绿）；② **`-o` 序号**——同一示例用 `001-` 与全量跑的 `113-` 两条路径手工跑，两条都绿；③ **断言陈旧**——`examples/stage86.as` 的 `NativeApplication` 断言已改为 `com.example::NoSuchClass`（注释引 `adl 51.4.1` 实测）后仍曾红。根因**未定**，已登记入 `### 遗留待开发`（门禁自身不可靠是隐患：它会让真缺陷与假红混在一起）。**结论**：这 3 个红与本次 diff **无关**（首次观测在任何代码改动之前），但本轮也**未改它们任何一行实现或断言**，故不宣称「已修」。
+
+**未验证（必须诚实标注）**：本机是 macOS，**无法**用 MSVC ABI 编静态库、也**无法**编/跑 D3D12 程序 ⇒ `d3d_glue.cc` 的每一次 D3D12 调用、`window_glue.cc` 的 Windows 分支、ps1 的**实际**编译产物**均未实机验证**（沿用仓库既有先例「Windows 分支已写出但开发机为 macOS 无法本地验证」，`AGENTS.md` §2.9）。首个 Windows 机器上的核对清单（含**逐条列出的假设**）见 [`docs/zh-cn/win32.md`](docs/zh-cn/win32.md) §5。
+
+**九、自查发现的真缺陷（已修 + 已加关口）**：改完后用手工命令
+`node src/index.ts --air-app examples/air-native/air-native-app.xml --main-class Main --target native`
+真编一次，**链接失败**：`_sk_gpu_begin_frame` / `_sk_gpu_flush`（referenced from `_ASC_window_render`）
+未定义。根因：中性 seam 只在 D3D12 侧落地，`metal_glue.mm` 仍只有 `sk_mtl_*` ⇒ **每个 macOS GPU 构建
+都链不起来**。而 `npm run test:examples` 却是 164/165 全绿——因为它对这条路径**盲**：
+`examples/air-native` 的目录单元编译的是 `.as` 文件列表（**不带 `--air-app`**），故 `ASC_RENDER_WINGPU`
+从未定义、GPU 窗口分支从未被编译；`test/unit/build.ts` 里的 `--air-app` 先例全带 `--dry`（只出清单）。
+**修复**：`metal_glue.mm` 补上中性五名的 Metal 实现（转发到 `sk_mtl_*`，与 `d3d_glue.cc` 对称），
+并改正 `src/runtime.ts` 里「window_glue.cc 定义这五个」的错误注释。**两道新关口**：① 单元组
+`unit: backendparity` 新增 4 条钉子（从 `runtime.ts` 的 WINGPU 块**导出**中性名集合，要求
+`metal_glue.mm` 与 `d3d_glue.cc` **双方**都实现且不得多出）——已做反向对照（临时移除一个转发即变红）；
+② `test/examples.ts` 新增一个真关口用例 `example: air-native (--air-app + renderMode=direct: 
+compile+link only)`，用**用户的命令形态**编译+链接（带 `--run` 会开真窗口不返回，故只验链接），
+并在 vendor 库缺失时显式 SKIP。此用例已做双向对照（破坏 macOS 实现 → 链接失败变红；还原 → 绿）。
+
+**文档**：新增 `docs/zh-cn/win32.md`；`README-CN.md` 的「构建与链接」新增 Windows 小节；`package.json` v0.4.98 → **v0.4.99**。
+
+**验证计数**：最终 `npm test` **258/258 全绿**（单元 **92 组**、示例 **166 个用例**，含 `unit: backendparity` +4 条中性 seam 钉子与 `examples` +1 个 air-app 链接关口）。
+
+**遗留表**：**移出 0 行**、**新登记 3 行**（Windows 侧未实机验证；Stage3D 无 Windows 后端；**测试门禁不稳定**——同一套件不同次运行报出 3 个不同的红、重跑全绿，根因未定）。
+
+---
+
+### 阶段一百二十七：内建类注册表 & Class 值 + `in`/`delete`/下标（批次 1 + 批次 3）（目标 v0.4.99 → v0.4.100）✅ 已完成
+
+**范围**：用户从本文件 `### 遗留待开发` 表中圈定的**两批共享同一缝隙**的项，一次收口（**批次 1** = 内建类注册表 & Class 值：内建类进注册表、内建类作 Class 值、`is`/`as` 的右操作数为内建类/接口 Class 值、`getDefinitionByName` 的 `#1065` 与消息、未知类型标注报 `CodegenError`、`IDataInput`/`IDataOutput` 注册；**批次 3** = `in`/`delete`/下标：Array 的 `in`、Vector 的 `delete`/`in`、`is`/`as Vector.<T>` 对动态左值）。**验收口径一律 `adl 51.4.1` 双端探针逐行对照**（`temp/pkg1/oracle/`、`temp/pkg1d/oracle/`），凡 AIR 已定义行为**逐字**对齐（§1.5）；跨切面、需独立立项的子项（`int`/`uint` 的独立 box tag、`Dictionary` 虚拟 vtable、原始包装类作 Class 值、内建**接口**作 Class 值、`Vector.<T>` 作 Class 值）**明确划出**并在遗留表内收窄改写，不混入本阶段。
+
+**一、批次 1a —— 内建类进类注册表 + 忠实 `#1065`**：`emitClassRegistry`（`src/emit.ts`）原先只给「有 `fqn` 的用户类/SWC 类」发 `_cls`，故 `getDefinitionByName("flash.display.BitmapData")` 抛 `Error #0: No definition found`（`adl` 返回类对象）；未命中时错误号是硬编码的 `0`。现在：① 对**每个有 `reflectFqn` 的类**（含全部内建类）发一份 `static as_class <name>_cls = { &<name>_vt, NULL, NULL, "<reflectFqn>", 0, NULL };`（**工厂/构造指针留 `NULL`** —— 内建类的 C 构造器是各自的特化符号，凭空指向它就会发明 AIR 没有的构造语义；故内建类被 `new (classValue)()` 时仍是**响亮**的 `#1063`）；② 同时放宽 `hasClassRefs` 与 `_cls` 前向声明的判据（`fqn || reflectFqn`）与 `emitVarLexical` 的 Class 值解析；③ 未命中改抛新的 `as_throw_def_not_found(const char* rawName)` ⇒ **`Error #1065: Variable <末段> is not defined.`**（`errorID` 亦是 **1065**；名按最后一个 `.` 或 `::` 取末段）。**顺带更正一处我方旧记载**：原遗留行说 AIR 的 message 是 `"Error #1065"`，双端复测实为完整句 `Variable NoSuchClass is not defined.`（`temp/pkg1d/oracle/adl-idi.txt` 同族现象一致）。
+
+**二、批次 1b —— 内建类作 Class 值**：`var c:Class = Object;`、`trace(BitmapData)`、`BitmapData is Class` 原先一律 `Codegen error: undefined variable 'BitmapData' at top level`，而 `adl` 给 `[class BitmapData]` / `true`。新增 `as_class_is_val(as_value, as_class*)`（实现 AIR 的自动装箱：`null`/`undefined` → false；**原始值**仅在目标 FQN 为 `Object` 时为 true（`as_is_object_cls` 按 `c->fqn` 比对，不用 `&Object_vt`——内建 `Object` 类的 vtable 未必是那一个））、`as_class_is_obj`（委托前者）、`as_class_str(c)`（⇒ `[class <短名>]`）；`as_class_as_val` 处理 `as`。替换两处恒返回字面量 `"[class]"` 的站点（`vectorElemToStr` 与 `toStringExpr` 的 `case 'class'`）与 `as_v_str_val` 的 tag 4 分支；`emitIs`/`emitAs` 的原始类型分支改走 `as_class_is_val(this.boxExpr(o), clsVal)` / `as_class_as_val(...)`。**`adl` 对照 11 例逐字一致**（`temp/pkg1/oracle/adl-pkg1.txt` C1/C4/C7/E2/E3/E8/E9 + `adl-na.txt` 的 `NA=[class NativeApplication]`）。
+
+**三、批次 1c —— 未知类型标注报 `CodegenError`**：`var x:NoSuchType = null;` 以前**不发语义错**、一路泄漏到 clang（`error: unknown type name 'NoSuchType'`，**无 `行:列`**，违背 §2.5）。在符号表侧新增 `checkTypeAnnotation(t, importAlias, known)`（`src/symbols.ts`，紧随 `resolveType`），递归校验 `Vector.<T>` 的元素，报 `` `unknown type '${t}'` `` / `` `unknown interface '${t}'` ``；在 `symbols.ts` 的 5 处声明块（接口方法、类字段、构造器参数、方法返回+参数、自由函数返回+参数）直接接入（其中**接口方法那处延后到 pass 2.1**，原因见第八节），**emit 侧** 新增 `Emitter.ann(t)`（先 `checkTypeAnnotation` 再 `resolveType`）并替换 26 个标注站点（`hoistVar`、`collectWalkFuncVarsStmt`、`walkStmt` 的 Var/Const、参数遍历、匿名函数参数/返回、`fn` 返回/参数、构造器参数、方法返回/参数、自由函数声明参数、模块变量、`loopVarType`、局部变量发射）+ `paramDecls`（自由函数原型是唯一能拦下其参数的站点）。**关键取舍：校验绝不能放进 `rt()`** —— 它同时是 `Type(expr)` **强转语法**的名字探测点，在那里校验会把合法自由函数调用拒掉（实测 `Codegen error at 19:5: unknown type 'fib'`）；故 `rt()` 保持纯解析，校验只在 `ann()` 与符号表。**双层兜底**（符号表 + emit 站点）保证只出现在一条路径上的构造同样被拦。实测：`temp/pkg1d/Bad.as` ⇒ `Codegen error at 1:1: unknown type 'NoSuchType'`（真 `CodegenError` 栈）；catch 子句的类名**早已**有独立校验，未动。
+
+**四、批次 1d —— `IDataInput`/`IDataOutput` 注册 + `ByteArray.writeDouble`**：`class TLSish extends Socket implements IDataInput, IDataOutput`（`com.hurlant.crypto.tls` 的形态）原先报 `unknown interface 'IDataInput'`。两个接口现已在 `symbols.ts` 里**按 AIR 的完整成员表**注册（`IDataInput` 14 个读方法含 `readObject`、`IDataOutput` 12 个写方法含 `writeObject`；`endian`/`objectEncoding` 是**访问器对**）——**按 AIR 的完整表、而不是「够用就行」的窄表**：漏登记成员会让我们**比 AIR 宽松**（用户类少实现一个方法也能通过 pass 4），属 §1.5 禁止的静默错误。**归属以装好的 SDK 为准**：两者是 `flash.utils` 而**不是** `flash.net`（`AIRSDK_51.4.1/frameworks/libs/air/airglobal.swc` 的 `catalog.xml` 实测；`reflectFqn` = `flash.utils::IDataInput`/`flash.utils::IDataOutput`）。给 `ByteArray`/`Socket` 补 `implements`、给 `URLStream` 补 `implements: ['IDataInput']`，并把 `endian`/`objectEncoding` 标为 `isAccessor: true`（pass 4 只比**名字 + 种类**，访问器成员必须由访问器满足，用户 `public var` 不能顶）。**顺带补上完全缺失的 `ByteArray.writeDouble`**，并发现一个**真字节序缺陷**：AIR 的双精度是**按 ByteArray 端序的原样 IEEE-754 八字节**，不是「高 32 位先写」——初版实现（两次 `as_ba_put_u32`）在**大端**下错，而早期比对只看 bytes 0/1（两种字序下都是 0）故漏网；由本阶段示例抓出。修法：新增 `as_ba_swap64`（由 `as_ba_swap32` 合成），`writeDouble`/`readDouble` 改为整块 8 字节 `memcpy` + 条件交换；`adl` 实测口径 `temp/pkg1d/oracle/adl-dbl.txt`（小端 `1.0` = `00 00 00 00 00 00 F0 3F`、大端 = `3F F0 00 00 00 00 00 00`）。`Socket.writeObject` 精确；`Socket.readObject` **响亮**报「socket 读侧不可回退」（新登记 1 行）。`emitInterfaceVtables` 的访问器 setter thunk 顺带发出**类型条件**的 GC 写屏障（`as_value` → `gc_write_barrier_value`、指针 → `gc_write_barrier`、标量 → 无）。
+
+**五、批次 3 —— `in` / `delete` / 下标**：① **Array 的 `in`**（静态 `Array` 原先**编译期被拒**、动态数组两问恒 false）：新增 `as_array_has(a, key)` —— `length`、区间内**非空洞**下标（`tag != 5`）、命名属性三者之一为真；`as_dyn_has` 的 `dk==2` 接上它。② **Vector 的 `in`/`delete`**（静态 Vector 原先直接 codegen 报错）：新增 `as_vec_has_len(key, len)` 并按「键可归约为下标且 `0 <= i < len`」判定，静态路径的长度取自 `as_vec_get_hook`（`*` 路径走新钩子 `as_vec_has_hook` / `as_vec_has_impl`，在 `as_vec_wire` 里装配），两条路都汇入同一助手、**不可能漂移**；`delete vec[key]` = **求值键、返回 `true`、不做删除**（`as_dyn_del` 的 `dk==3` 直接返回 `true`）——**并更正一处我方误归因**：旧记载说 `delete vec[i]` 该抛 `#2005`，实测 `adl` 返回 **true 且是 no-op**，而 `#2005` 实属 `new Vector.<int>(非数字长度)`（`temp/vecconv/adl.txt`）；据此**删掉**了误加的 `as_vec_del_2005`（发射点 + runtime 声明）。③ **`is`/`as Vector.<T>` 对动态（`*`）左值**：新增 `as_vec_is_name(v, name)` / `as_v_as_vec_named(v, name)`，右操作数为 `Vector.<T>` 时按**精确元素名**匹配（`Vector.<*>` 不命中、`[] is Vector.<Number>` 为 false），静态左值仍走原有字面比对（**不让静态路径退化成查表**）。④ **裸 `Vector` 作类型名不是缺口**（口径更正）：`mxmlc` 接受 `var vv:Vector;` 但**拒绝** `var vv:Vector = new Vector.<int>();`（「从类型 `Vector.<int>` 的值到不相关类型 `Vector` 之间的隐式强制转换」）⇒ 有意义的那一半 AIR 自己就拒，故我们的 `CodegenError` **吻合 AIR**，原遗留行的括注随之移出。
+
+**六、顺带修掉一个生成 C 的告警**：`emitIs` 的接口分支发出 `as_iface_lookup(...) != NULL` 时**未加括号**，使 `!(x is IDataInput)` 变成 `(!as_iface_lookup(..) != NULL)`（`-Wpointer-integer-compare`；语义正确但噪音）。两处发射点补括号后，本阶段示例构建 **0 warning**（该字符串无测试钉子，`grep as_iface_lookup test/` 为空）。
+
+**七、回归与文档**：新增示例 `examples/builtin-class.as`（62 条断言，期望值逐项取自 `adl` 探针：内建类作 Class 值 / `getDefinitionByName` 命中 + `#1065` / Array `in` / Vector `in`·`delete` 边界 / `*` 接收者的 `is`·`as Vector.<T>` / 动态对象与数组的 `in`·`delete` / `IDataInput`·`IDataOutput` 判定与接口槽读数 / `writeDouble` 双端序字节与往返 / `extends Socket implements` 的 pass 4 通过），离屏、纯 C、纳入回归；`examples/reg-bytearray-endian.as` 增补双精度双端序的**逐字节**钉子（其 `bytes()` 按**无符号**读，`LEstr`/`BEstr` 的 `240`/`192` 与 AIR 逐值相同），`examples/stage86.as` 的「找不到定义」探针改用 `com.example::NoSuchClass`（`flash.desktop::NativeApplication` 在 AIR 里**存在**，原探针本身失真）。单元组 `test/unit/diagnostics.ts` 的 `unit: diagnostics/Codegen` **+11 条**（未知标注 ×9 指名文案与 `行:列`、内建接口一致性 ×2：`class C implements IDataInput {}` ⇒ `class 'C' does not implement method 'readBoolean' of interface 'IDataInput'`），`test/unit/reflection.ts` 随发射形态更新。
+
+**八、本阶段的次序缺陷（由 `examples/air-starling-demo` 端到端构建抓出）**：批次 1c 的接口方法标注校验最初写在 **pass 0（接口注册）**里，而**用户类的类壳要到 pass 1 才注册**——于是 `hasClass` 此刻只看得见内建类，任何**接口方法名引用用户类**的合法程序都被误判。实测炸点：`examples/air-starling-demo` 构建报 `Codegen error at 24:5: unknown type 'Texture'`（`src/starling/filters/IFilterHelper.as:37` 的 `function getTexture(resolution:Number=1.0):Texture;`）。修法：接口仍然在 pass 0 **注册**（那正是 pass 0 的职责），校验改为**延后到 pass 2.1**（pass 2 注册完成员之后）统一跑，位置仍取接口声明的 `行:列`，`importAlias` 复用已存入 `InterfaceInfo` 的那份。**该缺陷能逃过整套自动回归，是因为 `examples/air-starling-demo` 不在 `test/examples.ts` 的套件内**——故同时补了三条正面钉子（跨包 `import`、同包免 import、通配 `import`），钉在 `unit: diagnostics/Codegen` 里。
+
+**验证计数**：`node test.ts` **259/259 全绿**（258 → +1 示例）；`unit: diagnostics/Codegen` 单跑 **39 条 / 3 组全绿**；示例 `examples/builtin-class.as` 单跑 `Build successful` + 零编译器告警；**端到端重建一个不在套件内的大 demo** —— `node src/index.ts --air-app examples/air-starling-demo/Demo-app.xml --main-class Demo --target native` ⇒ `rc=0` / `Build successful`（139/141 源可达，302 warnings、**0 errors**），产物实跑正常（Starling 上下文就绪、9 个资源 `onLoadComplete`）。
+
+**文档**：`README-CN.md` 「当前限制」章新增本条（含 `getDefinitionByName`/内建类表/Class 值/`in`·`delete` 四处旧口径的更正）与示例清单条目；`package.json` v0.4.99 → **v0.4.100**。
+
+**遗留表**：**移出 6 行**（① `IDataInput`/`IDataOutput` 未注册；② `delete vec[i]`/`"0" in vec` 静态 Vector 报错；③ 数组上的 `in`；④ `getDefinitionByName` 错误号与消息；⑤ 未知类作类型标注；⑥ `is`/`as Vector.<T>` 动态左值）；**新登记 2 行**（`Vector.<T>` 作 Class 值/值表达式 —— 值位置先是 parse error；`Socket.readObject` 未实现 —— **响亮**）；**收窄改写 3 行**（`is`/`as` 右操作数为内建类/接口 Class 值 → 内建类已落地、只剩接口与 `Vector.<T>`；内置类名作 Class 值 → 引用类型已落地、只剩原始包装类；反射 API 的内建类名口径 → ①④ 实测**更正为已对齐/部分对齐**，只剩 `int`/`uint` 独立 box tag 与 `Dictionary` 虚拟 vtable）。表内项数 **99 → 95**（部分完成 10 → 13、未开始 88 → 81）。
+
+---
+
+### 阶段一百二十八：多端渲染性能与分辨率收口 —— Stage3D 状态缓存 / 2D mip 链 / 烘焙分辨率与 `BitmapData.draw` 口径（目标 v0.4.100 → v0.4.101）✅ 已完成
+
+**范围**：用户从本文件 `### 遗留待开发` 表中圈定的**四批同属「渲染性能 / 分辨率」缝隙**的项，一次收口；因项目已是**多端**（native Metal / web WebGL2），每一项都按「一份生成 C、两个 seam」的纪律**在两端同步落地**，并以 **`adl 51.4.1` 为唯一 oracle** 做**三端验收**（`temp/mipprobe/` 18 行、`temp/bakeprobe/` 20 行 + 真 GPU 截图）。四批 = **A** Stage3D 状态对象缓存（逐 draw 重建 DSS）、**B** 逐帧分配与 RSS（row 7893）、**C** 2D mip 链（rows 7954/7955）、**D** 烘焙分辨率与几何口径（rows 7927/7928，并顺带定案同族的 `BitmapData.draw(source, matrix)` 源变换行）。**口径**：凡 AIR 已定义行为一律**逐行对齐 `adl`**（§1.5），跨端**逐位相同**；差异不得静默，一律入遗留表。
+
+**一、批次 A —— Stage3D 状态对象缓存（`vendor/stage3d_glue.mm`）**：away3d 的铬环与天空盒**逐 draw 交替** depth 状态（`ASC_S3D_DUMP=1` 实测 `depth=(less,w=0)` 与 `depth=(lessEqual,w=1)` 相间），而 `s3d_rebuild_dss` 每次状态变化都**新建 + 释放**一个 `MTLDepthStencilState` ⇒ `dss=8039 / draw=8040`，即每 draw 一次驱动对象分配（**不泄漏，只是抖动**）。改为**按键值缓存**：新增 `S3D_MAX_DSS 16` 个槽 + `S3DDssVariant`（键 = 状态字段的快照，`s3d_key_str` 把调用者的字符串**拷进槽内**，`depthCompare` 一并入键），`s3d_select_dss` 命中即复用、未命中才新建并 `asc_tr_dss++`（**计数器只统计编译/创建**，故 `dss` 数直接可读为「真实对象数」），满 16 槽按 LRU 淘汰。生命周期按「槽持有 +1、`c->dss` 借用」整理（init 建槽、destroy 逐个释放），避免复用后双重释放。**实测（`Basic_SkyBox`，1680 draws）**：`TRACE draw=1680 compile=1680 make_pso=2 pso_miss=0 dss=2 smp_miss=1 bindtex=1679 cube=1 mipbuild=0 mipdrop=0` —— DSS 对象数 8039 → **2**，管线缓存未受影响（`make_pso=2`/`pso_miss=0`），mip 路径零扰动；截图 `temp/skybox-aot/aot-c-final.png` 204748/204800 像素非黑（120 fps 铬环 + 天空盒反射，肉眼与修前一致）。**全量 src 改动落定后**又做了一次**全量重建**复验（`temp/skybox-aot/build-128.log`）：`TRACE draw=4620 compile=4620 make_pso=2 pso_miss=0 dss=2 smp_miss=1 bindtex=4619 cube=1 smpseti=4620 uptex=0 mipbuild=0 mipdrop=0`（4620 draws 下 DSS 仍是 **2**、程序缓存 0 miss；天空盒应用不传 2D 高级 mip，故 `uptex/mipbuild/mipdrop` 全 0 = 丢弃规则不误伤），截图 `temp/skybox-aot/aot-128-final.png` **204749/204800 非黑（100.0%）**、116 fps。
+
+**二、批次 C —— 2D mip 链（`src/symbols.ts`/`src/emit.ts`/`src/runtime.ts`/两端 glue）**：先补足 **adl 侧口径**（`temp/mipprobe/`，AGALMiniAssembler + 8×8 BGRA 贴图 + 256 px 视口，`T` = uv 平铺数 ⇒ `lod = log2(T/32)`），得到三条决定性结论：① **丢弃的触发条件是「从未上传过任何 level > 0」**，不是 `createTexture(..., mipmapped=true)`（`texY`：标志为真但只传 level 0，配 `miplinear` **照样丢弃**）；② 上传一级时的口径是**区域规则** —— 取**源位图左上 `lw×lh`**（`lw = max(1, width>>level)`，并**按源的行距**读，不是按 `lw`），实测 `texC`（把整幅 8×8 条带按 level 传三次）逐行读出 `16/48/80/112`；③ 正确尺度的各级（`texD`）读回**恰好等于上传值**，且 `lod` 只选一层。实现：`Texture`/`RectangleTexture` 增私有 `mips` 计数；`Texture_uploadFromBitmapData` 的 `miplevel != 0` 分支计算 `nlv = max(width,height)` 的层数、拒绝 `miplevel >= nlv`、取 `lw/lh = max(1, w>>miplevel)` 且**钳到源位图尺寸**、置 `o->mips = 1`，走新 seam `as_s3d_texture_upload_level(ctx, gpu, level, lw, lh, pixels, srcW)`；绑定侧把 `hasChain` 传下去（2D 传 `o->tex{i}->mips`、立方体传 `1`）。两端实现**同一条件**的丢弃：`c->samplerStateSet[i] && c->samplerMip[i] != 0 && c->texHasMips[i] == 0 && 纹理非空` ⇒ 整 draw 丢弃（Metal 侧走一个 `loadAction=Clear` 的空 pass **消费掉挂起的清屏色**，故「被丢弃」在回读里表现为清屏色，与 adl 逐位一致；WebGL 侧**必须放在 `glUseProgram` 之前**——GL 对不完整纹理的采样是**黑**，放在之后会把「丢弃」画成黑而不是清屏色）。**验收**：`temp/mipprobe/` 18 行 `adl == native == web` **逐位相同**（唯一差异是尾行 `END-OF-SCENE (sync)` vs `(frames)`——headless 构建没有帧循环，同步跑完即结束）。
+
+**三、批次 B —— 逐帧分配 / RSS（row 7893）：不改码，用测量结案**：row 当年建议的三处修法**都已在位**——① `ASC_stage3d_pixels` 只在 `w/h` 变化时重分配、`s3d_submit_scratch` 是 grow-only 缓存（两者只服务 CPU-raster 的 `#else` 路径与逐帧顶点解交织），② `gc_trim_os()` → `malloc_zone_pressure_relief(NULL, 0)` 已接到 500 ms 的 release pass（`ASC_GC_RELEASE`），③ `as_alloc()` 只被文件枚举助手使用、**不在逐帧路径**。新写自包含 harness（`temp/rssharness/rsscycle.py`，自带「启动 → 轮询窗口 → AppleScript 移到屏上/激活 → `screencapture -l` → 点按钮换场景」全链路）实测：**Skybox（Metal, 120 fps, 连续）** 172.4 → 174.5 MB（前 20 s +2 MB，后 40 s +0.1 MB）⇒ 平；**菜单↔场景 4 轮** +0.7 MB/轮且递减；**Sprite 3D（场景 11）12 轮** 205.7 → **195.0 MB**（第 8 轮掉 11 MB = release pass 生效，**无增长**）；**Sprite 3D `--stay` 60 s** +0.1 MB ⇒ 平；**Benchmark（场景 9）+ Start** 223 → 590 MB/10 s（+34 MB/s）后衰减到 451 MB —— 但 `ASC_GC_STATS=1` 同期显示 GC 堆 `18MB → 110MB`（`instance 28.7→32.4MB/402176→454020`、`bytes 32.1→38.8MB`）、`as_big = 0`（无 arena ≥1 MB），`vmmap` 峰值 `Physical footprint 560.3M`、`MALLOC ZONE 33% FRAG`，而**衰减后** footprint 270.9M、`MALLOC_SMALL (empty)` 112.7M → 2.75M、**FRAG 0%** ⇒ 结论：那条曲线是 **Starling 设计内的活集增长（benchmark 自己抬高对象数）+ 分配器高水位**，且高水位**已被 release pass 归还**，无逐帧临时分配泄漏。row 7893 据此关闭。
+
+**四、批次 D —— 烘焙分辨率与 `BitmapData.draw` 几何口径**：adl 侧新写探针 `temp/bakeprobe/`（离屏 `BitmapData.draw` + `getPixel32` 扫描：包围盒、`alpha>8`/`alpha>128` 的左边界线宽、逐像素 `pixdiff/maxdiff`；**判据取「缓存开 vs 关逐像素相同」**——这正是 AIR 的行为）。三处落地：
+
+1. **烘焙分辨率（row 7927）**：`as_render_cached` 原先 `sc = ASC_render_scale`（**只含 dpr**），而回贴目标画布带的是 `dpr × 祖先缩放 × 自身缩放` ⇒ 缓存内容被回贴**放大点采样**（`scale=2` 的边框 4 物理 px、字边锯齿）。新增 `as_bake_scale(canvas, lw, lh)`：取**目标画布总缩放**，上限 `4 × ASC_render_scale`（比例护栏）与 `AS_BAKE_MAX_PIXELS = 4e6`（像素预算，≈16 MB）；超限即退回「放大回贴」的旧行为（质量降级但内存有界）。**九宫格 `as_render_nine_slice` 同源同修**（同一助手——它的条带也是按**逻辑单位**回贴到带自身缩放的画布上）。adl oracle：`cacheAsBitmap` 开/关在 `k=1/2/3` 与「祖先缩放」两态**全部 `pixdiff=0 maxdiff=0`**（真实 GPU 的 1:1 回贴是同一结论）。
+2. **`BitmapData.draw` 的源矩形与边框 +1（row 7928）**：adl 实测 `bd.draw(field, mat_k)` 的包围盒 = **`width·k + 1`**（41/81/121），且边框在任何 `k` 下都是**1 个位图像素**（`line>8=1`、`line>128=1`）。⇒ 源矩形里的 `+1` 是**位图像素**（`width/s + 1` 局部单位），不是 1 局部单位；`as_render_bounds` 的那个 +1 只服务烘焙/滤镜面尺寸（略大一点无害），渲染侧早已是屏幕空间 1 px（阶段九十四·二十一）。**同批修掉一个由本探针抓出的新偏差**：`BitmapData.draw(src, matrix)` 原先在 **1× 栅格**里画对象、再被逆矩阵采样器**放大**（`k=2` 时边框变 2 px、`k=3` 变 3 px，与 adl 的恒 1 px 不符）。现在按矩阵缩放 `rs` 栅格化（TextField 与 DisplayObject **两个分支**都改：画布 `scale(rs,rs)`、源矩形按 `rs` 计尺寸），采样坐标统一乘 `rs`（栅格 1:1 读回），并在栅格化期间把 `ASC_render_scale` **钉为 1**（离屏位图里「设备像素」就是位图像素 ⇒ 与窗口 dpr 解耦，hdpi 窗口下口径也一致）。`BitmapData_draw` 在 `ASC_render_scale` 声明之前发射，故补了该全局的**前向声明**（与 `ASC_win_scale` 同形）。
+3. **顺带定案 `BitmapData.draw` 的 source 自身变换**：该行原写「未定案，需先用 `adl` 做 2×2 矩阵（带/不带容器、带/不带 `matrix`）」。补测后定案：**AIR 完全忽略 source 自身的变换，只吃 `matrix` 参量，两者不相乘** —— `cont.scaleX=scaleY=2` 独立 `draw` 得 **41×21**（= 1× 尺寸），再加 `mat=scale(3)` 得 **121×61**（= 只按矩阵 3×，不是 2×3×）。按该行的选项 ①实施：栅格化期间把源的 `x/y/rotation/scaleX/scaleY` 与 `transform.matrix` **归零**、事后原样还原（**保留** `alpha`/`visible`/滤镜/子件——那些是外观不是变换）。用户侧可观测的语义变化：此前「给对象设了 `x/y/scale` 再 `bd.draw(o)` 指望它生效」的代码，现在与 AIR 一致地不生效。
+
+**五、跨端同步清单（seam 纪律）**：Stage3D 的 `s3d_*` seam 一份签名两处实现 —— native `vendor/stage3d_glue.mm`（Metal）、web `vendor/stage3d_webgl.cc`（WebGL2）；ABI 钉子（`test/unit/stage3d.ts` 的 `stage3d/webgl-abi`）要求 **`src/runtime.ts` 里引用的每个 `s3d_*` 都在 webgl glue 里定义**，本阶段新增的 `s3d_texture_upload_level`/`as_s3d_texture_upload_level` 两端同时定义并同时接入钉子；`s3d_bind_texture` 加第 4 参 `hasChain`（名字型 ABI 钉子只查名字，签名可改）；丢弃规则用**逐字节相同**的条件串钉在两端。`s3d_flush(ctx);` 的出现次数是钉子（新同步点不得借用 `s3d_flush`），本阶段未新增。2D 显示侧（`as_render_cached`/`as_render_nine_slice`/`BitmapData.draw`）走**同一份生成 C**，两端只是光栅后端不同（Skia CPU raster / Ganesh）⇒ 生成侧一处改动天然覆盖两端，三端逐位相同即是证据。
+
+**六、顺带修掉一处 headless Metal 链接缺陷**：`vendor/stage3d_glue.mm` 的 `sk_mtl_shared_queue` 原以 `__attribute__((weak_import))` 声明，而**现代 macOS 链接器仍把它当未定义符号**（`Undefined symbols: _sk_mtl_shared_queue`），故 `examples/stage83.build.json` 那种 headless Stage3D 构建（不链 `metal_glue`）链接失败（**既有缺陷**，非本阶段引入）。改为 `#include <dlfcn.h>` + `dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")` 惰性查找（`SkMtlSharedQueueFn` 函数指针缓存），`s3d_create` 取到共享队列则采纳、取不到用自有队列 ⇒ 普通清单即可链接（不再需要 `-Wl,-U`）。钉子在 `unit: stage3d/gpu-queue-sharing`。
+
+**七、回归与验证**：单元组 —— 新增 `unit: render/BakeResolution`（7 条：烘焙缩放来源 + 双护栏 + `draw` 栅格缩放 + 源矩形 +1 是位图像素 + `ASC_render_scale` 钉位 + 源变换归零与还原 + **三端探针逐行一致**），改写 `unit: stage3d/mip-semantics`（区域上传调用、`o->mips` 置位/清零、层数拒绝、两个结构体的 `mips` 字段、2D/立方体绑定传参、两端丢弃规则的条件串与**位置**、`texHasMips` 清零）与新增 `unit: stage3d/dss-cache`（16 槽、键值选择、LRU 淘汰、`asc_tr_dss` 只计未命中、键拷贝与 `depthCompare` 入键），`stage3d/gpu-queue-sharing` 改写为 dlsym 形态；`node --test --test-name-pattern='stage3d/' test/unit/*.ts` **26/26 全绿**。示例端到端 `node test.ts` **263/263 全绿**（新增示例 `examples/bakecrisp.as` —— 离屏 `BitmapData.draw` 探针的**可回归化**：`cacheAsBitmap` 开/关在祖先缩放 1/2/3 下逐像素相同、`draw(field,scale(k))` 墨迹 `41x21/81x41/121x61` 且边框恒 1 位图像素、`draw(container)` 忽略源自身变换、几何 shape 在 `scale=2` 下 `62x40` 且 `pixdiff=0`，该示例在 `test/examples.ts` 的 `EXAMPLE_ARGS` 里登记了 `--manifest examples/bakecrisp.build.json`（**必须链 Skia**：它断言的是 `getPixel32` 像素，纯 C 构建的 `draw` 是空桩、墨迹 0x0，与只 `trace` 的 `autobake.as` 不同）；逐条对应 adl 实测行；**这正是修前的反例**——修前 `k=2` 的 `pixdiff` 是 528、边框 2 px）。另修 `test/unit/text-input.ts` 的 `TextSelection` 钉子（该钉子把旧口径 `sw = ceil(_fieldWidth) + 1` 钉死了，已按 adl 实测改为 `sw = ceil(_fieldWidth * rs) + 1`）。真实 GPU 无回归：`Basic_SkyBox` 重新全量构建（**记一个坑**：`temp/skybox-aot/relink-a3d.sh` 的「只重编 glue、对旧 `.o` 链接」仅在生成 C 未变时有效——`emit.ts` 一改，旧 `.o` 里的调用约定就与新的 `.c` 不匹配，实测表现为 `EXC_BAD_ACCESS` 在 `s3d_compile` 的 `snprintf` 里，真因是参数错位；必须全量重建）。
+
+**文档**：`README-CN.md` 三处口径更新（烘焙分辨率不再是 dpr、`BitmapData.draw` 源变换与 +1 口径、2D mip 链已落地），`docs/zh-cn/display3d.md` §9.2（2D 不再只收 level 0）/§9.5（无链丢弃已落地）/新增 §9.12（状态缓存 + 2D mip 链 + 两端同步），`package.json` v0.4.100 → **v0.4.101**。
+
+**遗留表**：**移出 7 行**（同上「本轮变动」① ~ ⑦）、**新登记 4 行**（web 构造器期 Stage3D + wasm 异常不可捕、`catch (e:*)`、内建可选参数、`textWidth` 字距口径）；表内项数 **95 → 92**（`部分完成` 12 → 10、`未开始` 82 → 81、`调研完成 · 实现暂缓` 1 不变）。
+
+---
+
+### 阶段一百二十九：显示器刷新率查询（`VsyncStateChangeAvailabilityEvent.refreshRate`）+ `Stage.vsyncEnabled`，并修掉 `--air-app` 闭包 `this` 捕获缺陷（目标 v0.4.101 → v0.4.102）✅ 已完成
+
+**需求来源**：可移植地让 `stage.frameRate` 跟上**真实面板刷新率**（120 Hz 屏上跑 120、拖到 60 Hz 外接屏自动降到 60）。难点在于 **AIR 根本不提供刷新率查询**：`flash.display.Screen` 只有 `bounds`/`visibleBounds`/`colorDepth`，与刷新率沾边的只有 `flash.events.VsyncStateChangeAvailabilityEvent`，而它**只带一个只读 `available:Boolean`**。
+
+**一、adl 51.4.1 实测口径（唯一 oracle）**：
+
+| 项 | 实测结果 |
+|---|---|
+| 构造器 | 恰为 `(type:String, bubbles=false, cancelable=false, available=false)`；**加第 5 个实参 `mxmlc` 直接拒绝**（「不超过 4 个」） |
+| `available` | **只读**（赋值即编译错） |
+| 常量 | `VSYNC_STATE_CHANGE_AVAILABILITY` = `"vSyncStateChangeAvailability"` |
+| 派发时机 | **一次**，在 `ADDED_TO_STAGE` 之后；`available` 实测恒 **`false`** |
+| `Stage.frameRate` 默认 | `24` |
+| `Stage.vsyncEnabled` | **可写**，默认 `true` |
+
+⇒ 判据（AGENTS.md §1.5）：「刷新率查询」在 AIR 里**没有对应物** ⇒ 属**增强**（`docs/zh-cn/enhancements.md` E16）；而 `Stage.vsyncEnabled` 是 **AIR 已定义**的开关 ⇒ 属**对齐**。
+
+**二、实现**：
+
+- **`src/symbols.ts`**：注册 `flash.events.VsyncStateChangeAvailabilityEvent`（superClass `Event`；字段 `available:bool` + `refreshRate:number`；静态常量；构造器 = AIR 的 4 参 **+ 第 5 个可选 `refreshRate`**），并加 BUILTIN_FQN `flash.events::VsyncStateChangeAvailabilityEvent`；新增 `Stage.vsyncEnabled` getter/setter。
+- **`src/emit.ts`**：① 一个**应用级** `static bool ASC_app_vsync_enabled = true;`（AIR 的默认值）——与 `ASC_app_frame_rate` 同理，`Stage` 在 AIR 里是应用级单值；② `Stage_get/set_vsyncEnabled` 只是它的代理；③ `VsyncStateChangeAvailabilityEvent_ctor/_new`；④ `ASC_dispatch_vsync_event(id, stage)`：**启动后首个已知帧** + **窗口落到不同速率的显示器**时各派发一次（用 `ASC_vsync_last_refresh` 去重），`available` 恒 `false`（同 adl）、`refreshRate` = 当场读到的刷新率；**`rr <= 0` 即不派发**（web/离屏无对应物 ⇒ 绝不伪造 `0`）；⑤ 挂到 `ASC_window_on_frame` 里、`Stage_dispatchFrame` **之前**（AFTER `ADDED_TO_STAGE` 且 ctor 里加监听器已生效）；⑥ **pacing 门**：`ASC_window_on_frame_delay` 里 `vsyncEnabled == false` 时**去掉**「显式 frameRate 高于面板就封顶」的规则。
+- **演示接线**：`examples/air-starling-demo/src/Demo.as` 监听该事件并在回调里 `stage.frameRate = e.refreshRate`。
+
+**三、`--air-app` 闭包捕获缺陷（验证中撞出，pre-existing，已修）**：`--air-app` 的引导代码（`src/air-app.ts:271`）会生成**顶层** `var stage:flash.display.Stage = new flash.display.Stage();`，于是**任何**在**闭包**里读裸 `stage` 的方法都让 `--air-app` 构建**编译失败**：`error: use of undeclared identifier 'this'`（**只在 `--air-app` 下暴露**——直接编译同一份源码无恙；demo 只是碰巧没在闭包里读裸 `stage`）。
+
+**根因是两处解析不同口径**：闭包捕获 walk（`emit.ts` 的 `Var` 分支）用 `lookupFuncVar`（**含模块帧 `funcVars[0]`**）判断「这个裸标识符是不是局部变量」，而发射期 `emitVarLexical` **刻意**让类成员优先——模块变量只在 `currentClass === null` 时可见（其注释原文：*a top-level `stage` never shadows the DisplayObject.stage getter*）。于是 walk 认为它是局部 ⇒ **跳过 getter 检查** ⇒ 不给闭包捕获 `this`，而发射期仍按 getter 发 `this->vtable->get_stage(this)` ⇒ 没有接收者的 `this`。**排除实验**（逐个名字对照 walk 输出）：`width`/`root`/`numChildren`/`mouseX`/`alpha`/`scaleX` **全部正常**，**只有被引导代码烤进去的 `stage`** 命中（`funcVar=y`）。
+
+**修法**：新增 `lookupFuncVarLocal`（只搜**真正的函数局部帧**、排除模块帧），walk 在 `currentWalkClass !== null` 时一律用它 —— 与发射期同口径。**回归钉子** `unit: emit/ClosureThisCapture`（6 条）+ **反例验证**：把修复回退后头两条钉子当场变红。**探针踩坑（已写进钉子注释）**：第一个版本的探针闭包里同时读 `stage` 与 `width`，而 `width` 会**独立置位 `needsThis`**、把缺陷掩盖掉（回退后仍全绿）；关了 `stage` 单读才拉得开。
+
+**四、验收**：
+
+- **单元/示例**：`examples/vsyncevent.as`（离屏）+ `test/unit/vsync.ts` 结构钉子；`unit: emit/ClosureThisCapture` 6 条。
+- **真机窗口探针** `temp/vsyncwin/`（自建 `-app.xml` + `drive.py` 驱动窗口跨屏）：`VSYNC available=false refreshRate=120` → 移到 60 Hz 外接屏派发 `refreshRate=60` → 移回 120 Hz 再派发 `120`，且 `TICK fr=120 vsync=true` 说明 `stage.frameRate` 同步跟随。
+- **Starling demo 无回归**：按官方路径重建（`node src/index.ts --air-app examples/air-starling-demo/Demo-app.xml --main-class Demo`，18.4 s / 302 warnings / **0 errors**）后跑 `temp/benchvar/knobs.py front` ⇒ **peak 59280 / result 59267 / fps 126.6**（基线带 61.4k–66.2k），即接线 `frameRate` 跟随刷新率后性能无退化。
+- **全量回归**：`node test.ts` **265/265 全绿**（新增 2 组：`vsync/VsyncStateChangeAvailabilityEvent`、`emit/ClosureThisCapture`）。
+
+**五、顺带修掉一条**骨灰级**的脆弱钉子**：`unit: numeric/Noreturn` 原先读 **`temp/perfreg/README.md`** 断言 A/B 数字，而 `temp/` 是**可丢弃的**（本轮它已被清掉）⇒ 钉子红。改为读 **`TODO.md`**（阶段九十四·二十六 的 A/B 表里 `21 888`/`42 144`/`_Noreturn`/`bl` 全在）——证据的**持久**副本才是该钉的地方，`temp/` 是草稿纸。
+
+**文档**：`README-CN.md`（当前限制两条 + `Stage` 属性表加 `vsyncEnabled` + `flash.events` 列表加该事件 + 增强清单 15 → 16 项 + 新示例条目）、`docs/zh-cn/enhancements.md` 新增 **§4.8 E16**、`docs/zh-cn/as3-semantics.md` §2「帧率口径」行（封顶现受 `Stage.vsyncEnabled` 控制）；`package.json` v0.4.101 → **v0.4.102**。
+
+**遗留表**：**移出 0 行 / 新登记 0 行**（本阶段是**新增能力**（E16）与**修对一个既有缺陷**（闭包捕获），两者都不属缺口；`Stage.vsyncEnabled` 反而**收窄**了 §2 里那条长期「维持现状」的口径差）。表内项数仍 **92 项**。
+
+---
+
 ### 遗留待开发
 
-> **状态（2026-10-01 复核，v0.4.23 收尾后更新）**：下表 **10 项**（与表内行数一致）——`部分完成` 1 项（Starling demo 的分配器高水位）、`未开始` 7 项（TextField 断行阈值、Flappy csf=2 缩放、`SecureSocket` 的 TLS 状态机、`DatagramSocket`、AMF 编解码、**`[SWF]` 元数据丢弃**、**`fullScreenWidth` 取完整模式**）、`调研完成 · 实现暂缓` 2 项（SWC 资源提取、preview2 `wasi:http`）；每项都附可复现证据（实测输出 / 代码位置）。**本轮（2026-10-01，八十九·六十八）新增 2 项**（Flappy-Starling 双目标实测的副产物，均为「`adl` 能跑对、我们不忠实」的**遗留**而非增强）。**本轮（2026-10-01，八十九·六十二）再移出 1 项已完成内容**：`URLLoader`/`URLStream` 对 non-2xx 的**条件终态**（已按受控实测实现，见 §6.7.6）→ **阶段八十九·六十二**。**本轮（2026-10-01）清理**：3 项已收尾内容移出并入对应阶段（见下条注记），并把原先挂在 2 个「汇总行」里的唯一未收尾子项 **AMF** 提升为独立行（否则会随汇总行一起丢失）。`flash.net` 的 **A~I 主体（八十九·五十二）+ 套接字层与静态自包含（八十九·五十三）已全部落地**。
->
-> **已完成项已从本表移出**，结论并入对应阶段（不再在本表重复）：`%=` 复合赋值、native/web 中间产物同名（`vendor/*.o`）→ **阶段八十九·三十三**；动态 `+` 的 `any+any` 语义、顶层「非声明位」`var` 的模块作用域 → **阶段八十九·三十四**；WASI `try/catch` 链接失败 → **阶段八十九·三十五**。密封类未知属性 `Error #1056`/`#1069`、`*` 承接数组的命名属性、`dynamic class` 建模、命名函数表达式、全可选参数构造器的 NULL factory → **阶段八十九·三十六**；顶层 `for-in`/`for-each` 循环变量的脚本作用域（阶段八十九·三十四 收尾时**主动保留**的子项）→ **阶段八十九·三十七**；重复求值审计（连带 `Boolean()` 引用语义与 NaN 真值）→ **阶段八十九·三十八**；循环条件 / `for` update 的重复求值（含连带发现的 null 归一化与 `typeof` 的 `function` 折叠）→ **阶段八十九·四十三**；MSL 单采样器限制 → **阶段八十九·三十九**；`flash.net.SharedObject` 未实现 → **阶段八十九·四十**（Flappy-Starling 的最后一个硬阻塞随之解除，其两项**渲染**残差仍留在表内）；Masks 场景被 `mask` 的对象未裁剪（遗留表原推测「stencil 状态未恢复」）内含的**字段遮蔽槽位合并** → **阶段八十九·四十四**；非 GUI 目标不自动回收（`gc_alloc` 无分配阈值）→ **阶段八十九·四十一**；该项的后续「阈值下限偏低（1 MiB）」→ **阶段八十九·四十七**（下限按路径二分：帧 1 MiB / 离屏 8 MiB，并缓存触发判定）；`ByteArray`/`BitmapData.pixels` 的字节缓冲 arena 泄漏 → **阶段八十九·四十二**（连同 `Context3D_submit` 临时缓冲缓存化；该行原附的「Sprite 3D 进出 12 轮 +3.7 MB/轮」归因经实测**更正**为分配器高水位，已改写为新行）；**异步 IO 是「假异步」（同步阻塞 + 事件派发推迟）** → **阶段八十九·四十五**（实测更正：停顿 99% 来自**同步解码**而非读；三个事件契约缺口一并修掉，native 改后台线程池、web/WASI 保持内联）；**`web` 帧率量化为刷新率整数分之一**（原表述「与 adl 的逻辑帧率口径不同」）经复核**不是待开发项而是已定的设计决策**——跟随 vsync 是本项目 native/web 两端的既定选择，与 adl 的差异属**口径不同**而非缺陷，结论并入 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §3 决策分歧点（**维持现状**；行为与理由另见 `docs/zh-cn/html5-web.md` §3.2/§6.4 与阶段八十九·二十九）。**`flash.net` 的「语义面 + `URLLoader` 契约」**（原遗留行的主体）→ **阶段八十九·四十八**（A/B 落地）；该项的 **G（无网目标诚实 `ioError`）+ C 的 native 竖直探针** → **阶段八十九·四十九**（`http(s)://` 显式识别 + opt-in libcurl 真传输）；**该探针揭示的构建层约束「`link-libs` 不按目标条件」** → **阶段八十九·五十**（清单 `targets` 按目标分层链接）。`URLStream`、web `fetch`、`navigateToURL` → **阶段八十九·五十一**（C 内核补全 + D/E/F/H）；AIR 语义保真校正 + 端到端验收 → **阶段八十九·五十二**。**本轮（2026-10-01）再移出 3 项已完成内容**：`flash.net` 的 **「HTTP 客户端 A~I 全部落地」汇总行**（已无残项）→ **阶段八十九·五十二**；**「`flash.net` 剩余重工程」汇总行里已落地的 3 项**（静态自包含、代理/cookie jar/HTTP-2、socket 层）→ **阶段八十九·五十三**（该行唯一的未收尾子项 **AMF** 已提升为下表独立行，故汇总行一并移出）；**web 构建里字体被重复打包**（已修复）→ **阶段八十九·五十八**。本表只留尚未收尾项。
+> **状态（2026-10-09 复核，v0.4.102）**：下表 **92 项** —— `部分完成` **10 项**、`未开始` **81 项**、`调研完成 · 实现暂缓` **1 项**（仅剩 preview2 `wasi:http`）；每项都附可复现证据（实测输出 / 代码位置）；项数**以表内实际行数**为准（脚本按本表内 `^|` 行重数，表头/分隔行除外）。**本轮变动（阶段一百二十九，显示器刷新率查询 + `Stage.vsyncEnabled`，并修掉 `--air-app` 闭包 `this` 捕获缺陷）**：**移出 0 行 / 新登记 0 行** —— 本阶段是**新增能力**（`docs/zh-cn/enhancements.md` E16：`VsyncStateChangeAvailabilityEvent.refreshRate`，AIR 无任何刷新率 API）与**修对一个既有缺陷**（`--air-app` 引导代码的顶层 `var stage` 让闭包捕获 walk 跳过 getter 检查、不捕获 `this` ⇒ `error: use of undeclared identifier 'this'`；已修 + `unit: emit/ClosureThisCapture` 6 条钉子，且回退修复后能变红），两者都不属缺口；`Stage.vsyncEnabled` 反而**收窄**了 `as3-semantics.md` §2「帧率口径」行那条长期「维持现状」的口径差（拍频取舍现在交回 AIR 自带的退出阀）。表内项数仍 **92 项**。**上一轮（阶段一百二十八，多端渲染性能与分辨率收口：Stage3D 状态缓存 / 2D mip 链 / 烘焙分辨率与 `BitmapData.draw` 口径）**：**移出 7 行** —— ① `Starling demo 逐轮 RSS 上涨`（三组新 harness 实测：skybox 60 s 平坦、Sprite 3D 12 轮无增长、benchmark 的 +34 MB/s 是 Starling 设计内的活集增长且 500 ms release pass 已归还 `vmmap` 的 FRAG 33% → 0%，`as_big`=0 ⇒ 无逐帧临时分配泄漏）；② `cacheAsBitmap`/自动烘焙按 **dpr**（而非目标画布总缩放）烘焙（已落地 `as_bake_scale`，带 4×dpr 与 4M 像素上限；九宫格同源同修；`adl` oracle：缓存开/关在 k=1/2/3 与祖先缩放两态**逐像素相同**）；③ `BitmapData.draw`/`as_render_bounds` 的**边框 +1**（adl 实测 = `width*k + 1` 且边框**恒 1 位图像素** ⇒ 源矩形的 +1 是**位图像素**、不是局部单位）；④ `BitmapData.draw(source, matrix)` 对 **source 自身变换**的处理（adl 2×2 矩阵定案：`cont.scaleX=2` 独立 draw 得 41×21 = 忽略源变换，`scale=2` + `mat=3` 得 121×61 = **只吃矩阵、两者不相乘** ⇒ 按该行选项 ① 对齐 AIR）；⑤ `Texture`/`CubeTexture` 的 **mip 1+ 未上传**（2D 已按 adl 实测的「源位图左上 `lw×lh`、按源行距读」区域规则上传各级）；⑥ **无 mip 链 + `miplinear` ⇒ 丢弃整个 draw**（两端同条件落地，web 侧丢弃点必须在 `glUseProgram` 之前，否则 GL 采到不完整纹理读作黑）；⑦ 每 draw 重建 **`MTLDepthStencilState`**（Metal 侧改按键值 LRU 缓存 `s3d_select_dss`，实测 `dss=2` over 1680 draws，`make_pso=2`/`pso_miss=0`）。**新登记 4 行** —— web 端从**文档类构造器**请求 Stage3D 不可用 + wasm 上胶水层 JS 异常 AS3 捕不到；`catch (e:*)` 被拒（`mxmlc` 接受）；内建方法的**可选参数**不生效（`drawTriangles(ib)` 报缺参）；`TextField.textWidth` 的字形累进口径残差（adl 14.5 vs 我们 14.40234375）。**上一轮（阶段一百二十七，内建类注册表 & Class 值 + `in`/`delete`/下标）**：**移出 6 行** —— ① `IDataInput`/`IDataOutput` 未注册为内建接口（已按 AIR **完整成员表**注册进 `flash.utils`，`TLSSocket extends Socket implements IDataInput, IDataOutput` 通过）；② `delete vec[i]` 与 `"0" in vec` 在**静态 Vector** 上报 codegen 错（已落地：`in` 按下标范围、`delete` 恒 true 且 no-op——原行猜的「`#2005`」经复测是**误归因**，`#2005` 实为 `new Vector.<int>(非数字长度)`）；③ `in` 在数组上（静态被拒 / 动态恒 false；已落地：`length` + 区间内非空洞下标 + 命名属性）；④ `getDefinitionByName` 的错误号与消息不忠实（两处硬编码改为 AIR 的 **`#1065`** + `Variable <末段> is not defined.`，原行的「message 是 `"Error #1065"`」经双端复测更正为完整句）；⑤ 未知类作**类型标注**不报语义错、泄漏 clang 诊断（已落地：符号表感知的 `checkTypeAnnotation`，带 `行:列`）；⑥ `is`/`as` 右操作为 `Vector.<T>` 时动态左值失效（已落地；其括注的「裸 `Vector` 作类型名报错」经 `mxmlc` 复测**吻合 AIR**——`var vv:Vector = new Vector.<int>()` 被 `mxmlc` 以「隐式强制转换」拒绝——故该括注**不属缺口**，已在下方节内写明）。**新登记 2 行** —— `Vector.<T>` 作 Class 值/值表达式（值位置先是 parse error）；`Socket.readObject` **响亮**未支持。**收窄改写 3 行** —— `is`/`as` 右操作数为内建类/接口 Class 值（内建类已落地，只剩接口与 `Vector.<T>`）；内置类名作 Class 值（引用类型已落地，只剩**原始包装类**）；反射 API 的内建类名口径（①④ 实测**更正为已对齐 / 部分对齐**，只剩 `int`/`uint` 独立 box tag 与 `Dictionary` 虚拟 vtable）。**上一轮（阶段一百二十六，Windows 原生后端）**：**移出 0 行 / 新登记 3 行**（Windows 侧未实机验证；Stage3D 无 Windows 后端；**测试门禁不稳定**——同一套件不同次运行报出 3 个不同的红、重跑全绿，根因未定，见本节末行）。**上一轮（阶段一百二十五）**：**移出 0 行 / 新登记 1 行**（`new XMLList()` 未注册为可构造内建类 —— `adl 51.4.1` 可构造、我们报 `unknown class 'XMLList'`（**响亮**失败）；`XML` 可构造而 `XMLList` 只能作类型标注，属不对称；见上节）。**上一轮（阶段一百二十四）**：**移出 1 行**（「编译范围 = 整个 `src/`（无可达性分析）」—— 已落地为**主类传递闭包**收面，同源 A/B：`Basic_SkyBox` 源文件 485→165、嵌资源 40→6、二进制 34,134,472→25,456,904 B、构建 37.03→15.94 s，且闭包产物是整包产物的**函数级子集**）；**新登记 0 行**。**上一轮（阶段一百二十三）**：**新登记 0 行 / 移出 0 行**（成员解析的最近声明规则属**把已定义行为修对**，不新增缺口；见上节）。**上一轮（ANEWebSocket 真源码实证，纯评估不升版本）**：**新登记 1 行**（**`flash.*` 包里的用户类对 `package`d 消费者不可见** —— 自写的 `flash.external.ExtensionContext` 顶不上内建，⇒ `ExtensionContext` 必须做成真内建；用真实厂商源码的隔离矩阵实测）。**更正 2 处口径**（① ANE 的 AS3 面 **74/61/678/115/368 → 70/59/605/106/363** —— 旧脚本用短名在整棵 `src/` 匹配，被工程自带的 `com.worlize.websocket.*` 污染；② 「ANE 的 AS3 类只能从 `DoABC` 拿」**不成立于全部** —— 工程 `src/` 已自带 **12** 个 ANE 相关类源码、其中 **2** 个就是被 import 的 ANE FQN）。**实证 1 条**（路线 ②′：ANEWebSocket 的 `.vcxproj` 链接仓库自带的 `libs/air/FlashRuntimeExtensions.lib`（内部记录 `Adobe AIR.dll` ×69）、无 `.def` ⇒ 换名 = **只换这一份导入库后重编**，零源码改动；且未经修改的 `WebSocketEvent.as` 在本编译器下**编译并运行正确**）。**上一轮（阶段一百二十二）**：**新登记 1 行**（**编译范围 = 整个 `src/`，无可达性分析** —— 实测 `embed 40 asset(s)` / 4,969,434 B 里含**别的 demo** 的资源，且它们**存活进产物**（`Basic_Stereo` 二进制里 `road.jpg`/`rockbase_normals.png`/`idle2.md5anim`/`grimnight_posX.png` 各自的 48 字节中段各 1 次）；不可达类里的坏 `[Embed]` 让我们编译期失败而 `adl` 无恙）。**上一轮（Windows 口径 ExtensionContext / ANE 宿主评估 v2，纯评估不升版本）**：**新登记 2 行**（**Windows ANE 宿主未实现**——实测 13/13 个 ANE DLL 的 FRE 符号**全部来自 `Adobe AIR.dll`**、全集 **34 个 = 25 在线参考已列 + 9 未列（但 SDK 头文件 52 个全有原型 ⇒ 无需逆向）**、加载协议为每 DLL 仅导出 `<Name>ExtInitializer`/`Finalizer`；**ANE 的 AS3 API 类无法纳入 AOT 闭包**——**74 个 FQN / 61 文件 / 3 个作基类**，定义在 `library.swf` 的 `DoABC`）。**更正 2 处口径**（① 上一版「真 ANE 桥接**不可行也无意义**」**作废**——它回答的是 macOS，而交付物是 **Windows**，届时 AIR **真的加载 `.dll`**、ANE 功能完整；② `talkmed-meeting-aot-gap-report-v2.md` §4.1 同步更正）。**复测确认 1 条**（v0.4.94 下**任何内建类**走 `getDefinitionByName` 仍抛 `#0 [No definition found]`，含 `String`/`Object`/`Sprite`/`StatusEvent`/`ExtensionContext`）。**上一轮（ExtensionContext / ANE 可行性评估 v1，macOS 口径）**：**新登记 2 行**（`getDefinitionByName` 的**错误号/消息不忠实**——未知名我们抛 `#0` + `"No definition found"`、AIR 抛 `#1065`；**未知类作类型标注**不报语义错、直接泄漏 `unknown type name` 到 clang 的**诊断缺陷**），**更正 1 行**（「内置类名不能作 Class 值」行原括注称「已支持 `getDefinitionByName("flash.display.BitmapData")`」，实测为**假**，已改正）。**上一轮（阶段一百二十）**：**移出 1 行**（`unboxAny` 的 `int`/`uint`/`bool` 分支用原始解箱而非 AS3 强转，动态值为字符串时给 0/false —— 已落地为「整族动态槽强转收口」，`unboxcoerce` 探针 **4/8 → 0/8**，并顺带修掉「`String`→数值」的 ES3 ToNumber 与数组字符串键的路由）；**新登记 4 行**（同批探针实测出的邻域缺口：`DisplayObject.name = null` 应抛 `#2007`、数组越界读应回 `undefined`、数组上的 `in`（静态被拒 / 动态恒 false）、`parseInt`/`parseFloat` 的 radix 与 `NaN`）。**上一轮（阶段一百一十九）**：**新登记 1 行**（同上）。**移出 6 行** —— ① 经动态槽给对象型参数赋错类型不抛 `#1034`（已落地：`unboxAny` 的对象解箱走 `as_req_inst`，`dyn` 探针 0/6 逐字一致）；② `(标量 as Object) == 标量` 恒 false（已落地：`Object` 静态类型的相等走 `as_v_loose_eq`；顺带修掉另一半 —— `Object` 槽里的 **Array** 原先按 tag 4 装箱，`==`/`+`/`length` 都看不见数组，现 `as_obj_to_value` 按 `as_dyn_kind` 回 tag 6，`verify` 探针 0/8）；③ 动态值 `x as <原始类型>` 给默认值而非 null（已落地：`as_v_as_*` 未命中回 null 箱，探针 C/C2 一致）；④ 装箱字符串参与算术/比较未走 ES3 ToNumber（已落地：`toNumberExpr` 的 `any` 分支改走 `as_v_to_number`，探针 D/E/F 一致）；⑤ 静态 `String` 与 `Number` 混算发射非法 C（已落地：现在是 `CodegenError`「operator '*' cannot be applied to a String operand」，`"5" < 6` 仍编译）；⑥ `null` 字面量传给 `Number`/`bool` 形参发射 `(double)(NULL)`（已落地：`v78` 探针 0/3）。**新登记 3 行**：AIR 数值解析/格式化的极值（`tonum2` 只剩 1/32 行差）；对象字面量/类实例的 **ToPrimitive**（`Number({})` 应为 NaN）；Function 值的 **#1063 qname**（接口接收者应报「方法定义类」，匿名闭包的 `<file>.as$N` 索引与顶层函数名不可复现）。**同轮顺带落地（不在本表、属新增包）**：Array 的 ToPrimitive/ToString（`[1,2]`→`"1,2"`、`Number([5])`→5、`==` 字符串化、`join(null)`→`"null"`）+ Function 值的 **#1063 参数个数检查**（原先一个 1 参闭包用 0 参调用会**段错误**）。上一轮（阶段一百一十八）：**新登记 2 行**（`extends <内建类型>` 文案已精确、特性仍缺；`IDataInput`/`IDataOutput` 未注册为内建接口）、**移出 0 行**。
+> **本表只留尚未收尾项**：已完成项一经落地即从本表移出，结论并入对应阶段节（每节末尾的「遗留表」行）；各项的逐轮增删沿革亦在同处，本表不再重复。
 
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
+| **Windows ANE 宿主未实现** —— FRE 宿主运行时，**34 个符号**（SDK 头文件 52 个全有声明）+ 扩展加载协议（**不产出 `Adobe AIR.dll`**：源码可得则重编换导入名，否则自建加载器） | 未开始（2026-10-09 可行性评估 v2（**Windows 口径**）实测登记；**新问题域**） | 交付物是 **Windows 应用**（`application.xml`：`extendedDesktop` + `<architecture>32</architecture>`），Windows 上 AIR **真的加载 `.dll`**、ANE 功能完整 ⇒ 「兼容 `ExtensionContext`」= 我们的运行时须**扮演 AIR 宿主**。实测（**PE 导入表逐字节解析**，`temp/extctx-win/`）：**13/13 个 Windows ANE DLL 的 FRE 符号全部来自 `Adobe AIR.dll`**——但该名字出自 **AIR SDK 自家导入库**（`lib/win/FlashRuntimeExtensions.lib` 文件名里没有 `Adobe AIR`，内部记录的模块名却是 `Adobe AIR.dll` ×109），是**链接期产物** ⇒ 我们**不必**产出这个名字：**有源码的 ANE 重编换导入名（§3.4 路线 ②′，首选）**，第三方 ANE 走**自建加载器**（route ①）。项目需要的全集 = **34 个 FRE 符号**，其中 **6/10 个 ANE 只用在线参考已列的符号**（AliyunRTC/NDI/NELivePlayer/WebSocket/WinWebView/ZoomSDK）；在线参考未列的 9 个里 **7 个只集中在 `ANEWinCore`(8) 与 `ANECefWebView`(2)**，且这 9 个在 `FlashRuntimeExtensions.h` 里**全部有原型**。加载协议亦已确认：每个 DLL **只导出 2 个符号**（`<Name>ExtInitializer`/`ExtFinalizer`），与各自 `extension.xml` 的 `<initializer>` **逐字相符**（`ANEWinCoreExtInitializer`/`ANEWebSocketExtInitializer`/`ANEMDKExtInitializer`/`ANEWinRTCExtInitializer`…）。**前置**：Windows 运行时后端（Win32 + D3D/Skia）**尚不存在**（现只有 macOS/Cocoa/Metal + wasm） | 分四步、每步可独立验收：① **Windows 运行时后端**（非 ANE 专属，但阻塞一切）；② `ExtensionContext` 内建类 + `StatusEvent` + 扩展加载协议骨架；③ **宿主 FRE 运行时**（按 SDK 头文件补齐签名），用 **6 个「只用在线参考已列 FRE」的 ANE** 验收；④ 原生窗口句柄（CEF）→ 再评估 `ANEWinCore` 的**渲染管线**（`FRESetRenderSource`/`FREMediaBufferLock`/`FREMediaBufferUnlock`/`FREGetRenderMode` = AIR 的 A/V 合成器）。**红线**：未实装的 ANE **不得**按「返回 `null`」处理——官方 `null` 的条件是「无该 id」或「initializer 找不到/失败」，Windows 上两条**都不成立** ⇒ 必须**响亮报明**（AGENTS.md §1.5）。证据：`temp/extctx-win/{peimp,peexp,split,impname,frehdr}.py` + `{imports,exports,split,impname,frehdr}.txt` |
+| **ANE 的 AS3 API 类无法纳入 AOT 闭包**（定义在 `library.swf` 的 `DoABC`） | 未开始（2026-10-09 同轮评估登记；**与平台无关**，是 AOT 路线的固有前提） | AIR 是**运行期**加载 ANE 的 `library.swf` 并执行其 ABC；AOT 要**静态链接**这些类，必须先拿到定义。实测面：静态 `import com.vsdevelop.air.extension.*` 去重 **70 个 FQN**、**59 个源文件**、**605 处**成员访问、**106 个**成员名（`getInstance` 独占 **363** 处）；**3 个类作基类**（`TestVideoView`/`VideoPlayer extends ANEVideo`、`VideoRootView extends ANEVideoRootView`）。**（口径已修正）** 旧记 **74/61/678/115/368** 是脚本 bug：`ane_surface.py` 用短名在**整棵 `src/`** 匹配，而工程自带纯 AS3 的 `com.worlize.websocket.{WebSocket,WebSocketEvent}`（10 文件 / 1506 行）短名与 ANE 的 `com.vsdevelop.air.extension.websocket.*` **相撞**（`WebSocketEvent` 一项 67→21）；新脚本 `temp/extctx-win/ane_surface2.py` 改为**按文件绑定**显式 import 的 FQN。**且「只能从 `DoABC` 拿」不成立于全部**：工程 `src/` 已自带 **12** 个 ANE 相关类源码（`com/vsdevelop/air/extension/{zip,lame,crypto,qcloud}/…` + `ManageExtension.as`），其中 **2** 个正是被 import 的 ANE FQN（`zip.ANEZipEvent`、`lame.data.lameInfo`）⇒ 这批**本就是普通工程源码**、早已在闭包里。**真正只能靠 `DoABC` 的是 70 个 FQN**。**已用真厂商源码（ANEWebSocket 仓库）实证**：`WebSocketEvent.as` **未经修改即编译并运行正确**（`open / hi`、`open`、`hi`），整个包装包唯一挡路的是内建 `ExtensionContext`（`25:5`）+ `StatusEvent` ⇒ 「拿到源码就解」不靠推测ANE 自带的 `catalog.xml` **只给类名 + 依赖名，不含成员签名**（连 `ANEWinCore.getInstance().macAddress()` 的返回类型都拿不到）。`DoABC` 属 [`docs/zh-cn/swc.md`](docs/zh-cn/swc.md) §3.3 明列范围外 | 四条路：① 写 AVM2 字节码前端（范围外、成本高）；② **离线反编译**——第三方 SWF 反编译器把 `library.swf` → **真 `.as`** 再纳入闭包（**推荐**：产出是源码而非桩，把 ABC 前端移出关键路径）；③ 手抄 74 类 API（不现实，≥115 成员起）；④ opt-in + **响亮** stub（stub 也要成员**存在且类型正确**，成本近 ②；静默返 `null` 会污染 `Log.as:34` 这类无判空调用点 ⇒ 触 §2.4 红线）。验收：每个 ANE「真源码能被我们编译并链接」 |
+| **`flash.*` 包里的用户类对 `package`d 消费者不可见** —— 自写的 `flash.external.ExtensionContext` 顶不上内建 ⇒ **`ExtensionContext` 必须做成真内建**，不能靠往工程里放一份同名 `.as` | 未开始（2026-10-09 ANEWebSocket 真源码实证时发现） | 用真实厂商源码隔离实测：`ANEWebSocket.as`（`package com.vsdevelop…`）import `flash.external.ExtensionContext`，**即使随构建提供同 FQN 的用户类**仍报 `25:5 undefined variable 'ExtensionContext'`。矩阵：**顶层**文件 import 自写 `flash.external.ExtensionContext` ⇒ **可行**；**`package`d** 类 import 同一 FQN ⇒ **失败**；同一 `package`d 类改非 `flash.*` FQN（`mypkg.ExtensionContext`）⇒ **可行**（墙移到下一符号）；`package`d 类 import 自写 `flash.fake.Thing` / `flash.display.MySprite` ⇒ **均失败**（`undefined variable` / `unknown class`）。⇒ 一条**包名相关**的可见性规则（非「类未注册」） | 先定口径：是「`flash.*`/`fl.*` 视为保留命名空间，用户定义一律不参与 `package`d 解析」（**则缺陷在于静默**：应响亮报「不能在 `flash.*` 定义类」/「`ExtensionContext` 是内建保留名」），还是可见性 bug（则应修解析）。**先补实测** `fl.*`、嵌套包、顶层与打包两形态的差异再动。证据：`temp/ane-src-probe/`（M1/M2/M3 + N1 + Q1/Q2 三组矩阵） |
+| `extends <内建类型>`（含 **`extends Array`**）不支持 —— 闭包内 **2 个文件**用它（`src/com/hurlant/util/der/Sequence.as`、`src/com/fiCharts/utils/graphic/StyleManager.as`），AIR 合法 | 未开始（2026-10-08 阶段一百一十八 重评估闭包时实测；**本轮只把文案改精确**，特性本身未做） | `resolveType('Array')` 给 `{kind:'array'}`、**无 `className`** ⇒ 旧码盲取 `.className` 报一字面的 `unknown superclass 'undefined' of 'Sequence'`（离原因很远）。现按 kind 分派：接口 ⇒ `cannot extend interface 'I'`；其余非类 ⇒ `unsupported superclass 'Array' of 'E': subclassing built-in types is not implemented`（带行列号）。**AIR 接受 `extends Array`**（mxmlc 51.4.1 实测），故这是**遗留缺陷**而非增强：子类数组需真实运行期支持（元素存储 / `length` / 全部 Array 方法在子类上的行为、`Vector` 与 `Array` 的元数据、`is Array` 沿链判定） | 立项前先量清面上：用 `adl` 实测「子类数组」的全部可观测差异（`a.length`、索引、`push` 等方法返回的是子类还是 `Array`、`getQualifiedClassName`、`is Array`/`is E`），再决定是「真做子类存储」还是「仅报精确错误 + 建议改写」。**先实测再动**（不得凭直觉定语义） |
+| AGAL `nrm` 的**归一化分量数**未实测（我方两个后端都用 **4 分量**模长，AGAL/AIR 的口径可能是 **xyz**） | 未开始（2026-10-08 阶段一百一十六 **代码观察后登记为待实测**；**未实测项**，不是实测结论） | `src/runtime.ts` 的 AGAL→着色器翻译对 `nrm`（opcode 0x0e）只有两种形态，**且两后端共用同一份格式串**（无 `target == 0` 分支）：全掩码分支发 `normalize(<src>)`（`runtime.ts:9855`）、部分掩码分支逐分量发 `normalize(<src>).<c>`（`runtime.ts:9814`）——两种都用 **vec4** 求模。故 `nrm ft0.xyz, v0`（away3d 环体镜面反射的常态写法）我方按 `(x,y,z,w)` 的模长归一化后再取 `x/y/z`，**`w` 分量参与模长**。若 AGAL 的 `nrm` 只以 `xyz` 求模（AIR 口径），源向量 `w != 0` 时我方与 AIR 会有**尺度差**（`w=0` 的常见情形无差别，`Basic_SkyBox` 的环体镜面反射看不出差别）。**跨后端一致性无问题**（两后端文本相同） | 立项实测：写一个 `nrm` 的 AGAL 小程序，让**源寄存器 `w` 非 0 且 `xyz` 模长 ≠ 1**，同帧对照 `adl` 与两后端的渲染像素（逐 draw 探针法同阶段一百一十五）；据实测把两后端的 `nrm` 改成 `normalize(<src>.xyz)` 形态或维持现状，并补一条单元钉子。**成本低**（单点格式串 + 一次双端渲染对照），但**先实测再改**（当前无 adl 口径，不得凭直觉改语义） |
+| web 目标无音频后端时，`Sound.loadCompressedDataFromByteArray` **直接抛 `#2068`**（AIR 是载入成功、到 `play()` 才体现「无声」） | 未开始（2026-10-08 阶段一百一十六 web 验收中实测；属既有已文档化限制的**口径差异**） | Starling web 版实测 `Error creating wing_flap: Could not load sound data: Error #2068: Invalid sound.`；native（同一份 AS3、miniaudio 后端）正常载入/播放。根因是**无后端时 `as_audio_decode` 是恒返 −1 的桩**（`src/runtime.ts:1745`），而 `Sound_loadCompressedDataFromByteArray` 把解码失败如实翻成 `#2068`（`src/emit.ts:8023`，抛错点 `:8049`）。`src/air-app.ts:686` 的构建期黄字警告说的是「web 构建尚无音频后端，`play()` 返 null、`areSoundsInaccessible()` 为 true」——**那条口径只在「声音已载入」的路径上成立**（零长 `Sound`/PCM 路径），走压缩数据装载的程序在 web 上是**载入即失败** | web 音频后端（`vendor/audio_glue.c` 的 wasm 版：miniaudio 的 web 后端或 `AudioWorklet`）落地后自然消失；在那之前二选一：维持「响亮失败」（当前，信息量大）或把桩改成「返回空缓冲」以贴合 `air-app.ts` 的警告口径。**先定口径再动**（`docs/zh-cn/audio.md` 与 `src/air-app.ts:686` 的措辞必须一致），**成本低** |
+| `is`/`as` 的右操作数是**内建类 / 接口 / `Vector.<T>` 的 Class 值**时仍不支持（**用户类已落地 v0.4.72、内建类已落地阶段一百二十七**） | **部分完成**（2026-10-06 阶段九十九 用户类/SWC 类；**2026-10-09 阶段一百二十七 内建类**） | **已落地**：`var c:Class = SomeUserClass` 下的 `x is c` / `x as c` 走运行时类对象（`as_class_is_obj`/`as_class_is_val`/`as_class_as_val`/`as_req_class`），子类命中父类、`null is c`=false、`*` 左值按运行时类、**右操作数非类对象一律 `#1009`**；顺带修掉 `x is Object` 的静态折叠（除 `null`/`undefined` 外皆 true，`as_v_is_object` 按 tag）。**阶段一百二十七 追加落地（内建类）**：`emitClassRegistry` 现在给**每个有 `reflectFqn` 的类**（含全部内建类）发 `_cls` 常量（工厂指针 `NULL`），`emitVarLexical` 的 Class 值解析随之放行 ⇒ `var c:Class = Object; 5 is c` = **true**（AIR 对**内建 `Object` 类**自动装箱任何原始值，`as_class_is_val` 实现）、`BitmapData is Class` = true、`String(c1)` = `[class BitmapData]`（`as_class_str`）；`adl 51.4.1` 对照见 `temp/pkg1/oracle/adl-pkg1.txt`（C1/C4/C7/E2/E3/E8/E9）与 `examples/builtin-class.as`。**剩余**：① **内建接口**作 Class 值仍不可表达 —— `getQualifiedClassName(IDataInput)` 报 `Codegen error at 3:1: undefined variable 'IDataInput' at top level`（`adl` 给 `flash.utils::IDataInput`）；② **`Vector.<T>`** 作 Class 值不可表达（`adl` 给 `[class Vector.<int>]`；`Vector.<int>` 出现在**值位置**时我们先是 parse error —— 见新增行）；③ 右操作数为 **`any`/`Object` 静态类型**时不走动态路径（无法廉价区分「真是 Class 值」与「普通对象」，误判会把普通对象的首字当 `as_class` 读 vtable ⇒ 静默错误） | 给**接口**补 `_cls` 常量（接口判定的运行时路径——`as_iface_lookup`——已存在，缺的只是「接口名进值位置」）；`Vector.<T>` 的 Class 值见新增行。**成本中**。证据：`temp/cisprobe/cis-result.txt`（A–J 组）+ `temp/pkg1/oracle/adl-pkg1.txt` + `temp/pkg1d/Cl2.as` |
+| 类实例的**隐式字符串转换**不走类自己的 `toString()`（`Error.toString`/`Error.name` 亦缺） | 未开始（2026-10-06 阶段九十六 实测发现并登记；**语言级**，非音频） | 阶段九十六 的音频探针把它放大出来了：`"x" + new Plain()`（`Plain` 有 `public function toString():String { return 'PLAIN-TOSTR'; }`）在 adl 51.4.1 上得 `PLAIN-TOSTR`，我们得**裸类名** `Plain`；无覆写时 adl 得 `[object Bare]`、我们得 `Bare`；`new Error("boom")` adl 得 `Error: boom`、我们得 `Error`；`Error.name` 字段在本子集**不存在**（`undefined field 'name'`）。显式 `p.toString()`/`String(p)` 两端一致。复现：`class Plain { public function toString():String { return 'PLAIN-TOSTR'; } } trace("plain=" + new Plain());` ⇒ `plain=Plain`。证据：`temp/audioprobe/gen4.ts` 的 `S1` 行（adl 参考 `temp/audioprobe/adlref/adl4.txt`） | 修在**值到字符串**的收敛点：`as_v_str_val`/`as_str_from_*` 遇 class 实例时应先查该类是否覆写了 `toString()`，命中则调用、否则输出 `[object <ClassName>]`；`Error` 再补 `name`/`message` 的 `toString` 形状（`<name>: <message>`）。注意别把**静态已知字符串**的路径拖慢（§2.4 红线表） |
+| **动态音频**（`SampleDataEvent`/`sampleData`）未实现 | 未开始（2026-10-06 阶段九十六 登记；属 D 步的一部分，本轮**主动不做**） | adl 51.4.1 实测：给 `Sound` 加 `SampleDataEvent.SAMPLE_DATA` 监听器后 `play()` 返回**真实 channel**（`temp/audioprobe/adlref/adl9.txt` 的 `F dyn play=true len=0`），AIR 随后按 `bufferTime` 派 `sampleData` 让应用自己喂 PCM。本子集当前**没有** `SampleDataEvent` 类 ⇒ 依赖它的程序（自制合成器/流式 PCM）无法移植。其余 `flash.media` 面（A/B/C + `extract`/`loadPCMFromByteArray`/`computeSpectrum`）已在 v0.4.69 落地 | 后续子阶段：加 `SampleDataEvent` 类（`data:ByteArray`、`position:Number`）+ 在混音回调里挂「应用喂数」通道（**线程红线**：喂数在 AS3 线程、混音在音频线程，需无锁环；口径见 `audio.md` §13.2）。除非有真实 demo 需要，优先级低于 `[Embed]` |
+| 顶层自由 `function` 名撞 **libc/libm 符号**（`log`/`pow`/`exp`/`index`…）⇒ **编译失败** | 未开始（2026-10-06 阶段九十六 探针实测发现；**命名层**，非音频） | 阶段七十六 的保留字表只覆盖**方法名/字段名/类名/局部变量/形参/模块变量**，**顶层自由函数**漏网 ⇒ `function log(s:String):void` 被发射成 C 的 `log`，与随机数一起链接的 `-lm` 的 `log(double)` 冲突：`error: passing 'char *' to parameter of incompatible type 'double'`；而 mxmlc/AIR 允许这个名字。复现：`function log(s:String):void { trace(s); } log("x");` ⇒ 编译失败（对照 `examples/stage76.as` 里**写在类内**的同名方法通过）。证据：`temp/audioprobe/gen10.ts` 首版（把 `log(` 改名为 `say(` 才编过） | 把顶层函数名（声明 + 调用点，`main`/`[WasmExport]` 除外）并入 `symbols.ts`/`emit.ts` 既有的 `sanitize` 集合；会**改变所有示例生成的 C 文本**（阶段七十六 已记载同类风险），须 examples 全量回归 |
+| IME **合成期**的 `.text` 口径未实测（合成串到底进不进 `.text`） | 未开始（2026-10-04 阶段九十四·十七 主动登记；**未实测项**） | 本阶段把合成串实现为**预览**（`.text`/caret/选区/`numLines`/`textWidth` 不动、不派 `change`），理由是：本机**无法把真实输入法接到 `adl`**——① `TISSelectInputSource(WeType)` 让 python 进程 `SIGTRAP`（exit 133）；② 输入源是**按应用（per-app）**的，`TIS` 只能改调用者自身，`adl` 拿不到；③ 菜单栏输入法菜单未启用（`Ctrl+Space` 旋转也无效）。因此「合成期 AIR 的 `.text` 含不含合成串」这一条**没有实测口径**，是**选择**而非复刻 | 立项：在一台输入法可用的机器上写 `adl` 探针——合成中每帧 dump `text`/`text.length`/`caretIndex`/`numLines`/`textWidth` 与 `change` 次数；若 AIR 确实把合成串算进 `.text`（则我们当前的「预览」模型需要改），再按实测重写；同时实测 `IMEEvent` 的事件序与 `data` 载荷 |
+| `flash.system.IME` 类与 `IMEConversionMode` **未实现**（只登记了实测口径） | 未开始（2026-10-04 阶段九十四·十七 实测登记后**主动不实现**） | `adl 51.4.1` 实测：`IME.isSupported=true`、`enabled` 初值 `true` 可写、`conversionMode="UNKNOWN"`；`setCompositionString`/`doConversion`/`compositionSelectionChanged` **恒抛 `Error #2063`**、`compositionAbandoned()` 是 no-op、`setConversionMode` **根本不存在**（`Error #1006` `setConversionMode is not a function`）；`IMEConversionMode` 只有 **8** 个常量，已废弃的 6 个**读回 `undefined`**；且 mxmlc **拒绝静态引用**这些成员（只能动态引用）。⇒ 这个类在 macOS 上没有可用路径，实现价值低 | 若将来做 web/Windows 端且确有需要，再按上表口径补类骨架（8 个常量 + `isSupported`/`enabled`/`conversionMode` + 方法抛 `#2063`），**不要**凭空给方法编语义 |
+| `IMEEvent` 事件族（`imeCompositionStart`/`Update`/`End`）**不可达** | 未开始（2026-10-04 阶段九十四·十七 实测登记） | mxmlc **拒绝** `IME.addEventListener(...)` 的静态调用（「可能未定义」）；AIR 文档口径是「未设 `imeClient` 时运行时用 out-of-line 合成，最终结果作为 `TextEvent.TEXT_INPUT` 送出」⇒ TextField 路径上唯一可观测的口径就是**提交时的 `TEXT_INPUT`**（本阶段已接）。事件族本身在 AS3 侧既发不出去也监听不到 | 与上一行同批：只有先能实测事件序（需真实输入法环境）才谈实现 |
+| web 目标**合成事件未接**（`compositionstart`/`compositionupdate`/`compositionend`） | 未开始（2026-10-04 阶段九十四·十七 主动登记） | native 侧已接 `SDL_TEXTEDITING` → `"textEditing"` 通道；web 侧 `vendor/web_glue.cc` 既没有键盘通道（既有遗留行）也没有合成事件通道，故浏览器下 IME 的 marked text **完全不可见**（提交路径 `input` 事件同样未接）。属**明确的未支持**，不静默降级 | 与「web 目标键盘与剪贴板未接线」同批立项：DOM 的 `compositionstart/update/end` → 帧边界队列 → 与 native 同一条 `"textEditing"` 语义（marked text + caret）；`beforeinput`/`input` → `sk_window_text_take` 等价物 |
+| 字符串内嵌 **NUL**（`"a\u0000b"`）在本运行时截断 | 未开始（2026-10-04 阶段九十四·十八 实测登记；属**字符串表示**的既定边界） | 阶段九十四·十八 已让 `\uXXXX`/`\xXX` 正确解码，但解码出的 `\u0000` 是真正的 NUL 字节，而本运行时的字符串是 **C 串**（`char*`）：`strlen` 在 NUL 处停止 ⇒ `"a\u0000b".length` 我们 **1**、`adl` **3**（AIR 的字符串是 UTF-16 码元序列，NUL 是普通码元）。影响面 = 用 NUL 做分隔/填充的协议代码（真实工程里 `ByteArray` 那侧另有 API，字符串这侧少见） | 要忠实须把字符串改成**带长度的表示**（`{char* , int len}` 或 UTF-16），触及运行时字符串层与全部示例 ⇒ 与「`String` 是 UTF-8 字节索引」行**同源同批**；当前只在示例里钉住可观测的那一面并写明偏差 |
+| 可视行表（`sk_textlayout_line_metrics` 的 `fStartIndex/fEndIndex`）仍是 **UTF-16 码元**，而 `as_tf_line_of_index`/`as_tf_line_end` 拿 **字节** caret 去比 | 未开始（2026-10-04 阶段九十四·十七 实测发现并登记） | 阶段九十四·十七 已把**渲染侧**（光标矩形、选区矩形）的字节→码元换算补上（`as_tf_utf16_index`），但阶段九十四·十五 的**可视行表**还在直接比较两种索引域：`as_tf_line_table` 存的是 Skia 给的 UTF-16 索引，`as_tf_line_of_index(caret)` 与 `as_tf_line_end(line)` 用的却是**字节**偏移。ASCII 下两者恒等（探针全 ASCII，故此前没暴露），**CJK 文本上**（如 `"ab你好"`，caret 字节 8 / 段落码元 4）会误判「caret 在末行之外」⇒ `Up`/`Down`/`PageUp`/`PageDown` 的落脚行/列会偏。**判据（§1.5）**：`adl` 能跑对 ⇒ **遗留** | 立项：把这四处比较统一走 `as_tf_utf16_index(tf, byte)`（换算一次即可，成本极低），并补一个 **CJK 多行 + `wordWrap`** 的双端探针（`temp/editprobe`）验证 Up/Down/PageUp/PageDown 的落点；与「上下移动的列位口径是字符列而非像素 X goal」行**同批**做一次文本导航的完整回归 |
+| 窗口键盘通道把 **Shift 自身**的 keyDown/keyUp **各派发两次** | 未开始（2026-10-04 阶段九十四·十三 实测中发现并登记；**AOT 独有**） | 同一个驱动（`Quartz.CGEventCreateKeyboardEvent`，Shift vk=56 只 post 一次）下，`adl 51.4.1` 每个 Shift 按键只记 1 条 `KEY keyDown kc=16` + 1 条 `KEYUP kc=16`，而 AOT 产物记 **2 条**（同一毫秒、内容逐字相同，`temp/editprobe/aot_run2d.txt` 与 `aot_ed10.txt` 都可复现；早于本阶段的旧证据里就有，非本次改动引入）。`mod` 位掩码、与 Tab 的配对、`shiftKey` 取值都正确，所以只影响「监听 Shift/修饰键自身按键」的代码（例如把 Shift keyDown 当手势起点的 UI）。`vendor/window_glue.cc` 的 `sk_key_cb`→`ASC_window_on_key`→`Stage_dispatchKey` 全程只有一个调用点，SDL 事件层是否重复投递待查。**判据（§1.5）**：`adl` 只发一次 ⇒ **遗留**（保真缺口） | 排查起点：在 `window_glue.cc` 的 `SDL_KEYDOWN/KEYUP` 分支加临时计数，确认是 SDL 收到两次还是我们派发两次；若是 `SDL_TEXTINPUT`/`KEYMAPCHANGED` 伴随路径重复进入同一分支，按事件类型去重 |
+| `displayAsPassword` 与 `htmlText` 的**组合**未实测 | 未开始（2026-10-04 阶段九十四·十六 主动登记；**未实测项**） | 遮罩已按实测落地（排版串 = 每字节一个 `*`、CR/LF 保留、`.text` 恒为明文、遮罩字段拒复制/剪切），但**带 run 表（`htmlText`/`setTextFormat`）的字段再开遮罩**没探过：当前实现让**遮罩优先**（`hasRuns` 在遮罩生效时强制为假，星号串走单一 `defaultTextFormat` 排版），理由是 run 的字节区间与屏幕上的星号串对不齐。`adl` 侧未跑（密码字段用富文本是罕见组合） | 立项：写一个 `htmlText` + `displayAsPassword=true` 的 `adl` 探针，实测 AIR 是「保留各 run 的大小/颜色但字换成 `*`」还是「整段退化成默认格式」；再决定是否让 run 表参与遮罩 |
+| 多行 `Return` 的 `textInput` **载荷**是 `"\r"`（`adl` 是 `"\n"`） | 未开始（2026-10-04 阶段九十四·十四 实测登记） | 阶段九十四·十四 给多行字段补上了 `Return` 的文本提交（SDL2/Cocoa 从不为 Return 产生 `SDL_TEXTINPUT`，我们在 keyDown 上合成），结果文本两端**逐字一致**（`5\r\r7`），但事件载荷不同：`adl 51.4.1` 实测 `TextEvent.text == "\n"`，我们传 `"\r"`。只在「监听 `textInput` 读载荷做判断」的代码上可观测 | 立项：合成时把载荷改成 `"\n"`、插入前把 LF 归一为 CR（要先实测粘贴含 `\n` 的剪贴板在 adl 上插入什么，别顺手改粘贴路径） |
 | `TextField.textWidth` 不含行尾空格（AIR 含） | 未开始（本轮实测发现，**与断行无关，是独立口径**） | 同字体同字号下 `textWidth` 对 `"Multitouch "`：AIR **133**（含 1 个空格 8.5px）、对 `"Multitouch  "` **141.5**；我们恒为 **124.945**（SkParagraph 不计尾部空白） | AIR 是权威（§1.5），该差异是**遗留**不是增强。**风险点**：Starling 的 `TrueTypeCompositor` 正是按 `textWidth` 定尺建 BitmapData，改动会**同时影响**它与 `textfield-align` 的居中期望值，须重跑 Starling 12 场景 + 相关 examples 才能收 |
-| Starling demo 逐轮 RSS 上涨（**分配器高水位，非泄漏**） | 部分完成（字节缓冲已迁 GC、`Context3D_submit` 临时缓冲已缓存复用；RSS 上涨本身尚未定位到具体分配点） | 阶段八十九·四十二 实测更正：把 `ByteArray`/`BitmapData.pixels` 迁入 GC 后，同机同 harness 的曲线**斜率不变**（迁移前 175→206 MB / 12 轮，迁移后 175→202 MB），且 `as_big`（arena ≥1 MB）**0 条**、`leaks` **288 B**、活动 `malloc` 16.7→17.1 MB、GC 堆平（16 MB / 276 段）、`vmmap` 的 `MALLOC_MEDIUM/LARGE (empty)` 空区在 10~60 MB 涨落（每 8~10 轮返回一次）——即增长是**分配器高水位**（瞬时峰值捏住的内存不还 OS），既非活对象泄漏也非字节缓冲。注：当前 harness 菜单点击落不到按钮（窗口 640×1112 vs 渲染面 1800×1169，已知 `csf==2` Stage3D 缩放缺陷），该曲线**不含**场景进出 | 冻结语义下的可选优化：①逐帧临时缓冲尽量复用（已做 `Context3D_submit`，`ASC_stage3d_pixels` 仍 `malloc`/`free`）；②`free()` 后显式 `malloc_zone_pressure_relief()`（GC 段归还路径已做）；③若要根治需按分配点做采样（`vmmap -summary` + `MallocStackLogging`）。见 [`docs/zh-cn/gc.md`](docs/zh-cn/gc.md) §6.14 |
-| SWC 资源提取 | 调研完成 · 实现暂缓（待用户决定） | 已调研（[`docs/zh-cn/swc.md`](docs/zh-cn/swc.md)，基于 `temp/skin.swc` 解包实测）：SWC 资源嵌于 `library.swf`（CWS）的 SWF tag（`DefineBitsLossless2`/`DefineBitsJPEG2` + `SymbolClass` → `BitmapData` 子类），提取链路 = ZIP 解包 → CWS 解压 → tag 扫描 → 像素/JPEG 字节。**2026-09-26 复核（v0.3.138）已就地校正该文档**：像素为**预乘** ARGB（字节序 A,R,G,B），AIR 读回时反预乘（`floor(stored*255/A + t)`，t∈[0.329,0.413)）→ 提取必须做反预乘；`BitmapData.pixels` 是 **straight ARGB**（非文档旧称的 RGBA）；16 个命名资源原始 1.48 MB → C 文本 ≈8.90 MB（须落独立资源 `.c`）；`small_gift`/`checkbom` 实为 `DefineSprite` 不属那 16 个。**同日追补复核（SWC 内的代码）**：`library.swf` 还有 **255 个 `DoABC` = 254 类 / 54,162 B AVM2 字节码**（含 `TweenLite`、`com.adobe.crypto.MD5`、JSON 解析器、Flex `mx.core`、自家组件库；按父类 192 `MovieClip` / 12 `BitmapAsset` / 4 `BitmapData`），本方案**只把 SWC 当资源容器**，代码属**范围外（不是「延后」）**——ABC 容器读取已解通（自写解析器对 **255/255** 模块 round-trip 精确吻合，自证正确），但字节码→可编译产物需反编译器或 AVM2 解释器，属另行立项；文档已补 §3.3 范围声明与 §3.3.3「用 `catalog.xml` 的 `<dep>` 做编译期早期诊断」 | **暂缓，后续用户决定再实现**（草案四步 = `src/swc.ts` 提取器（含反预乘，**只读资源、不解析 ABC**）→ 资源类注册 + 像素嵌入（含 `getDefinitionByName` 注册表）→ CLI/清单接入 → 读 `catalog.xml` 的 `<dep>`，对「引用了只以字节码存在于 SWC 的类」给出编译期报错（§3.3.3，不反编译））。**注意：早期草案占用的「阶段六十六~六十八」编号无效**，该三号已被其他已完成功能使用，实现启动时需另申请编号 |
-| AMF 编解码（`URLStream.readObject`/`writeObject`、`registerClassAlias`/`getClassByAlias`） | 未开始（当前是**诚实失败而非错误实现**：本子集无 AMF 编解码器，`ObjectEncoding.AMF3` 只是文档默认值，`ByteArray` 同样缺 `readObject`/`writeObject` 这一对——见 `src/emit.ts:4681`/`src/symbols.ts:1312`） | AMF 是二进制**对象图**序列化（AMF0/AMF3 双版本 + 引用表 + trait 编码 + 别名注册表），与现有「对象当纯数据」的 `Dictionary`/record 反射表**不重合**，需独立编解码器。**语义面本身也没采集全**：`adl` 探针只测到空 `URLStream` 的 `readObject()` 抛 `#2029`（`temp/air-probe/air-probe-result.txt`）。原为 `flash.net` 两个汇总行的共有未收尾子项，本轮汇总行移出时**提升为独立行**以免丢失 | 独立立项：先用 `mxmlc + adl` 采全语义（别名注册表、AMF0/AMF3 切换、引用表、`ByteArray` 读写对、`writeObject` 的 `trait` 形状），再实现编解码器；验收用本地服务器**回放固定 AMF 字节**并与 `adl` 逐字节对照。**成本中**（编解码器本体 + 反射表对接） |
+| AMF 编解码（`URLStream.readObject`/`writeObject`、`registerClassAlias`/`getClassByAlias`） | **部分完成**（2026-10-03 阶段九十四·四：**AMF3 读写双向已实现并与 `adl 51.4.1` 逐字节一致**——`ByteArray`/`URLStream` 的 `readObject`/`writeObject`、`registerClassAlias`/`getClassByAlias`、引用表/trait 表/别名表齐备（`examples/stage94d.as` 67 条断言 + `test.ts` `[amf]`/`[bytearray]` 钉子）。**未完成**：①**AMF0 完全未实现**（`objectEncoding != AMF3` 时**响亮抛错**；AMF0 语义已采全：number `00`+double、布尔 `01`、null `05`、undefined `06`、string `02`、**Array 走 ECMA 数组 `08`**、object `03`、typed object `10`、Date `0b`）；②`IExternalizable`/外部化对象（`bit2`）**响亮报不支持**（AIR 自己也会以 `#2173` 拒这类手工流）；③Function/XML 值 AMF3 下**响亮报不支持**；④`ByteArray` 引用（`#3`）不支持 | AMF 是二进制**对象图**序列化（AMF0/AMF3 双版本 + 引用表 + trait 编码 + 别名注册表），与现有「对象当纯数据」的 `Dictionary`/record 反射表**不重合**，需独立编解码器。**语义面本身也没采集全**：`adl` 探针只测到空 `URLStream` 的 `readObject()` 抛 `#2029`（`temp/air-probe/air-probe-result.txt`）。原为 `flash.net` 两个汇总行的共有未收尾子项，本轮汇总行移出时**提升为独立行**以免丢失 | 独立立项：先用 `mxmlc + adl` 采全语义（别名注册表、AMF0/AMF3 切换、引用表、`ByteArray` 读写对、`writeObject` 的 `trait` 形状），再实现编解码器；验收用本地服务器**回放固定 AMF 字节**并与 `adl` 逐字节对照。**成本中**（编解码器本体 + 反射表对接）。**2026-10-03 已立项为阶段九十四·四**（与该子阶段的 `ByteArray.readObject`/`writeObject` 合并推进，避免两处各写一份编解码器） |
 | `SecureSocket` 的 TLS 状态机 | 未开始（当前是**诚实失败**而非错误实现：`isSupported=false`、`connect()` 派 `#2031`） | 缺的是「非阻塞传输之上的 TLS 状态机 + AIR 的 `serverCertificateValidate` 握手回调」。可链接的现成 TLS 库与静态 curl 的取舍同源（`vendor/curl` 已把 nghttp2/zlib 静态化，TLS 后端仍是系统 SecureTransport）。**不实现比假装实现正确**——静默明文连接是最坏的失败模式 | 立项时改 `as_sock` 的连接状态机（CONNECTING 之后插入 TLS 握手态），并补齐证书事件面；验收用本地 TLS 服务器 + `adl` 对照 |
 | `DatagramSocket`（UDP） | 未开始 | UDP 与 TCP 底座不同：无连接、无 `flush` 语义、`send()` 自带目标地址、`DatagramSocketDataEvent` 载荷是完整的 `ByteArray`。AS3 面（`bind`/`send`/`close`/`receive`）与实测语义均未采集 | 独立立项：先按 AGENTS.md §2.4 用 `adl` 采全部语义，再复用 `as_sock` 的注册表与帧边界泵（`SOCK_DGRAM` 分支） |
 | preview2 `wasi:http`（WASI 原生联网） | 调研完成 · 实现暂缓（**本轮只侦察，未写一行代码**） | 侦察结论（均为本机实测）：① wasmtime **48.0.2** 支持 `-S http[=y]`、`-S inherit-network`、`-S tcp/udp`、`max-http-fields-size`（明示 wasi-http **0.2**），故**宿主侧已就绪**；② wasi-sdk-34 的 `share/wasi-sysroot/include/wasm32-wasip2/wasi/` **没有 wasi:http 头**（只有 `sockets`/`filesystem`/`clocks`/`random`/`io` 的 p2 生成头），故 bindings 需**手写 canonical ABI** 或用 **wit-bindgen** 生成；③ 无 `wit-bindgen`/`wasm-tools`/`cargo`/`rustc`（`command -v` 全部 MISSING），且 wasi-sdk 下**没有** `wasi_snapshot_preview1` adapter（`find -name "*adapter*"` 为空）——但二者**可经本机代理下载**（`github.com`/`api.github.com` 均 200，`codeload.github.com` 亦通）；④ 要跑 wasi:http 必须交付**组件**（`wasm-tools component new` + p2 adapter），而本项目现有 wasm 目标是 **wasip1 核心模块**，故还需在 `build.ts` 增一个 p2 目标与后处理步骤 | 立项时的完整链路（已明确）：① 下载 wasm-tools（aarch64-macos 预编译）+ `wasi_snapshot_preview1.command.wasm` adapter；② 取 `wasi:http@0.2.x` 的 WIT（`github.com/WebAssembly/wasi-http`）并用 wit-bindgen 生成，或手写 ~14 个 canonical ABI 导入（`types.new-*`/`set-method`/`append-header`/`outgoing-handler.handle`/`incoming-response.{status,headers,consume}`/`incoming-body`/`streams.read`/`drop`）；③ `build.ts` 增 `wasm-p2` 目标（`clang --target=wasm32-wasip2` + `component new --adapt`）与 `ASC_HAVE_WASI_HTTP` 宏；④ 在 `as_http_perform` 的第三后端里映射到 `handle`；⑤ 验收用本地 HTTP 服务器 + `wasmtime run -S http -S inherit-network`。**风险**：手写 canonical ABI 的 `result<incoming-response, error-code>` 落地下标与 `option<resource>` 的哨兵值必须精确，错一处即 trap；故优先走 wit-bindgen 生成而非手写 |
 | Starling 在 `contentScaleFactor ≠ 1` 时 Stage3D 层被重复放大（只露左上 1/4） | 未开始（本轮实测记录：`examples/Flappy-Starling` 的 AOT 产物在 `csf=2` 下只见舞台左上 1/4 且放大 2×；改 `ScreenSetup` dpi 使 `csf=1` 则整屏正确） | 阶段八十九·十九 定的合成口径是「源=物理尺寸、目标矩形=`ASC_stage3d_lw/lh`（逻辑 stage 单位）、由 canvas 设备缩放还原到物理像素」。该口径在「AS3 侧把**像素**尺寸传给 `configureBackBuffer`」时会把设备缩放叠加两次：Starling 的 `_clippedViewPort` 就是像素单位（`Starling.as:505` → `Painter.as:247`），且它按 `_supportHighResolutions`（Flappy 未开）传 `wantsBestResolution=false`。探针实测 `configureBackBuffer req=375x667 best=0 bbScale=1 -> bb=375x667`，同轮 `ASC_window_render` 的 blit（`emit.ts:7323`）未触发——Metal Stage3D 层直画 drawable，缩放不受 2D 画布 CTM 管辖，需按 Stage3D 自己的视口/投影口径核对 | 先查 Metal 后端（`vendor/stage3d_glue.mm` + `ASC_window_render`）在 `csf≠1` 时的实际绘制矩形与投影：AIR 的语义是「后台缓冲像素尺寸 = 视口像素尺寸」（本机 750x1334），而舞台 375x667 只是逻辑坐标——即 `bbw/ASC_win_scale` 才等于逻辑尺寸。修法与验收：用 `examples/air-starling-demo`（`csf=1`，当前正常）做零回归对照 + Flappy 的 `csf=2` 场景做「整屏可见」断言 |
-| `[SWF(width,height,backgroundColor)]` 元数据被解析后**丢弃**（`stage.stageWidth/Height` 与舞台底色两处不忠实） | 未开始（**本轮实测发现**，八十九·六十八；`src/parser.ts:215` 的注释「no runtime effect」经实测推翻） | 受控实验（同一探针、只切元数据、`adl` 桌面档）：无元数据 `stage=500x375`（mxmlc 默认 SWF 尺寸）；加 `[SWF(width="320",height="480")]` → `stage=320x480`。即 AIR 的 **`stage.stageWidth/Height` = SWF 声明尺寸**，我们 = **窗口尺寸**（探针 1600x1000；`examples/Flappy-Starling` 的 `[SWF(width="320",height="480",frameRate="60",backgroundColor="#d1f4f7")]` 因此无效）。**同一根因的第二处可见差异**：adl 画面底色 `#d1f4f7`、我们白 | 独立立项（**动它会改所有 GUI 示例的布局**，须连 Starling 12 场景一起回归）：①`ast.ts` 增加 SWF 元数据载体（现在 parser 解析后直接丢）；②`air-app.ts` 把元数据透传到 `BuildConfig`；③运行时以「元数据优先、缺省回退窗口尺寸」定 `stage.stageWidth/Height`，底色同上。`frameRate` 是否一并生效需另行实测（当前口径见 §3 决策分歧点）。**判据（§1.5）**：`adl` 能跑对而我们跑不出 ⇒ **遗留**，非增强 |
-| `Stage.fullScreenWidth/Height` 取「完整显示模式」而非 AIR 的「可用区」 | 未开始（**本轮实测发现**，八十九·六十八） | 同机同刻三端对照：`adl` **1800x1137** vs 我们 **1800x1169**（同一显示器时 Δ = 32 = 菜单栏高度）；换到外接显示器后 `adl` 报 **2560x1408**（= 2560x1440 − 32），规则**跨两种显示模式复现**。即 AIR 取**窗口所在显示器的可用边界**，我们取 `SDL_GetCurrentDisplayMode`（display 0 的完整模式）。**多显示器下两者甚至不在同一块屏**（native 报内建 1800x1169、adl 报外接 2560x1408），修复须一并考量「窗口在哪块屏」——这与当前实现的「总是 display 0」是两件事。web 侧同源：我们读 `window.screen`（无头 Chrome 实测 800x600，真实浏览器则是整屏尺寸），而舞台其实只有 canvas 那么大 | 独立立项：native 侧把 `SDL_GetCurrentDisplayMode` 换成「窗口所在显示器的可用边界」（`SDL_GetDisplayUsableBounds` + `SDL_GetWindowDisplayIndex`），web 侧把 `window.screen` 换成 `screen.availWidth/availHeight`。**注意**：`Starling` 的 `ScreenSetup` 正是按这两个值定世界尺寸（`examples/Flappy-Starling` 的布局即由此而来），改动会连带影响所有 GUI 示例与 Starling 场景 ⇒ 与上一行**同批回归** |
+| `[SWF(width,height,backgroundColor)]` 元数据被解析后**丢弃**（`stage.stageWidth/Height` 与舞台底色两处不忠实；**`frameRate` 已实测确认同样丢弃**） | 未开始（**本轮实测发现**，八十九·六十八；`src/parser.ts:215` 的注释「no runtime effect」经实测推翻） | 受控实验（同一探针、只切元数据、`adl` 桌面档）：无元数据 `stage=500x375`（mxmlc 默认 SWF 尺寸）；加 `[SWF(width="320",height="480")]` → `stage=320x480`。即 AIR 的 **`stage.stageWidth/Height` = SWF 声明尺寸**，我们 = **窗口尺寸**（探针 1600x1000；`examples/Flappy-Starling` 的 `[SWF(width="320",height="480",frameRate="60",backgroundColor="#d1f4f7")]` 因此无效）。**同一根因的第二处可见差异**：adl 画面底色 `#d1f4f7`、我们白。**`frameRate` 半已于2026-10-07（阶段一百一十四）实测落定**：`temp/rprobe/`（`[SWF(frameRate="60")]`，adl 哨兵看门狗）⇒ `adl 51.4.1` 报 `stage.frameRate = 60`、3 s 内 `ENTER_FRAME` **169 次（56.1 fps）**；我方同一 demo 实测 **120 fps**（`ASC_S3D_STATS` 的 draws/s=240 ÷ 每帧 2 draw）、`stage.frameRate` 读回 **0**（`ASC_app_frame_rate` 初值 `0.0` = 未设⇒跟随刷新率）⇒ **动速度两倍于 AIR**。**旁证（旧探针 `temp/fpsprobe/`，2026-10-02）**：无 `[SWF(frameRate)]` 元数据时 `adl` 起始 `mainFR = 24`（= mxmlc 默认 SWF 帧率）、我方 `0` ⇒ 两边合证 AIR 的初值就是 **SWF 头帧率**（默认 24，元数据可抬到 60） | 独立立项（**动它会改所有 GUI 示例的布局与节拍**，须连 Starling 12 场景一起回归）：①`ast.ts` 增加 SWF 元数据载体（现在 parser 解析后直接丢）；②`air-app.ts` 把元数据透传到 `BuildConfig`；③运行时以「元数据优先、缺省回退窗口尺寸」定 `stage.stageWidth/Height`，底色同上，**`frameRate` 写入 `ASC_app_frame_rate` 初值**（`0` 仍表示未设）。`frameRate` 的 adl 口径已实测（见左）；`width/height/backgroundColor` 口径已实测。**判据（§1.5）**：`adl` 能跑对而我们跑不出 ⇒ **遗留**，非增强。**注意**：本项落地会让现有 GUI 示例（含 `Basic_SkyBox`）从 120 Hz 降到声明的 60 Hz——这正是 AIR 行为，但属**可观测节拍变更**，须单独立项验收 |
+| `Stage.fullScreenWidth/Height` 取「完整显示模式」而非 AIR 的「可用区」 | 未开始（**本轮实测发现**，八十九·六十八） | 同机同刻三端对照：`adl` **1800x1137** vs 我们 **1800x1169**（同一显示器时 Δ = 32 = 菜单栏高度）；换到外接显示器后 `adl` 报 **2560x1408**（= 2560x1440 − 32），规则**跨两种显示模式复现**。即 AIR 取**窗口所在显示器的可用边界**，我们取 `SDL_GetCurrentDisplayMode`（display 0 的完整模式）。**多显示器下两者甚至不在同一块屏**（native 报内建 1800x1169、adl 报外接 2560x1408），修复须一并考量「窗口在哪块屏」——这与当前实现的「总是 display 0」是两件事。web 侧同源：我们读 `window.screen`（无头 Chrome 实测 800x600，真实浏览器则是整屏尺寸），而舞台其实只有 canvas 那么大 | 独立立项：native 侧把 `SDL_GetCurrentDisplayMode` 换成「窗口所在显示器的可用边界」（`SDL_GetDisplayUsableBounds` + `SDL_GetWindowDisplayIndex`），web 侧把 `window.screen` 换成 `screen.availWidth/availHeight`。**注意**：`Starling` 的 `ScreenSetup` 正是按这两个值定世界尺寸（`examples/Flappy-Starling` 的布局即由此而来），改动会连带影响所有 GUI 示例与 Starling 场景 ⇒ 与上一行**同批回归**。**2026-10-02 实测澄清（防误修）**：`Capabilities.screenResolutionX/Y` 是**另一个量**——同机同刻 `adl` 报 **1800x1169**、我们也是 **1800x1169**（**已对齐**，`as_cap_screen_resolution_x/y` 走的就是 `SDL_GetCurrentDisplayMode`）；只有 `Stage.fullScreenWidth/Height` 才有 1800x1137 vs 1800x1169 的差。故本行修法**只能落在 `Stage` 侧**，不得顺手把 `Capabilities` 的口径一并换成「可用区」（详见下表新增的 `Screen` 行） |
+| 命中测试的**边界约定**：`adl` 的 box 在描边外缘外 **0.25px** 仍算命中、右/下边界**排他**；我们一律**严格几何 + 闭区间** | 未开始（2026-10-04 阶段九十四·二十二 实测登记，`temp/editprobe/hit25_{adl,aot}.txt`） | 42 行逐行对照里**只有 2 行不同**，且都在边界那 0.25px 的抗锯齿模糊带里：`outer edge x=5.75`（描边外缘 6.0 之外）adl `box=true` / 我们 `false`；`right x=34`（正落在描边外缘）adl `box=false shape=false` / 我们 `true true`。`adl` 自己的边界在三组 bitmap 探针里也不完全自洽（Ed21 §A1 与 Ed23 §A 对同一几何给出不同的右边界），故这是**抗锯齿光栅化**的产物而不是一条可抄的规则 | 立项：若要逐像素对齐，须先搞清 AIR 用的是「4x4 超采样覆盖率 ≥ 某阈值」还是「整数像素网格」，并用更多几何（斜线、圆）定阈值；风险是给命中测试引入半像素模糊。当前取严格几何（可解释、可测），差异登记在此 |
+| 多个 `beginFill/endFill` **组**的嵌套：`adl` 两组都填充，我们只有**一条路径** ⇒ even-odd 把它当洞 | 未开始（2026-10-04 阶段九十四·二十二 实测登记，`temp/editprobe/probe26.py` + `snap_ed26_{adl,aot}.png`） | 同一个 200x200 外框 + 60..140 内框：**一次 fill 两个同向子路径** ⇒ 内层中心 adl `FFFFFF`（洞）、我们 `FFFFFF`（洞）✓ 一致；**两个独立 fill 组** ⇒ 内层中心 adl `FF0000`（填充）、我们 `FFFFFF`（洞）✗。根因是本实现「一个 Graphics = 一条 SkPath + 一对 paint」（注释里已写为单路径子集），fill 组边界在记录几何时丢失 | 立项：把 `Graphics` 的绘制记录成**组**（每组一条路径 + 一对 paint），渲染与命中都按组并集；代价是数据结构与指纹（`as_fp_*`）都要跟着改，属独立阶段。顺带定 **`Graphics` 填充规则的第二个判据**（自相交路径：nonzero 填满星形中心、even-odd 挖空；现在只有「同向嵌套子路径成洞」这一条实测支撑 even-odd） |
+| 鼠标**拾取**（`as_pick_hit`）仍按含描边外框，未按内容区域 | 未开始（2026-10-04 阶段九十四·二十二 主动登记，**未实测 adl 的交互拾取口径**） | 本阶段把 `hitTestPoint` 改成区域判定，拾取只跟着改成「含描边外框」（原来连描边都不算 ⇒ 仅有描边的 `Shape` 本来点不到，这是同批修掉的真缺口）。但 `hitTestPoint(x,y,true)` 的实测说「容器子对象之间的缝不命中」——若 AIR 的交互拾取也用区域，则在缝里点父容器应当**不**命中，我们现在会命中。`adl` 侧未做「缝里点击是否收到事件」的探针 | 立项：写一个 adl 点击探针（在 Ed24 §4 的缝里合成点击，看 `MouseEvent.target`），再决定 `as_pick_hit_m` 是否改用 `as_obj_region_hit_local`（改动很小，但会影响既有鼠标相关示例/Starling 触摸通路，需全量回归） |
+| 命中测试在**边界 ~0.05px 内**与 `adl` 不一致（`adl` 更松） | 未开始（2026-10-03 阶段九十四·六 实测登记；**只在贴边点击时可观测**） | `temp/c1probe/click/` 真鼠标实测：屏幕点 `(310,110)` 打在旋转方块上，`adl` 报 `localX/localY = (14.13, -0.021)` **且判定命中**——按严格几何它在盒外 5e-5（`adl` 把 x/y 量化到 1/20px、中间量走单精度，见 `temp/xformcmp/README.md`）。本子集按严格几何判 ⇒ 该点判**不中**。示例为避免依赖这一口径，命中断言一律用**内部点**（如 `(328,142)` → local `(49.49,9.88)`） | 让判定带一个 adl 量级的小容差（经验值 ~1e-3 px，或取量化步长 0.05 的一半），但**任何容差都要先用点击探针在两端口径上标定**，否则会把「贴边未中」变成「贴边中」的假阳性 |
+| `NativeWindow` 家族**剩余**方法/事件/属性面（多窗口运行时已落地） | 部分完成（2026-10-02 阶段八十九·七十一 落地；本行只登记其中**尚未实现**的部分） | **已落地**（native 与 `adl 51.4.1` 逐项对齐，含端到端点击验收）：`new NativeWindow(opts)`（默认 400x232 框、返回时 `visible=false`）、`NativeWindowInitOptions` 八个默认值、`bounds/x/y/width/height/title/visible/closed/active/displayState/alwaysInFront/resizable/maximizable/minimizable/systemChrome/type/renderMode/transparent/owner(get)/stage/toString`、`close/activate/minimize/maximize/restore/orderToFront/orderToBack`、4 个静态常量、5 个 token 常量类、**每窗独立 `Stage`**（`showAll`/`align=""`，帧率继承应用级 `Stage.frameRate`，见阶段八十九·七十三）、`Event.CLOSE`（帧边界延迟一帧收尾）、`resize` 事件。**尚未实现（AIR 有 ⇒ 遗留）**：`startMove()`/`startResize()`（系统拖拽/缩放）、`owner` **setter**、`notifyUser()`（通知）、窗口菜单（`menu`/`NativeMenu`）、`Stage.nativeWindow`、`NativeApplication.openedWindows`/`activeWindow`/`exit()`、`systemMinSize/systemMaxSize/minSize/maxSize` 四个尺寸限制属性，以及 `Event.ACTIVATE/DEACTIVATE`、`NativeWindowDisplayStateEvent`、`NativeWindowBoundsEvent`（MOVING/MOVED/RESIZING/RESIZED/CLOSING 系列）。web 目标无多窗口概念 ⇒ 已按 §1.5 **诚实抛 `#2012`**，不属本行 | 分批、每批一个可验收行为：① `Stage.nativeWindow` + `NativeApplication.openedWindows`（纯反查，成本最低，让「谁是主窗口」在 AS3 里可判定）；② `startMove`/`startResize`（macOS 走 `-[NSWindow performWindowDragWithEvent:]`，需从 SDL 事件取 `NSEvent` 指针）；③ 事件面（glue 暴露 `SDL_WINDOWEVENT_MOVED/RESIZED` 与焦点事件；注意 `live_resize_watch` 已在管拖动中的尺寸，别重复派发）；④ 菜单/通知/尺寸限制（依赖面最大，最低优先）。验收沿用 `temp/nwtest/` 的双端对照 harness（`adl` 结果文件 + AOT 结果文件逐行 diff） |
+| `X.transform.matrix` 的**访问链别名**（`var t = X.transform; t.matrix`）仍是残余槽的裸读写 | 未开始（2026-10-02 阶段八十九·七十六 主动登记的实现边界） | `X.transform.matrix` 本身读写已精确（合成/分解访问器对），但 `Transform` 结构体**没有指回属主的反指针**（加它要给每个 `DisplayObject` 挂一个反向引用字段并补 `gc_write_barrier`，风险面覆盖 GC 与全部显示对象）。故先取 `t` 再经 `t.matrix` 读写时，读到/写到的仍是 **skew 残余槽**（不含 `x/y/rotation/scaleX/scaleY`），与 adl 的「同源单一矩阵」不一致。探针 T5 实测 adl 的 getter 返回拷贝，故这个别名写法**在 AIR 里本来就是无效操作**（改了不动对象），我方目前是「改残余槽」——不报错但语义不同 | 立项时与「矩阵作唯一真源」的重构合并做：`Transform` 加 `owner` 反指针（或用 owner 侧懒查表），读写字面量 `t.matrix` 也走访问器对；**须整批回归** GC 审计（`ASC_GC_AUDIT`）+ Starling 12 场景 + 全部 GUI examples |
+| 两个矩阵的**分解字段**与 adl 不同（矩阵往返与渲染仍精确） | 未开始（2026-10-02 阶段八十九·七十六 探针实测） | ① 纯 flipX `[-1,0,0,1,5,6]`（T10）：adl 给 `rotation 0 / scaleX -1 / scaleY 1`，我方给 `rotation 180 / scaleX 1 / scaleY -1`；**证据**：adl 对结构相同的 `diag(-2,3)`（T19）却给 `rotation 180 / scaleX 2 / scaleY -3`，即 adl 的选择**不是所赋矩阵的函数**（纯 flipX 与 `diag(-1,1)` 是同一矩阵，adl 两者答案不同）。② `[0,0,1,1,5,6]`（T25，零首列且非零首行）：我方渲染链 `translate·rotate·scale·残余` 在 `scaleX=0` 时表示不出「首行非零」，故把线性部分整体寄存到残余（字段报 `scaleX/scaleY = 1`），adl 报 `scaleX 0 / scaleY 1.414`。两例的**矩阵读回与像素都精确**（T10/T25 反向对照：读回逐值等于所赋矩阵） | 收益极低（要改渲染合成顺序或引入 AIR 内部的双存储），暂不排期；若将来做 ①，先扩充 `temp/xformcmp/cmp_probe.py` 的 `KNOWN` 集合口径，并把两例的行为差异写进 `docs/zh-cn/as3-semantics.md` 决策分歧点 |
+| 光标形状是**进程级一个**（多窗口时跟随最后一个写入者） | 未开始（平台硬边界，2026-10-02 阶段八十九·七十六 落地时实测） | `SDL_SetCursor` 在 SDL2 里**没有 per-window 版本**（窗口参数被忽略），故第二个窗口写 `Mouse.cursor` 会改掉第一个窗口的指针形状；窗口数≥2 且各自需要不同光标时才可观测。指针离开窗口恢复箭头（`SDL_WINDOWEVENT_LEAVE`）已做，故不会把 I-beam 带到菜单栏 | 若要根治需绕开 SDL：macOS 走 `-[NSCursor set]` + `NSTrackingArea`（或在 `mouseMoved` 里按窗口决定）、Windows 走 `WM_SETCURSOR`；属平台耦合，按 §2.9 应隔离在 glue 内。优先级低（AIR 自身也多窗口共享系统光标） |
+| web 目标**键盘与剪贴板未接线**（native 已对齐 `adl`，含阶段九十四·七 的文本输入） | 未开始（2026-10-02 阶段八十九·七十七 主动登记，2026-10-03 阶段九十四·七 复查**依旧未接线**，属**明确的未支持**而非静默降级） | native 侧 SDL 键盘 → `KeyboardEvent` + `stage.focus` + `SDL_TEXTINPUT` → `TextEvent.TEXT_INPUT` + 加速键复制/剪切/粘贴已与 `adl` 逐项对齐（同一驱动两端实测一致）；`web` 侧 `vendor/web_glue.cc` **键盘整块被丢弃**（`(void)on_key;`，第 347 行）、剪贴板两个函数是空实现（`void sk_clipboard_set_text(const char*){(void)text;}` / `int sk_clipboard_get_text(char*,int){(void)buf;(void)cap;return 0;}`，第 422~423 行）——本轮新增的 `sk_window_text_take` 在 web 侧**同样没有对应物**：DOM 的 `keyCode`/`charCode` 与 AIR 的编号**不同族**（AIR 字母 keyCode 是大写 ASCII、Delete=46/charCode=127…），需一张 DOM→AIR 映射表并重建 DOM 焦点模型（`tabIndex`/`contentEditable` 那套与 AS3 显示列表焦点不是一回事）；文本输入还要把 DOM 的 `input`/`beforeinput` 事件泵到帧边界；剪贴板 API（`navigator.clipboard`）是**异步 + 用户手势门控**，而 AIR 的 `Clipboard` 是**同步**的——这是**平台硬边界**（§1.5），只能在帧边界做 pending 态并如实上报，不能假装同步成功 | 立项顺序：①键盘映射表 + DOM 焦点模型（可先支持「点击 canvas 即把焦点交给舞台」的最小模型）；②`input`/`beforeinput` → `sk_window_text_take` 的等价物（帧边界队列）；③剪贴板 pending 态（`Cmd+C` 时若无手势授权，按浏览器语义可能静默失败——须如实上报，不假装成功）。**注意**：emsdk 的 SDL2 port 未缓存，web 构建当前**离线不可复现** |
+| 非 US 布局与 Option 组合字符的 `keyCode`/`charCode` 只按**基键**近似 | **部分完成**（2026-10-03 阶段九十四·七：**文本通道已按 `SDL_TEXTINPUT` 真实接线**——组合结果（`Option+e` → `"´"`、`Option+8` → `"•"`）会作为 `TextEvent.TEXT_INPUT` 的载荷送进字段，与 `adl` 双端对照一致；**剩下的缺口只在 keyDown 的 `charCode`**） | `SDL2` 不提供键盘布局查询、也不在 `SDL_KEYDOWN` 里给组合后的字符（组合字符走独立的 `SDL_TEXTINPUT`，已接线），故 `sk_us_char()` 按 US 布局的基键给 `charCode`：德语 `z`/`y` 互换、法语 AZERTY 的数字行、`Option+e` 变音符等的 **keyDown** 仍给出**基字母**而非实际字符（`adl 51.4.1` 实测 `Option+e` 的 keyDown 是 kc=0/cc=**180**，我们给基字母 `e`=101；`sk_air_keycode()` 在 `Option+字母` 时给 keyCode **0** 这一条已对齐）。**判据（§1.5）**：`adl` 给的是真实布局字符 ⇒ **遗留** | 立项：给 keyDown 补布局/组合字符——需在 `SDL_TEXTINPUT` 到达时回填**紧邻的那一次** keyDown 的 `charCode`（组合结果在 keyDown 之后到达，需要一个小的时间戳/待回填队列），布局相关 keyCode 需另查（SDL 只有 `SDL_GetKeyFromScancode` 的 US 假设）；验收用 `temp/editprobe/` 的同一驱动在**德语/法语布局**下与 `adl` 对照 |
+| 广色域显示器上的**用户可见**颜色一致性未经仪器验证（`screencapture` 无法区分） | 未开始（2026-10-04 阶段九十四·二十三 收窄登记；原「整条渲染管线色彩管理 sRGB→P3」行的根因已定位） | 阶段八十九·七十七 记的偏移（`0x3366FF→(64,101,246)` 等）本轮**追到了捕获段**：我们的离屏 CPU 光栅与提交前的 Metal drawable 都是**逐位精确**的 sRGB（`ASC_MTL_READBACK` 读回 `ff00ff00`），金属/CPU 两个后端截图**逐值相同**，而 `adl` **自己**的窗口截图同样偏移（`FF8000→FF7700`，−9 LSB；我们 `FF8002`）⇒ 是窗口服务器/显示色彩管理在**截图**上引入的，两端共有、程度不同。剩下来的真问题只有一个：在广色域屏上**肉眼观感**是否与 AIR 一致，这需要色度计或与系统取色器对比，截图测不出来 | 立项：用系统取色器（Digital Color Meter）在两端窗口上读同一块纯色，比较**显示值**；若不同则说明 `CAMetalLayer` 的 sRGB 声明（已加，见 `metal_glue.mm` `sk_mtl_init`）与 AIR 的实际声明仍有差别。成本低（人工比对），但需真实广色域屏与人眼/仪器 |
+| 上下移动的列位口径是**字符列**而非**像素 X goal** | 未开始（2026-10-04 阶段九十四·十五 主动登记；**精化项，非已知差异**） | 阶段九十四·十五 的 `Up`/`Down`/`PageUp`/`PageDown` 全部按**字符列**（`caret - lineStart`）保留列位，实测的英文等宽探针（`_typewriter`，行内全为单宽字符）下与 AIR 的「像素 X 换算回字符索引」**逐值一致**。但比例字体 + 混排（宽窄字符、制表符、内联图片 `getImageReference`）下，AIR 的 goal 是**像素 X**（同一 X 落在不同字符宽度的行上会换算出不同的字符列），字符列模型会偏移（Air 侧未做比例字体探针，故记为**口径待精化**而非「已知差异」）。**判据（§1.5）**：等宽下两者等价 ⇒ 不是「adl 能跑对我们跑不出」，而是「未实测比例字体口径」 | 立项：先写一个比例字体（`_sans`）+ 宽窄混排的 `adl` 探针（`AAAA...` 对 `iiii...` 交替行），实测 goal 是像素 X 还是字符列；若确为像素 X，则把 `_goal_col` 改存像素 X、由 `sk_textlayout_glyph_position_at`（或逐行 `getGlyphPositionAtCoordinate`）换算回字符索引 |
+| 字体度量：**别名字面已对齐、行盒模型已对齐**，余 `_sans`/`_serif` 通用别名行高与 ≤0.5px 残差 | **部分完成**（2026-10-04 阶段九十四·二十 主体修复；原「行距 12 vs 15、前进 5.3 vs 6.6」**两个数字都已消除**） | 同为 `_typewriter` 12px、同一段 `ABCDEFGHIJ abcdefghij`：`adl` 的行高（选中带高）**15 px**、字符前进 **6.6 px**，我们 **12 px** / **5.3 px**（比值 ≈ 1.25）。故「同一拖拽距离覆盖的字符数与行数」两端不同（实测 adl 拖拽 `x 40→110` 得 `[4,14)`、我们得 `[3,14)`；另一探针里 adl 的多行选中带更高）。**阶段九十四·七 追加的同源证据**：`temp/editprobe/` 的鼠标落点探针里，`adl` 单行字段 `x=50` 落在**第 7 个字符**（我们第 6 个），多行 `Ed3` 第 2 行 `x=110` 落在 **22**（行尾钳位，我们 **18**）——同一段「点击/拖拽落点到字符索引」的换算是**度量驱动的**，与本节的行距/前进比同源，修字体后应一并复核（换算代码本身在 `as_tf_index_at`，走 `Skia` 的真实字形位置）。**阶段九十四·八 再次追加同源证据**：`temp/editprobe/` 的 Ed5 选区探针（`cmp_ed5.py` 结构化比对已忽略该度量差）里，同一文本、同一拖拽距离下 adl 的落点为 `21`/`26`、我们为 `18`/`23`（差值与「行距 12/15、前进 5.3/6.6」同源）。**阶段九十四·十五 追加的新证据（本轮把该耦合「证据化」）**：同批探针 `temp/editprobe/` 的 Ed15 里，`_typewriter 12` 的 **Skia 命中字体**与 adl 明显不同——同一多行字段的行宽落点（每个 20 字符词）我们约 **8.1 px/字符**、adl **6.6 px/字符**（我们更宽，故软换行点更早）；行高我们 `height/lineCount` 给 **12 px**、adl **15 px**（我们更矮，故 36px 高字段我们 `visible=3`、adl `2`，`w2` 可视行我们 `8`、adl `6`）。两项比值方向相反（宽 ×1.23、高 ×0.8）⇒ **不是整体缩放，而是真的命中了不同 Typeface**，与下述「根因疑似字体家族回落」一致。**阶段九十四·十六 追加的第三组同源证据（最刺眼的一次）**：`displayAsPassword` 的星号串把差距放大到肉眼可见——同为 `_typewriter` 12，一个 `*` 在 adl 是 **7.2 px**（等宽族每个字形同宽）而我们是 **4.67 px**（回落字体的星号明显更窄），于是「点击 x=45 落在第几个字符」adl 是 **6**、我们是 **9**；`_sans` 12 的 `*` 两侧倒是几乎一致（adl 46.5 / 我们 46.7 每十颗），说明差距**不是**我们的遮罩算法而是**字体命中**。**影响面**：`PageUp`/`PageDown` 步长、`scrollV` 数值、软换行落点、`textWidth`/`numLines` 的可观测值全部随之变化（阶段九十四·十五 的**规则**已对齐，只有**数值**受此影响）。**根因疑似字体家族回落**（我们拿到的不是 AIR 的 `_typewriter` 同一份 Typeface，Skia 按名字回落到别的字体），**不是**排版代码缺陷——`getHeight()/lineNumber()` 的接线在阶段三十八已按 Skia 真实行高落地。**判据（§1.5）**：`adl` 能跑对 ⇒ **遗留** | 立项：先实测两端 `_typewriter` 实际命中的 `SkTypeface`（`familyName()`/`getBounds()`）与 AIR 的字体文件，确认是「回落」还是「度量口径」；若是回落则按家族名精确选字体（`SkFontMgr::matchFamilyStyle` 指定 family 而非默认），随后**整批回归**文本布局示例（`textflow`/`textrich`/`textfield-align`/Starling 12 场景的按钮标签尺寸）。**阶段九十四·二十 结案（主体已修）**：根因确认为**家族回落**——`_typewriter`/`_sans`/`_serif` 是 Flash 运行时要自己解析的通用别名，原样透传 CoreText 会被静默当成未知家族而回落到系统默认**比例**字体，于是 `_typewriter` 量出 113.26 px/10×`W`（应为 72）、星号 4.67 px（应为 7.2）、行高 12（应为 15）。现按 adl 实测字宽选定字面（`_typewriter`→Monaco、`_sans`→Helvetica、`_serif`→Times New Roman、空→Times）并在 glue 内统一翻译（`sk_family_alias()`），**修后 `_typewriter` 12px 的 10×`W`/10×`i`/10×`*` 全为 72（= adl 72）、行高 15（= adl 15）、星号前进 7.2（= adl 7.2）**；行盒另按 AIR 模型强制（`round_half(ascent)+round_half(descent)`、丢弃字体自带 line gap、`TextFormat.leading` 按 px 计、多行字段尾行 leading 不计），12 个字面族里 8 个行高逐值相同、2 个残差 0.5 px（`Courier New`/`Arial`）。**阶段一百零三 追加的**行级**证据**（`getLineMetrics` 落地后逐行对照，`temp/metricprobe/metric6-diff.txt`）：残差家族与整段一致 —— 字符前进 `21.6 vs 21.5` / `36.01 vs 36`（≤0.01px）、`_sans` 12 的行高 `12 vs 15.5`、Monaco 20px 的行高 `25 vs 22`、对齐 ≤0.4px（居中 `89.2 vs 89`、右对齐 `176.4 vs 176`）；另测得 `wordWrap=true` 宽 60 时**软换行断点**不同（两边都是 3 行、断的位置不同）。**结论**：行级证据与整段证据指向同一个「设备字体表 + 半像素取整」根因，故不另立行。****仍未对齐的部分**：`_sans`/`_serif` 行高（AIR 用自有**非线性**设备字体度量表，见下一行）与上述 ≤0.5px 残差。证据台 `temp/metricprobe/`（12 族矩阵 + leading 矩阵 + adl 侧 `getLineMetrics`），模型见 `docs/zh-cn/skia.md` §8，`test.ts` 有 `[fontmetrics]` **8 条**结构钉子。 |
+| `_sans` / `_serif` 通用别名的**行高**仍与 AIR 不同（我们 12 / 13，`adl` 15.5 / 15） | 未开始（2026-10-04 阶段九十四·二十 实测登记，**已定界**） | AIR 对三个通用别名用**自己的设备字体度量表**，且该表**非线性**：实测 9 档字号（8/10/11/12/14/16/20/24/32），`_sans` 行高 = 11/11/14/15.5/16/19/24/27/36、`_serif` = 10/11/14.5/15/16/19/22.5/26.5/35.5、`_typewriter` = 8/10/14/15/16/18.5/22/26/35（比值 1.0→1.29→1.09 之间来回，`_typewriter` 在 12 px 恰好等于 Monaco 的 12+3，14 px 起与 Monaco 分道）⇒ **没有一个可解析的字面能复现它**。本轮**不做**按测量点插值的硬编码表（那会把未测尺寸的数值也说成「实测」）。 | 若要完全对齐，唯一诚实的路是**逐尺寸复刻 AIR 的设备字体度量表**（须先扩大实测覆盖到全部常用整数尺寸，再决定插值口径）；否则接受这 2–3.5 px 偏差并保持文档明示 |
+| Proxy 枚举/点号调用接管只对**静态类型**为 Proxy 子类的接收者发射 | 未开始（2026-10-03 阶段九十四·一 主动登记的实现边界） | `for-in`/`for-each` 的 `nextNameIndex`/`nextName`/`nextValue` 协议与「未声明成员的点号调用」只在**编译期已知**接收者是 Proxy 子类时发射（`symbols.ts` 的 `isProxy` 判定）；接收者声明为 `*`/`Object` 时走既有的记录槽/动态反射路径，**不查 `flash_proxy` 方法**。`adl` 是**运行时**判定（`vp is Proxy`），故 `var o:* = new MyProxy(); for (var k:String in o)` 在 AIR 里走拦截器、在我们这里得空/走记录槽。真实用例（GSAP `TweenProxy`/`VarsCore`）都是**具型**接收者（`this` 或具型变量），因此不在主流路径上 | 立项时把接管判定从「静态类型」改成「运行时 `is_proxy` 位」（vtable 已有该字段）：枚举协议改为生成一个运行时分支（`as_is_proxy(o) ? 代理协议 : 记录槽协议`），点号调用同理（`as_dyn_call` 已带 `is_proxy` 分支，缺的是枚举与外层判定）。**注意**：`*` 接收者的枚举循环变量 C 类型须一并按运行时分派（当前按静态判定选 `char*`/装箱值） |
+| Proxy 拦截器收到的 `name` 恒为**原始 String**（`adl` 传的是装箱 String） | 未开始（2026-10-03 阶段九十四·一 实测登记，不动语义） | `adl 51.4.1` 实测（探针 `KeyProxy`）：点号/方括号**字符串键**与 `delete`/写 传入的 `name` 是**装箱** String（`typeof==="object"`、`v is String===false`、但 `v == "foo"` 为 **true**）；**数字键**（`p[3]`/`p[0.5]`）与 **`in` 运算符**传的是**原始** String（`typeof==="string"`）。我们一律传原始 String ⇒ 差异只落在「用户代码对 `name` 做 `typeof`/严格相等/`===` 比较」时。**这条不是理论差异**：GSAP `VarsCore.deleteProperty` 的 `_props.indexOf(prop)`（`_props` 是原始 String 数组、`indexOf` 走严格相等）在 AIR 里对点号传入的装箱 `name` **恒返回 -1**，因此 `delete vars.foo` 在 AIR 里返回 **false** 且不删（实测 `d1..d5`：`delete` 得 false、`_props`/`_values` 原封不动），而我们返回 true 并真的删掉——我们「更正确」，但**与 AIR 不一致** | 要复刻须引入**装箱 String 对象**：①运行时造一个 boxing 助手（GCF 跟踪、`as_string_vt` 已有对象形态，须补 `as_v_eq`/`as_v_str_val`/`typeof`/`is String`/字典键强转五处）；②在**调用点**按访问形态选原始或装箱（点号/字符串键/`delete` → 装箱；数字键/`in` → 原始）——即 emit 侧要按形态分派。**风险评估**：收益仅限 `typeof`/严格相等这类少见用法，而改动横跨运行时装箱、比较与字典键三处**全局**路径，回归面覆盖全部示例 ⇒ 暂不动，如实记账 |
+| `Proxy.getDescendants` 在 **`..` 作用于 Proxy 接收者**时仍不可达 | 未开始（2026-10-03 阶段九十四·一 登记；**本轮（阶段一百零六）改写**：`..` 语法与 XML/XMLList 分派已落地） | 十个拦截器里 `getDescendants` 由 `p..foo`（E4X 后代访问）触发。**阶段一百零六 已补上 `..` 语法**（`Descendants` 节点 + `as_xml_descendants`/`as_xml_list_descendants`，`examples/lang-superset.as` 与 `temp/langair/cases.as` 都覆盖），但生成侧只在接收者静态类型是 `XML`/`XMLList` 时发射 XML 遍历，其余类型抛**响亮**的 `CodegenError("'..' requires an XML or XMLList value, got <kind>")` ⇒ `as_proxy_descendants`（运行时已实现且与 `adl` 编号对照通过）**仍无调用点**。`adl` 侧 `p..foo` 能跑 ⇒ 按 §1.5 是**遗留**，但今日是**响亮失败**而非静默 | 在 `emitExpr` 的 `Descendants` 分支按接收者类型分派：类实例/`Proxy`/动态对象走 `as_proxy_descendants`（`as_proxy_descendants` 已就位），数组/字符串等 AIR 也按动态属性解析的接收者另议。成本低-中，需先用 `adl` 采 `p..foo` 在「有/无 `getDescendants` 拦截器」两态下的返回 |
+| `with` 接收者的**静态类型**只支持类实例 / `Object` / `*`（其余响亮报错） | 未开始（2026-10-03 阶段九十四·二 主动登记的实现边界） | `with` 的接收者在编译期分两类：**类实例**（含前向/继承链）走编译期成员解析并发射无分支 C，**`*`/`Object`/动态类/`Proxy`** 走运行时 `as_dyn_has` 判定。静态类型为 `Array`/`Vector.<T>`/`String`/`Function`/`Dictionary`/接口时 `emitWith` 直接抛 `CodegenError`（如 `with: a array-typed receiver is not supported (needs a class instance, Object or *)`）——**响亮失败，不静默降级**。`adl` 对数组/字符串接收者按元素的动态属性解析（探针 `x12 len=2`/`x13 len=1`）。**判据（§1.5）**：`adl` 能跑 ⇒ 遗留。 | 在 `emitWith` 的接收者分类里为 `Array`/`Vector`/`String` 增设运行时记录槽分支（`Array` 已自带 `_dyn` 槽表，主要是放开拦截并核对 `hasProperty` 语义）；接口接收者需先确定 `adl` 的成员查找口径 |
+| `with` 作用域**不进入闭包体**（`adl` 会把 with 作用域捕获进闭包链） | 未开始（2026-10-03 阶段九十四·二 主动登记的实现边界） | 实现上用 `this.withScopes` 栈表示作用域链，而 `emit` 的匿名函数体发射会**临时清空该栈**（`anonFuncs` 循环里 save → `[]` → restore），故 `with (o) { var f = function():* { return x; } }` 里的 `x` **不会**解析到 `o`；`adl` 里闭包按创建时的作用域链捕获，`x` 解析到 `o.x`。当前是**明确的未支持**：闭包体里若含未定义名会照常报编译期错误（不静默取错值）。 | 若要落地需给「闭包创建点」保存一份 with 作用域快照并在闭包体内发射时还原；与 `x4/x5`（`this` 绑定）同一段代码路径，宜同批做 |
+| `with` 体内给「对象与词法作用域都没有」的名字赋值仍是**编译期错误**（`adl` 会创建隐式全局） | 未开始（2026-10-03 阶段九十四·二 登记；**与本子集裸 `x = 1` 的既有口径一致**，非 with 特有） | `adl` 实测：`with (h) { brandNew = 1 }`（`brandNew` 既不在 `h` 上也不在词法作用域）在**非严格模式**下创建隐式全局并成功；本子集对「裸标识符赋值给未声明名」一律在编译期报 `undefined variable`（`with` 路径经 `withLexical` 归一为 `as_throw_var_not_defined` 的**读**路径，写路径仍编译期报错）。**这是子集既有缺口**，with 只是又暴露一次。 | 与「隐式全局」统一立项（顶层/函数内/with 内三处同一规则）：可在写路径回落 `as_global_set(name, v)`（模块级名字表），并核对 `adl` 对已存在全局的写与 `delete` 语义 |
+| VM 抛错文案与未捕获打印格式与 `adl` **不逐字一致**（编号/异常类/时机一致） | 未开始（2026-10-03 阶段九十四·二 实测登记；**既有全局差异**，with 只是又新增 4 个发射点） | `adl 51.4.1` 实测（探针 `temp/errprobe/`）：`e.message` 对 VM 抛错是**短式**——`with (null)` → `Error #1009`、`with (undefined)` → `Error #1010`、`f()`（`f:Function = null`）→ `Error #1006`、`throw new Error("custom")` → `custom`（自定义 `Error` 保留用户文案）、`throw new TypeError("tmsg",1234)` → `tmsg`；`Error.getErrorMessage(1009)` 同样是 `Error #1009`；`String(e)`/`e.toString()` = `TypeError: Error #1009`；**未捕获**打印恰好是 `<异常类名>: <message>`（无前缀）。本子集自阶段「异常」起用带描述的长文案（`Error #1009: Cannot access a property or method of a null object reference.` 等，约 36 处发射点），未捕获走 `Uncaught exception: <message>`；`e.name` 在本子集是**编译期错误**（未声明）。**结论**：编号、异常类与抛出时机全部一致，仅**文案与打印前缀**不同，故登记为遗留而非误实现。 | 若要逐字对齐：把 VM 抛错文案统一改为短式 `Error #<id>`（`Error.getErrorMessage` 走同一表；用户文案的自定义 `Error` 保持原样），未捕获打印改为 `<类名>: <message>`，并给 `Error` 补 `name`/`getErrorMessage`。属跨切面改动（约 36 个发射点 + runtime 助手），宜单独立项、一次性对齐 + 全量 `test.ts` 回归 |
+| 反射 API 的**内建类名口径**不忠实（`getQualifiedClassName`/`getQualifiedSuperclassName`） | **部分完成**（2026-10-03 阶段九十四·三 登记；**2026-10-09 阶段一百二十七 实测：①④ 已对齐/部分对齐，②③ 仍缺**） | **更正（2026-10-09 阶段一百二十七 实测，探针 `temp/pkg1d/Qn.as`）**：① **已对齐** —— `getQualifiedClassName(new Sprite())` = `flash.display::Sprite`、`getQualifiedSuperclassName(new Sprite())` = `flash.display::DisplayObjectContainer`、`qc(new BitmapData(1,1))` = `flash.display::BitmapData`、`qs(new Sprite())` = `Object`（与 `adl` 的 A1/B1/A2 逐字相同：内建类的 vtable `fqn` 槽早已是包限定名，本行 ① 属**陈旧记载**）；**同一根因下 `getDefinitionByName("flash.display.BitmapData")` 也已可用**（注册表已收录内建类，阶段一百二十七）。④ **部分对齐** —— 内建**类**作 Class 值已可（`var c:Class = Object`、`BitmapData is Class`），**接口**仍不可（`getQualifiedClassName(IDataInput)` 报 `undefined variable`）。**仍缺**：② `int`/`uint` 装箱成 number ⇒ `getQualifiedClassName(5)` 给 `"Number"` 而非 `"int"`（实测 Q3；`boxExpr` 的 tag 1，数字与整型不区分）；③ `Dictionary` 是特殊 C 类型（`kind:'dict'`）而非建模类 ⇒ `getQualifiedClassName(new Dictionary())` 给 `"Object"`、`getQualifiedSuperclassName` 给 `"Object"`（实测 Q4），而 `adl` 给 `"flash.utils::Dictionary"`/`"Object"`。`Vector.<T>` 的元素名口径见下段阶段九十四·五 证据（未变）。 | 修法：给 `int`/`uint` 单独一个 box tag（tag 引入需同步补 `as_v_typeof`/`as_v_truthy`/`as_v_eq`/`as_v_str_val`/`gc_mark_value`/写屏障，见 AGENTS.md §2.4 红线）；`dict` 需要一条「虚拟 vtable」才能参与反射。属跨切面改动，宜单独立项。 **阶段九十四·五 新增证据（`Vector` 类名已部分修复，本行剩余口径仍适用）**：`adl 51.4.1` 实测（探针 `temp/a5probe/`）——`getQualifiedClassName(Vector.<T>)` 的**元素名**对**内建类/接口**元素（`String`/`Boolean`/`Object`/`Array`/`Date`/`XML`/`XMLList`/`IEventDispatcher`）均给**包限定名**（如 `__AS3__.vec::Vector.<String>`），只有**数值**元素（`int`/`uint`/`Number`）与用户自定义类给短名/C 名；本子集已按「静态已知元素类型 + 类 fqn 查表」给出 `__AS3__.vec::Vector.<…>`（含数值元素保持 `int`/`uint` 与 `adl` 一致），但**内建类/接口元素仍是短名/C 名**（同属本行的「内建类无 fqn」根因，故不另立行）|
+| 本子集的 `String` 是 **UTF-8 字节索引**（非 UTF-16 码元索引）。**阶段九十四·十六 追加**：`displayAsPassword` 的星号数也随此口径——我们「一字节一个 `*`」，`adl` 是「一个 UTF-16 码元一个 `*`」，故 CJK 密码我们显示 3 倍星号（实测 `_typewriter` 12 的 `中文ab`：adl 4 颗 / 我们 12 颗） | 未开始（既有全局口径；2026-10-03 阶段九十四·四 实测复核） | `"中".length` 我们给 **3**、`adl` 给 **1**；`charAt`/`charCodeAt`/`substr`/索引赋值全部按 **UTF-8 字节**推进（星形平面 `"😀"` 我们 `length` 为 4、`charCodeAt(0)` 为 240）。这是「C 里就是 `char*`」这一表示的**直接后果**，不是 AMF/多字节代码引入的：`writeMultiByte`/AMF 的字符串长度恰好也按 UTF-8 字节计，故这两处**反而与 `adl` 一致**。**阶段九十四·七 追加证据（可编辑文本侧）**：编辑索引（`caretIndex`/`selectionBeginIndex`/`selectionEndIndex`）同源——`adl 51.4.1` 实测 `Option+8` 提交 `"•"`（U+2022，UTF-8 三字节）后光标只 `+1`，我们 `+3`（`temp/editprobe/` 的 Ed3 差异表：`op(1,1,1) len=1` vs `(3,3,3) len=3`）。影响面 = 「对含非 ASCII 的字符串做长度/索引运算」的 AS3 代码（真实工程里主要是截断、切片与定长协议字段） | 要忠实须把 `as_str_*` 全面改成 UTF-16 码元索引：字符串本体可继续存 UTF-8（或改存 UTF-16），但**全部**索引/长度/切片/`charCodeAt`/正则/`TextField.text` 长度都要经过码元换算表 ⇒ 触及运行时字符串层与全部示例的回归面 |
+| `URLStream.readObject` 要求 `Loader` **已完成**（AMF 值须已完整缓冲） | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `URLStream` 的读取在本运行时是**缓冲式**：`readObject` 直接从已下载的字节缓冲解（此前也如此），若加载**在飞**（`_job != NULL`）则**响亮抛错**并说明「本子集需要 URLStream 已完成加载」。`adl` 支持流式（边下边解） | 若要流式须让 AMF 读侧与异步 IO 的增量到达打通（读侧要能「不够就等下一块」——与既有 `as_async` 的 pump 模型耦合），成本中；真实工程（`as3swf` 读远程 SWF）通常先整体下载再解析 |
+| `wasm`/`web` 目标**不链接 `iconv`** ⇒ 除 `utf-8`/`unicode` 外的字符集**响亮抛错** | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `build.ts` 的 `platformLinkLibs()` 只在 **darwin** 追加 `iconv`；`AS_HAVE_ICONV=0`（`__EMSCRIPTEN__`/`__wasi__`）时 `writeMultiByte`/`readMultiByte` 遇到非 UTF-8/UTF-16 字符集走 `as_throw_charset_unsupported`（**不静默降级**成 UTF-8——静默会给错字节）。工程的真实用法里 `gbk`/`gb2312`/`shift-jis`/`IBM437`/`iso-8859-*` 都有使用 ⇒ web 目标上这些路径当前**不可用** | emscripten 侧需带 `iconv` 或内置精简代码页表（GBK/Big5/Shift-JIS 三张表即可覆盖工程里的字符集），或改链 ICU/`libiconv` 到 wasm。成本中，且**只影响非 UTF-8 字符集**的 web 构建 |
+| Function 值的 **`this` 绑定**（成员调用 / `with` 调用 / `Function.call(thisArg)` / `apply(thisArg)`）不在本子集 | 未开始（2026-10-03 阶段九十四·五 主动登记；该子阶段已让前两种形态**可编译**） | `adl 51.4.1` 实测（探针 `temp/a4probe/`，三行对照）：`cb.fn()` 与 `with (cb) { fn() }`（`fn` 是对象上的 Function 值）都把 `this` 绑到**接收者**（连顶层普通函数也如此：`this.tag` 读到 cb 的字段），而裸调用 `fn()` **不绑**（`this` 是全局对象）。本子集的闭包在**创建点**词法捕获 `this`（`env->this`），呼叫点无法重绑 ⇒ 两种形态「能调用，但 `this` 仍是闭包自己的」；`call`/`apply` 的 `thisArg` 同样被忽略（既有口径）。差异只在「被调函数体读写 `this`」时可观测 | 要忠实须让 `this` 改为**呼叫点决定**：给 `as_closure` 加 `env_size` 并约定「`this` 是 env 首字段」，再用「按 obj 重绑 = 拷贝 env 并替换首字段」的运行时助手重造闭包（成员调用/`with`/`call`/`apply` 四处统一走它）。属运行时表示层改动，收益窄（多数回调不读 `this`）|
+| 滤镜的 **`inner`（内发光/内阴影）与 `knockout`** 未在光栅路径实现 | 未开始（2026-10-06 阶段九十五·七 实测登记） | 两者都从 SWC 记录解析出来并写进 AS3 滤镜对象（`GlowFilter.inner/knockout`、`DropShadowFilter.inner/knockout`），但 `as_render_filtered` 一律按**外**发光/外阴影画。实测 `temp/skin.swc` 烘焙闭包内 13 条记录 `inner = 0`、`knockout = 0` ⇒ **当前无像素影响**（`temp/swc_po3_detail.ts`）。AS3 侧同理（`new GlowFilter(..., true, ...)` 的内发光会被画成外发光）| Skia 侧表达「内」需另构造：把剪影取反（`SkColorFilters` 反 alpha）后模糊，再用 `Blend(kSrcIn, ...)` 与本体求交；`knockout` 还要额外的 `kDstOut` 一步。先补 `temp/filterprobe/` 的 inner/knockout 用例（adl 侧量出内发光剖面）再动手 |
+| `FILTERLIST` 的 **Bevel / GradientGlow / Convolution / GradientBevel / ColorMatrix**（FilterID 3–7）未实现 | 未开始（2026-10-06 阶段九十五·七 登记） | 解析器按文档长度**跳过字节**并把 FilterID 记进 `swcBake.notes`（`src/index.ts` 打印为**响亮警告**，不静默）。实测 `temp/skin.swc` 烘焙闭包内 **0 条**。属「遇到再实现」，非当前缺陷 | 逐族补 `readSwfFilter` 的字段解析 + AS3 类（`BevelFilter`/`GradientGlowFilter`/`ConvolutionFilter`/`GradientBevelFilter`/`ColorMatrixFilter`）+ glue 映射（Convolution 可直接映 `SkImageFilters::MatrixConvolution`）|
+| 滤镜模糊剖面：我们的是**高斯近似**，AIR 是**真 box** | 部分完成（2026-10-06 阶段九十五·七，已按方差匹配） | 已把「直径 `blurX` 的 box 重复 `quality` 次」折算成 `sigma = blur*sqrt(quality)/sqrt(12)`（实测钉定，取代 `blurX/3`）。但 Skia 的模糊是 3 个 box 逼近高斯：`blur6 q1` 逐点 ours **217/161/94/38/9** vs AIR **191/148/106/63/21**（AIR 在 `d ≥ 4` 为 0，我们拖尾） | 求真 box：`SkImageFilters::MatrixConvolution` 每层 36~256 抽头且**非可分离** ⇒ 大 blur 下开销显著。收益是「边缘剖面逐点一致」，当前判定**不值得**（`swc.md` §9.2 F4 已记口径）|
+| `BlendMode` 中 **Skia 无法表达的模式**（subtract / invert / alpha / erase）| 未开始（2026-10-06 阶段九十五·七 登记） | `sk_paint_set_blend` 对它们**返回 0**（按 `kSrcOver` 处理）并由 `swcBake.notes` **报明**，不做近似 —— 实测本库 8 条全在可表达集合内（7×`layer`、1×`darken`）| Skia 侧可用 `SkBlendMode::kDifference`+通道运算拼 `subtract`/`invert`（`SkRuntimeEffect` 或 `SkColorFilters::Matrix`），`erase` 用 `kDstOut`。先做出可复现样本再定 |
+| 未支持字符的**占位子件只有空壳**（文本无字形/初始文本、morph 无几何） | 部分完成（2026-10-06 阶段九十五·八 落地占位子件） | 子件的**存在性与个数**已与 AIR 一致（`DefineEditText`/`DefineText` 341 个 ⇒ 空 `TextField`、morph 6 个 ⇒ 空 `Shape`；`minfo` 6↔6、`fileitemskin` 5↔5）。**残留两类**：① 文本占位子件没有字形与初始文本，其 `width/height` 只按声明的 `RECT` 报（本库 341 个 `AutoSize` 全为 0 ⇒ 与 AIR 无差，但真遇到 `AutoSize = 1` 的文本就会偏）；② morph 占位子件没有几何 ⇒ 3 处 `width/height` 差（`fileitemskin c2` `221.25×41.65` vs `128.35×19.55`、`元件124_72 c2` `11.75×11.75` vs `0×0`、`元件27_310 c0` `1×18` vs `0×0`）。证据 `temp/childfx/cmp_item2_final.txt` | ① 真做 `DefineEditText`/`DefineText` 解码（字形 + 布局 + `AutoSize` 盒，另一独立域）；② 真做 morph 两套几何 + 插值（另一独立域）。两者都不影响像素（空壳不画） |
+| 子件自身 `scaleX/scaleY/rotation` 仍读 1/0（缩放只在 `transform.matrix` 里） | 部分完成（2026-10-06 阶段九十五·八：`x/y` 已修） | 平移已写进子件自身 `x/y`（实测 `vbitemskin c4` `41,23.75`、文本子件 `x = tx + RECT.xmin`，逐位相同）。但 2×2（scale/rotation/skew）**刻意**只留在 `transform.matrix`：F1 实测 AIR 的九宫格**不认** placement 拉伸（42 个被拉伸的 gridded entry 只有那样才对得上）⇒ 我们报 `scaleX = 1`，而 AIR 有时报 decomposed 值（`popchatitem c0` `1.4973`）。像素与 `transform.matrix` 读回一致，只有直接读 `child.scaleX` 的代码可观测 | 若要做到两面一致：把 2×2 也分解写进对象自身字段，并另打一个「本例不做九宫格」的位（AIR 的情形正是「矩阵在对象自身字段里但九宫格仍不触发」）。须先实测 AIR 在「timeline 放的实例 + 代码 `gotoAndStop` 后」的字段值，再动 `emitSwcPlacement` + `as_render_object` 的九宫格判据 |
+| AIR 的包围盒**量化/累积口径**与我们不同（**未定案**） | 未开始（2026-10-06 阶段九十五·八 实测登记） | `temp/childfx/` 99 个子件里 33 处 `width/height` 差 `\|Δ\| ≤ 0.021px`（多数 ≤0.005，且两个方向都有）：`userskin c4` AIR `260×30` vs 我们 `260.0006×30.0001`（同一个 280×46 的矩形 × 同一个 16.16 矩阵 scale，AIR 的值看着像它自己的内部取整）、`homeskin c6` `354×580` vs `353.999×580.021`、`playskin c0` `634.3×31` vs `634.3×30.975` | 两个模型的差在 0.4 twip 以内。要定案得先量出 AIR 是「先取整再累加」还是「盒存 1/20 网格」：造一个 `adl` 探针，用已知的 2×2 / 3×2 子件组合与分数缩放逐步推。当前归为精度级，不影响像素与命中判定 |
+| 子件的**类名身份**与 AIR 不同 | 未开始（2026-10-06 阶段九十五·八 登记） | AIR 对 `SymbolClass` 链接过的字符报**链接类名**（如 `popbgskin`）、对 morph 报 `MorphShape`；我们统一按基类报 `Sprite`/`Shape`（`getQualifiedClassName` 可观测）。像素与树形（个数/索引）不受影响 | 需把 `SymbolClass` 的 `{id → className}` 映射到「被内联烘焙的子件」上（现在只有导出符号注册了类）；morph 则需真建一个 `MorphShape extends Shape` 空类。成本中等，收益仅限反射面 |
+| 时间轴子件的 **`name` 恒 `null`**（AIR 自动命名 `instanceN`） | 未开始（2026-10-06 阶段九十五·九 实测登记） | 多帧 sprite 的摆放记录里**没有 `Name` 字段**（SWF 只能给名字），AIR 在运行期按每个 SWF 的实例计数器自动命名（同一帧来回跳还会换号：`checkbom` 帧 2 的 Shape 由 `instance24` 变 `instance26`）；我们报 `null`。树形（个数/索引/类名/`x/y`）与像素不受影响，只有 `child.name` 可观测。证据 `temp/tlprobe/`（68 行 API 对照里该字段被显式归一化） | 要逐位一致须复刻 AIR 的命名计数器（含「同一帧重建也递增」的时机），收益仅限反射面；若做，宜与「子件类名身份」一并处理 |
+| **每帧 ActionScript（`DoABC`）不执行** ⇒ 烘焙剪辑恒停在第 1 帧 | 未开始（2026-10-06 阶段九十五·九 实测登记） | 皮肤符号在 DoABC 里第 1 帧 `stop()`（实测：`adl` 新建剪辑 `isPlaying == false`，上屏跨 12 帧也不自走）。我们**读不到字节码**（§3.3 范围外）⇒ 只能让烘焙剪辑起始停在帧 1：这**正好等于 `adl` 的观测行为**，但一旦 SWF 的时间轴真有 `play()`/动画帧脚本，我们不会自走（`play()`/`gotoAndPlay()` 只能由用户代码或`_playing` 驱动）。**绝不静默**：`swcBake.notes` 已报明 79 个多帧 sprite / 514 个 op 的烘焙口径与「起始停帧」 | 属 `DoABC` 解读（反编译器或 AVM2 解释器）这一独立立项；在那之前维持「资源取自 SWC、代码来自 `.as`」的现实形态 |
+| 富文本 run 之间的**空隙**用 `runs[0]` 的样式排版（AIR 用 `defaultTextFormat`） | 未开始（2026-10-06 阶段一百零三 实测登记） | `vendor/skia_glue.cc` 的 `sk_textlayout_new_runs` 建段落时用 `ps.setTextStyle(mkStyle(runs[0]))` 填「run 之间的空隙」（以及 run 未覆盖的位置），而 AIR 用**字段的 `defaultTextFormat`**。实测（`temp/metricprobe/metric6-adl.txt` vs `metric6-aot.txt` 的 `tw12-24rich` 例：默认 `_typewriter` 12，rich 只给第 2 行 24px）：AIR 第 0 行 `12/3/h15`、第 1 行 `20/6/h26`（`textHeight` 41），**我方第 0 行也是 24px**（`24/6/h30`、`textHeight` 60）—— 即空隙吃到了 run 的样式而不是默认格式 | 把段落级 `TextStyle` 改由 `defaultTextFormat` 构造（family/size/bold/italic/color/leading/align），run 只在有覆盖处生效。**先量**：AIR 的富文本空隙是否也受 `TextFormat` 的其它字段（`leading`/`align`）影响。证据同上 |
+| 混合字号时**行盒整段统一**（AIR 逐行取该行字体度量） | 未开始（2026-10-06 阶段一百零三 实测登记；与上一行同为富文本面） | `sk_set_air_strut(ps, runs[leadIdx]...)` 用**单个** strut 覆盖整段（`setForceStrutHeight(true)`）⇒ 所有行共享一个行盒高度；AIR **逐行**。实测 `tw12-24rich`：AIR 两行 `h15`/`h26`，我方两行都是 `h30`（`textHeight` 60 vs AIR 41） | Skia 的 `StrutStyle` 是**段落级**的，故逐行行盒需要别的手段（逐行单独构造 `Paragraph`，或改用 `TextStyle` 的 `height`/`halfLeading` 逐 run 控制）—— 成本中，且要与既有的「按行取度量」模型（`as_tf_line_table`/`sk_textlayout_line_box`）对齐。**先量**：AIR 在混合字号且 `leading != 0` 时的逐行 height 矩阵 |
+| `TextField` 多行**渲染**的居中/右对齐按**最宽行整块平移**（AIR 逐行） | 未开始（2026-10-06 阶段一百零三 实测登记；**渲染侧**，与行度量无关） | 画家走 `as_tf_align_dx`（用 `as_skia_textlayout_max_width` 算一次平移量）⇒ 多行居中时**短行**会偏（200px 字段、行宽 21.5/50 居中：AIR **逐行** x=89/75，我方两行同一个量）。本阶段的 `getLineMetrics.x` 已按 AIR **逐行**实现，**渲染未动** | 让 `as_tf_align_dx` 的消费点按行取偏移（与 `sk_textlayout_line_box` 的 `left` 同源），或在 `ParagraphStyle` 层交给 Skia 逐行对齐。**先量**：`align6-adl.txt` 只有数值，需一次出图对照像素。成本低-中 |
+| `TextFormat` 的字段是**子集**：缺 `leftMargin`/`rightMargin`/`indent`/`blockIndent`/`bullet`/`display`/`tabStops`/`url`/`target` 等，且构造器只收 **6 参**（`mxmlc` 收 11 参） | 未开始（2026-10-06 阶段一百零三 探针副产物；**响亮报错**，非静默） | 现有字段只有 `font/size/color/bold/italic/underline/leading/align/kerning/letterSpacing`（`src/symbols.ts` 的 `TextFormat` classMap），ctor 六参 `(font,size,color,bold,italic,leading)`。报错样例：`undefined field 'leftMargin' on class 'TextFormat'`、`too many arguments (expected 6, got 9) for font,size,color,bold,italic,leading (constructor of TextFormat, ...)`。旁证：`mxmlc` **拒绝** `TextField.leftMargin`（说明 `leftMargin` 属 `TextFormat`），我方在读它的那一刻 `CodegenError` ⇒ 用 `leftMargin`/`blockIndent` 排版的真实工程无法移植 | 补齐字段（多数只需 C 槽 + 送进 Skia 的 `ParagraphStyle`/`TextStyle`：`indent`/`blockIndent` → `ParagraphStyle::setTextIndent`）并把 ctor 扩到 11 参（可选参数给默认值、保持既有 6 参调用兼容）。**先实测** adl 对每个字段的可观测效果再动手。成本低-中 |
+| **Windows 原生后端未实机验证**（`vendor/d3d_glue.cc` + `window_glue.cc` 的 Windows 分支 + `build-windows-deps.ps1` 的产物） | 未开始（2026-10-09 阶段一百二十六 主动登记） | 本机为 macOS：既不能编 MSVC ABI 的静态库，也不能编/跑 D3D12 程序 ⇒ `vendor/d3d_glue.cc`（进程级 `ID3D12Device`/队列/`GrDirectContext::MakeDirect3D`、`CreateSwapChainForHwnd` + 双 back buffer + fence 帧同步、`ResizeBuffers`）与 `window_glue.cc` 的 `sk_attach_d3d`/`sk_window_show_gpu` **全部未编译过**。编译器侧接线（`<architecture>`、清单、`-l` 名、seam 改名、TDZ 修复）**已在 macOS 离线验证**：`gn gen target_os="win"` 实测归档名、win32 仿真逐字段核对清单、单测 **90/92** + 示例 **164/165**（与改动前同一失败集） | 在 **Windows x64** 机器上：`pwsh vendor/build-windows-deps.ps1 -Arch x64`（与 `-Arch x86`）→ 跑一个 `<renderMode>direct</renderMode>` 的 `--air-app` 项目 → 按 `docs/zh-cn/win32.md` §5 的核对清单逐条过（首个可见症状若为黑窗，看 stderr 的 `d3d_glue:` 前缀诊断：设备/队列/swapchain/`WrapBackendRenderTarget` 各有专属文案）。**那份清单就是本行的验收脚本** |
+| **Stage3D 无 Windows 后端**（`Context3D` 在 Windows 构建期**响亮**拒绝） | 未开始（2026-10-09 阶段一百二十六 登记；AGAL→HLSL 为其前置） | `air-app.ts` 在 **Windows** 目标上检出描述符/源码用 Stage3D 时抛 `AirAppError`（**不静默降级**成「其实没上 GPU」，`AGENTS.md` §1.5）——Windows 侧既无 `stage3d_glue.mm` 的等价物，也没有 AGAL→HLSL 翻译器（`AGALTranslator.translate` 目前只出 MSL/GLSL ES）。故 `examples/air-starling-demo` 在 Windows 目标上**编译期失败**；这是本阶段明确的能力边界，不是缺陷 | 新增 `vendor/stage3d_d3d.cc` + 构建期 `ASC_AGAL_TARGET=hlsl`：把 `AGALTranslator` 扩到 HLSL（28 条基础指令带 swizzle/write-mask 展开 + AGAL2 控制流 + 导数 + `tex` 采样），并按 `stage3d_glue.mm` 的结构补 D3D 侧的 buffer/texture/pipeline/离屏 RT/混合状态缓存。成本高，独立立项 |
+| **测试门禁不稳定**：同一套件、同一代码，不同次运行报出 **3 个不同的红**（`example: stage86.as`、`unit: emit/StringConcatFlat`、`unit: reflection/ClassValueOperand`），重跑全绿 | 未开始（2026-10-09 阶段一百二十六 **实测发现**，根因未定） | 现象：本阶段开头 `npm run test:unit` 连跑两次均 **90/92**（那两个单元组红）、`npm run test:examples` **164/165**（stage86 红）；最终 `npm test` **258/258 全绿**，其后 `npm run test:unit` 单跑/连跑 3 次、`node --test --test-name-pattern=… test/unit.ts` 单进程形态、以及各用例单独跑**全绿**。**已排除的假说**：① 陈旧产物 —— 在用例将使用的产物路径上埋一个假二进制，实测被**无条件重建并覆盖**（脚本变回 Mach-O、用例仍绿）；② `-o` 序号 —— 同一示例用 `001-` 与全量跑的 `113-` 两条路径手工跑，两条都绿；③ 断言陈旧 —— `examples/stage86.as` 的 `NativeApplication` 断言已改为 `com.example::NoSuchClass`（注释引 `adl 51.4.1` 实测）后仍曾红。**未排除**：进程/文件级并行与共享 `temp/` 下的交互。| **必须先定案再修**：把这三例各自连跑 N 次（含 `npm test` 单进程与 `node --test test/unit/*.ts` 多进程两种形态）做统计，定位是否与并发/共享临时路径/产物 mtime 有关；定案前**不得**把这 3 个红当作「已修」或「无关紧要」——门禁不可靠会让真缺陷与假红混在一起（本轮**真的**发生过一次真缺陷在**全绿**下溜过：见本节「九、自查发现的真缺陷」）。三个红与本次 diff **无关**（首次观测发生在任何代码改动之前），但也不能据此静默放过 |
+| 接口**访问器作方法调用**（`iface.prop()`）只在**接口接收者**上支持；**类接收者**仍 codegen 报错 | 未开始（2026-10-07 阶段一百一十 顺带落地一半） | 本阶段把「无同名方法、但**有 getter**、且零实参」的 `iface.prop()` 发射成**属性读**（走接口 vtable；`examples/stage89.as:48` 的 `check(helper.targetBounds() == 100, "interface getter implemented")` 正是这个形态，`helper` 静态类型是接口）。接口 getter 槽本身早就在表里（`examples/Flappy-Starling/temp/flappy-native.c:18783` 的 `(*get_targetBounds)(void* _this)`）。**剩余**：静态类型为**类**时 `obj.prop()` 仍走旧路径报错；带实参的 `iface.prop(x)` 一律**故意**报错（AS3 的 getter 无实参，AIR 的 mxmlc 同样拒）。附带：类接收者的 `obj.prop()` 失败被记为「另一条路」，本轮未修 | 让类接收者走同一条回退（零实参 + 该类有 getter ⇒ 发 `obj->vtable->get_prop(obj)`）；补一条类接收者的示例断言。**成本低** |
+| `x.ns::[expr]` / `x.@[expr]` 的孩子轴按**本地名**匹配（命名空间未建模） | 未开始（2026-10-07 阶段一百零八 实测登记；**已文档化的近似**） | 本子集把自定义命名空间**编译期透明化**（限定词丢弃、前缀不进匹配），故：`<n:item>`（ns=`urn:x`）测 `x.ns::["item"]` 得 **2 = AIR**（阶段一百零八 已让前缀不阻碍本地名匹配），但 `x.item`（无限定）**也给 2**（AIR 为 **0** —— 无前缀的属性名只匹配无命名空间的节点），即「同局部名、不同 uri」无法区分。另：`Namespace` 值本身是**透明占位**（`new Namespace(prefix, uri)` 1/2 参构造器未实现，只认 0 参；`.uri`/`.prefix` 未建模），写示例只能走 `xml.namespace()` | 若要精确：给节点存 `(prefix, uri)` 与一张**作用域内命名空间表**，孩子轴比较「uri + 局部名」，`Namespace` 成为真对象（`uri`/`prefix`/2 参构造器）。**成本高**（XML 与 Namespace 两个模型都要改）；当前 away3d DAEParser 的用法（`xml.namespace()` + `ns::[expr]`）结果已与 AIR 一致，故列为「已知近似」而非阻塞项 |
+| XMLList 的 `@attr` 在**标量上下文**给「首个非空值」，AIR 给**拼接串** | 未开始（2026-10-07 阶段一百零八 实测登记） | `adl 51.4.1`（`temp/nsbracket/` B6）：`xml.item.@at`（两条 `item`，`at="1"`/`"2"`，标量上下文）= **"12"** —— E4X 把整个列表的属性值**拼接**成一个串；我们 `as_xml_list_attr` 返回**第一个非空值** ⇒ `"1"`。单元素列表二者一致（`@id==@["id"]` 为 true），故只在**多元素 + 属性值非空**时可观测 | `as_xml_list_attr` 改为拼接所有非空值（与 `as_xml_attr` 的「空值当 `""`」口径一起复核）；补一条多元素列表的标量上下文断言到 `test/unit/`（示例里目前只钉了单元素形态）。**成本低**（一处助手） |
+| **类体无类型字段**按 `int` 编译（AIR 是 `*`） | 未开始（2026-10-07 阶段一百零八 顺带实测发现） | `public var u;`（类体、无类型注释）—— `AGENTS.md` §2.4 的约定「`var x;` 按 `int` 处理」是**函数作用域**的规则，而 AIR 对**类字段**同样给 `*`（动态）。后果：`m.u == null` 生成 `int` 与 `NULL` 比较（本机 `cc` 给 `-Wint-conversion` 警告）、`m.u = "x"` 存不进串。证据：写 `examples/field-declarators.as` 时踩到（该断言已**移除**，而非把错语义烘进示例） | 类字段的**无类型**声明改投 `any`（`emit.ts` 的字段类型解析处，不影响函数作用域既有约定）；代价是该字段所有使用点走装箱，需全量回归 + 补一条动态可赋值断言。**成本低~中** |
+| 内置类名**部分**可作 **Class 值**（`trace(BitmapData)` / `var c:Class = BitmapData` / `BitmapData is Class` 已落地；**原始包装类仍不可**） | **部分完成**（2026-10-07 阶段一百一十二 登记；**2026-10-09 阶段一百二十七 落地内建引用类型的 Class 值**） | `adl 51.4.1`：`trace(BitmapData)` ⇒ `[class BitmapData]`、`BitmapData is Class` ⇒ true、`var c:Class = Object; 5 is c` ⇒ true（`temp/pkg1/oracle/adl-pkg1.txt` C1/C4/C7/E2/E3/E8/E9 + `adl-na.txt` 的 `NA=[class NativeApplication]`）。**已落地（阶段一百二十七）**：每个内建类都进注册表并发出 `_cls` 常量、内建类名可在**值位置**解析、`is`/`as` 与字符串转换逐项对 `adl`。**仍不可**：**原始包装类**（`String`/`Number`/`int`/`uint`/`Boolean`/`Array`/`Function`/`Class`）作 Class 值 —— `var c:Class = String;` 仍是**响亮**的 `Codegen error: undefined variable 'String' at top level`（`adl` 里 `[class String]` 合法，见 `adl-pkg1.txt` C6）；它们的 `_cls` 需要先有「原始包装类的静态度量」（`int`/`uint` 还要独立 box tag，见反射口径那行）⇒ 与「`getQualifiedClassName(5)` 应给 `int`」同源，宜同批 | 先做 `int`/`uint` 的独立 box tag（反射行已列），再让 `String`/`Number`/`int`/`uint`/`Boolean`/`Array`/`Function`/`Class` 各自进注册表（`reflectFqn` 已能用 `adl` 实测：`String`/`Array`/`Boolean`/`Date`/`RegExp` 无包、`int`/`uint` 短名）。**成本中**。 |
+| 顶层 `new <any/object 类型变量>()` 报 `unknown class` | 未开始（2026-10-07 阶段一百一十二 顺带实测发现） | 模块级 `var k:Class = ...; var o = new k();`（`k` 是**对象/any 槽**里的 Class 值）在**顶层**报 `Codegen error: unknown class 'k'`；类内/函数内走 `locateClassVar`/`Object` 槽的动态分派已能工作（阶段一百一十一 的 ⑧`new <对象变量>()` 已修），顶层作用域漏了同一条路 | 顶层 `new` 的解析顺序把「模块级对象/any 变量」也纳入动态分派（与 `emitNew` 的 `lookupClassVar`/`lookupObjectVar` 同路），并补一条负例钉 |
+| 用户定义名为 `main` 的函数与生成的 `int main(void)` **冲突** | 未开始（2026-10-07 阶段一百一十二 顺带实测发现） | `.as` 里写 `function main():void {}`（AIR 合法，且是常见的入口命名）会与发射器无条件生成的 `int main(void)` **同名** ⇒ C 层重定义（`conflicting types for 'main'`）或静默抢走入口。属于「生成 C 的命名空间」与用户标识符相交的**系统性**风险（`main` 是唯一被发射器**硬编码**抢占的名字） | 二选一：① 把用户 `main` 改名（如 `main$user`）并在 `main()` 里调用它；② 若用户已有 `main`，就不再生成入口（AIR 会把它当普通函数，入口仍是 `[SWF]`/文档类的构造）。先按 ① 落地（最小惊讶），并补负例 |
+| AGAL → MSL 翻译：临时寄存器 `vtN/ftN/op` **未初始化**即可能被读 | 未开始（2026-10-07 阶段一百一十三 读 `temp/ringdiag/dump2.log` 的 MSL 反射发现；**潜在 UB，当前未被触发**） | 生成的 MSL 是 `float4 vt0;` 一类**无初始化**声明（`float4 vtN/ftN/op`），若某程序在写之前读（AGAL 规范里临时寄存器在**程序开始**是有定义的——avmplus/驱动通常给 0），读到的是**栈垃圾** ⇒ 结果非确定。当前所有实测程序（away3d/Starling）都在用前写，故未观测到差异；**AIR 侧的初值也没有实测口径**（需要一个「读未初始化临时寄存器」的 adl 探针才能定「AIR 是 0 还是未定义」） | 先补 adl 探针（读 `vt0.xyz` 后直接输出 ⇒ 看 AIR 给什么），再决定是**零初始化**（最可能对齐，且严格更安全）还是在**首次读之前无写**时**响亮报错**（§2.5 不静默）。**成本低**（翻译器一处声明），但会改动所有 MSL 文本 ⇒ 需重跑真 GPU 验收 |
+| NativeWindow **居中用 SDL display 0**，双显示器机器上 0 号可能不是主显示器 | 未开始（2026-10-07 阶段一百一十二 GUI 驱动时实测） | `vendor/window_glue.cc` 的 `sk_window_create` 用 `sk_display_bounds(0, …)` 取「显示器」来居中 **frame**（该行为本身是对 adl 的忠实复刻：AIR 居中 frame 而非 client，实测 700,469）。但 SDL 的显示序号来自操作系统，**0 号不保证是主显示器**：本机 2 台显示器（主 1800×1169 @(0,0)、副 2560×1707 @(−333,−1707)）上 display 0 = **副屏** ⇒ 新窗口被挪到 y ≈ −1377 的**屏外**，GUI harness 必须先用 AppleScript 把它拖回来（`temp/skybox-aot/shot.py`） | 改 `SDL_GetWindowDisplayIndex(c->win)`（窗口刚建好时 SDL 会把它放在它选定的显示器上）再取 bounds，回退 0；单显示器机器上的数值**逐字不变**（回归风险低）。顺带复核 `Screen.screens` 的序号语义 |
+| AIR 的**数值解析/格式化极值**仍与 `adl` 有残差（语言层，窄口径） | 未开始（2026-10-08 阶段一百一十九 `tonum2` 双端探针实测：**32 行里只剩 1 行不同**） | 32 条 `Number("...")`/`String(num)` 极值里唯一未对齐的是 **`1e308` 的打印**：`adl` 给 `1.00000000000000e+308`、我们给 `1e+308`（AVM2 的 `doubleToString` 走 15 位有效数字 + 定宽指数）。解析侧另有两处已知偏差（同族）：`Number("1.7976931348623157e308")` `adl` 给 **Infinity**（我们把最大值解析成了有限值）、`Number("9.999999999999999")` `adl` 给 **10**（17 位有效数字的舍入口径）、`Number("1e100")` 差 **1 ulp**。其余 29 条（零/负零/指数/前导空白/`Infinity` 字面/十六进制/`NaN`）**逐字一致** | 立项：把数值转字符串改成 AVM2 的 `doubleToString` 口径（优先 `%.15g`、必要时回退 `%.17g`，指数格式补足位数），解析侧按 `stringToDouble` 的「17 位有效数字 + 溢出即 Infinity」重写。**成本低但影响面广**（所有 `trace(number)` 的文本），须先采一份完整极值矩阵再动，并补 `test/unit/` 数值格式化钉子 |
+| 对象字面量 / 类实例的 **ToPrimitive**（number-hint 的 `valueOf`-first）未实现 | 未开始（2026-10-08 阶段一百一十九 `arrnum` 探针实测：`Number({})` `adl` = **NaN**、我方 = **0**） | ES3 的 ToNumber(Object) 先调 `valueOf()`（Object 原型返回对象本身）再调 `toString()`（`"[object Object]"` ⇒ NaN）；且 **number-hint 时先 valueOf、string-hint 时先 toString**。我们对 tag 4 直接给 0，`as_v_loose_eq` 的对象分支也刻意排除了对象（见该函数内「AIR 的 number-hint ToPrimitive needs a valueOf vtable slot」注释）。同源未收尾项：**类实例的隐式字符串转换不走类自己的 `toString()`**（本表另有独立行） | 立项：给 vtable 加一对 `valueOf`/`toString` 槽（Object 原型挂默认实现，用户覆写即在链上命中），`as_v_to_number` 在 tag 4 时按 number-hint 走 `valueOf → toString → stringToDouble`；`as_v_str_val` 的 tag 4 分支改走 `toString`（与「类实例隐式字符串转换」行**同批**做，两行共用同一对槽）。**成本中**（改 vtable 形状 ⇒ 全量 examples 回归） |
+| Function 值 **#1063 的 qname** 对接口接收者/匿名闭包/顶层函数不逐字（**错误文案**层） | 未开始（2026-10-08 阶段一百一十九实现 #1063 时实测；语义（何时抛、编号、Expected/got 数字）**已逐字一致**） | 已对齐：实例方法 `<fqn>/<m>`（`foo::Widget/m`）、静态方法 `<fqn>$/<m>`、具名函数表达式 `Function/<name>`、可选参/rest/0 参的放行规则（`arity`/`arity2`/`arity3` 探针除 qname 外全绿）。**未对齐三处**：① AIR 的类名半取自方法的**定义类** —— `var io:InteractiveObject = new Sprite(); io.dispatchEvent` 的 `adl` qname 是 `flash.events::EventDispatcher/dispatchEvent`（trait 所在类），我们是静态类型 `flash.display::InteractiveObject/dispatchEvent`（接口接收者同理：我们报 `foo::IFoo/m`、`adl` 报 `foo::Widget/m`）；② 匿名闭包 `adl` 报 `Function/<file>.as$N:anonymous`，索引是 **AVM2 内部序号**（与 embed 类名 hash 同类不可复现），我们报 `Function/anonymous`；③ **顶层/包级函数**：`adl` 报 `<EnclosingClass>/<name>`，但 `mxmlc` 不接受「包级函数值 + 主类同文件」，探针无法构造对照，故 `Function/<name>` 未经验证 | 立项：接口/父类接收者的 bound thunk 在**运行期**问对象所属类，并在该类的反射表里找方法的**定义类**（需要「方法 → 定义类」的元数据，当前 vtable 只有方法指针）；找不到时回退到静态类型名。②③ 属可复现性/可测性边界，若要收口需先在 AIR 侧找到能构造「包级函数值」的写法。**成本中**（要扩反射表），收益仅是错误文案 ⇒ 优先级低，但记录在案以免误以为已完全对齐 |
+| `DisplayObject.name = null` 应抛 `Error #2007`（我方静默写入 `null`） | 未开始（2026-10-08 阶段一百二十 `coerce3` 双端探针实测：**2/8 行差全是它**） | `adl 51.4.1`：`sprite.name = null` 抛 `Error #2007: Parameter name must be non-null.` —— 静态槽与动态接收者两种形态都抛（`temp/pkgA/coerce3` 的 adl 侧 `static.name=null` 与 `dynL.name=null` 两行均为 `ERR #2007`），我方两行都给 `null` ⇒ 此后该箱子在 `name` 读取与 `trace` 上静默不同。**同族对照**：`tabIndex = null` ⇒ 0、`mouseEnabled = null` ⇒ false **两端一致**（`int`/`bool` 强转已对，正是阶段一百二十 的收口面），故只有 `name` 这一处**漏了 null 守卫** | 在 `name` 的 setter 路径加 `null`/`undefined` 检查并按 AIR 抛 `#2007`（文案逐字 `Parameter name must be non-null.`）。**先补实测两条**：`undefined`（本轮只测了 `null`）与「字面量 `null` 能否编译期拒绝」。**成本低** |
+| 越界 / 已删键的 `Array` 读回 `null`（AIR 回 `undefined`） | 未开始（2026-10-08 阶段一百二十 `arrkey` 双端探针实测：**3/11 行差里的 2 行**） | `adl 51.4.1`：`var e:* = [1,2,3,4]; e.length = 2; e[3]` ⇒ **`undefined`**；`var m:* = [1,2,3]; m["7"]` ⇒ **`undefined`**。我方两处都给 **`null`**（缺失元素的分支返回 null 箱）。**可观测面**：`=== undefined` / `is undefined` 不命中（`== null` 仍为 true，故只有**严格比较**与 `trace` 文本可见），以及依赖 `undefined` 与 `null` 区分的序列化/JSON 代码 | 缺失分支改回 `undefined` 箱，并**顺带复核**同一批的「对象动态属性缺失读」（`d.bar` 一行当前两端一致，改动时须一起回归）。**成本低但面广**（所有数组越界读）⇒ 须全量 examples 回归 + `test/unit/` 钉子一条 |
+| `parseInt` / `parseFloat` 未按 ES3 实现：**radix 被忽略、`NaN` 不可表示、缺十六进制自动识别** | 未开始（2026-10-08 阶段一百二十 `parseInt` 双端探针实测：**15 行里 11 行不同**） | `temp/pkgA/parseInt`（`adl 51.4.1` 对照 AOT）：`parseInt("ff",16)` **255** / 我们 **0**；`parseInt("11",2)` **3** / **11**、`parseInt("17",8)` **15** / **17**、`parseInt("z",36)` **35** / **0**（**radix 完全被忽略**，一律十进制前缀解析）；`parseInt("0xff")` **255** / **0**、`parseInt("0X1F")` **31** / **0**（缺「`0x`/`0X` 自动识别」）；`parseInt("abc")` / `parseInt("")` / `parseFloat("")` / `parseInt("z",1)`（非法 radix）在 adl 全是 **`NaN`**、我方全是 **`0`**（**`NaN` 在本运行的 `int` 域不可表示**）；动态 radix 同样被忽略（`parseInt(d,16)`，`d:* = "ff"` ⇒ adl **255** / 我们 **0**）。**已一致**：`"  12abc"` ⇒ 12、`"-12"` ⇒ −12、`parseFloat("1.5e3")` ⇒ 1500、`parseFloat("Infinity")` ⇒ Infinity | 两件事：① 助手按 ES3 15.1.2.2/15.1.2.3 实现（trim → 可选符号 → 按 radix 解析 → 非法即 `NaN`）；② **返回类型** —— AIR 的 `parseInt` 返回 `Number`（可为 `NaN`），我方现发 `int` 槽 ⇒ 要么改签名，要么按 adl 逐条实测「何时给 NaN、`isNaN` 怎么走」再定。**先实测静态类型行为再动**，并补 `test/unit/` 数值钉子。**成本中** |
+| `new XMLList()` **不可构造**（`XMLList` 只能作类型标注） | 未开始（2026-10-09 阶段一百二十五 双端探针实测） | `temp/logicrepro/Probe5.as`：`var l:XMLList = new XMLList();` ⇒ `Codegen error at 2:1: unknown class 'XMLList'`（**响亮**失败，非静默错值 —— AGENTS.md §2.5 合规）；同一探针里 `new XML("<r><a>1</a></r>")` 正常，且 `x.a` 的 `XMLList` 取值 / `length()` / `Boolean()` 三者与 `adl 51.4.1` **逐字一致**（`kidslen=1 kidsbool=true cond=T`）。`adl` 侧 `new XMLList()` 合法（得 `len=0`、`Boolean(empty)=true` —— 注意 AIR 里**空 XMLList 是真值**，故 `condExpr` 的指针非空判定对它是正确的，本轮未动）。⇒ 缺的是「`XMLList` 未注册进**可构造内建类**表」（`XML` 已注册），属不对称。 | 在 `src/symbols.ts` 的内建类表里把 `XMLList` 补齐为可 `new`（零参 ⇒ 空列表），并把「内建类型的**可构造性**」与「**可作类型标注**」两件事在代码里显式分开（现由 `BUILTIN_FQN` / 类型映射两张表隐式承担）。**成本低**（一处注册 + 一条示例断言），但需先确认 AIR 侧 `new XMLList(值)` 的强制转换口径与 `length()`/`toString()` 的边界。 |
+| **`Vector.<T>` 作 Class 值 / 值表达式**（`Vector.<int>`）—— `adl` 给 `[class Vector.<int>]`、`is Class` 为 true；我们**先是 parse error** | 未开始（2026-10-09 阶段一百二十七 实测发现；与上两行同族，独立立项以免与「内建类 Class 值」混淆） | `adl 51.4.1`（`temp/pkg1/AirV2.as` → `oracle/adl-v2.txt` 的 `bare=[class Vector.<int>]`，`AirV3.as` 的 `var cc:Class = Vector.<int>; cc is Class` 亦为 true）。注意**裸 `Vector` 作类型名我们报 codegen 错是吻合 AIR 的**：`mxmlc` 接受 `var vv:Vector;` 但拒绝 `var vv:Vector = new Vector.<int>();`（「从类型 `Vector.<int>` 的值到不相关类型 `Vector` 之间的隐式强制转换」）⇒ 有意义的那一半 AIR 自己就拒，故**不属缺口**（原 `is`/`as Vector.<T>` 那行的括注已随之移出）。我们：`trace("V=" + Vector.<int>)` ⇒ `Parse error at 1:26: expected '(' but found ')'`（`parser.ts` 的 `parseVectorCall` 把 `Vector.<T>` 一律当**调用**解析）；静态 `is`/`as Vector.<T>`（含动态 `*` 左值，阶段九十八·二）**不受影响** | 在 `parsePrimary` 里按「后面是否跟 `(`」分流：跟则仍是 `Vector.<T>(arrayLike)` 转换（`VectorCoerce`），不跟则是**类值**（新 AST 节点或复用 `Class` 值解析），codegen 侧按元素名映射到该 spec 的 `_cls`（`as_vec_fqn_hook` 已能给出精确元素名，可复用做 `is Class` 与字符串形式）。**成本中**，与接口 Class 值同属「名字进值位置」的分流工作，宜同批 |
+| `Socket.readObject` **未实现**（**响亮**报错）—— 而 `ByteArray.readObject`/`writeObject` 与新增的 `Socket.writeObject` 均精确 | 未开始（2026-10-09 阶段一百二十七 落地 `IDataInput`/`IDataOutput` 时主动登记；**明确的未支持**，非静默降级，符合 §1.5） | socket 的读侧**不可回退**：AMF3 的一个值可能跨多个数据包，解到一半发现字节不够时无法「把已消费的字节放回去」（AIR 有内部缓冲层故能流式解），故 `Socket_readObject` 直接抛 `"Socket.readObject is not supported by this subset: the socket read side is not seekable, so an AMF3 value spanning packets cannot be parsed without consuming the bytes after it. Use Socket.readBytes() with ByteArray.readObject()."`；写侧无此问题（序列化完再交给 `Socket__write`） | 与「`URLStream.readObject` 要求 Loader 已完成」同源（缓冲式读侧）：给 AMF 读侧做**增量缓冲**（不够就等下一块 —— 与 `as_async` 的 pump 模型耦合），或按 AIR 语义在 `Socket` 内维持一个可回退的接收缓冲。成本中 |
+| **web 端从文档类构造器请求 Stage3D 上下文不可用**，且 wasm 上胶水层抛的 JS 异常 AS3 `try/catch` **捕不到** | 未开始（2026-10-09 阶段一百二十八 实测发现，`temp/mipprobe/`） | web 侧的 WebGL2 上下文由 `Stage.showWindow` 创建，而文档类构造器里 `stage.stage3Ds[0].requestContext3D()` ⇒ `s3d_alloc_target` 的 `glGenFramebuffers(1, &c->fbo)` 读到未初始化的 GL 对象，抛 `TypeError: Cannot read properties of undefined (reading 'createFramebuffer')`。两层缺口：① **时机** —— AIR 允许「构造器里 requestContext3D、第一帧等 `CONTEXT3D_CREATE`」（native/adl 都能跑），web 上该形态必然失败（`Stage.showWindow` 后请求则正常）；② **可观测性** —— 该异常是 emscripten 帧里的 JS 抛错，**不经过 AS3 异常通道**，`try { requestContext3D(); } catch (e:Error) {}` 捕不到，用户只看到一个 unhandled rejection。探针因此改成「先 `showWindow`、再在第一帧请求」（三端一致）。 | 若要收口需两处：① web 侧把 Stage3D 目标的创建推迟到 canvas 就绪（`Stage.showWindow` 之后），并对「此前请求过」的 Context3D 补建（与 native 的「构造器即可请求」形态对齐）；② 给 glue 里所有会抛 JS 异常的入口加守卫，失败走 `as_throw` 而不是 JS throw（把不可捕获变成**响亮**的 AS3 错误）。**成本中**，且要保证 native 语义不变。 |
+| `catch (e:*)` 被本编译器拒绝（`mxmlc` 接受） | 未开始（2026-10-09 阶段一百二十八 探针副产物） | 写 `try { ... } catch (e:*) { ... }`（AIR 里合法且常见——catch 参数是动态类型）报 `Codegen error at 99:13: undefined class 'any' in catch`（`src/emit.ts` 的 catch 类名解析把 `*` 归一成类名 `any` 后去查类表）。`adl 51.4.1` 接受该形态。规避写法是 `catch (e:Error)` 或 `catch (e:Object)`（后者与 AIR 的 `*` 语义更接近）。 | catch 子句里 `*`/无标注 ⇒ 发射成**动态**捕获（`as_any` 槽），只在写了类名时才做 `is` 判定。**成本低**（一处 catch 类名解析 + 补负例/正例钉子）。 |
+| 内建方法的**可选参数**不生效（省略即报缺参） | 未开始（2026-10-09 阶段一百二十八 探针副产物） | `_ctx.drawTriangles(_ib)`（只传索引缓冲，`Stage3D` 里最常见的单参形态）报 `Codegen error at 196:7: missing argument for parameter 'firstIndex'`；`symbols.ts` 的内建方法表里 `firstIndex`/`numTriangles` 写着 `defaultValue: null`，但发射侧不把 `null` 当「用 AIR 的默认值」⇒ `drawTriangles(ib)`/`drawTriangles(ib, 0)` 两种 AIR 合法写法里前者编译失败。同类站点需一次清点（凡 `defaultValue` 非空的内建参数）。 | 发射侧对「实参少于形参且形参有默认值」按 AIR 的默认值补齐（`drawTriangles` 的 `firstIndex=0`/`numTriangles=-1`，其余逐类按 AIR 文档）；补一条单参 `drawTriangles` 的示例/负例。**成本低-中**（要逐个核对内建默认值）。 |
+| `TextField.textWidth` 的字形累进口径与 AIR 有残差 | 未开始（2026-10-09 阶段一百二十八 三端探针实测，`temp/bakeprobe/`） | 同字体同字号（`_typewriter` 12）同一串：`adl 51.4.1` 给 `14.5`，我们给 `14.40234375`（= 14 + 103/256，看着像 26.6 定点累加；`adl` 的 14.5 更接近其内部 twip/半像素口径）。与本表「`TextField.textWidth` 不含行尾空格（AIR 含）」是**同一族**（字形累进与度量舍入），但根因不同：那条是**取哪些字形**，这条是**每个字形的进位数**。像素影响仅限用 `textWidth` 做布局/换行的代码（本阶段探针的包围盒因字段宽度显式给出而不受影响）。 | 先扩大实测样本（多字号 × 多串 × 单字形）定 AIR 的进位舍入口径（是否 `ceil`/half-px/twip 取整），再决定是否复刻；与「设备字体度量表」那条同批评估更省。**成本低（测量）~中（复刻）**。 |
 
 ---
 
 ### 增强待做
 
-> **与「遗留待开发」的区别**：上表是**欠账**（AIR 有、我们没有，或我们有但不忠实——`adl` 一跑就知道差在哪）；
-> 本表是**增益**（AIR **本来就报错、或压根不存在**，我们做出来才算增强）。判据与五条入库标准见
-> [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1/§2；原则亦见
-> [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §4。
->
-> **状态（2026-10-01，v0.4.23）**：下表 **15 项**，已完成 **3 项**、未排期 12 项。增强的**开启方式已统一为具名开关**
-> （`--features`，见八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；当前只登记已端到端实现的
-> `svg`（E1），E2/E4 实现后再登记（登记未实现的开关就是「看着开了、实际没编进去」）。
-> **已完成**：**WebP/BMP/ICO 解码**（阶段八十九·六十三，实测**零代码**可用——两端 `SkCodec` 本就编入
-> `libwebp_decode`/`wuffs`，走的是与 PNG/JPG 同一条通道；`QOI` 不在内）、**LTO/PGO 构建开关**
-> （阶段八十九·六十四，清单 + CLI 两条路，默认全关）与 **SVG 运行时解码 native 半**
-> （阶段八十九·六十五，opt-in 具名开关 `--features svg`；web 无 svg/sksg/expat 库故不支持）。其中 SVG / Lottie / RAW-DNG 的 **native 侧库已构建
-> 且已在链接表**（只是无人引用，被 `-O2` 的调用图分析剥掉）。实现任何一项都须 **opt-in**
-> （默认产物保持与 AIR 同构）并过 AGENTS.md §4 的 DoD。
+> **与「遗留待开发」的区别**：上表是**欠账**（AIR 有、我们没有，或我们有但不忠实——`adl` 一跑就知道差在哪）；本表是**增益**（AIR **本来就报错、或压根不存在**，我们做出来才算增强）。判据与五条入库标准见 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1/§2；原则亦见 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §4。
+> **状态（2026-10-05 复核，v0.4.61）**：下表 **15 项**，已完成 **5 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**已有** 2 项、未排期 **8 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`），登记未实现的开关等于「看着开了、实际没编进去」。
 
 | 增强项 | AIR 现状 | 目标端 | 成本 | 状态 |
 |--------|---------|--------|------|------|
 | **SVG 运行时解码**（`Loader.load("*.svg")` → `Bitmap`） | ✗ 从不支持（`adl 51.4.1` 实测 `#2124`） | ✅ **native 已实现、opt-in**（具名开关 `--features svg`；四条解码入口全支持，含 `<text>`/相对尺寸）；web 无 svg/sksg/expat 库，不支持 | — | **已完成（八十九·六十五）** |
 | **Lottie 矢量动画**（Skottie 播放 `.json`） | ✗ 无对应物 | native：`libskottie.a`+`libskresources.a` 已构建+已链接，缺播放器 API；web：需重编 | 中 | 未排期 |
-| **WebP / BMP / ICO 解码** | 部分：仅 JPG/PNG/GIF（`adl` 对三者报 `#2124`） | ✅ **已具备、零代码**（两端实测全部解码正确；`QOI` 未编入 `SkQoiCodec`，不含在内） | — | **已完成（八十九·六十三，实测确认）** |
-| **相机 RAW / DNG 解码** | ✗ | native：`libpiex.a`+`libdng_sdk.a` 已构建；web：需重编 | 低-中 | 未排期 |
+| **WebP / BMP / ICO 解码** | 部分：仅 JPG/PNG/GIF（`adl` 对三者报 `#2124`） | ✅ **已实现、opt-in**（默认与 AIR **同报 `#2124`**，`--features formats` 打开后两端实测全部解码正确；`QOI` 未编入 `SkQoiCodec`，不含在内） | 两端 | **已完成（九十四·二十五，默认拒绝 + 开关）** |
+| **相机 RAW / DNG 解码** | ✗（`adl` 对 `.dng` 报 `#2124`；`BitmapData.loadFile` 不存在 → `#1069`） | ✅ **已实现、opt-in**（默认与 AIR 同报 `#2124`，`--features raw` 打开后 native 四条解码入口全部解出 600×338）；web 无 piex/dng_sdk 归档 ⇒ 该开关在 wasm 上被前置拒绝 | native / web 与 AIR 同形 | **已完成（九十四·二十五，默认拒绝 + 开关）** |
 | **矢量图形直接上屏**（`Shape` 走 `SkPath`） | ✗（`BitmapData` 只有位图） | 两端 | 中 | 未排期 |
 | **原生着色器直通**（MSL / GLSL ES） | ✗（只有 AGAL） | 两端 | 中 | 未排期 |
 | **GPU 通用计算**（Metal compute / transform feedback） | ✗ | 两端 | 高 | 未排期 |
 | **无窗口 / 服务端出图** | 半（可离屏，但绑死 AIR 运行时） | 两端 | 已有（headless + `stage.render()` 出 PNG） | 已有 |
-| **64 位整数**（`int64`/`uint64`） | ✗（`int`/`uint` 均 32 位） | 两端 | 中 | 未排期 |
+| **64 位整数**（`int64`/`uint64`） | ✗（`int`/`uint` 均 32 位） | ✅ **已实现、opt-in**：类型 + `L`/`UL` 字面量 + `int64()`/`uint64()` 转换 + 64 位算术/位运算/比较 + 独立装箱 tag；纯 C ⇒ **native/web/WASI 同一份代码同一行为**（无胶水依赖） | — | **已完成（阶段九十四·二十四）** |
 | **`Vector.<Number>` 批量 SIMD**（NEON/SSE） | ✗ | 两端 | 中-高 | 未排期 |
 | **FFI：声明并直调宿主 C 函数** | ✗ | native（「直接转 C」的独有红利） | 中 | 未排期 |
 | **真并发 `Worker`（OS 线程）** | 部分（AIR Worker 受限） | native（已有 4 worker 池，目前只服务异步 IO） | 中 | 未排期 |

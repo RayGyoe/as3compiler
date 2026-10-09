@@ -177,6 +177,20 @@ function makeWasi(host) {
     // 无 preopened 目录：返回 EBADF，让 wasi-libc 的 preopen 扫描就此结束
     fd_prestat_get: () => 8,                  // EBADF
     fd_prestat_dir_name: () => 8,             // EBADF
+    // 沙箱里没有环境变量、没有文件。运行时会因为 GC/IO 的 getenv 调试开关而保留
+    // environ/fopen 一族 import，故这些桩必须存在（否则 instantiate 直接失败）。
+    environ_get: () => 0,                       // 空 environ：不写任何指针
+    environ_sizes_get: (countPtr, bufSizePtr) => {
+      const dv = view();
+      dv.setUint32(countPtr, 0, true);          // count = 0
+      dv.setUint32(bufSizePtr, 0, true);        // buf size = 0
+      return 0;
+    },
+    fd_fdstat_set_flags: () => 8,               // EBADF
+    fd_read: () => 8,                           // EBADF
+    fd_readdir: () => 8,                        // EBADF
+    path_filestat_get: () => 44,                // ENOENT
+    path_open: () => 44,                        // ENOENT
     fd_seek: (fd, offset, whence, newoffsetPtr) => {
       view().setBigUint64(newoffsetPtr, offset, true);
       return 0;

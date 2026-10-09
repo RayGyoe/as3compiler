@@ -97,14 +97,20 @@ Options:
   --manifest <f> build manifest JSON (extra sources / include / link libs)
   --air-app <xml> AIR app descriptor: generate bootstrap + build manifest
   --main-class <n> main class for --air-app (default: infer src/**/Main.as)
+  --all-sources  --air-app: compile every .as under src/ instead of the main class
+                 reachable closure (see §3.5; pre-阶段一百二十四 behaviour)
   -I <dir>       include path (repeatable)
   -L <dir>       library search path (repeatable)
   -l <lib>       link library (repeatable)
   -D <macro>     preprocessor define (repeatable)
   --framework <n> link a macOS framework (repeatable; distinct from clang -F, which is a search path)
   --source <f>   extra C/C++ source to compile and link (repeatable)
+  --swc <f>      .swc library: bake its named bitmap resources, vector shapes and
+                 display tree at compile time (repeatable; see docs/zh-cn/swc.md §5/§6/§9)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
+  --debug-info   keep DWARF: add -g to every backend and stop stripping it from the
+                 default wasm build (default: off — artifacts carry no debug info; see §4.3)
   --dry          emit C and print the compile command without compiling
   -h, --help     show this help
 ```
@@ -148,6 +154,17 @@ as-aot examples/hello.as --target wasm --dry
 `--run` 在 wasm 目标下会用 WASI 运行时运行产物，按 `wasmtime → wasmer → wasm3` 顺序探测，
 一个都没装则报错退出。因 wasm 产物声明了异常处理特性（见 §2），需 wasmtime/wasmer 才能运行，
 wasm3 不支持异常处理提案。
+
+#### 宿主桩需要提供的 WASI import
+
+生成的 `.wasm` 是 WASI 模块，宿主（浏览器 / 自定义运行时）必须为它的**整份** import 集合提供函数，
+否则 `WebAssembly.instantiate` 直接失败（浏览器实测报 `function import requires a callable`）。
+当前运行时因为 GC/IO 的调试开关读 `getenv`、文件 job 用 `fopen`，每个 wasm 模块都会导入 **18** 个
+`wasi_snapshot_preview1` 函数，其中包含 `environ_get`/`environ_sizes_get` 与文件系统一族
+（`path_open`/`fd_read`/`fd_readdir`/`path_filestat_get`/`fd_fdstat_set_flags`）。在浏览器里跑一个**不碰文件/环境**
+的程序时，这些桩可以如实返回「空环境 / `EBADF` / `ENOENT`」 —— 见 `examples/wasm-native/fib.html`、`index.html`
+的**逐条显式桩**，或 `fib-export.html`、`export-meta.html` 的 **Proxy 通配桩**（后者对 import 集合变化免疫）。
+列出某个 `.wasm` 的实际 import 集合：`node temp/regen/imports.mjs <file.wasm>`。
 
 #### 导出函数给 JS 直调
 
@@ -275,6 +292,8 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 | 名字 | 宏 | 可用目标 | 说明 |
 |---|---|---|---|
 | `svg` | `ASC_USE_SVG=1` | 仅 `native` | 见 §3.4.3 |
+| `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | `native` / `wasm` | 额外图片格式 WebP / BMP / ICO（AIR 对它们报 `#2124`，故**默认拒绝**——见 §3.4.3.1） |
+| `raw` | `ASC_ALLOW_RAW_FORMATS=1` | 仅 `native` | 相机 RAW / DNG（默认拒绝——见 §3.4.3.1；web 侧 Skia 无 piex/dng_sdk 归档，故目标不支持时就报错） |
 
 清单里同名字段是一份**字符串数组**，语义与 CLI 一致：
 
@@ -286,7 +305,7 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 
 - **默认全关**：不开时产物与以前**逐字节相同**，与 `adl` 同构。开了会打印一行
   `== enhancements: svg (-D ASC_USE_SVG=1) ==`，并在提示里写明它是 AIR 超集。
-- **未知名字报错**，不静默忽略：`--features lottie` 会报 `unknown feature 'lottie' (known: svg)`
+- **未知名字报错**，不静默忽略：`--features lottie` 会报 `unknown feature 'lottie' (known: formats, raw, svg)`
   并在**生成任何代码之前**退出（清单里也已实现的能力才会被登记，登记了却没实现的开关
   等于给用户一个「看着开了、实际没编进去」的东西）。`--features none` 不能与其它名字同用。
 - **目标不支持就报错**：`--target wasm --features svg` 直接报
@@ -309,7 +328,9 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 
 #### 3.4.3 图片解码的 SVG 通道也是 opt-in 宏（`ASC_USE_SVG`）
 
-编码图片（PNG/JPEG/GIF/BMP/WebP/ICO）无需任何宏——两端 Skia 本就编入了对应 codec。
+编码图片里 **只有 PNG/JPEG/GIF 无需宏**——它们是 AIR 支持的格式（`adl` 解得出来）。BMP/WebP/ICO 两端
+Skia 虽编入了对应 codec，但 AIR 对它们报 `#2124`，故**默认拒绝、须显式开关**（`--features formats`，
+见 §3.4.3.1）。
 **SVG 不同**：它不是 `SkCodec` 格式，走的是独立通道（`SkSVGDOM` 解析 → `SkSurface` 光栅化），
 且 AIR 的 `Loader` **从不支持 SVG**，故按 §1.5 做成 **opt-in**：
 
@@ -330,6 +351,27 @@ as-aot app.as --air-app app.xml -D ASC_USE_SVG=1
 `skia_use_expat=false` 把 svg 目标整体门掉），定义该宏会在**链接期**失败——显式报错，不静默降级。
 要支持须改 wasm `args.gn` 并**重编 wasm Skia**。详见 [`enhancements.md`](enhancements.md) §4.1 与
 [`skia.md`](skia.md) §9.1。
+
+#### 3.4.3.1 图片格式与相机 RAW 的**默认拒绝**（`formats` / `raw`）
+
+同一个道理的另外两处：我们的 Skia 带的 codec 比 AIR 多，而「多」必须 opt-in（AGENTS.md §1.5）——
+否则默认产物就**比 AIR 宽**：`adl` 会拒绝的输入我们却接受了，这正是标准 (d) 禁止的形态。
+
+| 输入 | 默认构建 | 开关 |
+|---|---|---|
+| PNG / JPEG / GIF | 正常解码（AIR 同） | 不需要 |
+| **BMP / WebP / ICO** | `ioError #2124 Error #2124: Loaded file is an unknown type.`（与 `adl` 逐字相同） | `--features formats`（= `-D ASC_ALLOW_EXTRA_FORMATS=1`，两端可用） |
+| **相机 RAW / DNG / CR2 / NEF / ARW / ORF / RW2… / RAF** | 同上 `#2124` | `--features raw`（= `-D ASC_ALLOW_RAW_FORMATS=1`，**仅 native**） |
+| SVG | 同上 `#2124` | `--features svg`（§3.4.3） |
+
+实现是胶水层的**魔数拦截**（`vendor/skia_glue.cc` 的 `sk_extra_format_refused`，四条解码入口都查）：
+`RIFF....WEBP`、`BM`、`ICO/CUR`、TIFF 头（`II*\0`/`MM\0*`，DNG/CR2/NEF/ARW/ORF/RW2 等 TIFF 系 RAW 的
+公共头）、`FUJIFILMCCD-RAW`（RAF）。命中即当作解码失败，于是**自动**走上层既有的 `#2124` 路径——报的错
+与 `adl` 无需另行维护就保持一致。命中失败（不认识的头）仍照旧交给 Skia，行为与从前一样。
+
+`--features raw --target wasm` 会被**前置拒绝**（`the wasm Skia has no piex/dng_sdk archive ...`）；
+`--features formats` 在两端都可用。`WBMP`（`SkWbmpCodec` 编入了）**故意不拦**：它的头部是裸多字节
+类型字段、没有可靠魔数，与其猜一个可能误伤真格式的判据，不如如实记在这里。
 
 #### 3.4.4 静态自包含（`vendor/curl`）
 
@@ -382,6 +424,38 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 在 app.xml 同目录写出 `<filename>.build.json`（链接 Skia + SDL2）→ 编链出 `<filename>` 可执行
 （产物名可用 `-o` 覆盖）。
 
+#### 3.5.1 编译面 = 主类的传递闭包（阶段一百二十四）
+
+`--air-app` 编译**哪些** `.as` 由**从主类出发的类引用闭包**决定（`src/reach.ts`），与 `mxmlc`/`adl`
+的链接行为一致：AIR 只链从文档类可达的传递闭包——`mxmlc -link-report` 实测 away3d 的六个 demo 各
+只链 **158/162/171/171/175/246** 个 def，而 `src/` 有 **485** 个文件、其中 **198** 个不被任何一个
+demo 触及。此前 `--air-app` 一律编译整包，是**过度近似**，代价有二：别的 demo 的 `[Embed]` 被打包
+且**存活进产物**，以及**不可达**类里的坏 `[Embed]` 让我们编译期失败（`adl` 无恙）。
+
+闭包的边 = 源码里出现的**类名引用**：`new X`、类型标注（含 `Vector.<T>` 的元素类型）、
+`extends`/`implements`、`is`/`as` 的目标、`catch (e:T)`、参数/返回类型，以及**裸标识符**
+（覆盖 `X.staticM()` 这类静态成员访问）。解析**刻意过度近似**——未解析的短名映射到**全部**同名
+候选，因此我们的闭包 **⊇** AIR 的闭包（否则剪枝本身就成了新的保真缺口）。另外这些**总是保留**：
+主类、`[WasmExport]` 标记的类（无 AS3 引用的 JS 入口）、以及带**非类顶层语句**（模块语句/自由
+函数）的文件——那些代码是整程序发射的，无法按类剪。
+
+**只被 `getDefinitionByName("…")` 字符串引用的类**不会被保留，这与 AIR 一致（`mxmlc` 同样解析不出
+字符串）。**类注册表 `as_class_registry[]` 保持 eager**（它同时服务 `is Class`、`new x()`、
+`getDefinitionByName` 与 GC 根）——收的是**发射面**，不是运行时表。
+
+要切回旧的「整包编译」口径：
+
+```bash
+as-aot --air-app app.xml --all-sources     # 编译 src/ 下全部 .as（阶段一百二十四 之前的行为）
+```
+
+实测（away3d `Basic_SkyBox`，同一份源码，`--all-sources` vs 默认）：源文件 **485 → 165**、
+`[Embed]` **40 → 6**、生成的 `.c` **31,324,486 → 9,105,166 B（−71%）**、二进制
+**34,134,472 → 25,456,904 B（−25%）**、整链构建 **37.03 → 15.94 s（−57%）**。
+构建日志会报出收面结果：`(main Basic_SkyBox, 165/485 sources reachable from Basic_SkyBox)`；
+逐 demo 的嵌资源数与 AIR **逐个相等**（6/2/0/2/1/27）。设计、健全性论证与逐机制来源见
+`src/reach.ts` 头注与单元组 `unit: reach/*`。
+
 **web 目标**（`--air-app ... --target wasm --package web`）下，`--air-app` 适配器自动切换到
 浏览器后端：构建清单改用 `web_glue.cc`（替换 `window_glue.cc`）+ wasm 版 Skia
 （`vendor/skia/lib/wasm`），去掉 SDL2/`objc`/Cocoa 等 macOS 框架，字体由 app.xml 的
@@ -420,6 +494,14 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
   `CAMetalLayer` 取一次性 drawable、包成 `GrBackendRenderTarget` 渲染、`flushAndSubmit` 后
   `presentDrawable`+`commit`。`cpu`/`auto`（缺省）保持纯软件 raster（web 用 `putImageData`，native 用
   SDL streaming texture）。
+  - **`ASC_RENDER_METAL` 对**所有**窗口生效**（阶段八十九·七十五）：主窗口恒走 Metal；运行期
+    `new NativeWindow()` 也默认走 Metal——AIR 的 `NativeWindowRenderMode.AUTO` 就是「有 GPU 就用 GPU」。
+    后端状态（layer/drawable/surface）**按窗口分槽**，只共享 `MTLDevice`/`MTLCommandQueue`/`GrDirectContext`；
+    开 N 个窗口就是 N 次 per-window Metal 初始化（日志 `metal_glue: window <id> layer bounds=…`）。
+  - 同一构建内要软件窗口，把 `NativeWindowInitOptions.renderMode = "cpu"` （主窗口无此旋钮，它由 app.xml 定）。
+    实测（两个副窗口）：同一份二进制只改这一行，CPU 平均 **32.8% → 14.0%**。
+  - **Stage3D/StageVideo 只在 Metal 窗口里合成**：AIR 文档明确软件窗口不支持 StageVideo/Stage3D 合成，
+    且 Metal 构建下没有 CPU 回读缓冲（暴露渲染目标纹理正是为了省掉每次回读）——按 AIR 行为处理，非静默降级。
 - 引导代码在 `new Main()` **之前**预设 `stage.stageWidth/stageHeight`，使 document class 构造时
   `trace(stage.stageWidth, stage.stageHeight)` 返回窗口尺寸（如 `1000 680`），而非 adl 之外的 `0 0`。
 
@@ -434,10 +516,12 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | 分发形态，默认 `raw`（§6）；`web` 要求 `target=wasm`，产出浏览器产物（见 [`html5-web.md`](html5-web.md)） |
 | `c-compiler` | string | C 编译器，默认 `cc` |
 | `opt` | string | 优化标志，默认 `-O2` |
+| `debug-info` | boolean | 是否保留调试信息，默认 `false`。默认产物在三个后端都**不带 DWARF**（wasm 链接因此加 `-Wl,--strip-debug`，见 §4.3）；设 `true` 则三端均加 `-g` 且 wasm 不再剥离（CLI `--debug-info`） |
 | `lto` | boolean | 布尔，默认 `false`。为 `true` 时向**每个编译步骤与链接步骤**都加 `-flto`（见 §4.2）；不设时命令行与产物与以前**逐字节相同** |
 | `pgo` | `"generate" \| "use"` | 分阶段优化（PGO）的阶段，默认不启用。`generate` 构建**插桩**产物（运行后会写剖析数据），`use` 用同一目录的剖析数据重编（见 §4.2） |
 | `pgo-dir` | string | `pgo` 两阶段共用的剖析目录（相对清单目录解析）。clang 从该目录读 `<dir>/default.profdata`，故两阶段**必须同名** |
 | `sources` | string[] | 额外 C/C++ 源文件（与生成的 `.c` 一起编译） |
+| `swc-paths` | string[] | `.swc` 库（路径相对清单目录解析）。两半都在**编译期**处理：**命名位图资源**被提取（`DefineBitsLossless/2` 反预乘后重编码为 PNG，`DefineBitsJPEG2/3` 原字节直搬）并合成为 `dynamic class X extends BitmapData`（构造器 `(width, height)` 但**实参被忽略**），**矢量 shape 与显示树**（`DefineShape*`/`DefineSprite`/`PlaceObject*`、`clipDepth` 遮罩、`PlaceObject3` 可见性、**九宫格** `DefineScalingGrid`、**按钮四态** `DefineButton2`）烘焙为运行时绘制调用，导出符号合成为 AST 类。于是 `new logo(0, 0)` 与 `getDefinitionByName("logo")` 两条引用路都可用；资源字节内嵌进生成的 `.c`，运行时由 Skia 解码（矢量侧零新增运行时 API）。实现与实测见 [`swc.md`](swc.md) §5/§6/§9；语义/限制见 [`swc.md`](swc.md) §10 |
 | `include-paths` | string[] | 头文件搜索路径（→ `-I`） |
 | `link-libs` | string[] | 链接库（→ `-l`） |
 | `link-paths` | string[] | 库搜索路径（→ `-L`） |
@@ -454,7 +538,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `deployment-target` | string | macOS 最低系统版本（填 `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） |
 | `targets` | `{ native?, wasm? }` | **按目标覆盖块**（§4.1）：顶层字段为公共默认，`targets.<目标>` 块对**匹配的目标**整体替换其声明的字段，使一份清单可服务链接集互斥的多目标 |
 
-路径类字段（`sources` / `include-paths` / `link-paths` / `objects` / `preload-excludes`）**相对清单文件所在目录解析**
+路径类字段（`sources` / `swc-paths` / `include-paths` / `link-paths` / `objects` / `preload-excludes`）**相对清单文件所在目录解析**
 （与 TypePHP 的 YAML 路径规则一致）。示例见
 [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json)：
 
@@ -560,12 +644,42 @@ as-aot bench.as --lto --pgo use --pgo-dir prof -o bench
 再叠 PGO 在本例无可测增益（已在噪声内）——本负载分支简单，PGO 的收益面是**分支多 / 间接调用多**的程序，
 不宜把它当普适提升。
 
+### 4.3 调试信息（`debug-info`）
+
+同样是与 `opt`/`lto`/`pgo` 正交的**构建层开关**，但方向相反：它管的是**产物要不要带调试段**。
+默认 `false`，含义是「三个后端都不带 DWARF」，与 C 工具链的惯例一致：
+
+| 后端 | 默认是否带 DWARF | 为什么 |
+|---|---|---|
+| native（`cc -O2`） | 否 | clang 不加 `-g` 就不发 `.debug_*`（可执行文件只有一个常规符号表） |
+| web（`emcc -O2`） | 否 | emcc 在 `-O2` 下自行剥离（实测 trivial 程序 2010 B、0 个 custom section；加 `-g` 才 28243 B） |
+| wasm（WASI raw） | **是，故默认显式剥离** | wasi-sdk 的 `libc.a` **自带 DWARF** 且 `wasm-ld` 默认保留——一个 trivial `printf` 就拖进 ~62 KB 调试段 |
+
+所以 `debugInfo=false` 时，**只有 wasm 链接**需要一枚反向的 `-Wl,--strip-debug`（native/web 无需任何补偿标志）。
+用 `--strip-debug` 而非 `--strip-all` 是有意的：它只删 `.debug_*`，保留 `name` 段（函数名）⇒ 即使不带调试信息，
+trap 仍打印**符号化的栈**，只丢源码行号/变量级信息。
+
+```bash
+# 默认：wasm 产物 133 KB（fib.wasm，剥离 288 KB 调试段）
+as-aot examples/wasm-native/fib.as --target wasm
+
+# 保留调试信息：三端均加 -g，wasm 不再剥离（fib.wasm ~640 KB）
+as-aot examples/wasm-native/fib.as --target wasm --debug-info
+```
+
+`debugInfo=true` 时 `-g` 会加在**每一个编译步**上（不只是链接），所以 DWARF 覆盖我们生成的 `.c` 本身——
+浏览器 DevTools 可对 AS3 降级出的 C 做源码级单步（`llvm-dwarfdump --debug-line` 会看到我们生成的 `.c` 文件名）。
+清单写法：`{ "debug-info": true }`，可被 `targets.<目标>` 分层覆盖（§4.1）。
+
+> 不发 `-g` 的 native/web 默认行为**完全未变**；回归里对三个后端的**默认命令**各自有断言
+> （`[debuginfo]`），反向对照证明它们真的钉住了这条策略。
+
 ## 5. 多目标后端
 
 | 目标 | 编译命令 | 产物 |
 |---|---|---|
 | `native`（默认，`--package raw`） | `cc -O2 -lm -lz -o <out> <c> [sources] -I... -D... [objects] -L... -l... [-framework X]` | Mach-O / ELF / PE 可执行 |
-| `wasm`（`--package raw`） | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 -mllvm -wasm-use-legacy-eh=false -o <out>.wasm <c> ... -lsetjmp` | WASI `.wasm` |
+| `wasm`（`--package raw`） | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 [-g] -mllvm -wasm-use-legacy-eh=false [-Wl,--strip-debug] -o <out>.wasm <c> ... -lsetjmp` | WASI `.wasm`（默认剥调试段；`--debug-info` 则去掉 `-Wl,--strip-debug` 并加 `-g`，见 §4.3） |
 | `native` + `--package xcode-project` | 生成 `.xcodeproj`（§6.5），由 Xcode/xcodebuild 驱动 | macOS `.app` bundle（`Contents/MacOS/<bin>` + `Info.plist`） |
 | `wasm` + `--package web` | `emcc`（Emscripten，需 `EMSDK_HOME`）编译 C/C++ 源 + 链接 wasm 版 Skia，`INVOKE_RUN=0` | `.wasm` + `.js` + `index.html`（浏览器 HTML5 渲染，见 [`html5-web.md`](html5-web.md)） |
 
@@ -797,11 +911,17 @@ as-aot examples/web/hello-web.as \
 no-op」（见下文 `runtime.ts` 的条件编译）。因此同一个 `.as` 换 manifest 即可在「离屏 PNG」与「GUI
 窗口」间切换，无需改源码。
 
+> **「离屏」那条只链 Skia**：`sources` 里没有 `window_glue.cc`、`link-libs` 里没有 `SDL2`，也不需要
+> SDL2 的头/库路径（`ASC_USE_WINDOW` 未定义时 `Stage.showWindow()` 退化为 no-op）。这两条文档清单
+> 都由 `test/unit/build.ts` 的 `build/DocumentedLinkSets` 用**清单自己的 `defines`** 编译一次生成的 C
+> 兜底：任一条组合编不过就红（2026-10-06 离屏那条缺 `AS_CURSOR_*` 而静默失效即此类，已修为
+> 「枚举在所有后端分支之外单处定义」）。
+
 > **两个 GPU 宏不可混用**（混用会误判 `Context3D.driverInfo` 的后端）：
 >
 > | 宏 | 含义 | 由谁定义 |
 > |---|---|---|
-> | `ASC_RENDER_METAL` | **窗口合成**走 Metal：`metal_glue.mm` 的 `CAMetalLayer` + Ganesh，整帧在 GPU 上合成（2D 上屏用） | `air-app.ts` 在 `<renderMode>direct/gpu` + 可见窗口时加入 |
+> | `ASC_RENDER_METAL` | **窗口合成**走 Metal：`metal_glue.mm` 的 `CAMetalLayer` + Ganesh，整帧在 GPU 上合成（2D 上屏用）。**每个窗口一份状态**（按窗口 id 分槽，只共享 device/queue/context），主窗口与运行期 `NativeWindow` 都走它（后者除非 `renderMode="cpu"`） | `air-app.ts` 在 `<renderMode>direct/gpu` + 可见窗口时加入 |
 > | `ASC_RENDER_STAGE3D` | **Stage3D 的 `Context3D` 接到真实 GPU**：链接 `stage3d_glue.mm`，`as_s3d_*` 包装器从 no-op 变为真实 Metal 调用 | 构建清单（`usesStage3D` 时由 `air-app.ts` 加入） |
 >
 > 二者**互相独立**：只定义前者时 `Context3D` 仍是纯 C 状态机（`driverInfo` 返回 `"Software (state machine)"`）；
@@ -891,9 +1011,10 @@ Retina 高清渲染（`ASC_DISPLAY_HIGH=1`）：
 
 ## 8. 相关文档
 
-- [`README-CN.md`](../../README-CN.md) — 项目总览、支持的语言子集、类型映射、当前限制
+- [`README-CN.md`](../../README-CN.md) — 项目总览、支持的语言子集、类型映射
 - [`TODO.md`](../../TODO.md) — 分阶段路线图（阶段二十九为「构建清单 + 多目标后端」）
 - [`as3-semantics.md`](as3-semantics.md) — AS3 语义保真红线与规范来源
 - [`html5-web.md`](html5-web.md) — 浏览器渲染目标（`--target wasm --package web`）的实现与使用
+- [`win32.md`](win32.md) — Windows 原生后端（`<architecture>` 位宽、`vendor/build-windows-deps.ps1`、Skia D3D12 直连 GPU、首跑核对清单）
 - [`skia.md`](skia.md) — 渲染后端（Skia 光栅化 + wasm 字体注入）
 - [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md) — 开发规范（§2.9 构建与链接）

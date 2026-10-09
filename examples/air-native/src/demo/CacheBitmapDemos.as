@@ -108,6 +108,7 @@ package demo {
       var t:TextField = new TextField();
       t.defaultTextFormat = new TextFormat("_sans", 10, 0x666666);
       t.text = text;
+      t.mouseEnabled = false;
       t.x = x;
       t.y = 0;
       t.width = 150;

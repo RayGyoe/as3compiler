@@ -30,15 +30,17 @@ check(sp.length == 5 && sp[0] == 1 && sp[1] == 9 && sp[2] == 8 && sp[3] == 4 && 
 // --- forEach(callback): 引用累加器（闭包改对象内容可回传）---
 var fe:Vector.<int> = new <int>[1, 2, 3];
 var acc:Vector.<int> = new <int>[];
-fe.forEach(function(x:int):void { acc.push(x); });
+// Vector callbacks get (element, index, vector) too: AIR requires the full
+// 3-parameter signature (#1063 otherwise -- temp/pkgA/cbk2).
+fe.forEach(function(x:int, i:int, v:Vector.<int>):void { acc.push(x); });
 check(acc.length == 3 && acc[0] == 1 && acc[2] == 3, "forEach pushes every element");
 
 // --- map(callback) ---
-var m:Vector.<int> = fe.map(function(x:int):int { return x * 2; });
+var m:Vector.<int> = fe.map(function(x:int, i:int, v:Vector.<int>):int { return x * 2; });
 check(m.length == 3 && m[0] == 2 && m[1] == 4 && m[2] == 6, "map");
 
 // --- filter(callback) ---
-var f:Vector.<int> = new <int>[1, 2, 3, 4, 5, 6].filter(function(x:int):Boolean { return x % 2 == 0; });
+var f:Vector.<int> = new <int>[1, 2, 3, 4, 5, 6].filter(function(x:int, i:int, v:Vector.<int>):Boolean { return x % 2 == 0; });
 check(f.length == 3 && f[0] == 2 && f[1] == 4 && f[2] == 6, "filter");
 
 // --- sort() 默认数值（Vector 元素为 int）---

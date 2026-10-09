@@ -9,12 +9,23 @@ import { dirname, resolve, basename, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parser.ts';
 import { generateC, type ExportedSymbol } from './codegen.ts';
-import { ctypeToString } from './symbols.ts';
-import type { Program } from './ast.ts';
+import { ctypeToString, qualifiedName } from './symbols.ts';
+import type { Program, Stmt } from './ast.ts';
 import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, wasmToolchainError, buildWebCompileSteps, webToolchainError, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures } from './build.ts';
 import type { BuildConfig, Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp } from './air-app.ts';
+import { computeReachable, prepareReachFiles, type ReachFile } from './reach.ts';
 import { generateXcodeProject } from './xcode-project.ts';
+import {
+  extractSwc,
+  swcCompileInputs,
+  swcBakePlan,
+  type SwcResourceSpec,
+  type SwcLibrary,
+  type SwcCharacterClass,
+  type SwcBake,
+} from './swc.ts';
+import { embedCompileInputs, type EmbedResourceSpec } from './embed.ts';
 
 interface Options {
   inputs: string[];
@@ -23,12 +34,17 @@ interface Options {
   manifest: string | null;
   airApp: string | null;
   mainClass: string | null;
+  // `--all-sources`: compile every .as under src/ instead of the main class's
+  // reachable closure (see reach.ts). The pre-阶段一百二十四 behaviour, kept as an
+  // escape hatch for a project whose references the source-level walker cannot
+  // see.
+  allSources: boolean;
   overrides: Partial<BuildConfig>;
 }
 
 function parseArgs(argv: string[]): Options {
-  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, overrides: {} };
-  const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'features' | 'exports' | 'frameworks' | 'sources', v: string): void => {
+  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, overrides: {} };
+  const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths', v: string): void => {
     (opts.overrides[key] ??= [] as string[]).push(v);
   };
   for (let i = 0; i < argv.length; i++) {
@@ -42,7 +58,9 @@ function parseArgs(argv: string[]): Options {
     else if (a === '--manifest') opts.manifest = argv[++i];
     else if (a === '--air-app') opts.airApp = argv[++i];
     else if (a === '--main-class') opts.mainClass = argv[++i];
+    else if (a === '--all-sources') opts.allSources = true;
     else if (a === '--opt') opts.overrides.opt = argv[++i];
+    else if (a === '--debug-info') opts.overrides.debugInfo = true;
     else if (a === '--lto') opts.overrides.lto = true;
     else if (a === '--pgo') {
       const v = argv[++i];
@@ -69,6 +87,7 @@ function parseArgs(argv: string[]): Options {
     }
     else if (a === '--framework') push('frameworks', argv[++i]);
     else if (a === '--source') push('sources', argv[++i]);
+    else if (a === '--swc') push('swcPaths', argv[++i]);
     else if (a === '--export') push('exports', argv[++i]);
     else if (a === '--help' || a === '-h') {
       console.log(usage());
@@ -99,6 +118,7 @@ function usage(): string {
     '  --manifest <f> build manifest JSON (extra sources / include / link libs)',
     '  --air-app <xml> AIR app descriptor: generate bootstrap + build manifest',
     '  --main-class <n> main class for --air-app (default: infer src/**/Main.as)',
+    '  --all-sources  --air-app: compile every .as under src/ instead of the main class\n                 reachable closure (pre-阶段一百二十四 behaviour; see reach.ts)',
     '  -I <dir>       include path (repeatable)',
     '  -L <dir>       library search path (repeatable)',
     '  -l <lib>       link library (repeatable)',
@@ -108,8 +128,12 @@ function usage(): string {
   `                 known: ${knownFeatures().join(', ')} (see docs/zh-cn/enhancements.md)`,
   '  --framework <n> link a macOS framework (repeatable; distinct from clang -F, which is a search path)',
     '  --source <f>   extra C/C++ source to compile and link (repeatable)',
+  '  --swc <f>      .swc library: bake bitmap resources, vector shapes and the display tree at',
+  '                 compile time (repeatable; see docs/zh-cn/swc.md §5/§6/§9)',
     '  --export <name> export a C symbol into the .wasm export table (repeatable)',
     '  --opt <flags>  optimization flags (default: -O2)',
+    '  --debug-info   keep DWARF: add -g to every backend and stop stripping it from the',
+    '                 default wasm build (default: off — artifacts carry no debug info)',
     '  --lto          add -flto to every compile step and the link step (E12)',
     '  --pgo <phase>  profile-guided optimization: generate | use (E12; pair with --pgo-dir)',
     '  --pgo-dir <d>  profile directory for --pgo (the two phases must name the same one)',
@@ -169,6 +193,23 @@ function main(): void {
   let cPath: string;
   let inputLabel: string;
 
+  // `[Embed]` assets (阶段一百一十二): collected per file while the DECLARING
+  // FILE's directory is still known, because a relative `source` resolves against
+  // it (AIR's rule, measured on adl) — a fact the flattened program no longer
+  // carries. A leading '/' resolves against `sourceRoot` instead.
+  const embedResources: EmbedResourceSpec[] = [];
+  const embedDecls: Stmt[] = [];
+  const embedFieldInits = new Map<string, string>();
+  const sourceRoot = opts.airApp
+    ? resolve(dirname(opts.airApp), 'src')
+    : dirname(resolve(opts.inputs[0]));
+  const collectEmbeds = (body: Stmt[], fileDir: string): void => {
+    const emb = embedCompileInputs(body, { fileDir, sourceRoot });
+    embedResources.push(...emb.resources);
+    embedDecls.push(...emb.decls);
+    for (const [k, v] of emb.fieldInits) embedFieldInits.set(k, v);
+  };
+
   if (opts.airApp) {
     const vendorAbs = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
     // --package web selects the browser backend for the generated manifest; the
@@ -189,52 +230,47 @@ function main(): void {
     program.body.push(...boot.body);
     program.imports.push(...boot.imports);
     const srcDir = resolve(dirname(opts.airApp), 'src');
-    for (const f of air.asFiles) {
-      const p = parse(readFileSync(f, 'utf8'));
-      const rel = relative(srcDir, f).replace(/\\/g, '/');
-      const fileId = rel.replace(/\.as$/i, '').replace(/[^A-Za-z0-9_]/g, '_');
-      // Every top-level class/interface declared in this file (for same-file
-      // visibility below).
-      const fileClasses: { name: string; packageName: string | null }[] = [];
-      for (const stmt of p.body) {
-        if (stmt.kind === 'ClassDecl' || stmt.kind === 'InterfaceDecl') {
-          fileClasses.push({ name: stmt.name, packageName: stmt.packageName });
-        }
-      }
-      // AS3 §5.1: a definition outside any `package { }` block lives in a per-file
-      // anonymous namespace. Give those a unique file-scoped package so their C
-      // keys can't collide with built-ins (e.g. Polygon.as's `class Rectangle` vs
-      // `flash.geom.Rectangle`). Every class records its source file for
-      // same-file internal visibility.
-      for (const stmt of p.body) {
-        if (stmt.kind === 'ClassDecl' || stmt.kind === 'InterfaceDecl') {
-          stmt.fileId = fileId;
-          if (stmt.packageName === null) stmt.packageName = fileId;
-        }
-      }
-      // Same-file visibility: a file's members are visible to each other without
-      // an explicit import. Append every same-file class's FQN to each class's
-      // import list so the import-aware resolver can see them.
-      for (const stmt of p.body) {
-        if (stmt.kind === 'ClassDecl' || stmt.kind === 'InterfaceDecl') {
-          for (const fc of fileClasses) {
-            const fqnStr = fc.packageName === null ? `${fileId}.${fc.name}` : `${fc.packageName}.${fc.name}`;
-            if (!stmt.imports.includes(fqnStr)) stmt.imports.push(fqnStr);
-          }
-        }
-      }
-      program.body.push(...p.body);
-      program.imports.push(...p.imports);
+    // Pass 1: read + parse + rewrite EVERY source, so the reachability closure can
+    // see the whole tree. The rewrite (file-scoped package for an
+    // anonymous-namespace class, same-file imports) must run first: it is what
+    // gives each declaration the identity the closure resolves against, and what
+    // the real build's symbols will carry. See reach.ts::prepareReachFiles.
+    const parsedFiles: ReachFile[] = prepareReachFiles(air.asFiles, srcDir);
+    // Pass 2: the compile face. AIR's own linker keeps only the transitive class
+    // closure from the document class (`mxmlc -link-report` on the away3d demos:
+    // 158–246 classes each, vs the 485 `.as` files a whole-src compile pulls in),
+    // so compiling everything over-approximates AIR — bloating the emitted C with
+    // other demos' `[Embed]` assets and turning a broken embed in an unreachable
+    // class into a build failure `adl` never sees. See reach.ts for the soundness
+    // argument; `--all-sources` restores the whole-tree face.
+    let keptFiles = parsedFiles;
+    let reachNote = `${air.asFiles.length} sources`;
+    if (!opts.allSources) {
+      const reach = computeReachable(parsedFiles, air.mainClass);
+      const keep = new Set(reach.kept);
+      keptFiles = parsedFiles.filter((f) => keep.has(f.path));
+      reachNote = reach.dropped.length > 0
+        ? `${reach.kept.length}/${air.asFiles.length} sources reachable from ${air.mainClass}`
+        : `${air.asFiles.length} sources`;
+    }
+    for (const f of keptFiles) {
+      program.body.push(...f.body);
+      program.imports.push(...f.imports);
+      // Runs AFTER the anonymous-namespace rewrite above, so the declaring class's
+      // name+package are the ones symbol collection will see (the `[Embed]` field
+      // lookup key is built from exactly these two strings).
+      collectEmbeds(f.body, dirname(f.path));
     }
     base = opts.output ?? resolve(dirname(opts.airApp), air.info.filename);
     cPath = `${base}.c`;
-    inputLabel = `${opts.airApp} (main ${air.mainClass}, ${air.asFiles.length} sources)`;
+    inputLabel = `${opts.airApp} (main ${air.mainClass}, ${reachNote})`;
   } else {
     program = { body: [], imports: [] };
     for (const input of opts.inputs) {
       const p = parse(readFileSync(input, 'utf8'));
       program.body.push(...p.body);
       program.imports.push(...p.imports);
+      collectEmbeds(p.body, dirname(resolve(input)));
     }
     const first = opts.inputs[0];
     base = opts.output ?? first.replace(/\.as$/i, '');
@@ -258,6 +294,7 @@ function main(): void {
   if (opts.overrides.package) cfg.package = opts.overrides.package;
   if (opts.overrides.cCompiler) cfg.cCompiler = opts.overrides.cCompiler;
   if (opts.overrides.opt) cfg.opt = opts.overrides.opt;
+  if (opts.overrides.debugInfo !== undefined) cfg.debugInfo = opts.overrides.debugInfo;
   if (opts.overrides.lto !== undefined) cfg.lto = opts.overrides.lto;
   if (opts.overrides.pgo) cfg.pgo = opts.overrides.pgo;
   if (opts.overrides.pgoDir) cfg.pgoDir = opts.overrides.pgoDir;
@@ -265,10 +302,53 @@ function main(): void {
   // Unlike -D (which appends to the manifest's defines), --features REPLACES the
   // set: see resolveFeatures for why.
   if (explicitFeatures) cfg.features = explicitFeatures;
-  for (const k of ['includePaths', 'linkLibs', 'linkPaths', 'defines', 'exports', 'frameworks', 'sources'] as const) {
+  for (const k of ['includePaths', 'linkLibs', 'linkPaths', 'defines', 'exports', 'frameworks', 'sources', 'swcPaths'] as const) {
     const extra = opts.overrides[k];
     if (extra) cfg[k].push(...extra);
   }
+
+  // SWC resources (阶段九十五): extract named bitmaps at compile time and turn
+  // them into ordinary class declarations plus embedded-byte specs. This runs
+  // BEFORE codegen so the synthesized `ClassDecl`s participate in symbol
+  // collection, type resolution, vtables and the reflection registry.
+  const swcResources: SwcResourceSpec[] = [];
+  const swcChars: SwcCharacterClass[] = [];
+  const swcLibraries: SwcLibrary[] = [];
+  if (cfg.swcPaths.length > 0) {
+    const declared = new Set<string>();
+    for (const s of program.body) {
+      if (s.kind === 'ClassDecl') declared.add(qualifiedName(s.name, s.packageName));
+    }
+    for (const libPath of cfg.swcPaths) {
+      const lib = extractSwc(libPath);
+      const inputs = swcCompileInputs(lib);
+      for (const spec of inputs.specs) {
+        if (declared.has(spec.cname)) {
+          throw new Error(
+            `SWC '${libPath}' exports class '${spec.className}', but the AS3 source already declares a class with the same name`
+          );
+        }
+        declared.add(spec.cname);
+      }
+      for (const ch of inputs.chars) {
+        if (declared.has(ch.cname)) {
+          throw new Error(
+            `SWC '${libPath}' exports display class '${ch.cname}', but the AS3 source already declares a class with the same name`
+          );
+        }
+        declared.add(ch.cname);
+      }
+      program.body.push(...inputs.decls);
+      swcResources.push(...inputs.specs);
+      swcChars.push(...inputs.chars);
+      swcLibraries.push(lib);
+    }
+  }
+
+  // The synthesized `[Embed]` asset classes join the program here, before codegen,
+  // so they take part in symbol collection, type resolution, vtables and the
+  // reflection registry exactly like the SWC resource classes do.
+  program.body.push(...embedDecls);
 
   // 校验 target/package 合法性：非法值（如 `--target .wasm` 多带了一个点）必须
   // 立即报错，而不是静默 fallback 到 native——那会产出「编译过但结果错」的产物，
@@ -296,8 +376,51 @@ function main(): void {
   }
   console.log(`[1/4] read        ${inputLabel}`);
   console.log('[2/4] parse       tokenize + AST');
+  if (cfg.swcPaths.length > 0) {
+    console.log(`      swc         ${cfg.swcPaths.length} library(ies): ${swcResources.length} embedded resource(s)`);
+  }
+  if (embedResources.length > 0) {
+    // Which asset KIND each `[Embed]` became, and from which file: `mimeType`
+    // overrides the extension, so this is the only place that mistake is visible
+    // before something renders wrong (§1.5 — never silently).
+    console.log(`      embed       ${embedResources.length} asset(s)`);
+    for (const r of embedResources) {
+      console.log(`                  ${r.kind.padEnd(7)} ${r.declaredAt} <- ${r.source} (${r.encoded.length} bytes)`);
+    }
+  }
   console.log('[3/4] codegen     emit C source');
-  const { c, exports } = generateC(program);
+  // Bake the display trees of every exported symbol (swc.md §9 E-3). Character
+  // ids are only unique WITHIN one library, and the baked factories are keyed by
+  // that raw id, so two libraries would need a global id remap. Refuse loudly
+  // rather than emitting a factory that resolves the wrong character.
+  let swcBake: SwcBake | undefined;
+  if (swcLibraries.length === 1) {
+    swcBake = swcBakePlan(swcLibraries[0], swcResources, swcChars);
+    // A baked symbol that needs a text/font/morph character loses that part of its
+    // artwork (swc.md §3.3 — those tags are deliberately not rendered). Say so
+    // loudly and name the tags, rather than producing a quietly incomplete skin.
+    if (swcBake.unsupported.length > 0) {
+      const named = [...new Set(swcBake.unsupported.map((u) => u.kind))].sort().join(', ');
+      console.warn(
+        `warning: ${swcBake.unsupported.length} character(s) in the baked display trees are ${named}; ` +
+          'they are not rendered (text/font/morph rendering is out of scope — see docs/zh-cn/swc.md §3.3); ' +
+          'the exported symbols that use them will be missing that artwork'
+      );
+    }
+    // Non-character fidelity gaps: a PlaceObject3 attribute the baker cannot
+    // express (a filter kind we do not render, a blend mode with no equivalent).
+    // AIR applies these, so they are named rather than silently rendered as if
+    // the SWF had not asked for them (swc.md §9.2 F4).
+    for (const note of swcBake.notes) {
+      console.warn(`warning: ${note} (docs/zh-cn/swc.md)`);
+    }
+  } else if (swcLibraries.length > 1) {
+    console.warn(
+      `warning: ${swcLibraries.length} .swc libraries given — display trees are only baked for a single library ` +
+        '(character ids are library-local); the exported classes still type-check and their named bitmaps still embed'
+    );
+  }
+  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits);
   writeFileSync(cPath, c);
 
   // [WasmExport] declarations are auto-exported: append their C symbols (or alias
@@ -311,6 +434,28 @@ function main(): void {
   }
 
   const outPath = cfg.target === 'wasm' ? `${base}.wasm` : base;
+
+  // Audio (flash.media) is delivered by a backend the build layer links, not by
+  // the frontend: without it every playback entry point keeps answering honestly
+  // — play() returns null, SoundMixer.areSoundsInaccessible() is true — instead
+  // of pretending to play. That is the right behaviour, but it is invisible from
+  // the AS3 source, so say it once here (§1.5). --air-app wires it automatically
+  // (no warning: the define is already in the manifest); a hand-written
+  // --manifest or a plain build does not.
+  // `defines` entries may carry a value (`ASC_HAVE_AUDIO=1`), so match the macro
+  // name, not the whole string.
+  const audioLinked = cfg.defines.some((d) => d === 'ASC_HAVE_AUDIO' || d.startsWith('ASC_HAVE_AUDIO='));
+  if (!audioLinked && program.imports.some((i) => i === 'flash.media' || i.startsWith('flash.media.'))) {
+    const how =
+      cfg.target === 'wasm'
+        ? `the browser build has no audio backend yet, so nothing will play (docs/zh-cn/audio.md)`
+        : `add \`vendor/audio_glue.c\` to the manifest's \`sources\` and \`ASC_HAVE_AUDIO=1\` to \`defines\` (docs/zh-cn/audio.md)`;
+    console.warn(
+      `warning: this program uses flash.media, but this build links no audio backend: play() returns null and ` +
+        `SoundMixer.areSoundsInaccessible() is true.\n` +
+        `  ${how}`
+    );
+  }
 
   // 分发形态分派（§6）：--package xcode-project 是「生成工程」步骤，不做 cc
   // 调用，也不走 buildCompileSteps 的单次链接。当前产出 macOS application
