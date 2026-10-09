@@ -3,7 +3,7 @@
 import { lex, isKeyword } from './lexer.ts';
 import type { Token } from './lexer.ts';
 import type {
-  Program, Stmt, Expr, Param, ASType, ClassMember, Block, SwitchCase, Visibility, InterfaceMethod, Metadata,
+  Program, Stmt, Expr, Param, ASType, ClassMember, Block, SwitchCase, Visibility, InterfaceMethod, Metadata, CatchClause,
 } from './ast.ts';
 
 const TYPE_KEYWORDS = new Set(['int', 'uint', 'Number', 'Boolean', 'String', 'void', 'Array', 'Function']);
@@ -25,6 +25,9 @@ function flattenTopLevelBlocks(body: Stmt[]): Stmt[] {
 
 
 const BIN_PREC: Record<string, number> = {
+  // `??` binds looser than every other binary operator (JS puts null-coalescing
+  // below `||`; `a ?? b || c` therefore parses as `a ?? (b || c)`).
+  '??': 0,
   '||': 1,
   '&&': 2,
   '|': 3,
@@ -77,8 +80,17 @@ class Parser {
     return this.tokens[this.pos++];
   }
 
+  // Match the current token against an expected value. The token `value` alone is
+  // NOT an identity: the string literal `"]"` carries the same `value` as the `]`
+  // symbol, so a bare value comparison made `[ "]" ]` look like an empty array
+  // (and let `[ "[" ]` pass by luck), and a stray `"]"` in any token stream could
+  // masquerade as a terminator. Word-like values (`function`, `package`, …) are
+  // always `ident` tokens (this lexer has no separate keyword kind); every other
+  // value is a `symbol`. Require the matching kind so only the real token matches.
   private at(value: string): boolean {
-    return this.peek().value === value;
+    const t = this.peek();
+    const word = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value);
+    return t.value === value && t.kind === (word ? 'ident' : 'symbol');
   }
 
   private atIdent(name: string): boolean {
@@ -209,17 +221,39 @@ class Parser {
     const saved = this.currentPackage;
     this.currentPackage = pkg;
     while (!this.at('}') && this.peek().kind !== 'eof') {
+      const before = this.pos;
       if (this.atIdent('import')) {
         this.parseImport();
       } else if (this.at('[')) {
-        // Flash metadata at package level ([SWF(...)], [Frame(...)], etc.). These
-        // configure the .swf (size/framerate/background) and have no runtime
-        // effect for the AOT translation, so they are parsed and discarded. At
-        // package level a leading '[' is always metadata (there is no array-literal
-        // statement here), so we consume it unconditionally instead of backtracking.
+        // Flash metadata at package level ([SWF(...)], [Frame(...)], etc.) configures
+        // the .swf (size/framerate/background) and has no runtime effect for the AOT
+        // translation, so it is parsed and discarded. At package level a leading '['
+        // is always metadata (there is no array-literal statement here), so we
+        // consume it unconditionally instead of backtracking.
+        //
+        // BUT: declaration metadata ([WasmExport], [Embed], ...) must not be thrown
+        // away with it — `package p { [WasmExport] function f() {} }` silently lost
+        // the export because this branch ate the metadata before the declaration
+        // was parsed. So consume the block, then rewind and let parseStatement()
+        // handle the whole `[meta] decl` when a declaration actually follows.
+        const save = this.pos;
         this.parseMetadataIfPresent(false);
+        const nxt = this.peek();
+        if (nxt.kind === 'ident' && METADATA_DECL.has(nxt.value)) {
+          this.pos = save;
+          body.push(this.parseStatement());
+        }
       } else {
         body.push(this.parseStatement());
+      }
+      // Loop-progress sentinel: every branch above must consume at least one
+      // token. The metadata branch can rewind to its start when parsing fails
+      // (parseMetadataIfPresent restores `pos` on an unexpected literal), which
+      // would leave `[` as the current token forever — a silent infinite loop.
+      // Report a syntax error instead (AGENTS.md §2.5: never hang, never
+      // swallow); a hang is far harder to diagnose than a positioned error.
+      if (this.pos === before) {
+        throw new ParseError(`unexpected token '${this.peek().value}' in package body`, this.peek());
       }
     }
     this.expect('}');
@@ -228,7 +262,20 @@ class Parser {
 
   // ---- statements ----
 
+  // Every statement (top level, block, loop body, class body via parseStatement at
+  // the top level, ...) funnels through here, so this is the one choke point where
+  // the starting token is still known. Stamp the position onto the node so the
+  // semantic layer can point a `CodegenError` at the offending construct
+  // (AGENTS.md §2.5). Nodes built by a wrapper (e.g. a Block returned for `;`) just
+  // get the position of the token the statement started at.
   private parseStatement(): Stmt {
+    const t = this.peek();
+    const node = this.parseStatementInner();
+    if (node.line === undefined) { node.line = t.line; node.col = t.col; }
+    return node;
+  }
+
+  private parseStatementInner(): Stmt {
     const t = this.peek();
 
     if (t.kind === 'symbol') {
@@ -263,6 +310,7 @@ class Parser {
       if (t.value === 'const') return this.parseConstDeclStmt();
       if (t.value === 'if') return this.parseIf();
       if (t.value === 'while') return this.parseWhile();
+      if (t.value === 'with') return this.parseWith();
       if (t.value === 'do') return this.parseDoWhile();
       if (t.value === 'for') return this.parseFor();
       if (t.value === 'switch') return this.parseSwitch();
@@ -323,6 +371,7 @@ class Parser {
         this.next(); // '['
         const name = this.expectIdent().value;
         const args: string[] = [];
+        const named: Record<string, string> = {};
         if (this.at('(')) {
           this.next();
           if (!this.at(')')) {
@@ -330,14 +379,24 @@ class Parser {
               // Flash metadata uses either positional args (`[WasmExport("x")]`) or
               // named args (`[SWF(width = "1000")]`, `[Embed(source="a.png")]`).
               // Both are collected as raw strings for later filtering; the `key =`
-              // prefix is dropped so the value is what gets recorded.
+              // prefix is dropped from `args` so the value is what gets recorded
+              // positionally, and KEPT in `named` — `[Embed]` is keyed metadata
+              // (`source`/`mimeType`), so a consumer that only sees values cannot
+              // tell `source` from `mimeType`.
+              // Metadata arguments are literals: strings, identifiers/keywords
+              // (`true`, `null`, an unquoted enum name) or numbers. Flash metadata
+              // routinely uses unquoted numbers — `[SWF(frameRate = 60)]` — and
+              // rejecting them used to abort the whole metadata block (which at
+              // package level then spun the loop; see parsePackage).
               const a = this.next();
-              if (a.kind === 'str' || a.kind === 'ident') {
+              if (a.kind === 'str' || a.kind === 'ident' || a.kind === 'num') {
                 if (this.at('=')) {
-                  this.next(); // '=' (drop the key)
+                  this.next(); // '='
                   const v = this.next();
-                  if (v.kind === 'str' || v.kind === 'ident') args.push(v.value);
-                  else throw new ParseError(`expected metadata value but found '${v.value}'`, v);
+                  if (v.kind === 'str' || v.kind === 'ident' || v.kind === 'num') {
+                    args.push(v.value);
+                    named[a.value] = v.value;
+                  } else throw new ParseError(`expected metadata value but found '${v.value}'`, v);
                 } else {
                   args.push(a.value);
                 }
@@ -349,7 +408,7 @@ class Parser {
           this.expect(')');
         }
         this.expect(']');
-        list.push({ name, args });
+        list.push(Object.keys(named).length > 0 ? { name, args, named } : { name, args });
       }
       const nxt = this.peek();
       if (requireDecl && !(nxt.kind === 'ident' && METADATA_DECL.has(nxt.value))) {
@@ -385,7 +444,7 @@ class Parser {
     }
     if (this.at('=')) {
       this.next();
-      init = this.parseExpression();
+      init = this.parseAssignment(); // a separator context: no comma operator
     }
     return { name, type, init };
   }
@@ -420,7 +479,7 @@ class Parser {
         type = this.parseType();
       }
       this.expect('='); // const must have an initializer
-      const init = this.parseExpression();
+      const init = this.parseAssignment();
       decls.push({ name, type, init });
       if (this.at(',')) this.next();
       else break;
@@ -450,6 +509,17 @@ class Parser {
     this.expect(')');
     const body = this.parseStatement();
     return { kind: 'While', cond, body };
+  }
+
+  // `with (object) statement` — pure syntax here; all of the (very specific)
+  // object-scope resolution semantics live in the codegen semantic layer.
+  private parseWith(): Stmt {
+    this.expect('with');
+    this.expect('(');
+    const obj = this.parseExpression();
+    this.expect(')');
+    const body = this.parseStatement();
+    return { kind: 'With', obj, body };
   }
 
   private parseDoWhile(): Stmt {
@@ -616,29 +686,31 @@ class Parser {
   private parseTry(): Stmt {
     this.expect('try');
     const tryBody = this.parseBlock();
-    let catchVar: string | null = null;
-    let catchType: ASType | null = null;
-    let catchBody: Block | null = null;
-    if (this.atIdent('catch')) {
+    // AS3 allows any number of catch clauses; they are tried in source order and
+    // the first whose type matches handles the exception. A `try` may also have
+    // only a `finally`.
+    const catches: CatchClause[] = [];
+    while (this.atIdent('catch')) {
       this.next();
       this.expect('(');
-      catchVar = this.expectIdent().value;
+      const varName = this.expectIdent().value;
+      let type: ASType | null = null;
       if (this.at(':')) {
         this.next();
-        catchType = this.parseType();
+        type = this.parseType();
       }
       this.expect(')');
-      catchBody = this.parseBlock();
+      catches.push({ varName, type, body: this.parseBlock() });
     }
     let finallyBody: Block | null = null;
     if (this.atIdent('finally')) {
       this.next();
       finallyBody = this.parseBlock();
     }
-    if (catchBody === null && finallyBody === null) {
+    if (catches.length === 0 && finallyBody === null) {
       throw new ParseError("'try' must be followed by 'catch' or 'finally'", this.peek());
     }
-    return { kind: 'Try', tryBody, catchVar, catchType, catchBody, finallyBody };
+    return { kind: 'Try', tryBody, catches, finallyBody };
   }
 
   private parseSuperStmt(): Stmt {
@@ -652,7 +724,7 @@ class Parser {
     this.expect('(');
     const args: Expr[] = [];
     while (!this.at(')')) {
-      args.push(this.parseExpression());
+      args.push(this.parseAssignment()); // separator context: no comma operator
       if (this.at(',')) this.next();
     }
     this.expect(')');
@@ -669,19 +741,20 @@ class Parser {
         isRest = true;
       }
       const name = this.expectIdent().value;
-      let type: ASType;
+      // An untyped parameter (`function f(_callObject) {}`) is AS3's `*`: the C
+      // type is the boxed `any`. mxmlc 51.4.1 accepts the form (with an implicit
+      // "untyped" warning), so this is a compatibility gap, not an enhancement.
+      let type: ASType = 'any';
       if (this.at(':')) {
         this.next();
         type = this.parseType();
       } else if (isRest) {
         type = 'Array'; // `...rest` is implicitly an Array
-      } else {
-        throw new ParseError(`expected ':' in parameter '${name}'`, this.peek());
       }
       let defaultValue: Expr | null = null;
       if (this.at('=')) {
         this.next();
-        defaultValue = this.parseExpression();
+        defaultValue = this.parseAssignment();
       }
       params.push({ name, type, defaultValue, isRest });
       if (this.at(',')) {
@@ -717,13 +790,33 @@ class Parser {
     const implementsList: string[] = [];
     if (this.atIdent('implements')) {
       this.next();
-      do {
+      for (;;) {
         implementsList.push(this.expectIdent().value);
-      } while (this.at(','));
+        if (this.at(',')) { this.next(); continue; }
+        break;
+      }
     }
     this.expect('{');
     const members: ClassMember[] = [];
     while (!this.at('}') && this.peek().kind !== 'eof') {
+      // The member's own starting token (modifiers included) -- stamped onto the
+      // member below so a semantic error inside a signature/reference resolves to
+      // the offending member rather than to the whole class.
+      const memberTok = this.peek();
+      const markMember = <T extends ClassMember>(m: T): T => {
+        m.line = memberTok.line; m.col = memberTok.col;
+        return m;
+      };
+      // `import a.b.C;` written INSIDE a class body (a zxing-ported idiom):
+      // recorded like a file-level import so the class's short-name resolution
+      // sees it; it is consumed here so the member loop continues.
+      if (this.atIdent('import')) {
+        this.parseImport();
+        continue;
+      }
+      // A stray `;` between members is tolerated by AS3 (`function get p():Boolean
+      // { return true; };`).
+      if (this.at(';')) { this.next(); continue; }
       // `use namespace starling_internal;` opens a namespace for the rest of the
       // class body. Transparent in AOT (no visibility enforcement) — dropped.
       if (this.atIdent('use')) {
@@ -738,31 +831,54 @@ class Parser {
       let visibility: Visibility = 'public';
       let isStatic = false;
       let isFinal = false;
+      // A namespace qualifier on a class member (e.g. `flash_proxy override
+      // function getProperty`). Transparent in AOT except for Proxy's interceptor
+      // names, so it is recorded on the member rather than merely dropped.
+      let nsQualifier: string | null = null;
+      let modifierCount = 0;
       while (true) {
         if (this.atIdent('public') || this.atIdent('private') || this.atIdent('protected') || this.atIdent('internal')) {
           visibility = this.next().value as Visibility;
+          modifierCount++;
         } else if (this.atIdent('static')) {
           this.next(); isStatic = true;
+          modifierCount++;
         } else if (this.atIdent('final')) {
           this.next(); isFinal = true;
+          modifierCount++;
         } else if (this.atIdent('override')) {
           this.next(); // override is handled implicitly via the vtable slot
+          modifierCount++;
         } else if (this.isNamespaceModifier()) {
-          this.next(); // namespace qualifier (e.g. starling_internal) — dropped
+          nsQualifier = this.peek().value;
+          this.next(); // namespace qualifier (e.g. starling_internal, flash_proxy)
+          modifierCount++;
         } else {
           break;
         }
       }
 
-      if (this.atIdent('var') || this.atIdent('const')) {
+      if (this.at('{')) {
+        // A bare block in a class body is AS3's static initializer. Only static
+        // initializers are legal there, so every class-body block is one; its
+        // statements run once as part of the class's static initialization.
+        const body = this.parseBlock();
+        members.push(markMember({ kind: 'StaticInit', body }));
+      } else if (this.atIdent('var') || this.atIdent('const')) {
         const isConst = this.next().value === 'const';
-        const fName = this.expectIdent().value;
-        let type: ASType | null = null;
-        if (this.at(':')) { this.next(); type = this.parseType(); }
-        let init: Expr | null = null;
-        if (this.at('=')) { this.next(); init = this.parseExpression(); }
+        // AS3 allows several declarators in ONE class-body field declaration
+        // (`private var _r:Number = 0, _g:Number = 0, _b:Number = 0;`, the
+        // Away3D material-method idiom). Each declarator becomes its own Field,
+        // sharing the modifiers already consumed above. `parseVarDeclarator` is
+        // the same leading-`var`-already-consumed primitive the statement form
+        // uses, so `var a:T, b:U = v;` parses identically in both positions.
+        while (true) {
+          const { name: fName, type, init } = this.parseVarDeclarator();
+          members.push(markMember({ kind: 'Field', name: fName, type, init, visibility, isStatic, isConst, metadata: memberMetadata }));
+          if (!this.at(',')) break;
+          this.next();
+        }
         this.consumeSemicolon();
-        members.push({ kind: 'Field', name: fName, type, init, visibility, isStatic, isConst });
       } else if (this.atIdent('function')) {
         this.expect('function');
         let isGetter = false;
@@ -785,7 +901,7 @@ class Parser {
             this.parseType();
           }
           const body = this.parseBlock();
-          members.push({ kind: 'Constructor', params, body });
+          members.push(markMember({ kind: 'Constructor', params, body }));
         } else {
           let returnType: ASType = 'void';
           if (this.at(':')) {
@@ -793,8 +909,24 @@ class Parser {
             returnType = this.parseType();
           }
           const body = this.parseBlock();
-          members.push({ kind: 'Method', name: mName, params, returnType, body, visibility, isStatic, isFinal, isGetter, isSetter, metadata: memberMetadata });
+          members.push(markMember({ kind: 'Method', name: mName, params, returnType, body, visibility, isStatic, isFinal, isGetter, isSetter, metadata: memberMetadata, ns: nsQualifier ?? undefined }));
         }
+      } else if (modifierCount === 0) {
+        // A BARE STATEMENT in a class body is legal AS3: it is an unbraced static
+        // initializer, running in declaration order with the static field
+        // initializers. Measured on mxmlc 51.4.1 (temp/unbraced/U.as):
+        // `class U { static const v:Number = 1; String.fromCharCode(65); }`
+        // compiles, and a bare `x = 1;` fails only because the NAME is undefined,
+        // never as a syntax error. greensock's TweenMax.as is the real case
+        // (`TweenPlugin.activate([...]);` between two static fields).
+        //
+        // Every member declaration begins with a modifier, `function`, `var`,
+        // `const` or `{` — all consumed above — so with no modifier read, anything
+        // else here must be a statement. A modifier followed by junk stays a hard
+        // error, keeping the precise "unexpected token in class body" message for
+        // genuinely malformed members (`public 3;`).
+        const stmt = this.parseStatement();
+        members.push(markMember({ kind: 'StaticInit', body: { kind: 'Block', body: [stmt] } }));
       } else {
         throw new ParseError(`unexpected token '${this.peek().value}' in class body`, this.peek());
       }
@@ -806,6 +938,16 @@ class Parser {
   private parseInterfaceDecl(): Stmt {
     this.expect('interface');
     const name = this.expectIdent().value;
+    // `interface I extends A, B { }` — AS3 allows multiple parent interfaces.
+    const extendsList: string[] = [];
+    if (this.atIdent('extends')) {
+      this.next();
+      for (;;) {
+        extendsList.push(this.expectIdent().value);
+        if (this.at(',')) { this.next(); continue; }
+        break;
+      }
+    }
     this.expect('{');
     const methods: InterfaceMethod[] = [];
     while (!this.at('}') && this.peek().kind !== 'eof') {
@@ -832,13 +974,31 @@ class Parser {
       methods.push({ name: mName, params, returnType, isGetter, isSetter });
     }
     this.expect('}');
-    return { kind: 'InterfaceDecl', name, packageName: this.currentPackage, methods, imports: this.imports.slice(), fileId: null };
+    return { kind: 'InterfaceDecl', name, packageName: this.currentPackage, extendsList, methods, imports: this.imports.slice(), fileId: null };
   }
 
   // ---- expressions ----
 
   parseExpression(): Expr {
-    return this.parseAssignment();
+    return this.parseComma();
+  }
+
+  // The comma operator (ES3 §11.14): `a, b` evaluates `a` for its side effects and
+  // yields `b`. It sits at the very bottom of the expression grammar, so ONLY the
+  // contexts that accept a full `Expression` use parseExpression: expression
+  // statements, `for` init/cond/update, `if`/`while`/`switch` heads, `return`/
+  // `throw` values, and parenthesised groups. Every separator context (argument
+  // lists, array/object literals, parameter defaults, var/const initialisers)
+  // takes a single AssignmentExpression instead — otherwise `f(a, b)` would parse
+  // as one argument `(a, b)`.
+  private parseComma(): Expr {
+    let left = this.parseAssignment();
+    while (this.at(',')) {
+      this.next();
+      const right = this.parseAssignment();
+      left = { kind: 'Comma', left, right };
+    }
+    return left;
   }
 
   private parseAssignment(): Expr {
@@ -853,7 +1013,7 @@ class Parser {
 
   // Ternary `cond ? a : b` is right-associative and sits just above assignment.
   private parseConditional(): Expr {
-    const cond = this.parseBinary(1);
+    const cond = this.parseBinary(0); // 0 admits `??`, the loosest binary operator
     if (this.at('?')) {
       this.next();
       const then = this.parseAssignment();
@@ -873,7 +1033,12 @@ class Parser {
         if (prec === undefined || prec < minPrec) break;
         this.next();
         const right = this.parseBinary(prec + 1); // left-associative
-        left = { kind: 'Binary', op: t.value, left, right };
+        // `??` is a distinct node: its right operand is evaluated only when the
+        // left is null/undefined (short-circuit), so it cannot go through the
+        // ordinary arithmetic/comparison Binary path.
+        left = t.value === '??'
+          ? { kind: 'NullCoalesce', left, right }
+          : { kind: 'Binary', op: t.value, left, right };
       } else if (t.kind === 'ident' && (t.value === 'is' || t.value === 'as')) {
         // `is` / `as` are relational-level operators (same precedence as < <= > >=).
         const prec = 7;
@@ -925,13 +1090,42 @@ class Parser {
   private parsePostfix(): Expr {
     let expr = this.parsePrimary();
     while (true) {
-      if (this.at('.')) {
+      if (this.at('..')) {
+        // E4X descendant accessor: `x..name` collects every descendant of x (any
+        // depth, x itself excluded) whose local name is `name`; `x..*` collects
+        // all of them. `..` is its own token, so it never collides with the `.`
+        // member access below.
+        this.next();
+        let name = '*';
+        if (this.at('*')) this.next();
+        else {
+          name = this.expectIdent().value;
+          // `x..ns::name` — the descendant axis over a NAMESPACE-QUALIFIED local
+          // name. Like every other `ns::` form, the qualifier is transparent in the
+          // AOT translation, so `x..ns::name` becomes `x..name` (DAEParser does this
+          // throughout: `_doc.._ns::scene`).
+          if (this.at('::')) {
+            this.next();
+            name = this.expectIdent().value;
+          }
+        }
+        expr = { kind: 'Descendants', object: expr, name };
+      } else if (this.at('.')) {
         if (this.peek(1).value === '@') {
-          // E4X attribute access: expr.@name (only valid on XML/XMLList).
+          // E4X attribute access: expr.@name (only valid on XML/XMLList). The name
+          // may also be computed: `expr.@[expr]` (adl 51.4.1 accepts it and it
+          // behaves exactly like the literal form -- temp/nsbracket/ case P/Q).
           this.next(); // '.'
           this.next(); // '@'
-          const attr = this.expectIdent().value;
-          expr = { kind: 'AttrAccess', object: expr, name: attr };
+          if (this.at('[')) {
+            this.next();
+            const index = this.parseExpression();
+            this.expect(']');
+            expr = { kind: 'E4xName', object: expr, index, attr: true };
+          } else {
+            const attr = this.expectIdent().value;
+            expr = { kind: 'AttrAccess', object: expr, name: attr };
+          }
         } else if (this.peek(1).value === '(') {
           // E4X filter predicate: expr.(@attr == value). Starling uses only the
           // @attr == "str" form (asset metadata extraction), so the predicate is
@@ -945,7 +1139,7 @@ class Parser {
           if (opTok.value !== '==' && opTok.value !== '!=') {
             throw new ParseError(`unsupported E4X filter operator '${opTok.value}' (expected == or !=)`, opTok);
           }
-          const value = this.parseExpression();
+          const value = this.parseAssignment();
           this.expect(')');
           expr = { kind: 'Filter', object: expr, attr, op: opTok.value, value };
         } else {
@@ -958,18 +1152,30 @@ class Parser {
         // in the AOT translation (no visibility enforcement), so the qualifier is
         // dropped. `A.ns::m` -> `A.m` (static/member access); `A.B.ns::m` -> `A.B.m`;
         // a bare `ns::m` -> `m` (an unqualified member of the current class).
+        //
+        // The name may also be COMPUTED -- `element.ns::[expr]` (the DAEParser
+        // idiom): the namespace qualifier is dropped the same way, leaving a
+        // child-axis lookup by the runtime-computed local name.
         this.next(); // '::'
-        const member = this.expectIdent().value;
-        if (expr.kind === 'Member') {
-          expr = { kind: 'Member', object: expr.object, property: member };
+        if (this.at('[')) {
+          this.next();
+          const index = this.parseExpression();
+          this.expect(']');
+          const target: Expr = expr.kind === 'Member' ? expr.object : { kind: 'Var', name: 'this' };
+          expr = { kind: 'E4xName', object: target, index, attr: false };
         } else {
-          expr = { kind: 'Var', name: member };
+          const member = this.expectIdent().value;
+          if (expr.kind === 'Member') {
+            expr = { kind: 'Member', object: expr.object, property: member };
+          } else {
+            expr = { kind: 'Var', name: member };
+          }
         }
       } else if (this.at('(')) {
         this.next();
         const args: Expr[] = [];
         while (!this.at(')')) {
-          args.push(this.parseExpression());
+          args.push(this.parseAssignment()); // separator context: no comma operator
           if (this.at(',')) this.next();
         }
         this.expect(')');
@@ -997,9 +1203,15 @@ class Parser {
       return { kind: 'RegExp', pattern: t.value, flags: t.regexFlags ?? '' };
     }
 
+    if (t.kind === 'xml') {
+      // An E4X XML literal, captured verbatim by the lexer; the runtime parses it
+      // into the same node tree `new XML("...")` produces.
+      this.next();
+      return { kind: 'XmlLit', raw: t.value };
+    }
     if (t.kind === 'num') {
       this.next();
-      return { kind: 'Num', value: t.num!, isInt: t.isInt! };
+      return { kind: 'Num', value: t.num!, isInt: t.isInt!, width: t.width, raw: t.value };
     }
     if (t.kind === 'str') {
       this.next();
@@ -1028,7 +1240,7 @@ class Parser {
         this.next();
         return { kind: 'Var', name: t.value };
       }
-      if (!isKeyword(t.value)) {
+      if (!isKeyword(t.value) || t.value === 'get' || t.value === 'set') {
         this.next();
         return { kind: 'Var', name: t.value };
       }
@@ -1054,7 +1266,7 @@ class Parser {
     this.expect('[');
     const elements: Expr[] = [];
     while (!this.at(']')) {
-      elements.push(this.parseExpression());
+      elements.push(this.parseAssignment()); // separator context: no comma operator
       if (this.at(',')) this.next();
     }
     this.expect(']');
@@ -1065,19 +1277,24 @@ class Parser {
     this.expect('{');
     const fields: { name: string; value: Expr }[] = [];
     while (!this.at('}')) {
-      // AS3 object literals allow both identifier keys (`{ x: 1 }`) and string
-      // keys (`{ "bytes4": 4 }`), the latter used by Starling's format-size
-      // tables.
+      // AS3 object literals allow identifier keys (`{ x: 1 }`), string keys
+      // (`{ "bytes4": 4 }`, Starling's format-size tables) and NUMBER keys
+      // (`{ 23 : parseApplicationData }`, hurlant's protocol handler map). A
+      // numeric key is the property name its decimal text calls for (AS3 keys are
+      // strings), so `23` becomes "23".
       const keyTok = this.peek();
       let name: string;
       if (keyTok.kind === 'str') {
         this.next();
         name = keyTok.value;
+      } else if (keyTok.kind === 'num') {
+        this.next();
+        name = String(keyTok.num);
       } else {
         name = this.expectIdent().value;
       }
       this.expect(':');
-      const value = this.parseExpression();
+      const value = this.parseAssignment(); // separator context: no comma operator
       fields.push({ name, value });
       if (this.at(',')) this.next();
     }
@@ -1091,7 +1308,7 @@ class Parser {
     // `new` distinguishes it from `new ClassName(...)`.
     if (this.at('(')) {
       this.next();
-      const classExpr = this.parseExpression();
+      const classExpr = this.parseAssignment();
       this.expect(')');
       const args = this.parseArgList();
       return { kind: 'NewDynamic', classExpr, args };
@@ -1104,10 +1321,10 @@ class Parser {
       this.expect('[');
       const elements: Expr[] = [];
       if (!this.at(']')) {
-        elements.push(this.parseExpression());
+        elements.push(this.parseAssignment());
         while (this.at(',')) {
           this.next();
-          elements.push(this.parseExpression());
+          elements.push(this.parseAssignment());
         }
       }
       this.expect(']');
@@ -1130,15 +1347,44 @@ class Parser {
         className += '.' + this.expectIdent().value;
       }
     }
-    // AS3 permits `new Vector.<T>` without the trailing `()` (the arg list is
-    // optional for the generic Vector constructor form). Every other `new X`
-    // still requires the parens.
-    const args = (isGenericVector && !this.at('(')) ? [] : this.parseArgList();
+    // `new memberExpression(...)`: the class reference is not a literal class name
+    // but a MemberExpression that evaluates to a Class at runtime. AS3's grammar
+    // puts the argument list after the whole member expression, so
+    // `new map[key]()`, `new list[i].cls()` and `new this.parsers[i]()` are all
+    // dynamic instantiations (away3d: `return new _parsers[i]();` in
+    // SingleFileLoader). Detected by the `[` / trailing `.` that the literal-name
+    // path above cannot consume; the parsed name becomes the head of a postfix
+    // chain and the instantiation is emitted as NewDynamic.
+    if (this.at('[') || this.at('.')) {
+      let classExpr: Expr = { kind: 'Var', name: className };
+      const parts = className.split('.');
+      if (parts.length > 1) {
+        classExpr = { kind: 'Var', name: parts[0] };
+        for (let k = 1; k < parts.length; k++) classExpr = { kind: 'Member', object: classExpr, property: parts[k] };
+      }
+      while (this.at('.')) {
+        this.next();
+        classExpr = { kind: 'Member', object: classExpr, property: this.expectIdent().value };
+      }
+      while (this.at('[')) {
+        this.next();
+        const index = this.parseExpression();
+        this.expect(']');
+        classExpr = { kind: 'Index', object: classExpr, index };
+      }
+      const dynArgs = this.at('(') ? this.parseArgList() : [];
+      return { kind: 'NewDynamic', classExpr, args: dynArgs };
+    }
+    // AS3 allows the argument list to be omitted entirely: `new ByteArray` means
+    // `new ByteArray()`. Real-world code relies on it (com.hurlant's MD5 does
+    // `new ByteArray;`), so the parens are optional for every `new X` form.
+    const args = this.at('(') ? this.parseArgList() : [];
     return { kind: 'New', className, args };
   }
 
-  // `Vector.<T>(...)` without `new` — the current token is `Vector`, followed
-  // by `.<`. Desugars to the same New node the `new Vector.<T>()` path emits.
+  // `Vector.<T>(...)` without `new` — AS3's Vector COERCION, not the
+  // `new Vector.<T>(length)` constructor (see the VectorCoerce AST node; the adl
+  // measurements separating the two live in temp/vecconv/).
   private parseVectorCall(): Expr {
     this.next(); // Vector
     this.next(); // '.'
@@ -1146,7 +1392,7 @@ class Parser {
     const elem = this.parseType();
     this.expect('>');
     const args = this.parseArgList();
-    return { kind: 'New', className: `Vector.<${elem}>`, args };
+    return { kind: 'VectorCoerce', elem, args };
   }
 
   // Function expression: `function [name](params):ret { body }`. AS3 allows an

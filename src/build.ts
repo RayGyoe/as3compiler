@@ -25,6 +25,22 @@ export interface BuildConfig {
   package: Package;
   cCompiler: string;
   opt: string;
+  // Debug-info policy (stage 94·29). Off by default, and "off" means the same
+  // thing on every target: the artifact carries no DWARF, exactly like `cc -O2`
+  // on macOS (no __DWARF segment) and `emcc -O2` (measured: a trivial program is
+  // 2010 B with zero custom sections, 28243 B with -g).
+  //
+  // The wasi backend is the only one that does NOT get this for free: wasi-sdk
+  // 34's libc.a ships DWARF and wasm-ld keeps it by default, so even an empty
+  // `int main(void){return 0;}` drags in ~19 KB and a printf program ~62 KB.
+  // With debugInfo=false the wasm link therefore passes `-Wl,--strip-debug` to
+  // restore parity (fib.wasm 421 KB -> 133 KB); the `name` section survives, so
+  // traps still print a named stack — only source-line/variable info is lost.
+  //
+  // debugInfo=true is the opt-in (mirroring `-g` on clang/emcc): every backend
+  // adds `-g`, and the wasm backend stops stripping so DevTools can step through
+  // the AS3-lowered C.
+  debugInfo: boolean;
   // E12: link-time optimization. Off by default so `--build` without a manifest
   // stays byte-for-byte the build it has always been; `-flto` has to be on BOTH
   // the compile and the link step (the compile step emits bitcode, the link step
@@ -40,6 +56,10 @@ export interface BuildConfig {
   pgoDir: string;
   // extra C/C++ source files compiled together with the generated .c
   sources: string[];
+  // .swc libraries whose named bitmap resources are extracted at compile time
+  // and embedded into the generated C (阶段九十五). Paths are resolved relative
+  // to the manifest that declares them.
+  swcPaths: string[];
   includePaths: string[];
   linkLibs: string[];
   linkPaths: string[];
@@ -117,10 +137,12 @@ export function defaultBuildConfig(): BuildConfig {
     package: 'raw',
     cCompiler: 'cc',
     opt: '-O2',
+    debugInfo: false,
     lto: false,
     pgo: '',
     pgoDir: '',
     sources: [],
+    swcPaths: [],
     includePaths: [],
     linkLibs: [],
     linkPaths: [],
@@ -149,10 +171,12 @@ interface ManifestFields {
   package?: 'raw' | 'xcode-project' | 'android-project' | 'web';
   'c-compiler'?: string;
   opt?: string;
+  'debug-info'?: boolean;
   lto?: boolean;
   pgo?: 'generate' | 'use';
   'pgo-dir'?: string;
   sources?: string[];
+  'swc-paths'?: string[];
   'include-paths'?: string[];
   'link-libs'?: string[];
   'link-paths'?: string[];
@@ -194,7 +218,8 @@ const TARGET_LAYER_FIELDS: ReadonlySet<string> = new Set([
   'c-compiler', 'opt', 'sources', 'include-paths', 'link-libs', 'link-paths',
   'defines', 'features', 'objects', 'frameworks', 'exports', 'font-urls',
   'preload-paths', 'preload-excludes',
-  'lto', 'pgo', 'pgo-dir',
+  'debug-info', 'lto', 'pgo', 'pgo-dir',
+  'swc-paths',
   'bundle-id', 'display-name', 'icon', 'deployment-target',
 ]);
 
@@ -228,10 +253,12 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m.package) next.package = m.package;
   if (m['c-compiler']) next.cCompiler = m['c-compiler'];
   if (m.opt) next.opt = m.opt;
+  if (m['debug-info'] !== undefined) next.debugInfo = m['debug-info'];
   if (m.lto !== undefined) next.lto = m.lto;
   if (m.pgo) next.pgo = m.pgo;
   if (m['pgo-dir']) next.pgoDir = resolveFromManifest(manifestPath, m['pgo-dir']);
   if (m.sources) next.sources = [...cfg.sources, ...m.sources.map((p) => resolveFromManifest(manifestPath, p))];
+  if (m['swc-paths']) next.swcPaths = [...cfg.swcPaths, ...m['swc-paths'].map((p) => resolveFromManifest(manifestPath, p))];
   if (m['include-paths']) next.includePaths = [...cfg.includePaths, ...m['include-paths'].map((p) => resolveFromManifest(manifestPath, p))];
   if (m['link-libs']) next.linkLibs = [...cfg.linkLibs, ...m['link-libs']];
   if (m['link-paths']) next.linkPaths = [...cfg.linkPaths, ...m['link-paths'].map((p) => resolveFromManifest(manifestPath, p))];
@@ -302,10 +329,12 @@ export function applyManifestOverlay(cfg: BuildConfig, m: Manifest, manifestPath
   const L = layer;
   if (L['c-compiler']) next.cCompiler = L['c-compiler'];
   if (L.opt) next.opt = L.opt;
+  if (L['debug-info'] !== undefined) next.debugInfo = L['debug-info'];
   if (L.lto !== undefined) next.lto = L.lto;
   if (L.pgo) next.pgo = L.pgo;
   if (L['pgo-dir']) next.pgoDir = resolveFromManifest(manifestPath, L['pgo-dir']);
   if (L.sources) next.sources = L.sources.map((p) => resolveFromManifest(manifestPath, p));
+  if (L['swc-paths']) next.swcPaths = L['swc-paths'].map((p) => resolveFromManifest(manifestPath, p));
   if (L['include-paths']) next.includePaths = L['include-paths'].map((p) => resolveFromManifest(manifestPath, p));
   if (L['link-libs']) next.linkLibs = [...L['link-libs']];
   if (L['link-paths']) next.linkPaths = L['link-paths'].map((p) => resolveFromManifest(manifestPath, p));
@@ -357,13 +386,54 @@ export function perfFlags(cfg: BuildConfig): string[] {
   return out;
 }
 
+// FP flags (stage 96). `-ffp-contract=off` is not an optimisation knob, it is a
+// semantic one: AS3 arithmetic is IEEE double with one rounding per operation,
+// while clang's default (-ffp-contract=on) fuses `a*b+c` into a single
+// multiply-add. Measured consequence: AIR's SoundTransform.pan getter computes
+// `1 - ltl*ltl` and reports 0.2604000000000001 for ltl=0.86; the fused form
+// rounds once and reports 0.2604. The difference is one ULP, but it is a
+// difference in *observable AS3 results*, so the generated C must not be
+// contracted — same reasoning as never passing -ffast-math. It goes on every
+// compile step and the link step of all four builders, like perfFlags.
+export function fpFlags(cfg: BuildConfig): string[] {
+  return ['-ffp-contract=off'];
+}
+
+// Debug-info policy -> compiler flags (stage 94·29). Split by direction so the
+// four command builders cannot drift apart:
+//
+//   `-g` goes on every *compile* step whenever debugInfo is on, so the DWARF
+//   covers our own generated C and not just the prebuilt SDK archives.
+//
+//   `-Wl,--strip-debug` goes on the wasm *link* whenever it is off. This is the
+//   one backend that needs it: wasi-sdk's libc.a ships DWARF and wasm-ld keeps
+//   it by default (measured: an empty program 19 KB, a printf program 62 KB of
+//   debug custom sections). Native keeps no DWARF at -O2 anyway, and emcc -O2
+//   strips by itself, so those two need no counter-flag — only the wasm side.
+//   `--strip-debug` (not `--strip-all`) is deliberate: the `name` section
+//   survives, so traps still print a named stack; only source-line/variable
+//   info is dropped.
+export function debugInfoFlags(cfg: BuildConfig): string[] {
+  return cfg.debugInfo ? ['-g'] : [];
+}
+
+export function wasmStripFlags(cfg: BuildConfig): string[] {
+  return cfg.target === 'wasm' && !cfg.debugInfo ? ['-Wl,--strip-debug'] : [];
+}
+
 // The named enhancement switches and the opt-in macro each one turns on.
 //
 // Every entry here is an AIR-superset capability (§1.5): `adl` errors or has no
 // such feature, and the macro is what makes the glue take the extra channel. A
 // name only belongs in this table once the channel actually EXISTS end to end -
-// listing E2 (`lottie`) or E4 (`raw`) now would hand the user a switch that
-// silently does nothing, which is worse than no switch at all.
+// listing E2 (`lottie`) now would hand the user a switch that silently does
+// nothing, which is worse than no switch at all.
+//
+// `formats`/`raw` (E3/E4) are the DEFAULT-DENY pair: our Skia carries those
+// codecs, but AIR reports #2124 for them, so the glue refuses the families by
+// magic byte unless the macro is defined. The switch is therefore load-bearing
+// in both directions - the build banner names it, and without it the runtime
+// behaves exactly like adl.
 //
 // `svg` (E1): teaches the four image-decode entry points in vendor/skia_glue.cc
 // to fall back to SkSVGDOM after every SkCodec format fails. The libraries it
@@ -380,6 +450,24 @@ const FEATURES: Readonly<Record<string, { macro: string; targets: readonly Targe
     macro: 'ASC_USE_SVG=1',
     targets: ['native'],
     why: 'the wasm Skia is built with skia_use_expat=false (no svg/sksg/expat archives to link)',
+  },
+  // `formats` (E3): WebP / BMP / ICO. Our Skia carries those codecs on BOTH
+  // backends, but AIR decodes only JPG/PNG/GIF (adl 51.4.1 answers #2124 for the
+  // other three), so the default build refuses them by magic byte and the switch
+  // opens the channel. No extra library is involved, hence both targets.
+  formats: {
+    macro: 'ASC_ALLOW_EXTRA_FORMATS=1',
+    targets: ['native', 'wasm'],
+    why: '',
+  },
+  // `raw` (E4): camera RAW / DNG via SkRawCodec (piex + dng_sdk). Native only --
+  // the wasm Skia ships no piex/dng_sdk archive at all (nm: zero SkRawDecoder
+  // symbols), so a web build that asked for it would fail at link time. Naming
+  // the missing archive is the point (§1.5: state the cross-backend gap).
+  raw: {
+    macro: 'ASC_ALLOW_RAW_FORMATS=1',
+    targets: ['native'],
+    why: 'the wasm Skia has no piex/dng_sdk archive (zero SkRawDecoder symbols), so camera RAW/DNG cannot be linked there',
   },
 };
 
@@ -489,6 +577,8 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
     // them, which is why a plain wasm build linked fine before this existed.
     args.push('-mllvm', '-wasm-enable-sjlj', cfg.opt);
     for (const f of perfFlags(cfg)) args.push(f);
+    for (const f of fpFlags(cfg)) args.push(f);
+    for (const f of debugInfoFlags(cfg)) args.push(f);
     const setjmpLib = wasiSetjmpLib();
     if (setjmpLib) args.push('-mllvm', '-wasm-use-legacy-eh=false');
     // Export the requested C symbols so the host calls them directly (no
@@ -496,9 +586,15 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
     // re-entrant for the instance lifetime as long as they do not depend on
     // libc state that _start's ctors would have set up.
     for (const e of cfg.exports) args.push(`-Wl,--export=${e}`);
+    // Strip the SDK libc's DWARF unless the user opted into debug info (see
+    // wasmStripFlags). Placed on the link side, after every object/export flag.
+    for (const f of wasmStripFlags(cfg)) args.push(f);
     args.push('-o', outPath);
   } else {
-    args.push(cfg.opt, ...perfFlags(cfg), '-lm', '-lz', '-o', outPath);
+    args.push(cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg));
+    for (const l of posixLinkLibs()) args.push(l);
+    for (const l of platformLinkLibs()) args.push('-l', l);
+    args.push('-o', outPath);
   }
 
   args.push(cPath);
@@ -514,6 +610,31 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
   if (cfg.target === 'wasm' && wasiSetjmpLib()) args.push('-lsetjmp');
 
   return [cc, ...args];
+}
+
+// -lm (libm) and -lz (zlib) are POSIX library NAMES: clang translates `-lm` into
+// the input `m.lib` on the MSVC target, and neither m.lib nor a system z.lib
+// exists on Windows. Math comes from the CRT there (linked by default) and zlib
+// from Skia's own bundled `zlib` target, which the manifest already lists. So the
+// pair is emitted only on the POSIX targets. Order is preserved relative to the
+// rest of the line: these still land after the flags and before -L/-l.
+function posixLinkLibs(): string[] {
+  if (process.platform === 'win32') return [];
+  return ['-lm', '-lz'];
+}
+
+// Extra platform link libraries for the NATIVE targets. iconv is what the
+// multi-byte charset codec (stage 94-4) needs: macOS keeps it in a separate
+// libiconv (so the linker needs -liconv), Linux/BSD ship it inside libc (no
+// flag), and the wasm backends have none at all -- there the generated C drops
+// the iconv path entirely via AS_HAVE_ICONV, and adding -liconv would fail the
+// link, so this list is deliberately empty for wasm/web. Windows is in the same
+// boat as wasm (no <iconv.h> in the CRT, and no libiconv in vendor/), so it takes
+// no flag here either -- see AS_HAVE_ICONV in runtime.ts, which is what makes the
+// Windows build report the unsupported charsets loudly instead of mis-encoding.
+function platformLinkLibs(): string[] {
+  if (process.platform !== 'darwin') return [];
+  return ['iconv'];
 }
 
 // A source file compiled as C++ (Skia glue layer, etc.). Objective-C++ (.mm)
@@ -556,7 +677,7 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
   // wasm-ld with "unknown file type" (stage 89-32). The web path now suffixes
   // `.wasm.o` (see buildWebCompileSteps) so both sets coexist.
   const objOf = (src: string): string => src.replace(/\.[^.]+$/, '.o');
-  const compileCommon: string[] = [cfg.opt, ...perfFlags(cfg)];
+  const compileCommon: string[] = [cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const d of effectiveDefines(cfg)) compileCommon.push('-D', d);
   for (const p of cfg.includePaths) compileCommon.push('-I', p);
 
@@ -572,14 +693,14 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
     steps.push([cxx, '-c', '-std=c++17', ...compileCommon, f, '-o', objOf(f)]);
   }
   // 3) link everything with the C++ driver (pulls in libstdc++).
-  const linkArgs: string[] = [cxx, cfg.opt, ...perfFlags(cfg), '-o', outPath];
+  const linkArgs: string[] = [cxx, cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg), '-o', outPath];
   for (const f of cFiles) linkArgs.push(objOf(f));
   for (const f of cppFiles) linkArgs.push(objOf(f));
   for (const o of cfg.objects) linkArgs.push(o);
   for (const p of cfg.linkPaths) linkArgs.push('-L', p);
   for (const l of cfg.linkLibs) linkArgs.push('-l', l);
-  linkArgs.push('-lm');
-  linkArgs.push('-lz');
+  linkArgs.push(...posixLinkLibs());
+  for (const l of platformLinkLibs()) linkArgs.push('-l', l);
   for (const f of cfg.frameworks) linkArgs.push('-framework', f);
   steps.push(linkArgs);
 
@@ -726,7 +847,7 @@ export function buildWebCompileSteps(cfg: BuildConfig, cPath: string, base: stri
   const objSuffix = cfg.target === 'wasm' ? '.wasm.o' : '.o';
   const objOf = (src: string): string => src.replace(/\.[^.]+$/, objSuffix);
 
-  const compileCommon: string[] = [cfg.opt, ...perfFlags(cfg)];
+  const compileCommon: string[] = [cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const d of effectiveDefines(cfg)) compileCommon.push('-D', d);
   for (const p of cfg.includePaths) compileCommon.push('-I', p);
   // USE_ZLIB must be on the *compile* steps too (not just the link): the
@@ -749,7 +870,7 @@ export function buildWebCompileSteps(cfg: BuildConfig, cPath: string, base: stri
     steps.push([emcc, '-c', '-std=c++17', ...compileCommon, '-D', 'SK_TRIVIAL_ABI=[[clang::trivial_abi]]', f, '-o', objOf(f)]);
   }
 
-  const linkArgs: string[] = [emcc, cfg.opt, ...perfFlags(cfg)];
+  const linkArgs: string[] = [emcc, cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const f of cFiles) linkArgs.push(objOf(f));
   for (const f of cppFiles) linkArgs.push(objOf(f));
   for (const o of cfg.objects) linkArgs.push(o);

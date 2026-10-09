@@ -1,0 +1,62 @@
+{
+  "target": "native",
+  "c-compiler": "clang",
+  "opt": "-O2",
+  "sources": [
+    "../vendor/skia_glue.cc",
+    "../vendor/audio_glue.c"
+  ],
+  "include-paths": [
+    "../vendor/skia"
+  ],
+  "link-libs": [
+    "skia",
+    "skparagraph",
+    "skshaper",
+    "skunicode",
+    "skottie",
+    "sksg",
+    "svg",
+    "skresources",
+    "bentleyottmann",
+    "skcms",
+    "wuffs",
+    "png",
+    "jpeg",
+    "webp",
+    "webp_sse41",
+    "dng_sdk",
+    "piex",
+    "expat",
+    "freetype2",
+    "harfbuzz",
+    "icu",
+    "zlib",
+    "z"
+  ],
+  "link-paths": [
+    "../vendor/skia/lib/macos-arm64"
+  ],
+  "frameworks": [
+    "CoreFoundation",
+    "CoreGraphics",
+    "CoreText",
+    "CoreServices",
+    "ApplicationServices",
+    "ImageIO",
+    "Accelerate",
+    "CoreVideo",
+    "Cocoa",
+    "Carbon",
+    "IOKit",
+    "Metal",
+    "QuartzCore",
+    "CoreAudio",
+    "AudioToolbox"
+  ],
+  "defines": [
+    "ASC_USE_SKIA=1",
+    "ASC_HAVE_AUDIO=1"
+  ],
+  "objects": []
+}

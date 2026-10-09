@@ -1,0 +1,4 @@
+{
+  "wasm": "gc_strings.wasm",
+  "exports": []
+}

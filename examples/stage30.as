@@ -1,7 +1,10 @@
 // stage30.as — Array 高阶方法 map/filter/sort/reverse + Array.NUMERIC。
 
 // --- map(callback): 每个元素调用回调，返回新数组 ---
-var m = [1, 2, 3].map(function(x:int) { return x * 2; });
+// map/filter/forEach callbacks receive (element, index, array) -- AIR requires
+// the callback to DECLARE all three; a shorter signature raises #1063 (measured
+// on adl 51.4.1, temp/pkgA/cbk2).
+var m = [1, 2, 3].map(function(x:int, i:int, a:Array):int { return x * 2; });
 trace(m.join(",") == "2,4,6");                    // true
 
 // map 回调接收 (element, index, array) 三参数；用 index 验证序号正确传入
@@ -13,7 +16,7 @@ var m3 = [5, 6].map(function(x:int, i:int, a:Array) { return x + a.length; });
 trace(m3.join(",") == "7,8");                     // true (5+2, 6+2)
 
 // --- filter(callback): 保留回调返回真值的元素 ---
-var f = [1, 2, 3, 4, 5, 6].filter(function(x:int) { return x % 2 == 0; });
+var f = [1, 2, 3, 4, 5, 6].filter(function(x:int, i:int, a:Array):Boolean { return x % 2 == 0; });
 trace(f.join(",") == "2,4,6");                    // true
 
 // --- sort(): 默认按字符串排序 ---
@@ -29,7 +32,7 @@ var s3 = [30, 1, 200, 7].sort(Array.NUMERIC).reverse();
 trace(s3.join(",") == "200,30,7,1");              // true
 
 // --- sort(compareFunction): 自定义比较（降序）---
-var s4 = [30, 1, 200, 7].sort(function(a:int, b:int) { return b - a; });
+var s4 = [30, 1, 200, 7].sort(function(a:int, b:int):int { return b - a; });
 trace(s4.join(",") == "200,30,7,1");              // true
 
 // --- Array.NUMERIC 常量值 ---

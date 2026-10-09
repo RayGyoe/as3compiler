@@ -1,0 +1,14 @@
+{
+  "target": "native",
+  "opt": "-O2",
+  "sources": [
+    "../vendor/audio_glue.c"
+  ],
+  "defines": [
+    "ASC_HAVE_AUDIO=1"
+  ],
+  "frameworks": [
+    "CoreAudio",
+    "AudioToolbox"
+  ]
+}

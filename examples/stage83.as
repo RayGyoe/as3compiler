@@ -69,7 +69,19 @@ check(cube != null, "cube texture created");
 check(cube.width == 4 && cube.height == 4, "cube size");
 var faceBd:BitmapData = new BitmapData(4, 4, false, 0xFF00FF00);
 cube.uploadFromBitmapData(faceBd, Context3DCubeMapFace.POSITIVE_X, 0);
-check(cube.face0 == faceBd, "cube face0 uploaded");
+// A face keeps a SNAPSHOT of level 0's pixels, not a reference to the source:
+// AIR uploads synchronously, while our GPU texture is built at the next submit,
+// so holding the source would read a disposed bitmap (away3d's MipmapGenerator
+// disposes the scratch bitmap one line after uploading it -- that left every
+// face with no pixels and the whole 3D pass invisible). Assert the CONTENT plus
+// the two rules that keep it valid: level > 0 must not overwrite the face, and
+// the face must survive the source's dispose().
+check(cube.face0 != null && cube.face0.getPixel32(0, 0) == 0xFF00FF00, "cube face0 uploaded");
+var faceBd2:BitmapData = new BitmapData(4, 4, false, 0xFF0000FF);
+cube.uploadFromBitmapData(faceBd2, Context3DCubeMapFace.POSITIVE_X, 1);
+check(cube.face0.getPixel32(0, 0) == 0xFF00FF00, "mip level 1 does not overwrite face0");
+faceBd.dispose();
+check(cube.face0.getPixel32(0, 0) == 0xFF00FF00, "face survives the source's dispose");
 check(Context3DCubeMapFace.NEGATIVE_Z == 5, "cube face constant");
 
 var rect:RectangleTexture = ctx.createRectangleTexture(5, 7, Context3DTextureFormat.BGRA, false);

@@ -31,11 +31,14 @@ void sk_gr_flush(void);
 // web never happens — the main loop runs forever).
 static void* g_surface = nullptr;
 static int g_pw = 0, g_ph = 0;
-static void (*g_on_mouse)(double, double, const char*) = nullptr;
-static void (*g_on_wheel)(double, double, double) = nullptr;
-static void (*g_on_redraw)(void) = nullptr;
-static void (*g_on_frame)(void) = nullptr;
-static double (*g_on_frame_delay)(void) = nullptr;
+// Unlike window_glue.cc there is no window registry: a page owns exactly one
+// canvas, so the window id is always 0. The signatures still carry it so the
+// generated C is byte-for-byte identical across the two window backends.
+static void (*g_on_mouse)(int, double, double, const char*) = nullptr;
+static void (*g_on_wheel)(int, double, double, double) = nullptr;
+static void (*g_on_redraw)(int) = nullptr;
+static void (*g_on_frame)(int) = nullptr;
+static double (*g_on_frame_delay)(int) = nullptr;
 
 // Present the Skia surface to the canvas. Two backends, selected at compile
 // time by <renderMode> (efficiency-first — not AIR's "direct = CPU compose +
@@ -147,7 +150,7 @@ static void main_loop(void) {
   }
   g_raf_prev_ms = now;
 
-  double interval = g_on_frame_delay ? g_on_frame_delay() : 16.0;
+  double interval = g_on_frame_delay ? g_on_frame_delay(0) : 16.0;
 #ifdef ASC_FRAME_STATS
   g_fs_loopcalls++;
 #endif
@@ -196,8 +199,8 @@ static void main_loop(void) {
 #ifdef ASC_FRAME_STATS
   double t_frame0 = emscripten_get_now();
 #endif
-  if (g_on_frame) g_on_frame();
-  if (g_on_redraw) g_on_redraw();
+  if (g_on_frame) g_on_frame(0);
+  if (g_on_redraw) g_on_redraw(0);
   present_frame();
 #ifdef ASC_FRAME_STATS
   double t_frame1 = emscripten_get_now();
@@ -233,10 +236,10 @@ static EM_BOOL on_mouse_evt(int eventType, const EmscriptenMouseEvent* e, void* 
   (void)ud;
   if (g_on_mouse == nullptr) return EM_TRUE;
   if (eventType == EMSCRIPTEN_EVENT_MOUSEDOWN && e->button == 0) {
-    g_on_mouse((double)e->targetX, (double)e->targetY, "mouseDown");
+    g_on_mouse(0, (double)e->targetX, (double)e->targetY, "mouseDown");
   } else if (eventType == EMSCRIPTEN_EVENT_MOUSEUP && e->button == 0) {
-    g_on_mouse((double)e->targetX, (double)e->targetY, "mouseUp");
-    g_on_mouse((double)e->targetX, (double)e->targetY, "click");
+    g_on_mouse(0, (double)e->targetX, (double)e->targetY, "mouseUp");
+    g_on_mouse(0, (double)e->targetX, (double)e->targetY, "click");
   }
   return EM_TRUE;
 }
@@ -248,7 +251,7 @@ static EM_BOOL on_mouse_evt(int eventType, const EmscriptenMouseEvent* e, void* 
 // the web backend match the native convention — otherwise scroll direction flips.
 static EM_BOOL on_wheel_evt(int eventType, const EmscriptenWheelEvent* e, void* ud) {
   (void)eventType; (void)ud;
-  if (g_on_wheel) g_on_wheel((double)e->mouse.targetX, (double)e->mouse.targetY, -(double)e->deltaY);
+  if (g_on_wheel) g_on_wheel(0, (double)e->mouse.targetX, (double)e->mouse.targetY, -(double)e->deltaY);
   return EM_TRUE;
 }
 
@@ -282,19 +285,66 @@ int sk_window_get_display_size(int* w, int* h) {
 // paces in whole vsync ticks (see the pacer comment there). Returning a rate
 // would not help — the AS3-side deadline pacer has no way to express "every Nth
 // vsync", which is the only pacing a compositor honors.
-double sk_window_get_display_refresh(void) { return 0.0; }
+double sk_window_get_display_refresh(int win) { (void)win; return 0.0; }
+
+// ---------- display enumeration (flash.display.Screen) ----------
+// A page sees exactly one display: the one its window is on. `bounds` stays the
+// full screen (window.screen.width/height) so it keeps agreeing with
+// Capabilities.screenResolutionX/Y, and `visibleBounds` uses the browser's own
+// "available" rectangle, which already excludes the OS taskbar/dock — the same
+// distinction AIR draws (measured on adl: bounds 0,0 1800x1169 vs visibleBounds
+// 47,39 1753x1130). availLeft/availTop are non-standard but present in Chromium;
+// where they are missing the origin falls back to 0.
+int sk_display_count(void) {
+  return EM_ASM_INT({ return (typeof window !== 'undefined' && window.screen) ? 1 : 0; });
+}
+
+int sk_display_bounds(int i, int* x, int* y, int* w, int* h) {
+  if (i != 0) return 0;
+  int dw = EM_ASM_INT({ return (typeof window !== 'undefined' && window.screen) ? window.screen.width : 0; });
+  int dh = EM_ASM_INT({ return (typeof window !== 'undefined' && window.screen) ? window.screen.height : 0; });
+  if (dw <= 0 || dh <= 0) return 0;
+  if (x) *x = 0;
+  if (y) *y = 0;
+  if (w) *w = dw;
+  if (h) *h = dh;
+  return 1;
+}
+
+int sk_display_usable_bounds(int i, int* x, int* y, int* w, int* h) {
+  if (i != 0) return 0;
+  int ux = EM_ASM_INT({ return (typeof window !== 'undefined' && window.screen && typeof window.screen.availLeft === 'number') ? window.screen.availLeft : 0; });
+  int uy = EM_ASM_INT({ return (typeof window !== 'undefined' && window.screen && typeof window.screen.availTop === 'number') ? window.screen.availTop : 0; });
+  int uw = EM_ASM_INT({ return (typeof window !== 'undefined' && window.screen) ? window.screen.availWidth : 0; });
+  int uh = EM_ASM_INT({ return (typeof window !== 'undefined' && window.screen) ? window.screen.availHeight : 0; });
+  if (uw <= 0 || uh <= 0) return sk_display_bounds(i, x, y, w, h);
+  if (x) *x = ux;
+  if (y) *y = uy;
+  if (w) *w = uw;
+  if (h) *h = uh;
+  return 1;
+}
 
 // Present the Skia raster surface in the canvas and run the rAF frame loop until
 // the page is closed. Mirrors sk_window_show's signature in window_glue.cc so the
 // generated C calls it identically. `w`/`h` are logical size (AIR <width>/<height>),
 // `pw`/`ph` the physical pixel size of the surface (from sk_window_probe_scale).
 int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* title,
-                   int fullscreen, void (*on_mouse)(double, double, const char*),
-                   void (*on_wheel)(double, double, double),
-                   void (*on_redraw)(void), void (*on_frame)(void),
-                   double (*on_frame_delay)(void),
-                   void* (*on_resize)(int, int, int, int, double)) {
+                   int fullscreen, void (*on_mouse)(int, double, double, const char*),
+                   void (*on_wheel)(int, double, double, double),
+                   void (*on_key)(int, const char*, int, int, int),
+                   void (*on_redraw)(int), void (*on_frame)(int),
+                   double (*on_frame_delay)(int),
+                   void* (*on_resize)(int, int, int, int, int, double),
+                   void (*on_close)(int)) {
   (void)on_resize;  // resize not yet wired on web (fixed canvas for now)
+  (void)on_close;   // a page has no window to close; the tab is the window
+  // The keyboard transport is NOT wired on web yet: a page delivers keys through
+  // DOM events on the canvas, whose keyCode/charCode are the browser's, not AIR's,
+  // so they need their own translation table (and a focus model that follows the
+  // DOM). Left unwired on purpose and recorded in TODO.md rather than faked —
+  // silently dropping keys would be a silent capability gap.
+  (void)on_key;
   g_surface = surface;
   g_pw = pw;
   g_ph = ph;
@@ -338,5 +388,77 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   emscripten_set_main_loop(main_loop, 0, 1);
   return 1;  // unreachable (simulate_infinite_loop keeps the loop running)
 }
+
+// ---------- dynamic window API (flash.display.NativeWindow) ----------
+// AIR's NativeWindow is a DESKTOP capability: a browser page cannot open extra
+// OS windows, so there is no way to honour it here. Following the project's rule
+// for platform hard boundaries (never silently degrade), every entry point is
+// present — so the generated C still links — but creation fails, which the AS3
+// side turns into a thrown Error naming the limitation. The alternative
+// (pretending to succeed and drawing into a window nobody can see) would be a
+// silent, undetectable lie.
+int sk_window_create(int w, int h, const char* title, int resizable, int decorated, int highdpi,
+                     int gpu,
+                     void (*on_mouse)(int, double, double, const char*),
+                     void (*on_wheel)(int, double, double, double),
+                     void (*on_key)(int, const char*, int, int, int),
+                     void (*on_redraw)(int),
+                     void (*on_frame)(int),
+                     double (*on_frame_delay)(int),
+                     void* (*on_resize)(int, int, int, int, int, double),
+                     void (*on_close)(int)) {
+  (void)w; (void)h; (void)title; (void)resizable; (void)decorated; (void)highdpi;
+  (void)gpu;
+  (void)on_mouse; (void)on_wheel; (void)on_key; (void)on_redraw; (void)on_frame;
+  (void)on_frame_delay; (void)on_resize; (void)on_close;
+  return -1;
+}
+
+// ---------- clipboard ----------
+// A page's clipboard is asynchronous (navigator.clipboard.writeText returns a
+// Promise) and gated on user activation, so it does not fit the synchronous
+// set/get seam the AS3 side needs. Left unimplemented and declared in TODO.md:
+// on web a copy silently does nothing rather than copying something else.
+void sk_clipboard_set_text(const char* text) { (void)text; }
+int sk_clipboard_get_text(char* buf, int cap) { (void)buf; (void)cap; return 0; }
+void sk_window_attach_surface(int id, void* surface, int pw, int ph) { (void)id; (void)surface; (void)pw; (void)ph; }
+void sk_window_set_visible(int id, int visible) { (void)id; (void)visible; }
+// Cursor shape is the page's business on web (the CSS cursor follows the DOM
+// element under the pointer), so the native cursor kind has no effect here; the
+// stub exists only so a `--package web` build links against the same glue API.
+void sk_window_set_cursor(int id, int kind) { (void)id; (void)kind; }
+int sk_window_get_visible(int id) { (void)id; return 0; }
+void sk_window_set_title(int id, const char* title) { (void)id; (void)title; }
+void sk_window_set_bounds(int id, int x, int y, int w, int h) { (void)id; (void)x; (void)y; (void)w; (void)h; }
+void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h) { (void)id; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; }
+void sk_window_close(int id) { (void)id; }
+int sk_window_is_closed(int id) { (void)id; return 1; }
+void sk_window_activate(int id) { (void)id; }
+void sk_window_minimize(int id) { (void)id; }
+void sk_window_maximize(int id) { (void)id; }
+void sk_window_restore(int id) { (void)id; }
+void sk_window_order_front(int id) { (void)id; }
+void sk_window_order_back(int id) { (void)id; }
+int sk_window_display_index(int id) { (void)id; return 0; }
+void sk_window_get_pixel_size(int id, int* pw, int* ph) { (void)id; if (pw) *pw = 0; if (ph) *ph = 0; }
+void sk_window_get_client_size(int id, int* lw, int* lh) { (void)id; if (lw) *lw = 0; if (lh) *lh = 0; }
+int sk_window_is_active(int id) { (void)id; return 0; }
+void sk_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
+// Composed-text seam (native window_glue.cc drains SDL_TEXTINPUT/SDL_TEXTEDITING
+// through these). On web the whole keyboard transport is unwired — see the note in
+// sk_window_show above — so there is no composed-text queue to drain and no OS
+// candidate window to position. The generated C still calls these every frame
+// under ASC_USE_WINDOW, so web must define them or the link fails; returning
+// "nothing pending" is the honest answer, not a silent capability drop.
+int sk_window_text_take(int id, char* buf, int cap) { (void)id; (void)buf; (void)cap; return 0; }
+int sk_window_text_edit_take(int id, char* buf, int cap, int* start, int* length) {
+  (void)id; (void)buf; (void)cap; (void)start; (void)length; return 0;
+}
+void sk_window_set_text_input_rect(int id, double x, double y, double w, double h) {
+  (void)id; (void)x; (void)y; (void)w; (void)h;
+}
+// The page's canvas is the only window; the generated boot code uses this id for
+// Stage.showWindow, so it must be 0 rather than "none".
+int sk_window_main(void) { return 0; }
 
 }  // extern "C"

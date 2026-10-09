@@ -1,6 +1,6 @@
 {
   "name": "as3compiler",
-  "version": "0.4.25",
+  "version": "0.4.102",
   "description": "A minimal ActionScript 3 subset compiler that transpiles AS to C and produces a native executable.",
   "type": "module",
   "bin": {
@@ -14,7 +14,9 @@
   ],
   "scripts": {
     "compile": "node src/index.ts",
-    "test": "node test.ts"
+    "test": "node test.ts",
+    "test:unit": "node --test test/unit/*.ts",
+    "test:examples": "node --test test/examples.ts"
   },
   "engines": {
     "node": ">=22.6.0"

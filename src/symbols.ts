@@ -7,6 +7,12 @@ import type { Program, ASType, Param, Expr, Visibility, Metadata } from './ast.t
 export type CType =
   | { kind: 'int' }
   | { kind: 'uint' }
+  // 64-bit integers: an opt-in enhancement (AIR has no such types, so accepting
+  // the names can never change how an AIR-valid program compiles). They are
+  // Number subtypes for `is` purposes, like int/uint, but keep full 64-bit width
+  // in their own arithmetic.
+  | { kind: 'int64' }
+  | { kind: 'uint64' }
   | { kind: 'number' }
   | { kind: 'bool' }
   | { kind: 'string' }
@@ -31,9 +37,38 @@ export type CType =
 // two declarations are DISTINCT slots that must not be collapsed into one C
 // member (see expandInheritance). `cName` is undefined until flattening runs for
 // its class, since `name` alone cannot tell whether a collision will occur.
-export interface FieldInfo { type: CType; init: Expr | null; visibility: Visibility; owner: string; isStatic: boolean; isConst: boolean; name?: string; cName?: string; }
-export interface MethodInfo { returnType: CType; params: Param[]; owner: string; visibility: Visibility; isStatic: boolean; isFinal: boolean; isGetter: boolean; isSetter: boolean; metadata?: Metadata[]; }
+export interface FieldInfo { type: CType; init: Expr | null; visibility: Visibility; owner: string; isStatic: boolean; isConst: boolean; name?: string; cName?: string;
+  // TRUE for a built-in property that AIR declares as an ACCESSOR PAIR (`get p` /
+  // `set p`) even though our C representation stores it as a plain field (direct
+  // member access is the faster, semantically-equivalent form). It matters only to
+  // the interface-conformance check and the interface vtable: a class that
+  // inherits e.g. `DisplayObject.y` DOES satisfy an interface's `get y`/`set y`,
+  // while a USER `public var y` does not. Measured on adl 51.4.1 (temp/accprobe*):
+  // `class T extends Sprite implements I{get/set x}` compiles, `extends Sprite`
+  // with `name`/`visible`/`alpha`/`rotation`/`scaleX`/`scaleY`/`blendMode`/
+  // `transform` all compile too, as do the `InteractiveObject` properties; but
+  // `extends Point`/`extends Rectangle` (x is a var), `Event.bubbles`/
+  // `cancelable`/`target` (vars, unlike `Event.type`) and a user `public var` are
+  // all REJECTED by AIR.
+  isAccessor?: boolean; }
+export interface MethodInfo { returnType: CType; params: Param[]; owner: string; visibility: Visibility; isStatic: boolean; isFinal: boolean; isGetter: boolean; isSetter: boolean; metadata?: Metadata[]; isProxyNs?: boolean; ns?: string; }
 export interface FuncInfo { returnType: CType; params: Param[]; metadata?: Metadata[]; }
+
+// The ten interceptor methods of flash.utils.Proxy, which AIR declares in the
+// `flash_proxy` namespace rather than the public one. They are still registered as
+// methods (so `flash_proxy override function ...` passes override checking and
+// fills a vtable slot) but they are NOT public traits: a public-namespace access on
+// a proxy receiver is a MISS that goes through the proxy's own callProperty /
+// getProperty instead (measured on adl 51.4.1: `p.getProperty("x")` on a subclass
+// that overrides everything returns callProperty's value, while on a bare subclass
+// it throws #2090 callProperty — NOT #2088 getProperty). The distinction is kept in
+// the emitted code by storing these reflection-table entries under the mangled name
+// `flash_proxy::<name>`, which as_proxy_invoke looks up but a public dynamic access
+// (`p["getProperty"]`, `p.getProperty`) never matches.
+export const PROXY_NS_METHODS = new Set<string>([
+  'getProperty', 'setProperty', 'deleteProperty', 'hasProperty', 'callProperty',
+  'getDescendants', 'nextNameIndex', 'nextName', 'nextValue', 'isAttribute',
+]);
 
 // A single ordered slot in a class vtable. Methods, getters, and setters share one
 // flattened list so overrides replace an inherited slot in place and new members
@@ -55,7 +90,28 @@ export interface ExportedSymbol {
   params: { name: string; type: CType }[];
 }
 export interface ConstructorInfo { params: Param[]; }
-export interface InterfaceInfo { methods: Map<string, MethodInfo>; importAlias?: Map<string, string>; }
+export interface InterfaceInfo {
+  // Plain methods only (public-namespace traits). Accessors live in their own maps
+  // below: AS3 lets `get x` and `set x` coexist under the SAME name, and a single
+  // name-keyed map let whichever came last in source silently overwrite the other
+  // — `interface ISound3DDriver { function get sourceSound():Sound; function set
+  // sourceSound(v:Sound):void; }` lost the getter, so every read of that property
+  // through the interface threw "setter ... used as a value".
+  methods: Map<string, MethodInfo>;
+  getters: Map<string, MethodInfo>;
+  setters: Map<string, MethodInfo>;
+  importAlias?: Map<string, string>;
+  // Parent interfaces of `interface I extends A, B`, resolved to FQNs. Recorded so
+  // the method maps can be merged transitively and so a class implementing I is
+  // also treated as an instance of every parent.
+  extends?: string[];
+  // AVM2-spelled interface name for user-visible messages (`foo.IFoo` ->
+  // `foo::IFoo`, package-less -> `IFoo`), mirroring the `pkg::Class` shape AIR
+  // prints for a method qname. The map KEY is the sanitized C identifier
+  // (`foo_IFoo`), which must never leak into an error message; without this the
+  // Function-value #1063 path printed `foo_IFoo/m()` instead of an AS3 name.
+  reflectFqn?: string;
+}
 export interface ClassInfo {
   // Instance storage slots, keyed by C member name (see FieldInfo.cName). Exactly
   // one entry per DECLARATION, so a shadowing field appears under its own
@@ -83,6 +139,14 @@ export interface ClassInfo {
   // runtime (AS3 `dynamic class`). The struct gets an extra `as_object* _dyn`
   // slot table and undeclared member access routes through as_dyn_get/set.
   isDynamic?: boolean;
+  // Proxy subclass (`extends flash.utils.Proxy`). Dynamic property access on
+  // such an instance is INTERCEPTED by the ten flash_proxy methods instead of
+  // falling back to the `_dyn` slot table: a miss routes to getProperty /
+  // setProperty / hasProperty / deleteProperty / callProperty, and enumeration
+  // runs the nextNameIndex/nextName/nextValue protocol (measured on adl 51.4.1,
+  // temp/proxyprobe/). The flag is INHERITED along the super chain like
+  // `isDynamic` — AIR's base Proxy methods exist only to throw #2088..#2093 /
+  // #2105..#2107, so a bare `extends Proxy` subclass is a proxy all the same.
   implements: string[];
   packageName: string | null;
   // AS3 fully-qualified class name (`包::类`, e.g. "starling.display::DisplayObject").
@@ -91,6 +155,16 @@ export interface ClassInfo {
   // (which have no package, and are also excluded from the getDefinitionByName
   // registry). Doubles as the "user class" marker for that registry.
   fqn?: string;
+  // The name AIR PRINTS for a class that is not a user class: the `flash.*`
+  // built-ins (measured on adl 51.4.1, temp/pkgA/fqn-result.txt). It feeds the
+  // vtable's reflectable fqn slot -- so TypeError #1034 / #1056 / #1069 messages,
+  // getQualifiedClassName, getQualifiedSuperclassName, describeType and the
+  // Vector element name all spell "flash.display::Sprite" the way AIR does --
+  // while staying SEPARATE from `fqn`, which gates the class-VALUE machinery
+  // (`_cls` objects + the getDefinitionByName registry): built-ins have no
+  // constructor thunk, so marking them with `fqn` would emit `X_cls` objects that
+  // reference a missing `X_new` and fail to link.
+  reflectFqn?: string;
   // Import-aware short-name -> C class key resolution for THIS class's file.
   // Populated from the `import` statements preceding the class, so that
   // `flash.display.Sprite` and `starling.display.Sprite` can coexist across files
@@ -106,7 +180,43 @@ export interface ClassInfo {
   vtableSlots?: VtableSlot[];
 }
 
-export class CodegenError extends Error {}
+// Source position of the construct the semantic layer is CURRENTLY processing.
+//
+// AGENTS.md §2.5: every error must carry a line:col. The semantic layer throws
+// from 150+ sites, most of which are deep inside a walk and have no token in hand.
+// Rather than threading a position through all of them, the emitter/symbols layer
+// publishes the position of the statement/member it is visiting (`setGenPos`,
+// stamped by the parser onto those nodes) and `CodegenError` reads it as its
+// default. A site that DOES know a better position can still pass one explicitly.
+let genLine: number | undefined;
+let genCol: number | undefined;
+
+export function setGenPos(line?: number, col?: number): void {
+  genLine = line;
+  genCol = col;
+}
+
+// The message WITHOUT the `Codegen error at L:C: ` prefix. Callers that inspect or
+// re-wrap a message (the `with` lexical fallback, the constructor-argument
+// rethrow) must work on the bare text -- otherwise the prefix breaks their anchors
+// or gets prepended twice.
+export function codegenBareMessage(error: CodegenError): string {
+  return error.message.replace(/^Codegen error at \d+:\d+: /, '');
+}
+
+export class CodegenError extends Error {
+  line?: number;
+  col?: number;
+  constructor(message: string, line: number | undefined = genLine, col: number | undefined = genCol) {
+    // Same shape as LexError/ParseError (`Lex error at 1:16: ...`), so the CLI's
+    // top-level handler prints a locatable message for all three layers. A throw
+    // from outside any stamped construct keeps the bare message rather than
+    // inventing a position.
+    super(line === undefined ? message : `Codegen error at ${line}:${col}: ${message}`);
+    this.line = line;
+    this.col = col;
+  }
+}
 
 // AS3 source type -> C semantic type. `null` (untyped) defaults to `int`.
 // Interface names resolve to `interface` (a reference = object pointer + vt).
@@ -197,7 +307,16 @@ export const C_RESERVED = new Set<string>([
 // map to distinct C names even when the reserved table alone would alias them
 // (e.g. `exit` and `_exit` both want `__exit`).
 export function sanitizeCIdent(name: string, used?: Set<string>): string {
-  let out = name;
+  // SWF `SymbolClass` linkage names routinely carry CJK identifiers (a
+  // Chinese-authored FLA exports its auto-generated symbols as `元件1_3`). Raw
+  // non-ASCII bytes in a C identifier are only a compiler extension, so escape
+  // every code point above ASCII to `_uXXXX`. Pure-ASCII names — including AS3's
+  // legal `$` — are left byte-identical, so existing output never changes.
+  let out = '';
+  for (const ch of name) {
+    const cp = ch.codePointAt(0) as number;
+    out += cp > 0x7f ? '_u' + cp.toString(16) : ch;
+  }
   while (C_RESERVED.has(out) || (used !== undefined && used.has(out))) out = '_' + out;
   if (used !== undefined) used.add(out);
   return out;
@@ -223,6 +342,8 @@ export function ctypeToString(t: CType): string {
   switch (t.kind) {
     case 'int': return 'int';
     case 'uint': return 'uint';
+    case 'int64': return 'int64';
+    case 'uint64': return 'uint64';
     case 'number': return 'Number';
     case 'bool': return 'Boolean';
     case 'string': return 'String';
@@ -253,6 +374,8 @@ export function resolveType(t: ASType | null, importAlias?: Map<string, string> 
   switch (t) {
     case 'int': return { kind: 'int' };
     case 'uint': return { kind: 'uint' };
+    case 'int64': return { kind: 'int64' };
+    case 'uint64': return { kind: 'uint64' };
     case 'Number': return { kind: 'number' };
     case 'Boolean': return { kind: 'bool' };
     case 'String': return { kind: 'string' };
@@ -289,6 +412,40 @@ export function resolveType(t: ASType | null, importAlias?: Map<string, string> 
   }
 }
 
+// 批次1c — reject a type ANNOTATION that names neither a class nor an interface.
+//
+// `resolveType` is a pure function with no symbol table, so for a name it cannot
+// classify it must answer `{kind:'object', className}`. That used to sail all
+// the way to `cc`, which failed with `error: unknown type name 'Nope'` — no AS3
+// line:col, and no hint that the annotation itself was the problem (measured:
+// `var x: NoSuchType = null;` on the pre-stage compiler). AIR rejects such a
+// program outright, so this is a missing compile-time error, not an enhancement.
+//
+// Callers only pass genuine annotation sites (field/param/return/local/for-each/
+// catch), never a name probe: `rt()` in emit.ts is also used to ask "is this name
+// a class?" (e.g. the `Type(expr)` cast syntax), where an unknown name is legal.
+// A `Vector.<T>` carries its element annotation inside the name, so it recurses
+// to report the ELEMENT type (`Vector.<Nope>` must say `Nope`, not the whole name).
+export function checkTypeAnnotation(
+  t: ASType | null,
+  importAlias: Map<string, string> | null | undefined,
+  known: { hasClass(name: string): boolean; hasInterface(name: string): boolean },
+): void {
+  if (t === null) return;
+  const ct = resolveType(t, importAlias);
+  if (ct.kind === 'vector') {
+    const inner = t.startsWith('Vector.<') ? t.slice('Vector.<'.length, -1) : null;
+    if (inner !== null) checkTypeAnnotation(inner as ASType, importAlias, known);
+    return;
+  }
+  if (ct.kind === 'object' && !known.hasClass(ct.className)) {
+    throw new CodegenError(`unknown type '${t}'`);
+  }
+  if (ct.kind === 'interface' && !known.hasInterface(ct.name)) {
+    throw new CodegenError(`unknown interface '${t}'`);
+  }
+}
+
 // Build an import-aware short-name -> C class-key map for one file's `import`
 // list. Handles `import a.b.C;` (short "C" -> C key of a.b.C) and
 // `import a.b.*;` (every known class in package a.b). flash.* built-ins are keyed
@@ -319,37 +476,83 @@ function buildImportAlias(imports: string[], classMap: Map<string, ClassInfo>): 
 // references resolve, then flatten inheritance for layout-compatible structs.
 export class SymbolTable {
   private classMap = new Map<string, ClassInfo>();
+  // ClassDecl starting position per FQN, so pass-2 walks that only see a class
+  // NAME (expandInheritance) can still publish a CodegenError position.
+  private classPos = new Map<string, { line?: number; col?: number }>();
   private funcMap = new Map<string, FuncInfo>();
   private interfaceMap = new Map<string, InterfaceInfo>();
   private exportList: ExportedSymbol[] = [];
+  // `<class FQN>#<field>` -> generated class FQN, for `[Embed]` fields: an
+  // embedded asset field is declared without an initializer, so its value is
+  // supplied here as a synthetic Class-value reference (see collect).
+  private embedFieldInits = new Map<string, string>();
+
+  /**
+   * The key an `[Embed]` field is looked up by: the declaring class's AS3 FQN
+   * (`a.b::C`) plus the field name. `embed.ts` builds the map with the same key,
+   * so the two cannot drift.
+   */
+  static embedFieldKey(ownerName: string, ownerPackage: string | null, field: string): string {
+    return `${ownerPackage ? `${ownerPackage}::${ownerName}` : ownerName}#${field}`;
+  }
 
   get classes(): ReadonlyMap<string, ClassInfo> { return this.classMap; }
   get funcs(): ReadonlyMap<string, FuncInfo> { return this.funcMap; }
   get interfaces(): ReadonlyMap<string, InterfaceInfo> { return this.interfaceMap; }
   get exports(): ReadonlyArray<ExportedSymbol> { return this.exportList; }
 
-  collect(program: Program): void {
+  collect(program: Program, embedFieldInits?: ReadonlyMap<string, string>): void {
+    this.embedFieldInits = new Map(embedFieldInits ?? []);
     // pass -1: build the short-name -> FQN alias table so type references can
     // resolve across namespaces, and reset module-level resolution state.
     const fqn = (name: string, pkg: string | null) => qualifiedName(name, pkg);
     interfaceNames.clear();
     typeAlias.clear();
+    this.classPos.clear();
     for (const stmt of program.body) {
       if (stmt.kind === 'InterfaceDecl' || stmt.kind === 'ClassDecl') {
+        setGenPos(stmt.line, stmt.col);
         typeAlias.set(stmt.name, fqn(stmt.name, stmt.packageName));
+        if (stmt.kind === 'ClassDecl') this.classPos.set(fqn(stmt.name, stmt.packageName), { line: stmt.line, col: stmt.col });
       }
     }
-    // pass 0: register interfaces.
+    // pass 0: register interfaces. Two loops on purpose: ALL interface names are
+    // published before any interface's member types are resolved. AS3 allows a
+    // same-package type to be referenced without an import, and resolveType only
+    // recognizes an interface through `interfaceNames` -- resolving inline meant a
+    // file processed before its sibling (away3d.paths.IPath before IPathSegment)
+    // resolved the sibling to an unknown OBJECT, emitting `IPathSegment*` in the
+    // vtable slot while the implementation returns the interface struct by value.
     for (const stmt of program.body) {
+      if (stmt.kind === 'InterfaceDecl') interfaceNames.add(fqn(stmt.name, stmt.packageName));
+    }
+    for (const stmt of program.body) {
+      setGenPos(stmt.line, stmt.col);
       if (stmt.kind === 'InterfaceDecl') {
         const iname = fqn(stmt.name, stmt.packageName);
-        interfaceNames.add(iname);
         const importAlias = buildImportAlias(stmt.imports, this.classMap);
         const methods = new Map<string, MethodInfo>();
+        const getters = new Map<string, MethodInfo>();
+        const setters = new Map<string, MethodInfo>();
         for (const m of stmt.methods) {
-          methods.set(m.name, { returnType: resolveType(m.returnType, importAlias), params: m.params, owner: iname, visibility: 'public', isStatic: false, isFinal: false, isGetter: m.isGetter, isSetter: m.isSetter });
+          // NOTE: annotations are NOT validated here — see "pass 2.1" below. At this
+          // point no user class shell exists yet (pass 1 registers those), so a legal
+          // interface method naming a user class (starling's `getTexture(): Texture`)
+          // would be falsely rejected. Registration is what pass 0 is for; validation
+          // waits until every class/interface is known.
+          const mi: MethodInfo = { returnType: resolveType(m.returnType, importAlias), params: m.params, owner: iname, visibility: 'public', isStatic: false, isFinal: false, isGetter: m.isGetter, isSetter: m.isSetter };
+          if (m.isGetter) getters.set(m.name, mi);
+          else if (m.isSetter) setters.set(m.name, mi);
+          else methods.set(m.name, mi);
         }
-        this.interfaceMap.set(iname, { methods, importAlias });
+        // `interface I extends A, B` — resolve parents with this file's import
+        // context, same as a class's `implements` list.
+        const parents = stmt.extendsList.map((i) => {
+          const t = resolveType(i, importAlias);
+          return t.kind === 'interface' ? t.name : (t.kind === 'object' ? t.className : i);
+        });
+        const reflectFqn = stmt.packageName ? `${stmt.packageName}::${stmt.name}` : stmt.name;
+        this.interfaceMap.set(iname, { methods, getters, setters, importAlias, extends: parents, reflectFqn });
       }
     }
     // pass 0.5: inject the built-in Object root class (every class's implicit base).
@@ -368,11 +571,51 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // flash.utils.Proxy (stage 94a): the AVM2 property-interception base class.
+    // The ten flash_proxy methods are registered with their real signatures so
+    // subclass overrides (`flash_proxy override function getProperty(...)`) match
+    // a vtable slot; the base implementations are NOT emitted — calling one that
+    // a subclass did not override throws AIR's error (see as_proxy_throw in
+    // emit.ts). Signatures per airglobal.abc's describeType(Proxy) dump (measured:
+    // temp/proxyprobe/proxy-traits.txt), which is authoritative over the docs —
+    // it lists getDescendants, NOT the widely-documented getPropertyKeys.
+    {
+      const pm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Proxy', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false, isProxyNs: true, ns: 'flash_proxy' });
+      // '*' is the AS3 untyped type; the parser normalizes source-level `*` to
+      // 'any', so the built-in signatures must use the same spelling (a raw '*'
+      // would resolve to the CType for a class literally named '*').
+      const pName: Param = { name: 'name', type: 'any', defaultValue: null, isRest: false };
+      const pIdx: Param = { name: 'index', type: 'int', defaultValue: null, isRest: false };
+      this.classMap.set('Proxy', {
+        fields: new Map(),
+        methods: new Map([
+          ['getProperty', pm({ kind: 'any' }, [pName])],
+          ['setProperty', pm({ kind: 'void' }, [pName, { name: 'value', type: 'any', defaultValue: null, isRest: false }])],
+          ['deleteProperty', pm({ kind: 'bool' }, [pName])],
+          ['hasProperty', pm({ kind: 'bool' }, [pName])],
+          ['callProperty', pm({ kind: 'any' }, [pName, { name: 'rest', type: 'Array', defaultValue: null, isRest: true }])],
+          ['getDescendants', pm({ kind: 'any' }, [pName])],
+          ['nextNameIndex', pm({ kind: 'int' }, [pIdx])],
+          ['nextName', pm({ kind: 'string' }, [pIdx])],
+          ['nextValue', pm({ kind: 'any' }, [pIdx])],
+          ['isAttribute', pm({ kind: 'bool' }, [pName])],
+        ]),
+        staticFields: new Map(),
+        staticMethods: new Map(),
+        getters: new Map(),
+        setters: new Map(),
+        constructor: { params: [] },
+        superClass: 'Object',
+        isFinal: false,
+        isProxy: true,
+        implements: [],
+      });
+    }
     // flash.display graphics-data classes (stage 93): Starling's Canvas legacy
     // drawGraphicsData path. Modeled as plain value bundles + an empty marker
     // interface; only the field reads/writes Canvas performs are needed.
     interfaceNames.add('IGraphicsData');
-    this.interfaceMap.set('IGraphicsData', { methods: new Map() });
+    this.interfaceMap.set('IGraphicsData', { methods: new Map(), getters: new Map(), setters: new Map(), reflectFqn: 'flash.display::IGraphicsData' });
     const gsff = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'GraphicsSolidFill', isStatic: false, isConst: false });
     this.classMap.set('GraphicsSolidFill', {
       fields: new Map([
@@ -449,14 +692,27 @@ export class SymbolTable {
       fields: new Map([
         ['message', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'Error', isStatic: false, isConst: false }],
         ['errorID', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'Error', isStatic: false, isConst: false }],
+        // AIR's Error also exposes `name` (read/write, default "Error"); every
+        // subclass except flash.errors.IOError/EOFError/IllegalOperationError
+        // overrides it with its own class name. Measured on adl 51.4.1 in
+        // temp/errprobe. Appended LAST so the { vtable; message } view the
+        // uncaught-exception printer uses (as_error_view) keeps its offsets.
+        ['name', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'Error', isStatic: false, isConst: false }],
       ]),
-      methods: new Map(),
+      methods: new Map([
+        // Error overrides Object.toString: the name alone when the message is
+        // empty, "name: message" otherwise (`new Error()` -> "Error",
+        // `new Error("boom")` -> "Error: boom"; measured).
+        ['toString', { returnType: { kind: 'string' }, params: [], owner: 'Error', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
       setters: new Map(),
       constructor: { params: [
-        { name: 'message', type: 'String', defaultValue: { kind: 'Str', value: 'Error' }, isRest: false },
+        // AIR's default message is the EMPTY string, not "Error" (`new Error()`
+        // reports message "" and toString() "Error"; measured).
+        { name: 'message', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
         { name: 'id', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
       ] },
       superClass: 'Object',
@@ -465,7 +721,7 @@ export class SymbolTable {
     });
     // built-in Error subclasses: share Error's { vtable; message } layout, but
     // each has its own vtable so `catch (e:TypeError)` can match precisely.
-    for (const sub of ['TypeError', 'RangeError', 'ArgumentError', 'SyntaxError', 'ReferenceError', 'IllegalOperationError', 'IllegalArgumentError', 'SecurityError', 'EOFError', 'IOError']) {
+    for (const sub of ['TypeError', 'RangeError', 'ArgumentError', 'SyntaxError', 'ReferenceError', 'DefinitionError', 'VerifyError', 'EvalError', 'URIError', 'UninitializedError', 'IllegalOperationError', 'IllegalArgumentError', 'SecurityError', 'EOFError', 'IOError']) {
       this.classMap.set(sub, {
         fields: new Map(),
         methods: new Map(),
@@ -474,7 +730,10 @@ export class SymbolTable {
         getters: new Map(),
         setters: new Map(),
         constructor: { params: [
-          { name: 'message', type: 'String', defaultValue: { kind: 'Str', value: sub }, isRest: false },
+          // Both defaults are AIR's: the message is empty and the id 0, and the
+          // class NAME is not the message (`new TypeError()` -> message "", name
+          // "TypeError"; measured in temp/errprobe).
+          { name: 'message', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
           { name: 'id', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         ] },
         superClass: 'Error',
@@ -567,6 +826,11 @@ export class SymbolTable {
         ['toString', evm({ kind: 'string' })],
         ['clone', evm({ kind: 'object', className: 'Event' })],
         ['preventDefault', evm({ kind: 'void' })],
+        // AIR reports the prevented state through isDefaultPrevented() (there is
+        // NO `defaultPrevented` property: assigning it throws #1056; measured in
+        // temp/evtdefprobe). The state itself lives in the `cancelled` slot, which
+        // preventDefault only sets when the event is cancelable.
+        ['isDefaultPrevented', evm({ kind: 'bool' })],
         ['stopPropagation', evm({ kind: 'void' })],
         ['stopImmediatePropagation', evm({ kind: 'void' })],
       ]),
@@ -647,6 +911,9 @@ export class SymbolTable {
       fields: new Map([
         ['listeners', dpf({ kind: 'record' })],
         ['parent', dpf({ kind: 'object', className: 'Object' })],
+        // AIR's `new EventDispatcher(target)`: the object that becomes event.target
+        // for events dispatched through this dispatcher (null = the dispatcher).
+        ['_evtarget', { type: { kind: 'object', className: 'Object' }, init: null, visibility: 'private', owner: 'EventDispatcher', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['addEventListener', dpm({ kind: 'void' }, [
@@ -675,11 +942,50 @@ export class SymbolTable {
       staticMethods: new Map(),
       getters: new Map(),
       setters: new Map(),
-      constructor: { params: [] },
+      // AIR signature: EventDispatcher(target:IEventDispatcher = null). The single
+      // optional argument is what `new EventDispatcher(this)` passes; being
+      // optional keeps the implicit `super()` of every subclass legal.
+      constructor: { params: [{ name: 'target', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false }] },
       superClass: 'Object',
       isFinal: false,
       implements: [],
     });
+    // flash.events.IEventDispatcher (AIR): the interface EventDispatcher
+    // implements, and the declared parent of user interfaces
+    // (`interface ILoader extends IEventDispatcher`). Registered with its five
+    // real AIR signatures — the same ones the built-in EventDispatcher carries —
+    // so a class that extends EventDispatcher (or any dispatcher) satisfies an
+    // `implements`/`extends` check against it. Without this, a perfectly legal
+    // `interface X extends IEventDispatcher` was rejected at the NEW
+    // interface-extends resolution (the parse error used to hide it).
+    {
+      const ied = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'IEventDispatcher', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      interfaceNames.add('IEventDispatcher');
+      this.interfaceMap.set('IEventDispatcher', {
+        // IEventDispatcher is an event bus with no accessors, but the empty maps
+        // keep the InterfaceInfo shape uniform (see the accessor split in pass 0).
+        reflectFqn: 'flash.events::IEventDispatcher',
+        getters: new Map(),
+        setters: new Map(),
+        methods: new Map([
+          ['addEventListener', ied({ kind: 'void' }, [
+            { name: 'type', type: 'String', defaultValue: null, isRest: false },
+            { name: 'listener', type: 'Function', defaultValue: null, isRest: false },
+            { name: 'useCapture', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+            { name: 'priority', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'useWeakReference', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          ])],
+          ['removeEventListener', ied({ kind: 'void' }, [
+            { name: 'type', type: 'String', defaultValue: null, isRest: false },
+            { name: 'listener', type: 'Function', defaultValue: null, isRest: false },
+            { name: 'useCapture', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          ])],
+          ['hasEventListener', ied({ kind: 'bool' }, [{ name: 'type', type: 'String', defaultValue: null, isRest: false }])],
+          ['willTrigger', ied({ kind: 'bool' }, [{ name: 'type', type: 'String', defaultValue: null, isRest: false }])],
+          ['dispatchEvent', ied({ kind: 'bool' }, [{ name: 'event', type: 'Event', defaultValue: null, isRest: false }])],
+        ]),
+      });
+    }
     // flash.desktop.NativeApplication: AIR's native-application singleton (window
     // activate/deactivate notifications). AOT keeps one global instance reachable
     // through the static `nativeApplication` getter; it inherits the EventDispatcher
@@ -702,26 +1008,94 @@ export class SymbolTable {
     // built-in display list (flash.display). DisplayObject extends EventDispatcher,
     // so the parent link and listener table are inherited; it adds the transform
     // properties (name/x/y/width/height/visible/alpha/rotation/scaleX/scaleY).
-    const dof = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'DisplayObject', isStatic: false, isConst: false });
+    //
+    // width/height are ACCESSORS, not fields (stage 94·5, measured on adl 51.4.1):
+    // AIR derives them from the content bounds transformed by the object's own
+    // matrix (§ examples/stage94f.as). A stored field would make every "draw and
+    // never assign width" object 0x0 (which is what the old code did, and it also
+    // broke hit testing). Measured rules:
+    //   get: AABB(contentBoundsInLocalSpace, ownMatrix) size -- so rotation and
+    //        both scales participate (100x20 rotated 45deg -> 84.85 x 84.85,
+    //        scaleX=2 -> double the content width).
+    //   set: scaleX = scaleX * value / currentWidth (0 when the content is empty,
+    //        measured: setting width=50 on an empty Shape leaves scaleX=0), which
+    //        is why `width` is a property and not a slot.
+    // TextField is the one class that overrides both accessors: it keeps real
+    // stored width/height fields and the setter writes the field (measured:
+    // scaleX=2 + width=200 -> field 200, scaleX stays 2, reported width 400).
+    const dof = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'DisplayObject', isStatic: false, isConst: false, isAccessor: true });
     const dog = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'DisplayObject', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     const dos = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'DisplayObject', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+    const dom = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'DisplayObject', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    // The geometry/coordinate family (stage 94·9, measured on adl 51.4.1
+    // temp/geoprobe/). ALL of them live on DisplayObject (so Shape gets them too,
+    // which is where AIR puts them):
+    //   * getRect(target)/getBounds(target) — content AABB in TARGET's coordinate
+    //     space; getBounds adds the stroke half-thickness, getRect does not;
+    //     target == null means the object's own (local) space (measured).
+    //   * localToGlobal/globalToLocal(point) — Stage <-> local, via the full
+    //     ancestor matrix chain; return a NEW Point, never mutate the argument;
+    //     a null point throws TypeError #2007.
+    //   * hitTestObject(obj) — intersection of the two STAGE AABBs (stroke
+    //     inclusive, i.e. getBounds-like: measured a stroked shape overlapping an
+    //     unstroked one only through its stroke still returns true).
+    const tfTarget = (): Param => ({ name: 'targetCoordinateSpace', type: 'DisplayObject', defaultValue: null, isRest: false });
+    const ptParam = (): Param => ({ name: 'point', type: 'Point', defaultValue: null, isRest: false });
     this.classMap.set('DisplayObject', {
       fields: new Map([
         ['name', dof({ kind: 'string' })],
         ['x', dof({ kind: 'number' })],
         ['y', dof({ kind: 'number' })],
-        ['width', dof({ kind: 'number' })],
-        ['height', dof({ kind: 'number' })],
         ['visible', dof({ kind: 'bool' })],
         ['alpha', dof({ kind: 'number' })],
         ['rotation', dof({ kind: 'number' })],
         ['scaleX', dof({ kind: 'number' })],
         ['scaleY', dof({ kind: 'number' })],
         ['filters', dof({ kind: 'array' })],
+        // BlendMode name (flash.display.BlendMode constants). A plain String slot,
+        // like AIR's property; default "normal" (measured on adl 51.4.1, see
+        // docs/zh-cn/swc.md §9.2 F4). The renderer reads it in as_render_object.
+        ['blendMode', dof({ kind: 'string' })],
         ['transform', dof({ kind: 'object', className: 'Transform' })],
-        ['cacheAsBitmap', dof({ kind: 'bool' })],
+        // Nine-slice grid, AS3-visible since stage 101. AIR truncates the four
+        // numbers toward zero on store, hands back a FRESH Rectangle on every read
+        // (never the assigned instance) and validates the grid against the object's
+        // current bounds -- anything not STRICTLY inside throws #2004, though the
+        // truncated value stays stored (all measured on adl 51.4.1, temp/s9probe/).
+        // The rect is kept in the private `_s9*` C slots the renderer already
+        // consumes (DefineScalingGrid path), so `scale9Grid` is an accessor pair
+        // backed by those private C slots (emitted literally in emitStructs), not an
+        // AS3 field -- adding one here would emit a DUPLICATE `double _s9x`.
+        // NOT a public slot: AIR's cacheAsBitmap getter reports true for any
+        // object with filters (measured, temp/attrsprobe), so a plain field read
+        // would diverge. The backing flag is private (C-runtime + accessor only),
+        // exactly like Sprite._graphics, so `c.cacheAsBitmap` resolves to the
+        // DisplayObject_get_cacheAsBitmap accessor instead of the slot.
+        ['_cache_flag', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // clipDepth mask object (SWC): AIR keeps the mask in the display list but
+        // never paints it, so this C-runtime-only flag carries "child, not a
+        // painter" to as_render_object / as_pick_hit_m. Private like _cache_flag so
+        // an AS3 `visible` read still sees AIR's value (true). (_mask_src was taken
+        // by TextField's cached-mask source text.)
+        ['_mask_object', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // The Flash DEPTH a baked SWC timeline child sits at (item ③): 0 = the
+        // object was not placed by a timeline (a user-added child), so the timeline
+        // ops never address it and `as_swc_tl_clear` leaves it alone. A plain int,
+        // so no GC write barrier is involved.
+        ['_tl_depth', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
       ]),
-      methods: new Map(),
+      methods: new Map([
+        ['getBounds', dom({ kind: 'object', className: 'Rectangle' }, [tfTarget()])],
+        ['getRect', dom({ kind: 'object', className: 'Rectangle' }, [tfTarget()])],
+        ['localToGlobal', dom({ kind: 'object', className: 'Point' }, [ptParam()])],
+        ['globalToLocal', dom({ kind: 'object', className: 'Point' }, [ptParam()])],
+        ['hitTestObject', dom({ kind: 'bool' }, [{ name: 'obj', type: 'DisplayObject', defaultValue: null, isRest: false }])],
+        ['hitTestPoint', dom({ kind: 'bool' }, [
+          { name: 'x', type: 'Number', defaultValue: null, isRest: false },
+          { name: 'y', type: 'Number', defaultValue: null, isRest: false },
+          { name: 'shapeFlag', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map([
@@ -729,10 +1103,16 @@ export class SymbolTable {
         ['stage', dog({ kind: 'object', className: 'Stage' })],
         ['filters', dog({ kind: 'array' })],
         ['cacheAsBitmap', dog({ kind: 'bool' })],
+        ['scale9Grid', dog({ kind: 'object', className: 'Rectangle' })],
+        ['width', dog({ kind: 'number' })],
+        ['height', dog({ kind: 'number' })],
       ]),
       setters: new Map([
         ['filters', dos('Array')],
         ['cacheAsBitmap', dos('Boolean')],
+        ['scale9Grid', dos('Rectangle')],
+        ['width', dos('Number')],
+        ['height', dos('Number')],
       ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
@@ -742,22 +1122,44 @@ export class SymbolTable {
     // InteractiveObject adds mouse/focus interaction flags (mouseEnabled/mouseChildren
     // drive the hit-test three-state machine, mouseChildren=false makes a parent
     // absorb its children's clicks).
-    const iof = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'InteractiveObject', isStatic: false, isConst: false });
+    const iof = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'InteractiveObject', isStatic: false, isConst: false, isAccessor: true });
+    // `contextMenu` is an accessor pair on InteractiveObject (AIR shape) backed by
+    // a private slot; measured on adl 51.4.1 (temp/constprobe): a fresh display
+    // object reports null and a stored ContextMenu round-trips by identity.
+    const iog = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'InteractiveObject', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const ios = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'InteractiveObject', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
     this.classMap.set('InteractiveObject', {
       fields: new Map([
         ['mouseEnabled', iof({ kind: 'bool' })],
         ['mouseChildren', iof({ kind: 'bool' })],
+        // AIR: `buttonMode` (default false) turns the object into a "button" for
+        // cursor purposes and `useHandCursor` (default TRUE) is the switch that
+        // actually selects the hand shape. The hand shows only when both are set
+        // (documented rule, applied by ASC_window_update_cursor).
+        ['buttonMode', iof({ kind: 'bool' })],
+        ['useHandCursor', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'InteractiveObject', isStatic: false, isConst: false }],
         ['doubleClickEnabled', iof({ kind: 'bool' })],
         ['tabEnabled', iof({ kind: 'bool' })],
         ['tabIndex', iof({ kind: 'int' })],
         ['focusRect', iof({ kind: 'bool' })],
         ['hasFocus', iof({ kind: 'bool' })],
+        ['_contextMenu', { type: { kind: 'object', className: 'ContextMenu' }, init: null, visibility: 'private', owner: 'InteractiveObject', isStatic: false, isConst: false }],
       ]),
       methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
-      setters: new Map(),
+      getters: new Map([
+        ['contextMenu', iog({ kind: 'object', className: 'ContextMenu' })],
+        // AIR's live pointer position relative to this object. The runtime tracks the
+        // pointer in STAGE coordinates (ASC_mouse_x/y, fed by the window glue and by
+        // the Stage.dispatchMouse test hook); the getters push that point through the
+        // object's transform chain with as_local_point.
+        ['mouseX', iog({ kind: 'number' })],
+        ['mouseY', iog({ kind: 'number' })],
+      ]),
+      setters: new Map([
+        ['contextMenu', ios('ContextMenu')],
+      ]),
       constructor: { params: [] },
       superClass: 'DisplayObject',
       isFinal: false,
@@ -808,7 +1210,10 @@ export class SymbolTable {
         ['quality', stgf({ kind: 'string' })],
         ['align', stgf({ kind: 'string' })],
         ['scale_mode', stgf({ kind: 'string' })],
-        ['frame_rate', stgf({ kind: 'number' })],
+        // NOTE: no `frame_rate` field — in AIR the frame rate is APPLICATION-wide,
+        // not per-Stage. It lives in the generated C as the single static
+        // ASC_app_frame_rate that every Stage's frameRate getter/setter proxies.
+        // See emit.ts's Stage accessors.
         ['stage_scale', stgf({ kind: 'number' })],
         ['display_state', stgf({ kind: 'string' })],
         ['stage_focus_rect', stgf({ kind: 'bool' })],
@@ -821,6 +1226,40 @@ export class SymbolTable {
           { name: 'x', type: 'Number', defaultValue: null, isRest: false },
           { name: 'y', type: 'Number', defaultValue: null, isRest: false },
           { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        ], owner: 'Stage', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // Native-backend hook: feeds a key event through the same path the SDL2
+        // event loop uses. `mod` is the ASC_MOD_* bit mask (1=ctrl, 2=alt,
+        // 4=shift, 8=cmd), the same one Stage_dispatchKey receives from the glue.
+        // Not part of AIR's Stage API; exposed so tests can drive the keyboard
+        // (and, via Tab, focus traversal) the same way dispatchMouse drives clicks.
+        ['dispatchKey', { returnType: { kind: 'void' }, params: [
+          { name: 'type', type: 'String', defaultValue: null, isRest: false },
+          { name: 'keyCode', type: 'int', defaultValue: null, isRest: false },
+          { name: 'charCode', type: 'int', defaultValue: null, isRest: false },
+          { name: 'mod', type: 'int', defaultValue: null, isRest: false },
+        ], owner: 'Stage', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // Native-backend hook: feeds a committed character string through the same
+        // path SDL_TEXTINPUT uses (AIR's TextEvent.TEXT_INPUT pipeline: dispatch
+        // textInput, then insert unless cancelled). Not part of AIR's Stage API;
+        // exposed so tests can drive typing the same way dispatchKey drives keys.
+        ['dispatchText', { returnType: { kind: 'void' }, params: [
+          { name: 'text', type: 'String', defaultValue: null, isRest: false },
+        ], owner: 'Stage', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // Native-backend hook: feeds an IME COMPOSITION (marked text) into the
+        // focused editable TextField through the same path SDL_TEXTEDITING uses.
+        // The marked text is a PREVIEW: it is not committed (`.text`, the caret and
+        // the selection stay put and no change fires) and is painted at the caret
+        // with an underline; the commit arrives as a plain textInput. An empty
+        // `text` ends the composition. `start`/`length` are the IME's selection
+        // inside the composition (-1/0 when it has none) and only feed the
+        // candidate-window placement. Not part of AIR's Stage API -- and on adl
+        // 51.4.1 the composition cannot be driven from AS3 at all
+        // (IME.setCompositionString throws Error #2063), so this hook is the only
+        // way to exercise the state.
+        ['dispatchTextEditing', { returnType: { kind: 'void' }, params: [
+          { name: 'text', type: 'String', defaultValue: null, isRest: false },
+          { name: 'start', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false },
+          { name: 'length', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         ], owner: 'Stage', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
         // Native-backend hook: feeds a wheel notch into the TextField under (x,y)
         // and dispatches a bubbling MouseEvent.MOUSE_WHEEL. Not part of AIR's Stage
@@ -868,7 +1307,16 @@ export class SymbolTable {
         ['allowsFullScreenInteractive', stgg({ kind: 'bool' })],
         ['contentsScaleFactor', stgg({ kind: 'number' })],
         ['browserZoomFactor', stgg({ kind: 'number' })],
+        // Stage.vsyncEnabled (AIR): whether the player synchronizes frame
+        // presentation to the display's vertical refresh. Application-wide like
+        // frameRate (one clock for the whole app), backed by the generated
+        // ASC_app_vsync_enabled; default true, exactly as adl 51.4.1 reports.
+        ['vsyncEnabled', stgg({ kind: 'bool' })],
         ['stage3Ds', stgg({ kind: 'vector', elem: { kind: 'object', className: 'Stage3D' } })],
+        // Stage.focus: the InteractiveObject that currently has the keyboard focus,
+        // or null. Backed by the generated as_focus_obj rather than a struct field,
+        // because a focus change also dispatches FocusEvent.FOCUS_OUT/FOCUS_IN.
+        ['focus', stgg({ kind: 'object', className: 'InteractiveObject' })],
       ]),
       setters: new Map([
         ['stageWidth', stgs('int')],
@@ -882,26 +1330,188 @@ export class SymbolTable {
         ['stageFocusRect', stgs('Boolean')],
         ['showDefaultContextMenu', stgs('Boolean')],
         ['tabChildren', stgs('Boolean')],
+        ['vsyncEnabled', stgs('Boolean')],
+        ['focus', stgs('InteractiveObject')],
       ]),
       constructor: { params: [] },
       superClass: 'DisplayObjectContainer',
       isFinal: false,
       implements: [],
     });
-    // Sprite is a drawable container (Graphics lands in stage 37; for now it is
-    // an empty DisplayObjectContainer subclass so hit-testing has a target type).
+    // flash.display.Screen (stage 89·71): read-only display enumeration. AIR hands
+    // out a FRESH wrapper on every access — measured on adl 51.4.1,
+    // `Screen.mainScreen === Screen.mainScreen` is false and
+    // `Screen.screens[0] === Screen.mainScreen` is false — so both static getters
+    // allocate. `bounds` (full display rectangle) and `visibleBounds` (usable area,
+    // menu bar and Dock excluded) are two DIFFERENT quantities on the same display,
+    // which is why they are separate queries rather than one size. The Rectangle a
+    // getter returns is the Screen's own live object, not a copy: mutating the value
+    // read from `s.bounds` is visible on the next `s.bounds` (also measured), so the
+    // runtime caches one Rectangle per Screen instead of rebuilding it per call.
+    // Screen has no public constructor: `new Screen()` throws Error #2012 in AIR.
+    {
+      const scrg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Screen', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      const scrgstatic = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Screen', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false });
+      this.classMap.set('Screen', {
+        fields: new Map(),
+        methods: new Map(),
+        staticFields: new Map(),
+        staticMethods: new Map([
+          // AIR's shape is a static method taking ONE Rectangle — there is no
+          // `getScreens()` (mxmlc rejects it as undefined).
+          ['getScreensForRectangle', { returnType: { kind: 'array' }, params: [
+            { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
+          ], owner: 'Screen', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+        ]),
+        getters: new Map([
+          ['bounds', scrg({ kind: 'object', className: 'Rectangle' })],
+          ['visibleBounds', scrg({ kind: 'object', className: 'Rectangle' })],
+          ['colorDepth', scrg({ kind: 'int' })],
+        ]),
+        staticGetters: new Map([
+          ['mainScreen', scrgstatic({ kind: 'object', className: 'Screen' })],
+          ['screens', scrgstatic({ kind: 'array' })],
+        ]),
+        setters: new Map(),
+        constructor: { params: [] },
+        superClass: 'Object',
+        isFinal: false,
+        implements: [],
+      });
+    }
+    // ---- flash.display.NativeWindow family (阶段八十九·七十一) ----
+    // AIR's multi-window API. Every default and constant below was read off
+    // adl 51.4.1 (temp/nw-probe/), not guessed: the init-option defaults are
+    // standard/normal/auto/transparent=false/maximizable=true/minimizable=true/
+    // resizable=true/owner=null, and NativeWindowResize.NONE really is the EMPTY
+    // STRING (the other members are the same "T"/"BR" codes StageAlign uses).
+    // The token classes (NativeWindowType etc.) are registered with the other
+    // const classes further down, where constClass() is defined.
+    {
+      // The per-window AS3 state lives in the generated C's ASC_wins[] table,
+      // indexed by the glue window id stored in the object's single `_win` slot
+      // (a plain int, so no props-table/GC entry is needed for it). Everything
+      // else about a window is a query into that table.
+      const nwField = (owner: string, t: CType, init: Expr | null): FieldInfo => ({ type: t, init, visibility: 'public', owner, isStatic: false, isConst: false });
+      const nwMethod = (owner: string, ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      const nwGet = (owner: string, ret: CType): MethodInfo => ({ returnType: ret, params: [], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      const nwSet = (owner: string, pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+
+      // NativeWindowInitOptions: a plain data bag whose defaults are the adl ones.
+      const opt = (t: CType, init: Expr): FieldInfo => nwField('NativeWindowInitOptions', t, init);
+      this.classMap.set('NativeWindowInitOptions', {
+        fields: new Map<string, FieldInfo>([
+          ['systemChrome', opt({ kind: 'string' }, { kind: 'Str', value: 'standard' })],
+          ['type', opt({ kind: 'string' }, { kind: 'Str', value: 'normal' })],
+          ['renderMode', opt({ kind: 'string' }, { kind: 'Str', value: 'auto' })],
+          ['transparent', opt({ kind: 'bool' }, { kind: 'Bool', value: false })],
+          ['maximizable', opt({ kind: 'bool' }, { kind: 'Bool', value: true })],
+          ['minimizable', opt({ kind: 'bool' }, { kind: 'Bool', value: true })],
+          ['resizable', opt({ kind: 'bool' }, { kind: 'Bool', value: true })],
+          ['owner', opt({ kind: 'object', className: 'NativeWindow' }, { kind: 'Null' })],
+        ]),
+        methods: new Map(),
+        staticFields: new Map(),
+        staticMethods: new Map(),
+        getters: new Map(),
+        setters: new Map(),
+        constructor: { params: [] },
+        superClass: 'Object',
+        isFinal: false,
+        implements: [],
+      });
+
+      this.classMap.set('NativeWindow', {
+        fields: new Map<string, FieldInfo>(),
+        methods: new Map<string, MethodInfo>([
+          // close() only REQUESTS teardown; the window is retired at the next
+          // frame boundary, which is why `closed` is still false for the rest of
+          // the call that invoked it (measured against adl).
+          ['close', nwMethod('NativeWindow', { kind: 'void' }, [])],
+          ['activate', nwMethod('NativeWindow', { kind: 'void' }, [])],
+          ['minimize', nwMethod('NativeWindow', { kind: 'void' }, [])],
+          ['maximize', nwMethod('NativeWindow', { kind: 'void' }, [])],
+          ['restore', nwMethod('NativeWindow', { kind: 'void' }, [])],
+          ['orderToFront', nwMethod('NativeWindow', { kind: 'void' }, [])],
+          ['orderToBack', nwMethod('NativeWindow', { kind: 'void' }, [])],
+          ['toString', nwMethod('NativeWindow', { kind: 'string' }, [])],
+        ]),
+        staticFields: new Map<string, FieldInfo>([
+          ['isSupported', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'NativeWindow', isStatic: true, isConst: true }],
+          ['supportsTransparency', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'NativeWindow', isStatic: true, isConst: true }],
+          ['supportsMenu', { type: { kind: 'bool' }, init: { kind: 'Bool', value: false }, visibility: 'public', owner: 'NativeWindow', isStatic: true, isConst: true }],
+          ['supportsNotification', { type: { kind: 'bool' }, init: { kind: 'Bool', value: false }, visibility: 'public', owner: 'NativeWindow', isStatic: true, isConst: true }],
+        ]),
+        staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([
+          ['stage', nwGet('NativeWindow', { kind: 'object', className: 'Stage' })],
+          ['bounds', nwGet('NativeWindow', { kind: 'object', className: 'Rectangle' })],
+          ['x', nwGet('NativeWindow', { kind: 'number' })],
+          ['y', nwGet('NativeWindow', { kind: 'number' })],
+          ['width', nwGet('NativeWindow', { kind: 'number' })],
+          ['height', nwGet('NativeWindow', { kind: 'number' })],
+          ['title', nwGet('NativeWindow', { kind: 'string' })],
+          ['visible', nwGet('NativeWindow', { kind: 'bool' })],
+          ['closed', nwGet('NativeWindow', { kind: 'bool' })],
+          ['active', nwGet('NativeWindow', { kind: 'bool' })],
+          ['displayState', nwGet('NativeWindow', { kind: 'string' })],
+          ['alwaysInFront', nwGet('NativeWindow', { kind: 'bool' })],
+          ['resizable', nwGet('NativeWindow', { kind: 'bool' })],
+          ['maximizable', nwGet('NativeWindow', { kind: 'bool' })],
+          ['minimizable', nwGet('NativeWindow', { kind: 'bool' })],
+          ['systemChrome', nwGet('NativeWindow', { kind: 'string' })],
+          ['type', nwGet('NativeWindow', { kind: 'string' })],
+          ['renderMode', nwGet('NativeWindow', { kind: 'string' })],
+          ['transparent', nwGet('NativeWindow', { kind: 'bool' })],
+          ['owner', nwGet('NativeWindow', { kind: 'object', className: 'NativeWindow' })],
+        ]),
+        setters: new Map<string, MethodInfo>([
+          // x/y/width/height write straight through to bounds (measured: setting
+          // x=100 moved bounds.x to 100 and left y/width/height alone).
+          ['bounds', nwSet('NativeWindow', 'Rectangle')],
+          ['x', nwSet('NativeWindow', 'Number')],
+          ['y', nwSet('NativeWindow', 'Number')],
+          ['width', nwSet('NativeWindow', 'Number')],
+          ['height', nwSet('NativeWindow', 'Number')],
+          ['title', nwSet('NativeWindow', 'String')],
+          ['visible', nwSet('NativeWindow', 'Boolean')],
+          ['displayState', nwSet('NativeWindow', 'String')],
+          ['alwaysInFront', nwSet('NativeWindow', 'Boolean')],
+        ]),
+        constructor: { params: [{ name: 'options', type: 'NativeWindowInitOptions', defaultValue: null, isRest: false }] },
+        // AIR: flash.display.NativeWindow extends EventDispatcher (it dispatches
+        // Event.CLOSE / ACTIVATE / DEACTIVATE). This is not cosmetic: the
+        // superclass fixes the STRUCT layout. With Object as the super, the
+        // generated struct was { vtable; int _win; } and EventDispatcher's
+        // listeners/parent fields were absent — so dispatchEvent() read the
+        // pointer at offset 8 (which was really `_win`, an int) as a listener
+        // table and read `parent` at offset 16, past the end of the 16-byte
+        // allocation. Closing a NativeWindow therefore crashed with SIGSEGV.
+        superClass: 'EventDispatcher',
+        isFinal: false,
+        implements: [],
+        isDynamic: false,
+      });
+    }
+
+    // Sprite is a drawable container. Its Graphics is stored PRIVATE and handed
+    // out by the public `graphics` getter, which creates it on first use: AIR
+    // semantics (never null) at the cost of one NULL pointer per untouched
+    // container (a Starling-scale tree allocates thousands of Sprites). Letting
+    // the accessor be a getter instead of a slot also keeps `s.graphics` working
+    // through the inherited member lookup, and Shape keeps its eager field.
     this.classMap.set('Sprite', {
-      fields: new Map(),
-      methods: new Map([
-        ['hitTestPoint', { returnType: { kind: 'bool' }, params: [
-          { name: 'x', type: 'Number', defaultValue: null, isRest: false },
-          { name: 'y', type: 'Number', defaultValue: null, isRest: false },
-          { name: 'shapeFlag', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
-        ], owner: 'Sprite', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      fields: new Map([
+        ['_graphics', { type: { kind: 'object', className: 'Graphics' }, init: null, visibility: 'private', owner: 'Sprite', isStatic: false, isConst: false }],
       ]),
+      // hitTestPoint lives on DisplayObject (AIR's owner); Sprite keeps only the
+      // lazy `graphics` accessor of its own.
+      methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
+      getters: new Map([
+        ['graphics', { returnType: { kind: 'object', className: 'Graphics' }, params: [], owner: 'Sprite', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       setters: new Map(),
       constructor: { params: [] },
       superClass: 'DisplayObjectContainer',
@@ -925,19 +1535,35 @@ export class SymbolTable {
       fields: new Map([
         ['currentFrame', mcf({ kind: 'int' })],
         ['totalFrames', mcf({ kind: 'int' })],
-        ['playing', mcf({ kind: 'bool' })],
+        // Private: AIR's MovieClip exposes `isPlaying`, not `playing` (measured on
+        // adl 51.4.1, temp/tlprobe), so the flag must not be a readable field.
+        ['_playing', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'MovieClip', isStatic: false, isConst: false }],
+        // The baked SWC timeline this clip runs, as a character id: 0 = none (a
+        // hand-made `new MovieClip()`, which keeps the frameless behaviour). It is
+        // an int, not a function pointer, because every timeline entry point is an
+        // emitted `as_swc_tl_*(int charId, ...)` switch over the baked characters.
+        ['_tl_char', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'MovieClip', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['play', mcm({ kind: 'void' }, [])],
         ['stop', mcm({ kind: 'void' }, [])],
-        ['gotoAndPlay', mcm({ kind: 'void' }, [{ name: 'frame', type: 'int', defaultValue: null, isRest: false }])],
-        ['gotoAndStop', mcm({ kind: 'void' }, [{ name: 'frame', type: 'int', defaultValue: null, isRest: false }])],
+        // AIR's signatures take `frame:Object` because a FrameLabel name is just as
+        // valid as a frame number: `gotoAndStop("_over")` is the whole point of the
+        // rollover skins in this library (measured, temp/tlprobe).
+        ['gotoAndPlay', mcm({ kind: 'void' }, [{ name: 'frame', type: 'any', defaultValue: null, isRest: false }])],
+        ['gotoAndStop', mcm({ kind: 'void' }, [{ name: 'frame', type: 'any', defaultValue: null, isRest: false }])],
+        ['nextFrame', mcm({ kind: 'void' }, [])],
+        ['prevFrame', mcm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map([
         ['currentFrame', mcg({ kind: 'int' })],
         ['totalFrames', mcg({ kind: 'int' })],
+        ['isPlaying', mcg({ kind: 'bool' })],
+        ['currentLabel', mcg({ kind: 'string' })],
+        ['currentFrameLabel', mcg({ kind: 'string' })],
+        ['currentLabels', mcg({ kind: 'array' })],
       ]),
       setters: new Map([
         ['totalFrames', mcs('int')],
@@ -945,6 +1571,26 @@ export class SymbolTable {
       constructor: { params: [] },
       superClass: 'Sprite',
       isDynamic: true,
+      isFinal: false,
+      implements: [],
+    });
+    // FrameLabel: the `name`/`frame` pair AIR hands back from
+    // `MovieClip.currentLabels` (measured, temp/tlprobe: `currentLabels[i].name` /
+    // `.frame`). AIR does not expose a public constructor for it, but the class is
+    // created on demand by the getter, so a plain two-field class is enough.
+    this.classMap.set('FrameLabel', {
+      fields: new Map([
+        ['name', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'FrameLabel', isStatic: false, isConst: false }],
+        ['frame', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'FrameLabel', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [{ name: 'name', type: 'String', defaultValue: null, isRest: false }, { name: 'frame', type: 'int', defaultValue: null, isRest: false }] },
+      superClass: 'Object',
+      isDynamic: false,
       isFinal: false,
       implements: [],
     });
@@ -1041,24 +1687,47 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
-    // flash.media (stage 93): Sound / SoundChannel / SoundTransform. Starling's
-    // MovieClip / AssetManager / SoundFactory reference these as types and call
-    // play() / loadCompressedDataFromByteArray(). Audio playback is a no-op stub
-    // (no audio backend in this subset) — the objects exist so the demo compiles;
-    // `play` returns a fresh SoundChannel, `loadCompressed...` is a no-op.
-    // Socket / Video / ContextMenu / URLVariables remain deferred (documented in
-    // README/todo).
-    const stf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'SoundTransform', isStatic: false, isConst: false });
+    // flash.media (阶段九十六): Sound / SoundChannel / SoundTransform /
+    // SoundMixer / SoundLoaderContext / ID3Info / AudioPlaybackMode.
+    // Stage 93 left five compiling stubs (play() returned a silent channel); this
+    // is the real surface backed by vendor/audio_glue.c through the as_audio_*
+    // seam. AIR 51.4.1 measurements are in docs/zh-cn/audio.md §13; the numbers
+    // quoted below are from temp/audioprobe (adl1/2/3.txt).
+    //
+    // Storage shape, measured rather than guessed:
+    //   * SoundTransform stores the four channel gains and derives `pan` from
+    //     them: pan = 1 - leftToLeft*leftToLeft when both cross terms are 0,
+    //     else 0 (setting any gain directly drops the pan shorthand). That is
+    //     why AIR reports `new SoundTransform(0.5, 0.25).pan` as
+    //     0.2500000000000001 and not 0.25 -- the drift is the derivation.
+    //   * A SoundChannel's transform holds the gains the MIXER uses, which AIR
+    //     quantizes to 2 decimals (play(0,0,new SoundTransform(1,0.6)) reads
+    //     back leftToLeft = 0.63, not 0.6324555320336759).
+    //   * soundTransform getters return a fresh object each call (measured:
+    //     `c.soundTransform == c.soundTransform` is false).
+    const stGain = (owner: string, name: string): [string, FieldInfo] => [name, { type: { kind: 'number' }, init: null, visibility: 'private', owner, isStatic: false, isConst: false }];
+    const stG = (ret: CType, name: string): [string, MethodInfo] => [name, { returnType: ret, params: [], owner: 'SoundTransform', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }];
+    const stS = (name: string, pt: ASType): [string, MethodInfo] => [name, { returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'SoundTransform', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }];
+    const numT: CType = { kind: 'number' };
     this.classMap.set('SoundTransform', {
       fields: new Map([
-        ['volume', stf({ kind: 'number' })],
-        ['pan', stf({ kind: 'number' })],
+        stGain('SoundTransform', '_st_volume'),
+        stGain('SoundTransform', '_st_ltl'),
+        stGain('SoundTransform', '_st_ltr'),
+        stGain('SoundTransform', '_st_rtl'),
+        stGain('SoundTransform', '_st_rtr'),
       ]),
       methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
-      setters: new Map(),
+      getters: new Map([
+        stG(numT, 'volume'), stG(numT, 'pan'), stG(numT, 'leftToLeft'),
+        stG(numT, 'leftToRight'), stG(numT, 'rightToLeft'), stG(numT, 'rightToRight'),
+      ]),
+      setters: new Map([
+        stS('volume', 'Number'), stS('pan', 'Number'), stS('leftToLeft', 'Number'),
+        stS('leftToRight', 'Number'), stS('rightToLeft', 'Number'), stS('rightToRight', 'Number'),
+      ]),
       constructor: { params: [
         { name: 'volume', type: 'Number', defaultValue: { kind: 'Num', value: 1, isInt: false }, isRest: false },
         { name: 'pan', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
@@ -1068,43 +1737,208 @@ export class SymbolTable {
       implements: [],
     });
     const sndm = (ret: CType, params: Param[] = []): MethodInfo => ({ returnType: ret, params, owner: 'Sound', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const sndF = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner: 'Sound', isStatic: false, isConst: false });
+    const sndG = (name: string, ret: CType): [string, MethodInfo] => [name, { returnType: ret, params: [], owner: 'Sound', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }];
     this.classMap.set('Sound', {
-      fields: new Map(),
+      fields: new Map<string, FieldInfo>([
+        ['_snd_buf', sndF({ kind: 'int' })],      // backend buffer id, -1 = no data
+        ['_snd_bytesTotal', sndF({ kind: 'uint' })],
+        ['_snd_bytesLoaded', sndF({ kind: 'uint' })],
+        ['_snd_url', sndF({ kind: 'string' })],
+        // The URL the caller asked for, kept only to fill _snd_url for a local
+        // read (an HTTP transfer records its own final/redirected URL). Measured:
+        // adl's url is "the final, absolute URL" and becomes non-null with the
+        // open event.
+        ['_snd_requrl', sndF({ kind: 'string' })],
+        ['_snd_id3', sndF({ kind: 'object', className: 'ID3Info' })],
+        ['_snd_buffering', sndF({ kind: 'bool' })],
+        ['_snd_inaccessible', sndF({ kind: 'bool' })],
+        // extract()'s cursor: its default startPosition=-1 means "continue where
+        // the last extract() stopped" (language reference), so the Sound carries
+        // the position. Counted in samples, like length/startPosition.
+        ['_snd_xpos', sndF({ kind: 'int' })],
+      ]),
       methods: new Map([
         ['play', sndm({ kind: 'object', className: 'SoundChannel' }, [
-          { name: 'startTime', type: 'Number', defaultValue: null, isRest: false },
-          { name: 'loops', type: 'int', defaultValue: null, isRest: false },
-          { name: 'transform', type: 'SoundTransform', defaultValue: null, isRest: false },
+          { name: 'startTime', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
+          { name: 'loops', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          { name: 'sndTransform', type: 'SoundTransform', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        ['close', sndm({ kind: 'void' })],
+        ['load', sndm({ kind: 'void' }, [
+          { name: 'stream', type: 'URLRequest', defaultValue: null, isRest: false },
+          { name: 'context', type: 'SoundLoaderContext', defaultValue: { kind: 'Null' }, isRest: false },
         ])],
         ['loadCompressedDataFromByteArray', sndm({ kind: 'void' }, [
           { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
           { name: 'length', type: 'uint', defaultValue: null, isRest: false },
         ])],
+        ['loadPCMFromByteArray', sndm({ kind: 'void' }, [
+          { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'samples', type: 'uint', defaultValue: null, isRest: false },
+          { name: 'format', type: 'String', defaultValue: { kind: 'Str', value: 'float' }, isRest: false },
+          { name: 'stereo', type: 'Boolean', defaultValue: { kind: 'Bool', value: true }, isRest: false },
+          { name: 'sampleRate', type: 'Number', defaultValue: { kind: 'Num', value: 44100, isInt: false }, isRest: false },
+        ])],
+        ['extract', sndm(numT, [
+          { name: 'target', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'length', type: 'Number', defaultValue: null, isRest: false },
+          { name: 'startPosition', type: 'Number', defaultValue: { kind: 'Num', value: -1, isInt: false }, isRest: false },
+        ])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
+      getters: new Map<string, MethodInfo>([
+        sndG('length', numT),
+        ['isBuffering', { returnType: { kind: 'bool' }, params: [], owner: 'Sound', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['bytesTotal', { returnType: { kind: 'uint' }, params: [], owner: 'Sound', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['bytesLoaded', { returnType: { kind: 'uint' }, params: [], owner: 'Sound', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        sndG('url', { kind: 'string' }),
+        sndG('id3', { kind: 'object', className: 'ID3Info' }),
+        ['isURLInaccessible', { returnType: { kind: 'bool' }, params: [], owner: 'Sound', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       setters: new Map(),
-      constructor: { params: [] },
+      constructor: { params: [
+        // AIR's Sound(stream, context) constructor LOADS the stream when one is
+        // given ("If you pass a valid URLRequest object to the Sound constructor,
+        // the constructor automatically calls the load() function"); measured on
+        // adl: new Sound(new URLRequest(badPath)) dispatches ioError by itself.
+        { name: 'stream', type: 'URLRequest', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'context', type: 'SoundLoaderContext', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
       superClass: 'EventDispatcher',
       isFinal: false,
       implements: [],
     });
     const sctm = (ret: CType, params: Param[] = []): MethodInfo => ({ returnType: ret, params, owner: 'SoundChannel', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const schF = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner: 'SoundChannel', isStatic: false, isConst: false });
     this.classMap.set('SoundChannel', {
-      fields: new Map(),
+      fields: new Map<string, FieldInfo>([
+        // Backend voice id; -1 once the channel has stopped, is finished, or was
+        // replaced by SoundMixer.stopAll(). The five gains are what AIR's mixer
+        // holds (quantized to 2 decimals), not the SoundTransform object passed
+        // to play(): the getter rebuilds a fresh object from them.
+        ['_ch_voice', schF({ kind: 'int' })],
+        ['_ch_pos', schF({ kind: 'number' })],
+        ['_ch_vol', schF({ kind: 'number' })],
+        ['_ch_ltl', schF({ kind: 'number' })],
+        ['_ch_ltr', schF({ kind: 'number' })],
+        ['_ch_rtl', schF({ kind: 'number' })],
+        ['_ch_rtr', schF({ kind: 'number' })],
+      ]),
       methods: new Map([
         ['stop', sctm({ kind: 'void' })],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
-      setters: new Map(),
+      getters: new Map<string, MethodInfo>([
+        ['position', { returnType: numT, params: [], owner: 'SoundChannel', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['leftPeak', { returnType: numT, params: [], owner: 'SoundChannel', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['rightPeak', { returnType: numT, params: [], owner: 'SoundChannel', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['soundTransform', { returnType: { kind: 'object', className: 'SoundTransform' }, params: [], owner: 'SoundChannel', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map<string, MethodInfo>([
+        ['soundTransform', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'SoundTransform', defaultValue: null, isRest: false }], owner: 'SoundChannel', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
       isFinal: false,
       implements: [],
     });
+    // SoundMixer: all-static facade over the process-wide mixer. bufferTime and
+    // audioPlaybackMode are plain writable statics (AIR defaults 5 and "media",
+    // measured); the transform is the same derived-gain shape as a channel's.
+    const smG = (name: string, ret: CType): [string, MethodInfo] => [name, { returnType: ret, params: [], owner: 'SoundMixer', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }];
+    this.classMap.set('SoundMixer', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map<string, FieldInfo>([
+        ['bufferTime', { type: { kind: 'int' }, init: { kind: 'Num', value: 5, isInt: true }, visibility: 'public', owner: 'SoundMixer', isStatic: true, isConst: false }],
+        ['audioPlaybackMode', { type: { kind: 'string' }, init: { kind: 'Str', value: 'media' }, visibility: 'public', owner: 'SoundMixer', isStatic: true, isConst: false }],
+        ['_mix_vol', { type: numT, init: { kind: 'Num', value: 1, isInt: false }, visibility: 'private', owner: 'SoundMixer', isStatic: true, isConst: false }],
+        ['_mix_ltl', { type: numT, init: { kind: 'Num', value: 1, isInt: false }, visibility: 'private', owner: 'SoundMixer', isStatic: true, isConst: false }],
+        ['_mix_ltr', { type: numT, init: { kind: 'Num', value: 0, isInt: false }, visibility: 'private', owner: 'SoundMixer', isStatic: true, isConst: false }],
+        ['_mix_rtl', { type: numT, init: { kind: 'Num', value: 0, isInt: false }, visibility: 'private', owner: 'SoundMixer', isStatic: true, isConst: false }],
+        ['_mix_rtr', { type: numT, init: { kind: 'Num', value: 1, isInt: false }, visibility: 'private', owner: 'SoundMixer', isStatic: true, isConst: false }],
+      ]),
+      staticMethods: new Map([
+        ['stopAll', { returnType: { kind: 'void' }, params: [], owner: 'SoundMixer', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+        ['computeSpectrum', { returnType: { kind: 'void' }, params: [
+          { name: 'outputArray', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'FFTMode', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          { name: 'stretchFactor', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ], owner: 'SoundMixer', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+        ['areSoundsInaccessible', { returnType: { kind: 'bool' }, params: [], owner: 'SoundMixer', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      getters: new Map(),
+      setters: new Map(),
+      staticGetters: new Map<string, MethodInfo>([
+        smG('soundTransform', { kind: 'object', className: 'SoundTransform' }),
+      ]),
+      staticSetters: new Map<string, MethodInfo>([
+        ['soundTransform', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'SoundTransform', defaultValue: null, isRest: false }], owner: 'SoundMixer', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    this.classMap.set('SoundLoaderContext', {
+      fields: new Map<string, FieldInfo>([
+        ['bufferTime', { type: numT, init: null, visibility: 'public', owner: 'SoundLoaderContext', isStatic: false, isConst: false }],
+        ['checkPolicyFile', { type: { kind: 'bool' }, init: null, visibility: 'public', owner: 'SoundLoaderContext', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'bufferTime', type: 'Number', defaultValue: { kind: 'Num', value: 1000, isInt: false }, isRest: false },
+        { name: 'checkPolicyFile', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // ID3Info: AIR always exposes an object (Sound.id3 is never null, measured)
+    // whose fields stay null until an ID3v2 tag is present.
+    const id3f = (): FieldInfo => ({ type: { kind: 'string' }, init: null, visibility: 'public', owner: 'ID3Info', isStatic: false, isConst: false });
+    this.classMap.set('ID3Info', {
+      fields: new Map<string, FieldInfo>([
+        ['songName', id3f()], ['artist', id3f()], ['album', id3f()], ['genre', id3f()],
+        ['track', id3f()], ['year', id3f()], ['comment', id3f()],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    // AudioPlaybackMode: the two String constants AIR exposes for
+    // SoundMixer.audioPlaybackMode (the class itself is only a holder).
+    this.classMap.set('AudioPlaybackMode', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map<string, FieldInfo>([
+        ['MEDIA', stMatch('AudioPlaybackMode', 'media')],
+        ['VOICE', stMatch('AudioPlaybackMode', 'voice')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    function stMatch(owner: string, value: string): FieldInfo {
+      return { type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true };
+    }
     // flash.media.Camera: Starling's Texture.fromCamera / ConcreteTexture.attachCamera
     // reference it as a type (and Camera.getCamera() as a factory). No camera backend
     // in this subset — the object exists so those signatures compile; getCamera is a
@@ -1259,10 +2093,11 @@ export class SymbolTable {
     });
     // URLStream: the streaming counterpart of URLLoader (IDataInput read side).
     // `endian`/`objectEncoding` are the interface's read-write properties, kept as
-    // plain fields (that is what IDataInput specifies: a settable property, not a
-    // method). `bytesAvailable`/`connected` are read-only and go through getters.
-    // IDataInput is NOT in `implements`: this subset registers interfaces by hand
-    // and nothing here needs interface-typed dispatch.
+    // plain fields marked `isAccessor` (AIR declares them `get`/`set` pairs; a
+    // field is the C model of the same slot — the convention DisplayObject.x
+    // uses, and what pass 4 accepts for a built-in accessor).
+    // `bytesAvailable`/`connected` are read-only and go through getters (the
+    // latter is URLStream's own; `bytesAvailable` is IDataInput's).
     const usf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'URLStream', isStatic: false, isConst: false });
     const usm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'URLStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     const usg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'URLStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
@@ -1270,8 +2105,8 @@ export class SymbolTable {
     const u_len = (name: string): Param => ({ name, type: 'uint', defaultValue: null, isRest: false });
     this.classMap.set('URLStream', {
       fields: new Map([
-        ['endian', usf({ kind: 'string' })],
-        ['objectEncoding', usf({ kind: 'uint' })],
+        ['endian', { ...usf({ kind: 'string' }), isAccessor: true }],
+        ['objectEncoding', { ...usf({ kind: 'uint' }), isAccessor: true }],
       ]),
       methods: new Map([
         ['load', usm({ kind: 'void' }, [{ name: 'request', type: 'URLRequest', defaultValue: null, isRest: false }])],
@@ -1288,6 +2123,7 @@ export class SymbolTable {
         ['readUTF', u_byte({ kind: 'string' })],
         ['readUTFBytes', usm({ kind: 'string' }, [u_len('length')])],
         ['readMultiByte', usm({ kind: 'string' }, [u_len('length'), { name: 'charSet', type: 'String', defaultValue: null, isRest: false }])],
+        ['readObject', usm({ kind: 'any' }, [])],
         ['readBytes', usm({ kind: 'void' }, [
           { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
           { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
@@ -1304,8 +2140,97 @@ export class SymbolTable {
       constructor: { params: [] },
       superClass: 'EventDispatcher',
       isFinal: false,
-      implements: [],
+      implements: ['IDataInput'],
     });
+    // flash.utils.IDataInput / IDataOutput (AIR): the two byte-stream interfaces
+    // (measured on the installed SDK: airglobal's catalog declares them as
+    // `flash.utils:IDataInput`/`flash.utils:IDataOutput` — NOT flash.net, which is
+    // where the paper docs used to list them; mxmlc rejects the flash.net path).
+    // ByteArray and Socket implement (URLStream implements IDataInput only — it
+    // is read-only). Registered by hand with AIR's FULL member list, so that a
+    // user class which restates them — the real-world case being a TLSSocket
+    // that `extends Socket implements IDataInput, IDataOutput` — passes the
+    // pass-4 conformance check instead of being rejected for members it cannot
+    // (and must not) redeclare.
+    //
+    // Member shapes follow the reference: `bytesAvailable` is read-only, while
+    // `endian`/`objectEncoding` are read-write PROPERTIES (not methods) — which
+    // is why the implementors keep them as `isAccessor` fields. pass 4 compares
+    // NAME and KIND (getter/setter/method), never signatures, so an overload
+    // mismatch cannot slip through this table.
+    //
+    // `readObject`/`writeObject` ARE in the list: ByteArray and URLStream have
+    // had the AMF3 pair since stage 94-4, and Socket got one too (see
+    // Socket_writeObject/Socket_readObject in emit.ts). Leaving them out would
+    // make the interface laxer than AIR (accepting a class that omits them),
+    // which is a silent hole; a loud "unsupported" on Socket's read side is the
+    // honest alternative.
+    {
+      const idin = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'IDataInput', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      const iding = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'IDataInput', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      const idins = (type: string): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type, defaultValue: null, isRest: false }], owner: 'IDataInput', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+      const baP = (name: string): Param => ({ name, type: 'ByteArray', defaultValue: null, isRest: false });
+      const uintP = (name: string): Param => ({ name, type: 'uint', defaultValue: null, isRest: false });
+      interfaceNames.add('IDataInput');
+      this.interfaceMap.set('IDataInput', {
+        reflectFqn: 'flash.utils::IDataInput',
+        getters: new Map([
+          ['bytesAvailable', iding({ kind: 'uint' })],
+          ['endian', iding({ kind: 'string' })],
+          ['objectEncoding', iding({ kind: 'uint' })],
+        ]),
+        setters: new Map([
+          ['endian', idins('String')],
+          ['objectEncoding', idins('uint')],
+        ]),
+        methods: new Map([
+          ['readBoolean', idin({ kind: 'bool' }, [])],
+          ['readByte', idin({ kind: 'int' }, [])],
+          ['readBytes', idin({ kind: 'void' }, [baP('bytes'), uintP('offset'), uintP('length')])],
+          ['readDouble', idin({ kind: 'number' }, [])],
+          ['readFloat', idin({ kind: 'number' }, [])],
+          ['readInt', idin({ kind: 'int' }, [])],
+          ['readMultiByte', idin({ kind: 'string' }, [uintP('length'), { name: 'charSet', type: 'String', defaultValue: null, isRest: false }])],
+          ['readObject', idin({ kind: 'any' }, [])],
+          ['readShort', idin({ kind: 'int' }, [])],
+          ['readUnsignedByte', idin({ kind: 'uint' }, [])],
+          ['readUnsignedInt', idin({ kind: 'uint' }, [])],
+          ['readUnsignedShort', idin({ kind: 'uint' }, [])],
+          ['readUTF', idin({ kind: 'string' }, [])],
+          ['readUTFBytes', idin({ kind: 'string' }, [uintP('length')])],
+        ]),
+      });
+      const idout = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'IDataOutput', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      const idoutg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'IDataOutput', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      const idouts = (type: string): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type, defaultValue: null, isRest: false }], owner: 'IDataOutput', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+      const valP = (type: string): Param => ({ name: 'value', type, defaultValue: null, isRest: false });
+      interfaceNames.add('IDataOutput');
+      this.interfaceMap.set('IDataOutput', {
+        reflectFqn: 'flash.utils::IDataOutput',
+        getters: new Map([
+          ['endian', idoutg({ kind: 'string' })],
+          ['objectEncoding', idoutg({ kind: 'uint' })],
+        ]),
+        setters: new Map([
+          ['endian', idouts('String')],
+          ['objectEncoding', idouts('uint')],
+        ]),
+        methods: new Map([
+          ['writeBoolean', idout({ kind: 'void' }, [valP('Boolean')])],
+          ['writeByte', idout({ kind: 'void' }, [valP('int')])],
+          ['writeBytes', idout({ kind: 'void' }, [baP('bytes'), uintP('offset'), uintP('length')])],
+          ['writeDouble', idout({ kind: 'void' }, [valP('Number')])],
+          ['writeFloat', idout({ kind: 'void' }, [valP('Number')])],
+          ['writeInt', idout({ kind: 'void' }, [valP('int')])],
+          ['writeMultiByte', idout({ kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }, { name: 'charSet', type: 'String', defaultValue: null, isRest: false }])],
+          ['writeObject', idout({ kind: 'void' }, [{ name: 'object', type: 'any', defaultValue: null, isRest: false }])],
+          ['writeShort', idout({ kind: 'void' }, [valP('int')])],
+          ['writeUnsignedInt', idout({ kind: 'void' }, [valP('uint')])],
+          ['writeUTF', idout({ kind: 'void' }, [valP('String')])],
+          ['writeUTFBytes', idout({ kind: 'void' }, [valP('String')])],
+        ]),
+      });
+    }
     // ---- flash.net.Socket / ServerSocket / XMLSocket / SecureSocket (stage 89·54) ----
     //
     // The member list follows the ActionScript 3.0 reference class-for-class.
@@ -1351,8 +2276,11 @@ export class SymbolTable {
     ]);
     this.classMap.set('Socket', {
       fields: new Map([
-        ['endian', skf({ kind: 'string' }, 'Socket')],
-        ['objectEncoding', skf({ kind: 'uint' }, 'Socket')],
+        // IDataInput/IDataOutput declare endian/objectEncoding as read-write
+        // accessors; AIR stores them as slots here, marked `isAccessor` so pass 4
+        // accepts the field as the accessor pair (DisplayObject.x convention).
+        ['endian', { ...skf({ kind: 'string' }, 'Socket'), isAccessor: true }],
+        ['objectEncoding', { ...skf({ kind: 'uint' }, 'Socket'), isAccessor: true }],
         ['timeout', skf({ kind: 'int' }, 'Socket')],
         ['tcpNoDelay', skf({ kind: 'bool' }, 'Socket')],
       ]),
@@ -1382,6 +2310,14 @@ export class SymbolTable {
           sk_num('offset'),
           sk_num('length'),
         ])],
+        // The AMF3 pair IDataInput/IDataOutput declare. writeObject is exact
+        // (serialize, then hand the buffer to the socket's write sink).
+        // readObject is the one member this subset cannot model: an AMF3 value
+        // may span several packets and our socket read side consumes bytes
+        // destructively (there is no push-back), so it fails loudly instead of
+        // silently mis-parsing a stream — see Socket_readObject in emit.ts.
+        ['writeObject', skm('Socket', { kind: 'void' }, [{ name: 'object', type: 'any', defaultValue: null, isRest: false }])],
+        ['readObject', skm('Socket', { kind: 'any' }, [])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1397,13 +2333,15 @@ export class SymbolTable {
       setters: new Map(),
       // Socket() and Socket(host, port) are both documented, and AIR's ctor with a
       // host connects immediately. The port is required once the host is given.
+      // Socket implements both byte-stream interfaces, so its members are the
+      // IDataInput/IDataOutput list (see the block above).
       constructor: { params: [
         { name: 'host', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
         { name: 'port', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
       ] },
       superClass: 'EventDispatcher',
       isFinal: false,
-      implements: [],
+      implements: ['IDataInput', 'IDataOutput'],
     });
     // SecureSocket: TLS on top of Socket. The TLS half is not implemented yet,
     // and the class reports that honestly (isSupported = false, connect()
@@ -1891,14 +2829,44 @@ export class SymbolTable {
       });
     };
     constClass('StageAlign', { TOP: 'T', BOTTOM: 'B', LEFT: 'L', RIGHT: 'R', TOP_LEFT: 'TL', TOP_RIGHT: 'TR', BOTTOM_LEFT: 'BL', BOTTOM_RIGHT: 'BR' });
+    // NativeWindow token classes (阶段八十九·七十一). Values measured on adl:
+    // Resize.NONE is the empty string, and the resize codes reuse the same
+    // T/B/L/R/"BR" letters as StageAlign.
+    constClass('NativeWindowSystemChrome', { STANDARD: 'standard', NONE: 'none', ALTERNATE: 'alternate' });
+    constClass('NativeWindowType', { NORMAL: 'normal', UTILITY: 'utility', LIGHTWEIGHT: 'lightweight' });
+    constClass('NativeWindowRenderMode', { AUTO: 'auto', DIRECT: 'direct', CPU: 'cpu', GPU: 'gpu' });
+    constClass('NativeWindowDisplayState', { NORMAL: 'normal', MINIMIZED: 'minimized', MAXIMIZED: 'maximized' });
+    constClass('NativeWindowResize', { NONE: '', TOP: 'T', BOTTOM: 'B', LEFT: 'L', RIGHT: 'R', TOP_LEFT: 'TL', TOP_RIGHT: 'TR', BOTTOM_LEFT: 'BL', BOTTOM_RIGHT: 'BR' });
     constClass('StageScaleMode', { EXACT_FIT: 'exactFit', SHOW_ALL: 'showAll', NO_BORDER: 'noBorder', NO_SCALE: 'noScale' });
+    // flash.display.BlendMode: one String constant per mix operator (the values are
+    // the operator names themselves, so no mapping table is needed here or in user
+    // code). AIR's LAYER is group isolation rather than an operator.
+    constClass('BlendMode', {
+      NORMAL: 'normal', LAYER: 'layer', MULTIPLY: 'multiply', SCREEN: 'screen',
+      LIGHTEN: 'lighten', DARKEN: 'darken', DIFFERENCE: 'difference', ADD: 'add',
+      SUBTRACT: 'subtract', INVERT: 'invert', ALPHA: 'alpha', ERASE: 'erase',
+      OVERLAY: 'overlay', HARDLIGHT: 'hardlight', SHADER: 'shader',
+    });
     constClass('StageQuality', { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', BEST: 'best' });
     constClass('StageDisplayState', { NORMAL: 'normal', FULL_SCREEN: 'fullScreen', FULL_SCREEN_INTERACTIVE: 'fullScreenInteractive' });
     constClass('TextFieldAutoSize', { NONE: 'none', LEFT: 'left', RIGHT: 'right', CENTER: 'center' });
+    // flash.text.TextFieldType (stage 94·7). Values measured on adl 51.4.1
+    // (temp/editprobe): TextFieldType.INPUT == "input" and DYNAMIC == "dynamic",
+    // and a fresh TextField reports type == "dynamic".
+    constClass('TextFieldType', { DYNAMIC: 'dynamic', INPUT: 'input' });
     constClass('AntiAliasType', { NORMAL: 'normal', ADVANCED: 'advanced' });
     constClass('TextFormatAlign', { LEFT: 'left', RIGHT: 'right', CENTER: 'center', JUSTIFY: 'justify' });
     constClass('TouchPhase', { BEGAN: 'began', MOVED: 'moved', ENDED: 'ended', STATIONARY: 'stationary', HOVER: 'hover' });
     constClass('MouseCursor', { AUTO: 'auto', ARROW: 'arrow', BUTTON: 'button', HAND: 'hand', IBEAM: 'ibeam' });
+    // Stage 110 (away3d-core walls): drawing-style / culling / orientation /
+    // shader-precision constant classes. Every value measured on adl 51.4.1
+    // (temp/constprobe/adl.txt), e.g. CapsStyle.NONE == "none".
+    constClass('CapsStyle', { NONE: 'none', ROUND: 'round', SQUARE: 'square' });
+    constClass('LineScaleMode', { NONE: 'none', NORMAL: 'normal', VERTICAL: 'vertical', HORIZONTAL: 'horizontal' });
+    constClass('TriangleCulling', { NONE: 'none', POSITIVE: 'positive', NEGATIVE: 'negative' });
+    // flash.geom.Orientation3D: the strings Matrix3D.decompose/recompose accept.
+    constClass('Orientation3D', { AXIS_ANGLE: 'axisAngle', EULER_ANGLES: 'eulerAngles', QUATERNION: 'quaternion' });
+    constClass('ShaderPrecision', { FAST: 'fast', FULL: 'full' });
     // ---- flash.net.SharedObject (stage 89·40) ----
     // Local shared objects persisted under applicationStorageDirectory. AIR's own
     // container is an AMF3 ".sol" file; this subset persists JSON through the
@@ -2043,20 +3011,48 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
-    // flash.events.TouchEvent (stage 93): multi-touch input. Fields model the
-    // touch-point state Starling reads (stageX/Y, touchPointID, pressure, size,
-    // primary flag); static constants are the event-type strings.
+    // flash.events.TouchEvent (stage 93; full AIR shape filled in while clearing
+    // away3d-core walls): multi-touch input. Field set and constructor parameter
+    // order come from the AIR 3.0 class reference --
+    // TouchEvent(type, bubbles, cancelable, touchPointID, isPrimaryTouchPoint,
+    //           localX, localY, sizeX, sizeY, pressure, relatedObject, ctrlKey,
+    //           altKey, shiftKey, commandKey, controlKey, timestamp, touchIntent,
+    //           samples, isTouchPointCanceled)
+    // Note the 11th parameter is relatedObject: there is no 16-argument shape, and
+    // passing a Boolean there is the mxmlc coercion error the probe hit (measured:
+    // temp/tevtprobe/). localX/localY are plain fields whose NaN default comes
+    // from the constructor arguments, while stageX/stageY are READ-ONLY DERIVED
+    // getters: AIR calculates them when localX/localY is set, and with no stage
+    // transform in this compiler that value is 0.0 (measured: adl,
+    // `new TouchEvent("touchMove")` -> stageX NaN while localX is NaN, but 0 once
+    // localX is set -- and writing stageX is rejected, matching mxmlc's
+    // "property stageX is read-only"). `samples` is accepted by the constructor
+    // but not stored: AIR exposes no `samples` property and getSamples() reports 0
+    // because no sample buffer exists. Touch input itself is not implemented (our
+    // Stage never dispatches TouchEvent), so these objects only ever come from
+    // user code -- same standing gap as the native touch backends.
     const tef = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'TouchEvent', isStatic: false, isConst: false });
     const tec = (value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner: 'TouchEvent', isStatic: true, isConst: true });
+    const teNum = (name: string): Param => ({ name, type: 'Number', defaultValue: { kind: 'Num', value: NaN, isInt: false }, isRest: false });
     this.classMap.set('TouchEvent', {
       fields: new Map([
-        ['stageX', tef({ kind: 'number' })],
-        ['stageY', tef({ kind: 'number' })],
-        ['touchPointID', tef({ kind: 'int' })],
-        ['pressure', tef({ kind: 'number' })],
+        ['localX', tef({ kind: 'number' })],
+        ['localY', tef({ kind: 'number' })],
         ['sizeX', tef({ kind: 'number' })],
         ['sizeY', tef({ kind: 'number' })],
+        ['pressure', tef({ kind: 'number' })],
+        ['timestamp', tef({ kind: 'number' })],
+        ['touchPointID', tef({ kind: 'int' })],
+        ['relatedObject', tef({ kind: 'object', className: 'InteractiveObject' })],
         ['isPrimaryTouchPoint', tef({ kind: 'bool' })],
+        ['isRelatedObjectInaccessible', tef({ kind: 'bool' })],
+        ['isTouchPointCanceled', tef({ kind: 'bool' })],
+        ['ctrlKey', tef({ kind: 'bool' })],
+        ['altKey', tef({ kind: 'bool' })],
+        ['shiftKey', tef({ kind: 'bool' })],
+        ['commandKey', tef({ kind: 'bool' })],
+        ['controlKey', tef({ kind: 'bool' })],
+        ['touchIntent', { type: { kind: 'string' }, init: { kind: 'Str', value: 'unknown' }, visibility: 'public', owner: 'TouchEvent', isStatic: false, isConst: false }],
       ]),
       methods: new Map(),
       staticFields: new Map([
@@ -2068,12 +3064,42 @@ export class SymbolTable {
         ['TOUCH_ROLL_OVER', tec('touchRollOver')],
         ['TOUCH_ROLL_OUT', tec('touchRollOut')],
         ['TOUCH_TAP', tec('touchTap')],
+        ['PROXIMITY_BEGIN', tec('proximityBegin')],
+        ['PROXIMITY_MOVE', tec('proximityMove')],
+        ['PROXIMITY_END', tec('proximityEnd')],
+        ['PROXIMITY_OVER', tec('proximityOver')],
+        ['PROXIMITY_OUT', tec('proximityOut')],
+        ['PROXIMITY_ROLL_OVER', tec('proximityRollOver')],
+        ['PROXIMITY_ROLL_OUT', tec('proximityRollOut')],
       ]),
       staticMethods: new Map(),
-      getters: new Map(),
+      // stageX/stageY are derived, not stored -- see the class comment above.
+      getters: new Map([
+        ['stageX', { returnType: { kind: 'number' }, params: [], owner: 'TouchEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['stageY', { returnType: { kind: 'number' }, params: [], owner: 'TouchEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       setters: new Map(),
       constructor: { params: [
         { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', true),
+        meBool('cancelable', false),
+        { name: 'touchPointID', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        meBool('isPrimaryTouchPoint', false),
+        teNum('localX'),
+        teNum('localY'),
+        teNum('sizeX'),
+        teNum('sizeY'),
+        teNum('pressure'),
+        { name: 'relatedObject', type: 'InteractiveObject', defaultValue: { kind: 'Null' }, isRest: false },
+        meBool('ctrlKey', false),
+        meBool('altKey', false),
+        meBool('shiftKey', false),
+        meBool('commandKey', false),
+        meBool('controlKey', false),
+        teNum('timestamp'),
+        { name: 'touchIntent', type: 'String', defaultValue: { kind: 'Str', value: 'unknown' }, isRest: false },
+        { name: 'samples', type: 'ByteArray', defaultValue: { kind: 'Null' }, isRest: false },
+        meBool('isTouchPointCanceled', false),
       ] },
       superClass: 'Event',
       isFinal: false,
@@ -2102,6 +3128,35 @@ export class SymbolTable {
         meBool('cancelable', false),
         { name: 'charCode', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         { name: 'keyCode', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.events.TextEvent (stage 94·7): the text-input event an editable
+    // TextField dispatches before it applies a typed/pasted character. Measured on
+    // adl 51.4.1 (temp/editprobe): TEXT_INPUT == "textInput", bubbles == true,
+    // cancelable == true, and the payload is the text about to be inserted (the
+    // whole pasted string for a paste, one character per keystroke). A canceling
+    // listener (preventDefault) stops the insertion and the change event; rewriting
+    // `text` only changes what later listeners see — the insertion still uses the
+    // text the field received (measured: rewriting "Y" to "Z" still inserted "Y").
+    this.classMap.set('TextEvent', {
+      fields: new Map([
+        ['text', mef({ kind: 'string' }, 'TextEvent')],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['TEXT_INPUT', mec('TextEvent', 'textInput')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', true),
+        meBool('cancelable', false),
+        { name: 'text', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
       ] },
       superClass: 'Event',
       isFinal: false,
@@ -2247,6 +3302,41 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // flash.events.VsyncStateChangeAvailabilityEvent — an ENHANCED builtin (stage
+    // 一百二十九). AIR defines the event but exposes NO refresh-rate query anywhere
+    // (measured on mxmlc/adl 51.4.1: Stage.vsyncEnabled exists, but Stage.refreshRate,
+    // Stage3D.refreshRate, Screen.refreshRate and Stage.vsyncStateChangeAvailability
+    // are all rejected as undefined, and the event's only own AIR property is the
+    // read-only `available:Boolean`). We keep `available` exactly as AIR defines it —
+    // same field, same value adl reports — and ADD a `refreshRate:Number` field that
+    // carries the real refresh rate (Hz) of the display the window occupies, so a
+    // portable app can match `stage.frameRate` to the panel instead of guessing.
+    // The addition is opt-in and additive: AIR's ctor (max 4 args, verified with
+    // mxmlc's "不超过 4 个" argument-count error) stays valid, and AIR programs never
+    // pass the 5th. See docs/zh-cn/enhancements.md.
+    this.classMap.set('VsyncStateChangeAvailabilityEvent', {
+      fields: new Map([
+        ['available', mef({ kind: 'bool' }, 'VsyncStateChangeAvailabilityEvent')],
+        ['refreshRate', mef({ kind: 'number' }, 'VsyncStateChangeAvailabilityEvent')],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['VSYNC_STATE_CHANGE_AVAILABILITY', mec('VsyncStateChangeAvailabilityEvent', 'vSyncStateChangeAvailability')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', false),
+        meBool('cancelable', false),
+        meBool('available', false),
+        { name: 'refreshRate', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
     // flash.events.HTTPStatusEvent / SecurityErrorEvent (AIR): HTTPStatusEvent adds
     // status/responseURL/responseHeaders; SecurityErrorEvent only adds a constant
     // (text is inherited from ErrorEvent).
@@ -2291,6 +3381,232 @@ export class SymbolTable {
         { name: 'text', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
       ] },
       superClass: 'ErrorEvent',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.events.NetStatusEvent / AsyncErrorEvent / ContextMenuEvent (stage 110,
+    // away3d-core walls). Only what the tree touches is modelled: the event
+    // constants plus NetStatusEvent.info, which a handler indexes as
+    // event.info["code"] (String keys measured on adl 51.4.1, temp/constprobe).
+    this.classMap.set('NetStatusEvent', {
+      fields: new Map([
+        ['info', mef({ kind: 'object', className: 'Object' }, 'NetStatusEvent')],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['NET_STATUS', mec('NetStatusEvent', 'netStatus')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', false),
+        meBool('cancelable', false),
+        { name: 'info', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
+    // AsyncErrorEvent: the asynchronous counterpart of ErrorEvent. AIR's payload is
+    // the thrown Error itself (inherited `text` is unused by the tree).
+    this.classMap.set('AsyncErrorEvent', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['ASYNC_ERROR', mec('AsyncErrorEvent', 'asyncError')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', false),
+        meBool('cancelable', false),
+        { name: 'text', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
+      ] },
+      superClass: 'ErrorEvent',
+      isFinal: false,
+      implements: [],
+    });
+    // ContextMenuEvent: MENU_SELECT fires on the display object, MENU_ITEM_SELECT on
+    // a ContextMenuItem. This subset never shows a native menu, so neither is ever
+    // dispatched (documented gap); the class exists so handlers and
+    // addEventListener calls type-check and link.
+    this.classMap.set('ContextMenuEvent', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['MENU_ITEM_SELECT', mec('ContextMenuEvent', 'menuItemSelect')],
+        ['MENU_SELECT', mec('ContextMenuEvent', 'menuSelect')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', false),
+        meBool('cancelable', false),
+        { name: 'mouseTarget', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'contextMenuOwner', type: 'InteractiveObject', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.ui.ContextMenu / ContextMenuItem / ContextMenuBuiltInItems (stage 110).
+    // The data model is faithful (measured with adl 51.4.1, temp/constprobe): a
+    // fresh ContextMenu owns an empty customItems array and a
+    // ContextMenuBuiltInItems object, and `new ContextMenuItem(caption,
+    // separatorBefore, enabled, visible)` copies its four arguments verbatim
+    // (caption "Cap\tx" round-trips). ContextMenuItem is an EventDispatcher because
+    // MENU_ITEM_SELECT listeners are attached to it. ContextMenuBuiltInItems'
+    // individual flags are NOT modelled (the tree never reads them).
+    const cmiF = (owner: string, t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
+    const cmiM = (owner: string, ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const cmiP = (name: string, t: ASType, def: Extract<Expr, { kind: 'Bool' }> | Extract<Expr, { kind: 'Str' }> | null): Param => ({ name, type: t, defaultValue: def, isRest: false });
+    this.classMap.set('ContextMenuBuiltInItems', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    this.classMap.set('ContextMenuItem', {
+      fields: new Map([
+        ['caption', cmiF('ContextMenuItem', { kind: 'string' })],
+        ['separatorBefore', cmiF('ContextMenuItem', { kind: 'bool' })],
+        ['enabled', cmiF('ContextMenuItem', { kind: 'bool' })],
+        ['visible', cmiF('ContextMenuItem', { kind: 'bool' })],
+        ['isSeparator', cmiF('ContextMenuItem', { kind: 'bool' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        cmiP('caption', 'String', { kind: 'Str', value: '' }),
+        cmiP('separatorBefore', 'Boolean', { kind: 'Bool', value: false }),
+        cmiP('enabled', 'Boolean', { kind: 'Bool', value: true }),
+        cmiP('visible', 'Boolean', { kind: 'Bool', value: true }),
+        cmiP('isSeparator', 'Boolean', { kind: 'Bool', value: false }),
+      ] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    this.classMap.set('ContextMenu', {
+      fields: new Map([
+        ['customItems', cmiF('ContextMenu', { kind: 'array' })],
+        ['builtInItems', cmiF('ContextMenu', { kind: 'object', className: 'ContextMenuBuiltInItems' })],
+      ]),
+      methods: new Map([
+        ['hideBuiltInItems', cmiM('ContextMenu', { kind: 'void' }, [])],
+        ['addItem', cmiM('ContextMenu', { kind: 'void' }, [{ name: 'item', type: 'ContextMenuItem', defaultValue: null, isRest: false }])],
+        ['removeItem', cmiM('ContextMenu', { kind: 'void' }, [{ name: 'item', type: 'ContextMenuItem', defaultValue: null, isRest: false }])],
+        ['containsItem', cmiM('ContextMenu', { kind: 'bool' }, [{ name: 'item', type: 'ContextMenuItem', defaultValue: null, isRest: false }])],
+        ['clone', cmiM('ContextMenu', { kind: 'object', className: 'ContextMenu' }, [])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.display.Shader / ShaderData / ShaderJob (stage 110). A Pixel Bender
+    // kernel cannot be interpreted by an AOT subset, so `new Shader(bytes)` with
+    // non-null bytecode fails loudly instead of pretending (the AIR validity error
+    // for empty bytecode, ArgumentError #2004, is matched first). `new Shader(null)`
+    // is legal in AIR and yields data == null — both measured on adl 51.4.1
+    // (temp/shaderprobe). ShaderData is dynamic: kernels are addressed by the
+    // parameter names baked into the PBJ metadata, which this subset does not
+    // parse, so `data.<name>` resolves through the dynamic slot table.
+    const shF = (owner: string, t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner, isStatic: false, isConst: false });
+    const shG = (owner: string, t: CType): MethodInfo => ({ returnType: t, params: [], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const shS = (owner: string, pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+    this.classMap.set('ShaderData', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      isDynamic: true,
+      implements: [],
+    });
+    this.classMap.set('Shader', {
+      fields: new Map([
+        ['_code', shF('Shader', { kind: 'object', className: 'ByteArray' })],
+        ['_data', shF('Shader', { kind: 'object', className: 'ShaderData' })],
+        ['_precisionHint', shF('Shader', { kind: 'string' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['data', shG('Shader', { kind: 'object', className: 'ShaderData' })],
+        ['precisionHint', shG('Shader', { kind: 'string' })],
+      ]),
+      setters: new Map([
+        ['precisionHint', shS('Shader', 'String')],
+        // AIR exposes byteCode as write-only; a read is a compile error here (the
+        // same loud failure as any setter-only accessor).
+        ['byteCode', shS('Shader', 'ByteArray')],
+      ]),
+      constructor: { params: [
+        { name: 'code', type: 'ByteArray', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+    });
+    this.classMap.set('ShaderJob', {
+      fields: new Map([
+        ['_shader', shF('ShaderJob', { kind: 'object', className: 'Shader' })],
+        ['_target', shF('ShaderJob', { kind: 'object', className: 'Object' })],
+        ['_width', shF('ShaderJob', { kind: 'int' })],
+        ['_height', shF('ShaderJob', { kind: 'int' })],
+        ['_progress', shF('ShaderJob', { kind: 'number' })],
+      ]),
+      methods: new Map([
+        ['start', cmiM('ShaderJob', { kind: 'void' }, [cmiP('waitForCompletion', 'Boolean', { kind: 'Bool', value: false })])],
+        ['cancel', cmiM('ShaderJob', { kind: 'void' }, [])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['shader', shG('ShaderJob', { kind: 'object', className: 'Shader' })],
+        ['target', shG('ShaderJob', { kind: 'object', className: 'Object' })],
+        ['width', shG('ShaderJob', { kind: 'int' })],
+        ['height', shG('ShaderJob', { kind: 'int' })],
+        ['progress', shG('ShaderJob', { kind: 'number' })],
+      ]),
+      setters: new Map([
+        ['shader', shS('ShaderJob', 'Shader')],
+        ['target', shS('ShaderJob', 'Object')],
+        ['width', shS('ShaderJob', 'int')],
+        ['height', shS('ShaderJob', 'int')],
+      ]),
+      constructor: { params: [
+        { name: 'shader', type: 'Shader', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'target', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'width', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        { name: 'height', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+      ] },
+      superClass: 'EventDispatcher',
       isFinal: false,
       implements: [],
     });
@@ -2342,6 +3658,7 @@ export class SymbolTable {
     // boundary as `void*` (`kind: 'null'`), so AS3 never sees their layout.
     const gpf = (): FieldInfo => ({ type: { kind: 'null' }, init: null, visibility: 'public', owner: 'Graphics', isStatic: false, isConst: false });
     const gpm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Graphics', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const gpf2 = (): FieldInfo => ({ type: { kind: 'number' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false });
     const gnum = (name: string, def: number): Param => ({ name, type: 'Number', defaultValue: { kind: 'Num', value: def, isInt: false }, isRest: false });
     const guint = (name: string, def: number): Param => ({ name, type: 'uint', defaultValue: { kind: 'Num', value: def, isInt: true }, isRest: false });
     this.classMap.set('Graphics', {
@@ -2349,14 +3666,74 @@ export class SymbolTable {
         ['path', gpf()],
         ['fill', gpf()],
         ['stroke', gpf()],
+        // Line thickness of the CURRENT stroke. Not an AIR-visible property: it
+        // exists so DisplayObject width/height can add the stroke extent, which
+        // adl reports (a 0..100 line with a 10px stroke measures 110x10) while
+        // getRect stays 0,0,100,0.
+        ['strokeWidth', { type: { kind: 'number' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
+        // Widest stroke ever set on this Graphics, never reset by a flush: the
+        // stroke-inclusive bound must cover groups that were already closed.
+        ['_max_sw', { type: { kind: 'number' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
+        // CPU-side bounding box of the accumulated path (_bl.._bb + _has_b),
+        // maintained by every path mutation. It mirrors SkPath::getBounds() (which
+        // includes curve control points) and exists so DisplayObject width/height
+        // and the hit test stay measurable in a PURE-C build too, where every Skia
+        // stub returns no geometry at all — and it avoids paying an Skia call on
+        // every width read on the hot path.
+        ['_bl', gpf2()], ['_bt', gpf2()], ['_br', gpf2()], ['_bb', gpf2()],
+        ['_has_b', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
+        // Ordered draw groups (swc.md §9 E): the current group is (path, fill,
+        // stroke); `draws`/`draw_tail` are the already-closed ones. `_cur_has`
+        // says whether the current group holds any geometry (so an empty group is
+        // never appended), `_cur_open`/`_lastx`/`_lasty` carry the current pen
+        // position so a style change mid-path resumes the stroke where it left
+        // off instead of dropping the segment.
+        ['draws', gpf()], ['draw_tail', gpf()],
+        ['_lastx', gpf2()], ['_lasty', gpf2()],
+        ['_cur_open', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
+        ['_cur_has', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
+        // 1 = even-odd (AIR's Graphics default: two same-direction nested drawRect
+        // subpaths leave the inner rect hollow, measured temp/editprobe/Ed21 §E).
+        // Baked `DefineShape4` geometry that sets UsesFillWindingRule uses even_odd
+        // = 0 instead, and every new group re-applies the rule (swc.md §9 E).
+        ['_even_odd', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
+        // Rasterisation clip (swc.md §9 E): AIR clips a DefineShape to its own
+        // ShapeBounds, so a subpath that reaches past them is CUT at the bound.
+        // Measured on skin.swc shape #319: its third subpath runs out to x=176.35
+        // px while ShapeBounds ends at 124.45 — adl paints nothing beyond 124.45,
+        // we painted the whole rect (the "extra block" in the cmp renders).
+        // `_clip` = 0 for every Graphics built through the AS3 API.
+        ['_clip', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
+        ['_clx', gpf2()], ['_cly', gpf2()], ['_clw', gpf2()], ['_clh', gpf2()],
       ]),
       methods: new Map([
         ['moveTo', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0)])],
         ['lineTo', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0)])],
         ['curveTo', gpm({ kind: 'void' }, [gnum('controlX', 0), gnum('controlY', 0), gnum('anchorX', 0), gnum('anchorY', 0)])],
         ['beginFill', gpm({ kind: 'void' }, [guint('color', 0), gnum('alpha', 1)])],
+        // AIR: beginBitmapFill(bitmap:BitmapData, matrix:Matrix = null,
+        // repeat:Boolean = true, smooth:Boolean = false). A null matrix is the
+        // identity, i.e. the bitmap's own pixel rect at the shape's origin.
+        ['beginBitmapFill', gpm({ kind: 'void' }, [
+          { name: 'bitmap', type: 'BitmapData', defaultValue: null, isRest: false },
+          { name: 'matrix', type: 'Matrix', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'repeat', type: 'Boolean', defaultValue: { kind: 'Bool', value: true }, isRest: false },
+          { name: 'smooth', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
         ['endFill', gpm({ kind: 'void' }, [])],
-        ['lineStyle', gpm({ kind: 'void' }, [gnum('thickness', 0), guint('color', 0), gnum('alpha', 1)])],
+        ['lineStyle', gpm({ kind: 'void' }, [
+          gnum('thickness', 0), guint('color', 0), gnum('alpha', 1),
+          // AIR's full parameter list (stage 98, clearing the away3d wall at
+          // AwayStats.as:384): pixelHinting/scaleMode/caps/joints/miterLimit.
+          // caps/joints/miterLimit are applied to the Skia stroke; pixelHinting
+          // has no Skia equivalent and scaleMode only models "normal" (both are
+          // accepted and documented in README's limitations).
+          { name: 'pixelHinting', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          { name: 'scaleMode', type: 'String', defaultValue: { kind: 'Str', value: 'normal' }, isRest: false },
+          { name: 'caps', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'joints', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          gnum('miterLimit', 3),
+        ])],
         ['beginGradientFill', gpm({ kind: 'void' }, [
           { name: 'type', type: 'String', defaultValue: null, isRest: false },
           { name: 'colors', type: 'Array', defaultValue: null, isRest: false },
@@ -2367,6 +3744,16 @@ export class SymbolTable {
         ['drawRect', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0)])],
         ['drawRoundRect', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0), gnum('ellipseWidth', 0), gnum('ellipseHeight', 0)])],
         ['drawCircle', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('radius', 0)])],
+        // AIR: drawTriangles(vertices:Vector.<Number>, indices:Vector.<int> = null,
+        // uvtData:Vector.<Number> = null, culling:String = "none"). Note the vertices
+        // come FIRST here, unlike Context3D.drawTriangles (WireframeMapGenerator calls
+        // g.drawTriangles(uvPositions, indexClone, null, TriangleCulling.NONE)).
+        ['drawTriangles', gpm({ kind: 'void' }, [
+          { name: 'vertices', type: 'Vector.<Number>', defaultValue: null, isRest: false },
+          { name: 'indices', type: 'Vector.<int>', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'uvtData', type: 'Vector.<Number>', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'culling', type: 'String', defaultValue: { kind: 'Str', value: 'none' }, isRest: false },
+        ])],
         ['clear', gpm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
@@ -2428,6 +3815,20 @@ export class SymbolTable {
           { name: 'y', type: 'int', defaultValue: null, isRest: false },
           { name: 'color', type: 'uint', defaultValue: null, isRest: false },
         ])],
+        // getPixel32/setPixel32: the ARGB (alpha-inclusive) counterparts of
+        // getPixel/setPixel. `pixels` stores straight ARGB 0xAARRGGBB, which is
+        // exactly what these return/take (see the ARGB contract note in TODO.md
+        // and swc.md §3.2). setPixel32 honors alpha only for a transparent
+        // BitmapData, like AIR.
+        ['getPixel32', bdm({ kind: 'uint' }, [
+          { name: 'x', type: 'int', defaultValue: null, isRest: false },
+          { name: 'y', type: 'int', defaultValue: null, isRest: false },
+        ])],
+        ['setPixel32', bdm({ kind: 'void' }, [
+          { name: 'x', type: 'int', defaultValue: null, isRest: false },
+          { name: 'y', type: 'int', defaultValue: null, isRest: false },
+          { name: 'color', type: 'uint', defaultValue: null, isRest: false },
+        ])],
         ['loadFile', bdm({ kind: 'void' }, [{ name: 'path', type: 'String', defaultValue: null, isRest: false }])],
         ['fillRect', bdm({ kind: 'void' }, [
           { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
@@ -2468,6 +3869,36 @@ export class SymbolTable {
           { name: 'alphaPoint', type: 'Point', defaultValue: { kind: 'Null' }, isRest: false },
           { name: 'mergeAlpha', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
         ])],
+        // copyChannel (stage 110, away3d SplatBlendBitmapTexture): straight 8-bit
+        // channel transfer between two ARGB buffers. AIR's channel selectors are
+        // BitmapDataChannel.RED/GREEN/BLUE/ALPHA == 1/2/4/8.
+        ['copyChannel', bdm({ kind: 'void' }, [
+          { name: 'sourceBitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
+          { name: 'sourceRect', type: 'Rectangle', defaultValue: null, isRest: false },
+          { name: 'destPoint', type: 'Point', defaultValue: null, isRest: false },
+          { name: 'sourceChannel', type: 'uint', defaultValue: null, isRest: false },
+          { name: 'destChannel', type: 'uint', defaultValue: null, isRest: false },
+        ])],
+        // clone/scroll/setVector/lock/unlock (stage 111, away3d walls: `BitmapData
+        // has no method 'clone'` in SplatBlendBitmapTexture and `'scroll'` in
+        // AwayStats). Signatures are AIR's: scroll(x:int, y:int), setVector(rect,
+        // inputVector:Vector.<uint>), clone():BitmapData. lock/unlock exist in AIR
+        // (deprecated there) and are accepted as a no-op: our pixel buffer is
+        // always live, so there is nothing to stage or flush.
+        ['clone', bdm({ kind: 'object', className: 'BitmapData' }, [])],
+        ['scroll', bdm({ kind: 'void' }, [
+          { name: 'x', type: 'int', defaultValue: null, isRest: false },
+          { name: 'y', type: 'int', defaultValue: null, isRest: false },
+        ])],
+        ['setVector', bdm({ kind: 'void' }, [
+          { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
+          { name: 'inputVector', type: 'Vector.<uint>', defaultValue: null, isRest: false },
+        ])],
+        ['getVector', bdm({ kind: 'vector', elem: { kind: 'uint' } }, [
+          { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
+        ])],
+        ['lock', bdm({ kind: 'void' }, [])],
+        ['unlock', bdm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -2559,6 +3990,9 @@ export class SymbolTable {
         ['inner', flf({ kind: 'bool' }, 'DropShadowFilter')],
         ['knockout', flf({ kind: 'bool' }, 'DropShadowFilter')],
         ['hideObject', flf({ kind: 'bool' }, 'DropShadowFilter')],
+        // C-runtime-only: skip painting the source under the shadow. Mirrors AS3's
+        // hideObject, and carries the SWC CompositeSource bit for the same purpose.
+        ['_shadow_only', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'DropShadowFilter', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['clone', flm({ kind: 'object', className: 'BitmapFilter' }, [], 'DropShadowFilter')],
@@ -2594,6 +4028,11 @@ export class SymbolTable {
         ['quality', flf({ kind: 'int' }, 'GlowFilter')],
         ['inner', flf({ kind: 'bool' }, 'GlowFilter')],
         ['knockout', flf({ kind: 'bool' }, 'GlowFilter')],
+        // Draw the halo WITHOUT the source on top. AS3 has no such flag on a glow;
+        // the SWC `FILTERLIST`'s CompositeSource bit does (swc.md §9.2 F4), and it
+        // reaches the rasterizer through this C-runtime-only field (never visible
+        // to AS3 name resolution, exactly like Sprite._graphics).
+        ['_shadow_only', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'GlowFilter', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['clone', flm({ kind: 'object', className: 'BitmapFilter' }, [], 'GlowFilter')],
@@ -2648,7 +4087,12 @@ export class SymbolTable {
         ['length', bayf({ kind: 'int' })],
         ['capacity', bayf({ kind: 'int' })],
         ['position', bayf({ kind: 'int' })],
-        ['endian', bayf({ kind: 'string' })],
+        // endian/objectEncoding are IDataInput/IDataOutput accessors in AIR;
+        // `isAccessor` marks the C slot as that accessor pair for pass 4.
+        ['endian', { ...bayf({ kind: 'string' }), isAccessor: true }],
+        // ObjectEncoding.AMF3 is the documented (and measured) default for both
+        // ByteArray and URLStream; readObject/writeObject consult it.
+        ['objectEncoding', { ...bayf({ kind: 'uint' }), isAccessor: true }],
       ]),
       methods: new Map([
         ['writeByte', baym({ kind: 'void' }, [{ name: 'v', type: 'int', defaultValue: null, isRest: false }])],
@@ -2656,6 +4100,9 @@ export class SymbolTable {
         ['writeInt', baym({ kind: 'void' }, [{ name: 'v', type: 'int', defaultValue: null, isRest: false }])],
         ['writeUnsignedInt', baym({ kind: 'void' }, [{ name: 'v', type: 'uint', defaultValue: null, isRest: false }])],
         ['writeFloat', baym({ kind: 'void' }, [{ name: 'v', type: 'Number', defaultValue: null, isRest: false }])],
+        // IDataOutput declares writeDouble alongside writeFloat; readDouble has
+        // been here since stage 36, so the asymmetric half was an omission.
+        ['writeDouble', baym({ kind: 'void' }, [{ name: 'v', type: 'Number', defaultValue: null, isRest: false }])],
         ['writeUTFBytes', baym({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
         ['writeUTF', baym({ kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
         ['writeBytes', baym({ kind: 'void' }, [
@@ -2672,20 +4119,45 @@ export class SymbolTable {
         ['readFloat', baym({ kind: 'number' }, [])],
         ['readDouble', baym({ kind: 'number' }, [])],
         ['readUTF', baym({ kind: 'string' }, [])],
-        ['readUTFBytes', baym({ kind: 'string' }, [{ name: 'n', type: 'int', defaultValue: null, isRest: false }])],
+        ['readUTFBytes', baym({ kind: 'string' }, [{ name: 'length', type: 'uint', defaultValue: null, isRest: false }])],
+        // IDataInput/IDataOutput multi-byte + boolean (stage 94-4). readMultiByte
+        // decodes with the named charset (utf-8 / unicode / gbk / system code
+        // pages), writeMultiByte encodes into it; both honour `endian` for the
+        // UTF-16 family. readBoolean treats any non-zero byte as true and
+        // writeBoolean emits one byte, both measured on adl 51.4.1.
+        ['readMultiByte', baym({ kind: 'string' }, [
+          { name: 'length', type: 'uint', defaultValue: null, isRest: false },
+          { name: 'charSet', type: 'String', defaultValue: null, isRest: false },
+        ])],
+        ['writeMultiByte', baym({ kind: 'void' }, [
+          { name: 'value', type: 'String', defaultValue: null, isRest: false },
+          { name: 'charSet', type: 'String', defaultValue: null, isRest: false },
+        ])],
+        ['readBoolean', baym({ kind: 'bool' }, [])],
+        ['writeBoolean', baym({ kind: 'void' }, [{ name: 'value', type: 'Boolean', defaultValue: null, isRest: false }])],
+        // AMF3 object serialization (stage 94-4). readObject/writeObject are
+        // driven by `objectEncoding` (AMF3 only; AMF0 throws -- registered).
+        ['readObject', baym({ kind: 'any' }, [])],
+        ['writeObject', baym({ kind: 'void' }, [{ name: 'object', type: 'any', defaultValue: null, isRest: false }])],
         ['readBytes', baym({ kind: 'void' }, [
           { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
           { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
           { name: 'length', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         ])],
-        ['compress', baym({ kind: 'void' }, [])],
-        ['uncompress', baym({ kind: 'void' }, [])],
+        // AIR's algorithm parameter: "zlib" (the default; "deflate" is accepted as
+        // the same thing) or "lzma". The lzma codec is not implemented by this
+        // subset: it fails loudly at runtime instead of silently producing zlib
+        // output (AWD2Parser passes COMPRESSIONMODE_LZMA).
+        ['compress', baym({ kind: 'void' }, [{ name: 'algorithm', type: 'String', defaultValue: { kind: 'Str', value: 'zlib' }, isRest: false }])],
+        ['uncompress', baym({ kind: 'void' }, [{ name: 'algorithm', type: 'String', defaultValue: { kind: 'Str', value: 'zlib' }, isRest: false }])],
         ['clear', baym({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map([
-        ['bytesAvailable', bayg({ kind: 'int' })],
+        // bytesAvailable is declared uint on IDataInput (and the C getter returns
+        // unsigned), unlike `length`, which AIR types as int.
+        ['bytesAvailable', bayg({ kind: 'uint' })],
         // `length` is an accessor on ByteArray: reading it is trivial, assigning
         // it must resize the backing buffer (see ByteArray_set_length).
         ['length', bayg({ kind: 'int' })],
@@ -2696,7 +4168,7 @@ export class SymbolTable {
       constructor: { params: [] },
       superClass: 'Object',
       isFinal: false,
-      implements: [],
+      implements: ['IDataInput', 'IDataOutput'],
     });
     // flash.utils.Endian — string constants for ByteArray.endian.
     constClass('Endian', { BIG_ENDIAN: 'bigEndian', LITTLE_ENDIAN: 'littleEndian' });
@@ -2746,19 +4218,121 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
-    // flash.net.NetStream: only its dynamic `client` slot is exercised (Starling
-    // reads/writes stream.client to inject an onMetaData handler).
+    // flash.net.NetStream (stage 110): the dynamic `client` slot (Starling injects
+    // an onMetaData handler through it) plus the playback surface away3d's
+    // SimpleVideoPlayer drives. Construction semantics measured on adl 51.4.1
+    // (temp/videoprobe): a null connection is ArgumentError #2007, an unconnected
+    // one Error #2126, and `client` defaults to the stream itself.
+    const nsm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const nsv = (name: string, t: ASType): Param => ({ name, type: t, defaultValue: { kind: 'Null' }, isRest: false });
+    const nsf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner: 'NetStream', isStatic: false, isConst: false });
     this.classMap.set('NetStream', {
       fields: new Map([
         ['client', { type: { kind: 'object', className: 'Object' }, init: null, visibility: 'public', owner: 'NetStream', isStatic: false, isConst: false }],
+        ['checkPolicyFile', { type: { kind: 'bool' }, init: { kind: 'Bool', value: false }, visibility: 'public', owner: 'NetStream', isStatic: false, isConst: false }],
+        // The stream's own SoundTransform (volume 1 / pan 0 until assigned), the
+        // value AIR reports for a freshly built stream (measured).
+        ['_snd', nsf({ kind: 'object', className: 'SoundTransform' })],
       ]),
-      methods: new Map(),
+      methods: new Map([
+        // play() is where this subset's missing media transport becomes
+        // observable, so it fails loudly instead of pretending to play (emit.ts).
+        ['play', nsm({ kind: 'void' }, [nsv('url', 'String')])],
+        ['pause', nsm({ kind: 'void' }, [])],
+        ['resume', nsm({ kind: 'void' }, [])],
+        ['togglePause', nsm({ kind: 'void' }, [])],
+        ['seek', nsm({ kind: 'void' }, [{ name: 'offset', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false }])],
+        ['close', nsm({ kind: 'void' }, [])],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
+      getters: new Map([
+        ['soundTransform', { returnType: { kind: 'object', className: 'SoundTransform' }, params: [], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // time: seconds of decoded playback. Nothing is ever decoded here, so this
+        // stays 0 — which is also what AIR reports for a stream that has not
+        // started (seek() alone does not move the playhead; measured).
+        ['time', { returnType: { kind: 'number' }, params: [], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map([
+        ['soundTransform', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'SoundTransform', defaultValue: null, isRest: false }], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
+      // AIR requires the connection argument (`new NetStream(nc)`); keeping it
+      // required makes the argument-count error surface at compile time, and the
+      // constructor body applies AIR's null/not-connected rejections.
+      constructor: { params: [{ name: 'connection', type: 'NetConnection', defaultValue: null, isRest: false }] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.net.NetConnection (stage 110): SimpleVideoPlayer opens a null (local)
+    // connection and listens for status/security/io/async events. There is no media
+    // transport in this subset, so connect(null) only marks the connection as
+    // connected (AIR's local case: connected == true, uri == null — both measured
+    // with temp/videoprobe) while connect(url) stays unconnected and no
+    // NetStatusEvent ever arrives (reported as a gap, not silently faked).
+    const ncm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'NetConnection', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    this.classMap.set('NetConnection', {
+      fields: new Map([
+        ['client', { type: { kind: 'object', className: 'Object' }, init: null, visibility: 'public', owner: 'NetConnection', isStatic: false, isConst: false }],
+        ['uri', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'NetConnection', isStatic: false, isConst: false }],
+        ['_connected', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'NetConnection', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map([
+        ['connect', ncm({ kind: 'void' }, [nsv('command', 'String')])],
+        ['close', ncm({ kind: 'void' }, [])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['connected', { returnType: { kind: 'bool' }, params: [], owner: 'NetConnection', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       setters: new Map(),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.media.Video (stage 110): a display object whose surface receives a
+    // NetStream or Camera feed. Measured on adl 51.4.1 (temp/videoprobe):
+    // `new Video()` is 320x240, the constructor arguments are the surface size,
+    // and width/height are that stored rect (assigning one leaves the other)
+    // while videoWidth/videoHeight stay 0 until real frames arrive. Since this
+    // subset never decodes frames, videoWidth/videoHeight are always 0 and the
+    // surface stays empty (the same documented gap as NetStream.play).
+    const vdm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Video', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const vdg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Video', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const vds = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'Video', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+    this.classMap.set('Video', {
+      fields: new Map([
+        ['deblocking', { type: { kind: 'int' }, init: { kind: 'Num', value: 0, isInt: true }, visibility: 'public', owner: 'Video', isStatic: false, isConst: false }],
+        ['smoothing', { type: { kind: 'bool' }, init: { kind: 'Bool', value: false }, visibility: 'public', owner: 'Video', isStatic: false, isConst: false }],
+        ['_videoW', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Video', isStatic: false, isConst: false }],
+        ['_videoH', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Video', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map([
+        ['attachNetStream', vdm({ kind: 'void' }, [nsv('netStream', 'NetStream')])],
+        ['attachCamera', vdm({ kind: 'void' }, [nsv('camera', 'Object')])],
+        ['clear', vdm({ kind: 'void' }, [])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        // Video OWNS width/height (it overrides DisplayObject's bounds-derived
+        // pair): AIR's Video rect is a stored size that does not scale content.
+        ['width', vdg({ kind: 'number' })],
+        ['height', vdg({ kind: 'number' })],
+        ['videoWidth', vdg({ kind: 'int' })],
+        ['videoHeight', vdg({ kind: 'int' })],
+      ]),
+      setters: new Map([
+        ['width', vds('Number')],
+        ['height', vds('Number')],
+      ]),
+      constructor: { params: [
+        { name: 'width', type: 'int', defaultValue: { kind: 'Num', value: 320, isInt: true }, isRest: false },
+        { name: 'height', type: 'int', defaultValue: { kind: 'Num', value: 240, isInt: true }, isRest: false },
+      ] },
+      superClass: 'DisplayObject',
       isFinal: false,
       implements: [],
     });
@@ -2804,12 +4378,47 @@ export class SymbolTable {
     const txm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     this.classMap.set('TextField', {
       fields: new Map([
+        // TextField is the one DisplayObject that overrides width/height: AIR keeps
+        // a real field size there (setting `width` resizes the field instead of
+        // scaling, and the reported width is fieldSize * scaleX). Since stage 94·5
+        // DisplayObject.width/height are accessors, so the raw field size needs its
+        // own storage; it stays PRIVATE because AS3 sees the accessors only.
+        ['_fieldWidth', { type: { kind: 'number' }, init: null, visibility: 'private', owner: 'TextField', isStatic: false, isConst: false }],
+        ['_fieldHeight', { type: { kind: 'number' }, init: null, visibility: 'private', owner: 'TextField', isStatic: false, isConst: false }],
         ['text', txf({ kind: 'string' })],
+        // type/maxChars back AIR's editable-text model (stage 94·7). `type` holds
+        // TextFieldType.DYNAMIC ("dynamic") by default, so nothing is editable
+        // until the app opts in; `maxChars` 0 means "no limit". Both are plain
+        // fields: adl keeps text and selection untouched across a `type`
+        // assignment, which a field write reproduces exactly (measured).
+        ['type', txf({ kind: 'string' })],
+        ['maxChars', txf({ kind: 'int' })],
+        // displayAsPassword / restrict exist so the AIR-visible surface matches adl
+        // (measured defaults: false / null). `restrict` filtering is implemented in
+        // the edit path (阶段九十四·十四, see as_tf_restrict_char in emit.ts); password
+        // MASKING is still unimplemented — a password field renders its text in the
+        // clear — and is registered in TODO.md 遗留 rather than silently ignored.
+        // `tabEnabled` is NOT
+        // redeclared here: it comes from InteractiveObject (a duplicate would be
+        // mangled into a second slot), and TextField's ctor just flips the inherited
+        // field to AIR's TextField default (true, measured).
+        ['displayAsPassword', txf({ kind: 'bool' })],
+        ['restrict', txf({ kind: 'string' })],
         ['defaultTextFormat', txf({ kind: 'object', className: 'TextFormat' })],
         ['multiline', txf({ kind: 'bool' })],
         ['wordWrap', txf({ kind: 'bool' })],
         ['background', txf({ kind: 'bool' })],
         ['backgroundColor', txf({ kind: 'uint' })],
+        // border/borderColor outline the field box. Measured on adl 51.4.1
+        // (temp/editprobe/src/Ed6.as, pixel-scanned via BitmapData.draw): defaults
+        // are false / 0x000000, the outline is FOUR crisp 1px lines on the OUTER
+        // edge of (0,0,width,height) -- i.e. pixels x in {0,width}, y in {0,height}
+        // -- drawn over the background and scaled with the field. The colour is
+        // 24-bit RGB (the alpha byte is DROPPED on write -- see the setters map).
+        // See as_render_object_content in emit.ts for the drawing and
+        // as_render_bounds for why the bake box grows by one pixel.
+        ['border', txf({ kind: 'bool' })],
+        ['borderColor', txf({ kind: 'uint' })],
         ['scrollV', txf({ kind: 'int' })],
         ['hscroll', txf({ kind: 'bool' })],
         ['selectable', txf({ kind: 'bool' })],
@@ -2820,6 +4429,10 @@ export class SymbolTable {
         ['styleSheet', txf({ kind: 'object', className: 'StyleSheet' })],
       ]),
       methods: new Map([
+        // getLineMetrics(index) returns a fresh flash.text.TextLineMetrics; an
+        // out-of-range index throws RangeError #2006 (measured on adl 51.4.1,
+        // temp/metricprobe/Metrics6.as).
+        ['getLineMetrics', txm({ kind: 'object', className: 'TextLineMetrics' }, [{ name: 'index', type: 'int', defaultValue: null, isRest: false }])],
         ['appendText', txm({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
         ['setSelection', txm({ kind: 'void' }, [{ name: 'begin', type: 'int', defaultValue: null, isRest: false }, { name: 'end', type: 'int', defaultValue: null, isRest: false }])],
         ['setTextFormat', txm({ kind: 'void' }, [{ name: 'format', type: 'TextFormat', defaultValue: null, isRest: false }, { name: 'begin', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false }, { name: 'end', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false }])],
@@ -2846,9 +4459,57 @@ export class SymbolTable {
         ['text', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
         ['htmlText', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
         ['scrollH', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'int', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        // `type` also stays a FIELD (reads are a plain load) with a setter, because
+        // AIR's type setter has a SIDE EFFECT: when the value actually changes it
+        // refreshes tabEnabled to (type == "input") — measured on adl 51.4.1
+        // (temp/editprobe/src/Def2.as: dynamic -> false, type=INPUT -> true, back to
+        // dynamic -> false, and re-assigning the SAME value leaves a manually set
+        // tabEnabled alone). See emit.ts TextField_set_type.
+        ['type', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        // The colour properties stay FIELDS (reads are a plain load) with setters
+        // that DROP the alpha byte — AIR keeps only 24 bits of RGB, so the top byte
+        // is gone from the read-back as well. Measured on adl 51.4.1
+        // (temp/editprobe/tracesrc/Ed8.as): 0x8000FF00 -> 0xff00 for backgroundColor
+        // and textColor, 0xFFFFFFFF -> 0xffffff for borderColor. See
+        // TextField_set_borderColor / _set_backgroundColor / _set_textColor.
+        ['borderColor', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['backgroundColor', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['textColor', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
       ]),
       constructor: { params: [] },
       superClass: 'InteractiveObject',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.text.TextLineMetrics — the six-Number value type returned by
+    // TextField.getLineMetrics. AIR's ctor takes all six in the documented order
+    // (x, width, height, ascent, descent, leading); measured on adl 51.4.1
+    // (temp/metricprobe/Metrics6.as): `new TextLineMetrics(1,2,3,4,5,6)` reads back
+    // x=1 w=2 h=3 asc=4 desc=5 lead=6, and the fields are writable.
+    const tlmf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'TextLineMetrics', isStatic: false, isConst: false });
+    this.classMap.set('TextLineMetrics', {
+      fields: new Map([
+        ['x', tlmf({ kind: 'number' })],
+        ['width', tlmf({ kind: 'number' })],
+        ['height', tlmf({ kind: 'number' })],
+        ['ascent', tlmf({ kind: 'number' })],
+        ['descent', tlmf({ kind: 'number' })],
+        ['leading', tlmf({ kind: 'number' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'x', type: 'Number', defaultValue: null, isRest: false },
+        { name: 'width', type: 'Number', defaultValue: null, isRest: false },
+        { name: 'height', type: 'Number', defaultValue: null, isRest: false },
+        { name: 'ascent', type: 'Number', defaultValue: null, isRest: false },
+        { name: 'descent', type: 'Number', defaultValue: null, isRest: false },
+        { name: 'leading', type: 'Number', defaultValue: null, isRest: false },
+      ] },
+      superClass: 'Object',
       isFinal: false,
       implements: [],
     });
@@ -3052,6 +4713,7 @@ export class SymbolTable {
           ['dotProduct', vm({ kind: 'number' }, [v3('a')])],
           ['crossProduct', vm({ kind: 'object', className: 'Vector3D' }, [v3('a')])],
           ['clone', vm({ kind: 'object', className: 'Vector3D' }, [])],
+          ['copyFrom', vm({ kind: 'void' }, [v3('sourceVector3D')])],
           ['setTo', vm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
           ['project', vm({ kind: 'void' }, [])],
           ['equals', vm({ kind: 'bool' }, [v3('toCompare'), { name: 'allFour', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
@@ -3105,6 +4767,10 @@ export class SymbolTable {
           ['recompose', mm({ kind: 'bool' }, [{ name: 'components', type: 'Vector.<Vector3D>', defaultValue: null, isRest: false }, orient])],
           ['decompose', mm(vv3(), [orient])],
           ['copyFrom', mm({ kind: 'void' }, [m3('sourceMatrix3D')])],
+          ['copyColumnFrom', mm({ kind: 'void' }, [{ name: 'column', type: 'uint', defaultValue: null, isRest: false }, v3p('vector3D')])],
+          ['copyColumnTo', mm({ kind: 'void' }, [{ name: 'column', type: 'uint', defaultValue: null, isRest: false }, v3p('vector3D')])],
+          ['copyRowFrom', mm({ kind: 'void' }, [{ name: 'row', type: 'uint', defaultValue: null, isRest: false }, v3p('vector3D')])],
+          ['copyRowTo', mm({ kind: 'void' }, [{ name: 'row', type: 'uint', defaultValue: null, isRest: false }, v3p('vector3D')])],
           ['copyRawDataTo', mm({ kind: 'void' }, [
             { name: 'vector', type: 'Vector.<Number>', defaultValue: null, isRest: false },
             { name: 'index', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
@@ -3129,8 +4795,18 @@ export class SymbolTable {
           ['interpolate', ms({ kind: 'object', className: 'Matrix3D' }, [m3('thisMat'), m3('toMat'), gegnum('percent', 0)])],
           ['identity', ms({ kind: 'object', className: 'Matrix3D' }, [])],
         ]),
-        getters: new Map([['rawData', { returnType: vnum(), params: [], owner: 'Matrix3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }]]),
-        setters: new Map([['rawData', { returnType: { kind: 'void' }, params: [{ name: 'v', type: 'Vector.<Number>', defaultValue: null, isRest: false }], owner: 'Matrix3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }]]),
+        getters: new Map([
+          ['rawData', { returnType: vnum(), params: [], owner: 'Matrix3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+          // position: a fresh Vector3D view of the translation column (w = 0), and a
+          // setter that copies x/y/z into it. Measured on adl 51.4.1: the getter
+          // never returns the same object twice and mutating it does NOT write
+          // back; assigning null is ignored (temp/matposprobe).
+          ['position', { returnType: { kind: 'object', className: 'Vector3D' }, params: [], owner: 'Matrix3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ]),
+        setters: new Map([
+          ['rawData', { returnType: { kind: 'void' }, params: [{ name: 'v', type: 'Vector.<Number>', defaultValue: null, isRest: false }], owner: 'Matrix3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+          ['position', { returnType: { kind: 'void' }, params: [{ name: 'v', type: 'Vector3D', defaultValue: null, isRest: false }], owner: 'Matrix3D', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ]),
         constructor: { params: [{ name: 'v', type: 'Vector.<Number>', defaultValue: { kind: 'Null' }, isRest: false }] },
         superClass: 'Object',
         isFinal: false,
@@ -3257,6 +4933,16 @@ export class SymbolTable {
         fields: new Map([
           ['vertexProgram', prf({ kind: 'object', className: 'ByteArray' })],
           ['fragmentProgram', prf({ kind: 'object', className: 'ByteArray' })],
+          // AGAL sampler state the fragment program declares, decoded from its
+          // `tex`/`tld` sampler flags at upload time (see as_agal_sampler_flags).
+          // `samplerUsed` is a bitmask of the sampler registers the program
+          // samples; `samplerFlags` is that register's packed
+          // (filter | wrap<<1 | mip<<2), 4 bits per register. Context3D_setProgram
+          // applies them to the GPU unit state -- Stage3D honours the AGAL flags
+          // (measured on AIR 51.4.1, temp/sampprobe) and they are the only
+          // sampler state away3d and Starling ever set.
+          ['samplerUsed', prf({ kind: 'int' })],
+          ['samplerFlags', prf({ kind: 'int' })],
         ]),
         methods: new Map([
           ['upload', prm({ kind: 'void' }, [
@@ -3311,6 +4997,13 @@ export class SymbolTable {
           // source BitmapData right after; deferring the upload to the next
           // Context3D_submit would then read a freed pixel buffer.
           ['ctx', txf({ kind: 'null' })],
+          // Mip-chain flag (trailing, layout-identical to RectangleTexture).
+          // Set when the app supplies a mip level > 0 (away3d's MipmapGenerator
+          // uploads level 0..N of one bitmap); cleared by a level-0 re-upload.
+          // Context3D_submit hands it to s3d_bind_texture so the backend can
+          // reproduce AIR's rule that a mip-filtered sampler on a texture with
+          // NO chain drops the whole draw (measured: temp/sampprobe A6).
+          ['mips', txf({ kind: 'int' })],
         ]),
         methods: new Map([
           ['uploadFromBitmapData', txm({ kind: 'void' }, [
@@ -3328,9 +5021,11 @@ export class SymbolTable {
         constructor: { params: [] }, superClass: 'TextureBase', isFinal: false, implements: [],
       });
 
-      // CubeTexture (stage 83): six square faces sharing one size. Held as a CPU
-      // descriptor (width/height + per-face BitmapData source); the GPU cube
-      // target is a future follow-up (the demo does not use cube sampling).
+      // CubeTexture (stage 83): six square faces sharing one size. width/height +
+      // per-face BitmapData sources, plus the GPU cube map handle (stage 113 --
+      // the six faces are uploaded as one MTLTextureTypeCube and bound in place of
+      // a 2D texture; the field lives OUTSIDE the face slots, so `->gpu` never
+      // aliases face0 the way a Texture-shaped read would).
       const cuf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'CubeTexture', isStatic: false, isConst: false });
       const cum = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'CubeTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
       this.classMap.set('CubeTexture', {
@@ -3344,6 +5039,7 @@ export class SymbolTable {
           ['face3', cuf({ kind: 'object', className: 'BitmapData' })],
           ['face4', cuf({ kind: 'object', className: 'BitmapData' })],
           ['face5', cuf({ kind: 'object', className: 'BitmapData' })],
+          ['gpu', cuf({ kind: 'null' })],
         ]),
         methods: new Map([
           ['uploadFromBitmapData', cum({ kind: 'void' }, [
@@ -3352,6 +5048,14 @@ export class SymbolTable {
             { name: 'miplevel', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
           ])],
           ['dispose', cum({ kind: 'void' }, [])],
+          // Declared on TextureBase in AIR; added here (owner CubeTexture) because our
+          // built-in inheritance is per-class C bodies -- a CubeTexture must not run
+          // Texture's body, whose struct layout it does not share.
+          ['uploadCompressedTextureFromByteArray', cum({ kind: 'void' }, [
+            { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'async', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          ])],
         ]),
         staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
         constructor: { params: [] }, superClass: 'TextureBase', isFinal: false, implements: [],
@@ -3376,6 +5080,12 @@ export class SymbolTable {
           ['gpu', rtf({ kind: 'null' })],
           // Same eager-upload context handle as Texture (layout-identical).
           ['ctx', rtf({ kind: 'null' })],
+          // Same trailing mip-chain flag as Texture (layout-identical): a
+          // RectangleTexture is NPOT and Stage3D forbids mipmaps on NPOT, so it
+          // stays 0 -- the field exists only to keep the two structs the same
+          // shape, which Context3D_submit relies on when it reads a RectangleTexture
+          // through a Texture*.
+          ['mips', rtf({ kind: 'int' })],
         ]),
         methods: new Map([
           ['uploadFromBitmapData', rtm({ kind: 'void' }, [
@@ -3454,11 +5164,14 @@ export class SymbolTable {
             { name: 'wantsBestResolution', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
             { name: 'wantsBestResolutionOnBrowserZoom', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           ])],
+          // AIR's declaration gives every parameter a default:
+          // clear(red=0, green=0, blue=0, alpha=1, depth=1, stencil=0, mask=0xFFFFFFFF).
+          // SingleObjectDepthPass calls context.clear(1.0, 1.0, 1.0).
           ['clear', c3m({ kind: 'void' }, [
-            { name: 'red', type: 'Number', defaultValue: null, isRest: false },
-            { name: 'green', type: 'Number', defaultValue: null, isRest: false },
-            { name: 'blue', type: 'Number', defaultValue: null, isRest: false },
-            { name: 'alpha', type: 'Number', defaultValue: null, isRest: false },
+            { name: 'red', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
+            { name: 'green', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
+            { name: 'blue', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
+            { name: 'alpha', type: 'Number', defaultValue: { kind: 'Num', value: 1, isInt: false }, isRest: false },
             { name: 'depth', type: 'Number', defaultValue: { kind: 'Num', value: 1, isInt: false }, isRest: false },
             { name: 'stencil', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
             { name: 'mask', type: 'uint', defaultValue: { kind: 'Num', value: 4294967295, isInt: true }, isRest: false },
@@ -3549,6 +5262,15 @@ export class SymbolTable {
             { name: 'passCompareMode', type: 'String', defaultValue: null, isRest: false },
           ])],
           ['setCulling', c3m({ kind: 'void' }, [{ name: 'triangleFaceToCull', type: 'String', defaultValue: null, isRest: false }])],
+          // setColorMask(red, green, blue, alpha): per-channel color writes for the
+          // following draws (away3d's DepthRenderer turns them all off for its
+          // depth-only prepass). All four parameters are required in AIR.
+          ['setColorMask', c3m({ kind: 'void' }, [
+            { name: 'red', type: 'Boolean', defaultValue: null, isRest: false },
+            { name: 'green', type: 'Boolean', defaultValue: null, isRest: false },
+            { name: 'blue', type: 'Boolean', defaultValue: null, isRest: false },
+            { name: 'alpha', type: 'Boolean', defaultValue: null, isRest: false },
+          ])],
           ['dispose', c3m({ kind: 'void' }, [
             { name: 'recreate', type: 'Boolean', defaultValue: { kind: 'Bool', value: true }, isRest: false },
           ])],
@@ -3640,10 +5362,121 @@ export class SymbolTable {
     const builtinAlias = new Map<string, string>();
     for (const n of this.classMap.keys()) if (this.classMap.get(n)!.packageName === undefined) builtinAlias.set(n, n);
     for (const n of builtinAlias.keys()) this.classMap.get(n)!.importAlias = builtinAlias;
+    // Fully-qualified names of the built-in classes, MEASURED on adl 51.4.1
+    // (temp/pkgA/fqn-result.txt: getDefinitionByName over candidate packages,
+    // then getQualifiedClassName on the resolved Class) -- never guessed from
+    // memory. AIR identifies a class by its "pkg::Name" fqn everywhere it names
+    // one: TypeError #1034 / ReferenceError #1056 / #1069 messages (through
+    // as_fqn_dotted), getQualifiedClassName, getQualifiedSuperclassName and
+    // describeType. Built-ins previously carried no fqn, so the vtable slot fell
+    // back to the bare C name and `var d:Object = sprite; d.transform = 5`
+    // reported "cannot convert 5 to Transform." instead of AIR's
+    // "...to flash.geom.Transform.". Top-level classes (Object/Array/String/
+    // Number/int/uint/Boolean/Function/Class/XML/XMLList/Date/RegExp/Error and
+    // the error family/Namespace) keep their short name, exactly as measured.
+    const BUILTIN_FQN: Record<string, string> = {
+      // top-level
+      Object: 'Object', Array: 'Array', String: 'String', Number: 'Number',
+      Boolean: 'Boolean', Function: 'Function', Class: 'Class', Date: 'Date',
+      RegExp: 'RegExp', Error: 'Error', Namespace: 'Namespace', XML: 'XML', XMLList: 'XMLList',
+      TypeError: 'TypeError', ArgumentError: 'ArgumentError', RangeError: 'RangeError',
+      ReferenceError: 'ReferenceError', SecurityError: 'SecurityError', VerifyError: 'VerifyError',
+      DefinitionError: 'DefinitionError', EvalError: 'EvalError', URIError: 'URIError',
+      // flash.display
+      Sprite: 'flash.display::Sprite', Shape: 'flash.display::Shape',
+      MovieClip: 'flash.display::MovieClip', Bitmap: 'flash.display::Bitmap',
+      BitmapData: 'flash.display::BitmapData', Loader: 'flash.display::Loader',
+      LoaderInfo: 'flash.display::LoaderInfo', DisplayObject: 'flash.display::DisplayObject',
+      DisplayObjectContainer: 'flash.display::DisplayObjectContainer',
+      InteractiveObject: 'flash.display::InteractiveObject',
+      SimpleButton: 'flash.display::SimpleButton', Stage: 'flash.display::Stage',
+      Stage3D: 'flash.display::Stage3D', Scene: 'flash.display::Scene',
+      FrameLabel: 'flash.display::FrameLabel', Graphics: 'flash.display::Graphics',
+      GraphicsPath: 'flash.display::GraphicsPath', GraphicsSolidFill: 'flash.display::GraphicsSolidFill',
+      GraphicsEndFill: 'flash.display::GraphicsEndFill',
+      GraphicsPathCommand: 'flash.display::GraphicsPathCommand',
+      Shader: 'flash.display::Shader', ShaderData: 'flash.display::ShaderData',
+      ShaderJob: 'flash.display::ShaderJob', ShaderParameter: 'flash.display::ShaderParameter',
+      ShaderPrecision: 'flash.display::ShaderPrecision', ShaderInput: 'flash.display::ShaderInput',
+      NativeWindow: 'flash.display::NativeWindow',
+      NativeWindowInitOptions: 'flash.display::NativeWindowInitOptions',
+      Screen: 'flash.display::Screen', NativeMenu: 'flash.display::NativeMenu',
+      NativeMenuItem: 'flash.display::NativeMenuItem',
+      NativeWindowDisplayState: 'flash.display::NativeWindowDisplayState',
+      NativeWindowType: 'flash.display::NativeWindowType',
+      NativeWindowSystemChrome: 'flash.display::NativeWindowSystemChrome',
+      NativeWindowRenderMode: 'flash.display::NativeWindowRenderMode',
+      BitmapDataChannel: 'flash.display::BitmapDataChannel',
+      // flash.text
+      TextField: 'flash.text::TextField', TextFormat: 'flash.text::TextFormat',
+      TextLineMetrics: 'flash.text::TextLineMetrics', StyleSheet: 'flash.text::StyleSheet',
+      Font: 'flash.text::Font',
+      // flash.utils / flash.system / flash.filesystem / flash.desktop / flash.ui
+      ByteArray: 'flash.utils::ByteArray', Dictionary: 'flash.utils::Dictionary',
+      Timer: 'flash.utils::Timer', Proxy: 'flash.utils::Proxy',
+      Capabilities: 'flash.system::Capabilities', System: 'flash.system::System',
+      ApplicationDomain: 'flash.system::ApplicationDomain', IME: 'flash.system::IME',
+      Security: 'flash.system::Security', LoaderContext: 'flash.system::LoaderContext',
+      File: 'flash.filesystem::File', FileStream: 'flash.filesystem::FileStream',
+      FileMode: 'flash.filesystem::FileMode',
+      Clipboard: 'flash.desktop::Clipboard', NativeApplication: 'flash.desktop::NativeApplication',
+      Mouse: 'flash.ui::Mouse', MouseCursor: 'flash.ui::MouseCursor', Keyboard: 'flash.ui::Keyboard',
+      Multitouch: 'flash.ui::Multitouch', MultitouchInputMode: 'flash.ui::MultitouchInputMode',
+      ContextMenu: 'flash.ui::ContextMenu', ContextMenuItem: 'flash.ui::ContextMenuItem',
+      ContextMenuBuiltInItems: 'flash.ui::ContextMenuBuiltInItems',
+      // flash.geom
+      Transform: 'flash.geom::Transform', Matrix: 'flash.geom::Matrix', Matrix3D: 'flash.geom::Matrix3D',
+      Point: 'flash.geom::Point', Rectangle: 'flash.geom::Rectangle',
+      ColorTransform: 'flash.geom::ColorTransform', Vector3D: 'flash.geom::Vector3D',
+      PerspectiveProjection: 'flash.geom::PerspectiveProjection',
+      // flash.events
+      Event: 'flash.events::Event', EventDispatcher: 'flash.events::EventDispatcher',
+      MouseEvent: 'flash.events::MouseEvent', KeyboardEvent: 'flash.events::KeyboardEvent',
+      TextEvent: 'flash.events::TextEvent', TimerEvent: 'flash.events::TimerEvent',
+      ProgressEvent: 'flash.events::ProgressEvent', ErrorEvent: 'flash.events::ErrorEvent',
+      VsyncStateChangeAvailabilityEvent: 'flash.events::VsyncStateChangeAvailabilityEvent',
+      IOErrorEvent: 'flash.events::IOErrorEvent', FocusEvent: 'flash.events::FocusEvent',
+      NetStatusEvent: 'flash.events::NetStatusEvent', DataEvent: 'flash.events::DataEvent',
+      HTTPStatusEvent: 'flash.events::HTTPStatusEvent', ContextMenuEvent: 'flash.events::ContextMenuEvent',
+      TouchEvent: 'flash.events::TouchEvent', AsyncErrorEvent: 'flash.events::AsyncErrorEvent',
+      OutputProgressEvent: 'flash.events::OutputProgressEvent',
+      ServerSocketConnectEvent: 'flash.events::ServerSocketConnectEvent',
+      SecurityErrorEvent: 'flash.events::SecurityErrorEvent',
+      // flash.net / flash.media / flash.filters / flash.display3D
+      URLRequest: 'flash.net::URLRequest', URLVariables: 'flash.net::URLVariables',
+      URLLoader: 'flash.net::URLLoader', URLStream: 'flash.net::URLStream',
+      URLRequestHeader: 'flash.net::URLRequestHeader', URLRequestMethod: 'flash.net::URLRequestMethod',
+      URLRequestDefaults: 'flash.net::URLRequestDefaults', Socket: 'flash.net::Socket',
+      XMLSocket: 'flash.net::XMLSocket', NetConnection: 'flash.net::NetConnection',
+      NetStream: 'flash.net::NetStream', SharedObject: 'flash.net::SharedObject',
+      URLLoaderDataFormat: 'flash.net::URLLoaderDataFormat', ServerSocket: 'flash.net::ServerSocket',
+      SecureSocket: 'flash.net::SecureSocket',
+      Sound: 'flash.media::Sound', SoundChannel: 'flash.media::SoundChannel',
+      SoundTransform: 'flash.media::SoundTransform', SoundMixer: 'flash.media::SoundMixer',
+      SoundLoaderContext: 'flash.media::SoundLoaderContext', Video: 'flash.media::Video',
+      Camera: 'flash.media::Camera', ID3Info: 'flash.media::ID3Info',
+      AudioPlaybackMode: 'flash.media::AudioPlaybackMode',
+      BitmapFilter: 'flash.filters::BitmapFilter', BlurFilter: 'flash.filters::BlurFilter',
+      GlowFilter: 'flash.filters::GlowFilter', DropShadowFilter: 'flash.filters::DropShadowFilter',
+      BitmapFilterQuality: 'flash.filters::BitmapFilterQuality',
+      Context3D: 'flash.display3D::Context3D', Program3D: 'flash.display3D::Program3D',
+      IndexBuffer3D: 'flash.display3D::IndexBuffer3D', VertexBuffer3D: 'flash.display3D::VertexBuffer3D',
+      Texture: 'flash.display3D.textures::Texture', TextureBase: 'flash.display3D.textures::TextureBase',
+      CubeTexture: 'flash.display3D.textures::CubeTexture',
+      RectangleTexture: 'flash.display3D.textures::RectangleTexture',
+      VideoTexture: 'flash.display3D.textures::VideoTexture',
+      ImageDecodingPolicy: 'flash.system::ImageDecodingPolicy',
+    };
+    for (const [n, info] of this.classMap) {
+      if (info.packageName !== undefined || info.fqn !== undefined || info.reflectFqn !== undefined) continue;
+      const f = BUILTIN_FQN[n];
+      if (f !== undefined) info.reflectFqn = f;
+    }
     // pass 1: register class shells. superclass/implements are deferred to pass 1.5
     // (after every class is registered) so wildcard imports can expand against the
     // full classMap and per-file import context resolves short-name clashes.
     for (const stmt of program.body) {
+      setGenPos(stmt.line, stmt.col);
       if (stmt.kind === 'ClassDecl') {
         const cname = fqn(stmt.name, stmt.packageName);
         const info: ClassInfo = {
@@ -3667,13 +5500,29 @@ export class SymbolTable {
     }
     // pass 1.5: resolve superclass + implements with per-file import context.
     for (const stmt of program.body) {
+      setGenPos(stmt.line, stmt.col);
       if (stmt.kind === 'ClassDecl') {
         const cname = fqn(stmt.name, stmt.packageName);
         const info = this.classMap.get(cname)!;
         const importAlias = buildImportAlias(stmt.imports, this.classMap);
         info.importAlias = importAlias;
         if (stmt.superClass) {
-          info.superClass = resolveType(stmt.superClass, importAlias).className;
+          const st = resolveType(stmt.superClass, importAlias);
+          // `resolveType` maps the type-only built-ins (Array/String/Number/...)
+          // to non-class CTypes that carry NO `className`, so reading `.className`
+          // blindly made `class X extends Array` report a superclass literally
+          // named "undefined" — an error far from the real cause. Name the actual
+          // limitation instead. AIR accepts `extends Array` (2 files in the
+          // talkmed-meeting closure use it: com.hurlant.util.der.Sequence,
+          // com.fiCharts.utils.graphic.StyleManager), so this remains a LOUD,
+          // honest gap rather than a misleading one.
+          if (st.kind === 'interface') {
+            throw new CodegenError(`class '${cname}' cannot extend interface '${stmt.superClass}'`);
+          }
+          if (st.kind !== 'object') {
+            throw new CodegenError(`unsupported superclass '${stmt.superClass}' of '${cname}': subclassing built-in types is not implemented`);
+          }
+          info.superClass = st.className;
         }
         info.implements = stmt.implements.map((i) => {
           const t = resolveType(i, importAlias);
@@ -3695,26 +5544,58 @@ export class SymbolTable {
         }
       }
     }
+    // pass 1.7: same inheritance rule for the Proxy interceptor flag (a subclass
+    // of a Proxy subclass is still a Proxy). The flag is also stamped onto the ten
+    // flash_proxy-namespaced interceptor methods, so a subclass override of them is
+    // kept out of the public member namespace exactly like Proxy's own (the parser
+    // drops the `flash_proxy` qualifier, so the name is the only signal).
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const info of this.classMap.values()) {
+        if (info.isProxy) continue;
+        if (this.classMap.get(info.superClass)?.isProxy) {
+          info.isProxy = true;
+          changed = true;
+        }
+      }
+    }
     // pass 2: direct fields / constructor / methods.
     for (const stmt of program.body) {
+      setGenPos(stmt.line, stmt.col);
       if (stmt.kind === 'ClassDecl') {
         const cname = fqn(stmt.name, stmt.packageName);
         const info = this.classMap.get(cname)!;
         for (const m of stmt.members) {
+          // A semantic error inside a member signature/`[WasmExport]` belongs to
+          // the member, not to the whole class.
+          setGenPos(m.line ?? stmt.line, m.col ?? stmt.col);
           if (m.kind === 'Field') {
-            const f: FieldInfo = { name: m.name, type: resolveType(m.type, info.importAlias), init: m.init, visibility: m.visibility, owner: cname, isStatic: m.isStatic, isConst: m.isConst };
+            // An `[Embed]` field has no source-level initializer; its value is the
+            // generated asset class, injected as a Class-value reference (a bare
+            // class name, which emit resolves to `&<cname>_cls`). This is the ONE
+            // place a field's initializer is decided, so the static (`_cinit`) and
+            // instance (constructor) paths both pick it up unchanged.
+            const embedClass = this.embedFieldInits.get(SymbolTable.embedFieldKey(stmt.name, stmt.packageName, m.name));
+            const init: Expr | null =
+              embedClass !== undefined ? { kind: 'Var', name: embedClass } : m.init;
+            const f: FieldInfo = { name: m.name, type: resolveType(m.type, info.importAlias), init, visibility: m.visibility, owner: cname, isStatic: m.isStatic, isConst: m.isConst };
+            checkTypeAnnotation(m.type, info.importAlias, this);
             // Only `static` makes a field class-level in AS3. A bare `const` is an
             // instance constant (each instance carries its own immutable value),
             // e.g. `private const _textures:Vector.<Texture>`.
             if (m.isStatic) info.staticFields.set(m.name, f);
             else info.fields.set(m.name, f);
           } else if (m.kind === 'Constructor') {
+            for (const p of m.params) checkTypeAnnotation(p.type, info.importAlias, this);
             info.constructor = { params: m.params };
           }
         }
         for (const m of stmt.members) {
+          setGenPos(m.line ?? stmt.line, m.col ?? stmt.col);
           if (m.kind === 'Method') {
-            const mi: MethodInfo = { returnType: resolveType(m.returnType, info.importAlias), params: m.params, owner: cname, visibility: m.visibility, isStatic: m.isStatic, isFinal: m.isFinal, isGetter: m.isGetter, isSetter: m.isSetter, metadata: m.metadata };
+            checkTypeAnnotation(m.returnType, info.importAlias, this);
+            for (const p of m.params) checkTypeAnnotation(p.type, info.importAlias, this);
+            const mi: MethodInfo = { returnType: resolveType(m.returnType, info.importAlias), params: m.params, owner: cname, visibility: m.visibility, isStatic: m.isStatic, isFinal: m.isFinal, isGetter: m.isGetter, isSetter: m.isSetter, metadata: m.metadata, ns: m.ns };
             // [WasmExport] on a method: only static methods lower to a `this`-free
             // C function callable from JS. Instance methods carry a leading
             // `void* _this` (plus GC-heap construction JS cannot perform) and
@@ -3740,6 +5621,8 @@ export class SymbolTable {
           }
         }
       } else if (stmt.kind === 'FuncDecl') {
+        checkTypeAnnotation(stmt.returnType, null, this);
+        for (const p of stmt.params) checkTypeAnnotation(p.type, null, this);
         this.funcMap.set(stmt.name, { returnType: resolveType(stmt.returnType), params: stmt.params, metadata: stmt.metadata });
         // [WasmExport] on a top-level function: it lowers to a same-named, `this`-free
         // C global, directly callable from JS.
@@ -3754,19 +5637,81 @@ export class SymbolTable {
         }
       }
     }
+    // pass 2.1: validate interface-METHOD annotations. This deliberately cannot run in
+    // pass 0: `hasClass` there sees only the built-ins (pass 1 registers user class
+    // shells), so an interface method naming a user class was reported as
+    // `unknown type 'X'` — measured on examples/air-starling-demo (IFilterHelper's
+    // `getTexture(): Texture`). Interfaces are still registered in pass 0; only this
+    // check is deferred until the full symbol table exists.
+    for (const stmt of program.body) {
+      if (stmt.kind !== 'InterfaceDecl') continue;
+      setGenPos(stmt.line, stmt.col);
+      const iface = this.interfaceMap.get(fqn(stmt.name, stmt.packageName));
+      if (iface === undefined) continue;
+      for (const m of stmt.methods) {
+        checkTypeAnnotation(m.returnType, iface.importAlias, this);
+        for (const p of m.params) checkTypeAnnotation(p.type, iface.importAlias, this);
+      }
+    }
+    // pass 2.5: stamp the flash_proxy-namespaced interceptor methods. This must
+    // run AFTER pass 2 has registered the user classes' members. Only a method
+    // that actually carries the `flash_proxy` qualifier is an interceptor: on
+    // adl 51.4.1 a PUBLIC-namespace `getProperty` on a Proxy subclass is an
+    // ordinary method and dynamic access still hits the base Proxy's #2088.
+    for (const info of this.classMap.values()) {
+      if (!info.isProxy) continue;
+      for (const [n, m] of info.methods) if (PROXY_NS_METHODS.has(n) && m.ns === 'flash_proxy') m.isProxyNs = true;
+    }
+    // pass 0.2: merge inherited interface methods (interface I extends A). An
+    // interface inherits every method of its parents, so a class implementing I
+    // must implement them too. Parents may be declared after the child, hence the
+    // recursion with a memo; a cycle is a compile-time error.
+    {
+      const memo = new Set<string>();
+      const merge = (iname: string, visiting: Set<string>): void => {
+        if (memo.has(iname)) return;
+        const info = this.interfaceMap.get(iname);
+        if (!info || !info.extends || info.extends.length === 0) { memo.add(iname); return; }
+        if (visiting.has(iname)) throw new CodegenError(`circular interface inheritance involving '${iname}'`);
+        visiting.add(iname);
+        for (const p of info.extends) {
+          if (!this.interfaceMap.has(p)) throw new CodegenError(`unknown parent interface '${p}' of '${iname}'`);
+          merge(p, visiting);
+          const pInfo = this.interfaceMap.get(p)!;
+          for (const [m, mi] of pInfo.methods) if (!info.methods.has(m)) info.methods.set(m, mi);
+          for (const [m, mi] of pInfo.getters) if (!info.getters.has(m)) info.getters.set(m, mi);
+          for (const [m, mi] of pInfo.setters) if (!info.setters.has(m)) info.setters.set(m, mi);
+        }
+        visiting.delete(iname);
+        memo.add(iname);
+      };
+      for (const iname of [...this.interfaceMap.keys()]) merge(iname, new Set());
+    }
     // pass 3: flatten inherited members into each subclass.
     for (const name of this.classMap.keys()) {
       this.expandInheritance(name);
     }
     // pass 4: verify each class implements every method of its interfaces.
     for (const [name, info] of this.classMap) {
+      const cpos = this.classPos.get(name);
+      setGenPos(cpos?.line, cpos?.col);
       for (const iname of info.implements) {
         const intf = this.interfaceMap.get(iname);
         if (!intf) throw new CodegenError(`unknown interface '${iname}'`);
-        for (const mname of intf.methods.keys()) {
-          const im = intf.methods.get(mname)!;
+        for (const [mname, im] of [...intf.methods, ...intf.getters, ...intf.setters]) {
           const impl = im.isGetter ? info.getters.get(mname) : im.isSetter ? info.setters.get(mname) : info.methods.get(mname);
-          if (!impl) {
+          if (impl) continue;
+          // AS3 requires an ACCESSOR to satisfy an interface accessor: a plain
+          // `public var` does NOT (measured on adl 51.4.1 — mxmlc rejects
+          // `class C implements I{get/set y} { public var y:Number; }`). But a
+          // BUILT-IN property is an accessor pair in AIR even though our C model
+          // stores it as a field, so inheriting e.g. `DisplayObject.y` DOES satisfy
+          // it (measured: `class T extends Sprite implements I{get/set y}` compiles).
+          // `isAccessor` marks exactly those built-in fields; fields are flattened
+          // by expandInheritance, so an inherited one is found here too.
+          const slot = info.fieldKeys?.get(mname);
+          const f = slot !== undefined ? info.fields.get(slot) : undefined;
+          if (!(f && f.isAccessor)) {
             throw new CodegenError(`class '${name}' does not implement method '${mname}' of interface '${iname}'`);
           }
         }
@@ -3824,6 +5769,52 @@ export class SymbolTable {
     return undefined;
   }
 
+  // AS3 settles an instance-member reference by the NEAREST declaration in the
+  // superclass chain, and a level's OWN declaration shadows EVERY inherited member
+  // of that name whatever kind the inherited one has. The flattened maps cannot
+  // express that on their own: `info.fields` is flattened and keyed by C slot (so a
+  // subclass's own field of a colliding name wins through `fieldKeys`), but an
+  // ANCESTOR's field is still what `fieldSlot()` returns -- and the read paths
+  // consult fields before getters. away3d hits exactly that seam:
+  // `away3d.containers.ObjectContainer3D` declares `get parent():ObjectContainer3D`
+  // while our built-in `EventDispatcher` carries the display-list ancestor link in
+  // a slot also named `parent` (AIR's EventDispatcher has no `parent` at all, so
+  // the two never meet there). The inherited slot won, `parent` read NULL, and
+  // Intermediate_MD5Animation died in updateMouseChildren with #1009.
+  //
+  // Answers "does the class (or any level between it and `fieldOwner`) declare
+  // `name` itself as a GETTER or METHOD?" -- i.e. must an inherited field be
+  // skipped when the name is READ? Walks level by level, so an accessor declared on
+  // an intermediate class counts too. The field slot (and the method/getter maps)
+  // are flattened, so an own accessor of a colliding name owns `owner === level`.
+  //
+  // SETTERS are deliberately NOT counted here, and this is the whole reason the
+  // helper is read-specific: our built-in classes keep AIR's accessor PAIRS as
+  // stored fields (`DisplayObject.x` is a field marked `isAccessor`), so a subclass
+  // that overrides only the setter -- away3d's `View3D` does `override set x`, then
+  // its setter body reads `x` -- has an own setter but no own getter to fall back
+  // to. Counting it would make the read of `x` vanish (measured: `Codegen error at
+  // 510:4: undefined variable 'x' in class away3d_containers_View3D`), whereas AIR
+  // reads the inherited base getter. A nearer setter only governs WRITES, and the
+  // write paths resolve setters ahead of the field on their own.
+  shadowedForRead(cls: string, fieldOwner: string, name: string): boolean {
+    let cur: string | null = cls;
+    const seen = new Set<string>();
+    while (cur !== null && cur !== fieldOwner && !seen.has(cur)) {
+      seen.add(cur);
+      const info = this.classMap.get(cur);
+      if (!info) return false;
+      const g = info.getters.get(name);
+      if (g && g.owner === cur) return true;
+      // A namespace-proxy stub is not a real trait (`isProxyNs`), so it must not
+      // shadow an inherited field any more than it can serve a `obj.name` read.
+      const m = info.methods.get(name);
+      if (m && m.owner === cur && !m.isProxyNs) return true;
+      cur = info.superClass;
+    }
+    return false;
+  }
+
   // The C member name of a field slot: `cName` once flattening named it, else the
   // AS3 name itself (unshadowed fields are stored under their own name).
   static fieldCName(f: FieldInfo, fallback: string): string { return f.cName ?? fallback; }
@@ -3836,6 +5827,24 @@ export class SymbolTable {
       if (info) {
         const g = info.getters.get(name);
         if (g) return { owner: cur, g };
+        cur = info.superClass;
+      } else break;
+    }
+    return undefined;
+  }
+
+  // Same walk for the write side: an accessor pair declared on a superclass
+  // (`Mesh.colorTransform`) must be found through the chain, exactly like reads
+  // already are (`vtable->get_x` is flattened).
+  findSetter(cls: string, name: string): { owner: string; s: MethodInfo } | undefined {
+    let cur: string | null = cls;
+    const seen = new Set<string>();
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      const info = this.classMap.get(cur);
+      if (info) {
+        const s = info.setters.get(name);
+        if (s) return { owner: cur, s };
         cur = info.superClass;
       } else break;
     }
@@ -3881,6 +5890,8 @@ export class SymbolTable {
 
   private expandInheritance(name: string, visiting: Set<string> = new Set()): void {
     const info = this.classMap.get(name)!;
+    const pos = this.classPos.get(name);
+    setGenPos(pos?.line, pos?.col);
     if (info.superClass === null) {
       // Base class (Object): the vtable slot list is just its own members.
       info.vtableSlots = this.buildVtableSlots([], info.methods, info.getters, info.setters);
@@ -3977,6 +5988,21 @@ export class SymbolTable {
 
     // interfaces are inherited: a subclass implements its superclass's interfaces too.
     info.implements = [...new Set([...superInfo2.implements, ...info.implements])];
+    // ... and an interface's PARENTS are interfaces of the class as well
+    // (`class C implements IChild` where `interface IChild extends IParent` means C
+    // is also an IParent). Recorded transitively here so emitInterfaceVtables builds
+    // a per-class vtable for every parent, which is what a runtime `x as IParent`
+    // looks up through as_iface_lookup.
+    {
+      const seen = new Set<string>();
+      const add = (n: string): void => {
+        if (seen.has(n)) return;
+        seen.add(n);
+        for (const p of this.interfaceMap.get(n)?.extends ?? []) add(p);
+      };
+      for (const n of info.implements) add(n);
+      info.implements = [...seen];
+    }
 
     // Unified vtable slot list: start from the superclass's (already flattened)
     // slots so inherited members keep their byte offset, then merge own members

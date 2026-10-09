@@ -46,7 +46,11 @@ var raw:ByteArray = new ByteArray();
 raw.endian = Endian.LITTLE_ENDIAN;
 raw.writeByte(0x78); raw.writeByte(0x56); raw.writeByte(0x34); raw.writeByte(0x12);
 raw.position = 0;
-check(raw.readUnsignedInt() == 0x12345678, "LE raw bytes -> u32, got " + raw.readUnsignedInt());
+// Read once into a local: re-reading inside the message would run off the end,
+// and AIR throws EOFError #2030 for that (measured on adl 51.4.1) -- the old
+// silent 0-on-EOF behaviour is what used to hide this.
+var rawU32:uint = raw.readUnsignedInt();
+check(rawU32 == 0x12345678, "LE raw bytes -> u32, got " + rawU32);
 
 // a mid-stream endian switch must not disturb position/length or prior bytes
 var mix:ByteArray = new ByteArray();
@@ -55,5 +59,29 @@ mix.endian = Endian.LITTLE_ENDIAN;
 mix.writeUnsignedInt(1);
 check(mix.length == 8, "mixed length, got " + mix.length);
 check(bytes(mix, 8) == "0,0,0,1,1,0,0,0", "mixed bytes, got " + bytes(mix, 8));
+
+// A double is the plain IEEE-754 byte sequence in the ByteArray's endianness, so
+// it does NOT decompose into "high 32 bits first" -- measured on adl 51.4.1
+// (temp/pkg1d/oracle/adl-dbl.txt): little-endian 1.0 is 00 00 00 00 00 00 F0 3F
+// (last byte 63), big-endian is 3F F0 00 00 00 00 00 00 (first byte 63).
+var dle:ByteArray = new ByteArray();
+dle.endian = Endian.LITTLE_ENDIAN;
+dle.writeDouble(1.0);
+check(bytes(dle, 8) == "0,0,0,0,0,0,240,63", "LE double bytes, got " + bytes(dle, 8));
+dle.position = 0;
+check(dle.readDouble() == 1, "LE read double");
+// ...and a hand-built big-endian buffer reads back as 1.0
+dle.length = 0;
+dle.endian = Endian.BIG_ENDIAN;
+dle.writeByte(0x3F); dle.writeByte(0xF0);
+for (var z:int = 0; z < 6; ++z) dle.writeByte(0);
+dle.position = 0;
+var dman:Number = dle.readDouble();
+check(dman == 1, "BE raw double bytes -> 1.0, got " + dman);
+dle.length = 0;
+dle.writeDouble(-2.5);
+check(bytes(dle, 8) == "192,4,0,0,0,0,0,0", "BE double -2.5 bytes, got " + bytes(dle, 8));
+dle.position = 0;
+check(dle.readDouble() == -2.5, "BE read double -2.5");
 
 trace("reg-bytearray-endian: all assertions passed");

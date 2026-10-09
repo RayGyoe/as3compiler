@@ -27,7 +27,7 @@
 | 资源 | `VertexBuffer3D`、`IndexBuffer3D`、`Program3D`（`upload(AGAL字节码)`） |
 | 纹理 | `flash.display3D.textures.{Texture, CubeTexture, RectangleTexture, TextureBase, VideoTexture}` |
 | 常量类 | 15 个：`BlendFactor`/`BufferUsage`/`ClearMask`/`CompareMode`/`FillMode`/`MipFilter`/`Profile`/`ProgramType`/`RenderMode`/`StencilAction`/`TextureFilter`/`TextureFormat`/`TriangleFace`/`VertexBufferFormat`/`WrapMode` |
-| 隐式依赖 | `flash.geom.Matrix3D`、`flash.geom.Vector3D`、`Vector.<Number|uint|float>`、`ByteArray`（小端读） |
+| 隐式依赖 | `flash.geom.Matrix3D`、`flash.geom.Vector3D`、`Vector.<Number\|uint\|float>`、`ByteArray`（小端读） |
 
 > 注意 `AGALMiniAssembler`（`com.adobe.utils.*`）**不是运行时**，是纯 AS3 工具类——只要编译器能编译它的
 > 源码，它就作为用户代码跑（只做字符串解析 + 位打包，产出 `ByteArray`）。所以不需要特殊运行时支持，
@@ -56,8 +56,16 @@
 Stage3D 的着色器是 **AGAL（Adobe 图形汇编语言）二进制字节码**，不是 GLSL/HLSL/MSL。`Program3D.upload()`
 收的是字节码，运行时负责把它翻译成目标平台的着色器语言。
 
-- **结构**：magic `0xa0` + version + program type + shader type，之后是一串 32-bit token
-  （`opcode | dest | src1 | src2 | swizzle/mask`），≤200 指令/程序。
+- **结构**：magic `0xa0` + version + program type + shader type，之后是一串 **固定 24 字节/条**的槽
+  （`[opcode:4][dest:4][src1:8][src2:8]`），≤200 指令/程序。
+  **无目的寄存器的指令（`kil`/`ife`/`ine`/`ifg`/`ifl`）也占满这 24 字节**：
+  `AGALMiniAssembler.as` 只把该指令的**操作数**写成槽里的 `src1`/`src2`，但**仍然写 4 字节 0 到
+  `dest` 槽**（`if ( j == 0 ) { agalcode.writeUnsignedInt( 0 ); }`）——故解码器**必须无条件**跳过
+  `dest` 槽，否则该指令的每个操作数都**早读 4 字节**。阶段一百一十五 前正是如此：
+  away3d `EnvMapMethod` 的 `kil temp2.w`（「立方体采样 alpha < 0.5 就杀片元」）被解成
+  `in.v0.xxxx`，判据变成**变换后法线 x < 0**——一个世界空间半平面，投影正好是**屏幕中心竖直线**，
+  把 `Basic_SkyBox` 的环体左侧外表面成片丢掉，且随旋转角度变化（看起来像「转到某些角度环就缺失」）。
+  钉子：`test/unit/stage3d.ts` 的 `stage3d/agal-operand-slots`。
 - **寄存器模型**（按 version 分档，详见 AGALMiniAssembler `initregmap`）：`va`（attribute，v1/v2=7、v3=15）、
   `vc`（vertex constant，v1=127、v2/v3=249）、`vt`（temp，v1=7、v2/v3=25）、`op/oc`（output）、
   `v`（varying，v1=7、v2/v3=9）、`fc`（fragment constant，v1=27、v2=63、v3=199）、`ft`（v1=7、v2/v3=25）、
@@ -206,7 +214,260 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 
 ---
 
-## 9. 参考链接
+## 9. 立方体贴图与纹理上传（阶段一百一十二 落地，一百一十三 修正 mip/采样器，一百一十四 定下共用队列，一百一十六 web 后端补齐，一百一十七 程序缓存，一百二十八 补齐 2D mip 链 + 无链丢弃 + 状态对象缓存）
+
+`CubeTexture` 与 2D `Texture` 的**上传时机**、**mip 语义**、**立方体面**三件事都是在
+把 headless `Basic_SkyBox`（away3d）跑起来的过程中实测定出来的，且它们**共同**决定
+「3D 通道是否可见」——错了不会报错，只是纹理**静默**为空，窗口显示舞台背景
+（Basic_SkyBox 曾因此**纯白**）。
+
+### 9.1 上传是**同步**的（不是延迟到 draw）
+
+AIR 的 `uploadFromBitmapData(source, …)` **当场**把像素交给 GPU；调用方随后
+`source.dispose()` 是**合法且常见**的写法——away3d 的 `MipmapGenerator.generateMipMaps`
+正是在上传完那张临时 `BitmapData` 的下一行 `mipmap.dispose()`。本运行时的
+`BitmapData_dispose` 会把 `pixels` 置空，因此：
+
+- 2D `Texture_uploadFromBitmapData`：命中的**立即**调用 `as_s3d_texture_from_pixels`
+  （Starling 的文本框贴图同样「上传后立刻 dispose」，同一原因）。
+- `CubeTexture_uploadFromBitmapData`：六个面无法一面一条 MTLTexture 地延迟上传，
+  故**在 mip 0 把像素快照**成面自己的 `BitmapData`（写屏障同步），submit 时再建
+  一张 `MTLTextureTypeCube`。
+
+### 9.2 mip 链：立方体给完整链 + 2D 收应用上传的每一级（阶段一百一十三 修正，**阶段一百二十八 补齐 2D**）
+
+**这是什么 bug**：环面的环境反射曾整片出现「细密网纹」（背景雪山从环身透出的高频噪声），
+而天空盒正常。根因是**立方体贴图没有 mip 链**：AIR 的 `BitmapCubeTexture` 经
+`MipmapGenerator.generateMipMaps` 把**每一级**都上传，away3d 的 AGAL 又写着
+`<cube,linear,miplinear>`（§9.5）——于是 AIR 的环境反射是**逐级 mip 过滤**的；本运行时当年
+为绕开延迟上传只留了 level 0，「被**放大**的天空盒看不出问题，被**缩小**的环面反射直接走样」。
+
+- **`CubeTexture`**：现在按 `mipmapped:YES` 建 `MTLTextureTypeCube`，六个面先写 level 0，
+  再用一次 blit（`generateMipmapsForTexture:`，同队列故排在当帧绘制批次之前，等其完成）
+  生成 level 1..n。Metal 的盒式滤波与 CPU 侧 `MipmapGenerator` 产出同级内容，且**不依赖**
+  延迟上传的顺序——这是比复刻 away3d 的软件 mip 生成更稳的做法。
+- **2D `Texture`（阶段一百二十八 起）**：`uploadFromBitmapData(source, miplevel)` 的
+  `miplevel != 0` 现在**按 AIR 的实测口径**真正上传该级（见 §9.12）——不再是「只收 level 0」
+  的已知偏差。**一条如实记录**：away3d 的 `MipmapGenerator` 风格循环把**同一张** scratch
+  位图逐级上传（`mipmap.draw(...)` 把缩小后的内容画回它自己），我们的区域规则会照搬 AIR
+  读到的内容（左上 `lw×lh`、**按源的行距**读）——这正是 adl 的行为（`temp/mipprobe/` 的
+  T5：逐级读回 `16/48/80/112`），所以 dot-for-dot 对齐，不额外「修正」应用自己写回的像素。
+- **无链 + `miplinear` ⇒ 整 draw 丢弃**：`Texture.mips`（被任何 `miplevel > 0` 上传置位）
+  是唯一判据，**不是** `createTexture` 的 `mipmapped` 标志（§9.12 T3/T4 实测）。
+
+> 全量对照证据：`temp/ringdiag/`（修复前后逐张截图 + 与 AIR 参考的并排图）、
+> `temp/ringdiag/mipfix-*.png`。
+
+### 9.5 采样器状态来自 AGAL `tex` 标志位（阶段一百一十三 实测）
+
+**为什么必须**：away3d 与 Starling **都从不调用** `setSamplerStateAt`（两棵树各 0 命中），
+它们只写 AGAL 标志位：away3d 的环境贴图是 `<cube,linear,miplinear>`，天空盒
+（`SkyBoxPass`）同样 `,miplinear`，Starling 是 `<2d,linear,nomip>` 一类。若运行时**忽略**这些位
+（旧行为），滤/环绕/mip 就全凭自定的默认值——恰好与 away3d 的默认路径一致，**看着对**，
+但 away3d 的 `useSmoothTextures = false` 分支要 `nearest`，会被静默渲染成双线性。
+
+实测（AIR SDK 51.4.1；探针 `temp/sampprobe/`，13 例 × 2 次回读，逐例独立清屏色＋md5 版本戳）：
+
+| 结论 | 证据 |
+|---|---|
+| **AGAL 标志位被执行** | 同一程序 `<2d,linear,nomip>` vs `<2d,nearest,nomip>`：2×2 纹理放大后中心呈**灰**（双线性平均）vs **纯色**（单纹素） |
+| **`setSamplerStateAt` 覆盖标志位** | 例 A3/A4：setProgram 之后调，结果随显式调用 |
+| **两者是「后写者胜」** | 例 A5：**先**调 `setSamplerStateAt`、再 setProgram → 结果随 AGAL 标志位 |
+| **`miplinear` 真按 lod 选层** | uv 平铺 T=1/8/16/64（lod = log2(每像素纹素数) = log2(T/4)）→ 采到 level 0/1/2/4 的**各层专色**（红/绿/蓝/品红） |
+| `nomip` / 显式 `MIPNONE` 不选层 | 例 B6/B7：同样平铺下仍为 level 0 |
+| mip 过滤 + **无 mip 链**的纹理 → **整个 draw 被丢弃** | 例 A6：回读整片等于清屏色（AIR 视为无效组合）。**已落地**（阶段一百二十八，两端同条件；web 侧的丢弃点必须在 `glUseProgram` **之前**，否则 GL 采到不完整纹理读作**黑**而不是清屏色）——见 §9.12 |
+
+实现：`as_agal_sampler_flags`（`runtime.ts`）在 `Program3D.upload` 时按 AGALMiniAssembler 的位域
+（`filter` 28 / `mipmap` 24 / `repeat` 20 / `dim` 12）解出每个采样器寄存器的
+`(filter, wrap, mip)`，打包进 `Program3D.samplerUsed/samplerFlags`；`Context3D_setProgram`
+调 `as_s3d_apply_agal_sampler_state` 写进 GPU 的**同一份**每单元状态（`s3d_set_sampler_state_i`），
+因此与显式 `setSamplerStateAt` 天然是「后写者胜」（AIR 语义）。注意 AGAL 的 filter 位
+1 = linear，而 glue 的 `filter` 1 = nearest，跨界时取反。
+
+> 此前 `miplinear` 曾退化为 level 0（`mipmapped:NO`）；现在立方体有链 + 采样器真的选层，
+> 两者**缺一不可**——只补 mip 链而采样器仍是 `nomip`，环面依旧走样。
+
+### 9.6 立方体贴图的 GPU 面
+
+- 一张 `MTLTextureTypeCube`，六个面按 **AGAL/Stage3D 顺序 +X, −X, +Y, −Y, +Z, −Z**
+  写入 —— 面是 texture **slice**，必须用带 `bytesPerImage` 的选择器
+  （`replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:` 在立方体上**不存在**，
+  发出去是 unrecognized selector，即硬崩，不是驱动的空操作）。
+- **识别靠 vtable，先于任何形如 `Texture` 的字段读取**：`CubeTexture.face0` 与
+  `Texture.gpu` 是**同一字偏移**，先读 `->gpu` 会把 `BitmapData*` 当 MTLTexture 用
+  （Basic_SkyBox 早期就撞过 `objc_retain` 悬空指针）。
+- AGAL 的 `<cube>` 维度把该采样器声明成 `texturecube<float>`（MSL）/ `samplerCube`
+  （GLSL），坐标取 `.xyz`。
+
+### 9.7 验收
+
+`examples/away3d-core/Basic_SkyBox.as`（8 个 `[Embed]` 资源，含 6 张 512² JPEG
+天空盒）headless 构建后渲染出**雪山天空盒 + 环境反射铬环**，与 adl 参照
+（`temp/away3d/skybox-01-view.png`）同场景同构图；天空采样 (30,35,35) vs adl
+(33,37,36)。环面的**反射清晰度**是阶段一百一十三 的验收点：修复前环身下半部是逐像素网纹，
+修复后是与 AIR 同级的连续锐利镜像（`temp/ringdiag/ab-air-vs-ours.png`）。这些不变量
+无法进 `examples/`（示例套件是纯 C、无 GPU），改由单元组 **`stage3d/texture-upload`**、
+**`stage3d/mip-semantics`**、**`stage3d/dss-cache`**、**`stage3d/agal-sampler-flags`** 与
+**`stage3d/gpu-queue-sharing`**（`test/unit/stage3d.ts`）钉在源级。阶段一百二十八 的三端验收
+另有离屏 runnable 探针：`temp/mipprobe/`（mip 语义，18 行）与 `temp/bakeprobe/`（烘焙分辨率
+与 `draw` 几何，20 行），两者 `adl == native(AOT) == web(AOT)` 逐行一致——见 §9.12、§9.13。
+
+### 9.8 合成目标纹理**必须与 Skia 共用一条 `MTLCommandQueue`**（阶段一百一十四）
+
+Stage3D 的离屏目标（`ASC_stage3d_tex`）是**同一帧内被先生后读**的：`ASC_window_render`
+的顺序是 `as_s3d_flush_all()`（commit + `waitUntilCompleted`）→ 取 drawable →
+`as_skia_mtl_draw_texture(canvas, ASC_stage3d_tex, …)`（Skia **采样**这张纹理）→
+`as_skia_mtl_flush`（Ganesh `flushAndSubmit` + present）。**CPU 侧提交顺序**是对的，但
+**GPU 侧的读与下一帧的写仍会重叠**，因为 Metal 的冒险跟踪（hazard tracking）**只在单条
+队列内有效** —— 两条队列之间既无执行序保证、也无跨 command buffer 的冒险跟踪。
+
+后果是一个很容易误判成「模型坏了」的画面：第 N 帧的合成读与第 N+1 帧的 Stage3D 写重叠，
+**写胜出**，于是尚未被环形 pass 写到的 tile 停在该帧的天空盒（背景）上 ⇒ **物体沿垂直 tile
+边界被直线切开、缺口处露出背景，而背景本身完好**。`Basic_SkyBox` 上 25 帧连拍命中 11 帧
+（偶有一帧整幅画面的竖直接缝）。
+
+**因此：`s3d_create` 必须采纳 Ganesh 那条队列**（`metal_glue.mm` 的进程级
+`sk_mtl_shared_queue()`），而不是自建一条。要点：
+
+- 该队列**持有到进程退出、永不释放**（`sk_mtl_destroy` 只置 `g_queue = nil`）：活着的
+  Stage3D 上下文还在用它，且下一个窗口必须拿到**同一条**；
+- `stage3d_glue.mm` 用 `__attribute__((weak_import))` 声明它 —— **headless Stage3D 构建会
+  链接 `stage3d_glue.mm` 而不链 `metal_glue.mm`**（无窗口 ⇒ 无 Ganesh），此时符号不存在，
+  上下文回落自建一条（恒 +1，与 `s3d_destroy` 的 release 配平）；
+- 目标纹理本身无需改动：`MTLStorageModeShared` + `usage = RenderTarget|ShaderRead` + 默认
+  `MTLHazardTrackingModeTracked`，正是同队列冒险跟踪生效的前提；
+- **不要**用「提交时让 CPU 等 GPU」（Ganesh `GrSyncCpu::kYes`）代替共用队列：那会把每帧的
+  CPU/GPU 串行化，正好吃掉阶段一百零四 用批量提交省下的 ~0.6 ms/帧。`MTLSharedEvent` 也不
+  可行 —— 它需要一个「合成已读完」的可靠信号，而 Ganesh 给不出。
+
+**验收**（`temp/ringdiag/cap.py`：窗口定位 + 光标预停窗口中心冻结相机 + 区域截屏连拍）：共用队列后
+**390 帧零切割**（修复前 25 帧里 11 帧被切，`adl` 60 帧零撕裂）。
+
+### 9.9 帧边界只 `commit`、**不** `waitUntilCompleted`（阶段一百一十五）
+
+`s3d_flush` 分成两个风味，共用一条提交路径（`s3d_flush_impl(ctx, wait)`）：
+
+| 风味 | 何时用 | 为什么 |
+|---|---|---|
+| `s3d_flush`（commit + wait） | `s3d_readback`、`s3d_readback_render`、`s3d_resize`、`s3d_destroy` | CPU 真的要**读**目标像素（AIR 的「读回拿到所画内容」契约） |
+| `s3d_flush_async`（只 commit） | `Context3D.present`、`ASC_window_render` 合成前 | 只需让写在 **GPU 侧**合成之前落地 |
+
+**关键是「CPU 可见」与「GPU 可见」不是一回事**：CPU 等待（`waitUntilCompleted`）只为了让写对
+**CPU** 可见；而帧边界上真正要采样这张纹理的是 **GPU 侧的合成**，自 §9.8 起它与 Stage3D
+**共用一条队列**，Metal 按提交序执行同一队列的 command buffer、并为默认 `Tracked` 的目标自动
+插入依赖屏障 ⇒ 后提交的合成 buffer **不可能**在本批写落地前读到它。Ganesh 自己就是这么做的：
+`sk_mtl_end_frame` 提交合成 buffer 时**完全不 wait**。若列表里有任何一条 **CPU 读回**，就必须
+用带 wait 的那一支——`s3d_draw` 本身**从不** flush（批次只在帧边界退休一次）。
+
+**实测**（`ASC_S3D_STATS=1`，`Basic_SkyBox`）：`gpu=0.13ms wait=0.00ms commit=0.01ms
+per-batch draws/batch=2.0` —— 阶段一百零四 账上的 `wait≈0.93ms/帧`（整帧 GPU 只有 0.34ms、
+120Hz 预算 8.33ms 的 ~11%）降到 `commit≈0.01ms/帧`；同轮重测阶段一百零四 的容量：Starling
+`showStats` 惩罚 **−6.4%/−5.0% → 归零**（OFF 61238 / ON 61603 峰值对象数）。
+
+**验收方法（参考无关）**：截屏域的逐像素掩码不可用——相机 yaw 是鼠标偏移的**累加和**（跨运行
+姿态不可比）、天空盒的**云会动**、窗口服务器还会给截屏叠色彩管理抖动（一次运行内静态天空角落的
+逐像素 max−min 达 103）。故改用**只认「贯穿环带的竖直线」的检测器**（每列
+`V(x)=|I(x+1)-I(x)|` 的行均值，扣掉左右邻列与同列在整串里的时间中位数）：320 帧 max **15.96**
+（median 5.34），而贴一条 10px 宽另一姿态竖条的灵敏度自检为 **24.88**；两处缺陷的缝都是这样的
+竖直线（AGAL `kil` 的世界 x=0 半平面、跨队列撕裂的 tile 边界），真实环体轮廓是**曲线**
+（任一一列上只有少数几行有边）。
+
+### 9.10 web 后端（`vendor/stage3d_webgl.cc`）的三处对齐（阶段一百一十六）
+
+阶段一百一十三 把「AGAL 采样器标志位」与「立方体整条 mip 链」先落在 Metal 侧，WebGL 胶水
+**没跟上**——而 `s3d_*` 的签名是两端共用的**同一个 seam**（生成 C 零改动就换后端），于是
+`away3d-core` 与 `air-starling-demo` 的 web 构建都在**链接期**倒在 `undefined symbol:
+s3d_set_sampler_state_i / s3d_upload_cube_texture`。三处对齐：
+
+1. **纹理 target 注册表**：GL **无法回答**「这个纹理对象的 target 是什么」（没有 `glGetTexParameter`
+   式的查询），所以胶水自己记：`struct S3DTexTarget{GLuint id; int cube;}` + `texTarget[64]/texTargetN`
+   注册表（`s3d_record_target`/`s3d_tex_gltarget`），上传时登记、draw 时**逐单元按登记的 target 绑定**、
+   销毁时清理。**空单元必须同时清 `GL_TEXTURE_2D` 与 `GL_TEXTURE_CUBE_MAP`** —— 只清 2D 时，
+   上一次留在该单元的 cube 绑定会被下一个 **2D** 采样器读到（实测的失效形态：不是「没绑定」）。
+2. **cube 上传 + mip 链**：`s3d_upload_cube_texture` 逐面 `GL_TEXTURE_CUBE_MAP_POSITIVE_X + face`
+   上传 level 0，随后 `glGenerateMipmap` 生成整链（选 GPU 生成而非复刻 away3d 的软件 mip，与
+   §9.2 的 Metal 口径一致）；cube 另设 `GL_TEXTURE_WRAP_R`（3D 环绕轴，2D 无此参数）。
+3. **清屏必须显式打开写掩码**：这是本轮唯一一个**只在 web 侧**的渲染 bug——**`glClear` 受 GL 写掩码
+   管辖**（`glColorMask`/`glDepthMask`/`glStencilMask`），而 Metal 的 `loadAction=Clear` **不受**。
+   某个 pass 的 `depthWrite=false` 会把 `GL_DEPTH_WRITEMASK` 留成 0，于是 `s3d_draw` 的**延迟深度清屏
+   被静默跳过** ⇒ 上一帧的近深度挡住天空盒（z≈1.0）与之后所有绘制，`Basic_SkyBox` 的环体就变成
+   **实心黑圆盘**（黑盘 = 各帧环体轮廓的并集，逐 draw 探针实测 RGB 恒 `(0,0,0,255)`）。修法：清屏前
+   `glDepthMask(GL_TRUE); glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE); glStencilMask(0xFF);` 再 `glClear`；
+   各 draw 自带掩码，故不会泄漏给后续 pass。
+
+**回归钉子**：`test/unit/stage3d.ts` 的 **`stage3d/webgl-abi`** 把「**运行时调用的每个 `s3d_*` 都必须
+在 WebGL 胶水里定义**」钉成结构不变量（去注释后做「引用 ⊆ 定义」比对，并具名点出上面两个入口），
+另钉 target 注册表、空单元清双 target、清屏前强制三掩码。（模拟把两个入口从胶水里删掉的 pre-fix
+文本，该组会当场列出那两个符号。）
+
+---
+
+### 9.11 程序缓存：同一条程序是「绑定」，不是「重编译」（阶段一百一十七）
+
+**为什么值得单列**：这是 `Basic_SkyBox` **62 MB/min 内存增长**的真根因，也是一个容易被「看着能跑」掩盖的类别——**画面完全正确**，只是驱动侧在不停地造对象。
+
+**现象与定性**：窗口激活后 RSS 线性 +62.4 MB/min；`footprint` 差分显示增量 **100% 在 `MALLOC_SMALL`**（不是 GC 堆、不是 GPU/IOSurface）；`leaks` 只报 304 KB（全是系统 XPC）⇒ **对象仍有引用，不是不可达泄漏**；`heap` 在 44 s 时报 **10,790 个 `MTLVertexDescriptor`**（≈ 2/帧）与 68,706 个 `CFString`。
+
+**根因**：发射侧的程序守卫是**深度 1** 的（`o->program != o->gpuProgram` = 「与**上一次**不同才重编」），而一个场景**逐 draw 交替两套材质**是常态（`Basic_SkyBox` 就是铬环 1600 三角 + 天空盒 12 三角相间）⇒ 守卫每 draw 都命中。计数探针一句话钉死：**`compile=7980, make_pso=7980`，draw 也是 7980**。每条 `MTLRenderPipelineState` 都带着新建的 `MTLVertexDescriptor` 交给 Metal，驱动**管线缓存长期持有它** ⇒ 永不回落。web 后端同形且更重（还多 512 次 `glGetUniformLocation`）。
+
+**修法（两后端同形）**：`s3d_compile` 增加 **Program3D 身份**参数（`emit.ts` 传 `o->program`），胶水内维持 `S3DProgramCache progs[16]`（LRU）+ `s3d_prog_stash`/`s3d_prog_load`，**命中即绑定、绝不进驱动编译器**——语义就是 AIR 的 `Program3D.upload()` 编译一次 / `setProgram()` 只绑定。两个必须注意的点：
+
+1. **槽位身份 = 指针 + 源码哈希**（FNV-1a 64 位）。同一个 `Program3D` 可以被**重新 `upload`** 新字节码，只比指针会静默复用过期管线。哈希类型必须 `unsigned long long`：**wasm32 的 `unsigned long` 是 32 位**，`ULL` 常量在那里溢出（且 `-Werror` 直接让 web 构建失败）。
+2. **命中的判定必须早于第一次驱动编译**（Metal 早于 `newLibraryWithSource:`、WebGL 早于 `glCreateShader`）——只有顺序对了才叫修复；顺序错了照样每 draw 重编。
+
+**复查探针（保留）**：`AS_S3D_TRACE=1` 每 60 draw 报一行计数器。判据是**比值**：`make_pso` 必须跟随**程序数**（本 demo = **2**），**绝不能**跟随 **draw 数**（修复前是 1:1）。`ASC_S3D_DUMP=1` 仍可逐 draw 看状态（本轮就是靠它确认环体/天空盒的 depth 状态相间，见遗留表「每 draw 重建 `MTLDepthStencilState`」一行）。
+
+**回归钉子**：`stage3d/program-cache`（17 条，`test/unit/stage3d.ts`）。
+
+---
+
+### 9.12 2D mip 链与「无链丢弃」：三条 adl 实测定案（阶段一百二十八）
+
+先补 adl 口径（探针 `temp/mipprobe/`：AGALMiniAssembler + 8×8 BGRA 贴图 + 256 px 视口，
+`T` = uv 平铺数 ⇒ `lod = log2(T/32)`；每例独立清屏色，故「被丢弃」在回读里表现为清屏色）：
+
+| 结论 | 证据（`temp/mipprobe/adl.txt`） |
+|---|---|
+| 丢弃的触发条件是**「从未上传过任何 level > 0」**，**不是** `createTexture(..., mipmapped=true)` | T1 `texN`（标志 false、只传 L0）`nomip` → **RED**（画了）；T2 同纹理 `miplinear` → 全 = 清屏色（**丢弃**）；T3 `texY`（标志 **true**、只传 L0）`miplinear` → **丢弃**；T4 同纹理 `nomip` → RED |
+| 上传一级的口径是**区域规则**：取**源位图左上 `lw×lh`**（`lw = max(1, width>>level)`），**按源的行距**读 | T5 `texC`（把整幅 8×8 条带按 level 1/2/3 各传一次）`miplinear T64`：预期外随机色却在 y0..y3 读到 `16/48/80/112`，正是源位图第 0..3 行（行距 8 而非 4） |
+| 正确尺度的各级读回**恰好等于上传值**，且 lod 只选一层 | T6 `texD`（L1 行 40/120/200/240、L2 70/210、L3 130）→ `y0..y3 = 40/120/200/240`；T7（lod −2）→ RED（level 0） |
+
+**实现**（一份生成 C + 两端 glue）：
+
+- `Texture`/`RectangleTexture` 增私有 `mips` 计数（任何 `miplevel > 0` 上传置 `1`，level 0
+  上传清 `0` 并重建纹理）；`Texture_uploadFromBitmapData` 的 `miplevel != 0` 分支自
+  `max(width,height)` 算层数、拒绝 `miplevel >= nlv`、取 `lw/lh = max(1, w>>miplevel)` 并
+  **钳到源位图尺寸**，走新 seam `as_s3d_texture_upload_level(ctx, gpu, level, lw, lh, pixels, srcW)`。
+- 绑定侧把「有无链」传下去（2D 传 `o->tex{i}->mips`、立方体传 `1`）：
+  `s3d_bind_texture(gpu, unit, tex, hasChain)`。
+- 丢弃规则两端**同一个条件**：`c->samplerStateSet[i] && c->samplerMip[i] != 0 &&
+  c->texHasMips[i] == 0 && 纹理非空` ⇒ 整 draw 丢弃。Metal 侧走一个 `loadAction=Clear` 的
+  空 pass **消费掉挂起的清屏色**（回读即清屏色）；WebGL 侧**必须放在 `glUseProgram` 之前**。
+- 代价：Metal 的 2D 纹理一律 `mipmapped:YES`（~33% VRAM，换来「随时可上传任何一级」）；
+  WebGL 只在真的上传了 level > 0 时才付这份显存。
+
+**验收**：`temp/mipprobe/` 18 行 `adl == native == web` **逐位相同**，唯一差异是尾行
+`END-OF-SCENE (sync)` vs `(frames)`（headless 构建无帧循环，同步跑完即结束）。
+
+### 9.13 状态对象缓存与逐 draw 重建（阶段一百二十八）
+
+away3d 的铬环与天空盒**逐 draw 交替**深度状态（`ASC_S3D_DUMP=1` 实测 `depth=(less,w=0)` 与
+`depth=(lessEqual,w=1)` 相间），而 `s3d_rebuild_dss` 原来每次状态变化都**新建 + 释放**一个
+`MTLDepthStencilState` ⇒ `dss=8039 / draw=8040`（**不泄漏，只是抖动**：每 draw 一次驱动对象
+分配）。改为**按键值缓存**：`S3D_MAX_DSS 16` 个槽 + `S3DDssVariant`（键 = 状态字段快照，
+`s3d_key_str` 把调用者的字符串**拷进槽内**，`depthCompare` 一并入键），`s3d_select_dss` 命中
+复用、未命中才新建并 `asc_tr_dss++`（**计数器只统计创建**，故 `dss` 数直接读作「真实对象数」），
+满 16 槽按 LRU 淘汰；生命周期按「槽持有 +1、`c->dss` 借用」整理。**实测（`Basic_SkyBox`，
+1680 draws）**：`TRACE draw=1680 compile=1680 make_pso=2 pso_miss=0 dss=2 smp_miss=1
+bindtex=1679 cube=1 uptex=0 mipbuild=0 mipdrop=0`，截图 204748/204800 像素非黑。
+
+另记一处与浏览器/链接器有关的口径：`sk_mtl_shared_queue`（§9.8）在 `stage3d_glue.mm` 里原以
+`__attribute__((weak_import))` 声明，而**现代 macOS 链接器仍把它当未定义符号** ⇒ headless
+Stage3D 构建（链 `stage3d_glue` 而不链 `metal_glue`）会链接失败；阶段一百二十八 改成
+`dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")` 惰性查找（函数指针缓存，取不到用自有队列），
+普通清单即可链接。钉子在 `stage3d/gpu-queue-sharing`。
+
+## 10. 参考链接
 
 - AIR SDK 参考（`flash.display3D` 包）：<https://airsdk.dev/reference/actionscript/3.0/flash/display3D/package-detail.html>
 - AIR SDK 参考（`Context3D`）：<https://airsdk.dev/reference/actionscript/3.0/flash/display3D/Context3D.html>

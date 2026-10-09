@@ -107,19 +107,22 @@ Skia 的一切围绕 `SkCanvas`（画布）组织。绘制调用 `canvas->drawRe
 {
   "target": "native",
   "c-compiler": "clang",
-  "opt": "-O2",
   "sources": ["../vendor/skia_glue.cc"],
-  "include-paths": ["../vendor/skia/include"],
-  "link-libs": ["skia", "skparagraph"],
+  "include-paths": ["../vendor/skia"],
+  "link-libs": ["skia", "…"],
   "link-paths": ["../vendor/skia/lib/macos-arm64"],
-  "defines": ["ASC_USE_SKIA=1"],
-  "objects": []
+  "defines": ["ASC_USE_SKIA=1"]
 }
 ```
 
-> 注意：现有 `examples/skia-link.build.example.json` 里写的是 `skia_glue.c`。因为 Skia 是 C++，胶水层
-> 实际应是 `.cc`（C++ 源），且编译命令需要用 `c++/clang++` 驱动（`-lstdc++` 隐式）。`build.ts` 需要在
-> `sources` 里识别 `.cc/.cpp` 后缀并切换到 C++ 编译驱动——这是渲染阶段落地时要补的构建层能力。
+> 上面只画**形态**（`link-libs` 实际有二十余项，整段抄进文档只会过期——本文件早先的版本就是这样把
+> `skia_glue.c` 与 `include-paths: ["../vendor/skia/include"]` 写错的）。**唯一权威是
+> [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json)**，
+> 文档里的命令一律 `--manifest` 引用它，不另抄一份。Skia 是 C++：胶水层是 `.cc`，`build.ts` 认
+> `sources` 里的 `.cc/.cpp` 并自动切到 C++ 驱动（`clang++`，隐式链 `libstdc++`），链接同样由 C++
+> 驱动收尾——这些在阶段三十六 就已实装。回归守卫：`test/unit/build.ts` 的
+> `build/DocumentedLinkSets` 用**真实清单**的 `defines` 编译一次生成的 C，任何一条文档清单定义的
+> 后端组合编不过都会红（2026-10-06 就是离屏那条分支缺 `AS_CURSOR_*` 而静默失效）。
 
 **胶水层设计原则**（遵守 AGENTS.md §2.9）：
 
@@ -154,9 +157,9 @@ Skia 的一切围绕 `SkCanvas`（画布）组织。绘制调用 `canvas->drawRe
 | `TextField.text`（基础字形） | `SkFont` + `SkTextBlob` → `drawTextBlob` | 仅字形定位，无换行 |
 | `TextField`（完整排版：换行/对齐/段落） | **SkParagraph**（`modules/skparagraph`）→ `SkParagraph::layout` + `paint` | AS3 的自动换行/多行需要 SkParagraph |
 | `TextFormat.font/size/color/bold/italic` | `SkFont` + `SkTypeface` + `SkPaint` | 字体族/字号/加粗/斜体 |
-| `filters.BlurFilter` | `SkImageFilters::Blur`（`saveLayer` 包裹子树） | 已落地（阶段六十一），`sigma ≈ blurX/3` |
-| `filters.DropShadowFilter` | `SkImageFilters::DropShadow`（`saveLayer` + `SkImageFilter`） | 已落地（阶段六十一），外投影 |
-| `filters.GlowFilter` | `SkColorFilters::Matrix`（alpha 轮廓着色）+ 模糊 + 叠本体 | 已落地（阶段六十一），外发光 |
+| `filters.BlurFilter` | `SkImageFilters::Blur`（`saveLayer` 包裹子树） | 已落地（阶段六十一），`sigma = blur * sqrt(quality) / sqrt(12)` —— 按 AIR 的「直径 = `blurX` 的 box 重复 `quality` 次」做**方差匹配**（阶段九十五·七实测钉定，取代早先的经验值 `blurX/3`）。剖面仍是高斯近似：中部更陡、尾部更薄 |
+| `filters.DropShadowFilter` | `SkImageFilters::DropShadow` / `DropShadowOnly`（`saveLayer` + `SkImageFilter`） | 已落地（阶段六十一），外投影。阶段九十五·七补 `strength`（模糊**之后**乘，`min(1, 剪影 × alpha × strength)`，对齐 adl 实测）与 `hideObject`；注意 `DropShadow` 工厂本身已把**源**合成进去，`strength` 绝不能套在它的输出上（会把整个对象打薄 —— 见 `swc.md` §9.2 F4 的 137/255 事故） |
+| `filters.GlowFilter` | `SkColorFilters::Matrix`（alpha 轮廓着色）+ 模糊 + 叠本体 | 已落地（阶段六十一），外发光。阶段九十五·七补 `strength`（同 DropShadow，且在模糊后乘：前置 alpha 因子因剪影不透明会饱和，实测 `strength 1` 与 `2` 会一模一样）|
 | `DisplayObject.mask` | `canvas->saveLayer` + mask 绘制 + `SkBlendMode::kSrcIn` | AS3 遮罩语义 |
 | `scrollRect` | `canvas->clipRect` | 裁剪可视区域 |
 
@@ -281,6 +284,52 @@ SDL 2.26 才加入）正是修复跨屏倍率 bug 的依赖，说明 2.32 对本
 （`SkParagraph`/`Skottie`/GPU 后端）。**升级触发条件**：只有当确需新 milestone 才有的特性（如某个新
 `SkImageFilter`、新字体引擎行为）时，才补 `gn`/`ninja` 环境从源码自编译最新版，并重测整个胶水层。
 
+### 6.5 vendored 头必须与预编译库**同版本**（这是 ABI，不是文档）
+
+`vendor/skia` 里是**预编译库 + 一份头文件拷贝**。两份东西一旦不同步，症状不是「画错」而是**内存/寄存器被写坏**：
+阶段八十九·七十四 实测到 `vendor/skia/include/gpu/GrBackendSurface.h` 停在**旧一版 m124**，`kMaxSubclassSize`
+为 `64/160/160`，而编出 `vendor/skia/lib/libskia.a` 的那棵树（`build-tools/skia-src`）是 `80/176/176`。
+后果是**栈上的 `GrBackendRenderTarget` 我们按 160 字节留位、库按 176 字节写**——库的构造器越界写 16 字节，
+正好砸在 `sk_mtl_begin_frame` 自己保存 `x28`/`x27` 的栈槽上（clang 的 canary 就在旁边 `sp+0x138`）。
+表现：`-O2` 的 `examples/air-native` 启动约 1 秒即 SIGSEGV，而 `-O0` 完全正常、**任何加打印/加计数的扰动构建都会掩盖它**
+（因为扰动改变了帧布局与寄存器分配）。
+
+- **判据**：`diff -rq vendor/skia/include build-tools/skia-src/include` 必须为空。
+- **同 milestone 不代表布局一致**：m124 内部上游也改过 `kMaxSubclassSize`（并且 `VulkanTypes.h` 也补过字段），
+  所以「都是 m124」不足以安心——要**逐字节比对**。
+- **回归钉子**：`node test.ts` 的 `[skia-abi]` 组（3 项）钉住 `kMaxSubclassSize` 的具体值、`VulkanTypes.h` 的字段，
+  并在 `build-tools/skia-src` 存在时要求两份头**逐字节一致**（不存在时打 `SKIP` 并保留字面值钉子）。
+- **升级流程**：任何「换 vendor/skia」的操作都要**头 + 库一起换**，并跑 `[skia-abi]`；只换库会立刻回落到上述状态。
+
+### 6.6 Metal 后端的窗口状态是**按窗口**的（阶段八十九·七十五）
+
+`metal_glue.mm` 最初是**进程级单例**（一份 `CAMetalLayer` + `GrDirectContext` + drawable + surface），只服务一个窗口。
+后果不是「第二个窗口画慢」，而是**运行期 `new NativeWindow()` 一律拿不到 Metal**，落回 CPU 光栅 +
+整帧 `SDL_UpdateTexture` 上传（600×410 @2x = 3.9 MB/帧/窗口，116 fps 下 ~470 MB/s），且成本**随开窗数线性叠加**
+（实测每窗 +12~14% CPU，三窗 44%）。现在：
+
+| 状态 | 归属 | 说明 |
+|---|---|---|
+| `MTLDevice` / `MTLCommandQueue` / `GrDirectContext` | **全进程共享** | Skia 要求它们比 context 活得久；第一个 GPU 窗口惰性创建，最后一个槽释放时拆掉 |
+| `CAMetalLayer` | **每窗口**（槽 `g_mtl[id]`） | 由该窗口的 `SDL_MetalView` 提供，只是借用：必须在销毁 view **之前**释放 |
+| 一次性 `CAMetalDrawable` + 包它的 `SkSurface` | **每窗口** | `sk_mtl_begin_frame(id, …)` 取、`sk_mtl_flush(id)` present 并释放 |
+
+- **id 就是全链路那把钥匙**：`ASC_wins[]`（生成 C）/ `WinCtx[]`（window_glue.cc）/ `g_mtl[]`（metal_glue.mm）
+  三张表同索引，容量常量 `ASC_MAX_WINDOWS` = `SK_MAX_WINDOWS` = `SK_MTL_MAX_WINDOWS` = 16 必须一致。
+- **哪些窗口走 GPU**：`ASC_RENDER_METAL` 构建下，主窗口恒走 Metal；运行期 `NativeWindow` 默认也走
+  （AIR 的 `NativeWindowRenderMode.AUTO` 就是「有 GPU 就用 GPU」），只有显式 `renderMode = "cpu"` 才落回软件光栅。
+  同一份二进制只改这一行的实测对照（两个副窗口）：**32.8% → 14.0% CPU 平均**。
+- **反向对照必须留在代码里**：`#ifndef ASC_RENDER_METAL gpu = 0;` 保证「没有 Metal 后端的构建」不会凭空
+  产生一个自称 Metal 的窗口；`renderMode="cpu"` 则是同一构建内的反向对照（`temp/gpuprobe/`）。
+- **踩坑（Objective-C++）**：`.mm` 里的参数**不能叫 `id`**——那会遮蔽 `id` 这个**类型关键字**，函数体内所有
+  `id<CAMetalDrawable>` 会被解析成比较表达式，整文件编译失败。参数名统一用 `win_id`。
+- **语义边界**：cpu 模式窗口在 Metal 构建里**不合成 Stage3D/StageVideo**——AIR 文档明确「软件窗口不支持
+  StageVideo/Stage3D 合成」，且 Metal 构建下本就没有 CPU 回读缓冲（暴露渲染目标纹理正是为了省掉每次回读）。
+  这不是静默降级，是 AIR 已定义行为。
+- **回归钉子**：`node test.ts` 的 `[native-window]` 组新增 15 项（Metal 唯表分槽、容量一致、每种入口带 id、
+  ObjC++ `id` 关键字、attach/释放顺序、`renderMode` 选后端、渲染/on_resize 分流、纯 C stub 与 Skia 版同形、
+  示例必须走默认路径）。
+
 ---
 
 ## 7. 多目标：native 与 wasm
@@ -362,6 +411,62 @@ SkParagraph 的富文本能力（`htmlText`、多 `TextFormat` 区间样式、�
    `as_tf_html_parse_hex` 当成 `2080` 读成错误的深蓝（Starling demo 里 `basic` 显示为绿、`HTML` 显示为青）。
    现由 `as_tf_html_attr_value(s, out, cap)` 按「开引号种类」定界（并支持无引号裸值）。
 
+**字体与行高对齐 AIR（阶段九十四·二十）**：`textWidth`/`textHeight`/`numLines`/光标几何全部由
+SkParagraph 的布局结果导出，所以「用哪个字面」和「行盒多高」两件事直接决定所有排版数值。二者修前都与 AIR 不一致，
+现按 `adl 51.4.1` 实测逐值对齐（证据台 `temp/metricprobe/`，输入矩阵与两侧输出都在里面）。
+
+**(1) 三个设备字体别名必须翻译成真实字面。** AS3 的 `_sans`/`_serif`/`_typewriter` 不是字体族名，是 Flash
+运行时要**自己解析**的通用别名；CoreText 不认识 `_typewriter`，原样透传给 SkParagraph 会**静默回落到系统默认
+比例字体**——一个 `_typewriter` 字段量 10 个 `W` 得 113.26 px 而不是 72（等宽体被渲染成比例体，字宽差 40%）。
+按 adl 实测的**字宽**选定字面（下表 10 字符墨迹宽度，adl / 我们）：
+
+| family | 10×W | 10×i | 10×* | 10×空格 | adl 行高 / 我们 |
+|---|---|---|---|---|---|
+| `_typewriter` | 72 / 72.01 | 72 / 72.01 | 72 / 72.01 | 72 / 72.01 | **15 / 15** ✓ |
+| `_sans` | 113 / 113.26 | 26.5 / 26.66 | 46.5 / 46.70 | 33 / 33.17 | 15.5 / 12 ✗ |
+| `_serif` | 113 / 113.26 | 33 / 33.34 | 60 / 60 | 30 / 30 | 15 / 13 ✗ |
+| *(空字符串)* | 113 / 113.26 | 33 / 33.34 | 60 / 60 | 30 / 30 | **12 / 12** ✓ |
+| Courier / Courier New | 72 / 72.01 | — | — | — | **12 / 12**、13.5 / 14 |
+| Menlo / Monaco | 72 / 72.25、72.01 | — | — | — | **14 / 14**、**15 / 15** |
+| Helvetica / Arial | 113 / 113.26 | 26.5 / 26.66 | 46.5 / 46.70 | 33 / 33.17 | **12 / 12**、13.5 / 13 |
+| Times New Roman / Geneva | 113 / 113.26、113.5 / 113.61 | 33、28 | 60、60.5 | 30、40 | **13 / 13**、**15 / 15** |
+
+映射表：`_typewriter` → `Monaco`、`_sans` → `Helvetica`、`_serif` → `Times New Roman`、空/`null` → `Times`
+（AIR 把空字体族读回成 `"Times Roman"`，且其中线高 12 与 Times 的 12 逐值一致，不是 Times New Roman 的 14）。
+具名字体一律**原样透传**——它们本来就已经逐值对上（表内加粗项）。别名的翻译与字面查找都在胶水里做
+（`sk_family_alias()` / `sk_match_typeface()`，后者按 `(family, bold, italic)` 缓存，避免每段都重跑 CoreText
+的族表扫描），且**每条** `setFontFamilies` 通路（平铺字段、带 `TextFormat.leading` 的字段、htmlText 多 run）
+都走它，`test.ts` 的 `[fontmetrics]` 有「不留任何未翻译透传」的反向钉子。
+
+**(2) 行盒高度按 AIR 的模型强制。** AIR 把行盒的上下两半**各自四舍五入到 0.5**、且**完全不用字体自带的
+line gap**；Skia 报的是 `ceil 型(ascent + descent + lineGap)`。Monaco 的 gap 是 1.002 px，于是同一个 12 px
+行 AIR 说 15、Skia 说 16。我们对齐 adl 的模型是：
+
+```
+行高 h      = round_half(ascent) + round_half(descent) + leading      (leading 以 px 计)
+字段 textHeight = numLines × h − leading            (numLines ≥ 2)
+              = h                                   (numLines = 1)
+```
+
+第二条是 AIR 的**尾行怪癖**（实测：`TextFormat.leading = 4`、行盒步长 19 px 时，1/2/3/4 行分别报
+19 / 34 / 53 / 72——**最后一行的 leading 不计**，行间 leading 照常）。实现上不能靠 Skia 自己的行高：
+`sk_set_air_strut()` 给每段装一个 **height override 的 strut**，让 Skia 按该因子缩放字面的 ascent/descent 到
+AIR 的盒子；这里有个反直觉点——Skia 的因子分母是 `ascent + descent + lineGap`（`rawFull`）而盒子里**不含**
+gap，所以高度必须**预乘 `rawFull / rawSum`**，否则每个强制行盒都正好短一个 line gap（实测 14 而非 15）。
+负 leading 另走一条：Skia 把 `StrutStyle::leading < 0` **钳成 0**，所以 `leading = -3`（AIR 盒子 15 → 12）
+折进 height，正 leading 才是 leading，`test.ts` 对这两条各有钉子。
+
+**(3) `TextFormat.leading` 的单位是 px。** 修前 `leading` 被当作 em 倍数传给 Skia（`setLeading(leading)`
+× fontSize ⇒ 12 px 的值被放大 12 倍，一个 1 行的字段报出 60+ px）。现在 px 值原样进模型，12 px 字号
+`leading = 4` 的四档（1..4 行）我们与 adl **12 个数值逐值相同**（19/34/53/72 与负值 12/27/39/51）。
+
+**仍存的偏差（如实记录，未美化）**：`_sans` / `_serif` 两个**通用别名**的行高仍对不上（我们按别名字面算 12 / 13，
+AIR 报 15.5 / 15）。原因是 AIR 对通用别名用**自己的设备字体度量表**，且该表**非线性**（实测 12 px 时
+`_sans` = 12.5+3、20 px 时 19.5+4.5；`_serif` 12 px = 12+3、20 px = 17.5+5；`_typewriter` 在 12 px 恰好等于
+Monaco 的 12+3、但 14 px 起就与 Monaco 分道）——没有一个可解析的字面能复现它。我们**不做**按测量点插值的硬编码
+表（那会把未测尺寸的数值也说成「实测」），只把 9 档尺寸的实测值留在证据台，并在 `TODO.md` 登记为遗留项。
+同理 `Courier New` / `Arial` 的行高各有 0.5 px 残差（Skia 内部对半像素的取整方向），也一并记录。
+
 ---
 
 ## 9. 图片解码（`BitmapData.loadBytes` / `Loader`）
@@ -375,9 +480,16 @@ Skia 的 `SkCodec`（`include/codec`）+ `SkImage::MakeFromEncoded` 覆盖 PNG/J
 
 上面写的「PNG/JPEG/WebP/GIF 等」**实测面比预期宽**：两端 Skia 都编入了
 `skia_use_libwebp_decode=true` + `skia_use_wuffs=true`，而 wuffs **同时**覆盖 BMP / ICO，
-故 `Loader` 实际可解的编码格式是 **PNG / JPEG / GIF / BMP / WebP / ICO 六种**，全部走同一条
+故 `SkCodec` 能力上是 **PNG / JPEG / GIF / BMP / WebP / ICO 六种**，全部走同一条
 `SkImages::DeferredFromEncodedData` → `SkCodec`（阶段八十九·六十三实测，两端一致）。
 **QOI 不在内**——`SkQoiCodec` 未编入（`args.gn` 无 `skia_use_qoi`）。
+
+**但 `Loader` 默认只解 AIR 支持的那三种**（阶段九十四·二十五起）：BMP/WebP/ICO 是 AIR 之外的格式
+（`adl` 报 `#2124`），故默认构建在**胶水层按魔数拦掉**它们（连同 TIFF 系相机 RAW/DNG）——
+拦截后走上层原有的 `#2124` 失败路径，报错与 `adl` 逐字相同。要放行须显式开 `--features formats`
+（BMP/WebP/ICO，两端可用）或 `--features raw`（相机 RAW/DNG，仅 native）——见
+[`compile.md`](compile.md) §3.4.3.1 与 [`enhancements.md`](enhancements.md) §4.3/§4.5。
+`WBMP`（`SkWbmpCodec` 编入了）**故意不拦**：头部是裸多字节类型字段、无可靠魔数。
 
 **SVG 是唯一的例外，它有自己的一条通道**（阶段八十九·六十五，native，opt-in；开启方式为具名开关
 `--features svg`，即定义 `ASC_USE_SVG`，见 [`compile.md`](compile.md) §3.4.2）：

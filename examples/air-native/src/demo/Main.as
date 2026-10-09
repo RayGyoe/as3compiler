@@ -50,6 +50,7 @@ package demo {
       FileDemos.visualize(stage);
       GeometryDemos.visualize(stage);
 
+      stage.addChild(new NtWindow());
       stage.addChild(new TweenDemo());
 
       stage.addChild(new Fps());

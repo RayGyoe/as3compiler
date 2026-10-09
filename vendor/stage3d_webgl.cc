@@ -39,6 +39,15 @@
 //    to the *texture object* of each bound unit (applied lazily at draw time,
 //    cached per texture so a steady state costs nothing).
 //
+//  * Cube maps. A Stage3D CubeTexture (away3d's skybox/environment maps) becomes
+//    a GL cube map: six glTexImage2D calls on the six GL_TEXTURE_CUBE_MAP_POSITIVE_X
+//    slices plus a mip chain, because the AGAL translator declares the matching
+//    samplerCube only when the bytecode says <cube>. GL distinguishes 2D and cube
+//    *targets* (binding a cube name to GL_TEXTURE_2D is GL_INVALID_OPERATION and
+//    samples black, and the parameters live on the cube target), and it offers no
+//    query for which target a name was created with -- so uploads record it in a
+//    per-context registry (S3DTexTarget) that bind/sampler paths consult.
+//
 //  * Depth/stencil. Context3D.clear() is deferred to the next draw (Stage3D
 //    clears once per frame and then issues many drawTriangles), the depth/stencil
 //    attachment is only *used* by the passes that need it, and Starling's masking
@@ -87,6 +96,13 @@ static int asc_s3d_stats(void) {
   if (on < 0) on = (getenv("ASC_S3D_STATS") != NULL) ? 1 : 0;
   return on;
 }
+// Per-draw state dump (ASC_S3D_DUMP=1), the web counterpart of the Metal glue's
+// asc_s3d_dump: names the draw-state decisions that are otherwise invisible.
+static int asc_s3d_dump(void) {
+  static int on = -1;
+  if (on < 0) on = (getenv("ASC_S3D_DUMP") != NULL) ? 1 : 0;
+  return on;
+}
 
 #define S3D_MAX_TEX  8
 #define S3D_MAX_ATTR 8
@@ -109,7 +125,37 @@ struct S3DRtTex {
   int width, height;
 };
 
+// Registry entry for a texture object's GL target. A cube map can only ever be
+// bound to GL_TEXTURE_CUBE_MAP (and its sampler parameters live on that target),
+// but GL has no "what target is this name" query, so the uploads record it here
+// and the bind/sampler paths look it up. Entries are dropped by
+// s3d_destroy_texture -- a GL name can be recycled, and a stale "cube" label on a
+// reused name would make a 2D texture unbindable.
+struct S3DTexTarget {
+  GLuint id;
+  int cube;   // 0 = GL_TEXTURE_2D, 1 = GL_TEXTURE_CUBE_MAP
+};
+
 struct S3DContext;
+
+// One compiled program: the linked GL program plus its cached constant-register
+// uniform locations. Stage3D lets a scene switch Program3D between draws (away3d
+// alternates its torus material and its skybox material on EVERY frame), and a
+// GL program link is a driver operation, not a bind. Compiling/linking per draw
+// was also 512 glGetUniformLocation string lookups + a glDeleteProgram per draw.
+// The compiled program is therefore cached per Program3D identity and merely
+// SELECTED on a switch (see s3d_compile), exactly like AIR's program bind.
+#define S3D_MAX_PROGRAMS 16
+
+struct S3DProgramCache {
+  void* key;              // Program3D identity (never cleared: the slot's name)
+  unsigned long long srcHash;  // hash of the GLSL this slot was compiled from
+  int used;               // whether the slot is allocated
+  GLuint prog;            // owned by the slot while it is STASHED
+  int uniVC[256];         // constant-register uniform locations (per program!)
+  int uniFC[256];
+  unsigned long stamp;    // LRU stamp
+};
 
 // An offscreen render target that can also be sampled: a color texture plus its
 // own framebuffer (the back buffer's FBO is `fbo`; a render texture gets one
@@ -130,7 +176,9 @@ struct S3DContext {
   // Current render override (rendering into a render texture); nil when drawing
   // to the back buffer.
   S3DRt* overrideRt;
-  // Program (one at a time, exactly like Metal's single vfn/ffn pair).
+  // The LIVE program: borrowed from the cache slot named c->progKey (see
+  // s3d_prog_load), or owned here while key == NULL. s3d_prog_stash hands this
+  // state back to its slot before any switch, so exactly one place owns it.
   GLuint prog;
   // Attribute locations are bound explicitly before linking (glBindAttribLocation
   // in s3d_compile), so stream i is always attribute i — the GLSL ES 1.00
@@ -138,6 +186,12 @@ struct S3DContext {
   // Constant-register uniform locations, indexed by register number (256 max).
   int uniVC[256];
   int uniFC[256];
+  // Compiled-program cache (see S3DProgramCache).
+  S3DProgramCache progs[S3D_MAX_PROGRAMS];
+  int nprogs;
+  void* progKey;            // identity of the live program (NULL = not cached)
+  unsigned long long progHash;   // GLSL source hash of the live program
+  unsigned long progstamp;  // LRU source for the slots
   // Vertex streams: one VBO per stream index, uploaded on s3d_upload_vertex.
   GLuint vbo[S3D_MAX_ATTR];
   int components[S3D_MAX_ATTR];
@@ -172,12 +226,23 @@ struct S3DContext {
   const char* stencilDepthPassStencilFail;
   unsigned int stencilRef, stencilReadMask, stencilWriteMask;
   int scissorOn, scissorX, scissorY, scissorW, scissorH;
+  // setColorMask: which channels the following draws may write (1 = write);
+  // applied with glColorMask when the draw is issued (Stage3D's
+  // set-state-then-drawTriangles order). 1 on context creation.
+  int colorMaskR, colorMaskG, colorMaskB, colorMaskA;
   int samplerFilter[S3D_MAX_TEX];
   int samplerWrap[S3D_MAX_TEX];
   int samplerMip[S3D_MAX_TEX];
   int samplerStateSet[S3D_MAX_TEX];
+  // Whether the texture bound at each unit owns a mip chain (reported by
+  // s3d_bind_texture; consulted by s3d_draw to reproduce AIR's rule that a
+  // mip-filtered sample on a chainless texture drops the whole draw -- in GL the
+  // alternative is an INCOMPLETE texture, which samples black).
+  int texHasMips[S3D_MAX_TEX];
   S3DTexState texState[64];
   int texStateN;
+  S3DTexTarget texTarget[64];
+  int texTargetN;
   S3DRtTex rtTex[32];
   int rtTexN;
   // Scratch buffer for pixel upload/readback conversions (BGRA <-> RGBA), grown
@@ -187,6 +252,10 @@ struct S3DContext {
   // VAO for the attribute setup; the element-buffer binding is VAO state in GLES3.
   GLuint vao;
 };
+
+// Program-cache helper, defined with s3d_compile further down but needed by the
+// teardown path above it.
+static void s3d_prog_release(S3DProgramCache* e);
 
 // Live contexts, so a destroyed texture can be scrubbed out of every binding (a
 // GL texture name freed while still bound would be rebound by a later alloc and
@@ -206,7 +275,7 @@ static void s3d_unbind_texture_everywhere(GLuint t) {
   if (t == 0) return;
   for (int k = 0; k < s3d_live_n; k++) {
     S3DContext* c = s3d_live[k];
-    for (int i = 0; i < S3D_MAX_TEX; i++) if (c->textures[i] == t) c->textures[i] = 0;
+    for (int i = 0; i < S3D_MAX_TEX; i++) if (c->textures[i] == t) { c->textures[i] = 0; c->texHasMips[i] = 0; }
     if (c->overrideRt != NULL && c->overrideRt->color == t) c->overrideRt = NULL;
   }
 }
@@ -291,23 +360,51 @@ static void s3d_rgba_to_bgra(const uint8_t* rgba, uint8_t* bgra, int n) {
   }
 }
 
+// The GL target a texture object was created with (see S3DTexTarget); an unknown
+// name is assumed 2D, which is what every creator but the cube upload makes.
+static GLenum s3d_tex_gltarget(S3DContext* c, GLuint tex) {
+  for (int i = 0; i < c->texTargetN; i++)
+    if (c->texTarget[i].id == tex) return c->texTarget[i].cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
+  return GL_TEXTURE_2D;
+}
+
+static void s3d_record_target(S3DContext* c, GLuint tex, int cube) {
+  for (int i = 0; i < c->texTargetN; i++)
+    if (c->texTarget[i].id == tex) { c->texTarget[i].cube = cube; return; }
+  if (c->texTargetN < 64) {
+    c->texTarget[c->texTargetN].id = tex;
+    c->texTarget[c->texTargetN].cube = cube;
+    c->texTargetN++;
+  }
+}
+
+// Write one texture's sampler parameters. A cube map also needs the third axis
+// (Stage3D's wrap mode is per-axis but AGAL names only one, so all three take it),
+// while a 2D texture must NOT be given GL_TEXTURE_WRAP_R.
+static void s3d_set_tex_params(GLenum target, int f, int w, int m) {
+  GLenum wt = (w == 1) ? GL_REPEAT : GL_CLAMP_TO_EDGE;
+  glTexParameteri(target, GL_TEXTURE_WRAP_S, wt);
+  glTexParameteri(target, GL_TEXTURE_WRAP_T, wt);
+  if (target == GL_TEXTURE_CUBE_MAP) glTexParameteri(target, GL_TEXTURE_WRAP_R, wt);
+  glTexParameteri(target, GL_TEXTURE_MAG_FILTER, (f == 1) ? GL_NEAREST : GL_LINEAR);
+  glTexParameteri(target, GL_TEXTURE_MIN_FILTER,
+                  (m == 0) ? ((f == 1) ? GL_NEAREST : GL_LINEAR)
+                           : ((m == 1) ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR));
+}
+
 // Apply the recorded sampler state to one bound texture (cached: sampler state
 // lives on the texture object in GL, so a steady state issues no GL calls).
 static void s3d_apply_sampler(S3DContext* c, GLuint tex, int unit) {
   if (!c->samplerStateSet[unit]) return;
   int f = c->samplerFilter[unit], w = c->samplerWrap[unit], m = c->samplerMip[unit];
+  GLenum target = s3d_tex_gltarget(c, tex);
   for (int i = 0; i < c->texStateN; i++) {
     S3DTexState* s = &c->texState[i];
     if (s->id == tex) {
       if (s->filter == f && s->wrap == w && s->mip == m) return;
       s->filter = f; s->wrap = w; s->mip = m;
-      glBindTexture(GL_TEXTURE_2D, tex);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, w == 1 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, w == 1 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f == 1 ? GL_NEAREST : GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                      m == 0 ? (f == 1 ? GL_NEAREST : GL_LINEAR)
-                             : (m == 1 ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR));
+      glBindTexture(target, tex);
+      s3d_set_tex_params(target, f, w, m);
       return;
     }
   }
@@ -315,13 +412,8 @@ static void s3d_apply_sampler(S3DContext* c, GLuint tex, int unit) {
   if (c->texStateN < 64) {
     S3DTexState* s = &c->texState[c->texStateN++];
     s->id = tex; s->filter = f; s->wrap = w; s->mip = m;
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, w == 1 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, w == 1 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f == 1 ? GL_NEAREST : GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                    m == 0 ? (f == 1 ? GL_NEAREST : GL_LINEAR)
-                           : (m == 1 ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR));
+    glBindTexture(target, tex);
+    s3d_set_tex_params(target, f, w, m);
   }
 }
 
@@ -368,6 +460,7 @@ void* s3d_create(int width, int height) {
   c->instanceCount = 1;
   c->stencilReadMask = 0xFF;
   c->stencilWriteMask = 0xFF;
+  c->colorMaskR = c->colorMaskG = c->colorMaskB = c->colorMaskA = 1;
   c->uniVC[0] = -1;  // memset already zeroed; -1 marks "not linked yet"
   for (int i = 0; i < 256; i++) { c->uniVC[i] = -1; c->uniFC[i] = -1; }
   if (!s3d_alloc_target(c, width, height)) { delete c; return NULL; }
@@ -383,6 +476,9 @@ void s3d_destroy(void* ctx) {
   S3DContext* c = (S3DContext*)ctx;
   s3d_unregister_ctx(c);
   if (c->prog != 0) glDeleteProgram(c->prog);
+  for (int i = 0; i < c->nprogs; i++) s3d_prog_release(&c->progs[i]);
+  c->nprogs = 0;
+  c->progKey = NULL;
   for (int i = 0; i < S3D_MAX_ATTR; i++) if (c->vbo[i] != 0) glDeleteBuffers(1, &c->vbo[i]);
   if (c->ibo != 0) glDeleteBuffers(1, &c->ibo);
   if (c->fbo != 0) glDeleteFramebuffers(1, &c->fbo);
@@ -494,16 +590,81 @@ void* s3d_texture_from_pixels(void* ctx, int width, int height, const uint32_t* 
 void* s3d_upload_texture(void* ctx, int unit, int width, int height, const uint32_t* argb) {
   if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX) return NULL;
   void* tex = s3d_texture_from_pixels(ctx, width, height, argb);
-  if (tex != NULL) ((S3DContext*)ctx)->textures[unit] = (GLuint)(uintptr_t)tex;
+  if (tex != NULL) {
+    S3DContext* c = (S3DContext*)ctx;
+    c->textures[unit] = (GLuint)(uintptr_t)tex;
+    c->texHasMips[unit] = 0;  // level 0 only, no chain (see s3d_draw)
+  }
   return tex;
+}
+
+// Upload ONE mip level (level > 0) from the top-left lw x lh rectangle of a
+// source whose row stride is srcW pixels -- AIR's region rule, measured in
+// temp/mipprobe (see the Metal glue's s3d_texture_upload_level for the numbers).
+// GL's glTexImage2D has no row-stride argument, so the region is first copied
+// row by row into a packed scratch buffer; that keeps both backends fed with the
+// SAME pixels (the dual-target requirement), which a glGenerateMipmap off level 0
+// could not guarantee for an app that supplies its own levels.
+void s3d_texture_upload_level(void* ctx, void* tex, int level, int lw, int lh, const uint32_t* src, int srcW) {
+  if (ctx == NULL || tex == NULL || src == NULL) return;
+  if (level <= 0 || lw <= 0 || lh <= 0 || srcW < lw) return;
+  S3DContext* c = (S3DContext*)ctx;
+  uint8_t* rgba = s3d_scratch(c, lw * lh * 4);
+  if (rgba == NULL) return;
+  for (int y = 0; y < lh; y++) {
+    s3d_argb_to_rgba(src + (size_t)y * (size_t)srcW, rgba + (size_t)y * (size_t)lw * 4, lw);
+  }
+  GLuint t = (GLuint)(uintptr_t)tex;
+  GLenum target = s3d_tex_gltarget(c, t);
+  glBindTexture(target, t);
+  glTexImage2D(target, level, GL_RGBA8, lw, lh, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+  glBindTexture(target, 0);
+  sk_gr_reset_context();
 }
 
 // Bind an existing texture (a bitmap upload or a render texture) as sampler
 // fs{unit}. No pixel transfer — the texture already holds content.
-int s3d_bind_texture(void* ctx, int unit, void* tex) {
+int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
   if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX || tex == NULL) return 0;
-  ((S3DContext*)ctx)->textures[unit] = (GLuint)(uintptr_t)tex;
+  S3DContext* c = (S3DContext*)ctx;
+  c->textures[unit] = (GLuint)(uintptr_t)tex;
+  c->texHasMips[unit] = hasChain ? 1 : 0;
   return 1;
+}
+
+// Upload a Stage3D CubeTexture (six square faces, ARGB like every other upload)
+// as one GL cube map and bind it as sampler fs{unit}. The AGAL translator only
+// declares a `samplerCube` when the bytecode says <cube>, so the GL target must
+// match: one slice per GL_TEXTURE_CUBE_MAP_POSITIVE_X+face.
+//
+// A mip chain is built at upload (mirroring the Metal glue's cube upload): the
+// <cube,linear,miplinear> sampler the env-map path asks for needs a complete
+// chain or the sampler returns black, and 512 texels squeezed into a few hundred
+// screen pixels of skybox has no level to fall back to without it.
+void* s3d_upload_cube_texture(void* ctx, int unit, int size, const uint32_t* const* argb) {
+  if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX || size <= 0 || argb == NULL) return NULL;
+  S3DContext* c = (S3DContext*)ctx;
+  int n = size * size;
+  uint8_t* rgba = s3d_scratch(c, n * 4);
+  if (rgba == NULL) return NULL;
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+  for (int face = 0; face < 6; face++) {
+    if (argb[face] == NULL) { glDeleteTextures(1, &tex); return NULL; }
+    s3d_argb_to_rgba(argb[face], rgba, n);
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA8, size, size, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+  }
+  glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+  // Stage3D's default sampler state (clamp, linear, miplinear) -- the AGAL `tex`
+  // flags retune it at draw time through s3d_apply_sampler.
+  s3d_set_tex_params(GL_TEXTURE_CUBE_MAP, 0, 0, 2);
+  s3d_record_target(c, tex, 1);
+  c->textures[unit] = tex;
+  c->texHasMips[unit] = 1;  // cube maps always carry a chain (built just above)
+  sk_gr_reset_context();
+  return (void*)(uintptr_t)tex;
 }
 
 void s3d_destroy_texture(void* tex) {
@@ -514,6 +675,9 @@ void s3d_destroy_texture(void* tex) {
   for (int k = 0; k < s3d_live_n; k++) {
     S3DContext* c = s3d_live[k];
     for (int i = 0; i < c->texStateN; i++) if (c->texState[i].id == t) c->texState[i].id = 0;
+    for (int i = 0; i < c->texTargetN; i++) {
+      if (c->texTarget[i].id == t) { c->texTarget[i] = c->texTarget[--c->texTargetN]; break; }
+    }
     for (int i = 0; i < c->rtTexN; i++) {
       if (c->rtTex[i].id == t) { c->rtTex[i] = c->rtTex[--c->rtTexN]; break; }
     }
@@ -534,7 +698,7 @@ void s3d_sampler_cache_invalidate(void) {
   for (int k = 0; k < s3d_live_n; k++) {
     S3DContext* c = s3d_live[k];
     c->texStateN = 0;
-    for (int i = 0; i < S3D_MAX_TEX; i++) c->samplerStateSet[i] = 0;
+    for (int i = 0; i < S3D_MAX_TEX; i++) { c->samplerStateSet[i] = 0; c->texHasMips[i] = 0; }
   }
 }
 
@@ -627,12 +791,99 @@ void* s3d_get_render_target(void* ctx) {
 
 // ---- program ---------------------------------------------------------------
 
-// Compile the AGAL->GLSL pair into one linked program. `errbuf` receives the GL
-// info log on failure (Context3D_submit turns it into an AS3 Error, exactly like
-// the Metal glue's NSError path).
-int s3d_compile(void* ctx, const char* vs_glsl, const char* fs_glsl, char* errbuf, int errbuf_size) {
+// Release everything a cache slot owns. The slot's KEY is deliberately left in
+// place: it is how an emptied slot is still found on the next switch to that
+// program.
+static void s3d_prog_release(S3DProgramCache* e) {
+  if (e->prog != 0) { glDeleteProgram(e->prog); e->prog = 0; }
+  for (int i = 0; i < 256; i++) { e->uniVC[i] = -1; e->uniFC[i] = -1; }
+}
+
+// Move the LIVE program into the cache slot named c->progKey, so a later switch
+// back to it is a lookup instead of a re-link. Ownership MOVES: the live slots
+// are emptied afterwards. A full table evicts the least recently used slot.
+// No-op when the live program is unkeyed (key == NULL).
+static void s3d_prog_stash(S3DContext* c) {
+  if (c->progKey == NULL) return;
+  int idx = -1;
+  for (int i = 0; i < c->nprogs; i++) if (c->progs[i].used && c->progs[i].key == c->progKey) { idx = i; break; }
+  if (idx < 0) {
+    if (c->nprogs < S3D_MAX_PROGRAMS) {
+      idx = c->nprogs++;
+      memset(&c->progs[idx], 0, sizeof(S3DProgramCache));
+      c->progs[idx].used = 1;
+      c->progs[idx].key = c->progKey;
+    } else {
+      idx = 0;
+      for (int i = 1; i < c->nprogs; i++) if (c->progs[i].stamp < c->progs[idx].stamp) idx = i;
+      s3d_prog_release(&c->progs[idx]);
+      c->progs[idx].key = c->progKey;
+    }
+  } else {
+    // The slot still holds an older copy (a recompile of the same Program3D).
+    s3d_prog_release(&c->progs[idx]);
+  }
+  S3DProgramCache* e = &c->progs[idx];
+  e->prog = c->prog;
+  memcpy(e->uniVC, c->uniVC, sizeof(e->uniVC));
+  memcpy(e->uniFC, c->uniFC, sizeof(e->uniFC));
+  e->srcHash = c->progHash;
+  e->stamp = ++c->progstamp;
+  c->prog = 0;
+  for (int i = 0; i < 256; i++) { c->uniVC[i] = -1; c->uniFC[i] = -1; }
+  c->progKey = NULL;
+}
+
+// Move a cached program's state back into the live slots. The slot keeps its key
+// (so it is still findable) and gives up ownership of the program.
+static void s3d_prog_load(S3DContext* c, int idx) {
+  S3DProgramCache* e = &c->progs[idx];
+  c->prog = e->prog;
+  memcpy(c->uniVC, e->uniVC, sizeof(c->uniVC));
+  memcpy(c->uniFC, e->uniFC, sizeof(c->uniFC));
+  e->prog = 0;
+  for (int i = 0; i < 256; i++) { e->uniVC[i] = -1; e->uniFC[i] = -1; }
+  c->progKey = e->key;
+  c->progHash = e->srcHash;
+  e->stamp = ++c->progstamp;
+}
+
+// FNV-1a over both shader sources: the cache slot's content check. The Program3D
+// pointer alone is not enough — Stage3D lets the SAME Program3D be re-uploaded
+// with new bytecode (Program3D.upload), which produces different GLSL that must
+// be recompiled instead of silently reusing the stale program.
+static unsigned long long s3d_src_hash(const char* vs, const char* fs) {
+  unsigned long long h = 1469598103934665603ULL;
+  for (const char* p = vs; p != NULL && *p != '\0'; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+  h ^= 0xFFUL; h *= 1099511628211ULL;   // separator: vs and fs must not be confusable
+  for (const char* p = fs; p != NULL && *p != '\0'; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+  return h;
+}
+
+// Compile the AGAL->GLSL pair into one linked program and make it current.
+// `key` is the Program3D identity the caller wants current (NULL = no caching).
+// A program whose source is already compiled is merely SELECTED. `errbuf`
+// receives the GL info log on failure (Context3D_submit turns it into an AS3
+// Error, exactly like the Metal glue's NSError path).
+int s3d_compile(void* ctx, void* key, const char* vs_glsl, const char* fs_glsl, char* errbuf, int errbuf_size) {
   if (ctx == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
+  const unsigned long long srchash = s3d_src_hash(vs_glsl, fs_glsl);
+  if (key != NULL) {
+    int cached = -1;
+    for (int i = 0; i < c->nprogs; i++) if (c->progs[i].used && c->progs[i].key == key) { cached = i; break; }
+    if (cached >= 0 && c->progs[cached].srcHash == srchash) {
+      if (c->progKey == key && c->progHash == srchash) return 1;
+      if (c->progKey != key) { s3d_prog_stash(c); s3d_prog_load(c, cached); return 1; }
+    }
+    // Preserve whatever program is live, then drop a stale copy of THIS one.
+    // (Re-find it afterwards: the stash may have evicted that very slot.)
+    s3d_prog_stash(c);
+    for (int i = 0; i < c->nprogs; i++) if (c->progs[i].used && c->progs[i].key == key) { s3d_prog_release(&c->progs[i]); break; }
+  } else {
+    // No identity to cache under: the previous program is unreachable.
+    if (c->prog != 0) { glDeleteProgram(c->prog); c->prog = 0; }
+  }
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &vs_glsl, NULL);
   glCompileShader(vs);
@@ -681,8 +932,12 @@ int s3d_compile(void* ctx, const char* vs_glsl, const char* fs_glsl, char* errbu
     glDeleteProgram(prog);
     return 0;
   }
-  if (c->prog != 0) glDeleteProgram(c->prog);
   c->prog = prog;
+  // Record the live program's identity + source hash, so the next switch away
+  // stashes it under the right slot and a re-upload is detected.
+  c->progKey = key;
+  c->progHash = srchash;
+  for (int i = 0; i < c->nprogs; i++) if (c->progs[i].used && c->progs[i].key == key) { c->progs[i].stamp = ++c->progstamp; break; }
   // Cache the constant-register and sampler locations once per program (a per-draw
   // glGetUniformLocation would cost a string lookup for every register).
   glUseProgram(prog);
@@ -731,6 +986,17 @@ void s3d_set_cull(void* ctx, const char* face) {
   if (ctx == NULL) return;
   ((S3DContext*)ctx)->cullMode = face;
 }
+// setColorMask: record the per-channel write mask applied by the next draw
+// (mirrors the Metal glue; away3d's DepthRenderer masks all four channels off for
+// its depth-only prepass and then restores them).
+void s3d_set_color_mask(void* ctx, int r, int g, int b, int a) {
+  if (ctx == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  c->colorMaskR = r ? 1 : 0;
+  c->colorMaskG = g ? 1 : 0;
+  c->colorMaskB = b ? 1 : 0;
+  c->colorMaskA = a ? 1 : 0;
+}
 void s3d_set_stencil(void* ctx, const char* face, const char* compare, const char* bothPass, const char* depthFail, const char* dpFail) {
   if (ctx == NULL) return;
   S3DContext* c = (S3DContext*)ctx;
@@ -750,18 +1016,32 @@ void s3d_set_stencil_ref(void* ctx, unsigned int ref, unsigned int readMask, uns
   c->stencilReadMask = rm;
   c->stencilWriteMask = wm;
 }
-void s3d_set_sampler_state(void* ctx, int unit, const char* wrap, const char* filter, const char* mipfilter) {
+// setSamplerStateAt(unit, wrap, filter, mipfilter): the AS3 side passes enum
+// *strings*, which decode to the same ints s3d_set_sampler_state_i takes. Stage3D
+// keeps ONE per-unit sampler state, written by both this call and the AGAL `tex`
+// flags of the bound program, so "last writer wins" -- which is why the AGAL path
+// (s3d_set_sampler_state_i, called from Context3D_setProgram) and this path must
+// share the same storage. Mirrors the Metal glue's split exactly.
+void s3d_set_sampler_state_i(void* ctx, int unit, int filter, int wrap, int mip) {
   if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX) return;
   S3DContext* c = (S3DContext*)ctx;
-  c->samplerFilter[unit] = (filter != NULL && !strcmp(filter, "nearest")) ? 1 : 0;
-  c->samplerWrap[unit] = (wrap != NULL && !strcmp(wrap, "repeat")) ? 1 : 0;
+  if (filter < 0 || filter > 1) filter = 0;
+  if (wrap < 0 || wrap > 1) wrap = 0;
+  if (mip < 0 || mip > 2) mip = 0;
+  c->samplerFilter[unit] = filter;
+  c->samplerWrap[unit] = wrap;
+  c->samplerMip[unit] = mip;
+  c->samplerStateSet[unit] = 1;
+}
+void s3d_set_sampler_state(void* ctx, int unit, const char* wrap, const char* filter, const char* mipfilter) {
+  int f = (filter != NULL && !strcmp(filter, "nearest")) ? 1 : 0;
+  int w = (wrap != NULL && !strcmp(wrap, "repeat")) ? 1 : 0;
   int m = 0;
   if (mipfilter != NULL) {
     if (!strcmp(mipfilter, "mipnearest")) m = 1;
     else if (!strcmp(mipfilter, "miplinear")) m = 2;
   }
-  c->samplerMip[unit] = m;
-  c->samplerStateSet[unit] = 1;
+  s3d_set_sampler_state_i(ctx, unit, f, w, m);
 }
 void s3d_set_scissor(void* ctx, int on, int x, int y, int w, int h) {
   if (ctx == NULL) return;
@@ -838,9 +1118,40 @@ int s3d_draw(void* ctx, int numTriangles) {
       glClearStencil((GLint)c->clearStencilValue);
       bits |= GL_STENCIL_BUFFER_BIT;
     }
-    if (bits != 0) glClear(bits);
+    if (bits != 0) {
+      // glClear obeys the *write masks*, unlike Metal's loadAction=Clear, while
+      // Stage3D sets those masks per draw (setColorMask / depthWrite / stencil
+      // write mask). A pass that draws with depthWrite=false leaves
+      // GL_DEPTH_WRITEMASK off, so the next frame's deferred depth clear would be
+      // silently skipped: the previous frame's near depth then rejects every
+      // later draw — the skybox (z ~ 1.0 loses against a stale near depth) leaves
+      // the clear colour and the geometry cannot re-draw itself, i.e. a frozen
+      // black silhouette that shadows the object wherever it has been. Force the
+      // write masks on for the clear; nothing leaks into a draw, because every
+      // pass that depends on a mask re-applies its own before drawing (colour
+      // mask per draw below, depth and stencil whenever the pass tests them).
+      glDepthMask(GL_TRUE);
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      glStencilMask(0xFF);
+      glClear(bits);
+    }
     c->clearPending = 0;
     c->clearColorBit = c->clearDepthBit = c->clearStencilBit = 0;
+  }
+
+  // AIR fidelity: a mip-filtered sampler (miplinear/mipnearest) on a texture
+  // that has NO mip chain makes AIR drop the whole draw (temp/sampprobe A6: a
+  // level-0-only 2x2 texture read back as the clear colour, while the same
+  // texture with <2d,linear,nomip> drew normally). GL has no such rule -- it
+  // would treat the texture as INCOMPLETE and sample black, i.e. draw a black
+  // quad where AIR draws nothing -- so the drop is enforced here. Placed AFTER
+  // the deferred clear so the frame still clears, which is what AIR does.
+  for (int i = 0; i < S3D_MAX_TEX; i++) {
+    if (c->samplerStateSet[i] && c->samplerMip[i] != 0 && c->texHasMips[i] == 0 && c->textures[i] != 0) {
+      if (asc_s3d_dump())
+        fprintf(stderr, "S3D mip-drop: unit %d asks for mipmaps but the bound texture has no chain (AIR drops the draw)\n", i);
+      return 0;
+    }
   }
 
   glUseProgram(c->prog);
@@ -897,6 +1208,12 @@ int s3d_draw(void* ctx, int numTriangles) {
   }
   glFrontFace(GL_CCW);
 
+  // Color write mask (setColorMask): GL keeps it as context state, so an
+  // unmasked draw must explicitly restore all four channels (unlike Metal, whose
+  // per-draw encoder starts writable).
+  glColorMask(c->colorMaskR ? GL_TRUE : GL_FALSE, c->colorMaskG ? GL_TRUE : GL_FALSE,
+              c->colorMaskB ? GL_TRUE : GL_FALSE, c->colorMaskA ? GL_TRUE : GL_FALSE);
+
   // Blending: (NULL, NULL) is Stage3D's initial (ONE, ZERO) — Metal disables
   // blending entirely for it and so does GL. Alpha uses the same factors as RGB,
   // matching the Metal glue's four-factor setup.
@@ -941,14 +1258,20 @@ int s3d_draw(void* ctx, int numTriangles) {
     }
   }
   // Fragment samplers fs0..fs7 -> texture units 0..7 (wired at link time), with
-  // each unit's recorded sampler state applied to its texture object.
+  // each unit's recorded sampler state applied to its texture object. The bind
+  // target must match what the texture was created as (a cube map on
+  // GL_TEXTURE_2D is GL_INVALID_OPERATION and samples black); an empty unit
+  // clears BOTH targets, since a leftover cube binding would otherwise be what a
+  // samplerCube samples.
   for (int i = 0; i < S3D_MAX_TEX; i++) {
     glActiveTexture(GL_TEXTURE0 + i);
     if (c->textures[i] != 0) {
-      glBindTexture(GL_TEXTURE_2D, c->textures[i]);
+      GLenum tgt = s3d_tex_gltarget(c, c->textures[i]);
+      glBindTexture(tgt, c->textures[i]);
       s3d_apply_sampler(c, c->textures[i], i);
     } else {
       glBindTexture(GL_TEXTURE_2D, 0);
+      glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
     }
   }
   glActiveTexture(GL_TEXTURE0);
@@ -1020,6 +1343,34 @@ int s3d_readback_render(void* ctx, uint8_t* out) {
   if (c->overrideRt != NULL)
     return s3d_readback_target(c, c->overrideRt->fbo, c->overrideRt->width, c->overrideRt->height, out);
   return s3d_readback_target(c, c->fbo, c->width, c->height, out);
+}
+
+// The Metal glue batches a frame's draws into one MTLCommandBuffer and commits it
+// from the flush entry points (see stage3d_glue.mm), which come in a
+// commit+wait flavour (s3d_flush, before a CPU readback) and a commit-only one
+// (s3d_flush_async, the frame boundary); reusing the target's contents across
+// draws is free there because a render pass keeps them in tile memory.
+//
+// GL has no such batch to retire: glDrawElements only appends to the command
+// stream, which the driver submits on its own, and every point that observes the
+// target (glReadPixels in the readback path, GrDirectContext::flushAndSubmit for
+// the on-screen composite) already synchronizes. So these exist to keep the extern "C" s3d_* ABI
+// identical across the two backends — the generated C calls them unconditionally
+// — and do the cheapest honest thing: submit the queue without waiting. The two
+// flavours therefore coincide here.
+void s3d_flush(void* ctx) {
+  (void)ctx;
+  glFlush();
+}
+void s3d_flush_async(void* ctx) {
+  (void)ctx;
+  glFlush();
+}
+void s3d_flush_all(void) {
+  glFlush();
+}
+void s3d_flush_all_async(void) {
+  glFlush();
 }
 
 }  // extern "C"

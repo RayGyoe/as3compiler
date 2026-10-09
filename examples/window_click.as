@@ -17,13 +17,17 @@ var stage:Stage = new Stage();
 
 // 可点击的矩形（Sprite 作为命中目标，Shape 只负责绘制）。
 var box:Sprite = new Sprite();
-box.x = 80; box.y = 80; box.width = 200; box.height = 150;
+box.x = 80; box.y = 80;
 
 var g:Shape = new Shape();
 g.graphics.beginFill(0x3366CC);
 g.graphics.drawRect(0, 0, 200, 150);
 g.graphics.endFill();
 box.addChild(g);
+
+// Stage 94·5: `width` is derived from the content and assigning it scales, so
+// this must come AFTER the drawing exists (an empty Sprite would scale to 0).
+box.width = 200; box.height = 150;
 
 var clicked:Boolean = false;
 

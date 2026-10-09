@@ -6,6 +6,8 @@
   原生 AIR 的 adl 启动开销约 2.6s 不计入（getTimer 从应用启动后开始计时）。
 
 用法：python3 benchmarks/run.py [benchmark ...]（不传参数跑全部）
+
+AIRSDK_HOME 必须指向 SDK 的 bin/ 目录（本脚本拼接 $AIRSDK_HOME/mxmlc）。
 """
 import os
 import subprocess
@@ -14,7 +16,7 @@ import sys
 
 AIRSDK = os.environ.get(
     "AIRSDK_HOME",
-    "/Users/ray.lei/Documents/Software/AIRSDK/AIRSDK_51.3.4/bin",
+    "/Users/ray.lei/Documents/Software/AIRSDK/AIRSDK_51.4.1/bin",
 )
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCHES = [

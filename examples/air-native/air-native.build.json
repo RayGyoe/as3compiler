@@ -1,51 +1,75 @@
 {
-  "target": "wasm",
-  "package": "web",
+  "target": "native",
+  "c-compiler": "clang",
   "opt": "-O2",
   "sources": [
     "../../vendor/skia_glue.cc",
-    "../../vendor/web_glue.cc"
+    "../../vendor/window_glue.cc",
+    "../../vendor/metal_glue.mm"
   ],
   "include-paths": [
-    "../../vendor/skia"
+    "../../vendor/skia",
+    "../../vendor/sdl2/arm64/include",
+    "../../vendor/curl/include"
   ],
   "link-libs": [
     "skia",
     "skparagraph",
     "skshaper",
     "skunicode",
+    "skottie",
+    "sksg",
+    "svg",
+    "skresources",
+    "bentleyottmann",
     "skcms",
     "wuffs",
     "png",
     "jpeg",
     "webp",
     "webp_sse41",
+    "dng_sdk",
+    "piex",
+    "expat",
     "freetype2",
     "harfbuzz",
-    "icu"
+    "icu",
+    "zlib",
+    "z",
+    "SDL2",
+    "objc",
+    "curl",
+    "nghttp2"
   ],
   "link-paths": [
-    "../../vendor/skia/lib/wasm"
+    "../../vendor/skia/lib/macos-arm64",
+    "../../vendor/sdl2/arm64/lib",
+    "../../vendor/curl/lib/macos-arm64"
+  ],
+  "frameworks": [
+    "CoreFoundation",
+    "CoreGraphics",
+    "CoreText",
+    "CoreServices",
+    "ApplicationServices",
+    "ImageIO",
+    "Accelerate",
+    "CoreVideo",
+    "Cocoa",
+    "Carbon",
+    "IOKit",
+    "Metal",
+    "QuartzCore",
+    "Security",
+    "SystemConfiguration"
   ],
   "defines": [
     "ASC_USE_SKIA=1",
     "ASC_USE_WINDOW=1",
-    "ASC_HAVE_FETCH=1",
     "ASC_DISPLAY_HIGH=1",
-    "ASC_RENDER_GPU=1"
-  ],
-  "font-urls": [
-    "fonts/MiSans-Regular.ttf",
-    "fonts/Arial.ttf"
-  ],
-  "preload-paths": [
-    "build-and-run.sh",
-    "fonts",
-    "main.swf"
-  ],
-  "preload-excludes": [
-    "fonts/MiSans-Regular.ttf",
-    "fonts/Arial.ttf"
+    "ASC_RENDER_WINGPU=1",
+    "ASC_RENDER_METAL=1",
+    "ASC_HAVE_CURL=1"
   ],
   "features": [],
   "objects": []

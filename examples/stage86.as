@@ -68,10 +68,16 @@ check(cls3 != null, "roundtrip definition");
 var inst3:Scene2 = new (cls3)() as Scene2;
 check(inst3 != null, "roundtrip instantiate");
 
-// ===== 9. 找不到抛 ReferenceError =====
+// ===== 9. 找不到抛 ReferenceError (#1065) =====
+// The name must be one that exists in NO runtime: `flash.desktop::
+// NativeApplication` is a real AIR class, so AIR RETURNS it (measured on adl
+// 51.4.1, temp/pkg1/oracle/adl-na.txt: NA=[class NativeApplication]) -- a
+// built-in that our registry now resolves too, instead of wrongly reporting it
+// missing. A nonexistent name is what raises #1065, whose message AIR spells
+// with the name's last segment.
 var threw:Boolean = false;
 try {
-  getDefinitionByName("flash.desktop::NativeApplication");
+  getDefinitionByName("com.example::NoSuchClass");
 } catch (e:ReferenceError) {
   threw = true;
 }
