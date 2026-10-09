@@ -359,3 +359,7 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
 - **[Ruffle](https://github.com/ruffle-rs/ruffle)**（[官网](https://ruffle.rs/)）——Adobe Flash 的开源 Rust 重实现。其 AS3/AVM2 的 `flash.events.*` 事件流、`flash.display.*` 显示列表与交互命中测试实现，是本项目 GUI/事件系统语义的权威参照。
 - **[Skia](https://github.com/google/skia)**（[官网](https://skia.org/)）——2D 图形库，渲染后端。本项目经 C++ 胶水层链接 Skia 实现光栅化（采用 [Aseprite 预编译静态库](https://github.com/aseprite/skia/releases) m124）。
 - **[SDL](https://github.com/libsdl-org/SDL)**（[官网](https://www.libsdl.org/)）——跨平台窗口/输入库，窗口化后端（`Stage.showWindow`）经 SDL2 上屏与事件循环。
+- **[miniaudio](https://github.com/mackron/miniaudio)**（v0.11.25）——单头文件音频库，`flash.media` 的音频后端（`vendor/audio_glue.c` 独立编译单元，`Sound`/`SoundChannel`/`SoundMixer`/`SoundTransform` 等由它驱动 Core Audio；web 端落到 Web Audio，WASI 无后端则如实报明）。
+- **[libcurl](https://github.com/curl/curl)**（[官网](https://curl.haxx.se/)）——`flash.net` 的 HTTP/HTTPS 客户端。native 构建以**静态**归档链接 `vendor/curl/`（curl 8.11.1 + [nghttp2](https://github.com/nghttp2/nghttp2) 1.64.0 提供 HTTP/2 + [zlib](https://zlib.net/) 1.3.1 解码 gzip/deflate，TLS 走系统 SecureTransport），产物不残留 `libcurl.4.dylib` 动态依赖。
+- **[Emscripten](https://emscripten.org/)**（[官网](https://emscripten.org/)，3.1.44）——`--target wasm --package web` 浏览器产物的工具链（`build-tools/emsdk`），经 `emcc` 编译链接 wasm 版 Skia；web 音频后端也用其随附的 `emscripten/webaudio.h`（AudioWorklet）。
+- **[HarfBuzz](https://github.com/harfbuzz/harfbuzz)**——文本 shaping 引擎，随 Skia 的预编译静态库一同引入，`flash.text` 的 `TextField`/`TextFormat` 排版（SkParagraph + HarfBuzz shaping + UAX#14 换行）由它完成。
