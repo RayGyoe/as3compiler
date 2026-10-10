@@ -8,17 +8,33 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <errno.h>   // strtoll/strtoull overflow detection for int64()/uint64()
+// MSVC gates the POSIX M_* math constants (M_PI, emitted for Math.PI) behind
+// _USE_MATH_DEFINES; define it so the token resolves identically everywhere.
+#define _USE_MATH_DEFINES
 #include <math.h>
 #include <ctype.h>
 #include <setjmp.h>
 #include <time.h>
-// dlfcn.h (and Dl_info/dladdr above) is POSIX; wasi-libc ships the header but
-// not the Apple/POSIX symbol-probe API, so the include is skipped there.
-#ifndef __wasi__
+// dlfcn.h (and Dl_info/dladdr below) is POSIX; wasi-libc ships the header but
+// not the Apple/POSIX symbol-probe API, and Windows has no dlfcn.h at all, so
+// the include is skipped on both — the probe degrades to a bare address there
+// (see gc_dbg_sym below).
+#if !defined(__wasi__) && !defined(_WIN32)
 #include <dlfcn.h>
 #endif
 #include <sys/stat.h>
+// MSVC's <sys/stat.h> has st_mode/_S_IFMT/_S_IFDIR but not the POSIX S_ISDIR()
+// macro; define it so as_path_is_dir() reads identically on every platform.
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+// dirent.h (opendir/readdir/closedir) is POSIX-only: MSVC ships no such header,
+// and Windows directory enumeration goes through FindFirstFile/FindNextFile
+// (the File.getDirectoryListing body in emit.ts). WASI ships dirent.h, so this
+// is skipped for Win32 only.
+#if !defined(_WIN32)
 #include <dirent.h>
+#endif
 // Emscripten glue (EM_ASM / EM_ASM_INT / EM_JS / UTF8ToString / HEAPU8). Needed
 // by the web target regardless of the network backend: navigateToURL alone uses
 // EM_ASM to call window.open, and the fetch backend adds the rest.
@@ -46,6 +62,12 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 // the OS when asked (see gc_trim_os below).
 #include <malloc/malloc.h>
 #elif defined(_WIN32)
+// <windows.h> pulls in <wingdi.h>, whose GDI Rectangle() function collides with
+// the C struct that flash.geom.Rectangle compiles to (typedef struct Rectangle
+// Rectangle) — a redefinition error under the MSVC headers. NOGDI drops the whole
+// GDI section; the generated C never calls a GDI entry point (all GPU/D3D work
+// lives in the separate d3d_glue.cc translation unit), so it loses nothing.
+#define NOGDI
 #include <windows.h>
 #include <psapi.h>
 #elif !defined(__wasi__)
@@ -57,9 +79,10 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #ifndef __wasi__
 #include <zlib.h>
 #endif
-// gettimeofday is POSIX-only; WASI has no sys/time.h, so wall-clock time is
-// abstracted behind as_now_ms() below and falls back to second precision there.
-#ifndef __wasi__
+// gettimeofday is POSIX-only; WASI has no sys/time.h and Windows reads the NT
+// system clock instead, so wall-clock time is abstracted behind as_now_ms()
+// below (which falls back to second precision on WASI and to FILETIME on Win32).
+#if !defined(__wasi__) && !defined(_WIN32)
 #include <sys/time.h>
 #endif
 
@@ -81,6 +104,17 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 static double as_now_ms(void) {
 #ifdef __wasi__
     return (double)time(NULL) * 1000.0;
+#elif defined(_WIN32)
+    // FILETIME counts 100 ns ticks since 1601-01-01; drop the Unix epoch offset
+    // and divide by 10 to land on milliseconds since 1970, the same wall-clock
+    // scale the POSIX path reports. windows.h is already included for the
+    // privateMemory branch above.
+    FILETIME ft;
+    ULARGE_INTEGER u;
+    GetSystemTimeAsFileTime(&ft);
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return (double)((int64_t)(u.QuadPart - 116444736000000000ULL) / 10000);
 #else
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -448,10 +482,11 @@ static bool gc_frame_driven = false;
 // atos -o <binary> (0x100000000 + off) instead of guessed at.
 //
 // Dl_info/dladdr are POSIX-with-Apple-extension; wasi-libc declares dlfcn.h but
-// has neither, and the probe only feeds the ASC_GC_STATS diagnostics (not any
-// program-visible behaviour), so WASI degrades to a bare address instead of
-// failing to compile the whole preamble.
-#ifdef __wasi__
+// has neither, and Windows has no dlfcn.h at all. The probe only feeds the
+// ASC_GC_STATS diagnostics (not any program-visible behaviour), so both WASI
+// and Win32 degrade to a bare address instead of failing to compile the whole
+// preamble.
+#if defined(__wasi__) || defined(_WIN32)
 static const char* gc_dbg_sym(const void* ra, unsigned long* off) {
     if (off) *off = (unsigned long)(uintptr_t)ra;
     return "?";
@@ -7900,8 +7935,13 @@ static unsigned char* as_job_read_file(const char* path, size_t* out_len, unsign
 // the same generic error a missing file produces.
 #if defined(ASC_HAVE_CURL) && !defined(__wasi__) && !defined(__EMSCRIPTEN__)
 #define ASC_HTTP_BACKEND 1
-#include <pthread.h>
 #include <curl/curl.h>
+// pthread.h is POSIX-only; Windows has no such header. libcurl on Win32 uses its
+// own native (winthread) internals, and our share-lock callbacks below are
+// backed by CRITICAL_SECTION there instead of pthread_mutex.
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 #elif defined(ASC_HAVE_FETCH) && defined(__EMSCRIPTEN__)
 #define ASC_HTTP_WEB 1
 #endif
@@ -8056,8 +8096,46 @@ static struct curl_slist* as_http_add_headers(struct curl_slist* list, const cha
 // the easy handle, so sharing them across transfers means a CURLSH. The lock
 // callbacks are not optional here: the transfers run on the worker pool, and two
 // threads touching the same cookie list without them is a data race.
-static pthread_mutex_t as_http_share_locks[CURL_LOCK_DATA_LAST];
 static CURLSH* as_http_share = NULL;
+
+#ifdef _WIN32
+// Windows has no pthread.h. The Win32 backend runs transfers inline on the AS3
+// thread (ASC_ASYNC_THREADS is off below), so the share's cookie jar is never
+// actually contended; libcurl still rejects CURLSHOPT_SHARE without a LOCKFUNC,
+// so the callbacks below are backed by a CRITICAL_SECTION (correct if threaded
+// Win32 curl ever arrives) and one-time init by InitOnceExecuteOnce.
+static CRITICAL_SECTION as_http_share_locks[CURL_LOCK_DATA_LAST];
+static INIT_ONCE as_http_share_once = INIT_ONCE_STATIC_INIT;
+
+static void as_http_share_lock(CURL* handle, curl_lock_data data, curl_lock_access access, void* userptr) {
+    (void)handle; (void)access; (void)userptr;
+    EnterCriticalSection(&as_http_share_locks[data]);
+}
+
+static void as_http_share_unlock(CURL* handle, curl_lock_data data, void* userptr) {
+    (void)handle; (void)userptr;
+    LeaveCriticalSection(&as_http_share_locks[data]);
+}
+
+static BOOL CALLBACK as_http_share_make_cb(PINIT_ONCE once, PVOID arg, PVOID* ctx) {
+    (void)once; (void)arg; (void)ctx;
+    int i;
+    for (i = 0; i < (int)CURL_LOCK_DATA_LAST; i++) InitializeCriticalSection(&as_http_share_locks[i]);
+    as_http_share = curl_share_init();
+    if (as_http_share != NULL) {
+        curl_share_setopt(as_http_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+        curl_share_setopt(as_http_share, CURLSHOPT_LOCKFUNC, as_http_share_lock);
+        curl_share_setopt(as_http_share, CURLSHOPT_UNLOCKFUNC, as_http_share_unlock);
+    }
+    return TRUE;
+}
+
+static CURLSH* as_http_share_get(void) {
+    InitOnceExecuteOnce(&as_http_share_once, as_http_share_make_cb, NULL, NULL);
+    return as_http_share;
+}
+#else
+static pthread_mutex_t as_http_share_locks[CURL_LOCK_DATA_LAST];
 static pthread_once_t as_http_share_once = PTHREAD_ONCE_INIT;
 
 static void as_http_share_lock(CURL* handle, curl_lock_data data, curl_lock_access access, void* userptr) {
@@ -8088,6 +8166,7 @@ static CURLSH* as_http_share_get(void) {
     pthread_once(&as_http_share_once, as_http_share_make);
     return as_http_share;
 }
+#endif
 
 // Does the environment already carry a proxy setting? libcurl reads these itself
 // on every transfer, so when one is present the OS must not override it (an
@@ -8601,10 +8680,13 @@ static void as_job_run(as_job* j) {
         }
         case AS_JOB_FS_OPEN: {
             if (j->path == NULL) { j->error = AS_JOB_ERR_IO; break; }
-            const char* mode = (j->mode != NULL) ? j->mode : "rb";
-            if (strcmp(mode, "write") == 0) mode = "wb";
-            else if (strcmp(mode, "append") == 0) mode = "ab";
-            else if (strcmp(mode, "update") == 0) mode = "r+b";
+            const char* mode = "rb";
+            if (j->mode != NULL) {
+                if (strcmp(j->mode, "write") == 0) mode = "wb";
+                else if (strcmp(j->mode, "append") == 0) mode = "ab";
+                else if (strcmp(j->mode, "update") == 0) mode = "r+b";
+                // FileMode.READ ("read") is the default: fall through to "rb".
+            }
             void* h = (void*)fopen(j->path, mode);
             if (h == NULL) { j->error = AS_JOB_ERR_IO; break; }
             j->handle = h;
@@ -10157,9 +10239,9 @@ static char agal_err_buf[128];
 static void agal_unsupported(unsigned op) {
     if (as_agal_errmsg != NULL) return;  // keep the first diagnostic
     if (op < 0x2f && agal_op_name[op] != NULL)
-        snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL: opcode '%s' (0x%02x) is not translated to MSL/GLSL yet", agal_op_name[op], op);
+        snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL: opcode '%s' (0x%02x) is not translated to MSL/GLSL/HLSL yet", agal_op_name[op], op);
     else
-        snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL: opcode 0x%02x is not translated to MSL/GLSL yet", op);
+        snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL: opcode 0x%02x is not translated to MSL/GLSL/HLSL yet", op);
     as_agal_errmsg = agal_err_buf;
 }
 
@@ -10195,36 +10277,68 @@ static void agal_swizzle(unsigned swz, char* out) {
     out[3] = agal_swz[(swz >> 6) & 3];
 }
 
-// Register access name. MSL uses array-indexed uniforms/attributes (vc[i],
-// va[i], fc[i]); GLSL ES uses individual named uniforms/attributes.
+// Register access name. One function, three targets; the only differences are
+// the *shape* of the name:
+//   target 0 (MSL)  : array-indexed uniforms/attributes (vc[i]) and a
+//                     [[stage_in]] struct attribute (va -> in.aN).
+//   target 1 (GLSL) : one named uniform/attribute per register (vcN/vaN) plus
+//                     the built-in gl_Position / gl_FragColor / gl_FragDepth.
+//   target 2 (HLSL) : array-indexed *cbuffer* members (vc[i] inside
+//                     'cbuffer VCBuf : register(b0)'), a stage-input struct
+//                     attribute (va -> input.aN) and the local op/oc/ocN/od that
+//                     the entry point packs into its SV_* output struct.
+// EVERY branch below must stay three-way. The 'else' arms used to mean "GLSL",
+// and the GLSL spellings (gl_FragColor/gl_Position/gl_FragDepth) are hard-coded
+// there: leaving one branch two-way would silently emit GLSL identifiers into an
+// HLSL shader, which is exactly the "compiles but the result is wrong" failure
+// AGENTS.md 2.5 forbids.
 static void agal_reg_name(char* out, int type, int num, int target) {
     switch (type) {
         case AGAL_VA: // vertex attribute (vertex only)
-            if (target == 0) sprintf(out, "in.a%d", num); else sprintf(out, "va%d", num); break;
+            if (target == 0) sprintf(out, "in.a%d", num);
+            else if (target == 2) sprintf(out, "input.a%d", num);
+            else sprintf(out, "va%d", num); break;
         case AGAL_VC: // constant: vc in vertex, fc in fragment
-            if (agal_is_frag) { if (target == 0) sprintf(out, "fc[%d]", num); else sprintf(out, "fc%d", num); }
-            else { if (target == 0) sprintf(out, "vc[%d]", num); else sprintf(out, "vc%d", num); }
+            // MSL/HLSL index an array (a 'constant float4*' / a cbuffer); GLSL
+            // declares one named uniform per register.
+            if (agal_is_frag) { if (target == 1) sprintf(out, "fc%d", num); else sprintf(out, "fc[%d]", num); }
+            else { if (target == 1) sprintf(out, "vc%d", num); else sprintf(out, "vc[%d]", num); }
             break;
         case AGAL_VT: // temporary: vt in vertex, ft in fragment
             sprintf(out, agal_is_frag ? "ft%d" : "vt%d", num); break;
-        case AGAL_OP: // output: op in vertex, oc in fragment
-            if (agal_is_frag) strcpy(out, target == 0 ? "oc" : "gl_FragColor");
-            else strcpy(out, target == 0 ? "op" : "gl_Position");
+        case AGAL_OP: // output: op in vertex, oc in fragment (ocN = MRT, HLSL only)
+            // MSL/GLSL keep the single-output shape they have always had
+            // (oc -> one 'oc' / gl_FragColor); HLSL maps oc0..oc3 onto
+            // SV_Target0..3, so the register number has to survive here.
+            if (agal_is_frag) {
+                if (target == 1) strcpy(out, "gl_FragColor");
+                else if (target == 2 && num != 0) sprintf(out, "oc%d", num);
+                else strcpy(out, "oc");
+            } else {
+                if (target == 1) strcpy(out, "gl_Position"); else strcpy(out, "op");
+            }
             break;
         case AGAL_V:  // varying
-            // Vertex: local temp v%d copied to out.varying%d; fragment: read from
-            // the [[stage_in]] struct (in.v%d) — Metal requires varying inputs to
-            // arrive via [[stage_in]], not as bare [[user(locn)]] parameters.
+            // Vertex writes a local v%d that is copied into the output struct;
+            // the fragment reads it back through the stage-input struct (MSL:
+            // 'in.v%d', HLSL: 'input.v%d'). GLSL keeps a file-scope
+            // 'varying vec4 vN' visible to both stages instead.
             if (agal_is_frag && target == 0) sprintf(out, "in.v%d", num);
+            else if (agal_is_frag && target == 2) sprintf(out, "input.v%d", num);
             else sprintf(out, "v%d", num); break;
         case AGAL_FS: // texture sampler
             sprintf(out, "fs%d", num); break;
         case AGAL_OD: // fragment depth output
-            strcpy(out, target == 0 ? "od" : "gl_FragDepth"); break;
+            if (target == 1) strcpy(out, "gl_FragDepth"); else strcpy(out, "od"); break;
+        case AGAL_IID: // instance id (AGAL3, vertex-only, read-only source)
+            // HLSL feeds it from the SV_InstanceID system value, which is a
+            // uint; it is broadcast to a float4 so the shared swizzle and
+            // component-wise code paths below keep working unchanged.
+            if (target == 2) strcpy(out, "float4(iid, iid, iid, iid)");
+            else sprintf(out, "r%d", num); break;
         default: sprintf(out, "r%d", num); break;
     }
 }
-
 // Source expression: register name + swizzle suffix (collapsed for identity).
 static void agal_src_expr(char* out, int type, int num, unsigned swz, int target) {
     char reg[40]; agal_reg_name(reg, type, num, target);
@@ -10251,7 +10365,13 @@ static int agal_is_cube(int num) { return (num >= 0 && num < 256) ? ((agal_cube[
 // Append a translated instruction body. Emits one statement per written
 // component (so write-masks are fully expanded).
 static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int target) {
-    const char* v4 = target == 0 ? "float4" : "vec4";
+    const char* v4 = target == 1 ? "vec4" : "float4";
+    // Builtins whose spelling differs between targets but whose call SHAPE is
+    // the same, so one format string still serves all three: MSL/GLSL say
+    // fract / dfdx / dfdy, HLSL says frac / ddx / ddy.
+    const char* f_fract = (target == 2) ? "frac" : "fract";
+    const char* f_ddx   = (target == 2) ? "ddx"  : "dfdx";
+    const char* f_ddy   = (target == 2) ? "ddy"  : "dfdy";
     for (int k = 0; k < n; k++) {
         unsigned op = ins[k].op;
         unsigned dst = ins[k].dst, s1lo = ins[k].s1lo, s1hi = ins[k].s1hi, s2lo = ins[k].s2lo, s2hi = ins[k].s2hi;
@@ -10291,6 +10411,26 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         if (op == 0x17 || op == 0x18 || op == 0x19) {
             int rows = (op == 0x18) ? 4 : 3;
             char mrow[4][48]; for (int r = 0; r < rows; r++) agal_reg_name(mrow[r], t2, n2 + r, target);
+            // HLSL: build the matrix ROW-major from the consecutive constant
+            // registers and use mul(mat, vec). mul() is the only correct HLSL
+            // operator here -- HLSL's '*' on matrices is component-wise (unlike
+            // MSL/GLSL, where it is a matrix product). mul(M, v) computes
+            // result_i = dot(M.row_i, v), i.e. exactly the dot() loop below, so
+            // all three targets agree on the matrix convention.
+            //
+            // m33 deliberately uses the same 3x4 form as m34 rather than a 3x3:
+            // the shared dot() loop consumes all four components of every row,
+            // while AGAL's m33 would per spec read only .xyz. Letting a new
+            // target silently diverge on that never-measured difference is worse
+            // than reproducing the existing behaviour bit-for-bit; reconciling
+            // it with the spec is a cross-target change registered in TODO.md.
+            if (target == 2) {
+                char t[320];
+                if (op == 0x18) sprintf(t, "    %s = mul(float4x4(%s, %s, %s, %s), %s);\\n", dname, mrow[0], mrow[1], mrow[2], mrow[3], s1);
+                else sprintf(t, "    %s.xyz = mul(float3x4(%s, %s, %s), %s);\\n", dname, mrow[0], mrow[1], mrow[2], s1);
+                as_json_buf_append_cstr(b, t);
+                continue;
+            }
             for (int r = 0; r < rows; r++) { char t[200]; sprintf(t, "    %s.%c = dot(%s, %s(%s.x, %s.y, %s.z, %s.w));\\n", dname, agal_swz[r], s1, v4, mrow[r], mrow[r], mrow[r], mrow[r]); as_json_buf_append_cstr(b, t); }
             continue;
         }
@@ -10307,9 +10447,9 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 else if (op == 0x05) sprintf(rhs, "1.0 / %s.%c", s1b, c1);
                 else if (op == 0x06) sprintf(rhs, "min(%s.%c, %s.%c)", s1b, c1, s2b, c2);
                 else if (op == 0x07) sprintf(rhs, "max(%s.%c, %s.%c)", s1b, c1, s2b, c2);
-                else if (op == 0x08) sprintf(rhs, "fract(%s.%c)", s1b, c1);
+                else if (op == 0x08) sprintf(rhs, "%s(%s.%c)", f_fract, s1b, c1);
                 else if (op == 0x09) sprintf(rhs, "sqrt(%s.%c)", s1b, c1);
-                else if (op == 0x0a) sprintf(rhs, "1.0 / sqrt(%s.%c)", s1b, c1);
+                else if (op == 0x0a) { if (target == 2) sprintf(rhs, "rsqrt(%s.%c)", s1b, c1); else sprintf(rhs, "1.0 / sqrt(%s.%c)", s1b, c1); }
                 else if (op == 0x0b) sprintf(rhs, "pow(%s.%c, %s.%c)", s1b, c1, s2b, c2);
                 else if (op == 0x0c) sprintf(rhs, "log2(%s.%c)", s1b, c1);
                 else if (op == 0x0d) sprintf(rhs, "exp2(%s.%c)", s1b, c1);
@@ -10324,14 +10464,14 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 else if (op == 0x13) sprintf(rhs, "dot(%s, %s)", s1, s2);
                 else if (op == 0x14) sprintf(rhs, "abs(%s.%c)", s1b, c1);
                 else if (op == 0x15) sprintf(rhs, "-%s.%c", s1b, c1);
-                else if (op == 0x16) sprintf(rhs, "clamp(%s.%c, 0.0, 1.0)", s1b, c1);
-                else if (op == 0x1a) sprintf(rhs, "dfdx(%s.%c)", s1b, c1);
-                else if (op == 0x1b) sprintf(rhs, "dfdy(%s.%c)", s1b, c1);
+                else if (op == 0x16) { if (target == 2) sprintf(rhs, "saturate(%s.%c)", s1b, c1); else sprintf(rhs, "clamp(%s.%c, 0.0, 1.0)", s1b, c1); }
+                else if (op == 0x1a) sprintf(rhs, "%s(%s.%c)", f_ddx, s1b, c1);
+                else if (op == 0x1b) sprintf(rhs, "%s(%s.%c)", f_ddy, s1b, c1);
                 // tex: MSL needs the sampler that matches the *sampled register*, so
                 // the two targets need a different vararg count -- keep them as two
                 // separate sprintf calls (a ternary format string would mis-read the
                 // tail, see the compare-op note below).
-                else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else sprintf(rhs, "%s(%s, %s%s).%c", agal_is_cube(n2) ? "textureCube" : "texture2D", s2b, s1, c3, c1); }
+                else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else if (target == 2) sprintf(rhs, "%s.Sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else sprintf(rhs, "%s(%s, %s%s).%c", agal_is_cube(n2) ? "textureCube" : "texture2D", s2b, s1, c3, c1); }
                 else if (op == 0x29) sprintf(rhs, "(%s.%c >= %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2a) sprintf(rhs, "(%s.%c < %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2c) sprintf(rhs, "(%s.%c == %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
@@ -10348,9 +10488,9 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         else if (op == 0x05) sprintf(rhs, "1.0 / %s", s1);
         else if (op == 0x06) sprintf(rhs, "min(%s, %s)", s1, s2);
         else if (op == 0x07) sprintf(rhs, "max(%s, %s)", s1, s2);
-        else if (op == 0x08) sprintf(rhs, "fract(%s)", s1);
+        else if (op == 0x08) sprintf(rhs, "%s(%s)", f_fract, s1);
         else if (op == 0x09) sprintf(rhs, "sqrt(%s)", s1);
-        else if (op == 0x0a) sprintf(rhs, "1.0 / sqrt(%s)", s1);
+        else if (op == 0x0a) { if (target == 2) sprintf(rhs, "rsqrt(%s)", s1); else sprintf(rhs, "1.0 / sqrt(%s)", s1); }
         else if (op == 0x0b) sprintf(rhs, "pow(%s, %s)", s1, s2);
         else if (op == 0x0c) sprintf(rhs, "log2(%s)", s1);
         else if (op == 0x0d) sprintf(rhs, "exp2(%s)", s1);
@@ -10358,14 +10498,21 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         else if (op == 0x0f) sprintf(rhs, "sin(%s)", s1);
         else if (op == 0x10) sprintf(rhs, "cos(%s)", s1);
         else if (op == 0x11) sprintf(rhs, "%s(cross(%s.xyz, %s.xyz), 1.0)", v4, s1, s2);
-        else if (op == 0x12) sprintf(rhs, "%s(dot(%s.xyz, %s.xyz))", v4, s1, s2);
-        else if (op == 0x13) sprintf(rhs, "%s(dot(%s, %s))", v4, s1, s2);
+        // dp3/dp4 yield a SCALAR dot product and the destination is a float4, so
+        // the vector constructor is needed -- but fxc rejects a scalar-splat
+        // constructor outright (X3014, see the note above the HLSL preamble), and
+        // it does so even for a literal like float4(1.0). HLSL's scalar swizzle is
+        // the portable spelling: 'dot(a, b).xxxx' splats the scalar without
+        // recomputing it. Splitting the format per target is required, not
+        // cosmetic -- one shared format string cannot express both.
+        else if (op == 0x12) { if (target == 2) sprintf(rhs, "dot(%s.xyz, %s.xyz).xxxx", s1, s2); else sprintf(rhs, "%s(dot(%s.xyz, %s.xyz))", v4, s1, s2); }
+        else if (op == 0x13) { if (target == 2) sprintf(rhs, "dot(%s, %s).xxxx", s1, s2); else sprintf(rhs, "%s(dot(%s, %s))", v4, s1, s2); }
         else if (op == 0x14) sprintf(rhs, "abs(%s)", s1);
         else if (op == 0x15) sprintf(rhs, "-%s", s1);
-        else if (op == 0x16) sprintf(rhs, "clamp(%s, 0.0, 1.0)", s1);
-        else if (op == 0x1a) sprintf(rhs, "dfdx(%s)", s1);
-        else if (op == 0x1b) sprintf(rhs, "dfdy(%s)", s1);
-        else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s)", s2b, n2, s1, c3); else sprintf(rhs, "%s(%s, %s%s)", agal_is_cube(n2) ? "textureCube" : "texture2D", s2b, s1, c3); }
+        else if (op == 0x16) { if (target == 2) sprintf(rhs, "saturate(%s)", s1); else sprintf(rhs, "clamp(%s, 0.0, 1.0)", s1); }
+        else if (op == 0x1a) sprintf(rhs, "%s(%s)", f_ddx, s1);
+        else if (op == 0x1b) sprintf(rhs, "%s(%s)", f_ddy, s1);
+        else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s)", s2b, n2, s1, c3); else if (target == 2) sprintf(rhs, "%s.Sample(smp%d, %s%s)", s2b, n2, s1, c3); else sprintf(rhs, "%s(%s, %s%s)", agal_is_cube(n2) ? "textureCube" : "texture2D", s2b, s1, c3); }
         // Compare instructions: sge/slt/seq/sne produce a per-component 0.0/1.0
         // mask. The operands are float4 (or 4-component swizzles), so the natural
         // 'cond ? v4(1.0) : v4(0.0)' is invalid in BOTH targets -- MSL needs a
@@ -10387,10 +10534,10 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         // construction rules are used to convert", cf. 'vec4(ivec4)'). mix() with
         // a bvecN condition, by contrast, only exists in ES 3.00 -- and our GLSL
         // is emitted as ES 1.00 (no #version directive), so it would not compile.
-        else if (op == 0x29) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s >= %s)", v4, v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(greaterThanEqual(%s, %s)))", v4, v4, v4, s1, s2); }
-        else if (op == 0x2a) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s < %s)", v4, v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(lessThan(%s, %s)))", v4, v4, v4, s1, s2); }
-        else if (op == 0x2c) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s == %s)", v4, v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(equal(%s, %s)))", v4, v4, v4, s1, s2); }
-        else if (op == 0x2d) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s != %s)", v4, v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(notEqual(%s, %s)))", v4, v4, v4, s1, s2); }
+        else if (op == 0x29) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s >= %s)", v4, v4, s1, s2); else if (target == 2) sprintf(rhs, "%s(%s >= %s)", v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(greaterThanEqual(%s, %s)))", v4, v4, v4, s1, s2); }
+        else if (op == 0x2a) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s < %s)", v4, v4, s1, s2); else if (target == 2) sprintf(rhs, "%s(%s < %s)", v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(lessThan(%s, %s)))", v4, v4, v4, s1, s2); }
+        else if (op == 0x2c) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s == %s)", v4, v4, s1, s2); else if (target == 2) sprintf(rhs, "%s(%s == %s)", v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(equal(%s, %s)))", v4, v4, v4, s1, s2); }
+        else if (op == 0x2d) { if (target == 0) sprintf(rhs, "select(%s(0.0), %s(1.0), %s != %s)", v4, v4, s1, s2); else if (target == 2) sprintf(rhs, "%s(%s != %s)", v4, s1, s2); else sprintf(rhs, "mix(%s(0.0), %s(1.0), %s(notEqual(%s, %s)))", v4, v4, v4, s1, s2); }
         if (rhs[0] == 0) { agal_unsupported(op); continue; }
         char t[300]; sprintf(t, "    %s = %s;\\n", dname, rhs); as_json_buf_append_cstr(b, t);
     }
@@ -10565,7 +10712,7 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
             as_json_buf_append_cstr(&b, "  return oc;\\n");
         }
         as_json_buf_append_cstr(&b, "}\\n");
-    } else {
+    } else if (target == 1) {
         // ---- GLSL ES 1.00 (WebGL2 accepts ES 1.00 sources) ----
         // Precision: highp everywhere. ES 3.00 (and therefore WebGL2) guarantees
         // highp in fragment shaders, and Starling's programs do matrix math on
@@ -10597,6 +10744,106 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         if (!isFragment)
             as_json_buf_append_cstr(&b, "  gl_Position.y = -gl_Position.y;\\n");
         as_json_buf_append_cstr(&b, "}\\n");
+    } else {
+        // ---- HLSL (Direct3D shader model 4+) ----
+        // Paired with vendor/stage3d_d3d.cc (the D3D12 backend, a SEPARATE
+        // stage): that glue compiles these sources with D3DCompile at profile
+        // vs_4_0 / ps_4_0 and calls the entry points vs_main / fs_main.
+        //
+        // Bound shape, and where it comes from. The constant registers stay an
+        // ARRAY indexed by AGAL register number like MSL's vc[i], but HLSL wants
+        // them in a cbuffer with an explicit register(bN) slot (MSL uses a
+        // 'constant float4*' with [[buffer(0)]]). Textures and samplers are
+        // declared one per sampled register -- exactly the shape stage 89.39
+        // settled on for MSL -- because D3D has no "sampler state lives on the
+        // texture object" model either (that one is GLSL's).
+        //
+        // Orientation: NOT flipped. AS3, and Metal, and D3D all put render
+        // target row 0 at the TOP; only GL is bottom-up. The GLSL branch's
+        // 'gl_Position.y = -gl_Position.y' is therefore deliberately NOT emitted
+        // here (to be re-confirmed with a pixel readback the first time a
+        // Windows Stage3D build runs -- see TODO.md).
+        if (!isFragment) {
+            // HLSL rejects an EMPTY struct, so a struct type only exists when the
+            // program really reads one: a shader with no vertex attributes takes
+            // no struct parameter at all.
+            int hasVA = 0; for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VA, i)) { hasVA = 1; break; }
+            if (hasVA) {
+                as_json_buf_append_cstr(&b, "struct VSIn {\\n");
+                for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VA, i)) { char t[64]; sprintf(t, "  float4 a%d : TEXCOORD%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
+                as_json_buf_append_cstr(&b, "};\\n");
+            }
+            // VARYINGS BEFORE SV_Position, and that order is load-bearing: D3D's PSO
+            // validation matches the two stages by semantic name+index AND by the
+            // DXBC register fxc assigned that semantic, and fxc numbers a
+            // stage-input/output struct's registers in DECLARATION order from 0. With
+            // position first, a one-varying program gets VSOut TEXCOORD0 at register
+            // 1 (SV_Position took 0) while FSIn's TEXCOORD0 sits at register 0 --
+            // CreateGraphicsPipelineState then fails outright with E_INVALIDARG,
+            // "Semantic 'TEXCOORD' is defined for mismatched hardware registers
+            // between the output stage and input stage" (reproduced and bisected with
+            // temp/psoprobe.cc + the D3D12 debug layer; the identical shader pair
+            // builds as soon as the two fields swap). Both loops walk AGAL_V in
+            // ascending order, so the two register sequences line up exactly.
+            as_json_buf_append_cstr(&b, "struct VSOut {\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[64]; sprintf(t, "  float4 varying%d : TEXCOORD%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, "  float4 position : SV_Position;\\n");
+            as_json_buf_append_cstr(&b, "};\\n");
+            // The backend uploads the constant registers contiguously from index
+            // 0, so the array is sized to the highest register the program
+            // touches and the AGAL register number IS the array index.
+            int cmax = -1; for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VC, i)) cmax = i;
+            if (cmax >= 0) { char t[64]; sprintf(t, "cbuffer VCBuf : register(b0) { float4 vc[%d]; };\\n", cmax + 1); as_json_buf_append_cstr(&b, t); }
+            // AGAL3 vertex texture fetch (a tex/tld in a VERTEX program) needs
+            // the same texture + sampler declarations in the vertex stage.
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[64]; sprintf(t, "%s fs%d : register(t%d);\\n", agal_is_cube(i) ? "TextureCube<float4>" : "Texture2D<float4>", i, i); as_json_buf_append_cstr(&b, t); }
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[64]; sprintf(t, "SamplerState smp%d : register(s%d);\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, "VSOut vs_main(");
+            if (hasVA) as_json_buf_append_cstr(&b, "VSIn input");
+            // AGAL3 instance id: a uint system value, broadcast to a float4 in
+            // agal_reg_name so the shared component/swizzle paths keep working.
+            if (agal_is_used(AGAL_IID, 0)) as_json_buf_append_cstr(&b, hasVA ? ", uint iid : SV_InstanceID" : "uint iid : SV_InstanceID");
+            as_json_buf_append_cstr(&b, ") {\\n  float4 op;\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 vt%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[32]; sprintf(t, "  float4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+        } else {
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[64]; sprintf(t, "%s fs%d : register(t%d);\\n", agal_is_cube(i) ? "TextureCube<float4>" : "Texture2D<float4>", i, i); as_json_buf_append_cstr(&b, t); }
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[64]; sprintf(t, "SamplerState smp%d : register(s%d);\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            // Same empty-struct rule as VSIn above.
+            int hasV = 0; for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { hasV = 1; break; }
+            if (hasV) {
+                as_json_buf_append_cstr(&b, "struct FSIn {\\n");
+                for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[64]; sprintf(t, "  float4 v%d : TEXCOORD%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
+                as_json_buf_append_cstr(&b, "};\\n");
+            }
+            // Output struct: SV_Target0 for oc0, SV_TargetN for MRT (oc1..oc3 --
+            // the MSL/GLSL targets still fold every ocN into a single output, a
+            // pre-existing limitation of theirs), and SV_Depth when the program
+            // writes the od register.
+            as_json_buf_append_cstr(&b, "struct FSOut {\\n  float4 color0 : SV_Target0;\\n");
+            for (int i = 1; i < 4; i++) if (agal_is_used(AGAL_OP, i)) { char t[64]; sprintf(t, "  float4 color%d : SV_Target%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            if (agal_is_used(AGAL_OD, 0)) as_json_buf_append_cstr(&b, "  float depth : SV_Depth;\\n");
+            as_json_buf_append_cstr(&b, "};\\n");
+            int cmax = -1; for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VC, i)) cmax = i;
+            if (cmax >= 0) { char t[64]; sprintf(t, "cbuffer FCBuf : register(b0) { float4 fc[%d]; };\\n", cmax + 1); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, hasV ? "FSOut fs_main(FSIn input) {\\n  float4 oc;\\n" : "FSOut fs_main() {\\n  float4 oc;\\n");
+            for (int i = 1; i < 4; i++) if (agal_is_used(AGAL_OP, i)) { char t[32]; sprintf(t, "  float4 oc%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 ft%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+            if (agal_is_used(AGAL_OD, 0)) as_json_buf_append_cstr(&b, "  float od;\\n");
+        }
+        agal_emit_body(&b, ins, n, target);
+        if (as_agal_errmsg != NULL) { free(b.buf); return NULL; }
+        if (!isFragment) {
+            as_json_buf_append_cstr(&b, "  VSOut output;\\n  output.position = op;\\n");
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[48]; sprintf(t, "  output.varying%d = v%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            as_json_buf_append_cstr(&b, "  return output;\\n");
+        } else {
+            as_json_buf_append_cstr(&b, "  FSOut output;\\n  output.color0 = oc;\\n");
+            for (int i = 1; i < 4; i++) if (agal_is_used(AGAL_OP, i)) { char t[48]; sprintf(t, "  output.color%d = oc%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
+            if (agal_is_used(AGAL_OD, 0)) as_json_buf_append_cstr(&b, "  output.depth = od;\\n");
+            as_json_buf_append_cstr(&b, "  return output;\\n");
+        }
+        as_json_buf_append_cstr(&b, "}\\n");
     }
     char* out = as_str_alloc(b.len + 1);
     memcpy(out, b.buf, b.len + 1);
@@ -10606,9 +10853,14 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
 
 // Shader language handed to the AGAL translator must match the linked Stage3D
 // glue: stage3d_glue.mm compiles MSL (target 0), stage3d_webgl.cc compiles GLSL
-// ES (target 1). Web build manifests set ASC_S3D_GLSL alongside the GL glue.
+// ES (target 1), and the Windows D3D12 backend (vendor/stage3d_d3d.cc, which
+// emits HLSL) compiles target 2. Web manifests set ASC_S3D_GLSL alongside the GL
+// glue; a Windows Stage3D manifest sets ASC_S3D_HLSL. With no macro at all the
+// translator stays on MSL, so a build that never mentions Stage3D is unchanged.
 #ifndef ASC_AGAL_TARGET
-#ifdef ASC_S3D_GLSL
+#ifdef ASC_S3D_HLSL
+#define ASC_AGAL_TARGET 2
+#elif defined(ASC_S3D_GLSL)
 #define ASC_AGAL_TARGET 1
 #else
 #define ASC_AGAL_TARGET 0

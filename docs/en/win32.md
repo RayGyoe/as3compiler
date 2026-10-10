@@ -77,13 +77,57 @@ Built from source: **Skia m124** (`build-tools/skia-src`, with `bin/gn` + ninja)
 
 The x86 side also needs `Repair-SkiaX86Toolchain`: it auto-detects `$winSdk\bin\SetEnv.cmd` and applies one
 **minimal** patch to the gn source (wrapping x86's `env_setup` in `if (clang_win == "")`, so it is not
-overwritten once `clang_win` takes effect), with the idempotence marker `ASC-X86-CLANG-PATCH` and CRLF
+overwritten once `clang_win` takes effect), with the idempotence marker `ASC-X86-CLANG-PATCH` and newline
 normalization.
+
+> Pitfall log: a PS 5.1 here-string **inherits the newlines of the script file itself**, and git defaults to
+> `core.autocrlf=true` on Windows ⇒ with a CRLF checkout `$old` is CRLF too, so it can never match the
+> LF-normalized text and the patch "fails to find its anchor" (the same script passes under an LF checkout).
+> Both sides must therefore be normalized; any new patch that compares source text has to do the same.
 
 `skia_use_direct3d = true` (turned on in stage one-hundred-twenty-six) has three consequences, none optional:
 `SK_DIRECT3D` enters the public defines, the `third_party/d3d12allocator` archive is produced, and the
 `d3d12`/`dxgi`/`d3dcompiler` system libraries are needed. **The manifest side must be synchronized** (see §3.2);
 changing the gn parameter without changing the manifest equals an explosion at link time.
+
+### 2.4 Four Build Breakers from the New Toolchain (clang 23 / MSVC STL 14.43) — handled
+
+All four were found by actually building; none is related to AS3. The script heals each one and leaves a
+minimal, marked patch in the touched source (re-entrant; it fails loudly if the source no longer matches):
+
+- **LLVM 23's resource dir uses the major version only** (`lib/clang/23`, not `X.Y.Z`), while Skia m124's
+  `gn/highest_version_dir.py` hard-codes the `X.Y.Z` regex ⇒ nothing matches, `IndexError`, and `gn gen`
+  dies. The script asks `clang-cl -print-resource-dir` instead (keeping a fallback that enumerates
+  `lib/clang` and picks the numerically-highest name) and writes `clang_win_version` straight into
+  `args.gn`, bypassing that brittle probe.
+- **clang 23 removed `__builtin_ia32_vcvtph2ps256`**, which the skcms copy shipped in m124 uses for its
+  f16→f32 AVX2 fast path (`F_from_Half` in `modules/skcms/src/Transform_inl.h`) ⇒ mirror **upstream
+  skcms's own** minimal fix (`_Float16` vector + `__builtin_convertvector`, available since `clang >= 15`).
+  `VCVTPH2PS` is still emitted — **no downgrade, no slowdown**. Marker `ASC-CLANG23-SKCMS-PATCH`.
+- **MSVC's STL removed `std::auto_ptr` under `/std:c++17`** (`yvals_core.h`: `_HAS_AUTO_PTR_ETC =
+  !_HAS_CXX17`), and dng_sdk's `dng_pthread.cpp` (the Windows pthread emulation) still uses it ⇒ the
+  script adds `_HAS_AUTO_PTR_ETC=1` to the `third_party/dng_sdk` target only, leaving **Adobe's source
+  untouched** (`auto_ptr`'s ownership semantics stay exactly as written instead of being quietly swapped
+  for `unique_ptr`). This has nothing to do with the clang version: it is a Windows + MSVC-STL-only
+  guaranteed failure; upstream AOSP's dng_sdk still uses `auto_ptr` today (there is no upstream fix to
+  copy). Marker `ASC-DNG-AUTOPTR-PATCH`.
+- **Skia's own `src/gpu/ganesh/d3d/GrD3DUtil.h`** declares `std::wstring`/`std::string` but never includes
+  `<string>` (it used to arrive transitively; newer MSVC STL no longer provides it) ⇒ add the explicit
+  include (the IWYU answer; pure declaration visibility). Marker `ASC-D3DUTIL-STRING-PATCH`.
+
+### 2.5 Windows `tar.exe` Cannot Create Symlinks (self-healed)
+
+Windows' bundled `tar.exe` (bsdtar) cannot extract symlinks when "Developer Mode" is off / there is no
+"create symbolic links" privilege, and SDL2's release tarball happens to contain two —
+`SDL2-2.32.10/android-project-ant/{src,AndroidManifest.xml}`, pointing at the same source under
+`android-project` and serving the obsolete Ant-based Android project template, unrelated to a Windows build —
+so the whole extraction ends with exit 1.
+
+The script **heals only that one failure**: it extracts normally first; on failure it scans tar's output line
+by line and accepts only `<path in archive>: Can't create '...'` and
+`tar.exe: Error exit delayed from previous errors`, treating any other line as a different problem and
+throwing the raw output; it then deletes the half-written tree, retries with `--exclude` for each such entry,
+and **lists every skipped entry** (no silent degradation, and what was skipped is never hidden).
 
 ---
 
@@ -132,17 +176,44 @@ The **only** place a backend branch appears is `vendor/window_glue.cc` (`sk_atta
 `sk_window_show_gpu` is implemented by macro), so the same AS3 source differs between the two ends only in the
 build manifest.
 
-Stage3D's window overlay layer **deliberately still guards on `ASC_RENDER_METAL`** (only renaming `is_gpu`):
-Windows' Stage3D errors at manifest time, and `ASC_stage3d_tex` is an `MTLTexture`. On Windows that `#else`
-branch is **unreachable** (`ASC_stage3d_ready` is always false).
+Stage3D's window overlay layer is **now unified across all three ends**: the condition widened from
+`ASC_RENDER_METAL` to `ASC_RENDER_METAL || ASC_RENDER_D3D` (**excluding** `ASC_RENDER_GPU`, whose
+`ASC_stage3d_tex` is a CPU pixel buffer and takes the `#elif` arm at the same site). The two arms pass
+different handles: an `MTLTexture` on Metal, an `ID3D12Resource*` on D3D, each decoded under its own backend
+macro by `sk_gpu_draw_texture`.
 
-### 3.4 Stage3D on Windows: Loud Failure at Build Time
+### 3.4 Stage3D on Windows: the D3D12 Backend (landed, stage one-hundred-thirty-two)
 
-When the descriptor or source uses `flash.display3D`, the Windows target raises `AirAppError` — because there is
-neither an equivalent of `stage3d_glue.mm` nor an AGAL→HLSL translator (`AGALTranslator.translate` currently
-emits only MSL / GLSL ES). This is **not a silent downgrade** but an explicit capability boundary
-(AGENTS.md §1.5); the follow-up project is in `TODO.md` stage one-hundred-twenty-six (`vendor/stage3d_d3d.cc` +
-`ASC_AGAL_TARGET=hlsl`). Therefore `examples/air-starling-demo` fails at compile time on the Windows target.
+When the descriptor or source uses `flash.display3D`, the Windows target now **really links a D3D12 backend**
+rather than raising an `AirAppError`:
+
+- **Build-time wiring** (`src/air-app.ts`): `sources` gets `vendor/stage3d_d3d.cc`; `defines` gets
+  `ASC_S3D_HLSL=1` (selects stage one-hundred-thirty-one's HLSL target, `target 2`) and `ASC_RENDER_STAGE3D=1`
+  (plus `ASC_RENDER_DEPTH_STENCIL=1` for `<depthAndStencil>true</depthAndStencil>`); `linkLibs` gets
+  `d3d12`/`dxgi`/`d3dcompiler` (the last is the `D3DCompile` = fxc entry point, which must be the real runtime
+  DLL, not a .lib stub). It does **not** push `stage3d_glue.mm` and does **not** add `Metal`/`Foundation`.
+  The old Windows `throw` is gone.
+- **Shared device/queue** (the prerequisite for "compositing can see the 3D"): `vendor/d3d_glue.cc` exports
+  `sk_d3d_shared_device()` / `sk_d3d_shared_queue()` via `__declspec(dllexport)`; `stage3d_d3d.cc` looks them
+  up on the main module with `GetProcAddress` **by name** (not a hard link — a Stage3D-only build may not
+  contain the window glue at all, and a hard reference would become an unresolved symbol there). If the lookup
+  fails it falls back to a private `ID3D12Device` + queue and **loudly warns** that the pixels will never
+  reach the window (no silent black screen).
+- **One queue ⇒ no CPU wait**: Stage3D's batches and Skia's `sk_gpu_flush` execute in submission order on the
+  same `ID3D12CommandQueue`, so the frame-boundary `s3d_flush_async` only needs `Close()` +
+  `ExecuteCommandLists()` (commit) and **not** a fence wait — the same line stage one-hundred-fourteen drew on
+  the Metal side.
+- **Evidence**: `examples/shmup-stage3d` reached **281 frames / 5 s** (~56 fps) with zero PSO or compositing
+  errors, and the **presented back buffer** exported through `ASC_GPU_DUMP` (a 1500x900 BMP) contains the
+  demo's Stage3D sprites.
+- **Not verified**: `examples/air-starling-demo` **has not been run** on the Windows target yet; the culling
+  state and winding order are still a paper decision (`FrontCounterClockwise=FALSE` + a positive viewport
+  height, no Y flip) with no culling A/B measurement.
+
+See also §2.9 of the Chinese document
+([`zh-cn/win32.md`](../zh-cn/win32.md)) for the Skia D3D `gr_cp` ownership contract that this composite had to
+satisfy (`retain()` instead of the adopting bare-pointer constructor) — it is the deepest third-party-API trap
+this project has hit so far.
 
 ---
 
@@ -162,9 +233,13 @@ resources, with only a begin/draw/present loop); the difference is only in what 
   value for that frame. **Neither half can be omitted** — flushing without submitting presents the **old** back
   buffer.
 
-`sk_gpu_draw_texture` (for Stage3D compositing) is explicitly **unimplemented and vocal** (prints an
-explanation once, rather than silently drawing nothing): its only caller is Stage3D compositing, and on Windows
-Stage3D is unreachable (§3.4).
+`sk_gpu_draw_texture` (for Stage3D compositing) is **implemented**: it wraps Stage3D's offscreen render target
+into a `GrBackendTexture` → `SkImages::BorrowTextureFrom` → `SkCanvas::drawImageRect` (the dst-only overload
+with `SkSamplingOptions(kLinear, kNone)`, because under HiDPI the source is device-size while the destination is
+logical-size). The target must be `R8G8B8A8`/`BGRA8` and non-multisampled, otherwise it is **loudly refused**
+(`unsupported render target (dxgi format %d, %u samples); nothing was drawn`, printed once). When wrapping, the
+resource must be `retain()`ed rather than passed through the bare-pointer constructor — **the deepest Skia D3D
+trap this project has hit; see §2.9 of [`zh-cn/win32.md`](../zh-cn/win32.md)**.
 
 ---
 
@@ -222,9 +297,10 @@ backend files must implement the five neutral names (`unit: backendparity`).
 
 ## 6. Follow-ups
 
-- **Stage3D on Windows**: `vendor/stage3d_d3d.cc` + `ASC_AGAL_TARGET=hlsl` (extending `AGALTranslator` to HLSL +
-  the D3D-side buffer/texture/pipeline/offscreen RT/blend-state cache). Until then, Stage3D on Windows always
-  errors at build time.
-- **`sk_gpu_draw_texture`**: implement it when Stage3D's D3D backend lands (it needs the render target's
-  `DXGI_FORMAT` and the current `D3D12_RESOURCE_STATE`, which can only come from the Stage3D context, so it
-  cannot be implemented by guessing).
+- **Stage3D on Windows**: ✅ **done** (stage one-hundred-thirty-two) — `vendor/stage3d_d3d.cc` + the HLSL
+  translator target + the `ASC_S3D_HLSL`/`d3d12`/`dxgi`/`d3dcompiler` wiring; `examples/shmup-stage3d` runs on
+  D3D12 with its frames composited into the window. Remaining: run `examples/air-starling-demo` on the Windows
+  target, and settle culling/winding with a real A/B measurement.
+- **`sk_gpu_draw_texture`**: ✅ **implemented** (stage one-hundred-thirty-two) — the render target's
+  `DXGI_FORMAT` and current `D3D12_RESOURCE_STATE` come from the Stage3D context (`s3d_get_render_target`
+  returns the raw `ID3D12Resource*`; the composite takes a temporary `retain()`ed reference).

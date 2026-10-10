@@ -615,3 +615,251 @@ function checkStage3dProgramCache(): string[] {
 registerGroup('stage3d/flush-policy', checkStage3dFlushPolicy);
 registerGroup('stage3d/webgl-abi', checkStage3dWebglAbiCoverage);
 registerGroup('stage3d/program-cache', checkStage3dProgramCache);
+// AGAL -> HLSL (stage 131): the third translation target, i.e. the prerequisite for
+// a Windows/D3D12 Stage3D backend. The groups above pin the slot walk and the
+// sampler flags; this one pins that target 2 is a genuine third dialect.
+//
+// What is actually being guarded. as_agal_translate is ONE implementation
+// parameterised by `target`, and the arms of its shared emitters used to be written
+// as "if (target == 0) ... else ..." where the else meant GLSL. Adding a third
+// target therefore risks the opposite of a missing feature: an HLSL shader quietly
+// carrying a GLSL identifier (gl_FragColor, gl_Position, mix(), greaterThanEqual()).
+// That is the "compiles but the result is wrong" failure AGENTS.md 2.5 forbids, and
+// no example can catch it -- examples/ runs in pure-C mode, with no GPU and no D3D
+// compiler anywhere near it.
+//
+// So the proof is split deliberately:
+//   - examples/stage80.as asserts the emitted text for every instruction class in
+//     all three dialects, and that the MSL/GLSL text is unchanged;
+//   - temp/hlslcheck compiles every generated HLSL shader with Microsoft's fxc
+//     (d3dcompiler_47, vs_4_0/ps_4_0). The two rules marked "fxc" below were found
+//     only by that run and are pinned here so they cannot regress without a GPU.
+function checkStage3dAgalHlsl(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  // Line endings are normalised first: the checkout is CRLF on Windows and LF in
+  // CI, and a pattern that only matches one of them is a false failure, not a
+  // finding (the same trap the operand-slot group documents).
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8').replace(/\r\n/g, '\n');
+  const airApp = readFileSync(join(root, 'src', 'air-app.ts'), 'utf8').replace(/\r\n/g, '\n');
+  const emitted = emittedLines();
+  // Whole-line comments quote the very spellings under test, so commentary is
+  // removed before any check that asserts a spelling is ABSENT.
+  const noComments = (s: string): string => s.replace(/^[ \t]*\/\/.*$/gm, '');
+  const region = (from: string, to: string): string => {
+    const i = runtime.indexOf(from);
+    const j = i < 0 ? -1 : runtime.indexOf(to, i);
+    return i >= 0 && j > i ? runtime.slice(i, j) : '';
+  };
+
+  // ---- target selection ------------------------------------------------------
+  // An explicit three-way ladder, with 2 tested before 1: a build that mentions
+  // only GLSL must keep meaning GLSL, and one that mentions neither keeps meaning
+  // MSL (so a build that never touches Stage3D is byte-identical to before).
+  check('ASC_S3D_HLSL selects target 2, ahead of the GLSL arm and the MSL fallback',
+    /#ifdef ASC_S3D_HLSL\n#define ASC_AGAL_TARGET 2\n#elif defined\(ASC_S3D_GLSL\)\n#define ASC_AGAL_TARGET 1\n#else\n#define ASC_AGAL_TARGET 0\n#endif/.test(runtime));
+  // The AS3-facing bridge has to name "hlsl" explicitly; anything unrecognised
+  // still falls back to MSL (that fallback is asserted in examples/stage80.as).
+  check('AGALTranslator.translate maps the "hlsl" target string to 2',
+    emitted.includes('strcmp(target, "hlsl") == 0) ? 2 : 0'));
+  // driverInfo is compile-time selected and the order of the arms is load-bearing:
+  // a Windows Stage3D build defines ASC_S3D_HLSL *and* ASC_RENDER_STAGE3D, so a D3D
+  // arm placed after the Metal one would report "Metal (Stage3D)" on Windows.
+  const diStart = emitted.indexOf('#if defined(ASC_S3D_GLSL)');
+  const diEnd = emitted.indexOf('#endif', diStart);
+  const di = diStart >= 0 && diEnd > diStart ? emitted.slice(diStart, diEnd) : '';
+  check('driverInfo has a D3D arm before the Metal arm',
+    di.includes('#elif defined(ASC_S3D_HLSL)') && di.includes('Direct3D12')
+    && di.indexOf('#elif defined(ASC_S3D_HLSL)') < di.indexOf('#elif defined(ASC_RENDER_STAGE3D)'));
+
+  // ---- dialect isolation -----------------------------------------------------
+  // Every GLSL built-in must sit inside an explicit "if (target == 1)" test. A bare
+  // 'else' emitting one is precisely how a two-way arm becomes a wrong third target.
+  const glslLines = noComments(runtime).split('\n').filter((l) => /"(gl_Position|gl_FragColor|gl_FragDepth)/.test(l));
+  check('every GLSL built-in is emitted only under an explicit target == 1 test',
+    glslLines.length >= 3 && glslLines.every((l) => l.includes('target == 1')));
+  const msl = region('// ---- MSL ----', '// ---- GLSL ES 1.00');
+  const hlsl = region('// ---- HLSL (Direct3D shader model 4+) ----', 'char* out = as_str_alloc(b.len + 1);');
+  check('the MSL branch carries no D3D or GL spelling',
+    msl.length > 500 && !/SV_|cbuffer|TEXCOORD|\.Sample\(|gl_Position|gl_FragColor/.test(noComments(msl)));
+  check('the HLSL branch carries no GL or Metal spelling',
+    hlsl.length > 1500 && !/"gl_|metal_stdlib|\[\[stage_in\]\]|\.sample\(/.test(noComments(hlsl)));
+  check('the HLSL vertex stage does not flip clip-space Y (D3D is top-down like AS3)',
+    !/"gl_Position\.y = -/.test(noComments(hlsl)) && hlsl.includes('output.position = op;'));
+
+  // ---- the shared register/instruction emitters -----------------------------
+  // These are the exact branches that had to grow a third arm; each one is pinned so
+  // a revert to the two-way form is a test failure rather than a wrong shader.
+  check('the HLSL register names are all three-way',
+    runtime.includes('else if (target == 2) sprintf(out, "input.a%d", num);')
+    && runtime.includes('else if (agal_is_frag && target == 2) sprintf(out, "input.v%d", num);')
+    && runtime.includes('else if (target == 2 && num != 0) sprintf(out, "oc%d", num);')
+    && runtime.includes('if (target == 2) strcpy(out, "float4(iid, iid, iid, iid)");'));
+  check('the HLSL instruction spellings are all three-way',
+    runtime.includes('(target == 2) ? "frac" : "fract"')
+    && runtime.includes('(target == 2) ? "ddx"')
+    && runtime.includes('(target == 2) ? "ddy"')
+    && runtime.includes('rsqrt(%s)') && runtime.includes('saturate(%s)')
+    && runtime.includes('.Sample(smp%d,'));
+
+  // ---- the HLSL dialect shape ------------------------------------------------
+  check('HLSL binds the D3D system values it needs',
+    hlsl.includes(': SV_Position') && hlsl.includes(': SV_Target%d')
+    && hlsl.includes(': SV_Depth') && hlsl.includes(': SV_InstanceID'));
+  // The VS float4 `position : SV_Position` field must be declared AFTER the varyings,
+  // and this one is a pure D3D12 linkage rule rather than a style choice: fxc numbers
+  // a stage struct's registers in declaration order, and D3D12 matches the VS output
+  // to the PS input by semantic name+index AND by that register number. With
+  // SV_Position first, VSOut's TEXCOORD0 sat at register 1 while FSIn's sat at 0, and
+  // CreateGraphicsPipelineState failed with "Vertex Shader - Pixel Shader linkage
+  // error: Signatures between stages are incompatible". Walking AGAL_V ascending on
+  // both sides lines the two sequences up. MSL/GLSL are order-insensitive, so only
+  // the HLSL arm carries this.
+  check('HLSL declares the varyings before SV_Position (fxc register order)',
+    hlsl.indexOf(': SV_Position') > hlsl.indexOf('varying%d : TEXCOORD%d')
+    && hlsl.indexOf('varying%d : TEXCOORD%d') >= 0);
+  check('HLSL constants live in cbuffers bound at b0',
+    hlsl.includes('cbuffer VCBuf : register(b0)') && hlsl.includes('cbuffer FCBuf : register(b0)'));
+  check('HLSL declares one texture and one sampler per sampled register',
+    hlsl.includes(': register(t%d)') && hlsl.includes(': register(s%d)')
+    && hlsl.includes('Texture2D<float4>') && hlsl.includes('TextureCube<float4>'));
+
+  // ---- the two rules only fxc could teach ------------------------------------
+  // fxc rejects EVERY scalar-splat numeric constructor at vs_4_0/ps_4_0: both
+  // float4(dot(a, b)) and even float4(1.0) fail with X3014 "incorrect number of
+  // arguments to numeric-type constructor", with or without
+  // D3DCOMPILE_ENABLE_STRICTNESS (ps_6_0/DXC accepts it). A scalar dot product
+  // therefore splats through HLSL's scalar swizzle instead.
+  check('fxc: a scalar dot product splats with .xxxx, never float4(scalar)',
+    runtime.includes('dot(%s.xyz, %s.xyz).xxxx') && runtime.includes('dot(%s, %s).xxxx')
+    && !noComments(runtime).includes('float4(dot('));
+  // fxc also rejects an EMPTY struct, so a stage-input struct may only be declared
+  // when the program genuinely reads an attribute/varying -- and the entry signature
+  // has to follow (a shader with no inputs takes no parameter at all).
+  check('fxc: the vertex stage-input struct is guarded by actual attribute use',
+    hlsl.includes('int hasVA = 0; for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VA, i)) { hasVA = 1; break; }')
+    && hlsl.includes('if (hasVA) as_json_buf_append_cstr(&b, "VSIn input");')
+    && hlsl.indexOf('"struct VSIn {') > hlsl.indexOf('if (hasVA) {'));
+  check('fxc: the fragment stage-input struct is guarded by actual varying use',
+    hlsl.includes('int hasV = 0;')
+    && hlsl.includes('hasV ? "FSOut fs_main(FSIn input)') && hlsl.includes('"FSOut fs_main() {')
+    && hlsl.indexOf('"struct FSIn {') > hlsl.indexOf('if (hasV) {'));
+
+  // ---- the Windows backend is wired, and the wiring is what used to be refused ---
+  // Until stage3d_d3d.cc existed, --air-app on Windows had to REFUSE a Stage3D app:
+  // linking stage3d_glue.mm there cannot compile, and leaving every as_s3d_* a no-op
+  // meant a black stage (the silent-wrong-result case). The refusal is gone, so the
+  // pin moves to the wiring it was replaced by -- a Windows build must take the D3D
+  // branch, which means the D3D glue, the HLSL dialect and the three D3D libs, and
+  // never the Metal glue/frameworks.
+  check('a Windows Stage3D build compiles the D3D glue with the HLSL dialect',
+    /if \(onWin\) \{[\s\S]{0,400}?stage3d_d3d\.cc[\s\S]{0,400}?ASC_S3D_HLSL=1[\s\S]{0,600}?stage3d_glue\.mm/.test(airApp)
+    && airApp.includes("'d3d12', 'dxgi', 'd3dcompiler'"));
+  check('the Windows Stage3D refusal is gone (the translator AND the backend exist now)',
+    !/if \(onWin\) \{\n\s*throw new AirAppError\(/.test(airApp)
+    && !airApp.includes('has not been written'));
+  check('the web branch still selects GLSL for stage3d_webgl.cc',
+    airApp.includes("defines.push('ASC_S3D_GLSL=1')") && airApp.includes('stage3d_webgl.cc'));
+  // A new target must not soften "we cannot translate this": an untranslatable
+  // opcode stays a hard error on all three, never a silently dropped instruction.
+  check('an untranslatable opcode still names all three targets in its diagnostic',
+    runtime.includes('is not translated to MSL/GLSL/HLSL yet'));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/agal-hlsl', checkStage3dAgalHlsl);
+
+// Windows/Direct3D 12 backend pins (vendor/stage3d_d3d.cc + vendor/d3d_glue.cc).
+//
+// The D3D backend is a SECOND full implementation of the same s3d_* ABI, so it earns
+// the same seam check the WebGL glue has: runtime.ts is the only place that spells a
+// bare `s3d_*` call, and each target links exactly ONE glue, so every symbol named
+// there must exist here too. A gap is not a soft failure -- it is the Windows link
+// error "undefined symbol: s3d_..." (which is exactly how the WebGL cube-texture gap
+// announced itself on the web target), or a silently black stage.
+function checkStage3dD3dGlue(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const d3d = readFileSync(join(root, 'vendor', 'stage3d_d3d.cc'), 'utf8');
+  const glue = readFileSync(join(root, 'vendor', 'd3d_glue.cc'), 'utf8');
+  const emitSrc = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const airApp = readFileSync(join(root, 'src', 'air-app.ts'), 'utf8');
+  const stripComments = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+
+  const referenced = new Set([...stripComments(runtime).matchAll(/\b(s3d_\w+)\s*\(/g)].map((m) => m[1]));
+  const definedD3d = new Set([...d3d.matchAll(/^[A-Za-z_][\w \t\*]*\b(s3d_\w+)\s*\(/gm)].map((m) => m[1]));
+  const missing = [...referenced].filter((n) => !definedD3d.has(n)).sort();
+  check(`every s3d_* symbol the runtime calls is defined in the D3D glue (missing: ${missing.join(', ') || 'none'})`,
+    missing.length === 0 && referenced.size > 30);
+
+  // The window backend's device/queue must be shared, not duplicated: Stage3D submits
+  // on the SAME D3D12 queue Ganesh composites on, which is what turns "submitted
+  // earlier" into "the GPU already has the pixels" with no CPU wait (the D3D
+  // counterpart of stage3d_glue.mm's sk_mtl_shared_queue). It is looked up by NAME
+  // through the loaded module -- not linked -- because a Stage3D-only build may omit
+  // the window glue entirely and a hard reference would then be an unresolved
+  // external in every such build.
+  check('the D3D glue exports the shared device/queue for Stage3D to join',
+    /__declspec\(dllexport\)[^\n]*\bsk_d3d_shared_queue\s*\(/.test(glue)
+    && /__declspec\(dllexport\)[^\n]*\bsk_d3d_shared_device\s*\(/.test(glue));
+  check('Stage3D looks the shared device/queue up by name with a loud private fallback',
+    d3d.includes('sk_d3d_shared_queue') && d3d.includes('sk_d3d_shared_device')
+    && /GetProcAddress/.test(d3d)
+    && /no shared D3D12|private device|its own device/.test(d3d));
+
+  // ---- THE OWNERSHIP PIN ------------------------------------------------------
+  // Skia's D3D backend has no Borrow/Adopt notion: GrD3DTextureResourceInfo's
+  // fResource is a gr_cp, and its bare-pointer constructor ADOPTS the pointer WITHOUT
+  // AddRef while the destructor still Releases it. Wrapping a BORROWED resource with
+  // that constructor therefore eats the owner's only reference: the Stage3D render
+  // target was freed as sk_gpu_draw_texture returned, and the next allocation
+  // recycled its address. Measured, per-frame: frame 1's composite saw
+  // desc(dim=3 TEXTURE2D fmt=87 1000x600) and drew; frame 2's GetDesc() on the SAME
+  // pointer reported a 144-byte vertex BUFFER (dim=1 fmt=0 w=144), so
+  // sk_gpu_draw_texture refused it -- "unsupported render target (dxgi format 0, 1
+  // samples); nothing was drawn" -- and the Stage3D frame never reached the window.
+  // It looked intermittent only because a just-released driver object often still
+  // reads back valid until the allocator hands its block out again.
+  // retain() is the balanced recipe (AddRef into the struct; its dtor releases that
+  // reference), and is exactly what Skia's own tools/window/win/D3D12WindowContext_win.cpp
+  // does with `info.fResource = fBuffers[i]` (gr_cp copy-assignment AddRefs).
+  check('the D3D window glue never wraps a borrowed resource with the adopting constructor',
+    !/GrD3DTextureResourceInfo\s+\w+\s*\(\s*(?!nullptr)/.test(stripComments(glue)));
+  check('both D3D wrap sites retain() their resource instead of adopting it',
+    (stripComments(glue).match(/\.retain\(/g) || []).length >= 2
+    && /draw_texture/.test(glue));
+  check('the ownership contract is documented where it bit (GrD3DTypes.h / retain)',
+    glue.includes('borrowed') || glue.includes('BORROW'));
+
+  // The composite condition: a GPU backend that renders INTO a texture (Metal, D3D12)
+  // composites that texture into the window's canvas, while the CPU backend
+  // (ASC_RENDER_GPU) owns a pixel buffer and instead draws it in the `#elif` arm.
+  // Handing a pixel backend into the texture-composite arm would pass a uint8_t*
+  // where an ID3D12Resource* is expected.
+  check('the composite arm is gated on the two texture-rendering backends only',
+    emitSrc.includes('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D)')
+    && emitSrc.includes('#elif defined(ASC_RENDER_GPU)'));
+  check('present()/the pre-composite flush arm also covers the D3D texture path',
+    emitSrc.includes('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GPU)'));
+  check('the D3D glue implements the composite entry point the generated C calls',
+    /void sk_gpu_draw_texture\(void\* canvas, void\* d3dTexture, int w, int h,/.test(glue));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/d3d-glue', checkStage3dD3dGlue);

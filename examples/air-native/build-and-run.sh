@@ -50,8 +50,18 @@ if [[ -z "$SDK" ]]; then
   exit 1
 fi
 
+# The AIR SDK ships adl extension-less on macOS/Linux and as adl.exe on
+# Windows. Pick whichever launcher the SDK actually provides instead of
+# probing the host OS: uname is not guaranteed to exist and $OSTYPE is
+# unreliable in Windows shells. macOS SDKs have no adl.exe, so macOS keeps
+# its plain "adl" unchanged.
+if [[ -f "$SDK/bin/adl.exe" ]]; then
+  ADL="$SDK/bin/adl.exe"
+else
+  ADL="$SDK/bin/adl"
+fi
+
 MXMLC="$SDK/bin/mxmlc"
-ADL="$SDK/bin/adl"
 
 # Paths are resolved relative to this script, so it works from any CWD.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

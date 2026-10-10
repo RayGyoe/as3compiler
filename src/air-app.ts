@@ -472,11 +472,31 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
       sources.push(mtlSrc);
     }
   }
-  // `z` is the macOS *system* zlib (libz.dylib, reached as z.lib there). Windows
-  // ships no such library — Skia's own `zlib` target above is what resolves there.
-  if (!onWin) linkLibs.push('z');
+  // Standard zlib: compress/uncompress/compressBound (what ByteArray.compress/
+  // uncompress calls) plus the unprefixed deflate/inflate. macOS reaches it as
+  // the system libz (`z`). Windows has no system zlib, and Skia's own `zlib`
+  // target above is Chromium's *prefixed* fork (`_Cr_z_compress` etc.) that
+  // libpng/libwebp consume but which does NOT expose the unprefixed names our
+  // generated C calls. The standard library on Windows is curl's bundled zlib
+  // (`z.lib` in curl/lib/<arch>), so `z` is linked on both hosts and the curl
+  // lib dir is pushed below on Windows.
   const includePaths = [`${vendorRel}/skia`, `${vendorRel}/sdl2/${sdlDir}/include`];
   const linkPaths = [`${vendorRel}/skia/lib/${libDir}`, `${vendorRel}/sdl2/${sdlDir}/lib`];
+  // Standard zlib: compress/uncompress/compressBound (what ByteArray.compress/
+  // uncompress calls) plus the unprefixed deflate/inflate. macOS reaches it as
+  // the system libz (`z`). Windows has no system zlib, and Skia's own `zlib`
+  // target above is Chromium's *prefixed* fork (`_Cr_z_compress` etc.) that
+  // libpng/libwebp consume but which does NOT expose the unprefixed names our
+  // generated C calls. The standard library on Windows is curl's bundled zlib
+  // (`z.lib` in curl/lib/<arch>), so `z` is linked on both hosts and the curl
+  // lib dir is pushed below on Windows.
+  linkLibs.push('z');
+  if (onWin) {
+    linkPaths.push(`${vendorRel}/curl/lib/${libDir}`);
+    // skia_glue.cc's SkFontMgr_New_GDI backend shapes text with Uniscribe
+    // (ScriptItemize/ScriptShape/ScriptFreeCache), all in the system usp10.lib.
+    linkLibs.push('usp10');
+  }
   const frameworks = onWin ? [] : [
     'CoreFoundation', 'CoreGraphics', 'CoreText', 'CoreServices',
     'ApplicationServices', 'ImageIO', 'Accelerate',
@@ -515,47 +535,50 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
       // curl was built with CURL_USE_SCHANNEL (Windows TLS, the counterpart of
       // macOS SecureTransport): Schannel itself, the Winsock stack its threaded
       // resolver uses, and the CNG/CryptoAPI entry points it calls. nghttp2 is
-      // linked above like on macOS.
+      // linked above like on macOS. CURL_STATICLIB is the consumer-side twin of
+      // the `-DNGHTTP2_STATICLIB` the curl *build* uses: without it curl/curl.h
+      // declares every API __declspec(dllimport), and the static curl.lib cannot
+      // satisfy those __imp_ references.
+      defines.push('CURL_STATICLIB=1');
       linkLibs.push('crypt32', 'ws2_32', 'secur32', 'bcrypt', 'iphlpapi');
     } else {
       frameworks.push('Security', 'SystemConfiguration');
     }
   }
-  // Stage3D (flash.display3D): link the offscreen Metal triangle pipeline
-  // (stage3d_glue.mm) and define ASC_RENDER_STAGE3D so the as_s3d_* wrappers stop
-  // being no-ops. Without this the demo runs Context3D as a software state machine
-  // and never produces GPU pixels (the "white screen" symptom). The web target has
-  // its own backend (stage3d_webgl.cc, WebGL2) wired the same way in the `web`
-  // branch above.
+  // Stage3D (flash.display3D): link the offscreen triangle pipeline and define
+  // ASC_RENDER_STAGE3D so the as_s3d_* wrappers stop being no-ops. Without this the
+  // demo runs Context3D as a software state machine and never produces GPU pixels
+  // (the "white screen" symptom). The backend is per-OS *and* per-API: Metal through
+  // stage3d_glue.mm on macOS, Direct3D 12 through stage3d_d3d.cc on Windows, and
+  // WebGL2 through stage3d_webgl.cc on the web target (wired in the `web` branch
+  // above).
   if (usesStage3D) {
-    // Stage3D needs a *per-backend* shader pipeline: stage3d_glue.mm translates
-    // AGAL to MSL and drives Metal, stage3d_webgl.cc emits GLSL ES for WebGL2. A
-    // third one (AGAL -> HLSL on D3D12) does not exist yet, so on Windows this is
-    // refused outright rather than wired to the *.mm above (which cannot compile
-    // there) or left unwired: ASC_RENDER_STAGE3D absent turns every as_s3d_*
-    // wrapper into a no-op, i.e. a black stage with a 2D overlay -- exactly the
-    // "compiles but the result is wrong" outcome AGENTS.md 2.5 forbids. This is
-    // the one blocker between a Windows build of the Starling demo and a window
-    // that draws it; registered in TODO.md.
+    // Each backend consumes the AGAL translator's own dialect: MSL for Metal (the
+    // default target 0), GLSL ES for WebGL2 (ASC_S3D_GLSL -> 1) and HLSL for D3D12
+    // (ASC_S3D_HLSL -> 2). Defining the dialect is what keeps stage3d_d3d.cc from
+    // being handed MSL it cannot compile.
     if (onWin) {
-      throw new AirAppError(
-        'Stage3D on the Windows native backend is not implemented yet: it needs an ' +
-        'AGAL -> HLSL pipeline (vendor/stage3d_d3d.cc) alongside stage3d_glue.mm ' +
-        '(Metal) and stage3d_webgl.cc (WebGL2). Build with --target wasm, or remove ' +
-        'the Stage3D usage, until that backend lands (see TODO.md).'
-      );
+      sources.push(`${vendorRel}/stage3d_d3d.cc`);
+      defines.push('ASC_S3D_HLSL=1');
+      // d3d12/dxgi are the device and swapchain APIs, d3dcompiler the fxc entry
+      // point (D3DCompile) that turns the translated HLSL into vs_5_1/ps_5_1
+      // bytecode. The window GPU branch above links the same three, so in
+      // <renderMode>direct</renderMode> this only guards the CPU-render-mode build
+      // (where Stage3D still needs a device of its own).
+      for (const lib of ['d3d12', 'dxgi', 'd3dcompiler']) if (!linkLibs.includes(lib)) linkLibs.push(lib);
+    } else {
+      sources.push(`${vendorRel}/stage3d_glue.mm`);
+      if (!frameworks.includes('Metal')) frameworks.push('Metal');
+      if (!frameworks.includes('Foundation')) frameworks.push('Foundation');
     }
-    sources.push(`${vendorRel}/stage3d_glue.mm`);
     defines.push('ASC_RENDER_STAGE3D=1');
     // <depthAndStencil>true</depthAndStencil> allocates the depth/stencil buffer at
     // startup (AIR requires it before any content loads; it must match the
     // enableDepthAndStencil argument to Context3D.configureBackBuffer). Mirror it
-    // as ASC_RENDER_DEPTH_STENCIL so stage3d_glue.mm attaches a depth32+stencil8
-    // render target, which the CPU-side setDepthTest/setStencilActions state
-    // machine (stage 87) defers to.
+    // as ASC_RENDER_DEPTH_STENCIL so the backend attaches a depth+stencil render
+    // target, which the CPU-side setDepthTest/setStencilActions state machine
+    // (stage 87) defers to.
     if (depthAndStencil) defines.push('ASC_RENDER_DEPTH_STENCIL=1');
-    if (!frameworks.includes('Metal')) frameworks.push('Metal');
-    if (!frameworks.includes('Foundation')) frameworks.push('Foundation');
   }
   // Audio (flash.media, see detectAudio): compile vendor/audio_glue.c into the app
   // and define ASC_HAVE_AUDIO, which is what turns the as_audio_* seam from "no
@@ -574,6 +597,7 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
     target: 'native',
     'c-compiler': 'clang',
     opt: '-O2',
+    architecture,
     sources,
     'include-paths': includePaths,
     'link-libs': linkLibs,

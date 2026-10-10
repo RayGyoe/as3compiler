@@ -68,7 +68,17 @@
 #include "include/gpu/ganesh/gl/GrGLDirectContext.h"
 #include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
 #else
+#if defined(_WIN32)
+// Windows font backend: GDI (Skia's default font manager on Windows). It
+// enumerates the installed system font collection through gdi32 — an import lib
+// already on the Windows link line for SDL2 — so it adds no dependency, unlike
+// DirectWrite (dwrite.lib). The factory lives in SkTypeface_win.h, exposed under
+// SK_BUILD_FOR_WIN (which SkFeatures.h derives from _WIN32); the mac_ct port
+// below is CoreText-only and cannot compile for Windows.
+#include "include/ports/SkTypeface_win.h"
+#else
 #include "include/ports/SkFontMgr_mac_ct.h"
+#endif
 #endif
 #include "include/effects/SkGradientShader.h"
 #include "include/effects/SkImageFilters.h"
@@ -1058,6 +1068,14 @@ int sk_fontmgr_register_data(const void* data, int len) {
   g_font_datas.push_back(SkData::MakeWithCopy(data, (size_t)len));
   g_fontmgr_cache = nullptr;  // force a rebuild that sees the new data
   return 1;
+}
+#elif defined(_WIN32)
+static sk_sp<SkFontMgr> sk_platform_fontmgr() {
+  // GDI enumerates the Windows system font collection (the analogue of CoreText
+  // on macOS). Cached for the same reason as the CoreText path: construction
+  // walks the whole installed family list and must not repeat per draw call.
+  static sk_sp<SkFontMgr> cached = SkFontMgr_New_GDI();
+  return cached;
 }
 #else
 static sk_sp<SkFontMgr> sk_platform_fontmgr() {

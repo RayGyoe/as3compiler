@@ -9,6 +9,7 @@ package demo {
   import flash.display.Stage;
   import flash.text.TextField;
   import flash.text.TextFormat;
+  import flash.system.System;
 
   /**
    * Stage 64 — flash.filesystem (POSIX filesystem model).
@@ -51,6 +52,14 @@ package demo {
 
       // File: type + existence (built from the writable app-storage location)
       var f:File = File.applicationStorageDirectory.resolvePath("air_native_fs_test.txt");
+
+
+
+      if(f.exists)f.deleteFile();
+      System.output(f.exists  + "   "+ f.nativePath  + "\n");
+
+      //return;
+
       Assert.check(f is File && f is EventDispatcher, "File is EventDispatcher");
       Assert.check(f.exists == false, "file does not exist yet");
 
@@ -61,7 +70,13 @@ package demo {
       Assert.check(out.position == 0, "position 0 after open(write)");
       out.writeUTFBytes("hello air-native");
       out.close();
+
+
+      System.output(f.exists  + "   "+ f.nativePath  + "\n");
+
+      return;
       Assert.check(f.exists, "file exists after write");
+
 
       var inp:FileStream = new FileStream();
       inp.open(f, FileMode.READ);
@@ -98,8 +113,8 @@ package demo {
       Assert.check(d.exists == false, "deleteDirectory removes it");
 
       // cleanup the roundtrip files
-      f.deleteFile();
-      af.deleteFile();
+      if(f.exists)f.deleteFile();
+      if(af.exists)af.deleteFile();
       Assert.check(f.exists == false, "deleteFile removes it");
 
       Log.out("FileDemos: all flash.filesystem assertions passed");

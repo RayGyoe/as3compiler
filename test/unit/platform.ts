@@ -349,13 +349,21 @@ function checkNativeWindow(): string[] {
     && c.includes('void Stage_set_frameRate(void* _this, double value) { (void)_this; ASC_app_frame_rate = value; }'));
   check('the frame cadence is read from the application rate, not a stage field',
     body('static double ASC_window_on_frame_delay(int id) {').includes('double fr = ASC_app_frame_rate;'));
+  // NOTE: the loop itself no longer dispatches the frame — it runs the shared
+  // sk_pump_frame, and so does the live-resize event watch, which is what makes a
+  // frame during a window drag literally the same frame as a frame here (see
+  // checkWindowFrame / docs/zh-cn/win32.md §2.8). The "ONE application frame"
+  // invariant therefore lives in the pump: one deadline, one on_frame call.
+  const pumpBody = glueBody('static double sk_pump_frame(void) {');
   check('the event loop runs ONE application frame (one deadline, one on_frame call)',
     !glue.includes('double next[SK_MAX_WINDOWS]')
     && glue.includes('static double g_app_next = 0.0;')
-    && count(glueBody('static void sk_run_loop(void) {'), 'on_frame(') === 1
-    && count(glueBody('static void sk_run_loop(void) {'), 'on_frame_delay(') === 1);
+    && count(glueBody('static void sk_run_loop(void) {'), 'sk_pump_frame()') === 1
+    && count(glueBody('static void sk_run_loop(void) {'), 'on_frame(') === 0
+    && count(pumpBody, 'on_frame(') === 1
+    && count(pumpBody, 'on_frame_delay(') === 1);
   check('...and that one frame tick marks every visible window dirty',
-    glueBody('static void sk_run_loop(void) {').includes('if (c->used && !c->destroy_pending && c->visible) c->dirty = 1;'));
+    pumpBody.includes('if (c->used && !c->destroy_pending && c->visible) c->dirty = 1;'));
 
   // (9) EVERY window may composite on the GPU. AIR's NativeWindowRenderMode default
   // is AUTO, and under a GPU-window build (<renderMode>direct</renderMode> =>
@@ -546,6 +554,120 @@ function checkBackendParity(): string[] {
     [...metalDefs, ...d3dDefs].every((n) => gpuSeam.includes(n)));
 
   if (ok > 0) console.log(`[backendparity] ${ok} cross-backend seam checks passed`);
+  return bad;
+}
+
+// Null-receiver member access (阶段九十四·十二). AIR throws TypeError #1009 for a
+// property/method access on null (any static type) and #1006 for a null Function
+// call. adl ground truth: temp/nullprobe/NullMain.as -> adl_null.txt.
+// Windows window backend: the high-DPI latch and the live-resize frame
+// (阶段一百二十七). A window drag/resize runs inside the OS's own modal message
+// loop, entered from within SDL_PumpEvents, so the shared loop is blocked for the
+// whole drag and the ONLY frames that happen are the ones SDL's live-resize event
+// watch drives. Two things must therefore hold, and both are invisible to
+// architecture-dependent code review:
+//
+//   1. the watch must be armed on EVERY window, the main one included — it was
+//      armed only for NativeWindows, so a main-window drag froze completely;
+//   2. the watch must run the loop's own PACED frame for all windows, not a
+//      private unpaced tick of the dragged window (which sped the app's
+//      ENTER_FRAME up to the OS message rate and left every other window frozen).
+//
+// Ground truth, measured under a REAL Windows modal move loop (2.5 s caption
+// drag; temp/dpiprobe/probe8.c enters the loop via WM_NCLBUTTONDOWN/HTCAPTION):
+//   watch before the fix -> loopIters +1, appFrames +1235 (≈494 fps), the other
+//                           window's renders +0 (frozen)
+//   watch after  the fix -> loopIters +1, appFrames +156 (≈62 fps, paced), the
+//                           other window's renders +156
+// The same run shows what feeds the watch on Windows: 235 EXPOSED (SDL's
+// USER_TIMER_MINIMUM live-resize timer, armed in WM_ENTERSIZEMOVE) + 75 MOVED
+// (WM_WINDOWPOSCHANGED, sent on every step of the drag).
+function checkWindowFrame(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [windowframe] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [windowframe] ${label}`); }
+  };
+
+  // 本仓库的 .cc 是 CRLF 检出，正则里只要跨行就必须先归一化换行。
+  const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
+  const stripComments = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const code = stripComments(glue);
+  // 取 name 的**定义体**（跳过同名声明/调用）：找 name( 后配平参数表，紧跟 `{` 的才是定义。
+  const bodyOf = (name: string): string => {
+    for (let i = glue.indexOf(`${name}(`); i >= 0; i = glue.indexOf(`${name}(`, i + 1)) {
+      let j = i + name.length; // at '('
+      let depth = 0;
+      for (; j < glue.length; j++) {
+        if (glue[j] === '(') depth++;
+        else if (glue[j] === ')') { depth--; if (depth === 0) break; }
+      }
+      let k = j + 1;
+      while (k < glue.length && /\s/.test(glue[k])) k++;
+      if (glue[k] !== '{') continue;
+      let d = 0;
+      for (; k < glue.length; k++) {
+        if (glue[k] === '{') d++;
+        else if (glue[k] === '}') { d--; if (d === 0) return glue.slice(i, k + 1); }
+      }
+    }
+    return '';
+  };
+
+  // ---- the high-DPI latch ----
+  // A DPI-unaware process has its whole window bitmap stretched by the compositor
+  // on a scaled monitor, so <requestedDisplayResolution>high changed nothing on
+  // screen. SDL_HINT_WINDOWS_DPI_SCALING=1 is what makes SDL_WINDOW_ALLOW_HIGHDPI
+  // mean anything on Windows (measured: 1000x680 logical -> 1500x1020 physical at
+  // 150% scaling). It must be latched BEFORE the first SDL_Init(SDL_INIT_VIDEO),
+  // which is why every video entry point goes through sk_video_init().
+  check('the Windows DPI-scaling hint is latched inside #ifdef _WIN32 + #ifdef ASC_DISPLAY_HIGH',
+    /#ifdef _WIN32\n#ifdef ASC_DISPLAY_HIGH\n[\s\S]{0,8000}?SDL_SetHint\(SDL_HINT_WINDOWS_DPI_SCALING, "1"\);\n#endif\n#endif/.test(glue));
+  check('...and that is its only occurrence (a standard build stays DPI-unaware)',
+    (glue.match(/SDL_HINT_WINDOWS_DPI_SCALING/g) ?? []).length === 1);
+  check('all video start-up is routed through sk_video_init (so no init can skip the hint)',
+    (code.match(/\bSDL_Init\(SDL_INIT_VIDEO\)/g) ?? []).length === 1 &&
+    bodyOf('sk_video_init').includes('SDL_Init(SDL_INIT_VIDEO)') &&
+    (code.match(/sk_video_init\(\)/g) ?? []).length >= 5);
+
+  // ---- the watch must exist on every window ----
+  // sk_window_create arms it for NativeWindows; the main window is opened by
+  // sk_window_show (CPU) / sk_window_show_metal (macOS GPU) / sk_window_show_gpu
+  // (Windows GPU) and each of those must arm it too. It was missing from the two
+  // GPU ones, so a main-window drag froze its animation entirely.
+  const entries = ['sk_window_show', 'sk_window_show_metal', 'sk_window_show_gpu', 'sk_window_create'];
+  for (const name of entries) {
+    check(`the live-resize watch is armed on the window ${name} opens`,
+      bodyOf(name).includes('SDL_AddEventWatch(live_resize_watch'));
+  }
+  check('...and no path that opens a window is left without one',
+    (glue.match(/SDL_AddEventWatch\(live_resize_watch/g) ?? []).length === entries.length);
+
+  // ---- the watch must run the SHARED frame, not a private per-window tick ----
+  const watch = bodyOf('live_resize_watch');
+  check('the watch runs the shared frame pump', watch.includes('sk_pump_frame();'));
+  check('...and ticks no frame nor presents any window of its own',
+    !/\bon_frame\b/.test(watch) && !/\bon_redraw\b/.test(watch) && !/\bpresent_frame\b/.test(watch));
+  check('the watch accepts every event that arrives DURING a drag (MOVED/RESIZED/EXPOSED)',
+    ['SDL_WINDOWEVENT_SIZE_CHANGED', 'SDL_WINDOWEVENT_RESIZED', 'SDL_WINDOWEVENT_EXPOSED',
+     'SDL_WINDOWEVENT_MOVED'].every((n) => watch.includes(n)));
+
+  // ---- one paced application frame for the whole application ----
+  const pump = bodyOf('sk_pump_frame');
+  check('the application frame is dispatched from exactly one place',
+    (code.match(/on_frame\(/g) ?? []).length === 1 && pump.includes('on_frame(clock)'));
+  check('the loop and the watch run that same pump',
+    bodyOf('sk_run_loop').includes('sk_pump_frame()') && watch.includes('sk_pump_frame()'));
+  check('the pump paces against the shared deadline (a drag cannot out-run frameRate)',
+    pump.includes('if (t >= g_app_next)'));
+  check('a new frame dirties every visible window (hidden/dying ones excluded)',
+    pump.includes('if (c->used && !c->destroy_pending && c->visible) c->dirty = 1;'));
+  check('the pump is re-entrancy guarded (its callbacks run real AS3)',
+    pump.includes('if (in_pump) return g_app_next;'));
+
+  if (ok > 0) console.log(`[windowframe] ${ok} window-frame checks passed`);
   return bad;
 }
 
@@ -759,5 +881,6 @@ registerGroup('unit: platform/AudioWiring', checkAudioWiring);
 registerGroup('unit: platform/Screen', checkScreen);
 registerGroup('unit: platform/NativeWindow', checkNativeWindow);
 registerGroup('unit: platform/BackendParity', checkBackendParity);
+registerGroup('unit: platform/WindowFrame', checkWindowFrame);
 registerGroup('unit: platform/NullRef', checkNullRef);
 registerGroup('unit: platform/Intervals', checkIntervals);

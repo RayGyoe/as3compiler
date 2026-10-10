@@ -238,6 +238,11 @@ export const C_RESERVED = new Set<string>([
   'int', 'long', 'register', 'restrict', 'return', 'short', 'signed', 'sizeof',
   'static', 'struct', 'switch', 'typedef', 'union', 'unsigned', 'void',
   'volatile', 'while', '_Bool', '_Complex', '_Imaginary', 'asm', 'typeof', 'main',
+  // Leading-underscore keyword aliases: MSVC also recognises `_restrict`, and both
+  // GCC/Clang/MSVC recognise `__restrict` — so `restrict` (TextField.restrict) must
+  // keep gaining underscores past both (→ `___restrict`) to be a valid field name
+  // on every platform, not just on GCC/Clang where `_restrict` happens to be legal.
+  '_restrict', '__restrict',
   // type names / macros
   'NULL', 'NAN', 'INFINITY', 'bool', 'true', 'false', 'unix', 'linux',
   // stdio

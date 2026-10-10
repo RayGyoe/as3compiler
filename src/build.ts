@@ -8,8 +8,8 @@
 // targeting*, not optimization or machine-code generation.
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, existsSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
+import { readFileSync, existsSync, copyFileSync } from 'node:fs';
+import { resolve, dirname, join } from 'node:path';
 
 export type Target = 'native' | 'wasm';
 
@@ -128,6 +128,11 @@ export interface BuildConfig {
   displayName: string;       // human-readable app name (fills CFBundleName)
   icon: string | null;       // .icns path (fills CFBundleIconFile); null = none
   deploymentTarget: string;  // macOS minimum version (fills LSMinimumSystemVersion)
+  // AIR <architecture> bit width ("32" | "64" | ""), carried by --air-app. On a
+  // Windows native build this is what selects the MSVC target triple (i686 vs
+  // x86_64); it is inert on macOS/wasm. Empty for non-AIR builds (let clang pick
+  // its host default).
+  architecture: string;
   dry: boolean;
 }
 
@@ -158,6 +163,7 @@ export function defaultBuildConfig(): BuildConfig {
     displayName: '',
     icon: null,
     deploymentTarget: '12.0',
+    architecture: '',
     dry: false,
   };
 }
@@ -192,6 +198,7 @@ interface ManifestFields {
   'display-name'?: string;
   icon?: string;
   'deployment-target'?: string;
+  architecture?: string;
 }
 
 // A per-target overlay block. `target`/`package` are deliberately excluded: the
@@ -284,6 +291,7 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m['display-name']) next.displayName = m['display-name'];
   if (m.icon) next.icon = resolveFromManifest(manifestPath, m.icon);
   if (m['deployment-target']) next.deploymentTarget = m['deployment-target'];
+  if (m.architecture) next.architecture = m.architecture;
   return next;
 }
 
@@ -540,6 +548,59 @@ export function effectiveDefines(cfg: BuildConfig): string[] {
   return [...cfg.defines, ...featureDefines(cfg.features)];
 }
 
+// The MSVC target triple for a Windows native build. clang on Windows must name
+// the ABI explicitly: the archives build-windows-deps.ps1 produces are MSVC-ABI,
+// and an AIR app whose <architecture> is "32" needs the i686 triple on every
+// compile AND link step — otherwise clang emits x86_64 objects that cannot link
+// against the windows-x86 archives. The triple is spelled out for "64" too so the
+// MSVC ABI (not a stray MinGW default) is pinned, and it is inert on non-Windows
+// hosts and non-native targets.
+function windowsTargetTriple(architecture: string): string {
+  return architecture === '32' ? 'i686-pc-windows-msvc' : 'x86_64-pc-windows-msvc';
+}
+
+// Extra flags every native step (C compile, C++ compile, link) needs on Windows
+// so all three drivers agree on the same ABI; empty elsewhere and for non-AIR
+// builds (architecture === ''), which keep clang's host default.
+function nativeTargetFlags(cfg: BuildConfig): string[] {
+  if (process.platform !== 'win32' || cfg.target !== 'native') return [];
+  if (cfg.architecture !== '32' && cfg.architecture !== '64') return [];
+  // Static CRT (/MT). The archives build-windows-deps.ps1 ships are all /MT
+  // (Skia's is_official_build, SDL2's CMakeLists, and the curl/nghttp2/zlib stack
+  // via -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded / nghttp2 -DENABLE_STATIC_CRT).
+  // clang's default for an MSVC triple is the *dynamic* CRT (/MD): it compiles
+  // every std call as __declspec(dllimport) (__imp_foo) and links msvcrt.lib +
+  // ucrt.lib. Mixing that with /MT archives leaves __except_handler4_common and
+  // __imp__wassert undefined. -fms-runtime-lib=static flips both compile (defines
+  // _MT instead of _DLL) and link (libcmt.lib + libucrt.lib instead of the import
+  // libs) to the static side, matching the archives.
+  return [`--target=${windowsTargetTriple(cfg.architecture)}`, '-fms-runtime-lib=static'];
+}
+
+// Skia's SkParagraph/SkUnicode (text shaping) needs the ICU data file
+// `icudtl.dat` at runtime. On Windows the native build is a static exe with no
+// DLL directory to fall back to, so SkLoadICU() (third_party/icu/SkLoadICU.cpp)
+// looks for icudtl.dat *beside the executable*. Without it the first text-shaping
+// call crashes with SIGILL: SkParagraph::Cluster::Cluster reads an out-of-bounds
+// index into the empty grapheme-property table and SK_ABORT()s to a `ud2` trap.
+// `build-windows-deps.ps1` already copies icudtl.dat next to the skia .lib; here
+// we mirror it next to the freshly linked exe (SkLoadICU only probes the exe and
+// library directories, so shipping it beside the .lib is not enough). Returns
+// true when a copy happened.
+export function deploySkiaIcuData(cfg: BuildConfig, outPath: string): boolean {
+  if (process.platform !== 'win32' || cfg.target !== 'native') return false;
+  if (cfg.architecture !== '32' && cfg.architecture !== '64') return false;
+  if (!cfg.linkLibs.includes('skia')) return false;
+  for (const p of cfg.linkPaths) {
+    const src = join(p, 'icudtl.dat');
+    if (existsSync(src)) {
+      copyFileSync(src, join(dirname(resolve(outPath)), 'icudtl.dat'));
+      return true;
+    }
+  }
+  return false;
+}
+
 // Build the full argv for the C compiler. Pure data -> string[] so the caller
 // can print it (--dry) or run it.
 export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: string): string[] {
@@ -591,7 +652,7 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
     for (const f of wasmStripFlags(cfg)) args.push(f);
     args.push('-o', outPath);
   } else {
-    args.push(cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg));
+    args.push(...nativeTargetFlags(cfg), cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg));
     for (const l of posixLinkLibs()) args.push(l);
     for (const l of platformLinkLibs()) args.push('-l', l);
     args.push('-o', outPath);
@@ -677,7 +738,7 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
   // wasm-ld with "unknown file type" (stage 89-32). The web path now suffixes
   // `.wasm.o` (see buildWebCompileSteps) so both sets coexist.
   const objOf = (src: string): string => src.replace(/\.[^.]+$/, '.o');
-  const compileCommon: string[] = [cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
+  const compileCommon: string[] = [...nativeTargetFlags(cfg), cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const d of effectiveDefines(cfg)) compileCommon.push('-D', d);
   for (const p of cfg.includePaths) compileCommon.push('-I', p);
 
@@ -693,7 +754,7 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
     steps.push([cxx, '-c', '-std=c++17', ...compileCommon, f, '-o', objOf(f)]);
   }
   // 3) link everything with the C++ driver (pulls in libstdc++).
-  const linkArgs: string[] = [cxx, cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg), '-o', outPath];
+  const linkArgs: string[] = [cxx, ...nativeTargetFlags(cfg), cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg), '-o', outPath];
   for (const f of cFiles) linkArgs.push(objOf(f));
   for (const f of cppFiles) linkArgs.push(objOf(f));
   for (const o of cfg.objects) linkArgs.push(o);
@@ -761,6 +822,18 @@ export function runCompile(argv: string[], extraEnv?: Record<string, string>): b
   const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
   const res = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', env });
   if (res.stderr) process.stderr.write(res.stderr);
+  if (res.error) {
+    const code = (res.error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      process.stderr.write(
+        `compiler not found: '${argv[0]}' is not on PATH.\n` +
+        `Install the toolchain (or add its bin directory to PATH) and retry.\n`,
+      );
+    } else {
+      process.stderr.write(`failed to run '${argv[0]}': ${res.error.message}\n`);
+    }
+    return false;
+  }
   if (res.status !== 0) {
     if (!res.stderr) process.stderr.write(`compilation failed: ${argv.join(' ')}\n`);
     return false;

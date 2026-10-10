@@ -49,6 +49,11 @@
 
 结论：**缺口集中在「3D GPU 资源 + 状态机 + AGAL」这一整块**，而非散点补齐。
 
+> **本表是立项时的快照**（阶段 79 之前）：上面那些 ❌ 项**已陆续落地**——`Vector3D`/`Matrix3D`、
+> `Stage3D`/`Context3D` 状态机、AGAL 翻译器（三档 MSL/GLSL/**HLSL**）、baked 的 GPU 三角形管线
+> （native **Metal** / web **WebGL2** / Windows **Direct3D 12**）。**现状以 §9（纹理/采样器/程序缓存/状态对象）
+> 与 §10（Windows D3D12 后端）为准**，各阶段逐条见 `TODO.md`。
+
 ---
 
 ## 3. 核心技术难点：AGAL 翻译（唯一真正「难」的点）
@@ -467,7 +472,90 @@ Stage3D 构建（链 `stage3d_glue` 而不链 `metal_glue`）会链接失败；�
 `dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")` 惰性查找（函数指针缓存，取不到用自有队列），
 普通清单即可链接。钉子在 `stage3d/gpu-queue-sharing`。
 
-## 10. 参考链接
+## 10. Windows / Direct3D 12 后端（阶段一百三十二 落地）
+
+第三份后端 `vendor/stage3d_d3d.cc`（~2,290 行）与 `stage3d_glue.mm`（Metal）/**结构同形**：同一套 `s3d_*` ABI、
+同一个「帧边界批量提交」模型、同一套语义取舍（§9.1–§9.13 的每一条都逐条移植），只是把 Metal 对象换成 D3D12 对象。
+它消费的是阶段一百三十一 的 **AGAL → HLSL** 翻译器（`ASC_S3D_HLSL` ⇒ `target 2`），构建期接线见
+`docs/zh-cn/win32.md` §3.4。下面只记**与 Metal 不同、或 D3D12 特有**的口径。
+
+### 10.1 提交模型：三缓冲槽位 + 延迟释放队列
+
+Metal 的 `MTLCommandBuffer` 天然是「提交即对象化」，D3D12 那边一切都要自己管：
+
+- **每条批一条命令列表**（`s3d_batch_begin` → draw… → `s3d_batch_end`），`Close()` 后
+  `ExecuteCommandLists(1, …)`。**帧边界**（`s3d_flush_async`）只提交当前批，不等待（与 §9.9 同口径）。
+- **三缓冲帧槽**（`S3D_FRAMES_IN_FLIGHT = 3`）：`c->slot` 指名**下一批**用哪个槽；`s3d_batch_begin` 先
+  `s3d_wait_slot(idx)` 等该槽的 fence 值走完、再 `Reset` 该槽的命令分配器；`s3d_batch_end` 信号
+  `fenceValues[idx] = ++fenceNext` 并推进槽号。每槽各有一份上传堆（UPLOAD heap），故三帧并行时 CPU
+  写常量缓冲不会触发为上一帧缓冲区已在使用中。
+- **常量缓冲每帧槽一份**（256 对齐、可增长、`S3D_CB_BYTES = 16384`），但 **CPU `memcpy` 前必须先
+  `s3d_wait_slot`** ——否则 CPU 可能写一块正被 GPU 读的 UPLOAD 内存（实测踩过，表现为常量"跳一帧"）。
+- **延迟释放队列**（`S3DRelease rel[4096]`，每条带一个 fence 值；`s3d_defer_release` 按
+  `fence->GetCompletedValue()` 排空）——D3D12 没有"命令缓冲释放时自动降引用"这回事，任何换掉的
+  资源都必须等其最后一帧真的跑完再 `Release()`。
+- **描述符堆**：CBV_SRV_UAV 按帧槽一个大 arena（`S3D_DESCS_PER_FRAME = 512*8`）、RTV（64）、DSV（16）。
+  **采样器堆另算**：一开始想做"每帧一个采样器 arena"，但 D3D12 的采样器堆**上限 2048 个描述符**
+  （`12288` 直接 `E_INVALIDARG`）；改为**按采样器状态向量缓存不可变块**（`S3D_MAX_SMPLCFG 256` × `S3D_MAX_TEX`），
+  同一组 STATE 重复命中，故实际占用是个位数块。
+
+### 10.2 PSO 缓存：键是**整个绘制状态**
+
+D3D12 没有 Metal 那种"随时能改状态"的 encoder，`ID3D12PipelineState` 是**不可变**的，一切可绘状态都必须
+烘进 PSO。故缓存键是所有影响管线的字段的拼接（`srcHash|writeMask|depthWrite|depthCompare|stencil*|dsNeeded|cullMode|blendOn|streamSig`），
+每条程序最多 `S3D_MAX_PSOVAR = 16` 个变体、全局 `S3D_KEY_CAP 256`、LRU 淘汰。这比 Metal 侧（§9.13 的 DSS 缓存）
+更硬：`SetPipelineState` 是纯指针绑定，但**建 PSO 很贵**（需编译 vs_5_1/ps_5_1 字节码）。
+
+### 10.3 一个只能实测发现的 D3D12 链接规则：**字段声明顺序即寄存器号**
+
+HLSL 的 `VSOut` 里 `varyingN : TEXCOORDN` 必须排在 `position : SV_Position` **之前**。fxc 按**声明顺序**给
+stage 结构体编号，D3D12 的 VS→PS 匹配同时看语义名+索引**和该寄存器号**；`SV_Position` 放第一位时，
+VS 侧的 `TEXCOORD0` 在 reg 1、PS 侧的 `TEXCOORD0` 在 reg 0 ⇒
+`CreateGraphicsPipelineState` 报「Signatures between stages are incompatible」。MSL/GLSL 对字段顺序不敏感，
+故**只有 HLSL 档**需要这条（钉子：`stage3d/agal-hlsl` 的「HLSL declares the varyings before SV_Position」）。
+同族的两个 D3D12 陷阱：① 输入布局的 `SemanticName` 必须是**裸名**（`"TEXCOORD"`）而索引放 `SemanticIndex`——
+写成 `"TEXCOORD0"` 会 `E_INVALIDARG`；② `D3D12_RASTERIZER_DESC` **没有** `ScissorEnable`（与 D3D11 不同），
+关闭的剪刀在 draw 时展开成整目标矩形并按目标边界夹取。
+
+### 10.4 合成（把 3D 的帧交给 Skia 画到窗口里）
+
+- `s3d_get_render_target` 返回**裸 `ID3D12Resource*`**（不是 `S3DTexture*`），因为它唯一的消费者是
+  `vendor/d3d_glue.cc` 的 `sk_gpu_draw_texture`。合成**借用**该资源：所有权仍在 Stage3D 上下文，
+  合成只在自己那次调用里临时多拿一份引用。
+- **这里的"借用"是 D3D 后端最深的陷阱**：Skia 的 D3D 后端**没有** Borrow/Adopt 的概念，
+  `GrD3DTextureResourceInfo::fResource` 是 `gr_cp<ID3D12Resource>`，而它的**裸指针形构造器是"接管"
+  （不 AddRef）而析构会 Release**。把自己唯一的那份引用递进去 = 送出所有权（细节、症状与正确写法见
+  `docs/zh-cn/win32.md` §2.9）。合成与 swapchain back buffer 两处包装点都已改用 `fResource.retain(...)`。
+- 后端用**同一条** `ID3D12Device`/命令队列（§3.4 of `win32.md`），故 `sk_gpu_draw_texture` 不需要任何
+  CPU 侧等待；但**优先级**仍是 "Stage3D 的批已提交、提交序在合成之前"。
+- 目标必须是 `R8G8B8A8`/`BGRA8` 且非多重采样，否则**响亮拒绝**且不画（`unsupported render target ...`，
+  只打一次）。
+
+### 10.5 验收（已做）与**未验收**（不静默）
+
+**已做（2026-10-10 本机 x86 `--air-app`）**：
+
+- `examples/shmup-stage3d`（1000x600、`renderMode=direct`、`depthAndStencil=true`、`requestedDisplayResolution=high`）
+  **开窗、跑到 281 帧 / 5 s（~56 fps）**，逐帧 `get_render_target` 都拿到 `desc(dim=3 fmt=87 1000x600)`、
+  每次 `draw_texture` 都被接受，**零** `unsupported render target`；fence 单调推进。
+- **客观像素证据**：`ASC_GPU_DUMP=<路径> ASC_GPU_DUMP_AT=40` 导出的 **presented back buffer**
+  （1500x900 BMP，4,050,054 B）里能看到 demo 的 **Stage3D 精灵**（spritesheet 分块在右上、HiDPI 缩放）。
+  ——**判定 Stage3D 是否上屏只能靠这个 dump，不能靠屏幕截图**：flip-model swapchain 的内容取不到
+  GDI/BitBlt（截到的是陈旧/全黑）。
+- 开发期的脚手架（`s3d_watch` 一族生命周期探针）**已从产品代码移除**；`get_render_target` 的诊断行保留
+  但改成**周期性**（`n++ % 120 == 0`），正是它把上面那个悬空指针的根因印了出来。
+
+**未验收（不得宣称更大范围）**：
+
+- `examples/air-starling-demo` **尚未在 Windows 目标上跑过** —— 它是外部依赖面最广的 Stage3D 工程
+  （127 个源文件 + 完整 Starling），是本后端是否真的通用的**关键对照**。
+- **背面剔除/绕序**：`FrontCounterClockwise = FALSE` + 正高度 viewport（不 Y 翻转）是**纸面推论**
+  （与 §关于 D3D 也是行 0 在顶一致），未做剔除的 A/B 实测。同理：DXGI **调试层**本轮未开（PSO 的
+  `E_INVALIDARG` 靠 `temp/psoprobe.cc` 的 InfoQueue 戳出来的，产品路径未开）。
+- **Mip-drop / 透明混合 / 立方体贴图**这些语义已按 §9 逐条移植且有文本级钉子，但**未在 D3D12 上单独复测**
+  （`shmup-stage3d` 只覆盖了 2D 精灵 + 混合 + 深度关闭的一小部分组合）。
+
+## 11. 参考链接
 
 - AIR SDK 参考（`flash.display3D` 包）：<https://airsdk.dev/reference/actionscript/3.0/flash/display3D/package-detail.html>
 - AIR SDK 参考（`Context3D`）：<https://airsdk.dev/reference/actionscript/3.0/flash/display3D/Context3D.html>

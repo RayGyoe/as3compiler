@@ -55,6 +55,12 @@ The full API surface (one more layer of dependencies than the 19 classes listed 
 Conclusion: **the gap is concentrated in the whole block "3D GPU resources + state machine + AGAL"**, not
 scattered point-filling.
 
+> **This table is a snapshot from project inception** (before stage 79): the ❌ items above have since landed —
+> `Vector3D`/`Matrix3D`, the `Stage3D`/`Context3D` state machine, the AGAL translator (three targets
+> MSL/GLSL/**HLSL**) and the real GPU triangle pipeline (native **Metal** / web **WebGL2** / Windows
+> **Direct3D 12**). **Current state is §9 (textures/samplers/program cache/state objects) and §10 (the Windows
+> D3D12 backend)**; the per-stage details are in `TODO.md`.
+
 ---
 
 ## 3. The Core Technical Difficulty: AGAL Translation (the only genuinely "hard" point)
@@ -547,7 +553,48 @@ one-hundred-twenty-eight changed it to a lazy `dlsym(RTLD_DEFAULT, "sk_mtl_share
 function pointer, falling back to its own queue if unavailable), so an ordinary manifest links. The nail is
 `stage3d/gpu-queue-sharing`.
 
-## 10. Reference Links
+## 10. The Windows / Direct3D 12 Backend (landed, stage one-hundred-thirty-two)
+
+The third backend, `vendor/stage3d_d3d.cc` (~2,290 lines), is **structurally isomorphic** to
+`stage3d_glue.mm` (the same `s3d_*` ABI, the same frame-boundary batch submission model, the same semantic
+trade-offs as §9.1–§9.13 one by one) with Metal objects swapped for D3D12 ones. It consumes stage
+one-hundred-thirty-one's **AGAL → HLSL** translator target (`ASC_S3D_HLSL` ⇒ `target 2`); the build-time wiring
+is in [`win32.md`](win32.md) §3.4. Only the D3D12-specific points are recorded here.
+
+**Submission model**: one command list per batch; the frame boundary only submits (no wait, as in §9.9).
+A three-deep frame slot ring plus a **deferred-release queue** keyed on fence values — D3D12 has no "command
+buffer releases its references on completion", so every replaced resource must wait for the frame that last used
+it. Constant buffers live in a per-frame-slot UPLOAD heap, but the CPU `memcpy` **must** wait for the slot first
+(measured: without it, constants "skip a frame"). Sampler descriptors are cached as immutable blocks per
+distinct sampler-state vector, because a D3D12 sampler heap has a **2048-descriptor cap** (a per-frame arena of
+12288 fails with `E_INVALIDARG`).
+
+**PSO cache keyed on the whole draw state**: `ID3D12PipelineState` is immutable and every drawing state must be
+baked into it (≤16 variants per program, 256 keys global, LRU). Building a PSO is expensive (it compiles
+`vs_5_1`/`ps_5_1` bytecode), far more so than the Metal-side DSS cache of §9.13.
+
+**A D3D12 linkage rule only measurement could teach**: in HLSL, `varyingN : TEXCOORDN` must be declared
+**before** `position : SV_Position`. fxc numbers a stage struct's registers in declaration order and D3D12 matches
+VS output to PS input by semantic *and* register number, so `SV_Position` first put VS's `TEXCOORD0` at register 1
+against PS's register 0 ⇒ `CreateGraphicsPipelineState` reports "Signatures between stages are incompatible".
+MSL/GLSL are order-insensitive (nails: `stage3d/agal-hlsl`). Two sibling D3D12 traps: the input layout's
+`SemanticName` must be the bare `"TEXCOORD"` with the index in `SemanticIndex`, and `D3D12_RASTERIZER_DESC` has
+**no** `ScissorEnable` (unlike D3D11).
+
+**Compositing**: `s3d_get_render_target` returns the raw `ID3D12Resource*`; the composite *borrows* it (the
+Stage3D context keeps ownership). This borrow is the deepest trap in the whole backend: Skia's D3D backend has
+no Borrow/Adopt notion, and `GrD3DTextureResourceInfo::fResource` is a `gr_cp` whose **bare-pointer constructor
+adopts without ref'ing** while its destructor `Release()`s — handing over your only reference silently loses the
+render target (see [`win32.md`](win32.md) §2.9 for the measured frame-2 `dxgi format 0` symptom). Both wrap sites
+now use `fResource.retain(...)`.
+
+**Accepted / not accepted**: `examples/shmup-stage3d` reached 281 frames / 5 s (~56 fps) on D3D12 with zero PSO
+or compositing errors, and the presented back buffer exported through `ASC_GPU_DUMP` contains the demo's Stage3D
+sprites (the only valid check — a flip-model swapchain cannot be captured by GDI/BitBlt). **Not** accepted:
+`examples/air-starling-demo` has not been run on the Windows target; the culling state/winding order is a paper
+decision with no A/B measurement; the DXGI debug layer is off in the product path.
+
+## 11. Reference Links
 
 - AIR SDK reference (`flash.display3D` package): <https://airsdk.dev/reference/actionscript/3.0/flash/display3D/package-detail.html>
 - AIR SDK reference (`Context3D`): <https://airsdk.dev/reference/actionscript/3.0/flash/display3D/Context3D.html>

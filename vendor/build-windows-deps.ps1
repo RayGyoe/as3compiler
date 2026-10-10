@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   在 Windows 上把 as3compiler 所需的本地依赖库（Skia / SDL2 / curl）从源码编译出来，
   产物直接落到 as3compiler/vendor/<pkg>/ 里 —— **x64 与 x86（win32）两套**，
@@ -51,6 +51,24 @@
     补丁**（仅当 clang_win 非空时跳过 env_setup，cl.exe 路径一字不改），并打印改了什么。这是
     「上游不受支持」的地带，所以构建后脚本会**核对产物真实位宽**（dumpbin / llvm-readobj），
     对不上就报错，而不是让一份 x64 的 .lib 冒充 x86 静默出货。
+
+  Windows 上的已知障碍（脚本自动处理并响亮报明）：
+    * Windows 自带的 tar.exe（bsdtar）在未开「开发者模式」/无「创建符号链接」特权时解不了 tarball
+      里的符号链接，而 SDL2 的发布包里正好有两条（android-project-ant/{src,AndroidManifest.xml}，
+      指向 android-project 里同一份源码，是给已废弃的 Ant 版 Android 工程模板用的，与 Windows
+      构建无关）→ 整个解包被判失败。脚本只对“这种 Can't create 失败”自愈：排除这些条目重解一次，
+      并把跳过的条目逐条列出；其它任何解包错误一律原样响亮抛错。
+    * LLVM 23 起 clang 的 resource dir **只用主版本号**（lib/clang/23，不再是 X.Y.Z），而 Skia m124
+      的 gn/highest_version_dir.py 正则写死 X.Y.Z，扫不到就 IndexError 把 gn gen 整个搞挂 —— 脚本
+      自己算出 clang_win_version 写进 args.gn，绕开那个脆弱探测。
+    * clang 23 删除了裸 builtin __builtin_ia32_vcvtph2ps256，而 m124 自带的 skcms 正用它做
+      f16->f32 的 AVX2 快速路径 —— 脚本照抄上游 skcms 的最小修法（_Float16 +
+      __builtin_convertvector）打补丁，不降级、不失速。
+    * dng_sdk 的 dng_pthread.cpp 用 std::auto_ptr，而 MSVC STL 在 /std:c++17 下把它移除了
+      （yvals_core.h: _HAS_AUTO_PTR_ETC = !_HAS_CXX17）—— Windows + MSVC STL 独有的必然失败，
+      与 clang 版本无关。脚本只给 dng_sdk 这一个 target 加 _HAS_AUTO_PTR_ETC=1，Adobe 源码一字不改。
+    * Skia 自己的 GrD3DUtil.h 声明 std::wstring/std::string 却没 include <string>，同样依赖了
+      MSVC STL 旧版的间接包含 —— 脚本补一行显式 include。
 
 .NOTES
   所有版本 pin 死，且与 build-tools/ 里既有的 macOS/wasm 构建同源，避免「头文件配另一份实现」的
@@ -110,7 +128,6 @@ $AsDir    = Split-Path $Vendor -Parent            # .../as3compiler
 $RepoRoot = Split-Path $AsDir -Parent             # .../as3compiler-aot
 $BuildTools = Join-Path $RepoRoot 'build-tools'
 $DlDir      = Join-Path $BuildTools 'win-deps-dl'      # 源码压缩包 + 解包
-$ShimDir    = Join-Path $BuildTools 'win-deps-shim'    # python/python3 名字垫片
 
 $script:NinjaExe = $null
 
@@ -186,29 +203,101 @@ $NeedCmake = ($Want -contains 'sdl2') -or ($Want -contains 'curl')
 $NeedGit   = ($Want -contains 'skia')
 $NeedTar   = $NeedCmake
 
-$PythonExe = Find-Exe 'python3'
-if (-not $PythonExe) { $PythonExe = Find-Exe 'python' }
-if (-not $PythonExe) {
-  Fail '找不到 python（需要 Python 3）。安装：https://www.python.org/downloads/windows/（勾 Add python.exe to PATH）'
+# Windows 上的 `python` 常常不是真解释器，而是商店的「应用执行别名」
+# （C:\...\WindowsApps\python.exe，0 字节的 ReparsePoint）：Copy-Item 它会直接抛
+# "The file cannot be accessed by the system."（实测）。而且**不能**把解释器单独拷到别处做垫片 ——
+# python.exe 依赖同目录的 pythonXX.dll 与 Lib\，单独拷一份一启动就哑火（实测无任何输出）。
+# 正确做法：定位真解释器**自己的目录**（home = 同时有 python.exe 与 pythonXY.dll），把它放到
+# PATH 最前；缺哪个名字就在**该目录内部**补 —— 同目录才有 DLL，拷/链到别处都不可用。
+function Test-PythonHome([string]$dir) {
+  if (-not $dir -or -not (Test-Path $dir)) { return $false }
+  $exe = Join-Path $dir 'python.exe'
+  if (-not (Test-Path $exe)) { return $false }
+  # 真解释器目录必带 pythonXY.dll；商店别名目录没有，单独拷贝出来的 exe 也缺。
+  $hasDll = [bool](@(Get-ChildItem -Path $dir -Filter 'python3*.dll' -File -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -match '^python3\d+\.dll$' }).Count)
+  if (-not $hasDll) { return $false }
+  # 光有文件还不够：商店版 Python 的**包目录**（C:\Program Files\WindowsApps\PythonSoftware...）
+  # 同样含 python.exe + python3X.dll，但 ACL 受限，**直接执行会 Access denied**（只有商店别名桩能
+  # 拉起它）。而 gn / fetch-gn / git-sync-deps 要的是一个能直接跑的 exe，故此处必须真跑一次确认，
+  # 否则会选到一个「看着像真 home、实则跑不起来」的目录，等到 Skia 那步才炸。
+  try {
+    & $exe -c 'import sys' 1>$null 2>$null
+  } catch { return $false }
+  return ((Get-ExitCode) -eq 0)
 }
+
+function Resolve-PythonHome {
+  $cands = @()
+  # 0) 显式覆盖
+  if ($env:ASC_PYTHON_HOME) { $cands += $env:ASC_PYTHON_HOME }
+  # 1) PATH 上解析到的 python 所在目录（若非商店别名，常常就是真 home）
+  # 2) 直接问能跑的 python 要 sys.prefix（商店版也能答，且答出的是真 home）
+  foreach ($n in @('python3', 'python')) {
+    $p = Find-Exe $n
+    if (-not $p) { continue }
+    $cands += (Split-Path $p -Parent)
+    $prefix = (& $p '-c' 'import sys;print(sys.prefix)' 2>$null | Select-Object -Last 1)
+    if ($prefix) { $cands += ('' + $prefix).Trim() }
+  }
+  # 3) pyenv-win 的版本目录（自带 python.exe + python3.exe + pythonXY.dll，且可写）
+  $pyenvRoot = if ($env:PYENV_ROOT) { $env:PYENV_ROOT } else { Join-Path $env:USERPROFILE '.pyenv\pyenv-win' }
+  $cands += @(Get-ChildItem -Path (Join-Path $pyenvRoot 'versions') -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending | ForEach-Object { $_.FullName })
+  # 4) 常见布局：python.org 安装器 / scoop / 盘根目录
+  if ($env:LOCALAPPDATA) {
+    $cands += @(Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs\Python') -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName })
+  }
+  foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, 'C:\')) {
+    if (-not $base) { continue }
+    $cands += @(Get-ChildItem -Path $base -Filter 'Python3*' -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName })
+  }
+  if ($env:USERPROFILE) {
+    $cands += @(Get-ChildItem -Path (Join-Path $env:USERPROFILE 'scoop\apps') -Filter 'python*' -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName 'current' })
+  }
+  foreach ($c in $cands) {
+    if (Test-PythonHome $c) { return (Resolve-Path $c).Path }
+  }
+  return $null
+}
+
+$PythonHome = Resolve-PythonHome
+if (-not $PythonHome) {
+  Fail '找不到可用的 Python 3 解释器（需真解释器目录，即同时含 python.exe 与 pythonXY.dll，且该 python.exe 能被直接执行）。安装：https://www.python.org/downloads/windows/（勾 Add python.exe to PATH），或用环境变量 ASC_PYTHON_HOME 直接指定解释器所在目录。'
+}
+$PythonExe = Join-Path $PythonHome 'python.exe'
 Write-Ok "python -> $PythonExe"
 
 # Skia 的 gn 在生成阶段会用 exec_script 调 python；不同版本的 gn 认的名字不一样（python 或 python3）。
-# 这里做一个同时提供两个名字的垫片目录放到 PATH 最前面，把「名字对不上」这类坑一次性抹掉。
-New-Item -ItemType Directory -Force -Path $ShimDir | Out-Null
-foreach ($n in @('python.exe', 'python3.exe')) {
-  $t = Join-Path $ShimDir $n
-  if (-not (Test-Path $t)) { Copy-Item $PythonExe $t -Force }
+# 真 home 通常两个名字都有（python.org 3.10+ / pyenv 都有）；缺哪个就在 home 内部补一个，
+# 这样 gn 按名找不到时也能落到同一个真解释器上。
+foreach ($n in @('python3.exe', 'python.exe')) {
+  $t = Join-Path $PythonHome $n
+  if (Test-Path $t) { continue }
+  try {
+    New-Item -ItemType HardLink -Path $t -Target $PythonExe -ErrorAction Stop | Out-Null
+    Write-Info "已在 python home 内补 $n（硬链接）"
+  } catch {
+    try {
+      Copy-Item $PythonExe $t -Force -ErrorAction Stop
+      Write-Info "已在 python home 内补 $n（拷贝）"
+    } catch {
+      Write-Note "无法在 $PythonHome 内补 $n（目录只读？）：$($_.Exception.Message)"
+    }
+  }
 }
-$env:PATH = "$ShimDir;$env:PATH"
-Write-Ok "python 垫片就绪：$ShimDir"
+$env:PATH = "$PythonHome;$env:PATH"
+Write-Ok "python home 已置于 PATH 最前：$PythonHome"
 
 $GitExe = $null
 if ($NeedGit) { $GitExe = Require-Exe 'git' '安装 Git for Windows：https://git-scm.com/download/win' }
 $TarExe = $null
 if ($NeedTar) { $TarExe = Require-Exe 'tar' 'Windows 10+ 自带 tar.exe；缺失时可从 Git 安装目录的 usr\bin 复制。' }
+# cmake 的定位放在「MSVC 环境」之后 —— 要借用 $vsPath 才能发现 Visual Studio 自带的那一份 CMake。
 $CmakeExe = $null
-if ($NeedCmake) { $CmakeExe = Require-Exe 'cmake' '安装 CMake 并加入 PATH：https://cmake.org/download/' }
 
 # ---------------------------------------------------------------- 3. MSVC 环境
 # clang-cl 用 MSVC 前端语义，需要 MSVC 的头/库与 Windows SDK；gn 的 win toolchain 也需要
@@ -232,6 +321,31 @@ if (-not $vsPath) { Fail 'vswhere 没找到带 VC++ x86/x64 工具集的 VS。�
 $vsPath = $vsPath.Trim()
 Write-Info "VS 安装路径：$vsPath"
 
+# ---- CMake：优先 PATH，其次 VS 自带的 CMake（「使用 C++ 的桌面开发」工作负载会带一份），
+# 再次各家安装器的默认目录。之前只查 PATH，而「CMake 装好了却没进 PATH」是很常见的情形。
+function Resolve-Cmake {
+  $c = Find-Exe 'cmake'
+  if ($c) { return $c }
+  $cands = @()
+  if ($vsPath) { $cands += (Join-Path $vsPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe') }
+  if ($env:ProgramFiles) { $cands += (Join-Path $env:ProgramFiles 'CMake\bin\cmake.exe') }
+  if (${env:ProgramFiles(x86)}) { $cands += (Join-Path ${env:ProgramFiles(x86)} 'CMake\bin\cmake.exe') }
+  if ($env:LOCALAPPDATA) { $cands += (Join-Path $env:LOCALAPPDATA 'Programs\CMake\bin\cmake.exe') }
+  if ($env:USERPROFILE) {
+    $cands += @(Get-ChildItem -Path (Join-Path $env:USERPROFILE 'scoop\apps\cmake') -Recurse -Filter 'cmake.exe' -File -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName })
+  }
+  foreach ($x in $cands) { if ($x -and (Test-Path $x)) { return (Resolve-Path $x).Path } }
+  return $null
+}
+
+if ($NeedCmake) {
+  $CmakeExe = Resolve-Cmake
+  if (-not $CmakeExe) {
+    Fail '找不到 cmake。安装 CMake 并加入 PATH：https://cmake.org/download/（或装 Visual Studio 的「使用 C++ 的桌面开发」工作负载，它自带一份 CMake）。'
+  }
+  Write-Ok "cmake -> $CmakeExe"
+}
 $vcvarsall = Join-Path $vsPath 'VC\Auxiliary\Build\vcvarsall.bat'
 if (-not (Test-Path $vcvarsall)) { Fail "找不到 vcvarsall.bat：$vcvarsall" }
 
@@ -275,6 +389,50 @@ Write-Ok "win_vc  = $winVc  ($winToolchainVersion)"
 Write-Ok "win_sdk = $winSdk ($winSdkVersion)"
 
 # ---------------------------------------------------------------- 4. LLVM clang-cl
+# clang 资源目录的版本名（$LlvmRoot/lib/clang/<ver>）。为什么要自己算、不交给 gn：
+# gn 在 clang_win 非空且 clang_win_version 为空时会跑 gn/highest_version_dir.py 扫这个目录，
+# 而那个脚本的正则写死成 X.Y.Z。**LLVM 23 起 resource dir 只用主版本号**（实测 clang 23.1.3
+# 的 resource dir 就是 lib/clang/23），正则一项都匹配不上 → sorted(...)[-1] 抛 IndexError
+# → gn gen 直接失败（gn/BUILDCONFIG.gn:157，报 "Script returned non-zero exit code"）。所以
+# 这里由脚本自己给出，绕开那个脆弱的探测脚本。
+# 安全性：clang_win_version 在 Skia 里**只**被 ASAN 分支引用（gn/skia/BUILD.gn:362 的
+# $clang_win/lib/clang/$clang_win_version/lib/windows/clang_rt.asan-x86_64.lib），本构建不开
+# sanitize，故填任何真实存在的目录名都无害。
+function Resolve-ClangResDirVersion([string]$clangCl, [string]$llvmRoot) {
+  # 权威来源：直接问 clang 自己 —— 对任何命名方案都成立，不猜。
+  $lines = @()
+  try { $lines = @(& $clangCl -print-resource-dir 2>$null) } catch { $lines = @() }
+  if ($lines.Count -gt 0) {
+    $rd = ('' + $lines[0]).Trim()
+    if ($rd -and (Test-Path $rd)) { return (Split-Path $rd -Leaf) }
+  }
+  # 退路：-print-resource-dir 万一不可用时自己扫 lib\clang，取版本号最大的目录名。
+  $parent = Join-Path $llvmRoot 'lib\clang'
+  $names = @()
+  if (Test-Path $parent) {
+    $names = @(Get-ChildItem -Directory -Path $parent -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+  }
+  if ($names.Count -eq 0) {
+    Fail @"
+$llvmRoot 下找不到 clang 资源目录（lib\clang\*）—— 这不是一份完整的 LLVM/clang 安装。
+请重装 LLVM 并确认含 clang 组件：https://github.com/llvm/llvm-project/releases 选 LLVM-<版本>-win64.exe
+（若 LLVM 装在别处，用 -LlvmHome 'C:\...' 或环境变量 LLVM_HOME 指过去。）
+"@
+  }
+  $best = $names[0]
+  $bestKey = -1
+  foreach ($n in $names) {
+    # 目录名可能是 "23" 或 "23.1.3" 或带后缀，取数字段补齐三位再比大小，避免 "23" 被误判小于 "21.1.5"。
+    $nums = @()
+    foreach ($p in ($n -split '[^0-9]+')) { if ($p -ne '') { $nums += [int]$p } }
+    if ($nums.Count -eq 0) { $nums = @(0) }
+    while ($nums.Count -lt 3) { $nums += 0 }
+    $key = $nums[0] * 1000000 + $nums[1] * 1000 + $nums[2]
+    if ($key -gt $bestKey) { $bestKey = $key; $best = $n }
+  }
+  return $best
+}
+
 Write-Step '定位 LLVM clang-cl'
 
 $LlvmRoot = $null
@@ -286,7 +444,14 @@ if ($LlvmHome) {
   if ($env:ProgramFiles) { $cands += (Join-Path $env:ProgramFiles 'LLVM') }
   if (${env:ProgramFiles(x86)}) { $cands += (Join-Path ${env:ProgramFiles(x86)} 'LLVM') }
   if ($env:LOCALAPPDATA) { $cands += (Join-Path $env:LOCALAPPDATA 'Programs\LLVM') }
+  if ($env:USERPROFILE) { $cands += (Join-Path $env:USERPROFILE 'scoop\apps\llvm\current') }
   $cands += 'C:\LLVM'
+  # Visual Studio 的「C++ Clang Compiler for Windows」组件会把 clang-cl 装在 VC\Tools\Llvm\<host>\ 下
+  # （注意：只装 clang-format/clang-tidy 的常见情形下这个目录里**没有** clang-cl，下面会报明）。
+  if ($vsPath) {
+    $cands += (Join-Path $vsPath 'VC\Tools\Llvm\x64')
+    $cands += (Join-Path $vsPath 'VC\Tools\Llvm')
+  }
   foreach ($c in $cands) {
     if ($c -and (Test-Path (Join-Path $c 'bin\clang-cl.exe'))) { $LlvmRoot = (Resolve-Path $c).Path; break }
   }
@@ -297,20 +462,36 @@ if ($LlvmHome) {
 }
 if (-not $LlvmRoot) {
   Fail @'
-找不到 clang-cl.exe。请安装 LLVM（内含 clang-cl）：
-  https://github.com/llvm/llvm-project/releases  选 LLVM-<版本>-win64.exe
-安装时勾选 "Add LLVM to the system PATH"，或用 -LlvmHome 'C:\Program Files\LLVM' 指定。
+找不到 clang-cl.exe（全机扫了一遍：PATH / Program Files\LLVM / scoop / Visual Studio 的 VC\Tools\Llvm）。
+二选一：
+  A) 独立安装 LLVM（推荐，clang-cl + llvm-readobj 齐备）：
+       https://github.com/llvm/llvm-project/releases  选 LLVM-<版本>-win64.exe
+       装时勾 "Add LLVM to the system PATH"，或用 -LlvmHome 'C:\Program Files\LLVM'（等价环境变量 LLVM_HOME）指定。
+  B) 给已装的 Visual Studio 补组件（只需 clang-cl，但脚本的位宽核对还想要 llvm-readobj）：
+       Visual Studio Installer → 修改 → 单个组件 → 勾 "C++ Clang Compiler for Windows"。
 '@
 }
 $ClangCl = Join-Path $LlvmRoot 'bin\clang-cl.exe'
 Write-Ok "LLVM: $LlvmRoot"
 & $ClangCl --version 2>&1 | Select-Object -First 1 | ForEach-Object { Write-Info $_ }
+$ClangResDirVersion = Resolve-ClangResDirVersion $ClangCl $LlvmRoot
+Write-Ok "clang 资源目录版本：lib/clang/$ClangResDirVersion"
 
 # ---------------------------------------------------------------- 5. ninja
 # CMake(-G Ninja) 与 Skia 都要 ninja。系统没有就用 Skia 自带的 fetch-ninja 取一个。
 function Resolve-Ninja {
   $n = Find-Exe 'ninja'
   if ($n) { Write-Ok "ninja -> $n"; return $n }
+  # Visual Studio 的「使用 C++ 的桌面开发」工作负载自带一份 ninja（就放在 CMake 扩展目录下）。
+  # 这比让用户去装 ninja 或先 clone 整个 Skia 取 fetch-ninja 都省事。
+  if ($vsPath) {
+    $vsNinja = Join-Path $vsPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
+    if (Test-Path $vsNinja) { Write-Ok "ninja -> $vsNinja"; return $vsNinja }
+  }
+  if ($env:USERPROFILE) {
+    $sn = @(Get-ChildItem -Path (Join-Path $env:USERPROFILE 'scoop\apps\ninja') -Recurse -Filter 'ninja.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($sn.Count -gt 0) { Write-Ok "ninja -> $($sn[0].FullName)"; return $sn[0].FullName }
+  }
   $src = Join-Path $BuildTools 'skia-src'
   $bundled = Join-Path $src 'third_party\ninja\ninja.exe'
   if ((Test-Path (Join-Path $src 'DEPS')) -and -not (Test-Path $bundled)) {
@@ -326,6 +507,63 @@ function Resolve-Ninja {
 }
 
 # ---------------------------------------------------------------- 6. 下载/解包
+# 解包 tarball，返回被跳过的条目（正常为 0 条）。
+#
+# 为什么不能只写一句 `tar -xzf`：Windows 自带的 tar.exe（bsdtar）在**没开「开发者模式」/没有
+# 「创建符号链接」特权**时建不了符号链接，一遇到就报
+#     <归档内相对路径>: Can't create '\\?\C:\...': Invalid argument
+# 并在最后以 exit 1 收尾。SDL2 的发布包正好有两条符号链接（android-project-ant/{src,
+# AndroidManifest.xml}，指向 android-project 里同一份源码 —— 给已废弃的 Ant 版 Android 工程模板用，
+# 与 Windows 构建无关），于是整个解包被判失败 —— 不该让用户手工处理。
+#
+# 处理原则：**只自愈这一种已知失败，其余一律原样响亮抛错**，不猜、不静默：
+#   1) 先原样解包，成功就返回；
+#   2) 失败后逐行核对 tar 的输出：只接受上面那种 "Can't create" 行，以及
+#      "tar.exe: Error exit delayed from previous errors" 这一行总结；出现任何别的行，
+#      说明是别的毛病，把原始输出整段抛出去；
+#   3) 删掉半成品目录，把这些条目用 --exclude 逐条排除后再解一次；
+#   4) 仍非 0 退出 → 同样整段抛错；
+#   5) 成功则把跳过的条目**逐条列出**，让用户看得见「少了什么」。
+function Expand-Tarball([string]$file, [string]$destDir) {
+  if (Test-Path $destDir) { Remove-Item -Recurse -Force $destDir }
+
+  # PS 5.1 下 $ErrorActionPreference='Stop' + 2>&1 会把原生 stderr 直接升级成**终止性**错误，
+  # 所以这里必须临时降到 Continue，才能把 tar 的报错文本拿到手里逐行筛查。
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $out = @(& $TarExe -xzf $file -C $DlDir 2>&1)
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = $prevEap
+  if ($code -eq 0) { return @() }
+
+  $blocked = @()
+  foreach ($line in $out) {
+    $s = ([string]$line).Trim()
+    if ($s -eq '') { continue }
+    if ($s -match "^([^:]+): Can't create '") { $blocked += $matches[1]; continue }
+    if ($s -match '^tar(\.exe)?: Error exit delayed from previous errors') { continue }
+    Fail ("解包 $file 失败（exit $code），且不是已知的符号链接问题。tar 原始输出：`n" + ($out -join "`n"))
+  }
+  if ($blocked.Count -eq 0) {
+    Fail ("解包 $file 失败（exit $code），但没有解析出可跳过的条目。tar 原始输出：`n" + ($out -join "`n"))
+  }
+
+  Write-Note ("Windows 建不了以下 $($blocked.Count) 条符号链接（需要「开发者模式」或「创建符号链接」特权），已跳过它们重新解包：`n" +
+              (($blocked | ForEach-Object { '        ' + $_ }) -join "`n"))
+
+  if (Test-Path $destDir) { Remove-Item -Recurse -Force $destDir }
+  $excl = @()
+  foreach ($b in $blocked) { $excl += @('--exclude', $b) }
+  $ErrorActionPreference = 'Continue'
+  $out2 = @(& $TarExe -xzf $file -C $DlDir @excl 2>&1)
+  $code2 = $LASTEXITCODE
+  $ErrorActionPreference = $prevEap
+  if ($code2 -ne 0) {
+    Fail ("排除了上述符号链接后，解包 $file 仍然失败（exit $code2）。tar 原始输出：`n" + ($out2 -join "`n"))
+  }
+  return $blocked
+}
+
 function Get-SourceTarball([string]$key, [string]$destDir) {
   $url = $Urls[$key]
   $file = Join-Path $DlDir ($url -split '/')[-1]
@@ -343,11 +581,13 @@ function Get-SourceTarball([string]$key, [string]$destDir) {
     }
     Write-Ok "下载完成：$file"
   }
-  if (Test-Path $destDir) { Remove-Item -Recurse -Force $destDir }
-  & $TarExe -xzf $file -C $DlDir
-  Assert-Ok "解包 $file"
+  $skipped = @(Expand-Tarball -file $file -destDir $destDir)
   if (-not (Test-Path $destDir)) { Fail "解包后没有预期目录：$destDir" }
-  Write-Ok "解包完成：$destDir"
+  if ($skipped.Count -gt 0) {
+    Write-Ok "解包完成（跳过 $($skipped.Count) 条建不了的符号链接）：$destDir"
+  } else {
+    Write-Ok "解包完成：$destDir"
+  }
 }
 
 # ---------------------------------------------------------------- 6.5 x86 的 Skia 工具链与产物位宽核对
@@ -374,8 +614,11 @@ function Repair-SkiaX86Toolchain([string]$src) {
   }
   Write-Note "win_sdk 里没有 bin\SetEnv.cmd：$setEnv"
 
-  # 注意：Windows 上的 Git 默认 core.autocrlf=true，Skia 源码里的换行很可能是 CRLF，而本文件里的
-  # here-string 是 LF。先归一化再比对，否则补丁会“找不到锚点”而假失败；写回时恢复原换行风格。
+  # 注意：**两边的换行都要归一化再比对**。Windows 上（git 默认 core.autocrlf=true）Skia 源码是 CRLF；
+  # 而本脚本自身也可能是 CRLF 检出 —— PS 5.1 的 here-string 会原样沿用源文件的换行，所以 CRLF
+  # 检出时 here-string 也是 CRLF，与归一化成 LF 的文本永远比不中（这就是本补丁在 CRLF 检出下
+  # “找不到锚点”假失败的真因；反之在 LF 检出下曾经能过 —— 同一个脚本两副面孔）。写回时恢复目标
+  # 文件自己的换行风格。
   $text = [System.IO.File]::ReadAllText($gnToolchain)
   $crlf = $text.Contains("`r`n")
   $norm = if ($crlf) { $text.Replace("`r`n", "`n") } else { $text }
@@ -402,6 +645,10 @@ function Repair-SkiaX86Toolchain([string]$src) {
       }
     } else if (toolchain_target_cpu == "arm64") {
 '@
+  # 这里必须把 here-string 也压成 LF：PS 5.1 的 here-string 沿用源文件换行，本文件是 CRLF 检出时
+  # $old 就是 CRLF，跟上面归一化过的 $norm 根本比不中（详见本函数开头的注释）。
+  $old = $old.Replace("`r`n", "`n")
+  $new = $new.Replace("`r`n", "`n")
   if (-not $norm.Contains($old)) {
     Fail @"
 Skia 的 gn/toolchain/BUILD.gn 与预期不符，补丁无法安全套用（上游可能改过这段）。
@@ -414,6 +661,175 @@ Skia 的 gn/toolchain/BUILD.gn 与预期不符，补丁无法安全套用（上�
   [System.IO.File]::WriteAllText($gnToolchain, $patched, (New-Object System.Text.UTF8Encoding($false)))
   Write-Note "已对 Skia 源码打 x86 工具链补丁（跳过 SetEnv.cmd）：$gnToolchain"
   Write-Note '这是「上游不受支持」的地带，本脚本会在构建后核对产物真实位宽。'
+}
+
+# ---------------------------------------------------------------- 6.6 skcms 的 f16->f32 builtin
+# clang 23 删除了裸 builtin __builtin_ia32_vcvtph2ps256（LLVM 23.1.3 实测报 "use of undeclared
+# identifier"，并给一个语义无关的建议），而 Skia m124 自带的那份 skcms 正用它做 f16 -> f32 的
+# AVX2 快速路径（modules/skcms/src/Transform_inl.h 的 F_from_Half），于是 skcms_TransformHsw.cc
+# 每次都编不过。上游 skcms 早已修过这点（_Float16 向量 + __builtin_convertvector，clang >= 15
+# 起可用），m124 里那份早于该修复。
+# 这里照抄上游的**最小**修法：保留旧 builtin 给老 clang / 非 clang（不降级），clang >= 15 走
+# convertvector —— 与上游行为逐字一致，AVX2 快速路径不变（仍编出 VCVTPH2PS），且对任意 clang
+# 版本都安全（所以无条件打，不必探测版本）。可重入；源码与预期不符时响亮报错，绝不静默改。
+function Repair-SkcmsClangBuiltin([string]$src) {
+  $file = Join-Path $src 'modules\skcms\src\Transform_inl.h'
+  if (-not (Test-Path $file)) { Fail "找不到 skcms 源码：$file" }
+
+  $text = [System.IO.File]::ReadAllText($file, (New-Object System.Text.UTF8Encoding($false)))
+  if ($text.Contains('ASC-CLANG23-SKCMS-PATCH')) {
+    Write-Ok 'skcms 已打过 f16 builtin 补丁（ASC-CLANG23-SKCMS-PATCH），跳过。'
+    return
+  }
+  # Skia 源码在 Windows 上常是 CRLF（Git core.autocrlf）；先归一化再比对，写回时恢复原风格。
+  $crlf = $text.Contains("`r`n")
+  $norm = $text.Replace("`r`n", "`n")
+
+  $old = @'
+#elif defined(USING_AVX_F16C)
+    typedef int16_t __attribute__((vector_size(16))) I16;
+    return __builtin_ia32_vcvtph2ps256((I16)half);
+#else
+'@
+  $new = @'
+#elif defined(USING_AVX_F16C)
+    // ASC-CLANG23-SKCMS-PATCH: clang 23 删除了 __builtin_ia32_vcvtph2ps256，改用上游 skcms 的修法：
+    // _Float16 向量 + __builtin_convertvector。语义相同（8×f16 -> 8×f32，仍走 VCVTPH2PS），
+    // 老 clang / 非 clang 仍走原来的裸 builtin。
+#if defined(__clang__) && __clang_major__ >= 15 // for _Float16 support
+    typedef _Float16 __attribute__((vector_size(16))) F16;
+    return __builtin_convertvector((F16)half, F);
+#else
+    typedef int16_t __attribute__((vector_size(16))) I16;
+    return __builtin_ia32_vcvtph2ps256((I16)half);
+#endif // defined(__clang__)
+#else
+'@
+  # here-string 的字面换行在不同 PowerShell 版本下可能是 CRLF 也可能是 LF，两边都归一。
+  $old = $old.Replace("`r`n", "`n")
+  $new = $new.Replace("`r`n", "`n")
+
+  if (-not $norm.Contains($old)) {
+    Fail @"
+Skia 的 modules/skcms/src/Transform_inl.h 与预期不符，clang 23 的补丁无法安全套用（上游可能改过这段）。
+请手工把 F_from_Half() 的 USING_AVX_F16C 分支改成：
+  #if defined(__clang__) && __clang_major__ >= 15
+      typedef _Float16 __attribute__((vector_size(16))) F16;
+      return __builtin_convertvector((F16)half, F);
+  #else
+      typedef int16_t __attribute__((vector_size(16))) I16;
+      return __builtin_ia32_vcvtph2ps256((I16)half);
+  #endif
+然后加 -SkipDownload 重跑。文件：$file
+"@
+  }
+  $patched = $norm.Replace($old, $new)
+  if ($crlf) { $patched = $patched.Replace("`n", "`r`n") }
+  [System.IO.File]::WriteAllText($file, $patched, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Note "已对 Skia 源码打 skcms f16 补丁（clang 23 删除了 __builtin_ia32_vcvtph2ps256）：$file"
+}
+
+# ---------------------------------------------------------------- 6.7 dng_sdk 的 std::auto_ptr
+# dng_sdk 的 dng_pthread.cpp（Windows 上的 pthread 仿真，qDNGThreadSafe=1 时编）用了 std::auto_ptr：
+#   std::auto_ptr<trampoline_args> args(...)
+# 而 MSVC STL 在 /std:c++17 下把 auto_ptr **移除了**（yvals_core.h: `_HAS_AUTO_PTR_ETC = !_HAS_CXX17`），
+# 于是这个 TU 必然编不过（报 "no member named 'auto_ptr' in namespace 'std'"）。注意：这不是 clang
+# 版本问题（macOS/Linux 的 libc++/libstdc++ 仍保留 auto_ptr，所以在那边一直编得过），而是
+# **Windows + MSVC STL** 独有的；上游 AOSP 的 dng_sdk 至今也还在用 auto_ptr（无上游修法可抄）。
+# 处理：只给 dng_sdk 这一个 target 加 `_HAS_AUTO_PTR_ETC=1`（MSVC STL 给这种“C++17 模式编旧代码”
+# 提供的官方开关），**Adobe 源码一字不改** —— auto_ptr 的所有权语义保持原样，不会被我方换成
+# unique_ptr 而抳动行为。可重入；BUILD.gn 与预期不符时响亮报错。
+function Repair-DngSdkAutoPtr([string]$src) {
+  $file = Join-Path $src 'third_party\dng_sdk\BUILD.gn'
+  if (-not (Test-Path $file)) { Fail "找不到 dng_sdk 构建文件：$file" }
+
+  $text = [System.IO.File]::ReadAllText($file, (New-Object System.Text.UTF8Encoding($false)))
+  if ($text.Contains('ASC-DNG-AUTOPTR-PATCH')) {
+    Write-Ok 'dng_sdk 已打过 auto_ptr 补丁（ASC-DNG-AUTOPTR-PATCH），跳过。'
+    return
+  }
+  $crlf = $text.Contains("`r`n")
+  $norm = $text.Replace("`r`n", "`n")
+
+  $old = @'
+  defines = [
+    "qDNGReportErrors=0",
+    "qDNGThreadSafe=1",
+'@
+  $new = @'
+  defines = [
+    # ASC-DNG-AUTOPTR-PATCH: dng_pthread.cpp（Windows 的 pthread 仿真）用 std::auto_ptr，而
+    # MSVC STL 在 /std:c++17 下把它移除了（yvals_core.h: _HAS_AUTO_PTR_ETC = !_HAS_CXX17），
+    # 这个 TU 必然编不过。只在本 target 内放开官方开关，Adobe 源码一字不改。
+    "_HAS_AUTO_PTR_ETC=1",
+    "qDNGReportErrors=0",
+    "qDNGThreadSafe=1",
+'@
+  $old = $old.Replace("`r`n", "`n")
+  $new = $new.Replace("`r`n", "`n")
+
+  if (-not $norm.Contains($old)) {
+    Fail @"
+Skia 的 third_party/dng_sdk/BUILD.gn 与预期不符，auto_ptr 补丁无法安全套用（上游可能改过这段）。
+请手工给 third_party("dng_sdk") 的 defines 加上 "_HAS_AUTO_PTR_ETC=1"，然后加 -SkipDownload 重跑。
+文件：$file
+"@
+  }
+  $patched = $norm.Replace($old, $new)
+  if ($crlf) { $patched = $patched.Replace("`n", "`r`n") }
+  [System.IO.File]::WriteAllText($file, $patched, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Note "已对 Skia 源码打 dng_sdk auto_ptr 补丁（_HAS_AUTO_PTR_ETC=1）：$file"
+}
+
+# ---------------------------------------------------------------- 6.8 GrD3DUtil.h 缺 <string>
+# Skia 自己的 src/gpu/ganesh/d3d/GrD3DUtil.h 在 163 行声明：
+#   std::wstring GrD3DMultiByteToWide(const std::string& str);
+# 却从不 include <string> —— 以前靠别的头间接带进来，而 MSVC STL 14.43（/std:c++17）不再间接提供，
+# 于是 GrD3DUtil.cpp / GrD3DAMDMemoryAllocator.cpp 双双报 "no type named 'string' in namespace 'std'"。
+# 处理：补一行显式 include（IWYU 正解，纯声明可见性，不改任何行为）。可重入。
+function Repair-GrD3DUtilStringInclude([string]$src) {
+  $file = Join-Path $src 'src\gpu\ganesh\d3d\GrD3DUtil.h'
+  if (-not (Test-Path $file)) {
+    # 不同 Skia 版本里 D3D 后端的位置可能变（也可能整体移除）。找不到就只提示，不算致命 ——
+    # 真有 TU 因此编不过，ninja 会在那里报错，不会静默。
+    Write-Note "未找到 Skia 的 GrD3DUtil.h（D3D 后端路径可能变了），跳过 <string> 补丁：$file"
+    return
+  }
+
+  $text = [System.IO.File]::ReadAllText($file, (New-Object System.Text.UTF8Encoding($false)))
+  if ($text.Contains('ASC-D3DUTIL-STRING-PATCH')) {
+    Write-Ok 'GrD3DUtil.h 已打过 <string> 补丁（ASC-D3DUTIL-STRING-PATCH），跳过。'
+    return
+  }
+  $crlf = $text.Contains("`r`n")
+  $norm = $text.Replace("`r`n", "`n")
+
+  $old = @'
+#include "include/core/SkImage.h"
+#include "include/gpu/GrTypes.h"
+'@
+  $new = @'
+// ASC-D3DUTIL-STRING-PATCH: 本头文件声明了 std::wstring/std::string，却从不 include <string>；
+// MSVC STL 14.43 在 /std:c++17 下不再间接提供它，于是用了本头文件的 TU 全部编不过。
+#include <string>
+
+#include "include/core/SkImage.h"
+#include "include/gpu/GrTypes.h"
+'@
+  $old = $old.Replace("`r`n", "`n")
+  $new = $new.Replace("`r`n", "`n")
+
+  if (-not $norm.Contains($old)) {
+    Fail @"
+Skia 的 src/gpu/ganesh/d3d/GrD3DUtil.h 与预期不符，<string> 补丁无法安全套用（上游可能改过这段）。
+请手工在 GrD3DUtil.h 的 include 块里补上 #include <string>，然后加 -SkipDownload 重跑。
+文件：$file
+"@
+  }
+  $patched = $norm.Replace($old, $new)
+  if ($crlf) { $patched = $patched.Replace("`n", "`r`n") }
+  [System.IO.File]::WriteAllText($file, $patched, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Note "已对 Skia 源码打 GrD3DUtil.h <string> 补丁：$file"
 }
 
 # 核对产物真实位宽 —— 防止「x86 目标却编出 x64 对象」这种静默错误一路滑到链接期
@@ -500,6 +916,15 @@ function Build-Skia([string]$arch) {
     # 未必有它（那是旧 SDK 的布局），没有就补一处最小的工具链补丁 —— 只影响 clang-cl 路径。
     if ($arch -eq 'x86') { Repair-SkiaX86Toolchain $src }
 
+    # skcms 的 f16->f32 builtin：clang 23 删掉了它，与位宽无关，x64/x86 都要处理。
+    Repair-SkcmsClangBuiltin $src
+
+    # dng_sdk 的 std::auto_ptr：MSVC STL 在 /std:c++17 下移除了它，也与位宽无关。
+    Repair-DngSdkAutoPtr $src
+
+    # GrD3DUtil.h 缺 <string> 的显式 include（MSVC STL 新版不再间接提供），同样与位宽无关。
+    Repair-GrD3DUtilStringInclude $src
+
     # ---- 写 args.gn：镜像 out/macos-arm64/args.gn，换成 win 目标
     $outName = "windows-$arch"
     $outDir = Join-Path $src ("out\" + $outName)
@@ -520,8 +945,12 @@ function Build-Skia([string]$arch) {
     $g += ''
     $g += '# gn 的 win toolchain 仅在 clang_win 非空时才切到 clang-cl + lld-link。'
     $g += '# win_vc / win_sdk 显式给出，免得 gn 再去调 python 探测。'
+    $g += '# clang_win_version 也必须自己给：gn 的自探测脚本 gn/highest_version_dir.py 只认 X.Y.Z，'
+    $g += '# 而 LLVM 23 起 resource dir 只用主版本号（lib/clang/23），交给它扫会 IndexError 搞挂 gn gen。'
     $g += "clang_win = `"$(To-Fwd $LlvmRoot)`""
+    $g += "clang_win_version = `"$ClangResDirVersion`""
     $g += "win_vc = `"$(To-Fwd $winVc)`""
+
     $g += "win_toolchain_version = `"$winToolchainVersion`""
     $g += "win_sdk = `"$(To-Fwd $winSdk)`""
     $g += "win_sdk_version = `"$winSdkVersion`""
@@ -619,6 +1048,18 @@ function Build-Skia([string]$arch) {
     Write-Info (($libs | Sort-Object Name | ForEach-Object { $_.Name }) -join ' ')
     Assert-LibBitness -Dir $dest -Arch $arch -Label "Skia ($arch)"
 
+    # ---- 运行时数据：icudtl.dat（Skia 的 ICU 数据，SkParagraph/SkUnicode 文本整形必需）
+    # 程序侧是静态 exe，SkLoadICU()（third_party/icu/SkLoadICU.cpp）只探 exe 目录与库目录，
+    # 故 icudtl.dat 必须随 .lib 一起入库，编译期再由 build.ts 把它拷到 exe 旁。缺了它首跑
+    # 会在首次文本整形时 SIGILL（SkParagraph::Cluster::Cluster 读空 grapheme 表越界 SK_ABORT）。
+    $icuData = Join-Path $outDir 'icudtl.dat'
+    if (Test-Path $icuData) {
+      Copy-Item $icuData (Join-Path $dest 'icudtl.dat') -Force
+      Write-Ok '已拷 icudtl.dat -> 与 skia .lib 同目录'
+    } else {
+      Fail "out 目录里没有 icudtl.dat（Skia 的 ICU 数据未产出）：$outDir"
+    }
+
     # ---- 头文件一致性提醒（docs/zh-cn/skia.md §6.5）
     $vendorInclude = Join-Path $Vendor 'skia\include'
     $srcInclude = Join-Path $src 'include'
@@ -664,8 +1105,12 @@ function Invoke-CmakeBuild {
     "-DCMAKE_C_COMPILER=$ClangCl",
     "-DCMAKE_CXX_COMPILER=$ClangCl",
     "-DCMAKE_MAKE_PROGRAM=$script:NinjaExe",
-    # 与 Skia 保持一致：Skia 的 gn 没设 /MT，走 MSVC 默认的 /MD。
-    '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL'
+    # 与 Skia 保持一致：Skia 的 gn 用 is_official_build 时显式走 /MT（静态 CRT），
+    # 链接清单里 skia.lib / SDL2.lib 引用的都是本地 _malloc/_memcpy（无 __imp_ 前缀）。
+    # 所以这里也必须 /MT（MultiThreaded），否则 curl/nghttp2/zlib 会编成 /MD，引用
+    # __imp__malloc 等动态 CRT 符号，链静态 CRT 时出现 __except_handler4_common、
+    # __fdopen 等一串 lld-link 未解析符号。
+    '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
   )
   if ($cFlags) {
     $cmakeArgs += "-DCMAKE_C_FLAGS=$cFlags"
@@ -714,7 +1159,13 @@ function Build-Sdl2([string]$arch) {
       '-DSDL_SHARED=OFF',
       '-DSDL_STATIC=ON',
       '-DSDL_TEST=OFF',
-      '-DSDL_TESTS=OFF'
+      '-DSDL_TESTS=OFF',
+      # SDL2 同样不用 CMake 的 CMAKE_MSVC_RUNTIME_LIBRARY，而是自带 SDL_FORCE_STATIC_VCRT
+      # 开关（CMakeLists.txt:267）：开启后把 CMAKE_C/CXX_FLAGS 里的 /MD 换成 /MT。不开启会
+      # 编成 /MD（每个 obj 带 /DEFAULTLIB:msvcrt.lib），与 /MT 的 skia/curl 混链时 msvcrt.lib
+      # 的 __except_handler4 引用 __except_handler4_common，而该符号只在 libcmt.lib（静态 CRT）里，
+      # 链静态 CRT 时未解析。
+      '-DSDL_FORCE_STATIC_VCRT=ON'
     )
 
   # SDL2 的 CMake 静态库叫 SDL2-static.lib；补一个 SDL2.lib，让 -lSDL2 能解析。
@@ -781,7 +1232,12 @@ function Build-CurlStack([string]$arch) {
       '-DBUILD_SHARED_LIBS=OFF',
       '-DBUILD_STATIC_LIBS=ON',
       '-DBUILD_TESTING=OFF',
-      '-DENABLE_DOC=OFF'
+      '-DENABLE_DOC=OFF',
+      # nghttp2 不用 CMake 的 CMAKE_MSVC_RUNTIME_LIBRARY（那是 3.15+ 的 MSVC_RUNTIME_LIBRARY
+      # target property 才读的东西），而是自带 ENABLE_STATIC_CRT 开关，把 CMAKE_C/CXX_FLAGS 里的
+      # /MD 换成 /MT（CMakeLists.txt:396）。不开启会编成 /MD，引用 __imp__malloc / __imp__wassert，
+      # 与 /MT 的 skia/sdl2/curl 混链时出现 __wassert 未解析。
+      '-DENABLE_STATIC_CRT=ON'
     )
 
   # --- curl：TLS 走系统 Schannel（Windows 原生，不引 OpenSSL；信任区用系统证书库，无需 CA bundle，

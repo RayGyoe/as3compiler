@@ -750,8 +750,10 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
    产出 Mach-O / ELF，工程生成器负责把编译命令 + 依赖库 + 资源组织成 `.xcodeproj` / Gradle 工程
    骨架。因此它们应作为 build 层**独立于编译命令的生成步骤**，而不是塞进 `cc/clang` 的编译参数。
 2. **Windows `.exe` 连新参数都不需要**。native 在 Windows 本来就是 PE 可执行文件，唯一的小坑是
-   现在 `-o app` 不自动补 `.exe` 扩展名（`index.ts` 只在 wasm 分支补后缀）。按 host OS 补默认
-   扩展名即可，不是新形态。
+   曾经 `-o app` 不自动补 `.exe` 扩展名——已按 host OS 补默认扩展名（`process.platform === 'win32'` 时
+   native 产物自动带 `.exe` 后缀、POSIX 不补）。这不只是命名规范：Windows 的 `CreateProcessW` 只按
+   `.exe`/`.cmd`/`.bat`/`.com` 扩展名序列查找可执行文件，无扩展名的 PE 文件对 `spawnSync` 而言是
+   `ENOENT`，所以 `--run` 在 macOS 能启动、在 Windows 却静默起不来——补 `.exe` 后两者一致。不是新形态。
 3. **工程元数据走 manifest，不平铺 CLI flag**。工程生成器需要大量元数据：bundle id、图标、
    签名证书、min SDK、权限、资源目录……这些**不是参数，是工程配置**。项目里已有对标 TypePHP
    `project.yml` 的 manifest 机制（见 §4），应扩展 manifest 承载这些字段，而非平铺成一堆 CLI flag。
