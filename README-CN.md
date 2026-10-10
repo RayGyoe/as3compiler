@@ -129,57 +129,6 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
 `.debug_*`，`name` 函数名段保留 ⇒ trap 仍打印符号化栈）。开 `--debug-info` 则三端均加 `-g` 且 wasm 不再剥离
 （`fib.wasm` ~640 KB，含我们生成的 C 的行号 ⇒ 可在 DevTools 里源码级调试）。
 
-### Windows 原生后端（阶段一百二十六）
-
-`--air-app` 在 Windows 上走 **Win32 + SDL2 + Skia D3D12 直连 GPU**。位宽由 AIR 描述符的
-`<application><architecture>`（`"32"`/`"64"`，**缺省 32**）决定，对应 `vendor/*/windows-x86|windows-x64`：
-
-```xml
-<!-- 32 位（AIR 默认，也是 <architecture> 缺省行为） -->
-<application><architecture>32</architecture></application>
-<!-- 64 位 -->
-<application><architecture>64</architecture></application>
-```
-
-- `<renderMode>direct</renderMode>`（或 `gpu`）→ `ASC_RENDER_WINGPU=1` + `ASC_RENDER_D3D=1`，额外链接
-  `vendor/d3d_glue.cc` 与 `d3d12`/`dxgi`/`d3dcompiler`（进程级 `ID3D12Device`/命令队列/`GrDirectContext`，
-  窗口级 `CreateSwapChainForHwnd` 双 back buffer + fence 帧同步 + `ResizeBuffers`）；`cpu`/`auto` 保持
-  CPU 光栅 + SDL streaming texture blit。
-- GPU seam 是**后端中立**的：生成 C 与 runtime 只说 `sk_gpu_*`/`sk_window_show_gpu`/`as_skia_gpu_*`/
-  `w->is_gpu`，`ASC_RENDER_WINGPU` 表示「本窗口的合成跑在 GPU 上」，具体后端由 `ASC_RENDER_METAL`(macOS)
-  / `ASC_RENDER_D3D`(Windows) 指名，**唯一**的分支点在 `vendor/window_glue.cc`（`sk_attach_gpu`）。
-- 与 macOS 的差别全在**构建期**选出来，不是运行期分支：Windows 上不链 `metal_glue.mm`/`objc`/Cocoa
-  framework、不加 `-lm`/`-lz`（`m.lib`/`z.lib` 在 Windows 不存在）、`AS_HAVE_ICONV=0`（非 UTF 字符集
-  **响亮**抛错）。归档名按 gn 的 Windows 规则（`<target>.lib`、**无** `lib` 前缀）⇒ 字面叫 `libpng` 一类的
-  目标链成 `-llibpng`；此结论来自在 macOS 上 `gn gen target_os="win"` 读出的**真实** `build.ninja`。
-- **Stage3D 在 Windows 上可用（阶段一百三十二）**：`vendor/stage3d_d3d.cc` 是 `stage3d_glue.mm` 的 D3D12 等价物
-  （缓冲区/纹理/PSO/离屏 RT/采样器与描述符堆/三缓冲提交），消费阶段一百三十一 的 **AGAL→HLSL** 翻译器
-  （`ASC_S3D_HLSL` ⇒ `target 2`、`driverInfo` 报 `Direct3D12 (Stage3D)`）。构建期接线：`--air-app` 在 Windows
-  推入 `stage3d_d3d.cc` + `ASC_S3D_HLSL=1` + `d3d12`/`dxgi`/`d3dcompiler`（**不再**推 `.mm`/Metal framework），
-  描述符里的 `<depthAndStencil>true</depthAndStencil>` 映成 `ASC_RENDER_DEPTH_STENCIL`。**与 2D 共用同一个
-  `ID3D12Device`/命令队列**（按名 `GetProcAddress` 取 `sk_d3d_shared_device`/`sk_d3d_shared_queue`），故
-  Stage3D 的帧与 Skia 的合成**同一条队列有序**、无需 CPU 等待。实机验收：`examples/shmup-stage3d` 在 Windows
-  上开窗、跑到 **281 帧/5 s**、零 PSO/合成错误，且 `ASC_GPU_DUMP` 导出的 back buffer 里**能看到 demo 的
-  Stage3D 精灵**。未验收：`examples/air-starling-demo` 尚未在 Windows 目标上跑过；背面剔除/绕序仍是纸面决定
-  （见 `docs/zh-cn/display3d.md` §10、`docs/zh-cn/win32.md` §3.4）。
-- **高清（`<requestedDisplayResolution>high</requestedDisplayResolution>`）在 Windows 上靠进程级 hint 生效**
-  （`SDL_HINT_WINDOWS_DPI_SCALING=1`，同时隐含 per-monitor-v2 → 不再被合成器位图拉伸）：逻辑尺寸
-  与物理像素分开（a 150% 缩放的屏上，`1000x680` 逻辑 → `1500x1020` 物理，`stage.stageWidth/Height`
-  仍报**逻辑**值）。该 hint **只在 `high` 构建（`ASC_DISPLAY_HIGH`）里 latch**：AIR 定义 `standard`
-  为「按 1x 渲染、交给 OS 放大」，与 DPI-unaware 进程的行为本就一致，故 `standard` 及 macOS/wasm
-  逐字节维持原行为。
-- **拖动/缩放窗口时动画与帧率不受影响，多窗口互不干扰**：拖动/缩放跑在 OS 的模态消息循环里（主循环
-  整个被阻塞），SDL 的 live-resize 监听器是**唯一**的帧源，且它驱动的是循环**同一个**节拍化帧泵
-  （`Stage.frameRate` 不被改写，所有窗口一起重画）。详见 `docs/zh-cn/win32.md` §2.8。
-- **拖动/缩放时画面不被合成器重采样（阶段一百三十三）**：呈现路径必须 **1:1** —— macOS 的
-  `CAMetalLayer.contentsGravity` 钉 `kCAGravityTopLeft`（CALayer 默认的 `kCAGravityResize` 会把
-  drawable **拉伸铺满**），Windows 的 `DXGI_SWAP_CHAIN_DESC1.Scaling` 钉 `DXGI_SCALING_NONE`
-  （零初始化默认 `STRETCH` 会把 back buffer 拉满客户区）。这正是 AIR `scaleMode=NO_SCALE` 的语义
-  （内容尺寸固定、左上锚定）：尺寸还没跟上的那一帧原尺寸显示，故拖动时**不再整幅放大/缩小**
-  （修前实测 93 帧中有 15 帧被整体重采样，比例 0.94~0.98）。详见 `docs/zh-cn/skia.md` §6.7 与 `win32.md` §2.10。
-- 依赖库由 `vendor/build-windows-deps.ps1` 从源码编（Skia m124 `skia_use_direct3d=true`、SDL2、curl、
-  zlib、nghttp2；x86/x64 双位宽，LLVM `clang-cl`，`dumpbin` 校验位宽，错位即硬失败）。完整说明、
-  **未实机验证的假设清单**与 Windows 首跑核对清单见 [`win32.md`](docs/zh-cn/win32.md)。
 
 ## 支持的语言子集
 
