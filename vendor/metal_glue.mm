@@ -160,11 +160,22 @@ int sk_mtl_init(int win_id, void* layer) {
     }
   }
 
-  // The CAMetalLayer must be told which device to draw with and which pixel
-  // format to use. BGRA8Unorm matches Skia's kBGRA_8888_SkColorType, and the
-  // layer's top-left gravity keeps drawable row 0 at the visual top, so Skia
-  // renders with kTopLeft_GrSurfaceOrigin (no vertical flip).
   CAMetalLayer* l = (CAMetalLayer*)layer;
+  // The layer MUST lay the drawable out 1:1 from the top-left, never scale it.
+  // CALayer's default contentsGravity is kCAGravityResize, which stretches the
+  // drawable to the layer's bounds -- and during a live resize the drawable we
+  // just presented (sized from SDL's window query) is transiently a different
+  // size than the bounds the compositor is using, so a Resize layer rescales the
+  // WHOLE picture for that frame and the content jitters violently while the
+  // window is dragged (measured: a fixed 200x100 element renders 189x95 on 9 of
+  // 43 frames of a fast drag). AIR's stage.scaleMode=NO_SCALE means content size
+  // is fixed and anchored top-left, which is exactly kCAGravityTopLeft: a
+  // not-yet-updated drawable is shown un-scaled and the newly exposed area keeps
+  // its background until the next frame paints it. (In the steady state, where
+  // drawableSize == bounds*contentsScale, the two gravities are identical, so
+  // this is a pure win.) Top-left also keeps drawable row 0 at the visual top,
+  // so Skia renders with kTopLeft_GrSurfaceOrigin (no vertical flip).
+  l.contentsGravity = kCAGravityTopLeft;
   l.device = g_device;
   l.pixelFormat = MTLPixelFormatBGRA8Unorm;
   // Tag the layer as sRGB: MTLPixelFormatBGRA8Unorm carries *encoded* values and
@@ -182,9 +193,11 @@ int sk_mtl_init(int win_id, void* layer) {
   // AIR window on the same display reads back exactly. The value is what AS3
   // handed us, so the layer must claim sRGB -- the space AIR's own pipeline
   // assumes -- and let the compositor convert if the display is wider-gamut.
-  fprintf(stderr, "metal_glue: window %d layer bounds=%gx%g contentsScale=%g\n", win_id,
+  fprintf(stderr, "metal_glue: window %d layer bounds=%gx%g contentsScale=%g gravity=%s\n", win_id,
           (double)l.bounds.size.width, (double)l.bounds.size.height,
-          (double)l.contentsScale);
+          (double)l.contentsScale,
+          [l.contentsGravity isEqualToString:kCAGravityTopLeft] ? "topleft" :
+          [l.contentsGravity isEqualToString:kCAGravityResize] ? "resize" : "other");
 
   g_mtl[win_id].used = 1;
   g_mtl[win_id].layer = l;
@@ -254,7 +267,6 @@ void* sk_mtl_begin_frame(int win_id, int width, int height) {
   id<CAMetalDrawable> drawable = [m->layer nextDrawable];
   if (drawable == nil) return nullptr;
   if (drawable.texture == nil) return nullptr;
-
   GrMtlTextureInfo fbInfo;
   fbInfo.fTexture.retain((GrMTLHandle)drawable.texture);
 

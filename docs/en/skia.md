@@ -394,6 +394,61 @@ MB/frame/window, ~470 MB/s at 116 fps), and the cost **stacks linearly with the 
 
 ---
 
+### 6.7 The picture must be presented 1:1, never rescaled by the compositor (stage one-hundred-thirty-three)
+
+**Symptom**: in `examples/air-native` (`scaleMode=NO_SCALE` + `align=TOP_LEFT`, Metal compositing), dragging
+the window to resize makes **the whole picture jitter violently** — not tearing, not content reflow, but the
+entire image being scaled up/down by a little between consecutive frames.
+
+**Root cause**: `CAMetalLayer`'s `contentsGravity` **defaults to `kCAGravityResize`** (`metal_glue.mm` had
+never set it, though a comment still claimed "top-left gravity"). The compositor therefore **stretches the
+drawable to fill the layer's bounds**. And during a live resize the drawable we just presented and the bounds
+the compositor is using are **necessarily transiently inconsistent**: the window keeps growing after the frame
+was drawn, so **no size picked at draw time can satisfy both** (`SDL_GetWindowSizeInPixels` and the layer
+bounds both come from Cocoa, but the compositor uses later geometry). Under Resize semantics that frame rescales
+**the whole picture** by `bounds/drawable` — which is exactly the jitter observed.
+
+**Fix**: `l.contentsGravity = kCAGravityTopLeft;`. This is precisely AIR's `scaleMode=NO_SCALE` semantics
+(content size fixed, anchored top-left): a frame whose size has not caught up is shown at its **original size**
+with the newly exposed area left as background until the next frame paints it — **never resampled**. In the
+steady state (`drawableSize == bounds*contentsScale`) the two gravities are pixel-for-pixel equivalent, so this
+is a pure win.
+
+**Measurement** (`temp/resizeprobe/fast.py`: `CGWindowListCreateImage` captures in-process at ~68 fps,
+concurrently with a user-speed drag over Quartz compositing):
+
+- **Pick the right ruler (we tripped once)**: at first we used the demo's fixed red "open window" box
+  (100x50 logical ⇒ exactly 200x100 px at 2x) as the canary — **that does not work**. Another 100x100 red
+  square **drifts** next to it by animation and the two **merge into one 4-connected component**, reading out as
+  a bogus size change (once mistaken for a residual defect). Only the **completely isolated** mid-gray
+  `identity` square (44x44 logical ⇒ **88x88 px** @(1120,1020)) made the measurement trustworthy.
+- **Result** (one drag of 500 px / 0.3 s):
+
+| `contentsGravity` | Frames rescaled (wrong size) | Samples |
+|---|---|---|
+| `kCAGravityResize` (pre-fix default) | **15 / 93** (4 drags: 2/24, 5/23, 4/23, 4/23) | 83x84@(1063,981), 86x86@(1111,1014), 85x85@(1084,994)… |
+| `kCAGravityTopLeft` (post-fix) | **0 / 151** (6 drags, no anomalous frame at all) | — |
+
+- **The samples prove it is a "whole-picture rescale", not local perturbation**: for 83x84@(1063,981),
+  83/88 = 0.943, 1063/1120 = 0.949, 981/1020 = 0.962 — **both dimensions and the origin offset shrink by the
+  same ~0.94**, i.e. a uniform scale about the origin, with the ratio varying between 0.94 and 0.98 from frame
+  to frame (exactly because the window size is changing mid-drag).
+- **It does not break "unpainted residue"**: after the fix, the transient frames during a drag have **only 2
+  colors** in the bottom-right (newly exposed) area, consistent with the same region of a steady-state frame
+  (no seam, no garbage pixels) — the newly exposed area shows the stage background; the cost of 1:1
+  presentation is just "a bit more background showing", not corruption.
+
+**Note**: a slow scripted drag (~2 px per step) **cannot see** this defect — the per-step scale ratio is only
+~0.3%, so it must be reproduced with a **user-speed** fast drag (this harness's `[px] [ms/step]` parameters).
+Early sampling with `screencapture` + a slow drag "looked perfectly normal" for exactly this reason.
+
+**Regression nail**: `test/unit/platform.ts`'s `unit: platform/PresentScale` (9 checks, spanning the two host
+files); reverting both fixes to their pre-fix shape turns **5 of them red on the spot**. Probes:
+`temp/resizeprobe/{fast.py,fastdump.py,measure.py,drive.py,drag.py}`. The same defect on Windows is in
+[`win32.md`](win32.md) §2.10.
+
+---
+
 ## 7. Multi-target: native and wasm
 
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.

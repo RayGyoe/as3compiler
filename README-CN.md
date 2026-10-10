@@ -171,6 +171,12 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
 - **拖动/缩放窗口时动画与帧率不受影响，多窗口互不干扰**：拖动/缩放跑在 OS 的模态消息循环里（主循环
   整个被阻塞），SDL 的 live-resize 监听器是**唯一**的帧源，且它驱动的是循环**同一个**节拍化帧泵
   （`Stage.frameRate` 不被改写，所有窗口一起重画）。详见 `docs/zh-cn/win32.md` §2.8。
+- **拖动/缩放时画面不被合成器重采样（阶段一百三十三）**：呈现路径必须 **1:1** —— macOS 的
+  `CAMetalLayer.contentsGravity` 钉 `kCAGravityTopLeft`（CALayer 默认的 `kCAGravityResize` 会把
+  drawable **拉伸铺满**），Windows 的 `DXGI_SWAP_CHAIN_DESC1.Scaling` 钉 `DXGI_SCALING_NONE`
+  （零初始化默认 `STRETCH` 会把 back buffer 拉满客户区）。这正是 AIR `scaleMode=NO_SCALE` 的语义
+  （内容尺寸固定、左上锚定）：尺寸还没跟上的那一帧原尺寸显示，故拖动时**不再整幅放大/缩小**
+  （修前实测 93 帧中有 15 帧被整体重采样，比例 0.94~0.98）。详见 `docs/zh-cn/skia.md` §6.7 与 `win32.md` §2.10。
 - 依赖库由 `vendor/build-windows-deps.ps1` 从源码编（Skia m124 `skia_use_direct3d=true`、SDL2、curl、
   zlib、nghttp2；x86/x64 双位宽，LLVM `clang-cl`，`dumpbin` 校验位宽，错位即硬失败）。完整说明、
   **未实机验证的假设清单**与 Windows 首跑核对清单见 [`win32.md`](docs/zh-cn/win32.md)。

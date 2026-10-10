@@ -278,6 +278,30 @@ resource with the adopting constructor」+「both wrap sites retain()」）。
 
 ---
 
+### 2.10 呈现必须 1:1，绝不能被 DXGI 拉伸（阶段一百三十三，**未在 Windows 实机复测**）
+
+**与 macOS 同源的缺陷**（macOS 侧见 [`skia.md`](skia.md) §6.7）：`d3d_glue.cc` 创建 swapchain 时
+**从未给 `DXGI_SWAP_CHAIN_DESC1.Scaling` 赋值**，而零初始化即 `DXGI_SCALING_STRETCH`（=0）——
+同步地，DXGI 会把 back buffer **拉伸到客户区**。这正是 Metal 侧 `kCAGravityResize` 的 D3D 对偶：
+live resize 期间我们提交的那帧 back buffer 与客户区**必然短暂不一致**（窗口在画完之后还在变大），
+拉伸语义下这一帧就把整幅画面重采样一次 ⇒ 所见的重影/抖动；且 2 帧 flip 队列会把被拉伸的帧
+多留一会儿，所以**放开鼠标后仍会抖**。
+
+**修法**：`sd.Scaling = DXGI_SCALING_NONE;`。它既是 **flip 模型要求的取值**
+（`DXGI_SCALING_STRETCH` 是给 bitblt 交换链的；flip 交换链要 `NONE`），也正是
+`kCAGravityTopLeft` 的对偶语义：尺寸未跟上的那一帧**原尺寸**呈现，而不是被拉满客户区。
+稳态（back buffer == 客户区）下两者呈现完全一致，故是纯收益。
+
+**为何未复测**：本机现为 Windows，但本节只做了**源码级**改动与验证 —— ① 改动是单字段赋值，
+枚举由已包含的 `<dxgi1_4.h>`（转引 `dxgi.h`）提供；② Metal 侧的同一缺陷已有 **15/93 vs 0/151** 的
+**实机 A/B**（`temp/resizeprobe/fast.py`），D3D 侧按该缺陷类 + 文档要求修正；③ 真正的 Windows 实机
+复验（真拖窗口看有无重影）**仍未做**，已入 §5 清单第 16 行，**不宣称已验收**。
+
+**回归钉子**：`test/unit/platform.ts` 的 `unit: platform/PresentScale`（9 条，跨
+`metal_glue.mm` / `d3d_glue.cc` 两个**互不可编译**的宿主文件 —— 正因如此才必须用源级钉子）。
+
+---
+
 ## 3. 编译器侧接线
 
 ### 3.1 `<renderMode>` 在 Windows 上的两个分支
@@ -411,6 +435,7 @@ Stage3D 的窗口合成层**已三端统一**：条件由 `ASC_RENDER_METAL` 扩
 | 13 | ✅ **Stage3D 在 D3D12 上真的上屏**（阶段一百三十二）：`examples/shmup-stage3d` 跑到 **281 帧 / 5 s**（~56 fps）、零 PSO/合成错误，`ASC_GPU_DUMP` 导出的 **presented back buffer（1500x900 BMP，4,050,054 B）** 里能看到 demo 的 Stage3D 精灵 | Stage3D 层为空／渐变黑／无精灵（合成未落地） |
 | 14 | ✅ 队列共享生效：`stage3d_d3d:` 打 `context 1000x600 ready (Direct3D 12)` 且**没有**「no shared D3D12 device」类的响亮告警 | 出现响亮告警 ⇒ Stage3D 自建设备、像素到不了窗口（黑屏但无错） |
 | 15 | ⚠ `examples/air-starling-demo` 在 Windows 目标上的完整编译/链接/运行（外部依赖面最广的那个 demo） | 未跑；仍属未验收 |
+| 16 | ⚠ **拖动缩放时画面不被拉伸**（阶段一百三十三）：`sd.Scaling = DXGI_SCALING_NONE` 是否真的去掉了 D3D12 侧的整幅重采样（是否还有重影/抖动，放开鼠标后是否停），以及 1:1 呈现时边上是否会露出未覆盖条 | 仍见重影/抖动（`Scaling` 未被 DXGI 采纳）；或新出现 1 px 未覆盖条。**判据**：真拖窗口（用户速度，非脚本慢拖）并肉眼比对；本 macOS 机上同一缺陷类的脚本判据见 [`skia.md`](skia.md) §6.7 的 15/93 vs 0/151 |
 
 **Stage3D 上屏的验证口径（重要）**：**不得**用屏幕截图判定——flip-model swapchain 的内容取不到
 GDI/BitBlt（截到的是陈旧或全黑画面）。唯一客观判据是 `ASC_GPU_DUMP=<路径> ASC_GPU_DUMP_AT=<帧号>`

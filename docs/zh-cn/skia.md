@@ -332,6 +332,53 @@ SDL 2.26 才加入）正是修复跨屏倍率 bug 的依赖，说明 2.32 对本
 
 ---
 
+### 6.7 画面必须 1:1 呈现，绝不能被合成器缩放（阶段一百三十三）
+
+**症状**：`examples/air-native`（`scaleMode=NO_SCALE` + `align=TOP_LEFT`，Metal 合成）拖动窗口做
+resize 时，**整个画面剧烈抖动** —— 不是撕裂、不是内容重排，而是整幅图在每一帧之间被放大/缩小一点点。
+
+**根因**：`CAMetalLayer` 的 `contentsGravity` **默认是 `kCAGravityResize`**（`metal_glue.mm` 里此前
+从未设置过它，注释里却写着「top-left gravity」）。于是合成器把 drawable **拉伸到铺满 layer 的
+bounds**。而 live resize 期间我们提交的那帧 drawable 与合成器此刻使用的 bounds **必然短暂不一致**：
+窗口在我们画完那一帧之后还在继续变大，所以**无论我们在绘制时刻取哪个尺寸都不可能同时满足**
+（`SDL_GetWindowSizeInPixels` 与 layer bounds 都来自 Cocoa，但合成器用的是更晚的几何）。
+Resize 语义下这一帧就把**整幅画面**按 `bounds/drawable` 重采样一次 —— 即所见的抖动。
+
+**修法**：`l.contentsGravity = kCAGravityTopLeft;`。这正是 AIR `scaleMode=NO_SCALE` 的语义
+（内容尺寸固定、左上锚定）：尺寸还没跟上的那一帧**原尺寸**显示、新露出的区域留背景，等下一帧补上，
+**永不重采样**。稳态（`drawableSize == bounds*contentsScale`）下两种 gravity 逐像素等价，故是纯收益。
+
+**实测**（`temp/resizeprobe/fast.py`：`CGWindowListCreateImage` 进程内取帧 ~68 次/s，与
+Quartz 合成的快拖并发）：
+
+- **量尺要选对（踩过一次坑）**：最初拿 demo 里固定的红色「open window」方块（100x50 逻辑 ⇒
+  2x 下应恰好 200x100 px）当尺子 —— **不行**。另有一个 100x100 的红方块会**动画漂移**到它旁边，
+  二者在 4 连通下**合并成一个分量**，读出「尺寸变了」的假象（一度被当成残留缺陷）。改用
+  **完全孤立**的 `identity` 中灰方块（44x44 逻辑 ⇒ **88x88 px** @(1120,1020)）后度量才可信。
+- **结果**（拖一次 500 px / 0.3 s）：
+
+| `contentsGravity` | 被重采样（尺寸不对）的帧 | 实测样本 |
+|---|---|---|
+| `kCAGravityResize`（修前默认） | **15 / 93**（4 次拖拽：2/24、5/23、4/23、4/23） | 83x84@(1063,981)、86x86@(1111,1014)、85x85@(1084,994)… |
+| `kCAGravityTopLeft`（修后） | **0 / 151**（6 次拖拽，且无任何异常帧） | —— |
+
+- **样本自证是「整幅重采样」而非局部扰动**：83x84@(1063,981) 的 83/88 = 0.943、
+  1063/1120 = 0.949、981/1020 = 0.962 —— **两维与原点偏移同比缩小 ~0.94**，即关于原点
+  的均匀缩放，比例逐帧在 0.94~0.98 之间变化（正是拖动中窗口尺寸在变）。
+- **不破「未绘制残留」**：修后拖拽中的瞬时帧在右下角（新露出区）**只有 2 种颜色**、与稳态帧同区域
+  一致（无接缝、无垃圾像素）—— 即新露出区显示的就是舞台背景，1:1 呈现的代价只是「背景多露一条」，
+  而不是花屏。
+
+**注意**：慢速脚本拖拽（每步 ~2 px）**看不出**这个缺陷 —— 每步的缩放比只有 ~0.3%，必须用**用户速度**
+的快拖复现（本 harness 的 `[px] [ms/step]` 参数）。早期用 `screencapture` + 慢拖取样「看起来一切正常」，
+正是这个原因。
+
+**回归钉子**：`test/unit/platform.ts` 的 `unit: platform/PresentScale`（9 条，跨两个宿主文件）；
+把两处改动回退成修前形状后其中 **5 条当场变红**。探针：`temp/resizeprobe/{fast.py,fastdump.py,measure.py,drive.py,drag.py}`。
+Windows 侧同源缺陷见 [`win32.md`](win32.md) §2.10。
+
+---
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

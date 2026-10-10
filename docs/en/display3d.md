@@ -556,43 +556,104 @@ function pointer, falling back to its own queue if unavailable), so an ordinary 
 ## 10. The Windows / Direct3D 12 Backend (landed, stage one-hundred-thirty-two)
 
 The third backend, `vendor/stage3d_d3d.cc` (~2,290 lines), is **structurally isomorphic** to
-`stage3d_glue.mm` (the same `s3d_*` ABI, the same frame-boundary batch submission model, the same semantic
-trade-offs as §9.1–§9.13 one by one) with Metal objects swapped for D3D12 ones. It consumes stage
-one-hundred-thirty-one's **AGAL → HLSL** translator target (`ASC_S3D_HLSL` ⇒ `target 2`); the build-time wiring
-is in [`win32.md`](win32.md) §3.4. Only the D3D12-specific points are recorded here.
+`stage3d_glue.mm` (Metal): the same `s3d_*` ABI, the same frame-boundary batch submission model, the same
+semantic trade-offs (§9.1–§9.13 ported one by one), with Metal objects swapped for D3D12 ones. It consumes
+stage one-hundred-thirty-one's **AGAL → HLSL** translator (`ASC_S3D_HLSL` ⇒ `target 2`); the build-time wiring
+is in [`win32.md`](win32.md) §3.4. Only the points that **differ from Metal or are D3D12-specific** are
+recorded here.
 
-**Submission model**: one command list per batch; the frame boundary only submits (no wait, as in §9.9).
-A three-deep frame slot ring plus a **deferred-release queue** keyed on fence values — D3D12 has no "command
-buffer releases its references on completion", so every replaced resource must wait for the frame that last used
-it. Constant buffers live in a per-frame-slot UPLOAD heap, but the CPU `memcpy` **must** wait for the slot first
-(measured: without it, constants "skip a frame"). Sampler descriptors are cached as immutable blocks per
-distinct sampler-state vector, because a D3D12 sampler heap has a **2048-descriptor cap** (a per-frame arena of
-12288 fails with `E_INVALIDARG`).
+### 10.1 Submission Model: Three Frame Slots + a Deferred-Release Queue
 
-**PSO cache keyed on the whole draw state**: `ID3D12PipelineState` is immutable and every drawing state must be
-baked into it (≤16 variants per program, 256 keys global, LRU). Building a PSO is expensive (it compiles
-`vs_5_1`/`ps_5_1` bytecode), far more so than the Metal-side DSS cache of §9.13.
+A Metal `MTLCommandBuffer` is inherently "submitting objectifies it"; on D3D12 everything has to be managed by
+hand:
 
-**A D3D12 linkage rule only measurement could teach**: in HLSL, `varyingN : TEXCOORDN` must be declared
-**before** `position : SV_Position`. fxc numbers a stage struct's registers in declaration order and D3D12 matches
-VS output to PS input by semantic *and* register number, so `SV_Position` first put VS's `TEXCOORD0` at register 1
-against PS's register 0 ⇒ `CreateGraphicsPipelineState` reports "Signatures between stages are incompatible".
-MSL/GLSL are order-insensitive (nails: `stage3d/agal-hlsl`). Two sibling D3D12 traps: the input layout's
-`SemanticName` must be the bare `"TEXCOORD"` with the index in `SemanticIndex`, and `D3D12_RASTERIZER_DESC` has
-**no** `ScissorEnable` (unlike D3D11).
+- **One command list per batch** (`s3d_batch_begin` → draw… → `s3d_batch_end`), then `Close()` and
+  `ExecuteCommandLists(1, …)`. The **frame boundary** (`s3d_flush_async`) only submits the current batch and does
+  not wait (the same line as §9.9).
+- **Three frame slots** (`S3D_FRAMES_IN_FLIGHT = 3`): `c->slot` names the slot the **next** batch will use;
+  `s3d_batch_begin` first calls `s3d_wait_slot(idx)` to wait for that slot's fence value, then `Reset`s that
+  slot's command allocator; `s3d_batch_end` signals `fenceValues[idx] = ++fenceNext` and advances the slot
+  number. Each slot has its own upload heap (UPLOAD heap), so with three frames in flight the CPU writing a
+  constant buffer never trips "the buffer is still in use by the previous frame".
+- **One constant buffer per frame slot** (256-aligned, growable, `S3D_CB_BYTES = 16384`), but the CPU
+  **must `s3d_wait_slot` before `memcpy`** — otherwise the CPU may write UPLOAD memory the GPU is still
+  reading (measured; the symptom was constants "skipping a frame").
+- **Deferred-release queue** (`S3DRelease rel[4096]`, each carrying a fence value; `s3d_defer_release` drains
+  by `fence->GetCompletedValue()`) — D3D12 has no "command buffer drops its references on release", so every
+  replaced resource must wait until the frame that last used it has really finished before `Release()`.
+- **Descriptor heaps**: CBV_SRV_UAV is one big arena per frame slot (`S3D_DESCS_PER_FRAME = 512*8`), RTV (64),
+  DSV (16). **The sampler heap is separate**: we first tried "one sampler arena per frame", but a D3D12
+  sampler heap has a **2048-descriptor cap** (`12288` fails outright with `E_INVALIDARG`); so instead immutable
+  blocks are cached per sampler-state vector (`S3D_MAX_SMPLCFG 256` × `S3D_MAX_TEX`), the same STATE set hits
+  repeatedly, and the real occupancy is single-digit blocks.
 
-**Compositing**: `s3d_get_render_target` returns the raw `ID3D12Resource*`; the composite *borrows* it (the
-Stage3D context keeps ownership). This borrow is the deepest trap in the whole backend: Skia's D3D backend has
-no Borrow/Adopt notion, and `GrD3DTextureResourceInfo::fResource` is a `gr_cp` whose **bare-pointer constructor
-adopts without ref'ing** while its destructor `Release()`s — handing over your only reference silently loses the
-render target (see [`win32.md`](win32.md) §2.9 for the measured frame-2 `dxgi format 0` symptom). Both wrap sites
-now use `fResource.retain(...)`.
+### 10.2 PSO Cache: the Key Is the **Whole Draw State**
 
-**Accepted / not accepted**: `examples/shmup-stage3d` reached 281 frames / 5 s (~56 fps) on D3D12 with zero PSO
-or compositing errors, and the presented back buffer exported through `ASC_GPU_DUMP` contains the demo's Stage3D
-sprites (the only valid check — a flip-model swapchain cannot be captured by GDI/BitBlt). **Not** accepted:
-`examples/air-starling-demo` has not been run on the Windows target; the culling state/winding order is a paper
-decision with no A/B measurement; the DXGI debug layer is off in the product path.
+D3D12 has no Metal-style encoder that can change state on the fly: `ID3D12PipelineState` is **immutable**, and
+every drawing state must be baked into it. So the cache key is a concatenation of every pipeline-affecting
+field (`srcHash|writeMask|depthWrite|depthCompare|stencil*|dsNeeded|cullMode|blendOn|streamSig`), at most
+`S3D_MAX_PSOVAR = 16` variants per program, `S3D_KEY_CAP 256` global, LRU eviction. This is harder than the
+Metal side (§9.13's DSS cache): `SetPipelineState` is a pure pointer binding, but **building a PSO is
+expensive** (it compiles `vs_5_1`/`ps_5_1` bytecode).
+
+### 10.3 A D3D12 Linkage Rule Only Measurement Could Teach: **Field Declaration Order Is the Register Number**
+
+In HLSL's `VSOut`, `varyingN : TEXCOORDN` must be declared **before** `position : SV_Position`. fxc numbers a
+stage struct's registers in **declaration order**, and D3D12's VS→PS matching looks at both the semantic
+name+index **and** that register number; with `SV_Position` first, VS's `TEXCOORD0` lands at reg 1 while PS's
+`TEXCOORD0` is at reg 0 ⇒ `CreateGraphicsPipelineState` reports "Signatures between stages are incompatible".
+MSL/GLSL are insensitive to field order, so **only the HLSL target** needs this (nail:
+`stage3d/agal-hlsl`'s "HLSL declares the varyings before SV_Position"). Two sibling D3D12 traps: ① the input
+layout's `SemanticName` must be the **bare name** (`"TEXCOORD"`) with the index in `SemanticIndex` — writing
+`"TEXCOORD0"` fails with `E_INVALIDARG`; ② `D3D12_RASTERIZER_DESC` has **no** `ScissorEnable` (unlike D3D11),
+so a disabled scissor expands to the whole target rect at draw time and is clipped to the target bounds.
+
+### 10.4 Compositing (Handing the 3D Frame to Skia to Draw into the Window)
+
+- `s3d_get_render_target` returns a **raw `ID3D12Resource*`** (not an `S3DTexture*`), because its only consumer
+  is `vendor/d3d_glue.cc`'s `sk_gpu_draw_texture`. The composite **borrows** that resource: ownership stays with
+  the Stage3D context, and the composite only takes one extra temporary reference for the duration of its own
+  call.
+- **This "borrow" is the deepest trap in the D3D backend**: Skia's D3D backend has **no** Borrow/Adopt
+  notion, `GrD3DTextureResourceInfo::fResource` is a `gr_cp<ID3D12Resource>`, and its **bare-pointer constructor
+  "adopts" (does not AddRef) while the destructor Release()s**. Handing in your own only reference = giving
+  away ownership (details, symptom, and the correct form are in [`win32.md`](win32.md) §2.9). Both the composite
+  and the swapchain back buffer wrap sites now use `fResource.retain(...)`.
+- The backend uses the **same** `ID3D12Device`/command queue (§3.4 of [`win32.md`](win32.md)), so
+  `sk_gpu_draw_texture` needs no CPU-side wait; but the **ordering** is still "Stage3D's batch is already
+  submitted, so its submission order precedes the composite".
+- The target must be `R8G8B8A8`/`BGRA8` and non-multisampled, otherwise it is **loudly refused** and not drawn
+  (`unsupported render target ...`, printed once).
+
+### 10.5 Acceptance (done) and **Not Accepted** (no silence)
+
+**Done (2026-10-10, local machine x86 `--air-app`)**:
+
+- `examples/shmup-stage3d` (1000x600, `renderMode=direct`, `depthAndStencil=true`,
+  `requestedDisplayResolution=high`) **opens a window and runs 281 frames / 5 s (~56 fps)**; every frame's
+  `get_render_target` returned `desc(dim=3 fmt=87 1000x600)`, every `draw_texture` was accepted, **zero**
+  `unsupported render target`, and the fence advanced monotonically.
+- **Objective pixel evidence**: the **presented back buffer** exported with
+  `ASC_GPU_DUMP=<path> ASC_GPU_DUMP_AT=40` (a 1500x900 BMP, 4,050,054 B) shows the demo's **Stage3D sprites**
+  (the spritesheet's tiles in the upper right, HiDPI-scaled). — **Whether Stage3D reaches the screen can only be
+  judged by this dump, not by screen capture**: a flip-model swapchain's contents cannot be captured through
+  GDI/BitBlt (you get a stale/all-black frame).
+- The development scaffolding (the `s3d_watch` family of lifetime probes) **has been removed from the product
+  code**; `get_render_target`'s diagnostic line is kept but made **periodic** (`n++ % 120 == 0`), and it was
+  exactly that which printed out the dangling-pointer root cause above.
+
+**Not accepted (do not claim a wider scope)**:
+
+- `examples/air-starling-demo` **has not been run** on the Windows target — it is the Stage3D project with the
+  widest external-dependency surface (127 source files + a complete Starling), and it is the **key control** for
+  whether this backend is really general.
+- **Back-face culling / winding order**: `FrontCounterClockwise = FALSE` + a positive-height viewport (no Y
+  flip) is a **paper inference** (consistent with §"D3D also has row 0 at the top"), with no culling A/B
+  measurement. Likewise the DXGI **debug layer** was off this round (the PSO `E_INVALIDARG` was poked out with
+  `temp/psoprobe.cc`'s InfoQueue; the product path does not enable it).
+- **Mip-drop / alpha blending / cube maps**: these semantics were ported per §9 one by one and have text-level
+  nails, but they **were not separately re-measured on D3D12** (`shmup-stage3d` covers only 2D sprites +
+  blending + depth-off, a small slice of the combinations).
 
 ## 11. Reference Links
 

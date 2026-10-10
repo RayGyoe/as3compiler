@@ -344,6 +344,20 @@ int sk_gpu_init(int win_id, void* native_handle) {
   // FLIP_DISCARD is the only modern presentation model (and the only one that gets
   // independent flip on Windows 10+); the swapchain is created on our own command
   // queue so that a Present can be ordered against the Signal below.
+  // No scaling: DXGI must present the back buffer 1:1, never stretch it to the
+  // window. This is both the value the flip model requires (DXGI_SCALING_STRETCH
+  // is defined for bitblt swapchains; NONE is the flip-model value) and the exact
+  // counterpart of the CAMetalLayer's kCAGravityTopLeft in metal_glue.mm: the
+  // presented frame lands un-scaled and top-left anchored.
+  //
+  // Leaving `Scaling` at its zero-initialised default means DXGI_SCALING_STRETCH,
+  // and then every frame whose back buffer size disagrees with the client rect --
+  // which is EVERY frame of a live drag, because the window keeps growing after
+  // the frame was drawn -- is rescaled to the client rect: the whole picture
+  // visibly doubles/ghosts and keeps doing so through the queued frames, which is
+  // the Windows half of the resize jitter (the macOS half was the same defect on
+  // the Metal layer, measured at 5 of 30 frames of a fast drag).
+  sd.Scaling = DXGI_SCALING_NONE;
   sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
   sd.SampleDesc.Count = 1;
 

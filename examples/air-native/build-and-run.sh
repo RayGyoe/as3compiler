@@ -50,15 +50,43 @@ if [[ -z "$SDK" ]]; then
   exit 1
 fi
 
-# The AIR SDK ships adl extension-less on macOS/Linux and as adl.exe on
-# Windows. Pick whichever launcher the SDK actually provides instead of
-# probing the host OS: uname is not guaranteed to exist and $OSTYPE is
-# unreliable in Windows shells. macOS SDKs have no adl.exe, so macOS keeps
-# its plain "adl" unchanged.
-if [[ -f "$SDK/bin/adl.exe" ]]; then
-  ADL="$SDK/bin/adl.exe"
-else
-  ADL="$SDK/bin/adl"
+# The AIR SDK bundles launchers for every platform side by side in bin/:
+# plain `adl` (macOS Mach-O), `adl.exe`/`adl64.exe` (Windows PE) and
+# `adl_linux64`/`adl_linux_arm64` (Linux ELF). Testing "does adl.exe exist?"
+# therefore selects a Windows PE binary on macOS, and exec then fails with
+# "cannot execute binary file". Select by the *host* OS instead, falling
+# back to a plain `adl` when the host is unrecognised.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  Darwin)
+    CANDIDATES=("adl" "adl64")
+    ;;
+  Linux)
+    if [[ "$(uname -m 2>/dev/null || echo unknown)" == "aarch64" ||
+          "$(uname -m 2>/dev/null || echo unknown)" == "arm64" ]]; then
+      CANDIDATES=("adl_linux_arm64" "adl")
+    else
+      CANDIDATES=("adl_linux64" "adl")
+    fi
+    ;;
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    CANDIDATES=("adl.exe" "adl64.exe" "adl")
+    ;;
+  *)
+    CANDIDATES=("adl")
+    ;;
+esac
+
+ADL=""
+for c in "${CANDIDATES[@]}"; do
+  if [[ -f "$SDK/bin/$c" ]]; then
+    ADL="$SDK/bin/$c"
+    break
+  fi
+done
+
+if [[ -z "$ADL" ]]; then
+  echo "ERROR: no AIR launcher (adl) found under $SDK/bin." >&2
+  exit 1
 fi
 
 MXMLC="$SDK/bin/mxmlc"

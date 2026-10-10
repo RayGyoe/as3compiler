@@ -131,6 +131,218 @@ and **lists every skipped entry** (no silent degradation, and what was skipped i
 
 ---
 
+### 2.6 Four Categories of MSVC Obstacles on the Program Side (the glue layer) (hit on real hardware 2026-10-10, fixed)
+
+Once the dependency libraries compiled, the **program side** (the generated `air-native.c` +
+`skia_glue.cc`/`window_glue.cc`/`d3d_glue.cc`) still had four categories of obstacles under
+`clang --target=i686-pc-windows-msvc` — all hit at compile time, all unrelated to AS3 semantics, each fixed:
+
+1. **Font backend**: `skia_glue.cc`'s `#else` (non-`__EMSCRIPTEN__`) branch hard-coded
+   `#include "include/ports/SkFontMgr_mac_ct.h"` (CoreText-only), and Windows reported
+   `unknown type name 'CTFontCollectionRef'`. Windows' GDI/DirectWrite font-manager factory is not in a
+   standalone header but in `include/ports/SkTypeface_win.h` (`SK_BUILD_FOR_WIN`, derived from `_WIN32` via
+   `SkFeatures.h`). Switched to **`SkFontMgr_New_GDI()`** — it enumerates the Windows system font collection,
+   and `gdi32` is already in SDL2's link list, so **no new dependency** (DirectWrite would need `dwrite.lib`).
+2. **Cocoa headers in `window_glue.cc`**: `#include <objc/message.h>`/`<objc/runtime.h>` had no guard, and
+   `objc_msgSend`/`SEL`/`sk_ns_msg_frame`/`sk_ns_msg_content_rect` plus the `SDL_SYSWM_COCOA`/`info.info.cocoa`
+   branch inside `sk_measure_borders` only exist on macOS ⇒ the whole block was wrapped in `#if defined(__APPLE__)`;
+   Windows falls to SDL's own `SDL_GetWindowBordersSize` (already implemented by the win32 driver).
+3. **The SDL2 `_m_prefetch` conflict**: clang 23's MSVC mode declares `_m_prefetch` as a builtin, while the
+   vendored `SDL_endian.h`'s old clang-compat shim `__inline__`-redefines it ⇒ "definition of builtin function".
+   Predefine `__PRFCHWINTRIN_H` (the include guard of `<prfchwintrin.h>`) before `#include <SDL2/SDL.h>` to skip
+   the shim — the builtin remains, and SDL's own `_m_prefetch` calls still compile.
+4. **Three type errors in `d3d_glue.cc`**: ① `g_adapter = d3d_hardware_adapter(...)` assigned a raw
+   `IDXGIAdapter1*` to a `gr_cp<IDXGIAdapter1>` (`gr_cp` has no `operator=(T*)`) ⇒ changed to `.reset(ptr)`
+   (adopt, matching `EnumAdapters1`'s +1 reference); ② `GrD3DTextureResourceInfo`'s constructor takes **8
+   arguments** (`resource, alloc, state, format, sampleCount, levelCount, sampleQualityLevel, protected`), and
+   the old code passed 7, treating `GrProtected::kNo` as the 7th (`sampleQualityLevel`) ⇒ added `0` for
+   `sampleQualityLevel` (matching Skia's own reference `D3D12WindowContext_win.cpp`) and `GrProtected::kNo` as
+   the 8th; ③ `GrBackendRenderTarget`'s D3D wrapper contains an `sk_sp<SkColorSpace>`, so a missing
+   `#include "include/core/SkColorSpace.h"` reports "member access into incomplete type 'SkColorSpace'" in
+   `SkRefCnt.h` ⇒ added the include.
+
+(This differs from §2.4's "four things that would not compile in Skia's source": those four self-heal by
+patching the **source** inside `build-windows-deps.ps1`; these four are fixed in the **in-repo glue files** and
+committed directly.)
+
+### 2.7 Three Windows-Specific Runtime Defects (hit on the real-machine first run 2026-10-10, fixed)
+
+After compiling and linking, the first run of `air-native` still exposed three **runtime** problems one by one —
+the first a crash, the last two semantic gaps in `flash.filesystem` on Windows, all unrelated to AS3:
+
+1. **Missing `icudtl.dat` → SIGILL (`ud2`)**. Skia's `SkParagraph` (`Cluster::Cluster` →
+   `codeUnitHasProperty()`) relies on ICU to fill `fCodeUnitProperties`, and on Windows `SkIcuLoader` reads the
+   ICU data from the **exe directory** (stderr prints `SkIcuLoader: datafile missing: icudtl.dat`). With the
+   file missing that table is empty, `Cluster::Cluster` indexes out of bounds and triggers `SK_ABORT`'s `ud2`
+   (exit 132). Fix: at build time **deploy `vendor/skia/lib/windows-x{N}/icudtl.dat` (10185008 bytes) into the
+   output directory automatically** — `src/build.ts` gained `deploySkiaIcuData(cfg, outPath)` (active for
+   win32+native+linked-against-skia), and `src/index.ts` calls it after a successful link
+   (`[4/4] data icudtl.dat -> ...`); `build-windows-deps.ps1` copies it alongside the artifacts too and
+   `Fail`s if missing.
+2. **async FileStream `openAsync(…, FileMode.READ)` → `__fastfail`**. The async `AS_JOB_FS_OPEN` mode mapping
+   was written as `mode = j->mode` (pass through whatever is non-empty), and `FileMode.READ` is the string
+   `"read"` — so `fopen(path, "read")`. POSIX `fopen` merely returns `NULL` for an invalid mode (a soft
+   failure, so on macOS it silently became an IOError and was never exposed); the MSVC CRT's `_invalid_parameter`
+   instead `__fastfail`s on `"read"` (0xc0000409). The synchronous path `FileStream_open` is **correct** (defaults
+   to `"rb"`, only swapping `"write"/"append"/"update"`), and the async path missed the "`"read"` falls back to
+   `"rb"`" rule ⇒ changed to the same contract as the sync path: default `"rb"`, and only compare the three
+   write modes when non-empty.
+3. **`File.deleteDirectory` cannot delete a directory**. The implementation called `remove(nativePath)` — POSIX
+   `remove()` is equivalent to `rmdir()` for a directory (deletes an empty directory), but MSVC `remove()` is
+   just `_unlink` (**files only**), so the `d.exists == false` assertion failed. Fix: added `as_rmdir_one`
+   (Windows `RemoveDirectoryA`, POSIX `rmdir`, isomorphic to `as_mkdir_one`'s `CreateDirectoryA`/`mkdir`), and
+   `deleteDirectory` calls it.
+
+### 2.8 High-DPI Mode and Three Drag/Resize Defects (hit on the real-machine second run 2026-10-10, fixed)
+
+Once `examples/air-native` with `<renderMode>direct</renderMode>` +
+`<requestedDisplayResolution>high</requestedDisplayResolution>` was actually run on real hardware, it exposed
+three problems **confined to the single layer `vendor/window_glue.cc`**. Machine here: a 3840x2560 physical
+display at 150% scaling (`GetDpiForSystem`=144, while a DPI-unaware process only sees 2560x1707). All three are
+unrelated to AS3 semantics.
+
+1. **High-DPI mode did not take effect (blurry window)**. On Windows `SDL_WINDOW_ALLOW_HIGHDPI` is a **no-op**:
+   what actually enables high DPI is the **process-level** hint `SDL_HINT_WINDOWS_DPI_SCALING=1`, which
+   (a) requests per-monitor-v2 awareness (the process is no longer bitmap-stretched by the compositor) and
+   (b) switches SDL's coordinate system to DPI-scaled **logical points** — exactly the model macOS has always
+   used (`SDL_GetWindowSize` = logical points, `SDL_GetWindowSizeInPixels` = physical pixels, whose ratio is
+   the device scale). Measured (`temp/dpiprobe/probe.c`): without the hint → logical 1000x680 / scale 1.000;
+   with `DPI_SCALING=1` → logical 1000x680, physical **1500x1020**, scale **1.500**.
+   Fix: added `sk_video_init()` as the **single** entry point for starting the video subsystem, latching the
+   hint inside it, and routed every other `SDL_Init(SDL_INIT_VIDEO)` call site in the file (three in show,
+   `sk_window_create`, `sk_window_get_display_size`) through it — the hint is only effective if set **before
+   the first init**, so leaving one bare `SDL_Init` behind is as good as randomly missing it.
+   **The gate is `ASC_DISPLAY_HIGH`**: AIR defines `standard` as "render at 1x, let the OS upscale", and a
+   DPI-unaware process already behaves exactly that way; lighting up awareness under `standard` too would be
+   cramming a 1x picture into the corner of a physical-size render target. So `standard` builds and macOS/wasm
+   **keep their behavior byte for byte** (preprocess check: after `-U_WIN32` that string vanishes).
+   Artifact measurement: stderr prints `d3d_glue: window 0 bound to 1500x1020 R8G8B8A8 swapchain` (pre-fix
+   `1000x680`), while the same run's `trace(stageWidth, stageHeight)` still prints `1000 680` — **the logical
+   size is unchanged**, matching AIR semantics.
+
+2. **Refreshing freezes during drag/resize**. Dragging/resizing runs inside the OS's own **modal message loop**,
+   and that loop is entered from inside `SDL_PumpEvents` ⇒ the whole drag blocks the main loop (real modal-loop
+   probe: during a 2.53 s drag the main loop ran only **1** iteration). The **only** thing that can emit frames
+   then is SDL's live-resize event watcher (`SDL_AddEventWatch`), and the **main window had never been attached
+   to it** — only `sk_window_show`'s CPU path and `sk_window_create` had it; the two GPU window-show paths
+   missed it. Fix: both `sk_window_show_metal` and `sk_window_show_gpu`'s D3D branch attach the same watcher.
+
+3. **Multiple windows affect each other's frame rate during drag/resize**. The old watcher **called `on_frame`
+   directly and redrew only the dragged window**, so ① the application frame was pulled up to the OS message
+   rate (`Stage.frameRate` was effectively ignored); ② the other windows did not draw a single frame and froze
+   for the whole drag. Fix: extracted steps 3–5 of the loop into a shared `sk_pump_frame()` (service resize +
+   pick the frame clock + dispatch **one** application frame on the `g_app_next` beat + mark **all** visible
+   windows dirty + redraw only the dirty ones, with an `in_pump` re-entrancy guard), and both the loop and the
+   watcher run only that, so "a frame during a drag" and "a normal frame" are word-for-word identical.
+
+**A/B measurement** (`temp/dpiprobe/probe8.c`: using `WM_NCLBUTTONDOWN`+`HTCAPTION` from a helper thread to
+enter the **real** modal move loop, two windows, two watcher behaviors; in both modes this drag received **the
+same 359 events**, i.e. `EXPOSED=260` + `MOVED=99`):
+
+| Watcher | Main loop | Application frames (2.53 s) | Dragged window redraws | **Other window redraws** |
+|---|---|---|---|---|
+| old (pre-fix) | blocked (`loopIters +1`) | **+359** (≈142 fps, following the OS event rate) | +359 | **+0 (frozen)** |
+| new (post-fix) | blocked (`loopIters +1`) | **+157** (≈62 fps, bounded by the 16 ms beat) | +157 | **+157 (keeps animating)** |
+
+In other real drags the old mode's frame counts were 1235 / 3262 (≈494 / 1300 fps), which shows it **follows
+the OS event rate** entirely rather than `frameRate`.
+
+**Who feeds the watcher during a drag** (the same hook on both platforms, so the fix is uni-directional for
+macOS too): on Windows SDL does `SetTimer(USER_TIMER_MINIMUM)` inside `WM_ENTERSIZEMOVE` → `WM_TIMER` →
+`SDL_OnWindowLiveResizeUpdate` → `SDL_WINDOWEVENT_EXPOSED` (measured 260 times), plus a
+`WM_WINDOWPOSCHANGED` → `MOVED`+`RESIZED` on every step (measured 99 times; that branch is fired
+**unconditionally** in SDL with no change detection); on macOS a 60 Hz `NSTimer` installed during live-resize
+emits the same `EXPOSED` (`src/video/cocoa/SDL_cocoawindow.m`). The two event classes are complementary, so
+even if one path is starved the beat does not drop.
+
+Probes and script: `temp/dpiprobe/{probe.c,probe8.c,ab.mjs}` (synthetic mouse injection has a failure rate; on
+failure the modal loop exits immediately, the probe reports `moved=0`, and `ab.mjs` retries until both drags
+actually moved the window before sampling). Source-level nail: `test/unit/platform.ts`'s
+`unit: platform/WindowFrame` (16 checks; reverting these three fixes to their pre-fix shape turns **7 of them
+red on the spot**).
+
+### 2.9 Skia's D3D Backend Has **No Borrow Semantics**: `gr_cp`'s "Owning" Contract (hit by Stage3D compositing 2026-10-10, fixed)
+
+This is the **deepest third-party API trap** this project has hit so far: it does not error, does not crash,
+and only happens intermittently under **concurrent timing**, yet 50 lines of printing can nail the root cause.
+First, the contract, copied here (`include/gpu/d3d/GrD3DTypes.h`, Skia m124):
+
+> there is no notion of Borrowed or Adopted resources in the D3D backend, so Ganesh will ref
+> `fResource` once it's asked to wrap it. **Clients are responsible for releasing their own ref**
+> to avoid memory leaks.
+
+`GrD3DTextureResourceInfo::fResource` is of type `gr_cp<ID3D12Resource>` (not a raw pointer), and `gr_cp`'s
+semantics are:
+
+| Operation | `AddRef`? | Release when |
+|---|---|---|
+| `gr_cp(T* obj)` constructor (**the raw-pointer form of the 8-arg constructor goes through this**) | **❌ no AddRef** ("adopts") | `~gr_cp` **does** `Release()` |
+| `gr_cp::retain(T* obj)` | ✅ +1 | |
+| `gr_cp` copy assignment / copy construction | ✅ +1 | |
+
+So handing in **your own only reference** through the raw-pointer constructor = giving away ownership; as soon
+as the function returns, `gr_cp`'s destructor `Release()`s that resource while the caller still holds a
+**dangling pointer**. Measured result (`ASC_S3D_LIFE` + `get_render_target`'s periodic print): **frame 1
+composites fine** (`desc(dim=3 TEXTURE2D fmt=87 1000x600)`), and on **frame 2 the same pointer's `GetDesc()`
+is a 144-byte vertex buffer** (`dim=1 fmt=0 w=144 h=1` — the address was recycled by the next allocation), so
+`sk_gpu_draw_texture` rejects it with `unsupported render target (dxgi format 0, 1 samples); nothing was drawn`
+and **Stage3D's frames never reach the screen again**. It looked "intermittent" (~25%) only because freed
+memory often still reads back the old contents until the allocator hands that block to someone else.
+
+The correct form (this is exactly what Skia's own `tools/window/win/D3D12WindowContext_win.cpp` does):
+
+```c
+GrD3DTextureResourceInfo info(nullptr, nullptr, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                              rd.Format, 1, 1, 0, GrProtected::kNo);
+info.fResource.retain(res);   /* take one more reference of our own; the destructor releases this one */
+```
+
+or just `info.fResource = otherGrCpRef;` (copy assignment AddRefs). **Both** wrap sites in
+`vendor/d3d_glue.cc` were changed to `retain()`: `sk_gpu_draw_texture` (compositing takes a temporary
+reference) and `d3d_setup_surfaces` (the swapchain back buffer — this **also fixes a latent double free**:
+previously every `d3d_setup_surfaces` call stole a back-buffer reference from the swapchain, which is bound to
+go wrong with two windows). Source-level nail: `test/unit/stage3d.ts`'s `stage3d/d3d-glue` group ("never wraps
+a borrowed resource with the adopting constructor" + "both wrap sites retain()").
+
+**The general form of the lesson**: before crossing a third-party API boundary, confirm three things — whether
+the parameter is **adopted** or **borrowed**, whether the destructor will release on your behalf, and whether
+the reference you hold is still needed. The name here is `GrD3DTextureResourceInfo`, but the same ambiguity is
+everywhere in C++ (the raw-pointer form of `std::unique_ptr`, the `CFRetain`/`Release` pair, and Android's
+`sp<>`).
+
+---
+
+### 2.10 Presentation Must Be 1:1, Never Stretched by DXGI (stage one-hundred-thirty-three, **not re-tested on real Windows hardware**)
+
+**A defect of the same family as macOS's** (macOS side in [`skia.md`](skia.md) §6.7): when `d3d_glue.cc`
+creates the swapchain it **never assigns `DXGI_SWAP_CHAIN_DESC1.Scaling`**, and zero-initialised that is
+`DXGI_SCALING_STRETCH` (=0) — so DXGI likewise **stretches the back buffer to the client rect**. This is
+exactly the D3D counterpart of the Metal side's `kCAGravityResize`: during a live resize the back buffer we
+submit and the client rect are **necessarily transiently inconsistent** (the window keeps growing after the
+frame was drawn), and under stretch semantics that frame rescales the whole picture once ⇒ the ghosting/jitter
+observed; and a 2-frame flip queue keeps the stretched frame around a while longer, so it **keeps jittering
+after the mouse is released**.
+
+**Fix**: `sd.Scaling = DXGI_SCALING_NONE;`. It is both **the value the flip model requires**
+(`DXGI_SCALING_STRETCH` is for bitblt swapchains; flip swapchains need `NONE`) and the exact counterpart
+semantics of `kCAGravityTopLeft`: a frame whose size has not caught up is presented at its **original size**
+rather than stretched to fill the client area. In the steady state (back buffer == client rect) the two present
+identically, so this is a pure win.
+
+**Why it was not re-tested**: this machine is currently Windows, but this section only made and verified a
+**source-level** change — ① the change is a single field assignment, and the enum comes from the already
+included `<dxgi1_4.h>` (which pulls in `dxgi.h`); ② the same defect on the Metal side already has a
+**real-hardware A/B** of **15/93 vs 0/151** (`temp/resizeprobe/fast.py`), and the D3D side is fixed per that
+defect class + the documented requirement; ③ the actual real-Windows re-verification (really dragging the
+window and looking for ghosting) **is still not done**, it is on §5's checklist row 16, and **no acceptance is
+claimed**.
+
+**Regression nail**: `test/unit/platform.ts`'s `unit: platform/PresentScale` (9 checks, spanning
+`metal_glue.mm` / `d3d_glue.cc`, two **mutually uncompilable** host files — which is precisely why source-level
+nails are required).
+
+---
+
 ## 3. Compiler-Side Wiring
 
 ### 3.1 `<renderMode>`'s Two Branches on Windows
@@ -210,10 +422,9 @@ rather than raising an `AirAppError`:
   state and winding order are still a paper decision (`FrontCounterClockwise=FALSE` + a positive viewport
   height, no Y flip) with no culling A/B measurement.
 
-See also §2.9 of the Chinese document
-([`zh-cn/win32.md`](../zh-cn/win32.md)) for the Skia D3D `gr_cp` ownership contract that this composite had to
-satisfy (`retain()` instead of the adopting bare-pointer constructor) — it is the deepest third-party-API trap
-this project has hit so far.
+See also §2.9 for the Skia D3D `gr_cp` ownership contract that this composite had to satisfy (`retain()`
+instead of the adopting bare-pointer constructor) — it is the deepest third-party-API trap this project has hit
+so far.
 
 ---
 
@@ -239,7 +450,7 @@ with `SkSamplingOptions(kLinear, kNone)`, because under HiDPI the source is devi
 logical-size). The target must be `R8G8B8A8`/`BGRA8` and non-multisampled, otherwise it is **loudly refused**
 (`unsupported render target (dxgi format %d, %u samples); nothing was drawn`, printed once). When wrapping, the
 resource must be `retain()`ed rather than passed through the bare-pointer constructor — **the deepest Skia D3D
-trap this project has hit; see §2.9 of [`zh-cn/win32.md`](../zh-cn/win32.md)**.
+trap this project has hit; see §2.9.**
 
 ---
 
@@ -257,23 +468,46 @@ On a Windows x64 machine, in order:
    (`CreateDXGIFactory1` / no available adapter / `D3D12CreateDevice` / `CreateCommandQueue` / `MakeDirect3D` /
    `CreateSwapChainForHwnd` / `WrapBackendRenderTarget`). A black window with no sound = rendering succeeded but
    drew no content; check the AS3 side.
+4. **Manually re-verify drag/resize and high DPI** (these two can only be judged by eye; see §2.8):
+   - Drag the main window's title bar and pull its bottom-right corner to resize: the animation should **keep
+     going** (neither freezing nor speeding up), and the `Fps` counter should sit near `Stage.frameRate`; after
+     clicking the red block to open a second NativeWindow, dragging the main window should leave **the second
+     window animating as usual**.
+   - On a 150%-scaled display: `d3d_glue:` should print **physical** pixels (1500x1020 on the machine here),
+     while `trace(stageWidth, stageHeight)` still prints the **logical** size (`1000 680`); with a `standard`
+     build (`<requestedDisplayResolution>standard</requestedDisplayResolution>`) the two should be **equal** and
+     the process should stay DPI-unaware (the picture is upscaled by the OS, which is AIR's definition of that
+     tier).
 
-**Unverified assumptions, item by item** (all of them fail at compile time):
+**Item-by-item results** (2026-10-10 real machine x86 + `direct` run-through: compile 1–3, link 10–12, run
+4/9/11 all confirmed; 5–8 open a window with no error, but "tearing / frame rate / exit" need eyeball
+re-verification; **stage one-hundred-thirty-two added 13/14 confirmed, 15 not accepted**):
 
 | # | Assumption | Symptom on failure |
 |---|---|---|
-| 1 | `gr_cp<T>`'s `operator&` is usable in `IID_PPV_ARGS(&x)` | compile error at the address-of (Skia's own reference writes it the same way) |
-| 2 | `GrD3DBackendContext` can be `= {}`-initialized and then assigned field by field (field names `fAdapter`/`fDevice`/`fQueue`/`fMemoryAllocator`/`fProtectedContext`) | compile error at the field name |
-| 3 | `GrD3DTextureResourceInfo(resource, alloc, state, format, levelCount, sampleCount, protected)` 7-arg constructor | compile error on that line |
-| 4 | `SkSurfaces::WrapBackendRenderTarget` can wrap the swapchain back buffer, and `kRGBA_8888_SkColorType` pairs correctly with `R8G8B8A8_UNORM` | color shift / all-black image |
-| 5 | `flush(kPresent)` makes Skia do the PRESENT→RENDER_TARGET→PRESENT state transition | DXGI debug layer reports a resource-state conflict / tearing |
-| 6 | `Present(1,0)` (wait for vsync) combined with SDL's frame loop causes no extra throttling | frame rate halved |
-| 7 | The fence protocol is correct (`buffer_index` stays constant between begin/flush) | occasional tearing / black bands |
-| 8 | Tearing down the process-level context at the last window close does not collide with still-in-flight frames | crash on exit |
-| 9 | `SDL_GetWindowWMInfo` gives `SDL_SYSWM_WINDOWS` and a valid HWND (SDL2's default win32 video driver) | `sk_attach_d3d` refuses loudly, window has no GPU |
-| 10 | `.lib`s produced by `clang --target=x86_64-pc-windows-msvc` and `clang-cl` cross-link successfully | many unresolved symbols at link time |
-| 11 | `skia_use_direct3d=true`'s gn parameter set is consistent with the `d3d12allocator` output (the parameter set was verified as accepted on the macOS side via `gn gen`) | `d3d12allocator.lib` missing at link time |
-| 12 | x86's `Repair-SkiaX86Toolchain` patch hits idempotently on the real `BUILD.gn` (the anchor and idempotence were verified on the real source) | gn reports `clang_win` not in effect / x86 built as ARM64 with cl.exe |
+| 1 | ✅ `gr_cp<T>`'s `operator&` is usable in `IID_PPV_ARGS(&x)` | (confirmed on real hardware: the glue layer compiles) |
+| 2 | ✅ `GrD3DBackendContext` can be `= {}`-initialized and then assigned field by field (field names `fAdapter`/`fDevice`/`fQueue`/`fMemoryAllocator`/`fProtectedContext`) | (confirmed on real hardware: field names correct) |
+| 3 | ✅ `GrD3DTextureResourceInfo(resource, alloc, state, format, sampleCount, levelCount, sampleQualityLevel, protected)` **8-arg** constructor (older docs wrongly said 7 args; corrected per Skia's reference, `sampleQualityLevel=0`) | (confirmed on real hardware: compiles) |
+| 4 | ✅ `SkSurfaces::WrapBackendRenderTarget` can wrap the swapchain back buffer (stderr prints `window N bound to WxH R8G8B8A8 swapchain`); whether `kRGBA_8888_SkColorType` paired with `R8G8B8A8_UNORM` **shifts color still awaits eyeballs** | color shift / all-black image |
+| 5 | ⚠ `flush(kPresent)` makes Skia do the PRESENT→RENDER_TARGET→PRESENT state transition (window opens, no DXGI error; tearing awaits eyeballs) | DXGI debug layer reports a resource-state conflict / tearing |
+| 6 | ⚠ `Present(1,0)` (wait for vsync) combined with SDL's frame loop causes no extra throttling (frame rate awaits eyeballs) | frame rate halved |
+| 7 | ⚠ the fence protocol is correct (`buffer_index` stays constant between begin/flush; two windows opened back-to-back with no error; black bands await eyeballs) | occasional tearing / black bands |
+| 8 | ⚠ tearing down the process-level context at the last window close does not collide with still-in-flight frames (headless runs never close a window, so the exit path is not covered) | crash on exit |
+| 9 | ✅ `SDL_GetWindowWMInfo` gives `SDL_SYSWM_WINDOWS` and a valid HWND (SDL2's default win32 video driver; window bound successfully) | `sk_attach_d3d` refuses loudly, window has no GPU |
+| 10 | ✅ `.lib`s produced by `clang --target=i686-pc-windows-msvc` and `clang-cl` cross-link successfully (40+ `.lib`s linked) | many unresolved symbols at link time |
+| 11 | ✅ `skia_use_direct3d=true`'s gn parameter set is consistent with the `d3d12allocator` output (links, `d3d12allocator.lib` present) | `d3d12allocator.lib` missing at link time |
+| 12 | ✅ x86's `Repair-SkiaX86Toolchain` patch hits idempotently on the real `BUILD.gn` (x86 `.lib`s produced on real hardware and linked) | gn reports `clang_win` not in effect / x86 built as ARM64 with cl.exe |
+| 13 | ✅ **Stage3D really reaches the screen on D3D12** (stage one-hundred-thirty-two): `examples/shmup-stage3d` runs **281 frames / 5 s** (~56 fps) with zero PSO/composite errors, and the **presented back buffer (1500x900 BMP, 4,050,054 B)** exported by `ASC_GPU_DUMP` shows the demo's Stage3D sprites | Stage3D layer empty / gradient black / no sprites (compositing not landed) |
+| 14 | ✅ queue sharing works: `stage3d_d3d:` prints `context 1000x600 ready (Direct3D 12)` and there is **no** loud "no shared D3D12 device"-class warning | a loud warning appears ⇒ Stage3D built its own device and pixels never reach the window (black but no error) |
+| 15 | ⚠ complete compile/link/run of `examples/air-starling-demo` on the Windows target (the demo with the widest external-dependency surface) | not run; still unaccepted |
+| 16 | ⚠ **the picture is not stretched while dragging to resize** (stage one-hundred-thirty-three): whether `sd.Scaling = DXGI_SCALING_NONE` really removes the whole-picture rescale on the D3D12 side (any ghosting/jitter left, and whether it stops after the mouse is released), and whether 1:1 presentation leaves an uncovered strip at the edges | still ghosting/jittering (DXGI did not honour `Scaling`); or a new 1 px uncovered strip. **Criterion**: really drag the window (user speed, not a slow scripted drag) and compare by eye; the scripted criterion for the same defect class on this macOS machine is the 15/93 vs 0/151 in [`skia.md`](skia.md) §6.7 |
+
+**How to verify Stage3D reaches the screen (important)**: **do not** judge by screen capture — a flip-model
+swapchain's contents cannot be captured through GDI/BitBlt (you get a stale or all-black frame). The only
+objective criterion is the **back-buffer BMP** exported via `ASC_GPU_DUMP=<path> ASC_GPU_DUMP_AT=<frame>`
+(note the environment variable's value is a **file path**, not a switch), then eyeballing/byte-checking that it
+contains 3D content. Note the dump goes through `d3d_dump_backbuffer`, which prints an `ASC_GPU_DUMP: <reason>`
+line on every early return, so there is no such thing as a "silent non-export".
 
 **Parts already verified on macOS** (no need to re-verify): `<architecture>` parsing and rejection behavior;
 under win32 emulation both the 32/64 manifests are correct field by field (no `z` / no `objc` / `frameworks: []` /

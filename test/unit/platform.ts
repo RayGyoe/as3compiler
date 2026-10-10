@@ -877,10 +877,93 @@ function checkAudioWiring(): string[] {
   return bad;
 }
 
+// Presentation must never be rescaled by the platform compositor (阶段一百三十三).
+//
+// The GPU backends handed the frame to the OS and let it scale-to-fit, which both
+// platforms default to:
+//   * Metal  — CALayer's default contentsGravity is kCAGravityResize, so the
+//              layer stretches the drawable to its bounds;
+//   * D3D12  — a zero-initialised DXGI_SWAP_CHAIN_DESC1.Scaling is
+//              DXGI_SCALING_STRETCH, so DXGI stretches the back buffer to the
+//              client rect.
+// During a live resize the presented frame is transiently a different size than
+// the window the compositor has already grown to -- the window keeps growing
+// after the frame was drawn, so the mismatch is inherent -- and scale-to-fit then
+// rescales the WHOLE picture for that frame. Measured on the air-native demo
+// (Retina 2x, fast programmatic drag, canary = an ISOLATED 44x44 logical / 88x88
+// px mid-gray square at (1120,1020)): with the resize default 15 of 93 captured
+// frames showed a uniform rescale about the origin (k ~ 0.94-0.98, e.g. 83x84 at
+// (1063,981) -- both dims AND the origin offset scaled together), and with
+// top-left 0 of 151 frames across 6 drags. The red "open window" box is NOT a
+// usable canary: an animated 100x100 red square drifts against it and the two
+// merge into one 4-connected component, which reads as a bogus size change.
+// Same demo, same drag script, same measurement: temp/resizeprobe/fast.py.
+//
+// Both are pinned here because neither default is visible in a diff: each is the
+// *absence* of an assignment, and both files are host-only (the macOS half cannot
+// be compiled on Windows and vice versa), so only a source-level pin catches a
+// regression on the other host. Evidence for the D3D half is the same defect
+// class measured on Metal plus the documented flip-model requirement; it has NOT
+// been re-measured on Windows hardware.
+function checkPresentScale(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [presentscale] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [presentscale] ${label}`); }
+  };
+
+  // The .cc/.mm files are CRLF in a Windows checkout; normalise before matching.
+  const read = (rel: string): string =>
+    readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
+  // Comments matter here: the prose above names kCAGravityResize /
+  // DXGI_SCALING_STRETCH, so only the real code may be searched.
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  // ---- Metal: lay the drawable out 1:1 from the top-left, never scale it ----
+  const mtl = strip(read('metal_glue.mm'));
+  // Any contentsGravity assignment other than top-left is the bug (the file may
+  // still *name* kCAGravityResize when logging the gravity it found).
+  check('the CAMetalLayer is not assigned a scale-to-fit gravity',
+    !/contentsGravity\s*=(?!\s*kCAGravityTopLeft\s*;)/.test(mtl));
+  check('...it is pinned to kCAGravityTopLeft, exactly once',
+    (mtl.match(/contentsGravity\s*=\s*kCAGravityTopLeft;/g) ?? []).length === 1);
+  const iCast = mtl.indexOf('CAMetalLayer* l =');
+  const iGrav = mtl.indexOf('contentsGravity = kCAGravityTopLeft;');
+  const iDev = mtl.indexOf('l.device =');
+  check('...on the attached layer, before that layer is configured or stored',
+    iCast >= 0 && iGrav > iCast && iDev > iGrav);
+  check('...so the drawable size stays what SDL reported (the gravity is the only change)',
+    /m->layer\.drawableSize = CGSizeMake\(\(CGFloat\)width, \(CGFloat\)height\);/.test(mtl));
+
+  // ---- D3D12: present the back buffer 1:1, never stretch it to the client rect ----
+  const d3d = strip(read('d3d_glue.cc'));
+  check('dxgi1_4.h is included (it is what defines the scaling enum)',
+    /#include <dxgi1_\d\.h>/.test(d3d));
+  check('the D3D12 swapchain is not left on the scale-to-fit default',
+    !/DXGI_SCALING_STRETCH/.test(d3d) &&
+    !/DXGI_SCALING_ASPECT_RATIO_STRETCH/.test(d3d) &&
+    !/Scaling\s*=\s*0\b/.test(d3d));
+  check('...it asks for DXGI_SCALING_NONE, exactly once',
+    (d3d.match(/sd\.Scaling = DXGI_SCALING_NONE;/g) ?? []).length === 1);
+  const iDesc = d3d.indexOf('DXGI_SWAP_CHAIN_DESC1 sd = {};');
+  const iScale = d3d.indexOf('sd.Scaling = DXGI_SCALING_NONE;');
+  const iCreate = d3d.indexOf('CreateSwapChainForHwnd(');
+  check('...on the same desc CreateSwapChainForHwnd consumes',
+    iDesc >= 0 && iScale > iDesc && iCreate > iScale);
+  check('...and the swapchain is still created at the client rect it will be shown in',
+    /GetClientRect\(hwnd, &rc\);/.test(d3d) && /sd\.Width = \(UINT\)cw;/.test(d3d));
+
+  if (ok > 0) console.log(`[presentscale] ${ok} presentation-scaling checks passed`);
+  return bad;
+}
+
 registerGroup('unit: platform/AudioWiring', checkAudioWiring);
 registerGroup('unit: platform/Screen', checkScreen);
 registerGroup('unit: platform/NativeWindow', checkNativeWindow);
 registerGroup('unit: platform/BackendParity', checkBackendParity);
 registerGroup('unit: platform/WindowFrame', checkWindowFrame);
+registerGroup('unit: platform/PresentScale', checkPresentScale);
 registerGroup('unit: platform/NullRef', checkNullRef);
 registerGroup('unit: platform/Intervals', checkIntervals);

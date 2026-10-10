@@ -166,6 +166,25 @@ On Windows, `--air-app` uses **Win32 + SDL2 + Skia D3D12 direct-to-GPU**. The bi
   **281 frames / 5 s** with zero PSO/composite errors, and the `ASC_GPU_DUMP` back buffer **shows the demo's
   Stage3D sprites**. Not yet verified: `examples/air-starling-demo` has not been run on the Windows target;
   back-face culling / winding is still a paper decision (see `docs/en/display3d.md` §10, `docs/en/win32.md` §3.4).
+- **High DPI (`<requestedDisplayResolution>high</requestedDisplayResolution>`) works on Windows through a
+  process-level hint** (`SDL_HINT_WINDOWS_DPI_SCALING=1`, which also implies per-monitor-v2 ⇒ no longer
+  bitmap-stretched by the compositor): the logical size and the physical pixels are separated (on a 150%-scaled
+  display, `1000x680` logical → `1500x1020` physical, while `stage.stageWidth/Height` still report the
+  **logical** values). That hint latches **only in `high` builds** (`ASC_DISPLAY_HIGH`): AIR defines `standard`
+  as "render at 1x and let the OS upscale", which is already what a DPI-unaware process does, so `standard`,
+  macOS and wasm keep their original behavior byte for byte.
+- **Dragging/resizing the window does not affect the animation or frame rate, and multiple windows do not
+  interfere**: drag/resize runs inside the OS's modal message loop (which blocks the whole main loop), and
+  SDL's live-resize watcher is the **only** frame source, driving the loop's **same** clocked frame pump
+  (`Stage.frameRate` is not rewritten and all windows redraw together). See `docs/en/win32.md` §2.8.
+- **The picture is not rescaled by the compositor while dragging/resizing (stage 133)**: the presentation
+  path must be **1:1** — macOS pins `CAMetalLayer.contentsGravity` to `kCAGravityTopLeft` (CALayer's default
+  `kCAGravityResize` **stretches** the drawable to fill the bounds), and Windows pins
+  `DXGI_SWAP_CHAIN_DESC1.Scaling` to `DXGI_SCALING_NONE` (the zero-initialised default `STRETCH` fills the back
+  buffer to the client rect). This is exactly AIR's `scaleMode=NO_SCALE` semantics (content size fixed, anchored
+  top-left): a frame whose size has not caught up shows at its original size, so dragging **no longer scales the
+  whole picture** (pre-fix, 15 of 93 frames were rescaled, ratios 0.94~0.98). See `docs/en/skia.md` §6.7 and
+  `win32.md` §2.10.
 - The dependency libraries are built from source by `vendor/build-windows-deps.ps1` (Skia m124 `skia_use_direct3d=true`, SDL2, curl,
   zlib, nghttp2; both x86/x64 widths, LLVM `clang-cl`, bit width verified with `dumpbin`, a mismatch hard-fails). Full details,
   the list of **assumptions not verified on real hardware**, and the Windows first-run checklist are in [`win32.md`](docs/en/win32.md).
