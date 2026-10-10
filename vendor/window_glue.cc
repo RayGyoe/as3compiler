@@ -1549,8 +1549,17 @@ int sk_window_create(int w, int h, const char* title, int resizable, int decorat
   // the CLIENT area — which would place the frame 16pt above adl's. Re-place it so
   // bounds matches adl's measured numbers; the +1 before halving reproduces adl's
   // rounding of the .5 remainder (1800-400 -> 700, 1169-232 -> 469).
+  //
+  // Center on the display SDL actually put the window on, NOT display 0: SDL's
+  // display indices come from the OS and 0 is not guaranteed to be the primary
+  // monitor. On a two-display machine where 0 is a secondary screen, centering on
+  // 0 moved new windows off-screen (measured: display 0 = 2560x1707 @(-333,-1707),
+  // so y came out around -1377). SDL places a fresh window on the display it
+  // chooses, so its index is the right one; fall back to 0 if SDL cannot say.
+  int disp = SDL_GetWindowDisplayIndex(c->win);
+  if (disp < 0) disp = 0;
   int dx = 0, dy = 0, dw = 0, dh = 0;
-  if (sk_display_bounds(0, &dx, &dy, &dw, &dh)) {
+  if (sk_display_bounds(disp, &dx, &dy, &dw, &dh)) {
     int fw = w + c->b_left + c->b_right;
     int fh = h + c->b_top + c->b_bottom;
     SDL_SetWindowPosition(c->win, dx + (dw - fw + 1) / 2, dy + (dh - fh + 1) / 2 + c->b_top);

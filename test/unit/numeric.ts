@@ -132,3 +132,46 @@ function checkNoreturn(): string[] {
 
 registerGroup('unit: numeric/Int64', checkInt64);
 registerGroup('unit: numeric/Noreturn', checkNoreturn);
+
+// ES3/AIR parseInt & parseFloat. The examples suite runs examples/parse-int.as
+// (assertions against adl 51.4.1), but the emitter shape and the runtime helpers
+// are only visible here: parseInt must return a Number (not int), pass the radix
+// through, and the two runtime scanners must implement AVM2's measured quirks
+// (trailing junk ignored, 0x stripped only at radix 0/16, leading zeros decimal,
+// "5e-" NaN but "5e"/"5e+" rewound). Reference: temp/qfix/gcadl/p{1,2,3,4}Main.as
+// -> 82 paired lines, 0 diff.
+function checkParseIntFloat(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [numparse] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [numparse] ${label}`); }
+  };
+
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const flat = pre.replace(/\s+/g, ' ');
+  const call = generateC(parse('function zzq():Number { return parseInt("ff", 16); }\nvar qq:Number = zzq();\ntrace(qq);\n')).c;
+  check('parseInt compiles to the helper, not atoi',
+    call.includes('return as_parse_int("ff", ((double)(16)));') && !/return atoi\(/.test(call));
+  check('the radix is passed through', call.includes('as_parse_int("ff", ((double)(16)))'));
+  check('a radix-less call defaults to 0 (auto-detect)',
+    /as_parse_int\([^)]*, 0\.0\)/.test(generateC(parse('var n:Number = parseInt("ff");\ntrace(n);\n')).c));
+  check('parseInt returns a Number, not an int', call.includes('static double zzq()'));
+  check('the auto-detect branch sets radix 16 on a 0x/0X prefix',
+    flat.includes("if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { radix = 16; p += 2; }"));
+  check('...and radix 10 otherwise (leading zeros stay decimal)',
+    flat.includes('else radix = 10;'));
+  check('an explicit radix 16 also strips the 0x prefix',
+    flat.includes("else if (radix == 16 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { p += 2; }"));
+  check('an invalid radix is NaN', flat.includes('} else if (radix < 2 || radix > 36) { return NAN; }'));
+  check('a digitless scan is NaN', flat.includes('if (digits == 0) return NAN;'));
+  check('parseFloat ignores trailing junk (scan, not full-string)',
+    flat.includes('return strtod(buf, NULL);'));
+  check('parseFloat is case-sensitive about Infinity',
+    flat.includes('if (strncmp(p, "Infinity", 8) == 0) return (start[0] == \'-\') ? -INFINITY : INFINITY;'));
+  check('the "5e-" NaN quirk is encoded', flat.includes('} else if (eneg) {') && flat.includes('// "5e-" is NaN'));
+
+  console.log(`     [numparse] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: numeric/ParseIntFloat', checkParseIntFloat);

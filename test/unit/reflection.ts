@@ -467,8 +467,11 @@ function checkMemberShadow(): string[] {
   check('the EventDispatcher `parent` slot survives as the runtime ABI anchor',
     c.includes('{ "parent", 12, offsetof(EventDispatcher, parent) },'));
   const cu = generateC(parse('class U extends Sprite { }\nvar u:U = new U();\nu.name = "k";\nvar n:String = u.name;\n')).c;
+  // The write still goes straight to the slot (no setter); it is only wrapped by
+  // the DisplayObject.name #2007 guard (AIR rejects a null name; measured on
+  // adl 51.4.1, temp/qfix/gcadl/result16.txt).
   check('an unshadowed inherited field is still read/written directly',
-    cu.includes('->name) = "k", gc_write_barrier')
+    cu.includes('->name) = as_req_name("k"), gc_write_barrier')
     && cu.includes('->name);')
     && !cu.includes('get_name('));
 

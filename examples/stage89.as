@@ -45,7 +45,14 @@ check(cast2 != null, "as Vector.<int> (matched)");
 // --- 7. get 作为方法名（与访问器关键字冲突）+ 接口 getter ---
 check(new Bucket().get(5) == 5, "method named get()");
 var helper:IHelper = new Helper();
-check(helper.targetBounds() == 100, "interface getter implemented");
+// An accessor named as a method is READ-THEN-CALL in AIR: the getter's value is
+// read and then invoked, so `helper.targetBounds()` throws TypeError #1006
+// ("value is not a function.") -- the property read itself is fine. Measured on
+// adl 51.4.1 (temp/qfix/gcadl).
+check(helper.targetBounds == 100, "interface getter read");
+var getterCallErr:int = 0;
+try { helper.targetBounds(); } catch (e:*) { getterCallErr = e.errorID; }
+check(getterCallErr == 1006, "interface getter-as-method throws #1006");
 
 trace("stage89 OK");
 

@@ -197,6 +197,12 @@ function checkCodegenDiagnostics(): string[] {
   const g9 = gen('var a:int = 0;\nvar b:* = new Nope();');
   check('a top-level initializer error carries the top-level line',
     g9?.message === "Codegen error at 2:1: unknown class 'Nope'");
+  // Only Object/any module variables are dynamic-construction candidates; a
+  // module-level scalar slot stays a loud compile error (the fix for
+  // examples/top-dynnew.as must not silently accept every identifier).
+  const g9b = gen('var n:int = 0;\nvar x:* = new n();');
+  check('a module-level non-Object/any variable still fails new',
+    g9b?.message === "Codegen error at 2:1: unknown class 'n'");
   // The prefix must survive a message WRAP: the constructor-argument rethrow adds
   // detail to a bare message, and the `with` lexical fallback matches on the bare
   // text (both would break if the prefix leaked in).

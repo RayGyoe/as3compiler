@@ -30,4 +30,18 @@ var font:XML = new XML("<font><info face='Arial' size='12'/><pages><page id='0' 
 check(font.info.@face == "Arial", "font.info.@face");
 check(font.pages.page.@file == "arial.png", "font.pages.page.@file");
 
+// --- 5. 多元素 XMLList 的 @attr 标量上下文 = 拼接串（E4X）---
+// adl 51.4.1（temp/qfix/xmlattr.body.as）：list.@attr 在标量上下文把每个条目的
+// 属性值按文档序拼接、无分隔符；缺失/空值不计入。单元素形态以上已覆盖，这里钉多元素。
+var multi:XML = new XML("<r><item at='1'/><item at='2'/></r>");
+check(multi.item.@at == "12", "multi-item @attr concatenates");
+check(multi.item.@at.toString() == "12", "multi-item @attr .toString()");
+check(multi.item.@["at"] == "12", "multi-item @[\"at\"] concatenates");
+var three:XML = new XML("<r><item at='a'/><item at='b'/><item at='c'/></r>");
+check(three.item.@at == "abc", "three-item @attr concatenates");
+var partial:XML = new XML("<r><item at='1'/><item/></r>");
+check(partial.item.@at == "1", "missing attribute contributes nothing");
+var none:XML = new XML("<r><item/><item/></r>");
+check(none.item.@at == "", "no attributes at all yields empty string");
+
 trace("stage91 OK");

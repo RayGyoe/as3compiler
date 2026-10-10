@@ -1064,6 +1064,9 @@ typedef struct {
 } as_value;
 
 static as_value as_v_null(void)     { as_value v = {0, 0.0, NULL}; return v; }
+// defined with the XML helpers further down; used by the array/object reads
+// below, which return AIR's undefined for a missing element/property.
+static as_value as_v_undefined(void);
 static as_value as_v_num(double d)  { as_value v = {1, d, NULL}; return v; }
 static as_value as_v_bool(bool b)   { as_value v = {2, b ? 1.0 : 0.0, NULL}; return v; }
 // A NULL char* is AS3's null, NOT a String holding a NULL pointer. A tag-3 box
@@ -1251,6 +1254,85 @@ static double as_str_to_number(const char* s) {
     if (*e != '\\0') return NAN;
     return neg ? -d : d;
 }
+// AS3 parseInt(str:String, radix:uint = 0):Number -- the ES3 grammar with AVM2's
+// measured deviations (adl 51.4.1, temp/qfix/gcadl/pMain.as + p2/p3/p4): trailing
+// junk is IGNORED ("12abc" -> 12), the radix is honored ("ff",16 -> 255), a 0x/0X
+// prefix is auto-detected at radix 0 AND stripped when radix 16 is explicit
+// ("0xB",16 -> 11) but NOT at other radixes ("0x10",10 -> 0), leading zeros are
+// DECIMAL ("010" -> 10, no octal), and a bad radix or a digitless string is NaN.
+// Distinct from Number(str), which rejects trailing junk.
+static double as_parse_int(const char* str, double radixd) {
+    if (str == NULL) return NAN;
+    const char* p = str;
+    while (*p == ' ' || *p == '\\t' || *p == '\\n' || *p == '\\v' || *p == '\\f' || *p == '\\r') p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+    int radix = as_to_int32(radixd);
+    if (radix == 0) {
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { radix = 16; p += 2; }
+        else radix = 10;
+    } else if (radix < 2 || radix > 36) {
+        return NAN;
+    } else if (radix == 16 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+    double acc = 0.0;
+    int digits = 0;
+    for (;; p++) {
+        int c = (unsigned char)*p;
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+        else break;
+        if (d >= radix) break;
+        acc = acc * (double)radix + (double)d;
+        digits++;
+    }
+    if (digits == 0) return NAN;
+    return neg ? -acc : acc;
+}
+// AS3 parseFloat(str:String):Number -- the longest prefix that is a decimal
+// literal; trailing junk is ignored ("5e3junk" -> 5000, "5x" -> 5) unlike
+// Number(). AVM2 quirks measured on adl 51.4.1 (temp/qfix/gcadl/p3/p4): an
+// exponent marker with no digits REWINDS ("5e" / "5e+" -> 5) unless it is a bare
+// minus ("5e-" -> NaN), "Infinity" is case-sensitive, "Inf" is NaN.
+static double as_parse_float(const char* str) {
+    if (str == NULL) return NAN;
+    const char* p = str;
+    while (*p == ' ' || *p == '\\t' || *p == '\\n' || *p == '\\v' || *p == '\\f' || *p == '\\r') p++;
+    const char* start = p;
+    if (*p == '+' || *p == '-') p++;
+    if (strncmp(p, "Infinity", 8) == 0) return (start[0] == '-') ? -INFINITY : INFINITY;
+    const char* ds = p;
+    while (*p >= '0' && *p <= '9') p++;
+    int ndig = (int)(p - ds);
+    if (*p == '.') {
+        p++;
+        const char* fs = p;
+        while (*p >= '0' && *p <= '9') p++;
+        ndig += (int)(p - fs);
+    }
+    if (ndig == 0) return NAN;
+    if (*p == 'e' || *p == 'E') {
+        const char* r = p + 1;
+        int eneg = 0;
+        if (*r == '+' || *r == '-') { eneg = (*r == '-'); r++; }
+        if (*r >= '0' && *r <= '9') {
+            p = r;
+            while (*p >= '0' && *p <= '9') p++;
+        } else if (eneg) {
+            return NAN;   // "5e-" is NaN, but "5e" / "5e+" rewind to the mantissa
+        }
+        // else: no exponent digits -> the marker is not part of the literal.
+    }
+    size_t n = (size_t)(p - start);
+    char buf[64];
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, start, n);
+    buf[n] = 0;
+    return strtod(buf, NULL);
+}
 // AS3 global conversion functions int(x)/uint(x)/Number(x) applied to a dynamic
 // 'any' value. Unlike the 'as' type-checked casts (as_v_cast_*), these COERCE: a
 // String operand parses its numeric text, a Boolean maps to 1/0. The value-path
@@ -1262,6 +1344,13 @@ static double as_str_to_number(const char* s) {
 // not visible yet at this point in the preamble, so the helper is declared here
 // and defined next to the other array functions.
 static char* as_arr_to_str(void* a);
+// ES3 ToNumber(Object): NUMBER-hint ToPrimitive -- valueOf() first, then
+// toString() -- then stringToDouble on the resulting primitive. Measured on adl
+// 51.4.1 (temp/qfix/gcadl/numMain.as): Number({}) is NaN, Number(a class whose
+// toString() gives "42") is 42, and a valueOf() override wins over toString()
+// (WithValueOf -> 7, not 99). Object's default valueOf returns the receiver, so a
+// class that does not override it falls through to toString.
+static double as_obj_to_number(void* obj);
 static double as_v_to_number(as_value v) {
     if (v.tag == 3) return as_str_to_number((char*)v.ptr);
     if (v.tag == 2) return v.num;         // bool: 1.0 or 0.0
@@ -1272,12 +1361,13 @@ static double as_v_to_number(as_value v) {
     if (v.tag == 8) return (double)v.i64;
     if (v.tag == 9) return (double)v.u64;
     // Arrays: Number([5]) is 5, Number([]) is 0, Number([1,2]) is NaN (the join
-    // is "1,2", which is not a number) -- adl 51.4.1, temp/pkgA/arrnum. Object
-    // values keep 0 for now: AIR runs the NUMBER-hint ToPrimitive there (valueOf
-    // first, then toString), which needs a valueOf vtable slot (TODO.md 遗留:
-    // 对象字面量/类实例的 ToPrimitive).
+    // is "1,2", which is not a number) -- adl 51.4.1, temp/pkgA/arrnum.
     if (v.tag == 6 && v.ptr != NULL) return as_str_to_number(as_arr_to_str(v.ptr));
-    return 0.0;                           // null/undefined/object -> 0
+    // An object runs the NUMBER-hint ToPrimitive (valueOf -> toString).
+    if (v.tag == 4) return as_obj_to_number(v.ptr);
+    // undefined and a Function value are NaN; null is 0 (ES3 9.3).
+    if (v.tag == 5 || v.tag == 7) return NAN;
+    return 0.0;                           // null -> 0
 }
 static int as_v_to_int(as_value v) {
     // A String goes through ES3 ToNumber, exactly like int(String) does -- so
@@ -1290,6 +1380,9 @@ static int as_v_to_int(as_value v) {
     if (v.tag == 9) return (int)(uint32_t)(v.u64 & 0xFFFFFFFFu);
     // An Array goes through its join(",") first (int([3]) is 3, adl 51.4.1).
     if (v.tag == 6 && v.ptr != NULL) return as_to_int32(as_str_to_number(as_arr_to_str(v.ptr)));
+    // An object goes through ToNumber first (int/uint of a class whose toString
+    // is "42" give 42); undefined/function give ToNumber NaN -> ToInt32 0.
+    if (v.tag == 4) return as_to_int32(as_obj_to_number(v.ptr));
     return 0;
 }
 static unsigned as_v_to_uint(as_value v) {
@@ -1300,6 +1393,9 @@ static unsigned as_v_to_uint(as_value v) {
     if (v.tag == 9) return (unsigned)(uint32_t)(v.u64 & 0xFFFFFFFFu);
     // Same array ToPrimitive as as_v_to_int (uint([3]) is 3 on adl 51.4.1).
     if (v.tag == 6 && v.ptr != NULL) return as_to_uint32(as_str_to_number(as_arr_to_str(v.ptr)));
+    // An object goes through ToNumber first (int/uint of a class whose toString
+    // is "42" give 42); undefined/function give ToNumber NaN -> ToUint32 0.
+    if (v.tag == 4) return as_to_uint32(as_obj_to_number(v.ptr));
     return 0u;
 }
 // ToInt64 / ToUint64 (the int64(x)/uint64(x) coercion functions, and the static
@@ -1402,6 +1498,31 @@ static bool as_v_is_nullish(as_value v) { return v.tag == 0 || v.tag == 5; }
 // receiver plus a uniform boxed argument list and returns a boxed result, so
 // any method can be invoked through a single as_dyn_call dispatch point.
 typedef struct { const char* name; as_value (*fn)(void* _this, as_value* args, int argc); } as_method;
+// ES3 ToNumber(Object): the NUMBER-hint ToPrimitive (valueOf first, then
+// toString) followed by stringToDouble on the primitive. Defined here because
+// it needs the as_method struct above; as_v_to_number forward-declares it.
+static double as_obj_to_number(void* obj) {
+    if (obj == NULL) return 0.0;
+    void* vt = ((as_object_header*)obj)->vtable;
+    if (vt == NULL) return 0.0;
+    // 1) valueOf(): a user override lives in the method table. The built-in
+    //    Object.valueOf is not emitted as a method and returns the receiver, so
+    //    its absence IS the "falls through to toString" case.
+    as_method* methods = (as_method*)((as_vtable_header*)vt)->methods;
+    if (methods != NULL) {
+        for (int i = 0; methods[i].name != NULL; i++) {
+            if (strcmp(methods[i].name, "valueOf") == 0) {
+                as_value r = methods[i].fn(obj, NULL, 0);
+                if (r.tag != 4 && r.tag != 6 && r.tag != 7) return as_v_to_number(r);
+                break;   // valueOf returned an object -> fall through to toString
+            }
+        }
+    }
+    // 2) toString() through the vtable slot the string path already uses.
+    char* (*toStr)(void*) = ((as_vtable_header*)vt)->toString;
+    char* s = toStr != NULL ? toStr(obj) : as_obj_default_str(obj);
+    return as_str_to_number(s != NULL ? s : "");
+}
 // Prototype for the Proxy interceptor dispatcher, defined with the array helpers
 // below (measure: as_dyn_call must reach a dynamic Proxy subclass's callProperty).
 static as_value as_proxy_call(void* obj, const char* mname, as_value* args, int argc);
@@ -1748,6 +1869,15 @@ static bool as_v_loose_eq(as_value a, as_value b) {
                                                    : as_v_to_number(a) == as_v_to_number(b);
     if (b.tag == 6 && aScalar) return (a.tag == 3) ? strcmp(as_arr_to_str(b.ptr), (char*)a.ptr) == 0
                                                    : as_v_to_number(a) == as_v_to_number(b);
+    // An OBJECT compared to a primitive goes through ToPrimitive (ES3 11.9.3):
+    // string-hint vs a String, number-hint vs a Number/Bool, and FALSE vs
+    // null/undefined (no coercion). Measured on adl 51.4.1 (temp/qfix/gcadl):
+    // ({})=="[object Object]" is true, ({})=0 is false, a class with toString
+    // "42" == 42 is true.
+    if (a.tag == 4 && b.tag == 3) return strcmp(as_obj_to_str(a.ptr), (char*)b.ptr) == 0;
+    if (b.tag == 4 && a.tag == 3) return strcmp(as_obj_to_str(b.ptr), (char*)a.ptr) == 0;
+    if (a.tag == 4 && bn) return as_obj_to_number(a.ptr) == as_v_to_number(b);
+    if (b.tag == 4 && an) return as_obj_to_number(b.ptr) == as_v_to_number(a);
     return (a.tag == 0 && b.tag == 5) || (a.tag == 5 && b.tag == 0);
 }
 
@@ -2448,7 +2578,10 @@ static void as_array_ensure(as_array* a, int need) {
     for (int i = 0; i < a->length; i++) gc_write_barrier_value(nd[i]);
 }
 static as_value as_array_get(as_array* a, int i) {
-    if (i < 0 || i >= a->length) return as_v_null();
+    // A missing index is AIR's undefined, not null: 'var e:*=[1,2,3,4]; e.length=2;
+    // e[3]' is undefined (=== undefined true, == null true) and 'x' + e[3] is
+    // "xundefined" (measured on adl 51.4.1, temp/qfix/gcadl/arrMain.as).
+    if (i < 0 || i >= a->length) return as_v_undefined();
     return a->data[i];
 }
 static as_value as_array_set(as_array* a, int i, as_value v) {
@@ -2466,11 +2599,12 @@ static int as_array_push(as_array* a, as_value v) {
     return a->length;
 }
 static as_value as_array_pop(as_array* a) {
-    if (a->length == 0) return as_v_null();
+    // Popping an empty array is undefined in AIR (temp/qfix/gcadl/arrMain.as).
+    if (a->length == 0) return as_v_undefined();
     return a->data[--a->length];
 }
 static as_value as_array_shift(as_array* a) {
-    if (a->length == 0) return as_v_null();
+    if (a->length == 0) return as_v_undefined();
     as_value v = a->data[0];
     for (int i = 0; i < a->length - 1; i++) a->data[i] = a->data[i + 1];
     a->length--;
@@ -2941,6 +3075,36 @@ static as_xml_list* as_xml_list_new(as_xml_node** items, int length) {
     return l;
 }
 
+// new XMLList(value) -- the 1-argument E4X list constructor. Semantics measured on
+// adl 51.4.1 (temp/qfix/xmllist.body.as): null/undefined -> an empty list; an XML
+// node -> a one-item list holding that node; an XMLList -> a copy of its items;
+// any other value -> a one-item list holding a TEXT node whose content is the
+// value's string form (new XMLList(5) has length 1 and toString() "5"). A text
+// node is an as_xml_node with a NULL name, so the node list itself is the
+// distinction, exactly as in the parser.
+static as_xml_list* as_xml_list_ctor(as_value v) {
+    if (v.tag == 0 || v.tag == 5) return as_xml_list_new(NULL, 0);
+    if (v.tag == 4 && v.ptr != NULL) {
+        if (as_is(v.ptr, (void*)&as_xml_vt)) {
+            as_xml_node** buf = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, sizeof(as_xml_node*));
+            buf[0] = (as_xml_node*)v.ptr;
+            return as_xml_list_new(buf, 1);
+        }
+        if (as_is(v.ptr, (void*)&as_xml_list_vt)) {
+            as_xml_list* src = (as_xml_list*)v.ptr;
+            int n = src->length;
+            as_xml_node** buf = n > 0 ? (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, (size_t)n * sizeof(as_xml_node*)) : NULL;
+            for (int i = 0; i < n; i++) buf[i] = src->items[i];
+            return as_xml_list_new(buf, n);
+        }
+    }
+    as_xml_node* t = as_xml_node_new(NULL);
+    t->text = as_v_str_val(v);
+    as_xml_node** buf = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, sizeof(as_xml_node*));
+    buf[0] = t;
+    return as_xml_list_new(buf, 1);
+}
+
 // Growable pointer buffer used by the parser to accumulate children (as_xml_node*)
 // and attributes (char*) before the node's final arrays are sized exactly.
 typedef struct { void** items; int length; int cap; } as_xml_buf;
@@ -3246,15 +3410,23 @@ static as_xml_list* as_xml_list_descendants(as_xml_list* l, const char* name) {
     return as_xml_list_new((as_xml_node**)buf.items, buf.length);
 }
 
-// @attr on a list: the attribute of the first matching item (E4X list.@attr
-// returns an XMLList, but Starling only reads it in a scalar String context).
+// @attr on a list: E4X list.@attr yields an XMLList of the attribute values, and
+// in a scalar (String) context that list is the CONCATENATION of every item's
+// value in document order, with NO separator; a missing or empty attribute
+// contributes nothing. Measured on adl 51.4.1 (temp/qfix/xmlattr.body.as): two
+// items at="1"/at="2" give "12" (not "1"), three give "abc", and a partial list
+// yields only the present values. Starling reads this only in scalar contexts.
 static char* as_xml_list_attr(as_xml_list* l, const char* name) {
-    if (!l) return "";
+    if (!l || l->length == 0) return "";
+    // The single-item case is the common Starling shape and needs no allocation.
+    if (l->length == 1) return as_xml_attr(l->items[0], name);
+    char* out = NULL;
     for (int i = 0; i < l->length; i++) {
         char* v = as_xml_attr(l->items[i], name);
-        if (v[0] != 0) return v;
+        if (v == NULL) v = "";
+        out = (out == NULL) ? v : as_str_concat(out, v);
     }
-    return "";
+    return out ? out : "";
 }
 
 // .( @attr == value ): keep the items whose named attribute equals the given
@@ -3386,7 +3558,10 @@ static int as_object_find(as_object* o, const char* key) {
 }
 static as_value as_object_get(as_object* o, const char* key) {
     int i = as_object_find(o, key);
-    return i < 0 ? as_v_null() : o->vals[i];
+    // AIR's missing dynamic property reads as undefined, not null (measured on
+    // adl 51.4.1, temp/qfix/gcadl/omMain.as: 'var o:*={}; o.bar' is undefined,
+    // === undefined true, == null true).
+    return i < 0 ? as_v_undefined() : o->vals[i];
 }
 // 'key in object' membership test (AS3 'in' operator).
 static bool as_object_has(as_object* o, const char* key) {
@@ -3616,6 +3791,12 @@ static as_value as_throw_sealed_get(const char* key, const char* fqn);
 // an Error object, so like the two above it is defined after the Error class
 // hierarchy and only prototyped here.
 static void as_throw_unsupported(const char* msg);
+// DisplayObject.name rejects a null/undefined write with TypeError #2007 in AIR,
+// on the static slot and on every dynamic (* / Object) receiver alike (measured
+// on adl 51.4.1, temp/qfix/gcadl/result16.txt). The definition sits with the
+// other Error-constructing helpers (emitSealedPropErrors), so it is prototyped
+// here; prop-table tag 13 marks that slot so a dynamic write takes the guard too.
+static char* as_req_name(char* s);
 // Runtime type coercion for a boxed value landing in a statically-typed reference
 // slot (dynamic call argument, apply/call argument, reflection setter). AS3 throws
 // TypeError #1034 when the value's class is incompatible -- silently reinterpreting
@@ -3736,7 +3917,7 @@ static as_value as_dyn_get(void* obj, const char* key) {
                     switch (props[i].type) {
                         case 1: return as_v_num(*(double*)(base + props[i].offset));
                         case 2: return as_v_bool(*(bool*)(base + props[i].offset));
-                        case 3: return as_v_str(*(char**)(base + props[i].offset));
+                        case 3: case 13: return as_v_str(*(char**)(base + props[i].offset));
                         case 4: return as_v_num((double)(*(int*)(base + props[i].offset)));
                         case 5: return as_v_num((double)(*(unsigned*)(base + props[i].offset)));
                         case 6: return as_v_obj(*(void**)(base + props[i].offset));
@@ -3887,6 +4068,11 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
                         case 1: *(double*)(base + props[i].offset) = as_v_to_number(v); return;
                         case 2: *(bool*)(base + props[i].offset) = as_v_truthy(v); return;
                         case 3: *(char**)(base + props[i].offset) = as_coerce_str(v); gc_write_barrier((void*)*(char**)(base + props[i].offset)); return;
+                        // 13: DisplayObject.name -- same string storage, but AIR
+                        // validates it against null/undefined (TypeError #2007)
+                        // instead of storing null (adl 51.4.1,
+                        // temp/qfix/gcadl/result16.txt). Error.name is tag 3.
+                        case 13: { char* ns = as_req_name(as_coerce_str(v)); if (ns == NULL) return; *(char**)(base + props[i].offset) = ns; gc_write_barrier((void*)ns); return; }
                         case 4: *(int*)(base + props[i].offset) = as_v_to_int(v); return;
                         case 5: *(unsigned*)(base + props[i].offset) = as_v_to_uint(v); return;
                         case 6: *(void**)(base + props[i].offset) = as_v_obj_val(v); gc_write_barrier(*(void**)(base + props[i].offset)); return;
@@ -3978,7 +4164,7 @@ static bool as_dyn_del(void* obj, const char* key) {
 // a.bar = 8 stores an ordinary named property beside the elements; the table is
 // allocated lazily, since the vast majority of arrays never carry one.
 static as_value as_array_prop_get(as_array* a, const char* key) {
-    return (a == NULL || a->props == NULL) ? as_v_null() : as_object_get(a->props, key);
+    return (a == NULL || a->props == NULL) ? as_v_undefined() : as_object_get(a->props, key);
 }
 static void as_array_prop_set(as_array* a, const char* key, as_value v) {
     if (a == NULL) return;
@@ -4484,11 +4670,40 @@ static double as_math_random(void) {
 typedef struct { void* vtable; char* message; } as_error_view;
 
 static void* as_exception = NULL;
+// User throw propagates an arbitrary VALUE (any Error, but also a plain string,
+// number, object or null). AVM2 boxes it, and a catch clause binds it back with
+// its identity intact -- for a thrown string, a dynamic catch still answers
+// "e is String" with true (measured on adl 51.4.1, temp/qfix/catchsem). A bare
+// object pointer cannot represent that, nor distinguish a thrown null from "no
+// exception", so a
+// boxed slot runs alongside the object slot. as_exception_boxed selects which
+// holds the pending throw: 0 => as_exception (an object; every internal runtime
+// error is thrown this way), 1 => as_exception_v (a user-thrown value).
+static as_value as_exception_v = {0, 0.0, NULL};
+static int as_exception_boxed = 0;
 static jmp_buf* as_jmp_stack[64];
 static int as_jmp_depth = 0;
 
 static const char* as_error_message(void* e) {
     return e ? ((as_error_view*)e)->message : "unknown";
+}
+static char* as_v_str_val(as_value v);
+// Throw an arbitrary boxed value (the throw-statement path). Kept separate from
+// as_throw(void*) so the ~36 internal runtime-error throws stay byte-identical;
+// only the catch side has to look at both slots.
+static _Noreturn void as_throw_val(as_value v) {
+    as_exception_v = v;
+    as_exception_boxed = 1;
+    if (as_jmp_depth == 0) {
+        // Internal errors keep the historical wording (an object's reflective
+        // message); a non-object thrown value has no message slot, so stringify
+        // it. (The adl-exact uncaught format is a separate, still-open item.)
+        const char* m = (v.tag == 4 && v.ptr != NULL) ? as_error_message(v.ptr) : as_v_str_val(v);
+        fprintf(stderr, "Uncaught exception: %s\\n", m);
+        fflush(stderr);
+        exit(1);
+    }
+    longjmp(*as_jmp_stack[as_jmp_depth - 1], 1);
 }
 // _Noreturn (C11) is not decoration. clang only inlines a guard helper when it
 // can prove the error path terminates; without the specifier the throw path is
@@ -4501,6 +4716,7 @@ static const char* as_error_message(void* e) {
 // a compiler attribute.
 static _Noreturn void as_throw(void* e) {
     as_exception = e;
+    as_exception_boxed = 0;
     if (as_jmp_depth == 0) {
         fprintf(stderr, "Uncaught exception: %s\\n", as_error_message(e));
         fflush(stderr);
@@ -4971,7 +5187,8 @@ static void gc_mark_internal_roots(void) {
     as_async_mark_roots();
     as_sock_mark_roots();
     as_audio_mark_roots();
-    gc_mark_ptr(as_exception);
+    if (as_exception_boxed) gc_mark_value(as_exception_v);
+    else gc_mark_ptr(as_exception);
 }
 
 // ---------- conservative stack roots for mid-frame collections ----------
