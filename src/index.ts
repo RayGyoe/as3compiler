@@ -11,7 +11,7 @@ import { parse } from './parser.ts';
 import { generateC, type ExportedSymbol } from './codegen.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, wasmToolchainError, buildWebCompileSteps, webToolchainError, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, wasmToolchainError, buildWebCompileSteps, webToolchainError, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData } from './build.ts';
 import type { BuildConfig, Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp } from './air-app.ts';
 import { computeReachable, prepareReachFiles, type ReachFile } from './reach.ts';
@@ -433,7 +433,18 @@ function main(): void {
     }
   }
 
-  const outPath = cfg.target === 'wasm' ? `${base}.wasm` : base;
+  // Native executables carry an `.exe` suffix on Windows (lld-link's standard
+  // output name; Node's spawnSync/execve equivalent — CreateProcessW — only tries
+  // the `.exe`/`.cmd`/`.bat`/`.com` extension sequence, so an extensionless PE
+  // file is ENOENT to it even though the same file runs fine from a shell). On
+  // POSIX there is no extension convention: the Mach-O/ELF runs via execve no
+  // matter its name, so `base` is left as-is.
+  const outPath =
+    cfg.target === 'wasm'
+      ? `${base}.wasm`
+      : process.platform === 'win32' && !base.toLowerCase().endsWith('.exe')
+        ? `${base}.exe`
+        : base;
 
   // Audio (flash.media) is delivered by a backend the build layer links, not by
   // the frontend: without it every playback entry point keeps answering honestly
@@ -551,6 +562,13 @@ function main(): void {
   for (const s of steps) {
     console.log(`[4/4] compile     ${s.join(' ')}`);
     if (!runCompile(s)) process.exit(1);
+  }
+
+  // Skia text shaping on a Windows native build needs icudtl.dat beside the exe
+  // (see deploySkiaIcuData). Deploy it after a successful link; a missing file
+  // would otherwise surface later as a SIGILL on the first text-shaping call.
+  if (deploySkiaIcuData(cfg, outPath)) {
+    console.log(`[4/4] data        icudtl.dat -> ${dirname(resolve(outPath))}`);
   }
 
   console.log(`Build successful: ${outPath}`);

@@ -154,8 +154,18 @@ On Windows, `--air-app` uses **Win32 + SDL2 + Skia D3D12 direct-to-GPU**. The bi
   framework, do not add `-lm`/`-lz` (`m.lib`/`z.lib` do not exist on Windows), and set `AS_HAVE_ICONV=0` (non-UTF charsets
   **loudly** throw). Archive names follow gn's Windows rules (`<target>.lib`, **no** `lib` prefix) ⇒ a target literally named `libpng`
   links as `-llibpng`; this conclusion comes from the **real** `build.ninja` read out of a macOS-side `gn gen target_os="win"`.
-- **Stage3D is unavailable on Windows and does not silently downgrade**: when the descriptor/source uses `Context3D`, the build reports `AirAppError`
-  (the AGAL→HLSL translator is not yet started, see `TODO.md` stage 126).
+- **Stage3D is available on Windows (stage 132)**: `vendor/stage3d_d3d.cc` is the D3D12 equivalent of
+  `stage3d_glue.mm` (buffers/textures/PSO/offscreen RTs/samplers and descriptor heaps/triple-buffered submission),
+  consuming the **AGAL→HLSL** translator from stage 131 (`ASC_S3D_HLSL` ⇒ `target 2`, `driverInfo` reports
+  `Direct3D12 (Stage3D)`). Build-time wiring: on Windows `--air-app` pushes `stage3d_d3d.cc` + `ASC_S3D_HLSL=1` +
+  `d3d12`/`dxgi`/`d3dcompiler` (**no** longer the `.mm`/Metal framework), and the descriptor's
+  `<depthAndStencil>true</depthAndStencil>` maps to `ASC_RENDER_DEPTH_STENCIL`. **Stage3D shares the very same
+  `ID3D12Device`/command queue as the 2D compositor** (looked up by name via `GetProcAddress` on
+  `sk_d3d_shared_device`/`sk_d3d_shared_queue`), so a Stage3D frame and Skia's composite are ordered on one queue
+  with no CPU wait. Verified on real hardware: `examples/shmup-stage3d` opens a window on Windows and runs
+  **281 frames / 5 s** with zero PSO/composite errors, and the `ASC_GPU_DUMP` back buffer **shows the demo's
+  Stage3D sprites**. Not yet verified: `examples/air-starling-demo` has not been run on the Windows target;
+  back-face culling / winding is still a paper decision (see `docs/en/display3d.md` §10, `docs/en/win32.md` §3.4).
 - The dependency libraries are built from source by `vendor/build-windows-deps.ps1` (Skia m124 `skia_use_direct3d=true`, SDL2, curl,
   zlib, nghttp2; both x86/x64 widths, LLVM `clang-cl`, bit width verified with `dumpbin`, a mismatch hard-fails). Full details,
   the list of **assumptions not verified on real hardware**, and the Windows first-run checklist are in [`win32.md`](docs/en/win32.md).
@@ -292,9 +302,10 @@ The full 16-item list (the rest being Lottie, native shaders, FFI, server-side r
 - `examples/stage87.as` — `Context3D` skeleton method completion (stencil/scissor/buffer upload readback/`drawTriangles`)
 - `examples/stage88.as` — AS3 language-feature gap fill (object-literal string keys, logical assignment, `for each`, namespaces, etc.)
 - `examples/stage89.as` — AS3 language-feature gaps, second batch (strict equality, generic default parameters, `for` multiple variable declarations, etc.)
+- `examples/shmup-stage3d/` — Stage3D shoot-em-up demo (listed in `test/examples.ts`'s `SKIP_DIRS`; needs the full Stage3D/Context3D layer plus `package {}` support), verified on real hardware on **both** macOS (Metal) and **Windows (Direct3D 12, stage 132)**: composites with the 2D display list into one window
 - `examples/stage82.as` — Metal end-to-end colored triangle (AGAL→MSL translation + `Context3D` full chain + pixel readback)
 - `examples/stage81.as` — stage eighty-one: `Stage3D` + `Context3D` skeleton (`Stage.stage3Ds` single slot + `requestContext3D` lazy creation + synchronous `CONTEXT3D_CREATE` dispatch + `Context3D` state machine (blend/depth/cull/program/vertex streams/textures/matrix constants) full-path calls + 15 constant class value assertions), off-screen (included in regression)
-- `examples/stage80.as` — stage eighty: AGAL bytecode kernel (hand-written vertex+fragment AGAL1 bytecode per the official AGALMiniAssembler encoding, asserting the MSL/GLSL translation contains the expected instructions, register mapping and swizzle/write-mask expansion, the **full-mask** form of the compare instructions (GLSL `mix(vec4(0.0), vec4(1.0), vec4(greaterThanEqual(a, b)))` / MSL `select(float4(0.0), float4(1.0), a >= b)`) and the **partial-mask** component-ternary form, and that an invalid opcode throws), off-screen (included in regression)
+- `examples/stage80.as` — stage eighty: AGAL bytecode kernel (hand-written vertex+fragment AGAL1 bytecode per the official AGALMiniAssembler encoding, asserting the MSL/GLSL/HLSL translations contain the expected instructions, register mapping and swizzle/write-mask expansion, the **full-mask** form of the compare instructions (GLSL `mix(vec4(0.0), vec4(1.0), vec4(greaterThanEqual(a, b)))` / MSL `select(float4(0.0), float4(1.0), a >= b)`) and the **partial-mask** component-ternary form, that each target's own register and built-in names are asserted, and that an invalid opcode and `tld` are loudly rejected), off-screen (included in regression)
 - `examples/stage79.as` — stage seventy-nine: Stage3D geometric prerequisites (`Vector3D` four-component/geometric ops/static axis constants + `Matrix3D` column-major matrix multiply/invert/transpose/transform-vector/rotation-scale-translation constructors + `decompose`/`recompose` round-trip assertions), off-screen (included in regression)
 - `examples/stage66.as` — stage sixty-six: `Vector.<T>` higher-order/sequence methods (`slice`/`concat`/`splice`/`forEach`/`map`/`filter`/`sort`/`reverse`) and the `new <T>[...]` literal, off-screen (included in regression)
 - `examples/stage65.as` — stage sixty-five: `flash.system.Capabilities` environment query (`version` (fixed AIR-compatible `"50,0,0,0"`), `os`/`cpuArchitecture` conditional-compile constants, `cpuAddressSize` + `supports64BitProcesses`/`supports32BitProcesses`, fixed desktop values `playerType`/`manufacturer`/`isDebugger`/`touchscreenType`/`screenColor`/`pixelAspectRatio`/`hasAudio`, locale-derived `language`, `screenResolutionX`/`screenResolutionY`/`screenDPI`), off-screen (included in regression)

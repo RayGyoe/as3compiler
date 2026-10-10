@@ -11,6 +11,17 @@
 // raw pixel buffer obtained through sk_surface_peek_pixels (defined in
 // skia_glue.cc), so no Skia type crosses the C boundary.
 
+// clang's MSVC mode (--target=*-pc-windows-msvc, clang 23) declares `_m_prefetch`
+// as a builtin. The vendored SDL2 SDL_endian.h carries a workaround for an older
+// clang that redefines `_m_prefetch` as an __inline__ shim guarded by
+// __PRFCHWINTRIN_H; under clang 23 that shim collides with the builtin
+// ("definition of builtin function '_m_prefetch'"). Pre-defining __PRFCHWINTRIN_H
+// (the include guard of <prfchwintrin.h>) skips the shim — the builtin stays
+// available for SDL's own use. Inert on non-Windows targets, where this
+// _MSC_VER-only branch never compiles.
+#if defined(_WIN32)
+#define __PRFCHWINTRIN_H
+#endif
 // SDL.h on macOS redefines `main` as `SDL_main` unless this is defined first.
 // Our generated .c provides its own standard `int main(void)`, so we opt out
 // of SDL's main wrapping here.
@@ -29,8 +40,12 @@
 // without the real borders every bounds value would be short by the title bar
 // (measured 32pt here — exactly adl's 410-vs-378 relationship).
 // These two headers are plain C (no Cocoa.h, no .mm), so this file stays C++.
+// They are macOS-only: the NSWindow border shim below is compiled out on other
+// platforms (objc_msgSend/SEL do not exist outside Objective-C).
+#if defined(__APPLE__)
 #include <objc/message.h>
 #include <objc/runtime.h>
+#endif
 
 extern "C" {
 
@@ -91,9 +106,49 @@ static double g_display_refresh = 0.0;
 // answer by briefly opening a hidden high-DPI window and comparing its logical
 // size against its drawable size, then reporting the resulting ratio. This is a
 // probe of the *primary* display, which is where the window is centered.
+// Everything that starts the video subsystem goes through here, because some of
+// the hints below only take effect if they are set BEFORE the first
+// SDL_Init(SDL_INIT_VIDEO) — a bare SDL_Init anywhere in this file would silently
+// skip them. SDL_SetHint is idempotent and re-latching the same values on a later
+// init is exactly right, so calling this on every init is correct rather than
+// merely harmless.
+static int sk_video_init(void) {
+#ifdef _WIN32
+#ifdef ASC_DISPLAY_HIGH
+  // A DPI-UNAWARE process has its whole window bitmap stretched by the compositor
+  // on a scaled monitor: a 1000x680 window is rasterized at 1000x680 and then
+  // blown up 1.5x on this machine's 150% 3840x2560 panel. The pixels the app never
+  // renders at are precisely the ones it is judged by, so
+  // <requestedDisplayResolution>high changed nothing on screen.
+  //
+  // SDL_WINDOWS_DPI_SCALING=1 is what makes SDL_WINDOW_ALLOW_HIGHDPI mean anything
+  // here. It (a) requests per-monitor-v2 DPI awareness, so the process stops being
+  // bitmap-stretched at all, and (b) puts SDL's coordinate system in DPI-scaled
+  // POINTS — which is the macOS model this whole file is written against:
+  // SDL_GetWindowSize() = logical points, SDL_GetWindowSizeInPixels() = physical
+  // pixels, and their ratio is the device scale sk_window_probe_scale() and
+  // do_resize() report. Measured on this machine (96 -> 144 DPI): without the hint
+  // a 1000x680 window reports 1000x680 / scale 1.0; with it, 1000x680 points ->
+  // 1500x1020 pixels / scale 1.5. Setting SDL_WINDOWS_DPI_AWARENESS as well would
+  // be redundant (this hint implies per-monitor-v2), and it would additionally
+  // force SDL_WINDOW_ALLOW_HIGHDPI on every window.
+  //
+  // Gated on ASC_DISPLAY_HIGH on purpose. AIR defines
+  // <requestedDisplayResolution>standard as "render at 1x and let the OS scale the
+  // result up", which is exactly what a DPI-unaware process already does; latching
+  // awareness there without also rescaling the 1x blit up to the physical backing
+  // would leave the picture in the corner of a physical-sized render target. So a
+  // standard build keeps its previous behaviour bit for bit. Inert outside _WIN32,
+  // so macOS and wasm are untouched either way.
+  SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
+#endif
+#endif
+  return SDL_Init(SDL_INIT_VIDEO);
+}
+
 static void ensure_video(void) {
   static int inited = 0;
-  if (!inited) { SDL_Init(SDL_INIT_VIDEO); inited = 1; }
+  if (!inited) { sk_video_init(); inited = 1; }
 }
 
 // Write the physical pixel size a logical w*h window would draw into when
@@ -121,7 +176,7 @@ double sk_window_probe_scale(int w, int h, int highdpi, int* pw, int* ph) {
 // Query the primary display's current mode (pixels). Returns 1 on success.
 int sk_window_get_display_size(int* w, int* h) {
   if (g_display_w <= 0 || g_display_h <= 0) {
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) return 0;
+    if (sk_video_init() != 0) return 0;
     SDL_DisplayMode dm;
     if (SDL_GetCurrentDisplayMode(0, &dm) == 0) {
       g_display_w = dm.w; g_display_h = dm.h;
@@ -432,6 +487,7 @@ static int do_resize(WinCtx* c) {
 // CGFloat (double) values, and on arm64 objc_msgSend uses the same calling
 // convention as a plain C function for struct arguments and struct returns, so
 // the ordinary ABI casts below are correct.
+#if defined(__APPLE__)
 typedef struct { double x, y, w, h; } sk_nsrect;
 
 static sk_nsrect sk_ns_msg_frame(void* nswin) {
@@ -443,6 +499,7 @@ static sk_nsrect sk_ns_msg_content_rect(void* nswin, sk_nsrect frame) {
   sk_nsrect (*fn)(void*, SEL, sk_nsrect) = (sk_nsrect (*)(void*, SEL, sk_nsrect))objc_msgSend;
   return fn(nswin, sel_registerName("contentRectForFrameRect:"), frame);
 }
+#endif
 
 // Frame borders (title bar / window edges): AIR's bounds is the OUTER frame rect
 // while SDL sizes and positions the CLIENT area, so both bounds conversions go
@@ -460,36 +517,130 @@ static void sk_measure_borders(WinCtx* c, int decorated) {
   c->decorated = decorated;
   c->b_top = c->b_left = c->b_bottom = c->b_right = 0;
   if (!decorated) return;
-  SDL_SysWMinfo info;
-  SDL_VERSION(&info.version);
-  if (SDL_GetWindowWMInfo(c->win, &info) &&
-      info.subsystem == SDL_SYSWM_COCOA && info.info.cocoa.window != NULL) {
-    sk_nsrect f = sk_ns_msg_frame(info.info.cocoa.window);
-    sk_nsrect ct = sk_ns_msg_content_rect(info.info.cocoa.window, f);
-    c->b_top = (int)((f.y + f.h) - (ct.y + ct.h));
-    c->b_left = (int)(ct.x - f.x);
-    c->b_right = (int)((f.x + f.w) - (ct.x + ct.w));
-    c->b_bottom = (int)(ct.y - f.y);
-    return;
-  }
   int t = 0, l = 0, b = 0, r = 0;
+#if defined(__APPLE__)
+  {
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (SDL_GetWindowWMInfo(c->win, &info) &&
+        info.subsystem == SDL_SYSWM_COCOA && info.info.cocoa.window != NULL) {
+      sk_nsrect f = sk_ns_msg_frame(info.info.cocoa.window);
+      sk_nsrect ct = sk_ns_msg_content_rect(info.info.cocoa.window, f);
+      c->b_top = (int)((f.y + f.h) - (ct.y + ct.h));
+      c->b_left = (int)(ct.x - f.x);
+      c->b_right = (int)((f.x + f.w) - (ct.x + ct.w));
+      c->b_bottom = (int)(ct.y - f.y);
+      return;
+    }
+  }
+#endif
   if (SDL_GetWindowBordersSize(c->win, &t, &l, &b, &r) == 0) {
     c->b_top = t; c->b_left = l; c->b_bottom = b; c->b_right = r;
   }
 }
 
-// Event filter: SDL invokes this as events are pumped, which on macOS still
-// happens while the main loop is blocked inside a live-resize drag. Rebuilding
-// the surface and presenting a frame here is what keeps the content from
-// stretching and the animation from freezing during the drag.
+// One application frame plus one repaint pass — the shared body of the main loop
+// AND of the live-resize watch below. Returns the next frame deadline in ms (the
+// caller sleeps to it), or -1 when no window can hold the frame clock.
+//
+// Why the watch must run THIS and not a private per-window repaint: a window
+// drag/resize runs inside the OS's own modal message loop, entered from within
+// SDL_PumpEvents, so sk_run_loop is blocked for the whole drag and the only frames
+// that happen are the ones the watch drives. SDL feeds it from a
+// USER_TIMER_MINIMUM timer on Windows (SDL_windowsevents.c: WM_ENTERSIZEMOVE ->
+// WM_TIMER -> SDL_OnWindowLiveResizeUpdate -> SDL_WINDOWEVENT_EXPOSED) and from a
+// 60 Hz NSTimer installed during a live resize on macOS (SDL_cocoawindow.m) —
+// the same window event through the same hook on both.
+//
+// An earlier version of the watch called on_frame directly and repainted only the
+// dragged window, with two visible consequences: the application's ENTER_FRAME
+// ticked at the OS message rate (so every window's animations sped up during a
+// drag), and every OTHER window stayed frozen until the drag ended — nothing
+// marked it dirty and nothing presented it. Reusing the loop's own frame — same
+// clock, same g_app_next deadline, same "a new frame dirties every visible window"
+// rule — is what makes a drag behave exactly like a normal frame, on every
+// window, on every backend.
+static double sk_pump_frame(void) {
+  // Re-entrancy: the frame callbacks run real AS3, which can open or close
+  // windows and therefore push SDL events — and the watch is reached from inside
+  // SDL_PushEvent. A nested call would advance the same frame clock twice.
+  static int in_pump = 0;
+  if (in_pump) return g_app_next;
+  in_pump = 1;
+
+  // Resize service + clock election. AIR runs ONE frame clock for the whole
+  // application (Stage.frameRate is application-wide), so the cadence is computed
+  // once and the frame dispatched once, however many windows are open. Any live
+  // window can hold the clock — they all install the same two generated callbacks
+  // — so the clock survives the main window closing.
+  int clock = -1;
+  for (int i = 0; i < SK_MAX_WINDOWS; i++) {
+    WinCtx* c = &g_wins[i];
+    if (!c->used || c->destroy_pending) continue;
+    int rres = do_resize(c);
+    if (rres > 0) c->dirty = 1;
+    // A hidden window still keeps its stage alive (NativeWindow.activate() is what
+    // makes it visible) but renders nothing, so it cannot hold the clock.
+    if (clock < 0 && c->visible && c->on_frame != NULL) clock = i;
+  }
+
+  // One application frame, then repaint every visible window. The frame is a
+  // single broadcast (ENTER_FRAME + timers + MovieClip advance + GC slice + async
+  // retire); each window only rasterizes its own stage afterwards. Doing this per
+  // window is what made a second window add its frame rate to the first window's
+  // ENTER_FRAME count.
+  double earliest = -1.0;
+  if (clock >= 0) {
+    double t = (double)SDL_GetTicks();
+    if (t >= g_app_next) {
+      g_wins[clock].on_frame(clock);
+      // A new application frame invalidates every visible window: they all render
+      // that same frame tick.
+      for (int i = 0; i < SK_MAX_WINDOWS; i++) {
+        WinCtx* c = &g_wins[i];
+        if (c->used && !c->destroy_pending && c->visible) c->dirty = 1;
+      }
+      double interval = g_wins[clock].on_frame_delay ? g_wins[clock].on_frame_delay(clock) : 16.0;
+      if (interval > 0.0) {
+        g_app_next += interval;
+        if (g_app_next < t) g_app_next = t;
+      } else {
+        g_app_next = t;
+      }
+    }
+    earliest = g_app_next;
+  }
+
+  // Present: only windows whose content is dirty re-rasterize. A window the user
+  // cannot see (hidden, or already being destroyed) is skipped.
+  for (int i = 0; i < SK_MAX_WINDOWS; i++) {
+    WinCtx* c = &g_wins[i];
+    if (!c->used || c->destroy_pending) continue;
+    if (c->visible && c->dirty && c->on_redraw != NULL) {
+      c->on_redraw(i);
+      if (!c->is_gpu) present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes);
+      c->dirty = 0;
+    }
+  }
+  in_pump = 0;
+  return earliest;
+}
+
+// Event filter: SDL invokes this as events are pumped, which on BOTH platforms
+// still happens while the main loop is blocked inside a live-resize drag (see
+// sk_pump_frame for the mechanism on each). Redrawing from here is the only thing
+// that keeps the animation alive during a drag — and because it runs the shared
+// frame, it keeps every OTHER window alive too instead of freezing them for the
+// duration.
 static int SDLCALL live_resize_watch(void* userdata, SDL_Event* e) {
   WinCtx* c = (WinCtx*)userdata;
   if (!c->used || c->destroy_pending) return 1;
   if (c->in_watch) return 1;
   if (e->type != SDL_WINDOWEVENT) return 1;
-  // The watch is registered per window but SDL calls every watch for every
-  // event, so ignore events that belong to a different window — otherwise one
-  // window's drag would re-render all of them.
+  // The watch is registered per window but SDL calls every watch for every event,
+  // so ignore events that belong to a different window: sk_pump_frame already
+  // repaints every dirty window, and what must NOT happen is each window's watch
+  // running its own frame off the same event.
   if (e->window.windowID != SDL_GetWindowID(c->win)) return 1;
   Uint8 we = e->window.event;
   if (we != SDL_WINDOWEVENT_SIZE_CHANGED &&
@@ -498,13 +649,7 @@ static int SDLCALL live_resize_watch(void* userdata, SDL_Event* e) {
       we != SDL_WINDOWEVENT_MOVED &&
       we != SDL_WINDOWEVENT_DISPLAY_CHANGED) return 1;
   c->in_watch = 1;
-  int rres = do_resize(c);
-  if (rres >= 0 && c->on_redraw != NULL) {
-    if (c->on_frame != NULL) c->on_frame((int)(c - g_wins));
-    c->on_redraw((int)(c - g_wins));
-    if (!c->is_gpu) present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes);
-    c->dirty = 0;
-  }
+  sk_pump_frame();
   c->in_watch = 0;
   return 1;
 }
@@ -927,61 +1072,12 @@ static void sk_run_loop(void) {
       }
     }
 
-    // 3. Service resizes and pick the window that holds the APPLICATION FRAME
-    //    clock. AIR runs one frame clock for the whole application (its
-    //    Stage.frameRate is application-wide), so the cadence is computed once and
-    //    the frame is dispatched once, no matter how many windows are open.
-    //    Any live window can hold the clock — they all install the same two
-    //    generated callbacks — so the clock survives the main window closing.
-    int clock = -1;
-    for (int i = 0; i < SK_MAX_WINDOWS; i++) {
-      WinCtx* c = &g_wins[i];
-      if (!c->used || c->destroy_pending) continue;
-      int rres = do_resize(c);
-      if (rres > 0) c->dirty = 1;
-      // A hidden window still keeps its stage alive (NativeWindow.activate() is
-      // what makes it visible) but renders nothing, so it cannot hold the clock.
-      if (clock < 0 && c->visible && c->on_frame != NULL) clock = i;
-    }
-
-    // 4. One application frame, then repaint every visible window. The frame is a
-    //    single broadcast (ENTER_FRAME + timers + MovieClip advance + GC slice +
-    //    async retire); each window only rasterizes its own stage afterwards.
-    //    Doing this per window is what made a second window add its frame rate to
-    //    the first window's ENTER_FRAME count.
-    double earliest = -1.0;
-    if (clock >= 0) {
-      double t = (double)SDL_GetTicks();
-      if (t >= g_app_next) {
-        g_wins[clock].on_frame(clock);
-        // A new application frame invalidates every visible window: they all
-        // render that same frame tick.
-        for (int i = 0; i < SK_MAX_WINDOWS; i++) {
-          WinCtx* c = &g_wins[i];
-          if (c->used && !c->destroy_pending && c->visible) c->dirty = 1;
-        }
-        double interval = g_wins[clock].on_frame_delay ? g_wins[clock].on_frame_delay(clock) : 16.0;
-        if (interval > 0.0) {
-          g_app_next += interval;
-          if (g_app_next < t) g_app_next = t;
-        } else {
-          g_app_next = t;
-        }
-      }
-      earliest = g_app_next;
-    }
-
-    // 5. Present: only windows whose content is dirty re-rasterize. A window the
-    //    user cannot see (hidden, or already being destroyed) is skipped.
-    for (int i = 0; i < SK_MAX_WINDOWS; i++) {
-      WinCtx* c = &g_wins[i];
-      if (!c->used || c->destroy_pending) continue;
-      if (c->visible && c->dirty && c->on_redraw != NULL) {
-        c->on_redraw(i);
-        if (!c->is_gpu) present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes);
-        c->dirty = 0;
-      }
-    }
+    // 3-5. Service resizes, dispatch the one application frame if it is due, and
+    //      repaint every dirty visible window. This is the same function the
+    //      live-resize watch runs, so a frame during a drag is literally the same
+    //      frame as a frame here — same clock, same deadline, same dirtying rule.
+    //      See sk_pump_frame.
+    double earliest = sk_pump_frame();
 
     // 6. Sleep to the application frame deadline. Sleeping *to* a rolling deadline
     // (rather than for a fixed delay after each frame) absorbs the
@@ -1104,7 +1200,7 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
                    sk_frame_delay_cb on_frame_delay, sk_resize_cb on_resize,
                    sk_close_cb on_close) {
   ensure_video();
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+  if (sk_video_init() != 0) {
     fprintf(stderr, "window_glue: SDL_Init failed: %s\n", SDL_GetError());
     return 0;
   }
@@ -1257,7 +1353,7 @@ int sk_window_show_metal(int w, int h, const char* title, int fullscreen,
                          sk_frame_delay_cb on_frame_delay, sk_resize_cb on_resize,
                          sk_close_cb on_close) {
   ensure_video();
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+  if (sk_video_init() != 0) {
     fprintf(stderr, "window_glue: SDL_Init failed: %s\n", SDL_GetError());
     return 0;
   }
@@ -1298,6 +1394,13 @@ int sk_window_show_metal(int w, int h, const char* title, int fullscreen,
   c->pw = pw; c->ph = ph;
   if (on_resize) on_resize(id, lw, lh, pw, ph, scale);
 
+  // Arm the live-resize watch on the MAIN window too. sk_window_create arms it
+  // for every NativeWindow, but the main window is opened here (and by the D3D
+  // entry below) and was left without one — and since the loop is blocked inside
+  // SDL for the whole of a drag/resize, a main-window drag froze its animation
+  // completely while a secondary window's kept running.
+  SDL_AddEventWatch(live_resize_watch, c);
+
   sk_run_loop();
 
   // The loop retires every window on its way out — sk_service_destroy() has
@@ -1331,7 +1434,7 @@ int sk_window_show_gpu(int w, int h, const char* title, int fullscreen,
                               on_redraw, on_frame, on_frame_delay, on_resize, on_close);
 #elif defined(ASC_RENDER_D3D)
   ensure_video();
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+  if (sk_video_init() != 0) {
     fprintf(stderr, "window_glue: SDL_Init failed: %s\n", SDL_GetError());
     return 0;
   }
@@ -1370,6 +1473,11 @@ int sk_window_show_gpu(int w, int h, const char* title, int fullscreen,
   c->pw = pw; c->ph = ph;
   if (on_resize) on_resize(id, lw, lh, pw, ph, scale);
 
+  // Arm the live-resize watch on the MAIN window, exactly as the macOS entry
+  // above does: the drag/resize modal loop blocks sk_run_loop inside SDL, so the
+  // watch is what keeps every window's animation running for its duration.
+  SDL_AddEventWatch(live_resize_watch, c);
+
   sk_run_loop();
   SDL_Quit();
   return 1;
@@ -1396,7 +1504,7 @@ int sk_window_create(int w, int h, const char* title, int resizable, int decorat
                      sk_frame_delay_cb on_frame_delay, sk_resize_cb on_resize,
                      sk_close_cb on_close) {
   ensure_video();
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) return -1;
+  if (sk_video_init() != 0) return -1;
   // A new NativeWindow starts HIDDEN (measured: w.visible is false right after
   // the constructor) and becomes visible on activate(), so open it hidden.
   int id = sk_open_window(w, h, title, decorated, 0, 0, highdpi, 0);

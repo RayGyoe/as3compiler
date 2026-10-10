@@ -170,7 +170,7 @@ function checkRestrict(): string[] {
   check('the filter runs after the textInput dispatch, so the event keeps the raw text',
     ins.indexOf('as_tf_restrict_char') > ins.indexOf('if (te->cancelled) return;'));
   check('restrict is only consulted when the pattern is non-NULL',
-    ins.includes('if (tf->_restrict != NULL) {') && ins.includes('ins = filtered;'));
+    ins.includes('if (tf->___restrict != NULL) {') && ins.includes('ins = filtered;'));
   check('newlines bypass the filter (measured: Return still inserts in a multiline field)',
     ins.includes('if (c == 13 || c == 10) filtered[fn++] = (char)c;'));
   check('the filtered string is what gets spliced (so it keeps the maxChars/selection semantics)',
@@ -222,7 +222,7 @@ function checkTextInput(): string[] {
     /\nstruct TextField \{[\s\S]{0,2000}?char\* type;/.test(c)
     && /\nstruct TextField \{[\s\S]{0,2000}?int maxChars;/.test(c)
     && /\nstruct TextField \{[\s\S]{0,2000}?bool displayAsPassword;/.test(c)
-    && /\nstruct TextField \{[\s\S]{0,2000}?char\* _restrict;/.test(c));
+    && /\nstruct TextField \{[\s\S]{0,2000}?char\* ___restrict;/.test(c));
 
   // 默认值（adl 逐项实测，temp/editprobe/src/Def.as）：dynamic / 无限 / 非密码 /
   // tabEnabled **false**（不是 true）/ restrict NULL，且 text 是空字符串而非 NULL。
@@ -231,7 +231,7 @@ function checkTextInput(): string[] {
     && c.includes('o->maxChars = 0;')
     && c.includes('o->displayAsPassword = false;')
     && c.includes('o->tabEnabled = false;')
-    && c.includes('o->_restrict = NULL;'));
+    && c.includes('o->___restrict = NULL;'));
   check('a fresh field reports "" (not a NULL string) for text',
     c.includes('o->text = as_str_alloc(1);') && !c.includes('o->text = NULL;'));
   // type 的 setter 复刻 AIR 那个「值真的变化才联动 tabEnabled」的副作用
@@ -268,7 +268,7 @@ function checkTextInput(): string[] {
   check('as_v_str normalizes a NULL char* to the null literal (AS3 one-null rule)',
     /static as_value as_v_str\(char\* s\)\s*\{\s*if \(s == NULL\) return as_v_null\(\);/.test(RUNTIME_PREAMBLE.replace(/\r\n/g, '\n')));
   check('a nullable string field boxes through as_v_str, so the NULL guard applies',
-    /as_v_str\(\([^\n]*g_f[^\n]*->_restrict\)\)/.test(nb) && nb.includes('as_v_loose_eq(g_x, as_v_null())'));
+    /as_v_str\(\([^\n]*g_f[^\n]*->___restrict\)\)/.test(nb) && nb.includes('as_v_loose_eq(g_x, as_v_null())'));
 
   // 编辑键集合（Home/End/箭头/Cmd/Option 词跳 + PageUp/PageDown），PageUp/Down 在
   // PageDown 上按「可见行数」移光标（阶段九十四·十五）。

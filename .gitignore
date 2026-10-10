@@ -27,6 +27,16 @@ examples/wasm-native/export-meta
 examples/stage12/Greeter
 examples/web/hello-web
 
+# Windows native build outputs (host-regenerated on every build): `--air-app` links
+# an `.exe` plus its import `.lib`, and deploys the Skia text-shaping data
+# `icudtl.dat` beside the executable. Scoped to examples/ on purpose --
+# vendor/**/*.lib are tracked build INPUTS and must not be swallowed by a global
+# `*.lib` rule.
+examples/**/*.exe
+examples/**/*.lib
+examples/**/icudtl.dat
+benchmarks/**/*.exe
+
 # Local acceptance-test demo projects: external clones holding their own VCS
 # metadata plus full AOT/web build outputs. Kept out of the repository.
 examples/Flappy-Starling/

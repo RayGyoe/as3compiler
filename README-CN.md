@@ -152,8 +152,25 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
   framework、不加 `-lm`/`-lz`（`m.lib`/`z.lib` 在 Windows 不存在）、`AS_HAVE_ICONV=0`（非 UTF 字符集
   **响亮**抛错）。归档名按 gn 的 Windows 规则（`<target>.lib`、**无** `lib` 前缀）⇒ 字面叫 `libpng` 一类的
   目标链成 `-llibpng`；此结论来自在 macOS 上 `gn gen target_os="win"` 读出的**真实** `build.ninja`。
-- **Stage3D 在 Windows 上不可用且不静默降级**：描述符/源码用到 `Context3D` 时构建期报 `AirAppError`
-  （AGAL→HLSL 翻译器尚未立项，见 `TODO.md` 阶段一百二十六）。
+- **Stage3D 在 Windows 上可用（阶段一百三十二）**：`vendor/stage3d_d3d.cc` 是 `stage3d_glue.mm` 的 D3D12 等价物
+  （缓冲区/纹理/PSO/离屏 RT/采样器与描述符堆/三缓冲提交），消费阶段一百三十一 的 **AGAL→HLSL** 翻译器
+  （`ASC_S3D_HLSL` ⇒ `target 2`、`driverInfo` 报 `Direct3D12 (Stage3D)`）。构建期接线：`--air-app` 在 Windows
+  推入 `stage3d_d3d.cc` + `ASC_S3D_HLSL=1` + `d3d12`/`dxgi`/`d3dcompiler`（**不再**推 `.mm`/Metal framework），
+  描述符里的 `<depthAndStencil>true</depthAndStencil>` 映成 `ASC_RENDER_DEPTH_STENCIL`。**与 2D 共用同一个
+  `ID3D12Device`/命令队列**（按名 `GetProcAddress` 取 `sk_d3d_shared_device`/`sk_d3d_shared_queue`），故
+  Stage3D 的帧与 Skia 的合成**同一条队列有序**、无需 CPU 等待。实机验收：`examples/shmup-stage3d` 在 Windows
+  上开窗、跑到 **281 帧/5 s**、零 PSO/合成错误，且 `ASC_GPU_DUMP` 导出的 back buffer 里**能看到 demo 的
+  Stage3D 精灵**。未验收：`examples/air-starling-demo` 尚未在 Windows 目标上跑过；背面剔除/绕序仍是纸面决定
+  （见 `docs/zh-cn/display3d.md` §10、`docs/zh-cn/win32.md` §3.4）。
+- **高清（`<requestedDisplayResolution>high</requestedDisplayResolution>`）在 Windows 上靠进程级 hint 生效**
+  （`SDL_HINT_WINDOWS_DPI_SCALING=1`，同时隐含 per-monitor-v2 → 不再被合成器位图拉伸）：逻辑尺寸
+  与物理像素分开（a 150% 缩放的屏上，`1000x680` 逻辑 → `1500x1020` 物理，`stage.stageWidth/Height`
+  仍报**逻辑**值）。该 hint **只在 `high` 构建（`ASC_DISPLAY_HIGH`）里 latch**：AIR 定义 `standard`
+  为「按 1x 渲染、交给 OS 放大」，与 DPI-unaware 进程的行为本就一致，故 `standard` 及 macOS/wasm
+  逐字节维持原行为。
+- **拖动/缩放窗口时动画与帧率不受影响，多窗口互不干扰**：拖动/缩放跑在 OS 的模态消息循环里（主循环
+  整个被阻塞），SDL 的 live-resize 监听器是**唯一**的帧源，且它驱动的是循环**同一个**节拍化帧泵
+  （`Stage.frameRate` 不被改写，所有窗口一起重画）。详见 `docs/zh-cn/win32.md` §2.8。
 - 依赖库由 `vendor/build-windows-deps.ps1` 从源码编（Skia m124 `skia_use_direct3d=true`、SDL2、curl、
   zlib、nghttp2；x86/x64 双位宽，LLVM `clang-cl`，`dumpbin` 校验位宽，错位即硬失败）。完整说明、
   **未实机验证的假设清单**与 Windows 首跑核对清单见 [`win32.md`](docs/zh-cn/win32.md)。
@@ -288,9 +305,10 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
 - `examples/stage87.as` — `Context3D` 骨架补方法（stencil/scissor/缓冲上传读回/`drawTriangles`）
 - `examples/stage88.as` — AS3 语言特性缺口补齐（对象字面量字符串键、逻辑赋值、`for each`、命名空间等）
 - `examples/stage89.as` — AS3 语言特性缺口第二批（严格相等、泛型默认参数、`for` 多变量声明等）
+- `examples/shmup-stage3d/` — Stage3D 射击 demo（`test/examples.ts` 的 `SKIP_DIRS` 列出，需整层 Stage3D/Context3D 与 `package {}` 支持），macOS（Metal）与 **Windows（Direct3D 12，阶段一百三十二）** 均实机跑通：与 2D 显示列表合成到同一窗口
 - `examples/stage82.as` — Metal 端到端彩色三角形（AGAL→MSL 翻译 + `Context3D` 全链路 + 像素读回）
 - `examples/stage81.as` — `Stage3D` + `Context3D` 骨架（`stage3Ds`/`requestContext3D`/状态机 + 常量断言）
-- `examples/stage80.as` — AGAL 字节码内核（MSL/GLSL 翻译、寄存器映射、swizzle/write-mask、比较指令）
+- `examples/stage80.as` — AGAL 字节码内核（MSL/GLSL/**HLSL** 三档翻译、寄存器映射、swizzle/write-mask、比较指令、三档各自的寄存器与内建名断言、非法 opcode 与 `tld` 的响亮拒绝）
 - `examples/stage79.as` — Stage3D 前置几何类（`Vector3D` + `Matrix3D` 运算与 `decompose`/`recompose`）
 - `examples/stage66.as` — `Vector.<T>` 高阶/序列方法（`slice`/`concat`/`splice`/`forEach`/`map`/`filter`/`sort`/`reverse`）
 - `examples/stage65.as` — `flash.system.Capabilities` 环境能力查询

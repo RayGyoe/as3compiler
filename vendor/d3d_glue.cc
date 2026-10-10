@@ -24,12 +24,13 @@
 //
 // STATUS — READ BEFORE TRUSTING THIS FILE: it is written against Skia m124's own
 // Windows reference (tools/window/win/D3D12WindowContext_win.cpp, which this
-// mirrors step for step) but has NOT been compiled or run: the development machine
-// for this repo is macOS and `clang --target=x86_64-pc-windows-msvc` cannot link a
-// D3D12 program here. The compiler-side wiring, the library names and the
-// backend-neutral seam ARE verified on macOS; every D3D12 call below is not. See
-// docs/zh-cn/win32.md for the exact list of unverified assumptions and for the
-// first-run checklist to run on the Windows build machine.
+// mirrors step for step). It now COMPILES (2026-10-10, clang 23.1.3 +
+// `--target=i686-pc-windows-msvc` — the font-backend/objc/_m_prefetch/type errors
+// that first blocked it are fixed, see docs/zh-cn/win32.md §2.6) but has NOT been
+// linked or run: the development machine for this repo is macOS and cannot link a
+// D3D12 program. The compiler-side wiring, the library names and the
+// backend-neutral seam ARE verified on macOS; every D3D12 call below is still
+// unverified at runtime. See docs/zh-cn/win32.md §5 for the first-run checklist.
 //
 // Spec references (AGENTS.md §2.4 requires the authority, not a guess):
 //   * swapchain setup, fence protocol, surface wrapping:
@@ -67,9 +68,18 @@
 
 #include "include/core/SkSurface.h"
 #include "include/core/SkCanvas.h"
+// GrD3DTextureResourceInfo's GrBackendRenderTarget wrapper carries a
+// sk_sp<SkColorSpace>, so SkColorSpace must be a complete type where the surface
+// is wrapped (the classic SkRefCnt.h "incomplete type" error otherwise).
+#include "include/core/SkColorSpace.h"
 #include "include/gpu/GrDirectContext.h"
 #include "include/gpu/GrBackendSurface.h"
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"
+// The Stage3D composite borrows an ID3D12Resource as an SkImage
+// (SkImages::BorrowTextureFrom) and draws it into the frame's canvas.
+#include "include/core/SkImage.h"
+#include "include/core/SkPaint.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"
 // GrD3DBackendContext.h pulls in GrD3DTypes.h -> d3d12.h -> windows.h, and warns
 // that windows.h redefines common identifiers (interface, small, near, far,
 // CreateSemaphore, MemoryBarrier). Including <windows.h> above is what makes that
@@ -155,6 +165,16 @@ static D3DWin* d3d_slot(int win_id) {
   return g_d3d[win_id].used ? &g_d3d[win_id] : nullptr;
 }
 
+// Progress trace for the backend's init sequence. Without it a hang inside
+// d3d_init_shared prints NOTHING at all (the window exists and the app never reaches
+// its event loop), which is indistinguishable from a hang in the window layer.
+// ASC_GPU_TRACE=1 turns it on.
+static void gpu_trace(const char* what) {
+  if (getenv("ASC_GPU_TRACE") == nullptr) return;
+  fprintf(stderr, "d3d_glue: trace %s\n", what);
+  fflush(stderr);
+}
+
 // Pick the first adapter that can actually create a D3D12 device (the probe SKU
 // check: an adapter that fails D3D12CreateDevice here would fail again for real).
 // Mirrors sk_gpu_test::get_hardware_adapter.
@@ -180,22 +200,26 @@ static int d3d_init_shared(void) {
   gr_cp<IDXGIFactory4> factory;
   D3D_OK_OR_WARN(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
   if (factory.get() == nullptr) return 0;
+  gpu_trace("factory");
 
-  g_adapter = d3d_hardware_adapter(factory.get());
+  g_adapter.reset(d3d_hardware_adapter(factory.get()));
   if (g_adapter.get() == nullptr) {
     fprintf(stderr, "d3d_glue: no adapter can create a Direct3D 12 device\n");
     return 0;
   }
+  gpu_trace("adapter");
 
   D3D_OK_OR_WARN(D3D12CreateDevice(g_adapter.get(), D3D_FEATURE_LEVEL_11_0,
                                    IID_PPV_ARGS(&g_device)));
   if (g_device.get() == nullptr) return 0;
+  gpu_trace("device");
 
   D3D12_COMMAND_QUEUE_DESC qd = {};
   qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
   qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   D3D_OK_OR_WARN(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)));
   if (g_queue.get() == nullptr) return 0;
+  gpu_trace("queue");
 
   GrD3DBackendContext backend = {};
   backend.fAdapter = g_adapter;
@@ -209,6 +233,7 @@ static int d3d_init_shared(void) {
   // fProtectedContext stays kNo: protected memory needs a DRM-capable display path
   // that a desktop app has no reason to ask for.
   g_context = GrDirectContext::MakeDirect3D(backend);
+  gpu_trace("GrDirectContext");
   if (g_context == nullptr) {
     fprintf(stderr, "d3d_glue: GrDirectContext::MakeDirect3D failed\n");
     g_queue.reset();
@@ -231,14 +256,22 @@ static int d3d_setup_surfaces(D3DWin* w) {
     D3D_OK_OR_WARN(w->swapchain->GetBuffer((UINT)i, IID_PPV_ARGS(&w->buffers[i])));
     if (w->buffers[i].get() == nullptr) return 0;
 
-    // GrD3DTextureResourceInfo(resource, alloc, state, format, levelCount,
-    // sampleCount, protected). `alloc` is null because the swapchain owns the
-    // resource (Skia must not try to free it), and the state is PRESENT because
-    // that is the state DXGI hands a back buffer back in.
-    GrD3DTextureResourceInfo info(w->buffers[i].get(), nullptr,
+    // GrD3DTextureResourceInfo(resource, alloc, state, format, sampleCount,
+    // levelCount, sampleQualityLevel, protected). `alloc` is null because the
+    // swapchain owns the resource (Skia must not try to free it), and the state
+    // is PRESENT because that is the state DXGI hands a back buffer back in.
+    // sampleQualityLevel is 0 (the standard pattern, matching Skia's own
+    // D3D12WindowContext_win.cpp reference) and protected is kNo.
+    GrD3DTextureResourceInfo info(nullptr, nullptr,
                                   D3D12_RESOURCE_STATE_PRESENT,
                                   SK_D3D_SWAPCHAIN_FORMAT,
-                                  1, 1, GrProtected::kNo);
+                                  1, 1, 0, GrProtected::kNo);
+    // NOT the (resource, ...) constructor: that one ADOPTS the bare pointer without
+    // AddRef while its destructor still Releases (see the ownership note below), so
+    // it would eat the reference w->buffers[i] believes it holds -- a double release
+    // the moment the surface is dropped. retain() Adds its own ref instead, which is
+    // what Skia's own D3D12WindowContext_win.cpp does (`info.fResource = fBuffers[i]`).
+    info.fResource.retain(w->buffers[i].get());
     GrBackendRenderTarget rt(w->width, w->height, info);
     w->surfaces[i] = SkSurfaces::WrapBackendRenderTarget(g_context.get(), rt,
                                                          kTopLeft_GrSurfaceOrigin,
@@ -251,6 +284,24 @@ static int d3d_setup_surfaces(D3DWin* w) {
   }
   return 1;
 }
+
+// --- shipping the backend to the Stage3D glue ------------------------------
+//
+// vendor/stage3d_d3d.cc renders the Stage3D frame on ITS OWN D3D12 command list,
+// but must submit it to THIS file's queue: the Skia composite samples the Stage3D
+// render target on the next submission to the same queue, and a shared queue is
+// what turns "submitted earlier" into "the GPU has the pixels" with no CPU wait.
+// That is exactly the contract metal_glue.mm exposes as sk_mtl_shared_queue and
+// stage3d_glue.mm picks up with a weak dlsym lookup; the D3D counterpart is below.
+//
+// The accessors are looked up by NAME (GetProcAddress on the main module) rather
+// than linked: a build may link stage3d_d3d.cc without the window backend at all
+// (D3D12 on a machine with no GPU window, i.e. a headless readback build), and a
+// hard reference would then be an unresolved external in every such build.
+//
+// __declspec(dllexport) is what makes that by-name lookup possible at all: a PE image has no RTLD_DEFAULT equivalent, so GetProcAddress only finds symbols listed in the executable's own export directory. (With __cdecl on i686 the exported name is the undecorated one, which is what stage3d_d3d.cc asks for.)
+__declspec(dllexport) extern "C" ID3D12Device* sk_d3d_shared_device(void) { return g_device.get(); }
+__declspec(dllexport) extern "C" ID3D12CommandQueue* sk_d3d_shared_queue(void) { return g_queue.get(); }
 
 // --- the seam the generated C calls ---------------------------------------
 
@@ -308,6 +359,7 @@ int sk_gpu_init(int win_id, void* native_handle) {
   D3D_OK_OR_WARN(factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER));
   D3D_OK_OR_WARN(swapchain->QueryInterface(IID_PPV_ARGS(&g_d3d[win_id].swapchain)));
   if (g_d3d[win_id].swapchain.get() == nullptr) return 0;
+  gpu_trace("swapchain");
 
   g_d3d[win_id].hwnd = hwnd;
   g_d3d[win_id].width = cw;
@@ -318,6 +370,7 @@ int sk_gpu_init(int win_id, void* native_handle) {
     g_d3d[win_id].swapchain.reset();
     return 0;
   }
+  gpu_trace("surfaces");
 
   // Fence values start high so they stand out in a PIX capture (Skia's reference
   // does the same); only their ordering matters.
@@ -440,6 +493,131 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
   return (void*)s->getCanvas();
 }
 
+// Debug: write the just-drawn back buffer to a 24-bit BMP.
+//
+// A flip-model swapchain's content CANNOT be screen-captured: GDI/BitBlt and most
+// screen grabbers see a stale or black surface because the presented image never
+// passes through the window's GDI surface. Without this dump a headless run has no
+// way to tell "composited correctly" from "drew nothing" -- the two look identical
+// in a screenshot. The copy is a plain back-buffer -> READBACK-buffer read on the
+// SAME queue, before Present, and it puts the resource back in PRESENT when done.
+//
+// ASC_GPU_DUMP   = output .bmp path (no dump unless set)
+// ASC_GPU_DUMP_AT = frame index to dump (default 30: the demo has its assets loaded)
+static void d3d_dump_backbuffer(D3DWin* w) {
+  const char* out = getenv("ASC_GPU_DUMP");
+  if (out == nullptr || out[0] == '\0') return;
+  static long n = 0;
+  const char* atEnv = getenv("ASC_GPU_DUMP_AT");
+  const long at = atEnv != nullptr ? atol(atEnv) : 30;
+  static int done = 0;
+  if (done || n++ < at) return;
+  done = 1;
+
+  ID3D12Resource* bb = w->buffers[w->buffer_index].get();
+  if (bb == nullptr) { fprintf(stderr, "ASC_GPU_DUMP: no back buffer\n"); fflush(stderr); return; }
+  const UINT width = (UINT)w->width, height = (UINT)w->height;
+  if (width == 0 || height == 0) { fprintf(stderr, "ASC_GPU_DUMP: zero size\n"); fflush(stderr); return; }
+  // CopyTextureRegion only accepts a 256-byte-aligned row pitch.
+  const UINT rowPitch = (width * 4u + 255u) & ~255u;
+
+  gr_cp<ID3D12CommandAllocator> alloc;
+  gr_cp<ID3D12GraphicsCommandList> list;
+  gr_cp<ID3D12Resource> rb;
+  gr_cp<ID3D12Fence> fence;
+  if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)))) { fprintf(stderr, "ASC_GPU_DUMP: allocator\n"); fflush(stderr); return; }
+  if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.get(), nullptr, IID_PPV_ARGS(&list)))) { fprintf(stderr, "ASC_GPU_DUMP: list\n"); fflush(stderr); return; }
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_READBACK;
+  D3D12_RESOURCE_DESC bd = {};
+  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  bd.Width = (UINT64)rowPitch * height;
+  bd.Height = 1;
+  bd.DepthOrArraySize = 1;
+  bd.MipLevels = 1;
+  bd.SampleDesc.Count = 1;
+  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&rb)))) { fprintf(stderr, "ASC_GPU_DUMP: readback resource\n"); fflush(stderr); return; }
+  if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) { fprintf(stderr, "ASC_GPU_DUMP: fence\n"); fflush(stderr); return; }
+
+  // Skia's kPresent flush left the back buffer in PRESENT, and DXGI needs it back
+  // there before the Present(1,0) that follows in sk_gpu_flush.
+  D3D12_RESOURCE_BARRIER bar = {};
+  bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  bar.Transition.pResource = bb;
+  bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+  bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1, &bar);
+  D3D12_TEXTURE_COPY_LOCATION src = {};
+  src.pResource = bb;
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  src.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = rb.get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint.Footprint.Format = SK_D3D_SWAPCHAIN_FORMAT;
+  dst.PlacedFootprint.Footprint.Width = width;
+  dst.PlacedFootprint.Footprint.Height = height;
+  dst.PlacedFootprint.Footprint.Depth = 1;
+  dst.PlacedFootprint.Footprint.RowPitch = rowPitch;
+  list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+  list->ResourceBarrier(1, &bar);
+  if (FAILED(list->Close())) { fprintf(stderr, "ASC_GPU_DUMP: close\n"); fflush(stderr); return; }
+  ID3D12CommandList* lists[1] = { list.get() };
+  g_queue->ExecuteCommandLists(1, lists);
+  D3D_OK_OR_WARN(g_queue->Signal(fence.get(), 1));
+  for (int spin = 0; spin < 20000; ++spin) {
+    if (fence->GetCompletedValue() >= 1) break;
+    Sleep(1);
+  }
+
+  void* mapped = nullptr;
+  const D3D12_RANGE readRange = { 0, (SIZE_T)rowPitch * height };
+  if (FAILED(rb->Map(0, &readRange, &mapped)) || mapped == nullptr) { fprintf(stderr, "ASC_GPU_DUMP: map\n"); fflush(stderr); return; }
+
+  const UINT rowBytes = ((width * 3u + 3u) & ~3u);
+  const UINT dataBytes = rowBytes * height;
+  const UINT fileBytes = 54u + dataBytes;
+  FILE* f = fopen(out, "wb");
+  if (f == nullptr) {
+    fprintf(stderr, "d3d_glue: ASC_GPU_DUMP: cannot open %s\n", out);
+  } else {
+    unsigned char hdr[54] = { 0 };
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &fileBytes, 4);
+    const unsigned int off = 54, hsz = 40;
+    memcpy(hdr + 10, &off, 4);
+    memcpy(hdr + 14, &hsz, 4);
+    const int iw = (int)width, ih = -(int)height;   // negative height = top-down rows
+    memcpy(hdr + 18, &iw, 4);
+    memcpy(hdr + 22, &ih, 4);
+    const unsigned short planes = 1, bpp = 24;
+    memcpy(hdr + 26, &planes, 2);
+    memcpy(hdr + 28, &bpp, 2);
+    memcpy(hdr + 34, &dataBytes, 4);
+    fwrite(hdr, 1, sizeof hdr, f);
+    const unsigned char* px = (const unsigned char*)mapped;
+    for (UINT y = 0; y < height; ++y) {
+      const unsigned char* row = px + (SIZE_T)y * rowPitch;
+      for (UINT x = 0; x < width; ++x) {
+        // R8G8B8A8 in memory -> B,G,R in the file.
+        const unsigned char bgr[3] = { row[x * 4 + 2], row[x * 4 + 1], row[x * 4 + 0] };
+        fwrite(bgr, 1, 3, f);
+      }
+      const unsigned char pad[3] = { 0, 0, 0 };
+      if (rowBytes > width * 3u) fwrite(pad, 1, rowBytes - width * 3u, f);
+    }
+    fclose(f);
+    fprintf(stderr, "d3d_glue: ASC_GPU_DUMP wrote %s (%ux%u)\n", out, width, height);
+  }
+  rb->Unmap(0, nullptr);
+}
+
 // Submit the frame's Ganesh work and present the back buffer.
 //
 // The two-step flush here is the D3D counterpart of Metal's flushAndSubmit, and
@@ -459,6 +637,8 @@ void sk_gpu_flush(int win_id) {
   g_context->flush(s, SkSurfaces::BackendSurfaceAccess::kPresent, info);
   g_context->submit();
 
+  d3d_dump_backbuffer(w);
+
   D3D_OK_OR_WARN(w->swapchain->Present(1, 0));
   // Mark this frame's completion on the queue so the next begin_frame for this
   // buffer index can wait for it (see above). Signaling AFTER Present is what
@@ -468,30 +648,97 @@ void sk_gpu_flush(int win_id) {
 }
 
 // Composite an externally-owned D3D12 texture (an ID3D12Resource) onto the current
-// canvas.
+// canvas — the Stage3D -> window blit, and the D3D counterpart of metal_glue.mm's
+// sk_mtl_draw_texture. Its only caller is the generated C's ASC_window_render
+// (`as_skia_gpu_draw_texture(canvas, ASC_stage3d_tex, ...)`), where
+// ASC_stage3d_tex is exactly the pointer s3d_get_render_target handed over.
 //
-// NOT REACHABLE IN THIS BUILD, and it says so out loud rather than drawing
-// nothing: its only caller is the Stage3D -> window composite, and Stage3D on
-// Windows is a build-time error (air-app.ts refuses an AIR descriptor that uses
-// Context3D there, because the AGAL -> HLSL pipeline does not exist yet — see
-// TODO.md's stage for vendor/stage3d_d3d.cc). When that pipeline lands, this must
-// wrap the render target's resource in a GrD3DTextureResourceInfo and draw it; the
-// resource's DXGI_FORMAT and current D3D12_RESOURCE_STATE are the two things that
-// have to come from the Stage3D context, which is exactly why they cannot be
-// invented here. Note that the generated C's Stage3D composite is compiled out
-// under ASC_RENDER_D3D anyway (it composites a Metal texture), so this exists to
-// make the seam complete, not to be called.
+// The contract with vendor/stage3d_d3d.cc (two things this file cannot obtain for
+// itself, which is why it used to refuse instead of guessing):
+//   * the resource is a single-level, single-sample 2D texture — read from the
+//     resource's own D3D12_RESOURCE_DESC (its DXGI_FORMAT included), so the format
+//     is NOT assumed; an sRGB or multi-sample resource is refused loudly rather
+//     than sampled wrong;
+//   * the resource is in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, which the
+//     Stage3D glue guarantees as its frame invariant (it ends every frame's
+//     command list by transitioning the current render target there) precisely so
+//     that this wrapper needs no state of its own.
+//
+// Skia tracks the state of a texture it wraps and inserts the barrier itself, so
+// passing the true state is what keeps the two sides from double-transitioning.
+// The image is borrowed for one draw and dropped immediately after it: it wraps a
+// resource the Stage3D context owns, so nothing here may outlive the draw.
 void sk_gpu_draw_texture(void* canvas, void* d3dTexture, int w, int h,
                          double dx, double dy, double dw, double dh) {
-  (void)canvas; (void)d3dTexture; (void)w; (void)h;
-  (void)dx; (void)dy; (void)dw; (void)dh;
-  static int warned = 0;
-  if (!warned) {
-    warned = 1;
-    fprintf(stderr, "d3d_glue: sk_gpu_draw_texture has no implementation yet "
-                    "(Stage3D composite); nothing was drawn\n");
-    fflush(stderr);
+  if (canvas == nullptr || d3dTexture == nullptr || g_context == nullptr) return;
+  if (w <= 0 || h <= 0) return;
+  ID3D12Resource* res = (ID3D12Resource*)d3dTexture;
+
+  const D3D12_RESOURCE_DESC rd = res->GetDesc();
+  if (getenv("ASC_S3D_TRACE") != nullptr) {
+      fprintf(stderr, "d3d_glue: draw_texture res=%p fmt=%d samples=%u dw=%llu dh=%llu w=%d h=%d\n",
+              (void*)res, (int)rd.Format, (unsigned)rd.SampleDesc.Count,
+              (unsigned long long)rd.Width, (unsigned long long)rd.Height, w, h);
   }
+  SkColorType ct = kUnknown_SkColorType;
+  if (rd.Format == DXGI_FORMAT_B8G8R8A8_UNORM) ct = kBGRA_8888_SkColorType;
+  else if (rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM) ct = kRGBA_8888_SkColorType;
+  if (ct == kUnknown_SkColorType || rd.SampleDesc.Count != 1) {
+    static int warned = 0;
+    if (!warned || getenv("ASC_S3D_TRACE") != nullptr) {
+      warned = 1;
+      fprintf(stderr, "d3d_glue: sk_gpu_draw_texture: unsupported render target "
+                      "(dxgi format %d, %u samples); nothing was drawn\n",
+              (int)rd.Format, (unsigned)rd.SampleDesc.Count);
+      fflush(stderr);
+    }
+    return;
+  }
+
+  // Ownership contract of Skia's D3D backend (include/gpu/d3d/GrD3DTypes.h):
+  //   "there is no notion of Borrowed or Adopted resources in the D3D backend, so
+  //    Ganesh will ref fResource once it's asked to wrap it. Clients are responsible
+  //    for releasing their own ref to avoid memory leaks."
+  // GrD3DTextureResourceInfo::fResource is a gr_cp, and building the struct from a
+  // BARE pointer ADOPTS that pointer without AddRef -- while its destructor Releases.
+  // Passing our only reference in via that constructor therefore silently drops the
+  // Stage3D context's reference to the render target: the resource is freed when this
+  // function returns and its address is recycled by the next allocation. Measured
+  // failure mode: frame 1's composite is fine, frame 2 reads a 144-byte vertex BUFFER
+  // where the 1000x600 texture was, and sk_gpu_draw_texture refuses it
+  // ("unsupported render target (dxgi format 0, 1 samples); nothing was drawn").
+  // retain() is the balanced recipe -- it AddRefs into the struct and the struct's
+  // destructor releases that reference -- exactly like Skia's own
+  // tools/window/win/D3D12WindowContext_win.cpp (`info.fResource = fBuffers[i]`).
+  GrD3DTextureResourceInfo info(nullptr, nullptr,
+                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                               rd.Format, 1, 1, 0, GrProtected::kNo);
+  info.fResource.retain(res);
+  GrBackendTexture beTex(w, h, info);
+  // BGRA8 render targets hold straight-ish premultiplied Stage3D output (Starling
+  // blends premultiplied), which is also the alpha type the 2D display list uses.
+  sk_sp<SkImage> img = SkImages::BorrowTextureFrom(g_context.get(), beTex,
+                                                   kTopLeft_GrSurfaceOrigin, ct,
+                                                   kPremul_SkAlphaType, nullptr);
+  if (img == nullptr) {
+    static int warned = 0;
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr, "d3d_glue: sk_gpu_draw_texture: BorrowTextureFrom failed; "
+                      "nothing was drawn\n");
+      fflush(stderr);
+    }
+    return;
+  }
+
+  SkCanvas* c = (SkCanvas*)canvas;
+  SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
+  // The dst-only overload (like sk_mtl_draw_texture) samples the WHOLE image, which
+  // is the render target's full extent; w/h only shaped the GrBackendTexture above.
+  // Linear filtering, not Skia's nearest default: the destination is the render
+  // target's LOGICAL size while the source is its DEVICE size under HiDPI, so this
+  // is a real scale-down and nearest would alias the game's sprites.
+  c->drawImageRect(img, dst, SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNone));
 }
 
 }  // extern "C"

@@ -7090,7 +7090,7 @@ export class Emitter {
     // maxChars case above.
     this.line('const char* ins = text;');
     this.line('char filtered[4096];');
-    this.line('if (tf->_restrict != NULL) {');
+    this.line('if (tf->___restrict != NULL) {');
     this.indent++;
     this.line('int fn = 0;');
     this.line('int i = 0;');
@@ -7100,7 +7100,7 @@ export class Emitter {
     this.line('if (c == 13 || c == 10) filtered[fn++] = (char)c;');
     this.line('else {');
     this.indent++;
-    this.line('int keep = as_tf_restrict_char(tf->_restrict, c);');
+    this.line('int keep = as_tf_restrict_char(tf->___restrict, c);');
     this.line('if (keep != 0) filtered[fn++] = (char)keep;');
     this.indent--;
     this.line('}');
@@ -10385,11 +10385,46 @@ export class Emitter {
     // applicationDirectory is the app's own directory (mapped to the CWD in this
     // subset); userDirectory/desktopDirectory/documentsDirectory read $HOME and
     // append the standard sub-path.
-    this.line('static char* as_home_dir(void) { char* h = getenv("HOME"); return (h == NULL || *h == \'\\0\') ? (char*)"." : h; }');
+    this.line('static char* as_home_dir(void) {');
+    this.indent++;
+    this.line('#ifdef _WIN32');
+    this.line('char* h = getenv("USERPROFILE");');
+    this.line('return (h == NULL || *h == \'\\0\') ? (char*)"." : h;');
+    this.line('#else');
+    this.line('char* h = getenv("HOME");');
+    this.line('return (h == NULL || *h == \'\\0\') ? (char*)"." : h;');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
     this.line('static char* as_app_dir(void) { return (char*)"."; }');
     this.line('static char* as_user_dir(void) { return as_home_dir(); }');
     this.line('static char* as_desktop_dir(void) { return as_path_join(as_home_dir(), "Desktop"); }');
     this.line('static char* as_documents_dir(void) { return as_path_join(as_home_dir(), "Documents"); }');
+    this.line('static int as_mkdir_one(const char* p) {');
+    this.indent++;
+    this.line('#ifdef _WIN32');
+    this.line('// MSVC names mkdir _mkdir and drops the mode argument, and _mkdir lives in');
+    this.line('// <direct.h> which this preamble does not include. CreateDirectoryA is the');
+    this.line('// kernel32 single-level directory creator and needs no extra header.');
+    this.line('return CreateDirectoryA(p, NULL) ? 0 : -1;');
+    this.line('#else');
+    this.line('return mkdir(p, 0755);');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
+    // POSIX remove() deletes an empty directory (via rmdir), but MSVC's remove()
+    // is _unlink-only and cannot delete a directory. deleteDirectory therefore
+    // needs its own helper: RemoveDirectoryA on Windows, rmdir elsewhere.
+    this.line('static int as_rmdir_one(const char* p) {');
+    this.indent++;
+    this.line('#ifdef _WIN32');
+    this.line('// kernel32 single-level empty-directory remover; mirrors as_mkdir_one.');
+    this.line('return RemoveDirectoryA(p) ? 0 : -1;');
+    this.line('#else');
+    this.line('return rmdir(p);');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
     this.line('static void as_mkdirs(const char* p) {');
     this.indent++;
     this.line('if (p == NULL || *p == \'\\0\') return;');
@@ -10397,8 +10432,15 @@ export class Emitter {
     this.line('size_t len = strlen(p);');
     this.line('if (len + 1 > sizeof(buf)) return;');
     this.line('memcpy(buf, p, len + 1);');
-    this.line('for (char* s = buf + 1; *s != \'\\0\'; s++) if (*s == \'/\') { *s = \'\\0\'; mkdir(buf, 0755); *s = \'/\'; }');
-    this.line('mkdir(buf, 0755);');
+    this.line('// Split on both path separators; buf[0] is skipped so an absolute path\'s');
+    this.line('// root is not turned into an empty component.');
+    this.line('for (char* s = buf + 1; *s != \'\\0\'; s++) {');
+    this.indent++;
+    this.line('char c = *s;');
+    this.line('if (c == \'/\' || c == \'\\\\\') { *s = \'\\0\'; as_mkdir_one(buf); *s = c; }');
+    this.indent--;
+    this.line('}');
+    this.line('as_mkdir_one(buf);');
     this.indent--;
     this.line('}');
     this.line('');
@@ -10444,7 +10486,7 @@ export class Emitter {
     this.line('File* File_resolvePath(void* _this, char* path) { File* o = (File*)_this; return (o->nativePath == NULL) ? File_new(path) : File_new(as_path_join(o->nativePath, path)); }');
     this.line('void File_createDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) as_mkdirs(o->nativePath); }');
     this.line('void File_deleteFile(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) remove(o->nativePath); }');
-    this.line('void File_deleteDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) remove(o->nativePath); }');
+    this.line('void File_deleteDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) as_rmdir_one(o->nativePath); }');
     // getDirectoryListing: list a directory's children as File objects (skipping
     // . and ..), used by AssetManager to recursively enqueue folder contents.
     this.line('as_array* File_getDirectoryListing(void* _this) {');
@@ -10452,6 +10494,32 @@ export class Emitter {
     this.line('File* o = (File*)_this;');
     this.line('as_array* result = as_array_new();');
     this.line('if (o->nativePath == NULL) return result;');
+    this.line('#ifdef _WIN32');
+    this.line('// MSVC has no dirent.h; enumerate with FindFirstFile/FindNextFile, which');
+    this.line('// want a backslash separator (FindFirstFile rejects the \'/\' as_path_join');
+    this.line('// produces), so build a "<dir>\\*" pattern and swap separators as we copy.');
+    this.line('{');
+    this.indent++;
+    this.line('size_t n = strlen(o->nativePath);');
+    this.line('char* pat = (char*)malloc(n + 3);');
+    this.line('size_t i;');
+    this.line('memcpy(pat, o->nativePath, n);');
+    this.line('for (i = 0; i < n; i++) if (pat[i] == \'/\') pat[i] = \'\\\\\';');
+    this.line('pat[n] = \'\\\\\'; pat[n + 1] = \'*\'; pat[n + 2] = \'\\0\';');
+    this.line('WIN32_FIND_DATAA fd;');
+    this.line('HANDLE h = FindFirstFileA(pat, &fd);');
+    this.line('free(pat);');
+    this.line('if (h == INVALID_HANDLE_VALUE) return result;');
+    this.line('do {');
+    this.indent++;
+    this.line('if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;');
+    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->nativePath, fd.cFileName))));');
+    this.indent--;
+    this.line('} while (FindNextFileA(h, &fd) != 0);');
+    this.line('FindClose(h);');
+    this.indent--;
+    this.line('}');
+    this.line('#else');
     this.line('DIR* d = opendir(o->nativePath);');
     this.line('if (d == NULL) return result;');
     this.line('struct dirent* e;');
@@ -10462,6 +10530,7 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('closedir(d);');
+    this.line('#endif');
     this.line('return result;');
     this.indent--;
     this.line('}');
@@ -12789,7 +12858,7 @@ export class Emitter {
     this.line('o->maxChars = 0;');
     this.line('o->displayAsPassword = false;');
     this.line('o->tabEnabled = false;');
-    this.line('o->_restrict = NULL;  /* restrict is a C keyword; cIdent() spells it _restrict */');
+    this.line('o->___restrict = NULL;  /* restrict is a C keyword; cIdent() spells it ___restrict */');
     this.line('o->defaultTextFormat = TextFormat_new(NULL, 12.0, 0x000000u, false, false, 0.0);');
     this.line('o->multiline = false;');
     this.line('o->wordWrap = false;');
@@ -13895,11 +13964,14 @@ export class Emitter {
     this.line('char* Matrix3D_toString(void* _this) { Matrix3D* m = (Matrix3D*)_this; char* b = as_str_alloc(320); int p = snprintf(b, 320, "Matrix3D("); for (int i = 0; i < 16; i++) p += snprintf(b + p, 320 - p, "%s%s", i == 0 ? "" : ", ", as_str_from_double(m->_m[i])); snprintf(b + p, 320 - p, ")"); return b; }');
     this.line('');
     // AGALTranslator.translate(bytes, target): stage-80 bridge over the runtime
-    // AGAL -> MSL/GLSL translator (as_agal_translate). `target` is "msl" (default)
-    // or "glsl". Validation errors throw Error with the translator's message.
+    // AGAL -> MSL/GLSL/HLSL translator (as_agal_translate). `target` is "msl"
+    // (default), "glsl", or "hlsl" (stage 131). "hlsl" has to be spelled out
+    // explicitly -- anything unrecognised falls back to MSL, so a Windows caller
+    // that passed no target would get Metal source for a D3D pipeline. Validation
+    // errors throw Error with the translator's message.
     this.line('char* AGALTranslator_translate_static(ByteArray* bytes, char* target) {');
     this.indent++;
-    this.line('int t = (target != NULL && strcmp(target, "glsl") == 0) ? 1 : 0;');
+    this.line('int t = (target != NULL && strcmp(target, "glsl") == 0) ? 1 : ((target != NULL && strcmp(target, "hlsl") == 0) ? 2 : 0);');
     this.line('char* r = as_agal_translate((const unsigned char*)bytes->data, bytes->length, t);');
     this.line('if (r == NULL) { as_throw(Error_new((char*)as_agal_errmsg, 0)); return NULL; }');
     this.line('return r;');
@@ -14335,7 +14407,7 @@ export class Emitter {
     // composites behind the 2D display list.
     this.line('int w = as_s3d_width(o->gpu), h = as_s3d_height(o->gpu);');
     this.line('if (w <= 0 || h <= 0) return;');
-    this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_GPU)');
+    this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GPU)');
     this.line('ASC_stage3d_tex = as_s3d_get_render_target(o->gpu);');
     this.line('ASC_stage3d_w = w; ASC_stage3d_h = h;');
     this.line('#else');    this.line('if (ASC_stage3d_pixels == NULL || ASC_stage3d_w != w || ASC_stage3d_h != h) {');
@@ -14788,6 +14860,15 @@ export class Emitter {
     this.line('#if defined(ASC_S3D_GLSL)');
     // Web backend: stage3d_webgl.cc drives the WebGL2 pipeline.
     this.line('return (char*)"WebGL2 (Stage3D)";');
+    this.line('#elif defined(ASC_S3D_HLSL)');
+    // Windows backend: vendor/stage3d_d3d.cc (D3D12) consumes the AGAL -> HLSL
+    // translation of target 2. This branch MUST come before ASC_RENDER_STAGE3D:
+    // a Windows Stage3D build defines both macros, and only this one is true
+    // there. The exact string AIR reports for a D3D backend has not been measured
+    // yet (it needs adl against a working backend), so it stays an honest
+    // placeholder -- the value is display-only (Starling's stats box), and
+    // claiming "Metal" on Windows would be plainly false. Registered in TODO.md.
+    this.line('return (char*)"Direct3D12 (Stage3D)";');
     this.line('#elif defined(ASC_RENDER_STAGE3D)');
     this.line('return (char*)"Metal (Stage3D)";');
     this.line('#else');
@@ -16309,20 +16390,19 @@ export class Emitter {
     this.line('as_skia_canvas_translate(canvas, ox, oy);');
     this.line('as_skia_canvas_scale(canvas, cx, cy);');
     // Composite the Stage3D frame behind the 2D display list (AIR puts Stage3D
-    // behind). The render target may be larger than the stage-unit rect it covers
-    // (HiDPI/+wantsBestResolution), so the source size and the destination rect
-    // are passed separately. Both GPU backends blit the render-target texture
-    // directly (Metal: MTLTexture; web: the GL texture wrapped as a
-    // GrBackendTexture); the CPU path draws the readback BGRA buffer.
-    // Composite the Stage3D frame behind the 2D display list (AIR puts Stage3D
-    // behind) — on the GPU path only. AIR's NativeWindowRenderMode.CPU documents
-    // that a software window does not composite StageVideo/Stage3D, and in a
-    // Metal build there is no readback buffer to composite from anyway: exposing
-    // the render target's texture is precisely what removed that per-frame CPU
-    // readback. So a metal window draws the texture, a cpu-mode window in the
-    // same build draws nothing — which is the documented AIR behaviour, not a
-    // silent gap.
-    this.line('#ifdef ASC_RENDER_METAL');
+    // behind) — on the GPU path only. The render target may be larger than the
+    // stage-unit rect it covers (HiDPI/+wantsBestResolution), so the source size
+    // and the destination rect are passed separately. Every GPU backend blits the
+    // render-target texture directly (Metal: MTLTexture; D3D12: ID3D12Resource;
+    // web: the GL texture wrapped as a GrBackendTexture); the CPU path draws the
+    // readback BGRA buffer.
+    // AIR's NativeWindowRenderMode.CPU documents that a software window does not
+    // composite StageVideo/Stage3D, and in a GPU build there is no readback buffer
+    // to composite from anyway: exposing the render target's texture is precisely
+    // what removed that per-frame CPU readback. So a GPU window draws the texture,
+    // a cpu-mode window in the same build draws nothing — which is the documented
+    // AIR behaviour, not a silent gap.
+    this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D)');
     this.line('if (getenv("ASC_S3D_TRACE") != NULL) { static int n = 0; if (n++ % 120 == 0) fprintf(stderr, "s3d_trace composite: is_gpu=%d ready=%d tex=%p w=%d h=%d lw=%d lh=%d\\n", w->is_gpu, ASC_stage3d_ready, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, ASC_stage3d_lw, ASC_stage3d_lh); }');
     this.line('if (w->is_gpu && ASC_stage3d_ready && ASC_stage3d_tex != NULL) {');
     this.indent++;
