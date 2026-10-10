@@ -14,6 +14,8 @@ function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL
 class Material {
   public var r:Number = 0.25, g:Number = 0.5, b:Number = 0.75;
   public var label:String = "base", tag:String;
+  public var dyn;
+  public var dynInit = 5;
   public static var base:int = 3, derived:int = base * 2;
   public static var sr:int = 1, sg:int = 2;
   public static const K:int = 9, L:int = 10, M:int = 11;
@@ -34,6 +36,17 @@ check(m2.r == 0.25, "each instance gets its own copy of every declarator");
 
 // 有类型的与无类型的声明混在一条里。
 check(m.label == "base" && m.tag == null, "a typed and an untyped declarator share one statement");
+
+// 类体无类型字段是 `*`（动态），不是 int：默认 null、可赋任意类型（adl 51.4.1 实测，
+// temp/qfix/gcadl/Untyped.as）。
+check(m.dyn == null, "an untyped field defaults to null");
+m.dyn = "text";
+check(m.dyn == "text", "an untyped field accepts a String");
+m.dyn = 7;
+check(m.dyn == 7, "an untyped field accepts a Number");
+check(m.dynInit == 5, "an untyped field with an initializer keeps it");
+m.dynInit = "str";
+check(m.dynInit == "str", "an initialized untyped field is still dynamic");
 
 // 一条声明里的 `const`。
 check(Material.K == 9 && Material.L == 10 && Material.M == 11, "a const declaration may list several constants");

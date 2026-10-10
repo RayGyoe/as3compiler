@@ -372,8 +372,8 @@ function checkEmitDynamicSlotCoercion(): string[] {
   check('...and never the C prefix parsers (atoi/atof would say 10 for "10x")',
     !/\b(?:atoi|atof)\(g_s\)/.test(gen('var s:String = "10x";\ntrace(int(s), uint(s), Number(s));\n')));
   check('parseInt/parseFloat keep their own PREFIX parsers (per spec)',
-    gen('var s:String = "1x";\ntrace(parseInt(s), parseFloat(s));\n').includes('atoi(g_s)')
-    && gen('var s:String = "1x";\ntrace(parseInt(s), parseFloat(s));\n').includes('atof(g_s)'));
+    gen('var s:String = "1x";\ntrace(parseInt(s), parseFloat(s));\n').includes('as_parse_int(g_s, 0.0)')
+    && gen('var s:String = "1x";\ntrace(parseInt(s), parseFloat(s));\n').includes('as_parse_float(g_s)'));
   check('as_v_truthy treats a non-empty boxed String as true',
     pre.includes('case 3: return v.ptr != NULL && ((char*)v.ptr)[0] != 0;'));
   check('as_coerce_str stringifies a boxed Number for a String slot',
@@ -650,3 +650,167 @@ function checkEmitClosureThisCapture(): string[] {
   return bad;
 }
 registerGroup('unit: emit/ClosureThisCapture', checkEmitClosureThisCapture);
+
+// E4X `list.@attr` in a scalar (String) context is the CONCATENATION of every
+// item's attribute value in document order (adl-measured, temp/qfix/xmlattr.body.as):
+// two items at="1"/at="2" give "12", not "1". The single-element shape is covered
+// end to end by examples/stage91.as; the multi-element list helper is only reached
+// through the runtime text, so it is pinned here.
+function checkEmitE4xListAttrScalar(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [e4x] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [e4x] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  check('as_xml_list_attr concatenates every item (E4X scalar context)',
+    pre.includes('out = (out == NULL) ? v : as_str_concat(out, v);'));
+  check('...and no longer short-circuits on the first non-empty value',
+    !/if \(v\[0\] != 0\) return v;/.test(pre));
+  check('the single-item fast path still returns the raw attribute value',
+    pre.includes('if (l->length == 1) return as_xml_attr(l->items[0], name);'));
+  console.log(`     [e4x] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: e4x/ListAttrScalar', checkEmitE4xListAttrScalar);
+
+// Object ToPrimitive (ES3 11.9.3): an object/class instance converted to a number
+// (Number/int/uint, numeric comparison) or compared loosely against a primitive
+// runs valueOf() first, then toString(). Measured on adl 51.4.1
+// (temp/qfix/gcadl/numMain.as -> result5.txt): Number({}) is NaN, Number(undefined)
+// is NaN, a class whose toString() is "42" gives 42, and a valueOf() override
+// (7) beats its toString() (99). The runtime half is reached only through the
+// preamble, so it is pinned here as text.
+function checkEmitObjectToPrimitive(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [objprim] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [objprim] ${label}`); }
+  };
+
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  check('an object routes to the number-hint ToPrimitive helper',
+    pre.includes('if (v.tag == 4) return as_obj_to_number(v.ptr);'));
+  check('undefined and a Function value are NaN (only null is 0)',
+    pre.includes('if (v.tag == 5 || v.tag == 7) return NAN;'));
+  check('the helper tries a user valueOf() through the method table',
+    pre.includes('if (strcmp(methods[i].name, "valueOf") == 0) {'));
+  check('...and falls back to the vtable toString() slot (or the [object X] default)',
+    pre.includes('char* s = toStr != NULL ? toStr(obj) : as_obj_default_str(obj);'));
+  check('int/uint route an object through ToNumber first',
+    pre.replace(/\s+/g, ' ').includes('if (v.tag == 4) return as_to_int32(as_obj_to_number(v.ptr));')
+    && pre.replace(/\s+/g, ' ').includes('if (v.tag == 4) return as_to_uint32(as_obj_to_number(v.ptr));'));
+  check('loose equality coerces an object against a string (string-hint)',
+    pre.includes('if (a.tag == 4 && b.tag == 3) return strcmp(as_obj_to_str(a.ptr), (char*)b.ptr) == 0;')
+    && pre.includes('if (b.tag == 4 && a.tag == 3) return strcmp(as_obj_to_str(b.ptr), (char*)a.ptr) == 0;'));
+  check('loose equality coerces an object against a Number/Bool (number-hint)',
+    pre.replace(/\s+/g, ' ').includes('if (a.tag == 4 && bn) return as_obj_to_number(a.ptr) == as_v_to_number(b);')
+    && pre.replace(/\s+/g, ' ').includes('if (b.tag == 4 && an) return as_obj_to_number(b.ptr) == as_v_to_number(a);'));
+
+  // A class instance compared with a primitive must box both sides; a same-class
+  // pointer or a null check must stay a cheap identity comparison.
+  const c = generateC(parse('class W { public function toString():String { return "42"; } }\n'
+    + 'var w:W = new W();\n'
+    + 'var n:Boolean = (w == 42);\n'
+    + 'var s:Boolean = (w == "42");\n'
+    + 'var z:Boolean = (w == null);\n'
+    + 'var p:W = w;\n'
+    + 'var id:Boolean = (w == p);\ntrace(n && s && z && id);\n')).c;
+  check('class instance == a number goes through as_v_loose_eq',
+    /as_v_loose_eq\(as_v_obj\([^)]*\), as_v_num\(42/.test(c) || /as_v_loose_eq\([^;]*42/.test(c));
+  check('class instance == a string goes through as_v_loose_eq',
+    /as_v_loose_eq\([^;]*as_v_str\("42"\)/.test(c));
+  check('class instance == null stays a pointer check (no as_v_loose_eq)',
+    !/as_v_loose_eq\([^;]*NULL\)/.test(c));
+  check('same-class identity stays a pointer comparison',
+    !/as_v_loose_eq\([^;]*g_p[^;]*g_w\)/.test(c));
+
+  console.log(`     [objprim] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ObjectToPrimitive', checkEmitObjectToPrimitive);
+
+// AIR validates DisplayObject.name against null/undefined (TypeError #2007,
+// measured on adl 51.4.1: temp/qfix/gcadl/result16.txt -- the static slot,
+// `this.name`, an unqualified `name` in a subclass method, `super.name` and
+// dynamic * / Object receivers all throw, and the field keeps its old value).
+// Error.name is a plain String slot and does not throw, so the guard must key on
+// the DECLARING class rather than on the field name.
+function checkEmitNameNullGuard(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [dname] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [dname] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  check('the guard helper is forward-declared in the runtime preamble',
+    pre.includes('static char* as_req_name(char* s);'));
+
+  // Static slot, unqualified field and `super.name` all take the guard.
+  const c = generateC(parse(
+    'import flash.display.Sprite;\n' +
+    'class Sub extends Sprite {\n' +
+    '  public function run():void { name = null; this.name = null; super.name = null; }\n' +
+    '}\n' +
+    'var s:Sprite = new Sprite(); s.name = null;\n')).c;
+  check('the guard helper throws #2007 with AIR\'s message',
+    c.includes('Error #2007: Parameter name must be non-null.'));
+  check('a static-slot null write wraps the value in as_req_name',
+    /s->name\)? *=\s*as_req_name\(/.test(c));
+  check('an unqualified null write takes the guard',
+    (c.match(/as_req_name\(/g) || []).length >= 3);
+
+  // A dynamic receiver routes through the prop table's tag-13 entry.
+  const dyn = generateC(parse(
+    'import flash.display.Sprite;\n' +
+    'var s:Sprite = new Sprite();\n' +
+    'var d:* = s; d.name = null;\n')).c;
+  check('the DisplayObject name slot is prop tag 13',
+    /\{ "name", 13, /.test(dyn));
+  check('a dynamic write reaches the same guard',
+    dyn.includes('as_req_name(as_coerce_str(v))'));
+  check('the dynamic read still treats tag 13 as a string',
+    dyn.includes('case 3: case 13:'));
+
+  // Error.name is a plain slot: no guard may be emitted for it.
+  const err = generateC(parse(
+    'var e:Error = new Error("x"); e.name = null;\n')).c;
+  check('Error.name is NOT guarded (plain String slot, tag 3)',
+    err.includes('->name) = NULL') && !/as_req_name\(NULL\)/.test(err) && /\{ "name", 3, /.test(err));
+
+  console.log(`     [dname] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/DisplayObjectNameNull', checkEmitNameNullGuard);
+
+// A missing Array element / named Array property and a missing dynamic object
+// property read as AIR's `undefined`, not null (measured on adl 51.4.1:
+// temp/qfix/gcadl/arrMain.as gives "undefined|xundefined", === undefined true and
+// == null true; omMain.as the same for objects). Only the runtime text can pin
+// this, since the examples suite exercises it but cannot assert the source.
+function checkRuntimeMissingIsUndefined(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [missing] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [missing] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  check('an out-of-range Array index is undefined',
+    pre.includes('if (i < 0 || i >= a->length) return as_v_undefined();'));
+  check('pop and shift on an empty Array are undefined',
+    (pre.match(/if \(a->length == 0\) return as_v_undefined\(\);/g) || []).length === 2);
+  check('a missing object property is undefined',
+    pre.replace(/\s+/g, ' ').includes('return i < 0 ? as_v_undefined() : o->vals[i];'));
+  check('a missing named Array property is undefined',
+    pre.replace(/\s+/g, ' ').includes('return (a == NULL || a->props == NULL) ? as_v_undefined() : as_object_get(a->props, key);'));
+  check('as_v_undefined is forward-declared before those reads',
+    pre.indexOf('static as_value as_v_undefined(void);') > 0
+    && pre.indexOf('static as_value as_v_undefined(void);') < pre.indexOf('static as_value as_array_get'));
+  console.log(`     [missing] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: runtime/MissingIsUndefined', checkRuntimeMissingIsUndefined);

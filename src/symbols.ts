@@ -5583,7 +5583,14 @@ export class SymbolTable {
             const embedClass = this.embedFieldInits.get(SymbolTable.embedFieldKey(stmt.name, stmt.packageName, m.name));
             const init: Expr | null =
               embedClass !== undefined ? { kind: 'Var', name: embedClass } : m.init;
-            const f: FieldInfo = { name: m.name, type: resolveType(m.type, info.importAlias), init, visibility: m.visibility, owner: cname, isStatic: m.isStatic, isConst: m.isConst };
+            // A class field with NO type annotation is `*` (dynamic) in AIR, NOT
+            // `int`: `public var u;` defaults to null and accepts a String or a
+            // Number, and `public var v = 5;` is still dynamic (measured on
+            // adl 51.4.1, temp/qfix/gcadl/Untyped.as). AGENTS.md §2.4's `var x; ->
+            // int` convention is for FUNCTION-scope declarations and does not
+            // apply to class members, so only this field path maps null to `any`.
+            const ftype: CType = m.type === null ? { kind: 'any' } : resolveType(m.type, info.importAlias);
+            const f: FieldInfo = { name: m.name, type: ftype, init, visibility: m.visibility, owner: cname, isStatic: m.isStatic, isConst: m.isConst };
             checkTypeAnnotation(m.type, info.importAlias, this);
             // Only `static` makes a field class-level in AS3. A bare `const` is an
             // instance constant (each instance carries its own immutable value),
@@ -5743,6 +5750,24 @@ export class SymbolTable {
       if (info) {
         const m = info.methods.get(name);
         if (m) return { owner: cur, m };
+        cur = info.superClass;
+      } else break;
+    }
+    return undefined;
+  }
+  // Same super-chain walk for an instance getter. Needed when a class receiver
+  // names an accessor as a method (`obj.prop()`): AIR reads the property and then
+  // calls the resulting value, so codegen must find the (possibly inherited)
+  // getter before concluding the method is undefined.
+  findGetter(cls: string, name: string): { owner: string; g: MethodInfo } | undefined {
+    let cur: string | null = cls;
+    const seen = new Set<string>();
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      const info = this.classMap.get(cur);
+      if (info) {
+        const g = info.getters.get(name);
+        if (g) return { owner: cur, g };
         cur = info.superClass;
       } else break;
     }

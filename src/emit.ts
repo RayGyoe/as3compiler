@@ -262,6 +262,15 @@ export class Emitter {
 
   private program: Program;
   private symbols: SymbolTable;
+  // Set while an assignment TARGET is being emitted, when that target resolved to
+  // DisplayObject's own `name` slot. AIR validates that slot against
+  // null/undefined (TypeError #2007, measured on adl 51.4.1: temp/qfix/gcadl/
+  // result16.txt -- the static slot, an unqualified reference inside a subclass
+  // method and dynamic * / Object receivers all throw, and the field keeps its
+  // previous value; Error.name, a plain String slot, does NOT throw). The read
+  // paths clear it before emitting the target and consume it immediately after,
+  // so a stale value from an unrelated member read can never leak into a write.
+  private lastDoNameTarget = false;
   private anonFuncs: { name: string; asName: string | null; params: Param[]; returnType: ASType; body: Block; captures: { name: string; type: CType }[]; cname: string | null; isStatic: boolean; depth: number; methodName: string | null }[] = [];
   private anonIndex = new Map<object, string>();
   private anonSeq = 0;
@@ -506,6 +515,16 @@ export class Emitter {
   // `static`, so once their referencing method bodies vanish they vanish too —
   // no manual dependency graph or per-class tree-shaking needed. Only `main`
   // and [WasmExport] symbols stay global (wasm export table / cross-TU glue).
+  // The C name of a top-level free function. Every name maps to itself except
+  // `main`: the emitter hardcodes the C entry point as `int main(void)`, so a
+  // user `function main()` (legal in AIR, and a natural entry-point name) would
+  // otherwise collide with it (`conflicting types for 'main'`). It is renamed at
+  // every emission site -- prototype, definition, call, function value and its
+  // `__call` thunk -- so the user's function stays callable under its own name.
+  private freeCName(asName: string): string {
+    return asName === 'main' ? 'asc_user_main' : asName;
+  }
+
   private staticizeTopLevelFunctions(): void {
     const exported = new Set<string>(['main']);
     for (const e of this.symbols.exports) {
@@ -1410,6 +1429,12 @@ export class Emitter {
     this.line('return buf;');
     this.indent--;
     this.line('}');
+    this.line('static char* as_req_name(char* s) {');
+    this.indent++;
+    this.line('if (s == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter name must be non-null.", 2007)); return NULL; }');
+    this.line('return s;');
+    this.indent--;
+    this.line('}');
     this.line('static void as_throw_sealed_set(const char* key, const char* fqn) {');
     this.indent++;
     this.line('const char* parts[5];');
@@ -1756,7 +1781,7 @@ export class Emitter {
     }
     // free functions
     for (const [fname, f] of this.symbols.funcs) {
-      this.line(`${this.cTypeName(f.returnType)} ${fname}(${this.paramDecls(f.params)});`);
+      this.line(`${this.cTypeName(f.returnType)} ${this.freeCName(fname)}(${this.paramDecls(f.params)});`);
     }
     // Vector.<T> monomorphized helpers.
     for (const [, elem] of this.vectorSpecs) {
@@ -2565,7 +2590,12 @@ export class Emitter {
       this.indent++;
       for (const [fname, f] of info.fields) {
         if (f.owner !== name) continue;
-        const tag = this.propTypeTag(f.type);
+        // tag 13: DisplayObject.name is a String slot that AIR rejects null for
+        // (TypeError #2007) instead of storing it (measured on adl 51.4.1,
+        // temp/qfix/gcadl/result16.txt: a dynamic * / Object write throws too).
+        // Error.name stays tag 3 -- it is a plain String slot and does NOT throw --
+        // so the marker keys on the declaring class, not on the field name.
+        const tag = (name === 'DisplayObject' && fname === 'name') ? 13 : this.propTypeTag(f.type);
         const label = this.escapeCString(f.name ?? fname);
         const off = `offsetof(${name}, ${this.cIdent(fname)})`;
         if (tag === 11) {
@@ -4272,7 +4302,7 @@ export class Emitter {
   // an impl that takes the environment as its first argument.
   private emitFunctionValues(): void {
     for (const [fname, f] of this.symbols.funcs) {
-      this.emitThunk(`${fname}__call`, fname, f.params, f.returnType, null, null, undefined, this.fnQName(null, fname));
+      this.emitThunk(`${this.freeCName(fname)}__call`, this.freeCName(fname), f.params, f.returnType, null, null, undefined, this.fnQName(null, fname));
     }
     // Bound-method thunks for implicit `this.method` references. The receiver is
     // the captured `this`; dispatch goes through the vtable so overridden methods
@@ -17592,7 +17622,7 @@ export class Emitter {
       this.functionScope = this.scopes[this.scopes.length - 1];
       for (const p of stmt.params) this.declareVar(p.name, this.ann(p.type));
       this.currentReturnType = f.returnType;
-      this.line(`${this.cTypeName(f.returnType)} ${stmt.name}(${this.paramDecls(stmt.params)}) {`);
+      this.line(`${this.cTypeName(f.returnType)} ${this.freeCName(stmt.name)}(${this.paramDecls(stmt.params)}) {`);
       this.indent++;
       this.hoistFunctionLocals(stmt.body.body);
       this.emitClosureCellLocals();
@@ -18552,17 +18582,70 @@ export class Emitter {
   private emitThrow(stmt: Extract<Stmt, { kind: 'Throw' }>): void {
     this.sequenceValueExpr(stmt.value, true, true);
     const e = this.emitExpr(stmt.value);
-    // Any Error subclass (Error/TypeError/RangeError/ArgumentError) passes through
-    // as-is; other values are wrapped into a fresh Error.
-    if (e.type.kind === 'object' && this.symbols.isSubclassOf(e.type.className, 'Error')) {
-      this.line(`as_throw(${e.code});`);
-    } else if (e.type.kind === 'string') {
-      this.line(`as_throw(Error_new(${e.code}, 0));`);
-    } else if (e.type.kind === 'object') {
-      this.line(`as_throw(Error_new(as_obj_to_str((void*)(${e.code})), 0));`);
-    } else {
-      this.line(`as_throw(Error_new(${this.toStringExpr(e)}, 0));`);
+    // AS3 propagates the thrown VALUE unchanged: a catch clause observes the same
+    // object/string/number, and `e is T` reflects its real type (measured on adl
+    // 51.4.1, temp/qfix/catchsem.body.as). The previous behaviour wrapped any
+    // non-Error value into a fresh Error, which made `throw "s"` observable as an
+    // Error -- a silent semantic error once dynamic catches are accepted.
+    this.line(`as_throw_val(${this.boxExpr(e)});`);
+  }
+
+  // The runtime test that decides whether the boxed pending exception `as_exc`
+  // (see emitTry) matches a catch clause's declared type. Mirrors emitIs(), but
+  // always operates on a boxed value.
+  private catchIsTest(src: string, resolved: string | null): string {
+    if (resolved === null) return 'true';
+    switch (src) {
+      case 'Object': return 'as_v_is_object(as_exc)';
+      case 'Array': return 'as_v_is_array(as_exc)';
+      case 'Function': return 'as_v_is_fn(as_exc)';
+      case 'Class': return 'as_v_is_class(as_exc)';
+      case 'XML': return 'as_is(as_v_obj_val(as_exc), &as_xml_vt)';
+      case 'XMLList': return 'as_is(as_v_obj_val(as_exc), &as_xml_list_vt)';
     }
+    if (this.isScalarTypeName(src)) return this.runtimeScalarIs('as_exc', src);
+    if (src.startsWith('Vector.<')) {
+      const rt = this.rt(src as ASType);
+      return `as_vec_is_name(as_exc, "${this.escapeCString(this.vectorReflectName(rt.elem))}")`;
+    }
+    const it = this.rt(src as ASType);
+    if (it.kind === 'interface') return `as_v_is_iface(as_exc, "${this.escapeCString(it.name)}")`;
+    return `as_v_is_inst(as_exc, &${resolved}_vt)`;
+  }
+
+  // The C type a catch clause's variable is bound to. The value is unboxed from
+  // the boxed exception with unboxAny(), so primitives keep their identity.
+  private catchVarType(src: string, resolved: string | null): CType {
+    if (resolved === null) return { kind: 'any' };
+    switch (src) {
+      case 'Object': return { kind: 'object', className: 'Object' };
+      case 'Array': return { kind: 'array' };
+      case 'Function': return { kind: 'function' };
+      case 'Class': return { kind: 'class' };
+      case 'XML': return { kind: 'xml' };
+      case 'XMLList': return { kind: 'xmllist' };
+    }
+    if (this.isScalarTypeName(src)) return this.rt(src as ASType);
+    if (src.startsWith('Vector.<')) return this.rt(src as ASType);
+    const it = this.rt(src as ASType);
+    if (it.kind === 'interface') return it;
+    return { kind: 'object', className: resolved };
+  }
+
+  // `obj.prop(...)` where `prop` is an ACCESSOR, not a method: AIR reads the
+  // property, then CALLS the resulting value. Measured on adl 51.4.1
+  // (temp/qfix/gcadl): a getter named as a method throws TypeError #1006 with the
+  // message "Error #1006: value is not a function." (it does NOT invoke the getter
+  // as a method), while a getter whose value IS a Function is invoked and its
+  // result returned. Model exactly that: evaluate the getter, box the value and
+  // route it through as_fn_call_dyn, which raises the same #1006 for a
+  // non-function value and calls a function value otherwise. The name argument is
+  // NULL so the message reads "value", matching AIR.
+  private emitAccessorInvoke(readCode: string, readType: CType, args: Expr[]): { code: string; type: CType } {
+    const items = args.map((a) => this.boxExpr(this.emitExpr(a)));
+    const n = items.length;
+    const arr = n > 0 ? `(as_value[${n}]){ ${items.join(', ')} }` : 'NULL';
+    return { code: `as_fn_call_dyn(${this.boxExpr({ code: readCode, type: readType })}, ${arr}, ${n}, NULL)`, type: { kind: 'any' } };
   }
 
   // `try { ... } catch (e:Error) { ... } finally { ... }` — setjmp/longjmp-based.
@@ -19030,35 +19113,48 @@ export class Emitter {
     this.line('}');
     if (stmt.catches.length > 0) {
       // Resolve every catch type up front, so an undefined class is a compile-time
-      // error before any C is written for the clause.
+      // error before any C is written for the clause. A `*` (or untyped) clause is
+      // DYNAMIC: it matches any thrown value and binds the value itself, so it has
+      // no class to resolve.
       const types = stmt.catches.map((c) => {
-        const t = c.type ?? 'Error';
+        const t = c.type ?? 'any';
+        if (t === 'any') return { src: 'any', resolved: null as string | null };
         // Resolve through the file's import table: in a multi-file build a user
         // class is registered under its sanitized FQN key (away3d_errors_CastError),
         // so the short source name must be mapped before the lookup.
         const resolved = this.resolveClassName(t);
-        if (!this.symbols.hasClass(resolved)) {
+        const special = this.isScalarTypeName(t) || t === 'Object' || t === 'Array'
+          || t === 'Function' || t === 'Class' || t === 'XML' || t === 'XMLList'
+          || t.startsWith('Vector.<') || this.rt(t).kind === 'interface';
+        if (!special && !this.symbols.hasClass(resolved)) {
           throw new CodegenError(`undefined class '${t}' in catch`);
         }
-        return resolved;
+        return { src: t, resolved };
       });
       this.line(`if (${ret} != 0) {`);
       this.indent++;
+      // The pending exception lives in one of two runtime slots; normalise it to
+      // a single boxed local so every clause test and binding sees the same value
+      // (see the as_exception_v comment in the runtime).
+      this.line(`as_value as_exc = as_exception_boxed ? as_exception_v : as_v_obj(as_exception);`);
       // Clauses are tried in source order and only the first matching type runs
       // (AS3 catch semantics). The chain is an `else if`: once a clause matches it
-      // clears as_exception, so the remaining tests are both unreachable and
-      // harmless. An exception no clause matches leaves as_exception set, so the
-      // rethrow at the end of emitTry propagates it outward.
+      // clears the pending slot, so the remaining tests are both unreachable and
+      // harmless. An exception no clause matches leaves it set, so the rethrow at
+      // the end of emitTry propagates it outward.
       for (let i = 0; i < stmt.catches.length; i++) {
         const c = stmt.catches[i];
-        const catchTypeName = types[i];
+        const { src, resolved } = types[i];
         this.pushScope();
-        this.line(`${i === 0 ? 'if' : 'else if'} (as_is(as_exception, &${catchTypeName}_vt)) {`);
+        this.line(`${i === 0 ? 'if' : 'else if'} (${this.catchIsTest(src, resolved)}) {`);
         this.indent++;
-        // AS3 `catch (e:Type)` only catches instances of Type (or its subclasses).
-        this.declareVar(c.varName, { kind: 'object', className: catchTypeName });
-        this.line(`${catchTypeName}* ${this.cIdent(c.varName)} = (${catchTypeName}*)as_exception;`);
-        this.line('as_exception = NULL;');
+        // AS3 `catch (e:Type)` only catches instances of Type (or its subclasses),
+        // and the value's identity is preserved -- a thrown string/number binds
+        // back as that same primitive.
+        const ct = this.catchVarType(src, resolved);
+        this.declareVar(c.varName, ct);
+        this.line(`${this.cTypeName(ct)} ${this.cIdent(c.varName)} = ${this.unboxAny({ code: 'as_exc', type: { kind: 'any' } }, ct)};`);
+        this.line('as_exception = NULL; as_exception_boxed = 0;');
         this.emitBlockBody(c.body);
         this.indent--;
         this.line('}');
@@ -19073,7 +19169,7 @@ export class Emitter {
       frame.finallyBody = null;
       this.emitBlockBody(stmt.finallyBody);
     }
-    this.line(`if (${ret} != 0 && as_exception != NULL) as_throw(as_exception);`);
+    this.line(`if (${ret} != 0) { if (as_exception_boxed) as_throw_val(as_exception_v); else if (as_exception != NULL) as_throw(as_exception); }`);
     this.indent--;
     this.line('}');
     this.tryFrames.pop();
@@ -20150,6 +20246,9 @@ export class Emitter {
         if (!this.symbols.isAccessible(f.visibility, f.owner, this.currentClass)) {
           throw new CodegenError(`field '${name}' is not accessible here`);
         }
+        // Unqualified `name = null` inside a DisplayObject subclass is the same
+        // property (AIR throws #2007 there too), so record it for the guard.
+        if (f.owner === 'DisplayObject' && name === 'name') this.lastDoNameTarget = true;
         return { code: `${self}->${this.cIdent(f.cName ?? name)}`, type: f.type };
       }
       const sf = cinfo?.staticFields.get(name);
@@ -20207,7 +20306,7 @@ export class Emitter {
     }
     // A free function used as a value (var f:Function = foo).
     const func = this.symbols.getFunc(name);
-    if (func) return { code: `as_fn_make(${name}__call, NULL, ${this.requiredArity(func.params)})`, type: { kind: 'function' } };
+    if (func) return { code: `as_fn_make(${this.freeCName(name)}__call, NULL, ${this.requiredArity(func.params)})`, type: { kind: 'function' } };
     // A recursive nested function references its own name (`setTimeout(fn, 1)`);
     // that resolves to a closure over the CURRENT env, not a rebuilt env (which
     // would recurse forever). Only relevant while emitting that function's body.
@@ -20507,7 +20606,18 @@ export class Emitter {
       // with `var oo:Object = true` is true in AS3 (measured on adl 51.4.1,
       // temp/pkgA/eq.body.as R5), and so is `oo === 5` with `oo = 5` and `oo == "5"`.
       const objish = (t: CType) => t.kind === 'interface' || (t.kind === 'object' && (t as { className: string }).className === 'Object');
-      if (l.type.kind === 'any' || r.type.kind === 'any' || objish(l.type) || objish(r.type)) {
+      // A class instance / object literal compared with a PRIMITIVE also needs the
+      // dynamic path: AIR runs ToPrimitive on the object (ES3 11.9.3), so
+      // 'new WithNum() == 42' is true when its toString is "42" and
+      // '({}) == "[object Object]"' is true. Emitting a raw C pointer-vs-number
+      // comparison instead just yields false (and a -Wpointer-integer-compare).
+      // Same-class pointers and 'obj == null' keep the cheap identity compare.
+      const classish = (t: CType) => t.kind === 'object' || t.kind === 'record';
+      const primish = (t: CType) =>
+        t.kind === 'number' || t.kind === 'int' || t.kind === 'uint' || t.kind === 'bool' ||
+        t.kind === 'string' || t.kind === 'int64' || t.kind === 'uint64';
+      if (l.type.kind === 'any' || r.type.kind === 'any' || objish(l.type) || objish(r.type) ||
+          (classish(l.type) && primish(r.type)) || (classish(r.type) && primish(l.type))) {
         // Strict equality (`===`/`!==`) dispatches on tag only; loose (`==`/`!=`)
         // is ES3 Abstract Equality (undefined == null, and a String/Boolean
         // counterpart of a Number is coerced to Number) via as_v_loose_eq.
@@ -21138,9 +21248,12 @@ export class Emitter {
       const superInfo = this.symbols.getClass(info.superClass)!;
       const f = this.symbols.fieldSlot(info.superClass, target.property);
       if (f) {
-        const code = expr.op === '='
+        let code = expr.op === '='
           ? this.convert(this.emitExpr(expr.value), f.type)
           : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), f.type);
+        // `super.name = null` is the same DisplayObject slot and takes the same
+        // TypeError #2007 guard as `this.name = null`.
+        if (f.owner === 'DisplayObject' && target.property === 'name') code = `as_req_name(${code})`;
         const lv = `this->${this.cIdent(f.cName ?? target.property)}`;
         const store = this.gcWriteAssign(lv, f.type, code);
         if (store) return { code: store, type: f.type, discard: true };
@@ -21395,11 +21508,23 @@ export class Emitter {
       return { code: this.sfWrite(sfTarget.owner, sfTarget.name, code), type: ft };
     }
 
+    // The target emission records whether it resolved to DisplayObject's own
+    // `name` slot (see lastDoNameTarget); capture it before the value expression
+    // runs, since emitting the value may resolve other, unrelated fields.
+    this.lastDoNameTarget = false;
     const t = this.emitExpr(target);
+    const doNameWrite = this.lastDoNameTarget;
+    this.lastDoNameTarget = false;
     const v = this.emitExpr(expr.value);
 
     if (expr.op === '=') {
-      const code = this.convert(v, t.type);
+      let code = this.convert(v, t.type);
+      // AIR throws TypeError #2007 for a null/undefined DisplayObject.name, and
+      // the field keeps its previous value because as_req_name throws before the
+      // store. Measured on adl 51.4.1 (temp/qfix/gcadl/result16.txt): the static
+      // slot, `this.name`, an unqualified `name` inside a subclass and dynamic
+      // `*`/Object receivers all throw; `Error.name = null` does not (plain slot).
+      if (doNameWrite) code = `as_req_name(${code})`;
       // Direct field write of a pointer/boxed slot (o.field = v) needs a write
       // barrier during incremental marking (GC-4): a BLACK object must not gain
       // a direct WHITE reference unobserved. Local/global variable slots are
@@ -21548,14 +21673,14 @@ export class Emitter {
         const intf = this.symbols.interfaces.get(obj.type.name)!;
         const m = intf.methods.get(callee.property);
         if (!m) {
-          // An ACCESSOR called as a method (`helper.targetBounds()`, pinned by
-          // examples/stage89.as): this subset reads the property through the
-          // interface vtable instead of AVM2's read-then-call (which would throw
-          // #1006 for a non-callable value). Only the zero-argument form is
-          // modelled -- arguments would be silently dropped, so that stays loud.
+          // An ACCESSOR named as a method (`helper.targetBounds()`): AIR reads the
+          // property, then calls the value -- so a getter called as a method throws
+          // TypeError #1006 (measured on adl 51.4.1, temp/qfix/gcadl), it does NOT
+          // run the getter as a method. See emitAccessorInvoke.
           const g = intf.getters.get(callee.property);
-          if (g && expr.args.length === 0) {
-            return { code: `(${obj.code}.vt->get_${this.cIdent(callee.property)}((void*)as_req_obj((void*)(${obj.code}.obj))))`, type: g.returnType };
+          if (g) {
+            const objExpr = `(as_req_obj((void*)(${obj.code}.obj)))`;
+            return this.emitAccessorInvoke(`(${obj.code}.vt->get_${this.cIdent(callee.property)}(${objExpr}))`, g.returnType, expr.args);
           }
           throw new CodegenError(`undefined method '${callee.property}' on interface '${obj.type.name}'`);
         }
@@ -21615,6 +21740,20 @@ export class Emitter {
           }
           const fnExpr = { code: `(${obj.code}->${this.cIdent(ff.f.cName ?? callee.property)})`, type: ff.f.type };
           return this.emitFunctionCall(fnExpr, expr.args);
+        }
+      }
+      // An ACCESSOR named as a method on a CLASS receiver (`obj.prop()` where
+      // `prop` is a getter): same read-then-call rule as the interface receiver
+      // above (AIR throws #1006 unless the getter's value is callable). The getter
+      // may live on a superclass, so walk the chain (measured on adl 51.4.1,
+      // temp/qfix/gcadl).
+      if (!m) {
+        const gg = this.symbols.findGetter(obj.type.className, callee.property);
+        if (gg) {
+          if (!this.symbols.isAccessible(gg.g.visibility, gg.owner, this.currentClass)) {
+            throw new CodegenError(`getter '${callee.property}' is not accessible here`);
+          }
+          return this.emitAccessorInvoke(`(${obj.code}->vtable->get_${this.cIdent(callee.property)}(${obj.code}))`, gg.g.returnType, expr.args);
         }
       }
       if (!m) throw new CodegenError(`undefined method '${callee.property}' on class '${obj.type.className}'`);
@@ -21682,7 +21821,7 @@ export class Emitter {
       }
       const f = this.symbols.getFunc(callee.name);
       if (f) {
-        return { code: `${callee.name}(${this.emitArgs(f.params, expr.args)})`, type: f.returnType };
+        return { code: `${this.freeCName(callee.name)}(${this.emitArgs(f.params, expr.args)})`, type: f.returnType };
       }
       // a value of type Function held in a variable (var f:Function = ...)
       const v = this.emitExpr(callee);
@@ -22114,6 +22253,8 @@ export class Emitter {
       if (!this.symbols.isAccessible(f.visibility, f.owner, this.currentClass)) {
         throw new CodegenError(`field '${expr.property}' is not accessible here`);
       }
+      // Record a DisplayObject.name target for the assignment emitter's #2007 guard.
+      if (f.owner === 'DisplayObject' && expr.property === 'name') this.lastDoNameTarget = true;
       return { code: `(${recv}->${this.cIdent(f.cName ?? expr.property)})`, type: f.type };
     }
     // getter accessor: obj.prop -> dispatch through the runtime object's vtable
@@ -22950,12 +23091,15 @@ export class Emitter {
     const e0 = args.length >= 1 ? this.emitExpr(args[0]) : null;
     switch (name) {
       case 'parseInt': {
+        // AIR: parseInt(str:String, radix:uint = 0):Number -- honors the radix and
+        // returns NaN (not 0) for an unparseable string, so the result is a Number.
         const s = e0!.type.kind === 'string' ? e0!.code : this.toStringExpr(e0!);
-        return { code: `atoi(${s})`, type: { kind: 'int' } };
+        const radix = args.length >= 2 ? this.toNumberExpr(this.emitExpr(args[1])) : '0.0';
+        return { code: `as_parse_int(${s}, ${radix})`, type: { kind: 'number' } };
       }
       case 'parseFloat': {
         const s = e0!.type.kind === 'string' ? e0!.code : this.toStringExpr(e0!);
-        return { code: `atof(${s})`, type: { kind: 'number' } };
+        return { code: `as_parse_float(${s})`, type: { kind: 'number' } };
       }
       case 'isNaN': return { code: `isnan(${this.toNumberExpr(e0!)})`, type: { kind: 'bool' } };
       case 'isFinite': return { code: `isfinite(${this.toNumberExpr(e0!)})`, type: { kind: 'bool' } };
@@ -23929,6 +24073,14 @@ export class Emitter {
       const lt = this.scopes[i].get(name);
       if (lt !== undefined) return (lt.kind === 'object' || lt.kind === 'any') ? { code: this.cIdent(name), type: lt } : null;
     }
+    // A MODULE-LEVEL Object/any variable (`var o:Object = SomeClass; new o()` at
+    // top level) lives in the module scope, not the lexical scope stack — mirror
+    // the fallback lookupClassVar already has, or `new o()` reports `unknown
+    // class 'o'` even though the class/function scopes resolve it.
+    if (this.currentClass === null) {
+      const mt = this.moduleScope.get(name);
+      if (mt !== undefined) return (mt.kind === 'object' || mt.kind === 'any') ? { code: this.moduleCName(name), type: mt } : null;
+    }
     return null;
   }
 
@@ -23998,6 +24150,18 @@ export class Emitter {
         parse = `as_xml_from_value(${this.boxExpr(e)})`;
       }
       return { code: parse, type: { kind: 'xml' } };
+    }
+    // new XMLList(value): 0- or 1-argument E4X list constructor. Measured on adl
+    // 51.4.1 (temp/qfix/xmllist.body.as): null/undefined -> empty list; an XML node
+    // -> a one-item list holding it; an XMLList -> a copy of its items; any other
+    // value -> a one-item list holding a TEXT node of its string form. XMLList is
+    // not a symbol-table class here (it maps to the `xmllist` CType), so it needs
+    // its own constructor route just like Array/Object/XML above.
+    if (expr.className === 'XMLList') {
+      if (expr.args.length === 0) return { code: 'as_xml_list_new(NULL, 0)', type: { kind: 'xmllist' } };
+      if (expr.args.length > 1) throw new CodegenError('new XMLList() takes at most 1 argument');
+      const a = this.emitExpr(expr.args[0]);
+      return { code: `as_xml_list_ctor(${this.boxExpr(a)})`, type: { kind: 'xmllist' } };
     }
     // new String(x) / new Number(x) / new Boolean(x) / new int(x) / new uint(x):
     // AS3 primitive-wrapper constructors, semantically identical to the conversion

@@ -28,11 +28,13 @@ try {
   trace("finally runs");
 }
 
-// throw a string
+// throw a string; AIR filters catch clauses by their declared type, so a thrown
+// String is caught by a String (or *) clause, not by 'catch (e:Error)'
+// (measured on adl 51.4.1, temp/qfix/gcadl/ctcMain.as)
 try {
   throw "oops";
-} catch (e:Error) {
-  trace("caught string:", e.message);
+} catch (e:String) {
+  trace("caught string:", e);
 }
 
 // rethrow from catch
