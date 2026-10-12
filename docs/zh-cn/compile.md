@@ -977,6 +977,11 @@ Retina 高清渲染（`ASC_DISPLAY_HIGH=1`）：
   并在 canvas 上 `scale(scale, scale)` 后按逻辑坐标绘制，所以 AS3 代码里的坐标系不变。
 - `Stage.contentsScaleFactor` 返回实测倍率（Retina 上 2.0，`standard` 下 1.0）。注意它只在
   `render`/`showWindow` 时写入，document class 构造期读到的是初始 `1.0`。
+- `Stage.nativeWindow` 在 document class 构造期**已非 `null`**（对齐 AIR 的「OS 窗口先于文档类存在」）：
+  我们的窗口本要到 `showWindow` 才建，故 `Stage_get_nativeWindow` 在根 Stage 尚未绑定窗口槽位时
+  **惰性绑定** `ASC_wins[0]`（`ASC_win_claim_main` 相应改为非摧毁式占用），此后 `showWindow` 再认领
+  同一槽位不丢绑定；构造期对 `nativeWindow` 的读是真实 wrapper（`nativeWindow === nativeWindow` 恒等），
+  此时尚未存在的 OS 窗口上的写（`bounds`/`title`）在胶水层是安全 no-op。
 - 验证方法：`screencapture -x -o -l<windowid> out.png` 后看尺寸，2x 窗口应为逻辑尺寸的两倍
   （如 1000×712 窗口 → 2000×1424 图）。
 
