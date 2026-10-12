@@ -607,6 +607,7 @@ export class Emitter {
     this.emitStaticFields();
     this.emitStaticInits();
     this.emitDefinitions();
+    this.emitSqlClasses();
     this.emitExportWrappers();
     this.emitGCRoots();
     this.emitMain();
@@ -2269,6 +2270,7 @@ export class Emitter {
   }
 
   private emitClassRegistry(): void {
+    this.collectCinitClasses();
     // Dynamic class instantiation: `new (classRef)()` and `new (classRef)(args)`.
     // AIR's two measured failures live here -- a NULL Class value is TypeError
     // #1007 ("Instantiation attempted on a non-constructor."), while an argument
@@ -2381,6 +2383,7 @@ export class Emitter {
     this.line('if (i < 0) return as_v_undefined();  /* AIR: unknown name on a Class value reads undefined */');
     this.line('const as_class_static* e = &c->statics[i];');
     this.line('if (e->kind == 1) return as_v_fn((void*)as_fn_make(e->fn, NULL, e->arity));');
+    this.line('if (e->kind == 3) { if (e->cinit != NULL) e->cinit(); return e->fn(NULL, NULL, 0); }');
     this.line('if (e->addr != NULL) return as_class_static_read(e);');
     this.line('as_throw_unsupported("Reading a static property through a Class value is not supported by this subset");');
     this.line('return as_v_null();');
@@ -2466,6 +2469,10 @@ export class Emitter {
     // thunks themselves come from staticMethodRefs (also filled by that walk).
     const staticTables = new Map<string, string>();
     if (this.dynClassMembers.size > 0 || this.dynClassFull.size > 0) {
+      // A row's cinit pointer is `<owner>_cinit`; its own forward declaration is
+      // emitted much later (with the static initializers), so declare the ones the
+      // tables point at here -- emitClassRegistry runs before emitStaticInits.
+      for (const cname of this.cinitClasses) this.line(`static void ${cname}_cinit(void);`);
       for (const [name, info] of this.symbols.classes) {
         const rows: string[] = [];
         const names = this.dynClassFull.has(name)
@@ -2493,9 +2500,22 @@ export class Emitter {
             continue;
           }
           if (info.staticGetters?.has(mname) ?? false) {
-            // A COMPUTED static (getter/setter pair): there is no slot to address, so
-            // the row is name-only and the Class-value path reports itself.
-            rows.push(`{ "${this.escapeCString(mname)}", 2, NULL, 0, NULL, 0, NULL }`);
+            // A COMPUTED static (getter/setter pair): there is no slot to address,
+            // so emit a boxed-args thunk that INVOKES the getter and boxes its
+            // result (the same shape as the static-method __call thunk), and mark
+            // the row kind 3. AIR resolves the name and calls the accessor. The
+            // declaring class's static initializer runs first, exactly as the
+            // direct C read path sequences it.
+            const sg = info.staticGetters.get(mname)!;
+            const thunk = `${name}__statget_${mname}`;
+            this.line(`static as_value ${thunk}(void* env, as_value* args, int argc) {`);
+            this.indent++;
+            this.line('(void)env; (void)args; (void)argc;');
+            this.line(`return ${this.boxExpr({ code: `${sg.owner}_get_${mname}_static(NULL)`, type: sg.returnType })};`);
+            this.indent--;
+            this.line('}');
+            const cinit = this.cinitClasses.has(sg.owner) ? `${sg.owner}_cinit` : 'NULL';
+            rows.push(`{ "${this.escapeCString(mname)}", 3, ${thunk}, 0, NULL, 0, ${cinit} }`);
           }
         }
         if (rows.length === 0) continue;
@@ -2552,7 +2572,12 @@ export class Emitter {
       // a bespoke C constructor with no uniform entry point, so dynamic
       // instantiation of it stays a loud #1063.
       const ctorFn = name === 'Object' ? 'as_core_cls_ctor' : 'NULL';
-      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, NULL, ${ctorFn}, "${this.escapeCString(info.reflectFqn)}", 0, NULL };`);
+      // Wire the static-member table just like user classes: a built-in's static
+      // getter/method/field is reachable through a Class value too (AIR: measured
+      // temp/adlprobe/adl.txt section 1; the app's Application.NativeApplication goes
+      // through flash.desktop.NativeApplication's static getter this way). Leaving it
+      // NULL used to read undefined, silently skipping the caller's branch.
+      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, NULL, ${ctorFn}, "${this.escapeCString(info.reflectFqn)}", 0, ${staticTables.get(name) ?? 'NULL'} };`);
     }
     // The core language classes (Object/String/Number/Boolean/int/uint/Array) have
     // no ClassInfo, so the two loops above never see them; they still need a class
@@ -3523,6 +3548,29 @@ export class Emitter {
   // Non-const static fields with a runtime initializer (object/array/function
   // literals, `new X()`, ...) are declared with a default and initialized in
   // main() in class-declaration order — C forbids non-constant static init.
+  // Which classes own a `_cinit` (a StaticInit block, or a static field whose
+  // initializer needs main()-time evaluation). emitClassRegistry's static-member
+  // tables store a pointer to that initializer and run BEFORE emitStaticFields, so
+  // the set must be filled here first: otherwise every Class-value static read
+  // carries cinit == NULL and reads the C slot before its initializer ran (a
+  // static var read through a Class value came back null instead of its value).
+  private collectCinitClasses(): void {
+    for (const stmt of this.program.body) {
+      if (stmt.kind !== 'ClassDecl') continue;
+      const cname = qualifiedName(stmt.name, stmt.packageName);
+      for (const m of stmt.members) {
+        if (m.kind === 'StaticInit') { this.cinitClasses.add(cname); break; }
+      }
+    }
+    for (const [cname, info] of this.symbols.classes) {
+      for (const [fname, f] of info.staticFields) {
+        if (f.owner !== cname) continue;
+        if (f.isConst && this.isConstExpr(f.init)) continue;
+        if (f.init) this.cinitClasses.add(cname);
+      }
+    }
+  }
+
   private emitStaticFields(): void {
     this.staticFieldInits = [];
     this.staticInitBlocks = [];
@@ -3587,6 +3635,1118 @@ export class Emitter {
   // wrapper keeps the exact resolved signature so the exported alias is a plain
   // callable function. Exports without an alias need no wrapper — the symbol is
   // exported directly under its own name.
+  // ---- flash.data (phases A-D): the hand-written C behind SQLConnection /
+  // SQLStatement / SQLResult / the schema classes (docs/zh-cn/flash-data.md). The
+  // engine is the official SQLite amalgamation reached through the narrow
+  // as_sql_* ABI; plain (unencrypted) AIR databases ARE standard SQLite files, so
+  // the semantics here are SQLite's own. Encryption is NOT implemented and is
+  // reported loudly (never a silent plaintext write).
+  private emitSqlClasses(): void {
+    const C = `
+// ---------- flash.data: SQLConnection / SQLStatement / SQLResult ----------
+//
+// The AS3 contract below is adl 51.4.1's, MEASURED rather than assumed: temp/sqladl
+// and temp/sql2 are the oracle harnesses (describeType dumps + every operation run
+// against the engine), and their results are recorded in
+// docs/zh-cn/flash-data.md section 5. The load-bearing measurements:
+//   * SQLResult.data is an Array for a SELECT with rows and NULL otherwise -- AIR
+//     does not report an empty Array for a statement that returned nothing (a
+//     CREATE TABLE, a DML statement, an empty SELECT, and the chunk that discovers
+//     the end of a prefetched cursor all report data=null).
+//   * SQLStatement.getResult() and SQLConnection.getSchemaResult() are FIFO QUEUES:
+//     each call pops one result and returns null once drained.
+//   * SQLConnection.inTransaction mirrors SQLite's OWN transaction state, so a
+//     deferred BEGIN reports false until a statement touches the database, while
+//     BEGIN IMMEDIATE/EXCLUSIVE report true immediately.
+//   * all events are dispatched by the CONNECTION except RESULT (which the
+//     SQLStatement dispatches); one SQLUpdateEvent per changed ROW, carrying that
+//     row's rowid and table name; and cancel() dispatches NOTHING.
+//   * a failing statement throws a SQLError whose message is AIR's status text
+//     ("Error #3115: SQL Error." / "Error #3131: Abort due to constraint
+//     violation."); the PLAIN Errors AIR raises for the other contract violations
+//     keep their #310x ids and texts (#3101 already open, #3103 during a
+//     transaction, #3104 not open, #3105 no open transaction, #3107 next() on a
+//     complete result, #3108 no text, #3109 no connection).
+//   * pageSize / cacheSize / totalChanges / lastInsertRowID all report 0 while the
+//     connection is not open, and autoCompact reports false.
+static char* as_sql_cstr(const char* s) {
+  if (s == NULL) return NULL;
+  size_t n = strlen(s);
+  char* p = as_str_alloc(n + 1);
+  memcpy(p, s, n + 1);
+  return p;
+}
+static char* as_sql_dup_n(const char* s, size_t n) {
+  char* p = as_str_alloc(n + 1);
+  memcpy(p, s, n);
+  p[n] = 0;
+  return p;
+}
+// Wrap a C string as a single-quoted SQL literal (' -> ''), so a database or table
+// name from AS3 can never break out of the string it is pasted into.
+static char* as_sql_sqlstr(const char* s) {
+  if (s == NULL) s = "";
+  size_t n = strlen(s);
+  char* out = as_str_alloc(n * 2 + 3);
+  size_t j = 0;
+  out[j++] = '\\'';
+  for (size_t i = 0; i < n; i++) { if (s[i] == '\\'') out[j++] = '\\''; out[j++] = s[i]; }
+  out[j++] = '\\'';
+  out[j] = 0;
+  return out;
+}
+// "Error #<id>: <label>" -- AIR's SQLError.message shape.
+static char* as_sql_status_msg(int id, const char* label) {
+  return as_str_concat(as_str_concat(as_str_concat((char*)"Error #", as_str_from_int(id)), (char*)": "), as_sql_cstr(label));
+}
+// A PLAIN Error with one of AIR's #310x id/text pairs: AIR reserves SQLError for
+// engine failures and raises Error for the contract violations (measured).
+static _Noreturn void as_sql_throw_err(int id, const char* label) {
+  as_throw((void*)Error_new(as_sql_status_msg(id, label), id));
+}
+// The details half of a SQLError: SQLite's own message. AIR RE-WORDS it (it reports
+// "column 'v' is not unique" where SQLite says "UNIQUE constraint failed: t.v"), so
+// the wording is a recorded deviation; the identifier AIR repeats in
+// detailArguments is recovered from the message, covering both SQLite's
+// 'near "FRO": syntax error' and 'no such table: nope' forms.
+static char* as_sql_details(const char* m, as_array** outArgs) {
+  char* d = as_sql_cstr(m);
+  if (outArgs != NULL) {
+    as_array* a = as_array_new();
+    const char* near = strstr(m, "near \\"");
+    if (near != NULL) {
+      const char* p = near + 6;
+      const char* q = strchr(p, '"');
+      if (q != NULL && q > p) as_array_push(a, as_v_str(as_sql_dup_n(p, (size_t)(q - p))));
+    } else {
+      const char* colon = strrchr(m, ':');
+      if (colon != NULL && colon[1] == ' ') as_array_push(a, as_v_str(as_sql_cstr(colon + 2)));
+    }
+    *outArgs = a;
+  }
+  return d;
+}
+// Build an SQLError with its four SQL-specific properties. The public constructor is
+// AIR's (message, id) pair; the engine details are attached here instead of through
+// the constructor, which is what keeps that shape equal to AIR's.
+static SQLError* as_sql_mk_error(const char* op, char* details, char* message, int id, int detailID, as_array* args) {
+  SQLError* e = SQLError_new(message, id);
+  e->_operation = as_sql_cstr(op);
+  e->_details = details;
+  e->_detailID = detailID;
+  e->_detailArguments = args;
+  gc_write_barrier((void*)e->_operation);
+  gc_write_barrier((void*)e->_details);
+  gc_write_barrier_value(as_v_arr((void*)e->_detailArguments));
+  return e;
+}
+// A SQLError built from SQLite's error state on 'db'. A negative 'id' asks for AIR's
+// engine-failure status: 3131 for a constraint violation (SQLITE_CONSTRAINT, primary
+// code 19) and 3115 for anything else. detailID carries the engine's EXTENDED result
+// code; AIR uses its own numbering there (2013 for a missing table, 2206 for a
+// constraint, 2003 for a syntax error), which is a recorded deviation.
+static SQLError* as_sql_err(void* db, const char* op, const char* fallback, int id) {
+  const char* m = (db != NULL) ? as_sql_errmsg(db) : NULL;
+  if (m == NULL || m[0] == 0) m = fallback;
+  int prim = (db != NULL) ? (as_sql_errcode(db) & 0xff) : 0;
+  int ext = (db != NULL) ? as_sql_extended_errcode(db) : 0;
+  int eid = id;
+  const char* label = "SQL Error.";
+  if (eid < 0) {
+    if (prim == 19) { eid = 3131; label = "Abort due to constraint violation."; }
+    else eid = 3115;
+  }
+  as_array* args = NULL;
+  char* details = as_sql_details(m, &args);
+  return as_sql_mk_error(op, details, as_sql_status_msg(eid, label), eid, ext, args);
+}
+static _Noreturn void as_sql_fail(void* db, const char* op, const char* fallback, int id) {
+  as_throw((void*)as_sql_err(db, op, fallback, id));
+}
+// The 'reference' argument of open()/attach(): a File. A File's struct starts with its
+// vtable word, so the vtable identifies it without an unchecked downcast (a ByteArray
+// or a plain Object must NOT be read as a File).
+static const char* as_sql_ref_path(Object* ref) {
+  if (ref == NULL) return NULL;
+  if (*(void**)ref == (void*)&File_vt) return ((File*)ref)->nativePath;
+  return NULL;
+}
+// One result column as a boxed AS3 value. AIR maps SQLite's storage classes onto
+// AS3: INTEGER -> Number, REAL -> Number, TEXT -> String, BLOB -> ByteArray,
+// NULL -> null.
+static as_value as_sql_col_value(void* st, int i) {
+  int t = as_sql_column_type(st, i);
+  if (t == 1) return as_v_num((double)as_sql_column_int64(st, i));
+  if (t == 2) return as_v_num(as_sql_column_double(st, i));
+  if (t == 3) return as_v_str(as_sql_cstr(as_sql_column_text(st, i)));
+  if (t == 4) {
+    int n = as_sql_column_bytes(st, i);
+    const void* b = as_sql_column_blob(st, i);
+    ByteArray* ba = (ByteArray*)gc_alloc(GCT_CLASS, sizeof(ByteArray));
+    ba->vtable = &ByteArray_vt;
+    ByteArray_ctor(ba);
+    if (n > 0 && b != NULL) {
+      as_ba_grow(ba, n);
+      memcpy((unsigned char*)ba->data, b, (size_t)n);
+      ba->length = n;
+    }
+    return as_v_obj((void*)ba);
+  }
+  return as_v_null();
+}
+// A result column's AS3 name under the connection's columnNameStyle. AIR's LONG form
+// is [table]_[column] (measured: "t_id"), SHORT is [column] and DEFAULT is [column]
+// for an unqualified SELECT; AIR additionally switches DEFAULT to the long form when
+// the statement text qualifies the column (measured: "select t.id from t" yields
+// "t_id"). We do not parse the statement text, so DEFAULT stays short -- recorded as
+// a deviation.
+static char* as_sql_col_name(void* st, int i, const char* style) {
+  const char* n = as_sql_column_name(st, i);
+  if (n == NULL) n = "";
+  if (style != NULL && strcmp(style, "long") == 0) {
+    const char* tn = as_sql_column_table_name(st, i);
+    if (tn != NULL && tn[0] != 0) return as_str_concat(as_str_concat(as_sql_cstr(tn), (char*)"_"), as_sql_cstr(n));
+  }
+  return as_sql_cstr(n);
+}
+// Bind one AS3 value to a statement parameter. A whole Number binds as INTEGER and a
+// fractional one as REAL, a String as TEXT, a ByteArray as BLOB, a Date as its
+// millisecond value.
+static void as_sql_bind_value(void* st, int idx, as_value v) {
+  if (v.tag == 0) { as_sql_bind_null(st, idx); return; }
+  if (v.tag == 8 || v.tag == 9) { as_sql_bind_int(st, idx, (long long)as_v_num_val(v)); return; }
+  if (v.tag == 1) {
+    double d = v.num;
+    if (d == (double)(long long)d) as_sql_bind_int(st, idx, (long long)d);
+    else as_sql_bind_double(st, idx, d);
+    return;
+  }
+  if (v.tag == 2) { as_sql_bind_int(st, idx, v.num != 0.0 ? 1 : 0); return; }
+  if (v.tag == 3) { as_sql_bind_text(st, idx, (const char*)v.ptr); return; }
+  if (v.tag == 4) {
+    if (v.ptr != NULL && *(void**)v.ptr == (void*)&ByteArray_vt) {
+      ByteArray* ba = (ByteArray*)v.ptr;
+      as_sql_bind_blob(st, idx, ba->data, ba->length);
+      return;
+    }
+    if (v.ptr != NULL && *(void**)v.ptr == (void*)&Date_vt) {
+      as_sql_bind_double(st, idx, ((Date*)v.ptr)->_time);
+      return;
+    }
+    as_sql_bind_text(st, idx, as_v_str_val(v));
+    return;
+  }
+  as_sql_bind_null(st, idx);
+}
+// The parameter index a 'parameters' key names: ":name" (also @/$) for a named
+// parameter, a leading digit for AIR's 1-based positional form. 0 = no parameter.
+// The digits are scanned by hand rather than through atoi(): the runtime preamble
+// calls no atoi at all, which unit: numeric/ParseIntFloat pins (that check exists
+// to catch parseInt being lowered to atoi), and a local scan keeps the pin meaningful
+// rather than teaching it which atoi calls are fine.
+static int as_sql_param_index(void* st, const char* key) {
+  if (key == NULL || key[0] == 0) return 0;
+  if (key[0] == ':' || key[0] == '@' || key[0] == '$') return as_sql_bind_parameter_index(st, key);
+  if (key[0] >= '0' && key[0] <= '9') {
+    int v = 0;
+    for (const char* p = key; *p >= '0' && *p <= '9'; p++) v = v * 10 + (*p - '0');
+    return v;
+  }
+  return 0;
+}
+static void as_sql_bind_params(SQLStatement* o, void* st) {
+  if (o->_params == NULL) return;
+  as_object* p = (as_object*)o->_params;
+  for (int i = 0; i < p->length; i++) {
+    if (p->keys[i] == NULL) continue;
+    int idx = as_sql_param_index(st, p->keys[i]);
+    if (idx <= 0) continue;
+    as_sql_bind_value(st, idx, p->vals[i]);
+  }
+}
+// AIR validates the parameter count before running the statement: an unbound named
+// parameter is REPORTED, never silently bound to NULL. Measured shape: errorID 3115,
+// detailID 1004, args [1, 0, ":a"], details "Mismatch in parameter count. Found 1 in
+// SQL specified and 0 value(s) set in parameters property, then a newline and
+// "Expecting values for ':a'".
+static void as_sql_check_params(SQLStatement* o, void* st) {
+  int n = as_sql_bind_parameter_count(st);
+  if (n <= 0) return;
+  int set = 0;
+  char* missing = NULL;
+  for (int i = 1; i <= n; i++) {
+    bool bound = false;
+    if (o->_params != NULL) {
+      as_object* p = (as_object*)o->_params;
+      for (int k = 0; k < p->length; k++) {
+        if (p->keys[k] != NULL && as_sql_param_index(st, p->keys[k]) == i) { bound = true; break; }
+      }
+    }
+    if (bound) { set++; continue; }
+    if (missing == NULL) {
+      const char* name = as_sql_bind_parameter_name(st, i);
+      missing = as_sql_cstr((name != NULL) ? name : "?");
+    }
+  }
+  if (missing == NULL) return;
+  as_array* args = as_array_new();
+  as_array_push(args, as_v_num((double)n));
+  as_array_push(args, as_v_num((double)set));
+  as_array_push(args, as_v_str(missing));
+  const char* parts[6] = { "Mismatch in parameter count. Found ", as_str_from_int(n),
+                           " in SQL specified and ", as_str_from_int(set),
+                           " value(s) set in parameters property.\\nExpecting values for '", missing };
+  char* details = as_str_concat(as_str_concat_n(6, parts), (char*)"'");
+  as_throw((void*)as_sql_mk_error("execute", details, as_sql_status_msg(3115, "SQL Error."), 3115, 1004, args));
+}
+// Does the statement text start with INSERT (after whitespace)? SQLResult
+// .lastInsertRowID is the rowid of a row THIS statement inserted, and AIR reports 0
+// for an UPDATE/DELETE/SELECT even though SQLite's connection-wide
+// last_insert_rowid() still holds the previous INSERT's id (measured).
+static bool as_sql_is_insert(const char* sql) {
+  if (sql == NULL) return false;
+  size_t i = 0;
+  while (sql[i] == ' ' || sql[i] == '\\t' || sql[i] == '\\n' || sql[i] == '\\r') i++;
+  const char* kw = "insert";
+  for (size_t k = 0; k < 6; k++) {
+    char c = sql[i + k];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (c != kw[k]) return false;
+  }
+  return true;
+}
+// Build one result row: an Object keyed by column name, or an instance of
+// SQLStatement.itemClass when one is set.
+static void* as_sql_make_row(SQLStatement* o, void* st, int nc) {
+  void* row = NULL;
+  if (o->_itemClass != NULL && o->_itemClass->factory != NULL) row = o->_itemClass->factory();
+  else row = (void*)as_object_new();
+  for (int i = 0; i < nc; i++) as_dyn_set(row, as_sql_col_name(st, i, o->_conn->_nameStyle), as_sql_col_value(st, i));
+  return row;
+}
+// One flash.events.SQLUpdateEvent per changed row, dispatched BY THE CONNECTION
+// (measured: a listener on the SQLStatement never sees them) in step order, before
+// the statement's own RESULT event.
+static void as_sql_dispatch_changes(SQLConnection* conn) {
+  if (conn->_db == NULL) return;
+  int n = as_sql_update_count(conn->_db);
+  for (int i = 0; i < n; i++) {
+    int op = as_sql_update_op(conn->_db, i);
+    const char* type = (op == 1) ? "insert" : (op == 2) ? "update" : "delete";
+    const char* table = as_sql_update_table(conn->_db, i);
+    double rowid = (double)as_sql_update_rowid(conn->_db, i);
+    EventDispatcher_dispatchEvent((void*)conn, (Event*)SQLUpdateEvent_new((char*)type, false, false, rowid, as_sql_cstr(table != NULL ? table : "")));
+  }
+}
+// Run one chunk of a statement and return its SQLResult. 'prefetch' follows AIR's
+// MEASURED contract: -1 fetches every remaining row, a positive value fetches at most
+// that many rows and leaves the cursor open, and 0 (or any other negative value) runs
+// the statement to the end while pushing no rows. data is NULL when the chunk
+// contained no rows at all -- AIR never reports an empty Array.
+static SQLResult* as_sql_chunk(SQLStatement* o, void* st, int prefetch) {
+  void* db = o->_conn->_db;
+  int nc = as_sql_column_count(st);
+  if (nc == 0) {
+    // A statement with no result columns (DDL or DML): step it once, to completion.
+    int sr = as_sql_step(st);
+    if (sr != 101) { as_sql_finalize(st); o->_stmt = NULL; o->_executing = false; as_sql_fail(db, "execute", "SQL step failed", -1); }
+    as_sql_finalize(st);
+    o->_stmt = NULL;
+    o->_executing = false;
+    double rows = (double)as_sql_changes(db);
+    double lastId = as_sql_is_insert(o->_text) ? (double)as_sql_last_insert_rowid(db) : 0.0;
+    return SQLResult_new(NULL, rows, true, lastId);
+  }
+  int cap = (prefetch > 0) ? prefetch : 0;
+  bool unlimited = (prefetch == -1);
+  as_array* rows = NULL;
+  int got = 0;
+  bool complete = false;
+  for (;;) {
+    int sr = as_sql_step(st);
+    if (sr == 101) { complete = true; break; }
+    if (sr != 100) { as_sql_finalize(st); o->_stmt = NULL; o->_executing = false; as_sql_fail(db, "execute", "SQL step failed", -1); }
+    if (unlimited || got < cap) {
+      if (rows == NULL) rows = as_array_new();
+      as_array_push(rows, as_v_obj(as_sql_make_row(o, st, nc)));
+      got++;
+      if (!unlimited && got >= cap) break;  // limit reached: leave the cursor open
+    }
+    // prefetch <= 0 (and not -1): AIR steps through the whole result and drops it.
+  }
+  if (complete) { as_sql_finalize(st); o->_stmt = NULL; o->_executing = false; }
+  else { o->_stmt = st; o->_executing = true; }
+  return SQLResult_new(rows, 0.0, complete, 0.0);
+}
+// Queue the chunk and announce it: the row-change events first (measured order), then
+// the statement's RESULT.
+static void as_sql_publish(SQLStatement* o, void* _this, SQLResult* r) {
+  as_array_push(o->_queue, as_v_obj((void*)r));
+  gc_write_barrier((void*)r);
+  as_sql_dispatch_changes(o->_conn);
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"result", false, false));
+}
+
+// ---------- SQLConnection ----------
+void SQLConnection_ctor(SQLConnection* o) {
+  EventDispatcher_ctor((EventDispatcher*)o, NULL);
+  o->_db = NULL;
+  o->_connected = false;
+  o->_autoCompact = false;
+  o->_nameStyle = (char*)"default";
+  o->_sawTxn = false;
+  o->_schemaQueue = as_array_new();
+  gc_write_barrier((void*)o->_schemaQueue);
+}
+SQLConnection* SQLConnection_new(void) {
+  SQLConnection* o = (SQLConnection*)gc_alloc(GCT_CLASS, sizeof(SQLConnection));
+  o->vtable = &SQLConnection_vt;
+  SQLConnection_ctor(o);
+  return o;
+}
+bool SQLConnection_get_isSupported_static(void* _this) { (void)_this; return true; }
+// AIR raises a plain Error from every method that needs an open connection.
+static void as_sql_need_open(SQLConnection* o) {
+  if (o->_db == NULL) as_sql_throw_err(3104, "A SQLConnection must be open to perform this operation.");
+}
+// #3103, not #3104: the connection is open but a transaction is in the way. The test
+// is AIR's OWN inTransaction -- that is, a transaction the engine reports as having
+// started -- which is what every measurement agrees with (temp/sql2 rounds 10 and 11):
+//   * a write transaction, and begin(IMMEDIATE), report #3103;
+//   * a DEFERRED BEGIN that has not touched the database does NOT: AIR reports
+//     inTransaction == false there, these operations are attempted, and compact() then
+//     relays the engine's own refusal as #3115 (measured);
+//   * a bare savepoint does not either.
+// compact(), cacheSize and deanalyze all share this check. analyze() has no check at
+// all and runs inside a transaction (measured).
+static void as_sql_need_no_txn(SQLConnection* o, const char* op) {
+  (void)op;
+  as_sql_need_open(o);
+  if (SQLConnection_get_inTransaction(o)) {
+    as_sql_throw_err(3103, "Operation cannot be performed while there is an open transaction on this connection.");
+  }
+}
+// The shared body of open()/openAsync(): returns NULL on success, or the SQLError the
+// caller must throw (sync) or dispatch (async).
+static SQLError* as_sql_conn_do_open(SQLConnection* o, Object* reference, char* openMode, bool autoCompact, int pageSize, ByteArray* key) {
+  if (o->_db != NULL) return as_sql_mk_error("open", (char*)"Connection closed.", as_sql_status_msg(3101, "Database connection is already open."), 3101, -1, as_array_new());
+  if (key != NULL) {
+    // LOUD, and nothing else happens: AIR's encrypted database format is AES-CCM with
+    // a private per-page layout (not SQLCipher -- docs/zh-cn/flash-data.md 3.3/3.4).
+    // Writing a plaintext database for an encryption request would be exactly the
+    // silent degradation AGENTS.md 1.5 forbids.
+    return as_sql_mk_error("open", (char*)"", (char*)"Error #3138: This build does not support encrypted databases (the SQLite backend stores plaintext only); pass no encryptionKey.", 3138, -1, as_array_new());
+  }
+  const char* mode = (openMode != NULL) ? openMode : "create";
+  const char* path = as_sql_ref_path(reference);
+  if (path == NULL) {
+    return as_sql_mk_error("open", (char*)"", (char*)"Error #3138: SQLConnection.open requires a File in this build (FileStream and ByteArray references, which AIR also accepts, are not implemented).", 3138, -1, as_array_new());
+  }
+  int flags = 0;
+  if (strcmp(mode, "read") == 0) flags = AS_SQL_F_READONLY;
+  else if (strcmp(mode, "update") == 0) flags = AS_SQL_F_READWRITE;
+  else flags = AS_SQL_F_CREATE | AS_SQL_F_READWRITE;
+  if ((flags & AS_SQL_F_CREATE) == 0 && !as_sql_file_exists(path)) {
+    // AIR's report for a file it cannot open: #3125 with details "Connection closed."
+    // and detailID 1001 (measured for both SQLMode.READ and SQLMode.UPDATE).
+    return as_sql_mk_error("open", (char*)"Connection closed.", as_sql_status_msg(3125, "Unable to open the database file."), 3125, 1001, as_array_new());
+  }
+  int rc = 0;
+  char* msg = NULL;
+  void* db = as_sql_open(path, flags, pageSize, autoCompact ? 1 : 0, &rc, &msg);
+  if (db == NULL) {
+    // Same mapping as attach: anything the engine refuses to open is AIR's #3125.
+    return as_sql_mk_error("open", as_sql_cstr((msg != NULL) ? msg : "unable to open database file"), as_sql_status_msg(3125, "Unable to open the database file."), 3125, -1, as_array_new());
+  }
+  o->_db = db;
+  o->_autoCompact = autoCompact;
+  o->_connected = true;
+  return NULL;
+}
+void SQLConnection_open(void* _this, Object* reference, char* openMode, bool autoCompact, int pageSize, ByteArray* encryptionKey) {
+  SQLConnection* o = (SQLConnection*)_this;
+  SQLError* e = as_sql_conn_do_open(o, reference, openMode, autoCompact, pageSize, encryptionKey);
+  if (e != NULL) as_throw((void*)e);
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"open", false, false));
+}
+// DOCUMENTED GAP (docs/zh-cn/flash-data.md 5.3): this build opens inline, so
+// 'connected' is already true when openAsync() returns and the OPEN/ERROR event is
+// dispatched before it does, where AIR completes asynchronously (measured: adl
+// reports connected=false immediately after the call and true from the first frame).
+// A listener registered BEFORE the call still receives the event, which is the
+// common pattern.
+void SQLConnection_openAsync(void* _this, Object* reference, char* openMode, Object* responder, bool autoCompact, int pageSize, ByteArray* encryptionKey) {
+  SQLConnection* o = (SQLConnection*)_this;
+  (void)responder;
+  SQLError* e = as_sql_conn_do_open(o, reference, openMode, autoCompact, pageSize, encryptionKey);
+  if (e != NULL) { EventDispatcher_dispatchEvent(_this, (Event*)SQLErrorEvent_new((char*)"error", false, false, (Object*)e)); return; }
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"open", false, false));
+}
+void SQLConnection_close(void* _this, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this;
+  (void)responder;
+  // An open transaction is rolled back by the engine when the last connection to the
+  // file closes, and attached databases are detached with it (SQLite's semantics).
+  if (o->_db != NULL) { as_sql_close(o->_db); o->_db = NULL; }
+  o->_connected = false;
+  // Measured: closing resets the per-connection state -- pageSize/cacheSize
+  // /totalChanges/lastInsertRowID report 0 and columnNameStyle reads "default"
+  // again even if it had been changed (temp/sql2 round 7).
+  o->_nameStyle = (char*)"default";
+  o->_sawTxn = false;
+  o->_autoCompact = false;
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"close", false, false));
+}
+static void as_sql_conn_stmt(SQLConnection* o, const char* _this, const char* sql, const char* op, const char* ev) {
+  char* msg = NULL;
+  if (as_sql_exec(o->_db, sql, &msg) != 0) as_sql_fail(o->_db, op, msg != NULL ? msg : "SQL execution failed", -1);
+  EventDispatcher_dispatchEvent((void*)_this, (Event*)SQLEvent_new((char*)ev, false, false));
+}
+void SQLConnection_begin(void* _this, char* option, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this;
+  (void)responder;
+  as_sql_need_open(o);
+  // No nested-begin guard: AIR issues the BEGIN and lets the engine report it, so a
+  // begin() inside an open transaction is #3115 with the engine's "cannot start a
+  // transaction within a transaction" (measured, temp/sql2 round 7; the earlier
+  // "nested begin ignored" note came from a probe that did not have a live
+  // transaction to begin with).
+  const char* sql = "BEGIN";
+  if (option != NULL) {
+    // Measured: any value outside the three SQLTransactionLockType constants is
+    // ArgumentError #3112 with this text (temp/sql2 round 9).
+    if (strcmp(option, "exclusive") == 0) sql = "BEGIN EXCLUSIVE";
+    else if (strcmp(option, "immediate") == 0) sql = "BEGIN IMMEDIATE";
+    else if (strcmp(option, "deferred") == 0) sql = "BEGIN DEFERRED";
+    else as_throw(ArgumentError_new((char*)"Error #3112: An invalid transaction lock type was specified.", 3112));
+  }
+  char* msg = NULL;
+  if (as_sql_exec(o->_db, sql, &msg) != 0) as_sql_fail(o->_db, "begin", msg != NULL ? msg : "BEGIN failed", -1);
+  o->_sawTxn = true;
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"begin", false, false));
+}
+// commit()/rollback() require an open transaction. AIR raises the PLAIN #3105 only
+// when it has no reason to think a transaction exists; after a setSavepoint() it
+// still issues the COMMIT and reports whatever the engine says. Measured pair
+// (temp/sql2 round 7): setSavepoint + releaseSavepoint, then commit() -> #3115 with
+// the engine's "cannot commit - no transaction is active", while a commit() with no
+// transaction at all -> #3105 with AIR's own text.
+static void as_sql_need_txn(SQLConnection* o) {
+  as_sql_need_open(o);
+  if (!o->_sawTxn && as_sql_get_autocommit(o->_db) != 0) {
+    as_sql_throw_err(3105, "Operation is only allowed if a connection has an open transaction.");
+  }
+}
+void SQLConnection_commit(void* _this, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this; (void)responder;
+  as_sql_need_txn(o);
+  as_sql_conn_stmt(o, _this, "COMMIT", "commit", "commit");
+  o->_sawTxn = false;
+}
+void SQLConnection_rollback(void* _this, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this; (void)responder;
+  as_sql_need_txn(o);
+  as_sql_conn_stmt(o, _this, "ROLLBACK", "rollback", "rollback");
+  o->_sawTxn = false;
+}
+void SQLConnection_compact(void* _this, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this; (void)responder;
+  as_sql_need_no_txn(o, "compact");
+  as_sql_conn_stmt(o, _this, "VACUUM", "compact", "compact");
+}
+void SQLConnection_analyze(void* _this, char* resourceName, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this; (void)responder;
+  as_sql_need_open(o);
+  char* sql = (resourceName != NULL && resourceName[0] != 0)
+    ? as_str_concat((char*)"ANALYZE ", as_sql_sqlstr(resourceName)) : (char*)"ANALYZE";
+  as_sql_conn_stmt(o, _this, sql, "analyze", "analyze");
+}
+// deanalyze() drops sqlite_stat1 with no IF EXISTS: AIR reports #3115 with details
+// "no such table: 'sqlite_stat1'" when ANALYZE has never run (measured).
+void SQLConnection_deanalyze(void* _this, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this; (void)responder;
+  as_sql_need_no_txn(o, "deanalyze");
+  as_sql_conn_stmt(o, _this, "DROP TABLE sqlite_stat1", "deanalyze", "deanalyze");
+}
+// cancel() interrupts the engine and dispatches NOTHING -- SQLEvent.CANCEL exists as a
+// constant but adl fires no event for either conn.cancel() or statement.cancel()
+// (measured).
+void SQLConnection_cancel(void* _this, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this;
+  (void)responder;
+  as_sql_need_open(o);
+  as_sql_interrupt(o->_db);
+}
+void SQLConnection_attach(void* _this, char* name, Object* reference, Object* responder, ByteArray* encryptionKey) {
+  SQLConnection* o = (SQLConnection*)_this;
+  (void)responder;
+  as_sql_need_open(o);
+  if (encryptionKey != NULL) as_sql_fail(NULL, "attach", "Error #3138: This build does not support encrypted databases.", 3138);
+  if (name == NULL || name[0] == 0) {
+    // AIR's own argument check, measured: ArgumentError #3102 with this text.
+    as_throw(ArgumentError_new((char*)"Error #3102: Name argument specified was invalid. It must not be null or empty.", 3102));
+  }
+  const char* path = as_sql_ref_path(reference);
+  if (path == NULL) as_sql_fail(NULL, "attach", "Error #3138: attach requires a File in this build (FileStream and ByteArray references are not implemented).", 3138);
+  char* sql = as_str_concat(as_str_concat((char*)"ATTACH DATABASE ", as_sql_sqlstr(path)), as_str_concat((char*)" AS ", as_sql_sqlstr(name)));
+  char* msg = NULL;
+  if (as_sql_exec(o->_db, sql, &msg) != 0) {
+    // Measured: AIR reports EVERY attach failure as #3125 "Unable to open the
+    // database file." -- both a database name already in use and an unreachable
+    // path -- with the engine's message as its details. ATTACH itself creates a
+    // missing file (measured), so there is no pre-flight existence check.
+    char* details = as_sql_cstr(msg != NULL ? msg : "unable to open database file");
+    as_throw((void*)as_sql_mk_error("attach", details, as_sql_status_msg(3125, "Unable to open the database file."), 3125, -1, as_array_new()));
+  }
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"attach", false, false));
+}
+void SQLConnection_detach(void* _this, char* name, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this;
+  (void)responder;
+  as_sql_need_open(o);
+  if (name == NULL || name[0] == 0) {
+    // Measured: detach validates the name exactly like attach (null AND empty are
+    // ArgumentError #3102).
+    as_throw(ArgumentError_new((char*)"Error #3102: Name argument specified was invalid. It must not be null or empty.", 3102));
+  }
+  char* sql = as_str_concat((char*)"DETACH DATABASE ", as_sql_sqlstr(name));
+  char* msg = NULL;
+  if (as_sql_exec(o->_db, sql, &msg) != 0) as_sql_fail(o->_db, "detach", msg != NULL ? msg : "DETACH failed", -1);
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"detach", false, false));
+}
+// AIR's unnamed savepoint is the EMPTY name, not a synthesized one: measured on a
+// releaseSavepoint(null) with no unnamed savepoint, the engine details read
+// "no such savepoint: ''", which is SQLite quoting the empty name it was given.
+// A savepoint outside a transaction is allowed -- it starts the transaction.
+void SQLConnection_setSavepoint(void* _this, char* name, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this; (void)responder;
+  as_sql_need_open(o);
+  char* sql = as_str_concat((char*)"SAVEPOINT ", as_sql_sqlstr(name != NULL ? name : (char*)""));
+  char* msg = NULL;
+  if (as_sql_exec(o->_db, sql, &msg) != 0) as_sql_fail(o->_db, "setSavepoint", msg != NULL ? msg : "SAVEPOINT failed", -1);
+  o->_sawTxn = true;
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"setSavepoint", false, false));
+}
+void SQLConnection_releaseSavepoint(void* _this, char* name, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this; (void)responder;
+  // Measured: releasing or rolling back to a savepoint with no open transaction is
+  // the PLAIN #3105, the same report commit()/rollback() make (temp/sql2 round 9).
+  as_sql_need_txn(o);
+  char* sql = as_str_concat((char*)"RELEASE ", as_sql_sqlstr(name != NULL ? name : (char*)""));
+  char* msg = NULL;
+  if (as_sql_exec(o->_db, sql, &msg) != 0) as_sql_fail(o->_db, "releaseSavepoint", msg != NULL ? msg : "RELEASE failed", -1);
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"releaseSavepoint", false, false));
+}
+void SQLConnection_rollbackToSavepoint(void* _this, char* name, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this; (void)responder;
+  as_sql_need_txn(o);
+  char* sql = as_str_concat((char*)"ROLLBACK TO ", as_sql_sqlstr(name != NULL ? name : (char*)""));
+  char* msg = NULL;
+  if (as_sql_exec(o->_db, sql, &msg) != 0) as_sql_fail(o->_db, "rollbackToSavepoint", msg != NULL ? msg : "ROLLBACK TO failed", -1);
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"rollbackToSavepoint", false, false));
+}
+void SQLConnection_reencrypt(void* _this, ByteArray* newEncryptionKey, Object* responder) {
+  (void)_this; (void)responder; (void)newEncryptionKey;
+  as_sql_fail(NULL, "reencrypt", "Error #3138: This build does not support encrypted databases, so reencrypt has nothing to do.", 3138);
+}
+
+// ---------- loadSchema ----------
+static as_array* as_sql_load_list(void* db, const char* kind, const char* dbname, const char* onlyName, bool withColumns);
+static bool as_sql_ieq_n(const char* a, const char* b, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    char x = a[i], y = b[i];
+    if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+    if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+    if (x != y) return false;
+  }
+  return true;
+}
+static bool as_sql_ascii_ieq(const char* a, const char* b) {
+  if (a == NULL || b == NULL) return false;
+  for (size_t i = 0;; i++) {
+    char x = a[i], y = b[i];
+    if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+    if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+    if (x != y) return false;
+    if (x == 0) return true;
+  }
+}
+// AUTOINCREMENT is a property of the CREATE TABLE text, not of a pragma column row
+// (measured: a column reports autoIncrement=true exactly when its table declares
+// "INTEGER PRIMARY KEY AUTOINCREMENT").
+static bool as_sql_table_has_autoincrement(const char* createSql) {
+  if (createSql == NULL) return false;
+  for (const char* p = createSql; *p != 0; p++) {
+    if ((p[0] == 'A' || p[0] == 'a') && as_sql_ieq_n(p, "autoincrement", 13)) return true;
+  }
+  return false;
+}
+static as_array* as_sql_load_columns(void* db, const char* table, const char* createSql) {
+  as_array* out = as_array_new();
+  bool autoInc = as_sql_table_has_autoincrement(createSql);
+  char* q = as_str_concat(as_str_concat((char*)"SELECT name, type, \\"notnull\\", pk FROM pragma_table_info(", as_sql_sqlstr(table)), (char*)")");
+  int rc = 0; char* msg = NULL;
+  void* st = as_sql_prepare(db, q, &rc, &msg);
+  if (st == NULL) return out;
+  while (as_sql_step(st) == 100) {
+    bool pk = (as_sql_column_int64(st, 3) != 0);
+    // AIR reports allowNull=false for a PRIMARY KEY even though SQLite's notnull flag
+    // stays 0 for a rowid alias (measured on "id INTEGER PRIMARY KEY").
+    bool allowNull = (as_sql_column_int64(st, 2) == 0) && !pk;
+    SQLColumnSchema* c = SQLColumnSchema_new(as_sql_cstr(as_sql_column_text(st, 0)), pk, allowNull, pk && autoInc,
+                                             as_sql_cstr(as_sql_column_text(st, 1)), (char*)"binary");
+    as_array_push(out, as_v_obj((void*)c));
+  }
+  as_sql_finalize(st);
+  return out;
+}
+static as_array* as_sql_load_list(void* db, const char* kind, const char* dbname, const char* onlyName, bool withColumns) {
+  as_array* out = as_array_new();
+  // 'sql IS NOT NULL' filters out the indexes SQLite creates for UNIQUE/PRIMARY KEY
+  // constraints: AIR reports only user-created objects (measured -- a table declared
+  // "v TEXT NOT NULL UNIQUE" makes loadSchema(SQLIndexSchema) find NO index).
+  // SQLite's own bookkeeping tables DO have a sql: AUTOINCREMENT creates
+  // sqlite_sequence and ANALYZE creates sqlite_stat1. AIR omits them (measured: a table
+  // with AUTOINCREMENT reports 2 tables, not 3), so they are skipped below by name --
+  // a SQL LIKE with an ESCAPE clause would need three levels of backslash escaping
+  // through the emitter's template literal, which is exactly the kind of thing that
+  // silently ships broken SQL.
+  char* q = as_str_concat((char*)"SELECT name, sql, tbl_name FROM ", as_str_concat(as_sql_sqlstr(dbname), (char*)".sqlite_master WHERE type="));
+  q = as_str_concat(q, as_sql_sqlstr(kind));
+  q = as_str_concat(q, (char*)" AND sql IS NOT NULL ORDER BY name");
+  int rc = 0; char* msg = NULL;
+  void* st = as_sql_prepare(db, q, &rc, &msg);
+  if (st == NULL) return out;
+  while (as_sql_step(st) == 100) {
+    const char* nm = as_sql_column_text(st, 0);
+    const char* sq = as_sql_column_text(st, 1);
+    const char* tbl = as_sql_column_text(st, 2);
+    if (as_sql_ieq_n(nm, "sqlite_", 7)) continue;
+    if (onlyName != NULL && !as_sql_ascii_ieq(onlyName, nm)) continue;
+    if (strcmp(kind, "table") == 0 || strcmp(kind, "view") == 0) {
+      // AIR reports an EMPTY Array (never null) when includeColumnSchema is false
+      // (measured: columns.length == 0).
+      as_array* cols = withColumns ? as_sql_load_columns(db, nm, sq) : as_array_new();
+      if (strcmp(kind, "table") == 0)
+        as_array_push(out, as_v_obj((void*)SQLTableSchema_new(as_sql_cstr(dbname), as_sql_cstr(nm), as_sql_cstr(sq), cols)));
+      else
+        as_array_push(out, as_v_obj((void*)SQLViewSchema_new(as_sql_cstr(dbname), as_sql_cstr(nm), as_sql_cstr(sq), cols)));
+    } else if (strcmp(kind, "index") == 0) {
+      as_array_push(out, as_v_obj((void*)SQLIndexSchema_new(as_sql_cstr(dbname), as_sql_cstr(nm), as_sql_cstr(sq), as_sql_cstr(tbl))));
+    } else {
+      as_array_push(out, as_v_obj((void*)SQLTriggerSchema_new(as_sql_cstr(dbname), as_sql_cstr(nm), as_sql_cstr(sq), as_sql_cstr(tbl))));
+    }
+  }
+  as_sql_finalize(st);
+  return out;
+}
+static char* as_sql_kind_of(const char* fqn) {
+  if (fqn == NULL) return NULL;
+  if (strcmp(fqn, "flash.data::SQLTableSchema") == 0) return (char*)"table";
+  if (strcmp(fqn, "flash.data::SQLViewSchema") == 0) return (char*)"view";
+  if (strcmp(fqn, "flash.data::SQLIndexSchema") == 0) return (char*)"index";
+  if (strcmp(fqn, "flash.data::SQLTriggerSchema") == 0) return (char*)"trigger";
+  return NULL;
+}
+void SQLConnection_loadSchema(void* _this, as_class* type, char* name, char* database, bool includeColumnSchema, Object* responder) {
+  SQLConnection* o = (SQLConnection*)_this;
+  (void)responder;
+  as_sql_need_open(o);
+  const char* dbname = (database != NULL && database[0] != 0) ? database : "main";
+  const char* fqn = (type != NULL) ? type->fqn : NULL;
+  char* kind = as_sql_kind_of(fqn);
+  if (fqn != NULL && kind == NULL) {
+    as_throw(ArgumentError_new((char*)"Error #2008: The type argument must be one of SQLTableSchema, SQLViewSchema, SQLIndexSchema or SQLTriggerSchema.", 2008));
+  }
+  const char* kinds[4] = { "table", "view", "index", "trigger" };
+  as_array* found[4];
+  int total = 0;
+  for (int i = 0; i < 4; i++) {
+    if (kind != NULL && strcmp(kinds[i], kind) != 0) { found[i] = as_array_new(); continue; }
+    found[i] = as_sql_load_list(o->_db, kinds[i], dbname, name, includeColumnSchema);
+    total += found[i]->length;
+  }
+  if (total == 0) {
+    // AIR's three "nothing found" reports, with their exact detailID/args (measured).
+    as_array* args = as_array_new();
+    char* detail;
+    int detailID;
+    if (name != NULL && kind != NULL) {
+      const char* p7[7] = { "The schema object with name '", name, "' of type '", kind, "' in database '", dbname, "' was not found." };
+      detail = as_str_concat_n(7, p7);
+      detailID = 1007;
+      as_array_push(args, as_v_str(as_sql_cstr(name)));
+      as_array_push(args, as_v_str(as_sql_cstr(kind)));
+      as_array_push(args, as_v_str(as_sql_cstr(dbname)));
+    } else if (kind != NULL) {
+      const char* p9[5] = { "No schema objects with type '", kind, "' in database '", dbname, "' were found." };
+      detail = as_str_concat_n(5, p9);
+      detailID = 1009;
+      as_array_push(args, as_v_str(as_sql_cstr(kind)));
+      as_array_push(args, as_v_str(as_sql_cstr(dbname)));
+    } else {
+      const char* p10[3] = { "No schema objects in database '", dbname, "' were found." };
+      detail = as_str_concat_n(3, p10);
+      detailID = 1010;
+      as_array_push(args, as_v_str(as_sql_cstr(dbname)));
+    }
+    as_throw((void*)as_sql_mk_error("schema", detail, as_sql_status_msg(3115, "SQL Error."), 3115, detailID, args));
+  }
+  as_array_push(o->_schemaQueue, as_v_obj((void*)SQLSchemaResult_new(found[0], found[1], found[2], found[3])));
+  EventDispatcher_dispatchEvent(_this, (Event*)SQLEvent_new((char*)"schema", false, false));
+}
+SQLSchemaResult* SQLConnection_getSchemaResult(void* _this) {
+  SQLConnection* o = (SQLConnection*)_this;
+  if (o->_schemaQueue == NULL || o->_schemaQueue->length == 0) return NULL;
+  return (SQLSchemaResult*)as_array_shift(o->_schemaQueue).ptr;
+}
+bool SQLConnection_get_connected(void* _this) { return ((SQLConnection*)_this)->_connected; }
+// AIR's inTransaction follows SQLite's own transaction state: a deferred BEGIN reads
+// false until a statement touches the database, so autocommit alone is not the answer
+// -- txn_state must have left NONE too.
+bool SQLConnection_get_inTransaction(void* _this) {
+  SQLConnection* o = (SQLConnection*)_this;
+  if (o->_db == NULL) return false;
+  return (as_sql_get_autocommit(o->_db) == 0) && (as_sql_txn_state(o->_db) != 0);
+}
+double SQLConnection_get_totalChanges(void* _this) {
+  SQLConnection* o = (SQLConnection*)_this;
+  return (o->_db != NULL) ? (double)as_sql_total_changes(o->_db) : 0.0;
+}
+double SQLConnection_get_lastInsertRowID(void* _this) {
+  SQLConnection* o = (SQLConnection*)_this;
+  return (o->_db != NULL) ? (double)as_sql_last_insert_rowid(o->_db) : 0.0;
+}
+// 0 while the connection is not open (measured after close()).
+unsigned int SQLConnection_get_pageSize(void* _this) {
+  SQLConnection* o = (SQLConnection*)_this;
+  return (o->_db != NULL) ? (unsigned int)as_sql_get_page_size(o->_db) : 0u;
+}
+// AIR reports the page count (2000 for SQLite's default, whose pragma value is the
+// negative -2000 meaning "2 MiB"), so a negative pragma is reported as its magnitude.
+// 0 while the connection is not open.
+unsigned int SQLConnection_get_cacheSize(void* _this) {
+  SQLConnection* o = (SQLConnection*)_this;
+  if (o->_db == NULL) return 0u;
+  long long cs = as_sql_get_cache_size(o->_db);
+  return (unsigned int)((cs < 0) ? -cs : cs);
+}
+bool SQLConnection_get_autoCompact(void* _this) {
+  SQLConnection* o = (SQLConnection*)_this;
+  return (o->_db != NULL) ? o->_autoCompact : false;
+}
+char* SQLConnection_get_columnNameStyle(void* _this) { return ((SQLConnection*)_this)->_nameStyle; }
+void SQLConnection_set_cacheSize(void* _this, unsigned int value) {
+  SQLConnection* o = (SQLConnection*)_this;
+  as_sql_need_no_txn(o, "cacheSize");
+  as_sql_set_cache_size(o->_db, (long long)value);
+}
+void SQLConnection_set_columnNameStyle(void* _this, char* value) {
+  SQLConnection* o = (SQLConnection*)_this;
+  as_sql_need_open(o);
+  if (value == NULL) {
+    // Measured: AIR raises TypeError #2007 for null (not ArgumentError).
+    as_throw(TypeError_new((char*)"Error #2007: Parameter columnNameStyle must be non-null.", 2007));
+  }
+  // Measured: an unrecognized value is not rejected -- the property simply reads
+  // "default" afterwards (temp/sql2 rounds 7 and 8, "bogus" and "DEFAULT").
+  const char* v = value;
+  if (strcmp(v, "long") != 0 && strcmp(v, "short") != 0) v = "default";
+  o->_nameStyle = as_sql_cstr(v);
+  gc_write_barrier((void*)o->_nameStyle);
+}
+
+// ---------- SQLStatement ----------
+void SQLStatement_ctor(SQLStatement* o) {
+  EventDispatcher_ctor((EventDispatcher*)o, NULL);
+  o->_conn = NULL;
+  // AIR's text property starts out as the EMPTY STRING, not null (measured on
+  // adl 51.4.1: a fresh SQLStatement reports text == "" and text.length == 0).
+  o->_text = (char*)"";
+  o->_params = (Object*)as_object_new();
+  // AIR's itemClass starts out as the Object class, not null (measured); rows are
+  // plain Objects until another class is assigned. Stored as NULL internally to keep
+  // the row builder on its plain-Object fast path, and reported as Object by the
+  // getter -- see SQLStatement_get_itemClass.
+  o->_itemClass = NULL;
+  o->_executing = false;
+  o->_complete = true;
+  o->_queue = as_array_new();
+  o->_stmt = NULL;
+  gc_write_barrier((void*)o->_params);
+  gc_write_barrier((void*)o->_queue);
+}
+SQLStatement* SQLStatement_new(void) {
+  SQLStatement* o = (SQLStatement*)gc_alloc(GCT_CLASS, sizeof(SQLStatement));
+  o->vtable = &SQLStatement_vt;
+  SQLStatement_ctor(o);
+  return o;
+}
+SQLConnection* SQLStatement_get_sqlConnection(void* _this) { return ((SQLStatement*)_this)->_conn; }
+void SQLStatement_set_sqlConnection(void* _this, SQLConnection* value) {
+  SQLStatement* o = (SQLStatement*)_this;
+  o->_conn = value;
+  gc_write_barrier((void*)value);
+}
+char* SQLStatement_get_text(void* _this) { return ((SQLStatement*)_this)->_text; }
+void SQLStatement_set_text(void* _this, char* value) {
+  SQLStatement* o = (SQLStatement*)_this;
+  // AIR dereferences the new value, so assigning null raises TypeError #1009 and
+  // leaves the property alone (measured on adl 51.4.1). "" IS accepted (and then
+  // fails execute() with #3108).
+  if (value == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }
+  o->_text = value;
+  gc_write_barrier((void*)value);
+}
+// AIR's 'parameters' is READ-ONLY and never null: the getter hands back a live
+// associative array to mutate (measured -- assigning the property does not compile
+// under mxmlc, and the object exists before any parameter is set).
+Object* SQLStatement_get_parameters(void* _this) {
+  SQLStatement* o = (SQLStatement*)_this;
+  if (o->_params == NULL) { o->_params = (Object*)as_object_new(); gc_write_barrier((void*)o->_params); }
+  return o->_params;
+}
+// clearParameters() empties the array without replacing it, so a caller holding the
+// object from an earlier getter keeps observing it (measured).
+void SQLStatement_clearParameters(void* _this) {
+  SQLStatement* o = (SQLStatement*)_this;
+  as_object* p = (as_object*)SQLStatement_get_parameters(_this);
+  p->length = 0;
+}
+// The unset itemClass READS as the Object class (measured), while NULL is kept
+// internally so the row builder does not have to route plain rows through a factory.
+as_class* SQLStatement_get_itemClass(void* _this) {
+  SQLStatement* o = (SQLStatement*)_this;
+  if (o->_itemClass != NULL) return o->_itemClass;
+  return (as_class*)as_v_class_by_name("Object").ptr;
+}
+void SQLStatement_set_itemClass(void* _this, as_class* value) {
+  SQLStatement* o = (SQLStatement*)_this;
+  // null is ACCEPTED here and reads back as Object (measured on adl 51.4.1), unlike
+  // text, whose setter dereferences and therefore rejects null with #1009.
+  o->_itemClass = value;
+  gc_write_barrier((void*)value);
+}
+bool SQLStatement_get_executing(void* _this) { return ((SQLStatement*)_this)->_executing; }
+// getResult() pops the FIFO queue and returns null once drained (measured: calling it
+// twice in one expression yields null the second time).
+SQLResult* SQLStatement_getResult(void* _this) {
+  SQLStatement* o = (SQLStatement*)_this;
+  if (o->_queue == NULL || o->_queue->length == 0) return NULL;
+  return (SQLResult*)as_array_shift(o->_queue).ptr;
+}
+// execute(): prepare, bind and run. A second execute() on the same statement is legal
+// (measured) and simply replaces the cursor.
+void SQLStatement_execute(void* _this, int prefetch, Object* responder) {
+  SQLStatement* o = (SQLStatement*)_this;
+  (void)responder;
+  if (o->_conn == NULL) as_sql_throw_err(3109, "Operation is not permitted when the SQLStatement.sqlConnection property is not set.");
+  if (o->_conn->_db == NULL) as_sql_throw_err(3104, "A SQLConnection must be open to perform this operation.");
+  if (o->_text == NULL || o->_text[0] == 0) as_sql_throw_err(3108, "Operation is not permitted when the SQLStatement.text property is not set.");
+  if (o->_stmt != NULL) { as_sql_finalize(o->_stmt); o->_stmt = NULL; }
+  void* db = o->_conn->_db;
+  int rc = 0;
+  char* msg = NULL;
+  void* st = as_sql_prepare(db, o->_text, &rc, &msg);
+  if (st == NULL) as_sql_fail(db, "execute", msg != NULL ? msg : "SQL prepare failed", -1);
+  as_sql_check_params(o, st);
+  as_sql_bind_params(o, st);
+  as_sql_reset_updates(db);
+  SQLResult* r = as_sql_chunk(o, st, prefetch);
+  o->_complete = r->_complete;
+  as_sql_publish(o, _this, r);
+}
+// next(): continue an unfinished SELECT. AIR pushes NO further rows once the cursor is
+// exhausted -- the call reports a chunk with data=null and complete=true -- and raises
+// #3107 when the result was already complete (measured).
+void SQLStatement_next(void* _this, int prefetch, Object* responder) {
+  SQLStatement* o = (SQLStatement*)_this;
+  (void)responder;
+  if (o->_stmt == NULL || o->_complete) as_sql_throw_err(3107, "SQLStatement.next may not be called unless SQLResult.complete is false.");
+  as_sql_reset_updates(o->_conn->_db);
+  SQLResult* r = as_sql_chunk(o, o->_stmt, prefetch);
+  o->_complete = r->_complete;
+  as_sql_publish(o, _this, r);
+}
+// cancel() drops the cursor and stops executing, without dispatching an event
+// (measured: a listener for SQLEvent.CANCEL never fires).
+void SQLStatement_cancel(void* _this, Object* responder) {
+  SQLStatement* o = (SQLStatement*)_this;
+  (void)responder;
+  if (o->_conn != NULL && o->_conn->_db != NULL) as_sql_interrupt(o->_conn->_db);
+  if (o->_stmt != NULL) { as_sql_finalize(o->_stmt); o->_stmt = NULL; }
+  o->_executing = false;
+}
+
+// ---------- SQLResult ----------
+// 'data' is NULL for a statement that returned no rows -- an Array only for a chunk
+// that carried rows (measured).
+void SQLResult_ctor(SQLResult* o, as_array* data, double rowsAffected, bool complete, double lastInsertRowID) {
+  Object_ctor((Object*)o);
+  o->_data = data;
+  o->_rowsAffected = rowsAffected;
+  o->_complete = complete;
+  o->_lastInsertRowID = lastInsertRowID;
+  gc_write_barrier((void*)o->_data);
+}
+SQLResult* SQLResult_new(as_array* data, double rowsAffected, bool complete, double lastInsertRowID) {
+  SQLResult* o = (SQLResult*)gc_alloc(GCT_CLASS, sizeof(SQLResult));
+  o->vtable = &SQLResult_vt;
+  SQLResult_ctor(o, data, rowsAffected, complete, lastInsertRowID);
+  return o;
+}
+as_array* SQLResult_get_data(void* _this) { return ((SQLResult*)_this)->_data; }
+double SQLResult_get_rowsAffected(void* _this) { return ((SQLResult*)_this)->_rowsAffected; }
+bool SQLResult_get_complete(void* _this) { return ((SQLResult*)_this)->_complete; }
+double SQLResult_get_lastInsertRowID(void* _this) { return ((SQLResult*)_this)->_lastInsertRowID; }
+
+// ---------- schema classes ----------
+// The constructor arguments are AIR's own (measured arities: SQLSchema 3,
+// SQLTableSchema 4, SQLColumnSchema 6, SQLSchemaResult 4), so user code that builds a
+// schema object compiles here exactly as it does under adl.
+void SQLSchema_ctor(SQLSchema* o, char* database, char* name, char* sql) {
+  Object_ctor((Object*)o);
+  o->_database = database; o->_name = name; o->_sql = sql;
+  gc_write_barrier((void*)o->_database); gc_write_barrier((void*)o->_name); gc_write_barrier((void*)o->_sql);
+}
+SQLSchema* SQLSchema_new(char* database, char* name, char* sql) {
+  SQLSchema* o = (SQLSchema*)gc_alloc(GCT_CLASS, sizeof(SQLSchema));
+  o->vtable = &SQLSchema_vt;
+  SQLSchema_ctor(o, database, name, sql);
+  return o;
+}
+char* SQLSchema_get_database(void* _this) { return ((SQLSchema*)_this)->_database; }
+char* SQLSchema_get_name(void* _this) { return ((SQLSchema*)_this)->_name; }
+char* SQLSchema_get_sql(void* _this) { return ((SQLSchema*)_this)->_sql; }
+void SQLTableSchema_ctor(SQLTableSchema* o, char* database, char* name, char* sql, as_array* columns) {
+  SQLSchema_ctor((SQLSchema*)o, database, name, sql);
+  o->_columns = columns;
+  gc_write_barrier((void*)o->_columns);
+}
+SQLTableSchema* SQLTableSchema_new(char* database, char* name, char* sql, as_array* columns) {
+  SQLTableSchema* o = (SQLTableSchema*)gc_alloc(GCT_CLASS, sizeof(SQLTableSchema));
+  o->vtable = &SQLTableSchema_vt;
+  SQLTableSchema_ctor(o, database, name, sql, columns);
+  return o;
+}
+as_array* SQLTableSchema_get_columns(void* _this) { return ((SQLTableSchema*)_this)->_columns; }
+char* SQLTableSchema_get_sql(void* _this) { return ((SQLTableSchema*)_this)->_sql; }
+// SQLViewSchema extends SQLTableSchema and inherits its fields, so these two vtable
+// slots forward to the same layout.
+void SQLViewSchema_ctor(SQLViewSchema* o, char* database, char* name, char* sql, as_array* columns) {
+  SQLTableSchema_ctor((SQLTableSchema*)o, database, name, sql, columns);
+}
+SQLViewSchema* SQLViewSchema_new(char* database, char* name, char* sql, as_array* columns) {
+  SQLViewSchema* o = (SQLViewSchema*)gc_alloc(GCT_CLASS, sizeof(SQLViewSchema));
+  o->vtable = &SQLViewSchema_vt;
+  SQLViewSchema_ctor(o, database, name, sql, columns);
+  return o;
+}
+as_array* SQLViewSchema_get_columns(void* _this) { return ((SQLTableSchema*)_this)->_columns; }
+char* SQLViewSchema_get_sql(void* _this) { return ((SQLTableSchema*)_this)->_sql; }
+void SQLIndexSchema_ctor(SQLIndexSchema* o, char* database, char* name, char* sql, char* table) {
+  SQLSchema_ctor((SQLSchema*)o, database, name, sql);
+  o->_table = table;
+  gc_write_barrier((void*)o->_table);
+}
+SQLIndexSchema* SQLIndexSchema_new(char* database, char* name, char* sql, char* table) {
+  SQLIndexSchema* o = (SQLIndexSchema*)gc_alloc(GCT_CLASS, sizeof(SQLIndexSchema));
+  o->vtable = &SQLIndexSchema_vt;
+  SQLIndexSchema_ctor(o, database, name, sql, table);
+  return o;
+}
+char* SQLIndexSchema_get_table(void* _this) { return ((SQLIndexSchema*)_this)->_table; }
+void SQLTriggerSchema_ctor(SQLTriggerSchema* o, char* database, char* name, char* sql, char* table) {
+  SQLSchema_ctor((SQLSchema*)o, database, name, sql);
+  o->_table = table;
+  gc_write_barrier((void*)o->_table);
+}
+SQLTriggerSchema* SQLTriggerSchema_new(char* database, char* name, char* sql, char* table) {
+  SQLTriggerSchema* o = (SQLTriggerSchema*)gc_alloc(GCT_CLASS, sizeof(SQLTriggerSchema));
+  o->vtable = &SQLTriggerSchema_vt;
+  SQLTriggerSchema_ctor(o, database, name, sql, table);
+  return o;
+}
+char* SQLTriggerSchema_get_table(void* _this) { return ((SQLTriggerSchema*)_this)->_table; }
+void SQLColumnSchema_ctor(SQLColumnSchema* o, char* name, bool primaryKey, bool allowNull, bool autoIncrement, char* dataType, char* defaultCollationType) {
+  Object_ctor((Object*)o);
+  o->_name = name;
+  o->_primaryKey = primaryKey;
+  o->_allowNull = allowNull;
+  o->_autoIncrement = autoIncrement;
+  o->_dataType = dataType;
+  o->_defaultCollationType = defaultCollationType;
+  gc_write_barrier((void*)o->_name); gc_write_barrier((void*)o->_dataType); gc_write_barrier((void*)o->_defaultCollationType);
+}
+SQLColumnSchema* SQLColumnSchema_new(char* name, bool primaryKey, bool allowNull, bool autoIncrement, char* dataType, char* defaultCollationType) {
+  SQLColumnSchema* o = (SQLColumnSchema*)gc_alloc(GCT_CLASS, sizeof(SQLColumnSchema));
+  o->vtable = &SQLColumnSchema_vt;
+  SQLColumnSchema_ctor(o, name, primaryKey, allowNull, autoIncrement, dataType, defaultCollationType);
+  return o;
+}
+char* SQLColumnSchema_get_name(void* _this) { return ((SQLColumnSchema*)_this)->_name; }
+bool SQLColumnSchema_get_primaryKey(void* _this) { return ((SQLColumnSchema*)_this)->_primaryKey; }
+bool SQLColumnSchema_get_allowNull(void* _this) { return ((SQLColumnSchema*)_this)->_allowNull; }
+bool SQLColumnSchema_get_autoIncrement(void* _this) { return ((SQLColumnSchema*)_this)->_autoIncrement; }
+char* SQLColumnSchema_get_dataType(void* _this) { return ((SQLColumnSchema*)_this)->_dataType; }
+// Always "binary": SQLite exposes no collation through pragma_table_info, so a column
+// declared COLLATE NOCASE still reads "binary" here (recorded deviation).
+char* SQLColumnSchema_get_defaultCollationType(void* _this) { return ((SQLColumnSchema*)_this)->_defaultCollationType; }
+void SQLSchemaResult_ctor(SQLSchemaResult* o, as_array* tables, as_array* views, as_array* indices, as_array* triggers) {
+  Object_ctor((Object*)o);
+  o->_tables = tables; o->_views = views; o->_indices = indices; o->_triggers = triggers;
+  gc_write_barrier((void*)o->_tables); gc_write_barrier((void*)o->_views);
+  gc_write_barrier((void*)o->_indices); gc_write_barrier((void*)o->_triggers);
+}
+SQLSchemaResult* SQLSchemaResult_new(as_array* tables, as_array* views, as_array* indices, as_array* triggers) {
+  SQLSchemaResult* o = (SQLSchemaResult*)gc_alloc(GCT_CLASS, sizeof(SQLSchemaResult));
+  o->vtable = &SQLSchemaResult_vt;
+  SQLSchemaResult_ctor(o, tables, views, indices, triggers);
+  return o;
+}
+as_array* SQLSchemaResult_get_tables(void* _this) { return ((SQLSchemaResult*)_this)->_tables; }
+as_array* SQLSchemaResult_get_views(void* _this) { return ((SQLSchemaResult*)_this)->_views; }
+as_array* SQLSchemaResult_get_indices(void* _this) { return ((SQLSchemaResult*)_this)->_indices; }
+as_array* SQLSchemaResult_get_triggers(void* _this) { return ((SQLSchemaResult*)_this)->_triggers; }
+
+// ---------- flash.events.SQLEvent / SQLUpdateEvent / SQLErrorEvent ----------
+void SQLEvent_ctor(SQLEvent* o, char* type, bool bubbles, bool cancelable) { Event_ctor((Event*)o, type, bubbles, cancelable); }
+SQLEvent* SQLEvent_new(char* type, bool bubbles, bool cancelable) { SQLEvent* o = (SQLEvent*)gc_alloc(GCT_CLASS, sizeof(SQLEvent)); o->vtable = &SQLEvent_vt; SQLEvent_ctor(o, type, bubbles, cancelable); return o; }
+void SQLUpdateEvent_ctor(SQLUpdateEvent* o, char* type, bool bubbles, bool cancelable, double rowID, char* table) {
+  Event_ctor((Event*)o, type, bubbles, cancelable);
+  o->_rowID = rowID;
+  o->_table = table;
+  gc_write_barrier((void*)table);
+}
+SQLUpdateEvent* SQLUpdateEvent_new(char* type, bool bubbles, bool cancelable, double rowID, char* table) {
+  SQLUpdateEvent* o = (SQLUpdateEvent*)gc_alloc(GCT_CLASS, sizeof(SQLUpdateEvent));
+  o->vtable = &SQLUpdateEvent_vt;
+  SQLUpdateEvent_ctor(o, type, bubbles, cancelable, rowID, table);
+  return o;
+}
+double SQLUpdateEvent_get_rowID(void* _this) { return ((SQLUpdateEvent*)_this)->_rowID; }
+char* SQLUpdateEvent_get_table(void* _this) { return ((SQLUpdateEvent*)_this)->_table; }
+// SQLErrorEvent extends ErrorEvent, and its inherited text/errorID carry the error's
+// message and id (measured on adl: text="Error #3125: Unable to open the database
+// file.", errorID=3125 for an SQLError with that id).
+void SQLErrorEvent_ctor(SQLErrorEvent* o, char* type, bool bubbles, bool cancelable, Object* error) {
+  SQLError* e = (SQLError*)error;
+  ErrorEvent_ctor((ErrorEvent*)o, type, bubbles, cancelable, (e != NULL) ? e->message : (char*)"");
+  ((ErrorEvent*)o)->errorID = (e != NULL) ? e->errorID : 0;
+  o->_error = e;
+  gc_write_barrier((void*)o->_error);
+}
+SQLErrorEvent* SQLErrorEvent_new(char* type, bool bubbles, bool cancelable, Object* error) {
+  SQLErrorEvent* o = (SQLErrorEvent*)gc_alloc(GCT_CLASS, sizeof(SQLErrorEvent));
+  o->vtable = &SQLErrorEvent_vt;
+  SQLErrorEvent_ctor(o, type, bubbles, cancelable, error);
+  return o;
+}
+SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)->_error; }
+`;
+    for (const ln of C.split('\n')) this.line(ln);
+  }
+
   private emitExportWrappers(): void {
     for (const e of this.symbols.exports) {
       if (!e.alias) continue;
@@ -6689,7 +7849,9 @@ export class Emitter {
       'Context3DRenderMode', 'Context3DStencilAction', 'Context3DTextureFilter', 'Context3DTextureFormat',
       'Context3DTriangleFace', 'Context3DVertexBufferFormat', 'Context3DWrapMode',
       // stage 110 constant classes
-      'CapsStyle', 'LineScaleMode', 'TriangleCulling', 'Orientation3D', 'ShaderPrecision']) {
+      'CapsStyle', 'LineScaleMode', 'TriangleCulling', 'Orientation3D', 'ShaderPrecision',
+      // flash.data token classes (pure static-String holders, never instantiated)
+      'SQLMode', 'SQLColumnNameStyle', 'SQLTransactionLockType', 'SQLCollationType']) {
       this.line(`void ${cc}_ctor(${cc}* o) { Object_ctor((Object*)o); }`);
       this.line(`${cc}* ${cc}_new(void) { ${cc}* o = (${cc}*)gc_alloc(GCT_CLASS, sizeof(${cc})); o->vtable = &${cc}_vt; ${cc}_ctor(o); return o; }`);
     }
@@ -6765,26 +7927,30 @@ export class Emitter {
     // flash.errors.SQLError: an Error subclass carrying the failed SQL operation, a
     // detail message, a detail id and the substitution arguments. Hand-written for
     // the same reason as the Error family above (the generated ctor cannot store
-    // four parameters), with the measured AIR string forms (adl 51.4.1,
+    // extra values), with the measured AIR string forms (adl 51.4.1,
     // temp/airref/Main.as): a NULL operation/details stringifies to "null" like
     // Error's message, detailArguments is ALWAYS an Array, and toString() omits the
     // detailID segment while it is still the -1 sentinel.
-    this.line('void SQLError_ctor(SQLError* o, char* operation, char* details, char* message, int id, int detailID, as_array* detailArgs) {');
+    //
+    // The PUBLIC constructor is AIR's own, (message, id) -- measured: `new
+    // SQLError()` does not compile under mxmlc because message has no default. The
+    // four SQL-specific values keep their "nothing known yet" state here and are
+    // filled in by the engine through as_sql_mk_error() (the flash.data block).
+    this.line('void SQLError_ctor(SQLError* o, char* message, int id) {');
     this.indent++;
     this.line('Error_ctor((Error*)o, message, id);');
-    this.line('o->_operation = (operation == NULL) ? (char*)"null" : operation;');
-    this.line('o->_details = (details == NULL) ? (char*)"null" : details;');
-    this.line('o->_detailID = detailID;');
-    this.line('o->_detailArguments = (detailArgs != NULL) ? detailArgs : as_array_new();');
-    this.line('gc_write_barrier((void*)o->_operation); gc_write_barrier((void*)o->_details);');
-    this.line('gc_write_barrier_value(as_v_arr((void*)o->_detailArguments));');
+    this.line('o->_operation = (char*)"null";');
+    this.line('o->_details = (char*)"null";');
+    this.line('o->_detailID = -1;');
+    this.line('o->_detailArguments = as_array_new();');
+    this.line('gc_write_barrier((void*)o->_detailArguments);');
     this.indent--;
     this.line('}');
-    this.line('SQLError* SQLError_new(char* operation, char* details, char* message, int id, int detailID, as_array* detailArgs) {');
+    this.line('SQLError* SQLError_new(char* message, int id) {');
     this.indent++;
     this.line('SQLError* o = (SQLError*)gc_alloc(GCT_CLASS, sizeof(SQLError));');
     this.line('o->vtable = &SQLError_vt;');
-    this.line('SQLError_ctor(o, operation, details, message, id, detailID, detailArgs);');
+    this.line('SQLError_ctor(o, message, id);');
     this.line('return o;');
     this.indent--;
     this.line('}');
@@ -11897,14 +13063,20 @@ export class Emitter {
     this.line('}');
     // POSIX remove() deletes an empty directory (via rmdir), but MSVC's remove()
     // is _unlink-only and cannot delete a directory. deleteDirectory therefore
-    // needs its own helper: RemoveDirectoryA on Windows, rmdir elsewhere.
+    // needs its own helper: RemoveDirectoryA on Windows, remove() elsewhere.
+    // remove() rather than rmdir() because rmdir is declared in <unistd.h>, which
+    // WASI does not get (the preamble skips it there -- no fork/exec to hand a URL
+    // to); wasi-libc declares remove() in <stdio.h> and routes an empty directory
+    // to rmdir, so one call covers POSIX and WASI alike. Without this, EVERY wasm
+    // build failed with "call to undeclared function 'rmdir'" (ISO C99 forbids the
+    // implicit declaration the older clang accepted).
     this.line('static int as_rmdir_one(const char* p) {');
     this.indent++;
     this.line('#ifdef _WIN32');
     this.line('// kernel32 single-level empty-directory remover; mirrors as_mkdir_one.');
     this.line('return RemoveDirectoryA(p) ? 0 : -1;');
     this.line('#else');
-    this.line('return rmdir(p);');
+    this.line('return remove(p);');
     this.line('#endif');
     this.indent--;
     this.line('}');

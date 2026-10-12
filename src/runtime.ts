@@ -256,6 +256,10 @@ static void gc_audit_gate(const char* what, const void* p);
 // ASC_GC_AUDIT switch (defined with the audit code below): gc_heap_used_bytes()
 // re-derives its O(1) mirror from the list when the audit is on.
 static bool gc_audit_on(void);
+// -1 until gc_audit_on() resolves the environment, then 0/1. Defined here rather
+// than with the audit code because the allocation path -- which comes first in
+// the preamble -- tests it directly (see the note on gc_audit_gate below).
+static int gc_audit_mode_cache = -1;
 
 #define AS_ARENA_SEG_CAP (1u << 22)
 typedef struct as_arena_seg { struct as_arena_seg* next; size_t used; char* buf; } as_arena_seg;
@@ -484,8 +488,15 @@ static gc_header* gc_find_block(size_t size, gc_header*** out_head, gc_header** 
     for (int li = first; li <= last; li++) {
         gc_header** list = gc_free_list_at(li);
         gc_header* prev = NULL;
+        // The audit gate is off by default and is called once per node visited,
+        // i.e. ~once per allocation. Testing the cached mode flag here instead of
+        // calling the gate unconditionally keeps the off case a load and a branch:
+        // the call alone (prologue, string argument, flag re-check) measured ~7%
+        // of benchmarks/strings and ~8% of benchmarks/binarytrees. -1 (not yet
+        // resolved) still falls through, and the gate resolves it. 2026-10,
+        // temp/bench/wbfix.
         for (gc_header* h = *list; h != NULL; prev = h, h = h->next) {
-            gc_audit_gate("free-list node", h);
+            if (gc_audit_mode_cache != 0) gc_audit_gate("free-list node", h);
             if (h->size >= size) { *out_head = list; *out_prev = prev; return h; }
         }
     }
@@ -729,11 +740,15 @@ static void gc_collect(void);
 // Allocate a GC object of the given type. Returns the object body (header hidden
 // before it). The body is zeroed so uninitialized array slots read as tag 0
 // (null) during mark, never a stale pointer.
+//
+// GCT_STRING is the one exception (see the memset below): it is a raw byte
+// buffer that gc_scan treats as a leaf, so none of its bytes is ever read as a
+// pointer and the zeroing buys nothing there.
 static void* gc_alloc(int type, size_t size) {
     // ASC_GC_AUDIT: gc_all is written only by this function and by the sweeper,
     // so a non-heap value here was stored by unrelated code (a wild store). The
     // report's call chain is the statement that ran right after that store.
-    gc_audit_gate("gc_all", gc_all);
+    if (gc_audit_mode_cache != 0) gc_audit_gate("gc_all", gc_all);
     // Non-GUI trigger: no frame has ever been dispatched, so nothing else will
     // ever call gc_step() -- collect here, once the allocation total crosses the
     // (adaptive) threshold. This runs *before* the new object exists, so the
@@ -840,7 +855,12 @@ static void* gc_alloc(int type, size_t size) {
         }
         gc_bytes_allocated += sizeof(gc_header) + h->size;
         void* body = (void*)((char*)h + sizeof(gc_header));
-        memset(body, 0, h->size);
+        // Skip the zero-fill for raw string buffers: gc_scan never reads their
+        // bytes as pointers (GCT_STRING is a leaf), and every producer writes
+        // its own trailing NUL, so the fill is pure cost -- and strings are the
+        // most allocation-heavy workload we have (14 of the 16 allocations in
+        // each benchmarks/strings iteration). Measured ~12 ms of 225 ms there.
+        if (type != GCT_STRING) memset(body, 0, h->size);
         return body;
     }
     // Out of free blocks: carve a fresh segment. A fixed 1 MiB segment only
@@ -934,6 +954,12 @@ static void gc_collect(void);
 // Allocate a GC-managed string of n bytes (the caller writes the trailing NUL).
 // Strings are GCT_STRING leaves: they carry no child pointers and are reclaimed
 // once no root / reachable object references them (stage 57 GC-2).
+//
+// gc_alloc skips zeroing a GCT_STRING block (see its note): the marker never
+// scans these bytes for pointers, so the zero-fill can never matter, and the
+// caller writing the trailing NUL is the contract anyway. Every producer below
+// honours it -- memcpy of a known length plus an explicit NUL, or snprintf/strcpy
+// which terminate -- so the block is always a well-formed C string on return.
 static char* as_str_alloc(size_t n) {
     return (char*)gc_alloc(GCT_STRING, n);
 }
@@ -1168,18 +1194,50 @@ static uint64_t as_u64_val(as_value v) { return v.u64; }
 
 // Write barrier (GC-4 incremental marking, Dijkstra insertion barrier). During
 // MARK the mutator runs between gc_step slices; a write of a still-WHITE pointer
-// must grey it so the mark does not miss the edge. Outside MARK this is one int
-// compare (near-zero cost). gc_write_barrier handles raw pointers (dict keys,
-// direct field writes); gc_write_barrier_value handles boxed as_value slots.
-static void gc_write_barrier(void* p) {
-    if (gc_inc.state != GC_MARK) return;
+// must grey it so the mark does not miss the edge. Outside MARK the whole barrier
+// is one int compare. gc_write_barrier handles raw pointers (dict keys, direct
+// field writes); gc_write_barrier_value handles boxed as_value slots.
+//
+// The split below is a performance decision, not a structural one. The barrier
+// body needs gc_in_heap (segment lookup) and gc_grey_push, and clang's inline cost
+// for the combined function is 275 -- over the 225 budget -- so all ~580 call sites
+// in a generated program (shell constructors, array/dict setters, and the *emitted*
+// field writes of a hot loop like benchmarks/binarytrees' make()) get an out-of-line
+// call. That is what cost binarytrees 99 -> 117 ms (measured 2026-10): three of
+// gc_write_barrier's 580 call sites are inside make(), and make() runs 3.2M times.
+// Note the body here is byte-identical to the pre-regression build; the regression
+// was purely clang choosing to inline gc_in_heap INTO the barrier that time, which
+// pushed the barrier over the budget. Keeping the expensive half out of line makes
+// the inlinable wrapper's cost independent of that decision.
+//
+// The slow path is reached through a volatile function pointer, NOT a direct call,
+// and that is load-bearing. clang grants a large "last call to static" bonus to a
+// callee with a single call site, which would inline the slow path back into the
+// wrapper and restore the 275 cost (measured: with a plain gc_write_barrier_slow(p)
+// call in the wrapper, the barrier is NOT inlined into any of its 584 callers again).
+// A second direct call site defeats the bonus too, but only while that call site
+// survives dead-code elimination -- a program that never touches an Array/Dictionary
+// drops gc_write_barrier_value, the slow path falls back to a single call site, and
+// the regression returns silently (measured). An indirect call through a volatile
+// pointer is immune to both: the address escapes, so the callee is never "used
+// once", and the volatile load stops clang devirtualising it. Cost: one predictable
+// compare in the hot path, an indirect call only inside MARK (never taken in the
+// non-GUI stop-the-world builds, where the mutator does not run during mark).
+// Measured on binarytrees: 117 -> 112 ms, vs 112 ms with the barrier deleted
+// outright -- i.e. the barrier's fast path is free again (temp/bench/wbfix/).
+static void gc_write_barrier_slow(void* p) {
     if (p == NULL || !gc_in_heap(p)) return;
     gc_header* h = gc_hdr(p);
     if (h->color == GC_WHITE) { h->color = GC_GREY; gc_grey_push(h); }
 }
+static void (*volatile gc_write_barrier_slow_fn)(void*) = gc_write_barrier_slow;
+static void gc_write_barrier(void* p) {
+    if (gc_inc.state != GC_MARK) return;
+    gc_write_barrier_slow_fn(p);
+}
 static void gc_write_barrier_value(as_value v) {
     if (gc_inc.state != GC_MARK) return;
-    if (v.tag == 3 || v.tag == 4 || v.tag == 6 || v.tag == 7) gc_write_barrier(v.ptr);
+    if (v.tag == 3 || v.tag == 4 || v.tag == 6 || v.tag == 7) gc_write_barrier_slow_fn(v.ptr);
 }
 
 // GC mark of a boxed value (declared here, after as_value is defined).
@@ -2379,7 +2437,12 @@ static void as_audio_mark_roots(void) {
 // as_class_static_write), so SomeClass[expr] can read AND write a declared
 // static by name at run time -- exactly the lookup AIR performs there (measured on
 // adl 51.4.1, temp/classprobe: c.nope -> undefined while a real static field
-// reads its value). A name that is not a static member at all stays undefined.
+// reads its value). kind 3 is a COMPUTED static (getter/setter pair): there is no
+// C slot, so fn holds a boxed-args thunk that INVOKES the getter and boxes its
+// result -- AIR resolves the name and calls the accessor (measured on adl 51.4.1,
+// temp/adlprobe/adl.txt section 1: a Class value static getter reads its value, and
+// NativeApplication_get_nativeApplication_static is exactly this shape). A name
+// that is not a static member at all stays undefined.
 typedef struct {
     const char* name;
     int kind;
@@ -2810,6 +2873,11 @@ static int as_array_indexOf(as_array* a, as_value v) {
 // temp/pkgA/arrstr). as_arr_to_str is declared up by as_v_to_number, where the
 // as_array layout is not visible yet.
 static char* as_array_join(as_array* a, const char* sep) {
+    // A statically Array-typed expression can still hold AS3 null (a property that
+    // was never assigned, SQLResult.data for a statement with no rows), and string
+    // concatenation must then produce String(null) == "null" rather than fault on
+    // a null receiver.
+    if (a == NULL) return (char*)"null";
     // A String-typed separator can be the AS3 null string (C NULL); AIR stringifies
     // it as "null" (adl 51.4.1: String s = null; [1,2].join(s) -> "1null2"), and
     // the strlen below would fault on it.
@@ -4918,11 +4986,25 @@ static as_value as_any_set_v(as_value box, const char* key, as_value v) { as_any
 // *decision* matches AS3 ToPrimitive, while their text is this subset's
 // simplification rather than AS3's toString()/join (see README current limits).
 // null/undefined coerce to 0 in the numeric branch, matching as_v_to_number.
+//
+// The numeric branch is kept inlinable on purpose, exactly like as_v_int_cast
+// above. as_v_to_number grew the tag==4 (object -> valueOf/toString) and tag 5/7
+// (undefined/function -> NaN) arms, and clang's inline cost for it crossed the
+// 225 budget: an out-of-line call per operand in the hot loop, so benchmarks/
+// array's 20M-iteration dynamic 'sum += a[j] + b[j]' paid 40M calls (193 ms vs
+// 119 ms inlined, measured on this host 2026-10). The tag 1/2 fast path is
+// exactly as_v_to_number's own first two arms (Number -> num, Boolean -> num),
+// so the wrapper is semantics-preserving and keeps the call out of the loop.
+// Every other numeric-ish tag (8/9 -> i64/u64, 5 -> undefined -> NaN) still
+// routes to as_v_to_number; the object/string tags were already diverted to the
+// concat branch above.
 static as_value as_add_v(as_value a, as_value b) {
     bool a_obj = a.tag == 3 || a.tag == 4 || a.tag == 6 || a.tag == 7;
     bool b_obj = b.tag == 3 || b.tag == 4 || b.tag == 6 || b.tag == 7;
     if (a_obj || b_obj) return as_v_str(as_str_concat(as_v_str_val(a), as_v_str_val(b)));
-    return as_v_num(as_v_to_number(a) + as_v_to_number(b));
+    double na = (a.tag == 1 || a.tag == 2) ? a.num : as_v_to_number(a);
+    double nb = (b.tag == 1 || b.tag == 2) ? b.num : as_v_to_number(b);
+    return as_v_num(na + nb);
 }
 
 // Array.sortOn(field, options): sort objects in place by a named property. The
@@ -5389,7 +5471,8 @@ static int gc_audit_reports = 0;
 // hid the first diagnosis).
 static int gc_audit_drift_reports = 0;
 static int gc_audit_release_reports = 0;
-static int gc_audit_mode_cache = -1;
+// gc_audit_mode_cache is defined with the forward declarations at the top of the
+// preamble: the allocation path tests it before the audit code is declared.
 // Holder of the pointer currently being examined: the object whose fields
 // gc_scan is walking (NULL while a root slot is being offered), plus the
 // reflecting-table property name / array slot being read from it.
@@ -5905,7 +5988,7 @@ static void gc_mark_drain(void) {
 static bool gc_sweep_step(size_t budget) {
     while (budget-- > 0 && gc_inc.sweep_cursor != NULL) {
         gc_header* h = gc_inc.sweep_cursor;
-        gc_audit_gate("sweep cursor", h);
+        if (gc_audit_mode_cache != 0) gc_audit_gate("sweep cursor", h);
         gc_header* next = h->next;
         if (h->color == GC_WHITE) {
             if (gc_inc.sweep_prev) gc_inc.sweep_prev->next = next; else gc_all = next;
@@ -12995,4 +13078,124 @@ static as_value as_amf_read_object(const unsigned char* data, size_t len, size_t
     free(r.objs);
     return v;
 }
+
+// ---------- flash.data engine ABI (SQLite) ----------
+// The AS3 flash.data layer (SQLConnection/SQLStatement/SQLResult) is emitted for
+// every build, but the ENGINE behind these entry points only exists when the
+// program actually references flash.data: then the compiler adds
+// -DASC_HAVE_SQLITE plus vendor/sqlite_glue.c and the SQLite amalgamation to the
+// link. Without that flag the stubs below keep the build self-contained -- and
+// since the AS3 side reports them, every open() fails LOUDLY rather than silently
+// pretending to work (AGENTS.md 1.5: never degrade silently).
+//
+// Plain (unencrypted) AIR databases ARE standard SQLite files -- measured: the
+// file adl 51.4.1's SQLConnection.open(..., SQLMode.CREATE) writes has the
+// "SQLite format 3\0" header and host sqlite3 reads it back (docs/zh-cn/flash-data.md
+// section 3.4). So "link the official amalgamation" is the exact-semantics choice,
+// not an approximation.
+// Open-flag bits for as_sql_open. The glue uses the same values (separate TU).
+#define AS_SQL_F_CREATE 1
+#define AS_SQL_F_READONLY 2
+#define AS_SQL_F_READWRITE 4
+
+#ifdef ASC_HAVE_SQLITE
+// The engine is actually linked: these resolve to vendor/sqlite_glue.c.
+extern void* as_sql_open(const char* path, int flags, int pageSize, int autoVacuum, int* rc, char** msg);
+extern void  as_sql_close(void* h);
+extern int   as_sql_exec(void* h, const char* sql, char** msg);
+extern void* as_sql_prepare(void* h, const char* sql, int* rc, char** msg);
+extern int   as_sql_bind_null(void* st, int idx);
+extern int   as_sql_bind_int(void* st, int idx, long long v);
+extern int   as_sql_bind_double(void* st, int idx, double v);
+extern int   as_sql_bind_text(void* st, int idx, const char* v);
+extern int   as_sql_bind_blob(void* st, int idx, const void* v, int n);
+extern int   as_sql_bind_parameter_index(void* st, const char* name);
+extern int   as_sql_bind_parameter_count(void* st);
+extern const char* as_sql_bind_parameter_name(void* st, int i);
+extern int   as_sql_step(void* st);
+extern void  as_sql_reset(void* st);
+extern void  as_sql_finalize(void* st);
+extern int   as_sql_column_count(void* st);
+extern const char* as_sql_column_name(void* st, int i);
+extern const char* as_sql_column_table_name(void* st, int i);
+extern int   as_sql_column_type(void* st, int i);
+extern long long as_sql_column_int64(void* st, int i);
+extern double as_sql_column_double(void* st, int i);
+extern const char* as_sql_column_text(void* st, int i);
+extern const void* as_sql_column_blob(void* st, int i);
+extern int   as_sql_column_bytes(void* st, int i);
+extern long long as_sql_changes(void* h);
+extern long long as_sql_total_changes(void* h);
+extern long long as_sql_last_insert_rowid(void* h);
+extern int   as_sql_errcode(void* h);
+extern int   as_sql_extended_errcode(void* h);
+extern const char* as_sql_errmsg(void* h);
+extern int   as_sql_get_autocommit(void* h);
+extern int   as_sql_txn_state(void* h);
+extern void  as_sql_interrupt(void* h);
+extern void  as_sql_watch_changes(void* h);
+extern void  as_sql_reset_updates(void* h);
+extern int   as_sql_update_count(void* h);
+extern int   as_sql_update_op(void* h, int i);
+extern long long as_sql_update_rowid(void* h, int i);
+extern const char* as_sql_update_table(void* h, int i);
+extern long long as_sql_get_page_size(void* h);
+extern long long as_sql_get_cache_size(void* h);
+extern long long as_sql_get_auto_vacuum(void* h);
+extern int   as_sql_set_cache_size(void* h, long long pages);
+extern int   as_sql_is_database_file(const char* path);
+extern int   as_sql_file_exists(const char* path);
+extern const char* as_sql_libversion(void);
+#else
+// No database engine in this build (the program never referenced flash.data, so
+// src/index.ts did not add the amalgamation). open() returns NULL with a message
+// that the AS3 layer turns into a thrown SQLError, so the failure is LOUD and
+// names its cause -- never a silently faked database (AGENTS.md 1.5).
+static inline void* as_sql_open(const char* p, int f, int ps, int av, int* rc, char** msg) { (void)p; (void)f; (void)ps; (void)av; if (rc) *rc = 1; if (msg) *msg = (char*)"the SQLite backend was not linked into this build (reference flash.data so the compiler adds it)"; return NULL; }
+static inline void  as_sql_close(void* h) { (void)h; }
+static inline int   as_sql_exec(void* h, const char* q, char** msg) { (void)h; (void)q; if (msg) *msg = (char*)"no SQLite backend"; return 1; }
+static inline void* as_sql_prepare(void* h, const char* q, int* rc, char** msg) { (void)h; (void)q; if (rc) *rc = 1; if (msg) *msg = (char*)"no SQLite backend"; return NULL; }
+static inline int   as_sql_bind_null(void* st, int i) { (void)st; (void)i; return 0; }
+static inline int   as_sql_bind_int(void* st, int i, long long v) { (void)st; (void)i; (void)v; return 0; }
+static inline int   as_sql_bind_double(void* st, int i, double v) { (void)st; (void)i; (void)v; return 0; }
+static inline int   as_sql_bind_text(void* st, int i, const char* v) { (void)st; (void)i; (void)v; return 0; }
+static inline int   as_sql_bind_blob(void* st, int i, const void* v, int n) { (void)st; (void)i; (void)v; (void)n; return 0; }
+static inline int   as_sql_bind_parameter_index(void* st, const char* n) { (void)st; (void)n; return 0; }
+static inline int   as_sql_bind_parameter_count(void* st) { (void)st; return 0; }
+static inline const char* as_sql_bind_parameter_name(void* st, int i) { (void)st; (void)i; return NULL; }
+static inline int   as_sql_step(void* st) { (void)st; return 101; }
+static inline void  as_sql_reset(void* st) { (void)st; }
+static inline void  as_sql_finalize(void* st) { (void)st; }
+static inline int   as_sql_column_count(void* st) { (void)st; return 0; }
+static inline const char* as_sql_column_name(void* st, int i) { (void)st; (void)i; return ""; }
+static inline const char* as_sql_column_table_name(void* st, int i) { (void)st; (void)i; return ""; }
+static inline int   as_sql_column_type(void* st, int i) { (void)st; (void)i; return 5; }
+static inline long long as_sql_column_int64(void* st, int i) { (void)st; (void)i; return 0; }
+static inline double as_sql_column_double(void* st, int i) { (void)st; (void)i; return 0.0; }
+static inline const char* as_sql_column_text(void* st, int i) { (void)st; (void)i; return ""; }
+static inline const void* as_sql_column_blob(void* st, int i) { (void)st; (void)i; return NULL; }
+static inline int   as_sql_column_bytes(void* st, int i) { (void)st; (void)i; return 0; }
+static inline long long as_sql_changes(void* h) { (void)h; return 0; }
+static inline long long as_sql_total_changes(void* h) { (void)h; return 0; }
+static inline long long as_sql_last_insert_rowid(void* h) { (void)h; return 0; }
+static inline int   as_sql_errcode(void* h) { (void)h; return 0; }
+static inline int   as_sql_extended_errcode(void* h) { (void)h; return 0; }
+static inline const char* as_sql_errmsg(void* h) { (void)h; return "no SQLite backend"; }
+static inline int   as_sql_get_autocommit(void* h) { (void)h; return 1; }
+static inline int   as_sql_txn_state(void* h) { (void)h; return 0; }
+static inline void  as_sql_interrupt(void* h) { (void)h; }
+static inline void  as_sql_watch_changes(void* h) { (void)h; }
+static inline void  as_sql_reset_updates(void* h) { (void)h; }
+static inline int   as_sql_update_count(void* h) { (void)h; return 0; }
+static inline int   as_sql_update_op(void* h, int i) { (void)h; (void)i; return 0; }
+static inline long long as_sql_update_rowid(void* h, int i) { (void)h; (void)i; return 0; }
+static inline const char* as_sql_update_table(void* h, int i) { (void)h; (void)i; return NULL; }
+static inline long long as_sql_get_page_size(void* h) { (void)h; return 0; }
+static inline long long as_sql_get_cache_size(void* h) { (void)h; return 0; }
+static inline long long as_sql_get_auto_vacuum(void* h) { (void)h; return 0; }
+static inline int   as_sql_set_cache_size(void* h, long long p) { (void)h; (void)p; return 0; }
+static inline int   as_sql_is_database_file(const char* p) { (void)p; return 0; }
+static inline int   as_sql_file_exists(const char* p) { (void)p; return 0; }
+static inline const char* as_sql_libversion(void) { return "none"; }
+#endif
 `;

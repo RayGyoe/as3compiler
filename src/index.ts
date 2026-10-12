@@ -169,6 +169,20 @@ function resolveFeatures(raw: string[] | undefined): string[] | null {
   return hasNone ? [] : [...new Set(raw)];
 }
 
+// Does this program touch flash.data (or a flash.events.SQL* event)? This decides
+// whether the build links the SQLite engine. The test is deliberately
+// over-inclusive: a false positive costs ~7 s of extra compile time, while a
+// false NEGATIVE is still loud — the runtime preamble's stub open() throws an
+// explicit "the SQLite backend was not linked into this build" SQLError rather
+// than silently faking a database (AGENTS.md 1.5). Matches both an import/
+// qualified use (`flash.data.`) and the bare class names, so
+// getDefinitionByName("flash.data.SQLConnection") is caught too.
+function usesFlashData(texts: string[]): boolean {
+  const re = /flash\.data\.|flash\.events\.SQL|(?:^|[^A-Za-z0-9_.$])(?:SQLConnection|SQLStatement|SQLResult|SQLMode|SQLSchema|SQLSchemaResult|SQLTableSchema|SQLViewSchema|SQLIndexSchema|SQLTriggerSchema|SQLColumnSchema|SQLColumnNameStyle|SQLTransactionLockType|SQLCollationType|SQLEvent|SQLUpdateEvent|SQLErrorEvent)(?![A-Za-z0-9_])/;
+  for (const t of texts) if (re.test(t)) return true;
+  return false;
+}
+
 function main(): void {
   if (process.env.AS3_MEMBERGAPS) {
     process.on('exit', () => {
@@ -212,6 +226,9 @@ function main(): void {
   const embedResources: EmbedResourceSpec[] = [];
   const embedDecls: Stmt[] = [];
   const embedFieldInits = new Map<string, string>();
+  // Source texts of every participating .as file, kept only to decide whether this
+  // program touches flash.data (below). See `usesFlashData`.
+  const sqliteScanTexts: string[] = [];
   const sourceRoot = opts.airApp
     ? resolve(dirname(opts.airApp), 'src')
     : dirname(resolve(opts.inputs[0]));
@@ -238,7 +255,9 @@ function main(): void {
     Object.assign(cfg, applyManifest(cfg, loadedManifest, air.manifestPath));
 
     program = { body: [], imports: [] };
-    const boot = parse(generateBootstrap(air.info, air.mainClass));
+    const bootSrc = generateBootstrap(air.info, air.mainClass);
+    sqliteScanTexts.push(bootSrc);
+    const boot = parse(bootSrc);
     program.body.push(...boot.body);
     program.imports.push(...boot.imports);
     const srcDir = resolve(dirname(opts.airApp), 'src');
@@ -268,6 +287,7 @@ function main(): void {
         : `${air.asFiles.length} sources`;
     }
     for (const f of keptFiles) {
+      sqliteScanTexts.push(readFileSync(f.path, 'utf8'));
       program.body.push(...f.body);
       program.imports.push(...f.imports);
       // Collect this file's file-level (script) declaration names so a name
@@ -293,7 +313,9 @@ function main(): void {
   } else {
     program = { body: [], imports: [] };
     for (const input of opts.inputs) {
-      const p = parse(readFileSync(input, 'utf8'));
+      const text = readFileSync(input, 'utf8');
+      sqliteScanTexts.push(text);
+      const p = parse(text);
       program.body.push(...p.body);
       program.imports.push(...p.imports);
       collectEmbeds(p.body, dirname(resolve(input)));
@@ -455,6 +477,24 @@ function main(): void {
   }
   const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml);
   writeFileSync(cPath, c);
+
+  // ---- flash.data / SQLite engine wiring ----------------------------------
+  // The AS3 flash.data layer is emitted for every build (its engine ABI stubs live
+  // in the runtime preamble), but the ENGINE -- the official SQLite amalgamation
+  // plus the as_sql_* glue -- is added ONLY when the program touches flash.data,
+  // because compiling the 9 MB amalgamation costs ~7 s and must not be paid by
+  // every unrelated example or test. The amalgamation is the exact-semantics
+  // choice: AIR's PLAINTEXT databases ARE standard SQLite files.
+  if (usesFlashData(sqliteScanTexts)) {
+    const vendorDir = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
+    cfg.sources.push(resolve(vendorDir, 'sqlite_glue.c'), resolve(vendorDir, 'sqlite', 'sqlite3.c'));
+    cfg.includePaths.push(resolve(vendorDir, 'sqlite'));
+    cfg.defines.push('ASC_HAVE_SQLITE', 'SQLITE_ENABLE_COLUMN_METADATA');
+    // wasi/wasm-ld has no pthread, so SQLite's default (multi-thread) mode would
+    // not compile there; our compiler and runtime are single-threaded anyway.
+    if (cfg.target === 'wasm') cfg.defines.push('SQLITE_THREADSAFE=0');
+    console.log('   + flash.data: linking the SQLite engine (vendor/sqlite)');
+  }
 
   // [WasmExport] declarations are auto-exported: append their C symbols (or alias
   // wrapper names) to the link-time export list so they land in the .wasm export

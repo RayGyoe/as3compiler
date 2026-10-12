@@ -848,13 +848,14 @@ export class SymbolTable {
         ['detailArguments', sqlGet({ kind: 'array' })],
       ]),
       setters: new Map(),
+      // AIR's PUBLIC SQLError constructor is (message:String, id:int = 0) --
+      // measured: `new SQLError()` does not compile ("requires 1"), because message
+      // has no default. The four SQL-specific properties are filled in by the engine
+      // layer through as_sql_mk_error(), which is what keeps this ctor shape equal to
+      // AIR's instead of exposing our internal six-argument form.
       constructor: { params: [
-        { name: 'operation', type: 'String', defaultValue: null, isRest: false },
-        { name: 'details', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
-        { name: 'message', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
+        { name: 'message', type: 'String', defaultValue: null, isRest: false },
         { name: 'id', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
-        { name: 'detailID', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false },
-        { name: 'detailArgs', type: 'Array', defaultValue: { kind: 'Null' }, isRest: false },
       ] },
       reflectFqn: 'flash.errors::SQLError',
       superClass: 'Error',
@@ -1181,13 +1182,19 @@ export class SymbolTable {
       staticMethods: new Map(),
       getters: new Map([
         ['systemIdleMode', { returnType: { kind: 'string' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // activeWindow is an INSTANCE property, not a static one: AIR's reference
+        // compiler rejects `NativeApplication.activeWindow` as "possibly undefined"
+        // and only accepts `NativeApplication.nativeApplication.activeWindow`
+        // (measured: mxmlc AIRSDK 51.4.1 on temp/awprobe/Aw.as). The C getter was
+        // always the instance shape (NativeApplication_get_activeWindow(void*)), so
+        // the old staticGetters entry was the wrong half of the pair -- and it made a
+        // Class-value read of `activeWindow` emit a call to a nonexistent _static
+        // symbol. The focused-window / as_win_active semantics are unchanged.
+        ['activeWindow', { returnType: { kind: 'object', className: 'NativeWindow' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       staticGetters: new Map([
-        // activeWindow: the focused window (the app's initial window when it holds
-        // focus), NULL when no window exists -- see emit.ts's as_win_active. The
-        // NativeWindow wrapper it hands back is the SAME object stage.nativeWindow
-        // returns (AIR's identity), because both go through as_win_wrapper.
-        ['activeWindow', { returnType: { kind: 'object', className: 'NativeWindow' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+        // nativeApplication: the application singleton (AIR's static getter that
+        // Application.NativeApplication resolves through).
         ['nativeApplication', { returnType: { kind: 'object', className: 'NativeApplication' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       setters: new Map([
@@ -3360,6 +3367,305 @@ export class SymbolTable {
       OVERLAY: 'overlay', HARDLIGHT: 'hardlight', SHADER: 'shader',
     });
     constClass('StageQuality', { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', BEST: 'best' });
+
+    // ---- flash.data: local SQL database (phases A-D, docs/zh-cn/flash-data.md) --
+    // The engine is the official SQLite amalgamation (AIR's PLAINTEXT databases ARE
+    // standard SQLite files -- measured, host sqlite3 reads them back), so the
+    // semantics are SQLite's, not a re-invention. The AS3 API layer below is
+    // hand-written; its C is emitted only when a program actually references
+    // flash.data (Emitter.usesSqlite), so a build that never touches a database
+    // never compiles the 9 MB amalgamation. ENCRYPTION IS NOT IMPLEMENTED: a caller
+    // that passes a key gets a LOUD failure and nothing is ever silently written as
+    // plaintext (AGENTS.md 1.5).
+    constClass('SQLMode', { CREATE: 'create', READ: 'read', UPDATE: 'update' });
+    constClass('SQLColumnNameStyle', { DEFAULT: 'default', LONG: 'long', SHORT: 'short' });
+    constClass('SQLTransactionLockType', { DEFERRED: 'deferred', EXCLUSIVE: 'exclusive', IMMEDIATE: 'immediate' });
+    constClass('SQLCollationType', { BINARY: 'binary', NO_CASE: 'noCase' });
+    {
+      const objT = (c: string): CType => ({ kind: 'object', className: c });
+      const sqf = (owner: string, t: CType, vis: 'public' | 'private' = 'private'): FieldInfo => ({ type: t, init: null, visibility: vis, owner, isStatic: false, isConst: false });
+      const sp = (name: string, type: string, def: Expr | null = null): Param => ({ name, type, defaultValue: def, isRest: false });
+      const sm = (owner: string, ret: CType, params: Param[] = []): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+      const sg = (owner: string, ret: CType, isStatic = false): MethodInfo => ({ returnType: ret, params: [], owner, visibility: 'public', isStatic, isFinal: false, isGetter: true, isSetter: false });
+      const ss = (owner: string, type: string): MethodInfo => ({ returnType: { kind: 'void' }, params: [sp('value', type)], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+      const nul: Expr = { kind: 'Null' };
+
+      // SQLConnection: a sqlite3* handle plus the state AIR reports. Every other
+      // value AIR exposes (pageSize / cacheSize / totalChanges / lastInsertRowID /
+      // inTransaction) is read from the ENGINE on demand, because adl reports 0 or
+      // false for all of them while the connection is not open (measured).
+      this.classMap.set('SQLConnection', {
+        fields: new Map<string, FieldInfo>([
+          ['_db', sqf('SQLConnection', { kind: 'null' })],
+          ['_connected', sqf('SQLConnection', { kind: 'bool' })],
+          ['_autoCompact', sqf('SQLConnection', { kind: 'bool' })],
+          ['_nameStyle', sqf('SQLConnection', { kind: 'string' })],
+          // AIR's own "a transaction has been started" flag: begin()/setSavepoint()
+          // set it, commit()/rollback() clear it. It is what separates the PLAIN
+          // #3105 (no transaction at all) from a #3115 that comes from the engine
+          // after a setSavepoint+releaseSavepoint (measured, temp/sql2 round 7).
+          ['_sawTxn', sqf('SQLConnection', { kind: 'bool' })],
+          // loadSchema() results, a FIFO queue: AIR's getSchemaResult() pops one
+          // SQLSchemaResult per call and returns null once drained (measured).
+          ['_schemaQueue', sqf('SQLConnection', { kind: 'array' })],
+        ]),
+        methods: new Map<string, MethodInfo>([
+          ['open', sm('SQLConnection', { kind: 'void' }, [sp('reference', 'Object', nul), sp('openMode', 'String', { kind: 'Str', value: 'create' }), sp('autoCompact', 'Boolean', { kind: 'Bool', value: false }), sp('pageSize', 'int', { kind: 'Num', value: 1024, isInt: true }), sp('encryptionKey', 'ByteArray', nul)])],
+          ['openAsync', sm('SQLConnection', { kind: 'void' }, [sp('reference', 'Object', nul), sp('openMode', 'String', { kind: 'Str', value: 'create' }), sp('responder', 'Object', nul), sp('autoCompact', 'Boolean', { kind: 'Bool', value: false }), sp('pageSize', 'int', { kind: 'Num', value: 1024, isInt: true }), sp('encryptionKey', 'ByteArray', nul)])],
+          ['close', sm('SQLConnection', { kind: 'void' }, [sp('responder', 'Object', nul)])],
+          ['begin', sm('SQLConnection', { kind: 'void' }, [sp('option', 'String', nul), sp('responder', 'Object', nul)])],
+          ['commit', sm('SQLConnection', { kind: 'void' }, [sp('responder', 'Object', nul)])],
+          ['rollback', sm('SQLConnection', { kind: 'void' }, [sp('responder', 'Object', nul)])],
+          ['compact', sm('SQLConnection', { kind: 'void' }, [sp('responder', 'Object', nul)])],
+          ['analyze', sm('SQLConnection', { kind: 'void' }, [sp('resourceName', 'String', nul), sp('responder', 'Object', nul)])],
+          ['deanalyze', sm('SQLConnection', { kind: 'void' }, [sp('responder', 'Object', nul)])],
+          ['cancel', sm('SQLConnection', { kind: 'void' }, [sp('responder', 'Object', nul)])],
+          ['attach', sm('SQLConnection', { kind: 'void' }, [sp('name', 'String', nul), sp('reference', 'Object', nul), sp('responder', 'Object', nul), sp('encryptionKey', 'ByteArray', nul)])],
+          ['detach', sm('SQLConnection', { kind: 'void' }, [sp('name', 'String', nul), sp('responder', 'Object', nul)])],
+          ['loadSchema', sm('SQLConnection', { kind: 'void' }, [sp('type', 'Class', nul), sp('name', 'String', nul), sp('database', 'String', { kind: 'Str', value: 'main' }), sp('includeColumnSchema', 'Boolean', { kind: 'Bool', value: true }), sp('responder', 'Object', nul)])],
+          ['getSchemaResult', sm('SQLConnection', objT('SQLSchemaResult'))],
+          ['setSavepoint', sm('SQLConnection', { kind: 'void' }, [sp('name', 'String', nul), sp('responder', 'Object', nul)])],
+          ['releaseSavepoint', sm('SQLConnection', { kind: 'void' }, [sp('name', 'String', nul), sp('responder', 'Object', nul)])],
+          ['rollbackToSavepoint', sm('SQLConnection', { kind: 'void' }, [sp('name', 'String', nul), sp('responder', 'Object', nul)])],
+          ['reencrypt', sm('SQLConnection', { kind: 'void' }, [sp('newEncryptionKey', 'ByteArray', nul), sp('responder', 'Object', nul)])],
+        ]),
+        staticFields: new Map(),
+        staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([
+          ['autoCompact', sg('SQLConnection', { kind: 'bool' })],
+          ['cacheSize', sg('SQLConnection', { kind: 'uint' })],
+          ['columnNameStyle', sg('SQLConnection', { kind: 'string' })],
+          ['connected', sg('SQLConnection', { kind: 'bool' })],
+          ['inTransaction', sg('SQLConnection', { kind: 'bool' })],
+          ['lastInsertRowID', sg('SQLConnection', { kind: 'number' })],
+          ['pageSize', sg('SQLConnection', { kind: 'uint' })],
+          ['totalChanges', sg('SQLConnection', { kind: 'number' })],
+        ]),
+        setters: new Map<string, MethodInfo>([
+          ['cacheSize', ss('SQLConnection', 'uint')],
+          ['columnNameStyle', ss('SQLConnection', 'String')],
+        ]),
+        staticGetters: new Map<string, MethodInfo>([
+          ['isSupported', sg('SQLConnection', { kind: 'bool' }, true)],
+        ]),
+        constructor: { params: [] },
+        superClass: 'EventDispatcher',
+        isFinal: false,
+        implements: [],
+        reflectFqn: 'flash.data::SQLConnection',
+      });
+
+      // SQLStatement: text + parameters + connection, execution and result.
+      // `parameters` is READ-ONLY in AIR (measured on adl 51.4.1: assigning it is a
+      // compile error "property parameters is read-only"); callers mutate the Object
+      // that the getter returns and reset it with clearParameters(). The result is a
+      // FIFO QUEUE (`_queue`) because AIR's getResult() pops one SQLResult per call
+      // and returns null once the queue is empty (measured: calling it twice in one
+      // expression yields null the second time).
+      this.classMap.set('SQLStatement', {
+        fields: new Map<string, FieldInfo>([
+          ['_conn', sqf('SQLStatement', objT('SQLConnection'))],
+          ['_text', sqf('SQLStatement', { kind: 'string' })],
+          ['_params', sqf('SQLStatement', objT('Object'))],
+          ['_itemClass', sqf('SQLStatement', { kind: 'class' })],
+          ['_executing', sqf('SQLStatement', { kind: 'bool' })],
+          ['_complete', sqf('SQLStatement', { kind: 'bool' })],
+          ['_queue', sqf('SQLStatement', { kind: 'array' })],
+          ['_stmt', sqf('SQLStatement', { kind: 'null' })],
+        ]),
+        methods: new Map<string, MethodInfo>([
+          ['execute', sm('SQLStatement', { kind: 'void' }, [sp('prefetch', 'int', { kind: 'Num', value: -1, isInt: true }), sp('responder', 'Object', nul)])],
+          ['next', sm('SQLStatement', { kind: 'void' }, [sp('prefetch', 'int', { kind: 'Num', value: -1, isInt: true }), sp('responder', 'Object', nul)])],
+          ['cancel', sm('SQLStatement', { kind: 'void' }, [sp('responder', 'Object', nul)])],
+          ['clearParameters', sm('SQLStatement', { kind: 'void' })],
+          ['getResult', sm('SQLStatement', objT('SQLResult'))],
+        ]),
+        staticFields: new Map(),
+        staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([
+          ['executing', sg('SQLStatement', { kind: 'bool' })],
+          ['parameters', sg('SQLStatement', objT('Object'))],
+          ['sqlConnection', sg('SQLStatement', objT('SQLConnection'))],
+          ['itemClass', sg('SQLStatement', { kind: 'class' })],
+          ['text', sg('SQLStatement', { kind: 'string' })],
+        ]),
+        setters: new Map<string, MethodInfo>([
+          ['sqlConnection', ss('SQLStatement', 'SQLConnection')],
+          ['itemClass', ss('SQLStatement', 'Class')],
+          ['text', ss('SQLStatement', 'String')],
+        ]),
+        constructor: { params: [] },
+        superClass: 'EventDispatcher',
+        isFinal: false,
+        implements: [],
+        reflectFqn: 'flash.data::SQLStatement',
+      });
+
+      // SQLResult: the outcome of one statement execution.
+      this.classMap.set('SQLResult', {
+        fields: new Map<string, FieldInfo>([
+          ['_data', sqf('SQLResult', { kind: 'array' })],
+          ['_rowsAffected', sqf('SQLResult', { kind: 'number' })],
+          ['_complete', sqf('SQLResult', { kind: 'bool' })],
+          ['_lastInsertRowID', sqf('SQLResult', { kind: 'number' })],
+        ]),
+        methods: new Map(),
+        staticFields: new Map(),
+        staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([
+          ['data', sg('SQLResult', { kind: 'array' })],
+          ['rowsAffected', sg('SQLResult', { kind: 'number' })],
+          ['complete', sg('SQLResult', { kind: 'bool' })],
+          ['lastInsertRowID', sg('SQLResult', { kind: 'number' })],
+        ]),
+        setters: new Map(),
+        constructor: { params: [
+          sp('data', 'Array', nul),
+          sp('rowsAffected', 'Number', { kind: 'Num', value: 0, isInt: false }),
+          sp('complete', 'Boolean', { kind: 'Bool', value: true }),
+          sp('lastInsertRowID', 'Number', { kind: 'Num', value: 0, isInt: false }),
+        ] },
+        superClass: 'Object',
+        isFinal: false,
+        implements: [],
+        reflectFqn: 'flash.data::SQLResult',
+      });
+
+      // Schema classes (phase D). AIR's SQLSchema carries database/name/sql itself
+      // (measured with describeType: the BASE class already exposes `sql`), and
+      // SQLViewSchema extends SQLTableSchema rather than the base -- so a
+      // `view is SQLTableSchema` cast holds, as it does under adl.
+      const schemaSub = (name: string, parent: string, extraFields: Array<[string, CType]>, extraGetters: Array<[string, CType]>, ctor: Param[]): void => {
+        this.classMap.set(name, {
+          fields: new Map<string, FieldInfo>(extraFields.map(([n, t]) => [n, sqf(name, t)] as [string, FieldInfo])),
+          methods: new Map(), staticFields: new Map(), staticMethods: new Map(),
+          getters: new Map<string, MethodInfo>(extraGetters.map(([n, t]) => [n, sg(name, t)] as [string, MethodInfo])),
+          setters: new Map(), constructor: { params: ctor }, superClass: parent, isFinal: false, implements: [],
+          reflectFqn: `flash.data::${name}`,
+        });
+      };
+      this.classMap.set('SQLSchema', {
+        fields: new Map<string, FieldInfo>([
+          ['_database', sqf('SQLSchema', { kind: 'string' })],
+          ['_name', sqf('SQLSchema', { kind: 'string' })],
+          ['_sql', sqf('SQLSchema', { kind: 'string' })],
+        ]),
+        methods: new Map(), staticFields: new Map(), staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([
+          ['database', sg('SQLSchema', { kind: 'string' })],
+          ['name', sg('SQLSchema', { kind: 'string' })],
+          ['sql', sg('SQLSchema', { kind: 'string' })],
+        ]),
+        setters: new Map(),
+        constructor: { params: [sp('database', 'String', nul), sp('name', 'String', nul), sp('sql', 'String', nul)] },
+        superClass: 'Object', isFinal: false, implements: [],
+        reflectFqn: 'flash.data::SQLSchema',
+      });
+      schemaSub('SQLTableSchema', 'SQLSchema', [['_columns', { kind: 'array' }]], [['columns', { kind: 'array' }]],
+        [sp('database', 'String', nul), sp('name', 'String', nul), sp('sql', 'String', nul), sp('columns', 'Array', nul)]);
+      // SQLViewSchema re-declares the two getters (the vtable needs its own slots) but
+      // inherits the fields, so the C bodies forward to the SQLTableSchema layout.
+      schemaSub('SQLViewSchema', 'SQLTableSchema', [], [['columns', { kind: 'array' }], ['sql', { kind: 'string' }]],
+        [sp('database', 'String', nul), sp('name', 'String', nul), sp('sql', 'String', nul), sp('columns', 'Array', nul)]);
+      schemaSub('SQLIndexSchema', 'SQLSchema', [['_table', { kind: 'string' }]], [['table', { kind: 'string' }]],
+        [sp('database', 'String', nul), sp('name', 'String', nul), sp('sql', 'String', nul), sp('table', 'String', nul)]);
+      schemaSub('SQLTriggerSchema', 'SQLSchema', [['_table', { kind: 'string' }]], [['table', { kind: 'string' }]],
+        [sp('database', 'String', nul), sp('name', 'String', nul), sp('sql', 'String', nul), sp('table', 'String', nul)]);
+      this.classMap.set('SQLColumnSchema', {
+        fields: new Map<string, FieldInfo>([
+          ['_name', sqf('SQLColumnSchema', { kind: 'string' })],
+          ['_primaryKey', sqf('SQLColumnSchema', { kind: 'bool' })],
+          ['_allowNull', sqf('SQLColumnSchema', { kind: 'bool' })],
+          ['_autoIncrement', sqf('SQLColumnSchema', { kind: 'bool' })],
+          ['_dataType', sqf('SQLColumnSchema', { kind: 'string' })],
+          ['_defaultCollationType', sqf('SQLColumnSchema', { kind: 'string' })],
+        ]),
+        methods: new Map(), staticFields: new Map(), staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([
+          ['name', sg('SQLColumnSchema', { kind: 'string' })],
+          ['primaryKey', sg('SQLColumnSchema', { kind: 'bool' })],
+          ['allowNull', sg('SQLColumnSchema', { kind: 'bool' })],
+          ['autoIncrement', sg('SQLColumnSchema', { kind: 'bool' })],
+          ['dataType', sg('SQLColumnSchema', { kind: 'string' })],
+          ['defaultCollationType', sg('SQLColumnSchema', { kind: 'string' })],
+        ]),
+        setters: new Map(), constructor: { params: [
+          sp('name', 'String', nul),
+          sp('primaryKey', 'Boolean', { kind: 'Bool', value: false }),
+          sp('allowNull', 'Boolean', { kind: 'Bool', value: true }),
+          sp('autoIncrement', 'Boolean', { kind: 'Bool', value: false }),
+          sp('dataType', 'String', nul),
+          sp('defaultCollationType', 'String', { kind: 'Str', value: 'binary' }),
+        ] }, superClass: 'Object', isFinal: false, implements: [],
+        reflectFqn: 'flash.data::SQLColumnSchema',
+      });
+      this.classMap.set('SQLSchemaResult', {
+        fields: new Map<string, FieldInfo>([
+          ['_tables', sqf('SQLSchemaResult', { kind: 'array' })],
+          ['_views', sqf('SQLSchemaResult', { kind: 'array' })],
+          ['_indices', sqf('SQLSchemaResult', { kind: 'array' })],
+          ['_triggers', sqf('SQLSchemaResult', { kind: 'array' })],
+        ]),
+        methods: new Map(), staticFields: new Map(), staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([
+          ['tables', sg('SQLSchemaResult', { kind: 'array' })],
+          ['views', sg('SQLSchemaResult', { kind: 'array' })],
+          ['indices', sg('SQLSchemaResult', { kind: 'array' })],
+          ['triggers', sg('SQLSchemaResult', { kind: 'array' })],
+        ]),
+        setters: new Map(), constructor: { params: [
+          sp('tables', 'Array', nul),
+          sp('views', 'Array', nul),
+          sp('indices', 'Array', nul),
+          sp('triggers', 'Array', nul),
+        ] }, superClass: 'Object', isFinal: false, implements: [],
+        reflectFqn: 'flash.data::SQLSchemaResult',
+      });
+
+      // flash.events.SQLEvent / SQLUpdateEvent / SQLErrorEvent.
+      const evConst = (owner: string, value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true });
+      const evParams = (): Param[] => [
+        sp('type', 'String', nul),
+        sp('bubbles', 'Boolean', { kind: 'Bool', value: false }),
+        sp('cancelable', 'Boolean', { kind: 'Bool', value: false }),
+      ];
+      this.classMap.set('SQLEvent', {
+        fields: new Map(), methods: new Map(),
+        staticFields: new Map<string, FieldInfo>(['OPEN', 'CLOSE', 'RESULT', 'BEGIN', 'COMMIT', 'ROLLBACK', 'ANALYZE', 'COMPACT', 'DEANALYZE', 'REENCRYPT', 'CANCEL', 'ATTACH', 'DETACH', 'SCHEMA', 'SET_SAVEPOINT', 'RELEASE_SAVEPOINT', 'ROLLBACK_TO_SAVEPOINT'].map((k) => {
+          const v = k === 'SET_SAVEPOINT' ? 'setSavepoint' : k === 'RELEASE_SAVEPOINT' ? 'releaseSavepoint' : k === 'ROLLBACK_TO_SAVEPOINT' ? 'rollbackToSavepoint' : k.toLowerCase();
+          return [k, evConst('SQLEvent', v)] as [string, FieldInfo];
+        })),
+        staticMethods: new Map(), getters: new Map(), setters: new Map(),
+        constructor: { params: evParams() }, superClass: 'Event', isFinal: false, implements: [],
+        reflectFqn: 'flash.events::SQLEvent',
+      });
+      this.classMap.set('SQLUpdateEvent', {
+        fields: new Map<string, FieldInfo>([
+          ['_rowID', sqf('SQLUpdateEvent', { kind: 'number' })],
+          ['_table', sqf('SQLUpdateEvent', { kind: 'string' })],
+        ]), methods: new Map(),
+        staticFields: new Map<string, FieldInfo>([['INSERT', evConst('SQLUpdateEvent', 'insert')], ['DELETE', evConst('SQLUpdateEvent', 'delete')], ['UPDATE', evConst('SQLUpdateEvent', 'update')]]),
+        staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([['rowID', sg('SQLUpdateEvent', { kind: 'number' })], ['table', sg('SQLUpdateEvent', { kind: 'string' })]]),
+        setters: new Map(),
+        constructor: { params: [sp('type', 'String', nul), sp('bubbles', 'Boolean', { kind: 'Bool', value: false }), sp('cancelable', 'Boolean', { kind: 'Bool', value: false }), sp('rowID', 'Number', { kind: 'Num', value: 0, isInt: false }), sp('table', 'String', nul)] },
+        superClass: 'Event', isFinal: false, implements: [], reflectFqn: 'flash.events::SQLUpdateEvent',
+      });
+      this.classMap.set('SQLErrorEvent', {
+        fields: new Map<string, FieldInfo>([['_error', sqf('SQLErrorEvent', objT('SQLError'))]]),
+        methods: new Map(),
+        staticFields: new Map<string, FieldInfo>([['ERROR', evConst('SQLErrorEvent', 'error')]]),
+        staticMethods: new Map(),
+        getters: new Map<string, MethodInfo>([['error', sg('SQLErrorEvent', objT('SQLError'))]]),
+        setters: new Map(),
+        constructor: { params: [sp('type', 'String', nul), sp('bubbles', 'Boolean', { kind: 'Bool', value: false }), sp('cancelable', 'Boolean', { kind: 'Bool', value: false }), sp('error', 'Object', nul)] },
+        // AIR's SQLErrorEvent extends ErrorEvent (measured with describeType:
+        // "flash.events::SQLErrorEvent extends flash.events::ErrorEvent"), and its
+        // inherited text/errorID carry the error's message and id (measured on adl:
+        // text="Error #3125: Unable to open the database file.", errorID=3125).
+        superClass: 'ErrorEvent', isFinal: false, implements: [], reflectFqn: 'flash.events::SQLErrorEvent',
+      });
+    }
     // flash.display.PixelSnapping: the three String values for Bitmap.pixelSnapping
     // (values verified against the AIR 3.0 reference, which also documents
     // PixelSnapping.AUTO as the property's default -- see the Bitmap field below).

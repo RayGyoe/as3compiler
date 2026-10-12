@@ -73,7 +73,10 @@ check(Keyboard.A == 65 && Keyboard.Z == 90, "Keyboard A/Z key codes");
 check(Keyboard.NUMBER_0 == 48 && Keyboard.NUMBER_9 == 57, "Keyboard 0/9 key codes");
 check(Keyboard.SPACE == 32 && Keyboard.ENTER == 13, "Keyboard SPACE/ENTER key codes");
 check(Keyboard.LEFT == 37 && Keyboard.UP == 38 && Keyboard.RIGHT == 39 && Keyboard.DOWN == 40, "Keyboard arrow key codes");
-check(Keyboard.isAccessible == true, "Keyboard.isAccessible true");
+// AIR's Keyboard.isAccessible is a METHOD, not a field (measured on adl 51.4.1:
+// `Keyboard.isAccessible` without parens is a Function and describeType reports a
+// `method` with returnType Boolean, while `Keyboard.isAccessible()` is true).
+check(Keyboard.isAccessible() == true, "Keyboard.isAccessible true");
 
 // --- Mouse: static hide/show + cursor/supportsCursor ---
 Mouse.hide();

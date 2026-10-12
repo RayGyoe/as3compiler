@@ -1,0 +1,4 @@
+{
+  "wasm": "sqlite-basic.wasm",
+  "exports": []
+}

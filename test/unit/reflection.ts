@@ -306,6 +306,71 @@ function checkClassValueOperand(): string[] {
 
 registerGroup('unit: reflection/ClassValueOperand', checkClassValueOperand);
 
+// ---- static members reached through a Class VALUE (stage 一百三十八) ----
+// AIR resolves `classValue.member` against the class's STATIC traits, including a
+// computed static getter (which it INVOKES). Measured on adl 51.4.1
+// (temp/adlprobe/adl.txt section 1): a Class value static getter reads THING, a
+// static var reads PLAIN, a static const reads KONST and a static method reads HI.
+// Before this fix the getter row carried no address, so the read fell through to
+// "not supported by this subset" (a bare Error id=0), and a BUILT-IN class's class
+// object never wired its statics table at all (so `clazz.nativeApplication` read
+// undefined and the caller's branch was silently skipped).
+function checkClassStaticMember(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [clsmem] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [clsmem] ${label}`); }
+  };
+  const src = 'class Holder {\n'
+    + '  public static function get thing():String { return "THING"; }\n'
+    + '  public static var plain:String = "PLAIN";\n'
+    + '  public static const KONST:String = "KONST";\n'
+    + '  public static function greet():String { return "HI"; }\n'
+    + '}\n'
+    + 'var c:Class = Holder;\n'
+    + 'var a:String = c.thing;\n'
+    + 'var b:String = c.plain;\n'
+    + 'var d:String = c.KONST;\n'
+    + 'var e:String = c.greet();\n';
+  const c = generateC(parse(src)).c;
+
+  check('a Class-value member read goes through as_class_member_value',
+    c.includes('as_class_member_value((as_class*)'));
+  check('a static getter gets a kind 3 row pointing at a boxed thunk',
+    /\{ "thing", 3, Holder__statget_thing, 0, NULL, 0, (NULL|Holder_cinit) \}/.test(c));
+  check('the thunk invokes the _static getter and boxes its result',
+    c.includes('static as_value Holder__statget_thing(void* env, as_value* args, int argc) {')
+    && c.includes('return as_v_str(Holder_get_thing_static(NULL));'));
+  check('a static var/const keeps its addressed kind 2 slot',
+    /\{ "plain", 2, NULL, 0, \(void\*\)&Holder_plain, 5, /.test(c)
+    && /\{ "KONST", 2, NULL, 0, \(void\*\)&Holder_KONST, 5, /.test(c));
+  check('a static method keeps its boxed __call thunk (kind 1)',
+    /\{ "greet", 1, Holder_greet__call, 0 \}/.test(c));
+  check('the runtime dispatches kind 3 by INVOKING the accessor thunk',
+    c.includes('if (e->kind == 3) { if (e->cinit != NULL) e->cinit(); return e->fn(NULL, NULL, 0); }'));
+  // A BUILT-IN class object must carry its statics table: this is what makes
+  // `Application.NativeApplication`'s `myClass.nativeApplication` resolve instead
+  // of returning undefined (the branch that used to be silently skipped).
+  const c2 = generateC(parse('var c:Class = null;\nvar n:Object = c.nativeApplication;\n')).c;
+  check('a built-in class object wires its static-member table',
+    /static as_class NativeApplication_cls = \{ &NativeApplication_vt, NULL, NULL, "flash\.desktop::NativeApplication", 0, NativeApplication_statics \};/.test(c2));
+  check('the built-in static getter row is kind 3 (computed, invoked)',
+    /\{ "nativeApplication", 3, NativeApplication__statget_nativeApplication, 0, NULL, 0, /.test(c2));
+  check('the struct documents kind 3 as a computed static',
+    RUNTIME_PREAMBLE.includes('kind 3 is a COMPUTED static (getter/setter pair)'));
+  // activeWindow is an INSTANCE property: AIR's own compiler rejects the static
+  // form (mxmlc 51.4.1, temp/awprobe/Aw.as), and the C getter was always the
+  // instance shape.
+  check('activeWindow is declared as an instance getter, not a static one',
+    /\n\s*\['activeWindow', \{ returnType: \{ kind: 'object', className: 'NativeWindow' \}, params: \[\], owner: 'NativeApplication', visibility: 'public', isStatic: false/.test(readFileSync(join(root, 'src', 'symbols.ts'), 'utf8')));
+
+  if (ok > 0) console.log(`[clsmem] ${ok} class-static-member checks passed`);
+  return bad;
+}
+
+registerGroup('unit: reflection/ClassStaticMember', checkClassStaticMember);
+
 // ---- the operand of a dynamic instantiation (stage 一百二十二) ----
 // `new <expr>()` is legal whenever the operand CAN carry a Class, which is not
 // only the `class`-typed spelling: an Array/Vector element is `any` (it boxes) and

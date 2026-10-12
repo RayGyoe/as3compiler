@@ -504,7 +504,7 @@ function checkRuntimeGcSizeClasses(): string[] {
   check('a class block is released under its true size, mid/big split at GC_BIG_CLASS',
     flat.includes('int i = gc_small_class(size); if (i >= 0) return &gc_free_small[i]; return size >= GC_BIG_CLASS ? &gc_free_big : &gc_free_mid;'));
   check('allocation re-checks h->size >= size while walking a class',
-    flat.includes('for (gc_header* h = *list; h != NULL; prev = h, h = h->next) { gc_audit_gate("free-list node", h); if (h->size >= size) { *out_head = list; *out_prev = prev; return h; } }'));
+    flat.includes('for (gc_header* h = *list; h != NULL; prev = h, h = h->next) { if (gc_audit_mode_cache != 0) gc_audit_gate("free-list node", h); if (h->size >= size) { *out_head = list; *out_prev = prev; return h; } }'));
   check('a small request climbs from its own class; a big request only uses the big list',
     flat.includes('bool big = size >= GC_BIG_CLASS; int first = big ? GC_SMALL_CLASSES + 1 : gc_small_class(size);')
     && flat.includes('if (!big && first < 0) first = GC_SMALL_CLASSES;')

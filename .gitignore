@@ -10,6 +10,15 @@ node_modules/
 *.wasm
 build/
 
+# ...but hand-written / vendored C sources ARE tracked build INPUTS, exactly like
+# the vendor/**.cc and vendor/**.mm glue files (which the *.c rule never touched):
+# the SQLite amalgamation engine + its glue, and the CoreAudio / SystemConfiguration
+# backends. Without this the flash.data engine would silently stay out of the repo
+# and a fresh clone could not build it. shell.c is the amalgamation's CLI (it ships
+# its own main()) and our build never compiles it, so it stays out on purpose.
+!vendor/**/*.c
+vendor/sqlite/shell.c
+
 # Compiled example executables (extensionless, generated from the same-named .as).
 # Keep the .as sources and the build-manifest / exporter configs.
 examples/*

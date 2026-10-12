@@ -1470,7 +1470,7 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 - [ ] **Window**/**NativeWindow**（对应 `window_glue.cc` 的多窗口/原生窗口管理，**2026-10-02 已实现**——多窗口运行时注册表、每窗独立 `Stage` 与 `Event.CLOSE` 见 **阶段八十九·七十一**，其关闭窗口崩溃的布局缺陷见 **阶段八十九·七十二**；`Window`（`flash.desktop` 的包装）仍延后）
 - [x] **File**/**FileStream**（`open`/`openAsync`（异步 PROGRESS+COMPLETE）/`read`/`write`，POSIX 文件 IO；静态目录 `applicationDirectory`/`desktopDirectory`/`documentsDirectory`/`userDirectory`）/ **FileMode**（常量）
-- [ ] **SQLConnection**/**SQLStatement**（依赖 SQLite 链接，延后）
+- [ ] **SQLConnection**/**SQLStatement**（依赖 SQLite 链接，延后）—— **2026-10-12 选型已定**：引擎链接**官方 SQLite amalgamation**（实测锁定：AIR 的**明文**库就是标准 SQLite 文件、加密库是私有格式），**加密不做**（传密钥时**响亮报明**，绝不静默写明文）。分阶段路线与全部双端实测证据见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md)。**前置**：先修「**`Class` 值的静态 getter 分派缺失**」（否则目标应用的 SQLite 分支**永不进入** + 可达 `#1009`），见 `TODO.md` 的 `### 遗留待开发`
 
 **验收**：`examples/stage64.as`（离屏）断言 `File` 路径束与 `exists`/`isDirectory`/`resolvePath`/`createDirectory`/`deleteFile`/`deleteDirectory` + 静态目录、
 `FileStream` `open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` 读写回环与只读 `position`/`bytesAvailable`、`FileMode` 常量。✅（73 passed / 0 failed；
@@ -8207,14 +8207,205 @@ compile+link only)`，用**用户的命令形态**编译+链接（带 `--run` �
 
 ---
 
+### 阶段一百三十九：`flash.data` / SQLite 本地数据库族（A–D 全量落地）（v0.4.109 → v0.4.110）✅ 已完成
+
+> **立项**：`docs/zh-cn/flash-data.md`（2026-10-12 选型评估）。**前置**：阶段一百三十八（同轮落地，见下）。
+> **交付**：官方 SQLite amalgamation 3.54.0 链接进产物 + `flash.data` 的 **A–D 四阶段全量 API**
+> （`open`/`execute`/结果集/`prefetch`/事件与错误号矩阵/事务与模式对象），**E 加密明确不做**（响亮报错）。
+
+**与 `adl 51.4.1` 的验收关系**：本阶段**全程用 AIR 当 oracle** —— 把每个 `examples/sqlite-*.as` 经
+`temp/sql3/gen_oracle.py` 改写成 `adl` harness（`run_adl.sh`），**同一份断言式检查在 AIR 上跑到全绿**
+才算这条行为「已对齐」；AIR 侧另有 11 轮（`temp/sql2/`）纯探针，专门逼出文档没写的行为（见 ADR §10.2）。
+
+**落地物**：
+
+| 文件 | 内容 |
+|---|---|
+| `vendor/sqlite/{sqlite3.c,sqlite3.h,sqlite3ext.h}` | 官方 amalgamation 3.54.0（public domain），**只作构建清单 `sources` 引用**（`shell.c` 是自带的 CLI、构建不编译，刻意不入库） |
+| `vendor/sqlite_glue.c` | 唯一 `#include <sqlite3.h>` 的翻译单元，对生成 C 暴露窄 `as_sql_*` ABI（open/exec/prepare/bind/step/column/changes/errcode/errmsg/txn_state/… + update-hook 逐行变更记录） |
+| `src/runtime.ts` | `as_sql_*` 声明 + **未链接时的响亮桩**（`#ifdef ASC_HAVE_SQLITE` 两分支；桩报「本构建没接 SQLite 引擎」而非假装建库） |
+| `src/symbols.ts` | `flash.data`（4 常量类 + `SQLConnection`/`SQLStatement`/`SQLResult`/7 个模式类）、`flash.errors.SQLError`、`flash.events.SQL{Event,UpdateEvent,ErrorEvent}` 的类骨架与成员表 |
+| `src/emit.ts` | `flash.data` 的 AS3→C 实现（手写 C 块 ≈1,600 行）+ `SQLError` 公开构造器（`(message, id=0)`） |
+| `src/index.ts` | `usesFlashData` 探测（含 `--air-app` 引导/闭包文本）→ 自动入 `sources`/`include-paths`/`ASC_HAVE_SQLITE`/`SQLITE_ENABLE_COLUMN_METADATA`（wasm 另加 `SQLITE_THREADSAFE=0`）；未引用则**完全不链接** |
+| `examples/sqlite-{basic,phase-b,phase-c,phase-d}.as` | 四阶段端到端示例（native + wasm + adl oracle 三端全绿） |
+| `test/unit/flash-data.ts` | 7 组钉子：离线桩 / 错误族二分 / 语句契约 / prefetch 模型 / 模式对象 / **构建接线**（走 `--air-app --dry` CLI 读 stdout）/ oracle 形状 |
+
+**关键实测口径**（详见 ADR §10.2，均为 `adl` 测出、文档未写或与文档不符）：`prefetch` 的
+`-1`/`>0`/`0` 三态与「空块恒 `data == null`」；`text` 初值**空串**而赋 `null` 抛 `TypeError #1009`；
+`itemClass` 初值 **`Object` 类**而赋 `null` 被接受；`getResult`/`getSchemaResult` 是 **FIFO 队列**；
+`loadSchema` 没命中是**报错**（`#3115` + `detailID` **1007/1009/1010** 三态文案）；
+只列用户对象（`sqlite_*` 与约束自动索引不列）；`columns` 在 `includeColumnSchema=false` 时是**空数组**；
+`SQLViewSchema extends SQLTableSchema`；**默认 `pageSize` = 1024**；`#3103` 的判据是 **`inTransaction`**
+（不是裸 autocommit）；无名保存点 = **空串**；`SQLUpdateEvent` 由 **`SQLConnection` 逐行**派发且早于
+`result`；`cancel()` **不派发事件**；`execute()` 在游标未走完时**合法**。
+
+**刻意保留的偏差（全部响亮，ADR §10.3）**：加密 = `SQLError #3138`（绝不静默写明文）；
+`details`/`detailID` 用 SQLite 原文（AIR 会改写文案，错误号与三态文案逐字复刻）；
+`attach(name, null)` AIR 静默接受而我们响亮报错；`openAsync()` 内部仍同步；
+`columnNameStyle="default"` 维持短名；`defaultCollationType` 恒 `"binary"`；
+`FileStream`/`ByteArray.reference` 不作 `open`/`attach` 目标；`#2008` 未逐字实测。
+
+**同轮撞出并修掉的既有限制（非 `flash.data` 引入）**：`as_rmdir_one` 在非 Windows 分支调 `rmdir()`，
+而 `<unistd.h>` **在 WASI 下被刻意跳过** ⇒ **每个** `--target wasm` 构建都死于
+`call to undeclared function 'rmdir'`（含 `examples/hello.as`）；改为 `remove()`（POSIX/wasi-libc
+对目录同样按 rmdir 处理），见 `docs/zh-cn/win32.md` §2.7。
+
+**WASI 目标结论**：**不需要**自写 VFS 或 `-DSQLITE_OS_OTHER`——wasi-libc 的 POSIX 文件面足够
+SQLite 的 unix VFS，四个示例在 Node 24 的 `node:wasi`（`temp/wasirun.mjs`）下全绿，产物库文件与
+native/AIR 同尺寸（3072 B / `page_size` 1024）。
+
+**遗留表**：移出 1 行（`Class` 值的静态 getter 分派缺失 —— 由同轮**阶段一百三十八**修掉，
+`examples/class-static-member.as` + `unit: reflection/ClassStaticMember`）、移出 1 行（`flash.data`/SQLite
+未实现 → 本轮 A–D 落地）、**新登记 1 行**（加密数据库仍不支持，`adl` 有而我们没有 ⇒ 属欠账，不入增强表）。
+
+### 阶段一百三十八：`Class` 值静态 getter 分派修复（`flash.data` 前置）（v0.4.108 → v0.4.109）✅ 已完成
+
+`var c:Class = X; c.someStaticGetter` 原抛**裸 `Error id=0`**（无需 `#` 号、无行列），而 `adl` 正常
+返回值：`Application.NativeApplication` 正是静态 getter（`myClass.nativeApplication`），返回 `NULL`
+导致目标应用 `if (Application.NativeApplication)` 整支被跳过 ⇒ `flash.data` 路径永不执行、随后
+未判空解引用硬崩 `#1009`。
+
+**修法**：`as_class` 增加 kind-3 静态成员行（`as_class_static`，`src/runtime.ts`）；`emitClassRegistry`
+为每个静态 getter 发一枚**装箱 thunk** `${name}__statget_${mname}` + kind-3 行，`clsDecls` 把
+`${staticTables.get(name) ?? 'NULL'}` 接上；`cinit` 顺序由 `collectCinitClasses()` 保证；
+`NativeApplication.activeWindow` 归位到 `getters`（`src/symbols.ts`）。
+**验收**：`unit: reflection/ClassStaticMember`（四条静态成员 × 经 Class 值取）+ `examples/class-static-member.as`。
+
+### 阶段一百四十：`array` 基准 +52% 回退的根因修复（`as_add_v` 数值快路径）+ 内联退化护栏（v0.4.110 → v0.4.111）✅ 已完成
+
+**背景**：基准重跑（v0.4.93 → v0.4.110，中间 17 个版本无基准记录）发现 **3 处真实回退**，以 **C 归一化比值 AOT/C**
+判定（`C`/`JS`/`AIR` 三路与本编译器无关，其跨轮漂移即机器状态读数，故用它抵消机器漂移）：
+`array` 5.90 → **8.95（+52%，最严重）**、`binarytrees` 1.43 → 1.62（+13%）、`strings` 2.59 → 2.91（+12%）；
+其余 5 项达标。
+
+**一、`array` 根因（C 层坐实）**：热循环 `sum += a[j]` 的生成 C 是
+`as_v_int_cast(as_add_v(as_v_num(g_sum), as_array_get(...)))`。**阶段一百三十四（commit `66b065c`）**
+给 `as_v_to_number` 加了 `tag==4 → as_obj_to_number` 与 `tag 5/7 → NAN` 两个分支，clang 内联代价升到
+**250 > 阈值 225**，于是 `as_add_v`（本身被内联进 `main`）对**两个操作数**都发外联调用。
+**反汇编实证**：`main` 里 `bl _as_v_to_number` **2 个**（修复后 **1 个** —— 只剩真正动态的数组元素），
+2000 万次循环 = **4000 万次外联调用**。**同 C 层 A/B**（同一份生成 C，只改这一处）：还原旧形态
+（`as_v_to_number(a) + as_v_to_number(b)`）→ 191–192 ms；修复版 → **118–119 ms**（回到 v0.4.93 的 118 ms），
+`result=959996015` 不变。
+
+**二、修法**：照搬项目既有的 `as_v_int_cast` 可内联包装模式，给 `as_add_v` 的数值分支加 tag 1/2 快路径
+（`(a.tag == 1 || a.tag == 2) ? a.num : as_v_to_number(a)`，两个操作数各一），使静态已知 Number 的操作数被 clang
+**折叠**、只有真正动态的一侧仍外联。**语义等价**：tag 1/2 就是 `as_v_to_number` 自己的前两个分支
+（Number/Boolean 直接读 `num`），其余 tag（String/Array/object/undefined/64 位）仍全部委托它。
+
+**三、内联退化护栏（治本）**：这类陷阱**已第三次出现**（`as_req_obj` 的 `_Noreturn`、`as_v_int_cast`、本次
+`as_v_to_number`/`gc_write_barrier`），而 **examples 套件看不见它** —— 程序照跑、结果照对，只是慢。
+新增 `test/unit/inline.ts`（组 `unit: inline/HotPath`），三层钉子：① **源码钉** —— `as_add_v` 的 tag 1/2
+快路径 + `as_v_int_cast`/`as_v_uint_cast` 的快路径必须在位；② **非空转钉** —— 断言该热循环片段确实经
+`as_add_v` 路由（否则汇编断言会真空通过）；③ **汇编钉** —— `cc -O2 -S` 编译该热循环，断言 `main` 里
+**`as_add_v` 被完全内联**（0 次外联）且 **`as_v_to_number` 外联调用 ≤1**（前缀形态为 2）。
+已用**反向验证**确认它会在回退时变红：还原 `as_add_v` 后源码钉与汇编钉**同时红**（实测计数 = 2）。
+诊断工具：`cc -O2 -S -Rpass-missed=inline x.c 2>&1 | grep as_v_to_number`（Apple clang 21 给出 cost/threshold）。
+
+**四、验收**
+
+| 证据 | 结果 |
+|---|---|
+| 全量回归 `node test.ts` | **295 passed / 0 failed**（含新组 `unit: inline/HotPath`） |
+| 基准 3 批（`python3 benchmarks/run.py`） | 8/8 `OK`，四路 `result` 一致 |
+| `array` | C 归一化 8.95 → **~5.3**（优于基线 5.90；3 批 asc 中位数 122 ms，同期 C 列 +15%） |
+| `binarytrees` / `strings` | 仍 +13% / +8.5% —— **与 `array` 不同源**，见下「遗留表」 |
+| 版本号 v0.4.110 → **v0.4.111**（`package.json`；纯内部性能修复、**无语义/API 变更** ⇒ `README-CN.md` 无需改） | ✅ |
+
+**遗留表**：**新登记 1 行**（`binarytrees`/`strings` 的 GC 区残差 —— 归因到 `gc_write_barrier` 去内联与 GC 核，
+需独立立项）。**该行已于 v0.4.112（阶段一百四十一）修掉并移出**，见下节。
+
+### 阶段一百四十一：`binarytrees` / `strings` 基准回退的根因修复（v0.4.111 → v0.4.112）✅ 已完成
+
+**背景**：阶段一百四十 把 `array` 的 +52% 修掉后，遗留表里还剩两项**真实回退**（以 C 归一化比值
+AOT/C 判定）：`binarytrees` 1.43 → 1.62（+13%）、`strings` 2.59 → 2.91（+12%）。当时的归因是
+「GC 区残差」，**本轮证明这个合并归因是错的**：两项是**两个独立原因**，且都与「GC 收得太频」无关。
+
+**一、`binarytrees`：`gc_write_barrier` 被 clang 去内联**
+
+`gc_write_barrier` 的函数体**逐字节未变**，但 clang 这一版开始把 `gc_in_heap`（cost 135）内联**进屏障**，
+屏障本体内联代价从 `-35` 变成 **275 > 阈值 225**，于是它的 **584 个调用点全部外联**
+（8 项基准都在 580–590 次）。**反汇编实证**：`make()` 里旧版 0 次、新版 **3 次** `bl _gc_write_barrier`
+（`make` 27 指令 / 3 调用 → 31 指令 / 6 调用）。
+
+**修法（不依赖 `__attribute__`，§2.6）**：拆成「可内联的两行 wrapper + 真正外联的慢路径」，慢路径
+**通过一个 `volatile` 函数指针**抵达。三种方案都实测过，只有第三种成立：
+
+| 方案 | 结果 |
+|---|---|
+| 「小包装 + 普通函数调用慢路径」 | ❌ clang 的「单调用点 static 函数」奖励把慢路径**内联回 wrapper**，代价传递，屏障再次全外联 |
+| 「小包装 + 复用另一个已有调用点」 | ⚠️ 有效但**脆弱**：那个调用点被 DCE 掉（不碰 `Array`/`Dictionary` 的程序）就**静默复发** |
+| **「慢路径经 `volatile` 函数指针」** | ✅ 0 次外联；地址逃逸 ⇒ 永不「只被用一次」，`volatile` 载入 ⇒ 不会 devirtualize |
+
+代价只有热路径多一次可预测比较，间接调用只在 MARK 期间发生（非 GUI 停世界构建里恒不触发）。
+**同 C 层 A/B**（40 轮长跑交替，每轮 5×300k）：旧形态 4.73 s / 新形态 **4.48 s**；
+删掉屏障本体 4.45 s ⇒ 屏障快路径重新变回近似免费。单批基准 118 → **104 ms**。
+
+**二、`strings`：分配热路径上的两笔「白付的钱」**
+
+真因**不是** GC 回收，而是**每次分配的固定开销**。反证：把 `ASC_GC_THRESHOLD` 往上调只会更慢
+（8 MiB 226 ms → 16 MiB 253 → 32 MiB 313 → 128 MiB 895）——本项存活集≈ 0，开销在分配路径，
+故阶段八十九·四十七 的「少收更省」结论**只适用于 `binarytrees` 那副形状**。
+
+- **① `GCT_STRING` 的无用零填充**：`gc_alloc` 清零对象体是为了「未初始化数组槽在标记期读到 tag 0
+  而非野指针」，但 `GCT_STRING` 在 `gc_scan` 里是 **leaf**（`case GCT_STRING: break;`），marker
+  **从不扫描它的字节**；而 `as_str_alloc` 的契约本就是「调用方自己写结尾 NUL」——**57 处调用点
+  逐一复核**（memcpy+显式 NUL 或 snprintf/strcpy），机械审计 0 例外。本项 16 次分配里 **14 次是字符串**。
+- **② 审计门（`gc_audit_gate`）在关闭态仍被调用**：它默认关闭，但调用点无条件调用——
+  **每次分配一次**（`gc_alloc` 入口）+ **每访问一个空闲链节点一次**（`gc_find_block` 内层循环）。
+  关闭时每次调用只做几个判断就返回，**调用本身**（序言 + 字符串实参 + 重查缓存标志）就是开销。
+
+**修法**：① `gc_alloc` 对 `GCT_STRING` 跳过 memset；② 三处 `gc_audit_gate` 调用点改为
+**就地判缓存标志** `if (gc_audit_mode_cache != 0)`（同文件 `gc_mark_ptr` 早就用的形态；
+`gc_audit_mode_cache` 的定义随前向声明上移到导通前，`-1` 仍会穿过并在门内解析 ⇒
+`ASC_GC_AUDIT=1` 时行为逐字不变，已用 `gc_barrier`/`gc_strings`/`gc_incremental` 三例开启态跑通）。
+**同 C 层 A/B**（长跑 5×300k，交替 n=10 取 min/median）：memset **−10.4 ms/轮**、
+审计门 **−11.4 ms/轮**，合计 **−22 ms/轮（≈ −9%）**；单批基准 222 → **198 ms**。
+
+**三、护栏（治本）**：这类陷阱的共同点是「程序照跑、结果照对，只是慢」，examples 套件看不见。
+新增两个组（`test/unit/inline.ts`）：
+
+- `unit: inline/WriteBarrier`——① 源码钉：慢路径在 `gc_write_barrier_slow`、经 `volatile` 函数指针抵达、
+  wrapper 只有两行且不内联 `gc_in_heap`；② 非空转钉：探针程序的生成 C 里 `gc_write_barrier(` ≥100 处；
+  ③ **汇编钉**：`cc -O2 -S` 后断言**0 次外联**调用（反向验证：把 wrapper 还原成旧体 ⇒ **274 次**外联，必红）。
+- `unit: inline/AuditGate`——`gc_audit_mode_cache` 的定义须在 `gc_alloc` 之前；**每个** `gc_audit_gate`
+  调用点都先判缓存标志（当前 3/3）。
+
+**四、验收**
+
+| 证据 | 结果 |
+|---|---|
+| 全量回归 `node test.ts` | **295 passed / 0 failed**（含新组 `unit: inline/WriteBarrier`、`unit: inline/AuditGate`） |
+| `ASC_GC_AUDIT=1` 冒烟（三例） | `gc_barrier`/`gc_strings`/`gc_incremental` 全部跑通、输出与关闭态一致 |
+| 基准 3 批（`python3 benchmarks/run.py`） | 8/8 `OK`，四路 `result` 一致；`binarytrees` 118 → **104 ms**（1.62 → 1.42）、`strings` 222 → **198 ms**（2.91 → **2.44**，优于基线 2.59）；其余 6 项在噪声内 |
+| 版本号 v0.4.111 → **v0.4.112**（`package.json`；纯性能修复、**无语义/API 变更** ⇒ `README-CN.md` 无需改） | ✅ |
+
+**遗留表**：**移出 1 行**（`binarytrees`/`strings` 的 GC 区残差 —— 本轮修复并移出）。
+
+**已量出但有意不动（如实报明）**：① `gc_alloc` 里 `gc_seg_find(h)` 的段计费值 **~10.6 ms/轮**，
+但它**不能删**——它是段归还判定的唯一账本（漏计会让「该段已空」误真、把活对象的内存还给 OS，
+即历史上「第二次跑基准 SIGSEGV」那个 bug）；② 每类型记账（`gc_dbg_type_bytes[24]`/`count[24]`）
+值 **~5 ms/轮（2%）**，但它同时是 `gc_trigger()` 自适应阈值的 O(1) 数据源且 `ASC_GC_STATS` 的
+类型分解靠它 ⇒ 2% 换掉一条诊断能力不划算；③ 分级空闲链对 `binarytrees` 的 +6% 是**有意取舍**
+（对 `strings` 的收益远大于此），不入表。
+
 ### 遗留待开发
 
-> **状态（2026-10-12 复核，v0.4.109）**：下表 **84 项** —— `部分完成` **14 项**、`已完成` **8 项**、`未开始` **61 项**、`调研完成 · 实现暂缓` **1 项**（仅剩 preview2 `wasi:http`）；每项都附可复现证据（实测输出 / 代码位置）；项数**以表内实际行数**为准（脚本按本表内 `^|` 行重数，表头/分隔行除外）。**本轮（2026-10-11，talkmed-meeting 启动崩溃定位）**：顺带按「项数以表内实际行数**为准**」的口径**重数**本表（旧摘要写 82 项/`未开始` 61，实为 **84 项**/`未开始` 62 —— 差 2 行系此前某轮新登记后未同步摘要，非本轮引入）。**改写 1 行 / 移出 0 行 / 新登记 0 行** —— 原「真 AIR 应用 `TalkMED Meeting` 链接成功但启动即抛 `TypeError #1009` 退出」由 `未开始` 转 **`部分完成`**：**根因①已定位并修掉**（`stage.nativeWindow` 在文档类构造期为 `NULL`，违反 AIR「OS 窗口先于文档类存在」的时序；`src/emit.ts` 两处同源修复 —— `ASC_win_claim_main` 改非摧毁式占用 + `Stage_get_nativeWindow` 对根 Stage 槽位**惰性绑定**），发布构建实机复验：运行输出从 **3 行推进到 16 行**；**根因②**（`Config.getDeviceInfo` 解引用 `ANEWinCore.getScreenSize()` 返回的 `undefined`）经确证**不是**翻译缺口，而是本表上方「Windows ANE 宿主未实现」行的必然结果（该 ANE 未加载 ⇒ `isSupported==false` ⇒ `getScreenSize()` 返回未初始化的 `rect`；AIR 缺同一 ANE 时**同样崩在该行**）。**最新一轮（2026-10-11，阶段一百三十五：输入面保真包 —— 插入点光标 + 五个文本遗留项 + `IME`/`IMEEvent` 类骨架）**：**状态改 9 行（其中 7 行转 `已完成`、1 行转 `部分完成`）/ 复核 3 行 / 新登记 0 行 / 表内项数仍 81 项** ——（a）**转 `已完成` 7 行**（六行原为 `未开始`）：① 「可视行表 UTF-16 码元 vs 字节」（在行表出口**一次性**换域 + 新增 `as_tf_byte_index`，证据 `temp/linecjk/RESULT.txt`）；② 「多行 Return 的 `textInput` 载荷」（拆成 `as_tf_insert_payload(payload, text)`，载荷 `"\n"` 而插入 `"\r"`）；③ 「`displayAsPassword` × `htmlText`」（**双端实测：AIR 遮罩换字形不换样式** ⇒ `hasRuns` 去掉 `!displayAsPassword`、run 驱动星号串排版，证据 `temp/pwdhtml/RESULT.txt`）；④⑤⑥ 富文本三行（`runs[0]`→`defaultTextFormat` 的空隙样式、行盒**逐行**且 leading 折进高度、无布局宽时以最长行做布局宽逐行对齐，证据 `temp/richprobe/` + `temp/alignprobe/`）；⑦ 「`flash.system.IME` 类与 `IMEConversionMode` 未实现」（**主动不实现 ⇒ 已实现**：8 常量 + `isSupported`/`enabled`/`conversionMode` + 四方法接我们已有的合成通道，双端口径都记入行内）。（b）**转 `部分完成` 1 行**：「`IMEEvent` 事件族不可达」——类形状已与 AIR 同构（`IMEEvent → TextEvent`、`text` 默认 `""`、`imeClient`），但我们**永不由运行时派发**（无输入法源，事件序仍未实测）。（c）**复核 3 行（状态不变，补证据）**：「IME 合成期的 `.text` 口径」（本机 Windows **确有中文 IME** ⇒ 该立项在本机可行，只差驱动 `adl` 窗口 + 真实输入法，本轮预算给了 ⑦ 实现）；「web 端 `beforeinput`/`compositionstart`」（`vendor/web_glue.cc` 仍无键盘/合成通道，**明确未支持**）；「未支持字符占位子件只有空壳」（本机/本仓**一个 `.swc` 都没有**，可验证的那一半需先手工造 SWF 作 oracle，**留待确认范围后再开**）。（d）**新登记 1 行**（`int`/`uint` 的静态 `Number` 路径是裸 C 强转、越界/NaN 是 UB，双端实测见该行；**非本批引入**，是收尾全量回归在 Windows 上抳出的既有缺陷，已入遗留表）。**上一轮（2026-10-10，阶段一百三十四：语言快修包（9 项）+ 语言核心保真包（3 项）落地）**：**移出 13 行 / 改写 1 行 / 新登记 0 行 / 表内项数 94 → 81 项** ——（a）**移出 13 行**（全部原为 `未开始`）：① 「`catch (e:*)` 被拒」（顺带把 catch 的值保真与**子句按类型过滤**一并收口 —— AIR 实测 `catch(e:Error)` **不**捕获 `throw "oops"`，`catch(e:*)`/`catch(e:String)` 才捕获，故 `examples/stage7.as` 的旧写法**本身是错的**，已改写）；② 「`new XMLList()` 不可构造」；③ 「XMLList `@attr` 标量上下文」（多元素列表拼接）；④ 「接口访问器作方法调用」——**语义反转为 `#1006`**：AIR 读到 getter 值后**当函数调用**，非函数一律 `TypeError #1006`，故旧阶段一百一十 给接口接收者发的「属性读」是**错的**（`examples/stage89.as:48` 已改为负例）；⑤ 「顶层 `new <any 变量>()`」；⑥ 「用户 `function main()` 撞入口」；⑦ 「类体无类型字段按 `int`」（类字段改投 `*`，函数作用域约定不变）；⑧ 「NativeWindow 居中用 SDL display 0」；⑨ 「类实例隐式字符串转换」——**实测已被更晚阶段修好**（`"x"+new Plain()`=`PLAIN-TOSTR`、`new Bare()`=`[object Bare]`、`new Error("boom")`=`Error: boom`、`e.name`=`Error` 均与 adl 逐字一致，本行属**陈旧记载**）；⑩ 「对象 ToPrimitive」（number-hint `valueOf`-first，`Number(WithValueOf)`=7 胜过 toString）；⑪ 「越界/已删键读回 `null`」（改回 `undefined`；顺带复核对象缺失属性，**实测原行「两端一致」不准**，现一并统一）；⑫ 「`parseInt`/`parseFloat` 未按 ES3」（radix/`0x`/前导零十进制/尾垃圾/NaN 全按 82 行双端矩阵，**0 diff**）；⑬ 「`DisplayObject.name = null` 应抛 `#2007`」（静态槽、`this.`/`super.`/无类型形、`*`/`Object` 接收者五种形态，**10/10 对 adl 逐字**）。（b）**改写 1 行**：「AIR 的数值解析/格式化极值」把「32 行里只剩 1 行不同」的**窄口径**扩证为 **48 行矩阵 / 10 行不同**（denormal 打印、`1.79769313486231e+308` 的 15 位**截断**、`Number("9.999999999999999")`→10、`Number("1.7976931348623157e308")`→Infinity、`Number("1e100")` 的**同值异文**），并明确**本轮不动**（须按 avmplus 逐字节移植，独立立项）。（c）**新登记 0 行** —— 本轮撞出的全是「把已定义行为修对」（含一处**语义反转**），不是 AIR 语义欠账。**未落地（如实报明）**：本行与「接口/`Vector.<T>` Class 值 + `int`/`uint` 独立 box tag」两族**本轮不动**（前者高风险，后者耦合 `as_class` 结构 + 注册表 + box tag 空间，需新一版 AIR oracle），理由见阶段一百三十四 节内。**上一轮（2026-10-10，阶段一百三十二：Windows Stage3D 后端（D3D12）落地 + demo 实机跑通）**：**改写 1 行 / 新登记 0 行 / 表内项数仍 94 项** ——（a）「**Stage3D 无 Windows 后端**」那行由 `未开始` 改为 **`部分完成`**：`vendor/stage3d_d3d.cc`（~2,290 行）已落地，`examples/shmup-stage3d` 在 Windows 上**开窗并跑到 281 帧 / 5 s**、零 PSO/合成错误，且 `ASC_GPU_DUMP` 导出的 presented back buffer 里有 demo 的 Stage3D 精灵；**剩下的**是 `examples/air-starling-demo` 在 Windows 目标上的完整运行（外部依赖面最广的那个工程）与背面剔除/绕序的 A/B 实测；（b）**新登记 0 行** —— 本阶段撞出的三个障碍（PSO 的写掩码/语义名/字段顺序、采样器堆 2048 上限、Skia D3D 的 `gr_cp` 所有权契约）都是**新代码自己的缺陷**，不是 AIR 语义欠账（其中 `gr_cp` 契约本身已写进 `win32.md` §2.9 并有单元钉子）。**上一轮（2026-10-10，阶段一百三十一：AGAL → HLSL 翻译器落地 + Windows 全量回归口径分类）**：**移出 0 行 / 新登记 2 行 / 扩写 1 行 / 表内项数 92 → 94 项** ——（a）本阶段是「Stage3D 无 Windows 后端」的**前置**（翻译器），该行保持**未开始**（还差 `vendor/stage3d_d3d.cc`），故不移出任何行；（b）**新登记 2 行**：① AGAL 翻译器在 **MSL/GLSL** 两档上的既有缺陷（片元 `od` 未声明且**从未接线**、`iid` 译成未声明的 `r0`、空 stage 结构）—— 三档化时**只有新写的 HLSL 档是对的**，两个旧档的错**早就在**，只是此前没有第三个目标可对照；② **CRLF 检出下**「多行 XML 字面量（≥2 个子元素）+ 非 ASCII 字符」触发**假 Lex error**（最小复现 6 行；同内容 LF 或压成一行即正常），它解释了 `examples/e4x-name.as` 在本机必红而 CI（LF 检出）绿；（c）**扩写 1 行**：「顶层自由 `function` 名撞 libc/libm 符号」→ 补上**Windows 侧的宿主宏撞名**证据（`function near(...)` ⇒ 生成 C 的 `near` 撞 `winnt.h` 的 `#define near`，**6 个示例**在本机编不过）；（d）Windows 全量回归的**必然红项**已用**同工具链的基线 A/B**证明与本次改动无关：把 `src/runtime.ts` 换回改动前版本跑同一套件，单元红 **10 → 9**，**唯一差异是新组 `stage3d/agal-hlsl` 由红转绿**（既证明无新增红，也证明该组能变红）。**上一轮（2026-10-10，文档轮：AGAL → HLSL 立项 + Windows 实测口径收口）**：**移出 0 行 / 新登记 0 行 / 表内项数仍 92 项** —— 本轮的 TODO 维护只做三件事：（a）把「Stage3D 无 Windows 后端」的**前置**立项为 **阶段一百三十一（AGAL → HLSL 翻译器）**（纯立项、未写一行实现，故**不改任何行的状态**）；（b）把阶段一百二十六 那段「**未验证**」收口为「2026-10-10 已实机编译+链接+运行」（开发机已换为 Windows，只剩肉眼级复验）；（c）给「测试门禁不稳定」行补注——本机 Windows 上 `node test.ts` 的**必然红项**已逐条分类为**环境红**（5 条 CRLF 假失败 + 2 条 macOS 硬编码断言 + 2 条 linkset 缺 `zlib.h` + examples 层整体缺 `-lz`/`cc`），与那 3 个 macOS 侧偶发**不同源**、不得混为一谈。**上一轮变动（阶段一百二十九，显示器刷新率查询 + `Stage.vsyncEnabled`，并修掉 `--air-app` 闭包 `this` 捕获缺陷）**：**移出 0 行 / 新登记 0 行** —— 本阶段是**新增能力**（`docs/zh-cn/enhancements.md` E16：`VsyncStateChangeAvailabilityEvent.refreshRate`，AIR 无任何刷新率 API）与**修对一个既有缺陷**（`--air-app` 引导代码的顶层 `var stage` 让闭包捕获 walk 跳过 getter 检查、不捕获 `this` ⇒ `error: use of undeclared identifier 'this'`；已修 + `unit: emit/ClosureThisCapture` 6 条钉子，且回退修复后能变红），两者都不属缺口；`Stage.vsyncEnabled` 反而**收窄**了 `as3-semantics.md` §2「帧率口径」行那条长期「维持现状」的口径差（拍频取舍现在交回 AIR 自带的退出阀）。表内项数仍 **92 项**。**上一轮（阶段一百二十八，多端渲染性能与分辨率收口：Stage3D 状态缓存 / 2D mip 链 / 烘焙分辨率与 `BitmapData.draw` 口径）**：**移出 7 行** —— ① `Starling demo 逐轮 RSS 上涨`（三组新 harness 实测：skybox 60 s 平坦、Sprite 3D 12 轮无增长、benchmark 的 +34 MB/s 是 Starling 设计内的活集增长且 500 ms release pass 已归还 `vmmap` 的 FRAG 33% → 0%，`as_big`=0 ⇒ 无逐帧临时分配泄漏）；② `cacheAsBitmap`/自动烘焙按 **dpr**（而非目标画布总缩放）烘焙（已落地 `as_bake_scale`，带 4×dpr 与 4M 像素上限；九宫格同源同修；`adl` oracle：缓存开/关在 k=1/2/3 与祖先缩放两态**逐像素相同**）；③ `BitmapData.draw`/`as_render_bounds` 的**边框 +1**（adl 实测 = `width*k + 1` 且边框**恒 1 位图像素** ⇒ 源矩形的 +1 是**位图像素**、不是局部单位）；④ `BitmapData.draw(source, matrix)` 对 **source 自身变换**的处理（adl 2×2 矩阵定案：`cont.scaleX=2` 独立 draw 得 41×21 = 忽略源变换，`scale=2` + `mat=3` 得 121×61 = **只吃矩阵、两者不相乘** ⇒ 按该行选项 ① 对齐 AIR）；⑤ `Texture`/`CubeTexture` 的 **mip 1+ 未上传**（2D 已按 adl 实测的「源位图左上 `lw×lh`、按源行距读」区域规则上传各级）；⑥ **无 mip 链 + `miplinear` ⇒ 丢弃整个 draw**（两端同条件落地，web 侧丢弃点必须在 `glUseProgram` 之前，否则 GL 采到不完整纹理读作黑）；⑦ 每 draw 重建 **`MTLDepthStencilState`**（Metal 侧改按键值 LRU 缓存 `s3d_select_dss`，实测 `dss=2` over 1680 draws，`make_pso=2`/`pso_miss=0`）。**新登记 4 行** —— web 端从**文档类构造器**请求 Stage3D 不可用 + wasm 上胶水层 JS 异常 AS3 捕不到；`catch (e:*)` 被拒（`mxmlc` 接受）；内建方法的**可选参数**不生效（`drawTriangles(ib)` 报缺参）；`TextField.textWidth` 的字形累进口径残差（adl 14.5 vs 我们 14.40234375）。**上一轮（阶段一百二十七，内建类注册表 & Class 值 + `in`/`delete`/下标）**：**移出 6 行** —— ① `IDataInput`/`IDataOutput` 未注册为内建接口（已按 AIR **完整成员表**注册进 `flash.utils`，`TLSSocket extends Socket implements IDataInput, IDataOutput` 通过）；② `delete vec[i]` 与 `"0" in vec` 在**静态 Vector** 上报 codegen 错（已落地：`in` 按下标范围、`delete` 恒 true 且 no-op——原行猜的「`#2005`」经复测是**误归因**，`#2005` 实为 `new Vector.<int>(非数字长度)`）；③ `in` 在数组上（静态被拒 / 动态恒 false；已落地：`length` + 区间内非空洞下标 + 命名属性）；④ `getDefinitionByName` 的错误号与消息不忠实（两处硬编码改为 AIR 的 **`#1065`** + `Variable <末段> is not defined.`，原行的「message 是 `"Error #1065"`」经双端复测更正为完整句）；⑤ 未知类作**类型标注**不报语义错、泄漏 clang 诊断（已落地：符号表感知的 `checkTypeAnnotation`，带 `行:列`）；⑥ `is`/`as` 右操作为 `Vector.<T>` 时动态左值失效（已落地；其括注的「裸 `Vector` 作类型名报错」经 `mxmlc` 复测**吻合 AIR**——`var vv:Vector = new Vector.<int>()` 被 `mxmlc` 以「隐式强制转换」拒绝——故该括注**不属缺口**，已在下方节内写明）。**新登记 2 行** —— `Vector.<T>` 作 Class 值/值表达式（值位置先是 parse error）；`Socket.readObject` **响亮**未支持。**收窄改写 3 行** —— `is`/`as` 右操作数为内建类/接口 Class 值（内建类已落地，只剩接口与 `Vector.<T>`）；内置类名作 Class 值（引用类型已落地，只剩**原始包装类**）；反射 API 的内建类名口径（①④ 实测**更正为已对齐 / 部分对齐**，只剩 `int`/`uint` 独立 box tag 与 `Dictionary` 虚拟 vtable）。**上一轮（阶段一百二十六，Windows 原生后端）**：**移出 0 行 / 新登记 3 行**（Windows 侧未实机验证；Stage3D 无 Windows 后端；**测试门禁不稳定**——同一套件不同次运行报出 3 个不同的红、重跑全绿，根因未定，见本节末行）。**上一轮（阶段一百二十五）**：**移出 0 行 / 新登记 1 行**（`new XMLList()` 未注册为可构造内建类 —— `adl 51.4.1` 可构造、我们报 `unknown class 'XMLList'`（**响亮**失败）；`XML` 可构造而 `XMLList` 只能作类型标注，属不对称；见上节）。**上一轮（阶段一百二十四）**：**移出 1 行**（「编译范围 = 整个 `src/`（无可达性分析）」—— 已落地为**主类传递闭包**收面，同源 A/B：`Basic_SkyBox` 源文件 485→165、嵌资源 40→6、二进制 34,134,472→25,456,904 B、构建 37.03→15.94 s，且闭包产物是整包产物的**函数级子集**）；**新登记 0 行**。**上一轮（阶段一百二十三）**：**新登记 0 行 / 移出 0 行**（成员解析的最近声明规则属**把已定义行为修对**，不新增缺口；见上节）。**上一轮（ANEWebSocket 真源码实证，纯评估不升版本）**：**新登记 1 行**（**`flash.*` 包里的用户类对 `package`d 消费者不可见** —— 自写的 `flash.external.ExtensionContext` 顶不上内建，⇒ `ExtensionContext` 必须做成真内建；用真实厂商源码的隔离矩阵实测）。**更正 2 处口径**（① ANE 的 AS3 面 **74/61/678/115/368 → 70/59/605/106/363** —— 旧脚本用短名在整棵 `src/` 匹配，被工程自带的 `com.worlize.websocket.*` 污染；② 「ANE 的 AS3 类只能从 `DoABC` 拿」**不成立于全部** —— 工程 `src/` 已自带 **12** 个 ANE 相关类源码、其中 **2** 个就是被 import 的 ANE FQN）。**实证 1 条**（路线 ②′：ANEWebSocket 的 `.vcxproj` 链接仓库自带的 `libs/air/FlashRuntimeExtensions.lib`（内部记录 `Adobe AIR.dll` ×69）、无 `.def` ⇒ 换名 = **只换这一份导入库后重编**，零源码改动；且未经修改的 `WebSocketEvent.as` 在本编译器下**编译并运行正确**）。**上一轮（阶段一百二十二）**：**新登记 1 行**（**编译范围 = 整个 `src/`，无可达性分析** —— 实测 `embed 40 asset(s)` / 4,969,434 B 里含**别的 demo** 的资源，且它们**存活进产物**（`Basic_Stereo` 二进制里 `road.jpg`/`rockbase_normals.png`/`idle2.md5anim`/`grimnight_posX.png` 各自的 48 字节中段各 1 次）；不可达类里的坏 `[Embed]` 让我们编译期失败而 `adl` 无恙）。**上一轮（Windows 口径 ExtensionContext / ANE 宿主评估 v2，纯评估不升版本）**：**新登记 2 行**（**Windows ANE 宿主未实现**——实测 13/13 个 ANE DLL 的 FRE 符号**全部来自 `Adobe AIR.dll`**、全集 **34 个 = 25 在线参考已列 + 9 未列（但 SDK 头文件 52 个全有原型 ⇒ 无需逆向）**、加载协议为每 DLL 仅导出 `<Name>ExtInitializer`/`Finalizer`；**ANE 的 AS3 API 类无法纳入 AOT 闭包**——**74 个 FQN / 61 文件 / 3 个作基类**，定义在 `library.swf` 的 `DoABC`）。**更正 2 处口径**（① 上一版「真 ANE 桥接**不可行也无意义**」**作废**——它回答的是 macOS，而交付物是 **Windows**，届时 AIR **真的加载 `.dll`**、ANE 功能完整；② `talkmed-meeting-aot-gap-report-v2.md` §4.1 同步更正）。**复测确认 1 条**（v0.4.94 下**任何内建类**走 `getDefinitionByName` 仍抛 `#0 [No definition found]`，含 `String`/`Object`/`Sprite`/`StatusEvent`/`ExtensionContext`）。**上一轮（ExtensionContext / ANE 可行性评估 v1，macOS 口径）**：**新登记 2 行**（`getDefinitionByName` 的**错误号/消息不忠实**——未知名我们抛 `#0` + `"No definition found"`、AIR 抛 `#1065`；**未知类作类型标注**不报语义错、直接泄漏 `unknown type name` 到 clang 的**诊断缺陷**），**更正 1 行**（「内置类名不能作 Class 值」行原括注称「已支持 `getDefinitionByName("flash.display.BitmapData")`」，实测为**假**，已改正）。**上一轮（阶段一百二十）**：**移出 1 行**（`unboxAny` 的 `int`/`uint`/`bool` 分支用原始解箱而非 AS3 强转，动态值为字符串时给 0/false —— 已落地为「整族动态槽强转收口」，`unboxcoerce` 探针 **4/8 → 0/8**，并顺带修掉「`String`→数值」的 ES3 ToNumber 与数组字符串键的路由）；**新登记 4 行**（同批探针实测出的邻域缺口：`DisplayObject.name = null` 应抛 `#2007`、数组越界读应回 `undefined`、数组上的 `in`（静态被拒 / 动态恒 false）、`parseInt`/`parseFloat` 的 radix 与 `NaN`）。**上一轮（阶段一百一十九）**：**新登记 1 行**（同上）。**移出 6 行** —— ① 经动态槽给对象型参数赋错类型不抛 `#1034`（已落地：`unboxAny` 的对象解箱走 `as_req_inst`，`dyn` 探针 0/6 逐字一致）；② `(标量 as Object) == 标量` 恒 false（已落地：`Object` 静态类型的相等走 `as_v_loose_eq`；顺带修掉另一半 —— `Object` 槽里的 **Array** 原先按 tag 4 装箱，`==`/`+`/`length` 都看不见数组，现 `as_obj_to_value` 按 `as_dyn_kind` 回 tag 6，`verify` 探针 0/8）；③ 动态值 `x as <原始类型>` 给默认值而非 null（已落地：`as_v_as_*` 未命中回 null 箱，探针 C/C2 一致）；④ 装箱字符串参与算术/比较未走 ES3 ToNumber（已落地：`toNumberExpr` 的 `any` 分支改走 `as_v_to_number`，探针 D/E/F 一致）；⑤ 静态 `String` 与 `Number` 混算发射非法 C（已落地：现在是 `CodegenError`「operator '*' cannot be applied to a String operand」，`"5" < 6` 仍编译）；⑥ `null` 字面量传给 `Number`/`bool` 形参发射 `(double)(NULL)`（已落地：`v78` 探针 0/3）。**新登记 3 行**：AIR 数值解析/格式化的极值（`tonum2` 只剩 1/32 行差）；对象字面量/类实例的 **ToPrimitive**（`Number({})` 应为 NaN）；Function 值的 **#1063 qname**（接口接收者应报「方法定义类」，匿名闭包的 `<file>.as$N` 索引与顶层函数名不可复现）。**同轮顺带落地（不在本表、属新增包）**：Array 的 ToPrimitive/ToString（`[1,2]`→`"1,2"`、`Number([5])`→5、`==` 字符串化、`join(null)`→`"null"`）+ Function 值的 **#1063 参数个数检查**（原先一个 1 参闭包用 0 参调用会**段错误**）。上一轮（阶段一百一十八）：**新登记 2 行**（`extends <内建类型>` 文案已精确、特性仍缺；`IDataInput`/`IDataOutput` 未注册为内建接口）、**移出 0 行**。
+> **状态（2026-10-12 复核，v0.4.112）**：下表 **86 项** —— `部分完成` **14 项**、`已完成` **8 项**、`未开始` **63 项**、`调研完成 · 实现暂缓` **1 项**（仅剩 preview2 `wasi:http`）；每项都附可复现证据（实测输出 / 代码位置）；项数**以表内实际行数**为准（脚本按本表内 `^|` 行重数，表头/分隔行除外）。**本轮（2026-10-11，talkmed-meeting 启动崩溃定位）**：顺带按「项数以表内实际行数**为准**」的口径**重数**本表（旧摘要写 82 项/`未开始` 61，实为 **84 项**/`未开始` 62 —— 差 2 行系此前某轮新登记后未同步摘要，非本轮引入）。**改写 1 行 / 移出 0 行 / 新登记 0 行** —— 原「真 AIR 应用 `TalkMED Meeting` 链接成功但启动即抛 `TypeError #1009` 退出」由 `未开始` 转 **`部分完成`**：**根因①已定位并修掉**（`stage.nativeWindow` 在文档类构造期为 `NULL`，违反 AIR「OS 窗口先于文档类存在」的时序；`src/emit.ts` 两处同源修复 —— `ASC_win_claim_main` 改非摧毁式占用 + `Stage_get_nativeWindow` 对根 Stage 槽位**惰性绑定**），发布构建实机复验：运行输出从 **3 行推进到 16 行**；**根因②**（`Config.getDeviceInfo` 解引用 `ANEWinCore.getScreenSize()` 返回的 `undefined`）经确证**不是**翻译缺口，而是本表上方「Windows ANE 宿主未实现」行的必然结果（该 ANE 未加载 ⇒ `isSupported==false` ⇒ `getScreenSize()` 返回未初始化的 `rect`；AIR 缺同一 ANE 时**同样崩在该行**）。**最新一轮（2026-10-11，阶段一百三十五：输入面保真包 —— 插入点光标 + 五个文本遗留项 + `IME`/`IMEEvent` 类骨架）**：**状态改 9 行（其中 7 行转 `已完成`、1 行转 `部分完成`）/ 复核 3 行 / 新登记 0 行 / 表内项数仍 81 项** ——（a）**转 `已完成` 7 行**（六行原为 `未开始`）：① 「可视行表 UTF-16 码元 vs 字节」（在行表出口**一次性**换域 + 新增 `as_tf_byte_index`，证据 `temp/linecjk/RESULT.txt`）；② 「多行 Return 的 `textInput` 载荷」（拆成 `as_tf_insert_payload(payload, text)`，载荷 `"\n"` 而插入 `"\r"`）；③ 「`displayAsPassword` × `htmlText`」（**双端实测：AIR 遮罩换字形不换样式** ⇒ `hasRuns` 去掉 `!displayAsPassword`、run 驱动星号串排版，证据 `temp/pwdhtml/RESULT.txt`）；④⑤⑥ 富文本三行（`runs[0]`→`defaultTextFormat` 的空隙样式、行盒**逐行**且 leading 折进高度、无布局宽时以最长行做布局宽逐行对齐，证据 `temp/richprobe/` + `temp/alignprobe/`）；⑦ 「`flash.system.IME` 类与 `IMEConversionMode` 未实现」（**主动不实现 ⇒ 已实现**：8 常量 + `isSupported`/`enabled`/`conversionMode` + 四方法接我们已有的合成通道，双端口径都记入行内）。（b）**转 `部分完成` 1 行**：「`IMEEvent` 事件族不可达」——类形状已与 AIR 同构（`IMEEvent → TextEvent`、`text` 默认 `""`、`imeClient`），但我们**永不由运行时派发**（无输入法源，事件序仍未实测）。（c）**复核 3 行（状态不变，补证据）**：「IME 合成期的 `.text` 口径」（本机 Windows **确有中文 IME** ⇒ 该立项在本机可行，只差驱动 `adl` 窗口 + 真实输入法，本轮预算给了 ⑦ 实现）；「web 端 `beforeinput`/`compositionstart`」（`vendor/web_glue.cc` 仍无键盘/合成通道，**明确未支持**）；「未支持字符占位子件只有空壳」（本机/本仓**一个 `.swc` 都没有**，可验证的那一半需先手工造 SWF 作 oracle，**留待确认范围后再开**）。（d）**新登记 1 行**（`int`/`uint` 的静态 `Number` 路径是裸 C 强转、越界/NaN 是 UB，双端实测见该行；**非本批引入**，是收尾全量回归在 Windows 上抳出的既有缺陷，已入遗留表）。**上一轮（2026-10-10，阶段一百三十四：语言快修包（9 项）+ 语言核心保真包（3 项）落地）**：**移出 13 行 / 改写 1 行 / 新登记 0 行 / 表内项数 94 → 81 项** ——（a）**移出 13 行**（全部原为 `未开始`）：① 「`catch (e:*)` 被拒」（顺带把 catch 的值保真与**子句按类型过滤**一并收口 —— AIR 实测 `catch(e:Error)` **不**捕获 `throw "oops"`，`catch(e:*)`/`catch(e:String)` 才捕获，故 `examples/stage7.as` 的旧写法**本身是错的**，已改写）；② 「`new XMLList()` 不可构造」；③ 「XMLList `@attr` 标量上下文」（多元素列表拼接）；④ 「接口访问器作方法调用」——**语义反转为 `#1006`**：AIR 读到 getter 值后**当函数调用**，非函数一律 `TypeError #1006`，故旧阶段一百一十 给接口接收者发的「属性读」是**错的**（`examples/stage89.as:48` 已改为负例）；⑤ 「顶层 `new <any 变量>()`」；⑥ 「用户 `function main()` 撞入口」；⑦ 「类体无类型字段按 `int`」（类字段改投 `*`，函数作用域约定不变）；⑧ 「NativeWindow 居中用 SDL display 0」；⑨ 「类实例隐式字符串转换」——**实测已被更晚阶段修好**（`"x"+new Plain()`=`PLAIN-TOSTR`、`new Bare()`=`[object Bare]`、`new Error("boom")`=`Error: boom`、`e.name`=`Error` 均与 adl 逐字一致，本行属**陈旧记载**）；⑩ 「对象 ToPrimitive」（number-hint `valueOf`-first，`Number(WithValueOf)`=7 胜过 toString）；⑪ 「越界/已删键读回 `null`」（改回 `undefined`；顺带复核对象缺失属性，**实测原行「两端一致」不准**，现一并统一）；⑫ 「`parseInt`/`parseFloat` 未按 ES3」（radix/`0x`/前导零十进制/尾垃圾/NaN 全按 82 行双端矩阵，**0 diff**）；⑬ 「`DisplayObject.name = null` 应抛 `#2007`」（静态槽、`this.`/`super.`/无类型形、`*`/`Object` 接收者五种形态，**10/10 对 adl 逐字**）。（b）**改写 1 行**：「AIR 的数值解析/格式化极值」把「32 行里只剩 1 行不同」的**窄口径**扩证为 **48 行矩阵 / 10 行不同**（denormal 打印、`1.79769313486231e+308` 的 15 位**截断**、`Number("9.999999999999999")`→10、`Number("1.7976931348623157e308")`→Infinity、`Number("1e100")` 的**同值异文**），并明确**本轮不动**（须按 avmplus 逐字节移植，独立立项）。（c）**新登记 0 行** —— 本轮撞出的全是「把已定义行为修对」（含一处**语义反转**），不是 AIR 语义欠账。**未落地（如实报明）**：本行与「接口/`Vector.<T>` Class 值 + `int`/`uint` 独立 box tag」两族**本轮不动**（前者高风险，后者耦合 `as_class` 结构 + 注册表 + box tag 空间，需新一版 AIR oracle），理由见阶段一百三十四 节内。**上一轮（2026-10-10，阶段一百三十二：Windows Stage3D 后端（D3D12）落地 + demo 实机跑通）**：**改写 1 行 / 新登记 0 行 / 表内项数仍 94 项** ——（a）「**Stage3D 无 Windows 后端**」那行由 `未开始` 改为 **`部分完成`**：`vendor/stage3d_d3d.cc`（~2,290 行）已落地，`examples/shmup-stage3d` 在 Windows 上**开窗并跑到 281 帧 / 5 s**、零 PSO/合成错误，且 `ASC_GPU_DUMP` 导出的 presented back buffer 里有 demo 的 Stage3D 精灵；**剩下的**是 `examples/air-starling-demo` 在 Windows 目标上的完整运行（外部依赖面最广的那个工程）与背面剔除/绕序的 A/B 实测；（b）**新登记 0 行** —— 本阶段撞出的三个障碍（PSO 的写掩码/语义名/字段顺序、采样器堆 2048 上限、Skia D3D 的 `gr_cp` 所有权契约）都是**新代码自己的缺陷**，不是 AIR 语义欠账（其中 `gr_cp` 契约本身已写进 `win32.md` §2.9 并有单元钉子）。**上一轮（2026-10-10，阶段一百三十一：AGAL → HLSL 翻译器落地 + Windows 全量回归口径分类）**：**移出 0 行 / 新登记 2 行 / 扩写 1 行 / 表内项数 92 → 94 项** ——（a）本阶段是「Stage3D 无 Windows 后端」的**前置**（翻译器），该行保持**未开始**（还差 `vendor/stage3d_d3d.cc`），故不移出任何行；（b）**新登记 2 行**：① AGAL 翻译器在 **MSL/GLSL** 两档上的既有缺陷（片元 `od` 未声明且**从未接线**、`iid` 译成未声明的 `r0`、空 stage 结构）—— 三档化时**只有新写的 HLSL 档是对的**，两个旧档的错**早就在**，只是此前没有第三个目标可对照；② **CRLF 检出下**「多行 XML 字面量（≥2 个子元素）+ 非 ASCII 字符」触发**假 Lex error**（最小复现 6 行；同内容 LF 或压成一行即正常），它解释了 `examples/e4x-name.as` 在本机必红而 CI（LF 检出）绿；（c）**扩写 1 行**：「顶层自由 `function` 名撞 libc/libm 符号」→ 补上**Windows 侧的宿主宏撞名**证据（`function near(...)` ⇒ 生成 C 的 `near` 撞 `winnt.h` 的 `#define near`，**6 个示例**在本机编不过）；（d）Windows 全量回归的**必然红项**已用**同工具链的基线 A/B**证明与本次改动无关：把 `src/runtime.ts` 换回改动前版本跑同一套件，单元红 **10 → 9**，**唯一差异是新组 `stage3d/agal-hlsl` 由红转绿**（既证明无新增红，也证明该组能变红）。**上一轮（2026-10-10，文档轮：AGAL → HLSL 立项 + Windows 实测口径收口）**：**移出 0 行 / 新登记 0 行 / 表内项数仍 92 项** —— 本轮的 TODO 维护只做三件事：（a）把「Stage3D 无 Windows 后端」的**前置**立项为 **阶段一百三十一（AGAL → HLSL 翻译器）**（纯立项、未写一行实现，故**不改任何行的状态**）；（b）把阶段一百二十六 那段「**未验证**」收口为「2026-10-10 已实机编译+链接+运行」（开发机已换为 Windows，只剩肉眼级复验）；（c）给「测试门禁不稳定」行补注——本机 Windows 上 `node test.ts` 的**必然红项**已逐条分类为**环境红**（5 条 CRLF 假失败 + 2 条 macOS 硬编码断言 + 2 条 linkset 缺 `zlib.h` + examples 层整体缺 `-lz`/`cc`），与那 3 个 macOS 侧偶发**不同源**、不得混为一谈。**上一轮变动（阶段一百二十九，显示器刷新率查询 + `Stage.vsyncEnabled`，并修掉 `--air-app` 闭包 `this` 捕获缺陷）**：**移出 0 行 / 新登记 0 行** —— 本阶段是**新增能力**（`docs/zh-cn/enhancements.md` E16：`VsyncStateChangeAvailabilityEvent.refreshRate`，AIR 无任何刷新率 API）与**修对一个既有缺陷**（`--air-app` 引导代码的顶层 `var stage` 让闭包捕获 walk 跳过 getter 检查、不捕获 `this` ⇒ `error: use of undeclared identifier 'this'`；已修 + `unit: emit/ClosureThisCapture` 6 条钉子，且回退修复后能变红），两者都不属缺口；`Stage.vsyncEnabled` 反而**收窄**了 `as3-semantics.md` §2「帧率口径」行那条长期「维持现状」的口径差（拍频取舍现在交回 AIR 自带的退出阀）。表内项数仍 **92 项**。**上一轮（阶段一百二十八，多端渲染性能与分辨率收口：Stage3D 状态缓存 / 2D mip 链 / 烘焙分辨率与 `BitmapData.draw` 口径）**：**移出 7 行** —— ① `Starling demo 逐轮 RSS 上涨`（三组新 harness 实测：skybox 60 s 平坦、Sprite 3D 12 轮无增长、benchmark 的 +34 MB/s 是 Starling 设计内的活集增长且 500 ms release pass 已归还 `vmmap` 的 FRAG 33% → 0%，`as_big`=0 ⇒ 无逐帧临时分配泄漏）；② `cacheAsBitmap`/自动烘焙按 **dpr**（而非目标画布总缩放）烘焙（已落地 `as_bake_scale`，带 4×dpr 与 4M 像素上限；九宫格同源同修；`adl` oracle：缓存开/关在 k=1/2/3 与祖先缩放两态**逐像素相同**）；③ `BitmapData.draw`/`as_render_bounds` 的**边框 +1**（adl 实测 = `width*k + 1` 且边框**恒 1 位图像素** ⇒ 源矩形的 +1 是**位图像素**、不是局部单位）；④ `BitmapData.draw(source, matrix)` 对 **source 自身变换**的处理（adl 2×2 矩阵定案：`cont.scaleX=2` 独立 draw 得 41×21 = 忽略源变换，`scale=2` + `mat=3` 得 121×61 = **只吃矩阵、两者不相乘** ⇒ 按该行选项 ① 对齐 AIR）；⑤ `Texture`/`CubeTexture` 的 **mip 1+ 未上传**（2D 已按 adl 实测的「源位图左上 `lw×lh`、按源行距读」区域规则上传各级）；⑥ **无 mip 链 + `miplinear` ⇒ 丢弃整个 draw**（两端同条件落地，web 侧丢弃点必须在 `glUseProgram` 之前，否则 GL 采到不完整纹理读作黑）；⑦ 每 draw 重建 **`MTLDepthStencilState`**（Metal 侧改按键值 LRU 缓存 `s3d_select_dss`，实测 `dss=2` over 1680 draws，`make_pso=2`/`pso_miss=0`）。**新登记 4 行** —— web 端从**文档类构造器**请求 Stage3D 不可用 + wasm 上胶水层 JS 异常 AS3 捕不到；`catch (e:*)` 被拒（`mxmlc` 接受）；内建方法的**可选参数**不生效（`drawTriangles(ib)` 报缺参）；`TextField.textWidth` 的字形累进口径残差（adl 14.5 vs 我们 14.40234375）。**上一轮（阶段一百二十七，内建类注册表 & Class 值 + `in`/`delete`/下标）**：**移出 6 行** —— ① `IDataInput`/`IDataOutput` 未注册为内建接口（已按 AIR **完整成员表**注册进 `flash.utils`，`TLSSocket extends Socket implements IDataInput, IDataOutput` 通过）；② `delete vec[i]` 与 `"0" in vec` 在**静态 Vector** 上报 codegen 错（已落地：`in` 按下标范围、`delete` 恒 true 且 no-op——原行猜的「`#2005`」经复测是**误归因**，`#2005` 实为 `new Vector.<int>(非数字长度)`）；③ `in` 在数组上（静态被拒 / 动态恒 false；已落地：`length` + 区间内非空洞下标 + 命名属性）；④ `getDefinitionByName` 的错误号与消息不忠实（两处硬编码改为 AIR 的 **`#1065`** + `Variable <末段> is not defined.`，原行的「message 是 `"Error #1065"`」经双端复测更正为完整句）；⑤ 未知类作**类型标注**不报语义错、泄漏 clang 诊断（已落地：符号表感知的 `checkTypeAnnotation`，带 `行:列`）；⑥ `is`/`as` 右操作为 `Vector.<T>` 时动态左值失效（已落地；其括注的「裸 `Vector` 作类型名报错」经 `mxmlc` 复测**吻合 AIR**——`var vv:Vector = new Vector.<int>()` 被 `mxmlc` 以「隐式强制转换」拒绝——故该括注**不属缺口**，已在下方节内写明）。**新登记 2 行** —— `Vector.<T>` 作 Class 值/值表达式（值位置先是 parse error）；`Socket.readObject` **响亮**未支持。**收窄改写 3 行** —— `is`/`as` 右操作数为内建类/接口 Class 值（内建类已落地，只剩接口与 `Vector.<T>`）；内置类名作 Class 值（引用类型已落地，只剩**原始包装类**）；反射 API 的内建类名口径（①④ 实测**更正为已对齐 / 部分对齐**，只剩 `int`/`uint` 独立 box tag 与 `Dictionary` 虚拟 vtable）。**上一轮（阶段一百二十六，Windows 原生后端）**：**移出 0 行 / 新登记 3 行**（Windows 侧未实机验证；Stage3D 无 Windows 后端；**测试门禁不稳定**——同一套件不同次运行报出 3 个不同的红、重跑全绿，根因未定，见本节末行）。**上一轮（阶段一百二十五）**：**移出 0 行 / 新登记 1 行**（`new XMLList()` 未注册为可构造内建类 —— `adl 51.4.1` 可构造、我们报 `unknown class 'XMLList'`（**响亮**失败）；`XML` 可构造而 `XMLList` 只能作类型标注，属不对称；见上节）。**上一轮（阶段一百二十四）**：**移出 1 行**（「编译范围 = 整个 `src/`（无可达性分析）」—— 已落地为**主类传递闭包**收面，同源 A/B：`Basic_SkyBox` 源文件 485→165、嵌资源 40→6、二进制 34,134,472→25,456,904 B、构建 37.03→15.94 s，且闭包产物是整包产物的**函数级子集**）；**新登记 0 行**。**上一轮（阶段一百二十三）**：**新登记 0 行 / 移出 0 行**（成员解析的最近声明规则属**把已定义行为修对**，不新增缺口；见上节）。**上一轮（ANEWebSocket 真源码实证，纯评估不升版本）**：**新登记 1 行**（**`flash.*` 包里的用户类对 `package`d 消费者不可见** —— 自写的 `flash.external.ExtensionContext` 顶不上内建，⇒ `ExtensionContext` 必须做成真内建；用真实厂商源码的隔离矩阵实测）。**更正 2 处口径**（① ANE 的 AS3 面 **74/61/678/115/368 → 70/59/605/106/363** —— 旧脚本用短名在整棵 `src/` 匹配，被工程自带的 `com.worlize.websocket.*` 污染；② 「ANE 的 AS3 类只能从 `DoABC` 拿」**不成立于全部** —— 工程 `src/` 已自带 **12** 个 ANE 相关类源码、其中 **2** 个就是被 import 的 ANE FQN）。**实证 1 条**（路线 ②′：ANEWebSocket 的 `.vcxproj` 链接仓库自带的 `libs/air/FlashRuntimeExtensions.lib`（内部记录 `Adobe AIR.dll` ×69）、无 `.def` ⇒ 换名 = **只换这一份导入库后重编**，零源码改动；且未经修改的 `WebSocketEvent.as` 在本编译器下**编译并运行正确**）。**上一轮（阶段一百二十二）**：**新登记 1 行**（**编译范围 = 整个 `src/`，无可达性分析** —— 实测 `embed 40 asset(s)` / 4,969,434 B 里含**别的 demo** 的资源，且它们**存活进产物**（`Basic_Stereo` 二进制里 `road.jpg`/`rockbase_normals.png`/`idle2.md5anim`/`grimnight_posX.png` 各自的 48 字节中段各 1 次）；不可达类里的坏 `[Embed]` 让我们编译期失败而 `adl` 无恙）。**上一轮（Windows 口径 ExtensionContext / ANE 宿主评估 v2，纯评估不升版本）**：**新登记 2 行**（**Windows ANE 宿主未实现**——实测 13/13 个 ANE DLL 的 FRE 符号**全部来自 `Adobe AIR.dll`**、全集 **34 个 = 25 在线参考已列 + 9 未列（但 SDK 头文件 52 个全有原型 ⇒ 无需逆向）**、加载协议为每 DLL 仅导出 `<Name>ExtInitializer`/`Finalizer`；**ANE 的 AS3 API 类无法纳入 AOT 闭包**——**74 个 FQN / 61 文件 / 3 个作基类**，定义在 `library.swf` 的 `DoABC`）。**更正 2 处口径**（① 上一版「真 ANE 桥接**不可行也无意义**」**作废**——它回答的是 macOS，而交付物是 **Windows**，届时 AIR **真的加载 `.dll`**、ANE 功能完整；② `talkmed-meeting-aot-gap-report-v2.md` §4.1 同步更正）。**复测确认 1 条**（v0.4.94 下**任何内建类**走 `getDefinitionByName` 仍抛 `#0 [No definition found]`，含 `String`/`Object`/`Sprite`/`StatusEvent`/`ExtensionContext`）。**上一轮（ExtensionContext / ANE 可行性评估 v1，macOS 口径）**：**新登记 2 行**（`getDefinitionByName` 的**错误号/消息不忠实**——未知名我们抛 `#0` + `"No definition found"`、AIR 抛 `#1065`；**未知类作类型标注**不报语义错、直接泄漏 `unknown type name` 到 clang 的**诊断缺陷**），**更正 1 行**（「内置类名不能作 Class 值」行原括注称「已支持 `getDefinitionByName("flash.display.BitmapData")`」，实测为**假**，已改正）。**上一轮（阶段一百二十）**：**移出 1 行**（`unboxAny` 的 `int`/`uint`/`bool` 分支用原始解箱而非 AS3 强转，动态值为字符串时给 0/false —— 已落地为「整族动态槽强转收口」，`unboxcoerce` 探针 **4/8 → 0/8**，并顺带修掉「`String`→数值」的 ES3 ToNumber 与数组字符串键的路由）；**新登记 4 行**（同批探针实测出的邻域缺口：`DisplayObject.name = null` 应抛 `#2007`、数组越界读应回 `undefined`、数组上的 `in`（静态被拒 / 动态恒 false）、`parseInt`/`parseFloat` 的 radix 与 `NaN`）。**上一轮（阶段一百一十九）**：**新登记 1 行**（同上）。**移出 6 行** —— ① 经动态槽给对象型参数赋错类型不抛 `#1034`（已落地：`unboxAny` 的对象解箱走 `as_req_inst`，`dyn` 探针 0/6 逐字一致）；② `(标量 as Object) == 标量` 恒 false（已落地：`Object` 静态类型的相等走 `as_v_loose_eq`；顺带修掉另一半 —— `Object` 槽里的 **Array** 原先按 tag 4 装箱，`==`/`+`/`length` 都看不见数组，现 `as_obj_to_value` 按 `as_dyn_kind` 回 tag 6，`verify` 探针 0/8）；③ 动态值 `x as <原始类型>` 给默认值而非 null（已落地：`as_v_as_*` 未命中回 null 箱，探针 C/C2 一致）；④ 装箱字符串参与算术/比较未走 ES3 ToNumber（已落地：`toNumberExpr` 的 `any` 分支改走 `as_v_to_number`，探针 D/E/F 一致）；⑤ 静态 `String` 与 `Number` 混算发射非法 C（已落地：现在是 `CodegenError`「operator '*' cannot be applied to a String operand」，`"5" < 6` 仍编译）；⑥ `null` 字面量传给 `Number`/`bool` 形参发射 `(double)(NULL)`（已落地：`v78` 探针 0/3）。**新登记 3 行**：AIR 数值解析/格式化的极值（`tonum2` 只剩 1/32 行差）；对象字面量/类实例的 **ToPrimitive**（`Number({})` 应为 NaN）；Function 值的 **#1063 qname**（接口接收者应报「方法定义类」，匿名闭包的 `<file>.as$N` 索引与顶层函数名不可复现）。**同轮顺带落地（不在本表、属新增包）**：Array 的 ToPrimitive/ToString（`[1,2]`→`"1,2"`、`Number([5])`→5、`==` 字符串化、`join(null)`→`"null"`）+ Function 值的 **#1063 参数个数检查**（原先一个 1 参闭包用 0 参调用会**段错误**）。上一轮（阶段一百一十八）：**新登记 2 行**（`extends <内建类型>` 文案已精确、特性仍缺；`IDataInput`/`IDataOutput` 未注册为内建接口）、**移出 0 行**。
+> **最新一轮（2026-10-12，阶段一百三十八 + 阶段一百三十九：`Class` 值静态 getter 修复 + `flash.data`/SQLite A–D 落地）**：**移出 2 行 / 新登记 2 行 / 表内项数 86 → 86 项**（两行出入相抵）；`未开始` 63 → **63**（净额不变：`部分完成` 14 / `已完成` 8 / `暂缓` 1 三项亦不变）。（a）**移出 1 行**：「`Class` 值的静态 getter 分派缺失」（阶段一百三十八：`as_class` 补 kind-3 静态成员行 + 逐 getter 装箱 thunk，证据 `examples/class-static-member.as`、`unit: reflection/ClassStaticMember`）；（b）**移出 1 行**：「`flash.data` / SQLite 本地数据库族未实现」（阶段一百三十九：A–D 四阶段全量落地，引擎 = 官方 amalgamation 3.54.0，四个示例 native + **wasm32-wasip1** + **`adl 51.4.1` oracle** 三端全绿，ADR 记为 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md) §10）；（c）**新登记 2 行**：① **加密数据库**（`encryptionKey`/`reencrypt()`/带密钥 `attach`）—— `adl` 能开我们**响亮**拒（`SQLError #3138`），按 §1.5 硬判据属**欠账**（AIR 有而我们没有），故入本表而非增强表；理由与 AES-CCM 私有格式的实测见 ADR §5.2/§10.3。② **`File` 的路径字符串契约**—— 本轮跑 AIR oracle 时**撞出**（`temp/relpath/`，6 行矩阵）：`adl 51.4.1` 的 `new File(x)` **只接受绝对路径或绝对 `file://` URL**，其余（`"abc"`/`"temp/x.txt"`/`"./x.txt"`/`"file://relative/x.txt"`）一律 **`ArgumentError #2004`**，且 `file://` 形式的 `nativePath` 会被**解析成路径**、`url` 归一化成 `file:///…`；我们**全部照单收下**（`nativePath` 原样返回、`url` 拼成 `file://<原串>`，`file:///tmp/x.txt` 更被拼成 `file://file:///tmp/x.txt`）—— 即 `File` 比 AIR **更宽松且在 URL 形态上错**。**注**：这是**既有**缺口（阶段六十四 的 `File` 实现，非本批引入），且**我们自己的示例依赖它**（`examples/stage64.as:16,41`、`examples/sqlite-*.as` 都用相对 `temp/…`）⇒ 修它须**同时**把示例改成绝对路径，故本轮只登记、不动手。**另如实报明两处非本表事项**：① 同轮修掉一个**挡住所有 wasm 构建**的既有限制（`as_rmdir_one` 调 `rmdir()` 而 `<unistd.h>` 在 WASI 下被跳过，改为 `remove()`，见 `docs/zh-cn/win32.md` §2.7）；② `examples/stage63.as` 原写的 `Keyboard.isAccessible`（无括号比较 `== true`）**是示例自己的错** —— `adl 51.4.1` 实测它是**静态方法**（无括号得到 `Function`、`describeType` 报 `method`），我们的成员表本来就对，已改写示例与 `README-CN.md` 的相应描述，**不入本表**。③ 阶段号口径：2026-10-12 的 `flash.data` 立项记录写「阶段一百三十七」，但该号**已被 SWC 命名子件占用**（`src/runtime.ts`），故实现轮按「已用最大 + 1」取 **一百三十九**（一百三十八 为同轮前置）。
+
+> **2026-10-12 追加（阶段一百四十：`array` 回退已修 + 内联退化护栏）**：**新登记 1 行 / 移出 0 行** ⇒ 表内项数 **86 → 87 项**（`未开始` 63 → **64**）。该行是**性能回退**而非保真缺口，与既有「非 GUI 自动回收阈值下限偏低」同类（那行已随阶段八十九·四十七 修掉并移出）：`array` 的 +52% 回退已在阶段一百四十 修掉，剩下 `binarytrees`/`strings` 的 GC 区残差**同轮登记为待开发**（证据：同 C 层 A/B + `-Rpass-missed=inline`）。
+
+> **2026-10-12 追加（阶段一百四十一：`binarytrees`/`strings` 的 GC 区残差已修）**：**移出 1 行 / 新登记 0 行** ⇒ 表内项数 **87 → 86 项**（`未开始` 64 → **63**）。该行是上一轮（阶段一百四十）刚登记的**性能回退**，本轮**已修**故移出：① `binarytrees` 的 +13% 真因是 **`gc_write_barrier` 被 clang 去内联**（模块增大后的内联预算效应，与 GC 核无关），修法是「可内联的两行 wrapper + `volatile` 函数指针指向外联慢路径」；② `strings` 的 +12% 真因是**分配热路径上的两笔固定开销**（`GCT_STRING` 的无用零填充 + 审计门在关闭态仍被调用），**不是**「GC 收得太频」（实测调大阈值反而更慢）。归一化比值 AOT/C：`binarytrees` 1.62 → **1.42**（基线 1.43）、`strings` 2.91 → **2.44**（基线 2.59）。两处都配了内联/热路径护栏（`unit: inline/WriteBarrier`、`unit: inline/AuditGate`）。**另如实报明**：该行归因里「分级空闲链 +6%」的部分**仍存在**（`binarytrees` 自身的内存代价），它不是回退、是有意取舍，未入表。
+
 > **本表只留尚未收尾项**：已完成项一经落地即从本表移出，结论并入对应阶段节（每节末尾的「遗留表」行）；各项的逐轮增删沿革亦在同处，本表不再重复。
 >
 > **2026-10-11 追加登记 2 行**（talkmed-meeting AIR 应用迁移：codegen → C → 链接 → 运行全线打通；本轮**不移出任何行**，新登记 2 项均为**Windows 原生目标的构建/运行缺口**，与上一轮已分类的「环境红」（CRLF 假失败 / macOS 硬编码断言 / linkset 缺 `zlib.h` / examples 层缺 `-lz`与`cc`）**不同源**）其中「真 AIR 应用 `TalkMED Meeting` 启动即抛 `#1009`」一行已于同日**定位并修复根因①、转 `部分完成`**（详见该行）。
 
 > **2026-10-12 追加（v0.4.108 → v0.4.109，阶段一百三十六 补记）**：本轮**不改判任何既有行的事实**，只把「`extends <内建类型>`（含 `extends Array`）不支持」一行由 `未开始` 改 **`部分完成`**（`extends Array` 已落地），故计数 `部分完成` 13 → **14**、`未开始` 62 → **61**，总数不变（**84 项**）。另：该批语言/工具链能力（E4X 通用谓词与 `x.*`、`import` ASI 与 `a.*` 通配、FQN 超类/implements/命名空间、`for-in` 变量类型、正则词法宽容、`extends Array`、`--include-third-party`、文件级撞名上报、`applicationDescriptor`、成员缺口台账 `AS3_MEMBERGAPS`、内建 shell 成员补齐、`CodegenError` 上下文后缀）此前**只落了代码、未落账**，本轮补记于「阶段一百三十六」节。
+
+> **2026-10-12 追加（阶段一百三十七 立项评估：`flash.data` / SQLite 本地数据库）**：**新登记 2 行 / 移出 0 行 / 改写 0 行** ⇒ 表内项数 **84 → 86 项**（`未开始` 61 → **63**）。两行均为**新问题域**，评估全文见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md)：① 「**`Class` 值的静态 getter 分派缺失**」—— `adl 51.4.1` 经 Class 值访问静态成员**四条全通**、我们**三条对一条错**（`c.thing`(静态 getter) 抛**裸 `Error id=0`**；`temp/adlprobe/adl.txt` §1 vs `temp/sqlprobe3.as`），且它使 `Application.NativeApplication` 为 **`NULL`** ⇒ 目标应用的 SQLite 分支**永不进入** + 随后一处**可达** `#1009`（`temp/narepro.as`）——故列为**阻塞级**前置；② 「**`flash.data` / SQLite 本地数据库族未实现**」—— **选型已定：链接官方 SQLite amalgamation**（实测锁定：AIR 的**明文**库 = **标准 SQLite 文件**，宿主机 `sqlite3` `PRAGMA integrity_check` = `ok` 且能 `SELECT` 出行、首 16 字节 = `SQLite format 3\0`；**带密钥**的库 = **私有格式**，`sqlite3` 报 `file is not a database`），**加密不自研、不换 SQLCipher（密钥派生/算法/布局三轴全不兼容）、传密钥时响亮报明**（`AGENTS.md` §1.5）。两行的全部双端实测证据、API 面收敛与 A–E 分阶段路线均落在该文。
+>
+> **同日 后记**：该「阶段一百三十七」的号码**已被 SWC 命名子件占用**（`src/runtime.ts`），实现轮实际记作 **阶段一百三十九**（一百三十八 为同轮前置：`Class` 值静态 getter 修复）。本段登记的两行**已于同日全部收口**：getter 行 → 阶段一百三十八 修掉并移出；`flash.data` 行 → 阶段一百三十九 A–D 落地并移出（另新登记 1 行「加密数据库未支持」，因 `adl` 有而我们没有 ⇒ 属欠账）。
 
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
@@ -8302,6 +8493,10 @@ compile+link only)`，用**用户的命令形态**编译+链接（带 `--run` �
 | **web 端从文档类构造器请求 Stage3D 上下文不可用**，且 wasm 上胶水层抛的 JS 异常 AS3 `try/catch` **捕不到** | 未开始（2026-10-09 阶段一百二十八 实测发现，`temp/mipprobe/`） | web 侧的 WebGL2 上下文由 `Stage.showWindow` 创建，而文档类构造器里 `stage.stage3Ds[0].requestContext3D()` ⇒ `s3d_alloc_target` 的 `glGenFramebuffers(1, &c->fbo)` 读到未初始化的 GL 对象，抛 `TypeError: Cannot read properties of undefined (reading 'createFramebuffer')`。两层缺口：① **时机** —— AIR 允许「构造器里 requestContext3D、第一帧等 `CONTEXT3D_CREATE`」（native/adl 都能跑），web 上该形态必然失败（`Stage.showWindow` 后请求则正常）；② **可观测性** —— 该异常是 emscripten 帧里的 JS 抛错，**不经过 AS3 异常通道**，`try { requestContext3D(); } catch (e:Error) {}` 捕不到，用户只看到一个 unhandled rejection。探针因此改成「先 `showWindow`、再在第一帧请求」（三端一致）。 | 若要收口需两处：① web 侧把 Stage3D 目标的创建推迟到 canvas 就绪（`Stage.showWindow` 之后），并对「此前请求过」的 Context3D 补建（与 native 的「构造器即可请求」形态对齐）；② 给 glue 里所有会抛 JS 异常的入口加守卫，失败走 `as_throw` 而不是 JS throw（把不可捕获变成**响亮**的 AS3 错误）。**成本中**，且要保证 native 语义不变。 |
 | 内建方法的**可选参数**不生效（省略即报缺参） | 未开始（2026-10-09 阶段一百二十八 探针副产物） | `_ctx.drawTriangles(_ib)`（只传索引缓冲，`Stage3D` 里最常见的单参形态）报 `Codegen error at 196:7: missing argument for parameter 'firstIndex'`；`symbols.ts` 的内建方法表里 `firstIndex`/`numTriangles` 写着 `defaultValue: null`，但发射侧不把 `null` 当「用 AIR 的默认值」⇒ `drawTriangles(ib)`/`drawTriangles(ib, 0)` 两种 AIR 合法写法里前者编译失败。同类站点需一次清点（凡 `defaultValue` 非空的内建参数）。 | 发射侧对「实参少于形参且形参有默认值」按 AIR 的默认值补齐（`drawTriangles` 的 `firstIndex=0`/`numTriangles=-1`，其余逐类按 AIR 文档）；补一条单参 `drawTriangles` 的示例/负例。**成本低-中**（要逐个核对内建默认值）。 |
 | `TextField.textWidth` 的字形累进口径与 AIR 有残差 | 未开始（2026-10-09 阶段一百二十八 三端探针实测，`temp/bakeprobe/`） | 同字体同字号（`_typewriter` 12）同一串：`adl 51.4.1` 给 `14.5`，我们给 `14.40234375`（= 14 + 103/256，看着像 26.6 定点累加；`adl` 的 14.5 更接近其内部 twip/半像素口径）。与本表「`TextField.textWidth` 不含行尾空格（AIR 含）」是**同一族**（字形累进与度量舍入），但根因不同：那条是**取哪些字形**，这条是**每个字形的进位数**。像素影响仅限用 `textWidth` 做布局/换行的代码（本阶段探针的包围盒因字段宽度显式给出而不受影响）。 | 先扩大实测样本（多字号 × 多串 × 单字形）定 AIR 的进位舍入口径（是否 `ceil`/half-px/twip 取整），再决定是否复刻；与「设备字体度量表」那条同批评估更省。**成本低（测量）~中（复刻）**。 |
+| **`flash.data` 加密数据库未支持**（`open(path, mode, …, encryptionKey)`、`reencrypt()`、带密钥的 `attach`） | 未开始（2026-10-12 阶段一百三十九 落地 A–D 时按 §1.5 硬判据登记为**欠账**；同轮四个示例的三端验收见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md) §10.4） | **`adl 51.4.1` 实测**：带密钥建库后宿主机 `sqlite3` 打不开（首 16 字节 = 密文而非 `SQLite format 3\0`、报 `file is not a database`）；明文库与带密钥库的字节 16–23 **唯一差别是 byte 20 `0x00`→`0x20`** ⇒ AIR 加密 = **AES-CCM + 16 字节裸密钥 + 每页保留 32 B**（密钥来自 `writeUTFBytes(16 字符口令)`），与 SQLCipher（PBKDF2 + AES-256-CBC + HMAC + 明文 salt、保留 48 B）**密钥派生/算法/页布局三轴全不兼容**；我们现状：非空密钥一律 **`SQLError #3138` 响亮拒绝**（绝**不**静默写明文库） | 若要做：按 avmplus 的加密页编解码逐字节移植（每页 nonce/MAC 布局需逆向实证），或整体换 SQLCipher （**语义不等价**，等于换引擎）。**明确不做**的替代方案：静默忽略密钥 / 静默写明文 —— 那会把「安全属性丢失」变成无声的数据流失，违反 §1.5。**成本高、优先级低**（目标应用零 `import flash.data`、包装层不传密钥；本轮示例与 ADR 已把该缺口写死为「响亮报错」） |
+| **`File` 的路径字符串契约与 AIR 不符**（`new File(x)` 对**非绝对**的 `x` 应抛 `ArgumentError #2004`；`file://` 形式应解析成原生路径） | 未开始（2026-10-12 阶段一百三十九 跑 AIR oracle 时**顺带撞出**；证据 `temp/relpath/`（adl 侧 6 行矩阵 + 我们侧同名探针），本轮只登记不动手） | **`adl 51.4.1` 实测**：`new File("abc")` / `"temp/x.txt"` / `"./x.txt"` / `"file://relative/x.txt"` 一律 `ArgumentError #2004 One of the parameters is invalid.`（抛在 `flash.filesystem::File/set nativePath()`，栈由 `-debug=true` 取到）；`"file:///tmp/x.txt"` 与 `"/tmp/x.txt"` **都成功**且 `nativePath == "/tmp/x.txt"`、`url == "file:///tmp/x.txt"`（**归一化**）。**我们侧**：六个输入**全部成功**，`nativePath` 原样回、`url` 恒为 `file://` + 原串（`file:///tmp/x.txt` ⇒ `file://file:///tmp/x.txt`）。 | 修法：`File` 的 setter 按 AIR 校验（非绝对 ⇒ `#2004`）+ 解析 `file://`（百分号解码、`url` 归一化）；**但**须同步改掉**依赖相对路径**的示例（`examples/stage64.as:16,41` 与四个 `examples/sqlite-*.as`，AIR 上的写法是 `File.applicationDirectory`/绝对路径，oracle harness 已如此改写）。**成本中、优先级低**（不影响 `flash.data` 主线：示例与 oracle 两侧都已按各自口径跑通） |
+
+
 
 ---
 

@@ -172,8 +172,14 @@ Windows 自带的 `tar.exe`（bsdtar）在未开「开发者模式」/没有「�
 3. **`File.deleteDirectory` 删不掉目录**。实现写的是 `remove(nativePath)`——POSIX 的 `remove()`
    对目录等价 `rmdir()`（能删空目录），MSVC 的 `remove()` 只是 `_unlink`（**只能删文件**），
    于是 `d.exists == false` 断言失败。修法：新增 `as_rmdir_one`（Windows 用 `RemoveDirectoryA`、
-   POSIX 用 `rmdir`，与 `as_mkdir_one` 的 `CreateDirectoryA`/`mkdir` 同构），`deleteDirectory`
+   POSIX 用 `remove`，与 `as_mkdir_one` 的 `CreateDirectoryA`/`mkdir` 同构），`deleteDirectory`
    改调它。
+   > **2026-10-12 补**：非 Windows 分支从 `rmdir()` 改成 **`remove()`** —— `rmdir` 声明在
+   > `<unistd.h>`，而该头**在 WASI 下被刻意跳过**（那里没有 `fork/exec`），于是**每个**
+   > `--target wasm` 构建都死于 `call to undeclared function 'rmdir'`（ISO C99 起隐式声明是
+   > 硬错误，`clang` 的新版本不再容忍）。`remove()` 在 `<stdio.h>`（恒在），POSIX 与 wasi-libc
+   > 对目录都按 rmdir 处理，故一个调用同时覆盖两端；Windows 分支仍是 `RemoveDirectoryA`（MSVC
+   > 的 `remove()` 只删文件，见上）。
 
 ### 2.8 高清模式与拖动/缩放三处缺陷（2026-10-10 实机第二跑撞出，已修）
 
