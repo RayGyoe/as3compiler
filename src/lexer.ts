@@ -284,24 +284,38 @@ export function lex(source: string): Token[] {
     const startLine = line;
     const startCol = col;
     if (ch === '/' && peek(1) !== '=' && canStartRegex(tokens[tokens.length - 1])) {
-      advance(); // opening '/'
-      let pattern = '';
-      let inClass = false;
-      let closed = false;
-      while (i < source.length) {
-        const c = source[i];
-        if (c === '\n' || c === '\r') throw new LexError('unterminated regular expression', startLine, startCol);
-        if (c === '\\') {
-          pattern += advance();
-          if (i < source.length) pattern += advance();
-          continue;
+      // Pure scan over indices (no line/col mutation) so a failed
+      // character-class-tracked attempt can be retried leniently. The result's
+      // `end` is the index just past the closing `/`.
+      const scanRegex = (trackClass: boolean): { body: string; end: number; ok: boolean } => {
+        let j = i + 1; // past the opening '/'
+        let body = '';
+        let inClass = false;
+        while (j < source.length) {
+          const c = source[j];
+          if (c === '\n' || c === '\r') break;
+          if (c === '\\') { body += c; j++; if (j < source.length) body += source[j++]; continue; }
+          if (trackClass) {
+            if (c === '[') inClass = true;
+            else if (c === ']') inClass = false;
+          }
+          if (c === '/' && !inClass) return { body, end: j + 1, ok: true };
+          body += c; j++;
         }
-        if (c === '[') inClass = true;
-        else if (c === ']') inClass = false;
-        if (c === '/' && !inClass) { advance(); closed = true; break; }
-        pattern += advance();
-      }
-      if (!closed) throw new LexError('unterminated regular expression', startLine, startCol);
+        return { body, end: j, ok: false };
+      };
+      let scan = scanRegex(true);
+      // A `[` with no matching `]` before the line end is NOT a hard error in
+      // AIR's lexer: it closes the pattern at the next raw `/`. The Markdown.as
+      // idiom `txt.replace( / [  /gx, ... )` (an unescaped `[`, which the regex
+      // engine only rejects at run time) compiles under mxmlc for exactly this
+      // reason. Retrying without class tracking reproduces that, and it can only
+      // turn a would-be LEX ERROR into a token: a genuinely unterminated regex
+      // (no `/` before the line end either way) still fails both passes.
+      if (!scan.ok) scan = scanRegex(false);
+      if (!scan.ok) throw new LexError('unterminated regular expression', startLine, startCol);
+      const pattern = scan.body;
+      while (i < scan.end) advance(); // consume opening '/' .. closing '/'
       let flags = '';
       while (/[a-z]/i.test(source[i] ?? '')) flags += advance();
       for (const f of flags) {

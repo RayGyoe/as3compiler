@@ -1302,6 +1302,16 @@ export interface SwcBakePlacement {
   /** `PlaceObject3` BitmapCached -> `DisplayObject.cacheAsBitmap`. */
   bitmapCached?: boolean;
   charId: number;
+  /**
+   * The `PlaceObject2/3` instance `Name`. AIR exposes every named child of a
+   * symbol's timeline as a PROPERTY of the symbol instance (`upLoadView extends
+   * uploadskin` then reads `select`/`cancel`/`dragfile` as bare identifiers),
+   * because a MovieClip-derived symbol is dynamic: Flash's generated frame code
+   * assigns each name to the parent object at construction. The emitter reproduces
+   * that assignment (see `as_swc_child_name`) instead of declaring traits, which
+   * is what AIR itself does. Absent = the placement is unnamed (the vast majority).
+   */
+  name?: string;
   /** [a, b, c, d, tx, ty]: the SWF matrix with the 16.16 scale fields already
    *  normalized to real factors (1.0 = unscaled) and the twips translation
    *  divided by 20. Nothing downstream divides again. */
@@ -1423,6 +1433,11 @@ export interface SwcBakeFrameOp {
   filters?: SwcFilter[];
   blendMode?: string;
   bitmapCached?: boolean;
+  /**
+   * The `Name` an add/replace record carries (or that a modify sets): the object
+   * at this depth becomes the parent's `name` property, exactly as on frame 1.
+   */
+  name?: string;
   /** Delete record: remove the timeline child at this depth. */
   del?: boolean;
 }
@@ -1668,6 +1683,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
         const prev = byDepth.get(p.depth);
         if (prev && p.matrix !== null) prev.matrix = pxMatrix(p.matrix);
         if (prev && p.cxform !== null) prev.cxform = p.cxform;
+        if (prev && p.name !== null) prev.name = p.name;
         if (prev && p.hidden) prev.hidden = true;
         if (prev && p.filters.length > 0) prev.filters = p.filters;
         if (prev && p.blendMode !== null) prev.blendMode = swfBlendModeName(p.blendMode) ?? undefined;
@@ -1686,6 +1702,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       }
       byDepth.set(p.depth, {
         charId: p.charId, matrix: pxMatrix(p.matrix), cxform: p.cxform, hidden: p.hidden,
+        name: p.name ?? undefined,
         filters: p.filters.length > 0 ? p.filters : undefined,
         blendMode: p.blendMode === null ? undefined : (swfBlendModeName(p.blendMode) ?? undefined),
         bitmapCached: p.bitmapCached || undefined,
@@ -1784,6 +1801,9 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
           const op = byDepth.get(p.depth) ?? { depth: p.depth, modCharId: state.get(p.depth)?.charId };
           if (p.matrix !== null) op.matrix = pxMatrix(p.matrix);
           if (p.cxform !== null) op.cxform = p.cxform;
+          // A modify may also (re)name the object at this depth: the parent's
+          // `name` property then points at it, exactly as on frame 1.
+          if (p.name !== null) op.name = p.name;
           if (p.hidden) op.hidden = true;
           if (p.visibleFlag === true) op.visible = true;
           if (p.filters.length > 0) op.filters = p.filters;
@@ -1796,7 +1816,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
           // only bloat the emitted applier.
           if (op.matrix === undefined && op.cxform === undefined && op.hidden === undefined &&
               op.visible === undefined && op.filters === undefined && op.blendMode === undefined &&
-              op.bitmapCached === undefined) {
+              op.bitmapCached === undefined && op.name === undefined) {
             byDepth.delete(p.depth);
             continue;
           }
@@ -1813,6 +1833,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
         byDepth.set(p.depth, {
           depth: p.depth, charId: p.charId, replace: prev !== undefined || undefined, matrix,
           cxform: p.cxform,
+          name: p.name ?? undefined,
           hidden: p.hidden || undefined,
           visible: p.visibleFlag === true || undefined,
           filters: p.filters.length > 0 ? p.filters : undefined,
@@ -1880,7 +1901,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       const states = (bits: number): SwcBakePlacement[] => button.records
         .filter((r) => (r.states & bits) !== 0)
         .sort((a, b) => a.depth - b.depth)
-        .map((r) => ({ charId: r.charId, matrix: pxMatrix(r.matrix), cxform: r.cxform }));
+        .map((r) => ({ charId: r.charId, matrix: pxMatrix(r.matrix), cxform: r.cxform, name: r.name ?? undefined }));
       characters.push({ id, kind: 'button', button: { up: states(1), over: states(2), down: states(4), hit: states(8) }, scalingGrid: bakeGrid(id) });
       continue;
     }

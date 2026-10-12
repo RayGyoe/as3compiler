@@ -473,7 +473,11 @@ function checkMemberShadow(): string[] {
   check('an unshadowed inherited field is still read/written directly',
     cu.includes('->name) = as_req_name("k"), gc_write_barrier')
     && cu.includes('->name);')
-    && !cu.includes('get_name('));
+    // NOT `!cu.includes('get_name(')`: the built-in shells for Camera/File expose a
+    // real `name` accessor of their own (`Camera_get_name`), so the blunt substring
+    // test stopped isolating this case once those shells landed. What must stay
+    // absent is a VTABLE getter dispatch for the unshadowed `Sprite.name` slot.
+    && !cu.includes('->vtable->get_name('));
 
   // A nearer setter-only override must not make the read disappear (the View3D
   // shape). Before the setter exclusion this shape failed to compile at all.
@@ -495,8 +499,8 @@ function checkMemberShadow(): string[] {
   check('the rule is a single named helper (shadowedForRead), not inlined twice',
     symbolsSrc.includes('shadowedForRead(cls: string, fieldOwner: string, name: string): boolean {'));
   const emitSrc = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
-  check('all five resolution sites consult it (3 reads + 2 type inferences)',
-    (emitSrc.match(/shadowedForRead\(/g) ?? []).length === 5);
+  check('all six resolution sites consult it (4 reads + 2 type inferences)',
+    (emitSrc.match(/shadowedForRead\(/g) ?? []).length === 6);
 
   // The example pins the measured AIR goldens end to end.
   const ex = readFileSync(join(dir, 'member-shadow.as'), 'utf8');

@@ -35,6 +35,13 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #if !defined(_WIN32)
 #include <dirent.h>
 #endif
+// statvfs() backs File.spaceAvailable on POSIX. MSVC has no <sys/statvfs.h> (the
+// Windows branch calls GetDiskFreeSpaceExA instead) and wasm targets have no
+// mounted volume to report, so the header is pulled in under the same guard as
+// the other POSIX-only includes.
+#if !defined(__wasi__) && !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <sys/statvfs.h>
+#endif
 // Emscripten glue (EM_ASM / EM_ASM_INT / EM_JS / UTF8ToString / HEAPU8). Needed
 // by the web target regardless of the network backend: navigateToURL alone uses
 // EM_ASM to call window.open, and the fetch backend adds the rest.
@@ -85,6 +92,22 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #if !defined(__wasi__) && !defined(_WIN32)
 #include <sys/time.h>
 #endif
+// Several Windows SDK / UCRT identifiers are OBJECT-LIKE macros, which silently
+// rewrite a same-named identifier anywhere it appears -- including inside a struct
+// body, where the generated C puts every AS3 field name verbatim. Measured on the
+// real app: AS3 field _timezone hit UCRT <time.h>'s "#define _timezone
+// (*__timezone())" ("field '__timezone' declared as a function") and AS3 field
+// small hit <rpcndr.h>'s "#define small char" ("expected member name or ';' after
+// declaration specifiers"). The generated TU never uses the CRT timezone globals or
+// the legacy 16-bit near/far/small qualifiers, so dropping the macros is lossless.
+#if defined(_WIN32)
+#undef _timezone
+#undef _daylight
+#undef _tzname
+#undef small
+#undef near
+#undef far
+#endif
 
 // __builtin_return_address is a no-op *error* on non-Emscripten wasm (LLVM:
 // "Non-Emscripten WebAssembly hasn't implemented __builtin_return_address").
@@ -97,6 +120,18 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #else
 #define ASC_RETURN_ADDRESS(n) __builtin_return_address(n)
 #endif
+
+// ---------- forward declarations ----------
+// Helpers the preamble calls before their definitions. The preamble is written in
+// dependency order, but a helper reached from an earlier one must still be declared
+// first -- the same reason the generated C prototypes class members.
+static void as_shell_unsupported(const char* what);  // as_show_redraw_regions reports through it
+// Class-value helpers reached from the preamble (as_obj_to_str / as_v_str_val /
+// as_get_qualified_*), all defined with the registry in emitClassRegistry: a Class
+// value is a static as_class object -- never GC-allocated -- so it is recognised by
+// registry identity, and its OWN fqn (not its instance vtable's) is its name.
+static const char* as_class_fqn_of_ptr(void* p);
+static char* as_class_display_name(const char* fqn);  // '[class <short name>]'
 
 // Wall-clock milliseconds since epoch. Native uses gettimeofday for real ms
 // resolution; WASI lacks it, so Date resolution drops to seconds (documented
@@ -130,6 +165,19 @@ static double as_start_ms = 0;
 static int as_getTimer(void) {
     if (as_start_ms == 0) as_start_ms = as_now_ms();
     return (int)(as_now_ms() - as_start_ms);
+}
+
+// flash.display.showRedrawRegions(enable, color): see the codegen note. Accepted and
+// recorded, but never painted: this render walk has no AIR-style region list, and a
+// rectangle around our dirty rect would depict a different thing. AS3's default color
+// (0xFF0000) is what the codegen passes when the second argument is omitted.
+static int ASC_show_redraw_regions = 0;
+static double ASC_show_redraw_regions_color = 16711680.0;
+static void as_show_redraw_regions(int on, double color) {
+    ASC_show_redraw_regions_color = color;
+    if (on == ASC_show_redraw_regions) return;
+    ASC_show_redraw_regions = on;
+    if (on) as_shell_unsupported("flash.display.showRedrawRegions (this renderer does not paint region outlines)");
 }
 
 // ---------- external URL launcher (flash.net.navigateToURL / sendToURL) ----------
@@ -968,7 +1016,15 @@ static char* as_str_from_bool(bool b) {
 }
 
 typedef struct { void* vtable; } as_object_header;
-// The last two slots mirror as_object_vtable's tail: every generated class
+// The last three slots mirror as_object_vtable's tail: every generated class
+// vtable appends Object's own method slots (toString, hasOwnProperty,
+// propertyIsEnumerable) after the common header, so the pre-baked vtables declared
+// here must carry the SAME slots in the SAME order: a shorter object leaves them
+// reading whatever variable happens to follow, and '({a:1}).hasOwnProperty("a")'
+// (a plain object literal, or an Object-typed slot holding a boxed scalar) then
+// jumps through a garbage function pointer. The generated Object_hasOwnProperty is
+// this same as_dyn_has walk and Object_propertyIsEnumerable the same
+// as_dyn_enumerable walk, so the semantics match exactly.
 // vtable (and every pre-baked box vtable) appends Object's own method slots --
 // the effective toString and hasOwnProperty -- directly after the common header,
 // so a vtable pointer can be read generically through this struct. as_obj_to_str
@@ -1003,6 +1059,11 @@ static void* as_iface_lookup(void* obj, const char* name) {
 
 static bool as_is(void* obj, void* target_vt) {
     if (obj == NULL) return false;
+    // A NULL target can never match, and answering it requires reading obj's first
+    // word as a vtable -- which is a data pointer or a mark callback for an Array/
+    // Vector/Dictionary, so the read itself would be the crash. (The core classes
+    // int/uint/Array carry no instance vtable: see Emitter.CORE_CLASS_VT.)
+    if (target_vt == NULL) return false;
     void* vt = ((as_object_header*)obj)->vtable;
     while (vt != NULL) {
         if (vt == target_vt) return true;
@@ -1034,6 +1095,15 @@ static char* as_obj_default_str(void* obj) {
 }
 static char* as_obj_to_str(void* obj) {
     if (obj == NULL) return "null";
+    // A Class VALUE is not an instance: the first word of a class object is the
+    // INSTANCE vtable of the class it denotes, so running that vtable's toString on
+    // it reads the class object as an object of its own class (measured: the
+    // primitive/String comparison 'x == String' segfaulted in as_string_box_to_str).
+    // AIR renders a Class value as [class X].
+    if (!gc_in_heap(obj)) {
+        const char* cfqn = as_class_fqn_of_ptr(obj);
+        if (cfqn != NULL) return as_class_display_name(cfqn);
+    }
     void* vt = ((as_object_header*)obj)->vtable;
     if (vt == NULL) return "Object";
     // A Proxy receiver is stringified through its callProperty("toString")
@@ -1503,6 +1573,12 @@ typedef struct { const char* name; as_value (*fn)(void* _this, as_value* args, i
 // it needs the as_method struct above; as_v_to_number forward-declares it.
 static double as_obj_to_number(void* obj) {
     if (obj == NULL) return 0.0;
+    // A Class value has no numeric conversion: ES3's ToNumber of an object runs
+    // valueOf/toString, and neither of a class object's inherited slots may be
+    // called -- its first word is the INSTANCE vtable of the class it denotes, so
+    // a String class object would run as_string_box_to_str on the class struct
+    // (measured crash). AIR: Number(SomeClass) is NaN, and '5 == SomeClass' is false.
+    if (!gc_in_heap(obj) && as_class_fqn_of_ptr(obj) != NULL) return NAN;
     void* vt = ((as_object_header*)obj)->vtable;
     if (vt == NULL) return 0.0;
     // 1) valueOf(): a user override lives in the method table. The built-in
@@ -1648,11 +1724,30 @@ static char* as_str_from_i64(int64_t x) {
     strcpy(r, d);
     return r;
 }
-// Forward declarations needed by as_v_str_val's Class-value branch below: a
+// The forward declarations needed by as_v_str_val's Class-value branch below: a
 // Class value is a static as_class object (never GC-allocated), so it is
 // recognised by registry identity (as_v_is_class) rather than by tag alone.
+// as_class_fqn_of_ptr answers that same value's OWN name -- never its instance
+// vtable's, which the core classes (int/uint/Array) do not even have -- and
+// as_class_display_name renders the '[class X]' text AIR prints for it.
 static bool as_v_is_class(as_value v);
+static const char* as_class_fqn_of_ptr(void* p);
+static as_value as_v_class_by_name(const char* name);  // registry lookup by name
 static char* as_str_concat_n(int, const char**);
+// AIR's Class-value toString: '[class <short name>]', the tail of the fqn after its
+// last ':'/'.' -- trace(BitmapData) prints '[class BitmapData]' (measured on adl
+// 51.4.1). Shared by as_v_str_val and as_obj_to_str so a Class value in an Object
+// slot and a bare Class value render identically.
+static char* as_class_display_name(const char* fqn) {
+    if (fqn == NULL) fqn = "Class";
+    const char* last = fqn;
+    for (const char* p = fqn; *p != 0; p++) { if (*p == ':' || *p == '.') last = p + 1; }
+    const char* parts[3];
+    parts[0] = "[class ";
+    parts[1] = last;
+    parts[2] = "]";
+    return as_str_concat_n(3, parts);
+}
 static char* as_v_str_val(as_value v) {
     switch (v.tag) {
         case 3: return (char*)v.ptr;
@@ -1668,16 +1763,7 @@ static char* as_v_str_val(as_value v) {
             // identity is the discriminator; every other object falls through
             // unchanged.
             if (!gc_in_heap(v.ptr) && as_v_is_class(v)) {
-                void* vt = v.ptr != NULL ? ((as_object_header*)v.ptr)->vtable : NULL;
-                const char* fqn = (vt != NULL && ((as_vtable_header*)vt)->fqn != NULL)
-                    ? ((as_vtable_header*)vt)->fqn : "Class";
-                const char* last = fqn;
-                for (const char* p = fqn; *p != 0; p++) { if (*p == ':' || *p == '.') last = p + 1; }
-                const char* parts[3];
-                parts[0] = "[class ";
-                parts[1] = last;
-                parts[2] = "]";
-                return as_str_concat_n(3, parts);
+                return as_class_display_name(as_class_fqn_of_ptr(v.ptr));
             }
             // Class instances and object literals stringify through the same
             // virtual-toString path as any other object: 'a' + arr[0] must call
@@ -2288,17 +2374,23 @@ static void as_audio_mark_roots(void) {
 //
 // One static-member entry. kind 1 is a static METHOD: fn is the same boxed-args
 // thunk shape as as_fn_impl and arity is the declared parameter count for
-// Function.length. kind 2 is a static FIELD/const, recorded by NAME ONLY (fn
-// NULL): reading one through a Class value is not implemented, and the name is
-// kept so that case fails loudly instead of silently returning undefined -- which
-// is exactly what AIR returns for a name that is not a static member at all
-// (measured on adl 51.4.1, temp/classprobe: c.nope -> undefined while a real
-// static field reads its value).
+// Function.length. kind 2 is a static FIELD/const: addr points at the C slot the
+// field lives in and slot names that slot's C kind (see as_class_static_read /
+// as_class_static_write), so SomeClass[expr] can read AND write a declared
+// static by name at run time -- exactly the lookup AIR performs there (measured on
+// adl 51.4.1, temp/classprobe: c.nope -> undefined while a real static field
+// reads its value). A name that is not a static member at all stays undefined.
 typedef struct {
     const char* name;
     int kind;
     as_value (*fn)(void* env, as_value* args, int argc);
     int arity;
+    void* addr;
+    int slot;
+    // The declaring class's static initializer (NULL when it has none): the same
+    // X_cinit() a direct C read/write sequences first, so a name-looked-up static
+    // never observes its slot before the initializer ran.
+    void (*cinit)(void);
 } as_class_static;
 
 typedef struct {
@@ -2321,6 +2413,18 @@ typedef struct {
     // never looks a static member up through a Class value).
     const as_class_static* statics;
 } as_class;
+
+// x as Class for a BOXED operand: keep the value when it really is a class
+// reference, else null (measured on adl 51.4.1: Object(Foo) as Class is Foo,
+// 5 as Class and null as Class are null). The ordinary object cast cannot be
+// used: a Class value is a static as_class object whose first word is the INSTANCE
+// vtable of a DIFFERENT class, and Class itself appears in no instance's vtable
+// chain, so a subtype test would answer null for every class reference (that is
+// also why the is-Class operator uses registry identity). as_v_is_class is
+// declared in the preamble ahead of this helper.
+static as_value as_val_as_class(as_value v) {
+    return as_v_is_class(v) ? v : as_v_null();
+}
 
 // Unbox a class reference stored as an object; non-object values yield NULL.
 static as_class* as_v_as_class(as_value v) {
@@ -2372,6 +2476,25 @@ typedef struct {
     struct as_object_s* props; // named (non-index) properties: a.bar, a["bar"]
 } as_array;
 
+// class X extends Array instances (stage 136) through a DYNAMIC receiver: the
+// instance is an ordinary class instance whose elements live in a hidden backing
+// array, so a star-typed receiver still has to see the Array side of the object
+// (var b:* = new Seq(); b.length, b[0], b["foo"] = v, "0" in b). The generated
+// as_arrback_wire() installs one hook that maps an instance to its backing array
+// by class fqn and answers NULL for every other receiver, so the dynamic paths
+// (as_any_length / as_dyn_get / as_dyn_set / as_dyn_has / as_dyn_del) try it
+// LAST -- after the declared fields/getters/setters the object exposes, which is
+// exactly AVM2's lookup order (a real trait wins over the Array property map).
+static as_array* (*as_arrback_hook)(void* obj) = NULL;
+// True when obj is one of those instances, so the sealed-class error paths can
+// tell "no such property on an Array subclass" from the sealed-class error.
+static bool as_arrback_is(void* obj) {
+    return obj != NULL && as_arrback_hook != NULL && as_arrback_hook(obj) != NULL;
+}
+// Keyed read on an Array (canonical index, "length", or a named property);
+// forward-declared here because as_dyn_get reaches it before its definition.
+static as_value as_array_key_get(as_array* a, const char* key);
+
 // AS3 array index keys are canonical non-negative decimal integers WITHOUT leading
 // zeros: "0", "1", "42" are indices; "01", "-1", "1.0", "" and "bar" are not
 // (they address dynamic named properties instead). Returning the index iff the
@@ -2387,6 +2510,64 @@ static bool as_array_index_key(const char* key, int* out) {
     }
     *out = (int)v;
     return true;
+}
+
+// Unimplemented-API report (阶段一百三十六). A shell class exists so the AIR surface
+// a real project imports still COMPILES, but this build has no backend behind it:
+// every shell method body is a no-op returning the type's zero value. The same
+// helper reports an individual member of a REAL built-in that has no
+// implementation here (a mask that is stored but never applied, a file dialog
+// that cannot open, System.setClipboard). Silence would be a semantic lie, so the
+// first few such calls name themselves on stderr (isSupported is false and the
+// API-shape members are real, so a program that checks before it calls never gets
+// here). Capped so a hot path cannot flood the log; the point is to make the gap
+// visible, not to narrate it.
+static int as_shell_warn_count = 0;
+static void as_shell_unsupported(const char* what) {
+    if (as_shell_warn_count >= 5) return;
+    as_shell_warn_count++;
+    fprintf(stderr, "[as3-aot] not implemented by this build: %s\\n", what);
+}
+
+// Resolution probe for a dynamic method call: does the object have a METHOD or a
+// Function-valued dynamic member under that name? This mirrors as_dyn_call's walk (the
+// per-class method reflection tables along the super chain, a Proxy interceptor,
+// then the dynamic property record) WITHOUT invoking anything, so a caller can tell
+// "no such member exists" -- a reportable gap -- from "the member ran and returned
+// null". The Vector/ByteArray dispatch hooks are deliberately not consulted: they
+// are only reachable through a statically star-typed receiver, which never asks this
+// question.
+static bool as_dyn_has_method(void* obj, const char* name) {
+    if (obj == NULL) return false;
+    void* vt = ((as_object_header*)obj)->vtable;
+    while (vt != NULL) {
+        as_method* methods = (as_method*)((as_vtable_header*)vt)->methods;
+        if (methods != NULL) {
+            for (int i = 0; methods[i].name != NULL; i++) {
+                if (strcmp(methods[i].name, name) == 0) return true;
+            }
+        }
+        vt = ((as_vtable_header*)vt)->super;
+    }
+    if (((as_vtable_header*)((as_object_header*)obj)->vtable)->is_proxy) return true;
+    return as_dyn_get(obj, name).tag == 7;
+}
+
+// Call a member of a dynamic-class receiver whose name is not statically known.
+// AIR resolves such a name at run time (MovieClip is declared dynamic in AIR, and
+// every SWC timeline symbol is a MovieClip subclass), so a name the static type does
+// not declare is normally dispatched to the RUNTIME class -- a real method declared
+// by a subclass the static type cannot see, or a Function held in the object's
+// dynamic record. That dispatch happens here; what is left is the case where nothing
+// matches, and that is not "the program is wrong" but "this build cannot see it":
+// a timeline symbol's own ActionScript lives in the library's DoABC
+// (docs/zh-cn/swc.md section 3.3 -- out of scope for the baker). Reported loudly
+// (capped) instead of failing silently; AIR would throw #1069 in the same situation,
+// so the caller still receives undefined.
+static as_value as_dyn_call_reporting(void* obj, const char* name, const char* label, as_value* args, int argc) {
+    as_value r = as_dyn_call(obj, name, args, argc);
+    if (r.tag == 0 && !as_dyn_has(obj, name) && !as_dyn_has_method(obj, name)) as_shell_unsupported(label);
+    return r;
 }
 
 // Dictionary: a flat key/value table with no vtable of its own (its GC tag
@@ -2634,16 +2815,24 @@ static char* as_array_join(as_array* a, const char* sep) {
     // the strlen below would fault on it.
     if (sep == NULL) sep = "null";
     if (a->length == 0) return (char*)"";
+    // A null/undefined ELEMENT contributes the empty string to join(), unlike
+    // String(null)/String(undefined) which yield "null"/"undefined" (ES3 15.4.4.5;
+    // adl 51.4.1 measured: [1,undefined,2].join('-') = [1--2], [null,1].toString()
+    // = ",1", while String(undefined) = "undefined"). as_v_str_val cannot be used
+    // for elements -- it is the general-purpose stringifier -- so join special-cases
+    // the two tags here.
     // Two passes: first measure total length, then copy with a running pointer.
     // This avoids a temporary parts array (one less malloc per join) and stays
     // O(n); strcat would re-scan from the start each time and become O(n^2).
     size_t total = 0;
-    for (int i = 0; i < a->length; i++) total += strlen(as_v_str_val(a->data[i]));
+    for (int i = 0; i < a->length; i++)
+        total += (a->data[i].tag == 0 || a->data[i].tag == 5) ? 0 : strlen(as_v_str_val(a->data[i]));
     size_t seplen = strlen(sep);
     char* r = as_str_alloc(total + seplen * (a->length - 1) + 1);
     char* p = r;
     for (int i = 0; i < a->length; i++) {
         if (i > 0) { memcpy(p, sep, seplen); p += seplen; }
+        if (a->data[i].tag == 0 || a->data[i].tag == 5) continue;
         char* s = as_v_str_val(a->data[i]);
         size_t n = strlen(s);
         memcpy(p, s, n);
@@ -2671,6 +2860,11 @@ static int as_any_length(as_value v) {
     if (v.tag == 4 && v.ptr != NULL && as_vec_get_hook != NULL && as_dyn_kind(v.ptr) == 3)
         return as_v_int_val(as_vec_get_hook(v.ptr, "length"));
     if (v.tag == 4 && v.ptr != NULL && as_ba_is_hook != NULL && as_ba_is_hook(v.ptr)) return as_ba_len_hook(v.ptr);
+    // 'class X extends Array' through a '*' receiver: the Array side's length.
+    if (v.tag == 4 && v.ptr != NULL && as_arrback_hook != NULL) {
+        as_array* ab = as_arrback_hook(v.ptr);
+        if (ab != NULL) return ab->length;
+    }
     return 0;
 }
 static char* as_any_join(as_value v, const char* sep) {
@@ -2846,18 +3040,25 @@ typedef struct {
     void* getters; void* setters; int dyn_offset; const char* fqn; int is_proxy;
     char* (*toString)(void*);
     bool (*hasOwnProperty)(void*, char*);
+    bool (*propertyIsEnumerable)(void*, char*);
 } as_object_vtable;
 
 static bool as_object_own_has_own_property(void* _this, char* name) {
     if (_this == NULL || name == NULL) return false;
     return as_dyn_has(_this, (const char*)name);
 }
+// The pre-baked vtables below need this slot before as_dyn_enumerable is defined;
+// the definition is the runtime walk documented further down.
+static bool as_dyn_enumerable(void* obj, const char* key);
+static bool as_object_own_enumerable(void* _this, char* name) {
+    return as_dyn_enumerable(_this, (const char*)name);
+}
 static char* as_object_box_to_str(void* o) { return as_obj_default_str(o); }
 // Boxed scalars know their own text; defined next to their structs below.
 static char* as_number_box_to_str(void* o);
 static char* as_string_box_to_str(void* o);
 
-static as_object_vtable as_object_vt = { "Object", NULL, NULL, NULL, NULL, NULL, NULL, -1, "Object", 0, as_object_box_to_str, as_object_own_has_own_property };
+static as_object_vtable as_object_vt = { "Object", NULL, NULL, NULL, NULL, NULL, NULL, -1, "Object", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 // ---------- boxed Number (Object slot holding a scalar) ----------
 // AS3's Object is the universal base AND auto-boxes scalars: 'var data:Object =
@@ -2873,7 +3074,7 @@ typedef struct as_number {
 
 static char* as_number_box_to_str(void* o) { return as_str_from_double(((as_number*)o)->value); }
 
-static as_object_vtable as_number_vt = { "Number", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Number", 0, as_number_box_to_str, as_object_own_has_own_property };
+static as_object_vtable as_number_vt = { "Number", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Number", 0, as_number_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_number* as_number_new(double value) {
     as_number* n = (as_number*)gc_alloc(GCT_NUMBER, sizeof(as_number));
@@ -2904,7 +3105,7 @@ typedef struct as_string {
 
 static char* as_string_box_to_str(void* o) { return ((as_string*)o)->value; }
 
-static as_object_vtable as_string_vt = { "String", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "String", 0, as_string_box_to_str, as_object_own_has_own_property };
+static as_object_vtable as_string_vt = { "String", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "String", 0, as_string_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_string* as_string_new(char* value) {
     as_string* s = (as_string*)gc_alloc(GCT_STRING_OBJ, sizeof(as_string));
@@ -2934,7 +3135,7 @@ typedef struct {
     as_fn value;                // the wrapped closure
 } as_function;
 
-static as_object_vtable as_function_vt = { "Function", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Function", 0, as_object_box_to_str, as_object_own_has_own_property };
+static as_object_vtable as_function_vt = { "Function", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Function", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_function* as_function_new(as_fn value) {
     as_function* f = (as_function*)gc_alloc(GCT_FUNCTION_OBJ, sizeof(as_function));
@@ -2964,7 +3165,7 @@ typedef struct as_boolean {
     bool value;
 } as_boolean;
 
-static as_object_vtable as_boolean_vt = { "Boolean", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Boolean", 0, as_object_box_to_str, as_object_own_has_own_property };
+static as_object_vtable as_boolean_vt = { "Boolean", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Boolean", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_boolean* as_boolean_new(bool value) {
     as_boolean* b = (as_boolean*)gc_alloc(GCT_BOOLEAN, sizeof(as_boolean));
@@ -3057,8 +3258,8 @@ typedef struct as_xml_list {
     int length;
 } as_xml_list;
 
-static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, as_object_box_to_str, as_object_own_has_own_property };
-static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, as_object_box_to_str, as_object_own_has_own_property };
+static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_xml_node* as_xml_node_new(char* name) {
     as_xml_node* n = (as_xml_node*)gc_alloc(GCT_XML, sizeof(as_xml_node));
@@ -3073,6 +3274,22 @@ static as_xml_list* as_xml_list_new(as_xml_node** items, int length) {
     l->items = items;
     l->length = length;
     return l;
+}
+
+// Growable list used by the general-predicate filter (emitXmlGeneralFilter): the
+// constructors above all take the finished item buffer, so the selection loop needs
+// an empty list to append to. Same reallocation idiom as as_array_ensure -- GC has
+// no realloc, a fresh buffer is copied over and every copied pointer re-greyed so an
+// object reachable only through the new block cannot be swept mid-mark.
+static as_xml_list* as_xml_list_empty(void) { return as_xml_list_new(NULL, 0); }
+static void as_xml_list_append(as_xml_list* l, as_xml_node* n) {
+    int n2 = l->length + 1;
+    as_xml_node** buf = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, (size_t)n2 * sizeof(as_xml_node*));
+    for (int i = 0; i < l->length; i++) { buf[i] = l->items[i]; gc_write_barrier((void*)buf[i]); }
+    buf[l->length] = n;
+    gc_write_barrier((void*)n);
+    l->items = buf;
+    l->length = n2;
 }
 
 // new XMLList(value) -- the 1-argument E4X list constructor. Semantics measured on
@@ -3350,6 +3567,30 @@ static const char* as_xml_local(const char* qname) {
 }
 static char* as_xml_local_name(as_xml_node* n) { return n ? (char*)as_xml_local(n->name) : NULL; }
 
+// XML.attributes() / XMLList.attributes() (E4X). AIR returns an XMLList of the
+// element's ATTRIBUTE NODES; this subset stores attributes as a name/value pair
+// list and has no attribute nodes, so the value every caller in the wild reads
+// (String(el.attributes()) on the app-descriptor text element with a lang= probe)
+// Config.as) is reproduced by returning the FIRST attribute's value as a String.
+// A multi-attribute element therefore reports only its first attribute: the
+// documented simplification (README-CN.md).
+static char* as_xml_attr_first(as_xml_node* n) {
+    if (n == NULL || n->attr_count <= 0 || n->attr_vals == NULL) return (char*)"";
+    return n->attr_vals[0] ? n->attr_vals[0] : (char*)"";
+}
+
+static char* as_xml_list_attributes(as_xml_list* l) {
+    if (l == NULL || l->length <= 0) return (char*)"";
+    return as_xml_attr_first(l->items[0]);
+}
+
+// XML.appendChild(): needs a mutable tree, which this model does not have (it is
+// parsed once from the source text), so the call names itself on stderr instead
+// of silently dropping the child.
+static void as_xml_append_child_unsupported(void) {
+    as_shell_unsupported((char*)"XML.appendChild");
+}
+
 // @attr: return the attribute value, or the empty string when absent (E4X's
 // undefined attribute stringifies to "", matching AS3's implicit toString).
 static char* as_xml_attr(as_xml_node* n, const char* name) {
@@ -3360,16 +3601,62 @@ static char* as_xml_attr(as_xml_node* n, const char* name) {
     return "";
 }
 
+// xml.@attr = value (the XMLList form writes EVERY node in the list). E4X converts
+// the assigned value to a String, so the emitter stringifies it and this helper only
+// stores text -- the same scalar view as_xml_attr reads back. Attributes are per-node
+// parallel arrays here, so an absent name is APPENDED and an existing name keeps its
+// slot: the order decides which attribute as_xml_attr_first reports first, which must
+// not change under a write.
+static void as_xml_set_attr(as_xml_node* n, const char* name, const char* value) {
+    if (n == NULL || name == NULL || name[0] == 0) return;
+    if (value == NULL) value = "";
+    for (int i = 0; i < n->attr_count; i++) {
+        if (strcmp(n->attr_names[i], name) == 0) {
+            size_t len = strlen(value);
+            char* nv = as_str_alloc(len + 1);
+            memcpy(nv, value, len + 1);
+            n->attr_vals[i] = nv;
+            gc_write_barrier((void*)nv);
+            return;
+        }
+    }
+    int c = n->attr_count + 1;
+    char** names = (char**)gc_alloc(GCT_PTR_ARRAY, (size_t)c * sizeof(char*));
+    char** vals = (char**)gc_alloc(GCT_PTR_ARRAY, (size_t)c * sizeof(char*));
+    // A fresh block is born black during a cycle, so every pointer copied into it
+    // must be re-greyed (see as_array_ensure); the tail slot is filled and barred
+    // afterwards.
+    for (int i = 0; i < n->attr_count; i++) {
+        names[i] = n->attr_names[i]; vals[i] = n->attr_vals[i];
+        gc_write_barrier((void*)names[i]); gc_write_barrier((void*)vals[i]);
+    }
+    size_t ln = strlen(name), lv = strlen(value);
+    char* nn = as_str_alloc(ln + 1); memcpy(nn, name, ln + 1);
+    char* nv2 = as_str_alloc(lv + 1); memcpy(nv2, value, lv + 1);
+    names[c - 1] = nn; vals[c - 1] = nv2;
+    gc_write_barrier((void*)nn); gc_write_barrier((void*)nv2);
+    n->attr_names = names; n->attr_vals = vals; n->attr_count = c;
+    gc_write_barrier((void*)names); gc_write_barrier((void*)vals);
+}
+static void as_xml_list_set_attr(as_xml_list* l, const char* name, const char* value) {
+    if (l == NULL) return;
+    for (int i = 0; i < l->length; i++) as_xml_set_attr(l->items[i], name, value);
+}
+
 // .child: all direct children whose LOCAL name matches (empty name = all
-// children). The requested name is always a bare local name (a source identifier
+// children, and "*" is AIR's documented child(propertyName:Object = "*")
+// wildcard). The requested name is always a bare local name (a source identifier
 // or a computed string), so only the node side is local-ized.
+static int as_xml_name_all(const char* name) {
+    return name == NULL || name[0] == 0 || (name[0] == '*' && name[1] == 0);
+}
 static as_xml_list* as_xml_children(as_xml_node* n, const char* name) {
     if (!n || n->child_count == 0) return as_xml_list_new(NULL, 0);
     as_xml_buf buf = { NULL, 0, 0 };
     for (int i = 0; i < n->child_count; i++) {
         as_xml_node* c = n->children[i];
         if (!c->name) continue;
-        if (name == NULL || name[0] == 0 || strcmp(as_xml_local(c->name), name) == 0) as_xml_buf_push(&buf, (void*)c);
+        if (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0) as_xml_buf_push(&buf, (void*)c);
     }
     return as_xml_list_new((as_xml_node**)buf.items, buf.length);
 }
@@ -3379,11 +3666,74 @@ static as_xml_list* as_xml_list_children(as_xml_list* l, const char* name) {
     as_xml_buf buf = { NULL, 0, 0 };
     if (l) {
         for (int i = 0; i < l->length; i++) {
-            as_xml_list* sub = as_xml_children(l->items[i], name);
-            for (int j = 0; j < sub->length; j++) as_xml_buf_push(&buf, (void*)sub->items[j]);
+            as_xml_list* sub = as_xml_children(l->items[i], name);            for (int j = 0; j < sub->length; j++) as_xml_buf_push(&buf, (void*)sub->items[j]);
         }
     }
     return as_xml_list_new((as_xml_node**)buf.items, buf.length);
+}
+
+// xml.prop = value: an E4X CHILD write (the read side is as_xml_children). The
+// semantics were measured on adl 51.4.1 (temp/airref/Main.as): with
+// <r><a>1</a><a>2</a><b>3</b></r>, x.a = "9" gives <r><a>9</a><b>3</b></r> (the
+// FIRST match's content is replaced -- its own element children are dropped, its
+// attributes kept -- and the REMAINING matches are removed), while x.c = "CC"
+// on <r><a>1</a><b>2</b></r> APPENDS <c>CC</c> after the last child. The assigned
+// value is converted to a String by the emitter, so this helper only stores text
+// (a Number child is its decimal form: x.a = 42 gives <a>42</a>).
+static void as_xml_set_child(as_xml_node* n, const char* name, const char* text) {
+    if (n == NULL || name == NULL || name[0] == 0) return;
+    if (text == NULL) text = "";
+    int first = -1;
+    for (int i = 0; i < n->child_count; i++) {
+        as_xml_node* c = n->children[i];
+        if (c->name != NULL && (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0)) { first = i; break; }
+    }
+    size_t tl = strlen(text);
+    char* nt = as_str_alloc(tl + 1);
+    memcpy(nt, text, tl + 1);
+    if (first < 0) {
+        size_t nl = strlen(name);
+        char* nn = as_str_alloc(nl + 1);
+        memcpy(nn, name, nl + 1);
+        as_xml_node* c = as_xml_node_new(nn);
+        c->text = nt;
+        // The new child is attached to its parent, so XML.parent() sees it -- the
+        // parser does the same for parsed nodes (the tree is otherwise immutable).
+        c->parent = n;
+        int nc = n->child_count + 1;
+        as_xml_node** buf = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, (size_t)nc * sizeof(as_xml_node*));
+        for (int i = 0; i < n->child_count; i++) { buf[i] = n->children[i]; gc_write_barrier((void*)buf[i]); }
+        buf[n->child_count] = c;
+        gc_write_barrier((void*)c);
+        n->children = buf; n->child_count = nc;
+        gc_write_barrier((void*)buf);
+        return;
+    }
+    as_xml_node* tgt = n->children[first];
+    tgt->text = nt;
+    gc_write_barrier((void*)nt);
+    tgt->children = NULL; tgt->child_count = 0;
+    int keep = 0;
+    for (int i = 0; i < n->child_count; i++) {
+        as_xml_node* c = n->children[i];
+        if (i != first && c->name != NULL && (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0)) continue;
+        keep++;
+    }
+    if (keep == n->child_count) return;
+    as_xml_node** buf = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, (size_t)keep * sizeof(as_xml_node*));
+    int k = 0;
+    for (int i = 0; i < n->child_count; i++) {
+        as_xml_node* c = n->children[i];
+        if (i != first && c->name != NULL && (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0)) continue;
+        buf[k] = c; gc_write_barrier((void*)c); k++;
+    }
+    n->children = buf; n->child_count = keep;
+    gc_write_barrier((void*)buf);
+}
+// The XMLList form writes EVERY node in the list, exactly like as_xml_list_set_attr.
+static void as_xml_list_set_child(as_xml_list* l, const char* name, const char* text) {
+    if (l == NULL) return;
+    for (int i = 0; i < l->length; i++) as_xml_set_child(l->items[i], name, text);
 }
 
 // x..name / x..*: every descendant at any depth, self EXCLUDED (E4X's
@@ -3394,7 +3744,7 @@ static void as_xml_desc_walk(as_xml_buf* buf, as_xml_node* n, const char* name) 
     if (!n) return;
     for (int i = 0; i < n->child_count; i++) {
         as_xml_node* c = n->children[i];
-        if (c->name && (name == NULL || name[0] == 0 || strcmp(as_xml_local(c->name), name) == 0)) as_xml_buf_push(buf, (void*)c);
+        if (c->name && (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0)) as_xml_buf_push(buf, (void*)c);
         as_xml_desc_walk(buf, c, name);
     }
 }
@@ -3661,6 +4011,15 @@ static char* as_get_qualified_class_name(as_value v) {
         case 7: return "Function";
         case 4: {
             if (v.ptr == NULL) return "null";
+            // A Class VALUE is a static as_class object (never in the GC heap): its
+            // OWN name is authoritative. Reading the instance vtable instead would
+            // report "Object" for the core classes, which have no boxed instance
+            // type at all -- AIR gives "int"/"uint"/"Array" (measured on adl
+            // 51.4.1: getQualifiedClassName(int) is "int").
+            if (!gc_in_heap(v.ptr)) {
+                const char* cfqn = as_class_fqn_of_ptr(v.ptr);
+                if (cfqn != NULL) return (char*)cfqn;
+            }
             int kind = as_heap_kind(v.ptr);
             if (kind == GCT_CUSTOM) {
                 // A recognized Vector specialization answers its own name; any other
@@ -3708,7 +4067,15 @@ static char* as_get_qualified_superclass_name(as_value v) {
             if (kind == GCT_ARRAY) return (char*)"Object";
             if (kind == GCT_DICT) return (char*)"Object";
             void* vt = ((as_object_header*)v.ptr)->vtable;
-            if (vt == NULL) return NULL;
+            if (vt == NULL) {
+                // A Class value with no instance vtable: a core class (int/uint/Array),
+                // which AIR reports as extending Object (measured on adl 51.4.1:
+                // getQualifiedSuperclassName(int) is "Object"). Object itself and a
+                // plain record have no superclass.
+                const char* cfqn = as_class_fqn_of_ptr(v.ptr);
+                if (cfqn != NULL && strcmp(cfqn, "Object") != 0) return (char*)"Object";
+                return NULL;
+            }
             void* sup = ((as_vtable_header*)vt)->super;
             if (sup == NULL) return NULL;   // Object itself (and a plain record)
             return (char*)((as_vtable_header*)sup)->fqn;   // NULL for an interface
@@ -3752,6 +4119,28 @@ static as_object* as_object_make(int n, char** keys, as_value* vals) {
     as_object* o = as_object_new();
     for (int i = 0; i < n; i++) as_object_set(o, keys[i], vals[i]);
     return o;
+}
+
+// SWC named-child properties (阶段一百三十七). AIR exposes every NAMED child of an
+// exported symbol's timeline as a property of the symbol instance: Flash
+// Professional's generated frame code assigns each instance name to the parent
+// object when the timeline runs, and a symbol class derived from MovieClip is
+// dynamic, so a class upLoadView extends uploadskin may read select / cancel /
+// dragfile as bare identifiers. The baker reproduces that assignment here
+// (emitted per named placement, see emit.ts) instead of declaring traits, which is
+// what AIR itself does at runtime.
+//
+// A SEALED timeline (a plain Sprite-backed symbol) is deliberately skipped, not
+// reported: AVM2's setproperty on a sealed object with an unknown name is a silent
+// no-op, and raising the sealed-property #1056 here would abort a construction AIR
+// completes. The child's own name field is set by the caller either way, so
+// getChildByName keeps working.
+static void as_swc_child_name(void* parent, const char* name, void* child) {
+    if (parent == NULL || name == NULL || child == NULL) return;
+    as_vtable_header* hv = (as_vtable_header*)((as_object_header*)parent)->vtable;
+    if (hv->dyn_offset < 0) return;
+    as_object* dyn = *(as_object**)((char*)parent + hv->dyn_offset);
+    if (dyn != NULL) as_object_set(dyn, name, as_v_obj(child));
 }
 
 // ---------- E4X member helpers used by the emitter ----------
@@ -3833,6 +4222,129 @@ static int as_dyn_kind(void* obj) {
     if (k == GCT_ARRAY) return 2;
     if (k == GCT_CUSTOM) return 3;
     return 0;
+}
+
+// for each (v in <dynamically-typed expr>): what gets enumerated is decided by the
+// VALUE's runtime kind, exactly as AIR dispatches on it -- an Array yields its
+// elements, a Dictionary its values, a Vector.<T> its elements, a dynamic Object
+// (a record) the VALUES of its dynamic properties in insertion order, and a
+// 'class X extends Array' instance its backing array's elements. null/undefined,
+// a number or a string yield no iterations (AIR's for-each over a non-collection
+// is an empty loop). The typed receiver paths in emit.ts do not come here; this is
+// the fallback for a '*' / Object-typed iterable, driven by an index cursor so the
+// emitted body stays a plain C loop whose 'break' is a real break.
+static int as_foreach_next(as_value coll, int* idx, as_value* out) {
+    int i = *idx;
+    if (coll.tag == 6) {                 // boxed Array
+        as_array* a = (as_array*)coll.ptr;
+        if (a == NULL || i >= a->length) return 0;
+        *out = a->data[i]; *idx = i + 1; return 1;
+    }
+    if (coll.tag != 4 || coll.ptr == NULL) return 0;
+    void* p = coll.ptr;
+    int dk = as_dyn_kind(p);
+    if (dk == 2) {
+        as_array* a = (as_array*)p;
+        if (i >= a->length) return 0;
+        *out = a->data[i]; *idx = i + 1; return 1;
+    }
+    if (dk == 1) {
+        as_dict* d = (as_dict*)p;
+        if (i >= d->length) return 0;
+        *out = d->vals[i]; *idx = i + 1; return 1;
+    }
+    if (dk == 3) {
+        if (as_vec_get_hook == NULL) return 0;
+        int n = as_v_int_val(as_vec_get_hook(p, "length"));
+        if (i >= n) return 0;
+        char key[24];
+        snprintf(key, sizeof key, "%d", i);
+        *out = as_vec_get_hook(p, key);
+        *idx = i + 1; return 1;
+    }
+    if (as_arrback_hook != NULL) {
+        as_array* ab = as_arrback_hook(p);
+        if (ab != NULL) {
+            if (i >= ab->length) return 0;
+            *out = ab->data[i]; *idx = i + 1; return 1;
+        }
+    }
+    as_object* rec = NULL;
+    if (((as_object_header*)p)->vtable == (void*)&as_object_vt) rec = (as_object*)p;
+    else {
+        as_vtable_header* hv = (as_vtable_header*)((as_object_header*)p)->vtable;
+        if (hv->dyn_offset >= 0) rec = *(as_object**)((char*)p + hv->dyn_offset);
+    }
+    if (rec == NULL || i >= rec->length) return 0;
+    *out = rec->vals[i]; *idx = i + 1; return 1;
+}
+
+// for (k in <expr>): enumerate the object's ENUMERABLE KEYS, each as an ordinary
+// key ATOM, in AIR's own order -- an Array's in-range non-hole indices as NUMBERS
+// followed by its named properties, a Vector's indices as numbers, a Dictionary's
+// keys with whatever type they were created with, a dynamic object's and a dynamic
+// class instance's string names (the class instance's _dyn table, so its DECLARED
+// fields are never enumerated). Everything else -- a sealed class instance, a
+// String, a number, null -- enumerates nothing at all.
+//
+// Every one of those cases is measured on adl 51.4.1 (temp/airref/Main.as):
+// [10,20] with a.foo=7 -> 0, 1, foo; Vector.<int> -> 0; {a:1,b:2} -> a, b; a
+// Dictionary -> its one key; a dynamic instance -> only the property added at run
+// time; a sealed instance (and a String) -> an empty enumeration. The atom's type
+// is what makes a String-declared loop variable and a star-declared one differ, and
+// the emitter converts the atom to the loop variable's declared type.
+//
+// Same index-cursor protocol as as_foreach_next, so the emitted body stays a plain
+// C loop whose break/continue are real C break/continue.
+static int as_enum_next(as_value coll, int* idx, as_value* out) {
+    if (coll.tag == 6) {                 // boxed Array: indices first, then props
+        as_array* a = (as_array*)coll.ptr;
+        if (a == NULL) return 0;
+        while (*idx < a->length) {
+            int i = (*idx)++;
+            if (a->data[i].tag == 5) continue;   // an undefined element is a hole
+            *out = as_v_num((double)i);
+            return 1;
+        }
+        int j = *idx - a->length;
+        if (a->props == NULL || j >= a->props->length) return 0;
+        *out = as_v_str(a->props->keys[j]);
+        (*idx)++;
+        return 1;
+    }
+    if (coll.tag != 4 || coll.ptr == NULL) return 0;
+    void* p = coll.ptr;
+    int dk = as_dyn_kind(p);
+    if (dk == 3) {                        // Vector.<T>: its indices
+        if (as_vec_get_hook == NULL) return 0;
+        int n = as_v_int_val(as_vec_get_hook(p, "length"));
+        if (*idx >= n) return 0;
+        *out = as_v_num((double)*idx);
+        (*idx)++;
+        return 1;
+    }
+    if (dk == 1) {                        // Dictionary: the keys keep their type
+        as_dict* d = (as_dict*)p;
+        if (*idx >= d->length) return 0;
+        *out = d->keys[*idx];
+        (*idx)++;
+        return 1;
+    }
+    if (as_arrback_hook != NULL) {        // 'class X extends Array': like an Array
+        as_array* ab = as_arrback_hook(p);
+        if (ab != NULL) return as_enum_next(as_v_arr(ab), idx, out);
+    }
+    as_object* rec = NULL;
+    if (((as_object_header*)p)->vtable == (void*)&as_object_vt) rec = (as_object*)p;
+    else {
+        as_vtable_header* hv = (as_vtable_header*)((as_object_header*)p)->vtable;
+        if (hv->is_proxy) return 0;       // the emitter runs AIR's protocol instead
+        if (hv->dyn_offset >= 0) rec = *(as_object**)((char*)p + hv->dyn_offset);
+    }
+    if (rec == NULL || *idx >= rec->length) return 0;
+    *out = as_v_str(rec->keys[*idx]);
+    (*idx)++;
+    return 1;
 }
 
 // A Vector index key that also accepts a NEGATIVE value, so it can be
@@ -3972,6 +4484,16 @@ static as_value as_dyn_get(void* obj, const char* key) {
     if (hv == (as_vtable_header*)&as_object_vt) {
         return as_object_get((as_object*)obj, key);
     }
+    // 'class X extends Array': the instance's own backing array is its property
+    // map, so an undeclared name (a numeric index, "length", or a dynamic
+    // property) is answered from there. This must precede the _dyn branch below:
+    // an Array subclass is dynamic, and everything the Array side owns -- indices,
+    // length, named properties -- belongs to the backing array, not to the slot
+    // table (leaving _dyn empty is what keeps the two views identical).
+    if (as_arrback_hook != NULL) {
+        as_array* ab = as_arrback_hook(obj);
+        if (ab != NULL) return as_array_key_get(ab, key);
+    }
     // Dynamic class instance: undeclared keys live in the _dyn slot table; its
     // byte offset within the struct is recorded in the vtable (dyn_offset >= 0).
     if (hv->dyn_offset >= 0) {
@@ -4028,6 +4550,13 @@ static bool as_dyn_has(void* obj, const char* key) {
     // Proxy receiver: membership goes through hasProperty (not the '_dyn' table).
     if (hv->is_proxy) return as_proxy_has_miss(obj, key);
     if (hv == (as_vtable_header*)&as_object_vt) return as_object_has((as_object*)obj, key);
+    // 'class X extends Array': same membership rule as a literal Array ('length'
+    // true, a canonical in-range index true, a stored named property true),
+    // checked before the _dyn table for the same reason as the read above.
+    if (as_arrback_hook != NULL) {
+        as_array* ab = as_arrback_hook(obj);
+        if (ab != NULL) return as_array_has(ab, key);
+    }
     if (hv->dyn_offset >= 0) {
         as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
         return dyn != NULL && as_object_has(dyn, key);
@@ -4037,6 +4566,67 @@ static bool as_dyn_has(void* obj, const char* key) {
     // non-index key is simply absent.
     if (as_ba_is_hook != NULL && as_ba_is_hook(obj)) return as_ba_has_key_hook(obj, key);
     return false;
+}
+
+// Object.propertyIsEnumerable(name): hasOwnProperty MINUS the trait walk -- TRUE
+// only when name is a DYNAMIC property of the object. An instance trait (field,
+// accessor, method) is never enumerable in this sense, not even on a dynamic
+// class. Measured on adl 51.4.1 (temp/airref/Main.as, all recorded on the
+// registration in symbols.ts): a sealed class -> false for field/getter/method and
+// a missing name; a dynamic class -> false for its declared fields, true for an
+// added property; a record -> true for a key, false for toString; an Array -> true
+// for an in-range index and an added named property, FALSE for length; a Vector
+// and a String -> false.
+static bool as_dyn_enumerable(void* obj, const char* key) {
+    if (obj == NULL || key == NULL) return false;
+    int dk = as_dyn_kind(obj);
+    if (dk == 1) return as_dict_find((as_dict*)obj, as_v_str((char*)key)) >= 0;
+    // Vector.<T>: every element and length are sealed traits in AIR, and a Vector
+    // is not dynamic at all (measured), so nothing here is ever enumerable.
+    if (dk == 3) return false;
+    if (dk == 2) {
+        as_array* a = (as_array*)obj;
+        if (strcmp(key, "length") == 0) return false;   // AIR: a trait, not enumerable
+        int i;
+        if (as_array_index_key(key, &i)) return i >= 0 && i < a->length;
+        return a->props != NULL && as_object_has(a->props, key);
+    }
+    as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
+    // A plain record (an Object literal): every slot is dynamic.
+    if (hv == (as_vtable_header*)&as_object_vt) return as_object_has((as_object*)obj, key);
+    if (hv->is_proxy) return as_proxy_has_miss(obj, key);
+    // 'class X extends Array': same rule as a literal Array.
+    if (as_arrback_hook != NULL) {
+        as_array* ab = as_arrback_hook(obj);
+        if (ab != NULL) {
+            if (strcmp(key, "length") == 0) return false;
+            int i;
+            if (as_array_index_key(key, &i)) return i >= 0 && i < ab->length;
+            return ab->props != NULL && as_object_has(ab->props, key);
+        }
+    }
+    // A dynamic class: only its _dyn slot table holds enumerable properties.
+    if (hv->dyn_offset >= 0) {
+        as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
+        return dyn != NULL && as_object_has(dyn, key);
+    }
+    return false;
+}
+
+// The dynamic-property table of a class instance, or NULL when it has none. AIR's
+// for-in yields EXACTLY the enumerable set (measured on adl 51.4.1: a dynamic class
+// instance enumerates only the properties added at run time -- its DECLARED fields
+// are not enumerated even though they are own properties -- and a sealed instance
+// enumerates nothing at all), and that set is the _dyn slot table. Records, arrays
+// and dictionaries have their own enumeration branches in the emitter.
+static as_object* as_dyn_table(void* obj) {
+    if (obj == NULL) return NULL;
+    as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
+    // A Proxy subclass enumerates through AIR's nextNameIndex protocol instead;
+    // the emitter handles that case, this is only the safety net.
+    if (hv->is_proxy) return NULL;
+    if (hv->dyn_offset < 0) return NULL;
+    return *(as_object**)((char*)obj + hv->dyn_offset);
 }
 
 // Value-returning form of as_dyn_set: AS3's assignment EXPRESSION evaluates to the
@@ -4123,6 +4713,14 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
         as_object_set((as_object*)obj, key, v);
         return;
     }
+    // 'class X extends Array': an undeclared write goes to the instance's backing
+    // array (same key classifier as a literal Array, so 'length' resizes and a
+    // canonical index lands in the elements). Before the _dyn branch, for the same
+    // reason as the read above.
+    if (as_arrback_hook != NULL) {
+        as_array* ab = as_arrback_hook(obj);
+        if (ab != NULL) { as_array_key_set(ab, key, v); return; }
+    }
     if (hv->dyn_offset >= 0) {
         as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
         if (dyn != NULL) as_object_set(dyn, key, v);
@@ -4152,6 +4750,24 @@ static bool as_dyn_del(void* obj, const char* key) {
     if (hv->is_proxy) return as_proxy_del_miss(obj, key);
     // A plain Object record is its own slot table (mirrors as_dyn_get/set/has).
     if (hv == (as_vtable_header*)&as_object_vt) return as_object_del((as_object*)obj, key);
+    // 'class X extends Array': deleting an element/property of the backing array
+    // (identical to 'delete arr[key]'), before the _dyn table as above. A DECLARED
+    // field is a fixed trait, so deleting it reports false and keeps it (only the
+    // Array-side property map is deletable -- same rule as a sealed class).
+    if (as_arrback_hook != NULL) {
+        as_array* ab = as_arrback_hook(obj);
+        if (ab != NULL) {
+            void* pvt = ((as_object_header*)obj)->vtable;
+            while (pvt != NULL) {
+                as_prop* pprops = (as_prop*)((as_vtable_header*)pvt)->props;
+                if (pprops != NULL)
+                    for (int i = 0; pprops[i].name != NULL; i++)
+                        if (strcmp(pprops[i].name, key) == 0) return false;
+                pvt = ((as_vtable_header*)pvt)->super;
+            }
+            return as_v_bool_val(as_array_del(ab, key));
+        }
+    }
     if (hv->dyn_offset >= 0) {
         as_object* dyn = *(as_object**)((char*)obj + hv->dyn_offset);
         return dyn != NULL && as_object_del(dyn, key);
@@ -4248,6 +4864,11 @@ static bool as_array_has(as_array* a, const char* key) {
 // Dynamically-typed ('any') index read: dispatch on the boxed value's runtime
 // tag — record slot, array element, or object field reflection.
 static as_value as_any_get(as_value box, const char* key) {
+    // 'constructor' is Object's own trait, not a slot: every value answers its
+    // runtime class (AIR: Object("a").constructor is [class String],
+    // [1].constructor is [class Array]; measured on adl 51.4.1). Handled before the
+    // tag dispatch because a boxed primitive has no slot table to read at all.
+    if (strcmp(key, "constructor") == 0) return as_v_class_of(box);
     switch (box.tag) {
         case 4: return as_dyn_get(as_v_obj_val(box), key);
         case 6: {
@@ -7043,6 +7664,7 @@ extern void sk_path_cubic_to(void* path, double c1x, double c1y, double c2x, dou
 extern void sk_path_quad_to(void* path, double cx, double cy, double x, double y);
 extern void sk_path_add_rect(void* path, double x, double y, double w, double h);
 extern void sk_path_add_circle(void* path, double cx, double cy, double r);
+extern void sk_path_add_oval(void* path, double x, double y, double w, double h);
 extern void sk_path_close(void* path);
 extern int sk_path_get_bounds(void* path, double* l, double* t, double* r, double* b);
 extern void sk_path_set_even_odd(void* path, int evenOdd);
@@ -7087,7 +7709,10 @@ extern int sk_textlayout_caret_rect(void* para, int index, double* x, double* y,
 // A single styled run of a rich-text paragraph (field order/layout must match
 // struct sk_text_run in vendor/skia_glue.cc). Ranges are UTF-8 byte offsets into
 // the (collapseNewlines-normalized) text, half-open [start, end).
-extern void* sk_textlayout_new_runs(const char* text, const sk_text_run* runs, int run_count, double width, int align, int collapseNewlines);
+// The 'def' argument carries the field's defaultTextFormat face (see
+// sk_set_air_run_height in the glue: AIR fills run gaps AND styles the line box
+// from it).
+extern void* sk_textlayout_new_runs(const char* text, const sk_text_run* def, const sk_text_run* runs, int run_count, double width, int align, int collapseNewlines);
 extern void sk_paint_set_image_filter_blur(void* paint, double sigmaX, double sigmaY);
 extern void sk_paint_set_image_filter_drop_shadow(void* paint, double dx, double dy, double sigmaX, double sigmaY, unsigned rgb, double alpha, double strength, int drawSource);
 extern void sk_paint_set_image_filter_glow(void* paint, double sigmaX, double sigmaY, unsigned rgb, double alpha, double strength);
@@ -7184,6 +7809,7 @@ static inline void as_skia_path_cubic_to(void* p, double c1x, double c1y, double
 static inline void as_skia_path_quad_to(void* p, double cx, double cy, double x, double y) { sk_path_quad_to(p, cx, cy, x, y); }
 static inline void as_skia_path_add_rect(void* p, double x, double y, double w, double h) { sk_path_add_rect(p, x, y, w, h); }
 static inline void as_skia_path_add_circle(void* p, double cx, double cy, double r) { sk_path_add_circle(p, cx, cy, r); }
+static inline void as_skia_path_add_oval(void* p, double x, double y, double w, double h) { sk_path_add_oval(p, x, y, w, h); }
 static inline void as_skia_path_close(void* p) { sk_path_close(p); }
 static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { return sk_path_get_bounds(p, l, t, r, b); }
 static inline void as_skia_path_set_even_odd(void* p, int evenOdd) { sk_path_set_even_odd(p, evenOdd); }
@@ -7229,7 +7855,7 @@ static inline double as_skia_text_measure(const char* t, double sz, int bold, in
 static inline double as_skia_text_measure_n(const char* t, int len, double sz, int bold, int italic) { return sk_text_measure_n(t, len, sz, bold, italic); }
 static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { return sk_textlayout_new(t, fam, sz, bold, italic, color, w, align, collapse); }
 static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double w, int align, int collapse) { return sk_textlayout_new_leading(t, fam, sz, bold, italic, color, leading, w, align, collapse); }
-static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* runs, int n, double w, int align, int collapse) { return sk_textlayout_new_runs(t, runs, n, w, align, collapse); }
+static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { return sk_textlayout_new_runs(t, def, runs, n, w, align, collapse); }
 static inline double as_skia_textlayout_height(void* p) { return sk_textlayout_height(p); }
 static inline double as_skia_textlayout_max_width(void* p) { return sk_textlayout_max_width(p); }
 static inline int as_skia_textlayout_line_count(void* p) { return sk_textlayout_line_count(p); }
@@ -7738,6 +8364,7 @@ static inline void as_skia_path_cubic_to(void* p, double c1x, double c1y, double
 static inline void as_skia_path_quad_to(void* p, double cx, double cy, double x, double y) { (void)p; (void)cx; (void)cy; (void)x; (void)y; }
 static inline void as_skia_path_add_rect(void* p, double x, double y, double w, double h) { (void)p; (void)x; (void)y; (void)w; (void)h; }
 static inline void as_skia_path_add_circle(void* p, double cx, double cy, double r) { (void)p; (void)cx; (void)cy; (void)r; }
+static inline void as_skia_path_add_oval(void* p, double x, double y, double w, double h) { (void)p; (void)x; (void)y; (void)w; (void)h; }
 static inline void as_skia_path_close(void* p) { (void)p; }
 static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { (void)p; (void)l; (void)t; (void)r; (void)b; return 0; }
 // A pure-C build keeps no geometry (the path is NULL), so containment cannot be
@@ -7771,7 +8398,7 @@ static inline double as_skia_text_measure(const char* t, double sz, int bold, in
 static inline double as_skia_text_measure_n(const char* t, int len, double sz, int bold, int italic) { (void)t; (void)len; (void)sz; (void)bold; (void)italic; return 0.0; }
 static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)w; (void)align; (void)collapse; return NULL; }
 static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; return NULL; }
-static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)runs; (void)n; (void)w; (void)align; (void)collapse; return NULL; }
+static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)def; (void)runs; (void)n; (void)w; (void)align; (void)collapse; return NULL; }
 static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }
 static inline int as_skia_textlayout_line_count(void* p) { (void)p; return 0; }
@@ -7843,6 +8470,31 @@ static inline int as_screen_color_depth(void) { return 32; }
 static inline double as_window_device_scale(int w, int h, int* pw, int* ph) { if (pw) *pw = w; if (ph) *ph = h; (void)w; (void)h; return 1.0; }
 static inline double as_window_display_refresh(int win) { (void)win; return 0.0; }
 #endif
+
+// ---------- Graphics.beginGradientFill: what the 2-stop linear path cannot draw ----------
+// The AS3 gradient API is implemented for the case this project actually draws:
+// a LINEAR gradient with exactly two stops spanning the whole ratio range, spread
+// PAD, focal 0 -- placed by the caller's Matrix (which maps the gradient space
+// +-819.2 px onto the shape). Any OTHER shape of the call would otherwise paint a
+// gradient that is not the one asked for, so it reports itself ONCE here instead
+// (its own flag, not as_shell_warn_count: this is a documented approximation every
+// frame of a rendered app could hit, not a one-off missing member).
+static void as_gradient_general_report(void) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    fprintf(stderr, "[as3-aot] Graphics.beginGradientFill: this build draws a 2-stop LINEAR gradient with SpreadMethod.PAD; radial / extra stops / other spreads / a focal point or a narrowed ratio range are approximated\\n");
+}
+// InterpolationMethod.LINEAR_RGB interpolates the stops in linear RGB (Adobe's
+// documented difference from the default InterpolationMethod.RGB). Skia's gradient
+// shader interpolates in the destination space, so a LINEAR_RGB gradient here is
+// interpolated in sRGB -- i.e. every intermediate pixel can differ. Reported once.
+static void as_gradient_linearrgb_report(void) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    fprintf(stderr, "[as3-aot] Graphics.beginGradientFill: InterpolationMethod.LINEAR_RGB is not implemented; the gradient is interpolated in sRGB\\n");
+}
 
 // ---------- asynchronous IO jobs (stage 89-45) ----------
 // AIR performs URLLoader / FileStream.openAsync / Loader work *off* the AS3
@@ -10178,6 +10830,18 @@ static void* as_async_submit_unsupported(void* obj, void (*finish)(void*), const
 // minus used). Their absolute values do NOT equal AIR's; only the trend
 // (grows with allocation, shrinks with release) is comparable. privateMemory is
 // the real OS process resident size and IS directly comparable.
+//
+// System.useCodePage is AIR's legacy "encode URL/URLVariables data with the system
+// code page instead of UTF-8" flag (default false). Our URL layer always encodes
+// UTF-8, which is exactly what AIR does while the flag is false -- so the flag is
+// STORED (a read returns what was written, AS3 property semantics) and a write of
+// TRUE reports the one case this build cannot honour, once, instead of silently
+// changing nothing.
+static bool as_sys_use_code_page = false;
+static void as_sys_set_use_code_page(bool v) {
+    as_sys_use_code_page = v;
+    if (v) as_shell_unsupported("System.useCodePage=true (this build always encodes URL data as UTF-8)");
+}
 static double as_system_total_memory_number(void) {
     return (double)(as_arena_used_bytes() + as_heap_bytes + gc_heap_used_bytes());
 }
@@ -10411,6 +11075,43 @@ static int as_cap_screen_resolution_y(void) {
 // fallback) — a documented subset, not a real physical-DPI read.
 static double as_cap_screen_dpi(void) {
     return 72.0;
+}
+// Capabilities.serverString: AIR returns a URL-encoded summary of the runtime —
+// "a URL-encoded string containing the properties of the player, including version,
+// platform, language, and a random number" (AIR reference). Adobe's exact fingerprint
+// byte format is not reproducible, so this build emits its OWN values in the same
+// url-encoded key=value shape (the AIR keys that carry the same meaning are reused:
+// SV version, MP manufacturer, p platform, l language, A=t/SA=t the two "available"
+// flags AIR always sets) plus a REAL per-process random component -- callers use the
+// string as PRNG/GUID entropy (com.hurlant Random, utils.Guid), so a constant would
+// be a security-relevant lie. Computed once and cached, which is AIR's behaviour too
+// (the property is stable for the life of the process). Deviation in TODO.md.
+static char* as_cap_server_string(void) {
+    static char* cached = NULL;
+    if (cached != NULL) return cached;
+    // Entropy: the clock, the allocator's address (ASLR) and rand() -- one per
+    // process is all the property promises, and it is what makes two runs differ.
+    unsigned long long nonce =
+        (unsigned long long)(as_now_ms() * 1000.0)
+        ^ (unsigned long long)(uintptr_t)&cached
+        ^ ((unsigned long long)(unsigned int)rand() << 32)
+        ^ (unsigned long long)(unsigned int)rand();
+    char* nbuf = as_str_alloc(24);
+    snprintf(nbuf, 24, "%llu", nonce);
+    const char* parts[12];
+    parts[0] = "A=t&SA=t&SV=";
+    parts[1] = as_cap_version();
+    parts[2] = "&MP=";
+    parts[3] = "AS-AOT";
+    parts[4] = "&p=";
+    parts[5] = as_cap_os();
+    parts[6] = "&l=";
+    parts[7] = as_cap_language();
+    parts[8] = "&r=";
+    parts[9] = nbuf;
+    parts[10] = "";
+    cached = as_str_concat_n(11, parts);
+    return cached;
 }
 
 // ===== AGAL translator (stage 80) =====

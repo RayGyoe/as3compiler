@@ -9,6 +9,7 @@ import './unit/transport.ts';
 import './unit/render.ts';
 import './unit/display.ts';
 import './unit/text-input.ts';
+import './unit/ime.ts';
 import './unit/numeric.ts';
 import './unit/bytearray-amf.ts';
 import './unit/reflection.ts';

@@ -190,16 +190,28 @@ class Parser {
   }
 
   // `import a.b.C;` or `import a.b.*;` — record the imported qualified name for
-  // symbol resolution across files/namespaces.
+  // symbol resolution across files/namespaces. The wildcard keeps its `.*`
+  // marker: consumers (`buildImportAlias`, reach.ts) expand a wildcard against
+  // the whole class map, and without the marker `import flash.events.*` was
+  // recorded as the bare package `flash.events` -- i.e. a request to import a
+  // CLASS named `events` in package `flash` -- so the wildcard contributed no
+  // aliases at all and a bare `Event` fell through to the global last-wins
+  // short-name table (which picks starling.events.Event when a project also
+  // ships starling, making flash-only constants like Event.INIT unresolvable).
   private parseImport(): void {
     this.expect('import');
     let path = this.expectIdent().value;
     while (this.at('.')) {
       this.next();
-      if (this.at('*')) { this.next(); break; }
+      if (this.at('*')) { this.next(); path += '.*'; break; }
       path += '.' + this.expectIdent().value;
     }
-    this.expect(';');
+    // AIR's lexer applies ASI to `import`, and real-world trees rely on it: the
+    // hosted protobuf runtime writes `import flash.errors.IllegalOperationError`
+    // with NO trailing `;`, and mxmlc accepts it. consumeSemicolon() is exactly
+    // that rule (a `;`, a `}`/EOF, or a line terminator ends the directive), so a
+    // same-line `import a.b import c.d` is still a hard error.
+    this.consumeSemicolon();
     this.imports.push(path);
   }
 
@@ -614,13 +626,19 @@ class Parser {
       const nameTok = this.peek();
       if (nameTok.kind === 'ident' && !isKeyword(nameTok.value)) {
         this.next(); // name
-        if (this.at(':')) { this.next(); this.parseType(); }
+        // The declared loop-variable type is kept: for-in keys arrive as ATOMS
+        // (a number for an Array/Vector index, a string for a name) and AS3
+        // coerces each one to this type -- `for (var k:String in arr)` yields
+        // "0"/"1" while `for (var k:* in arr)` yields the numbers (measured on
+        // adl 51.4.1).
+        let varType: ASType | null = null;
+        if (this.at(':')) { this.next(); varType = this.parseType(); }
         if (this.atIdent('in')) {
           this.next();
           const iterable = this.parseExpression();
           this.expect(')');
           const body = this.parseStatement();
-          return { kind: 'ForIn', varName: nameTok.value, declares, iterable, body };
+          return { kind: 'ForIn', varName: nameTok.value, varType, declares, iterable, body };
         }
       }
       this.pos = saved; // backtrack: treat as C-style for
@@ -785,13 +803,16 @@ class Parser {
     let superClass: string | null = null;
     if (this.atIdent('extends')) {
       this.next();
-      superClass = this.expectIdent().value;
+      // AS3 allows a fully-qualified superclass (`extends com.netease.protobuf.Message`,
+      // the haXe/protoc-generated protobuf runtime writes exactly that). resolveType
+      // maps a dotted name to the sanitized FQN key, so it is kept verbatim here.
+      superClass = this.parseQualifiedName();
     }
     const implementsList: string[] = [];
     if (this.atIdent('implements')) {
       this.next();
       for (;;) {
-        implementsList.push(this.expectIdent().value);
+        implementsList.push(this.parseQualifiedName());
         if (this.at(',')) { this.next(); continue; }
         break;
       }
@@ -822,7 +843,7 @@ class Parser {
       if (this.atIdent('use')) {
         this.next(); // use
         this.expect('namespace');
-        this.expectIdent(); // namespace name
+        this.parseQualifiedName(); // namespace name (may be dotted)
         this.consumeSemicolon();
         continue;
       }
@@ -850,8 +871,10 @@ class Parser {
           this.next(); // override is handled implicitly via the vtable slot
           modifierCount++;
         } else if (this.isNamespaceModifier()) {
-          nsQualifier = this.peek().value;
-          this.next(); // namespace qualifier (e.g. starling_internal, flash_proxy)
+          const nsLen = this.namespaceQualifierLength();
+          let q = '';
+          for (let i = 0; i < nsLen; i++) q += this.next().value;
+          nsQualifier = q;
           modifierCount++;
         } else {
           break;
@@ -943,7 +966,7 @@ class Parser {
     if (this.atIdent('extends')) {
       this.next();
       for (;;) {
-        extendsList.push(this.expectIdent().value);
+        extendsList.push(this.parseQualifiedName());
         if (this.at(',')) { this.next(); continue; }
         break;
       }
@@ -1131,17 +1154,43 @@ class Parser {
           // @attr == "str" form (asset metadata extraction), so the predicate is
           // compiled down to an attribute-name / comparison pair rather than a
           // general predicate expression.
+          //
+          // AS3 ALSO accepts a fully general predicate `expr.(anything)` (comma
+          // expression included), and mxmlc compiles it for ANY receiver; whether
+          // the receiver is XML/XMLList is only checked at RUN time. Measured on
+          // adl 51.3.2 (temp/talkmed/e4xprobe): `y.(y.t++, 0)` on an Object and on
+          // a user class both throw `TypeError: Error #1123: Filter operator not
+          // supported on type <FQN>`. So the general form is parsed here as a plain
+          // value expression and lowered by codegen (see emitFilter).
           this.next(); // '.'
           this.next(); // '('  (the filter operator)
-          this.expect('@');
-          const attr = this.expectIdent().value;
-          const opTok = this.next();
-          if (opTok.value !== '==' && opTok.value !== '!=') {
-            throw new ParseError(`unsupported E4X filter operator '${opTok.value}' (expected == or !=)`, opTok);
+          if (this.at('@')) {
+            this.next(); // '@'
+            const attr = this.expectIdent().value;
+            const opTok = this.next();
+            if (opTok.value !== '==' && opTok.value !== '!=') {
+              throw new ParseError(`unsupported E4X filter operator '${opTok.value}' (expected == or !=)`, opTok);
+            }
+            const value = this.parseAssignment();
+            this.expect(')');
+            expr = { kind: 'Filter', object: expr, attr, op: opTok.value, value };
+          } else {
+            // General predicate. `value` holds the predicate expression; the
+            // attr/op fields are unused and `general` selects the codegen path.
+            const pred = this.parseExpression(); // comma expression allowed
+            this.expect(')');
+            expr = { kind: 'Filter', object: expr, attr: '', op: '', value: pred, general: true };
           }
-          const value = this.parseAssignment();
-          this.expect(')');
-          expr = { kind: 'Filter', object: expr, attr, op: opTok.value, value };
+        } else if (this.peek(1).value === '*') {
+          // E4X ALL-CHILDREN wildcard: `x.*` is an XMLList of every CHILD NODE of x
+          // (measured on adl 51.4.1: <a>text</a>.* is one TEXT node and
+          // <a k="v"><b/><c/></a>.* is b,c -- an attribute is never included, and
+          // `x.@*` is the separate all-attributes operator handled above). Kept in
+          // the AST as a Member named '*' and lowered to the children() axis, which
+          // already treats '*' as "match any name".
+          this.next(); // '.'
+          this.next(); // '*'
+          expr = { kind: 'Member', object: expr, property: '*' };
         } else {
           this.next();
           const prop = this.expectIdent().value;
@@ -1201,6 +1250,24 @@ class Parser {
     if (t.kind === 'regex') {
       this.next();
       return { kind: 'RegExp', pattern: t.value, flags: t.regexFlags ?? '' };
+    }
+
+    if (t.kind === 'symbol' && t.value === '@') {
+      // E4X ATTRIBUTE on the implicit CONTEXT node -- a filter predicate's scope is
+      // the node being tested, so `x.*.(String(@type) == "int")` reads the tested
+      // node's @type (protobuf's TextFormat does exactly this, and also
+      // `type[@name]`). Parsed with the implicit flag; codegen binds it to the
+      // predicate's context local (rewriteE4xPredicate) and reports loudly anywhere
+      // else, where there is no context node.
+      this.next(); // '@'
+      if (this.at('[')) {
+        this.next();
+        const index = this.parseExpression();
+        this.expect(']');
+        return { kind: 'E4xName', object: { kind: 'Var', name: 'this' }, index, attr: true, implicitContext: true } as Expr;
+      }
+      const attr = this.at('*') ? this.next().value : this.expectIdent().value;
+      return { kind: 'AttrAccess', object: { kind: 'Var', name: 'this' }, name: attr, implicitContext: true };
     }
 
     if (t.kind === 'xml') {
@@ -1432,34 +1499,53 @@ class Parser {
   }
 
   // `[public] namespace name;` — declares a custom namespace (Starling's
-  // `starling_internal`). Namespaces only gate compile-time visibility, which the
-  // AOT translation does not enforce, so the declaration is consumed and dropped.
+  // `starling_internal`. The URL-qualified form `public namespace bi_internal =
+  // "http://...";` is the same declaration with an explicit name string. Namespaces
+  // only gate compile-time visibility, which the AOT translation does not enforce,
+  // so both the name and any initializer are consumed and dropped.
   private parseNamespaceDecl(): Stmt {
     this.expect('namespace');
     this.expectIdent(); // namespace name
+    if (this.at('=')) {
+      this.next();
+      this.parseExpression(); // namespace URI initializer, dropped
+    }
     this.consumeSemicolon();
     return { kind: 'Block', body: [] };
   }
 
-  // `use namespace name;` — opens a namespace for the current scope. Transparent
-  // in the AOT translation (no visibility enforcement); consumed and dropped.
+  // `use namespace a.b.c;` — opens a namespace (possibly a dotted one, e.g.
+  // `use namespace com.netease.protobuf.used_by_generated_code;`) for the current
+  // scope. Transparent in the AOT translation (no visibility enforcement);
+  // consumed and dropped.
   private parseUseNamespace(): Stmt {
     this.expect('use');
     this.expect('namespace');
-    this.expectIdent(); // namespace name
+    this.parseQualifiedName(); // namespace name (may be dotted)
     this.consumeSemicolon();
     return { kind: 'Block', body: [] };
   }
 
   // A namespace qualifier immediately before a class member (e.g.
-  // `starling_internal function f()`): an identifier that is not a modifier
-  // keyword, directly followed by a member-declaration keyword. Namespaces are
-  // transparent in AOT, so the qualifier is recognised and dropped.
-  private isNamespaceModifier(): boolean {
+  // `starling_internal function f()`, or the DOTTED
+  // `override com.netease.protobuf.used_by_generated_code final function ...` the
+  // protoc-generated protobuf runtime writes). Namespaces are transparent in AOT,
+  // so the qualifier is recognised and dropped. Returns the number of tokens the
+  // qualifier spans (identifier + any `.ident` chain), or 0 when the current token
+  // is not one — the member loop then consumes exactly that many tokens.
+  private namespaceQualifierLength(): number {
     const t = this.peek();
-    if (t.kind !== 'ident' || isKeyword(t.value)) return false;
-    const nxt = this.peek(1).value;
-    return nxt === 'function' || nxt === 'var' || nxt === 'const' ||
-      nxt === 'static' || nxt === 'override' || nxt === 'get' || nxt === 'set';
+    if (t.kind !== 'ident' || isKeyword(t.value)) return 0;
+    let k = 1;
+    while (this.peek(k).value === '.' && this.peek(k + 1).kind === 'ident') k += 2;
+    const nxt = this.peek(k).value;
+    const isMemberKeyword = nxt === 'function' || nxt === 'var' || nxt === 'const' ||
+      nxt === 'static' || nxt === 'override' || nxt === 'get' || nxt === 'set' ||
+      nxt === 'final' || nxt === 'native';
+    return isMemberKeyword ? k : 0;
+  }
+
+  private isNamespaceModifier(): boolean {
+    return this.namespaceQualifierLength() > 0;
   }
 }

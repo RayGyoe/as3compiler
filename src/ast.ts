@@ -58,7 +58,7 @@ export type Stmt = (
   | { kind: 'While'; cond: Expr; body: Stmt }
   | { kind: 'DoWhile'; cond: Expr; body: Stmt }
   | { kind: 'For'; init: Stmt | null; cond: Expr | null; update: Expr | null; body: Stmt }
-  | { kind: 'ForIn'; varName: string; declares: boolean; iterable: Expr; body: Stmt }
+  | { kind: 'ForIn'; varName: string; varType: ASType | null; declares: boolean; iterable: Expr; body: Stmt }
   | { kind: 'ForEachIn'; varName: string; varType: ASType | null; declares: boolean; iterable: Expr; body: Stmt }
   | { kind: 'Switch'; disc: Expr; cases: SwitchCase[] }
   | { kind: 'Break'; label: string | null }
@@ -124,7 +124,7 @@ export type Expr =
   | { kind: 'Assign'; op: string; target: Expr; value: Expr }
   | { kind: 'Call'; callee: Expr; args: Expr[] }
   | { kind: 'Member'; object: Expr; property: string }
-  | { kind: 'AttrAccess'; object: Expr; name: string }
+  | { kind: 'AttrAccess'; object: Expr; name: string; implicitContext?: boolean }
   // E4X computed name, both axes (measured on adl 51.4.1, temp/nsbracket/): the
   // child axis `x.ns::[expr]` (attr=false) picks the child whose LOCAL name is the
   // value of `expr`, and the attribute axis `x.@[expr]` (attr=true) picks that
@@ -132,8 +132,8 @@ export type Expr =
   // computed at run time; the namespace qualifier is dropped like every other
   // `::` (namespaces are transparent in the AOT translation), so the child form
   // is the same local-name lookup `x.name` already performs.
-  | { kind: 'E4xName'; object: Expr; index: Expr; attr: boolean }
-  | { kind: 'Filter'; object: Expr; attr: string; op: string; value: Expr }
+  | { kind: 'E4xName'; object: Expr; index: Expr; attr: boolean; implicitContext?: boolean }
+  | { kind: 'Filter'; object: Expr; attr: string; op: string; value: Expr; general?: boolean }
   | { kind: 'SuperMethod'; method: string; args: Expr[] }
   | { kind: 'SuperProperty'; property: string }
   | { kind: 'Is'; obj: Expr; typeName: string }

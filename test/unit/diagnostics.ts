@@ -169,21 +169,24 @@ function checkCodegenDiagnostics(): string[] {
   // `extends <built-in type>`: `resolveType` maps the type-only built-ins to
   // non-class CTypes with NO className, so an earlier version reported a superclass
   // literally named "undefined" (e.g. `class E extends Array {}`). The message must
-  // name the real limitation — subclassing Array is a genuine, AIR-supported gap
-  // (2 files in the talkmed-meeting closure use it).
-  const gi3 = gen('class E extends Array {}');
+  // name the real limitation — subclassing String/Number/int is still a gap
+  // (`extends Array` used to be one; it is implemented now, see gi3b below).
+  const gi3 = gen('class E extends String {}');
   check('subclassing a built-in type names it instead of reporting \'undefined\'',
-    gi3?.message === "Codegen error at 1:1: unsupported superclass 'Array' of 'E': subclassing built-in types is not implemented");
+    gi3?.message === "Codegen error at 1:1: unsupported superclass 'String' of 'E': subclassing built-in types is not implemented");
+  const gi3b = gen('class E extends Array {}');
+  check('a built-in that IS subclassable compiles (Array, via the hidden _arr slot)',
+    gi3b === null);
   const gi4 = gen('interface I {}\nclass E extends I {}');
   check('extending an interface is reported as such',
     gi4?.message === "Codegen error at 2:1: class 'E' cannot extend interface 'I'");
 
   const g5 = gen('function f(a:int):void {}\nf(1, 2);');
   check('an arity mismatch is reported with the expected and actual counts',
-    g5?.message === 'Codegen error at 2:1: too many arguments (expected 1, got 2) for a');
+    g5?.message === 'Codegen error at 2:1: too many arguments (expected 1, got 2) for (params: a) in <top>.<top>');
   const g6 = gen('function f(a:int):void {}\nf();');
   check('a missing argument names the parameter',
-    g6?.message === "Codegen error at 2:1: missing argument for parameter 'a'");
+    g6?.message === "Codegen error at 2:1: missing argument for parameter 'a' in <top>.<top>");
 
   // The statement stamp must report the statement's OWN line, not the file start.
   const g7 = gen('class A { }\n\n\nclass B extends Nope {}');
@@ -208,7 +211,7 @@ function checkCodegenDiagnostics(): string[] {
   // text (both would break if the prefix leaked in).
   const g10 = gen('class P { public function P(a:int):void { } }\nvar p:* = new P();');
   check('a re-wrapped message keeps exactly one position prefix',
-    g10?.message === "Codegen error at 2:1: missing argument for parameter 'a' (constructor of P, args=0, params=[a])");
+    g10?.message === "Codegen error at 2:1: missing argument for parameter 'a' in <top>.<top> (constructor of P, args=0, params=[a])");
   check('codegenBareMessage strips the position prefix',
     g1 !== null && codegenBareMessage(g1 as never) === "unknown superclass 'Nope' of 'A'");
   // The `with` lexical fallback still degrades an unknown name into AIR's runtime

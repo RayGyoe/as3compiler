@@ -553,7 +553,7 @@ function checkWasmExport(): string[] {
   check('the same function is static without --export (negative control)',
     /^static int fib\(int n\);/m.test(withoutKeep));
   check('index.ts threads the CLI export list into codegen',
-    /generateC\(program, cfg\.exports, swcResources, swcBake, embedResources, embedFieldInits\)/.test(readFileSync(join(root, 'src', 'index.ts'), 'utf8')));
+    /generateC\(program, cfg\.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml\)/.test(readFileSync(join(root, 'src', 'index.ts'), 'utf8')));
 
   // (2) [WasmExport] on a packaged top-level function must be collected.
   const pkgSrc = [

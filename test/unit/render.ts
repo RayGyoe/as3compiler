@@ -142,18 +142,28 @@ function checkFontMetrics(): string[] {
   // without it every forced line box came out exactly one line gap short
   // (measured: 14 instead of 15 for a 12 px Monaco line).
   check('the strut height is pre-multiplied by the raw metric ratio',
-    glue.includes('am.rawFull / (am.rawSum * size)') && /boxHeight \* am\.rawFull/.test(glue));
-  // Negative leading: Skia clamps StrutStyle::leading < 0 to 0, so AIR's
-  // "leading -3 shrinks the box to 12" case has to go through the height.
-  check('negative leading is folded into the height, positive stays a leading',
-    glue.includes('(leading < 0.0) ? box : am.model') &&
-    glue.includes('if (leading > 0.0) strut.setLeading((SkScalar)(leading / size));') &&
-    !glue.includes('strut.setLeading((SkScalar)leading);'));
-  // Every paragraph builder installs the strut (flat field, flat field with
-  // TextFormat.leading, htmlText runs) -- one miss silently reverts that path to
-  // Skia's own line height.
-  check('all three paragraph builders install the AIR line box',
-    (glue.match(/sk_set_air_strut\(ps,/g) ?? []).length === 3);
+    glue.includes('am.rawFull / (am.rawSum * size)') && /strut\.setHeight\(\(SkScalar\)\(box \* am\.rawFull/.test(glue));
+  // AIR's box is ascent + descent + leading with an ascent/descent split that
+  // ignores the leading, and Skia has no usable leading knob here: StrutStyle's
+  // leading never reaches the line box (measured -- a leading of 4 left a 2-line
+  // paragraph at 2*model) and a negative one is clamped to 0 outright, so BOTH
+  // signs go through the height and sk_textlayout_line_box scales the split back.
+  check('leading, either sign, is folded into the strut height',
+    glue.includes('strut.setHeight((SkScalar)(box * am.rawFull / (am.rawSum * size)));') &&
+    !glue.includes('strut.setLeading(') &&
+    glue.includes('const double model = lh - leading;'));
+  // Both run-free paragraph builders install the strut (flat field, flat field
+  // with TextFormat.leading) -- the rich-text builder cannot: it must give EACH
+  // run its own AIR box (TextStyle::heightOverride) because a strut would force
+  // one box on every line (measured on adl: a 12 px default with a 24 px run gives
+  // 13.975/27.950, and the gap line must follow defaultTextFormat). One miss
+  // silently reverts that path to Skia's own line height.
+  check('the two run-free paragraph builders install the AIR strut',
+    (glue.match(/sk_set_air_strut\(ps,/g) ?? []).length === 2);
+  check('the rich-text builder uses a per-run AIR box instead of the strut',
+    glue.includes('sk_set_air_run_height(ts, r.family, r.size, r.bold, r.italic, r.leading);') &&
+    glue.includes('ts.setHeightOverride(true);') &&
+    !/sk_textlayout_new_runs[\s\S]{0,2400}?sk_set_air_strut/.test(glue));
   // AIR's field height omits the TRAILING inter-line leading (measured: 19/34/53/
   // 72 for 1..4 lines at a 19 px stride), which is one subtraction in the getter.
   check('textHeight drops the trailing leading for a multi-line field',

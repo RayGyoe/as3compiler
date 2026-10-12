@@ -139,6 +139,21 @@ export interface ClassInfo {
   // runtime (AS3 `dynamic class`). The struct gets an extra `as_object* _dyn`
   // slot table and undeclared member access routes through as_dyn_get/set.
   isDynamic?: boolean;
+  // A "shell" class: registered for API SHAPE only, with no native backend behind
+  // it. emit.ts generates its `_ctor`/`_new`/method bodies from this registration
+  // (see emitShellClasses): every method is a no-op stub returning the type's zero
+  // value, and one loud one-time warning is printed to stderr the first time such a
+  // stub is reached. Used for the AIR surface a real project imports but this
+  // build cannot implement (NativeProcess, StageWebView, Microphone, ...) so the
+  // sources still type-check and compile; see README-CN.md "Shell classes".
+  shell?: boolean;
+  // Array-backed subclass (`class X extends Array`, e.g. com.hurlant.util.der.
+  // Sequence). There is no C struct for `Array` to inherit from, so the subclass
+  // carries a hidden `as_array* _arr` slot allocated in `X_new`, and every
+  // operation Array would serve (index get/set, `length`, the Array methods,
+  // for-in/for-each) is emitted against that slot. The flag is INHERITED along
+  // the super chain (`Set extends Sequence`), exactly like isDynamic.
+  arrayBacked?: boolean;
   // Proxy subclass (`extends flash.utils.Proxy`). Dynamic property access on
   // such an instance is INTERCEPTED by the ten flash_proxy methods instead of
   // falling back to the `_dyn` slot table: a miss routes to getProperty /
@@ -224,6 +239,16 @@ export class CodegenError extends Error {
 const interfaceNames = new Set<string>();
 // short class/interface name -> sanitized fully-qualified name (C identifier).
 const typeAlias = new Map<string, string>();
+// package -> (short name -> sanitized FQN) for the USER classes/interfaces of this
+// program. AS3 resolves a bare type name against the file's OWN PACKAGE, so a file
+// in `com.svgaplayer` that says `FrameEntity` means `com.svgaplayer.FrameEntity`
+// even when another package (`com.svgaplayer.proto`) declares a class of the same
+// name. The global `typeAlias` above is last-wins across ALL files and cannot
+// express that, so this table is what `buildImportAlias` seeds a file's alias map
+// from (measured on the talkmed-meeting AIR app: `com/svgaplayer/SpriteEntity.as`
+// has no import for FrameEntity, so `new FrameEntity(spec)` bound to the proto
+// class -- which declares no constructor -- and failed "too many arguments").
+const packageTypes = new Map<string, Map<string, string>>();
 
 // Full C reserved-word table: C keywords plus libc/libm/POSIX/stdio/string.h/
 // dirent/sys*/time.h/setjmp symbols that the generated C links against (Skia/
@@ -455,24 +480,47 @@ export function checkTypeAnnotation(
 // list. Handles `import a.b.C;` (short "C" -> C key of a.b.C) and
 // `import a.b.*;` (every known class in package a.b). flash.* built-ins are keyed
 // by their short name; user classes by their sanitized FQN.
-function buildImportAlias(imports: string[], classMap: Map<string, ClassInfo>): Map<string, string> {
+//
+// `packageName` is the package the referring FILE declares. Its own package's
+// definitions are visible without an import, which is the precedence AS3 uses:
+// a same-package name beats a wildcard import, and an explicit single-type import
+// beats both (see the seed order below).
+function buildImportAlias(imports: string[], classMap: Map<string, ClassInfo>, packageName?: string | null): Map<string, string> {
   const alias = new Map<string, string>();
+  // 1. On-demand (wildcard) imports, lowest precedence.
   for (const imp of imports) {
-    if (imp.endsWith('.*')) {
-      const pkg = imp.slice(0, -2);
-      for (const [cname, info] of classMap) {
-        if (info.packageName === pkg && info.fqn) {
-          alias.set(info.fqn.split('::').pop()!, cname);
-        }
-      }
-      continue;
+    if (!imp.endsWith('.*')) continue;
+    const pkg = imp.slice(0, -2);
+    for (const [cname, info] of classMap) {
+      // User classes name their package in `packageName`/`fqn`; a flash built-in
+      // carries the AIR-printed `reflectFqn` ('flash.events::Event') instead.
+      // Without the built-in half, `import flash.events.*` added NO aliases and a
+      // bare `Event` fell through to the global last-wins short-name table — which
+      // picks starling.events.Event when a project also ships starling, making
+      // `Event.INIT` (a flash-only constant) a compile error (measured on the
+      // talkmed-meeting AIR app: svgaplayer's Player.as/VideoEntity.as import
+      // flash.events.* and use Event.INIT).
+      const q = info.fqn ?? info.reflectFqn;
+      if (q === undefined || !q.startsWith(pkg + '::')) continue;
+      alias.set(q.slice(q.lastIndexOf('::') + 2), cname);
     }
+  }
+  // 2. The referring file's OWN PACKAGE: visible with no import at all, and it
+  //    wins over an on-demand import (`packageTypes` is filled in pass -1, before
+  //    any name is resolved).
+  if (packageName) {
+    const same = packageTypes.get(packageName);
+    if (same !== undefined) for (const [short, key] of same) alias.set(short, key);
+  }
+  // 3. Explicit single-type imports, highest precedence: the file asked for THIS
+  //    class by name, so it beats a same-package class of the same short name.
+  for (const imp of imports) {
+    if (imp.endsWith('.*')) continue;
     const dot = imp.lastIndexOf('.');
     const short = dot >= 0 ? imp.slice(dot + 1) : imp;
     const pkg = dot >= 0 ? imp.slice(0, dot) : '';
     // flash.* built-ins are keyed by short name; everything else by FQN.
-    const cname = pkg.startsWith('flash.') ? short : qualifiedName(short, pkg);
-    alias.set(short, cname);
+    alias.set(short, pkg.startsWith('flash.') ? short : qualifiedName(short, pkg));
   }
   return alias;
 }
@@ -513,11 +561,19 @@ export class SymbolTable {
     const fqn = (name: string, pkg: string | null) => qualifiedName(name, pkg);
     interfaceNames.clear();
     typeAlias.clear();
+    packageTypes.clear();
     this.classPos.clear();
     for (const stmt of program.body) {
       if (stmt.kind === 'InterfaceDecl' || stmt.kind === 'ClassDecl') {
         setGenPos(stmt.line, stmt.col);
         typeAlias.set(stmt.name, fqn(stmt.name, stmt.packageName));
+        if (stmt.packageName) {
+          let byName = packageTypes.get(stmt.packageName);
+          if (byName === undefined) { byName = new Map<string, string>(); packageTypes.set(stmt.packageName, byName); }
+          // First definition wins: two files cannot declare the same name in the
+          // same package in AIR, so a collision is already a broken program.
+          if (!byName.has(stmt.name)) byName.set(stmt.name, fqn(stmt.name, stmt.packageName));
+        }
         if (stmt.kind === 'ClassDecl') this.classPos.set(fqn(stmt.name, stmt.packageName), { line: stmt.line, col: stmt.col });
       }
     }
@@ -535,7 +591,7 @@ export class SymbolTable {
       setGenPos(stmt.line, stmt.col);
       if (stmt.kind === 'InterfaceDecl') {
         const iname = fqn(stmt.name, stmt.packageName);
-        const importAlias = buildImportAlias(stmt.imports, this.classMap);
+        const importAlias = buildImportAlias(stmt.imports, this.classMap, stmt.packageName);
         const methods = new Map<string, MethodInfo>();
         const getters = new Map<string, MethodInfo>();
         const setters = new Map<string, MethodInfo>();
@@ -566,6 +622,17 @@ export class SymbolTable {
       methods: new Map([
         ['toString', { returnType: { kind: 'string' }, params: [], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
         ['hasOwnProperty', { returnType: { kind: 'bool' }, params: [{ name: 'name', type: 'String', defaultValue: null, isRest: false }], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // Object.propertyIsEnumerable(name): TRUE only when `name` is a DYNAMIC
+        // property of the receiver -- an instance trait (field, accessor, method) is
+        // never enumerable in this sense, unlike hasOwnProperty. Measured on adl
+        // 51.4.1 (temp/airref/Main.as): a sealed class answers false for its field,
+        // getter and method AND true for hasOwnProperty of the same field; a dynamic
+        // class answers false for its declared fields and true for an added one; a
+        // record answers true for a key, false for 'toString'; an Array answers true
+        // for an index and an added named property but FALSE for 'length'; a Vector
+        // and a String answer false. Implemented by as_dyn_enumerable (runtime.ts),
+        // i.e. hasOwnProperty minus the trait walk.
+        ['propertyIsEnumerable', { returnType: { kind: 'bool' }, params: [{ name: 'name', type: 'String', defaultValue: null, isRest: false }], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -709,6 +776,10 @@ export class SymbolTable {
         // empty, "name: message" otherwise (`new Error()` -> "Error",
         // `new Error("boom")` -> "Error: boom"; measured).
         ['toString', { returnType: { kind: 'string' }, params: [], owner: 'Error', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // AIR's Error.getStackTrace() (a real method on Error, inherited by every
+        // subclass). The C body is hand-written next to Error_toString; it reports
+        // itself once through as_shell_unsupported and returns "".
+        ['getStackTrace', { returnType: { kind: 'string' }, params: [], owner: 'Error', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -746,6 +817,50 @@ export class SymbolTable {
         implements: [],
       });
     }
+    // flash.errors.SQLError (AIR 1.0): the Error subclass a failed SQL operation
+    // throws or carries in a SQLErrorEvent. AIR declares the four SQL-specific
+    // values READ-ONLY (getters) and gives the class a custom toString; measured on
+    // adl 51.4.1 (temp/airref/Main.as): `name` stays "Error" (SQLError does NOT
+    // override it, unlike TypeError), detailArguments is always an Array (empty for
+    // a null/omitted argument), a NULL operation stringifies to "null", and the
+    // toString detailID segment appears only once detailID leaves its -1 default.
+    // The SQL layer itself is still deferred (see the flash.filesystem note above),
+    // so a SQLError can only ever reach the app through a `catch (e:SQLError)`
+    // clause of its own wrapper -- which is exactly why the class must exist.
+    const sqlField = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner: 'SQLError', isStatic: false, isConst: false });
+    const sqlGet = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'SQLError', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    this.classMap.set('SQLError', {
+      fields: new Map([
+        ['_operation', sqlField({ kind: 'string' })],
+        ['_details', sqlField({ kind: 'string' })],
+        ['_detailID', sqlField({ kind: 'int' })],
+        ['_detailArguments', sqlField({ kind: 'array' })],
+      ]),
+      methods: new Map([
+        ['toString', { returnType: { kind: 'string' }, params: [], owner: 'SQLError', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['operation', sqlGet({ kind: 'string' })],
+        ['details', sqlGet({ kind: 'string' })],
+        ['detailID', sqlGet({ kind: 'int' })],
+        ['detailArguments', sqlGet({ kind: 'array' })],
+      ]),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'operation', type: 'String', defaultValue: null, isRest: false },
+        { name: 'details', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
+        { name: 'message', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
+        { name: 'id', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        { name: 'detailID', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false },
+        { name: 'detailArgs', type: 'Array', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      reflectFqn: 'flash.errors::SQLError',
+      superClass: 'Error',
+      isFinal: false,
+      implements: [],
+    });
     // built-in Date class: wraps a millisecond timestamp and exposes calendar accessors.
     const dm = (ret: CType): MethodInfo => ({
       returnType: ret, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false,
@@ -763,13 +878,40 @@ export class SymbolTable {
         ['getSeconds', dm({ kind: 'int' })],
         ['toDateString', dm({ kind: 'string' })],
         ['toUTCString', dm({ kind: 'string' })],
+        ['toTimeString', dm({ kind: 'string' })],
+        ['toLocaleTimeString', dm({ kind: 'string' })],
       ]),
       staticFields: new Map(),
       staticMethods: new Map([
         ['parse', { returnType: { kind: 'number' }, params: [{ name: 's', type: 'String', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
       ]),
-      getters: new Map(),
-      setters: new Map(),
+      getters: new Map([
+        // The LOCAL-time component accessors (AIR's Date properties, inherited from
+        // the ES3 Date): each is read-write and mirrors the getX()/setX() method pair.
+        // `day` is read-only -- there is no setDay in AIR either.
+        ['fullYear', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['month', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['date', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['day', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['hours', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['minutes', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['seconds', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // milliseconds / millisecondsUTC (AIR 2+ extensions of the ES3 Date): the
+        // millisecond component of the local / UTC time. Both are read-write;
+        // setting one replaces the component and keeps the rest of the value.
+        ['milliseconds', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['millisecondsUTC', { returnType: { kind: 'int' }, params: [], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map([
+        ['fullYear', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['month', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['date', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['hours', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['minutes', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['seconds', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['milliseconds', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['millisecondsUTC', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }], owner: 'Date', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
       constructor: { params: [] },
       superClass: 'Object',
       isFinal: false,
@@ -838,44 +980,81 @@ export class SymbolTable {
         ['isDefaultPrevented', evm({ kind: 'bool' })],
         ['stopPropagation', evm({ kind: 'void' })],
         ['stopImmediatePropagation', evm({ kind: 'void' })],
+        // AIR's protected Event.formatToString(className, ...propertyNames). The C
+        // body is hand-written (it reads each named property back through the dynamic
+        // reader), so the rest parameter has to be declared the way the call site
+        // packs it (an Array of boxed values). Registered `public` because our
+        // visibility table has no `protected` tier: accepting a call that AIR would
+        // reject is the harmless direction, rejecting a legal one is not.
+        ['formatToString', { returnType: { kind: 'string' }, params: [
+          { name: 'className', type: 'String', defaultValue: null, isRest: false },
+          { name: 'arguments', type: 'Array', defaultValue: null, isRest: true },
+        ], owner: 'Event', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map([
         ['ACTIVATE', evc('activate')],
         ['ADDED', evc('added')],
         ['ADDED_TO_STAGE', evc('addedToStage')],
-        ['REMOVED', evc('removed')],
-        ['REMOVED_FROM_STAGE', evc('removedFromStage')],
-        ['ENTER_FRAME', evc('enterFrame')],
-        ['EXIT_FRAME', evc('exitFrame')],
-        ['COMPLETE', evc('complete')],
-        ['CHANGE', evc('change')],
-        ['RESIZE', evc('resize')],
+        // The AIR constant set (reference/actionscript/3.0/flash/events/Event.html,
+        // "Constant detail"). Completed in one go: these are pure string constants,
+        // so a missing one only ever shows up as `undefined static field` on an
+        // otherwise valid AIR program (measured: Event.CLOSING in a window-closing
+        // handler and Event.INIT in greensock's loaders).
+        ['BROWSER_ZOOM_CHANGE', evc('browserZoomChange')],
         ['CANCEL', evc('cancel')],
+        ['CHANGE', evc('change')],
+        ['CHANNEL_MESSAGE', evc('channelMessage')],
+        ['CHANNEL_STATE', evc('channelState')],
         ['CLEAR', evc('clear')],
         ['CLOSE', evc('close')],
+        ['CLOSING', evc('closing')],
+        ['COMPLETE', evc('complete')],
         ['CONNECT', evc('connect')],
+        ['CONTEXT3D_CREATE', evc('context3DCreate')],
         ['COPY', evc('copy')],
         ['CUT', evc('cut')],
         ['DEACTIVATE', evc('deactivate')],
+        ['DISPLAYING', evc('displaying')],
+        ['ENTER_FRAME', evc('enterFrame')],
+        ['EXIT_FRAME', evc('exitFrame')],
+        ['EXITING', evc('exiting')],
         ['FRAME_CONSTRUCTED', evc('frameConstructed')],
+        ['FRAME_LABEL', evc('frameLabel')],
         ['FULLSCREEN', evc('fullScreen')],
+        ['HTML_BOUNDS_CHANGE', evc('htmlBoundsChange')],
+        ['HTML_DOM_INITIALIZE', evc('htmlDOMInitialize')],
+        ['HTML_RENDER', evc('htmlRender')],
         ['ID3', evc('id3')],
         ['INIT', evc('init')],
+        ['LOCATION_CHANGE', evc('locationChange')],
         ['MOUSE_LEAVE', evc('mouseLeave')],
+        ['NETWORK_CHANGE', evc('networkChange')],
         ['OPEN', evc('open')],
         ['PASTE', evc('paste')],
+        ['PREPARING', evc('preparing')],
+        ['REMOVED', evc('removed')],
+        ['REMOVED_FROM_STAGE', evc('removedFromStage')],
         ['RENDER', evc('render')],
+        ['RESIZE', evc('resize')],
         ['SCROLL', evc('scroll')],
         ['SELECT', evc('select')],
+        ['SELECT_ALL', evc('selectAll')],
         ['SOUND_COMPLETE', evc('soundComplete')],
+        ['STANDARD_ERROR_CLOSE', evc('standardErrorClose')],
+        ['STANDARD_INPUT_CLOSE', evc('standardInputClose')],
+        ['STANDARD_OUTPUT_CLOSE', evc('standardOutputClose')],
+        ['SUSPEND', evc('suspend')],
         ['TAB_CHILDREN_CHANGE', evc('tabChildrenChange')],
         ['TAB_ENABLED_CHANGE', evc('tabEnabledChange')],
         ['TAB_INDEX_CHANGE', evc('tabIndexChange')],
-        ['UNLOAD', evc('unload')],
-        ['BROWSER_ZOOM_CHANGE', evc('browserZoomChange')],
-        ['CONTEXT3D_CREATE', evc('context3DCreate')],
+        ['TEXT_INTERACTION_MODE_CHANGE', evc('textInteractionModeChange')],
         ['TEXTURE_READY', evc('textureReady')],
         ['TEXTURES_RESTORED', evc('texturesRestored')],
+        ['UNLOAD', evc('unload')],
+        ['USER_IDLE', evc('userIdle')],
+        ['USER_PRESENT', evc('userPresent')],
+        ['VIDEO_FRAME', evc('videoFrame')],
+        ['WORKER_STATE', evc('workerState')],
         ['CONTEXT', evc('context')],
         ['ERROR', evc('error')],
         ['FATAL_ERROR', evc('fatalError')],
@@ -1000,11 +1179,23 @@ export class SymbolTable {
       methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
+      getters: new Map([
+        ['systemIdleMode', { returnType: { kind: 'string' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       staticGetters: new Map([
+        // activeWindow: the focused window (the app's initial window when it holds
+        // focus), NULL when no window exists -- see emit.ts's as_win_active. The
+        // NativeWindow wrapper it hands back is the SAME object stage.nativeWindow
+        // returns (AIR's identity), because both go through as_win_wrapper.
+        ['activeWindow', { returnType: { kind: 'object', className: 'NativeWindow' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
         ['nativeApplication', { returnType: { kind: 'object', className: 'NativeApplication' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
       ]),
-      setters: new Map(),
+      setters: new Map([
+        // systemIdleMode: a stored String (AIR default "normal"). This build never
+        // inhibits the OS idle timer, so the setter reports a KEEP_AWAKE request
+        // once on stderr instead of silently pretending the machine stays awake.
+        ['systemIdleMode', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
       isFinal: false,
@@ -1088,6 +1279,36 @@ export class SymbolTable {
         // ops never address it and `as_swc_tl_clear` leaves it alone. A plain int,
         // so no GC write barrier is involved.
         ['_tl_depth', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // DisplayObject.mask: the object that masks this one. A private backing slot
+        // (the accessor pair below is what AS3 sees), because the value must also be
+        // READ by the renderer to ever take effect -- and today it does not: see the
+        // loud report in DisplayObject_set_mask. Kept private so `c.mask` resolves
+        // to the accessor rather than to a raw field read, exactly like _mask_object.
+        ['_mask_ref', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // DisplayObject.cacheAsBitmapMatrix: the Matrix the caller last set (NULL
+        // when never set). A private backing slot for the same reason as _mask_ref --
+        // the AS3-visible property is the accessor pair. Unlike _mask_ref this one
+        // is not even read by the renderer (see the note in the accessor pair):
+        // cacheAsBitmap bakes at the object's own resolution here.
+        ['_cache_matrix', { type: { kind: 'object', className: 'Matrix' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // DisplayObject.opaqueBackground (Object, default null): AIR backs the
+        // object with an OPAQUE bitmap (no alpha channel) whose background is this
+        // colour, so the colour shows through wherever the content is transparent.
+        // The app uses it in earnest -- alternating item/row backgrounds
+        // (`itemRenderer.opaqueBackground = 0xf1f1f1`) and solid scrollbar
+        // surfaces -- so it is IMPLEMENTED, not stubbed. A plain `any` slot holds
+        // null or the colour Number, and the renderer paints it as a fill behind
+        // the object's tight local bounds (emit.ts, as_render_object). AIR's
+        // region is not hit-tested and takes no mouse events, which is automatic
+        // here: as_pick_hit_m never consults this slot. AIR declares the property
+        // as an accessor pair; a field is observationally identical (no app class
+        // overrides it) and the renderer can read it directly.
+        ['opaqueBackground', { type: { kind: 'any' }, init: null, visibility: 'public', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // DisplayObject.scrollRect: the clip rectangle (NULL when unset). Private
+        // backing slot like _mask_ref; the RENDERER and the hit test both read it,
+        // which is why it is a field rather than a codegen-side table entry. The
+        // accessor stores its own copy (see emit.ts).
+        ['_scroll_rect', { type: { kind: 'object', className: 'Rectangle' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['getBounds', dom({ kind: 'object', className: 'Rectangle' }, [tfTarget()])],
@@ -1111,6 +1332,25 @@ export class SymbolTable {
         ['scale9Grid', dog({ kind: 'object', className: 'Rectangle' })],
         ['width', dog({ kind: 'number' })],
         ['height', dog({ kind: 'number' })],
+        ['mask', dog({ kind: 'object', className: 'DisplayObject' })],
+        // cacheAsBitmapMatrix: AIR's "cache the object once, at this matrix"
+        // (AIR 2+). Stored and reported back -- AIR's accessor reads back what was
+        // set -- but NOT applied: this runtime bakes a cacheAsBitmap subtree at the
+        // object's own resolution (see as_render_cached), so the cached bitmap is
+        // the same picture; what is lost is AIR's fixed-resolution cache for an
+        // object animated through that matrix. The setter reports that once.
+        ['cacheAsBitmapMatrix', dog({ kind: 'object', className: 'Matrix' })],
+        ['scrollRect', dog({ kind: 'object', className: 'Rectangle' })],
+        // DisplayObject.mouseX/mouseY (read-only Number): AIR declares these on
+        // DisplayObject, NOT on InteractiveObject (official reference, property
+        // summary "Defined by DisplayObject"), so a DisplayObject-typed reference
+        // reads them (`_drawTarget:DisplayObject; _drawTarget.mouseX` in the
+        // talkmed-meeting app compiles under mxmlc). InteractiveObject inherits
+        // them -- registering them here therefore serves BOTH receiver types
+        // through the normal super-chain lookup. The values are the live pointer
+        // position in the object's own space (C bodies in emit.ts).
+        ['mouseX', dog({ kind: 'number' })],
+        ['mouseY', dog({ kind: 'number' })],
       ]),
       setters: new Map([
         ['filters', dos('Array')],
@@ -1118,6 +1358,11 @@ export class SymbolTable {
         ['scale9Grid', dos('Rectangle')],
         ['width', dos('Number')],
         ['height', dos('Number')],
+        ['mask', dos('DisplayObject')],
+        // cacheAsBitmapMatrix is stored, not applied: see the getter.
+        ['cacheAsBitmapMatrix', dos('Matrix')],
+        // scrollRect is applied by the renderer and the hit test (see emit.ts).
+        ['scrollRect', dos('Rectangle')],
       ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
@@ -1155,12 +1400,8 @@ export class SymbolTable {
       staticMethods: new Map(),
       getters: new Map([
         ['contextMenu', iog({ kind: 'object', className: 'ContextMenu' })],
-        // AIR's live pointer position relative to this object. The runtime tracks the
-        // pointer in STAGE coordinates (ASC_mouse_x/y, fed by the window glue and by
-        // the Stage.dispatchMouse test hook); the getters push that point through the
-        // object's transform chain with as_local_point.
-        ['mouseX', iog({ kind: 'number' })],
-        ['mouseY', iog({ kind: 'number' })],
+        // mouseX/mouseY are NOT declared here: AIR defines them on DisplayObject and
+        // this class inherits them (see the pair registered on DisplayObject).
       ]),
       setters: new Map([
         ['contextMenu', ios('ContextMenu')],
@@ -1187,6 +1428,17 @@ export class SymbolTable {
         ['getChildByName', dcm({ kind: 'object', className: 'DisplayObject' }, [{ name: 'name', type: 'String', defaultValue: null, isRest: false }])],
         ['contains', dcm({ kind: 'bool' }, [dcChild('child')])],
         ['setChildIndex', dcm({ kind: 'void' }, [dcChild('child'), { name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        // removeChildren(beginIndex = 0, endIndex = 0x7FFFFFFF): removes the range,
+        // endIndex exclusive (AIR's documented default). Implemented for real (the
+        // app clears skins with `stage.removeChildren()`), see emit.ts.
+        ['removeChildren', dcm({ kind: 'void' }, [
+          { name: 'beginIndex', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          { name: 'endIndex', type: 'int', defaultValue: { kind: 'Num', value: 2147483647, isInt: true }, isRest: false },
+        ])],
+        // getChildIndex(child): AIR throws ArgumentError #2025 when the object is not
+        // a child of this container; implemented for real (greensock's BlitMask /
+        // AutoFitArea re-insert a child at its own index).
+        ['getChildIndex', dcm({ kind: 'int' }, [dcChild('child')])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1318,6 +1570,11 @@ export class SymbolTable {
         // ASC_app_vsync_enabled; default true, exactly as adl 51.4.1 reports.
         ['vsyncEnabled', stgg({ kind: 'bool' })],
         ['stage3Ds', stgg({ kind: 'vector', elem: { kind: 'object', className: 'Stage3D' } })],
+        // Stage.nativeWindow (AIR, read-only): the NativeWindow the stage is
+        // displayed in. The window table (ASC_wins) owns the connection; the
+        // wrapper is created on first access and kept there (see emit.ts), so
+        // `stage.nativeWindow` is the SAME object every time, as in AIR.
+        ['nativeWindow', stgg({ kind: 'object', className: 'NativeWindow' })],
         // Stage.focus: the InteractiveObject that currently has the keyboard focus,
         // or null. Backed by the generated as_focus_obj rather than a struct field,
         // because a focus change also dispatches FocusEvent.FOCUS_OUT/FOCUS_IN.
@@ -1427,7 +1684,13 @@ export class SymbolTable {
       });
 
       this.classMap.set('NativeWindow', {
-        fields: new Map<string, FieldInfo>(),
+        // `minSize` is AIR's minimum window size (a Point). The backend imposes no
+        // minimum, so it is stored and read back verbatim -- the property is real
+        // (apps use it to keep a window from being dragged smaller than its
+        // content) but there is nothing to enforce here.
+        fields: new Map<string, FieldInfo>([
+          ['minSize', { type: { kind: 'object', className: 'Point' } as CType, init: null, visibility: 'public', owner: 'NativeWindow', isStatic: false, isConst: false }],
+        ]),
         methods: new Map<string, MethodInfo>([
           // close() only REQUESTS teardown; the window is retired at the next
           // frame boundary, which is why `closed` is still false for the rest of
@@ -1439,6 +1702,15 @@ export class SymbolTable {
           ['restore', nwMethod('NativeWindow', { kind: 'void' }, [])],
           ['orderToFront', nwMethod('NativeWindow', { kind: 'void' }, [])],
           ['orderToBack', nwMethod('NativeWindow', { kind: 'void' }, [])],
+          // notifyUser(type): AIR asks the OS to draw attention to the window (a
+          // flashing taskbar button on Windows, a bouncing Dock icon on macOS).
+          // Purely cosmetic, so it is accepted and does nothing (see emit.ts).
+          ['notifyUser', nwMethod('NativeWindow', { kind: 'void' }, [{ name: 'type', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }])],
+          // startMove()/startResize(edgeOrCorner="BR"): AIR hands the drag over to
+          // the window manager; this runtime has no backend hook for it, so both
+          // report themselves once and return false (see the C bodies in emit.ts).
+          ['startMove', nwMethod('NativeWindow', { kind: 'bool' }, [])],
+          ['startResize', nwMethod('NativeWindow', { kind: 'bool' }, [{ name: 'edgeOrCorner', type: 'String', defaultValue: { kind: 'Str', value: 'BR' }, isRest: false }])],
           ['toString', nwMethod('NativeWindow', { kind: 'string' }, [])],
         ]),
         staticFields: new Map<string, FieldInfo>([
@@ -1505,13 +1777,25 @@ export class SymbolTable {
     // container (a Starling-scale tree allocates thousands of Sprites). Letting
     // the accessor be a getter instead of a slot also keeps `s.graphics` working
     // through the inherited member lookup, and Shape keeps its eager field.
+    const spMethod = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Sprite', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     this.classMap.set('Sprite', {
       fields: new Map([
         ['_graphics', { type: { kind: 'object', className: 'Graphics' }, init: null, visibility: 'private', owner: 'Sprite', isStatic: false, isConst: false }],
       ]),
       // hitTestPoint lives on DisplayObject (AIR's owner); Sprite keeps only the
       // lazy `graphics` accessor of its own.
-      methods: new Map(),
+      methods: new Map([
+        // startDrag(lockCenter = false, bounds = null) / stopDrag(): the pointer
+        // drag. Implemented for real in the mouse runtime (emit.ts, as_drag_follow):
+        // the object's x/y follow the pointer in its PARENT's space until stopDrag()
+        // -- a mouseUp does not end it, matching AIR. bounds clamps the object's box
+        // inside the rectangle; the app's scrollbar thumbs are the main user.
+        ['startDrag', spMethod({ kind: 'void' }, [
+          { name: 'lockCenter', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          { name: 'bounds', type: 'Rectangle', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        ['stopDrag', spMethod({ kind: 'void' }, [])],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map([
@@ -1679,6 +1963,11 @@ export class SymbolTable {
         ['load', { returnType: { kind: 'void' }, params: [{ name: 'request', type: 'URLRequest', defaultValue: null, isRest: false }], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
         ['loadBytes', { returnType: { kind: 'void' }, params: [{ name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false }, { name: 'context', type: 'LoaderContext', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
         ['unload', { returnType: { kind: 'void' }, params: [], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // unloadAndStop(gc:Boolean = true): 'unload AND stop' -- drops the content
+        // and everything the loaded clip was running. Our content is a baked
+        // display object with no timeline playback of its own, so dropping the
+        // child is the whole observable effect (see the body in emit.ts).
+        ['unloadAndStop', { returnType: { kind: 'void' }, params: [{ name: 'gc', type: 'Boolean', defaultValue: { kind: 'Bool', value: true }, isRest: false }], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1955,8 +2244,18 @@ export class SymbolTable {
       staticMethods: new Map([
         ['getCamera', { returnType: { kind: 'object', className: 'Camera' }, params: [{ name: 'name', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'Camera', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
       ]),
-      getters: new Map(),
+      getters: new Map([
+        // flash.media.Camera.name (read-only String) -- the device's name. There is
+        // no camera backend in this build, so the value is the empty string and the
+        // omission reports itself once through as_shell_unsupported.
+        ['name', { returnType: { kind: 'string' }, params: [], owner: 'Camera', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       setters: new Map(),
+      staticGetters: new Map([
+        // Camera.names: an Array of the available camera names (CamMic.as:21 reads
+        // it straight into a picker). Empty, not NULL, so a for-each is well-defined.
+        ['names', { returnType: { kind: 'array' }, params: [], owner: 'Camera', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
       isFinal: false,
@@ -2176,6 +2475,14 @@ export class SymbolTable {
       const idins = (type: string): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type, defaultValue: null, isRest: false }], owner: 'IDataInput', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
       const baP = (name: string): Param => ({ name, type: 'ByteArray', defaultValue: null, isRest: false });
       const uintP = (name: string): Param => ({ name, type: 'uint', defaultValue: null, isRest: false });
+    // uint with AIR's explicit 0 default: IDataInput/IDataOutput declare
+    // `readBytes(bytes, offset:uint = 0, length:uint = 0)` (and writeBytes likewise),
+    // so a one-argument call is legal and `length == 0` means "to the end" in the
+    // implementations. The prototypes for those slots are generated from these
+    // registrations, so a missing default here is a hard "missing argument" error
+    // at the call site (com.netease.protobuf.WritingBuffer.toNormal calls
+    // output.writeBytes(this, begin) through an IDataOutput-typed parameter).
+    const uintPdef = (name: string): Param => ({ name, type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false });
       interfaceNames.add('IDataInput');
       this.interfaceMap.set('IDataInput', {
         reflectFqn: 'flash.utils::IDataInput',
@@ -2191,7 +2498,7 @@ export class SymbolTable {
         methods: new Map([
           ['readBoolean', idin({ kind: 'bool' }, [])],
           ['readByte', idin({ kind: 'int' }, [])],
-          ['readBytes', idin({ kind: 'void' }, [baP('bytes'), uintP('offset'), uintP('length')])],
+          ['readBytes', idin({ kind: 'void' }, [baP('bytes'), uintPdef('offset'), uintPdef('length')])],
           ['readDouble', idin({ kind: 'number' }, [])],
           ['readFloat', idin({ kind: 'number' }, [])],
           ['readInt', idin({ kind: 'int' }, [])],
@@ -2223,7 +2530,7 @@ export class SymbolTable {
         methods: new Map([
           ['writeBoolean', idout({ kind: 'void' }, [valP('Boolean')])],
           ['writeByte', idout({ kind: 'void' }, [valP('int')])],
-          ['writeBytes', idout({ kind: 'void' }, [baP('bytes'), uintP('offset'), uintP('length')])],
+          ['writeBytes', idout({ kind: 'void' }, [baP('bytes'), uintPdef('offset'), uintPdef('length')])],
           ['writeDouble', idout({ kind: 'void' }, [valP('Number')])],
           ['writeFloat', idout({ kind: 'void' }, [valP('Number')])],
           ['writeInt', idout({ kind: 'void' }, [valP('int')])],
@@ -2619,8 +2926,12 @@ export class SymbolTable {
       implements: [],
     });
     // Keyboard: a class of static key-code constants (uint, matching AIR's Keyboard
-    // constants) plus a read-only isAccessible flag. Only a representative subset of
-    // the full AIR key-code table is mapped.
+    // constants) plus the read-only environment flags. The key-code table below is
+    // the COMPLETE AIR table (flash.ui.Keyboard, verified against the language
+    // reference) so a key handler can compare against any documented constant;
+    // only the CharCodeStrings/KEYNAME_*/STRING_* name tables are not mapped (they
+    // are OS-X text-input key NAMES, unused by desktop key handling -- a program
+    // that reads one gets a loud "undefined member" error, never a wrong value).
     const kbd = (owner: string, value: number): FieldInfo => ({ type: { kind: 'uint' }, init: { kind: 'Num', value, isInt: true }, visibility: 'public', owner, isStatic: true, isConst: true });
     const kbdStatic: [string, number][] = [
       ['A', 65], ['B', 66], ['C', 67], ['D', 68], ['E', 69], ['F', 70], ['G', 71], ['H', 72],
@@ -2629,17 +2940,58 @@ export class SymbolTable {
       ['Y', 89], ['Z', 90],
       ['NUMBER_0', 48], ['NUMBER_1', 49], ['NUMBER_2', 50], ['NUMBER_3', 51], ['NUMBER_4', 52],
       ['NUMBER_5', 53], ['NUMBER_6', 54], ['NUMBER_7', 55], ['NUMBER_8', 56], ['NUMBER_9', 57],
+      ['NUMPAD_0', 96], ['NUMPAD_1', 97], ['NUMPAD_2', 98], ['NUMPAD_3', 99], ['NUMPAD_4', 100],
+      ['NUMPAD_5', 101], ['NUMPAD_6', 102], ['NUMPAD_7', 103], ['NUMPAD_8', 104], ['NUMPAD_9', 105],
+      ['NUMPAD_ADD', 107], ['NUMPAD_DECIMAL', 110], ['NUMPAD_DIVIDE', 111], ['NUMPAD_ENTER', 108],
+      ['NUMPAD_MULTIPLY', 106], ['NUMPAD_SUBTRACT', 109],
+      ['F1', 112], ['F2', 113], ['F3', 114], ['F4', 115], ['F5', 116], ['F6', 117], ['F7', 118],
+      ['F8', 119], ['F9', 120], ['F10', 121], ['F11', 122], ['F12', 123], ['F13', 124],
+      ['F14', 125], ['F15', 126], ['F24', 135],
       ['SPACE', 32], ['ENTER', 13], ['TAB', 9], ['ESCAPE', 27], ['BACKSPACE', 8], ['DELETE', 46],
-      ['SHIFT', 16], ['CONTROL', 17], ['LEFT', 37], ['RIGHT', 39], ['UP', 38], ['DOWN', 40],
+      ['INSERT', 45], ['HOME', 36], ['END', 35], ['PAGE_UP', 33], ['PAGE_DOWN', 34],
+      ['LEFT', 37], ['RIGHT', 39], ['UP', 38], ['DOWN', 40],
+      ['SHIFT', 16], ['CONTROL', 17], ['ALTERNATE', 18], ['COMMAND', 15], ['FUNCTION', 14],
+      ['CAPS_LOCK', 20], ['NUMPAD', 21],
+      ['BACKQUOTE', 192], ['BACKSLASH', 220], ['COMMA', 188], ['EQUAL', 187], ['LEFTBRACKET', 219],
+      ['MINUS', 189], ['PERIOD', 190], ['QUOTE', 222], ['RIGHTBRACKET', 221], ['SEMICOLON', 186],
+      ['SLASH', 191],
+      // The 0x01000000 media/TV block. AIR documents these as `undefined` on
+      // non-TV platforms (Android/TV only); this build exposes the documented code
+      // instead of `undefined`, which cannot inhabit a uint slot. Behaviour is
+      // unchanged for a key handler because no desktop key can produce one of
+      // these codes, so `keyCode == Keyboard.BACK` stays false exactly as under AIR.
+      ['RED', 0x01000000], ['GREEN', 0x01000001], ['YELLOW', 0x01000002], ['BLUE', 0x01000003],
+      ['CHANNEL_UP', 0x01000004], ['CHANNEL_DOWN', 0x01000005], ['RECORD', 0x01000006],
+      ['PLAY', 0x01000007], ['PAUSE', 0x01000008], ['STOP', 0x01000009],
+      ['FAST_FORWARD', 0x0100000A], ['REWIND', 0x0100000B], ['SKIP_FORWARD', 0x0100000C],
+      ['SKIP_BACKWARD', 0x0100000D], ['NEXT', 0x0100000E], ['PREVIOUS', 0x0100000F],
+      ['LIVE', 0x01000010], ['LAST', 0x01000011], ['MENU', 0x01000012], ['INFO', 0x01000013],
+      ['GUIDE', 0x01000014], ['EXIT', 0x01000015], ['BACK', 0x01000016], ['AUDIO', 0x01000017],
+      ['SUBTITLE', 0x01000018], ['DVR', 0x01000019], ['VOD', 0x0100001A], ['INPUT', 0x0100001B],
+      ['SETUP', 0x0100001C], ['HELP', 0x0100001D], ['MASTER_SHELL', 0x0100001E],
+      ['SEARCH', 0x0100001F], ['PLAY_PAUSE', 0x01000020],
     ];
     const kbdFields = new Map<string, FieldInfo>();
-    kbdFields.set('isAccessible', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'Keyboard', isStatic: true, isConst: true });
+    // capsLock/numLock/hasVirtualKeyboard read the live OS state in AIR. This build
+    // has no OS key-state backend, so they report the neutral desktop values
+    // (both locks off; a physical keyboard exists since the window backend drives a
+    // hardware key handler). physicalKeyboardType is the documented ALPHANUMERIC.
+    for (const [k, v] of [['capsLock', false], ['numLock', false], ['hasVirtualKeyboard', false]] as [string, boolean][]) {
+      kbdFields.set(k, { type: { kind: 'bool' }, init: { kind: 'Bool', value: v }, visibility: 'public', owner: 'Keyboard', isStatic: true, isConst: true });
+    }
+    kbdFields.set('physicalKeyboardType', { type: { kind: 'string' }, init: { kind: 'Str', value: 'alphanumeric' }, visibility: 'public', owner: 'Keyboard', isStatic: true, isConst: true });
     for (const [k, v] of kbdStatic) kbdFields.set(k, kbd('Keyboard', v));
     this.classMap.set('Keyboard', {
       fields: new Map(),
       methods: new Map(),
       staticFields: kbdFields,
-      staticMethods: new Map(),
+      staticMethods: new Map([
+        // Keyboard.isAccessible() is a METHOD in AIR (the old field-typed shape was
+        // wrong): it reports whether the last key press is visible to other SWFs.
+        // Single-domain native builds have no cross-domain keystroke restriction,
+        // so it is always true.
+        ['isAccessible', { returnType: { kind: 'bool' }, params: [], owner: 'Keyboard', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       getters: new Map(),
       setters: new Map(),
       constructor: { params: [] },
@@ -2695,6 +3047,10 @@ export class SymbolTable {
       getters: new Map(),
       staticGetters: new Map([
         ['inputMode', { returnType: { kind: 'string' }, params: [], owner: 'Multitouch', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+        // maxTouchPoints: AIR reports 0 when the device has no touch input. This
+        // build's backends (window/mouse only) never see a touch point, so 0 is the
+        // measured truth here rather than a placeholder.
+        ['maxTouchPoints', { returnType: { kind: 'number' }, params: [], owner: 'Multitouch', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       setters: new Map(),
       staticSetters: new Map([
@@ -2705,6 +3061,96 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // flash.system.IMEConversionMode: the conversion-mode strings, "for use with the
+    // IME.conversionMode property". The class reference lists exactly these 8 and the
+    // measured Windows 51.3.2 probe (temp/imeprobe) agrees: the Flash-era extras
+    // (ALPHANUMERIC / JAPANESE_KATAKANA / NONE) all read back `undefined` in AIR.
+    // Here an unknown constant is a compile-time error instead of `undefined`
+    // (loud beats silent, §2.5) — the same treatment Capabilities gets.
+    {
+      const mode = (v: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value: v }, visibility: 'public', owner: 'IMEConversionMode', isStatic: true, isConst: true });
+      this.classMap.set('IMEConversionMode', {
+        fields: new Map(),
+        methods: new Map(),
+        staticFields: new Map([
+          ['ALPHANUMERIC_FULL', mode('ALPHANUMERIC_FULL')],
+          ['ALPHANUMERIC_HALF', mode('ALPHANUMERIC_HALF')],
+          ['CHINESE', mode('CHINESE')],
+          ['JAPANESE_HIRAGANA', mode('JAPANESE_HIRAGANA')],
+          ['JAPANESE_KATAKANA_FULL', mode('JAPANESE_KATAKANA_FULL')],
+          ['JAPANESE_KATAKANA_HALF', mode('JAPANESE_KATAKANA_HALF')],
+          ['KOREAN', mode('KOREAN')],
+          ['UNKNOWN', mode('UNKNOWN')],
+        ]),
+        staticMethods: new Map(),
+        getters: new Map(),
+        setters: new Map(),
+        constructor: { params: [] },
+        superClass: 'Object',
+        isFinal: false,
+        implements: [],
+      });
+    }
+    // flash.system.IME (TODO 遗留 L8148). AIR's class reference fixes the SHAPE
+    // (`final`, no public constructor, three static properties + four static
+    // methods); the behavior was measured at BOTH ends because the two builds
+    // disagree:
+    //   * macOS 51.4.1 (the repo baseline, stage 94·17): `isSupported` true,
+    //     `enabled` true and writable, `conversionMode` "UNKNOWN";
+    //     setCompositionString / doConversion / compositionSelectionChanged THROW
+    //     Error #2063 and compositionAbandoned() is a no-op; `setConversionMode`
+    //     does not exist at all (#1006). That probe had NO text field focused, and
+    //     the reference says setCompositionString "fails" in exactly that case.
+    //   * Windows 51.3.2 (temp/imeprobe): with no focused field the four methods
+    //     SUCCEED; conversionMode defaults to "ALPHANUMERIC_HALF"; its setter takes
+    //     the modes the installed IME supports ("CHINESE" ok) and rejects
+    //     JAPANESE_*/KOREAN/"UNKNOWN"/"BOGUS"/"" with #2063, and null with #2007
+    //     ("Parameter mode must be non-null."); `new IME()` is #2012
+    //     ("IME$ class cannot be instantiated.").
+    // We have no operating-system IME to bind to, so the class drives OUR
+    // composition channel (the marked-text preview SDL_TEXTEDITING already feeds,
+    // as_tf_set_comp): with a focused editable TextField the four methods compose /
+    // commit / re-select / abandon the marked text — the documented semantics, which
+    // Windows AIR follows too; with none they throw #2063, i.e. the macOS baseline
+    // reproduced. `System.ime` (AIR's IME *instance* singleton, which does carry the
+    // EventDispatcher surface) is NOT provided — see TODO 遗留 L8148.
+    {
+      const imeStatic = (ret: CType, params: Param[] = []): MethodInfo => ({ returnType: ret, params, owner: 'IME', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false });
+      const imeGet = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'IME', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false });
+      const imeSet = (ty: string): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: ty, defaultValue: null, isRest: false }], owner: 'IME', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: true });
+      this.classMap.set('IME', {
+        fields: new Map(),
+        methods: new Map(),
+        staticFields: new Map([
+          // Read-only in AIR: the reference has a getter only, so a write is a
+          // compile-time error here.
+          ['isSupported', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'IME', isStatic: true, isConst: true }],
+        ]),
+        staticMethods: new Map([
+          ['setCompositionString', imeStatic({ kind: 'void' }, [{ name: 'composition', type: 'String', defaultValue: null, isRest: false }])],
+          ['doConversion', imeStatic({ kind: 'void' })],
+          ['compositionSelectionChanged', imeStatic({ kind: 'void' }, [
+            { name: 'start', type: 'int', defaultValue: null, isRest: false },
+            { name: 'end', type: 'int', defaultValue: null, isRest: false },
+          ])],
+          ['compositionAbandoned', imeStatic({ kind: 'void' })],
+        ]),
+        staticGetters: new Map([
+          ['enabled', imeGet({ kind: 'bool' })],
+          ['conversionMode', imeGet({ kind: 'string' })],
+        ]),
+        staticSetters: new Map([
+          ['enabled', imeSet('Boolean')],
+          ['conversionMode', imeSet('String')],
+        ]),
+        getters: new Map(),
+        setters: new Map(),
+        constructor: { params: [] },
+        superClass: 'Object',
+        isFinal: true,
+        implements: [],
+      });
+    }
     // flash.filesystem (stage 64): File / FileStream / FileMode. NativeWindow and
     // SQLConnection/SQLStatement are deferred (native multi-window management and
     // SQLite linking, respectively).
@@ -2727,15 +3173,76 @@ export class SymbolTable {
         ['createDirectory', filemeth({ kind: 'void' }, [])],
         ['deleteFile', filemeth({ kind: 'void' }, [])],
         ['deleteDirectory', filemeth({ kind: 'void' }, [])],
+        // moveTo(newFile, overwrite = false, force = false): a real rename() (see the
+        // C body in emit.ts). rename() is atomic on one volume, which is the case
+        // AIR optimizes too; the two conditions AIR raises IOError for (a missing
+        // source, an existing target with overwrite/force false) are reported on
+        // stderr rather than thrown -- consistent with this class's other members.
+        ['moveTo', filemeth({ kind: 'void' }, [
+          { name: 'newFile', type: 'File', defaultValue: null, isRest: false },
+          { name: 'overwrite', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+          { name: 'force', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
         ['getDirectoryListing', filemeth({ kind: 'array' }, [])],
+        // The async half of the File API (AIR delivers the result as an event).
+        // getDirectoryListingAsync is implemented for real (it lists now and
+        // dispatches FileListEvent.DIRECTORY_LISTING); the delete pair deletes and
+        // dispatches Event.COMPLETE; the four interactive/platform ones have no
+        // backend here and report themselves loudly (see emit.ts).
+        ['getDirectoryListingAsync', filemeth({ kind: 'void' }, [])],
+        ['deleteFileAsync', filemeth({ kind: 'void' }, [])],
+        ['deleteDirectoryAsync', filemeth({ kind: 'void' }, [{ name: 'deleteDirectory', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
+        ['browseForDirectory', filemeth({ kind: 'void' }, [{ name: 'title', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }])],
+        ['browseForOpen', filemeth({ kind: 'void' }, [
+          { name: 'title', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'typeFilter', type: 'Array', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        ['openWithDefaultApplication', filemeth({ kind: 'void' }, [])],
+        // cancel(): FileReference's "cancel the pending async operation". Every async
+        // member of this File (getDirectoryListingAsync, the delete pair) completes
+        // synchronously, so nothing is ever in flight and there is genuinely nothing
+        // to cancel -- a no-op rather than an unsupported report.
+        ['cancel', filemeth({ kind: 'void' }, [])],
+        // upload(request, uploadDataFieldName = null, testUpload = false): POST the
+        // file as multipart/form-data. No HTTP upload backend exists here; the body
+        // reports itself loudly and dispatches nothing (see emit.ts) so a caller
+        // waiting on DataEvent.UPLOAD_COMPLETE_DATA is not falsely told it finished.
+        ['upload', filemeth({ kind: 'void' }, [
+          { name: 'request', type: 'URLRequest', defaultValue: null, isRest: false },
+          { name: 'uploadDataFieldName', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'testUpload', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map([
         ['url', filegetr({ kind: 'string' })],
+        // name: the last path component (AIR's File.name), and parent: the containing
+        // directory as a File (null at the filesystem root, like AIR). Both are real
+        // path splits on '/' and '\\' (see emit.ts).
+        ['name', filegetr({ kind: 'string' })],
+        // extension: the text after the last dot of the name, or "" when there is
+        // none. A dot-file (".DS_Store") has NO extension in AIR, not "DS_Store".
+        ['extension', filegetr({ kind: 'string' })],
+        // type: AIR declares this on FileReference (File's superclass); we model the
+        // flattened File, so it lives here. On Windows/Linux AIR documents it as the
+        // file's extension, and the published AIR apps compare it as a
+        // dot-prefixed lower-case string (e.g. upLoadView's ['.ppt','.pptx','.pdf']),
+        // so it is emitted as "." + extension lower-cased, "" when there is none.
+        ['type', filegetr({ kind: 'string' })],
+        ['parent', filegetr({ kind: 'object', className: 'File' })],
         ['exists', filegetr({ kind: 'bool' })],
         ['isDirectory', filegetr({ kind: 'bool' })],
         ['isHidden', filegetr({ kind: 'bool' })],
+        // size: the file's length in bytes (AIR's File.size:Number). Measured stat()
+        // rather than cached, so a file that grows on disk is seen immediately; a
+        // missing path reports 0 (AIR returns 0 there too, and callers guard with
+        // `exists` first).
+        ['size', filegetr({ kind: 'number' })],
+        // spaceAvailable: free bytes on the volume holding the path (AIR 2). Real
+        // filesystem query -- GetDiskFreeSpaceExA / statvfs(), see as_file_space_available
+        // in emit.ts. 0 when the OS cannot resolve the path.
+        ['spaceAvailable', filegetr({ kind: 'number' })],
       ]),
       setters: new Map(),
       constructor: { params: [
@@ -2853,6 +3360,10 @@ export class SymbolTable {
       OVERLAY: 'overlay', HARDLIGHT: 'hardlight', SHADER: 'shader',
     });
     constClass('StageQuality', { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', BEST: 'best' });
+    // flash.display.PixelSnapping: the three String values for Bitmap.pixelSnapping
+    // (values verified against the AIR 3.0 reference, which also documents
+    // PixelSnapping.AUTO as the property's default -- see the Bitmap field below).
+    constClass('PixelSnapping', { ALWAYS: 'always', AUTO: 'auto', NEVER: 'never' });
     constClass('StageDisplayState', { NORMAL: 'normal', FULL_SCREEN: 'fullScreen', FULL_SCREEN_INTERACTIVE: 'fullScreenInteractive' });
     constClass('TextFieldAutoSize', { NONE: 'none', LEFT: 'left', RIGHT: 'right', CENTER: 'center' });
     // flash.text.TextFieldType (stage 94·7). Values measured on adl 51.4.1
@@ -2863,6 +3374,13 @@ export class SymbolTable {
     constClass('TextFormatAlign', { LEFT: 'left', RIGHT: 'right', CENTER: 'center', JUSTIFY: 'justify' });
     constClass('TouchPhase', { BEGAN: 'began', MOVED: 'moved', ENDED: 'ended', STATIONARY: 'stationary', HOVER: 'hover' });
     constClass('MouseCursor', { AUTO: 'auto', ARROW: 'arrow', BUTTON: 'button', HAND: 'hand', IBEAM: 'ibeam' });
+    // flash.ui.KeyboardType (the values Keyboard.physicalKeyboardType reports).
+    constClass('KeyboardType', { ALPHANUMERIC: 'alphanumeric', KEYPAD: 'keypad', NONE: 'none' });
+    // flash.desktop.SystemIdleMode (the values NativeApplication.systemIdleMode takes).
+    constClass('SystemIdleMode', { KEEP_AWAKE: 'keepAwake', NORMAL: 'normal' });
+    // flash.desktop.NotificationType (the values NativeWindow.notifyUser takes). AIR
+    // declares exactly these two (no WARNING -- that is a Flash-Player-era spelling).
+    constClass('NotificationType', { INFORMATIONAL: 'informational', CRITICAL: 'critical' });
     // Stage 110 (away3d-core walls): drawing-style / culling / orientation /
     // shader-precision constant classes. Every value measured on adl 51.4.1
     // (temp/constprobe/adl.txt), e.g. CapsStyle.NONE == "none".
@@ -2970,6 +3488,335 @@ export class SymbolTable {
     const mef = (t: CType, owner: string): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
     const mec = (owner: string, value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true });
     const meBool = (name: string, def: boolean): Param => ({ name, type: 'Boolean', defaultValue: { kind: 'Bool', value: def }, isRest: false });
+    // flash.events.StatusEvent (AIR native-extension surface). An ANE hands status
+    // notifications back to AS3 as a StatusEvent whose `code`/`level` are the two
+    // Strings the native side passes to FREDispatchStatusEventAsync. The shape is
+    // the AIR one: extends Event, one constant, the two String fields, and
+    // updateAfterEvent() (a rendering no-op on native, measured inert there too).
+    this.classMap.set('StatusEvent', {
+      fields: new Map([
+        ['code', mef({ kind: 'string' }, 'StatusEvent')],
+        ['level', mef({ kind: 'string' }, 'StatusEvent')],
+      ]),
+      methods: new Map([
+        ['updateAfterEvent', { returnType: { kind: 'void' }, params: [], owner: 'StatusEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      staticFields: new Map([
+        ['STATUS', mec('StatusEvent', 'status')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        { name: 'bubbles', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        { name: 'cancelable', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        { name: 'code', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'level', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: false,
+      implements: [],
+      fqn: 'flash.events::StatusEvent',
+    });
+    // flash.external.ExtensionContext (AIR native-extension bridge, stage 135).
+    // The AS3 half of an ANE: createExtensionContext() resolves the extension by
+    // id and hands back a context whose call() reaches the native side, whose
+    // getExtensionDirectory() locates its bundled files, and which dispatches
+    // StatusEvent. This build has NO FRE host (no <Name>ExtInitializer DLL
+    // loader), so the context is a SHELL: it exists, carries its id, accepts
+    // listeners and returns null from call() — the honest "extension not loaded"
+    // answer (§1.5), never a fake success. Modelling it lets the ANE's own AS3
+    // API sources type-check and compile; the native wiring is a separate task.
+    const ecObj = (): CType => ({ kind: 'object', className: 'Object' });
+    this.classMap.set('ExtensionContext', {
+      fields: new Map([
+        ['actionScriptData', { type: ecObj(), init: null, visibility: 'public', owner: 'ExtensionContext', isStatic: false, isConst: false }],
+        ['_extID', { type: { kind: 'string' }, init: null, visibility: 'private', owner: 'ExtensionContext', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map([
+        ['call', { returnType: { kind: 'any' }, params: [
+          { name: 'functionName', type: 'String', defaultValue: null, isRest: false },
+          { name: 'args', type: 'Array', defaultValue: null, isRest: true },
+        ], owner: 'ExtensionContext', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['dispose', { returnType: { kind: 'bool' }, params: [], owner: 'ExtensionContext', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map([
+        ['createExtensionContext', { returnType: { kind: 'object', className: 'ExtensionContext' }, params: [
+          { name: 'extensionID', type: 'String', defaultValue: null, isRest: false },
+          { name: 'contextType', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        ], owner: 'ExtensionContext', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+        ['getExtensionDirectory', { returnType: { kind: 'object', className: 'File' }, params: [
+          { name: 'extensionID', type: 'String', defaultValue: null, isRest: false },
+        ], owner: 'ExtensionContext', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      getters: new Map([
+        ['extensionID', { returnType: { kind: 'string' }, params: [], owner: 'ExtensionContext', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'extensionID', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'contextType', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+      fqn: 'flash.external::ExtensionContext',
+    });
+    // ---- AIR shell classes (stage 136) -----------------------------------------
+    //
+    // The AIR surface a real project imports but this build has no backend for.
+    // Each is registered with its AIR API shape (constructor parameter order,
+    // fields, constants) and marked `shell`, so emit.ts can generate a
+    // compilable body for it (see emitShellClasses). The point is that the
+    // project's OWN sources keep type-checking and compiling instead of dying on
+    // "unknown type flash.desktop.NativeProcess" — the runtime behavior behind
+    // them is honestly absent (isSupported = false, methods no-op + warn), never
+    // silently wrong. See README-CN.md "Shell classes" and docs/zh-cn/enhancements.md.
+    const shObj = (cls: string): CType => ({ kind: 'object', className: cls });
+    const shBoolP = (name: string, def: boolean): Param => ({ name, type: 'Boolean', defaultValue: { kind: 'Bool', value: def }, isRest: false });
+    const shNumP = (name: string, def: number): Param => ({ name, type: 'Number', defaultValue: { kind: 'Num', value: def, isInt: false }, isRest: false });
+    const shIntP = (name: string, def: number): Param => ({ name, type: 'int', defaultValue: { kind: 'Num', value: def, isInt: true }, isRest: false });
+    const shNullP = (name: string, type: string): Param => ({ name, type, defaultValue: { kind: 'Null' }, isRest: false });
+    const shReq = (name: string, type: string): Param => ({ name, type, defaultValue: null, isRest: false });
+    const shMethod = (owner: string, ret: CType, params: Param[], isStatic = false): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic, isFinal: false, isGetter: false, isSetter: false });
+    const shConst = (owner: string, value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true });
+    const shField = (owner: string, t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
+    const shell = (
+      name: string,
+      fqnName: string,
+      superClass: string,
+      fields: Array<[string, CType]>,
+      constants: Array<[string, string]>,
+      ctor: Param[],
+      methods: Array<[string, CType, Param[]]> = [],
+      staticMethods: Array<[string, CType, Param[]]> = [],
+      staticGetters: Array<[string, CType]> = [],
+      staticBools: string[] = [],
+    ): void => {
+      this.classMap.set(name, {
+        fields: new Map(fields.map(([n, t]) => [n, shField(name, t)] as [string, FieldInfo])),
+        methods: new Map(methods.map(([n, r, p]) => [n, shMethod(name, r, p)] as [string, MethodInfo])),
+        staticFields: new Map([
+          ...constants.map(([n, v]) => [n, shConst(name, v)] as [string, FieldInfo]),
+          ...staticBools.map((n) => [n, { type: { kind: 'bool' } as CType, init: { kind: 'Bool', value: false } as Expr, visibility: 'public', owner: name, isStatic: true, isConst: true } as FieldInfo] as [string, FieldInfo]),
+        ]),
+        staticMethods: new Map(staticMethods.map(([n, r, p]) => [n, shMethod(name, r, p, true)] as [string, MethodInfo])),
+        getters: new Map(),
+        setters: new Map(),
+        staticGetters: new Map(staticGetters.map(([n, r]) => [n, { returnType: r, params: [], owner: name, visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false } as MethodInfo] as [string, MethodInfo])),
+        constructor: { params: ctor },
+        superClass,
+        isFinal: false,
+        implements: [],
+        fqn: fqnName,
+        shell: true,
+      } as ClassInfo);
+    };
+    // flash.display.JPEGEncoderOptions / PNGEncoderOptions: the compressor argument
+    // of BitmapData.encode. Both are plain option bundles in AIR (a quality number,
+    // a fastCompression flag); the slots are real fields, assigned by the shell
+    // constructor from the same-named parameter. `encode` itself reports itself
+    // loudly for both formats (see symbols.ts) -- the options still carry the values
+    // a caller passes so a reflection-based caller sees them back.
+    shell('JPEGEncoderOptions', 'flash.display::JPEGEncoderOptions', 'Object',
+      [['quality', { kind: 'number' }]],
+      [],
+      [shNumP('quality', 50)],
+      []);
+    shell('PNGEncoderOptions', 'flash.display::PNGEncoderOptions', 'Object',
+      [['fastCompression', { kind: 'bool' }]],
+      [],
+      [shBoolP('fastCompression', false)],
+      []);
+    // flash.net.FileFilter: the chooser filter (description + extension list).
+    shell('FileFilter', 'flash.net::FileFilter', 'Object',
+      [['description', { kind: 'string' }], ['extension', { kind: 'string' }], ['macType', { kind: 'string' }], ['winType', { kind: 'string' }], ['name', { kind: 'string' }]],
+      [],
+      [shReq('description', 'String'), shReq('extension', 'String'), shNullP('macType', 'String'), shNullP('winType', 'String')],
+      [['clone', shObj('FileFilter'), []]]);
+    // flash.events.FileListEvent: File.getDirectoryListingAsync()'s result.
+    shell('FileListEvent', 'flash.events::FileListEvent', 'Event',
+      [['directory', shObj('File')], ['files', { kind: 'array' }]],
+      [['DIRECTORY_LISTING', 'directoryListing']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNullP('directory', 'File'), shNullP('files', 'Array')],
+      [['clone', shObj('Event'), []]]);
+    // flash.events.NativeWindowBoundsEvent: NativeWindow move/resize.
+    shell('NativeWindowBoundsEvent', 'flash.events::NativeWindowBoundsEvent', 'Event',
+      [['beforeBounds', shObj('Rectangle')], ['afterBounds', shObj('Rectangle')]],
+      [['MOVE', 'move'], ['MOVING', 'moving'], ['RESIZE', 'resize'], ['RESIZING', 'resizing']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNullP('beforeBounds', 'Rectangle'), shNullP('afterBounds', 'Rectangle')],
+      [['clone', shObj('Event'), []]]);
+    // flash.events.InvokeEvent: the AIR "launch with a document/argument" event.
+    shell('InvokeEvent', 'flash.events::InvokeEvent', 'Event',
+      [['arguments', { kind: 'array' }], ['currentDirectory', shObj('File')], ['reason', { kind: 'string' }]],
+      [['INVOKE', 'invoke']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false)],
+      [['clone', shObj('Event'), []]]);
+    // flash.events.LocationChangeEvent: StageWebView navigation.
+    shell('LocationChangeEvent', 'flash.events::LocationChangeEvent', 'Event',
+      [['location', { kind: 'string' }]],
+      [['LOCATION_CHANGE', 'locationChange']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), { name: 'location', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false }],
+      [['clone', shObj('Event'), []]]);
+    // flash.events.NativeDragEvent: OS file drag-and-drop onto the app. AIR
+    // defines BOTH the flash-level DRAG_* pair-set and the native NATIVE_DRAG_*
+    // ones (a drag from the desktop raises the latter); the project listens for
+    // NATIVE_DRAG_ENTER / NATIVE_DRAG_DROP (upLoadView.as).
+    shell('NativeDragEvent', 'flash.events::NativeDragEvent', 'Event',
+      [['action', { kind: 'string' }], ['allowedActions', { kind: 'string' }], ['clipboard', shObj('Clipboard')],
+       ['dragInitiator', shObj('InteractiveObject')], ['dragSource', shObj('Object')],
+       ['localX', { kind: 'number' }], ['localY', { kind: 'number' }]],
+      [['DRAG_COMPLETE', 'dragComplete'], ['DRAG_DROP', 'dragDrop'], ['DRAG_ENTER', 'dragEnter'],
+       ['DRAG_EXIT', 'dragExit'], ['DRAG_OVER', 'dragOver'], ['DRAG_START', 'dragStart'],
+       ['NATIVE_DRAG_DROP', 'nativeDragDrop'], ['NATIVE_DRAG_ENTER', 'nativeDragEnter']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false),
+       shNumP('localX', 0), shNumP('localY', 0), shNullP('relatedObject', 'Object'),
+       shNullP('dragInitiator', 'InteractiveObject'), shNullP('dragSource', 'Object'), shNullP('clipboard', 'Clipboard')],
+      [['clone', shObj('Event'), []]]);
+    // flash.events.SampleDataEvent: the microphone/sound sample callback.
+    shell('SampleDataEvent', 'flash.events::SampleDataEvent', 'Event',
+      [['data', shObj('ByteArray')], ['position', { kind: 'number' }]],
+      [['SAMPLE_DATA', 'sampleData']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNumP('position', 0), shNullP('data', 'ByteArray')],
+      [['clone', shObj('Event'), []]]);
+    // flash.events.NativeProcessExitEvent: NativeProcess termination.
+    shell('NativeProcessExitEvent', 'flash.events::NativeProcessExitEvent', 'Event',
+      [['exitCode', { kind: 'uint' }], ['process', shObj('NativeProcess')]],
+      [['EXIT', 'exit']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false),
+       { name: 'exitCode', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+       shNullP('process', 'NativeProcess')],
+      [['clone', shObj('Event'), []]]);
+    // flash.desktop.NativeProcessStartupInfo: the launcher descriptor.
+    shell('NativeProcessStartupInfo', 'flash.desktop::NativeProcessStartupInfo', 'Object',
+      [['arguments', { kind: 'vector', elem: { kind: 'string' } }], ['executable', shObj('File')],
+       ['workingDirectory', shObj('File')], ['environment', { kind: 'vector', elem: { kind: 'string' } }],
+       ['standardInput', shObj('File')], ['standardOutput', shObj('File')], ['standardError', shObj('File')]],
+      [],
+      []);
+    // flash.desktop.NativeProcess: the child-process handle. The three pipes are
+    // typed ByteArray rather than AIR's IDataInput/IDataOutput: a shell cannot
+    // hand back a live stream, and an empty ByteArray serves every read/write the
+    // documented pattern uses (bytesAvailable is 0, readUTFBytes returns "").
+    shell('NativeProcess', 'flash.desktop::NativeProcess', 'EventDispatcher',
+      [['running', { kind: 'bool' }], ['processID', { kind: 'uint' }],
+       ['standardInput', shObj('ByteArray')], ['standardOutput', shObj('ByteArray')], ['standardError', shObj('ByteArray')]],
+      [],
+      [],
+      [['start', { kind: 'void' }, [shReq('info', 'NativeProcessStartupInfo')]],
+       // exit(force:Boolean = false) -- the AIR signature (the flag is ignored by
+       // the stub, which never starts a process in the first place).
+       ['exit', { kind: 'void' }, [{ name: 'force', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }]],
+       ['closeInput', { kind: 'void' }, []]],
+      [], [], ['isSupported']);
+    // flash.media.StageWebView: the native web view.
+    shell('StageWebView', 'flash.media::StageWebView', 'EventDispatcher',
+      [['viewPort', shObj('Rectangle')], ['stage', shObj('Stage')], ['userAgent', { kind: 'string' }],
+       ['mediaPlaybackRequiresUserAction', { kind: 'bool' }],
+       ['isHistoryBackEnabled', { kind: 'bool' }], ['isHistoryForwardEnabled', { kind: 'bool' }],
+       ['location', { kind: 'string' }], ['title', { kind: 'string' }]],
+      [],
+      [shNullP('stage', 'Stage')],
+      [['assignFocus', { kind: 'void' }, [{ name: 'direction', type: 'String', defaultValue: { kind: 'Str', value: 'none' }, isRest: false }]],
+       ['dispose', { kind: 'void' }, []],
+       ['drawViewPortToBitmapData', { kind: 'void' }, [shReq('bitmapData', 'BitmapData')]],
+       ['historyBack', { kind: 'void' }, []], ['historyForward', { kind: 'void' }, []],
+       ['loadString', { kind: 'void' }, [shReq('text', 'String'), shReq('mimeType', 'String')]],
+       ['loadURL', { kind: 'void' }, [shReq('url', 'String')]],
+       ['reload', { kind: 'void' }, []], ['stop', { kind: 'void' }, []]],
+      [], [], ['isSupported']);
+    // flash.display.NativeMenuItem: one native context-menu entry.
+    shell('NativeMenuItem', 'flash.display::NativeMenuItem', 'EventDispatcher',
+      [['label', { kind: 'string' }], ['enabled', { kind: 'bool' }], ['checked', { kind: 'bool' }],
+       ['isSeparator', { kind: 'bool' }], ['keyEquivalent', { kind: 'string' }],
+       ['keyEquivalentModifiers', { kind: 'array' }], ['mnemonicIndex', { kind: 'int' }],
+       ['data', shObj('Object')], ['menu', shObj('Object')], ['submenu', shObj('Object')]],
+      [],
+      [shReq('label', 'String'), shBoolP('isSeparator', false)]);
+    // flash.net.NetworkInterface / NetworkInfo: the interface inventory.
+    shell('NetworkInterface', 'flash.net::NetworkInterface', 'EventDispatcher',
+      [['name', { kind: 'string' }], ['displayName', { kind: 'string' }], ['hardwareAddress', { kind: 'string' }],
+       ['active', { kind: 'bool' }], ['mtu', { kind: 'int' }], ['manufacturer', { kind: 'string' }],
+       ['subType', { kind: 'string' }], ['subTypeName', { kind: 'string' }],
+       ['parent', shObj('NetworkInterface')],
+       ['addresses', { kind: 'vector', elem: shObj('Object') }]],
+      [], []);
+    shell('NetworkInfo', 'flash.net::NetworkInfo', 'EventDispatcher',
+      [], [], [],
+      [['findInterfaces', { kind: 'vector', elem: shObj('NetworkInterface') }, []]],
+      [], [['networkInfo', shObj('NetworkInfo')]]);
+    // flash.net.LocalConnection: AIR has no such transport (it is a Flash Player
+    // feature used by libraries only as a GC/"am I local?" trick).
+    shell('LocalConnection', 'flash.net::LocalConnection', 'EventDispatcher',
+      [['client', shObj('Object')], ['domain', { kind: 'string' }]],
+      [], [],
+      [['allowDomain', { kind: 'void' }, [{ name: 'domains', type: 'any', defaultValue: null, isRest: true }]],
+       ['allowInsecureDomain', { kind: 'void' }, [{ name: 'domains', type: 'any', defaultValue: null, isRest: true }]],
+       ['close', { kind: 'void' }, []],
+       ['connect', { kind: 'void' }, [shReq('connectionName', 'String')]],
+       ['send', { kind: 'void' }, [shReq('connectionName', 'String'), shReq('methodName', 'String'), { name: 'args', type: 'any', defaultValue: null, isRest: true }]]],
+      [], [], ['isSupported']);
+    // flash.media.Microphone: capture device. `names` / `isSupported` / the two
+    // getters are static in AIR; the activity/level members are plain fields so a
+    // read of `activityLevel` is a value (0), not a stub call.
+    shell('Microphone', 'flash.media::Microphone', 'EventDispatcher',
+      [['gain', { kind: 'number' }], ['rate', { kind: 'int' }], ['silenceLevel', { kind: 'number' }],
+       ['silenceTimeout', { kind: 'int' }], ['activityLevel', { kind: 'number' }], ['index', { kind: 'int' }],
+       ['name', { kind: 'string' }], ['codec', { kind: 'string' }], ['enableVAD', { kind: 'bool' }],
+       ['fps', { kind: 'number' }], ['muted', { kind: 'bool' }]],
+      [], [],
+      [['setSilenceLevel', { kind: 'void' }, [shReq('silenceLevel', 'Number'), shIntP('timeout', -1)]],
+       ['setUseEchoSuppression', { kind: 'void' }, [shReq('useEchoSuppression', 'Boolean')]],
+       ['setLoopBack', { kind: 'void' }, [shReq('state', 'Boolean')]],
+       ['setCodec', { kind: 'void' }, [shReq('codec', 'String')]],
+       ['setRate', { kind: 'void' }, [shIntP('rate', 11)]]],
+      [['getMicrophone', shObj('Microphone'), [shIntP('index', -1)]],
+       ['getEnhancedMicrophone', shObj('Microphone'), [shIntP('index', -1)]]],
+      [['names', { kind: 'array' }]], ['isSupported']);
+    // flash.desktop.Clipboard: AIR's system clipboard. The project only reaches it
+    // through NativeDragEvent.clipboard / NativeDragManager, so the shape here is
+    // the drag-and-drop subset (hasFormat/getData/clear).
+    shell('Clipboard', 'flash.desktop::Clipboard', 'Object',
+      [['formats', { kind: 'array' }]], [], [],
+      [['clear', { kind: 'void' }, []],
+       ['clearData', { kind: 'void' }, [shNullP('mimeType', 'String')]],
+       ['getData', { kind: 'any' }, [{ name: 'format', type: 'String', defaultValue: null, isRest: false },
+         { name: 'transferMode', type: 'String', defaultValue: { kind: 'Str', value: 'originalPreferred' }, isRest: false }]],
+       ['hasFormat', { kind: 'bool' }, [shReq('format', 'String')]],
+       ['setData', { kind: 'bool' }, [shReq('format', 'String'), shReq('data', 'Object'), shBoolP('serializable', true)]]],
+      [], [['generalClipboard', shObj('Clipboard')]]);
+    // flash.desktop.NativeDragManager: AIR declares acceptDragDrop/doDrag as
+    // STATIC methods and dropAction/isSupported as static read-only properties
+    // (they were registered in the instance-method slot by mistake, which made a
+    // real call site -- upLoadView.onDragIn -- fail with "undefined static method
+    // 'acceptDragDrop'"). allowedActions is typed Object here because AIR's
+    // NativeDragOptions class is not modelled; nothing in this project uses it.
+    shell('NativeDragManager', 'flash.desktop::NativeDragManager', 'Object',
+      [], [], [],
+      [],
+      [['acceptDragDrop', { kind: 'void' }, [shReq('target', 'InteractiveObject')]],
+       ['doDrag', { kind: 'void' }, [shReq('dragInitiator', 'InteractiveObject'), shReq('clipboard', 'Clipboard'),
+         shNullP('dragImage', 'BitmapData'), shNullP('offset', 'Point'), shNullP('allowedActions', 'Object'),
+         { name: 'transferMode', type: 'String', defaultValue: { kind: 'Str', value: 'copy' }, isRest: false }]]],
+      [['dropAction', { kind: 'string' }]], ['isSupported']);
+    shell('ClipboardFormats', 'flash.desktop::ClipboardFormats', 'Object',
+      [],
+      [['FILE_LIST_FORMAT', 'fileList'], ['TEXT_FORMAT', 'text'], ['HTML_FORMAT', 'html'],
+       ['URL_FORMAT', 'url'], ['BITMAP_FORMAT', 'bitmap'], ['RICH_TEXT_FORMAT', 'richText'],
+       ['FILE_PROMISE_LIST_FORMAT', 'filePromiseList']],
+      []);
+    // flash.events.ProgressEvent also carries the three NativeProcess pipe events
+    // (AIR declares them here, not on NativeProcess).
+    {
+      const pe = this.classMap.get('ProgressEvent');
+      if (pe) {
+        pe.staticFields.set('STANDARD_OUTPUT_DATA', shConst('ProgressEvent', 'standardOutputData'));
+        pe.staticFields.set('STANDARD_ERROR_DATA', shConst('ProgressEvent', 'standardErrorData'));
+        pe.staticFields.set('STANDARD_INPUT_PROGRESS', shConst('ProgressEvent', 'standardInputProgress'));
+      }
+    }
     this.classMap.set('MouseEvent', {
       fields: new Map([
         ['localX', mef({ kind: 'number' }, 'MouseEvent')],
@@ -2983,7 +3830,16 @@ export class SymbolTable {
         ['buttonDown', mef({ kind: 'bool' }, 'MouseEvent')],
         ['delta', mef({ kind: 'number' }, 'MouseEvent')],
       ]),
-      methods: new Map(),
+      // updateAfterEvent() is an AIR rendering hint: redraw immediately after the
+      // listener returns. AIR declares it on the event classes that can fire at
+      // pointer/keyboard rate (MouseEvent/KeyboardEvent/TouchEvent/TimerEvent, plus
+      // StatusEvent) and NOT on Event, so it is registered per class, exactly as AIR
+      // has it. This runtime paints from its own frame loop and a listener has no way
+      // to force an extra pass, so the body is a no-op -- documented, and the only
+      // observable difference is up to one frame of latency.
+      methods: new Map([
+        ['updateAfterEvent', { returnType: { kind: 'void' }, params: [], owner: 'MouseEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map([
         ['MOUSE_DOWN', mec('MouseEvent', 'mouseDown')],
         ['MOUSE_UP', mec('MouseEvent', 'mouseUp')],
@@ -3059,7 +3915,9 @@ export class SymbolTable {
         ['controlKey', tef({ kind: 'bool' })],
         ['touchIntent', { type: { kind: 'string' }, init: { kind: 'Str', value: 'unknown' }, visibility: 'public', owner: 'TouchEvent', isStatic: false, isConst: false }],
       ]),
-      methods: new Map(),
+      methods: new Map([
+        ['updateAfterEvent', { returnType: { kind: 'void' }, params: [], owner: 'TouchEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map([
         ['TOUCH_BEGIN', tec('touchBegin')],
         ['TOUCH_MOVE', tec('touchMove')],
@@ -3116,10 +3974,24 @@ export class SymbolTable {
         ['charCode', mef({ kind: 'int' }, 'KeyboardEvent')],
         ['keyLocation', mef({ kind: 'int' }, 'KeyboardEvent')],
         ['ctrlKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
+        // controlKey / commandKey are AIR's platform-specific modifier names. The
+        // backend reports them as far as the platform can tell them apart (see the
+        // keyboard dispatch in emit.ts): on macOS Command is commandKey while controlKey
+        // -- the PHYSICAL Control key -- is folded into Ctrl by the window glue and stays
+        // false; on Windows/Linux controlKey is the Ctrl key (the same one ctrlKey
+        // reports) and commandKey does not exist there.
+        ['controlKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
+        ['commandKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
         ['altKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
         ['shiftKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
+        // functionKey (AIR 50, macOS only: the Fn key). No backend reports it, so it is
+        // readable and stays false, the same treatment controlKey/commandKey got before
+        // the platform rule above existed.
+        ['functionKey', mef({ kind: 'bool' }, 'KeyboardEvent')],
       ]),
-      methods: new Map(),
+      methods: new Map([
+        ['updateAfterEvent', { returnType: { kind: 'void' }, params: [], owner: 'KeyboardEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map([
         ['KEY_DOWN', mec('KeyboardEvent', 'keyDown')],
         ['KEY_UP', mec('KeyboardEvent', 'keyUp')],
@@ -3133,6 +4005,13 @@ export class SymbolTable {
         meBool('cancelable', false),
         { name: 'charCode', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         { name: 'keyCode', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        { name: 'keyLocation', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        meBool('ctrlKey', false),
+        meBool('altKey', false),
+        meBool('shiftKey', false),
+        meBool('controlKey', false),
+        meBool('commandKey', false),
+        meBool('functionKey', false),
       ] },
       superClass: 'Event',
       isFinal: false,
@@ -3164,6 +4043,39 @@ export class SymbolTable {
         { name: 'text', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
       ] },
       superClass: 'Event',
+      isFinal: false,
+      implements: [],
+    });
+    // flash.events.IMEEvent (TODO 遗留 L8149): the documented IME event — a TextEvent
+    // subclass (so `text` is inherited, with the empty-string default) plus an
+    // `imeClient` slot and two type constants. Measured on adl 51.3.2
+    // (temp/imeprobe): IME_COMPOSITION == "imeComposition", `new
+    // IMEEvent("imeComposition").text` is "" and there is NO `data` property
+    // (#1069 "Property data not found on flash.events.IMEEvent"). The family is not
+    // reachable from AIR's static IME surface (mxmlc rejects IME.addEventListener,
+    // and our runtime has no IME source to raise one from), so we never dispatch
+    // it — but the class itself is constructible and dispatchable exactly like
+    // AIR's, which is what lets a program name IMEEvent.IME_COMPOSITION at all.
+    this.classMap.set('IMEEvent', {
+      fields: new Map([
+        ['imeClient', mef({ kind: 'object', className: 'Object' }, 'IMEEvent')],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['IME_COMPOSITION', mec('IMEEvent', 'imeComposition')],
+        ['IME_START_COMPOSITION', mec('IMEEvent', 'imeStartComposition')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', false),
+        meBool('cancelable', false),
+        { name: 'text', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },
+        { name: 'imeClient', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'TextEvent',
       isFinal: false,
       implements: [],
     });
@@ -3200,7 +4112,9 @@ export class SymbolTable {
     // simplification (not overridden; Event.clone() returns a base Event).
     this.classMap.set('TimerEvent', {
       fields: new Map(),
-      methods: new Map(),
+      methods: new Map([
+        ['updateAfterEvent', { returnType: { kind: 'void' }, params: [], owner: 'TimerEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map([
         ['TIMER', mec('TimerEvent', 'timer')],
         ['TIMER_COMPLETE', mec('TimerEvent', 'timerComplete')],
@@ -3219,8 +4133,10 @@ export class SymbolTable {
     });
     this.classMap.set('ProgressEvent', {
       fields: new Map([
-        ['bytesLoaded', mef({ kind: 'uint' }, 'ProgressEvent')],
-        ['bytesTotal', mef({ kind: 'uint' }, 'ProgressEvent')],
+        // bytesLoaded/bytesTotal are Number in AIR (not uint): a progress handler may
+        // see a fractional count from a byte-range source.
+        ['bytesLoaded', mef({ kind: 'number' }, 'ProgressEvent')],
+        ['bytesTotal', mef({ kind: 'number' }, 'ProgressEvent')],
       ]),
       methods: new Map(),
       staticFields: new Map([
@@ -3228,6 +4144,10 @@ export class SymbolTable {
         // flash.net.Socket raises this, not PROGRESS: see the socket section in
         // emit.ts. Same shape, different type string.
         ['SOCKET_DATA', mec('ProgressEvent', 'socketData')],
+        // The NativeProcess pipe events (verified against the AIR reference).
+        ['STANDARD_ERROR_DATA', mec('ProgressEvent', 'standardErrorData')],
+        ['STANDARD_INPUT_PROGRESS', mec('ProgressEvent', 'standardInputProgress')],
+        ['STANDARD_OUTPUT_DATA', mec('ProgressEvent', 'standardOutputData')],
       ]),
       staticMethods: new Map(),
       getters: new Map(),
@@ -3236,8 +4156,8 @@ export class SymbolTable {
         { name: 'type', type: 'String', defaultValue: null, isRest: false },
         meBool('bubbles', false),
         meBool('cancelable', false),
-        { name: 'bytesLoaded', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
-        { name: 'bytesTotal', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        { name: 'bytesLoaded', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        { name: 'bytesTotal', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
       ] },
       superClass: 'Event',
       isFinal: false,
@@ -3272,6 +4192,16 @@ export class SymbolTable {
       methods: new Map(),
       staticFields: new Map([
         ['IO_ERROR', mec('IOErrorEvent', 'ioError')],
+        // The three stream errors a NativeProcess dispatches (AIR 2+), plus the
+        // Flash-era spellings AVM2 keeps (the AIR reference page documents only the
+        // stream ones; svgaplayer's Parser listens for diskError/networkError/
+        // verifyError on a Loader). Only the value matters -- it is the event type.
+        ['STANDARD_INPUT_IO_ERROR', mec('IOErrorEvent', 'standardInputIoError')],
+        ['STANDARD_OUTPUT_IO_ERROR', mec('IOErrorEvent', 'standardOutputIoError')],
+        ['STANDARD_ERROR_IO_ERROR', mec('IOErrorEvent', 'standardErrorIoError')],
+        ['DISK_ERROR', mec('IOErrorEvent', 'diskError')],
+        ['NETWORK_ERROR', mec('IOErrorEvent', 'networkError')],
+        ['VERIFY_ERROR', mec('IOErrorEvent', 'verifyError')],
       ]),
       staticMethods: new Map(),
       getters: new Map(),
@@ -3293,6 +4223,10 @@ export class SymbolTable {
       methods: new Map(),
       staticFields: new Map([
         ['DATA', mec('DataEvent', 'data')],
+        // The other two DataEvent types (verified against the AIR reference; note
+        // that TEXT_INPUT belongs to TextEvent, not DataEvent).
+        ['UPLOAD_COMPLETE_DATA', mec('DataEvent', 'uploadCompleteData')],
+        ['WEBVIEW_MESSAGE', mec('DataEvent', 'webViewMessage')],
       ]),
       staticMethods: new Map(),
       getters: new Map(),
@@ -3438,9 +4372,14 @@ export class SymbolTable {
     // ContextMenuEvent: MENU_SELECT fires on the display object, MENU_ITEM_SELECT on
     // a ContextMenuItem. This subset never shows a native menu, so neither is ever
     // dispatched (documented gap); the class exists so handlers and
-    // addEventListener calls type-check and link.
+    // addEventListener calls type-check and link. mouseTarget/contextMenuOwner are
+    // AIR's two read-write InteractiveObject properties (AdvanceLayoutVideo.
+    // menuItemSelect reads e.contextMenuOwner to find the tile the menu belongs to).
     this.classMap.set('ContextMenuEvent', {
-      fields: new Map(),
+      fields: new Map([
+        ['mouseTarget', mef({ kind: 'object', className: 'InteractiveObject' }, 'ContextMenuEvent')],
+        ['contextMenuOwner', mef({ kind: 'object', className: 'InteractiveObject' }, 'ContextMenuEvent')],
+      ]),
       methods: new Map(),
       staticFields: new Map([
         ['MENU_ITEM_SELECT', mec('ContextMenuEvent', 'menuItemSelect')],
@@ -3453,7 +4392,7 @@ export class SymbolTable {
         { name: 'type', type: 'String', defaultValue: null, isRest: false },
         meBool('bubbles', false),
         meBool('cancelable', false),
-        { name: 'mouseTarget', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'mouseTarget', type: 'InteractiveObject', defaultValue: { kind: 'Null' }, isRest: false },
         { name: 'contextMenuOwner', type: 'InteractiveObject', defaultValue: { kind: 'Null' }, isRest: false },
       ] },
       superClass: 'Event',
@@ -3484,12 +4423,16 @@ export class SymbolTable {
       implements: [],
     });
     this.classMap.set('ContextMenuItem', {
+      // AIR: ContextMenuItem extends NativeMenuItem (its `caption` is the AS3 name of
+      // the display string NativeMenuItem calls `label`). We keep `caption` as its own
+      // slot AND pass it to the super ctor so `label` reports the same text; a write to
+      // one of the two names is not seen by the other (the app never uses
+      // ContextMenuItem -- it builds menus out of NativeMenuItem -- so this stays
+      // invisible; AIR itself aliases the two).
       fields: new Map([
         ['caption', cmiF('ContextMenuItem', { kind: 'string' })],
         ['separatorBefore', cmiF('ContextMenuItem', { kind: 'bool' })],
-        ['enabled', cmiF('ContextMenuItem', { kind: 'bool' })],
         ['visible', cmiF('ContextMenuItem', { kind: 'bool' })],
-        ['isSeparator', cmiF('ContextMenuItem', { kind: 'bool' })],
       ]),
       methods: new Map(),
       staticFields: new Map(),
@@ -3501,9 +4444,8 @@ export class SymbolTable {
         cmiP('separatorBefore', 'Boolean', { kind: 'Bool', value: false }),
         cmiP('enabled', 'Boolean', { kind: 'Bool', value: true }),
         cmiP('visible', 'Boolean', { kind: 'Bool', value: true }),
-        cmiP('isSeparator', 'Boolean', { kind: 'Bool', value: false }),
       ] },
-      superClass: 'EventDispatcher',
+      superClass: 'NativeMenuItem',
       isFinal: false,
       implements: [],
     });
@@ -3514,15 +4456,30 @@ export class SymbolTable {
       ]),
       methods: new Map([
         ['hideBuiltInItems', cmiM('ContextMenu', { kind: 'void' }, [])],
-        ['addItem', cmiM('ContextMenu', { kind: 'void' }, [{ name: 'item', type: 'ContextMenuItem', defaultValue: null, isRest: false }])],
-        ['removeItem', cmiM('ContextMenu', { kind: 'void' }, [{ name: 'item', type: 'ContextMenuItem', defaultValue: null, isRest: false }])],
-        ['containsItem', cmiM('ContextMenu', { kind: 'bool' }, [{ name: 'item', type: 'ContextMenuItem', defaultValue: null, isRest: false }])],
+        // AIR types every item-slot method on NativeMenuItem (ContextMenuItem is the
+        // subclass) and returns the item, not void -- the app passes the
+        // NativeMenuItem instances it constructs, so the wide type is the correct one.
+        ['addItem', cmiM('ContextMenu', { kind: 'object', className: 'NativeMenuItem' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
+        ['removeItem', cmiM('ContextMenu', { kind: 'object', className: 'NativeMenuItem' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
+        ['containsItem', cmiM('ContextMenu', { kind: 'bool' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
+        ['getItemAt', cmiM('ContextMenu', { kind: 'object', className: 'NativeMenuItem' }, [{ name: 'index', type: 'int', defaultValue: null, isRest: false }])],
         ['clone', cmiM('ContextMenu', { kind: 'object', className: 'ContextMenu' }, [])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
-      setters: new Map(),
+      getters: new Map([
+        // numItems is read-only in AIR. Our ContextMenu models no built-in items
+        // (hideBuiltInItems is a no-op), so the count is exactly the list
+        // getItemAt() indexes -- see the body comment in emit.ts.
+        ['numItems', { returnType: { kind: 'int' }, params: [], owner: 'ContextMenu', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // AIR: `items` is a synonym of `customItems` ("Using this property is
+        // equivalent to using the customItems property"). Both accessors below alias
+        // the same array.
+        ['items', { returnType: { kind: 'array' }, params: [], owner: 'ContextMenu', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map([
+        ['items', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Array', defaultValue: null, isRest: false }], owner: 'ContextMenu', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
       isFinal: false,
@@ -3739,16 +4696,27 @@ export class SymbolTable {
           { name: 'joints', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
           gnum('miterLimit', 3),
         ])],
+        // AIR: beginGradientFill(type:String, colors:Array, alphas:Array,
+        // ratios:Array, matrix:Matrix = null, spreadMethod:String = "pad",
+        // interpolationMethod:String = "rgb", focalPointRatio:Number = 0). The three
+        // trailing optionals MUST be registered: the prototype is generated from the
+        // registration, so a missing one made a documented 8-argument call (e.g.
+        // CalendarSkin.as:133) a hard "too many arguments" error.
         ['beginGradientFill', gpm({ kind: 'void' }, [
           { name: 'type', type: 'String', defaultValue: null, isRest: false },
           { name: 'colors', type: 'Array', defaultValue: null, isRest: false },
           { name: 'alphas', type: 'Array', defaultValue: null, isRest: false },
           { name: 'ratios', type: 'Array', defaultValue: null, isRest: false },
-          { name: 'matrix', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'matrix', type: 'Matrix', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'spreadMethod', type: 'String', defaultValue: { kind: 'Str', value: 'pad' }, isRest: false },
+          { name: 'interpolationMethod', type: 'String', defaultValue: { kind: 'Str', value: 'rgb' }, isRest: false },
+          gnum('focalPointRatio', 0),
         ])],
         ['drawRect', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0)])],
         ['drawRoundRect', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0), gnum('ellipseWidth', 0), gnum('ellipseHeight', 0)])],
         ['drawCircle', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('radius', 0)])],
+        // AIR's drawEllipse(x, y, width, height): the oval inscribed in that rect.
+        ['drawEllipse', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0)])],
         // AIR: drawTriangles(vertices:Vector.<Number>, indices:Vector.<int> = null,
         // uvtData:Vector.<Number> = null, culling:String = "none"). Note the vertices
         // come FIRST here, unlike Context3D.drawTriangles (WireframeMapGenerator calls
@@ -3789,13 +4757,30 @@ export class SymbolTable {
     // loadFile hook) used by render().
     const bmpf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Bitmap', isStatic: false, isConst: false });
     this.classMap.set('Bitmap', {
-      fields: new Map([['bitmapData', bmpf({ kind: 'object', className: 'BitmapData' })], ['smoothing', bmpf({ kind: 'bool' })]]),
+      fields: new Map([
+        ['bitmapData', bmpf({ kind: 'object', className: 'BitmapData' })],
+        ['smoothing', bmpf({ kind: 'bool' })],
+        // pixelSnapping: a plain String field, because in this backend no pixel
+        // snapping ever happens -- the value is stored and read back verbatim
+        // (which is all a program can observe besides rendering) rather than
+        // silently defaulted. Its documented default is PixelSnapping.AUTO, so the
+        // field carries that initializer instead of null.
+        ['pixelSnapping', { ...bmpf({ kind: 'string' }), init: { kind: 'Str', value: 'auto' } as const }],
+      ]),
       methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
       setters: new Map(),
-      constructor: { params: [{ name: 'bitmapData', type: 'BitmapData', defaultValue: { kind: 'Null' }, isRest: false }] },
+      constructor: { params: [
+        { name: 'bitmapData', type: 'BitmapData', defaultValue: { kind: 'Null' }, isRest: false },
+        // AIR's full signature: Bitmap(bitmapData = null, pixelSnapping = "auto",
+        // smoothing = false). The app passes all three (`new Bitmap(bd,
+        // PixelSnapping.NEVER, true)`), so the extra two parameters are part of the
+        // shape and are stored in the matching fields.
+        { name: 'pixelSnapping', type: 'String', defaultValue: { kind: 'Str', value: 'auto' }, isRest: false },
+        { name: 'smoothing', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+      ] },
       superClass: 'DisplayObject',
       isFinal: false,
       implements: [],
@@ -3862,9 +4847,28 @@ export class SymbolTable {
           { name: 'fractalNoise', type: 'Boolean', defaultValue: null, isRest: false },
         ])],
         ['dispose', bdm({ kind: 'void' }, [])],
+        // encode(rect, compressor, byteArray, byteArrayOffset = 0): serialize the
+        // pixels through the named compressor (JPEGEncoderOptions /
+        // PNGEncoderOptions). Neither format is available from this build's vendored
+        // Skia (skia_use_libjpeg_turbo_encode / _libwebp_encode are off; SkPngEncoder
+        // IS linked, so PNG has a real path available through the glue). Writing the
+        // WRONG format's bytes into the caller's ByteArray would be a silent lie, so
+        // the body reports the gap and writes nothing; see TODO.md ('encode').
+        ['encode', bdm({ kind: 'void' }, [
+          { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
+          { name: 'compressor', type: 'Object', defaultValue: null, isRest: false },
+          { name: 'byteArray', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
         ['setPixels', bdm({ kind: 'void' }, [
           { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
           { name: 'inputByteArray', type: 'ByteArray', defaultValue: null, isRest: false },
+        ])],
+        // getPixels(rect): the same byte layout setPixels reads, returned in a FRESH
+        // ByteArray (VideoPlayer caches a decoded frame this way before re-uploading
+        // it through RectangleTexture.uploadFromByteArray).
+        ['getPixels', bdm({ kind: 'object', className: 'ByteArray' }, [
+          { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
         ])],
         ['copyPixels', bdm({ kind: 'void' }, [
           { name: 'sourceBitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
@@ -3904,6 +4908,15 @@ export class SymbolTable {
         ])],
         ['lock', bdm({ kind: 'void' }, [])],
         ['unlock', bdm({ kind: 'void' }, [])],
+        // copyPixelsToByteArray(rect, data, offset=0): the pixel buffer of a
+        // rectangle, written into a ByteArray as 4 bytes per pixel in the
+        // ByteArray's endianness (AIR's documented layout; the same one
+        // setPixels reads back).
+        ['copyPixelsToByteArray', bdm({ kind: 'void' }, [
+          { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
+          { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -4191,6 +5204,10 @@ export class SymbolTable {
         ['align', tff({ kind: 'string' }, 'TextFormat')],
         ['kerning', tff({ kind: 'bool' }, 'TextFormat')],
         ['letterSpacing', tff({ kind: 'number' }, 'TextFormat')],
+        // Paragraph margins (AIR declares them as Object because a null means
+        // "unset", but the documented default is 0 and callers assign numbers).
+        ['leftMargin', tff({ kind: 'number' }, 'TextFormat')],
+        ['rightMargin', tff({ kind: 'number' }, 'TextFormat')],
       ]),
       methods: new Map(),
       staticFields: new Map(),
@@ -4211,9 +5228,20 @@ export class SymbolTable {
     });
     // flash.text.StyleSheet: Starling only passes it through as a nullable value
     // (no CSS parsing is exercised), so it is modeled as a bare Object subclass.
+    // `setStyle` exists because real projects DO load a stylesheet and feed it rules
+    // (talkmed-meeting's Fps.as sets fontSize/fontFamily/leading/color and assigns
+    // the sheet to a TextField); no CSS is applied by this backend, so the method
+    // reports itself once and returns -- an app that never stylesheets is
+    // unaffected, and one that does gets told, rather than getting silently
+    // unstyled text.
     this.classMap.set('StyleSheet', {
       fields: new Map(),
-      methods: new Map(),
+      methods: new Map([
+        ['setStyle', { returnType: { kind: 'void' }, params: [
+          { name: 'styleName', type: 'String', defaultValue: null, isRest: false },
+          { name: 'styleObject', type: 'Object', defaultValue: null, isRest: false },
+        ], owner: 'StyleSheet', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
@@ -4378,6 +5406,12 @@ export class SymbolTable {
     });
     constClass('FontStyle', { REGULAR: 'regular', BOLD: 'bold', ITALIC: 'italic', BOLD_ITALIC: 'boldItalic' });
     constClass('GradientType', { LINEAR: 'linear', RADIAL: 'radial' });
+    // beginGradientFill's spread/interpolation token classes (AIR's values, from the
+    // flash.display reference). GradientType existed on its own; these two are reached
+    // by the same call sites (CalendarSkin.as:120-121 passes SpreadMethod.PAD and
+    // InterpolationMethod.LINEAR_RGB as the 6th/7th arguments).
+    constClass('SpreadMethod', { PAD: 'pad', REFLECT: 'reflect', REPEAT: 'repeat' });
+    constClass('InterpolationMethod', { RGB: 'rgb', LINEAR_RGB: 'linearRGB' });
     const txf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'TextField', isStatic: false, isConst: false });
     const txg = (ret: CType, name: string): MethodInfo => ({ returnType: ret, params: [], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     const txm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
@@ -4431,6 +5465,15 @@ export class SymbolTable {
         ['textColor', txf({ kind: 'uint' })],
         ['embedFonts', txf({ kind: 'bool' })],
         ['antiAliasType', txf({ kind: 'string' })],
+        // mouseWheelEnabled (AIR default true) gates the wheel-notch scrolling the
+        // native backend feeds in through Stage.dispatchWheel -- real behaviour, not
+        // a stored-only slot (see Stage_dispatchWheel). Apps use it to stop labels
+        // from scrolling under the cursor.
+        ['mouseWheelEnabled', txf({ kind: 'bool' })],
+        // condenseWhite (AIR default false): when true, runs of whitespace in the
+        // HTML source are collapsed before parsing (see as_tf_html_set). Plain text
+        // is unaffected, exactly as in AIR.
+        ['condenseWhite', txf({ kind: 'bool' })],
         ['styleSheet', txf({ kind: 'object', className: 'StyleSheet' })],
       ]),
       methods: new Map([
@@ -4441,6 +5484,15 @@ export class SymbolTable {
         ['appendText', txm({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
         ['setSelection', txm({ kind: 'void' }, [{ name: 'begin', type: 'int', defaultValue: null, isRest: false }, { name: 'end', type: 'int', defaultValue: null, isRest: false }])],
         ['setTextFormat', txm({ kind: 'void' }, [{ name: 'format', type: 'TextFormat', defaultValue: null, isRest: false }, { name: 'begin', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false }, { name: 'end', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false }])],
+        // getTextFormat: AIR returns a snapshot of the character formatting over a
+        // range. The subset stores ONE format per field (no per-character runs), so
+        // the only honest answer is the field's effective format, which is exactly
+        // what `defaultTextFormat` returns; the begin/end arguments are accepted
+        // and ignored (documented in README-CN.md).
+        ['getTextFormat', txm({ kind: 'object', className: 'TextFormat' }, [
+          { name: 'beginIndex', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false },
+          { name: 'endIndex', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false },
+        ])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -4652,6 +5704,8 @@ export class SymbolTable {
     {
       const cf = gefield('ColorTransform');
       const cm = gemethod('ColorTransform');
+      const ctget = gegetter('ColorTransform');
+      const ctset = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'ColorTransform', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
       const cp = (name: string): Param => ({ name, type: 'ColorTransform', defaultValue: null, isRest: false });
       this.classMap.set('ColorTransform', {
         fields: new Map([
@@ -4664,8 +5718,15 @@ export class SymbolTable {
         ]),
         staticFields: new Map(),
         staticMethods: new Map(),
-        getters: new Map(),
-        setters: new Map(),
+        // `color` is a real AIR accessor, not a stored field: reading it recombines
+        // the three color offsets, writing it sets them and zeroes the three color
+        // multipliers (alpha untouched) -- see ColorTransform_get/set_color in emit.ts.
+        getters: new Map([
+          ['color', ctget({ kind: 'uint' })],
+        ]),
+        setters: new Map([
+          ['color', ctset('uint')],
+        ]),
         constructor: { params: [gegnum('redMultiplier', 1), gegnum('greenMultiplier', 1), gegnum('blueMultiplier', 1), gegnum('alphaMultiplier', 1), gegnum('redOffset', 0), gegnum('greenOffset', 0), gegnum('blueOffset', 0), gegnum('alphaOffset', 0)] },
         superClass: 'Object',
         isFinal: false,
@@ -5015,6 +6076,14 @@ export class SymbolTable {
             { name: 'bitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
             { name: 'miplevel', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
           ])],
+          // uploadFromByteArray(data, byteArrayOffset, miplevel=0): the texels are
+          // read straight out of the ByteArray (streaming-video upload path). Level
+          // 0 is uploaded for real; a level > 0 reports loudly (see emit.ts).
+          ['uploadFromByteArray', txm({ kind: 'void' }, [
+            { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: null, isRest: false },
+            { name: 'miplevel', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          ])],
           ['uploadCompressedTextureFromByteArray', txm({ kind: 'void' }, [
             { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
             { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
@@ -5051,6 +6120,14 @@ export class SymbolTable {
             { name: 'bitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
             { name: 'side', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
             { name: 'miplevel', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+          ])],
+          // AIR declares uploadFromByteArray(data, byteArrayOffset, side) on
+          // CubeTexture. Not implemented here (a cube face upload needs the six-face
+          // re-upload path); the body reports loudly instead of fetching silently.
+          ['uploadFromByteArray', cum({ kind: 'void' }, [
+            { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: null, isRest: false },
+            { name: 'side', type: 'uint', defaultValue: null, isRest: false },
           ])],
           ['dispose', cum({ kind: 'void' }, [])],
           // Declared on TextureBase in AIR; added here (owner CubeTexture) because our
@@ -5096,6 +6173,13 @@ export class SymbolTable {
           ['uploadFromBitmapData', rtm({ kind: 'void' }, [
             { name: 'bitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
           ])],
+          // RectangleTexture.uploadFromByteArray has NO miplevel (AIR 3.8): an NPOT
+          // texture carries a single level. This is the path the app's video decoder
+          // drives (OpenGLVideo.update / StarlingView frame upload).
+          ['uploadFromByteArray', rtm({ kind: 'void' }, [
+            { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: null, isRest: false },
+          ])],
           ['dispose', rtm({ kind: 'void' }, [])],
         ]),
         staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
@@ -5113,6 +6197,12 @@ export class SymbolTable {
         ['backBufferHeight', c3f({ kind: 'int' })],
         ['antiAlias', c3f({ kind: 'int' })],
         ['enableDepthAndStencil', c3f({ kind: 'bool' })],
+        // ignoreResourceLimits (AIR 50, read-write): "specifies whether to ignore
+        // all 'soft' resource limits associated with a profile". This backend
+        // imposes no GPU resource limits of its own, so there is nothing to lift;
+        // the request is stored so a read-back reports what was set (Starling sets
+        // it from its rootCreated handler and traces the value straight back).
+        ['ignoreResourceLimits', c3f({ kind: 'bool' })],
         ['blendSource', c3f({ kind: 'string' })],
         ['blendDest', c3f({ kind: 'string' })],
         ['depthTestOn', c3f({ kind: 'bool' })],
@@ -5366,7 +6456,25 @@ export class SymbolTable {
     // emit-time param resolution (paramDecls) picks the built-in type.
     const builtinAlias = new Map<string, string>();
     for (const n of this.classMap.keys()) if (this.classMap.get(n)!.packageName === undefined) builtinAlias.set(n, n);
-    for (const n of builtinAlias.keys()) this.classMap.get(n)!.importAlias = builtinAlias;
+    // Built-in INTERFACES carry their parameter types the same way (and an
+    // interface vtable merges a super-interface's methods, whose slot types must
+    // resolve in the DECLARING interface's own context -- see methodPtrField).
+    for (const n of this.interfaceMap.keys()) builtinAlias.set(n, n);
+    for (const n of builtinAlias.keys()) {
+      const c = this.classMap.get(n);
+      if (c) c.importAlias = builtinAlias;
+      // A USER interface already carries the alias built from ITS OWN import list,
+      // and that one must stay: overwriting it with the global built-in table made
+      // every param naming a flash built-in resolve to the built-in, so
+      // starling.filters.IFilterHelper's `putTexture(texture:Texture)` slot took
+      // the built-in `Texture*` while the interface's own `getTexture():Texture`
+      // (pre-resolved at registration) and the implementing
+      // `FilterHelper_putTexture` both took `starling_textures_Texture*`
+      // (5 "incompatible function pointer types" + 5 "incompatible pointer types").
+      // Only a built-in interface (no source file, hence no alias) needs the table.
+      const i = this.interfaceMap.get(n);
+      if (i && i.importAlias === undefined) i.importAlias = builtinAlias;
+    }
     // Fully-qualified names of the built-in classes, MEASURED on adl 51.4.1
     // (temp/pkgA/fqn-result.txt: getDefinitionByName over candidate packages,
     // then getQualifiedClassName on the resolved Class) -- never guessed from
@@ -5404,6 +6512,8 @@ export class SymbolTable {
       ShaderJob: 'flash.display::ShaderJob', ShaderParameter: 'flash.display::ShaderParameter',
       ShaderPrecision: 'flash.display::ShaderPrecision', ShaderInput: 'flash.display::ShaderInput',
       NativeWindow: 'flash.display::NativeWindow',
+      JPEGEncoderOptions: 'flash.display::JPEGEncoderOptions',
+      PNGEncoderOptions: 'flash.display::PNGEncoderOptions',
       NativeWindowInitOptions: 'flash.display::NativeWindowInitOptions',
       Screen: 'flash.display::Screen', NativeMenu: 'flash.display::NativeMenu',
       NativeMenuItem: 'flash.display::NativeMenuItem',
@@ -5421,6 +6531,7 @@ export class SymbolTable {
       Timer: 'flash.utils::Timer', Proxy: 'flash.utils::Proxy',
       Capabilities: 'flash.system::Capabilities', System: 'flash.system::System',
       ApplicationDomain: 'flash.system::ApplicationDomain', IME: 'flash.system::IME',
+      IMEConversionMode: 'flash.system::IMEConversionMode',
       Security: 'flash.system::Security', LoaderContext: 'flash.system::LoaderContext',
       File: 'flash.filesystem::File', FileStream: 'flash.filesystem::FileStream',
       FileMode: 'flash.filesystem::FileMode',
@@ -5438,6 +6549,7 @@ export class SymbolTable {
       Event: 'flash.events::Event', EventDispatcher: 'flash.events::EventDispatcher',
       MouseEvent: 'flash.events::MouseEvent', KeyboardEvent: 'flash.events::KeyboardEvent',
       TextEvent: 'flash.events::TextEvent', TimerEvent: 'flash.events::TimerEvent',
+      IMEEvent: 'flash.events::IMEEvent',
       ProgressEvent: 'flash.events::ProgressEvent', ErrorEvent: 'flash.events::ErrorEvent',
       VsyncStateChangeAvailabilityEvent: 'flash.events::VsyncStateChangeAvailabilityEvent',
       IOErrorEvent: 'flash.events::IOErrorEvent', FocusEvent: 'flash.events::FocusEvent',
@@ -5445,6 +6557,30 @@ export class SymbolTable {
       HTTPStatusEvent: 'flash.events::HTTPStatusEvent', ContextMenuEvent: 'flash.events::ContextMenuEvent',
       TouchEvent: 'flash.events::TouchEvent', AsyncErrorEvent: 'flash.events::AsyncErrorEvent',
       OutputProgressEvent: 'flash.events::OutputProgressEvent',
+      StatusEvent: 'flash.events::StatusEvent',
+      // flash.external — the ANE bridge's AS3 face (a shell in this build).
+      ExtensionContext: 'flash.external::ExtensionContext',
+      // Shell classes (stage 136): registered with an `fqn` of their own, so this
+      // short-name map only feeds getQualifiedClassName/describeType helpers.
+      FileFilter: 'flash.net::FileFilter',
+      FileListEvent: 'flash.events::FileListEvent',
+      NativeWindowBoundsEvent: 'flash.events::NativeWindowBoundsEvent',
+      InvokeEvent: 'flash.events::InvokeEvent',
+      LocationChangeEvent: 'flash.events::LocationChangeEvent',
+      NativeDragEvent: 'flash.events::NativeDragEvent',
+      SampleDataEvent: 'flash.events::SampleDataEvent',
+      NativeProcessExitEvent: 'flash.events::NativeProcessExitEvent',
+      NativeProcessStartupInfo: 'flash.desktop::NativeProcessStartupInfo',
+      NativeProcess: 'flash.desktop::NativeProcess',
+      StageWebView: 'flash.media::StageWebView',
+      NativeMenuItem: 'flash.display::NativeMenuItem',
+      NetworkInterface: 'flash.net::NetworkInterface',
+      NetworkInfo: 'flash.net::NetworkInfo',
+      LocalConnection: 'flash.net::LocalConnection',
+      Microphone: 'flash.media::Microphone',
+      ClipboardFormats: 'flash.desktop::ClipboardFormats',
+      Clipboard: 'flash.desktop::Clipboard',
+      NativeDragManager: 'flash.desktop::NativeDragManager',
       ServerSocketConnectEvent: 'flash.events::ServerSocketConnectEvent',
       SecurityErrorEvent: 'flash.events::SecurityErrorEvent',
       // flash.net / flash.media / flash.filters / flash.display3D
@@ -5509,7 +6645,7 @@ export class SymbolTable {
       if (stmt.kind === 'ClassDecl') {
         const cname = fqn(stmt.name, stmt.packageName);
         const info = this.classMap.get(cname)!;
-        const importAlias = buildImportAlias(stmt.imports, this.classMap);
+        const importAlias = buildImportAlias(stmt.imports, this.classMap, stmt.packageName);
         info.importAlias = importAlias;
         if (stmt.superClass) {
           const st = resolveType(stmt.superClass, importAlias);
@@ -5524,10 +6660,20 @@ export class SymbolTable {
           if (st.kind === 'interface') {
             throw new CodegenError(`class '${cname}' cannot extend interface '${stmt.superClass}'`);
           }
-          if (st.kind !== 'object') {
+          if (st.kind === 'array') {
+            // `class X extends Array`: AIR's Array is a dynamic class backed by
+            // the engine's array storage. There is no C struct to inherit, so the
+            // subclass keeps its OWN vtable and gets a hidden `as_array* _arr`
+            // slot (see ClassInfo.arrayBacked) that serves every Array operation.
+            // `Object` is the C-visible superclass: the struct still begins with
+            // the vtable pointer, so a subclass pointer stays layout-compatible.
+            info.arrayBacked = true;
+            info.superClass = 'Object';
+          } else if (st.kind !== 'object') {
             throw new CodegenError(`unsupported superclass '${stmt.superClass}' of '${cname}': subclassing built-in types is not implemented`);
+          } else {
+            info.superClass = st.className;
           }
-          info.superClass = st.className;
         }
         info.implements = stmt.implements.map((i) => {
           const t = resolveType(i, importAlias);
@@ -5539,12 +6685,17 @@ export class SymbolTable {
     // trait is inherited, not just declared), so propagate it along the super
     // chain to a fixpoint. This runs for built-ins too, which is what makes a
     // user subclass of `MovieClip` (a `dynamic class`) dynamic as AIR has it.
+    // `arrayBacked` rides the same chain (`Set extends Sequence extends Array`).
     for (let changed = true; changed; ) {
       changed = false;
       for (const info of this.classMap.values()) {
-        if (info.isDynamic) continue;
-        if (this.classMap.get(info.superClass)?.isDynamic) {
+        const sup = info.superClass ? this.classMap.get(info.superClass) : undefined;
+        if (!info.isDynamic && sup?.isDynamic) {
           info.isDynamic = true;
+          changed = true;
+        }
+        if (!info.arrayBacked && sup?.arrayBacked) {
+          info.arrayBacked = true;
           changed = true;
         }
       }

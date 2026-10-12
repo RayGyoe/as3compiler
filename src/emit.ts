@@ -8,6 +8,16 @@ import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 import type { SwcResourceSpec, SwcBake } from './swc.ts';
 import type { EmbedResourceSpec } from './embed.ts';
 
+// [temp instrumentation] AS3_MEMBERGAPS=1 makes every "undefined member" site
+// record what it hit and continue with a null value instead of throwing, so ONE
+// dry run lists the whole long tail of missing members. Removed after the scan.
+export const AS3_GAPS: string[] = [];
+export function as3Gap(kind: string, what: string): boolean {
+  if (!process.env.AS3_MEMBERGAPS) return false;
+  AS3_GAPS.push(kind + ': ' + what);
+  return true;
+}
+
 /** One baked clipDepth mask the emitter must emit: a mask shape plus the affine
  *  that maps its local pixels into the masked object's local pixels. */
 interface SwcMaskRef {
@@ -127,7 +137,7 @@ function collectScriptDecls(body: Stmt[]): ScriptDecl[] {
           walk([s.body]);
           break;
         case 'ForIn':
-          if (s.declares) push(s.varName, null, null, false, { kind: 'in', iterable: s.iterable, declared: null });
+          if (s.declares) push(s.varName, null, null, false, { kind: 'in', iterable: s.iterable, declared: s.varType });
           walk([s.body]);
           break;
         case 'ForEachIn':
@@ -150,7 +160,7 @@ function collectScriptDecls(body: Stmt[]): ScriptDecl[] {
   return decls;
 }
 
-function collectScriptVars(body: Stmt[]): Set<string> {
+export function collectScriptVars(body: Stmt[]): Set<string> {
   return new Set(collectScriptDecls(body).map((d) => d.name));
 }
 
@@ -159,6 +169,20 @@ const COMPOUND_BASE: Record<string, string> = {
   '+=': '+', '-=': '-', '*=': '*', '/=': '/', '%=': '%',
   '<<=': '<<', '>>=': '>>', '>>>=': '>>>', '&=': '&', '|=': '|', '^=': '^',
 };
+
+// Can this `case` label be a native C `case`? Only a literal (possibly signed or
+// bit-complemented) is a C constant expression. AS3 allows ANY expression as a case
+// label -- a static const whose value is materialized by a cinit call, or a plain
+// local variable -- and evaluates them left to right at runtime, so such a switch
+// must take the index-switch lowering instead (see Emitter.emitSwitchChained).
+function isSwitchLabelConst(e: Expr | null): boolean {
+  if (e === null) return true; // `default:` takes no test
+  switch (e.kind) {
+    case 'Num': case 'Str': case 'Bool': case 'Null': return true;
+    case 'Unary': return (e.op === '-' || e.op === '+' || e.op === '~') && isSwitchLabelConst(e.operand);
+    default: return false;
+  }
+}
 
 // A left-associative String `+` chain (`"a" + b + "c" + ...`) nests one
 // `as_str_concat(...)` per term, so N terms cost N levels of C bracket nesting.
@@ -200,7 +224,55 @@ function cStringLiteral(bytes: Buffer): string {
   return out + '"';
 }
 
+// The E4X context calls an ECMA-357 filter predicate may use WITHOUT a receiver:
+// inside `x.(pred)` the predicate's scope IS the candidate node, so `name()` /
+// `attribute("a")` / `child` read the node being tested. rewriteE4xPredicate points
+// them at the synthesized context local (see emitXmlGeneralFilter).
+const E4X_CTX_CALLS = new Set([
+  'name', 'localName', 'attribute', 'attributes', 'child', 'children', 'elements', 'text', 'parent',
+]);
+
+// C statements appended to a shell class's constructor (see emitShellClasses).
+// Needed only where leaving a slot NULL would make a DOCUMENTED call pattern
+// crash instead of reporting itself — NativeProcess's three pipes are read and
+// written directly by every launcher recipe, so they start as empty ByteArrays
+// (bytesAvailable is 0 and readUTFBytes hands back "", exactly what a process
+// that has produced no output yet looks like).
+const SHELL_CTOR_EXTRA = new Map<string, string[]>([
+  ['NativeProcess', [
+    'o->standardInput = ByteArray_new();',
+    'o->standardOutput = ByteArray_new();',
+    'o->standardError = ByteArray_new();',
+  ]],
+]);
+
 export class Emitter {
+  // AIR classes whose members are resolved BY NAME in the emitter's member/call
+  // special cases rather than through a ClassInfo: they are `final` with static
+  // members only (System/Capabilities/Math/JSON) or carry language-level statics
+  // (int/uint MIN_VALUE/MAX_VALUE). `Cls["x"]` must reach the same emission as
+  // `Cls.x`, so these names are recognized there too.
+  private static readonly STATIC_ONLY_CLASSES = new Set([
+    'System', 'Capabilities', 'Math', 'JSON', 'int', 'uint',
+  ]);
+  // The CORE language classes used as Class VALUES. None of these has a ClassInfo
+  // (they are C primitives or runtime structs, and `Array`/`String`/... resolve to
+  // their C type in type position), so `var c:Class = int` / `return String` /
+  // `case Array:` / `getDefinitionByName("int")` are outside every existing
+  // resolution path. Each gets a shared as_class OBJECT from emitClassRegistry,
+  // named with AIR's UNQUALIFIED name -- `getQualifiedClassName(int)` prints
+  // "int", `String(Array)` prints "[class Array]", and `getDefinitionByName(
+  // "Array")` finds it (measured on adl 51.4.1). The value is the boxed
+  // representation's vtable where the runtime has one; `int`, `uint` and `Array`
+  // have no as_object-shaped runtime type at all (an Array is a tag-6 as_array
+  // whose first field is its data pointer, so it must NOT be walked as a vtable),
+  // so theirs stays NULL: identity, name and switch dispatch all still work, and
+  // only an `is`/`as` test through a Class VARIABLE holding one cannot match. The
+  // static forms (`x is Array`, `x is int`) are compiled directly and stay exact.
+  private static readonly CORE_CLASS_VT: Record<string, string> = {
+    'Object': '&as_object_vt', 'String': '&as_string_vt', 'Number': '&as_number_vt',
+    'Boolean': '&as_boolean_vt', 'Function': '&as_function_vt', 'int': 'NULL', 'uint': 'NULL', 'Array': 'NULL',
+  };
   private out: string[] = [];
   private indent = 0;
   private scopes: Map<string, CType>[] = [];
@@ -212,6 +284,9 @@ export class Emitter {
   // Names already hoisted to the function top for the current function; their
   // in-body `var` sites emit a plain assignment instead of a re-declaration.
   private hoistedLocals: Set<string> = new Set();
+  // Static C variables holding shell-class singletons, so emitGCRoots can mark
+  // them (see emitShellClasses).
+  private shellSingletons: string[] = [];
   private currentClass: string | null = null;
   private currentMethod: string | null = null;
   private suppressBreak = 0;
@@ -249,6 +324,11 @@ export class Emitter {
   // be emitted only when some `continue` actually targets it.
   private continueTargets: { depth: number; label: string | null; used: boolean }[] = [];
   private tmpCounter = 0;
+  // The expression node `emitStmt` is currently emitting in DISCARD position (an
+  // ExprStmt's own expression) and the assignment node `emitAssign` is emitting;
+  // their identity match is what tells storeThenValue the value is thrown away.
+  private discardedExprNode: Expr | null = null;
+  private currentAssignNode: Expr | null = null;
   private currentReturnType: CType | null = null;
   // module-level (file-scope) variables: AS3 top-level `var`/`const` are hoisted
   // to C file-scope globals so free functions and main() both see them.
@@ -377,11 +457,30 @@ export class Emitter {
   // static-method-as-value state: `ClassName.method` referenced as a Function value
   // (e.g. `var f:Function = TweenLite.killTweensOf`) needs a non-capturing thunk.
   private staticMethodRefs = new Map<string, { cname: string; mname: string; m: MethodInfo }>();
+  // Package-level built-in functions referenced as a Function VALUE rather than
+  // called (`static var getTime:Function = getTimer`). Each one gets a `__call`
+  // thunk, emitted by emitFunctionValues; the name is also the C symbol prefix.
+  private builtinFnRefs = new Set<string>();
+  // Built-in free functions usable as a value: name -> arity. Kept tiny on
+  // purpose -- a value reference needs a hand-written thunk over the same runtime
+  // helper the CALL form uses (see emitGlobalCall).
+  // A `Map`, NOT a plain object literal: `RECORD[name]` also reaches the names
+  // inherited from Object.prototype, so a bare identifier used as a value whose
+  // name happened to be `toString` (or `constructor`, `valueOf`, ...) was treated
+  // as a package-level built-in function and emitted the JS source text of
+  // Object.prototype.toString as C code -- measured on the real app as
+  // `return as_v_num((double)(function toString() { [native code] }()));`.
+  private static readonly BUILTIN_FN_VALUES: Map<string, number> = new Map([['getTimer', 0]]);
+  // C implementation behind each BUILTIN_FN_VALUES entry (the thunk forwards to it).
+  private static readonly BUILTIN_FN_IMPL: Map<string, string> = new Map([['getTimer', 'as_getTimer']]);
   // Names looked up through a `Class`-typed receiver (`classValue.method`, see the
   // Member case of walkExpr). Every user class that has a static member with one of
   // these names gets a static-member table in its class object, so the lookup is
   // resolved at runtime -- the receiver's actual class is only known then.
   private dynClassMembers = new Set<string>();
+  // Classes whose static table must be emitted in FULL because a computed key was
+  // used on a Class-typed receiver (see walkExpr's Index case).
+  private dynClassFull = new Set<string>();
   private currentWalkClass: string | null = null;
   private currentWalkIsStatic = false;
   private currentWalkMethod: string | null = null;
@@ -448,6 +547,12 @@ export class Emitter {
   // epilogue. Keyed by the generated class's sanitized C name; empty when no
   // `[Embed]` was present, in which case nothing extra is emitted.
   private embedResources: Map<string, EmbedResourceSpec>;
+  // The AIR application descriptor's XML text, when this build came from
+  // `--air-app <xml>`: `NativeApplication.applicationDescriptor` hands exactly this
+  // document to the program (AIR guarantees the descriptor is readable there).
+  // Undefined for a plain-source build, which has no descriptor; the getter then
+  // returns a minimal empty <application/> element rather than inventing one.
+  private appDescriptorXml: string | undefined;
 
   constructor(
     program: Program,
@@ -455,7 +560,8 @@ export class Emitter {
     keepGlobal: readonly string[] = [],
     swcResources: readonly SwcResourceSpec[] = [],
     swcBake: SwcBake | undefined = undefined,
-    embedResources: readonly EmbedResourceSpec[] = []
+    embedResources: readonly EmbedResourceSpec[] = [],
+    appDescriptorXml: string | undefined = undefined
   ) {
     this.program = program;
     this.symbols = symbols;
@@ -476,6 +582,8 @@ export class Emitter {
     }
     this.collectFunctionValues(); // also gathers Vector.<T> specializations
     this.noteBuiltinVectorSpecs();
+    // Freeze the C type-name set before any identifier is handed out (cIdent).
+    this.reservedTypeNames();
     this.emitTypedefs();
     this.emitStructs();
     this.emitPrototypes();
@@ -494,6 +602,8 @@ export class Emitter {
     this.emitVtables();
     this.emitClassRegistry();
     this.emitAmfCodec();
+    this.emitShellClasses();
+    this.emitArrayBackedWire();
     this.emitStaticFields();
     this.emitStaticInits();
     this.emitDefinitions();
@@ -1014,6 +1124,13 @@ export class Emitter {
     switch (s.kind) {
       case 'VarDecl': this.hoistVar(s.name, s.type); break;
       case 'VarDecls': for (const d of s.decls) this.hoistVar(d.name, d.type); break;
+      // AS3 has NO block scope: a `const` declared inside a block binds for the
+      // whole enclosing function, exactly like `var` (measured against mxmlc 51.2.2:
+      // com/netease/protobuf/TextFormat.as declares `const enumTypeDescription`
+      // inside an if-branch and reads it in the sibling else-branch). Only the
+      // single-assignment rule differs, and that is checked where it is written.
+      case 'ConstDecl': this.hoistVar(s.name, s.type); break;
+      case 'ConstDecls': for (const d of s.decls) this.hoistVar(d.name, d.type); break;
       case 'Block': this.collectHoistedVars(s.body); break;
       case 'If': this.collectHoistedVarsStmt(s.then); if (s.else) this.collectHoistedVarsStmt(s.else); break;
       case 'While': this.collectHoistedVarsStmt(s.body); break;
@@ -1052,12 +1169,38 @@ export class Emitter {
   // Sanitize a method/field/local/param name to a collision-free C identifier.
   // Cached so the same AS3 name always maps to the same C name (declaration and
   // every reference agree); `usedCIdentifiers` keeps distinct names distinct (P2).
+  // The result additionally avoids every C TYPE name (reservedTypeNames).
   private cIdent(name: string): string {
     const cached = this.cNameCache.get(name);
     if (cached !== undefined) return cached;
-    const c = sanitizeCIdent(name, this.usedCIdentifiers);
+    let c = sanitizeCIdent(name, this.usedCIdentifiers);
+    const types = this.reservedTypeNames();
+    while (types.has(c)) c = '_' + c;
+    this.usedCIdentifiers.add(c);
     this.cNameCache.set(name, c);
     return c;
+  }
+
+  // Every C TYPE name the generated translation unit declares a typedef for.
+  // C keeps ONE namespace for typedefs and variables, so an identifier that reuses
+  // a type name HIDES it: com/vsdevelop/utils/StringCore.as:579 declares
+  // `var PNGEncoderOptions:Class = ...`, whose local slot then shadowed the
+  // `PNGEncoderOptions` typedef and made `PNGEncoderOptions* _once5436 = ...` parse
+  // as a multiplication (clang: "use of undeclared identifier '_once5436'").
+  // `cIdent` therefore never hands out one of these names.
+  private typeCNames: Set<string> | null = null;
+  private reservedTypeNames(): Set<string> {
+    if (this.typeCNames !== null) return this.typeCNames;
+    // The runtime's own struct typedefs (the classMap covers every class, built-in
+    // included, because a built-in has no package and so keeps its bare name).
+    const s = new Set<string>([
+      'as_value', 'as_array', 'as_object', 'as_class', 'as_prop', 'as_vtable',
+      'as_xml_node', 'as_xml_list', 'as_function', 'as_regexp',
+    ]);
+    for (const k of this.symbols.classes.keys()) s.add(k);
+    for (const k of this.symbols.interfaces.keys()) s.add(k);
+    this.typeCNames = s;
+    return s;
   }
 
   private tmpName(prefix: string): string {
@@ -1097,6 +1240,33 @@ export class Emitter {
     if (t.kind === 'object') return t.className;
     if (t.kind === 'interface') return t.name;
     return name;
+  }
+
+  // Is this class one of the SWC's exported SYMBOL classes (an exported sprite or
+  // button)? Their own ActionScript was compiled by Flash Professional into the
+  // library's DoABC, which docs/zh-cn/swc.md §3.3 declares out of scope for this
+  // compiler: the baker reproduces the character's display tree, timeline and base
+  // class, but the members the symbol's own class declares are invisible to it.
+  // A member miss on such a class is therefore a member we cannot SEE, not a
+  // source error -- it is reported loudly and yields the type's zero value instead
+  // of failing the build (see the call site in emitCall).
+  private swcSymbolClass(cname: string | null | undefined): boolean {
+    return cname !== null && cname !== undefined && this.swcCharClass.has(cname);
+  }
+
+  // Whether a name is bound as a local/parameter/closure capture, or as a field
+  // or static field of the class being emitted. Used to decide if the root of a
+  // dot chain is a VARIABLE (a member chain) rather than the first package
+  // segment of a fully-qualified class name.
+  private varInScope(name: string): boolean {
+    if (this.currentClosureCaptures?.has(name) || this.enclosingCaptured.has(name)) return true;
+    for (let i = this.scopes.length - 1; i >= 0; i--) if (this.scopes[i].has(name)) return true;
+    if (this.currentClass) {
+      if (this.symbols.fieldSlot(this.currentClass, name)) return true;
+      const cinfo = this.symbols.getClass(this.currentClass);
+      if (cinfo?.staticFields.has(name)) return true;
+    }
+    return false;
   }
 
   // Flatten a dot-separated member chain (`a.b.c.d`) into [a, b, c, d] when it is
@@ -1322,6 +1492,11 @@ export class Emitter {
       if (this.symbols.isSubclassOf(name, 'NativeWindow')) {
         this.line('int _win;');
       }
+      // `class X extends Array` (arrayBacked): AIR's Array has no C struct to
+      // inherit, so the element storage lives in this hidden backing array, and
+      // every inherited Array member operates on it. It is a GC object, so the
+      // props reflection table marks it (see emitPropTables).
+      if (info.arrayBacked) this.line('as_array* _arr;');
       // Dynamic classes (AS3 `dynamic class`) carry a runtime slot table for
       // arbitrary undeclared string-keyed properties. Its byte offset is emitted
       // into the vtable so as_dyn_get/set can reach it.
@@ -1509,6 +1684,24 @@ export class Emitter {
     this.line('return NULL;');
     this.indent--;
     this.line('}');
+    // The `Class(x)` conversion. AIR's AS3 conversion to the Class type raises
+    // TypeError #1034 when the value is not a class object, and the accepted set is
+    // exactly what `x is Class` accepts; as_v_is_class applies that same
+    // registry-identity test, so the conversion and the operator can never disagree.
+    // Needed by `var c:Class = Class(getDefinitionByName(n))` (measured on the
+    // talkmed-meeting AIR app, cn/edoctor/model/BaseModel.as:69).
+    this.line('static void* as_v_req_class(as_value v) {');
+    this.indent++;
+    this.line('if (v.tag == 4 || v.tag == 6) {');
+    this.indent++;
+    this.line('void* p = as_v_obj_val(v);');
+    this.line('if (p != NULL && as_v_is_class(v)) return p;');
+    this.indent--;
+    this.line('}');
+    this.line('as_throw_1034(v, "Class");');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
     this.line('static void* as_v_req_array(as_value v, const char* fqn) {');
     this.indent++;
     this.line('if (v.tag == 0 || v.tag == 5) return NULL;');
@@ -1542,6 +1735,24 @@ export class Emitter {
     this.line('if (v.tag == 0) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return as_v_null(); }');
     this.line('if (v.tag == 5) { as_throw(TypeError_new((char*)"Error #1010: A term is undefined and has no properties.", 1010)); return as_v_null(); }');
     this.line('return v;');
+    this.indent--;
+    this.line('}');
+    // E4X filter `expr.(predicate)` on a NON-XML/XMLList receiver. mxmlc accepts
+    // the syntax for any receiver and AIR only fails at RUN time with
+    // `TypeError: Error #1123: Filter operator not supported on type <FQN>`
+    // (measured on adl 51.3.2, temp/talkmed/e4xprobe: both an Object and a user
+    // class throw it; a public class reports its `pkg::Cls` name). Generated C
+    // routes the general predicate form here when the static receiver type is not
+    // XML/XMLList, so the program behaves exactly as AIR does (the classic
+    // hurlant BigInteger `while (y.t < ys) y.(y.t++, 0)` is the motivating site).
+    this.line('static as_value as_e4x_filter_type_error(void* obj) {');
+    this.indent++;
+    this.line('void* vt = obj != NULL ? ((as_object_header*)obj)->vtable : NULL;');
+    this.line('const char* fqn = vt != NULL ? ((as_vtable_header*)vt)->fqn : NULL;');
+    this.line('if (fqn == NULL || fqn[0] == 0) fqn = "Object";');
+    this.line('char* parts[3]; parts[0] = (char*)"Error #1123: Filter operator not supported on type "; parts[1] = (char*)fqn; parts[2] = (char*)".";');
+    this.line('as_throw(TypeError_new(as_str_concat_n(3, parts), 1123));');
+    this.line('return as_v_null();');
     this.indent--;
     this.line('}');
     // `x is c` / `x as c` with a runtime Class VALUE as the right operand (a
@@ -1578,12 +1789,37 @@ export class Emitter {
     this.indent++;
     this.line('if (v.ptr == NULL) return false;');
     this.line('if (as_is_object_cls(cl)) return true;');
+    // tag 6 is an Array/Vector/Dictionary: none of them carries an as_object
+    // vtable (their first word is a data pointer), so walking one as an object is
+    // undefined behaviour -- as_is would follow that data pointer as a vtable.
+    // They match by NAME instead. AIR: an Array IS the Array class, a Vector and
+    // a Dictionary are not (measured on adl 51.4.1).
+    this.line('if (v.tag == 6) return cl->fqn != NULL && strcmp(cl->fqn, "Array") == 0 && as_heap_kind(v.ptr) == GCT_ARRAY;');
+    // The same hazard in tag 4: an Array/Vector/Dictionary body starts with its
+    // data pointer or its mark callback, never a vtable (as_heap_kind's contract),
+    // so it is refused rather than walked. Measured: `new <int>[1] is <a Class
+    // value holding Array>` segfaulted before this guard.
+    this.line('int hk = as_heap_kind(v.ptr);');
+    this.line('if (hk == GCT_CUSTOM || hk == GCT_ARRAY || hk == GCT_DICT) return false;');
     this.line('return as_is(v.ptr, cl->vtable);');
     this.indent--;
     this.line('}');
     this.line('if (v.tag == 0 || v.tag == 5) return false;  // null / undefined');
-    // Any other tag (number/bool/string/function/int64) is a primitive whose
-    // autoboxed wrapper's only real-class supertype is Object.
+    // A boxed primitive is an instance of its OWN wrapper class, and only of that
+    // one: 5 is <Number class> and 5 is <int class> are both true (an int is
+    // carried as a Number), "x" is <String class> is true while 5 is <String
+    // class> is false, true is <Boolean class> is true (measured on adl 51.4.1).
+    this.line('const char* pf = cl->fqn;');
+    this.line('if (pf != NULL) {');
+    this.indent++;
+    this.line('if (v.tag == 1 && (strcmp(pf, "Number") == 0 || strcmp(pf, "int") == 0 || strcmp(pf, "uint") == 0)) return true;');
+    this.line('if (v.tag == 2 && strcmp(pf, "Boolean") == 0) return true;');
+    this.line('if (v.tag == 3 && strcmp(pf, "String") == 0) return true;');
+    this.line('if (v.tag == 7 && strcmp(pf, "Function") == 0) return true;');
+    this.indent--;
+    this.line('}');
+    // Any other tag (int64/uint64) is a primitive whose autoboxed wrapper's only
+    // real-class supertype is Object.
     this.line('return as_is_object_cls(cl);');
     this.indent--;
     this.line('}');
@@ -1735,7 +1971,7 @@ export class Emitter {
       // default) but whose constructor still takes parameters need a genuine
       // no-argument entry point for the reflection factory.
       const cparams = info.constructor.params;
-      if (cparams.length > 0 && cparams.every((p) => p.defaultValue !== null || p.isRest) && this.userClasses.has(name)) {
+      if (cparams.length > 0 && cparams.every((p) => p.defaultValue !== null || p.isRest) && this.hasGeneratedFactory(name)) {
         this.line(`${name}* ${name}_new_default(void);`);
       }
     }
@@ -1816,6 +2052,17 @@ export class Emitter {
       this.line(`as_vector_${key}* as_vector_${key}_reverse(as_vector_${key}* v);`);
     }
     if (this.symbols.classes.size > 0 || this.symbols.funcs.size > 0 || this.vectorSpecs.size > 0) this.line('');
+    // Helpers the GENERATED program calls but that are defined further down in the
+    // same file (they are emitted with the class bodies, not the preamble). Without
+    // a declaration the call is an implicit `int f()` and the real definition then
+    // conflicts: measured on the real app as "call to undeclared function
+    // 'as_any_call'" (21 sites) and "conflicting types for 'as_app_dir' /
+    // 'URLRequest__navigate'". Declared here, after the class typedefs (URLRequest)
+    // and the as_value definition (preamble), so every call site sees the prototype.
+    this.line('static char* as_app_dir(void);');
+    this.line('static void URLRequest__navigate(URLRequest* request, char* window);');
+    this.line('static as_value as_any_call(as_value v, const char* name, as_value* args, int argc);');
+    this.line('');
   }
 
   private paramDecls(params: Param[], importAlias?: Map<string, string> | null): string {
@@ -1864,6 +2111,17 @@ export class Emitter {
     this.line('static as_value ByteArray_get_index(void* _this, int i);');
     this.line('static as_value ByteArray_get_index_key(void* _this, char* k);');
     this.line('static void ByteArray_set_index(void* _this, int i, double v);');
+    // BitmapData.copyPixelsToByteArray writes through as_ba_ensure_len (the
+    // absolute-length grower), whose definition sits with the rest of the ByteArray
+    // helpers -- after the BitmapData bodies that call it.
+    this.line('static void as_ba_ensure_len(ByteArray* o, int len);');
+    // The window-wrapper helpers (defined with the window table, AFTER the
+    // NativeApplication bodies that call as_win_active).
+    this.line('static NativeWindow* as_win_wrapper(int id);');
+    this.line('static NativeWindow* as_win_active(void);');
+    // The drag follower (defined with the drag state, AFTER Sprite/startDrag's body
+    // which calls it to place the object at the press point).
+    this.line('static void as_drag_follow(double x, double y);');
     // Class-value dispatch (see emitClassRegistry): the class objects and the
     // static-member helpers are referenced by anonymous-function bodies, which are
     // emitted BEFORE the registry. The class objects get tentative definitions
@@ -1874,17 +2132,36 @@ export class Emitter {
         if (info.fqn === undefined && info.reflectFqn === undefined) continue;
         this.line(`static as_class ${name}_cls;`);
       }
-      this.line('static as_value as_class_member_value(as_class* c, const char* name);');
-      this.line('static void as_class_set_static(as_class* c, const char* name, as_value v);');
+      this.line('static as_value as_class_member_value(as_class* c, const char* name);');      this.line('static void as_class_set_static(as_class* c, const char* name, as_value v);');
+      this.line('static as_value as_class_static_read(const as_class_static* e);');
+      this.line('static void as_class_static_write(const as_class_static* e, as_value v);');
       this.line('static as_value as_class_call_static(as_class* c, const char* name, as_value* args, int argc);');
+      // getDefinitionByName's implementation needs the registry, so it is defined
+      // AFTER the anonymous-function bodies that can call it.
+      this.line('static as_value as_get_definition_by_name(const char* name);');
     }
+    // The CORE class objects (Object/Array/String/Number/Boolean/int/uint) live in
+    // no ClassInfo, so the loop above never declares them, yet an anonymous
+    // function emitted before the registry can name one (`trace(int)`, a closure
+    // returning `String`). Tentative definitions, completed by the initialized
+    // one in emitClassRegistry.
+    for (const n of Object.keys(Emitter.CORE_CLASS_VT)) this.line(`static as_class as_corecls_${n};`);
     if (this.symbols.classes.size > 0) this.line('');
   }
 
   // Function-pointer field declaration for a vtable slot. The receiver is a
   // `void*` so an overriding method keeps the same signature as the overridden one.
   private methodPtrField(m: MethodInfo, name: string, importAlias?: Map<string, string> | null): string {
-    const alias = importAlias ?? this.symbols.getClass(m.owner)?.importAlias;
+    // The slot's parameter types belong to the file that DECLARES the method
+    // (declAliasOf), not to the class whose vtable this is: an interface vtable
+    // merges methods inherited from a super-interface, and resolving their
+    // `Event`/`Rectangle` with the sub-interface's own file alias picked the
+    // wrong class (measured: com.vsdevelop.interfacer.ILoader's inherited
+    // dispatchEvent slot took starling.events.Event while its initializer is
+    // EventDispatcher_dispatchEvent -- 4 "incompatible function pointer types").
+    // The declaring owner therefore WINS; `importAlias` (the enclosing
+    // interface's own file) is only the fallback for an owner with no alias.
+    const alias = this.declAliasOf(m.owner) ?? importAlias;
     const params = m.params.map((p) => this.cTypeName(resolveType(p.type, alias))).join(', ');
     const args = params ? `void*, ${params}` : 'void*';
     return `${this.cTypeName(m.returnType)} (*${this.cIdent(name)})(${args})`;
@@ -1900,7 +2177,7 @@ export class Emitter {
   // Function-pointer field for a vtable SETTER slot. Setter signature is receiver
   // plus one value parameter (`void (*set_name)(void* _this, ParamType value)`).
   private setterPtrField(s: MethodInfo, name: string, importAlias?: Map<string, string> | null): string {
-    const alias = importAlias ?? this.symbols.getClass(s.owner)?.importAlias;
+    const alias = this.declAliasOf(s.owner) ?? importAlias;
     const params = s.params.map((p) => this.cTypeName(resolveType(p.type, alias))).join(', ');
     const args = params ? `void* _this, ${params}` : 'void* _this';
     return `void (*set_${this.cIdent(name)})(${args})`;
@@ -1969,7 +2246,14 @@ export class Emitter {
     const required = params.filter((p) => p.defaultValue === null && !p.isRest).length;
     if (required !== 0) return 'NULL';
     if (params.length === 0) return `(void*(*)(void))${name}_new`;
-    return this.userClasses.has(name) ? `(void*(*)(void))${name}_new_default` : 'NULL';
+    return this.hasGeneratedFactory(name) ? `(void*(*)(void))${name}_new_default` : 'NULL';
+  }
+
+  // A class whose no-arg factory and argument-carrying ctor thunk this emitter
+  // generates itself: a compiled source class, or a shell class (emitShellClasses
+  // emits both `X_new_default` and the registry-visible `X_ctor`/`X_new` bodies).
+  private hasGeneratedFactory(name: string): boolean {
+    return this.userClasses.has(name) || this.symbols.getClass(name)?.shell === true;
   }
 
   // The argument-carrying constructor thunk registered for `name`, or 'NULL'.
@@ -1981,7 +2265,7 @@ export class Emitter {
     const info = this.symbols.classes.get(name);
     const params = info ? info.constructor.params : [];
     if (params.length === 0) return 'NULL';
-    return this.userClasses.has(name) ? `${name}_ctorfn` : 'NULL';
+    return this.hasGeneratedFactory(name) ? `${name}_ctorfn` : 'NULL';
   }
 
   private emitClassRegistry(): void {
@@ -2042,6 +2326,35 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('static as_value as_dyn_new(as_class* c) { return as_dyn_new_args(c, 0, NULL); }');
+    // `new (ClassValue)(args)` on a CORE class. AIR's core classes are all
+    // conversions of the first argument -- new int(5) is 5, new String() is "",
+    // new Array() is [], new Number() is 0, new Boolean() is false and new
+    // Object() is a plain object, while new Object(5) still yields an OBJECT
+    // (unlike the Object(5) CONVERSION, which yields 5) -- measured on adl
+    // 51.4.1. as_dyn_new_args passes the class object as `env`, which is how the
+    // fqn picks the conversion.
+    this.line('static as_value as_core_cls_ctor(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('as_class* c = (as_class*)env;');
+    this.line('const char* n = (c != NULL && c->fqn != NULL) ? c->fqn : "";');
+    this.line('as_value a = (args != NULL && argc > 0) ? args[0] : as_v_null();');
+    this.line('if (strcmp(n, "int") == 0) return as_v_num((double)(int)as_v_to_number(a));');
+    this.line('if (strcmp(n, "uint") == 0) return as_v_num((double)(unsigned int)as_v_to_number(a));');
+    this.line('if (strcmp(n, "Number") == 0) return as_v_num(as_v_to_number(a));');
+    this.line('if (strcmp(n, "Boolean") == 0) return as_v_bool(as_v_truthy(a));');
+    this.line('if (strcmp(n, "String") == 0) return as_v_str(argc > 0 ? as_v_str_val(a) : (char*)"");');
+    this.line('if (strcmp(n, "Object") == 0) return as_v_obj((void*)as_object_new());');
+    this.line('if (strcmp(n, "Array") == 0) {');
+    this.indent++;
+    this.line('if (argc == 1 && a.tag == 1) return as_v_arr((void*)as_array_new_sized((int)a.num));');
+    this.line('as_array* arr = as_array_new();');
+    this.line('for (int i = 0; i < argc; i++) as_array_set(arr, i, args[i]);');
+    this.line('return as_v_arr((void*)arr);');
+    this.indent--;
+    this.line('}');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
     this.line('');
     // Static-member dispatch through a Class VALUE: `classValue.method(...)` and
     // `classValue.member` (away3d's `_parsers[i].supportsType(ext)`). AIR resolves
@@ -2066,18 +2379,63 @@ export class Emitter {
     this.indent++;
     this.line('int i = as_class_static_find(c, name);');
     this.line('if (i < 0) return as_v_undefined();  /* AIR: unknown name on a Class value reads undefined */');
-    this.line('if (c->statics[i].kind != 1) {');
-    this.indent++;
-    this.line('as_throw_unsupported("Reading a static field through a Class value is not supported by this subset");');
+    this.line('const as_class_static* e = &c->statics[i];');
+    this.line('if (e->kind == 1) return as_v_fn((void*)as_fn_make(e->fn, NULL, e->arity));');
+    this.line('if (e->addr != NULL) return as_class_static_read(e);');
+    this.line('as_throw_unsupported("Reading a static property through a Class value is not supported by this subset");');
     this.line('return as_v_null();');
     this.indent--;
     this.line('}');
-    this.line('return as_v_fn((void*)as_fn_make(c->statics[i].fn, NULL, c->statics[i].arity));');
+    // Reading/writing a DECLARED static field by name at run time (`Cls[key]` with a
+    // computed key). AIR resolves the name against the class's static traits, so a
+    // declared field is readable and writable; the slot kind decides the C store
+    // (the class's own emitted C slot keeps its declared type -- the same slot the
+    // static-root collector already marks, so a GC string written here stays live).
+    this.line('static as_value as_class_static_read(const as_class_static* e) {');
+    this.indent++;
+    this.line('if (e->cinit != NULL) e->cinit();');
+    this.line('void* addr = e->addr;');
+    this.line('switch (e->slot) {');
+    this.indent++;
+    this.line('case 1: return as_v_bool(*(bool*)addr);');
+    this.line('case 2: return as_v_num((double)(*(int*)addr));');
+    this.line('case 3: return as_v_num((double)(*(unsigned int*)addr));');
+    this.line('case 4: return as_v_num(*(double*)addr);');
+    this.line('case 5: return as_v_str(*(char**)addr);');
+    this.line('case 6: return as_v_obj(*(void**)addr);');
+    this.line('case 7: return as_v_i64(*(int64_t*)addr);');
+    this.line('case 8: return as_v_u64(*(uint64_t*)addr);');
+    this.line('default: break;');
+    this.indent--;
+    this.line('}');
+    this.line('as_throw_unsupported("Reading a static field of this type through a Class value is not supported by this subset");');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_class_static_write(const as_class_static* e, as_value v) {');
+    this.indent++;
+    this.line('if (e->cinit != NULL) e->cinit();');
+    this.line('void* addr = e->addr;');
+    this.line('switch (e->slot) {');
+    this.indent++;
+    this.line('case 1: *(bool*)addr = as_v_truthy(v); return;');
+    this.line('case 2: *(int*)addr = as_v_int_cast(v); return;');
+    this.line('case 3: *(unsigned int*)addr = as_v_uint_cast(v); return;');
+    this.line('case 4: *(double*)addr = as_v_to_number(v); return;');
+    this.line('case 5: *(char**)addr = as_coerce_str(v); return;');
+    this.line('case 6: *(void**)addr = as_value_to_obj(v); return;');
+    this.line('case 7: *(int64_t*)addr = as_v_to_i64(v); return;');
+    this.line('case 8: *(uint64_t*)addr = as_v_to_u64(v); return;');
+    this.line('default: break;');
+    this.indent--;
+    this.line('}');
+    this.line('as_throw_unsupported("Writing a static field of this type through a Class value is not supported by this subset");');
     this.indent--;
     this.line('}');
     this.line('static void as_class_set_static(as_class* c, const char* name, as_value v) {');
     this.indent++;
-    this.line('(void)c; (void)v;');
+    this.line('int i = as_class_static_find(c, name);');
+    this.line('if (i >= 0 && c->statics[i].addr != NULL && c->statics[i].kind == 2) { as_class_static_write(&c->statics[i], v); return; }');
     this.line('const char* parts[4];');
     this.line('parts[0] = "Writing ";');
     this.line('parts[1] = name;');
@@ -2107,21 +2465,37 @@ export class Emitter {
     // no dynamically-looked-up statics keep `statics = NULL`. The static-method
     // thunks themselves come from staticMethodRefs (also filled by that walk).
     const staticTables = new Map<string, string>();
-    if (this.dynClassMembers.size > 0) {
+    if (this.dynClassMembers.size > 0 || this.dynClassFull.size > 0) {
       for (const [name, info] of this.symbols.classes) {
         const rows: string[] = [];
-        for (const mname of this.dynClassMembers) {
+        const names = this.dynClassFull.has(name)
+          ? new Set<string>([...info.staticMethods.keys(), ...info.staticFields.keys(), ...(info.staticGetters?.keys() ?? [])])
+          : this.dynClassMembers;
+        for (const mname of names) {
           const sm = info.staticMethods.get(mname);
           if (sm) {
             // kind 1 = static method; the thunk unboxes the boxed args (the same
             // name the static-method-as-value path emits).
-            rows.push(`{ "${this.escapeCString(mname)}", 1, ${sm.owner}_${this.cIdent(mname)}__call, ${this.requiredArity(sm.params)} }`);
+            rows.push(`{ "${this.escapeCString(mname)}", 1, ${sm.owner}_${mname}__call, ${this.requiredArity(sm.params)} }`);
             continue;
           }
-          if (info.staticFields.has(mname) || (info.staticGetters?.has(mname) ?? false)) {
-            // kind 2 = static field/const, by NAME ONLY: the Class-value read path
-            // fails loudly on it (see as_class_member_value).
-            rows.push(`{ "${this.escapeCString(mname)}", 2, NULL, 0 }`);
+          const sf = info.staticFields.get(mname);
+          if (sf) {
+            // kind 2 = static field/const: the row carries the C slot's address and
+            // kind, so `Cls[key]` reads AND writes the DECLARED static (AIR resolves
+            // the name against the static traits). A slot kind we cannot store
+            // generically (an interface struct, say) stays addr-less and fails
+            // loudly on access instead of writing a wrong-sized value.
+            const slot = this.staticSlotKind(sf.type);
+            const addr = slot > 0 ? `(void*)&${sf.owner}_${mname}` : 'NULL';
+            const cinit = this.cinitClasses.has(sf.owner) ? `${sf.owner}_cinit` : 'NULL';
+            rows.push(`{ "${this.escapeCString(mname)}", 2, NULL, 0, ${addr}, ${slot}, ${cinit} }`);
+            continue;
+          }
+          if (info.staticGetters?.has(mname) ?? false) {
+            // A COMPUTED static (getter/setter pair): there is no slot to address, so
+            // the row is name-only and the Class-value path reports itself.
+            rows.push(`{ "${this.escapeCString(mname)}", 2, NULL, 0, NULL, 0, NULL }`);
           }
         }
         if (rows.length === 0) continue;
@@ -2129,7 +2503,7 @@ export class Emitter {
         this.line(`static const as_class_static ${name}_statics[] = {`);
         this.indent++;
         for (const r of rows) this.line(r + ',');
-        this.line('{ NULL, 0, NULL, 0 }');
+        this.line('{ NULL, 0, NULL, 0, NULL, 0, NULL }');
         this.indent--;
         this.line('};');
       }
@@ -2172,7 +2546,28 @@ export class Emitter {
     for (const [name, info] of this.symbols.classes) {
       if (info.fqn !== undefined || info.reflectFqn === undefined) continue;
       entries.push(`{ "${this.escapeCString(info.reflectFqn)}", &${name}_cls }`);
-      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, NULL, NULL, "${this.escapeCString(info.reflectFqn)}", 0, NULL };`);
+      // The Object class alone gets a uniform no-arg constructor (a plain object,
+      // which is exactly what `new Object()` and `new Object(5)` answer in AIR --
+      // unlike the Object(x) CONVERSION, which yields x). Every other built-in has
+      // a bespoke C constructor with no uniform entry point, so dynamic
+      // instantiation of it stays a loud #1063.
+      const ctorFn = name === 'Object' ? 'as_core_cls_ctor' : 'NULL';
+      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, NULL, ${ctorFn}, "${this.escapeCString(info.reflectFqn)}", 0, NULL };`);
+    }
+    // The core language classes (Object/String/Number/Boolean/int/uint/Array) have
+    // no ClassInfo, so the two loops above never see them; they still need a class
+    // OBJECT because AS3 code uses them as Class values and as
+    // getDefinitionByName keys (protobuf's `return int` / `case String:`) -- see
+    // CORE_CLASS_VT. Identity is preserved because every reference (a bare name, a
+    // registry lookup, a switch case label) resolves to this ONE object.
+    for (const n of Object.keys(Emitter.CORE_CLASS_VT)) {
+      // Skip a name that is already a modeled built-in class: `Object` has its own
+      // class OBJECT (`Object_cls`, with the real Object vtable) and a registry
+      // entry, so a second one would make two Class values that are not identical.
+      const info = this.symbols.classes.get(n);
+      if (info !== undefined && (info.fqn !== undefined || info.reflectFqn !== undefined)) continue;
+      entries.push(`{ "${n}", &as_corecls_${n} }`);
+      clsDecls.push(`static as_class as_corecls_${n} = { ${Emitter.CORE_CLASS_VT[n]}, NULL, as_core_cls_ctor, "${n}", 0, NULL };`);
     }
     // SWC symbols: an exported character's AS3 name is its SymbolClass linkage
     // name, which may hold characters our lexer cannot put in an identifier (CJK)
@@ -2258,9 +2653,23 @@ export class Emitter {
     this.indent--;
     this.line('}');
     // Object.constructor: the Class reference of an object instance. Reads the
-    // vtable's fqn and matches it against as_class_registry.
+    // vtable's fqn and matches it against as_class_registry. A PRIMITIVE answers its
+    // autoboxed wrapper class instead -- AIR: Object("a").constructor is
+    // [class String], Object(5).constructor is [class Number] (an int is carried as
+    // a Number, so `Object(5).constructor == int` is FALSE while `== Number` is
+    // true; measured on adl 51.4.1).
     this.line('static as_value as_v_class_of(as_value v) {');
     this.indent++;
+    this.line('switch (v.tag) {');
+    this.indent++;
+    this.line('case 1: return as_v_class_by_name("Number");');
+    this.line('case 2: return as_v_class_by_name("Boolean");');
+    this.line('case 3: return as_v_class_by_name("String");');
+    this.line('case 6: return as_v_class_by_name("Array");');
+    this.line('case 7: return as_v_class_by_name("Function");');
+    this.line('default: break;');
+    this.indent--;
+    this.line('}');
     this.line('if (v.tag != 4 || v.ptr == NULL) return as_v_null();');
     this.line('void* vt = ((as_object_header*)v.ptr)->vtable;');
     this.line('if (vt == NULL) return as_v_null();');
@@ -2288,6 +2697,41 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('return false;');
+    this.indent--;
+    this.line('}');
+    // The name of a Class VALUE: the class's OWN fqn, or NULL when `p` is not a
+    // class object at all (a heap pointer never is: every class object is a static
+    // as_class). Not its instance vtable's fqn -- the core classes (int/uint/Array)
+    // have no boxed instance type to read a vtable from, and AIR still names them:
+    // getQualifiedClassName(int) is "int" and String(int) is "[class int]"
+    // (measured on adl 51.4.1). The registry entry's own fqn is used when a class
+    // object has none (an SWC linkage alias entry).
+    this.line('static const char* as_class_fqn_of_ptr(void* p) {');
+    this.indent++;
+    this.line('if (p == NULL || gc_in_heap(p)) return NULL;');
+    this.line('for (int i = 0; as_class_registry[i].fqn != NULL; i++) {');
+    this.indent++;
+    this.line('if ((void*)as_class_registry[i].cls != p) continue;');
+    this.line('as_class* c = (as_class*)p;');
+    this.line('return (c->fqn != NULL) ? c->fqn : as_class_registry[i].fqn;');
+    this.indent--;
+    this.line('}');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    // Registry lookup by name, for helpers that must name a class without a source
+    // reference to it (as_v_class_of answers a boxed primitive's autoboxed class).
+    // The CORE class entries carry AIR's UNQUALIFIED names, which is exactly what
+    // those lookups use.
+    this.line('static as_value as_v_class_by_name(const char* name) {');
+    this.indent++;
+    this.line('if (name == NULL) return as_v_null();');
+    this.line('for (int i = 0; as_class_registry[i].fqn != NULL; i++) {');
+    this.indent++;
+    this.line('if (strcmp(name, as_class_registry[i].fqn) == 0) return as_v_obj((void*)as_class_registry[i].cls);');
+    this.indent--;
+    this.line('}');
+    this.line('return as_v_null();');
     this.indent--;
     this.line('}');
     this.line('');
@@ -2513,6 +2957,10 @@ export class Emitter {
     // them). Without this the vtable's props slot is NULL and a collection can free
     // a Rectangle the Screen is still handing out.
     if (name === 'Screen') return true;
+    // `class X extends Array` (arrayBacked) carries its element storage in a
+    // C-runtime-only `_arr` slot that the GC must trace even when the class
+    // declares no AS3-visible field of its own (Set extends Sequence).
+    if (info.arrayBacked) return true;
     for (const [fname, f] of info.fields) if (f.owner === name) return true;
     return false;
   }
@@ -2582,6 +3030,209 @@ export class Emitter {
   // class's OWN instance fields (inherited fields are found by walking the vtable
   // super chain, where each class contributes its own table). Offsets are byte
   // offsets within the flattened struct, computed with offsetof.
+  // C statements appended to a shell class's constructor — for the handful of
+  // slots where a NULL would make a DOCUMENTED call pattern crash instead of
+  // reporting itself (NativeProcess's three pipes are read/written directly).
+  private emitShellClasses(): void {
+    let any = false;
+    for (const [name, info] of this.symbols.classes) {
+      if (info.shell !== true) continue;
+      any = true;
+      const label = (info.fqn ?? name).split('::').join('.');
+      const params = this.paramDecls(info.constructor.params, info.importAlias);
+      const paramNames = info.constructor.params.map((p) => this.cIdent(p.name));
+      this.line(`// ---- shell class ${name} (${label}): API shape only, no backend ----`);
+      // `_ctor` runs the superclass constructor with whatever our own parameter
+      // list can supply for it (matched by AIR parameter name), else the super's
+      // declared default — so `NativeDragEvent` really does construct its `Event`
+      // half with the type/bubbles/cancelable the caller passed.
+      const sup = info.superClass ? this.symbols.getClass(info.superClass) : undefined;
+      const supArgs = (sup?.constructor.params ?? []).map((sp) => {
+        const mine = info.constructor.params.find((p) => p.name === sp.name);
+        return mine !== undefined ? this.cIdent(mine.name) : this.shellLiteral(sp.defaultValue);
+      });
+      this.line(`void ${name}_ctor(${name}* o${params ? ', ' + params : ''}) {`);
+      this.indent++;
+      if (sup) this.line(`${info.superClass}_ctor((${info.superClass}*)o${supArgs.length ? ', ' + supArgs.join(', ') : ''});`);
+      for (const [fname, f] of info.fields) {
+        if (f.owner !== name) continue;
+        const slot = this.cIdent(fname);
+        const p = info.constructor.params.find((q) => q.name === (f.name ?? fname));
+        if (p !== undefined) {
+          this.line(`o->${slot} = ${this.cIdent(p.name)};`);
+          const barrier = this.shellBarrier(`o->${slot}`, f.type);
+          if (barrier) this.line(barrier);
+        } else if (f.type.kind === 'array') {
+          // An Array/Vector slot defaults to EMPTY rather than NULL: AIR's
+          // equivalent member is always a live collection, and a NULL would turn
+          // a documented `for (x in y)` into a crash.
+          this.line(`o->${slot} = as_array_new();`);
+        } else if (f.type.kind === 'vector') {
+          this.line(`o->${slot} = as_vector_${this.vectorCName(f.type.elem)}_new();`);
+        }
+      }
+      for (const c of SHELL_CTOR_EXTRA.get(name) ?? []) this.line(c);
+      this.indent--;
+      this.line('}');
+      this.line(`${name}* ${name}_new(${params || 'void'}) {`);
+      this.indent++;
+      this.line(`${name}* o = (${name}*)gc_alloc(GCT_CLASS, sizeof(${name}));`);
+      this.line(`o->vtable = &${name}_vt;`);
+      this.line(`${name}_ctor(o${paramNames.length ? ', ' + paramNames.join(', ') : ''});`);
+      this.line('return o;');
+      this.indent--;
+      this.line('}');
+      if (info.constructor.params.length > 0 && info.constructor.params.every((p) => p.defaultValue !== null || p.isRest)) {
+        const defaults = info.constructor.params
+          .map((p) => (p.isRest ? 'as_array_new()' : this.convert(this.emitExpr(p.defaultValue!), this.rt(p.type))))
+          .join(', ');
+        this.line(`${name}* ${name}_new_default(void) { return ${name}_new(${defaults}); }`);
+      }
+      // Instance methods, then getters/setters, then the static side. Every one is
+      // a no-op returning the type's zero value.
+      for (const [mname, m] of info.methods) {
+        if (m.owner !== name) continue;
+        this.emitShellStub(`${name}_${mname}`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, m.returnType, `${label}.${mname}`);
+      }
+      for (const [mname, m] of info.getters) {
+        if (m.owner !== name) continue;
+        this.emitShellStub(`${name}_get_${mname}`, 'void* _this', m.returnType, `${label}.${mname}`);
+      }
+      for (const [mname, m] of info.setters) {
+        if (m.owner !== name) continue;
+        this.emitShellStub(`${name}_set_${mname}`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, { kind: 'void' }, `${label}.${mname}`);
+      }
+      for (const [mname, m] of info.staticMethods) {
+        if (m.owner !== name) continue;
+        this.emitShellStub(`${name}_${mname}_static`, this.shellArgs(m.params, info.importAlias, true), m.returnType, `${label}.${mname}`);
+      }
+      for (const [mname, m] of info.staticSetters ?? []) {
+        if (m.owner !== name) continue;
+        this.emitShellStub(`${name}_set_${mname}_static`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, { kind: 'void' }, `${label}.${mname}`);
+      }
+      for (const [mname, m] of info.staticGetters ?? []) {
+        if (m.owner !== name) continue;
+        // A static getter returning the class it lives on is the documented
+        // singleton (`NativeApplication.nativeApplication`, `Clipboard.
+        // generalClipboard`, `NetworkInfo.networkInfo`): hand back one shared
+        // instance instead of NULL, since callers chain a method off it.
+        if (m.returnType.kind === 'object' && m.returnType.className === name) {
+          const varName = `${name}__shell_singleton`;
+          this.shellSingletons.push(varName);
+          this.line(`static ${name}* ${varName} = NULL;`);
+          this.line(`${name}* ${name}_get_${mname}_static(void* _this) {`);
+          this.indent++;
+          this.line('(void)_this;');
+          const mk = info.constructor.params.length === 0 ? `${name}_new()` : `${name}_new_default()`;
+          this.line(`if (${varName} == NULL) ${varName} = ${mk};`);
+          this.line(`return ${varName};`);
+          this.indent--;
+          this.line('}');
+          continue;
+        }
+        this.emitShellStub(`${name}_get_${mname}_static`, 'void* _this', m.returnType, `${label}.${mname}`);
+      }
+      this.line('');
+    }
+    if (any) this.line('');
+  }
+
+  // `class X extends Array` (stage 136) through a DYNAMIC receiver: an instance
+  // whose elements live in a hidden backing array must answer the Array side of
+  // its API (`b.length`, `b[i]`, `b["k"] = v`, `"0" in b`, `delete b[0]`) even
+  // when the static type is `*`/Object. Unlike a ByteArray/Vector -- whose class
+  // body the runtime can recognise without generated code -- an Array subclass is
+  // an ordinary class instance, so the mapping instance -> backing array is
+  // emitted here and installed by as_arrback_wire() (exactly like as_ba_wire).
+  // A program with no Array subclass emits an empty stub, so output is unchanged.
+  private emitArrayBackedWire(): void {
+    const backed: Array<[string, ClassInfo]> = [];
+    for (const [name, info] of this.symbols.classes) {
+      if (info.arrayBacked) backed.push([name, info]);
+    }
+    if (backed.length === 0) {
+      this.line('static void as_arrback_wire(void) { }');
+      this.line('');
+      return;
+    }
+    this.line('static as_array* as_arrback_impl(void* obj) {');
+    this.indent++;
+    this.line('if (obj == NULL) return NULL;');
+    // The fqn discriminator is the vtable's own `fqn` slot (the same string the
+    // class registry and #1069/#1056 messages use), so no name mangling matters.
+    this.line('void* vt = ((as_object_header*)obj)->vtable;');
+    this.line('const char* f = vt != NULL ? ((as_vtable_header*)vt)->fqn : NULL;');
+    this.line('if (f == NULL) return NULL;');
+    for (const [name, info] of backed) {
+      const fqn = info.fqn ?? info.reflectFqn ?? name;
+      // A subclass of an Array subclass shares the backing invariant, but its own
+      // vtable carries its own fqn -- so every array-backed class gets a branch
+      // (the struct layout is identical, which is what makes the cast legal).
+      this.line(`if (strcmp(f, "${this.escapeCString(fqn)}") == 0) return ((struct ${name}*)obj)->_arr;`);
+    }
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_arrback_wire(void) { as_arrback_hook = as_arrback_impl; }');
+    this.line('');
+  }
+
+  // `, <paramDecls>` for a shell body (empty string when there are none).
+  private shellArgs(params: Param[], importAlias: Map<string, string> | undefined | null, noThis = false): string {
+    const decls = this.paramDecls(params, importAlias);
+    if (!decls) return '';
+    return noThis ? decls : `, ${decls}`;
+  }
+
+  private emitShellStub(decl: string, argsDecl: string, ret: CType, label: string): void {
+    this.line(`${this.cTypeName(ret)} ${decl}(${argsDecl}) {`);
+    this.indent++;
+    const firstParam = argsDecl.indexOf(', ');
+    if (firstParam >= 0) {
+      for (const p of argsDecl.slice(firstParam + 2).split(', ')) this.line(`(void)${p.slice(p.lastIndexOf(' ') + 1)};`);
+    }
+    this.line(`as_shell_unsupported((char*)"${this.escapeCString(label)}");`);
+    if (ret.kind !== 'void') this.line(`return ${this.shellZero(ret)};`);
+    this.indent--;
+    this.line('}');
+  }
+
+  // The C expression for a shell member's return value: the type's AS3 zero/
+  // empty value, never a NULL a caller would then dereference.
+  private shellZero(t: CType): string {
+    switch (t.kind) {
+      case 'bool': return 'false';
+      case 'int': case 'uint': case 'int64': case 'uint64': case 'number': return '0';
+      case 'string': return 'NULL';
+      case 'any': case 'record': return 'as_v_null()';
+      case 'array': return 'as_array_new()';
+      case 'vector': return `as_vector_${this.vectorCName(t.elem)}_new()`;
+      case 'interface': return `(${t.name}){ NULL, NULL }`;
+      case 'void': return '';
+      default: return 'NULL';
+    }
+  }
+
+  // A GC write barrier for the field write `lhs = ...`, or '' when the slot holds
+  // no GC pointer (numbers/bools) — the same rule gcWriteAssign uses.
+  private shellBarrier(lhs: string, t: CType): string {
+    if (t.kind === 'any') return `gc_write_barrier_value(${lhs});`;
+    if (t.kind === 'interface') return `gc_write_barrier((void*)${lhs}.obj);`;
+    return this.gcPtrKind(t) ? `gc_write_barrier((void*)${lhs});` : '';
+  }
+
+  // Literal C for a built-in constructor parameter default.
+  private shellLiteral(e: Expr | null): string {
+    if (e === null) return 'NULL';
+    switch (e.kind) {
+      case 'Null': return 'NULL';
+      case 'Bool': return e.value ? 'true' : 'false';
+      case 'Num': return e.value === 0 ? '0' : `${e.value}`;
+      case 'Str': return `(char*)"${this.escapeCString(e.value)}"`;
+      default: return 'NULL';
+    }
+  }
+
   private emitPropTables(): void {
     let any = false;
     for (const [name, info] of this.symbols.classes) {
@@ -2607,6 +3258,12 @@ export class Emitter {
         } else {
           this.line(`{ "${label}", ${tag}, ${off} },`);
         }
+      }
+      // `class X extends Array` (arrayBacked): the element storage is a GC array
+      // in a C-runtime-only slot, so type 6 makes gc_scan follow it. Not an
+      // AS3-visible member (the AS3 surface is the inherited Array API).
+      if (info.arrayBacked) {
+        this.line(`{ "_arr", 6, offsetof(${name}, _arr) },`);
       }
       // TextField holds GC-managed rich-text runs (an as_array of TextFormat
       // object refs) that is not an AS3-visible member, so it is marked here
@@ -2977,6 +3634,14 @@ export class Emitter {
     this.line('gc_mark_ptr((void*)as_focus_obj);');
     this.line('gc_mark_ptr((void*)as_tab_anchor);');
     this.line('gc_mark_ptr((void*)ASC_native_app);');
+    // An in-flight startDrag(): the dragged object and its bounds rectangle are held
+    // only by these C statics, and a drag outlives the event that started it.
+    this.line('gc_mark_ptr(ASC_drag_obj);');
+    this.line('gc_mark_ptr((void*)ASC_drag_bounds);');
+    // Shell-class singletons (`Clipboard.generalClipboard`, `NetworkInfo.
+    // networkInfo`): one shared instance behind a static C pointer, so it must be
+    // a permanent root like any other static field.
+    for (const v of this.shellSingletons) this.line(`gc_mark_ptr((void*)${v});`);
     // flash.net.URLRequestDefaults.userAgent is a settable static String, so it can
     // hold a GC string after `URLRequestDefaults.userAgent = ...`. (The other six
     // URLRequestDefaults members are bool/Number and cannot hold a pointer.)
@@ -3315,6 +3980,19 @@ export class Emitter {
     // activate() is also what makes a fresh window visible (adl: visible flips from
     // false to true across activate()), so the two are one call in the glue.
     this.line('void NativeWindow_activate(void* _this) { as_window_activate(((NativeWindow*)_this)->_win); }');
+    // notifyUser(type): an OS attention hint (flashing taskbar / bouncing dock).
+    // Nothing to draw and nothing a program can observe, so it is accepted and
+    // does nothing.
+    this.line('void NativeWindow_notifyUser(void* _this, char* type) { (void)_this; (void)type; }');
+    // startMove()/startResize(): AIR hands the drag/resize over to the window
+    // manager, which this runtime has no hook for (the backend owns the OS window
+    // but exposes no "begin system move" entry point). They therefore report
+    // themselves once and answer AIR's "was the operation started?" with false --
+    // the value AIR itself returns for a maximized window -- rather than pretending
+    // a drag is under way. A caller that only drags a window (the documented idiom)
+    // observes no wrong state; a caller that branches on the result sees false.
+    this.line('bool NativeWindow_startMove(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.display.NativeWindow.startMove (system-controlled window move)"); return false; }');
+    this.line('bool NativeWindow_startResize(void* _this, char* edgeOrCorner) { (void)_this; (void)edgeOrCorner; as_shell_unsupported((char*)"flash.display.NativeWindow.startResize (system-controlled window resize)"); return false; }');
     this.line('void NativeWindow_minimize(void* _this) {');
     this.indent++;
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
@@ -3667,7 +4345,13 @@ export class Emitter {
       case 'While': this.collectWalkFuncVarsStmt(s.body); break;
       case 'DoWhile': this.collectWalkFuncVarsStmt(s.body); break;
       case 'For': if (s.init) this.collectWalkFuncVarsStmt(s.init); this.collectWalkFuncVarsStmt(s.body); break;
-      case 'ForIn': if (s.declares) frame.set(s.varName, { kind: 'string' }); this.collectWalkFuncVarsStmt(s.body); break;
+      // `for (var k in obj)`: the key is a String UNLESS the loop declares its own
+      // type -- AS3 allows `for (var idx:* in imageDatas)`, and the emit pass
+      // honours that annotation (the C local is an as_value), so the walk frame
+      // must too: assuming String made a closure capture the key as `char*` and
+      // the env_make argument (`as_value`) mismatched its parameter (measured on
+      // com.svgaplayer.VideoEntity.resetImages).
+      case 'ForIn': if (s.declares) frame.set(s.varName, s.varType === null ? { kind: 'string' } : this.ann(s.varType)); this.collectWalkFuncVarsStmt(s.body); break;
       case 'ForEachIn': if (s.declares) frame.set(s.varName, s.varType === null ? { kind: 'any' } : this.ann(s.varType)); this.collectWalkFuncVarsStmt(s.body); break;
       case 'Switch': for (const c of s.cases) this.collectWalkFuncVars(c.body); break;
       case 'Try':
@@ -3962,7 +4646,33 @@ export class Emitter {
           setGenPos(m.line ?? s.line, m.col ?? s.col);
           if (m.kind === 'Field') {
             this.noteType(m.type);
-            if (m.init) this.walkExpr(m.init);
+            if (m.init) {
+              // An initializer runs in the class's scope, so a bare identifier
+              // naming one of the class's methods is `this.method` / `Class.method`
+              // used as a value and must register its bound-method thunk. Walking
+              // it with no current class (the bug) missed the registration but the
+              // emit pass still produced `as_fn_make(X__bound, ...)`:
+              // "use of undeclared identifier '_parseApplicationData__bound'" --
+              // measured on com.hurlant.crypto.tls.TLSEngine's
+              // `protocolHandlers:Object = { 23 : parseApplicationData, ... }`.
+              const savedFC = this.currentWalkClass;
+              const savedFS = this.currentWalkIsStatic;
+              const savedFM = this.currentWalkMethod;
+              const savedEC = this.currentClass;
+              const savedES = this.currentIsStatic;
+              this.currentWalkClass = cname;
+              this.currentWalkIsStatic = m.isStatic;
+              this.currentWalkMethod = null;
+              // `ann` resolves through `this.currentClass` (see walkClassBodyFrame).
+              this.currentClass = cname;
+              this.currentIsStatic = m.isStatic;
+              this.walkExpr(m.init);
+              this.currentClass = savedEC;
+              this.currentIsStatic = savedES;
+              this.currentWalkClass = savedFC;
+              this.currentWalkIsStatic = savedFS;
+              this.currentWalkMethod = savedFM;
+            }
           } else if (m.kind === 'StaticInit') {
             // A class-body static initializer block: no parameters, no `this`, and
             // its `var`s live in the block's own (function-scoped) frame. Walked
@@ -3995,9 +4705,22 @@ export class Emitter {
     const saved = this.currentWalkClass;
     const savedStatic = this.currentWalkIsStatic;
     const savedMethod = this.currentWalkMethod;
+    // Parameter/var annotation resolution (`ann`) goes through `this.currentClass`,
+    // so the walk must install the class being walked as well as `currentWalkClass`.
+    // Without it every type annotation inside the walk fell back to the GLOBAL
+    // short-name table, which is last-wins: `scale9Grid:Rectangle` in starling's
+    // Image.as (which imports flash.geom.Rectangle) resolved to the file-local
+    // helper class `Rectangle` of starling/geom/Polygon.as and the closure's env
+    // field took `starling_geom_Polygon_Rectangle*` while its call site passed
+    // `Rectangle*` -- "incompatible pointer types passing ... to parameter of type"
+    // (measured on the real app, 2 sites).
+    const savedClass = this.currentClass;
+    const savedIsStatic = this.currentIsStatic;
     this.currentWalkClass = cname;
     this.currentWalkIsStatic = isStatic;
     this.currentWalkMethod = methodName;
+    this.currentClass = cname;
+    this.currentIsStatic = isStatic;
     this.funcVars.push(new Map(params.map((p) => [p.name, this.ann(p.type)])));
     this.walkParams(params);
     this.collectWalkFuncVars(body);
@@ -4007,6 +4730,8 @@ export class Emitter {
     this.mergeNestedGroup(groupStart);
     this.popWalkFnBody();
     this.funcVars.pop();
+    this.currentClass = savedClass;
+    this.currentIsStatic = savedIsStatic;
     this.currentWalkClass = saved;
     this.currentWalkIsStatic = savedStatic;
     this.currentWalkMethod = savedMethod;
@@ -4045,6 +4770,14 @@ export class Emitter {
         const localVar = this.currentWalkClass !== null
           ? this.lookupFuncVarLocal(e.name)
           : this.lookupFuncVar(e.name);
+        // A package-level built-in used as a VALUE (`= getTimer`): record it so
+        // emitFunctionValues emits its `__call` thunk. Only when the name is not
+        // shadowed by a local and not a user free function (both of which win in
+        // emitVarLexical and would own the `name__call` symbol themselves).
+        if (Emitter.BUILTIN_FN_VALUES.has(e.name) && !localVar
+          && this.symbols.getFunc(e.name) === undefined) {
+          this.builtinFnRefs.add(e.name);
+        }
         if (this.currentWalkClass && !localVar) {
           const cinfo = this.symbols.getClass(this.currentWalkClass);
           if (!this.currentWalkIsStatic) {
@@ -4214,7 +4947,34 @@ export class Emitter {
       case 'ArrayLit': for (const el of e.elements) this.walkExpr(el); break;
       case 'VectorLit': this.noteType(`Vector.<${e.elem}>`); for (const el of e.elements) this.walkExpr(el); break;
       case 'VectorCoerce': this.noteType(`Vector.<${e.elem}>`); for (const a of e.args) this.walkExpr(a); break;
-      case 'Index': this.walkExpr(e.object); this.walkExpr(e.index); break;
+      // A COMPUTED key on a Class-typed receiver (`SomeClass[key]`) resolves against
+      // the class's WHOLE static table at run time -- there is no name to collect --
+      // so every class with a statics table is emitted in FULL for it. That is what
+      // makes cn/edoctor/utils/Language.as's `Language[key] = xml` (and the
+      // `Language[key]` guard above it) read and write the DECLARED static it names.
+      case 'Index': {
+        const it = this.walkInferType(e.object);
+        const addStatics = (cn: string): void => {
+          const ci = this.symbols.getClass(cn);
+          if (!ci) return;
+          this.dynClassFull.add(cn);
+          for (const [mn, m] of ci.staticMethods) {
+            const k = `${m.owner}:${mn}`;
+            if (!this.staticMethodRefs.has(k)) this.staticMethodRefs.set(k, { cname: m.owner, mname: mn, m: m });
+          }
+        };
+        if (it !== null && it.kind === 'class') {
+          // A Class-typed VALUE: which class it holds is a run-time fact, so every
+          // class needs its full table.
+          for (const cn3 of this.symbols.classes.keys()) addStatics(cn3);
+        } else if (e.object.kind === 'Var' && this.lookupFuncVar(e.object.name) === null) {
+          const cn3 = this.resolveClassName(e.object.name);
+          if (this.symbols.hasClass(cn3)) addStatics(cn3);
+        }
+        this.walkExpr(e.object);
+        this.walkExpr(e.index);
+        break;
+      }
       case 'ObjectLit': for (const f of e.fields) this.walkExpr(f.value); break;
       case 'NullCoalesce': this.walkExpr(e.left); this.walkExpr(e.right); break;
       case 'Comma': this.walkExpr(e.left); this.walkExpr(e.right); break;
@@ -4317,6 +5077,7 @@ export class Emitter {
         b.cname,
         undefined,
         this.fnQName(b.cname, b.mname),
+        b.m.owner,
       );
     }
     // Interface methods referenced as Function values (`var f:Function = d.describe`
@@ -4337,6 +5098,12 @@ export class Emitter {
           null,
           undefined,
           this.fnQName(iname, mname),
+          // The DECLARING interface's file owns the parameter types: a method this
+          // interface merely inherits (`dispatchEvent` from flash's
+          // IEventDispatcher) must resolve `Event` in ITS own context, not the
+          // sub-interface's ('incompatible pointer types passing
+          // starling_events_Event* to parameter of type Event*').
+          m.owner,
         );
       }
     }
@@ -4352,6 +5119,7 @@ export class Emitter {
         s.owner,
         undefined,
         this.fnQName(s.owner, s.mname),
+        s.m.owner,
       );
     }
     // Built-in static method as a value: `String.fromCharCode`. It has no
@@ -4376,6 +5144,14 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('');
+    // A package-level built-in function used as a VALUE (`static var f:Function =
+    // getTimer`): a non-capturing thunk over the same runtime helper the call form
+    // uses, so `f()` and `getTimer()` behave identically.
+    for (const g of this.builtinFnRefs) {
+      const impl = Emitter.BUILTIN_FN_IMPL.get(g);
+      if (impl === undefined) continue;
+      this.emitThunk(`${g}__call`, impl, [], { kind: 'int' }, null, null, undefined, `flash.utils/${g}`);
+    }
     // Static-method-as-value thunks: `ClassName.method` used as a Function value.
     // No receiver; the static method is called directly.
     for (const s of this.staticMethodRefs.values()) {
@@ -4452,7 +5228,22 @@ export class Emitter {
     if (this.anonFuncs.length > 0) this.line('');
     // prototypes first so a nested anonymous function's thunk resolves before
     // its enclosing body references it.
+    //
+    // Every closure in this batch is emitted OUT of its file's emission order, so
+    // the declaring class context must be installed before ANY type annotation is
+    // resolved (return, params, `paramDecls`, the closure env struct). Without it
+    // `ann`/`rt` fall back to the GLOBAL short-name table, which is last-wins:
+    // `view.mouseChildren` on a `flash.display.DisplayObjectContainer` parameter
+    // resolved to `starling_display_DisplayObjectContainer` (starling ships in src/
+    // and registers `DisplayObjectContainer` later) and failed with a bogus
+    // "undefined field" error (measured on the talkmed-meeting Windows port).
     for (const fn of this.anonFuncs) {
+      const savedClass0 = this.currentClass;
+      const savedIsStatic0 = this.currentIsStatic;
+      const savedMethod0 = this.currentMethod;
+      this.currentClass = fn.cname;
+      this.currentIsStatic = fn.isStatic;
+      this.currentMethod = fn.methodName;
       const rt = this.ann(fn.returnType);
       if (fn.captures.length === 0) {
         this.line(`${this.cTypeName(rt)} ${fn.name}(${this.paramDecls(fn.params)});`);
@@ -4461,6 +5252,9 @@ export class Emitter {
         this.line(`${this.cTypeName(rt)} ${fn.name}__impl(${this.closureEnvType(fn)}* env${p ? ', ' + p : ''});`);
       }
       this.line(`as_value ${fn.name}__call(void* env, as_value* args, int argc);`);
+      this.currentClass = savedClass0;
+      this.currentIsStatic = savedIsStatic0;
+      this.currentMethod = savedMethod0;
     }
     // Eager cell allocators: allocate the shared cell, fill each member's `as_fn`
     // slot, and default-initialize the captured variables. Boxed captured locals
@@ -4485,6 +5279,14 @@ export class Emitter {
     }
     if (this.anonFuncs.length > 0) this.line('');
     for (const fn of this.anonFuncs) {
+      // The declaring class context must be live BEFORE the first annotation is
+      // resolved — see the prototype loop above.
+      const savedClass = this.currentClass;
+      const savedIsStatic = this.currentIsStatic;
+      const savedMethod = this.currentMethod;
+      this.currentClass = fn.cname;
+      this.currentIsStatic = fn.isStatic;
+      this.currentMethod = fn.methodName;
       const rt = this.ann(fn.returnType);
       this.pushScope();
       this.functionScope = this.scopes[this.scopes.length - 1];
@@ -4499,15 +5301,6 @@ export class Emitter {
         this.currentClosureCells = this.closureCellEnv.get(fn.name)?.resolve ?? null;
       }
       this.indent++;
-      // Restore the enclosing class context so a bare instance-method call or
-      // `this` inside the closure resolves against the defining class (with
-      // env->this as the receiver; see emitVar / emitCall).
-      const savedClass = this.currentClass;
-      const savedIsStatic = this.currentIsStatic;
-      const savedMethod = this.currentMethod;
-      this.currentClass = fn.cname;
-      this.currentIsStatic = fn.isStatic;
-      this.currentMethod = fn.methodName;
       // A `with` object scope lives in a C local of the *enclosing* function body
       // and its names resolve to that local, so a nested function body (a closure
       // or a local function) cannot see it: AIR captures the with scope in the
@@ -4537,9 +5330,9 @@ export class Emitter {
       this.popScope();
       this.currentReturnType = null;
       if (fn.captures.length === 0) {
-        this.emitThunk(`${fn.name}__call`, fn.name, fn.params, rt, null, null, undefined, fn.asName !== null ? this.fnQName(null, fn.asName) : 'Function/anonymous');
+        this.emitThunk(`${fn.name}__call`, fn.name, fn.params, rt, null, null, undefined, fn.asName !== null ? this.fnQName(null, fn.asName) : 'Function/anonymous', fn.cname);
       } else {
-        this.emitThunk(`${fn.name}__call`, `${fn.name}__impl`, fn.params, rt, `((${this.closureEnvType(fn)}*)env)`, null, undefined, fn.asName !== null ? this.fnQName(null, fn.asName) : 'Function/anonymous');
+        this.emitThunk(`${fn.name}__call`, `${fn.name}__impl`, fn.params, rt, `((${this.closureEnvType(fn)}*)env)`, null, undefined, fn.asName !== null ? this.fnQName(null, fn.asName) : 'Function/anonymous', fn.cname);
       }
     }
     if (this.symbols.funcs.size > 0 || this.anonFuncs.length > 0) this.line('');
@@ -4560,10 +5353,29 @@ export class Emitter {
     return n;
   }
 
+  // The import alias of the class that declares a member: parameter types belong
+  // to that file, so call/thunk sites resolve them with it (see emitArgs / the
+  // thunk emitter). Returns null for an interface owner or an unknown name, which
+  // keeps the caller's own resolution -- interface method params are stored
+  // PRE-resolved as CTypes, so they must not be run through resolveType again.
+  private declAliasOf(owner: string | null | undefined): Map<string, string> | null {
+    if (!owner) return null;
+    return this.symbols.getClass(owner)?.importAlias ?? this.symbols.interfaces.get(owner)?.importAlias ?? null;
+  }
+
+  // The C type of a setter's VALUE parameter, resolved through the declaring
+  // class's import alias (see emitArgs). Measured on the real app: `obj.mask = mc`
+  // cast the argument to starling's DisplayObject while the vtable setter slot took
+  // the built-in's -- 18 "incompatible pointer types" errors.
+  private setterParamType(s: MethodInfo): CType {
+    const alias = this.declAliasOf(s.owner);
+    return alias ? resolveType(s.params[0].type, alias) : this.rt(s.params[0].type);
+  }
+
   // A calling thunk: unbox each argument from the as_value[] list, call the
   // typed implementation, and box the result back into as_value. `envArg` is the
   // environment expression passed first for capturing closures (null otherwise).
-  private emitThunk(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null, ownerClass: string | null = null, ctorMax: number | null | undefined = undefined, qname: string | null = null): void {
+  private emitThunk(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null, ownerClass: string | null = null, ctorMax: number | null | undefined = undefined, qname: string | null = null, declOwner: string | null = null): void {
     // A default parameter value is a constant expression that may name a STATIC
     // const of the owning class (`radiusMode:int = RADIUS` in away3d's
     // SphereMaker). Thunks are emitted from emitFunctionValues, outside any class
@@ -4575,14 +5387,27 @@ export class Emitter {
     const savedIsStatic = this.currentIsStatic;
     if (ownerClass !== null) { this.currentClass = ownerClass; this.currentIsStatic = true; }
     try {
-      this.emitThunkBody(name, callTarget, params, returnType, envArg, ctorMax, qname);
+      this.emitThunkBody(name, callTarget, params, returnType, envArg, ctorMax, qname, declOwner);
     } finally {
       this.currentClass = savedClass;
       this.currentIsStatic = savedIsStatic;
     }
   }
 
-  private emitThunkBody(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null, ctorMax: number | null | undefined = undefined, qname: string | null = null): void {
+  private emitThunkBody(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null, ctorMax: number | null | undefined = undefined, qname: string | null = null, declOwner: string | null = null): void {
+
+    // Parameter types resolve through the DECLARING class's import alias, exactly
+    // like the vtable slot they are passed to (methodPtrField). Resolving with
+    // `this.currentClass` instead -- the class the thunk BELONGS to -- picked the
+    // receiver's file alias, and with no alias entry the global typeAlias table
+    // (last-wins across all files) answered. Measured on the real app: the thunk
+    // for AlertExitRoom's inherited flash `addChild(child:DisplayObject)` unboxed
+    // the argument as `starling_display_DisplayObject*` while the vtable slot took
+    // the built-in's `DisplayObject*` ("incompatible pointer types passing ..."
+    // for 18 slots). Built-ins carry an alias mapping every built-in short name to
+    // itself, so the declaring-owner lookup restores the built-in type.
+    const declAlias = this.declAliasOf(declOwner);
+    const rtOf = (p: Param): CType => (declAlias !== null ? resolveType(p.type, declAlias) : this.rt(p.type));
     const argCodes: string[] = [];
     for (let i = 0; i < params.length; i++) {
       const p = params[i];
@@ -4594,12 +5419,12 @@ export class Emitter {
         argCodes.push(`as_array_make((argc > ${i} ? argc - ${i} : 0), (argc > ${i} ? &args[${i}] : NULL))`);
         break;
       }
-      const unboxArg = this.unboxAny({ code: `args[${i}]`, type: { kind: 'any' } as CType }, this.rt(p.type));
+      const unboxArg = this.unboxAny({ code: `args[${i}]`, type: { kind: 'any' } as CType }, rtOf(p));
       if (p.defaultValue !== null) {
         // An optional argument the caller may omit: fall back to its default value
         // when argc <= i. Otherwise the thunk reads args[i] out of bounds (args may
         // be NULL, e.g. `onAssetLoaded()` with `name:String=null`).
-        const defCode = this.convert(this.emitExpr(p.defaultValue), this.rt(p.type));
+        const defCode = this.convert(this.emitExpr(p.defaultValue), rtOf(p));
         argCodes.push(`(argc > ${i} ? ${unboxArg} : ${defCode})`);
       } else {
         argCodes.push(unboxArg);
@@ -4652,7 +5477,18 @@ export class Emitter {
 
   // Emit a call's argument list, applying default values and packing trailing
   // arguments into a rest parameter's Array.
-  private emitArgs(params: Param[], args: Expr[]): string {
+  //
+  // `alias` is the import alias of the class that DECLARES the callee. A
+  // parameter's type name belongs to the callee's file, so it must resolve through
+  // that file's alias -- resolving through `this.currentClass` (the CALLER) picked
+  // the caller's meaning of the same short name and inserted a bogus downcast.
+  // Measured on the real app: `Alert_Toast(msg, stage)` (declared in a file that
+  // imports flash.display.Stage) called from a starling file cast the argument to
+  // `(starling_display_Stage*)` -- 804 "incompatible pointer types" C errors, all
+  // starling-class -> flash-class. Built-ins carry an alias mapping every built-in
+  // short name to itself, so the declaring-owner lookup restores the built-in type.
+  private emitArgs(params: Param[], args: Expr[], alias?: Map<string, string> | null): string {
+    const rtOf = (p: Param): CType => (alias ? resolveType(p.type, alias) : this.rt(p.type));
     const codes: string[] = [];
     let i = 0;
     for (; i < params.length; i++) {
@@ -4665,15 +5501,24 @@ export class Emitter {
         return codes.join(', ');
       }
       if (i < args.length) {
-        codes.push(this.convert(this.emitExpr(args[i]), this.rt(p.type)));
+        codes.push(this.convert(this.emitExpr(args[i]), rtOf(p)));
       } else if (p.defaultValue !== null) {
-        codes.push(this.convert(this.emitExpr(p.defaultValue), this.rt(p.type)));
+        codes.push(this.convert(this.emitExpr(p.defaultValue), rtOf(p)));
       } else {
-        throw new CodegenError(`missing argument for parameter '${p.name}'`);
+        // [temp instrumentation] record the gap and keep going.
+        if (as3Gap('missing argument', `param '${p.name}' in ${this.currentClass ?? '<top>'}.${this.currentMethod ?? '<top>'}`)) {
+          codes.push('as_v_null()');
+          continue;
+        }
+        throw new CodegenError(`missing argument for parameter '${p.name}' in ${this.currentClass ?? '<top>'}.${this.currentMethod ?? '<top>'}`);
       }
     }
     if (args.length > params.length) {
-      throw new CodegenError(`too many arguments (expected ${params.length}, got ${args.length}) for ${params.map((p) => p.name).join(',')}`);
+      // [temp instrumentation] record the arity mismatch and drop the extras.
+      if (as3Gap('too many arguments', `expected ${params.length}, got ${args.length} (params: ${params.map((p) => p.name).join(',') || '<none>'}) in ${this.currentClass ?? '<top>'}.${this.currentMethod ?? '<top>'}`)) {
+        return codes.join(', ');
+      }
+      throw new CodegenError(`too many arguments (expected ${params.length}, got ${args.length}) for (params: ${params.map((p) => p.name).join(',') || '<none>'}) in ${this.currentClass ?? '<top>'}.${this.currentMethod ?? '<top>'}`);
     }
     return codes.join(', ');
   }
@@ -5086,12 +5931,14 @@ export class Emitter {
         matrix: op.matrix ?? null,
         cxform: op.cxform ?? null,
         hidden: op.hidden === true,
+        name: op.name,
         filters: op.filters,
         blendMode: op.blendMode,
         bitmapCached: op.bitmapCached,
       };
       this.emitSwcPlacement(name, p);
       this.emitSwcPlacementAttrs(name, p, 0);
+      this.emitSwcChildName(name, p, 'o');
       if (op.hidden) this.line(`if (${name} != NULL) ${name}->visible = false;`);
       if (op.visible) this.line(`if (${name} != NULL) ${name}->visible = true;`);
       this.line(`if (${name} != NULL) as_swc_tl_put(o, ${name}, ${op.depth});`);
@@ -5122,6 +5969,9 @@ export class Emitter {
     }
     if (op.hidden) this.line(`${name}->visible = false;`);
     if (op.visible) this.line(`${name}->visible = true;`);
+    // A modify record can (re)name the object at this depth: the parent's
+    // property follows, exactly as for a placement record.
+    if (op.name !== undefined) this.emitSwcChildName(name, { charId: op.modCharId ?? 0, matrix: null, cxform: null, hidden: false, name: op.name }, 'o');
     // Filters / blendMode / cacheAsBitmap reuse the frame-1 emitter so a modify
     // record and a placement record can never drift apart.
     if (op.filters !== undefined || op.blendMode !== undefined || op.bitmapCached !== undefined) {
@@ -5344,6 +6194,21 @@ export class Emitter {
   }
 
   /** A sprite/button character: build its frame-1 children (button: four states). */
+  /**
+   * A placement's instance NAME (PlaceObject2/3 `Name`). AIR makes every named
+   * timeline child a property of its parent (see as_swc_child_name), and gives the
+   * child itself that name -- so `parent.select`, `getChildByName("select")` and
+   * `select.name == "select"` all agree, and a project class derived from the
+   * symbol (`class upLoadView extends uploadskin`) can read the name as a BARE
+   * identifier, which resolves through the parent's dynamic-property table.
+   */
+  private emitSwcChildName(child: string, p: SwcBakePlacement, parent: string): void {
+    if (p.name === undefined || p.name === null || p.name === '') return;
+    const lit = `(char*)"${this.escapeCString(p.name)}"`;
+    this.line(`if (${child} != NULL) { ${child}->name = ${lit}; gc_write_barrier((void*)${child}->name); }`);
+    this.line(`as_swc_child_name((void*)(${parent}), "${this.escapeCString(p.name)}", (void*)${child});`);
+  }
+
   private emitSwcCharBuilder(ch: SwcBakeCharacter, maskSymbol: (m: { charId: number; matrix: number[] }) => string): void {
     this.line(`// SWC ${ch.kind} character #${ch.id}.`);
     this.line(`static void as_swc_build_${ch.id}(DisplayObject* o) {`);
@@ -5369,6 +6234,7 @@ export class Emitter {
         list.forEach((p, i) => {
           this.line(`DisplayObject* ${state}_${i} = as_swc_new(${p.charId});`);
           this.emitSwcPlacement(`${state}_${i}`, p);
+          this.emitSwcChildName(`${state}_${i}`, p, state);
           if (p.mask) this.line(`if (${state}_${i} != NULL) ${state}_${i}->_clip_path = ${maskSymbol(p.mask)}();`);
           this.line(`if (${state}_${i} != NULL) DisplayObjectContainer_addChild((void*)${state}, ${state}_${i});`);
         });
@@ -5389,6 +6255,7 @@ export class Emitter {
       this.line(`DisplayObject* c${i} = as_swc_new(${p.charId});`);
       this.emitSwcPlacement(`c${i}`, p);
       this.emitSwcPlacementAttrs(`c${i}`, p, i);
+      this.emitSwcChildName(`c${i}`, p, 'o');
       if (p.mask) this.line(`if (c${i} != NULL) c${i}->_clip_path = ${maskSymbol(p.mask)}();`);
       // The Flash depth the child was placed at: a later frame's timeline op
       // addresses the object by depth, exactly like AIR (item ③).
@@ -5641,7 +6508,7 @@ export class Emitter {
         // reports `is Bitmap` and a usable bitmapData for it), reusing the same
         // adopt path the named resources use.
         const b = (bake.bitmaps.find((x) => x.id === ch.bitmapId) as SwcBakeBitmap);
-        this.line(`case ${ch.id}: { BitmapData* bd = BitmapData_new(0, 0, true, 0u); BitmapData_adoptEncoded(bd, ${b.bytesSymbol}, (size_t)${b.encoded.length}); return (DisplayObject*)Bitmap_new(bd); }`);
+        this.line(`case ${ch.id}: { BitmapData* bd = BitmapData_new(0, 0, true, 0u); BitmapData_adoptEncoded(bd, ${b.bytesSymbol}, (size_t)${b.encoded.length}); return (DisplayObject*)Bitmap_new(bd, (char*)"auto", false); }`);
       } else if (ch.kind === 'morph') {
         // AIR's class here is MorphShape (a Shape subclass). We have no MorphShape
         // class, and the child reports "Shape" — part of the registered child-class
@@ -5722,6 +6589,15 @@ export class Emitter {
     this.line('return as_dyn_has(_this, name);');
     this.indent--;
     this.line('}');
+    // Object.propertyIsEnumerable(name): true only for a DYNAMIC property (see
+    // as_dyn_enumerable for the adl measurements -- a trait is never enumerable,
+    // not even on a dynamic class, and an Array's `length` is a trait). Same
+    // super-chain reachability as hasOwnProperty: every class inherits the slot.
+    this.line('bool Object_propertyIsEnumerable(void* _this, char* name) {');
+    this.indent++;
+    this.line('return as_dyn_enumerable(_this, name);');
+    this.indent--;
+    this.line('}');
     this.line('');
     // Stage3D on-screen compositing (stage 82 P2): Context3D.present() exposes the
     // offscreen render target for ASC_window_render to composite behind the 2D
@@ -5768,6 +6644,15 @@ export class Emitter {
     // built-in Object: no fields to initialize, but every subclass's implicit
     // super() lands here, so it needs a real (empty) constructor definition.
     this.line('void Object_ctor(Object* o) { (void)o; }');
+    this.line('void StyleSheet_setStyle(void* _this, char* styleName, Object* styleObject) { (void)_this; (void)styleName; (void)styleObject; as_shell_unsupported((char*)"flash.text.StyleSheet.setStyle (CSS styling is not applied)"); }');
+    // StyleSheet IS constructible in AIR (`new StyleSheet()`, and AS3 code assigns
+    // the sheet to TextField.styleSheet), and nothing else emits its ctor/factory:
+    // it is a built-in with a hand-written body, so without these two definitions
+    // the factory call from a user class's field initializer links against
+    // `_StyleSheet_new` -- "undefined symbol" (measured on the talkmed-meeting AIR
+    // app: com.vsdevelop.controls.Fps_new).
+    this.line('void StyleSheet_ctor(StyleSheet* o) { Object_ctor((Object*)o); }');
+    this.line('StyleSheet* StyleSheet_new(void) { StyleSheet* o = (StyleSheet*)gc_alloc(GCT_CLASS, sizeof(StyleSheet)); o->vtable = &StyleSheet_vt; StyleSheet_ctor(o); return o; }');
     this.line('Object* Object_new(void) { Object* o = (Object*)gc_alloc(GCT_CLASS, sizeof(Object)); o->vtable = &Object_vt; Object_ctor(o); return o; }');
     this.line('');
     // built-in flash.utils.Proxy (stage 94a). The base flash_proxy methods exist
@@ -5834,6 +6719,11 @@ export class Emitter {
     // Error.toString(): the name alone when the message is empty, "name: message"
     // otherwise (measured: `new Error()` -> "Error", `new Error("boom")` ->
     // "Error: boom", `new Error("boom", 7)` -> "Error: boom").
+    // Error.getStackTrace(): AIR hands back the AVM2 stack captured at throw time.
+    // This compiler keeps no shadow stack for exception objects, so the call
+    // reports itself once and returns the empty string (the callers are all
+    // diagnostics that concatenate it into a log line).
+    this.line('char* Error_getStackTrace(void* _this) { (void)_this; as_shell_unsupported((char*)"Error.getStackTrace"); return (char*)""; }');
     this.line('char* Error_toString(void* _this) {');
     this.indent++;
     this.line('Error* e = (Error*)_this;');
@@ -5872,6 +6762,48 @@ export class Emitter {
       this.line('}');
       this.line('');
     }
+    // flash.errors.SQLError: an Error subclass carrying the failed SQL operation, a
+    // detail message, a detail id and the substitution arguments. Hand-written for
+    // the same reason as the Error family above (the generated ctor cannot store
+    // four parameters), with the measured AIR string forms (adl 51.4.1,
+    // temp/airref/Main.as): a NULL operation/details stringifies to "null" like
+    // Error's message, detailArguments is ALWAYS an Array, and toString() omits the
+    // detailID segment while it is still the -1 sentinel.
+    this.line('void SQLError_ctor(SQLError* o, char* operation, char* details, char* message, int id, int detailID, as_array* detailArgs) {');
+    this.indent++;
+    this.line('Error_ctor((Error*)o, message, id);');
+    this.line('o->_operation = (operation == NULL) ? (char*)"null" : operation;');
+    this.line('o->_details = (details == NULL) ? (char*)"null" : details;');
+    this.line('o->_detailID = detailID;');
+    this.line('o->_detailArguments = (detailArgs != NULL) ? detailArgs : as_array_new();');
+    this.line('gc_write_barrier((void*)o->_operation); gc_write_barrier((void*)o->_details);');
+    this.line('gc_write_barrier_value(as_v_arr((void*)o->_detailArguments));');
+    this.indent--;
+    this.line('}');
+    this.line('SQLError* SQLError_new(char* operation, char* details, char* message, int id, int detailID, as_array* detailArgs) {');
+    this.indent++;
+    this.line('SQLError* o = (SQLError*)gc_alloc(GCT_CLASS, sizeof(SQLError));');
+    this.line('o->vtable = &SQLError_vt;');
+    this.line('SQLError_ctor(o, operation, details, message, id, detailID, detailArgs);');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    this.line('char* SQLError_get_operation(void* _this) { return ((SQLError*)_this)->_operation; }');
+    this.line('char* SQLError_get_details(void* _this) { return ((SQLError*)_this)->_details; }');
+    this.line('int SQLError_get_detailID(void* _this) { return ((SQLError*)_this)->_detailID; }');
+    this.line('as_array* SQLError_get_detailArguments(void* _this) { return ((SQLError*)_this)->_detailArguments; }');
+    this.line('char* SQLError_toString(void* _this) {');
+    this.indent++;
+    this.line('SQLError* e = (SQLError*)_this;');
+    this.line('const char* parts[11]; int n = 0;');
+    this.line('parts[n++] = "SQLError: \'"; parts[n++] = (e->message != NULL) ? e->message : ""; parts[n++] = "\', details:\'";');
+    this.line('parts[n++] = (e->_details != NULL) ? e->_details : ""; parts[n++] = "\', operation:\'";');
+    this.line('parts[n++] = (e->_operation != NULL) ? e->_operation : ""; parts[n++] = "\'";');
+    this.line('if (e->_detailID >= 0) { parts[n++] = ", detailID:\'"; parts[n++] = as_str_from_int(e->_detailID); parts[n++] = "\'"; }');
+    this.line('return as_str_concat_n(n, parts);');
+    this.indent--;
+    this.line('}');
+    this.line('');
     // XML parse wrapper: as_xml_parse returns NULL on malformed input; the AS3
     // `new XML(bytes)` constructor must throw an Error instead of silently
     // degrading. Emitted here (not in RUNTIME_PREAMBLE) because it calls the
@@ -5907,6 +6839,11 @@ export class Emitter {
     this.indent++;
     this.line('if (v.tag == 3) return as_xml_parse_str_checked((char*)v.ptr);');
     this.line('if (v.tag == 4 && as_is(as_v_obj_val(v), &as_xml_vt)) return (as_xml_node*)as_v_obj_val(v);');
+    // XML(xmlList): E4X returns the list\'s first node (XML(xmlList) on a one-item
+    // list is the documented idiom, e.g. Config.as\'s XML(xml.ns::initialWindow)).
+    // An EMPTY list yields NULL, which every navigation helper in this runtime
+    // treats as \'no match\' rather than crashing.
+    this.line('if (v.tag == 4 && as_is(as_v_obj_val(v), &as_xml_list_vt)) { as_xml_list* l = (as_xml_list*)as_v_obj_val(v); return l != NULL && l->length > 0 ? l->items[0] : NULL; }');
     this.line('as_throw_unsupported("XML(value) is only supported for String and XML values by this subset");');
     this.line('return NULL;');
     this.indent--;
@@ -5996,6 +6933,73 @@ export class Emitter {
     this.line('int Date_getHours(void* _this) { return Date_tm((Date*)_this)->tm_hour; }');
     this.line('int Date_getMinutes(void* _this) { return Date_tm((Date*)_this)->tm_min; }');
     this.line('int Date_getSeconds(void* _this) { return Date_tm((Date*)_this)->tm_sec; }');
+    // milliseconds / millisecondsUTC (AIR 2+ extension of the ES3 Date): the
+    // millisecond component. The same expression serves both -- a UTC offset is a
+    // whole number of minutes in every real time zone, so the sub-second component
+    // is identical either way. The C `%` on a negative epoch must not go negative,
+    // which is what the correction below is for.
+    this.line('int Date_get_milliseconds(void* _this) { double raw = fmod(((Date*)_this)->_time, 1000.0); int ms = (int)raw; if (ms < 0) ms += 1000; return ms; }');
+    this.line('void Date_set_milliseconds(void* _this, double value) {');
+    this.indent++;
+    this.line('Date* o = (Date*)_this;');
+    // Keep the whole seconds, replace only the component. AIR truncates toward zero
+    // and accepts any number (a value outside 0..999 rolls into the seconds, which
+    // the floor() of the second line already expresses).
+    this.line('double base = floor(o->_time / 1000.0) * 1000.0;');
+    this.line('o->_time = base + value;');
+    this.indent--;
+    this.line('}');
+    // The UTC namings of the same pair: every real zone offset is a whole number of
+    // MINUTES, so the sub-second component is identical in local and UTC time and both
+    // delegate to the expression above (AIR's millisecondsUTC differs from the
+    // LOCAL one only in what the whole-second part belongs to).
+    this.line('int Date_get_millisecondsUTC(void* _this) { return Date_get_milliseconds(_this); }');
+    this.line('void Date_set_millisecondsUTC(void* _this, double value) { Date_set_milliseconds(_this, value); }');
+    // The remaining local-time Date properties delegate straight to the getX()
+    // methods above, so there is exactly one place that knows how a component is
+    // read (Date_tm = localtime). `day` is read-only in AIR.
+    this.line('int Date_get_fullYear(void* _this) { return Date_getFullYear(_this); }');
+    this.line('int Date_get_month(void* _this) { return Date_getMonth(_this); }');
+    this.line('int Date_get_date(void* _this) { return Date_getDate(_this); }');
+    this.line('int Date_get_day(void* _this) { return Date_getDay(_this); }');
+    this.line('int Date_get_hours(void* _this) { return Date_getHours(_this); }');
+    this.line('int Date_get_minutes(void* _this) { return Date_getMinutes(_this); }');
+    this.line('int Date_get_seconds(void* _this) { return Date_getSeconds(_this); }');
+    // Component SETTERS (d.hours = 5, d.month = 12): AS3/ES3 assign the component on
+    // the local calendar and let the DATE normalize -- setMonth(12) rolls into January
+    // of the next year, setDate(31) in a 30-day month rolls into the 1st -- which is
+    // exactly what mktime does with an over-range tm field, so the snapshot/mktime pair
+    // reproduces the documented behaviour instead of re-deriving calendar arithmetic.
+    // The sub-second part of the old value is carried over (mktime has no ms field),
+    // and a non-finite component makes the whole date NaN, like AIR's setters.
+    this.line('static void as_date_set_component(Date* o, int which, double value) {');
+    this.indent++;
+    this.line('if (!(value == value)) { o->_time = NAN; return; }  /* NaN component: the date is invalid */');
+    this.line('struct tm t = *Date_tm(o);');
+    this.line('switch (which) {');
+    this.indent++;
+    this.line('case 0: t.tm_year = (int)value - 1900; break;');
+    this.line('case 1: t.tm_mon = (int)value; break;');
+    this.line('case 2: t.tm_mday = (int)value; break;');
+    this.line('case 3: t.tm_hour = (int)value; break;');
+    this.line('case 4: t.tm_min = (int)value; break;');
+    this.line('case 5: t.tm_sec = (int)value; break;');
+    this.line('default: break;');
+    this.indent--;
+    this.line('}');
+    this.line('t.tm_isdst = -1;  /* let mktime pick the DST offset for the new wall-clock time */');
+    this.line('time_t secs = mktime(&t);');
+    this.line('if (secs == (time_t)-1) { o->_time = NAN; return; }');
+    this.line('double sub = fmod(o->_time, 1000.0); if (sub < 0) sub += 1000.0;');
+    this.line('o->_time = (double)secs * 1000.0 + sub;');
+    this.indent--;
+    this.line('}');
+    this.line('void Date_set_fullYear(void* _this, double value) { as_date_set_component((Date*)_this, 0, value); }');
+    this.line('void Date_set_month(void* _this, double value) { as_date_set_component((Date*)_this, 1, value); }');
+    this.line('void Date_set_date(void* _this, double value) { as_date_set_component((Date*)_this, 2, value); }');
+    this.line('void Date_set_hours(void* _this, double value) { as_date_set_component((Date*)_this, 3, value); }');
+    this.line('void Date_set_minutes(void* _this, double value) { as_date_set_component((Date*)_this, 4, value); }');
+    this.line('void Date_set_seconds(void* _this, double value) { as_date_set_component((Date*)_this, 5, value); }');
     this.line('char* Date_toDateString(void* _this) {');
     this.indent++;
     this.line('struct tm* t = Date_tm((Date*)_this);');
@@ -6003,6 +7007,41 @@ export class Emitter {
     this.line('static const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};');
     this.line('char* r = as_str_alloc(32);');
     this.line('snprintf(r, 32, "%s %s %02d %04d", days[t->tm_wday], months[t->tm_mon], t->tm_mday, t->tm_year + 1900);');
+    this.line('return r;');
+    this.indent--;
+    this.line('}');
+    // toTimeString: "HH:MM:SS GMT+HHMM (zone)" in AIR. Callers slice the first 8
+    // characters (a clock), so the value is the local time and the zone suffix is
+    // the numeric offset -- the zone NAME would need the platform tz database.
+    this.line('char* Date_toTimeString(void* _this) {');
+    this.indent++;
+    this.line('struct tm* t = Date_tm((Date*)_this);');
+    // The zone offset is local-vs-UTC for the same instant. `_time` holds
+    // milliseconds as a double (the Date field), so it is converted to time_t
+    // first: gmtime takes a time_t*, not the raw field (clang rejected the field
+    // directly: incompatible pointer types double* -> const time_t*).
+    this.line('time_t tt = (time_t)(((Date*)_this)->_time / 1000.0);');
+    this.line('struct tm lt = *t, gt = *gmtime(&tt);');
+    this.line('gt.tm_isdst = -1;');
+    this.line('long off = (long)(mktime(&lt) - mktime(&gt));');
+    this.line('char* r = as_str_alloc(48);');
+    this.line('int hh = (int)(off / 3600), mm = (int)((off < 0 ? -off : off) % 3600) / 60;');
+    this.line('snprintf(r, 48, "%02d:%02d:%02d GMT%c%02d%02d", t->tm_hour, t->tm_min, t->tm_sec, off < 0 ? \'-\' : \'+\', hh < 0 ? -hh : hh, mm);');
+    this.line('return r;');
+    this.indent--;
+    this.line('}');
+    // toLocaleTimeString(): AIR renders this through the locale's time pattern
+    // ("5:31:00 AM" for en-US), which needs the locale database this backend does
+    // not carry. The platform-independent part IS the local clock time, so it is
+    // toTimeString's value without the zone suffix — documented approximation.
+    this.line('char* Date_toLocaleTimeString(void* _this) {');
+    this.indent++;
+    this.line('char* full = Date_toTimeString(_this);');
+    this.line('char* sp = strstr(full, " GMT");');
+    this.line('if (sp == NULL) return full;');
+    this.line('int n = (int)(sp - full);');
+    this.line('char* r = as_str_alloc(n + 1);');
+    this.line('memcpy(r, full, (size_t)n); r[n] = 0;');
     this.line('return r;');
     this.indent--;
     this.line('}');
@@ -6295,6 +7334,32 @@ export class Emitter {
     this.line('return o;');
     this.indent--;
     this.line('}');
+    // AIR's Event.formatToString(className, ...propertyNames): "[" + className,
+    // then " name=value" per extra argument, then "]" -- a String value is
+    // DOUBLE-QUOTED, every other value is rendered by its own string form
+    // (measured on adl 51.4.1, temp/airref/Main.as: `[MyEv type="click" bubbles=false
+    // cancelable=false eventPhase=2]`, a Number as `myNum=5`, null as `myNull=null`,
+    // and no extras at all as `[OnlyName]`). Each property is read back BY NAME
+    // through the dynamic reader, so a name the receiver does not carry raises
+    // exactly the ReferenceError #1069 AIR raises (as_throw_sealed_get).
+    this.line('char* Event_formatToString(void* _this, char* className, as_array* arguments) {');
+    this.indent++;
+    this.line('char* out = as_str_concat("[", className);');
+    this.line('int n = (arguments != NULL) ? arguments->length : 0;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('char* name = as_v_str_val(as_array_get(arguments, i));');
+    this.line('out = as_str_concat(out, " ");');
+    this.line('out = as_str_concat(out, name);');
+    this.line('out = as_str_concat(out, "=");');
+    this.line('as_value v = as_dyn_get((void*)_this, name);');
+    this.line('if (v.tag == 3) { out = as_str_concat(out, "\\""); out = as_str_concat(out, (char*)v.ptr); out = as_str_concat(out, "\\""); }');
+    this.line('else out = as_str_concat(out, as_v_str_val(v));');
+    this.indent--;
+    this.line('}');
+    this.line('return as_str_concat(out, "]");');
+    this.indent--;
+    this.line('}');
     this.line('char* Event_toString(void* _this) {');
     this.indent++;
     this.line('Event* e = (Event*)_this;');
@@ -6432,6 +7497,9 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('static NativeApplication* ASC_native_app = NULL;');
+    // systemIdleMode lives in a file-scope string so a get/set pair round-trips
+    // through the singleton; AIR's default is SystemIdleMode.NORMAL.
+    this.line('static char* ASC_idle_mode = (char*)"normal";');
     this.line('NativeApplication* NativeApplication_get_nativeApplication_static(void* _this) {');
     this.indent++;
     this.line('(void)_this;');
@@ -6439,10 +7507,29 @@ export class Emitter {
     this.line('return ASC_native_app;');
     this.indent--;
     this.line('}');
+    this.line('char* NativeApplication_get_systemIdleMode(void* _this) { (void)_this; return ASC_idle_mode; }');
+    // Setting it stores the value (so a read-back agrees with what was written, the
+    // way AIR reports the mode it is in) but the idle-timer part has no backend, so
+    // a KEEP_AWAKE request is reported once rather than silently ignored.
+    this.line('void NativeApplication_set_systemIdleMode(void* _this, char* value) { (void)_this; ASC_idle_mode = value; if (value != NULL && strcmp(value, "keepAwake") == 0) as_shell_unsupported((char*)"flash.desktop.NativeApplication.systemIdleMode (this build never inhibits the system idle timer)"); }');
+    // applicationDescriptor: the AIR descriptor document itself, embedded at compile
+    // time by `--air-app` (a program reads <id>/<versionNumber>/<initialWindow> from
+    // it, e.g. cn/edoctor/utils/Config.as). A plain-source build has no descriptor,
+    // so it answers with an empty <application/> rather than fabricating fields.
+    this.line(`static char* as_app_descriptor_xml(void) { return (char*)${cStringLiteral(Buffer.from(this.appDescriptorXml ?? '<?xml version="1.0" encoding="utf-8"?>\n<application/>', 'utf8'))}; }`);
+    this.line('as_xml_node* NativeApplication_get_applicationDescriptor(void* _this) { (void)_this; return as_xml_parse(as_app_descriptor_xml(), (int)strlen(as_app_descriptor_xml())); }');
+    // activeWindow: the currently focused window, else the initial one (see
+    // as_win_active, defined with the window table). Alert.as depends on this
+    // returning a real window -- `!activeWindow` sends it down its "no window to
+    // show the alert in" branch, silently swallowing the alert.
+    this.line('NativeWindow* NativeApplication_get_activeWindow(void* _this) { (void)_this; return as_win_active(); }');
     this.line('');
     // flash.ui.Multitouch: inputMode is a global string (default "none").
     this.line('static char* ASC_multitouch_input_mode = (char*)"none";');
     this.line('char* Multitouch_get_inputMode_static(void* _this) { (void)_this; return ASC_multitouch_input_mode; }');
+    // maxTouchPoints: no backend here ever delivers a touch point, so 0 -- AIR's own
+    // value for a device without touch input (not a placeholder).
+    this.line('double Multitouch_get_maxTouchPoints_static(void* _this) { (void)_this; return 0.0; }');
     this.line('void Multitouch_set_inputMode_static(void* _this, char* value) { (void)_this; ASC_multitouch_input_mode = value; }');
     this.line('');
     // ---- flash.display display list (stage 34) ----
@@ -6546,6 +7633,64 @@ export class Emitter {
     this.line('}');
     this.line('as_array* DisplayObject_get_filters(void* _this) { return ((DisplayObject*)_this)->filters; }');
     this.line('void DisplayObject_set_filters(void* _this, as_array* value) { DisplayObject* o = (DisplayObject*)_this; o->filters = value; if (value != NULL) gc_write_barrier((void*)value); }');
+    // DisplayObject.mask: the property round-trips by identity (a program that sets
+    // it and reads it back sees its own object, exactly as in AIR), but THIS
+    // RENDERER DOES NOT APPLY MASKS: AIR uses the mask object's alpha channel as a
+    // per-pixel coverage mask for everything it covers, which needs a saveLayer +
+    // mask blend pass the renderer does not have (it only implements the SWC
+    // clipDepth path clip, a different mechanism). Silence would be a semantic lie,
+    // so the first few non-null assignments say so on stderr -- the same loud,
+    // capped report the shell classes use. See TODO.md ('mask')
+    // and docs/zh-cn/as3-semantics.md.
+    this.line('DisplayObject* DisplayObject_get_mask(void* _this) { DisplayObject* o = (DisplayObject*)_this; if (o == NULL) return NULL; return o->_mask_ref; }');
+    this.line('void DisplayObject_set_mask(void* _this, DisplayObject* value) {');
+    this.indent++;
+    this.line('DisplayObject* o = (DisplayObject*)_this;');
+    this.line('if (o == NULL) return;');
+    this.line('o->_mask_ref = value;');
+    this.line('if (value != NULL) { gc_write_barrier((void*)value); as_shell_unsupported("DisplayObject.mask (this renderer does not apply masks)"); }');
+    this.indent--;
+    this.line('}');
+    // cacheAsBitmapMatrix: stored (AIR's getter hands back what was set) but not
+    // applied -- this renderer bakes a cacheAsBitmap subtree at the object's own
+    // resolution, so a fixed-resolution cache for a transformed object is a quality
+    // / perf difference, not a different picture. The assignment says so once.
+    this.line('Matrix* DisplayObject_get_cacheAsBitmapMatrix(void* _this) { DisplayObject* o = (DisplayObject*)_this; if (o == NULL) return NULL; return o->_cache_matrix; }');
+    this.line('void DisplayObject_set_cacheAsBitmapMatrix(void* _this, Matrix* value) {');
+    this.indent++;
+    this.line('DisplayObject* o = (DisplayObject*)_this;');
+    this.line('if (o == NULL) return;');
+    this.line('o->_cache_matrix = value;');
+    this.line('if (value != NULL) { gc_write_barrier((void*)value); as_shell_unsupported("DisplayObject.cacheAsBitmapMatrix (this renderer caches at the object\'s own resolution)"); }');
+    this.indent--;
+    this.line('}');
+    // DisplayObject.scrollRect: the object is displayed clipped to the rectangle and
+    // shifted so the rectangle's origin lands on the object's origin -- that shift is
+    // what makes `mc.scrollRect = new Rectangle(0, y, w, h)` scroll in AIR. Both
+    // halves are implemented for real in as_render_object / as_pick_hit_m (the app's
+    // lists, its VScrollBar and greensock's crop all depend on it).
+    // The getter hands back a FRESH Rectangle, like AIR (and like scale9Grid here):
+    // AIR requires the property to be assigned again for a mutation to take effect.
+    this.line('Rectangle* DisplayObject_get_scrollRect(void* _this) {');
+    this.indent++;
+    this.line('DisplayObject* o = (DisplayObject*)_this;');
+    this.line('if (o == NULL || o->_scroll_rect == NULL) return NULL;');
+    this.line('Rectangle* r = o->_scroll_rect;');
+    this.line('return Rectangle_new(r->x, r->y, r->width, r->height);');
+    this.indent--;
+    this.line('}');
+    this.line('void DisplayObject_set_scrollRect(void* _this, Rectangle* value) {');
+    this.indent++;
+    this.line('DisplayObject* o = (DisplayObject*)_this;');
+    this.line('if (o == NULL) return;');
+    this.line('if (value == NULL) { o->_scroll_rect = NULL; return; }');
+    // Store a private copy (the same reason the getter copies): the renderer reads
+    // this every frame, so keeping the caller's instance would make a mutation
+    // without a re-assignment scroll the object, which AIR does not do.
+    this.line('o->_scroll_rect = Rectangle_new(value->x, value->y, value->width, value->height);');
+    this.line('gc_write_barrier((void*)o->_scroll_rect);');
+    this.indent--;
+    this.line('}');
     // cacheAsBitmap: toggling invalidates the baked subtree so the next frame
     // re-bakes (AIR lets apps force a refresh by clearing + re-setting the flag).
     // Measured on adl 51.4.1 (temp/attrsprobe): an object with filters reports
@@ -6688,6 +7833,33 @@ export class Emitter {
     this.line('return child;');
     this.indent--;
     this.line('}');
+    // removeChildren(beginIndex = 0, endIndex = 0x7FFFFFFF): AIR removes beginIndex
+    // up to -- but NOT including -- endIndex. Removing from the top down keeps the
+    // indices below the cursor stable while the array shrinks; endIndex is clamped
+    // to the current length so the documented default (0x7FFFFFFF) means "to the
+    // end" without the caller knowing the count.
+    this.line('void DisplayObjectContainer_removeChildren(void* _this, int beginIndex, int endIndex) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
+    this.line('if (c->children == NULL) return;');
+    this.line('if (beginIndex < 0) beginIndex = 0;');
+    this.line('if (endIndex > c->children->length) endIndex = c->children->length;');
+    this.line('for (int i = endIndex - 1; i >= beginIndex; i--) DisplayObjectContainer_removeChildAt(_this, i);');
+    this.indent--;
+    this.line('}');
+    // getChildIndex(child): the child's position. AIR throws ArgumentError #2025
+    // ("The supplied DisplayObject must be a child of the caller.") when it is not
+    // a child; throwing here matches that, instead of the wrong answer (-1) AIR
+    // never returns -- a caller that uses the result as an addChildAt index would
+    // otherwise silently re-insert at the front.
+    this.line('int DisplayObjectContainer_getChildIndex(void* _this, DisplayObject* child) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
+    this.line('if (c->children != NULL) for (int i = 0; i < c->children->length; i++) if ((DisplayObject*)as_v_obj_val(c->children->data[i]) == child) return i;');
+    this.line('as_throw(ArgumentError_new((char*)"Error #2025: The supplied DisplayObject must be a child of the caller.", 2025));');
+    this.line('return -1;');
+    this.indent--;
+    this.line('}');
     this.line('DisplayObject* DisplayObjectContainer_getChildAt(void* _this, int index) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
@@ -6754,6 +7926,23 @@ export class Emitter {
     // It is a permanent GC root: nothing else points at the focused object, and an
     // app can hold focus across frames while allocating.
     this.line('static DisplayObject* as_focus_obj = NULL;');
+    // Insertion-caret blink clock (阶段一百三十五). AIR's caret blinks on a ~500 ms
+    // half period and the clock RESTARTS on every focus change / caret move /
+    // keystroke, so the bar is solid right after the user acts instead of flickering
+    // off the instant they type. `as_tf_caret_on` reads it; the phase is folded into
+    // the field's render fingerprint (gated on focus) so a still field never bakes a
+    // frozen caret. Not a GC pointer, so it needs no root.
+    this.line('static double as_tf_blink_t0 = 0.0;');
+    this.line('static void as_tf_blink_reset(void) { as_tf_blink_t0 = as_now_ms(); }');
+    this.line('static int as_tf_caret_on(void) {');
+    this.indent++;
+    this.line('double now = as_now_ms();');
+    this.line('if (as_tf_blink_t0 <= 0.0) as_tf_blink_t0 = now;');
+    this.line('double dt = now - as_tf_blink_t0;');
+    this.line('if (dt < 0.0) dt = 0.0;');
+    this.line('return ((long)(dt / 500.0) % 2) == 0;');
+    this.indent--;
+    this.line('}');
     // The anchor Tab traversal resumes from when nothing is focused. Measured on
     // adl (temp/editprobe/drive_ed10.py): after click f1 -> Tab to f3 -> click an
     // empty Sprite (focus becomes null) -> Tab lands on the tabbable AFTER f1, not
@@ -6786,6 +7975,9 @@ export class Emitter {
     this.line('if (obj == as_focus_obj) return;');
     this.line('DisplayObject* old = as_focus_obj;');
     this.line('as_focus_obj = obj;');
+    // Focus change restarts the caret blink so a freshly focused field shows a
+    // solid caret immediately (阶段一百三十五).
+    this.line('as_tf_blink_reset();');
     this.line('as_focus_dispatch(old, (char*)"focusOut", (Object*)obj);');
     this.line('as_focus_dispatch(obj, (char*)"focusIn", (Object*)old);');
     this.indent--;
@@ -6957,6 +8149,11 @@ export class Emitter {
     this.line('int n = (int)strlen(s);');
     this.line('if (byteIndex < 0) byteIndex = 0;');
     this.line('if (byteIndex > n) byteIndex = n;');
+    // displayAsPassword: the paragraph is laid out from the MASK (one ASCII star per
+    // byte, see as_tf_layout_text), so the paragraph's code-unit index is the byte
+    // index -- the conversion below would count the PLAINTEXT's units and land short
+    // on any multi-byte character (CJK masked field).
+    this.line('if (tf->displayAsPassword) return byteIndex;');
     this.line('int units = 0, i = 0;');
     this.line('while (i < byteIndex) {');
     this.indent++;
@@ -6971,11 +8168,41 @@ export class Emitter {
     this.line('return units;');
     this.indent--;
     this.line('}');
+    // The inverse of as_tf_utf16_index: a paragraph (Skia) code-unit index back to a
+    // byte index. Needed because Skia's line table speaks UTF-16 code units while
+    // every caret/selection index in this runtime is a byte offset -- comparing the
+    // two domains directly mis-locates the caret on CJK text (measured family: the
+    // visual line table, TODO L8152). A unit index that falls INSIDE a multi-byte
+    // sequence (Skia only reports break positions, so this cannot normally happen)
+    // rounds down to the start of that character instead of splitting it.
+    this.line('static int as_tf_byte_index(TextField* tf, int unitIndex) {');
+    this.indent++;
+    this.line('const char* s = tf->text;');
+    this.line('if (s == NULL || unitIndex <= 0) return 0;');
+    this.line('if (tf->displayAsPassword) { int m = (int)strlen(s); return unitIndex > m ? m : unitIndex; }');
+    this.line('int n = (int)strlen(s);');
+    this.line('int units = 0, i = 0;');
+    this.line('while (i < n && units < unitIndex) {');
+    this.indent++;
+    this.line('unsigned char c = (unsigned char)s[i];');
+    this.line('if (c < 0x80) { i += 1; units += 1; }');
+    this.line('else if ((c & 0xE0) == 0xC0) { i += 2; units += 1; }');
+    this.line('else if ((c & 0xF0) == 0xE0) { i += 3; units += 1; }');
+    this.line('else if ((c & 0xF8) == 0xF0) { i += 4; units += 2; }');
+    this.line('else { i += 1; units += 1; }');
+    this.indent--;
+    this.line('}');
+    this.line('return i > n ? n : i;');
+    this.indent--;
+    this.line('}');
     this.line('static void as_tf_set_caret(TextField* tf, int pos) {');
     this.indent++;
     this.line('int len = (int)strlen(as_tf_text(tf));');
     this.line('if (pos < 0) pos = 0; if (pos > len) pos = len;');
     this.line('tf->_sel_begin = pos; tf->_sel_end = pos; tf->_sel_caret = pos;');
+    // A caret move restarts the blink: the caret stays solid while the user is
+    // navigating or typing (阶段一百三十五).
+    this.line('as_tf_blink_reset();');
     // Any non-vertical caret move drops the vertical-move goal column; as_tf_vmove
     // re-installs it right after the call for the move it owns.
     this.line('tf->_goal_col = -1;');
@@ -6993,6 +8220,7 @@ export class Emitter {
     this.line('if (anchor < 0) anchor = 0; if (anchor > len) anchor = len;');
     this.line('if (pos <= anchor) { tf->_sel_begin = pos; tf->_sel_end = anchor; } else { tf->_sel_begin = anchor; tf->_sel_end = pos; }');
     this.line('tf->_sel_caret = pos;');
+    this.line('as_tf_blink_reset();');
     this.line('tf->_goal_col = -1;');
     this.indent--;
     this.line('}');
@@ -7104,11 +8332,15 @@ export class Emitter {
     // payload is the text the FIELD received: rewriting e.text is visible to later
     // listeners but does not change what gets inserted (measured: rewriting "Y" to
     // "Z" still inserted "Y").
-    this.line('static void as_tf_insert_text(TextField* tf, const char* text) {');
+    //
+    // `payload` and `text` are separate because Return differs between them:
+    // measured on adl 51.4.1, a multiline Return dispatches textInput "\n" while
+    // the TEXT gains a CR ("5\r\r7") -- one event, two strings (TODO.md L8155).
+    this.line('static void as_tf_insert_payload(TextField* tf, const char* payload, const char* text) {');
     this.indent++;
     this.line('if (!as_tf_is_input(tf) || text == NULL) return;');
     this.line('if (as_key_text_suppressed) { as_key_text_suppressed = 0; return; }');
-    this.line('TextEvent* te = TextEvent_new((char*)"textInput", true, true, (char*)text);');
+    this.line('TextEvent* te = TextEvent_new((char*)"textInput", true, true, (char*)(payload != NULL ? payload : text));');
     this.line('EventDispatcher_dispatchEvent((void*)tf, (Event*)te);');
     this.line('if (te->cancelled) return;');
     // restrict (measured): the payload is filtered per character first, and a
@@ -7146,6 +8378,8 @@ export class Emitter {
     this.line('if (as_tf_splice(tf, lo, hi, ins)) as_tf_dispatch_change(tf);');
     this.indent--;
     this.line('}');
+    // A typed/composed character: the payload IS what gets inserted.
+    this.line('static void as_tf_insert_text(TextField* tf, const char* text) { as_tf_insert_payload(tf, text, text); }');
     // Cmd+X: copy the selection, delete it, caret to the selection start, change.
     // Measured: cut fires NO textInput, only change (the clipboard write is ours).
     this.line('static void as_tf_cut(TextField* tf) {');
@@ -7252,6 +8486,13 @@ export class Emitter {
     this.line('static double as_tf_line_height(TextField* tf);');
     this.line('static int as_tf_visible_lines(TextField* tf);');
     this.line('static int as_tf_line_count(TextField* tf);');
+    // Every index this table hands out is a BYTE offset into tf->text, because that
+    // is the index domain of the whole runtime (caret, selection, `as_tf_line_end`'s
+    // CR/LF test). Skia reports its break positions in UTF-16 CODE UNITS, and the two
+    // domains coincide only for ASCII: on "ab\u4f60\u597d" wrapped onto two lines the
+    // unit table says line 1 starts at 3 while the caret after the CJK pair is byte
+    // 8, so `as_tf_line_of_index` concluded "past the last line" and Up/Down fell
+    // over (TODO.md L8152). Convert once, here, so every consumer stays in bytes.
     this.line('static int as_tf_line_table(TextField* tf, int* starts, int* ends, double* tops, int cap) {');
     this.indent++;
     this.line('if (cap > AS_TF_MAX_LINES) cap = AS_TF_MAX_LINES;');
@@ -7260,7 +8501,17 @@ export class Emitter {
     this.line('if (para != NULL) {');
     this.indent++;
     this.line('int n = as_skia_textlayout_line_metrics(para, starts, ends, tops, NULL, cap);');
-    this.line('if (n > 0) return n;');
+    this.line('if (n > 0) {');
+    this.indent++;
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('if (starts != NULL) starts[i] = as_tf_byte_index(tf, starts[i]);');
+    this.line('if (ends != NULL) ends[i] = as_tf_byte_index(tf, ends[i]);');
+    this.indent--;
+    this.line('}');
+    this.line('return n;');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('const char* t = as_tf_text(tf);');
@@ -7481,10 +8732,18 @@ export class Emitter {
     // keyDown is cancelable (measured); keyUp is not, which is what keeps a
     // preventDefault on keyUp from ever suppressing the text.
     this.line('DisplayObject* target = (as_focus_obj != NULL) ? as_focus_obj : (DisplayObject*)_this;');
-    this.line('KeyboardEvent* evt = KeyboardEvent_new(type, true, down, charCode, keyCode);');
-    this.line('evt->ctrlKey = (mod & ASC_MOD_CTRL) != 0;');
-    this.line('evt->altKey = (mod & ASC_MOD_ALT) != 0;');
-    this.line('evt->shiftKey = (mod & ASC_MOD_SHIFT) != 0;');
+    this.line('KeyboardEvent* evt = KeyboardEvent_new(type, true, down, charCode, keyCode, 0, (mod & ASC_MOD_CTRL) != 0, (mod & ASC_MOD_ALT) != 0, (mod & ASC_MOD_SHIFT) != 0, false, false, false);');
+    // AIR's platform rule for the two named modifiers, applied from the physical bits
+    // the window glue reports: on macOS the Command key is commandKey and controlKey
+    // (the physical Control key) is not separable from Ctrl there, so it stays false;
+    // on Windows/Linux controlKey IS the Ctrl key. functionKey needs an Fn report no
+    // backend provides and stays false. keyLocation is the STANDARD default above: the
+    // backend does not tell the left/right instance of a key apart.
+    this.line('#ifdef __APPLE__');
+    this.line('evt->commandKey = (mod & ASC_MOD_CMD) != 0;');
+    this.line('#else');
+    this.line('evt->controlKey = (mod & ASC_MOD_CTRL) != 0;');
+    this.line('#endif');
     this.line('EventDispatcher_dispatchEvent((void*)target, (Event*)evt);');
     this.line('if (!down) return;');
     // A default-prevented keyDown swallows the text this keystroke would produce.
@@ -7508,8 +8767,9 @@ export class Emitter {
     // press produces SDL_KEYDOWN and no SDL_TEXTINPUT. Synthesizing the commit here
     // puts Return on the same path as a typed character (a prevented keyDown still
     // suppresses it, via as_key_text_suppressed consumed inside as_tf_insert_text).
-    // Payload note: ours is "\r", adl reports "\n" -- the resulting text matches.
-    this.line('if (keyCode == 13 && tf->multiline) as_tf_insert_text(tf, "\\r");');
+    // Payload note: the event's text is "\n" (adl) while the inserted byte is CR,
+    // so this goes through the two-string form of the pipeline.
+    this.line('if (keyCode == 13 && tf->multiline) as_tf_insert_payload(tf, "\\n", "\\r");');
     this.indent--;
     this.line('}');
     // Composed text (SDL_TEXTINPUT) — the payload of AIR's TextEvent.TEXT_INPUT.
@@ -7568,10 +8828,10 @@ export class Emitter {
     // backs the AS3 test hook Stage.dispatchTextEditing (like dispatchMouse /
     // dispatchKey / dispatchText, it is not part of AIR's API) so the composition
     // model is testable without a platform IME. An empty `text` ends the
-    // composition. Measured on adl 51.4.1: AIR's own IME surface cannot be driven
-    // from AS3 here (IME.setCompositionString throws Error #2063, and the static
-    // reference addEventListener/setConversionMode is rejected by mxmlc), so this
-    // channel is the only way to exercise the state.
+    // composition. This is the channel SDL_TEXTEDITING feeds; flash.system.IME's
+    // setCompositionString/doConversion drive the SAME state from AS3 (see the IME
+    // block below), and on the repo's macOS baseline AIR's own surface throws Error
+    // #2063 unless a text field has focus (measured 51.4.1, stage 94·17).
     this.line('void Stage_dispatchTextEditing(void* _this, char* text, int start, int length) {');
     this.indent++;
     this.line('(void)_this;');
@@ -7614,6 +8874,96 @@ export class Emitter {
     this.line('as_set_focus((DisplayObject*)value);');
     this.indent--;
     this.line('}');
+    this.line('');
+    // flash.system.IME (TODO 遗留 L8148) — hand-written here (not in
+    // RUNTIME_PREAMBLE) because it needs the TextField composition helpers above.
+    //
+    // The class is static-only and its state lives in two file-scope globals; all
+    // stored mode strings are C literals, so nothing here can hold a heap pointer
+    // and no write barrier is needed. Behavior per the measurements recorded on the
+    // classMap entry in symbols.ts:
+    //   * no focused editable TextField -> the three operating methods throw
+    //     Error #2063 (the macOS 51.4.1 baseline, which measured that exact
+    //     unfocused case); compositionAbandoned() is a no-op there, as measured;
+    //   * with one -> they compose / commit / re-select / abandon OUR marked-text
+    //     preview (as_tf_set_comp), which is the documented semantics and what
+    //     Windows AIR does;
+    //   * conversionMode's setter takes the seven settable mode strings and rejects
+    //     null with #2007, anything else (incl. "UNKNOWN", which the reference
+    //     marks read-only) with #2063.
+    this.line('static bool ASC_ime_enabled = true;');
+    this.line('static char* ASC_ime_conversion_mode = (char*)"UNKNOWN";');
+    this.line('bool IME_get_enabled_static(void* _this) { (void)_this; return ASC_ime_enabled; }');
+    this.line('void IME_set_enabled_static(void* _this, bool value) { (void)_this; ASC_ime_enabled = value; }');
+    this.line('char* IME_get_conversionMode_static(void* _this) { (void)_this; return ASC_ime_conversion_mode; }');
+    this.line('void IME_set_conversionMode_static(void* _this, char* value) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('if (value == NULL) { as_throw(Error_new((char*)"Error #2007: Parameter mode must be non-null.", 2007)); return; }');
+    this.line('if (strcmp(value, "ALPHANUMERIC_FULL") == 0) { ASC_ime_conversion_mode = (char*)"ALPHANUMERIC_FULL"; return; }');
+    this.line('if (strcmp(value, "ALPHANUMERIC_HALF") == 0) { ASC_ime_conversion_mode = (char*)"ALPHANUMERIC_HALF"; return; }');
+    this.line('if (strcmp(value, "CHINESE") == 0) { ASC_ime_conversion_mode = (char*)"CHINESE"; return; }');
+    this.line('if (strcmp(value, "JAPANESE_HIRAGANA") == 0) { ASC_ime_conversion_mode = (char*)"JAPANESE_HIRAGANA"; return; }');
+    this.line('if (strcmp(value, "JAPANESE_KATAKANA_FULL") == 0) { ASC_ime_conversion_mode = (char*)"JAPANESE_KATAKANA_FULL"; return; }');
+    this.line('if (strcmp(value, "JAPANESE_KATAKANA_HALF") == 0) { ASC_ime_conversion_mode = (char*)"JAPANESE_KATAKANA_HALF"; return; }');
+    this.line('if (strcmp(value, "KOREAN") == 0) { ASC_ime_conversion_mode = (char*)"KOREAN"; return; }');
+    this.line('as_throw(Error_new((char*)"Error #2063: Error attempting to execute IME command.", 2063));');
+    this.indent--;
+    this.line('}');
+    // The composition target: the same focus/type gate the composition channel uses.
+    this.line('static TextField* as_ime_target(void) {');
+    this.indent++;
+    this.line('if (as_focus_obj == NULL || !as_is((void*)as_focus_obj, &TextField_vt)) return NULL;');
+    this.line('TextField* tf = (TextField*)as_focus_obj;');
+    this.line('if (!as_tf_is_input(tf)) return NULL;');
+    this.line('return tf;');
+    this.indent--;
+    this.line('}');
+    this.line('void IME_setCompositionString_static(char* composition) {');
+    this.indent++;
+    this.line('TextField* tf = as_ime_target();');
+    this.line('if (tf == NULL) { as_throw(Error_new((char*)"Error #2063: Error attempting to execute IME command.", 2063)); return; }');
+    // start/length stay "no selection" (-1/0): the whole composition is underlined
+    // and the IME's own selection only places the candidate window, which
+    // compositionSelectionChanged then updates.
+    this.line('as_tf_set_comp(tf, composition, -1, 0);');
+    this.indent--;
+    this.line('}');
+    this.line('void IME_doConversion_static(void) {');
+    this.indent++;
+    this.line('TextField* tf = as_ime_target();');
+    this.line('if (tf == NULL || tf->_comp == NULL) { as_throw(Error_new((char*)"Error #2063: Error attempting to execute IME command.", 2063)); return; }');
+    // We have no candidate list, so "select the first candidate" is the composition
+    // itself: commit it as the textInput payload and drop the preview. The copy is
+    // needed because dropping the preview frees the buffer we are reading.
+    this.line('size_t n = strlen(tf->_comp);');
+    this.line('char* committed = (char*)malloc(n + 1);');
+    this.line('if (committed == NULL) { as_throw(Error_new((char*)"Error #2063: Error attempting to execute IME command.", 2063)); return; }');
+    this.line('memcpy(committed, tf->_comp, n + 1);');
+    this.line('as_tf_set_comp(tf, NULL, -1, 0);');
+    this.line('as_tf_insert_text(tf, committed);');
+    this.line('free(committed);');
+    this.indent--;
+    this.line('}');
+    this.line('void IME_compositionSelectionChanged_static(int start, int end) {');
+    this.indent++;
+    this.line('TextField* tf = as_ime_target();');
+    this.line('if (tf == NULL || tf->_comp == NULL) { as_throw(Error_new((char*)"Error #2063: Error attempting to execute IME command.", 2063)); return; }');
+    this.line('tf->_comp_start = start;');
+    this.line('tf->_comp_len = end - start;');
+    this.line('if (tf->_comp_len < 0) tf->_comp_len = 0;');
+    this.indent--;
+    this.line('}');
+    this.line('void IME_compositionAbandoned_static(void) {');
+    this.indent++;
+    // No throw when nothing is focused or nothing is composed -- measured no-op.
+    this.line('TextField* tf = as_ime_target();');
+    this.line('if (tf != NULL) as_tf_set_comp(tf, NULL, -1, 0);');
+    this.indent--;
+    this.line('}');
+    // `public final class IME` has no public constructor: AIR throws #2012
+    // (measured message: "IME$ class cannot be instantiated.").
+    this.line('IME* IME_new(void) { as_throw(Error_new((char*)"Error #2012: IME$ class cannot be instantiated.", 2012)); return NULL; }');
     this.line('');
     // Stage 41: Stage now carries the desktop AIR stage properties as fields.
     // Defaults match AIR: white background, HIGH quality, TOP_LEFT align,
@@ -7709,17 +9059,23 @@ export class Emitter {
     this.line('return o;');
     this.indent--;
     this.line('}');
-    this.line('void KeyboardEvent_ctor(KeyboardEvent* o, char* type, bool bubbles, bool cancelable, int charCode, int keyCode) {');
+    // AIR's full 12-argument KeyboardEvent constructor: the three modifier flags the
+    // stage dispatch does not have (controlKey/commandKey/functionKey) are set by the
+    // caller, and keyLocation defaults to 0 (KeyLocation.STANDARD -- this backend does
+    // not distinguish the left/right instances of a key).
+    this.line('void KeyboardEvent_ctor(KeyboardEvent* o, char* type, bool bubbles, bool cancelable, int charCode, int keyCode, int keyLocation, bool ctrlKey, bool altKey, bool shiftKey, bool controlKey, bool commandKey, bool functionKey) {');
     this.indent++;
     this.line('Event_ctor((Event*)o, type, bubbles, cancelable);');
-    this.line('o->keyCode = keyCode; o->charCode = charCode;');
+    this.line('o->keyCode = keyCode; o->charCode = charCode; o->keyLocation = keyLocation;');
+    this.line('o->ctrlKey = ctrlKey; o->altKey = altKey; o->shiftKey = shiftKey;');
+    this.line('o->controlKey = controlKey; o->commandKey = commandKey; o->functionKey = functionKey;');
     this.indent--;
     this.line('}');
-    this.line('KeyboardEvent* KeyboardEvent_new(char* type, bool bubbles, bool cancelable, int charCode, int keyCode) {');
+    this.line('KeyboardEvent* KeyboardEvent_new(char* type, bool bubbles, bool cancelable, int charCode, int keyCode, int keyLocation, bool ctrlKey, bool altKey, bool shiftKey, bool controlKey, bool commandKey, bool functionKey) {');
     this.indent++;
     this.line('KeyboardEvent* o = (KeyboardEvent*)gc_alloc(GCT_CLASS, sizeof(KeyboardEvent));');
     this.line('o->vtable = &KeyboardEvent_vt;');
-    this.line('KeyboardEvent_ctor(o, type, bubbles, cancelable, charCode, keyCode);');
+    this.line('KeyboardEvent_ctor(o, type, bubbles, cancelable, charCode, keyCode, keyLocation, ctrlKey, altKey, shiftKey, controlKey, commandKey, functionKey);');
     this.line('return o;');
     this.indent--;
     this.line('}');
@@ -7781,8 +9137,8 @@ export class Emitter {
     // Event_ctor for the base fields and adds its own.
     this.line('void TimerEvent_ctor(TimerEvent* o, char* type, bool bubbles, bool cancelable) { Event_ctor((Event*)o, type, bubbles, cancelable); }');
     this.line('TimerEvent* TimerEvent_new(char* type, bool bubbles, bool cancelable) { TimerEvent* o = (TimerEvent*)gc_alloc(GCT_CLASS, sizeof(TimerEvent)); o->vtable = &TimerEvent_vt; TimerEvent_ctor(o, type, bubbles, cancelable); return o; }');
-    this.line('void ProgressEvent_ctor(ProgressEvent* o, char* type, bool bubbles, bool cancelable, unsigned int bytesLoaded, unsigned int bytesTotal) { Event_ctor((Event*)o, type, bubbles, cancelable); o->bytesLoaded = bytesLoaded; o->bytesTotal = bytesTotal; }');
-    this.line('ProgressEvent* ProgressEvent_new(char* type, bool bubbles, bool cancelable, unsigned int bytesLoaded, unsigned int bytesTotal) { ProgressEvent* o = (ProgressEvent*)gc_alloc(GCT_CLASS, sizeof(ProgressEvent)); o->vtable = &ProgressEvent_vt; ProgressEvent_ctor(o, type, bubbles, cancelable, bytesLoaded, bytesTotal); return o; }');
+    this.line('void ProgressEvent_ctor(ProgressEvent* o, char* type, bool bubbles, bool cancelable, double bytesLoaded, double bytesTotal) { Event_ctor((Event*)o, type, bubbles, cancelable); o->bytesLoaded = bytesLoaded; o->bytesTotal = bytesTotal; }');
+    this.line('ProgressEvent* ProgressEvent_new(char* type, bool bubbles, bool cancelable, double bytesLoaded, double bytesTotal) { ProgressEvent* o = (ProgressEvent*)gc_alloc(GCT_CLASS, sizeof(ProgressEvent)); o->vtable = &ProgressEvent_vt; ProgressEvent_ctor(o, type, bubbles, cancelable, bytesLoaded, bytesTotal); return o; }');
     // flash.events.VsyncStateChangeAvailabilityEvent (enhanced builtin). `available`
     // is AIR's own read-only property; `refreshRate` (Hz of the display the window
     // occupies) is OUR added field. Both are scalars, so no GC write barrier is
@@ -7800,6 +9156,13 @@ export class Emitter {
     // because a GC string is being stored into a class instance.
     this.line('void TextEvent_ctor(TextEvent* o, char* type, bool bubbles, bool cancelable, char* text) { Event_ctor((Event*)o, type, bubbles, cancelable); o->text = text; gc_write_barrier((void*)text); }');
     this.line('TextEvent* TextEvent_new(char* type, bool bubbles, bool cancelable, char* text) { TextEvent* o = (TextEvent*)gc_alloc(GCT_CLASS, sizeof(TextEvent)); o->vtable = &TextEvent_vt; TextEvent_ctor(o, type, bubbles, cancelable, text); return o; }');
+    // flash.events.IMEEvent (TODO 遗留 L8149): a TextEvent subclass, so `text` keeps
+    // its empty-string default; `imeClient` is an object slot and therefore needs the
+    // write barrier like every other GC pointer stored into a class instance. Nothing
+    // in this runtime dispatches one (there is no IME source), but user code can
+    // construct it exactly as AIR's 5-argument shape allows.
+    this.line('void IMEEvent_ctor(IMEEvent* o, char* type, bool bubbles, bool cancelable, char* text, Object* imeClient) { TextEvent_ctor((TextEvent*)o, type, bubbles, cancelable, text); o->imeClient = imeClient; gc_write_barrier((void*)imeClient); }');
+    this.line('IMEEvent* IMEEvent_new(char* type, bool bubbles, bool cancelable, char* text, Object* imeClient) { IMEEvent* o = (IMEEvent*)gc_alloc(GCT_CLASS, sizeof(IMEEvent)); o->vtable = &IMEEvent_vt; IMEEvent_ctor(o, type, bubbles, cancelable, text, imeClient); return o; }');
     // HTTPStatusEvent (flash.events, AIR): a response that carries a status line
     // reports it before PROGRESS/COMPLETE. `status` is set here; responseURL /
     // responseHeaders / redirected are filled by the URLLoader thunk through
@@ -7822,8 +9185,8 @@ export class Emitter {
     this.line('NetStatusEvent* NetStatusEvent_new(char* type, bool bubbles, bool cancelable, Object* info) { NetStatusEvent* o = (NetStatusEvent*)gc_alloc(GCT_CLASS, sizeof(NetStatusEvent)); o->vtable = &NetStatusEvent_vt; NetStatusEvent_ctor(o, type, bubbles, cancelable, info); return o; }');
     this.line('void AsyncErrorEvent_ctor(AsyncErrorEvent* o, char* type, bool bubbles, bool cancelable, char* text) { ErrorEvent_ctor((ErrorEvent*)o, type, bubbles, cancelable, text); }');
     this.line('AsyncErrorEvent* AsyncErrorEvent_new(char* type, bool bubbles, bool cancelable, char* text) { AsyncErrorEvent* o = (AsyncErrorEvent*)gc_alloc(GCT_CLASS, sizeof(AsyncErrorEvent)); o->vtable = &AsyncErrorEvent_vt; AsyncErrorEvent_ctor(o, type, bubbles, cancelable, text); return o; }');
-    this.line('void ContextMenuEvent_ctor(ContextMenuEvent* o, char* type, bool bubbles, bool cancelable, Object* mouseTarget, InteractiveObject* contextMenuOwner) { (void)mouseTarget; (void)contextMenuOwner; Event_ctor((Event*)o, type, bubbles, cancelable); }');
-    this.line('ContextMenuEvent* ContextMenuEvent_new(char* type, bool bubbles, bool cancelable, Object* mouseTarget, InteractiveObject* contextMenuOwner) { ContextMenuEvent* o = (ContextMenuEvent*)gc_alloc(GCT_CLASS, sizeof(ContextMenuEvent)); o->vtable = &ContextMenuEvent_vt; ContextMenuEvent_ctor(o, type, bubbles, cancelable, mouseTarget, contextMenuOwner); return o; }');
+    this.line('void ContextMenuEvent_ctor(ContextMenuEvent* o, char* type, bool bubbles, bool cancelable, InteractiveObject* mouseTarget, InteractiveObject* contextMenuOwner) { Event_ctor((Event*)o, type, bubbles, cancelable); o->mouseTarget = mouseTarget; gc_write_barrier((void*)mouseTarget); o->contextMenuOwner = contextMenuOwner; gc_write_barrier((void*)contextMenuOwner); }');
+    this.line('ContextMenuEvent* ContextMenuEvent_new(char* type, bool bubbles, bool cancelable, InteractiveObject* mouseTarget, InteractiveObject* contextMenuOwner) { ContextMenuEvent* o = (ContextMenuEvent*)gc_alloc(GCT_CLASS, sizeof(ContextMenuEvent)); o->vtable = &ContextMenuEvent_vt; ContextMenuEvent_ctor(o, type, bubbles, cancelable, mouseTarget, contextMenuOwner); return o; }');
     // ---- flash.ui.ContextMenu family (stage 110) ----
     // Faithful data model (temp/constprobe on adl 51.4.1): a fresh menu owns an
     // empty customItems array and a ContextMenuBuiltInItems instance, and a display
@@ -7831,14 +9194,18 @@ export class Emitter {
     // is ever shown here, so MENU_SELECT / MENU_ITEM_SELECT never fire.
     this.line('void ContextMenuBuiltInItems_ctor(ContextMenuBuiltInItems* o) { Object_ctor((Object*)o); }');
     this.line('ContextMenuBuiltInItems* ContextMenuBuiltInItems_new(void) { ContextMenuBuiltInItems* o = (ContextMenuBuiltInItems*)gc_alloc(GCT_CLASS, sizeof(ContextMenuBuiltInItems)); o->vtable = &ContextMenuBuiltInItems_vt; ContextMenuBuiltInItems_ctor(o); return o; }');
-    this.line('void ContextMenuItem_ctor(ContextMenuItem* o, char* caption, bool separatorBefore, bool enabled, bool visible, bool isSeparator) {');
+    // ContextMenuItem extends NativeMenuItem in AIR: `caption` is the AS3 name of the
+    // display string NativeMenuItem calls `label`, so the super ctor gets the caption
+    // (which sets `label`) and we mirror it into our own `caption` slot. `enabled` /
+    // `isSeparator` belong to NativeMenuItem and are inherited, not redeclared.
+    this.line('void ContextMenuItem_ctor(ContextMenuItem* o, char* caption, bool separatorBefore, bool enabled, bool visible) {');
     this.indent++;
-    this.line('EventDispatcher_ctor((EventDispatcher*)o, NULL);');
+    this.line('NativeMenuItem_ctor((NativeMenuItem*)o, caption, false);');
     this.line('o->caption = caption; gc_write_barrier((void*)caption);');
-    this.line('o->separatorBefore = separatorBefore; o->enabled = enabled; o->visible = visible; o->isSeparator = isSeparator;');
+    this.line('o->separatorBefore = separatorBefore; o->enabled = enabled; o->visible = visible;');
     this.indent--;
     this.line('}');
-    this.line('ContextMenuItem* ContextMenuItem_new(char* caption, bool separatorBefore, bool enabled, bool visible, bool isSeparator) { ContextMenuItem* o = (ContextMenuItem*)gc_alloc(GCT_CLASS, sizeof(ContextMenuItem)); o->vtable = &ContextMenuItem_vt; ContextMenuItem_ctor(o, caption, separatorBefore, enabled, visible, isSeparator); return o; }');
+    this.line('ContextMenuItem* ContextMenuItem_new(char* caption, bool separatorBefore, bool enabled, bool visible) { ContextMenuItem* o = (ContextMenuItem*)gc_alloc(GCT_CLASS, sizeof(ContextMenuItem)); o->vtable = &ContextMenuItem_vt; ContextMenuItem_ctor(o, caption, separatorBefore, enabled, visible); return o; }');
     this.line('void ContextMenu_ctor(ContextMenu* o) {');
     this.indent++;
     this.line('EventDispatcher_ctor((EventDispatcher*)o, NULL);');
@@ -7851,7 +9218,7 @@ export class Emitter {
     // addItem appends unless the item is already present (the measured AIR behaviour
     // was ArgumentError #2004 for a duplicate, which is the closest thing to a
     // documented contract); removeItem/containsItem scan customItems by identity.
-    this.line('static int as_ctxmenu_index(ContextMenu* o, ContextMenuItem* item) {');
+    this.line('static int as_ctxmenu_index(ContextMenu* o, NativeMenuItem* item) {');
     this.indent++;
     this.line('int i;');
     this.line('if (o->customItems == NULL || item == NULL) return -1;');
@@ -7859,23 +9226,65 @@ export class Emitter {
     this.line('return -1;');
     this.indent--;
     this.line('}');
-    this.line('void ContextMenu_addItem(void* _this, ContextMenuItem* item) {');
+    this.line('NativeMenuItem* ContextMenu_addItem(void* _this, NativeMenuItem* item) {');
     this.indent++;
     this.line('ContextMenu* o = (ContextMenu*)_this;');
-    this.line('if (item == NULL) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }');
-    this.line('if (as_ctxmenu_index(o, item) >= 0) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }');
+    this.line('if (item == NULL) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return NULL; }');
+    this.line('if (as_ctxmenu_index(o, item) >= 0) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return NULL; }');
     this.line('as_array_push(o->customItems, as_v_obj((void*)item));');
+    this.line('return item;');
     this.indent--;
     this.line('}');
-    this.line('void ContextMenu_removeItem(void* _this, ContextMenuItem* item) {');
+    this.line('NativeMenuItem* ContextMenu_removeItem(void* _this, NativeMenuItem* item) {');
     this.indent++;
     this.line('ContextMenu* o = (ContextMenu*)_this;');
     this.line('int i = as_ctxmenu_index(o, item);');
-    this.line('if (i < 0) return;');
+    this.line('if (i < 0) return NULL;');
     this.line('as_array_removeAt(o->customItems, i);');
+    this.line('return item;');
     this.indent--;
     this.line('}');
-    this.line('bool ContextMenu_containsItem(void* _this, ContextMenuItem* item) { return as_ctxmenu_index((ContextMenu*)_this, item) >= 0; }');
+    this.line('bool ContextMenu_containsItem(void* _this, NativeMenuItem* item) { return as_ctxmenu_index((ContextMenu*)_this, item) >= 0; }');
+    // getItemAt(index): the custom item at that position (ContextMenuItem), or
+    // null when out of range -- AIR's documented behaviour. numItems counts the
+    // custom items only, matching this list.
+    // numItems: AIR counts the built-in items AND the custom ones; this build
+    // models no built-in menu items at all (hideBuiltInItems above is a no-op),
+    // so the count is exactly the list getItemAt() indexes. A caller that only
+    // asks "does this menu have items" (UserItemRenderers.getContextMenu) and a
+    // caller that asks for the last one (numItems - 1) both get the same answer
+    // they would from AIR, because the last custom item is last in both models.
+    this.line('int ContextMenu_get_numItems(void* _this) {');
+    this.indent++;
+    this.line('ContextMenu* o = (ContextMenu*)_this;');
+    this.line('return (o->customItems == NULL) ? 0 : o->customItems->length;');
+    this.indent--;
+    this.line('}');
+    // `items` IS `customItems` in AIR ("Using this property is equivalent to using
+    // the customItems property"), so both accessors are exactly the `customItems`
+    // slot -- no second list is kept.
+    this.line('as_array* ContextMenu_get_items(void* _this) {');
+    this.indent++;
+    this.line('ContextMenu* o = (ContextMenu*)_this;');
+    this.line('if (o->customItems == NULL) { o->customItems = as_array_new(); gc_write_barrier((void*)o->customItems); }');
+    this.line('return o->customItems;');
+    this.indent--;
+    this.line('}');
+    this.line('void ContextMenu_set_items(void* _this, as_array* value) {');
+    this.indent++;
+    this.line('ContextMenu* o = (ContextMenu*)_this;');
+    this.line('if (value == NULL) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }');
+    this.line('o->customItems = value; gc_write_barrier((void*)value);');
+    this.indent--;
+    this.line('}');
+    this.line('NativeMenuItem* ContextMenu_getItemAt(void* _this, int index) {');
+    this.indent++;
+    this.line('ContextMenu* o = (ContextMenu*)_this;');
+    this.line('if (o->customItems == NULL || index < 0 || index >= o->customItems->length) return NULL;');
+    this.line('as_value v = o->customItems->data[index];');
+    this.line('return (v.tag == 4) ? (NativeMenuItem*)v.ptr : NULL;');
+    this.indent--;
+    this.line('}');
     this.line('ContextMenu* ContextMenu_clone(void* _this) {');
     this.indent++;
     this.line('ContextMenu* o = (ContextMenu*)_this;');
@@ -8228,7 +9637,7 @@ export class Emitter {
     this.line('unsigned enc_len = as_job_len(job);');
     this.line('if (enc != NULL && enc_len > 0) bd->image = as_skia_image_from_bytes(enc, enc_len);');
     this.line('else if (li->url != NULL) bd->image = as_skia_image_from_file(li->url);');
-    this.line('Bitmap* bmp = Bitmap_new(bd);');
+    this.line('Bitmap* bmp = Bitmap_new(bd, (char*)"auto", false);');
     this.line('o->content = (DisplayObject*)bmp;');
     this.line('gc_write_barrier((void*)bmp);');
     // AIR adds the loaded content as the Loader's OWN child (loader.numChildren
@@ -8260,6 +9669,10 @@ export class Emitter {
     // unload() detaches the content the way AIR does: the loaded child leaves the
     // Loader's child list (and so stops rendering) and content goes back to null.
     this.line('void Loader_unload(void* _this) { Loader* o = (Loader*)_this; if (o->content != NULL) DisplayObjectContainer_removeChild((void*)o, o->content); o->content = NULL; }');
+    // unloadAndStop(gc): same observable effect as unload() here -- the loaded
+    // clip is a baked display object that owns no timeline of its own, so there
+    // is nothing else to stop (documented deviation, README-CN.md).
+    this.line('void Loader_unloadAndStop(void* _this, bool gc) { (void)gc; Loader_unload(_this); }');
     this.line('void Loader_loadBytes(void* _this, ByteArray* bytes, LoaderContext* context) {');
     this.indent++;
     this.line('Loader* o = (Loader*)_this;');
@@ -8680,7 +10093,44 @@ export class Emitter {
     this.line('}');
     this.line('void Camera_ctor(Camera* o) { EventDispatcher_ctor((EventDispatcher*)o, NULL); }');
     this.line('Camera* Camera_new(void) { Camera* o = (Camera*)gc_alloc(GCT_CLASS, sizeof(Camera)); o->vtable = &Camera_vt; Camera_ctor(o); return o; }');
-    this.line('Camera* Camera_getCamera_static(char* name) { (void)name; return NULL; }');
+    this.line('Camera* Camera_getCamera_static(char* name) { (void)name; as_shell_unsupported("Camera.getCamera"); return NULL; }');
+    // No camera backend: getCamera() finds nothing, and the two documented readers
+    // report the missing device once (as_shell_unsupported) instead of silently
+    // pretending an empty name / an empty camera list is the truth of the machine.
+    // The app guards every use with `if (camera)`, and its own camera picker just
+    // shows no entries.
+    this.line('char* Camera_get_name(void* _this) { (void)_this; as_shell_unsupported("Camera.name"); return (char*)""; }');
+    this.line('as_array* Camera_get_names_static(void* _this) { (void)_this; as_shell_unsupported("Camera.names"); return as_array_new(); }');
+    // ---- flash.external.ExtensionContext + flash.events.StatusEvent (stage 135) ----
+    // The AS3 half of the AIR native-extension bridge, as a SHELL. No FRE host is
+    // linked here, so a context carries its extension id, is a real EventDispatcher
+    // (callers addEventListener(StatusEvent.STATUS, ...) on it directly, and that
+    // must not dereference NULL), call() answers null -- the honest "no native side"
+    // reply (§1.5) -- and dispose() returns true. getExtensionDirectory() returns a
+    // live (pathless) File so callers can inspect it instead of crashing; nothing
+    // is ever dispatched, so no StatusEvent is fabricated.
+    this.line('void StatusEvent_ctor(StatusEvent* o, char* type, bool bubbles, bool cancelable, char* code, char* level) { Event_ctor((Event*)o, type, bubbles, cancelable); o->code = code; gc_write_barrier((void*)code); o->level = level; gc_write_barrier((void*)level); }');
+    this.line('StatusEvent* StatusEvent_new(char* type, bool bubbles, bool cancelable, char* code, char* level) { StatusEvent* o = (StatusEvent*)gc_alloc(GCT_CLASS, sizeof(StatusEvent)); o->vtable = &StatusEvent_vt; StatusEvent_ctor(o, type, bubbles, cancelable, code, level); return o; }');
+    this.line('void StatusEvent_updateAfterEvent(void* _this) { (void)_this; }');
+    // updateAfterEvent() on the pointer/keyboard-rate event classes AIR declares it
+    // on (see symbols.ts): a rendering hint this runtime cannot honour from inside a
+    // listener -- it paints from its own frame loop -- so the body is a no-op rather
+    // than a fabricated redraw. Same shape as the StatusEvent one above.
+    this.line('void MouseEvent_updateAfterEvent(void* _this) { (void)_this; }');
+    this.line('void KeyboardEvent_updateAfterEvent(void* _this) { (void)_this; }');
+    this.line('void TouchEvent_updateAfterEvent(void* _this) { (void)_this; }');
+    this.line('void TimerEvent_updateAfterEvent(void* _this) { (void)_this; }');
+    this.line('void ExtensionContext_ctor(ExtensionContext* o, char* extensionID, char* contextType) { EventDispatcher_ctor((EventDispatcher*)o, NULL); (void)contextType; o->_extID = extensionID; gc_write_barrier((void*)extensionID); o->actionScriptData = NULL; }');
+    this.line('ExtensionContext* ExtensionContext_new(char* extensionID, char* contextType) { ExtensionContext* o = (ExtensionContext*)gc_alloc(GCT_CLASS, sizeof(ExtensionContext)); o->vtable = &ExtensionContext_vt; ExtensionContext_ctor(o, extensionID, contextType); return o; }');
+    this.line('char* ExtensionContext_get_extensionID(void* _this) { return ((ExtensionContext*)_this)->_extID; }');
+    // AIR types call() as `*`, so the ANE wrapper sources may hand its result to ANY
+    // parameter without a coercion error (ANEQcloud.as:179 `return _extCtx.call(...)`
+    // in a `:Boolean` method). No FRe host is loaded, so the honest answer stays the
+    // null box -- as_shell_unsupported already reported the omission.
+    this.line('as_value ExtensionContext_call(void* _this, char* functionName, as_array* args) { (void)_this; (void)functionName; (void)args; as_shell_unsupported("ExtensionContext.call"); return as_v_null(); }');
+    this.line('bool ExtensionContext_dispose(void* _this) { (void)_this; return true; }');
+    this.line('ExtensionContext* ExtensionContext_createExtensionContext_static(char* extensionID, char* contextType) { return ExtensionContext_new(extensionID, contextType); }');
+    this.line('File* ExtensionContext_getExtensionDirectory_static(char* extensionID) { (void)extensionID; return File_new(NULL); }');
     // ---- flash.net.NetConnection / NetStream + flash.media.Video (stage 110) ----
     // The transport surface away3d's SimpleVideoPlayer drives. There is no media
     // transport and no video decoder in this subset: the connection state machine
@@ -10388,6 +11838,9 @@ export class Emitter {
     // constant classes). Mouse.hide/show toggle a file-scope visibility flag.
     this.line('void Keyboard_ctor(Keyboard* o) { Object_ctor((Object*)o); }');
     this.line('Keyboard* Keyboard_new(void) { Keyboard* o = (Keyboard*)gc_alloc(GCT_CLASS, sizeof(Keyboard)); o->vtable = &Keyboard_vt; Keyboard_ctor(o); return o; }');
+    // Keyboard.isAccessible(): a single-domain native build has no cross-domain
+    // keystroke restriction, so the last key press is always readable.
+    this.line('bool Keyboard_isAccessible_static(void) { return true; }');
     this.line('void Mouse_ctor(Mouse* o) { Object_ctor((Object*)o); }');
     this.line('Mouse* Mouse_new(void) { Mouse* o = (Mouse*)gc_alloc(GCT_CLASS, sizeof(Mouse)); o->vtable = &Mouse_vt; Mouse_ctor(o); return o; }');
     this.line('static bool as_mouse_visible = true;');
@@ -10502,6 +11955,122 @@ export class Emitter {
     this.line('char* File_get_url(void* _this) { File* o = (File*)_this; return (o->nativePath == NULL) ? (char*)"file://" : as_str_concat((char*)"file://", o->nativePath); }');
     this.line('bool File_get_exists(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_exists(o->nativePath); }');
     this.line('bool File_get_isDirectory(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_is_dir(o->nativePath); }');
+    // size: the length in bytes, measured with stat() (AIR's File.size is a
+    // Number). A path that does not exist reports 0, matching AIR; st_size is an
+    // off_t, so it is widened to double rather than truncated to int (a >2 GB file
+    // must not go negative).
+    this.line('double File_get_size(void* _this) { File* o = (File*)_this; if (o->nativePath == NULL) return 0.0; struct stat st; if (stat(o->nativePath, &st) != 0) return 0.0; return (double)st.st_size; }');
+    // spaceAvailable: the free bytes on the volume that holds this path. AIR asks
+    // the OS for it, so we do too -- GetDiskFreeSpaceExA on Windows, statvfs() on
+    // POSIX (bavail*frsize is the space an unprivileged process may actually use,
+    // which is what AIR reports). A path the OS cannot resolve, and a platform
+    // with no volume concept (wasm), report 0: the app only tests truthiness
+    // ("is there room for the recording") and a fabricated number would be worse
+    // than a real "none".
+    this.line('static double as_file_space_available(const char* p) {');
+    this.indent++;
+    this.line('if (p == NULL) return 0.0;');
+    this.line('#ifdef _WIN32');
+    this.indent++;
+    this.line('ULARGE_INTEGER freeAvail;');
+    this.line('freeAvail.QuadPart = 0;');
+    this.line('if (!GetDiskFreeSpaceExA(p, &freeAvail, NULL, NULL)) return 0.0;');
+    this.line('return (double)freeAvail.QuadPart;');
+    this.indent--;
+    this.line('#elif !defined(__wasi__) && !defined(__EMSCRIPTEN__)');
+    this.indent++;
+    this.line('struct statvfs sv;');
+    this.line('if (statvfs(p, &sv) != 0) return 0.0;');
+    this.line('return (double)sv.f_bavail * (double)sv.f_frsize;');
+    this.indent--;
+    this.line('#else');
+    this.indent++;
+    this.line('return 0.0;');
+    this.indent--;
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
+    this.line('double File_get_spaceAvailable(void* _this) { File* o = (File*)_this; return as_file_space_available(o->nativePath); }');
+    // name: the last component of the path (AIR's File.name). BOTH separators count,
+    // so a Windows nativePath ("C:\\Users\\x\\a.log") names the file and not the
+    // drive, and a trailing separator is ignored ("/a/b/" names "b").
+    this.line('char* File_get_name(void* _this) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('if (o->nativePath == NULL) return (char*)"";');
+    this.line('const char* s = o->nativePath;');
+    this.line('int n = (int)strlen(s);');
+    this.line('while (n > 1 && (s[n - 1] == \'/\' || s[n - 1] == \'\\\\\')) n--;');
+    this.line('int start = 0;');
+    this.line('for (int i = n - 1; i >= 0; i--) if (s[i] == \'/\' || s[i] == \'\\\\\') { start = i + 1; break; }');
+    this.line('char* out = as_str_alloc((size_t)(n - start) + 1);');
+    this.line('memcpy(out, s + start, (size_t)(n - start));');
+    this.line('out[n - start] = \'\\0\';');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    // extension: the text after the last dot of the NAME, or "" when there is none.
+    // A dot-file (".DS_Store") has no extension in AIR (not "DS_Store"), and the
+    // search starts after the last separator so "a.b/c" is "" while "a/b.c" is "c".
+    this.line('char* File_get_extension(void* _this) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('if (o->nativePath == NULL) return (char*)"";');
+    this.line('const char* s = o->nativePath;');
+    this.line('int n = (int)strlen(s);');
+    this.line('while (n > 1 && (s[n - 1] == \'/\' || s[n - 1] == \'\\\\\')) n--;');
+    this.line('int base = 0;');
+    this.line('for (int i = n - 1; i >= 0; i--) if (s[i] == \'/\' || s[i] == \'\\\\\') { base = i + 1; break; }');
+    this.line('int dot = -1;');
+    this.line('for (int i = n - 1; i > base; i--) if (s[i] == \'.\') { dot = i; break; }');
+    this.line('if (dot < 0) return (char*)"";');
+    this.line('char* out = as_str_alloc((size_t)(n - dot - 1) + 1);');
+    this.line('memcpy(out, s + dot + 1, (size_t)(n - dot - 1));');
+    this.line('out[n - dot - 1] = \'\\0\';');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    // type: AIR's FileReference.type on Windows/Linux is the file's extension; the
+    // form published AIR apps rely on is dot-prefixed and lower-case, so this is
+    // "." + extension (lower-cased), or "" when the name has no dot. Built on
+    // File_get_extension, so the separator/dot-file rules stay in one place.
+    this.line('char* File_get_type(void* _this) {');
+    this.indent++;
+    this.line('char* ext = File_get_extension(_this);');
+    this.line('int n = (int)strlen(ext);');
+    this.line('if (n == 0) return (char*)"";');
+    this.line('char* out = as_str_alloc((size_t)n + 2);');
+    this.line('out[0] = \'.\';');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('char c = ext[i];');
+    this.line('if (c >= \'A\' && c <= \'Z\') c = (char)(c + 32);');
+    this.line('out[i + 1] = c;');
+    this.indent--;
+    this.line('}');
+    this.line('out[n + 1] = \'\\0\';');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    // parent: the containing directory as a File (AIR's File.parent). NULL at the
+    // filesystem root, exactly like AIR -- a caller that dereferences it gets the
+    // usual catchable TypeError #1009 rather than a wrong path.
+    this.line('File* File_get_parent(void* _this) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('if (o->nativePath == NULL) return NULL;');
+    this.line('const char* s = o->nativePath;');
+    this.line('int n = (int)strlen(s);');
+    this.line('while (n > 1 && (s[n - 1] == \'/\' || s[n - 1] == \'\\\\\')) n--;');
+    this.line('int cut = -1;');
+    this.line('for (int i = n - 1; i > 0; i--) if (s[i] == \'/\' || s[i] == \'\\\\\') { cut = i; break; }');
+    this.line('if (cut <= 0) return NULL;');
+    this.line('char* out = as_str_alloc((size_t)cut + 1);');
+    this.line('memcpy(out, s, (size_t)cut);');
+    this.line('out[cut] = \'\\0\';');
+    this.line('return File_new(out);');
+    this.indent--;
+    this.line('}');
     // isHidden: on POSIX a file is hidden when its basename starts with a dot
     // (matches the .DS_Store filtering the demo relies on).
     this.line('bool File_get_isHidden(void* _this) {');
@@ -10509,7 +12078,7 @@ export class Emitter {
     this.line('File* o = (File*)_this;');
     this.line('if (o->nativePath == NULL) return false;');
     this.line('const char* base = o->nativePath;');
-    this.line('for (const char* p = o->nativePath; *p; p++) if (*p == \'/\') base = p + 1;');
+    this.line('for (const char* p = o->nativePath; *p; p++) if (*p == \'/\' || *p == \'\\\\\') base = p + 1;');
     this.line('return base[0] == \'.\';');
     this.indent--;
     this.line('}');
@@ -10517,6 +12086,65 @@ export class Emitter {
     this.line('void File_createDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) as_mkdirs(o->nativePath); }');
     this.line('void File_deleteFile(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) remove(o->nativePath); }');
     this.line('void File_deleteDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) as_rmdir_one(o->nativePath); }');
+    // File.moveTo(newFile, overwrite = false, force = false): rename() the path.
+    // rename() is the real operation AIR performs (atomic within one volume); the two
+    // failure modes AIR raises IOError for are reported on stderr instead of thrown,
+    // because an IOError thrown here would unwind through the caller's event handler.
+    this.line('void File_moveTo(void* _this, File* target, bool overwrite, bool force) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('if (target == NULL || o->nativePath == NULL || target->nativePath == NULL) return;');
+    this.line('if (!as_path_exists(o->nativePath)) { as_shell_unsupported("File.moveTo with a source path that does not exist (AIR throws IOError)"); return; }');
+    this.line('if (as_path_exists(target->nativePath) && !(overwrite || force)) { as_shell_unsupported("File.moveTo onto an existing path with overwrite/force false (AIR throws IOError)"); return; }');
+    // A cross-volume move makes rename() fail (Windows: EXDEV-style failure); it is
+    // reported rather than silently copied, so a caller is never told a move happened
+    // when the file is still at the old path.
+    this.line('if (rename(o->nativePath, target->nativePath) != 0) { as_shell_unsupported("File.moveTo across volumes (rename failed)"); return; }');
+    // AIR: the receiver now denotes the new location.
+    this.line('o->nativePath = target->nativePath;');
+    this.line('gc_write_barrier((void*)o->nativePath);');
+    this.indent--;
+    this.line('}');
+    // The async half of the File API. AIR delivers the result as an event, so the
+    // listing is computed synchronously and the event is dispatched from the same
+    // call: every caller in the wild registers its listener BEFORE it asks (that
+    // is the only pattern that works in AIR too), so the delivery order that
+    // matters is preserved. `deleteDirectoryAsync` ignores its flag argument like
+    // AIR does when the directory is already empty; both deletes report COMPLETE.
+    this.line('void File_getDirectoryListingAsync(void* _this) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)FileListEvent_new((char*)"directoryListing", false, false, o, File_getDirectoryListing(_this)));');
+    this.indent--;
+    this.line('}');
+    this.line('void File_deleteFileAsync(void* _this) {');
+    this.indent++;
+    this.line('File_deleteFile(_this);');
+    this.line('EventDispatcher_dispatchEvent((void*)_this, Event_new((char*)"complete", false, false));');
+    this.indent--;
+    this.line('}');
+    // File.cancel(): nothing is ever in flight (every async member here completes
+    // synchronously), so this is honestly a no-op.
+    this.line('void File_cancel(void* _this) { (void)_this; }');
+    this.line('void File_deleteDirectoryAsync(void* _this, bool deleteDirectory) {');
+    this.indent++;
+    this.line('(void)deleteDirectory;');
+    this.line('File_deleteDirectory(_this);');
+    this.line('EventDispatcher_dispatchEvent((void*)_this, Event_new((char*)"complete", false, false));');
+    this.indent--;
+    this.line('}');
+    // No backend here: a native file dialog / the OS shell. These report
+    // themselves once (stderr) instead of silently returning, so a flow that
+    // depends on one is visibly stalled rather than mysteriously empty.
+    this.line('void File_browseForDirectory(void* _this, char* title) { (void)_this; (void)title; as_shell_unsupported((char*)"flash.filesystem.File.browseForDirectory"); }');
+    this.line('void File_browseForOpen(void* _this, char* title, as_array* typeFilter) { (void)_this; (void)title; (void)typeFilter; as_shell_unsupported((char*)"flash.filesystem.File.browseForOpen"); }');
+    this.line('void File_openWithDefaultApplication(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.filesystem.File.openWithDefaultApplication"); }');
+    // File.upload(request, fieldName, testUpload): POST the file's contents as
+    // multipart/form-data. There is no HTTP request backend in this build, so the
+    // call reports itself once (stderr) and dispatches NOTHING -- the upload cannot
+    // silently "succeed", which is what an app waiting on
+    // DataEvent.UPLOAD_COMPLETE_DATA would otherwise conclude.
+    this.line('void File_upload(void* _this, URLRequest* request, char* uploadDataFieldName, bool testUpload) { (void)_this; (void)request; (void)uploadDataFieldName; (void)testUpload; as_shell_unsupported((char*)"flash.filesystem.File.upload (no HTTP upload backend in this build)"); }');
     // getDirectoryListing: list a directory's children as File objects (skipping
     // . and ..), used by AssetManager to recursively enqueue folder contents.
     this.line('as_array* File_getDirectoryListing(void* _this) {');
@@ -11115,6 +12743,20 @@ export class Emitter {
     this.line('double ia, ib, ic, id, itx, ity;');
     this.line('if (!as_mat_invert(a, b, c, d, tx, ty, &ia, &ib, &ic, &id, &itx, &ity)) return NULL;');
     this.line('double lx = ia * x + ic * y + itx, ly = ib * x + id * y + ity;');
+    // DisplayObject.scrollRect splits the test in two, exactly as the renderer does:
+    // a point outside the rectangle is outside the CLIPPED subtree (nothing there
+    // is on screen, so nothing there can be hit), while the children are tested in
+    // the content space the -x/-y shift produces -- folded into the matrix handed
+    // to each child, so the whole subtree stays consistent.
+    this.line('double oa = a, ob = b, oc = c, od = d, otx = tx, oty = ty;');
+    this.line('if (o->_scroll_rect != NULL) {');
+    this.indent++;
+    this.line('Rectangle* sr = o->_scroll_rect;');
+    this.line('if (lx < sr->x || ly < sr->y || lx > sr->x + sr->width || ly > sr->y + sr->height) return NULL;');
+    this.line('otx -= oa * sr->x + oc * sr->y;');
+    this.line('oty -= ob * sr->x + od * sr->y;');
+    this.indent--;
+    this.line('}');
     this.line('if (as_is(obj, &DisplayObjectContainer_vt)) {');
     this.indent++;
     this.line('DisplayObjectContainer* cc = (DisplayObjectContainer*)obj;');
@@ -11127,7 +12769,7 @@ export class Emitter {
     this.line('double ca, cb, ccn, cd, ctx, cty;');
     this.line('as_do_matrix(ch, &ca, &cb, &ccn, &cd, &ctx, &cty);');
     this.line('double ga, gb, gc, gd, gtx, gty;');
-    this.line('as_mat_mul(a, b, c, d, tx, ty, ca, cb, ccn, cd, ctx, cty, &ga, &gb, &gc, &gd, &gtx, &gty);');
+    this.line('as_mat_mul(oa, ob, oc, od, otx, oty, ca, cb, ccn, cd, ctx, cty, &ga, &gb, &gc, &gd, &gtx, &gty);');
     this.line('void* res = as_pick_hit_m(ch, x, y, ga, gb, gc, gd, gtx, gty);');
     this.line('if (res != NULL) return res;');
     this.indent--;
@@ -11305,6 +12947,18 @@ export class Emitter {
     this.line('static int ASC_mouse_down = 0;');
     this.line('static TextField* drag_tf = NULL;');
     this.line('static int drag_anchor = -1;');
+    // ---- Sprite.startDrag/stopDrag ----
+    // AIR's drag follows the pointer until stopDrag() is called -- a mouseUp does NOT
+    // end it (that is why the documented recipe calls stopDrag from a mouseUp
+    // listener) -- so this state outlives the event and is a GC root (see
+    // gc_mark_user_roots). The pointer is mapped into the dragged object's PARENT
+    // space, since that is the space its x/y live in; `ASC_drag_off_*` is the
+    // object-to-pointer offset captured at startDrag (AIR's lockCenter:false), and
+    // lockCenter:true pins the object's registration point to the pointer instead.
+    this.line('static void* ASC_drag_obj = NULL;');
+    this.line('static int ASC_drag_lock = 0;');
+    this.line('static Rectangle* ASC_drag_bounds = NULL;');
+    this.line('static double ASC_drag_off_x = 0.0, ASC_drag_off_y = 0.0;');
     this.line('void Stage_dispatchMouse(void* _this, double x, double y, char* type) {');
     this.indent++;
     // Record the live pointer before dispatching: a SimpleButton picks which of its
@@ -11312,6 +12966,11 @@ export class Emitter {
     // readable outside the event. Living here means the AS3 test hook
     // Stage.dispatchMouse(x, y, type) drives the states too (temp/btnstate).
     this.line('ASC_mouse_x = x; ASC_mouse_y = y; ASC_mouse_has = 1;');
+    // An active startDrag() follows the pointer BEFORE the event is dispatched, so a
+    // mouseMove listener already sees the object at its new position (AIR moves the
+    // object as part of handling the move) -- including the very first move after
+    // startDrag, which is why the position update is not gated on the type.
+    this.line('as_drag_follow(x, y);');
     this.line('if (strcmp(type, "mouseDown") == 0) ASC_mouse_down = 1;');
     this.line('else if (strcmp(type, "mouseUp") == 0) ASC_mouse_down = 0;');
     this.line('void* target = as_pick_hit(_this, x, y);');
@@ -11413,13 +13072,90 @@ export class Emitter {
     this.line('EventDispatcher_dispatchEvent(target, (Event*)evt);');
     this.indent--;
     this.line('}');
-    // InteractiveObject.mouseX/mouseY: the live pointer position expressed in the
-    // object's own coordinate space. The pointer is tracked in stage coordinates
-    // (ASC_mouse_x/y above), so the transform chain is inverted the same way the
-    // TextField hit math does it. Before the first mouse event there is no known
-    // pointer, and 0 is reported (the object-local origin).
-    this.line('double InteractiveObject_get_mouseX(void* _this) { if (!ASC_mouse_has) return 0.0; double lx = 0.0, ly = 0.0; as_local_point((DisplayObject*)_this, ASC_mouse_x, ASC_mouse_y, &lx, &ly); return lx; }');
-    this.line('double InteractiveObject_get_mouseY(void* _this) { if (!ASC_mouse_has) return 0.0; double lx = 0.0, ly = 0.0; as_local_point((DisplayObject*)_this, ASC_mouse_x, ASC_mouse_y, &lx, &ly); return ly; }');
+    // DisplayObject.mouseX/mouseY: the live pointer position expressed in the
+    // object's own coordinate space. AIR declares these on DisplayObject (a
+    // DisplayObject-typed receiver reads them; InteractiveObject merely inherits),
+    // so the bodies carry the DisplayObject_ prefix like every other member of
+    // that class. The pointer is tracked in stage coordinates (ASC_mouse_x/y,
+    // fed by the window glue and by the Stage.dispatchMouse test hook), so the
+    // transform chain is inverted the same way the TextField hit math does it.
+    // Before the first mouse event there is no known pointer, and 0 is reported
+    // (the object-local origin).
+    this.line('double DisplayObject_get_mouseX(void* _this) { if (!ASC_mouse_has) return 0.0; double lx = 0.0, ly = 0.0; as_local_point((DisplayObject*)_this, ASC_mouse_x, ASC_mouse_y, &lx, &ly); return lx; }');
+    this.line('double DisplayObject_get_mouseY(void* _this) { if (!ASC_mouse_has) return 0.0; double lx = 0.0, ly = 0.0; as_local_point((DisplayObject*)_this, ASC_mouse_x, ASC_mouse_y, &lx, &ly); return ly; }');
+    this.line('');
+    // Move the dragged object to follow the pointer, expressed in the object's
+    // parent space (see the state declarations above). The offset keeps the grab
+    // point under the cursor (lockCenter:false) or pins the registration point to it
+    // (lockCenter:true). `bounds` clips the RESULT: AIR keeps the dragged object's
+    // bounds inside the rectangle, measured in the parent's space and through the
+    // object's own scale (the scrollbar-thumb case, which the app uses). A rotated
+    // dragged object clamps on its unrotated box.
+    this.line('static void as_drag_follow(double x, double y) {');
+    this.indent++;
+    this.line('DisplayObject* d = (DisplayObject*)ASC_drag_obj;');
+    this.line('if (d == NULL) return;');
+    this.line('double px = x, py = y;');
+    this.line('DisplayObject* par = (DisplayObject*)d->parent;');
+    this.line('if (par != NULL) as_local_point(par, x, y, &px, &py);');
+    this.line('double nx = ASC_drag_lock ? px : px + ASC_drag_off_x;');
+    this.line('double ny = ASC_drag_lock ? py : py + ASC_drag_off_y;');
+    this.line('if (ASC_drag_bounds != NULL) {');
+    this.indent++;
+    this.line('double bl = 0.0, bt = 0.0, br = 0.0, bb = 0.0;');
+    this.line('double sx = (d->scaleX != 0.0) ? d->scaleX : 1.0, sy = (d->scaleY != 0.0) ? d->scaleY : 1.0;');
+    this.line('if (as_bounds_walk(d, 0, 0, &bl, &bt, &br, &bb)) {');
+    this.indent++;
+    this.line('double w = (br - bl) * sx, h = (bb - bt) * sy;');
+    this.line('double lx = ASC_drag_bounds->x + (bl * sx), ty = ASC_drag_bounds->y + (bt * sy);');
+    this.line('double rx = ASC_drag_bounds->x + ASC_drag_bounds->width - w;');
+    this.line('double by = ASC_drag_bounds->y + ASC_drag_bounds->height - h;');
+    this.line('if (rx < lx) rx = lx;');
+    this.line('if (by < ty) by = ty;');
+    this.line('if (nx < lx) nx = lx; else if (nx > rx) nx = rx;');
+    this.line('if (ny < ty) ny = ty; else if (ny > by) ny = by;');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('if (nx < ASC_drag_bounds->x) nx = ASC_drag_bounds->x;');
+    this.line('else if (nx > ASC_drag_bounds->x + ASC_drag_bounds->width) nx = ASC_drag_bounds->x + ASC_drag_bounds->width;');
+    this.line('if (ny < ASC_drag_bounds->y) ny = ASC_drag_bounds->y;');
+    this.line('else if (ny > ASC_drag_bounds->y + ASC_drag_bounds->height) ny = ASC_drag_bounds->y + ASC_drag_bounds->height;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('d->x = nx; d->y = ny;');
+    this.indent--;
+    this.line('}');
+    // Sprite.startDrag(lockCenter = false, bounds = null) / stopDrag().
+    this.line('void Sprite_startDrag(void* _this, bool lockCenter, Rectangle* bounds) {');
+    this.indent++;
+    this.line('DisplayObject* o = (DisplayObject*)_this;');
+    this.line('if (o == NULL) return;');
+    this.line('ASC_drag_obj = (void*)o;');
+    this.line('ASC_drag_lock = lockCenter ? 1 : 0;');
+    this.line('ASC_drag_bounds = bounds;');
+    // The offset is measured against the CURRENT pointer; with no pointer known yet
+    // (an offscreen run that never received a mouse event) it is 0, i.e. the same
+    // thing AIR's lockCenter does -- the registration point lands on the pointer.
+    this.line('if (!lockCenter && ASC_mouse_has) {');
+    this.indent++;
+    this.line('double px = ASC_mouse_x, py = ASC_mouse_y;');
+    this.line('DisplayObject* par = (DisplayObject*)o->parent;');
+    this.line('if (par != NULL) as_local_point(par, ASC_mouse_x, ASC_mouse_y, &px, &py);');
+    this.line('ASC_drag_off_x = o->x - px; ASC_drag_off_y = o->y - py;');
+    this.indent--;
+    this.line('} else { ASC_drag_off_x = 0.0; ASC_drag_off_y = 0.0; }');
+    this.indent--;
+    this.line('}');
+    // stopDrag() ends the drag of the object it is called on; calling it on any other
+    // object leaves the running drag alone (AIR's behaviour).
+    this.line('void Sprite_stopDrag(void* _this) {');
+    this.indent++;
+    this.line('if (ASC_drag_obj == (void*)_this) { ASC_drag_obj = NULL; ASC_drag_bounds = NULL; }');
+    this.indent--;
+    this.line('}');
     this.line('');
     // ---- flash.display drawing + rendering (stage 37) ----
     // Graphics keeps an ORDERED list of draw groups (as_gdraw: path + fill paint +
@@ -11595,24 +13331,47 @@ export class Emitter {
     this.line('g->fill = as_gbitmap_fill_paint(bd, mtx, repeat, smooth);');
     this.indent--;
     this.line('}');
-    this.line('void Graphics_beginGradientFill(void* _this, char* type, as_array* colors, as_array* alphas, as_array* ratios, Object* matrix) {');
+    // AIR: beginGradientFill(type, colors, alphas, ratios, matrix = null,
+    // spreadMethod = "pad", interpolationMethod = "rgb", focalPointRatio = 0).
+    // The gradient runs along the axis of its own space, which spans +-819.2 px
+    // (1638.4 = 32768/20), so the two endpoints in shape pixels are simply the
+    // matrix applied to (-819.2, 0) and (+819.2, 0) -- that is how
+    // Matrix.createGradientBox(w, h, rot, tx, ty) places a w-wide axis inside the
+    // box (scale = w/1638.4, translation = tx + w/2). Everything the 2-stop linear
+    // path cannot honour reports itself once through as_gradient_general_report /
+    // as_gradient_linearrgb_report rather than painting a different gradient.
+    this.line('void Graphics_beginGradientFill(void* _this, char* type, as_array* colors, as_array* alphas, as_array* ratios, Matrix* matrix, char* spreadMethod, char* interpolationMethod, double focalPointRatio) {');
     this.indent++;
     this.line('Graphics* g = (Graphics*)_this;');
-    this.line('(void)matrix; // minimal: linear two-stop only, at the AS3 default box');
     this.line('as_gflush(g);');
-    this.line('unsigned c0 = (colors != NULL && colors->length > 0) ? as_v_uint_cast(colors->data[0]) : 0u;');
-    this.line('unsigned c1 = (colors != NULL && colors->length > 1) ? as_v_uint_cast(colors->data[1]) : c0;');
-    this.line('double a0 = (alphas != NULL && alphas->length > 0) ? as_v_to_number(alphas->data[0]) : 1.0;');
-    this.line('double a1 = (alphas != NULL && alphas->length > 1) ? as_v_to_number(alphas->data[1]) : a0;');
+    this.line('int n = (colors != NULL) ? colors->length : 0;');
+    this.line('if (alphas != NULL && alphas->length < n) n = alphas->length;');
+    this.line('if (n < 2) { as_skia_paint_delete(g->fill); g->fill = NULL; return; }');
+    this.line('bool radial = (type != NULL && strcmp(type, "radial") == 0);');
+    this.line('bool narrowed = ratios != NULL && (ratios->length != n || as_v_to_number(ratios->data[0]) != 0.0 || as_v_to_number(ratios->data[ratios->length - 1]) != 255.0);');
+    this.line('if (radial || n > 2 || focalPointRatio != 0.0 || narrowed || (spreadMethod != NULL && strcmp(spreadMethod, "pad") != 0)) as_gradient_general_report();');
+    this.line('if (interpolationMethod != NULL && strcmp(interpolationMethod, "rgb") != 0) as_gradient_linearrgb_report();');
+    this.line('double ma = 100.0 / 1638.4, mb = 0.0, mtx = 0.0, mty = 0.0;');
+    this.line('if (matrix != NULL) { ma = matrix->a; mb = matrix->b; mtx = matrix->tx; mty = matrix->ty; }');
+    this.line('double x0 = mtx - 819.2 * ma, y0 = mty - 819.2 * mb;');
+    this.line('double x1 = mtx + 819.2 * ma, y1 = mty + 819.2 * mb;');
+    this.line('unsigned c0 = as_v_uint_cast(colors->data[0]) & 0xFFFFFFu;');
+    this.line('unsigned c1 = as_v_uint_cast(colors->data[n - 1]) & 0xFFFFFFu;');
+    this.line('double a0 = as_v_to_number(alphas->data[0]);');
+    this.line('double a1 = as_v_to_number(alphas->data[n - 1]);');
     this.line('as_skia_paint_delete(g->fill);');
     this.line('g->fill = as_skia_paint_fill(c0, a0);');
-    this.line('as_skia_paint_set_linear_gradient(g->fill, 0.0, 0.0, 100.0, 0.0, c0, a0, c1, a1);');
-    this.line('(void)type; (void)ratios;');
+    this.line('as_skia_paint_set_linear_gradient(g->fill, x0, y0, x1, y1, c0, a0, c1, a1);');
     this.indent--;
     this.line('}');
     this.line('void Graphics_drawRect(void* _this, double x, double y, double w, double h) { Graphics* g = (Graphics*)_this; as_skia_path_add_rect(g->path, x, y, w, h); as_gpath_rect(g, x, y, w, h); as_gclosed(g, x, y); }');
     this.line('void Graphics_drawRoundRect(void* _this, double x, double y, double w, double h, double ew, double eh) { (void)ew; (void)eh; Graphics_drawRect(_this, x, y, w, h); }');
     this.line('void Graphics_drawCircle(void* _this, double x, double y, double r) { Graphics* g = (Graphics*)_this; as_skia_path_add_circle(g->path, x, y, r); as_gpath_rect(g, x - r, y - r, 2.0 * r, 2.0 * r); as_gclosed(g, x - r, y); }');
+    // drawEllipse(x, y, width, height): the oval inscribed in that rectangle (AIR,
+    // Flash Player 10+). A negative width/height mirrors the rectangle, which for a
+    // symmetric oval is the same outline, so the size is normalized the way AIR's
+    // drawRect bounds are (the mirrored rect is the shape's bounding box either way).
+    this.line('void Graphics_drawEllipse(void* _this, double x, double y, double w, double h) { Graphics* g = (Graphics*)_this; if (w < 0) { x += w; w = -w; } if (h < 0) { y += h; h = -h; } as_skia_path_add_oval(g->path, x, y, w, h); as_gpath_rect(g, x, y, w, h); as_gclosed(g, x + w * 0.5, y); }');
     // drawTriangles: builds one closed sub-path per triangle (like drawRect adds a
     // closed sub-path), so the fill/stroke in effect is applied by as_gflush exactly
     // as it is for the other shape methods. `vertices` is a flat x,y pair list; an
@@ -11963,14 +13722,17 @@ export class Emitter {
     this.line('if (owned != NULL) free(owned);');
     this.indent--;
     this.line('}');
-    this.line('void Bitmap_ctor(Bitmap* o, BitmapData* bitmapData) {');
+    this.line('void Bitmap_ctor(Bitmap* o, BitmapData* bitmapData, char* pixelSnapping, bool smoothing) {');
     this.indent++;
     this.line('DisplayObject_ctor((DisplayObject*)o);');
     this.line('o->bitmapData = bitmapData;');
     this.line('gc_write_barrier((void*)bitmapData);');
+    this.line('o->pixelSnapping = pixelSnapping;');
+    this.line('gc_write_barrier((void*)pixelSnapping);');
+    this.line('o->smoothing = smoothing;');
     this.indent--;
     this.line('}');
-    this.line('Bitmap* Bitmap_new(BitmapData* bitmapData) { Bitmap* o = (Bitmap*)gc_alloc(GCT_CLASS, sizeof(Bitmap)); o->vtable = &Bitmap_vt; Bitmap_ctor(o, bitmapData); return o; }');
+    this.line('Bitmap* Bitmap_new(BitmapData* bitmapData, char* pixelSnapping, bool smoothing) { Bitmap* o = (Bitmap*)gc_alloc(GCT_CLASS, sizeof(Bitmap)); o->vtable = &Bitmap_vt; Bitmap_ctor(o, bitmapData, pixelSnapping, smoothing); return o; }');
     this.line('');
     // ---- flash.filters (stage 61) ----
     // Filter value bundles. BitmapFilter is an abstract base; concrete filters are
@@ -12031,6 +13793,21 @@ export class Emitter {
     this.line('}');
     this.line('memcpy(dst, a, sizeof(unsigned) * (size_t)(w * h));');
     this.line('free(tmp); free(a);');
+    this.indent--;
+    this.line('}');
+    // BitmapData.encode(rect, compressor, byteArray, byteArrayOffset = 0): serialize
+    // the pixels through the named compressor. Neither format this build can reach:
+    // the vendored Skia is built with skia_use_libjpeg_turbo_encode=false and
+    // _libwebp_encode=false (SkPngEncoder IS linked, so PNG could be done through
+    // the glue -- see TODO.md 'encode'). Pointing the caller at the WRONG format's
+    // bytes would be a silent lie, so nothing is written and the gap is reported.
+    this.line('void BitmapData_encode(void* _this, Rectangle* rect, Object* compressor, ByteArray* out, unsigned byteArrayOffset) {');
+    this.indent++;
+    this.line('(void)_this; (void)rect; (void)out; (void)byteArrayOffset;');
+    this.line('const char* fmt = "an unknown compressor";');
+    this.line('if (compressor != NULL && as_is(compressor, &JPEGEncoderOptions_vt)) fmt = "JPEGEncoderOptions";');
+    this.line('else if (compressor != NULL && as_is(compressor, &PNGEncoderOptions_vt)) fmt = "PNGEncoderOptions";');
+    this.line('as_shell_unsupported(as_str_concat_n(4, (const char*[]){ "BitmapData.encode with ", fmt, " (this build has no image encoder: the vendored Skia disables JPEG/WebP encoding)", "" }));');
     this.indent--;
     this.line('}');
     // applyFilter: blur sourceRect of sourceBitmapData (via BlurFilter) into this
@@ -12255,6 +14032,58 @@ export class Emitter {
     // buffer generated here is always live, so there is nothing to defer. Accepting
     // them keeps the AIR API shape (away3d's VideoTexture/WebcamTexture/Elevation
     // wrap their pixel writes in the pair).
+    // copyPixelsToByteArray(rect, data, offset): the rect's pixels as 4 bytes each
+    // (A, R, G, B -- the same layout setPixels reads back), written at `offset`
+    // and growing the ByteArray as needed. Out-of-range source pixels stay 0
+    // (transparent black), matching the fill AIR applies outside the bitmap.
+    this.line('void BitmapData_copyPixelsToByteArray(void* _this, Rectangle* rect, ByteArray* ba, unsigned int offset) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('if (bd == NULL || bd->pixels == NULL || rect == NULL || ba == NULL) return;');
+    this.line('int x0 = (int)rect->x, y0 = (int)rect->y, w = (int)rect->width, h = (int)rect->height;');
+    this.line('if (w <= 0 || h <= 0) return;');
+    this.line('as_ba_ensure_len(ba, (int)offset + w * h * 4);');
+    this.line('unsigned char* dst = (unsigned char*)ba->data;');
+    this.line('if (dst == NULL) return;');
+    this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
+    this.indent++;
+    this.line('int px = x0 + x, py = y0 + y;');
+    this.line('unsigned word = (px >= 0 && py >= 0 && px < bd->width && py < bd->height) ? ((unsigned*)bd->pixels)[py * bd->width + px] : 0u;');
+    this.line('unsigned i = offset + (unsigned)((y * w + x) * 4);');
+    this.line('dst[i] = (unsigned char)(word >> 24); dst[i + 1] = (unsigned char)(word >> 16);');
+    this.line('dst[i + 2] = (unsigned char)(word >> 8); dst[i + 3] = (unsigned char)(word);');
+    this.indent--;
+    this.line('} }');
+    this.indent--;
+    this.line('}');
+    // getPixels(rect): the rect's pixels as a FRESH ByteArray, 4 bytes each in the
+    // same A,R,G,B layout copyPixelsToByteArray writes (and setPixels reads back).
+    // Pixels outside the bitmap read as 0 (transparent black), exactly like the
+    // other rect readers here. AIR returns null data for a degenerate rect, which
+    // this models as the empty ByteArray the caller can still byte-address.
+    this.line('ByteArray* BitmapData_getPixels(void* _this, Rectangle* rect) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('ByteArray* ba = ByteArray_new();');
+    this.line('if (rect == NULL) return ba;');
+    this.line('int x0 = (int)rect->x, y0 = (int)rect->y, w = (int)rect->width, h = (int)rect->height;');
+    this.line('if (w <= 0 || h <= 0) return ba;');
+    this.line('as_ba_ensure_len(ba, w * h * 4);');
+    this.line('if (bd == NULL || bd->pixels == NULL) return ba;');
+    this.line('unsigned char* dst = (unsigned char*)ba->data;');
+    this.line('if (dst == NULL) return ba;');
+    this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
+    this.indent++;
+    this.line('int px = x0 + x, py = y0 + y;');
+    this.line('unsigned word = (px >= 0 && py >= 0 && px < bd->width && py < bd->height) ? ((unsigned*)bd->pixels)[py * bd->width + px] : 0u;');
+    this.line('unsigned i = (unsigned)((y * w + x) * 4);');
+    this.line('dst[i] = (unsigned char)(word >> 24); dst[i + 1] = (unsigned char)(word >> 16);');
+    this.line('dst[i + 2] = (unsigned char)(word >> 8); dst[i + 3] = (unsigned char)(word);');
+    this.indent--;
+    this.line('} }');
+    this.line('return ba;');
+    this.indent--;
+    this.line('}');
     this.line('void BitmapData_lock(void* _this) { (void)_this; }');
     this.line('void BitmapData_unlock(void* _this) { (void)_this; }');
     this.line('');
@@ -12274,6 +14103,29 @@ export class Emitter {
     // Barrier: `o` may be BLACK (allocated during an incremental cycle) and
     // `nd` is fresh/white, so the write must be visible to the marker.
     this.line('o->data = (void*)nd; o->capacity = cap; gc_write_barrier((void*)nd);');
+    this.indent--;
+    this.line('}');
+    // Absolute-length grower for callers that write at a fixed offset rather
+    // than appending (BitmapData.copyPixelsToByteArray): extends length to `len`,
+    // zero-filling the gap, and never moves `position`.
+    this.line('static void as_ba_ensure_len(ByteArray* o, int len) {');
+    this.indent++;
+    this.line('if (len <= o->length) return;');
+    this.line('if (len > o->capacity) {');
+    this.indent++;
+    this.line('int cap = o->capacity > 0 ? o->capacity : 16;');
+    this.line('while (cap < len) cap *= 2;');
+    this.line('unsigned char* nd = (unsigned char*)gc_alloc(GCT_BYTES, (size_t)cap);');
+    this.line('if (o->data != NULL && o->length > 0) memcpy(nd, o->data, (size_t)o->length);');
+    this.line('memset(nd + o->length, 0, (size_t)(cap - o->length));');
+    this.line('o->data = (void*)nd; o->capacity = cap; gc_write_barrier((void*)nd);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('memset((unsigned char*)o->data + o->length, 0, (size_t)(len - o->length));');
+    this.indent--;
+    this.line('}');
+    this.line('o->length = len;');
     this.indent--;
     this.line('}');
     // AS3 write* semantics write at the current `position` cursor and advance it
@@ -12889,6 +14741,9 @@ export class Emitter {
     this.line('o->displayAsPassword = false;');
     this.line('o->tabEnabled = false;');
     this.line('o->___restrict = NULL;  /* restrict is a C keyword; cIdent() spells it ___restrict */');
+    // mouseWheelEnabled is AIR-true on a fresh field (condenseWhite is AIR-false,
+    // so its zeroed slot is already right).
+    this.line('o->mouseWheelEnabled = true;');
     this.line('o->defaultTextFormat = TextFormat_new(NULL, 12.0, 0x000000u, false, false, 0.0);');
     this.line('o->multiline = false;');
     this.line('o->wordWrap = false;');
@@ -13028,20 +14883,36 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('int collapse = tf->multiline ? 0 : 1;');
-    // Horizontal alignment. SkParagraph can only align within a layout width, so
-    // it must stay kLeft when there is none (the glue substitutes 1e9 for a zero
-    // width, and centering inside 1e9 would shove the text far to the right);
-    // as_tf_align_dx below applies the alignment as a block shift in that case.
-    // AIR honours horizontalAlign on a non-wrapping field too -- that is exactly
-    // how Starling's TrueTypeCompositor centers native text (it draws the field
-    // into a bitmap sized to textWidth and offsets by (width - textWidth) / 2).
+    // Horizontal alignment. SkParagraph aligns inside a layout width; with no
+    // width the glue substitutes 1e9 and centering inside that would shove the
+    // text far off to the right, so a width-less field must NOT hand its align to
+    // a 1e9-wide box. AIR still honours horizontalAlign on a non-wrapping field,
+    // and does so PER LINE (measured: a 200 px field, center, "abc\ndefghij" ->
+    // line left edges 89/75, i.e. (196 - lineWidth)/2 + 2 for each line) -- exactly
+    // how Starling's TrueTypeCompositor centers native text. So with no layout
+    // width we lay the text out unwrapped once to measure the LONGEST line, then
+    // reuse that as the layout width (see the builds below): no line exceeds it,
+    // nothing wraps, Skia aligns each line inside the block, and as_tf_align_dx
+    // shifts that block into the field box. The two shifts sum to AIR's per-line
+    // offset for ANY M (the M terms cancel), which is why the +1 margin there is
+    // free. justify (3) keeps the old behaviour: it needs a wrap width to stretch
+    // into and as_tf_align_dx leaves it alone.
     this.line('int align = as_tf_align_index(tf->defaultTextFormat);');
     this.line('int layoutAlign = (w > 0.0) ? align : 0;');
-    // The mask wins over htmlText runs: a password field lays out stars, and the
-    // runs' byte ranges would no longer line up with what is on screen. (The
-    // htmlText + displayAsPassword combination is not measured on adl.)
+    this.line('if (w <= 0.0 && (align == 1 || align == 2)) layoutAlign = align;');
+    // The runs DO survive the mask (measured on adl 51.3.2, temp/pwdhtml: a field
+    // whose htmlText gives its first character a 24px red run reports the SAME
+    // paragraph metrics masked as unmasked -- line 0 height 30.28 / ascent 23.29 --
+    // and the drawn star for that character is the 24px one, in RED; a run-free
+    // masked field keeps the defaultTextFormat metrics. So the mask replaces the
+    // GLYPHS, not the run styles: the layout string is still the star string
+    // (as_tf_layout_text), and because that string is one ASCII star per byte of
+    // tf->text, a run's byte range lands on exactly the stars it covers -- the
+    // runs array needs no re-indexing (that is why the layout text, not tf->text,
+    // is handed to the glue below: for an unmasked field they are the same
+    // pointer).
     this.line('const char* ltext = as_tf_layout_text(tf);');
-    this.line('int hasRuns = (tf->_runs != NULL && tf->_runs->length > 0 && !tf->displayAsPassword);');
+    this.line('int hasRuns = (tf->_runs != NULL && tf->_runs->length > 0);');
     this.line('if (tf->_para != NULL && tf->_para_text == ltext && tf->_para_w == w &&');
     this.line('    tf->_para_size == size && tf->_para_bold == bold && tf->_para_italic == italic &&');
     this.line('    tf->_para_color == color && tf->_para_collapse == collapse && tf->_para_leading == leading &&');
@@ -13076,11 +14947,36 @@ export class Emitter {
     this.line('runs[i].leading = rf->leading;');
     this.indent--;
     this.line('}');
-    this.line('tf->_para = as_skia_textlayout_new_runs(tf->text, runs, n, w, layoutAlign, collapse);');
+    // The field's own default style: AIR lays out everything the runs do NOT
+    // cover in it (the gaps between runs, and the line box of a line no run
+    // reaches), so it is handed to the glue separately from runs[0] (measured on
+    // adl -- see sk_set_air_run_height in vendor/skia_glue.cc).
+    this.line('sk_text_run dr;');
+    this.line('dr.start = 0; dr.end = 0; dr.family = fmt->font; dr.size = size;');
+    this.line('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading;');
+    this.line('double pw = w; int pa = layoutAlign;');
+    this.line('if (w <= 0.0 && layoutAlign != 0) {');
+    this.indent++;
+    this.line('void* pr = as_skia_textlayout_new_runs(ltext, &dr, runs, n, 0.0, 0, collapse);');
+    this.line('double m = as_skia_textlayout_max_width(pr);');
+    this.line('as_skia_textlayout_delete(pr);');
+    this.line('if (m > 0.0) pw = m + 1.0; else pa = 0;');
+    this.indent--;
+    this.line('}');
+    this.line('tf->_para = as_skia_textlayout_new_runs(ltext, &dr, runs, n, pw, pa, collapse);');
     this.indent--;
     this.line('} else {');
     this.indent++;
-    this.line('tf->_para = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, w, layoutAlign, collapse);');
+    this.line('double pw = w; int pa = layoutAlign;');
+    this.line('if (w <= 0.0 && layoutAlign != 0) {');
+    this.indent++;
+    this.line('void* pp = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, 0.0, 0, collapse);');
+    this.line('double m = as_skia_textlayout_max_width(pp);');
+    this.line('as_skia_textlayout_delete(pp);');
+    this.line('if (m > 0.0) pw = m + 1.0; else pa = 0;');
+    this.indent--;
+    this.line('}');
+    this.line('tf->_para = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, pw, pa, collapse);');
     this.indent--;
     this.line('}');
     this.line('tf->_para_text = ltext;');
@@ -13258,24 +15154,15 @@ export class Emitter {
     this.line('double asc = 0.0, desc = 0.0, left = 0.0, w = 0.0;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para != NULL) as_skia_textlayout_line_box(para, index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);');
-    // x is the line's left edge: AIR's 2 px text inset, plus the alignment shift
-    // for the LINE's own width (measured: a 200 px field with center align puts
-    // line 0 of "abc\ndefghij" at x=89 and line 1 at x=75, with the widths 21.5
-    // and 50 -- i.e. AIR aligns per line, temp/metricprobe/Align6.as). When the
-    // field wraps, Skia already aligned inside the layout width (left != 0), so
-    // no extra shift is added -- the same split as the painter's as_tf_align_dx.
-    // Known divergence (registered): the PAINTER shifts the whole block by the
-    // widest line instead of aligning per line, so a centered multi-line field is
-    // drawn left-shifted; getLineMetrics.x follows AIR, not that defect.
-    this.line('double x = 2.0 + left;');
-    this.line('if (!(tf->wordWrap && tf->_fieldWidth > 0.0) && tf->defaultTextFormat != NULL) {');
-    this.indent++;
-    this.line('int a = as_tf_align_index(tf->defaultTextFormat);');
-    this.line('double inner = tf->_fieldWidth - 4.0;');
-    this.line('if (a == 2) x += (inner - w) / 2.0;');
-    this.line('else if (a == 1) x += inner - w;');
-    this.indent--;
-    this.line('}');
+    // x is the line's left edge: AIR's 2 px text inset, the block shift that
+    // places the aligned block inside the field box (as_tf_align_dx -- 0 when the
+    // field wraps, because Skia then aligns inside the layout width itself), plus
+    // the per-line offset Skia applied inside that block (`left`). Together they
+    // equal AIR's per-line rule x = 2 + (inner - lineWidth)/2 for a centered 200 px
+    // field (measured: line left edges 89/75 for "abc\ndefghij" with widths
+    // 21.5/50 -- temp/metricprobe/Align6.as). Alignment offsets may still differ
+    // from AIR by <= 0.5 px (the documented half-pixel family).
+    this.line('double x = 2.0 + as_tf_align_dx(tf) + left;');
     this.line('return TextLineMetrics_new(x, w, asc + desc + lead, asc, desc, lead);');
     this.indent--;
     this.line('}');
@@ -13308,9 +15195,10 @@ export class Emitter {
     // Map a stage-space point to a caret index in the field's paragraph. The
     // point is converted to paragraph coordinates: subtract the field's stage
     // position, undo the paint-origin gutter (2px), and add back the current
-    // scroll offset. SkParagraph returns a UTF-16 code unit; for the ASCII text
-    // this runtime models UTF-16 == UTF-8 byte offset, so the index is directly
-    // compatible with the _sel_* byte offsets. scrollV is clamped like the renderer.
+    // scroll offset. SkParagraph answers in UTF-16 CODE UNITS, but `_sel_*` is a
+    // byte offset, so the answer goes through as_tf_byte_index -- the two domains
+    // only coincide for ASCII (a click past "ab\u4f60\u597d" is unit 4 = byte 8;
+    // measured family: TODO.md L8152). scrollV is clamped like the renderer.
     this.line('static int as_tf_index_at(TextField* tf, double x, double y) {');
     this.indent++;
     this.line('void* para = as_tf_paragraph(tf);');
@@ -13325,11 +15213,15 @@ export class Emitter {
     this.line('int leftpx = tf->hscroll ? tf->_scroll_h : 0;');
     this.line('if (leftpx < 0) leftpx = 0; if (leftpx > maxsh) leftpx = maxsh;');
     // x/y arrive in the field's own space already (the caller maps the stage
-    // point through the ancestor transforms), so only scrolling is subtracted.
-    this.line('double lx = x + (double)leftpx - 2.0;');
+    // point through the ancestor transforms), so only scrolling is subtracted --
+    // plus the block alignment shift, which the painter adds on top of the 2px
+    // inset (as_tf_align_dx; 0 for a wrapping field, whose lines Skia aligned
+    // inside the layout width).
+    this.line('double lx = x + (double)leftpx - 2.0 - as_tf_align_dx(tf);');
     this.line('double ly = y + scrollY - 2.0;');
     this.line('int idx = as_skia_textlayout_glyph_position_at(para, lx, ly);');
     this.line('if (idx < 0) idx = 0;');
+    this.line('idx = as_tf_byte_index(tf, idx);');
     this.line('if (tf->text != NULL) { int len = (int)strlen(tf->text); if (idx > len) idx = len; }');
     this.line('return idx;');
     this.indent--;
@@ -13460,10 +15352,33 @@ export class Emitter {
     this.line('return s;');
     this.indent--;
     this.line('}');
+    // condenseWhite: AIR removes the extra white space from the HTML SOURCE
+    // before parsing it -- every run of spaces/tabs/line breaks collapses to ONE
+    // space, and a run at the very start or end disappears. It has to happen on
+    // the source: the parser below copies text nodes verbatim, and collapsing the
+    // OUTPUT afterwards would also eat the line breaks that <br>/<p> just emitted.
+    this.line('static char* as_tf_condense_white(char* s) {');
+    this.indent++;
+    this.line('size_t n = strlen(s);');
+    this.line('char* c = as_str_alloc(n + 1);');
+    this.line('size_t m = 0; int pending = 0;');
+    this.line('for (size_t k = 0; k < n; k++) {');
+    this.indent++;
+    this.line('char ch = s[k];');
+    this.line('if (ch == \' \' || ch == \'\\t\' || ch == \'\\n\' || ch == \'\\r\') { pending = (m > 0); continue; }');
+    this.line('if (pending) { c[m++] = \' \'; pending = 0; }');
+    this.line('c[m++] = ch;');
+    this.indent--;
+    this.line('}');
+    this.line('c[m] = 0;');
+    this.line('return c;');
+    this.indent--;
+    this.line('}');
     this.line('static void as_tf_html_set(TextField* tf, char* html) {');
     this.indent++;
     this.line('if (tf->_runs != NULL) { as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_runs = NULL; }');
     this.line('if (html == NULL) { tf->text = NULL; return; }');
+    this.line('if (tf->condenseWhite) html = as_tf_condense_white(html);');
     // Build plain text (newline normalization) into a GC string, tracking byte
     // offsets, while accumulating runs from the tags encountered.
     this.line('size_t n = strlen(html);');
@@ -13560,7 +15475,17 @@ export class Emitter {
     // composes, so entering a scene with HTML text silently re-sized every
     // plain-text label drawn afterwards (textHeight 29 -> 38 at the same font).
     // `_runs` is a GC array, so dropping the reference is enough to retire it.
-    this.line('void TextField_set_text(void* _this, char* value) {');
+    // getTextFormat(): AIR returns the formatting in effect over a range. This
+    // subset stores ONE format per field, so the field's defaultTextFormat IS the
+    // answer for any range; beginIndex/endIndex are accepted and ignored.
+    this.line('TextFormat* TextField_getTextFormat(void* _this, int beginIndex, int endIndex) {');
+    this.indent++;
+    this.line('(void)beginIndex; (void)endIndex;');
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('return (tf != NULL) ? tf->defaultTextFormat : NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('void TextField_set_text(void* _this, char* value) {'),
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
     this.line('as_skia_textlayout_delete(tf->_para);');
@@ -13773,6 +15698,14 @@ export class Emitter {
     this.line('void ColorTransform_ctor(ColorTransform* o, double rm, double gm, double bm, double am, double ro, double go, double bo, double ao) { o->redMultiplier = rm; o->greenMultiplier = gm; o->blueMultiplier = bm; o->alphaMultiplier = am; o->redOffset = ro; o->greenOffset = go; o->blueOffset = bo; o->alphaOffset = ao; }');
     this.line('ColorTransform* ColorTransform_new(double rm, double gm, double bm, double am, double ro, double go, double bo, double ao) { ColorTransform* o = (ColorTransform*)gc_alloc(GCT_CLASS, sizeof(ColorTransform)); o->vtable = &ColorTransform_vt; ColorTransform_ctor(o, rm, gm, bm, am, ro, go, bo, ao); return o; }');
     this.line('void ColorTransform_concat(void* _this, ColorTransform* q) { ColorTransform* t = (ColorTransform*)_this; double rm = t->redMultiplier * q->redMultiplier, gm = t->greenMultiplier * q->greenMultiplier, bm = t->blueMultiplier * q->blueMultiplier, am = t->alphaMultiplier * q->alphaMultiplier; double ro = t->redMultiplier * q->redOffset + t->redOffset, go = t->greenMultiplier * q->greenOffset + t->greenOffset, bo = t->blueMultiplier * q->blueOffset + t->blueOffset, ao = t->alphaMultiplier * q->alphaOffset + t->alphaOffset; t->redMultiplier = rm; t->greenMultiplier = gm; t->blueMultiplier = bm; t->alphaMultiplier = am; t->redOffset = ro; t->greenOffset = go; t->blueOffset = bo; t->alphaOffset = ao; }');
+    // `color` (AIR's read-write `uint` over the three color OFFSETS). The setter sets
+    // red/green/blueOffset from the 0xRRGGBB value and ZEROES the three color
+    // multipliers; alpha is untouched. The getter recombines the offsets, each
+    // shifted as a 32-bit int exactly like AS3's `redOffset << 16 | greenOffset << 8
+    // | blueOffset` (unsigned shifts here so a negative offset -- which AIR also
+    // allows, offsets range -255..255 -- does not invoke C's signed-shift UB).
+    this.line('uint32_t ColorTransform_get_color(void* _this) { ColorTransform* t = (ColorTransform*)_this; return ((uint32_t)(int32_t)t->redOffset << 16) | ((uint32_t)(int32_t)t->greenOffset << 8) | (uint32_t)(int32_t)t->blueOffset; }');
+    this.line('void ColorTransform_set_color(void* _this, uint32_t value) { ColorTransform* t = (ColorTransform*)_this; t->redOffset = (double)((value >> 16) & 0xFF); t->greenOffset = (double)((value >> 8) & 0xFF); t->blueOffset = (double)(value & 0xFF); t->redMultiplier = 0.0; t->greenMultiplier = 0.0; t->blueMultiplier = 0.0; }');
     this.line('char* ColorTransform_toString(void* _this) { ColorTransform* t = (ColorTransform*)_this; char* b = as_str_alloc(160); snprintf(b, 160, "(redMultiplier=%s, greenMultiplier=%s, blueMultiplier=%s, alphaMultiplier=%s, redOffset=%s, greenOffset=%s, blueOffset=%s, alphaOffset=%s)", as_str_from_double(t->redMultiplier), as_str_from_double(t->greenMultiplier), as_str_from_double(t->blueMultiplier), as_str_from_double(t->alphaMultiplier), as_str_from_double(t->redOffset), as_str_from_double(t->greenOffset), as_str_from_double(t->blueOffset), as_str_from_double(t->alphaOffset)); return b; }');
     this.line('');
     // Transform holds an identity Matrix and ColorTransform by default; wiring to
@@ -14161,6 +16094,47 @@ export class Emitter {
     this.line('void VideoTexture_attachNetStream(void* _this, Object* netStream) { (void)_this; (void)netStream; }');
     this.line('void Texture_ctor(Texture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; o->gpu = NULL; o->ctx = NULL; o->mips = 0; }');
     this.line('Texture* Texture_new(void) { Texture* o = (Texture*)gc_alloc(GCT_CLASS, sizeof(Texture)); o->vtable = &Texture_vt; Texture_ctor(o); return o; }');
+    // uploadFromByteArray (Texture / RectangleTexture): the texels are read straight
+    // out of the ByteArray at byteArrayOffset, in the texture's INTERNAL format.
+    // For the 8-bit formats that is 4 bytes per texel -- bgra is the byte order
+    // B,G,R,A, which is precisely an ARGB uint32 in little-endian, i.e. our
+    // canonical pixel word (rgba is the same word with R and B swapped). AIR
+    // validates the available byte count BEFORE copying, so the same check runs
+    // here: uploading a partially-filled texture would sample stale/garbage texels
+    // instead of raising, which is worse than not rendering at all.
+    // This is the video path (StarlingView frame upload / OpenGLVideo.update), so it
+    // must be real -- a stub would leave every video texture empty.
+    this.line('static const uint32_t* as_tex_argb_from_byte_array(ByteArray* data, unsigned int off, int w, int h, char* format, int* out_swizzled) {');
+    this.indent++;
+    this.line('int n = w * h;');
+    this.line('if (n < 0) n = 0;');
+    this.line('if (out_swizzled != NULL) *out_swizzled = 0;');
+    // AIR throws TypeError #2007 for a null ByteArray.
+    this.line('if (data == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter data must be non-null.", 2007)); return NULL; }');
+    // Only 8-bit RGBA/BGRA is consumed. The packed (2 bytes/texel) and float
+    // (4 bytes/component) formats would need a different stride, so they are
+    // reported loudly rather than read at the wrong stride.
+    this.line('if (format == NULL || (strcmp(format, "bgra") != 0 && strcmp(format, "rgba") != 0)) {');
+    this.indent++;
+    this.line('as_shell_unsupported("Texture.uploadFromByteArray (non-8-bit texture format)");');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('if ((size_t)off >= (size_t)data->length || (size_t)data->length - (size_t)off < (size_t)n * 4) {');
+    this.indent++;
+    this.line('as_throw(RangeError_new((char*)"Error #2004: One of the parameters is invalid.", 2004));');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('const uint32_t* src = (const uint32_t*)((const unsigned char*)data->data + off);');
+    this.line('if (strcmp(format, "bgra") == 0) return src;');
+    this.line('uint32_t* out = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)n);');
+    this.line('if (out == NULL) return NULL;');
+    this.line('for (int i = 0; i < n; i++) { uint32_t v = src[i]; out[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16); }');
+    this.line('if (out_swizzled != NULL) *out_swizzled = 1;');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
     this.line('void Texture_uploadFromBitmapData(void* _this, BitmapData* bitmapData, unsigned int miplevel) {');
     this.indent++;
     this.line('Texture* o = (Texture*)_this;');
@@ -14223,6 +16197,26 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('void Texture_dispose(void* _this) { Texture* o = (Texture*)_this; o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; as_s3d_destroy_texture(o->gpu); o->gpu = NULL; o->ctx = NULL; }');
+    this.line('void Texture_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, unsigned int miplevel) {');
+    this.indent++;
+    this.line('Texture* o = (Texture*)_this;');
+    // A level > 0 carries its own (smaller) image and would need its own size
+    // validation (the full-texture check above is NOT sufficient for the level's
+    // row stride), so it is reported rather than read out of bounds.
+    this.line('if (miplevel != 0) { as_shell_unsupported("Texture.uploadFromByteArray (mip level > 0)"); return; }');
+    this.line('int sw = 0;');
+    this.line('const uint32_t* px = as_tex_argb_from_byte_array(data, byteArrayOffset, o->width, o->height, o->format, &sw);');
+    this.line('if (px == NULL) return;');
+    this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
+    this.line('o->mips = 0;');
+    // The pixel source is not a BitmapData, so drop any previous one: otherwise
+    // Context3D_submit's deferred-upload fallback (which runs when gpu == NULL)
+    // would upload that stale bitmap's pixels in place of this byte array.
+    this.line('o->bitmapData = NULL;');
+    this.line('if (o->ctx != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, px);');
+    this.line('if (sw) free((void*)px);');
+    this.indent--;
+    this.line('}');
     // ATF (Adobe Texture Format) decoding lives in as_atf_decode_dxt (runtime):
     // the container is parsed, the DXT record of mip level 0 is decoded to ARGB
     // and handed on as an ordinary bitmap-sourced texture. AIR would bind the
@@ -14322,6 +16316,17 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('void CubeTexture_dispose(void* _this) { CubeTexture* o = (CubeTexture*)_this; if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; } o->face0 = o->face1 = o->face2 = o->face3 = o->face4 = o->face5 = NULL; }');
+    // CubeTexture.uploadFromByteArray(data, byteArrayOffset, side): one face from a
+    // ByteArray. A face upload is only complete once the six-face cube map is
+    // re-uploaded (as_s3d_upload_cube_texture needs all six snapshots at once, and
+    // createCubeTexture never sets a ctx handle on the texture), so this reports
+    // loudly rather than filling one face and leaving the cube unbound.
+    this.line('void CubeTexture_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, unsigned int side) {');
+    this.indent++;
+    this.line('(void)_this; (void)data; (void)byteArrayOffset; (void)side;');
+    this.line('as_shell_unsupported("CubeTexture.uploadFromByteArray (cube faces are not uploaded from a ByteArray by this build)");');
+    this.indent--;
+    this.line('}');
     // ATFCubeTexture uploads a cubemap ATF here. An ATF cubemap carries six faces
     // (the decoder rejects the cubemap flag outright), and the CubeTexture GPU
     // target is itself still a CPU-only follow-up, so this fails loudly instead of
@@ -14351,6 +16356,21 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('void RectangleTexture_dispose(void* _this) { RectangleTexture* o = (RectangleTexture*)_this; o->bitmapData = NULL; as_s3d_destroy_texture(o->gpu); o->gpu = NULL; o->ctx = NULL; }');
+    this.line('void RectangleTexture_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset) {');
+    this.indent++;
+    this.line('RectangleTexture* o = (RectangleTexture*)_this;');
+    this.line('int sw = 0;');
+    this.line('const uint32_t* px = as_tex_argb_from_byte_array(data, byteArrayOffset, o->width, o->height, o->format, &sw);');
+    this.line('if (px == NULL) return;');
+    // Same contract as RectangleTexture_uploadFromBitmapData: invalidate the cached
+    // GPU handle, then upload eagerly (AIR's upload is synchronous, and the video
+    // decoder reuses/clears its ByteArray right after this call returns).
+    this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
+    this.line('o->bitmapData = NULL;');
+    this.line('if (o->ctx != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, px);');
+    this.line('if (sw) free((void*)px);');
+    this.indent--;
+    this.line('}');
     this.line('');
     this.line('// ---- Context3D: CPU state machine + optional Stage3D GPU backend. ----');
     this.line('void Context3D_ctor(Context3D* o) {');
@@ -14977,14 +16997,17 @@ export class Emitter {
     // Two things happen, in AIR's order:
     //  1. the TextField under the pointer scrolls itself (no listener needed) —
     //     measured against adl, one delta unit moves exactly one line and scrollV
-    //     *decreases* as the wheel turns up, clamped to [1, maxScrollV];
+    //     *decreases* as the wheel turns up, clamped to [1, maxScrollV], and only
+    //     when the field's mouseWheelEnabled is true (AIR's default; apps set it
+    //     false on labels). The MOUSE_WHEEL event below is dispatched either way:
+    //     the flag disables the DEFAULT scrolling, not the event.
     //  2. a bubbling MouseEvent.MOUSE_WHEEL is dispatched so app code can react.
     this.line('void Stage_dispatchWheel(void* _this, double x, double y, double delta) {');
     this.indent++;
     this.line('void* target = as_pick_hit(_this, x, y);');
     this.line('if (target == NULL) return;');
     this.line('DisplayObject* o = (DisplayObject*)target;');
-    this.line('if (as_is(target, &TextField_vt)) {');
+    this.line('if (as_is(target, &TextField_vt) && ((TextField*)target)->mouseWheelEnabled) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)target;');
     this.line('int maxs = as_tf_line_count(tf) - as_tf_visible_lines(tf) + 1;');
@@ -15590,6 +17613,14 @@ export class Emitter {
     // as_render_cached reads it to cap the bake resolution and to keep
     // screen-space decorations (the TextField border) one device pixel thick.
     this.line('static double ASC_render_scale = 1.0;');
+    // 1 only while a WINDOW is being composed (ASC_window_render). The insertion caret
+    // is drawn only then: AIR's caret is a player overlay, NOT part of the field's
+    // rasterization -- measured on adl 51.4.1, where `BitmapData.draw` of a focused
+    // editable field captures no caret at all (temp/caretprobe, 14 samples over 1.7 s
+    // all empty). Gating on the window pass reproduces that exactly: the caret shows
+    // on screen but never lands in a BitmapData.draw, a cacheAsBitmap bake, or the
+    // Stage.render PNG hook (阶段一百三十五).
+    this.line('static int ASC_caret_pass = 0;');
     // Destination CTM scale while a cacheAsBitmap/auto-bake pass is rendering the
     // content into an OFFSCREEN surface. Inside that pass the canvas transform is
     // the bake resolution, not the screen's, so a screen-space 1px decoration (the
@@ -15924,6 +17955,45 @@ export class Emitter {
     // above, so the path needs no further adjustment.
     this.line('int clip_on = (o->_clip_path != NULL);');
     this.line('if (clip_on) { as_skia_canvas_save(canvas); as_skia_canvas_clip_path(canvas, o->_clip_path, 1); }');
+    // DisplayObject.scrollRect: clip to the rectangle in this object's own local
+    // space, then shift the content by -x/-y so the rectangle's origin lands on the
+    // object's origin (the shift is what makes the classic
+    // `mc.scrollRect = new Rectangle(0, y, w, h)` a scroll). The rect is local, and
+    // this point is past the transform above, so no adjustment is needed. Filter
+    // bounds and cacheAsBitmap bakes go through this same walk, so both see it.
+    this.line('int scroll_on = (o->_scroll_rect != NULL);');
+    this.line('if (scroll_on) {');
+    this.indent++;
+    this.line('as_skia_canvas_save(canvas);');
+    // Shift FIRST, then clip in the shifted space: the clip is expressed in the
+    // current coordinate system, so (translate -r, clip 0,0,w,h) means "content
+    // whose pre-shift coordinate is inside r", which is exactly AIR's scroll window.
+    this.line('as_skia_canvas_translate(canvas, -o->_scroll_rect->x, -o->_scroll_rect->y);');
+    this.line('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);');
+    this.indent--;
+    this.line('}');
+
+    // DisplayObject.opaqueBackground: AIR backs the object with an OPAQUE bitmap
+    // (no alpha channel) whose background is this colour, so the colour shows
+    // through wherever the content is transparent -- the app uses it for
+    // alternating item/row backgrounds and for solid scrollbar surfaces. We paint
+    // the colour as a filled rect over the object's tight local bounds BEFORE any
+    // content, which is the same picture (and, like AIR's region, it is invisible
+    // to hit testing and to mouse events -- as_pick_hit_m never consults it).
+    // Only a Number is meaningful (AIR: "If set to a number value, the surface is
+    // opaque"); null, and any non-numeric value, leaves the object transparent.
+    this.line('if (as_v_is_number(o->opaqueBackground)) {');
+    this.indent++;
+    this.line('double opa_l = 0.0, opa_t = 0.0, opa_r = 0.0, opa_b = 0.0;');
+    this.line('if (as_render_bounds(o, &opa_l, &opa_t, &opa_r, &opa_b) && opa_r > opa_l && opa_b > opa_t) {');
+    this.indent++;
+    this.line('void* opa_p = as_skia_paint_fill((unsigned)(long long)as_v_num_val(o->opaqueBackground), 1.0);');
+    this.line('as_skia_canvas_draw_rect(canvas, opa_l, opa_t, opa_r - opa_l, opa_b - opa_t, opa_p);');
+    this.line('as_skia_paint_delete(opa_p);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
 
     // DefineScalingGrid (swc.md §9 F) comes FIRST: when a 9-sliced instance is
     // stretched, Flash reassembles it from a natural-size picture instead of
@@ -15933,7 +18003,11 @@ export class Emitter {
     this.indent++;
     this.line('as_render_nine_slice(canvas, o);');
     this.indent--;
-    this.line('} else if (o->_cache_flag || o->_auto_baked) {');
+    // A focused TextField must never render from the bake: its caret blinks (and a
+    // composition preview moves) every frame, and the explicit cacheAsBitmap path
+    // only re-bakes on size/flag change -- so it would freeze the caret. Render it
+    // live instead (阶段一百三十五).
+    this.line('} else if ((o->_cache_flag || o->_auto_baked) && !(as_is(o, &TextField_vt) && as_focus_obj == (void*)o)) {');
     this.indent++;
     this.line('as_render_cached(canvas, o);');
     this.indent--;
@@ -15960,6 +18034,7 @@ export class Emitter {
     this.line('as_render_object_content(canvas, o);');
     this.indent--;
     this.line('}');
+    this.line('if (scroll_on) as_skia_canvas_restore(canvas);');
     this.line('if (clip_on) as_skia_canvas_restore(canvas);');
     this.line('if (ct_on) as_skia_canvas_restore(canvas);');
     this.line('if (blend_on) as_skia_canvas_restore(canvas);');
@@ -16210,6 +18285,37 @@ export class Emitter {
     this.line('as_skia_paint_delete(bp);');
     this.indent--;
     this.line('}');
+    // Insertion caret (阶段一百三十五). Drawn ONLY on the FOCUSED, SELECTABLE field
+    // -- the same gate the selection highlight uses (measured rule: a dynamic field
+    // with selectable=false gets no caret at all) -- and ONLY in a window/compose
+    // pass (ASC_caret_pass), because AIR's caret is a player overlay rather than
+    // part of the field's rasterization (measured: BitmapData.draw excludes it).
+    // A 1 DEVICE-pixel vertical bar at the caret's paragraph box, in the field's
+    // text colour, blinking on a ~500 ms half period whose clock restarts on focus /
+    // caret move / keystroke (as_tf_blink_reset) so it is solid right after the user
+    // acts. A focused field is never served from a bake (see the cache guard in
+    // as_render_object), so the caret is repainted live each frame.
+    this.line('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable) {');
+    this.indent++;
+    this.line('double kcx = 0.0, kcy = 0.0, kch = 0.0;');
+    this.line('if (as_tf_caret_on() && as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, as_tf_caret(tf)), &kcx, &kcy, &kch)) {');
+    this.indent++;
+    this.line('unsigned kcol = (tf->textColor != 0u) ? tf->textColor : tf->defaultTextFormat->color;');
+    // 1 device pixel wide, like the border rule: the canvas already carries the
+    // device ratio * ancestor scale * own scale, so divide the caller's total scale
+    // out (the bake pass publishes the DESTINATION scale in ASC_bake_ctm_*).
+    this.line('double ksx = ASC_bake_ctm_x, ksy = ASC_bake_ctm_y;');
+    this.line('if (ksx <= 0.0 || ksy <= 0.0) as_skia_canvas_total_scale(canvas, &ksx, &ksy);');
+    this.line('if (ksx <= 0.0) ksx = 1.0;');
+    this.line('double kw = ASC_render_scale / ksx;');
+    this.line('if (kw <= 0.0) kw = 1.0;');
+    this.line('void* kp = as_skia_paint_fill(kcol, 1.0);');
+    this.line('as_skia_canvas_draw_rect(canvas, 2.0 + alignDx - scrollX + kcx, 2.0 - scrollY + kcy, kw, kch, kp);');
+    this.line('as_skia_paint_delete(kp);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     // IME composition preview: the marked text is NOT in .text (it is not committed
     // yet), so it is not part of the paragraph above -- it is painted here, at the
     // caret it will be inserted at, with a 1px underline, the way a platform IME
@@ -16282,7 +18388,12 @@ export class Emitter {
     this.line('as_skia_canvas_clear(canvas, st->stage_color);');
     this.line('ASC_render_scale = scale;');
     this.line('as_render_fp((DisplayObject*)_this);');
+    // Stage.render is this runtime's SCREENSHOT hook (AIR has no such API): include
+    // the caret overlay so the PNG shows what the window shows. BitmapData.draw and
+    // cacheAsBitmap bakes deliberately do NOT (they match adl, see ASC_caret_pass).
+    this.line('ASC_caret_pass = 1;');
     this.line('as_render_object(canvas, (DisplayObject*)_this);');
+    this.line('ASC_caret_pass = 0;');
     this.line('as_skia_surface_save_png(surface, path);');
     this.line('as_skia_surface_delete(surface);');
     this.indent--;
@@ -16345,8 +18456,21 @@ export class Emitter {
     this.line('} ASCWin;');
     this.line('static ASCWin ASC_wins[ASC_MAX_WINDOWS];');
     this.line('static ASCWin* ASC_w(int id) { return (id >= 0 && id < ASC_MAX_WINDOWS) ? &ASC_wins[id] : NULL; }');
-    // Claim slot 0 for the app's initial window (see the note above).
-    this.line('static ASCWin* ASC_win_claim_main(void) { memset(&ASC_wins[0], 0, sizeof(ASCWin)); return &ASC_wins[0]; }');
+    // Claim slot 0 for the app's initial window (see the note above). The slot may
+    // already be bound before the OS window exists: AIR builds the initial window
+    // BEFORE the document class runs, but our bootstrap creates the stage first and
+    // only opens the window in Stage.showWindow (which then blocks on the event
+    // loop), so the binding happens on the first nativeWindow read instead (see
+    // Stage_get_nativeWindow). Re-zeroing such a slot would drop the bound stage and
+    // the cached NativeWindow wrapper -- breaking both
+    // `stage.nativeWindow === stage.nativeWindow` and the Event.CLOSE listeners the
+    // document class registered on that wrapper.
+    this.line('static ASCWin* ASC_win_claim_main(void) {');
+    this.indent++;
+    this.line('if (ASC_wins[0].stage == NULL && ASC_wins[0].window == NULL) memset(&ASC_wins[0], 0, sizeof(ASCWin));');
+    this.line('return &ASC_wins[0];');
+    this.indent--;
+    this.line('}');
     this.line('static double ASC_win_scale = 1.0;');   // device pixel ratio of the window being rendered
     this.line('static double ASC_app_frame_rate = 0.0;');   // 0 = unset -> event loop follows the display refresh rate
     this.line('static bool ASC_app_vsync_enabled = true;'); // AIR default; false lets the pacer exceed the display refresh
@@ -16457,7 +18581,12 @@ export class Emitter {
     this.line('#endif');
     this.line('ASC_render_scale = w->scale;');
     this.line('as_render_fp((DisplayObject*)st);');
+    // Window composition pass: the caret overlay is drawn only here (see the
+    // ASC_caret_pass note). as_render_fp above does NOT set it, so the fingerprint
+    // (and therefore any bake) never sees a caret.
+    this.line('ASC_caret_pass = 1;');
     this.line('as_render_object(canvas, (DisplayObject*)st);');
+    this.line('ASC_caret_pass = 0;');
     this.line('as_skia_canvas_restore(canvas);');
     this.line('#ifdef ASC_RENDER_WINGPU');
     this.line('if (w->is_gpu) as_skia_gpu_flush(id);');
@@ -16762,6 +18891,104 @@ export class Emitter {
     // gc_mark_user_roots. Slot 0 (the initial window) has no NativeWindow object —
     // `window` stays NULL there and the slot is simply cleared.
     this.line('w->window = NULL;');
+    this.indent--;
+    this.line('}');
+    // Stage.nativeWindow: the NativeWindow the stage is drawn in. The window table
+    // is the single source of truth (it holds the stage, the client size, the
+    // title, the closed flag), so the wrapper just carries the slot's id. Slot 0
+    // is the app's initial window, which nothing else constructs a NativeWindow
+    // for, so the wrapper is built here on first access and cached in the table —
+    // that keeps `stage.nativeWindow` identity-stable AND, because the close path
+    // dispatches Event.CLOSE on w->window when it is set, lets
+    // `stage.nativeWindow.addEventListener(Event.CLOSE, ...)` receive the event
+    // exactly as AIR does.
+    // NativeWindow wrapper for window slot `id`, created on first use and cached in
+    // the table. Both `stage.nativeWindow` and `NativeApplication.activeWindow`
+    // must hand back the SAME object (AIR's identity), so both go through here.
+    // NOT NativeWindow_ctor: that allocates a new OS window; this wrapper describes
+    // one that already exists, so only the base part is set up.
+    this.line('static NativeWindow* as_win_wrapper(int id) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL || w->stage == NULL) return NULL;');
+    this.line('if (w->window == NULL) {');
+    this.indent++;
+    this.line('NativeWindow* nw = (NativeWindow*)gc_alloc(GCT_CLASS, sizeof(NativeWindow));');
+    this.line('nw->vtable = &NativeWindow_vt;');
+    this.line('EventDispatcher_ctor((EventDispatcher*)nw, NULL);');
+    this.line('nw->_win = id;');
+    this.line('w->window = (void*)nw;');
+    this.indent--;
+    this.line('}');
+    this.line('return (NativeWindow*)w->window;');
+    this.indent--;
+    this.line('}');
+    // NativeApplication.activeWindow: the window that currently owns the focus,
+    // else the app's initial (first open) window, which is what AIR reports for an
+    // application whose single window holds the focus. NULL when no window exists
+    // at all -- AIR's null, which callers such as Alert.as test for.
+    this.line('static NativeWindow* as_win_active(void) {');
+    this.indent++;
+    this.line('int i;');
+    this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(i);');
+    this.line('if (w != NULL && w->stage != NULL && !w->closed && as_window_is_active(i)) return as_win_wrapper(i);');
+    this.indent--;
+    this.line('}');
+    this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(i);');
+    this.line('if (w != NULL && w->stage != NULL && !w->closed) return as_win_wrapper(i);');
+    this.indent--;
+    this.line('}');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('NativeWindow* Stage_get_nativeWindow(void* _this) {');
+    this.indent++;
+    this.line('Stage* st = (Stage*)_this;');
+    this.line('int i;');
+    this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) {');
+    this.indent++;
+    this.line('ASCWin* w = &ASC_wins[i];');
+    this.line('if (w->stage != st) continue;');
+    this.line('return as_win_wrapper(i);');
+    this.indent--;
+    this.line('}');
+    // AIR's initial window exists BEFORE the document class is constructed, so a
+    // windowed app's root stage always has a non-null nativeWindow -- including the
+    // `stage.nativeWindow` read inside the document class's own constructor. Ours is
+    // created later (Stage.showWindow opens it and then blocks on the event loop),
+    // so bind the reserved main-window slot on first query instead of reporting
+    // AIR's null: a null here would make every `nativeWindow.x = ...` in the
+    // document-class constructor throw TypeError #1009.
+    //
+    // Only ASC_root_stage may claim slot 0. A secondary window's stage is bound to
+    // its own slot by NativeWindow_ctor, so it never reaches this path -- and must
+    // not, or it would silently repoint the app's unattached roots at the wrong
+    // window.
+    //
+    // The properties written before the OS window exists (bounds, title) are
+    // dropped by the glue, which only touches a window that is already open; the
+    // window is later created at SDL_WINDOWPOS_CENTERED with the descriptor's size,
+    // which is the position/size the document class computes for itself.
+    // Stage.showWindow re-claims the same slot without clearing it, so the wrapper
+    // created here keeps its identity and its listeners.
+    this.line('if (st == ASC_root_stage && ASC_wins[0].stage == NULL && ASC_wins[0].window == NULL) {');
+    this.indent++;
+    this.line('ASCWin* w0 = ASC_win_claim_main();');
+    this.line('w0->stage = st;');
+    this.line('st->stage_scale = 1.0;');
+    this.line('w0->scale = 1.0;');
+    this.line('ASC_win_scale = 1.0;');
+    this.line('w0->design_w = st->stage_w; w0->design_h = st->stage_h;');
+    this.line('w0->lw = st->stage_w; w0->lh = st->stage_h;');
+    this.line('w0->pw = st->stage_w; w0->ph = st->stage_h;');
+    this.line('return as_win_wrapper(0);');
+    this.indent--;
+    this.line('}');
+    this.line('return NULL;');
     this.indent--;
     this.line('}');
     // Stage.showWindow(width, height, title): rasterizes the tree offscreen, then
@@ -17429,7 +19656,7 @@ export class Emitter {
         // superclass still has one parameter per declared AS3 parameter, so the
         // defaults must be filled here — exactly like an explicit `super()`.
         const superInfo = this.symbols.getClass(info.superClass)!;
-        const defArgs = this.emitArgs(superInfo.constructor.params, []);
+        const defArgs = this.emitArgs(superInfo.constructor.params, [], superInfo.importAlias);
         this.line(`${info.superClass}_ctor((${info.superClass}*)o${defArgs ? ', ' + defArgs : ''});`);
       }
       // Field initializers run after super() (AS3). Defaults are already seeded.
@@ -17490,6 +19717,12 @@ export class Emitter {
       this.indent++;
       this.line(`${name}* o = (${name}*)gc_alloc(GCT_CLASS, sizeof(${name}));`);
       this.line(`o->vtable = &${name}_vt;`);
+      // `class X extends Array` (arrayBacked): the hidden backing array is
+      // allocated before the constructor body runs, so an Array member called
+      // from the constructor (or by `super(...)`) already has storage. Air's
+      // `new Sequence` therefore starts with length 0 and an empty named-property
+      // table, exactly like a plain Array.
+      if (info.arrayBacked) this.line(`o->_arr = as_array_new();`);
       this.line(`${name}_ctor(o${paramNames ? ', ' + paramNames : ''});`);
       this.line('return o;');
       this.indent--;
@@ -17659,8 +19892,8 @@ export class Emitter {
       const ctype = v.type !== null
         ? this.ann(v.type)
         : v.loop
-          ? this.loopVarType(v.loop.kind, this.emitExpr(v.loop.iterable).type, v.loop.declared)
-          : (v.init ? this.emitExpr(v.init).type : { kind: 'int' });
+          ? this.loopVarType(v.loop.kind, this.probeExprType(v.loop.iterable), v.loop.declared)
+          : (v.init ? this.probeExprType(v.init) : { kind: 'int' });
       this.moduleScope.set(v.name, ctype);
       const cn = this.moduleCName(v.name);
       if (v.isConst && this.isConstExpr(v.init)) {
@@ -17691,8 +19924,14 @@ export class Emitter {
   //                (`for each (var s:Sprite in list)`), otherwise the iterable decides
   private loopVarType(kind: 'in' | 'each', it: CType, declared: ASType | null): CType {
     if (kind === 'in') {
+      // A DECLARED loop-variable type wins: AS3 coerces each key atom to it
+      // (`for (var k:String in arr)` yields "0"/"1"/"foo", `for (var k:* in arr)`
+      // the raw number/string atoms -- measured on adl 51.4.1). Otherwise the
+      // iterable decides: a Dictionary key keeps its box, an Array/Vector index is
+      // an int, and a record / dynamic object / dynamic class instance yields names.
+      if (declared != null) return this.ann(declared);
       if (it.kind === 'dict') return { kind: 'any' };
-      if (it.kind === 'array') return { kind: 'int' };
+      if (it.kind === 'array' || it.kind === 'vector') return { kind: 'int' };
       return { kind: 'string' }; // record / dynamic Object keys
     }
     if (declared !== null) return this.ann(declared);
@@ -17779,8 +20018,26 @@ export class Emitter {
   // field is runtime-initialized (so a read can never observe an uninitialized
   // NULL/default slot). Compile-time-literal consts are emitted at file scope
   // and need no guard.
-  private sfRead(owner: string, name: string): string {
-    if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${owner}_${name})`;
+  // The C-slot kind code a dynamically-addressed static field is stored as (see
+  // runtime.ts's as_class_static_read/write). 0 = 'not addressable generically',
+  // which makes the Class-value path report itself instead of writing a
+  // wrong-sized value.
+  private staticSlotKind(t: CType): number {
+    switch (t.kind) {
+      case 'bool': return 1;
+      case 'int': return 2;
+      case 'uint': return 3;
+      case 'number': return 4;
+      case 'string': return 5;
+      case 'object': case 'array': case 'vector': case 'record': case 'dict':
+      case 'xml': case 'xmllist': case 'regexp': case 'function': case 'class': return 6;
+      case 'int64': return 7;
+      case 'uint64': return 8;
+      default: return 0;
+    }
+  }
+
+  private sfRead(owner: string, name: string): string {    if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${owner}_${name})`;
     return `${owner}_${name}`;
   }
 
@@ -17809,6 +20066,9 @@ export class Emitter {
     this.line('as_vec_wire();');
     // ... and the ByteArray index-form hooks (reads/writes/`in` on a `*` receiver).
     this.line('as_ba_wire();');
+    // ... and the `class X extends Array` backing-array hook (a `*` receiver's
+    // elements/length/named properties).
+    this.line('as_arrback_wire();');
     // Static fields initialize lazily on first access (see emitStaticInits), so
     // main() only runs module-level variable initializers and top-level
     // statements; the demo bootstrap's static reads trigger each class's cinit.
@@ -17915,6 +20175,18 @@ export class Emitter {
           }
           break;
         }
+        // A hoisted (function-scoped) const is already declared at the function
+        // top -- AS3 gives `const` the same function-wide binding as `var`; only
+        // single assignment differs -- so emit just the assignment here and never
+        // a second C declaration, which would shadow the hoisted one and leave it
+        // at its default (that is how a `const` in an if-branch read from the
+        // sibling branch used to come back null).
+        if (this.hoistedLocals.has(stmt.name)) {
+          const ht = this.functionScope!.get(stmt.name) ?? this.ann(stmt.type);
+          const e = this.emitExpr(stmt.init!);
+          this.line(`${this.emitVar(stmt.name).code} = ${this.convert(e, ht)};`);
+          break;
+        }
         const ctype = stmt.type !== null ? this.ann(stmt.type) : this.emitExpr(stmt.init!).type;
         this.declareVar(stmt.name, ctype);
         const e = this.emitExpr(stmt.init!);
@@ -17925,11 +20197,18 @@ export class Emitter {
         for (const d of stmt.decls) {
           if (d.init) this.sequenceValueExpr(d.init, true, true);
           if (this.functionScope === null && this.moduleScope.has(d.name)) {
-            if (!this.isConstExpr(d.init)) {
+            if (d.init && !this.isConstExpr(d.init)) {
               const ctype = this.moduleScope.get(d.name)!;
-              const e = this.emitExpr(d.init!);
+              const e = this.emitExpr(d.init);
               this.line(`${this.moduleCName(d.name)} = ${this.convert(e, ctype)};`);
             }
+            continue;
+          }
+          // Hoisted (function-wide) const: see the ConstDecl case above.
+          if (this.hoistedLocals.has(d.name)) {
+            const ht = this.functionScope!.get(d.name) ?? this.ann(d.type);
+            const e = this.emitExpr(d.init!);
+            this.line(`${this.emitVar(d.name).code} = ${this.convert(e, ht)};`);
             continue;
           }
           const ctype = d.type !== null ? this.ann(d.type) : this.emitExpr(d.init!).type;
@@ -17940,6 +20219,11 @@ export class Emitter {
         break;
       }
       case 'ExprStmt': {
+        // Mark this statement's own expression as the discarded one, so a top-level
+        // index assignment can store without materializing its value
+        // (storeThenValue). Restored on the way out.
+        const outerDiscarded = this.discardedExprNode;
+        this.discardedExprNode = stmt.expr;
         this.sequenceValueExpr(stmt.expr, false, true);
         // A getter/setter update (`prop++`) was already expanded into a getter
         // read + setter write by sequenceValueExpr; emitExpr would only reproduce
@@ -17952,6 +20236,7 @@ export class Emitter {
         // is intentionally discarded in statement position; (void) silences clang's
         // -Wunused-value while the value stays for chained-assignment contexts.
         this.line(e.discard ? `(void)(${e.code});` : `${e.code};`);
+        this.discardedExprNode = outerDiscarded;
         break;
       }
       case 'Block':
@@ -17989,13 +20274,18 @@ export class Emitter {
         // scope), so emit into the hoisted global `g_x` instead of declaring a
         // block-local; `emitModuleVars` already emitted its C declaration.
         const modVar = stmt.declares && this.isModuleLoopVar(stmt.varName);
+        // Sequence the iterable first: it is evaluated exactly once, and a general
+        // E4X filter in that position needs its per-node selection loop emitted
+        // before the loop statement (see emitXmlGeneralFilter).
+        this.sequenceValueExpr(stmt.iterable, true, true);
         const it = this.emitExpr(stmt.iterable);
         it.code = this.hoistCollection(it);
-        // for-in iterates array indices (int), Dictionary object keys, or
-        // dynamic-object string keys.
-        const isRecord = it.type.kind === 'record' || it.type.kind === 'any'
-          || (it.type.kind === 'object' && it.type.className === 'Object');
-        const isDict = it.type.kind === 'dict';
+        // `class X extends Array`: for-in enumerates the backing array's indices,
+        // exactly as the Array branch below does.
+        {
+          const ab = this.arrayBackedArrayCode(it, it.code);
+          if (ab) { it.code = ab.code; it.type = ab.type; }
+        }
         // Proxy subclass: `for (var k in p)` runs AIR's enumeration protocol —
         // nextNameIndex(0) -> 1, nextName(1), nextNameIndex(1) -> 2, ... until 0
         // (measured on adl 51.4.1). Real traits are NOT enumerated and the `_dyn`
@@ -18022,56 +20312,41 @@ export class Emitter {
           this.popScope();
           break;
         }
-        if (it.type.kind !== 'array' && !isRecord && !isDict) {
-          throw new CodegenError('for-in requires an Array, Dictionary, or dynamic Object');
-        }
         const idx = this.tmpName('i');
         this.pushScope();
         this.breakTargets.push(this.tryFrames.length);
         this.continueTargets.push({ depth: this.tryFrames.length, label: null, used: false });
-        if (isDict) {
-          // Dictionary keys are boxed as_value. `for (var key:* in dict)` declares
-          // an `any` loop var that keeps the box; an existing typed loop var
-          // (`for (tgt:Object in dict)`) must unbox the key to its declared type.
-          if (stmt.declares && !modVar) this.declareVar(stmt.varName, { kind: 'any' });
-          this.line(`for (int ${idx} = 0; ${idx} < (${it.code})->length; ${idx}++) {`);
-          this.indent++;
-          if (stmt.declares) {
-            const lhs = modVar ? this.moduleCName(stmt.varName) : `as_value ${this.cIdent(stmt.varName)}`;
-            this.line(`${lhs} = (${it.code})->keys[${idx}];`);
-          } else {
-            const keyVal = { code: `(${it.code})->keys[${idx}]`, type: { kind: 'any' } as CType };
-            this.line(`${this.cIdent(stmt.varName)} = ${this.unboxAny(keyVal, this.emitVar(stmt.varName).type)};`);
-          }
-          this.emitStmt(stmt.body);
-          this.indent--;
-          this.line('}');
-        } else if (isRecord) {
-          const objCode = it.type.kind === 'record'
-            ? it.code
-            : `((as_object*)${it.type.kind === 'any' ? `as_v_obj_val(${it.code})` : it.code})`;
-          if (stmt.declares && !modVar) this.declareVar(stmt.varName, { kind: 'string' });
-          this.line(`for (int ${idx} = 0; ${idx} < (${objCode})->length; ${idx}++) {`);
-          this.indent++;
-          const recLhs = stmt.declares
-            ? (modVar ? this.moduleCName(stmt.varName) : `char* ${this.cIdent(stmt.varName)}`)
-            : this.cIdent(stmt.varName);
-          this.line(`${recLhs} = (${objCode})->keys[${idx}];`);
-          this.emitStmt(stmt.body);
-          this.indent--;
-          this.line('}');
+        // ONE enumeration for every receiver: what gets enumerated (and in which
+        // order) depends on the VALUE's runtime kind, which is AIR's own dispatch --
+        // an Array's in-range non-hole indices followed by its named properties, a
+        // Vector's indices, a Dictionary's keys (keeping their type), a dynamic
+        // object's names, a dynamic class instance's added properties, and NOTHING
+        // for a sealed instance, a String, a number or null. All of that was
+        // MEASURED on adl 51.4.1 (temp/airref/Main.as) and all of it lives in
+        // as_enum_next, so the key's own ATOM type (a number for an index, a string
+        // for a name) reaches the loop variable and is converted to its DECLARED
+        // type exactly as AIR coerces it -- `for (var k:String in a)` yields
+        // "0"/"1"/"foo" while `for (var k:* in a)` yields number:0, number:1,
+        // string:foo. The index cursor keeps the emitted body a plain C loop, so
+        // AS3 break/continue stay real C break/continue.
+        const coll = this.tmpName('coll');
+        const keyv = this.tmpName('key');
+        const keyType: CType = this.loopVarType('in', it.type, stmt.varType);
+        if (stmt.declares && !modVar) this.declareVar(stmt.varName, keyType);
+        this.line(`as_value ${coll} = ${this.boxExpr({ code: it.code, type: it.type })};`);
+        this.line(`as_value ${keyv};`);
+        this.line(`for (int ${idx} = 0; as_enum_next(${coll}, &${idx}, &${keyv}); ) {`);
+        this.indent++;
+        const keyExpr = { code: keyv, type: { kind: 'any' } as CType };
+        if (stmt.declares) {
+          const lhs = modVar ? this.moduleCName(stmt.varName) : `${this.cTypeName(keyType)} ${this.cIdent(stmt.varName)}`;
+          this.line(`${lhs} = ${this.convert(keyExpr, keyType)};`);
         } else {
-          if (stmt.declares && !modVar) this.declareVar(stmt.varName, { kind: 'int' });
-          this.line(`for (int ${idx} = 0; ${idx} < (${it.code})->length; ${idx}++) {`);
-          this.indent++;
-          const arrLhs = stmt.declares
-            ? (modVar ? this.moduleCName(stmt.varName) : `int ${this.cIdent(stmt.varName)}`)
-            : this.cIdent(stmt.varName);
-          this.line(`${arrLhs} = ${idx};`);
-          this.emitStmt(stmt.body);
-          this.indent--;
-          this.line('}');
+          this.line(`${this.cIdent(stmt.varName)} = ${this.convert(keyExpr, this.emitVar(stmt.varName).type)};`);
         }
+        this.emitStmt(stmt.body);
+        this.indent--;
+        this.line('}');
         this.continueTargets.pop();
         this.breakTargets.pop();
         this.popScope();
@@ -18079,8 +20354,53 @@ export class Emitter {
       }
       case 'ForEachIn': {
         const modVar = stmt.declares && this.isModuleLoopVar(stmt.varName);
+        // Evaluated once, and a general E4X filter here (as3corelib's JSONEncoder
+        // iterates `classInfo..*.( name() == ... )`) needs its selection loop
+        // emitted before the for statement.
+        this.sequenceValueExpr(stmt.iterable, true, true);
         const arr = this.emitExpr(stmt.iterable);
         arr.code = this.hoistCollection(arr);
+        // `class X extends Array`: for-each walks the backing array's elements
+        // (this is how Sequence.findAttributeValue iterates itself).
+        {
+          const ab = this.arrayBackedArrayCode(arr, arr.code);
+          if (ab) { arr.code = ab.code; arr.type = ab.type; }
+        }
+        // A DYNAMICALLY-typed iterable (`for each (var v in obj.someDynamicProp)`, or
+        // any other '*' / Object-typed collection): what is enumerated depends on the
+        // VALUE's runtime kind, which is AIR's own dispatch -- Array elements,
+        // Dictionary values, Vector elements, or the values of a dynamic object's
+        // properties. The runtime helper advances an index cursor, so the body stays
+        // a plain C loop and AS3 `break`/`continue` keep working (a statically typed
+        // receiver still takes the specialised branches below).
+        if (arr.type.kind === 'any') {
+          const idx = this.tmpName('i');
+          const elem = this.tmpName('v');
+          this.pushScope();
+          this.breakTargets.push(this.tryFrames.length);
+          this.continueTargets.push({ depth: this.tryFrames.length, label: null, used: false });
+          const elemType = this.loopVarType('each', arr.type, stmt.varType);
+          if (stmt.declares && !modVar) this.declareVar(stmt.varName, elemType);
+          this.line(`int ${idx} = 0;`);
+          this.line('for (;;) {');
+          this.indent++;
+          this.line(`as_value ${elem};`);
+          this.line(`if (!as_foreach_next(${arr.code}, &${idx}, &${elem})) break;`);
+          if (stmt.declares) {
+            const lhs = modVar ? this.moduleCName(stmt.varName) : `${this.cTypeName(elemType)} ${this.cIdent(stmt.varName)}`;
+            this.line(`${lhs} = ${this.convert({ code: elem, type: { kind: 'any' } as CType }, elemType)};`);
+          } else {
+            const existing = this.emitVar(stmt.varName);
+            this.line(`${existing.code} = ${this.convert({ code: elem, type: { kind: 'any' } as CType }, existing.type)};`);
+          }
+          this.emitStmt(stmt.body);
+          this.indent--;
+          this.line('}');
+          this.continueTargets.pop();
+          this.breakTargets.pop();
+          this.popScope();
+          break;
+        }
         // XMLList iteration: `for each (child in xml.children)` walks the list's
         // items (each an XML node), mirroring the Array loop below.
         if (arr.type.kind === 'xmllist') {
@@ -18136,7 +20456,7 @@ export class Emitter {
           break;
         }
         if (arr.type.kind !== 'array' && arr.type.kind !== 'vector' && arr.type.kind !== 'dict' && arr.type.kind !== 'record' && !(arr.type.kind === 'object' && arr.type.className === 'Object')) {
-          throw new CodegenError('for-each-in requires an Array, Vector, Dictionary, Object or XMLList');
+          throw new CodegenError('for-each-in requires an Array, Vector, Dictionary, Object or XMLList' + (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : ''));
         }
         if (arr.type.kind === 'vector') {
           const key = this.vectorCName(arr.type.elem);
@@ -18250,7 +20570,7 @@ export class Emitter {
       case 'Switch': {
         this.sequenceValueExpr(stmt.disc, true, true);
         const disc = this.emitExpr(stmt.disc);
-        if (disc.type.kind === 'int' || disc.type.kind === 'uint') {
+        if ((disc.type.kind === 'int' || disc.type.kind === 'uint') && stmt.cases.every((c) => isSwitchLabelConst(c.test))) {
           this.emitSwitchIntegral(stmt, disc);
         } else {
           this.emitSwitchChained(stmt, disc);
@@ -18320,7 +20640,18 @@ export class Emitter {
           }
         } else {
           if (this.tryFrames.length > 0) this.emitUnwind(0);
-          this.line('return;');
+          // A bare `return;` in a function that RETURNS A VALUE is legal AS3 for a
+          // `:*` function (it yields `undefined`) and must not become a C `return;`
+          // in a non-void function (`-Wreturn-mismatch` AND undefined behaviour for
+          // the caller). Measured on com.vsdevelop.net.SharedManage:
+          // `public static function getEncryptedLocalStore(key:String):* {
+          //    if (!EncryptedLocalStore || ...) return;`
+          const rt = this.currentReturnType;
+          if (rt !== null && rt.kind !== 'void') {
+            this.line(`return ${rt.kind === 'any' ? 'as_v_undefined()' : this.defaultInit(rt)};`);
+          } else {
+            this.line('return;');
+          }
         }
         break;
       }
@@ -18329,7 +20660,7 @@ export class Emitter {
         const info = this.symbols.getClass(this.currentClass)!;
         if (!info.superClass) throw new CodegenError(`class '${this.currentClass}' has no superclass`);
         const superInfo = this.symbols.getClass(info.superClass)!;
-        const args = this.emitArgs(superInfo.constructor.params, stmt.args);
+        const args = this.emitArgs(superInfo.constructor.params, stmt.args, superInfo.importAlias);
         const callArgs = args ? ', ' + args : '';
         this.line(`${info.superClass}_ctor((${info.superClass}*)this${callArgs});`);
         break;
@@ -18843,11 +21174,25 @@ export class Emitter {
   // setter or method across the super chain). Static traits are not instance
   // properties, so they are not consulted — the with scope only sees the object's
   // own instance members. Mirrors the precedence emitMember/emitAssign use.
+  //
+  // ACCESSIBILITY is part of the test: a trait this class cannot see is not a
+  // candidate binding for the with object either, so the name falls through to the
+  // enclosing scope instead of becoming an "not accessible here" build error.
+  // That is what makes `with (_layouts) { x = _x; }` (OpenGLVideoRootView: _layouts
+  // is a starling Sprite, whose `_x` is a PRIVATE DisplayObject field) read the
+  // enclosing PARAMETER `_x` -- which is also the only reading mxmlc can compile.
   private withClassHasMember(className: string, name: string): boolean {
-    if (this.symbols.fieldSlot(className, name)) return true;
+    const f = this.symbols.fieldSlot(className, name);
+    // A shadowed field is not the nearest declaration (see emitMember).
+    if (f && !this.symbols.shadowedForRead(className, f.owner, name)
+          && this.symbols.isAccessible(f.visibility, f.owner, this.currentClass)) return true;
     const cinfo = this.symbols.getClass(className);
     if (!cinfo) return false;
-    return cinfo.getters.has(name) || cinfo.setters.has(name) || cinfo.methods.has(name);
+    const members = [cinfo.getters.get(name), cinfo.setters.get(name), cinfo.methods.get(name)];
+    for (const m of members) {
+      if (m && this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) return true;
+    }
+    return false;
   }
 
   // Whether the runtime branch of a scope can claim `name`. A sealed class
@@ -18969,7 +21314,7 @@ export class Emitter {
         const m = cinfo?.methods.get(name);
         const cid = this.cIdent(sc.tmp);
         if (m && !m.isProxyNs) {
-          const args = this.emitArgs(m.params, expr.args);
+          const args = this.emitArgs(m.params, expr.args, this.declAliasOf(m.owner));
           const callArgs = args ? ', ' + args : '';
           return { code: `(${cid}->vtable->${this.cIdent(name)}(${cid}${callArgs}))`, type: m.returnType };
         }
@@ -19073,7 +21418,7 @@ export class Emitter {
       if (sc.mode !== 'sealed' || sc.className === null) continue;
       const s = this.symbols.getClass(sc.className)?.setters.get(name);
       if (s) {
-        return { owner: s.owner, property: name, paramType: this.rt(s.params[0].type), objCode: this.cIdent(sc.tmp), isStatic: false };
+        return { owner: s.owner, property: name, paramType: this.setterParamType(s), objCode: this.cIdent(sc.tmp), isStatic: false };
       }
     }
     return null;
@@ -19203,8 +21548,50 @@ export class Emitter {
     this.breakTargets.pop();
   }
 
+  // Does an equality between these two C types need the DYNAMIC (boxed) path
+  // rather than a raw C comparison? Shared by `emitBinary`'s ==/!= branch and by
+  // `emitSwitchChained` (a non-integer switch lowers to an if/else chain): a
+  // dynamic discriminant compared against a scalar case emitted a raw
+  // `as_dyn_get(...) == 150` C comparison -- an as_value struct against an int
+  // (measured on the real app: `switch (resp.event) { case Type.SessionStarted: }`,
+  // 47 "invalid operands to binary expression" errors).
+  private needsDynamicEquality(a: CType, b: CType): boolean {
+    // An Object-root operand holds a BOXED value, so a scalar on the other side
+    // must be boxed too instead of comparing a pointer against a number: `oo == 1`
+    // with `var oo:Object = true` is true in AS3 (measured on adl 51.4.1,
+    // temp/pkgA/eq.body.as R5), and so is `oo === 5` with `oo = 5` and `oo == "5"`.
+    const objish = (t: CType) => t.kind === 'interface' || (t.kind === 'object' && (t as { className: string }).className === 'Object');
+    // A class instance / object literal compared with a PRIMITIVE also needs the
+    // dynamic path: AIR runs ToPrimitive on the object (ES3 11.9.3), so
+    // 'new WithNum() == 42' is true when its toString is "42" and
+    // '({}) == "[object Object]"' is true. Emitting a raw C pointer-vs-number
+    // comparison instead just yields false (and a -Wpointer-integer-compare).
+    // Same-class pointers and 'obj == null' keep the cheap identity compare.
+    const classish = (t: CType) => t.kind === 'object' || t.kind === 'record';
+    const primish = (t: CType) =>
+      t.kind === 'number' || t.kind === 'int' || t.kind === 'uint' || t.kind === 'bool' ||
+      t.kind === 'string' || t.kind === 'int64' || t.kind === 'uint64';
+    return a.kind === 'any' || b.kind === 'any' || objish(a) || objish(b) ||
+      (classish(a) && primish(b)) || (classish(b) && primish(a));
+  }
+
   // Non-integer switch (string/Number/bool) lowers to an if/else chain using strict
   // equality. Each case is an independent branch, so `break` inside is suppressed.
+  // A switch that cannot become a native C `switch`: a non-integer discriminant,
+  // or a `case` label that is not a compile-time constant (AS3 evaluates every
+  // case expression at runtime, in source order). It still needs C's *matching and
+  // fall-through* semantics -- test the labels into an index, then switch on the
+  // index:
+  //
+  //     { int _swN = 0;
+  //       if (cond0) _swN = 1; else if (cond1) _swN = 2; else _swN = 3; /* default */
+  //       switch (_swN) { case 1: ; ...; case 2: ; ...; case 3: ; ...; } }
+  //
+  // so `case A: case B: <body>` (empty labels falling into the shared body) and a
+  // body that falls through into the next case both behave exactly as in AS3, and a
+  // `switch` `break` stays a PLAIN C `break` -- it exits precisely this index
+  // switch. (The old if/else-chain lowering had to suppress `break`, which also
+  // swallowed the `break` of a *loop* nested inside a case body.)
   private emitSwitchChained(stmt: Extract<Stmt, { kind: 'Switch' }>, disc: { code: string; type: CType }): void {
     const cases = stmt.cases.filter((c) => c.test !== null);
     const def = stmt.cases.find((c) => c.test === null);
@@ -19214,27 +21601,41 @@ export class Emitter {
       return;
     }
 
+    // AS3's switch compares with STRICT equality, so a dynamic discriminant takes
+    // the boxed path (as_v_seq) instead of a raw C `==`.
+    const tmp = this.tmpName('sw');
+    this.line('{');
+    this.indent++;
+    this.line(`int ${tmp} = 0;`);
     for (let i = 0; i < cases.length; i++) {
       const test = this.emitExpr(cases[i].test!);
-      const cond = this.emitEquality(disc, test, '==');
+      const cond = this.needsDynamicEquality(disc.type, test.type)
+        ? `as_v_seq(${this.boxExpr(disc)}, ${this.boxExpr(test)})`
+        : this.emitEquality(disc, test, '==');
       const kw = i === 0 ? 'if' : 'else if';
-      this.line(`${kw} (${cond}) {`);
+      this.line(`${kw} (${cond}) ${tmp} = ${i + 1};`);
+    }
+    // No label matched: the default body's index, or 0 (skip the whole switch).
+    this.line(`else ${tmp} = ${def ? cases.length + 1 : 0};`);
+    this.line(`switch (${tmp}) {`);
+    this.indent++;
+    for (let i = 0; i < cases.length; i++) {
+      // A `case` label must be followed by a statement (see emitSwitchIntegral).
+      this.line(`case ${i + 1}: ;`);
       this.indent++;
-      this.suppressBreak++;
       for (const s of cases[i].body) this.emitStmt(s);
-      this.suppressBreak--;
       this.indent--;
-      this.line('}');
     }
     if (def) {
-      this.line('else {');
+      this.line(`case ${cases.length + 1}: ;`);
       this.indent++;
-      this.suppressBreak++;
       for (const s of def.body) this.emitStmt(s);
-      this.suppressBreak--;
       this.indent--;
-      this.line('}');
     }
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
   }
 
   // Returns declaration text without trailing semicolon.
@@ -19310,7 +21711,7 @@ export class Emitter {
         const cinfo = this.symbols.getClass(cname)!;
         const ss = cinfo.staticSetters?.get(target.property);
         if (ss) {
-          return { owner: ss.owner, property: target.property, paramType: this.rt(ss.params[0].type), objCode: 'NULL', isStatic: true };
+          return { owner: ss.owner, property: target.property, paramType: this.setterParamType(ss), objCode: 'NULL', isStatic: true };
         }
       }
     }
@@ -19318,7 +21719,7 @@ export class Emitter {
     if (obj.type.kind === 'object') {
       const cinfo = this.symbols.getClass(obj.type.className);
       const s = cinfo?.setters.get(target.property);
-      if (s) return { owner: s.owner, property: target.property, paramType: this.rt(s.params[0].type), objCode: obj.code, isStatic: false };
+      if (s) return { owner: s.owner, property: target.property, paramType: this.setterParamType(s), objCode: obj.code, isStatic: false };
     }
     return null;
   }
@@ -19344,12 +21745,12 @@ export class Emitter {
     if (!this.currentIsStatic) {
       const s = cinfo?.setters.get(target.name);
       if (s) {
-        return { owner: s.owner, property: target.name, paramType: this.rt(s.params[0].type), objCode: this.emitVar('this').code, isStatic: false };
+        return { owner: s.owner, property: target.name, paramType: this.setterParamType(s), objCode: this.emitVar('this').code, isStatic: false };
       }
     }
     const ss = cinfo?.staticSetters?.get(target.name);
     if (ss) {
-      return { owner: ss.owner, property: target.name, paramType: this.rt(ss.params[0].type), objCode: 'NULL', isStatic: true };
+      return { owner: ss.owner, property: target.name, paramType: this.setterParamType(ss), objCode: 'NULL', isStatic: true };
     }
     return null;
   }
@@ -19486,6 +21887,36 @@ export class Emitter {
     this.hoistedAssigns.set(e, { tmp, type: v.type });
   }
 
+  // The VALUE of an index store used as an expression. AS3's assignment expression
+  // evaluates to the assigned value, MEASURED on adl 51.4.1 (temp/airref/Main.as):
+  // with an empty ByteArray `(b[0] = 300)` is 300 (b[0] stores 44) and `(b[0] += 10)`
+  // with b[0]=250 is 260 (b[0] stores 4) -- the READ side is the stored byte but the
+  // result is NOT truncated to it. Every C container store (as_array_set,
+  // as_vector_T_set, ByteArray_set_index, as_dict_set, as_object_set, as_dyn_set_v,
+  // as_any_set_v, as_class_set_static) returns void, so the value is materialized in
+  // a temporary FIRST and the same temporary then feeds the store, which keeps the
+  // value un-truncated and evaluates the value expression exactly once.
+  //
+  // Statement position is the exception: a discarded write (b[5] = 7;) has no value
+  // to preserve, so storing straight through keeps the generated C lean (a
+  // temporary per index write would be pure noise in a 1.2 M-line app, and the
+  // structural pins in test/unit/emit.ts + bytearray-amf.ts pin that shape).
+  // `discardedExprNode` is set by the ExprStmt case of emitStmt and compared by
+  // IDENTITY against the assignment node being emitted, so the check can only ever
+  // answer yes for the statement's own top-level expression: an assignment nested
+  // in a larger expression mismatches and materializes. Failing toward the
+  // temporary is always safe.
+  private storeThenValue(store: string, valueCode: string, type: CType): { code: string; type: CType } {
+    if (this.discardedExprNode !== null && this.discardedExprNode === this.currentAssignNode) {
+      // Value thrown away: emit the bare store, the converted value already being
+      // the store call's last argument (no comma expression, no temporary).
+      return { code: store, type };
+    }
+    const t = this.tmpName('sv');
+    this.line(`${this.cTypeName(type)} ${t} = ${valueCode};`);
+    return { code: `(${store}, ${t})`, type };
+  }
+
   // The store half of a container-element update, `x[i] = Number(x[i]) ± 1`, built
   // as an AST the ordinary Assign path can emit (used by the `Update` handling in
   // sequenceValueExpr and emitExpr). `Number(...)` is the ToNumber that the
@@ -19501,6 +21932,29 @@ export class Emitter {
         left: this.toNumberAst(target),
         right: { kind: 'Num', value: 1, isInt: true },
       },
+    };
+  }
+
+  // `o.length++` / `++o.length` / `o.length--` on a Vector or Array. Unlike a plain
+  // field, a built-in container's `length` is a settable property implemented by a
+  // setLength helper (as_vector_<T>_setLength / as_array_set_length): the element
+  // buffer must be resized and any growth filled with the element default. Emitting
+  // the increment as an lvalue on the struct field bumped `length` WITHOUT resizing
+  // the buffer -- measured: `var v:Vector.<int> = new Vector.<int>(); v.length++;`
+  // left `v->data == NULL` with `v->length == 1`, and the next element read
+  // SIGSEGV'd (temp/vlen). Returns the `+= 1` / `-= 1` assignment AST the compound
+  // path emits (the increment operator's own Number arithmetic on the length read),
+  // or null for any other target. Callers keep the old value in a scratch temp when
+  // the result of the update is consumed.
+  private containerLengthStore(target: Expr, op: '++' | '--'): Extract<Expr, { kind: 'Assign' }> | null {
+    if (target.kind !== 'Member' || target.property !== 'length') return null;
+    const recv = this.emitExpr(target.object);
+    if (recv.type.kind !== 'vector' && recv.type.kind !== 'array') return null;
+    return {
+      kind: 'Assign',
+      op: op === '++' ? '+=' : '-=',
+      target,
+      value: { kind: 'Num', value: 1, isInt: true },
     };
   }
 
@@ -19809,6 +22263,10 @@ export class Emitter {
       }
       case 'Filter': {
         this.sequenceValueExpr(e.object, true, guaranteed);
+        // A general predicate over an XML/XMLList receiver is a per-NODE selection
+        // loop, which only a statement position can hold. Build the selection here
+        // (the sequencing pass) and let emitExpr read the finished list.
+        if (e.general && this.emitXmlGeneralFilter(e)) return;
         this.sequenceValueExpr(e.value, true, guaranteed);
         return;
       }
@@ -20048,6 +22506,23 @@ export class Emitter {
           return {
             code: `((${t} = ${o.code}), ${call}, ${expr.prefix ? `(${t} ${sign} 1)` : t})`,
             type: o.type,
+          };
+        }
+        const cl = this.containerLengthStore(expr.target, expr.op);
+        if (cl) {
+          // `v.length++` / `++v.length` on a Vector/Array: the store must go
+          // through setLength (see containerLengthStore), so the read-modify-write
+          // is folded into one C expression `(t = <len>, <setLength>, t[±1])` --
+          // the same shape the Index branch below uses. In statement position the
+          // value is discarded, so the expression is marked so ExprStmt wraps it in
+          // `(void)(...)` and no -Wunused-value warning appears.
+          const t = this.tmpName('upd');
+          this.line(`${this.cTypeName(o.type)} ${t} = ${o.code};`);
+          const store = this.emitAssign(cl);
+          return {
+            code: `(${store.code}, ${expr.prefix ? `(${t} ${expr.op === '++' ? '+' : '-'} 1)` : t})`,
+            type: o.type,
+            discard: true,
           };
         }
         const code = expr.prefix ? `(${expr.op}${o.code})` : `(${o.code}${expr.op})`;
@@ -20298,9 +22773,23 @@ export class Emitter {
         return { code: `as_fn_make(${sm.owner}_${name}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
       }
     }
-    // Module-level (top-level) variables are only visible outside class methods,
-    // so a top-level `stage` never shadows the DisplayObject.stage getter.
-    if (this.currentClass === null) {
+    // File-level (top-level) names: AS3's scope chain inside a method is
+    // locals -> the class's own traits -> the enclosing SCRIPT, so a top-level
+    // `var`/`const` is visible from a class method of the same file. Class members
+    // are resolved ABOVE, which keeps a top-level `stage` from shadowing the
+    // DisplayObject.stage getter (the reason this check used to be gated on
+    // currentClass === null). A package file that puts companion helpers at file
+    // level -- `const SINGLELINE_MODE:PrintSetting = new PrintSetting` next to the
+    // class that reads it, as com/netease/protobuf/TextFormat.as does -- is legal
+    // AIR, verified on mxmlc 51.2.2 + adl 51.4.1 (temp/airref/Main.as: a
+    // file-level `const K` read from a class method of the same file yields 5).
+    //
+    // NOTE: `--air-app` merges every reachable file into ONE script, so this
+    // lookup can also see a file-level name declared in ANOTHER file (AIR scopes
+    // those per file). That is an over-approximation -- it accepts code AIR
+    // rejects -- and it would alias two same-named declarations onto one global,
+    // so index.ts reports the collision loudly when it sees one.
+    {
       const mt = this.moduleScope.get(name);
       if (mt !== undefined) return { code: this.moduleCName(name), type: mt };
     }
@@ -20361,7 +22850,72 @@ export class Emitter {
         return { code: `&${clsName}_cls`, type: { kind: 'class' } };
       }
     }
+    // A bare `length` (or another Array member) inside a `class X extends Array`
+    // is an implicit `this.<member>`: AIR's Array trait is inherited, so
+    // `i < length` inside Sequence.toDER reads the backing array's length.
+    if (this.currentClass && !this.currentIsStatic) {
+      const ci = this.symbols.getClass(this.currentClass);
+      if (ci?.arrayBacked && name === 'length') {
+        const self = this.emitVar('this').code;
+        const ab = this.arrayBackedArrayCode({ code: self, type: { kind: 'object', className: this.currentClass } }, self);
+        if (ab) return { code: `(${ab.code}->length)`, type: { kind: 'int' } };
+      }
+    }
+    // A package-level built-in function used as a value (`var f:Function =
+    // getTimer`; the thunk is emitted by emitFunctionValues). Last, so every
+    // declared name -- local, class member, module var, free function, nested
+    // function, class -- has already had its chance to win.
+    const bArity = Emitter.BUILTIN_FN_VALUES.get(name);
+    if (bArity !== undefined) return { code: `as_fn_make(${name}__call, NULL, ${bArity})`, type: { kind: 'function' } };
+    // A bare identifier that resolves nowhere, inside an INSTANCE method of a
+    // DYNAMIC class, is `this.<name>` at runtime: AS3 resolves an unqualified name
+    // against the instance's own properties, and a dynamic instance's property
+    // table holds whatever was assigned at runtime (reading an absent one yields
+    // undefined, never a compile error). This is exactly how a project class
+    // derived from a baked SWC symbol reaches the symbol's named timeline children
+    // -- `class upLoadView extends uploadskin` reads `select`/`cancel`/`dragfile`,
+    // which the baker installs as dynamic properties (as_swc_child_name). Sealed
+    // classes keep the compile error: their instances cannot carry an undeclared
+    // name, so such a reference really is bogus.
+    if (this.currentClass && !this.currentIsStatic && this.classIsDynamic(this.currentClass)) {
+      return { code: `as_dyn_get((void*)(${this.emitVar('this').code}), "${this.escapeCString(name)}")`, type: { kind: 'any' } };
+    }
+    // A core language class used as a Class VALUE (`var c:Class = int`,
+    // `return String`, `case Array:`, `getDefinitionByName("int")`). These names
+    // are not ClassInfos, so the `_cls` branch above cannot see them; the shared
+    // object emitted by emitClassRegistry is handed out here (see CORE_CLASS_VT).
+    if (Emitter.CORE_CLASS_VT[name] !== undefined) return { code: `&as_corecls_${name}`, type: { kind: 'class' } };
+    // A bare unresolved `length` inside a CLASS scope is AIR's compile-time
+    // constant 1. ASC resolves the name against the class scope (the class's Class
+    // object carries a `length` slot) and FOLDS it: `if (sofar < length)` in
+    // vendored library code becomes `sofar < 1` (measured on mxmlc 51.2.2 -- the
+    // emitted SWF holds `pushbyte 1` / `pushstring "1"`, and `typeof` folds to
+    // "number"). The same read at PACKAGE level is a hard "possibly undefined
+    // property" error, and so is every OTHER unknown bare name in class scope
+    // (e.g. `sofar_kind`) -- hence this is NOT a general unknown-name fallback:
+    // only the name `length`, only where a class scope exists. Writing it is
+    // illegal in AIR ("assignment to a const"), so a write still falls through to
+    // the ordinary assignment path. Real declaration sites (a member named
+    // `length`, an `extends Array` implicit member) all resolve earlier.
+    if (this.currentClass && name === 'length') return { code: '1.0', type: { kind: 'number' } };
     throw new CodegenError(`undefined variable '${name}'` + (this.currentClass ? ` in class ${this.currentClass}` : ' at top level') + (this.currentClosureCaptures ? ` (closure captures: [${[...this.currentClosureCaptures.keys()].join(', ')}])` : ''));
+  }
+
+  // Is this class (or any ancestor) an AS3 `dynamic class`? The flag is inherited
+  // along the super chain like `isDynamic` in the symbol table's own expansion, but
+  // the walk is repeated here so a bare-name read cannot depend on the ORDER in
+  // which class info was expanded.
+  private classIsDynamic(cname: string): boolean {
+    let cur: string | null = cname;
+    const seen = new Set<string>();
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      const info = this.symbols.getClass(cur);
+      if (info === undefined) return false;
+      if (info.isDynamic) return true;
+      cur = info.superClass;
+    }
+    return false;
   }
 
   // Whether a statement/expression tree references AS3's `arguments` object.
@@ -20601,23 +23155,7 @@ export class Emitter {
     // comparison
     if (op === '==' || op === '!=' || op === '===' || op === '!==') {
       const strict = op === '===' || op === '!==';
-      // An Object-root operand holds a BOXED value, so a scalar on the other side
-      // must be boxed too instead of comparing a pointer against a number: `oo == 1`
-      // with `var oo:Object = true` is true in AS3 (measured on adl 51.4.1,
-      // temp/pkgA/eq.body.as R5), and so is `oo === 5` with `oo = 5` and `oo == "5"`.
-      const objish = (t: CType) => t.kind === 'interface' || (t.kind === 'object' && (t as { className: string }).className === 'Object');
-      // A class instance / object literal compared with a PRIMITIVE also needs the
-      // dynamic path: AIR runs ToPrimitive on the object (ES3 11.9.3), so
-      // 'new WithNum() == 42' is true when its toString is "42" and
-      // '({}) == "[object Object]"' is true. Emitting a raw C pointer-vs-number
-      // comparison instead just yields false (and a -Wpointer-integer-compare).
-      // Same-class pointers and 'obj == null' keep the cheap identity compare.
-      const classish = (t: CType) => t.kind === 'object' || t.kind === 'record';
-      const primish = (t: CType) =>
-        t.kind === 'number' || t.kind === 'int' || t.kind === 'uint' || t.kind === 'bool' ||
-        t.kind === 'string' || t.kind === 'int64' || t.kind === 'uint64';
-      if (l.type.kind === 'any' || r.type.kind === 'any' || objish(l.type) || objish(r.type) ||
-          (classish(l.type) && primish(r.type)) || (classish(r.type) && primish(l.type))) {
+      if (this.needsDynamicEquality(l.type, r.type)) {
         // Strict equality (`===`/`!==`) dispatches on tag only; loose (`==`/`!=`)
         // is ES3 Abstract Equality (undefined == null, and a String/Boolean
         // counterpart of a Number is coerced to Number) via as_v_loose_eq.
@@ -21002,7 +23540,7 @@ export class Emitter {
         const got = isLocal ? undefined : this.symbols.findGetter(this.currentClass, target.name);
         if (set && got && !got.g.isStatic) {
           const truthy = this.condExpr(t);
-          const v = this.convert(this.emitExpr(expr.value), this.rt(set.s.params[0].type));
+          const v = this.convert(this.emitExpr(expr.value), this.setterParamType(set.s));
           const write = this.setterCallCode(set.owner, target.name, false, 'this', v);
           if (expr.op === '||=') {
             return { code: `(${truthy} ? ${t.code} : ${write})`, type: t.type, discard: true };
@@ -21026,7 +23564,7 @@ export class Emitter {
                 const got = this.symbols.findGetter(obj.type.className, target.property);
                 if (!set || !got) return null;
                 const recv = this.guardRecv(target.object, obj);
-                return { paramType: this.rt(set.s.params[0].type), write: (v: string) => this.setterCallCode(set.owner, target.property, false, recv, v) };
+                return { paramType: this.setterParamType(set.s), write: (v: string) => this.setterCallCode(set.owner, target.property, false, recv, v) };
               })()
             : obj.type.kind === 'interface'
               ? (() => {
@@ -21034,7 +23572,7 @@ export class Emitter {
                   const s = iinfo?.setters.get(target.property);
                   if (!s || !iinfo!.getters.has(target.property)) return null;
                   const self = `(void*)as_req_obj((void*)(${obj.code}.obj))`;
-                  return { paramType: this.rt(s.params[0].type), write: (v: string) => `${obj.code}.vt->set_${this.cIdent(target.property)}(${self}, ${v})` };
+                  return { paramType: this.setterParamType(s), write: (v: string) => `${obj.code}.vt->set_${this.cIdent(target.property)}(${self}, ${v})` };
                 })()
               : null;
         if (pair) {
@@ -21113,6 +23651,10 @@ export class Emitter {
   }
 
   private emitAssign(expr: Extract<Expr, { kind: 'Assign' }>): { code: string; type: CType; discard?: boolean } {
+    // Remember which assignment node this is, so storeThenValue can tell whether the
+    // assignment IS the enclosing statement's discarded expression (identity, not
+    // equality: a nested assignment can never be).
+    this.currentAssignNode = expr;
     const hoisted = this.hoistedAssigns.get(expr);
     if (hoisted) return { code: hoisted.tmp, type: hoisted.type };
     const target = expr.target;
@@ -21136,6 +23678,29 @@ export class Emitter {
       const obj = this.emitExpr(target.object);
       // Null-receiver guard (#1009): `a[0] = v` on a null Array throws in AIR.
       const recv = this.guardRecv(target.object, obj);
+      // `class X extends Array`: the index write lands on the hidden backing array.
+      const abT = this.arrayBackedArrayCode(obj, recv);
+      if (abT) {
+        const idxExpr = this.emitExpr(target.index);
+        if (!this.indexKeyIsNumeric(idxExpr.type)) {
+          if (expr.op !== '=') throw new CodegenError('a string-indexed Array write only supports simple assignment');
+          const v = this.emitExpr(expr.value);
+          // Trait-first, exactly like the read: a declared field/setter of the
+          // subclass wins, and only a miss reaches the backing array.
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_dyn_set_v((void*)(${recv}), ${this.toStringExpr(idxExpr)}, ${bv})`, bv, { kind: 'any' });
+        }
+        const idx = this.convert(idxExpr, { kind: 'int' });
+        if (expr.op === '=') {
+          const v = this.emitExpr(expr.value);
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_array_set(${abT.code}, ${idx}, ${bv})`, bv, { kind: 'any' });
+        }
+        const op2 = COMPOUND_BASE[expr.op];
+        const combined2 = this.emitBinary({ kind: 'Binary', op: op2, left: target, right: expr.value });
+        const b2 = this.boxExpr(combined2);
+        return this.storeThenValue(`as_array_set(${abT.code}, ${idx}, ${b2})`, b2, { kind: 'any' });
+      }
       if (obj.type.kind === 'vector') {
         const elem = obj.type.elem;
         const key = this.vectorCName(elem);
@@ -21143,34 +23708,38 @@ export class Emitter {
         if (!this.indexKeyIsNumeric(idxExpr.type)) {
           if (expr.op !== '=') throw new CodegenError('a string-indexed Vector write only supports simple assignment');
           const v = this.emitExpr(expr.value);
-          return { code: `as_vec_set_impl((void*)(${recv}), ${this.toStringExpr(idxExpr)}, ${this.boxExpr(v)})`, type: elem };
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_vec_set_impl((void*)(${recv}), ${this.toStringExpr(idxExpr)}, ${bv})`, bv, elem);
         }
         const idx = this.convert(idxExpr, { kind: 'int' });
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
           const ev = this.convert(v, elem);
-          return { code: `as_vector_${key}_set(${recv}, ${idx}, ${ev})`, type: elem };
+          return this.storeThenValue(`as_vector_${key}_set(${recv}, ${idx}, ${ev})`, ev, elem);
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
         const cv = this.convert(combined, elem);
-        return { code: `as_vector_${key}_set(${recv}, ${idx}, ${cv})`, type: elem };
+        return this.storeThenValue(`as_vector_${key}_set(${recv}, ${idx}, ${cv})`, cv, elem);
       }
       if (obj.type.kind === 'array') {
         const idxExpr = this.emitExpr(target.index);
         if (!this.indexKeyIsNumeric(idxExpr.type)) {
           if (expr.op !== '=') throw new CodegenError('a string-indexed Array write only supports simple assignment');
           const v = this.emitExpr(expr.value);
-          return { code: `as_array_key_set(${recv}, ${this.toStringExpr(idxExpr)}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_array_key_set(${recv}, ${this.toStringExpr(idxExpr)}, ${bv})`, bv, { kind: 'any' });
         }
         const idx = this.convert(idxExpr, { kind: 'int' });
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
-          return { code: `as_array_set(${recv}, ${idx}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_array_set(${recv}, ${idx}, ${bv})`, bv, { kind: 'any' });
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
-        return { code: `as_array_set(${recv}, ${idx}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+        const b = this.boxExpr(combined);
+        return this.storeThenValue(`as_array_set(${recv}, ${idx}, ${b})`, b, { kind: 'any' });
       }
       // ByteArray[i] = v writes a byte at an absolute index (AVM2's index form,
       // not the dynamic property table -- AIR does not throw #1056 here). Writes
@@ -21188,7 +23757,11 @@ export class Emitter {
         // "5" wrote 0 where AIR writes 5 (measured, temp/baidxprobe).
         const ve = this.emitExpr(value as Expr);
         const dv = ve.type.kind === 'any' ? `as_v_to_number(${ve.code})` : this.toNumberExpr(ve);
-        return { code: `ByteArray_set_index((void*)(${recv}), ${idx}, ${dv})`, type: { kind: 'void' } };
+        // The expression's VALUE is the assigned value, NOT the byte that lands in
+        // the buffer (measured on adl 51.4.1: `(b[0] = 300)` is 300 while b[0] stores
+        // 44, and `(b[0] += 10)` with b[0]=250 is 260 while b[0] stores 4). The store
+        // returns void, so the value is materialized first (see storeThenValue).
+        return this.storeThenValue(`ByteArray_set_index((void*)(${recv}), ${idx}, ${dv})`, dv, { kind: 'number' });
       }
       // Dictionary obj[key] = v, key is an object reference.
       if (obj.type.kind === 'dict') {
@@ -21196,11 +23769,13 @@ export class Emitter {
         const keyRef = this.dictKeyRef(key);
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
-          return { code: `as_dict_set(${obj.code}, ${keyRef}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_dict_set(${obj.code}, ${keyRef}, ${bv})`, bv, { kind: 'any' });
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
-        return { code: `as_dict_set(${obj.code}, ${keyRef}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+        const b = this.boxExpr(combined);
+        return this.storeThenValue(`as_dict_set(${obj.code}, ${keyRef}, ${b})`, b, { kind: 'any' });
       }
       // record / Object / any dynamic key write.
       const key = this.emitExpr(target.index);
@@ -21208,11 +23783,13 @@ export class Emitter {
       if (obj.type.kind === 'record') {
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
-          return { code: `as_object_set(${recv}, ${keyStr}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_object_set(${recv}, ${keyStr}, ${bv})`, bv, { kind: 'any' });
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
-        return { code: `as_object_set(${recv}, ${keyStr}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+        const b = this.boxExpr(combined);
+        return this.storeThenValue(`as_object_set(${recv}, ${keyStr}, ${b})`, b, { kind: 'any' });
       }
       // Any class instance supports obj[key] = value dynamic write: route through
       // as_dyn_set, which walks the vtable super chain for a reflectable field
@@ -21222,20 +23799,49 @@ export class Emitter {
       if (obj.type.kind === 'object') {
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
-          return { code: `as_dyn_set_v((void*)(${recv}), ${keyStr}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_dyn_set_v((void*)(${recv}), ${keyStr}, ${bv})`, bv, { kind: 'any' });
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
-        return { code: `as_dyn_set_v((void*)(${recv}), ${keyStr}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+        const b = this.boxExpr(combined);
+        return this.storeThenValue(`as_dyn_set_v((void*)(${recv}), ${keyStr}, ${b})`, b, { kind: 'any' });
       }
       if (obj.type.kind === 'any') {
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
-          return { code: `as_any_set_v(as_req_box(${obj.code}), ${keyStr}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          const bv = this.boxExpr(v);
+          return this.storeThenValue(`as_any_set_v(as_req_box(${obj.code}), ${keyStr}, ${bv})`, bv, { kind: 'any' });
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
-        return { code: `as_any_set_v(as_req_box(${obj.code}), ${keyStr}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+        const b = this.boxExpr(combined);
+        return this.storeThenValue(`as_any_set_v(as_req_box(${obj.code}), ${keyStr}, ${b})`, b, { kind: 'any' });
+      }
+      // A Class receiver indexed by a computed key: the SAME lookup AIR performs on
+      // the class object's static traits. A declared static field is written (its
+      // slot address is in the class's static table); an unknown name or a computed
+      // static reports itself (see as_class_set_static).
+      if (obj.type.kind === 'class') {
+        if (expr.op !== '=') throw new CodegenError('a compound assignment to a Class-indexed member is not supported by this subset');
+        const v = this.emitExpr(expr.value);
+        const bv = this.boxExpr(v);
+        return this.storeThenValue(`as_class_set_static((as_class*)(void*)(${recv}), ${keyStr}, ${bv})`, bv, { kind: 'any' });
+      }
+      // xml[computedName] = v: the SAME E4X child write as xml.prop = v (see the
+      // Member path) -- a computed child name is the runtime-key form of it.
+      if (obj.type.kind === 'xml' || obj.type.kind === 'xmllist') {
+        if (expr.op !== '=') {
+          throw new CodegenError(
+            'a compound write through a computed XML child name is not supported by this subset' +
+            (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : '')
+          );
+        }
+        const text = this.toStringExpr(this.emitExpr(expr.value));
+        const k = key.type.kind === 'string' ? key.code : this.toStringExpr(key);
+        return obj.type.kind === 'xml'
+          ? { code: `as_xml_set_child(${recv}, ${k}, ${text})`, type: { kind: 'void' }, discard: true }
+          : { code: `as_xml_list_set_child(${recv}, ${k}, ${text})`, type: { kind: 'void' }, discard: true };
       }
       throw new CodegenError('index write on non-dynamic type');
     }
@@ -21261,17 +23867,60 @@ export class Emitter {
       }
       const s = superInfo.setters.get(target.property);
       if (s) {
-        const paramType = this.rt(s.params[0].type);
+        const paramType = this.setterParamType(s);
         const code = expr.op === '='
           ? this.convert(this.emitExpr(expr.value), paramType)
           : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
         return { code: `${s.owner}_set_${target.property}(this, ${code})`, type: { kind: 'void' } };
       }
+      if (as3Gap('super prop set', `${info.superClass}.${target.property}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
       throw new CodegenError(`undefined property '${target.property}' on superclass '${info.superClass}'`);
     }
 
+    // xml.@attr = v: an E4X attribute WRITE. E4X converts the assigned value to a
+    // String -- the same scalar view emitAttrAccess reads back -- so the value is
+    // stringified here. AIR writes every node of an XMLList and CREATES the attribute
+    // when it is absent; as_xml_set_attr does both (see its note on slot order).
+    // A compound operator (`xml.@a += "x"`) is read-modify-write, which no call site
+    // in this subset uses, so it names itself instead of guessing.
+    if (target.kind === 'AttrAccess') {
+      if (expr.op !== '=') {
+        throw new CodegenError(
+          `'${expr.op}' on an E4X attribute is not supported (only a plain '=' attribute write is)` +
+          (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : '')
+        );
+      }
+      const o = this.emitExpr(target.object);
+      const attr = this.escapeCString(target.name);
+      const value = this.toStringExpr(this.emitExpr(expr.value));
+      if (o.type.kind === 'xml') {
+        return { code: `as_xml_set_attr(${o.code}, "${attr}", ${value})`, type: { kind: 'void' }, discard: true };
+      }
+      if (o.type.kind === 'xmllist') {
+        return { code: `as_xml_list_set_attr(${o.code}, "${attr}", ${value})`, type: { kind: 'void' }, discard: true };
+      }
+      // Same rule as the read: on a Proxy/dynamic object `@` is an ordinary dynamic
+      // write of the attribute NAME (see emitAttrAccess).
+      if (o.type.kind === 'object') {
+        const cinfo = this.symbols.getClass(o.type.className);
+        if (cinfo?.isProxy || cinfo?.isDynamic) {
+          return { code: `as_dyn_set((void*)(${o.code}), "${attr}", as_v_str(${value}))`, type: { kind: 'void' }, discard: true };
+        }
+      }
+      throw new CodegenError(
+        `'@' attribute write on non-XML type ${o.type.kind}` +
+        (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : '')
+      );
+    }
+
     if (target.kind !== 'Var' && target.kind !== 'Member') {
-      throw new CodegenError('invalid assignment target');
+      // A target shape no branch above claimed. Name the AST kind and the enclosing
+      // method: in a multi-file --air-app program a bare line:col does not identify
+      // the source file, and the kind is what says WHAT could not be written.
+      throw new CodegenError(
+        `invalid assignment target (node kind '${target.kind}')` +
+        (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : '')
+      );
     }
 
     // o.x = v (and o.x OP= v) on an object literal: mutate the associative map.
@@ -21293,6 +23942,17 @@ export class Emitter {
       }
       // static field: ClassName.field = v
       if (target.object.kind === 'Var') {
+        // `System.useCodePage = v` is the one WRITABLE property of the static-only
+        // pseudo-class System (every other System name is a read-only constant, so
+        // the read side lives in emitSystemConst and a write there has no receiver
+        // object at all -- without this branch the identifier `System` fell through
+        // to the variable path and reported "undefined variable 'System'").
+        if (target.object.name === 'System' && target.property === 'useCodePage') {
+          const code = expr.op === '='
+            ? this.convert(this.emitExpr(expr.value), { kind: 'bool' })
+            : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), { kind: 'bool' });
+          return { code: `as_sys_set_use_code_page(${code})`, type: { kind: 'void' } };
+        }
         const cname = this.resolveClassName(target.object.name);
         if (this.symbols.hasClass(cname)) {
           const cinfo = this.symbols.getClass(cname)!;
@@ -21311,7 +23971,7 @@ export class Emitter {
             if (!this.symbols.isAccessible(ss.visibility, ss.owner, this.currentClass)) {
               throw new CodegenError(`static setter '${target.property}' is not accessible here`);
             }
-            const paramType = this.rt(ss.params[0].type);
+            const paramType = this.setterParamType(ss);
             const code = expr.op === '='
               ? this.convert(this.emitExpr(expr.value), paramType)
               : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
@@ -21322,6 +23982,31 @@ export class Emitter {
       const obj = this.emitExpr(target.object);
       // Null-receiver guard (#1009): `o.x = v` on a null receiver throws in AIR.
       const recv = this.guardRecv(target.object, obj);
+      // `class X extends Array` (array-backed): `.length` and any undeclared
+      // property write address the hidden backing array, exactly as a plain Array
+      // would. Handled before the ordinary member paths below so the Array rules
+      // (real resize, named-property table) apply unchanged.
+      {
+        const ab = this.arrayBackedArrayCode(obj, recv);
+        if (ab) {
+          if (target.property === 'length') {
+            if (expr.op !== '=') throw new CodegenError('Array.length only supports simple assignment');
+            const n = this.convert(this.emitExpr(expr.value), { kind: 'uint' });
+            return { code: `as_array_set_length(${ab.code}, ${n})`, type: { kind: 'void' } };
+          }
+          const key = `"${this.escapeCString(target.property)}"`;
+          // Named property write/read go through the dynamic accessors so a
+          // DECLARED member of the subclass keeps winning (the static member path
+          // above already handled that case; this is the Array-side fallback).
+          if (expr.op === '=') {
+            const v = this.emitExpr(expr.value);
+            return { code: `as_dyn_set_v((void*)(${recv}), ${key}, ${this.boxExpr(v)})`, type: { kind: 'any' } };
+          }
+          const op = COMPOUND_BASE[expr.op];
+          const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
+          return { code: `as_dyn_set_v((void*)(${recv}), ${key}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
+        }
+      }
       // Class-typed receiver: `classValue.field = v` stores into the class's static
       // field in AIR. That write path is not implemented, so it fails loudly (see
       // as_class_set_static) instead of silently dropping the write.
@@ -21330,20 +24015,24 @@ export class Emitter {
         const cv = this.emitExpr(expr.value);
         return { code: `as_class_set_static((as_class*)(void*)(${recv}), "${this.escapeCString(target.property)}", ${this.boxExpr(cv)})`, type: { kind: 'void' } };
       }
-      // Vector.length = n: shrink truncates; grow fills with element default.
+      // Vector.length = n: shrink truncates; grow fills with element default. A
+      // compound form (`v.length += 2`, the protobuf WritingBuffer.beginBlock
+      // idiom) is the read-modify-write AIR performs on any accessor pair, so it
+      // folds through the length read exactly as the getter/setter branches below
+      // do -- AIR's Vector.length is a plain settable property, not an error.
       if (obj.type.kind === 'vector' && target.property === 'length') {
-        if (expr.op !== '=') throw new CodegenError('Vector.length only supports simple assignment');
-        const n = this.convert(this.emitExpr(expr.value), { kind: 'int' });
-        return { code: `as_vector_${this.vectorCName(obj.type.elem)}_setLength(${recv}, ${n})`, type: { kind: 'void' } };
+        const n = expr.op === '=' ? this.emitExpr(expr.value)
+          : this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value });
+        return { code: `as_vector_${this.vectorCName(obj.type.elem)}_setLength(${recv}, ${this.convert(n, { kind: 'int' })})`, type: { kind: 'void' } };
       }
       // Array.length = n: a real resize (growth fills `undefined`, shrinkage
       // truncates, named properties survive) -- AIR semantics, measured on adl
       // 51.4.1 (temp/strkeyprobe). Writing the raw `length` field, as this used to
       // fall through to, left the element buffer unsized.
       if (obj.type.kind === 'array' && target.property === 'length') {
-        if (expr.op !== '=') throw new CodegenError('Array.length only supports simple assignment');
-        const n = this.convert(this.emitExpr(expr.value), { kind: 'uint' });
-        return { code: `as_array_set_length(${recv}, ${n})`, type: { kind: 'void' } };
+        const n = expr.op === '=' ? this.emitExpr(expr.value)
+          : this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value });
+        return { code: `as_array_set_length(${recv}, ${this.convert(n, { kind: 'uint' })})`, type: { kind: 'void' } };
       }
       // Vector.fixed = b: a plain flag write, no length change by itself.
       if (obj.type.kind === 'vector' && target.property === 'fixed') {
@@ -21418,7 +24107,7 @@ export class Emitter {
         const iinfo = this.symbols.interfaces.get(iname);
         const s = iinfo?.setters.get(target.property);
         if (s) {
-          const paramType = this.rt(s.params[0].type);
+          const paramType = this.setterParamType(s);
           // Compound assignment folds the old value in through the getter
           // (`i.prop += v` => set(i, get(i) OP v)), matching AS3 semantics.
           const code = expr.op === '='
@@ -21430,6 +24119,7 @@ export class Emitter {
           // A getter without a setter is read-only; AIR's mxmlc rejects the write.
           throw new CodegenError(`cannot assign to read-only property '${target.property}' of interface '${iname}'`);
         }
+        if (as3Gap('interface prop set', `${iname}.${target.property}`)) return { code: 'as_v_null()', type: { kind: 'void' } };
         throw new CodegenError(`undefined property '${target.property}' on interface '${iname}'`);
       }
       // setter: obj.prop = v -> ClassName_set_prop(obj, v)
@@ -21437,7 +24127,7 @@ export class Emitter {
         const cinfo = this.symbols.getClass(obj.type.className);
         const s = cinfo?.setters.get(target.property);
         if (s) {
-          const paramType = this.rt(s.params[0].type);
+          const paramType = this.setterParamType(s);
           // Compound assignment reads the current value through the getter and
           // folds it in (`obj.prop += v` => `set(obj, get(obj) OP v)`) instead of
           // discarding the old value.
@@ -21459,6 +24149,33 @@ export class Emitter {
           return { code: `as_dyn_set_v((void*)(${recv}), ${key}, ${this.boxExpr(combined)})`, type: { kind: 'any' } };
         }
       }
+      // xml.prop = v: an E4X CHILD write (the read side is emitMember's
+      // as_xml_children). Measured on adl 51.4.1 (temp/airref/Main.as): the FIRST
+      // matching child's content is replaced and any further matches are removed, or
+      // a new <prop>value</prop> element is APPENDED when none exists; the value is
+      // converted to a String. Without this branch the write fell through to the
+      // generic lvalue path below, which used the READ helper as an assignment
+      // target (as_xml_children(...) = ..., "expression is not assignable" --
+      // com/vsdevelop/controls/Fps.as:54 `xml.fps = "FPS: " + fps + ...`).
+      if (obj.type.kind === 'xml' || obj.type.kind === 'xmllist') {
+        const valueExpr = expr.op === '='
+          ? this.emitExpr(expr.value)
+          : this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value });
+        if (valueExpr.type.kind === 'xml' || valueExpr.type.kind === 'xmllist') {
+          // E4X inserts COPIES of the given nodes as the child's content; this
+          // subset implements the text form, so a node-valued write names itself
+          // rather than inserting the XML's serialized text (silently wrong).
+          throw new CodegenError(
+            `assigning an XML value to child property '${target.property}' is not supported by this subset` +
+            (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : '')
+          );
+        }
+        const text = this.toStringExpr(valueExpr);
+        const nm = `"${this.escapeCString(target.property)}"`;
+        return obj.type.kind === 'xml'
+          ? { code: `as_xml_set_child(${recv}, ${nm}, ${text})`, type: { kind: 'void' }, discard: true }
+          : { code: `as_xml_list_set_child(${recv}, ${nm}, ${text})`, type: { kind: 'void' }, discard: true };
+      }
     }
 
     // Bare-identifier setter assignment (`nativeOverlayBlocksTouches = true` or a
@@ -21477,7 +24194,7 @@ export class Emitter {
           const s = cinfo?.setters.get(target.name);
           if (s) {
             const self = this.emitVar('this').code;
-            const paramType = this.rt(s.params[0].type);
+            const paramType = this.setterParamType(s);
             const code = expr.op === '='
               ? this.convert(this.emitExpr(expr.value), paramType)
               : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
@@ -21486,7 +24203,7 @@ export class Emitter {
         }
         const ss = cinfo?.staticSetters?.get(target.name);
         if (ss) {
-          const paramType = this.rt(ss.params[0].type);
+          const paramType = this.setterParamType(ss);
           const code = expr.op === '='
             ? this.convert(this.emitExpr(expr.value), paramType)
             : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
@@ -21551,6 +24268,19 @@ export class Emitter {
   }
 
   private emitCall(expr: Extract<Expr, { kind: 'Call' }>): { code: string; type: CType } {
+    // `SomeClass["member"](...)` is the same lookup as `SomeClass.member(...)`: AIR
+    // resolves both through the class object's traits. Normalize the dynamic form
+    // before dispatching so a static CALL that carries its name as a string reaches
+    // the same special-case emission as the dotted spelling -- e.g.
+    // `System["disposeXML"](xml)` (com/vsdevelop/system/Gc.as:36), whose callee
+    // would otherwise be treated as an index read of a variable named `System`.
+    if (expr.callee.kind === 'Index' && expr.callee.index.kind === 'Str' && expr.callee.object.kind === 'Var' &&
+        !this.varInScope(expr.callee.object.name)) {
+      const name = expr.callee.object.name;
+      if (this.symbols.hasClass(this.resolveClassName(name)) || Emitter.STATIC_ONLY_CLASSES.has(name)) {
+        return this.emitCall({ kind: 'Call', callee: { kind: 'Member', object: expr.callee.object, property: expr.callee.index.value }, args: expr.args });
+      }
+    }
     const callee = expr.callee;
 
     // builtin trace(...)
@@ -21575,6 +24305,14 @@ export class Emitter {
       // boundaries, so there is no stop-the-world collection to forestall).
       if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'pauseForGCIfCollectionImminent') {
         return { code: '(void)0', type: { kind: 'void' } };
+      }
+      // System.setClipboard(str): a real Clipboard request on a real OS. This
+      // build has no clipboard backend (no OS clipboard binding in the runtime),
+      // so the call reports itself once and copies nothing — a silent no-op would
+      // make a "copied!" toast a lie.
+      if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'setClipboard') {
+        const a = this.emitExpr(expr.args[0]);
+        return { code: `(void)(${a.code}), (as_shell_unsupported((char*)"flash.system.System.setClipboard"), (void)0)`, type: { kind: 'void' } };
       }
       // System.disposeXML(xml): AIR hint to release an XML object early. Our GC
       // reclaims XML automatically, so it is a no-op (the argument is still
@@ -21605,9 +24343,24 @@ export class Emitter {
             if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
               throw new CodegenError(`static method '${callee.property}' is not accessible here`);
             }
-            const args = this.emitArgs(sm.params, expr.args);
+            const args = this.emitArgs(sm.params, expr.args, this.declAliasOf(sm.owner));
             return { code: `${sm.owner}_${callee.property}_static(${args})`, type: sm.returnType };
           }
+          // A static FIELD holding a callable value (`static var getTime:Function =
+          // getTimer;` then `LibCore.getTime()`): AIR dispatches through the field's
+          // value, so it is called like any other Function-typed value. Tried BEFORE
+          // the member-gap hook, so a Function-typed static is never misreported as
+          // a missing static method.
+          const sf = cinfo.staticFields.get(callee.property);
+          if (sf !== undefined && (sf.type.kind === 'function' || sf.type.kind === 'any')) {
+            const ce = this.emitExpr(callee);
+            if (ce.type.kind === 'function') return this.emitFunctionCall(ce, expr.args);
+            const items = expr.args.map((a) => this.boxExpr(this.emitExpr(a)));
+            const n = items.length;
+            const arr = n > 0 ? `(as_value[${n}]){ ${items.join(', ')} }` : 'NULL';
+            return { code: `as_fn_call_dyn(${ce.code}, ${arr}, ${n}, "${this.escapeCString(callee.property)}")`, type: { kind: 'any' } };
+          }
+          if (as3Gap('static method', `${callee.object.name}.${callee.property} [in ${this.currentClass}.${this.currentMethod}]`)) return { code: 'as_v_null()', type: { kind: 'any' } };
           throw new CodegenError(`undefined static method '${callee.property}' on class '${callee.object.name}'`);
         }
       }
@@ -21642,6 +24395,14 @@ export class Emitter {
       }
       if (obj.type.kind === 'array') {
         return this.emitArrayMethod(obj, callee.property, expr.args);
+      }
+      // `class X extends Array`: an Array member the class does not override
+      // dispatches to the same as_array_* helpers with the backing array.
+      {
+        const ab = this.arrayBackedArrayCode(obj, obj.code);
+        if (ab && !this.arrayBackedDeclares(obj.type, callee.property)) {
+          return this.emitArrayMethod(ab, callee.property, expr.args);
+        }
       }
       if (obj.type.kind === 'vector') {
         return this.emitVectorMethod(obj, callee.property, expr.args);
@@ -21682,9 +24443,10 @@ export class Emitter {
             const objExpr = `(as_req_obj((void*)(${obj.code}.obj)))`;
             return this.emitAccessorInvoke(`(${obj.code}.vt->get_${this.cIdent(callee.property)}(${objExpr}))`, g.returnType, expr.args);
           }
+          if (as3Gap('interface method', `${obj.type.name}.${callee.property}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
           throw new CodegenError(`undefined method '${callee.property}' on interface '${obj.type.name}'`);
         }
-        const args = this.emitArgs(m.params, expr.args);
+        const args = this.emitArgs(m.params, expr.args, this.declAliasOf(m.owner));
         const callArgs = args ? ', ' + args : '';
         return { code: `(${obj.code}.vt->${this.cIdent(callee.property)}((void*)as_req_obj((void*)(${obj.code}.obj))${callArgs}))`, type: m.returnType };
       }
@@ -21756,11 +24518,49 @@ export class Emitter {
           return this.emitAccessorInvoke(`(${obj.code}->vtable->get_${this.cIdent(callee.property)}(${obj.code}))`, gg.g.returnType, expr.args);
         }
       }
-      if (!m) throw new CodegenError(`undefined method '${callee.property}' on class '${obj.type.className}'`);
+      if (!m) {
+        // A member MISS on an SWC symbol class is not a source error: the symbol's
+        // own ActionScript lives in the library's DoABC (Flash Professional compiled
+        // it into the .swf), which swc.md §3.3 puts out of scope, so the baker
+        // synthesizes the display tree and the base class but cannot know the members
+        // the symbol declares (measured: `toastbtn.setText(...)` in
+        // cn.edoctor.controls.ToastScreen -- toastbtn is character #634 of skin.swc).
+        // Report it loudly (the shell warning, capped) and continue with null, the
+        // same shape as a shell class member. Args are still evaluated, because AIR
+        // would have run them.
+        if (this.swcSymbolClass(obj.type.className)) {
+          const label = `${obj.type.className}.${callee.property}`;
+          const argCodes = expr.args.map((a) => `(void)(${this.emitExpr(a).code})`);
+          const parts = [`(void)as_shell_unsupported((char*)"${this.escapeCString(label)}")`, ...argCodes, 'as_v_null()'];
+          return { code: `(${parts.join(', ')})`, type: { kind: 'any' } };
+        }
+        // A member miss on a `dynamic class` receiver is a RUNTIME lookup, not a
+        // source error: AIR declares MovieClip `dynamic class` (the property is
+        // inherited, so every subclass and every SWC timeline symbol is dynamic too),
+        // and a dynamic receiver's unknown name resolves against the RUNTIME class.
+        // That is how a symbol's own methods are reached through a base-typed
+        // variable -- VideoRootView keeps its no-cam button in a `MovieClip` field and
+        // calls the symbol's setText on it. Dispatch through the runtime tables (the
+        // same path a `*` receiver takes), and let the helper report loudly when
+        // nothing matches at all: a name that resolves NOWHERE is a member this build
+        // cannot see (the library's DoABC), never a silent no-op. AIR would throw #1069
+        // in that same situation, so the result is undefined rather than a value.
+        if (cinfo?.isDynamic) {
+          const label = `${obj.type.className}.${callee.property} (dynamic member, not found at run time)`;
+          const argCodes = expr.args.map((a) => this.boxExpr(this.emitExpr(a)));
+          const argArr = expr.args.length > 0 ? `(as_value[]){ ${argCodes.join(', ')} }` : 'NULL';
+          return {
+            code: `as_dyn_call_reporting((void*)(${obj.code}), "${this.escapeCString(callee.property)}", "${this.escapeCString(label)}", ${argArr}, ${expr.args.length})`,
+            type: { kind: 'any' },
+          };
+        }
+        if (as3Gap('method', `${obj.type.className}.${callee.property} [in ${this.currentClass}.${this.currentMethod}]`)) return { code: 'as_v_null()', type: { kind: 'any' } };
+        throw new CodegenError(`undefined method '${callee.property}' on class '${obj.type.className}'`);
+      }
       if (!this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) {
         throw new CodegenError(`method '${callee.property}' is not accessible here`);
       }
-      const args = this.emitArgs(m.params, expr.args);
+      const args = this.emitArgs(m.params, expr.args, this.declAliasOf(m.owner));
       const callArgs = args ? ', ' + args : '';
       return {
         code: `(${obj.code}->vtable->${this.cIdent(callee.property)}(${obj.code}${callArgs}))`,
@@ -21786,12 +24586,24 @@ export class Emitter {
           if (!this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) {
             throw new CodegenError(`method '${callee.name}' is not accessible here` + (this.currentClass ? ` in class ${this.currentClass}` : ''));
           }
-          const args = this.emitArgs(m.params, expr.args);
+          const args = this.emitArgs(m.params, expr.args, this.declAliasOf(m.owner));
           const callArgs = args ? ', ' + args : '';
           // The receiver is `this` normally, or `env->this` when this call site
           // lives inside a closure that captured the enclosing `this`.
           const self = this.emitVar('this').code;
           return { code: `(${self}->vtable->${this.cIdent(callee.name)}(${self}${callArgs}))`, type: m.returnType };
+        }
+      }
+      // An Array method called on `this` inside a `class X extends Array`
+      // (`Set.toString` does `join("\n")`): the implicit receiver is the hidden
+      // backing array, and an override declared by the class has already been
+      // tried above, so the inherited Array member wins here.
+      if (this.currentClass && !this.currentIsStatic) {
+        const ci = this.symbols.getClass(this.currentClass);
+        if (ci?.arrayBacked && Emitter.ARRAY_API.has(callee.name) && !this.arrayBackedDeclares({ kind: 'object', className: this.currentClass }, callee.name)) {
+          const self = this.emitVar('this').code;
+          const ab = this.arrayBackedArrayCode({ code: self, type: { kind: 'object', className: this.currentClass } }, self);
+          if (ab) return this.emitArrayMethod(ab, callee.name, expr.args);
         }
       }
       // Bare static-method call from within the same class (e.g. `init()` called
@@ -21804,7 +24616,7 @@ export class Emitter {
           if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
             throw new CodegenError(`static method '${callee.name}' is not accessible here`);
           }
-          const args = this.emitArgs(sm.params, expr.args);
+          const args = this.emitArgs(sm.params, expr.args, this.declAliasOf(sm.owner));
           return { code: `${sm.owner}_${callee.name}_static(${args})`, type: sm.returnType };
         }
       }
@@ -21823,10 +24635,24 @@ export class Emitter {
       if (f) {
         return { code: `${this.freeCName(callee.name)}(${this.emitArgs(f.params, expr.args)})`, type: f.returnType };
       }
-      // a value of type Function held in a variable (var f:Function = ...)
+      // A callable VALUE held in a variable / field / parameter (var f:Function = ...).
+      // AIR's call opcode also accepts a Function stored in an Object-typed or
+      // dynamically-typed slot (Function IS an Object) and rejects a non-Function
+      // only at RUN time with #1006 -- protobuf's FieldDescriptor_TYPE_MESSAGE relies
+      // on exactly that: it keeps either a Class or a factory Function in ONE
+      // Object-typed slot and calls it, `(messageUnion as Class) ||
+      // Class(messageUnion = messageUnion())`. A statically-known non-callable type
+      // (int/String/Array/...) keeps the loud COMPILE error: calling one is a source
+      // bug, not a runtime choice.
       const v = this.emitExpr(callee);
       if (v.type.kind === 'function') {
         return this.emitFunctionCall(v, expr.args);
+      }
+      if (v.type.kind === 'any' || v.type.kind === 'object') {
+        const items = expr.args.map((a) => this.boxExpr(this.emitExpr(a)));
+        const n = items.length;
+        const arr = n > 0 ? `(as_value[${n}]){ ${items.join(', ')} }` : 'NULL';
+        return { code: `as_fn_call_dyn(${this.boxExpr(v)}, ${arr}, ${n}, "${this.escapeCString(callee.name)}")`, type: { kind: 'any' } };
       }
       throw new CodegenError(`undefined function '${callee.name}'`);
     }
@@ -21887,6 +24713,12 @@ export class Emitter {
   // XMLList, but Starling only reads it in a scalar String context, so the
   // emitter narrows it to String (documented in e4x.md).
   private emitAttrAccess(expr: Extract<Expr, { kind: 'AttrAccess' }>): { code: string; type: CType } {
+    // A bare `@attr` (the implicit marker stays set only when no E4X filter predicate
+    // provided a context node): outside a predicate there is no node to read, so this
+    // is a loud error rather than an accidental `this.@attr`.
+    if (expr.implicitContext === true) {
+      throw new CodegenError(`'@${expr.name}' (attribute of the implicit E4X context node) is only supported inside an E4X filter predicate` + (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : ''));
+    }
     const o = this.emitExpr(expr.object);
     const attr = this.escapeCString(expr.name);
     if (o.type.kind === 'xml') {
@@ -21919,6 +24751,9 @@ export class Emitter {
   // match, so `x.ns::[name]` finds it (case A) while `x[name]` does not (case B) --
   // we return it for both. Pre-existing approximation, recorded in TODO.md.
   private emitE4xName(expr: Extract<Expr, { kind: 'E4xName' }>): { code: string; type: CType } {
+    if (expr.implicitContext === true) {
+      throw new CodegenError(`'@[expr]' (attribute of the implicit E4X context node) is only supported inside an E4X filter predicate` + (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : ''));
+    }
     const o = this.emitExpr(expr.object);
     const key = this.emitExpr(expr.index);
     const keyStr = key.type.kind === 'string' ? key.code : this.toStringExpr(key);
@@ -21953,6 +24788,45 @@ export class Emitter {
   // XMLList. Starling uses only `==` here (asset metadata extraction).
   private emitFilter(expr: Extract<Expr, { kind: 'Filter' }>): { code: string; type: CType } {
     const o = this.emitExpr(expr.object);
+    if (expr.general) {
+      // A general predicate `obj.(e)`: compilable for ANY receiver, but only an
+      // XML/XMLList receiver can actually be filtered. AIR fails at RUN time
+      // (#1123) for everything else, so emit the same runtime failure rather than
+      // a compile-time one — the program still builds, exactly as it does in AIR
+      // (temp/talkmed/e4xprobe).
+      if (o.type.kind === 'xml' || o.type.kind === 'xmllist') {
+        // An XML/XMLList receiver normally reaches emitXmlGeneralFilter from the
+        // sequencing pass (which is what can emit the per-node loop). Getting HERE
+        // means the filter sits somewhere the emitter cannot put a statement before
+        // the expression that consumes it, so the predicate cannot be evaluated
+        // once per node. Report that instead of compiling a wrong selection.
+        throw new CodegenError(
+          `E4X filter with a general predicate '.(...)' on an XML/XMLList receiver is only supported where the selection can be built before the expression that consumes it ` +
+          `(a for-each iterable, a variable initializer/assignment, an argument, or an expression statement); assign the filter to a variable first` +
+          (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : '')
+        );
+      }
+      let recv = 'NULL';
+      switch (o.type.kind) {
+        case 'object':
+        case 'class':
+        case 'array':
+        case 'record':
+        case 'dict':
+        case 'regexp':
+        case 'vector':
+        case 'string':
+          recv = `(void*)(${o.code})`;
+          break;
+        case 'any':
+          recv = `as_v_obj_val(${o.code})`;
+          break;
+        default:
+          recv = 'NULL';
+          break;
+      }
+      return { code: `as_e4x_filter_type_error(${recv})`, type: { kind: 'any' } };
+    }
     if (o.type.kind !== 'xmllist' && o.type.kind !== 'xml') {
       throw new CodegenError(`E4X filter '.(...)' requires an XML/XMLList receiver, got ${o.type.kind}`);
     }
@@ -21961,6 +24835,118 @@ export class Emitter {
     const vStr = v.type.kind === 'string' ? v.code : this.toStringExpr(v);
     const op = expr.op === '!=' ? 1 : 0;
     return { code: `as_xml_filter(${o.code}, "${attr}", ${vStr}, ${op})`, type: { kind: 'xmllist' } };
+  }
+
+  // The static type of an expression WITHOUT emitting it. Used by the few spots
+  // that need a type before the expression can legitimately be emitted — the
+  // module-level declarations are typed at FILE scope, before main()'s statements
+  // exist (emitModuleVars). A general E4X filter is the case that matters: its
+  // type follows from the RECEIVER (an XML/XMLList selection, or `any` for the
+  // receiver types AIR rejects at run time with #1123), and emitting it there would
+  // put its per-node loop outside any function body.
+  private probeExprType(e: Expr): CType {
+    if (e.kind !== 'Filter') return this.emitExpr(e).type;
+    if (!e.general) return { kind: 'xmllist' };
+    const rt = this.probeExprType(e.object);
+    return rt.kind === 'xml' || rt.kind === 'xmllist' ? { kind: 'xmllist' } : { kind: 'any' };
+  }
+
+  // General E4X predicate `x.(e)` over an XML/XMLList receiver.
+  //
+  // AIR evaluates the predicate once per CANDIDATE NODE with that node as the E4X
+  // context, so `name()`, `attribute("a")`, `child`, `@attr` inside `e` read the
+  // candidate. We build the selection with a plain C loop at the current statement
+  // position:
+  //
+  //   as_xml_list* src = <the receiver, or a one-node list for an XML receiver>;
+  //   as_xml_list* sel = as_xml_list_empty();
+  //   { int i; as_xml_node* ctx; for (...) { ctx = ...; if (<e>) append; } }
+  //
+  // `e` is emitted INLINE against a local context variable, after
+  // rewriteE4xPredicate has pointed the context calls (name/attribute/child/...)
+  // at it. Inline emission is why free variables (`this`, class members, enclosing
+  // locals) keep resolving exactly as they do outside the predicate -- no closure
+  // or capture machinery is involved, and the predicate runs with the real scope.
+  //
+  // This runs from the sequencing pass (sequenceValueExpr), i.e. only where the
+  // enclosing statement can be preceded by the loop; the receiver itself has
+  // already been sequenced by then, so side effects happen in AIR's order.
+  private emitXmlGeneralFilter(e: Extract<Expr, { kind: 'Filter' }>): boolean {
+    const o = this.emitExpr(e.object);
+    // Any other receiver type is AIR's run-time #1123, emitted by emitFilter.
+    if (o.type.kind !== 'xml' && o.type.kind !== 'xmllist') return false;
+    const src = this.tmpName('e4xsrc');
+    const sel = this.tmpName('e4xsel');
+    const idx = this.tmpName('e4xi');
+    const ctx = this.tmpName('e4xctx');
+    const nodePtr = this.cTypeName({ kind: 'xml' });
+    const listPtr = this.cTypeName({ kind: 'xmllist' });
+    // Bind the context BEFORE emitting the predicate: as far as the predicate is
+    // concerned the context node is an ordinary local named `ctx`.
+    this.pushScope();
+    this.declareVar(ctx, { kind: 'xml' });
+    let test: string;
+    try {
+      const p = this.emitExpr(this.rewriteE4xPredicate(e.value, ctx));
+      test = p.type.kind === 'bool' ? `(${p.code})` : `as_v_truthy(${this.boxExpr(p)})`;
+    } finally {
+      this.popScope();
+    }
+    // An XML receiver is filtered as the one-node list AIR treats it as.
+    const srcExpr = o.type.kind === 'xml' ? `as_xml_list_ctor(as_v_obj((void*)(${o.code})))` : o.code;
+    this.line(`${listPtr} ${src} = ${srcExpr};`);
+    this.line(`${listPtr} ${sel} = as_xml_list_empty();`);
+    this.line(`{ int ${idx}; ${nodePtr} ${ctx} = NULL;`);
+    this.indent++;
+    this.line(`for (${idx} = 0; ${idx} < ${src}->length; ${idx}++) {`);
+    this.indent++;
+    this.line(`${ctx} = ${src}->items[${idx}];`);
+    this.line(`if (${test}) as_xml_list_append(${sel}, ${src}->items[${idx}]);`);
+    this.indent--;
+    this.line('} }');
+    this.indent--;
+    this.hoistedAssigns.set(e, { tmp: sel, type: { kind: 'xmllist' } });
+    return true;
+  }
+
+  // Rebuild a predicate expression with the E4X context calls bound to the
+  // synthesized context local (ECMA-357: a filter predicate's scope IS the node
+  // being tested, so a receiver-less `name()` / `attribute("a")` / `child` reads it).
+  //
+  // `name()` becomes `localName()`: as_xml_qname returns a record, and a record is
+  // never string-equal (as_v_eq compares object tags by POINTER), so the as3corelib
+  // JSONEncoder predicate `name() == "variable"` would silently never match. The
+  // local name is what that comparison means for an unqualified element, which is
+  // every element this subset produces; AIR compares a NAMESPACED element's
+  // `name() == "x"` as false and we compare true -- a documented narrowing.
+  // The predicate AST is copied, never mutated (codegen must not touch the AST).
+  private rewriteE4xPredicate(e: Expr, ctx: string): Expr {
+    const walk = (x: unknown): unknown => {
+      if (Array.isArray(x)) return x.map(walk);
+      if (x === null || typeof x !== 'object') return x;
+      const src = x as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(src)) out[k] = walk(src[k]);
+      const callee = out.callee as { kind?: string; name?: string } | undefined;
+      if (out.kind === 'Call' && callee?.kind === 'Var' && callee.name !== undefined && E4X_CTX_CALLS.has(callee.name)) {
+        out.callee = {
+          kind: 'Member',
+          object: { kind: 'Var', name: ctx },
+          property: callee.name === 'name' ? 'localName' : callee.name,
+        };
+      }
+      // A bare `@attr` / `@[expr]` reads the CONTEXT node, which is what the implicit
+      // marker means; here it finally has one. Dropping the marker makes the node an
+      // ordinary attribute access on the context local, so the normal E4X paths
+      // (emitAttrAccess / emitE4xName) handle it. Measured on adl 51.4.1: inside a
+      // predicate AIR resolves the bare form exactly like this.
+      if ((out.kind === 'AttrAccess' || out.kind === 'E4xName') && out.implicitContext === true) {
+        out.object = { kind: 'Var', name: ctx };
+        delete out.implicitContext;
+      }
+      return out;
+    };
+    return walk(e) as Expr;
   }
 
   // True when an expression can never evaluate to null, so a member access on
@@ -22068,7 +25054,10 @@ export class Emitter {
     // Number.MAX_VALUE / int.MAX_VALUE / uint.MAX_VALUE etc.
     if (expr.object.kind === 'Var' && (expr.object.name === 'Number' || expr.object.name === 'int' || expr.object.name === 'uint')) {
       const c = this.emitNumConst(expr.object.name, expr.property);
-      if (!c) throw new CodegenError(`undefined constant '${expr.object.name}.${expr.property}'`);
+      if (!c) {
+        if (as3Gap('constant', `${expr.object.name}.${expr.property}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
+        throw new CodegenError(`undefined constant '${expr.object.name}.${expr.property}'`);
+      }
       return c;
     }
     // Fully-qualified static reference: `pkg.subpkg.Class.CONST` / `.staticMethod`.
@@ -22109,6 +25098,20 @@ export class Emitter {
         break; // a known class prefix but unknown member: not an FQN static ref
       }
     }
+    // A fully-qualified class name used as a VALUE (`com.svgaplayer.proto.Layout`
+    // handed around as a `Class`, the protobuf-generated style): the chain
+    // resolves END-TO-END to a registered class and its root segment is not a
+    // variable in scope, so this is the class object, not a member chain — the
+    // same `&X_cls` the bare-name path in emitVarLexical produces. Without this the
+    // chain fell through to the member path, whose root `com` is not a variable
+    // ('undefined variable com at top level').
+    if (chain && chain.length >= 2 && !this.varInScope(chain[0])) {
+      const fq = this.resolveClassName(chain.join('.'));
+      const ci = this.symbols.getClass(fq);
+      if (ci && (ci.fqn !== undefined || ci.reflectFqn !== undefined)) {
+        return { code: `&${fq}_cls`, type: { kind: 'class' } };
+      }
+    }
     // static field access: ClassName.field
     if (expr.object.kind === 'Var') {
       const cname = this.resolveClassName(expr.object.name);
@@ -22137,6 +25140,7 @@ export class Emitter {
           }
           return { code: `as_fn_make(${sm.owner}_${expr.property}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
         }
+        if (as3Gap('static field', `${cname}.${expr.property} [in ${this.currentClass}.${this.currentMethod}]`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined static field '${expr.property}' on class '${cname}'`);
       }
     }
@@ -22155,6 +25159,12 @@ export class Emitter {
     if (obj.type.kind === 'array' && expr.property === 'length') {
       return { code: `(${recv}->length)`, type: { kind: 'int' } };
     }
+    // `class X extends Array`: `length` is the backing array's length (Array
+    // defines it; a class extending Array may not override it).
+    {
+      const ab = this.arrayBackedArrayCode(obj, recv);
+      if (ab && expr.property === 'length') return { code: `(${ab.code}->length)`, type: { kind: 'int' } };
+    }
     if (obj.type.kind === 'vector' && expr.property === 'length') {
       return { code: `(${recv}->length)`, type: { kind: 'int' } };
     }
@@ -22166,6 +25176,16 @@ export class Emitter {
     if (obj.type.kind === 'function' && expr.property === 'length') {
       // AS3 Function.length is the declared parameter count.
       return { code: `(${recv}->arity)`, type: { kind: 'int' } };
+    }
+    // E4X all-children wildcard `x.*` (a Member named '*', see the parser): the
+    // XMLList of every child node -- the same axis children() exposes (our E4X model
+    // keeps a node's text in the node itself rather than as a child node, so a text
+    // child is not reported separately; every other case matches AIR, measured on adl
+    // 51.4.1: <a k="v"><b/><c/></a>.* is the two elements, never the attribute).
+    if ((obj.type.kind === 'xml' || obj.type.kind === 'xmllist') && expr.property === '*') {
+      return obj.type.kind === 'xmllist'
+        ? { code: `as_xml_list_children(${recv}, "*")`, type: { kind: 'xmllist' } }
+        : { code: `as_xml_children(${recv}, "*")`, type: { kind: 'xmllist' } };
     }
     // E4X child navigation: xml.child / xmlList.child return the matching
     // child nodes as an XMLList (a structural navigation, not a field read).
@@ -22224,7 +25244,14 @@ export class Emitter {
         // Interface method referenced as a Function value.
         return { code: `as_fn_make(${iname}_${this.cIdent(expr.property)}__bound, (void*)(${obj.code}.obj), ${this.requiredArity(im.params)})`, type: { kind: 'function' } };
       }
+      if (as3Gap('interface member', `${iname}.${expr.property}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
       throw new CodegenError(`undefined member '${expr.property}' on interface '${iname}'`);
+    }
+    if (obj.type.kind === 'array' && expr.property === 'constructor') {
+      // Array.constructor: AIR answers the Array class itself ([1].constructor is
+      // [class Array], measured on adl 51.4.1). 'constructor' is Object's own trait,
+      // not an element or a named property, so it must not read the property table.
+      return { code: '&as_corecls_Array', type: { kind: 'class' } };
     }
     if (obj.type.kind === 'array' && expr.property !== 'length') {
       // AS3 Array is dynamic: every property other than the modelled members
@@ -22232,6 +25259,14 @@ export class Emitter {
       // the elements without touching them, so read it from the named-property
       // table (null when absent) — previously a loud compile error.
       return { code: `as_array_prop_get(${recv}, "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
+    }
+    // `class X extends Array`: an undeclared property read is an Array named
+    // property (this is the DER path: `o.signedCertificate` / `o[name]`).
+    {
+      const ab = this.arrayBackedArrayCode(obj, recv);
+      if (ab && !this.arrayBackedDeclares(obj.type, expr.property)) {
+        return { code: `as_array_prop_get(${ab.code}, "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
+      }
     }
     if (obj.type.kind !== 'object') {
       throw new CodegenError(`cannot access property '${expr.property}' on non-object type`);
@@ -22283,21 +25318,28 @@ export class Emitter {
     if (cinfo?.isDynamic) {
       return { code: `as_dyn_get((void*)(${recv}), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
-    throw new CodegenError(`undefined field '${expr.property}' on class '${obj.type.className}'`);
+    if (as3Gap('field', `${obj.type.className}.${expr.property} [in ${this.currentClass}.${this.currentMethod}]`)) return { code: 'as_v_null()', type: { kind: 'any' } };
+    throw new CodegenError(`undefined field '${expr.property}' on class '${obj.type.className}'` + (this.currentClass ? ` [in ${this.currentClass}.${this.currentMethod}]` : ''));
   }
 
   // Built-in XML / XMLList methods (E4X navigation). XML exposes localName()/
   // toString()/length(); XMLList exposes length()/toString(). @attr and .child
   // are handled in emitMember (they are postfix operators, not method calls).
   private emitXmlMethod(obj: { code: string; type: CType }, method: string, args: Expr[]): { code: string; type: CType } {
-    // XML.children(): every direct child ELEMENT (our model stores text as a
-    // trimmed string on the element, so there are no text-node children -- a
-    // documented simplification of E4X). Called with no name, so it is the `*`
-    // child axis. The list-side form flattens over the list's nodes.
-    if (method === 'children' || method === 'elements') {
-      if (args.length !== 0) throw new CodegenError(`${method}() takes no arguments`);
-      if (obj.type.kind === 'xmllist') return { code: `as_xml_list_children(${obj.code}, "")`, type: { kind: 'xmllist' } };
-      return { code: `as_xml_children(${obj.code}, "")`, type: { kind: 'xmllist' } };
+    // XML.child(name) / XMLList.child(name): the named CHILD axis. AIR's
+    // signature is child(propertyName:Object = "*"), so the argument is optional
+    // and "*" means every child (the same axis as children()). The name is
+    // compared on the LOCAL part of the element name (as_xml_children), matching
+    // the transparent-namespace translation used everywhere else.
+    if (method === 'child' || method === 'elements' || method === 'children') {
+      if (args.length > 1) throw new CodegenError(`${method}() takes at most 1 argument`);
+      let nameExpr = 'NULL';
+      if (args.length === 1) {
+        const a = this.emitExpr(args[0]);
+        nameExpr = a.type.kind === 'string' ? a.code : this.toStringExpr(a);
+      }
+      if (obj.type.kind === 'xmllist') return { code: `as_xml_list_children(${obj.code}, ${nameExpr})`, type: { kind: 'xmllist' } };
+      return { code: `as_xml_children(${obj.code}, ${nameExpr})`, type: { kind: 'xmllist' } };
     }
     // XML.attribute(name): the attribute value (AIR returns a one-element
     // XMLList; the string value is what every caller reads, and an absent
@@ -22306,6 +25348,24 @@ export class Emitter {
       if (args.length !== 1) throw new CodegenError('attribute() expects a name');
       const name = this.emitExpr(args[0]);
       return { code: `as_xml_attr(${obj.code}, ${name.type.kind === 'string' ? name.code : this.toStringExpr(name)})`, type: { kind: 'string' } };
+    }
+    // attributes(): E4X returns the attribute NODES as an XMLList; this subset has
+    // no attribute nodes, so it returns the first attribute's value (see the
+    // helper in runtime.ts for why that is the value callers actually read).
+    if (method === 'attributes') {
+      if (args.length !== 0) throw new CodegenError('attributes() takes no arguments');
+      if (obj.type.kind === 'xmllist') return { code: `as_xml_list_attributes(${obj.code})`, type: { kind: 'string' } };
+      return { code: `as_xml_attr_first(${obj.code})`, type: { kind: 'string' } };
+    }
+    // appendChild(): mutates the tree in E4X. Our XML model is built once from the
+    // source text and is not mutable, so the call reports itself once and returns
+    // the receiver (the value AIR returns) instead of silently dropping the child.
+    if (method === 'appendChild') {
+      const a = args.length === 1 ? this.emitExpr(args[0]) : null;
+      return {
+        code: `${a ? `(void)(${a.code}), ` : ''}(as_xml_append_child_unsupported(), ${obj.code})`,
+        type: obj.type,
+      };
     }
     if (method === 'name' || method === 'nodeKind' || method === 'parent' || method === 'text') {
       if (args.length !== 0) throw new CodegenError(`${method}() takes no arguments`);
@@ -22322,6 +25382,13 @@ export class Emitter {
         // style XMLList text access (text()[0], text().length()) is not modelled.
         if (obj.type.kind === 'xmllist') return { code: `as_xml_list_to_string(${obj.code})`, type: { kind: 'string' } };
         return { code: `${obj.code} != NULL && ${obj.code}->text != NULL ? ${obj.code}->text : (char*)""`, type: { kind: 'string' } };
+      }
+      if (method === 'nodeKind') {
+        // Every node this subset can produce is an ELEMENT (the parser stores an
+        // element's text as a trimmed string and does not model text/comment/
+        // attribute nodes), so nodeKind() answers the element kind -- the value
+        // com/adobe/utils/XMLUtil compares against its ELEMENT constant.
+        return { code: '"element"', type: { kind: 'string' } };
       }
       if (obj.type.kind === 'xmllist') throw new CodegenError(`${method}() is not supported on an XMLList`);
       return { code: `as_xml_parent(${obj.code})`, type: { kind: 'xml' } };
@@ -22422,7 +25489,7 @@ export class Emitter {
       const ec = this.cTypeName(elem);
       // A temp keeps an interface unbox (whose struct literal contains a comma)
       // from breaking the argument list.
-      const un = this.unboxAny({ code: 'value', type: ANY }, elem);
+      const un = this.unboxAny({ code: 'value', type: { kind: 'any' } }, elem);
       this.line(`if (mark == (void*)as_vector_${key}_mark) { ${ec} e = ${un}; as_vector_${key}_set((as_vector_${key}*)ptr, i, e); return; }`);
     }
     this.indent--;
@@ -22436,7 +25503,7 @@ export class Emitter {
     for (const [, elem] of this.vectorSpecs) {
       const key = this.vectorCName(elem);
       const ec = this.cTypeName(elem);
-      const un = (expr: string): string => this.unboxAny({ code: expr, type: ANY }, elem);
+      const un = (expr: string): string => this.unboxAny({ code: expr, type: { kind: 'any' } }, elem);
       const box = (code: string): string => this.boxExpr({ code, type: elem });
       this.line(`if (mark == (void*)as_vector_${key}_mark) {`);
       this.indent++;
@@ -22499,6 +25566,14 @@ export class Emitter {
     const ec = this.cTypeName(elem);
     const v = obj.code;
     switch (method) {
+      // Inherited Object members on a Vector: hasOwnProperty sees the Vector's own
+      // traits -- `length`, and a canonical in-range index (measured on adl 51.4.1:
+      // both true); propertyIsEnumerable is FALSE for them (a Vector has no dynamic
+      // slots at all). as_dyn_has dispatches to the vector's has hook.
+      case 'hasOwnProperty':
+        return { code: `as_dyn_has((void*)(${v}), ${this.propNameArg(args)})`, type: { kind: 'bool' } };
+      case 'propertyIsEnumerable':
+        return { code: 'false', type: { kind: 'bool' } };
       case 'push': {
         // AS3 Vector.push is variadic (push(a, b, c, ...)) and returns the new
         // length. Multiple args are sequenced left-to-right via the comma
@@ -22528,6 +25603,14 @@ export class Emitter {
         if (args.length !== 1) throw new CodegenError('Vector.indexOf expects 1 argument');
         const e = this.convert(this.emitExpr(args[0]), elem);
         return { code: `as_vector_${key}_indexOf(${v}, ${e})`, type: { kind: 'int' } };
+      }
+      // includes() (ES2016, present in the AIR this project targets): the boolean
+      // form of indexOf. Exactly one argument, and no `fromIndex` overload (AIR's
+      // includes takes only the search element).
+      case 'includes': {
+        if (args.length !== 1) throw new CodegenError('Vector.includes expects 1 argument');
+        const e = this.convert(this.emitExpr(args[0]), elem);
+        return { code: `(as_vector_${key}_indexOf(${v}, ${e}) >= 0)`, type: { kind: 'bool' } };
       }
       case 'removeAt': {
         if (args.length !== 1) throw new CodegenError('Vector.removeAt expects 1 argument');
@@ -22619,6 +25702,51 @@ export class Emitter {
   }
 
   // Built-in Array methods. `a.push/pop/shift/unshift/splice/slice/indexOf/join/concat`.
+  // ---- `class X extends Array` (ClassInfo.arrayBacked) -------------------------
+  //
+  // AIR's Array is a dynamic class backed by the engine's array storage, so a
+  // subclass has no C struct to inherit: it carries a hidden `as_array* _arr`
+  // slot instead (see symbols.ts pass 1.5). Everything Array defines but the
+  // subclass does not override is inherited AVM2 Array behavior, which for this
+  // backend means the very same as_array_* helpers operating on that slot. These
+  // two helpers answer "is this receiver array-backed" and "does the class
+  // declare this member itself" so every dispatch site can route through them.
+
+  // The Array API surface emitArrayMethod implements. A bare `name(...)` inside
+  // an array-backed class may only be routed there when it is one of these;
+  // anything else must keep falling through to the normal resolution (and its
+  // loud 'undefined function' error).
+  private static readonly ARRAY_API = new Set([
+    'push', 'pop', 'shift', 'unshift', 'indexOf', 'includes', 'insertAt',
+    'removeAt', 'join', 'toString', 'slice', 'concat', 'splice', 'map',
+    'filter', 'reverse', 'sortOn', 'sort',
+  ]);
+
+  // The hidden backing array of an array-backed instance, or null when `obj` is
+  // not one. `code` is the (possibly null-guarded) C expression of the receiver.
+  private arrayBackedArrayCode(obj: { code: string; type: CType }, code: string): { code: string; type: CType } | null {
+    if (obj.type.kind !== 'object') return null;
+    const info = this.symbols.getClass(obj.type.className);
+    if (!info || !info.arrayBacked) return null;
+    return { code: `(((${obj.type.className}*)${code})->_arr)`, type: { kind: 'array' } };
+  }
+
+  // Whether the array-backed class (or an array-backed ancestor: `Set extends
+  // Sequence`) declares `member` itself, in which case the declaration wins over
+  // the inherited Array member. The walk stops at the first non-array-backed
+  // class (Object) so that Object's own members never shadow Array's — AIR gives
+  // an Array subclass Array's toString/join, not Object's.
+  private arrayBackedDeclares(type: CType, member: string): boolean {
+    if (type.kind !== 'object') return false;
+    for (let c: string | undefined = type.className; c; ) {
+      const ci = this.symbols.getClass(c);
+      if (!ci || !ci.arrayBacked) return false;
+      if (ci.fields.has(member) || ci.methods.has(member) || ci.getters.has(member) || ci.setters.has(member)) return true;
+      c = ci.superClass;
+    }
+    return false;
+  }
+
   private emitArrayMethod(obj: { code: string; type: CType }, method: string, args: Expr[]): { code: string; type: CType } {
     const a = obj.code;
     switch (method) {
@@ -22644,6 +25772,13 @@ export class Emitter {
         if (args.length !== 1) throw new CodegenError('indexOf expects 1 argument');
         const v = this.boxExpr(this.emitExpr(args[0]));
         return { code: `as_array_indexOf(${a}, ${v})`, type: { kind: 'int' } };
+      }
+      // includes() (ES2016, present in the AIR this project targets): the boolean
+      // form of indexOf, sharing the same element comparison.
+      case 'includes': {
+        if (args.length !== 1) throw new CodegenError('includes expects 1 argument');
+        const v = this.boxExpr(this.emitExpr(args[0]));
+        return { code: `(as_array_indexOf(${a}, ${v}) >= 0)`, type: { kind: 'bool' } };
       }
       case 'insertAt': {
         if (args.length !== 2) throw new CodegenError('Array.insertAt expects 2 arguments');
@@ -22729,9 +25864,29 @@ export class Emitter {
         }
         return { code: `as_array_sort_num(${a})`, type: { kind: 'array' } };
       }
+      // Inherited Object members on an Array (measured on adl 51.4.1: an in-range
+      // index, `length` and an added named property are all OWN properties, a missing
+      // name and a missing ARGUMENT are not; propertyIsEnumerable answers true only
+      // for the dynamic ones, so `length` -- a trait -- is FALSE there). A `class X
+      // extends Array` receiver arrives here with its hidden backing array, which
+      // follows exactly the same rule.
+      case 'hasOwnProperty':
+        return { code: `as_array_has(${a}, ${this.propNameArg(args)})`, type: { kind: 'bool' } };
+      case 'propertyIsEnumerable':
+        return { code: `as_dyn_enumerable(${a}, ${this.propNameArg(args)})`, type: { kind: 'bool' } };
       default:
+        if (as3Gap('Array method', `Array.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined Array method '${method}'`);
     }
+  }
+
+  // The name argument of the inherited Object.hasOwnProperty /
+  // propertyIsEnumerable: a missing argument is AS3's undefined, which matches no
+  // property (measured on adl 51.4.1: both answer false), so it becomes the empty
+  // name -- NULL would cross the C helpers' strcmp guards.
+  private propNameArg(args: Expr[]): string {
+    if (args.length === 0) return '""';
+    return this.toStringExpr(this.emitExpr(args[0]));
   }
 
   // Built-in static String methods: fromCharCode.
@@ -22743,6 +25898,7 @@ export class Emitter {
         return { code: `as_str_fromCharCodes(${codes.length}, (int[]){ ${codes.join(', ')} })`, type: { kind: 'string' } };
       }
       default:
+        if (as3Gap('String static', `String.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined static String method '${method}'`);
     }
   }
@@ -22764,6 +25920,7 @@ export class Emitter {
         return { code: `as_json_parse(${s})`, type: { kind: 'any' } };
       }
       default:
+        if (as3Gap('JSON static', `JSON.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined static JSON method '${method}'`);
     }
   }
@@ -22772,14 +25929,34 @@ export class Emitter {
   // substring / substr / slice / split / toUpperCase / toLowerCase.
   private emitStringMethod(obj: { code: string; type: CType }, method: string, args: Expr[]): { code: string; type: CType } {
     const s = obj.code;
-    const argInt = (i: number): string => this.convert(this.emitExpr(args[i]), { kind: 'int' });
+    // A missing argument is either the documented DEFAULT (the reference gives
+    // `index:Number = 0` on charAt/charCodeAt, `startIndex = 0` on substring/
+    // substr/slice, ...) or a real arity error: never a silent crash. Both are
+    // spelled out per call site below; these two helpers only guard the position.
+    const argInt = (i: number, dflt?: string): string => {
+      if (args[i] === undefined) {
+        if (dflt !== undefined) return dflt;
+        throw new CodegenError(`String.${method} is missing argument ${i + 1}`);
+      }
+      return this.convert(this.emitExpr(args[i]), { kind: 'int' });
+    };
     const argStr = (i: number): string => {
+      if (args[i] === undefined) throw new CodegenError(`String.${method} is missing argument ${i + 1}`);
       const e = this.emitExpr(args[i]);
       return e.type.kind === 'string' ? e.code : this.toStringExpr(e);
     };
     switch (method) {
-      case 'charAt': return { code: `as_str_charAt(${s}, ${argInt(0)})`, type: { kind: 'string' } };
-      case 'charCodeAt': return { code: `as_str_charCodeAt(${s}, ${argInt(0)})`, type: { kind: 'int' } };
+      // Inherited Object members on a String (measured on adl 51.4.1): the ONLY own
+      // property is `length` ("ab".hasOwnProperty("length") is true while
+      // ...("0")/...("x") are false -- a character index is not an own property),
+      // and a String has no dynamic slots, so propertyIsEnumerable is always false.
+      case 'hasOwnProperty':
+        return { code: `(strcmp(${this.propNameArg(args)}, "length") == 0)`, type: { kind: 'bool' } };
+      case 'propertyIsEnumerable':
+        return { code: 'false', type: { kind: 'bool' } };
+      // charAt/charCodeAt: `index:Number = 0` (String.html, AIR 1.0).
+      case 'charAt': return { code: `as_str_charAt(${s}, ${argInt(0, '0')})`, type: { kind: 'string' } };
+      case 'charCodeAt': return { code: `as_str_charCodeAt(${s}, ${argInt(0, '0')})`, type: { kind: 'int' } };
       // AS3's optional startIndex on both search methods: omitting it must mean
       // the documented default, and a THIRD argument is a mistake the compiler
       // reports rather than drops (AGENTS.md §2.5). The defaults (0 and 0x7FFFFFFF)
@@ -22795,17 +25972,18 @@ export class Emitter {
         return { code: `as_str_lastIndexOf_from(${s}, ${argStr(0)}, ${from})`, type: { kind: 'int' } };
       }
       case 'substring': {
-        const from = argInt(0);
+        // startIndex = 0, endIndex = 0x7fffffff (String.html).
+        const from = argInt(0, '0');
         const to = args.length >= 2 ? argInt(1) : `(int)strlen(${s})`;
         return { code: `as_str_substring(${s}, ${from}, ${to})`, type: { kind: 'string' } };
       }
       case 'substr': {
-        const from = argInt(0);
+        const from = argInt(0, '0');
         const len = args.length >= 2 ? argInt(1) : `(int)strlen(${s})`;
         return { code: `as_str_substr(${s}, ${from}, ${len})`, type: { kind: 'string' } };
       }
       case 'slice': {
-        const from = argInt(0);
+        const from = argInt(0, '0');
         const to = args.length >= 2 ? argInt(1) : `(int)strlen(${s})`;
         return { code: `as_str_slice(${s}, ${from}, ${to})`, type: { kind: 'string' } };
       }
@@ -22862,6 +26040,7 @@ export class Emitter {
       case 'startsWith': return { code: `as_str_startsWith(${s}, ${argStr(0)})`, type: { kind: 'bool' } };
       case 'endsWith': return { code: `as_str_endsWith(${s}, ${argStr(0)})`, type: { kind: 'bool' } };
       default:
+        if (as3Gap('String method', `String.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined String method '${method}'`);
     }
   }
@@ -22894,6 +26073,7 @@ export class Emitter {
       }
       case 'valueOf': return { code: v, type: obj.type };
       default:
+        if (as3Gap('Number method', `Number.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined Number method '${method}'`);
     }
   }
@@ -22904,6 +26084,7 @@ export class Emitter {
       case 'toString': return { code: `as_str_from_bool(${obj.code})`, type: { kind: 'string' } };
       case 'valueOf': return { code: obj.code, type: { kind: 'bool' } };
       default:
+        if (as3Gap('Boolean method', `Boolean.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined Boolean method '${method}'`);
     }
   }
@@ -22975,6 +26156,14 @@ export class Emitter {
       case 'totalMemoryNumber': return { code: 'as_system_total_memory_number()', type: { kind: 'number' } };
       case 'freeMemory': return { code: 'as_system_free_memory()', type: { kind: 'number' } };
       case 'privateMemory': return { code: 'as_system_private_memory()', type: { kind: 'number' } };
+      // System.containsDebugInfo (AIR): whether the player is a debugger build. This
+      // is a native executable, so it is the release value false -- the same answer
+      // Capabilities.isDebugger gives.
+      case 'containsDebugInfo': return { code: 'false', type: { kind: 'bool' } };
+      // System.useCodePage is the one READ-WRITE property of this static-only
+      // pseudo-class: a plain stored flag (see as_sys_use_code_page), written by
+      // the emitAssign branch that recognises the same receiver.
+      case 'useCodePage': return { code: 'as_sys_use_code_page', type: { kind: 'bool' } };
       default:
         throw new CodegenError(`unknown System constant '${name}'`);
     }
@@ -23000,6 +26189,11 @@ export class Emitter {
       case 'isDebugger': return { code: 'false', type: { kind: 'bool' } };
       case 'touchscreenType': return { code: '"none"', type: { kind: 'string' } };
       case 'language': return { code: 'as_cap_language()', type: { kind: 'string' } };
+      // serverString is AIR's url-encoded runtime fingerprint. Its exact byte format is
+      // Adobe's own and is not reproduced; as_cap_server_string builds this build's
+      // values in the same shape with a real per-process random component (see its
+      // comment), because callers seed PRNGs/GUIDs with it.
+      case 'serverString': return { code: 'as_cap_server_string()', type: { kind: 'string' } };
       case 'screenResolutionX': return { code: 'as_cap_screen_resolution_x()', type: { kind: 'int' } };
       case 'screenResolutionY': return { code: 'as_cap_screen_resolution_y()', type: { kind: 'int' } };
       case 'screenDPI': return { code: 'as_cap_screen_dpi()', type: { kind: 'number' } };
@@ -23107,6 +26301,17 @@ export class Emitter {
       // it as a package-level function; this subset treats it as a global built-in
       // (like parseInt) so frame counters can time themselves without importing it.
       case 'getTimer': return { code: 'as_getTimer()', type: { kind: 'int' } };
+      // flash.display.showRedrawRegions(enable:Boolean, color:uint = 0xFF0000):void --
+      // AIR's debug overlay that outlines each redrawn region. This render walk has
+      // no AIR-style region list to outline (it repaints the tree, and the dirty-rect
+      // path is a different notion), so the call is accepted and remembered, and the
+      // first enabling call reports that no overlay is painted. Both arguments are
+      // still evaluated (AIR evaluates them), so a call with a side effect behaves.
+      case 'showRedrawRegions': {
+        const on = this.condExpr(e0!);
+        const col = args.length >= 2 ? this.toNumberExpr(this.emitExpr(args[1])) : '16711680.0';
+        return { code: `(as_show_redraw_regions(${on}, ${col}), (void)0)`, type: { kind: 'void' } };
+      }
       // flash.utils.getQualifiedClassName(value:*): String — AS3 fully-qualified
       // class name ("包::类"). The value is boxed to as_value and dispatched at
       // runtime: primitives map to canonical names, objects/Classes read the
@@ -23245,6 +26450,16 @@ export class Emitter {
         return { code: `URLRequest__sendToURL(${rc})`, type: { kind: 'void' } };
       }
       case 'String': return { code: this.toStringExpr(e0!), type: { kind: 'string' } };
+      // Class(x): the AS3 conversion to the Class type. getDefinitionByName /
+      // getClassByAlias hand a class reference back boxed as an object (tag 4), so a
+      // dynamic operand is unboxed by the checked helper (TypeError #1034 when it is
+      // not a class, matching AIR); an operand already statically known to be a Class
+      // passes through unchanged.
+      case 'Class': {
+        if (e0 === null) return { code: 'as_v_req_class(as_v_null())', type: { kind: 'class' } };
+        if (e0.type.kind === 'class') return { code: e0.code, type: { kind: 'class' } };
+        return { code: `as_v_req_class(${e0.type.kind === 'any' ? e0.code : this.boxExpr(e0)})`, type: { kind: 'class' } };
+      }
       case 'Number': {
         if (e0!.type.kind === 'string') return { code: `as_str_to_number(${e0!.code})`, type: { kind: 'number' } };
         if (e0!.type.kind === 'any') return { code: `as_v_to_number(${e0!.code})`, type: { kind: 'number' } };
@@ -23335,6 +26550,16 @@ export class Emitter {
         if (e0!.type.kind === 'xml') return e0!;
         return { code: `as_xml_from_value(${this.boxExpr(e0!)})`, type: { kind: 'xml' } };
       }
+      // XMLList(x): the E4X conversion, exactly the 1-argument list constructor's
+      // semantics (see the `new XMLList(value)` route above): an XML node -> a
+      // one-item list, an XMLList -> a copy, any other value -> a one-item TEXT
+      // node. cn/edoctor/utils/Config.as reads the app descriptor this way
+      // (`XMLList(xml.ns::name)`), which is a CONVERSION, not a construction.
+      case 'XMLList': {
+        if (args.length === 0) return { code: 'as_xml_list_new(NULL, 0)', type: { kind: 'xmllist' } };
+        if (args.length > 1) throw new CodegenError('XMLList() takes at most 1 argument');
+        return { code: `as_xml_list_ctor(${this.boxExpr(e0!)})`, type: { kind: 'xmllist' } };
+      }
       case 'Array': return this.emitArrayConstructor(args);
       // flash.geom value types constructible without `new` (Point(x, y) etc.).
       case 'Point':
@@ -23373,7 +26598,7 @@ export class Emitter {
   // routing through the symbol table's constructor signature and factory name.
   private emitGeomConstructor(className: string, args: Expr[]): { code: string; type: CType } {
     const cinfo = this.symbols.getClass(className)!;
-    const cargs = this.emitArgs(cinfo.constructor.params, args);
+    const cargs = this.emitArgs(cinfo.constructor.params, args, cinfo.importAlias);
     return { code: `${className}_new(${cargs})`, type: { kind: 'object', className } };
   }
 
@@ -23385,8 +26610,11 @@ export class Emitter {
     if (!info.superClass) throw new CodegenError(`class '${this.currentClass}' has no superclass`);
     const superInfo = this.symbols.getClass(info.superClass)!;
     const m = superInfo.methods.get(expr.method);
-    if (!m) throw new CodegenError(`undefined method '${expr.method}' on superclass '${info.superClass}'`);
-    const args = this.emitArgs(m.params, expr.args);
+    if (!m) {
+      if (as3Gap('super method', `${info.superClass}.${expr.method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
+      throw new CodegenError(`undefined method '${expr.method}' on superclass '${info.superClass}'`);
+    }
+    const args = this.emitArgs(m.params, expr.args, this.declAliasOf(m.owner));
     const callArgs = args ? ', ' + args : '';
     return {
       code: `${m.owner}_${expr.method}(this${callArgs})`,
@@ -23415,6 +26643,7 @@ export class Emitter {
     // for the common `super.m.apply(this, args)` delegation pattern).
     const sm = superInfo.methods.get(expr.property);
     if (sm) return { code: `as_fn_make(${sm.owner}_${expr.property}__superbound, (void*)this, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+    if (as3Gap('super property', `${info.superClass}.${expr.property}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
     throw new CodegenError(`undefined property '${expr.property}' on superclass '${info.superClass}'`);
   }
 
@@ -23543,6 +26772,11 @@ export class Emitter {
     if (expr.typeName === 'Array') {
       if (o.type.kind === 'array') return { code: 'true', type: { kind: 'bool' } };
       if (o.type.kind === 'any') return { code: `as_v_is_array(${o.code})`, type: { kind: 'bool' } };
+      // `class X extends Array` IS an Array in AS3 (the trait is inherited), even
+      // though the C struct has no Array in its vtable chain.
+      if (o.type.kind === 'object' && this.symbols.getClass(o.type.className)?.arrayBacked) {
+        return { code: 'true', type: { kind: 'bool' } };
+      }
       return { code: 'false', type: { kind: 'bool' } };
     }
     // `x is Class`: a Class reference is boxed as an object (tag 4) but points to a
@@ -23713,7 +26947,29 @@ export class Emitter {
       const key = t.kind === 'Index'
         ? this.toStringExpr(this.emitExpr(t.index))
         : `"${this.escapeCString(t.property)}"`;
-      return { code: `as_array_del(${obj.code}, ${key})`, type: { kind: 'bool' } };
+      // as_array_del returns a BOXED bool (it reports true for every Array form);
+      // the result is `delete`'s value, so it has to be unboxed here. Emitting the
+      // raw as_value where a bool was declared was a real C type error the moment
+      // the result was used (temp/tarray: 'passing as_value to parameter of type
+      // bool').
+      return { code: `as_v_bool_val(as_array_del(${obj.code}, ${key}))`, type: { kind: 'bool' } };
+    }
+    // 'class X extends Array': delete follows the Array rules on the backing array.
+    {
+      const ab = this.arrayBackedArrayCode(obj, obj.code);
+      if (ab) {
+        const key = t.kind === 'Index'
+          ? this.toStringExpr(this.emitExpr(t.index))
+          : `"${this.escapeCString(t.property)}"`;
+        // A STRING key goes through the dynamic deleter so a declared field of the
+        // subclass stays undeletable (addressing the backing array directly would
+        // report true for it); a numeric index is always an element.
+        const strKey = t.kind === 'Index' ? this.emitExpr(t.index).type : null;
+        if (strKey === null || !this.indexKeyIsNumeric(strKey)) {
+          return { code: `as_dyn_del((void*)(${obj.code}), ${key})`, type: { kind: 'bool' } };
+        }
+        return { code: `as_v_bool_val(as_array_del(${ab.code}, ${key}))`, type: { kind: 'bool' } };
+      }
     }
     // delete v[key]: a Vector has no deletable member, and AIR reports TRUE,
     // leaving the vector untouched -- for an integer key, a numeric string and a
@@ -23744,21 +27000,20 @@ export class Emitter {
     else if (obj.type.kind === 'object') {
       // Any class instance: as_dyn_del decides at runtime — a Proxy intercepts via
       // deleteProperty (#2092 when not overridden), a dynamic class removes the
-      // `_dyn` slot, a sealed class has nothing to delete and reports false.
-      // `delete ba[0]` on a ByteArray is the index form's no-op: AIR reports false
-      // and never throws (measured, temp/baidxprobe), unlike the sealed-property
-      // `delete` which is a compile-time error in our subset.
+      // `_dyn` slot (reporting true), a sealed class has nothing to delete and
+      // reports FALSE. `delete sealedInst[key]` is therefore perfectly legal AIR
+      // and never an error: measured on adl 51.4.1 (temp/airref/Main.as) a sealed
+      // instance's declared field answers false and keeps its value, as does an
+      // absent name, while a dynamic instance's added property answers true and is
+      // removed. `delete ba[0]` on a ByteArray is the index form's no-op: AIR
+      // reports false and never throws (measured, temp/baidxprobe).
       if (obj.type.className === 'ByteArray' && t.kind === 'Index') {
         return { code: `((void)(${obj.code}), false)`, type: { kind: 'bool' } };
       }
-      const cinfo = this.symbols.getClass(obj.type.className);
-      if (cinfo?.isProxy || cinfo?.isDynamic) {
-        const dkey = t.kind === 'Index'
-          ? this.toStringExpr(this.emitExpr(t.index))
-          : `"${this.escapeCString(t.property)}"`;
-        return { code: `as_dyn_del((void*)(${obj.code}), ${dkey})`, type: { kind: 'bool' } };
-      }
-      throw new CodegenError(`delete on non-dynamic type ${obj.type.kind}`);
+      const dkey = t.kind === 'Index'
+        ? this.toStringExpr(this.emitExpr(t.index))
+        : `"${this.escapeCString(t.property)}"`;
+      return { code: `as_dyn_del((void*)(${obj.code}), ${dkey})`, type: { kind: 'bool' } };
     }
     // `delete b[k]` on a primitive receiver: AS3 autoboxes to a Sealed object with
     // nothing to delete, so the operation is a no-op reporting false -- the same
@@ -23772,7 +27027,7 @@ export class Emitter {
         : `"${this.escapeCString(t.property)}"`;
       return { code: `((void)(${obj.code}), (void)(${k0}), false)`, type: { kind: 'bool' } };
     }
-    else throw new CodegenError(`delete on non-dynamic type ${obj.type.kind}`);
+    else throw new CodegenError(`delete on non-dynamic type ${obj.type.kind} in ${this.currentClass}.${this.currentMethod}`);
     const key = t.kind === 'Index'
       ? this.toStringExpr(this.emitExpr(t.index))
       : `"${this.escapeCString(t.property)}"`;
@@ -23880,6 +27135,17 @@ export class Emitter {
       }
       return { code: 'as_v_null()', type: anyType };
     }
+    // `x as Class`: only a class reference survives. A Class value boxes as a tag-4
+    // object pointing at a static as_class entry, so no vtable subtype test can see
+    // it -- the ordinary object cast answered null for every class reference. AIR
+    // (measured on adl 51.4.1): `Object(Foo) as Class` is Foo, `5 as Class` and
+    // `null as Class` are null. Same registry identity as `is Class`.
+    if (expr.typeName === 'Class') {
+      const anyType: CType = { kind: 'any' };
+      if (o.type.kind === 'class') return { code: o.code, type: { kind: 'class' } };
+      if (o.type.kind === 'any') return { code: `as_val_as_class(${o.code})`, type: anyType };
+      return { code: `as_val_as_class(${this.boxExpr(o)})`, type: anyType };
+    }
     // Object root: anything that IS an Object. AS3 treats primitives as Objects,
     // so AIR returns the value itself ('5 as Object' -> 5, getQualifiedClassName
     // "int") and null/undefined -> null (measured on adl 51.4.1, temp/a3probe).
@@ -23914,6 +27180,12 @@ export class Emitter {
     if (expr.typeName === 'Array') {
       if (o.type.kind === 'any') return { code: `((as_array*)as_v_obj_val(${o.code}))`, type: { kind: 'array' } };
       if (o.type.kind === 'array') return { code: o.code, type: { kind: 'array' } };
+      // `class X extends Array` IS an Array in AS3, so the cast yields its
+      // backing array (the same storage every inherited Array member uses).
+      {
+        const ab = this.arrayBackedArrayCode(o, o.code);
+        if (ab) return { code: ab.code, type: { kind: 'array' } };
+      }
       return { code: 'NULL', type: { kind: 'array' } };
     }
     // `x as Dictionary`: unbox a dynamically-held Dictionary; else NULL.
@@ -24190,6 +27462,41 @@ export class Emitter {
       // Class reference at runtime (AS3 `if (asset is Class) asset = new asset()`).
       const ov = this.lookupObjectVar(expr.className);
       if (ov) return { code: this.dynNewCode(ov, expr.args), type: { kind: 'any' } };
+      // A bare identifier naming an INSTANCE MEMBER of the ENCLOSING class: `new type`
+      // in protobuf's FieldDescriptor_TYPE_MESSAGE, where `type` is the class's own
+      // `override get type():Class` accessor (unqualified name resolution reaches a
+      // class's own members before the package scope). Only emitted when the member
+      // really exists, so a genuine typo still reports `unknown class`. The member is
+      // read through the ordinary member machinery (visibility, getter invocation).
+      if (!expr.className.includes('.') && this.currentClass) {
+        const slot = this.symbols.fieldSlot(this.currentClass, expr.className);
+        const gg = this.symbols.findGetter(this.currentClass, expr.className);
+        const mt = slot !== undefined ? slot.type : gg?.g.returnType;
+        if (mt !== undefined && (mt.kind === 'class' || mt.kind === 'object' || mt.kind === 'any')) {
+          const recv = this.emitExpr({
+            kind: 'Member',
+            object: { kind: 'Var', name: 'this' },
+            property: expr.className,
+          });
+          return { code: this.dynNewCode(recv, expr.args), type: { kind: 'any' } };
+        }
+      }
+      // `new this.member(args)`: a Class held by an INSTANCE member of the ENCLOSING
+      // class (VideoRootView assigns `this.videoClass = VideoPlayer`, then creates one
+      // player per render view). This is not a static of another class, so the
+      // qualified-static walk below cannot reach it: read the member off the receiver
+      // -- the ordinary field/accessor/visibility machinery, not a hand-rolled lookup
+      // -- and instantiate whatever Class value it holds.
+      if (expr.className.startsWith('this.') && !expr.className.slice(5).includes('.')) {
+        const recv = this.emitExpr({
+          kind: 'Member',
+          object: { kind: 'Var', name: 'this' },
+          property: expr.className.slice(5),
+        });
+        if (recv.type.kind === 'class' || recv.type.kind === 'object' || recv.type.kind === 'any') {
+          return { code: this.dynNewCode(recv, expr.args), type: { kind: 'any' } };
+        }
+      }
       // `new Assets.pic()`: a QUALIFIED static member holding a Class -- the shape
       // every [Embed] asset is consumed through (`new EmbeddedAssets.logo()`), and
       // a qualified name is the only spelling that reaches a static of another
@@ -24219,7 +27526,7 @@ export class Emitter {
     if (!cinfo) throw new CodegenError(`unknown class '${cname}'`);
     let args: string;
     try {
-      args = this.emitArgs(cinfo.constructor.params, expr.args);
+      args = this.emitArgs(cinfo.constructor.params, expr.args, cinfo.importAlias);
     } catch (e) {
       if (e instanceof CodegenError) throw new CodegenError(`${codegenBareMessage(e)} (constructor of ${cname}, args=${expr.args.length}, params=[${cinfo.constructor.params.map((p) => `${p.name}${p.defaultValue !== null ? '?' : ''}`).join(', ')}])`, e.line, e.col);
       throw e;
@@ -24414,10 +27721,37 @@ export class Emitter {
         const sg = cinfo.staticGetters?.get(prop);
         if (sg) return { code: `${sg.owner}_get_${prop}_static(NULL)`, type: sg.returnType };
       }
+      // Every other class-ish receiver falls back to the DOTTED member path: a
+      // class-object read means exactly the same thing there, which is what lets
+      // the name-resolved static-only classes (System/Capabilities/Math/...),
+      // `File.desktopDirectory`-style static getters and `Cls["instanceMethod"]`
+      // answer, instead of the generic receiver path failing on a variable that
+      // does not exist (measured on the talkmed-meeting AIR app:
+      // `trace("System.containsDebugInfo", System['containsDebugInfo'])`).
+      if (!this.varInScope(expr.object.name) && Emitter.STATIC_ONLY_CLASSES.has(expr.object.name)) {
+        return this.emitMember({ kind: 'Member', object: expr.object, property: expr.index.value });
+      }
     }
     const obj = this.emitExpr(expr.object);
     // Null-receiver guard (#1009): `a[0]` on a null Array throws in AIR.
     const recv = this.guardRecv(expr.object, obj);
+    // `class X extends Array`: index access reads the hidden backing array, with
+    // the Array rules (numeric string = element, "length" = length, other names =
+    // named properties).
+    const abIdx = this.arrayBackedArrayCode(obj, recv);
+    if (abIdx) {
+      const idxExpr = this.emitExpr(expr.index);
+      if (!this.indexKeyIsNumeric(idxExpr.type)) {
+        // A STRING key is a property lookup, so it goes through the dynamic reader:
+        // a declared field/getter of the subclass answers first (this is how
+        // `seq["tag"]` returns the subclass's own field), and only a miss reaches
+        // the backing array's property map ('length', a named property, or a
+        // canonical index spelled as a string).
+        return { code: `as_dyn_get((void*)(${recv}), ${this.toStringExpr(idxExpr)})`, type: { kind: 'any' } };
+      }
+      const idx = this.convert(idxExpr, { kind: 'int' });
+      return { code: `as_array_get(${abIdx.code}, ${idx})`, type: { kind: 'any' } };
+    }
     if (obj.type.kind === 'vector') {
       const idxExpr = this.emitExpr(expr.index);
       // A STRING key is not an integer index: AIR parses it as a number and falls
@@ -24722,6 +28056,29 @@ export class Emitter {
         const s = e.type as { className: string };
         return t.className === s.className ? e.code : `((${t.className}*)(${e.code}))`;
       }
+      // An INTERFACE-to-INTERFACE conversion (a widening upcast, e.g. an IMode value
+      // returned where an ICipher is expected): C keeps ONE struct per interface, so
+      // the pair must be re-tagged. A pointer cast is NOT enough -- an interface's
+      // slot list puts its OWN methods first and APPENDS its parents' (symbols pass
+      // 0.2), so a parent vtable is not a layout prefix of the child's, and casting
+      // would dispatch to the wrong method. The runtime lookup returns the object's
+      // class's vtable for the TARGET interface, which emitInterfaceVtables emits for
+      // every transitively inherited parent. Site: com/hurlant/crypto/Crypto.as:111,
+      // `return getMode(...)` in `getCipher(...):ICipher` where `interface IMode
+      // extends ICipher` (com/hurlant/crypto/symmetric/IMode.as:12).
+      if (target.kind === 'interface') {
+        const src = (e.type as { name: string }).name;
+        const dst = (target as { name: string }).name;
+        if (src !== dst) {
+          // `e.code` may be an arbitrary expression (a call, a field read), so the
+          // value is bound to a temporary FIRST: it must be evaluated exactly once
+          // (the conversion reads both fields and asks for the target vtable).
+          const t = this.tmpName('ifc');
+          this.line(`${src} ${t} = ${e.code};`);
+          const lk = `as_iface_lookup((void*)(${t}.obj), "${this.escapeCString(dst)}")`;
+          return `(${dst}){ (void*)(${t}.obj), (${dst}_vtable*)(${lk}) }`;
+        }
+      }
       return e.code;
     }
     if (target.kind === 'any') return this.boxExpr(e);
@@ -24748,6 +28105,16 @@ export class Emitter {
       if (target.kind === 'object' || target.kind === 'function' || target.kind === 'class') return 'NULL';
       if (target.kind === 'array' || target.kind === 'vector' || target.kind === 'record' || target.kind === 'dict' || target.kind === 'xml' || target.kind === 'xmllist' || target.kind === 'regexp') return 'NULL';
     }
+    // E4X conversions between the two XML C types (a node and a list) and from a
+    // scalar. AS3 types every XML-ish slot as XML or XMLList, so a program like
+    // Config.as's `var list:XMLList = xml.attributes()` (attributes() returns a
+    // String in this subset) or `xml = XML(xml.ns::initialWindow)` (a list) needs
+    // the same conversion the E4X constructors perform: an XMLList slot takes a
+    // list of the value (a text node for a scalar), an XML slot takes the first
+    // node of a list (NULL for an empty one -- every navigation helper treats a
+    // NULL node as 'no match').
+    if (target.kind === 'xmllist') return `as_xml_list_ctor(${this.boxExpr(e)})`;
+    if (target.kind === 'xml') return `as_xml_from_value(${this.boxExpr(e)})`;
     if (target.kind === 'string') return this.toStringExpr(e);
     // Reference types cannot implicitly convert to numeric/bool scalars in AS3.
     // This guards `var x; x = "hello";` (x inferred as int) from silently
@@ -24755,7 +28122,38 @@ export class Emitter {
     // The 64-bit types are scalars, so int64 <-> int/Number conversions are
     // permitted (narrowing to int keeps the low 32 bits; widening is exact).
     if (this.isRefType(e.type) && (target.kind === 'int' || target.kind === 'uint' || target.kind === 'number' || target.kind === 'bool')) {
-      throw new CodegenError(`cannot convert ${this.describeType(e.type)} to ${target.kind}`);
+      // A STRING source is coerced the way AIR coerces it, not rejected. AIR types a
+      // number of its own numeric slots as Object (flash.text.TextFormat.color /
+      // size / bold / leading / letterSpacing / ...), so real projects do write
+      // `format.color = '0xa2a2a2'` (talkmed-meeting, TextInput.as:47) and mxmlc
+      // accepts it -- the string lands in an Object slot and is coerced with
+      // ToNumber/ToBoolean when the renderer uses it. Emitting that same coercion
+      // keeps the rendering result identical; note the deviation that OUR slot is a
+      // C number, so reading the property back gives the coerced number rather than
+      // the assigned string (documented in TODO.md).
+      // Object/Array/Function sources stay a hard error: those are programmer
+      // mistakes, not the Object-slot pattern.
+      if (e.type.kind === 'string') {
+        if (target.kind === 'bool') return `as_str_truthy(${e.code})`;
+        if (target.kind === 'number') return `as_str_to_number(${e.code})`;
+        if (target.kind === 'int') return `as_to_int32(as_str_to_number(${e.code}))`;
+        return `as_to_uint32(as_str_to_number(${e.code}))`;
+      }
+      // AIR ACCEPTS a reference-typed source where a Boolean or a Number is
+      // expected, applying the ordinary ToBoolean/ToNumber at run time -- measured
+      // on adl 51.4.1 (temp/airref/Main.as): a `:Boolean` function may `return o`
+      // (Object) and gives true for {} / false for null, and a `:Number` function
+      // may `return o` (ToNumber of an object is NaN). int and uint are the ones
+      // AIR REJECTS ("implicit coercion of a value of type Object to a possibly
+      // unrelated type int/uint"), which is the hard error below -- e.g.
+      // ANEQcloud.as:179 `return _extCtx.call(...)`, whose AIR type is `*`.
+      if (target.kind === 'bool') return `as_v_truthy(${this.boxExpr(e)})`;
+      if (target.kind === 'number') return `as_v_to_number(${this.boxExpr(e)})`;
+      // Name the enclosing member: the position attached to this error is only as
+      // fresh as the last node that published one, so in a multi-file program
+      // (--air-app) the class/method is what identifies the offending line.
+      const where = this.currentClass ? ` in ${this.currentClass}${this.currentMethod ? '.' + this.currentMethod : ''}` : '';
+      throw new CodegenError(`cannot convert ${this.describeType(e.type)} to ${target.kind}${where}`);
     }
     if (target.kind === 'int') return e.type.kind === 'number' ? `as_to_int32(${e.code})` : `((int)(${e.code}))`;
     if (target.kind === 'uint') return e.type.kind === 'number' ? `as_to_uint32(${e.code})` : `((unsigned int)(${e.code}))`;

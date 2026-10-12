@@ -26,11 +26,12 @@ export function generateC(
   swcResources: readonly SwcResourceSpec[] = [],
   swcBake: SwcBake | undefined = undefined,
   embedResources: readonly EmbedResourceSpec[] = [],
-  embedFieldInits?: ReadonlyMap<string, string>
+  embedFieldInits?: ReadonlyMap<string, string>,
+  appDescriptorXml?: string
 ): CodegenResult {
   const symbols = new SymbolTable();
   symbols.collect(program, embedFieldInits);
-  const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources);
+  const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources, appDescriptorXml);
   const c = emitter.run();
   return { c, exports: [...symbols.exports] };
 }

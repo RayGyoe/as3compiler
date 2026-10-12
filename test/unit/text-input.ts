@@ -166,7 +166,10 @@ function checkRestrict(): string[] {
   check('a char with no other case (digit, symbol) is dropped instead',
     ch.includes('if (alt == c) return 0;') && ch.includes('\n  return 0;'));
   // (3) 过滤位置：textInput 之后（事件带原始文本）、splice 之前；换行绕过。
-  const ins = /static void as_tf_insert_text\([\s\S]*?\n\}\n/.exec(c)?.[0] ?? '';
+  // The pipeline function is as_tf_insert_payload (the Return synthesis needs a
+  // payload that differs from what is inserted); as_tf_insert_text is the
+  // one-string wrapper a typed character or a paste comes through.
+  const ins = /static void as_tf_insert_payload\([\s\S]*?\n\}\n/.exec(c)?.[0] ?? '';
   check('the filter runs after the textInput dispatch, so the event keeps the raw text',
     ins.indexOf('as_tf_restrict_char') > ins.indexOf('if (te->cancelled) return;'));
   check('restrict is only consulted when the pattern is non-NULL',
@@ -175,21 +178,22 @@ function checkRestrict(): string[] {
     ins.includes('if (c == 13 || c == 10) filtered[fn++] = (char)c;'));
   check('the filtered string is what gets spliced (so it keeps the maxChars/selection semantics)',
     ins.includes('if (as_tf_splice(tf, lo, hi, ins)) as_tf_dispatch_change(tf);'));
-  check('the raw payload is still what the event carries',
-    ins.includes('TextEvent_new((char*)"textInput", true, true, (char*)text)'));
+  check('the payload is what the event carries, defaulting to the inserted text',
+    ins.includes('TextEvent_new((char*)"textInput", true, true, (char*)(payload != NULL ? payload : text))'));
   // (4) 只作用于用户输入：text 赋值路径完全不经过 restrict。
   check('the TextField.text setter never consults restrict',
     /static void TextField_set_text\(void\* _this, char\* value\) \{[\s\S]{0,600}?\n\}/.test(c) &&
     !/static void TextField_set_text\(void\* _this, char\* value\) \{[\s\S]{0,600}?as_tf_restrict/.test(c));
-  // (5) 粘贴与单字符走同一条管道（因此也过滤）。
+  // (5) 粘贴与单字符走同一条管道（因此也过滤）：as_tf_insert_text 是单串包装。
   const paste = /static void as_tf_paste\([\s\S]*?\n\}\n/.exec(c)?.[0] ?? '';
-  check('paste routes through as_tf_insert_text, so restrict applies to it too',
-    paste.includes('as_tf_insert_text(tf, buf);'));
-  // (6) Return 的换行：SDL2/Cocoa 从不为 Return 产生 text，故在 keyDown 上合成提交。
+  check('paste routes through the one-string pipeline, so restrict applies to it too',
+    paste.includes('as_tf_insert_text(tf, buf);') && c.includes('static void as_tf_insert_text(TextField* tf, const char* text) { as_tf_insert_payload(tf, text, text); }'));
+  // (6) Return 的换行：SDL2/Cocoa 从不为 Return 产生 text，故在 keyDown 上合成提交；
+  // 载荷是 "\n"（adl）而插入的是 CR —— 所以走的是两串形态。
   check('Return synthesizes its text commit for a multiline editable field',
-    c.includes('if (keyCode == 13 && tf->multiline) as_tf_insert_text(tf, "\\r");'));
+    c.includes('if (keyCode == 13 && tf->multiline) as_tf_insert_payload(tf, "\\n", "\\r");'));
   check('the Return commit sits in the keyDown-only path, after the editable-field guard',
-    /if \(!down\) return;[\s\S]{0,1400}?if \(keyCode == 13 && tf->multiline\) as_tf_insert_text/.test(c) &&
+    /if \(!down\) return;[\s\S]{0,1400}?if \(keyCode == 13 && tf->multiline\) as_tf_insert_payload/.test(c) &&
     /as_tf_is_input\(tf\)\) return;[\s\S]{0,400}?if \(keyCode == 13/.test(c));
   // (7) dispatchText 是 headless 驱动钩子，通到 Stage_dispatchText。
   check('Stage.dispatchText(text) routes to Stage_dispatchText',
@@ -343,8 +347,13 @@ function checkTextInput(): string[] {
   check('the paragraph cache is keyed on the layout string, not on .text',
     c.includes('tf->_para_text == ltext') && c.includes('tf->_para_text = ltext;')
     && c.includes('as_skia_textlayout_new_leading(ltext, fmt->font'));
-  check('the mask wins over htmlText runs while it is on',
-    c.includes("tf->_runs->length > 0 && !tf->displayAsPassword"));
+  // 遮罩**不**吞掉 run 表（2026-10-11 阶段一百三十五 / L8154 实测推翻旧决定）：
+  // adl 上带 24px 红 run 的 htmlText 字段开遮罩后，行盒/run 大小/红色星星号与不遮罩时
+  // 同结构（C 行盒 30.28 = B），故星号按所属 run 排版；排版串仍是星号串。
+  check('the mask keeps the htmlText runs (each star takes its run\'s style)',
+    c.includes('int hasRuns = (tf->_runs != NULL && tf->_runs->length > 0);')
+    && !c.includes('length > 0 && !tf->displayAsPassword')
+    && c.includes('as_skia_textlayout_new_runs(ltext, &dr, runs, n, pw, pa, collapse);'));
   // 实测：遮罩字段 Cmd+A 仍选中（SEL=0,3），但 Cmd+C / Cmd+X 拒写剪贴板（对照字段
   // 的同一手势复制出 "abcdefghij"）；Cut 连文本也不删。
   check('a password field refuses to copy its plaintext to the clipboard',
@@ -506,7 +515,7 @@ function checkTextSelection(): string[] {
   check('the kept selection collapses onto the release index at mouseUp',
     /strcmp\(type, "mouseUp"\) == 0\) \{[\s\S]{0,300}?if \(drag_tf != NULL && drag_anchor == -2\) \{[\s\S]{0,420}?drag_tf->_sel_begin = idx; drag_tf->_sel_end = idx; drag_tf->_sel_caret = idx;/.test(c));
   check('the drag state is FILE scope so the wordSelect bridge can clear it',
-    /static TextField\* drag_tf = NULL;\nstatic int drag_anchor = -1;\nstatic void Stage_dispatchMouse/.test(c)
+    /static TextField\* drag_tf = NULL;\nstatic int drag_anchor = -1;/.test(c)
     && !/void Stage_dispatchMouse[\s\S]{0,200}static TextField\* drag_tf/.test(c));
   check('a word select cancels the pending collapse from the double click\'s mouseDown',
     /as_tf_word_select\(tf, as_tf_index_at\(tf, tfx, tfy\)\);[\s\S]{0,60}?drag_tf = NULL;[\s\S]{0,40}?drag_anchor = -1;/.test(c));
@@ -516,8 +525,171 @@ function checkTextSelection(): string[] {
   return bad;
 }
 
+// Insertion caret (阶段一百三十五). adl ground truth: the caret is a player OVERLAY,
+// not part of the field's rasterization — measured on adl 51.4.1 that
+// `BitmapData.draw` of a focused editable field captures NO caret at all
+// (temp/caretprobe: 14 samples over 1.7 s, every one empty). We reproduce that by
+// drawing the caret only in a window/compose pass (ASC_caret_pass): a 1-device-pixel
+// bar in the field's text colour, blinking on a ~500 ms half period whose clock
+// restarts on focus / caret move / keystroke.
+function checkCaret(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [caret] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [caret] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.Stage;\n' +
+    'import flash.text.TextField;\n' +
+    'var s:Stage = new Stage();\n' +
+    'var f:TextField = new TextField();\n' +
+    's.addChild(f);\n' +
+    's.focus = f;\n')).c;
+
+  // (1) blink clock + ~500 ms half period.
+  check('the caret blink clock exists and restarts on demand',
+    c.includes('static double as_tf_blink_t0 = 0.0;')
+    && c.includes('static void as_tf_blink_reset(void) { as_tf_blink_t0 = as_now_ms(); }'));
+  check('the caret blinks on a 500 ms half period',
+    /static int as_tf_caret_on\(void\) \{[\s\S]{0,320}?\(\(long\)\(dt \/ 500\.0\) % 2\) == 0/.test(c));
+  // (2) the clock restarts on focus / caret move / extend, so the caret is solid
+  // right after the user acts instead of flickering off mid-keystroke.
+  check('focus change restarts the blink',
+    /void as_set_focus\(DisplayObject\* obj\) \{[\s\S]{0,420}?as_tf_blink_reset\(\);/.test(c));
+  check('a plain caret move restarts the blink',
+    /static void as_tf_set_caret\(TextField\* tf, int pos\) \{[\s\S]{0,420}?as_tf_blink_reset\(\);/.test(c));
+  check('a shift-extend restarts the blink',
+    /static void as_tf_extend_caret\(TextField\* tf, int pos\) \{[\s\S]{0,520}?as_tf_blink_reset\(\);/.test(c));
+  // (3) drawn only in a window/compose pass and only on a focused + selectable
+  // field, as a 1-device-pixel fill rect at the caret box in the text colour.
+  check('the caret is gated on the window pass and on focused + selectable',
+    c.includes('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable) {'));
+  check('the caret bar is a 1-device-pixel fill rect at the caret box, in the text colour',
+    /if \(ASC_caret_pass && as_focus_obj == \(void\*\)tf && tf->selectable\) \{[\s\S]{0,900}?as_skia_textlayout_caret_rect\(para, as_tf_utf16_index\(tf, as_tf_caret\(tf\)\), &kcx, &kcy, &kch\)[\s\S]{0,520}?as_skia_paint_fill\(kcol, 1\.0\)[\s\S]{0,180}?as_skia_canvas_draw_rect\(canvas, 2\.0 \+ alignDx - scrollX \+ kcx, 2\.0 - scrollY \+ kcy, kw, kch, kp\)/.test(c));
+  check('the caret width is one DEVICE pixel (scale divided out), like the border',
+    /double kw = ASC_render_scale \/ ksx;/.test(c));
+  // (4) the window compose pass switches it on; Stage.render (the screenshot hook)
+  // does too; the fingerprint and every bake never do.
+  check('ASC_window_render enables the caret pass around the display list only',
+    /as_render_fp\(\(DisplayObject\*\)st\);\n\s*ASC_caret_pass = 1;\n\s*as_render_object\(canvas, \(DisplayObject\*\)st\);\n\s*ASC_caret_pass = 0;/.test(c));
+  check('Stage.render (screenshot hook) enables the caret pass',
+    /as_render_fp\(\(DisplayObject\*\)_this\);\n\s*ASC_caret_pass = 1;\n\s*as_render_object\(canvas, \(DisplayObject\*\)_this\);\n\s*ASC_caret_pass = 0;/.test(c));
+  const fp = c.match(/static uint32_t as_render_fp\(DisplayObject\* o\) \{[\s\S]*?\n\}/);
+  check('the fingerprint never depends on the caret pass (a bake must not capture a caret)',
+    fp !== null && !/ASC_caret_pass/.test(fp[0]));
+  // (5) a focused TextField renders live, never from a bake (the caret blinks).
+  check('a focused TextField is never served from a bake',
+    c.includes('!(as_is(o, &TextField_vt) && as_focus_obj == (void*)o)'));
+  return bad;
+}
+
+// ---- TODO L8152 / L8155: the index domain of the visual line table, and the
+// payload of a multiline Return ----
+// Two measured defects that share one root: this runtime indexes strings by UTF-8
+// BYTE while Skia's paragraph answers in UTF-16 CODE UNITS, and the domains only
+// coincide for ASCII.
+//   * the visual line table handed Skia's code-unit starts to as_tf_line_of_index /
+//     as_tf_line_end, which compare them against a byte caret. Measured on a
+//     wrapped all-CJK field (temp/linecjk, 7 characters = 21 bytes / 7 units, lines
+//     4+3 so bytes start at 0/12 while units start at 0/4): Down from byte 0 landed
+//     on byte 4 -- inside the first character -- and Down from byte 6 (inside line
+//     0) did not move AT ALL, because unit start 4 <= byte 6 read as "already on
+//     line 1"; the click path reported the unit count (2) instead of the byte index
+//     (6). After the fix the same probe returns 12 / 18 (start + kept column 6) / 6.
+//   * a multiline Return dispatches `TextEvent.TEXT_INPUT` with text "\n" (adl
+//     51.4.1) while the field's own text gains a CR -- one event, two strings.
+function checkIndexDomain(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [indexdomain] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [indexdomain] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.Stage;\n' +
+    'import flash.text.TextField;\n' +
+    'var s:Stage = new Stage();\n' +
+    'var f:TextField = new TextField();\n' +
+    'f.multiline = true;\n' +
+    's.addChild(f);\n' +
+    's.focus = f;\n')).c;
+
+  // (1) the inverse of as_tf_utf16_index, and the mask identity: a masked paragraph
+  // is laid out from one ASCII star per BYTE, so its code-unit index IS the byte
+  // index -- the plaintext count would land short on CJK.
+  check('a byte index is the inverse of the code-unit index',
+    c.includes('static int as_tf_byte_index(TextField* tf, int unitIndex) {')
+    && /int units = 0, i = 0;\n\s*while \(i < n && units < unitIndex\) \{/.test(c));
+  check('the masked paragraph keeps the identity in BOTH directions',
+    /static int as_tf_utf16_index\(TextField\* tf, int byteIndex\) \{[\s\S]{0,420}?if \(tf->displayAsPassword\) return byteIndex;/.test(c)
+    && /static int as_tf_byte_index\(TextField\* tf, int unitIndex\) \{[\s\S]{0,260}?displayAsPassword\) \{ int m = \(int\)strlen\(s\); return unitIndex > m \? m : unitIndex; \}/.test(c));
+
+  // (2) the visual line table converts Skia's answer at its exit, so every consumer
+  // (as_tf_line_of_index, as_tf_line_end's CR test, the column arithmetic, the
+  // scroll target) stays in bytes; the no-Skia fallback already scans bytes.
+  check('the visual line table hands out BYTE offsets, not Skia code units',
+    /int n = as_skia_textlayout_line_metrics\(para, starts, ends, tops, NULL, cap\);\n\s*if \(n > 0\) \{[\s\S]{0,260}?if \(starts != NULL\) starts\[i\] = as_tf_byte_index\(tf, starts\[i\]\);\n\s*if \(ends != NULL\) ends\[i\] = as_tf_byte_index\(tf, ends\[i\]\);/.test(c));
+  check('the CR/LF fallback table is byte-indexed too (both paths agree)',
+    /int le = ls;\n\s*while \(le < len && t\[le\] != 13 && t\[le\] != 10\) le\++;/.test(c));
+  check('a click maps Skia\'s answer back to a byte index',
+    /int idx = as_skia_textlayout_glyph_position_at\(para, lx, ly\);\n\s*if \(idx < 0\) idx = 0;\n\s*idx = as_tf_byte_index\(tf, idx\);/.test(c));
+
+  // (3) Return: the payload and the inserted text are separate arguments, and the
+  // synthesis passes "\n" as the payload while splicing a CR.
+  check('the text pipeline takes the event payload and the inserted text separately',
+    c.includes('static void as_tf_insert_payload(TextField* tf, const char* payload, const char* text) {')
+    && /TextEvent\* te = TextEvent_new\(\(char\*\)"textInput", true, true, \(char\*\)\(payload != NULL \? payload : text\)\);/.test(c));
+  check('a typed or pasted character passes its text as both',
+    c.includes('static void as_tf_insert_text(TextField* tf, const char* text) { as_tf_insert_payload(tf, text, text); }'));
+  check('a multiline Return dispatches "\\n" while inserting a CR',
+    c.includes('if (keyCode == 13 && tf->multiline) as_tf_insert_payload(tf, "\\n", "\\r");'));
+  return bad;
+}
+
+// ---- TODO L8154: displayAsPassword x htmlText (mask keeps the runs) ----
+//
+// Measured on adl 51.3.2 (temp/pwdhtml, five cases): a field whose htmlText gives
+// its first character a 24px RED run reports the SAME paragraph metrics masked as
+// unmasked (line 0 height 30.28 / ascent 23.29 against 13.98 / 11.65 for the plain
+// control) and the drawn star for that character is the 24px one, in red. A
+// run-free masked field keeps the default format (identical to the plain control),
+// so the mask replaces the GLYPHS and not the styles.
+function checkMaskHtml(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [maskhtml] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [maskhtml] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.Stage;\n' +
+    'import flash.text.TextField;\n' +
+    'import flash.text.TextFormat;\n' +
+    'var s:Stage = new Stage();\n' +
+    'var f:TextField = new TextField();\n' +
+    'f.htmlText = "<font size=\'24\' color=\'#ff0000\'>A</font>aaaa";\n' +
+    'f.displayAsPassword = true;\n' +
+    's.addChild(f);\n')).c;
+
+  check('the mask does not suppress the run table any more',
+    c.includes('int hasRuns = (tf->_runs != NULL && tf->_runs->length > 0);')
+    && !c.includes('&& !tf->displayAsPassword);'));
+  check('the masked layout still comes from the star string',
+    /static const char\* as_tf_layout_text\(TextField\* tf\) \{[\s\S]{0,200}?if \(!tf->displayAsPassword\) return tf->text;/.test(c)
+    && c.includes("m[i] = (c == '\\r' || c == '\\n') ? c : '*';"));
+  check('the runs are built from the LAYOUT text, so a run\'s byte range lands on its stars',
+    c.includes('void* pr = as_skia_textlayout_new_runs(ltext, &dr, runs, n, 0.0, 0, collapse);')
+    && c.includes('tf->_para = as_skia_textlayout_new_runs(ltext, &dr, runs, n, pw, pa, collapse);')
+    && !/as_skia_textlayout_new_runs\(tf->text/.test(c));
+  return bad;
+}
+
 registerGroup('unit: text-input/DoubleClick', checkDoubleClick);
 registerGroup('unit: text-input/TabFocus', checkTabFocus);
 registerGroup('unit: text-input/Restrict', checkRestrict);
 registerGroup('unit: text-input/TextInput', checkTextInput);
 registerGroup('unit: text-input/TextSelection', checkTextSelection);
+registerGroup('unit: text-input/Caret', checkCaret);
+registerGroup('unit: text-input/IndexDomain', checkIndexDomain);
+registerGroup('unit: text-input/MaskHtml', checkMaskHtml);

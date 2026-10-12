@@ -459,6 +459,12 @@ void sk_path_add_rect(void* path, double x, double y, double w, double h) {
 void sk_path_add_circle(void* path, double cx, double cy, double r) {
   ((SkPath*)path)->addCircle((SkScalar)cx, (SkScalar)cy, (SkScalar)r);
 }
+// Graphics.drawEllipse: AIR's ellipse inscribed in the (x, y, width, height)
+// rectangle. A negative width/height mirrors the rectangle, which for a symmetric
+// oval is the same outline, so the caller normalizes before calling this.
+void sk_path_add_oval(void* path, double x, double y, double w, double h) {
+  ((SkPath*)path)->addOval(SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)w, (SkScalar)h));
+}
 void sk_path_close(void* path) { ((SkPath*)path)->close(); }
 // Append `src` transformed by the affine [a, b, c, d, tx, ty] (AS3 convention:
 // x' = a*x + c*y + tx). Used to place a mask shape's outline into the masked
@@ -1283,16 +1289,49 @@ static void sk_set_air_strut(skia::textlayout::ParagraphStyle& ps, const char* f
   strut.setFontSize((SkScalar)size);
   strut.setFontFamilies({ SkString(sk_family_alias(family)) });
   // Skia scales the raw metrics by (height * fontSize / rawFull); pre-multiply so
-  // the resulting box before the strut leading is exactly the intended one.
-  // Negative leading cannot go through StrutStyle::leading (Skia clamps a
-  // negative value to 0 -- ParagraphImpl.cpp), so it is folded into the height
-  // instead; a positive one stays a leading so the ascent keeps its AIR ratio.
-  const double boxHeight = (leading < 0.0) ? box : am.model;
-  strut.setHeight((SkScalar)(boxHeight * am.rawFull / (am.rawSum * size)));
+  // the resulting box is exactly AIR's. The leading is folded into the height in
+  // BOTH directions: AIR's box is ascent + descent + leading with an ascent /
+  // descent split that ignores the leading, and StrutStyle::leading does not reach
+  // the line box in this build (measured: a leading of 4 leaves a 2-line paragraph
+  // at 2*model, so the box must be raised by the height instead); a negative
+  // leading cannot go through StrutStyle::leading at all (Skia clamps it to 0 --
+  // ParagraphImpl.cpp). sk_textlayout_line_box scales the split back out.
+  strut.setHeight((SkScalar)(box * am.rawFull / (am.rawSum * size)));
   strut.setHeightOverride(true);
   strut.setForceStrutHeight(true);
-  if (leading > 0.0) strut.setLeading((SkScalar)(leading / size));
   ps.setStrutStyle(strut);
+  ps.setStrutStyle(strut);
+}
+
+// AIR's line box for ONE face, applied to a run through TextStyle::heightOverride:
+// round_half(ascent) + round_half(descent) + leading (in px). A paragraph-wide
+// StrutStyle can only force ONE box on every line, which is wrong as soon as runs
+// carry different sizes -- measured on adl 51.4.1: a 12 px default plus one 24 px
+// run gives line heights 13.975 / 27.950, not a uniform box, and the same probe
+// shows the GAP between runs must be laid out in the defaultTextFormat's face
+// (not runs[0]'s: with a _sans default the gap line reports _sans metrics even
+// when runs[0] is _typewriter). Run::calculateMetrics() makes a run's
+// ascent+descent equal height*fontSize and keeps the FACE's line gap as the line
+// leading, so the height handed over is (box - lineGap)/size to land on AIR's box.
+// Known residual: with leading != 0 Skia folds it into the ascent/descent ratio
+// (AIR keeps the ascent independent of the leading), so a rich paragraph WITH an
+// explicit leading can sit its baseline up to ~leading*asc/(asc+desc) low.
+static void sk_set_air_run_height(skia::textlayout::TextStyle& ts, const char* family, double size,
+                                  int bold, int italic, double leading) {
+  using namespace skia::textlayout;
+  SkAirLineMetrics am = sk_air_line_metrics(family, size, bold, italic);
+  if (size <= 0.0 || am.model <= 0.0 || am.rawFull <= 0.0) return;
+  // Run::calculateMetrics splits the face's own line gap half into the ascent and
+  // half into the descent and then rescales BOTH by height*size/rawFull, so the
+  // line box ends up exactly height*size (the gap is not added on top). AIR's box
+  // for a run is its font model (ascent + descent) plus the TextFormat leading,
+  // which has no knob of its own on a run -- fold it into the height.
+  double h = am.model + leading;
+  if (h <= 0.0) h = am.model + leading;        // degenerate face: best effort
+  if (h <= 0.0) return;
+  ts.setHeight((SkScalar)(h / size));
+  ts.setHeightOverride(true);
+  ts.setHalfLeading(false);
 }
 
 static const char* sk_family_alias(const char* family) {
@@ -1482,10 +1521,15 @@ struct sk_text_run {
 
 // Rich text: lay out a paragraph from an array of style runs, each carrying its
 // own font/size/color/weight/slant/leading. Runs are applied in order via
-// ParagraphBuilder pushStyle/addText/pop; a leading on the *paragraph* level
-// (strut) is applied from the first run that requests it (AIR applies one
-// uniform line height from defaultTextFormat.leading).
-void* sk_textlayout_new_runs(const char* text, const sk_text_run* runs, int run_count,
+// ParagraphBuilder pushStyle/addText/pop.
+//
+// `defaultStyle` describes the FIELD's defaultTextFormat and is what AIR uses for
+// everything the runs do not cover -- both the gaps between runs and the whole
+// line box (measured on adl: see sk_set_air_run_height). It also gets the per-run
+// height override, so a paragraph with one run covering all text measures exactly
+// like a run-free field (pinned by the probe's whole1line-24 vs plain24-1line).
+void* sk_textlayout_new_runs(const char* text, const sk_text_run* defaultStyle,
+                             const sk_text_run* runs, int run_count,
                              double width, int align, int collapseNewlines) {
   if (text == NULL || run_count <= 0) return nullptr;
   using namespace skia::textlayout;
@@ -1498,23 +1542,16 @@ void* sk_textlayout_new_runs(const char* text, const sk_text_run* runs, int run_
                                 SkFontStyle::kNormal_Width,
                                 r.italic ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
     ts.setFontFamilies({ SkString(sk_family_alias(r.family)) });
+    sk_set_air_run_height(ts, r.family, r.size, r.bold, r.italic, r.leading);
     return ts;
   };
 
+  sk_text_run def = runs[0];
+  if (defaultStyle != nullptr) def = *defaultStyle;
+
   ParagraphStyle ps;
-  ps.setTextStyle(mkStyle(runs[0]));
+  ps.setTextStyle(mkStyle(def));
   ps.setTextAlign((TextAlign)align);
-  // One line box for the whole paragraph: AIR gives a TextField a single line
-  // height (htmlText runs with different sizes all share it), so the strut is
-  // taken from the first run that sets a leading, else from the first run.
-  {
-    int leadIdx = 0;
-    for (int i = 0; i < run_count; i++) {
-      if (runs[i].leading != 0.0) { leadIdx = i; break; }
-    }
-    sk_set_air_strut(ps, runs[leadIdx].family, runs[leadIdx].size,
-                     runs[leadIdx].bold ? 1 : 0, runs[leadIdx].italic ? 1 : 0, runs[leadIdx].leading);
-  }
   auto builder = ParagraphBuilder::make(ps, sk_textlayout_collection());
 
   std::string normbuf;
@@ -1687,24 +1724,25 @@ int sk_textlayout_line_box(void* para, int idx, double leading, const char* fami
     if (width) *width = 0.0;
     return 1;
   }
-  double stride = (n > 1) ? (lm[n - 1].fBaseline - lm[0].fBaseline) / (double)(n - 1)
-                          : (double)((Paragraph*)para)->getHeight();
+  // This LINE's own box, not a paragraph-wide stride: LineMetrics::fHeight is the
+  // height of THIS line (not the cumulative paragraph height) and already carries
+  // whatever strut or per-run height override was forced on it, so a paragraph
+  // whose runs differ in size reports each line's own box instead of one average
+  // over all of them (measured on adl: a 12 px default plus a 24 px run has line
+  // heights 13.975 / 27.950, not a uniform box).
   LineMetrics& m = lm[idx];
-  double asc = (double)m.fBaseline - (double)idx * stride - leading;
-  double desc = stride - leading - asc;
-  if (leading < 0.0) {
-    // A negative leading is folded into the strut height (Skia clamps
-    // StrutStyle::leading to 0), which drags the baseline up with it -- the
-    // stride-derived split then drifts (Monaco 12, leading -3: 12.6/2.4 instead
-    // of AIR's 12/3). AIR keeps ascent/descent independent of the leading, so for
-    // this one case take the AIR model of the face directly (measured,
-    // temp/metricprobe/Lead7.as: asc 12 / desc 3 at every leading).
-    SkAirLineMetrics am = sk_air_line_metrics(family, size, bold, italic);
-    if (am.model > 0.0) {
-      asc = am.asc;
-      desc = am.desc;
-    }
-  }
+  const double lh = (double)m.fHeight;
+  // AIR splits that box as ascent + descent + leading with an ascent/descent pair
+  // that ignores the leading. Skia keeps exposing the UNFORCED halves when a box
+  // was forced on the line (measured: a 12 px Arial strut reports asc 10 / desc 4
+  // for a 12 px box), so scale the pair into the box minus the leading. With
+  // leading 0 -- the common case -- the split is left exactly as Skia reports it,
+  // and a run-level height override already reports halves that sum to its box.
+  const double sum = (double)m.fAscent + (double)m.fDescent;
+  const double model = lh - leading;
+  const double k = (sum > 0.0 && model > 0.0) ? model / sum : 1.0;
+  double asc = (double)m.fAscent * k;
+  double desc = (double)m.fDescent * k;
   if (ascent) *ascent = asc;
   if (descent) *descent = desc;
   if (left) *left = (double)m.fLeft;

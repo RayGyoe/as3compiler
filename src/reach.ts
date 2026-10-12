@@ -500,9 +500,24 @@ export function computeReachable(files: ReachFile[], mainClassFqn: string): Reac
   }
 
   // Resolve one name as seen from `ctx` into every class it could denote. The
-  // import / same-package / global steps mirror symbols.ts's `resolveType` +
-  // `buildImportAlias`; the global step intentionally returns ALL matches
-  // because `typeAlias` there is a last-wins table over the whole program.
+  // import / same-package steps mirror symbols.ts's `resolveType` +
+  // `buildImportAlias`.
+  //
+  // The global short-name step is the delicate one. Codegen's `resolveType`
+  // consults the per-class import alias FIRST and only falls back to the
+  // program-wide last-wins `typeAlias` table when NO import matched
+  // (`importAlias?.get(t) ?? typeAlias.get(t)`). So:
+  //   * an import DID resolve the name -> codegen uses that import and the global
+  //     candidates are dead code for this reference -> follow ONLY the import.
+  //     Following the global set here is what dragged mxmlc-Invisible third-party
+  //     trees into a real app: `cn.edoctor...RWebSocket` imports the ANE stub
+  //     `com.vsdevelop.air.extension.websocket.WebSocket`, yet the old "all
+  //     candidates" rule also pulled in `com.worlize.websocket.WebSocket` (and
+  //     with it hurlant's whole TLS/DER stack, whose `class Sequence extends
+  //     Array` this subset cannot compile) even though AIR never keeps it.
+  //   * nothing resolved it -> codegen falls back to `typeAlias`, a last-wins
+  //     table over the EMITTED set, so any candidate could be the winner -> keep
+  //     them all (the original over-approximation).
   const resolveInto = (name: string, ctx: ResolveCtx, out: Set<string>): void => {
     if (name.includes('.')) {
       // Already qualified: `flash.display3D.textures.Texture`, or a user FQN.
@@ -515,26 +530,33 @@ export function computeReachable(files: ReachFile[], mainClassFqn: string): Reac
       return;
     }
     if (NON_CLASS_TYPES.has(name)) return;
-    // Same file (its classes are visible to each other without an import).
-    for (const d of declsByFile.get(ctx.file) ?? []) if (d.short === name) out.add(d.fqn);
+    // Did an import (or a same-file name, which the caller turned into an import)
+    // resolve this name? If so codegen is precise here and the global fallback
+    // below must not run.
+    let precise = false;
+    // Same file (its classes are visible to each other without an import, and the
+    // caller injected their FQNs into this class's import list).
+    for (const d of declsByFile.get(ctx.file) ?? []) if (d.short === name) { out.add(d.fqn); precise = true; }
     // Explicit imports.
     for (const imp of ctx.imports) {
       if (imp.endsWith('.*')) continue;
-      if (shortOf(imp) === name && byFqn.has(imp)) out.add(imp);
+      if (shortOf(imp) === name && byFqn.has(imp)) { out.add(imp); precise = true; }
     }
     // Wildcard imports.
     for (const imp of ctx.imports) {
       if (!imp.endsWith('.*')) continue;
       const pkg = imp.slice(0, -2);
-      for (const d of byShort.get(name) ?? []) if (d.pkg === pkg) out.add(d.fqn);
+      for (const d of byShort.get(name) ?? []) if (d.pkg === pkg) { out.add(d.fqn); precise = true; }
     }
-    // Own package.
+    // Own package. NB: codegen has no own-package rule (a same-package reference
+    // without an import falls through to the global table), so this does NOT set
+    // `precise` — the global candidates below stay in play.
     if (ctx.ownPkg) {
       const cand = `${ctx.ownPkg}.${name}`;
       if (byFqn.has(cand)) out.add(cand);
     }
-    // Global short-name table (over-approximated: every candidate).
-    for (const d of byShort.get(name) ?? []) out.add(d.fqn);
+    // Global short-name table: only when nothing above resolved (see the note).
+    if (!precise) for (const d of byShort.get(name) ?? []) out.add(d.fqn);
   };
 
   const reachable = new Set<string>();
@@ -630,8 +652,23 @@ export function computeReachable(files: ReachFile[], mainClassFqn: string): Reac
 // same-file visibility off, so it must match `symbols.ts`'s notion of the file.
 export function prepareReachFiles(asFiles: string[], srcDir: string): ReachFile[] {
   const out: ReachFile[] = [];
+  // Files this compiler's front end cannot parse yet (all in vendored third-party
+  // packages in practice: E4X-heavy JSON/crypto, one greensock wall). They are
+  // EXCLUDED, not silently ignored: the list is printed loudly, and because a
+  // skipped file simply contributes no declarations, any class that was only
+  // defined there fails LOUDLY downstream as an unknown type — never a silent
+  // fallback to wrong semantics (§2.5). A whole-tree parse used to abort on the
+  // first one, which made a real app impossible to attempt at all.
+  const unparsed: string[] = [];
   for (const f of asFiles) {
-    const p = parse(readFileSync(f, 'utf8'));
+    let p;
+    try {
+      p = parse(readFileSync(f, 'utf8'));
+    } catch (err) {
+      const rel = relative(srcDir, f).replace(/\\/g, '/');
+      unparsed.push(`${rel}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
     const rel = relative(srcDir, f).replace(/\\/g, '/');
     const fileId = rel.replace(/\.as$/i, '').replace(/[^A-Za-z0-9_]/g, '_');
     // Every top-level class/interface declared in this file (for same-file
@@ -657,6 +694,16 @@ export function prepareReachFiles(asFiles: string[], srcDir: string): ReachFile[
       }
     }
     out.push({ path: f, body: p.body, imports: p.imports });
+  }
+  if (unparsed.length > 0) {
+    process.stderr.write(
+      `\x1b[33mwarning: ${unparsed.length} source file(s) under src/ could not be parsed and were EXCLUDED from this build:\x1b[0m\n`
+    );
+    for (const l of unparsed) process.stderr.write(`\x1b[33m  - ${l}\x1b[0m\n`);
+    process.stderr.write(
+      '\x1b[33m  (unlike a silent fallback, a class defined only in an excluded file is simply\n' +
+      '  absent: referencing it then fails loudly as an unknown type)\x1b[0m\n'
+    );
   }
   return out;
 }

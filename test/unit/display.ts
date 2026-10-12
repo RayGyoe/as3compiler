@@ -156,7 +156,7 @@ function checkDisplayGeometry(): string[] {
 
   // 命中测试：舞台坐标 -> 逐层折算局部坐标 -> 按内容包围盒判定。
   check('the pick carries the accumulated parent matrix into each child',
-    c.includes('as_mat_mul(a, b, c, d, tx, ty, ca, cb, ccn, cd, ctx, cty, &ga, &gb, &gc, &gd, &gtx, &gty);')
+    c.includes('as_mat_mul(oa, ob, oc, od, otx, oty, ca, cb, ccn, cd, ctx, cty, &ga, &gb, &gc, &gd, &gtx, &gty);')
     && c.includes('void* res = as_pick_hit_m(ch, x, y, ga, gb, gc, gd, gtx, gty);'));
   check('the object matrix is recovered from the same transform the renderer uses',
     c.includes('as_do_point(o, &x0, &y0); as_do_point(o, &x1, &y1); as_do_point(o, &x2, &y2);')
@@ -451,9 +451,9 @@ function glueBodyArrow(glue: string): string {
 //   * out of range -> RangeError #2006 (NOT null);
 //   * "height == ascent + descent + leading" with ascent/descent INDEPENDENT of the
 //     leading (Monaco 12: 12/3 at leading 0, 4, 10 and -3), so the leading is
-//     stripped back out of Skia's stride-derived split; a NEGATIVE leading has to
-//     take the AIR face model because Skia folds it into the strut and drags the
-//     baseline (measured drift 12.6/2.4 vs AIR's 12/3);
+//     split back out of the line box (h = asc + desc + leading) instead of being
+//     folded into the ascent. The box itself is Skia's per-line height, so a rich
+//     paragraph gets one box PER LINE rather than a paragraph-wide average;
 //   * x == 2px inset + a PER-LINE alignment shift (center 89/75, right 176/147.5 on a
 //     200px field), which is why this uses as_tf_align_index + the line's own width
 //     rather than the painter's whole-block as_tf_align_dx;
@@ -504,16 +504,30 @@ function checkLineMetrics(): string[] {
     !/lead\s*<\s*0/.test(lmBodyScoped));
   check('the per-line box is asked for the default format face plus that leading',
     emitted.includes('as_skia_textlayout_line_box(para, index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);'));
-  check('x is the 2px text inset plus the line box left offset',
-    emitted.includes('double x = 2.0 + left;'));
-  check('the alignment shift is PER LINE, taken from the line width (not as_tf_align_dx)',
-    lmBodyScoped.includes('int a = as_tf_align_index(tf->defaultTextFormat);') &&
-    lmBodyScoped.includes('double inner = tf->_fieldWidth - 4.0;') &&
-    lmBodyScoped.includes('if (a == 2) x += (inner - w) / 2.0;') &&
-    lmBodyScoped.includes('else if (a == 1) x += inner - w;') &&
-    !lmBodyScoped.includes('as_tf_align_dx'));
-  check('a wrapping field leaves the alignment to Skia (the guard skips the shift)',
-    emitted.includes('if (!(tf->wordWrap && tf->_fieldWidth > 0.0) && tf->defaultTextFormat != NULL) {'));
+  check('x is the 2px inset, the block align shift and the line box left offset',
+    emitted.includes('double x = 2.0 + as_tf_align_dx(tf) + left;'));
+  // A field with no layout width (wordWrap off) still honours horizontalAlign PER
+  // LINE (adl: 200 px center field, "abc\\ndefghij" -> line left edges 89/75).
+  // Skia can only align inside a layout width, so the paragraph is laid out
+  // unwrapped once to measure the longest line, then re-laid-out at that width
+  // with the real align: no line exceeds it, nothing wraps, and the shifts of the
+  // two stages sum to AIR's per-line offset (the M terms cancel, hence the +1).
+  check('a width-less field hands its align to the paragraph, sized to its longest line',
+    emitted.includes('if (w <= 0.0 && (align == 1 || align == 2)) layoutAlign = align;') &&
+    emitted.includes('void* pp = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, 0.0, 0, collapse);') &&
+    emitted.includes('void* pr = as_skia_textlayout_new_runs(ltext, &dr, runs, n, 0.0, 0, collapse);') &&
+    emitted.includes('sk_text_run dr;') &&
+    emitted.includes('dr.family = fmt->font; dr.size = size;') &&
+    emitted.includes('if (m > 0.0) pw = m + 1.0; else pa = 0;') &&
+    emitted.includes('tf->_para = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, pw, pa, collapse);') &&
+    emitted.includes('tf->_para = as_skia_textlayout_new_runs(ltext, &dr, runs, n, pw, pa, collapse);'));
+  // justify needs a wrap width to stretch into: it is left to the old path.
+  check('justify keeps the old path (only center/right are carried into a width-less paragraph)',
+    !emitted.includes('&& (align == 3') && !emitted.includes('align <= 3'));
+  check('a wrapping field leaves the alignment to Skia (as_tf_align_dx returns 0)',
+    emitted.includes('if (tf->wordWrap && tf->_fieldWidth > 0.0) return 0.0;'));
+  check('the hit test subtracts the same block shift (a click in a centered field)',
+    emitted.includes('double lx = x + (double)leftpx - 2.0 - as_tf_align_dx(tf);'));
   check('height is built as ascent + descent + leading, in that argument order',
     emitted.includes('return TextLineMetrics_new(x, w, asc + desc + lead, asc, desc, lead);'));
   check('the compiled function is the one this group pinned',
@@ -547,14 +561,21 @@ function checkLineMetrics(): string[] {
   check('an empty field falls back to the AIR face metrics with width 0',
     /if \(idx >= n\) \{[\s\S]{0,600}?if \(idx != 0 \|\| n != 0\) return 0;[\s\S]{0,300}?SkAirLineMetrics am = sk_air_line_metrics\(family, size, bold, italic\);/.test(glue) &&
     glue.includes('if (left) *left = 0.0;') && glue.includes('if (width) *width = 0.0;'));
-  check('the stride is derived from the baselines (paragraph height for a single line)',
-    glue.includes('double stride = (n > 1) ? (lm[n - 1].fBaseline - lm[0].fBaseline) / (double)(n - 1)') &&
-    glue.includes(': (double)((Paragraph*)para)->getHeight();') &&
-    glue.includes('double asc = (double)m.fBaseline - (double)idx * stride - leading;') &&
-    glue.includes('double desc = stride - leading - asc;'));
-  check('a negative leading switches to the AIR face split (Skia folds it into the strut)',
-    glue.includes('if (leading < 0.0) {') &&
-    /if \(leading < 0\.0\) \{[\s\S]{0,900}?asc = am\.asc;[\s\S]{0,120}?desc = am\.desc;/.test(glue));
+  // The per-line box is Skia's own LineMetrics::fHeight, and the ascent/descent
+  // pair is scaled into (box - leading) because a forced box (strut or per-run
+  // height override) leaves Skia reporting the UNFORCED halves there (measured on
+  // Windows/Arial 12: a 12 px box reports asc 10 / desc 4).
+  check('the line box is Skia\'s own per-line height, not a stride over the paragraph',
+    glue.includes('const double lh = (double)m.fHeight;') &&
+    !glue.includes('double stride = (n > 1) ? (lm[n - 1].fBaseline') &&
+    !glue.includes('(double)idx * stride'));
+  check('the ascent/descent pair is scaled so that asc + desc + leading == the box',
+    glue.includes('const double sum = (double)m.fAscent + (double)m.fDescent;') &&
+    glue.includes('const double model = lh - leading;') &&
+    glue.includes('const double k = (sum > 0.0 && model > 0.0) ? model / sum : 1.0;') &&
+    glue.includes('double asc = (double)m.fAscent * k;') &&
+    glue.includes('double desc = (double)m.fDescent * k;') &&
+    !glue.includes('if (leading < 0.0) {'));
   check('left/width come from the line box itself',
     glue.includes('if (left) *left = (double)m.fLeft;') &&
     glue.includes('if (width) *width = (double)m.fWidth;'));

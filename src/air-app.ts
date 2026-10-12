@@ -721,7 +721,11 @@ export interface PreparedAirApp {
 // flag was absent, so whatever the existing manifest already pins is kept (this is
 // what makes a chosen enhancement survive regeneration); an array (possibly empty,
 // from `--features none`) means the user has just decided, so it replaces it.
-export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean, features: string[] | null = null, outputPath: string | null = null): PreparedAirApp {
+// `includeThirdParty` walks the reverse-DNS dirs the demo-oriented default skips
+// (com/org/net) — required by a real AIR app whose OWN framework layer lives under
+// `com/` (the TalkMED meeting app's com.vsdevelop.*, com.greensock, com.hurlant…),
+// which is otherwise invisible to the reachability closure.
+export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean, features: string[] | null = null, outputPath: string | null = null, includeThirdParty = false): PreparedAirApp {
   const xml = readFileSync(appXmlPath, 'utf8');
   const info = parseAirApp(xml);
   const dir = dirname(resolve(appXmlPath));
@@ -731,15 +735,18 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   }
 
   const asFiles: string[] = [];
+  const seen = new Set<string>();
   const walk = (d: string): void => {
     for (const e of readdirSync(d, { withFileTypes: true })) {
       const p = resolve(d, e.name);
       if (e.isDirectory()) {
-        if (THIRD_PARTY_DIRS.has(e.name)) continue;
+        if (!includeThirdParty && THIRD_PARTY_DIRS.has(e.name)) continue;
         walk(p);
       } else if (e.name.endsWith('.as')) {
         const rel = relative(srcDir, p).replace(/\\/g, '/');
         if (SKIP_FILES.has(rel)) continue;
+        if (seen.has(p)) continue;
+        seen.add(p);
         asFiles.push(p);
       }
     }
@@ -747,13 +754,15 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   walk(srcDir);
   // Re-add the GreenSock core the demo reaches (present only in this example; a
   // different project without these vendored files simply gets nothing added).
+  // Skipped when the walk already swept them (--include-third-party): a duplicate
+  // declaration would be a hard symbol clash.
   for (const rel of GREEN_SOCK_CORE) {
     const p = resolve(srcDir, rel);
-    if (existsSync(p)) asFiles.push(p);
+    if (existsSync(p) && !seen.has(p)) { seen.add(p); asFiles.push(p); }
   }
   for (const rel of ADOBE_UTILS_CORE) {
     const p = resolve(srcDir, rel);
-    if (existsSync(p)) asFiles.push(p);
+    if (existsSync(p) && !seen.has(p)) { seen.add(p); asFiles.push(p); }
   }
   if (asFiles.length === 0) {
     throw new AirAppError(`no .as sources found under ${srcDir}`);
@@ -798,6 +807,17 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // is the §2.5 rule applied to the build layer rather than the frontend.
   const usesNetworking = detectNetworking(asFiles);
   const usesAudio = detectAudio(asFiles);
+  // A native audio build links the miniaudio glue translation unit, and the glue
+  // shipped in this workspace is the CoreAudio/AudioToolbox (macOS) backend, whose
+  // frameworks are Apple-only (`-framework CoreAudio` is not a clang argument on
+  // Windows). Claiming ASC_HAVE_AUDIO without a glue that exists would make the
+  // manifest name a source file that is not there (clang: "no such file or
+  // directory: vendor/audio_glue.c") -- a build failure with no hint of the real
+  // cause. Without the define the runtime's as_audio_* seam answers honestly
+  // (play() returns null, which is AIR's own no-sound-card result), so this is a
+  // missing capability to name, not a wrong result to hide (§1.5).
+  const audioGluePath = resolve(vendorAbs, 'audio_glue.c');
+  const audioLinked = usesAudio && existsSync(audioGluePath) && process.platform === 'darwin';
   if (usesNetworking && !web && !existsSync(resolve(vendorAbs, 'curl', 'include', 'curl', 'curl.h'))) {
     throw new AirAppError(
       `this app uses flash.net / URLRequest, so its build must link the HTTP transport, but the static curl tree is missing:\n` +
@@ -813,6 +833,14 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // previews correctly in every other respect (layout, bitmaps), and failing the
   // build would not make the font appear.
   const warnings: string[] = [];
+  if (usesAudio && !audioLinked && !web) {
+    warnings.push(
+      `this app uses flash.media, but this native build has no audio backend available, so nothing will play:\n` +
+      `  glue: ${audioGluePath}${existsSync(audioGluePath) ? ' (present, but only the macOS CoreAudio backend is shipped)' : ' (missing)'}\n` +
+      `  sounds report AIR's own no-sound-card result: play() returns null and SoundMixer.areSoundsInaccessible() is true\n` +
+      `  fix: provide a vendor/audio_glue.c for this platform (see docs/zh-cn/audio.md)`
+    );
+  }
   // A web build has no audio backend yet (the glue's miniaudio build is
   // CoreAudio/AudioToolbox, native-only). The wasm side keeps answering honestly
   // — play() null, areSoundsInaccessible() true — so this is a missing capability,
@@ -851,7 +879,7 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   const effectiveFeatures = features ?? persistedFeatures;
   const keptFromManifest = features === null && persistedFeatures.length > 0;
 
-  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, usesAudio, info.architecture, effectiveFeatures), null, 2) + '\n');
+  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures), null, 2) + '\n');
   if (keptFromManifest) {
     // Not silent (§1.5): the artifact about to be built is NOT an AIR-identical
     // default, and the reason is a setting from a previous run.

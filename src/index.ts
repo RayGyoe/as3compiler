@@ -9,6 +9,7 @@ import { dirname, resolve, basename, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parser.ts';
 import { generateC, type ExportedSymbol } from './codegen.ts';
+import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
 import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, wasmToolchainError, buildWebCompileSteps, webToolchainError, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData } from './build.ts';
@@ -39,11 +40,15 @@ interface Options {
   // escape hatch for a project whose references the source-level walker cannot
   // see.
   allSources: boolean;
+  // `--include-third-party`: --air-app only. Sweep the reverse-DNS source dirs
+  // (com/org/net) the demo-oriented default skips, so a real app's own `com.*`
+  // framework layer joins the reachability closure.
+  includeThirdParty: boolean;
   overrides: Partial<BuildConfig>;
 }
 
 function parseArgs(argv: string[]): Options {
-  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, overrides: {} };
+  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, overrides: {} };
   const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths', v: string): void => {
     (opts.overrides[key] ??= [] as string[]).push(v);
   };
@@ -59,6 +64,7 @@ function parseArgs(argv: string[]): Options {
     else if (a === '--air-app') opts.airApp = argv[++i];
     else if (a === '--main-class') opts.mainClass = argv[++i];
     else if (a === '--all-sources') opts.allSources = true;
+    else if (a === '--include-third-party') opts.includeThirdParty = true;
     else if (a === '--opt') opts.overrides.opt = argv[++i];
     else if (a === '--debug-info') opts.overrides.debugInfo = true;
     else if (a === '--lto') opts.overrides.lto = true;
@@ -118,6 +124,7 @@ function usage(): string {
     '  --manifest <f> build manifest JSON (extra sources / include / link libs)',
     '  --air-app <xml> AIR app descriptor: generate bootstrap + build manifest',
     '  --main-class <n> main class for --air-app (default: infer src/**/Main.as)',
+    '  --include-third-party  --air-app: also sweep src/com, src/org, src/net (a real app\n                 keeps its own framework layer there; skipped by default)',
     '  --all-sources  --air-app: compile every .as under src/ instead of the main class\n                 reachable closure (pre-阶段一百二十四 behaviour; see reach.ts)',
     '  -I <dir>       include path (repeatable)',
     '  -L <dir>       library search path (repeatable)',
@@ -163,6 +170,11 @@ function resolveFeatures(raw: string[] | undefined): string[] | null {
 }
 
 function main(): void {
+  if (process.env.AS3_MEMBERGAPS) {
+    process.on('exit', () => {
+      console.error('\n=== AS3_GAPS ===\n' + [...new Set(AS3_GAPS)].sort().join('\n') + '\n=== /AS3_GAPS ===');
+    });
+  }
   const opts = parseArgs(process.argv.slice(2));
 
   // Resolve --features to the explicit set for THIS invocation, keeping "absent"
@@ -216,7 +228,7 @@ function main(): void {
     // window backend (SDL2/Cocoa) is native-only and cannot link under wasm-ld.
     // `opts.output` reaches the adapter because the web preload set must not sweep
     // this build's own output dir into the page's FS image (see findPreloadPaths).
-    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output);
+    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output, opts.includeThirdParty);
     // The adapter reports what it can see but must not silently ship (e.g. a web
     // build whose text has no font to draw with). Yellow, not red: the build is
     // still usable, but the output would be wrong in a way the user cannot guess.
@@ -244,6 +256,8 @@ function main(): void {
     // class into a build failure `adl` never sees. See reach.ts for the soundness
     // argument; `--all-sources` restores the whole-tree face.
     let keptFiles = parsedFiles;
+    const fileLevelDecls = new Map<string, string>();
+    const fileLevelCollisions = new Set<string>();
     let reachNote = `${air.asFiles.length} sources`;
     if (!opts.allSources) {
       const reach = computeReachable(parsedFiles, air.mainClass);
@@ -256,6 +270,18 @@ function main(): void {
     for (const f of keptFiles) {
       program.body.push(...f.body);
       program.imports.push(...f.imports);
+      // Collect this file's file-level (script) declaration names so a name
+      // declared in TWO kept files can be reported. (`--air-app` merges every file
+      // into one script, so the two declarations would alias onto one global while
+      // AIR scopes them per file -- a divergence the user must see, not discover.)
+      for (const n of collectScriptVars(f.body)) {
+        const prev = fileLevelDecls.get(n);
+        if (prev === undefined) fileLevelDecls.set(n, f.path);
+        else if (!fileLevelCollisions.has(n)) {
+          fileLevelCollisions.add(n);
+          process.stderr.write(`\x1b[33mwarning: file-level declaration '${n}' appears in both ${basename(prev)} and ${basename(f.path)}; AIR scopes file-level declarations per file, but this build merges every source into one script and shares one global\x1b[0m\n`);
+        }
+      }
       // Runs AFTER the anonymous-namespace rewrite above, so the declaring class's
       // name+package are the ones symbol collection will see (the `[Embed]` field
       // lookup key is built from exactly these two strings).
@@ -420,7 +446,14 @@ function main(): void {
         '(character ids are library-local); the exported classes still type-check and their named bitmaps still embed'
     );
   }
-  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits);
+  // `--air-app` builds carry the descriptor into the generated program so
+  // `NativeApplication.applicationDescriptor` can hand the program the very
+  // document that described this build (AIR guarantees readability there).
+  let appDescriptorXml: string | undefined;
+  if (opts.airApp) {
+    try { appDescriptorXml = readFileSync(opts.airApp, 'utf8'); } catch { appDescriptorXml = undefined; }
+  }
+  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml);
   writeFileSync(cPath, c);
 
   // [WasmExport] declarations are auto-exported: append their C symbols (or alias
