@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8" standalone="no" ?>
+<application xmlns="http://ns.adobe.com/air/application/51.1">
+
+    <!-- Kept at the app root (next to src/) by build-and-run.sh, because that is
+         the one directory both launchers agree on: adl resolves the content
+         subpath from here, and "as-aot --air-app" takes this directory as the
+         app root, scanning its src/ tree and writing the build manifest here.
+         (Comments are safe here: the AOT descriptor reader strips comments
+         before matching elements, so a tag name spelled in one is not read as a
+         live element — pinned by air-app/DescriptorComments.) -->
+
+    <id>com.awayfoundation.away3d.example.BasicStereo</id>
+    <filename>Basic_Stereo</filename>
+    <name>Basic_Stereo</name>
+    <versionNumber>0.0.1</versionNumber>
+
+    <!-- Stage3D needs the extended-desktop profile, direct rendering and a
+         depth/stencil buffer: Away3D requests a depth buffer when it
+         configures the Stage3D back buffer, and without one the SkyBox torus
+         loses its depth test. -->
+    <supportedProfiles>extendedDesktop</supportedProfiles>
+
+    <initialWindow>
+        <!-- The SWF is a build product under build/, so the content is a relative
+             subpath rather than a file at the app root. -->
+        <content>build/Basic_Stereo.swf</content>
+        <renderMode>direct</renderMode>
+        <depthAndStencil>true</depthAndStencil>
+        <width>1024</width>
+        <height>768</height>
+        <visible>true</visible>
+        <requestedDisplayResolution>high</requestedDisplayResolution>
+    </initialWindow>
+
+</application>
