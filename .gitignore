@@ -92,4 +92,14 @@ scratch
 
 # Transient junk from local adl / desktop test runs (never a build input).
 adl.pid
+pid.txt
 examples/air-native/air-native.log
+
+# Root-level scratch screenshots dumped by local probe scripts. Real image assets
+# live under examples/ or docs/ (nothing at the repo root is tracked).
+/*.png
+
+# Python bytecode caches from the probe scripts under examples/ (the .py sources
+# themselves are tracked).
+__pycache__/
+*.pyc

@@ -237,3 +237,46 @@ ctime_r asctime_r gmtime_r localtime_r gettimeofday
 - **`gc.md`**: the GC uses `gc_in_heap()` segment-table address-range checks to skip non-heap
   pointers; naming sanitize does not affect that mechanism (sanitize only changes identifier text, not pointer
   layout).
+
+## 7. The Opposite Direction: Names the Emitter Plants Itself (stage 165, v0.4.136)
+
+§1–§5 solve one direction of collision (AS3 name → C name hitting a C keyword/libc/type name). There is a
+mirror-image class: identifiers the emitter writes **verbatim inside a function body**, which AS3 source is
+equally free to use.
+
+| Generated name | Where it appears | clang when it collides |
+|---|---|---|
+| `o` | the receiver parameter of a **constructor** (`Widget_ctor(Widget* o, ...)`, and `Widget_new`'s local) | `error: redefinition of 'o' with a different type: 'Object *' vs 'Widget *'` |
+| `_this` | the receiver parameter of **every instance method** (`Widget_add(void* _this, ...)`) | `error: redefinition of parameter '_this'` |
+| `_<word><N>` | `tmpName()` temporaries (`_once0`/`_i3`/`_ret1`, ...) and the closure-cell env tag `_cell0` | duplicate-definition error (and **silent** clobbering when the types match) |
+
+Minimal repro (`temp/d31probe/ocollide2.as`, a 7-line AIR app class that `adl` runs fine):
+
+```as
+class Widget {
+  public var v:int;
+  public function Widget() { var o:Object = { a: 1 }; v = o.a; }
+}
+```
+
+**Fix** (`cIdent` in `src/emit.ts`): the spellings above join the "never hand this to an AS3 identifier" set
+(the same loop that already avoids `reservedTypeNames`); `cIdent` prefixes `_` until three tests are all clear:
+**type name / generated name / already-used name**. The last one is only checked for the *post-prefix*
+candidate (`sanitizeCIdent` has already registered the first one), otherwise the loop would never terminate.
+So `var o:Object` becomes `Object* _o`, a parameter `_this` becomes `__this`, `_once0` becomes `__once0` — while
+the receivers stay literally `o`/`_this` (they are emitted raw and never go through `cIdent`).
+
+**Red line: only the C spelling changes; the AS3 side must not move at all.** The reflection table
+(`as_prop.name`, the AMF member list, `for-in` keys) stores the **original string**, so `w["o"]`,
+serialization and `describeType` must still see `o` — that is the invariant pinned by
+`examples/ident-collide.as` + `unit: emit/GeneratedNameReservation` (reverting the reservation turns 5 of its 8
+checks red and the example's C stops compiling).
+
+**Known residual (reported, not fixed)**: the closure-cell **pointer** local `cell<N>` (`cell0`/`cell1`, ... from
+the global `anonSeq` counter) is still emitted raw, so `var cell1` together with a closure **in the same
+function** collides — `error: duplicate member 'cell1'` (a **loud** failure, never silent corruption). Repro:
+`temp/d31probe/cellres{0,1,2}.as` (`cell0`/`cell2` green, `cell1` red). The cause is an **inconsistent emission
+convention** for that one name: six of its seven emission sites spell it raw and one (`emitActivationCell`'s
+declaration) goes through `cIdent`, so any spelling-level reservation would split declaration from use. Closing
+it requires routing every closure-cell emission through one mapping (touches `cellLocal`/`captures`/
+`closureCellEnv`) — a separate project.

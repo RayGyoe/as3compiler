@@ -181,7 +181,7 @@ stages thirty-four/thirty-five; Skia only takes over at **leaf rendering**, draw
 | `filters.DropShadowFilter` | `SkImageFilters::DropShadow` / `DropShadowOnly` (`saveLayer` + `SkImageFilter`) | landed (stage sixty-one), outer drop shadow. Stage ninety-five / seven adds `strength` (multiplied **after** the blur, `min(1, silhouette × alpha × strength)`, aligned with adl measurement) and `hideObject`; note the `DropShadow` factory already composites the **source** in, so `strength` must never be applied to its output (it would thin the whole object — see `swc.md` §9.2 F4's 137/255 incident) |
 | `filters.GlowFilter` | `SkColorFilters::Matrix` (alpha-silhouette coloring) + blur + overlay the body | landed (stage sixty-one), outer glow. Stage ninety-five / seven adds `strength` (same as DropShadow, and multiplied after the blur: a pre-applied alpha factor saturates because the silhouette is opaque, so measured `strength 1` and `2` come out identical) |
 | `DisplayObject.mask` | `canvas->saveLayer` + mask drawing + `SkBlendMode::kSrcIn` | AS3 mask semantics |
-| `scrollRect` | `canvas->clipRect` | clips the visible area |
+| `scrollRect` | `canvas->clipRect(0,0,w,h)` **then** `translate(-x,-y)` | the window stays anchored on the object's own box and only the **content** slides (measured in stage one-sixty-two; see "coordinate transforms" below and D29) |
 
 **The correct posture for coordinate transforms** (corresponding to Skia `SkCanvas`'s matrix stack):
 
@@ -192,7 +192,10 @@ Rendering a DisplayObject subtree (recursive):
   canvas->rotate(obj->rotation);
   canvas->scale(obj->scaleX, obj->scaleY);
   canvas->concat(obj->transform.matrix);     // if there is a full matrix
-  if (obj->scrollRect) canvas->clipRect(obj->scrollRect);
+  // if (obj->scrollRect) { clipRect(0,0,w,h); translate(-x,-y); }
+  //   ↑ the order is not swappable: Skia maps clipRect through the CTM in force at the
+  //     call, so clipping after the translate moves the WINDOW itself to (x,y,w,h)
+  //     (the window slides along with the content) -- that was D29 in stage one-sixty-two.
   // 1) first draw itself: obj->render_self(canvas)   (Shape draws path, Bitmap draws image, TextField draws textBlob)
   // 2) then draw children in depth order: for child in children: render(child)
   canvas->restore();
@@ -237,10 +240,16 @@ is left until precise shape hit testing is needed.
 
 ### 6.1 Obtaining and Compiling Skia
 
-> **This project's actual landing approach (precompiled)**: this machine lacks `gn`/`ninja` and has
-> insufficient disk space to compile from source, so
+> **This project's actual landing approach — read this before touching `vendor/skia/`**: `vendor/skia/include`
+> comes from the upstream prebuilt milestone, but `vendor/skia/lib/macos-arm64/libskia.a` is **compiled from
+> source** in `build-tools/skia-src` and carries a **local patch** (see §6.9 and
+> `vendor/skia/patches/README.md`). Never replace that library with an upstream prebuilt one: the patch fixes
+> CoreText silently switching faces between two font files that share family + PostScript name (stage 167).
+> The wasm and Windows libraries are unpatched (the change is macOS/iOS-only).
+>
+> Historically this machine lacked `gn`/`ninja` and disk space, so
 > [Aseprite's official precompiled Skia](https://github.com/aseprite/skia/releases) **m124**
-> (`Skia-macOS-Release-arm64.zip`) is used instead. That package ships headers (`include/`) and the full set of
+> (`Skia-macOS-Release-arm64.zip`) was used instead; that package ships headers (`include/`) and the full set of
 > static libraries (`out/Release-arm64/*.a`), extracted into `vendor/skia/{include,lib}/` and wired into the
 > build manifest together with the transitive dependencies PNG/JPEG/WebP/freetype/harfbuzz/icu/zlib (see
 > `examples/skia-link.build.example.json`). **If you need to compile from source yourself, follow the process
@@ -449,6 +458,135 @@ files); reverting both fixes to their pre-fix shape turns **5 of them red on the
 
 ---
 
+### 6.8 The drawable must be allowed to be sampled as a texture (advanced blend modes, stage one-hundred-sixty)
+
+**Symptom**: the AOT build of the TalkMED desktop app (`talkmed-meeting`) shows **large magenta regions** on
+its home page (`(255,0,255)`, or `(117,20,124)` where the app's own dimming scrim covers it): the whole
+background band under the toolbar and the gaps between the cards, while the cards, icons and text themselves
+render correctly — in **every** frame, as soon as the cursor moves inside the window (and also when the window
+is inactive, just dimmed). `adl` never shows it.
+
+**Root cause**: AS3 `DisplayObject.blendMode` becomes a Skia paint blend mode (`sk_paint_set_blend` in
+`skia_glue.cc`, applied by the generated `as_skia_canvas_save_layer_paint(canvas, bp)`, see `emit.ts`).
+Everything except `add` (`kPlus`) and `layer` (`kSrcOver`) — `darken`/`multiply`/`screen`/`lighten`/
+`difference`/`overlay`/`hardlight` — is an **advanced blend mode** in Skia: fixed-function blending cannot
+express it, so Ganesh has to **read the destination back as a texture** and blend in a shader. On the Metal
+backend that destination is the **CAMetalLayer drawable** we wrapped, and a CAMetalLayer's drawables default to
+**`framebufferOnly = YES`** — a write-only storage mode that **forbids being used as a shader input**; when
+forced, Apple GPUs answer with **uninitialized memory**. The TalkMED home-page skin carries a
+`BlendMode.DARKEN` (baked from the SWC `PlaceObject3` BlendMode tag) whose clip covers the whole canvas, so
+that layer composites the garbage it read back (magenta) over the **entire window** with SrcOver semantics;
+whatever is drawn afterwards (cards, icons, dialog) simply lands on top — which is exactly the observed
+L-shaped / fragmented shape.
+
+**Fix**: `l.framebufferOnly = NO;` (`sk_mtl_init` in `metal_glue.mm`, right next to `pixelFormat`/`colorspace`).
+The cost is a slower drawable *allocation* (not a per-frame cost); what it buys is the correct declaration that
+this render target may be read as a texture — the documented requirement for any dst-reading pass.
+
+**Why it must stay pinned**: it is not "unused configuration" — deleting it breaks no build and turns no unit
+test red, it just makes **any** app using one of those 7 modes render a fully magenta screen (`add`/`layer` are
+spared because they never read the destination, which is also why earlier acceptance runs never caught it:
+the Starling demo and every `examples/` program used none of them).
+
+**Measurements** (`temp/tkmeet-mac/`, diff D26):
+
+| Step | Result |
+|---|---|
+| Home-page capture (product binary, pre-fix) | background `(117,20,124)` (magenta under the dimming scrim), reproducible every frame |
+| Add only `framebufferOnly = NO` (no drawing code touched) | same boot state, same dialog scrim: that pixel becomes `(128,128,128)` (dimmed white) |
+| Strict criterion (`min(r,b)>70 && 2g<min(r,b)`) over the whole window, **excluding the app's own FPS/MEM/MAX overlay** (its `MAX:` is deliberately pink; device px x 296..404 / y 70..150) | hit in every frame pre-fix; **0 px** post-fix |
+| 15-point hover sweep (activate window → move cursor → `screencapture -l`) | **0/15 frames contain magenta** post-fix |
+| How it was localised | bisect on the `saveLayer` paint's **blend mode**: degrading advanced-blend layers to a plain `save` (`ASC_DEBUG_NO_BM_LAYER`) removed the magenta while plain `kSrcOver` layers (colour matrix / filters) stayed ⇒ only dst-reading layers trigger it; the pre-existing `ASC_MTL_READBACK` hook then proved the magenta was already inside the drawable (not introduced by the window server's compositing) |
+
+**Regression nail**: `unit: platform/DrawableReadable` in `test/unit/platform.ts`. **Whether Windows shares this
+defect is unverified** (no Windows machine here; how Skia reads a D3D12 flip-model swapchain buffer was not
+measured) — registered in `TODO.md`.
+
+---
+
+### 6.9 LOCAL PATCH: CoreText switches faces between two font files that share family + PS name (stage 167)
+
+> **In one sentence**: `vendor/skia/lib/macos-arm64/libskia.a` is **not** the upstream prebuilt — it is
+> built from `build-tools/skia-src` (a full m124 source tree) with the local patch
+> `vendor/skia/patches/skia-m124-ct-exact-copy-keep-face.patch` applied. Reproducing on another
+> machine/CI requires applying that patch first, otherwise fonts like 微软雅黑 silently paint the wrong
+> characters. Patch list + rebuild steps: `vendor/skia/patches/README.md`.
+
+**Symptom** (TalkMED's 「创建同传」): the same source renders `创建同传` under `adl 51.4.1` but
+`初开名伤` on our side; **ASCII/Latin is untouched and so are other CJK families** (PingFang SC,
+华文细黑) — only family `微软雅黑`, and only on a machine that has that particular pair of files.
+
+**Root cause** (after ruling out the layers beneath it; evidence in `temp/tfswc/{ctprobe*,skgl,skdata}.mm`):
+
+1. `~/Library/Fonts/` ships both `微软雅黑.ttf` (Regular) and `微软雅黑粗体.ttf` (Bold); **both files
+   declare** family `Microsoft YaHei`/`微软雅黑` and PS name `MicrosoftYaHei`, and both have 29126
+   glyphs — but their **glyph order diverges at index 110** (`sfthyphen` vs `uni00AD`), so Regular's
+   `创=1259 / 建=1679 / 同=1379 / 传=1134` shift by one in Bold into `1258/1678/1378/1133`, while
+   ASCII ids agree exactly (space=3, `A`=39, `C`=41, `a`=71). That is why **CJK is garbled while Latin
+   is pixel-perfect**: with the wrong face, every CJK gid paints the *next* character.
+2. Shaping and cmap are correct: `SkTypeface::textToGlyphs`, HarfBuzz (from file bytes and from
+   CoreText tables alike) and `SkShaper` all return the right ids `1259 1679 1379 1134`.
+3. The **rasterizer** is where it goes wrong: `SkScalerContext_mac` rebuilds a per-size CTFont through
+   `SkCTFontCreateExactCopy(baseFont, size, opsz)`, which passes an **attributes-only** descriptor
+   (`CTFontDescriptorCreateWithAttributes`). **Given a non-NULL descriptor,
+   `CTFontCreateCopyWithAttributes` re-resolves the face by family** and, with two same-family /
+   same-PS-name files installed, picks the *other* file (`kCTFontURLAttribute` becomes
+   `微软雅黑粗体.ttf`; a copy with `descriptor == NULL` stays Regular). Adding attributes
+   (`NSCTFontOpticalSizeAttribute`, `NSCTFontUnscaledTrackingAttribute`, even merging the base's own
+   attributes back in) does **not** pin the face.
+4. Corroboration: a bare-Skia probe shows `SkFont::getPath(1259)` has the **Bold** face's width
+   (`Bold 1259 = 0.23/14.80`), while a face created straight from **file bytes**
+   (`SkFontMgr::makeFromData(微软雅黑.ttf)`) draws it correctly (`14.578`) — data-backed faces survive
+   this copy.
+
+**Fix** (~20 lines in `SkCTFontCreateExactCopy.cpp`): after the copy, compare `kCTFontURLAttribute`
+and, **if the file changed, copy again without a descriptor** (keeping the base face):
+
+```cpp
+static bool sk_fonts_share_file(CTFontRef a, CTFontRef b) {          // no URL either side => "same", never interfere
+    SkUniqueCFRef<CFTypeRef> ua(CTFontCopyAttribute(a, kCTFontURLAttribute));
+    SkUniqueCFRef<CFTypeRef> ub(CTFontCopyAttribute(b, kCTFontURLAttribute));
+    if (!ua || !ub) return true;
+    return CFEqual(ua.get(), ub.get());
+}
+...
+SkUniqueCFRef<CTFontRef> copy(CTFontCreateCopyWithAttributes(baseFont, textSize, nullptr, desc.get()));
+if (copy && !sk_fonts_share_file(baseFont, copy.get()))
+    return SkUniqueCFRef<CTFontRef>(CTFontCreateCopyWithAttributes(baseFont, textSize, nullptr, nullptr));
+```
+
+**Why Skia and not the glue layer**: a face is resolved along several paths — `SkParagraph`'s
+`FontCollection::matchTypeface/findTypefaces`, the line-metric helpers (`sk_air_line_metrics`) and the
+legacy `drawString` path. Intercepting in the glue (e.g. `makeFromData` inside `sk_match_typeface`, or
+wrapping a `SkFontMgr`) either misses paragraph's second resolution or costs a hundred-line proxy
+class; pinning it in `SkScalerContext` fixes **all** paths at once.
+
+**Boundaries**: macOS/iOS only (`SK_BUILD_FOR_MAC || SK_BUILD_FOR_IOS`), so the **wasm/Windows
+libraries are unaffected**; the patch only fires when the file really changed, so fonts with a single
+backing file (Helvetica, PingFang SC — measured) behave **byte-for-byte as before**; the cost is the
+lost `tracking/opsz` attributes for that family (only noticeable with a `trak` table), paid for a
+stable face.
+
+**Verification** (same-source two-sided probe `temp/tfswc/`: `BitmapData.draw()` + `getPixels()` raw
+ARGB, one `Main.as` run under both our build and `adl`):
+
+| case | family | ink-mask IoU (vs `adl`) |
+|---|---|---|
+| plain `TextField` 16px | 微软雅黑 | **100.00%** (wrong glyphs before the fix) |
+| plain `TextField` 16px | Microsoft YaHei | **100.00%** |
+| plain `TextField` 16px | 华文细黑 | **100.00%** |
+| plain `TextField` 16px | PingFang SC | 97.24% (antialiasing coverage, not wrong glyphs) |
+| SWC skin text (`aisubtitlehomeskin…label1`) | 微软雅黑 | glyphs correct (`创建同传`); pixel deltas come from that child's dump origin |
+
+**Regression pin**: `test/unit/build.ts`, group `unit: build/SkiaLocalPatch` (guards **provenance**: the
+patch file exists, carries both halves of the fix, targets `SkCTFontCreateExactCopy.cpp`, and is
+referenced by this document — a binary's internals cannot be asserted, so the pin only protects "the
+patch was not quietly lost"). **Reproducing the defect needs the two same-family fonts installed on the
+machine** (CI machines do not have them), so no example assertion is provided; the measurements live in
+`temp/tfswc/`.
+
+---
+
 ## 7. Multi-target: native and wasm
 
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.
@@ -516,7 +654,8 @@ upgraded in v0.3.73 to **SkParagraph (`modules/skparagraph`) full typesetting**,
   `ceil(ink + 4)` — `124.945+4→129`, `133.383+4→138`, `258.328+4→263`, `266.766+4→271`, hitting **every one of
   the six values**. Before the fix we typeset against the un-padded field width, so we were one word late at
   the boundary.
-  This 4px is not a new convention: `autoSize` (`width = textWidth + 4`) and `maxScrollH`
+  This 4px is not a new convention: `autoSize` (`width = textWidth + 4`, **only when `wordWrap=false`**;
+  with `wordWrap=true` the width stays put and only the height follows — see §8.2) and `maxScrollH`
   (`over = textWidth + 4 - width`) were already written against it; **only the line-break threshold was missed
   the subtraction**. The fix is in stage eighty-nine / sixty-six, and `test.ts` has a `[textwrap]` structural
   nail.
@@ -537,6 +676,129 @@ spacing/multiple paragraphs) have all landed: `htmlText` parses a subset of
 run order, with the gaps between runs falling back to the paragraph default style (= `runs[0]`'s font/size,
 color from `defaultTextFormat`). `autoSize`/`hscroll`/`selectable`/`leading` have also landed, with
 assertion-style regressions in `examples/textrich.as` (`examples/textflow.as` is the layout baseline).
+
+### 8.2 `autoSize` sizing contract and the fallback face for an uninstalled family (stage 168)
+
+Both live in the text layer (`vendor/skia_glue.cc` / `src/emit.ts`), and both were pinned against the
+`adl 51.4.1` same-source dual-end probe (`temp/tfswc` cases 6/7/8/9/10; after the fix the AOT report is
+**byte-identical** to `adl`'s).
+
+**① With `autoSize != "none"`, the width only follows the text when `wordWrap=false`.** Measured:
+`wordWrap=true` keeps the width the user set (290 for both a short run and a 3-line run) and only sets
+`height := textHeight + 4`; `wordWrap=false` sets `width := textWidth + 4` in **both** directions
+(290→28 for "中文", 100→523.5 for a long run). The old code unconditionally wrote
+`width = longest line of the already-wrapped layout + 4`, which is a **self-reinforcing loop**: a narrower
+field shortens the longest line, the shorter line narrows the field again, and every repaint shrinks it once
+more (measured 290 → 64.66 → 50.66 → 36.66 → 32). That is what broke the `title` of the TalkMED AI
+subtitle list item: it wrapped into three lines and ran over the `ctime`. One more observable point: `adl`
+reports the new box **right after assignment, with no draw in between** (`autoSize=LEFT` then `h=18`), so the
+generated `as_do_extents` (where both the `width` and `height` reads land) calls `as_tf_apply_autosize` too.
+
+**② An uninstalled family means the platform default face's line box, not the box of whichever CJK face
+supplied the glyphs.** `adl` measures a 16px line box of **16px** for both `MiSans Regular` (absent locally;
+shipped only inside the app bundle, and **AIR does not register app fonts**) and `宋体` — exactly Helvetica's
+box. `SkFontMgr::matchFamilyStyle` returns **NULL** for those names, so SkParagraph sized the line from the
+CJK cascade (PingFang/Songti SC, 1.4 em → 22px at size 16). `sk_family_alias` therefore checks whether the
+family is installed at all and substitutes the `matchFamilyStyle(nullptr)` family name (Helvetica on macOS),
+cached, so the strut and the runs both land on one face.
+> This is **user visible**: the list item was 6px taller than `adl` and pushed `ctime.y` down. Note it is
+> **not** evidence for registering app fonts: `adl` cannot see that bundled `MiSans-Regular.ttf` either, so
+> registering it would move us away from the oracle.
+
+Regression: `examples/autosize-metrics.as` (behavioural assertions, links Skia) +
+`unit: display/AutoSizeMetrics` (generated-C / glue structural nails, reverse-mutation verified).
+
+### 8.3 Metrics and glyph normalisation for a scaled field (阶段一百六十九)
+
+When a field's CTM carries a **non-uniform** scale (common with SWC placements — e.g. the TalkMED subtitle
+skin's `ctime` child is `scaleX = 1.2246, scaleY = 1`), `adl`'s contract differs from ours in **two** places.
+Both were pinned against the `adl 51.4.1` same-source dual-end probe (`temp/tfswc` cases ⑯⑯b⑯c⑰b, size 12,
+nominal `166.00/12.00`):
+
+| (scaleX,scaleY) | adl textWidth | adl textHeight | adl rendered ink width |
+|---|---|---|---|
+| (1.0000,1.0000) | 166.00 | 12.00 | 165.0pt |
+| (2.0000,1.0000) | 83.00 | 6.00 | 165.0pt |
+| (1.0000,2.0000) | 332.00 | 24.00 | 329.5pt |
+| (2.0000,2.0000) | 166.00 | 12.00 | 329.5pt |
+| (0.5000,1.0000) | 332.00 | 24.00 | 165.0pt |
+| (1.0000,0.5000) | 83.00 | 6.00 | 82.5pt |
+| parent scaleX=2 | 83.00 | 6.00 | — |
+
+**① Metrics: `textWidth`/`textHeight` = nominal × scaleY/scaleX — both extents divided by `scaleX`.** Not
+"width by scaleX and height by scaleY": at `scaleY=2` the height **doubles** too (`24.00`) without being
+divided by anything. The scale is the **accumulated** value over the object and every ancestor (a parent at
+scaleX=2 halves a child field's numbers). In the generated C, `as_disp_chain_scale` multiplies the linear
+parts down the `parent` chain in the same order as `as_bounds_xform`/`as_render_object`
+(`T·R·S·transform.matrix`; translations cannot change a basis vector's length, so they drop out), and
+`as_tf_scale_ratio` returns `sy/sx`.
+
+**② Rendering: the glyphs are scaled **uniformly by the accumulated `scaleY`** and `scaleX` never widens
+them (nor their advances).** Hence a field at `scaleX=2` inks **exactly as wide** as at `scaleX=1` (165.0pt),
+while its **box** still follows scaleX (`width` = local width × scaleX). The implementation post-concatenates
+`scale(sy/sx, 1)` onto the CTM in the TextField glyph pass: a non-uniform `M = R(θ)·S(sx,sy)·…` times
+`S(sy/sx,1)` is exactly `R(θ)·S(sy,sy)·…`, i.e. the same rotation with a uniform scaleY. It **must** be
+issued **after** the `clipRect`: Skia maps a clip through the CTM in force at clip time, and the visible box
+*is* supposed to follow scaleX (stage 162's D29 was bitten by exactly that mapping). The ratio is read from the
+**destination CTM** (`ASC_bake_ctm_*`, the same idiom as the 1px border), so:
+
+- a normal window pass: the CTM carries the object's accumulated transform ⇒ ratio = accumulated `sy/sx`;
+- a `cacheAsBitmap`/filter bake: the canvas only holds the bake resolution, and `ASC_bake_ctm_*` supplies the
+  destination ratio;
+- `BitmapData.draw(field)`: that path re-rasterises in **local** space, and `adl` measurably **ignores the
+  source's own transform** in `draw()` (a scaleY=2 field dumps a **byte-identical** raster) ⇒ the ratio
+  degrades to 1, which is exactly what that path needs.
+
+Regression: `examples/tf-scale-metrics.as` (6 relative metric assertions + 3 ink-width assertions through
+`draw(container)`, links Skia) + `unit: display/TfScaleMetrics` (10 nails, two reverse-mutation verified).
+
+### 8.1 `flash.text.StyleSheet` and HTML's **block-level** model (阶段一百四十八)
+
+`StyleSheet` was upgraded in 阶段一百四十八 from a "reports but does nothing" shell into a **real class**
+(`superClass: EventDispatcher`, reflect name `flash.text::StyleSheet`): `setStyle`/`getStyle`/`clear`/`styleNames`
+all land, and it becomes the **rule source** for `htmlText` layout. The trigger was talkmed-meeting's FPS overlay
+(`com.vsdevelop.controls.Fps.as`), which puts `htmlText` plus a `styleSheet` on a `TextField` whose `multiline`
+stays at its default `false`: AIR shows **four lines** (FPS / MS / MEM / MAX), we squeezed the four values onto one.
+
+**The root cause is the block-level rule, not `<br>`.** Item-by-item measurement against `adl 51.4.1` (probes in
+`temp/ssprobe/`, `temp/blockprobe/`, `temp/mlprobe/`, `temp/fpsprobe2/`) yields AIR's model, implemented as follows:
+
+| Observation | AIR's behaviour |
+|---|---|
+| An unruled unknown tag (`<x>`, `<fps>`, `<memmax>`, ...) | **inline** (plain unstyled text, absent from `text`) |
+| **Ruled** unknown tag | **block**: the break lands **after its closing tag** (break-after) and is **independent of `multiline`** |
+| Tags AIR renders inline (`span`/`p`/`b`/`i`/`u`/`font`/`a`/`li`/`br`/`img`/`textformat`) | **never** become blocks -- not even with `display:block` |
+| `display:inline` | **downgrades** an unknown tag back to inline |
+| `display:none` | **hides** the element (and its text) |
+| `<br>`, `</p>` | break only when `multiline == true` |
+| Selectors | matched **case-insensitively**; `styleNames` reports the **lowercased** names |
+| `setStyle` / `getStyle` | both **copy**: mutating the passed-in object leaves the rule table alone, and so does mutating what `getStyle` returns; `setStyle(name, null)` **removes** |
+
+Implementation notes:
+
+- The tag name is **lowercased** before the rule lookup (`as_ss_lookup`, keys are lowercase); `as_str_ieq` does the
+  case-insensitive ASCII comparison with **zero allocation**, so no `toLower` allocation per tag.
+- Style state is **stacked** (`st_face/st_size/st_color/st_bold/st_italic/st_under/st_block`, depth 32); a closing
+  tag restores the enclosing level, matching AIR's scoped styling.
+- "The break lands after the close" means the block's text is emitted first and the `\n` appended afterwards, with
+  `tf->_html_block = true`. This is what makes a **single-line** field honour that break: Skia collapses `\n` to a
+  space in a single-line field (`collapseNewlines`), whereas AIR breaks anyway for a rule-driven block. So
+  `as_tf_paragraph` uses `collapse = (tf->multiline || tf->_html_block) ? 0 : 1` -- a **raw `\n` still collapses**
+  in a single-line field (measured); only a rule-driven block break is exempt. `_html_block` is a C-side `bool`
+  with no GC pointer, so it is deliberately **not** in the reflection table.
+- Declaration values flow through `as_ss_str` (CSS numbers take their numeric part, colours only `#RRGGBB`) into the
+  existing run machinery: `color`/`fontSize`/`fontFamily`/`fontWeight`/`fontStyle`/`textDecoration`. Note that
+  `as_ss_str` reuses a **static buffer**, so the `display`-derived `hidden`/`noinline` must be read **before** any
+  other `as_ss_str` call.
+- The FPS overlay sets no `defaultTextFormat`, so `as_tf_paragraph` supplies an implicit `TextFormat` (`_sans`/12/black)
+  when none is set.
+
+**Measured but not yet aligned** (logged in `TODO.md`, not prettified): multi-line run **height** is ~1.5x too tall
+(the same htmlText reports `h=45` for us against AIR's `30.1`, while line counts and widths match value-for-value);
+`leading` coming from a rule is not applied per run; `numLines` semantics (AIR counts a trailing empty line) still
+follow our reading. `StyleSheet.parseCSS` / `transform` are **deliberately unimplemented** -- calling them is a
+**loud** `undefined method` compile error rather than silently accepting CSS AIR would have parsed.
+
 
 **Two semantic details aligned with AIR (fixed in stage eighty-nine / twenty-eight)**:
 
@@ -676,6 +938,31 @@ Two key points: **without `setFontManager`, not a single `<text>` glyph is drawn
 0); and **the wasm side has no `libsvg.a`/`libsksg.a`/`libexpat.a`** (`skia_use_expat=false` gates out the
 whole svg target), so web does not support SVG, and defining the macro is a link-time error. The default build
 does not contain the macro, with behavior verbatim isomorphic to AIR (`#2124`).
+
+### 9.2 The display SkImage and the bytes it was decoded from share one lifetime (stage 154)
+
+A `Bitmap` in the display list is painted **only from `bd->image`** (the SkImage view); `bd->pixels`
+(the CPU buffer) does not take part in drawing. On the `Loader.loadBytes` path `bd->image` is built
+from **the encoded bytes carried by the same job**
+(`as_skia_image_from_bytes(as_job_bytes(job), as_job_len(job))`) — there is no file to re-open by
+name and no URL to fall back on. So as soon as the job's `AS_JOB_DECODE` branch freed the payload
+right after decoding and nulled `bytes/len` (the comment said "only needed to decode"), `bd->image`
+stayed `NULL`: `bitmapData.width/height` and `getPixel32` were **all correct** (the pixels really
+were decoded) and the screen **painted nothing**, without any error.
+
+TalkMED's login captcha takes exactly this path (the server returns `data:image/jpeg;base64,...`,
+the app runs `Base64.decodeToByteArray` and then `Loader.loadBytes`): after the request started
+succeeding the captcha slot stayed blank while `adl` showed the image. It was localised by
+**temporarily instrumenting the app** (`content=[object Bitmap]`, `bitmapData 100x50`,
+`getPixel32(1,1)` non-zero, `numChildren=1`, `parent/onStage` both true), which separates "the image
+was obtained" from "the image was painted" and lands on the job payload's ownership.
+
+**Rule**: both `AS_JOB_IMAGE_URL` (an image fetched over http) and `AS_JOB_DECODE` (a `loadBytes`
+payload) **must keep their encoded bytes until `as_job_retire`**; only `AS_JOB_IMAGE` (a local file)
+may release them right after the decode, because its display view is re-opened **by file name**
+(`as_skia_image_from_file`). Pinned by `unit: transport/JobOwnership` (three checks); the ownership
+table is in [`gc.md`](gc.md).
+
 
 ---
 

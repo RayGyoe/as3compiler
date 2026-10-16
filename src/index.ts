@@ -260,6 +260,10 @@ function main(): void {
     const boot = parse(bootSrc);
     program.body.push(...boot.body);
     program.imports.push(...boot.imports);
+    // The document class's [SWF(frameRate=...)] is the last word on the cadence: the
+    // bootstrap has none, and an app's own file is merged below only if it declares
+    // one (the boot file is deliberately skipped there, see the loop).
+    if (boot.swfFrameRate !== undefined) program.swfFrameRate = boot.swfFrameRate;
     const srcDir = resolve(dirname(opts.airApp), 'src');
     // Pass 1: read + parse + rewrite EVERY source, so the reachability closure can
     // see the whole tree. The rewrite (file-scoped package for an
@@ -290,6 +294,9 @@ function main(): void {
       sqliteScanTexts.push(readFileSync(f.path, 'utf8'));
       program.body.push(...f.body);
       program.imports.push(...f.imports);
+      // [SWF(frameRate=...)] rides along with the file that declares it (the merged
+      // program is what codegen sees; the metadata itself is not a declaration).
+      if (f.swfFrameRate !== undefined && program.swfFrameRate === undefined) program.swfFrameRate = f.swfFrameRate;
       // Collect this file's file-level (script) declaration names so a name
       // declared in TWO kept files can be reported. (`--air-app` merges every file
       // into one script, so the two declarations would alias onto one global while
@@ -318,6 +325,7 @@ function main(): void {
       const p = parse(text);
       program.body.push(...p.body);
       program.imports.push(...p.imports);
+      if (p.swfFrameRate !== undefined && program.swfFrameRate === undefined) program.swfFrameRate = p.swfFrameRate;
       collectEmbeds(p.body, dirname(resolve(input)));
     }
     const first = opts.inputs[0];

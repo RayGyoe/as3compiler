@@ -466,6 +466,44 @@ void sk_path_add_oval(void* path, double x, double y, double w, double h) {
   ((SkPath*)path)->addOval(SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)w, (SkScalar)h));
 }
 void sk_path_close(void* path) { ((SkPath*)path)->close(); }
+// Close EVERY contour of a path. A SWF shape outline is a closed figure by
+// definition, but the SWF edge records spell that out only as "the last point
+// coincides with the first" -- there is no close verb in the format, so our
+// emitter produces `move_to, line_to, ...` with no kClose (Skia fills an open
+// contour implicitly, so fills looked right). Skia's AA CLIPPER does not: an
+// unclosed contour contributes no area, so a clip path built from it clips the
+// whole region away -- every clipDepth-masked sibling (the app's banner and
+// whatever else the skin masks) rendered blank. Measured on the TalkMED login
+// skin: mask #346 (a 36.25x18.5 rect) as a clip left the banner empty, the same
+// outline with the closing verb restored rendered it. `close()` alone only
+// closes the LAST contour, hence this per-contour rewrite.
+void sk_path_close_all(void* path) {
+  SkPath* p = (SkPath*)path;
+  if (p->countVerbs() == 0) return;
+  SkPath out;
+  out.setFillType(p->getFillType());
+  SkPath::Iter it(*p, false);
+  SkPoint pts[4];
+  SkPath::Verb v;
+  bool open = false;
+  while ((v = it.next(pts)) != SkPath::kDone_Verb) {
+    switch (v) {
+      case SkPath::kMove_Verb:
+        if (open) out.close();
+        out.moveTo(pts[0]);
+        open = true;
+        break;
+      case SkPath::kLine_Verb: out.lineTo(pts[1]); break;
+      case SkPath::kQuad_Verb: out.quadTo(pts[1], pts[2]); break;
+      case SkPath::kConic_Verb: out.conicTo(pts[1], pts[2], it.conicWeight()); break;
+      case SkPath::kCubic_Verb: out.cubicTo(pts[1], pts[2], pts[3]); break;
+      case SkPath::kClose_Verb: out.close(); open = false; break;
+      default: break;
+    }
+  }
+  if (open) out.close();
+  *p = out;
+}
 // Append `src` transformed by the affine [a, b, c, d, tx, ty] (AS3 convention:
 // x' = a*x + c*y + tx). Used to place a mask shape's outline into the masked
 // child's local pixel space without duplicating the geometry.
@@ -1221,6 +1259,11 @@ static sk_sp<SkTypeface> sk_match_typeface(const char* family, int bold, int ita
                     SkFontStyle::kNormal_Width,
                     italic ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant);
   sk_sp<SkTypeface> tf = mgr ? mgr->matchFamilyStyle(sk_family_alias(family), style) : nullptr;
+  // The alias already points an uninstalled family at the default one; this only
+  // covers the default family itself missing the requested weight/slant (e.g.
+  // bold of a family that ships Regular only). AIR keeps the family's own metrics
+  // there, so taking the default face's box is the closer approximation.
+  if (!tf && mgr) tf = mgr->matchFamilyStyle(nullptr, style);
   cache[std::string(key.c_str())] = tf;
   return tf;
 }
@@ -1339,7 +1382,34 @@ static const char* sk_family_alias(const char* family) {
   if (strcmp(family, "_typewriter") == 0) return "Monaco";
   if (strcmp(family, "_sans") == 0) return "Helvetica";
   if (strcmp(family, "_serif") == 0) return "Times New Roman";
-  return family;
+  // A family that is NOT installed behaves like the platform default face in AIR,
+  // not like the CJK face that happens to supply the glyphs. Measured on adl
+  // 51.4.1 (temp/tfswc cases 6/9, both sides running the same Main.as): a field
+  // whose family is "MiSans Regular" (not installed anywhere on the machine, but
+  // shipped inside the app bundle -- AIR does NOT register app fonts) lays out a
+  // 16 px line as 16 px, and "宋体" (also unresolvable: CoreText+Skia both return
+  // NULL, only "Songti SC" exists) as 16 px too, i.e. Helvetica's box. We used to
+  // hand the unresolvable name straight to Skia, which returns NULL and lets
+  // SkParagraph size the line from whichever cascade face drew the CJK glyphs
+  // (PingFang/Songti SC: 1.4 em -> 22 px at size 16, 20 px at 14). That 6 px made
+  // the AI subtitle list item taller than adl and pushed its ctime down
+  // (stage 168). Substituting the default family keeps the strut, the runs and
+  // the typeface lookup on ONE face. Cached: the lookup walks the whole installed
+  // family list, and CSS family names of a TextField never change at runtime.
+  static std::map<std::string, std::string> alias_cache;
+  auto it = alias_cache.find(std::string(family));
+  if (it != alias_cache.end()) return it->second.c_str();
+  std::string resolved(family);
+  sk_sp<SkFontMgr> mgr = sk_platform_fontmgr();
+  if (mgr && !mgr->matchFamilyStyle(family, SkFontStyle())) {
+    sk_sp<SkTypeface> dflt = mgr->matchFamilyStyle(nullptr, SkFontStyle());
+    if (dflt) {
+      SkString n;
+      dflt->getFamilyName(&n);
+      if (n.size() > 0) resolved = n.c_str();
+    }
+  }
+  return alias_cache.emplace(std::string(family), std::move(resolved)).first->second.c_str();
 }
 
 static SkFont sk_font(double size, int bold, int italic) {

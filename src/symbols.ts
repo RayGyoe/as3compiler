@@ -1191,6 +1191,23 @@ export class SymbolTable {
         // Class-value read of `activeWindow` emit a call to a nonexistent _static
         // symbol. The focused-window / as_win_active semantics are unchanged.
         ['activeWindow', { returnType: { kind: 'object', className: 'NativeWindow' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // applicationDescriptor: the descriptor document itself, as XML. The C getter
+        // (NativeApplication_get_applicationDescriptor, emitted next to
+        // as_app_descriptor_xml) has existed since `--air-app` did, but WITHOUT an
+        // entry here it was reachable only through a STATICALLY typed receiver. A
+        // program that resolves the class at runtime -- Config.CurrentAppVersion in
+        // talkmed-meeting does `getDefinitionByName("flash.desktop.NativeApplication")
+        // as Class` and then reads `.applicationDescriptor` -- has an `any` receiver,
+        // so the read goes through as_dyn_get -> the per-class getter table, found
+        // nothing, and raised #1069 ("Property applicationDescriptor not found on
+        // flash.desktop.NativeApplication and there is no default value"). Config's
+        // try/catch then swallowed it and the getter answered null, which sent the
+        // version check into appVersion(null, ...) and an uncaught #1009.
+        // Measured on adl 51.4.1 (temp/apv/adl): the same expression returns the
+        // descriptor XML, xml.namespace() its namespace, and xml.ns::versionNumber
+        // the version string — and AIR's missing-property error is #1069 with the
+        // exact wording above, so only this member-table entry was missing.
+        ['applicationDescriptor', { returnType: { kind: 'xml' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       staticGetters: new Map([
         // nativeApplication: the application singleton (AIR's static getter that
@@ -1283,9 +1300,19 @@ export class SymbolTable {
         ['_mask_object', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
         // The Flash DEPTH a baked SWC timeline child sits at (item ③): 0 = the
         // object was not placed by a timeline (a user-added child), so the timeline
-        // ops never address it and `as_swc_tl_clear` leaves it alone. A plain int,
+        // ops never address it and a rewind never claims or prunes it. A plain int,
         // so no GC write barrier is involved.
         ['_tl_depth', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // The SWC character this object was instantiated from (0 = not a baked
+        // character). Set by `as_swc_new` for EVERY character kind, so a backward
+        // timeline jump can tell whether the object sitting at a depth is still
+        // the character the target frame places there: AIR keeps that instance
+        // (and everything AS3 wrote into it) and only instantiates the ones whose
+        // character changed -- measured on adl 51.4.1, temp/btnprobe/Rewind2.as.
+        // It lives on DisplayObject, not MovieClip, because the instances that
+        // must survive are the non-MovieClip ones too (a card's two labels are
+        // TextFields).
+        ['_tl_char', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
         // DisplayObject.mask: the object that masks this one. A private backing slot
         // (the accessor pair below is what AS3 sees), because the value must also be
         // READ by the renderer to ever take effect -- and today it does not: see the
@@ -1401,6 +1428,13 @@ export class SymbolTable {
         ['focusRect', iof({ kind: 'bool' })],
         ['hasFocus', iof({ kind: 'bool' })],
         ['_contextMenu', { type: { kind: 'object', className: 'ContextMenu' }, init: null, visibility: 'private', owner: 'InteractiveObject', isStatic: false, isConst: false }],
+        // Press generation of the mouse button this object was pressed on
+        // (as_mc_button_state): AIR latches `_down` to the object the press
+        // STARTED on, so a press that began outside and was dragged in shows
+        // `_over` instead. A generation counter rather than a pointer, because a
+        // stored pointer would have to be a GC root; 0 = "never/not pressed"
+        // because the counter starts at 1. Plain int, no write barrier.
+        ['_btn_press_gen', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'InteractiveObject', isStatic: false, isConst: false }],
       ]),
       methods: new Map(),
       staticFields: new Map(),
@@ -1838,7 +1872,8 @@ export class SymbolTable {
         // hand-made `new MovieClip()`, which keeps the frameless behaviour). It is
         // an int, not a function pointer, because every timeline entry point is an
         // emitted `as_swc_tl_*(int charId, ...)` switch over the baked characters.
-        ['_tl_char', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'MovieClip', isStatic: false, isConst: false }],
+        // Declared on DisplayObject (see there): a baked child of any kind must be
+        // able to answer "which character am I".
       ]),
       methods: new Map([
         ['play', mcm({ kind: 'void' }, [])],
@@ -5532,30 +5567,47 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
-    // flash.text.StyleSheet: Starling only passes it through as a nullable value
-    // (no CSS parsing is exercised), so it is modeled as a bare Object subclass.
-    // `setStyle` exists because real projects DO load a stylesheet and feed it rules
-    // (talkmed-meeting's Fps.as sets fontSize/fontFamily/leading/color and assigns
-    // the sheet to a TextField); no CSS is applied by this backend, so the method
-    // reports itself once and returns -- an app that never stylesheets is
-    // unaffected, and one that does gets told, rather than getting silently
-    // unstyled text.
+    // flash.text.StyleSheet (阶段一百四十八): a real stylesheet, not a pass-through.
+    // AIR's class is `dynamic class StyleSheet extends EventDispatcher` with
+    // clear()/getStyle()/setStyle()/parseCSS()/transform() and a read-only
+    // styleNames Array (airsdk.dev/reference/actionscript/3.0/flash/text/StyleSheet.html).
+    // Semantics measured on adl 51.4.1 (temp/fpsprobe2, temp/blockprobe):
+    //   * selectors are stored AND matched case-insensitively -- setStyle("memMax")
+    //     is reported by styleNames as "memmax" and still styles <memMax>;
+    //   * getStyle returns a COPY of the style object, or null when unknown;
+    //   * setStyle(name, null) REMOVES the named style;
+    //   * a child element whose tag has a rule renders as a BLOCK (a break AFTER it,
+    //     independent of multiline), which is what puts Fps.as's four values on four
+    //     lines and makes stage.frameRate readable in the overlay.
+    // parseCSS()/transform() are AIR members this compiler does NOT implement, so
+    // they stay absent from the table: using one is a loud compile-time error rather
+    // than silently unstyled text (AGENTS §1.5), and the gap is logged in TODO.md's
+    // 遗留待开发 table.
+    const ssm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'StyleSheet', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const ssv = (name: string, t: ASType): Param => ({ name, type: t, defaultValue: { kind: 'Null' }, isRest: false });
     this.classMap.set('StyleSheet', {
       fields: new Map(),
       methods: new Map([
-        ['setStyle', { returnType: { kind: 'void' }, params: [
-          { name: 'styleName', type: 'String', defaultValue: null, isRest: false },
-          { name: 'styleObject', type: 'Object', defaultValue: null, isRest: false },
-        ], owner: 'StyleSheet', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['setStyle', ssm({ kind: 'void' }, [ssv('styleName', 'String'), ssv('styleObject', 'Object')])],
+        // `getStyle` hands back a plain Object (AIR: "a copy of the style object, or
+        // null if there is none"). Code reads its properties dynamically --
+        // `getStyle('fps').color` -- which is why the return type is Object and not
+        // the runtime's record type: Object member access goes through the dynamic
+        // property path (as_dyn_get), exactly as AIR's untyped Object does.
+        ['getStyle', ssm({ kind: 'object', className: 'Object' }, [ssv('styleName', 'String')])],
+        ['clear', ssm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
+      getters: new Map([
+        ['styleNames', { returnType: { kind: 'array' }, params: [], owner: 'StyleSheet', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       setters: new Map(),
       constructor: { params: [] },
-      superClass: 'Object',
+      superClass: 'EventDispatcher',
       isFinal: false,
       implements: [],
+      reflectFqn: 'flash.text::StyleSheet',
     });
     // flash.net.NetStream (stage 110): the dynamic `client` slot (Starling injects
     // an onMetaData handler through it) plus the playback surface away3d's

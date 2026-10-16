@@ -65,6 +65,10 @@ export interface ReachFile {
   path: string;
   body: Stmt[];
   imports: string[];
+  // `[SWF(frameRate = N)]` declared in this file (阶段一百四十八). The compile face
+  // carries it out of the parse so index.ts can hand the document class's value to
+  // codegen -- the frame rate is the one [SWF] key an AOT build must honour.
+  swfFrameRate?: number;
 }
 
 export interface ReachResult {
@@ -693,7 +697,7 @@ export function prepareReachFiles(asFiles: string[], srcDir: string): ReachFile[
         }
       }
     }
-    out.push({ path: f, body: p.body, imports: p.imports });
+    out.push({ path: f, body: p.body, imports: p.imports, swfFrameRate: p.swfFrameRate });
   }
   if (unparsed.length > 0) {
     process.stderr.write(

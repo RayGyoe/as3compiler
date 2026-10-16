@@ -122,4 +122,24 @@ var threw5:Boolean = false;
 try { sealed2.nope = 1; } catch (e5:Error) { threw5 = true; }
 check(threw5, "a plain class stays sealed (no dynamic ancestor)");
 
+// --- 7) decoded URLVariables keys are ordinary dynamic properties (阶段一百四十七) ---
+// Behaviour check: decode() splits its source, so the keys are what a later lookup
+// has to find -- after a GC and a burst of churn.
+// The invariant that makes this SAFE (the key is an owned copy, never a pointer
+// into the split buffer) cannot be shown here: a headless program has no frame
+// loop, so it never runs the incremental mark that turns a borrowed interior
+// pointer into heap corruption. It is pinned structurally instead, on the sources
+// -- see `unit: emit/NoInteriorPointers`.
+var q:URLVariables = new URLVariables("alpha=1&beta=two&gamma=%20three");
+var churn:String = "";
+for (var i:int = 0; i < 4000; i++) churn = "pad" + i;
+System.gc();
+check(q.alpha == "1", "a decoded key survives a GC: alpha, got " + q.alpha);
+check(q.beta == "two", "…and its value: beta, got " + q.beta);
+check(q.gamma == " three", "…and percent-decoding still applies: gamma, got " + q.gamma);
+check(churn.length > 0, "the churn loop actually ran");
+q["delta"] = "4";
+check(q.delta == "4", "a key built at the call site is stored owned too");
+trace("dyn-prop: URLVariables keys are owned, not borrowed");
+
 trace("dyn-prop: all assertions passed");

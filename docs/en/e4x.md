@@ -95,6 +95,62 @@ DOM, and the highest-cost part to land.
 | `System.disposeXML(xml)` | explicit release (6 places, a `System` builtin) |
 | `describeType(x):XML` | reflection description (2 places) |
 
+### 2.6 String Value and `XML(ByteArray)` (stage one-hundred-forty-three, `adl 51.4.1` value logs `temp/tkmeet-mac/{xmlstr,xmlba}/`)
+
+The real app talkmed-meeting loads its language resource via `XML(new language_en())`
+(`[Embed(..., mimeType="application/octet-stream")]` ⇒ the generated resource class is a **ByteArray subclass**),
+and measuring it pinned down two rules:
+
+**1. `XML(value)` accepts a ByteArray** (its bytes are the UTF-8 markup text). When the call site's static type
+is `Class`/`*` the **dynamic** branch runs, so `as_xml_from_value` must recognize ByteArray — including every
+ByteArray subclass (`as_is` walks the `super` chain, so every `[Embed]` class matches).
+
+| Input | `adl` | This subset |
+|---|---|---|
+| `XML(ba)` (UTF-8 markup) | the parsed tree (multi-byte characters intact) | ✅ same (`examples/xml-embed.as`) |
+| `XML(new <octet-stream Embed class>())` | same | ✅ same |
+| `XML(xmlNode)` | pass-through | ✅ same |
+
+**2. `toString()` is the E4X "string value", not the markup**:
+
+| Shape | `toString()` | `toXMLString()` |
+|---|---|---|
+| text node `XML("plaintext")` | `plaintext` | — |
+| `<a b='1'>txt</a>` (**no** element children) | `txt` | `<a b="1">txt</a>` |
+| `<a b='1'/>` (no children) | `""` | `<a b="1"/>` |
+| `<a b='1'><c d='2'/></a>` (**has** element children) | the markup | the markup |
+| `<a>x<b/>y</a>` | the markup | the markup |
+| `XMLList`: 0 / **1** / ≥2 items | `""` / **that item's string value** (`"a"`) / the items' **markup** joined by a newline | — |
+
+**Not yet aligned** (measured in the same batch, registered in `TODO.md`'s leftover table): ① **`toXMLString()` is
+unimplemented** (loud `CodegenError: unsupported XML/XMLList method 'toXMLString'`); ② the markup output **keeps the
+source form**, while AIR **re-indents** (`<a><b/></a>` → `<a>\n  <b/>\n</a>`) and **drops whitespace-only text
+nodes** (`<a> </a>` → `<a/>`).
+
+### 2.7 An XML/XMLList in a Dynamic Slot Must Be Its String Value Too (stage one-hundred-forty-four, measured in `temp/xmlstr3` + `temp/apv/adl`)
+
+The rules above cover a **statically known** `var s:String = xml` (the emitter calls `as_xml_string_value` directly).
+But as soon as the value travels through a **dynamic slot** — `Object`, `*`, an array element, a `Dictionary` value, a
+dynamic property, an `Object` parameter — it lands in the **object vtable's string conversion slot** (`box_to_str`)
+instead, which answered `[object XML]`.
+
+What is emitted today: talkmed-meeting stores its localized labels in an XML document and resolves them through
+**dynamic lookups**, so **every label** on its login page (and the window title) rendered `[object XML]`.
+
+| Shape | `adl` | Before the fix | Now |
+|---|---|---|---|
+| `String(o)` with `o:Object` holding an XML | the text | `[object XML]` | ✅ the text |
+| `"" + o` / an XML passed to a parameter | the text | `[object XML]` | ✅ the text |
+| `[x][0]`, and the array's own `toString()` | the text | `[object XML]` | ✅ the text |
+| `{k:x}.k` (a dynamic property) | the text | `[object XML]` | ✅ the text |
+| an `XMLList` through a dynamic slot (0 / 1 items) | `""` / that item's string value | `[object XMLList]` | ✅ same |
+| `xml as String` | `null` (an XML is not a String) | `null` | ✅ unchanged |
+
+**Implementation**: `as_xml_vt`/`as_xml_list_vt` now use `as_xml_box_to_str`/`as_xml_list_box_to_str` as their
+`box_to_str` slot instead of `as_object_box_to_str` (both delegate to `as_xml_string_value`/
+`as_xml_list_to_string`). Behaviour: `examples/xml-dynamic-str.as`; the last three checks of
+`unit: e4x/StringValue` pin the wiring.
+
 ---
 
 ## 3. AS3 E4X Semantics vs C (Correctness Red Lines)
@@ -164,7 +220,9 @@ Split into four stages by "dependency order + verifiable per stage", **all lande
 > distinguished, a `Namespace` value is only a placeholder); ② `..*` **does not count text nodes** (AIR counts
 > them; `5.desc-any` gives 2 for us / 4 for AIR); ③ **general filter predicates** `.(<expr>)` (only the
 > `.(@attr ==/!= value)` form is supported); ④ `+`/`+=` XML concatenation.
-> All registered in `TODO.md`'s leftover table.
+> All registered in `TODO.md`'s leftover table. ⑤ **`toXMLString()` is unimplemented** (loud `CodegenError`);
+> ⑥ the markup output is **not re-indented the way AIR does** and **does not drop whitespace-only text nodes**
+> (measured in stage one-hundred-forty-three, see §2.6).
 
 ---
 

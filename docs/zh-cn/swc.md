@@ -119,7 +119,8 @@ skin.swc (ZIP 归档)
 | PNG/无损位图 | `DefineBitsLossless` | 20 | SWF 自有位图格式，**无 alpha**（见 §3.1） |
 | PNG/无损位图（带 alpha） | `DefineBitsLossless2` | 36 | SWF 自有位图格式，**有 alpha**（见 §3.1） |
 | JPEG | `DefineBitsJPEG2` | 21 | `characterID` + **完整 JPEG 字节**（`FF D8` 开头） |
-| JPEG（带 alpha） | `DefineBitsJPEG3/4` | 35/90 | JPEG + alpha 数据 |
+| JPEG（带 alpha） | `DefineBitsJPEG3` | 35 | `characterID` + `alphaDataOffset` + JPEG 字节 + **独立 zlib alpha 平面**（见 §3.2③） |
+| JPEG4（带 alpha） | `DefineBitsJPEG4` | 90 | 与 35 同族，实测本库无；**未支持**（见 §10） |
 | 原始字节 | `DefineBinaryData` | 87 | `characterID` + 原始字节 |
 | 字体 / 声音 | `DefineFont*` / `DefineSound` | 10/48/14/75 | 字体/音频数据 |
 | **symbol → 类名** | `SymbolClass` | 76 | `{id → "类名"}` 映射 |
@@ -128,6 +129,8 @@ skin.swc (ZIP 归档)
 实测 `temp/skin.swc` 的 `library.swf` 有 **59 个位图 tag**（`DefineBitsLossless2`×53 +
 `DefineBitsLossless`×1 + `DefineBitsJPEG2`×3 + `DefineBitsJPEG3`×2），`SymbolClass` 里 **214 条映射**；
 另有 `DefineSprite`×333、`DefineShape*`×378、`DefineButton2`×29、**`DefineFont3`×7**。
+两个 `DefineBitsJPEG3`（`#1113` 186×160、`#1118` 167×162）正是 TalkMED 首页两张卡片的插画，
+其 alpha 平面必须合成（§3.2③）。
 
 ### 3.1 重要陷阱：`DefineBitsLossless` 存的**不是 PNG**，且 tag 20 与 tag 36 语义不同
 
@@ -204,10 +207,70 @@ static uint8_t out = a == 0 ? 0 : min(255, (int)floor(c * 255.0 / a + 1.0 / 3.0)
 > 若将来不愿依赖 `t=1/3` 这一拟合值，退一步用 `round(c*255/a)` 亦可——与 AIR 的差异是
 > ±1 个通道级（视觉不可辨）；但**绝不能不反预乘**。
 
+**③ `DefineBitsJPEG3`(35) 的 alpha 是「**独立的 zlib 平面**」，必须与 JPEG 合成**
+（2026-10-15 新增，diff doc **D25**）。
+
+JPEG 本身没有 alpha 通道，所以 tag 35 把同一张图存了**两份**：
+
+```
+DefineBitsJPEG3 (tag 35) 数据体：
+  characterID     u16
+  alphaDataOffset u32                    ← 后面 JPEG 字节的长度
+  JPEG 字节       (alphaDataOffset B)     —— **不透明**，透明处是 FLA 导出时填的**黑**
+  alpha 平面      (tag 剩余字节)          —— **zlib 压缩**，宽×高 个字节，行主序、**无行填充**
+```
+
+AIR 把两者合成；若只把 JPEG 喂给 Skia，透明区域会画成**黑色矩形**（实测 TalkMED 首页两张卡片
+`#1113` 186×160 / `#1118` 167×162：JPEG 四角恰为 `(0,0,0)`，平面上四角为 `0`、中心 `255`）。
+
+**正确做法**：**编译期解压平面**（`node:zlib` 现成），**运行时合成**——运行时有 Skia 的 JPEG
+解码器，而 Node 侧不引入 JPEG 解码器（AGENTS.md §3.1 零依赖）。生成 C 里两个平面各是一个数组，
+由 `as_argb_apply_alpha` 合成：
+
+```c
+/* 直通 0xAARRGGBB 上叠一层 8 位覆盖度（tag 35 的 alpha 平面）。
+   JPEG 恒解成不透明，故乘法既保住它自带的 alpha，又取到平面的值。 */
+static void as_argb_apply_alpha(unsigned* p, int n, const unsigned char* alpha) {
+  for (int i = 0; i < n; i++) {
+    unsigned c = p[i];
+    unsigned a = ((((c >> 24) & 0xffu) * (unsigned)alpha[i]) + 127u) / 255u;
+    p[i] = (a << 24) | (c & 0x00ffffffu);
+  }
+}
+```
+
+运行时有**两条**路要走它：位图**子件 / 资源类**（`BitmapData_adoptEncodedAlpha`，合成后同时更新
+`pixels` 与 `bd->image`）与**位图填充**（`as_swc_image_alpha`，填充 shader 采样的是 SkImage）。
+**没有平面**时两条路都退回原样（`BitmapData_adoptEncoded` / `as_skia_image_from_bytes`），
+保留 Skia 的惰性解码。
+
+> **不许静默降级**：平面为空、坏流、或解不出 `宽×高` 字节时，`swc.ts` **响亮告警**并把
+> `SwcBitmap.alpha` 记 `null` ⇒ 退回「只喂 JPEG」的行为，绝不拿垃圾覆盖度去合成。
+> 钉 `unit: render/SwcJpeg3Alpha`（14 钉，合成与退回两条都钉住）。
+
 ### 3.3 另一类 tag：代码（`DoABC` / ABC 字节码）——**这是范围声明，不是「延后」**
 
 `library.swf` 里除了位图资源，还有 **255 个 `DoABC`（tag 82）**，它们是 **254 个类的真实 AVM2
 字节码**，不是空壳占位。实测（自写解析器对 **255/255** 模块 round-trip 精确吻合，方法见 §11）：
+
+> **它现在真的挡路（实机证据，2026-10-14）**：皮肤符号自己的**时间轴脚本**也在 `DoABC` 里。真应用
+> talkmed-meeting 登录页的用户协议开关 `agreebtn`，**没有任何 AS3 代码**去改它 —— 应用只**读**
+> `agreebtn.currentFrame != 3`（`SmsAccount.as:270` / `TalkMEDAccount.as:129`），勾选动作在符号脚本内；
+> 我们不执行 ⇒ `currentFrame` 永远停在第 1 帧 ⇒ 开关**点不动**、按「登录」必弹「请了解并阅读隐私政策和服务协议」，
+> **登录流程到此为止**。双端对照：`adl 51.4.1` 点一下即变绿勾，AOT 版连点 4 次无变化。
+> 详见 `as3compiler/talkmed-meeting-aot-vs-adl-diff.md` §2 D17 与 `TODO.md` 的遗留行。
+
+**2026-10-14 收口（阶段一百五十六）：帧脚本这一半已落地，「范围声明」收窄为「真逻辑不执行、帧脚本执行」。**
+新增 `src/abc.ts`（`parseAbc` / `decodeSymbolScripts` / `OPCODES` / `decodeCode`）在**编译期**把**符号类**的
+帧脚本（`frame1`/`frame2`… 那一族方法）解成 AST、复用现有发射器：`this.stop()`、属性赋值、
+`addEventListener` + 闭包 `_self`、`if/else` 三元、Flash 构造器形状的 `addFrameScript`
+（**`callproperty` + `pop`** —— 只认 `callpropvoid` 会漏掉一半帧脚本）都在覆盖内。落点：`SwcCharacterClass.frames`
+→ `as_swc_frames(charId, frame, o)`，由**构造器（第 1 帧）**与 **`as_mc_goto`（后续帧）**两个入口驱动；
+`as_swc_new` 让被导出的嵌套符号实例化**自己的符号类**（帧脚本要类方法，裸 `MovieClip_new()` 没有）。
+**边界照旧**：255 个模块里那 **254 个类的一般方法**（TweenLite / StringCore / DownLoader…）**仍然不执行** ——
+那需要整个 AVM2；不支持的字节码形态一律**响亮报明/跳过**，不静默。实测：`skin.swc` 的 255 个 ABC 块
+`aligned: 255 bad: 0`，解出 **100 个符号类 / 110 段帧脚本 / 138 个方法**；
+回归钉在 `unit: render/swctimeline`（5 条，钉在发射出的 C 上，已验证能变红）。
 
 | 指标 | 实测 |
 |---|---|
@@ -347,7 +410,7 @@ error: class 'mx.core.BitmapAsset' is only available as AVM2 bytecode inside
 | `DefineScalingGrid` (78) | 22 | **九宫格缩放**（`scale9Grid`），皮肤拉伸要按它切 |
 | `DefineButton2` (34) | 29 | 按钮四态 |
 | `DefineMorphShape`/`2` (46/84) | 4 / 2 | 形变 shape |
-| `DefineEditText`(37) / `DefineText`/`2`(11/33) | 337 / 3 | 文本字段（走既有 `TextField`，不属矢量域） |
+| `DefineEditText`(37) / `DefineText`/`2`(11/33) | 337 / 3 | 文本字段（**tag 37 自阶段一百四十九起全量解码**，见 §10） |
 | `DefineFont3` (75) | 7 | SWC 内嵌字体（§10 已列） |
 
 **② shape 的几何与样式实测**：
@@ -416,6 +479,7 @@ SWF body（跳过 stage header：RECT + frameRate + frameCount）
   │                         ├─→ 反预乘 → straight ARGB（§3.2，编译期）
   │                         └─→ **PNG 重编码**（§5.1，约 100 行编码器）→ 编码字节
   └─ JPEG2/3   → 完整 JPEG 字节（+ alpha）——**原字节直搬，零转换**
+                  └─ tag 35 → **alpha 平面单独解压**，运行时合成（§3.2③）
 
 两者统一交给运行时现成接口（§5）：as_skia_image_decode_bytes_argb → straight ARGB → BitmapData
 ```
@@ -459,7 +523,8 @@ mangled-header 补丁（那是给 LZMA-alone 13 字节头用的）。`temp/skin.
 
 | 资源格式 | 嵌入内容（**编码字节**） | 运行时解码 |
 |---------|----------------------|-----------|
-| `DefineBitsJPEG2/3` (21/35) | **JPEG 原始字节直搬**（零转换） | 现有 `as_skia_image_decode_bytes_argb` |
+| `DefineBitsJPEG2` (21) | **JPEG 原始字节直搬**（零转换） | 现有 `as_skia_image_decode_bytes_argb` |
+| `DefineBitsJPEG3` (35) | JPEG 原字节直搬 **+ 解压后的 alpha 平面**（两个数组，§3.2③） | `as_swc_image_alpha` / `BitmapData_adoptEncodedAlpha`（先 Skia 解码再合成） |
 | `DefineBitsLossless2` (36) | 编译期做**反预乘**（§3.2）后**重编码为 PNG** | 同上 |
 | `DefineBitsLossless` (20) | 同上，但源数据无 alpha → 写 `A=0xFF` | 同上 |
 
@@ -655,7 +720,7 @@ com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wrig
 
 | 层 | 改动 | 说明 |
 |----|------|------|
-| **构建层 `src/swc.ts`（新增）** | SWC 提取器 | ZIP 解析 + CWS/ZWS 解压 + stage header 跳过 + tag 扫描 + 位图提取 + **反预乘（§3.2）**，产出 `SwcResource[]`（类名/格式/宽高/straight ARGB 像素或 JPEG 字节）。**只读资源，不解析 `DoABC` 字节码**（§3.3）；同时读 `catalog.xml` 的 `<script>/<dep>` 供 §3.3.3 的早期诊断用 |
+| **构建层 `src/swc.ts`（新增）** | SWC 提取器 | ZIP 解析 + CWS/ZWS 解压 + stage header 跳过 + tag 扫描 + 位图提取 + **反预乘（§3.2）**，产出 `SwcResource[]`（类名/格式/宽高/straight ARGB 像素或 JPEG 字节）。**资源全量解析**；`DoABC` 只解**符号类的帧脚本**（§3.3 收口），一般类方法不碰；同时读 `catalog.xml` 的 `<script>/<dep>` 供 §3.3.3 的早期诊断用 |
 | **构建编排 `src/build.ts`** | `--swc` 参数 / 构建清单 `swc-paths` | 收集 SWC 依赖，调用提取器；资源段超过阈值时生成独立资源 `.c` 并接入 `sources`（§5.1，**默认不拆**） |
 | **语义层 `src/symbols.ts`** | 资源类注册 | 把资源类名注册为 `BitmapData` 子类（`dynamic`，构造器 `(int,int)` 但**实参忽略**） |
 | **语义层 `src/emit.ts`** | 资源段发射 + `new`/反射分发 | 发射 C 编码字节资源段（PNG/JPEG，§5.1）；`new logo(w,h)` 分发到「内嵌字节 → Skia 解码 → BitmapData」工厂，宽高取**资源自身**值；资源类同时登记进既有 `getDefinitionByName` 注册表（§6） |
@@ -666,8 +731,9 @@ com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wrig
 **边界铁律**：提取逻辑（ZIP/SWF 解析）**只能**发生在编译期（`swc.ts`），**禁止**塞进 `RUNTIME_PREAMBLE`
 ——那会让运行时背一个 SWF 解析器，违反「前端只翻译」铁律（AGENTS.md §1.3）。反预乘同理放在编译期。
 
-**第二条边界**：`swc.ts` **只读资源，不解析 `DoABC` 字节码**（§3.3）——字节码→C 需反编译器或
-AVM2 解释器，属另行立项。`catalog.xml` 的 `<dep>` 只用于**名字层面**的早期诊断（§3.3.3）。
+**第二条边界**：`swc.ts` **资源全量解析**；`DoABC` **只解「符号类的帧脚本」**（§3.3 收口）——
+那足够让勾选框/按钮皮肤真的切帧，而**一般的类方法不执行**（一个类 1400+ 个方法体、54 KB 字节码，
+全跑起来就是 AVM2，属另行立项）。`catalog.xml` 的 `<dep>` 只用于**名字层面**的早期诊断（§3.3.3）。
 
 ---
 
@@ -858,9 +924,16 @@ hit   : 960 + 252(scale 0.714, 0.261)
 `as_pick_hit`，而它**只报告 InteractiveObject**；按钮的 hit 态是用**普通 `Shape`** 搭出来的，于是永不命中。
 改为几何判定——把舞台点映到按钮本地空间，再映射进 hit 态自身空间，调用
 `as_obj_region_hit_local`（走它自己的子件与轮廓），即 AIR 真正命中的那块区域。修复落在**共用助手**层：
-拆出 `as_sbtn_contains_local`（本地空间）供 `as_sbtn_contains`（舞台空间）与 `as_obj_region_hit_local` 共用，
-因此 `SimpleButton.hitTestPoint(x, y, true)` 也跟着按 hit 态几何判定（此前恒为 miss）——
-结构回归见 `examples/swc-shape.as`。
+拆出 `as_sbtn_contains_local`（本地空间）供 `as_sbtn_contains`（舞台空间）与
+`as_sbtn_state` 的历史路径共用——结构回归见 `examples/swc-shape.as`。
+
+> **阶段一百五十七 校正（本节旧文曾写「`hitTestPoint(x, y, true)` 也跟着按 hit 态几何判定」）**：
+> `as_obj_region_hit_local` 对 `SimpleButton` **刻意直接回 false**（按钮的四个态是彼此独立的子对象，
+> 自身没有形状区域；`temp/sbtnstate2/` 七个探针：即便 `hitTestState` 是实心 60×60 且在台上，
+> `hitTestPoint(x, y, true)` 仍为 false），而 `as_sbtn_contains_local` 是 **hover 与鼠标拾取共用**的
+> **输入命中区域**。二者分工由此固定：绘制/包围盒/形状区域三问不变，**只有当「这只鼠标点谁」时才问 hit 态**
+> —— 真应用 talkmed-meeting 里那 29 个「只有 down + hit」的隐形按钮（个人中心三行、`选择企业` 返回箭头）
+> 正是因为拾取还去问绘制态的包围盒而**完全点不动**，修法见 `src/emit.ts` 的 `as_pick_hit_local`。
 
 **结果**：
 
@@ -1063,18 +1136,34 @@ cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../temp/skin.swc
 修后：**`x/y` 0 处不符、`numChildren` 0 处不符、`width/height` 35 处**（其中 3 处源自 morph 几何缺失，
 其余 ≤0.021px 的精度级差）。
 
-**① 未支持的字符建为占位子件（绝不静默）**
+**① 文本字符烘焙成真 `TextField`（`DefineEditText` 全量解码）**
 
-- `DefineEditText`(37) / `DefineText`(11)：实测本库 **341 个**（338 + 3）⇒ 烘焙成**空 `TextField`**
-  （`as_swc_new` 的 `'text'` 分支 = `TextField_new()` + `_fieldWidth/_fieldHeight` 取声明的 `RECT` 尺寸），
-  于是 `numChildren` / `getChildAt` 索引顺序与 AIR 一致。字形与初始文本仍是**已声明缺口**，
-  用 `notes` 报明（`341 DefineText/DefineEditText character(s) are baked as EMPTY TextField placeholders …`）。
-- `AutoSize` 实测：`DefineEditText` 第二 flags 字节的 `0x80` 位在本库 **341 个全为 0**；我们已把它解析出来
-  （`SwcText.autoSize`），既然全为 0，占位框按 `RECT` 报即与 AIR 无差。
+- `DefineEditText`(37) / `DefineText`(11)：实测本库 **341 个**（338 + 3）。
+  **阶段一百四十九**起 tag 37 的整张字段被**逐字段解码**并盖到实例上：InitialText（`hasText`）、
+  `HasFont` 的 `FontID`→`FontName` + `FontHeight`、`HasTextColor` 的 **RGBA**、
+  `HasLayout` 的 align/margins/indent/leading、以及 Multiline/WordWrap/Password/ReadOnly/
+  NoSelect/Border/HTML/MaxLength 各标志。于是「皮肤里的每一行字」都真的画出来了——修前
+talkmed 的协议段落、页脚、按钮文案**整体缺失**（字段是空的）。
+- **flags 是 MSB-first 的 16 位字**（一个位字段序列），**不能**按 LE `UI16` 读：本库 #92 的两字节
+  `ad 36` 作 MSB-first 读为 `0xad36` = HasText|Multiline|ReadOnly|HasTextColor|HasFont|HasLayout|
+  WasStatic|HTML，与该字符完全吻合（它自己的文本就是 `<p align="left"><font face="MiSans Regular"…`，
+  FontID=5，而库里 font 5 正是 `MiSans Regular`）；按 LE 读成 `0x36ad` 则**每一位都变成另一位**。
+  旧实现的 `autoSize = (第二字节 & 0x80)` 因此读的是 **HasFontClass**（本库 341 个全 0，所以看起来
+  「永远为 0」），并非 AutoSize。现在 `SwcText.autoSize` = flags 的 `0x0040`，本库 **341 个全为 0**，
+  故占位框按 `RECT` 报即与 AIR 无差。
+- `FontID` → `FontName` 由 tag 48/75/91（`DefineFont2/3/4`）只读 `FontName` 得到；`FontNameLen`
+  实测**含结尾 NUL**，故解析后要截掉。本库 7 个字体族：`MiSans Regular`/`微软雅黑`/`宋体`/`Arial`/
+  `04b_08`/`微软雅黑 Light`/`Matura MT Script Capitals`。**嵌入字体的字形轮廓仍未解码**（不由 SWC
+  造字体文件），故这些族名走 Skia 的系统字体别名，度量有残差——已声明缺口。
+- `DefineText`(11) **仍烘焙成空框**：它的字形 run 要对嵌入字体的 `CodeTable`（字形索引→字符码）
+  才能还原，本库只有 3 个，用 `notes` 报明。
+- `notes` 现在按类分别报告：`N text character(s) are baked as TextFields: X DefineEditText … carry
+  their decoded InitialText + TextFormat (Y have a non-empty string), Z DefineText … still bake as an
+  EMPTY box …`。
 - `DefineMorphShape`(46) / `2`(84)：实测闭包内 **6 个** ⇒ 烘焙成**空 `Shape`**（AIR 是 `MorphShape`，
   `Shape` 的子类；本工程无此类，故 `getQualifiedClassName` 报 `Shape`）。树形（个数/索引）对齐、
   **不画错像素**（空 Shape 不画），几何缺失用 `notes` 报明。
-- 旧实现是「`unsupported` ⇒ 摆放处直接跳过」，会**连子件都没有**；现在是「建占位 + 报明」。
+- 旧实现是「`unsupported` ⇒ 摆放处直接跳过」，会**连子件都没有**；现在是「建真子件 + 报明」。
   `is TextField` 对文本子件成立（`examples/swc-shape.as` ⑦ 断言）。
 
 **② `clipDepth` 遮罩对象是子件，不是「不存在的子件」**
@@ -1088,14 +1177,17 @@ cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../temp/skin.swc
 
 **③ placement 平移落到子件自身 `x/y`（scale 仍留在 `transform.matrix`）**
 
-`emitSwcPlacement` 现在只把 2×2（旋转/缩放/斜切）写进 `transform.matrix`，**平移**写进子件自己的 `x/y`
-（文本子件再加其 `RECT` 原点）。实测 AIR：非文本子件 `child.x == matrix.tx`（`vbitemskin c4 xy=41,23.75`）、
-TextField 子件 `x = tx + RECT.xmin`（`staticskin c1 xy=9.25,55.7` ✓ 逐位相同）。缩放**必须**留在矩阵里：
+`emitSwcPlacement` 现在只把 2×2（旋转/缩放/斜切）写进 `transform.matrix`，**平移**写进子件自己的 `x/y`。
+实测 AIR：非文本子件 `child.x == matrix.tx`（`vbitemskin c4 xy=41,23.75`）。**文本子件另加其 `RECT` 原点，
+且原点要走 placement 的线性部分、再落到 AIR 的 twip 栅格（1/20 px）**：`x = round20(tx + a·xmin + c·ymin)`
+（stage 170 修正；此前是 `tx + xmin`，只在**单位缩放**的子件上与 AIR 相同 —— `temp/childfx` 那 99 个子件全是
+单位缩放故未暴露，一旦 placement 带缩放即偏，如 `subtitleskin.ctime` 偏 11.7px）。判别证据 = `temp/tfswc`
+case ⑰ 的四个子件（`ctime 12.0000`/`filesskin.tab1 0.0500`/`tab2 90.1000`/`logintabskin.tab1 0.0000`，
+`adl` 报的每个数都是 1/20 的整数倍），实现见 `src/emit.ts` 的 `swcTextChildXY`。缩放**必须**留在矩阵里：
 F1 已实测 AIR 的九宫格不认 placement 拉伸（42 个被拉伸的 gridded entry 只有那样才对得上），
 且 AIR 仍从矩阵读出 decomposed 值。像素不变（渲染合成 `T(x,y)·R·S·M`）。
 
 **④ `width/height` 的精度对齐（`as_do_extents`）**
-
 文本子件宽高走「角点映射」会带上子件自身 `y` 再减回去，实测 `staticskin` 的文本子件读成
 `19.950000000000003`（AIR 正好 `19.95`）；现在轴对齐情形直接算 `(r-l)*a*scaleX` / `(b-t)*d*scaleY`
 （旋转/斜切仍走角点映射），逐位等于 AIR。
@@ -1110,6 +1202,36 @@ hairline 斜线的排线，累积盒不稳）。因此 `as_bounds_walk` 增加�
 `hitTestObject`），**命中测试与 `getRect` 传 0**（AIR 按**绘制区域**拾取；`getRect` 保持既有「不含描边」口径）。
 `temp/shbox.ts` 复核：378 个 shape 里「声明矩形」与「路径并集 + 描边」在 **116 个**上有差 ⇒ 声明矩形才是
 权威并集（我们的路径累积盒还会把笔位 `moveTo` 也算进去）。`decl` 只喂 AS3 包围盒读口，**不参与光栅**。
+
+**⑥ 遮罩路径必须**闭合**每个子路径（否则整块区域被裁掉）**
+
+`clipDepth` 遮罩的轮廓直接当作裁剪路径（`as_swc_clip_path_new`）。真应用 `skin.swc` 的遮罩 `#346`
+是 `moveTo/lineTo×4`、**没有 `close`** 的 5 个 verb —— `kWinding` 下这条路径**什么都不填充**，
+于是被遮的登录页轮播 `banner`（以及 `con`/`titletext`/`confbtn2`）**整块被裁成空**（用户看到
+「轮播只有第一张图／空白」）。实测（`temp/tkmeet-mac/`，临时胶水探针 `sk_path_dbg`）：
+`SRC346 fillType=1 verbs=5 pts=5 bounds=0,0,36.25,18.5 empty=0` / `DST346 fillType=0 verbs=5
+pts=5 bounds=0,0,354,402.5`；对照实验：手搭矩形（closed）✓ 渲染、烘出的路径 + `as_skia_path_close()` ✓
+渲染、手搭 **closed 三角形** ✓ 渲染 ⇒ **闭合轮廓（任意形状）都能裁；未闭合轮廓把整块区域裁空**。
+
+**修法**：胶水层新增 `sk_path_close_all(void* path)`（用 `SkPath::Iter` 把**每一条**子路径都改写为
+已闭合；不能用 `SkPath::close()`，它只闭合**最后一条**，多轮廓遮罩仍会坏），发射侧在
+`as_skia_path_add_transformed(...)` 之后立刻调一次。**修在「裁剪路径构造器」而不是形状发射器**：
+裁剪是「填充区域」，闭合它**语义不变**；而形状发射器里的描边轮廓**允许开放**，在那里补 `close`
+会改掉描边渲染。钉在 `test/unit/render.ts` swctimeline。
+
+**⑦ 遮罩活在**父**空间：裁剪必须设在对象自身变换**之前**（否则遮罩跟着对象跑）**
+
+`clipDepth` 遮罩是**兄弟节点**（同 parent、depth 在 `(maskDepth, clipDepth]` 区间内），它**不随**被遮对象运动。
+烘焙曾把遮罩矩阵合成到**子件局部像素**（`inverse(childMatrix) * maskMatrix`），渲染时又在 `translate(o->x, o->y)`
+**之后**裁剪 ⇒ 遮罩**跟着对象走**。对登录页轮播（`banner` 被 `TweenLite.to(..., {x:-(index-1)*354})` 横移、
+遮罩固定）后果正是用户看到的「**只显示第一张图**」：只有 `x==0`（局部≡父空间）时遮罩与视口重合、露出第 1 张，
+之后遮罩随胶片移出卡片 ⇒ **整块空白**。实测（`temp/tkmeet-mac/shots/`）：修前 `spc_early`（x≈0）有图、
+`spc_late`（x≈-725.7，由 `[diag] banner visit=150 x=-725.7` 记录）**全空**；修后 `fix_early` 与 `fix_late`
+**各有内容且是不同两张**（`ImageChops` 差值 `changed_px=33476`）。
+
+**修法**：烘焙只传遮罩**自己的** placement（父空间），渲染走查把 `clip_path` 从「变换之后」搬到
+对象 `save` **之后、`translate` 之前**（同时也落在 `alpha` 的 `saveLayer` 之前，让层本身被裁）。
+钉：`test/unit/render.ts` swctimeline 的『the clipDepth clip is applied BEFORE the object transform』。
 
 **验收**：
 
@@ -1161,11 +1283,11 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 | 观测项 | `adl` 口径 |
 |---|---|
 | `totalFrames` | = SWF 的 `ShowFrame` 条数（`desktopshareitem` 21、`devicesitemskin` 23、`元件16_124` 17、`checkbom`/`toastbtn` 2、`元件172_339` 3） |
-| 新建剪辑的初态 | `currentFrame == 1`、**`isPlaying == false`**，且在显示列表上**跨 12 帧也不自走**（离屏与上屏都一样）⇒ 皮肤符号的 `stop()` 在 DoABC 里，我们读不到；故**烘焙剪辑一律停在第 1 帧**（既不发明动画，也让像素 harness 逐位不变） |
+| 新建剪辑的初态 | `currentFrame == 1`、**`isPlaying == false`**，且在显示列表上**跨 12 帧也不自走**（离屏与上屏都一样）⇒ 皮肤符号的 `stop()` 在 DoABC 里；**帧脚本从 v0.4.127 起由编译期解码并真的执行**（§3.3 收口），所以这不再是"读不到而不得不停在第 1 帧"——而是**文件里就写着 `stop()`**，执行它才是对齐 AIR |
 | 属性名 | 是 **`isPlaying`**（没有 `playing`） |
 | `currentLabel` / `currentFrameLabel` | 该帧的 `FrameLabel` 名，或 `null` |
 | `currentLabels` | **`Array` of `FrameLabel`**（`{name, frame}`），与我们的解析逐条一致（如 `_up@1 _over@8 _down@15`） |
-| `gotoAndStop(n\|label)` | **前进**：就地打增量（子件身份保持）；**后退或回到 1**：**重建**目标帧的对象（adl 复现出新的自动实例名 `instance5`） |
+| `gotoAndStop(n\|label)` | **前进**：就地打增量（子件身份保持）；**后退或回到 1**：**复用**目标帧上「同一（父, 深度, 角色）」的现有子件（对象身份与运行期状态都保留），只有该位置的角色**变了**才换新对象——详见下方「回到旧帧的复用规则」 |
 | `nextFrame` / `prevFrame` | 步进 + **回绕**（`totalFrames` 处回 1、1 处回 `totalFrames`） |
 
 **实现**
@@ -1177,11 +1299,12 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
   逐帧推演：带字符 = 新增/替换（`replace: true`，继承记录省略的变换）、`Move` 且无字符 = 修改、无 `Move`
   且无字符 = **删除**、同帧同深度后写覆盖先写；**什么也没带的 op 直接丢掉**并计数报明（本库 270 条
   只带 morph `Ratio` 的记录）。`SwcBakeCharacter` 增加 `totalFrames`/`frames`/`labels`。
-- **发射**（`src/emit.ts`）：`as_swc_tl_total/start/find/put/del/clear/apply` + `as_swc_tl_labelcount/
+- **发射**（`src/emit.ts`）：`as_swc_tl_total/start/find/put/del/apply/rewind/reuse/new/link/unlink` + `as_swc_tl_labelcount/
   labelat/frameat/label/labelframe`（静态 `switch (charId)`，标签名用 `strcmp`）；`MovieClip` 增加
   `play`/`stop`/`gotoAndPlay`/`gotoAndStop`/`nextFrame`/`prevFrame` 与 `isPlaying`/`currentLabel`/
   `currentFrameLabel`/`currentLabels`；新内建类 **`FrameLabel`**；时间轴子件带深度 `_tl_depth`
-  （0 = 用户 `addChild` 的子件）以便「后退重建」只清时间轴子件。**无 bake 时全部发空桩**。
+  （0 = 用户 `addChild` 的子件）以便「回到旧帧」只认领/清理时间轴子件（v0.4.143 起回退改为
+  **复用**，见下方「回到旧帧的复用规则」）。**无 bake 时全部发空桩**。
 - **类身份顺带收窄**：多帧 sprite 现在实例化为 `MovieClip`（`as_swc_new` 的 sprite 分支），与 AIR 报的
   `flash.display::MovieClip` 一致（原先报 `Sprite`）。
 
@@ -1197,6 +1320,38 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 3. **无 bake 时 `as_swc_bind` 没有定义**：`MovieClip` 的走表函数现在会调用它，于是**没有 SWC 的构建**
    （`examples/dyn-prop.as`、`stage62.as`、`stage94f.as`、`air-native/`）链接失败（阶段九十七 的验收里
    记录的正是这 4 个失败）。补一句 stub（`this.swcBake === undefined` 时发射）⇒ 4 个示例全绿。
+
+**回到旧帧的复用规则（阶段一百七十二，D43）**
+
+上面的「后退 → 重建目标帧的对象」是 v0.4.68 的粗口径，**收回**：adl 51.4.1 的实测规则是
+「**目标帧在同一（父, 深度）上还是同一个角色 ⇒ 复用原对象**（连 App 运行时写进它的属性、
+`TextField.text`、事件监听一起保留）；角色不同 ⇒ 才换新对象」。证据 `temp/btnprobe/`：
+
+- `Rewind.as`：往 `homeskin.joinmeeting` 卡片的 `label1/label2` 写 `MARK0/MARK1` 后
+  `_up(1) → _over(5) → _down(11) → _up(1)`，四个标签/文字全程保留（AIR 每帧写出 `label1.text`）。
+- `Rewind2.as`：逐层打印子对象**编号与身份**（`#n`）+ 自动实例名，实测
+
+  ```
+  card f=1 children: 0:#0/sh/instance8@0,0  1:#1/tf/label1@16,16  2:#2/tf/label2@16,44  3:#3/sh/instance9@0,0
+  over f=5 children: 0:#0/sh/instance8@0,0  ...(1/2/3 未变)
+  back to up f=1 children: 0:#4(new)/sh/instance28@0,0  1:#1/tf/label1  2:#2/tf/label2  3:#3/sh/instance9
+  ```
+
+  即：深度 1 的角色在帧 1（518）与帧 5（524）不同 ⇒ 退回时换新对象（`instance8 → instance28`）；
+  深度 2/3 的角色没变 ⇒ **对象编号原封不动**。
+- 实现（`src/emit.ts`）：回退路径由 `as_swc_tl_clear + as_swc_bind` 改为 `as_swc_tl_rewind`——先把当前
+  子件按 `(parent, 子件)` 存进快照数组（`ASC_tl_snap_par/obj`，`gc_root_register` 过的静态槽，嵌套
+  回退各存一层），重跑帧 1 时 `as_swc_tl_reuse(parent, depth, charId)` 先认领快照里同（深度, 角色）的
+  对象，再按 `as_swc_tl_apply` 打到目标帧，最后按**对象指针**（不是深度）清掉没人认领的残留。
+  每个烘培子件都知道自己来自哪个角色（`_tl_char` 从 `MovieClip` 移到 `DisplayObject`，由 `as_swc_new`
+  统一盖章）。
+- 症状与现场：TalkMED 首页卡片标题是 App 运行时写进皮肤 `TextField` 的，旧实现下悬停一次再移开
+  就被皮肤原稿覆盖（「快速入会」→「加入会议」）；修后 `temp/tkmeet-mac/s172labels.py` 量到
+  移出前后**整窗（排除 FPS 浮层）0 像素差**、两条标签带各自 0 差。
+
+**残留（D43b）**：**前进**方向上「`Move` + 新字符」的记录，AIR 保留原对象身份，我们仍换新对象——
+因为烘培类是把图**画进类里**的（一个角色一个类），换角色就必然换实例。D43b 不影响文字保留
+（只有角色真的变了才会触发），记在差异文档里待后续架构层处理。
 
 **烘焙口径的数量（`temp/tlcheck.ts`）**：79 个多帧 sprite、其中 **75 个**帧 1 之后有变化、**448** 个 op 帧、
 **514** 个 op（**102** 增/替、**404** 改、**8** 删）；**89** 条 `FrameLabel`（31 个 sprite）。
@@ -1220,7 +1375,7 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
   `isPlaying` / 无 bake 的 `as_swc_bind` stub）。
 
 **残留（记 §10）**：① 时间轴子件的 `name` 恒 `null`（AIR 自动命名 `instanceN`，SWF 记录里没有 `Name` 字段）；
-② **每帧 ActionScript（DoABC）不执行** ⇒ 剪辑恒停在第 1 帧；③ morph 时间轴的 `Ratio` 记录被丢弃（morph 是
+② **每帧 ActionScript（DoABC）只有符号帧脚本执行**（v0.4.127 起，§3.3 收口），一般类方法仍不执行；③ morph 时间轴的 `Ratio` 记录被丢弃（morph 是
 空占位子件）；④ 子件 `x/y` 的**末位差**（`0.9500000000000002` vs `0.95`，≤2 ULP，来自两次 `/20` 相加）。
 
 **复现**：
@@ -1235,6 +1390,135 @@ cd temp/childfx && node gen.ts && ../../src/index.ts ours.as --manifest ../swc-r
 # 1× 全量像素（须与 rep_final.txt 逐行相同）
 cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node compare.ts
 ```
+
+---
+
+### 9.2 F7 `DefineBitsJPEG3` 的 alpha 平面（阶段一百五十九，v0.4.130，diff doc D25）
+
+**现象**：TalkMED 首页两张卡片（“快速入会”/“创建会议”）的插画位置是**黑矩形**，`adl` 同页是透明的。
+`temp/alphaprobe/probe.mjs` 扫出全库只有两个 tag 35（`#1113` 186×160、`#1118` 167×162），
+即这两张图。
+
+**根因**：早期提取器只搬 JPEG 字节、扔掉 alpha 平面，并打一句「not composited」的 warning。
+FLA 导出时透明区被填**黑**，于是透明区画成黑矩形。这不是 PNG 编码问题，而是**漏了一个 SWF tag 形态**。
+
+**实现**（两处，共约 90 行）：
+
+- **编译期**（`src/swc.ts`）：`DefineBitsJPEG3` 分支用 `node:zlib` `inflateSync` 解压平面，
+  校验解出长度 ≥ `宽×高`（取前 `宽×高` 字节，容忍尾部填充）；空平面 / 坏流 / 长度不足一律
+  **响亮告警 + `alpha = null`**（退回原行为，不拿垃圾覆盖度合成）。
+- **运行时**（`src/emit.ts`）：平面另发一个 `static const unsigned char` 数组（`__swcbmp_<id>_a` /
+  `__res_<name>_a`），新增 `as_argb_apply_alpha`；两条路各接上——**位图子件/资源类**走
+  `BitmapData_adoptEncodedAlpha`（Skia 解完 JPEG 后叠平面，重新建 `bd->image`），
+  **位图填充**走 `as_swc_image_alpha`（填充 shader 采样的是 SkImage，不是 `pixels`）。
+  无平面时两条路**一字不变**（仍走 `BitmapData_adoptEncoded` / `as_skia_image_from_bytes`，保住惰性解码）。
+
+**两个踩到的坑（已钉住）**：
+
+1. **填充表是 1-based**：`SwcStyleLayer.fills[0]` 是占位符（与 SWF 的 `FillStyle0/1 == 0` 同义），
+   真填充从下标 1 起。写测试夹具时忘加占位符 ⇒ `swcBakePlan` 的位图闭包变空，填充自然没有图片数组。
+2. **合成器必须与 adopt 成对发射**：一开始把 `as_argb_apply_alpha` 的发射挂在
+   「本构建是否真有 alpha 平面」上，但 `BitmapData_adoptEncodedAlpha` 里**无条件**调它 ⇒
+   无平面的构建产出「只调用、无定义」的 C（隐式声明报错）。现为**成对发射**：
+   宣称支持 alpha 的入口，就必须带上能落地 alpha 的实现。
+
+**验收**：
+
+- **视觉**：`temp/tkmeet-mac/d25-boot.png` / `d25-home.png`——黑矩形消失，插画透明（与 `adl` 同形）。
+- **单元**：`unit: render/SwcJpeg3Alpha` **14 钉**（自造最小 SWC：SOF0「JPEG」+ 自造 alpha 平面，
+  用 STORE-method ZIP 手写容器）——平面解压/取值、坏平面拒收、命名资源与填充两条路的 C 都钉住，
+  含「无平面时退回原样」的反向对照。
+- **回归**：全量 `node test.ts` 全绿。
+
+---
+
+### 9.2 F8 MovieClip 三种按钮态（`buttonMode` + `_up`/`_over`/`_down`）（阶段一百七十一，v0.4.142，diff doc D42/R29）
+
+**现象**：TalkMED 首页两张卡片（“快速入会”/“创建会议”）以及登录按钮、九宫格图标按钮、弹窗按钮，在
+`adl` 上悬停/按下都有明显的视觉反馈（首页卡片悬停改 15524 像素、按下改 105227 像素），而我们的窗口
+只改了 423 / 440 像素 —— 且那点变化是调试浮层自己在动。即**全 App 的按钮反馈都是死的**。
+
+**根因**：AIR 对「带 Flash 按钮标签的 MovieClip」有一个内建状态机：`buttonMode == true` 且时间轴上有
+`_up` / `_over` / `_down` 三个 `FrameLabel` 时，指针滚入/按下/滚出会把**播放头真的移过去**
+（`currentFrame`/`currentLabel` 都变，该帧的帧脚本也跟着跑）。我们只实现了 `FrameLabel` 与
+`gotoAndStop`（§9.2 F6），没有这个状态机。TalkMED 皮肤里有 **29 个**这样的符号。
+
+**AIR 实测口径（`temp/btnprobe/`：`Probe.as` 是 adl 侧探针 + `p4~p7` 截图，`Aot.as`/`Card.as` 是我们侧同一份时间线脚本）**
+
+| 观测项 | `adl` 口径 |
+|---|---|
+| 门 | 是 **`buttonMode`**，不是「有标签就算按钮」：同一个类把 `buttonMode` 置 false 就永远停在第 1 帧；另一个「有标签、没有脚本」（默认 `false`）的符号 `BtnRootResources_99复制_362` 悬停/按下也永远停在第 1 帧 |
+| 帧 | 由**标签**决定，不是帧号：`元件17_125` 是 `_up@1/_over@4/_down@7`，`BtnRootResources_99复制_362` 是 `_up@1/_over@5/_down@10`，各自落到自己标签那一帧 |
+| 三档 | 移开 → `_up`；滚入 → `_over`；按下 → `_down`（是**真导航**，`currentFrame`/`currentLabel` 都变） |
+| 按压锁 | 锁在 `mouseDown` 的那个对象上：在别处按下再拖进来只有 `_over`；在这里按下再拖出去仍保持 `_down` |
+| 松开 | 指针在内回到 `_over`，在外回到 `_up` |
+| 离屏 | 没有任何鼠标事件时保持 `_up` |
+
+**实现**（`src/symbols.ts` 一字段 + `src/emit.ts` 一组助手）：
+
+- `symbols.ts`：`InteractiveObject` 增私有 `int _btn_press_gen`（**按代际而非存指针**，故不引入新的
+  GC 根，也不必担心对象先死）。
+- `ASC_mouse_target`：每次绘制/指纹 pass 开头用当前 `(x,y)` 重算拾取目标（`as_mouse_refresh_target`），
+  鼠标停着不动时显示列表变了也要跟得上。
+- `ASC_press_gen`：`mouseDown` 时 `+1`，并把拾取目标的**祖先链**逐个盖上这个代际；判定则为
+  `ASC_mouse_down && gen 匹配`。代际只增不减 ⇒ 陈旧的戳永远不会撞上后来的按压。
+- `as_mc_button_state`：三道门（有烘焙时间轴 / `buttonMode` / 真的有指针）→ 选 `_down`/`_over`/`_up`
+  标签（标签缺失时按 `_down → _over → _up` 退链）→ **帧号真的不同才** `as_mc_goto`（否则会把增量
+  反复打一遍、把帧脚本反复跑）。
+- 两处结算：绘制 pass（`as_render_object`）与**指纹 pass**（`as_render_fp`）。
+
+**最关键的一条坑：自动烘焙会绕过绘制 pass**
+
+祖先一旦被自动烘焙（连续 3 帧指纹相同就贴缓存图），绘制 pass 根本不会遍历到子件 ⇒ 只在
+`as_render_object` 里结算状态，卡片就「帧变了、像素不动」：实测 headless 30 帧后仍是 `f=1 _up`、
+像素差 **0**；同一场景 `ASC_NO_AUTO_BAKE=1` 立刻对（`f=5 _over`、差 3355 像素）。修法两条缺一不可：
+① 状态也在 `as_render_fp` 里结算（它每帧都遍历每个节点）；② 指纹里混入 `MovieClip.currentFrame`，
+让「状态变了但画法没变」也能让缓存失效。
+
+**验收**
+
+- **双端对照**：`temp/btnprobe/` 逐档帧号/标签一致（`元件17_125` `1:_up`→`4:_over`→`7:_down`、
+  按住拖出仍 `7:_down`、外面松开 `1:_up`、原地松开回 `4:_over`、别处按下再拖进来只有 `4:_over`），
+  像素差同量级；`ASC_NO_AUTO_BAKE=1` 下两侧窗口的 hover/按下像素差为 16094/105076 vs adl 15524/105227。
+- **示例**：`examples/swc-mc-button.as`（结构 + 8 档迁移 + 两个负例 + 首页卡片在自动烘焙下的
+  `1→5→11` + 三对像素差），推进器 `--manifest examples/swc-bitmap.build.json`。
+- **单元**：`unit: display/McButtonState` **15 钉**（三道门、标签退链、按压代际、两处结算点、
+  指纹混帧、刷新点、示例登记）。
+- **变异验证**：把 `as_render_fp` 里的那次结算删掉 ⇒ 示例 **11 处红**（含首页卡片三档）。
+- **真机**：`temp/tkmeet-mac/sweep.py` 首页「快速入会」卡片悬停改 41591 像素，与 `adl` 同形；
+  tabs/齿轮/用户信息三处无变化，也与 `adl` 一致。
+- **回归**：全量 `node test.ts` 全绿。
+
+### 9.2 F9 时间轴回退的**复用规则**（`_tl_char` + `as_swc_tl_rewind`）（阶段一百七十二，v0.4.143，diff doc D43/R30）
+
+**现象**：阶段一百七十一 修完按钮态，真机验收第一眼就发现：首页两张卡片标题是 App 运行时写进皮肤
+`TextField` 的（`快速入会 / Join quickly`、`创建会议 / Create Meeting`），**悬停一次再移开**就变回皮肤原稿
+（`加入会议`）。
+
+**根因**：`as_mc_goto` 的后退分支是 `as_swc_tl_clear + as_swc_bind` —— 把第 1 帧的子件**整棵重建**，
+App 写在皮肤 `TextField` 实例上的文字随旧对象一起丢掉。AIR 的口径是：**目标帧仍在同一（父, 深度）上放的
+是同一个角色 ⇒ 复用原对象**（属性、`text`、监听器全保留），只有角色**换了**才造新对象。
+
+**AIR 实测口径**（`temp/btnprobe/Rewind.as` / `Rewind2.as`；我方镜像 `Rewind3.as` / `CardText.as`）
+
+| 观测项 | `adl` 口径 |
+|---|---|
+| `_over(5) → _up(1)` 的子件身份 | 深度 2/3（`label1`/`label2`）编号 `#1`/`#2` **不变**，App 写的 `text` 原样保留 |
+| 角色变了的那一层 | 深度 1：帧 5 的 524 → 帧 1 的 518 ⇒ 换新对象（自动实例名 `instance8 → instance28`） |
+| 前进 `Move` + 新字符 | **保留原对象身份**（只换图不换实例）—— 我方仍有差（D43b） |
+
+**实现**：`_tl_char` 下移到 `DisplayObject`（由 `as_swc_new` 统一盖章）；回退改走 `as_swc_tl_rewind`
+（快照 `(父, 子件)` → 重跑帧 1 时 `as_swc_tl_reuse(父, 深度, 角色)` 认领 → `as_swc_tl_apply` 打到目标帧 →
+按**对象指针**清残留）；`as_swc_tl_link` 对「已在同一父下」的对象什么都不做（不给复用对象派发多余的
+`ADDED`/`REMOVED`）。细节见 §9.2 F6 的「回到旧帧的复用规则」。
+
+**验收**：`examples/swc-mc-button.as` 第 ⑪ 档（复用 + 文字保留 + 回退后的 `_up` 与悬停前 `inkDiff == 0` +
+子件数不增不减 + 变了角色的那一层确实换新对象）；`unit: render/SwcTimeline` **+7 钉**；真机
+`temp/tkmeet-mac/s172labels.py` 量到**移出前后整窗（排除 FPS 浮层）0 像素差**。
+
+**同轮登记的三处未修小缺口**：① 指针移出窗口不 roll-out（窗口后端收不到「离开窗口」，悬停态粘住）；
+② `ROLL_OVER`/`ROLL_OUT`/`Stage.MOUSE_LEAVE` 事件完全不派发；③ **D43b**：前进 `Move` + 新字符在
+`adl` 里是同一对象换图，我方换实例（烘焙类一个角色一个类）。
 
 ---
 
@@ -1259,13 +1543,14 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 | 声音（`DefineSound`） | 实测 `temp/skin.swc` **无** `DefineSound`（0 个）；若将来遇到，是独立解码域 |
 | 被 `Sprite` 引用的无类名位图（43 个） | 需解析 `DefineSprite`/`PlaceObject` 的完整显示树；**注意 `small_gift`/`checkbom` 属于这一档**（早期版本误列为 16 个之一） |
 | `[Embed]` 元数据语法 | **不是「已有捷径」**：`Embed` 目前无任何语义层消费者（§1），自有项目场景同样需要实现 |
-| `DefineBitsJPEG4`（tag 90） | 实测 `temp/skin.swc` 无；与 JPEG3 同族，随手支持即可。**注意**：`CHARACTER_TAG_KINDS` 已把它归为 `bitmap`，但提取器只处理 20/21/35/36 ⇒ 真遇到 tag 90 会在 `swcBakePlan` 的位图分支上以一句**误导性**的 `bitmap fill references missing bitmap #N` 失败（应按 JPEG4 报明） |
+| `DefineBitsJPEG4`（tag 90） | 实测 `temp/skin.swc` 无；与 JPEG3 同族（tag 35 **已支持**，§3.2③），随手支持即可。**注意**：`CHARACTER_TAG_KINDS` 已把它归为 `bitmap`，但提取器只处理 20/21/35/36 ⇒ 真遇到 tag 90 会在 `swcBakePlan` 的位图分支上以一句**误导性**的 `bitmap fill references missing bitmap #N` 失败（应按 JPEG4 报明） |
 | ~~九宫格缩放（`DefineScalingGrid`，实测 22 个）~~ **已实现**（§9 F/§9.2 F1）；但 **AS3 侧的 `DisplayObject.scale9Grid` 属性尚未实现** | 工程只从 SWF tag 烘焙九宫格，运行时**没有**可读写的 `scale9Grid` 属性（AIR 有）。即：SWF 皮肤里的缩放不会糊，但用户代码无法自己设置/查询它。 已按 §1.5 记入 `TODO.md` 的 `### 遗留待开发` |
 | `BitmapData.draw(source, matrix)` 对 source **自身变换**的处理与 AIR 不同 | 实测 `adl`：给被绘对象设 `o.scaleX = 2` 在 `draw(source, matrix)` 中**无效**（只受 `matrix` 参量影响）； 我们的实现会应用它。探针因此统一改为先包一层容器再 draw。**未定案**，记入 `### 遗留待开发` |
 | 形变 shape（`DefineMorphShape`/`2`，实测 6 个） | 需两套几何 + 插值；本库仅 6 个，价值低故延后。**现状**：已烘成**空 `Shape` 占位子件**（§9.2 F5）⇒ 树形对齐、不画错像素，几何与插值仍是缺口；其时间轴的 `Ratio` 记录（本库 270 条）被丢弃并报明（§9.2 F6） |
 | ~~按钮四态（`DefineButton2`，实测 29 个）~~ **已实现**（§9 F/§9.2 F2） | `ButtonRecord.states` 位掩码 + 绘制时状态机（`as_sbtn_state`）；离屏与 `adl` 逐像素一致 |
-| ~~时间轴动画（`DefineSprite` 多帧 + `FrameLabel`）~~ **已实现**（§9.2 F6，v0.4.68） | 逐帧差值（增/替/改/删）在编译期烘焙，`gotoAndStop`/`nextFrame`/`prevFrame`/`currentLabels` 与 `adl` 逐项一致（68 行 0 差异）；79 个多帧 sprite / 514 个 op / 89 条 `FrameLabel`。**残留**：① 时间轴子件的 `name` 恒 `null`（AIR 自动命名 `instanceN`，SWF 记录里没有 `Name` 字段）；② **每帧 ActionScript（DoABC）不执行**—— 皮肤符号的 `stop()` 读不到，故烘焙剪辑**一律停在第 1 帧**（这正是 `adl` 的观测行为，像素 harness 因此逐位不变）；③ morph 时间轴的 `Ratio` 记录被丢弃（morph 是空占位子件） |
-| **SWC 内嵌代码（ABC 字节码）** | **这是范围外，不是「延后」**：实测 255 个 `DoABC` = 254 类 / 54,162 B 字节码。容器读取已解（§3.3.1，255/255 round-trip 自证），但字节码→可编译产物需**反编译器或 AVM2 解释器**（§3.3.2），属另行立项。现实形态 =「资源取自 SWC，代码来自 `.as`」，并用 `<dep>` 做编译期诊断（§3.3.3）。**实测只有 mx/flex 8 个类（3,135 B）缺源码**，手写即可（§3.3.0） |
+| 时间轴动画（`DefineSprite` 多帧 + `FrameLabel`）~~ **已实现**（§9.2 F6，v0.4.68） | 逐帧差值（增/替/改/删）在编译期烘焙，`gotoAndStop`/`nextFrame`/`prevFrame`/`currentLabels` 与 `adl` 逐项一致（68 行 0 差异）；79 个多帧 sprite / 514 个 op / 89 条 `FrameLabel`；回到旧帧按「同一 (父, 深度, 角色) 复用子件」对齐（阶段一百七十二，D43）。**残留**：① 时间轴子件的 `name` 恒 `null`（AIR 自动命名 `instanceN`，SWF 记录里没有 `Name` 字段）；② 帧脚本（DoABC）**自 v0.4.127 起由编译期解码并真的执行**（§3.3 收口）—— 皮肤符号里的 `stop()` 就是文件里写着的，执行它才是对齐 AIR（此前「一律停在第 1 帧」的那条旧描述已作废）；③ morph 时间轴的 `Ratio` 记录被丢弃（morph 是空占位子件）；④ 前进方向「`Move` + 新字符」AIR 保留原对象身份而我方换新对象（D43b，烘培类一个角色一个类所致） |
+| MovieClip 按钮态的**结算时机** | 三种按钮态在**绘制/指纹 pass** 结算（与 `as_sbtn_state` 同一口径），因此一个从不 `render`、也没有窗口的离屏程序里，`dispatchMouse` 之后 `currentFrame` 不会自己变；真实 App（窗口每帧走这条 pass）与 `stage.render` 下行为与 `adl` 逐档一致（§9.2 F8） |
+| **SWC 内嵌代码（ABC 字节码）** | **原来划为范围外、现已部分落地**：实测 255 个 `DoABC` = 254 类 / 54,162 B 字节码，容器读取已解（§3.3.1，255/255 round-trip 自证）。**v0.4.127 起符号类的帧脚本会在编译期解成 AST 并执行**（§3.3 收口：110 段帧脚本、真应用的勾选框/按钮皮肤因此真的切帧）；剩下的**一般类方法**（TweenLite/StringCore…）→ 可编译产物仍需**反编译器或 AVM2 解释器**，属另行立项。现实形态 =「资源取自 SWC，代码来自 `.as`」，并用 `<dep>` 做编译期诊断（§3.3.3）。**实测只有 mx/flex 8 个类（3,135 B）缺源码**，手写即可（§3.3.0） |
 
 ---
 

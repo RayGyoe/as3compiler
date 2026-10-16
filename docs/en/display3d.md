@@ -1,17 +1,29 @@
-# Stage3D (`flash.display3D`) Alignment Investigation and Integration Plan
+# Stage3D (`flash.display3D`) Alignment and Landing
 
-> This document answers one question: **can AIR SDK's `flash.display3D.*` (Stage3D) be aligned to this project**,
-> and if so, how should it land. The core conclusion up front: **it can be implemented, and it is not an
-> architectural overthrow but a bounded extension of the existing GPU infrastructure**; but it is the heaviest
-> single piece in this project so far (equivalent to rebuilding a small 3D graphics API runtime), and its core
-> difficulty is the **AGAL bytecode → native shader language (MSL/GLSL) translation**. The gap is concentrated in
-> the whole block "3D GPU resources + state machine + AGAL", not scattered point-filling.
+> This document began as a project-inception investigation — **can AIR SDK's `flash.display3D.*` (Stage3D) be
+> aligned to this project, and if so how should it land**. The conclusion is **yes, and it is not an architectural
+> overthrow but a bounded extension of the existing GPU infrastructure**; it is the heaviest single piece in this
+> project so far (equivalent to rebuilding a small 3D graphics API runtime), and its core difficulty is the
+> **AGAL bytecode → native shader language translation**. The gap is concentrated in the whole block "3D GPU
+> resources + state machine + AGAL", not scattered point-filling.
+>
+> **Current state (2026-10-13, v0.4.112, stage one-hundred-forty-one)**: the whole block missing at project
+> inception is **now fully closed**,
+> and a whole extra **Windows / Direct3D 12** backend exists beyond the original plan — the AGAL translator (three
+> targets **MSL / GLSL ES / HLSL**), `Matrix3D`/`Vector3D`, the `Stage3D`/`Context3D` state machine and resource
+> classes, and three self-contained glues (`vendor/stage3d_glue.mm` Metal / `vendor/stage3d_webgl.cc` WebGL2 /
+> `vendor/stage3d_d3d.cc` D3D12, one shared `s3d_*` ABI) have all landed. **This document splits by nature into
+> two halves**: §1–§8 is the inception reasoning and layered design (each section ends with a "Landing status"
+> note), **and §9 onward is the per-stage landing record, which is also the authoritative source for the current
+> contract** (§9 textures/samplers/program cache/state objects, §10 the Windows D3D12 backend); the per-stage
+> log is in `TODO.md`.
 >
 > Positioning: Stage3D is to this project the **isomorphic extension** of stages thirty-six through thirty-eight
 > "link Skia rather than build our own rasterizer" — what it replaces is the "programmable GPU triangle pipeline"
-> layer (raw MTLBuffer/render pass/MSL), **not** the 2D display-list/event layer of `flash.display.*`. The
-> display-list stacking relationship and event-flow semantics are unchanged; Stage3D merely adds a separate GPU
-> render pass that converges with the 2D surface at the window compositing stage.
+> layer (raw `MTLBuffer`/D3D12 command lists/render pass/shader compilation), **not** the 2D display-list/event
+> layer of `flash.display.*`. The display-list stacking relationship and event-flow semantics are unchanged;
+> Stage3D merely adds a separate GPU render pass that converges with the 2D surface at the window compositing
+> stage.
 
 ---
 
@@ -30,36 +42,45 @@ The full API surface (one more layer of dependencies than the 19 classes listed 
 | Context | `Context3D` (about 30 methods: `configureBackBuffer`/`clear`/`present`/`drawTriangles`/`drawTrianglesInstanced`/`setVertexBufferAt`/`setProgram`/`setTextureAt`/`setBlendFactors`/`setDepthTest`/`setCulling`/`setStencilActions`/`setRenderToTexture`/`setScissorRectangle`/`setProgramConstantsFrom*`/`setColorMask`/`drawToBitmapData`, etc.) |
 | Resources | `VertexBuffer3D`, `IndexBuffer3D`, `Program3D` (`upload(AGAL bytecode)`) |
 | Textures | `flash.display3D.textures.{Texture, CubeTexture, RectangleTexture, TextureBase, VideoTexture}` |
-| Constant classes | 15: `BlendFactor`/`BufferUsage`/`ClearMask`/`CompareMode`/`FillMode`/`MipFilter`/`Profile`/`ProgramType`/`RenderMode`/`StencilAction`/`TextureFilter`/`TextureFormat`/`TriangleFace`/`VertexBufferFormat`/`WrapMode` |
+| Constant classes | 16: `BlendFactor`/`BufferUsage`/`ClearMask`/`CompareMode`/`CubeMapFace`/`FillMode`/`MipFilter`/`Profile`/`ProgramType`/`RenderMode`/`StencilAction`/`TextureFilter`/`TextureFormat`/`TriangleFace`/`VertexBufferFormat`/`WrapMode` (all named with a `Context3D` prefix in AS3) |
 | Implicit dependencies | `flash.geom.Matrix3D`, `flash.geom.Vector3D`, `Vector.<Number\|uint\|float>`, `ByteArray` (little-endian reads) |
 
 > Note that `AGALMiniAssembler` (`com.adobe.utils.*`) is **not a runtime** but a pure AS3 utility class — as long
 > as the compiler can compile its source, it runs as user code (only string parsing + bit packing, producing a
 > `ByteArray`). So no special runtime support is needed, but real Starling/Away3D projects all depend on it, so it
 > must be used for end-to-end acceptance.
+>
+> **Landing status**: every class in the table above is implemented — `Matrix3D`/`Vector3D` (stage seventy-nine),
+> `Stage3D`/`Context3D` plus the resource/texture/constant classes (stages eighty-one~eighty-three, eighty-seven,
+> eighty-nine / twenty-one, one-hundred-twenty-eight), and `AGALMiniAssembler` compiled as **user code**
+> (validated end-to-end in `shmup-stage3d` at stage eighty-four).
 
 ---
 
-## 2. Current-State Inventory (have vs missing)
+## 2. Current-State Inventory
 
-| Item | Status |
+At project inception (before stage seventy-nine) the conclusion here was "everything except the 2D render loop is
+missing". As of v0.4.112 (stage one-hundred-forty-one), the gap is fully closed, and a whole extra
+**Windows / Direct3D 12** backend exists beyond the original plan:
+
+| Item | Current state |
 |---|---|
-| 2D render loop | ✅ Skia CPU raster + GPU (native **Metal** `metal_glue.mm`, web **WebGL2** `web_glue.cc`) + SDL2 window |
+| 2D render loop | ✅ Skia CPU raster + GPU (macOS `metal_glue.mm`, Windows `window_glue.cc`+`d3d_glue.cc`, web `web_glue.cc`) + SDL2 window |
 | `ByteArray` (including grow/compress/uncompress) | ✅ implemented |
 | `Point`/`Rectangle`/`Matrix` | ✅ implemented |
 | `Vector.<T>` type system | ✅ modeled |
-| `Stage3D` / `Context3D` / `display3D.*` | ❌ entirely unimplemented (`TODO.md` explicitly lists `stage3Ds` as an unmodeled type) |
-| `Matrix3D` / `Vector3D` | ❌ unimplemented |
-| **Native GPU triangle pipeline** | ❌ the existing Metal backend is only "Skia Ganesh → Metal + flush", with **no** raw `MTLBuffer`/render-pass/MSL-compilation ability |
+| `Matrix3D` / `Vector3D` | ✅ stage seventy-nine |
+| `Stage3D` / `Context3D` / `display3D.*` | ✅ state machine + resource/texture classes + 16 constant classes (stages eighty-one~eighty-seven, eighty-nine / twenty-one, one-hundred-twenty-eight) |
+| AGAL translator (**MSL / GLSL ES / HLSL** three targets) | ✅ stage eighty (MSL/GLSL), one-hundred-thirty-one (HLSL) |
+| Native GPU triangle pipeline | ✅ three self-contained glues sharing one `s3d_*` ABI: `stage3d_glue.mm` (Metal) / `stage3d_webgl.cc` (WebGL2) / `stage3d_d3d.cc` (D3D12) |
 
-Conclusion: **the gap is concentrated in the whole block "3D GPU resources + state machine + AGAL"**, not
-scattered point-filling.
+Conclusion: the inception verdict "the gap is concentrated in the whole block '3D GPU resources + state machine +
+AGAL'" **holds and the whole block is now closed**; the three glues are structurally isomorphic, with the semantic
+trade-offs (§9.1–§9.13) ported one by one to all three backends.
 
-> **This table is a snapshot from project inception** (before stage 79): the ❌ items above have since landed —
-> `Vector3D`/`Matrix3D`, the `Stage3D`/`Context3D` state machine, the AGAL translator (three targets
-> MSL/GLSL/**HLSL**) and the real GPU triangle pipeline (native **Metal** / web **WebGL2** / Windows
-> **Direct3D 12**). **Current state is §9 (textures/samplers/program cache/state objects) and §10 (the Windows
-> D3D12 backend)**; the per-stage details are in `TODO.md`.
+> **The authoritative source for the current state is this document's "Landing status" notes in §3/§5 plus the
+> landing records in §9 and §10** (§9 textures/samplers/program cache/state objects, §10 the Windows D3D12
+> backend); the per-stage log and acceptance evidence are in `TODO.md`.
 
 ---
 
@@ -90,10 +111,17 @@ platform's shader language.
   with swizzle and write-mask; AGAL2 extends control flow (`ife/ine/ifg/ifl/els/eif`) + derivatives
   (`ddx/ddy`) + MRT; AGAL3 extends instancing and vertex texture sampling.
 
-**The translation approach is mature and deterministic**:
-- native: AGAL → **MSL** (`newLibraryWithSource` compilation), registers mapped to `float4`, `tex` mapped to
-  `texture2d.sample()`.
-- web: AGAL → **GLSL ES** (WebGL2).
+**The translation approach is mature and deterministic** (landed in stage eighty; widened from one target to
+three in stage one-hundred-thirty-one):
+- macOS native: AGAL → **MSL** (compiled by `newLibraryWithSource:` in `vendor/stage3d_glue.mm`), registers mapped
+  to `float4`, `tex` mapped to `texture2d.sample()`.
+- web: AGAL → **GLSL ES** (`vendor/stage3d_webgl.cc`, WebGL2).
+- Windows native: AGAL → **HLSL** (shader model 4+, compiled by a real `D3DCompile` into `vs_5_1`/`ps_5_1` in
+  `vendor/stage3d_d3d.cc`).
+- The target is chosen at build time by `ASC_AGAL_TARGET` (**MSL=0 / GLSL=1 / HLSL=2**); the generated C is
+  completely unchanged and it is the linked glue plus the build manifest that decide. The translator is exposed
+  as the pure-static builtin bridge `AGALTranslator.translate(bytes:ByteArray, target:String):String`
+  (`"msl"`/`"glsl"`/`"hlsl"`, not an AS3 runtime API).
 - **Authoritative reference**: Ruffle already implements Stage3D (AGAL → wgpu/WebGPU), and there are several
   open-source AGAL → GLSL implementations in the community; the semantic rules (swizzle/mask/register
   constraints/validation-error list) are fully defined in `Program3D.upload`'s 40+ validation errors.
@@ -103,23 +131,30 @@ front-end "translate AS3→C" main pipeline, consistent with AGENTS.md §2.9's "
 iron rule. The real grunt work is in the AGAL validator (40+ errors) and the extensions of AGAL1/2/3's three
 generations (MRT, instancing, the `iid` register, `fragment output index`).
 
+> **Cross-target coverage gaps (faithfully recorded, filed in `TODO.md`'s `### 遗留待开发` table)**: three
+> features — fragment **MRT** (`oc1..oc3` → multiple outputs), the **depth output** (`od`), and the **AGAL3
+> `iid`** register — are currently complete only in the **HLSL target** (`SV_TargetN` / `SV_Depth` /
+> `SV_InstanceID`): MSL/GLSL still fold the fragment into a **single output** (`oc` / `gl_FragColor`), MSL's `od` is
+> **not declared** (GLSL goes through the built-in `gl_FragDepth`), and `iid` is translated into an **undeclared
+> `r<num>`**. These three are **old defects that predate HLSL** — the third target was the first thing that could
+> contrast them. **Do not confuse this with instancing itself**: `drawTrianglesInstanced` → `instanceCount` is
+> **on-screen on all three backends**; what is missing is only the shader's **per-instance ID register**.
+
 ---
 
-## 4. Layered Alignment Plan (key: reuse what already exists)
+## 4. Layered Alignment Plan (inception design + landing status)
 
-| Layer | Approach |
+| Layer | Approach (inception design → landing status) |
 |---|---|
 | Front end (AST/lexer/parser) | zero changes. `Context3D` etc. are all ordinary builtin classes, going through `symbols.ts` modeling + `runtime.ts` helpers |
 | Runtime state machine | `Context3D` is a pure state machine (blend/depth/stencil/cull/scissor/colorMask/fillMode + the currently bound buffer/program/texture/constants); a C struct suffices |
-| GPU resources | `metal_glue.mm` extension: `MTLBuffer` (vertex/index), `MTLTexture` (2D/cube/rect), `MTLLibrary` (MSL), `MTLRenderPassDescriptor` (render-to-texture), `MTLDepthStencilState` |
-| On-screen compositing | Stage3D's back buffer composites with the Skia 2D surface into the same window (the display3D layer above/below the display list), reusing the existing SDL2/Metal presentation path |
-| web | `web_glue.cc` extension with raw WebGL2 (`createBuffer`/`shaderSource`/`drawElements`), or reuse the existing Ganesh context |
-| Prerequisite classes | `Matrix3D` (perspective projection/append/recompose), `Vector3D` — pure logic, the same pattern as `Matrix` |
+| GPU resources | it did **not** go into `metal_glue.mm` after all; instead three self-contained glues each expose the same `s3d_*` set: `vendor/stage3d_glue.mm` (`MTLBuffer`/`MTLTexture`/`MTLLibrary`/`MTLRenderPassDescriptor`/`MTLDepthStencilState`), `vendor/stage3d_webgl.cc` (WebGL2), `vendor/stage3d_d3d.cc` (D3D12) |
+| On-screen compositing | Stage3D's offscreen target composites with the Skia 2D surface into the same window: on macOS Ganesh samples the same `MTLTexture`, on Windows Skia's D3D backend samples the same `ID3D12Resource`, and on web it goes through a CPU readback (stage eighty-nine / thirty); all three must **share one device/queue** with the 2D backend (§9.8, §10.4) |
+| web | `vendor/stage3d_webgl.cc`: raw WebGL2, sharing the same WebGL2 context as Ganesh |
+| Prerequisite classes | `Matrix3D` (perspective projection/append/recompose), `Vector3D` — pure logic, the same pattern as `Matrix` (landed in stage seventy-nine) |
 
-`AGALMiniAssembler` (`com.adobe.utils.*`) is **not a runtime** but a pure AS3 utility class — as long as the
-compiler can compile its source, it runs as user code (only string parsing + bit packing, producing a
-`ByteArray`). So no special runtime support is needed, but real Starling/Away3D projects all depend on it, so it
-must be used for end-to-end acceptance.
+(`AGALMiniAssembler` is covered by the note in §1: it is not a runtime but a pure AS3 utility class, compiled
+along with user source and used for end-to-end acceptance.)
 
 ---
 
@@ -130,9 +165,9 @@ through thirty-eight, doing only an **incremental extension** without introducin
 
 | Concern | Note |
 |---|---|
-| Glue layer | Add the AGAL→MSL/GLSL translator + GPU resource-management functions into `metal_glue.mm` (native) / `web_glue.cc` (web), still exposing a flat C interface via `extern "C"` |
-| Prerequisite classes | `Matrix3D`/`Vector3D` are pure AS3 logic classes, going through the existing `symbols.ts` builtin modeling, not touching the GPU |
-| Build manifest | No new third-party library needed — Metal (a macOS system framework) and WebGL2 (built into the browser) need no extra `-l`; reuse the existing `metal_glue.mm`'s `-framework Metal -framework QuartzCore` linking |
+| Glue layer | the AGAL→MSL/GLSL/HLSL translator and GPU resource-management functions are **not** in `metal_glue.mm`/`web_glue.cc` but in three self-contained glues (`stage3d_glue.mm` / `stage3d_webgl.cc` / `stage3d_d3d.cc`), still exposing the **same** flat `s3d_*` C interface via `extern "C"` |
+| Prerequisite classes | `Matrix3D`/`Vector3D` are pure AS3 logic classes, going through the existing `symbols.ts` builtin modeling, not touching the GPU (landed in stage seventy-nine) |
+| Build manifest | macOS needs no new third-party library (Metal/Foundation are system frameworks, reusing the existing linking); web reuses Ganesh's WebGL2; Windows pushes `stage3d_d3d.cc` and links `d3d12`/`dxgi`/`d3dcompiler` |
 
 > **Metal headers and frameworks**: `metal_glue.mm` already exists from stage seventy-five (the native Metal
 > rendering backend), and the creation of `MTLDevice`/`MTLCommandQueue` and the Ganesh integration of
@@ -141,43 +176,47 @@ through thirty-eight, doing only an **incremental extension** without introducin
 > triangle pipeline wants direct `MTLBuffer` + `MTLRenderPipelineDescriptor`; the two coexist on the same
 > `MTLDevice`, submitted via the same `MTLCommandQueue`, and finally share one drawable for presentation.
 
-> **Landing status (native = stages eighty-two~eighty-three, web = stage eighty-nine / thirty)**: it was not put
-> into `metal_glue.mm`/`web_glue.cc`, but into separate self-contained glue files each exposing the **same flat
-> `s3d_*` C signatures**:
+> **Landing status (native macOS = stages eighty-two~eighty-three, web = stage eighty-nine / thirty, Windows =
+> stages one-hundred-thirty-one~one-hundred-thirty-two)**: it was not put into `metal_glue.mm`/`web_glue.cc`, but
+> into **three** separate self-contained glue files each exposing the **same flat `s3d_*` C signatures**:
 >
 > | Target | File | Shader | Build switch |
 > |---|---|---|---|
-> | native (macOS) | `vendor/stage3d_glue.mm` | raw Metal, AGAL→MSL | `ASC_RENDER_STAGE3D=1` |
+> | native (macOS) | `vendor/stage3d_glue.mm` | raw Metal, AGAL→MSL | `ASC_RENDER_STAGE3D=1` (plus `ASC_RENDER_METAL` for the window layer) |
+> | native (Windows) | `vendor/stage3d_d3d.cc` | Direct3D 12, AGAL→HLSL | `ASC_RENDER_STAGE3D=1` + `ASC_S3D_HLSL=1`, links `d3d12`/`dxgi`/`d3dcompiler` |
 > | web | `vendor/stage3d_webgl.cc` | WebGL2/GLES3, AGAL→GLSL ES | `ASC_RENDER_STAGE3D=1` + `ASC_S3D_GLSL=1` (plus `ASC_RENDER_DEPTH_STENCIL=1` when `<depthAndStencil>` is present) |
 >
 > Therefore the `Context3D` state machine, the `as_s3d_*` wrappers, and the AGAL translator call sites in the
-> generated C are **completely identical on both ends**, and the shader language is chosen only by the build-time
-> `ASC_AGAL_TARGET`. The web side's GL↔AS3 semantic differences (Y-axis flip, BGRA swap, per-register uniform,
-> FBO/stencil, CPU-readback presentation and its cost) are in [`html5-web.md`](html5-web.md) §3.3.
-> Whether to mount a backend is auto-determined by `src/air-app.ts`'s `detectStage3D(files)` scanning the source
-> (applicable to both native and web).
+> generated C are **completely identical on all three ends**, and the shader language is chosen only by the
+> build-time `ASC_AGAL_TARGET`. The web side's GL↔AS3 semantic differences (Y-axis flip, BGRA swap, per-register
+> uniform, FBO/stencil, CPU-readback presentation and its cost) are in [`html5-web.md`](html5-web.md) §3.3; the
+> Windows side's submission model/PSO cache/field-order rule/composite borrowing are in §10 of this document and
+> [`win32.md`](win32.md) §3.4. Whether to mount a backend is auto-determined by `src/air-app.ts`'s
+> `detectStage3D(files)` scanning the source (applicable to all three ends; the backend is then chosen by OS).
 
 ---
 
-## 6. Recommended Phased Roadmap (matching the existing "stage XX" convention)
+## 6. Phased Roadmap (inception proposal → all landed)
 
-| Stage | Goal |
-|---|---|
-| **A prerequisite** | `Matrix3D` + `Vector3D` + completing `Vector.<Number/uint/float>` (pure logic, low risk) |
-| **B AGAL kernel** | AGAL bytecode parser (AGAL1/2/3) + validator + →MSL/GLSL translator (**the hardest step**, a stage of its own) |
-| **C Context3D skeleton** | `Stage3D` + `Context3D` state machine + `VertexBuffer3D`/`IndexBuffer3D`/`Program3D`/`Texture`(BGRA/RGBA) + `drawTriangles`, `enableErrorChecking=false` taking the async path |
-| **D end-to-end** | Land the raw Metal pipeline, get a "colored triangle" demo running, then roll out blend/depth/stencil/cull/scissor/render-to-texture |
-| **E alignment hardening** | `drawToBitmapData`, `setRenderToTexture`, CubeTexture/RectangleTexture, AGAL2/3 GPU-side end-to-end on-screen (MRT render pass / instancing) |
+| Stage | Goal | Landing |
+|---|---|---|
+| **A prerequisite** | `Matrix3D` + `Vector3D` + completing `Vector.<Number/uint/float>` (pure logic, low risk) | ✅ stage seventy-nine |
+| **B AGAL kernel** | AGAL bytecode parser (AGAL1/2/3) + validator + →MSL/GLSL translator (**the hardest step**, a stage of its own) | ✅ stage eighty (one target); stage one-hundred-thirty-one added the HLSL target |
+| **C Context3D skeleton** | `Stage3D` + `Context3D` state machine + `VertexBuffer3D`/`IndexBuffer3D`/`Program3D`/`Texture`(BGRA/RGBA) + `drawTriangles`, `enableErrorChecking=false` taking the async path | ✅ stage eighty-one; stage eighty-seven added the Starling prerequisite methods |
+| **D end-to-end** | Land the raw Metal pipeline, get a "colored triangle" demo running, then roll out blend/depth/stencil/cull/scissor/render-to-texture | ✅ stages eighty-two~eighty-three (plus stage one-hundred-four per-frame batching, one-hundred-fifteen frame-boundary commit-only) |
+| **E alignment hardening** | `drawToBitmapData`, `setRenderToTexture`, CubeTexture/RectangleTexture, AGAL2/3 GPU-side end-to-end on-screen (MRT render pass / instancing) | ✅ stage eighty-three "instancing" on-screen; ⚠️ **MRT/`od`/`iid` complete only in HLSL** (see §3 and the `TODO.md` leftover table) |
 
-**The kernel translator supports all three AGAL1/2/3 generations; the initial `Context3D.profile` converges to
-baseline (AGAL1 capability + uncompressed 2D/cube textures + no instancing/MRT)** — which exactly covers Stage3D's
-largest real consumer, **Starling** (a 2D-on-GPU framework).
+**The kernel translator supports all three AGAL1/2/3 generations; `Context3D.profile` still reports a fixed
+`"baseline"`** (`Context3D_get_profile` always returns `"baseline"`: AGAL1 capability + uncompressed 2D/cube
+textures) — which exactly covers Stage3D's largest real consumer, **Starling** (a 2D-on-GPU framework).
 
 ### 6.1 Final Acceptance Demo: `examples/shmup-stage3d`
 
-> This demo is the **final end-to-end acceptance target** of stages seventy-nine through eighty-three — once
-> everything lands, this project should compile it from `.as` into a native executable and produce a picture
-> identical to `mxmlc + adl`.
+> This demo is the **final end-to-end acceptance target** of stages seventy-nine through eighty-three, and
+> **stage eighty-four got it running** — this project compiled it from `.as` into a native executable and produced
+> the correct picture. Three larger real projects serve as **generality cross-checks**:
+> `examples/away3d-core/Basic_SkyBox.as` (§9), `examples/air-starling-demo` (127 source files + full Starling, all
+> 12 web scenes correct), and `examples/Flappy-Starling`.
 
 **Source and structure**: Christer Kaitila's "Stage3D Shoot-em-up Tutorial" (a tutsplus tutorial; a batched
 sprite engine predating Starling). Roughly 1806 lines of AS3:
@@ -211,39 +250,47 @@ sprite engine predating Starling). Roughly 1806 lines of AS3:
 - This demo's shaders are **AGAL1** (`assemble` called without a `version` argument), **falling exactly within
   the baseline convergence range** — once stage seventy-nine (`Matrix3D`/`Vector3D`) + eighty (AGAL kernel,
   covering AGAL1 instructions) + eighty-one (`Context3D` state machine) + eighty-two (Metal end-to-end) are all
-  done, it can be compiled and run, without waiting for stage eighty-three's MRT/instancing.
+  done, it can be compiled and run, without waiting for stage eighty-three's MRT/instancing (which is exactly how
+  it went: stage eighty-four got it running).
 - It **does not depend on** AGAL2/3 features (no `ife`/`ddx`/MRT/`iid`), making it a precise probe of "is
-  baseline closed"; stage eighty-three's (AGAL2/3 on-screen) acceptance is covered separately by a dedicated demo.
+  baseline closed"; stage eighty-three's AGAL2/3 capability (`drawTrianglesInstanced` instancing,
+  `setProgramConstantsFromVector`) is covered separately by `examples/stage83.as`, and the cross-target
+  differences in MRT/`od`/`iid` are in §3.
 - `build-and-run.sh` compiles and runs with `mxmlc -swf-version=13` + `adl` (`renderMode=direct`), consistent with
   AGENTS.md §2.4's convention "use `mxmlc` as the reference compiler and cross-validate on the same `.as`" —
   when this project compiles it, that script's produced picture/behavior is the baseline comparison.
 
 ---
 
-## 7. Risks and the Boundary of "Explicitly Not Recommended for Alignment"
+## 7. Risks and Landing Boundaries
 
 | Item | Judgment |
 |---|---|
-| `VideoTexture` | ❌ depends on `NetStream`/`Camera` (video decoding), **excluded**, returns null |
+| `VideoTexture` | ⚠️ **no decoder, but the class and object are complete**: `Context3D.createVideoTexture()` returns an empty `VideoTexture` (`videoWidth`/`videoHeight` constantly 0), `Context3D.supportsVideoTexture` is the constant `true`, and `attachCamera`/`attachNetStream` are **empty implementations** — the object exists so Starling's `ConcreteVideoTexture` can hold/attach a base; it draws nothing wrong, it just produces no video pixels |
 | Compressed textures (ATF/DXT/PVRTC) | ⚠️ **partial** (stage eighty-nine / twenty-one): the ATF container's `format 3/5` (raw DXT1/DXT5) is implemented — at runtime `as_atf_decode_dxt` decodes to straight-alpha ARGB on the CPU and takes the ordinary texture-upload path (no premultiply, consistent with adl handing raw DXT5 to the GPU; mip 1+ is not decoded, only level 0 taken); ETC1/PVRTC, cubemap, and `format 0xc/0xd` (JPEG-XR lossy) still **error loudly** (`Error #3680`), not silently producing an empty image |
-| Precise reporting of `driverInfo`/`totalGPUMemory`/`profile` | `driverInfo` now reports by "context-level backend": linked with `stage3d_glue.mm` (`ASC_RENDER_STAGE3D`) gives `"Metal (Stage3D)"`, otherwise `"Software (state machine)"` (**not** looking at `ASC_RENDER_METAL`, which denotes only the window-compositing backend); `profile` is fixed to `"baseline"`; `totalGPUMemory` is implemented but is an **approximation** (stage eighty-nine / twenty-one: the back-buffer BGRA8 byte count plus the D32S8 byte count when depth-stencil is present) — it must exist because Starling's `StatsDisplay.supportsGpuMem` probes with `"totalGPUMemory" in context` and adds/removes a whole HUD row accordingly |
-| Synchronous throw on `enableErrorChecking=true` | optional; do only the `false` async path first |
-| AGAL2/AGAL3 GPU-side end-to-end on-screen (MRT/instancing) | translation is covered in the kernel stage (stage eighty); the Metal-side MRT `[[color(i)]]` and AGAL3 `iid` → `[[instance_id]]` on-screen are deferred to stage eighty-three |
+| Precise reporting of `driverInfo`/`totalGPUMemory`/`profile` | `driverInfo` reports four cases by **build-time backend macro**: `ASC_S3D_GLSL` → `"WebGL2 (Stage3D)"`, `ASC_S3D_HLSL` → `"Direct3D12 (Stage3D)"`, `ASC_RENDER_STAGE3D` → `"Metal (Stage3D)"`, otherwise `"Software (state machine)"`; the probe is `ASC_RENDER_STAGE3D` (**not** `ASC_RENDER_WINGPU`/`ASC_RENDER_METAL`, which denote only the window-compositing backend, see the comment on that function in `emit.ts`). `profile` is fixed to `"baseline"`; `totalGPUMemory` is implemented but is an **approximation** (stage eighty-nine / twenty-one: the back-buffer BGRA8 byte count plus the D32S8 byte count when depth-stencil is present) — it must exist because Starling's `StatsDisplay.supportsGpuMem` probes with `"totalGPUMemory" in context` and adds/removes a whole HUD row accordingly. The D3D12 string has no adl measurement yet (adl has no usable D3D backend), so it is an **honest placeholder**, filed in the leftover table |
+| Synchronous throw on `enableErrorChecking=true` | **not implemented**: `Context3D.enableErrorChecking`'s setter is currently a no-op, so `true` does not produce AIR's synchronous validation throw (our draws batch-submit and retire once at the frame boundary, so there is no synchronous throw point anyway). Does not affect Starling/Away3D |
+| AGAL2/AGAL3 GPU-side end-to-end on-screen (MRT/instancing) | **instancing is on-screen** (stage eighty-three: `drawTrianglesInstanced` → `instanceCount` on all three backends) and AGAL2 control flow/derivatives are translated on all three. **What is not closed are three cross-target differences**: fragment **MRT** (`oc1..oc3`) and **`od`**, plus the AGAL3 **`iid`** register, are currently complete only in the **HLSL target**; MSL/GLSL fold to a single output / MSL `od` is undeclared / `iid` becomes an undeclared `r<num>` (see the note at the end of §3; filed in `TODO.md`'s leftover table) |
 
 ---
 
 ## 8. Workload and Conclusion
 
-- **Workload**: this is "small GPU runtime" scale, roughly estimated at the same magnitude as the entire existing
-  "stages thirty-three through forty (events + display list + rendering + window)" block; the AGAL translator +
-  validator is about 40%, the `Context3D` state machine and Metal/WebGL resource management 40%, and the
-  prerequisite classes plus end-to-end regression 20%.
+- **Workload**: this is "small GPU runtime" scale, about the same magnitude as the entire existing "stages
+  thirty-three through forty (events + display list + rendering + window)" block; the AGAL translator + validator
+  is about 40%, the `Context3D` state machine and GPU resource management 40%, and the prerequisite classes plus
+  end-to-end regression 20%. **Checked after the fact: the magnitude estimate was accurate** — it actually
+  spanned stages seventy-nine~eighty-five, eighty-seven, one-hundred-four, one-hundred-twelve~one-hundred-seventeen,
+  one-hundred-twenty-eight, and one-hundred-thirty-one~one-hundred-thirty-two.
 - **Feasibility**: ✅ technically fully feasible, with no insurmountable obstacle; AGAL translation has mature
-  references (Ruffle/open-source AGAL→GLSL), the raw Metal/WebGL pipeline is a standard capability, and the
-  project already has a Metal/WebGL2/GPU presentation foundation to reuse.
-- **The only thing to decide**: whether it is worth the investment — because the project already has a complete
-  2D GPU rendering chain, and Stage3D's incremental value lies only in "running third-party engines built on
-  Stage3D such as Starling/Away3D", not in drawing ordinary UI.
+  references (Ruffle/open-source AGAL→GLSL), the raw Metal/WebGL2/D3D12 pipeline is a standard capability, and
+  the project's existing GPU presentation foundation was indeed reused.
+- **Decision and conclusion**: **we decided to invest, and delivered** — the only inception question was "is it
+  worth the investment" (the project already has a complete 2D GPU rendering chain, and Stage3D's incremental
+  value lies only in "running third-party engines built on Stage3D such as Starling/Away3D", not in drawing
+  ordinary UI). The answer is **yes**: this project can now compile and run real Stage3D projects from `.as` on
+  **macOS (Metal), Windows (D3D12), and the web (WebGL2)** (`shmup-stage3d`, away3d `Basic_SkyBox`,
+  `air-starling-demo`, `Flappy-Starling`).
 
 ---
 

@@ -39,11 +39,14 @@ check(btn is SimpleButton, "the exported button must be a SimpleButton");
 // SimpleButton 在 AIR 里 extends InteractiveObject（**不是** DisplayObjectContainer），
 // 所以它没有 numChildren——不要照 Sprite 断言。
 
-// ---- ③ 按钮几何命中（AIR 口径：按 hit 态的几何，而非交互性）----
-// upvpage 的可见画面实测约 200x20 逻辑像素，位于自身 (4,-4)-(196,16)。
-var hit:Boolean = btn.hitTestPoint(btn.x + 100, btn.y + 6, true);
-check(hit, "hitTestPoint must hit the button's hit state (geometric, not interactive)");
+// ---- ③ 按钮命中（AIR 口径：按**自身**的形状/包围盒，不用 hitTestState）----
+// SimpleButton 没有自己的 shape（四态是独立 DisplayObject），所以 shapeFlag=true 恒 false
+// ——adl 51.4.1 实测（temp/sbtnstate2）：即便 hitTestState 是 60x60 实心块、按钮已在显示列表上，
+// 仍为 false。hitTestState 只是**事件输入**的命中区（hover 由 as_sbtn_contains 走它）。
+// shapeFlag=false 则仍按按钮自身包围盒（= up 态）：upvpage 画面约 200x20。
+check(!btn.hitTestPoint(btn.x + 100, btn.y + 6, true), "shapeFlag=true on a SimpleButton is always false (no own shape)");
 check(!btn.hitTestPoint(btn.x + 4000, btn.y + 4000, true), "hitTestPoint must miss far away");
+check(btn.hitTestPoint(btn.x + 100, btn.y + 6, false), "shapeFlag=false tests the button's own (up-state) bounds");
 
 // ---- ④ 九宫格只由 SWF tag 烘焙而来（AS3 侧无 scale9Grid 属性，见 TODO.md 遗留表）----
 // 这里只能断言缩放不改变对象树结构；拉伸效果本身在 temp/swc-render（swc.md §9.2 F1）里与 adl 对照。

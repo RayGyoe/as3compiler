@@ -181,4 +181,9 @@ export type Expr =
 export interface Program {
   body: Stmt[];
   imports: string[];
+  // `[SWF(frameRate = N)]` from the document class (阶段一百四十八): AIR's stage
+  // defaults to 24 fps and this metadata overrides it. Only the FRAME RATE is
+  // surfaced -- width/height/backgroundColor still configure the .swf container and
+  // are irrelevant to an AOT build (whose window comes from the descriptor).
+  swfFrameRate?: number;
 }

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- adl 描述符：真值裁判侧（docs/zh-cn/flash-text.md §5）。
+     窗口不可见——探针只看数值（textWidth/textHeight/numLines/getLineMetrics），
+     不需要真窗口；这样 adl 也不会弹窗打断。 -->
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+    <id>textfieldprobe</id>
+    <versionNumber>0.0.1</versionNumber>
+    <filename>textfieldprobe</filename>
+    <initialWindow>
+        <content>Main.swf</content>
+        <visible>false</visible>
+        <width>400</width>
+        <height>400</height>
+    </initialWindow>
+</application>

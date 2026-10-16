@@ -317,6 +317,17 @@ function checkCodegenDiagnostics(): string[] {
   rmSync(tmpDir, { recursive: true, force: true });
 
   // Every codegen diagnostic in this file is locatable.
+  // 阶段一百四十八: StyleSheet is a real class now (setStyle/getStyle/clear/
+  // styleNames), but two AIR members are deliberately left out -- see the 遗留表
+  // row. They must fail LOUDLY rather than silently accept a stylesheet AIR would
+  // have parsed, so the shape of the diagnostic is pinned here.
+  const ss1 = gen('var s:StyleSheet = new StyleSheet();\ns.parseCSS(".x{}");');
+  check('StyleSheet.parseCSS is not implemented yet, and says so',
+    ss1?.message === "Codegen error at 2:1: undefined method 'parseCSS' on class 'StyleSheet'");
+  const ss2 = gen('var s:StyleSheet = new StyleSheet();\nvar f:TextFormat = s.transform({});');
+  check('StyleSheet.transform is not implemented yet, and says so',
+    ss2?.message === "Codegen error at 2:1: undefined method 'transform' on class 'StyleSheet'");
+
   const all = [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g12, g13, gi2, gi3, gi4, t1, t2, t3, t4, t5, t6, t7, t8, t9, i1, i2];
   check('every CodegenError carries a numeric line and col',
     all.every((e) => e !== null && typeof e.line === 'number' && typeof e.col === 'number')

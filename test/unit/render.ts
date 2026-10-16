@@ -16,6 +16,8 @@ import { parse } from '../../src/parser.ts';
 import { extractSwc, swcCompileInputs, swcBakePlan } from '../../src/swc.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import type { SwcLibrary } from '../../src/swc.ts';
+import { deflateSync } from 'node:zlib';
 
 // ---- E1: the opt-in SVG decode channel (+ the GC red line it exposed) ----
 //
@@ -281,19 +283,37 @@ function checkBakeResolution(): string[] {
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
   const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
 
-  // (1) The bake surface follows the destination canvas, bounded by two guards.
-  check('the bake scale comes from the destination canvas total scale',
-    emitted.includes('static double as_bake_scale(void* canvas, int lw, int lh) {') &&
+  // (1) The bake surface follows the destination canvas -- but PER AXIS, and it is
+  // blitted back 1:1 in device pixels. A single shared scale (max of the two axes)
+  // is what the TalkMED account page exposed: whenever the destination scaled x and
+  // y differently, the blit rect stayed logical-sized while the surface had been
+  // sized with the max, so the whole image was re-scaled by ctx/sc -- an error that
+  // grows with the distance from the bake origin (left edge still, right edge
+  // drifting) and compounds through nested bakes (measured: the caret in the
+  // account field jumped ~2 px). s * lw must therefore equal the surface width in
+  // device pixels.
+  check('the bake scale is per axis with one shared degrade factor',
+    emitted.includes('static void as_bake_scale2(void* canvas, int lw, int lh, double* sx, double* sy) {') &&
     emitted.includes('as_skia_canvas_total_scale(canvas, &dt_x, &dt_y);') &&
-    emitted.includes('double s = dt_x > dt_y ? dt_x : dt_y;') &&
-    (emitted.match(/double sc = as_bake_scale\(canvas, /g) ?? []).length === 2 &&
+    emitted.includes('double f = 1.0;') &&
+    emitted.includes('*sx = dt_x * f; *sy = dt_y * f;') &&
+    (emitted.match(/as_bake_scale2\(canvas, /g) ?? []).length === 1 &&
     !emitted.includes('double sc = ASC_render_scale;'));
+  check('the bake blits back 1:1 in device pixels',
+    emitted.includes('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bl, bt, (double)pw / sx, (double)ph / sy);') &&
+    emitted.includes('as_skia_canvas_scale(c2, sx, sy);') &&
+    // as_bake_scale (max-of-axes) survives for the ONLY caller whose rect is
+    // computed in logical units by itself: the 9-slice path.
+    (emitted.match(/double sc = as_bake_scale\(canvas, /g) ?? []).length === 1);
   check('the bake scale is capped in ratio and in pixels',
     emitted.includes('#define AS_BAKE_MAX_PIXELS 4000000.0') &&
-    emitted.includes('double cap = 4.0 * ASC_render_scale; if (cap < 1.0) cap = 1.0;') &&
+    (emitted.match(/double cap = 4\.0 \* ASC_render_scale; if \(cap < 1\.0\) cap = 1\.0;/g) ?? []).length === 2 &&
     emitted.includes('if (s > cap) s = cap;') &&
+    emitted.includes('if (s > area) s = area;') &&
+    emitted.includes('if (dt_x > cap) f = cap / dt_x;') &&
+    emitted.includes('if (dt_y * f > cap) f = cap / dt_y;') &&
     emitted.includes('double area = sqrt(AS_BAKE_MAX_PIXELS / ((double)lw * (double)lh));') &&
-    emitted.includes('if (s > area) s = area;'));
+    emitted.includes('if (area > AS_BAKE_MAX_PIXELS) f *= sqrt(AS_BAKE_MAX_PIXELS / area);'));
 
   // (2) BitmapData.draw rasterizes a DisplayObject source at the matrix's scale
   // and reads the raster back 1:1 (source coords are multiplied by that scale).
@@ -518,6 +538,17 @@ function checkSwcTimeline(): string[] {
     c.includes('FrameLabel_new((char*)as_swc_tl_labelat(o->_tl_char, i), as_swc_tl_frameat(o->_tl_char, i))'));
   check('isPlaying is the property (the old public `playing` field is gone)',
     c.includes('bool MovieClip_get_isPlaying(void* _this)') && c.includes('o->_playing = false;'));
+  // A SWF outline has no close verb, so the Graphics path our shape builders emit is
+  // OPEN. Skia fills an open contour implicitly but its AA clipper drops it, so a
+  // clipDepth mask built straight from that path clipped the whole region away (the
+  // TalkMED login banner painted blank). Every contour must be closed first.
+  check('a clipDepth mask path closes every contour before becoming a clip',
+    c.includes('static void* as_swc_clip_path_new(void* src, double a, double b, double c, double d, double tx, double ty) {') &&
+    /void\* p = as_skia_path_new\(\);\s*as_skia_path_add_transformed\(p, src, a, b, c, d, tx, ty\);\s*as_skia_path_close_all\(p\);/.test(c));
+  // A clipDepth mask is a SIBLING of what it clips, so it must not travel with it:
+  // the clip is set before the object's translate/rotate/scale (parent space).
+  check('the clipDepth clip is applied BEFORE the object transform',
+    /as_skia_canvas_save\(canvas\);\s*int clip_on = \(o->_clip_path != NULL\);\s*if \(clip_on\) as_skia_canvas_clip_path\(canvas, o->_clip_path, 1\);\s*if \(o->alpha < 1\.0\) as_skia_canvas_save_layer_alpha\(canvas, o->alpha\);\s*as_skia_canvas_translate\(canvas, o->x, o->y\);/.test(c));
   // The MovieClip runtime calls as_swc_bind long before the bake defines it, and a
   // build with NO swc has no bake to define it: the stub is what keeps it linking.
   const plain = generateC(parse('import flash.display.MovieClip;\nvar m:MovieClip = new MovieClip();\nm.gotoAndStop(2);\n')).c;
@@ -533,7 +564,271 @@ function checkSwcTimeline(): string[] {
     (noTl.match(/void as_swc_bind\(DisplayObject\* o, int charId\) \{/g) ?? []).length === 1 &&
     noTl.includes('static void as_swc_tl_apply(int charId, DisplayObject* o, int frame) { (void)charId; (void)o; (void)frame; }'));
 
+  // ---- SWC 符号级 DoABC 帧脚本（D17）----
+  // 协议勾选框 `agreebtn`（char#84 = skin_fla.元件172_339）的勾选态**不在 AS3 代码里**，
+  // 而在符号自己的时间轴脚本（DoABC）里：`this.stop(); this.buttonMode = true;
+  // addEventListener(CLICK, function(){ _self.gotoAndStop(_self.currentFrame < 3 ? 3 : 2) })`。
+  // 编译器在**编译期**把这些字节码解成 AST、复用现有发射器（`src/abc.ts` 新模块）。
+  // 一个反向改动会让"点一下变绿勾"默默回到"点了没反应"，这里就钉住发射出的 C：
+  //   · 帧脚本函数体真的被翻译出来（stop + buttonMode + CLICK 监听，且 `_self` 经闭包 cell 捕获）；
+  //   · 闭包里那个三元 `gotoAndStop` 没被丢掉（丢了就永远只有第 1 帧）；
+  //   · 只有一帧但带脚本的符号也要 `as_swc_tl_start`，否则 `currentFrame` 没有意义；
+  //   · `as_swc_frames` 按 charId/frame 两级 switch 分发，且 `gotoAndStop` 是第二个入口。
+  check('the DoABC frame script of the agree checkbox is decoded and translated',
+    c.includes('static as_value skin_fla__u5143_u4ef6172_339_frame1(void* _this) {') &&
+    /->_self = as_v_obj\(\(void\*\)\(this\)\);\s*\(this->vtable->stop\(this\)\);\s*\(\(this->buttonMode\) = true\);\s*as_fn _once\d+ = as_fn_make\(_fn\d+__call, _fn\d+_env_make\(/.test(c) &&
+    c.includes('addEventListener(this, MouseEvent_CLICK, _once'));
+  check('the CLICK handler\'s ternary gotoAndStop survives translation',
+    /as_any_get\(as_req_box\(env->\w+->_self\), "currentFrame"\)\) < \(\(double\)\(3\)\)\) \? 3 : 2\);/.test(c) &&
+    /as_any_call\(env->\w+->_self, "gotoAndStop",/.test(c));
+  check('a one-frame symbol with a script still starts its timeline and runs frame 1',
+    /as_swc_bind\(\(DisplayObject\*\)o, 84\);\s*as_swc_tl_start\(\(MovieClip\*\)o, 84\);\s*as_swc_frames\(84, 1, \(DisplayObject\*\)o\);/.test(c));
+  check('as_swc_frames dispatches per character and per frame; gotoAndStop is the 2nd entry',
+    c.includes('static void as_swc_frames(int charId, int frame, DisplayObject* o) {') &&
+    c.includes('case 1: audio_volume_frame1((void*)o); break;') &&
+    c.includes('case 12: audio_volume_frame12((void*)o); break;') &&
+    c.includes('as_swc_frames(o->_tl_char, f, (DisplayObject*)o);'));
+  // 勾选框的描边色来自 LINESTYLE 的 rgba：#00948C（而不是 fillStyle，也不是默认黑）——
+  // shape#83（那个对勾）是**只有描边**的字符，取错色就变成黑勾。
+  check('a stroke-only SWC shape takes its colour from the LINESTYLE rgba',
+    c.includes('as_swc_stroke(g, as_swc_paint_solid(0xff00948cu), 2.0, 0, 0, 3.0);') &&
+    c.includes('as_swc_move_to(g, 15.0, 6.6);'));
+
+  // ---- D43：回退到旧帧时子件必须**复用**（而不是重建第 1 帧）----
+  // AIR 实测（temp/btnprobe/Rewind2.as）：从 _over(5) 退回 _up(1) 时 label1/label2 仍是同一批对象
+  // （#1/#2 不变）且 App 写进去的文字保留；只有「目标帧的（深度, 角色）与当前不同」的深度上才换新对象。
+  // 旧实现是 `as_swc_tl_clear + as_swc_bind`，会把第 1 帧全部子件重建一遍——于是 TalkMED 首页卡片
+  // 悬停一次就把 App 写的「快速入会 / Join creating」换回皮肤原稿（D43，阶段一百七十二）。
+  // 这里钉住四件事：快照表、按 (父, 深度, 角色) 复用、回退路径改走 rewind、以及“角色来源”字段在基类上。
+  check('the rewind snapshots the frame-1 children (parent-scoped, GC-rooted slots)',
+    c.includes('static as_array* ASC_tl_snap_par = NULL;') &&
+    c.includes('static as_array* ASC_tl_snap_obj = NULL;') &&
+    c.includes('gc_root_register((void**)&ASC_tl_snap_par); gc_root_register((void**)&ASC_tl_snap_obj);'));
+  check('a rewind reuses a child only when (parent, depth, character) still match',
+    c.includes('static DisplayObject* as_swc_tl_reuse(DisplayObject* parent, int depth, int charId) {') &&
+    /DisplayObject\* as_swc_tl_reuse\(DisplayObject\* parent, int depth, int charId\) \{[^}]*as_v_obj_val\(ASC_tl_snap_par->data\[i\]\) != parent[^}]*c->_tl_depth == depth && c->_tl_char == charId/.test(c));
+  check('the backtrack branch calls as_swc_tl_rewind instead of clear + rebind',
+    c.includes('if (f <= 1 || f < o->currentFrame) as_swc_tl_rewind(o->_tl_char, (DisplayObject*)o, f);') &&
+    !c.includes('as_swc_tl_clear('));
+  check('every baked child knows its SWC character (the field lives on DisplayObject)',
+    readFileSync(join(root, 'src', 'symbols.ts'), 'utf8')
+      .includes("['_tl_char', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'DisplayObject'"));
+  check('as_swc_new stamps the character id so a rewind can compare it',
+    c.includes('DisplayObject* o = as_swc_new_char(charId);') &&
+    c.includes('o->_tl_char = charId;'));
+  check('frame-1 timeline children are built through as_swc_tl_new/as_swc_tl_link (depth recorded)',
+    /as_swc_tl_link\(o, c\d+, \d+\);/.test(c) && /as_swc_tl_new\(o, \d+, \d+\)/.test(c));
+  check('the rewind prunes leftovers by pointer identity, not by depth',
+    c.includes('static void as_swc_tl_unlink(DisplayObject* parentD, DisplayObject* c) {') &&
+    c.includes('if (c != NULL) as_swc_tl_unlink(o, c);'));
+
   if (ok > 0) console.log(`[swctimeline] ${ok} timeline-bake checks passed`);
+  return bad;
+}
+
+// ---- SWC DefineBitsJPEG3 alpha plane (diff doc D25) ----
+//
+// A `DefineBitsJPEG3` tag stores its picture TWICE: an ordinary JPEG for RGB (no
+// alpha channel exists in JPEG) plus a zlib-compressed 8-bit coverage plane. AIR
+// composites the two; an FLA export fills the "transparent" area of the JPEG with
+// BLACK, so a bitmap whose plane is dropped paints a black rectangle over the skin
+// (measured on the TalkMED home cards #1113/#1118: the artwork's corners are
+// exactly `(0,0,0)` in the extracted JPEG and `0` in the plane).
+//
+// The composition happens at RUNTIME (Skia decodes the JPEG there; the Node side
+// has no JPEG decoder and must not gain one, AGENTS.md §3.1), so two things can
+// silently regress and both are pinned here:
+//   · the compile-time decode — decompress the plane and refuse to use a stream
+//     that does not inflate to `width * height` (garbage coverage is worse than
+//     none: it must be reported and the image left opaque, never composed);
+//   · the emitted wiring — the plane's own C array, `as_argb_apply_alpha` and the
+//     alpha-aware adopt/`as_swc_image` calls. A bitmap WITHOUT a plane must keep
+//     the old `BitmapData_adoptEncoded` / `as_skia_image_from_bytes` path, or its
+//     lazy Skia decode is silently replaced by a full pixel copy.
+function checkSwcJpeg3Alpha(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [swcjpeg3] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [swcjpeg3] ${label}`); }
+  };
+
+  const u16 = (v: number): Buffer => { const b = Buffer.alloc(2); b.writeUInt16LE(v, 0); return b; };
+  const tag = (code: number, payload: Buffer): Buffer => {
+    const head = payload.length < 0x3f ? Buffer.alloc(2) : Buffer.alloc(6);
+    if (payload.length < 0x3f) head.writeUInt16LE((code << 6) | payload.length, 0);
+    else { head.writeUInt16LE((code << 6) | 0x3f, 0); head.writeUInt32LE(payload.length, 2); }
+    return Buffer.concat([head, payload]);
+  };
+  // A JPEG only has to reach `jpegSize`'s SOF0 reader (it never decodes at compile
+  // time): SOI, SOF0 with the 2-byte height/width, then filler.
+  const jpeg = (w: number, h: number): Buffer => {
+    const b = Buffer.alloc(21);
+    b.writeUInt16BE(0xffd8, 0);
+    b.writeUInt16BE(0xffc0, 2);
+    b.writeUInt16BE(17, 4);
+    b[6] = 8; b.writeUInt16BE(h, 7); b.writeUInt16BE(w, 9); b[11] = 3;
+    return b;
+  };
+  const jpeg3 = (id: number, w: number, h: number, plane: Buffer): Buffer => {
+    const jpg = jpeg(w, h);
+    const p = Buffer.alloc(6 + jpg.length + plane.length);
+    p.writeUInt16LE(id, 0);
+    p.writeUInt32LE(jpg.length, 2);
+    jpg.copy(p, 6);
+    plane.copy(p, 6 + jpg.length);
+    return p;
+  };
+  // STORE-method ZIP writer: swc.ts's `unzip` walks the EOCD + central directory
+  // (it does not scan local headers), so a fixture needs both records.
+  const zip = (name: string, data: Buffer): Buffer => {
+    const n = Buffer.from(name, 'utf8');
+    const lh = Buffer.alloc(30 + n.length);
+    lh.writeUInt32LE(0x04034b50, 0);
+    lh.writeUInt16LE(20, 4);
+    lh.writeUInt32LE(data.length, 18);
+    lh.writeUInt32LE(data.length, 22);
+    lh.writeUInt16LE(n.length, 26);
+    n.copy(lh, 30);
+    const ch = Buffer.alloc(46 + n.length);
+    ch.writeUInt32LE(0x02014b50, 0);
+    ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6);
+    ch.writeUInt32LE(data.length, 20);
+    ch.writeUInt32LE(data.length, 24);
+    ch.writeUInt16LE(n.length, 28);
+    n.copy(ch, 46);
+    const cd = ch;
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(1, 8); eocd.writeUInt16LE(1, 10);
+    eocd.writeUInt32LE(cd.length, 12);
+    eocd.writeUInt32LE(lh.length + data.length, 16);
+    return Buffer.concat([lh, data, cd, eocd]);
+  };
+  const swf = (tags: Buffer[]): Buffer => {
+    // RECT with nbits=0 is one zero byte, then frameRate + frameCount (swc.md §4).
+    const stage = Buffer.alloc(5);
+    stage.writeUInt16LE(0x0100, 1);
+    stage.writeUInt16LE(1, 3);
+    const body = Buffer.concat([stage, ...tags, tag(0, Buffer.alloc(0))]);
+    const head = Buffer.alloc(8);
+    head.write('FWS', 0, 'latin1');
+    head[3] = 6;
+    head.writeUInt32LE(8 + body.length, 4);
+    return Buffer.concat([head, body]);
+  };
+
+  const quad = Buffer.from([
+    0, 0, 0, 0,
+    0, 64, 128, 255,
+    0, 255, 128, 64,
+    0, 0, 0, 0,
+  ]);
+  const sym = Buffer.concat([u16(1), u16(1), Buffer.from('probeArt\0', 'latin1')]);
+  const d = join(root, 'temp', 'swcjpeg3');
+  mkdirSync(d, { recursive: true });
+  const fixture = join(d, 'probe.swc');
+  writeFileSync(fixture, zip('library.swf', swf([
+    tag(35, jpeg3(1, 4, 4, deflateSync(quad))),
+    // #2: the plane inflates to only 3 bytes for a 4x4 image -- unreadable.
+    tag(35, jpeg3(2, 4, 4, deflateSync(Buffer.from([1, 2, 3])))),
+    tag(76, sym),
+  ])));
+
+  const lib = extractSwc(fixture);
+  const b1 = lib.bitmaps.find((b) => b.tagId === 1);
+  const b2 = lib.bitmaps.find((b) => b.tagId === 2);
+  check('the JPEG3 alpha plane is decompressed to one byte per pixel',
+    b1?.alpha !== null && b1?.alpha?.length === 16 && b1?.width === 4 && b1?.height === 4);
+  check('the plane keeps the coverage values (corners transparent, centre opaque)',
+    b1?.alpha?.[0] === 0 && b1?.alpha?.[15] === 0 && b1?.alpha?.[7] === 255 && b1?.alpha?.[5] === 64);
+  check('the JPEG half is embedded verbatim and sniffs as jpeg',
+    b1?.format === 'jpeg' && b1?.encoded.length === 21 && b1?.encoded[0] === 0xff);
+  check('a plane that does not inflate to width*height is refused, not composed',
+    b2?.alpha === null && b2?.width === 4 && b2?.height === 4);
+  check('a non-empty plane is interned for a NAMED bitmap too (class registry)',
+    lib.classNames.get(1) === 'probeArt' && lib.characters.get(1)?.kind === 'bitmap');
+
+  const inputs = swcCompileInputs(lib);
+  const bake = swcBakePlan(lib, inputs.specs, inputs.chars);
+  const prog = parse('var _pad:int = 0;\n');
+  prog.body.push(...inputs.decls);
+  const c = generateC(prog, [], inputs.specs, bake).c;
+  check('the plane is emitted as its own C array next to the JPEG bytes',
+    c.includes('static const unsigned char __res_probeArt_a[] =') &&
+    c.includes('static const unsigned char __res_probeArt[] ='));
+  check('the alpha composer is one helper shared by both adopt paths',
+    c.includes('static void as_argb_apply_alpha(unsigned* p, int n, const unsigned char* alpha) {') &&
+    c.includes('unsigned a = ((((c >> 24) & 0xffu) * (unsigned)alpha[i]) + 127u) / 255u;') &&
+    c.includes('p[i] = (a << 24) | (c & 0x00ffffffu);'));
+  check('a BitmapData is adopted through the alpha-aware helper with the plane + size',
+    c.includes('BitmapData_adoptEncodedAlpha((BitmapData*)o, __res_probeArt, (size_t)21, __res_probeArt_a, 4, 4);'));
+  check('the composed pixels become the view (the encoded bytes would paint black)',
+    c.includes('if (alpha != NULL) { bd->image = as_skia_image_from_argb(gcpx, w, h); return; }'));
+  check('no plane is still the plain adopt, i.e. the lazy Skia decode is kept',
+    c.includes('static void BitmapData_adoptEncoded(BitmapData* bd, const unsigned char* bytes, size_t len) {') &&
+    c.includes('BitmapData_adoptEncodedAlpha(bd, bytes, len, NULL, 0, 0);'));
+
+  // The fill path is a separate call site (`as_swc_image` builds the shader's
+  // SkImage), and a skin's artwork is mostly bitmap FILLS, not Bitmap children --
+  // the two TalkMED cards are fills, so this is the branch that actually regresses.
+  // Built as a SwcLibrary value: no SWF shape encoding is needed to reach it.
+  const fillLib: SwcLibrary = {
+    source: 'probe',
+    bitmaps: [{ tagId: 7, className: null, format: 'jpeg', width: 4, height: 4, encoded: Buffer.alloc(21), alpha: quad }],
+    shapes: [{
+      id: 9, version: 1, winding: 'evenOdd',
+      bounds: { xmin: 0, xmax: 80, ymin: 0, ymax: 80 },
+      layers: [{ fills: [{ type: 0 }, { type: 0x41, bitmapId: 7, matrix: [1, 0, 0, 1, 0, 0], repeating: false, smoothed: true }], lines: [] }],
+      subpaths: [{
+        layer: 0, fill0: 1, fill1: 0, line: 0, moveToFirst: true,
+        start: { x: 0, y: 0 },
+        pts: [{ x: 0, y: 0 }, { x: 80, y: 0 }, { x: 80, y: 80 }, { x: 0, y: 80 }, { x: 0, y: 0 }],
+      }],
+    }],
+    sprites: [{
+      id: 10, frames: 1, frameStarts: [1], labels: [],
+      placements: [{
+        depth: 1, charId: 9, move: true, name: null, matrix: [1, 0, 0, 1, 0, 0], cxform: null,
+        clipDepth: null, hidden: false, visibleFlag: null, ratio: null, filters: [], skippedFilters: [],
+        blendMode: null, bitmapCached: false,
+      }],
+    }],
+    buttons: [], texts: [], fonts: new Map(), scalingGrids: new Map(),
+    classNames: new Map([[10, 'probeSkin']]),
+    characters: new Map([
+      [7, { id: 7, kind: 'bitmap', tag: 35 }],
+      [9, { id: 9, kind: 'shape', tag: 2 }],
+      [10, { id: 10, kind: 'sprite', tag: 39 }],
+    ]),
+    scripts: new Map(),
+  };
+  const fillInputs = swcCompileInputs(fillLib);
+  const fillBake = swcBakePlan(fillLib, fillInputs.specs, fillInputs.chars);
+  const prog2 = parse('var _pad2:int = 0;\n');
+  prog2.body.push(...fillInputs.decls);
+  const c2 = generateC(prog2, [], fillInputs.specs, fillBake).c;
+  check('a bitmap FILL with a plane goes through the composing SkImage builder',
+    c2.includes('static void* as_swc_image_alpha(const unsigned char* bytes, size_t len, const unsigned char* alpha, int aw, int ah) {') &&
+    /case 7: \{ static void\* img = NULL; if \(img == NULL\) img = as_swc_image_alpha\(__swcbmp_7, \(size_t\)21, __swcbmp_7_a, 4, 4\); return img; \}/.test(c2));
+  check('the fill bitmap gets its own plane array (it is not a named resource)',
+    c2.includes('static const unsigned char __swcbmp_7_a[] ='));
+  // The counterpart: the SAME library with the plane absent must keep the encoded
+  // bytes as the view (Skia decodes lazily) -- and must not emit a plane array or
+  // the composing builder at all.
+  const plainLib: SwcLibrary = { ...fillLib, bitmaps: [{ ...fillLib.bitmaps[0], alpha: null }] };
+  const plainInputs = swcCompileInputs(plainLib);
+  const plainBake = swcBakePlan(plainLib, plainInputs.specs, plainInputs.chars);
+  const prog3 = parse('var _pad3:int = 0;\n');
+  prog3.body.push(...plainInputs.decls);
+  const c3 = generateC(prog3, [], plainInputs.specs, plainBake).c;
+  check('a fill bitmap without a plane keeps the encoded-byte view',
+    /case 7: \{ static void\* img = NULL; if \(img == NULL\) img = as_skia_image_from_bytes\(__swcbmp_7, \(size_t\)21\); return img; \}/.test(c3) &&
+    c3.includes('as_swc_fill(g, as_swc_paint_bitmap(as_swc_image(7), lm, 0, 1));'));
+  check('no plane means no plane array and no fill composer (the fill C stays as it was)',
+    !c3.includes('__swcbmp_7_a') && !c3.includes('as_swc_image_alpha'));
+
+  if (ok > 0) console.log(`[swcjpeg3] ${ok} JPEG3-alpha checks passed`);
   return bad;
 }
 
@@ -690,6 +985,161 @@ function checkSkiaAbi(): string[] {
   return bad;
 }
 
+// ---- D29: the scrollRect window is anchored on the object's own box ----
+//
+// The behavioural oracle is examples/scrollrect-clip.as (measured on adl 51.4.1:
+// `scrollRect = (20,30,100,80)` on a box at (100,50) paints at (100,50)-(199,129)).
+// What a pixel test CANNOT see is the ORDER of the two renderer calls and the pick
+// window, because both mistakes still produce a rectangle on screen:
+//   * clipRect after the translate: Skia maps the clip through the CTM in force at
+//     the call, so the window itself slid to (r.x,r.y,w,h) -- TalkMED's file list
+//     then painted over its fixed header and left a blank band below it;
+//   * as_pick_hit_m testing (sr->x,sr->y,w,h): the top `scrollY` points of a
+//     scrolled list went dead (adl hits the row there -- verified live by scrolling
+//     the adl file list and clicking its first row, which toggled the checkmark).
+// So pin the emitted C's shape, in the spirit of the other source-level pins here.
+function checkScrollRectWindow(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [scrollrect] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [scrollrect] ${label}`); }
+  };
+  const src = [
+    'import flash.display.Sprite;',
+    'import flash.geom.Rectangle;',
+    'var s:Sprite = new Sprite();',
+    "s.scrollRect = new Rectangle(0, 30, 100, 80);",
+    'trace(s.scrollRect.y);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  const start = c.indexOf('int scroll_on = (o->_scroll_rect != NULL);');
+  check('the renderer has a scrollRect branch', start >= 0);
+  const end = start < 0 ? -1 : c.indexOf('if (scroll_on) as_skia_canvas_restore(canvas);', start);
+  const block = start < 0 || end < 0 ? '' : c.slice(start, end);
+  const clip = block.indexOf('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);');
+  const move = block.indexOf('as_skia_canvas_translate(canvas, -o->_scroll_rect->x, -o->_scroll_rect->y);');
+  check('the window is clipped at the object\'s own box (0,0,w,h)', clip >= 0);
+  check('the content is shifted by -x/-y', move >= 0);
+  check('the clip comes FIRST, so the shift cannot move the window (D29)', clip >= 0 && move >= 0 && clip < move);
+  check('the window never uses the rectangle\'s x/y slot as its origin',
+    !block.includes('clip_rect(canvas, o->_scroll_rect->x'));
+
+  const pstart = c.indexOf('static void* as_pick_hit_m(');
+  const pend = pstart < 0 ? -1 : c.indexOf('if (as_is(obj, &DisplayObjectContainer_vt))', pstart);
+  const pick = pstart < 0 || pend < 0 ? '' : c.slice(pstart, pend);
+  check('the pick window tests the object\'s own box',
+    pick.includes('if (lx < 0 || ly < 0 || lx > sr->width || ly > sr->height) return NULL;'));
+  check('...and does not test the read-back rect (that left the top of a scrolled list dead)',
+    !pick.includes('lx < sr->x'));
+
+  console.log(`[scrollrect] ${ok} scrollRect window checks passed`);
+  return bad;
+}
+
+// ---- D34: a scrollRect change must invalidate an ancestor's auto-bake ----
+//
+// The behavioural oracle is examples/autobake-scrollrect.as (its mutation is the
+// reported defect: without the fingerprint entry the example fails with "a
+// scrollRect change must invalidate the ancestor's bake .. 0xff0000, want 0xff00").
+// What a structural pin adds is the INVARIANT that makes the entry necessary:
+// as_render_cached bakes only as_render_object_content, so the scrollRect clip and
+// translate run OUTSIDE the cached image -- which means a baked ancestor freezes
+// the scrolled child unless scrollRect is part of the per-frame subtree fingerprint
+// (as_render_fp). If a future change moves the clip inside the bake, that is fine,
+// but then this rationale (and the pin) must be revisited deliberately rather than
+// silently: TalkMED's home tab row kept painting the frame in which a drag started,
+// so the bounce looked broken even though scrollX went 0 -> 105 -> 0.
+function checkScrollRectBakeInvalidation(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [scrollrectbake] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [scrollrectbake] ${label}`); }
+  };
+  const src = [
+    'import flash.display.Sprite;',
+    'import flash.geom.Rectangle;',
+    'var s:Sprite = new Sprite();',
+    "s.scrollRect = new Rectangle(0, 30, 100, 80);",
+    'trace(s.scrollRect.y);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  const fpStart = c.indexOf('static uint32_t as_render_fp(DisplayObject* o) {');
+  const fpEnd = fpStart < 0 ? -1 : c.indexOf('\nstatic ', fpStart + 10);
+  const fp = fpStart < 0 || fpEnd < 0 ? '' : c.slice(fpStart, fpEnd);
+  check('as_render_fp hashes the scrollRect rectangle', fp.includes('if (o->_scroll_rect != NULL)'));
+  check('...all four fields, so a pure -x/-y scroll moves the hash',
+    ['o->_scroll_rect->x', 'o->_scroll_rect->y', 'o->_scroll_rect->width', 'o->_scroll_rect->height']
+      .every((f) => fp.includes(f)));
+  check('...and it is hashed before the children loop, so ancestors see it',
+    fp.indexOf('o->_scroll_rect') >= 0
+    && fp.indexOf('o->_scroll_rect') < fp.indexOf('as_render_fp((DisplayObject*)as_v_obj_val(c->children->data[i]))'));
+
+  const cacheStart = c.indexOf('static void as_render_cached(void* canvas, DisplayObject* o) {');
+  const cacheEnd = cacheStart < 0 ? -1 : c.indexOf('\nstatic ', cacheStart + 10);
+  const cache = cacheStart < 0 || cacheEnd < 0 ? '' : c.slice(cacheStart, cacheEnd);
+  check('as_render_cached bakes the CONTENT only (clip/translate stay outside the bake)',
+    cache.includes('as_render_object_content(canvas, o)') && !cache.includes('clip_rect(canvas, 0.0, 0.0, o->_scroll_rect'));
+
+  check('a moved fingerprint drops the bake',
+    c.includes('if (o->_auto_baked) { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+
+  console.log(`[scrollrectbake] ${ok} scrollRect bake-invalidation checks passed`);
+  return bad;
+}
+
+// ---- D30: draw() composites SourceOver instead of replacing the destination ----
+//
+// The behavioural oracle is examples/draw-over.as (measured on adl 51.4.1: green
+// destination kept where the source has no coverage, 50% red over opaque blue =
+// 0x7f0080). What a pixel test cannot see is the SHAPE of the sampler, and it is the
+// shape that made this invisible for so long: the loop wrote the source pixel (and
+// wrote 0 where the source had no coverage), which is the same answer whenever the
+// destination is transparent -- i.e. for every bake onto a fresh bitmap, but wrong
+// for a composing draw() onto a pre-filled one. Pin the two writes.
+function checkDrawComposite(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [drawover] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [drawover] ${label}`); }
+  };
+  const src = [
+    'import flash.display.BitmapData;',
+    'import flash.display.Sprite;',
+    'var bd:BitmapData = new BitmapData(8, 8, false, 0x0000FF);',
+    'bd.draw(new Sprite());',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+  const start = c.indexOf('void BitmapData_draw(');
+  const end = start < 0 ? -1 : c.indexOf('void Bitmap_ctor(', start);
+  check('BitmapData.draw is emitted', start >= 0 && end > start);
+  const body = start < 0 || end < 0 ? '' : c.slice(start, end);
+
+  check('the source pixel is combined with the destination, not stored over it',
+    body.includes('as_bd_over(dp, bd->width, dx, dy, sr, sg, sb, sa);'));
+  check('...and the helper really is SourceOver (straight-ARGB un-premultiply)',
+    c.includes('double oa = s + df * ia;') && c.includes('static void as_bd_over('));
+  check('a sampled pixel with no coverage leaves the destination alone',
+    body.includes('if (sa == 0) return;'));
+  check('missing source coverage no longer writes 0 over the destination',
+    !body.includes('dp[dy * bd->width + dx] = 0u;'));
+  check('the sampler never assigns the destination directly any more',
+    !body.includes('dp[dy * bd->width + dx] ='));
+
+  console.log(`[drawover] ${ok} BitmapData.draw composite checks passed`);
+  return bad;
+}
+
+registerGroup('unit: render/DrawComposite', checkDrawComposite);
+registerGroup('unit: render/ScrollRectWindow', checkScrollRectWindow);
+registerGroup('unit: render/ScrollRectBake', checkScrollRectBakeInvalidation);
 registerGroup('unit: render/SvgChannel', checkSvgChannel);
 registerGroup('unit: render/FontMetrics', checkFontMetrics);
 registerGroup('unit: render/TextWrap', checkTextWrap);
@@ -698,5 +1148,6 @@ registerGroup('unit: render/BakeResolution', checkBakeResolution);
 registerGroup('unit: render/ColorPath', checkColorPath);
 registerGroup('unit: render/FilterRaster', checkFilterRaster);
 registerGroup('unit: render/SwcTimeline', checkSwcTimeline);
+registerGroup('unit: render/SwcJpeg3Alpha', checkSwcJpeg3Alpha);
 registerGroup('unit: render/AirAppFonts', checkAirAppFonts);
 registerGroup('unit: render/SkiaAbi', checkSkiaAbi);

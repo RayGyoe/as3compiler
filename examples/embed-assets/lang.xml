@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <label name="hello">世界 HELLO</label>
+  <label name="bye">再见</label>
+</root>

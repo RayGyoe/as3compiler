@@ -675,6 +675,116 @@ function checkEmitE4xListAttrScalar(): string[] {
 }
 registerGroup('unit: e4x/ListAttrScalar', checkEmitE4xListAttrScalar);
 
+// E4X string value + the ByteArray arm of XML(value) (阶段一百四十三). MEASURED on
+// adl 51.4.1 (temp/tkmeet-mac/xmlstr, temp/tkmeet-mac/xmlba):
+//   * XML.toString() is the E4X STRING VALUE, not the markup -- a text node yields
+//     its text, and an element with NO element children yields its text content
+//     ("<a b='1'>txt</a>" -> "txt", "<a b='1'/>" -> ""), while an element WITH
+//     element children yields the markup.
+//   * XMLList.toString() delegates for a ONE-item list ("a") and joins the items'
+//     MARKUP with a newline for several.
+//   * XML(value) accepts a ByteArray and parses its bytes as UTF-8 markup -- the
+//     `[Embed(mimeType="application/octet-stream")]` + `XML(new Cls())` idiom that
+//     Config/Language.as relies on (it used to fail loudly).
+// The rules live in the runtime preamble, the wiring in the emitter, so both halves
+// are pinned here; examples/xml-embed.as covers them end to end.
+function checkEmitE4xStringValue(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [e4xstr] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [e4xstr] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  // as_xml_from_value is emitted by the emitter (not the runtime preamble), so the
+  // ByteArray arm has to be pinned against generated C.
+  const c = generateC(parse('var doc:XML = new XML("<a/>");\ntrace(doc.toString());\n')).c;
+  const count = (hay: string, needle: string): number => hay.split(needle).length - 1;
+  check('XML(byteArray) parses the payload instead of failing loudly',
+    c.includes('if (v.tag == 4 && as_is(as_v_obj_val(v), &ByteArray_vt)) return as_xml_parse_bytes_checked((ByteArray*)as_v_obj_val(v));'));
+  check('the residual loud message names ByteArray too',
+    c.includes('"XML(value) is only supported for String, XML and ByteArray values by this subset"'));
+  // 阶段一百四十七: a String handed to AS3 is a VALUE, so the XML readers copy out
+  // of the node (as_str_dup) instead of lending the node's own buffer. Lending it
+  // left ~1000 Language statics pointing into a parsed tree that then died, and
+  // the freed blocks corrupted the GC free list (SIGSEGV in gc_sweep_step).
+  check('as_xml_string_value copies the node text',
+    pre.includes('if (n->child_count == 0) return as_str_dup(n->text ? n->text : "");'));
+  check('…and the text-node branch copies too',
+    pre.includes('if (!n->name) return as_str_dup(n->text ? n->text : "");'));
+  check('...and falls back to the markup serializer otherwise',
+    pre.includes('return as_xml_to_string(n);'));
+  check('a one-item XMLList delegates to the item string value',
+    pre.includes('if (l->length == 1) return as_xml_string_value(l->items[0]);'));
+  check('a multi-item XMLList joins item markup with a newline',
+    pre.includes('if (i > 0) out = as_str_concat(out, "\\n");'));
+  // Wiring: XML.toString() must lower to the string-value helper (the markup
+  // serializer now serves only the runtime's own recursion / list fallback).
+  check('XML.toString() lowers to as_xml_string_value',
+    count(c, 'as_xml_string_value') > count(pre, 'as_xml_string_value'));
+  // Dynamic-path wiring: a value that travels through an Object/*/Array/dynamic slot
+  // is stringified by the object vtable, not by the emitter, so the vtable's
+  // box_to_str slot must be the E4X string value -- otherwise every label the real
+  // app resolves out of an XML document renders "[object XML]".
+  check('the XML vtable stringifies through as_xml_box_to_str',
+    pre.includes('static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, as_xml_box_to_str,'));
+  check('the XMLList vtable stringifies through as_xml_list_box_to_str',
+    pre.includes('static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, as_xml_list_box_to_str,'));
+  check('...and both helpers delegate to the string-value rules',
+    pre.includes('static char* as_xml_box_to_str(void* o) { return as_xml_string_value((as_xml_node*)o); }')
+    && pre.includes('static char* as_xml_list_box_to_str(void* o) { return as_xml_list_to_string((as_xml_list*)o); }'));
+  console.log(`     [e4xstr] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: e4x/StringValue', checkEmitE4xStringValue);
+
+// ---- an Object slot holding a primitive / a function value ----
+// Our Object-typed slots are raw pointers, so a scalar must be BOXED to live in one
+// (as_number_new / as_string_new / as_boolean_new). AIR keeps the primitive, so the
+// observable behaviour has to be reconstructed at every sink. Three of them, all
+// measured on adl 51.4.1 (temp/apv/adl):
+//   * truthiness applies the PRIMITIVE's ToBoolean (false/""/0 -> F);
+//   * String(boxed Boolean) is "false"/"true", and a NULL String/Function assigned
+//     to an Object slot IS null (wrapper-free), which is what the app's
+//     `if (loader.data) loader.data()` guard depends on (uncaught #1006 before);
+//   * any function value stringifies to "function Function() {}", but a NULL one to
+//     "null".
+// examples/object-box.as covers the behaviour end to end; the shape is pinned here.
+function checkEmitObjectBoxCoercion(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [objbox] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [objbox] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const count = (hay: string, needle: string): number => hay.split(needle).length - 1;
+
+  // Null-preserving boxing: both wrappers must answer NULL for a null payload.
+  check('a null String boxes to NULL, not to a wrapper',
+    count(pre, 'if (value == NULL) return NULL;') >= 2);
+  check('the boxed Boolean stringifies as its own text',
+    pre.includes('static char* as_boolean_box_to_str(void* o) { return as_str_from_bool(((as_boolean*)o)->value); }')
+    && pre.includes('0, as_boolean_box_to_str, as_object_own_has_own_property'));
+  check('a function value stringifies to the AIR constant',
+    pre.includes('static char* as_function_box_to_str(void* o) { (void)o; return "function Function() {}"; }')
+    && pre.includes('case 7: return "function Function() {}";'));
+
+  const c = generateC(parse('function hi():void { }\nvar o:Object = null;\nif (o) { trace("x"); }\ntrace(String(hi));\n')).c;
+  // The Object ROOT cannot be tested as a bare pointer: false/""/0 sit in a
+  // non-NULL box, so the test has to unbox first (a concrete subclass cannot hold a
+  // boxed scalar and keeps the plain pointer test).
+  check('an Object-typed condition unboxes before the truthiness test',
+    c.includes('as_v_truthy(as_obj_to_value((void*)(g_o)))'));
+  check('a statically-typed Function stringifies with a null check',
+    c.includes('== NULL ? (char*)"null" : (char*)"function Function() {}"'));
+  check('...and the old bare "function" placeholder is gone',
+    !c.includes('concat("function")'));
+  console.log(`     [objbox] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ObjectBoxCoercion', checkEmitObjectBoxCoercion);
+
 // Object ToPrimitive (ES3 11.9.3): an object/class instance converted to a number
 // (Number/int/uint, numeric comparison) or compared loosely against a primitive
 // runs valueOf() first, then toString(). Measured on adl 51.4.1
@@ -814,3 +924,648 @@ function checkRuntimeMissingIsUndefined(): string[] {
   return bad;
 }
 registerGroup('unit: runtime/MissingIsUndefined', checkRuntimeMissingIsUndefined);
+
+// ---- the GC must be able to reach every C-runtime-only pointer slot ----
+// A class instance is traced by walking the props reflection table of its vtable
+// and of every super (runtime.ts, gc_scan case GCT_CLASS) -- so a pointer field
+// that is NOT in that table is invisible to the collector, and built-in classes
+// keep fields AS3 cannot declare (a storage path, an element array, a Skia
+// handle). Each one must therefore be classified deliberately:
+//
+//   * GC pointer -> an entry in the props table (type 3 = char* string,
+//     6 = object/array/instance), or, for a dynamic class's slot table, the
+//     vtable's dyn_offset;
+//   * C-owned    -> named in C_OWNED_CHAR_SLOTS below and NEVER listed.
+//
+// Getting it wrong is silent and delayed: the slot is reclaimed by a later sweep
+// and the program misbehaves seconds afterwards. That is exactly what happened to
+// SharedObject.name/path -- the persisted-file path was collected, so app startup
+// died with `Uncaught exception: SharedObject.flush: cannot write the storage
+// file` and, under a tighter GC budget, corrupted the heap (阶段一百四十七).
+// examples/so-persist.as covers the behaviour; the classification is pinned here.
+function checkEmitGcMarkedRuntimeSlots(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [gcslot] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [gcslot] ${label}`); }
+  };
+  const src = [
+    'import flash.net.SharedObject;',
+    'import flash.net.URLStream;',
+    'import flash.text.TextField;',
+    'import flash.display.Screen;',
+    'import flash.display.NativeWindow;',
+    'import flash.display.NativeWindowInitOptions;',
+    'import flash.geom.Matrix3D;',
+    'var so:SharedObject = SharedObject.getLocal("k");',
+    'var us:URLStream = new URLStream();',
+    'var tf:TextField = new TextField();',
+    'var sc:Screen = Screen.mainScreen;',
+    'var nw:NativeWindow = new NativeWindow(new NativeWindowInitOptions());',
+    'var m3:Matrix3D = new Matrix3D();',
+    'trace(so.size + us.bytesAvailable + tf.text.length + sc.bounds.x + nw.title + m3.rawData.length);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  // char* slots owned by C (a malloc'd rendering aid, or a borrowed alias into a
+  // String field that IS marked): they must never appear in a props table, since
+  // gc_scan would either tag a malloc block or mark an interior pointer.
+  const C_OWNED_CHAR_SLOTS = new Set([
+    'TextField._mask',      // displayAsPassword layout text (malloc, as_tf_layout_text)
+    'TextField._mask_src',  // borrowed alias of TextField.text (marked itself)
+    'TextField._comp',      // IME composition preview (malloc, as_tf_set_comp)
+    'TextField._para_text', // borrowed alias of the layout text (marked itself)
+  ]);
+
+  const structFields = new Map<string, string[]>();
+  for (const m of c.matchAll(/\nstruct (\w+) \{\n([\s\S]*?)\n\};/g)) {
+    const fields: string[] = [];
+    for (const decl of m[2].split(';')) {
+      const fm = /(?:^|\s)(?:const\s+)?char\s*\*\s*(\w+)\s*$/.exec(decl.trim());
+      if (fm) fields.push(fm[1]);
+    }
+    structFields.set(m[1], fields);
+  }
+  const supers = new Map<string, string>();
+  for (const m of c.matchAll(/static \w+_vtable (\w+)_vt = \{ "[^"]*", &(\w+)_vt,/g)) supers.set(m[1], m[2]);
+  const marks = new Map<string, Set<string>>();
+  for (const m of c.matchAll(/static as_prop (\w+)_props\[\] = \{([\s\S]*?)\n\};/g)) {
+    const set = new Set<string>();
+    for (const p of m[2].matchAll(/\{\s*"[^"]*",\s*(\d+),\s*offsetof\((\w+),\s*(\w+)\)/g)) {
+      if (p[1] === '3' || p[1] === '13') set.add(p[3]);
+    }
+    marks.set(m[1], set);
+  }
+  const covered = (cls: string, field: string): boolean => {
+    for (let k: string | undefined = cls; k !== undefined; k = supers.get(k)) {
+      if (marks.get(k)?.has(field)) return true;
+    }
+    return false;
+  };
+
+  check('the fixture reaches the built-in classes with C-only slots',
+    structFields.has('SharedObject') && structFields.has('TextField') && structFields.has('URLStream')
+    && structFields.has('Screen') && structFields.has('NativeWindow'));
+  // The regression itself: both string slots are reachable from the marker.
+  check('SharedObject.name is marked as a string slot',
+    (marks.get('SharedObject') ?? new Set()).has('name')
+    && c.includes('{ "_name", 3, offsetof(SharedObject, name), NULL, NULL, 1 }'));
+  check('SharedObject.path is marked as a string slot',
+    (marks.get('SharedObject') ?? new Set()).has('path')
+    && c.includes('{ "_path", 3, offsetof(SharedObject, path), NULL, NULL, 1 }'));
+  check('...and both are stored under a write barrier',
+    c.includes('o->name = name; gc_write_barrier((void*)name);')
+    && c.includes('o->path = path; gc_write_barrier((void*)path);'));
+  check('SharedObject._data / _client stay marked as object slots',
+    c.includes('{ "_data", 6, offsetof(SharedObject, _data), NULL, NULL, 1 }')
+    && c.includes('{ "_client", 6, offsetof(SharedObject, _client), NULL, NULL, 1 }'));
+
+  // The general rule, over every char* slot of every class the fixture emits.
+  let checked = 0;
+  for (const [cls, fields] of structFields) {
+    if (!marks.has(cls)) continue; // no reflection table => not scanned as an instance
+    for (const f of fields) {
+      checked++;
+      const byName = `${cls}.${f}`;
+      if (C_OWNED_CHAR_SLOTS.has(byName)) {
+        check(`${byName} is C-owned and NOT in the props table`, !covered(cls, f));
+      } else {
+        check(`${byName} is a GC string slot the marker can reach`, covered(cls, f));
+      }
+    }
+  }
+  check('the scan actually looked at the string slots', checked >= 12);
+
+  // A props-table entry is only half of the contract: gc_scan has to FOLLOW the
+  // tag. DisplayObject.name is stored as a char* under its own tag 13 (see
+  // emitPropTables -- the tag exists so a dynamic null write throws #2007 like AIR)
+  // and the marker's switch listed 3/6/7/10/11/12 but not 13, so every object name
+  // was swept on the first collection that reached it and the freed block was handed
+  // to the next short-lived string. TalkMED's HomeView.clickTabList reads the clicked
+  // tab out of e.target.name, so every tab click then indexed menuArray[0] and opened
+  // the "打开网页" StageWebView (examples/gc_name.as is the end-to-end pin).
+  // The tags that carry a pointer are exactly the ones as_prop uses for storage kinds
+  // 3 (char* string), 6 (unchecked ref), 7 (boxed as_value), 10/11/12 (typed ref) and
+  // 13 (DisplayObject.name).
+  const POINTER_TAGS = ['3', '6', '7', '10', '11', '12', '13'];
+  const usedTags = new Set<string>();
+  for (const m of c.matchAll(/static as_prop \w+_props\[\] = \{([\s\S]*?)\n\};/g)) {
+    for (const p of m[1].matchAll(/\{\s*"[^"]*",\s*(\d+),/g)) {
+      if (POINTER_TAGS.includes(p[1])) usedTags.add(p[1]);
+    }
+  }
+  const scanStart = RUNTIME_PREAMBLE.indexOf('static void gc_scan(gc_header* h) {');
+  const scanEnd = RUNTIME_PREAMBLE.indexOf('\nstatic ', scanStart + 10);
+  const scanBody = scanStart >= 0 ? RUNTIME_PREAMBLE.slice(scanStart, scanEnd > 0 ? scanEnd : undefined) : '';
+  const scanCases = new Set([...scanBody.matchAll(/case (\d+):/g)].map((m) => m[1]));
+  check('the fixture really emits more than one pointer-carrying prop tag', usedTags.size >= 2);
+  check('gc_scan follows every pointer-carrying prop tag',
+    [...usedTags].every((t) => scanCases.has(t)));
+  check('...including the DisplayObject name slot (tag 13)',
+    scanCases.has('13') && scanBody.includes('case 13: gc_mark_ptr(*(char**)(base + props[i].offset));'));
+
+  console.log(`     [gcslot] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/GcMarkedRuntimeSlots', checkEmitGcMarkedRuntimeSlots);
+
+// ---- No AS3-owned slot may hold an interior pointer (阶段一百四十七) ----
+// The marker reads a slot as a block BODY: gc_hdr(p) = p - sizeof(gc_header), so
+// a pointer into the middle of a string makes the GC treat payload bytes as a
+// header and grey a bogus "block". The next sweep then links that garbage into a
+// free list and the heap collapses seconds later -- measured on TalkMED as a
+// SIGSEGV in gc_sweep_step whose faulting address was literally the ASCII of the
+// FPS overlay's "FPS: 121". Two sites produced interior pointers; both are pinned
+// here on the sources, because the failure mode is silent and the two spots are
+// exactly the shape a future in-place parse would reintroduce:
+//   * URLLoader__parseHeaders splits an HTTP header line in place and handed
+//     colon+1 (a pointer into that line) to URLRequestHeader as the VALUE.
+//   * as_object_set stored the CALLER'S key pointer. Its keys array is a
+//     GCT_PTR_ARRAY, so it is marked as pointers too (URLVariables.decode passes
+//     a pointer into the buffer it just split in place).
+// The general rule: any char* that lands in AS3-visible storage is an independent
+// VALUE (as_str_dup / as_str_alloc) -- never a pointer borrowed from another
+// object or from the middle of a buffer.
+function checkEmitNoInteriorPointers(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [interior] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [interior] ${label}`); }
+  };
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const pre = RUNTIME_PREAMBLE;
+
+  check('a parsed header VALUE is copied out of the line it was split from',
+    emitSource.includes('URLRequestHeader_new(line, as_str_dup(val))'));
+  check('…and the borrowing form is gone',
+    !emitSource.includes('URLRequestHeader_new(line, val)'));
+  check('as_object_set copies the key into a fresh GC string',
+    pre.includes('if (copy_key && key != NULL) owned = as_str_dup(key);')
+    && pre.includes('o->keys[o->length] = (char*)owned;'));
+  check('…and never stores the caller\'s pointer',
+    !pre.includes('o->keys[o->length] = (char*)key;'));
+  check('the borrowed statement was dropped with the pointer',
+    !pre.includes('gc_write_barrier((void*)key);'));
+  // The one exception is a compile-time literal key (as_object_make). Pin BOTH halves:
+  // the literal path skips the copy, and every other caller still gets it by default.
+  check('object literal keys are stored as-is (they are C string literals)',
+    pre.includes('for (int i = 0; i < n; i++) as_object_set_key(o, keys[i], vals[i], 0);'));
+  check('…while as_object_set itself is the copying path',
+    pre.includes('static as_value as_object_set(as_object* o, const char* key, as_value v) {')
+    && pre.includes('return as_object_set_key(o, key, v, 1);'));
+
+  // The two helpers the rule leans on must really dupe.
+  check('as_str_dup allocates a fresh string and copies into it',
+    pre.includes('static char* as_str_dup(const char* s) {')
+    && pre.includes('char* out = as_str_alloc(n + 1);'));
+  check('as_xml_trim copies rather than advancing the pointer (it used to advance)',
+    pre.includes('as_xml_trim(const char* s)'));
+
+  console.log(`     [interior] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/NoInteriorPointers', checkEmitNoInteriorPointers);
+
+// ---- URLVariables.toString() sizes its buffer from the ENCODED lengths (阶段一百五十三) ----
+// The query string percent-encodes every non-alphanumeric byte of BOTH halves,
+// so the output can be ~3x the sum of the raw lengths. Sizing the destination from
+// the raw lengths (the form this pins against) writes past the end of the GC
+// string into whatever block follows. Measured on TalkMED: the 159-byte
+// device_info JSON blob of the SMS-code login request encodes to 285, and the 126
+// bytes written past the end landed on a free-list node's `next` -- the heap
+// collapsed seconds later in gc_sweep_step / as_render_fp with a faulting address
+// that was literally the ASCII of the encoded body ("...%22%2C..."). A silent
+// overflow, and "build a buffer, then fill it" is exactly the shape an edit would
+// rewrite, so the size and the encoder are pinned to agree on the same rule.
+function checkEmitUrlVarEncoding(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [urlvar] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [urlvar] ${label}`); }
+  };
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const pre = RUNTIME_PREAMBLE;
+
+  const sizeLine = 'total += as_url_encoded_len(d->keys[i]) + as_url_encoded_len(as_v_str_val(d->vals[i])) + 2;';
+  check('the buffer is sized from the ENCODED key + ENCODED value', emitSource.includes(sizeLine));
+  check('…and no longer from the raw value length',
+    !emitSource.includes('total += strlen(d->keys[i]) + strlen(as_v_str_val(d->vals[i])) + 2;'));
+  check('both halves are encoded straight into the destination',
+    emitSource.includes('p += as_url_encode_into(p, d->keys[i]);')
+    && emitSource.includes('p += as_url_encode_into(p, as_v_str_val(d->vals[i]));'));
+  check('…so the encode-then-strlen-then-memcpy form is gone',
+    !emitSource.includes('char* v = as_url_encode(as_v_str_val(d->vals[i]));')
+    && !emitSource.includes('size_t kl = strlen(k), vl = strlen(v);'));
+
+  check('the length helper exists and never allocates',
+    pre.includes('static size_t as_url_encoded_len(const char* s) {')
+    && pre.includes('n += as_url_var_safe((char)*p) ? 1 : 3;'));
+  check('the encoder writes through the SAME predicate',
+    pre.includes('static size_t as_url_encode_into(char* dst, const char* s) {')
+    && pre.includes('if (as_url_var_safe((char)c)) dst[p++] = (char)c;'));
+  check('as_url_encode is the allocating wrapper of that pair',
+    pre.includes('static char* as_url_encode(const char* s) {')
+    && pre.includes('char* r = as_str_alloc(as_url_encoded_len(s) + 1);'));
+  // The escape set is alphanumeric-only, measured on adl 51.4.1: '-' '_' '.' '~'
+  // come out as %2D %5F %2E %7E. The old permissive predicate kept them literal.
+  check('the URLVariables escape set is [A-Za-z0-9] only',
+    pre.includes('static bool as_url_var_safe(char c) {') && !pre.includes('as_url_is_unreserved'));
+
+  // The read side is FORM decoding and it applies to BOTH halves of a pair.
+  // Measured on adl 51.4.1 (temp/uvarair): new URLVariables("a%20b=c%20d") answers
+  // the key "a b" -- and toString() gives "a%20b=c%20d" back, a round trip that only
+  // closes because the key was decoded on the way in; "p+q=1" answers the key "p q".
+  // Keys used to be stored raw ("AIR decodes values but not keys" was an assumption).
+  check('decode() percent-decodes the KEY as well as the value',
+    emitSource.includes('as_object_set(o->_dyn, as_url_decode(p), as_v_str(as_url_decode(val)));'));
+  check('…and the raw-key form is gone',
+    !emitSource.includes('as_object_set(o->_dyn, p, as_v_str(as_url_decode(val)));'));
+  check("a literal '+' decodes to a space (form encoding, not URI)",
+    pre.includes("        } else if (s[i] == '+') {\n            r[p++] = ' ';"));
+
+  console.log(`     [urlvar] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/UrlVarEncoding', checkEmitUrlVarEncoding);
+
+// A one-byte as_str_alloc is the *empty string* — the single case where the
+// allocation has no content to copy in. The GC deliberately does not zero
+// GCT_STRING (see the as_str_alloc contract in runtime.ts), so the caller must
+// write the terminator; a bare `as_str_alloc(1)` that forgets it yields a string
+// whose bytes are whatever the recycled block used to hold (阶段一百四十九:
+// TalkMED's SWC-baked empty TextField rendered "MS: 17/18" as its text, and the
+// Socket.read error paths returned the same kind of garbage). The invariant is
+// source-level, so it is pinned here rather than in an example.
+function checkEmitEmptyStringTerminator(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [emit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [emit] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const pre = RUNTIME_PREAMBLE;
+
+  check('the runtime provides as_str_empty',
+    pre.includes('static char* as_str_empty(void) {'));
+  check('as_str_empty writes the terminator itself',
+    /static char\* as_str_empty\(void\) \{\n\s*char\* s = \(char\*\)gc_alloc\(GCT_STRING, 1\);\n\s*s\[0\] = 0;/.test(pre));
+  check('no bare as_str_alloc(1) is left in the emitter',
+    !emitSource.includes('as_str_alloc(1)'));
+  check('no bare as_str_alloc(1) is left in the runtime',
+    !pre.includes('as_str_alloc(1)'));
+
+  // The generated TextField constructor must produce a real empty string, not a
+  // one-byte buffer with an uninitialised first byte.
+  const c = generateC(parse('var t:TextField = new TextField();\ntrace(t.text);\n')).c;
+  check('TextField_ctor initialises text through as_str_empty',
+    c.includes('o->text = as_str_empty();'));
+  check('…and no longer zero-fills-by-omission',
+    !c.includes('o->text = as_str_alloc(1);'));
+
+  // Both Socket.read error paths (invalid socket, read past the end) return "".
+  check('Socket__str error paths return as_str_empty',
+    (emitSource.match(/Socket__(invalid|eof)\(\); return as_str_empty\(\);/g) ?? []).length === 2);
+  check('…while the success path still allocates n+1 bytes for n characters',
+    emitSource.includes('char* s = as_str_alloc((size_t)n + 1);'));
+
+  console.log(`     [empty-string] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/EmptyStringTerminator', checkEmitEmptyStringTerminator);
+
+// The one-argument class call (`Type(expr)`), which AIR resolves class by class:
+// the native Error family CONSTRUCTS while every other class COERCES at run time
+// through #1034. The shape is a source-level emitter invariant (a bare C pointer
+// cast of the argument used to be emitted for the coerce case, which boxed a
+// string BODY as an object and SIGSEGV'd the first `catch (e:Error)` -- the
+// talkmed-meeting close-the-window crash), so it is pinned here; the runtime
+// semantics are the example's job (examples/error-call.as, verified against adl).
+function checkEmitClassCall(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [emit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [emit] ${label}`); }
+  };
+  const emit = (src: string): string => generateC(parse(src)).c;
+  // Compile-time refusals: the emitter must throw, never emit a broken cast.
+  const refuses = (src: string, re: RegExp): boolean => {
+    try { generateC(parse(src)); return false; }
+    catch (e) { return re.test(String(e)); }
+  };
+
+  // 1. The native Error family constructs -- emitted as the very same
+  //    `X_new(message, id)` call the `new` form uses, so the two are equivalent
+  //    by construction. A bare pointer cast (`(Error*)("boom")`) is what used to
+  //    be emitted, which boxed a string BODY as an object.
+  const boom = emit('var e:* = Error("boom");\ntrace(e);\n');
+  check('Error("boom") emits Error_new', boom.includes('Error_new("boom", 0)'));
+  check('…and not a pointer cast of the argument', !boom.includes('(Error*)("boom")'));
+  const five = emit('var e:* = Error(5);\ntrace(e);\n');
+  check('Error(5) converts the message', five.includes('Error_new(as_str_from_int(5), 0)'));
+  const terr = emit('var t:* = TypeError(5);\ntrace(t);\n');
+  check('TypeError(5) constructs its own class', terr.includes('TypeError_new('));
+  const sec = emit('var s:* = SecurityError(5);\ntrace(s);\n');
+  check('SecurityError(5) constructs too', sec.includes('SecurityError_new('));
+  const rx = emit('var r:* = RegExp("a");\ntrace(r);\n');
+  check('RegExp("a") constructs', rx.includes('RegExp_new("a", "")'));
+  const ns = emit('var n:* = Namespace("u");\ntrace(n);\n');
+  check('Namespace("u") constructs', ns.includes('((void)("u"), Namespace_new())'));
+
+  // 2. Everything else coerces through the shared as_v_req_inst runtime rule
+  //    (null/undefined -> null, an instance -> the instance, else #1034), which
+  //    needs the class fqn for the error message.
+  const spr = emit('var s:* = Sprite(5);\ntrace(s);\n');
+  check('Sprite(5) coerces', spr.includes('as_v_req_inst(as_v_num((double)(5)), &Sprite_vt,'));
+  const sprn = emit('var s:* = Sprite(null);\ntrace(s);\n');
+  check('Sprite(null) coerces the null literal', sprn.includes('as_v_req_inst(as_v_null(), &Sprite_vt,'));
+  const foo = emit('class Foo { }\nvar f:* = Foo(5);\ntrace(f);\n');
+  check('a user class coerces', foo.includes('as_v_req_inst(as_v_num((double)(5)), &Foo_vt,'));
+  // The flash.errors subclasses and a user subclass of Error are NOT native, so
+  // AIR has no constructor call behaviour for them (measured in temp/errsub).
+  const ioerr = emit('import flash.errors.IOError;\nvar x:* = IOError(5);\ntrace(x);\n');
+  check('IOError(5) coerces instead of constructing',
+    ioerr.includes('as_v_req_inst(as_v_num((double)(5)), &IOError_vt,'));
+  const myerr = emit('class MyErr extends Error { public function MyErr() { super("m"); } }\nvar m:* = MyErr(5);\ntrace(m);\n');
+  check('a user subclass of Error coerces', myerr.includes('&MyErr_vt,'));
+
+  // 3. Arity outside the one-argument form stays a loud compile error, as in
+  //    mxmlc ("参数的数量不正确。不超过 1 个" for the two-argument spelling).
+  check('a two-argument no-new class call is refused',
+    refuses('var e:* = Error("m", 42);\ntrace(e);\n', /undefined function 'Error'/));
+  check('the no-new Date(...) call is refused at compile time',
+    refuses('var d:* = Date(5);\ntrace(d);\n', /no-new Date/));
+
+  // 4. The conversion functions are reached before the class-call rule, so their
+  //    existing behaviour must be untouched.
+  const obj = emit('var o:* = Object(5);\ntrace(o);\n');
+  check('Object(5) still autoboxes rather than coercing', obj.includes('as_obj_to_value'));
+  const str = emit('var s:* = String(5);\ntrace(s);\n');
+  check('String(5) still converts', str.includes('as_str_from_'));
+
+  console.log(`     [class-call] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ClassCall', checkEmitClassCall);
+
+// ---- listener registration identity + the AT_TARGET phase (adl 51.4.1) ----
+//
+// Two AIR rules the emitter has to encode, both measured on adl in
+// temp/dupprobe (cases A-I) and pinned end-to-end by examples/listener_identity.as:
+//   * addEventListener is idempotent per (function, receiver, useCapture) and
+//     removeEventListener matches by that same pair -- appending blindly made
+//     dual-registered handlers run twice and left a stray listener behind after a
+//     single removal (TalkMED's scrollbars re-register MOUSE_DOWN from a subclassed
+//     ADDED_TO_STAGE hook, so the app ended up with two live stage mouseMove/mouseUp
+//     pairs that permanently disabled the scrolled container's mouse and killed the
+//     flick's bounce).
+//   * AT_TARGET consults only the non-capture list: the capture phase ends at the
+//     target's parent.
+function checkEmitListenerIdentity(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [listener] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [listener] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.Sprite;\n' +
+    'import flash.events.MouseEvent;\n' +
+    'var s:Sprite = new Sprite();\n' +
+    'function h(e:MouseEvent):void { trace("hit"); }\n' +
+    's.addEventListener(MouseEvent.CLICK, h, true);\n' +
+    's.addEventListener(MouseEvent.CLICK, h, false);\n' +
+    's.removeEventListener(MouseEvent.CLICK, h);\n')).c.replace(/\r\n/g, '\n');
+
+  // Slice one emitted function DEFINITION by scanning braces from its signature.
+  // The same signature also appears in the prototype block, so an occurrence whose
+  // first brace comes after its terminating ';' is skipped.
+  const fnBody = (sig: string): string => {
+    for (let from = 0; ;) {
+      const i = c.indexOf(sig, from);
+      if (i < 0) return '';
+      const semi = c.indexOf(';', i);
+      const brace = c.indexOf('{', i);
+      if (brace >= 0 && (semi < 0 || brace < semi)) {
+        let depth = 0;
+        for (let j = brace; j < c.length; j++) {
+          if (c[j] === '{') depth++;
+          else if (c[j] === '}') { depth--; if (depth === 0) return c.slice(i, j + 1); }
+        }
+        return '';
+      }
+      from = i + sig.length;
+    }
+  };
+
+  const add = fnBody('static void EventDispatcher_addEventListener(');
+  const rem = fnBody('static void EventDispatcher_removeEventListener(');
+  const target = fnBody('static bool as_disp_target(');
+  const phase = fnBody('static bool as_disp_phase(Event* evt, void* current, bool capture)');
+  check('the fixtures emitted all four listener entry points',
+    add.length > 0 && rem.length > 0 && target.length > 0 && phase.length > 0);
+  // Dedup: the identical (fn, env) already in the list short-circuits the add.
+  check('addEventListener skips an already-registered (function, receiver)',
+    /for \(int i = 0; i < arr->length; i\+\+\) \{[\s\S]*?if \(a->fn == listener->fn && a->env == listener->env\) return;[\s\S]*?\}\s*as_array_push\(arr, as_v_obj\(\(void\*\)listener\)\);/.test(add));
+  check('the dedup runs before the push, not after',
+    add.indexOf('a->env == listener->env') < add.indexOf('as_array_push(arr, as_v_obj'));
+  check('removeEventListener matches the same (function, receiver) pair',
+    /if \(a->fn == listener->fn && a->env == listener->env\)/.test(rem));
+  // AT_TARGET: bubble list only -- no capture lookup may appear in the body.
+  check('as_disp_target reads only the non-capture list',
+    target.includes('as_listeners_get(d->listeners, evt->type, false)') &&
+    !target.includes('as_listeners_get(d->listeners, evt->type, true)'));
+  check('as_disp_target still sets the AT_TARGET phase and currentTarget',
+    target.includes('evt->eventPhase = 2;') && target.includes('evt->currentTarget = (Object*)target;'));
+  // The ancestor capture phase must stay (that is where capture listeners live);
+  // as_disp_phase takes the flag as a parameter, so the walk itself supplies `true`.
+  check('the capture phase still walks the ancestors',
+    c.includes('for (int i = anc_count - 1; i >= 0; i--) { if (event->propStopped) break; if (as_disp_phase(event, ancestors[i], true)) ran = true; }') &&
+    phase.includes('as_listeners_get(d->listeners, evt->type, capture)'));
+
+  console.log(`     [listener] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ListenerIdentity', checkEmitListenerIdentity);
+
+// int(x) / uint(x) must be ES3 ToInt32 / ToUint32 for EVERY source type, never a
+// bare C cast. `(int)` of a double is UNDEFINED BEHAVIOUR once the value is NaN,
+// infinite or outside int32 -- the same expression printed 1, 1073741824,
+// 2147483647 or a garbage negative depending on the surrounding function (arm64
+// -O2, temp/d31probe) -- while AIR is total and WRAPS. Reference values are the
+// adl 51.4.1 oracle (temp/d31probe/adl/result-adl.txt, same source both sides):
+// int(NaN)=0, int(1e10)=1410065408, int(-1e10)=-1410065408, uint(-1e10)=2884901888,
+// int(2147483648)=-2147483648, uint(4294967296)=0, int(Infinity)=0.
+// examples/int-cast.as covers the values end to end; the emitted shape is pinned
+// here, because with a correct helper the two spellings are indistinguishable at
+// runtime on the inputs an example can reach.
+function checkEmitIntCastCall(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [intcast] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [intcast] ${label}`); }
+  };
+
+  const c = generateC(parse('function i32(n:Number):int { return int(n); }\n'
+    + 'function u32(n:Number):uint { return uint(n); }\n'
+    + 'var a:int = i32(1.5);\nvar b:uint = u32(1.5);\n'
+    + 'var d:* = 1.5;\nvar e:int = int(d);\ntrace(a + b + e);\n')).c;
+
+  const body = (sig: string): string => {
+    const i = c.indexOf(sig);
+    if (i < 0) return '';
+    const brace = c.indexOf('{', i);
+    let depth = 0;
+    for (let j = brace; j < c.length; j++) {
+      if (c[j] === '{') depth++;
+      else if (c[j] === '}') { depth--; if (depth === 0) return c.slice(i, j + 1); }
+    }
+    return '';
+  };
+
+  const i32 = body('static int i32(double n) {');
+  const u32 = body('static unsigned int u32(double n) {');
+  check('the fixtures emitted both conversion functions', i32.length > 0 && u32.length > 0);
+  check('int(Number) goes through the ES3 ToInt32 helper',
+    i32.includes('as_to_int32(') && !i32.includes('(int)('));
+  check('uint(Number) goes through the ES3 ToUint32 helper',
+    u32.includes('as_to_uint32(') && !u32.includes('(unsigned int)('));
+  check('the ToInt32 helper wraps out-of-range and NaN input (not a machine cast)',
+    RUNTIME_PREAMBLE.includes('if (isnan(v) || isinf(v)) return 0;')
+    && RUNTIME_PREAMBLE.includes('fmod(t, 4294967296.0)'));
+  // Dynamic source: the coercing helper, which also handles String/object payloads.
+  check('int(*) dispatches on the box tag',
+    c.includes('as_v_int_cast('));
+  // The same two bugs lived in the `new (ClassValue)(x)` path (as_core_cls_ctor),
+  // which is a SEPARATE emitter string: a bare cast there was undefined behaviour
+  // too -- measured, temp/d31probe/newcore2.as: int 1e10 printed 2147483647 (a
+  // saturating fold) where adl gives 1410065408.
+  check('the dynamic core-class constructor uses the same ES3 helpers',
+    c.includes('if (strcmp(n, "int") == 0) return as_v_num((double)as_to_int32(as_v_to_number(a)));')
+    && c.includes('if (strcmp(n, "uint") == 0) return as_v_num((double)as_to_uint32(as_v_to_number(a)));'));
+  // `new co(5)` on a Class value is the Object(5) CONVERSION (the number 5), not a
+  // fresh object -- measured on adl 51.4.1 (temp/d31probe/adl-newcore3.txt).
+  check('new (Object Class)(x) is the Object(x) conversion, not a fresh object',
+    c.includes('if (strcmp(n, "Object") == 0) return as_obj_conv(a);'));
+  // `new Number()` is 0 (the constructor default) while the CONVERSION `Number()`
+  // is NaN -- the two must not share an implementation.
+  check('new Number() with no argument is 0, not NaN',
+    generateC(parse('var zzq:Number = new Number();\ntrace(zzq);\n')).c.includes('g_zzq = 0;'));
+
+  console.log(`     [intcast] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/IntCastCall', checkEmitIntCastCall);
+
+// E4X has its own typeof bucket in AIR: "xml" for XML and XMLList alike, in every
+// slot shape (static, `*`, Object -- measured on adl 51.4.1, temp/xmlmeth +
+// temp/d31probe/adl). We used to fold every xml-typed operand to "object", and a
+// boxed XML value fell through as_ptr_typeof's vtable chain to "object" too.
+function checkEmitTypeofXml(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [toxm] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [toxm] ${label}`); }
+  };
+
+  const c = generateC(parse('var x:XML = <a/>;\nvar xl:XMLList = XMLList(x);\n'
+    + 'var t1:String = typeof x;\nvar t2:String = typeof xl;\n'
+    + 'var a:* = x;\nvar t3:String = typeof a;\n'
+    + 'var o:Object = x;\nvar t4:String = typeof o;\ntrace(t1 + t2 + t3 + t4);\n')).c;
+
+  check('a statically xml-typed operand reports "xml"',
+    c.includes('typeof x').toString() === 'false' && /g_t1 = "xml";/.test(c));
+  check('...and so does a statically xml-typed XMLList',
+    /g_t2 = "xml";/.test(c));
+  check('a `*` slot holding an XML goes through the runtime dispatcher',
+    c.includes('as_v_typeof('));
+  check('an Object slot holding an XML goes through as_ptr_typeof',
+    c.includes('as_ptr_typeof('));
+  // The two runtime dispatchers are the ones that decide for boxed values, so both
+  // must know the two E4X vtables (a missing branch silently answers "object").
+  const pre = RUNTIME_PREAMBLE;
+  const needle = 'as_xml_vt || vt == (void*)&as_xml_list_vt) return "xml";';
+  check('as_v_typeof and as_ptr_typeof both recognise the XML/XMLList vtables',
+    pre.split(needle).length - 1 === 2);
+  check('the vtables are the ones E4X values actually carry',
+    pre.includes('static as_object_vtable as_xml_vt =') && pre.includes('as_xml_list_vt ='));
+
+  console.log(`     [toxm] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: e4x/TypeofXml', checkEmitTypeofXml);
+
+// The generated C body plants FIXED identifier spellings that AS3 source is free
+// to use as well: `o` is the receiver parameter of a generated class constructor
+// (`Widget_ctor(Widget* o, ...)`) and `_this` the receiver of every generated
+// instance method. Before cIdent reserved them, a class declaring a parameter,
+// field or local named `o` emitted C that clang rejected:
+//   static void Widget_ctor(Widget* o) { ... Object* o = NULL; ... }
+//   error: redefinition of 'o' with a different type: 'Object *' vs 'Widget *'
+// (temp/d31probe/ocollide2.as, a 7-line AIR app that `adl` runs fine). The fix is
+// spelling-only: the AS3 identifier is renamed (`_o`, `__this`) while the
+// REFLECTION name stays the original string, which is what `w["o"]` resolves
+// against -- examples/ident-collide.as pins that end to end.
+function checkEmitGeneratedNameReservation(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [gname] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [gname] ${label}`); }
+  };
+
+  const c = generateC(parse('class Widget {\n'
+    + '  public var o:int;\n'
+    + '  public function Widget(o:int, _this:String) { this.o = o; }\n'
+    + '  public function add(o:int, _this:int):int { var _i0:int = 1; return o + _this + _i0; }\n'
+    + '  public function o():int { return 9; }\n'
+    + '}\n'
+    + 'var w:Widget = new Widget(1, "a");\ntrace("" + w.o + w.add(2, 3) + w["o"]);\n')).c;
+
+  const body = (sig: string): string => {
+    const i = c.indexOf(sig);
+    if (i < 0) return '';
+    const brace = c.indexOf('{', i);
+    let depth = 0;
+    for (let j = brace; j < c.length; j++) {
+      if (c[j] === '{') depth++;
+      else if (c[j] === '}') { depth--; if (depth === 0) return c.slice(i, j + 1); }
+    }
+    return '';
+  };
+
+  // The receiver keeps its spelling (it is emitted raw, never through cIdent) and
+  // the source identifiers move out of the way.
+  check('the constructor receiver stays `o` while a param named `o` is renamed',
+    c.includes('Widget_ctor(Widget* o, int _o, char* __this)'));
+  const ctor = body('static void Widget_ctor(Widget* o, int _o, char* __this) {');
+  check('the fixture emitted the colliding constructor', ctor.length > 0);
+  check('no C local reuses the receiver spelling',
+    !/\bObject\* o =|\bchar\* o =|\bint o =/.test(ctor) && ctor.includes('this->_o'));
+  check('a method param named `_this` is renamed to `__this`',
+    c.includes('Widget_add(void* _this, int _o, int __this)'));
+  const add = body('static int Widget_add(void* _this, int _o, int __this) {');
+  check('a local spelled like a tmpName() temporary is renamed out of that space',
+    add.includes('int __i0 = 0;') && !/\bint _i0 = 0;/.test(add));
+  // A method NAMED `o` is not a collision (it is `Owner_o`), but it must not be
+  // renamed either -- cIdent's reservation is for function-scope locals.
+  check('a method named `o` keeps its owner prefix', c.includes('static int Widget_o(void* _this)'));
+  // The reflection table maps the ORIGINAL AS3 name to the renamed slot: this is
+  // what keeps `w["o"]`, for-in and AMF member lists AIR-correct.
+  check('the props table keeps the AS3 name "o" pointing at the renamed slot',
+    /\{ "o", \d+, offsetof\(Widget, _o\)/.test(c));
+  check('the AMF member list keeps the AS3 name "o"',
+    /static const char\* Widget_amf_members\[\] = \{ "o", NULL \};/.test(c));
+
+  console.log(`     [gname] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/GeneratedNameReservation', checkEmitGeneratedNameReservation);

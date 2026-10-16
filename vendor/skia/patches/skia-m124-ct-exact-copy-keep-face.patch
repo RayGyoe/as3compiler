@@ -1,0 +1,53 @@
+--- a/src/utils/mac/SkCTFontCreateExactCopy.cpp
++++ b/src/utils/mac/SkCTFontCreateExactCopy.cpp
+@@ -43,6 +43,18 @@
+     CFDictionarySetValue(attr, SkCTFontUnscaledTrackingAttribute, unscaledTrackingNumber.get());
+ }
+ 
++// LOCAL PATCH (TalkMED as3compiler, 阶段一百六十七): true if both fonts are backed
++// by the same file. Unknowable (either side missing the URL attribute) counts as
++// "same", so the patch never fires on fonts it cannot reason about.
++static bool sk_fonts_share_file(CTFontRef a, CTFontRef b) {
++    SkUniqueCFRef<CFTypeRef> ua(CTFontCopyAttribute(a, kCTFontURLAttribute));
++    SkUniqueCFRef<CFTypeRef> ub(CTFontCopyAttribute(b, kCTFontURLAttribute));
++    if (!ua || !ub) {
++        return true;
++    }
++    return CFEqual(ua.get(), ub.get());
++}
++
+ SkUniqueCFRef<CTFontRef> SkCTFontCreateExactCopy(CTFontRef baseFont, CGFloat textSize,
+                                                  OpszVariation opszVariation)
+ {
+@@ -79,8 +91,30 @@
+ 
+     SkUniqueCFRef<CTFontDescriptorRef> desc(CTFontDescriptorCreateWithAttributes(attr.get()));
+ 
+-    return SkUniqueCFRef<CTFontRef>(
++    SkUniqueCFRef<CTFontRef> copy(
+             CTFontCreateCopyWithAttributes(baseFont, textSize, nullptr, desc.get()));
++
++    // LOCAL PATCH (TalkMED as3compiler, 阶段一百六十七): an attributes-only
++    // descriptor makes CoreText re-resolve the face by FAMILY instead of keeping
++    // the base font's face. When two installed files declare the same family and
++    // PostScript name (e.g. ~/Library/Fonts/微软雅黑.ttf and 微软雅黑粗体.ttf both
++    // say family "Microsoft YaHei"/"微软雅黑", PS "MicrosoftYaHei"), CoreText can
++    // pick the OTHER file -- and when the two files' glyph orders differ (the bold
++    // file inserts a glyph around index 110, shifting every later id by one) every
++    // CJK glyph comes out as the next character while Latin is unaffected (ASCII
++    // ids agree between the files). Measured: 创建同传 rasterized as 初开名伤, even
++    // though Skia's glyph ids and advances came from the correct face.
++    // Keep the base face whenever the copy switched files: dropping the descriptor
++    // costs only the 'trak'-off/opsz attributes for that family, and preserves the
++    // face identity CoreText was dropping.
++    if (copy && !sk_fonts_share_file(baseFont, copy.get())) {
++        SkUniqueCFRef<CTFontRef> kept(
++                CTFontCreateCopyWithAttributes(baseFont, textSize, nullptr, nullptr));
++        if (kept) {
++            return kept;
++        }
++    }
++    return copy;
+ }
+ 
+ #endif

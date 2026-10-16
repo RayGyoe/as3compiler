@@ -253,6 +253,10 @@ static size_t gc_heap_total_bytes(void);
 // forward-declared because as_alloc/gc_alloc -- which run before it in the
 // preamble -- call it to validate a bookkeeping word before trusting it.
 static void gc_audit_gate(const char* what, const void* p);
+// Report a pointer handed to the marker/barrier that is in the heap but is not a
+// block body (阶段一百四十七). Declared here: the write barrier precedes the
+// audit code in the preamble.
+static void gc_audit_check(void* p);
 // ASC_GC_AUDIT switch (defined with the audit code below): gc_heap_used_bytes()
 // re-derives its O(1) mirror from the list when the audit is on.
 static bool gc_audit_on(void);
@@ -805,6 +809,7 @@ static void* gc_alloc(int type, size_t size) {
     gc_header* prev = NULL;
     gc_header* h = gc_find_block(size, &head, &prev);
     if (h != NULL) {
+        if (gc_audit_mode_cache != 0) gc_audit_gate("free-list block", h);
         if (prev) prev->next = h->next; else *head = h->next;
         size_t remain = h->size - size;
         if (remain >= GC_MIN_BLOCK) {
@@ -964,6 +969,39 @@ static char* as_str_alloc(size_t n) {
     return (char*)gc_alloc(GCT_STRING, n);
 }
 
+// Duplicate a C string into a FRESH GC string (NULL-safe).
+//
+// Every char* that crosses into AS3-owned storage must be an independent value:
+// AS3 strings are values, and a pointer that belongs to another object dies with
+// its owner. Measured on TalkMED (阶段一百四十七): the XML text of every <label>
+// in the language pack reached cn.edoctor.utils.Language's static fields through a
+// dynamic write (Language[key] = xml), i.e. ~1000 statics held pointers into
+// XML-owned buffers; once the parsed tree became garbage the statics dangled, and
+// the freed blocks then corrupted the GC free list (SIGSEGV at gc_sweep_step /
+// sk_textlayout_paint / as_v_is_inst, plus a DANGLING reference to a SWEPT block
+// naming the Language statics as the holder).
+static char* as_str_dup(const char* s) {
+    if (s == NULL) return NULL;
+    size_t n = strlen(s);
+    char* out = as_str_alloc(n + 1);
+    memcpy(out, s, n + 1);
+    return out;
+}
+
+// The empty AS3 string as an independent GC-managed value: one byte, with the
+// terminator written right here. Use this instead of a bare one-byte
+// as_str_alloc of one byte, which allocates that byte but leaves it uninitialised — the GC deliberately
+// does not zero GCT_STRING (see the as_str_alloc contract), so a forgotten write
+// lets every consumer of the string (strlen, text layout, trace) read whatever
+// the recycled block used to hold. Measured on TalkMED (阶段一百四十九): an
+// SWC-baked empty TextField rendered the previous occupant of its block
+// ("MS: 17/18", "_sans") as visible text, with the run's own glyph attributes.
+static char* as_str_empty(void) {
+    char* s = (char*)gc_alloc(GCT_STRING, 1);
+    s[0] = 0;
+    return s;
+}
+
 // AS3 string concatenation. A String-typed slot may hold NULL (the AS3 default for
 // an unset String field, and null itself), and ES3's ToString(null) is the four
 // characters "null" — which is exactly what the reference implementation prints
@@ -1068,7 +1106,16 @@ typedef struct { const char* name; void* super; void** ifaces; void* props; void
 // #1034 "... to flash.geom.Transform."): 10 = Array, 11 = class instance (needs
 // 'vt'/'fqn' for as_v_req_inst), 12 = Object (autoboxes like AIR's Object slot).
 // 'offset' is the byte offset of the field within the (flattened) class struct.
-typedef struct { const char* name; int type; size_t offset; void* vt; const char* fqn; } as_prop;
+//
+// 'vis' is the member's visibility for the reflection consumers that must skip
+// non-public members: 0 = public, 1 = non-public (private/protected/internal,
+// plus the synthetic entries this table also carries for the GC scanner). It is
+// the LAST field so that every pre-existing initializer -- which omits it --
+// still spells a public member, which is what those tables mean. JSON.stringify
+// is the first consumer: AIR serializes only public fields and public getters
+// (measured on adl 51.4.1 -- temp/jsonair5 emits {"p":3} for a class whose only
+// public member is the getter of a private field).
+typedef struct { const char* name; int type; size_t offset; void* vt; const char* fqn; int vis; } as_prop;
 
 // Look up an interface vtable by name from the object's vtable interface list.
 // Returns NULL when the object's class does not implement the interface.
@@ -1192,6 +1239,28 @@ static as_value as_v_u64(uint64_t x) { as_value v; v.tag = 9; v.num = 0.0; v.u64
 static int64_t  as_i64_val(as_value v) { return v.i64; }
 static uint64_t as_u64_val(as_value v) { return v.u64; }
 
+// Read one field of a class instance by reflection-table entry. Shared by the
+// dynamic readers (as_dyn_get / as_any_get / for-in) and by JSON.stringify, so
+// the two can never drift apart on a storage kind. Type tags are the ones
+// documented on as_prop above; kinds 10/11/12 (Array / class instance / Object
+// slot) read exactly like 6, because the slot is already a pointer -- only the
+// WRITE side type-checks. 64-bit enhancement fields (our own tags 8/9) hold a
+// plain int64_t/uint64_t in the struct, so the boxed value keeps the exact width.
+static as_value as_prop_read(void* base, const as_prop* p) {
+    switch (p->type) {
+        case 1: return as_v_num(*(double*)((char*)base + p->offset));
+        case 2: return as_v_bool(*(bool*)((char*)base + p->offset));
+        case 3: case 13: return as_v_str(*(char**)((char*)base + p->offset));
+        case 4: return as_v_num((double)(*(int*)((char*)base + p->offset)));
+        case 5: return as_v_num((double)(*(unsigned*)((char*)base + p->offset)));
+        case 6: case 10: case 11: case 12: return as_v_obj(*(void**)((char*)base + p->offset));
+        case 7: return *(as_value*)((char*)base + p->offset);
+        case 8: return as_v_i64(*(int64_t*)((char*)base + p->offset));
+        case 9: return as_v_u64(*(uint64_t*)((char*)base + p->offset));
+    }
+    return as_v_null();
+}
+
 // Write barrier (GC-4 incremental marking, Dijkstra insertion barrier). During
 // MARK the mutator runs between gc_step slices; a write of a still-WHITE pointer
 // must grey it so the mark does not miss the edge. Outside MARK the whole barrier
@@ -1227,6 +1296,9 @@ static uint64_t as_u64_val(as_value v) { return v.u64; }
 // outright -- i.e. the barrier's fast path is free again (temp/bench/wbfix/).
 static void gc_write_barrier_slow(void* p) {
     if (p == NULL || !gc_in_heap(p)) return;
+    // ASC_GC_AUDIT: a barrier write is where a bad reference first reaches the
+    // heap, so report a non-body pointer here -- the call chain is the writer.
+    if (gc_audit_mode_cache != 0) gc_audit_check(p);
     gc_header* h = gc_hdr(p);
     if (h->color == GC_WHITE) { h->color = GC_GREY; gc_grey_push(h); }
 }
@@ -1625,7 +1697,10 @@ static bool as_v_is_nullish(as_value v) { return v.tag == 0 || v.tag == 5; }
 // Reflection table entry for one dynamically-callable method. 'fn' takes the
 // receiver plus a uniform boxed argument list and returns a boxed result, so
 // any method can be invoked through a single as_dyn_call dispatch point.
-typedef struct { const char* name; as_value (*fn)(void* _this, as_value* args, int argc); } as_method;
+// Method-reflective table entry: 'vis' is the same public/non-public flag as on
+// as_prop, so JSON.stringify emits only public getters. Last field again, so an
+// initializer that omits it spells a public member.
+typedef struct { const char* name; as_value (*fn)(void* _this, as_value* args, int argc); int vis; } as_method;
 // ES3 ToNumber(Object): the NUMBER-hint ToPrimitive (valueOf first, then
 // toString) followed by stringToDouble on the primitive. Defined here because
 // it needs the as_method struct above; as_v_to_number forward-declares it.
@@ -1830,7 +1905,7 @@ static char* as_v_str_val(as_value v) {
         }
         case 5: return "undefined";
         case 6: return as_arr_to_str(v.ptr);
-        case 7: return "[Function]";
+        case 7: return "function Function() {}";
         // Owned (GC) copies, NOT the formatters' shared static buffers: trace
         // passes several of these to one printf, so a static buffer would make
         // every argument print the last value.
@@ -2653,12 +2728,16 @@ static as_array* as_array_new(void) {
     a->props = NULL;
     return a;
 }
+// NOTE (阶段一百四十七): during a sliced cycle gc_alloc hands out blocks that are
+// already BLACK and stops scanning them, so a reference written into a fresh
+// array is only reachable if the WRITE went through the barrier -- filling a new
+// array without one loses every element that is not also reachable elsewhere.
 static as_array* as_array_make(int n, as_value* items) {
     as_array* a = (as_array*)gc_alloc(GCT_ARRAY, sizeof(as_array));
     a->length = n;
     a->capacity = n;
     a->data = n > 0 ? (as_value*)gc_alloc(GCT_VALUE_ARRAY, sizeof(as_value) * (size_t)n) : NULL;
-    for (int i = 0; i < n; i++) a->data[i] = items[i];
+    for (int i = 0; i < n; i++) { a->data[i] = items[i]; gc_write_barrier_value(items[i]); }
     a->index = 0;
     a->input = NULL;
     a->props = NULL;
@@ -2722,16 +2801,25 @@ static bool as_proxy_del_miss(void* obj, const char* key) {
     return false;
 }
 // callProperty(name, ...rest): the invoked name is argument 0 and the call
-// arguments follow. The rest parameter is registered as an implicit Array (AS3
-// semantics), so the uniform thunk unboxes args[1] as an array: the flat
-// argument list is packed into one here rather than spread, matching how a
-// direct call packs '...rest'.
+// arguments follow. The uniform method thunk PACKS the rest parameter itself, so
+// what it must receive is the FLAT argument list (name followed by a0, a1, ...). Building
+// the packed Array here instead (the previous shape) made the thunk wrap that
+// already-packed Array into a one-element Array, so an interceptor reading
+// rest.length saw 1 where adl reports the real count (caught by examples/proxy.as,
+// "dotted call routes to callProperty").
 static as_value as_proxy_call(void* obj, const char* mname, as_value* args, int argc) {
-    as_value buf[2];
-    buf[0] = as_v_str((char*)mname);
-    buf[1] = as_v_obj(argc > 0 ? as_array_make(argc, args) : as_array_new());
+    as_value buf[8];
+    as_value* callArgs = buf;
+    if (argc + 1 > (int)(sizeof(buf) / sizeof(buf[0]))) {
+        // A proxy call with 8+ arguments is rare enough to take the arena (the
+        // runtime's program-lifetime allocator), like every other persistent-shape
+        // allocation; nothing here is a per-frame path.
+        callArgs = (as_value*)as_alloc(sizeof(as_value) * (size_t)(argc + 1));
+    }
+    callArgs[0] = as_v_str((char*)mname);
+    for (int i = 0; i < argc; i++) callArgs[i + 1] = args[i];
     as_value out;
-    if (as_proxy_invoke(obj, "callProperty", buf, 2, &out)) return out;
+    if (as_proxy_invoke(obj, "callProperty", callArgs, argc + 1, &out)) return out;
     return as_proxy_throw("callProperty", 2090);
 }
 // Enumeration protocol: the loop starts at index 0 and replaces it with each
@@ -2974,7 +3062,9 @@ static as_array* as_array_splice(as_array* a, int start, int deleteCount, as_val
     int delta = itemCount - deleteCount;
     as_array_ensure(a, a->length + delta);
     if (tail > 0) memmove(&a->data[start + itemCount], &a->data[start + deleteCount], sizeof(as_value) * tail);
-    for (int i = 0; i < itemCount; i++) a->data[start + i] = items[i];
+    // The inserted items are new references into an array that may already be
+    // marked (see as_array_make): the barrier is what keeps them alive.
+    for (int i = 0; i < itemCount; i++) { a->data[start + i] = items[i]; gc_write_barrier_value(items[i]); }
     a->length += delta;
     return removed;
 }
@@ -3176,6 +3266,13 @@ static char* as_string_box_to_str(void* o) { return ((as_string*)o)->value; }
 static as_object_vtable as_string_vt = { "String", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "String", 0, as_string_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_string* as_string_new(char* value) {
+    // AS3 converts the VALUE null to Object as null, not as a String wrapper
+    // (measured on adl 51.4.1, temp/apv/adl: assigning a null String to an Object
+    // slot gives an Object that is null). Boxing NULL produced a non-NULL object, so
+    // a plain truthiness test answered true where AIR answers false -- the same
+    // defect class as as_function_new below (talkmed-meeting called a null loader
+    // callback and died on an uncaught TypeError #1006).
+    if (value == NULL) return NULL;
     as_string* s = (as_string*)gc_alloc(GCT_STRING_OBJ, sizeof(as_string));
     s->vtable = (void*)&as_string_vt;
     s->value = value;
@@ -3203,9 +3300,21 @@ typedef struct {
     as_fn value;                // the wrapped closure
 } as_function;
 
-static as_object_vtable as_function_vt = { "Function", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Function", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+// String()/toString() of ANY function value is the constant "function Function() {}"
+// on AIR -- measured on adl 51.4.1 for a builtin (unescape), a method closure and an
+// anonymous closure alike (temp/apv/adl). The generic box form gave "[object
+// Function]", and a bare boxed function value rendered "[Function]" (as_v_str_val
+// tag 7); both now answer the AIR constant.
+static char* as_function_box_to_str(void* o) { (void)o; return "function Function() {}"; }
+
+static as_object_vtable as_function_vt = { "Function", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Function", 0, as_function_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_function* as_function_new(as_fn value) {
+    // Null-preserving, exactly like as_string_new above: assigning a null Function to
+    // an Object slot is null on AIR (adl 51.4.1, temp/apv/adl). Wrapping a null
+    // closure made the guard in talkmed-meeting's TKAppUpdate.loadComplete take the
+    // true branch and call a function that is not there (uncaught TypeError #1006).
+    if (value == NULL) return NULL;
     as_function* f = (as_function*)gc_alloc(GCT_FUNCTION_OBJ, sizeof(as_function));
     f->vtable = (void*)&as_function_vt;
     f->value = value;
@@ -3233,7 +3342,9 @@ typedef struct as_boolean {
     bool value;
 } as_boolean;
 
-static as_object_vtable as_boolean_vt = { "Boolean", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Boolean", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static char* as_boolean_box_to_str(void* o) { return as_str_from_bool(((as_boolean*)o)->value); }
+
+static as_object_vtable as_boolean_vt = { "Boolean", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Boolean", 0, as_boolean_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_boolean* as_boolean_new(bool value) {
     as_boolean* b = (as_boolean*)gc_alloc(GCT_BOOLEAN, sizeof(as_boolean));
@@ -3326,8 +3437,20 @@ typedef struct as_xml_list {
     int length;
 } as_xml_list;
 
-static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
-static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+// Dynamic stringification of an XML/XMLList value must yield its E4X string value,
+// not "[object XML]". A statically-typed String assignment from an XML already goes
+// through as_xml_string_value (emit), but a value that travels through a dynamic slot --
+// Object, *, an Array element, a Dictionary value, a dynamic property -- lands in
+// vtable->box_to_str instead. talkmed-meeting stores its localized labels as XML
+// and resolves them dynamically, so every label on the login page rendered
+// "[object XML]" (measured on adl 51.4.1, temp/xmlstr3 + temp/apv/adl: String(xml),
+// ""+xml, [xml], [xml] joined, {k:xml}.k and xml-through-an-Object-parameter all
+// print the text). Both helpers are defined below, next to the E4X string value.
+static char* as_xml_box_to_str(void* o);
+static char* as_xml_list_box_to_str(void* o);
+
+static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, as_xml_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, as_xml_list_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_xml_node* as_xml_node_new(char* name) {
     as_xml_node* n = (as_xml_node*)gc_alloc(GCT_XML, sizeof(as_xml_node));
@@ -3450,13 +3573,21 @@ static char* as_xml_sc_attrval(as_xml_sc* sc) {
 }
 
 // Trim leading/trailing whitespace in place; returns the trimmed start pointer.
-static char* as_xml_trim(char* s) {
+// Trim leading/trailing XML whitespace into a FRESH GC string. It must COPY: the
+// trimmed result is stored in the node (as_xml_node.text), so advancing a pointer
+// into the caller's buffer would leave the node owning an INTERIOR pointer. An
+// interior pointer is unmarkable (gc_mark_ptr reads a header at p - sizeof) and
+// would be handed to the GC grey stack as a bogus header -- and the source buffer
+// was also being NUL-terminated in place, mutating text shared with other nodes.
+static char* as_xml_trim(const char* s) {
     if (!s) return NULL;
     while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;
     size_t n = strlen(s);
     while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\\t' || s[n-1] == '\\r' || s[n-1] == '\\n')) n--;
-    s[n] = 0;
-    return s;
+    char* out = as_str_alloc(n + 1);
+    memcpy(out, s, n);
+    out[n] = 0;
+    return out;
 }
 
 static as_xml_node* as_xml_sc_element(as_xml_sc* sc);
@@ -3633,7 +3764,11 @@ static const char* as_xml_local(const char* qname) {
     const char* colon = strrchr(qname, ':');
     return colon ? colon + 1 : qname;
 }
-static char* as_xml_local_name(as_xml_node* n) { return n ? (char*)as_xml_local(n->name) : NULL; }
+// localName() is an AS3 String value too: as_xml_local returns an INTERIOR pointer
+// (past the 'prefix:' part), so it must be copied before it leaves the runtime.
+static char* as_xml_local_name(as_xml_node* n) {
+    return n ? as_str_dup(as_xml_local(n->name)) : NULL;
+}
 
 // XML.attributes() / XMLList.attributes() (E4X). AIR returns an XMLList of the
 // element's ATTRIBUTE NODES; this subset stores attributes as a name/value pair
@@ -3644,7 +3779,7 @@ static char* as_xml_local_name(as_xml_node* n) { return n ? (char*)as_xml_local(
 // documented simplification (README-CN.md).
 static char* as_xml_attr_first(as_xml_node* n) {
     if (n == NULL || n->attr_count <= 0 || n->attr_vals == NULL) return (char*)"";
-    return n->attr_vals[0] ? n->attr_vals[0] : (char*)"";
+    return n->attr_vals[0] ? as_str_dup(n->attr_vals[0]) : (char*)"";
 }
 
 static char* as_xml_list_attributes(as_xml_list* l) {
@@ -3664,7 +3799,7 @@ static void as_xml_append_child_unsupported(void) {
 static char* as_xml_attr(as_xml_node* n, const char* name) {
     if (!n) return "";
     for (int i = 0; i < n->attr_count; i++) {
-        if (strcmp(n->attr_names[i], name) == 0) return n->attr_vals[i];
+        if (strcmp(n->attr_names[i], name) == 0) return as_str_dup(n->attr_vals[i]);
     }
     return "";
 }
@@ -3910,7 +4045,7 @@ static void as_xml_append(char** outp, size_t* lenp, size_t* capp, const char* c
 
 static char* as_xml_to_string(as_xml_node* n) {
     if (!n) return "";
-    if (!n->name) return n->text ? n->text : "";
+    if (!n->name) return as_str_dup(n->text ? n->text : "");
     // <name attr="v" ...>...</name>
     size_t cap = 64;
     char* out = as_str_alloc(cap);
@@ -3943,13 +4078,40 @@ static char* as_xml_to_string(as_xml_node* n) {
     return out;
 }
 
-// Serialize a list to text by concatenating each node's serialization.
+// E4X string value -- what XML.toString(), String(xml) and xml + "" all yield.
+// MEASURED on adl 51.4.1 (temp/tkmeet-mac/xmlstr): a TEXT node yields its text; an
+// element with NO element children yields its text content ("<a b='1'>txt</a>" ->
+// "txt", "<a b='1'/>" -> ""); an element WITH element children yields the MARKUP
+// ("<a><b/></a>" -> "<a>\\n  <b/>\\n</a>"). Our parser already trims an element's
+// text, which is why the whitespace-only case agrees. Known remaining deviations,
+// deliberately not modelled here: AIR prunes whitespace-only text nodes and
+// pretty-prints the markup; as_xml_to_string keeps the source form (TODO.md).
+static char* as_xml_string_value(as_xml_node* n) {
+    if (!n) return "";
+    // A String handed to AS3 is a VALUE: always copy the node's own buffer (see
+    // as_str_dup) -- the node may be collected while AS3 still holds the string.
+    if (!n->name) return as_str_dup(n->text ? n->text : "");
+    if (n->child_count == 0) return as_str_dup(n->text ? n->text : "");
+    return as_xml_to_string(n);
+}
+
+// XMLList string value: 0 items -> "", 1 item -> that item's string value, more
+// than one -> each item's MARKUP joined by a newline (adl 51.4.1: a list of two
+// <i>a</i>/<i>b</i> nodes prints "<i>a</i>\\n<i>b</i>", while a ONE-item list prints
+// "a" -- a lone item delegates, several do not).
 static char* as_xml_list_to_string(as_xml_list* l) {
     if (!l || l->length == 0) return "";
+    if (l->length == 1) return as_xml_string_value(l->items[0]);
     char* out = (char*)"";
-    for (int i = 0; i < l->length; i++) out = as_str_concat(out, as_xml_to_string(l->items[i]));
+    for (int i = 0; i < l->length; i++) {
+        if (i > 0) out = as_str_concat(out, "\\n");
+        out = as_str_concat(out, as_xml_to_string(l->items[i]));
+    }
     return out;
 }
+
+static char* as_xml_box_to_str(void* o) { return as_xml_string_value((as_xml_node*)o); }
+static char* as_xml_list_box_to_str(void* o) { return as_xml_list_to_string((as_xml_list*)o); }
 
 typedef struct as_object_s {
     void* vtable;
@@ -3967,6 +4129,17 @@ static as_object* as_object_new(void) {
     o->length = 0;
     o->capacity = 0;
     return o;
+}
+// AS3 Object(x): "every value is an object" -- the value ITSELF, with exactly one
+// exception: null/undefined yield a NEW EMPTY Object. Measured on adl 51.4.1
+// (temp/xmlmeth, temp/d31probe/adl): Object(null) == null is false and
+// String(Object(null)) is "[object Object]", both for a statically null operand
+// and for a dynamic star variable holding null/undefined. Boxing the null through
+// as_v_to_obj instead handed back the null-box, so Object(null) === null was
+// true here and "null" was printed.
+static as_value as_obj_conv(as_value v) {
+    if (v.tag == 0 || v.tag == 5) { as_value r = {4, 0.0, NULL}; r.ptr = (void*)as_object_new(); return r; }
+    return v;
 }
 static int as_object_find(as_object* o, const char* key) {
     for (int i = 0; i < o->length; i++) {
@@ -3997,6 +4170,82 @@ static bool as_object_del(as_object* o, const char* key) {
     o->length--;
     return true;
 }
+// ASCII case-insensitive equality (stage one hundred forty-eight). CSS selectors and
+// HTML tag names are matched case-insensitively: measured on adl 51.4.1
+// (temp/fpsprobe2, temp/blockprobe), setStyle("memMax") both styles <memMax> and is
+// reported by styleNames as "memmax", and setStyle("MemMax") styles it too.
+// No allocation on purpose -- the stylesheet lookup runs on every htmlText
+// assignment, and Fps.as assigns htmlText once per frame.
+static bool as_str_ieq(const char* a, const char* b) {
+    if (a == NULL || b == NULL) return false;
+    while (*a != 0 && *b != 0) {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb) return false;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+// Forward declaration: as_object_set is defined further down (the two entry points are
+// as_object_set_key/as_object_set); as_object_clone below needs it here.
+static as_value as_object_set(as_object* o, const char* key, as_value v);
+// Shallow copy of a record: the same string keys and the same property values in a
+// brand-new as_object. AIR's StyleSheet.setStyle stores "a copy of the style object
+// that you pass to this method" (class reference), and getStyle returns another copy,
+// so a caller that mutates the object it passed (or the one it read back) must not
+// change the sheet. Keys go through as_object_set, which owns its own copy of the key
+// and barriers the value (see the interior-pointer red line there).
+static as_object* as_object_clone(const as_object* o) {
+    as_object* r = as_object_new();
+    if (o == NULL) return r;
+    for (int i = 0; i < o->length; i++) as_object_set(r, o->keys[i], o->vals[i]);
+    return r;
+}
+// StyleSheet rule lookup: 'rules' maps a selector to a declaration record. Returns the
+// declaration record for 'name' or NULL. Case-insensitive on both sides (see
+// as_str_ieq).
+static as_object* as_ss_lookup(as_object* rules, const char* name) {
+    if (rules == NULL || name == NULL || name[0] == 0) return NULL;
+    for (int i = 0; i < rules->length; i++) {
+        if (!as_str_ieq(rules->keys[i], name)) continue;
+        as_value v = rules->vals[i];
+        // as_value tag 4 is a plain object (as_v_obj), tag 6 an array (as_v_arr).
+        // Only an OBJECT is a declaration record: a style set to an array/string/
+        // number is stored but never matches a tag lookup.
+        if (v.tag == 4) return (as_object*)v.ptr;
+        return NULL;
+    }
+    return NULL;
+}
+// A CSS numeric value's numeric part: AIR's StyleSheet table says "Only the numeric
+// part of the value is used. Units (px, pt) are not parsed", so '9px' -> 9 and
+// '-2px' -> -2 (measured: temp/fpsprobe2 A vs A2 -- the 9px/leading -2 root rule is
+// what makes the overlay 30.1px tall instead of 47.55px).
+static double as_css_num(const char* v) {
+    if (v == NULL) return 0.0;
+    return atof(v);
+}
+// A CSS color: only '#RRGGBB' (AIR: "Only hexadecimal color values are supported.
+// Named colors (such as blue) are not supported"). Anything else yields -1, which the
+// caller reads as "no color declared" rather than black.
+static int as_css_color(const char* v) {
+    if (v == NULL || v[0] != '#') return -1;
+    int acc = 0, n = 0;
+    const char* p = v + 1;
+    while (*p != 0 && n < 8) {
+        char c = *p;
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return -1;
+        acc = acc * 16 + d;
+        n++;
+        p++;
+    }
+    if (n == 0 || *p != 0) return -1;
+    return acc;
+}
 // AS3 typeof: returns the runtime type tag as a string. Matches ES3/AS3
 // semantics for the boxed subset ("number"/"string"/"boolean"/"object"/
 // "function"/"undefined").
@@ -4012,8 +4261,16 @@ static char* as_v_typeof(as_value v) {
         // A Function value sitting in an Object-typed slot is autoboxed into an
         // as_function (as_value_to_obj), so its dynamic type is still "function"
         // -- AS3 reports typeof(f) == "function" for every function value.
-        case 4: return (v.ptr != NULL && ((as_object_header*)v.ptr)->vtable == (void*)&as_function_vt)
-                       ? "function" : "object";
+        case 4:
+            // A Function value sitting in an Object-typed slot is autoboxed into an
+            // as_function (as_value_to_obj), so its dynamic type is still "function".
+            // XML/XMLList report "xml", everything else "object".
+            if (v.ptr == NULL) return "object";
+            {   void* vt = ((as_object_header*)v.ptr)->vtable;
+                if (vt == (void*)&as_function_vt) return "function";
+                if (vt == (void*)&as_xml_vt || vt == (void*)&as_xml_list_vt) return "xml";
+            }
+            return "object";
         case 6: return "object";
         case 7: return "function";
         case 0: return "object"; // AS3: typeof null == "object" (ES3 quirk)
@@ -4032,6 +4289,10 @@ static char* as_ptr_typeof(void* p) {
     if (vt == (void*)&as_boolean_vt)  return "boolean";
     if (vt == (void*)&as_string_vt)   return "string";
     if (vt == (void*)&as_function_vt) return "function";
+    // E4X is its own typeof bucket in AIR: "xml" for XML and XMLList alike
+    // (adl 51.4.1, temp/d31probe/adl -- static, dynamic-slot and Object-slot all
+    // report "xml").
+    if (vt == (void*)&as_xml_vt || vt == (void*)&as_xml_list_vt) return "xml";
     return "object";
 }
 
@@ -4151,7 +4412,13 @@ static char* as_get_qualified_superclass_name(as_value v) {
         default: return NULL;
     }
 }
-static as_value as_object_set(as_object* o, const char* key, as_value v) {
+// as_object_set_key is the shared core for the two public entry points below.
+// copy_key == 0 is only used for keys this program can PROVE are permanent C string
+// literals in the read-only data segment (the compiler emits those for object
+// literal keys), where copying would allocate a fresh string on every literal
+// evaluation -- pure waste that also shifts the offscreen GC trigger's phase
+// (阶段一百四十七: measured +1.4 MB of churn per 1000 literal records).
+static as_value as_object_set_key(as_object* o, const char* key, as_value v, int copy_key) {
     int i = as_object_find(o, key);
     if (i >= 0) {
         o->vals[i] = v;
@@ -4176,17 +4443,34 @@ static as_value as_object_set(as_object* o, const char* key, as_value v) {
         // parallel arrays are not swept while still referenced.
         for (int i = 0; i < o->length; i++) { gc_write_barrier((void*)nk[i]); gc_write_barrier_value(nv[i]); }
     }
-    o->keys[o->length] = (char*)key;
+    // The key must be an INDEPENDENT value. o->keys is a GCT_PTR_ARRAY, so the
+    // marker walks every entry as a pointer: a caller-supplied INTERIOR pointer
+    // (URLVariables.decode passes a p pointer into the buffer it just split in
+    // place, and any AS3 obj[str] with a substring key gets here) would be read
+    // as a block
+    // body, greying a bogus "block" whose header is really string bytes -- the
+    // corruption measured on TalkMED (阶段一百四十七). Copying also fixes the
+    // lifetime: the caller's buffer may be garbage while the key is still in use.
+    // The copy is skipped only for keys the compiler emitted as string literals
+    // (see as_object_make), whose lifetime is the program's.
+    const char* owned = key;
+    if (copy_key && key != NULL) owned = as_str_dup(key);
+    o->keys[o->length] = (char*)owned;
     o->vals[o->length] = v;
     o->length++;
-    gc_write_barrier((void*)key);
+    gc_write_barrier((void*)owned);
     gc_write_barrier_value(v);
     return v;
 }
+// The literal-key path: the keys come from the emitted (char*[n]){ "a", ... } brace
+// initialiser, i.e. permanent string literals -- store them as-is (copy_key == 0).
 static as_object* as_object_make(int n, char** keys, as_value* vals) {
     as_object* o = as_object_new();
-    for (int i = 0; i < n; i++) as_object_set(o, keys[i], vals[i]);
+    for (int i = 0; i < n; i++) as_object_set_key(o, keys[i], vals[i], 0);
     return o;
+}
+static as_value as_object_set(as_object* o, const char* key, as_value v) {
+    return as_object_set_key(o, key, v, 1);
 }
 
 // SWC named-child properties (阶段一百三十七). AIR exposes every NAMED child of an
@@ -4492,28 +4776,7 @@ static as_value as_dyn_get(void* obj, const char* key) {
         as_prop* props = (as_prop*)((as_vtable_header*)vt)->props;
         if (props != NULL) {
             for (int i = 0; props[i].name != NULL; i++) {
-                if (strcmp(props[i].name, key) == 0) {
-                    char* base = (char*)obj;
-                    switch (props[i].type) {
-                        case 1: return as_v_num(*(double*)(base + props[i].offset));
-                        case 2: return as_v_bool(*(bool*)(base + props[i].offset));
-                        case 3: case 13: return as_v_str(*(char**)(base + props[i].offset));
-                        case 4: return as_v_num((double)(*(int*)(base + props[i].offset)));
-                        case 5: return as_v_num((double)(*(unsigned*)(base + props[i].offset)));
-                        case 6: return as_v_obj(*(void**)(base + props[i].offset));
-                        // Reference kinds 10/11/12 (Array / class instance /
-                        // Object slot) read exactly like 6: the slot is already a
-                        // pointer; only the WRITE side type-checks.
-                        case 10: case 11: case 12: return as_v_obj(*(void**)(base + props[i].offset));
-                        case 7: return *(as_value*)(base + props[i].offset);
-                        // 64-bit enhancement fields (our own tags 8/9 in the prop
-                        // table): the struct slot is a plain int64_t/uint64_t, so
-                        // the boxed value carries the exact width.
-                        case 8: return as_v_i64(*(int64_t*)(base + props[i].offset));
-                        case 9: return as_v_u64(*(uint64_t*)(base + props[i].offset));
-                    }
-                    return as_v_null();
-                }
+                if (strcmp(props[i].name, key) == 0) return as_prop_read(obj, &props[i]);
             }
         }
         vt = ((as_vtable_header*)vt)->super;
@@ -5465,6 +5728,7 @@ static size_t gc_audit_freed_size[GC_AUDIT_FREED_RING];
 static void* gc_audit_freed_vt[GC_AUDIT_FREED_RING];
 static int gc_audit_freed_pos = 0;
 static int gc_audit_reports = 0;
+static int gc_audit_body_reports = 0;   // NON-BODY budget (阶段一百四十七)
 // Separate budgets: the free_bytes drift lines are numerous and only
 // informative in bulk, while a DANGLING/RELEASING report IS the finding --
 // it must never be crowded out by drift noise (crowding out is exactly what
@@ -5627,6 +5891,30 @@ static bool gc_audit_is_block(const void* p) {
     gc_seg_range* r = gc_seg_find(p);
     return r != NULL && (const char*)p >= r->base && (const char*)p < r->base + r->size;
 }
+
+// Does this pointer look like the BODY of a real block? The marker is handed raw
+// object pointers; an interior pointer (a substring into a string, a malloc'd
+// buffer that happens to sit inside a segment, a body used where a header
+// belongs) is unmarkable -- gc_hdr(p) = p - sizeof(gc_header) rereads somebody
+// else's bytes as type/colour/size and the marker then greys a bogus "block",
+// corrupting whatever lives there. Measured on TalkMED (阶段一百四十七): the FPS
+// overlay writes an htmlText string every frame, and a link in the heap ended up
+// holding the string's first 8 bytes -- the SIGSEGV address was literally the
+// ASCII of "FPS: 121". A body has a known type tag, a colour 0..2, an 8-aligned
+// size, and does not overrun its segment.
+static bool gc_audit_is_body(const void* p) {
+    gc_seg_range* r = gc_seg_find(p);
+    if (r == NULL || (const char*)p < r->base + sizeof(gc_header) || (const char*)p >= r->base + r->size) return false;
+    const gc_header* h = (const gc_header*)((const char*)p - sizeof(gc_header));
+    if (h->type != 0 && (h->type < GCT_TAG_BASE || h->type > GCT_TAG_BASE + 16)) return false;
+    if (h->color < 0 || h->color > 2) return false;
+    if (h->size == 0 || (h->size & 7) != 0) return false;
+    // The header sits *before* p, so only the body has to fit (a block that ends
+    // exactly at its segment's end is normal, and it is the common case for the
+    // last block of a small segment).
+    if (h->size > (size_t)((r->base + r->size) - (const char*)p)) return false;
+    return true;
+}
 static void gc_audit_gate_frame(int i, const void* ra) {
     unsigned long off = 0;
     const char* sym = gc_dbg_sym(ra, &off);
@@ -5670,7 +5958,40 @@ static void gc_audit_check(void* p) {
     if (p == NULL) return;
     if (gc_in_heap(p)) {
         gc_header* h = gc_hdr(p);
-        if (h->type != 0) return;
+        if (h->type != 0) {
+            // A live block -- but is the pointer we were handed really this
+            // block's body? An interior pointer (a substring, a body passed where
+            // a header belongs) greys a bogus "block" at p - 24 and the next
+            // sweep links that garbage into a free list (阶段一百四十七).
+            if (!gc_audit_is_body(p) && gc_audit_body_reports++ < 40) {
+                fprintf(stderr, "[gc-audit] NON-BODY pointer %p (hdr type=0x%x color=%d size=%zu) handed to the marker/barrier\\n",
+                        p, h->type, h->color, h->size);
+                gc_audit_where();
+                {
+                    // What IS this memory? Dump the surroundings as text: a response
+                    // header block, a JSON payload and a struct differ at a glance.
+                    const unsigned char* d = (const unsigned char*)p - 40;
+                    fprintf(stderr, "                 raw ra=%p bytes:", (void*)ASC_RETURN_ADDRESS(0));
+                    for (int _i = 0; _i < 40; _i++) {
+                        unsigned char _c = d[_i];
+                        fputc((_c >= 32 && _c < 127) ? (int)_c : '.', stderr);
+                    }
+                    fputs(" | ", stderr);
+                    for (int _i = 40; _i < 80; _i++) {
+                        unsigned char _c = d[_i];
+                        fputc((_c >= 32 && _c < 127) ? (int)_c : '.', stderr);
+                    }
+                    fputc('\\n', stderr);
+                }
+                gc_audit_gate_frame(0, ASC_RETURN_ADDRESS(0));
+                gc_audit_gate_frame(1, ASC_RETURN_ADDRESS(1));
+                gc_audit_gate_frame(2, ASC_RETURN_ADDRESS(2));
+                gc_audit_gate_frame(3, ASC_RETURN_ADDRESS(3));
+                gc_audit_gate_frame(4, ASC_RETURN_ADDRESS(4));
+                fflush(stderr);
+            }
+            return;
+        }
         if (gc_audit_reports++ < 32) {
             int old_type = -1; size_t old_size = 0; void* old_vt = NULL;
             for (int i = 0; i < GC_AUDIT_FREED_RING; i++) {
@@ -5779,7 +6100,7 @@ static void gc_scan(gc_header* h) {
     }
     case GCT_CLASS: {
         // Walk the vtable super chain's props reflection tables. Only ref (6),
-        // any (7) and string (3) fields carry pointers.
+        // any (7), string (3) and name-string (13) fields carry pointers.
         void* vt = ((as_object_header*)b)->vtable;
         while (vt != NULL) {
             as_prop* props = (as_prop*)((as_vtable_header*)vt)->props;
@@ -5788,7 +6109,19 @@ static void gc_scan(gc_header* h) {
                     char* base = b;
                     gc_audit_prop = props[i].name;
                     switch (props[i].type) {
-                    case 3: gc_mark_ptr(*(char**)(base + props[i].offset)); break;
+                    // 13 is DisplayObject.name: the very same char* storage as 3, but
+                    // its own tag because a dynamic write must reject null with
+                    // TypeError #2007. It MUST be marked like 3 -- the tag exists for
+                    // the WRITE side only. Leaving it out swept every DisplayObject
+                    // name on the first collection that reached the object, and the
+                    // freed slot was handed to the next short-lived string, so
+                    // e.target.name in a click handler came back as an unrelated
+                    // string (TalkMED: HomeView.clickTabList parses the tab index out
+                    // of e.target.name, so every tab click collapsed to index 0 and
+                    // opened the "打开网页" tab's StageWebView; measured on the live
+                    // app and reproduced in temp/nameprobe, where a rooted
+                    // TextField's name read back as a churned "ZZ: 0").
+                    case 3: case 13: gc_mark_ptr(*(char**)(base + props[i].offset)); break;
                     case 6: gc_mark_ptr(*(void**)(base + props[i].offset)); break;
                     // 10/11/12 hold the same kind of pointer as 6 (Array, class
                     // instance, autoboxed Object) -- they exist only so the WRITE
@@ -5960,6 +6293,9 @@ static void gc_mark_stack(void) {
     for (char* p = lo; p < gc_stack_top; p += sizeof(void*)) {
         void* w;
         memcpy(&w, p, sizeof(void*));   // words are not guaranteed pointer-aligned
+        // gc_is_object rejects interior pointers (a char* cursor walking a
+        // string): marking one would grey a bogus "block" whose "header" is
+        // really payload bytes (阶段一百四十七).
         if (gc_is_object(w)) gc_mark_ptr(w);
     }
 }
@@ -6596,9 +6932,38 @@ static unsigned char* as_multibyte_encode(const char* s, const char* charSet, un
 // URL percent-encoding (application/x-www-form-urlencoded). encode leaves
 // unreserved chars [A-Za-z0-9-_.~] alone and escapes everything else as %XX;
 // decode reverses %XX (invalid sequences are left verbatim).
-static bool as_url_is_unreserved(char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
-        || c == '-' || c == '_' || c == '.' || c == '~';
+// URLVariables.toString()'s escape set is ALPHANUMERIC ONLY: measured on adl
+// 51.4.1 (temp/uvarair), '-' '_' '.' '~' are encoded as well ('s_-.~' comes out
+// 's%5F%2D%2E%7E'), so every non [A-Za-z0-9] byte becomes %XX with UPPERCASE hex.
+// This is NOT the encodeURIComponent safe set -- that one is as_uri_encode()'s,
+// which keeps the extra characters its 'safe' argument lists. Both the KEY and
+// the VALUE of a pair go through this encoder.
+static bool as_url_var_safe(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+}
+// The encoded length in bytes, WITHOUT allocating. Callers must size their
+// destination with this and never with strlen(): a value holding a JSON blob
+// encodes to about three times its raw length, and a buffer sized from the raw
+// length overflows -- that overflow wrote past a GC string into the next block's
+// first word and corrupted the free list (阶段一百五十三).
+static size_t as_url_encoded_len(const char* s) {
+    if (s == NULL) return 0;
+    size_t n = 0;
+    for (const unsigned char* p = (const unsigned char*)s; *p != 0; p++) n += as_url_var_safe((char)*p) ? 1 : 3;
+    return n;
+}
+// Encode into a caller-sized buffer. Returns the number of bytes written (no
+// terminator is appended).
+static size_t as_url_encode_into(char* dst, const char* s) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t p = 0;
+    if (s == NULL) return 0;
+    for (const unsigned char* q = (const unsigned char*)s; *q != 0; q++) {
+        unsigned char c = *q;
+        if (as_url_var_safe((char)c)) dst[p++] = (char)c;
+        else { dst[p++] = '%'; dst[p++] = hex[c >> 4]; dst[p++] = hex[c & 0xF]; }
+    }
+    return p;
 }
 static int as_url_hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -6608,18 +6973,19 @@ static int as_url_hexval(char c) {
 }
 static char* as_url_encode(const char* s) {
     if (s == NULL) return (char*)"";
-    size_t n = strlen(s);
-    char* r = as_str_alloc(n * 3 + 1);
-    int p = 0;
-    static const char hex[] = "0123456789ABCDEF";
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (as_url_is_unreserved((char)c)) r[p++] = (char)c;
-        else { r[p++] = '%'; r[p++] = hex[c >> 4]; r[p++] = hex[c & 0xF]; }
-    }
-    r[p] = 0;
+    char* r = as_str_alloc(as_url_encoded_len(s) + 1);
+    size_t n = as_url_encode_into(r, s);
+    r[n] = 0;
     return r;
 }
+// application/x-www-form-urlencoded decoding -- the read side of
+// URLVariables.decode()/the URLVariables constructor. This is FORM decoding, not
+// URI decoding: a literal '+' means a space, in EITHER half of a pair. Measured
+// on adl 51.4.1 (temp/uvarair): new URLVariables("plus=a+b") answers "a b",
+// new URLVariables("p+q=1") answers the key "p q", and
+// new URLVariables("a%20b=c%20d") answers the key "a b" -- the round trip closes
+// (toString() gives back "a%20b=c%20d") only because the key was decoded too.
+// The only caller is URLVariables_decode, so the form rule lives here.
 static char* as_url_decode(const char* s) {
     if (s == NULL) return (char*)"";
     size_t n = strlen(s);
@@ -6631,6 +6997,8 @@ static char* as_url_decode(const char* s) {
             int lo = as_url_hexval(s[i+2]);
             r[p++] = (char)((hi << 4) | lo);
             i += 2;
+        } else if (s[i] == '+') {
+            r[p++] = ' ';
         } else {
             r[p++] = s[i];
         }
@@ -7424,15 +7792,20 @@ static void as_json_buf_append_cstr(as_json_buf* b, const char* s) {
 static void as_json_buf_append_char(as_json_buf* b, char c) {
     as_json_buf_append(b, &c, 1);
 }
-// Append s as a JSON string literal: quoted, with \", \\ and the control
-// characters (U+0000..U+001F) escaped per JSON.
+// Append s as a JSON string literal: quoted, with the quote and backslash
+// characters backslash-escaped plus the control characters (U+0000..U+001F),
+// matching ECMAScript JSON.stringify (measured on adl 51.4.1, temp/jsonair7).
+// The two-character escapes are appended as TWO single characters on purpose:
+// the earlier form passed a 2-byte C literal for the single-char escapes, which
+// also copied the literal's NUL terminator into the MIDDLE of the buffer, so any
+// JSON string holding a quote or a backslash came out truncated at that point.
 static void as_json_buf_append_string(as_json_buf* b, const char* s) {
     as_json_buf_append_char(b, '"');
     for (const char* p = s; *p; p++) {
         unsigned char c = (unsigned char)*p;
         switch (c) {
-            case '"':  as_json_buf_append(b, "\\\"", 2); break;
-            case '\\\\': as_json_buf_append(b, "\\\\", 2); break;
+            case '"':  as_json_buf_append_char(b, '\\\\'); as_json_buf_append_char(b, '"'); break;
+            case '\\\\': as_json_buf_append_char(b, '\\\\'); as_json_buf_append_char(b, '\\\\'); break;
             case '\\n': as_json_buf_append(b, "\\\\n", 2); break;
             case '\\r': as_json_buf_append(b, "\\\\r", 2); break;
             case '\\t': as_json_buf_append(b, "\\\\t", 2); break;
@@ -7451,50 +7824,153 @@ static void as_json_buf_append_string(as_json_buf* b, const char* s) {
     as_json_buf_append_char(b, '"');
 }
 
-static void as_json_stringify_rec(as_json_buf* b, as_value v) {
+// ---------- JSON.stringify: the object SHAPE ----------
+// JSON.stringify serializes a value by its RUNTIME shape, not its static type:
+// which members an object has, and where they live, depends on what it actually
+// is. Measured on adl 51.4.1 (temp/jsonair*, temp/jsonair7):
+//   * a plain record emits its dynamic keys in insertion order;
+//   * a class instance emits its PUBLIC declared fields (base class members
+//     first) and its PUBLIC getters, then its own dynamic slots -- a sealed class
+//     with public vars serializes exactly like a dynamic one, and a private field
+//     is NOT a member (a class whose only public member is the getter of a
+//     private field emits just that getter);
+//   * a member whose value is undefined or a Function is OMITTED, not written as
+//     null; a null member is kept;
+//   * an Array boxed into an Object-typed slot still serializes as a JSON array;
+//   * a cyclic structure throws TypeError #1129.
+// The previous code read EVERY tag-4 payload as an as_object record. That is the
+// layout of an object literal, but not of a class instance, whose first two words
+// are its vtable and its _dyn slot table: URLVariables' _dyn pointer was read as
+// the record's keys array and its heap neighbours as the vals/length slots. That
+// is the crash on the talkmed-meeting SMS-code login tab -- TKURLLoader.sendAndLoad
+// json-encodes its URLVariables for the debug trace, so the first
+// JSON.stringify(urlVariables) jumped into garbage
+// (talkmedE-2026-10-14-062417.ips: SIGBUS in as_json_buf_append_string, the
+// string pointer coming from a bogus o->keys[i]).
+typedef struct { as_json_buf b; void** path; int depth; int cap; } as_json_ctx;
+static _Noreturn void as_throw_json_cycle(void);   // emitted with the class helpers
+static void as_json_stringify_rec(as_json_ctx* c, as_value v);
+
+static void as_json_seen_push(as_json_ctx* c, void* p) {
+    if (c->depth == c->cap) {
+        c->cap = c->cap == 0 ? 32 : c->cap * 2;
+        c->path = (void**)realloc(c->path, (size_t)c->cap * sizeof(void*));
+    }
+    c->path[c->depth++] = p;
+}
+// True when p is already open HIGHER UP this same chain. A pointer shared by two
+// SIBLING branches is a DAG, not a cycle, and must serialize twice -- AIR does
+// exactly that (temp/jsonair4 'dag': {p:x, q:x} emits x in both).
+static bool as_json_seen(const as_json_ctx* c, void* p) {
+    for (int i = 0; i < c->depth; i++) if (c->path[i] == p) return true;
+    return false;
+}
+// One "name":value member; the caller's counter supplies the commas. AIR skips an
+// undefined or Function value entirely (temp/jsonair7).
+static void as_json_member(as_json_ctx* c, const char* name, as_value v, int* n) {
+    if (v.tag == 5 || v.tag == 7) return;
+    if (*n > 0) as_json_buf_append_char(&c->b, ',');
+    as_json_buf_append_string(&c->b, name);
+    as_json_buf_append_char(&c->b, ':');
+    as_json_stringify_rec(c, v);
+    (*n)++;
+}
+// The members one class DECLARES, base class first (AIR puts the inherited
+// members ahead of the derived ones -- temp/jsonair2 'inherit'). vis != 0 marks a
+// non-public member, or a table entry that exists only for the GC scanner, and
+// neither is a JSON member.
+static void as_json_class_members(as_json_ctx* c, void* obj, void* vt, int* n) {
+    as_vtable_header* h = (as_vtable_header*)vt;
+    if (h->super != NULL) as_json_class_members(c, obj, h->super, n);
+    as_prop* props = (as_prop*)h->props;
+    for (int i = 0; props != NULL && props[i].name != NULL; i++) {
+        if (props[i].vis) continue;
+        as_json_member(c, props[i].name, as_prop_read(obj, &props[i]), n);
+    }
+    as_method* getters = (as_method*)h->getters;
+    for (int i = 0; getters != NULL && getters[i].name != NULL; i++) {
+        if (getters[i].vis) continue;
+        as_json_member(c, getters[i].name, getters[i].fn(obj, NULL, 0), n);
+    }
+}
+static void as_json_array(as_json_ctx* c, as_array* a) {
+    if (as_json_seen(c, a)) as_throw_json_cycle();
+    as_json_seen_push(c, a);
+    as_json_buf_append_char(&c->b, '[');
+    for (int i = 0; i < a->length; i++) {
+        if (i > 0) as_json_buf_append_char(&c->b, ',');
+        as_json_stringify_rec(c, a->data[i]);
+    }
+    as_json_buf_append_char(&c->b, ']');
+    c->depth--;
+}
+
+static void as_json_stringify_rec(as_json_ctx* c, as_value v) {
     switch (v.tag) {
-        case 0: as_json_buf_append_cstr(b, "null"); break;
+        case 0: as_json_buf_append_cstr(&c->b, "null"); break;
         case 1:
             // JSON has no NaN/Infinity; ECMAScript JSON.stringify serializes
             // them as null.
-            if (isnan(v.num) || isinf(v.num)) as_json_buf_append_cstr(b, "null");
-            else as_json_buf_append_cstr(b, as_str_from_double(v.num));
+            if (isnan(v.num) || isinf(v.num)) as_json_buf_append_cstr(&c->b, "null");
+            else as_json_buf_append_cstr(&c->b, as_str_from_double(v.num));
             break;
-        case 2: as_json_buf_append_cstr(b, (v.num != 0.0) ? "true" : "false"); break;
-        case 3: as_json_buf_append_string(b, (char*)v.ptr); break;
-        case 5: as_json_buf_append_cstr(b, "null"); break;
-        case 6: {
-            as_array* a = (as_array*)v.ptr;
-            as_json_buf_append_char(b, '[');
-            for (int i = 0; i < a->length; i++) {
-                if (i > 0) as_json_buf_append_char(b, ',');
-                as_json_stringify_rec(b, a->data[i]);
-            }
-            as_json_buf_append_char(b, ']');
-            break;
-        }
+        case 2: as_json_buf_append_cstr(&c->b, (v.num != 0.0) ? "true" : "false"); break;
+        case 3: as_json_buf_append_string(&c->b, (char*)v.ptr); break;
+        // undefined is null at the TOP level (JSON.stringify(undefined) is
+        // "null"); inside an object it is omitted, and as_json_member does that.
+        case 5: as_json_buf_append_cstr(&c->b, "null"); break;
+        case 6: as_json_array(c, (as_array*)v.ptr); break;
         case 4: {
-            as_object* o = (as_object*)v.ptr;
-            as_json_buf_append_char(b, '{');
-            for (int i = 0; i < o->length; i++) {
-                if (i > 0) as_json_buf_append_char(b, ',');
-                as_json_buf_append_string(b, o->keys[i]);
-                as_json_buf_append_char(b, ':');
-                as_json_stringify_rec(b, o->vals[i]);
+            void* p = v.ptr;
+            if (p == NULL) { as_json_buf_append_cstr(&c->b, "null"); break; }
+            int kind = as_heap_kind(p);
+            if (kind == GCT_ARRAY) { as_json_array(c, (as_array*)p); break; }
+            if (kind != GCT_OBJECT && kind != GCT_CLASS) {
+                // A Dictionary (GCT_DICT), a Vector (GCT_CUSTOM) or a static box
+                // also keeps tag 4 in an Object-typed slot, but its first word is
+                // NOT a vtable, so it cannot be reflected at all. AIR stringifies
+                // these as their toString (measured: Dictionary -> "Dictionary",
+                // ByteArray -> "ByteArray", Date -> its date string), which this
+                // subset does not model; null is reported, and named on stderr,
+                // instead of reading a data pointer as a vtable -- the crash the
+                // shape dispatch above exists to prevent. Documented divergence.
+                as_shell_unsupported("JSON.stringify of a Dictionary/Vector/boxed native value (serialized as null)");
+                as_json_buf_append_cstr(&c->b, "null");
+                break;
             }
-            as_json_buf_append_char(b, '}');
+            if (as_json_seen(c, p)) as_throw_json_cycle();
+            as_json_seen_push(c, p);
+            int n = 0;
+            as_json_buf_append_char(&c->b, '{');
+            if (kind == GCT_OBJECT) {
+                // An object literal / dynamic Object: its own property table IS
+                // the member list (insertion order; AIR's is a hash order).
+                as_object* o = (as_object*)p;
+                for (int i = 0; i < o->length; i++) as_json_member(c, o->keys[i], o->vals[i], &n);
+            } else {
+                as_json_class_members(c, p, ((as_object_header*)p)->vtable, &n);
+                // A dynamic class instance keeps its UNDECLARED members in the
+                // _dyn slot table, after the declared ones.
+                as_object* dyn = as_dyn_table(p);
+                for (int i = 0; dyn != NULL && i < dyn->length; i++)
+                    as_json_member(c, dyn->keys[i], dyn->vals[i], &n);
+            }
+            as_json_buf_append_char(&c->b, '}');
+            c->depth--;
             break;
         }
-        default: as_json_buf_append_cstr(b, "null"); break;
+        default: as_json_buf_append_cstr(&c->b, "null"); break;
     }
 }
 static char* as_json_stringify(as_value v) {
-    as_json_buf b;
-    as_json_buf_init(&b);
-    as_json_stringify_rec(&b, v);
-    char* r = as_str_alloc(b.len + 1);
-    strcpy(r, b.buf);
-    free(b.buf);
+    as_json_ctx c;
+    memset(&c, 0, sizeof(c));
+    as_json_buf_init(&c.b);
+    as_json_stringify_rec(&c, v);
+    char* r = as_str_alloc(c.b.len + 1);
+    strcpy(r, c.b.buf);
+    free(c.b.buf);
+    free(c.path);
     return r;
 }
 
@@ -7749,6 +8225,9 @@ extern void sk_path_add_rect(void* path, double x, double y, double w, double h)
 extern void sk_path_add_circle(void* path, double cx, double cy, double r);
 extern void sk_path_add_oval(void* path, double x, double y, double w, double h);
 extern void sk_path_close(void* path);
+// Closes every contour (Skia's AA clipper drops an unclosed contour, so a clip
+// path must be built from closed figures -- see vendor/skia_glue.cc).
+extern void sk_path_close_all(void* path);
 extern int sk_path_get_bounds(void* path, double* l, double* t, double* r, double* b);
 extern void sk_path_set_even_odd(void* path, int evenOdd);
 extern int sk_path_contains(void* path, double x, double y);
@@ -7894,6 +8373,7 @@ static inline void as_skia_path_add_rect(void* p, double x, double y, double w, 
 static inline void as_skia_path_add_circle(void* p, double cx, double cy, double r) { sk_path_add_circle(p, cx, cy, r); }
 static inline void as_skia_path_add_oval(void* p, double x, double y, double w, double h) { sk_path_add_oval(p, x, y, w, h); }
 static inline void as_skia_path_close(void* p) { sk_path_close(p); }
+static inline void as_skia_path_close_all(void* p) { sk_path_close_all(p); }
 static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { return sk_path_get_bounds(p, l, t, r, b); }
 static inline void as_skia_path_set_even_odd(void* p, int evenOdd) { sk_path_set_even_odd(p, evenOdd); }
 static inline int as_skia_path_contains(void* p, double x, double y) { return sk_path_contains(p, x, y); }
@@ -8449,6 +8929,7 @@ static inline void as_skia_path_add_rect(void* p, double x, double y, double w, 
 static inline void as_skia_path_add_circle(void* p, double cx, double cy, double r) { (void)p; (void)cx; (void)cy; (void)r; }
 static inline void as_skia_path_add_oval(void* p, double x, double y, double w, double h) { (void)p; (void)x; (void)y; (void)w; (void)h; }
 static inline void as_skia_path_close(void* p) { (void)p; }
+static inline void as_skia_path_close_all(void* p) { (void)p; }
 static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { (void)p; (void)l; (void)t; (void)r; (void)b; return 0; }
 // A pure-C build keeps no geometry (the path is NULL), so containment cannot be
 // answered here: 0 makes the hit test fall back to the stroke-inclusive bounds --
@@ -9262,6 +9743,20 @@ static void as_http_perform(as_job* j, as_http_ctx* ctx) {
     if (hdrs != NULL) curl_slist_free_all(hdrs);
     curl_easy_cleanup(h);
     if (rc != CURLE_OK || ctx->body.oom || ctx->hdr.oom) {
+        // An ioError with no cause is untriable. AIR's #2032 tells the .as
+        // program only that the transfer failed, and the AS3-visible text must
+        // stay byte-identical to AIR's, so the cause goes to stderr instead:
+        // libcurl's own code and sentence, plus the URL that failed. Without
+        // this line a transport failure on one host out of many is
+        // indistinguishable from the server refusing the request (阶段一百五十三:
+        // the SMS-code login request reported #2032 while the same POST answered
+        // 200 with plain curl).
+        if (rc != CURLE_OK) {
+            fprintf(stderr, "[as3-aot] http: %s (%d) for %s\\n", curl_easy_strerror(rc), (int)rc, (j->path != NULL) ? j->path : "(no url)");
+        } else {
+            fprintf(stderr, "[as3-aot] http: response buffer out of memory for %s\\n", (j->path != NULL) ? j->path : "(no url)");
+        }
+        fflush(stderr);
         free(eff_copy);
         free(ctx->body.buf);
         free(ctx->hdr.buf);
@@ -9578,7 +10073,18 @@ static void as_job_run(as_job* j) {
             // AS_JOB_IMAGE_URL keeps its fetched payload on the job: the finish
             // thunk still needs the encoded bytes to build the display-list
             // SkImage (there is no file to re-open by name).
-            int keep_encoded = 0;
+            //
+            // AS_JOB_DECODE (Loader.loadBytes) needs them for the SAME reason and
+            // used to drop them: the payload was freed and bytes/len were nulled
+            // as only-needed-to-decode, but the finish thunk builds bd->image
+            // from exactly those bytes. With neither payload nor URL left, the
+            // Bitmap kept correct pixels in bitmapData and still painted
+            // NOTHING (the display-list Bitmap draws only from bd->image). That
+            // is how the TalkMED login page lost its graphical captcha (a JPEG
+            // handed to loadBytes) even after the request itself succeeded
+            // (stage 154); measured with an in-app probe printing
+            // content=[object Bitmap] w=100 h=50 next to a blank slot.
+            int keep_encoded = (j->kind == AS_JOB_DECODE);
             if (j->kind == AS_JOB_IMAGE_URL) {
 #if defined(ASC_HTTP_BACKEND)
                 // The same transport URLLoader uses, run here on the worker: one
@@ -9622,7 +10128,8 @@ static void as_job_run(as_job* j) {
             void* px = (n > 0) ? as_skia_image_decode_bytes_argb(buf, n, &w, &h) : NULL;
             // The encoded bytes are only needed to decode; free them right away
             // rather than pinning the whole file until the next frame boundary.
-            // (Exception: a fetched payload, which the finish thunk still needs.)
+            // (Exceptions: a fetched payload and a loadBytes payload, which the
+            // finish thunk still needs to build the display image.)
             if (!keep_encoded) { free(buf); j->bytes = NULL; j->len = 0; }
             if (px == NULL) { j->error = AS_JOB_ERR_DECODE; break; }
             j->pixels = px;
@@ -11128,18 +11635,129 @@ static char* as_user_agent_default(void) {
     return (char*)"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) AdobeAIR/50.0";
 #endif
 }
-// ISO 639-1 language from the process locale (LANG, then LC_ALL). AIR reports a
-// bare two-letter code ("en", "zh", ...); the POSIX locale's region/encoding
-// suffix ("en_US.UTF-8") is stripped. Falls back to "en" when unset.
+// Capabilities.language / Capabilities.languages report the SYSTEM language as a
+// BCP-47 tag, NOT the process locale. Measured on adl 51.4.1 / macOS 26.6.2:
+// Capabilities.language == "zh-CN" and Capabilities.languages == ["zh-CN"] while
+// this process's LANG is "en_US.UTF-8" — the process locale is simply a different
+// thing from the user's UI language, and AIR reads the latter (CFLocale). The old
+// implementation read LANG and truncated it to two letters, so "zh-CN" could never
+// be produced: an application that compares against the exact "zh-CN" (TalkMED's
+// cn.edoctor.utils.Language.as) then silently fell back to English.
+//
+// The CoreFoundation HEADERS cannot be included here — they pull in MacTypes.h,
+// which defines struct Point, the name this compiler gives flash.geom.Point
+// (AGENTS 2.6: the generated C stays header-free, and the collision is a hard
+// compile error). So the few CoreFoundation entry points used below are declared
+// by hand: the ABI is public and stable, the shapes are fixed (CFIndex is long,
+// CFStringEncoding is UnsignedInt, Boolean is one byte), and the darwin link adds
+// -framework CoreFoundation (see platformFrameworks in src/build.ts).
+#if defined(__APPLE__) && !defined(__wasi__)
+#define ASC_HAVE_CFLOCALE 1
+typedef const void* ASC_CFRef;
+typedef const void* ASC_CFStringRef;
+extern ASC_CFRef CFLocaleCopyCurrent(void);
+extern ASC_CFRef CFLocaleCopyPreferredLanguages(void);
+extern ASC_CFRef CFLocaleGetIdentifier(ASC_CFRef locale);
+extern ASC_CFRef CFArrayGetValueAtIndex(ASC_CFRef array, long idx);
+extern long CFArrayGetCount(ASC_CFRef array);
+extern unsigned char CFStringGetCString(ASC_CFStringRef s, char* buf, long cap, unsigned encoding);
+extern void CFRelease(ASC_CFRef obj);
+// kCFStringEncodingUTF8 (CFString.h), inlined because the header is off-limits.
+#define ASC_CF_UTF8 0x08000100u
+#endif
+
+// Normalize a locale tag to the "language-REGION" shape AIR reports: the script
+// subtag is dropped (adl turns an AppleLanguages of ["zh-Hans-CN"] into "zh-CN"),
+// the region is upper-cased, and the POSIX/ICU decorations that appear in LANG
+// ("zh_CN.UTF-8", "en_US@currency=USD") end the tag. A tag with no region keeps
+// just the language ("en"). Writes at most cap-1 bytes plus the terminator.
+static void as_cap_lang_normalize(const char* tag, char* out, size_t cap) {
+    size_t n = 0;
+    if (cap == 0) return;
+    if (tag == NULL) { out[0] = 0; return; }
+    while (*tag != 0 && *tag != '-' && *tag != '_' && *tag != '.' && *tag != '@' && n + 1 < cap) {
+        out[n++] = *tag++;
+    }
+    while (*tag == '-' || *tag == '_') {
+        const char* start;
+        size_t len = 0;
+        tag++;
+        start = tag;
+        while (start[len] != 0 && start[len] != '-' && start[len] != '_' && start[len] != '.' && start[len] != '@') len++;
+        // A region subtag is two letters or three digits; anything else here is a
+        // script or variant subtag, which AIR does not report (see above).
+        if (len == 2 || (len == 3 && start[0] >= '0' && start[0] <= '9')) {
+            size_t i;
+            if (n + 1 < cap) out[n++] = '-';
+            for (i = 0; i < len && n + 1 < cap; i++) {
+                char c = start[i];
+                if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+                out[n++] = c;
+            }
+            break;
+        }
+        tag += len;
+    }
+    out[n] = 0;
+}
+
+// Capabilities.language ("zh-CN"). On Apple this is the current locale's
+// identifier, i.e. CFLocaleCopyCurrent() — the same source AIR reads, so a user
+// override made with 'defaults write -g AppleLocale' is picked up here too. The
+// process locale is the fallback for non-Apple targets and for an Apple build
+// where CoreFoundation yields nothing.
 static const char* as_cap_language(void) {
-    const char* lang = getenv("LANG");
-    if (!lang) lang = getenv("LC_ALL");
-    if (!lang || !lang[0]) return "en";
-    static char out[8];
-    int i = 0;
-    while (lang[i] && lang[i] != '_' && lang[i] != '.' && lang[i] != '-' && i < 7) { out[i] = lang[i]; i++; }
-    out[i] = '\\0';
-    return out;
+    static char out[32];
+#if defined(ASC_HAVE_CFLOCALE)
+    ASC_CFRef loc = CFLocaleCopyCurrent();
+    if (loc != NULL) {
+        ASC_CFRef id = CFLocaleGetIdentifier(loc);
+        char buf[96];
+        int ok = 0;
+        buf[0] = 0;
+        if (id != NULL) ok = CFStringGetCString((ASC_CFStringRef)id, buf, (long)sizeof(buf), ASC_CF_UTF8) ? 1 : 0;
+        CFRelease(loc);
+        if (ok) {
+            as_cap_lang_normalize(buf, out, sizeof(out));
+            if (out[0] != 0) return out;
+        }
+    }
+#endif
+    {
+        const char* lang = getenv("LANG");
+        if (!lang) lang = getenv("LC_ALL");
+        if (!lang || !lang[0]) return "en";
+        as_cap_lang_normalize(lang, out, sizeof(out));
+        return out[0] != 0 ? out : "en";
+    }
+}
+
+// Capabilities.languages: the user's preferred languages, most preferred first,
+// each normalized exactly like 'language'. Falls back to the single entry that
+// 'language' reports when no preference list is available, so the AIR invariant
+// "languages[0] == language" always holds.
+static as_array* as_cap_languages(void) {
+    as_array* list = as_array_new();
+#if defined(ASC_HAVE_CFLOCALE)
+    ASC_CFRef prefs = CFLocaleCopyPreferredLanguages();
+    if (prefs != NULL) {
+        long n = CFArrayGetCount(prefs);
+        long i;
+        for (i = 0; i < n; i++) {
+            ASC_CFRef s = CFArrayGetValueAtIndex(prefs, i);
+            char buf[96];
+            char norm[32];
+            buf[0] = 0;
+            if (s != NULL && CFStringGetCString((ASC_CFStringRef)s, buf, (long)sizeof(buf), ASC_CF_UTF8)) {
+                as_cap_lang_normalize(buf, norm, sizeof(norm));
+                if (norm[0] != 0 && strcmp(norm, "C") != 0) as_array_push(list, as_v_str(as_str_dup(norm)));
+            }
+        }
+        CFRelease(prefs);
+    }
+#endif
+    if (list->length == 0) as_array_push(list, as_v_str(as_str_dup((char*)as_cap_language())));
+    return list;
 }
 // Primary display resolution. Backed by the SDL2 window backend's display query;
 // headless (pure-C, no ASC_USE_WINDOW) builds report 0.
@@ -12446,13 +13064,22 @@ static int as_amf3w_stridx(as_amf3w* w, char* s) {
     return -1;
 }
 // A string in AMF3: 0x06 then either a reference (index << 1) or a literal
-// ((utf8 byte length << 1) | 1). Every literal joins the string table, which is
-// why a repeated member name comes back as a reference (measured).
+// ((utf8 byte length << 1) | 1). Every NON-EMPTY literal joins the string table,
+// which is why a repeated member name comes back as a reference (measured).
+//
+// The EMPTY string is the one exception: AIR writes 06 01 every single time and
+// never gives it a slot. Measured on adl (temp/solread/adl-login-2617.sol): the
+// four empty values in userInfo (realname/email/wechat_openid/mini_program_openid)
+// are all literals, while our writer entered "" on the first one and referenced it
+// afterwards -- and adl then resolved that reference to a DIFFERENT string, so
+// "email":"" came back as "mobile", the company objects lost their "title"/
+// "app_menu" keys, and HomeView.getTextBtn threw #2007 on a null title.
 static void as_amf3_wstr_body(as_amf3w* w, char* s) {
+    size_t n = strlen(s);
+    if (n == 0) { as_amfb_u29(&w->out, 1u); return; }
     int idx = as_amf3w_stridx(w, s);
     if (idx >= 0) { as_amfb_u29(&w->out, (unsigned)idx << 1); return; }
     as_amf3w_addstr(w, s);
-    size_t n = strlen(s);
     as_amfb_u29(&w->out, (unsigned)((n << 1) | 1));
     as_amfb_bytes(&w->out, s, n);
 }
@@ -12479,6 +13106,16 @@ static void as_amf3_wstr_classname(as_amf3w* w, char* s) {
     size_t n = strlen(s);
     as_amfb_u29(&w->out, (unsigned)((n << 1) | 1));
     as_amfb_bytes(&w->out, s, n);
+}
+// The empty string that terminates an object's dynamic member list is a raw
+// literal that does NOT join the string table either. Measured on adl (阶段一百五十,
+// temp/solprobeC): for {o:{x:1}, s1:"same", s2:"same"} the second "same" is the
+// reference 0x06 (index 3), so only "o1", "x" and "s1" took slots -- the class name
+// AND the terminator took none. Interning the terminator pushed every later index
+// up by one, and adl then read a repeated value out of our ".sol" as the wrong
+// string ("same" came back as "dup2").
+static void as_amf3_wstr_endmark(as_amf3w* w) {
+    as_amfb_u29(&w->out, 1);
 }
 static int as_amf3w_addobj(as_amf3w* w, as_value v) {
     if (w->nobj == w->objcap) {
@@ -12734,7 +13371,7 @@ static void as_amf3_wvalue(as_amf3w* w, as_value v) {
             as_amf3_wstr_raw(w, o->keys[i]);
             as_amf3_wvalue(w, o->vals[i]);
         }
-        as_amf3_wstr_raw(w, (char*)"");
+        as_amf3_wstr_endmark(w);
     }
 }
 
@@ -12802,7 +13439,11 @@ static char* as_amfr_str_body(as_amf3r* r) {
     if (n > 0) memcpy(s, r->p + r->pos, n);
     s[n] = 0;
     r->pos += n;
-    as_amfr_addstr(r, s);
+    // The empty string never joins the table, mirroring the writer and AIR: a
+    // literal 06 01 takes no slot, so interning it here would shift every later
+    // reference (measured while reading adl-login-2617.sol, which carries seven
+    // empty literals).
+    if (n > 0) as_amfr_addstr(r, s);
     return s;
 }
 // A string in a VALUE position: the 0x06 marker has already been consumed by
@@ -12822,6 +13463,32 @@ static char* as_amfr_str_classname(as_amf3r* r) {
     if (n > 0) memcpy(s, r->p + r->pos, n);
     s[n] = 0;
     r->pos += n;
+    return s;
+}
+// The dynamic-member terminator of an object: an empty string that never entered
+// the string table (see as_amf3_wstr_endmark). A NON-empty key, however, does
+// join the table exactly like as_amfr_str_body's strings -- AIR interns every
+// dynamic property name, and treating them as table-free desynchronised the
+// reader on any AIR-written object with dynamic fields (measured on the TalkMED
+// store: the value of "email" is the reference 14, which resolved to "" only
+// once accessToken..realname had taken slots 1..13). Only the empty terminator
+// is skipped, so a reference to "" (interned from some earlier string VALUE)
+// still resolves.
+static char* as_amfr_str_endmark(as_amf3r* r) {
+    unsigned u = as_amfr_u29(r);
+    if ((u & 1u) == 0) {
+        unsigned idx = u >> 1;
+        if (idx < (unsigned)r->nstr) return r->strs[idx];
+        as_amfr_fail(r, 3, 0);
+        return (char*)"";
+    }
+    unsigned n = u >> 1;
+    if (!as_amfr_have(r, n)) { as_amfr_fail(r, 1, 0); return (char*)""; }
+    char* s = as_str_alloc((size_t)n + 1);
+    if (n > 0) memcpy(s, r->p + r->pos, n);
+    s[n] = 0;
+    r->pos += n;
+    if (n > 0) as_amfr_addstr(r, s);
     return s;
 }
 static as_value as_amfr_addobj(as_amf3r* r, as_value v) {
@@ -12910,7 +13577,7 @@ static as_value as_amf3_robject(as_amf3r* r) {
     }
     if (dynamic) {
         for (;;) {
-            char* key = as_amfr_str_body(r);
+            char* key = as_amfr_str_endmark(r);
             if (key == NULL || key[0] == 0) break;
             as_dyn_set(out.ptr, key, as_amf3_rvalue(r));
         }

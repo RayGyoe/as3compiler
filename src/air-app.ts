@@ -879,7 +879,16 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   const effectiveFeatures = features ?? persistedFeatures;
   const keptFromManifest = features === null && persistedFeatures.length > 0;
 
-  writeFileSync(manifestPath, JSON.stringify(airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures), null, 2) + '\n');
+  const generated = airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures);
+  // applicationStorageDirectory is per application id, and AIR nests local shared
+  // objects under "#SharedObjects/<content path>/" (the descriptor's <content>).
+  // Both ride along as defines so the generated C can place ".sol" files exactly
+  // where adl does; parsing the descriptor stays here, in one place.
+  const generatedDefines = generated.defines;
+  if (Array.isArray(generatedDefines)) {
+    generatedDefines.push(`ASC_APP_ID="${info.id}"`, `ASC_SWF_PATH="${info.content}"`);
+  }
+  writeFileSync(manifestPath, JSON.stringify(generated, null, 2) + '\n');
   if (keptFromManifest) {
     // Not silent (§1.5): the artifact about to be built is NOT an AIR-identical
     // default, and the reason is a setting from a previous run.

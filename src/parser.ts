@@ -67,6 +67,7 @@ class Parser {
   private tokens: Token[];
   private imports: string[] = [];
   private currentPackage: string | null = null;
+  private swfFrameRate: number | undefined;
 
   constructor(tokens: Token[]) {
     this.tokens = tokens;
@@ -186,7 +187,24 @@ class Parser {
     // body into the top level — class/interface/function declarations then land
     // directly in program.body where symbol collection and code emission expect
     // them. Only top-level blocks are flattened (never those inside functions).
-    return { body: flattenTopLevelBlocks(body), imports: this.imports };
+    return { body: flattenTopLevelBlocks(body), imports: this.imports, swfFrameRate: this.swfFrameRate };
+  }
+
+  // `[SWF(frameRate = 30)]`: AIR's Stage reads this back through `stage.frameRate`
+  // (measured on adl 51.4.1 -- with the metadata absent the default is 24, and a
+  // 60 there reads back 60), so an AOT build must carry it too. The OTHER [SWF]
+  // keys (width/height/backgroundColor) configure the .swf container, which an AOT
+  // build does not produce -- they stay discarded. Last one wins, matching how the
+  // rest of the metadata path behaves; the value is kept raw and clamped where it
+  // is used (see Stage_set_frameRate), so both entry points share one rule.
+  private recordSwfFrameRate(list: Metadata[]): void {
+    for (const m of list) {
+      if (m.name !== 'SWF') continue;
+      const raw = m.named?.frameRate ?? m.named?.framerate;
+      if (raw === undefined) continue;
+      const v = Number(raw);
+      if (Number.isFinite(v)) this.swfFrameRate = v;
+    }
   }
 
   // `import a.b.C;` or `import a.b.*;` — record the imported qualified name for
@@ -239,9 +257,11 @@ class Parser {
       } else if (this.at('[')) {
         // Flash metadata at package level ([SWF(...)], [Frame(...)], etc.) configures
         // the .swf (size/framerate/background) and has no runtime effect for the AOT
-        // translation, so it is parsed and discarded. At package level a leading '['
-        // is always metadata (there is no array-literal statement here), so we
-        // consume it unconditionally instead of backtracking.
+        // translation, so it is parsed and discarded -- EXCEPT the frame rate, which
+        // AIR's Stage really reads back (阶段一百四十八: the default is 24, and
+        // [SWF(frameRate="60")] reads back 60 through `stage.frameRate`). At package
+        // level a leading '[' is always metadata (there is no array-literal statement
+        // here), so we consume it unconditionally instead of backtracking.
         //
         // BUT: declaration metadata ([WasmExport], [Embed], ...) must not be thrown
         // away with it — `package p { [WasmExport] function f() {} }` silently lost
@@ -249,7 +269,7 @@ class Parser {
         // was parsed. So consume the block, then rewind and let parseStatement()
         // handle the whole `[meta] decl` when a declaration actually follows.
         const save = this.pos;
-        this.parseMetadataIfPresent(false);
+        this.recordSwfFrameRate(this.parseMetadataIfPresent(false));
         const nxt = this.peek();
         if (nxt.kind === 'ident' && METADATA_DECL.has(nxt.value)) {
           this.pos = save;
@@ -299,6 +319,7 @@ class Parser {
     // followed by an identifier is treated as metadata; anything else (an array
     // literal expression statement) is left untouched by parseMetadataIfPresent.
     const metadata = this.parseMetadataIfPresent();
+    this.recordSwfFrameRate(metadata);
     if (metadata.length > 0) {
       if (this.atIdent('function')) return this.parseFuncDecl(metadata);
       if (this.atIdent('class')) return this.parseClassDecl(false, metadata, false);

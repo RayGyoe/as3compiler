@@ -154,3 +154,84 @@ if (rf.text != "hello world") throw new Error("setTextFormat must not change tex
 if (rf.numLines != 1) throw new Error("setTextFormat single line should stay 1 line, got " + rf.numLines);
 
 trace("textrich: selection/leading/hscroll/autoSize/htmlText/setTextFormat/text-replaces-runs OK");
+
+// --- StyleSheet rules make an unknown tag a BLOCK (阶段一百四十八) -------------
+// AIR's htmlText layout is stylesheet-driven: a tag the player has no inline
+// rendering for (anything outside span/p/b/i/u/font/a/li/br/img/textformat) turns
+// into a BLOCK once a rule names it, and the line break is emitted AFTER its close.
+// That is what puts the FPS overlay of the talkmed-meeting app on four lines in a
+// field whose multiline is left false. Measured on adl 51.4.1 (temp/ssprobe,
+// temp/blockprobe). Assertions here are line COUNTS and the stripped text, so they
+// hold in the pure-C flavor too (the no-Skia line count walks newlines).
+function mkSheet():StyleSheet {
+  var sheet:StyleSheet = new StyleSheet();
+  sheet.setStyle("x", {color:"#ff0000"});
+  return sheet;
+}
+function probe(html:String, sheet:StyleSheet, multiline:Boolean):TextField {
+  var f:TextField = new TextField();
+  f.width = 200;
+  f.height = 100;
+  f.wordWrap = false;
+  f.multiline = multiline;
+  f.styleSheet = sheet;
+  f.htmlText = html;
+  return f;
+}
+
+// (1) no rule -> the unknown tag stays inline.
+var plainX:TextField = probe("<x>a</x><x>b</x>", null, false);
+if (plainX.text != "ab") throw new Error("an unruled unknown tag must stay inline, got '" + plainX.text + "'");
+if (plainX.numLines != 1) throw new Error("an unruled unknown tag must not break the line, got " + plainX.numLines);
+
+// (2) with a rule -> a block break AFTER each element (independent of multiline).
+var ruledX:TextField = probe("<x>a</x><x>b</x>", mkSheet(), false);
+if (ruledX.text != "a\nb\n") throw new Error("a ruled unknown tag must break after its close, got '" + ruledX.text + "'");
+if (ruledX.numLines != 3) throw new Error("a ruled unknown tag must lay out 3 lines (a/ b/ empty), got " + ruledX.numLines);
+
+// (3) AIR's inline tags never become blocks, with or without a rule.
+var sheetSpan:StyleSheet = new StyleSheet();
+sheetSpan.setStyle("span", {color:"#00ff00", display:"block"});
+var spanField:TextField = probe("<span>a</span><span>b</span>", sheetSpan, false);
+if (spanField.text != "ab") throw new Error("a ruled <span> must stay inline, got '" + spanField.text + "'");
+if (spanField.numLines != 1) throw new Error("a ruled <span> must stay on one line, got " + spanField.numLines);
+
+// (4) a block element among inline text breaks exactly at its close.
+var mixed:TextField = probe("<span>s</span><x>F</x><span>s</span>", mkSheet(), false);
+if (mixed.text != "sF\ns") throw new Error("the break belongs AFTER the block element, got '" + mixed.text + "'");
+if (mixed.numLines != 2) throw new Error("inline-block-inline must be two lines, got " + mixed.numLines);
+
+// (5) display:inline downgrades an unknown tag; display:none hides its content.
+var sheetInline:StyleSheet = new StyleSheet();
+sheetInline.setStyle("x", {color:"#ff0000", display:"inline"});
+var inlineX:TextField = probe("<x>a</x><x>b</x>", sheetInline, false);
+if (inlineX.text != "ab") throw new Error("display:inline must downgrade the tag, got '" + inlineX.text + "'");
+if (inlineX.numLines != 1) throw new Error("display:inline must keep one line, got " + inlineX.numLines);
+var sheetNone:StyleSheet = new StyleSheet();
+sheetNone.setStyle("x", {color:"#ff0000", display:"none"});
+var noneX:TextField = probe("a<x>b</x>c", sheetNone, false);
+if (noneX.text != "ac") throw new Error("display:none must hide the element's text, got '" + noneX.text + "'");
+
+// (6) br still needs multiline (unchanged, re-asserted beside the block rule).
+var brSingle:TextField = probe("a<br>b", null, false);
+if (brSingle.numLines != 1) throw new Error("br must not break a single-line field, got " + brSingle.numLines);
+
+// (7) selectors are stored lowercased and matched case-insensitively; setStyle
+//     stores a copy and getStyle hands out another one.
+var sheetCase:StyleSheet = new StyleSheet();
+var declared:Object = {color:"#ff0070"};
+sheetCase.setStyle("MemMax", declared);
+declared.color = "#00ff00";
+if (sheetCase.styleNames.join(",") != "memmax") {
+  throw new Error("styleNames must report lowercased selectors, got '" + sheetCase.styleNames.join(",") + "'");
+}
+var readBack:Object = sheetCase.getStyle("MEMMAX");
+if (readBack.color != "#ff0070") throw new Error("setStyle must store a COPY of the object, got '" + readBack.color + "'");
+readBack.color = "#0000ff";
+var again:Object = sheetCase.getStyle("memmax");
+if (again.color != "#ff0070") throw new Error("getStyle must hand out its own copy, got '" + again.color + "'");
+sheetCase.setStyle("memmax", null);
+if (sheetCase.getStyle("memmax") != null) throw new Error("setStyle(name, null) must remove the style");
+if (sheetCase.styleNames.length != 0) throw new Error("a removed style must leave styleNames, got " + sheetCase.styleNames.length);
+
+trace("textrich: stylesheet block layout + StyleSheet copy/lowercase semantics OK");

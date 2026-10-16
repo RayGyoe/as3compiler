@@ -5,12 +5,24 @@
 // `-o temp/regress-out/<seq>-<label>` routing are unchanged; only the driver
 // changed (node:test instead of a hand-rolled pass/failed counter), which is what
 // makes `node --test --test-name-pattern=dyn-prop test/examples.ts` possible.
-import { execFileSync } from 'node:child_process';
+//
+// 阶段一百五十一: the units now run CONCURRENTLY (bounded pool, see JOBS below).
+// This layer is pure I/O — every unit waits on a `node src/index.ts … --run`
+// child, which itself waits on `cc -O2` — so overlapping them is nearly free
+// wall-clock. It is the whole reason `node test.ts` used to take minutes: the
+// unit groups are in-process CPU work (~35 s serial, and JS is single-threaded
+// so fanning them out would buy nothing), while these ~190 subprocess units were
+// awaited one at a time.
+import { execFile } from 'node:child_process';
 import { readdirSync, existsSync, mkdirSync } from 'node:fs';
+import { availableParallelism } from 'node:os';
 import { join, resolve } from 'node:path';
-import { test } from 'node:test';
+import { promisify } from 'node:util';
+import { test, describe } from 'node:test';
 import assert from 'node:assert';
 import { root } from './harness.ts';
+
+const runAsync = promisify(execFile);
 
 const dir = join(root, 'examples');
 const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
@@ -40,7 +52,11 @@ function scratchOut(label: string): string {
 // air-native's Main instantiates TweenDemo, which depends on the GreenSock core
 // (a third-party library directory excluded by SKIP_DIRS below). Those specific
 // sources are re-added explicitly for the air-native unit (see GREENSOCK_CORE).
-const SKIP_FILES = new Set(['boot-gui.as']);
+// `entry-ui.as` is textfield's second entry: it is the same probe with the UI grid
+// turned on (`new Main(true)`), which writes a 4 MB raw bitmap on top of the
+// numeric report. The directory unit must keep the single numeric entry, so the
+// UI variant is compiled only by examples/textfield/run-aot-ui.sh.
+const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as']);
 // Third-party library directories (e.g. com/greensock) ship with full AIR apps
 // but depend on features outside this compiler's subset; they are not part of
 // the regression suite's input. `shmup-stage3d` is the stage 79-83 end-to-end
@@ -140,73 +156,144 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // /边框线宽/`pixdiff`），而纯 C 构建没有光栅后端（draw 是空桩 ⇒ 墨迹 0x0），故必须链 Skia。
   // 与 autobake.as 的区别正在此：那个只 trace、不做像素断言，三种构建下都能「过」。
   'bakecrisp.as': ['--manifest', join(dir, 'bakecrisp.build.json')],
+  // scrollrect-clip.as 断言的也是**像素**（scrollRect 窗口的着色包围盒与窗口左上角
+  // 色条），纯 C 构建没有光栅后端（draw 是空桩），故与 bakecrisp.as 一样链 Skia。
+  'scrollrect-clip.as': ['--manifest', join(dir, 'scrollrect-clip.build.json')],
+  // autobake-scrollrect.as 断言的是**自动烘焙失效**后的像素（祖先烘焙 → 改 scrollRect →
+  // draw 必须变），而且它要靠 `stage.render` 跑每帧指纹 pass 才会真的进入烘焙态，
+  // 两者都只在 Skia 构建下存在，故同样链 Skia。
+  'autobake-scrollrect.as': ['--manifest', join(dir, 'autobake-scrollrect.build.json')],
+  // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
+  'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
+  // autosize-metrics.as 断言的是**字体度量**（`textWidth`/`textHeight`/`numLines`）与
+  // 「反复 `BitmapData.draw` 后字段宽度不得自噬」，两者都只在 Skia 文本后端下存在，
+  // 故与 bakecrisp.as 一样链 Skia（阶段一百六十八的 autoSize/字族兜底回归）。
+  'autosize-metrics.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
+  // tf-scale-metrics.as 断言的是**字体度量 + 字形光栅**（缩放字段的 textWidth/textHeight 口径，
+  // 以及「字形按 scaleY 整体缩放、scaleX 不拉宽」的 ink 宽），两者都只在 Skia 文本后端下存在，
+  // 故与 bakecrisp.as 一样链 Skia（阶段一百六十九的缩放口径回归）。
+  'tf-scale-metrics.as': ['--manifest', join(dir, 'tf-scale-metrics.build.json')],
+  // sbtn-null-up.as 断言的也是**像素**（`upState==NULL` 时 `BitmapData.draw` 什么都不能画、
+  // 有 up 态时画的正是 up 态），而纯 C 构建没有光栅后端（draw 是空桩），故与 bakecrisp.as 一样链 Skia。
+  'sbtn-null-up.as': ['--manifest', join(dir, 'sbtn-null-up.build.json')],
+  // swc-mc-button.as（阶段一百七十一）是 MovieClip 按钮态的渲染层回归：状态在绘制 pass 里结算，
+  // 必须真的走一帧（`stage.render`）才观察得到，而且要用像素差断言「状态真的画出来了」——两者都
+  // 只在 Skia 构建下存在，故链 swc-bitmap.build.json（它已经带上了 temp/skin.swc，与 swc-shape.as
+  // 的渲染层变体同一路子）。
+  'swc-mc-button.as': ['--manifest', join(dir, 'swc-bitmap.build.json')],
+  // examples/textfield/ 是 TextField 显示矩阵探针（docs/zh-cn/flash-text.md §3）：它报的
+  // `textWidth`/`textHeight`/`getLineMetrics` 只有在 Skia 文本后端下才存在，故目录单元
+  // 与 bakecrisp.as 一样链 Skia。键带尾部 `/` 以区分目录单元与同名 .as。
+  'textfield/': ['--manifest', join(dir, 'textfield', 'textfield.build.json')],
 };
 // Examples that need an input file absent from the tree. Skipped loudly so the
 // suite never reports coverage it did not exercise.
 const EXAMPLE_REQUIRES: Record<string, string> = {
   'swc-bitmap.as': join(root, '..', 'temp', 'skin.swc'),
   'swc-shape.as': join(root, '..', 'temp', 'skin.swc'),
+  'swc-mc-button.as': join(root, '..', 'temp', 'skin.swc'),
 };
+
+// The concurrency the example suite actually runs at.
+//
+// node:test executes TOP-LEVEL tests strictly serially (each is awaited before
+// the next one starts), so a per-test `concurrency` option cannot help here —
+// the lever is a parent suite, hence the `describe(…, { concurrency })` below.
+// Measured on 24 spread-out examples: 91.8 s at jobs=1 vs 13.6 s at jobs=8.
+//
+// Cap at 6 rather than the core count: each child is a `cc -O2` link over up to
+// ~20 MB of static libraries (Skia/SDL2/curl), so unbounded fan-out trades wall
+// time for memory pressure on the linker. `ASC_TEST_JOBS=1` restores the exact
+// original fully serial order (the fallback to reach for if a future red is ever
+// suspected of being concurrency-induced); any other positive integer overrides.
+const JOBS = (() => {
+  const raw = process.env.ASC_TEST_JOBS;
+  if (raw) {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 1) return n;
+  }
+  return Math.min(availableParallelism(), 6);
+})();
 
 // Run one example unit: compile -> link -> run. node:test turns a non-zero exit
 // into a test failure, so this only surfaces the captured output and rethrows.
-function runExample(label: string, args: string[], env?: Record<string, string>): void {
+//
+// The spawn must be ASYNC (`execFile`, not `execFileSync`). A synchronous spawn
+// pins the single JS thread for the child's whole lifetime, which is what kept
+// this file serial no matter what concurrency the runner was given: with the
+// sync form the pool below would still run one unit at a time. `out` is passed
+// in (rather than computed here) so the `temp/regress-out/<seq>-<label>` paths
+// stay deterministic under concurrency — they are numbered in registration
+// order, not completion order.
+async function runExample(label: string, args: string[], out: string, env?: Record<string, string>): Promise<void> {
   try {
-    execFileSync('node', ['src/index.ts', ...args, '-o', scratchOut(label), '--run'], { cwd: root, stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS, env: { ...process.env, ...env } });
+    await runAsync('node', ['src/index.ts', ...args, '-o', out, '--run'], {
+      cwd: root,
+      timeout: EXAMPLE_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+      env: { ...process.env, ...env },
+    });
     console.log(`PASS  ${label}`);
   } catch (err) {
-    const e = err as { stdout?: Buffer; stderr?: Buffer; signal?: string };
+    const e = err as { stdout?: string; stderr?: string; signal?: string | null };
     console.log(`FAIL  ${label}`);
-    if (e.stdout) process.stdout.write(e.stdout.toString());
-    if (e.stderr) process.stderr.write(e.stderr.toString());
+    if (e.stdout) process.stdout.write(e.stdout);
+    if (e.stderr) process.stderr.write(e.stderr);
     if (e.signal === 'SIGTERM') console.log(`  (timed out after ${EXAMPLE_TIMEOUT_MS}ms)`);
     throw err;
   }
 }
 
 // One node:test case per example unit, so a single example can be re-run with
-// e.g. `node --test --test-name-pattern=dyn-prop test/examples.ts`.
-for (const e of entries) {
-  if (SKIP_DIRS.has(e.name)) continue;
-  if (e.isDirectory()) {
-    // Multi-file example: compile every .as in the subdirectory (recursively) as one unit.
-    const subDir = join(dir, e.name);
-    const subFiles = collectAsFiles(subDir);
-    if (subFiles.length === 0) continue;
-    if (e.name === 'air-native') {
-      for (const g of GREENSOCK_CORE) subFiles.push(join(subDir, 'src', g));
-    }
-    const names = subFiles.map((f) => f.slice(subDir.length + 1));
-    test(`example: ${e.name}/ (dir unit)`, () => {
-      // Live guard: the directory unit must leave its source tree untouched.
-      // Snapshot before/after so the assertion covers whatever the compiler
-      // happens to write (a future `-o` default change would show up here, not in
-      // a structural grep of this file).
-      //
-      // The snapshot MUST be recursive: the litter that motivated this guard
-      // landed in a NESTED directory (air-native's sorted-first source is
-      // src/demo/ArrayDemos.as, so with no `-o` the default output path put
-      // ArrayDemos.c + the ArrayDemos binary into examples/air-native/src/demo/).
-      // A top-level-only readdir would have watched the one directory the bug
-      // never touched and reported PASS.
-      const before = readdirSync(subDir, { recursive: true }).sort();
-      runExample(`${e.name}/ (${names.join(', ')})`, subFiles);
-      const after = readdirSync(subDir, { recursive: true }).sort();
-      assert.deepStrictEqual(after, before,
-        `[no-src-litter] ${e.name}/ wrote into its own source dir: ${after.filter((n) => !before.includes(n)).join(', ')}`);
-    });
-  } else if (e.name.endsWith('.as')) {
-    const required = EXAMPLE_REQUIRES[e.name];
-    test(`example: ${e.name}`, (t) => {
-      if (required && !existsSync(required)) {
-        console.log(`SKIP  ${e.name} (needs ${resolve(required)}, not present)`);
-        t.skip(`needs ${resolve(required)}, not present`);
-        return;
+// e.g. `node --test --test-name-pattern=dyn-prop test/examples.ts`. The wrapper
+// suite only adds a `describe` level to the report; the case names are unchanged,
+// so `--test-name-pattern` still matches them directly.
+describe(`examples (jobs=${JOBS})`, { concurrency: JOBS }, () => {
+  for (const e of entries) {
+    if (SKIP_DIRS.has(e.name)) continue;
+    if (e.isDirectory()) {
+      // Multi-file example: compile every .as in the subdirectory (recursively) as one unit.
+      const subDir = join(dir, e.name);
+      const subFiles = collectAsFiles(subDir);
+      if (subFiles.length === 0) continue;
+      if (e.name === 'air-native') {
+        for (const g of GREENSOCK_CORE) subFiles.push(join(subDir, 'src', g));
       }
-      runExample(e.name, [join(dir, e.name), ...(EXAMPLE_ARGS[e.name] ?? [])], EXAMPLE_ENV[e.name]);
-    });
+      const names = subFiles.map((f) => f.slice(subDir.length + 1));
+      const label = `${e.name}/ (${names.join(', ')})`;
+      const out = scratchOut(label);
+      test(`example: ${e.name}/ (dir unit)`, async () => {
+        // Live guard: the directory unit must leave its source tree untouched.
+        // Snapshot before/after so the assertion covers whatever the compiler
+        // happens to write (a future `-o` default change would show up here, not in
+        // a structural grep of this file).
+        //
+        // The snapshot MUST be recursive: the litter that motivated this guard
+        // landed in a NESTED directory (air-native's sorted-first source is
+        // src/demo/ArrayDemos.as, so with no `-o` the default output path put
+        // ArrayDemos.c + the ArrayDemos binary into examples/air-native/src/demo/).
+        // A top-level-only readdir would have watched the one directory the bug
+        // never touched and reported PASS.
+        const before = readdirSync(subDir, { recursive: true }).sort();
+        await runExample(label, [...subFiles, ...(EXAMPLE_ARGS[`${e.name}/`] ?? [])], out);
+        const after = readdirSync(subDir, { recursive: true }).sort();
+        assert.deepStrictEqual(after, before,
+          `[no-src-litter] ${e.name}/ wrote into its own source dir: ${after.filter((n) => !before.includes(n)).join(', ')}`);
+      });
+    } else if (e.name.endsWith('.as')) {
+      const required = EXAMPLE_REQUIRES[e.name];
+      const out = scratchOut(e.name);
+      test(`example: ${e.name}`, async (t) => {
+        if (required && !existsSync(required)) {
+          console.log(`SKIP  ${e.name} (needs ${resolve(required)}, not present)`);
+          t.skip(`needs ${resolve(required)}, not present`);
+          return;
+        }
+        await runExample(e.name, [join(dir, e.name), ...(EXAMPLE_ARGS[e.name] ?? [])], out, EXAMPLE_ENV[e.name]);
+      });
+    }
   }
-}
+});
 
 // The AIR-app GPU window path (阶段一百二十六). The directory unit above compiles
 // air-native's .as files WITHOUT --air-app, so ASC_RENDER_WINGPU is never defined
@@ -221,7 +308,7 @@ for (const e of entries) {
 // covered by the air-native directory unit above, which is the same program).
 // It carries its own timeout: this is the only case that compiles Skia, SDL2 and
 // curl glue from source and links ~20 MB of static libraries.
-test('example: air-native (--air-app + renderMode=direct: compile+link only)', (t) => {
+test('example: air-native (--air-app + renderMode=direct: compile+link only)', async (t) => {
   const xml = join(dir, 'air-native', 'air-native-app.xml');
   const vendorLibs = ['skia', 'sdl2', 'curl'].map((v) => join(root, 'vendor', v));
   if (!existsSync(xml) || !vendorLibs.every((p) => existsSync(p))) {
@@ -229,8 +316,12 @@ test('example: air-native (--air-app + renderMode=direct: compile+link only)', (
     t.skip('needs vendor/skia, vendor/sdl2 and vendor/curl');
     return;
   }
-  execFileSync('node', ['src/index.ts', '--air-app', xml, '--main-class', 'Main',
+  // Deliberately OUTSIDE the concurrent suite above (it is registered after it,
+  // and top-level tests are serial): this one compiles Skia/SDL2/curl glue from
+  // source and links ~20 MB of static libraries, so it wants the machine to
+  // itself rather than one of the six pool slots.
+  await runAsync('node', ['src/index.ts', '--air-app', xml, '--main-class', 'Main',
     '--target', 'native', '-o', scratchOut('air-native-app')],
-    { cwd: root, stdio: 'pipe', timeout: 240_000 });
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
   console.log('PASS  air-native (--air-app)');
 });

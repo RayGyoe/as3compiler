@@ -685,6 +685,7 @@ arena / `malloc`。它们挂在 **GC 可见的字段**上（`ByteArray_props` / 
 | `BitmapData` 构造 | `malloc(w*h*4)` | `gc_alloc(GCT_BYTES, w*h*4)`（`gc_alloc` 自带清零，填充循环随后覆盖） |
 | 图片解码落 `BitmapData.pixels`（`Loader.loadBytes` / `BitmapData.loadFile`） | 直接 adopt glue `malloc` 的 ARGB 缓冲 | `memcpy` 进 GC 缓冲 + `free` glue 缓冲（glue 是 C++，调不到 GC；所有权因此单一：`pixels` 只在 GC 堆上） |
 | `BitmapData.dispose()` | `free(bd->pixels)` | `bd->pixels = NULL`（**丢引用**：`free` 一个 GC 缓冲会砸坏 GC 的空闲链） |
+| job 里的**编码字节**（`AS_JOB_DECODE` = `Loader.loadBytes` 的载荷） | 解码完立刻 `free` + 置空 `bytes/len`（「只用于解码」） | **保留到 `as_job_retire`**：`Loader__imageFinish` 要用同一批字节建显示用 SkImage（`bd->image`），否则像素正确却**什么都不画**（阶段一百五十四） |
 
 **为什么不必扫字节**：`GCT_BYTES` 是叶子（`gc_scan` 的 case 直接 `break`）。字节里没有指针
 可跟——它**可达**只因为某个类字段指向它，而那个字段的反射表条目（type 6）已经在 GCT_CLASS
@@ -728,6 +729,61 @@ BLACK，而刚 `gc_alloc` 出来的缓冲是 WHITE。
 注意当前 harness 的菜单点击落不到按钮上（窗口 640×1112 而渲染面 1800×1169，即已知的
 `csf==2` Stage3D 缩放缺陷），因此上面这条曲线其实**不含**场景进出——它只是帧循环的高水位。
 
+### 6.15 内部指针红线（阶段一百四十七）
+
+**规则**：任何进入 AS3 可见存储的 `char*` 都必须是**独立的值**（`as_str_dup` / 新 `as_str_alloc`），
+**不得**是指向别的对象内部、或指向某个缓冲区中段的**内部指针**（interior pointer）。
+
+**为什么致命**：标记器与写屏障把槽里的每个指针都当成**块体（body）**——`gc_hdr(p) = p - sizeof(gc_header)`。
+若 `p` 是字符串中段，则「头部」读到的是**正文的字节**：tag 是 ASCII、`size` 是任意值，于是 GC 把一个
+**假块**置灰，`gc_scan` 再去读它的 vtable/值，把垃圾压进灰栈；下一次清扫会把这条垃圾链进空闲链或
+`gc_all`，代价是——**几秒后堆崩**。TalkMED 实测的落点就是 `gc_sweep_step` 里的
+`gc_header* next = h->next;`，而故障地址是 **ASCII**（正是 FPS 覆盖层自己每帧写的 `"FPS: 121"`）。
+
+**实测到的生产者（都是「把借来的/中段的指针当值存」）**：
+
+| 位置 | 借用来源 | 修法 |
+|---|---|---|
+| `Language[key] = languageXMLList[i]`（XML 文本） | XML 节点的 `text` 缓冲（解析树一死，~1000 个静态字段全悬空） | `as_xml_string_value`/`as_xml_to_string`/`as_xml_attr*`/`as_xml_local_name` 一律 `as_str_dup`；`as_xml_trim` **必须复制**而不是把指针往前提（往前提还会往共享源文本里写 NUL） |
+| `URLLoader__parseHeaders` 的 header **value** | 就地切分开的整行里的 `colon + 1` | `URLRequestHeader_new(line, as_str_dup(val))` |
+| `as_object_set` 的 **key** | 调用者的指针；`URLVariables.decode` 传的就是它自己就地切分缓冲里的 `p`。而 `o->keys` 是 `GCT_PTR_ARRAY`，**会被当指针标记** | 插入时 `as_str_dup(key)` 存自己的副本（顺带修掉悬空：调用者的缓冲随时可能变成垃圾）。**唯一例外**：对象字面量的键由编译器发成 C 字符串字面量（常量数据段、程序生命周期），`as_object_make` 走 `copy_key == 0` 不复制 —— 否则每求值一个字面量就白分配一个键串（实测 1000 条字面量记录多出 ~1.4 MB 垃圾，还会挪动离屏触发器的相位） |
+
+**怎么守住**：
+
+- 源级钉 `unit: emit/NoInteriorPointers`（两处修法 + 反例断言「借用式写法已消失」）。示例无法胜任：
+  headless 程序没有帧循环，跑不到增量标记那一步（保守扫描还会顺手把缓冲保活）。
+- **审计器会当场指认**：`ASC_GC_AUDIT=1` 下 `gc_audit_check` 对每个进标记/屏障的指针做**块体形状检查**
+  （`gc_audit_is_body`：合法 `GCT_*` tag、颜色 0..2、8 字节对齐且不越段的 `size`、且不以段首为体），
+  不通过就打印 `NON-BODY pointer … handed to the marker/barrier`，附**持有者**、**5 层调用帧**，
+  以及该指针周围 **80 字节的 ASCII 现场**。`URLLoader__parseHeaders` 就是靠现场里那一片
+  `Server: nginx` / `Content-Type: text/html` 的响应头文本被抓出来的。
+- 读 `DRIFT`/`ghost` 行时若想先把「段归还」这条支路排除，用 `ASC_GC_RELEASE=0` 复跑一次对比。
+
+### 6.16 带指针的 props tag 必须全部被标记（阶段一百六十一）
+
+**规则**：类实例的 `as_prop` 反射表里有一条目，只是契约的**一半** —— `gc_scan` 还必须**跟随**那个 tag。
+带指针的 tag 是 3（`char*` 字符串）、6（未检查引用）、7（装箱 `as_value`）、10/11/12（带类型的引用）与
+**13**（`DisplayObject.name`）；1/2/4/5 是裸值，8/9（`int64`/`uint64`）**根本不持指针**（在那里做区间测试
+会把整数的位模式当堆引用标记）。
+
+**漏一个 tag 的代价**：`DisplayObject.name` 的存储与任何 String 槽**完全一样**（tag 13 只为**写侧**而设：
+*动态*写 `null` 必须抛 `TypeError #2007`），而标记器的 switch 列了 3/6/7/10/11/12 却**没列 13** ⇒ 名字字符串
+**从不置灰**，第一次到达它的回收就把它 swept 掉，释放出来的块**立刻转手**给下一条短字符串。真应用实测：
+FPS 浮层每帧都造一条 `"MS: N"`，几秒后每个点击目标的 `name` 都读回成这种串，
+`HomeView.clickTabList` 正是从 `e.target.name` 解析 tab 序号的 ⇒ 每次点击都落到 index 0（`打开网页` 那个 tab）
+并打开网页。
+
+**怎么守住**：
+
+- `examples/gc_name.as`：`System.gc()` 前后各 churn 3 万条短字符串，断言被永久根持有的 `TextField` 的 `name`
+  仍是 `"b_2"`（修前第 2 轮读回 churned 的 `"ZZ: 0"`）。
+- 单元钉 `unit: emit/GcMarkedRuntimeSlots`：从**发射物里实际出现的** props tag 集合反查 `gc_scan` 的 `case`
+  列表，**每一个都必须有分支** —— 新增一个没被标记的 tag 会把钉子变红，这正是本缺陷的形状。
+
+**相邻规则**：这是 §6.15（内部指针）在**标记侧**的兄弟，也与 box tag 的写屏障规则同源 ——
+新增任何 box tag 或持指针字段，都要在**所有**面同步补（typeof / truthy / eq / str_val / mark / barrier），
+props 表的 tag 同理。
+
 ## 7. 与现有反射表的关系（复用，不重造）
 
 | 现有设施 | GC 用途 |
@@ -753,6 +809,8 @@ BLACK，而刚 `gc_alloc` 出来的缓冲是 WHITE。
 | `realloc` 迁移数组的悬空指针 | `as_dict`/`as_timers` 等 `realloc` 时旧指针失效 | GC 只扫登记在 shadow stack/全局根的指针；`realloc` 后必须更新引用（现有代码已注意此点） |
 | **stop-the-world 停顿** | 触发帧主线程阻塞，堆大时可见卡顿 | 安全点触发 + 阈值控制频率；堆增大后必须引入**增量标记**（GC-4）才能真正消除，否则停顿随堆线性增长 |
 | WASI 无 `getrusage` 等 | 内存统计退化 | `privateMemory` 已退化到 `totalMemory`（阶段五十二），GC 不影响 |
+| **AS3 可见槽里放进内部指针** | 标记器按 `p - sizeof(gc_header)` 读「头部」→ 把正文当 tag/size → 灰化假块 → 垃圾链进空闲链/`gc_all` → 几秒后堆崩（阶段一百四十七：故障地址是 FPS 覆盖层文本的 ASCII） | 规则「进 AS3 存储的 `char*` 必须是独立值」（§6.15）；`unit: emit/NoInteriorPointers` 钉源；`ASC_GC_AUDIT=1` 的 `NON-BODY` 报告给出值/持有者/5 层调用帧/80 字节现场 |
+| **反射表的 tag 未在 `gc_scan` 里跟随** | 该槽的堆指针从不置灰 → 第一次回收即 swept 掉，释放的块转手给下一条短字符串 ⇒ 该字段读回**不相干的字符串**（阶段一百六十一：`DisplayObject.name` 的 tag 13 漏列，`e.target.name` 读回 FPS 浮层的 `MS: 17`，首页所有 tab 点击都解析成 0 而打开网页） | 规则「带指针的 tag（3/6/7/10/11/12/13）必须在 `gc_scan` 里有分支」（§6.16）；单元钉 `unit: emit/GcMarkedRuntimeSlots` 按发射物实际出现的 tag 集合反查，漏一个即红；`examples/gc_name.as` 作端到端钉子 |
 | **同一字段混用 GC 缓冲与 `malloc` 缓冲** | 对 GC 缓冲调 `free()` 会把它链进 malloc 的空闲链、砸坏 GC 的空闲链 → 随机崩溃；`malloc` 缓冲则永不回收 | 所有权单一：`ByteArray.data` / `BitmapData.pixels` 只能由 `gc_alloc(GCT_BYTES)` 产生（glue 的 `malloc` 结果一律 `memcpy` 进 GC 缓冲后 `free`）；新增/改动这些写点必须同时补 `gc_write_barrier`（§6.14） |
 
 ---

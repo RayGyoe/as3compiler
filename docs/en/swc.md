@@ -232,11 +232,80 @@ static uint8_t out = a == 0 ? 0 : min(255, (int)floor(c * 255.0 / a + 1.0 / 3.0)
 > also acceptable — the difference from AIR is ±1 channel level (visually indistinguishable); but you must
 > **never skip de-premultiplication**.
 
+**③ `DefineBitsJPEG3`(35)'s alpha is a **separate zlib plane**, and it must be composited with the JPEG**
+(added 2026-10-15, diff doc **D25**).
+
+JPEG has no alpha channel at all, so tag 35 stores the same picture **twice**:
+
+```
+DefineBitsJPEG3 (tag 35) body:
+  characterID     u16
+  alphaDataOffset u32                  <- length of the JPEG bytes that follow
+  JPEG bytes      (alphaDataOffset B)   -- **opaque**; the transparent area is filled with **black** by the FLA export
+  alpha plane     (remaining tag bytes) -- **zlib compressed**, width*height bytes, row-major, **no row padding**
+```
+
+AIR composites the two; feed only the JPEG to Skia and the transparent area is painted as a **black
+rectangle** (measured on the two TalkMED home cards `#1113` 186×160 / `#1118` 167×162: the JPEG's four
+corners are exactly `(0,0,0)`, while the plane's corners are `0` and its centre is `255`).
+
+**Correct approach**: **decompress the plane at compile time** (Node's built-in `zlib`), **composite at
+runtime** — the runtime has Skia's JPEG decoder, while the Node side must not gain one (AGENTS.md §3.1, zero
+third-party dependencies). In the generated C each plane is its own array, combined by
+`as_argb_apply_alpha`:
+
+```c
+/* Overlay an 8-bit coverage plane (tag 35's alpha) onto straight 0xAARRGGBB.
+   A JPEG always decodes opaque, so the multiply both keeps its own alpha and takes the plane's value. */
+static void as_argb_apply_alpha(unsigned* p, int n, const unsigned char* alpha) {
+  for (int i = 0; i < n; i++) {
+    unsigned c = p[i];
+    unsigned a = ((((c >> 24) & 0xffu) * (unsigned)alpha[i]) + 127u) / 255u;
+    p[i] = (a << 24) | (c & 0x00ffffffu);
+  }
+}
+```
+
+**Two** runtime paths have to go through it: a bitmap **child / resource class**
+(`BitmapData_adoptEncodedAlpha`, which updates both `pixels` and `bd->image` after compositing) and a
+**bitmap fill** (`as_swc_image_alpha`, since the fill's shader samples a SkImage). With **no plane** both
+paths fall back exactly as before (`BitmapData_adoptEncoded` / `as_skia_image_from_bytes`), keeping Skia's
+lazy decode.
+
+> **No silent degradation**: when the plane is empty, corrupt, or does not inflate to `width*height` bytes,
+> `swc.ts` warns **loudly** and records `SwcBitmap.alpha` as `null` => behaviour falls back to "JPEG only";
+> garbage coverage is never composited. Pinned by `unit: render/SwcJpeg3Alpha` (14 pins, covering both the
+> composited and the fallback path).
+
 ### 3.3 The Other Tag Category: Code (`DoABC` / ABC Bytecode) — **a Scope Declaration, Not a "Deferral"**
 
 Besides bitmap resources, `library.swf` also holds **255 `DoABC` (tag 82)** blocks, which are the **real AVM2
 bytecode of 254 classes**, not empty placeholders. Measured (a self-written parser round-trips **255/255**
 modules exactly; method in §11):
+
+> **It is in the way right now (real-machine evidence, 2026-10-14)**: a skin symbol's **own timeline script**
+> also lives in `DoABC`. On the TalkMED login page nothing in AS3 ever writes the agreement switch
+> `agreebtn` — the app only **reads** `agreebtn.currentFrame != 3` (`SmsAccount.as:270`,
+> `TalkMEDAccount.as:129`) and the toggling lives inside the symbol's script. We never run it, so
+> `currentFrame` stays at frame 1 => the switch **cannot be clicked** and pressing "sign in" always raises
+> the "please read the privacy policy and terms of service" toast: **the login flow ends there**. Measured
+> side by side: `adl 51.4.1` turns it into a green check on one click; the AOT build does not change after
+> four. See `as3compiler/talkmed-meeting-aot-vs-adl-diff.md` §2 D17 and the `TODO.md` legacy row.
+
+**Closed out on 2026-10-14 (stage 156): the frame-script half has landed; this "scope declaration" narrows to
+"real logic is not executed, frame scripts are".** A new `src/abc.ts` (`parseAbc` / `decodeSymbolScripts` /
+`OPCODES` / `decodeCode`) decodes a **symbol class**'s frame scripts (the `frame1`/`frame2`… family) into AST
+**at compile time** and reuses the existing emitter: `this.stop()`, property writes, `addEventListener` +
+closure `_self`, the `if/else` ternary, and the Flash-constructor-shaped `addFrameScript` (**`callproperty` +
+`pop`** — accepting only `callpropvoid` misses half of the frame scripts) are all covered. Landing points:
+`SwcCharacterClass.frames` → `as_swc_frames(charId, frame, o)`, driven from **the constructor (frame 1)** and
+from **`as_mc_goto` (later frames)**; `as_swc_new` makes an exported nested symbol instantiate **its own symbol
+class** (frame scripts need class methods; a bare `MovieClip_new()` has none). **The other boundary is
+unchanged**: the **254 classes' ordinary methods** among the 255 modules (TweenLite / StringCore /
+DownLoader…) are **still not executed** — that needs a whole AVM2; unsupported bytecode shapes are always
+**reported loudly / skipped**, never silent. Measured: `skin.swc`'s 255 ABC blocks give
+`aligned: 255 bad: 0`, decoding into **100 symbol classes / 110 frame scripts / 138 methods**; the regression
+pins live in `unit: render/swctimeline` (5 of them, pinned on the emitted C, verified able to go red).
 
 | Metric | Measured |
 |---|---|
@@ -394,7 +463,7 @@ library's resources (and vectors are precisely Flash's core capability).
 | `DefineScalingGrid` (78) | 22 | **nine-slice scaling** (`scale9Grid`); skin stretching must cut per it |
 | `DefineButton2` (34) | 29 | button four states |
 | `DefineMorphShape`/`2` (46/84) | 4 / 2 | morph shapes |
-| `DefineEditText`(37) / `DefineText`/`2`(11/33) | 337 / 3 | text fields (go through the existing `TextField`, not the vector domain) |
+| `DefineEditText`(37) / `DefineText`/`2`(11/33) | 337 / 3 | text fields (**tag 37 fully decoded since stage 149**, see §10) |
 | `DefineFont3` (75) | 7 | SWC-embedded fonts (listed in §10) |
 
 **② Measured shape geometry and styles**:
@@ -618,8 +687,10 @@ conclusion**:
   > referenced do its bytes truly enter the artifact.
 
 > **A PNG encoder is needed at compile time**: implementable with Node's built-in `zlib` (IHDR/IDAT/IEND + a
-> filter 0 per row, about 100 lines, zero third-party dependencies). `DefineBitsJPEG2/3` tags already store a
-> complete JPEG, so **the raw bytes are copied, with no encoder needed**. Measured, all 16 named resources in
+> filter 0 per row, about 100 lines, zero third-party dependencies). `DefineBitsJPEG2` tags already store a
+> complete JPEG, so **the raw bytes are copied, with no encoder needed**; `DefineBitsJPEG3` additionally
+> carries a zlib alpha plane that is decompressed at compile time and composited at runtime (§3.2③).
+> Measured, all 16 named resources in
 > this sample are lossless (no JPEG hit), so the first iteration must implement the PNG encoder.
 
 ### 5.2 Resources That Should *Not* Be Embedded: the Desktop / Web / Mobile Channel (**already exists — do not rebuild it**)
@@ -744,7 +815,7 @@ com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wrig
 
 | Layer | Change | Note |
 |----|------|------|
-| **build layer `src/swc.ts` (new)** | SWC extractor | ZIP parsing + CWS/ZWS decompression + stage-header skip + tag scan + bitmap extraction + **de-premultiply (§3.2)**, producing `SwcResource[]` (class name/format/width/height/straight ARGB pixels or JPEG bytes). **Reads resources only, does not parse `DoABC` bytecode** (§3.3); also reads `catalog.xml`'s `<script>/<dep>` for the §3.3.3 early diagnostic |
+| **build layer `src/swc.ts` (new)** | SWC extractor | ZIP parsing + CWS/ZWS decompression + stage-header skip + tag scan + bitmap extraction + **de-premultiply (§3.2)**, producing `SwcResource[]` (class name/format/width/height/straight ARGB pixels or JPEG bytes). **Resources are fully parsed**; for `DoABC` only a **symbol class's frame scripts** are decoded (§3.3 close-out), ordinary class methods are untouched; also reads `catalog.xml`'s `<script>/<dep>` for the §3.3.3 early diagnostic |
 | **build orchestration `src/build.ts`** | `--swc` argument / manifest `swc-paths` | collect SWC dependencies and call the extractor; when the resource section exceeds a threshold, generate a separate resource `.c` and wire it into `sources` (§5.1, **no split by default**) |
 | **semantic layer `src/symbols.ts`** | resource class registration | register the resource class names as `BitmapData` subclasses (`dynamic`, constructor `(int,int)` but **arguments ignored**) |
 | **semantic layer `src/emit.ts`** | resource-section emission + `new`/reflection dispatch | emit the C encoded-byte resource section (PNG/JPEG, §5.1); `new logo(w,h)` dispatches to the "embedded bytes → Skia decode → BitmapData" factory, with width/height from the **resource itself**; resource classes are also registered into the existing `getDefinitionByName` registry (§6) |
@@ -757,9 +828,10 @@ com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wrig
 violating the "the frontend only translates" iron rule (AGENTS.md §1.3). De-premultiplication likewise belongs
 at compile time.
 
-**Second boundary**: `swc.ts` **reads resources only, does not parse `DoABC` bytecode** (§3.3) — bytecode → C
-needs a decompiler or an AVM2 interpreter, which is a separate project. `catalog.xml`'s `<dep>` is used only
-for the **name-level** early diagnostic (§3.3.3).
+**Second boundary**: `swc.ts` **parses resources in full**; for `DoABC` it decodes **only a symbol class's frame
+scripts** (§3.3 close-out) — enough to make a checkbox/button skin actually change frames, while **ordinary class
+methods are not executed** (one class's 1,400+ method bodies / 54 KB of bytecode would mean a whole AVM2, a
+separate project). `catalog.xml`'s `<dep>` is used only for the **name-level** early diagnostic (§3.3.3).
 
 ---
 
@@ -995,8 +1067,17 @@ is built from ordinary `Shape`s, so it never hit. Changed to a geometric determi
 into the button's local space, then map it into the hit state's own space, and call `as_obj_region_hit_local`
 (which walks its own children and outline), i.e. the region AIR actually hits. The fix landed at the **shared
 helper** layer: `as_sbtn_contains_local` (local space) was factored out for `as_sbtn_contains` (stage space)
-and `as_obj_region_hit_local` to share, so `SimpleButton.hitTestPoint(x, y, true)` also now determines by hit
--state geometry (previously always a miss) — structural regression in `examples/swc-shape.as`.
+and the historical `as_sbtn_state` path to share — structural regression in `examples/swc-shape.as`.
+
+> **Stage 157 correction (this section used to say `hitTestPoint(x, y, true)` also now determines by hit-state geometry)**:
+> `as_obj_region_hit_local` deliberately returns false straight away for a `SimpleButton` (the four states are
+> separate child objects, so the button itself owns no shape region; seven probes in `temp/sbtnstate2/`: even
+> with a filled 60x60 `hitTestState` and the button on the display list, `hitTestPoint(x, y, true)` stays false),
+> while `as_sbtn_contains_local` is the **input hit area shared by hover and the mouse pick**. The split is
+> therefore fixed: paint / bounding box / shape region are unchanged — the hit state is consulted **only** for
+> "which object does this mouse hit". The 29 "down + hit only" invisible buttons in the real app
+> (three personal-centre rows, the `选择企业` back arrow) were completely dead precisely because the pick still
+> asked the paint state for a box; see `as_pick_hit_local` in `src/emit.ts`.
 
 **Results**:
 
@@ -1227,16 +1308,35 @@ reported 2 vs `adl`'s 6), and `width/height` differed in **39** places.
 After the fix: **`x/y` 0 mismatches, `numChildren` 0 mismatches, `width/height` 35** (3 of those from missing
 morph geometry, the rest precision-level differences ≤ 0.021px).
 
-**① Unsupported characters become placeholder children (never silent)**
+**① Text characters are baked as real `TextField`s (full `DefineEditText` decode)**
 
-- `DefineEditText`(37) / `DefineText`(11): measured **341** in this library (338 + 3) ⇒ baked as an **empty
-  `TextField`** (`as_swc_new`'s `'text'` branch = `TextField_new()` + `_fieldWidth/_fieldHeight` taken from the
-  declared `RECT` size), so `numChildren` / `getChildAt` index order match AIR. Glyphs and initial text remain
-  a **declared gap**, reported via `notes`
-  (`341 DefineText/DefineEditText character(s) are baked as EMPTY TextField placeholders …`).
-- `AutoSize` measured: bit `0x80` of `DefineEditText`'s second flags byte is **0 for all 341** in this
-  library; we do parse it out (`SwcText.autoSize`) — since it is all 0, reporting the placeholder box per the
-  `RECT` matches AIR.
+- `DefineEditText`(37) / `DefineText`(11): measured **341** in this library (338 + 3). Since
+  **stage 149** the whole tag-37 field is **decoded field by field** and stamped onto the instance:
+  InitialText (`hasText`), `HasFont`'s `FontID` → `FontName` + `FontHeight`, `HasTextColor`'s **RGBA**,
+  `HasLayout`'s align/margins/indent/leading, and the Multiline/WordWrap/Password/ReadOnly/NoSelect/
+  Border/HTML/MaxLength flags. Every line of text a skin ships now really draws — before this the
+  agreement paragraph, the footer line and the button captions in talkmed were **entirely absent**
+  (the fields were empty).
+- **The flags are a MSB-first 16-bit word** (a sequence of bit fields) and must **not** be read as a
+  little-endian `UI16`: the two bytes of #92 in this library are `ad 36`, which MSB-first is `0xad36`
+  = HasText|Multiline|ReadOnly|HasTextColor|HasFont|HasLayout|WasStatic|HTML — an exact match for that
+  character (its own text is `<p align="left"><font face="MiSans Regular"…`, its FontID is 5, and font 5
+  in the library *is* `MiSans Regular`). Read little-endian (`0x36ad`) **every bit becomes a different
+  flag**, which is why the old `autoSize = (second byte & 0x80)` was in fact reading **HasFontClass**
+  (0 for all 341 here, so it merely looked "always 0"). `SwcText.autoSize` is now flags `0x0040`, which
+  is **0 for all 341** in this library, so reporting the box per the `RECT` matches AIR.
+- `FontID` → `FontName` comes from reading only the `FontName` of tag 48/75/91
+  (`DefineFont2/3/4`); `FontNameLen` measured **includes the trailing NUL**, so it is trimmed after
+  decoding. This library has 7 families: `MiSans Regular`/`微软雅黑`/`宋体`/`Arial`/`04b_08`/
+  `微软雅黑 Light`/`Matura MT Script Capitals`. **The embedded glyph outlines are still not decoded** (we
+  do not synthesize a font file from the SWC), so those family names go through Skia's system-font
+  aliasing and the metrics carry a residual — a declared gap.
+- `DefineText`(11) **still bakes as an empty box**: its glyph runs need the embedded font's
+  `CodeTable` (glyph index → character code) to be recovered, and this library has only 3 — reported
+  via `notes`.
+- `notes` now reports per class: `N text character(s) are baked as TextFields: X DefineEditText … carry
+  their decoded InitialText + TextFormat (Y have a non-empty string), Z DefineText … still bake as an
+  EMPTY box …`.
 - `DefineMorphShape`(46) / `2`(84): measured **6** inside the closure ⇒ baked as an **empty `Shape`** (AIR
   uses `MorphShape`, a subclass of `Shape`; this project has no such class, so `getQualifiedClassName` reports
   `Shape`). The tree (count/index) aligns and **no wrong pixels are drawn** (an empty Shape draws nothing);
@@ -1258,9 +1358,15 @@ AIR `n=4` (including the `MorphShape` mask) ↔ ours `n=4` ✓.
 **③ The placement translation lands on the child's own `x/y` (scale stays in `transform.matrix`)**
 
 `emitSwcPlacement` now writes only the 2×2 (rotation/scale/skew) into `transform.matrix`, and the
-**translation** into the child's own `x/y` (text children add their `RECT` origin). Measured with AIR:
-non-text child `child.x == matrix.tx` (`vbitemskin c4 xy=41,23.75`), TextField child
-`x = tx + RECT.xmin` (`staticskin c1 xy=9.25,55.7` ✓ bit-identical). Scale **must** stay in the matrix:
+**translation** into the child's own `x/y`. Measured with AIR: non-text child `child.x == matrix.tx`
+(`vbitemskin c4 xy=41,23.75`). **A text child additionally adds its `RECT` origin — and that origin goes
+through the placement's linear part, with the result snapped to AIR's twip grid (1/20 px)**:
+`x = round20(tx + a·xmin + c·ymin)` (corrected in stage 170; the previous `tx + xmin` matched AIR only for
+**unit-scaled** children — all 99 children in `temp/childfx` were unit-scaled, which is why it never showed,
+while a scaled placement drifts, e.g. `subtitleskin.ctime` by 11.7px). Discriminating evidence = the four
+children of `temp/tfswc` case ⑰ (`ctime 12.0000` / `filesskin.tab1 0.0500` / `tab2 90.1000` /
+`logintabskin.tab1 0.0000`; every number AIR reports is a multiple of 1/20), implementation in
+`src/emit.ts`'s `swcTextChildXY`. Scale **must** stay in the matrix:
 F1 measured that AIR's nine-slice does not recognize placement stretching (only that way do the 42 stretched
 gridded entries match), and AIR still reads decomposed values from the matrix. Pixels unchanged (rendering
 composes `T(x,y)·R·S·M`).
@@ -1286,6 +1392,43 @@ its existing "excluding stroke" convention). A `temp/shbox.ts` re-check: among t
 and "path union + stroke" differ on **116** ⇒ the declared rect is the authoritative union (our path-accumulated
 box also counts pen `moveTo` positions). `decl` only feeds the AS3 bbox readout, **it does not participate in
 rasterization**.
+
+**⑥ A mask path must CLOSE every contour (otherwise the whole region is clipped away)**
+
+A `clipDepth` mask's outline is used directly as a clip path (`as_swc_clip_path_new`). In the real app's
+`skin.swc`, mask `#346` is `moveTo/lineTo×4` with **no `close`** — five verbs — and under `kWinding` such a
+path fills **nothing**, so the masked login-page ticker `banner` (and `con`/`titletext`/`confbtn2`) came out
+**entirely blank** (the user saw "the ticker only ever shows the first image / is blank"). Measured
+(`temp/tkmeet-mac/`, temporary glue probe `sk_path_dbg`): `SRC346 fillType=1 verbs=5 pts=5
+bounds=0,0,36.25,18.5 empty=0` / `DST346 fillType=0 verbs=5 pts=5 bounds=0,0,354,402.5`. Control
+experiments: a hand-built closed rectangle rendered ✓, the baked path + `as_skia_path_close()` rendered ✓,
+a hand-built **closed triangle** rendered ✓ ⇒ **closed contours of any shape clip fine; an unclosed contour
+blanks the entire region**.
+
+**Fix**: the glue layer gained `sk_path_close_all(void* path)` (an `SkPath::Iter` walk that rewrites **every**
+contour as closed — `SkPath::close()` alone closes only the last one and would still break multi-contour
+masks), called by the emitter right after `as_skia_path_add_transformed(...)`. Fixed at the **clip-path
+builder**, not the shape emitters: a clip is a *filled* region, so closing it is semantics-preserving, whereas
+SWF stroke contours may legitimately be open and adding `close` in the shape emitters would change stroke
+rendering. Pinned in `test/unit/render.ts` swctimeline.
+
+**⑦ The mask lives in the PARENT's space: the clip must be set BEFORE the object's own transform**
+
+A `clipDepth` mask is a **sibling** (same parent, depth in `(maskDepth, clipDepth]`) and does **not** follow
+the object it masks. The bake used to compose the mask into the **child's local pixels**
+(`inverse(childMatrix) * maskMatrix`) and the renderer clipped **after** `translate(o->x, o->y)` ⇒ the mask
+travelled with the object. For the login ticker (`banner` sliding via
+`TweenLite.to(..., {x:-(index-1)*354})` under a fixed mask) that is exactly the user's "**only the first
+image shows**": only at `x==0` (local ≡ parent) does the mask coincide with the viewport and reveal slide 1;
+after that the mask slides out of the card with the film ⇒ **entirely blank**. Measured
+(`temp/tkmeet-mac/shots/`): before the fix `spc_early` (x≈0) had an image and `spc_late` (x≈-725.7, from the
+`[diag] banner visit=150 x=-725.7` log) was **blank**; after the fix `fix_early` and `fix_late` each have
+content and show **two different slides** (`ImageChops` diff `changed_px=33476`).
+
+**Fix**: the bake passes only the mask's **own** placement (parent space), and the render walk moved
+`clip_path` from "after the transform" to **after the object's `save`, before its `translate`** (which also
+puts it before the `alpha` `saveLayer`, so the layer itself is clipped). Pinned:
+`test/unit/render.ts` swctimeline, 'the clipDepth clip is applied BEFORE the object transform'.
 
 **Acceptance**:
 
@@ -1340,11 +1483,13 @@ of API output, and after explicitly normalizing the known differences (child `na
 | Observation | `adl` semantics |
 |---|---|
 | `totalFrames` | = the SWF's number of `ShowFrame`s (`desktopshareitem` 21, `devicesitemskin` 23, `元件16_124` 17, `checkbom`/`toastbtn` 2, `元件172_339` 3) |
-| Initial state of a fresh clip | `currentFrame == 1`, **`isPlaying == false`**, and it **does not self-advance across 12 frames** while on the display list (same offscreen and onscreen) ⇒ the skin symbol's `stop()` is in the DoABC, which we cannot read; so **a baked clip always stops at frame 1** (inventing no animation, and keeping the pixel harness bit-unchanged) |
+| Initial state of a fresh clip | `currentFrame == 1`, **`isPlaying == false`**, and it **does not self-advance across 12 frames** while on the display list (same offscreen and onscreen) ⇒ the skin symbol's `stop()` is in the DoABC; **since v0.4.127 frame scripts are decoded at compile time and
+actually executed** (§3.3 close-out), so this is no longer "we cannot read it, so we must stay on frame 1" — the
+file simply *says* `stop()`, and running it is what matches AIR |
 | Property name | it is **`isPlaying`** (there is no `playing`) |
 | `currentLabel` / `currentFrameLabel` | that frame's `FrameLabel` name, or `null` |
 | `currentLabels` | an **`Array` of `FrameLabel`** (`{name, frame}`), item-by-item identical to our parse (e.g. `_up@1 _over@8 _down@15`) |
-| `gotoAndStop(n\|label)` | **advancing**: apply the delta in place (child identity preserved); **going back or back to 1**: **rebuild** the target frame's objects (adl reproduces a new auto instance name `instance5`) |
+| `gotoAndStop(n\|label)` | **advancing**: apply the delta in place (child identity preserved); **going back or back to 1**: **reuse** the existing children that the target frame still places at the same **(parent, depth, character)** — object identity and runtime state included — and only build a new object where that character actually changed; see "The reuse rule of going back" below |
 | `nextFrame` / `prevFrame` | step + **wrap** (`totalFrames` wraps to 1, 1 wraps to `totalFrames`) |
 
 **Implementation**
@@ -1359,12 +1504,13 @@ of API output, and after explicitly normalizing the known differences (child `na
   character = **delete**, and for the same frame and depth a later write overrides an earlier one; **an op
   carrying nothing is dropped** and counted/reported (this library has 270 records carrying only a morph
   `Ratio`). `SwcBakeCharacter` gains `totalFrames`/`frames`/`labels`.
-- **Emission** (`src/emit.ts`): `as_swc_tl_total/start/find/put/del/clear/apply` + `as_swc_tl_labelcount/
+- **Emission** (`src/emit.ts`): `as_swc_tl_total/start/find/put/del/apply/rewind/reuse/new/link/unlink` + `as_swc_tl_labelcount/
   labelat/frameat/label/labelframe` (a static `switch (charId)`, label names compared with `strcmp`);
   `MovieClip` gains `play`/`stop`/`gotoAndPlay`/`gotoAndStop`/`nextFrame`/`prevFrame` and `isPlaying`/
   `currentLabel`/`currentFrameLabel`/`currentLabels`; a new built-in class **`FrameLabel`**; timeline children
-  carry a depth `_tl_depth` (0 = a child added by the user's `addChild`) so that "rebuild on going back"
-  clears only timeline children. **With no bake, everything emits an empty stub.**
+  carry a depth `_tl_depth` (0 = a child added by the user's `addChild`) so that going back only claims and
+  prunes timeline children (since v0.4.143 the backward path **reuses** them — see "The reuse rule of going
+  back" below). **With no bake, everything emits an empty stub.**
 - **Class identity incidentally narrowed**: a multi-frame sprite is now instantiated as a `MovieClip`
   (`as_swc_new`'s sprite branch), consistent with the `flash.display::MovieClip` AIR reports (previously
   `Sprite`).
@@ -1385,6 +1531,44 @@ of API output, and after explicitly normalizing the known differences (child `na
    **builds without an SWC** (`examples/dyn-prop.as`, `stage62.as`, `stage94f.as`, `air-native/`) failed to
    link (the 4 failures recorded in stage ninety-seven's acceptance). Adding a stub (emitted when
    `this.swcBake === undefined`) ⇒ all 4 examples green.
+
+**The reuse rule of going back (stage 172, D43)**
+
+The "going back → rebuild the target frame's objects" above was the coarse v0.4.68 wording and is
+**retracted**: the rule measured on adl 51.4.1 is "**if the target frame still places the same character
+at the same (parent, depth), keep the existing object** — its application-written properties, its
+`TextField.text`, its listeners, all of it; a *different* character there gets a new object". Evidence in
+`temp/btnprobe/`:
+
+- `Rewind.as`: after writing `MARK0`/`MARK1` into the home card `homeskin.joinmeeting`'s `label1`/`label2`,
+  the round trip `_up(1) → _over(5) → _down(11) → _up(1)` keeps every label and its text (AIR prints
+  `label1.text` at each step).
+- `Rewind2.as`: prints each child's **identity counter** (`#n`) plus its auto instance name:
+
+  ```
+  card f=1 children: 0:#0/sh/instance8@0,0  1:#1/tf/label1@16,16  2:#2/tf/label2@16,44  3:#3/sh/instance9@0,0
+  over f=5 children: 0:#0/sh/instance8@0,0  ...(1/2/3 unchanged)
+  back to up f=1 children: 0:#4(new)/sh/instance28@0,0  1:#1/tf/label1  2:#2/tf/label2  3:#3/sh/instance9
+  ```
+
+  i.e. depth 1's character differs between frame 1 (518) and frame 5 (524) ⇒ going back builds a new object
+  (`instance8 → instance28`); depths 2/3 keep their character ⇒ **their identity counters do not move**.
+- Implementation (`src/emit.ts`): the backward path went from `as_swc_tl_clear + as_swc_bind` to
+  `as_swc_tl_rewind` — snapshot the current children as `(parent, child)` pairs (`ASC_tl_snap_par/obj`,
+  static slots registered with `gc_root_register`; a nested rewind keeps its own level), re-run frame 1 where
+  `as_swc_tl_reuse(parent, depth, charId)` first claims the snapshot's object with the same (depth, character),
+  then `as_swc_tl_apply` up to the target frame, and finally drop what nobody claimed **by object pointer**
+  (not by depth). Every baked child knows which character it came from (`_tl_char` moved from `MovieClip` to
+  `DisplayObject`, stamped centrally by `as_swc_new`).
+- Symptom and field evidence: the TalkMED home cards have their titles written into the skin `TextField` by
+  the app; the old path wiped them back to the skin design text ("快速入会" → "加入会议") after a single
+  hover. After the fix `temp/tkmeet-mac/s172labels.py` measures **0 pixel difference across the whole window
+  (FPS overlay excluded)** and 0 in each label band, before vs after a hover.
+
+**Residual (D43b)**: in the **forward** direction a `Move` record **with a new character** keeps the original
+object in AIR, while we build a new one — a baked class carries its artwork (one class per character), so a
+character change necessarily means a new instance. D43b cannot lose application text (it only fires when the
+character really changed) and is tracked in the difference doc for a later architectural decision.
 
 **Baked counts (`temp/tlcheck.ts`)**: 79 multi-frame sprites, of which **75** change after frame 1, **448**
 op frames, **514** ops (**102** add/replace, **404** modify, **8** delete); **89** `FrameLabel`s (31 sprites).
@@ -1411,8 +1595,8 @@ op frames, **514** ops (**102** add/replace, **404** modify, **8** delete); **89
   `as_swc_tl_start` / `FrameLabel` constructor / `isPlaying` / the no-bake `as_swc_bind` stub).
 
 **Residuals (recorded in §10)**: ① a timeline child's `name` is always `null` (AIR auto-names it `instanceN`;
-the SWF record has no `Name` field); ② **per-frame ActionScript (DoABC) is not executed** ⇒ the clip always
-stops at frame 1; ③ a morph timeline's `Ratio` records are discarded (morph is an empty placeholder child);
+the SWF record has no `Name` field); ② **per-frame ActionScript (DoABC) executes only for symbol frame scripts**
+(since v0.4.127, §3.3 close-out), ordinary class methods still do not; ③ a morph timeline's `Ratio` records are discarded (morph is an empty placeholder child);
 ④ the **last-digit difference** in a child's `x/y` (`0.9500000000000002` vs `0.95`, ≤2 ULP, from two `/20`
 additions).
 
@@ -1431,6 +1615,159 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 
 ---
 
+### 9.2 F7 `DefineBitsJPEG3`'s alpha plane (stage one hundred fifty-nine, v0.4.130, diff doc D25)
+
+**Symptom**: on the TalkMED home page the two cards' illustrations ("Quick join" / "Create meeting") were
+**black rectangles**, while the same page under `adl` showed them transparent. `temp/alphaprobe/probe.mjs`
+scans out exactly two tag-35 bitmaps in the whole library (`#1113` 186×160, `#1118` 167×162) — those two
+pictures.
+
+**Root cause**: the original extractor copied only the JPEG bytes and discarded the alpha plane, emitting a
+"not composited" warning. The FLA export fills the transparent area with **black**, so the transparent area
+was painted as a black rectangle. This is not a PNG-encoding problem: an entire SWF tag shape was missing.
+
+**Implementation** (two places, about 90 lines):
+
+- **Compile time** (`src/swc.ts`): the `DefineBitsJPEG3` branch inflates the plane with `node:zlib`'s
+  `inflateSync` and validates that it yields at least `width*height` bytes (taking the first `width*height`,
+  tolerating trailing padding); an empty plane, a corrupt stream, or a too-short one warns **loudly** and
+  records `alpha = null` (falling back to the old behaviour rather than compositing garbage coverage).
+- **Runtime** (`src/emit.ts`): the plane is emitted as its own `static const unsigned char` array
+  (`__swcbmp_<id>_a` / `__res_<name>_a`) plus a new `as_argb_apply_alpha`; both paths are wired up —
+  a **bitmap child / resource class** goes through `BitmapData_adoptEncodedAlpha` (overlay the plane after
+  Skia decodes the JPEG, then rebuild `bd->image`), and a **bitmap fill** goes through
+  `as_swc_image_alpha` (a fill's shader samples a SkImage, not `pixels`). With no plane both paths are
+  **byte-for-byte unchanged** (still `BitmapData_adoptEncoded` / `as_skia_image_from_bytes`, keeping the lazy decode).
+
+**Two pitfalls hit (now pinned)**:
+
+1. **Fill arrays are 1-based**: `SwcStyleLayer.fills[0]` is a placeholder (the same convention as SWF's
+   `FillStyle0/1 == 0`), with real fills from index 1. A test fixture that forgets the placeholder makes
+   `swcBakePlan`'s bitmap closure empty, so naturally no fill image array appears.
+2. **The composer must be emitted as a pair with the adopt function**: emission of `as_argb_apply_alpha`
+   was first gated on "does this build really have an alpha plane", but `BitmapData_adoptEncodedAlpha`
+   calls it **unconditionally** => a build without planes emitted C that calls a function it never defines
+   (an implicit-declaration error). It is now emitted **as a pair**: an entry point that advertises alpha
+   support must come with the implementation that can actually apply it.
+
+**Acceptance**:
+
+- **Visual**: `temp/tkmeet-mac/d25-boot.png` / `d25-home.png` — the black rectangles are gone and the
+  illustrations are transparent (same shape as `adl`).
+- **Unit**: `unit: render/SwcJpeg3Alpha`, **14 pins** (a self-made minimal SWC: a SOF0 "JPEG" plus a
+  self-made alpha plane, in a hand-written STORE-method ZIP container) pinning plane inflation/values,
+  rejection of a bad plane, and the emitted C of both the named-resource and fill paths, including the
+  reverse control "no plane falls back to the old shape".
+- **Regression**: full `node test.ts` green.
+
+---
+
+### 9.2 F8 MovieClip's three button states (`buttonMode` + `_up`/`_over`/`_down`) (stage one hundred seventy-one, v0.4.142, diff doc D42/R29)
+
+**Symptom**: TalkMED's two home cards ("quick join" / "create meeting"), the login button, the nine-grid
+icon buttons and the dialog buttons all give obvious visual feedback on hover/press under `adl` (the home
+card changes 15524 px on roll-over and 105227 px on press), while our window changed only 423 / 440 px —
+and that little change was the debug overlay animating. In other words **every button feedback in the app
+was dead**.
+
+**Root cause**: AIR has a built-in state machine for "a MovieClip carrying Flash button labels": when
+`buttonMode == true` and the timeline has the `_up` / `_over` / `_down` `FrameLabel`s, roll-over / press /
+roll-out move the **playhead for real** (`currentFrame` and `currentLabel` both change, and that frame's
+frame script runs too). We had implemented `FrameLabel` and `gotoAndStop` (§9.2 F6) but not this state
+machine. The TalkMED skin contains **29** such symbols.
+
+**Measured AIR behavior (`temp/btnprobe/`: `Probe.as` is the adl-side probe plus `p4`~`p7` captures;
+`Aot.as` / `Card.as` drive the same timeline script on our side)**
+
+| Observation | `adl` behavior |
+|---|---|
+| Gate | it is **`buttonMode`**, not "labels make it a button": switching the same class's `buttonMode` off pins it to frame 1 forever, and another symbol that has labels but no script (`BtnRootResources_99复制_362`, `buttonMode` default `false`) also stays on frame 1 |
+| Frame | decided by the **label**, not by an index: `元件17_125` is `_up@1/_over@4/_down@7`, `BtnRootResources_99复制_362` is `_up@1/_over@5/_down@10`; each lands on its own label's frame |
+| Three levels | away → `_up`; roll-over → `_over`; press → `_down` (**a real navigation**: both `currentFrame` and `currentLabel` change) |
+| Press latch | latched to the object where `mouseDown` happened: pressing elsewhere and dragging in shows only `_over`; pressing here and dragging out still holds `_down` |
+| Release | release inside goes back to `_over`, outside to `_up` |
+| Off-screen | with no mouse events at all it stays on `_up` |
+
+**Implementation** (one field in `src/symbols.ts` plus a set of helpers in `src/emit.ts`):
+
+- `symbols.ts`: `InteractiveObject` gains a private `int _btn_press_gen` (**a generation, not a stored
+  pointer**, so it introduces no new GC root and cannot dangle).
+- `ASC_mouse_target`: recomputed from the current `(x,y)` at the start of every paint/fingerprint pass
+  (`as_mouse_refresh_target`), so it also tracks display-list changes while the mouse is still.
+- `ASC_press_gen`: incremented on `mouseDown`, which then stamps that generation onto the whole **ancestor
+  chain** of the pick target; the test is `ASC_mouse_down && gen matches`. The generation only grows ⇒ a
+  stale stamp can never collide with a later press.
+- `as_mc_button_state`: three gates (a baked timeline / `buttonMode` / a real pointer) → pick the
+  `_down`/`_over`/`_up` label (with a `_down → _over → _up` fallback when a label is missing) → call
+  `as_mc_goto` **only when the frame really differs** (otherwise the delta would be replayed and the frame
+  script re-run over and over).
+- Two settle sites: the paint pass (`as_render_object`) and the **fingerprint pass** (`as_render_fp`).
+
+**The crucial pitfall: auto-baking bypasses the paint pass**
+
+Once an ancestor is auto-baked (three identical fingerprints in a row ⇒ paste the cached bitmap), the paint
+pass never walks into its children ⇒ settling the state only in `as_render_object` gives "the frame changed
+but the pixels did not": measured, after 30 headless frames it was still `f=1 _up` with a pixel difference
+of **0**, while the very same scene with `ASC_NO_AUTO_BAKE=1` was immediately correct (`f=5 _over`, 3355 px
+different). The fix needs both halves: ① settle the state in `as_render_fp` as well (it visits every node
+every frame); ② mix `MovieClip.currentFrame` into the fingerprint so that "the state changed but the drawing
+recipe did not" still invalidates the cache.
+
+**Acceptance**
+
+- **Two-ended comparison**: `temp/btnprobe/` agrees level by level on frames and labels (`元件17_125`
+  `1:_up`→`4:_over`→`7:_down`, dragging off while held keeps `7:_down`, releasing outside gives `1:_up`,
+  releasing in place returns to `4:_over`, a press that started elsewhere shows only `4:_over`), with pixel
+  differences of the same magnitude; under `ASC_NO_AUTO_BAKE=1` the window's roll-over/press pixel counts
+  are 16094/105076 vs adl's 15524/105227.
+- **Example**: `examples/swc-mc-button.as` (structure + the eight level transitions + two negative
+  controls + the home card's `1→5→11` under auto-baking + three pixel-difference pairs), driven with
+  `--manifest examples/swc-bitmap.build.json`.
+- **Unit**: `unit: display/McButtonState`, **15 pins** (three gates, the label fallback chain, the press
+  generation, both settle sites, the frame in the fingerprint, the refresh points, the example registration).
+- **Mutation check**: deleting the settle call inside `as_render_fp` turns the example **red in 11 places**
+  (including all three home-card levels).
+- **On-device**: `temp/tkmeet-mac/sweep.py` — the home card's roll-over changes 41591 px, matching `adl`'s
+  shape; the tabs/gear/user-info spots change nothing, also matching `adl`.
+- **Regression**: full `node test.ts` green.
+
+### 9.2 F9 The reuse rule of a backward timeline move (`_tl_char` + `as_swc_tl_rewind`) (stage 172, v0.4.143, diff doc D43/R30)
+
+**Symptom**: as soon as stage 171 shipped the button states, on-device acceptance caught this: the home cards'
+titles are written into the skin `TextField`s by the app (`快速入会 / Join quickly`, `创建会议 / Create Meeting`),
+and **one hover** turns them back into the skin design text (`加入会议`).
+
+**Root cause**: `as_mc_goto`'s backward branch was `as_swc_tl_clear + as_swc_bind` — it **rebuilt the whole
+frame-1 subtree**, so anything the app had written into those skin `TextField` instances went away with them.
+AIR's rule: **if the target frame still puts the same character at the same (parent, depth), reuse the existing
+object** (its properties, its `text`, its listeners); only a *different* character there gets a new object.
+
+**Measured on `adl 51.4.1`** (`temp/btnprobe/Rewind.as` / `Rewind2.as`; our mirrors `Rewind3.as` / `CardText.as`)
+
+| Observation | `adl` |
+|---|---|
+| Child identity on `_over(5) → _up(1)` | depths 2/3 (`label1`/`label2`) keep counters `#1`/`#2`; the app-written `text` survives |
+| The depth whose character changed | depth 1: 524 in frame 5 → 518 in frame 1 ⇒ a new object (auto instance name `instance8 → instance28`) |
+| A forward `Move` **with a new character** | **keeps the object identity** (only the artwork changes) — still a (D43b) difference on our side |
+
+**Implementation**: `_tl_char` moved down to `DisplayObject` (stamped centrally by `as_swc_new`); the backward
+path now runs `as_swc_tl_rewind` (snapshot `(parent, child)` → re-run frame 1 where `as_swc_tl_reuse(parent,
+depth, character)` claims the snapshot's object → `as_swc_tl_apply` to the target frame → prune by **object
+pointer**); `as_swc_tl_link` does nothing when the child already sits under the same parent (no spurious
+`ADDED`/`REMOVED` for a reused object). Details in §9.2 F6's "The reuse rule of going back".
+
+**Acceptance**: `examples/swc-mc-button.as` level ⑪ (reuse + text survival + `inkDiff == 0` against the
+pre-hover `_up` + child count unchanged + the changed-character depth really gets a new object);
+`unit: render/SwcTimeline` **+7 pins**; on-device `temp/tkmeet-mac/s172labels.py` measures **0 pixel
+difference across the whole window (FPS overlay excluded)** before vs after a hover.
+
+**Three unfixed gaps registered in the same round**: ① the pointer leaving the window does not roll out (the
+window backend never reports "left the window", so a hover latches); ② `ROLL_OVER`/`ROLL_OUT`/
+`Stage.MOUSE_LEAVE` events are not dispatched at all; ③ **D43b**: a forward `Move` with a new character keeps
+the same object in `adl` but builds a new instance here (one baked class per character).
+
+---
+
 ## 10. Explicit deferrals / limitations
 
 | Item | Reason |
@@ -1443,22 +1780,23 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 | Blur profile: we use a **Gaussian approximation**, AIR uses a **true box** | Already variance-matched (`sigma = blur*sqrt(quality)/sqrt(12)`), but the center/tail still differ (`blur6q1` ours 217/161/94/38/9 vs AIR 191/148/106/63/21). A true box needs `MatrixConvolution` (36~256 taps per layer, non-separable), a performance risk outweighing the benefit |
 | `BlendMode` modes Skia cannot express (subtract / invert / alpha / erase) | The glue returns 0 (treated as `kSrcOver`) and **reports** via `notes`, with no approximation — measured, all 8 in this library are in the expressible set (`layer`/`darken`) |
 | The semantic definition of `BlendMode.LAYER` | Implemented as **pure group isolation** (`saveLayer` + `kSrcOver`). AIR's `layer` also requires that object to become an independent cache group (equivalent to `cacheAsBitmap`); this library's only `layer` scene has no pixel difference, so no cache is layered on |
-| ~~Skipped character types make the display list's **child count too small**~~ **fixed** (§9.2 F5, v0.4.66) | `DefineEditText`/`DefineText` (341) bake to an empty `TextField`, `DefineMorphShape`/`2` (6) to an empty `Shape`, and `numChildren`/`getChildAt` indexes match AIR (`minfo` 6 vs 6, `fileitemskin` 5 vs 5, `staticskin` 19 vs 19). **Residuals**: ① text placeholder children have no glyphs/initial text, and their `width/height` are reported only per the declared `RECT` (measured, all 341 `DefineEditText` in this library have `AutoSize = 0` ⇒ no difference from AIR); ② morph placeholder children have no geometry ⇒ 3 `width/height` differences (`fileitemskin c2` `221.25×41.65` vs `128.35×19.55`, `元件124_72 c2` `11.75×11.75` vs `0×0`, `元件27_310 c0` `1×18` vs `0×0`) |
+| ~~Skipped character types make the display list's **child count too small**~~ **fixed** (§9.2 F5, v0.4.66; text **filled in** in stage 149) | `DefineEditText`/`DefineText` (341) bake to a `TextField`, `DefineMorphShape`/`2` (6) to an empty `Shape`, and `numChildren`/`getChildAt` indexes match AIR (`minfo` 6 vs 6, `fileitemskin` 5 vs 5, `staticskin` 19 vs 19). **Residuals**: ① tag-11 text children (`DefineText`, 3 in this library) still have no glyphs, and every text child's `width/height` is reported per the declared `RECT` (measured, all 341 `DefineEditText` in this library have `AutoSize = 0` ⇒ no difference from AIR); ② morph placeholder children have no geometry ⇒ 3 `width/height` differences (`fileitemskin c2` `221.25×41.65` vs `128.35×19.55`, `元件124_72 c2` `11.75×11.75` vs `0×0`, `元件27_310 c0` `1×18` vs `0×0`) |
 | A child's **class-name identity** differs from AIR | AIR reports the **class name** for characters linked by SymbolClass (e.g. `popbgskin`) and `MorphShape` for morph; we uniformly report the base class `Sprite`/`Shape` (observable via `getQualifiedClassName`). Pixels and tree are unaffected |
 | AIR's bbox **quantization/accumulation convention** differs from ours (not settled) | Measured, `temp/childfx/` has 33 `width/height` differences with `\|Δ\| ≤ 0.021px` (most ≤ 0.005, and **in both directions**): e.g. `userskin c4` AIR `260×30` vs ours `260.0006×30.0001` (the same 280×46 rect × the same 16.16 matrix scale; AIR's value looks like its own internal rounding), `homeskin c6` `354×580` vs `353.999×580.021`. The two models differ by under 0.4 twip, not settled. **Also**: baked coordinates themselves have a last-digit difference (in the timeline probe a text child's `y = 0.9500000000000002` vs `adl 0.95`, ≤2 ULP, caused by two `/20` additions), likewise only affecting string printing |
 | ~~Timeline placement matrices not back-filled into the child's **own** `x/y/scaleX/scaleY`~~ **`x/y` fixed** (§9.2 F5, v0.4.66) | The translation is now written into the child's own `x/y` (measured `vbitemskin c4` `41,23.75`, text child `x = tx + RECT.xmin`, both bit-identical). **Deliberately preserved**: the 2×2 (scale/rotation/skew) stays only in `transform.matrix` — F1 measured that AIR's nine-slice does **not** recognize placement stretching (only that way do the 42 stretched gridded entries match), so `child.scaleX/scaleY` we report as 1 while AIR sometimes reports the decomposed value (e.g. `popchatitem c0` `1.4973`). Pixels and the `transform.matrix` readback agree; only code that reads `child.scaleX` directly can observe it |
 | `ZWS` (LZMA) SWC | `temp/skin.swc` is `CWS`; the layout is given in §4, so implementation cost is low, but the value is limited, hence deferred |
 | Fonts (`DefineFont*`) | Two roads must be distinguished: the **app.xml `<embedFonts>` path is already implemented in `air-app.ts`** (producing manifest `font-urls` / `preload-paths`); **SWC-embedded fonts are not yet handled** — measured, `temp/skin.swc` contains **7 `DefineFont3`**, belonging to the separate decoding domain of "getting fonts from an SWC" |
+| The **settle timing** of MovieClip button states | The three button states settle in the **paint/fingerprint pass** (the same convention as `as_sbtn_state`), so in an off-screen program that never calls `render` and has no window, `currentFrame` does not change by itself after `dispatchMouse`; in a real app (the window runs that pass every frame) and under `stage.render` the behavior matches `adl` level by level (§9.2 F8) |
 | Sound (`DefineSound`) | Measured, `temp/skin.swc` has **no** `DefineSound` (0); if encountered in the future, it is a separate decoding domain |
 | Bitmaps referenced by `Sprite` without a class name (43) | Requires parsing the complete display tree of `DefineSprite`/`PlaceObject`; **note `small_gift`/`checkbom` belong to this bucket** (an earlier version wrongly listed them among the 16) |
 | `[Embed]` metadata syntax | **not an "existing shortcut"**: `Embed` currently has no semantic-layer consumer (§1), and the own-project scenario equally needs implementation |
-| `DefineBitsJPEG4` (tag 90) | Measured, `temp/skin.swc` has none; same family as JPEG3, support it casually. **Note**: `CHARACTER_TAG_KINDS` already classifies it as `bitmap`, but the extractor only handles 20/21/35/36 ⇒ a real tag 90 would fail on `swcBakePlan`'s bitmap branch with a **misleading** `bitmap fill references missing bitmap #N` (it should report as JPEG4) |
+| `DefineBitsJPEG4` (tag 90) | Measured, `temp/skin.swc` has none; same family as JPEG3 (tag 35 **is supported**, §3.2③), support it casually. **Note**: `CHARACTER_TAG_KINDS` already classifies it as `bitmap`, but the extractor only handles 20/21/35/36 ⇒ a real tag 90 would fail on `swcBakePlan`'s bitmap branch with a **misleading** `bitmap fill references missing bitmap #N` (it should report as JPEG4) |
 | ~~Nine-slice scaling (`DefineScalingGrid`, measured 22)~~ **implemented** (§9 F/§9.2 F1); but the **AS3-side `DisplayObject.scale9Grid` property is not yet implemented** | The project only bakes nine-slice from the SWF tag, and the runtime **has no** readable/writable `scale9Grid` property (AIR does). That is: scaling in an SWF skin does not blur, but user code cannot set/query it itself. Recorded per §1.5 in `TODO.md`'s `### 遗留待开发` |
 | `BitmapData.draw(source, matrix)` handling of source's **own transform** differs from AIR | Measured with `adl`: setting `o.scaleX = 2` on the drawn object has **no effect** in `draw(source, matrix)` (only the `matrix` argument matters); our implementation applies it. The probe was therefore uniformly changed to wrap in a container first and then draw. **Not settled**, recorded in `### 遗留待开发` |
 | Morph shapes (`DefineMorphShape`/`2`, measured 6) | Requires two sets of geometry + interpolation; only 6 in this library, low value, hence deferred. **Current state**: already baked as an **empty `Shape` placeholder child** (§9.2 F5) ⇒ the tree aligns and no wrong pixels are drawn, but geometry and interpolation remain gaps; its timeline `Ratio` records (270 in this library) are discarded and reported (§9.2 F6) |
 | ~~Button four states (`DefineButton2`, measured 29)~~ **implemented** (§9 F/§9.2 F2) | `ButtonRecord.states` bitmask + a draw-time state machine (`as_sbtn_state`); offscreen pixel-identical to `adl` |
-| ~~Timeline animation (`DefineSprite` multi-frame + `FrameLabel`)~~ **implemented** (§9.2 F6, v0.4.68) | The per-frame delta (add/replace/modify/delete) is baked at compile time, and `gotoAndStop`/`nextFrame`/`prevFrame`/`currentLabels` match `adl` item by item (68 lines, 0 differences); 79 multi-frame sprites / 514 ops / 89 `FrameLabel`s. **Residuals**: ① a timeline child's `name` is always `null` (AIR auto-names it `instanceN`; the SWF record has no `Name` field); ② **per-frame ActionScript (DoABC) is not executed** — the skin symbol's `stop()` cannot be read, so a baked clip **always stops at frame 1** (this is exactly `adl`'s observed behavior, which is why the pixel harness is bit-unchanged); ③ a morph timeline's `Ratio` records are discarded (morph is an empty placeholder child) |
-| **SWC-embedded code (ABC bytecode)** | **This is out of scope, not a "deferral"**: measured 255 `DoABC` = 254 classes / 54,162 B of bytecode. Container reading is solved (§3.3.1, 255/255 round-trip self-proving), but bytecode → a compilable artifact needs a **decompiler or an AVM2 interpreter** (§3.3.2), a separate project. The realistic form = "resources from the SWC, code from `.as`", with `<dep>` for the compile-time diagnostic (§3.3.3). **Measured, only the 8 mx/flex classes (3,135 B) lack source**, so hand-writing them suffices (§3.3.0) |
+| ~~Timeline animation (`DefineSprite` multi-frame + `FrameLabel`)~~ **implemented** (§9.2 F6, v0.4.68) | The per-frame delta (add/replace/modify/delete) is baked at compile time, and `gotoAndStop`/`nextFrame`/`prevFrame`/`currentLabels` match `adl` item by item (68 lines, 0 differences); 79 multi-frame sprites / 514 ops / 89 `FrameLabel`s; going back reuses children whose (parent, depth, character) is unchanged (stage 172, D43). **Residuals**: ① a timeline child's `name` is always `null` (AIR auto-names it `instanceN`; the SWF record has no `Name` field); ② **per-frame ActionScript (DoABC) executes for symbol frame scripts** (since v0.4.127, §3.3 close-out); ordinary class methods still do not; ③ a morph timeline's `Ratio` records are discarded (morph is an empty placeholder child); ④ a forward `Move` **with a new character** keeps the object identity in AIR but builds a new object here (D43b — a baked class carries one character's artwork) |
+| **SWC-embedded code (ABC bytecode)** | **Originally ruled out of scope, now partially landed**: measured 255 `DoABC` = 254 classes / 54,162 B of bytecode; container reading is solved (§3.3.1, 255/255 round-trip self-proving). **Since v0.4.127 a symbol class's frame scripts are decoded into AST at compile time and executed** (§3.3 close-out: 110 frame scripts, which is why the real app's checkbox/button skins actually change frames); the remaining **ordinary class methods** (TweenLite/StringCore…) → a compilable artifact still needs a **decompiler or an AVM2 interpreter** (§3.3.2), a separate project. The realistic form = "resources from the SWC, code from `.as`", with `<dep>` for the compile-time diagnostic (§3.3.3). **Measured, only the 8 mx/flex classes (3,135 B) lack source**, so hand-writing them suffices (§3.3.0) |
 
 ---
 

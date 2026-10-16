@@ -215,7 +215,7 @@ function checkTextInput(): string[] {
   check('TextFieldType exposes INPUT/DYNAMIC as measured constants',
     c.includes('TextFieldType_INPUT') && c.includes('"input"') && c.includes('"dynamic"'));
   check('TextEvent carries a text payload and the TEXT_INPUT constant',
-    c.includes('{ "text", 3, offsetof(TextEvent, text) }')
+    c.includes('{ "text", 3, offsetof(TextEvent, text), NULL, NULL, 0 }')
     && c.includes('static char* const TextEvent_TEXT_INPUT = "textInput";'));
   check('TextEvent constructs through the measured (type, bubbles, cancelable, text) shape',
     c.includes('static TextEvent* TextEvent_new(char* type, bool bubbles, bool cancelable, char* text) {')
@@ -236,8 +236,11 @@ function checkTextInput(): string[] {
     && c.includes('o->displayAsPassword = false;')
     && c.includes('o->tabEnabled = false;')
     && c.includes('o->___restrict = NULL;'));
+  // `as_str_empty()` (not a bare one-byte as_str_alloc) so the byte is really
+  // terminated: the GC does not zero GCT_STRING, and a forgotten write made the
+  // field report whatever the recycled block held (阶段一百四十九).
   check('a fresh field reports "" (not a NULL string) for text',
-    c.includes('o->text = as_str_alloc(1);') && !c.includes('o->text = NULL;'));
+    c.includes('o->text = as_str_empty();') && !c.includes('o->text = NULL;'));
   // type 的 setter 复刻 AIR 那个「值真的变化才联动 tabEnabled」的副作用
   // （四步实测见 temp/editprobe/src/Def2.as）：同值重赋不得覆盖手工设置的值。
   check('the type setter implements the measured tabEnabled side effect',
@@ -467,8 +470,8 @@ function checkTextSelection(): string[] {
   // border/borderColor 是真实槽（反射表里要有），默认值按 adl 实测。
   check('TextField declares border/borderColor slots',
     c.includes('bool border;') && c.includes('unsigned int borderColor;')
-    && c.includes('{ "border", 2, offsetof(TextField, border) }')
-    && c.includes('{ "borderColor", 5, offsetof(TextField, borderColor) }'));
+    && c.includes('{ "border", 2, offsetof(TextField, border), NULL, NULL, 0 }')
+    && c.includes('{ "borderColor", 5, offsetof(TextField, borderColor), NULL, NULL, 0 }'));
   check('the constructor defaults match adl (border false, borderColor 0, backgroundColor 0xFFFFFF)',
     c.includes('o->border = false;') && c.includes('o->borderColor = 0x000000u;')
     && c.includes('o->backgroundColor = 0xFFFFFFu;'));
@@ -480,7 +483,7 @@ function checkTextSelection(): string[] {
     && c.includes('((TextField*)_this)->textColor = value & 0xFFFFFFu;'));
   check('the colour properties keep plain field reads and only write through setters',
     c.includes('unsigned int TextField_get_borderColor')
-    || c.includes('{ "borderColor", 5, offsetof(TextField, borderColor) }'));
+    || c.includes('{ "borderColor", 5, offsetof(TextField, borderColor), NULL, NULL, 0 }'));
 
   // 边框渲染：背景之后、文本 clip 之前画四条像素对齐的填充矩形（非 1px 描边）。
   // 阶段九十四·二十一 起厚度不再是常量 1 局部单位，而是屏幕空间的
@@ -693,3 +696,114 @@ registerGroup('unit: text-input/TextSelection', checkTextSelection);
 registerGroup('unit: text-input/Caret', checkCaret);
 registerGroup('unit: text-input/IndexDomain', checkIndexDomain);
 registerGroup('unit: text-input/MaskHtml', checkMaskHtml);
+
+// ---- flash.text.StyleSheet + the HTML block model (阶段一百四十八) --------------
+//
+// Measured on adl 51.4.1 (temp/fpsprobe2, temp/blockprobe, temp/ssprobe): the FPS
+// overlay of the talkmed-meeting app renders FIVE numLines for a field whose
+// `multiline` is left at its default (false). The mechanism is the stylesheet rule,
+// not <br>:
+//   * a tag with NO rule that AIR has no inline rendering for (fps/ms/mem/memMax/
+//     xml/head/bold/em/div...) becomes a BLOCK, and the break is emitted AFTER its
+//     close -- independent of `multiline`;
+//   * the tags AIR does render inline (span/p/b/i/u/font/a/li/br/img/textformat) never
+//     become blocks, not even with display:block;
+//   * display:inline downgrades an unknown tag back to inline, display:none hides
+//     the element;
+//   * <br> and </p> end a line ONLY when multiline is true;
+//   * selectors/tags are matched case-insensitively and stored lowercased.
+function checkStyleSheet(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stylesheet] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stylesheet] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.Stage;\n' +
+    'import flash.text.TextField;\n' +
+    'import flash.text.StyleSheet;\n' +
+    'var s:Stage = new Stage();\n' +
+    'var f:TextField = new TextField();\n' +
+    'var ss:StyleSheet = new StyleSheet();\n' +
+    'ss.setStyle("xml", {fontSize:\'9px\', leading:\'-2px\'});\n' +
+    'ss.setStyle("fps", {color:"#ffff00"});\n' +
+    'f.styleSheet = ss;\n' +
+    'f.htmlText = "<xml><fps>FPS: 1 / 2</fps></xml>";\n' +
+    'var names:Array = ss.styleNames;\n' +
+    'var one:Object = ss.getStyle("fps");\n' +
+    'ss.clear();\n' +
+    's.addChild(f);\n')).c;
+
+  // The class itself: real members (a stub that only reported "CSS styling is not
+  // applied" was here before -- AIR's StyleSheet really styles htmlText).
+  check('setStyle is implemented, not the old loud stub',
+    c.includes('void StyleSheet_setStyle(void* _this, char* styleName, Object* styleObject) {')
+    && !c.includes('flash.text.StyleSheet.setStyle (CSS styling is not applied)'));
+  check('setStyle stores a COPY of the style object (AIR: setStyle stores a copy, getStyle returns one)',
+    c.includes('as_object_set(ss->_rules, key, as_v_obj((void*)as_object_clone((as_object*)styleObject)));'));
+  check('setStyle(name, null) removes the style',
+    c.includes('if (styleObject == NULL) { as_object_del(ss->_rules, key); return; }'));
+  check('selectors are stored lowercased (styleNames reports memmax after setStyle("memMax"))',
+    c.includes('char* key = as_str_toLower(styleName);'));
+  check('getStyle returns a copy, or NULL for an unknown name',
+    c.includes('Object* StyleSheet_getStyle(void* _this, char* styleName) {')
+    && c.includes('as_object* decl = as_ss_lookup(ss->_rules, styleName);')
+    && c.includes('return (Object*)(void*)as_object_clone(decl);'));
+  check('clear empties the rule table; styleNames lists the stored selectors',
+    c.includes('void StyleSheet_clear(void* _this) { StyleSheet* ss = (StyleSheet*)_this; if (ss != NULL) ss->_rules = as_object_new(); }')
+    && c.includes('for (int i = 0; i < ss->_rules->length; i++) as_array_push(a, as_v_str(ss->_rules->keys[i]));'));
+  // StyleSheet extends EventDispatcher in AIR, so its ctor must chain there (it
+  // used to call Object_ctor).
+  check('the ctor chains to EventDispatcher and allocates the rule table',
+    c.includes('void StyleSheet_ctor(StyleSheet* o) { EventDispatcher_ctor((EventDispatcher*)o, NULL); o->_rules = as_object_new(); }'));
+  // The rule table is a C-runtime-only slot: without the props entry gc_scan would
+  // never trace it and a collection could free a live sheet's rules.
+  check('the rule table is a C-only slot marked for the GC',
+    c.includes('as_object* _rules;')
+    && c.includes('{ "_rules", 6, offsetof(StyleSheet, _rules), NULL, NULL, 1 },'));
+
+  // The tag classifier.
+  check('AIR\'s inline tag set is spelled out (and nothing else is)',
+    c.includes('static const char* const t[] = { "span", "p", "b", "i", "u", "font", "a", "li", "br", "img", "textformat", NULL };')
+    && c.includes('for (int i = 0; t[i] != NULL; i++) if (strcmp(nm, t[i]) == 0) return 1;'));
+  check('the rule lookup happens for every tag and is case-insensitive',
+    c.includes('as_object* rule = (tf->styleSheet != NULL) ? as_ss_lookup(tf->styleSheet->_rules, nm) : NULL;')
+    && c.includes('static bool as_str_ieq(const char* a, const char* b) {'));
+  check('a rule-styled unknown tag is a block; display:inline opts out; display:none hides',
+    c.includes('if (!as_tf_tag_inline(nm) && !noinline) { if (depth < AS_TF_STACK) st_block[depth] = 1; }')
+    && c.includes('int noinline = (disp != NULL && as_str_ieq(disp, "inline"));')
+    && c.includes('int hidden = (disp != NULL && as_str_ieq(disp, "none"));')
+    && c.includes('if (hidden) skip++;'));
+  check('the block break is emitted AFTER the closing tag (break-after, not before)',
+    c.includes('if (st_block[depth] && skip == 0 && opos > 0 && out[opos - 1] != \'\\n\') { out[opos++] = \'\\n\'; tf->_html_block = true; }'));
+  check('<br> and </p> only break a MULTILINE field',
+    c.includes('if ((strcmp(nm, "br") == 0 || strcmp(nm, "p") == 0) && tf->multiline && skip == 0 && opos > 0 && out[opos - 1] != \'\\n\') out[opos++] = \'\\n\';')
+    && c.includes('else if (strcmp(nm, "br") == 0) { if (tf->multiline && skip == 0 && opos > 0 && out[opos - 1] != \'\\n\') out[opos++] = \'\\n\'; }'));
+  check('style state is stacked, so a close restores what the open replaced',
+    c.includes('if (depth > 0) { depth--; if (depth < AS_TF_STACK) {')
+    && c.includes('st_face[depth] = face; st_size[depth] = size; st_color[depth] = color;'));
+  check('declarations feed the runs (color/size/family/weight/slant/decoration)',
+    c.includes('char* v = as_ss_str(rule, "color"); if (v != NULL) { int c = as_css_color(v); if (c >= 0) color = (unsigned)c; }')
+    && c.includes('v = as_ss_str(rule, "fontsize"); if (v != NULL) { double d = as_css_num(v); if (d >= 1.0) size = d; }')
+    && c.includes('v = as_ss_str(rule, "fontfamily"); if (v != NULL && v[0] != 0) face = as_str_dup(v);'));
+  check('CSS numbers take the numeric part (9px -> 9, -2px -> -2) and colours need #RRGGBB',
+    c.includes('static double as_css_num(const char* v) {')
+    && c.includes('static int as_css_color(const char* v) {')
+    && c.includes('if (v == NULL || v[0] != \'#\') return -1;'));
+
+  // Layout: the block breaks must survive a single-line field's newline collapse.
+  check('a block-break htmlText lays out multi-line even with multiline false',
+    c.includes('int collapse = (tf->multiline || tf->_html_block) ? 0 : 1;')
+    && c.includes('bool _html_block;')
+    && c.includes('tf->_html_block = false;')
+    && c.includes('if (!tf->multiline && !tf->_html_block) return 1;'));
+  // A field with htmlText but no defaultTextFormat still lays out (Fps.as sets only
+  // styleSheet + htmlText), with AIR's implicit TextFormat defaults.
+  check('a field without defaultTextFormat still lays out (implicit 12px/_sans format)',
+    c.includes('if (dflt == NULL) { static TextFormat idd; static int idd_init = 0;')
+    && c.includes('idd.font = (char*)"_sans"; idd.size = 12.0; idd.color = 0x000000u;'));
+  return bad;
+}
+
+registerGroup('unit: text-input/StyleSheet', checkStyleSheet);

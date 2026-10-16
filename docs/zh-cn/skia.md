@@ -161,7 +161,7 @@ Skia 的一切围绕 `SkCanvas`（画布）组织。绘制调用 `canvas->drawRe
 | `filters.DropShadowFilter` | `SkImageFilters::DropShadow` / `DropShadowOnly`（`saveLayer` + `SkImageFilter`） | 已落地（阶段六十一），外投影。阶段九十五·七补 `strength`（模糊**之后**乘，`min(1, 剪影 × alpha × strength)`，对齐 adl 实测）与 `hideObject`；注意 `DropShadow` 工厂本身已把**源**合成进去，`strength` 绝不能套在它的输出上（会把整个对象打薄 —— 见 `swc.md` §9.2 F4 的 137/255 事故） |
 | `filters.GlowFilter` | `SkColorFilters::Matrix`（alpha 轮廓着色）+ 模糊 + 叠本体 | 已落地（阶段六十一），外发光。阶段九十五·七补 `strength`（同 DropShadow，且在模糊后乘：前置 alpha 因子因剪影不透明会饱和，实测 `strength 1` 与 `2` 会一模一样）|
 | `DisplayObject.mask` | `canvas->saveLayer` + mask 绘制 + `SkBlendMode::kSrcIn` | AS3 遮罩语义 |
-| `scrollRect` | `canvas->clipRect` | 裁剪可视区域 |
+| `scrollRect` | `canvas->clipRect(0,0,w,h)` **再** `translate(-x,-y)` | 窗口钉在对象自己的盒上、只有**内容**平移（阶段一百六十二实测，见下方「坐标变换」与 D29）|
 
 **坐标变换的正确姿势**（对应 Skia `SkCanvas` 的矩阵栈）：
 
@@ -172,7 +172,9 @@ Skia 的一切围绕 `SkCanvas`（画布）组织。绘制调用 `canvas->drawRe
   canvas->rotate(obj->rotation);
   canvas->scale(obj->scaleX, obj->scaleY);
   canvas->concat(obj->transform.matrix);     // 若有完整 matrix
-  if (obj->scrollRect) canvas->clipRect(obj->scrollRect);
+  // if (obj->scrollRect) { clipRect(0,0,w,h); translate(-x,-y); }
+  //   ↑ 顺序不能颠倒：Skia 的 clipRect 按**调用时**的 CTM 映射，先 translate 再 clip
+  //     会把窗口本身挪到 (x,y,w,h)（窗口跟着内容滑）—— 阶段一百六十二的 D29 就是这个错。
   // 1) 先画自身：obj->render_self(canvas)   （Shape 画 path、Bitmap 画 image、TextField 画 textBlob）
   // 2) 再按深度序画子对象：for child in children: render(child)
   canvas->restore();
@@ -210,7 +212,13 @@ SkPath 命中留到需要精确形状命中时再接。
 
 ### 6.1 获取与编译 Skia
 
-> **本项目实际落地方式（预编译）**：本机缺少 `gn`/`ninja` 且磁盘空间不足以从源码编译，故改用
+> **本项目实际落地方式（动手改 `vendor/skia/` 之前必读）**：`vendor/skia/include` 来自上游预编译包，但
+> **`vendor/skia/lib/macos-arm64/libskia.a` 是从源码自编的**（源码树 `build-tools/skia-src`），并带回一份
+> **本地补丁**（见 §6.9 与 `vendor/skia/patches/README.md`）。**切勿用上游预编译包覆盖它**——那个补丁修的
+> 是 CoreText 会在「同族同 PS 名」的两个字体文件之间换脸（阶段一百六十七）。wasm / Windows 两份库**未打**
+> 该补丁（改动只在 macOS/iOS 分支）。
+>
+> 历史情况：本机当初缺 `gn`/`ninja` 且磁盘空间不足，故曾用
 > [Aseprite 官方预编译 Skia](https://github.com/aseprite/skia/releases) **m124**
 > （`Skia-macOS-Release-arm64.zip`）。该包自带头文件（`include/`）与全套静态库（`out/Release-arm64/*.a`），
 > 已解压为 `vendor/skia/{include,lib}/`，并连同 PNG/JPEG/WebP/freetype/harfbuzz/icu/zlib 等传递依赖
@@ -379,6 +387,122 @@ Windows 侧同源缺陷见 [`win32.md`](win32.md) §2.10。
 
 ---
 
+### 6.8 drawable 必须允许被当作纹理采样（高级混合模式，阶段一百六十）
+
+**症状**：TalkMED 桌面端（`talkmed-meeting`）AOT 版首页**大面积洋红**（`(255,0,255)` 及其被遮罩压暗后的
+`(117,20,124)`）：工具栏下方整块背景、卡片之间的空隙全是洋红，而卡片、图标、文字本身正常；鼠标在窗口内
+移动时**每帧都出现**。窗口未激活时同样出现（只是被合成的暗化叠加压暗）。`adl` 完全没有这个现象。
+
+**根因**：AS3 的 `DisplayObject.blendMode` 会变成 Skia 的 paint 混合模式（`skia_glue.cc` 的
+`sk_paint_set_blend`；由生成的 `as_skia_canvas_save_layer_paint(canvas, bp)` 施加，见 `emit.ts`）。
+其中 **`add`（`kPlus`）与 `layer`（`kSrcOver`）以外**的模式 —— `darken`/`multiply`/`screen`/`lighten`/
+`difference`/`overlay`/`hardlight` —— 都是 Skia 的**高级混合模式（advanced blend mode）**：固定功能混合
+表达不了，Ganesh 必须**把目标当作纹理读回来**在着色器里混合。Metal 后端的目标就是我们 wrap 的那张
+**CAMetalLayer drawable**，而 `CAMetalLayer` 的 drawable **默认 `framebufferOnly = YES`** —— 这是一种
+「只写」存储模式，**禁止被当作着色器输入采样**；强行采样时 Apple GPU 返回的是**未初始化显存**。
+TalkMED 首页皮肤里带一个 `BlendMode.DARKEN`（SWC `PlaceObject3` 的 BlendMode 标签烘进来的 ⇒ 运行时的
+`SkBlendMode::kDarken`），该层的裁剪域覆盖整个画布，于是它把「读回来」的垃圾（洋红）以 SrcOver 语义**铺满整个窗口**，其后再绘制的内容
+（卡片、图标、对话框）自然盖在上面 —— 正是现象的 L 形/碎块外形。
+
+**修法**：`l.framebufferOnly = NO;`（`metal_glue.mm` 的 `sk_mtl_init`，紧挨 `pixelFormat`/`colorspace`）。
+代价只是 drawable 的分配略慢（不是逐帧代价），换来「这个渲染目标可以被当作纹理读」这一正确声明 ——
+这正是所有「读目标」渲染通道的文档要求。
+
+**为何必须钉死**：它不是「多余配置」——删掉它不会编译失败、也不会让任何单测变红，只会让**任何**用到
+`darken`/`multiply`/`screen`/`overlay` 等 7 个模式的应用整屏洋红（`add`/`layer` 因为不需要读目标而幸免，
+这也解释了为什么此前历次验收都没发现：Starling demo 与各 `examples/` 从未用过这些模式）。
+
+**实测**（`temp/tkmeet-mac/`，diff D26）：
+
+| 步骤 | 结果 |
+|---|---|
+| 首页截图（产品二进制，修前） | 背景 `(117,20,124)`（被暗化遮罩压暗的洋红）；逐帧稳定复现 |
+| 只把 `framebufferOnly = NO` 加上（不碰任何绘制代码） | 同一次启动态、同一张对话框遮罩下，该像素变 `(128,128,128)`（压暗后的白） |
+| 严格判据（`min(r,b)>70 && 2g<min(r,b)`）全窗口扫描（**排除应用自带的 FPS/MEM/MAX 浮层**——它的 `MAX:` 本来就是粉字，设备像素 x 296..404 / y 70..150） | 修前逐帧命中；修后 **0 px** |
+| 15 点悬停扫掠（激活窗口 → 逐点移动光标 → `screencapture -l`） | 修后 **0/15 帧含洋红** |
+| 定位手法 | 先按 `saveLayer` 的 paint **混合模式**二分：把高级混合层的 `saveLayer` 退化成 `save`（`ASC_DEBUG_NO_BM_LAYER`）后洋红消失、普通 `kSrcOver` 层（颜色矩阵/滤镜）保留 ⇒ 只有「需要读目标」的层是触发点；再由旧有的 `ASC_MTL_READBACK` 读回 drawable 证实洋红就在 drawable 里（不是窗口服务器合成出来的） |
+
+**回归钉子**：`test/unit/platform.ts` 的 `unit: platform/DrawableReadable`。**Windows 侧是否有同源缺陷
+未验证**（本机无 Windows；D3D12 的翻转模型交换链缓冲如何被 Skia 读回未实测），登记见 `TODO.md`。
+
+### 6.9 本地补丁：CoreText 会在「同族同 PS 名」的两个字体文件之间换脸（阶段一百六十七）
+
+> **一句话**：`vendor/skia/lib/macos-arm64/libskia.a` **不是**上游预编译产物，而是从
+> `build-tools/skia-src`（完整 m124 源码树）自编、并带回
+> `vendor/skia/patches/skia-m124-ct-exact-copy-keep-face.patch` 的产物。换机器/换 CI 复现时
+> 必须先打这个补丁，否则「微软雅黑」之类的同族双字体上会静默换脸（见下）。补丁清单与重编步骤见
+> `vendor/skia/patches/README.md`。
+
+**现象**（TalkMED 首页「创建同传」）：同一份源码 `adl 51.4.1` 画 `创建同传`，我们画 `初开名伤`；
+**ASCII/Latin 完全正常，其它 CJK 字族（PingFang SC、华文细黑）也完全正常**——只有字族 `微软雅黑`
+（且只有该机安装的那一对文件）中招。
+
+**根因**（逐层排除后的结论，证据见 `temp/tfswc/` 的 `ctprobe*.mm` / `skgl.mm` / `skdata.mm`）：
+
+1. 本机 `~/Library/Fonts/` 同时有 `微软雅黑.ttf`（Regular）与 `微软雅黑粗体.ttf`（Bold），
+   **两个文件都声明** family `Microsoft YaHei`/`微软雅黑`、PS 名 `MicrosoftYaHei`，字形数都是 29126
+   ——但**字形序在 index 110 处分叉**（`sfthyphen` vs `uni00AD`），于是 Regular 的
+   `创=1259 / 建=1679 / 同=1379 / 传=1134` 在 Bold 里整体**下移一位**成 `1258/1678/1378/1133`；
+   而 ASCII 的 gid 两边完全一致（space=3、`A`=39、`C`=41、`a`=71）。
+   ⇒ 这就是「**CJK 全糊、拉丁毫发无损**」的由来：拿错脸之后，每个 CJK gid 都画成了**下一个字**。
+2. 取形（shaping）与 cmap 并没错：`SkTypeface::textToGlyphs`、HarfBuzz（无论吃文件字节还是吃
+   CoreText 表）、`SkShaper` 三方给出的 gid 都是正确的 `1259 1679 1379 1134`。
+3. **错在光栅化**：`SkScalerContext_mac` 为每个尺寸重建 CTFont 时走
+   `src/ports/SkScalerContext_mac_ct.cpp` 的 `SkCTFontCreateExactCopy(baseFont, size, opsz)`，
+   而它用的是**只有属性、没有字体文件的** descriptor（`CTFontDescriptorCreateWithAttributes`）。
+   **`CTFontCreateCopyWithAttributes` 一旦拿到非 NULL descriptor，CoreText 就按「字族」重新解析脸**
+   ——两个文件同族同 PS 名时它挑了**另一个文件**（实测：`kCTFontURLAttribute` 变成 `微软雅黑粗体.ttf`，
+   而 `descriptor == NULL` 的拷贝仍是 Regular）。补属性（`NSCTFontOpticalSizeAttribute`、
+   `NSCTFontUnscaledTrackingAttribute`、甚至把 base 自己的属性合进去）**都不能钉住脸**。
+4. 佐证：裸 Skia 探针里 `SkFont::getPath(1259)` 的宽度等于 **Bold 的脸**（`Bold 1259 = 0.23/14.80`），
+   而直接从**文件字节**建脸（`SkFontMgr::makeFromData(微软雅黑.ttf)`）画得完全正确（`14.578`）
+   ——数据支撑的脸不怕这次拷贝。
+
+**修法**（约 20 行，`SkCTFontCreateExactCopy.cpp`）：拷贝后比较 `kCTFontURLAttribute`，
+**若换了文件就丢掉 descriptor 重拷一次**（保留 base 的脸）：
+
+```cpp
+static bool sk_fonts_share_file(CTFontRef a, CTFontRef b) {          // 取不到 URL 视为「同一个」，不介入
+    SkUniqueCFRef<CFTypeRef> ua(CTFontCopyAttribute(a, kCTFontURLAttribute));
+    SkUniqueCFRef<CFTypeRef> ub(CTFontCopyAttribute(b, kCTFontURLAttribute));
+    if (!ua || !ub) return true;
+    return CFEqual(ua.get(), ub.get());
+}
+...
+SkUniqueCFRef<CTFontRef> copy(CTFontCreateCopyWithAttributes(baseFont, textSize, nullptr, desc.get()));
+if (copy && !sk_fonts_share_file(baseFont, copy.get()))
+    return SkUniqueCFRef<CTFontRef>(CTFontCreateCopyWithAttributes(baseFont, textSize, nullptr, nullptr));
+```
+
+**为什么钉在 Skia 而不是胶水层**：同一份字体在多条路径上取脸——`SkParagraph` 的
+`FontCollection::matchTypeface/findTypefaces`、间距度量（`sk_air_line_metrics`）、
+旧的 `drawString` 路径。在胶水层拦（`sk_match_typeface` 里 `makeFromData`、或包一层 `SkFontMgr`）
+要么盖不住 paragraph 的二次解析，要么要写上百行代理类；钉在 `SkScalerContext` 这一层，**一次修全**。
+
+**修法边界**：
+
+- 只对 **macOS/iOS**（`SK_BUILD_FOR_MAC || SK_BUILD_FOR_IOS`）生效，**wasm/Windows 库不受影响**；
+- 只在「确实换了文件」时介入，同族同文件的字（Helvetica、PingFang SC 实测）行为**逐字节不变**；
+- 代价：该字族丢掉 `tracking/opsz` 属性（有 `trak` 表的字才会感知），换来的是**脸不变**。
+
+**验证口径**（本机，双端同源探针 `temp/tfswc/`：`BitmapData.draw()` + `getPixels()` 出裸 ARGB，
+同一份 `Main.as` 分别用我们与 `adl` 跑）：
+
+| 用例 | 字族 | 墨掩码 IoU（vs `adl`） |
+|---|---|---|
+| 纯 `TextField` 16px | 微软雅黑 | **100.00%**（修前是错字） |
+| 纯 `TextField` 16px | Microsoft YaHei | **100.00%** |
+| 纯 `TextField` 16px | 华文细黑 | **100.00%** |
+| 纯 `TextField` 16px | PingFang SC | 97.24%（抗锯齿覆盖率差异，非错字） |
+| SWC 皮肤文本（`aisubtitlehomeskin…label1`） | 微软雅黑 | 字形正确（`创建同传`）；像素差来自该子件的 dump 原点口径 |
+
+**回归钉子**：`test/unit/build.ts` 的 `unit: build/SkiaLocalPatch`（守**出处**：补丁文件存在、
+两半修法齐全、落在 `SkCTFontCreateExactCopy.cpp`、且被本文档引用——二进制内部无法断言，故只钉
+「补丁没被悄悄弄丢」）。**该缺陷的复现依赖本机装了那一对同族同 PS 名的字体**（CI 机器没有），
+故不设 examples 断言，实测记录留在 `temp/tfswc/`。
+
+---
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。
@@ -431,7 +555,8 @@ Windows 侧同源缺陷见 [`win32.md`](win32.md) §2.10。
   尾空格的有无/多少**完全不影响 AIR 的阈值**（三档 0/1/2 个尾空格都是 129），所以「行尾空格」不是原因。
   真因是**可用宽度要减掉 AIR 的 2px 内边距**：阈值恒为 `ceil(ink + 4)`——`124.945+4→129`、`133.383+4→138`、
   `258.328+4→263`、`266.766+4→271`，六项**逐值命中**。修前我们按未减内边距的字段宽度排版，故边界上晚一个词。
-  这个 4px 不是新约定：`autoSize`（`width = textWidth + 4`）与 `maxScrollH`（`over = textWidth + 4 - width`）
+  这个 4px 不是新约定：`autoSize`（**仅当 `wordWrap=false`** 时 `width = textWidth + 4`；`wordWrap=true`
+  时宽度不动、只改高度，见 §8.2）与 `maxScrollH`（`over = textWidth + 4 - width`）
   早已按它写，**只有断行阈值一处漏减**。修复见阶段八十九·六十六，`test.ts` 有 `[textwrap]` 结构钉子。
   > 另注：`textWidth` 对带尾空格的文本，AIR 含尾空格（`"Multitouch "` = 133）、我们不含（恒 124.945）。
   > 这是**另一个**独立的口径差异，**不影响断行**（见上表），已按 §1.5 记入 `TODO.md` 遗留表。
@@ -444,6 +569,116 @@ SkParagraph 的富文本能力（`htmlText`、多 `TextFormat` 区间样式、�
 以同样机制追加 run；`sk_textlayout_new_runs` 按 run 顺序 `pushStyle`/`addText`/`pop`，run 之间的间隙回落到
 段落默认样式（= `runs[0]` 的字体/字号，颜色取自 `defaultTextFormat`）。`autoSize`/`hscroll`/`selectable`/`leading`
 亦已落地，断言式回归见 `examples/textrich.as`（`examples/textflow.as` 为布局基线）。
+
+### 8.2 `autoSize` 的大小口径与「装不上的字族」的兜底脸（阶段一百六十八）
+
+两条都在 `vendor/skia_glue.cc` / `src/emit.ts` 的文本层，判据来自 `adl 51.4.1` 双端同源探针
+（`temp/tfswc` 的 case ⑥⑦⑧⑨⑩；修后 AOT 侧与 `adl` 的报告**逐字相同**）。
+
+**① `autoSize != "none"` 时宽度只在 `wordWrap=false` 才跟文本走。** 实测：`wordWrap=true` 时
+`width` 保持用户给的值（290 对短串与 3 行串都不变），只有 `height := textHeight + 4` 变；
+`wordWrap=false` 时 `width := textWidth + 4` **两个方向**都收/放（290→28、「中文」；100→523.5、超长串）。
+旧实现无条件用「已换行排版的最长行」+ 4 去写宽度，于是自己造出一个**自噬回路**：宽度一收 ⇒ 同一段
+文本的可用宽正好等于文本宽 ⇒ 下次排版又断行、最长行更短 ⇒ 每绘制一次再收一圈
+（实测 290 → 64.66 → 50.66 → 36.66 → 32），TalkMED AI 同传列表项的 `title` 因此被断成三行、压住 `ctime`。
+另一个可观测点：`adl` 在**赋值后不画就能读到**新盒（`autoSize=LEFT` 后立刻 `h=18`），
+所以生成 C 的 `as_do_extents`（`width`/`height` 两个读取都落在这里）也调 `as_tf_apply_autosize`。
+
+**② 装不上的字族 = 平台默认脸的行盒，不是「哪个 CJK 脸供字形就用哪个的行盒」。** `adl` 对
+`MiSans Regular`（本机没有；只在 app 包里，而 **AIR 不注册 app 自带字体**）与 `宋体` 量到的 16px 行盒
+都是 **16px**，正是 Helvetica 的盒；而 `SkFontMgr::matchFamilyStyle` 对这两个名字返回 **NULL**，
+SkParagraph 遂按供字形的 CJK 层取行盒（PingFang/Songti SC 1.4em → 16px 字号下 22px）。
+`sk_family_alias` 因此先查该字族**是否装得上**，装不上就替换成 `matchFamilyStyle(nullptr)` 的族名
+（macOS = Helvetica），并缓存；该替换同时影响 strut 与 run，保证行盒与字形落在同一条路径上。
+> 这是**用户可见**的：列表项比 `adl` 高 6px，`ctime.y` 被推下去。注意它**不是**「该注册 app 字体」的
+> 证据——`adl` 也看不见那个 `MiSans-Regular.ttf`，我们若注册反而与 oracle 分道扬镳。
+
+回归：`examples/autosize-metrics.as`（行为断言，链 Skia）+ `unit: display/AutoSizeMetrics`
+（生成 C / glue 结构钉，含反向 mutation 验证）。
+
+### 8.3 字段被缩放时的度量与字形归一化（阶段一百六十九）
+
+字段的 CTM 里带**非均匀** scale（SWC placement 常见，例如 TalkMED 字幕皮肤子件 `ctime` 是
+`scaleX = 1.2246, scaleY = 1`）时，`adl` 的口径与我们修前**两处都不同**，判据来自 `adl 51.4.1`
+双端同源探针（`temp/tfswc` case ⑯⑯b⑯c⑰b，size 12 名义 `166.00/12.00`）：
+
+| (scaleX,scaleY) | adl textWidth | adl textHeight | adl 渲染 ink 宽 |
+|---|---|---|---|
+| (1.0000,1.0000) | 166.00 | 12.00 | 165.0pt |
+| (2.0000,1.0000) | 83.00 | 6.00 | 165.0pt |
+| (1.0000,2.0000) | 332.00 | 24.00 | 329.5pt |
+| (2.0000,2.0000) | 166.00 | 12.00 | 329.5pt |
+| (0.5000,1.0000) | 332.00 | 24.00 | 165.0pt |
+| (1.0000,0.5000) | 83.00 | 6.00 | 82.5pt |
+| 父容器 scaleX=2 | 83.00 | 6.00 | — |
+
+**① 度量：`textWidth`/`textHeight` = 名义 × scaleY/scaleX，两个方向都除 `scaleX`。** 不是「宽度除
+scaleX、高度除 scaleY」——`scaleY=2` 时高度也**翻倍**（`24.00`），而它并没有被 scaleX 除。scale 取的是
+**自己 + 全部祖先的累积值**（父容器 scaleX=2 ⇒ 子字段的值减半）。生成 C 里由 `as_disp_chain_scale`
+沿 `parent` 链累乘线性部分（顺序同为 `T·R·S·transform.matrix`，与 `as_bounds_xform`/`as_render_object`
+一致；平移不改基向量长度故不影响）得到 `(sx, sy)`，`as_tf_scale_ratio` 返回 `sy/sx`。
+
+**② 渲染：字形只按累积 `scaleY` **整体**缩放，`scaleX` 不拉宽字形（也不拉宽字距）。** 所以同一个字段
+在 `scaleX=2` 下的 ink 宽与 `scaleX=1` **逐像素同宽**（165.0pt），而它的**盒子**照旧按 scaleX 变宽
+（`width` = 本地宽 × scaleX）。实现是在 TextField 绘制的字形 pass 里把 CTM 后乘 `scale(sy/sx, 1)`：
+非均匀 CTM `M = R(θ)·S(sx,sy)·…` 后乘 `S(sy/sx,1)` 恰好得到 `R(θ)·S(sy,sy)·…`，即「同一旋转、均匀
+scaleY」。**必须夹在 `clipRect` 之后**：Skia 的 `clipRect` 按调用时的 CTM 映射，而可见盒是**要**跟着
+scaleX 走的（阶段一百六十二的 D29 就是栽在这个映射上）。比值取「**最终落点 CTM**」
+（`ASC_bake_ctm_*`，与 1px 边框同口径），于是：
+
+- 正常窗口渲染：CTM 含对象的累积变换 ⇒ 比值 = 累积 `sy/sx`；
+- `cacheAsBitmap`/过滤器烘焙：canvas 只有烘焙分辨率，`ASC_bake_ctm_*` 给出落点比值；
+- `BitmapData.draw(字段)`：这一路是**本地空间**重栅格，且 `adl` 实测 `draw()` **忽略被画对象自身的
+transform**（scaleY=2 的字段画出来与未缩放**逐字节相同**）⇒ 比值自动退化为 1，正是该路要的。
+
+回归：`examples/tf-scale-metrics.as`（度量 6 组相对断言 + `draw(容器)` 的 ink 宽 3 组，链 Skia）+
+`unit: display/TfScaleMetrics`（10 钉，含两处反向 mutation 验证）。
+
+### 8.1 `flash.text.StyleSheet` 与 HTML 的**块级**模型（阶段一百四十八）
+
+
+
+`StyleSheet` 在阶段一百四十八从「只报不做的空壳」升级为**真类**（`superClass: EventDispatcher`、
+反射名 `flash.text::StyleSheet`），`setStyle`/`getStyle`/`clear`/`styleNames` 全部落地，并成为
+`htmlText` 排版的**规则来源**。促成这次开工的是 talkmed-meeting 的 FPS 浮层（`com.vsdevelop.controls.Fps.as`）：
+它给一个 `multiline` 保持默认 `false` 的 `TextField` 赋 `htmlText` 与 `styleSheet`，在 AIR 里显示**四行**
+（FPS / MS / MEM / MAX），我们却把四个值挤成一行。
+
+**根因是块级判定，不是 `<br>`。** 用 `adl 51.4.1` 逐项实测（证据台 `temp/ssprobe/`、`temp/blockprobe/`、
+`temp/mlprobe/`、`temp/fpsprobe2/`）得到 AIR 的模型，逐条实现：
+
+| 观测 | AIR 行为 |
+|---|---|
+| 无规则的未知标签（`<x>`、`<fps>`、`<memmax>`…） | **内联**（当作无样式文本，不出现在 `text` 里） |
+| **有规则**的未知标签 | **块级**：断行发生在**其闭合标签之后**（break-after），且**与 `multiline` 无关** |
+| AIR 有内联渲染的标签（`span`/`p`/`b`/`i`/`u`/`font`/`a`/`li`/`br`/`img`/`textformat`） | **永不**成块——即使规则里写 `display:block` 也无事 |
+| `display:inline` | 把未知标签**降级**回内联 |
+| `display:none` | 元素（含其文本）**隐藏** |
+| `<br>`、`</p>` | 只在 `multiline == true` 时断行 |
+| 选择器 | **大小写不敏感**匹配；`styleNames` 报出的是**小写化**后的名字 |
+| `setStyle` / `getStyle` | 双方都**拷贝**：改传进去的对象不影响规则表，改 `getStyle` 的返回也不影响；`setStyle(name, null)` 是**删除** |
+
+实现要点：
+
+- 标签名先**小写化**再查规则（`as_ss_lookup`，键为小写）；`as_str_ieq` 做**零分配**的 ASCII
+  大小写不敏感比较，避免每标签都 `toLower` 分配。
+- 状态**入栈**（`st_face/st_size/st_color/st_bold/st_italic/st_under/st_block`，深 32），闭合标签恢复上层，
+  与 AIR 的「样式有作用域」一致。
+- 断行「在闭合之后」意味着块内文本先输出、再补 `\n`，并置 `tf->_html_block = true`。这是为了让
+  **单行字段**也认这个换行：Skia 排版会把单行字段里的 `\n` 折成空格（`collapseNewlines`），而 AIR 对
+  规则驱动的块级换行**在单行字段里照断**。故 `as_tf_paragraph` 用
+  `collapse = (tf->multiline || tf->_html_block) ? 0 : 1`——**原始 `\n` 在单行字段仍折行**（实测），
+  只有规则块的换行豁免。`_html_block` 是 C 侧 `bool`，无 GC 指针，故**不进**反射表。
+- 声明值经 `as_ss_str`（CSS 数值取数字部分、颜色只认 `#RRGGBB`）喂给既有 run 机制：`color`/`fontSize`/
+  `fontFamily`/`fontWeight`/`fontStyle`/`textDecoration`。注意 `as_ss_str` 复用**静态缓冲**，所以
+  `display` 派生的 `hidden`/`noinline` 必须在其它 `as_ss_str` 调用**之前**读出来。
+- FPS 浮层没有 `defaultTextFormat`，故 `as_tf_paragraph` 在缺省时补一个隐式 `TextFormat`（`_sans`/12/黑）。
+
+**已实测但未对齐的部分**（见 `TODO.md` 遗留表，未美化）：多行 run 的**行高**偏大约 1.5×（同一段
+htmlText 我们报 `h=45`、AIR 报 `30.1`，行数与宽度逐值吻合）；`leading` 来自规则时未按 run 生效；
+`numLines` 的语义（AIR 计入尾部空行）仍按我们的口径。`StyleSheet.parseCSS` / `transform` **刻意未实现**，
+调用处是**响亮**的 `undefined method` 编译错误（不静默接受 AIR 能解析的 CSS）。
+
 
 **两条与 AIR 对齐的语义细节（阶段八十九·二十八修复）**：
 
@@ -553,6 +788,27 @@ SkSVGDOM::Builder().setFontManager(sk_platform_fontmgr()).make(stream)
 两个要点：**`setFontManager` 不设则 `<text>` 一个字都不画**（实测字形像素 97 → 0）；
 **wasm 侧无 `libsvg.a`/`libsksg.a`/`libexpat.a`**（`skia_use_expat=false` 把 svg 目标整体门掉），
 故 web 不支持 SVG，定义宏即链接期报错。默认构建不含该宏，行为与 AIR 逐字同构（`#2124`）。
+
+### 9.2 显示用的 SkImage 与「解码用的字节」是同一条命（阶段一百五十四）
+
+显示列表里的 `Bitmap` **只从 `bd->image`（SkImage 视图）画**，`bd->pixels`（CPU 缓冲）不参与绘制。
+而 `Loader.loadBytes` 这条路上，`bd->image` 是用**同一个 job 里的编码字节**现建的
+（`as_skia_image_from_bytes(as_job_bytes(job), as_job_len(job))`）——它不是从文件按名重开，
+也没有 URL 可退。于是 job 的 `AS_JOB_DECODE` 分支一旦在解码后把载荷 `free` 掉并把 `bytes/len`
+置空（注释当时写的是「只用于解码」），`bd->image` 就恒为 `NULL`：`bitmapData.width/height`
+与 `getPixel32` **全都对**（像素确实解出来了），**画面却什么都不画**，且不会报任何错。
+
+TalkMED 登录页的图形验证码正是这条路（服务端返回 `data:image/jpeg;base64,...` → 应用
+`Base64.decodeToByteArray` → `Loader.loadBytes`）：请求成功后验证码格仍是空白，而 `adl`
+同格显示出图形码。定位手法是**在应用里临时打点**（`content=[object Bitmap]`、
+`bitmapData 100x50`、`bitmapData.getPixel32(1,1)` 非零、`numChildren=1`、`parent/onStage` 均真），
+把「取到了图」与「画出来了」这两件事分开，才落到 job 载荷的所有权上。
+
+**规则**：`AS_JOB_IMAGE_URL`（http 取回的图）与 `AS_JOB_DECODE`（`loadBytes` 的载荷）
+**都必须把编码字节留到 `as_job_retire`**；只有 `AS_JOB_IMAGE`（本地文件）可以在解码后立刻释放——
+它的显示视图是按**文件名**重开的（`as_skia_image_from_file`）。单元钉见
+`unit: transport/JobOwnership`（三条），所有权表见 [`gc.md`](gc.md) §「从 arena 到 GC 的迁移」。
+
 
 ---
 

@@ -212,3 +212,41 @@ ctime_r asctime_r gmtime_r localtime_r gettimeofday
 - **`src/emit.ts`**：`cIdent` 是方法/字段名的 sanitize 入口，P0 在此扩展表；`declareVar` 是局部/形参入口，P1 在此接。
 - **`docs/zh-cn/compile.md`**：多目标链接（Skia/SDL2/WASI）说明，命名冲突是链接面的直接后果，本文补充其前端防御。
 - **`docs/zh-cn/gc.md`**：GC 靠 `gc_in_heap()` 段表地址范围检查跳过非堆指针；命名 sanitize 不影响该机制（sanitize 只改标识符文本，不改指针布局）。
+
+## 7. 反向方向：**发射器自己种下的名字**（阶段一百六十五，v0.4.136）
+
+§1–§5 解决的是「AS3 名 → C 名」一个方向的冲突（撞 C 关键字/libc/类型名）。还有**反方向**的一类：
+发射器在**函数体**里**固定**写下的标识符，而 AS3 源码完全有权用同样的拼写。
+
+| 生成名 | 出没位置 | 撞上时 clang 报 |
+|---|---|---|
+| `o` | **构造器**的接收者形参（`Widget_ctor(Widget* o, …)`、`Widget_new` 的局部） | `error: redefinition of 'o' with a different type: 'Object *' vs 'Widget *'` |
+| `_this` | **每个实例方法**的接收者形参（`Widget_add(void* _this, …)`） | `error: redefinition of parameter '_this'` |
+| `_<word><N>` | `tmpName()` 临时（`_once0`/`_i3`/`_ret1`…）与闭包 cell 的 env 结构体标签 `_cell0` | 同名重定义（同类型时**静默**覆盖，更危险） |
+
+最小复现（`temp/d31probe/ocollide2.as`，7 行 AIR app 类；`adl` 跑它一切正常）：
+
+```as
+class Widget {
+  public var v:int;
+  public function Widget() { var o:Object = { a: 1 }; v = o.a; }
+}
+```
+
+**修法**（`src/emit.ts` 的 `cIdent`）：把上面这些拼写并进「不许发给 AS3 标识符」的集合
+（与 `reservedTypeNames` 同一处循环），`cIdent` 逐级加 `_` 直到三个判据全清：**类型名 / 生成名 /
+已用名**。注意后者的检查只对**加前缀之后的候选**生效（`sanitizeCIdent` 已经把首个候选登记进已用集），
+否则会自锁死循环。于是 `var o:Object` → `Object* _o`、形参 `_this` → `__this`、`_once0` → `__once0`，
+而接收者仍是字面 `o`/`_this`（它们是**原样发射**的，从不经过 `cIdent`）。
+
+**红线：只改 C 侧拼写，AS3 侧一个字都不能动。** 反射表（`as_prop.name` / AMF 成员表 / `for-in` 的 key）
+存的是**原字符串**，所以 `w["o"]`、序列化、`describeType` 仍必须看到 `o` —— 这正是
+`examples/ident-collide.as` + `unit: emit/GeneratedNameReservation` 钉住的不变量（改回不保留生成名时
+该组 8 钉里 5 钉转红、示例 C 直接编不过）。
+
+**已知残余（如实报明，未修）**：闭包 cell 的**指针**局部名 `cell<N>`（`cell0`/`cell1`…，由全局
+`anonSeq` 计数）**仍是裸名**，因此 `var cell1` 与**同一函数内的闭包**同时出现时会撞名 —— 报
+`error: duplicate member 'cell1'`（**响亮**失败，不是静默错语义），复现见 `temp/d31probe/cellres{0,1,2}.as`
+（`cell0`/`cell2` 绿、`cell1` 红）。原因是这一个名字**发射口径不统一**：7 个发射点里 6 处裸写、1 处
+（`emitActivationCell` 的声明）走 `cIdent`，所以任何「按拼写保留」的方案都会把声明与使用拆开。要收口得先把
+闭包 cell 的发射全部统一走同一个映射（涉及 `cellLocal`/`captures`/`closureCellEnv` 三处），属**独立立项**。

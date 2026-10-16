@@ -666,6 +666,7 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
   for (const p of cfg.linkPaths) args.push('-L', p);
   for (const l of cfg.linkLibs) args.push('-l', l);
   for (const f of cfg.frameworks) args.push('-framework', f);
+  for (const f of platformFrameworks(cfg)) args.push('-framework', f);
   // Static-archive order: libraries must follow the objects that reference
   // them, hence -lsetjmp here rather than in the wasm branch above.
   if (cfg.target === 'wasm' && wasiSetjmpLib()) args.push('-lsetjmp');
@@ -696,6 +697,21 @@ function posixLinkLibs(): string[] {
 function platformLinkLibs(): string[] {
   if (process.platform !== 'darwin') return [];
   return ['iconv'];
+}
+
+// macOS frameworks the RUNTIME platform layer itself needs, as opposed to the
+// ones a manifest asks for (Skia's CoreText/CoreGraphics, SDL2's Cocoa, ...).
+// CoreFoundation is what Capabilities.language/languages read the system locale
+// through: the generated C cannot include the Apple headers (MacTypes.h defines
+// `struct Point`, which is what flash.geom.Point compiles to — see the CF block in
+// runtime.ts), so the handful of CF entry points are declared by hand there and
+// resolved here. Like -liconv above this is an OS-provided detail rather than a
+// third-party dependency, so it is added for every darwin native link instead of
+// being opt-in: a build that omitted it would fail to link, and one that silently
+// fell back to LANG would report the wrong language (AGENTS 1.5).
+export function platformFrameworks(cfg: BuildConfig): string[] {
+  if (process.platform !== 'darwin' || cfg.target !== 'native') return [];
+  return ['CoreFoundation'].filter((f) => !cfg.frameworks.includes(f));
 }
 
 // A source file compiled as C++ (Skia glue layer, etc.). Objective-C++ (.mm)
@@ -763,6 +779,7 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
   linkArgs.push(...posixLinkLibs());
   for (const l of platformLinkLibs()) linkArgs.push('-l', l);
   for (const f of cfg.frameworks) linkArgs.push('-framework', f);
+  for (const f of platformFrameworks(cfg)) linkArgs.push('-framework', f);
   steps.push(linkArgs);
 
   return steps;

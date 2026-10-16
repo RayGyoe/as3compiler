@@ -813,6 +813,7 @@ So a visible memory "leak" must be judged by RSS; the books can only see the GC 
 | `BitmapData` construction | `malloc(w*h*4)` | `gc_alloc(GCT_BYTES, w*h*4)` (`gc_alloc` zeroes it; the fill loop overwrites afterwards) |
 | Image decode into `BitmapData.pixels` (`Loader.loadBytes` / `BitmapData.loadFile`) | directly adopting glue's `malloc`ed ARGB buffer | `memcpy` into a GC buffer + `free` the glue buffer (glue is C++ and cannot call into GC; ownership is therefore single: `pixels` exists only on the GC heap) |
 | `BitmapData.dispose()` | `free(bd->pixels)` | `bd->pixels = NULL` (**drop the reference**: `free`ing a GC buffer wrecks GC's free list) |
+| the **encoded bytes** a job carries (`AS_JOB_DECODE` = the `Loader.loadBytes` payload) | freed and `bytes/len` nulled right after the decode ("only needed to decode") | **kept until `as_job_retire`**: `Loader__imageFinish` builds the display SkImage (`bd->image`) from those very bytes, otherwise the pixels are correct and it still paints NOTHING (stage 154) |
 
 **Why the bytes need not be scanned**: `GCT_BYTES` is a leaf (`gc_scan`'s case just `break`s). There are no
 pointers to follow in the bytes — it is **reachable** only because some class field points at it, and that
@@ -865,6 +866,56 @@ land on the button (window 640×1112 while the render surface is 1800×1169, i.e
 scaling defect), so the curve above actually **excludes** scene entry/exit — it is just the frame loop's high
 water mark.
 
+### 6.15 The Interior-pointer Red Line (stage one hundred forty-seven)
+
+**Rule**: every `char*` that lands in AS3-visible storage must be an **independent value**
+(`as_str_dup` / a fresh `as_str_alloc`) -- **never** a pointer into another object, nor an
+**interior pointer** into the middle of a buffer.
+
+**Why it is fatal**: the marker and the write barrier treat every slot pointer as a block
+**body** -- `gc_hdr(p) = p - sizeof(gc_header)`. For a pointer into the middle of a string the
+"header" is read out of the **payload bytes**: the tag is ASCII and the size is arbitrary, so
+the GC greys a **bogus block**, `gc_scan` then reads its vtable/values and pushes garbage onto
+the grey stack, and the next sweep links that garbage into a free list or into `gc_all`. The
+price is a **heap collapse a few seconds later**. Measured on TalkMED the fault was literally in
+`gc_sweep_step`'s `gc_header* next = h->next;`, with the faulting address being **ASCII** -- the
+FPS overlay's own per-frame text, `"FPS: 121"`.
+
+**The producers actually measured** (all "stored a borrowed or mid-buffer pointer as a value"):
+
+| Site | What was borrowed | Fix |
+|---|---|---|
+| `Language[key] = languageXMLList[i]` (XML text) | an XML node's `text` buffer (once the parsed tree died, ~1000 static fields dangled) | `as_xml_string_value`/`as_xml_to_string`/`as_xml_attr*`/`as_xml_local_name` all `as_str_dup`; `as_xml_trim` **must copy** instead of advancing the pointer (advancing also wrote a NUL into the shared source text) |
+| the header **value** in `URLLoader__parseHeaders` | `colon + 1`, i.e. the middle of the line it had just split in place | `URLRequestHeader_new(line, as_str_dup(val))` |
+| the **key** in `as_object_set` | the caller's pointer; `URLVariables.decode` passes `p` into the buffer it just split in place. `o->keys` is a `GCT_PTR_ARRAY`, so it **is** marked as pointers | copy it on insert with `as_str_dup(key)` (which also fixes the dangling: the caller's buffer may become garbage at any time). **The one exception**: object-literal keys are emitted as C string literals (constant data segment, program lifetime), so `as_object_make` passes `copy_key == 0` and skips the copy -- otherwise every evaluation of a literal would allocate a key string for nothing (measured: ~1.4 MB of extra garbage per 1000 literal records, which also shifts the offscreen trigger's phase) |
+
+**How it is guarded**:
+
+- Source pins in `unit: emit/NoInteriorPointers` (both fixes, plus negative assertions that the
+  borrowing form is gone). An example cannot do this job: a headless program has no frame loop,
+  so it never reaches the incremental mark (and the conservative scan keeps the buffer alive anyway).
+- **The audit names the offender on the spot**: with `ASC_GC_AUDIT=1`, `gc_audit_check` applies a
+  **block-body shape test** (`gc_audit_is_body`: a known `GCT_*` tag, colour 0..2, an 8-aligned size
+  that fits its segment, and a body that is not the segment head) to every pointer entering the
+  marker/barrier. A failure prints `NON-BODY pointer ... handed to the marker/barrier` with the
+  **holder**, **5 call frames** and an **80-byte ASCII dump of the surroundings**. That dump is how
+  `URLLoader__parseHeaders` was caught -- the memory read `Server: nginx` / `Content-Type: text/html`.
+- To rule out the segment-return branch first when reading `DRIFT`/`ghost` lines, re-run with
+  `ASC_GC_RELEASE=0` and compare.
+
+### 6.16 Every Pointer-carrying Property Tag Must Be Marked (stage one hundred and sixty-one)
+
+**Rule**: an entry in a class's `as_prop` reflection table is only **half** of the contract -- `gc_scan` must also **follow** that tag. The tags that carry a pointer are 3 (`char*` string), 6 (unchecked ref), 7 (boxed `as_value`), 10/11/12 (typed ref) and **13** (`DisplayObject.name`); 1/2/4/5 are raw values and 8/9 (`int64`/`uint64`) hold no pointer at all (a range test there would mark raw integer bits as a heap reference).
+
+**What a missing tag costs**: `DisplayObject.name` is stored exactly like any other String slot -- tag 13 exists for the **write** side only, where a *dynamic* write of `null` has to throw `TypeError #2007` -- but the marker's switch listed 3/6/7/10/11/12 and not 13, so the name string was **never greyed**. The first collection that reached the object reclaimed it, and the freed block was handed straight to the next short-lived string. Measured on the live TalkMED app: the FPS overlay allocates a `"MS: N"` string every frame, so after a few seconds every click target's `name` read back as one of those, `HomeView.clickTabList` parsed the tab index out of `e.target.name`, and every tab click collapsed to index 0 -- the `打开网页` tab -- and opened a web page.
+
+**How it is guarded**:
+
+- `examples/gc_name.as` churns 2 x 30,000 short-lived strings around `System.gc()` and asserts a rooted `TextField`'s `name` still reads `"b_2"` (before the fix the second round read back a churned `"ZZ: 0"`).
+- `unit: emit/GcMarkedRuntimeSlots` derives the set of pointer-carrying tags **actually present in the emitted property tables** and asserts `gc_scan` has a `case` for every one of them -- a new tag that is not marked turns the pin red, which is exactly the shape of this defect.
+
+**Related**: this is the marking-side sibling of §6.15 (interior pointers) and of the `gc_write_barrier` rule for box tags: any new box tag or pointer-carrying field has to be added on **all** sides (typeof / truthy / eq / str_val / mark / barrier), and a property-table tag is no different.
+
 ## 7. Relationship with the Existing Reflection Tables (reuse, don't rebuild)
 
 | Existing facility | GC use |
@@ -890,7 +941,9 @@ water mark.
 | the dangling pointer from `realloc`-migrating an array | `as_dict`/`as_timers` etc.'s old pointer becomes invalid on `realloc` | GC only scans pointers registered in the shadow stack/global roots; references must be updated after `realloc` (existing code already notes this) |
 | **stop-the-world pause** | the triggering frame blocks the main thread, a visible stall with a large heap | safepoint triggering + threshold-controlled frequency; once the heap grows, **incremental marking** (GC-4) is required to truly eliminate it, otherwise the pause grows linearly with the heap |
 | WASI lacks `getrusage` etc. | memory statistics degrade | `privateMemory` already degrades to `totalMemory` (stage fifty-two); GC is unaffected |
+| **An interior pointer placed in an AS3-visible slot** | the marker reads a "header" at `p - sizeof(gc_header)`: payload becomes tag/size, a bogus block is greyed, garbage is linked into a free list / `gc_all`, and the heap collapses seconds later (stage one hundred forty-seven: the fault address was the ASCII of the FPS overlay text) | the rule "a `char*` entering AS3 storage must be an independent value" (§6.15); source pins in `unit: emit/NoInteriorPointers`; the `NON-BODY` report under `ASC_GC_AUDIT=1` (value, holder, 5 frames, 80-byte dump) |
 | **Mixing GC buffers and `malloc` buffers in the same field** | calling `free()` on a GC buffer links it into malloc's free list and wrecks GC's free list → a random crash; a `malloc` buffer is never reclaimed | single ownership: `ByteArray.data` / `BitmapData.pixels` may only be produced by `gc_alloc(GCT_BYTES)` (glue's `malloc` result is always `memcpy`ed into a GC buffer then `free`d); adding/changing these write points must also add `gc_write_barrier` (§6.14) |
+| **A reflection-table tag that `gc_scan` does not follow** | that slot's heap pointer is never greyed → the first collection sweeps it and the freed block goes to the next short-lived string ⇒ the field reads back an **unrelated string** (stage one hundred and sixty-one: tag 13 for `DisplayObject.name` was missing, `e.target.name` read back the FPS overlay's `MS: 17`, and every home-page tab click parsed to index 0 and opened a web page) | the rule "every pointer-carrying tag (3/6/7/10/11/12/13) needs a `gc_scan` branch" (§6.16); the `unit: emit/GcMarkedRuntimeSlots` pin derives the tags actually present in the emitted tables and goes red on a missing one; `examples/gc_name.as` is the end-to-end pin |
 
 ---
 

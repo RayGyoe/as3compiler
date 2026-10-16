@@ -9,7 +9,7 @@ import { readdirSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 
 import { join, dirname, resolve } from 'node:path';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, platformFrameworks } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
@@ -68,8 +68,8 @@ function checkScreen(): string[] {
   // The cached Rectangles are GC objects in C-runtime-only slots, so the props
   // table must expose them or a collection can free a live bounds rectangle.
   check('both cached Rectangles are reachable from the GC props table',
-    c.includes('{ "_bounds", 6, offsetof(Screen, _bounds) },')
-    && c.includes('{ "_visible_bounds", 6, offsetof(Screen, _visible_bounds) },'));
+    c.includes('{ "_bounds", 6, offsetof(Screen, _bounds), NULL, NULL, 1 },')
+    && c.includes('{ "_visible_bounds", 6, offsetof(Screen, _visible_bounds), NULL, NULL, 1 },'));
 
   // (3) Intersection rule: against bounds, half-open.
   const hitFn = (() => {
@@ -212,6 +212,52 @@ function checkNativeWindow(): string[] {
   // cannot alias window 0.
   check('the window object carries only the glue id, and starts it at -1',
     /\n\s*int _win;/.test(c) && nwCtor.includes('o->_win = -1;'));
+  // (2b) …and `_win` must stay at NativeWindow's offset even when the SUBCLASS has
+  // fields of its own. The emitter used to append the built-in base slots AFTER the
+  // subclass's fields, so `class wsub extends NativeWindow { var fa:int; var fb:String; }`
+  // came out as {…, minSize, fa, fb, _win}: NativeWindow_ctor's `o->_win = id` wrote
+  // into `fa`, the subclass's own field write overwrote it, and every later
+  // `stage` read (NativeWindow_get_stage casts to NativeWindow*) went through a
+  // pointer fragment — ASC_w(-2137378480) → NULL ⇒ #1009. Measured on the TalkMED
+  // app: its FixLaunchView (extends NativeWindow, 4 own fields) threw #1009 in its
+  // Event.CLOSE handler and the exit(1) path took the whole app down (阶段一百四十五).
+  // A base class with NO fields of its own (the demo windowTest, and the unit
+  // fixture above) cannot show the bug, which is why it survived until a real app
+  // subclassed a built-in. Asserted as the general rule: a subclass's slot list
+  // must START with its base's slot list, verbatim.
+  const subC = generateC(parse(
+    'import flash.display.NativeWindow;\n' +
+    'import flash.display.NativeWindowInitOptions;\n' +
+    'class wsub extends NativeWindow {\n' +
+    '  private var fa:int = 1;\n' +
+    '  private var fb:String = "x";\n' +
+    '  public function wsub() { super(new NativeWindowInitOptions()); }\n' +
+    '}\n' +
+    'var w:NativeWindow = new wsub();\n' +
+    'w.close();\n'
+  )).c;
+  const slots = (src: string, cls: string): string[] => {
+    const m = new RegExp(`^struct ${cls} \\{\\n([\\s\\S]*?)^\\};`, 'm').exec(src);
+    return m === null ? [] : m[1].trim().split('\n').map((l) => l.trim()).filter((l) => l !== '').slice(1);
+  };
+  const baseSlots = slots(subC, 'NativeWindow');
+  const subSlots = slots(subC, 'wsub');
+  check('a NativeWindow subclass repeats the base slot list first, own fields after it',
+    baseSlots.length > 0 && baseSlots.every((l, i) => subSlots[i] === l));
+  check('`_win` follows the BASE fields (minSize), never the subclass\'s',
+    subSlots.indexOf('int _win;') === subSlots.indexOf('Point* minSize;') + 1
+    && subSlots.indexOf('int fa;') > subSlots.indexOf('int _win;'));
+  // The other built-in bases that own C-runtime-only slots are field-less, so the
+  // same rule puts their slots BEFORE the subclass's first field.
+  const scrC = generateC(parse(
+    'import flash.display.Screen;\n' +
+    'class ssub extends Screen { private var fa:int = 1; }\n'
+  )).c;
+  const scrSlots = slots(scrC, 'Screen');
+  const ssubSlots = slots(scrC, 'ssub');
+  check('a field-less base (Screen) still contributes its slots before the subclass\'s',
+    scrSlots.length === 3 && scrSlots.every((l, i) => ssubSlots[i] === l)
+    && ssubSlots.indexOf('int fa;') === 3);
   check('x/y/width/height are queries into the window table, not stored fields',
     body('static double NativeWindow_get_x(void* _this) {').includes('NativeWindow_coord(((NativeWindow*)_this)->_win, 0)')
     && body('static double NativeWindow_get_height(void* _this) {').includes('NativeWindow_coord(((NativeWindow*)_this)->_win, 3)'));
@@ -341,14 +387,31 @@ function checkNativeWindow(): string[] {
   // slice / async retire once per window per frame.
   check('frameRate is one application-wide value, not a per-Stage field',
     c.includes('static double ASC_app_frame_rate;')
-    && c.includes('static double ASC_app_frame_rate = 0.0;')
+    // Default 24 -- AIR's Stage.frameRate before any assignment (measured on
+    // adl 51.4.1, temp/frprobe). It used to default to 0, which this compiler read
+    // as "follow the display refresh rate" (so an app that never set a rate ran at
+    // the panel's 120Hz and `stage.frameRate` read back 0 -- what Fps.as printed in
+    // its overlay). `[SWF(frameRate = N)]` is the document class's override and
+    // reaches the emitted initializer (temp/tkmeet-mac/talkmed.c: = 60, the
+    // talkmed-meeting descriptor; the [SWF] probe emits = 30).
+    && (c.includes('static double ASC_app_frame_rate = 24;') || /static double ASC_app_frame_rate = [0-9.]+;/.test(c))
     && !c.includes('offsetof(Stage, frame_rate)')
     && !c.includes('->frame_rate'));
+  check('the Stage.frameRate setter CLAMPS to AIR\'s 0.01..1000 range',
+    // Measured read-backs on adl 51.4.1 (temp/frclamp): -5 and 0 become 0.01,
+    // 2000 and 1e9 become 1000, while 0.005 / 0.01 / 12.5 / 1000 pass through (and
+    // NaN stays NaN).
+    c.includes('void Stage_set_frameRate(void* _this, double value) {')
+    && body('void Stage_set_frameRate(void* _this, double value) {').includes('if (value <= 0.0) value = 0.01;')
+    && body('void Stage_set_frameRate(void* _this, double value) {').includes('else if (value > 1000.0) value = 1000.0;')
+    && body('void Stage_set_frameRate(void* _this, double value) {').includes('ASC_app_frame_rate = value;'));
   check('every Stage\'s frameRate getter/setter proxies that one value',
-    c.includes('double Stage_get_frameRate(void* _this) { (void)_this; return ASC_app_frame_rate; }')
-    && c.includes('void Stage_set_frameRate(void* _this, double value) { (void)_this; ASC_app_frame_rate = value; }'));
+    c.includes('double Stage_get_frameRate(void* _this) { (void)_this; return ASC_app_frame_rate; }'));
   check('the frame cadence is read from the application rate, not a stage field',
     body('static double ASC_window_on_frame_delay(int id) {').includes('double fr = ASC_app_frame_rate;'));
+  check('a NaN rate cannot poison the pacer deadline (it falls back to the refresh)',
+    // NaN fails both <= and >, so the guard must be a negated > comparison.
+    body('static double ASC_window_on_frame_delay(int id) {').includes('if (!(fr > 0.0)) {'));
   // NOTE: the loop itself no longer dispatches the frame — it runs the shared
   // sk_pump_frame, and so does the live-resize event watch, which is what makes a
   // frame during a window drag literally the same frame as a frame here (see
@@ -424,6 +487,13 @@ function checkNativeWindow(): string[] {
   check('the GPU frame calls carry the window id (a shared layer would corrupt)',
     body('static void ASC_window_render(int id) {').includes('as_skia_gpu_begin_frame(id, w->pw, w->ph)')
     && body('static void ASC_window_render(int id) {').includes('if (w->is_gpu) as_skia_gpu_flush(id);'));
+  // The initial window's title must honour an assignment made BEFORE the OS window
+  // exists: the document class runs first, so `stage.nativeWindow.title = X` lands in
+  // w->title while the glue (which only touches an already-open window) ignores it.
+  // D7: adl showed the app's title while we kept the app.xml descriptor's.
+  check('Stage.showWindow re-claims a title the app set before the window existed',
+    body('void Stage_showWindow(void* _this, double width, double height, char* title) {')
+      .includes('if (w->title != NULL && w->title[0] != 0) title = w->title;'));
   check('Stage3D composites only into a GPU window (AIR: software windows do not)',
     body('static void ASC_window_render(int id) {')
       .includes('if (w->is_gpu && ASC_stage3d_ready && ASC_stage3d_tex != NULL) {'));
@@ -959,6 +1029,203 @@ function checkPresentScale(): string[] {
   return bad;
 }
 
+// ---- Capabilities.language / Capabilities.languages ----------------
+// AIR reports the SYSTEM UI language, not the process locale: measured on adl
+// 51.4.1 / macOS 26.6.2, the process LANG is "en_US.UTF-8" while
+// Capabilities.language is "zh-CN" and Capabilities.languages is ["zh-CN"]. The
+// emitter used to read LANG and cut it to two letters, so a program testing
+// `Capabilities.language == "zh-CN"` (TalkMED's cn.edoctor.utils.Language.as)
+// silently fell back to English — the single widest-reaching defect in the
+// talkmed-meeting AOT-vs-adl diff (D1). This group pins the two halves that can
+// regress independently:
+//   (1) the tag normalizer's BEHAVIOUR, which is a pure function of its input tag
+//       and therefore checked by running it with a fixed tag table (no dependence
+//       on the host locale), and
+//   (2) the wiring — emitter -> runtime helper, and the darwin framework the
+//       helper's CoreFoundation calls need at link time.
+function checkCapabilitiesLocale(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [capabilities] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [capabilities] ${label}`); }
+  };
+
+  // (1) Behaviour. The preamble alone does not link: it forward-declares helpers
+  // that the generated C defines (as_v_is_class, as_class_fqn_of_ptr, ...). The
+  // driver below calls none of them, so the link runs with -undefined
+  // dynamic_lookup — the point of this test is as_cap_lang_normalize, not a build.
+  if (process.platform === 'darwin') {
+    const tags = ['zh_CN', 'zh-Hans-CN', 'en_US.UTF-8', 'en', 'zh_CN@currency=CNY', 'sr-Latn-RS'];
+    const want = ['zh-CN', 'zh-CN', 'en-US', 'en', 'zh-CN', 'sr-RS'];
+    const scratch = join(root, 'temp', 'caploc-unit');
+    mkdirSync(scratch, { recursive: true });
+    const cfile = join(scratch, 'norm.c');
+    const exe = join(scratch, 'norm');
+    const list = tags.map((t) => `"${t}"`).join(', ');
+    writeFileSync(cfile, RUNTIME_PREAMBLE + [
+      'int main(void) {',
+      `  static const char* tags[] = { ${list} };`,
+      `  for (int i = 0; i < ${tags.length}; i++) {`,
+      '    char out[32];',
+      '    as_cap_lang_normalize(tags[i], out, sizeof(out));',
+      '    printf("%s\\n", out);',
+      '  }',
+      '  // The AIR invariant: languages[0] is the same tag as language.',
+      '  {',
+      '    as_array* ls = as_cap_languages();',
+      '    const char* first = (ls->length > 0) ? (const char*)as_v_obj_val(ls->data[0]) : NULL;',
+      '    printf("lang=%s first=%s same=%d n=%d\\n",',
+      '      as_cap_language(), first != NULL ? first : "",',
+      '      (first != NULL && strcmp(first, as_cap_language()) == 0) ? 1 : 0, (int)ls->length);',
+      '  }',
+      '  return 0;',
+      '}',
+      '',
+    ].join('\n'));
+    let out = '';
+    let err = '';
+    try {
+      execFileSync('cc', ['-O1', '-w', cfile, '-o', exe, '-lm', '-lz',
+        '-framework', 'CoreFoundation', '-Wl,-undefined,dynamic_lookup'],
+        { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS });
+      out = execFileSync(exe, [], { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS }).toString();
+    } catch (e) {
+      err = String((e as { stderr?: Buffer }).stderr ?? e).split('\n').slice(0, 3).join(' | ');
+    }
+    const lines = out.trim() === '' ? [] : out.trim().split('\n');
+    check(`the locale probe builds and runs${err ? ` -- ${err}` : ''}`, err === '' && lines.length === tags.length + 1);
+    for (let i = 0; i < tags.length; i++) {
+      check(`normalize("${tags[i]}") == "${want[i]}"`, lines[i] === want[i]);
+    }
+    const tail = lines[tags.length] ?? '';
+    check(`the system tag is a language-REGION tag: ${tail}`, /^lang=[a-z]{2}(-[A-Z0-9]{2,3})? first=/.test(tail));
+    check(`Capabilities.languages[0] == Capabilities.language: ${tail}`, tail.includes('same=1') && !tail.includes('n=0'));
+  } else {
+    console.log('SKIP  [capabilities] the locale probe needs macOS (CoreFoundation)');
+  }
+
+  // (2) Wiring. `language`/`languages` must be resolved to the runtime helpers, and
+  // the runtime must reach the system locale rather than the process locale.
+  const c = generateC(parse(
+    'import flash.system.Capabilities;\n' +
+    'var s:String = Capabilities.language;\n' +
+    'var a:Array = Capabilities.languages;\n' +
+    'var n:int = a.length;\n'
+  )).c;
+  check('the emitter resolves `language` to as_cap_language()', c.includes('as_cap_language()'));
+  check('the emitter resolves `languages` to as_cap_languages()', c.includes('as_cap_languages()'));
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  check('the CoreFoundation entry points are declared by hand (the Apple headers cannot be included)',
+    pre.includes('extern ASC_CFRef CFLocaleCopyCurrent(void);')
+    && pre.includes('extern unsigned char CFStringGetCString(ASC_CFStringRef s, char* buf, long cap, unsigned encoding);'));
+  check('the declarations are Apple-only (no Apple dependency on other targets)',
+    /#if defined\(__APPLE__\) && !defined\(__wasi__\)\n#define ASC_HAVE_CFLOCALE 1/.test(pre));
+  const langBody = (() => {
+    const i = pre.indexOf('static const char* as_cap_language(void) {');
+    return i < 0 ? '' : pre.slice(i, pre.indexOf('\n}', i));
+  })();
+  check('language reads CFLocaleCopyCurrent() before ever consulting LANG',
+    langBody.indexOf('CFLocaleCopyCurrent()') >= 0
+    && langBody.indexOf('CFLocaleCopyCurrent()') < langBody.indexOf('getenv("LANG")'));
+  check('language still falls back to the process locale and then "en"',
+    langBody.includes('getenv("LANG")') && langBody.includes('return "en";'));
+  const normBody = (() => {
+    const i = pre.indexOf('static void as_cap_lang_normalize(const char* tag, char* out, size_t cap) {');
+    return i < 0 ? '' : pre.slice(i, pre.indexOf('\n}', i));
+  })();
+  check('the normalizer detects a region subtag as 2 letters or 3 digits',
+    normBody.includes("if (len == 2 || (len == 3 && start[0] >= '0' && start[0] <= '9')) {"));
+
+  // The runtime's CoreFoundation calls have to be resolved by the link, and only
+  // where the declarations exist (darwin native). Missing it is a link error the
+  // build layer reports for the whole program, so it is pinned here as data.
+  const darwinNative = { ...defaultBuildConfig(), frameworks: [] } as BuildConfig;
+  const wasmCfg = { ...defaultBuildConfig(), target: 'wasm' as Target } as BuildConfig;
+  if (process.platform === 'darwin') {
+    check('the darwin native link adds -framework CoreFoundation',
+      platformFrameworks(darwinNative).includes('CoreFoundation'));
+  }
+  check('the wasm link does not ask for a macOS framework',
+    platformFrameworks(wasmCfg).length === 0);
+  check('a manifest that already lists CoreFoundation is not duplicated',
+    platformFrameworks({ ...darwinNative, frameworks: ['CoreFoundation'] } as BuildConfig).length === 0
+    || process.platform !== 'darwin');
+
+  if (ok > 0) console.log(`[capabilities] ${ok} locale checks passed`);
+  return bad;
+}
+
+
+// ---- the presented drawable must be readable as a shader input (stage 160) ----
+//
+// AS3 `DisplayObject.blendMode` reaches Skia as a paint blend mode
+// (`sk_paint_set_blend` in skia_glue.cc, fed from the generated
+// `as_skia_canvas_save_layer_paint(canvas, bp)` in emit.ts). All but `add`/`layer`
+// of those modes -- darken, multiply, screen, lighten, difference, overlay,
+// hardlight -- are *advanced* blend modes: fixed-function blending cannot express
+// them, so Ganesh has to READ THE DESTINATION and blend it in a shader. On the
+// Metal backend the destination is the CAMetalLayer drawable we wrapped, and a
+// CAMetalLayer's drawables are `framebufferOnly = YES` by default -- a
+// render-only storage mode that forbids being used as a shader input and answers
+// with uninitialized memory when forced. Measured on TalkMED (temp/tkmeet-mac,
+// diff D26): the home page's baked-in `BlendMode.DARKEN` layer composited that
+// memory over the whole window as large magenta regions, in every frame, on any
+// hover. The fix is one property; the pin exists so it cannot be "cleaned up".
+function checkDrawableReadable(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [drawableread] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [drawableread] ${label}`); }
+  };
+
+  const read = (rel: string): string =>
+    readFileSync(join(root, rel), 'utf8').replace(/\r\n/g, '\n');
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  const mtlRaw = read('vendor/metal_glue.mm');
+  const mtl = strip(mtlRaw);
+  check('the CAMetalLayer drawable is allowed to be used as a shader input',
+    (mtl.match(/framebufferOnly\s*=\s*NO;/g) ?? []).length === 1);
+  check('...and never left on the render-only default',
+    !/framebufferOnly\s*=\s*YES/.test(mtl));
+  const iCast = mtl.indexOf('CAMetalLayer* l =');
+  const iFbo = mtl.indexOf('framebufferOnly = NO;');
+  const iBind = mtl.indexOf('g_mtl[win_id].used = 1;');
+  check('...on the attached layer, during sk_mtl_init and before the slot is usable',
+    iCast >= 0 && iFbo > iCast && iBind > iFbo);
+  check('...and before any drawable of that layer is ever requested',
+    iFbo > 0 && iFbo < mtl.indexOf('nextDrawable'));
+  // The property is a workaround for a dst-reading pass, so the file must say so
+  // -- a bare assignment invites removal as "unused configuration".
+  check('the reason (advanced blend modes sample the destination) is documented next to it',
+    /framebufferOnly/.test(mtlRaw) && /blend/i.test(mtlRaw) && /sampl/i.test(mtlRaw));
+
+  // Consumer anchor: the renderer must really be able to ask for a dst-reading
+  // blend, i.e. the mode table and the layer wrapper are still wired.
+  const glue = strip(read('vendor/skia_glue.cc'));
+  const emit = read('src/emit.ts');
+  check('the blend-name table still maps advanced (dst-reading) modes',
+    glue.includes('m = SkBlendMode::kDarken;') &&
+    glue.includes('m = SkBlendMode::kMultiply;') &&
+    glue.includes('m = SkBlendMode::kOverlay;'));
+  check('...and a DisplayObject with blendMode is still composited through a layer',
+    emit.includes('as_skia_canvas_save_layer_paint(canvas, bp)'));
+
+  // The finding must stay written down, in both mirrors (docs/en mirrors docs/zh-cn).
+  const zh = read('docs/zh-cn/skia.md');
+  const en = read('docs/en/skia.md');
+  check('the Metal drawable requirement is documented in skia.md (zh + en)',
+    zh.includes('framebufferOnly') && zh.includes('kDarken') &&
+    en.includes('framebufferOnly'));
+
+  if (ok > 0) console.log(`[drawableread] ${ok} drawable-readability checks passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/DrawableReadable', checkDrawableReadable);
 registerGroup('unit: platform/AudioWiring', checkAudioWiring);
 registerGroup('unit: platform/Screen', checkScreen);
 registerGroup('unit: platform/NativeWindow', checkNativeWindow);
@@ -967,3 +1234,4 @@ registerGroup('unit: platform/WindowFrame', checkWindowFrame);
 registerGroup('unit: platform/PresentScale', checkPresentScale);
 registerGroup('unit: platform/NullRef', checkNullRef);
 registerGroup('unit: platform/Intervals', checkIntervals);
+registerGroup('unit: platform/CapabilitiesLocale', checkCapabilitiesLocale);

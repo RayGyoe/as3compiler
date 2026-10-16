@@ -29,6 +29,9 @@
 
 #include "include/core/SkSurface.h"
 #include "include/core/SkCanvas.h"
+#include "include/core/SkData.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkPixmap.h"
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkImage.h"
 #include "include/gpu/GrDirectContext.h"
@@ -178,6 +181,22 @@ int sk_mtl_init(int win_id, void* layer) {
   l.contentsGravity = kCAGravityTopLeft;
   l.device = g_device;
   l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+  // A CAMetalLayer's drawables are `framebufferOnly = YES` by default, which lets
+  // Metal put them in a faster, render-only storage mode but FORBIDS using the
+  // texture as a shader input. Skia's advanced blend modes (everything AS3 can
+  // reach through `DisplayObject.blendMode` beyond normal/add/alpha/erase --
+  // darken, multiply, overlay, ...) cannot be expressed with fixed-function
+  // blending: Ganesh has to READ THE DESTINATION and blend in a shader, i.e.
+  // sample the drawable we just wrapped. Sampling a framebuffer-only drawable is
+  // undefined, and Apple's GPUs answer with uninitialized memory -- the TalkMED
+  // home page's `BlendMode.DARKEN` layer composited that garbage over the whole
+  // window (large magenta regions). Opting the drawable out of render-only
+  // storage is the documented requirement for a dst-reading render pass; the
+  // cost is a slower drawable allocation, not a per-frame one.
+  // Measured: with the default YES the home page showed magenta wherever the
+  // baked-in magenta of the drawable survived; with NO the frame is pixel-correct
+  // (temp/tkmeet-mac/d27*, talkmed-meeting-aot-vs-adl-diff.md D27).
+  l.framebufferOnly = NO;
   // Tag the layer as sRGB: MTLPixelFormatBGRA8Unorm carries *encoded* values and
   // says nothing about their color space, so an untagged layer is interpreted as
   // display-native (over-saturated on a wide-gamut display). What Skia paints is
@@ -330,7 +349,7 @@ void sk_mtl_flush(int win_id) {
                                            kPremul_SkAlphaType, nullptr);
       uint32_t buf[64];
       if (m->surface->readPixels(rinfo, buf, sizeof(uint32_t) * (size_t)rn, rx, ry)) {
-        fprintf(stderr, "mtl_readback y=%d x=%d:", ry, rx);
+        fprintf(stderr, "mtl_readback win=%d y=%d x=%d:", win_id, ry, rx);
         for (int i = 0; i < rn; i++) fprintf(stderr, " %08x", buf[i]);
         fprintf(stderr, "\n");
         fflush(stderr);
@@ -391,30 +410,6 @@ void sk_mtl_draw_texture(void* canvas, void* mtlTexture, int w, int h,
   ((SkCanvas*)canvas)->drawImageRect(img.get(), dst, SkSamplingOptions());
 }
 
-// ---------------------------------------------------------------------------
-// The backend-neutral seam: this file is the Metal end of the sk_gpu_* five that
-// src/runtime.ts externs under ASC_RENDER_WINGPU (d3d_glue.cc is the D3D12 end).
-// The generated C and the runtime only ever name these five, so that ONE
-// generated .c serves both backends; which backend it gets is decided in
-// window_glue.cc's sk_attach_gpu, never here.
-//
-// These are not the init path: window_glue.cc's sk_attach_gpu calls sk_mtl_init
-// directly (through sk_attach_metal), so the per-window CAMetalLayer is already
-// bound before any frame runs. What the generated C actually reaches is the
-// per-frame pair — ASC_window_render calls as_skia_gpu_begin_frame /
-// as_skia_gpu_flush — plus sk_gpu_draw_texture on a Stage3D build. Those MUST
-// resolve at LINK time even though a macOS window normally renders inside
-// sk_window_show_metal's own loop in window_glue.cc: "not called at runtime" is
-// not "not referenced".
-//
-// That distinction is not hypothetical. Until 2026-10-09 the five names were
-// externed but implemented only on D3D12, so every macOS GPU build of an AIR app
-// failed to link (`_sk_gpu_begin_frame`, `_sk_gpu_flush`, referenced from
-// _ASC_window_render) while the examples suite stayed green — its air-native unit
-// compiles the demo's .as files WITHOUT --air-app, so ASC_RENDER_WINGPU was never
-// defined there and the whole GPU path was never compiled. Only
-// `node src/index.ts --air-app examples/air-native/air-native-app.xml --target
-// native` (the command in test/unit/platform.ts's seam nail) sees it.
 int sk_gpu_init(int win_id, void* layer) { return sk_mtl_init(win_id, layer); }
 void sk_gpu_destroy(int win_id) { sk_mtl_destroy(win_id); }
 void* sk_gpu_begin_frame(int win_id, int width, int height) {

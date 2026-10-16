@@ -15,6 +15,7 @@
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import type { BuildConfig } from './build.ts';
+import { platformFrameworks } from './build.ts';
 import { parsePlist, serializePlist, asDict, asArray, scalarText, dictEntry, type PlistValue } from './pbxproj.ts';
 
 // A .xcodeproj is a directory containing project.pbxproj plus an optional
@@ -419,6 +420,9 @@ function pushTargetConfig(
   for (const l of cfg.linkLibs) ldflags.push(`-l${l}`);
   for (const o of cfg.objects) ldflags.push(resolve(o));
   for (const f of cfg.frameworks) ldflags.push('-framework', f);
+  // The runtime's own macOS frameworks (CoreFoundation for Capabilities.language) —
+  // the generated .app must link exactly what the raw link step links.
+  for (const f of platformFrameworks(cfg)) ldflags.push('-framework', f);
 
   // Optimization flag: the raw build uses cfg.opt (default -O2). Xcode exposes
   // optimization via GCC_OPTIMIZATION_LEVEL, so map the common -O{0,1,2,3,s}.

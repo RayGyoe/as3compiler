@@ -538,9 +538,12 @@ export class Emitter {
    */
   private swcTextOrigin = new Map<number, { ox: number; oy: number }>();
   private swcCharClass: Map<string, number>;
+  /** charId -> the exported symbol's synthesized class (cname, kind, frame scripts). */
+  private swcCharInfo: Map<number, { cname: string; kind: 'sprite' | 'button'; frames: readonly { frame: number; method: string }[] }>;
   // `BitmapData_adoptEncoded` is shared by the SWC and `[Embed]` image paths
   // (both go through emitBitmapDataAdoptEncoded), so it is emitted once.
   private adoptEncodedEmitted = false;
+  private argbApplyAlphaEmitted = false;
 
   // `[Embed]` assets (阶段一百一十二): each generated asset class gets its bytes
   // embedded as a C array and the matching binding emitted in its constructor's
@@ -569,7 +572,16 @@ export class Emitter {
     this.swcResources = new Map(swcResources.map((r) => [r.cname, r]));
     this.swcBake = swcBake;
     this.swcCharClass = new Map((swcBake?.chars ?? []).map((c) => [c.cname, c.charId]));
+    this.swcCharInfo = new Map((swcBake?.chars ?? []).map((c) => [c.charId, { cname: c.cname, kind: c.kind, frames: c.frames }]));
     this.embedResources = new Map(embedResources.map((r) => [r.cname, r]));
+    // This assignment is load-bearing: the field is what emits the descriptor bytes
+    // and the accessor that hands them out. Leaving it out (as it was until
+    // stage 一百四十四) did not fail to compile -- it silently degraded every build
+    // to the no-descriptor fallback, so `--air-app` programs that read
+    // `NativeApplication.applicationDescriptor` got an empty <application/> whose
+    // `ns::versionNumber` is "" (talkmed-meeting's Config.CurrentAppVersion then
+    // answered an empty version and the update check compared nothing).
+    this.appDescriptorXml = appDescriptorXml;
   }
 
   // ---------- top level ----------
@@ -904,7 +916,7 @@ export class Emitter {
       case 'string': return `(${expr} ? ${expr} : "null")`;
       case 'object': return `as_obj_to_str((void*)(${expr}))`;
       case 'interface': return `as_obj_to_str(${expr}.obj)`;
-      case 'xml': return `as_xml_to_string(${expr})`;
+      case 'xml': return `as_xml_string_value(${expr})`;
       case 'xmllist': return `as_xml_list_to_string(${expr})`;
       case 'function': return '"function Function() {}"';
       case 'vector': return '"[object Vector]"';
@@ -1176,10 +1188,39 @@ export class Emitter {
     if (cached !== undefined) return cached;
     let c = sanitizeCIdent(name, this.usedCIdentifiers);
     const types = this.reservedTypeNames();
-    while (types.has(c)) c = '_' + c;
+    // `sanitizeCIdent` already reserved `c` for this AS3 name, so the first
+    // candidate is exempt from the used-set test; every PREPEND must clear all
+    // three tests, else a later AS3 name would alias onto the same C identifier.
+    let adjusted = false;
+    for (;;) {
+      const taken = types.has(c) || Emitter.isGeneratedLocalName(c) || (adjusted && this.usedCIdentifiers.has(c));
+      if (!taken) break;
+      c = '_' + c;
+      adjusted = true;
+    }
     this.usedCIdentifiers.add(c);
     this.cNameCache.set(name, c);
     return c;
+  }
+
+  // Names the emitter PLANTS in a generated function body — a free AS3 local that
+  // happens to reuse one of them collided with the generated slot and the C did
+  // not compile (measured on a 7-line AIR app class, temp/d31probe/ocollide2.as):
+  //   static void Widget_ctor(Widget* o) { ... Object* o = NULL; ... }
+  //   error: redefinition of 'o' with a different type: 'Object *' vs 'Widget *'
+  // They are NOT C/libc symbols, so C_RESERVED cannot carry them:
+  //   `o`     — receiver parameter of a generated class constructor
+  //   `_this` — receiver parameter of every generated instance method
+  //   `_<word><N>` — tmpName() temporaries (`_once0`, `_i3`, `_ret1`, ...) and
+  //                 closure-cell env struct tags (`_cell0`)
+  // `this` is deliberately absent: AS3 forbids it as an identifier, and the
+  // emitter emits the receiver alias with that literal spelling.
+  // `cell<N>` (the closure-cell POINTER) is also absent: it is spelled raw at six
+  // emission sites and through `cIdent` at one (the activation-cell declaration),
+  // so a spelling-level reservation would split declaration from use — see
+  // docs/zh-cn/c-naming.md §7 for that residual hole.
+  private static isGeneratedLocalName(n: string): boolean {
+    return n === 'o' || n === '_this' || /^_[A-Za-z]+\d+$/.test(n);
   }
 
   // Every C TYPE name the generated translation unit declares a typedef for.
@@ -1301,6 +1342,56 @@ export class Emitter {
     if (this.symbols.classes.size > 0 || this.symbols.interfaces.size > 0) this.line('');
   }
 
+  // C-runtime-only slots that belong to a BUILT-IN class rather than to the class
+  // being emitted: they must sit at the SAME offset as in that class's own struct,
+  // or a base-class body that reads them through a `Base*` cast would read whatever
+  // the subclass happened to put there. emitStructs therefore emits each of these
+  // right after the owning base class's own declared fields (阶段一百四十五).
+  private hasBaseClassSlots(cls: string): boolean {
+    return cls === 'Screen' || cls === 'NativeWindow' || cls === 'Matrix3D' || cls === 'SharedObject';
+  }
+
+  private emitBaseClassSlots(cls: string): void {
+    if (cls === 'Screen') {
+      // Screen keeps one live Rectangle per display rectangle. AIR hands back the
+      // SAME Rectangle object on every read (mutating the value returned by
+      // `s.bounds` shows up on the next `s.bounds`, measured on adl), so the two
+      // rectangles are cached here rather than rebuilt per getter call; only the
+      // Screen wrapper itself is fresh on every access. Both are GC objects in
+      // C-runtime-only slots, so the props table marks them (see emitPropTables).
+      this.line('int _display_index;');
+      this.line('void* _bounds;');
+      this.line('void* _visible_bounds;');
+      return;
+    }
+    if (cls === 'NativeWindow') {
+      // NativeWindow keeps only the glue window id on the object; everything else
+      // about the window lives in the generated ASC_wins[] table, indexed by that
+      // id. A plain int, so no props-table entry (and no GC root) is needed.
+      this.line('int _win;');
+      return;
+    }
+    if (cls === 'Matrix3D') {
+      // Matrix3D keeps its 16 column-major doubles in a C-runtime-only array (the
+      // class declares no AS3-visible fields; rawData is a getter/setter).
+      this.line('double _m[16];');
+      return;
+    }
+    if (cls === 'SharedObject') {
+      // SharedObject keeps its persisted attribute table (a GC object, so the
+      // props reflection table marks it — see emitPropTables), the storage file
+      // path, and the client callback target in C-runtime-only slots. data / size
+      // / client / objectEncoding are AS3 accessors, so no AS3-visible field is
+      // declared (AIR's data is read-only and mxmlc rejects `so.data = x`).
+      this.line('char* name;');
+      this.line('char* path;');
+      this.line('as_object* _data;');
+      this.line('void* _client;');
+      this.line('unsigned int _objectEncoding;');
+      this.line('double _fps;');
+    }
+  }
+
   private emitStructs(): void {
     // Vector.<T> monomorphized structs: a GCT_CUSTOM mark callback (so the GC
     // can trace element pointers for reference element types), then the
@@ -1384,7 +1475,31 @@ export class Emitter {
       this.line(`struct ${name} {`);
       this.indent++;
       this.line(`${name}_vtable* vtable;`);
-      for (const [fname, f] of info.fields) {
+      // A struct must lay its superclass's slots out exactly as the superclass's
+      // own struct does, so `((Base*)sub)` reads what `Base`'s bodies wrote. The
+      // emitter used to append the built-in base slots (see emitBaseClassSlots)
+      // AFTER the subclass's own fields: `class FixLaunchView extends NativeWindow`
+      // then came out as {…, minSize, skinView, …, launchUrl, _win} while
+      // NativeWindow's struct is {…, minSize, _win}. NativeWindow_ctor's
+      // `o->_win = id` landed on `skinView` and the subclass's very next
+      // `skinView = new …` overwrote it, so every later `stage` read went through a
+      // pointer fragment (ASC_w → NULL) and threw #1009 (measured: the app died
+      // when its secondary window's CLOSE handler touched `stage`). Emit each
+      // base's slots right after that base's own declared fields — and before the
+      // fields of any class further down the chain, since a field-less base
+      // (Screen / Matrix3D / SharedObject) owns slots but declares no field.
+      const chain: string[] = [];
+      for (let cur: string | null = name; cur !== null; cur = this.symbols.getClass(cur)?.superClass ?? null) {
+        chain.unshift(cur);
+      }
+      const slotsPending = chain.filter((c) => this.hasBaseClassSlots(c));
+      const fieldList = [...info.fields];
+      for (let fi = 0; fi < fieldList.length; fi++) {
+        const [fname, f] = fieldList[fi];
+        const ownerIdx = chain.indexOf(f.owner);
+        while (slotsPending.length > 0 && chain.indexOf(slotsPending[0]) < (ownerIdx < 0 ? chain.length : ownerIdx)) {
+          this.emitBaseClassSlots(slotsPending.shift()!);
+        }
         this.line(`${this.cTypeName(f.type)} ${this.cIdent(fname)};`);
         // cacheAsBitmap backing store: when the AS3-visible cacheAsBitmap flag is
         // set, as_render_cached bakes the subtree into an offscreen surface and
@@ -1444,6 +1559,26 @@ export class Emitter {
           this.line('int _para_collapse;');
           this.line('double _para_leading;');
           this.line('int _para_align;');
+          // Rich-text (run) invalidation counter: the cached paragraph is keyed on
+          // the runs' CONTENT, but runs are appended into one Array whose address
+          // never changes, so the identity test used for the plain-text path is
+          // unsound here. Every run write bumps _runs_gen and the paragraph
+          // remembers the generation it was built from. Without this the cache was
+          // disabled whenever runs existed (hasRuns == 0 below), so EVERY
+          // as_tf_paragraph call freed the previous paragraph and rebuilt it --
+          // while the render pass still held the pointer it had captured. Fps.as
+          // (htmlText per frame) hit it every frame: '[para] PAINT **FREED**
+          // paragraph ... freed_by=as_tf_paragraph' and SIGSEGV inside
+          // sk_textlayout_paint (阶段一百四十七).
+          // 1 when the current htmlText produced at least one BLOCK break (a
+          // rule-styled unknown tag closed -- see as_tf_html_set). AIR honours such a
+          // break even with multiline=false (measured, temp/blockprobe: the four
+          // <fps>/<ms>/<mem>/<memMax> values are five numLines in a field whose
+          // multiline is left at its default), so the paragraph builder must not run
+          // its single-line newline collapse for them.
+          this.line('bool _html_block;');
+          this.line('int _runs_gen;');
+          this.line('int _para_runs_gen;');
           // displayAsPassword layout text + the .text{} pointer it was built from.
           // LAYOUT ONLY: the mask is never returned to AS3 (TextField.text stays the
           // plaintext); it exists so the paragraph (and therefore textWidth, the
@@ -1473,26 +1608,12 @@ export class Emitter {
           // dropped by anything else that relocates the caret.
           this.line('int _goal_col;');
         }
+        const nextField = fieldList[fi + 1];
+        if (slotsPending.length > 0 && slotsPending[0] === f.owner && (nextField === undefined || nextField[1].owner !== f.owner)) {
+          this.emitBaseClassSlots(slotsPending.shift()!);
+        }
       }
-      // Screen keeps one live Rectangle per display rectangle. AIR hands back the
-      // SAME Rectangle object on every read (mutating the value returned by
-      // `s.bounds` shows up on the next `s.bounds`, measured on adl), so the two
-      // rectangles are cached here rather than rebuilt per getter call; only the
-      // Screen wrapper itself is fresh on every access. Both are GC objects in
-      // C-runtime-only slots, so the props table marks them (see emitPropTables).
-      if (this.symbols.isSubclassOf(name, 'Screen')) {
-        this.line('int _display_index;');
-        this.line('void* _bounds;');
-        this.line('void* _visible_bounds;');
-      }
-      // NativeWindow keeps only the glue window id on the object; everything else
-      // about the window lives in the generated ASC_wins[] table, indexed by that
-      // id. A plain int, so no props-table entry (and no GC root) is needed. The
-      // flat struct means a subclass (windowTest extends NativeWindow) carries
-      // `_win` at the same offset, so the base functions can read it directly.
-      if (this.symbols.isSubclassOf(name, 'NativeWindow')) {
-        this.line('int _win;');
-      }
+      while (slotsPending.length > 0) this.emitBaseClassSlots(slotsPending.shift()!);
       // `class X extends Array` (arrayBacked): AIR's Array has no C struct to
       // inherit, so the element storage lives in this hidden backing array, and
       // every inherited Array member operates on it. It is a GC object, so the
@@ -1502,25 +1623,6 @@ export class Emitter {
       // arbitrary undeclared string-keyed properties. Its byte offset is emitted
       // into the vtable so as_dyn_get/set can reach it.
       if (info.isDynamic) this.line('as_object* _dyn;');
-      // Matrix3D keeps its 16 column-major doubles in a C-runtime-only array (the
-      // class declares no AS3-visible fields; rawData is a getter/setter). Emitted
-      // here so the layout is stable and all Matrix3D_* bodies can read `o->_m`.
-      if (this.symbols.isSubclassOf(name, 'Matrix3D')) {
-        this.line('double _m[16];');
-      }
-      // SharedObject keeps its persisted attribute table (a GC object, so the
-      // props reflection table marks it — see emitPropTables), the storage file
-      // path, and the client callback target in C-runtime-only slots. data / size
-      // / client / objectEncoding are AS3 accessors, so no AS3-visible field is
-      // declared (AIR's data is read-only and mxmlc rejects `so.data = x`).
-      if (this.symbols.isSubclassOf(name, 'SharedObject')) {
-        this.line('char* name;');
-        this.line('char* path;');
-        this.line('as_object* _data;');
-        this.line('void* _client;');
-        this.line('unsigned int _objectEncoding;');
-        this.line('double _fps;');
-      }
       // URLStream owns its transfer: `_job` is the live streaming job (a plain
       // malloc structure, NOT traced by the GC), and `_buf`/`_buf_pos` are the
       // remainder copied out of it when the load completes, so reads keep working
@@ -1531,6 +1633,13 @@ export class Emitter {
         this.line('void* _job;');
         this.line('void* _buf;');
         this.line('int _buf_pos;');
+      }
+      // flash.text.StyleSheet keeps its rules in a C-runtime-only slot: a record
+      // mapping a selector to a declaration record. Not an AS3-visible member (the
+      // AS3 surface is setStyle/getStyle/clear/styleNames), so the props reflection
+      // table marks it (emitPropTables). It is a GC object, hence the explicit entry.
+      if (name === 'StyleSheet') {
+        this.line('as_object* _rules;');
       }
       // flash.net sockets: `_sock` is a BORROWED handle to the transport owned by
       // RUNTIME_PREAMBLE's socket registry (see the socket seam). Not AS3-visible
@@ -1667,6 +1776,16 @@ export class Emitter {
     this.line('parts[3] = as_fqn_dotted(fqn);');
     this.line('parts[4] = ".";');
     this.line('as_throw(TypeError_new(as_str_concat_n(5, parts), 1034));');
+    this.indent--;
+    this.line('}');
+    // JSON.stringify on a structure that contains itself. AIR refuses it with a
+    // TypeError whose message and errorID are pinned (measured on adl 51.4.1,
+    // temp/jsonair3: 'Error #1129: Cyclic structure cannot be converted to JSON
+    // string.'). Declared up in the preamble, where as_json_stringify_rec calls
+    // it; the !1129 throw needs the typed constructor emitted here.
+    this.line('static _Noreturn void as_throw_json_cycle(void) {');
+    this.indent++;
+    this.line('as_throw(TypeError_new("Error #1129: Cyclic structure cannot be converted to JSON string.", 1129));');
     this.indent--;
     this.line('}');
     this.line('static void* as_v_req_inst(as_value v, void* target_vt, const char* fqn) {');
@@ -2331,21 +2450,23 @@ export class Emitter {
     // `new (ClassValue)(args)` on a CORE class. AIR's core classes are all
     // conversions of the first argument -- new int(5) is 5, new String() is "",
     // new Array() is [], new Number() is 0, new Boolean() is false and new
-    // Object() is a plain object, while new Object(5) still yields an OBJECT
-    // (unlike the Object(5) CONVERSION, which yields 5) -- measured on adl
-    // 51.4.1. as_dyn_new_args passes the class object as `env`, which is how the
-    // fqn picks the conversion.
+    // Object() is a plain object. Measured on adl 51.4.1: the value goes through
+    // the SAME conversion as `Object(x)` / `int(x)` -- `new co(5)` is the number 5
+    // (typeof number) and `new co(null)` is a fresh [object Object], and int/uint
+    // wrap like ToInt32/ToUint32 (new ci(1e10) is 1410065408) instead of being
+    // undefined behaviour. as_dyn_new_args passes the class object as `env`,
+    // which is how the fqn picks the conversion.
     this.line('static as_value as_core_cls_ctor(void* env, as_value* args, int argc) {');
     this.indent++;
     this.line('as_class* c = (as_class*)env;');
     this.line('const char* n = (c != NULL && c->fqn != NULL) ? c->fqn : "";');
     this.line('as_value a = (args != NULL && argc > 0) ? args[0] : as_v_null();');
-    this.line('if (strcmp(n, "int") == 0) return as_v_num((double)(int)as_v_to_number(a));');
-    this.line('if (strcmp(n, "uint") == 0) return as_v_num((double)(unsigned int)as_v_to_number(a));');
+    this.line('if (strcmp(n, "int") == 0) return as_v_num((double)as_to_int32(as_v_to_number(a)));');
+    this.line('if (strcmp(n, "uint") == 0) return as_v_num((double)as_to_uint32(as_v_to_number(a)));');
     this.line('if (strcmp(n, "Number") == 0) return as_v_num(as_v_to_number(a));');
     this.line('if (strcmp(n, "Boolean") == 0) return as_v_bool(as_v_truthy(a));');
     this.line('if (strcmp(n, "String") == 0) return as_v_str(argc > 0 ? as_v_str_val(a) : (char*)"");');
-    this.line('if (strcmp(n, "Object") == 0) return as_v_obj((void*)as_object_new());');
+    this.line('if (strcmp(n, "Object") == 0) return as_obj_conv(a);');
     this.line('if (strcmp(n, "Array") == 0) {');
     this.indent++;
     this.line('if (argc == 1 && a.tag == 1) return as_v_arr((void*)as_array_new_sized((int)a.num));');
@@ -2982,6 +3103,11 @@ export class Emitter {
     // them). Without this the vtable's props slot is NULL and a collection can free
     // a Rectangle the Screen is still handing out.
     if (name === 'Screen') return true;
+    // StyleSheet declares no AS3-visible fields (styleNames is an accessor), yet its
+    // rule table is a GC record held in a C-runtime-only slot that must be traced
+    // (emitPropTables adds `_rules`). Without this the table would be swept while the
+    // sheet still answers from it (阶段一百四十八).
+    if (name === 'StyleSheet') return true;
     // `class X extends Array` (arrayBacked) carries its element storage in a
     // C-runtime-only `_arr` slot that the GC must trace even when the class
     // declares no AS3-visible field of its own (Set extends Sequence).
@@ -3274,48 +3400,75 @@ export class Emitter {
         const tag = (name === 'DisplayObject' && fname === 'name') ? 13 : this.propTypeTag(f.type);
         const label = this.escapeCString(f.name ?? fname);
         const off = `offsetof(${name}, ${this.cIdent(fname)})`;
+        // vis: only a PUBLIC member is a JSON member. AIR omits the private /
+        // protected / internal ones (measured on adl 51.4.1: temp/jsonair5's T5
+        // declares a private field plus a public getter for it and serializes to
+        // {"p":3} -- the getter only). The GC scanner ignores this slot.
+        const vis = f.visibility === 'public' ? 0 : 1;
         if (tag === 11) {
           // A class-typed slot must be able to name itself in the #1034 message,
           // so carry the target vtable + fqn rather than only the tag.
           const cls = (f.type as { className: string }).className;
           const cinfo = this.symbols.getClass(cls)!;
-          this.line(`{ "${label}", 11, ${off}, (void*)&${cls}_vt, "${this.escapeCString(cinfo.fqn ?? cinfo.reflectFqn ?? cls)}" },`);
+          this.line(`{ "${label}", 11, ${off}, (void*)&${cls}_vt, "${this.escapeCString(cinfo.fqn ?? cinfo.reflectFqn ?? cls)}", ${vis} },`);
         } else {
-          this.line(`{ "${label}", ${tag}, ${off} },`);
+          this.line(`{ "${label}", ${tag}, ${off}, NULL, NULL, ${vis} },`);
         }
       }
       // `class X extends Array` (arrayBacked): the element storage is a GC array
       // in a C-runtime-only slot, so type 6 makes gc_scan follow it. Not an
       // AS3-visible member (the AS3 surface is the inherited Array API).
+      // The entries below are NOT AS3-visible members -- they exist so gc_scan
+      // follows a C-runtime-only slot -- so they carry vis=1 and JSON.stringify
+      // never sees them.
       if (info.arrayBacked) {
-        this.line(`{ "_arr", 6, offsetof(${name}, _arr) },`);
+        this.line(`{ "_arr", 6, offsetof(${name}, _arr), NULL, NULL, 1 },`);
       }
       // TextField holds GC-managed rich-text runs (an as_array of TextFormat
       // object refs) that is not an AS3-visible member, so it is marked here
       // explicitly rather than via a declared field.
       if (name === 'TextField') {
-        this.line(`{ "_runs", 6, offsetof(TextField, _runs) },`);
+        this.line(`{ "_runs", 6, offsetof(TextField, _runs), NULL, NULL, 1 },`);
+      }
+      // StyleSheet's rule table is a GC record in a C-runtime-only slot: type 6 makes
+      // gc_scan follow it (阶段一百四十八). Its declaration records are reachable from
+      // that record's own GCT_PTR_ARRAY keys / GCT_VALUE_ARRAY values, so they need no
+      // entry of their own.
+      if (name === 'StyleSheet') {
+        this.line(`{ "_rules", 6, offsetof(StyleSheet, _rules), NULL, NULL, 1 },`);
       }
       // SharedObject's persisted table (a GC object) and its client callback
       // target live in C-runtime-only slots; type 6 makes gc_scan follow them.
       if (name === 'SharedObject') {
-        this.line(`{ "_data", 6, offsetof(SharedObject, _data) },`);
-        this.line(`{ "_client", 6, offsetof(SharedObject, _client) },`);
+        this.line(`{ "_data", 6, offsetof(SharedObject, _data), NULL, NULL, 1 },`);
+        this.line(`{ "_client", 6, offsetof(SharedObject, _client), NULL, NULL, 1 },`);
+        // `name` and `path` are GC strings too: as_so_make receives the caller's
+        // name String (as_v_str_val) and as_so_path builds the path with
+        // as_str_concat, both of which go through as_str_alloc. They are
+        // AS3-invisible (SharedObject exposes neither), so nothing else can keep
+        // them alive -- without these two entries the marker never reaches them
+        // and the FIRST sweep reclaims the path, after which as_so_flush's
+        // fopen(o->path, "wb") either fails (Uncaught exception:
+        // SharedObject.flush: cannot write the storage file) or writes through
+        // the stale pointer (measured on TalkMED, 阶段一百四十七). Type 3 is the
+        // char* string slot -- the same code a declared String field gets.
+        this.line(`{ "_name", 3, offsetof(SharedObject, name), NULL, NULL, 1 },`);
+        this.line(`{ "_path", 3, offsetof(SharedObject, path), NULL, NULL, 1 },`);
       }
       // URLStream's remainder buffer is a GC ByteArray held in a C-runtime-only
       // slot, so it is marked here. `_job` is deliberately absent: it is a
       // malloc'd structure, not a GC object (gc_in_heap would reject it, but
       // listing it would also expose it to dynamic obj[key] access).
       if (name === 'URLStream') {
-        this.line(`{ "_buf", 6, offsetof(URLStream, _buf) },`);
+        this.line(`{ "_buf", 6, offsetof(URLStream, _buf), NULL, NULL, 1 },`);
       }
       // Screen's two cached Rectangles are GC objects held in C-runtime-only
       // slots, so type 6 makes gc_scan follow them.
       if (name === 'Screen') {
-        this.line(`{ "_bounds", 6, offsetof(Screen, _bounds) },`);
-        this.line(`{ "_visible_bounds", 6, offsetof(Screen, _visible_bounds) },`);
+        this.line(`{ "_bounds", 6, offsetof(Screen, _bounds), NULL, NULL, 1 },`);
+        this.line(`{ "_visible_bounds", 6, offsetof(Screen, _visible_bounds), NULL, NULL, 1 },`);
       }
-      this.line('{ NULL, 0, 0 }');
+      this.line('{ NULL, 0, 0, NULL, NULL, 0 }');
       this.indent--;
       this.line('};');
       any = true;
@@ -3332,16 +3485,76 @@ export class Emitter {
     for (const [cname, info] of this.symbols.classes) {
       for (const [mname, m] of info.methods) {
         if (m.owner !== cname) continue;
-        const argCodes = m.params.map((p, i) =>
-          this.unboxAny({ code: `args[${i}]`, type: { kind: 'any' } as CType }, resolveType(p.type, info.importAlias)),
-        );
+        const params = m.params;
+        // AIR checks a DYNAMIC call's argument count against the DECLARED parameter
+        // list before dispatching (measured on adl 51.4.1, temp/tkmeet-mac/dyn):
+        // `c.f(1,2,3)` on `f(a:int, b:int=7)` and `h.m(9)` on a 0-parameter `m()`
+        // both throw ArgumentError #1063, whose "Expected" is the count of
+        // parameters BEFORE the first optional one. NOTE the asymmetry with a
+        // Function VALUE: AIR builds a 0-parameter CLOSURE variadic, but a
+        // 0-parameter METHOD rejects any argument. A rest parameter lifts the
+        // upper bound (max = -1).
+        const req = this.requiredArity(params);
+        const max = params.some((p) => p.isRest) ? -1 : params.length;
+        // A default parameter value is a constant expression that may name a STATIC
+        // member of the DECLARING class (`apply(x:int = RADIUS)` -> `D_RADIUS`).
+        // Thunks are emitted outside every class body, so `currentClass` would be
+        // null here and the reference would resolve against the global scope
+        // instead (measured: the ThunkOwnerScope unit group caught exactly this
+        // when the argc guard was added). Re-enter the declaring class for the
+        // duration of the argument-code map, the same way emitThunk does when it
+        // emits a bound-method thunk.
+        const savedClass = this.currentClass;
+        const savedIsStatic = this.currentIsStatic;
+        this.currentClass = cname;
+        this.currentIsStatic = true;
+        let argCodes: string[];
+        try {
+          argCodes = params.map((p, i) => {
+            if (p.isRest) {
+              // The rest parameter is the callee's Array of every trailing boxed
+              // argument: the tail of the caller's contiguous as_value[] list, so
+              // as_array_make copies args[i..argc-1] (same packing as the
+              // Function-value thunk; no per-arg unbox). `convert` is required
+              // because the rest slot is NOT always Array-typed: the built-in
+              // flash.net.LocalConnection#send declares `...args` as `*` (C
+              // `as_value`), so the packed Array must be BOXED for it.
+              const packed = `as_array_make((argc > ${i} ? argc - ${i} : 0), (argc > ${i} ? &args[${i}] : NULL))`;
+              return this.convert({ code: packed, type: { kind: 'array' } as CType }, resolveType(p.type, info.importAlias));
+            }
+            const rt = resolveType(p.type, info.importAlias);
+            const unboxArg = this.unboxAny({ code: `args[${i}]`, type: { kind: 'any' } as CType }, rt);
+            if (p.defaultValue !== null) {
+              // An OPTIONAL argument the caller may omit takes its DECLARED default
+              // (`c.f(1)` is 7, measured). Without the argc guard the thunk read
+              // args[i] past the end of the caller's array -- out of bounds, and a
+              // NULL dereference when the call had no arguments at all (that is the
+              // crash this guard fixes: the talkmed-meeting AIR app's
+              // `Conn.addEventListener(type, fn)` on a `*` receiver passed argc=2
+              // for a 5-parameter method, read args[2..4] off the stack and died in
+              // strlen on a garbage "array" pointer).
+              const defCode = this.convert(this.emitExpr(p.defaultValue), rt);
+              return `(argc > ${i} ? ${unboxArg} : ${defCode})`;
+            }
+            return unboxArg;
+          });
+        } finally {
+          this.currentClass = savedClass;
+          this.currentIsStatic = savedIsStatic;
+        }
         const callArgs = argCodes.join(', ');
         const receiver = `(${cname}*)_this`;
         const call = `${cname}_${mname}(${receiver}${callArgs ? ', ' + callArgs : ''})`;
         this.line(`as_value ${cname}_${mname}__dyn(void* _this, as_value* args, int argc) {`);
         this.indent++;
-        this.line('(void)argc;');
-        if (m.params.length === 0) this.line('(void)args;');
+        if (req === 0 && max < 0) this.line('(void)argc;');   // f(...rest): any count is legal
+        else {
+          // `arm` collapses to the single comparison that actually applies, so the
+          // emitted C stays readable (`argc > 0`, not `argc < 0 || argc > 0`).
+          const arm = req === 0 ? `argc > ${max}` : (max < 0 ? `argc < ${req}` : `argc < ${req} || argc > ${max}`);
+          this.line(`if (${arm}) { as_fn_arity_error("${this.escapeCString(this.fnQName(cname, mname))}", ${req}, argc); return as_v_null(); }`);
+        }
+        if (params.length === 0) this.line('(void)args;');
         if (m.returnType.kind === 'void') {
           this.line(`${call};`);
           this.line('return as_v_null();');
@@ -3457,9 +3670,14 @@ export class Emitter {
       this.indent++;
       for (const [gname, g] of info.getters) {
         if (g.owner !== name) continue;
-        this.line(`{ "${this.escapeCString(gname)}", ${name}_get_${gname}__dyn },`);
+        // Same public-only rule as the field table: a private/protected/internal
+        // accessor is not a JSON member. as_dyn_get (the dynamic obj[key] path)
+        // deliberately ignores vis -- AIR serves a private accessor to dynamic
+        // access -- so only JSON.stringify filters on it.
+        const vis = g.visibility === 'public' ? 0 : 1;
+        this.line(`{ "${this.escapeCString(gname)}", ${name}_get_${gname}__dyn, ${vis} },`);
       }
-      this.line('{ NULL, NULL }');
+      this.line('{ NULL, NULL, 0 }');
       this.indent--;
       this.line('};');
       any = true;
@@ -6714,8 +6932,25 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.line(cStringLiteral(r.encoded) + ';');
       this.indent--;
       this.line('');
+      if (r.alpha !== null) this.emitAlphaPlane(r.bytesSymbol, r.alpha, r.width, r.height);
     }
     this.emitBitmapDataAdoptEncoded();
+  }
+
+  /**
+   * A `DefineBitsJPEG3` coverage plane: one 8-bit byte per pixel, row-major, no
+   * row padding (the tag splits the image into a JPEG for RGB plus this plane for
+   * alpha). Emitted as a plain C array because the runtime composes it onto the
+   * JPEG's decoded pixels — see `BitmapData_adoptEncodedAlpha`.
+   */
+  private emitAlphaPlane(bytesSymbol: string, alpha: Buffer, width: number, height: number): void {
+    this.line(`// DefineBitsJPEG3 alpha plane (${width}x${height}, 1 byte/pixel) for ${bytesSymbol};`);
+    this.line('// the JPEG half carries no alpha channel, so the coverage is composed at runtime.');
+    this.line(`static const unsigned char ${bytesSymbol}_a[] =`);
+    this.indent++;
+    this.line(cStringLiteral(alpha) + ';');
+    this.indent--;
+    this.line('');
   }
 
   // Adopt encoded bytes into a BitmapData: decode to straight ARGB pixels via
@@ -6729,12 +6964,18 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   private emitBitmapDataAdoptEncoded(): void {
     if (this.adoptEncodedEmitted) return;
     this.adoptEncodedEmitted = true;
-    this.line('static void BitmapData_adoptEncoded(BitmapData* bd, const unsigned char* bytes, size_t len) {');
+    // The composer belongs to the adopt pair: whoever takes a coverage plane must
+    // have a way to apply it. Emitted together, never alone -- an alpha-aware
+    // adopt that silently ignores its `alpha` argument would be exactly the kind
+    // of quiet wrong result AGENTS.md forbids.
+    this.emitArgbApplyAlpha();
+    this.line('static void BitmapData_adoptEncodedAlpha(BitmapData* bd, const unsigned char* bytes, size_t len, const unsigned char* alpha, int aw, int ah) {');
     this.indent++;
     this.line('int w = 0, h = 0;');
     this.line('void* px = as_skia_image_decode_bytes_argb(bytes, len, &w, &h);');
     this.line('if (px != NULL && w > 0 && h > 0) {');
     this.indent++;
+    this.line('if (alpha != NULL && w == aw && h == ah) as_argb_apply_alpha((unsigned*)px, w * h, alpha);');
     this.line('unsigned* gcpx = (unsigned*)gc_alloc(GCT_BYTES, sizeof(unsigned) * (size_t)(w * h));');
     this.line('memcpy(gcpx, px, sizeof(unsigned) * (size_t)(w * h));');
     this.line('free(px);');
@@ -6742,9 +6983,42 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('gc_write_barrier(bd->pixels);');
     this.line('bd->width = w;');
     this.line('bd->height = h;');
+    // A bitmap that has a coverage plane must be viewed through its COMPOSED
+    // pixels: the encoded bytes are the opaque JPEG, which paints black wherever
+    // the artwork is transparent. Without a plane the bytes stay the direct view,
+    // keeping Skia's lazy decode.
+    this.line('if (alpha != NULL) { bd->image = as_skia_image_from_argb(gcpx, w, h); return; }');
     this.indent--;
     this.line('}');
     this.line('bd->image = as_skia_image_from_bytes(bytes, len);');
+    this.indent--;
+    this.line('}');
+    this.line('static void BitmapData_adoptEncoded(BitmapData* bd, const unsigned char* bytes, size_t len) {');
+    this.indent++;
+    this.line('BitmapData_adoptEncodedAlpha(bd, bytes, len, NULL, 0, 0);');
+    this.indent--;
+    this.line('}');
+    this.line('');
+  }
+
+  /**
+   * Compose one 8-bit coverage byte per pixel onto straight 0xAARRGGBB words —
+   * the `DefineBitsJPEG3` alpha plane, which AIR applies to the JPEG's RGB.
+   * The JPEG decodes opaque, so multiplying keeps any alpha it does carry and
+   * takes the plane's value everywhere else.
+   */
+  private emitArgbApplyAlpha(): void {
+    if (this.argbApplyAlphaEmitted) return;
+    this.argbApplyAlphaEmitted = true;
+    this.line('static void as_argb_apply_alpha(unsigned* p, int n, const unsigned char* alpha) {');
+    this.indent++;
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('unsigned c = p[i];');
+    this.line('unsigned a = ((((c >> 24) & 0xffu) * (unsigned)alpha[i]) + 127u) / 255u;');
+    this.line('p[i] = (a << 24) | (c & 0x00ffffffu);');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('');
@@ -6841,8 +7115,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     if (bake === undefined) return;
     this.swcTextOrigin = new Map(
       bake.characters.filter((c) => c.kind === 'text').map((c) => [c.id, { ox: (c.text as NonNullable<typeof c.text>).ox, oy: (c.text as NonNullable<typeof c.text>).oy }])
-    );
-    for (const b of bake.bitmaps) {
+    );    for (const b of bake.bitmaps) {
       if (!b.ownBytes) continue;
       this.line(`// SWC bitmap character #${b.id} (${b.width}x${b.height}) — used as a fill/child, decoded by Skia on demand.`);
       this.line(`static const unsigned char ${b.bytesSymbol}[] =`);
@@ -6850,6 +7123,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.line(cStringLiteral(b.encoded) + ';');
       this.indent--;
       this.line('');
+      if (b.ownAlpha && b.alpha !== null) this.emitAlphaPlane(b.bytesSymbol, b.alpha, b.width, b.height);
     }
     this.emitSwcPaintHelpers();
     this.emitSwcPathHelpers();
@@ -6861,10 +7135,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       else if (ch.kind !== 'bitmap' && ch.kind !== 'text' && ch.kind !== 'morph') this.line(`static void as_swc_build_${ch.id}(DisplayObject* o);`);
     }
     this.line('static void* as_swc_image(int id);');
+    this.line('static DisplayObject* as_swc_new_char(int charId);');
     this.line('static DisplayObject* as_swc_new(int charId);');
     this.line('void as_swc_bind(DisplayObject* o, int charId);');
     if (bake.characters.some((c) => (c.totalFrames ?? 1) > 1)) {
       this.line('static void as_swc_tl_start(MovieClip* o, int charId);');
+      // The frame-1 builders place their children through these two, so both are
+      // needed as soon as ANY character has a timeline (the reuse test only ever
+      // fires during a backward navigation, but the call sites are unconditional).
+      this.line('static DisplayObject* as_swc_tl_new(DisplayObject* parent, int depth, int charId);');
+      this.line('static void as_swc_tl_link(DisplayObject* parentD, DisplayObject* c, int depth);');
     }    // Every clipDepth mask (one per mask shape + matrix). Prototypes first because
     // the character builders below call them and C99 rejects an implicit
     // declaration.
@@ -6956,10 +7236,103 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('for (int i = p->children->length - 1; i >= 0; i--) { DisplayObject* old = (DisplayObject*)as_v_obj_val(p->children->data[i]); if (old != NULL && old->_tl_depth == depth) { DisplayObjectContainer_removeChildAt((void*)p, i); return; } }');
     this.indent--;
     this.line('}');
-    this.line('static void as_swc_tl_clear(DisplayObject* o) {');
+    this.line('');
+    // ---- Backward navigation (swc.md §9.2 F6, diff doc D43) ----
+    //
+    // AIR does not re-instantiate a frame from scratch when the playhead jumps
+    // backwards: it re-applies the target frame's records and KEEPS every object
+    // whose (depth, character) the target frame still places there. Measured on
+    // adl 51.4.1 with the homeskin card #527 (temp/btnprobe/Rewind.as, Rewind2.as):
+    // a round trip _up(1) -> _over(5) -> _up(1) keeps the depth-2/3 labels as the
+    // very same TextFields -- and with them everything AS3 had written into them --
+    // while the depth-1 shape, whose character the frame-1 record replaces
+    // (524 -> 518), comes back as a NEW instance (its auto-generated name goes
+    // instance8 -> instance28, which is how AIR renders the swap). A tape-recorder
+    // rebuild threw ALL of them away, so a rollover wiped the app's card labels.
+    //
+    // The frame-1 builder therefore asks this snapshot before it instantiates, and
+    // `as_swc_tl_link` silently re-inserts what it takes over. Both arrays are
+    // (parent, object) pairs because a nested rebuild can legitimately be running
+    // inside another one (a frame-1 script navigates a different clip).
+    this.line('static as_array* ASC_tl_snap_par = NULL;');
+    this.line('static as_array* ASC_tl_snap_obj = NULL;');
+    this.line('static int ASC_tl_snap_reg = 0;');
+    this.line('');
+    // The applier below is defined after this block, and `as_swc_tl_rewind` patches
+    // foward through it once frame 1 has been restored.
+    this.line('static void as_swc_tl_apply(int charId, DisplayObject* o, int frame);');
+    this.line('');
+    this.line('static DisplayObject* as_swc_tl_reuse(DisplayObject* parent, int depth, int charId) {');
     this.indent++;
+    this.line('if (ASC_tl_snap_obj == NULL) return NULL;');
+    this.line('for (int i = 0; i < ASC_tl_snap_obj->length; i++) {');
+    this.indent++;
+    this.line('DisplayObject* c = (DisplayObject*)as_v_obj_val(ASC_tl_snap_obj->data[i]);');
+    this.line('if (c == NULL) continue;');
+    this.line('if ((DisplayObject*)as_v_obj_val(ASC_tl_snap_par->data[i]) != parent) continue;');
+    this.line('if (c->_tl_depth == depth && c->_tl_char == charId) { ASC_tl_snap_obj->data[i] = as_v_null(); return c; }');
+    this.indent--;
+    this.line('}');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('static DisplayObject* as_swc_tl_new(DisplayObject* parent, int depth, int charId) {');
+    this.indent++;
+    this.line('DisplayObject* r = as_swc_tl_reuse(parent, depth, charId);');
+    this.line('return r != NULL ? r : as_swc_new(charId);');
+    this.indent--;
+    this.line('}');
+    // A reused child is already in the parent's list, so AIR dispatches nothing for
+    // it (no REMOVED/ADDED, no ADDED_TO_STAGE walk over its subtree). Only a child
+    // that is new to this parent goes through addChildAt, which keeps the Flash
+    // depth order and fires the events AS3 expects for a genuinely placed object.
+    this.line('static void as_swc_tl_link(DisplayObject* parentD, DisplayObject* c, int depth) {');
+    this.indent++;
+    this.line('if (c == NULL) return;');
+    this.line('if (c->parent == (Object*)parentD) return;');
+    this.line('DisplayObjectContainer* p = (DisplayObjectContainer*)parentD;');
+    this.line('int at = p->children == NULL ? 0 : p->children->length;');
+    this.line('if (p->children != NULL) for (int i = 0; i < p->children->length; i++) { DisplayObject* s = (DisplayObject*)as_v_obj_val(p->children->data[i]); if (s != NULL && s->_tl_depth > depth) { at = i; break; } }');
+    this.line('DisplayObjectContainer_addChildAt((void*)p, c, at);');
+    this.indent--;
+    this.line('}');
+    // Remove ONE child, addressed by identity: during a rewind the frame-1 object
+    // and the stale object it supersedes can share a depth, and the depth-addressed
+    // as_swc_tl_del would then drop the wrong one.
+    this.line('static void as_swc_tl_unlink(DisplayObject* parentD, DisplayObject* c) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* p = (DisplayObjectContainer*)parentD;');
+    this.line('if (p->children == NULL) return;');
+    this.line('for (int i = p->children->length - 1; i >= 0; i--) if ((DisplayObject*)as_v_obj_val(p->children->data[i]) == c) { DisplayObjectContainer_removeChildAt((void*)p, i); return; }');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_swc_tl_rewind(int charId, DisplayObject* o, int frame) {');
+    this.indent++;
+    this.line('as_array* sp = ASC_tl_snap_par;');
+    this.line('as_array* so = ASC_tl_snap_obj;');
+    this.line('ASC_tl_snap_par = as_array_new();');
+    this.line('ASC_tl_snap_obj = as_array_new();');
+    // The registered slots are the ADDRESSES of the two statics, so whatever they
+    // point at is marked -- including the pair an outer (nested) rewind is still
+    // using. Registered once: re-registering per call would grow gc_roots forever.
+    this.line('if (!ASC_tl_snap_reg) { ASC_tl_snap_reg = 1; gc_root_register((void**)&ASC_tl_snap_par); gc_root_register((void**)&ASC_tl_snap_obj); }');
     this.line('DisplayObjectContainer* p = (DisplayObjectContainer*)o;');
-    this.line('for (int i = p->children->length - 1; i >= 0; i--) { DisplayObject* c = (DisplayObject*)as_v_obj_val(p->children->data[i]); if (c != NULL && c->_tl_depth != 0) DisplayObjectContainer_removeChildAt((void*)p, i); }');
+    this.line('if (p->children != NULL) for (int i = 0; i < p->children->length; i++) {');
+    this.indent++;
+    this.line('DisplayObject* c = (DisplayObject*)as_v_obj_val(p->children->data[i]);');
+    this.line('if (c != NULL && c->_tl_depth != 0) { as_array_push(ASC_tl_snap_par, as_v_obj((void*)o)); as_array_push(ASC_tl_snap_obj, as_v_obj((void*)c)); }');
+    this.indent--;
+    this.line('}');
+    this.line('as_swc_bind(o, charId);');
+    this.line('for (int i = 0; i < ASC_tl_snap_obj->length; i++) {');
+    this.indent++;
+    this.line('DisplayObject* c = (DisplayObject*)as_v_obj_val(ASC_tl_snap_obj->data[i]);');
+    this.line('if (c != NULL) as_swc_tl_unlink(o, c);');
+    this.indent--;
+    this.line('}');
+    this.line('as_swc_tl_apply(charId, o, frame);');
+    this.line('ASC_tl_snap_par = sp;');
+    this.line('ASC_tl_snap_obj = so;');
     this.indent--;
     this.line('}');
     this.line('');
@@ -7119,7 +7492,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       const oy = origin === undefined ? 0 : origin.oy;
       this.line(`Matrix* mm = ${name}->transform->matrix;`);
       this.line(`mm->a = ${this.formatDouble(m[0])}; mm->b = ${this.formatDouble(m[1])}; mm->c = ${this.formatDouble(m[2])}; mm->d = ${this.formatDouble(m[3])}; mm->tx = 0; mm->ty = 0;`);
-      this.line(`${name}->x = ${this.formatDouble(m[4] + ox)}; ${name}->y = ${this.formatDouble(m[5] + oy)};`);
+      const { x, y } = this.swcTextChildXY(m, ox, oy);
+      this.line(`${name}->x = ${this.formatDouble(x)}; ${name}->y = ${this.formatDouble(y)};`);
     }
     if (op.cxform !== undefined && op.cxform !== null) {
       const c = op.cxform;
@@ -7214,7 +7588,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
 
   /** Path ops that keep the same pen/bounds bookkeeping the AS3 Graphics API does. */
   private emitSwcPathHelpers(): void {
-    this.line('static void as_swc_move_to(Graphics* g, double x, double y) { as_skia_path_move_to(g->path, x, y); as_gpen(g, x, y); }');
+    // The move-to point MUST join the tracked path rect too (Graphics_moveTo does
+    // the same). Otherwise a SWF shape whose start point sticks out -- e.g. a
+    // check mark drawn from its top-right tip -- gets a bounds box that covers
+    // only the later points, which the auto-bake then uses as its bitmap rect and
+    // clips the shape (阶段一百五十六: 勾选自选的对勾只剩一小段).
+    this.line('static void as_swc_move_to(Graphics* g, double x, double y) { as_skia_path_move_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); }');
     this.line('static void as_swc_line_to(Graphics* g, double x, double y) { as_skia_path_line_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); }');
     // SWF shape curves are QUADRATIC (CX, CY, X, Y) — DefineShape has no cubic.
     this.line('static void as_swc_quad_to(Graphics* g, double cx, double cy, double x, double y) { as_skia_path_quad_to(g->path, cx, cy, x, y); as_gpath_pt(g, cx, cy); as_gpath_pt(g, x, y); as_gpen(g, x, y); }');
@@ -7233,10 +7612,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // composed inverse(childMatrix) * maskMatrix, so the renderer clips with the
     // result verbatim. The path lives as long as the program (one per mask+matrix),
     // which is why the caller caches it in a function-local static.
+    //
+    // The contours must be CLOSED before the path becomes a clip (阶段一百四十六). A
+    // SWF outline expresses its closure only as "the last point coincides with the
+    // first" -- there is no close verb in the edge records -- and Skia fills such a
+    // contour implicitly, so fills always looked right. Its AA clipper does not:
+    // an open contour contributes no area, so a clip path built from one clipped the
+    // ENTIRE region away and every clipDepth-masked sibling of the TalkMED login
+    // skin (banner included) painted blank white.
     this.line('static void* as_swc_clip_path_new(void* src, double a, double b, double c, double d, double tx, double ty) {');
     this.indent++;
     this.line('void* p = as_skia_path_new();');
     this.line('as_skia_path_add_transformed(p, src, a, b, c, d, tx, ty);');
+    this.line('as_skia_path_close_all(p);');
     this.line('return p;');
     this.indent--;
     this.line('}');
@@ -7257,7 +7645,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     );
     for (const grp of shape.groups) {
       const pre: string[] = [];
-      const paint = this.swcPaintExpr(grp.fill ?? grp.line?.fillStyle ?? null, pre);
+      // A STROKE's colour lives in its LINESTYLE (`line.rgba`), not in a fill: the
+      // group's `fill` is null for a stroke-only run and `line.fillStyle` is only set
+      // by LINESTYLE2's HasFill. Falling back to "no style" painted EVERY stroked
+      // shape in the skin solid black (measured: 105 of 105 `as_swc_stroke` calls
+      // passed 0xff000000) while the fills kept their colours -- so the login
+      // checkbox's teal ring and tick came out black (swc.md §3.4⑤).
+      const solid = grp.fill ?? grp.line?.fillStyle ?? (grp.line?.rgba !== undefined ? { type: 0, rgba: grp.line.rgba } : null);
+      const paint = this.swcPaintExpr(solid, pre);
       const call = grp.fill !== null
         ? `as_swc_fill(g, ${paint});`
         : `as_swc_stroke(g, ${paint}, ${this.swcLineWidth(grp.line as SwcLineStyle)}, ` +
@@ -7334,10 +7729,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
 
   /**
    * One clipDepth mask: build the mask shape's outline once, transformed into the
-   * masked object's local pixels. `matrix` was composed by the baker
-   * (`inverse(childMatrix) * maskMatrix`), so all that is left is copying the
-   * shape's path through it. Cached in a function-local static: a mask is constant
-   * for the lifetime of the program, and `as_swc_shape_*` allocates a Graphics.
+   * PARENT's pixels by the mask's own placement matrix. `matrix` comes straight
+   * from the baker (the mask record's own placement), and the renderer sets the
+   * result BEFORE the masked object's transform, so the region stays fixed while
+   * the object moves underneath it. Cached in a function-local static: a mask is
+   * constant for the lifetime of the program, and `as_swc_shape_*` allocates a
+   * Graphics.
    */
   private emitSwcMaskBuilder(m: SwcMaskRef): void {
     this.line(`// clipDepth mask: shape #${m.charId} clips the siblings inside its depth range.`);
@@ -7411,21 +7808,31 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     }
     // Sprite: the frame-1 display list, already ordered by depth (Flash paints by
     // depth, and the caller supplied them sorted).
+    //
+    // With a timeline in the bake, a frame-1 record does NOT always instantiate:
+    // a BACKWARD jump re-runs this builder (`as_swc_tl_rewind`) and AIR keeps every
+    // instance whose character the target frame still places at that depth, so the
+    // builder asks the rewind's snapshot first. `as_swc_tl_link` then only adds
+    // what is genuinely new -- a reused child is already in the display list and
+    // AIR dispatches no ADDED for it (measured: temp/btnprobe/Rewind2.as).
+    const reuse = this.swcBake !== undefined && this.swcBake.characters.some((c) => (c.totalFrames ?? 1) > 1);
     for (const [i, p] of (ch.children ?? []).entries()) {
-      this.line(`DisplayObject* c${i} = as_swc_new(${p.charId});`);
+      const depth = p.depth;
+      const reuseHere = reuse && depth !== undefined;
+      this.line(`DisplayObject* c${i} = ${reuseHere ? `as_swc_tl_new(o, ${depth}, ${p.charId})` : `as_swc_new(${p.charId})`};`);
       this.emitSwcPlacement(`c${i}`, p);
       this.emitSwcPlacementAttrs(`c${i}`, p, i);
       this.emitSwcChildName(`c${i}`, p, 'o');
       if (p.mask) this.line(`if (c${i} != NULL) c${i}->_clip_path = ${maskSymbol(p.mask)}();`);
       // The Flash depth the child was placed at: a later frame's timeline op
       // addresses the object by depth, exactly like AIR (item ③).
-      if (p.depth !== undefined) this.line(`if (c${i} != NULL) c${i}->_tl_depth = ${p.depth};`);
+      if (depth !== undefined) this.line(`if (c${i} != NULL) c${i}->_tl_depth = ${depth};`);
       // PlaceObject3 `Visible = 0`: AIR still creates the child and hides it
       // (measured: vbitemskin has 6 children, one visible=false). Setting the
       // flag keeps the tree identical AND paints nothing, since the renderer
       // skips an invisible child.
       if (p.hidden) this.line(`if (c${i} != NULL) c${i}->visible = false;`);
-      this.line(`if (c${i} != NULL) DisplayObjectContainer_addChild((void*)o, c${i});`);
+      this.line(`if (c${i} != NULL) ${reuseHere ? `as_swc_tl_link(o, c${i}, ${depth})` : `DisplayObjectContainer_addChild((void*)o, c${i})`};`);
     }
     this.indent--;
     this.line('}');
@@ -7588,6 +7995,31 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     }
   }
 
+  /**
+   * The `x`/`y` a TEXT child reports for a placement whose character carries a RECT
+   * origin `(ox, oy)`. The origin is a point in the character's own space, so it goes
+   * through the placement's linear part; AIR then stores the result on its twip grid
+   * (1/20 px). Measured on adl 51.4.1, temp/tfswc case ⑰ (the skin library's four
+   * discriminating entries — all four have `d=1, b=c=0`, so only the x/a term is
+   * exercised, and the last two decimals are what forces the 1/20 rounding):
+   *
+   *   subtitleskin.ctime  a=1.224609 ox= 52.05 tx=-51.75 -> plain  0.30, xform 11.9913, adl 12.0000
+   *   filesskin.tab1      a=0.775101 ox= -2.00 tx=  1.60 -> plain -0.40, xform  0.0498, adl  0.0500
+   *   filesskin.tab2      a=0.775101 ox= -2.00 tx= 91.65 -> plain 89.65, xform 90.0998, adl 90.1000
+   *   logintabskin.tab1   a=0.959381 ox= -2.00 tx=  1.90 -> plain -0.10, xform -0.0188, adl  0.0000
+   *
+   * The old `tx + ox` form happened to match the earlier temp/childfx sample only
+   * because every one of those 99 children had a unit scale; for `ctime` it put the
+   * text 11.7 px to the left of where AIR puts it.
+   */
+  private swcTextChildXY(m: number[], ox: number, oy: number): { x: number; y: number } {
+    const round20 = (v: number): number => Math.round(v * 20) / 20;
+    return {
+      x: round20(m[4] + m[0] * ox + m[2] * oy),
+      y: round20(m[5] + m[1] * ox + m[3] * oy),
+    };
+  }
+
   private emitSwcPlacement(child: string, p: SwcBakePlacement): void {
     const m = p.matrix;
     const origin = p.charId === null ? undefined : this.swcTextOrigin.get(p.charId);
@@ -7598,6 +8030,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     //    matrix tx/ty; every MovieClip child matched its matrix to the digit, while
     //    a TextField child reads `x = matrix.tx + RECT.xmin`, e.g. staticskin c1
     //    `x=9.25` with tx=14.45 and xmin=-5.2);
+    //    for a TEXT child the RECT origin is a point in the character's own space, so
+    //    it goes THROUGH the placement's linear part and AIR then stores the result on
+    //    its twip grid — see swcTextChildXY() for the four discriminating measurements.
     //  * the ROTATION/SCALE/SKEW stays in `transform.matrix`, because a
     //    DefineScalingGrid (swc.md §9 F) must NOT fire for a timeline placement
     //    stretch. Measured against adl (temp/swc-render, 42 entries containing a
@@ -7618,7 +8053,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.line(`  mm->a = ${this.formatDouble(m[0])}; mm->b = ${this.formatDouble(m[1])}; mm->c = ${this.formatDouble(m[2])}; mm->d = ${this.formatDouble(m[3])}; mm->tx = 0; mm->ty = 0;`);
       const ox = origin === undefined ? 0 : origin.ox;
       const oy = origin === undefined ? 0 : origin.oy;
-      this.line(`  ${child}->x = ${this.formatDouble(m[4] + ox)}; ${child}->y = ${this.formatDouble(m[5] + oy)}; }`);
+      const { x, y } = this.swcTextChildXY(m, ox, oy);
+      this.line(`  ${child}->x = ${this.formatDouble(x)}; ${child}->y = ${this.formatDouble(y)}; }`);
     }
     if (p.maskSource) {
       // A clipDepth mask object: AIR keeps it as a child (with visible == true and
@@ -7639,6 +8075,27 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
 
   /** The `as_swc_image` / `as_swc_new` / `as_swc_bind` factories. */
   private emitSwcFactories(bake: SwcBake): void {
+    // A DefineBitsJPEG3 bitmap is two planes at runtime: the JPEG (opaque) and the
+    // separate coverage plane. Skia decodes only the JPEG, so the coverage is
+    // composed onto the decoded pixels and THAT image is what a fill shader
+    // samples -- drawing the JPEG's own view would paint a black rectangle
+    // wherever the artwork is transparent (diff doc D25).
+    if (bake.bitmaps.some((b) => b.alpha !== null)) {
+      this.emitArgbApplyAlpha();
+      this.line('// Decode + compose one DefineBitsJPEG3 bitmap (see as_swc_image).');
+      this.line('static void* as_swc_image_alpha(const unsigned char* bytes, size_t len, const unsigned char* alpha, int aw, int ah) {');
+      this.indent++;
+      this.line('int w = 0, h = 0;');
+      this.line('void* px = as_skia_image_decode_bytes_argb(bytes, len, &w, &h);');
+      this.line('if (px == NULL) return NULL;');
+      this.line('if (w == aw && h == ah) as_argb_apply_alpha((unsigned*)px, w * h, alpha);');
+      this.line('void* img = as_skia_image_from_argb(px, w, h);');
+      this.line('free(px);');
+      this.line('return img;');
+      this.indent--;
+      this.line('}');
+      this.line('');
+    }
     this.line('// Decode + cache one bitmap character as an SkImage. Cached because a fill is');
     this.line('// rebuilt on every instantiation while the image itself never changes.');
     this.line('static void* as_swc_image(int id) {');
@@ -7646,7 +8103,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('switch (id) {');
     this.indent++;
     for (const b of bake.bitmaps) {
-      this.line(`case ${b.id}: { static void* img = NULL; if (img == NULL) img = as_skia_image_from_bytes(${b.bytesSymbol}, (size_t)${b.encoded.length}); return img; }`);
+      const load = b.alpha === null
+        ? `as_skia_image_from_bytes(${b.bytesSymbol}, (size_t)${b.encoded.length})`
+        : `as_swc_image_alpha(${b.bytesSymbol}, (size_t)${b.encoded.length}, ${b.alphaSymbol}, ${b.width}, ${b.height})`;
+      this.line(`case ${b.id}: { static void* img = NULL; if (img == NULL) img = ${load}; return img; }`);
     }
     this.line('default: return NULL;');
     this.indent--;
@@ -7658,6 +8118,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('// Graphics), a Sprite, a four-state SimpleButton, or a Bitmap.');
     this.line('static DisplayObject* as_swc_new(int charId) {');
     this.indent++;
+    this.line('DisplayObject* o = as_swc_new_char(charId);');
+    // The character id travels WITH the instance. A timeline addresses objects by
+    // depth, so this is the only way to answer "is the object at this depth still
+    // the character frame N places there" when the playhead jumps backwards --
+    // AIR keeps the instance in that case and only re-instantiates on a real
+    // character change (measured on adl 51.4.1, temp/btnprobe/Rewind2.as).
+    this.line('if (o != NULL) o->_tl_char = charId;');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    this.line('static DisplayObject* as_swc_new_char(int charId) {');
+    this.indent++;
     this.line('switch (charId) {');
     this.indent++;
     for (const ch of bake.characters) {
@@ -7668,7 +8141,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         // reports `is Bitmap` and a usable bitmapData for it), reusing the same
         // adopt path the named resources use.
         const b = (bake.bitmaps.find((x) => x.id === ch.bitmapId) as SwcBakeBitmap);
-        this.line(`case ${ch.id}: { BitmapData* bd = BitmapData_new(0, 0, true, 0u); BitmapData_adoptEncoded(bd, ${b.bytesSymbol}, (size_t)${b.encoded.length}); return (DisplayObject*)Bitmap_new(bd, (char*)"auto", false); }`);
+        const adopt = b.alpha === null
+          ? `BitmapData_adoptEncoded(bd, ${b.bytesSymbol}, (size_t)${b.encoded.length})`
+          : `BitmapData_adoptEncodedAlpha(bd, ${b.bytesSymbol}, (size_t)${b.encoded.length}, ${b.alphaSymbol}, ${b.width}, ${b.height})`;
+        this.line(`case ${ch.id}: { BitmapData* bd = BitmapData_new(0, 0, true, 0u); ${adopt}; return (DisplayObject*)Bitmap_new(bd, (char*)"auto", false); }`);
       } else if (ch.kind === 'morph') {
         // AIR's class here is MorphShape (a Shape subclass). We have no MorphShape
         // class, and the child reports "Shape" — part of the registered child-class
@@ -7676,12 +8152,58 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         // Shape paints nothing, so no wrong pixels are introduced.
         this.line(`case ${ch.id}: { return (DisplayObject*)Shape_new(); }`);
       } else if (ch.kind === 'text') {
-        // AIR instantiates DefineText/DefineEditText as TextFields (measured), and
-        // the box size is the character's own RECT. The glyphs are NOT decoded, so
-        // the field is empty -- a declared gap (the bake plan announces it), never a
-        // silently missing child (which would shift every later index).
+        // AIR instantiates DefineText/DefineEditText as TextFields, sized by the
+        // character's own RECT. For DefineEditText the WHOLE field is stamped here:
+        // the InitialText (or its HTML), the TextFormat (face/size/colour/leading/
+        // alignment/margins) and the flags. Before this the field was created EMPTY
+        // and every label a skin shipped rendered blank -- talkmed's agreement
+        // paragraph, its footer line and its button captions were simply absent.
         const t = ch.text as NonNullable<typeof ch.text>;
-        this.line(`case ${ch.id}: { TextField* t = TextField_new(); t->_fieldWidth = ${this.formatDouble(t.w)}; t->_fieldHeight = ${this.formatDouble(t.h)}; return (DisplayObject*)t; }`);
+        const e = t.edit;
+        const steps: string[] = [
+          'TextField* t = TextField_new();',
+          `t->_fieldWidth = ${this.formatDouble(t.w)}; t->_fieldHeight = ${this.formatDouble(t.h)};`,
+        ];
+        if (e !== undefined) {
+          // A field with no HasFont keeps the TextField's own default face; an
+          // embedded family the machine does not have ("MiSans Regular", "微软雅黑")
+          // falls back through the same Skia alias path as any other name.
+          const face = e.font === null ? 'NULL' : `(char*)${cStringLiteral(Buffer.from(e.font, 'utf8'))}`;
+          const size = e.size > 0 ? e.size : 12;
+          const color = e.color === null ? 0 : e.color;
+          steps.push(`t->defaultTextFormat = TextFormat_new(${face}, ${this.formatDouble(size)}, 0x${color.toString(16).padStart(6, '0')}u, false, false, ${this.formatDouble(e.leading)});`);
+          if (e.align !== null) steps.push(`t->defaultTextFormat->align = (char*)"${e.align}";`);
+          if (e.leftMargin > 0) steps.push(`t->defaultTextFormat->leftMargin = ${this.formatDouble(e.leftMargin)};`);
+          if (e.rightMargin > 0) steps.push(`t->defaultTextFormat->rightMargin = ${this.formatDouble(e.rightMargin)};`);
+          steps.push(`t->multiline = ${e.multiline ? 'true' : 'false'};`);
+          steps.push(`t->wordWrap = ${e.wordWrap ? 'true' : 'false'};`);
+          steps.push(`t->selectable = ${e.selectable ? 'true' : 'false'};`);
+          if (e.border) steps.push('t->border = true;');
+          if (e.password) steps.push('t->displayAsPassword = true;');
+          if (e.maxLength !== null) steps.push(`t->maxChars = ${e.maxLength};`);
+          // ReadOnly clear is how Flash stores an EDITABLE field (there is no
+          // separate "input" flag in DefineEditText), so that is exactly the case
+          // where AIR reports type = input; its setter also leaves tabEnabled true.
+          if (!e.readOnly) steps.push('t->type = (char*)"input"; t->tabEnabled = true;');
+          if (e.text !== null && e.text !== '') {
+            const lit = `(char*)${cStringLiteral(Buffer.from(e.text, 'utf8'))}`;
+            // The HTML flag means InitialText is markup, exactly as AIR treats it.
+            steps.push(e.html
+              ? `TextField_set_htmlText((void*)t, ${lit});`
+              : `TextField_set_text((void*)t, ${lit});`);
+          }
+        }
+        steps.push('return (DisplayObject*)t;');
+        this.line(`case ${ch.id}: { ${steps.join(' ')} }`);
+      } else if (this.swcCharInfo.has(ch.id)) {
+        // An EXPORTED character: AIR instantiates the symbol's own linkage class for
+        // a timeline placement, which is the only way its timeline script (and any
+        // field its class declares) can work — the login checkbox is a nested child
+        // of `loginitem1` whose whole behaviour lives in that script. Calling the
+        // class's factory also runs the ctor's `as_swc_bind`/`as_swc_tl_start`/frame 1,
+        // so the instance is complete before anyone can see it.
+        const info = this.swcCharInfo.get(ch.id)!;
+        this.line(`case ${ch.id}: { ${info.cname}* s = ${info.cname}_new(); return (DisplayObject*)s; }`);
       } else if (ch.kind === 'button') {
         this.line(`case ${ch.id}: { SimpleButton* s = SimpleButton_new(NULL, NULL, NULL, NULL); as_swc_build_${ch.id}((DisplayObject*)s); return (DisplayObject*)s; }`);
       } else {
@@ -7716,6 +8238,48 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     for (const ch of bake.characters) {
       if (ch.kind === 'shape' || ch.kind === 'bitmap' || ch.kind === 'text' || ch.kind === 'morph') continue;
       this.line(`case ${ch.id}: as_swc_build_${ch.id}(o); break;`);
+    }
+    this.line('default: break;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    this.emitSwcFrameScripts(bake);
+  }
+
+  /**
+   * The `as_swc_frames` dispatcher: `(symbol charId, frame) -> that frame's script`.
+   *
+   * AIR runs a timeline script from its class's `addFrameScript` registrations when
+   * the playhead lands on the frame — at construction for frame 1, and on every
+   * `gotoAndStop`/`gotoAndPlay`/play tick for the rest. Both call sites funnel
+   * through here, so the timeline has exactly one place where frame scripts run.
+   */
+  private emitSwcFrameScripts(bake: SwcBake): void {
+    const withScripts = bake.chars.filter((c) => c.frames.length > 0);
+    if (withScripts.length === 0) return;
+    void bake;
+    this.line('void as_swc_frames(int charId, int frame, DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o == NULL) return;');
+    this.line('switch (charId) {');
+    this.indent++;
+    for (const ch of withScripts) {
+      this.line(`case ${ch.charId}:`);
+      this.indent++;
+      this.line('switch (frame) {');
+      this.indent++;
+      for (const f of ch.frames) {
+        // The C name a class method gets is `<class>_<AS3 name>` (emitClassProtos),
+        // so a frame script is called exactly like any other method of the class.
+        this.line(`case ${f.frame}: ${ch.cname}_${f.method}((void*)o); break;`);
+      }
+      this.line('default: break;');
+      this.indent--;
+      this.line('}');
+      this.line('break;');
+      this.indent--;
     }
     this.line('default: break;');
     this.indent--;
@@ -7804,14 +8368,56 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // built-in Object: no fields to initialize, but every subclass's implicit
     // super() lands here, so it needs a real (empty) constructor definition.
     this.line('void Object_ctor(Object* o) { (void)o; }');
-    this.line('void StyleSheet_setStyle(void* _this, char* styleName, Object* styleObject) { (void)_this; (void)styleName; (void)styleObject; as_shell_unsupported((char*)"flash.text.StyleSheet.setStyle (CSS styling is not applied)"); }');
+    // --- flash.text.StyleSheet (阶段一百四十八) ---------------------------------
+    // AIR's StyleSheet stores one declaration record per selector and applies those
+    // declarations to HTML text whose tag matches the selector (see as_tf_html_set,
+    // which also implements the measured block rule). Semantics pinned against
+    // adl 51.4.1 (temp/fpsprobe2, temp/blockprobe):
+    //   * selectors are stored lowercased and matched case-insensitively;
+    //   * setStyle stores a COPY of the caller's object (mutating it afterwards does
+    //     not change the sheet) -- as_object_clone;
+    //   * setStyle(name, null) removes the style;
+    //   * getStyle returns a COPY, or null for an unknown name;
+    //   * clear() removes every style;
+    //   * styleNames is a fresh Array of the stored (lowercased) selectors. AIR's
+    //     ORDER is its internal hash order (measured: mem,memmax,xml,ms,fps for four
+    //     setStyle calls); ours is insertion order, which AS3 code must not depend on
+    //     either way.
+    this.line('void StyleSheet_setStyle(void* _this, char* styleName, Object* styleObject) {');
+    this.indent++;
+    this.line('StyleSheet* ss = (StyleSheet*)_this;');
+    this.line('if (ss == NULL || styleName == NULL) return;');
+    this.line('char* key = as_str_toLower(styleName);');
+    this.line('if (styleObject == NULL) { as_object_del(ss->_rules, key); return; }');
+    this.line('as_object_set(ss->_rules, key, as_v_obj((void*)as_object_clone((as_object*)styleObject)));');
+    this.indent--;
+    this.line('}');
+    this.line('Object* StyleSheet_getStyle(void* _this, char* styleName) {');
+    this.indent++;
+    this.line('StyleSheet* ss = (StyleSheet*)_this;');
+    this.line('if (ss == NULL || styleName == NULL) return NULL;');
+    this.line('as_object* decl = as_ss_lookup(ss->_rules, styleName);');
+    this.line('if (decl == NULL) return NULL;');
+    this.line('return (Object*)(void*)as_object_clone(decl);');
+    this.indent--;
+    this.line('}');
+    this.line('void StyleSheet_clear(void* _this) { StyleSheet* ss = (StyleSheet*)_this; if (ss != NULL) ss->_rules = as_object_new(); }');
+    this.line('as_array* StyleSheet_get_styleNames(void* _this) {');
+    this.indent++;
+    this.line('StyleSheet* ss = (StyleSheet*)_this;');
+    this.line('as_array* a = as_array_new();');
+    this.line('if (ss == NULL) return a;');
+    this.line('for (int i = 0; i < ss->_rules->length; i++) as_array_push(a, as_v_str(ss->_rules->keys[i]));');
+    this.line('return a;');
+    this.indent--;
+    this.line('}');
     // StyleSheet IS constructible in AIR (`new StyleSheet()`, and AS3 code assigns
     // the sheet to TextField.styleSheet), and nothing else emits its ctor/factory:
     // it is a built-in with a hand-written body, so without these two definitions
     // the factory call from a user class's field initializer links against
     // `_StyleSheet_new` -- "undefined symbol" (measured on the talkmed-meeting AIR
     // app: com.vsdevelop.controls.Fps_new).
-    this.line('void StyleSheet_ctor(StyleSheet* o) { Object_ctor((Object*)o); }');
+    this.line('void StyleSheet_ctor(StyleSheet* o) { EventDispatcher_ctor((EventDispatcher*)o, NULL); o->_rules = as_object_new(); }');
     this.line('StyleSheet* StyleSheet_new(void) { StyleSheet* o = (StyleSheet*)gc_alloc(GCT_CLASS, sizeof(StyleSheet)); o->vtable = &StyleSheet_vt; StyleSheet_ctor(o); return o; }');
     this.line('Object* Object_new(void) { Object* o = (Object*)gc_alloc(GCT_CLASS, sizeof(Object)); o->vtable = &Object_vt; Object_ctor(o); return o; }');
     this.line('');
@@ -7839,6 +8445,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('bool Proxy_isAttribute(void* _this, as_value name) { (void)_this; (void)name; as_proxy_throw("isAttribute", 0); return false; }');
     this.line('void Proxy_ctor(Proxy* o) { Object_ctor((Object*)o); }');
     this.line('Proxy* Proxy_new(void) { Proxy* o = (Proxy*)gc_alloc(GCT_CLASS, sizeof(Proxy)); o->vtable = &Proxy_vt; Proxy_ctor(o); return o; }');
+    this.line('');
+    // flash.xml.Namespace is an E4X-transparent stub (no field is ever read), but
+    // AIR's one-argument call `Namespace("u")` does CONSTRUCT one (measured on adl
+    // 51.4.1, temp/errcall4: the result is a Namespace, not null), so the class
+    // needs a concrete ctor/new like every other instantiable stub.
+    this.line('void Namespace_ctor(Namespace* o) { Object_ctor((Object*)o); }');
+    this.line('Namespace* Namespace_new(void) { Namespace* o = (Namespace*)gc_alloc(GCT_CLASS, sizeof(Namespace)); o->vtable = &Namespace_vt; Namespace_ctor(o); return o; }');
     this.line('');
     // Stage 41 constant classes are pure static-String holders and are never
     // instantiated, but they still need concrete (empty) ctor/new definitions
@@ -7999,8 +8612,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     // XML(value) where the value's kind is only known at runtime (Cast.xml passes a
     // `*`): E4X parses a String, returns an existing XML unchanged, and turns a
-    // Number/Boolean into an element carrying that text. Only the String and XML
-    // cases are modelled -- the rest fail loudly rather than inventing markup.
+    // Number/Boolean into an element carrying that text. Only the String, XML,
+    // XMLList and ByteArray cases are modelled -- the rest fail loudly rather than
+    // inventing markup.
     this.line('static as_xml_node* as_xml_from_value(as_value v) {');
     this.indent++;
     this.line('if (v.tag == 3) return as_xml_parse_str_checked((char*)v.ptr);');
@@ -8010,7 +8624,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // An EMPTY list yields NULL, which every navigation helper in this runtime
     // treats as \'no match\' rather than crashing.
     this.line('if (v.tag == 4 && as_is(as_v_obj_val(v), &as_xml_list_vt)) { as_xml_list* l = (as_xml_list*)as_v_obj_val(v); return l != NULL && l->length > 0 ? l->items[0] : NULL; }');
-    this.line('as_throw_unsupported("XML(value) is only supported for String and XML values by this subset");');
+    // XML(byteArray): a ByteArray's BYTES are the markup, decoded as UTF-8. This is
+    // the `[Embed(..., mimeType="application/octet-stream")]` + `XML(new Cls())`
+    // idiom (Config/Language.as is the live case): the argument's static type is
+    // `Class`, so it reaches this dynamic branch instead of the static
+    // as_xml_parse_bytes_checked path. as_is walks the super chain, so every
+    // [Embed] ByteArray SUBCLASS matches here too. Measured on adl 51.4.1: XML(ba)
+    // over UTF-8 markup yields the parsed tree, and so does XML(new EmbeddedClass())
+    // (temp/tkmeet-mac/xmlba).
+    this.line('if (v.tag == 4 && as_is(as_v_obj_val(v), &ByteArray_vt)) return as_xml_parse_bytes_checked((ByteArray*)as_v_obj_val(v));');
+    this.line('as_throw_unsupported("XML(value) is only supported for String, XML and ByteArray values by this subset");');
     this.line('return NULL;');
     this.indent--;
     this.line('}');
@@ -8458,19 +9081,32 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return false;');
     this.indent--;
     this.line('}');
-    // Target phase: the target runs BOTH capture and bubble listeners.
+    // Target phase: the target runs ONLY its non-capture (bubble) listeners.
+    //
+    // AIR never runs a useCapture listener registered on the TARGET itself: the
+    // capture phase walks from the root down to the target's PARENT, and AT_TARGET
+    // consults only the bubble list. Measured on adl 51.4.1 (temp/dupprobe, cases
+    // F/G/H): a capture-only listener on a bare EventDispatcher never runs (0), and
+    // on a p->c chain a dispatch from `c` gives p.cap@1, c.bub@2, p.bub@3 -- the
+    // target's own capture listener is absent. Running both lists here (as this did)
+    // fired the target's capture listener too, which AIR never does.
     this.line('static bool as_disp_target(Event* evt, void* target) {');
     this.indent++;
     this.line('evt->eventPhase = 2;');
     this.line('evt->currentTarget = (Object*)target;');
     this.line('EventDispatcher* d = (EventDispatcher*)target;');
     this.line('if (d->listeners == NULL) return false;');
-    this.line('bool ran = false;');
-    this.line('as_value vc = as_listeners_get(d->listeners, evt->type, true);');
-    this.line('if (vc.tag == 6 && as_disp_arr((as_array*)vc.ptr, evt)) ran = true;');
+    // AT_TARGET consults the NON-capture list only. AIR's capture phase walks root
+    // -> target's PARENT, so a useCapture listener registered on the target itself
+    // never runs (measured on adl 51.4.1, temp/dupprobe cases D/F/G/H: a capture-only
+    // listener on a bare dispatcher fires zero times, and a dispatch from `c` on a
+    // p->c chain gives p.cap@1, c.bub@2, p.bub@3). Running the capture list here as
+    // well double-fired such listeners -- which for the drag idiom (a container that
+    // registers its own MOUSE_DOWN with capture) means the handler runs twice and the
+    // second run sees state the first one already consumed.
     this.line('as_value vb = as_listeners_get(d->listeners, evt->type, false);');
-    this.line('if (vb.tag == 6 && as_disp_arr((as_array*)vb.ptr, evt)) ran = true;');
-    this.line('return ran;');
+    this.line('if (vb.tag == 6) return as_disp_arr((as_array*)vb.ptr, evt);');
+    this.line('return false;');
     this.indent--;
     this.line('}');
     this.line('');
@@ -8573,6 +9209,26 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_array* arr;');
     this.line('if (v.tag == 6) { arr = (as_array*)v.ptr; }');
     this.line('else { arr = as_array_new(); as_object_set(d->listeners, key, as_v_arr((void*)arr)); }');
+    // AIR does NOT register the same listener twice: a second addEventListener with
+    // the same listener function AND the same receiver AND the same useCapture is a
+    // no-op (measured on adl 51.4.1, temp/dupprobe cases A/B/C: the very same closure
+    // added twice runs once; a bound method added twice -- two distinct closures over
+    // one method+receiver -- also runs once; add twice then remove once runs zero
+    // times, i.e. there was only ever one entry). Appending the duplicate instead
+    // made dual-registered handlers run twice and made removeEventListener (which
+    // removes one entry) leave a stray listener behind -- the TalkMED home page's
+    // scrollbars re-register MOUSE_DOWN from a subclassed ADDED_TO_STAGE hook that
+    // does not remove itself (com.vsdevelop.proxy.ViewControl's base one does), so the
+    // drag installed TWO stage mouseMove/mouseUp pairs, one mouseUp removed only one
+    // of them, and the leftover pair kept running the app's drag code -- which
+    // disables mouse on the scrolled container and never bounces the flick back
+    // (measured: temp/tkmeet-mac d28dbg.txt; pinned by examples/listener_identity.as).
+    this.line('for (int i = 0; i < arr->length; i++) {');
+    this.indent++;
+    this.line('as_fn a = (as_fn)as_v_obj_val(arr->data[i]);');
+    this.line('if (a->fn == listener->fn && a->env == listener->env) return;');
+    this.indent--;
+    this.line('}');
     this.line('as_array_push(arr, as_v_obj((void*)listener));');
     this.line('if (strcmp(type, "enterFrame") == 0) as_ef_register(_this);');
     this.indent--;
@@ -8944,13 +9600,50 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return o;');
     this.indent--;
     this.line('}');
+    // "Actually on the stage": walks to the topmost ancestor and requires a real Stage
+    // there. Unlike DisplayObject_get_stage this must NOT fall back to
+    // ASC_root_stage: that fallback exists so the DOCUMENT class's `stage` is non-null
+    // before it is attached (TODO.md), but an orphan Sprite is not on the stage in
+    // AIR, and addChild() on such a container dispatches no ADDED_TO_STAGE --
+    // measured on adl 51.4.1 (temp/dlprobe/ `off.addChild(c2)` -> only `c2:added`).
+    this.line('static int as_on_stage(DisplayObject* o) {');
+    this.line('  while (o->parent != NULL) o = (DisplayObject*)o->parent;');
+    this.line('  return o->vtable != NULL && strcmp(o->vtable->cls_name, "Stage") == 0;');
+    this.line('}');
+    // ADDED_TO_STAGE / REMOVED_FROM_STAGE are dispatched on the object AND on every
+    // descendant, parent first, one per object in display order. Measured on adl
+    // 51.4.1 (temp/dlprobe/): adding or removing a populated subtree reports exactly
+    // one non-bubbling event per object, and they are dispatched even when nobody
+    // listens -- which is what the vsdevelop framework relies on
+    // (com.vsdevelop.proxy.ViewControl listens for Event.REMOVED and calls
+    // removeAt(), the hook that stops a WxScanView's Timer).
+    this.line('static void as_disp_stage_walk(DisplayObject* o, char* type) {');
+    this.line('  if (o == NULL) return;');
+    this.line('  EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new(type, false, false));');
+    this.line('  if (!as_is((void*)o, &DisplayObjectContainer_vt)) return;');
+    this.line('  DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('  if (c->children == NULL) return;');
+    this.line('  for (int i = 0; i < c->children->length; i++) as_disp_stage_walk((DisplayObject*)as_v_obj_val(c->children->data[i]), type);');
+    this.line('}');
     this.line('DisplayObject* DisplayObjectContainer_addChild(void* _this, DisplayObject* child) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
     this.line('if (c->children == NULL) c->children = as_array_new();');
+    // AIR implicitly reparents: adding an object that already has a parent first
+    // dispatches REMOVED (bubbling) + REMOVED_FROM_STAGE on its subtree through the
+    // OLD parent, and only then ADDED. Measured in temp/dlprobe/ (`p2.addChild(kid)`
+    // while kid sits in box): `kid:removed ... grand:removedFromStage` then
+    // `kid:added ... grand:addedToStage`. Without this the object would also stay
+    // listed in the old parent's array -- one child in two containers.
+    this.line('if (child->parent != NULL) DisplayObjectContainer_removeChild((void*)child->parent, child);');
     this.line('as_array_push(c->children, as_v_obj((void*)child));');
     this.line('child->parent = (Object*)_this;');
-    this.line('if (DisplayObject_get_stage(_this) != NULL) EventDispatcher_dispatchEvent(child, Event_new((char*)"addedToStage", false, false));');
+    // AIR dispatches Event.ADDED ("added", bubbles=true) first -- the parent is
+    // already in the bubble path -- and only then ADDED_TO_STAGE. Measured in
+    // temp/dlprobe/: `kid:added b=1 p=2`, `kid:added b=1 p=3` (the parent), then
+    // `kid:addedToStage b=0 p=2`.
+    this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"added", true, false));');
+    this.line('if (as_on_stage((DisplayObject*)_this)) as_disp_stage_walk(child, (char*)"addedToStage");');
     this.line('return child;');
     this.indent--;
     this.line('}');
@@ -8960,12 +9653,20 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (c->children == NULL) c->children = as_array_new();');
     this.line('if (index < 0) index = 0;');
     this.line('if (index > c->children->length) index = c->children->length;');
+    // Same implicit re-parent as addChild (measured in temp/dlprobe/): the old
+    // parent's REMOVED must fire before the new parent's ADDED.
+    this.line('if (child->parent != NULL) DisplayObjectContainer_removeChild((void*)child->parent, child);');
     this.line('as_array_ensure(c->children, c->children->length + 1);');
     this.line('for (int i = c->children->length; i > index; i--) c->children->data[i] = c->children->data[i - 1];');
     this.line('c->children->data[index] = as_v_obj((void*)child);');
+    // The child reference is new to this array, so it needs the incremental
+    // marking barrier: a container that is already BLACK is never re-scanned, so
+    // without it a child reachable only through this array could be swept.
+    this.line('gc_write_barrier_value(c->children->data[index]);');
     this.line('c->children->length++;');
     this.line('child->parent = (Object*)_this;');
-    this.line('if (DisplayObject_get_stage(_this) != NULL) EventDispatcher_dispatchEvent(child, Event_new((char*)"addedToStage", false, false));');
+    this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"added", true, false));');
+    this.line('if (as_on_stage((DisplayObject*)_this)) as_disp_stage_walk(child, (char*)"addedToStage");');
     this.line('return child;');
     this.indent--;
     this.line('}');
@@ -8973,30 +9674,38 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
     this.line('if (c->children == NULL) return NULL;');
+    this.line('int idx = -1;');
+    this.line('for (int i = 0; i < c->children->length; i++) if ((DisplayObject*)as_v_obj_val(c->children->data[i]) == child) { idx = i; break; }');
+    this.line('if (idx < 0) return NULL;');
+    this.line('int was_on_stage = as_on_stage(child);');
+    // AIR dispatches REMOVED while the child is STILL attached: measured in
+    // temp/dlprobe/, the handler sees parent=box / box.numChildren=1 / index 0, and
+    // the event bubbles up to the parent. Detaching first would cut the parent out
+    // of the bubble path.
+    this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"removed", true, false));');
+    // A "removed" handler may itself re-parent the child (the vsdevelop
+    // ViewControl disposes the view from this very event), so re-find it instead of
+    // trusting idx, and only clear the back-pointer while it is still ours.
     this.line('for (int i = 0; i < c->children->length; i++) {');
     this.indent++;
-    this.line('if ((DisplayObject*)as_v_obj_val(c->children->data[i]) == child) {');
-    this.indent++;
+    this.line('if ((DisplayObject*)as_v_obj_val(c->children->data[i]) != child) continue;');
     this.line('for (int j = i; j < c->children->length - 1; j++) c->children->data[j] = c->children->data[j + 1];');
     this.line('c->children->length--;');
-    this.line('child->parent = NULL;');
+    this.line('break;');
+    this.indent--;
+    this.line('}');
+    this.line('if (child->parent == (Object*)_this) child->parent = NULL;');
+    this.line('if (was_on_stage) as_disp_stage_walk(child, (char*)"removedFromStage");');
     this.line('return child;');
-    this.indent--;
-    this.line('}');
-    this.indent--;
-    this.line('}');
-    this.line('return NULL;');
     this.indent--;
     this.line('}');
     this.line('DisplayObject* DisplayObjectContainer_removeChildAt(void* _this, int index) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
     this.line('if (c->children == NULL || index < 0 || index >= c->children->length) return NULL;');
-    this.line('DisplayObject* child = (DisplayObject*)as_v_obj_val(c->children->data[index]);');
-    this.line('for (int j = index; j < c->children->length - 1; j++) c->children->data[j] = c->children->data[j + 1];');
-    this.line('c->children->length--;');
-    this.line('child->parent = NULL;');
-    this.line('return child;');
+    // Shares removeChild so the removal events (and the re-entrancy guard) cannot
+    // drift between the two entry points; AIR reports the same sequence for both.
+    this.line('return DisplayObjectContainer_removeChild(_this, (DisplayObject*)as_v_obj_val(c->children->data[index]));');
     this.indent--;
     this.line('}');
     // removeChildren(beginIndex = 0, endIndex = 0x7FFFFFFF): AIR removes beginIndex
@@ -10191,7 +10900,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // setter: AIR's valid range is 0.01..1000; <= 0 means "unset" for this
     // compiler and makes the event loop follow the display refresh rate.
     this.line('double Stage_get_frameRate(void* _this) { (void)_this; return ASC_app_frame_rate; }');
-    this.line('void Stage_set_frameRate(void* _this, double value) { (void)_this; ASC_app_frame_rate = value; }');
+    // Stage.frameRate is APPLICATION-wide (阶段一百四十八): measured on adl 51.4.1,
+    // setting it on the main Stage changes the cadence of every window, and a newly
+    // created NativeWindow's stage reads the same value back. AIR also CLAMPS the
+    // stored value -- measured read-backs: -5 and 0 become 0.01, 2000/1e9 become
+    // 1000, while 0.005/0.01/12.5/1000 pass through unchanged (and NaN stays NaN).
+    this.line('void Stage_set_frameRate(void* _this, double value) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('if (value <= 0.0) value = 0.01;');
+    this.line('else if (value > 1000.0) value = 1000.0;');
+    this.line('ASC_app_frame_rate = value;');
+    this.indent--;
+    this.line('}');
     this.line('unsigned int Stage_get_fullScreenWidth(void* _this) { (void)_this; int w = 0, h = 0; as_window_get_display_size(&w, &h); return (unsigned int)w; }');
     this.line('unsigned int Stage_get_fullScreenHeight(void* _this) { (void)_this; int w = 0, h = 0; as_window_get_display_size(&w, &h); return (unsigned int)h; }');
     this.line('bool Stage_get_allowsFullScreen(void* _this) { (void)_this; return true; }');
@@ -10583,19 +11304,26 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // (the playhead sits on no frame yet) and totalFrames == 1 (the minimum).
     //
     // A clip that came from a SWC symbol (`_tl_char != 0`) additionally OWNS a baked
-    // display list per frame: jumping backwards re-runs frame 1 (AIR recreates the
-    // objects of the frame it jumps back to) and jumping forwards applies the frames
-    // in between -- both measured on adl 51.4.1 (temp/tlprobe, swc.md §9.2 F6).
-    // Those two helpers are `as_swc_tl_*`; without a bake they are no-ops.
+    // display list per frame: jumping backwards re-applies frame 1 and the frames
+    // up to the target (AIR keeps every instance the target frame still places at
+    // its depth, and re-instantiates the rest) , jumping forwards applies the
+    // frames in between -- both measured on adl 51.4.1 (temp/tlprobe,
+    // temp/btnprobe/Rewind2.as, swc.md §9.2 F6). Those helpers are `as_swc_tl_*`;
+    // without a bake they are no-ops.
     // `as_swc_bind` rebuilds a baked symbol's frame 1; its prototype is emitted
     // further down (with the other bake helpers), so declare it here too.
     this.line('void as_swc_bind(DisplayObject* o, int charId);');
+    // The frame scripts the exported symbols' own DoABC installs (abc.ts): AIR runs
+    // a timeline's script when the playhead lands on its frame, including frame 1
+    // at construction, which is what makes a skin checkbox toggle itself. Declared
+    // here because `as_mc_goto` below is the frame-change choke point.
+    this.line('void as_swc_frames(int charId, int frame, DisplayObject* o);');
     const hasSwcTimeline = this.swcBake !== undefined && this.swcBake.characters.some((c) => (c.totalFrames ?? 1) > 1);
     // Without any SWC bake there is no `as_swc_bind` definition to link against (the
     // bake emits it with the other resource factories), so stub it here too.
     if (this.swcBake === undefined) this.line('void as_swc_bind(DisplayObject* o, int charId) { (void)o; (void)charId; }');
     if (!hasSwcTimeline) {
-      this.line('static void as_swc_tl_clear(DisplayObject* o) { (void)o; }');
+      this.line('static void as_swc_tl_rewind(int charId, DisplayObject* o, int frame) { (void)charId; (void)o; (void)frame; }');
       this.line('static void as_swc_tl_apply(int charId, DisplayObject* o, int frame) { (void)charId; (void)o; (void)frame; }');
       this.line('static int as_swc_tl_labelcount(int charId) { (void)charId; return 0; }');
       this.line('static const char* as_swc_tl_labelat(int charId, int i) { (void)charId; (void)i; return NULL; }');
@@ -10603,7 +11331,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.line('static const char* as_swc_tl_label(int charId, int frame) { (void)charId; (void)frame; return NULL; }');
       this.line('static int as_swc_tl_labelframe(int charId, const char* name) { (void)charId; (void)name; return 0; }');
     } else {
-      this.line('static void as_swc_tl_clear(DisplayObject* o);');
+      this.line('static void as_swc_tl_rewind(int charId, DisplayObject* o, int frame);');
       this.line('static void as_swc_tl_apply(int charId, DisplayObject* o, int frame);');
       this.line('static int as_swc_tl_labelcount(int charId);');
       this.line('static const char* as_swc_tl_labelat(int charId, int i);');
@@ -10629,18 +11357,25 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // timeline to take it from); a value < 1 is rejected like AIR rejects an empty
     // timeline. A baked clip sets it from the SWF's ShowFrame count in its ctor.
     this.line('void MovieClip_set_totalFrames(void* _this, int value) { if (value < 1) { as_throw(RangeError_new((char*)"The totalFrames specified is less than 1", 0)); return; } ((MovieClip*)_this)->totalFrames = value; }');
-    // The timeline move itself. Backwards (or to frame 1) = rebuild from frame 1;
-    // forwards = apply the frames between the current one and the target. A clip
-    // with no baked timeline only moves the number, as before.
+    // The timeline move itself. Backwards (or to frame 1) = re-apply frame 1 and
+    // then the records up to the target, keeping the instances AIR keeps; forwards
+    // = apply the frames between the current one and the target. A clip with no
+    // baked timeline only moves the number, as before.
     this.line('static void as_mc_goto(MovieClip* o, int f) {');
     this.indent++;
     this.line('if (o->_tl_char != 0) {');
     this.indent++;
-    this.line('if (f <= 1 || f < o->currentFrame) { as_swc_tl_clear((DisplayObject*)o); as_swc_bind((DisplayObject*)o, o->_tl_char); }');
+    this.line('if (f <= 1 || f < o->currentFrame) as_swc_tl_rewind(o->_tl_char, (DisplayObject*)o, f);');
     this.line('else if (f > o->currentFrame) as_swc_tl_apply(o->_tl_char, (DisplayObject*)o, f);');
     this.indent--;
     this.line('}');
     this.line('o->currentFrame = f;');
+    // Run the frame's timeline script (`_self.gotoAndStop(...)`, `stop()`, …). The
+    // dispatcher is emitted by the SWC bake; without one (or for a charId with no
+    // script) it does nothing, so this needs no guard of its own.
+    if ([...this.swcCharInfo.values()].some((c) => c.frames.length > 0)) {
+      this.line('as_swc_frames(o->_tl_char, f, (DisplayObject*)o);');
+    }
     this.indent--;
     this.line('}');
     // One ENTER_FRAME tick = one timeline frame, wrapping at totalFrames.
@@ -10825,6 +11560,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('li->bytesLoaded = 0; li->bytesTotal = 0;');
     // AIR nulls `content` for the duration of the load and dispatches Event.INIT
     // synchronously; the decode + COMPLETE arrive via the job's finish thunk.
+    // The PREVIOUS content leaves the child list at the same moment: measured on
+    // adl 51.4.1 (temp/ldr2/), right after a second load()/loadBytes() returns the
+    // Loader reports numChildren == 0 and content == null, and after COMPLETE
+    // numChildren == 1 with the new Bitmap at index 0. Keeping the old child made
+    // a re-loaded image invisible: the Loader held two children and the stale
+    // Bitmap (added first, drawn last) painted over the new one -- the TalkMED
+    // captcha refresh showed the old image forever.
+    this.line('if (o->content != NULL) DisplayObjectContainer_removeChild((void*)o, o->content);');
     this.line('o->content = NULL; gc_write_barrier((void*)o->content);');
     // The transport is chosen from the URL inside the runtime (a local path is a
     // file read, http(s):// is the HTTP job), so this line stays one call.
@@ -10846,6 +11589,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('LoaderInfo* li = o->contentLoaderInfo;');
     this.line('li->url = NULL; gc_write_barrier(NULL);');
     this.line('li->bytesLoaded = 0; li->bytesTotal = 0;');
+    this.line('if (o->content != NULL) DisplayObjectContainer_removeChild((void*)o, o->content);');
     this.line('o->content = NULL; gc_write_barrier((void*)o->content);');
     // Decode the byte buffer into a Bitmap content, mirroring Loader_load(): AIR
     // also decodes loadBytes into a Bitmap, so the COMPLETE handler can read
@@ -11566,7 +12310,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('char* line = as_str_alloc((size_t)n + 1);');
     this.line('memcpy(line, p, (size_t)n); line[n] = \'\\0\';');
     this.line('char* colon = strchr(line, \':\');');
-    this.line('if (colon != NULL) { *colon = \'\\0\'; char* val = colon + 1; while (*val == \' \' || *val == \'\\t\') val++; as_array_push(arr, as_v_obj((void*)URLRequestHeader_new(line, val))); }');
+    this.line('if (colon != NULL) { *colon = \'\\0\'; char* val = colon + 1; while (*val == \' \' || *val == \'\\t\') val++; as_array_push(arr, as_v_obj((void*)URLRequestHeader_new(line, as_str_dup(val)))); }');
     this.indent--;
     this.line('}');
     this.line('p = (*nl == \'\\0\') ? nl : nl + 1;');
@@ -11605,17 +12349,29 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     // Serialize a URLRequest into the pieces the network seam takes, on the AS3
-    // thread. Both loaders share it because the rule it enforces is easy to break
-    // twice: a worker thread must never walk a GC Array or call anything that
-    // allocates from the GC heap, so requestHeaders (an Array of
-    // URLRequestHeader) and `data` (String | URLVariables | ByteArray) are turned
-    // into plain byte/char buffers here, before the job is published. The two
-    // pointers that may reference GC strings ('url', 'headers') stay valid because
-    // the submit strdup's them immediately.
+    // thread. All three loaders (URLLoader/Sound/URLStream) share it because the
+    // rule it enforces is easy to break twice: a worker thread must never walk a
+    // GC Array or call anything that allocates from the GC heap, so requestHeaders
+    // (an Array of URLRequestHeader) and `data` (String | URLVariables | ByteArray)
+    // are turned into plain byte/char buffers here, before the job is published.
+    // The pointers that may reference GC strings ('url', 'headers', 'method') stay
+    // valid because the submit strdup's them immediately.
+    //
+    // AS3 vs our transport: URLRequest.method is CASE-INSENSITIVE — AIR keeps the
+    // spelling on the property (measured: setting "get" reads back as "get",
+    // "pOsT" as "pOsT") but normalizes it to UPPERCASE before it reaches the wire,
+    // and applies the same case-insensitive rule when deciding whether `data`
+    // belongs in the query string or in the body. Measured on adl 51.4.1 against a
+    // local echo server (temp/httpverb): method "get"/"GET" => wire `GET` with
+    // `?a=1&b=x%20y` and an empty body; "pOsT"/"PUT" => wire `POST`/`PUT` with the
+    // variables as the body. Comparing the raw spelling here sent the lowercase
+    // verb verbatim AND kept its payload in the body, so the TalkMED SMS-code
+    // request (which passes "get") came back 405 and surfaced as
+    // Error #2032: Stream Error (stage 154).
     this.line('typedef struct net_req { const char* method; const char* url; const char* headers; const void* body; size_t body_len; } net_req;');
     this.line('static void net__prepare_request(URLRequest* request, net_req* r) {');
     this.indent++;
-    this.line('r->method = (request->method != NULL) ? request->method : "GET";');
+    this.line('r->method = (request->method != NULL) ? as_str_toUpper(request->method) : "GET";');
     this.line('r->headers = (const char*)"";');
     this.line('if (request->requestHeaders != NULL) {');
     this.indent++;
@@ -11640,8 +12396,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     // GET folds data into the query string (url?data or url&data); POST and every
-    // other verb send it as the body. AIR behaves the same, and it is what makes
-    // `method` observable at all.
+    // other verb send it as the body. AIR's rule is case-insensitive, which is why
+    // `method` is uppercased above — that one normalization is what makes this
+    // strcmp correct for every spelling the app can set.
     this.line('r->url = request->url;');
     this.line('r->body = NULL;');
     this.line('r->body_len = 0;');
@@ -12547,9 +13304,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('// A read of n bytes into a fresh GC string. Bytes are copied verbatim: this');
     this.line('// subset\'s String is a UTF-8 byte sequence (same rule as ByteArray.readUTFBytes).');
     this.line('static char* Socket__str(Socket* o, int n) {');
-    this.line('    if (!Socket__live((void*)o)) { Socket__invalid(); return as_str_alloc(1); }');
+    this.line('    if (!Socket__live((void*)o)) { Socket__invalid(); return as_str_empty(); }');
     this.line('    if (n < 0) n = 0;');
-    this.line('    if (Socket__avail(o) < n) { Socket__eof(); return as_str_alloc(1); }');
+    this.line('    if (Socket__avail(o) < n) { Socket__eof(); return as_str_empty(); }');
     this.line('    char* s = as_str_alloc((size_t)n + 1);');
     this.line('    if (n > 0) Socket__read((void*)o, s, n);');
     this.line('    s[n] = \'\\0\';');
@@ -12934,7 +13691,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // URLVariables: dynamic class (AS3 `dynamic class`). Arbitrary string-keyed
     // properties live in the `_dyn` slot table (see the dynamic-class mechanism);
     // toString() serializes them as a URL-encoded query string (key=value&...),
-    // insertion-ordered for deterministic output.
+    // insertion-ordered for deterministic output (AIR walks its hash order -- a
+    // documented ordering divergence, see docs/zh-cn/flash-net.md §3.1).
     this.line('void URLVariables_ctor(URLVariables* o, char* source) {');
     this.indent++;
     this.line('Object_ctor((Object*)o);');
@@ -12967,7 +13725,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('*eq = \'\\0\';');
     this.line('char* val = eq + 1;');
     this.line('if (amp != NULL) { *amp = \'\\0\'; amp++; }');
-    this.line('as_object_set(o->_dyn, p, as_v_str(as_url_decode(val)));');
+    // Both halves of a pair are percent-decoded, not just the value: measured on
+    // adl 51.4.1 (temp/uvarair), `new URLVariables("a%20b=c%20d")` answers the key
+    // "a b" and `toString()` gives back "a%20b=c%20d" (the round trip closes only
+    // if the key was decoded in the first place), and "plus=a+b" decodes to "a b"
+    // for the value -- so '+' is a space in either half.
+    this.line('as_object_set(o->_dyn, as_url_decode(p), as_v_str(as_url_decode(val)));');
     this.line('if (amp == NULL) break;');
     this.line('p = amp;');
     this.indent--;
@@ -12979,19 +13742,22 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('URLVariables* o = (URLVariables*)_this;');
     this.line('as_object* d = o->_dyn;');
     this.line('if (d == NULL || d->length == 0) return (char*)"";');
+    // Both the key AND the value are percent-encoded (measured on adl 51.4.1,
+    // temp/uvarair): every non-alphanumeric character, in either half, becomes
+    // %XX. The buffer is therefore sized from the ENCODED lengths -- sizing it
+    // from the raw ones (the previous form: strlen of the raw value) under-states
+    // the write by up to 3x and overflows the GC string, which is what corrupted
+    // the heap on TalkMED (阶段一百五十三).
     this.line('size_t total = 0;');
-    this.line('for (int i = 0; i < d->length; i++) total += strlen(d->keys[i]) + strlen(as_v_str_val(d->vals[i])) + 2;');
+    this.line('for (int i = 0; i < d->length; i++) total += as_url_encoded_len(d->keys[i]) + as_url_encoded_len(as_v_str_val(d->vals[i])) + 2;');
     this.line('char* out = as_str_alloc(total + 1);');
     this.line('char* p = out;');
     this.line('for (int i = 0; i < d->length; i++) {');
     this.indent++;
-    this.line('char* k = d->keys[i];');
-    this.line('char* v = as_url_encode(as_v_str_val(d->vals[i]));');
-    this.line('size_t kl = strlen(k), vl = strlen(v);');
-    this.line('memcpy(p, k, kl); p += kl;');
+    this.line('p += as_url_encode_into(p, d->keys[i]);');
     this.line('*p++ = \'=\';');
-    this.line('memcpy(p, v, vl); p += vl;');
-    this.line('if (i < d->length - 1) *p++ = \'&\';');
+    this.line('p += as_url_encode_into(p, as_v_str_val(d->vals[i]));');
+    this.line('if (i < d->length - 1) *p++ = \'&\';');;
     this.indent--;
     this.line('}');
     this.line('*p = \'\\0\';');
@@ -13102,14 +13868,27 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // Writable per-app storage (AIR applicationStorageDirectory). A bundled .app is
     // launched with a non-writable CWD (Xcode runs it with CWD="/"), so "." is not
     // a safe write target; resolve a stable directory under $HOME and create it.
+    // AIR scopes applicationStorageDirectory by the descriptor's <id>, so the app
+    // id has to reach the generated C: without it every AOT app shared one store
+    // (D11; adl writes "Application Support/<id>/Local Store").
+    this.line('#ifndef ASC_APP_ID');
+    this.line('#define ASC_APP_ID "as3aot"');
+    this.line('#endif');
+    // The descriptor's <content>, i.e. the SWF that AIR nests local objects under:
+    // "#SharedObjects/assets/app/TalkMED-Meeting.swf/...". Empty for a bare build
+    // (no descriptor), where AIR has no SWF URL to derive the directory from.
+    this.line('#ifndef ASC_SWF_PATH');
+    this.line('#define ASC_SWF_PATH ""');
+    this.line('#endif');
     this.line('static char* as_app_storage_dir(void) {');
     this.indent++;
     this.line('char* home = as_home_dir();');
     this.line('char* base = NULL;');
     this.line('#ifdef __APPLE__');
-    this.line('base = as_path_join(home, "Library/Application Support/as3aot/Local Store");');
+    this.line('base = as_path_join(home, "Library/Application Support/" ASC_APP_ID "/Local Store");');
     this.line('#else');
     this.line('base = as_path_join(home, ".as3aot");');
+    this.line('base = as_path_join(base, ASC_APP_ID);');
     this.line('#endif');
     this.line('as_mkdirs(base);');
     this.line('return base;');
@@ -13477,13 +14256,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('');
     // ---- flash.net.SharedObject (stage 89·40) ----
-    // Local shared objects, persisted as JSON under applicationStorageDirectory:
-    //   <storage>/[<localPath>/]<name>.json
-    // AIR stores an AMF3 ".sol" container under the per-application Local Store;
-    // this subset has a JSON codec but no AMF3 encoder, so the byte format (and
-    // therefore the exact size values) differ while the observable semantics do
-    // not. Only the local half is implemented — getRemote/connect/send need a
-    // Flash Media Server, so they throw instead of silently doing nothing.
+    // Local shared objects, persisted in AIR's own container so the two runtimes
+    // can read each other's stores (阶段一百五十):
+    //   <storage>/#SharedObjects/[<content path>/][<localPath>/]<encoded name>.sol
+    // The bytes are exactly AIR's -- see as_so_read_entries for the layout -- and
+    // the AMF3 payload reuses the ByteArray codec, so a repeated string becomes a
+    // reference just as adl writes it. Only the local half is implemented --
+    // getRemote/connect/send need a Flash Media Server, so they throw instead of
+    // silently doing nothing.
     this.line('static unsigned int ASC_so_default_encoding = 3u;');
     this.line('static bool ASC_so_prevent_backup = false;');
     // mkdir -p for the parent directory of a storage file. A shared-object name
@@ -13501,29 +14281,102 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_mkdirs(dir);');
     this.indent--;
     this.line('}');
+    // AIR caps a local-store path component at 31 bytes: the FILE keeps the last
+    // 27 characters of the name (27 + ".sol"), and the remainder is folded into
+    // directories of at most 30 characters, each suffixed with '#'. Measured with
+    // adl 51.4.1 (temp/solprobe2, /solprobe5): the 35-character name
+    // "eDoctor_TalkMED_Meeting_Windows_DEV" is stored as
+    // "eDoctor_#/TalkMED_Meeting_Windows_DEV.sol", and an 80-character name as
+    // "<23>#/<30>#/<27>.sol". Names holding characters AIR escapes ('#', ':', ' ',
+    // non-ASCII, ...) are written literally here instead -- adl rejects several of
+    // them outright with Error #2134 and hashes the rest, which this subset does
+    // not reproduce (docs/zh-cn/flash-net.md).
+    this.line('static char* as_so_encode_name(const char* name) {');
+    this.indent++;
+    this.line('size_t n = strlen(name);');
+    this.line('if (n <= 27) return as_str_concat((char*)name, (char*)".sol");');
+    this.line('size_t prefix = n - 27;');
+    this.line('size_t head = prefix > 30 ? (prefix % 30 == 0 ? 30 : prefix % 30) : prefix;');
+    this.line('char* out = as_str_alloc(n + 8 + (prefix / 30 + 2) * 2);');
+    this.line('size_t w = 0, pos = 0;');
+    this.line('while (1) {');
+    this.indent++;
+    this.line('size_t clen = pos == 0 ? head : 30;');
+    this.line('memcpy(out + w, name + pos, clen);');
+    this.line('w += clen; pos += clen;');
+    this.line('if (pos >= prefix) break;');
+    this.line('out[w++] = \'#\'; out[w++] = \'/\';');
+    this.indent--;
+    this.line('}');
+    this.line('out[w++] = \'#\'; out[w++] = \'/\';');
+    this.line('memcpy(out + w, name + prefix, 27); w += 27;');
+    this.line('memcpy(out + w, ".sol", 4); w += 4;');
+    this.line('out[w] = \'\\0\';');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
     this.line('static char* as_so_path(const char* name, const char* localPath) {');
     this.indent++;
     this.line('char* base = as_app_storage_dir();');
+    this.line('base = as_path_join(base, "#SharedObjects");');
+    this.line('if (ASC_SWF_PATH[0] != \'\\0\') base = as_path_join(base, ASC_SWF_PATH);');
     this.line('if (localPath != NULL && localPath[0] != \'\\0\') base = as_path_join(base, localPath);');
-    this.line('return as_path_join(base, as_str_concat(name == NULL ? (char*)"" : name, (char*)".json"));');
+    this.line('return as_path_join(base, as_so_encode_name(name == NULL ? (char*)"" : name));');
     this.indent--;
     this.line('}');
-    // Whole-file read into arena memory (NULL when the file does not exist).
-    this.line('static char* as_so_load_text(const char* p) {');
+    // Whole-file read into arena memory (NULL when the file does not exist). The
+    // ".sol" payload carries NUL bytes, so the byte count matters and a
+    // NUL-terminated string is not enough.
+    this.line('static unsigned char* as_so_load_bytes(const char* p, size_t* out_len) {');
     this.indent++;
+    this.line('*out_len = 0;');
     this.line('FILE* f = fopen(p, "rb");');
     this.line('if (f == NULL) return NULL;');
     this.line('size_t cap = 4096, len = 0, n = 0;');
-    this.line('char* buf = as_alloc(cap);');
-    this.line('while ((n = fread(buf + len, 1, cap - len - 1, f)) > 0) {');
+    this.line('unsigned char* buf = (unsigned char*)as_alloc(cap);');
+    this.line('while ((n = fread(buf + len, 1, cap - len, f)) > 0) {');
     this.indent++;
     this.line('len += n;');
-    this.line('if (len + 1 >= cap) { char* nb = as_alloc(cap * 2); memcpy(nb, buf, len); buf = nb; cap *= 2; }');
+    this.line('if (len == cap) { unsigned char* nb = (unsigned char*)as_alloc(cap * 2); memcpy(nb, buf, len); buf = nb; cap *= 2; }');
     this.indent--;
     this.line('}');
     this.line('fclose(f);');
-    this.line('buf[len] = \'\\0\';');
+    this.line('*out_len = len;');
     this.line('return buf;');
+    this.indent--;
+    this.line('}');
+    // Read the entries of an AIR ".sol":
+    //   00 BF | u32BE(fileSize - 6) | "TCSO" | u16 4 | u32 0 | u16 nameLen | name
+    //   | 00 00 00 03 | ( U29S key | AMF3 value | 00 )*
+    // The key field is a plain U29S (the type marker is omitted), so a key whose
+    // text already entered the table comes back as a reference -- w6.sol's last
+    // entry is key "zz" written as the reference 0x02 after "zz" appeared as a
+    // value. ONE string/object table spans the whole file and it starts EMPTY (no
+    // implicit "" slot: w2.sol's repeated value references index 1, not 2), which
+    // is what as_amf3_rvalue already implements, so the helpers are reused as-is.
+    this.line('static void as_so_read_entries(SharedObject* o, const unsigned char* buf, size_t len) {');
+    this.indent++;
+    this.line('if (len < 24 || buf[0] != 0x00 || buf[1] != 0xBF || memcmp(buf + 6, "TCSO", 4) != 0) return;');
+    this.line('unsigned nameLen = (unsigned)((buf[16] << 8) | buf[17]);');
+    this.line('size_t pos = 18 + (size_t)nameLen + 4;');
+    this.line('if (pos >= len) return;');
+    this.line('as_amf3r r;');
+    this.line('memset(&r, 0, sizeof(r));');
+    this.line('r.p = buf;');
+    this.line('r.len = len;');
+    this.line('r.pos = pos;');
+    this.line('while (r.pos < r.len && r.code == 0) {');
+    this.indent++;
+    this.line('char* key = as_amfr_str_body(&r);');
+    this.line('if (r.code != 0) break;');
+    this.line('as_value v = as_amf3_rvalue(&r);');
+    this.line('as_dyn_set((void*)o->_data, key, v);');
+    this.line('if (!as_amfr_have(&r, 1)) break;');
+    this.line('r.pos += 1;  // per-entry 0x00 terminator');
+    this.indent--;
+    this.line('}');
+    this.line('for (int i = 0; i < r.ntr; i++) free(r.traits[i].members);');
+    this.line('free(r.traits); free(r.strs); free(r.objs);');
     this.indent--;
     this.line('}');
     this.line('void SharedObject_ctor(SharedObject* o) {');
@@ -13541,8 +14394,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('SharedObject* SharedObject_new(void) { SharedObject* o = (SharedObject*)gc_alloc(GCT_CLASS, sizeof(SharedObject)); o->vtable = &SharedObject_vt; SharedObject_ctor(o); return o; }');
     // Build an instance for a storage path, loading the persisted table when the
-    // file exists. A file that parses to a non-object top level is treated as
-    // empty (as_json_parse skips malformed input rather than reporting it).
+    // file exists. A file whose header is not AIR's is ignored, leaving the table
+    // empty, the way a corrupt store reads as blank rather than crashing.
     this.line('static SharedObject* as_so_make(char* name, char* path) {');
     this.indent++;
     this.line('SharedObject* o = (SharedObject*)gc_alloc(GCT_CLASS, sizeof(SharedObject));');
@@ -13550,14 +14403,52 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('SharedObject_ctor(o);');
     this.line('o->name = name; gc_write_barrier((void*)name);');
     this.line('o->path = path; gc_write_barrier((void*)path);');
-    this.line('char* text = as_so_load_text(path);');
-    this.line('if (text != NULL && text[0] != \'\\0\') {');
-    this.indent++;
-    this.line('as_value v = as_json_parse(text);');
-    this.line('if (v.tag == 4 && v.ptr != NULL) { o->_data = (as_object*)v.ptr; gc_write_barrier((void*)o->_data); }');
+    this.line('size_t len = 0;');
+    this.line('unsigned char* buf = as_so_load_bytes(path, &len);');
+    this.line('if (buf != NULL) as_so_read_entries(o, buf, len);');
+    this.line('return o;');
     this.indent--;
     this.line('}');
-    this.line('return o;');
+    // Serialise the table in AIR's ".sol" shape (byte layout in as_so_read_entries).
+    // ONE AMF3 writer spans every entry, so a repeated string becomes a reference
+    // exactly like adl's writer. Returns a malloc'd buffer the caller frees;
+    // *out_len receives the byte count. AIR's format is fixed up front except for
+    // the payload length, so the header is written with a placeholder and patched.
+    this.line('static unsigned char* as_so_serialize(SharedObject* o, size_t* out_len) {');
+    this.indent++;
+    this.line('as_amf3w w;');
+    this.line('memset(&w, 0, sizeof(w));');
+    this.line('size_t nameLen = o->name == NULL ? 0 : strlen(o->name);');
+    this.line('as_amfb_byte(&w.out, 0x00);');
+    this.line('as_amfb_byte(&w.out, 0xBF);');
+    this.line('as_amfb_bytes_be32(&w.out, 0);  // patched below: fileSize - 6');
+    this.line('as_amfb_bytes(&w.out, (const unsigned char*)"TCSO", 4);');
+    this.line('as_amfb_byte(&w.out, 0x00);');
+    this.line('as_amfb_byte(&w.out, 0x04);');
+    this.line('as_amfb_bytes_be32(&w.out, 0);');
+    this.line('as_amfb_byte(&w.out, (unsigned)((nameLen >> 8) & 0xFFu));');
+    this.line('as_amfb_byte(&w.out, (unsigned)(nameLen & 0xFFu));');
+    this.line('if (nameLen > 0) as_amfb_bytes(&w.out, (const unsigned char*)o->name, nameLen);');
+    this.line('as_amfb_byte(&w.out, 0x00);');
+    this.line('as_amfb_byte(&w.out, 0x00);');
+    this.line('as_amfb_byte(&w.out, 0x00);');
+    this.line('as_amfb_byte(&w.out, 0x03);');
+    this.line('for (int i = 0; i < o->_data->length; i++) {');
+    this.indent++;
+    this.line('char* key = o->_data->keys[i];');
+    this.line('as_amf3_wstr_body(&w, key);  // U29S; a repeated key text becomes a reference');
+    this.line('as_amf3_wvalue(&w, o->_data->vals[i]);');
+    this.line('as_amfb_byte(&w.out, 0x00);');
+    this.indent--;
+    this.line('}');
+    this.line('unsigned payload = (unsigned)(w.out.len - 6);');
+    this.line('w.out.b[2] = (unsigned char)((payload >> 24) & 0xFFu);');
+    this.line('w.out.b[3] = (unsigned char)((payload >> 16) & 0xFFu);');
+    this.line('w.out.b[4] = (unsigned char)((payload >> 8) & 0xFFu);');
+    this.line('w.out.b[5] = (unsigned char)(payload & 0xFFu);');
+    this.line('free(w.strs); free(w.objs); free(w.traits);');
+    this.line('*out_len = w.out.len;');
+    this.line('return w.out.b;');
     this.indent--;
     this.line('}');
     // flush-all for the exit hook: AIR writes every local shared object when the
@@ -13600,16 +14491,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('Object* SharedObject_get_data(void* _this) { SharedObject* o = (SharedObject*)_this; return (Object*)o->_data; }');
     // size: the byte count of the persisted representation, i.e. the size of the
-    // file flush() writes (AIR: the AMF3 ".sol", which carries a 16-byte header
-    // plus the object name — adl reports 48 bytes for {value:12345}, of which 15
-    // are the AMF payload; ours is the JSON text, so the numbers are smaller but
-    // follow the same rule). AIR reports the projected size even before the first
-    // flush (adl: size=48 with no file on disk yet), so this measures the current
-    // table instead of stat()ing the file.
+    // ".sol" file flush() writes. Measured against adl 51.4.1 on temp/sotest: 266
+    // for that store's eight properties, byte-for-byte the file this writes, and 0
+    // while the table is still empty (adl reports the projected size even before
+    // the first flush, so this measures the current table instead of stat()ing the
+    // file).
     this.line('unsigned int SharedObject_get_size(void* _this) {');
     this.indent++;
     this.line('SharedObject* o = (SharedObject*)_this;');
-    this.line('return (unsigned int)strlen(as_json_stringify(as_v_obj((void*)o->_data)));');
+    this.line('if (o->_data->length == 0) return 0;');
+    this.line('size_t len = 0;');
+    this.line('unsigned char* buf = as_so_serialize(o, &len);');
+    this.line('free(buf);');
+    this.line('return (unsigned int)len;');
     this.indent--;
     this.line('}');
     this.line('Object* SharedObject_get_client(void* _this) { return (Object*)((SharedObject*)_this)->_client; }');
@@ -13631,11 +14525,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('if (o->path == NULL) return 1;');
     this.line('as_so_mkparent(o->path);');
-    this.line('char* json = as_json_stringify(as_v_obj((void*)o->_data));');
+    this.line('size_t len = 0;');
+    this.line('unsigned char* buf = as_so_serialize(o, &len);');
     this.line('FILE* f = fopen(o->path, "wb");');
-    this.line('if (f == NULL) return 0;');
-    this.line('fwrite(json, 1, strlen(json), f);');
+    this.line('if (f == NULL) { free(buf); return 0; }');
+    this.line('if (len > 0) fwrite(buf, 1, len, f);');
     this.line('fclose(f);');
+    this.line('free(buf);');
     this.line('return 1;');
     this.indent--;
     this.line('}');
@@ -13723,6 +14619,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // delegate to the button helper. That helper lives next to the state machine
     // (below, with the paint path), hence this forward declaration.
     this.line('static int as_sbtn_contains_local(SimpleButton* b, double lx, double ly);');
+    this.line('static bool as_pick_hit_local(DisplayObject* o, double lx, double ly);');
     this.line('static void* as_pick_hit_m(void* obj, double x, double y, double a, double b, double c, double d, double tx, double ty);');
     // The object's own local transform (translate * rotate * scale * userMatrix),
     // spelled exactly like as_render_object and as_bounds_xform compose it, so the
@@ -13817,6 +14714,24 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return lx >= l && lx <= r && ly >= t && ly <= b;');
     this.indent--;
     this.line('}');
+    // The MOUSE PICK region. For everything but a button it IS as_obj_hit_local
+    // above; a SimpleButton differs: AIR hit-tests a button through its HIT state,
+    // which is the very same predicate that decides hover (as_sbtn_contains_local).
+    // Why the box test cannot stand in: a "down-only" SWC button (a down record + a
+    // hit record, no up) is an INVISIBLE click target -- upState is NULL, so
+    // as_bounds_walk finds no box at all and the button could never be clicked. That
+    // is exactly the shape of 29 characters / 73 placements in the real app's
+    // skin.swc: the TalkMED personal-centre rows and the 选择企业 back arrow -- all
+    // dead to the mouse, while the Sprite-shaped buttons beside them
+    // (submitbtn/agreebtn) worked, which is what pointed here.
+    // NOTE hitTestPoint(x, y, false) keeps the bounding-box path above: a button with
+    // no up state reports a 0x0 box there, and that IS the measured AIR answer.
+    this.line('static bool as_pick_hit_local(DisplayObject* o, double lx, double ly) {');
+    this.indent++;
+    this.line('if (as_is((void*)o, &SimpleButton_vt)) return as_sbtn_contains_local((SimpleButton*)o, lx, ly) != 0;');
+    this.line('return as_obj_hit_local(o, lx, ly);');
+    this.indent--;
+    this.line('}');
     // ---- shape-flag hit test (stage 94·22) ----
     // AIR's hitTestPoint(x, y, true) asks for the CONTENT REGION, not the box:
     // a point in the empty gap between two children of a Sprite is a miss while
@@ -13858,12 +14773,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly) {');
     this.indent++;
-    // A SimpleButton owns STATES, not children: its hit region is the hit state's
-    // geometry (that is what AIR hit-tests, and it is why mouseEnabled-based
-    // picking never matched a plain-Shape hit state). Handled first so everything
-    // that goes through the region test (hitTestPoint(shapeFlag=true), the window
-    // picker) sees the same region the button state machine uses.
-    this.line('if (as_is((void*)o, &SimpleButton_vt)) return as_sbtn_contains_local((SimpleButton*)o, lx, ly) != 0;');
+    // A SimpleButton draws its STATES but owns no shape of its own (the four states
+    // are separate DisplayObjects, per the SimpleButton docs). So its shapeFlag=true
+    // region is EMPTY: adl answers false for hitTestPoint(x, y, true) on a button
+    // even when its hitTestState is a filled 60x60 square AND the button is on the
+    // display list (temp/sbtnstate2, seven probes). The hitTestState is the *input*
+    // hit area only -- that is what as_sbtn_contains uses for hover; it is not a
+    // shape region, so it must NOT leak into hitTestPoint here.
+    this.line('if (as_is((void*)o, &SimpleButton_vt)) return false;');
     this.line('if (as_shape_region_hit(o, lx, ly)) return true;');
     this.line('if (as_is((void*)o, &Bitmap_vt) || as_is((void*)o, &TextField_vt)) {');
     this.indent++;
@@ -13916,15 +14833,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (!as_mat_invert(a, b, c, d, tx, ty, &ia, &ib, &ic, &id, &itx, &ity)) return NULL;');
     this.line('double lx = ia * x + ic * y + itx, ly = ib * x + id * y + ity;');
     // DisplayObject.scrollRect splits the test in two, exactly as the renderer does:
-    // a point outside the rectangle is outside the CLIPPED subtree (nothing there
-    // is on screen, so nothing there can be hit), while the children are tested in
-    // the content space the -x/-y shift produces -- folded into the matrix handed
-    // to each child, so the whole subtree stays consistent.
+    // a point outside the WINDOW is outside the clipped subtree (nothing there is on
+    // screen, so nothing there can be hit), while the children are tested in the
+    // content space the -x/-y shift produces -- folded into the matrix handed to
+    // each child, so the whole subtree stays consistent. The window is the object's
+    // own box (local 0,0,w,h), not the rectangle's own x/y slot: adl keeps the
+    // window anchored to the box and only slides the content (see the renderer note
+    // and temp/scrollrect-probe), so testing the read-back rect instead left the
+    // top `scrollY` points of a scrolled list unclickable.
     this.line('double oa = a, ob = b, oc = c, od = d, otx = tx, oty = ty;');
     this.line('if (o->_scroll_rect != NULL) {');
     this.indent++;
     this.line('Rectangle* sr = o->_scroll_rect;');
-    this.line('if (lx < sr->x || ly < sr->y || lx > sr->x + sr->width || ly > sr->y + sr->height) return NULL;');
+    this.line('if (lx < 0 || ly < 0 || lx > sr->width || ly > sr->height) return NULL;');
     this.line('otx -= oa * sr->x + oc * sr->y;');
     this.line('oty -= ob * sr->x + od * sr->y;');
     this.indent--;
@@ -13952,7 +14873,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('if (as_is(obj, &InteractiveObject_vt)) {');
     this.indent++;
-    this.line('if (as_obj_hit_local(o, lx, ly) && ((InteractiveObject*)obj)->mouseEnabled) return obj;');
+    this.line('if (as_pick_hit_local(o, lx, ly) && ((InteractiveObject*)obj)->mouseEnabled) return obj;');
     this.indent--;
     this.line('}');
     this.line('return NULL;');
@@ -14117,6 +15038,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('static double ASC_mouse_y = 0.0;');
     this.line('static int ASC_mouse_has = 0;');
     this.line('static int ASC_mouse_down = 0;');
+    // The InteractiveObject under the pointer (AIR's roll-over target), and the
+    // press generation latched by the mouseDown that is still held. Both feed the
+    // MovieClip button states (as_mc_button_state). ASC_mouse_target is only read
+    // inside one paint pass -- it is refreshed there, so it never has to be a GC
+    // root -- and the press is a generation NUMBER rather than a target pointer for
+    // the same reason: 0 means "nothing pressed" and no object ever stores 0.
+    this.line('static void* ASC_mouse_target = NULL;');
+    this.line('static int ASC_press_gen = 0;');
     this.line('static TextField* drag_tf = NULL;');
     this.line('static int drag_anchor = -1;');
     // ---- Sprite.startDrag/stopDrag ----
@@ -14146,6 +15075,23 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (strcmp(type, "mouseDown") == 0) ASC_mouse_down = 1;');
     this.line('else if (strcmp(type, "mouseUp") == 0) ASC_mouse_down = 0;');
     this.line('void* target = as_pick_hit(_this, x, y);');
+    // Roll-over target for the MovieClip button states, and the press latch: AIR
+    // latches `_down` to the object the press STARTED on (temp/btnprobe p5/p7 --
+    // press outside then drag in shows only `_over`, press here then drag off keeps
+    // `_down`), so the ancestor chain of THIS target is stamped with a fresh
+    // generation and every other object's stamp stops matching at mouseUp.
+    this.line('ASC_mouse_target = target;');
+    // The generation only ever GROWS: a fresh press stamps the chain of THIS target
+    // and every earlier stamp stops matching, so a press that began on empty space
+    // (or on another button) can never resume an old stamp. "Held" itself is
+    // ASC_mouse_down, which is what makes a release clear the state.
+    this.line('if (strcmp(type, "mouseDown") == 0) {');
+    this.indent++;
+    this.line('ASC_press_gen++;');
+    this.line('if (ASC_press_gen <= 0) ASC_press_gen = 1;');
+    this.line('for (DisplayObject* p = (DisplayObject*)target; p != NULL; p = (DisplayObject*)p->parent) { if (as_is((void*)p, &InteractiveObject_vt)) ((InteractiveObject*)p)->_btn_press_gen = ASC_press_gen; }');
+    this.indent--;
+    this.line('}');
     // Mouse-down index of the in-flight drag. AIR keeps it as a fixed anchor and
     // reports the span normalised (begin = min(anchor, idx), end = max, caret at
     // the max end), so a backwards drag highlights exactly like a forwards one.
@@ -14748,8 +15694,41 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // TextField (Starling's TrueTypeCompositor rasterizes native text via draw(TextField))
     // or any other DisplayObject (see the DisplayObject branch below).
     this.line('static void as_render_object_content(void* canvas, DisplayObject* o);');
+    this.line('static void as_disp_chain_scale(DisplayObject* o, double* ox, double* oy);');
     this.line('static void as_render_object(void* canvas, DisplayObject* o);');
     this.line('static void as_tf_apply_autosize(TextField* tf);');
+    // BitmapData.draw() composites the source OVER the destination (SourceOver): it
+    // never erases what it does not paint. Measured on adl 51.4.1 (temp/drawprobe/,
+    // both sides run the same source): with a green destination, drawing a red box
+    // leaves the untouched corner green (00ff00); drawing an EMPTY Sprite changes
+    // nothing at all (0000ff stays); and 50% red over opaque blue reads 7f0080 --
+    // exactly SourceOver. Our sampler used to REPLACE the destination pixel and even
+    // wrote 0 where the source had no coverage, so any composing draw() (a draw onto
+    // a pre-filled or already-drawn-on bitmap) produced a different picture: the
+    // pixel was wiped instead of kept. Bakes that draw onto a freshly allocated
+    // TRANSPARENT bitmap are unaffected (da == 0 takes the same branch it always
+    // did), which is why this stayed invisible until it was measured.
+    this.line('static void as_bd_over(unsigned* dp, int w, int x, int y, unsigned sr, unsigned sg, unsigned sb, unsigned sa) {');
+    this.indent++;
+    this.line('size_t i = (size_t)y * (size_t)w + (size_t)x;');
+    this.line('if (sa == 0) return;');
+    this.line('unsigned d0 = dp[i];');
+    this.line('if (sa == 255) { dp[i] = (255u << 24) | (sr << 16) | (sg << 8) | sb; return; }');
+    this.line('unsigned da = d0 >> 24;');
+    this.line('if (da == 0) { dp[i] = (sa << 24) | (sr << 16) | (sg << 8) | sb; return; }');
+    // Straight (non-premultiplied) ARGB on both sides, so the SourceOver result has
+    // to be un-premultiplied again by the output alpha.
+    this.line('double s = sa / 255.0, df = da / 255.0, ia = 1.0 - s;');
+    this.line('double oa = s + df * ia;');
+    this.line('double r = (sr * s + ((d0 >> 16) & 0xFF) * df * ia) / oa;');
+    this.line('double g = (sg * s + ((d0 >> 8) & 0xFF) * df * ia) / oa;');
+    this.line('double b = (sb * s + (d0 & 0xFF) * df * ia) / oa;');
+    this.line('unsigned ao = (unsigned)(oa * 255.0 + 0.5); if (ao > 255) ao = 255;');
+    this.line('unsigned ro = (unsigned)(r + 0.5), go = (unsigned)(g + 0.5), bo = (unsigned)(b + 0.5);');
+    this.line('if (ro > 255) ro = 255; if (go > 255) go = 255; if (bo > 255) bo = 255;');
+    this.line('dp[i] = (ao << 24) | (ro << 16) | (go << 8) | bo;');
+    this.indent--;
+    this.line('}');
     this.line('void BitmapData_draw(void* _this, BitmapData* source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {');
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
@@ -14873,7 +15852,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double scx = (ia * (dx + 0.5) + ic * (dy + 0.5) + itx) * rs;');
     this.line('double scy = (ib * (dx + 0.5) + id * (dy + 0.5) + ity) * rs;');
     this.line('unsigned sr = 0, sg = 0, sb = 0, sa = 0;');
-    this.line('if (!smoothing) { int sx = (int)floor(scx), sy = (int)floor(scy); if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) { dp[dy * bd->width + dx] = 0u; continue; } unsigned c = sp[sy * sw + sx]; sr = (c >> 16) & 0xFF; sg = (c >> 8) & 0xFF; sb = c & 0xFF; sa = c >> 24; }');
+    this.line('if (!smoothing) { int sx = (int)floor(scx), sy = (int)floor(scy); if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) continue; unsigned c = sp[sy * sw + sx]; sr = (c >> 16) & 0xFF; sg = (c >> 8) & 0xFF; sb = c & 0xFF; sa = c >> 24; }');
     this.line('else { double u = scx - 0.5, v = scy - 0.5; int x0 = (int)floor(u), y0 = (int)floor(v); double fx = u - x0, fy = v - y0; unsigned c00 = 0, c10 = 0, c01 = 0, c11 = 0;');
     this.indent++;
     this.line('if (x0 >= 0 && y0 >= 0 && x0 < sw && y0 < sh) c00 = sp[y0 * sw + x0];');
@@ -14888,7 +15867,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('if (ct != NULL) { double rr = (sr * rm + ro), gg = (sg * gm + go), bb = (sb * bm + bo), aa = (sa * am + ao); if (rr < 0) rr = 0; if (rr > 255) rr = 255; if (gg < 0) gg = 0; if (gg > 255) gg = 255; if (bb < 0) bb = 0; if (bb > 255) bb = 255; if (aa < 0) aa = 0; if (aa > 255) aa = 255; sr = (unsigned)rr; sg = (unsigned)gg; sb = (unsigned)bb; sa = (unsigned)aa; }');
-    this.line('dp[dy * bd->width + dx] = (sa << 24) | (sr << 16) | (sg << 8) | sb;');
+    this.line('as_bd_over(dp, bd->width, dx, dy, sr, sg, sb, sa);');
     this.indent--;
     this.line('} }');
     this.line('if (owned != NULL) free(owned);');
@@ -15575,7 +16554,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // unsigned to match the interface slot (IDataInput declares length:uint, and
     // the interface vtable stores one function-pointer type for every
     // implementor, so ByteArray/URLStream/Socket must agree on the signature).
-    this.line('if (length == 0) { char* e = (char*)as_str_alloc(1); e[0] = 0; return e; }');
+    this.line('if (length == 0) return as_str_empty();');
     this.line('int avail = o->length - o->position; if (avail < 0) avail = 0;');
     this.line('if (length > (unsigned)avail) { as_throw_eof(); return (char*)""; } // adl throws EOFError #2030 rather than truncating');
     this.line('char* r = (char*)as_str_alloc((size_t)length + 1);');
@@ -15898,7 +16877,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // (measured on adl 51.4.1: new TextField().text == "" and .text.length == 0,
     // temp/editprobe/src/Def.as). Handing out a C NULL here would make
     // `f.text == ""` false and `f.text.length` dereference NULL.
-    this.line('o->text = as_str_alloc(1);');
+    this.line('o->text = as_str_empty();');
     // Editable-text defaults (阶段九十四·七), measured on adl 51.4.1 with a fresh
     // `new TextField()` (temp/editprobe/src/Def.as): dynamic, no character limit,
     // not a password field, NO tab focus yet, no restrict pattern (NULL = no filter).
@@ -16021,8 +17000,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('static void* as_tf_paragraph(TextField* tf) {');
     this.indent++;
-    this.line('if (tf->text == NULL || tf->defaultTextFormat == NULL) return NULL;');
-    this.line('TextFormat* fmt = tf->defaultTextFormat;');
+    // A field with htmlText but no defaultTextFormat still lays out (AIR: Fps.as
+    // sets only styleSheet + htmlText, and its overlay is five lines). The runs
+    // carry the per-tag font/size/colour; the DEFAULT run -- used before the first
+    // run and for any gap -- falls back to AIR's implicit TextFormat defaults
+    // (size 12, black, family _sans), which is what a TextField uses before
+    // defaultTextFormat is ever assigned.
+    this.line('if (tf->text == NULL) return NULL;');
+    this.line('TextFormat* dflt = tf->defaultTextFormat;');
+    this.line('if (dflt == NULL) { static TextFormat idd; static int idd_init = 0; if (!idd_init) { idd.font = (char*)"_sans"; idd.size = 12.0; idd.color = 0x000000u; idd.bold = false; idd.italic = false; idd.leading = 0.0; idd_init = 1; } dflt = &idd; }');
+    this.line('TextFormat* fmt = dflt;');
     this.line('double size = fmt->size;');
     this.line('int bold = fmt->bold ? 1 : 0;');
     this.line('int italic = fmt->italic ? 1 : 0;');
@@ -16054,7 +17041,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (w < 1.0) w = 1.0;');
     this.indent--;
     this.line('}');
-    this.line('int collapse = tf->multiline ? 0 : 1;');
+    // A field whose htmlText produced block breaks honours them even with
+    // multiline left false (see TextField._html_block). Plain '\n' in a single-line
+    // field is still collapsed to a space, which is what AIR does with them.
+    this.line('int collapse = (tf->multiline || tf->_html_block) ? 0 : 1;');
     // Horizontal alignment. SkParagraph aligns inside a layout width; with no
     // width the glue substitutes 1e9 and centering inside that would shove the
     // text far off to the right, so a width-less field must NOT hand its align to
@@ -16089,7 +17079,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('    tf->_para_size == size && tf->_para_bold == bold && tf->_para_italic == italic &&');
     this.line('    tf->_para_color == color && tf->_para_collapse == collapse && tf->_para_leading == leading &&');
     this.line('    tf->_para_align == layoutAlign &&');
-    this.line('    hasRuns == 0) {');
+    this.line('    tf->_para_runs_gen == tf->_runs_gen) {');
     this.indent++;
     this.line('return tf->_para;');
     this.indent--;
@@ -16160,6 +17150,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('tf->_para_collapse = collapse;');
     this.line('tf->_para_leading = leading;');
     this.line('tf->_para_align = layoutAlign;');
+    this.line('tf->_para_runs_gen = tf->_runs_gen;');
     this.line('return tf->_para;');
     this.indent--;
     this.line('}');
@@ -16225,19 +17216,27 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // other before layout, so counting only LF here would make the same field
     // report a different numLines in the two builds.
     this.line('if (tf->text == NULL) return 0;');
-    this.line('if (!tf->multiline) return 1;');
+    this.line('if (!tf->multiline && !tf->_html_block) return 1;');
     this.line('int n = 1;');
     this.line('for (const char* p = tf->text; *p; p++) if (*p == \'\\n\' || *p == \'\\r\') n++;');
     this.line('return n;');
     this.indent--;
     this.line('}');
-    // autoSize != "none" makes the field shrink/grow to hug its text: width to
-    // textWidth and height to textHeight (plus a small 2px gutter on each side
-    // matching the paint origin). LEFT/RIGHT/CENTER only differ in anchoring,
-    // which the renderer handles via the alignment already carried by the layout.
-    // Word-wrapping depends on width, so autoSize re-flows: we first size height
-    // from the current wrap width, then width from textWidth, then height once
-    // more. This is called after every property read / render that needs it.
+    // autoSize != "none" hugs the text: the HEIGHT always becomes textHeight + 4,
+    // but the WIDTH only follows textWidth + 4 when wordWrap is OFF. Measured on
+    // adl 51.4.1 (temp/tfswc cases 6/7/8, both sides running the same Main.as):
+    //   wordWrap=true  -- width stays the authored value (290 for both a short
+    //                     and a 3-line run); only the height follows the text
+    //                     (26.6 -> 18, or 46 for three 14px lines).
+    //   wordWrap=false -- width := textWidth + 4 in BOTH directions (290 -> 28
+    //                     for "\u4e2d\u6587", 100 -> 523.5 for a long run).
+    // Re-deriving the width from a WRAPPED layout is a self-reinforcing trap: the
+    // field's own wrap shortens the longest line, the shorter line shrinks the
+    // field, and the text fragments into one glyph per line (290 -> 64.66 ->
+    // 50.66 -> 36.66 -> 32, watched live in probe.c). That cascade is what broke
+    // the AI \u540c\u4f20 list item (stage 168: our title wrapped into three lines and ran
+    // over the ctime). Guard on wordWrap rather than re-flowing the height first.
+    // This is called after every property read / render that needs it.
     this.line('static void as_tf_apply_autosize(TextField* tf) {');
     this.indent++;
     this.line('if (tf->autoSize == NULL || strcmp(tf->autoSize, "none") == 0) return;');
@@ -16245,8 +17244,61 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (para == NULL) return;');
     this.line('double tw = as_skia_textlayout_max_width(para);');
     this.line('double th = as_skia_textlayout_height(para);');
-    this.line('tf->_fieldWidth = tw + 4.0;');
+    this.line('if (!tf->wordWrap) tf->_fieldWidth = tw + 4.0;');
     this.line('tf->_fieldHeight = th + 4.0;');
+    this.indent--;
+    this.line('}');
+    // The accumulated scale of a DisplayObject's OWN transform plus every
+    // ancestor's -- the linear part only, since a translation cannot change a
+    // basis vector's length. Composed in the same order as_render_object applies
+    // the parts: T(x,y)*R(rotation)*S(scaleX,scaleY)*transform.matrix. Measured on
+    // adl 51.4.1 (temp/tfswc case ⑯ 'd' row): a field whose PARENT is scaled by 2
+    // reports half the textWidth, so the metrics must walk the chain rather than
+    // look at the object's own scale alone.
+    this.line('static void as_disp_chain_scale(DisplayObject* o, double* ox, double* oy) {');
+    this.indent++;
+    this.line('double a = 1.0, b = 0.0, c = 0.0, d = 1.0;');
+    this.line('for (DisplayObject* p = o; p != NULL; p = (DisplayObject*)p->parent) {');
+    this.indent++;
+    this.line('double rad = p->rotation * 3.14159265358979323846 / 180.0;');
+    this.line('double cs = cos(rad), sn = sin(rad);');
+    this.line('double la = cs * p->scaleX, lb = sn * p->scaleX, lc = -sn * p->scaleY, ld = cs * p->scaleY;');
+    this.line('Matrix* m = (p->transform != NULL) ? p->transform->matrix : NULL;');
+    this.line('if (m != NULL) { double ma = la * m->a + lc * m->b, mb = lb * m->a + ld * m->b, mc = la * m->c + lc * m->d, md = lb * m->c + ld * m->d; la = ma; lb = mb; lc = mc; ld = md; }');
+    this.line('double ta = la * a + lc * b, tb = lb * a + ld * b, tc = la * c + lc * d, td = lb * c + ld * d;');
+    this.line('a = ta; b = tb; c = tc; d = td;');
+    this.indent--;
+    this.line('}');
+    this.line('*ox = sqrt(a * a + b * b);');
+    this.line('*oy = sqrt(c * c + d * d);');
+    this.indent--;
+    this.line('}');
+    // AIR's TextField metrics are reported in a space where BOTH extents are
+    // divided by the ACCUMULATED scaleX -- i.e. a scaled field reports its text
+    // extents as if the field were not scaled horizontally, while its on-screen
+    // glyphs keep the vertical scale only. Width and height use the SAME divisor
+    // (scaleX, not scaleY). Measured on adl 51.4.1, same Main.as on both sides
+    // (temp/tfswc case ⑯, size 12: nominal textWidth 166.00 / textHeight 12.00):
+    //
+    //   (scaleX,scaleY) | textWidth | textHeight | rendered ink width
+    //   (1.0000,1.0000) |    166.00 |      12.00 |  165.0pt
+    //   (2.0000,1.0000) |     83.00 |       6.00 |  165.0pt
+    //   (1.0000,2.0000) |    332.00 |      24.00 |  329.5pt
+    //   (2.0000,2.0000) |    166.00 |      12.00 |  329.5pt
+    //   (0.5000,1.0000) |    332.00 |      24.00 |  165.0pt
+    //   (1.0000,0.5000) |     83.00 |       6.00 |   82.5pt
+    //
+    // i.e. textWidth/textHeight = nominal * scaleY/scaleX, and the rendered glyph
+    // size = nominal * scaleY (scaleX does not stretch glyphs horizontally -- see
+    // the normalisation in the TextField paint below). This is what makes the
+    // TalkMED subtitle skin's `ctime` (placement scaleX 1.2246, scaleY 1) report
+    // 135.55/11.45 to the app instead of our 166.10/14.00, which is exactly the
+    // 2.5pt of extra card height the AI 同传 list item showed (阶段一百六十九).
+    this.line('static double as_tf_scale_ratio(TextField* tf) {');
+    this.indent++;
+    this.line('double sx = 1.0, sy = 1.0;');
+    this.line('as_disp_chain_scale((DisplayObject*)tf, &sx, &sy);');
+    this.line('return (sx > 0.0) ? sy / sx : 1.0;');
     this.indent--;
     this.line('}');
     this.line('double TextField_get_textWidth(void* _this) {');
@@ -16258,7 +17310,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // back -FLT_MAX rather than 0; AIR reports 0 for an empty field (measured,
     // temp/metricprobe/Metrics6.as: `tw=0` alongside `th=0`).
     this.line('if (as_skia_textlayout_line_count(para) == 0) return 0.0;');
-    this.line('return as_skia_textlayout_max_width(para);');
+    this.line('return as_skia_textlayout_max_width(para) * as_tf_scale_ratio(tf);');
     this.indent--;
     this.line('}');
     this.line('double TextField_get_textHeight(void* _this) {');
@@ -16284,17 +17336,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double h = as_skia_textlayout_height(para);');
     this.line('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;');
     this.line('if (lead != 0.0 && as_skia_textlayout_line_count(para) > 1) h -= lead;');
-    this.line('return h;');
+    this.line('return h * as_tf_scale_ratio(tf);');
     this.indent--;
     this.line('}');
     // Pure-C fallback (no Skia linked): line count × approximated line height. An
     // empty field is 0, matching AIR (and the Skia path's no-line-box guard above).
+    // The scale ratio applies here too: it is a property of the field's transform,
+    // not of the text backend.
     this.line('const char* t = as_tf_layout_text(tf);');
     this.line('if (t == NULL || t[0] == 0) return 0.0;');
     this.line('double size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
     this.line('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;');
     this.line('if (lead < 0.0) lead = 0.0;');
-    this.line('return (double)as_tf_line_count(tf) * (size * 1.2 + lead);');
+    this.line('return (double)as_tf_line_count(tf) * (size * 1.2 + lead) * as_tf_scale_ratio(tf);');
     this.indent--;
     this.line('}');
     this.line('int TextField_get_numLines(void* _this) { return as_tf_line_count((TextField*)_this); }');
@@ -16470,6 +17524,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_array_push(tf->_runs, as_v_num((double)begin));');
     this.line('as_array_push(tf->_runs, as_v_num((double)end));');
     this.line('as_array_push(tf->_runs, as_v_obj((void*)format));');
+    this.line('tf->_runs_gen++;');
     this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL;');
     this.indent--;
     this.line('}');
@@ -16488,6 +17543,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_array_push(tf->_runs, as_v_num((double)begin));');
     this.line('as_array_push(tf->_runs, as_v_num((double)end));');
     this.line('as_array_push(tf->_runs, as_v_obj((void*)f));');
+    this.line('tf->_runs_gen++;');
     this.indent--;
     this.line('}');
     this.line('static int as_tf_html_parse_hex(const char* s) {');
@@ -16546,9 +17602,103 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return c;');
     this.indent--;
     this.line('}');
+    // A stylesheet declaration read as a C string. Numbers are rendered into a shared
+    // SCRATCH buffer (AS3 writes {fontSize: 9} as often as {fontSize: '9px'}), so a
+    // caller that must keep the pointer copies it (as_str_dup) -- and a caller that
+    // only compares it must do so before the NEXT call overwrites the buffer.
+    this.line('static char* as_ss_str_into(as_object* decl, const char* key, char* buf, int bufsz) {');
+    this.indent++;
+    this.line('if (decl == NULL) return NULL;');
+    this.line('for (int i = 0; i < decl->length; i++) {');
+    this.indent++;
+    this.line('if (!as_str_ieq(decl->keys[i], key)) continue;');
+    this.line('as_value v = decl->vals[i];');
+    this.line('if (v.tag == 3) return as_v_str_val(v);');
+    this.line('if (v.tag == 0 || v.tag == 1 || v.tag == 8 || v.tag == 9) { snprintf(buf, (size_t)bufsz, "%g", as_v_num_val(v)); return buf; }');
+    this.line('return NULL;   // object/array/function/null: not a CSS value');
+    this.indent--;
+    this.line('}');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('static char* as_ss_str(as_object* decl, const char* key) { static char ss_buf[64]; return as_ss_str_into(decl, key, ss_buf, 64); }');
+    // HTML character references AIR decodes inside a text field's htmlText: the named
+    // set Flash documents plus the numeric forms. They matter in practice --
+    // talkmed's footer is literally
+    //   <p align="center">eDoctor Healthcare Communications.</p>
+    //   <p align="left"> &nbsp;&nbsp;...&nbsp;meeting.talkmed.com</p>
+    // so without this the field renders "&nbsp;" as visible characters.
+    // Returns the number of BYTES appended to dst (0 = not a reference) and advances
+    // *pi past it; cap is the current output length, and a decoded reference is never
+    // longer than its source, so the caller's buffer cannot overflow.
+    this.line('static int as_tf_html_entity(const char* s, int n, int* pi, char* dst, int cap) {');
+    this.indent++;
+    this.line('static const struct { const char* nm; const char* utf; } t[] = {');
+    this.line('  { "&amp;", "&" }, { "&lt;", "<" }, { "&gt;", ">" }, { "&quot;", "\\"" },');
+    this.line('  { "&apos;", "\'" }, { "&nbsp;", "\\xc2\\xa0" }, { NULL, NULL }');
+    this.line('};');
+    this.line('int i = *pi;');
+    this.line('for (int k = 0; t[k].nm != NULL; k++) {');
+    this.indent++;
+    this.line('int L = (int)strlen(t[k].nm);');
+    this.line('if (i + L > n || strncmp(s + i, t[k].nm, (size_t)L) != 0) continue;');
+    this.line('int w = (int)strlen(t[k].utf);');
+    this.line('for (int z = 0; z < w; z++) dst[cap + z] = t[k].utf[z];');
+    this.line('*pi = i + L;');
+    this.line('return w;');
+    this.indent--;
+    this.line('}');
+    this.line('if (i + 2 < n && s[i + 1] == \'#\') {');
+    this.indent++;
+    this.line('int z = i + 2, hex = 0, digits = 0;');
+    this.line('unsigned v = 0;');
+    this.line('if (z < n && (s[z] == \'x\' || s[z] == \'X\')) { hex = 1; z++; }');
+    this.line('while (z < n && digits < 8) {');
+    this.indent++;
+    this.line('char c = s[z]; int d;');
+    this.line('if (c >= \'0\' && c <= \'9\') d = c - \'0\';');
+    this.line('else if (hex && c >= \'a\' && c <= \'f\') d = c - \'a\' + 10;');
+    this.line('else if (hex && c >= \'A\' && c <= \'F\') d = c - \'A\' + 10;');
+    this.line('else break;');
+    this.line('v = v * (unsigned)(hex ? 16 : 10) + (unsigned)d; z++; digits++;');
+    this.indent--;
+    this.line('}');
+    this.line('if (digits > 0 && z < n && s[z] == \';\' && v > 0 && v <= 0x10FFFFu && !(v >= 0xD800u && v <= 0xDFFFu)) {');
+    this.indent++;
+    this.line('int w = 0;');
+    this.line('if (v < 0x80u) { dst[cap + w++] = (char)v; }');
+    this.line('else if (v < 0x800u) { dst[cap + w++] = (char)(0xC0 | (v >> 6)); dst[cap + w++] = (char)(0x80 | (v & 0x3F)); }');
+    this.line('else if (v < 0x10000u) { dst[cap + w++] = (char)(0xE0 | (v >> 12)); dst[cap + w++] = (char)(0x80 | ((v >> 6) & 0x3F)); dst[cap + w++] = (char)(0x80 | (v & 0x3F)); }');
+    this.line('else { dst[cap + w++] = (char)(0xF0 | (v >> 18)); dst[cap + w++] = (char)(0x80 | ((v >> 12) & 0x3F)); dst[cap + w++] = (char)(0x80 | ((v >> 6) & 0x3F)); dst[cap + w++] = (char)(0x80 | (v & 0x3F)); }');
+    this.line('*pi = z + 1;');
+    this.line('return w;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
+    // The HTML tags AIR renders INLINE in a text field's htmlText. A tag outside this
+    // list becomes a BLOCK as soon as a StyleSheet rule names it (measured on
+    // adl 51.4.1, temp/blockprobe: fps/xml/head/bold/em/div turn into blocks with a
+    // {color} rule, while span/p/b/i/u/font/li/a never do -- and display:block does
+    // not promote them either).
+    this.line('static int as_tf_tag_inline(const char* nm) {');
+    this.indent++;
+    this.line('static const char* const t[] = { "span", "p", "b", "i", "u", "font", "a", "li", "br", "img", "textformat", NULL };');
+    this.line('for (int i = 0; t[i] != NULL; i++) if (strcmp(nm, t[i]) == 0) return 1;');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
     this.line('static void as_tf_html_set(TextField* tf, char* html) {');
     this.indent++;
-    this.line('if (tf->_runs != NULL) { as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_runs = NULL; }');
+    this.line('if (tf->_runs != NULL) { tf->_runs_gen++; as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_runs = NULL; }');
+    // Reset the block-break flag here and set it below when a block break is
+    // emitted, so the layout only honours hard breaks this htmlText actually asked
+    // for (see the field's declaration for why a single-line field can still have
+    // five lines).
+    this.line('tf->_html_block = false;');
     this.line('if (html == NULL) { tf->text = NULL; return; }');
     this.line('if (tf->condenseWhite) html = as_tf_condense_white(html);');
     // Build plain text (newline normalization) into a GC string, tracking byte
@@ -16562,23 +17712,51 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('bool bold = false, italic = false, underline = false;');
     this.line('int runStart = 0;');
     this.line('int i = 0;');
+    // Style stack (阶段一百四十八): each open element saves the style in effect
+    // before it, so its close can restore it. A nest deeper than AS_TF_STACK keeps the
+    // innermost styles applied but truncates the restore chain (documented, not
+    // silent: no text field in any app nests that far, and the style itself is still
+    // applied -- only the unwinding is cut off).
+    this.line('#define AS_TF_STACK 32');
+    this.line('char* st_face[AS_TF_STACK]; double st_size[AS_TF_STACK]; unsigned st_color[AS_TF_STACK];');
+    this.line('int st_bold[AS_TF_STACK], st_italic[AS_TF_STACK], st_under[AS_TF_STACK], st_block[AS_TF_STACK];');
+    this.line('int depth = 0;');
+    // >0 while inside a `display:none` element: its text is dropped (measured on
+    // adl: display:none produces empty lines in the same places).
+    this.line('int skip = 0;');
     this.line('while (i < (int)n) {');
     this.indent++;
     this.line('if (html[i] != \'<\') {');
     this.indent++;
-    this.line('out[opos++] = html[i++];');
+    // A `display:none` element's text is dropped, but the run/offset bookkeeping
+    // still advances (the hidden bytes never reach `out`).
+    this.line('if (skip == 0) {');
+    this.indent++;
+    this.line('if (html[i] == \'&\') {');
+    this.indent++;
+    this.line('int ew = as_tf_html_entity(html, (int)n, &i, out, opos);');
+    this.line('if (ew > 0) { opos += ew; continue; }');
+    this.indent--;
+    this.line('}');
+    this.line('out[opos++] = html[i];');
+    this.indent--;
+    this.line('}');
+    this.line('i++;');
     this.indent--;
     this.line('} else {');
     this.indent++;
     // Find the closing '>', then dispatch on the tag name.
     this.line('int j = i + 1;');
     this.line('while (j < (int)n && html[j] != \'>\') j++;');
-    this.line('if (j >= (int)n) { out[opos++] = html[i++]; continue; }');
+    this.line('if (j >= (int)n) { if (skip == 0) out[opos++] = html[i]; i++; continue; }');
     this.line('int tagLen = j - (i + 1);');
     this.line('char tag[64];');
     this.line('int tl = tagLen < 63 ? tagLen : 63;');
     this.line('memcpy(tag, html + i + 1, (size_t)tl);');
     this.line('tag[tl] = 0;');
+    // HTML tag names and stylesheet selectors are matched CASE-INSENSITIVELY
+    // (measured on adl 51.4.1: setStyle("memMax") styles <memMax>).
+    this.line('for (int z = 0; z < tl; z++) if (tag[z] >= \'A\' && tag[z] <= \'Z\') tag[z] = (char)(tag[z] + 32);');
     this.line('int closing = (tagLen > 0 && tag[0] == \'/\');');
     this.line('char* name = closing ? tag + 1 : tag;');
     this.line('int nl = 0;');
@@ -16586,29 +17764,78 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('char nm[24]; int k = 0; while (k < nl && k < 23) { nm[k] = name[k]; k++; } nm[k] = 0;');
     // Flush the run ending here BEFORE any style/break change.
     this.line('#define AS_TF_FLUSH() do { as_tf_html_emit_run(tf, runStart, opos, face, size, color, bold, italic, underline); runStart = opos; } while (0)');
-    this.line('if (strcmp(nm, "br") == 0) {');
+    this.line('as_object* rule = (tf->styleSheet != NULL) ? as_ss_lookup(tf->styleSheet->_rules, nm) : NULL;');
+    this.line('char* disp = (rule != NULL) ? as_ss_str(rule, "display") : NULL;');
+    this.line('if (closing) {');
+    this.indent++;
+    this.line('int hidden = (skip > 0 && disp != NULL && as_str_ieq(disp, "none"));');
+    this.line('if (hidden) skip--;');
+    this.line('if (!hidden) {');
     this.indent++;
     this.line('AS_TF_FLUSH();');
-    this.line('out[opos++] = \'\\n\';');
+    this.line('if (depth > 0) { depth--; if (depth < AS_TF_STACK) {');
+    this.indent++;
+    this.line('face = st_face[depth]; size = st_size[depth]; color = st_color[depth];');
+    this.line('bold = st_bold[depth] != 0; italic = st_italic[depth] != 0; underline = st_under[depth] != 0;');
+    // A rule'd tag that AIR does not render inline is a BLOCK: its CLOSE ends the
+    // line. Break AFTER, not before -- measured on adl 51.4.1 (temp/blockprobe):
+    // "<span>s</span><fps>F</fps><span>s</span>" with an fps rule gives ["sF","s"].
+    this.line('if (st_block[depth] && skip == 0 && opos > 0 && out[opos - 1] != \'\\n\') { out[opos++] = \'\\n\'; tf->_html_block = true; }');
     this.indent--;
-    this.line('} else if (strcmp(nm, "p") == 0) {');
-    this.indent++;
-    this.line('AS_TF_FLUSH();');
-    this.line('if (opos > 0 && out[opos - 1] != \'\\n\') out[opos++] = \'\\n\';');
+    this.line('} }');
+    // <br> and </p> end a line ONLY when the field is multiline. AIR's default is
+    // multiline=false and then BOTH are ignored (measured: '<fps>a</fps><br><fps>b</fps>'
+    // is one line while multiline is false and two when it is true). Fps.as leaves
+    // multiline at its default, so its four lines come from the block rule alone --
+    // which is exactly what AIR shows.
+    this.line('if ((strcmp(nm, "br") == 0 || strcmp(nm, "p") == 0) && tf->multiline && skip == 0 && opos > 0 && out[opos - 1] != \'\\n\') out[opos++] = \'\\n\';');
     this.indent--;
-    this.line('} else if (strcmp(nm, "b") == 0) { AS_TF_FLUSH(); bold = !closing; }');
-    this.line('else if (strcmp(nm, "i") == 0) { AS_TF_FLUSH(); italic = !closing; }');
-    this.line('else if (strcmp(nm, "u") == 0) { AS_TF_FLUSH(); underline = !closing; }');
-    this.line('else if (strcmp(nm, "font") == 0 && !closing) {');
+    this.line('}');
+    this.indent--;
+    this.line('} else {');
     this.indent++;
     this.line('AS_TF_FLUSH();');
+    this.line('if (depth < AS_TF_STACK) {');
+    this.indent++;
+    this.line('st_face[depth] = face; st_size[depth] = size; st_color[depth] = color;');
+    this.line('st_bold[depth] = bold ? 1 : 0; st_italic[depth] = italic ? 1 : 0; st_under[depth] = underline ? 1 : 0;');
+    this.line('st_block[depth] = 0;');
+    this.indent--;
+    this.line('}');
+    // Stylesheet declarations (measured values: '9px' -> 9, '-2px' -> -2, '#ffff00');
+    // only these properties are implemented -- leading/margins/letterSpacing are not
+    // in the run model (logged in TODO.md).
+    this.line('if (rule != NULL) {');
+    this.indent++;
+    // Both display decisions are taken BEFORE the other declarations are read: the
+    // scratch buffer behind as_ss_str is reused by every call (see as_ss_str_into).
+    this.line('int hidden = (disp != NULL && as_str_ieq(disp, "none"));');
+    this.line('int noinline = (disp != NULL && as_str_ieq(disp, "inline"));');
+    this.line('if (hidden) skip++;');
+    // A tag AIR does not render inline becomes a block once a rule names it;
+    // display:inline opts out (measured: display:inline on a custom tag gives one
+    // line again, while display:block on <span> changes nothing).
+    this.line('if (!as_tf_tag_inline(nm) && !noinline) { if (depth < AS_TF_STACK) st_block[depth] = 1; }');
+    this.line('char* v = as_ss_str(rule, "color"); if (v != NULL) { int c = as_css_color(v); if (c >= 0) color = (unsigned)c; }');
+    this.line('v = as_ss_str(rule, "fontsize"); if (v != NULL) { double d = as_css_num(v); if (d >= 1.0) size = d; }');
+    this.line('v = as_ss_str(rule, "fontfamily"); if (v != NULL && v[0] != 0) face = as_str_dup(v);');
+    this.line('v = as_ss_str(rule, "fontstyle"); if (v != NULL) italic = as_str_ieq(v, "italic");');
+    this.line('v = as_ss_str(rule, "fontweight"); if (v != NULL) bold = as_str_ieq(v, "bold");');
+    this.line('v = as_ss_str(rule, "textdecoration"); if (v != NULL) underline = as_str_ieq(v, "underline");');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(nm, "b") == 0) bold = true;');
+    this.line('else if (strcmp(nm, "i") == 0) italic = true;');
+    this.line('else if (strcmp(nm, "u") == 0) underline = true;');
+    this.line('else if (strcmp(nm, "font") == 0) {');
+    this.indent++;
     this.line('char* s = tag + nl;');
     this.line('while (*s) {');
     this.indent++;
     this.line('while (*s == \' \' || *s == \'/\') s++;');
     this.line('if (strncmp(s, "color=", 6) == 0) { char v[32]; s = as_tf_html_attr_value(s + 6, v, 32); color = (unsigned)as_tf_html_parse_hex(v[0] == \'#\' ? v + 1 : v); }');
     this.line('else if (strncmp(s, "size=", 5) == 0) { char v[32]; s = as_tf_html_attr_value(s + 5, v, 32); size = atof(v); if (size < 1.0) size = 1.0; }');
-    this.line('else if (strncmp(s, "face=", 5) == 0) { char v[128]; s = as_tf_html_attr_value(s + 5, v, 128); int fl = (int)strlen(v); face = as_str_alloc((size_t)fl + 1); memcpy(face, v, (size_t)fl); face[fl] = 0; }');
+    this.line('else if (strncmp(s, "face=", 5) == 0) { char v[128]; s = as_tf_html_attr_value(s + 5, v, 128); face = as_str_dup(v); }');
     // Advance past the just-parsed attribute value. A recognised value was already
     // consumed by as_tf_html_attr_value (together with its closing quote, single or
     // double); for an unrecognised token both quote kinds must be skipped, otherwise
@@ -16619,12 +17846,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.indent--;
-    this.line('} else if (strcmp(nm, "font") == 0 && closing) {');
-    this.indent++;
-    this.line('AS_TF_FLUSH();');
-    this.line('face = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->font : NULL;');
-    this.line('size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
-    this.line('color = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->color : 0x000000u;');
+    this.line('}');
+    // <br> has no close tag: in a multiline field it ends the line here.
+    this.line('else if (strcmp(nm, "br") == 0) { if (tf->multiline && skip == 0 && opos > 0 && out[opos - 1] != \'\\n\') out[opos++] = \'\\n\'; }');
+    // The saved style is popped by the matching close tag (see the closing branch),
+    // so <b>/<i>/<u>/<font> as well as every rule'd element restore symmetrically.
+    this.line('depth++;');
     this.indent--;
     this.line('}');
     this.line('#undef AS_TF_FLUSH');
@@ -16663,6 +17890,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_skia_textlayout_delete(tf->_para);');
     this.line('tf->_para = NULL;');
     this.line('tf->_para_text = NULL;');
+    this.line('tf->_runs_gen++;');
     this.line('tf->_runs = NULL;');
     this.line('tf->text = value;');
     this.line('gc_write_barrier((void*)value);');
@@ -18319,14 +19547,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // and NOT what getRect reports.
     // The state a SimpleButton actually shows: downState while the pointer is
     // pressed on it, overState while the pointer is on it, upState otherwise --
-    // decided from the live pointer state fed by ASC_window_on_mouse. A null state
-    // falls through up -> over -> down -> hit (measured on adl 51.4.1, swc.md §9 F).
-    // An offscreen run (BitmapData.draw, no window) never sees a mouse event, so it
-    // keeps the up state -- which is why the offscreen acceptance harness compares
-    // up states only.
+    // decided from the live pointer state fed by ASC_window_on_mouse. An offscreen
+    // run (BitmapData.draw, no window) never sees a mouse event, so it keeps the up
+    // state -- which is why the offscreen acceptance harness compares up states
+    // only. (An upState of NULL paints nothing at all; see as_sbtn_state below.)
     this.line('static int as_sbtn_contains_local(SimpleButton* b, double lx, double ly) {');
     this.indent++;
-    this.line('DisplayObject* hs = (b->hitTestState != NULL) ? b->hitTestState : (b->upState != NULL ? b->upState : (DisplayObject*)b);');
+    // hitTestState, else upState, else NO region. The old "> the button itself"
+    // fallback handed this same SimpleButton back to as_obj_region_hit_local, whose
+    // SimpleButton branch calls straight back into here -- so a button with up=null
+    // AND hitTestState=null (a down-only SWC button) recursed forever at 100% CPU
+    // instead of answering. With no state to measure there is no region to hit.
+    this.line('DisplayObject* hs = (b->hitTestState != NULL) ? b->hitTestState : b->upState;');
+    this.line('if (hs == NULL) return 0;');
     // Geometry, not interactivity: a button's hit state is built from plain Shape
     // children, and as_pick_hit only reports INTERACTIVE objects, so it never hit
     // anything (measured on temp/btnstate: hover stuck at 0 with the pointer
@@ -18351,6 +19584,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('static DisplayObject* as_sbtn_state(DisplayObject* o) {');
     this.indent++;
     this.line('SimpleButton* b = (SimpleButton*)o;');
+    // adl (temp/sbtnstate2, six probes): a button whose upState is NULL paints
+    // NOTHING -- over/down/hit do not stand in for it -- and reports
+    // width/height/getRect all 0. So the fallback chain below only applies once an
+    // up state exists; without one the button has no visual at all (this is the
+    // SWC-baked "down-only" button shape that used to leak two grey blocks).
+    this.line('if (b->upState == NULL) return NULL;');
     this.line('int hover = ASC_mouse_has ? as_sbtn_contains(b, ASC_mouse_x, ASC_mouse_y) : 0;');
 
     this.line('if (hover && ASC_mouse_down && b->downState != NULL) return b->downState;');
@@ -18359,6 +19598,68 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (b->overState != NULL) return b->overState;');
     this.line('if (b->downState != NULL) return b->downState;');
     this.line('return b->hitTestState;');
+    this.indent--;
+    this.line('}');
+    // ---- MovieClip button states: buttonMode + the FrameLabel triple ----
+    // AIR plays the three Flash button states on a plain MovieClip when its
+    // timeline carries the labels `_up` / `_over` / `_down` and `buttonMode` is
+    // true: the playhead moves to the matching label on roll-over, press and
+    // roll-out, by a REAL timeline move (currentFrame/currentLabel follow, and the
+    // frame's own scripts run). Measured on adl 51.4.1 with skin.swc's own button
+    // symbols (temp/btnprobe/probe.swf, drive.py):
+    //   * gate = buttonMode, NOT the labels: the same class with buttonMode forced
+    //     false keeps frame 1, and a symbol that HAS the labels but no script
+    //     (buttonMode left at its default false) also stays on frame 1;
+    //   * the LABEL decides the frame, not an index: `元件17_125` has _over@4/_down@7
+    //     and `BtnRootResources_99复制_362` has _over@5/_down@10, and each lands on
+    //     its own label's frame;
+    //   * away -> _up, roll-over -> _over, release -> _over (a byte-identical
+    //     capture to the pre-press hover), roll-out -> _up;
+    //   * the press is LATCHED to the object it started on: pressing elsewhere and
+    //     dragging in shows only `_over`, while pressing here and dragging off keeps
+    //     `_down` (that latch is `_btn_press_gen`, stamped in Stage_dispatchMouse);
+    //   * a missing label falls back down the chain (_down -> _over -> _up), which
+    //     keeps a symbol that only defines a subset on its best available state.
+    // 29 symbols in the TalkMED skin carry the triple (home cards, login buttons,
+    // the grid icon buttons, ...), so without this every hover/press feedback in the
+    // app was missing (D42/R29).
+    //
+    // The roll-over target is the pick result, i.e. the object the mouse would be
+    // delivered to (mouseEnabled/mouseChildren honoured, exactly like AIR's roll
+    // over), and this object is on its ancestor chain -- that is what makes a
+    // press on a child light up the card around it.
+    this.line('static int as_mc_under_target(DisplayObject* o) {');
+    this.indent++;
+    this.line('for (DisplayObject* p = (DisplayObject*)ASC_mouse_target; p != NULL; p = (DisplayObject*)p->parent) if (p == o) return 1;');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_mc_button_state(DisplayObject* o) {');
+    this.indent++;
+    this.line('MovieClip* mc = (MovieClip*)o;');
+    this.line('if (mc->_tl_char == 0) return;');
+    this.line('if (!((InteractiveObject*)o)->buttonMode) return;');
+    this.line('if (!ASC_mouse_has) return;');
+    this.line('int over = as_mc_under_target(o);');
+    this.line('int pressed = ASC_mouse_down && ASC_press_gen != 0 && ((InteractiveObject*)o)->_btn_press_gen == ASC_press_gen;');
+    this.line('const char* want = pressed ? "_down" : (over ? "_over" : "_up");');
+    this.line('int f = as_swc_tl_labelframe(mc->_tl_char, want);');
+    this.line('if (f <= 0 && pressed) f = as_swc_tl_labelframe(mc->_tl_char, "_over");');
+    this.line('if (f <= 0 && (pressed || over)) f = as_swc_tl_labelframe(mc->_tl_char, "_up");');
+    // Only a real frame change moves the playhead: re-entering as_mc_goto for the
+    // frame the clip is already showing would replay its frame script (and rebuild
+    // its children) on every painted frame.
+    this.line('if (f > 0 && f != mc->currentFrame) as_mc_goto(mc, f);');
+    this.indent--;
+    this.line('}');
+    // Refresh the roll-over target once per paint pass (and on every mouse event,
+    // via Stage_dispatchMouse): a button that appears under a parked pointer still
+    // picks up its state, and an offscreen draw sees the same target the window
+    // paint does. Recomputed rather than cached across frames so the pointer never
+    // has to be a GC root -- it only lives while a pass walks the display list.
+    this.line('static void as_mouse_refresh_target(DisplayObject* root) {');
+    this.indent++;
+    this.line('ASC_mouse_target = (ASC_mouse_has && root != NULL) ? as_pick_hit((void*)root, ASC_mouse_x, ASC_mouse_y) : NULL;');
     this.indent--;
     this.line('}');
     this.line('static int as_bounds_walk(DisplayObject* o, int with_stroke, int decl, double* l, double* t, double* r, double* b) {');
@@ -18484,6 +19785,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('static int as_do_extents(DisplayObject* o, double* w, double* h) {');
     this.indent++;
+    // autoSize is observable through the field's own `width`/`height` the moment
+    // it is set: adl 51.4.1 reads back `height = textHeight + 4` right after
+    // `autoSize = LEFT` with no draw in between (temp/tfswc cases 6/7). Our other
+    // two call sites are the raster bake and the renderer, so a plain property
+    // read used to report the authored box (height 30 for a 12 px line). Geometry
+    // access is the third and last one: as_do_width / as_do_height both land here,
+    // and for a TextField those two ARE the field box (_fieldWidth/_fieldHeight).
+    this.line('if (as_is((void*)o, &TextField_vt)) as_tf_apply_autosize((TextField*)o);');
     this.line('double l, t, r, b;');
     this.line('if (!as_bounds_walk(o, 1, 1, &l, &t, &r, &b)) return 0;');
     this.line('double a = 1.0, mb = 0.0, c = 0.0, d = 1.0;');
@@ -18820,6 +20129,37 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('  return s;');
     this.line('}');
     this.line('');
+    // Per-axis bake scale for as_render_cached. That path blits the bake back 1:1 in
+    // DEVICE PIXELS (a full-image drawImageRect), so the surface must carry the
+    // destination canvas's per-axis scale exactly.
+    //
+    // Why a single isotropic scale is wrong: the surface ends up with pw = ceil(lw*sc)
+    // pixels while the destination rect spans lw*ctx device pixels, so the blit
+    // rescales the image by lw*ctx/pw != 1. That error is proportional to the
+    // distance from the bake origin (bl), so a child far from the origin moves by
+    // more than one near it -- and every bake rebuild shifts it again. Measured on
+    // the TalkMED login form (temp/tkfix/): with nested auto-bakes the login
+    // button's right edge sat ~5 device px left of its true position while its left
+    // edge was correct, and each click (which drops and rebuilds the bake) popped
+    // the edge by ~2 px -- the reported "picture jitters" bug. Geometry itself never
+    // changed (an in-app ENTER_FRAME probe of stage/skin/button x/width printed one
+    // single line across 4 clicks).
+    this.line('static void as_bake_scale2(void* canvas, int lw, int lh, double* sx, double* sy) {');
+    this.line('  double dt_x = 0.0, dt_y = 0.0;');
+    this.line('  as_skia_canvas_total_scale(canvas, &dt_x, &dt_y);');
+    this.line('  if (dt_x < 1.0) dt_x = 1.0;');  // never rasterize below the logical size
+    this.line('  if (dt_y < 1.0) dt_y = 1.0;');
+    // The two caps below must degrade resolution, never introduce an axis ratio, so
+    // they shrink both axes by the same factor.
+    this.line('  double cap = 4.0 * ASC_render_scale; if (cap < 1.0) cap = 1.0;');
+    this.line('  double f = 1.0;');
+    this.line('  if (dt_x > cap) f = cap / dt_x;');
+    this.line('  if (dt_y * f > cap) f = cap / dt_y;');
+    this.line('  double area = (double)lw * dt_x * f * (double)lh * dt_y * f;');
+    this.line('  if (area > AS_BAKE_MAX_PIXELS) f *= sqrt(AS_BAKE_MAX_PIXELS / area);');
+    this.line('  *sx = dt_x * f; *sy = dt_y * f;');
+    this.line('}');
+    this.line('');
     this.line('static inline uint32_t as_fp_u32(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }');
     this.line('static inline uint32_t as_fp_i32(uint32_t h, int v) { return (h ^ (uint32_t)v) * 16777619u; }');
     this.line('static inline uint32_t as_fp_ptr(uint32_t h, const void* p) { return (h ^ (uint32_t)(uintptr_t)p) * 16777619u; }');
@@ -18847,9 +20187,41 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('uint32_t h = 2166136261u;');
     this.line('if (o == NULL) return h;');
+    // MovieClip button states are settled HERE as well as in as_render_object, and
+    // this pass is the one that matters when an ANCESTOR is auto-baked: a baked
+    // ancestor paints its cached image and never walks its descendants, so the
+    // card's own as_render_object (and the state move in it) never ran -- the
+    // timeline stayed on _up and the hover feedback was invisible (measured: the
+    // app's home cards, 306 px of change limited to the debug overlay, against
+    // adl's 15524 px on the card). The fingerprint walk does reach every node every
+    // frame, so settling here both moves the playhead and makes the frame part of
+    // the hash below, which drops the stale bake in this very frame.
+    this.line('if (as_is(o, &MovieClip_vt)) as_mc_button_state(o);');
     this.line('h = as_fp_dbl(h, o->x); h = as_fp_dbl(h, o->y);');
     this.line('h = as_fp_dbl(h, o->rotation); h = as_fp_dbl(h, o->scaleX); h = as_fp_dbl(h, o->scaleY);');
     this.line('h = as_fp_dbl(h, o->alpha); h = as_fp_bool(h, o->visible);');
+    // The timeline frame of a MovieClip is an input of its render exactly like
+    // scrollRect below: a frame move REPLACES children, but a move between two
+    // frames whose children happen to hash the same (or, more commonly, a move
+    // whose only difference is a child that keeps its geometry) must still
+    // invalidate the bake. Without this the MovieClip button states
+    // (as_mc_button_state) navigated to _over/_down and the pixels never moved:
+    // the fingerprint stayed equal, so the cached up-state image was replayed
+    // (measured on the app's home cards -- hover showed a 306 px diff limited to
+    // the debug overlay, against adl's 15524 px on the card).
+    this.line('if (as_is(o, &MovieClip_vt)) h = as_fp_i32(h, ((MovieClip*)o)->currentFrame);');
+    // DisplayObject.scrollRect is an input of the PARENT's render, not just of this
+    // object's own: the clip+translate in as_render_object runs outside the cached
+    // image (as_render_cached bakes as_render_object_content only), so a baked
+    // ANCESTOR freezes the scrolled child at whatever offset existed when it baked.
+    // Without this hash a scroll then neither moves the child nor ever invalidates
+    // that ancestor: the app's home tab row kept painting the frame in which the
+    // drag started (菜单回弹 D34 -- the bounce arithmetic ran, scrollX went
+    // 0->105->0, yet the pixels never moved, measured with ASC_NO_AUTO_BAKE=1 as
+    // the A/B: with auto-bake off the same drag scrolls and springs back).
+    // scrollRect.x/y/width/height are all live here: the accessor stores a private
+    // copy per assignment, so this reads exactly what the app last assigned.
+    this.line('if (o->_scroll_rect != NULL) { h = as_fp_dbl(h, o->_scroll_rect->x); h = as_fp_dbl(h, o->_scroll_rect->y); h = as_fp_dbl(h, o->_scroll_rect->width); h = as_fp_dbl(h, o->_scroll_rect->height); }');
     this.line('if (o->transform != NULL && o->transform->matrix != NULL) {');
     this.indent++;
     this.line('Matrix* m = o->transform->matrix;');
@@ -18981,10 +20353,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // retry the bounds probe every ASC_AUTO_BAKE_FRAMES frames, not every frame.
     this.line('if (h == o->_auto_fp) { o->_auto_still++; }');
     this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked) { o->_auto_baked = 0; o->_cache_valid = 0; } }');
-    this.line('if (o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES) {');
+    this.line('if (getenv("ASC_NO_AUTO_BAKE") == NULL && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
-    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) o->_auto_baked = 1; else o->_auto_still = 0;');
+    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", (void*)o, bl, bt, br - bl, bb - bt); } else o->_auto_still = 0;');
     this.indent--;
     this.line('}');
     this.line('return h;');
@@ -19021,22 +20393,25 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // the bake to the total scale makes the blit 1:1, so a cached object renders
     // identically to an uncached one (adl is the oracle here: cacheAsBitmap on
     // vs off is pixel-identical at scale 1/2/3, temp/bakeprobe/).
-    this.line('double sc = as_bake_scale(canvas, lw, lh);');
-    this.line('int pw = (int)ceil((double)lw * sc); int ph = (int)ceil((double)lh * sc);');
+    this.line('double sx = 1.0, sy = 1.0;');
+    this.line('as_bake_scale2(canvas, lw, lh, &sx, &sy);');
+    this.line('int pw = (int)ceil((double)lw * sx); int ph = (int)ceil((double)lh * sy);');
     this.line('if (!o->_cache_valid || o->_cache_image == NULL || o->_cache_w != (double)pw || o->_cache_h != (double)ph) {');
     this.indent++;
+    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f\\n", (void*)o, bl, bt, lw, lh, pw, ph, sx, sy);');
+    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { double _tx = 0.0, _ty = 0.0; as_skia_canvas_total_scale(canvas, &_tx, &_ty); double _ex = (_tx > 0.0) ? fabs((double)pw / ((double)lw * _tx) - 1.0) : 0.0; if (_ex > 0.002 || _tx != _ty) fprintf(stderr, "bake_anis o=%p lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f ctx=%.5f cty=%.5f ex=%.5f\\n", (void*)o, lw, lh, pw, ph, sx, sy, _tx, _ty, _ex); }');
     this.line('if (o->_cache_image != NULL) { as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('void* surface = as_skia_surface_bake_new(pw, ph);');
     this.line('if (surface != NULL) {');
     this.indent++;
     this.line('void* c2 = as_skia_surface_canvas(surface);');
     this.line('as_skia_canvas_clear_transparent(c2);');
-    this.line('as_skia_canvas_scale(c2, sc, sc);');
+    this.line('as_skia_canvas_scale(c2, sx, sy);');
     this.line('as_skia_canvas_translate(c2, -bl, -bt);');
     this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y;');
     this.line('as_skia_canvas_total_scale(canvas, &ASC_bake_ctm_x, &ASC_bake_ctm_y);');
-    this.line('if (ASC_bake_ctm_x <= 0.0) ASC_bake_ctm_x = sc;');
-    this.line('if (ASC_bake_ctm_y <= 0.0) ASC_bake_ctm_y = sc;');
+    this.line('if (ASC_bake_ctm_x <= 0.0) ASC_bake_ctm_x = sx;');
+    this.line('if (ASC_bake_ctm_y <= 0.0) ASC_bake_ctm_y = sy;');
     this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(c2, o, o->filters, o->filters->length - 1);');
     this.line('else as_render_object_content(c2, o);');
     this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by;');
@@ -19050,7 +20425,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('if (o->_cache_image != NULL) {');
     this.indent++;
-    this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bl, bt, (double)lw, (double)lh);');
+    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { static int _bc = 0; double _bx = 0.0, _by = 0.0; as_skia_canvas_total_scale(canvas, &_bx, &_by); double _ex2 = (_bx > 0.0) ? fabs((double)pw / ((double)lw * _bx) - 1.0) : 0.0; if (_bc < 80 && (_ex2 > 0.002 || _bx != _by)) { _bc++; fprintf(stderr, "bake_blit o=%p lw=%d pw=%d bx=%.5f by=%.5f ex=%.5f\\n", (void*)o, lw, pw, _bx, _by, _ex2); } }');
+    // Blit 1:1 in device pixels: the surface's pixel grid has to land on the
+    // destination's, i.e. each surface pixel covers exactly one device pixel. The
+    // rect is therefore pw/sx logical units wide (sx = device pixels per logical
+    // unit inside the surface), not lw -- see as_bake_scale2.
+    this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bl, bt, (double)pw / sx, (double)ph / sy);');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -19078,13 +20458,26 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('static void as_render_object(void* canvas, DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL || !o->visible) return;');
+    // MovieClip button states settle BEFORE anything is measured or painted, so the
+    // bounds, the nine-slice slice and the pixels all see the state the pointer
+    // implies (as_mc_button_state is a no-op unless the clip is a buttonMode).
+    this.line('if (as_is((void*)o, &MovieClip_vt)) as_mc_button_state(o);');
     // A clipDepth mask object is a child (AIR reports it) but is never painted: its
     // outline became the clip path of the siblings in its depth range. Skipping the
     // whole subtree is right for a sprite mask too — AIR renders it into the mask
     // buffer, never into the visible output.
     this.line('if (o->_mask_object) return;');
+    // clipDepth mask (swc.md §9 E-4): the mask is a SIBLING, so its region lives in
+    // the PARENT's pixel space and must NOT follow this object as it moves. The clip
+    // therefore goes on BEFORE the object's own translate/rotate/scale, and the baked
+    // path is the mask's placement in that same parent space (阶段一百四十六).
+    // Composing it into the object's local pixels instead made the mask travel with
+    // the object -- the TalkMED login ticker (banner x = -(index-1)*354 under a fixed
+    // mask) showed only the first slide and blank afterwards.
+    this.line('as_skia_canvas_save(canvas);');
+    this.line('int clip_on = (o->_clip_path != NULL);');
+    this.line('if (clip_on) as_skia_canvas_clip_path(canvas, o->_clip_path, 1);');
     this.line('if (o->alpha < 1.0) as_skia_canvas_save_layer_alpha(canvas, o->alpha);');
-    this.line('else as_skia_canvas_save(canvas);');
     this.line('as_skia_canvas_translate(canvas, o->x, o->y);');
     this.line('as_skia_canvas_rotate(canvas, o->rotation);');
     this.line('as_skia_canvas_scale(canvas, o->scaleX, o->scaleY);');
@@ -19122,26 +20515,29 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_skia_paint_delete(cp);');
     this.indent--;
     this.line('}');
-    // A clipDepth mask (swc.md §9 E-4) clips everything this object paints,
-    // children included, in the object's own local space -- after the transform
-    // above, so the path needs no further adjustment.
-    this.line('int clip_on = (o->_clip_path != NULL);');
-    this.line('if (clip_on) { as_skia_canvas_save(canvas); as_skia_canvas_clip_path(canvas, o->_clip_path, 1); }');
-    // DisplayObject.scrollRect: clip to the rectangle in this object's own local
-    // space, then shift the content by -x/-y so the rectangle's origin lands on the
-    // object's origin (the shift is what makes the classic
-    // `mc.scrollRect = new Rectangle(0, y, w, h)` a scroll). The rect is local, and
-    // this point is past the transform above, so no adjustment is needed. Filter
-    // bounds and cacheAsBitmap bakes go through this same walk, so both see it.
+    // DisplayObject.scrollRect: the object is shown through a window of the
+    // rectangle's SIZE that stays anchored on the object's own box (local
+    // 0,0,w,h); only the CONTENT slides, by -x/-y -- that shift is what makes the
+    // classic `mc.scrollRect = new Rectangle(0, y, w, h)` a scroll and what makes
+    // the app's List (VScrollBar.scrollY) work.
+    //
+    // Clip FIRST, then shift. Skia maps a clipRect through the CTM in force at the
+    // call, so clipping after the translate would put the window itself at
+    // (r.x, r.y, w, h) -- i.e. drag it along with the content. Measured on adl
+    // 51.4.1 (temp/scrollrect-probe: a stripe-painted box at (100,50) with
+    // `scrollRect = (20,30,100,80)` reports its painted pixels at (100,50)-(199,129)
+    // -- the box -- and the pixel at the window's top-left is object x=20, so the
+    // window is the box and only the content moved; our old order reported
+    // (80,20)-(179,99) and object x=0). The consequences in the app were bug D29:
+    // scrolled list content painted over the fixed header, a blank band at the
+    // bottom of the list, and a dead click zone at the top of the scrolled list
+    // (the pick window in as_pick_hit_m mirrored the same wrong rect).
     this.line('int scroll_on = (o->_scroll_rect != NULL);');
     this.line('if (scroll_on) {');
     this.indent++;
     this.line('as_skia_canvas_save(canvas);');
-    // Shift FIRST, then clip in the shifted space: the clip is expressed in the
-    // current coordinate system, so (translate -r, clip 0,0,w,h) means "content
-    // whose pre-shift coordinate is inside r", which is exactly AIR's scroll window.
-    this.line('as_skia_canvas_translate(canvas, -o->_scroll_rect->x, -o->_scroll_rect->y);');
     this.line('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);');
+    this.line('as_skia_canvas_translate(canvas, -o->_scroll_rect->x, -o->_scroll_rect->y);');
     this.indent--;
     this.line('}');
 
@@ -19207,7 +20603,6 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('if (scroll_on) as_skia_canvas_restore(canvas);');
-    this.line('if (clip_on) as_skia_canvas_restore(canvas);');
     this.line('if (ct_on) as_skia_canvas_restore(canvas);');
     this.line('if (blend_on) as_skia_canvas_restore(canvas);');
     this.line('as_skia_canvas_restore(canvas);');
@@ -19389,6 +20784,32 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double alignDx = as_tf_align_dx(tf);');
     this.line('as_skia_canvas_save(canvas);');
     this.line('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, tf->_fieldWidth, tf->_fieldHeight);');
+    // AIR stretches a field's glyphs by the ACCUMULATED scaleY only: scaleX does
+    // NOT widen the text. Measured on adl 51.4.1 with the same Main.as on both
+    // sides (temp/tfswc case ⑯, window screenshot + ARGB dump): a 12pt run whose
+    // nominal ink is 165pt renders 165pt at (scaleX,scaleY) = (1,1), (2,1),
+    // (0.5,1) and at a parent scaleX=2 -- while (1,2)/(2,2) render 329.5pt and
+    // (1,0.5) renders 82.5pt. i.e. the rendered glyph size = nominal * scaleY and
+    // the on-screen box = local * scaleX. Our canvas already carries the field's
+    // full (non-uniform) transform, so post-concatenating scale(sy/sx, 1) turns
+    // the glyph transform into a uniform one at the vertical scale. The clip above
+    // is issued BEFORE this on purpose: the visible box does follow scaleX (Skia
+    // maps a clip through the CTM in force at clip time), and only the glyphs are
+    // normalised. Without this the TalkMED subtitle skin's `ctime` (placement
+    // scaleX 1.2246) painted its runs 22% wider than adl (阶段一百六十九).
+    //
+    // The factor comes from the CTM the content will FINALLY land on, using the
+    // same ASC_bake_ctm_* idiom as the border above: inside a cacheAsBitmap/filter
+    // bake the canvas carries the bake resolution rather than the object, so the
+    // destination scale is the only honest measure. A TextField's own
+    // BitmapData.draw rebuilds it in LOCAL space (measured on adl 51.4.1 via
+    // temp/tfswc case ⑯c: `bmd.draw(tf)` dumps the identical raster for a plain
+    // field and for scaleY=2, i.e. AIR ignores the object's own transform there),
+    // and there ASC_bake_ctm_* is 0 so the canvas' uniform bake scale yields
+    // ratio 1 -- exactly what that path needs.
+    this.line('double tsx = ASC_bake_ctm_x, tsy = ASC_bake_ctm_y;');
+    this.line('if (tsx <= 0.0 || tsy <= 0.0) as_skia_canvas_total_scale(canvas, &tsx, &tsy);');
+    this.line('if (tsx > 0.0 && fabs(tsy / tsx - 1.0) > 1e-9) as_skia_canvas_scale(canvas, tsy / tsx, 1.0);');
     // Selection highlight (drawn behind the glyphs, paragraph-relative).
     // Selection highlight. Two measured rules (SelFocus probe, adl 51.4.1):
     //   1. it is drawn ONLY on the FOCUSED field — setSelection on an unfocused
@@ -19559,6 +20980,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_skia_canvas_scale(canvas, scale, scale);');
     this.line('as_skia_canvas_clear(canvas, st->stage_color);');
     this.line('ASC_render_scale = scale;');
+    // Refresh the roll-over target before the pass so the MovieClip button states
+    // this render settles reflect the live pointer (Stage.render is the headless
+    // twin of the window paint; a test that only calls dispatchMouse keeps the
+    // target that event stored).
+    this.line('as_mouse_refresh_target((DisplayObject*)_this);');
     this.line('as_render_fp((DisplayObject*)_this);');
     // Stage.render is this runtime's SCREENSHOT hook (AIR has no such API): include
     // the caret overlay so the PNG shows what the window shows. BitmapData.draw and
@@ -19644,7 +21070,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('static double ASC_win_scale = 1.0;');   // device pixel ratio of the window being rendered
-    this.line('static double ASC_app_frame_rate = 0.0;');   // 0 = unset -> event loop follows the display refresh rate
+    // The application-wide frame rate (阶段一百四十八). AIR's default is 24, and
+    // `[SWF(frameRate = N)]` in the document class overrides it -- both measured on
+    // adl 51.4.1 (temp/frprobe*: no metadata reads back 24; frameRate="60" reads
+    // back 60). The initial value goes through the same clamp as the setter, so a
+    // metadata value and a runtime assignment cannot disagree.
+    {
+      const raw = this.program.swfFrameRate;
+      const rate = raw === undefined ? 24.0 : (raw <= 0 ? 0.01 : raw > 1000 ? 1000 : raw);
+      this.line(`static double ASC_app_frame_rate = ${rate};`);
+    }
     this.line('static bool ASC_app_vsync_enabled = true;'); // AIR default; false lets the pacer exceed the display refresh
     // stageWidth/stageHeight follow AIR: under NO_SCALE they track the real window
     // size (the app is expected to relayout on Event.RESIZE); under every scaling
@@ -19752,6 +21187,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('#endif');
     this.line('ASC_render_scale = w->scale;');
+    this.line('as_mouse_refresh_target((DisplayObject*)st);');
     this.line('as_render_fp((DisplayObject*)st);');
     // Window composition pass: the caret overlay is drawn only here (see the
     // ASC_caret_pass note). as_render_fp above does NOT set it, so the fingerprint
@@ -19978,7 +21414,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double fr = ASC_app_frame_rate;');
     this.line('double rr = as_window_display_refresh(id);');
     this.line('bool vs = ASC_app_vsync_enabled;');
-    this.line('if (fr <= 0.0) {');
+    // `!(fr > 0.0)` rather than `fr <= 0.0`: NaN fails BOTH comparisons, and a NaN
+    // delay would poison the loop deadline arithmetic. AIR stores a NaN frameRate
+    // verbatim (measured read-back), so the value is preserved for reads; only the
+    // PACER falls back to the display refresh for it (the same fallback as "no rate").
+    this.line('if (!(fr > 0.0)) {');
     this.indent++;
     this.line('if (vs && rr > 0.0) return 1000.0 / rr;');
     this.line('return 1000.0 / 120.0;');
@@ -20176,6 +21616,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('Stage* st = (Stage*)_this;');
     // The app's initial window always takes slot 0 — see ASC_win_claim_main.
     this.line('ASCWin* w = ASC_win_claim_main();');
+    // The document class runs BEFORE this (the event loop below is what blocks), so
+    // `stage.nativeWindow.title = ...` has already run. NativeWindow_set_title stored
+    // it in w->title, but the glue only touches an already-open window, so that call
+    // was a no-op. Honour the app's title here instead of the descriptor's (which is
+    // where the initial title came from) -- measured: adl shows Language.TALKMED_MEETING
+    // while we kept showing the app.xml <title> (talkmed-meeting-aot-vs-adl-diff.md D7).
+    this.line('if (w->title != NULL && w->title[0] != 0) title = w->title;');
     this.line('w->stage = st;');
     this.line('st->stage_scale = 1.0;');
     this.line('w->scale = 1.0;');
@@ -20852,7 +22299,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       // image's real dimensions (swc.md §6 — the ctor args are NOT trusted).
       const swcRes = this.swcResources.get(name);
       if (swcRes) {
-        this.line(`BitmapData_adoptEncoded((BitmapData*)o, ${swcRes.bytesSymbol}, (size_t)${swcRes.encoded.length});`);
+        const adopt = swcRes.alpha === null
+          ? `BitmapData_adoptEncoded((BitmapData*)o, ${swcRes.bytesSymbol}, (size_t)${swcRes.encoded.length})`
+          : `BitmapData_adoptEncodedAlpha((BitmapData*)o, ${swcRes.bytesSymbol}, (size_t)${swcRes.encoded.length}, ${swcRes.bytesSymbol}_a, ${swcRes.width}, ${swcRes.height})`;
+        this.line(`${adopt};`);
       }
       // `[Embed]` asset class: bind the embedded bytes in the constructor epilogue,
       // after super() (which allocated the base object and seeded its fields) and
@@ -20876,8 +22326,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         // A multi-frame symbol: the baked timeline length, FrameLabels and the
         // "start on frame 1, stopped" default (item ③) are set here, before the
         // class's own (empty) constructor body could touch the frame count.
-        if (this.swcBake?.characters.some((c) => c.id === swcCharId && (c.totalFrames ?? 1) > 1)) {
+        const char = this.swcBake?.characters.find((c) => c.id === swcCharId);
+        const charFrames = this.swcCharInfo.get(swcCharId)?.frames ?? [];
+        // A symbol whose class carries frame scripts is a timeline clip even when it
+        // has a single frame: AIR's playhead sits on frame 1, and the frame 1 script
+        // reads `currentFrame` (the login checkbox compares it against 3), so the
+        // playhead must be seeded before that script runs.
+        if ((char?.totalFrames ?? 1) > 1 || charFrames.length > 0) {
           this.line(`as_swc_tl_start((MovieClip*)o, ${swcCharId});`);
+        }
+        // Frame 1's script, which AIR runs once the object is fully constructed
+        // (`addFrameScript(0, …)` is the ctor's last act).
+        if (charFrames.some((f) => f.frame === 1)) {
+          this.line(`as_swc_frames(${swcCharId}, 1, (DisplayObject*)o);`);
         }
       }
       this.indent--;
@@ -24656,10 +26117,18 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       case 'vector': return `(${e.code} == NULL ? (char*)"null" : as_vector_${this.vectorCName(e.type.elem)}_join(${e.code}, ","))`;
       case 'record': return '"[object Object]"';
       case 'any': return `as_v_str_val(${e.code})`;
-      case 'function': return '"function"';
+      // AIR stringifies ANY function value to the constant "function Function() {}" --
+      // a builtin, a bound method closure and an anonymous closure alike -- but a
+      // NULL function to "null" (measured on adl 51.4.1, temp/apv/adl). The old
+      // placeholder "function" was neither. Same null-check shape as the vector case
+      // above, so the operand keeps being mentioned exactly once.
+      case 'function': return `(${e.code} == NULL ? (char*)"null" : (char*)"function Function() {}")`;
       case 'class': return `as_class_str(${e.code})`;
-      // XML/XMLList stringify to their markup (XML.toString()).
-      case 'xml': return `as_xml_to_string(${e.code})`;
+      // XML stringifies to its E4X string VALUE (text when the element has no
+      // element children, else the markup) and XMLList to its list string value --
+      // this is XML.toString()/XMLList.toString() (measured on adl 51.4.1,
+      // temp/tkmeet-mac/xmlstr).
+      case 'xml': return `as_xml_string_value(${e.code})`;
       case 'xmllist': return `as_xml_list_to_string(${e.code})`;
       // Dictionary/RegExp have no recoverable source text here (as_regex keeps only
       // compiled instructions); render the class form used by vectorElemToStr.
@@ -25794,12 +27263,60 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       }
       const builtin = this.emitGlobalCall(callee.name, expr.args);
       if (builtin) return builtin;
-      // AS3 cast syntax `Type(expr)`: a single-argument call whose callee names
-      // a known user class/interface is a checked cast (semantically `expr as
-      // Type`). Guard with hasClass so plain free functions are never misread.
+      // AS3 `Type(expr)`: a ONE-argument call whose callee names a known
+      // class/interface is a type CONVERSION, not `new`. Guarded with hasClass so
+      // plain free functions are never misread. Measured on adl 51.4.1
+      // (temp/errcall, temp/errcall4, temp/errnew) -- three shapes live here:
+      //
+      //   1. The native Error family CONSTRUCTS: `Error(x)` is `new Error(x)`
+      //      (temp/errcall, temp/errnew) and `name` is the subclass's own. AIR keeps
+      //      the operand in an UNTYPED slot, with NO conversion -- measured on
+      //      adl 51.4.1 (temp/errnull): `Error(null).message === null`,
+      //      `Error(undefined).message === undefined` and `Error(5).message === 5`
+      //      (typeof "number") are all true; a Number/object message only
+      //      stringifies when it is USED (5 + "" -> "5", {} -> "[object Object]").
+      //      This build keeps the pre-existing `char*` String slot for `message`
+      //      (dozens of read sites treat it as a String), so the operand coerces
+      //      at construction instead -- which is why `Error(undefined).message`
+      //      here is "null" where AIR gives undefined. Recorded divergence, see
+      //      docs/zh-cn/as3-semantics.md §3. A USER
+      //      subclass of Error, and AIR's own flash.errors subclasses
+      //      (IOError/EOFError/SQLError/...), COERCE instead -- the constructor
+      //      call behaviour belongs to the native classes alone (temp/errsub).
+      //      RegExp constructs too (`RegExp("a")` is a RegExp whose source is "a"),
+      //      and so does the E4X-transparent Namespace stub (its uri is not
+      //      modelled, see symbols.ts).
+      //      This used to fall through to a bare C pointer cast: `(Error*)("msg")`
+      //      boxed a STRING BODY as a tag-4 object, so the first `catch (e:Error)`
+      //      read that text as a vtable and SIGSEGV'd. That was the
+      //      talkmed-meeting close-the-window crash (`throw Error('...')` in
+      //      ANECefWebView.destroy, 70 such sites in that app alone).
+      //   2. EVERY OTHER class COERCES -- and a coercion is a RUNTIME CHECK, not a
+      //      pointer cast: null/undefined -> null, an instance of the class (or a
+      //      subclass) -> that very instance, anything else -> TypeError #1034
+      //      ("cannot convert 5 to flash.display.Sprite."). as_v_req_inst is
+      //      exactly that rule and is already what a dynamic value landing in a
+      //      typed slot uses, so the conversion is shared rather than re-derived.
+      //   3. Interfaces keep their previous unchecked conversion (unchanged here).
       if (expr.args.length === 1) {
         const ct = this.rt(callee.name);
-        if (ct.kind === 'interface' || (ct.kind === 'object' && this.symbols.hasClass(ct.className))) {
+        if (ct.kind === 'object' && this.symbols.hasClass(ct.className)) {
+          const cls = ct.className;
+          if (this.constructsOnCall(cls)) {
+            if (cls === 'Namespace') {
+              // Namespace is the documented E4X-transparent stub (no field is ever
+              // read); AIR puts the uri inside the object, this subset cannot, so
+              // the operand is evaluated for its side effects and dropped.
+              return { code: `((void)(${this.emitExpr(expr.args[0]).code}), Namespace_new())`, type: ct };
+            }
+            return this.emitNew({ kind: 'New', className: cls, args: expr.args });
+          }
+          const arg = this.emitExpr(expr.args[0]);
+          const ci = this.symbols.getClass(cls);
+          const fq = ci?.fqn ?? ci?.reflectFqn ?? cls;
+          return { code: `((${cls}*)as_v_req_inst(${this.boxExpr(arg)}, &${cls}_vt, "${this.escapeCString(fq)}"))`, type: ct };
+        }
+        if (ct.kind === 'interface') {
           return { code: this.convert(this.emitExpr(expr.args[0]), ct), type: ct };
         }
       }
@@ -25871,7 +27388,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         case 'record': formats.push('%s'); vals.push('"[object Object]"'); break;
         case 'object': formats.push('%s'); vals.push(`as_obj_to_str((void*)(${e.code}))`); break;
         case 'interface': formats.push('%s'); vals.push(`as_obj_to_str(${e.code}.obj)`); break;
-        case 'function': formats.push('%s'); vals.push('"function"'); break;
+        case 'function': formats.push('%s'); vals.push(`${e.code} == NULL ? (char*)"null" : (char*)"function Function() {}"`); break;
         case 'null': formats.push('%s'); vals.push('"null"'); break;
         case 'void': formats.push('%s'); vals.push('""'); break;
       }
@@ -26571,7 +28088,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         if (obj.type.kind !== 'xml') throw new CodegenError('localName() only on XML');
         return { code: `as_xml_local_name(${obj.code})`, type: { kind: 'string' } };
       case 'toString':
-        if (obj.type.kind === 'xml') return { code: `as_xml_to_string(${obj.code})`, type: { kind: 'string' } };
+        if (obj.type.kind === 'xml') return { code: `as_xml_string_value(${obj.code})`, type: { kind: 'string' } };
         return { code: `as_xml_list_to_string(${obj.code})`, type: { kind: 'string' } };
       case 'length':
         if (obj.type.kind === 'xmllist') return { code: `(${obj.code}->length)`, type: { kind: 'int' } };
@@ -27361,6 +28878,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       case 'isDebugger': return { code: 'false', type: { kind: 'bool' } };
       case 'touchscreenType': return { code: '"none"', type: { kind: 'string' } };
       case 'language': return { code: 'as_cap_language()', type: { kind: 'string' } };
+      // languages: the preferred-language list, most preferred first (an Array of
+      // BCP-47 strings whose first entry is the same as `language`). Read from the
+      // system locale like `language` — see as_cap_languages in runtime.ts.
+      case 'languages': return { code: 'as_cap_languages()', type: { kind: 'array' } };
       // serverString is AIR's url-encoded runtime fingerprint. Its exact byte format is
       // Adobe's own and is not reproduced; as_cap_server_string builds this build's
       // values in the same shape with a real per-process random component (see its
@@ -27669,7 +29190,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         if (e0!.type.kind === 'int64' || e0!.type.kind === 'uint64') {
           return { code: this.toInt32Expr(e0!), type: { kind: 'int' } };
         }
-        return { code: `((int)(${this.toNumberExpr(e0!)}))`, type: { kind: 'int' } };
+        // Every other source (Number, int, uint, Boolean, null, undefined, and the
+        // reference types AIR lets through) is ES3 ToNumber followed by ToInt32.
+        // This used to be a bare `(int)` cast, which is UNDEFINED BEHAVIOUR for
+        // out-of-range and NaN input: the same expression produced 1, 1073741824,
+        // 2147483647 or a garbage negative depending on the surrounding function
+        // (measured on arm64 -O2; temp/d31probe). AIR is well-defined -- to both
+        // ends of the range it WRAPS (int(1e10) = 1410065408, int(NaN) = 0,
+        // uint(1e10) = 1410065408) -- which is exactly what as_to_int32/
+        // as_to_uint32 implement (ECMA-262 §9.5).
+        return { code: `as_to_int32(${this.toNumberExpr(e0!)})`, type: { kind: 'int' } };
       }
       case 'uint': {
         if (e0!.type.kind === 'string') return { code: `as_to_uint32(as_str_to_number(${e0!.code}))`, type: { kind: 'uint' } };
@@ -27677,7 +29207,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         if (e0!.type.kind === 'int64' || e0!.type.kind === 'uint64') {
           return { code: this.toUint32Expr(e0!), type: { kind: 'uint' } };
         }
-        return { code: `((unsigned int)(${this.toNumberExpr(e0!)}))`, type: { kind: 'uint' } };
+        // ES3 ToNumber then ToUint32, never a bare cast (see the `int` case above).
+        return { code: `as_to_uint32(${this.toNumberExpr(e0!)})`, type: { kind: 'uint' } };
       }
       // int64(x) / uint64(x): the opt-in 64-bit conversion functions (AIR has no
       // such globals, so a name collision is impossible in a portable program).
@@ -27733,6 +29264,20 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         return { code: `as_xml_list_ctor(${this.boxExpr(e0!)})`, type: { kind: 'xmllist' } };
       }
       case 'Array': return this.emitArrayConstructor(args);
+      // The no-`new` Date call is the legacy ES3 Date FUNCTION: it ignores every
+      // argument and returns the CURRENT time as a String (measured on adl 51.4.1,
+      // temp/errcall4: Date(), Date(5) and Date(1,2) all equal
+      // `new Date().toString()`). This backend models Date as a constructor only,
+      // and Date.toString() is not the ES3 date string yet, so compiling the call
+      // would have to invent an answer -- refuse it loudly instead of emitting the
+      // bare pointer cast the one-argument class-call rule used to produce
+      // (`(Date*)(5)`, which read an integer as a Date struct). mxmlc rejects the
+      // 0- and 2-argument spellings outright ("参数的数量不正确。要求 1 个").
+      case 'Date':
+        throw new CodegenError(
+          'the no-new Date(...) call (AIR: the current time as a String) is not modelled by this subset; ' +
+          'use new Date() and its accessors instead'
+        );
       // flash.geom value types constructible without `new` (Point(x, y) etc.).
       case 'Point':
       case 'Rectangle':
@@ -27757,8 +29302,23 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           case 'xmllist':
             return { code: e.code, type: e.type };
           case 'any':
-            return { code: e.code, type: { kind: 'any' } };
-          default: // int / uint / number / bool / string / null / void -> box
+            // A dynamic operand has to be checked at run time: AIR gives a new empty
+            // Object for null/undefined here too, and the identity for everything
+            // else (see as_obj_conv).
+            return { code: `as_obj_conv(${e.code})`, type: { kind: 'any' } };
+          // Object(null) / Object(undefined) is the ONE case that is not the
+          // identity: AIR hands back a NEW EMPTY Object (measured on adl 51.4.1,
+          // temp/d31probe/adl: `Object(null) == null` is false and
+          // `String(Object(null))` is "[object Object]", same for undefined).
+          // Boxing the null through as_v_to_obj gave back a null-box instead, so
+          // `Object(null) === null` was true here and "null" was printed.
+          // A statically null/void source is the only shape that can reach this.
+          // Same shape as the no-argument `Object()` above: a fresh dynamic object
+          // (as_object_new).
+          case 'null':
+          case 'void':
+            return { code: 'as_object_new()', type: { kind: 'record' } };
+          default: // int / uint / number / bool / string -> box
             return { code: this.boxExpr(e), type: { kind: 'any' } };
         }
       }
@@ -28084,7 +29644,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       case 'object': case 'interface':
         return { code: `as_ptr_typeof((void*)${o.code})`, type: { kind: 'string' } };
       case 'array': case 'vector': case 'record': case 'dict':
-      case 'regexp': case 'class': case 'xml': case 'xmllist': return lit('object');
+      case 'regexp': case 'class': return lit('object');
+      // E4X has its own typeof bucket in AIR: "xml" for BOTH XML and XMLList
+      // (measured on adl 51.4.1, temp/d31probe/adl -- statically typed, in an
+      // `*` slot, and in an Object slot, all four report "xml").
+      case 'xml': case 'xmllist': return lit('xml');
       case 'null': return lit('object'); // AS3: typeof null == "object"
       case 'any': return { code: `as_v_typeof(${o.code})`, type: { kind: 'string' } };
       case 'void': return lit('undefined');
@@ -28614,11 +30178,15 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     if (expr.className === 'String' || expr.className === 'Number' || expr.className === 'Boolean' || expr.className === 'int' || expr.className === 'uint') {
       if (expr.args.length > 1) throw new CodegenError(`new ${expr.className}() takes at most 1 argument`);
       // Zero-argument wrapper constructors: `new String()` is the empty string,
-      // `new Number()` is NaN, `new Boolean()` is false, `new int()/uint()` is 0
-      // (equivalent to the same conversion functions called with no argument).
+      // `new Number()` is 0 (the constructor's `value:Object = 0` default -- NOT
+      // the NaN that the zero-argument CONVERSION `Number()` yields, which is
+      // why the two cannot share an implementation; measured on adl 51.4.1,
+      // temp/d31probe/adl-litnum.txt), `new Boolean()` is false, `new int()/uint()`
+      // is 0. An EXPLICIT undefined/null argument takes the ordinary conversion
+      // path instead: `new Number(undefined)` is NaN, `new Number(null)` is 0.
       if (expr.args.length === 0) {
         if (expr.className === 'String') return { code: '""', type: { kind: 'string' } };
-        if (expr.className === 'Number') return { code: 'NAN', type: { kind: 'number' } };
+        if (expr.className === 'Number') return { code: '0', type: { kind: 'number' } };
         if (expr.className === 'Boolean') return { code: 'false', type: { kind: 'bool' } };
         return { code: '0', type: { kind: expr.className === 'uint' ? 'uint' : 'int' } };
       }
@@ -29046,6 +30614,17 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   private condExpr(e: { code: string; type: CType }): string {
     if (e.type.kind === 'any') return `as_v_truthy(${e.code})`;
     if (e.type.kind === 'interface') return `(${e.code}.obj != NULL)`;
+    // The Object ROOT cannot be tested as a bare pointer. Our Object-typed slots
+    // BOX scalars (as_number_new/as_string_new/as_boolean_new), so a slot holding
+    // false, an empty string or 0 is a non-NULL object and a pointer test called it
+    // TRUE -- while AIR keeps the primitive in the slot and applies ITS ToBoolean
+    // (measured on adl 51.4.1 through a parameter, temp/apv/adl: false/""/0 -> F and
+    // true/"hi"/{}/a function -> T; typeof reports boolean/string/number, not
+    // object). Unboxing first reproduces that exactly; concrete subclasses never hold
+    // a boxed scalar, so they keep the pointer test.
+    if (e.type.kind === 'object' && (e.type as { className: string }).className === 'Object') {
+      return `as_v_truthy(as_obj_to_value((void*)(${e.code})))`;
+    }
     // A statically-number-typed condition must not rely on C's own test: `if (d)`
     // calls NaN true, while AS3 calls it false (`if (0/0)` must not run). The
     // helper also keeps the operand mentioned exactly once.
@@ -29205,6 +30784,31 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   // Convert a value expression to the target type where a C cast is required.
   private isRefType(t: CType): boolean {
     return t.kind === 'string' || t.kind === 'object' || t.kind === 'array' || t.kind === 'vector' || t.kind === 'record' || t.kind === 'interface' || t.kind === 'function' || t.kind === 'regexp' || t.kind === 'xml' || t.kind === 'xmllist';
+  }
+
+  // AIR's NATIVE Error classes: Error itself plus the subclasses avmplus defines
+  // in playerglobal (their ErrorClass carries a CALL behaviour, so a one-argument
+  // call to one of these CONSTRUCTS). The pure-AS3 subclasses that live in
+  // flash.errors (IOError, EOFError, IllegalOperationError, SQLError,
+  // IllegalArgumentError, MemoryError, ...) are NOT in this set -- measured on adl
+  // 51.4.1, temp/errsub: `IOError(5)` reports TypeError #1034 "cannot convert 5 to
+  // flash.errors.IOError", `IllegalArgumentError(5)` does not even compile
+  // ("may be undefined"), while `SecurityError(5)` is a SecurityError with message
+  // "5". A USER subclass of Error behaves like flash.errors: `MyErr("x")` is
+  // #1034, never a construction.
+  private static readonly NATIVE_ERROR_CLASSES = new Set([
+    'Error', 'TypeError', 'RangeError', 'ArgumentError', 'SyntaxError',
+    'ReferenceError', 'DefinitionError', 'VerifyError', 'EvalError', 'URIError',
+    'UninitializedError', 'SecurityError',
+  ]);
+
+  // Does a one-argument class call on `cls` CONSTRUCT in AIR? True for the native
+  // Error family (see above), RegExp (`RegExp("a")` is a RegExp whose source is
+  // "a") and the E4X-transparent Namespace stub. Everything else -- user classes
+  // (including a user subclass of Error), Sprite, ByteArray, Vector -- COERCES.
+  // Measured on adl 51.4.1: temp/errcall, temp/errcall4, temp/errsub.
+  private constructsOnCall(cls: string): boolean {
+    return Emitter.NATIVE_ERROR_CLASSES.has(cls) || cls === 'RegExp' || cls === 'Namespace';
   }
 
   private describeType(t: CType): string {

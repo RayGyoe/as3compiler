@@ -729,3 +729,43 @@ registerGroup('unit: build/Features', checkFeatures);
 registerGroup('unit: build/WasmExport', checkWasmExport);
 registerGroup('unit: build/DocumentedLinkSets', checkDocumentedLinkSets);
 registerGroup('unit: air-app/DescriptorComments', checkAirAppDescriptorComments);
+
+// --- vendor/skia 本地补丁的出处守卫（阶段一百六十七）------------------------
+// The macOS arm64 libskia.a we ship is NOT the upstream prebuilt: it is compiled
+// from build-tools/skia-src with the patch below applied. Nothing in this repo can
+// verify a binary's internals, so what we pin is PROVENANCE — the patch file that
+// documents the change must exist, must still carry both halves of the fix, must
+// target the file it claims, and must be referenced by the doc that explains it.
+// Losing that trail is how a future "rebuild skia from a clean tree" silently
+// reintroduces the CoreText face switch.
+function checkSkiaLocalPatch(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [skia-patch] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [skia-patch] ${label}`); }
+  };
+  const patchPath = join(root, 'vendor', 'skia', 'patches', 'skia-m124-ct-exact-copy-keep-face.patch');
+  check('the local patch file exists', existsSync(patchPath));
+  if (!existsSync(patchPath)) { return bad; }
+  const patch = readFileSync(patchPath, 'utf8');
+  // 1) Both halves of the fix: the file-identity helper and its use as the guard.
+  check('the patch defines the file-identity helper', patch.includes('sk_fonts_share_file(CTFontRef a, CTFontRef b)'));
+  check('the patch keeps the base face when the copy switched files',
+    patch.includes('!sk_fonts_share_file(baseFont, copy.get())')
+    && patch.includes('CTFontCreateCopyWithAttributes(baseFont, textSize, nullptr, nullptr)'));
+  // 2) It must land on the CoreText per-size copy, not on the shaper (the bug is
+  //    "the rasterizer's face changed", see docs/zh-cn/skia.md §6.9).
+  check('the patch targets SkCTFontCreateExactCopy.cpp',
+    patch.includes('a/src/utils/mac/SkCTFontCreateExactCopy.cpp'));
+  check('the patch carries the stage marker', patch.includes('阶段一百六十七'));
+  // 3) Doc/patch must not drift apart: the doc is the only place a human learns
+  //    that this library needs a patch at all.
+  const doc = readFileSync(join(root, 'docs', 'zh-cn', 'skia.md'), 'utf8');
+  check('docs/zh-cn/skia.md points at the patch',
+    doc.includes('skia-m124-ct-exact-copy-keep-face.patch'));
+  console.log(`[skiapatch] ${ok} skia local-patch checks passed`);
+  return bad;
+}
+
+registerGroup('unit: build/SkiaLocalPatch', checkSkiaLocalPatch);

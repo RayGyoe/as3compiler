@@ -70,7 +70,9 @@
     "ASC_DISPLAY_HIGH=1",
     "ASC_RENDER_WINGPU=1",
     "ASC_RENDER_METAL=1",
-    "ASC_HAVE_CURL=1"
+    "ASC_HAVE_CURL=1",
+    "ASC_APP_ID=\"demo.as3.native\"",
+    "ASC_SWF_PATH=\"main.swf\""
   ],
   "features": [],
   "objects": []

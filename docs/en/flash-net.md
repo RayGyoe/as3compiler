@@ -137,6 +137,27 @@ new request's domain/whole URL with a redirected request's URL).
 
 > `URLRequest` is `final`, constructor `URLRequest(url:String = null)`.
 
+> **How `method`'s case is handled (measured on `adl 51.4.1`, `temp/httpverb/`)**: `method` is
+> **case-insensitive**, but the property itself **keeps the spelling it was assigned** and is only
+> **normalized to UPPERCASE before it reaches the wire**. Measured against a local echo server:
+>
+> | Assigned | `req.method` reads back | Method on the wire | Where `data` goes |
+> |---|---|---|---|
+> | nothing (ctor default) | `GET` | `GET` | query (`/p?a=1&b=x%20y`, empty body) |
+> | `"get"` | `get` | `GET` | query |
+> | `"GET"` | `GET` | `GET` | query |
+> | `"pOsT"` | `pOsT` | `POST` | request body |
+> | `"put"` | `put` | `PUT` | request body |
+>
+> In other words "fold into the query vs send as the body" and "the verb's spelling on the wire"
+> are **one and the same case-insensitive rule**, while the value read back from the property is
+> **not** rewritten. We used to decide with a literal `strcmp(method, "GET")`, so `method="get"`
+> (which is exactly how the TalkMED login page fetches its graphical captcha) both left `data` in
+> the body **and** sent the lowercase verb verbatim ⇒ the server answered 405 ⇒ the app surfaced
+> `Error #2032: Stream Error`. The fix uppercases **once** at the serialization seam
+> (`net__prepare_request`, stage 154), which makes the downstream `strcmp(..., "GET")`/`"POST"`/
+> `"HEAD"` correct; pinned by `unit: transport/RequestMethod`.
+
 ### 2.4 `URLRequestMethod` ([official page](https://airsdk.dev/reference/actionscript/3.0/flash/net/URLRequestMethod.html))
 
 `final` constant class (**6**, one more than the GET/POST most people assume): `GET`, `POST`, `PUT`, `DELETE`,
@@ -182,6 +203,36 @@ the server, paired with `URLRequest.data`.
 | constructor | `URLVariables(source:String = null)` | **if a string is passed, `decode()` is called automatically** |
 | `decode` | `decode(source:String):void` | "converts a variable string into properties"; **a non-URL-encoded name/value string throws `Error`** |
 | `toString` | `toString():String` | returns all enumerable variables encoded as **`application/x-www-form-urlencoded`** |
+
+**How `toString()` encodes (measured on `adl 51.4.1`, `temp/uvarair/`)**: the safe set is
+**`[A-Za-z0-9]` only** — every other byte becomes `%XX` (uppercase hex, one `%XX` per UTF-8 byte),
+and it applies to **both the key and the value**. This is **not** the `encodeURIComponent` safe set:
+`-` `_` `.` `~` are encoded too (`s_-.~` → `s%5F%2D%2E%7E`), `+` becomes `%2B` rather than a literal
+plus, and `%` becomes `%25` (so `%41` is not read back as `A`). A non-String value goes through its own
+`String` form first (`null`→`null`, `true`→`true`, `1.5`→`1%2E5`); an empty object → the empty string;
+`'\u0000'` terminates the string (`a="\u0000x"` yields `a=`, length 2).
+
+> **The heap overflow this used to cause (stage 153, fixed)**: the encoded form can be 3x the raw one,
+> while the destination buffer was sized from the **raw** length (`strlen(raw)`), so the write ran off
+> the end. The TalkMED desktop build's SMS-code login request carries a 159-byte `device_info` JSON that
+> encodes to 285 bytes ⇒ 126 bytes past the end, landing on the first word of the neighbouring GC block
+> (a free-list `next`), and the heap collapsed seconds later in `gc_sweep_step` / `as_render_fp` with a
+> **faulting address that was literally the ASCII of the encoded body**. The buffer is now sized by
+> `as_url_encoded_len()` and filled by `as_url_encode_into()` (one shared rule) — see
+> `examples/urlvars-encode.as` and `unit: emit/UrlVarEncoding`.
+
+**How `decode()` decodes (same `adl`, same probe)**: this is **form decoding**
+(`application/x-www-form-urlencoded`), **not** URI decoding, and it applies **the same rule to both
+halves of a pair** — a `%XX` escape **and a literal `+`** (a space) are decoded **in the key too**.
+`new URLVariables("a%20b=c%20d")` answers the **key `a b`** (not `a%20b`) while `toString()` emits
+`a%20b=c%20d` again: that round trip **only closes because the key was decoded on the way in**; and
+`new URLVariables("p+q=1")` answers the **key `p q`**. (Storing keys raw, on the assumption that "AIR
+decodes values but not keys", was an unverified guess — corrected in stage 154.) `decode()` only
+splits, it does not validate (see the table row above), and `k=` decodes to an empty value.
+
+> **Property-order divergence (kept)**: AIR walks its dynamic-property hash order, we use insertion
+> order (deterministic output). A single property is identical; with several, the order can differ
+> (`{num,n2,b,nul}` comes out as `nul,num,b,n2` on AIR).
 
 ### 2.8 `URLStream` ([official page](https://airsdk.dev/reference/actionscript/3.0/flash/net/URLStream.html))
 
@@ -285,6 +336,7 @@ content via `progress`/`complete`, rather than `ioError`".
 | `URLLoaderDataFormat` (TEXT/BINARY/VARIABLES) | `symbols.ts:1342` | ✅ three constants |
 | `HTTPStatusEvent` (`status`/`responseURL`/`responseHeaders`/`redirected`) | `symbols.ts:1954` / `emit.ts:3780` | ✅ **all four properties filled** (eighty-nine / fifty-one): `status` takes the response status code; `responseHeaders` is parsed from the header block before the backend's first chunk into a `URLRequestHeader` array (**on the web side header names are normalized to lowercase by the browser**, faithfully reflected); `responseURL` is the **effective URL** (the final address after redirects, copied into the GC rather than pointing at the job); `redirected` is given by the backend's redirect count. **The two events divide the work** (eighty-nine / fifty-two): `httpStatus` **carries only `status`** (`responseURL=null`, `responseHeaders` an empty array, `redirected=false`), and `httpResponseStatus` is the one that carries url/headers/`redirected`; 4xx/5xx are successful loads and dispatch `complete` |
 | `URLStream` (`load`/`close`/13 `read*`/`bytesAvailable`/`connected`/`endian`/`objectEncoding`) | `symbols.ts:1385` / `emit.ts:4450` | ✅ **new** (eighty-nine / fifty-one): a streaming job; `bytesAvailable` grows as data arrives; `read*` is non-blocking and throws `EOFError #2030` when data is insufficient, and throws a plain `Error` when "never opened at all"; `close()` throws `#2029`; on completion the unconsumed remainder is **copied** into a GC `ByteArray` before clearing `_job` (the copy happens before the terminal event is dispatched, so a listener can read the tail). `readObject` is not implemented (AMF depends on ObjectEncoding, see §3.2) |
+| `SharedObject` (local store: `getLocal`/`data`/`flush`/`clear`/`size`/`client`/`objectEncoding`/`getRemote`) | `emit.ts:13768` onward | ✅ **local half** (since eighty-nine / forty), and **byte-compatible with AIR since stage one hundred and fifty**: it writes AIR's own path and container (the AMF3 `.sol`), so the two runtimes can read each other's stores (see §6.9). `getRemote`/`connect`/`send` need a Flash Media Server and **fail loudly** rather than silently |
 | `SecurityErrorEvent` (`SECURITY_ERROR`, `text`) | `symbols.ts:1978` | ⚠️ **still never dispatched** (this machine has AIR's application-sandbox semantics, so there is no source that would refuse); missing `CERTIFICATE_ERROR`. See also §4.4 |
 
 ### 3.2 Still unimplemented (beyond A/B)
@@ -1258,6 +1310,101 @@ like "the default was changed but the example was missed".
 - Still pending: automated **byte-for-byte consistency** regression when all three ends **simultaneously** have
   a backend (currently relying on two probe sets' same-family assertions + manual comparison).
 
+### 6.9 `SharedObject` local store: two-way interoperability with AIR's `.sol` — **executed (stage one hundred and fifty; closed bidirectionally on the real app at stage one hundred and fifty-eight)**
+
+Background: see **D11** of `talkmed-meeting-aot-vs-adl-diff.md`. The desktop app stores prefilled data
+(the login account) in a local shared object. Before this stage we wrote `<storage>/<name>.json` (JSON text)
+while AIR writes an AMF3 `.sol` container, so **the two runtimes could not see each other's store** (the AOT
+build lost the prefilled account on start-up) — a user-visible divergence.
+
+**Path and naming** (ground truth: `adl 51.4.1`, probes `temp/solprobe2..C`):
+
+```
+<applicationStorageDirectory>/#SharedObjects/[<descriptor <content>>/][<localPath>/]<encoded name>.sol
+```
+
+- `applicationStorageDirectory` is scoped by the descriptor `<id>`: on macOS it is
+  `~/Library/Application Support/<id>/Local Store`. The descriptor's id / content reach the generated C as
+  `-DASC_APP_ID` / `-DASC_SWF_PATH` (injected automatically by `air-app.ts`); a bare build defaults to
+  `"as3aot"` / empty (empty drops the `<content>` level, the same shape AIR produces with no SWF).
+- **Name encoding**: every component of a local-store path is capped at 31 bytes. The file keeps the name's
+  **last 27 characters** + `.sol`; the remaining prefix is folded, **from the end**, into directories of at most
+  **30** characters, each suffixed with `#`. Measured: the 35-character
+  `eDoctor_TalkMED_Meeting_Windows_DEV` becomes `eDoctor_#/TalkMED_Meeting_Windows_DEV.sol`, and an
+  80-character name becomes `<23>#/<30>#/<27>.sol`
+  (`head = prefix > 30 ? (prefix % 30 == 0 ? 30 : prefix % 30) : prefix`).
+- ⚠️ **§1.5 disclosure**: for names containing `#`/`:`/spaces/`\`/`?` AIR either raises
+  `Error #2134: Cannot create SharedObject` outright or switches to `#XX` escaping / a hashed directory;
+  **this subset does not reproduce that** — such names are written literally (TalkMED's shared object name
+  only uses `[A-Za-z_]`, so it is unaffected).
+
+**Byte format** (measured over 12+ real `.sol` files / 7 value types):
+
+```
+00 BF | u32BE(fileSize - 6) | "TCSO" | u16 4 | u32 0 | u16 nameLen | name
+      | 00 00 00 03 | ( U29S key | AMF3 value | 00 )*
+```
+
+- A key is a **bare U29S** (no `0x06` type marker), so a repeated key text is written as a **reference**.
+- **One** AMF3 string table spans the whole file and it **starts empty** (no implicit `""` slot: a repeated
+  value references index 1, not 2).
+- Neither the **class name** nor the **end-of-dynamic-members marker** of an object enters the string table, but
+  a **dynamic member NAME does** (same rule as a string value; only the empty terminator is exempt). The marker
+  was the last off-by-one fixed in this stage: our AMF3 writer used to intern the marker's empty string, which
+  shifted every later index, so AIR read a repeated string back as the **wrong** value (measured: `same` came
+  back as `dup2`). Writer and reader now both match AIR (`as_amf3_wstr_endmark` / `as_amfr_str_endmark`), pinned
+  by `examples/sharedobject.as` and the `[solstore]` group in `test/unit/transport.ts`.
+- **A dynamic member name takes a slot on the READ side too (stage one hundred and fifty-eight)**: AIR interns every non-empty dynamic
+  property name into the same table — measured on `temp/solread/adl-login-2617.sol`, where the value of the
+  `email` member of `User_Local_Info` is the **reference 14**, which only holds if `accessToken`…`realname`
+  (13 names) occupy slots 1..13. We interned string **values** but not **names** (the writer was right, the
+  reader was not), so reading a real store ran off our own table: `User_Local_Info` died half-way and **every
+  later entry was abandoned**, `refresh_token_timer` read back as `undefined`, `LoginView`'s
+  `now < Number(...)` became `NaN`, the auto-login gate was always false and **every launch ran
+  `clearLoginSession()`** (the user-visible symptom: log in, restart, log in again). Fix: `as_amfr_str_endmark()`
+  calls `as_amfr_addstr()` for names with `n > 0`; the empty terminator still takes no slot.
+  `examples/sharedobject.as` now also asserts that a second entry *after* a dynamic object survives, pinning the
+  entry-loss consequence.
+- **The empty string never takes a slot (stage one hundred and fifty-eight)**: AIR writes an empty value as the literal `06 01`
+  every single time and **never enters it into the table**. Measured on `temp/solread/adl-login-2617.sol`: all four
+  empty values in `userInfo` (`realname` / `email` / `wechat_openid` / `mini_program_openid`) are literals, none a
+  reference. Both of our sides used to intern the **first** empty string that appeared (the writer entered it, so did
+  the reader), which made the table one entry too long from that point on and shifted **every later reference**: when
+  adl read a store WE had written, `"email":""` came back as `"mobile"`, the `title` / `app_menu` keys of
+  `companyList[i]` disappeared entirely, and `HomeView.getTextBtn` was handed a `null` title and threw **#2007**
+  (`Parameter text must be non-null`, `HomeView.as:609`) -- the real root cause of D21's *reverse* direction.
+  Fix: `as_amf3_wstr_body()` emits the literal `1` directly for `n == 0` (no lookup, no insert), and
+  `as_amfr_str_body()` calls `as_amfr_addstr()` only for `n > 0`. `examples/sharedobject.as` §4c pins the
+  **shift** consequence with two empty literals followed by a repeated value reference, and the `[solstore]`
+  group in `test/unit/transport.ts` gains 3 more checks.
+- `SharedObject.size` is the **total serialized byte count** of the `.sol`, and **0** for an empty table; it
+  does not wait for `flush()` (adl reports the projected size even before the first flush).
+
+**Acceptance (two-way interop, `temp/sotest/`)**: one pair of write/read probes and one `app.xml`
+(id `solprobe9`, content `Main.swf`); the AOT manifest injects the same define pair, so both ends point at
+one `.sol` file:
+
+| Direction | Command | Result |
+|---|---|---|
+| **AOT writes → adl reads** | `node src/index.ts temp/sotest/ours.as --manifest temp/sotest/aot.build.json -o temp/sotest/ours`, then `adl application.xml bin` | The path matches character for character (`#SharedObjects/Main.swf/<encoded name>.sol`); `size_empty=0` and `size=266` are **byte-for-byte identical** to adl's own file; adl reads all 8 properties back correctly, including the repeated string (`dup=same|same`) |
+| **adl writes → AOT reads** | `cd temp/sotest && cp MainWrite.as Main.as && sh ../tryadl.sh .`, then run the AOT read probe | The AOT build reads all 8 properties back correctly, `size=266` |
+
+**Second round (stage one hundred and fifty-eight, the two directions that showed up in the real app)**: that
+266 B pair only proves "each side can read the other's file"; a string-table rule that is off by **one slot** only
+shows up on a **real** store (60+ strings, seven empty strings, dozens of dynamic names) — a 266 B sample never
+reaches those paths. On the real app the verification looked like this:
+
+| Direction | How | Result |
+|---|---|---|
+| Locating tool | `temp/soread2/`: drop the store **we** wrote into its storage path and let `adl` `for..in`-dump the whole tree (**black-box oracle**) | The first divergence becomes visible immediately (`userInfo.email` resolving as `mobile`) |
+| **AOT writes → adl reads** | `temp/soempty/`: one `app.xml`, one define pair; AOT writes, `adl` reads | `u.email=[]` and `app_menu[0].title=menu-0` all correct; both files exactly **273 B** |
+| **adl writes → AOT reads** | the same, with the direction flipped | all correct |
+| **Real app, end to end** | log in as `1**********` → home shows `Ray.lei1` → kill the process and relaunch → no login page | **goes straight to the home page**; the 2515 B `.sol`'s mtime is not rewritten by `clearLoginSession()`; screenshot `temp/tkmeet-mac/d21v-auto-login.png` (re-verified on a stage one hundred and fifty-eight binary with the same store) |
+
+`examples/sharedobject.as` pins the container shape into the regression set: it **hand-writes** a `.sol` in the
+byte format above and reads it back through `getLocal` (also pinning `00 BF` / `TCSO` / version 4 /
+`00 00 00 03` / the header name-length field), and asserts that `size` equals the actual file length.
+
 ---
 
 ## 7. `Socket` / `SecureSocket` / `ServerSocket` / `XMLSocket` (stage eighty-nine / fifty-three)
@@ -1353,7 +1500,7 @@ NUL cannot be observed via `readUTFBytes`, hence two separate reads), and `Secur
 | `DatagramSocket` (UDP) | ⏸ deferred (a different base from TCP: connectionless, no `flush` semantics, `send()` carries the target address) |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*`/RTMP | ❌ not done (depends on FMS / audio-video, out of scope) |
 | `FileReference`/`FileReferenceList` (file upload/download dialogs) | ⏸ deferred (depends on native file dialogs) |
-| `registerClassAlias`/`getClassByAlias` (AMF) | ⏸ deferred (`SharedObject` is already modeled per AIR semantics; AMF serialization as needed) |
+| `registerClassAlias`/`getClassByAlias` (AMF) | ✅ **done**: the AMF3 codec behind `ByteArray.readObject`/`writeObject`, aliases (a base-class alias covers its subclasses) and the error paths have all landed (`examples/stage94d.as`); since stage one hundred and fifty the `SharedObject` local store uses the same AMF3 codec and is byte-compatible with AIR's `.sol` (see §6.9) |
 | HTTP/2, cookie jar, proxy | ✅ **done (stage eighty-nine / fifty-three)**: HTTP/2 = `ASC_HTTP2` (still 1.1 by default), cookie jar = process-level `CURLSH`, proxy = environment variables + the system proxy |
 | gzip, HTTP caching, HTTP authentication | ⏸ as needed (gzip depends on the `zstd`/`brotli` trade-off beyond building `libz`; `setLoginCredentialsForHost` is still deferred) |
 

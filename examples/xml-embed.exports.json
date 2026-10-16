@@ -1,0 +1,4 @@
+{
+  "wasm": "xml-embed.wasm",
+  "exports": []
+}

@@ -74,8 +74,14 @@ export function checkLogicalOperandPassThrough(): string[] {
     intInt.includes('(g_i ? g_j : g_i)') && !intInt.includes('as_v_truthy'));
 
   const objOr = mainOf('var o:Object = null;\nvar p:Object = null;\nvar r:* = (o || p);\ntrace(r);\n');
+  // The RESULT still passes references through unboxed (which is what this pin
+  // exists for: no as_v_req_* on the pass-through operand). The CONDITION, however,
+  // must apply AS3 truthiness to the Object slot rather than a bare pointer test:
+  // our Object slots BOX scalars, so a slot holding false/""/0 is a non-NULL object
+  // and the pointer test called it TRUE where AIR calls it false (measured on
+  // adl 51.4.1 through a parameter, temp/apv/adl).
   check('`Object || Object` still passes references through unboxed',
-    objOr.includes('(g_o ? g_o : g_p)') && !objOr.includes('as_v_truthy'));
+    objOr.includes('(as_v_truthy(as_obj_to_value((void*)(g_o))) ? g_o : g_p)') && !/\bas_v_req_\w*/.test(objOr));
 
   return bad;
 }

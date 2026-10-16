@@ -119,6 +119,24 @@ POST 数据内存分配失败）、`SecurityError`（本地不可信文件联网
 
 > `URLRequest` 是 `final`，构造器 `URLRequest(url:String = null)`。
 
+> **`method` 的大小写口径（`adl 51.4.1` 实测，`temp/httpverb/`）**：`method` **不区分大小写**，
+> 但属性本身**原样保存**赋值时的拼写、**上线前才规范成大写**。本地回显服务器实测：
+>
+> | 赋值 | `req.method` 读回 | 线上方法 | `data` 去向 |
+> |---|---|---|---|
+> | 不赋值（构造器默认）| `GET` | `GET` | query（`/p?a=1&b=x%20y`，体为空）|
+> | `"get"` | `get` | `GET` | query |
+> | `"GET"` | `GET` | `GET` | query |
+> | `"pOsT"` | `pOsT` | `POST` | 请求体 |
+> | `"put"` | `put` | `PUT` | 请求体 |
+>
+> 也就是说「折进 query 还是进 body」与「线上动词拼写」是**同一条大小写无关规则**，而属性读回值
+> **不**被改写。我们原先按字面 `strcmp(method, "GET")` 判定，于是 `method="get"`（TalkMED 登录页
+> 取图形验证码就是这样调的，见下）既把 `data` 留在请求体里、又把小写动词 `get` 原样发给服务器
+> ⇒ 服务器回 405 ⇒ 应用侧表现为 `Error #2032: Stream Error`。修法是在序列化缝
+> `net__prepare_request` 处**一次性 `as_str_toUpper`**（阶段一百五十四），使下游的
+> `strcmp(..., "GET")`/`"POST"`/`"HEAD"` 全部正确；单元钉 `unit: transport/RequestMethod`。
+
 ### 2.4 `URLRequestMethod`（[官方页](https://airsdk.dev/reference/actionscript/3.0/flash/net/URLRequestMethod.html)）
 
 `final` 常量类（**6 个**，比多数人以为的 GET/POST 多）：`GET`、`POST`、`PUT`、`DELETE`、`HEAD`、`OPTIONS`
@@ -161,6 +179,31 @@ AIR 默认设 `ACCEPT` 头为一串 MIME 列表（除非你在 `requestHeaders` 
 | 构造器 | `URLVariables(source:String = null)` | **若传字符串，自动调用 `decode()`** |
 | `decode` | `decode(source:String):void` | 「把变量串转成属性」；**非 URL 编码的 name/value 串会抛 `Error`** |
 | `toString` | `toString():String` | 返回 **`application/x-www-form-urlencoded`** 编码的全部可枚举变量 |
+
+**`toString()` 的编码口径（`adl 51.4.1` 实测，`temp/uvarair/`）**：安全字符集只有
+**`[A-Za-z0-9]`**——其余每个字节一律 `%XX`（大写十六进制，一个 `%XX` 对应一个 UTF-8 字节），
+**键与值都编码**。注意这**不是** `encodeURIComponent` 的安全集：`-` `_` `.` `~` 都被编码
+（`s_-.~` → `s%5F%2D%2E%7E`），`+` 编成 `%2B` 而非字面 `+`，`%` 编成 `%25`（所以 `%41` 不会被
+当 `A` 回读）。非字符串值先走各自的 `String` 形式（`null`→`null`、`true`→`true`、`1.5`→`1%2E5`）；
+空对象 → 空串；`'\u0000'` 终止字符串（`a="\u0000x"` 得到 `a=`，长度 2）。
+
+> **由此引出的一个堆溢出（阶段一百五十三，已修）**：编码后长度可达原始长度的 3 倍，而目标缓冲
+> 原来按**原始**长度分配（`strlen(raw)`），于是写出缓冲区末尾。TalkMED 桌面版的验证码登录请求
+> 带一个 159 字节的 `device_info` JSON，编码后 285 字节 ⇒ 越界 126 字节写进相邻 GC 块的首字
+> （空闲链表的 `next`），几秒后 `gc_sweep_step` / `as_render_fp` 崩溃，**故障地址正是编码正文的
+> ASCII**。现在缓冲按 `as_url_encoded_len()` 分配、由 `as_url_encode_into()` 填充（同一套规则，
+> 见 `examples/urlvars-encode.as` 与 `unit: emit/UrlVarEncoding`）。
+
+**`decode()` 的解码口径（同一台 `adl` 实测）**：这是 **form 解码**
+（`application/x-www-form-urlencoded`），**不是 URI 解码**，且**键与值走同一套规则** ——
+`%XX` 百分号转义**和字面 `+`**（一个空格）**两半都解**。`new URLVariables("a%20b=c%20d")`
+给出的**键是 `a b`**（不是 `a%20b`），而 `toString()` 又输出回 `a%20b=c%20d` —— 这个往返
+**只有键被解码才闭合**；`new URLVariables("p+q=1")` 的**键是 `p q`**。
+（曾按「AIR 解值不解键」实现并把键原样存下，那是**未经验证的假设**，阶段一百五十四更正。）
+`decode()` 只切分、不做合法性校验（见下表原文），空值 `k=` 解出空串。
+
+> **键序分歧（保留）**：AIR 按其动态属性的哈希序遍历，我们按插入序（确定性输出）。
+> 单属性无差异；多属性时输出顺序可能不同（`{num,n2,b,nul}` 在 AIR 为 `nul,num,b,n2`）。
 
 ### 2.8 `URLStream`（[官方页](https://airsdk.dev/reference/actionscript/3.0/flash/net/URLStream.html)）
 
@@ -255,6 +298,7 @@ AIR 默认设 `ACCEPT` 头为一串 MIME 列表（除非你在 `requestHeaders` 
 | `URLLoaderDataFormat`（TEXT/BINARY/VARIABLES） | `symbols.ts:1342` | ✅ 三常量 |
 | `HTTPStatusEvent`（`status`/`responseURL`/`responseHeaders`/`redirected`） | `symbols.ts:1954` / `emit.ts:3780` | ✅ **四个属性全填**（八十九·五十一）：`status` 取响应状态码；`responseHeaders` 由后端首块前的头区解析成 `URLRequestHeader` 数组（**web 侧键名被浏览器规范化为小写**，如实反映）；`responseURL` 是**有效 URL**（重定向后的最终地址，GC 拷贝而非指向 job）；`redirected` 由后端重定向计数给出。**两个事件分工**（八十九·五十二）：`httpStatus` **只带 `status`**（`responseURL=null`、`responseHeaders` 空数组、`redirected=false`），`httpResponseStatus` 才带 url/头/`redirected`；4xx/5xx 是成功加载且派 `complete` |
 | `URLStream`（`load`/`close`/13 个 `read*`/`bytesAvailable`/`connected`/`endian`/`objectEncoding`） | `symbols.ts:1385` / `emit.ts:4450` | ✅ **新增**（八十九·五十一）：流式 job，`bytesAvailable` 随数据到达增长，`read*` 非阻塞且数据不足抛 `EOFError #2030`，「根本没打开」抛普通 `Error`；`close()` 抛 `#2029`；完成时把未消费余量**拷贝**成 GC `ByteArray` 后清 `_job`（拷贝在派终态事件之前，监听器读得到尾巴）。`readObject` 未实现（AMF 依赖 ObjectEncoding，见 §3.2） |
+| `SharedObject`（本地存储：`getLocal`/`data`/`flush`/`clear`/`size`/`client`/`objectEncoding`/`getRemote`） | `emit.ts:13768` 起 | ✅ **本地半边**（八十九·四十 起），**阶段一百五十 起容器与 AIR 逐字节互通**：写在 AIR 的原路径原格式 `.sol`（AMF3 容器），两个运行时互相读得到对方的存档（见 §6.9）。`getRemote`/`connect`/`send` 需要 Flash Media Server，**诚实报错**而不静默 |
 | `SecurityErrorEvent`（`SECURITY_ERROR`、`text`） | `symbols.ts:1978` | ⚠️ **仍从不被派发**（本机即 AIR 的应用沙箱语义，没有会拒绝的源）；缺 `CERTIFICATE_ERROR`。另见 §4.4 |
 
 ### 3.2 仍未实现（A/B 之外）
@@ -1117,6 +1161,87 @@ AIR 没有这一信息（它总能联网），但丢掉它会让「被 CORS 拦�
   都在文档里写明，不用 make-believe 抹平。
 - 仍待：三端**同时**有后端时的**逐字节一致性**回归自动化（目前靠两套探针的同族断言 + 人工对照）。
 
+### 6.9 `SharedObject` 本地存储：与 AIR 的 `.sol` 双向互通 —— **已执行（阶段一百五十；双向在真机上闭环于阶段一百五十八）**
+
+背景见 `talkmed-meeting-aot-vs-adl-diff.md` 的 **D11**：桌面应用把登录账号等预填数据写进本地共享对象，
+而本轮之前我们写的是 `<storage>/<name>.json`（JSON 文本）、AIR 写的是 AMF3 的 `.sol` 容器，
+于是**两个运行时互相看不见对方的存档**（AOT 版启动后账号预填丢失），这是用户可见的差异。
+
+**路径与命名**（真值来源 `adl 51.4.1`，探针 `temp/solprobe2..C`）：
+
+```
+<applicationStorageDirectory>/#SharedObjects/[<描述符 <content>>/][<localPath>/]<编码名>.sol
+```
+
+- `applicationStorageDirectory` 由描述符 `<id>` 限定：macOS = `~/Library/Application Support/<id>/Local Store`。
+  描述符的 id / content 经 `-DASC_APP_ID` / `-DASC_SWF_PATH` 注入生成的 C（`air-app.ts` 自动注入），
+  裸构建缺省为 `"as3aot"` / 空（空则省掉 `<content>` 这一层，与 AIR 无 SWF 时同一形状）。
+- **名字编码**：本地存储**每个路径分量上限 31 字节**。文件名 = 名字**末 27 字符** + `.sol`；
+  其余前缀从**尾部**按 **30** 切成目录、每段后缀 `#`。实测：35 字符的
+  `eDoctor_TalkMED_Meeting_Windows_DEV` → `eDoctor_#/TalkMED_Meeting_Windows_DEV.sol`；
+  80 字符 → `<23>#/<30>#/<27>.sol`（`head = prefix > 30 ? (prefix % 30 == 0 ? 30 : prefix % 30) : prefix`）。
+- ⚠️ **§1.5 报明**：名字含 `#`/`:`/空格/`\`/`?` 等字符时 AIR 要么直接 `Error #2134: Cannot create SharedObject`、
+  要么另走 `#XX` 转义 / 哈希目录，**本子集不复现**——这类名字按字面写文件（TalkMED 的共享对象名仅含
+  `[A-Za-z_]`，不受影响）。
+
+**字节格式**（12+ 个真 `.sol` / 7 种值类型实测）：
+
+```
+00 BF | u32BE(文件长度-6) | "TCSO" | u16 4 | u32 0 | u16 nameLen | name
+      | 00 00 00 03 | ( U29S key | AMF3 value | 00 )*
+```
+
+- 键是**裸 U29S**（无 `0x06` 类型标记），故重复的键文本会写成**引用**；
+- **整文件共用一张** AMF3 串表，且**起始为空**（无隐式 `""` 槽：重复值引用的是 index 1 而非 2）；
+- **类名**与**对象动态成员的结束标记**都不进串表；但**动态成员的名字本身进表**（与字符串值同一条规则，
+  空命名空间的结束标记除外）。后者是本轮修掉的最后一个 off-by-one：我们的 AMF3 writer 曾把结束标记的
+  空串 intern 进表，于是 AIR 读回重复字符串时**错位**（实测把 `same` 读成 `dup2`）；现 writer/reader
+  两侧都与 AIR 对齐（`as_amf3_wstr_endmark` / `as_amfr_str_endmark`），`examples/sharedobject.as` 与
+  `test/unit/transport.ts` 的 `[solstore]` 组把它钉死。
+- **动态成员名进表（阶段一百五十八）**：AIR 的**读**也把非空动态属性名写进同一张表——实测
+  `temp/solread/adl-login-2617.sol`：`User_Local_Info` 的下一个成员 `email` 的值就是**引用 14**，
+  只有 `accessToken`…`realname` 共 13 个名字占掉槽 1..13 才成立。我们曾只 intern 字符串**值**、
+  不 intern **名字**（只对 writer 做对，reader 漏了），于是读真实存档时**自己越界**：`User_Local_Info`
+  在一半处崩掉、**后面所有条目一起丢**，`refresh_token_timer` 读回 `undefined`、`LoginView` 的
+  `now < Number(...)` 变 `NaN`、自动登录闸门恒假**每次都走 `clearLoginSession()`**（用户可见症状：登录
+  后重启又要重新登录）。修法：`as_amfr_str_endmark()` 对 `n > 0` 的键调 `as_amfr_addstr()`，
+  空结束标记仍不占槽。`examples/sharedobject.as` 新增「手写流 + 晚于动态对象的第二个条目」断言把
+  **丢条目**这个后果也钉住。
+- **空字符串不占槽（阶段一百五十八）**：AIR 把**空串**一律写成字面量 `06 01`，**永远不进表**。
+  实测 `temp/solread/adl-login-2617.sol`：`userInfo` 的四个空值（`realname`/`email`/`wechat_openid`/
+  `mini_program_openid`）**全是字面量**，没有任何一个变成引用。我们两侧都曾把**第一次**出现的空串
+  intern 进表（writer 进、reader 也进），于是从那一处起**表长多一项**、之后所有**引用**整体错位：
+  adl 读我们写的存档时 `"email":""` 解成 `"mobile"`、`companyList[i]` 的 `title`/`app_menu`
+  两个键**整个消失**，`HomeView.getTextBtn` 便拿到 `null` 标题抛 `#2007`
+  （`Parameter text must be non-null`，`HomeView.as:609`）——这正是 D21「反向」的真根因。
+  修法：`as_amf3_wstr_body()` 在 `n == 0` 时直接发字面量 `1`（不查表、不进表）、`as_amfr_str_body()`
+  只对 `n > 0` 调 `as_amfr_addstr()`。`examples/sharedobject.as` §4c 用「两个空字面量 + 之后的
+  重复值引用」把**错位**这个后果钉死；`test/unit/transport.ts` 的 `[solstore]` 组新增 3 钉。
+- `SharedObject.size` = `.sol` 序列化后的**总字节数**，空表为 **0**；不必等 `flush()`
+  （adl 在首次 flush 前就报出投影大小）。
+
+**验收（双向互通，`temp/sotest/`）**：同一份写/读探针、同一个 `app.xml`（id `solprobe9`、content `Main.swf`），
+AOT 侧清单注入同一对 define，因此两端指向同一个 `.sol`：
+
+| 方向 | 命令 | 结果 |
+|---|---|---|
+| **AOT 写 → adl 读** | `node src/index.ts temp/sotest/ours.as --manifest temp/sotest/aot.build.json -o temp/sotest/ours`，再 `adl application.xml bin` | 路径逐字一致（`#SharedObjects/Main.swf/<编码名>.sol`）；`size_empty=0`、`size=266` 与 adl 自写**逐字节相同**；adl 读回 8 个属性（含重复字符串 `dup=same|same`）**全对** |
+| **adl 写 → AOT 读** | `cd temp/sotest && cp MainWrite.as Main.as && sh ../tryadl.sh .`，再跑 AOT 读探针 | AOT 读回 8 个属性**全对**，`size=266` |
+
+**第二轮（阶段一百五十八，真机队列的两个方向）**：上面那组 266 B 样本只能证明「两边都能读对方」；
+串表规则一旦在**真存档**上偏一项（真存档有 60+ 个字符串、7 个空串、几十个动态名），266 B 样本根本触发不到。
+真机上是这样验的：
+
+| 方向 | 做法 | 结果 |
+|---|---|---|
+| 定位工具 | `temp/soread2/`：把我们写的 `.sol` 摆进它的存储路径，用 `adl` 把整棵树 `for..in` 打出来（**黑盒 oracle**） | 首次分歧点直接现形（`userInfo.email` 解成 `mobile`） |
+| **AOT 写 → adl 读** | `temp/soempty/`：同一个 `app.xml`、同一对 define，AOT 写 → `adl` 读 | `u.email=[]`、`app_menu[0].title=menu-0` 全对；双边文件均 **273 B** |
+| **adl 写 → AOT 读** | 同上，方向倒过来 | 全对 |
+| **真机端到端** | `1**********` 登录 → 首页 `Ray.lei1` → 杀进程重启 → 不再出现登录页 | **直接进首页**；`.sol` 2515 B 的 mtime 未被 `clearLoginSession()` 改写；截图 `temp/tkmeet-mac/d21v-auto-login.png`（同一存档于阶段一百五十八 版二进制上复验） |
+
+`examples/sharedobject.as` 把容器形状钉进回归：它按上述字节格式**手写**一个 `.sol` 再让 `getLocal` 读回
+（同时钉 `00 BF` / `TCSO` / 版本 4 / `00 00 00 03` / 头部名字长度字段），并断言 `size` 与实际文件长度相等。
+
 ---
 
 ## 7. `Socket` / `SecureSocket` / `ServerSocket` / `XMLSocket`（阶段八十九·五十三）
@@ -1203,7 +1328,7 @@ String 是 NUL 结尾的，嵌入的 NUL 无法用 `readUTFBytes` 观测，故�
 | `DatagramSocket`（UDP） | ⏸ 延后（与 TCP 底座不同：无连接、无 `flush` 语义、`send()` 自带目标地址） |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*`/RTMP | ❌ 不做（依赖 FMS / 音视频，超出范围） |
 | `FileReference`/`FileReferenceList`（文件上传/下载对话框） | ⏸ 延后（依赖原生文件对话框） |
-| `registerClassAlias`/`getClassByAlias`（AMF） | ⏸ 延后（`SharedObject` 已按 AIR 语义建模，AMF 序列化按需） |
+| `registerClassAlias`/`getClassByAlias`（AMF） | ✅ **已做**：`ByteArray.readObject`/`writeObject` 的 AMF3 编解码、别名（含基类别名覆盖子类）与错误路径均已落地（`examples/stage94d.as`）；`SharedObject` 的本地存档自阶段一百五十 起也走同一套 AMF3 编解码，与 AIR 的 `.sol` 逐字节互通（见 §6.9） |
 | HTTP/2、cookie jar、代理 | ✅ **已做（阶段八十九·五十三）**：HTTP/2 = `ASC_HTTP2`（默认仍 1.1）、cookie jar = 进程级 `CURLSH`、代理 = 环境变量 + 系统代理 |
 | gzip、HTTP 缓存、HTTP 认证 | ⏸ 按需（gzip 依赖构建 `libz` 之外的 `zstd`/`brotli` 取舍；`setLoginCredentialsForHost` 仍延后） |
 

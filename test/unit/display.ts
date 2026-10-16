@@ -68,6 +68,34 @@ function checkHitShape(): string[] {
     !emitSource.includes("this.line('(void)shapeFlag;');") &&
     emitted.includes('if (shapeFlag) return as_obj_region_hit(_this, x, y);'));
 
+  // ---- SimpleButton: no shape of its own (D3) ----
+  // adl 51.4.1 实测（temp/sbtnstate2，七个探针）：按钮的 shapeFlag=true 命中区恒为空
+  // （四态是独立 DisplayObject，hitTestState 只是**事件输入**的命中区），且 upState==NULL 时
+  // 什么都不画、width/height/getRect 全 0。
+  check('a SimpleButton has no shapeFlag region of its own',
+    emitted.includes('if (as_is((void*)o, &SimpleButton_vt)) return false;') &&
+    !/as_obj_region_hit_local\(DisplayObject\* o, double lx, double ly\) \{[\s\S]{0,1500}?as_sbtn_contains_local/.test(emitted));
+  // ---- 鼠标拾取与 hitTestPoint 是两条路（阶段一百五十七 D20）----
+  // 真应用里 29 个 `DefineButton2` / 73 处 placement 全点不动，而同类位置的 Sprite 按钮能点：
+  // 那些按钮是「**隐形点击靶**」（SWF 里只有 down + hit 两条记录、没有 up），`upState == NULL`
+  // ⇒ `as_bounds_walk` 的 PAINT 状态拿不到任何盒子 ⇒ 包围盒拾取永远失败。AIR 是拿**命中态**
+  // 做拾取的（与 hover 同一个判据），所以拾取必须走 `as_sbtn_contains_local`；
+  // 而 `hitTestPoint(x, y, false)` 仍走包围盒（无 up 态时 0x0 就是 adl 的实测答案）—— 两条路不得混。
+  check('the mouse pick path asks a button through its hit state, not its painted box',
+    emitted.includes('static bool as_pick_hit_local(DisplayObject* o, double lx, double ly) {') &&
+    /as_pick_hit_local\(DisplayObject\* o, double lx, double ly\) \{[\s\S]{0,400}?if \(as_is\(\(void\*\)o, &SimpleButton_vt\)\) return as_sbtn_contains_local\(\(SimpleButton\*\)o, lx, ly\) != 0;/.test(emitted) &&
+    emitted.includes('if (as_pick_hit_local(o, lx, ly) && ((InteractiveObject*)obj)->mouseEnabled) return obj;') &&
+    !emitted.includes('if (as_obj_hit_local(o, lx, ly) && ((InteractiveObject*)obj)->mouseEnabled) return obj;'));
+  check('hitTestPoint keeps the bounding-box path for a button',
+    /static bool as_pick_hit_local[\s\S]{0,400}?return as_obj_hit_local\(o, lx, ly\);/.test(emitted) &&
+    emitted.includes('if (shapeFlag) return as_obj_region_hit(_this, x, y);'));
+  check('the SimpleButton hit region never falls back to the button itself',
+    emitted.includes('DisplayObject* hs = (b->hitTestState != NULL) ? b->hitTestState : b->upState;') &&
+    emitted.includes('if (hs == NULL) return 0;') &&
+    !emitted.includes('? b->upState : (DisplayObject*)b)'));
+  check('upState==NULL paints nothing',
+    emitted.includes('if (b->upState == NULL) return NULL;'));
+
   if (ok > 0) console.log(`[hitshape] ${ok} hit-region checks passed`);
   return bad;
 }
@@ -613,8 +641,329 @@ function checkLineMetrics(): string[] {
   return bad;
 }
 
+// ---- display-list add/remove events (the TalkMED ViewControl leak) ----------
+//
+// AIR dispatches ADDED/REMOVED (bubbling) and ADDED_TO_STAGE/REMOVED_FROM_STAGE
+// (non-bubbling, one per descendant) on every add/remove; nothing stage-related
+// when the container is off the stage; and addChild() of an object that already
+// has a parent first removes it (REMOVED through the OLD parent, then ADDED).
+// Every expected string in the example is verbatim adl 51.4.1 output
+// (temp/dlprobe/), and the example is what test/examples.ts executes; these are
+// the source-level invariants behind it. Not cosmetic: TalkMED's
+// com.vsdevelop.proxy.ViewControl listens for Event.REMOVED and stops a leaked
+// Timer from it -- with no "removed" at all, closing the WeChat scan-code dialog
+// left its 2 s poll running forever.
+function checkListEvents(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [listev] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [listev] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+
+  check('ADDED/REMOVED bubble, the stage pair does not',
+    emitted.includes('EventDispatcher_dispatchEvent(child, Event_new((char*)"added", true, false));') &&
+    (emitted.match(/EventDispatcher_dispatchEvent\(child, Event_new\(\(char\*\)"added", true, false\)\);/g) ?? []).length === 2 &&
+    emitted.includes('EventDispatcher_dispatchEvent(child, Event_new((char*)"removed", true, false));') &&
+    emitted.includes('as_disp_stage_walk(child, (char*)"addedToStage");') &&
+    emitted.includes('as_disp_stage_walk(child, (char*)"removedFromStage");') &&
+    emitted.includes('EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new(type, false, false));'));
+
+  check('the stage pair walks the whole subtree, parent first',
+    emitted.includes('static void as_disp_stage_walk(DisplayObject* o, char* type) {') &&
+    emitted.includes('if (!as_is((void*)o, &DisplayObjectContainer_vt)) return;') &&
+    emitted.includes('for (int i = 0; i < c->children->length; i++) as_disp_stage_walk((DisplayObject*)as_v_obj_val(c->children->data[i]), type);'));
+
+  // DisplayObject_get_stage deliberately falls back to ASC_root_stage (the document
+  // class's `stage` is non-null in its constructor, matching Flash) -- but an orphan
+  // is NOT on the stage in AIR, so the event path must ask the strict question.
+  check('off-stage containers dispatch no stage events (no root-stage fallback)',
+    emitted.includes('static int as_on_stage(DisplayObject* o) {') &&
+    emitted.includes('return o->vtable != NULL && strcmp(o->vtable->cls_name, "Stage") == 0;') &&
+    (emitted.match(/if \(as_on_stage\(\(DisplayObject\*\)_this\)\) as_disp_stage_walk\(child, /g) ?? []).length === 2 &&
+    emitted.includes('int was_on_stage = as_on_stage(child);') &&
+    !emitted.includes('if (DisplayObject_get_stage(_this) != NULL) EventDispatcher_dispatchEvent(child,'));
+
+  // AIR dispatches REMOVED while the child is still attached (the handler sees
+  // parent/numChildren/index intact and the event bubbles to the parent).
+  check('REMOVED is dispatched before the child is detached, then re-found',
+    emitted.includes('int was_on_stage = as_on_stage(child);') &&
+    emitted.includes('as_disp_stage_walk(child, (char*)"removedFromStage");') &&
+    emitted.includes('if ((DisplayObject*)as_v_obj_val(c->children->data[i]) != child) continue;') &&
+    emitted.includes('if (child->parent == (Object*)_this) child->parent = NULL;') &&
+    emitted.includes('return DisplayObjectContainer_removeChild(_this, (DisplayObject*)as_v_obj_val(c->children->data[index]));'));
+
+  check('addChild implicitly re-parents through the old parent first',
+    (emitted.match(/if \(child->parent != NULL\) DisplayObjectContainer_removeChild\(\(void\*\)child->parent, child\);/g) ?? []).length === 2);
+
+  // The behaviour itself is pinned by the example (run by test/examples.ts).
+  const example = readFileSync(join(root, 'examples', 'displaylist-events.as'), 'utf8');
+  check('the example asserts the adl-measured sequences verbatim',
+    example.includes('check("addChild", "kid:added b=1 p=2 kid:added b=1 p=3 kid:addedToStage b=0 p=2 ");') &&
+    example.includes('check("nested addChild", "grand:added b=1 p=2 grand:added b=1 p=3 grand:added b=1 p=3 grand:addedToStage b=0 p=2 ");') &&
+    example.includes('check("removeChild", "kid:removed b=1 p=2 kid:removed b=1 p=3 kid:removedFromStage b=0 p=2 ");') &&
+    example.includes('check("removeChildAt", "kid:removed b=1 p=2 kid:removed b=1 p=3 kid:removedFromStage b=0 p=2 grand:removedFromStage b=0 p=2 ");') &&
+    example.includes('check("addChild off stage", "c2:added b=1 p=2 ");') &&
+    example.includes('check("re-parent", "kid:removed b=1 p=2 kid:removed b=1 p=3 kid:removedFromStage b=0 p=2 grand:removedFromStage b=0 p=2 kid:added b=1 p=2 kid:addedToStage b=0 p=2 grand:addedToStage b=0 p=2 ");') &&
+    example.includes('check("subtree remove", "sub:removed b=1 p=2 sub:removedFromStage b=0 p=2 subsub:removedFromStage b=0 p=2 ")'));
+
+  if (ok > 0) console.log(`[listev] ${ok} display-list event checks passed`);
+  return bad;
+}
+
+// ---- TextField.autoSize 的大小口径 + 装不上的字族的兜底脸（阶段一百六十八）----
+//
+// 两个 AIR 保真回归，都用 adl 51.4.1 双端同源探针定过真值（temp/tfswc 的 case ⑥⑦⑧⑨⑩，
+// 修后 AOT 侧与 adl 的报告逐字相同）：
+//   ① wordWrap=true 时 autoSize **只改高度**（height = textHeight + 4），宽度保持用户值；
+//      只有 wordWrap=false 才 width = textWidth + 4。旧的「高度从当前换行宽算、宽度取换行后的
+//      最长行 + 4」会在每次绘制后把宽度再收一圈（290 → 64.66 → 50.66 → 36.66 → 32），
+//      把 AI 同传列表项的 title 断成三行压住 ctime。
+//   ② 装不上的字族用**平台默认脸**的行盒（adl 对 MiSans Regular / 宋体 量到 16px → 行盒 16 = 
+//      Helvetica），不是「哪个 CJK 脸供字形就用哪个的行盒」（PingFang/Songti SC 1.4em → 22）。
+// 行为型判据（断言式）在 examples/autosize-metrics.as；这里只钉生成 C / glue 的结构，
+// 因为 CI 上既没有 微软雅黑 也没有 MiSans，像素级真值不可能有。
+function checkAutoSizeMetrics(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [autosize] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [autosize] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+  const example = readFileSync(join(root, 'examples', 'autosize-metrics.as'), 'utf8');
+  const registry = readFileSync(join(root, 'test', 'examples.ts'), 'utf8');
+
+  // ① autoSize：宽度只在 wordWrap=false 时才跟 textWidth 走
+  check('the width hug is guarded on wordWrap (height stays unconditional)',
+    emitted.includes('if (!tf->wordWrap) tf->_fieldWidth = tw + 4.0;') &&
+    emitted.includes('tf->_fieldHeight = th + 4.0;') &&
+    !/^\ttf->_fieldWidth = tw \+ 4\.0;$/m.test(emitted));
+
+  // ①b 几何读取也要刷新 autoSize（adl 赋值后不画就能读到新高度）
+  check('geometry access refreshes autoSize (as_do_extents -> as_tf_apply_autosize)',
+    emitted.includes('if (as_is((void*)o, &TextField_vt)) as_tf_apply_autosize((TextField*)o);'));
+
+  // ② 装不上的字族 → 平台默认脸（名字替换 + 度量兜底两处都在）
+  const aliasBody = glue.slice(glue.indexOf('static const char* sk_family_alias(const char* family) {'));
+  check('an uninstalled family is substituted with the platform default family',
+    aliasBody.includes('!mgr->matchFamilyStyle(family, SkFontStyle())') &&
+    aliasBody.includes('dflt->getFamilyName(&n)') &&
+    aliasBody.includes('alias_cache'));
+  check('the typeface lookup falls back to the default face when the family misses',
+    glue.includes('if (!tf && mgr) tf = mgr->matchFamilyStyle(nullptr, style);'));
+
+  // ③ 行为型回归必须真的存在并被回归套件跑到（链 Skia，否则度量恒 0）
+  check('examples/autosize-metrics.as asserts the no-cascade + fallback rules',
+    example.includes('反复绘制后宽度/行数不得自噬') &&
+    example.includes('wordWrap=false 时宽度收成 textWidth + 4') &&
+    example.includes('装不上的字族必须用平台默认脸的行盒'));
+  check('the example is registered with its Skia manifest',
+    registry.includes("'autosize-metrics.as': ['--manifest', join(dir, 'autosize-metrics.build.json')]"));
+
+  if (ok > 0) console.log(`[autosize] ${ok} autoSize/family-fallback checks passed`);
+  return bad;
+}
+
+// unit: display/TfScaleMetrics — TextField 缩放下的度量/字形口径（阶段一百六十九，adl 口径：
+// textWidth/textHeight = 名义 × scaleY/scaleX（含祖先链），字形按 scaleY 整体缩放、scaleX 不拉宽）。
+// 结构钉子盯生成 C 的两处来源：度量 getter 的 ÷ 比值、绘制前对 CTM 的归一化；行为钉子靠
+// examples/tf-scale-metrics.as 的相对断言 + temp/tfswc 双端探针（case ⑯⑯b⑯c⑰b）钉绝对数。
+function checkTfScaleMetrics(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [tfscale] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [tfscale] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+  const example = readFileSync(join(root, 'examples', 'tf-scale-metrics.as'), 'utf8');
+  const registry = readFileSync(join(root, 'test', 'examples.ts'), 'utf8');
+
+  // ① 累积 scale 助手真的沿 parent 链走，而且线性部分按 T·R·S·M 的顺序累乘
+  check('the accumulated scale walks the parent chain',
+    emitted.includes('for (DisplayObject* p = o; p != NULL; p = (DisplayObject*)p->parent) {'));
+  check('the accumulated scale composes R(rotation)*S(scaleX,scaleY)*transform.matrix',
+    emitted.includes('double la = cs * p->scaleX, lb = sn * p->scaleX, lc = -sn * p->scaleY, ld = cs * p->scaleY;') &&
+    emitted.includes('Matrix* m = (p->transform != NULL) ? p->transform->matrix : NULL;'));
+
+  // ② 度量 = 名义 × (scaleY/scaleX)，两个方向同一个除数
+  check('the ratio is scaleY/scaleX',
+    emitted.includes('return (sx > 0.0) ? sy / sx : 1.0;'));
+  check('textWidth is scaled by the ratio',
+    emitted.includes('return as_skia_textlayout_max_width(para) * as_tf_scale_ratio(tf);'));
+  check('textHeight is scaled by the ratio (Skia path)',
+    emitted.includes('return h * as_tf_scale_ratio(tf);'));
+  check('textHeight is scaled by the ratio (pure-C path)',
+    emitted.includes('return (double)as_tf_line_count(tf) * (size * 1.2 + lead) * as_tf_scale_ratio(tf);'));
+
+  // ③ 绘制前把 CTM 归一成 scaleY 的均匀缩放，且用「最终落点 CTM」而不是当前 canvas 盲读
+  check('the glyph paint normalises the CTM to a uniform scaleY',
+    emitted.includes('if (tsx > 0.0 && fabs(tsy / tsx - 1.0) > 1e-9) as_skia_canvas_scale(canvas, tsy / tsx, 1.0);'));
+  check('the normalisation measures the destination CTM (bake-aware)',
+    emitted.includes('double tsx = ASC_bake_ctm_x, tsy = ASC_bake_ctm_y;'));
+
+  // ④ 行为型回归必须存在并被套件跑到（链 Skia，否则度量恒 0、draw 是空桩）
+  check('examples/tf-scale-metrics.as asserts both the metric and the glyph rules',
+    example.includes('scaleX=2 时 textWidth 减半') &&
+    example.includes('scaleX=2 时 textHeight 也减半（同除 scaleX）') &&
+    example.includes('父容器 scaleX=2 时子字段 textWidth 减半') &&
+    example.includes('scaleX=2 不得把字形横向拉宽') &&
+    example.includes('scaleY=2 时字形整体放大一倍'));
+  check('the example is registered with its Skia manifest',
+    registry.includes("'tf-scale-metrics.as': ['--manifest', join(dir, 'tf-scale-metrics.build.json')]"));
+
+  if (ok > 0) console.log(`[tfscale] ${ok} TextField scale-metric checks passed`);
+  return bad;
+}
+
+// unit: swc/TextChildOrigin — 被缩放的文本子件的 x/y（阶段一百六十九；adl 口径：
+// 文本子件的 RECT 原点在**角色自己的空间**里，故要走 placement 的线性部分，且 AIR 把结果
+// 存回 twip 栅格（1/20 px）。真值 = temp/tfswc case ⑰ 的四个判别例（subtitleskin.ctime
+// 12.0000 / filesskin.tab1 0.0500 / filesskin.tab2 90.1000 / logintabskin.tab1 0.0000，
+// 与 `tx + ox` 分别差 11.7 / 0.45 / 0.45 / 0.10 px）。本组只钉生成侧来源与两处调用点，
+// 绝对数由 temp/tfswc 双端探针钉（CI 无 .swc，见 test/unit 的约定：不断言 temp/ 内容）。
+function checkSwcTextChildOrigin(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [swcxy] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [swcxy] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const swcSource = readFileSync(join(root, 'src', 'swc.ts'), 'utf8');
+
+  // ① 原点走线性部分，并把结果落到 AIR 的 twip 栅格上
+  const helper = emitSource.slice(emitSource.indexOf('private swcTextChildXY('));
+  const helperDoc = emitSource.slice(emitSource.indexOf('a TEXT child reports for a placement'));
+  check('the RECT origin is mapped through the placement linear part',
+    helper.includes('x: round20(m[4] + m[0] * ox + m[2] * oy),') &&
+    helper.includes('y: round20(m[5] + m[1] * ox + m[3] * oy),'));
+  check('the result is snapped to the twip grid (1/20 px)',
+    helper.includes('const round20 = (v: number): number => Math.round(v * 20) / 20;'));
+
+  // ② 两处（帧 1 placement / 时间轴 modify）都必须走这个 helper，不能再各算一份
+  check('the frame-1 placement uses the helper',
+    emitSource.includes('const { x, y } = this.swcTextChildXY(m, ox, oy);\n      this.line(`  ${child}->x = '));
+  check('the timeline modify path uses the helper',
+    emitSource.includes('const { x, y } = this.swcTextChildXY(m, ox, oy);\n      this.line(`${name}->x = '));
+  check('no call site still adds the raw origin',
+    !/->x = \$\{this\.formatDouble\(m\[4\] \+ ox\)\}/.test(emitSource));
+
+  // ③ 四条判别证据留在注释里（数量级决定 1/20 取整这一条）
+  check('the four discriminating measurements are cited',
+    helperDoc.includes('subtitleskin.ctime') && helperDoc.includes('filesskin.tab1') &&
+    helperDoc.includes('filesskin.tab2') && helperDoc.includes('logintabskin.tab1') &&
+    helperDoc.includes('adl 12.0000') && helperDoc.includes('adl  0.0500') && helperDoc.includes('adl  0.0000'));
+
+  // ④ swc.ts 的接口注释同步（老注释写的是 `x = matrix.tx + xmin`）
+  check('swc.ts documents the linear-part + twip-grid rule',
+    swcSource.includes('x = round20(tx + a*xmin + c*ymin)'));
+
+  if (ok > 0) console.log(`[swcxy] ${ok} SWC text-child origin checks passed`);
+  return bad;
+}
+
+// unit: display/McButtonState — MovieClip 的三种按钮态（阶段一百七十一）。
+// adl 51.4.1 实测口径在 temp/btnprobe（Probe.as + p4~p7 截图 + Aot.as 双端）；本组只钉生成侧
+// 来源与关键判断点（CI 无 .swc，按 test/unit 约定不断言 temp/ 内容）。四条最容易再丢的东西：
+//   ① 门是 buttonMode（不是“有标签就算按钮”）；
+//   ② 帧由标签决定，且缺失时按 _down → _over → _up 退链；
+//   ③ 按压锁在“按下的那个对象”上（生成号递增，鼠标松开靠 ASC_mouse_down 清）；
+//   ④ 状态在**指纹 pass**与绘制 pass 两处都要结算 —— 祖先被自动烘培时只有指纹 pass 会走到子件。
+function checkMcButtonState(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [mcbtn] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [mcbtn] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const symbolsSource = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const registry = readFileSync(join(root, 'test', 'examples.ts'), 'utf8');
+  const example = readFileSync(join(root, 'examples', 'swc-mc-button.as'), 'utf8');
+  const fn = emitSource.slice(emitSource.indexOf("this.line('static void as_mc_button_state(DisplayObject* o) {')"));
+
+  // ① 三道门：有烘培时间轴、buttonMode、真的有鼠标（离屏保持 _up）
+  check('the state machine is gated on a baked timeline, buttonMode and a live pointer',
+    fn.includes("if (mc->_tl_char == 0) return;") &&
+    fn.includes("if (!((InteractiveObject*)o)->buttonMode) return;") &&
+    fn.includes("if (!ASC_mouse_has) return;"));
+
+  // ② 帧由标签决定 + 缺失时退链（不作帧号映射）
+  check('the frame comes from the label, with a _down -> _over -> _up fallback chain',
+    fn.includes("const char* want = pressed ? \"_down\" : (over ? \"_over\" : \"_up\");") &&
+    fn.includes("as_swc_tl_labelframe(mc->_tl_char, want)") &&
+    fn.includes("if (f <= 0 && pressed) f = as_swc_tl_labelframe(mc->_tl_char, \"_over\");") &&
+    fn.includes("if (f <= 0 && (pressed || over)) f = as_swc_tl_labelframe(mc->_tl_char, \"_up\");"));
+  check('an unchanged state never re-enters as_mc_goto (frame scripts must not replay)',
+    fn.includes('if (f > 0 && f != mc->currentFrame) as_mc_goto(mc, f);'));
+  check('the roll-over target is the pick result, walked up the ancestor chain',
+    emitSource.includes("this.line('for (DisplayObject* p = (DisplayObject*)ASC_mouse_target; p != NULL; p = (DisplayObject*)p->parent) if (p == o) return 1;');"));
+
+  // ③ 按压锁：按下的代际 + 只增不减 + 链上盖章
+  check('the press is latched by a generation on the pressed chain',
+    emitSource.includes("for (DisplayObject* p = (DisplayObject*)target; p != NULL; p = (DisplayObject*)p->parent) { if (as_is((void*)p, &InteractiveObject_vt)) ((InteractiveObject*)p)->_btn_press_gen = ASC_press_gen; }") &&
+    fn.includes('int pressed = ASC_mouse_down && ASC_press_gen != 0 && ((InteractiveObject*)o)->_btn_press_gen == ASC_press_gen;'));
+  check('the generation only grows (a stale stamp can never match a later press)',
+    emitSource.includes("if (ASC_press_gen <= 0) ASC_press_gen = 1;") &&
+    !emitSource.includes("ASC_press_gen = 0;  // mouseUp"));
+  check('the private latch field is declared on InteractiveObject (not a GC-rooted pointer)',
+    symbolsSource.includes("['_btn_press_gen', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'InteractiveObject'"));
+
+  // ④ 两处结算点：绘制 pass + 指纹 pass（祖先被自动烘培时只有后者会走到子件）
+  check('the state settles in the paint pass',
+    emitSource.includes("if (as_is((void*)o, &MovieClip_vt)) as_mc_button_state(o);"));
+  check('the state settles in the fingerprint pass (baked-ancestor path)',
+    emitSource.includes("if (as_is(o, &MovieClip_vt)) as_mc_button_state(o);"));
+  check('the fingerprint carries the timeline frame (so a stale bake drops)',
+    emitSource.includes('if (as_is(o, &MovieClip_vt)) h = as_fp_i32(h, ((MovieClip*)o)->currentFrame);'));
+
+  // ⑤ 每帧刷新拾取目标（鼠标停着不动时也要跟着显示列表变）+ 两个入口都要刷新
+  check('the pointer target is refreshed once per pass, in both paint entries',
+    (emitSource.match(/as_mouse_refresh_target\(\(DisplayObject\*\)/g) ?? []).length === 2 &&
+    emitSource.includes("ASC_mouse_target = (ASC_mouse_has && root != NULL) ? as_pick_hit((void*)root, ASC_mouse_x, ASC_mouse_y) : NULL;"));
+
+  // ⑥ 四条实测结论留在注释里（门是 buttonMode / 帧看标签 / 按压锁 / 祖先烘培）
+  const doc = emitSource.slice(emitSource.indexOf('MovieClip button states: buttonMode + the FrameLabel triple'));
+  check('the measurements are cited in the runtime comment',
+    doc.slice(0, 4000).includes('gate = buttonMode, NOT the labels') &&
+    doc.slice(0, 4000).includes('the LABEL decides the frame, not an index') &&
+    doc.slice(0, 4000).includes('press is LATCHED') &&
+    doc.slice(0, 4000).includes('29 symbols in the TalkMED skin carry the triple'));
+
+  // ⑦ 示例与登记
+  check('the example is registered with the Skia manifest and the skin requirement',
+    registry.includes("'swc-mc-button.as': ['--manifest', join(dir, 'swc-bitmap.build.json')]") &&
+    registry.includes("'swc-mc-button.as': join(root, '..', 'temp', 'skin.swc')"));
+  check('the example asserts the exact label frames measured on adl',
+    example.includes('_up@1,_over@4,_down@7') && example.includes('_up@1,_over@5,_down@10') &&
+    example.includes('home card roll-over -> 5:_over'));
+  check('the example exercises the auto-bake (many frames per state) and pixel differences',
+    example.includes('for (var i:int = 0; i < n; i++) stage.render(400, 700, "temp/swc-mc-button.png");') &&
+    example.includes('function inkDiff(a:BitmapData, b:BitmapData):int'));
+
+  if (ok > 0) console.log(`[mcbtn] ${ok} MovieClip button-state checks passed`);
+  return bad;
+}
+
 registerGroup('unit: display/HitShape', checkHitShape);
+registerGroup('unit: swc/TextChildOrigin', checkSwcTextChildOrigin);
+registerGroup('unit: display/McButtonState', checkMcButtonState);
 registerGroup('unit: display/DisplayGeometry', checkDisplayGeometry);
 registerGroup('unit: display/TransformMatrix', checkTransformMatrix);
 registerGroup('unit: display/Scale9Grid', checkScale9Grid);
 registerGroup('unit: display/LineMetrics', checkLineMetrics);
+registerGroup('unit: display/AutoSizeMetrics', checkAutoSizeMetrics);
+registerGroup('unit: display/TfScaleMetrics', checkTfScaleMetrics);
+registerGroup('unit: display/ListEvents', checkListEvents);

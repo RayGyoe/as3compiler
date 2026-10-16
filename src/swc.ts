@@ -12,9 +12,11 @@
 // never parses SWF: it just decodes the embedded PNG/JPEG bytes via Skia
 // (`as_skia_image_decode_bytes_argb`), exactly like `Loader.loadBytes` does.
 //
-// Scope (swc.md §3.3): this module reads RESOURCES only. `DoABC` (AVM2
-// bytecode) is deliberately not parsed — repurposing bytecode needs a
-// decompiler or an AVM2 interpreter, i.e. a separate project.
+// Scope (swc.md §3.3): this module reads RESOURCES, plus — since the agreement
+// checkbox fix (diff doc D17) — the ONE piece of `DoABC` that a skin symbol's
+// behaviour depends on: a generated FLA symbol class's timeline scripts, which are
+// decoded by `abc.ts` into our AST so a scripted symbol's playhead actually moves.
+// AVM2 execution in general remains out of scope.
 //
 // Reference: docs/zh-cn/swc.md §§3.1, 3.2, 4, 5. The two traps that produce
 // silently visible-but-wrong output are:
@@ -24,8 +26,10 @@
 
 import { readFileSync } from 'node:fs';
 import { inflateRawSync, inflateSync, deflateSync } from 'node:zlib';
-import type { Expr, Stmt } from './ast.ts';
+import type { ASType, Block, Expr, Method, Param, Stmt, Visibility } from './ast.ts';
 import { qualifiedName } from './symbols.ts';
+import { decodeSymbolScripts } from './abc.ts';
+import type { AbcFrameScript, AbcSymbolClass } from './abc.ts';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -44,6 +48,16 @@ export interface SwcBitmap {
   height: number;
   /** Encoded image bytes to embed in the generated C (swc.md §5.1). */
   encoded: Buffer;
+  /**
+   * 8-bit coverage plane, one byte per pixel, or null when the source carries
+   * none. Only `DefineBitsJPEG3` produces one: JPEG has no alpha channel, so the
+   * tag splits the image into "RGB (JPEG) + separate zlib alpha plane". The plane
+   * is decompressed here and composited at RUNTIME, because there is no JPEG
+   * decoder on the Node side (zero-dependency build, AGENTS.md §3.1) while Skia
+   * has one. Dropping it renders the artwork's transparent regions as the JPEG's
+   * own black (diff doc D25).
+   */
+  alpha: Buffer | null;
 }
 
 /**
@@ -58,17 +72,58 @@ export interface SwcBitmap {
  */
 export interface SwcText {
   id: number;
+  /** The defining tag: 37 = `DefineEditText`, 11 = `DefineText` (static glyph run). */
+  tag: number;
   /** The character's box in its own space (DefineText's `TextBounds`, DefineEditText's `Bounds`). */
   bounds: SwcRect;
   /**
-   * `DefineEditText`'s AutoSize flag (bit 0x80 of the second flag byte). AIR then
-   * fits the field box to the glyphs it lays out, so the RECT is NOT the box AIR
-   * reports for that child (measured: `fileitemskin` c2 is 221.25x41.65 in AIR while
-   * its RECT is 37.15x19.55 wide). Counting those separately keeps "our box equals
-   * AIR's" honest instead of averaging a known gap into a precision claim.
+   * `DefineEditText`'s AutoSize flag (bit 0x0040 of the flags word, which SWF stores
+   * little-endian: 0x40 of the HIGH byte). AIR then fits the field box to the glyphs
+   * it lays out, so the RECT is NOT the box AIR reports for that child (measured:
+   * `fileitemskin` c2 is 221.25x41.65 in AIR while its RECT is 37.15x19.55 wide).
+   * Counting those separately keeps "our box equals AIR's" honest instead of
+   * averaging a known gap into a precision claim.
+   *
    * Always false for `DefineText` (tag 11), which has no such flag.
    */
   autoSize: boolean;
+  /** `DefineEditText`: the HasText flag (0x8000). Only then is `text` present. */
+  hasText: boolean;
+  /**
+   * `DefineEditText`'s InitialText, decoded as UTF-8 (SWF >= 6 stores STRING as
+   * UTF-8). This is what AIR puts in the TextField: the baker used to leave it
+   * NULL and instantiate an EMPTY field, so every label a Flash skin shipped was
+   * blank (talkmed's footer line, its agreement paragraph, every button caption).
+   *
+   * When the `html` flag is set this is markup, exactly as AIR treats it.
+   * Always NULL for tag 11, whose glyph runs are not decoded (they need the
+   * embedded font's CodeTable).
+   */
+  text: string | null;
+  /** `DefineEditText`: HasFont's FontID, resolved through the library's font table. */
+  fontId: number | null;
+  fontName: string | null;
+  /** `DefineEditText`: FontHeight in twips (SWF stores text sizes in twips). */
+  fontHeight: number | null;
+  /** `DefineEditText`: TextColor as 0xRRGGBB, or null when HasTextColor is clear. */
+  color: number | null;
+  /** `DefineEditText`: Align (0 left / 1 right / 2 center / 3 justify), or null. */
+  align: string | null;
+  /** `DefineEditText`: the Layout fields. Zeros when HasLayout is clear. */
+  leftMargin: number;
+  rightMargin: number;
+  indent: number;
+  leading: number;
+  multiline: boolean;
+  wordWrap: boolean;
+  password: boolean;
+  readOnly: boolean;
+  /** `DefineEditText`: !NoSelect. AIR's TextField.selectable. */
+  selectable: boolean;
+  border: boolean;
+  html: boolean;
+  hasLayout: boolean;
+  maxLength: number | null;
 }
 
 export interface SwcLibrary {
@@ -82,15 +137,21 @@ export interface SwcLibrary {
   sprites: SwcSprite[];
   /** Every `DefineButton`/`DefineButton2` four-state button. */
   buttons: SwcButton[];
-  /** Every text character (`DefineText`/`DefineEditText`) — baked as empty TextField
-   *  placeholders so the tree shape matches AIR (item ②). */
+  /** Every text character (`DefineText`/`DefineEditText`). `DefineEditText` is
+   *  decoded in full (text + format); `DefineText`'s glyph runs are a reported gap. */
   texts: SwcText[];
+  /** Embedded font characters (`DefineFont2/3/4`): FontID -> FontName. A text
+   *  character's HasFont FontID resolves through this to the family AIR would use. */
+  fonts: Map<number, string>;
   /** `DefineScalingGrid` (tag 78): characterId -> 9-slice splitter rect. */
   scalingGrids: Map<number, SwcRect>;
   /** `SymbolClass` id -> AS3 class name. */
   classNames: Map<number, string>;
   /** Every character definition we know about, keyed by character id. */
   characters: Map<number, SwcCharacter>;
+  /** Timeline scripts of Flash-generated symbol classes, keyed by character id
+   *  (diff doc D17). A symbol absent here has no timeline script of its own. */
+  scripts: Map<number, AbcSymbolClass>;
 }
 
 /** The named bitmaps only — the ones a user's AS3 can name (swc.md §6). */
@@ -111,6 +172,8 @@ export interface SwcResourceSpec {
   height: number;
   format: 'png' | 'jpeg' | 'gif';
   encoded: Buffer;
+  /** Separate coverage plane (JPEG3 only), see `SwcBitmap.alpha`. */
+  alpha: Buffer | null;
   source: string; // .swc the resource came from (provenance comment)
 }
 
@@ -173,6 +236,13 @@ export interface SwcCharacterClass {
   cname: string;
   charId: number;
   kind: 'sprite' | 'button';
+  /**
+   * The timeline scripts the symbol's own DoABC registers with
+   * `addFrameScript(frame - 1, this.frameN)` (abc.ts), decoded at compile time.
+   * The emitter turns them into `as_swc_frames`, the one place a frame change runs
+   * the frame's script. Empty for a symbol whose Flash class has none.
+   */
+  frames: readonly AbcFrameScript[];
 }
 
 /**
@@ -206,6 +276,7 @@ export function swcCompileInputs(lib: SwcLibrary): {
       height: r.height,
       format: r.format,
       encoded: r.encoded,
+      alpha: r.alpha,
       source: lib.source,
     });
   }
@@ -213,8 +284,9 @@ export function swcCompileInputs(lib: SwcLibrary): {
     const kind = lib.characters.get(charId)?.kind;
     if (kind !== 'sprite' && kind !== 'button') continue;
     const { name, pkg } = splitFqn(className);
-    decls.push(swcDisplayClassDecl(name, pkg, kind));
-    chars.push({ cname: qualifiedName(name, pkg), charId, kind });
+    const script = lib.scripts.get(charId);
+    decls.push(swcDisplayClassDecl(name, pkg, kind, script));
+    chars.push({ cname: qualifiedName(name, pkg), charId, kind, frames: script?.frames ?? [] });
   }
   return { decls, specs, chars };
 }
@@ -228,7 +300,7 @@ export function swcCompileInputs(lib: SwcLibrary): {
  * (`as_swc_bind`), because the construction is C — not AS3 — and therefore cannot
  * live in an AST body (AGENTS.md §2.8).
  */
-function swcDisplayClassDecl(name: string, pkg: string | null, kind: 'sprite' | 'button'): Stmt {
+function swcDisplayClassDecl(name: string, pkg: string | null, kind: 'sprite' | 'button', script: AbcSymbolClass | undefined): Stmt {
   return {
     kind: 'ClassDecl',
     name,
@@ -239,7 +311,13 @@ function swcDisplayClassDecl(name: string, pkg: string | null, kind: 'sprite' | 
     isDynamic: false,
     implements: [],
     metadata: [],
-    imports: [kind === 'sprite' ? 'flash.display.MovieClip' : 'flash.display.SimpleButton'],
+    // The symbol's own Flash class imports what ITS code reaches through the scope
+    // chain (`MouseEvent.CLICK`), because the decoded methods are emitted as
+    // ordinary methods of this class and resolve their names through this list.
+    imports: [
+      kind === 'sprite' ? 'flash.display.MovieClip' : 'flash.display.SimpleButton',
+      ...(script?.imports ?? []),
+    ],
     fileId: null,
     members: [
       {
@@ -255,8 +333,32 @@ function swcDisplayClassDecl(name: string, pkg: string | null, kind: 'sprite' | 
             : [],
         },
       },
+      // The symbol class's own methods, decoded from its DoABC (abc.ts). They ARE
+      // the difference between a skin symbol and a picture of one: `frame1` of the
+      // login checkbox installs the CLICK listener that toggles the tick, and
+      // TalkMEDAccount reads `agreebtn.currentFrame != 3` to decide whether the
+      // user agreed to the privacy policy (swc.md §3.3 addendum).
+      ...(script?.methods ?? []).map((m) => swcScriptMethod(m)),
     ],
   };
+}
+
+/** One decoded DoABC method as an ordinary AST method of the synthesized class. */
+function swcScriptMethod(m: { name: string; params: Param[]; returnType: ASType; body: Block; visibility: Visibility }): Stmt {
+  const method: Method = {
+    kind: 'Method',
+    name: m.name,
+    params: m.params,
+    returnType: m.returnType,
+    body: m.body,
+    visibility: m.visibility,
+    isStatic: false,
+    isFinal: false,
+    isGetter: false,
+    isSetter: false,
+    metadata: [],
+  };
+  return method;
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +827,24 @@ class SwfReader {
     this.align();
     this.pos += n * 8;
   }
+  /** A fixed-length run of bytes decoded as UTF-8 (SWF font names: ANSI or UTF-8). */
+  str8(n: number): string {
+    this.align();
+    const at = this.start + (this.pos >> 3);
+    this.pos += n * 8;
+    return this.buf.toString('utf8', at, at + n);
+  }
+  /** SWF STRING: NUL-terminated bytes. From SWF 6 on these are UTF-8, so mapping
+   *  one byte to one character (asciiZ) would mangle every non-ASCII label --
+   *  talkmed's skin text is Chinese. */
+  str8Z(): string {
+    this.align();
+    const at = this.start + (this.pos >> 3);
+    let i = at;
+    while (i < this.end && this.buf[i] !== 0) i++;
+    this.pos += (i - at + 1) * 8;
+    return this.buf.toString('utf8', at, i);
+  }
   remainingBytes(): number {
     return this.end - (this.start + (this.pos >> 3));
   }
@@ -737,6 +857,103 @@ function readSwfRect(r: SwfReader): SwcRect {
   // discarded: byte alignment after a RECT is part of the format, not an accident.
   r.align();
   return rect;
+}
+
+/** `DefineEditText` Align values -> the strings AIR's TextFormat.align reports. */
+const SWF_TEXT_ALIGNS = ['left', 'right', 'center', 'justify'];
+
+/**
+ * `DefineEditText` (tag 37) / `DefineText` (tag 11).
+ *
+ * Tag 37 is what a Flash-authored skin uses for practically every piece of text
+ * (talkmed's skin.swc: 338 of its 341 text characters), and it carries the whole
+ * TextField at once: the initial string, the font/size/colour/alignment and the
+ * layout margins. Decoding it in full is what makes text appear at all -- the baker
+ * used to read only the RECT and hand the emitter an EMPTY TextField, so every
+ * label a skin shipped rendered blank.
+ *
+ * Tag 11 stores glyph runs against its embedded font's CodeTable (glyph index ->
+ * character code). Only 3 of talkmed's 341 characters are tag 11; they stay a
+ * reported gap rather than baked wrong.
+ *
+ * Flag bits are the SWF's UI16, little-endian, exactly as the spec lists them:
+ *   0x8000 HasText      0x4000 WordWrap     0x2000 Multiline   0x1000 Password
+ *   0x0800 ReadOnly     0x0400 HasTextColor 0x0200 HasMaxLength 0x0100 HasFont
+ *   0x0080 HasFontClass 0x0040 AutoSize     0x0020 HasLayout     0x0010 NoSelect
+ *   0x0008 Border       0x0004 WasStatic    0x0002 HTML          0x0001 UseOutlines
+ */
+function parseSwfText(body: Buffer, start: number, length: number, code: number, fonts: Map<number, string>): SwcText {
+  const r = new SwfReader(body, start + 2, start + length);
+  const id = body.readUInt16LE(start);
+  const bounds = readSwfRect(r);
+  const out: SwcText = {
+    id, tag: code, bounds, autoSize: false, hasText: false, text: null,
+    fontId: null, fontName: null, fontHeight: null, color: null, align: null,
+    leftMargin: 0, rightMargin: 0, indent: 0, leading: 0,
+    multiline: false, wordWrap: false, password: false, readOnly: false,
+    selectable: true, border: false, html: false, hasLayout: false, maxLength: null,
+  };
+  if (code !== 37) return out; // DefineText: only the RECT is read (see the header note)
+  // The flags are 16 individual 1-bit fields, and SWF writes them as ONE MSB-first
+  // bit word -- i.e. the first byte holds HasText..HasMaxLength and the second holds
+  // HasFont..UseOutlines. Reading it as a little-endian UI16 swaps the halves and
+  // turns every flag into a different one (verified on skin.swc #92: 0xad36 =
+  // HasText|Multiline|ReadOnly|HasTextColor|HasFont|HasLayout|WasStatic|HTML, which
+  // is exactly the character -- the field's own text is `<p align="left"><font
+  // face="MiSans Regular"...`, its FontID is 5, and the library's font 5 IS
+  // "MiSans Regular"). `ub(16)` is the MSB-first read that matches this layout.
+  const flags = r.ub(16);
+  out.hasText = (flags & 0x8000) !== 0;
+  out.wordWrap = (flags & 0x4000) !== 0;
+  out.multiline = (flags & 0x2000) !== 0;
+  out.password = (flags & 0x1000) !== 0;
+  out.readOnly = (flags & 0x0800) !== 0;
+  out.autoSize = (flags & 0x0040) !== 0;
+  out.hasLayout = (flags & 0x0020) !== 0;
+  out.selectable = (flags & 0x0010) === 0;
+  out.border = (flags & 0x0008) !== 0;
+  out.html = (flags & 0x0002) !== 0;
+  // The optional fields come in this exact order; each is present only when its
+  // flag is set, which is why they cannot be read as a fixed struct.
+  if (flags & 0x0100) { out.fontId = r.u16(); out.fontHeight = r.u16(); }
+  // TextColor is RGBA, not RGB: measured on skin.swc #92 the four bytes are
+  // 99 99 99 ff, i.e. an opaque grey. Reading three leaves one byte behind and
+  // shifts the layout/VariableName/InitialText that follow (symptom: leading
+  // 10240 and an empty string). Alpha is dropped: our TextFormat colour is RGB,
+  // same rule as the other three colour properties.
+  if (flags & 0x0400) { const rr = r.u8(), gg = r.u8(), bb = r.u8(); r.u8(); out.color = (rr << 16) | (gg << 8) | bb; }
+  if (flags & 0x0200) out.maxLength = r.u16();
+  if (flags & 0x0020) {
+    out.align = SWF_TEXT_ALIGNS[r.u8()] ?? 'left';
+    out.leftMargin = r.u16();
+    out.rightMargin = r.u16();
+    out.indent = r.u16();
+    const lead = r.i16();
+    out.leading = lead < 0 ? 0 : lead; // AIR clamps negative leading to 0
+  }
+  r.str8Z(); // VariableName (only meaningful to Flash's authoring tool)
+  if (out.hasText) out.text = r.str8Z();
+  if (out.fontId !== null) out.fontName = fonts.get(out.fontId) ?? null;
+  return out;
+}
+
+/**
+ * `DefineFont2`(48) / `DefineFont3`(75) / `DefineFont4`(91): the family name only.
+ *   48/75: FontID | FontFlags | LanguageCode | FontNameLen | FontName
+ *   91:    FontID | FontFlags | FontName (STRING)
+ * The glyph tables are not decoded -- a `DefineEditText` only needs the family, so
+ * the emitted TextField can ask Skia for the face AIR would have shaped with.
+ */
+function parseSwfFontName(body: Buffer, start: number, length: number, code: number): { id: number; name: string } {
+  const id = body.readUInt16LE(start);
+  const r = new SwfReader(body, start + 2, start + length);
+  r.u8(); // FontFlags
+  if (code === 91) return { id, name: r.str8Z() };
+  r.u8(); // LanguageCode
+  const n = r.u8();
+  // Flash writes FontNameLen including the terminating NUL (hence the trailing
+  // \0 in the raw bytes), so trim it rather than carrying it into the family name.
+  return { id, name: n === 0 ? '' : r.str8(n).replace(/\0+$/, '') };
 }
 
 /** MATRIX: variable-width scale/rotate fields then a twips translation. */
@@ -1318,10 +1535,10 @@ export interface SwcBakePlacement {
   matrix: number[] | null;
   cxform: number[] | null;
   /**
-   * The clipDepth mask that clips this child, already composed into the CHILD's
-   * own pixel space: `mask.matrix` maps the mask SHAPE's local pixels onto this
-   * child's local pixels (bake-time `inverse(childMatrix) * maskMatrix`), so the
-   * renderer only has to build the mask shape's path and clip with it.
+   * The clipDepth mask that clips this child, as the mask's own placement in the
+   * PARENT's pixel space. The mask is a sibling of the objects it clips, so its
+   * region does not follow them: the renderer applies this path before the child's
+   * own transform (see Emitter.emitRenderWalk).
    *
    * The mask character itself is never painted (AIR hides the mask object) and
    * therefore never appears in `children`. Absent/null = the child is not masked.
@@ -1347,8 +1564,10 @@ export interface SwcBakeButton {
 /**
  * A baked text character: AIR instantiates these as real `TextField`s, so we bake
  * an EMPTY `TextField` at the character's own RECT (item ②). The RECT origin is
- * applied by the placement (`x = matrix.tx + xmin`, measured in temp/childfx), and
- * the box size becomes the field size.
+ * applied by the placement, which maps it through the placement's LINEAR part and
+ * rounds to AIR's twip grid: `x = round20(tx + a*xmin + c*ymin)` (measured for four
+ * scaled children in temp/tfswc case ⑰ — see `Emitter.swcTextChildXY`), and the box
+ * size becomes the field size.
  */
 /** AutoSize lookup for the report/emitter: only DefineEditText can carry it. */
 function textAuto(id: number): boolean {
@@ -1362,6 +1581,33 @@ export interface SwcBakeText {
   oy: number;
   w: number;
   h: number;
+  /**
+   * The decoded `DefineEditText` payload; `null` for a `DefineText` (tag 11) glyph
+   * run, which the baker does not decode. When present the emitter stamps the
+   * instantiated TextField so it renders what AIR renders: `text` is the initial
+   * string (or HTML markup when `html`), and the rest is the TextFormat/layout.
+   */
+  edit?: {
+    text: string | null;
+    html: boolean;
+    font: string | null;
+    /** px (the SWF's twips / 20). 0 means "no font", i.e. TextField's own default. */
+    size: number;
+    color: number | null;
+    align: string | null;
+    multiline: boolean;
+    wordWrap: boolean;
+    password: boolean;
+    readOnly: boolean;
+    selectable: boolean;
+    border: boolean;
+    leading: number;
+    leftMargin: number;
+    rightMargin: number;
+    indent: number;
+    autoSize: boolean;
+    maxLength: number | null;
+  };
 }
 
 export interface SwcBakeCharacter {
@@ -1461,6 +1707,12 @@ export interface SwcBakeBitmap {
   height: number;
   format: 'png' | 'jpeg' | 'gif';
   encoded: Buffer;
+  /** Separate coverage plane (JPEG3 only), see `SwcBitmap.alpha`. */
+  alpha: Buffer | null;
+  /** C array symbol holding `alpha`. */
+  alphaSymbol: string;
+  /** True when this entry needs its own alpha array emitted. */
+  ownAlpha: boolean;
 }
 
 export interface SwcBake {
@@ -1719,15 +1971,16 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       for (const [md, m] of masks) if (md < depth && depth <= m.clipDepth) mask = m;
       if (mask !== null) {
         if (shapeById.has(mask.charId)) {
-          // Compose MASK -> CHILD: the child is rendered with its own matrix, so the
-          // clip path must be expressed in the child's local pixels. A singular
-          // child matrix (scale 0) paints nothing at all, so skipping the clip
-          // there cannot change any pixel.
-          const inv = child.matrix === null ? [1, 0, 0, 1, 0, 0] : invMatrix(child.matrix);
-          const composed = inv === null
-            ? null
-            : mulMatrix(inv, mask.matrix === null ? [1, 0, 0, 1, 0, 0] : mask.matrix);
-          if (composed !== null) child.mask = { charId: mask.charId, matrix: composed };
+          // The clip path is the mask's outline in the PARENT's pixel space (the
+          // mask's own placement matrix, nothing more). A clipDepth mask is a
+          // sibling of the objects it clips, so it stays put while they move;
+          // composing it into the child's local pixels instead (bake-time
+          // `inverse(childMatrix) * maskMatrix`) made the mask travel with the
+          // child -- the TalkMED login ticker, whose fixed mask is supposed to
+          // reveal the slide the film has slid to, showed only the first slide
+          // (local == parent only while the film is at x=0) and blank afterwards.
+          // The renderer sets this path BEFORE the object's own transform.
+          child.mask = { charId: mask.charId, matrix: mask.matrix === null ? [1, 0, 0, 1, 0, 0] : mask.matrix };
         } else if (!maskNotes.has(mask.charId)) {
           // A mask that is a sprite or a morph shape cannot be turned into a path
           // clip here (AIR uses the mask's rendered alpha, which our path clip
@@ -1874,7 +2127,33 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       const b = text.bounds;
       characters.push({
         id, kind: 'text',
-        text: { ox: px(b.xmin), oy: px(b.ymin), w: px(b.xmax - b.xmin), h: px(b.ymax - b.ymin) },
+        text: {
+          ox: px(b.xmin), oy: px(b.ymin), w: px(b.xmax - b.xmin), h: px(b.ymax - b.ymin),
+          // Only tag 37 has a payload to stamp; tag 11 stays an empty box (its
+          // glyph runs need the embedded font's CodeTable).
+          edit: text.tag === 37
+            ? {
+              text: text.text,
+              html: text.html,
+              font: text.fontName,
+              size: text.fontHeight === null ? 0 : px(text.fontHeight),
+              color: text.color,
+              align: text.align,
+              multiline: text.multiline,
+              wordWrap: text.wordWrap,
+              password: text.password,
+              readOnly: text.readOnly,
+              selectable: text.selectable,
+              border: text.border,
+              leading: px(text.leading),
+              leftMargin: px(text.leftMargin),
+              rightMargin: px(text.rightMargin),
+              indent: px(text.indent),
+              autoSize: text.autoSize,
+              maxLength: text.maxLength,
+            }
+            : undefined,
+        },
       });
       continue;
     }
@@ -1923,6 +2202,9 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       height: b.height,
       format: b.format,
       encoded: b.encoded,
+      alpha: b.alpha,
+      alphaSymbol: `${shared ?? `__swcbmp_${id}`}_a`,
+      ownAlpha: shared === undefined,
     });
   }
 
@@ -1966,13 +2248,18 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       `the child keeps its place in the display list but paints nothing (swc.md §10)`
     );
   }
-  const textPlaceholders = characters.filter((c) => c.kind === 'text').length;
-  if (textPlaceholders > 0) {
-    const autoSized = characters.filter((c) => c.kind === 'text' && textAuto(c.id)).length;
+  const textChars = characters.filter((c) => c.kind === 'text');
+  if (textChars.length > 0) {
+    const editText = textChars.filter((c) => c.text?.edit !== undefined);
+    const withText = editText.filter((c) => (c.text?.edit?.text ?? null) !== null).length;
+    const glyphRuns = textChars.length - editText.length;
+    const autoSized = textChars.filter((c) => textAuto(c.id)).length;
     notes.push(
-      `${textPlaceholders} DefineText/DefineEditText character(s) are baked as EMPTY TextField placeholders ` +
-      `(box size + position from the SWF RECT): AIR also fills them with the authored glyphs, which this baker ` +
-      `does not decode (swc.md §3.3 / §10)` +
+      `${textChars.length} text character(s) are baked as TextFields: ` +
+      `${editText.length} DefineEditText (tag 37) carry their decoded InitialText + TextFormat ` +
+      `(${withText} have a non-empty string), ${glyphRuns} DefineText (tag 11) still bake as an EMPTY box ` +
+      `because their glyph runs need the embedded font's CodeTable, which this baker does not decode ` +
+      `(swc.md §3.3 / §10)` +
       (autoSized > 0
         ? `; ${autoSized} of them have DefineEditText's AutoSize flag set, so AIR fits their box to those glyphs ` +
           `and the width/height it reports differ from the RECT`
@@ -1983,13 +2270,18 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
   if (timelineSprites.length > 0) {
     const labelled = timelineSprites.filter((c) => (c.labels ?? []).length > 0).length;
     const animated = timelineSprites.filter((c) => (c.frames ?? []).length > 0).length;
+    // The frame ACTION SCRIPTS are NOT in the SWF timeline: Flash compiles them into
+    // the symbol's own DoABC and registers them with `addFrameScript`. abc.ts decodes
+    // them, so this note reports how many of these clips actually have one to run
+    // rather than claiming they cannot run (they used to be out of scope).
+    const scripted = timelineSprites.filter((c) => lib.scripts.has(c.id)).length;
     notes.push(
       `${timelineSprites.length} baked DefineSprite character(s) have a multi-frame timeline (totalFrames > 1): ` +
       `${animated} of them change their display list after frame 1 and ${labelled} carry FrameLabel records. ` +
       `The timeline itself is baked (gotoAndStop/gotoAndPlay/nextFrame/prevFrame/play and currentLabels work), ` +
-      `but the per-frame ACTION SCRIPTS live in DoABC, which this baker does not read: AIR's stop()/gotoAndStop() ` +
-      `frame scripts are therefore NOT run, and every baked clip starts on frame 1 with isPlaying == false ` +
-      `(which is what adl 51.4.1 reports for this library's skin clips, measured)`
+      `and the frame ACTION SCRIPTS decoded from the symbols' DoABC (${scripted} of these clips have one) run ` +
+      `when the playhead lands on their frame, frame 1 included. Every baked clip starts on frame 1 with ` +
+      `isPlaying == false (which is what adl 51.4.1 reports for this library's skin clips, measured)`
     );
   }
   for (const n of frameNotes) notes.push(n);
@@ -2091,6 +2383,41 @@ function sniffFormat(bytes: Buffer): 'png' | 'jpeg' | 'gif' {
   if (bytes.length >= 8 && bytes[0] === 0x89 && bytes.toString('latin1', 1, 4) === 'PNG') return 'png';
   if (bytes.length >= 6 && bytes.toString('latin1', 0, 3) === 'GIF') return 'gif';
   return 'jpeg';
+}
+
+/**
+ * Decompress a `DefineBitsJPEG3` alpha plane (the tail of the tag, after the
+ * JPEG half) into one coverage byte per pixel.
+ *
+ * The plane is a plain zlib stream of `width * height` bytes in row-major order
+ * (no row padding, unlike `DefineBitsLossless`). Anything that does not inflate
+ * to at least that many bytes means the bitmap is unreadable — say so loudly and
+ * keep the image opaque rather than compose garbage coverage on top of it
+ * (AGENTS.md §2.5: never fall back silently to a wrong result).
+ */
+function decodeJpeg3Alpha(plane: Buffer, id: number, width: number, height: number): Buffer | null {
+  if (plane.length === 0) {
+    process.stderr.write(`\x1b[33mwarning: SWC bitmap #${id} is DefineBitsJPEG3 with an empty alpha plane — the image will decode opaque\x1b[0m\n`);
+    return null;
+  }
+  let raw: Buffer;
+  try {
+    raw = inflateSync(plane);
+  } catch (e) {
+    process.stderr.write(
+      `\x1b[33mwarning: SWC bitmap #${id} is DefineBitsJPEG3 but its alpha plane does not inflate ` +
+        `(${(e as Error).message}) — the image will decode opaque\x1b[0m\n`
+    );
+    return null;
+  }
+  if (width <= 0 || height <= 0 || raw.length < width * height) {
+    process.stderr.write(
+      `\x1b[33mwarning: SWC bitmap #${id} is DefineBitsJPEG3 but its alpha plane is ${raw.length} bytes ` +
+        `for a ${width}x${height} image — the image will decode opaque\x1b[0m\n`
+    );
+    return null;
+  }
+  return Buffer.from(raw.subarray(0, width * height));
 }
 
 /**
@@ -2302,27 +2629,31 @@ export function extractSwc(path: string): SwcLibrary {
         width,
         height,
         encoded: encodePng(width, height, rgba),
+        alpha: null,
       });
     } else if (t.code === TAG_DEFINE_BITS_JPEG2) {
       // characterID u16 + complete JPEG/PNG/GIF bytes, pass-through (no alpha).
       const encoded = Buffer.from(body.subarray(t.start + 2, t.start + t.length));
       const format = sniffFormat(encoded);
       const { width, height } = format === 'jpeg' ? jpegSize(encoded) : { width: 0, height: 0 };
-      bitmaps.push({ tagId: id, className: classNames.get(id) ?? null, format, width, height, encoded });
+      bitmaps.push({ tagId: id, className: classNames.get(id) ?? null, format, width, height, encoded, alpha: null });
     } else if (t.code === TAG_DEFINE_BITS_JPEG3) {
       // characterID u16 | alphaDataOffset u32 | JPEG bytes | zlib alpha plane.
-      // JPEG cannot carry alpha, and we have no JPEG decoder in the zero-dep
-      // build, so the alpha plane is dropped; flag it loudly rather than ship a
-      // silently-opaque image (swc.md §10 keeps full JPEG3 support deferred).
+      // JPEG cannot carry alpha, so the tag stores the picture twice: an ordinary
+      // JPEG for RGB, plus one zlib-compressed 8-bit coverage byte per pixel. AIR
+      // composites the two, so the artwork's "transparent" area in the JPEG (which
+      // an FLA export fills with BLACK) must be replaced by the plane's coverage —
+      // otherwise every such bitmap renders as a black rectangle over the skin.
+      //
+      // The JPEG half is embedded verbatim and the plane is handed over DECOMPRESSED:
+      // decoding happens at runtime, where Skia already has a JPEG decoder, instead
+      // of pulling one into the zero-dependency Node side (AGENTS.md §3.1).
       const alphaOffset = body.readUInt32LE(t.start + 2);
       const encoded = Buffer.from(body.subarray(t.start + 6, t.start + 6 + alphaOffset));
       const format = sniffFormat(encoded);
       const { width, height } = format === 'jpeg' ? jpegSize(encoded) : { width: 0, height: 0 };
-      process.stderr.write(
-        `\x1b[33mwarning: SWC bitmap #${id} is DefineBitsJPEG3; its alpha plane is not ` +
-          `composited (JPEG has no alpha channel) — the image will decode opaque\x1b[0m\n`
-      );
-      bitmaps.push({ tagId: id, className: classNames.get(id) ?? null, format, width, height, encoded });
+      const alpha = decodeJpeg3Alpha(body.subarray(t.start + 6 + alphaOffset, t.start + t.length), id, width, height);
+      bitmaps.push({ tagId: id, className: classNames.get(id) ?? null, format, width, height, encoded, alpha });
     }
   }
 
@@ -2334,30 +2665,30 @@ export function extractSwc(path: string): SwcLibrary {
   const sprites: SwcSprite[] = [];
   const buttons: SwcButton[] = [];
   const texts: SwcText[] = [];
+  const fonts = new Map<number, string>();
   const scalingGrids = new Map<number, SwcRect>();
   const characters = new Map<number, SwcCharacter>();
+  // Fonts first: a DefineEditText names its face by FontID, so the table has to be
+  // complete before any text character is decoded (the tag order in the file is
+  // not guaranteed to put DefineFont* before the text that uses it).
+  for (const t of tags) {
+    if (t.code === 48 || t.code === 75 || t.code === 91) {
+      const f = parseSwfFontName(body, t.start, t.length, t.code);
+      if (!fonts.has(f.id)) fonts.set(f.id, f.name);
+    }
+  }
   for (const t of tags) {
     const kind = CHARACTER_TAG_KINDS[t.code];
     if (kind) {
       const id = t.length >= 2 ? body.readUInt16LE(t.start) : 0;
       // A later definition of the same id wins (SWF allows redefinition).
       characters.set(id, { id, kind, tag: t.code });
-      // Both text tags carry the character's RECT right after the id:
-      // DefineText = CharacterID | TextBounds | TextMatrix | GlyphBits | ..., and
-      // DefineEditText = CharacterID | Bounds | flags | ... Only the RECT is read:
-      // the glyph/text payload is a documented, out-of-scope gap (swc.md §3.3).
+      // Text characters carry the character's RECT right after the id, and tag 37
+      // (DefineEditText) carries the whole TextField after it -- see parseSwfText.
       if (t.code === 11 || t.code === 37) {
-        const r = new SwfReader(body, t.start + 2, t.start + t.length);
-        const bounds = readSwfRect(r);
-        // DefineEditText's flag bytes follow the RECT; AutoSize is 0x80 of the
-        // second one. DefineText (tag 11) goes straight to TextMatrix, so it has none.
-        let autoSize = false;
-        if (t.code === 37) {
-          r.u8(); // HasText / HasTextColor / HasMaxLength / HasFont / HasFontClass / HasLayout / Password / ReadOnly
-          autoSize = (r.u8() & 0x80) !== 0;
-        }
-        texts.push({ id, bounds, autoSize });
-        TEXT_AUTOSIZE.set(id, autoSize);
+        const text = parseSwfText(body, t.start, t.length, t.code, fonts);
+        texts.push(text);
+        TEXT_AUTOSIZE.set(id, text.autoSize);
       }
     }
     if (t.code === 2 || t.code === 22 || t.code === 32 || t.code === 83) {
@@ -2394,5 +2725,26 @@ export function extractSwc(path: string): SwcLibrary {
   }
   // counts are exposed only through the returned library (swc.md §9 E).
 
-  return { source: path, bitmaps, shapes, sprites, buttons, texts, scalingGrids, classNames, characters };
+  // --- Symbol-class timeline scripts (diff doc D17) ------------------------
+  // A Flash symbol's behaviour (`stop()`, `buttonMode`, the click handler that
+  // moves a checkbox to its checked frame) is compiled into a generated FLA class
+  // whose constructor calls `addFrameScript`; without it a scripted symbol's
+  // playhead never moves, which is why talkmed's agreement checkbox could not be
+  // ticked. `abc.ts` decodes those classes into our AST. Anything it cannot decode
+  // is reported here and left behaving exactly as before (no scripts), never
+  // guessed at (AGENTS.md §1.5).
+  const charKinds = new Map<number, string>();
+  for (const [id, c] of characters) charKinds.set(id, c.kind);
+  const { scripts: scriptsDecoded, skipped: scriptNotes } = decodeSymbolScripts(body, tags, classNames, charKinds);
+  if (scriptNotes.length > 0) {
+    process.stderr.write(
+      `\x1b[33mwarning: SWC symbol timeline scripts not decoded (those symbols keep ` +
+        `their frame-1-only behaviour):\n  ${scriptNotes.join('\n  ')}\x1b[0m\n`
+    );
+  }
+
+  return {
+    source: path, bitmaps, shapes, sprites, buttons, texts, fonts, scalingGrids,
+    classNames, characters, scripts: scriptsDecoded,
+  };
 }

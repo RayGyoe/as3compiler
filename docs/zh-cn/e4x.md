@@ -84,6 +84,57 @@ Starling 连纹理图集和位图字体都加载不了**，是渲染管线的硬
 | `System.disposeXML(xml)` | 显式释放（6 处，`System` 内建） |
 | `describeType(x):XML` | 反射描述（2 处） |
 
+### 2.6 字符串值与 `XML(ByteArray)`（阶段一百四十三，`adl 51.4.1` 值日志 `temp/tkmeet-mac/{xmlstr,xmlba}/`）
+
+真应用 talkmed-meeting 的语言资源走 `XML(new language_en())`（`[Embed(..., mimeType="application/octet-stream")]`
+⇒ 生成的资源类是 **ByteArray 子类**），实测把两条规则钉死：
+
+**一、`XML(value)` 接受 ByteArray**（其字节即 UTF-8 标记文本）。调用点静态类型是 `Class`/`*` 时走**动态**分支，
+故 `as_xml_from_value` 必须认 ByteArray（含一切 ByteArray 子类 —— `as_is` 沿 `super` 链走，`[Embed]` 类都命中）。
+
+| 输入 | `adl` | 本子集 |
+|---|---|---|
+| `XML(ba)`（UTF-8 标记） | 解析出的树（多字节字符完好） | ✅ 同（`examples/xml-embed.as`） |
+| `XML(new <octet-stream Embed 类>())` | 同上 | ✅ 同 |
+| `XML(xmlNode)` | 透传 | ✅ 同 |
+
+**二、`toString()` 是 E4X 的「字符串值」，不是标记**：
+
+| 形状 | `toString()` | `toXMLString()` |
+|---|---|---|
+| 文本节点 `XML("plaintext")` | `plaintext` | — |
+| `<a b='1'>txt</a>`（**无**元素子节点） | `txt` | `<a b="1">txt</a>` |
+| `<a b='1'/>`（无子节点） | `""` | `<a b="1"/>` |
+| `<a b='1'><c d='2'/></a>`（**有**元素子节点） | 标记 | 标记 |
+| `<a>x<b/>y</a>` | 标记 | 标记 |
+| `XMLList`：0 / **1** / ≥2 项 | `""` / **该项的字符串值**（`"a"`） / 各项**标记**以换行连接 | — |
+
+**仍未对齐**（同一批实测，已登记 `TODO.md` 遗留表）：① **`toXMLString()` 未实现**（响亮
+`CodegenError: unsupported XML/XMLList method 'toXMLString'`）；② 标记输出**保持源形态**，而 AIR 会**重新缩进**
+（`<a><b/></a>` → `<a>\n  <b/>\n</a>`）并**剪掉纯白空格文本节点**（`<a> </a>` → `<a/>`）。
+
+### 2.7 动态槽里的 XML/XMLList 也必须是字符串值（阶段一百四十四，实测 `temp/xmlstr3` + `temp/apv/adl`）
+
+上一节的规则覆盖**静态已知**的 `var s:String = xml`（发射侧直接走 `as_xml_string_value`）。但值一旦流经
+**动态槽** —— `Object`、`*`、数组元素、`Dictionary` 值、动态属性、`Object` 形参 —— 就落到**对象 vtable 的字符串
+转换槽**（`box_to_str`），于是输出 `[object XML]`。
+
+真应用形态：talkmed-meeting 的本地化文案存在 XML 里、经**动态查表**取出，登录页**每一条文案**都渲染成
+`[object XML]`（窗口标题也是）。
+
+| 形状 | `adl` | 修复前 | 现在 |
+|---|---|---|---|
+| `String(o)`，`o:Object` 持有 XML | 文本 | `[object XML]` | ✅ 文本 |
+| `"" + o` / 形参传 XML | 文本 | `[object XML]` | ✅ 文本 |
+| `[x]` 的 `[0]`、数组整体 `toString()` | 文本 | `[object XML]` | ✅ 文本 |
+| `{k:x}.k` 动态属性 | 文本 | `[object XML]` | ✅ 文本 |
+| `XMLList` 经动态槽（0 项 / 1 项） | `""` / 该项字符串值 | `[object XMLList]` | ✅ 同 |
+| `xml as String` | `null`（XML 不是 String） | `null` | ✅ 不变 |
+
+**实现**：`as_xml_vt`/`as_xml_list_vt` 的 `box_to_str` 从 `as_object_box_to_str` 换成
+`as_xml_box_to_str`/`as_xml_list_box_to_str`（委托给 `as_xml_string_value`/`as_xml_list_to_string`）。
+例：`examples/xml-dynamic-str.as`；结构钉：`unit: e4x/StringValue` 后三条。
+
 ---
 
 ## 3. AS3 E4X 语义与 C 的差异（正确性红线）
@@ -143,6 +194,7 @@ E4X 是 ES4 规范的产物，AS3 完全继承。翻译时必须显式处理的�
 > **修正（阶段一百零八）**：上面这行旧结论**已过时** —— XML 字面量与 `..` 后代轴在**阶段一百零六** 落地（见 §4 表），`ns::[expr]`/`@[expr]` 计算名与命名空间前缀处理在**阶段一百零八** 落地。仍未实现：
 > ① **命名空间建模**（限定词透明 ⇒ 同局部名不同 uri 无法区分，`Namespace` 值只是占位）；② `..*` **不计文本节点**（AIR 计，`5.desc-any` 我们 2 / AIR 4）；③ **一般过滤谓词** `.(<expr>)`（只支持 `.(@attr ==/!= value)` 形态）；④ `+`/`+=` 的 XML 拼接。
 > 均已在 `TODO.md` 遗留表登记。
+> ⑤ **`toXMLString()` 未实现**（响亮 `CodegenError`）；⑥ 标记输出**不按 AIR 重新缩进**、**不剪纯白空格文本节点**（阶段一百四十三 实测，见 §2.6）。
 
 ---
 

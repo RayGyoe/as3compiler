@@ -76,7 +76,10 @@ function checkFunctionMemberCall(): string[] {
   check('a dotted call of a Function-valued field invokes the stored closure',
     c.includes('as_req_fn((this->fn), NULL)->fn(as_req_fn((this->fn), NULL)->env, NULL, 0);'));
   check('a `with` call of a Function-valued field invokes the stored closure',
-    c.includes('as_req_fn((_w0->fn), NULL)->fn(as_req_fn((_w0->fn), NULL)->env, NULL, 0);'));
+    // The `with` receiver is a tmpName() temporary, and tmpName() spellings live in
+    // the emitter's own name space (cIdent pushes an AS3 identifier out of it), so
+    // the temp reads as `__w0` rather than `_w0` -- match either.
+    /as_req_fn\(\(_+w\d+->fn\), NULL\)->fn\(as_req_fn\(\(_+w\d+->fn\), NULL\)->env, NULL, 0\);/.test(c));
 
   const loud = (src: string): string => {
     try { generateC(parse(src)); return ''; } catch (e) { return (e as Error).message; }
@@ -530,7 +533,7 @@ function checkMemberShadow(): string[] {
   // its layout is pinned in platform.ts, and it still must read for a receiver that
   // does not shadow it.
   check('the EventDispatcher `parent` slot survives as the runtime ABI anchor',
-    c.includes('{ "parent", 12, offsetof(EventDispatcher, parent) },'));
+    c.includes('{ "parent", 12, offsetof(EventDispatcher, parent), NULL, NULL, 0 },'));
   const cu = generateC(parse('class U extends Sprite { }\nvar u:U = new U();\nu.name = "k";\nvar n:String = u.name;\n')).c;
   // The write still goes straight to the slot (no setter); it is only wrapped by
   // the DisplayObject.name #2007 guard (AIR rejects a null name; measured on
@@ -633,3 +636,104 @@ function checkThunkOwnerScope(): string[] {
   return bad;
 }
 registerGroup('unit: reflection/ThunkOwnerScope', checkThunkOwnerScope);
+
+// ---- dynamic-call arity + optional-argument defaults (stage 142) ----
+// A dynamic call (a `*`-typed receiver) dispatches through as_dyn_call/as_any_call
+// to a per-method reflection thunk. That thunk read `args[i]` for every parameter
+// unguarded, so an OMITTED optional argument was an out-of-bounds read of the
+// caller's as_value[] -- and a NULL dereference when the call passed no arguments
+// at all (the array is NULL). It crashed the real talkmed-meeting AIR app inside
+// com.vsdevelop.air.data.SQLConnect's constructor:
+//   Conn.addEventListener(SQLErrorEvent.ERROR, errorHandler)   // Conn is `*`
+// argc=2 for a 5-parameter method, args[2..4] came off the caller's stack, one
+// looked like an Array (tag 6) with a garbage pointer, and as_array_join died in
+// strlen. adl 51.4.1 (temp/tkmeet-mac/dyn/adl.txt) shows the two rules the thunk
+// must now implement: an omitted optional takes its DECLARED default (`c.f(1)` is
+// 7), and any other argument count is ArgumentError #1063 whose "Expected" is the
+// number of parameters before the first optional one (a 0-parameter METHOD
+// rejects any argument, unlike a 0-parameter Function VALUE, which AIR variadic).
+function checkDynCallArityDefaults(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [dynarity] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [dynarity] ${label}`); }
+  };
+  const src = [
+    'class C { public function f(a:int, b:int = 7):int { return b; } }',
+    'class H { public function m():int { return 5; } }',
+    'class R { public function r(a:int = 0, ...rest):String { return "x"; } }',
+    'class S { public function t(a:int, ...rest):String { return "y"; } }',
+    'var c:* = new C(); var x:* = c.f(1);',
+    'var h:* = new H(); var y:* = h.m();',
+    'var r:* = new R(); var z:* = r.r(1);',
+    'var s:* = new S(); var w:* = s.t(1);',
+    'var lc:* = new LocalConnection(); lc.allowDomain("a");',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+  const thunk = (n: string): string => c.match(new RegExp(`static as_value ${n}\\(void\\* _this, as_value\\* args, int argc\\) \\{[\\s\\S]*?\\n\\}`))?.[0] ?? '';
+
+  // req=1, max=2. Both bounds are checked; "Expected" is the REQUIRED count (1).
+  const cf = thunk('C_f__dyn');
+  check('a dynamic call checks both bounds and names class/method in #1063',
+    cf.includes('if (argc < 1 || argc > 2) { as_fn_arity_error("C/f", 1, argc); return as_v_null(); }'));
+  check('an omitted optional argument falls back to its DECLARED default, not args[i]',
+    cf.includes('(argc > 1 ? as_v_int_cast(args[1]) : 7)'));
+  check('...and no parameter is read unguarded', !/args\[1\]\)\)\)/.test(cf));
+
+  // A 0-parameter METHOD rejects any argument (max=0, so only the upper bound).
+  const hm = thunk('H_m__dyn');
+  check('a 0-parameter method rejects any argument (argc > 0)',
+    hm.includes('if (argc > 0) { as_fn_arity_error("H/m", 0, argc); return as_v_null(); }'));
+
+  // req=0 with a rest parameter: every count is legal, so no guard is emitted and
+  // the trailing arguments are packed from args[0..].
+  const rr = thunk('R_r__dyn');
+  check('a rest parameter after only optionals lifts the upper bound (no guard)',
+    rr.includes('(void)argc;') && !rr.includes('as_fn_arity_error'));
+  check('...and the rest parameter is packed from the caller\'s flat argument list',
+    rr.includes('as_array_make((argc > 1 ? argc - 1 : 0), (argc > 1 ? &args[1] : NULL))'));
+
+  // req=1 before a rest: only the lower bound applies.
+  const st = thunk('S_t__dyn');
+  check('a required parameter before a rest still bounds the count',
+    st.includes('if (argc < 1) { as_fn_arity_error("S/t", 1, argc); return as_v_null(); }'));
+  check('...and the rest still packs', st.includes('as_array_make((argc > 1 ? argc - 1 : 0), (argc > 1 ? &args[1] : NULL))'));
+
+  // The rest slot is NOT always Array-typed: the built-in LocalConnection#send /
+  // allowDomain declare `...domains` as `*` (C as_value), so the packed Array must
+  // be boxed. Without this the generated C does not compile at all.
+  const lc = thunk('LocalConnection_allowDomain__dyn');
+  check('a rest parameter declared `*` has its packed Array BOXED',
+    lc.includes('as_v_arr((void*)(as_array_make((argc > 0 ? argc - 0 : 0), (argc > 0 ? &args[0] : NULL))))'));
+
+  // The built-in this bug was found through: `addEventListener(type, listener)`
+  // with three optionals omitted is legal, and the qname is AIR's qualified form.
+  const ad = thunk('EventDispatcher_addEventListener__dyn');
+  check('the built-in addEventListener thunk enforces AIR\'s 2..5 and quotes the qualified name',
+    ad.includes('if (argc < 2 || argc > 5) { as_fn_arity_error("flash.events::EventDispatcher/addEventListener", 2, argc); return as_v_null(); }'));
+  check('its three omitted optionals take their declared defaults',
+    ad.includes('(argc > 2 ? as_v_truthy(args[2]) : false)')
+    && ad.includes('(argc > 3 ? as_v_int_cast(args[3]) : 0)')
+    && ad.includes('(argc > 4 ? as_v_truthy(args[4]) : false)'));
+
+  // Source-level: the rule lives in emitMethodThunks and reuses the two existing
+  // helpers rather than re-deriving the count or the name.
+  const emitSrc = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const thunkBody = emitSrc.slice(emitSrc.indexOf('private emitMethodThunks()'), emitSrc.indexOf('private emitMethodTables()'));
+  check('the method thunk uses requiredArity() for "Expected"', thunkBody.includes('const req = this.requiredArity(params);'));
+  check('...reuses as_fn_arity_error with fnQName()', thunkBody.includes('this.fnQName(cname, mname)') && thunkBody.includes('as_fn_arity_error('));
+  check('...and guards each omitted optional with the declared default',
+    thunkBody.includes('return `(argc > ${i} ? ${unboxArg} : ${defCode})`;'));
+
+  // The example pins the measured AIR goldens end to end.
+  const ex = readFileSync(join(dir, 'dyn-call-defaults.as'), 'utf8');
+  check('the example pins AIR\'s #1063 text',
+    ex.includes('"Error #1063: Argument count mismatch on C/f(). Expected 1, got 0."'));
+  check('...and the declared-default and rest goldens',
+    ex.includes('check(c.f(1) == 7') && ex.includes('check(r.r(5, 1, 2, 3) == "5|3|1-2-3"'));
+
+  if (ok > 0) console.log(`[dynarity] ${ok} dynamic-call arity/default checks passed`);
+  return bad;
+}
+registerGroup('unit: reflection/DynCallArityDefaults', checkDynCallArityDefaults);

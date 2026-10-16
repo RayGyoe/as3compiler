@@ -98,6 +98,12 @@ check(URLRequestDefaults.userAgent == "LaterAgent/1.0", "URLRequestDefaults.user
 check(new URLRequest("http://www.example.com/").userAgent == "LaterAgent/1.0", "…and is still handed to new requests");
 
 // --- URLVariables.decode(): the read side of the query-string serializer ---
+// This is FORM decoding (application/x-www-form-urlencoded), not URI decoding, and
+// it applies to BOTH halves of a pair: percent escapes and a literal '+' (a space)
+// are decoded in the key as well as in the value. Measured on adl 51.4.1
+// (temp/uvarair): new URLVariables("a%20b=c%20d") answers the key "a b" and
+// toString() gives back "a%20b=c%20d" -- the round trip only closes because the
+// key was decoded on the way in; "p+q=1" answers the key "p q".
 var vars:URLVariables = new URLVariables();
 vars.decode("first=1&second=hello%20world&third=");
 check(vars.first == "1", "decode() sets a numeric-looking value as a String");
@@ -105,11 +111,13 @@ check(vars.second == "hello world", "decode() percent-decodes values");
 check(vars.third == "", "decode() keeps an empty value");
 vars.decode("only=one");
 check(vars.only == "one", "decode() can be called again on the same instance");
-// Keys are not percent-decoded (AIR's asymmetry: values are decoded, keys are not).
 var vars2:URLVariables = new URLVariables("a%20b=c%20d");
-check(vars2["a%20b"] == "c d", "decode() decodes values but not keys");
-check(vars2.toString().indexOf("a%20b=c+d") >= 0 || vars2.toString().indexOf("a%20b=c%20d") >= 0,
-      "decoded variables round-trip through toString()");
+check(vars2["a b"] == "c d", "decode() percent-decodes the KEY as well as the value");
+check(vars2["a%20b"] == undefined, "...so the raw spelling is not a property");
+check(vars2.toString() == "a%20b=c%20d", "decoded variables round-trip through toString()");
+var vars3:URLVariables = new URLVariables("p+q=1");
+check(vars3["p q"] == "1", "a literal '+' is a space in the key too");
+check(vars3.toString() == "p%20q=1", "...and toString() re-encodes it as %20");
 
 // --- useRedirectedURL(): domain substitution, then pattern replacement ---
 // A "source" request that has already been redirected to a CDN.

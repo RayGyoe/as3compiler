@@ -20,3 +20,4 @@ import './unit/emit.ts';
 import './unit/logical.ts';
 import './unit/embed.ts';
 import './unit/reach.ts';
+import './unit/testinfra.ts';

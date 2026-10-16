@@ -346,6 +346,56 @@ function checkRequestContentType(): string[] {
   return bad;
 }
 
+// ---- URLRequest.method is case-insensitive on the wire (阶段一百五十四) ----
+// AIR keeps whatever spelling the app assigned on the property, but normalizes
+// the verb to UPPERCASE before the request leaves the process, and applies the
+// SAME case-insensitive rule when deciding whether `data` goes into the query
+// string or into the body. Measured on adl 51.4.1 against a local echo server
+// (probe kept under temp/httpverb, not asserted here):
+//
+//   new URLRequest(url).method            => "GET"
+//   r.method = "get";  r.method           => "get"      (property keeps the spelling)
+//   method "get"/"GET" + URLVariables     => wire `GET  /p?a=1&b=x%20y` body ""
+//   method "pOsT"/"PUT" + URLVariables    => wire `POST`/`PUT /p` body "a=1&b=x%20y"
+//
+// The two halves must not drift apart: the fold and the wire verb are decided by
+// one predicate, so the fix is a single normalization at the serialization seam
+// (net__prepare_request) rather than a case-insensitive strcmp at each site.
+function checkRequestMethod(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [req-method] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [req-method] ${label}`); }
+  };
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const prep = (() => {
+    const i = emitSource.indexOf('static void net__prepare_request(URLRequest* request, net_req* r) {');
+    if (i < 0) return '';
+    const j = emitSource.indexOf('net_req r; net__prepare_request(request, &r);', i);
+    return emitSource.slice(i, j < 0 ? i + 6000 : j);
+  })();
+  check('the shared serialization seam uppercases request->method',
+    /as_str_toUpper\(request->method\)/.test(prep));
+  check('the raw spelling never reaches the job verbatim',
+    !/r->method = \(request->method != NULL\) \? request->method :/.test(prep));
+  check('a request without an explicit method still defaults to GET',
+    /: "GET";/.test(prep));
+  check('the query/body fold tests the normalized verb',
+    /if \(strcmp\(r->method, "GET"\) == 0\)/.test(prep));
+  // The transport seam therefore only ever sees an uppercase verb, and its own
+  // comparisons may stay literal (they would silently stop matching if the
+  // normalization above were dropped).
+  check('the curl seam still decides POST/GET/HEAD on the normalized verb',
+    /int is_post = \(strcmp\(method, "POST"\) == 0\)/.test(RUNTIME_PREAMBLE) &&
+    /else if \(strcmp\(method, "GET"\) != 0\)/.test(RUNTIME_PREAMBLE) &&
+    /if \(strcmp\(method, "HEAD"\) == 0\)/.test(RUNTIME_PREAMBLE));
+  check('the URLRequest ctor default matches adl ("GET")',
+    /o->method = \(char\*\)"GET";/.test(emitSource));
+  if (ok > 0) console.log(`[req-method] ${ok} method-normalization checks passed`);
+  return bad;
+}
+
 // ---- who owns a staged job result (阶段八十九·七十) ----
 // The async job table has TWO ownership rules and they are opposites, so the
 // wrong one is invisible until a resource is destroyed twice:
@@ -412,6 +462,24 @@ function checkJobOwnership(): string[] {
   check('the job still owns and frees its staged buffers',
     /free\(\(void\*\)j->bytes\);/.test(retired) && /free\(j->pixels\);/.test(retired));
 
+  // ...and a loadBytes payload is the THIRD case, where the same rule was applied
+  // one time too many: the decode freed it and nulled bytes/len, but the loader's
+  // finish thunk builds the display-list SkImage from exactly those bytes. With
+  // the payload gone and no URL to fall back on, bd->image stayed NULL and the
+  // Bitmap painted nothing while bitmapData held correct pixels -- TalkMED's
+  // graphical captcha (a JPEG handed to loadBytes) was invisible for this reason
+  // even after its request started succeeding (stage 154).
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const emitSrc = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  check('a loadBytes payload survives its own decode',
+    /int keep_encoded = \(j->kind == AS_JOB_DECODE\);/.test(pre));
+  check('the loader builds its display image from that payload, file second',
+    emitSrc.includes("const void* enc = as_job_bytes(job);") &&
+    emitSrc.includes('if (enc != NULL && enc_len > 0) bd->image = as_skia_image_from_bytes(enc, enc_len);') &&
+    emitSrc.includes('else if (li->url != NULL) bd->image = as_skia_image_from_file(li->url);'));
+  check('the decode still releases a payload nobody kept',
+    /if \(!keep_encoded\) \{ free\(buf\); j->bytes = NULL; j->len = 0; \}/.test(pre));
+
   // The example that reproduced the crash must keep reproducing it: it is the
   // close() from the app's own COMPLETE listener that makes the second fclose a
   // double close. Without it the pin above passes on a build that cannot fail.
@@ -428,9 +496,151 @@ function checkJobOwnership(): string[] {
   return bad;
 }
 
+// ---- SharedObject local store: AIR's ".sol" container (阶段一百五十) ----
+// D11 of the TalkMED diff: the store used to be a JSON file under
+// <storage>/<name>.json, so an AIR session and an AOT session could not see each
+// other's data. The container, the path encoding and the AMF3 payload were then
+// reverse-engineered from adl (temp/solprobe2..C) and reimplemented; the two
+// directions are verified against each other in temp/sotest (AOT writes -> adl
+// reads, adl writes -> AOT reads, byte counts identical). Those probes live
+// outside the regression set, so the SHAPE is pinned here.
+function checkSharedObjectStore(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [solstore] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [solstore] ${label}`); }
+  };
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const airApp = readFileSync(join(root, 'src', 'air-app.ts'), 'utf8');
+  const p = RUNTIME_PREAMBLE;
+
+  // -- the path AIR derives from the name: 27 characters + ".sol", the remaining
+  //    prefix folded from the END into '#'-suffixed directories of at most 30.
+  check('a name of 27 bytes or less is <name>.sol',
+    emitSource.includes("if (n <= 27) return as_str_concat((char*)name, (char*)\".sol\");"));
+  check('a longer name keeps its LAST 27 characters in the file name',
+    emitSource.includes('memcpy(out + w, name + prefix, 27); w += 27;')
+    && emitSource.includes('memcpy(out + w, ".sol", 4); w += 4;'));
+  check('the remainder becomes #-suffixed directories of 30 (measured: a 35-character name is "eDoctor_#/<last 27>.sol")',
+    emitSource.includes('size_t head = prefix > 30 ? (prefix % 30 == 0 ? 30 : prefix % 30) : prefix;')
+    && emitSource.includes('size_t clen = pos == 0 ? head : 30;')
+    && emitSource.includes("out[w++] = \\'#\\'; out[w++] = \\'/\\';"));
+  check('a local object lives under #SharedObjects, then the descriptor content, then localPath',
+    emitSource.includes('base = as_path_join(base, "#SharedObjects");')
+    && emitSource.includes('base = as_path_join(base, ASC_SWF_PATH);')
+    && emitSource.includes('base = as_path_join(base, localPath);'));
+
+  // -- the application id has to reach the generated C: without it every AOT app
+  //    shares one Local Store, and the descriptor's <content> is the directory
+  //    level AIR nests the store under.
+  check('the storage dir carries the app id, defaulting to "as3aot"',
+    emitSource.includes('#ifndef ASC_APP_ID')
+    && emitSource.includes('#define ASC_APP_ID "as3aot"')
+    && emitSource.includes('Library/Application Support/" ASC_APP_ID "/Local Store'));
+  check('the descriptor content path reaches the generated C too',
+    emitSource.includes('#ifndef ASC_SWF_PATH') && emitSource.includes('#define ASC_SWF_PATH ""'));
+  check('an AIR descriptor build injects both defines',
+    airApp.includes('ASC_APP_ID="${info.id}"') && airApp.includes('ASC_SWF_PATH="${info.content}"'));
+
+  // -- the container: 00 BF | be32(fileSize-6) | "TCSO" | u16 4 | u32 0 |
+  //    u16 nameLen | name | 00 00 00 03 | ( U29S key | AMF3 value | 00 )*
+  check('the reader accepts only AIR\'s magic, length and TCSO tag',
+    emitSource.includes('if (len < 24 || buf[0] != 0x00 || buf[1] != 0xBF || memcmp(buf + 6, "TCSO", 4) != 0) return;')
+    && emitSource.includes('unsigned nameLen = (unsigned)((buf[16] << 8) | buf[17]);')
+    && emitSource.includes('size_t pos = 18 + (size_t)nameLen + 4;'));
+  check('the writer emits the same fixed header (version 4 in the low byte of the u16)',
+    emitSource.includes('as_amfb_byte(&w.out, 0x00);')
+    && emitSource.includes('as_amfb_byte(&w.out, 0xBF);')
+    && emitSource.includes('as_amfb_bytes(&w.out, (const unsigned char*)"TCSO", 4);')
+    && emitSource.includes('as_amfb_byte(&w.out, 0x00);') && emitSource.includes('as_amfb_byte(&w.out, 0x04);'));
+  const word3 = emitSource.indexOf('as_amfb_byte(&w.out, 0x03);');
+  const beforeWord = word3 < 0 ? '' : emitSource.slice(Math.max(0, word3 - 200), word3);
+  check('the entry list opens with adl\'s 00 00 00 03 word',
+    beforeWord.split('as_amfb_byte(&w.out, 0x00);').length - 1 === 3);
+  check('the payload length is patched into bytes 2..5 (fileSize - 6)',
+    emitSource.includes('unsigned payload = (unsigned)(w.out.len - 6);')
+    && emitSource.includes('w.out.b[2] = (unsigned char)((payload >> 24) & 0xFFu);')
+    && emitSource.includes('w.out.b[5] = (unsigned char)(payload & 0xFFu);'));
+  check('one AMF3 writer spans every entry, so repeated strings become references like adl\'s',
+    emitSource.includes('as_amf3_wstr_body(&w, key);') && emitSource.includes('as_amf3_wvalue(&w, o->_data->vals[i]);'));
+  check('a missing/corrupt file leaves the table empty instead of failing',
+    emitSource.includes('unsigned char* buf = as_so_load_bytes(path, &len);')
+    && emitSource.includes('if (buf != NULL) as_so_read_entries(o, buf, len);'));
+  check('size is 0 for an empty table and the serialized byte count otherwise',
+    emitSource.includes('if (o->_data->length == 0) return 0;')
+    && emitSource.includes('unsigned char* buf = as_so_serialize(o, &len);'));
+  check('flush writes the serialized bytes and clear() removes the file',
+    emitSource.includes('FILE* f = fopen(o->path, "wb");') && emitSource.includes('remove(o->path);'));
+
+  // -- the AMF3 string table is shared by every entry, and AIR enters BOTH a
+  //    string VALUE and a dynamic property NAME into it. The end-of-members
+  //    marker is the one exception: a raw literal that takes no slot (measured:
+  //    temp/solprobeC). Interning the terminator shifted every later index by one,
+  //    which is exactly how adl read a repeated value back as the wrong string.
+  //    Skipping the NAMES, on the other hand, made the reader run off the end of
+  //    its own table: on temp/solread/adl-login-2617.sol the value of "email" is
+  //    the reference 14, the empty string only once accessToken..realname hold
+  //    slots 1..13. 阶段一百五十七: the object was then dropped half-way and
+  //    every LATER entry was abandoned, so refresh_token_timer read back as
+  //    undefined, LoginView's `now < Number(...)` became NaN, and the app cleared
+  //    the session on every launch.
+  check('the dynamic end marker is written without entering the string table',
+    p.includes('static void as_amf3_wstr_endmark(as_amf3w* w) {')
+    && /static void as_amf3_wstr_endmark\(as_amf3w\* w\) \{\n\s*as_amfb_u29\(&w->out, 1\);/.test(p));
+  const endmarkReader = /static char\* as_amfr_str_endmark\(as_amf3r\* r\) \{([\s\S]*?)\n\}/.exec(p)?.[1] ?? '';
+  check('a NON-empty dynamic property name does take a slot, as AIR writes it',
+    endmarkReader.includes('if (n > 0) as_amfr_addstr(r, s);'));
+  check('…while the empty terminator itself still takes no slot',
+    endmarkReader.includes('if (n > 0) as_amfr_addstr(r, s);')
+    && !/if \(n == 0\) as_amfr_addstr/.test(endmarkReader));
+  const rawWriter = /static void as_amf3_wstr_raw\(as_amf3w\* w, char\* s\) \{([\s\S]*?)\n\}/.exec(p)?.[1] ?? '';
+  check('the writer and reader agree: a dynamic key goes through the interning U29S',
+    rawWriter.includes('as_amf3_wstr_body(w, s);')
+    && p.includes('as_amf3_wstr_raw(w, o->keys[i]);'));
+  check('the object path no longer interns the terminator through as_amf3_wstr_raw',
+    !/\n        as_amf3_wstr_raw\(w, \(char\*\)""\);\n    \}/.test(p));
+  // The example carries the same rule as bytes: a hand-built AIR-shaped stream
+  // whose "gamma" holds a reference to the earlier NAME "alpha".
+  const soExample = readFileSync(join(dir, 'sharedobject.as'), 'utf8');
+  check('examples/sharedobject.as pins the hand-built stream (marker 0A, U29O 0B, reference 06 02)',
+    soExample.includes('dyn.writeByte(0x0A);')
+    && soExample.includes('dyn.writeByte(0x0B);')
+    && soExample.includes('dyn.writeByte(0x06); dyn.writeByte(1 << 1);')
+    && soExample.includes('a reference to an earlier dynamic NAME resolves'));
+  check('…and names the measured AIR evidence it replays',
+    soExample.includes('temp/solread/adl-login-2617.sol') && soExample.includes('clearLoginSession'));
+
+  // -- the EMPTY string is the second thing that never takes a slot. AIR writes
+  //    `06 01` every single time, so a reader/writer that enters "" on the first
+  //    occurrence shifts every later reference by one. Measured on
+  //    temp/solread/adl-login-2617.sol: the four empty values in userInfo are all
+  //    literals, and interning "" made adl read an AOT store's "email":"" back as
+  //    "mobile" and drop the company objects' "title"/"app_menu" keys.
+  const wstrBody = /static void as_amf3_wstr_body\(as_amf3w\* w, char\* s\) \{([\s\S]*?)\n\}/.exec(p)?.[1] ?? '';
+  check('the writer emits an empty string as a literal every time (no slot)',
+    /if \(n == 0\) \{ as_amfb_u29\(&w->out, 1u\); return; \}/.test(wstrBody));
+  check('…and only a NON-empty literal joins the writer\'s table',
+    wstrBody.includes('as_amf3w_addstr(w, s);')
+    && wstrBody.indexOf('if (n == 0)') < wstrBody.indexOf('as_amf3w_addstr(w, s);'));
+  const strBodyReader = /static char\* as_amfr_str_body\(as_amf3r\* r\) \{([\s\S]*?)\n\}/.exec(p)?.[1] ?? '';
+  check('the reader mirrors it: an empty literal does not take a slot',
+    strBodyReader.includes('if (n > 0) as_amfr_addstr(r, s);')
+    && !/^\s*as_amfr_addstr\(r, s\);$/m.test(strBodyReader));
+  check('…and examples/sharedobject.as pins the repeated-empty-string rule as bytes',
+    soExample.includes("emp.writeByte(0x06); emp.writeByte(0x01);")
+    && soExample.includes('emp.writeByte(3 << 1);')
+    && soExample.includes('an empty literal takes no slot, so a later reference still resolves'));
+
+  if (ok > 0) console.log(`[solstore] ${ok} SharedObject-store checks passed`);
+  return bad;
+}
+
 registerGroup('unit: transport/IoErrorFidelity', checkIoErrorFidelity);
 registerGroup('unit: transport/HttpStatusTerminal', checkHttpStatusTerminal);
 registerGroup('unit: transport/AirAppTransport', checkAirAppTransport);
 registerGroup('unit: transport/WebTransport', checkWebTransport);
 registerGroup('unit: transport/RequestContentType', checkRequestContentType);
+registerGroup('unit: transport/RequestMethod', checkRequestMethod);
 registerGroup('unit: transport/JobOwnership', checkJobOwnership);
+registerGroup('unit: transport/SharedObjectStore', checkSharedObjectStore);

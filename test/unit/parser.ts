@@ -39,6 +39,17 @@ function checkMetadataBrackets(): string[] {
     swf?.metadata?.[0]?.name === 'SWF' && swf?.metadata?.[0]?.args[0] === '60'
     && swf?.metadata?.[0]?.named?.frameRate === '60'
     && swf?.metadata?.[0]?.named?.backgroundColor === '0x000000');
+  // The frame rate is the ONE [SWF] key an AOT build must honour: AIR's Stage
+  // reports it back through stage.frameRate (measured on adl 51.4.1, temp/frprobe*:
+  // 60 with the metadata, 24 without it), and codegen seeds the application rate
+  // from it. `Program.swfFrameRate` is the carrier; the other keys stay discarded.
+  check('[SWF(frameRate)] reaches Program.swfFrameRate as a number',
+    parse('package { [SWF(frameRate = 60, backgroundColor = "0x000000")] class A {} }').swfFrameRate === 60);
+  check('...quoted, float and unquoted spellings all work',
+    parse('package { [SWF(frameRate = "30")] class A {} }').swfFrameRate === 30
+    && parse('package { [SWF(frameRate = 12.5)] class A {} }').swfFrameRate === 12.5);
+  check('...and a file without the metadata leaves it undefined',
+    parse('package { class A {} }').swfFrameRate === undefined);
 
   // Positional / float / boolean / hex literals are all legal metadata arguments.
   const tag: any = first('package { [Tag(1, 2.5, true, 0x1F)] class A {} }');
