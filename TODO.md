@@ -9176,7 +9176,7 @@ static bool as_pick_hit_local(DisplayObject* o, double lx, double ly) {
 `a SimpleButton has no shapeFlag region of its own` 收窄为「`as_obj_region_hit_local` 不得回退到 `as_sbtn_contains_local`」
 （新助手**可以**这么做）——三钉共 11 项，`node --test test/unit/display.ts` 全绿。
 
-**验收（真机重编 `temp/tkmeet-mac/talkmed`，日志 `build-d20.log`）**：真账号 `1**********` 登录进首页后
+**验收（真机重编 `temp/tkmeet-mac/talkmed`，日志 `build-d20.log`）**：真账号 `1**********`（已脱敏）登录进首页后
 ① 个人中心 `昵称` → 打开 `编辑信息`；② `资料库` → 新窗口 `文档- [TalkMED Meeting]` 且**真的列出文档**（`/v1/user/…` 列表已回、`d20-doc.png`）；
 ③ `修改密码` → 处理器执行（日志 `loadURL …/change_password?access_token=…`）、窗口开出（内容仍受 D22 `StageWebView` 阻塞）；
 ④ `选择企业`（点击后有 `/v1/user/company` 请求、视图正常开出，`d20-nick2.png`）→ **返回箭头回到个人中心**（`d20-back343.png`）。
