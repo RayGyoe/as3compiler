@@ -1,0 +1,19 @@
+# Line endings that are load-bearing, declared instead of inherited from the
+# cloner's `core.autocrlf`.
+#
+# A Windows batch file must be CRLF, and for lib/build-asaot.bat that is not
+# cosmetic: cmd.exe's `^` line continuation swallows characters when the file has
+# bare LF, and the script relies on it for the clang line. The toolchain pins it
+# (test/unit/build.ts: "build-asaot.bat keeps CRLF line endings" asserts the file
+# has \r\n and no bare \n).
+#
+# The file was written with CRLF and committed from a machine with
+# `core.autocrlf=input`, which converts CRLF->LF on the way IN and never converts
+# back on the way OUT. So the repository blob ended up LF while the author's
+# working copy stayed CRLF -- the pin passed there and nobody noticed. A fresh
+# clone (CI included, `actions/checkout` does not set autocrlf) wrote LF and the
+# pin failed on every run.
+#
+# `text` normalizes to LF in the repository and `eol=crlf` restores CRLF on
+# checkout, on every host, so the result no longer depends on who clones it.
+*.bat text eol=crlf

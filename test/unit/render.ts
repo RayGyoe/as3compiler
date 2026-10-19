@@ -360,17 +360,29 @@ function checkBakeResolution(): string[] {
     emitted.includes('if (sdo->transform != NULL) sdo->transform->matrix = sx_km;'));
 
   // (4) The recorded oracle: native and web ends agree with adl line for line.
+  //
+  // temp/ is a disposable scratch tree (see .gitignore), so the three recordings
+  // exist only where the probe was run -- a fresh clone has none of them. Guarded
+  // like checkSwcTimeline and [skia-abi] below: absent means SKIP, never a
+  // failure, because "the recording is not here" is not "the bake regressed".
+  // Unguarded, this read was the whole reason CI went red while every developer
+  // machine stayed green.
   const probeDir = join(root, 'temp', 'bakeprobe');
-  const adl = readFileSync(join(probeDir, 'adl.txt'), 'utf8').split('\n').filter((l) => l.includes('PROBE|'));
-  const nat = readFileSync(join(probeDir, 'aot-native.txt'), 'utf8').split('\n').filter((l) => l.includes('PROBE|'));
-  const web = readFileSync(join(probeDir, 'aot-web.txt'), 'utf8').split('\n').filter((l) => l.includes('PROBE|'));
-  const same = (a: string[], b: string[]): boolean =>
-    a.length === b.length && a.every((l, i) => l === b[i] || l.startsWith('PROBE|tf '));
-  check('the bake probe matches adl on every line but the font metric',
-    adl.length === 20 && same(adl, nat) && same(adl, web) &&
-    nat.some((l) => l.includes('H1 k=2 cache=on ') && l.includes('pixdiff=0')) &&
-    nat.some((l) => l.includes('H1b cont2 cache=off ext=41x21')) &&
-    nat.some((l) => l.includes('H1d cont2+mat3 ext=121x61')));
+  const probeFiles = ['adl.txt', 'aot-native.txt', 'aot-web.txt'].map((f) => join(probeDir, f));
+  if (probeFiles.every((f) => existsSync(f))) {
+    const probeLines = (f: string): string[] =>
+      readFileSync(f, 'utf8').split('\n').filter((l) => l.includes('PROBE|'));
+    const [adl, nat, web] = probeFiles.map(probeLines);
+    const same = (a: string[], b: string[]): boolean =>
+      a.length === b.length && a.every((l, i) => l === b[i] || l.startsWith('PROBE|tf '));
+    check('the bake probe matches adl on every line but the font metric',
+      adl.length === 20 && same(adl, nat) && same(adl, web) &&
+      nat.some((l) => l.includes('H1 k=2 cache=on ') && l.includes('pixdiff=0')) &&
+      nat.some((l) => l.includes('H1b cont2 cache=off ext=41x21')) &&
+      nat.some((l) => l.includes('H1d cont2+mat3 ext=121x61')));
+  } else {
+    console.log('SKIP  [bakeres] the recorded bake probe (temp/bakeprobe) is not present');
+  }
 
   if (ok > 0) console.log(`[bakeres] ${ok} bake/draw resolution checks passed`);
   return bad;
@@ -393,7 +405,12 @@ function checkColorPath(): string[] {
   };
 
   const glue = readFileSync(join(root, 'vendor', 'metal_glue.mm'), 'utf8');
-  const docs = readFileSync(join(root, 'temp', 'editprobe', 'README.md'), 'utf8');
+  // The evidence table lives in the disposable temp/editprobe tree, which only
+  // exists where the probe was run, so it is read only when present -- the same
+  // guard, and for the same reason, as checkSwcTimeline and [skia-abi] below. An
+  // unguarded readFileSync here made a fresh clone report ENOENT as a failure.
+  const docsPath = join(root, 'temp', 'editprobe', 'README.md');
+  const docs = existsSync(docsPath) ? readFileSync(docsPath, 'utf8') : null;
 
   check('the CAMetalLayer declares sRGB',
     glue.includes('l.colorspace = cs;') &&
@@ -404,9 +421,13 @@ function checkColorPath(): string[] {
     /getenv\("ASC_MTL_READBACK"\)[\s\S]{0,900}?m->surface->readPixels\(/.test(glue));
   // The comparison tooling must keep its tolerance for capture-path colour drift,
   // and the evidence table for the four measured stages must stay documented.
-  check('the capture-path finding is documented with its four stages',
-    docs.includes('ASC_MTL_READBACK') && docs.includes('ff00ff00') &&
-    docs.includes('FF7700') && docs.includes('offscreen_cpu.txt'));
+  if (docs === null) {
+    console.log('SKIP  [colormanage] temp/editprobe/README.md is not present');
+  } else {
+    check('the capture-path finding is documented with its four stages',
+      docs.includes('ASC_MTL_READBACK') && docs.includes('ff00ff00') &&
+      docs.includes('FF7700') && docs.includes('offscreen_cpu.txt'));
+  }
 
   if (ok > 0) console.log(`[colormanage] ${ok} render-color checks passed`);
   return bad;

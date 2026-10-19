@@ -41,7 +41,17 @@ examples/*
 !examples/*.as
 !examples/*.json
 !examples/*.md
+!examples/*.bin
 !examples/*/
+
+# `examples/*` above is the catch-all for the compiled executables, so it also
+# swallows the hand-authored FIXTURES sitting next to the .as files -- and a
+# zero-byte fixture is exactly the file nobody notices is missing. examples/empty.bin
+# is the empty body urlloader-contract.as loads to pin AIR's "a zero-length body
+# emits no PROGRESS" rule, so without the negation above the example failed on a
+# fresh clone ("a zero-length load still completes") while passing on any machine
+# that had ever run it. Negated on the same reasoning as the .as/.json/.md lines:
+# inputs are tracked, generated outputs are not.
 
 # Generated wasm export manifests (written next to the .wasm by src/index.ts:959).
 # They are build output, not inputs — nothing reads them back — so they stay out of the
