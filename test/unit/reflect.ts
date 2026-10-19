@@ -158,10 +158,13 @@ function checkFrameErrorRecovery(): string[] {
     if (cond) { ok++; console.log(`PASS  [frameguard] ${label}`); }
     else { bad.push(label); console.log(`FAIL  [frameguard] ${label}`); }
   };
-  check('the runtime keeps one frame-level jump buffer',
-    RUNTIME_PREAMBLE.includes('static jmp_buf as_frame_jmp;'));
-  check('...and a guard saying whether a frame owns it',
-    RUNTIME_PREAMBLE.includes('static int as_frame_guard = 0;'));
+  // Thread-local, like the unwind stack: the buffer lives on the stack of the
+  // thread that planted it, so a worker thread recovering from an uncaught
+  // error must not longjmp into the dispatching thread's frame.
+  check('the runtime keeps one frame-level jump buffer, per thread',
+    RUNTIME_PREAMBLE.includes('static ASC_TLS jmp_buf as_frame_jmp;'));
+  check('...and a guard saying whether a frame owns it, per thread',
+    RUNTIME_PREAMBLE.includes('static ASC_TLS int as_frame_guard = 0;'));
   check('an uncaught error longjmps to the frame instead of exiting',
     RUNTIME_PREAMBLE.includes('longjmp(as_frame_jmp, 1)'));
   check('...from both throw entry points (value and boxed)',

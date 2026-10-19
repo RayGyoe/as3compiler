@@ -295,7 +295,7 @@ export class Emitter {
   // try/finally exception-stack hygiene (stage 76 follow-up): each open try
   // block is tracked so that control flow leaving it early (return/break/
   // continue) pops the jmp stack and runs any pending finally body before
-  // jumping out. `active` marks frames whose `as_jmp_depth++` is still on the
+  // jumping out. `active` marks frames whose `as_jmp_push` is still on the
   // stack (i.e. while emitting the try body); `finallyBody` is the not-yet-run
   // finally block, nulled once the inline finally starts emitting.
   private tryFrames: { active: boolean; finallyBody: Block | null }[] = [];
@@ -24184,7 +24184,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // reported like any other uncaught error in an event handler.
     this.line('if (setjmp(jb) != 0) {');
     this.indent++;
-    this.line('as_jmp_depth--;');
+    this.line('as_jmp_pop();');
     this.line('as_value m = as_exception_boxed ? as_exception_v : as_v_obj(as_exception);');
     this.line('as_exception = NULL; as_exception_boxed = 0;');
     this.line('fprintf(stderr, "Uncaught exception in StatusEvent handler: %s\\n", as_v_str_val(m));');
@@ -24192,11 +24192,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return;');
     this.indent--;
     this.line('}');
-    this.line('as_jmp_stack[as_jmp_depth++] = &jb;');
+    this.line('as_jmp_push(&jb);');
     this.line('StatusEvent* ev = StatusEvent_new((char*)"status", false, false, as_str_dup(code), as_str_dup(level));');
     this.line('as_value a = as_v_obj((void*)ev);');
     this.line('as_dyn_call(as3ctx, "dispatchEvent", &a, 1);');
-    this.line('as_jmp_depth--;');
+    this.line('as_jmp_pop();');
     this.indent--;
     this.line('}');
     this.line('static void as_fre_wire_classes(void) {');
@@ -24856,13 +24856,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   // Emit cleanup for every open try frame above `targetDepth` (innermost first):
   // pop the jmp stack for still-active frames and re-run any pending finally
   // body. Used by return/break/continue that exit a try block before its inline
-  // `as_jmp_depth--` / finally code is reached. Re-running the finally here (in
+  // `as_jmp_pop` / finally code is reached. Re-running the finally here (in
   // a nested C block so its locals stay isolated) keeps AS3's guarantee that
   // `finally` always runs, even when a return/break/continue jumps out of the try.
   private emitUnwind(targetDepth: number): void {
     for (let i = this.tryFrames.length - 1; i >= targetDepth; i--) {
       const f = this.tryFrames[i];
-      if (f.active) this.line('as_jmp_depth--;');
+      if (f.active) this.line('as_jmp_pop();');
       const fb = f.finallyBody;
       if (fb) {
         // Temporarily mark this frame as already-unwound so a return/break/
@@ -25606,15 +25606,15 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line(`int ${ret} = setjmp(${env});`);
     this.line(`if (${ret} == 0) {`);
     this.indent++;
-    this.line(`as_jmp_stack[as_jmp_depth++] = &${env};`);
+    this.line(`as_jmp_push(&${env});`);
     frame.active = true;
     this.emitBlockBody(stmt.tryBody);
     frame.active = false;
-    this.line('as_jmp_depth--;');
+    this.line('as_jmp_pop();');
     this.indent--;
     this.line('} else {');
     this.indent++;
-    this.line('as_jmp_depth--;');
+    this.line('as_jmp_pop();');
     this.indent--;
     this.line('}');
     if (stmt.catches.length > 0) {

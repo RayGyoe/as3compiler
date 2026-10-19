@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
+import { FRE_BODY } from '../../src/fre.ts';
 import { SymbolTable } from '../../src/symbols.ts';
 import { registerGroup, root } from '../harness.ts';
 
@@ -1844,3 +1845,81 @@ function checkBuiltinArity(): string[] {
   return bad;
 }
 registerGroup('unit: builtin/Arity', checkBuiltinArity);
+
+// The exception-unwinding state must be per-THREAD and growable. It used to be
+// `static jmp_buf* as_jmp_stack[64]` written with unchecked `stack[depth++]`
+// pushes: the AS3 dispatcher thread and every ANE worker thread (FRE callbacks
+// such as FRESetObjectProperty) shared one counter, so past the 64th frame the
+// write landed on the depth counter itself and then at wild .data addresses --
+// silently corrupting the runtime statics next to it -- and a throw could
+// longjmp into another thread's frame. Measured A/B on examples/try-deep.as
+// (201-deep try/catch with rethrow): the old shape exits 0xC0000005 with no
+// output at all, the fixed shape completes all 8 checks.
+function checkRuntimeUnwindStackPerThread(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [unwind] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [unwind] ${label}`); }
+  };
+
+  const program = generateC(parse(
+    `function dive(n:int):void {` +
+    `  try { if (n > 0) dive(n - 1); else throw new Error("bottom"); }` +
+    `  catch (e:Error) { throw e; }` +
+    `}` +
+    `try { dive(2); } catch (e:Error) { trace(e.message); }` +
+    `try { dive(1); } catch (e:Error) { trace(e.message); }`
+  )).c;
+  const pre = RUNTIME_PREAMBLE;
+  const fre = FRE_BODY;
+
+  // 1. The storage is thread-local, starts empty, and grew out of a fixed array.
+  check('the frame stack is thread-local and starts empty',
+    pre.includes('static ASC_TLS jmp_buf** as_jmp_stack = NULL;'));
+  check('depth and capacity are thread-local too',
+    pre.includes('static ASC_TLS int as_jmp_depth = 0;') && pre.includes('static ASC_TLS int as_jmp_cap = 0;'));
+  check('the old process-global fixed array is gone', !pre.includes('static jmp_buf* as_jmp_stack[64];'));
+  check('ASC_TLS is defined before its first use and for all three toolchains',
+    pre.indexOf('#define ASC_TLS __declspec(thread)') >= 0 &&
+    pre.indexOf('#define ASC_TLS __declspec(thread)') < pre.indexOf('static ASC_TLS') &&
+    pre.includes('#define ASC_TLS __thread') && pre.includes('__wasm__'));
+
+  // 2. No unchecked indexing survives: the only write to the array is the one
+  //    inside the helper, which grows the stack first.
+  check('the emitted program indexes the array exactly once (inside as_jmp_push)',
+    (program.match(/as_jmp_stack\[as_jmp_depth\+\+\]/g) || []).length === 1 &&
+    program.includes('as_jmp_stack[as_jmp_depth++] = jb;'));
+  check('…and its try/catch sites go through the helpers',
+    (program.match(/as_jmp_push\(&/g) || []).length >= 2 &&
+    (program.match(/as_jmp_pop\(\);/g) || []).length >= 4);
+  check('the FRE entry points go through the helpers too',
+    (fre.match(/as_jmp_push\(&jb\);/g) || []).length >= 5 &&
+    (fre.match(/as_jmp_pop\(\);/g) || []).length >= 5 &&
+    !/as_jmp_stack\[as_jmp_depth/.test(fre) && !/as_jmp_depth--/.test(fre));
+
+  // 3. Growth, and a pop that cannot underflow.
+  check('as_jmp_push grows the stack instead of overflowing',
+    pre.includes('realloc(as_jmp_stack, sizeof(jmp_buf*) * (size_t)ncap)') &&
+    pre.includes('int ncap = as_jmp_cap == 0 ? 64 : as_jmp_cap * 2;'));
+  check('a failed grow reports instead of silently dropping the frame',
+    pre.includes('AS3 out of memory: exception stack') && pre.includes('exit(1);'));
+  check('as_jmp_pop cannot go negative', pre.includes('if (as_jmp_depth > 0) as_jmp_depth--;'));
+  check('throw still unwinds to the innermost frame',
+    (pre.match(/longjmp\(\*as_jmp_stack\[as_jmp_depth - 1\], 1\);/g) || []).length === 2);
+
+  // 4. The rest of the unwinding state -- the frame-boundary guard and the
+  //    pending throw -- is per-thread for the same reason: a worker thread must
+  //    not longjmp into the dispatcher thread's frame, and two threads inside
+  //    FRE calls must not clobber each other's pending value.
+  check('the frame-boundary guard is thread-local',
+    pre.includes('static ASC_TLS jmp_buf as_frame_jmp;') && pre.includes('static ASC_TLS int as_frame_guard = 0;'));
+  check('the pending throw is thread-local',
+    pre.includes('static ASC_TLS void* as_exception = NULL;') &&
+    pre.includes('static ASC_TLS as_value as_exception_v = {0, 0.0, NULL};') &&
+    pre.includes('static ASC_TLS int as_exception_boxed = 0;'));
+
+  console.log(`     [unwind] ${ok} exception-unwinding state check(s) passed`);
+  return bad;
+}
+registerGroup('unit: runtime/UnwindStackPerThread', checkRuntimeUnwindStackPerThread);

@@ -5683,7 +5683,23 @@ static double as_math_random(void) {
 // lets the uncaught-exception path read the message without knowing Error's type.
 typedef struct { void* vtable; char* message; } as_error_view;
 
-static void* as_exception = NULL;
+// Thread-local storage for the exception-unwinding state. The AS3 dispatcher
+// thread and every ANE worker thread run through this runtime, so all of it
+// (the frame stack, the frame-boundary guard, the pending throw) must be
+// per-thread -- see the comments at each group.
+#if defined(_MSC_VER)
+#define ASC_TLS __declspec(thread)
+#elif defined(__wasm__) || defined(__wasm32__)
+#define ASC_TLS /* wasm32 has no threads; a plain static is the same thing */
+#else
+#define ASC_TLS __thread
+#endif
+// Per-THREAD: an ANE worker thread can enter this runtime through an FRE call
+// at the same time the dispatcher thread is inside AS3 code, and unwinding from
+// one thread to the other is undefined behaviour (the frame lives on the other
+// stack). The FRE entry points catch within the call, so a worker's pending
+// value never survives a GC step.
+static ASC_TLS void* as_exception = NULL;
 // User throw propagates an arbitrary VALUE (any Error, but also a plain string,
 // number, object or null). AVM2 boxes it, and a catch clause binds it back with
 // its identity intact -- for a thrown string, a dynamic catch still answers
@@ -5693,10 +5709,39 @@ static void* as_exception = NULL;
 // boxed slot runs alongside the object slot. as_exception_boxed selects which
 // holds the pending throw: 0 => as_exception (an object; every internal runtime
 // error is thrown this way), 1 => as_exception_v (a user-thrown value).
-static as_value as_exception_v = {0, 0.0, NULL};
-static int as_exception_boxed = 0;
-static jmp_buf* as_jmp_stack[64];
-static int as_jmp_depth = 0;
+static ASC_TLS as_value as_exception_v = {0, 0.0, NULL};
+static ASC_TLS int as_exception_boxed = 0;
+// The unwinding stack is per-THREAD and grows on demand. It used to be a
+// process-global "jmp_buf*[64]" written with unchecked "stack[depth++]" pushes.
+// ANE worker threads (FRE callbacks such as FRESetObjectProperty) and the AS3
+// dispatcher thread both use it, so one global counter served two threads:
+// past the 64th frame the write landed on the depth counter itself and then at
+// wild .data addresses, silently corrupting neighbouring runtime statics, and a
+// throw could longjmp into another thread's frame. Per-thread + unbounded
+// removes both failure modes.
+static ASC_TLS jmp_buf** as_jmp_stack = NULL;
+static ASC_TLS int as_jmp_depth = 0;
+static ASC_TLS int as_jmp_cap = 0;
+static void as_jmp_push(jmp_buf* jb) {
+    if (as_jmp_depth == as_jmp_cap) {
+        int ncap = as_jmp_cap == 0 ? 64 : as_jmp_cap * 2;
+        jmp_buf** ns = (jmp_buf**)realloc(as_jmp_stack, sizeof(jmp_buf*) * (size_t)ncap);
+        if (ns == NULL) {
+            // Dropping the frame would unwind to the wrong place, and AIR dies
+            // on memory exhaustion too -- report rather than corrupt.
+            fprintf(stderr, "AS3 out of memory: exception stack\\n");
+            fflush(stderr);
+            exit(1);
+        }
+        as_jmp_stack = ns;
+        as_jmp_cap = ncap;
+    }
+    as_jmp_stack[as_jmp_depth++] = jb;
+}
+static void as_jmp_pop(void) {
+    // Push/pop sites are balanced, but a stray pop must never go negative.
+    if (as_jmp_depth > 0) as_jmp_depth--;
+}
 // Frame-boundary recovery for an UNCAUGHT error. AIR does not terminate the
 // process on an uncaught error -- it reports it and keeps running, so one bad
 // listener costs its own dispatch rather than the whole application. (Calling
@@ -5705,8 +5750,8 @@ static int as_jmp_depth = 0;
 // build did on the very first uncaught #1009.) Stage_dispatchFrame plants this
 // jmp_buf; longjmp'ing to it gives AIR's behaviour. With no frame on the stack
 // (a non-GUI program, or an error before the first frame) exit(1) still applies.
-static jmp_buf as_frame_jmp;
-static int as_frame_guard = 0;
+static ASC_TLS jmp_buf as_frame_jmp;
+static ASC_TLS int as_frame_guard = 0;
 
 static const char* as_error_message(void* e) {
     return e ? ((as_error_view*)e)->message : "unknown";
