@@ -46,6 +46,24 @@ if (ctx != null) {
     // Strings.
     check("ping", ctx.call("ping") as String, "pong");
 
+    // The FRE string length contract (docs/zh-cn/ane.md 5.1). AIR's header says the
+    // length FREGetObjectAsUTF8 reports INCLUDES the null terminator; AIR does not
+    // count it. The extension reports both counts, so `extra` is exactly that
+    // disagreement -- and a non-zero `extra` is what an extension that carries the
+    // length (ANEUtils::getString's std::string(val, val + length)) appends to every
+    // string it reads. One extra byte inside a WebSocket URL is enough to make every
+    // wss connect fail with no server reply at all, which is how this was found: the
+    // host app built AOT had every wss connection dying before the TLS handshake.
+    check("stringInfo('abcdef')", ctx.call("stringInfo", "abcdef") as String, "bytes=6 len=6 extra=0");
+    // Four CJK chars are 12 UTF-8 bytes but 4 UTF-16 units, so the same assertion
+    // also pins the count as BYTES: a unit count would answer len=4 here (and every
+    // multibyte string an extension receives would be truncated).
+    check("stringInfo(cjk)", ctx.call("stringInfo", String.fromCharCode(0x64CD, 0x4F5C, 0x6210, 0x529F)) as String,
+          "bytes=12 len=12 extra=0");
+    // The empty string follows the same rule (an empty NUL-terminated buffer is 0
+    // bytes); an "includes the terminator" reading would report len=1.
+    check("stringInfo('')", ctx.call("stringInfo", "") as String, "bytes=0 len=0 extra=0");
+
     // ints and unsigneds (both come back as boxed Numbers).
     check("addInt(2,40)", int(ctx.call("addInt", 2, 40)), 42);
     check("scaleUint(3,5)", uint(ctx.call("scaleUint", 3, 5)), 15);

@@ -560,11 +560,11 @@ this build: ...`。按症状查：
 
 | 文件 | 作用 |
 |---|---|
-| `examples/ane/ProbeANE.c` | 扩展的**原生半边**，1.9 万字节，覆盖整数/浮点/UTF8/布尔/数组/字节数组/对象属性/方法调用/原生数据/状态事件/线程与互斥/抛异常 |
+| `examples/ane/ProbeANE.c` | 扩展的**原生半边**，2.1 万字节，覆盖整数/浮点/UTF8/布尔/数组/字节数组/对象属性/方法调用/原生数据/状态事件/线程与互斥/抛异常/**FRE 字符串长度契约**（`stringInfo`） |
 | `examples/ane/shim/FlashRuntimeExtensions.h` | §4.3 的 shim，且**故意让 `ProbeANE.c` 用 AIR 的 include 名**，这样 shim 真的被走到了 |
 | `examples/ane/build-ane.bat` | §4.4 的重编配方（clang-cl），编完自动跑 §4.5 的导入表检查，并把结果装进**两棵**暂存树 |
 | `examples/ane/ext-aot/com.example.probe/extension.xml` | §4.6 的描述符（目录名 = 扩展 id） |
-| `examples/ane/ext-aot/com.example.probe/Windows-x86-64/ProbeANE.dll` | 重编产物（18,432 字节，导入 `asaot.dll`） |
+| `examples/ane/ext-aot/com.example.probe/Windows-x86-64/ProbeANE.dll` | 重编产物（19,456 字节，导入 `asaot.dll`） |
 | `examples/ane/driver.as` | AS3 驱动，**每一行都是断言**，最后打印 `RESULT passed=N failed=0` |
 | `examples/ane/ane.build.json` | 构建清单（`ane-paths` 指向那棵暂存树） |
 | `examples/ane-app/` | §4.9.1：同一个夹具，走 `--air-app` + 描述符 `<extensions>` 那条路 |
@@ -656,7 +656,7 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 
 ### 5.1 已修的缺陷（留作教训）
 
-五条都是**「`adl` 跑得对、我们跑不出」**那一类，都是在拿真实三方 ANE 做迁移时量出来的；
+六条都是**「`adl` 跑得对、我们跑不出」**那一类，都是在拿真实三方 ANE 做迁移时量出来的；
 现在都修了并配了行为钉。列在这儿的价值在于它们的共同形态：**都是「看起来对、结果错」**。
 
 | 缺陷 | 症状 | 修法 | 钉（条数） |
@@ -666,6 +666,8 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 | `readAne` 只认扁平布局 | 官方 `adt` 包（`META-INF/ANE/<平台>/<lib>`）一律被拒，而 `adl` 加载同一个包正常 | 三种布局全认（并额外接受**解包后的目录**——这是增强，不是对齐，见 §4.6）；找不到时报错列出全部候选路径与实际条目 | `unit: ane/PackageLayout`（27） |
 | 所有扩展的原生库挤进**一个目录**、按**文件名**做键 | 两个 ANE 各带一个同名 `Shared.dll` 时，后一个**静默覆盖**前一个：摘要写「2 extension(s)」旁边却是「1 native library(ies)」，exit 0；于是一个扩展加载到了另一个的库，报出来的是「导出里没有 XXXInitializer」这种**指错方向**的话。AIR 不这样（`adl` 实测：第二个包用**另一个 extensionID** 放一个同名的哨兵库，第一个扩展照样 13/13 全过） | 改为 `<extID>/<平台>/<库>`（一扩展一目录，与 AIR 同构）；**描述符携带的路径与落盘键由同一行生成**，不允许各自拼一遍 | `unit: ane/PackageLayout`（同上；变异 5/5 全被抓） |
 | ANE 平台键按**宿主**取而不按**构建目标**取 | 32 位构建链 x64 宿主库、暂存 x64 切片，编译链接全绿、**运行期**才炸 | win32 原生构建下键 = `architecture` 的位宽；arm64 目标无键（拒绝并指名目标） | `unit: ane/PlatformForBuild`（11） |
+
+| **FRE 字符串长度多算了一个终止符** | 我方 `FREGetObjectAsUTF8` 返回 `strlen+1`（照着 SDK 头文件那句「Includes the null terminator」写的），而 `adl` 实测返回的是**不含**终止符的字节数。扩展若**携带长度**——`ANEUtils::getString` 正是 `std::string(val, val + length)`——它读到的每个字符串都会多出一个 NUL 字节；字符串被原样嵌进协议帧时（WebSocket URL 进 HTTP 请求行）就变成 `GET /node1?...\0 HTTP/1.1`，服务端不回响应直接关闭。宿主应用 AOT 后**所有 wss 连接**都以 `status_code 0` + `websocketpp.transport:7`（EOF）失败，而**同一台机器**上 `adl` 加载同一份原生库、同一个 URL、同一个 token 却 `101` 成功并收到业务帧。只把指针交给 `printf`/`strcmp` 的扩展察觉不到这个字节，凡自己带长度的（`std::string`、协议帧、哈希）都会中招 | 按 `adl` 实测改成 `strlen(s)`，并把「**头文件那句话与实测不符**」连同证据写进注释，免得后人照字面「修」回 `+1`；反方向的 `FRENewObjectFromUTF8` 仍按文档接受调用方传入的终止符（写 `strlen+1` 的调用方遍地在写） | `unit: fre/Utf8LengthContract`（8；变异 7/7 全被抓）+ `examples/ane/` 的原生回显断言 `stringInfo`（3：ASCII 6 字节、4 个 CJK 字符 12 字节、空串 0 字节，`extra` 必须为 0——把 `src/fre.ts` 改回 `+1` 这条必红） |
 
 配套的一条诊断改进：加载失败的两处自报现在**带上 Win32 错误码**（`193` = 位宽不符、
 `126` = 找不到）。此前它们无条件归咎于「库没重编」——当一个纯位宽问题被套上「你重编错了」的
@@ -686,9 +688,10 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 
 | 证据 | 内容 | 怎么复现 |
 |---|---|---|
-| `examples/ane/` | 端到端示例，**43 条断言全过**，末行 `RESULT passed=43 failed=0` | `node --test --test-name-pattern='example: ane' test/examples.ts` |
+| `examples/ane/` | 端到端示例，**46 条断言全过**，末行 `RESULT passed=46 failed=0` | `node --test --test-name-pattern='example: ane' test/examples.ts` |
 | `examples/ane-app/` | 端到端示例·**描述符那一半**：`--air-app` 把描述符里的 `<extensions>` 解析成 `ane-paths`、把库落到 `extensions/<扩展 id>/<平台>/`，再运行；**8 条断言全过**，末行 `RESULT passed=8 failed=0`（另有一行是未声明 id 的自报原文） | 同上 |
 | `test/unit/emit.ts` → `unit: ane/ExtensionContextSurface` | 9 条：钉**发射出来的 C** 里 `getExtensionDirectory` 必须自报、必须仍返回活着的 `File`、自报必须**点名本构建的布局**并说清那个目录里**没有**整包、`actionScriptData` 是真成员而 `extensionID` **不是**、`call` 的「扩展从未加载」自报必须具名 | `node --test --test-name-pattern='ane/ExtensionContextSurface' test/unit/emit.ts` |
+| `test/unit/fre.ts` → `unit: fre/Utf8LengthContract`（8 条） | FRE 字符串边界的两向契约：`FREGetObjectAsUTF8` 的 `length` 必须是 `strlen`（**不得**加上终止符，也不得变成别的计数）、`value` 必须是字符串本身、非 String 仍须 `FRE_TYPE_MISMATCH`；反方向 `FRENewObjectFromUTF8` 必须容忍调用方传入的终止符，且不得把它算进字符串。变异 7/7（`+1u`、`+1`、换掉 `value` 指针、放开 tag 判定、去掉容忍、把终止符拷进字符串、不写结尾 0） | `node --test --test-name-pattern='fre/' test/unit.ts` |
 | `test/unit/build.ts` → `unit: ane/ExtensionXmlComments` | 9 条：注释不得凭空造出平台条目、不得吞掉真实条目、未闭合注释必须拒绝并指名包 | 同上换成 `test/unit/build.ts` |
 | `test/unit/build.ts` → `unit: ane/PackageLayout`（27 条） | 官方 `adt` 布局、扁平布局、`adt` 暂存布局都认；**解包后的目录**也认（含递归与 `/` 分隔名字两条，所以手工解压的 `META-INF/ANE` 树可读）；目录形式同样按平台取切片、不借另一平台的切片；找不到时不得只说「没有」，要列出候选路径；**落盘路径必须是 `<extID>/<平台>/<库>`**（描述符与暂存键两处都要，且不得再出现裸文件名）；**两个扩展可以各带一个同名库且各留各的字节**；声明在子目录里的库**保留那个子目录**；**扩展数上限是硬闸门**（正好 32 过、33 拒绝并给出计数与常量名） | 同上换成 `test/unit/build.ts` |
 | `test/unit/build.ts` → `unit: ane/PlatformForBuild`（11 条） | 平台键跟随 `architecture`；留空保留宿主答案；wasm/darwin 下 `architecture` 无效（AIR 描述符默认就是 `32`，不能因此变成 `Windows-x86`）；arm64 目标不发明键；**位宽在 ANE 键与目标三元组两处读数一致** | 同上 |

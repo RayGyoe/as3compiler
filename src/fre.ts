@@ -420,9 +420,20 @@ static FREResult FREGetObjectAsUTF8(FREObject object, uint32_t* length, const ui
     as_value v = as_fre_unbox(object);
     if (v.tag != 3 || v.ptr == NULL) return FRE_TYPE_MISMATCH;
     const char* s = (const char*)v.ptr;
-    // AIR's documented length INCLUDES the null terminator, and ANENDI depends on
-    // it (ANEUtils::nativeString builds a std::string from [val, val + length)).
-    *length = (uint32_t)strlen(s) + 1u;
+    // The AIR SDK header DOCUMENTS this length as "the size, in bytes, of the
+    // string. Includes the null terminator", and the ANEUtils idiom is
+    // std::string(val, val + length) -- but the two disagree, and adl is the
+    // oracle: AIR reports the length WITHOUT the terminator. Measured on adl
+    // 51.4.1 + ANEWebSocket (ext-aot A/B on one machine, one URL, one token):
+    // adl hands over "...appversion=1.9.36" (strlen bytes), while strlen+1
+    // appended a NUL that websocketpp baked straight into the wire request line
+    // ("GET /node1?...1.9.36\0 HTTP/1.1"), so every wss connect died with
+    // status_code 0 + websocketpp.transport:7 (EOF) before any TLS/WS upgrade.
+    // Extensions that memcpy(%s) never noticed; ones that carry an explicit
+    // length -- a std::string, a protocol frame, a hash -- did.
+    // AIR's buffer stays NUL-terminated either way, so a caller that reads
+    // one byte past the reported length still sees the same terminator.
+    *length = (uint32_t)strlen(s);
     *value = (const uint8_t*)s;
     return FRE_OK;
 }

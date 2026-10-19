@@ -28,4 +28,5 @@ import './unit/doctor.ts';
 import './unit/vsync.ts';
 import './unit/npm-package.ts';
 import './unit/cli.ts';
+import './unit/fre.ts';
 import './unit/testinfra.ts';
