@@ -16011,21 +16011,57 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // which would otherwise collapse the freshly selected word at mouseUp.
     // Neither variable is a GC root — they only live between mouseDown and
     // mouseUp, where no GC safe point runs.
-    // Live pointer state in STAGE coordinates, fed by ASC_window_on_mouse. It has
+    // Live pointer state in STAGE coordinates, fed by Stage_dispatchMouse. It has
     // to live outside the event dispatch because a SimpleButton decides which of
     // its four states to show at PAINT time (as_sbtn_state), not while an event is
-    // being handled. `ASC_mouse_has` is false until the first mouse event, so an
-    // offscreen run (BitmapData.draw, no window) keeps the up state.
-    this.line('static double ASC_mouse_x = 0.0;');
-    this.line('static double ASC_mouse_y = 0.0;');
-    this.line('static int ASC_mouse_has = 0;');
+    // being handled.
+    //
+    // The coordinates live on the Stage OBJECT (`_mouse_x/_mouse_y/_mouse_has`), not
+    // in process-wide statics: AIR keeps one pointer per Stage (each NativeWindow
+    // owns its own Stage), and process-wide statics made every window's paint pass
+    // read whichever window received the last mouse event -- window A hovered and
+    // reported mouseX/mouseY for a pointer that was only ever over window B. Measured
+    // before the fix (temp/mouse2w, two windows, one process): driving a mouseMove
+    // into window B turned window A's SimpleButton to its over state and made
+    // A.mouseX/mouseY equal B's client coordinates. `_mouse_has` is per stage and
+    // false until that stage's first mouse event, so a stage nobody pointed at (and
+    // any object off the display list) keeps the up state.
+    //
+    // ASC_mouse_down stays a process-wide static on purpose: there is ONE OS pointer
+    // and one button state, and a press that began in one window must be cleared by a
+    // release in another -- that is AIR's latched-press behaviour.
+    //
+    // MEASURED AIR CONTRACT for leaving a window (adl 51.4.1, two windows, real
+    // pointer, temp/mouse2w sched.cjs adl arm): the moment the pointer crosses into
+    // the OTHER window, the left window's button ROLLS BACK TO ITS UP STATE while
+    // its mouseX/mouseY KEEP the last in-window coordinates (measured: state
+    // up -> over -> up, mouseX/mouseY frozen at 179.9,203.6 instead of zeroing, and
+    // never following the other window's pointer). We do not roll out yet -- the
+    // window backend never reports the leave (TODO.md's residual), so the hover
+    // sticks -- and whoever wires that up must NOT clear this slot: it gates both the
+    // hover and mouseX/mouseY. Add a separate "pointer is inside" slot (set false on
+    // leave, coords untouched) instead of zeroing `_mouse_has`, or the coordinates
+    // would diverge from AIR's measured behaviour.
     this.line('static int ASC_mouse_down = 0;');
+    // The Stage an object belongs to, WITHOUT DisplayObject_get_stage's root fallback.
+    // That fallback exists so the document class sees its own `stage` inside its
+    // constructor; borrowing ANOTHER window's stage here is exactly the defect the
+    // per-stage pointer state removes. NULL = the object is not on any stage.
+    this.line('static Stage* as_mouse_owner_stage(DisplayObject* o) {');
+    this.indent++;
+    this.line('while (o != NULL && o->parent != NULL) o = (DisplayObject*)o->parent;');
+    this.line('if (o != NULL && o->vtable != NULL && strcmp(o->vtable->cls_name, "Stage") == 0) return (Stage*)o;');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
     // The InteractiveObject under the pointer (AIR's roll-over target), and the
     // press generation latched by the mouseDown that is still held. Both feed the
     // MovieClip button states (as_mc_button_state). ASC_mouse_target is only read
-    // inside one paint pass -- it is refreshed there, so it never has to be a GC
-    // root -- and the press is a generation NUMBER rather than a target pointer for
-    // the same reason: 0 means "nothing pressed" and no object ever stores 0.
+    // inside one paint pass -- it is refreshed there from THAT stage's own pointer
+    // (as_mouse_refresh_target), so it never has to be a GC root, and reading it
+    // during a pass can only ever see the coordinates the pass just refreshed. The
+    // press is a generation NUMBER rather than a target pointer for the same reason:
+    // 0 means "nothing pressed" and no object ever stores 0.
     this.line('static void* ASC_mouse_target = NULL;');
     this.line('static int ASC_press_gen = 0;');
     this.line('static TextField* drag_tf = NULL;');
@@ -16046,9 +16082,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     // Record the live pointer before dispatching: a SimpleButton picks which of its
     // four states to show at PAINT time (as_sbtn_state), so the state has to be
-    // readable outside the event. Living here means the AS3 test hook
-    // Stage.dispatchMouse(x, y, type) drives the states too (temp/btnstate).
-    this.line('ASC_mouse_x = x; ASC_mouse_y = y; ASC_mouse_has = 1;');
+    // readable outside the event. Living on THIS stage means each window's pointer is
+    // its own, and the AS3 test hook Stage.dispatchMouse(x, y, type) drives the states
+    // of the stage it was called on (temp/btnstate).
+    this.line('Stage* mst = (Stage*)_this;');
+    this.line('if (mst != NULL) { mst->_mouse_x = x; mst->_mouse_y = y; mst->_mouse_has = true; }');
     // An active startDrag() follows the pointer BEFORE the event is dispatched, so a
     // mouseMove listener already sees the object at its new position (AIR moves the
     // object as part of handling the move) -- including the very first move after
@@ -16176,13 +16214,17 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // object's own coordinate space. AIR declares these on DisplayObject (a
     // DisplayObject-typed receiver reads them; InteractiveObject merely inherits),
     // so the bodies carry the DisplayObject_ prefix like every other member of
-    // that class. The pointer is tracked in stage coordinates (ASC_mouse_x/y,
-    // fed by the window glue and by the Stage.dispatchMouse test hook), so the
+    // that class. The pointer is tracked per Stage in stage coordinates
+    // (`_mouse_x/_mouse_y` on the Stage the object belongs to, fed by the window glue
+    // and by the Stage.dispatchMouse test hook), so the
     // transform chain is inverted the same way the TextField hit math does it.
     // Before the first mouse event there is no known pointer, and 0 is reported
     // (the object-local origin).
-    this.line('double DisplayObject_get_mouseX(void* _this) { if (!ASC_mouse_has) return 0.0; double lx = 0.0, ly = 0.0; as_local_point((DisplayObject*)_this, ASC_mouse_x, ASC_mouse_y, &lx, &ly); return lx; }');
-    this.line('double DisplayObject_get_mouseY(void* _this) { if (!ASC_mouse_has) return 0.0; double lx = 0.0, ly = 0.0; as_local_point((DisplayObject*)_this, ASC_mouse_x, ASC_mouse_y, &lx, &ly); return ly; }');
+    // mouseX/mouseY are the pointer in THIS object's own space, taken from the
+    // pointer of the stage the object belongs to (AIR: one pointer per Stage), so an
+    // object in an untouched window reports 0 rather than another window's pointer.
+    this.line('double DisplayObject_get_mouseX(void* _this) { Stage* mst = as_mouse_owner_stage((DisplayObject*)_this); if (mst == NULL || !mst->_mouse_has) return 0.0; double lx = 0.0, ly = 0.0; as_local_point((DisplayObject*)_this, mst->_mouse_x, mst->_mouse_y, &lx, &ly); return lx; }');
+    this.line('double DisplayObject_get_mouseY(void* _this) { Stage* mst = as_mouse_owner_stage((DisplayObject*)_this); if (mst == NULL || !mst->_mouse_has) return 0.0; double lx = 0.0, ly = 0.0; as_local_point((DisplayObject*)_this, mst->_mouse_x, mst->_mouse_y, &lx, &ly); return ly; }');
     this.line('');
     // Move the dragged object to follow the pointer, expressed in the object's
     // parent space (see the state declarations above). The offset keeps the grab
@@ -16239,11 +16281,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // The offset is measured against the CURRENT pointer; with no pointer known yet
     // (an offscreen run that never received a mouse event) it is 0, i.e. the same
     // thing AIR's lockCenter does -- the registration point lands on the pointer.
-    this.line('if (!lockCenter && ASC_mouse_has) {');
+    this.line('Stage* pst = (Stage*)((o != NULL) ? as_mouse_owner_stage(o) : NULL);');
+    this.line('if (!lockCenter && pst != NULL && pst->_mouse_has) {');
     this.indent++;
-    this.line('double px = ASC_mouse_x, py = ASC_mouse_y;');
+    this.line('double px = pst->_mouse_x, py = pst->_mouse_y;');
     this.line('DisplayObject* par = (DisplayObject*)o->parent;');
-    this.line('if (par != NULL) as_local_point(par, ASC_mouse_x, ASC_mouse_y, &px, &py);');
+    this.line('if (par != NULL) as_local_point(par, pst->_mouse_x, pst->_mouse_y, &px, &py);');
     this.line('ASC_drag_off_x = o->x - px; ASC_drag_off_y = o->y - py;');
     this.indent--;
     this.line('} else { ASC_drag_off_x = 0.0; ASC_drag_off_y = 0.0; }');
@@ -20586,7 +20629,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // up state exists; without one the button has no visual at all (this is the
     // SWC-baked "down-only" button shape that used to leak two grey blocks).
     this.line('if (b->upState == NULL) return NULL;');
-    this.line('int hover = ASC_mouse_has ? as_sbtn_contains(b, ASC_mouse_x, ASC_mouse_y) : 0;');
+    // Hover comes from the pointer of the stage the BUTTON belongs to: a button in
+    // another, untouched window must not light up because some other window's mouse
+    // moved (AIR keeps one pointer per Stage).
+    this.line('Stage* mst = as_mouse_owner_stage(o);');
+    this.line('int hover = (mst != NULL && mst->_mouse_has) ? as_sbtn_contains(b, mst->_mouse_x, mst->_mouse_y) : 0;');
 
     this.line('if (hover && ASC_mouse_down && b->downState != NULL) return b->downState;');
     this.line('if (hover && b->overState != NULL) return b->overState;');
@@ -20635,7 +20682,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('MovieClip* mc = (MovieClip*)o;');
     this.line('if (mc->_tl_char == 0) return;');
     this.line('if (!((InteractiveObject*)o)->buttonMode) return;');
-    this.line('if (!ASC_mouse_has) return;');
+    this.line('Stage* mst = as_mouse_owner_stage(o);');
+    this.line('if (mst == NULL || !mst->_mouse_has) return;');
     this.line('int over = as_mc_under_target(o);');
     this.line('int pressed = ASC_mouse_down && ASC_press_gen != 0 && ((InteractiveObject*)o)->_btn_press_gen == ASC_press_gen;');
     this.line('const char* want = pressed ? "_down" : (over ? "_over" : "_up");');
@@ -20653,9 +20701,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // picks up its state, and an offscreen draw sees the same target the window
     // paint does. Recomputed rather than cached across frames so the pointer never
     // has to be a GC root -- it only lives while a pass walks the display list.
+    // `root` is the Stage being painted, so the target is picked with THAT stage's
+    // own pointer coordinates.
     this.line('static void as_mouse_refresh_target(DisplayObject* root) {');
     this.indent++;
-    this.line('ASC_mouse_target = (ASC_mouse_has && root != NULL) ? as_pick_hit((void*)root, ASC_mouse_x, ASC_mouse_y) : NULL;');
+    this.line('Stage* mst = (root != NULL) ? as_mouse_owner_stage(root) : NULL;');
+    this.line('ASC_mouse_target = (mst != NULL && mst->_mouse_has) ? as_pick_hit((void*)root, mst->_mouse_x, mst->_mouse_y) : NULL;');
     this.indent--;
     this.line('}');
     this.line('static int as_bounds_walk(DisplayObject* o, int with_stroke, int decl, double* l, double* t, double* r, double* b) {');

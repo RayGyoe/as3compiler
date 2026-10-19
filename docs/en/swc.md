@@ -1075,11 +1075,13 @@ hit   : 960 + 252(scale 0.714, 0.261)
 ```
 
 **State machine**: `as_sbtn_state` selects **at draw time** by the live pointer state — `down` (hover ∧
-mouseDown), `over`, else up→over→down→hit fallback. The pointer state (`ASC_mouse_x/y/has/down`) is written
-uniformly by `Stage_dispatchMouse`, so **both the window's SDL callback and AS3's
-`stage.dispatchMouse(x,y,type)` test hook drive the four states**; off-window (`BitmapData.draw`)
-`ASC_mouse_has = 0`, so only the up state is seen — which is why §9.1's offscreen acceptance only compares the
-up state.
+mouseDown), `over`, else up→over→down→hit fallback. The pointer coordinates (`_mouse_x/_mouse_y/_mouse_has`)
+live on **the Stage the button belongs to** and are written by `Stage_dispatchMouse` (`ASC_mouse_down` stays
+process-wide: one OS pointer, one button state), so **both the window's SDL callback and AS3's
+`stage.dispatchMouse(x,y,type)` test hook drive the four states** — and because **each Stage owns its own
+pointer** (AIR: one per NativeWindow), moving the mouse in another window never pushes this window's hover
+state around. A stage the pointer has never entered (off-window `BitmapData.draw`, a build with no window)
+keeps the up state — which is why §9.1's offscreen acceptance only compares the up state.
 
 **Hit determination (the real pit of this item)**: in the window probe hover was always 0. Root cause:
 `as_sbtn_contains` initially used `as_pick_hit`, which **only reports InteractiveObject**; a button's hit state

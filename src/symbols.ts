@@ -1516,6 +1516,8 @@ export class SymbolTable {
     const stgf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Stage', isStatic: false, isConst: false });
     const stgg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Stage', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     const stgs = (pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner: 'Stage', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+    // Private Stage slots (never visible to AS3): the per-Stage pointer state.
+    const stgp = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner: 'Stage', isStatic: false, isConst: false });
     this.classMap.set('Stage', {
       fields: new Map([
         ['stage_w', stgf({ kind: 'int' })],
@@ -1534,6 +1536,19 @@ export class SymbolTable {
         ['show_default_context_menu', stgf({ kind: 'bool' })],
         ['tab_children', stgf({ kind: 'bool' })],
         ['stage3ds', stgf({ kind: 'vector', elem: { kind: 'object', className: 'Stage3D' } })],
+        // Live pointer state OF THIS STAGE. AIR keeps one pointer per Stage (each
+        // NativeWindow owns its own Stage), so these must NOT be process-wide
+        // statics: when they were, a mouse move over a secondary window left the
+        // main window's paint pass reading the OTHER window's client coordinates,
+        // so the main window hovered and reported mouseX/mouseY for a pointer that
+        // was never over it (measured: pointer parked inside a secondary window
+        // turned the main window's button to its over state -- see temp/mouse2w,
+        // and the fix note in emit.ts's Stage_dispatchMouse block).
+        // `_mouse_has` is false until THIS stage's first mouse event, which keeps
+        // an untouched stage (and any off-list object) on its up state.
+        ['_mouse_x', stgp({ kind: 'number' })],
+        ['_mouse_y', stgp({ kind: 'number' })],
+        ['_mouse_has', stgp({ kind: 'bool' })],
       ]),
       methods: new Map([
         ['dispatchMouse', { returnType: { kind: 'void' }, params: [

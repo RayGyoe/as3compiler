@@ -930,9 +930,12 @@ hit   : 960 + 252(scale 0.714, 0.261)
 ```
 
 **状态机**：`as_sbtn_state` 在**绘制时**按实时指针状态选择——`down`（hover ∧ mouseDown）、`over`、
-否则 up→over→down→hit 回退。指针状态（`ASC_mouse_x/y/has/down`）由 `Stage_dispatchMouse` 统一写入，
-因此**窗口的 SDL 回调与 AS3 的 `stage.dispatchMouse(x,y,type)` 测试钩子都会驱动四态**；窗口外
-（`BitmapData.draw`）`ASC_mouse_has = 0`，只看 up 态——这也是 §9.1 的离屏验收只比 up 态的原因。
+否则 up→over→down→hit 回退。指针坐标（`_mouse_x/_mouse_y/_mouse_has`）存在**该按钮所属的那个 Stage**
+上，由 `Stage_dispatchMouse` 写入（`ASC_mouse_down` 仍是进程级的按键态：一个 OS 指针、一个按键），
+因此**窗口的 SDL 回调与 AS3 的 `stage.dispatchMouse(x,y,type)` 测试钩子都会驱动四态**；而**每个
+Stage 各有一份指针**（AIR 一个 NativeWindow 一个 Stage），别的窗口动鼠标不会推开本窗口的悬停态。
+指针从未到过的 stage（离屏 `BitmapData.draw`、没有窗口的构建）保持 up 态 —— 这也是 §9.1 的离屏
+验收只比 up 态的原因。
 
 **命中判定（本项真正的坑）**：窗口探针里 hover 恒为 0。根因：`as_sbtn_contains` 最初用
 `as_pick_hit`，而它**只报告 InteractiveObject**；按钮的 hit 态是用**普通 `Shape`** 搭出来的，于是永不命中。
