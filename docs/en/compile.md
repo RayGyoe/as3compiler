@@ -488,7 +488,7 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 ```
 
 Flow: parse `<id>/<filename>/<initialWindow>` (`title`/`width`/`height`/`visible`/`resizable`/
-`requestedDisplayResolution`/`renderMode`) →
+`requestedDisplayResolution`/`renderMode`/`maximizable`/`minimizable`/`systemChrome`/`x`/`y`/`minSize`/`maxSize`) →
 generate bootstrap code equivalent to `boot-gui.as` (`new Stage()` → preset `stageWidth/stageHeight` →
 `new Main()` → `addChild` → `showWindow`; when `visible=false`, use offscreen `render` to output PNG) →
 recursively scan `src/**/*.as` (skip reverse-domain third-party library directories `com/org/net`, but
@@ -601,7 +601,16 @@ touch the network is unaffected (still the zero-dependency default form).
 
 Three key behaviors aligned with adl:
 - `<resizable>false</resizable>` → build manifest adds `ASC_WINDOW_FIXED=1`; window creation omits
-  `SDL_WINDOW_RESIZABLE`, yielding a fixed-size window consistent with adl.
+  `SDL_WINDOW_RESIZABLE`, yielding a fixed-size window consistent with adl. **It applies only to the "first
+  window" the descriptor describes**: a window the program creates itself with
+  `new NativeWindow(NativeWindowInitOptions)` is governed by its own `resizable`, and the build-wide define does
+  not leak out (same for `ASC_WINDOW_NOT_MAXIMIZABLE` / `ASC_WINDOW_NOT_MINIMIZABLE` / `ASC_WINDOW_NOCHROME`).
+- `<maximizable>` / `<minimizable>` / `<systemChrome>` / `<x>` / `<y>` / `<minSize>` / `<maxSize>` → likewise
+  **build defines + main window only**: the first three decide win32's `WS_MAXIMIZEBOX`/`WS_MINIMIZEBOX` and
+  whether there is a non-client area, while the last four are the initial window's top-left corner (`xs:int`,
+  negatives allowed) and its size bounds (`BoundsSizeType`: two whitespace-separated unsigned integers — giving
+  only one is an **error**, not a default). `WS_MAXIMIZEBOX` is not cosmetic: it decides whether maximizing
+  fills the **work area** or the **whole monitor**, taskbar included (see `win32.md` §5 item 21).
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → build manifest adds `ASC_DISPLAY_HIGH=1`;
   the window opens `SDL_WINDOW_ALLOW_HIGHDPI` and the surface is created with physical pixels at device scale
   (Retina is not blurry); `standard` or omitted keeps 1x (consistent with adl, stretched by the compositor).

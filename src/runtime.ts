@@ -8583,7 +8583,8 @@ extern int sk_display_usable_bounds(int i, int* x, int* y, int* w, int* h);
 // Dynamic window API behind flash.display.NativeWindow. A window is created
 // hidden (adl reports visible=false right after the constructor) with a CPU
 // streaming-texture paint path, and is shown/raised by activate().
-extern int sk_window_create(int w, int h, const char* title, int resizable, int decorated, int highdpi,
+extern int sk_window_create(int w, int h, const char* title, int resizable, int maximizable, int minimizable,
+                            int decorated, int highdpi,
                             int gpu,
                            void (*on_mouse)(int, double, double, const char*),
                            void (*on_wheel)(int, double, double, double),
@@ -8762,7 +8763,8 @@ static inline int as_skia_surface_show_window_gpu(int w, int h,
 // ASC_RENDER_WINGPU no GPU window backend is compiled in and the glue downgrades
 // the request (see sk_window_create), so the generated C only ever asks for 1 in a
 // build that has one.
-static inline int as_window_create(int w, int h, const char* title, int resizable, int decorated, int highdpi,
+static inline int as_window_create(int w, int h, const char* title, int resizable, int maximizable, int minimizable,
+                                   int decorated, int highdpi,
                                    int gpu,
                                    void (*on_mouse)(int, double, double, const char*),
                                    void (*on_wheel)(int, double, double, double),
@@ -8773,10 +8775,10 @@ static inline int as_window_create(int w, int h, const char* title, int resizabl
                                    void* (*on_resize)(int, int, int, int, int, double),
                                    void (*on_close)(int)) {
 #ifdef ASC_USE_WINDOW
-    return sk_window_create(w, h, title, resizable, decorated, highdpi, gpu,
+    return sk_window_create(w, h, title, resizable, maximizable, minimizable, decorated, highdpi, gpu,
                             on_mouse, on_wheel, on_key, on_redraw, on_frame, on_frame_delay, on_resize, on_close);
 #else
-    (void)w; (void)h; (void)title; (void)resizable; (void)decorated; (void)highdpi; (void)gpu;
+    (void)w; (void)h; (void)title; (void)resizable; (void)maximizable; (void)minimizable; (void)decorated; (void)highdpi; (void)gpu;
     (void)on_mouse; (void)on_wheel; (void)on_key; (void)on_redraw; (void)on_frame;
     (void)on_frame_delay; (void)on_resize; (void)on_close;
     return -1;
@@ -9202,7 +9204,8 @@ static inline int sk_window_text_take(int id, char* buf, int cap) { (void)id; (v
 static inline int sk_window_text_edit_take(int id, char* buf, int cap, int* start, int* length) { (void)id; (void)buf; (void)cap; (void)start; (void)length; return 0; }
 static inline void sk_window_set_text_input_rect(int id, double x, double y, double w, double h) { (void)id; (void)x; (void)y; (void)w; (void)h; }
 static inline int as_skia_surface_show_window(void* s, int w, int h, int pw, int ph, const char* title, int fullscreen, void (*on_mouse)(int, double, double, const char*), void (*on_wheel)(int, double, double, double), void (*on_key)(int, const char*, int, int, int), void (*on_redraw)(int), void (*on_frame)(int), double (*on_frame_delay)(int), void* (*on_resize)(int, int, int, int, int, double), void (*on_close)(int)) { (void)s; (void)w; (void)h; (void)pw; (void)ph; (void)title; (void)fullscreen; (void)on_mouse; (void)on_wheel; (void)on_key; (void)on_redraw; (void)on_frame; (void)on_frame_delay; (void)on_resize; (void)on_close; return 0; }
-static inline int as_window_create(int w, int h, const char* title, int resizable, int decorated, int highdpi,
+static inline int as_window_create(int w, int h, const char* title, int resizable, int maximizable, int minimizable,
+                                   int decorated, int highdpi,
                                    int gpu,
                                    void (*on_mouse)(int, double, double, const char*),
                                    void (*on_wheel)(int, double, double, double),
@@ -9212,7 +9215,7 @@ static inline int as_window_create(int w, int h, const char* title, int resizabl
                                    double (*on_frame_delay)(int),
                                    void* (*on_resize)(int, int, int, int, int, double),
                                    void (*on_close)(int)) {
-    (void)w; (void)h; (void)title; (void)resizable; (void)decorated; (void)highdpi; (void)gpu;
+    (void)w; (void)h; (void)title; (void)resizable; (void)maximizable; (void)minimizable; (void)decorated; (void)highdpi; (void)gpu;
     (void)on_mouse; (void)on_wheel; (void)on_redraw; (void)on_frame;
     (void)on_frame_delay; (void)on_resize; (void)on_close;
     return -1;

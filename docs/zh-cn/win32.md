@@ -860,6 +860,31 @@ macOS 自动跳过）。
 | 16 | ⚠ **拖动缩放时画面不被拉伸**（阶段一百三十三）：`sd.Scaling = DXGI_SCALING_NONE` 是否真的去掉了 D3D12 侧的整幅重采样（是否还有重影/抖动，放开鼠标后是否停），以及 1:1 呈现时边上是否会露出未覆盖条 | 仍见重影/抖动（`Scaling` 未被 DXGI 采纳）；或新出现 1 px 未覆盖条。**判据**：真拖窗口（用户速度，非脚本慢拖）并肉眼比对；本 macOS 机上同一缺陷类的脚本判据见 [`skia.md`](skia.md) §6.7 的 15/93 vs 0/151 |
 | 17 | ⚠ **arm64 依赖前缀真的能建出来**（§2.11）：在一台装了 `MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools` 的机器上跑 `-Arch arm64`，产物经 `Assert-LibBitness` 读出的 COFF 机器字段是 **ARM64**（`0xaa64`）而非 x64（`0x8664`） | 现在是**守卫已验证、产出未验证**：本机没有该工具集，故只证明了 `-Arch arm64` 会**退出 1 并指名缺失组件**、以及 x86 路径的正向分支真的通过自检 |
 
+| 18 | ✅ **窗口限制的 Windows 列已实测**（阶段二百零四）：`minSize` 默认与**地板**都是 `136,39`（`minSize=(0,0)→136,39`、`(100,10)→136,39`；macOS 是 `78,32` / 地板 `2,32`）、`maxSize` `107374182,107374182`、`supportsMenu`/`supportsNotification` = `true`/`true`、钳制规则（min300/max100 ⇒ 两侧 `300,300`）与 macOS 同形、`w.minSize === w.minSize` 为 `false` | 读到别的数 ⇒ `sk_window_size_defaults`/`sk_window_size_floor` 的 `_WIN32` 分支被改错（见 `unit: platform/WindowLimitsAndEvents` 的 3 条新钉子） |
+| 19 | ✅ **固定窗的 `maximize()` 真的生效**（阶段二百零四）：`<resizable>false</resizable>`（即 `ASC_WINDOW_FIXED`）的窗口调 `stage.nativeWindow.maximize()`，下一拍 `displayState == "maximized"`、画面铺满。修复前它是**静默 no-op**：SDL 的 win32 后端拒绝最大化无 `SDL_WINDOW_RESIZABLE` 的窗口，而 Cocoa 的 `zoom:` 不拒 | 窗口不动、`displayState` 恒 `normal`、且**无任何报错**＝又回到了静默状态：查 `sk_window_maximize` 的 `#ifdef _WIN32` 分支（借标志那三行）是否还在 |
+| 20 | ✅ **程序显式 `resizable=true` 的子窗真的能拖边**（阶段二百零四）：`NativeWindowInitOptions` 里 `resizable = true` 建的窗，win32 样式应含 `WS_THICKFRAME`/`WS_MAXIMIZEBOX` | 拖不动边 ⇒ `ASC_WINDOW_FIXED` 又变成了**构建级**污染：`sk_window_create` 的 `SDL_SetWindowResizable(c->win, resizable ? SDL_TRUE : SDL_FALSE)` 被改回非对称的 `if (!resizable) … SDL_FALSE` |
+| 21 | ✅ **最大化后的尺寸口径**（阶段二百零五 已定）：**不是 `bounds` getter 的另一套数，而是 `WS_MAXIMIZEBOX` 这一位**：该位**在** ⇒ 最大化尺寸取**可用区**（`2576x1675` = `1659` + 16）；**不在** ⇒ 取**整块显示器**（`2576x1723` = `1707` + 16，压住任务栏）。adl 跟着这一位走而与 `<resizable>` 无关：同一份 `W.as` 在 `<maximizable>false</maximizable>` 与默认描述符下分别落 `2576x1723` / `2576x1675`，我们**两格逐字相同**（含最大化原点的 `-8,-8` = 边框补偿） | 读到 `1675` 却应 `1723`（或反之）⇒ `sk_win_apply_style` 的 `WS_MAXIMIZEBOX` 映射丢了，或 `sk_window_maximize` 没有在 `SDL_MaximizeWindow` **之前**补上样式（SDL 的 `WIN_SetWindowResizable` 会把 MAXIMIZEBOX 加回去） |
+| 22 | ✅ **`NativeWindow.x` / `bounds=` 的横向边框**（阶段二百零五 已修）：四处同一口径 —— `sk_window_set_bounds`（`x + c->b_left`）、`sk_window_get_bounds`（`*x = px - c->b_left`）、`sk_window_create` 的居中放置、**以及 `sk_sys_drag_step` 的 startMove 分支**（少于这一处，拖动会差 8px 且只在 Windows 上可见） | 与 adl 的孪生探针对 `x`/`bounds` 逐值差 **8** ⇒ 查上面四处是否同源补了 `b_left`/`b_top`（钉子 `unit: platform/InitialWindowStyle`） |
+| 23 | ✅ **描述符只描述「第一扇窗」**（阶段二百零五）：`<maximizable>false</maximizable><minimizable>false</minimizable><resizable>false</resizable>` 的描述符下，主窗回读 `false/false/false`、`minSize 300,500`、`maxSize 800,900`，而**同一进程**里 `new NativeWindow(new NativeWindowInitOptions())` 仍回读 `true/true/true` 与 `minSize 136,39`（adl 与 AOT **逐字相同**） | 子窗也跟着变 `false` / `minSize` 变成描述符的数 ⇒ 构建级 define 又漏进 `sk_open_window`/`sk_window_create`（正是阶段二百零四 修掉的那类静默污染） |
+| 24 | ✅ **描述符成员已接线**（阶段二百零五）：`<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>` 七项解析进 `AirAppInfo.style` → 构建 define → 主窗的样式与几何（`systemChrome:none` 走 `SDL_WINDOW_BORDERLESS`）。**仍未接线**：`<transparent>`（只解析成属性，两端都没有真透明窗） | 写了 `<x>50</x><y>60</y>` 而窗口不在 `50,60` ⇒ 查 `ASC_WIN_X/Y` 是否落进 `sk_open_window` 的 `is_main` 分支（注意加的是**框**坐标 `+ c->b_left`） |
+| 25 | ⚠ **初始窗的 `<width>/<height>` 是「框」尺寸，我们当「客户区」**：adl 对 `<width>366</width><height>630</height>` 回读 `bounds=366x630` 而 `stage=350x591`；我们回读 `bounds=382x669`（stage 仍是 `366x630`），差 **16x39 = 边框**（macOS 同一条代码路径 ⇒ 预计差 32 的标题栏高度，本机不可实测） | 宿主程序按 `<width>` 摆的版式在 AIR 里是 350x591 的舞台。见 `TODO.md` 遗留行「初始窗的框/客户区单位」——**两端都有、非 Windows 专属**，改动会动到每扇窗的初始几何，须单独立项 |
+| 26 | ✅ **`maximize()`/`restore()` 的时点**（阶段二百零五）：adl 两者**都是异步**的 —— 调用当拍 `ds` 与 `bounds` 都不变（`normal 366x630`），下一拍才 `maximized 2576x1723`；`restore()` 同理，须再等一拍才回 `normal`。我们**同拍即达**，**终态一致**（差异只在「调用后的那一瞬间」） | 只在「调用后立刻读状态」的代码里可观测（宿主的 `if (stage.displayState == NORMAL) maximize()` 不受影响）；若要逐字对齐须把这两次调用排到帧边界 |
+
+> **阶段二百零四 补的实测证据（18–20 是修好后应对齐的口径）**：探针
+> `temp/nwwin/probe.c`（**直驱 SDL 2.32.10，不经我们任何代码**）+ `temp/nwwin/{mx-def,mx-nomax,mx-fix}.xml`
+> 三档描述符的 `adl 51.4.1` 运行（`temp/nwwin/out-mx-*.txt`）；同轮修复的端到端对照见 `TODO.md` 阶段二百零四。
+> **取 trace 的两个坑**：Windows 上 `adl` 的 `trace()` 走 **stderr**（不是 stdout），且 SWF 必须用
+> `mxmlc -debug=true` 编译，否则一行都收不到。
+>
+> **阶段二百零五 补的实测证据（21–24、26 是同一轮 A/B 出来的口径，25 是顺手量到的新欠账）**：同一份
+> `temp/nwwin/W.as` 分别用 `mxmlc`+`adl` 与我们的 `--air-app` 构建（描述符 `temp/nwwin/w-{strict,def}.xml`，
+> 后者即宿主 `application.xml` 的形状）跑一遍，**逐行对照** —— 两档描述符共 32 格，除 25 那一格与
+> 「会话级级联放置」外**全部逐字相同**（`temp/nwwin/out-w-*.txt` 对 `temp/nwwin/wprobe/ours-w-*.txt`）。
+> 同轮另有两个**只有端到端才能发现**的缺陷：`parseWindowInt`/`parseBoundsSize` 在 `<x>`/`<minSize>`
+> **缺席**时对着 `null` 调 `.trim()`（`childText` 答 `null`，守卫写的是 `undefined`）⇒ **任何**没有这几项的
+> 描述符都编不过，包括宿主自己的；以及 macOS 专属的 Metal 开窗路径仍停在旧参数个数上（Windows 编不到
+> 那条分支，只有 CI 会红）。
+
 **Stage3D 上屏的验证口径（重要）**：**不得**用屏幕截图判定——flip-model swapchain 的内容取不到
 GDI/BitBlt（截到的是陈旧或全黑画面）。唯一客观判据是 `ASC_GPU_DUMP=<路径> ASC_GPU_DUMP_AT=<帧号>`
 导出的 **back buffer BMP**（注意该环境变量的值是**文件路径**，不是开关），再肉眼/逐字节核对其中有 3D 内容。

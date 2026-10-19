@@ -5707,7 +5707,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // whatever the allocation contained and crashed the close path.
     this.line('EventDispatcher_ctor((EventDispatcher*)o, NULL);');
     this.line('o->_win = -1;');
-    this.line('int decorated = 1, resizable = 1;');
+    this.line('int decorated = 1, resizable = 1, maximizable = 1, minimizable = 1;');
     // Default frame 400x232 (adl). With standard chrome the title bar is part of
     // the frame, so the client starts at 400x200; a borderless window has no title
     // bar, so the same frame IS the client size.
@@ -5717,6 +5717,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('char* chrome = options->systemChrome;');
     this.line('if (chrome != NULL && strcmp(chrome, "none") == 0) { decorated = 0; ch = 232.0; }');
     this.line('resizable = options->resizable ? 1 : 0;');
+    // maximizable/minimizable are per-window too, and on Windows they are not the
+    // same bit as resizable: AIR maps WS_THICKFRAME <=> resizable, WS_MAXIMIZEBOX
+    // <=> maximizable, WS_MINIMIZEBOX <=> minimizable (measured), so a window that
+    // asks for one without the other needs its own flag at create time -- SDL ties
+    // THICKFRAME|MAXIMIZEBOX to its single resizable flag.
+    this.line('maximizable = options->maximizable ? 1 : 0;');
+    this.line('minimizable = options->minimizable ? 1 : 0;');
     this.indent--;
     this.line('}');
     // The window's handlers are installed at creation, exactly as the main
@@ -5736,7 +5743,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('#ifdef ASC_RENDER_WINGPU');
     this.line('gpu = (strcmp(want_mode, "cpu") != 0) ? 1 : 0;');
     this.line('#endif');
-    this.line('int id = as_window_create((int)cw, (int)ch, (char*)"", resizable, decorated,');
+    this.line('int id = as_window_create((int)cw, (int)ch, (char*)"", resizable, maximizable, minimizable, decorated,');
     this.line('#ifdef ASC_DISPLAY_HIGH');
     this.line('                            1,');
     this.line('#else');
@@ -22283,9 +22290,65 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // the cached NativeWindow wrapper -- breaking both
     // `stage.nativeWindow === stage.nativeWindow` and the Event.CLOSE listeners the
     // document class registered on that wrapper.
+    // The initial window's OWN style and limits, which the descriptor describes and which
+    // nothing else may share. --air-app turns <initialWindow> into build defines (the same
+    // ones window_glue.cc reads), so the values are quote compile-time here. They are
+    // written only into the freshly zeroed slot 0, never on a later call: AIR's descriptor
+    // describes the window the app STARTED with, so a programmatic
+    // `stage.nativeWindow.resizable = ...` has to survive every following frame.
+    //
+    // The getters already answer the platform defaults for a NULL field, but the STYLE
+    // flags cannot be left NULL: AIR reads them back as the descriptor's value -- measured
+    // on adl 51.4.1, a strict `<resizable>false</resizable><maximizable>false</maximizable>
+    // <minimizable>false</minimizable>` descriptor answers exactly those three false
+    // (temp/nwwin/out-lk-strict.txt) -- and a plain `false` from a missing mirror is
+    // indistinguishable from the real thing.
+    this.line('static void ASC_win_seed_main(ASCWin* w) {');
+    this.indent++;
+    this.line('if (w == NULL) return;');
+    this.line('#ifndef ASC_WINDOW_FIXED');
+    this.line('w->resizable = 1;');
+    this.line('#endif');
+    this.line('#ifndef ASC_WINDOW_NOT_MAXIMIZABLE');
+    this.line('w->maximizable = 1;');
+    this.line('#endif');
+    this.line('#ifndef ASC_WINDOW_NOT_MINIMIZABLE');
+    this.line('w->minimizable = 1;');
+    this.line('#endif');
+    this.line('#ifdef ASC_WINDOW_NOCHROME');
+    this.line('w->system_chrome = (char*)"none";');
+    this.line('#endif');
+    // minSize/maxSize: the glue holds the effective pair and is the same source a window
+    // created by this program reads, so it is read back rather than recomputed. The
+    // fallback below covers the ordering AIR imposes: the document class runs BEFORE the
+    // OS window is opened (Stage.showWindow), so slot 0 can be claimed while the glue has
+    // no window yet and would answer zeros -- in which case ASC_win_limits_init copies the
+    // platform defaults, and the descriptor's own pair goes on top.
+    this.line('ASC_win_limits_init(0);');
+    this.line('#ifdef ASC_WIN_MIN_W');
+    this.line('w->min_w = (double)ASC_WIN_MIN_W; w->min_h = (double)ASC_WIN_MIN_H;');
+    this.line('#endif');
+    this.line('#ifdef ASC_WIN_MAX_W');
+    this.line('w->max_w = (double)ASC_WIN_MAX_W; w->max_h = (double)ASC_WIN_MAX_H;');
+    this.line('#endif');
+    // The same clamp the minSize/maxSize setters apply (window_glue.cc stores the pair
+    // verbatim and the AS3 side owns the clamp), so a descriptor pair and an assignment
+    // cannot disagree. Clamping twice is a no-op, which keeps this correct in both of the
+    // orderings above.
+    this.line('int fw = 0, fh = 0;');
+    this.line('as_window_limits_floor(&fw, &fh);');
+    this.line('if (w->min_w < (double)fw) w->min_w = (double)fw;');
+    this.line('if (w->min_h < (double)fh) w->min_h = (double)fh;');
+    this.line('if (w->max_w < w->min_w) w->max_w = w->min_w;');
+    this.line('if (w->max_h < w->min_h) w->max_h = w->min_h;');
+    this.indent--;
+    this.line('}');
     this.line('static ASCWin* ASC_win_claim_main(void) {');
     this.indent++;
-    this.line('if (ASC_wins[0].stage == NULL && ASC_wins[0].window == NULL) memset(&ASC_wins[0], 0, sizeof(ASCWin));');
+    this.line('if (ASC_wins[0].stage == NULL && ASC_wins[0].window == NULL) {');
+    this.line('  memset(&ASC_wins[0], 0, sizeof(ASCWin));');
+    this.line('  ASC_win_seed_main(&ASC_wins[0]);');
+    this.line('}');
     this.line('return &ASC_wins[0];');
     this.indent--;
     this.line('}');

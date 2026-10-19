@@ -355,6 +355,13 @@ struct WinCtx {
   // the flag is cached here because AIR's getter is expected to read back what the
   // last setter wrote even on a platform that cannot honour it.
   int always_in_front;
+  // The three style-affecting flags the descriptor / NativeWindowInitOptions carry.
+  // AIR's win32 mapping is THICKFRAME <=> resizable, MAXIMIZEBOX <=> maximizable,
+  // MINIMIZEBOX <=> minimizable (measured off the real window, temp/nwwin/wstyle.exe),
+  // which is NOT SDL's (it ties THICKFRAME|MAXIMIZEBOX to one flag and always keeps
+  // MINIMIZEBOX). MAXIMIZEBOX also decides the maximized geometry, so these cannot be
+  // re-derived from SDL's own flags afterwards -- see sk_win_apply_style.
+  int resizable, maximizable, minimizable;
   int dirty;
   int destroy_pending;
   // The user (or the OS) asked this window to close -- its close button, its Cmd-W
@@ -1015,7 +1022,12 @@ static void sk_sys_drag_step(WinCtx* c) {
   int dx = gx - c->sys_gx;
   int dy = gy - c->sys_gy;
   if (c->sys_drag == 1) {
-    SDL_SetWindowPosition(c->win, c->sys_x + dx, c->sys_y + dy);
+    // sys_x/sys_y hold FRAME coordinates (what NativeWindow.bounds reports), SDL takes the
+    // client origin, so the frame borders are converted on the way out — the same
+    // conversion the resize branch below and sk_window_set_bounds do. Without it a
+    // startMove drag follows the pointer 8px off on Windows (b_left 8) and correctly on
+    // macOS (b_left 0), which is exactly why the asymmetry was invisible there.
+    SDL_SetWindowPosition(c->win, c->sys_x + dx + c->b_left, c->sys_y + dy + c->b_top);
     return;
   }
   // Resizing: the dragged edges move with the pointer, the opposite ones stay.
@@ -1046,7 +1058,7 @@ static void sk_sys_drag_step(WinCtx* c) {
   int ch = nh - c->b_top - c->b_bottom;
   if (cw < 1) cw = 1;
   if (ch < 1) ch = 1;
-  if (nx != c->sys_x || ny != c->sys_y) SDL_SetWindowPosition(c->win, nx, ny + c->b_top);
+  if (nx != c->sys_x || ny != c->sys_y) SDL_SetWindowPosition(c->win, nx + c->b_left, ny + c->b_top);
   if (cw + c->b_left + c->b_right != c->sys_w || ch + c->b_top + c->b_bottom != c->sys_h)
     SDL_SetWindowSize(c->win, cw, ch);
 }
@@ -1300,12 +1312,104 @@ static void sk_run_loop(void) {
 // because window creation is what installs the defaults.
 static void sk_window_size_defaults(int* mnw, int* mnh, int* mxw, int* mxh);
 static void sk_window_size_floor(int* fw, int* fh);
+// Deliberately NOT static: this one is the glue's public entry point (the generated C's
+// NativeWindow_set_minSize/maxSize reach it through as_window_set_limits), so a `static`
+// here would silently pull the whole definition to internal linkage and the link would
+// fail with an undefined symbol.
+void sk_window_set_limits(int id, int mnw, int mnh, int mxw, int mxh);
 
-static int sk_open_window(int w, int h, const char* title, int decorated, int visible, int fullscreen, int highdpi, int is_main) {
-  Uint32 winFlags = visible ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN;
-#ifndef ASC_WINDOW_FIXED
-  winFlags |= SDL_WINDOW_RESIZABLE;
+// The app's OWN initial window, as the AIR descriptor describes it. Compile-time because
+// --air-app turns <initialWindow> into build defines, and deliberately named after the
+// FIRST window: AIR's descriptor does not describe any window the program creates itself.
+// Measured against a strict descriptor (<resizable>false</resizable>, <maximizable>false,
+// <x>50</x><y>60</y>, <minSize>300 500</minSize>) with temp/nwwin/Leak.as: a plain
+// `new NativeWindow(new NativeWindowInitOptions())` still answers resizable/maximizable/
+// minimizable all true, minSize (136,39), maxSize (107374182,107374182) and the platform's
+// own bounds -- i.e. nothing from the descriptor reaches it. So these may only ever be
+// read under `is_main`.
+#ifdef ASC_WINDOW_FIXED
+#define SK_MAIN_RESIZABLE 0
+#else
+#define SK_MAIN_RESIZABLE 1
 #endif
+#ifdef ASC_WINDOW_NOT_MAXIMIZABLE
+#define SK_MAIN_MAXIMIZABLE 0
+#else
+#define SK_MAIN_MAXIMIZABLE 1
+#endif
+#ifdef ASC_WINDOW_NOT_MINIMIZABLE
+#define SK_MAIN_MINIMIZABLE 0
+#else
+#define SK_MAIN_MINIMIZABLE 1
+#endif
+
+// Put AIR's frame style on a window: WS_THICKFRAME iff resizable, WS_MAXIMIZEBOX iff
+// maximizable, WS_MINIMIZEBOX iff minimizable. AIR's own mapping, read off the real window
+// with temp/nwwin/wstyle.exe (adl 51.4.1 on Windows 11), where the bits beside
+// CAPTION|SYSMENU|BORDER|DLGFRAME are:
+//
+//   <resizable> <maximizable> <minimizable>   style
+//   true        true         true            THICKFRAME|MAXIMIZEBOX|MINIMIZEBOX
+//   true        false        true            THICKFRAME|MINIMIZEBOX
+//   true        true         false           THICKFRAME|MAXIMIZEBOX
+//   false       true         true            MAXIMIZEBOX|MINIMIZEBOX
+//   false       false        true            MINIMIZEBOX
+//
+// SDL instead maps the single SDL_WINDOW_RESIZABLE flag onto THICKFRAME|MAXIMIZEBOX and
+// always keeps MINIMIZEBOX, so any window whose maximizable/minimizable differ from its
+// resizable comes out wrong. MAXIMIZEBOX is not cosmetic: Windows sizes a MAXIMIZED window
+// to the WORK AREA when the bit is present and to the FULL MONITOR -- taskbar included --
+// when it is absent (SDL's own WIN_MaximizeWindow comment says the OS "resizes the window
+// weirdly (covering the taskbar)" without it), and adl follows that bit rather than the
+// resizable one: a 366x630 frame on this 2560x1707 desktop settles at 2576x1675 (work area)
+// with MAXIMIZEBOX and 2576x1723 (full monitor) without it, for <resizable> true and false
+// alike. So the bit has to be right BEFORE a maximize, not only after it.
+static void sk_win_apply_style(WinCtx* c) {
+#ifdef _WIN32
+  if (c == NULL || c->win == NULL) return;
+  // A borderless window has no frame to style; AIR's own <systemChrome>none</systemChrome>
+  // window keeps the caption bits but draws no non-client area, which is what SDL's
+  // SDL_WINDOW_BORDERLESS (WS_POPUP) already gives observationally: a client equal to the
+  // frame and 366x630 bounds for a 366x630 descriptor.
+  if (!c->decorated) return;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
+  HWND hwnd = info.info.win.window;
+  LONG style = GetWindowLongPtrA(hwnd, GWL_STYLE);
+  LONG want = style & ~(LONG)(WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX);
+  if (c->resizable) want |= WS_THICKFRAME;
+  if (c->maximizable) want |= WS_MAXIMIZEBOX;
+  if (c->minimizable) want |= WS_MINIMIZEBOX;
+  if (want == style) return;
+  SetWindowLongPtrA(hwnd, GWL_STYLE, want);
+  // The non-client area is laid out from the style, and SDL's own WIN_SetWindowResizable
+  // skips this step (it only writes GWL_STYLE), which is why a runtime flip can leave a
+  // stale title bar behind. A redundant SWP is cheaper than a maximize button that should
+  // not be there.
+  SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+#else
+  (void)c;
+#endif
+}
+
+static int sk_open_window(int w, int h, const char* title, int decorated, int visible, int fullscreen, int highdpi, int is_main,
+                          int resizable, int maximizable, int minimizable) {
+  // The descriptor's <systemChrome> is the initial window's too: measured on adl 51.4.1,
+  // a none-chrome initial window answers a client equal to its frame and 366x630 bounds
+  // for a <width>366</width><height>630</height> descriptor, i.e. no frame at all -- what
+  // SDL_WINDOW_BORDERLESS gives. is_main keeps it off every window the program makes.
+#ifdef ASC_WINDOW_NOCHROME
+  if (is_main) decorated = 0;
+#endif
+  Uint32 winFlags = visible ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN;
+  // resizable is a PER-WINDOW value, not the build-wide one it used to be: the caller
+  // passes the descriptor's <resizable> for the app's initial window and
+  // NativeWindowInitOptions.resizable for a `new NativeWindow()`. `#ifndef
+  // ASC_WINDOW_FIXED` here is what made every program-made window fixed as well (AIR's
+  // descriptor describes the first window only).
+  if (resizable) winFlags |= SDL_WINDOW_RESIZABLE;
   if (highdpi) winFlags |= SDL_WINDOW_ALLOW_HIGHDPI;
   if (!decorated) winFlags |= SDL_WINDOW_BORDERLESS;
   SDL_Window* win = SDL_CreateWindow(
@@ -1337,6 +1441,57 @@ static int sk_open_window(int w, int h, const char* title, int decorated, int vi
   int dmnw = 0, dmnh = 0, dmxw = 0, dmxh = 0;
   sk_window_size_defaults(&dmnw, &dmnh, &dmxw, &dmxh);
   c->min_w = dmnw; c->min_h = dmnh; c->max_w = dmxw; c->max_h = dmxh;
+  // Keep the three style flags (AIR's mapping, see sk_win_apply_style) and put the real
+  // win32 style on the window now that it exists. Done here rather than at each call
+  // site so the main window and every NativeWindow go through one place.
+  c->resizable = resizable ? 1 : 0;
+  c->maximizable = maximizable ? 1 : 0;
+  c->minimizable = minimizable ? 1 : 0;
+  sk_win_apply_style(c);
+  // The descriptor's <minSize>/<maxSize>/<x>/<y>, which are likewise the initial window's.
+  // The pair is clamped the way the AS3 setter clamps it -- floor for the min, min for the
+  // max -- so a descriptor pair and a `minSize = ...` assignment cannot end up with two
+  // different口径. (Measured on adl 51.4.1: `minSize = (0,0)` reads back the floor, and a
+  // min above the max is pulled down to it, temp/nwmac/limits-out.txt.) A `null` test is
+  // not needed: c->min_w/max_w hold the platform defaults already.
+#if defined(ASC_WIN_MIN_W) || defined(ASC_WIN_MAX_W)
+  if (is_main) {
+    int fw = 0, fh = 0;
+    int mnw = c->min_w, mnh = c->min_h, mxw = c->max_w, mxh = c->max_h;
+    sk_window_size_floor(&fw, &fh);
+#ifdef ASC_WIN_MIN_W
+    mnw = ASC_WIN_MIN_W; mnh = ASC_WIN_MIN_H;
+#endif
+#ifdef ASC_WIN_MAX_W
+    mxw = ASC_WIN_MAX_W; mxh = ASC_WIN_MAX_H;
+#endif
+    if (mnw < fw) mnw = fw;
+    if (mnh < fh) mnh = fh;
+    if (mxw < mnw) mxw = mnw;
+    if (mxh < mnh) mxh = mnh;
+    sk_window_set_limits(id, mnw, mnh, mxw, mxh);
+  }
+#endif
+#if defined(ASC_WIN_X) || defined(ASC_WIN_Y)
+  if (is_main) {
+    // Half a position is legal in the descriptor (x and y are independent children), and
+    // AIR does have an opinion about the other axis that we have not measured, so the
+    // axis that was NOT given keeps whatever the platform chose rather than a guess.
+    int px = 0, py = 0;
+    SDL_GetWindowPosition(c->win, &px, &py);
+#ifdef ASC_WIN_X
+    px = ASC_WIN_X + c->b_left;
+#endif
+#ifdef ASC_WIN_Y
+    py = ASC_WIN_Y + c->b_top;
+#endif
+    // SDL positions a window by its CLIENT origin -- measured on both backends: Cocoa keeps
+    // window->x at contentRectForFrameRect's origin, win32 at the WM_MOVE client origin --
+    // while AIR's bounds is the FRAME. So the frame borders go back on, including the
+    // horizontal ones, where the two platforms differ (b_left 8 on Windows, 0 on macOS).
+    SDL_SetWindowPosition(c->win, px, py);
+  }
+#endif
   return id;
 }
 
@@ -1423,17 +1578,16 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
     g_display_refresh = (double)dm.refresh_rate;
   }
 
-  // The app's own initial window is always chrome-decorated: AIR's initial window
-  // takes its systemChrome from the descriptor, and an app.xml that asks for
-  // `none` is rare enough that the border difference is reported rather than
-  // guessed at here.
+  // The app's own initial window takes its whole style from the descriptor: the chrome
+  // (ASC_WINDOW_NOCHROME) and the three style flags are read inside sk_open_window under
+  // `is_main`, so nothing in the descriptor can reach a window the program makes.
   int id = sk_open_window(w, h, title, 1, 1, fullscreen,
 #ifdef ASC_DISPLAY_HIGH
-                         1, 1
+                         1, 1,
 #else
-                         0, 1
+                         0, 1,
 #endif
-  );
+                         SK_MAIN_RESIZABLE, SK_MAIN_MAXIMIZABLE, SK_MAIN_MINIMIZABLE);
   if (id < 0) { SDL_Quit(); return 0; }
   WinCtx* c = &g_wins[id];
   c->on_mouse = on_mouse;
@@ -1575,7 +1729,8 @@ int sk_window_show_metal(int w, int h, const char* title, int fullscreen,
     g_display_refresh = (double)dm.refresh_rate;
   }
 
-  int id = sk_open_window(w, h, title, 1, 1, fullscreen, 1, 1);
+  int id = sk_open_window(w, h, title, 1, 1, fullscreen, 1, 1,
+                          SK_MAIN_RESIZABLE, SK_MAIN_MAXIMIZABLE, SK_MAIN_MINIMIZABLE);
   if (id < 0) { SDL_Quit(); return 0; }
   WinCtx* c = &g_wins[id];
   c->on_mouse = on_mouse;
@@ -1656,7 +1811,8 @@ int sk_window_show_gpu(int w, int h, const char* title, int fullscreen,
     g_display_refresh = (double)dm.refresh_rate;
   }
 
-  int id = sk_open_window(w, h, title, 1, 1, fullscreen, 1, 1);
+  int id = sk_open_window(w, h, title, 1, 1, fullscreen, 1, 1,
+                          SK_MAIN_RESIZABLE, SK_MAIN_MAXIMIZABLE, SK_MAIN_MINIMIZABLE);
   if (id < 0) { SDL_Quit(); return 0; }
   WinCtx* c = &g_wins[id];
   c->on_mouse = on_mouse;
@@ -1707,7 +1863,8 @@ int sk_window_show_gpu(int w, int h, const char* title, int fullscreen,
 // `w`/`h` here are the CONTENT size, matching what SDL measures; NativeWindow's
 // bounds arithmetic on the AS3 side adds the frame borders back on.
 
-int sk_window_create(int w, int h, const char* title, int resizable, int decorated, int highdpi,
+int sk_window_create(int w, int h, const char* title, int resizable, int maximizable, int minimizable,
+                     int decorated, int highdpi,
                      int gpu,
                      sk_mouse_cb on_mouse, sk_wheel_cb on_wheel,
                      sk_key_cb on_key,
@@ -1718,7 +1875,13 @@ int sk_window_create(int w, int h, const char* title, int resizable, int decorat
   if (sk_video_init() != 0) return -1;
   // A new NativeWindow starts HIDDEN (measured: w.visible is false right after
   // the constructor) and becomes visible on activate(), so open it hidden.
-  int id = sk_open_window(w, h, title, decorated, 0, 0, highdpi, 0);
+  // The three style flags are NativeWindowInitOptions' own values -- NOT the build-wide
+  // ASC_WINDOW_FIXED, which describes the app's initial window only (AIR's descriptor does
+  // not describe a window the program creates). Passing them here means the flag is right
+  // from SDL_CreateWindow onward, so SDL_WINDOW_RESIZABLE does not have to be flipped on
+  // afterwards -- a flip reaches the win32 style but leaves the non-client area stale unless
+  // a frame-changed SetWindowPos follows (WIN_SetWindowResizable only writes GWL_STYLE).
+  int id = sk_open_window(w, h, title, decorated, 0, 0, highdpi, 0, resizable, maximizable, minimizable);
   if (id < 0) return -1;
   WinCtx* c = &g_wins[id];
   c->visible = 0;
@@ -1736,7 +1899,6 @@ int sk_window_create(int w, int h, const char* title, int resizable, int decorat
   c->on_frame = on_frame;
   c->on_frame_delay = on_frame_delay;
   c->on_close = on_close;
-  if (!resizable) SDL_SetWindowResizable(c->win, SDL_FALSE);
   // Backend choice. The AS3 side passes gpu=1 when NativeWindowInitOptions.
   // renderMode asks for the GPU — which is AIR's default ('auto') and also what
   // 'direct' and 'gpu' mean. ASC_RENDER_WINGPU is a build-wide define, so in a
@@ -1773,7 +1935,9 @@ int sk_window_create(int w, int h, const char* title, int resizable, int decorat
   if (sk_display_bounds(disp, &dx, &dy, &dw, &dh)) {
     int fw = w + c->b_left + c->b_right;
     int fh = h + c->b_top + c->b_bottom;
-    SDL_SetWindowPosition(c->win, dx + (dw - fw + 1) / 2, dy + (dh - fh + 1) / 2 + c->b_top);
+    // The FRAME is centered, so the client origin it is derived from carries the left
+    // border as well (0 on macOS, 8 on Windows).
+    SDL_SetWindowPosition(c->win, dx + (dw - fw + 1) / 2 + c->b_left, dy + (dh - fh + 1) / 2 + c->b_top);
   }
   SDL_AddEventWatch(live_resize_watch, c);
   return id;
@@ -1842,6 +2006,13 @@ void sk_window_set_cursor(int id, int kind) {
 // sizes the content), so the frame rect is converted on the way in: a 600x410 frame
 // with a 32pt title bar becomes a 600x378 client placed at y+32 — which is why
 // stage.stageHeight comes out 378 under NO_SCALE, exactly as measured on adl.
+//
+// The horizontal border is part of that conversion too, and it is zero only on macOS:
+// a win32 standard-chrome window has b_left = b_right = 8 (measured: frame 366x630 at
+// 26,26 with clientOrigin 34,57 and client 350x591, temp/nwwin/out-ws-res.txt), so
+// passing the frame x straight through as the client x put NativeWindow.x — and every
+// `bounds = ...` — 8px to the left of what adl reports. macOS never showed it because
+// its b_left is 0.
 void sk_window_set_bounds(int id, int x, int y, int w, int h) {
   WinCtx* c = sk_slot(id);
   if (c == NULL || c->win == NULL) return;
@@ -1849,7 +2020,7 @@ void sk_window_set_bounds(int id, int x, int y, int w, int h) {
   int ch = h - c->b_top - c->b_bottom;
   if (cw < 1) cw = 1;
   if (ch < 1) ch = 1;
-  SDL_SetWindowPosition(c->win, x, y + c->b_top);
+  SDL_SetWindowPosition(c->win, x + c->b_left, y + c->b_top);
   SDL_SetWindowSize(c->win, cw, ch);
 }
 
@@ -1862,8 +2033,11 @@ void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h) {
   int px = 0, py = 0, cw = 0, ch = 0;
   SDL_GetWindowPosition(c->win, &px, &py);
   SDL_GetWindowSize(c->win, &cw, &ch);
-  if (x) *x = px;
-  if (y) *y = py - c->b_top;   // SDL reports the client top; the frame starts above it
+  // SDL reports the CLIENT origin; AIR's bounds is the frame, so both frame borders go
+  // back on. b_left is 0 on macOS and 8 on Windows, which is why the x was right there
+  // and 8px off here (see sk_window_set_bounds).
+  if (x) *x = px - c->b_left;
+  if (y) *y = py - c->b_top;
   if (w) *w = cw + c->b_left + c->b_right;
   if (h) *h = ch + c->b_top + c->b_bottom;
 }
@@ -1895,10 +2069,12 @@ void sk_window_get_borders(int id, int* top, int* left, int* bottom, int* right)
 // separately measurable: `minSize = (0,0)` reads back (2,32) and (100,10) reads back
 // (100,32) on macOS (temp/nwmac/limits-out.txt).
 //
-// The Windows column (min 136x39) comes from the Windows-side measurement of the
-// same getter; its maximum is assumed to be the same 107374182 constant and its
-// floor is assumed to equal its minimum window size — the two Windows numbers this
-// host cannot verify, which is why they are spelled out here rather than derived.
+// The Windows column is measured as well (adl 51.4.1 on Windows 11, temp/nwwin/):
+// the defaults are 136x39 and 107374182x107374182, and the floor really does equal
+// the minimum window size there -- `minSize = (0,0)` reads back (136,39) and
+// (100,10) reads back (136,39), where macOS answers (2,32) and (100,32). The floor is
+// therefore not one shared constant with two callers but the OS's own content
+// minimum, and the two OSes really do disagree about it.
 static void sk_window_size_defaults(int* mnw, int* mnh, int* mxw, int* mxh) {
 #ifdef _WIN32
   if (mnw) *mnw = 136; if (mnh) *mnh = 39;
@@ -2052,7 +2228,39 @@ void sk_window_minimize(int id) {
 
 void sk_window_maximize(int id) {
   WinCtx* c = sk_slot(id);
-  if (c != NULL && c->win != NULL) SDL_MaximizeWindow(c->win);
+  if (c == NULL || c->win == NULL) return;
+  // SDL's win32 backend refuses to maximize a window without SDL_WINDOW_RESIZABLE
+  // (WIN_MaximizeWindow: `if (window->flags & SDL_WINDOW_RESIZABLE) { ...
+  // ShowWindow(hwnd, SW_MAXIMIZE); }`), while Cocoa's zoom: carries no such guard.
+  // A --air-app build with <resizable>false</resizable> creates exactly that window
+  // (ASC_WINDOW_FIXED), so the same AS3 call would maximize on macOS and silently do
+  // nothing on Windows -- and AIR does maximize it: adl 51.4.1 on Windows answers
+  // displayState=maximized for that descriptor shape (temp/nwwin/out-mx-fix.txt).
+  //
+  // Lend the flag for the duration of the call instead of leaving it on. Measured with
+  // temp/nwwin/probe.c (SDL 2.32.10, Windows 11): the window really maximizes; its style
+  // has no WS_THICKFRAME while the flag is off, so it stays non-resizable; and a second
+  // maximize with the flag off is still refused, i.e. nothing leaks between calls.
+  //
+  // The style is re-applied to AIR's mapping around the call, and that is not cosmetic:
+  // Windows sizes a maximized window to the WORK AREA when WS_MAXIMIZEBOX is present and
+  // to the FULL MONITOR -- taskbar included -- when it is absent, and adl follows that bit
+  // rather than <resizable>: a 366x630 frame on this 2560x1707 desktop settles at
+  // 2576x1675 with <maximizable>true and 2576x1723 with <maximizable>false, for
+  // <resizable> true and false alike (temp/nwwin/out-ws-*.txt). SDL_SetWindowResizable
+  // puts MAXIMIZEBOX back, so the strip has to happen after the lend and before the call.
+  // The non-Windows branches keep the bare call: on macOS a style-mask round trip around
+  // zoom: is not known to be neutral, and there it is not needed.
+#ifdef _WIN32
+  int was = (SDL_GetWindowFlags(c->win) & SDL_WINDOW_RESIZABLE) != 0;
+  if (!was) SDL_SetWindowResizable(c->win, SDL_TRUE);
+  sk_win_apply_style(c);
+  SDL_MaximizeWindow(c->win);
+  if (!was) SDL_SetWindowResizable(c->win, SDL_FALSE);
+  sk_win_apply_style(c);
+#else
+  SDL_MaximizeWindow(c->win);
+#endif
 }
 
 void sk_window_restore(int id) {

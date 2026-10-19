@@ -11,7 +11,7 @@ import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
 import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, platformFrameworks } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
-import { airManifest, prepareAirApp } from '../../src/air-app.ts';
+import { airManifest, parseAirApp, prepareAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
@@ -316,7 +316,7 @@ function checkNativeWindow(): string[] {
   check('a window that cannot be created throws AIR\'s Error #2012',
     nwCtor.includes('Error #2012: NativeWindow cannot be instantiated on this target.'));
   check('the browser backend reports "no second OS window" instead of faking one',
-    /int sk_window_create\([\s\S]{0,900}?return -1;/.test(webGlue)
+    /int sk_window_create\([\s\S]{0,2400}?return -1;/.test(webGlue)
     && preamble.includes('static inline int as_window_create('));
   check('toString matches adl',
     body('static char* NativeWindow_toString(void* _this) {').includes('[object NativeWindow]'));
@@ -516,12 +516,15 @@ function checkNativeWindow(): string[] {
   // glue, the pure-C stub (Emits for --target without Skia) does not, and only the
   // compile of a stub build catches the drift — which is a 14th argument to a 13
   // parameter function, i.e. "too many arguments to function call" in generated C.
-  const seamDefs = count(preamble, 'as_window_create(int w, int h, const char* title, int resizable, int decorated, int highdpi,');
+  // The same seam now also carries the pair of per-window style flags, so the audit
+  // counts the arguments of every sk_open_window call site instead of trusting one
+  // signature to have been updated everywhere (see unit: platform/InitialWindowStyle).
+  const seamDefs = count(preamble, 'as_window_create(int w, int h, const char* title, int resizable, int maximizable, int minimizable,');
   check(`every as_window_create definition takes the backend request (${seamDefs})`,
     seamDefs === 2
     && count(preamble, 'int gpu,') === seamDefs + 1  // + the sk_window_create extern
     && count(preamble, '(void)gpu;') === seamDefs
-    && preamble.includes('return sk_window_create(w, h, title, resizable, decorated, highdpi, gpu,'));
+    && preamble.includes('return sk_window_create(w, h, title, resizable, maximizable, minimizable, decorated, highdpi, gpu,'));
   check('the GPU frame helpers take the window id too',
     preamble.includes('static inline void* as_skia_gpu_begin_frame(int id, int w, int h)')
     && preamble.includes('static inline void as_skia_gpu_flush(int id)')
@@ -1927,8 +1930,10 @@ function checkNativeWindowLimitsAndEvents(): string[] {
     else { bad.push(label); console.log(`FAIL  [win-limits] ${label}`); }
   };
 
-  const glueWin = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
-  const glueWeb = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8');
+  // 本仓库的 .cc 是 CRLF 检出（.gitattributes 只钉了 *.bat），正则里只要跨行就必须
+  // 先归一化换行 —— 下面有一半的钉子都是跨行的。
+  const glueWin = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
+  const glueWeb = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
   // These two symbols are emitted by the AS3 side of the window table, so they are
   // matched in the generated C rather than in the emitter source.
   const exSrc = readFileSync(join(dir, 'native-window.as'), 'utf8');
@@ -1955,8 +1960,38 @@ function checkNativeWindowLimitsAndEvents(): string[] {
     && /if \(mxw\) \*mxw = 107374182; if \(mxh\) \*mxh = 107374182;/.test(glueWin));
   check('the floor (what minSize=(0,0) reads back as) is the OS content minimum',
     /#ifdef _WIN32\n  if \(fw\) \*fw = 136; if \(fh\) \*fh = 39;\n#else\n  if \(fw\) \*fw = 2; if \(fh\) \*fh = 32;/.test(glueWin));
-  check('the two numbers this host cannot verify say so in place',
-    /the two Windows numbers this\n\/\/ host cannot verify, which is why they are spelled out here rather than derived/.test(glueWin));
+  check('both columns say they are measured, not assumed',
+    /The Windows column is measured as well/.test(glueWin)
+    && /\(100,10\) reads back \(136,39\)/.test(glueWin));
+
+  // (2b) A fixed window has to stay MAXIMIZABLE, which is not the same thing as being
+  // resizable: SDL's win32 backend refuses to maximize a window without
+  // SDL_WINDOW_RESIZABLE (WIN_MaximizeWindow is guarded by it) while Cocoa's zoom:
+  // is not, so our Windows build silently did nothing where macOS worked -- and AIR
+  // does maximize such a window (adl on Windows answers displayState=maximized,
+  // 2576x1723, for a <resizable>false</resizable> descriptor). The flag is lent for
+  // the duration of the call and taken back, never left on.
+  check('maximize() lends the RESIZABLE flag on Windows, around the call only',
+    /#ifdef _WIN32\n  int was = \(SDL_GetWindowFlags\(c->win\) & SDL_WINDOW_RESIZABLE\) != 0;\n  if \(!was\) SDL_SetWindowResizable\(c->win, SDL_TRUE\);\n  sk_win_apply_style\(c\);\n  SDL_MaximizeWindow\(c->win\);\n  if \(!was\) SDL_SetWindowResizable\(c->win, SDL_FALSE\);\n  sk_win_apply_style\(c\);\n#else\n  SDL_MaximizeWindow\(c->win\);\n#endif/.test(glueWin)
+    // The style is re-derived BEFORE the call and again after the un-lend: SDL's
+    // WIN_SetWindowResizable puts WS_MAXIMIZEBOX back, and that bit (not <resizable>)
+    // is what decides whether the maximized frame is the work area or the whole monitor.
+    && glueWin.indexOf('sk_win_apply_style(c);\n  SDL_MaximizeWindow(c->win);') > 0);
+  check('...and every other platform keeps the bare call (macOS is not touched)',
+    /#else\n  SDL_MaximizeWindow\(c->win\);\n#endif\n\}/.test(glueWin));
+
+  // (2c) A child window that ASKED for resizable=true must get it, even in a build
+  // whose descriptor turned ASC_WINDOW_FIXED on for everybody: that define is
+  // build-wide, the descriptor element is about the main window alone.
+  check("a child window's own resizable request decides its style",
+    /int id = sk_open_window\(w, h, title, decorated, 0, 0, highdpi, 0, resizable, maximizable, minimizable\);/.test(glueWin)
+    && /c->resizable = resizable \? 1 : 0;\n  c->maximizable = maximizable \? 1 : 0;\n  c->minimizable = minimizable \? 1 : 0;\n  sk_win_apply_style\(c\);/.test(glueWin)
+    // The build-wide define's ONLY remaining consumer is the first window's macro trio:
+    // reading it inside sk_open_window/sk_window_create is what made every program-made
+    // window fixed, and a runtime flip cannot repair it (WIN_SetWindowResizable leaves the
+    // non-client area stale).
+    && /#ifdef ASC_WINDOW_FIXED\n#define SK_MAIN_RESIZABLE 0\n#else\n#define SK_MAIN_RESIZABLE 1\n#endif/.test(glueWin)
+    && (glueWin.match(/#ifdef ASC_WINDOW_FIXED/g) || []).length === 1);
   check('an app that never chose a maximum does not install AIR\'s own unbounded one on SDL',
     /if \(mxw > 0 && mxw < SK_LIMIT_UNBOUNDED && mxh > 0 && mxh < SK_LIMIT_UNBOUNDED\) \{/.test(glueWin)
     && /SDL_SetWindowMaximumSize\(c->win, 0, 0\);/.test(glueWin));
@@ -1973,7 +2008,8 @@ function checkNativeWindowLimitsAndEvents(): string[] {
     && /sk_sys_drag_begin\(c, 2, t, b, l, r\);/.test(glueWin)
     && /case SDL_MOUSEBUTTONUP:[\s\S]{0,400}c->sys_drag = 0;/.test(glueWin));
   check('the drag tracks the pointer against its START snapshot (no per-event drift)',
-    /int dx = gx - c->sys_gx;/.test(glueWin) && /SDL_SetWindowPosition\(c->win, c->sys_x \+ dx, c->sys_y \+ dy\);/.test(glueWin));
+    /int dx = gx - c->sys_gx;/.test(glueWin)
+    && /SDL_SetWindowPosition\(c->win, c->sys_x \+ dx \+ c->b_left, c->sys_y \+ dy \+ c->b_top\);/.test(glueWin));
 
   // (4) A user close is a request the AS3 side answers with CLOSING.
   check('a window-manager close is a REQUEST, not an inline teardown',
@@ -2057,3 +2093,191 @@ function checkNativeWindowLimitsAndEvents(): string[] {
 }
 
 registerGroup('unit: platform/WindowLimitsAndEvents', checkNativeWindowLimitsAndEvents);
+
+// ---- the app's OWN initial window: the descriptor describes THAT window only ----
+//
+// 阶段二百零五. AIR's `<initialWindow>` is the FIRST window's description, not a
+// build-wide policy, and the two halves have to be held apart in code:
+//
+//   * `stage.nativeWindow` under a strict descriptor reads back false/false/false with
+//     minSize (300,500) / maxSize (800,900) and bounds 50,60,366,630 (measured on adl
+//     51.4.1, temp/nwwin/out-w-strict.txt), while a plain `new NativeWindow(new
+//     NativeWindowInitOptions())` in the SAME process still answers
+//     resizable/maximizable/minimizable all true with minSize (136,39) -- nothing from
+//     the descriptor reaches it;
+//   * our build had folded the descriptor into ONE build-wide define
+//     (`ASC_WINDOW_FIXED`), which `sk_open_window` consulted for every window, so every
+//     program-made window came out fixed too -- and SDL's win32 backend then refused to
+//     maximize them (WIN_MaximizeWindow is gated on SDL_WINDOW_RESIZABLE), which is why
+//     a Windows build silently ignored `maximize()` where macOS worked.
+//
+// So the descriptor now travels as per-window create-time values (plus defines for the
+// two translation units that have to agree about the FIRST window), and the pins below
+// check both directions: what reaches the main window, and what may NOT read those
+// defines. Two traps recorded here because neither is visible from the platform this
+// kit was written on (Windows): the Metal show path is compiled only on macOS
+// (`#ifdef ASC_RENDER_METAL`), so a stale `sk_open_window` call site there is a CI-only
+// failure -- hence the call-site arity audit; and a `static` forward declaration of
+// `sk_window_set_limits` silently internalises its definition, which nothing but a real
+// link reports.
+function checkInitialWindowStyle(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [init-win] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [init-win] ${label}`); }
+  };
+
+  const glueWin = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
+  const glueWeb = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
+  const preamble = RUNTIME_PREAMBLE;
+  const c = generateC(parse(readFileSync(join(dir, 'native-window.as'), 'utf8'))).c;
+
+  // The descriptors are inlined (a `temp/` fixture would not exist on CI).
+  const strict = parseAirApp(
+    '<application xmlns="http://ns.adobe.com/air/application/51.3"><id>t</id>' +
+    '<versionNumber>1.0</versionNumber><filename>t</filename><initialWindow>' +
+    '<content>t.swf</content><visible>true</visible><systemChrome>standard</systemChrome>' +
+    '<transparent>false</transparent><maximizable>false</maximizable><minimizable>false</minimizable>' +
+    '<resizable>false</resizable><x>50</x><y>60</y><width>366</width><height>630</height>' +
+    '<minSize>300 500</minSize><maxSize>800 900</maxSize></initialWindow></application>').style;
+  // ...and the same descriptor with every optional element left out, which is the
+  // shape the host app's application.xml has: <x>/<y>/<minSize>/<maxSize> absent must
+  // mean "undefined", not "null that the helper trips over" (that crash shipped: the
+  // helper guarded on `undefined` while childText answers null, so a descriptor without
+  // <x> took the whole --air-app build down with a TypeError).
+  const plain = parseAirApp(
+    '<application xmlns="http://ns.adobe.com/air/application/51.3"><id>t</id>' +
+    '<versionNumber>1.0</versionNumber><filename>t</filename><initialWindow>' +
+    '<content>t.swf</content><visible>true</visible>' +
+    '<width>300</width><height>200</height></initialWindow></application>').style;
+
+  check('the descriptor names all three style flags',
+    strict.maximizable === false && strict.minimizable === false);
+  check('a descriptor that omits them keeps AIR\'s defaults',
+    plain.maximizable === true && plain.minimizable === true && plain.systemChrome === 'standard');
+  check('an absent optional element is undefined, not a null the helper trips over',
+    plain.x === undefined && plain.y === undefined && plain.minSize === undefined && plain.maxSize === undefined);
+  check('<x>/<y> are xs:int and reach the style (a negative coordinate is legal)',
+    strict.x === 50 && strict.y === 60
+    && parseAirApp('<?xml version="1.0"?><application xmlns="http://ns.adobe.com/air/application/51.3">' +
+      '<id>t</id><versionNumber>1.0</versionNumber><filename>t</filename><initialWindow>' +
+      '<content>t.swf</content><visible>true</visible><x>-10</x><y>0</y><width>300</width>' +
+      '<height>200</height></initialWindow></application>').style.x === -10);
+  check('<minSize>/<maxSize> are the BoundsSizeType pairs, both axes required',
+    strict.minSize!.w === 300 && strict.minSize!.h === 500
+    && strict.maxSize!.w === 800 && strict.maxSize!.h === 900);
+  check('a <minSize> that is not two integers is an error, not a silent default',
+    (() => {
+      try {
+        parseAirApp('<?xml version="1.0"?><application xmlns="http://ns.adobe.com/air/application/51.3">' +
+          '<id>t</id><versionNumber>1.0</versionNumber><filename>t</filename><initialWindow>' +
+          '<content>t.swf</content><visible>true</visible><minSize>300</minSize>' +
+          '<width>300</width><height>200</height></initialWindow></application>');
+        return false;
+      } catch (e) { return /two unsigned integers/.test((e as Error).message); }
+    })());
+
+  // The descriptor -> build defines half. Both translation units need the values: the
+  // glue puts them on the real window, the generated C mirrors them for the getters.
+  const man = (st: unknown): Record<string, unknown> => airManifest('vendor', true, true, true, false, 'auto',
+    false, true, [], [], [], [], true, false, '64', [], st as never) as Record<string, unknown>;
+  check('airManifest carries the descriptor into the build defines',
+    (() => {
+      const d = man(strict)['defines'] as string[];
+      return ['ASC_WINDOW_NOT_MAXIMIZABLE=1', 'ASC_WINDOW_NOT_MINIMIZABLE=1', 'ASC_WIN_X=50', 'ASC_WIN_Y=60',
+        'ASC_WIN_MIN_W=300', 'ASC_WIN_MIN_H=500', 'ASC_WIN_MAX_W=800', 'ASC_WIN_MAX_H=900'].every((x) => d.includes(x));
+    })());
+  check('...while a default descriptor invents none of them (the windows are not fixed)',
+    (() => {
+      const d = man(plain)['defines'] as string[];
+      return !d.some((x) => /^ASC_WIN_|^ASC_WINDOW_NOT/.test(x));
+    })());
+
+  // The glue half: one place applies AIR's frame style, read off the real window.
+  check('the three SK_MAIN_ macros come from the three defines',
+    /#ifdef ASC_WINDOW_FIXED\n#define SK_MAIN_RESIZABLE 0\n#else\n#define SK_MAIN_RESIZABLE 1\n#endif/.test(glueWin)
+    && /#ifdef ASC_WINDOW_NOT_MAXIMIZABLE\n#define SK_MAIN_MAXIMIZABLE 0/.test(glueWin)
+    && /#ifdef ASC_WINDOW_NOT_MINIMIZABLE\n#define SK_MAIN_MINIMIZABLE 0/.test(glueWin));
+  check('resizable is a per-window create-time value, not the build-wide define',
+    /if \(resizable\) winFlags \|= SDL_WINDOW_RESIZABLE;/.test(glueWin)
+    && !/#ifndef ASC_WINDOW_FIXED[\s\S]{0,80}winFlags \|= SDL_WINDOW_RESIZABLE;/.test(glueWin));
+  check('sk_win_apply_style is AIR\'s measured mapping (MAXIMIZEBOX decides the maximized rect)',
+    /if \(c->resizable\) want \|= WS_THICKFRAME;\n  if \(c->maximizable\) want \|= WS_MAXIMIZEBOX;\n  if \(c->minimizable\) want \|= WS_MINIMIZEBOX;/.test(glueWin)
+    && /SWP_NOMOVE \| SWP_NOSIZE \| SWP_NOZORDER \| SWP_NOACTIVATE \| SWP_FRAMECHANGED/.test(glueWin)
+    && /if \(!c->decorated\) return;/.test(glueWin));
+  check('...and it is a Windows-only override (every other platform keeps the bare call)',
+    /static void sk_win_apply_style\(WinCtx\* c\) \{\n#ifdef _WIN32\n/.test(glueWin)
+    && /#else\n  \(void\)c;\n#endif\n\}/.test(glueWin));
+  check('sk_window_set_limits is declared NON-static (a static decl internalises the definition)',
+    /\nvoid sk_window_set_limits\(int id, int mnw, int mnh, int mxw, int mxh\);\n/.test(glueWin)
+    && !/\nstatic void sk_window_set_limits\(int id, int mnw, int mnh, int mxw, int mxh\);\n/.test(glueWin));
+  // The Metal show path only exists on macOS, so this audit is what stands in for
+  // compiling it here: the definition plus four call sites, of which the three main
+  // paths must pass the macros and the `new NativeWindow()` path its own values.
+  check('every sk_open_window call site passes the three flags (the macOS-only path included)',
+    (() => {
+      const callArgs = (src: string, name: string): string[][] => {
+        const out: string[][] = [];
+        let i = src.indexOf(name + '(');
+        while (i >= 0) {
+          let depth = 0, j = i + name.length, start = j + 1;
+          const args: string[] = [];
+          for (; j < src.length; j++) {
+            const ch = src[j];
+            if (ch === '(') { depth++; if (depth === 1) start = j + 1; }
+            else if (ch === ')') { depth--; if (depth === 0) { args.push(src.slice(start, j).trim()); break; } }
+            else if (ch === ',' && depth === 1) { args.push(src.slice(start, j).trim()); start = j + 1; }
+          }
+          out.push(args);
+          i = src.indexOf(name + '(', j);
+        }
+        return out;
+      };
+      const calls = callArgs(glueWin, 'sk_open_window');
+      if (calls.length !== 5) return false;
+      const tail = (a: string[]): string =>
+        a.slice(-3).map((x) => x.replace(/#[^\n]*\n/g, '').replace(/\s+/g, '')).join(',');
+      const tails = calls.map(tail);
+      const main3 = tails.slice(1).filter((t) => t === 'SK_MAIN_RESIZABLE,SK_MAIN_MAXIMIZABLE,SK_MAIN_MINIMIZABLE');
+      const own3 = tails.slice(1).filter((t) => t === 'resizable,maximizable,minimizable');
+      return tails[0] === 'intresizable,intmaximizable,intminimizable' && main3.length === 3 && own3.length === 1;
+    })());
+  check('the descriptor\'s limits are installed on the initial window only, clamped as the setter clamps',
+    /#if defined\(ASC_WIN_MIN_W\) \|\| defined\(ASC_WIN_MAX_W\)\n  if \(is_main\) \{/.test(glueWin)
+    && /if \(mnw < fw\) mnw = fw;/.test(glueWin) && /if \(mxw < mnw\) mxw = mnw;/.test(glueWin)
+    && /sk_window_set_limits\(id, mnw, mnh, mxw, mxh\);/.test(glueWin));
+  check('the descriptor\'s position is installed on the initial window only, in FRAME coordinates',
+    /#if defined\(ASC_WIN_X\) \|\| defined\(ASC_WIN_Y\)\n  if \(is_main\) \{/.test(glueWin)
+    && /px = ASC_WIN_X \+ c->b_left;/.test(glueWin) && /py = ASC_WIN_Y \+ c->b_top;/.test(glueWin));
+  check('every frame->client conversion adds both borders (drag, bounds, position)',
+    /SDL_SetWindowPosition\(c->win, c->sys_x \+ dx \+ c->b_left, c->sys_y \+ dy \+ c->b_top\);/.test(glueWin)
+    && /SDL_SetWindowPosition\(c->win, x \+ c->b_left, y \+ c->b_top\);/.test(glueWin)
+    && /SDL_GetWindowPosition\(c->win, &px, &py\);[\s\S]{0,700}if \(x\) \*x = px - c->b_left;/.test(glueWin));
+
+  // The generated C half: the AS3 table mirrors the same values so the getters answer
+  // what the window was built with, and the AS3 seed is applied only to slot 0.
+  check('the emitted main-window mirror is seeded from the same defines',
+    /static void ASC_win_seed_main\(ASCWin\* w\) \{\n  if \(w == NULL\) return;\n  #ifndef ASC_WINDOW_FIXED\n  w->resizable = 1;\n  #endif/.test(c)
+    && /#ifndef ASC_WINDOW_NOT_MAXIMIZABLE\n  w->maximizable = 1;\n  #endif/.test(c)
+    && /#ifndef ASC_WINDOW_NOT_MINIMIZABLE\n  w->minimizable = 1;\n  #endif/.test(c));
+  check('...seeded exactly when the main slot is claimed (never for a program-made window)',
+    /if \(ASC_wins\[0\]\.stage == NULL && ASC_wins\[0\]\.window == NULL\) \{\n    memset\(&ASC_wins\[0\], 0, sizeof\(ASCWin\)\);\n    ASC_win_seed_main\(&ASC_wins\[0\]\);/.test(c)
+    && !/ASC_win_seed_main\(&ASC_wins\[1\]\)/.test(c));
+  check('...and the seed clamps like the minSize setter so both orders converge',
+    /ASC_win_limits_init\(0\);/.test(c) && /as_window_limits_floor\(&fw, &fh\);/.test(c)
+    && /if \(w->max_w < w->min_w\) w->max_w = w->min_w;/.test(c));
+  check('a program-made window passes its OWN flags to the glue',
+    /int decorated = 1, resizable = 1, maximizable = 1, minimizable = 1;/.test(c)
+    && /as_window_create\(\(int\)cw, \(int\)ch, \(char\*\)"", resizable, maximizable, minimizable, decorated,/.test(c));
+  check('the runtime seam, the headless stub and the web stub all track the new arity',
+    /extern int sk_window_create\(int w, int h, const char\* title, int resizable, int maximizable, int minimizable,/.test(preamble)
+    && (preamble.match(/static inline int as_window_create\(int w, int h, const char\* title, int resizable, int maximizable, int minimizable,/g) || []).length === 2
+    && /\(void\)resizable; \(void\)maximizable; \(void\)minimizable;/.test(preamble)
+    && (glueWeb.match(/\nint sk_window_create\(int w, int h, const char\* title, int resizable, int maximizable, int minimizable,/g) || []).length === 1);
+
+  console.log(`     [init-win] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/InitialWindowStyle', checkInitialWindowStyle);

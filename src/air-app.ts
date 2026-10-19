@@ -38,6 +38,13 @@ export interface AirAppInfo {
   displayResolution: string;
   renderMode: string;
   depthAndStencil: boolean;
+  // The rest of <initialWindow>: the frame style of the app's FIRST window. Kept in
+  // one object because that is the only window AIR's descriptor describes — measured
+  // on adl 51.4.1, a `<resizable>false</resizable>` descriptor still yields a
+  // `new NativeWindow(new NativeWindowInitOptions())` whose resizable/maximizable/
+  // minimizable are all true and whose minSize/maxSize are the platform's defaults
+  // (temp/nwwin/Leak.as) — so nothing here may be read for a window the program makes.
+  style: InitialWindowStyle;
   // <architecture> — the bit width of the Windows captive app, "32" or "64".
   // AIR's default is 32 when the element is absent (airsdk.dev
   // application#architecture), so that is what a descriptor without it means.
@@ -48,6 +55,21 @@ export interface AirAppInfo {
   // packages are located through an `-extdir` on the command line instead. Kept in
   // descriptor order, because that order decides the build's extension table.
   extensionIDs: string[];
+}
+
+// The <initialWindow> members that describe the initial window's frame besides its
+// size/title/content. AIR's schema fixes each one's domain: <systemChrome> is
+// "none"|"standard", <x>/<y> are xs:int (negative is legal), and <minSize>/<maxSize>
+// are BoundsSizeType — a whitespace-separated list of exactly two unsigned ints, e.g.
+// `<minSize>300 500</minSize>`.
+export interface InitialWindowStyle {
+  maximizable: boolean;
+  minimizable: boolean;
+  systemChrome: string;
+  x?: number;
+  y?: number;
+  minSize?: { w: number; h: number };
+  maxSize?: { w: number; h: number };
 }
 
 export class AirAppError extends Error {}
@@ -276,6 +298,28 @@ export function parseAirApp(xml: string): AirAppInfo {
   const resizable = resizableStr.toLowerCase() !== 'false';
   const width = parseInt(widthStr, 10);
   const height = parseInt(heightStr, 10);
+  // <maximizable>/<minimizable>/<systemChrome> are the initial window's frame as well,
+  // and each one is observable: AIR answers the first two back through
+  // `stage.nativeWindow.maximizable/minimizable` and puts them on the real win32 frame
+  // (measured: WS_MAXIMIZEBOX ⟺ maximizable, WS_MINIMIZEBOX ⟺ minimizable,
+  // temp/nwwin/out-ws-*.txt), while systemChrome decides whether the frame has a
+  // non-client area at all. An out-of-domain value is an error rather than a silent
+  // fallback: AIR's schema rejects it, so a descriptor carrying one is already broken.
+  const maximizable = (childText(iwXml, 'maximizable') ?? 'true').toLowerCase() !== 'false';
+  const minimizable = (childText(iwXml, 'minimizable') ?? 'true').toLowerCase() !== 'false';
+  const systemChrome = (childText(iwXml, 'systemChrome') ?? 'standard').toLowerCase();
+  if (systemChrome !== 'standard' && systemChrome !== 'none') {
+    throw new AirAppError(`air-app.xml <initialWindow> <systemChrome> must be "standard" or "none" (got "${systemChrome}")`);
+  }
+  const style: InitialWindowStyle = {
+    maximizable,
+    minimizable,
+    systemChrome,
+    x: parseWindowInt(childText(iwXml, 'x'), 'x'),
+    y: parseWindowInt(childText(iwXml, 'y'), 'y'),
+    minSize: parseBoundsSize(childText(iwXml, 'minSize'), 'minSize'),
+    maxSize: parseBoundsSize(childText(iwXml, 'maxSize'), 'maxSize'),
+  };
   const fonts = parseEmbedFonts(doc);
   const extensionIDs = parseExtensionIDs(xml);
 
@@ -285,7 +329,33 @@ export function parseAirApp(xml: string): AirAppInfo {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     throw new AirAppError('air-app.xml <initialWindow> width/height must be positive integers');
   }
-  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, architecture: architectureStr, fonts, extensionIDs };
+  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, style, architecture: architectureStr, fonts, extensionIDs };
+}
+
+// <x>/<y> of <initialWindow>, both xs:int — so a negative coordinate is legal and means
+// what it says (a window whose frame starts off the top-left of the desktop).
+function parseWindowInt(text: string | null, name: string): number | undefined {
+  if (text === null) return undefined;
+  const raw = text.trim();
+  if (raw === '') return undefined;
+  const v = Number(raw);
+  if (!Number.isInteger(v)) {
+    throw new AirAppError(`air-app.xml <initialWindow> <${name}> must be an integer (got "${raw}")`);
+  }
+  return v;
+}
+
+// BoundsSizeType: a whitespace-separated list of exactly two unsigned ints.
+function parseBoundsSize(text: string | null, name: string): { w: number; h: number } | undefined {
+  if (text === null) return undefined;
+  const raw = text.trim();
+  if (raw === '') return undefined;
+  const parts = raw.split(/\s+/);
+  const nums = parts.map((p) => Number(p));
+  if (parts.length !== 2 || !nums.every((n) => Number.isInteger(n) && n >= 0)) {
+    throw new AirAppError(`air-app.xml <initialWindow> <${name}> must be two unsigned integers, e.g. <${name}>300 500</${name}> (got "${raw}")`);
+  }
+  return { w: nums[0], h: nums[1] };
 }
 
 // Short name of a fully-qualified class: `demo.Main` -> `Main`.
@@ -355,7 +425,13 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
 // the wasm build of Skia, with no SDL2/objc/Cocoa — those are native-only and wasm-ld
 // cannot find them (`-lobjc`). The AIR <initialWindow> visible/resizable/highdpi
 // flags still shape defines, but the window-backend specifics differ per target.
-export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, depthAndStencil: boolean, fonts: EmbedFont[], preloadPaths: string[], preloadExcludes: string[], appFontUrls: string[], usesNetworking: boolean, usesAudio: boolean, architecture: string, features: string[] = []): Record<string, unknown> {
+//
+// `style` carries the remaining <initialWindow> frame members. They become defines for
+// the same reason ASC_WINDOW_FIXED does: a define reaches BOTH the generated C (which
+// mirrors the values for the NativeWindow getters) and window_glue.cc (which puts them
+// on the real window), and both must agree. It defaults to AIR's own defaults, so a
+// caller that has no descriptor in hand asks for nothing.
+export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, depthAndStencil: boolean, fonts: EmbedFont[], preloadPaths: string[], preloadExcludes: string[], appFontUrls: string[], usesNetworking: boolean, usesAudio: boolean, architecture: string, features: string[] = [], style: InitialWindowStyle = { maximizable: true, minimizable: true, systemChrome: 'standard' }): Record<string, unknown> {
   // Browser backend: skia_glue.cc + web_glue.cc, the wasm Skia library set, no
   // SDL2/Cocoa/frameworks. Mirrors examples/web/hello-web.build.json. The wasm
   // Skia build omits the native-only animation/image codecs (skottie/svg/...), so
@@ -497,6 +573,25 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // ASC_WINDOW_FIXED mirrors AIR's <resizable>false</resizable>: the window is
   // created without SDL_WINDOW_RESIZABLE, matching adl's fixed-size window.
   if (visible && !resizable) defines.push('ASC_WINDOW_FIXED=1');
+  // The rest of the initial window's frame, each as its own define because each one is
+  // observable independently: maximizable/minimizable are the win32
+  // WS_MAXIMIZEBOX/WS_MINIMIZEBOX bits (measured with temp/nwwin/wstyle.exe — SDL does
+  // NOT separate them, it ties both THICKFRAME and MAXIMIZEBOX to resizable and always
+  // keeps MINIMIZEBOX), systemChrome=none drops the frame, and x/y/minSize/maxSize are
+  // the initial placement and the window manager's limits. All of them describe the
+  // FIRST window only (AIR's descriptor has no say over a window the program creates),
+  // which is why the C side reads every one of them under its own `is_main`.
+  if (visible && !style.maximizable) defines.push('ASC_WINDOW_NOT_MAXIMIZABLE=1');
+  if (visible && !style.minimizable) defines.push('ASC_WINDOW_NOT_MINIMIZABLE=1');
+  if (visible && style.systemChrome === 'none') defines.push('ASC_WINDOW_NOCHROME=1');
+  if (visible && style.x !== undefined) defines.push(`ASC_WIN_X=${style.x}`);
+  if (visible && style.y !== undefined) defines.push(`ASC_WIN_Y=${style.y}`);
+  if (visible && style.minSize !== undefined) {
+    defines.push(`ASC_WIN_MIN_W=${style.minSize.w}`, `ASC_WIN_MIN_H=${style.minSize.h}`);
+  }
+  if (visible && style.maxSize !== undefined) {
+    defines.push(`ASC_WIN_MAX_W=${style.maxSize.w}`, `ASC_WIN_MAX_H=${style.maxSize.h}`);
+  }
   // ASC_DISPLAY_HIGH mirrors <requestedDisplayResolution>high: the window asks SDL
   // for a native-resolution drawable and the offscreen surface is sized in physical
   // pixels, so text is not stretched by the compositor (the "blurry" symptom).
@@ -1019,7 +1114,7 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   const effectiveFeatures = features ?? persistedFeatures;
   const keptFromManifest = features === null && persistedFeatures.length > 0;
 
-  const generated = airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures);
+  const generated = airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures, info.style);
   // Native extensions. The descriptor names them by ID and never by path — AIR is
   // the same, locating the packages through `-extdir` — so the two halves are put
   // together here and written into the manifest as resolved paths.

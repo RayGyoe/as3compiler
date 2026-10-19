@@ -397,7 +397,8 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
 // side turns into a thrown Error naming the limitation. The alternative
 // (pretending to succeed and drawing into a window nobody can see) would be a
 // silent, undetectable lie.
-int sk_window_create(int w, int h, const char* title, int resizable, int decorated, int highdpi,
+int sk_window_create(int w, int h, const char* title, int resizable, int maximizable, int minimizable,
+                     int decorated, int highdpi,
                      int gpu,
                      void (*on_mouse)(int, double, double, const char*),
                      void (*on_wheel)(int, double, double, double),
@@ -407,7 +408,10 @@ int sk_window_create(int w, int h, const char* title, int resizable, int decorat
                      double (*on_frame_delay)(int),
                      void* (*on_resize)(int, int, int, int, int, double),
                      void (*on_close)(int)) {
-  (void)w; (void)h; (void)title; (void)resizable; (void)decorated; (void)highdpi;
+  // A browser has no second OS window, so the whole per-window style is moot here;
+  // the signature still tracks window_glue.cc's.
+  (void)w; (void)h; (void)title; (void)resizable; (void)maximizable; (void)minimizable;
+  (void)decorated; (void)highdpi;
   (void)gpu;
   (void)on_mouse; (void)on_wheel; (void)on_key; (void)on_redraw; (void)on_frame;
   (void)on_frame_delay; (void)on_resize; (void)on_close;

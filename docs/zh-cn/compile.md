@@ -453,7 +453,7 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 ```
 
 流程：解析 `<id>/<filename>/<initialWindow>`（`title`/`width`/`height`/`visible`/`resizable`/
-`requestedDisplayResolution`/`renderMode`）→
+`requestedDisplayResolution`/`renderMode`/`maximizable`/`minimizable`/`systemChrome`/`x`/`y`/`minSize`/`maxSize`）→
 生成等价 `boot-gui.as` 的引导代码（`new Stage()` → 预设 `stageWidth/stageHeight` → `new Main()` →
 `addChild` → `showWindow`；`visible=false` 时改用离屏 `render` 出 PNG）→ 递归扫描 `src/**/*.as`
 （跳过反向域名第三方库目录 `com/org/net`，但显式回加 air-native demo 实际用到的 GreenSock 核心
@@ -548,7 +548,14 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
 
 对齐 adl 的三个关键行为：
 - `<resizable>false</resizable>` → 构建清单加 `ASC_WINDOW_FIXED=1`，窗口创建时不加
-  `SDL_WINDOW_RESIZABLE`，得到与 adl 一致的固定尺寸窗口。
+  `SDL_WINDOW_RESIZABLE`，得到与 adl 一致的固定尺寸窗口。**只作用于描述符所描述的「第一扇窗」**：
+  程序自己 `new NativeWindow(NativeWindowInitOptions)` 建的窗按它自己的 `resizable` 决定，构建级 define
+  不外溢（`ASC_WINDOW_NOT_MAXIMIZABLE` / `ASC_WINDOW_NOT_MINIMIZABLE` / `ASC_WINDOW_NOCHROME` 同理）。
+- `<maximizable>` / `<minimizable>` / `<systemChrome>` / `<x>` / `<y>` / `<minSize>` / `<maxSize>` →
+  同样是**构建 define + 主窗专属**：前三者决定 win32 的 `WS_MAXIMIZEBOX`/`WS_MINIMIZEBOX` 与有无非客户区，
+  后四者分别是初始窗的左上角（`xs:int`，可为负）与尺寸上下限（`BoundsSizeType`：空白分隔的两个无符号整数，
+  少一个就**报错**而不是取默认）。`WS_MAXIMIZEBOX` 不是摆设：它决定最大化后是铺**可用区**还是盖住任务栏的
+  **整块显示器**（见 `win32.md` §5 第 21 条）。
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → 构建清单加 `ASC_DISPLAY_HIGH=1`，
   窗口开 `SDL_WINDOW_ALLOW_HIGHDPI` 且 surface 按设备倍率创建物理像素（Retina 不模糊）；`standard`
   或缺省保持 1x（与 adl 一致，会被合成器拉伸）。
