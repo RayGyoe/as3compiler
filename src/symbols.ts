@@ -1741,14 +1741,11 @@ export class SymbolTable {
       });
 
       this.classMap.set('NativeWindow', {
-        // `minSize` is AIR's minimum window size (a Point). The backend imposes no
-        // minimum, so it is stored and read back verbatim -- the property is real
-        // (apps use it to keep a window from being dragged smaller than its
-        // content) but there is nothing to enforce here. Its adl default is the
-        // OS's own minimum track size (136x39 on Windows), which is why the
-        // initial value is a lingering gap rather than a literal: see TODO.md.
+        // No plain fields: every NativeWindow property is an accessor on the AS3
+        // side, because AIR's getters compute or clamp (minSize/maxSize are
+        // clamped against each other and against the OS's own floor) rather than
+        // hand back a stored slot.
         fields: new Map<string, FieldInfo>([
-          ['minSize', { type: { kind: 'object', className: 'Point' } as CType, init: null, visibility: 'public', owner: 'NativeWindow', isStatic: false, isConst: false }],
         ]),
         methods: new Map<string, MethodInfo>([
           // close() only REQUESTS teardown; the window is retired at the next
@@ -1766,12 +1763,25 @@ export class SymbolTable {
           // Purely cosmetic, so it is accepted and does nothing (see emit.ts).
           ['notifyUser', nwMethod('NativeWindow', { kind: 'void' }, [{ name: 'type', type: 'String', defaultValue: null, isRest: false }])],
           // startMove()/startResize(edgeOrCorner="BR"): AIR hands the drag over to
-          // the window manager (and answers true); this runtime has no backend hook
-          // for it, so both report themselves once and return false -- the value AIR
-          // itself returns for a window it cannot drag (see the C bodies in emit.ts).
-          // Registered as a lingering gap in TODO.md rather than passed off as done.
+          // the window manager and answers true when the drag began. Both are real
+          // here: the glue drives them from the pointer's global position until the
+          // button comes up (window_glue.cc sk_window_start_move/_resize), and the
+          // false cases are AIR's own -- a window with no window manager (the
+          // browser), one that is not resizable, or one that is minimized/maximized
+          // and therefore has no frame to drag.
           ['startMove', nwMethod('NativeWindow', { kind: 'bool' }, [])],
           ['startResize', nwMethod('NativeWindow', { kind: 'bool' }, [{ name: 'edgeOrCorner', type: 'String', defaultValue: { kind: 'Str', value: 'BR' }, isRest: false }])],
+          // resizeToScreen(screen): move + size the window to the screen's visible
+          // bounds. AIR's documented contract is "the window is resized to the
+          // screen's visibleBounds" (the menu bar / Dock are not covered); measured
+          // on adl 51.4.1 (temp/nwmac/): a 400x260 frame at (120,120) became
+          // (0,39,900,584) on a 1800x1169 display, i.e. the usable area, with the
+          // frame's own borders subtracted from the client size.
+          ['resizeToScreen', nwMethod('NativeWindow', { kind: 'void' }, [{ name: 'screen', type: 'Screen', defaultValue: null, isRest: false }])],
+          // listOwnedWindows(): the windows whose NativeWindowInitOptions.owner is
+          // this window. AIR answers a Vector.<NativeWindow> (measured: the returned
+          // object's class is __AS3__.vec::Vector.<flash.display::NativeWindow>).
+          ['listOwnedWindows', nwMethod('NativeWindow', { kind: 'vector', elem: { kind: 'object', className: 'NativeWindow' } }, [])],
           ['toString', nwMethod('NativeWindow', { kind: 'string' }, [])],
           // orderInFrontOf(window)/orderInBackOf(window): reorder relative to
           // another window; adl 51.4.1 answers true for a normal pair. Ours maps
@@ -1818,6 +1828,14 @@ export class SymbolTable {
           // hand back and the declared type is Object rather than inventing a
           // NativeMenu class that answers nothing.
           ['menu', nwGet('NativeWindow', { kind: 'object', className: 'Object' })],
+          // minSize/maxSize: AIR's window size limits (Points, clamped --
+          // see emit.ts and window_glue.cc sk_window_size_floor). Measured on adl
+          // 51.4.1 (temp/nwmac/limits-out.txt): macOS starts at (78,32) and
+          // (107374182,107374182); `minSize = (0,0)` reads back (2,32), the OS's
+          // minimum content size; `maxSize = (0,0)` reads back the current minSize;
+          // each read returns a FRESH Point (identity is never preserved).
+          ['minSize', nwGet('NativeWindow', { kind: 'object', className: 'Point' })],
+          ['maxSize', nwGet('NativeWindow', { kind: 'object', className: 'Point' })],
         ]),
         setters: new Map<string, MethodInfo>([
           // x/y/width/height write straight through to bounds (measured: setting
@@ -1831,6 +1849,8 @@ export class SymbolTable {
           ['visible', nwSet('NativeWindow', 'Boolean')],
           ['displayState', nwSet('NativeWindow', 'String')],
           ['alwaysInFront', nwSet('NativeWindow', 'Boolean')],
+          ['minSize', nwSet('NativeWindow', 'Point')],
+          ['maxSize', nwSet('NativeWindow', 'Point')],
         ]),
         constructor: { params: [{ name: 'options', type: 'NativeWindowInitOptions', defaultValue: null, isRest: false }] },
         // AIR: flash.display.NativeWindow extends EventDispatcher (it dispatches
@@ -4042,15 +4062,15 @@ export class SymbolTable {
       [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNullP('beforeBounds', 'Rectangle'), shNullP('afterBounds', 'Rectangle')],
       [['clone', shObj('Event'), []]]);
     // flash.events.NativeWindowDisplayStateEvent: minimize/maximize/restore.
-    // Both halves of the pair exist (CHANGING before, CHANGE after), and the
-    // class also carries the three display-state strings, measured on adl
-    // 51.4.1 (temp/nwor/adl-oracle.txt section E: CHANGING/CHANGE =
-    // displayStateChanging/displayStateChange, NORMAL/MINIMIZED/MAXIMIZED =
-    // normal/minimized/maximized).
+    // Both halves of the pair exist (CHANGING before, CHANGE after). The constant
+    // NAMES are the long ones: `NativeWindowDisplayStateEvent.DISPLAY_STATE_CHANGE`
+    // / `.DISPLAY_STATE_CHANGING` are what mxmlc 51.4.1 accepts, and a program
+    // written against the short forms (CHANGE/CHANGING) or against the
+    // NativeWindowDisplayState strings (NORMAL/MINIMIZED/MAXIMIZED, which live on
+    // that OTHER class) does not compile -- all measured in temp/nwmac/cstest.
     shell('NativeWindowDisplayStateEvent', 'flash.events::NativeWindowDisplayStateEvent', 'Event',
       [['beforeDisplayState', { kind: 'string' }], ['afterDisplayState', { kind: 'string' }]],
-      [['CHANGING', 'displayStateChanging'], ['CHANGE', 'displayStateChange'],
-       ['NORMAL', 'normal'], ['MINIMIZED', 'minimized'], ['MAXIMIZED', 'maximized']],
+      [['DISPLAY_STATE_CHANGING', 'displayStateChanging'], ['DISPLAY_STATE_CHANGE', 'displayStateChange']],
       [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNullP('beforeDisplayState', 'String'), shNullP('afterDisplayState', 'String')],
       [['clone', shObj('Event'), []]]);
     // flash.events.InvokeEvent: the AIR "launch with a document/argument" event.

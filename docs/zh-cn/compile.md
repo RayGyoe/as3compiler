@@ -60,8 +60,20 @@ ActionScript 源码 (.as)
 
 ## 2. 环境依赖
 
-- **Node ≥ 22.6**：原生 type-stripping 直接运行 `.ts` 源码，无需编译步骤。
+- **Node ≥ 18**：发布到 npm 的包是**已转好的 JavaScript**（`dist/`），不需要 type-stripping。
+  **从源码跑**（`node src/index.ts`，即 clone 里的用法）才需要 **Node ≥ 22.18**（类型擦除默认开启的版本；
+  22.6–22.17 需额外加 `--experimental-strip-types`），自行 `npm run build:dist` 亦然。
+  `dist/` 由 `scripts/build-dist.ts` 生成（挂在 `prepare` 上，`npm pack` / `npm publish` 自动跑）——
+  `bin` **不能**指回 `src/index.ts`：Node 拒绝对 `node_modules/` 下的 `.ts` 擦类型
+  （`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`），那会让每一种安装方式装完即崩。
+  转换是等长空白替换，行号与 `src/` 一一对应，生成的 C 与直接跑 `.ts` 逐字节相同；
+  该形态由 `unit: npm-package/PublishForm`（19 钉）封住。
 - **C 编译器**：`cc` / `clang`（native 目标默认 `cc`，可用 `--cc` 覆盖）。
+- **预编译依赖库**：`vendor/` 里入库的是 **macos-arm64 / windows-x64 / windows-x86 / wasm** 四套。
+  本机不在其中（Linux、Intel Mac）时，`--air-app` **响亮报错**并说明只有哪几套存在，
+  而不是悄悄按 `macos-arm64` 去链一套 ARM64 归档 + Cocoa 框架。
+  - 这些产物**怎么来的**在 `vendor/provision/`（`windows.ps1` / `macos.sh`；产物本身与胶水源码留在
+    `vendor/` 下）；判定「本机缺什么」用 `as-aot doctor`（§3.6）。
 - **WASI 工具链**（仅 `--target wasm` 需要）：WASI SDK 或自带 `wasm32-wasip1` 后端的 LLVM clang。
   - 约定通过环境变量 `WASI_SDK_HOME` 指向 SDK 根目录，编译器位于 `$WASI_SDK_HOME/bin/clang`，
     sysroot 位于 `$WASI_SDK_HOME/share/wasi-sysroot`。
@@ -87,6 +99,8 @@ ActionScript 源码 (.as)
 
 ```text
 Usage: as-aot <input.as> [more.as ...] [options]
+       as-aot doctor [options]        report whether this machine can build what the flags ask
+       as-aot version                 print the compiler version (same as --version / -V)
 
 Options:
   -o <path>      output path (native: executable; wasm: .wasm appended); also the base
@@ -125,8 +139,18 @@ Options:
   --debug-info   keep DWARF: add -g to every backend and stop stripping it from the
                  default wasm build (default: off — artifacts carry no debug info; see §4.3)
   --dry          emit C and print the compile command without compiling
+  -V, --version  print the compiler version (read from package.json) and exit
   -h, --help     show this help
 ```
+
+`as-aot --version`（或 `-V` / `version` 子命令）打印编译器版本——版本**只有一个来源**
+（`package.json`，`doctor` 报告的头行也带它），报 bug 时请先把它带上。出错时 stderr 只印一行
+错误信息；要连 Node 堆栈一起看（那是报**编译器自身**的 bug 时需要的）设 `AS3_TRACE=1`。
+
+开关写错时，那一行会**给出下一步**而不只是重复你敲的名字：与某个真开关相近（`--versoin`、
+`--feat`）直接提示 `did you mean --version?`；差得太远（`--sss`）则指向 `as-aot --help`。
+开关没拿到值——`-o` 落在行尾、或 `-o --dry` 把下一个开关吃成了它的值——**报错而不是猜**；
+而只是**以 `-` 开头**的值（`--opt -O3`、`-D FOO=-1`）仍算值。
 
 ### 3.1 基本编译
 
@@ -546,6 +570,41 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
     且 Metal 构建下没有 CPU 回读缓冲（暴露渲染目标纹理正是为了省掉每次回读）——按 AIR 行为处理，非静默降级。
 - 引导代码在 `new Main()` **之前**预设 `stage.stageWidth/stageHeight`，使 document class 构造时
   `trace(stage.stageWidth, stage.stageHeight)` 返回窗口尺寸（如 `1000 680`），而非 adl 之外的 `0 0`。
+
+### 3.6 构建环境自检（`as-aot doctor`）
+
+编不动的时候，第一件事是问「这台机器到底缺什么」。`doctor` 把散落在构建路径各处的缺失检查
+汇总成**一份只读报告**，并且**与构建路径共用同一张检查表**（`src/checks.ts`）——报告说什么，
+编译时就报什么，不会出现「doctor 说没事、一编就炸」。
+
+```bash
+as-aot doctor                                   # 判断「这个仓库默认形态能不能编」
+as-aot doctor --air-app path/to/app.xml         # 判断「这个应用能不能编」（按它真实触碰的功能裁剪）
+as-aot doctor --manifest hello.build.json       # 判断「这份构建清单能不能编」
+as-aot doctor --json                            # 机器可读输出
+as-aot doctor --fix                             # 只做秒级幂等修复（如补齐 icudtl.dat）
+as-aot doctor --check-update                    # 只读地问一次 registry 有没有新版本（不安装任何东西）
+```
+
+要点：
+
+- **不传配置时合成的是「默认桌面应用」**：与 `--air-app` 走同一个 `airManifest`，所以规则只有一份。
+  只有 `--target native` 才合成——`--target wasm --package raw` 是裸 WASI 模块、一个 vendor 库都不链，
+  给它报 SDL2/Cocoa 就全是噪声。
+- **CLI 覆盖清单**（与编译时同规则）：`doctor --air-app app.xml --target wasm` 判的是 wasm 那份。
+- **检查项分三档**：`ok` / `warn`（能编但产物是错的，例如 web 构建里的文本没有字体可画）/
+  `fail`（编不过）。`--fix` 只处理秒级幂等项；依赖库本身怎么建，报告里直接给命令。
+- **`--air-app` 会写清单**（`<app>/<filename>.build.json`，与编译时同一个文件、同一次生成）——
+  `doctor` 读回它再判断，所以「被检查的配置」就是「会被构建的配置」。
+- **报告头行带编译器版本**（`as-aot doctor -- <version> darwin/arm64, node v24.14.1`），`--json` 里在
+  `compiler: { name, version }`——同一个来源（`package.json`），故不会与 `as-aot --version` 不一致。
+- **`--check-update` 是只读的、且默认不做**：它向 `npm_config_registry` 指定的 registry（默认 npmjs，
+  故企业镜像会被尊重）查一次 `as3compiler/latest`，只打印升级命令
+  （`npm i -g as3compiler@latest`），**从不自己安装**——换掉用户装的编译器是硬不可逆动作，那该是用户
+  的，不是工具的。查不到（离线 / 镜像不可达 / HTTP 错误）**如实报明**而不是失败，且**从不影响退出码**
+  （0/1/2 只表示「能不能编」，连不上 registry 的机器照样能编）。该检查**只在给了这个 flag 时才发生**，
+  所以默认路径一次网络请求都不发。`--json` 下它落在 `update` 键里（不给该 flag 时这个键**不存在**
+  = 「没查」，与「查了但连不上」区分）。
 
 ## 4. 构建清单（build manifest）
 
@@ -1067,6 +1126,6 @@ Retina 高清渲染（`ASC_DISPLAY_HIGH=1`）：
 - [`TODO.md`](../../TODO.md) — 分阶段路线图（阶段二十九为「构建清单 + 多目标后端」）
 - [`as3-semantics.md`](as3-semantics.md) — AS3 语义保真红线与规范来源
 - [`html5-web.md`](html5-web.md) — 浏览器渲染目标（`--target wasm --package web`）的实现与使用
-- [`win32.md`](win32.md) — Windows 原生后端（`<architecture>` 位宽、`vendor/build-windows-deps.ps1`、Skia D3D12 直连 GPU、首跑核对清单）
+- [`win32.md`](win32.md) — Windows 原生后端（`<architecture>` 位宽、`vendor/provision/windows.ps1`、Skia D3D12 直连 GPU、首跑核对清单）
 - [`skia.md`](skia.md) — 渲染后端（Skia 光栅化 + wasm 字体注入）
 - [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md) — 开发规范（§2.9 构建与链接）

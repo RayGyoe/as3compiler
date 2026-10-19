@@ -215,7 +215,7 @@ function checkNativeWindow(): string[] {
   // (2b) …and `_win` must stay at NativeWindow's offset even when the SUBCLASS has
   // fields of its own. The emitter used to append the built-in base slots AFTER the
   // subclass's fields, so `class wsub extends NativeWindow { var fa:int; var fb:String; }`
-  // came out as {…, minSize, fa, fb, _win}: NativeWindow_ctor's `o->_win = id` wrote
+  // came out as {…, fa, fb, _win}: NativeWindow_ctor's `o->_win = id` wrote
   // into `fa`, the subclass's own field write overwrote it, and every later
   // `stage` read (NativeWindow_get_stage casts to NativeWindow*) went through a
   // pointer fragment — ASC_w(-2137378480) → NULL ⇒ #1009. Measured on the TalkMED
@@ -244,8 +244,14 @@ function checkNativeWindow(): string[] {
   const subSlots = slots(subC, 'wsub');
   check('a NativeWindow subclass repeats the base slot list first, own fields after it',
     baseSlots.length > 0 && baseSlots.every((l, i) => subSlots[i] === l));
-  check('`_win` follows the BASE fields (minSize), never the subclass\'s',
-    subSlots.indexOf('int _win;') === subSlots.indexOf('Point* minSize;') + 1
+  // `_win` is the LAST base slot (right after the EventDispatcher trio) and must
+  // still precede every own field of the subclass. Written against the slot-list
+  // positions rather than a named field: minSize/maxSize used to be placeholder
+  // FIELDS pinned here, until 阶段一百九十六 turned them into real accessors backed
+  // by the glue's own size table, so no field name is stable enough to pin.
+  check('`_win` is the last BASE slot, never after the subclass\'s own fields',
+    baseSlots.indexOf('int _win;') === baseSlots.length - 1
+    && subSlots.indexOf('int _win;') === baseSlots.length - 1
     && subSlots.indexOf('int fa;') > subSlots.indexOf('int _win;'));
   // The other built-in bases that own C-runtime-only slots are field-less, so the
   // same rule puts their slots BEFORE the subclass's first field.
@@ -556,7 +562,12 @@ function checkBackendParity(): string[] {
   };
 
   // 定义形态：行首是返回类型，然后 sk_window_<name>(（native 与 web 两个文件都是这一风格）。
-  const defRe = /^(?:static\s+)?(?:int|void|double|float|long|unsigned|char|size_t|short|bool)\s*\**\s*(sk_window_\w+)\s*\(/gm;
+  // `static` 定义**不算 seam**：静态函数不参与链接，生成 C 根本引用不到它（如
+  // sk_window_size_defaults/size_floor 这两个胶水内部助手，它们只被 window_glue.cc
+  // 自己的 sk_window_limits_default 调用）。把这族算进来只会把「内部助手」误报成
+  // 「web 缺符号」，反而埋住真正的缺口（阶段一百九十六实测：两个内部助手进集合后
+  // 这条钉直接变红）。
+  const defRe = /^(?:int|void|double|float|long|unsigned|char|size_t|short|bool)\s*\**\s*(sk_window_\w+)\s*\(/gm;
   const seamDefs = (rel: string): Set<string> =>
     new Set([...readFileSync(join(root, rel), 'utf8').matchAll(defRe)].map((m) => m[1]));
   const nativeDefs = seamDefs(join('vendor', 'window_glue.cc'));
@@ -932,9 +943,12 @@ function checkAudioWiring(): string[] {
     !hostHasAudioBackend || list(audioNative, 'sources').some((p) => p.endsWith('vendor/audio_glue.c')));
   check('an app using flash.media defines ASC_HAVE_AUDIO',
     list(audioNative, 'defines').includes('ASC_HAVE_AUDIO=1'));
-  check('the backend hosts are named as data (darwin + win32), not as a single-platform check',
-    /const audioGlueHosts = \['darwin', 'win32'\];/.test(airApp)
-    && /audioGlueHosts\.includes\(process\.platform\)/.test(airApp));
+  check('the backend hosts are named as data (darwin + win32), once, in checks.ts',
+    /export const AUDIO_GLUE_HOSTS: readonly string\[\] = \['darwin', 'win32'\];/.test(readSrc('src/checks.ts'))
+    && /AUDIO_GLUE_HOSTS\.includes\(process\.platform\)/.test(airApp)
+    // Not two copies: the check table and air-app must read the SAME list, or
+    // one of them eventually says "nothing will play" about a build that does.
+    && !/audioGlueHosts = \['darwin', 'win32'\]/.test(airApp));
   check(apples
     ? 'macOS names miniaudio\'s CoreAudio backend (CoreAudio + AudioToolbox)'
     : 'Windows names no -framework at all (miniaudio LoadLibrary\'s WASAPI/DirectSound/WinMM)',
@@ -948,15 +962,15 @@ function checkAudioWiring(): string[] {
     airApp.includes('reaches all three of its Windows backends through LoadLibrary/GetProcAddress')
     && airApp.includes('is not even a Windows flag'));
   check('the no-backend warning names the glue, the hosts that have one, and this host',
-    /it carries a backend for \$\{audioGlueHosts\.join\('\/'\)\}, and this host is \$\{process\.platform\}/.test(airApp));
+    /it carries a backend for \$\{AUDIO_GLUE_HOSTS\.join\('\/'\)\} only, and this host is \$\{process\.platform\}/.test(readSrc('src/checks.ts'))
+    && /this build does not link it/.test(readSrc('src/checks.ts')));
   check('and the CLI hint only offers `frameworks` where the flag exists (no Apple flags on Windows)',
-    ((): boolean => {
-      const idx = readSrc('src/index.ts');
-      const at = idx.indexOf("const audioLinked = cfg.defines.some((d) => d === 'ASC_HAVE_AUDIO'");
-      if (at < 0) return false;
-      const hint = idx.slice(at, at + 900);
-      return hint.includes("process.platform === 'darwin' ? `, plus") && hint.includes('frameworks');
-    })());
+    // Moved with the requirement: the hint is built by the vendor.audio check now,
+    // not by a hand-written block in index.ts, so the pin follows it. Pinned as
+    // the exact expression rather than "somewhere within N characters of a
+    // guessable anchor", which is what made the previous form fragile.
+    readSrc('src/checks.ts').includes(
+      "+ (process.platform === 'darwin' ? ', plus `CoreAudio`/`AudioToolbox` to frameworks' : '')"));
   check('an app that does not use flash.media gets no audio backend (and no stray frameworks)',
     !list(plainNative, 'sources').some((p) => p.endsWith('vendor/audio_glue.c'))
     && !list(plainNative, 'defines').includes('ASC_HAVE_AUDIO=1')
@@ -971,16 +985,21 @@ function checkAudioWiring(): string[] {
     !list(audioWeb, 'sources').some((p) => p.endsWith('vendor/audio_glue.c'))
     && !list(audioWeb, 'defines').includes('ASC_HAVE_AUDIO=1'));
 
-  const demo = join(root, 'examples', 'air-starling-demo');
-  const am = readFileSync(join(demo, 'src', 'starling', 'assets', 'AssetManager.as'), 'utf8');
-  const movie = readFileSync(join(demo, 'src', 'scenes', 'MovieScene.as'), 'utf8');
-  const sfLines = am.split('\n').filter((l) => l.includes('registerFactory(new SoundFactory())'));
-  check('AssetManager registers SoundFactory, uncommented (else the mp3 is stored as raw bytes)',
-    sfLines.length > 0 && sfLines.every((l) => !l.trim().startsWith('//')));
-  check('ByteArrayFactory is still the last-priority fallback (why the registration above decides it)',
-    am.includes('registerFactory(new ByteArrayFactory(), -100)'));
-  check('MovieScene wires the wing_flap frame sound through getSound + setFrameSound',
-    /getSound\("wing_flap"\)/.test(movie) && /_movie\.setFrameSound\(2,\s*\w+\)/.test(movie));
+  // The three air-starling-demo pins that used to live here are GONE (阶段一百九十八),
+  // and they are not coming back: they asserted Starling's OWN classes
+  // (`registerFactory(new SoundFactory())`, `ByteArrayFactory` at priority -100,
+  // `getSound("wing_flap")` + `_movie.setFrameSound(2, …)`), none of which is an AIR
+  // API -- `setFrameSound` appears nowhere under src/. So they never tested this
+  // compiler; they pinned the acceptance fixture's source text, guarding against
+  // an edit that would have made the audio evidence stale. Once the fixture became
+  // an external, untracked clone (examples/EXTERNAL-FIXTURES.md) that guard has no
+  // remaining object: editing your own local copy is your business.
+  //
+  // What they recorded is not lost -- it is written up in full in
+  // docs/zh-cn/audio.md §13.4 (the commented-out SoundFactory line, the
+  // ByteArrayFactory fallback swallowing the mp3 as raw bytes, and the resulting
+  // silently-dead frame sound). The behavioural coverage of the API surface they
+  // really depended on is examples/audio.as, which the example suite runs.
 
   if (ok > 0) console.log(`[audio] ${ok} audio-wiring checks passed`);
   return bad;
@@ -1567,8 +1586,18 @@ function checkCapabilitiesOs(): string[] {
   // The two facts a future editor would otherwise "fix" the wrong way.
   check('the comment names the manifest version lie that forces RtlGetVersion',
     /manifest version lie/.test(RUNTIME_PREAMBLE) && /supportedOS/.test(RUNTIME_PREAMBLE));
-  check('...and states that macOS/Linux still report the bare family name',
-    /macOS\/Linux\/WASI still report the bare family name/.test(RUNTIME_PREAMBLE));
+  check('...and states that Linux/WASI still report the bare family name (macOS is closed out)',
+    /Linux\/WASI still report the bare family name/.test(RUNTIME_PREAMBLE)
+    && !/macOS\/Linux\/WASI still report/.test(RUNTIME_PREAMBLE));
+  // macOS is no longer a gap: it appends the *product* version, taken from
+  // kern.osproductversion rather than uname -r (which answers the Darwin kernel
+  // release, 25.6.0 on macOS 26.6.2 -- a plausible-looking wrong value a future
+  // editor could switch to, since both live in the same comment).
+  check('...and pins the macOS product version to kern.osproductversion, not uname -r',
+    /kern\.osproductversion/.test(RUNTIME_PREAMBLE)
+    && /sysctlbyname\("kern\.osproductversion"/.test(RUNTIME_PREAMBLE)
+    && !/\buname\s*\(/.test(RUNTIME_PREAMBLE) && !/utsname\.h/.test(RUNTIME_PREAMBLE)
+    && /Mac OS 26\.6\.2/.test(RUNTIME_PREAMBLE));
 
   console.log(`     [capos] ${ok} check(s) passed`);
   return bad;
@@ -1625,8 +1654,8 @@ function checkNativeWindowSurface(): string[] {
     'var f1:Boolean = w.orderInFrontOf(w);\n' +
     'var f2:Boolean = w.orderInBackOf(null);\n' +
     'var pt:Point = w.globalToScreen(new Point(0, 0));\n' +
-    'var ds:String = NativeWindowDisplayStateEvent.CHANGE;\n' +
-    'var ds2:String = NativeWindowDisplayStateEvent.NORMAL;\n' +
+    'var ds:String = NativeWindowDisplayStateEvent.DISPLAY_STATE_CHANGE;\n' +
+    'var ds2:String = NativeWindowDisplayStateEvent.DISPLAY_STATE_CHANGING;\n' +
     'app.exit();\n'
   )).c;
   const preamble = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
@@ -1703,14 +1732,13 @@ function checkNativeWindowSurface(): string[] {
     && g2s.includes('if (point == NULL) return NULL;'));
 
   // (6) The event class exists with the measured constant strings, so a listener
-  // written against AIR compiles and compares equal. The state constants mirror
-  // NativeWindowDisplayState's three values.
+  // written against AIR compiles and compares equal. The two names ARE the long
+  // ones: mxmlc 51.4.1 accepts DISPLAY_STATE_CHANGE/DISPLAY_STATE_CHANGING and
+  // REJECTS CHANGE/CHANGING plus NORMAL/MINIMIZED/MAXIMIZED on this class (those
+  // three live on NativeWindowDisplayState) -- measured temp/nwmac/cstest.
   check('NativeWindowDisplayStateEvent carries AIR\'s measured constants',
-    c.includes('static char* const NativeWindowDisplayStateEvent_CHANGE = "displayStateChange";')
-    && c.includes('static char* const NativeWindowDisplayStateEvent_CHANGING = "displayStateChanging";')
-    && c.includes('static char* const NativeWindowDisplayStateEvent_NORMAL = "normal";')
-    && c.includes('static char* const NativeWindowDisplayStateEvent_MINIMIZED = "minimized";')
-    && c.includes('static char* const NativeWindowDisplayStateEvent_MAXIMIZED = "maximized";'));
+    c.includes('static char* const NativeWindowDisplayStateEvent_DISPLAY_STATE_CHANGE = "displayStateChange";')
+    && c.includes('static char* const NativeWindowDisplayStateEvent_DISPLAY_STATE_CHANGING = "displayStateChanging";'));
   check('...and the class carries AIR\'s before/afterDisplayState pair',
     c.includes('"beforeDisplayState"') && c.includes('"afterDisplayState"')
     && c.includes('{ "clone", NativeWindowDisplayStateEvent_clone__dyn, 0, "flash.events::Event" }'));
@@ -1869,3 +1897,163 @@ function checkFontFallback(): string[] {
 }
 
 registerGroup('unit: platform/FontFallback', checkFontFallback);
+
+// ---- NativeWindow minSize/maxSize, startMove/startResize, listOwnedWindows and the
+// ---- per-frame event poll (阶段一百九十六) ----
+// Four measured facts drive every pin below, and each one is in a place a reader
+// would not look for it:
+//
+//  (1) The limits are a property of the OS WINDOW, not of the AS3 wrapper: a
+//      startResize drag has to respect them, so they live in the glue's WinCtx and
+//      the getters read the SAME storage. A wrapper-side copy reads back right and
+//      lets the user drag the window out of range.
+//  (2) `minSize` clamping is against the PLATFORM floor and the CURRENT OPPOSITE
+//      limit, not against the requested pair: adl 51.4.1 answers minSize=(0,0) ->
+//      (2,32), minSize=(100,10) -> (100,32) on macOS (temp/nwmac/limits-out.txt), and
+//      setting min=(2000,2000) after max=(1000,800) leaves BOTH at (1000,800).
+//  (3) The bounds events are dispatched ONCE PER FRAME from a snapshot, not inline
+//      from each setter, and both events of one frame take their `before` from the
+//      state the frame STARTED in. Measured: a change that moves and resizes at once
+//      answers RESIZE(100,100 300x200->200,200 500x400) | MOVE(...same pair...)
+//      (temp/nwmac/ev-out-adl.txt t2) -- a before taken from the half-updated
+//      snapshot would answer the move's before as "200,200 300x200".
+//  (4) A user close is a REQUEST answered with a cancelable Event.CLOSING, so the
+//      glue must not tear the window down in its own event handler.
+function checkNativeWindowLimitsAndEvents(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [win-limits] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [win-limits] ${label}`); }
+  };
+
+  const glueWin = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
+  const glueWeb = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8');
+  // These two symbols are emitted by the AS3 side of the window table, so they are
+  // matched in the generated C rather than in the emitter source.
+  const exSrc = readFileSync(join(dir, 'native-window.as'), 'utf8');
+  const c = generateC(parse(exSrc)).c;
+  const preamble = RUNTIME_PREAMBLE;
+
+  // (1) One storage for the limits, in the glue, read back by the getters.
+  check('the limits live in the window context, not in the wrapper',
+    /int min_w, min_h, max_w, max_h;/.test(glueWin)
+    && /void sk_window_get_limits\(int id, int\* mnw[^)]*\) \{\n  WinCtx\* c = sk_slot\(id\);\n  if \(mnw\) \*mnw = \(c != NULL\) \? c->min_w : 0;/.test(glueWin)
+    && /void sk_window_set_limits\(int id, int mnw, int mnh, int mxw, int mxh\) \{\n  WinCtx\* c = sk_slot\(id\);\n  if \(c == NULL\) return;\n  c->min_w = mnw;/.test(glueWin));
+  // ...and the drag really enforces them on the frame, flipping the origin when the
+  // dragged edge is the moving one.
+  check('a startResize drag is bounded by the frame limits',
+    /if \(c->min_w > 0 && nw < c->min_w\) \{\n    if \(c->sys_l\) nx -= \(c->min_w - nw\);\n    nw = c->min_w;/.test(glueWin)
+    && /if \(c->max_h > 0 && nh > c->max_h\) \{/.test(glueWin));
+  check('...and the opposite edge stays put while the dragged one clamps',
+    /if \(c->sys_t\) ny -= \(c->min_h - nh\);/.test(glueWin));
+
+  // (2) AIR's own defaults/floor, per platform, with the unverifiable Windows floor
+  // spelled out as an assumption rather than derived.
+  check('the default limits are AIR\'s numbers, per platform (macOS 78x32 measured)',
+    /#ifdef _WIN32\n  if \(mnw\) \*mnw = 136; if \(mnh\) \*mnh = 39;\n#else\n  if \(mnw\) \*mnw = 78; if \(mnh\) \*mnh = 32;\n#endif/.test(glueWin)
+    && /if \(mxw\) \*mxw = 107374182; if \(mxh\) \*mxh = 107374182;/.test(glueWin));
+  check('the floor (what minSize=(0,0) reads back as) is the OS content minimum',
+    /#ifdef _WIN32\n  if \(fw\) \*fw = 136; if \(fh\) \*fh = 39;\n#else\n  if \(fw\) \*fw = 2; if \(fh\) \*fh = 32;/.test(glueWin));
+  check('the two numbers this host cannot verify say so in place',
+    /the two Windows numbers this\n\/\/ host cannot verify, which is why they are spelled out here rather than derived/.test(glueWin));
+  check('an app that never chose a maximum does not install AIR\'s own unbounded one on SDL',
+    /if \(mxw > 0 && mxw < SK_LIMIT_UNBOUNDED && mxh > 0 && mxh < SK_LIMIT_UNBOUNDED\) \{/.test(glueWin)
+    && /SDL_SetWindowMaximumSize\(c->win, 0, 0\);/.test(glueWin));
+
+  // (3) startMove/startResize are real system drags that refuse the non-draggable
+  // cases, and an unknown edge refuses instead of guessing.
+  check('startMove refuses a window with no frame to drag (maximized/minimized)',
+    /int sk_window_start_move\(int id\) \{[\s\S]{0,220}if \(flags & \(SDL_WINDOW_MAXIMIZED \| SDL_WINDOW_MINIMIZED\)\) return 0;/.test(glueWin));
+  check('startResize refuses a non-resizable window and an unknown edge',
+    /if \(!\(SDL_GetWindowFlags\(c->win\) & SDL_WINDOW_RESIZABLE\)\) return 0;/.test(glueWin)
+    && /else return 0;   \/\/ unknown edge: refuse rather than guess/.test(glueWin));
+  check('...and both begin a drag the pointer drives, latched until the button comes up',
+    /sk_sys_drag_begin\(c, 1, 0, 0, 0, 0\);/.test(glueWin)
+    && /sk_sys_drag_begin\(c, 2, t, b, l, r\);/.test(glueWin)
+    && /case SDL_MOUSEBUTTONUP:[\s\S]{0,400}c->sys_drag = 0;/.test(glueWin));
+  check('the drag tracks the pointer against its START snapshot (no per-event drift)',
+    /int dx = gx - c->sys_gx;/.test(glueWin) && /SDL_SetWindowPosition\(c->win, c->sys_x \+ dx, c->sys_y \+ dy\);/.test(glueWin));
+
+  // (4) A user close is a request the AS3 side answers with CLOSING.
+  check('a window-manager close is a REQUEST, not an inline teardown',
+    /c->close_request = 1;/.test(glueWin)
+    && /int sk_window_take_close_request\(int id\) \{[\s\S]{0,200}c->close_request = 0;/.test(glueWin));
+  check('...and the poll answers it with a cancelable CLOSING before closing',
+    /if \(as_window_take_close_request\(id\)\) \{\n\s*if \(ASC_win_fire\(id, \(char\*\)"closing", true\)\) as_window_close\(id\);/.test(c));
+
+  // The per-frame poll: all windows, once per application frame, from one snapshot.
+  check('every open window is polled once per application frame (not just the clock window)',
+    /for \(i = 0; i < ASC_MAX_WINDOWS; i\+\+\) ASC_win_poll\(i\);/.test(c));
+  check('the poll bails out of a closed or stage-less window',
+    /static void ASC_win_poll\(int id\) \{\n  ASCWin\* w = ASC_w\(id\);\n  if \(w == NULL \|\| w->closed \|\| w->stage == NULL\) return;/.test(c));
+  check('both bounds events take their before from the FRAME-START snapshot',
+    /int fx = w->snap_x, fy = w->snap_y, fw = w->snap_w, fh = w->snap_h;/.test(c)
+    && (c.match(/Rectangle\* before = Rectangle_new\(\(double\)fx, \(double\)fy, \(double\)fw, \(double\)fh\);/g) || []).length === 2);
+  check('...and the dispatch order is deactivate, resize, displayStateChange, move, activate',
+    (() => {
+      const at = (needle: string): number => c.indexOf(needle);
+      const ds = at('ASC_win_fire(id, (char*)"deactivate", false);');
+      const rs = at('ASC_win_fire_bounds(id, (char*)"resize", before, after);');
+      const st = at('ASC_win_fire_ds(id, before, after);');
+      const mv = at('ASC_win_fire_bounds(id, (char*)"move", before, after);');
+      const ac = at('ASC_win_fire(id, (char*)"activate", false);');
+      return ds > 0 && ds < rs && rs < st && st < mv && mv < ac;
+    })());
+  check('the two carrying events are AIR\'s own classes, not a bare Event',
+    /NativeWindowBoundsEvent_new\(\(char\*\)type, false, false, before, after\)/.test(c)
+    && /NativeWindowDisplayStateEvent_new\(\(char\*\)"displayStateChange", false, false, before, after\)/.test(c));
+  check('a minimize is reported as DEACTIVATE before the display-state change',
+    /if \(ds == 1 && w->snap_ds != 1 && w->snap_active\) \{ w->snap_active = 0; ASC_win_fire\(id, \(char\*\)"deactivate", false\); \}/.test(c));
+  check('ACTIVATE is the raw 0->1 focus transition (a stale flag cannot undo the inferred deactivate)',
+    /if \(!w->snap_raw_active && active\) \{\n    w->snap_active = 1;\n    ASC_win_fire\(id, \(char\*\)"activate", false\);/.test(c));
+  check('the display-state string is rewritten through the write barrier',
+    /ASCWin_displayState_set|as_win_set_display_state/.test(c) || /gc_write_barrier_value/.test(c));
+
+  // minSize/maxSize getters/setters: the getter allocates (adl: `w.minSize === w.minSize`
+  // is false) and the setter clamps against the floor and the current opposite limit.
+  check('the minSize getter allocates a fresh Point (adl: identity is false)',
+    /static Point\* NativeWindow_get_minSize\(void\* _this\)/.test(c)
+    && /Point_new\(/.test(c));
+  check('the minSize setter clamps to [platform floor, current maxSize]',
+    /as_window_limits_floor\(&fw, &fh\);/.test(c)
+    && /as_window_get_limits\(/.test(c)
+    && /as_window_set_limits\(/.test(c));
+  check('listOwnedWindows walks the live window table and filters by owner',
+    /static as_vector_NativeWindow\* as_win_owned_windows\(int id\) \{/.test(c)
+    && /as_vector_NativeWindow\* a = as_vector_NativeWindow_new\(\);/.test(c)
+    && /if \(w->owner != me->window\) continue;/.test(c));
+
+  // The AS3-facing seam: real backend, headless fallback, and the web stub -- all
+  // three have to exist or the backend-less builds stop linking.
+  check('the runtime declares the new glue externs',
+    /sk_window_get_limits\(int id, int\* mnw/.test(preamble)
+    && /sk_window_start_resize\(int id, const char\* edge\)/.test(preamble));
+  check('...and the headless branch stubs the whole set (link cleanliness)',
+    /static inline void as_window_limits_default\(int\* mnw, int\* mnh, int\* mxw, int\* mxh\) \{\n\s*if \(mnw\) \*mnw = 0;/.test(preamble)
+    && /static inline int as_window_start_resize\(int id, const char\* edge\) \{ \(void\)id; \(void\)edge; return 0; \}/.test(preamble));
+  check('the web glue stubs the same set so the same C links there',
+    ['sk_window_get_limits', 'sk_window_set_limits', 'sk_window_limits_floor',
+     'sk_window_limits_default', 'sk_window_start_move', 'sk_window_start_resize',
+     'sk_window_take_close_request'].every((f) => new RegExp(`\\n(?:void|int) ${f}\\(`).test(glueWeb)));
+  check('...including the one the web glue had been missing all along (get_borders)',
+    /void sk_window_get_borders\(int id, int\* top/.test(glueWeb));
+
+  // The platform facts the static fields answer with come from the same place the
+  // rest of the class does, not from a bare `false` literal.
+  check('supportsMenu/supportsNotification are platform macros, not literals',
+    /#define ASC_NW_SUPPORTS_MENU true/.test(preamble)
+    && /ASC_NW_SUPPORTS_MENU false/.test(preamble));
+
+  // The example that exercises all of this is windowed (it never returns on its own
+  // until nativeApplication.exit()), so it cannot be part of the run suite -- but it
+  // must still be the file the pins above are read from, and it must compile.
+  check('the example compiles and carries its measured expectations',
+    c.includes('NativeWindow_listOwnedWindows')
+    && /RESIZE\(100,100 300x200->200,200 500x400\) \| MOVE\(100,100 300x200->200,200 500x400\)/.test(exSrc));
+
+  console.log(`     [win-limits] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/WindowLimitsAndEvents', checkNativeWindowLimitsAndEvents);

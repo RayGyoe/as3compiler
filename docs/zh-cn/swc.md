@@ -735,6 +735,20 @@ com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wrig
 那足够让勾选框/按钮皮肤真的切帧，而**一般的类方法不执行**（一个类 1400+ 个方法体、54 KB 字节码，
 全跑起来就是 AVM2，属另行立项）。`catalog.xml` 的 `<dep>` 只用于**名字层面**的早期诊断（§3.3.3）。
 
+**第三条边界（阶段一百九十六 起）**：符号类的**基类**取自它自己的 `DoABC`（AVM2 的 `InstanceInfo.super`
+multiname），但**只有本次编译真的提供那个类时才绑定**（`swc.ts::availableProjectBase`，判定由调用方
+`index.ts` 用它正在编译的源文件集合回答）。理由与做法：
+
+- `skin.swc` 的四个组合框都继承 **App 自己**的 `com.vsdevelop.controls.ComBoBox`（同名类的**源码**在
+  `src/` 下）。AIR 在同一份输入上把库里的符号链到**库外**那个类上，行为来自源码；我们照做（阶段一百九十一）。
+- 库里那份**同名副本**是 ABC 代码，不参与编译（本节第一/二条边界），所以当编译单元里**没有**这个类时，
+  生成的 `class ComBox extends <不存在的类>` 会直接编译失败（`unknown superclass`）。
+- 此时**回落**成纯美术符号（`MovieClip`/`SimpleButton` 子类），并**响亮告警一次**（按基类名去重）：
+  `warning: SWC symbol class extends '<基类>', which this compilation does not provide: …`。
+  回落**不是静默降级**——告警写明缺哪个基类、退化成什么、少了哪些成员；而 `adl` 对同一份输入照跑不误
+  （它执行库里的那份基类），故「库内基类的行为」仍是 `TODO.md` 的遗留项。
+- 动态特性（`dynamic`）与基类**无关**，任何时候都按 ABC 原样复现（阶段一百九十二）。
+
 ---
 
 ## 8. 与 Ruffle 的关系（复用评估）

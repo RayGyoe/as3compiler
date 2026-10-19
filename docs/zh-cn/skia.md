@@ -286,11 +286,22 @@ SDL2 而非 SDL3，理由：SDL3（2025-01 首发 3.2.0）太新，社区生态/
 SDL 2.26 才加入）正是修复跨屏倍率 bug 的依赖，说明 2.32 对本项目够用且恰好支持所需。我们是源码编译 arm64
 静态库（`configure --host=arm64-apple-darwin --disable-shared`），版本自控，无需追一个刚满一年的新大版本。
 
-**Skia：m124 确实旧（约 1.5 年），但有具体原因。** 根本原因是环境受限：本机缺 `gn`/`ninja` 且磁盘不足以
-从源码编译，只能吃 Aseprite 官方钉死的预编译 milestone（§6.1）。次要原因：Skia 无稳定 API/ABI，milestone
-每 4~6 周滚动、接口频繁变动，升级意味着重写整层 `skia_glue.cc`；而 m124 已含所需全部模块
+**Skia：m124 确实旧（约 2.5 年，m124 ≈ 2024-04），但有具体原因。** 注意「环境受限」那一层**已不再是**原因——
+它是**历史情况**，§6.1 的「本项目实际落地方式」已如此标注：仓库根 `build-tools/skia-src` 现在就是完整 m124
+源码树（含 `bin/gn` + `third_party`），`vendor/skia/lib/macos-arm64/libskia.a` 正是从它**自编**、并带回一份本地
+补丁（`vendor/skia/patches/`）。真实原因三条：① Skia 无稳定 API/ABI，milestone 每 4 周滚动、接口频繁变动，
+升级意味着重写整层 `skia_glue.cc`；② 四份平台库（`macos-arm64`/`wasm`/`windows-x64`/`windows-x86`）与 vendored
+头必须**同批换**，本地补丁要重打、`[skia-abi]` 的逐字节钉子要重跑——§6.5 记过「同一个 milestone 内部」上游改
+`kMaxSubclassSize` 就够砸坏寄存器（`x28`）的事故，跨 milestone 只会更大；③ m124 已含所需全部模块
 （`SkParagraph`/`Skottie`/GPU 后端）。**升级触发条件**：只有当确需新 milestone 才有的特性（如某个新
-`SkImageFilter`、新字体引擎行为）时，才补 `gn`/`ninja` 环境从源码自编译最新版，并重测整个胶水层。
+`SkImageFilter`、新字体引擎行为）时，才从 `build-tools/skia-src` 换上对应 milestone 重编（**无需**再补
+`gn`/`ninja` 环境），并重测整个胶水层。
+
+> **2026-10-19 复核（v0.4.179）**：`skia-canvas` **4.0.0**（2026-10-12 发布）捆 **Skia m153**（`skia-safe`
+> 0.99.0），但它是 **Node.js 的 N-API 绑定**、走运行时 JS Canvas 调用，与本项目「**编译期**把 Skia C++ 静态链进
+> 原生产物 / wasm」**不在同一层**，无接入路径（本项目 npm 依赖恒为空，§3.1）。4.0 的修复清单里也没有可捡的：
+> 唯一的跨端项（macOS Metal 导出器缺 autorelease pool ⇒ 原生缓冲泄漏）我们早已有（`metal_glue.mm` /
+> `stage3d_glue.mm` 的 `@autoreleasepool`）。**未因此重开「升 milestone」决策，触发条件不变。**
 
 ### 6.5 vendored 头必须与预编译库**同版本**（这是 ABI，不是文档）
 

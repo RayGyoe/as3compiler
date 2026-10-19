@@ -192,12 +192,16 @@ function checkPreloadOutputDir(): string[] {
     preload(appXml, join(d, 'outdir')).includes('assets'));
   // (5) Structural: everything above passes an output path in by hand, so none of
   // it would notice the CLI never handing `-o` over in the first place (measured:
-  // mutating index.ts to pass `null` left checks 1-4 green). Pin the call site.
+  // mutating index.ts to pass `null` left checks 1-4 green). Pin the call sites --
+  // ALL of them, not just the first: `doctor` calls prepareAirApp too, and a scan
+  // that stops at the first match silently pinned whichever call happened to come
+  // first in the file (which is how this went red the moment doctor was added).
   const indexSource = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
-  const callSite = /prepareAirApp\([^;]*?\);/s.exec(indexSource)?.[0] ?? '';
-  check('the CLI hands -o to the adapter', callSite.includes('opts.output'));
+  const callSites = [...indexSource.matchAll(/prepareAirApp\([^;]*?\);/gs)].map((m) => m[0]);
+  check('the CLI hands -o to the adapter',
+    callSites.length > 0 && callSites.every((c) => c.includes('opts.output')));
   check('...and still passes the resolved --features set',
-    callSite.includes('explicitFeatures'));
+    callSites.length > 0 && callSites.every((c) => c.includes('explicitFeatures') || c.includes('resolveFeatures(')));
 
   if (ok > 0) console.log(`[preload-dir] ${ok} preload output-dir checks passed`);
   return bad;
@@ -680,7 +684,7 @@ function checkAneHostLayout(): string[] {
 //   (c) the target triple: `arm64` is a MANIFEST-only value (AIR's <architecture>
 //       takes 32/64 only) mapping to aarch64, so a Windows-on-ARM host cannot reach
 //       the linker holding an x86_64 archive set while believing it built arm64.
-//   (d) build-windows-deps.ps1 grew a real arm64 axis, plus the two properties that
+//   (d) vendor/provision/windows.ps1 grew a real arm64 axis, plus the two properties that
 //       keep it honest: `both` does NOT silently include arm64 (both means "the
 //       widths an AIR descriptor can ask for"), and vcvarsall's exit code is not
 //       trusted -- `vcvarsall arm64` exits 0 on this machine with no arm64 toolset
@@ -746,8 +750,11 @@ function checkWindowsArch(): string[] {
 
   // (d) the dependency script's arm64 axis, and the guard that must not be a
   //     blanket reject: the self-check reads FILES, and it names the component.
-  const ps1 = readFileSync(join(root, 'vendor', 'build-windows-deps.ps1'), 'utf8');
-  check('build-windows-deps.ps1 accepts -Arch arm64',
+  // The script lives under vendor/provision/ (provisioning = how the artifacts
+  // were made; vendor/ itself is the artifacts), so this path is deliberately
+  // two segments deep.
+  const ps1 = readFileSync(join(root, 'vendor', 'provision', 'windows.ps1'), 'utf8');
+  check('vendor/provision/windows.ps1 accepts -Arch arm64',
     /\[ValidateSet\('x64', 'x86', 'arm64', 'both'\)\]/.test(ps1));
   check('`both` still means the two AIR widths, not three',
     /if \(\$Arch -eq 'both'\) \{ \$Arches = @\('x64', 'x86'\) \}/.test(ps1));
@@ -2013,7 +2020,7 @@ function checkVendorLayout(): string[] {
   // The same call with `usesNetworking = false`, returning the INCLUDE list alone.
   // src/runtime.ts `#include <zlib.h>`s in EVERY native build, and on Windows
   // neither that header nor the unprefixed `z` exists outside curl's dependency
-  // stack (`vendor/build-windows-deps.ps1` builds both into curl/); macOS reaches
+  // stack (`vendor/provision/windows.ps1` builds both into curl/); macOS reaches
   // the system <zlib.h> and needs neither. So on Windows the include dir belongs to
   // the build, not to the transport -- emitting only the `-L` (what this did until
   // 阶段一百八十四) left every non-networking Windows app failing at

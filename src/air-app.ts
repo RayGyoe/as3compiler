@@ -14,6 +14,8 @@
 import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve, dirname, relative, basename, sep, isAbsolute } from 'node:path';
 import { resolveExtensionPackages } from './ane.ts';
+import { AUDIO_GLUE_HOSTS, checkFailure, requireCheck, type CheckCtx } from './checks.ts';
+import { applyManifest, defaultBuildConfig, nonWindowsVendorKey, type Manifest } from './build.ts';
 
 // A single <font> entry under <embedFonts>. AIR uses these for StageText custom
 // fonts: <fontPath> is the ttf relative to the app root, <fontName> is the name
@@ -447,11 +449,11 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
 
   // ---- Native platform profile -------------------------------------------------
   // The native app is built for the host OS: there is no cross-compilation, because
-  // the vendor libraries themselves are host artifacts (build-windows-deps.ps1
+  // the vendor libraries themselves are host artifacts (vendor/provision/windows.ps1
   // writes windows-<arch> on Windows, build-static.sh writes macos-arm64 on macOS).
   // So the running compiler's platform IS the target's.
   //   * macOS   — platform key `macos-arm64`, Cocoa/Metal frameworks, libobjc;
-  //   * Windows — platform key `windows-<arch>` (built by build-windows-deps.ps1,
+  //   * Windows — platform key `windows-<arch>` (built by vendor/provision/windows.ps1,
   //     named after AIR's own wording), D3D12/Win32 system libraries, and NO
   //     `-framework` at all (that flag does not exist in lld-link).
   // Both platforms key off the SAME `libDir`, because every vendor package now uses one
@@ -475,7 +477,22 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // `build skia: phony ./skia.lib`.
   const onWin = process.platform === 'win32';
   const winArch = architecture === '32' ? 'x86' : 'x64';
-  const libDir = onWin ? `windows-${winArch}` : 'macos-arm64';
+  // On Windows the key follows the descriptor's <architecture> (the archives must
+  // match the target ABI). Off Windows it follows the HOST -- and until now that
+  // was a bare `'macos-arm64'` literal, which pointed Linux and Intel Macs at an
+  // ARM64 archive set plus Cocoa/Metal frameworks. It did not fail early and it
+  // did not say why, so it was a silent wrong answer rather than a loud one
+  // (AGENTS.md 1.5); the empty string now makes that host say so instead.
+  const hostKey = onWin ? `windows-${winArch}` : nonWindowsVendorKey(process.platform, process.arch);
+  if (hostKey === '') {
+    throw new AirAppError(
+      `no prebuilt dependency tree for this host (${process.platform}/${process.arch}): ` +
+      `vendor/ carries macos-arm64, windows-x64, windows-x86 and wasm only.\n` +
+      `  build the tree for this host, or run on a host that already has one ` +
+      `(see vendor/provision/ and docs/zh-cn/compile.md)`
+    );
+  }
+  const libDir = hostKey;
   const defines = visible ? ['ASC_USE_SKIA=1', 'ASC_USE_WINDOW=1'] : ['ASC_USE_SKIA=1'];
   // ASC_WINDOW_FIXED mirrors AIR's <resizable>false</resizable>: the window is
   // created without SDL_WINDOW_RESIZABLE, matching adl's fixed-size window.
@@ -545,7 +562,7 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // (`_Cr_z_compress` etc.) that libpng/libwebp consume but which does NOT
   // expose the unprefixed names our generated C calls. Windows' standard zlib --
   // library AND header -- is the one curl's dependency stack builds (`z.lib` and
-  // `zlib.h` in curl/lib/<arch> + curl/include; see vendor/build-windows-deps.ps1).
+  // `zlib.h` in curl/lib/<arch> + curl/include; see vendor/provision/windows.ps1).
   //
   // Both halves are pushed together, and on Windows UNCONDITIONALLY: the
   // generated C includes <zlib.h> in every native build (src/runtime.ts), so a
@@ -933,35 +950,29 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // reaches all three of its Windows backends through LoadLibrary/GetProcAddress
   // (measured: the compiled Windows object's only undefined imports are kernel32
   // and the CRT), so that link line needs no `-l` at all -- while macOS needs its
-  // two Apple frameworks named (see airManifest's audio block). This list is thus
-  // "hosts where a backend was built AND measured"; every other host keeps the
-  // honest no-backend answer (play() returns null, which is AIR's own
-  // no-sound-card result) rather than -- `-framework CoreAudio` is not a clang
-  // argument on Windows -- a build failure with no hint of the real cause. Without
-  // the define the seam answers honestly, so this is a missing capability to name,
-  // not a wrong result to hide (§1.5).
+  // two Apple frameworks named (see airManifest's audio block). WHICH hosts have a
+  // backend is stated once, in checks.ts (AUDIO_GLUE_HOSTS), because two callers
+  // need the same answer for different reasons: this one decides whether the glue
+  // goes on the link line, and the `doctor` report decides how to explain the gap
+  // when it does not. Every other host keeps the honest no-backend answer (play()
+  // returns null, which is AIR's own no-sound-card result) rather than --
+  // `-framework CoreAudio` is not a clang argument on Windows -- a build failure
+  // with no hint of the real cause. Without the define the seam answers honestly,
+  // so this is a missing capability to name, not a wrong result to hide (§1.5).
   const audioGluePath = resolve(vendorAbs, 'audio_glue.c');
-  const audioGlueHosts = ['darwin', 'win32'];
-  const audioLinked = usesAudio && existsSync(audioGluePath) && audioGlueHosts.includes(process.platform);
-  // The curl tree is needed by EVERY Windows native build, not only a networking
-  // one: Windows has no system zlib, so both halves of the generated C's zlib use
-  // -- the unconditional `#include <zlib.h>` and `-l z` -- resolve inside that
-  // tree (see airManifest's zlib block). Checking only for networking is how a
-  // pure offscreen app ended up failing at the header with no mention of curl.
-  const curlHeader = resolve(vendorAbs, 'curl', 'include', 'curl', 'curl.h');
-  const needsCurlTree = !web && (usesNetworking || process.platform === 'win32');
-  if (needsCurlTree && !existsSync(curlHeader)) {
-    throw new AirAppError(
-      (usesNetworking
-        ? 'this app uses flash.net / URLRequest, so its build must link the HTTP transport'
-        : 'a Windows native build takes zlib from the static curl tree -- Windows has no system zlib, and the generated C includes <zlib.h> in every native build') +
-      ', but that tree is missing:\n' +
-      `  expected: ${curlHeader}\n` +
-      `  build it with: ${process.platform === 'win32'
-        ? 'as3compiler/vendor/build-windows-deps.ps1 (it builds the curl + nghttp2 + zlib stack; -Only curl for just that)'
-        : 'build-tools/curl-src/build-static.sh'}`
-    );
-  }
+  const audioLinked = usesAudio && existsSync(audioGluePath) && AUDIO_GLUE_HOSTS.includes(process.platform);
+  // The curl tree and the audio backend used to be diagnosed right here, with
+  // messages written by hand. They now come from checks.ts -- the same table
+  // `as-aot doctor` renders -- and are read further down, from the manifest this
+  // function is about to generate. See the block after writeFileSync.
+  //
+  // The reason the curl tree is needed at all (still worth stating once, because
+  // it is not obvious): it is needed by EVERY Windows native build, not only a
+  // networking one. Windows has no system zlib, so both halves of the generated
+  // C's zlib use -- the unconditional `#include <zlib.h>` and `-l z` -- resolve
+  // inside that tree (see airManifest's zlib block). Checking only for networking
+  // is how a pure offscreen app ended up failing at the header with no mention of
+  // curl.
   // A web build that draws text but resolves no font renders blank (see
   // detectText): the generated page gets `FONT_URLS = []`, so the wasm side stays
   // on the empty font manager and every glyph disappears. That is a silent wrong
@@ -970,14 +981,6 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // previews correctly in every other respect (layout, bitmaps), and failing the
   // build would not make the font appear.
   const warnings: string[] = [];
-  if (usesAudio && !audioLinked && !web) {
-    warnings.push(
-      `this app uses flash.media, but this native build has no audio backend available, so nothing will play:\n` +
-      `  glue: ${audioGluePath}${existsSync(audioGluePath) ? ` (present; it carries a backend for ${audioGlueHosts.join('/')}, and this host is ${process.platform})` : ' (missing)'}\n` +
-      `  sounds report AIR's own no-sound-card result: play() returns null and SoundMixer.areSoundsInaccessible() is true\n` +
-      `  fix: provide a vendor/audio_glue.c for this platform (see docs/zh-cn/audio.md)`
-    );
-  }
   // A web build has no audio backend yet (the glue's miniaudio build is
   // CoreAudio/AudioToolbox, native-only). The wasm side keeps answering honestly
   // — play() null, areSoundsInaccessible() true — so this is a missing capability,
@@ -1057,6 +1060,26 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
     generatedDefines.push(`ASC_APP_ID="${info.id}"`, `ASC_SWF_PATH="${info.content}"`);
   }
   writeFileSync(manifestPath, JSON.stringify(generated, null, 2) + '\n');
+
+  // Enforce (and warn about) exactly what `as-aot doctor` will report, using the
+  // manifest just written as the input. Reading it back through applyManifest
+  // means the build is judged on the config it will actually consume, rather
+  // than on a second description of it -- which is what the two hand-written
+  // blocks above used to be, and how they could drift from doctor's view.
+  const requirementCtx: CheckCtx = {
+    cfg: applyManifest(defaultBuildConfig(), generated as Manifest, manifestPath),
+    vendorDir: vendorAbs,
+    repoDir: resolve(vendorAbs, '..'),
+    outDir: null,
+    // The one signal the manifest cannot carry: it defines ASC_HAVE_AUDIO only
+    // once a backend IS linked, so "uses flash.media but has no backend" -- the
+    // case this warning exists for -- is invisible in `generated`.
+    appUses: { audio: usesAudio },
+  };
+  const missingCurl = requireCheck('vendor.curl', requirementCtx);
+  if (missingCurl !== null) throw new AirAppError(missingCurl);
+  const audioGap = checkFailure('vendor.audio', requirementCtx);
+  if (audioGap !== null) warnings.push(audioGap);
   if (keptFromManifest) {
     // Not silent (§1.5): the artifact about to be built is NOT an AIR-identical
     // default, and the reason is a setting from a previous run.

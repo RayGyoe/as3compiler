@@ -13,9 +13,11 @@ import { aneHostDirName, anePlatformForBuild, anePlatformHint, resolveAneDescrip
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, wasmToolchainError, buildWebCompileSteps, webToolchainError, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, type BuildConfig } from './build.ts';
+import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { BuildConfig, Target, Package, Manifest } from './build.ts';
-import { generateBootstrap, prepareAirApp } from './air-app.ts';
+import { generateBootstrap, prepareAirApp, airManifest } from './air-app.ts';
+import { runDoctor, checkForUpdate } from './doctor.ts';
 import { computeReachable, prepareReachFiles, type ReachFile } from './reach.ts';
 import { generateXcodeProject } from './xcode-project.ts';
 import {
@@ -28,6 +30,39 @@ import {
   type SwcBake,
 } from './swc.ts';
 import { embedCompileInputs, type EmbedResourceSpec } from './embed.ts';
+
+// The compiler's own version, read from package.json rather than duplicated as a
+// constant: `version` is bumped in that one file once per stage (§2.7), and a
+// second copy in the sources would drift from it silently. Both entry points sit
+// one level below the package root -- src/index.ts and the published
+// dist/index.js -- so the same relative URL resolves from either, and npm always
+// ships package.json no matter what `files` says.
+function compilerVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : '';
+  } catch {
+    // A dist/index.js copied out of the package by hand has no package.json above
+    // it. Reporting the version is the last thing that should take down the
+    // compiler, so this degrades to a visible "(unknown)" instead of throwing.
+    return '';
+  }
+}
+
+// One line and no colour: `as-aot --version` is pasted into bug reports and read
+// by scripts (`as-aot --version | awk '{print $NF}'`). The name is the package
+// name, because that is what identifies a release to the registry.
+function versionLine(): string {
+  const v = compilerVersion();
+  return `as3compiler ${v === '' ? '(unknown)' : v}`;
+}
+
+// The registry `npm_config_registry` names is the one this machine's npm would
+// install from, so a corporate mirror (or an offline default in .npmrc) is
+// honoured instead of us hard-coding npmjs in the source.
+function registryBase(): string {
+  return (process.env.npm_config_registry ?? 'https://registry.npmjs.org').replace(/\/+$/, '');
+}
 
 interface Options {
   inputs: string[];
@@ -52,69 +87,184 @@ interface Options {
   // `ane-paths`), not while the build runs.
   extDirs: string[];
   overrides: Partial<BuildConfig>;
+  // `as-aot doctor` (below). The subcommand is recognised by its own name as the
+  // FIRST argument, before the flag loop, because otherwise `doctor` would be
+  // taken for an input file (every non-dash argument is one) and the run would
+  // fail trying to read a file called "doctor".
+  doctor: boolean;
+  doctorJson: boolean;
+  doctorFix: boolean;
+  doctorVerbose: boolean;
+  // `doctor --check-update`: ask the registry whether a newer release is out.
+  // Read-only and opt-in (see doctor.ts); it rides along in Options like the
+  // other doctor switches.
+  doctorCheckUpdate: boolean;
 }
 
-function parseArgs(argv: string[]): Options {
-  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, extDirs: [], overrides: {} };
+// Every flag the parser accepts, in one list. Two things need to know what a
+// flag IS -- the "did you mean" suggestion for an unknown one, and the check
+// that a value-taking flag really got its value -- and a second hand-kept copy
+// would drift from the parser's if/else chain the first time a flag is added
+// (the `unit: cli/ArgErrors` group reads the chain and reddens if it does).
+const KNOWN_FLAGS: readonly string[] = [
+  '-o', '--run', '--dry', '--cc', '--target', '--package', '--manifest', '--air-app',
+  '--main-class', '--all-sources', '--include-third-party', '--extdir', '--json', '--fix',
+  '--check-update', '--verbose', '-v', '--opt', '--debug-info', '--lto', '--pgo', '--pgo-dir',
+  '-I', '-L', '-l', '-D', '--features', '--framework', '--source', '--swc', '--ane',
+  '--ane-platform', '--export', '--version', '-V', '--help', '-h',
+];
+
+// Plain Levenshtein, two rows of state (no dependency, no per-cell allocation).
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// The nearest known flag, or '' when nothing is close enough to be worth
+// guessing. Two shapes are worth guessing at, and both happen: a misspelling of
+// a long flag (`--versoin`), and a long flag typed short (`--feat`).
+//
+// Short flags are excluded on purpose: `-x` is one edit from EVERY other
+// single-letter flag, so any guess there is noise rather than help -- a wrong
+// "did you mean" costs more than no guess at all.
+// Short flags need no separate rule: a two-character name admits only a
+// zero-edit match, so the ratio below already keeps `-x` from being answered
+// with a confident guess at `-I`.
+function suggestFlag(arg: string): string {
+  let best = '';
+  let bestDist = 3; // 0..2; three edits away is a different word, not a slip
+  for (const f of KNOWN_FLAGS) {
+    const d = editDistance(arg, f);
+    // ...and close RELATIVE to the name's own length, because an absolute
+    // threshold lies about short names: `--sss` is two edits from `--swc`,
+    // which is nothing like a typo of it, while `-x` is one edit from EVERY
+    // other single-letter flag -- there a guess is a coin flip, and a confident
+    // wrong guess costs more than no guess at all.
+    if (d < bestDist && d * 3 <= arg.length) { bestDist = d; best = f; }
+  }
+  if (best !== '') return best;
+  // Nothing near, but the user may simply have stopped typing: `--feat` is four
+  // edits from `--features`, far enough that Levenshtein says no and a prefix
+  // test says yes. Only when it is unambiguous -- two candidates means the
+  // guess is a coin flip.
+  const candidates = KNOWN_FLAGS.filter((f) => f.length > arg.length && f.startsWith(arg));
+  return candidates.length === 1 ? candidates[0] : '';
+}
+
+function parseArgs(argv: string[], doctorMode = false): Options {
+  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, extDirs: [], overrides: {}, doctor: doctorMode, doctorJson: false, doctorFix: false, doctorVerbose: false, doctorCheckUpdate: false };
   const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths' | 'anePaths', v: string): void => {
     (opts.overrides[key] ??= [] as string[]).push(v);
   };
-  for (let i = 0; i < argv.length; i++) {
+  // Every value-taking flag reads its operand through here rather than inline
+  // `argv[++i]`, which made two mistakes silent (阶段二百零二):
+  //   * a flag at the very end of the command line -- `as-aot x.as -o` set the
+  //     output to `undefined`, and the `?? default` downstream quietly built
+  //     under the default name, as if -o had never been written;
+  //   * a flag that ate the NEXT FLAG -- `-o --dry` named the output `--dry`,
+  //     dropped the dry-run flag, and only surfaced later as clang rejecting
+  //     `--dry.c`, an error with nothing to do with the user's mistake.
+  // A value may legitimately start with a dash (`--opt -O3`, `-D FOO=-1`), so
+  // the test is "is this operand itself a known flag", never "does it start
+  // with a dash".
+  let i = 0;
+  const value = (flag: string): string => {
+    const v = argv[++i];
+    if (v === undefined) {
+      throw new Error(`${flag}: expects a value, but it is the last argument (see \`as-aot --help\`)`);
+    }
+    if (KNOWN_FLAGS.includes(v)) {
+      throw new Error(`${flag}: expects a value, but got the flag ${v} (see \`as-aot --help\`)`);
+    }
+    return v;
+  };
+  for (; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '-o') opts.output = argv[++i];
+    if (a === '-o') opts.output = value('-o');
     else if (a === '--run') opts.run = true;
     else if (a === '--dry') opts.overrides.dry = true;
-    else if (a === '--cc') opts.overrides.cCompiler = argv[++i];
-    else if (a === '--target') opts.overrides.target = argv[++i] as Target;
-    else if (a === '--package') opts.overrides.package = argv[++i] as Package;
-    else if (a === '--manifest') opts.manifest = argv[++i];
-    else if (a === '--air-app') opts.airApp = argv[++i];
-    else if (a === '--main-class') opts.mainClass = argv[++i];
+    else if (a === '--cc') opts.overrides.cCompiler = value('--cc');
+    else if (a === '--target') opts.overrides.target = value('--target') as Target;
+    else if (a === '--package') opts.overrides.package = value('--package') as Package;
+    else if (a === '--manifest') opts.manifest = value('--manifest');
+    else if (a === '--air-app') opts.airApp = value('--air-app');
+    else if (a === '--main-class') opts.mainClass = value('--main-class');
     else if (a === '--all-sources') opts.allSources = true;
     else if (a === '--include-third-party') opts.includeThirdParty = true;
-    else if (a === '--extdir') opts.extDirs.push(argv[++i]);
-    else if (a === '--opt') opts.overrides.opt = argv[++i];
+    else if (a === '--extdir') opts.extDirs.push(value('--extdir'));
+    else if (a === '--json') opts.doctorJson = true;
+    else if (a === '--fix') opts.doctorFix = true;
+    else if (a === '--check-update') opts.doctorCheckUpdate = true;
+    else if (a === '--verbose' || a === '-v') opts.doctorVerbose = true;
+    else if (a === '--opt') opts.overrides.opt = value('--opt');
     else if (a === '--debug-info') opts.overrides.debugInfo = true;
     else if (a === '--lto') opts.overrides.lto = true;
     else if (a === '--pgo') {
-      const v = argv[++i];
+      const v = value('--pgo');
       if (v !== 'generate' && v !== 'use') {
-        throw new Error(`--pgo expects 'generate' or 'use' (got ${v === undefined ? 'nothing' : `'${v}'`})`);
+        throw new Error(`--pgo expects 'generate' or 'use' (got '${v}')`);
       }
       opts.overrides.pgo = v;
     }
-    else if (a === '--pgo-dir') opts.overrides.pgoDir = argv[++i];
-    else if (a === '-I') push('includePaths', argv[++i]);
-    else if (a === '-L') push('linkPaths', argv[++i]);
-    else if (a === '-l') push('linkLibs', argv[++i]);
-    else if (a === '-D') push('defines', argv[++i]);
+    else if (a === '--pgo-dir') opts.overrides.pgoDir = value('--pgo-dir');
+    else if (a === '-I') push('includePaths', value('-I'));
+    else if (a === '-L') push('linkPaths', value('-L'));
+    else if (a === '-l') push('linkLibs', value('-l'));
+    else if (a === '-D') push('defines', value('-D'));
     // --features <a,b>: named enhancement switches (AIR supersets, §1.5).
     // Repeatable and/or comma-separated; `none` clears. Stored raw here — the
     // `none`-vs-absent distinction is resolved in main(), because it decides
     // whether the generated manifest's persisted set is kept or wiped.
     else if (a === '--features') {
-      const v = argv[++i];
-      if (v === undefined) {
-        throw new Error(`--features expects a comma-separated list (e.g. --features svg; --features none to clear)`);
-      }
+      // The list's own syntax (`svg,lottie`; `none` clears) lives in `--help`,
+      // which the missing-value error points at, so it is not repeated here.
+      const v = value('--features');
       for (const f of v.split(',').map((s) => s.trim()).filter((s) => s !== '')) push('features', f);
     }
-    else if (a === '--framework') push('frameworks', argv[++i]);
-    else if (a === '--source') push('sources', argv[++i]);
-    else if (a === '--swc') push('swcPaths', argv[++i]);
-    else if (a === '--ane') push('anePaths', argv[++i]);
-    else if (a === '--ane-platform') opts.overrides.anePlatform = argv[++i];
-    else if (a === '--export') push('exports', argv[++i]);
+    else if (a === '--framework') push('frameworks', value('--framework'));
+    else if (a === '--source') push('sources', value('--source'));
+    else if (a === '--swc') push('swcPaths', value('--swc'));
+    else if (a === '--ane') push('anePaths', value('--ane'));
+    else if (a === '--ane-platform') opts.overrides.anePlatform = value('--ane-platform');
+    else if (a === '--export') push('exports', value('--export'));
+    // -V, not -v: -v is doctor's --verbose and has been in the help text since
+    // then, so taking it over would be a breaking change for anyone using it.
+    else if (a === '--version' || a === '-V') {
+      console.log(versionLine());
+      process.exit(0);
+    }
     else if (a === '--help' || a === '-h') {
       console.log(usage());
       process.exit(0);
     } else if (!a.startsWith('-')) {
       opts.inputs.push(a);
     } else {
-      throw new Error(`unknown argument: ${a}`);
+      // Two shapes of mistake, two different next steps: a near miss of a known
+      // flag is worth guessing at (that is the whole failure mode this exists
+      // for), while a flag nothing resembles is better answered with where the
+      // full list is than with a guess.
+      const near = suggestFlag(a);
+      throw new Error(near !== ''
+        ? `unknown argument: ${a} (did you mean ${near}?)`
+        : `unknown argument: ${a} (see \`as-aot --help\` for the full list)`);
     }
   }
-  if (opts.inputs.length === 0 && !opts.airApp) {
+  // Same reasoning as --extdir below: on a compile run this would look like it
+  // had been honoured and quietly do nothing -- worse here, because the flag's
+  // whole point is a side effect (the registry lookup) the user would expect to
+  // have happened. Checked BEFORE the no-input banner, so `as-aot --check-update`
+  // says what is wrong instead of printing usage.
+  if (opts.doctorCheckUpdate && !opts.doctor) {
+    throw new Error(`--check-update only applies to the doctor subcommand; use \`as-aot doctor --check-update\``);
+  }
+  if (opts.inputs.length === 0 && !opts.airApp && !opts.doctor) {
     console.error(usage());
     process.exit(1);
   }
@@ -130,6 +280,8 @@ function parseArgs(argv: string[]): Options {
 function usage(): string {
   return [
     'Usage: as-aot <input.as> [more.as ...] [options]',
+    '       as-aot doctor [options]        report whether this machine can build what the flags ask',
+    '       as-aot version                 print the compiler version (same as --version / -V)',
     '',
     'Options:',
     '  -o <path>      output path (native: executable; wasm: .wasm appended)',
@@ -171,7 +323,25 @@ function usage(): string {
     '  --pgo <phase>  profile-guided optimization: generate | use (E12; pair with --pgo-dir)',
     '  --pgo-dir <d>  profile directory for --pgo (the two phases must name the same one)',
     '  --dry          emit C and print the compile command without compiling',
+    '  -V, --version  print the compiler version (read from package.json) and exit',
     '  -h, --help     show this help',
+    '',
+    'doctor options (only with the `doctor` subcommand):',
+    '  --json         machine-readable report (one JSON object on stdout)',
+    '  --fix          perform the safe, instant fixes; never builds a dependency or',
+    '                 installs a toolchain -- those checks print the command instead',
+    '  -v, --verbose  also print the resolved repo/vendor/output directories',
+    '  --check-update ask the registry `npm_config_registry` names (npmjs by default)',
+    '                 whether a newer release is published, and print the upgrade',
+    '                 command. Read-only: it never installs anything, and a registry',
+    '                 it cannot reach is reported rather than fatal -- the exit code',
+    '                 still means build-readiness and nothing else',
+    '',
+    'doctor judges against a real build configuration: `--manifest <f>` reads one,',
+    '`--air-app <xml>` generates one (writing <filename>.build.json, the same file a',
+    'build writes), and with neither it assumes the standard native desktop app.',
+    'Exit codes: 0 ready, 1 a hard requirement is missing, 2 warnings only (the build',
+    'would succeed but the output would be wrong).',
   ].join('\n');
 }
 
@@ -209,13 +379,131 @@ function usesFlashData(texts: string[]): boolean {
   return false;
 }
 
-function main(): void {
+// `as-aot doctor`. The check table lives in src/checks.ts and the rendering in
+// src/doctor.ts; what belongs HERE is the one decision neither of them can make:
+// *which build is being asked about*. That answer is a real BuildConfig rather
+// than a hand-written summary of one, because the checks key off the same fields
+// a build keys off (linkLibs, defines, sources). A parallel description of "what
+// this needs" would be a second source of truth, i.e. exactly what this design
+// sets out to avoid.
+//
+// Three ways to say what is being built:
+//   --manifest <f>   read that manifest (no side effects);
+//   --air-app <xml>  generate the manifest a real build would and read it back --
+//                    this DOES write <filename>.build.json, because that is the
+//                    only way to know what the app actually pulls in; the report
+//                    says so on stderr;
+//   neither          the standard native desktop app, synthesised through
+//                    airManifest (the same function the --air-app path uses) so
+//                    no file is written and no rule is duplicated.
+// The two directories every build-relevant check needs. Derived from this file's
+// own URL (so a relocated checkout still resolves them) and stated once, so that
+// `doctor` and the build path cannot disagree about where `vendor/` lives.
+function repoPaths(): { repoDir: string; vendorDir: string } {
+  const repoDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  return { repoDir, vendorDir: resolve(repoDir, 'vendor') };
+}
+
+// The context the check table reads on the build path. `outDir` is null: only the
+// icudtl.dat deployment (a `doctor --fix` action) needs an output directory, and
+// a compile never invokes it.
+function buildCheckCtx(cfg: BuildConfig, appUses?: CheckCtx['appUses']): CheckCtx {
+  return { ...repoPaths(), cfg, outDir: null, appUses };
+}
+
+// Async for exactly one reason: `--check-update` waits on the registry. Every
+// other path through here stays synchronous.
+async function runDoctorMode(opts: Options): Promise<number> {
+  const { repoDir, vendorDir } = repoPaths();
+  const cfg = defaultBuildConfig();
+
+  // CLI overrides are applied LAST, after any manifest merge -- the same
+  // "manifest first, CLI wins" rule main() follows. Applying them first is a
+  // real bug rather than a style choice: the generated manifest carries
+  // `target: native`, so `--target wasm` would be silently undone.
+  const overrides = opts.overrides;
+
+  if (opts.airApp) {
+    const air = prepareAirApp(
+      opts.airApp, opts.mainClass, vendorDir,
+      overrides.package === 'web', resolveFeatures(overrides.features),
+      opts.output, opts.includeThirdParty, opts.extDirs,
+    );
+    process.stderr.write(`doctor: judged against the manifest generated from ${opts.airApp}\n`);
+    Object.assign(cfg, applyManifest(cfg, loadManifest(air.manifestPath), air.manifestPath));
+  } else if (opts.manifest) {
+    Object.assign(cfg, applyManifest(cfg, loadManifest(opts.manifest), opts.manifest));
+  } else {
+    // No configuration was named. Synthesise the standard desktop app through
+    // airManifest -- the same function the --air-app path uses, so no rule is
+    // duplicated -- but only where that is the right shape. A `--target wasm`
+    // --package raw build is a bare WASI module that links no vendor libraries
+    // at all, so synthesising SDL2 + Cocoa into it would report requirements
+    // the build will never have.
+    Object.assign(cfg, overrides);
+    // Synthesise only for a NATIVE target. Two reasons, one of them a real bug:
+    //   1. native is the shape the vendor checks exist for;
+    //   2. airManifest pins `target` itself. Letting it run for a wasm request
+    //      overwrites the user's --target, and worse, it silently REPAIRS a
+    //      `--package web` that is missing `--target wasm` -- which the real
+    //      build rejects (index.ts). A doctor that disagrees with the build is
+    //      the one thing it must never do, so the web branch is simply not
+    //      synthesised here and `build.package-target` gets to report it.
+    if (cfg.target === 'native') {
+      // `vendor` + a repoDir anchor: the generator emits paths relative to the
+      // `vendorRel` it is handed, and resolving them against the repo root is
+      // what makes them point at the real tree. The path below is never written
+      // -- applyManifest only uses it as a resolution anchor.
+      const m = airManifest('vendor', true, true, false, false, 'auto', false, true,
+        [], [], [], [], false, false, cfg.architecture, cfg.features);
+      Object.assign(cfg, applyManifest(cfg, m as Manifest, join(repoDir, 'doctor.json')));
+    }
+  }
+
+  // "CLI beats manifest" stated exactly once, covering every branch: the
+  // synthesised path above had to merge early only to know WHICH shape to
+  // synthesise, and that merge must not be the last word either.
+  Object.assign(cfg, overrides);
+
+  // The version is read from package.json in exactly one place (up there):
+  // doctor.ts is a renderer and is handed what to print.
+  const version = compilerVersion();
+  // The ONE network call in this CLI: opt-in, read-only, bounded, and reported
+  // rather than thrown. It cannot move the exit code -- a machine that simply
+  // cannot reach the registry is still a machine that can build.
+  const update = opts.doctorCheckUpdate ? await checkForUpdate(version, registryBase()) : null;
+
+  return runDoctor({
+    cfg,
+    repoDir,
+    vendorDir,
+    outDir: opts.output === null ? null : dirname(resolve(opts.output)),
+    json: opts.doctorJson,
+    fix: opts.doctorFix,
+    verbose: opts.doctorVerbose,
+    version,
+    update,
+  });
+}
+
+async function main(): Promise<void> {
   if (process.env.AS3_MEMBERGAPS) {
     process.on('exit', () => {
       console.error('\n=== AS3_GAPS ===\n' + [...new Set(AS3_GAPS)].sort().join('\n') + '\n=== /AS3_GAPS ===');
     });
   }
-  const opts = parseArgs(process.argv.slice(2));
+  // `version` is a subcommand, positional like `doctor`, and it is recognised
+  // before parseArgs for the same reason doctor is: every non-dash argument is an
+  // input file, so `as-aot version` would otherwise die trying to read a file
+  // called "version".
+  if (process.argv[2] === 'version') {
+    console.log(versionLine());
+    process.exit(0);
+  }
+  const opts = parseArgs(process.argv.slice(2), process.argv[2] === 'doctor');
+  if (opts.doctor) {
+    process.exit(await runDoctorMode(opts));
+  }
 
   // Resolve --features to the explicit set for THIS invocation, keeping "absent"
   // (null → keep whatever the manifest persists) distinct from "clear" ([] →
@@ -431,12 +719,20 @@ function main(): void {
   const swcLibraries: SwcLibrary[] = [];
   if (cfg.swcPaths.length > 0) {
     const declared = new Set<string>();
+    // The same set in AS3 spelling (`com.example.controls.ComBoBox`), because that is
+    // how the library's `DoABC` names a base class. A symbol binds to its project base
+    // only when that base is one of THESE sources -- the library's own copy of the
+    // class is not compiled (swc.md §3.3), so a base missing here would not even be
+    // declarable (see availableProjectBase in swc.ts).
+    const declaredFqn = new Set<string>();
     for (const s of program.body) {
-      if (s.kind === 'ClassDecl') declared.add(qualifiedName(s.name, s.packageName));
+      if (s.kind !== 'ClassDecl') continue;
+      declared.add(qualifiedName(s.name, s.packageName));
+      declaredFqn.add(s.packageName ? `${s.packageName}.${s.name}` : s.name);
     }
     for (const libPath of cfg.swcPaths) {
       const lib = swcLib(libPath);
-      const inputs = swcCompileInputs(lib);
+      const inputs = swcCompileInputs(lib, (fqn) => declaredFqn.has(fqn));
       for (const spec of inputs.specs) {
         if (declared.has(spec.cname)) {
           throw new Error(
@@ -653,17 +949,21 @@ function main(): void {
   // name, not the whole string.
   const audioLinked = cfg.defines.some((d) => d === 'ASC_HAVE_AUDIO' || d.startsWith('ASC_HAVE_AUDIO='));
   if (!audioLinked && program.imports.some((i) => i === 'flash.media' || i.startsWith('flash.media.'))) {
-    const how =
-      cfg.target === 'wasm'
-        ? `the browser build has no audio backend yet, so nothing will play (docs/zh-cn/audio.md)`
-        : `add \`vendor/audio_glue.c\` to the manifest's \`sources\` and \`ASC_HAVE_AUDIO=1\` to \`defines\`` +
-          (process.platform === 'darwin' ? `, plus \`CoreAudio\`/\`AudioToolbox\` to \`frameworks\`` : ``) +
-          ` (docs/zh-cn/audio.md)`;
-    console.warn(
-      `warning: this program uses flash.media, but this build links no audio backend: play() returns null and ` +
-        `SoundMixer.areSoundsInaccessible() is true.\n` +
-        `  ${how}`
-    );
+    // The native wording (and the fix) comes from the check table, so `doctor`
+    // and a build say the same sentence. The browser case is a separate
+    // requirement -- there is no glue to add, the backend simply does not exist
+    // yet -- so it keeps a line of its own rather than being forced into that
+    // check's "add this file" shape.
+    const how = cfg.target === 'wasm'
+      ? `the browser build has no audio backend yet, so nothing will play (docs/zh-cn/audio.md)`
+      : checkFailure('vendor.audio', buildCheckCtx(cfg, { audio: true }));
+    if (how !== null) {
+      console.warn(
+        `warning: this program uses flash.media, but this build links no audio backend: play() returns null and ` +
+          `SoundMixer.areSoundsInaccessible() is true.\n` +
+          `  ${how}`
+      );
+    }
   }
 
   // 分发形态分派（§6）：--package xcode-project 是「生成工程」步骤，不做 cc
@@ -698,20 +998,14 @@ function main(): void {
   // 要求 target=wasm（emcc 后端）；编译走 buildWebCompileSteps（emcc 而非 wasi
   // clang），再生成 index.html 脚手架（字体运行时注入 + 手动运行 main）。
   if (cfg.package === 'web') {
-    if (cfg.target !== 'wasm') {
-      throw new Error(`--package web produces a browser page (--target wasm); --target ${cfg.target} is not yet supported`);
-    }
-    const missing = webToolchainError();
-    if (missing) {
-      throw new Error(
-        `cannot build for --package web: ${missing}\n` +
-        '\n' +
-        'Install an Emscripten SDK to produce browser output:\n' +
-        '  - https://emscripten.org/docs/getting_started/downloads.html\n' +
-        '    then set EMSDK_HOME=/path/to/emsdk\n' +
-        '\n' +
-        'Use --dry to preview the compile command without a toolchain.'
-      );
+    // Both of these are enforced by the same table `as-aot doctor` renders, so
+    // there is one sentence per requirement rather than two that can drift
+    // (see requireCheck in checks.ts).
+    const badTarget = requireCheck('build.package-target', buildCheckCtx(cfg));
+    if (badTarget !== null) throw new Error(`cannot build for --package web: ${badTarget}`);
+    const missing = requireCheck('web.emsdk', buildCheckCtx(cfg));
+    if (missing !== null) {
+      throw new Error(`cannot build for --package web: ${missing}`);
     }
     const steps = buildWebCompileSteps(cfg, cPath, base);
     if (cfg.dry) {
@@ -742,19 +1036,9 @@ function main(): void {
   }
 
   if (cfg.target === 'wasm') {
-    const missing = wasmToolchainError(cfg);
-    if (missing) {
-      throw new Error(
-        `cannot build for --target wasm: ${missing}\n` +
-        '\n' +
-        'Install a WASI toolchain to produce .wasm output:\n' +
-        '  - WASI SDK: https://github.com/WebAssembly/wasi-sdk/releases\n' +
-        '    then set WASI_SDK_HOME=/path/to/wasi-sdk\n' +
-        '  - Homebrew: brew install wasi-sdk\n' +
-        '  - or use a clang with a wasm32-wasip1 backend + wasi-libc\n' +
-        '\n' +
-        'Use --dry to preview the compile command without a toolchain.'
-      );
+    const missing = requireCheck('wasi.sdk', buildCheckCtx(cfg));
+    if (missing !== null) {
+      throw new Error(`cannot build for --target wasm: ${missing}`);
     }
   }
   for (const s of steps) {
@@ -782,13 +1066,8 @@ function main(): void {
       aneHostDirName(aneResolution.platform)
     );
     const dll = resolve(hostDir, 'asaot.dll');
-    if (!existsSync(dll)) {
-      throw new Error(
-        `asaot.dll is missing from ${hostDir}. Build it first: run lib/build-asaot.bat ` +
-          '(it needs clang; see as3compiler/lib/asaot_host.c). Only the Windows host ' +
-          'library is built today, so an --ane-platform for another OS has no host side yet.'
-      );
-    }
+    const noHost = requireCheck('ane.hostlib', buildCheckCtx(cfg));
+    if (noHost !== null) throw new Error(noHost);
     copyFileSync(dll, join(dirname(resolve(outPath)), 'asaot.dll'));
     console.log(`[4/4] ane         asaot.dll + ${written.length} native library(ies) -> ${join(dirname(resolve(outPath)), 'extensions')}`);
     for (const w of written) console.log(`                  extensions/${w}`);
@@ -932,10 +1211,17 @@ var Module = {
 }
 
 try {
-  main();
+  await main();
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
   process.stderr.write(`\x1b[31m${msg}\x1b[0m\n`);
-  if (err instanceof Error && err.stack) process.stderr.write(err.stack + '\n');
+  // The stack is for us, not for the user: it used to print unconditionally, so a
+  // mistyped flag arrived buried under Node internals and read as a crash rather
+  // than as "I do not know that flag". AS3_TRACE=1 brings it back -- that, plus
+  // `as-aot --version`, is what a bug report should carry.
+  const trace = process.env.AS3_TRACE;
+  if (trace !== undefined && trace !== '' && trace !== '0' && err instanceof Error && err.stack) {
+    process.stderr.write(err.stack + '\n');
+  }
   process.exit(1);
 }

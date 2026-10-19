@@ -459,6 +459,72 @@ hand-maintained manifest is needed. `CoreAudio`+`AudioToolbox` are added on **ma
 `-framework` argument is not a Windows linker flag), and Windows needs no extra `-l` at all. Fixed
 2026-10-17; see **§15**.
 
+### 13.5 A self-owned fixture and a UI player example (stage 201, 2026-10-19)
+
+**Why a new one.** The encoded-file route — `Sound.load(URLRequest)` and, after the asynchronous load,
+the `bytesLoaded` / `bytesTotal` / `url` / `length` / `id3` surface — plus `SoundChannel` playback and
+the `soundComplete` lifecycle had **no regression input at all**. Neither existing audio example
+reaches it: `examples/audio.as` feeds **synthesized PCM** to `loadPCMFromByteArray`, and
+`examples/embed.as` decodes an mp3 embedded at **compile time**. What looked like coverage was three
+pins reading a third-party Starling sample's `AssetManager.as` — they asserted Starling's own classes,
+not this compiler, and went away with the external fixtures in stage 198.
+
+**Fixture**: `examples/audio/clip.mp3` — the **full audio track** of the product video in the README,
+demuxed and re-encoded to MP3 with ffmpeg. It is **self-owned**: no third-party tree that could be
+re-cloned into a different shape can shift what the pins read.
+
+| Measured | Value |
+|---|---|
+| Size | `1 890 142` bytes (the player's own self-check hard-codes this too; the pin compares the **two against each other**) |
+| Duration | `118.1 s` (`Sound.length` reports `118125.71 ms`, see below) |
+| Encoding | MPEG-1 Layer III, 128 kbps, 44 100 Hz, stereo (first frame sync `FF FB 90 00` at offset 132, after the ID3v2.3 tag) |
+| Tags | ID3v2.3: TIT2 `TalkMED AOT audio fixture` / TPE1 `TalkMED` / TALB `as3compiler examples` |
+| Container leftovers | **none** (ffmpeg copies the mp4's `major_brand` / `Remotion` into TXXX frames unless told not to; cleaned, and their absence is pinned) |
+
+`Sound.length` is in **milliseconds**, and it is MPEG's *nominal* duration (frames × 1152/44100), about
+26 ms more than the container duration — the same reading `adl` gives (§13.2's 6686-byte mp3 reports
+`417.959…ms` for the same reason).
+
+**Example**: `examples/audio/AudioPlayer.as` — a window with play/pause/stop, ±10% volume, ±10 s seek
+and a path box that loads another file. `FileReference.browse` / `File.browseForOpen` are **not
+implemented** in this backend (those members report themselves loudly as unsupported), so the file is
+chosen by typing a path instead of a real dialog — it genuinely swaps files, and it is not a pretend
+dialog.
+
+**Why it must be a window**: `soundComplete` is dispatched by `as_audio_tick()` at the **frame
+boundary**, which only `Stage_dispatchFrame` calls — the offscreen `tickTimers()` / `tickFrame()` do
+**not** drive it. So "playing to the end" only exists inside a real window and cannot be observed
+headlessly, which is also why the example is **not run** by the regression (compile+link only; see
+`example: audio/ (windowed: compile+link only)` in `test/examples.ts`).
+
+```bash
+# run from the repo root (the default path is relative to the current directory)
+node src/index.ts examples/audio/AudioPlayer.as \
+     --manifest examples/audio/player.build.json --run
+```
+
+**23 scripted self-checks** (driven by the frame clock once the window is up; `trace` prints the summary):
+
+| Group | Coverage |
+|---|---|
+| Load | `bytesTotal` / `bytesLoaded` / `url` / `isBuffering` / `length` / the three `id3` fields |
+| Playback | channel returned, position advances, pause releases the channel and remembers the position, resume, volume clamp and its effect on the live channel, seek landing |
+| Terminal | `soundComplete` for a 0.5 s slice of **real audio** taken with `extract`, and the channel state after `stop()` |
+
+**A host with no audio device is not faked**: when `SoundMixer.areSoundsInaccessible()` is true the
+playback assertions are skipped as a group with the **reason printed**, while the decode/length/id3
+group still runs (§1.5). `ASC_AUDIO_NULL=1` (miniaudio's Null backend: no hardware, position still
+advances) gives a CI deterministic timing.
+
+**A trap in the measuring method itself**: typing into that path box under a CJK input method puts the
+letters into the IME's **composition** — `keyDown` still arrives with the right keyCode/charCode, but
+`edit.text` does not change and no `textInput` fires; the user must **commit with Enter** before
+`SDL_TEXTINPUT` is produced. Reading "I typed a letter and nothing happened" as "the keyboard channel
+is broken" is wrong; on that reading a `FOCUS_GAINED → SDL_StartTextInput()` patch was once added to
+`vendor/window_glue.cc`. An A/B measurement (cold start, and lost-then-regained focus) showed SDL
+handles this by itself — its own header states desktop platforms start text input implicitly at video
+init — so the patch was removed and a pin keeps it from coming back (`test/unit/text-input.ts`).
+
 ---
 
 ## 14. Divergences from AIR (stage 96)

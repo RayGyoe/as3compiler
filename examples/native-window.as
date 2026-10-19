@@ -1,0 +1,143 @@
+// native-window.as — NativeWindow 家族（多窗口）的自校验示例。
+//
+// 跑法（需要 arm64 SDL2/Skia，见 docs/zh-cn/compile.md §6）：
+//   node src/index.ts examples/native-window.as \
+//        --manifest examples/window.build.example.json --run
+// 程序自己断言，最后打印 "native-window: N checks passed"；有失败则逐条打印
+// "FAIL ..."（并仍然退出，方便肉眼定位）。
+//
+// 覆盖面（逐项对齐 adl 51.4.1，oracle 见 temp/nwmac/）：
+//   * minSize/maxSize：默认值随 OS、写入按 [平台地板, 当前对侧上限] 钳制、getter 每次回新 Point
+//   * listOwnedWindows()：Vector.<NativeWindow>，元素就是 owner 本人持有的那个窗口对象
+//   * 帧边界的 RESIZE/MOVE：before 是**本帧开始**的矩形（不是半更新状态），顺序 RESIZE→MOVE
+//   * close()：当帧 closed 仍为 false、CLOSE 在帧边界送达
+//   * startMove()/startResize()：真实系统拖拽，回 true（放在最后，拖拽闩锁随进程退出消失）
+//
+// 纯 C 构建（没有 window 后端）里 `new NativeWindow()` 会**响亮**地抛 #2012（不静默 fallback），
+// 而 examples/ 下的每个 .as 都会被回归套件在纯 C 配置下真跑一遍 —— 所以这里显式分流：没有后端
+// 就报明并停在原地，有后端才继续做断言。（这只覆盖「拿不到窗口」这一种构建，不是兜底语义。）
+import flash.display.Stage;
+import flash.display.NativeWindow;
+import flash.display.NativeWindowInitOptions;
+import flash.display.NativeWindowResize;
+import flash.events.Event;
+import flash.events.NativeWindowBoundsEvent;
+import flash.desktop.NativeApplication;
+import flash.geom.Point;
+import flash.geom.Rectangle;
+import flash.system.Capabilities;
+import flash.utils.setTimeout;
+
+var pass:int = 0;
+var fails:Array = [];
+
+function eq(label:String, got:*, want:*):void {
+  if (String(got) == String(want)) { pass++; }
+  else { fails.push(label + " (got " + got + ", want " + want + ")"); }
+}
+function rr(r:Rectangle):String { return r == null ? "null" : r.x + "," + r.y + " " + r.width + "x" + r.height; }
+function pt(p:Point):String { return p == null ? "null" : p.x + "," + p.y; }
+
+// 平台地板/默认值随 OS 变（adl 实测：macOS 默认 78x32、地板 2x32；Windows 默认 136x39）。
+var isMac:Boolean = Capabilities.version.substr(0, 3) == "MAC";
+var defMin:String = isMac ? "78,32" : "136,39";
+var floorMin:String = isMac ? "2,32" : "136,39";
+
+var stage:Stage = new Stage();
+// w 只做几何/事件口径的断言，尺寸限制的**写入**全放在 wSize 上：写 minSize/maxSize 会真的改动
+// 活窗口（adl 实测：minSize=(1000,800) 之后窗口宽度立刻变 1000），那条 RESIZE 会混进 w 的事件表，
+// 让「改 bounds 到底派发什么」变得不可判读。
+var w:NativeWindow = null;
+var wSize:NativeWindow = null;
+var w2:NativeWindow = null;
+var got:Array = [];
+var gotClose:Boolean = false;
+var hasBackend:Boolean = true;
+try {
+  w = new NativeWindow(new NativeWindowInitOptions());
+  wSize = new NativeWindow(new NativeWindowInitOptions());
+} catch (e:Error) {
+  trace("native-window: this build has no window backend (" + e.message + ") -- nothing to check");
+  hasBackend = false;
+}
+
+if (hasBackend) {
+  w.bounds = new Rectangle(100, 100, 300, 200);
+  wSize.bounds = new Rectangle(900, 500, 300, 200);
+  wSize.visible = true;
+  w.visible = true;
+  w.addEventListener(NativeWindowBoundsEvent.RESIZE, function(e:NativeWindowBoundsEvent):void {
+    got.push("RESIZE(" + rr(e.beforeBounds) + "->" + rr(e.afterBounds) + ")");
+  });
+  w.addEventListener(NativeWindowBoundsEvent.MOVE, function(e:NativeWindowBoundsEvent):void {
+    got.push("MOVE(" + rr(e.beforeBounds) + "->" + rr(e.afterBounds) + ")");
+  });
+  setTimeout(phase1, 600);
+  setTimeout(phase2, 1200);
+  setTimeout(phase3, 1800);
+  setTimeout(phase4, 2400);
+}
+
+function phase1():void {
+  eq("minSize default", pt(w.minSize), defMin);
+  eq("maxSize default", pt(w.maxSize), "107374182,107374182");
+  // 钳制：低于平台地板抬到地板；高于当前 maxSize 压回 maxSize。
+  wSize.minSize = new Point(0, 0);
+  eq("minSize (0,0) clamps to the platform floor", pt(wSize.minSize), floorMin);
+  wSize.minSize = new Point(100, 10);
+  eq("minSize (100,10) keeps the taller axis", pt(wSize.minSize), isMac ? "100,32" : "136,39");
+  wSize.maxSize = new Point(1000, 800);
+  wSize.minSize = new Point(2000, 2000);
+  eq("a minSize above maxSize is pulled down to it", pt(wSize.minSize), "1000,800");
+  eq("...and maxSize itself is unchanged", pt(wSize.maxSize), "1000,800");
+  // 写下去的限制立刻作用在活窗口上（adl 实测：minSize=(1000,800) 后宽度变 1000；高度按 AIR 是
+  // 异步应用的，故只断言宽度这条即刻成立的）。
+  eq("a minSize write resizes the live window", wSize.width, 1000);
+  // getter 每次都是新对象（adl：`w.minSize === w.minSize` 为 false）。
+  eq("minSize returns a fresh Point", wSize.minSize === wSize.minSize, false);
+  wSize.minSize = new Point(2, 32);
+  wSize.maxSize = new Point(107374182, 107374182);
+}
+
+function phase2():void {
+  // 程序化改 bounds：帧边界派发 RESIZE + MOVE，before 是本帧开始的矩形。
+  w.bounds = new Rectangle(200, 200, 500, 400);
+}
+
+function phase3():void {
+  eq("bounds= dispatches RESIZE then MOVE with the frame-start before rect",
+    got.join(" | "), "RESIZE(100,100 300x200->200,200 500x400) | MOVE(100,100 300x200->200,200 500x400)");
+  got = [];
+
+  // owner / listOwnedWindows：只有 owner 是本窗口的那个窗口才在里面。
+  var oo:NativeWindowInitOptions = new NativeWindowInitOptions();
+  oo.owner = w;
+  w2 = new NativeWindow(oo);
+  w2.bounds = new Rectangle(700, 200, 300, 200);
+  w2.visible = true;
+  w2.addEventListener(Event.CLOSE, function(e:Event):void { gotClose = true; });
+  eq("w.listOwnedWindows() has one entry", w.listOwnedWindows().length, 1);
+  eq("...and its element IS the owned window object", w.listOwnedWindows()[0] === w2, true);
+  eq("w2.owner IS w", w2.owner === w, true);
+  eq("w2.listOwnedWindows() is empty", w2.listOwnedWindows().length, 0);
+  w2.close();
+  eq("close() leaves closed false for the rest of the call", w2.closed, false);
+}
+
+function phase4():void {
+  eq("the window is closed at the next frame boundary", w2.closed, true);
+  eq("...and Event.CLOSE arrived", gotClose, true);
+  // 真实系统拖拽：AIR 回 true（本示例放在最后，拖拽闩锁随进程退出一起消失）。
+  eq("startMove() reports a started drag", w.startMove(), true);
+  eq("startResize(bottomRight) reports a started resize", w.startResize(NativeWindowResize.BOTTOM_RIGHT), true);
+
+  if (fails.length == 0) {
+    trace("native-window: " + pass + " checks passed");
+  } else {
+    trace("native-window: " + pass + " passed, " + fails.length + " FAILED");
+    for (var i:int = 0; i < fails.length; i++) trace("FAIL " + fails[i]);
+  }
+  NativeApplication.nativeApplication.exit();
+}
+
+stage.showWindow(300, 200, "native-window example");

@@ -46,7 +46,7 @@
 
 // SK_DIRECT3D gates the D3D-specific constructors in Skia's public headers
 // (GrDirectContext::MakeDirect3D, and GrD3DTypes.h's contents). Skia's own build
-// sets it via `skia_use_direct3d = true` (see vendor/build-windows-deps.ps1, which
+// sets it via `skia_use_direct3d = true` (see vendor/provision/windows.ps1, which
 // turns it on for the Windows archives); a consumer of those prebuilt .lib files
 // must define it here for the same reason metal_glue.mm defines SK_METAL. SK_GANESH
 // is also required: SkTypes.h #undefs the backend macro unless a GPU backend is

@@ -67,7 +67,9 @@ const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as']);
 // read-only reference for API-surface research (e.g. the stage-86 reflection
 // functions). It needs namespace/XML/E4X and the full Starling Stage3D surface —
 // features that land in later stages — so it is skipped rather than treated as a
-// passing regression unit.
+// passing regression unit. As of 阶段一百九十八 the directory is an external,
+// untracked clone like Flappy-Starling (.gitignore `examples/air-starling-demo`);
+// see examples/EXTERNAL-FIXTURES.md.
 // `Flappy-Starling` (Josh Tynjala's Starling game, cloned into examples/ on
 // 2026-09-26) is the same kind of third-party, read-only reference. It now builds
 // and runs end to end (stage 89·33 named function expressions, 89·36 the NULL
@@ -96,7 +98,26 @@ const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as']);
 // whose createExtensionContext() answers null for the very id under test. Its own
 // serial case is registered after the pool (see "example: ane-app" below), the same
 // arrangement air-native has.
-const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'ane-app']);
+//
+// `url-test` is here because it is an EXTERNAL, gitignored probe app
+// (.gitignore `examples/url-test`), like the third-party trees above. It is listed
+// even though its two sources compile fine, because listing it is what makes the
+// corpus deterministic: without the entry, a local clone WAS compiled as a
+// directory unit (`example: url-test/ (dir unit)`) while a fresh clone / CI never
+// ran it -- so one `node test.ts` tested different things on different machines.
+// A gitignored directory must not silently be a regression input; see
+// examples/EXTERNAL-FIXTURES.md.
+//
+// `audio` is here for the same reason as `ane-app`, one step weaker: its single
+// entry (`AudioPlayer.as`) is a WINDOWED program (it prints its self-check from
+// inside a real window, because SoundChannel's soundComplete is dispatched at the
+// frame boundary -- see src/runtime.ts as_audio_tick), so running it as a
+// directory unit would open a window and sit there until the 60 s budget killed
+// it. Compile+link is what matters for the suite -- the case is registered after
+// the pool as "example: audio/ (windowed: compile+link only)". Note this is NOT
+// the same as examples/audio.as (a top-level file, run normally): that one drives
+// synthesized PCM through loadPCMFromByteArray with no window at all.
+const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'url-test', 'ane-app', 'audio']);
 // GreenSock core files that air-native's TweenDemo actually reaches. Only these
 // are pulled in; the rest of com/greensock (easing/loading/other plugins) stays
 // outside the subset and is not compiled.
@@ -401,6 +422,60 @@ test('example: air-native (--air-app + renderMode=direct: compile+link only)', a
     '--target', 'native', '-o', scratchOut('air-native-app')],
     { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
   console.log('PASS  air-native (--air-app)');
+});
+
+test('example: native-window.as (windowed: compile+link only)', async (t) => {
+  // A windowed program is not part of the run suite -- native-window.as opens a real
+  // window, ticks on the application frame clock and only returns when
+  // nativeApplication.exit() is reached -- but it is where every NativeWindow pin in
+  // test/unit/platform.ts is read from, so it has to keep COMPILING and LINKING.
+  // (Manual run: `node src/index.ts examples/native-window.as
+  //  --manifest examples/window.build.example.json --run`.)
+  const manifest = join(dir, 'window.build.example.json');
+  const vendorLibs = ['skia', 'sdl2'].map((v) => join(root, 'vendor', v));
+  if (!existsSync(manifest) || !vendorLibs.every((p) => existsSync(p))) {
+    console.log('SKIP  native-window (needs the native Skia/SDL2 vendor libs)');
+    t.skip('needs vendor/skia and vendor/sdl2');
+    return;
+  }
+  // Serial, like the air-native case above: it links ~20 MB of static libraries.
+  await runAsync('node', ['src/index.ts', 'examples/native-window.as',
+    '--manifest', manifest, '-o', scratchOut('native-window')],
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
+  console.log('PASS  native-window (compile+link)');
+});
+
+// The encoded-audio path: Sound.load(URLRequest) over a real .mp3 fixture, then
+// SoundChannel playback and soundComplete.
+//
+// Neither existing audio example covers it. `examples/audio.as` feeds synthesized
+// PCM to loadPCMFromByteArray and `examples/embed.as` decodes an mp3 embedded at
+// compile time -- so the whole FILE-loading route (bytesLoaded/bytesTotal/url/id3
+// after an asynchronous load) had no regression input at all, and the three pins
+// that used to assert it were reading a THIRD-PARTY Starling sample's AssetManager
+// (deleted with the external fixtures in 阶段一百九十八). This one is self-owned.
+//
+// It is WINDOWED and therefore compile+link only: soundComplete is dispatched by
+// as_audio_tick() from the window frame loop, so the example must run inside a real
+// window -- which is also why `audio/` is in SKIP_DIRS above. The 23 self-checks run
+// on a manual windowed launch (`--run`, see the source header for the command).
+// Serial like the two cases above: it compiles the Skia/SDL2/miniaudio glue from
+// source and links ~20 MB of static libraries.
+test('example: audio/ (windowed: compile+link only)', async (t) => {
+  const entry = join(dir, 'audio', 'AudioPlayer.as');
+  const manifest = join(dir, 'audio', 'player.build.json');
+  const fixture = join(dir, 'audio', 'clip.mp3');
+  const vendorLibs = ['skia', 'sdl2'].map((v) => join(root, 'vendor', v));
+  if (!existsSync(entry) || !existsSync(manifest) || !existsSync(fixture)
+      || !vendorLibs.every((p) => existsSync(p))) {
+    console.log('SKIP  audio/ (needs the native Skia/SDL2 vendor libs and examples/audio/clip.mp3)');
+    t.skip('needs vendor/skia, vendor/sdl2 and examples/audio/{AudioPlayer.as,player.build.json,clip.mp3}');
+    return;
+  }
+  await runAsync('node', ['src/index.ts', entry,
+    '--manifest', manifest, '-o', scratchOut('audio-player')],
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
+  console.log('PASS  audio/ (compile+link)');
 });
 
 // The DESCRIPTOR-to-extension chain, end to end: an app whose app.xml declares

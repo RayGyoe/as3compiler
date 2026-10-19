@@ -357,6 +357,13 @@ struct WinCtx {
   int always_in_front;
   int dirty;
   int destroy_pending;
+  // The user (or the OS) asked this window to close -- its close button, its Cmd-W
+  // equivalent, or a session shutdown. This is NOT teardown: AIR makes it a
+  // cancelable Event.CLOSING first, so the request is parked here until the AS3
+  // side answers (sk_window_take_close_request + sk_window_close, or nothing at all
+  // when a listener called preventDefault()). Keeping it apart from
+  // destroy_pending is what makes that choice possible.
+  int close_request;
   int in_watch;
   sk_mouse_cb on_mouse;
   sk_wheel_cb on_wheel;
@@ -374,9 +381,25 @@ struct WinCtx {
   sk_frame_cb on_frame;
   sk_frame_delay_cb on_frame_delay;
   sk_close_cb on_close;
+  // NativeWindow.startMove()/startResize(): an in-progress SYSTEM drag that AS3
+  // started but the pointer drives. 0 = idle, 1 = moving, 2 = resizing. The
+  // start snapshot (global pointer + frame rect) is what each mouseMove is
+  // measured against, so the window tracks the pointer exactly instead of
+  // accumulating per-event rounding.
+  int sys_drag;
+  int sys_gx, sys_gy;
+  int sys_x, sys_y, sys_w, sys_h;
+  int sys_t, sys_b, sys_l, sys_r;
+  // NativeWindow.minSize/maxSize, enforced by the window manager while the user
+  // drags an edge. 0 means "no limit" in that direction.
+  int min_w, min_h, max_w, max_h;
 };
 
 static WinCtx g_wins[SK_MAX_WINDOWS];
+// The largest size a window can be given. It is AIR's own default maximum
+// (measured 107374182 on adl 51.4.1, both platforms), and anything at or above it
+// means "no limit" to sk_window_set_limits.
+#define SK_LIMIT_UNBOUNDED 107374182
 // NativeApplication.exit() sets this; sk_run_loop consumes it and retires every
 // window through the normal teardown path (see sk_window_request_exit).
 static int g_exit_requested = 0;
@@ -953,6 +976,81 @@ static int    g_mod_last_down = -1;
 static int    g_mod_last_valid = 0;
 #endif
 
+// ---------- system move/resize (NativeWindow.startMove / startResize) ----------
+// AIR's startMove()/startResize() hand the drag over to the window manager: the
+// app keeps receiving mouse events, but the OS now moves/resizes the frame until
+// the button comes up. macOS can do that natively (performWindowDragWithEvent:),
+// but that call is ObjC/platform-specific while our window layer is SDL — and SDL
+// exposes no "begin system drag" entry point. So the drag is driven here: the
+// pointer's global position is sampled on every mouseMove and the frame is
+// re-placed relative to the snapshot taken at the start, which reproduces the
+// same observable behaviour (window follows the pointer, one MOVE per step, ends
+// on button-up) on every backend.
+static void sk_sys_drag_begin(WinCtx* c, int mode, int t, int b, int l, int r) {
+  if (c == NULL || c->win == NULL) return;
+  int gx = 0, gy = 0;
+  SDL_GetGlobalMouseState(&gx, &gy);
+  int px = 0, py = 0, cw = 0, ch = 0;
+  SDL_GetWindowPosition(c->win, &px, &py);
+  SDL_GetWindowSize(c->win, &cw, &ch);
+  c->sys_drag = mode;
+  c->sys_gx = gx; c->sys_gy = gy;
+  // The snapshot is the FRAME rect (what NativeWindow.bounds reports), because
+  // that is the rectangle the user sees; SDL works in client coordinates, so the
+  // conversion happens on the way back out.
+  c->sys_x = px - c->b_left;
+  c->sys_y = py - c->b_top;
+  c->sys_w = cw + c->b_left + c->b_right;
+  c->sys_h = ch + c->b_top + c->b_bottom;
+  c->sys_t = t; c->sys_b = b; c->sys_l = l; c->sys_r = r;
+}
+
+// Re-place the frame for the pointer's current global position. Called from the
+// mouseMove handler, so a drag costs one SetWindowPosition/SetWindowSize per
+// motion event — the same pacing the OS's own drag loop produces.
+static void sk_sys_drag_step(WinCtx* c) {
+  if (c == NULL || c->win == NULL || c->sys_drag == 0) return;
+  int gx = 0, gy = 0;
+  SDL_GetGlobalMouseState(&gx, &gy);
+  int dx = gx - c->sys_gx;
+  int dy = gy - c->sys_gy;
+  if (c->sys_drag == 1) {
+    SDL_SetWindowPosition(c->win, c->sys_x + dx, c->sys_y + dy);
+    return;
+  }
+  // Resizing: the dragged edges move with the pointer, the opposite ones stay.
+  int nx = c->sys_x, ny = c->sys_y, nw = c->sys_w, nh = c->sys_h;
+  if (c->sys_l) { nx = c->sys_x + dx; nw = c->sys_w - dx; }
+  if (c->sys_r) { nw = c->sys_w + dx; }
+  if (c->sys_t) { ny = c->sys_y + dy; nh = c->sys_h - dy; }
+  if (c->sys_b) { nh = c->sys_h + dy; }
+  // AIR's minSize/maxSize bound the FRAME, and they are what stops a drag from
+  // inverting the window; the client area shrinks by the borders.
+  if (c->min_w > 0 && nw < c->min_w) {
+    if (c->sys_l) nx -= (c->min_w - nw);
+    nw = c->min_w;
+  }
+  if (c->min_h > 0 && nh < c->min_h) {
+    if (c->sys_t) ny -= (c->min_h - nh);
+    nh = c->min_h;
+  }
+  if (c->max_w > 0 && nw > c->max_w) {
+    if (c->sys_l) nx -= (nw - c->max_w);
+    nw = c->max_w;
+  }
+  if (c->max_h > 0 && nh > c->max_h) {
+    if (c->sys_t) ny -= (nh - c->max_h);
+    nh = c->max_h;
+  }
+  int cw = nw - c->b_left - c->b_right;
+  int ch = nh - c->b_top - c->b_bottom;
+  if (cw < 1) cw = 1;
+  if (ch < 1) ch = 1;
+  if (nx != c->sys_x || ny != c->sys_y) SDL_SetWindowPosition(c->win, nx, ny + c->b_top);
+  if (cw + c->b_left + c->b_right != c->sys_w || ch + c->b_top + c->b_bottom != c->sys_h)
+    SDL_SetWindowSize(c->win, cw, ch);
+}
+
 // The shared event loop. Every window is polled, paced and presented from here;
 // the loop runs until no window is left (AIR's NativeApplication.autoExit
 // behaviour, which is what SDL's own "quit on last window close" matches).
@@ -1001,10 +1099,13 @@ static void sk_run_loop(void) {
       switch (e.type) {
         case SDL_WINDOWEVENT:
           if (e.window.event == SDL_WINDOWEVENT_CLOSE) {
-            // The user (or the OS) asked this window to go away. Route it through
-            // the same deferred teardown close() uses, so the CLOSE dispatch and
-            // the `closed` flag behave identically for both paths.
-            c->destroy_pending = 1;
+            // The user (or the OS) asked this window to go away. AIR reports that as
+            // a cancelable Event.CLOSING, so it is parked and handed to the AS3 side
+            // (which either closes the window through the normal teardown, or --
+            // when a listener prevented the default -- does nothing). A window
+            // nobody listens for still closes: the AS3 side closes it on the very
+            // next frame.
+            c->close_request = 1;
           } else if (e.window.event == SDL_WINDOWEVENT_EXPOSED) {
             c->dirty = 1;
           } else if (e.window.event == SDL_WINDOWEVENT_LEAVE) {
@@ -1016,6 +1117,10 @@ static void sk_run_loop(void) {
           // SIZE_CHANGED/RESIZED are handled by live_resize_watch during pump.
           break;
         case SDL_MOUSEMOTION:
+          // A system drag owns the pointer: re-place the frame first so the
+          // mouseMove the app sees already describes the new geometry, which is
+          // the order AIR's own drag loop produces.
+          sk_sys_drag_step(c);
           if (c->on_mouse) {
             c->on_mouse(id, (double)e.motion.x, (double)e.motion.y, "mouseMove");
             c->dirty = 1;
@@ -1040,6 +1145,7 @@ static void sk_run_loop(void) {
           }
           break;
         case SDL_MOUSEBUTTONUP:
+          if (e.button.button == SDL_BUTTON_LEFT) c->sys_drag = 0;
           if (e.button.button == SDL_BUTTON_LEFT && c->on_mouse) {
             c->on_mouse(id, (double)e.button.x, (double)e.button.y, "mouseUp");
             // Second click of a double click: AIR REPLACES that click with a
@@ -1189,6 +1295,12 @@ static void sk_run_loop(void) {
 
 // Common window setup shared by the main window and every NativeWindow. Returns
 // the registry id, or -1 on failure.
+// Size limits of a fresh window and the floor a minSize assignment is clamped to.
+// Defined with the rest of the minSize/maxSize support further down; declared here
+// because window creation is what installs the defaults.
+static void sk_window_size_defaults(int* mnw, int* mnh, int* mxw, int* mxh);
+static void sk_window_size_floor(int* fw, int* fh);
+
 static int sk_open_window(int w, int h, const char* title, int decorated, int visible, int fullscreen, int highdpi, int is_main) {
   Uint32 winFlags = visible ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN;
 #ifndef ASC_WINDOW_FIXED
@@ -1218,6 +1330,13 @@ static int sk_open_window(int w, int h, const char* title, int decorated, int vi
   c->visible = visible;
   c->pixfmt = SDL_MasksToPixelFormatEnum(32, 0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u);
   sk_measure_borders(c, decorated);
+  // NativeWindow.minSize/maxSize start at AIR's own defaults for this platform —
+  // set HERE so both entry points (sk_window_show* for the app's initial window,
+  // sk_window_create for a `new NativeWindow()`) get them, and so the numbers live
+  // next to the other platform measurements. See sk_window_size_defaults.
+  int dmnw = 0, dmnh = 0, dmxw = 0, dmxh = 0;
+  sk_window_size_defaults(&dmnw, &dmnh, &dmxw, &dmxh);
+  c->min_w = dmnw; c->min_h = dmnh; c->max_w = dmxw; c->max_h = dmxh;
   return id;
 }
 
@@ -1767,6 +1886,117 @@ void sk_window_get_borders(int id, int* top, int* left, int* bottom, int* right)
   if (right) *right = c->b_right;
 }
 
+// ---------- NativeWindow minSize/maxSize ----------
+// AIR's initial window size limits, per platform, and the floor a later minSize
+// assignment is clamped to. These are AIR's own numbers, NOT the platform's: a bare
+// NSWindow reports minSize (0,32) and maxSize FLT_MAX (measured with a 20-line
+// Cocoa probe, temp/nwmac/nswin.m), while adl 51.4.1 answers (78,32) and
+// (107374182,107374182) on macOS. The floor is the OS's minimum CONTENT size and is
+// separately measurable: `minSize = (0,0)` reads back (2,32) and (100,10) reads back
+// (100,32) on macOS (temp/nwmac/limits-out.txt).
+//
+// The Windows column (min 136x39) comes from the Windows-side measurement of the
+// same getter; its maximum is assumed to be the same 107374182 constant and its
+// floor is assumed to equal its minimum window size — the two Windows numbers this
+// host cannot verify, which is why they are spelled out here rather than derived.
+static void sk_window_size_defaults(int* mnw, int* mnh, int* mxw, int* mxh) {
+#ifdef _WIN32
+  if (mnw) *mnw = 136; if (mnh) *mnh = 39;
+#else
+  if (mnw) *mnw = 78; if (mnh) *mnh = 32;
+#endif
+  if (mxw) *mxw = 107374182; if (mxh) *mxh = 107374182;
+}
+
+static void sk_window_size_floor(int* fw, int* fh) {
+#ifdef _WIN32
+  if (fw) *fw = 136; if (fh) *fh = 39;
+#else
+  if (fw) *fw = 2; if (fh) *fh = 32;
+#endif
+}
+
+void sk_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh) {
+  sk_window_size_defaults(mnw, mnh, mxw, mxh);
+}
+
+void sk_window_limits_floor(int* fw, int* fh) {
+  sk_window_size_floor(fw, fh);
+}
+
+// NativeWindow.minSize/maxSize. Stored here because they are a property of the OS
+// window (a resize drag must respect them), and read back by the AS3 getters — so
+// the clamp AIR applies is applied to one set of values, not to a copy of them.
+void sk_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh) {
+  WinCtx* c = sk_slot(id);
+  if (mnw) *mnw = (c != NULL) ? c->min_w : 0;
+  if (mnh) *mnh = (c != NULL) ? c->min_h : 0;
+  if (mxw) *mxw = (c != NULL) ? c->max_w : 0;
+  if (mxh) *mxh = (c != NULL) ? c->max_h : 0;
+}
+
+void sk_window_set_limits(int id, int mnw, int mnh, int mxw, int mxh) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL) return;
+  c->min_w = mnw; c->min_h = mnh; c->max_w = mxw; c->max_h = mxh;
+  if (c->win == NULL) return;
+  // SDL has no "frame" size limits, only client ones, and the frame limits are
+  // enforced by sk_sys_drag_step during a startResize drag — these calls only need
+  // to stop the USER's own edge drag from leaving the range. 0 means "no limit" in
+  // our vocabulary and SDL spells that as "any" when the value is <= 0.
+  int cw = (mnw > 0) ? mnw - c->b_left - c->b_right : 0;
+  int ch = (mnh > 0) ? mnh - c->b_top - c->b_bottom : 0;
+  if (cw < 1) cw = 1;
+  if (ch < 1) ch = 1;
+  SDL_SetWindowMinimumSize(c->win, mnw > 0 ? cw : 0, mnh > 0 ? ch : 0);
+  // Only a max the app actually chose is installed: AIR's own default maximum
+  // (107374182, measured on adl 51.4.1) is what the AS3 side passes when nothing
+  // was set, and handing that to SDL would clamp the window to a limit no user can
+  // reach while making SDL believe a limit exists.
+  if (mxw > 0 && mxw < SK_LIMIT_UNBOUNDED && mxh > 0 && mxh < SK_LIMIT_UNBOUNDED) {
+    int cmw = mxw - c->b_left - c->b_right;
+    int cmh = mxh - c->b_top - c->b_bottom;
+    if (cmw < 1) cmw = 1;
+    if (cmh < 1) cmh = 1;
+    SDL_SetWindowMaximumSize(c->win, cmw, cmh);
+  } else {
+    SDL_SetWindowMaximumSize(c->win, 0, 0);
+  }
+}
+
+// NativeWindow.startMove(): hand the frame over to the pointer until the button
+// comes up. Returns AIR's true/false. A window that is maximized or minimized has
+// no frame to drag, and a non-resizable window cannot be resized, so those are the
+// false cases (AIR returns false for them too).
+int sk_window_start_move(int id) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL || c->win == NULL) return 0;
+  Uint32 flags = SDL_GetWindowFlags(c->win);
+  if (flags & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED)) return 0;
+  sk_sys_drag_begin(c, 1, 0, 0, 0, 0);
+  return 1;
+}
+
+// NativeWindow.startResize(): same, for one edge or corner. `edge` uses the values
+// of flash.display.NativeWindowResize ("T","B","L","R","TL","TR","BL","BR";
+// NONE is the empty string and is not a drag). A non-resizable window refuses.
+int sk_window_start_resize(int id, const char* edge) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL || c->win == NULL || edge == NULL) return 0;
+  if (!(SDL_GetWindowFlags(c->win) & SDL_WINDOW_RESIZABLE)) return 0;
+  int t = 0, b = 0, l = 0, r = 0;
+  for (const char* p = edge; *p != '\0'; p++) {
+    if (*p == 'T') t = 1;
+    else if (*p == 'B') b = 1;
+    else if (*p == 'L') l = 1;
+    else if (*p == 'R') r = 1;
+    else return 0;   // unknown edge: refuse rather than guess
+  }
+  if (!t && !b && !l && !r) return 0;
+  sk_sys_drag_begin(c, 2, t, b, l, r);
+  return 1;
+}
+
 // NativeApplication.exit(): stop the shared event loop at the next turn even
 // though windows are still open. The flag is consumed in sk_run_loop, which then
 // lets sk_service_destroy retire every window exactly like a natural shutdown, so
@@ -1788,12 +2018,30 @@ int sk_window_is_closed(int id) {
   return sk_slot(id) == NULL ? 1 : 0;
 }
 
+// Did the window manager ask this window to close since the last call? The AS3
+// side polls it once per frame: a request is answered with Event.CLOSING (which a
+// listener may cancel) and, unless it was cancelled, with close(). Taking the flag
+// clears it, so one gesture is reported exactly once.
+int sk_window_take_close_request(int id) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL) return 0;
+  int r = c->close_request;
+  c->close_request = 0;
+  return r;
+}
+
 // A NativeWindow is created hidden and raised by activate(), which per adl also
 // makes it visible — the two are one gesture there, so they are one call here.
 void sk_window_activate(int id) {
   WinCtx* c = sk_slot(id);
   if (c == NULL || c->win == NULL) return;
   if (!c->visible) { c->visible = 1; SDL_ShowWindow(c->win); c->dirty = 1; }
+  // AIR's activate() is "bring this window to the front and give it focus", and a
+  // minimized window has to come back first: adl 51.4.1 answers
+  // activate() on a minimized window with DISPLAY_STATE_CHANGE + ACTIVATE
+  // (temp/nwmac/ev-out-adl.txt t5b, whose displayState reads back "normal"). SDL
+  // needs the explicit restore — raising a minimized window leaves it minimized.
+  if (SDL_GetWindowFlags(c->win) & SDL_WINDOW_MINIMIZED) SDL_RestoreWindow(c->win);
   SDL_RaiseWindow(c->win);
 }
 

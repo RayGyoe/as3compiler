@@ -431,6 +431,12 @@ int sk_window_get_visible(int id) { (void)id; return 0; }
 void sk_window_set_title(int id, const char* title) { (void)id; (void)title; }
 void sk_window_set_bounds(int id, int x, int y, int w, int h) { (void)id; (void)x; (void)y; (void)w; (void)h; }
 void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h) { (void)id; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; }
+// Frame borders do not exist in a page: the stage IS the window, so the border is
+// zero and NativeWindow.bounds and globalToScreen coincide (see the AS3 comment on
+// as_window_get_borders).
+void sk_window_get_borders(int id, int* top, int* left, int* bottom, int* right) {
+  (void)id; if (top) *top = 0; if (left) *left = 0; if (bottom) *bottom = 0; if (right) *right = 0;
+}
 void sk_window_close(int id) { (void)id; }
 int sk_window_is_closed(int id) { (void)id; return 1; }
 void sk_window_activate(int id) { (void)id; }
@@ -444,6 +450,39 @@ void sk_window_get_pixel_size(int id, int* pw, int* ph) { (void)id; if (pw) *pw 
 void sk_window_get_client_size(int id, int* lw, int* lh) { (void)id; if (lw) *lw = 0; if (lh) *lh = 0; }
 int sk_window_is_active(int id) { (void)id; return 0; }
 void sk_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
+// minSize/maxSize and the system move/resize drags have no browser counterpart:
+// a page's window belongs to the browser, so there is no frame to size-limit and
+// no frame to hand over to the pointer. "No limit" and "the drag did not start"
+// are the honest answers; the generated C turns the latter into AIR's `false`
+// (Beta 1 note: the browser's window is not scriptable, so this is a platform
+// boundary, not a missing feature).
+void sk_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh) {
+  (void)id;
+  if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+}
+void sk_window_set_limits(int id, int mnw, int mnh, int mxw, int mxh) {
+  (void)id; (void)mnw; (void)mnh; (void)mxw; (void)mxh;
+}
+// No window manager, so nothing to clamp against: a zero floor lets minSize answer
+// with whatever was written (see the note on sk_window_get_limits above).
+void sk_window_limits_floor(int* fw, int* fh) { if (fw) *fw = 0; if (fh) *fh = 0; }
+// No OS window exists on web at all, so there is no platform default to report;
+// zeros keep the getter honest instead of inventing a window manager's numbers.
+void sk_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh) {
+  if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+}
+int sk_window_start_move(int id) { (void)id; return 0; }
+int sk_window_start_resize(int id, const char* edge) { (void)id; (void)edge; return 0; }
+// A browser tab's close button is the browser's to own: the page never sees it, so
+// there is never a pending request -- but the generated C asks once per frame, so
+// the stub has to exist for this backend to link.
+int sk_window_take_close_request(int id) { (void)id; return 0; }
+// NativeApplication.exit(): ask the shared event loop to end. A page cannot end its
+// own browser process, and this backend never defines ASC_USE_WINDOW today, so the
+// call is not even compiled -- the stub exists so that the two backends stay in
+// step if web ever gains a window loop (the seam parity pin in
+// test/unit/platform.ts checks exactly this pair).
+void sk_window_request_exit(void) {}
 // Composed-text seam (native window_glue.cc drains SDL_TEXTINPUT/SDL_TEXTEDITING
 // through these). On web the whole keyboard transport is unwired — see the note in
 // sk_window_show above — so there is no composed-text queue to drain and no OS

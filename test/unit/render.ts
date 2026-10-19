@@ -1267,11 +1267,19 @@ function checkSwcBaseClass(): string[] {
     'swc.ts carries them on the extracted library');
 
   // --- binding the symbol to a project base class (the stage-191 fix) ---
-  ck(/const baseName = lib\.bases\.get\(charId\) \?\? \{ baseName: '', dynamic: false \};/.test(swc) &&
-    /swcDisplayClassDecl\(name, pkg, kind, script, baseName\.baseName, baseName\.dynamic\)/.test(swc),
+  ck(/const base = lib\.bases\.get\(charId\) \?\? \{ baseName: '', dynamic: false \};/.test(swc) &&
+    /const baseName = availableProjectBase\(base\.baseName, hasProjectClass\);/.test(swc) &&
+    /swcDisplayClassDecl\(name, pkg, kind, script, baseName, base\.dynamic\)/.test(swc),
     'the character binding reports each symbol class its base AND its dynamic trait');
-  ck(/const projectBase = baseName\.length > 0 && !baseName\.startsWith\('flash\.display\.'\) \? baseName : '';/.test(swc),
-    'a base the project compiles from source outranks the stock artwork superclass');
+  ck(/if \(baseName\.length === 0 \|\| baseName\.startsWith\('flash\.display\.'\)\) return '';/.test(swc) &&
+    /if \(hasProjectClass\(baseName\)\) return baseName;/.test(swc) &&
+    /const projectBase = baseName\.length > 0 && !baseName\.startsWith\('flash\.display\.'\) \? baseName : '';/.test(swc),
+    'a base the project compiles from source outranks the stock artwork superclass -- and only when it compiles it');
+  ck(/export function swcCompileInputs\(\s*lib: SwcLibrary,/.test(swc) &&
+    /hasProjectClass: \(fqn: string\) => boolean = \(\) => false/.test(swc) &&
+    /const declaredFqn = new Set<string>\(\)/.test(index) &&
+    /swcCompileInputs\(lib, \(fqn\) => declaredFqn\.has\(fqn\)\)/.test(index),
+    'the caller supplies that answer from the sources it is compiling (index.ts), and the artwork-only default says "no"');
   ck(/superClass: projectBase\.length > 0 \? splitFqn\(projectBase\)\.name : builtin,/.test(swc),
     '...and becomes the synthesized class superclass (short name, as a source `extends` clause)');
   ck(/projectBase\.length > 0 \? projectBase : builtin,/.test(swc),
@@ -1333,7 +1341,10 @@ function checkSwcBaseClass(): string[] {
     [232, 'flash.display.SimpleButton', true],
     [233, 'flash.display.MovieClip', false],
   ]);
-  const inputs = swcCompileInputs(lib);
+  // The caller answers "does THIS compilation provide that class" (index.ts passes the
+  // set of sources it is compiling). Here the base is provided -- that is the app case.
+  const provided = (fqn: string): boolean => fqn === 'com.example.controls.ComBoBox';
+  const inputs = swcCompileInputs(lib, provided);
   type Decl = { kind: string; name: string; superClass?: string | null; isDynamic?: boolean; imports?: string[] };
   const declOf = (n: string): Decl | undefined =>
     (inputs.decls as unknown as Decl[]).find((d) => d.kind === 'ClassDecl' && d.name === n);
@@ -1343,6 +1354,30 @@ function checkSwcBaseClass(): string[] {
   const sealed = declOf('probeSealed');
   ck(widget !== undefined && widget.superClass === 'ComBoBox',
     'a symbol based on a project class is emitted as a subclass of THAT class');
+  // The other half of the same rule, and the reason it exists: a base the compilation
+  // does NOT provide cannot even be declared (`unknown superclass`), because the
+  // library's own copy of that class is ABC we do not compile (swc.md §3.3). Falling
+  // back to the artwork superclass is announced, never silent -- five SWC examples and
+  // the whole `render/SwcTimeline` group broke on this before the fallback existed.
+  {
+    const errs: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (s: string) => boolean }).write = (chunk: string): boolean => { errs.push(String(chunk)); return true; };
+    let missing: ReturnType<typeof swcCompileInputs>;
+    try { missing = swcCompileInputs(lib); } finally {
+      (process.stderr as unknown as { write: unknown }).write = realWrite;
+    }
+    const mw = (missing.decls as unknown as Decl[]).find((d) => d.kind === 'ClassDecl' && d.name === 'probeWidget');
+    ck(mw !== undefined && mw.superClass === 'flash.display.MovieClip' &&
+      (mw.imports ?? []).length === 1 && mw.imports?.[0] === 'flash.display.MovieClip',
+      'a base this compilation does NOT provide falls back to the artwork superclass (and drops the dangling import)');
+    ck(missing.chars[0].baseName === '',
+      '...and the character spec drops it too, so nothing downstream still names the absent class');
+    ck(errs.filter((e) => e.includes("extends 'com.example.controls.ComBoBox'")).length === 1,
+      '...loudly, once per missing base, never silently');
+    ck(mw?.isDynamic === true,
+      '...while the ABC dynamic trait is still reproduced (the fallback changes the base, not the trait)');
+  }
   ck(widget !== undefined && (widget.imports ?? []).includes('com.example.controls.ComBoBox'),
     '...with the base imported so symbol collection resolves it');
   ck(art !== undefined && art.superClass === 'flash.display.MovieClip',

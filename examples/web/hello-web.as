@@ -5,8 +5,9 @@
 // 蓝色矩形和一行文字；文字字体在运行时从网络加载（见 hello-web.build.json 的
 // font-urls）。
 //
-// 示例字体用 Arial.ttf（英文验证）；如需 CJK，把 font-urls 换成 CJK 字体（如
-// STHeiti/MiSans）并将文本换成中文。
+// 示例字体用 Arial.ttf（英文验证）；如需 CJK，把 font-urls 换成一份 CJK 字体并将
+// 文本换成中文。仓库里已有一份可直接指过去：examples/air-native/fonts/MiSans-Regular.ttf
+// （那是 air-native 描述符的字体；此处不再放第二份拷贝）。
 //
 // 编译（需 Emscripten SDK + wasm 版 Skia，见 docs/zh-cn/html5-web.md）：
 //   as-aot examples/web/hello-web.as --manifest examples/web/hello-web.build.json

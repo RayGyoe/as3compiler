@@ -377,6 +377,21 @@ function checkTextInput(): string[] {
   const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
   check('the window glue feeds SDL_TEXTINPUT through the reserved textInput key type',
     glue.includes('case SDL_TEXTINPUT:') && glue.includes('on_key(id, "textInput", 0, 0, 0)') && glue.includes('SDL_StartTextInput();'));
+  // Text input is started EXACTLY ONCE, at window creation, and never re-issued on
+  // focus gain. Measured on macOS/SDL 2.32.10 (temp/keyprobe, A/B, 2026-10-19): a
+  // window that only ever got the creation-time call receives SDL_TEXTINPUT from the
+  // app's first keystroke, and SDL itself handles the lose/regain-focus transition --
+  // its own header says desktop platforms start text input implicitly at video init.
+  // A SDL_WINDOWEVENT_FOCUS_GAINED handler calling SDL_StartTextInput() was added once
+  // on the strength of "clicking the field focused it but no textInput ever fired";
+  // that observation was an artifact of testing under a CJK input method (letters
+  // enter the IME's composition and emit nothing until Enter commits them), it did not
+  // reproduce under the A/B, and the handler was removed. This pin keeps it from being
+  // re-added on the same non-evidence -- if a future backend really does need it, this
+  // check is where the reason has to be written down.
+  const startCalls = glue.match(/SDL_StartTextInput\(\);/g) ?? [];
+  check('the glue starts text input once (at creation), never on focus gain',
+    startCalls.length === 1 && !/FOCUS_GAINED[\s\S]{0,800}?SDL_StartTextInput\(\)/.test(glue));
   check('the glue routes SDL_TEXTINPUT by its own window id',
     glue.includes('e.text.windowID'));
   check('window_glue exposes sk_window_text_take',

@@ -70,6 +70,9 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 // malloc_zone_pressure_relief: the macOS allocator only returns freed pages to
 // the OS when asked (see gc_trim_os below).
 #include <malloc/malloc.h>
+// sysctlbyname("kern.osproductversion"): the macOS *product* version that AIR
+// appends to the family name in Capabilities.os (see as_cap_os below).
+#include <sys/sysctl.h>
 #elif defined(_WIN32)
 // <windows.h> pulls in <wingdi.h>, whose GDI Rectangle() function collides with
 // the C struct that flash.geom.Rectangle compiles to (typedef struct Rectangle
@@ -8194,6 +8197,25 @@ typedef struct as_gdraw {
     struct as_gdraw* next;
 } as_gdraw;
 
+// NativeWindow.supportsMenu / supportsNotification: AIR answers these from the OS,
+// not from its own build. Measured on adl 51.4.1 -- macOS false/false
+// (temp/nwmac/nwmac-out.txt), Windows true/true -- and AIR documents window menus
+// and notifications as Windows/Linux features. Macros (not runtime probes) so the
+// generated static field stays a compile-time constant on every target.
+//
+// Same placement rule as the AS_CURSOR_* kinds below: the class's static fields are
+// part of the generated CLASS section, which every build emits, so a definition that
+// lives inside a backend branch is a definition that is missing whenever a different
+// branch is taken. Measured the hard way -- these sat in the ASC_USE_SKIA region and
+// a pure-C build of the windowed example answered "use of undeclared identifier
+// 'ASC_NW_SUPPORTS_MENU'" (2026-10-19).
+#if defined(_WIN32) || defined(__linux__)
+  #define ASC_NW_SUPPORTS_MENU true
+  #define ASC_NW_SUPPORTS_NOTIFICATION true
+#else
+  #define ASC_NW_SUPPORTS_MENU false
+  #define ASC_NW_SUPPORTS_NOTIFICATION false
+#endif
 // Mouse pointer shapes. The generated C names the kinds AS_CURSOR_* and the
 // window glue keeps its own copies named SK_CURSOR_*; the two lists must stay in
 // step. The generated cursor sampler (ASC_cursor_kind_of_name) references them in
@@ -8583,6 +8605,9 @@ extern void sk_window_get_borders(int id, int* top, int* left, int* bottom, int*
 extern void sk_window_request_exit(void);
 extern void sk_window_close(int id);
 extern int sk_window_is_closed(int id);
+// Did the user ask this window to close (its close button)? Taken by the AS3
+// frame, which reports it as the cancelable Event.CLOSING.
+extern int sk_window_take_close_request(int id);
 extern void sk_window_activate(int id);
 // Mouse pointer shape. The kinds themselves are defined once, above the backend
 // branches (AS_CURSOR_*). SDL2 has no per-window cursor API and no "button"
@@ -8599,6 +8624,24 @@ extern void sk_window_get_pixel_size(int id, int* pw, int* ph);
 extern void sk_window_get_client_size(int id, int* lw, int* lh);
 extern int sk_window_is_active(int id);
 extern void sk_window_set_always_in_front(int id, int on);
+// NativeWindow.minSize/maxSize. The limits live in the glue (0 = unlimited) and
+// are what the window manager enforces while the user drags an edge; the AS3 side
+// keeps its own copy because AIR's getters report the last value written, even on
+// a platform that cannot honour it.
+extern void sk_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh);
+extern void sk_window_set_limits(int id, int mnw, int mnh, int mxw, int mxh);
+// AIR's per-platform defaults for a fresh window's minSize/maxSize, and the floor a
+// later minSize assignment is clamped to. Both live in the platform layer, next to
+// the other measurements of what the OS actually enforces.
+extern void sk_window_limits_floor(int* fw, int* fh);
+// The same two numbers, readable before any OS window exists (see the note on
+// as_window_limits_default).
+extern void sk_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh);
+// NativeWindow.startMove()/startResize(): begin a pointer-driven system drag.
+// Returns 1 when the drag was started (AIR's true), 0 when the window cannot be
+// dragged at all (closed/maximized/not resizable), which is also AIR's false.
+extern int sk_window_start_move(int id);
+extern int sk_window_start_resize(int id, const char* edge);
 extern int sk_window_main(void);
 #ifdef ASC_RENDER_WINGPU
 // Native GPU window backend: no surface is passed in or handed back — the frame's
@@ -8812,6 +8855,14 @@ static inline void as_window_close(int id) {
     (void)id;
 #endif
 }
+// The user's close request, taken once per frame by ASC_win_poll.
+static inline int as_window_take_close_request(int id) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_take_close_request(id);
+#else
+    (void)id; return 0;
+#endif
+}
 static inline int as_window_is_closed(int id) {
 #ifdef ASC_USE_WINDOW
     return sk_window_is_closed(id);
@@ -8904,6 +8955,62 @@ static inline void as_window_set_always_in_front(int id, int on) {
     sk_window_set_always_in_front(id, on);
 #else
     (void)id; (void)on;
+#endif
+}
+// NativeWindow.minSize/maxSize. The window manager owns the enforcement (a resize
+// drag must respect them), the AS3 side owns the values AIR's getters report — so
+// the two are kept in step by always going through these two calls.
+static inline void as_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh) {
+#ifdef ASC_USE_WINDOW
+    sk_window_get_limits(id, mnw, mnh, mxw, mxh);
+#else
+    (void)id; if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+#endif
+}
+static inline void as_window_set_limits(int id, int mnw, int mnh, int mxw, int mxh) {
+#ifdef ASC_USE_WINDOW
+    sk_window_set_limits(id, mnw, mnh, mxw, mxh);
+#else
+    (void)id; (void)mnw; (void)mnh; (void)mxw; (void)mxh;
+#endif
+}
+static inline void as_window_limits_floor(int* fw, int* fh) {
+#ifdef ASC_USE_WINDOW
+    sk_window_limits_floor(fw, fh);
+#else
+    if (fw) *fw = 0; if (fh) *fh = 0;
+#endif
+}
+// The platform's own starting minSize/maxSize. Needed separately because a fresh
+// NativeWindow has NO OS window yet -- AIR creates it when the window is first shown
+// -- so a limits read at construction time finds an empty slot (zeros) and would
+// cache those zeros. NativeWindow's constructor therefore falls back to these
+// defaults, the same numbers the backend installs on the real window.
+// Degrades to zeros in a build with no window backend, where no window exists at
+// all and every NativeWindow entry point reports itself unsupported.
+static inline void as_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh) {
+#ifdef ASC_USE_WINDOW
+    sk_window_limits_default(mnw, mnh, mxw, mxh);
+#else
+    if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+#endif
+}
+// NativeWindow.startMove()/startResize(): begin a pointer-driven system drag.
+// Returns 1 when the drag started, which is AIR's true; 0 (no window manager, or a
+// window that cannot be dragged) is AIR's false and is reported as such rather
+// than faked.
+static inline int as_window_start_move(int id) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_start_move(id);
+#else
+    (void)id; return 0;
+#endif
+}
+static inline int as_window_start_resize(int id, const char* edge) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_start_resize(id, edge);
+#else
+    (void)id; (void)edge; return 0;
 #endif
 }
 // The main window's id (the one Stage.showWindow created). -1 before it exists.
@@ -9127,6 +9234,7 @@ static inline void as_window_request_exit(void) { }
 // No event loop to end: NativeApplication.exit() in a headless build is a no-op
 // whose observable effect is simply that the program stops there.
 static inline void as_window_close(int id) { (void)id; }
+static inline int as_window_take_close_request(int id) { (void)id; return 0; }
 static inline int as_window_is_closed(int id) { (void)id; return 1; }
 static inline void as_window_activate(int id) { (void)id; }
 // A pure-C build has no pointer at all, but the generated cursor sampler still
@@ -9143,6 +9251,18 @@ static inline void as_window_get_pixel_size(int id, int* pw, int* ph) { (void)id
 static inline void as_window_get_client_size(int id, int* lw, int* lh) { (void)id; if (lw) *lw = 0; if (lh) *lh = 0; }
 static inline int as_window_is_active(int id) { (void)id; return 0; }
 static inline void as_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
+static inline void as_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh) {
+    (void)id; if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+}
+static inline void as_window_set_limits(int id, int mnw, int mnh, int mxw, int mxh) {
+    (void)id; (void)mnw; (void)mnh; (void)mxw; (void)mxh;
+}
+static inline void as_window_limits_floor(int* fw, int* fh) { if (fw) *fw = 0; if (fh) *fh = 0; }
+static inline void as_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh) {
+    if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+}
+static inline int as_window_start_move(int id) { (void)id; return 0; }
+static inline int as_window_start_resize(int id, const char* edge) { (void)id; (void)edge; return 0; }
 static inline int as_window_main(void) { return -1; }
 static inline int as_window_get_display_size(int* w, int* h) { if (w) *w = 0; if (h) *h = 0; return 0; }
 static inline int as_screen_count(void) { return 1; }
@@ -11690,9 +11810,10 @@ static void as_system_output(const char* s) {
 // verbatim would thus report Windows 11 as Windows 8. Our binaries carry no manifest, so
 // the true version comes from ntdll's RtlGetVersion (resolved dynamically, so no import
 // library is added) and feeds that same table; the observable result then matches AIR's.
-// macOS/Linux/WASI still report the bare family name. AIR appends a version there too,
-// but no Darwin/Linux release->name table can be verified from a Windows dev host, so the
-// gap is left stated rather than guessed at.
+// macOS appends its product version the same way ("Mac OS 26.6.2", measured on
+// adl 51.4.1). Linux/WASI still report the bare family name: AIR appends a version there
+// too, but no Linux release->name table can be verified from this dev host, so the gap is
+// left stated rather than guessed at.
 #ifdef _WIN32
 typedef struct {
     unsigned long dwOSVersionInfoSize;
@@ -11739,6 +11860,28 @@ static const char* as_win_os_name(unsigned long major, unsigned long minor, unsi
 #endif
 static const char* as_cap_os(void) {
 #ifdef __APPLE__
+    // AIR appends a version on macOS too: adl 51.4.1 on macOS 26.6.2 answers
+    // "Mac OS 26.6.2" (measured: temp/nwmac/nwmac-out.txt). The number is the OS
+    // *product* version, not the Darwin kernel release (uname -r says 25.6.0),
+    // so it comes from the kern.osproductversion sysctl -- the same value
+    // SystemVersion.plist's ProductVersion holds. The family name is the bare
+    // "Mac OS" AIR's own string pool carries (not "Mac OS X").
+    //
+    // No caching: unlike the Windows branch (whose result is a literal), this one
+    // has to build a GC string, and a static-char-pointer cache would be an unrooted
+    // pointer the collector could reclaim out from under the next call.
+    char ver[64];
+    size_t len = sizeof(ver) - 1;
+    if (sysctlbyname("kern.osproductversion", ver, &len, NULL, 0) == 0 && len > 0
+        && ver[0] >= '0' && ver[0] <= '9') {
+        ver[len] = 0;
+        char* out = as_str_alloc(7 + len + 1);   // "Mac OS " + version + NUL
+        memcpy(out, "Mac OS ", 7);
+        memcpy(out + 7, ver, len + 1);
+        return out;
+    }
+    // A kernel without the sysctl (macOS before 10.13) degrades to the family
+    // name, exactly like AIR's fallback for a version its table cannot name.
     return "Mac OS";
 #elif defined(_WIN32)
     // Resolve once: the OS cannot change while the process runs.

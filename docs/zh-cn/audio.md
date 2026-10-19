@@ -435,6 +435,64 @@ cd temp/demosound && ./Probe
 生成的 `Starling-Demo.build.json`，无需手工维护清单。`CoreAudio`+`AudioToolbox` 只在 **macOS** 上追加（`-framework`
 不是 Windows 链接器的参数），Windows 侧一个额外 `-l` 都不需要 —— 这一条 2026-10-17 才补上，见 **§15**。
 
+### 13.5 自有夹具与带 UI 的播放器示例（阶段二百零一，2026-10-19）
+
+**为什么要新开一个**：`Sound.load(URLRequest)` 这条**编码文件加载**路（异步载入，以及载入后的
+`bytesLoaded` / `bytesTotal` / `url` / `length` / `id3` 面）加上 `SoundChannel` 播放与
+`soundComplete` 生命周期，此前**没有任何回归输入** —— 两个既有音频示例都不走它：
+`examples/audio.as` 喂的是**合成 PCM**（`loadPCMFromByteArray`），`examples/embed.as` 解的是
+**编译期嵌入**的 mp3。看起来像覆盖的那三条钉子读的是第三方 Starling 示例的 `AssetManager.as`
+（断言的是 Starling 自己的类，不是本编译器），已随外部夹具在阶段一百九十八 删除。
+
+**夹具**：`examples/audio/clip.mp3` —— README 里那份产品视频的**完整音轨**，用 ffmpeg 拆出并
+重编为 MP3。它是**自有**的：不依赖任何可能被重新克隆成别的形状的第三方树，故钉子读它不会被
+别人的编辑悄悄改掉底。
+
+| 实测项 | 值 |
+|---|---|
+| 字节数 | `1 890 142`（播放器自检里也硬写着这个数，两处必须一致，钉子比的是**两者相符**） |
+| 时长 | `118.1 s`（`Sound.length` 报 `118125.71 ms`，见下） |
+| 编码 | MPEG-1 Layer III，128 kbps，44 100 Hz，立体声（ID3v2.3 标签之后偏移 132 处首帧同步 `FF FB 90 00`） |
+| 标签 | ID3v2.3：TIT2 `TalkMED AOT audio fixture` / TPE1 `TalkMED` / TALB `as3compiler examples` |
+| 容器残留 | **无**（ffmpeg 会把 mp4 的 `major_brand` / `Remotion` 抄成 TXXX 帧，已清掉；钉子钉住其缺席） |
+
+`Sound.length` 的单位是**毫秒**，且它是 MPEG 的「名义时长」（帧数 × 1152/44100），比容器时长多约
+26 ms —— 与 `adl` 同口径（§13.2 的表里那只 6686 字节的 mp3 也报 `417.959…ms`）。
+
+**示例**：`examples/audio/AudioPlayer.as` —— 窗口内可播放/暂停/停止、±10% 音量、±10 s 拖动、
+路径框换文件（`FileReference.browse` / `File.browseForOpen` 在本后端无实现，那两个成员会响亮报
+「不支持」，故用可编辑输入框代替真对话框 —— 真能换文件，且不是假装的对话框）。
+
+**为什么必须是窗口**：`soundComplete` 由 `as_audio_tick()` 在**帧边界**派发，而它只被
+`Stage_dispatchFrame` 调用 —— 离屏的 `tickTimers()` / `tickFrame()` **不驱动**它。所以「播到结束」
+这件事只在真实窗口里成立，无头示例观察不到；这也就是它**不进回归实跑**的原因（回归只做
+compile+link，见 `test/examples.ts` 的 `example: audio/ (windowed: compile+link only)`）。
+
+```bash
+# 从仓库根跑（默认路径是相对当前目录的）
+node src/index.ts examples/audio/AudioPlayer.as \
+     --manifest examples/audio/player.build.json --run
+```
+
+**脚本化自检 23 条**（开窗后由帧时钟推进，`trace` 打印汇总）：
+
+| 组 | 覆盖 |
+|---|---|
+| 载入面 | `bytesTotal` / `bytesLoaded` / `url` / `isBuffering` / `length` / `id3` 三项 |
+| 播放面 | 通道返回、位置前进、暂停释放通道并记住位置、续播、音量 clamp 与作用到活通道、拖动落点 |
+| 终态 | 0.5 s 切片（`extract` 出来的**真音频**）的 `soundComplete`、`stop()` 后的通道状态 |
+
+**无设备主机不会假装**：`SoundMixer.areSoundsInaccessible()` 为真时播放断言整组跳过并**打印原因**，
+解码/长度/id3 那组照跑（§1.5）。想要确定性计时的 CI 可设 `ASC_AUDIO_NULL=1`（miniaudio 的 Null
+后端：无硬件、位置照常前进）。
+
+**一条踩坑记（量测方法本身）**：用中文输入法在那个路径框里打字时，字母会先进 IME 的**组词态** ——
+`keyDown` 照常到达（keyCode/charCode 都对）但 `edit.text` 不变、也没有 `textInput`，**必须回车确认**
+才产生 `SDL_TEXTINPUT`。只看「敲了字母没反应」会把它误判成「键盘通道坏了」；本阶段曾据此在
+`vendor/window_glue.cc` 加过一个 `FOCUS_GAINED → SDL_StartTextInput()` 的补丁，A/B 实测（冷启动与
+失焦回焦两轮）证明 SDL 自己就管这件事（其头文件自述桌面平台在 video init 时已隐式开启文本输入），
+补丁已删除，并留了钉子防重加（`test/unit/text-input.ts`）。
+
 ---
 
 ## 14. 与 AIR 的差异清单（阶段九十六）

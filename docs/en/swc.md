@@ -833,6 +833,26 @@ scripts** (§3.3 close-out) — enough to make a checkbox/button skin actually c
 methods are not executed** (one class's 1,400+ method bodies / 54 KB of bytecode would mean a whole AVM2, a
 separate project). `catalog.xml`'s `<dep>` is used only for the **name-level** early diagnostic (§3.3.3).
 
+**Third boundary (since stage one hundred and ninety-six)**: a symbol class's **base class** comes from its own
+`DoABC` (AVM2's `InstanceInfo.super` multiname), but is bound **only when this compilation actually provides that
+class** (`swc.ts::availableProjectBase`, with the answer supplied by `index.ts` from the set of sources it is
+compiling). Why, and what happens otherwise:
+
+- All four of `skin.swc`'s combo boxes extend **the project's own** `com.example.controls.ComBoBox`, whose
+  *source* lives under `src/`. On the same input AIR links the library's symbol to that **out-of-library** class
+  and the behaviour comes from the source; we do the same (stage one hundred and ninety-one).
+- The library's own copy of that same class is ABC code and is not compiled (the first two boundaries above), so
+  when the compilation unit does **not** provide the class, the synthesized `class ComBox extends <absent class>`
+  fails to compile outright (`unknown superclass`).
+- In that case it **falls back** to a plain artwork symbol (a `MovieClip`/`SimpleButton` subclass) and **warns
+  loudly once per base name**:
+  `warning: SWC symbol class extends '<base>', which this compilation does not provide: …`.
+  The fallback is **not** a silent downgrade — the warning names the missing base, what it degrades to, and what
+  members are gone — while `adl` runs the same input fine (it executes the library's copy of that base), so "the
+  behaviour of an in-library base class" stays a lingering item in `TODO.md`.
+- The `dynamic` trait is independent of the base and is always reproduced from the ABC verbatim (stage one
+  hundred and ninety-two).
+
 ---
 
 ## 8. Relationship to Ruffle (Reuse Evaluation)

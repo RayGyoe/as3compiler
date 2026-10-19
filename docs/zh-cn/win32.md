@@ -44,13 +44,13 @@ ARM64 运行时（量值见 §2.11），描述符里写它没有任何消费者�
 
 ---
 
-## 2. 依赖库的构建：`vendor/build-windows-deps.ps1`
+## 2. 依赖库的构建：`vendor/provision/windows.ps1`
 
 ```powershell
-pwsh vendor/build-windows-deps.ps1             # = -Arch both（缺省）：x64 + x86
-pwsh vendor/build-windows-deps.ps1 -Arch x64    # 产出 vendor/*/lib/windows-x64
-pwsh vendor/build-windows-deps.ps1 -Arch x86    # 产出 vendor/*/lib/windows-x86
-pwsh vendor/build-windows-deps.ps1 -Arch arm64  # 产出 vendor/*/lib/windows-arm64（需先装 ARM64 工具集，见 §2.11）
+pwsh vendor/provision/windows.ps1              # = -Arch both（缺省）：x64 + x86
+pwsh vendor/provision/windows.ps1 -Arch x64    # 产出 vendor/*/lib/windows-x64
+pwsh vendor/provision/windows.ps1 -Arch x86    # 产出 vendor/*/lib/windows-x86
+pwsh vendor/provision/windows.ps1 -Arch arm64  # 产出 vendor/*/lib/windows-arm64（需先装 ARM64 工具集，见 §2.11）
 ```
 
 从源码构建：**Skia m124**（`build-tools/skia-src`，含 `bin/gn` + ninja）、**SDL2 2.32.10**、
@@ -159,7 +159,7 @@ Windows 自带的 `tar.exe`（bsdtar）在未开「开发者模式」/没有「�
    的 D3D 包装含 `sk_sp<SkColorSpace>`，缺 `#include "include/core/SkColorSpace.h"` 会在
    `SkRefCnt.h` 报 “member access into incomplete type 'SkColorSpace'” ⇒ 补 include。
 
-（这与 §2.4 的「Skia 源码层四处编不过」不同：那四处在 `build-windows-deps.ps1` 里对**源码**
+（这与 §2.4 的「Skia 源码层四处编不过」不同：那四处在 `vendor/provision/windows.ps1` 里对**源码**
 打补丁自愈；这四类在**仓库内 glue 文件**里改，直接入库。）
 
 ### 2.7 运行期三处 Windows 专属缺陷（2026-10-10 实机首跑撞出，已修）
@@ -173,7 +173,7 @@ Windows 自带的 `tar.exe`（bsdtar）在未开「开发者模式」/没有「�
    该表为空，`Cluster::Cluster` 索引越界触发 `SK_ABORT` 的 `ud2`（exit 132）。修法：构建期把
    `vendor/skia/lib/windows-x{N}/icudtl.dat`（10185008 字节）**自动部署到产物目录**——
    `src/build.ts` 新增 `deploySkiaIcuData(cfg, outPath)`（win32+native+链接 skia 时生效），
-   `src/index.ts` 在 link 成功后调用（`[4/4] data icudtl.dat -> ...`）；`build-windows-deps.ps1`
+   `src/index.ts` 在 link 成功后调用（`[4/4] data icudtl.dat -> ...`）；`vendor/provision/windows.ps1`
    收产物时同步复制、缺失则 `Fail`。
 2. **async FileStream `openAsync(…, FileMode.READ)` → `__fastfail`**。异步 `AS_JOB_FS_OPEN`
    的 mode 映射写成了 `mode = j->mode`（非空即原样透传），而 `FileMode.READ` 是字符串
@@ -782,9 +782,14 @@ interface (UI) language…used for all menus, dialog boxes, error messages, and 
 `GetSystemMetrics(89)` 与 `RtlGetVersion` **都经 `GetProcAddress` 动态解析**：该助手编入**每一个**构建，
 而 headless 构建**不链接 user32**，静态引用会直接链接失败（`undefined symbol: GetSystemMetrics`）。
 
-**未对齐（如实报明）**：macOS / Linux / WASI 仍是裸家族名（`"Mac OS"` / `"Linux"` / `"WASI"`）。AIR 在那里
-同样带版本，但本机是 Windows，没有可核对的 Darwin/Linux「版本→名字」表，故**不臆造**；缺口写在代码注释里，
-而不是猜一个值填上。
+**macOS 一端已收口（阶段一百九十六，实测）**：`Mac OS <major>.<minor>.<patch>` —— 与 `adl 51.4.1` **逐字相同**
+（本机 `Mac OS 26.6.2`，双端孪生探针 `temp/nwmac/nwmac-{adl,aot}.txt` 的第一行 `CAP_os` 两端一致）。
+形态与 Windows 侧同构（AIR 是「家族名 + 版本」，不是裸家族名），版本取自 `uname` 的 Darwin 版本按 AIR 的
+`Mac OS X 10.x` → 系统版本映射拼出。
+
+**未对齐（如实报明）**：Linux / WASI 仍是裸家族名（`"Linux"` / `"WASI"`）。AIR 在那里同样带版本，但本机
+没有可核对的 `adl for Linux` 真值与发行版「版本→名字」表，故**不臆造**；缺口写在代码注释里，而不是猜一个
+值填上。
 
 钉子：`unit: platform/CapabilitiesOs`（18 个可返回名齐备 / `build >= 22000` 提升 / `wProductType` 分流 /
 **不含 user32 静态依赖** / 理由留档）+ `examples/stage65.as`（Windows 上断言 `os` 能 `split(" ")` 出非空版本号，
@@ -816,7 +821,7 @@ macOS 自动跳过）。
 
 在 Windows x64 机器上，按顺序做：
 
-1. `pwsh vendor/build-windows-deps.ps1 -Arch x64`（可再跑 `-Arch x86`）。**核对**：ps1 在真实
+1. `pwsh vendor/provision/windows.ps1 -Arch x64`（可再跑 `-Arch x86`）。**核对**：ps1 在真实
    PowerShell 下的 `SetEnv.cmd` 探测、`Invoke-CmakeBuild` 的 `-Arch` 传递、以及 `Assert-LibBitness`
    不误报（macOS 侧只做到「便携 pwsh 解析 AST 通过 + `gn format` 通过 + 补丁对真实源命中且幂等」）。
 2. 编一个 `<renderMode>direct</renderMode>` 的 `--air-app` 项目。**核对**：链接期不再出现

@@ -12,7 +12,7 @@
 // Reverting either one turns the suite from ~3 min back into ~13 min with every
 // assertion still passing — precisely the silent regression that AGENTS.md §2.7
 // says has to be pinned in test/unit/ rather than left to the example suite.
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerGroup, root } from '../harness.ts';
 
@@ -45,3 +45,38 @@ function checkExampleDriverConcurrency(): string[] {
 }
 
 registerGroup('unit: testinfra/ExampleDriver', checkExampleDriverConcurrency);
+
+// The two documented entry points must agree on WHAT they run. `npm run test:unit`
+// globs `test/unit/*.ts`; `node test.ts` — the one AGENTS.md §2.7 calls the
+// mandatory full regression — imports test/unit.ts, an explicit barrel. So a new
+// unit file whose author forgets the barrel runs under the fast command and is
+// silently absent from the full regression, which is the worst possible split:
+// locally green either way, and the safety net has a hole exactly where the newest
+// work is. (Measured: this stage's own unit: doctor/* groups were written, passed
+// under test:unit, and did not run under test.ts at all.)
+function checkUnitBarrel(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [barrel] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [barrel] ${label}`); }
+  };
+  const unitDir = join(root, 'test', 'unit');
+  const modules = readdirSync(unitDir).filter((f) => f.endsWith('.ts')).sort();
+  const barrel = readFileSync(join(root, 'test', 'unit.ts'), 'utf8');
+  const imported = [...barrel.matchAll(/import '\.\/unit\/([^']+)';/g)].map((m) => m[1]).sort();
+
+  check('the barrel imports every module in test/unit/',
+    modules.join(',') === imported.join(','));
+  // The other direction too: an import with no file behind it is a hard crash at
+  // startup, but a stale one left after a rename is easy to introduce.
+  check('every import in the barrel resolves to a file',
+    imported.every((name) => modules.includes(name)));
+  check('the barrel lists more than a token module (it is the list, not a sample)',
+    modules.length >= 20 && imported.length === modules.length);
+
+  if (ok > 0) console.log(`[barrel] ${ok} unit-barrel checks passed`);
+  return bad;
+}
+
+registerGroup('unit: testinfra/UnitBarrel', checkUnitBarrel);

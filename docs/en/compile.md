@@ -64,8 +64,21 @@ Key division of labor (see `AGENTS.md` §2.8, the project's development-conventi
 
 ## 2. Environment Dependencies
 
-- **Node ≥ 22.6**: native type-stripping runs `.ts` source directly, no compilation step required.
+- **Node ≥ 18**: the package published to npm is **already-transpiled JavaScript** (`dist/`), so no type stripping is
+  needed. Running **from source** (`node src/index.ts`, the checkout form) needs **Node ≥ 22.18** — as does running
+  `npm run build:dist` yourself. `dist/` is produced by `scripts/build-dist.ts` (wired to `prepare`, so `npm pack` /
+  `npm publish` run it); `bin` must **not** point back at `src/index.ts`, because Node refuses to strip types for files
+  under `node_modules` (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`), which makes every install crash on first run.
+  The conversion blanks annotations in place, so line numbers map 1:1 onto `src/` and the emitted C is byte-identical to
+  running the `.ts` directly; pinned by `unit: npm-package/PublishForm` (19 checks).
 - **C compiler**: `cc` / `clang` (native target defaults to `cc`; override with `--cc`).
+- **Prebuilt dependency libraries**: `vendor/` ships **four** sets -- macos-arm64 / windows-x64 /
+  windows-x86 / wasm. A host that is not one of those (Linux, Intel Mac) makes `--air-app` **fail loudly**,
+  naming the sets that do exist, instead of quietly pointing `-I`/`-L` at an ARM64 archive set plus Cocoa
+  frameworks.
+  - How those artifacts are produced lives in `vendor/provision/` (`windows.ps1` / `macos.sh`; the artifacts
+    themselves and the glue sources stay under `vendor/`); to find out what this machine is missing, run
+    `as-aot doctor` (§3.6).
 - **WASI toolchain** (only needed for `--target wasm`): WASI SDK or LLVM clang with a `wasm32-wasip1` backend.
   - By convention the environment variable `WASI_SDK_HOME` points to the SDK root; the compiler is at
     `$WASI_SDK_HOME/bin/clang`, and the sysroot at `$WASI_SDK_HOME/share/wasi-sysroot`.
@@ -96,6 +109,8 @@ Key division of labor (see `AGENTS.md` §2.8, the project's development-conventi
 
 ```text
 Usage: as-aot <input.as> [more.as ...] [options]
+       as-aot doctor [options]        report whether this machine can build what the flags ask
+       as-aot version                 print the compiler version (same as --version / -V)
 
 Options:
   -o <path>      output path (native: executable; wasm: .wasm appended); also the base
@@ -124,8 +139,20 @@ Options:
   --debug-info   keep DWARF: add -g to every backend and stop stripping it from the
                  default wasm build (default: off — artifacts carry no debug info; see §4.3)
   --dry          emit C and print the compile command without compiling
+  -V, --version  print the compiler version (read from package.json) and exit
   -h, --help     show this help
 ```
+
+`as-aot --version` (or `-V`, or the `version` subcommand) prints the compiler version. There is
+**one source** for it -- `package.json`, which the report header also carries -- so please include it in a
+bug report. On failure stderr carries one line and nothing else; set `AS3_TRACE=1` to get the Node stack
+too (that is what reporting a bug in the *compiler itself* wants).
+
+A mistyped flag is answered with a **next step**, not just a repeat of the name you typed: a near miss
+of a real flag (`--versoin`, `--feat`) gets `did you mean --version?`, and one nothing resembles
+(`--sss`) gets pointed at `as-aot --help`. A flag left without a value -- `-o` at the end of the
+command line, or `-o --dry` swallowing the next flag as its value -- is refused rather than guessed
+at; a value that merely *starts* with a dash (`--opt -O3`, `-D FOO=-1`) is still a value.
 
 ### 3.1 Basic Compilation
 
@@ -604,6 +631,49 @@ Three key behaviors aligned with adl:
 - The bootstrap code presets `stage.stageWidth/stageHeight` **before** `new Main()`, so that during document
   class construction `trace(stage.stageWidth, stage.stageHeight)` returns the window size (e.g. `1000 680`)
   rather than `0 0` outside adl.
+
+### 3.6 Build-environment self-check (`as-aot doctor`)
+
+When a build will not start, the first question is what this machine is missing. `doctor` gathers the checks
+that would otherwise be scattered across the build path into **one read-only report**, and it shares **one
+check table** (`src/checks.ts`) with the build itself -- what the report says is what a compile says, so
+"doctor is green but the build explodes" cannot happen.
+
+```bash
+as-aot doctor                                   # can this repository build its default shape?
+as-aot doctor --air-app path/to/app.xml         # can this app build? (trimmed to what it actually touches)
+as-aot doctor --manifest hello.build.json       # can this manifest build?
+as-aot doctor --json                            # machine-readable output
+as-aot doctor --fix                             # only sub-second idempotent repairs (e.g. staging icudtl.dat)
+as-aot doctor --check-update                    # read-only: ask the registry whether a newer release exists
+```
+
+Worth knowing:
+
+- **With no configuration it synthesises the default desktop app**, through the very same `airManifest`
+  `--air-app` uses, so the rules exist once. It synthesises for `--target native` only: a
+  `--target wasm --package raw` build is a bare WASI module that links no vendor library at all, so reporting
+  SDL2/Cocoa for it would be pure noise.
+- **CLI beats the manifest**, the same rule compilation follows: `doctor --air-app app.xml --target wasm`
+  judges the wasm shape.
+- **The report header carries the compiler version** (`as-aot doctor -- <version> darwin/arm64, node v24.14.1`,
+  and `compiler: { name, version }` under `--json`). Same single source (`package.json`), so it can never
+  disagree with `as-aot --version`.
+- **`--check-update` is read-only, and off by default**: it asks the registry `npm_config_registry` names
+  (npmjs unless a mirror is configured) once for `as3compiler/latest` and prints the upgrade command
+  (`npm i -g as3compiler@latest`) -- it **never installs anything**, because replacing a user's compiler is a
+  hard-to-reverse action that belongs to the user rather than to the tool. A lookup that cannot complete
+  (offline, mirror down, HTTP error) is **reported, not fatal**, and it never touches the exit code (0/1/2 mean
+  build-readiness; a machine that cannot reach the registry may still build perfectly). The lookup happens
+  **only when the flag is given**, so the default path sends no request at all. Under `--json` it lands in the
+  `update` key, which is **absent** when the flag was not given -- "not asked" and "asked, unreachable" are
+  different states on purpose.
+- **Three verdicts**: `ok` / `warn` (it builds, but the output is wrong -- e.g. a web build whose text has no
+  font to draw with) / `fail` (it does not build). `--fix` handles sub-second idempotent items only; for a
+  dependency library the report prints the command that builds it.
+- **`--air-app` writes the manifest** (`<app>/<filename>.build.json`, the same file and the same generation
+  as a build), then reads it back and judges that -- so the configuration being checked is the configuration
+  that will be built.
 
 ## 4. Build Manifest
 
@@ -1192,6 +1262,6 @@ Key implementation points:
 - [`TODO.md`](../../TODO.md) — staged roadmap (stage twenty-nine is "build manifest + multi-target backend")
 - [`as3-semantics.md`](as3-semantics.md) — AS3 semantic-fidelity red lines and specification sources
 - [`html5-web.md`](html5-web.md) — browser rendering target (`--target wasm --package web`) implementation and usage
-- [`win32.md`](win32.md) — Windows native backend (`<architecture>` bit width, `vendor/build-windows-deps.ps1`, Skia D3D12 direct GPU, first-run checklist)
+- [`win32.md`](win32.md) — Windows native backend (`<architecture>` bit width, `vendor/provision/windows.ps1`, Skia D3D12 direct GPU, first-run checklist)
 - [`skia.md`](skia.md) — rendering backend (Skia rasterization + wasm font injection)
 - `AGENTS.md` — development conventions (§2.9 build & link); kept with the project's developer documentation, not inside this repo

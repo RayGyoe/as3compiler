@@ -3957,6 +3957,20 @@ export class Emitter {
     }
   }
 
+  // Static `const` fields whose value AIR takes from the OS rather than from the
+  // library. The symbol table carries the value measured on THIS host (macOS); the
+  // other platforms are selected by a macro in the runtime preamble, so the field
+  // stays a compile-time constant everywhere and no runtime probe is needed.
+  // Measured on adl 51.4.1: macOS `supportsMenu=false supportsNotification=false`
+  // (temp/nwmac/nwmac-out.txt); AIR documents Windows/Linux as the platforms that
+  // have window menus and notifications.
+  private platformStaticConst(cname: string, fname: string): string | null {
+    if (!cname.endsWith('NativeWindow')) return null;
+    if (fname === 'supportsMenu') return 'ASC_NW_SUPPORTS_MENU';
+    if (fname === 'supportsNotification') return 'ASC_NW_SUPPORTS_NOTIFICATION';
+    return null;
+  }
+
   private emitStaticFields(): void {
     this.staticFieldInits = [];
     this.staticInitBlocks = [];
@@ -3979,7 +3993,8 @@ export class Emitter {
         if (f.owner !== cname) continue;
         this.currentClass = cname;
         if (f.isConst && this.isConstExpr(f.init)) {
-          const init = f.init ? this.convert(this.emitExpr(f.init), f.type) : this.defaultInit(f.type);
+          const init = this.platformStaticConst(cname, fname)
+            ?? (f.init ? this.convert(this.emitExpr(f.init), f.type) : this.defaultInit(f.type));
           this.line(`static ${this.constTypeName(f.type)} ${cname}_${fname} = ${init};`);
         } else {
           // Mutable static slot with a default; the initializer (when present)
@@ -5795,6 +5810,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('ASC_window_apply_stage_size(id);');
+    // AIR reports minSize/maxSize on a window that was never shown, so the cache is
+    // seeded here (from the backend's own defaults, which is what a fresh window has)
+    // and the frame snapshot is taken so the first poll does not mistake this
+    // construction-time state for a move the app made.
+    this.line('ASC_win_limits_init(id);');
+    this.line('ASC_win_snap(id);');
     this.indent--;
     this.line('}');
     this.line('NativeWindow* NativeWindow_new(NativeWindowInitOptions* options) {');
@@ -5840,7 +5861,30 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('bool NativeWindow_get_visible(void* _this) { return as_window_get_visible(((NativeWindow*)_this)->_win) ? true : false; }');
-    this.line('void NativeWindow_set_visible(void* _this, bool value) { as_window_set_visible(((NativeWindow*)_this)->_win, value ? 1 : 0); }');
+    this.line('void NativeWindow_set_visible(void* _this, bool value) {');
+    this.indent++;
+    this.line('int id = ((NativeWindow*)_this)->_win;');
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('bool want = value ? true : false;');
+    // AIR dispatches DEACTIVATE the moment a visible window is hidden (measured on
+    // adl 51.4.1, temp/nwmac/events-out.txt: `visible=false` on the active window
+    // yields a lone deactivate, with no displayStateChange). Firing it here and
+    // clearing the focus snapshot keeps ASC_win_poll from dispatching it a second
+    // time at the next frame boundary -- the event is dispatched once either way.
+    this.line('if (as_window_get_visible(id) && !want) {');
+    this.indent++;
+    this.line('if (w != NULL && w->snap_active) { w->snap_active = 0; ASC_win_fire(id, "deactivate", false); }');
+    this.indent--;
+    this.line('}');
+    this.line('as_window_set_visible(id, want ? 1 : 0);');
+    // Showing a window is what CREATES the OS window, so this is where the frame
+    // finally has real geometry to compare against. Snapshotting here means the
+    // next frame's poll sees only changes that happen after the window existed --
+    // which is what AIR reports too (temp/nwmac/nwmac-out.txt: the poll-driven
+    // RESIZE,MOVE arrives for a bounds change made after the window was shown).
+    this.line('if (want) ASC_win_snap(id);');
+    this.indent--;
+    this.line('}');
     // closed: true once the window is gone. The slot is released in
     // ASC_window_on_close, so a missing slot means closed.
     this.line('bool NativeWindow_get_closed(void* _this) {');
@@ -5956,6 +6000,79 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return Point_new((double)(x + bl) + point->x, (double)(y + bt) + point->y);');
     this.indent--;
     this.line('}');
+    // resizeToScreen(screen): move + size the frame to that screen's visible
+    // bounds. Measured on adl 51.4.1 (temp/nwmac/rts-out.txt): on the scale-1
+    // display it answers exactly that screen's visibleBounds
+    // ((0,-1410,2560,1410) for a 2560x1440 display whose visible bounds are
+    // (0,-1410,2560,1410)). On the Retina display the same call lands at
+    // (0,39,900,584) for visibleBounds (47,39,1753,1130) -- HALF the screen in both
+    // axes, i.e. AIR divided the logical size by the backing scale factor. That
+    // looks like AIR's own unit mix-up rather than a defined contract, and it is
+    // the only measured case that disagrees with the documented "size to the
+    // screen" behaviour, so this implementation follows the documented one (and
+    // the scale-1 measurement) and the Retina case is registered as a divergence
+    // instead of reproduced. A null screen is AIR's #1009 (measured: it throws).
+    this.line('void NativeWindow_resizeToScreen(void* _this, Screen* screen) {');
+    this.indent++;
+    this.line('int id = ((NativeWindow*)_this)->_win;');
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL) return;');
+    this.line('if (screen == NULL) as_throw(Error_new((char*)"TypeError: Error #1009: Cannot access a property or method of a null object reference.", 1009));');
+    this.line('Rectangle* vb = Screen_get_visibleBounds((void*)screen);');
+    this.line('if (vb == NULL) return;');
+    this.line('as_window_set_bounds(id, (int)vb->x, (int)vb->y, (int)vb->width, (int)vb->height);');
+    this.indent--;
+    this.line('}');
+    // listOwnedWindows(): the windows this one owns, which in AIR is the set whose
+    // NativeWindowInitOptions.owner is this window (NativeWindow.owner is read-only
+    // in mxmlc 51.4.1 -- assigning it is a compile error, measured in temp/nwor/ --
+    // so the init options are the only way to establish ownership).
+    this.line('as_vector_NativeWindow* NativeWindow_listOwnedWindows(void* _this) { return as_win_owned_windows(((NativeWindow*)_this)->_win); }');
+    // minSize/maxSize. AIR clamps each write against the other limit and against the
+    // OS's own floor, and answers a FRESH Point every read (identity is never
+    // preserved). Measured on adl 51.4.1, temp/nwmac/limits-out.txt: `minSize =
+    // (0,0)` reads back (2,32), `(100,10)` -> (100,32), and a min above the current
+    // max is pulled DOWN to it; `maxSize = (0,0)` (or any value below the min) reads
+    // back the current minSize.
+    for (const prop of ['minSize', 'maxSize'] as const) {
+      this.line(`Point* NativeWindow_get_${prop}(void* _this) {`);
+      this.indent++;
+      this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
+      this.line(`if (w == NULL) return Point_new(0.0, 0.0);`);
+      this.line(`return Point_new(w->${prop === 'minSize' ? 'min_w, w->min_h' : 'max_w, w->max_h'});`);
+      this.indent--;
+      this.line('}');
+    }
+    this.line('void NativeWindow_set_minSize(void* _this, Point* value) {');
+    this.indent++;
+    this.line('if (value == NULL) return;');
+    this.line('int id = ((NativeWindow*)_this)->_win;');
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL) return;');
+    this.line('int fw = 0, fh = 0;');
+    this.line('as_window_limits_floor(&fw, &fh);');
+    this.line('double nw = value->x, nh = value->y;');
+    this.line('if (nw < (double)fw) nw = (double)fw;');
+    this.line('if (nh < (double)fh) nh = (double)fh;');
+    this.line('if (nw > w->max_w) nw = w->max_w;');
+    this.line('if (nh > w->max_h) nh = w->max_h;');
+    this.line('w->min_w = nw; w->min_h = nh;');
+    this.line('as_window_set_limits(id, (int)w->min_w, (int)w->min_h, (int)w->max_w, (int)w->max_h);');
+    this.indent--;
+    this.line('}');
+    this.line('void NativeWindow_set_maxSize(void* _this, Point* value) {');
+    this.indent++;
+    this.line('if (value == NULL) return;');
+    this.line('int id = ((NativeWindow*)_this)->_win;');
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL) return;');
+    this.line('double nw = value->x, nh = value->y;');
+    this.line('if (nw < w->min_w) nw = w->min_w;');
+    this.line('if (nh < w->min_h) nh = w->min_h;');
+    this.line('w->max_w = nw; w->max_h = nh;');
+    this.line('as_window_set_limits(id, (int)w->min_w, (int)w->min_h, (int)w->max_w, (int)w->max_h);');
+    this.indent--;
+    this.line('}');
     // close() only REQUESTS teardown; the glue retires the window at the next frame
     // boundary and then calls back into ASC_window_on_close, which is where `closed`
     // flips and Event.CLOSE is dispatched. That ordering is what makes `closed` read
@@ -5963,20 +6080,39 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('void NativeWindow_close(void* _this) { as_window_close(((NativeWindow*)_this)->_win); }');
     // activate() is also what makes a fresh window visible (adl: visible flips from
     // false to true across activate()), so the two are one call in the glue.
-    this.line('void NativeWindow_activate(void* _this) { as_window_activate(((NativeWindow*)_this)->_win); }');
+    // activate() brings a MINIMIZED window back before focusing it: measured on adl
+    // 51.4.1, activate() on a minimized window answers DISPLAY_STATE_CHANGE +
+    // ACTIVATE and `displayState` reads back "normal" afterwards
+    // (temp/nwmac/ev-out-adl.txt t5b). The record is updated here because it is what
+    // the frame poll compares against -- the backend's restore is what actually
+    // deminiaturizes (SDL needs the explicit call).
+    this.line('void NativeWindow_activate(void* _this) {');
+    this.indent++;
+    this.line('int id = ((NativeWindow*)_this)->_win;');
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w != NULL && w->display_state != NULL && strcmp(w->display_state, "minimized") == 0) {');
+    this.indent++;
+    this.line('w->display_state = (char*)"normal";');
+    this.line('gc_write_barrier((void*)w->display_state);');
+    this.indent--;
+    this.line('}');
+    this.line('as_window_activate(id);');
+    this.indent--;
+    this.line('}');
     // notifyUser(type): an OS attention hint (flashing taskbar / bouncing dock).
     // Nothing to draw and nothing a program can observe, so it is accepted and
     // does nothing.
     this.line('void NativeWindow_notifyUser(void* _this, char* type) { (void)_this; (void)type; }');
-    // startMove()/startResize(): AIR hands the drag/resize over to the window
-    // manager, which this runtime has no hook for (the backend owns the OS window
-    // but exposes no "begin system move" entry point). They therefore report
-    // themselves once and answer AIR's "was the operation started?" with false --
-    // the value AIR itself returns for a maximized window -- rather than pretending
-    // a drag is under way. A caller that only drags a window (the documented idiom)
-    // observes no wrong state; a caller that branches on the result sees false.
-    this.line('bool NativeWindow_startMove(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.display.NativeWindow.startMove (system-controlled window move)"); return false; }');
-    this.line('bool NativeWindow_startResize(void* _this, char* edgeOrCorner) { (void)_this; (void)edgeOrCorner; as_shell_unsupported((char*)"flash.display.NativeWindow.startResize (system-controlled window resize)"); return false; }');
+    // startMove()/startResize(): hand the frame over to the pointer until the
+    // button comes up. Real system drags (see window_glue.cc sk_sys_drag_step, which
+    // keeps the window under the pointer by re-placing it from the pointer's GLOBAL
+    // position on every mouseMove -- the same observable behaviour macOS's
+    // performWindowDragWithEvent: produces, without the ObjC/platform coupling).
+    // The result is AIR's own: true when a drag began, false when it cannot
+    // (no window manager, a non-resizable window for a resize, or a
+    // minimized/maximized window whose frame is not the app's to drag).
+    this.line('bool NativeWindow_startMove(void* _this) { return as_window_start_move(((NativeWindow*)_this)->_win) ? true : false; }');
+    this.line('bool NativeWindow_startResize(void* _this, char* edgeOrCorner) { return as_window_start_resize(((NativeWindow*)_this)->_win, edgeOrCorner) ? true : false; }');
     this.line('void NativeWindow_minimize(void* _this) {');
     this.indent++;
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
@@ -21917,6 +22053,26 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double cx, cy, ox, oy;');   // content scale (scaleMode) + offset (align)
     this.line('int closed;');     // NativeWindow.closed
     this.line('int resizable, maximizable, minimizable, always_in_front, transparent;');
+    // NativeWindow.minSize/maxSize as the AS3 side last wrote them. The glue keeps
+    // the same pair (it is what the window manager enforces during a drag); these
+    // are what the getters report, because AIR answers with the value that was
+    // written rather than re-querying the OS.
+    this.line('double min_w, min_h, max_w, max_h;');
+    // Per-frame change detector for the events the window manager produces on its
+    // own: moving, resizing and the focus change that ACTIVATE/DEACTIVATE report.
+    // The glue reports geometry, not events, so the transition is found by
+    // comparing these snapshots at each frame boundary (see ASC_window_poll_geom).
+    // A programmatic setter refreshes the same four values, which is what keeps it
+    // from being reported twice.
+    this.line('int snap_x, snap_y, snap_w, snap_h, snap_active;');
+    // The focus flag as the LAST poll saw it, kept apart from snap_active (which is
+    // what AS3's activate/deactivate pair is derived from): a window whose
+    // displayState turned minimized is deactivated even while the backend still
+    // reports focus, so the raw transition is what gates ACTIVATE.
+    this.line('int snap_raw_active;');
+    // Display state as a code (0 normal, 1 minimized, 2 maximized, 3 fullScreen),
+    // so the poll can compare it with a plain int; see ASC_win_ds_code.
+    this.line('int snap_ds;');
     this.line('char* title;');
     this.line('char* system_chrome;');
     this.line('char* type;');
@@ -21927,6 +22083,197 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('} ASCWin;');
     this.line('static ASCWin ASC_wins[ASC_MAX_WINDOWS];');
     this.line('static ASCWin* ASC_w(int id) { return (id >= 0 && id < ASC_MAX_WINDOWS) ? &ASC_wins[id] : NULL; }');
+    this.line('');
+    // ---- NativeWindow events ----
+    // AIR's window events come from the platform, not from the call that caused
+    // them: an app that drags, resizes, focuses or closes a window hears about it
+    // through MOVE/RESIZE/ACTIVATE/DEACTIVATE/CLOSING, and even a PROGRAMMATIC
+    // change is reported only after the call has returned (measured on adl 51.4.1:
+    // `bounds = ...` / `visible = true` report their MOVE/ACTIVATE on a later
+    // event-loop turn -- temp/nwmac/events-out.txt). Our glue layer reports
+    // geometry, not events, so the transitions are found by comparing a per-window
+    // snapshot at the frame boundary (ASC_win_poll) instead of being forwarded from
+    // a callback. That reproduces AIR's asynchrony for free, and it is also the
+    // only way to see a change the OS made (a window being dragged by the user
+    // dispatches no callback of its own).
+    //
+    // Fire `type` on the window's NativeWindow object. Returns false when a
+    // listener called preventDefault() on a cancelable event -- that is what makes
+    // CLOSING able to refuse a user-initiated close, exactly as AIR specifies.
+    this.line('static bool ASC_win_fire(int id, const char* type, bool cancelable) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL || w->closed) return true;');
+    this.line('NativeWindow* nw = as_win_wrapper(id);');
+    this.line('if (nw == NULL) return true;');
+    this.line('return EventDispatcher_dispatchEvent((void*)nw, Event_new((char*)type, false, cancelable));');
+    this.indent--;
+    this.line('}');
+    // The display state as a small code, so the poll can compare it with a plain
+    // int. w->display_state is the AS3 side's own record (NativeWindow.minimize/
+    // maximize/restore and Stage.displayState write it), which is also what the
+    // displayState getter answers -- so the poll and the getter can never disagree.
+    this.line('static int ASC_win_ds_code(ASCWin* w) {');
+    this.indent++;
+    this.line('char* ds = (w != NULL) ? w->display_state : NULL;');
+    this.line('if (ds == NULL) return 0;');
+    this.line('if (strcmp(ds, "minimized") == 0) return 1;');
+    this.line('if (strcmp(ds, "maximized") == 0) return 2;');
+    this.line('if (strcmp(ds, "fullScreen") == 0) return 3;');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
+    // Record the state the poll compares against. Called at window creation (so the
+    // window's own initial placement is not reported as a move) and after a change
+    // the AS3 side already reported itself.
+    this.line('static void ASC_win_snap(int id) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL) return;');
+    this.line('int x = 0, y = 0, cw = 0, ch = 0;');
+    this.line('as_window_get_bounds(id, &x, &y, &cw, &ch);');
+    this.line('w->snap_x = x; w->snap_y = y; w->snap_w = cw; w->snap_h = ch;');
+    this.line('w->snap_active = as_window_is_active(id);');
+    this.line('w->snap_raw_active = w->snap_active;');
+    this.line('w->snap_ds = ASC_win_ds_code(w);');
+    this.indent--;
+    this.line('}');
+    // NativeWindow.minSize/maxSize as the window starts out, and the floor a later
+    // minSize assignment is clamped to. The tables live in the platform layer
+    // (window_glue.cc sk_window_size_defaults/sk_window_size_floor): macOS starts at
+    // (78,32) with max (107374182,107374182) and a floor of (2,32), Windows at
+    // (136,39). A window takes them at creation — including the app's initial window,
+    // which is created inside the blocking show call and therefore cannot be
+    // initialised from here. This only copies what the window now has.
+    this.line('static void ASC_win_limits_init(int id) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL) return;');
+    this.line('int mnw = 0, mnh = 0, mxw = 0, mxh = 0;');
+    this.line('as_window_get_limits(id, &mnw, &mnh, &mxw, &mxh);');
+    // A `new NativeWindow()` has no OS window yet (AIR creates it when the window is
+    // first shown), so the backend answers with zeros. The platform defaults are the
+    // same numbers it installs on the real window, so taking them here keeps
+    // minSize/maxSize correct from the constructor onward -- which is exactly when
+    // AIR reports them (measured: `w.minSize` is (78,32) on macOS for a window that
+    // was never shown, temp/nwmac/limits-out.txt).
+    this.line('if (mxw <= 0) as_window_limits_default(&mnw, &mnh, &mxw, &mxh);');
+    this.line('w->min_w = (double)mnw; w->min_h = (double)mnh;');
+    this.line('w->max_w = (double)mxw; w->max_h = (double)mxh;');
+    this.indent--;
+    this.line('}');
+    // The frame-boundary transition detector. The ORDER is AIR's own, measured for
+    // every programmatic transition (temp/nwmac/events-out.txt): deactivate first
+    // (a window that is going away reports the loss of focus before the state
+    // change), then RESIZE before MOVE, with DISPLAY_STATE_CHANGE between them
+    // (`maximize()` -> RESIZE,DISPLAY_STATE_CHANGE,MOVE; `bounds = ...` ->
+    // RESIZE,MOVE), and ACTIVATE last (coming back -> DISPLAY_STATE_CHANGE,
+    // ACTIVATE). The two `before` values the events carry are the snapshot's, which
+    // is exactly what AIR fills in.
+    this.line('static void ASC_win_fire_bounds(int id, const char* type, Rectangle* before, Rectangle* after);');
+    this.line('static void ASC_win_fire_ds(int id, char* before, char* after);');
+    this.line('static void ASC_win_poll(int id) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL || w->closed || w->stage == NULL) return;');
+    // A close request from the window manager (its close button). AIR reports it as
+    // a cancelable Event.CLOSING and only closes the window when no listener
+    // prevented the default -- so the request is answered here, not in the glue.
+    this.line('if (as_window_take_close_request(id)) {');
+    this.indent++;
+    this.line('if (ASC_win_fire(id, (char*)"closing", true)) as_window_close(id);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('if (w->snap_w == 0 && w->snap_h == 0) { ASC_win_snap(id); return; }');
+    this.line('int x = 0, y = 0, cw = 0, ch = 0;');
+    this.line('as_window_get_bounds(id, &x, &y, &cw, &ch);');
+    this.line('int active = as_window_is_active(id);');
+    this.line('int ds = ASC_win_ds_code(w);');
+    // The frame's starting state, so every event dispatched below describes the same
+    // before/after pair (see the note on the move branch).
+    this.line('int fx = w->snap_x, fy = w->snap_y, fw = w->snap_w, fh = w->snap_h;');
+    // A window that just became minimized is not the active window any more, and AIR
+    // reports the two together with deactivate FIRST (measured on adl 51.4.1:
+    // minimize() -> "DEACTIVATE | DSCHANGE", temp/nwmac/ev-out-adl.txt t3/t5). SDL sets
+    // the MINIMIZED flag synchronously inside SDL_MinimizeWindow, while the focus loss
+    // only shows up with the next pump, so without this the pair would split across two
+    // frames and the order would invert. A minimized window is never the key window on
+    // any platform we target, so this is an inference from a property of the state
+    // rather than a guess about the backend.
+    this.line('if (ds == 1 && w->snap_ds != 1 && w->snap_active) { w->snap_active = 0; ASC_win_fire(id, (char*)"deactivate", false); }');
+    this.line('if (w->snap_active && !active) {');
+    this.indent++;
+    this.line('w->snap_active = 0;');
+    this.line('ASC_win_fire(id, (char*)"deactivate", false);');
+    this.indent--;
+    this.line('}');
+    // Both bounds events describe the SAME frame, so both take their `before` from the
+    // state this frame started in -- not from the half-updated snapshot. Measured: for a
+    // change that moves and resizes at once, adl answers
+    // RESIZE(100,100 300x200->200,200 500x400) | MOVE(100,100 300x200->200,200 500x400),
+    // i.e. the move's beforeBounds is the pre-change rect, NOT the new size at the old
+    // origin (temp/nwmac/ev-out-adl.txt t2).
+    this.line('if (cw != w->snap_w || ch != w->snap_h) {');
+    this.indent++;
+    this.line('Rectangle* before = Rectangle_new((double)fx, (double)fy, (double)fw, (double)fh);');
+    this.line('Rectangle* after = Rectangle_new((double)x, (double)y, (double)cw, (double)ch);');
+    this.line('w->snap_w = cw; w->snap_h = ch;');
+    this.line('ASC_win_fire_bounds(id, (char*)"resize", before, after);');
+    this.indent--;
+    this.line('}');
+    this.line('if (ds != w->snap_ds) {');
+    this.indent++;
+    this.line('char* before = (char*)(w->snap_ds == 1 ? "minimized" : w->snap_ds == 2 ? "maximized" : w->snap_ds == 3 ? "fullScreen" : "normal");');
+    this.line('char* after = (char*)(ds == 1 ? "minimized" : ds == 2 ? "maximized" : ds == 3 ? "fullScreen" : "normal");');
+    this.line('w->snap_ds = ds;');
+    this.line('ASC_win_fire_ds(id, before, after);');
+    this.indent--;
+    this.line('}');
+    this.line('if (x != w->snap_x || y != w->snap_y) {');
+    this.indent++;
+    this.line('Rectangle* before = Rectangle_new((double)fx, (double)fy, (double)fw, (double)fh);');
+    this.line('Rectangle* after = Rectangle_new((double)x, (double)y, (double)cw, (double)ch);');
+    this.line('w->snap_x = x; w->snap_y = y;');
+    this.line('ASC_win_fire_bounds(id, (char*)"move", before, after);');
+    this.indent--;
+    this.line('}');
+    // ACTIVATE is the raw 0->1 focus transition, so the inferred deactivate above
+    // cannot be undone by the stale focus flag inside the same frame (which would
+    // otherwise dispatch ACTIVATE right after DEACTIVATE, one frame before the
+    // backend's own focus loss arrives).
+    this.line('if (!w->snap_raw_active && active) {');
+    this.indent++;
+    this.line('w->snap_active = 1;');
+    this.line('ASC_win_fire(id, (char*)"activate", false);');
+    this.indent--;
+    this.line('}');
+    this.line('w->snap_raw_active = active;');
+    this.indent--;
+    this.line('}');
+    // The two events that carry state are AIR's own classes
+    // (flash.events.NativeWindowBoundsEvent / NativeWindowDisplayStateEvent), not a
+    // bare Event: a listener declared `function(e:NativeWindowBoundsEvent)` would
+    // otherwise be handed an object of the wrong class, and the before/after values
+    // it reads are exactly what our snapshot already holds.
+    this.line('static void ASC_win_fire_bounds(int id, const char* type, Rectangle* before, Rectangle* after) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL || w->closed) return;');
+    this.line('NativeWindow* nw = as_win_wrapper(id);');
+    this.line('if (nw == NULL) return;');
+    this.line('EventDispatcher_dispatchEvent((void*)nw, (Event*)NativeWindowBoundsEvent_new((char*)type, false, false, before, after));');
+    this.indent--;
+    this.line('}');
+    this.line('static void ASC_win_fire_ds(int id, char* before, char* after) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL || w->closed) return;');
+    this.line('NativeWindow* nw = as_win_wrapper(id);');
+    this.line('if (nw == NULL) return;');
+    this.line('EventDispatcher_dispatchEvent((void*)nw, (Event*)NativeWindowDisplayStateEvent_new((char*)"displayStateChange", false, false, before, after));');
+    this.indent--;
+    this.line('}');
     // Claim slot 0 for the app's initial window (see the note above). The slot may
     // already be bound before the OS window exists: AIR builds the initial window
     // BEFORE the document class runs, but our bootstrap creates the stage first and
@@ -22272,6 +22619,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL) return;');
+    // Report anything the window manager did to ANY window since the last frame
+    // (moved, resized, focused, lost focus, changed display state, asked to close)
+    // BEFORE the frame runs, so a listener that reacts by re-laying out sees a
+    // consistent stage. The loop is here, not in ASC_window_on_frame's caller,
+    // because the loop runs the application frame through ONE clock window (the
+    // first visible one) -- polling only `id` would leave every other open window's
+    // events undispatched until it happened to become the clock. One poll sweep per
+    // application frame is also exactly AIR's cadence.
+    this.line('int i;');
+    this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) ASC_win_poll(i);');
     this.line('ASC_dispatch_vsync_event(id, (void*)w->stage);');
     this.line('Stage_dispatchFrame((void*)w->stage);');
     this.indent--;
@@ -22436,6 +22793,30 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (w == NULL || w->stage == NULL || w->closed) continue;');
     this.line('NativeWindow* nw = as_win_wrapper(i);');
     this.line('if (nw != NULL) as_array_push(a, as_v_obj((void*)nw));');
+    this.indent--;
+    this.line('}');
+    this.line('return a;');
+    this.indent--;
+    this.line('}');
+    this.line('static as_vector_NativeWindow* as_win_owned_windows(int id) {');
+    this.indent++;
+    // AIR's own return type here is `Vector.<NativeWindow>` (measured: adl prints
+    // `__AS3__.vec::Vector.<flash.display::NativeWindow>` for it, temp/nwmac/
+    // nwmac-out.txt), unlike NativeApplication.openedWindows which is an Array.
+    this.line('as_vector_NativeWindow* a = as_vector_NativeWindow_new();');
+    this.line('ASCWin* me = ASC_w(id);');
+    // `w->owner` holds the NativeWindowInitOptions.owner OBJECT and AIR compares
+    // windows by object identity here, so the test is pointer equality against this
+    // window's own NativeWindow object -- the same object the caller used.
+    this.line('if (me == NULL || me->window == NULL) return a;');
+    this.line('int i;');
+    this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(i);');
+    this.line('if (w == NULL || w == me || w->stage == NULL || w->closed) continue;');
+    this.line('if (w->owner != me->window) continue;');
+    this.line('NativeWindow* nw = as_win_wrapper(i);');
+    this.line('if (nw != NULL) as_vector_NativeWindow_push(a, nw);');
     this.indent--;
     this.line('}');
     this.line('return a;');

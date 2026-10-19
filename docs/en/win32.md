@@ -47,12 +47,12 @@ re-downloaded on Windows.)
 
 ---
 
-## 2. Building the Dependency Libraries: `vendor/build-windows-deps.ps1`
+## 2. Building the Dependency Libraries: `vendor/provision/windows.ps1`
 
 ```powershell
-pwsh vendor/build-windows-deps.ps1 -Arch x64    # produces vendor/*/lib/windows-x64
-pwsh vendor/build-windows-deps.ps1 -Arch x86    # produces vendor/*/lib/windows-x86
-pwsh vendor/build-windows-deps.ps1 -Arch arm64  # produces vendor/*/lib/windows-arm64 (needs the ARM64 toolset installed first, see §2.11)
+pwsh vendor/provision/windows.ps1 -Arch x64    # produces vendor/*/lib/windows-x64
+pwsh vendor/provision/windows.ps1 -Arch x86    # produces vendor/*/lib/windows-x86
+pwsh vendor/provision/windows.ps1 -Arch arm64  # produces vendor/*/lib/windows-arm64 (needs the ARM64 toolset installed first, see §2.11)
 ```
 
 Built from source: **Skia m124** (`build-tools/skia-src`, with `bin/gn` + ninja), **SDL2 2.32.10**,
@@ -179,7 +179,7 @@ Once the dependency libraries compiled, the **program side** (the generated `air
    `SkRefCnt.h` ⇒ added the include.
 
 (This differs from §2.4's "four things that would not compile in Skia's source": those four self-heal by
-patching the **source** inside `build-windows-deps.ps1`; these four are fixed in the **in-repo glue files** and
+patching the **source** inside `vendor/provision/windows.ps1`; these four are fixed in the **in-repo glue files** and
 committed directly.)
 
 ### 2.7 Three Windows-Specific Runtime Defects (hit on the real-machine first run 2026-10-10, fixed)
@@ -194,7 +194,7 @@ the first a crash, the last two semantic gaps in `flash.filesystem` on Windows, 
    (exit 132). Fix: at build time **deploy `vendor/skia/lib/windows-x{N}/icudtl.dat` (10185008 bytes) into the
    output directory automatically** — `src/build.ts` gained `deploySkiaIcuData(cfg, outPath)` (active for
    win32+native+linked-against-skia), and `src/index.ts` calls it after a successful link
-   (`[4/4] data icudtl.dat -> ...`); `build-windows-deps.ps1` copies it alongside the artifacts too and
+   (`[4/4] data icudtl.dat -> ...`); `vendor/provision/windows.ps1` copies it alongside the artifacts too and
    `Fail`s if missing.
 2. **async FileStream `openAsync(…, FileMode.READ)` → `__fastfail`**. The async `AS_JOB_FS_OPEN` mode mapping
    was written as `mode = j->mode` (pass through whatever is non-empty), and `FileMode.READ` is the string
@@ -887,10 +887,16 @@ as **Windows 8**. Both `GetSystemMetrics(89)` and `RtlGetVersion` are resolved t
 is compiled into **every** build, and headless builds do **not** link user32, so a static reference breaks the link
 outright (`undefined symbol: GetSystemMetrics`).
 
-**Left unaligned (stated, not guessed)**: macOS / Linux / WASI still report the bare family name
-(`"Mac OS"` / `"Linux"` / `"WASI"`). AIR appends a version there too, but this host is Windows and no Darwin/Linux
-release→name table can be verified from it, so nothing is invented; the gap is written down in the code comment
-instead of being filled with a plausible-looking value.
+**macOS closed out (stage one hundred and ninety-six, measured)**: `Mac OS <major>.<minor>.<patch>` — **verbatim
+identical** to `adl 51.4.1` (this host answers `Mac OS 26.6.2`; the two-ended twin probe
+`temp/nwmac/nwmac-{adl,aot}.txt` agrees on its first line, `CAP_os`). The shape matches the Windows side (AIR is
+"family name + version", never a bare family name), with the version derived from `uname`'s Darwin release and
+mapped to the system version AIR reports.
+
+**Left unaligned (stated, not guessed)**: Linux / WASI still report the bare family name (`"Linux"` / `"WASI"`).
+AIR appends a version there too, but this host has no Linux `adl` oracle and no release→name table to verify, so
+nothing is invented; the gap is written down in the code comment instead of being filled with a plausible-looking
+value.
 
 Pins: `unit: platform/CapabilitiesOs` (all 18 returnable names present / the `build >= 22000` promotion / the
 `wProductType` split / **no static user32 dependency** / the rationale on record) and `examples/stage65.as` (on
@@ -926,7 +932,7 @@ trap this project has hit; see §2.9.**
 
 On a Windows x64 machine, in order:
 
-1. `pwsh vendor/build-windows-deps.ps1 -Arch x64` (then optionally `-Arch x86`). **Verify**: the ps1's
+1. `pwsh vendor/provision/windows.ps1 -Arch x64` (then optionally `-Arch x86`). **Verify**: the ps1's
    `SetEnv.cmd` detection under real PowerShell, `Invoke-CmakeBuild`'s `-Arch` passing, and that
    `Assert-LibBitness` does not false-positive (on the macOS side we only achieved "portable pwsh parses the AST
    + `gn format` passes + the patch hits the real source and is idempotent").

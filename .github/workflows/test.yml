@@ -32,8 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Node >= 22.6 is required: src/ is run as .ts directly through Node's
-      # native type-stripping (no build step, no third-party test framework).
+      # Node >= 22.18 is required: src/ is run as .ts directly through Node's
+      # native type-stripping (no build step, no third-party test framework), and
+      # 22.18 / 23.6 is where stripping became the DEFAULT. The published package
+      # does not depend on this -- it ships pre-built dist/ JavaScript and runs on
+      # Node >= 18 -- but the checkout does.
       - uses: actions/setup-node@v4
         with:
           node-version: '24'

@@ -329,14 +329,29 @@ this project and happens to support what is needed. We compile an arm64 static l
 (`configure --host=arm64-apple-darwin --disable-shared`), controlling the version ourselves, with no need to
 chase a new major version barely a year old.
 
-**Skia: m124 is indeed old (~1.5 years), but there is a concrete reason.** The root cause is environmental
-constraints: this machine lacks `gn`/`ninja` and has insufficient disk space to compile from source, so it can
-only consume the precompiled milestone Aseprite officially pins (§6.1). A secondary reason: Skia has no stable
-API/ABI, the milestone rolls every 4–6 weeks and interfaces change frequently, so an upgrade means rewriting
-the entire `skia_glue.cc` layer; and m124 already contains all needed modules
-(`SkParagraph`/`Skottie`/GPU backends). **Upgrade trigger condition**: only when a feature available only in a
-new milestone is truly needed (e.g. some new `SkImageFilter`, new font-engine behavior) do you set up the
-`gn`/`ninja` environment to self-compile the latest from source and re-test the entire glue layer.
+**Skia: m124 is indeed old (~2.5 years, m124 ≈ 2024-04), but there is a concrete reason.** Note that
+"environmental constraints" is **no longer** the reason — it is **historical**, as §6.1's "how this project
+actually does it" already marks it: the repo-root `build-tools/skia-src` is now a full m124 source tree (with
+`bin/gn` + `third_party`), and `vendor/skia/lib/macos-arm64/libskia.a` is **self-compiled** from it along with a
+local patch (`vendor/skia/patches/`). The real reasons are three: ① Skia has no stable API/ABI, the milestone
+rolls every 4 weeks and interfaces change frequently, so an upgrade means rewriting the entire `skia_glue.cc`
+layer; ② the four platform libraries (`macos-arm64`/`wasm`/`windows-x64`/`windows-x86`) and the vendored headers
+must move **in one batch**, the local patches must be re-applied and the `[skia-abi]` byte-for-byte pins re-run —
+§6.5 records an incident where a change made *within the same milestone* to `kMaxSubclassSize` was enough to
+corrupt a register (`x28`), so a cross-milestone jump can only be worse; ③ m124 already contains all needed
+modules (`SkParagraph`/`Skottie`/GPU backends). **Upgrade trigger condition**: only when a feature available
+only in a new milestone is truly needed (e.g. some new `SkImageFilter`, new font-engine behavior) do you take
+the corresponding milestone from `build-tools/skia-src` and recompile (**no** need to set up a `gn`/`ninja`
+environment again) and re-test the entire glue layer.
+
+> **Re-checked 2026-10-19 (v0.4.179)**: `skia-canvas` **4.0.0** (released 2026-10-12) bundles **Skia m153**
+> (`skia-safe` 0.99.0), but it is a **Node.js N-API binding** driving Skia through runtime JS Canvas calls,
+> which is **not the same layer** as this project's "**compile-time** static linking of Skia C++ into a native
+> artifact / wasm" — there is no integration path (and this project's npm dependency set is permanently empty,
+> §3.1). Nor is there anything to take from 4.0's fix list: the one cross-cutting item (the macOS Metal exporter
+> missing an autorelease pool ⇒ native-buffer leak) we already have (`@autoreleasepool` in `metal_glue.mm` /
+> `stage3d_glue.mm`). **The "upgrade the milestone" decision was therefore not reopened; the trigger condition
+> is unchanged.**
 
 ### 6.5 vendored headers must be the **same version** as the precompiled library (this is ABI, not documentation)
 

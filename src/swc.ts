@@ -286,7 +286,15 @@ export interface SwcCharacterClass {
  * sprite is a `MovieClip` subclass, an exported button a `SimpleButton`, and a
  * baked ctor body is what makes `new homeskin()` show the artwork (swc.md §9 E-3).
  */
-export function swcCompileInputs(lib: SwcLibrary): {
+export function swcCompileInputs(
+  lib: SwcLibrary,
+  // Does THIS compilation provide the class? Answered by the caller (index.ts) from
+  // the set of sources it is about to compile, because the SWC layer cannot know it:
+  // the library's own copy of a base class is never compiled from ABC (swc.md §3.3),
+  // so a base is only real when the project compiles it from source. The default
+  // (`false`) is the artwork-only case: nothing outside the library is available.
+  hasProjectClass: (fqn: string) => boolean = () => false
+): {
   decls: Stmt[];
   specs: SwcResourceSpec[];
   chars: SwcCharacterClass[];
@@ -315,9 +323,10 @@ export function swcCompileInputs(lib: SwcLibrary): {
     if (kind !== 'sprite' && kind !== 'button') continue;
     const { name, pkg } = splitFqn(className);
     const script = lib.scripts.get(charId);
-    const baseName = lib.bases.get(charId) ?? { baseName: '', dynamic: false };
-    decls.push(swcDisplayClassDecl(name, pkg, kind, script, baseName.baseName, baseName.dynamic));
-    chars.push({ cname: qualifiedName(name, pkg), charId, kind, baseName: baseName.baseName, dynamic: baseName.dynamic, frames: script?.frames ?? [] });
+    const base = lib.bases.get(charId) ?? { baseName: '', dynamic: false };
+    const baseName = availableProjectBase(base.baseName, hasProjectClass);
+    decls.push(swcDisplayClassDecl(name, pkg, kind, script, baseName, base.dynamic));
+    chars.push({ cname: qualifiedName(name, pkg), charId, kind, baseName, dynamic: base.dynamic, frames: script?.frames ?? [] });
   }
   return { decls, specs, chars };
 }
@@ -331,6 +340,33 @@ export function swcCompileInputs(lib: SwcLibrary): {
  * (`as_swc_bind`), because the construction is C — not AS3 — and therefore cannot
  * live in an AST body (AGENTS.md §2.8).
  */
+/**
+ * The base class to bind a symbol to, or `''` for the stock artwork superclass.
+ *
+ * A project base is only usable when the project actually compiles it: the
+ * library's own copy of that class arrives as ABC (which is out of scope, swc.md
+ * §3.3), so a symbol bound to a class that is not in this compilation cannot even be
+ * DECLARED (the semantic layer reports `unknown superclass`). Baking the artwork
+ * symbol as a plain `MovieClip`/`SimpleButton` subclass is then the closest thing to
+ * AIR that this compiler can produce -- and it is announced, never silent, because
+ * members inherited from the missing base are genuinely absent.
+ */
+const reportedMissingBases = new Set<string>();
+function availableProjectBase(baseName: string, hasProjectClass: (fqn: string) => boolean): string {
+  if (baseName.length === 0 || baseName.startsWith('flash.display.')) return '';
+  if (hasProjectClass(baseName)) return baseName;
+  // Once per missing base, not once per symbol: a widget base is typically shared by
+  // several exported symbols and repeating the same paragraph buries the rest.
+  if (!reportedMissingBases.has(baseName)) {
+    reportedMissingBases.add(baseName);
+    process.stderr.write(
+      `\x1b[33mwarning: SWC symbol class extends '${baseName}', which this compilation does not provide: ` +
+        `baking those symbols as plain artwork symbols instead, so members inherited from '${baseName}' are missing (docs/zh-cn/swc.md)\x1b[0m\n`
+    );
+  }
+  return '';
+}
+
 function swcDisplayClassDecl(name: string, pkg: string | null, kind: 'sprite' | 'button', script: AbcSymbolClass | undefined, baseName: string, dynamic: boolean): Stmt {
   // A base class the PROJECT compiles from source outranks the stock artwork
   // superclass: AIR links a code library's symbol class to whatever its `DoABC`

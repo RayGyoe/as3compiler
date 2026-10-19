@@ -593,7 +593,7 @@ export function effectiveDefines(cfg: BuildConfig): string[] {
 }
 
 // The MSVC target triple for a Windows native build. clang on Windows must name
-// the ABI explicitly: the archives build-windows-deps.ps1 produces are MSVC-ABI,
+// the ABI explicitly: the archives vendor/provision/windows.ps1 produces are MSVC-ABI,
 // and an AIR app whose <architecture> is "32" needs the i686 triple on every
 // compile AND link step — otherwise clang emits x86_64 objects that cannot link
 // against the windows-x86 archives. The triple is spelled out for "64" too so the
@@ -615,13 +615,30 @@ export function windowsTargetTriple(architecture: string): string {
   return 'x86_64-pc-windows-msvc';
 }
 
+// The vendor/<pkg>/lib/<key> directory a NON-Windows host links against.
+//
+// macOS arm64 is the only non-Windows host with a prebuilt tree (vendor/*/lib/
+// holds macos-arm64, windows-x64, windows-x86 and wasm). Until now air-app.ts
+// spelled this as a bare `'macos-arm64'` fallback, which meant EVERY non-Windows
+// host -- Linux, and an Intel Mac -- was handed an ARM64 archive set plus Cocoa/
+// Metal frameworks. That does not fail early and it does not say why: it is a
+// silent wrong answer that only surfaces at link time, which is exactly the
+// class of failure §1.5 forbids. Returning '' means "this host has no tree",
+// and the caller has to say so instead of guessing one.
+//
+// Exported (and parameterised) so both rows are pinnable from any machine: a
+// darwin/arm64 box cannot otherwise exercise the Linux row.
+export function nonWindowsVendorKey(platform: string, hostArch: string): string {
+  return platform === 'darwin' && hostArch === 'arm64' ? 'macos-arm64' : '';
+}
+
 // Extra flags every native step (C compile, C++ compile, link) needs on Windows
 // so all three drivers agree on the same ABI; empty elsewhere and for non-AIR
 // builds (architecture === ''), which keep clang's host default.
 function nativeTargetFlags(cfg: BuildConfig): string[] {
   if (process.platform !== 'win32' || cfg.target !== 'native') return [];
   if (cfg.architecture !== '32' && cfg.architecture !== '64' && cfg.architecture !== 'arm64') return [];
-  // Static CRT (/MT). The archives build-windows-deps.ps1 ships are all /MT
+  // Static CRT (/MT). The archives vendor/provision/windows.ps1 ships are all /MT
   // (Skia's is_official_build, SDL2's CMakeLists, and the curl/nghttp2/zlib stack
   // via -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded / nghttp2 -DENABLE_STATIC_CRT).
   // clang's default for an MSVC triple is the *dynamic* CRT (/MD): it compiles
@@ -639,7 +656,7 @@ function nativeTargetFlags(cfg: BuildConfig): string[] {
 // looks for icudtl.dat *beside the executable*. Without it the first text-shaping
 // call crashes with SIGILL: SkParagraph::Cluster::Cluster reads an out-of-bounds
 // index into the empty grapheme-property table and SK_ABORT()s to a `ud2` trap.
-// `build-windows-deps.ps1` already copies icudtl.dat next to the skia .lib; here
+// `vendor/provision/windows.ps1` already copies icudtl.dat next to the skia .lib; here
 // we mirror it next to the freshly linked exe (SkLoadICU only probes the exe and
 // library directories, so shipping it beside the .lib is not enough). Returns
 // true when a copy happened.
