@@ -360,7 +360,7 @@ function checkTransformMatrix(): string[] {
   check('the glue declares the seam before the event pump uses it',
     glue.indexOf('void sk_window_set_cursor(int id, int kind);') < glue.indexOf('SDL_WINDOWEVENT_LEAVE'));
   check('leaving the window restores the arrow',
-    glueBodyArrow(glue).includes('SK_CURSOR_ARROW'));
+    glueBodyArrow(glue).includes('sk_window_set_cursor(id, SK_CURSOR_ARROW);'));
   check('the web glue stubs the seam so wasm builds still link',
     webGlue.includes('void sk_window_set_cursor(int id, int kind) { (void)id; (void)kind; }'));
 
@@ -468,8 +468,13 @@ function checkScale9Grid(): string[] {
 // The SDL_WINDOWEVENT_LEAVE arm of the glue's event switch, isolated so the check
 // cannot be satisfied by some other SK_CURSOR_ARROW mention.
 function glueBodyArrow(glue: string): string {
+  // The body of the SDL_WINDOWEVENT_LEAVE branch: from its marker to the next
+  // SDL_WINDOWEVENT case (the branch made room for the "is the pointer really
+  // outside" filter and its comment, so a fixed-length slice is not enough).
   const i = glue.indexOf('SDL_WINDOWEVENT_LEAVE) {');
-  return i < 0 ? '' : glue.slice(i, i + 400);
+  if (i < 0) return '';
+  const next = glue.indexOf('SDL_WINDOWEVENT', i + 30);
+  return glue.slice(i, next < 0 ? i + 2400 : next);
 }
 
 // ---- TextField.getLineMetrics / flash.text.TextLineMetrics (stage 103) ----
@@ -902,7 +907,7 @@ function checkMcButtonState(): string[] {
     fn.includes("if (mc->_tl_char == 0) return;") &&
     fn.includes("if (!((InteractiveObject*)o)->buttonMode) return;") &&
     fn.includes('Stage* mst = as_mouse_owner_stage(o);') &&
-    fn.includes('if (mst == NULL || !mst->_mouse_has) return;'));
+    fn.includes('if (mst == NULL || !mst->_mouse_in) return;'));
 
   // ② 帧由标签决定 + 缺失时退链（不作帧号映射）
   check('the frame comes from the label, with a _down -> _over -> _up fallback chain',
@@ -937,7 +942,7 @@ function checkMcButtonState(): string[] {
   // 且用的是**正在绘制那个 stage** 自己的坐标
   check('the pointer target is refreshed once per pass, in both paint entries',
     (emitSource.match(/as_mouse_refresh_target\(\(DisplayObject\*\)/g) ?? []).length === 2 &&
-    emitSource.includes('ASC_mouse_target = (mst != NULL && mst->_mouse_has) ? as_pick_hit((void*)root, mst->_mouse_x, mst->_mouse_y) : NULL;'));
+    emitSource.includes('ASC_mouse_target = (mst != NULL && mst->_mouse_in) ? as_pick_hit((void*)root, mst->_mouse_x, mst->_mouse_y) : NULL;'));
 
   // ⑥ 四条实测结论留在注释里（门是 buttonMode / 帧看标签 / 按压锁 / 祖先烘培）
   const doc = emitSource.slice(emitSource.indexOf('MovieClip button states: buttonMode + the FrameLabel triple'));
@@ -962,16 +967,18 @@ function checkMcButtonState(): string[] {
   return bad;
 }
 
-// unit: display/PerStagePointer — 指针态按 Stage 隔离（阶段二百零七）。
+// unit: display/PerStagePointer — 指针态按 Stage 隔离 + 离开窗口的回滚（阶段二百零七）。
 // AIR 每个 Stage 各有一份指针（一个 NativeWindow 一个 Stage），所以坐标必须挂在 Stage 对象上。
 // 旧实现把它们放在进程级 static 里，症状是「鼠标在别的窗口里动一下，本窗口的按钮就悬停、
 // mouseX/mouseY 跟着别的窗口的客户端坐标走」（实测现场 temp/mouse2w：双窗口 + 真实指针 +
-// Stage.dispatchMouse 两臂；行为钉子见 examples/pointer-per-stage.as，变异测试 6/11 可击穿）。
-// 本组钉四件最容易再丢的事：
-//   ① 坐标在 Stage 上（三个私有槽），进程级坐标一个不剩；
+// Stage.dispatchMouse 两臂；行为钉子见 examples/pointer-per-stage.as，变异测试可击穿）。
+// 本组钉五件最容易再丢的事：
+//   ① 坐标在 Stage 上（私有槽），进程级坐标一个不剩；
 //   ② 每个读点都从**对象自己的** stage 取坐标（SimpleButton 态、MovieClip 态、mouseX/Y、刷新拾取目标）；
 //   ③ 取 stage 的助手刻意**没有** ASC_root_stage 兜底（DisplayObject_get_stage 的兜底会借来别的窗口的 stage）；
-//   ④ ASC_mouse_down 仍是进程级（一个 OS 指针、一个按键态，在别的窗口松手也要清）。
+//   ④ 悬停门是 `_mouse_in`、坐标门是 `_mouse_has`（adl 实测：离开窗口回滚悬停态但**保留**坐标）；
+//   ⑤ 离开事件（SDL_WINDOWEVENT_LEAVE → "mouseLeave"）两端都在，且按键期间被忽略。
+//   另外 ASC_mouse_down 仍是进程级（一个 OS 指针、一个按键态，在别的窗口松手也要清）。
 function checkPerStagePointer(): string[] {
   let ok = 0;
   const bad: string[] = [];
@@ -983,36 +990,67 @@ function checkPerStagePointer(): string[] {
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
   const symbolsSource = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
   const example = readFileSync(join(root, 'examples', 'pointer-per-stage.as'), 'utf8');
+  const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
   const owner = emitSource.slice(emitSource.indexOf('static Stage* as_mouse_owner_stage'));
   const sbtn = emitSource.slice(emitSource.indexOf("this.line('static DisplayObject* as_sbtn_state(DisplayObject* o) {'"));
+  const dispatch = emitSource.slice(emitSource.indexOf("this.line('void Stage_dispatchMouse(void* _this"));
 
   // ① 坐标挂在 Stage 上，进程级坐标一个不剩
-  check('the pointer coordinates live on the Stage (three private slots)',
+  check('the pointer coordinates live on the Stage (private slots)',
     symbolsSource.includes("['_mouse_x', stgp({ kind: 'number' })]") &&
     symbolsSource.includes("['_mouse_y', stgp({ kind: 'number' })]") &&
-    symbolsSource.includes("['_mouse_has', stgp({ kind: 'bool' })]"));
+    symbolsSource.includes("['_mouse_has', stgp({ kind: 'bool' })]") &&
+    symbolsSource.includes("['_mouse_in', stgp({ kind: 'bool' })]"));
   check('no process-wide pointer coordinate survives in the emitter',
     !emitSource.includes('ASC_mouse_x') && !emitSource.includes('ASC_mouse_y') && !emitSource.includes('ASC_mouse_has'));
   check('the dispatch writes the stage it was called on, not a shared slot',
     emitSource.includes("this.line('Stage* mst = (Stage*)_this;')") &&
-    emitSource.includes('if (mst != NULL) { mst->_mouse_x = x; mst->_mouse_y = y; mst->_mouse_has = true; }'));
+    emitSource.includes('if (mst != NULL) { mst->_mouse_x = x; mst->_mouse_y = y; mst->_mouse_has = true; mst->_mouse_in = true; }'));
 
   // ② 每个读点各取自己的 stage
   check('every reader resolves the object own stage through the helper',
     (emitSource.match(/as_mouse_owner_stage\(/g) ?? []).length >= 6);
   check('the SimpleButton state hovers off that button own stage',
     sbtn.includes('Stage* mst = as_mouse_owner_stage(o);') &&
-    sbtn.includes('int hover = (mst != NULL && mst->_mouse_has) ? as_sbtn_contains(b, mst->_mouse_x, mst->_mouse_y) : 0;'));
+    sbtn.includes('int hover = (mst != NULL && mst->_mouse_in) ? as_sbtn_contains(b, mst->_mouse_x, mst->_mouse_y) : 0;'));
   check('mouseX/mouseY read the stage the object belongs to',
     emitSource.includes('double DisplayObject_get_mouseX(void* _this) { Stage* mst = as_mouse_owner_stage((DisplayObject*)_this); if (mst == NULL || !mst->_mouse_has) return 0.0;'));
   check('the paint pass refreshes the roll-over target from the stage it paints',
-    emitSource.includes('ASC_mouse_target = (mst != NULL && mst->_mouse_has) ? as_pick_hit((void*)root, mst->_mouse_x, mst->_mouse_y) : NULL;'));
+    emitSource.includes('ASC_mouse_target = (mst != NULL && mst->_mouse_in) ? as_pick_hit((void*)root, mst->_mouse_x, mst->_mouse_y) : NULL;'));
 
   // ③ 助手不借别的窗口的 stage
   check('as_mouse_owner_stage walks to the root and demands it BE a Stage',
     owner.includes('while (o != NULL && o->parent != NULL) o = (DisplayObject*)o->parent;') &&
     owner.includes('strcmp(o->vtable->cls_name, "Stage") == 0') &&
     !owner.slice(0, 900).includes('ASC_root_stage'));
+
+  // ④ 离开窗口：悬停门回 false、坐标门不动（adl 实测「回滚悬停态但保留坐标」）—— 只看
+  //    分支自己的语句（到它自己的 return 为止），绝不能碰坐标：
+  const leaveAt = dispatch.indexOf('strcmp(type, "mouseLeave")');
+  const leave = dispatch.slice(leaveAt, dispatch.indexOf("this.line('return;')", leaveAt));
+  check('a leave clears the hover gate and NOT the coordinates',
+    dispatch.includes("this.line('if (strcmp(type, \"mouseLeave\") == 0) {')") &&
+    leave.includes('mst->_mouse_in = false;') &&
+    !leave.includes('_mouse_x =') && !leave.includes('_mouse_y =') && !leave.includes('_mouse_has ='));
+  check('a leave dispatches the AIR-measured mouseLeave ON THE STAGE',
+    dispatch.includes('EventDispatcher_dispatchEvent((void*)mst, (Event*)Event_new((char*)"mouseLeave", false, false));'));
+  check('a leave while the button is held is ignored (the press owns the pointer)',
+    dispatch.includes('if (mst != NULL && !ASC_mouse_down) {'));
+  check('mouseX/mouseY still gate on the coordinate slot, not on the hover slot',
+    emitSource.includes('Stage* mst = as_mouse_owner_stage((DisplayObject*)_this); if (mst == NULL || !mst->_mouse_has) return 0.0;'));
+  // 后端那一半：没有它，窗口里永远收不到 mouseLeave（CI 无窗口，只能钉源级）
+  check('the window backend forwards SDL_WINDOWEVENT_LEAVE on the mouse channel',
+    glue.includes('e.window.event == SDL_WINDOWEVENT_LEAVE') &&
+    glue.includes('c->on_mouse(id, 0.0, 0.0, "mouseLeave");') &&
+    glue.includes('c->dirty = 1;'));
+  // 但「报上来的 LEAVE」不等于真的离开：窗口在静止指针下被抬起/激活时，Windows 会发
+  // WM_MOUSELEAVE，SDL 随之报一个指针仍在窗内的 LEAVE（实测 temp/mouse2w GLUE-DBG：
+  // 指针 1268,301 落在该窗 1108,181 304x201 客户区里）。没这个过滤，应用会收到假的
+  // mouseLeave（adl 同一时序下没有），所以它必须按几何再判一次。
+  check('a reported leave with the pointer still inside is filtered out',
+    glue.includes('int still_inside = gx >= wx + 2 && gx <= wx + ww - 2 &&') &&
+    glue.includes('gy >= wy + 2 && gy <= wy + wh - 2;') &&
+    glue.includes('if (!still_inside) {'));
 
   // ④ 按键态仍是进程级 + 行为钉子在场（且反例在前）
   check('the button-down latch stays process-wide (one OS pointer)',
@@ -1022,6 +1060,12 @@ function checkPerStagePointer(): string[] {
     example.indexOf('b.dispatchMouse') < example.indexOf('a.dispatchMouse(20, 20') &&
     example.includes("a pointer on another stage does not hover this stage's button") &&
     example.includes('btn.width, 40'));
+  check('the behavior pin covers the leave roll-back and the retained coordinates',
+    example.includes('a.dispatchMouse(20, 20, "mouseLeave");') &&
+    example.includes('leaving the window rolls the button back to up') &&
+    example.includes('...but mouseX/mouseY keep the last in-window position') &&
+    example.includes('...and the stage gets the AIR-measured mouseLeave event') &&
+    example.includes('a leave while the button is held is ignored (the press owns the pointer)'));
 
   if (ok > 0) console.log(`[perstage] ${ok} per-Stage pointer checks passed`);
   return bad;

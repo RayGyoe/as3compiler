@@ -1549,6 +1549,12 @@ export class SymbolTable {
         ['_mouse_x', stgp({ kind: 'number' })],
         ['_mouse_y', stgp({ kind: 'number' })],
         ['_mouse_has', stgp({ kind: 'bool' })],
+        // Whether the pointer is inside THIS window right now. Distinct from
+        // `_mouse_has` because AIR keeps reporting the last in-window mouseX/mouseY
+        // after the pointer leaves (measured: 179.9,203.6 once it had crossed into the
+        // other window) while the roll-over state rolls back to up -- so the hover
+        // gate is this flag and the coordinate gate is `_mouse_has`.
+        ['_mouse_in', stgp({ kind: 'bool' })],
       ]),
       methods: new Map([
         ['dispatchMouse', { returnType: { kind: 'void' }, params: [

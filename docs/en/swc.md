@@ -1083,6 +1083,23 @@ pointer** (AIR: one per NativeWindow), moving the mouse in another window never 
 state around. A stage the pointer has never entered (off-window `BitmapData.draw`, a build with no window)
 keeps the up state — which is why §9.1's offscreen acceptance only compares the up state.
 
+**The hover gate and the coordinate gate are two different things (measured)**: `_mouse_in` = "the pointer is
+inside this window right now", `_mouse_has` = "a pointer position is known". The hover states (SimpleButton
+four states, MovieClip button states, roll-over target refresh) are gated on `_mouse_in`; `mouseX/mouseY` are
+gated on `_mouse_has`. Reason: measured on adl 51.4.1 (two windows, real pointer), when the pointer **leaves**
+the window the hover state rolls back to up but `mouseX/mouseY` **keep** the last in-window position
+(179.9,203.6 — neither zeroed nor following the other window), and adl dispatches, in order,
+mouseOut → rollOut (on the object) → `"mouseLeave"` (on the Stage). This runtime implements exactly that: the
+backend feeds `SDL_WINDOWEVENT_LEAVE` into the mouse channel under the reserved `"mouseLeave"` type (with
+coordinates 0,0, which the AS3 side ignores), and `Stage_dispatchMouse` then clears only `_mouse_in`,
+dispatches `mouseLeave` on the Stage, and **never touches the coordinates**; while a button is held it is not
+treated as a leave at all (AIR latches the press to the object it started on). Note also that **a reported
+LEAVE is not necessarily a real leave**: raising/activating a window under a stationary pointer makes Windows
+emit `WM_MOUSELEAVE`, so SDL reports a LEAVE with the pointer still inside (measured), so the backend
+re-checks the pointer against the window rectangle before forwarding, keeping apps from seeing a fake
+`mouseLeave`. (The per-object mouseOut/rollOut pair still needs "this stage's hovered object" and is the part
+not yet implemented.)
+
 **Hit determination (the real pit of this item)**: in the window probe hover was always 0. Root cause:
 `as_sbtn_contains` initially used `as_pick_hit`, which **only reports InteractiveObject**; a button's hit state
 is built from ordinary `Shape`s, so it never hit. Changed to a geometric determination — map the stage point

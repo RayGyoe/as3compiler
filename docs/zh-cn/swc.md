@@ -937,6 +937,18 @@ Stage 各有一份指针**（AIR 一个 NativeWindow 一个 Stage），别的窗
 指针从未到过的 stage（离屏 `BitmapData.draw`、没有窗口的构建）保持 up 态 —— 这也是 §9.1 的离屏
 验收只比 up 态的原因。
 
+**悬停门与坐标门是两回事（实测）**：`_mouse_in`＝「指针现在在本窗口内」，`_mouse_has`＝「已知一个
+指针位置」。悬停态（SimpleButton 四态、MovieClip 按钮态、拾取目标刷新）门在 `_mouse_in` 上；
+`mouseX/mouseY` 门在 `_mouse_has` 上。理由：adl 51.4.1 实测（双窗口 + 真实指针）指针**离开窗口**时
+悬停态回滚到 up，但 `mouseX/mouseY` **保留**最后那个窗内位置（179.9,203.6，既不清零也不跟随另一个
+窗口），并按序派发 mouseOut → rollOut（具体对象）→ `"mouseLeave"`（Stage 上）。本运行时按此实现：
+后端把 `SDL_WINDOWEVENT_LEAVE` 以保留类型 `"mouseLeave"` 送进鼠标通道（指针坐标带 0,0，AS3 侧忽略），
+`Stage_dispatchMouse` 收到后只清 `_mouse_in`、派发 Stage 上的 `mouseLeave`，**绝不碰坐标**；按键
+未松时不当作离开（AIR 把按压闩在按下的那个对象上）。另外，**报上来的 LEAVE 不等于真的离开**：
+窗口在静止指针下被抬起/激活时 Windows 会发 `WM_MOUSELEAVE`，SDL 随之报一个指针仍在窗内的 LEAVE
+（实测），所以后端会按几何再判一次「指针是否真的在窗外」再转发，避免应用收到假的 `mouseLeave`。
+（具体对象的 mouseOut/rollOut 仍需「本舞台当前悬停对象」，是尚未实现的那部分。）
+
 **命中判定（本项真正的坑）**：窗口探针里 hover 恒为 0。根因：`as_sbtn_contains` 最初用
 `as_pick_hit`，而它**只报告 InteractiveObject**；按钮的 hit 态是用**普通 `Shape`** 搭出来的，于是永不命中。
 改为几何判定——把舞台点映到按钮本地空间，再映射进 hit 态自身空间，调用

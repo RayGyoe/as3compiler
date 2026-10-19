@@ -266,8 +266,9 @@ int sk_display_usable_bounds(int i, int* x, int* y, int* w, int* h) {
 // resize during a frame) would silently clobber.
 //
 // on_mouse receives the window-relative x/y and an AS3 event-type string
-// ("mouseDown"/"mouseUp"/"click", plus the reserved "wordSelect" described at
-// its dispatch site); on_redraw is invoked after every handled event
+// ("mouseDown"/"mouseUp"/"click", the reserved "mouseLeave" for leaving the
+// window, plus the reserved "wordSelect" described at its dispatch site); on_redraw
+// is invoked after every handled event
 // so the AS3 side can re-rasterize the (possibly mutated) display tree into the
 // same surface.
 typedef void (*sk_mouse_cb)(int win, double x, double y, const char* type);
@@ -1121,10 +1122,44 @@ static void sk_run_loop(void) {
           } else if (e.window.event == SDL_WINDOWEVENT_EXPOSED) {
             c->dirty = 1;
           } else if (e.window.event == SDL_WINDOWEVENT_LEAVE) {
-            // The pointer left the window. macOS can keep a cursor installed by
-            // the last window (SDL_SetCursor is not per-window), so an I-beam
-            // would otherwise follow the pointer onto the menu bar / desktop.
-            sk_window_set_cursor(id, SK_CURSOR_ARROW);
+            // Is the pointer really outside now? Raising/activating a window that
+            // already sits under a stationary pointer makes Windows emit
+            // WM_MOUSELEAVE for it and SDL therefore reports a LEAVE with the
+            // pointer still INSIDE the window -- measured: win=1 ev=11 with the
+            // pointer at 1268,301 inside its 1108,181 304x201 client rect (temp/
+            // mouse2w, GLUE-DBG). Forwarding that as mouseLeave would roll the
+            // window's roll-over state back for no reason while the pointer never
+            // left, and AIR does not do it (its own window in the same schedule
+            // never reported a leave). So a LEAVE with the pointer STRICTLY inside
+            // the client rect is not a leave. The 2px margin keeps a REAL leave --
+            // where the pointer is already outside, typically by a pixel -- from
+            // being swallowed at the boundary.
+            int gx = 0, gy = 0, wx = 0, wy = 0, ww = 0, wh = 0;
+            SDL_GetGlobalMouseState(&gx, &gy);
+            SDL_GetWindowPosition(c->win, &wx, &wy);
+            SDL_GetWindowSize(c->win, &ww, &wh);
+            int still_inside = gx >= wx + 2 && gx <= wx + ww - 2 &&
+                               gy >= wy + 2 && gy <= wy + wh - 2;
+            if (!still_inside) {
+              // The pointer left the window. macOS can keep a cursor installed by
+              // the last window (SDL_SetCursor is not per-window), so an I-beam
+              // would otherwise follow the pointer onto the menu bar / desktop.
+              sk_window_set_cursor(id, SK_CURSOR_ARROW);
+              // Tell the AS3 side, on the mouse channel under the reserved
+              // "mouseLeave" type (ASC_window_on_mouse): AIR rolls the window's
+              // roll-over state back to its up/out state when the pointer leaves the
+              // stage, so without this a button stayed hovered until the pointer came
+              // back and moved once more (TODO.md's "指针移出窗口不 roll-out"). The
+              // coordinates are deliberately 0,0 -- the event carries none, and AIR
+              // does NOT touch mouseX/mouseY on a leave: they keep the last in-window
+              // position (measured on adl 51.4.1, temp/mouse2w), so the AS3 side keeps
+              // its own last values and ignores these. dirty makes the window repaint
+              // with the rolled-back state.
+              if (c->on_mouse) {
+                c->on_mouse(id, 0.0, 0.0, "mouseLeave");
+                c->dirty = 1;
+              }
+            }
           }
           // SIZE_CHANGED/RESIZED are handled by live_resize_watch during pump.
           break;

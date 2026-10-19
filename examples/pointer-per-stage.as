@@ -11,6 +11,7 @@
 import flash.display.Sprite;
 import flash.display.SimpleButton;
 import flash.display.Stage;
+import flash.events.Event;
 
 var pass:int = 0;
 var fails:Array = [];
@@ -20,7 +21,7 @@ function eq(label:String, got:*, want:*):void {
   else { fails.push(label + " (got " + got + ", want " + want + ")"); }
 }
 
-// up 态 40x20、over 态 80x40：按钮的 width 直接暴露它现在显示的是哪个状态。
+// up 态 40x20、over 态 80x40、down 态 60x30：按钮的 width 直接暴露它现在显示的是哪个状态。
 var up:Sprite = new Sprite();
 up.graphics.beginFill(0x9aa0a6);
 up.graphics.drawRect(0, 0, 40, 20);
@@ -29,12 +30,16 @@ var over:Sprite = new Sprite();
 over.graphics.beginFill(0xff2d2d);
 over.graphics.drawRect(0, 0, 80, 40);
 over.graphics.endFill();
+var down:Sprite = new Sprite();
+down.graphics.beginFill(0x3a3a3a);
+down.graphics.drawRect(0, 0, 60, 30);
+down.graphics.endFill();
 // 命中区固定 80x40：状态切换不改变"哪里算按钮上"，只改画出来的那个状态。
 var hit:Sprite = new Sprite();
 hit.graphics.beginFill(0x000000);
 hit.graphics.drawRect(0, 0, 80, 40);
 hit.graphics.endFill();
-var btn:SimpleButton = new SimpleButton(up, over, up, hit);
+var btn:SimpleButton = new SimpleButton(up, over, down, hit);
 btn.x = 10;
 btn.y = 10;
 
@@ -66,6 +71,34 @@ eq("...while that stage follows its own pointer", b.mouseX + "," + b.mouseY, "20
 // ⑤ a 的指针移出按钮：回 up。
 a.dispatchMouse(5, 5, "mouseMove");
 eq("moving this stage's pointer off the button rolls it back to up", btn.width, 40);
+
+// ⑥ 指针离开窗口（mouseLeave）。AIR 实测（adl 51.4.1，temp/mouse2w，真实指针双窗口）：
+//    离开窗口时悬停态回滚到 up，但 mouseX/mouseY **保留**最后那个窗内位置（不清零、也不跟
+//    随别的窗口）；adl 同时按序派发 mouseOut → rollOut（具体对象）→ "mouseLeave"（Stage 上）。
+//    本运行时目前只派发 Stage 那一个（另外两个需要“本舞台当前悬停对象”，是已单独登记的欠账）。
+var mlFired:int = 0;
+a.addEventListener("mouseLeave", function(e:Event):void { mlFired++; });
+a.dispatchMouse(20, 20, "mouseMove");
+eq("a pointer inside the window hovers again", btn.width, 80);
+var kept:String = a.mouseX + "," + a.mouseY;
+a.dispatchMouse(20, 20, "mouseLeave");
+eq("leaving the window rolls the button back to up", btn.width, 40);
+eq("...but mouseX/mouseY keep the last in-window position", a.mouseX + "," + a.mouseY, kept);
+eq("...and the stage gets the AIR-measured mouseLeave event", mlFired, 1);
+
+// ⑦ 按着不放时离开窗口不算离开：AIR 把按压闩在**按下的那个对象**上（temp/btnprobe p7：
+//    在按钮上按下、再把指针拖出去，仍是 _down），所以按键期间后端报的 mouseLeave 被忽略。
+a.dispatchMouse(20, 20, "mouseMove");
+a.dispatchMouse(20, 20, "mouseDown");
+eq("a press shows the down state", btn.width, 60);
+a.dispatchMouse(20, 20, "mouseLeave");
+eq("a leave while the button is held is ignored (the press owns the pointer)", btn.width, 60);
+eq("...and it dispatches no mouseLeave", mlFired, 1);
+a.dispatchMouse(20, 20, "mouseUp");
+eq("releasing over the button returns to over", btn.width, 80);
+a.dispatchMouse(20, 20, "mouseLeave");
+eq("the leave rolls it back once the button is up", btn.width, 40);
+eq("...and dispatches mouseLeave this time", mlFired, 2);
 
 if (fails.length == 0) {
   trace("pointer-per-stage: " + pass + " checks passed");

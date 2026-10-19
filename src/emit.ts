@@ -16033,15 +16033,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     //
     // MEASURED AIR CONTRACT for leaving a window (adl 51.4.1, two windows, real
     // pointer, temp/mouse2w sched.cjs adl arm): the moment the pointer crosses into
-    // the OTHER window, the left window's button ROLLS BACK TO ITS UP STATE while
-    // its mouseX/mouseY KEEP the last in-window coordinates (measured: state
-    // up -> over -> up, mouseX/mouseY frozen at 179.9,203.6 instead of zeroing, and
-    // never following the other window's pointer). We do not roll out yet -- the
-    // window backend never reports the leave (TODO.md's residual), so the hover
-    // sticks -- and whoever wires that up must NOT clear this slot: it gates both the
-    // hover and mouseX/mouseY. Add a separate "pointer is inside" slot (set false on
-    // leave, coords untouched) instead of zeroing `_mouse_has`, or the coordinates
-    // would diverge from AIR's measured behaviour.
+    // the OTHER window the left window's button ROLLS BACK TO ITS UP STATE while its
+    // mouseX/mouseY KEEP the last in-window coordinates (measured: state up -> over ->
+    // up, coordinates frozen at 179.9,203.6 instead of zeroing, never following the
+    // other window's pointer), and the events adl dispatches at that instant are, in
+    // order, mouseOut -> rollOut (on the button) -> "mouseLeave" (on the STAGE).
+    // That is why the hover gate is a separate `_mouse_in` slot: clearing it rolls the
+    // hover back without touching the coordinates. The per-object mouseOut/rollOut
+    // pair is still missing (it needs the hovered object OF THIS STAGE, which the
+    // emitter does not track -- TODO.md's rollOver/rollOut residual); the Stage's
+    // "mouseLeave" is dispatched (see Stage_dispatchMouse).
+    //
+    // The pointer position is recorded before dispatching, and a leave clears only the
+    // "is inside" flag.
     this.line('static int ASC_mouse_down = 0;');
     // The Stage an object belongs to, WITHOUT DisplayObject_get_stage's root fallback.
     // That fallback exists so the document class sees its own `stage` inside its
@@ -16086,7 +16090,26 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // its own, and the AS3 test hook Stage.dispatchMouse(x, y, type) drives the states
     // of the stage it was called on (temp/btnstate).
     this.line('Stage* mst = (Stage*)_this;');
-    this.line('if (mst != NULL) { mst->_mouse_x = x; mst->_mouse_y = y; mst->_mouse_has = true; }');
+    // The pointer left this window (the glue forwards SDL_WINDOWEVENT_LEAVE on the
+    // mouse channel under this reserved type; AS3 can drive it through
+    // Stage.dispatchMouse too). AIR: roll the roll-over state back to up and tell the
+    // Stage, keeping the coordinates (see the measured contract above). A PRESS owns
+    // the pointer -- AIR latches `_down` to the object the press started on and a
+    // press that drags off keeps it (temp/btnprobe p7) -- so a leave while the button
+    // is held is ignored; the OS keeps delivering motion to the captured window
+    // anyway, and the state has to survive it.
+    this.line('if (strcmp(type, "mouseLeave") == 0) {');
+    this.indent++;
+    this.line('if (mst != NULL && !ASC_mouse_down) {');
+    this.indent++;
+    this.line('mst->_mouse_in = false;');
+    this.line('EventDispatcher_dispatchEvent((void*)mst, (Event*)Event_new((char*)"mouseLeave", false, false));');
+    this.indent--;
+    this.line('}');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('if (mst != NULL) { mst->_mouse_x = x; mst->_mouse_y = y; mst->_mouse_has = true; mst->_mouse_in = true; }');
     // An active startDrag() follows the pointer BEFORE the event is dispatched, so a
     // mouseMove listener already sees the object at its new position (AIR moves the
     // object as part of handling the move) -- including the very first move after
@@ -20633,7 +20656,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // another, untouched window must not light up because some other window's mouse
     // moved (AIR keeps one pointer per Stage).
     this.line('Stage* mst = as_mouse_owner_stage(o);');
-    this.line('int hover = (mst != NULL && mst->_mouse_has) ? as_sbtn_contains(b, mst->_mouse_x, mst->_mouse_y) : 0;');
+    this.line('int hover = (mst != NULL && mst->_mouse_in) ? as_sbtn_contains(b, mst->_mouse_x, mst->_mouse_y) : 0;');
 
     this.line('if (hover && ASC_mouse_down && b->downState != NULL) return b->downState;');
     this.line('if (hover && b->overState != NULL) return b->overState;');
@@ -20683,7 +20706,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (mc->_tl_char == 0) return;');
     this.line('if (!((InteractiveObject*)o)->buttonMode) return;');
     this.line('Stage* mst = as_mouse_owner_stage(o);');
-    this.line('if (mst == NULL || !mst->_mouse_has) return;');
+    this.line('if (mst == NULL || !mst->_mouse_in) return;');
     this.line('int over = as_mc_under_target(o);');
     this.line('int pressed = ASC_mouse_down && ASC_press_gen != 0 && ((InteractiveObject*)o)->_btn_press_gen == ASC_press_gen;');
     this.line('const char* want = pressed ? "_down" : (over ? "_over" : "_up");');
@@ -20706,7 +20729,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('static void as_mouse_refresh_target(DisplayObject* root) {');
     this.indent++;
     this.line('Stage* mst = (root != NULL) ? as_mouse_owner_stage(root) : NULL;');
-    this.line('ASC_mouse_target = (mst != NULL && mst->_mouse_has) ? as_pick_hit((void*)root, mst->_mouse_x, mst->_mouse_y) : NULL;');
+    this.line('ASC_mouse_target = (mst != NULL && mst->_mouse_in) ? as_pick_hit((void*)root, mst->_mouse_x, mst->_mouse_y) : NULL;');
     this.indent--;
     this.line('}');
     this.line('static int as_bounds_walk(DisplayObject* o, int with_stroke, int decl, double* l, double* t, double* r, double* b) {');
@@ -22585,6 +22608,18 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // anything in stage coordinates. Under NO_SCALE + TOP_LEFT this is the identity.
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL || w->stage == NULL) return;');
+    // Reserved type sent by the glue when the pointer leaves the window
+    // (SDL_WINDOWEVENT_LEAVE): AIR rolls the roll-over state back to up and dispatches
+    // mouseOut/rollOut on the hovered object followed by "mouseLeave" on the STAGE,
+    // and it does NOT touch mouseX/mouseY (measured on adl 51.4.1 -- full contract in
+    // the comment above Stage_dispatchMouse). A leave carries no coordinates, so it is
+    // handled before the window transform.
+    this.line('if (strcmp(type, "mouseLeave") == 0) {');
+    this.indent++;
+    this.line('Stage_dispatchMouse((void*)w->stage, 0.0, 0.0, (char*)type);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
     this.line('double sx = (x - w->ox) / w->cx;');
     this.line('double sy = (y - w->oy) / w->cy;');
     // Feed the live pointer state a SimpleButton reads at paint time: mouseMove and
