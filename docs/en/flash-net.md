@@ -152,9 +152,9 @@ new request's domain/whole URL with a redirected request's URL).
 > In other words "fold into the query vs send as the body" and "the verb's spelling on the wire"
 > are **one and the same case-insensitive rule**, while the value read back from the property is
 > **not** rewritten. We used to decide with a literal `strcmp(method, "GET")`, so `method="get"`
-> (which is exactly how the TalkMED login page fetches its graphical captcha) both left `data` in
+> (which is exactly how the AcmeApp login page fetches its graphical captcha) both left `data` in
 > the body **and** sent the lowercase verb verbatim ⇒ the server answered 405 ⇒ the app surfaced
-> `Error #2032: Stream Error`. The fix uppercases **once** at the serialization seam
+> `Error #2032: Stream Error`. The fix applies `as_str_toUpper` **once** at the serialization seam
 > (`net__prepare_request`, stage 154), which makes the downstream `strcmp(..., "GET")`/`"POST"`/
 > `"HEAD"` correct; pinned by `unit: transport/RequestMethod`.
 
@@ -214,7 +214,7 @@ plus, and `%` becomes `%25` (so `%41` is not read back as `A`). A non-String val
 
 > **The heap overflow this used to cause (stage 153, fixed)**: the encoded form can be 3x the raw one,
 > while the destination buffer was sized from the **raw** length (`strlen(raw)`), so the write ran off
-> the end. The TalkMED desktop build's SMS-code login request carries a 159-byte `device_info` JSON that
+> the end. The AcmeApp desktop build's SMS-code login request carries a 159-byte `device_info` JSON that
 > encodes to 285 bytes ⇒ 126 bytes past the end, landing on the first word of the neighbouring GC block
 > (a free-list `next`), and the heap collapsed seconds later in `gc_sweep_step` / `as_render_fp` with a
 > **faulting address that was literally the ASCII of the encoded body**. The buffer is now sized by
@@ -471,10 +471,10 @@ library" with evidence — the answer is no**.
 | Directory | Role | Existing contents |
 |---|---|---|
 | `build-tools/` | **build input area**: **source + toolchain** that need to be recompiled themselves, **not part of runtime linking** | `skia-src/` (complete Skia source, recompilable with gn+ninja), `emsdk/` (Emscripten toolchain) |
-| `as3compiler/vendor/` | **consumption area**: **precompiled artifacts**, where the build manifest's `include-paths`/`link-paths`/`link-libs` point | `skia/{include,lib/macos-arm64,lib/wasm}`, `sdl2/arm64/{include,lib}` (static `.a`), each glue `.cc/.mm` + `.o` |
+| `as3compiler/vendor/` | **consumption area**: **precompiled artifacts**, where the build manifest's `include-paths`/`link-paths`/`link-libs` point | `skia/{include,lib/macos-arm64,lib/wasm}`, `sdl2/{include,lib}/macos-arm64` (static `.a`), each glue `.cc/.mm` + `.o` |
 
 That is, the established paradigm is "**put source that needs recompiling in `build-tools/`, put the compiled
-static library in `vendor/<lib>/<platform>-<arch>/{include,lib}`**" — the reason Skia goes this way is that the
+static library in `vendor/<pkg>/{include,lib}/<platform>`**" — the reason Skia goes this way is that the
 official precompiled package does not include Metal and **must be recompiled**. libcurl need not be so.
 
 **Route one (recommended for the first phase): use the system library — zero download, zero compilation, zero vendor**
@@ -864,7 +864,7 @@ The same `examples/url-test/src/Main.as` (login POST + stats GET + results on sc
 **this project** (`as-aot --air-app … --run`).
 The AIR side is observed by **screenshotting the `adl` window** (`adl` swallows `trace()`, so the results are
 only in the on-stage `TextField`), while this project's side reads stdout directly (native `trace` goes straight
-out); both sides face the real `devapimeeting.talkmed.com`:
+out); both sides face the real `api.acme.example`:
 
 | Comparison item | AIR (mxmlc + adl) | This project (`--air-app --run`) | Match? |
 |---|---|---|---|
@@ -889,7 +889,7 @@ out); both sides face the real `devapimeeting.talkmed.com`:
 
 ```bash
 # ① AIR reference implementation (mxmlc + adl)
-SDK=/Users/ray.lei/Documents/Software/AIRSDK/AIRSDK_51.3.4   # note: 51.4.1's adl opens no window on macOS 26, so 51.3.4 is used
+SDK=/Users/<user>/Documents/Software/AIRSDK/AIRSDK_51.3.4   # note: 51.4.1's adl opens no window on macOS 26, so 51.3.4 is used
 "$SDK/bin/mxmlc" -source-path+=examples/url-test/src -output examples/url-test/main.swf examples/url-test/src/Main.as
 "$SDK/bin/adl" examples/url-test/url-test-app.xml -- examples/url-test   # after the window opens, screenshot and read the TextField
 
@@ -903,15 +903,15 @@ script -q /dev/null ./temp/out/url-test/main > temp/url-test-aot.log   # a pty m
 **This project's side, stdout (`temp/url-test-aot.log`, long JSON truncated)**
 
 ```
-=== url-test: TalkMed login + live_statistics ===
+=== url-test: AcmeApp login + live_statistics ===
 
-[login] POST https://devapimeeting.talkmed.com/v1/login
+[login] POST https://api.acme.example/v1/login
 [login] response:
 {"code":0,"data":{"accessToken":"afdd0e0f-…","refreshToken":"…","accessTTL":172800,…},"message":"success"}
 
 [login] accessToken = afdd0e0f-…
 
-[stats] GET https://devapimeeting.talkmed.com/v1/user/live_statistics?access_token=afdd0e0f-…&platform=wechat_small&language=zh_CN&appversion=1.9.10&timezone=8:00
+[stats] GET https://api.acme.example/v1/user/live_statistics?access_token=afdd0e0f-…&platform=wechat_small&language=zh_CN&appversion=1.9.10&timezone=8:00
 [stats] response:
 {"code":0,"data":{"creator_live_total":56,"watcher_live_total":156,"speaker_live_total":68},"message":"success"}
 
@@ -926,7 +926,7 @@ script -q /dev/null ./temp/out/url-test/main > temp/url-test-aot.log   # a pty m
 
 [login] accessToken = a4fe9f8b-…
 
-[stats] GET https://devapimeeting.talkmed.com/v1/user/live_statistics?access_token=a4fe9f8b-…&platform=wechat_small&language=zh_CN&appversion=1.9.10&timezone=8:00
+[stats] GET https://api.acme.example/v1/user/live_statistics?access_token=a4fe9f8b-…&platform=wechat_small&language=zh_CN&appversion=1.9.10&timezone=8:00
 [stats] response:
 {"code":0,"data":{"creator_live_total":56,"watcher_live_total":156,"speaker_live_total":68},"message":"success"}
 
@@ -941,9 +941,9 @@ is **byte-for-byte identical** on both sides.
 **Reverse-comparison output (no `ASC_HAVE_CURL`)**
 
 ```
-=== url-test: TalkMed login + live_statistics ===
+=== url-test: AcmeApp login + live_statistics ===
 
-[login] POST https://devapimeeting.talkmed.com/v1/login
+[login] POST https://api.acme.example/v1/login
 [login] failed: ioError  [Event type="ioError" bubbles=false cancelable=false]
 ```
 
@@ -955,7 +955,7 @@ is **byte-for-byte identical** on both sides.
 #### 6.7.2 Comparison of the two internet PNGs (stage eighty-nine / fifty-four)
 
 The same `examples/url-test/src/Main.as` has two more `Loader.load(URLRequest)` steps appended (two
-`https://meeting.talkmed.com/img/*.png`), run once on each side as before:
+`https://cdn.acme.example/img/*.png`), run once on each side as before:
 
 ```bash
 # this project's side: one command suffices (curl is auto-mounted by --air-app, see §6.7.3)
@@ -976,9 +976,9 @@ node src/index.ts --air-app examples/url-test/url-test-app.xml \
 differs, as the two images are parallel on two workers):
 
 ```
-[img] loading 2 PNGs from meeting.talkmed.com ...
-[img] GET https://meeting.talkmed.com/img/meeting_3.0bca6577.png
-[img] GET https://meeting.talkmed.com/img/meeting_2.6e101b24.png
+[img] loading 2 PNGs from cdn.acme.example ...
+[img] GET https://cdn.acme.example/img/meeting_3.0bca6577.png
+[img] GET https://cdn.acme.example/img/meeting_2.6e101b24.png
 [img] meeting_3.0bca6577.png 753x751 decoded, scale=0.452 -> 340x339 at (10,60)  bytesTotal=487042
 [img] meeting_2.6e101b24.png 815x814 decoded, scale=0.417 -> 340x340 at (370,60)  bytesTotal=511484
 [img] 2/2 images on stage
@@ -1073,7 +1073,7 @@ producing **item-by-item identical** to the curl branch: the pixels BitmapData n
 display SkImage needs. Decoding happens at the frame boundary (the browser has no worker thread to hide it in;
 a few ms per frame, one image per job).
 
-**Hard boundary: these two URLs should **not** be readable on web.** `meeting.talkmed.com`'s image response has
+**Hard boundary: these two URLs should **not** be readable on web.** `cdn.acme.example`'s image response has
 **no** `Access-Control-Allow-Origin` (only `timing-allow-origin: *`). A cross-origin image can be **displayed**
 in the browser, but its **pixels cannot be read** (the canvas gets tainted), and rendering to Skia needs the
 pixels — so this is not a boundary the compiler can work around. Measured in real Chrome: `fetch()` of that URL
@@ -1312,7 +1312,7 @@ like "the default was changed but the example was missed".
 
 ### 6.9 `SharedObject` local store: two-way interoperability with AIR's `.sol` — **executed (stage one hundred and fifty; closed bidirectionally on the real app at stage one hundred and fifty-eight)**
 
-Background: see **D11** of `talkmed-meeting-aot-vs-adl-diff.md`. The desktop app stores prefilled data
+Background: see **D11** of `acme-app-aot-vs-adl-diff.md`. The desktop app stores prefilled data
 (the login account) in a local shared object. Before this stage we wrote `<storage>/<name>.json` (JSON text)
 while AIR writes an AMF3 `.sol` container, so **the two runtimes could not see each other's store** (the AOT
 build lost the prefilled account on start-up) — a user-visible divergence.
@@ -1323,20 +1323,71 @@ build lost the prefilled account on start-up) — a user-visible divergence.
 <applicationStorageDirectory>/#SharedObjects/[<descriptor <content>>/][<localPath>/]<encoded name>.sol
 ```
 
-- `applicationStorageDirectory` is scoped by the descriptor `<id>`: on macOS it is
-  `~/Library/Application Support/<id>/Local Store`. The descriptor's id / content reach the generated C as
+- `applicationStorageDirectory` is scoped by the descriptor `<id>`, and each OS root is copied from `adl`
+  (measured in stage one hundred and eighty-eight): macOS = `~/Library/Application Support/<id>/Local Store`
+  (the AIR 3.3+ path), Windows = `%APPDATA%\<id>\Local Store` (i.e. Roaming; `%APPDATA%` is what the shell's
+  `CSIDL_APPDATA` known folder resolves to, and the documented default
+  `%USERPROFILE%\AppData\Roaming` is the fallback when it is not exported), other POSIX hosts =
+  `~/.as3aot/<id>` (AIR has no counterpart to copy there, so it keeps the `$HOME` dot-directory convention).
+  The descriptor's id / content reach the generated C as
   `-DASC_APP_ID` / `-DASC_SWF_PATH` (injected automatically by `air-app.ts`); a bare build defaults to
   `"as3aot"` / empty (empty drops the `<content>` level, the same shape AIR produces with no SWF).
-- **Name encoding**: every component of a local-store path is capped at 31 bytes. The file keeps the name's
-  **last 27 characters** + `.sol`; the remaining prefix is folded, **from the end**, into directories of at most
-  **30** characters, each suffixed with `#`. Measured: the 35-character
-  `eDoctor_TalkMED_Meeting_Windows_DEV` becomes `eDoctor_#/TalkMED_Meeting_Windows_DEV.sol`, and an
-  80-character name becomes `<23>#/<30>#/<27>.sol`
-  (`head = prefix > 30 ? (prefix % 30 == 0 ? 30 : prefix % 30) : prefix`).
-- ⚠️ **§1.5 disclosure**: for names containing `#`/`:`/spaces/`\`/`?` AIR either raises
-  `Error #2134: Cannot create SharedObject` outright or switches to `#XX` escaping / a hashed directory;
-  **this subset does not reproduce that** — such names are written literally (TalkMED's shared object name
-  only uses `[A-Za-z_]`, so it is unaffected).
+- **File name = the name + `.sol`, and the name itself is a relative path** (measured correction, stage one
+  hundred and ninety-four; probes `temp/sotor` `So5..SoE`, replayed cell-by-cell against adl by
+  `temp/sorow/lpcell.as`, **55/55 cells identical**). Three steps: ① drop **one** leading `/`, then **one**
+  leading `./`; ② if a `/` remains, prefix the **first** component with `#`; ③ append `.sol`. Measured
+  samples: `x/y`→`#x/y.sol`, `x/y/z`→`#x/y/z.sol`, `x/`→`#x/.sol`, `trail/`→`#trail/.sol`, `/x`→`x.sol`,
+  `./x`→`x.sol`, `.`→`..sol`, `a/..`→`#a/...sol`; a single-component name is just `<name>.sol` verbatim
+  (the 35-character `Example_Product_Meeting_Windows_DEV` is
+  `Example_Product_Meeting_Windows_DEV.sol`). **No folding for long names**: measured on `adl 51.4.1`
+  (Windows 11), names of 32 / 35 / 40 / 60 / 80 / 120 / 138 / 150 / 160 / 166 / 168 / 170 / 172 characters
+  **all** land as `<name>.sol`, and a 52-character `<content>` component becomes that directory's name
+  unchanged. **The only encoding AIR applies is a fallback at the operating system's path limit**: at an
+  absolute path of 255 characters the file is still verbatim, at 263 it turns into
+  `##<16 hex digits>/<8-digit index>.sol` — which **this subset does not reproduce** (see below).
+  > Correction (stage one hundred and eighty-eight): this file previously recorded “every component of a
+  > local-store path is capped at 31 bytes: the file keeps the **last 27 characters**, the remaining prefix is
+  > folded from the end into 30-character directories suffixed `#`”. That rule is **not reproducible** on this
+  > machine's `adl` (probes `temp/sotor`: `SoProbe` / `So3` / `SO2` / `SO3`), and with it in place the AOT build
+  > and AIR kept two different files for one and the same shared object — exactly the D11 symptom.
+- A name **may contain `/`** (AIR documents `getLocal("work/addresses")`) ⇒ the parent directory is created
+  before writing.
+- **The rejected NAME set is the measured one, not the documented one** (`temp/sotor/So7/SoB/SoC`): every
+  **C0 control** (TAB/LF/CR included) and **space**, plus `"` `#` `&` `'` `,` `:` `;` `<` `>` `?` `\` `~`,
+  makes `getLocal` raise `Error #2134: Cannot create SharedObject.` on the spot (an `Error`, not a
+  flush-time failure). The list usually quoted from the documentation **is wrong**: `%`, `.` and `0x7F` are
+  in fact **accepted**, while **space is missing from it**. `*` and `|` are not in the set either: adl lets
+  them through `getLocal` and only raises `Error #2130` at `flush()` (illegal in a Windows file name; macOS
+  would take them) ⇒ this subset **deliberately does not reject** those two, to stay platform-neutral. An
+  empty name `""` is `#2134` as well, while a `null` name is
+  `Error #2007: Parameter name must be non-null.` (raised at the same point). Two more name shapes are
+  rejected: **an empty component that is not the last one** (`x//y`, `//x`) and **a leading `..` component**
+  (`../up`) ⇒ `#2134`; a trailing empty component (`x/`) is legal.
+- **`localPath` REPLACES the `<content>` level, and must be a component prefix of it** (aligned in stage one
+  hundred and ninety-four; previously “concatenated below `<content>` and never throwing”). The rule: after
+  dropping **one** leading and **one** trailing `/`, the remainder must have **no empty component** and be a
+  **component prefix** of `ASC_SWF_PATH` (equality counts), with empty (`/`) meaning “drop this level”.
+  Measured with content `assets/So6.swf`: `null` → the `<content>` level; `/` → `#SharedObjects/<name>.sol`
+  (the root level, **one level up**); `"assets"` / `"assets/"` → `#SharedObjects/assets/`;
+  `"/assets/So6.swf"` / `"assets/So6.swf"` → the content directory. **An empty `""` is NOT the same as
+  `null`**: `""` raises `Error #2134` (`temp/sotor/SoD`, p7 vs p8). `"./assets"`, `"/assets/sub"`,
+  `"//assets//"` and `"/assets/../assets"` all raise `#2134` (creating the directory does not help).
+  **Bare-build relaxation** (specific to this subset, §1.5 disclosure): with no descriptor and an empty
+  `ASC_SWF_PATH` there is no `<content>` to compare against, so the value is taken **verbatim** and only the
+  shape checks above apply (otherwise a bare build like `examples/sharedobject.as` could not use `"/"`).
+- ⚠️ **§1.5 disclosure (three edges still not aligned)**: ① for a name holding non-ASCII, adl **hex-escapes**
+  the non-ASCII bytes into the file name (`has中wen` → `hasE#4B#8A#Dwen.sol`; 4 samples, the scheme being
+  “emit `#` before every odd index of the UTF-8 bytes”), whereas this subset writes the name literally and
+  Windows' narrow `fopen` even re-encodes it to GBK (`has涓瓀en.sol`); ② past the operating system's path
+  limit AIR falls back to a `##<16 hex digits>/<8-digit index>.sol` hashed directory (this subset still
+  writes literally and lets the OS report the over-long path); ③ `SharedObject.name` (AIR's read-only
+  property) is **not implemented** in this subset — reading it reports an undefined field. All three are
+  registered in `TODO.md` under “遗留待开发”.
+- ⚠️ **Upgrade note (Windows)**: now that the root is `%APPDATA%\<id>\Local Store`, a store written by an earlier
+  build under `<home>\.as3aot\<id>` is **no longer read** (the two trees cannot see each other — the same effect
+  AIR had when the macOS location changed in the 3.3 namespace). To keep that session, copy the old `.sol` files
+  into the new tree at the same relative path, using the **verbatim** file name (earlier builds folded long names
+  into `#` directories) — the container format is identical on both sides.
 
 **Byte format** (measured over 12+ real `.sol` files / 7 value types):
 
@@ -1399,7 +1450,7 @@ reaches those paths. On the real app the verification looked like this:
 | Locating tool | `temp/soread2/`: drop the store **we** wrote into its storage path and let `adl` `for..in`-dump the whole tree (**black-box oracle**) | The first divergence becomes visible immediately (`userInfo.email` resolving as `mobile`) |
 | **AOT writes → adl reads** | `temp/soempty/`: one `app.xml`, one define pair; AOT writes, `adl` reads | `u.email=[]` and `app_menu[0].title=menu-0` all correct; both files exactly **273 B** |
 | **adl writes → AOT reads** | the same, with the direction flipped | all correct |
-| **Real app, end to end** | log in as `1**********` → home shows `Ray.lei1` → kill the process and relaunch → no login page | **goes straight to the home page**; the 2515 B `.sol`'s mtime is not rewritten by `clearLoginSession()`; screenshot `temp/tkmeet-mac/d21v-auto-login.png` (re-verified on a stage one hundred and fifty-eight binary with the same store) |
+| **Real app, end to end** | log in as `1**********` → home shows `ExampleUser` → kill the process and relaunch → no login page | **goes straight to the home page**; the 2515 B `.sol`'s mtime is not rewritten by `clearLoginSession()`; screenshot `temp/acme-mac/d21v-auto-login.png` (re-verified on a stage one hundred and fifty-eight binary with the same store) |
 
 `examples/sharedobject.as` pins the container shape into the regression set: it **hand-writes** a `.sol` in the
 byte format above and reads it back through `getLocal` (also pinning `00 BF` / `TCSO` / version 4 /

@@ -503,7 +503,10 @@ function checkJobOwnership(): string[] {
 // reverse-engineered from adl (temp/solprobe2..C) and reimplemented; the two
 // directions are verified against each other in temp/sotest (AOT writes -> adl
 // reads, adl writes -> AOT reads, byte counts identical). Those probes live
-// outside the regression set, so the SHAPE is pinned here.
+// outside the regression set, so the SHAPE is pinned here. 阶段一百九十四 added
+// the name/localPath rules AIR actually applies (temp/sotor So5..SoE, replayed
+// by temp/sorow/lpcell.as: 55/55 cells identical), and the example carries the
+// same cells as assertions.
 function checkSharedObjectStore(): string[] {
   let ok = 0;
   const bad: string[] = [];
@@ -515,29 +518,89 @@ function checkSharedObjectStore(): string[] {
   const airApp = readFileSync(join(root, 'src', 'air-app.ts'), 'utf8');
   const p = RUNTIME_PREAMBLE;
 
-  // -- the path AIR derives from the name: 27 characters + ".sol", the remaining
-  //    prefix folded from the END into '#'-suffixed directories of at most 30.
-  check('a name of 27 bytes or less is <name>.sol',
-    emitSource.includes("if (n <= 27) return as_str_concat((char*)name, (char*)\".sol\");"));
-  check('a longer name keeps its LAST 27 characters in the file name',
-    emitSource.includes('memcpy(out + w, name + prefix, 27); w += 27;')
-    && emitSource.includes('memcpy(out + w, ".sol", 4); w += 4;'));
-  check('the remainder becomes #-suffixed directories of 30 (measured: a 35-character name is "eDoctor_#/<last 27>.sol")',
-    emitSource.includes('size_t head = prefix > 30 ? (prefix % 30 == 0 ? 30 : prefix % 30) : prefix;')
-    && emitSource.includes('size_t clen = pos == 0 ? head : 30;')
-    && emitSource.includes("out[w++] = \\'#\\'; out[w++] = \\'/\\';"));
-  check('a local object lives under #SharedObjects, then the descriptor content, then localPath',
-    emitSource.includes('base = as_path_join(base, "#SharedObjects");')
-    && emitSource.includes('base = as_path_join(base, ASC_SWF_PATH);')
-    && emitSource.includes('base = as_path_join(base, localPath);'));
+  // -- how AIR derives the storage path. The name is written with ".sol" and, when
+  //    it carries a slash, with a "#" prefix on its FIRST component; localPath
+  //    REPLACES the <content> layer and has to be a component-prefix of it.
+  //    Measured with adl 51.4.1 (temp/sotor: SoProbe/So3 for the long-name
+  //    question, So5..SoE for these rules) and replayed cell-for-cell against our
+  //    build by temp/sorow/lpcell.as: 55/55 cells identical, and the store trees
+  //    identical for every ASCII name. Names of 32..172 characters all land as
+  //    "<name>.sol" inside one directory. An earlier revision folded the name into
+  //    31-byte "#"-suffixed components; that rule is not reproducible, and with it
+  //    in place the AOT build and AIR kept two different files for the same shared
+  //    object -- the D11 symptom this layer exists to remove.
+  const so = generateC(parse('import flash.net.SharedObject;\nvar s:SharedObject = SharedObject.getLocal("k");\nvar t:SharedObject = SharedObject.getLocal("x/y", "/");\ntrace(1);\n')).c.replace(/\r\n/g, '\n');
+  check('the file name is the name plus ".sol", verbatim for a single-component name',
+    so.includes('static char* as_so_file_name(const char* name) {')
+    && so.includes('return as_str_concat((char*)n, (char*)".sol");'));
+  check('a name still holding a slash after the leading strip gets the "#" prefix',
+    so.includes('if (strchr(n, \'/\') != NULL) return as_str_concat(as_str_concat((char*)"#", (char*)n), (char*)".sol");'));
+  check('ONE leading "/" and one leading "./" are dropped first',
+    so.includes('if (n[0] == \'/\') n++;') && so.includes('if (n[0] == \'.\' && n[1] == \'/\') n += 2;'));
+  check('no length-based folding of the name survives (adl writes a 172-character name verbatim)',
+    !emitSource.includes('as_so_encode_name')
+    && !emitSource.includes('prefix % 30')
+    && !emitSource.includes('memcpy(out + w, name + prefix, 27); w += 27;'));
+  check('a name may hold slashes (AIR documents getLocal("work/addresses")), so the parent dir is made',
+    emitSource.includes('static void as_so_mkparent(const char* p) {')
+    && emitSource.includes('as_mkdirs(dir);'));
+  check('a local object lives under #SharedObjects, then the REPLACED layer',
+    so.includes('base = as_path_join(base, "#SharedObjects");')
+    && so.includes('char* layer = as_so_layer(localPath);')
+    && so.includes('if (layer[0] != \'\\0\') base = as_path_join(base, layer);'));
+  // -- the accepted NAME set is the MEASURED one, not the documented one: every C0
+  //    control plus space " # & ' , : ; < > ? \ ~, while "%", "." and 0x7F are
+  //    accepted. SoA pinned WHERE it throws: getLocal, not flush.
+  const nameBad = /static bool as_so_name_bad\(int c\) \{([\s\S]*?)\n\}/.exec(so)?.[1] ?? '';
+  check('a C0 control or a space is a rejected name character',
+    nameBad.includes('if (c <= 0x20) return true;'));
+  check('…and so are quote, #, &, tick, comma, colon, semi, <, >, ?, backslash, ~',
+    nameBad.includes(`strchr("\\"#&',:;<>?\\\\~", c) != NULL`));
+  check('"%", "." and 0x7F are NOT rejected (measured; the documented list is wrong)',
+    !nameBad.includes('%') && !nameBad.includes('.') && !/0x7f/.test(nameBad));
+  check('an empty name and a rejected character raise Error #2134 with adl\'s message',
+    so.includes('static void as_so_reject(void) { as_throw(Error_new((char*)"Error #2134: Cannot create SharedObject.", 2134)); }')
+    && so.includes('if (name[0] == \'\\0\') as_so_reject();'));
+  const getLocal = /SharedObject\* SharedObject_getLocal_static\(char\* name, char\* localPath, bool secure\) \{([\s\S]*?)\n\}/.exec(so)?.[1] ?? '';
+  check('a NULL name is Error #2007 instead (adl: "Parameter name must be non-null.")',
+    getLocal.includes('if (name == NULL) { as_throw(Error_new((char*)"Error #2007: Parameter name must be non-null.", 2007)); return NULL; }'));
+  const checkName = /static void as_so_check_name\(const char\* name\) \{([\s\S]*?)\n\}/.exec(so)?.[1] ?? '';
+  check('a name that resolves out of the layer ("../x") is rejected',
+    checkName.includes("c == n && e == c + 2 && c[0] == '.' && c[1] == '.'"));
+  check('…and so is an empty inner component ("x//y", "//x"), while a trailing one is kept',
+    checkName.includes('if (e == c) as_so_reject();'));
+  const soLayer = /static char\* as_so_layer\(const char\* localPath\) \{([\s\S]*?)\n\}/.exec(so)?.[1] ?? '';
+  check('an empty localPath is NOT the same as null (adl #2134; SoD p7 vs p8)',
+    soLayer.includes('if (localPath[0] == \'\\0\') as_so_reject();'));
+  check('localPath is compared component-by-component against <content>',
+    soLayer.includes("while (k < j - i && c[k] != '\\0' && c[k] != '/') k++;")
+    && soLayer.includes('if (k != j - i || memcmp(s + i, c, k) != 0) as_so_reject();'));
+  check('a bare build (no <content>) takes the layer verbatim -- the documented relaxation',
+    soLayer.includes('if (ASC_SWF_PATH[0] != \'\\0\') {'));
 
   // -- the application id has to reach the generated C: without it every AOT app
   //    shares one Local Store, and the descriptor's <content> is the directory
-  //    level AIR nests the store under.
+  //    level AIR nests the store under. Each OS root is adl's own, measured
+  //    byte-for-byte against AIR SDK 51.4.1 (see docs/*/flash-net.md).
   check('the storage dir carries the app id, defaulting to "as3aot"',
     emitSource.includes('#ifndef ASC_APP_ID')
     && emitSource.includes('#define ASC_APP_ID "as3aot"')
     && emitSource.includes('Library/Application Support/" ASC_APP_ID "/Local Store'));
+  check('on Windows the store root is %APPDATA%/<id>/Local Store (adl writes the same tree)',
+    emitSource.includes('char* appdata = getenv("APPDATA");')
+    && emitSource.includes('base = as_path_join(appdata, ASC_APP_ID);')
+    && emitSource.includes('base = as_path_join(base, "Local Store");'));
+  check('a host that does not export APPDATA falls back to the known folder default',
+    emitSource.includes('if (appdata == NULL || *appdata ==')
+    && emitSource.includes('appdata = as_path_join(home, "AppData/Roaming");'));
+  const winRoot = emitSource.indexOf('char* appdata = getenv("APPDATA");');
+  const macRoot = emitSource.indexOf('Library/Application Support/" ASC_APP_ID');
+  check('the Windows root is a sibling #elif of the macOS one, not a fallthrough',
+    winRoot > 0 && macRoot > winRoot
+    && emitSource.slice(winRoot, macRoot).includes('#elif defined(__APPLE__)'));
+  check('a POSIX host with no AIR path to copy keeps the ~/.as3aot convention',
+    emitSource.includes('base = as_path_join(home, ".as3aot");')
+    && emitSource.includes('base = as_path_join(base, ASC_APP_ID);'));
   check('the descriptor content path reaches the generated C too',
     emitSource.includes('#ifndef ASC_SWF_PATH') && emitSource.includes('#define ASC_SWF_PATH ""'));
   check('an AIR descriptor build injects both defines',
@@ -610,6 +673,17 @@ function checkSharedObjectStore(): string[] {
     && soExample.includes('a reference to an earlier dynamic NAME resolves'));
   check('…and names the measured AIR evidence it replays',
     soExample.includes('temp/solread/adl-login-2617.sol') && soExample.includes('clearLoginSession'));
+  check('…and examples/sharedobject.as pins the "#" prefix of a slashed name',
+    soExample.includes('solPath("#sp/leaf").exists')
+    && soExample.includes('solPath("#trail/").exists')
+    && soExample.includes('a leading slash is dropped from the name'));
+  check('…the REJECTED character set (space included, % and . not)',
+    soExample.includes('expect(rejects("has space")')
+    && soExample.includes('expect(rejects("has\\\\bs")')
+    && soExample.includes('!rejects("has%pc") && !rejects("has.dot")'));
+  check('…and the null-vs-empty localPath boundary plus Error #2007',
+    soExample.includes('expect(lpRejects(""), "an empty localPath is NOT null')
+    && soExample.includes('nullId == 2007'));
 
   // -- the EMPTY string is the second thing that never takes a slot. AIR writes
   //    `06 01` every single time, so a reader/writer that enters "" on the first

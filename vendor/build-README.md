@@ -58,11 +58,17 @@ powershell -ExecutionPolicy Bypass -File .\build-windows-deps.ps1
 ## 产物布局
 
 ```
+# 规则：**库产物一律 <pkg>/lib/<arch>/**；头文件与平台无关就共用 <pkg>/include/，
+#       逐平台生成才分层到 <pkg>/include/<arch>/。
 vendor/skia/lib/windows-x64/*.lib        # skia.lib / skottie.lib / libpng.lib ...（无 lib 前缀）
 vendor/skia/lib/windows-x86/*.lib
+vendor/skia/include/                       # Skia 源码形状的 include 树（跨平台共用；-I 指包根 vendor/skia）
 vendor/skia/lib/windows-<arch>/icudtl.dat   # Skia 的 ICU 数据（文本整形必需，见下）
-vendor/sdl2/windows-x64/{include,lib}      # SDL2.lib / SDL2main.lib
-vendor/sdl2/windows-x86/{include,lib}
+vendor/sdl2/lib/windows-x64/               # SDL2.lib / SDL2main.lib（附 cmake/ 与 pkgconfig/）
+vendor/sdl2/lib/windows-x86/
+vendor/sdl2/include/windows-x64/SDL2/*.h   # SDL_config.h 由构建逐平台生成，故头文件也分位宽
+vendor/sdl2/include/windows-x86/SDL2/*.h
+vendor/sdl2/licenses/SDL2/LICENSE.txt      # 两套位宽字节相同，共用一份
 vendor/curl/include/                        # 头文件（两套位宽共享）
 vendor/curl/lib/windows-x64/                # curl.lib / nghttp2.lib / zlib.lib / z.lib
 vendor/curl/lib/windows-x86/

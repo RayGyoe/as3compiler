@@ -60,6 +60,14 @@ export interface BuildConfig {
   // and embedded into the generated C (阶段九十五). Paths are resolved relative
   // to the manifest that declares them.
   swcPaths: string[];
+  // .ane native-extension packages whose extension.xml is resolved at compile
+  // time into the descriptor table the generated executable carries (阶段一百七十二).
+  // Paths are resolved relative to the manifest that declares them.
+  anePaths: string[];
+  // AIR platform key to read out of each .ane's extension.xml. Empty means "the
+  // platform this build is running on" (see currentAnePlatform); it is only ever
+  // set for a cross-build, where the answer is not the build machine.
+  anePlatform: string;
   includePaths: string[];
   linkLibs: string[];
   linkPaths: string[];
@@ -128,9 +136,10 @@ export interface BuildConfig {
   displayName: string;       // human-readable app name (fills CFBundleName)
   icon: string | null;       // .icns path (fills CFBundleIconFile); null = none
   deploymentTarget: string;  // macOS minimum version (fills LSMinimumSystemVersion)
-  // AIR <architecture> bit width ("32" | "64" | ""), carried by --air-app. On a
-  // Windows native build this is what selects the MSVC target triple (i686 vs
-  // x86_64); it is inert on macOS/wasm. Empty for non-AIR builds (let clang pick
+  // AIR <architecture> bit width ("32" | "64"), carried by --air-app; a plain
+  // manifest may also spell "arm64" for a Windows ARM64 native build. On a Windows
+  // native build this is what selects the MSVC target triple (i686 vs x86_64 vs
+  // aarch64); it is inert on macOS/wasm. Empty for non-AIR builds (let clang pick
   // its host default).
   architecture: string;
   dry: boolean;
@@ -148,6 +157,8 @@ export function defaultBuildConfig(): BuildConfig {
     pgoDir: '',
     sources: [],
     swcPaths: [],
+    anePaths: [],
+    anePlatform: '',
     includePaths: [],
     linkLibs: [],
     linkPaths: [],
@@ -183,6 +194,8 @@ interface ManifestFields {
   'pgo-dir'?: string;
   sources?: string[];
   'swc-paths'?: string[];
+  'ane-paths'?: string[];
+  'ane-platform'?: string;
   'include-paths'?: string[];
   'link-libs'?: string[];
   'link-paths'?: string[];
@@ -227,6 +240,7 @@ const TARGET_LAYER_FIELDS: ReadonlySet<string> = new Set([
   'preload-paths', 'preload-excludes',
   'debug-info', 'lto', 'pgo', 'pgo-dir',
   'swc-paths',
+  'ane-paths', 'ane-platform',
   'bundle-id', 'display-name', 'icon', 'deployment-target',
 ]);
 
@@ -266,6 +280,23 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m['pgo-dir']) next.pgoDir = resolveFromManifest(manifestPath, m['pgo-dir']);
   if (m.sources) next.sources = [...cfg.sources, ...m.sources.map((p) => resolveFromManifest(manifestPath, p))];
   if (m['swc-paths']) next.swcPaths = [...cfg.swcPaths, ...m['swc-paths'].map((p) => resolveFromManifest(manifestPath, p))];
+  if (m['ane-paths']) {
+    // Appended to the CLI's --ane list (a manifest adds packages), but never the
+    // same package twice. An --air-app build now DERIVES ane-paths from the
+    // descriptor's <extensions> (see air-app.ts), so a user mid-migration who still
+    // passes the package with --ane would hand one package in twice and get "two
+    // ANEs declare the same extensionID" -- a wrong-cause diagnosis for a list that
+    // simply names one package more than once (§2.5). Compared as resolved paths,
+    // because the CLI's are cwd-relative and the manifest's are manifest-relative.
+    const have = new Set(cfg.anePaths.map((p) => resolve(p)));
+    next.anePaths = [...cfg.anePaths];
+    for (const p of m['ane-paths'].map((q) => resolveFromManifest(manifestPath, q))) {
+      if (have.has(resolve(p))) continue;
+      have.add(resolve(p));
+      next.anePaths.push(p);
+    }
+  }
+  if (m['ane-platform']) next.anePlatform = m['ane-platform'];
   if (m['include-paths']) next.includePaths = [...cfg.includePaths, ...m['include-paths'].map((p) => resolveFromManifest(manifestPath, p))];
   if (m['link-libs']) next.linkLibs = [...cfg.linkLibs, ...m['link-libs']];
   if (m['link-paths']) next.linkPaths = [...cfg.linkPaths, ...m['link-paths'].map((p) => resolveFromManifest(manifestPath, p))];
@@ -291,7 +322,18 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m['display-name']) next.displayName = m['display-name'];
   if (m.icon) next.icon = resolveFromManifest(manifestPath, m.icon);
   if (m['deployment-target']) next.deploymentTarget = m['deployment-target'];
-  if (m.architecture) next.architecture = m.architecture;
+  if (m.architecture) {
+    // "32"/"64" are AIR's own values (parseAirApp rejects anything else in a
+    // descriptor). `arm64` is a manifest-only extension naming a Windows ARM64
+    // native build — AIR has no Windows ARM64 runtime, so it can never appear in
+    // an air-app.xml, but a plain as3compiler manifest may target it. Rejecting
+    // anything else here is what keeps windowsTargetTriple's default from
+    // silently turning a typo into an x86_64 build.
+    if (m.architecture !== '32' && m.architecture !== '64' && m.architecture !== 'arm64') {
+      throw new Error(`manifest 'architecture' must be "32", "64" or "arm64" (got "${m.architecture}")`);
+    }
+    next.architecture = m.architecture;
+  }
   return next;
 }
 
@@ -343,6 +385,8 @@ export function applyManifestOverlay(cfg: BuildConfig, m: Manifest, manifestPath
   if (L['pgo-dir']) next.pgoDir = resolveFromManifest(manifestPath, L['pgo-dir']);
   if (L.sources) next.sources = L.sources.map((p) => resolveFromManifest(manifestPath, p));
   if (L['swc-paths']) next.swcPaths = L['swc-paths'].map((p) => resolveFromManifest(manifestPath, p));
+  if (L['ane-paths']) next.anePaths = L['ane-paths'].map((p) => resolveFromManifest(manifestPath, p));
+  if (L['ane-platform']) next.anePlatform = L['ane-platform'];
   if (L['include-paths']) next.includePaths = L['include-paths'].map((p) => resolveFromManifest(manifestPath, p));
   if (L['link-libs']) next.linkLibs = [...L['link-libs']];
   if (L['link-paths']) next.linkPaths = L['link-paths'].map((p) => resolveFromManifest(manifestPath, p));
@@ -555,8 +599,20 @@ export function effectiveDefines(cfg: BuildConfig): string[] {
 // against the windows-x86 archives. The triple is spelled out for "64" too so the
 // MSVC ABI (not a stray MinGW default) is pinned, and it is inert on non-Windows
 // hosts and non-native targets.
-function windowsTargetTriple(architecture: string): string {
-  return architecture === '32' ? 'i686-pc-windows-msvc' : 'x86_64-pc-windows-msvc';
+//
+// `arm64` is deliberately NOT an AIR value — parseAirApp allows only "32"/"64",
+// because AIR's Windows runtimes are x86/x64 only. It is the manifest-only name
+// for a Windows ARM64 native build, and it exists so that a Windows-on-ARM host
+// gets a *chosen* target instead of clang's host default (aarch64) reaching the
+// linker with an x86_64 archive set, or — worse — an x64 build silently standing
+// in for the arm64 one that was asked for.
+//
+// Exported so the whole mapping is pinnable on any host: an x64 machine cannot
+// otherwise exercise the arm64 or i686 rows.
+export function windowsTargetTriple(architecture: string): string {
+  if (architecture === '32') return 'i686-pc-windows-msvc';
+  if (architecture === 'arm64') return 'aarch64-pc-windows-msvc';
+  return 'x86_64-pc-windows-msvc';
 }
 
 // Extra flags every native step (C compile, C++ compile, link) needs on Windows
@@ -564,7 +620,7 @@ function windowsTargetTriple(architecture: string): string {
 // builds (architecture === ''), which keep clang's host default.
 function nativeTargetFlags(cfg: BuildConfig): string[] {
   if (process.platform !== 'win32' || cfg.target !== 'native') return [];
-  if (cfg.architecture !== '32' && cfg.architecture !== '64') return [];
+  if (cfg.architecture !== '32' && cfg.architecture !== '64' && cfg.architecture !== 'arm64') return [];
   // Static CRT (/MT). The archives build-windows-deps.ps1 ships are all /MT
   // (Skia's is_official_build, SDL2's CMakeLists, and the curl/nghttp2/zlib stack
   // via -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded / nghttp2 -DENABLE_STATIC_CRT).
@@ -589,7 +645,7 @@ function nativeTargetFlags(cfg: BuildConfig): string[] {
 // true when a copy happened.
 export function deploySkiaIcuData(cfg: BuildConfig, outPath: string): boolean {
   if (process.platform !== 'win32' || cfg.target !== 'native') return false;
-  if (cfg.architecture !== '32' && cfg.architecture !== '64') return false;
+  if (cfg.architecture !== '32' && cfg.architecture !== '64' && cfg.architecture !== 'arm64') return false;
   if (!cfg.linkLibs.includes('skia')) return false;
   for (const p of cfg.linkPaths) {
     const src = join(p, 'icudtl.dat');

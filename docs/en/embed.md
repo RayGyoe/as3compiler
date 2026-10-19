@@ -85,7 +85,7 @@ lexer → parser → parser keeps `[Embed(...)]` as Metadata.named / Field.metad
 | Embedded audio | A real `Sound` subclass is generated, decoding handed to the audio backend; in a build **without** an audio backend `loadCompressedDataFromByteArray` returns −1 ⇒ `#2068` (different from AIR's behavior when a device is present, but this is a backend capability, not `[Embed]` semantics) |
 | Rejection set | `.txt`/`.svg`/`.wav`/`application/xml` are rejected just like AIR; an unknown extension/`mimeType` also **errors loudly** and lists the supported set (§1.5, never silent) |
 | **Compile scope = the whole `src/`** | We do **no reachability analysis**: every `.as`'s `[Embed]` under `<appRoot>/src` is packed in (including **other demos**' resources) and **survives into the output**; `mxmlc`/`adl` compile **transitively**, handling only reachable classes' `[Embed]`. Knock-on consequence: a bad `[Embed]` in an unreachable class makes us **fail at compile time**. Measurement and criteria in **§7**; registered in `TODO.md`'s leftover table |
-| Sound's `extract`/`id3` | Depends on audio-backend capability, see `docs/zh-cn/audio.md` |
+| Sound's `extract`/`id3` | Depends on audio-backend capability, see `docs/en/audio.md` |
 
 ## 5. Usage
 
@@ -106,7 +106,7 @@ text.
 - `temp/embedprobe*`: adl probes (the kind table, the 0-arg constructor, `mimeType` override, path rules,
   deduplication, the rejection set), with conclusions written to `temp/embedprobe7/adl.txt`.
 - `examples/away3d-core/Basic_SkyBox.as`: 6 skybox JPEGs; under headless runtime the window renders a snowy
-  skybox + an environment-reflective chrome ring (see `docs/zh-cn/display3d.md` §9).
+  skybox + an environment-reflective chrome ring (see `docs/en/display3d.md` §9).
 - Static implementation locations: `src/embed.ts` (expansion), `emit.ts`'s `emitEmbedResources` (bytes and
   binding helpers), `test/unit/embed.ts` (source-level nails, 3 groups).
 

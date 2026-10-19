@@ -53,7 +53,7 @@ check(x is Object, "an XML is an Object");
 check(x is XML, "an XML is an XML");
 // String() of an XML is its TEXT CONTENT, not the markup (measured on adl 51.4.1,
 // temp/d31probe/adl-xstr.txt: String(<a/>) is "" and String(<r a="1">t</r>) is
-// "t"; the markup form is toXMLString(), which is not in this subset yet).
+// "t"; the markup form is toXMLString(), which e4x-toxmlstring.as covers).
 check(String(x) == "", "String(a childless element) is empty, got '" + String(x) + "'");
 check(String(<r a="1">t</r>) == "t", "String of an element is its text content");
 check(x.children().length() == 0, "a childless element has an empty children list");

@@ -372,9 +372,14 @@ function checkStage3dAgalOperandSlots(): string[] {
   };
 
   const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  // A literal '\n}\n' probe matches NOTHING in this CRLF checkout, which silently
+  // reduced every body below to the signature's first two characters (so the two
+  // checks further down asserted against "st" and failed for the wrong reason).
   const bodyOf = (sig: string): string => {
     const i = runtime.indexOf(sig);
-    return i < 0 ? '' : runtime.slice(i, runtime.indexOf('\n}\n', i) + 3);
+    if (i < 0) return '';
+    const m = /\r?\n\}\r?\n/.exec(runtime.slice(i));
+    return m == null ? '' : runtime.slice(i, i + m.index);
   };
 
   // Both slot walkers: the dest slot is consumed unconditionally, and the old
@@ -384,7 +389,7 @@ function checkStage3dAgalOperandSlots(): string[] {
     const name = sig.split(' ').pop()!.replace('(', '');
     const body = bodyOf(sig);
     check(`${name} skips the always-present dest slot before reading src1`,
-      body !== '' && /pos \+= 4;\n\s*if \(hasSrc1\)/.test(body)
+      body !== '' && /pos \+= 4;\r?\n\s*if \(hasSrc1\)/.test(body)
       && !/if \(hasDst\) pos \+= 4;/.test(body));
   }
 
@@ -857,6 +862,200 @@ function checkStage3dD3dGlue(): string[] {
     emitSrc.includes('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GPU)'));
   check('the D3D glue implements the composite entry point the generated C calls',
     /void sk_gpu_draw_texture\(void\* canvas, void\* d3dTexture, int w, int h,/.test(glue));
+
+  // ---- THE CONSTANT-REGION PIN ---------------------------------------------------
+  // D3D12 reads a root CBV when the GPU EXECUTES the command list (end of frame),
+  // while the generated C re-uploads the whole register file immediately before every
+  // drawTriangles (Context3D_submit). One constant buffer per frame slot therefore made
+  // every draw read the LAST upload's matrix: measured on examples/air-starling-demo,
+  // all 12 menu buttons were transformed by the final button's mvp (11 left the screen),
+  // while Metal -- whose setVertexBytes copies the values inline -- never saw it. Each
+  // upload now owns a REGION inside the slot's buffer and a draw binds the region of the
+  // last upload; every part below is load-bearing (dropping one reproduces the bug).
+  const bodyOfIn = (src: string, sig: string): string => {
+    const i = src.indexOf(sig);
+    if (i < 0) return '';
+    const m = /\r?\n\}\r?\n/.exec(src.slice(i));
+    return m == null ? '' : src.slice(i, i + m.index);
+  };
+  const region = /#define S3D_CB_REGION (\d+)/.exec(d3d);
+  check(`the constant region is a whole number of float4 (${region == null ? 'missing' : 'S3D_CB_REGION=' + region[1]})`,
+    region != null && Number(region[1]) > 0 && Number(region[1]) % 256 === 0);
+  check('each frame slot holds S3D_DRAWS_PER_FRAME constant regions',
+    /#define S3D_CB_BYTES \(S3D_CB_REGION \* S3D_DRAWS_PER_FRAME\)/.test(d3d));
+
+  const upload = bodyOfIn(d3d, 'int s3d_upload_constants(');
+  check('an upload advances the per-stage cursor and remembers its region',
+    upload !== '' && /UINT\* cur = isFragment \? &c->cbCurF : &c->cbCurV;/.test(upload)
+    && /\*cur = off \+ \(UINT\)S3D_CB_REGION;/.test(upload)
+    && /if \(isFragment\) c->cbOffF = off; else c->cbOffV = off;/.test(upload));
+  check('an oversize register file is refused loudly, never truncated',
+    /if \(need > S3D_CB_REGION\)/.test(upload)
+    && /constants need %u bytes, one region holds %u/.test(upload));
+  check('running out of regions in one frame warns instead of silently wrapping',
+    /constant regions exhausted/.test(upload) && /\*cur = 0;/.test(upload));
+  check('the CPU waits the slot before writing into one of its regions',
+    /s3d_wait_slot\(c, slot\);/.test(upload));
+  check('a draw binds the region the last upload left on each stage',
+    /SetGraphicsRootConstantBufferView\(0,\s*vcb->GetGPUVirtualAddress\(\) \+ c->cbOffV\)/.test(d3d)
+    && /SetGraphicsRootConstantBufferView\(1,\s*fcb->GetGPUVirtualAddress\(\) \+ c->cbOffF\)/.test(d3d));
+
+  // The cursor reset lives in batch_end, NOT batch_begin: the FIRST upload of a frame
+  // precedes anything opening the batch, so a reset there discarded the region that
+  // upload had just written and left draws 0 and 1 sharing region 0 (measured in the
+  // per-draw dump: cbV=0 on BOTH draw 0 and draw 1).
+  const batchEnd = bodyOfIn(d3d, 'static void s3d_batch_end(');
+  const batchBegin = bodyOfIn(d3d, 'static int s3d_batch_begin(');
+  check('the constant-region cursor is rewound in batch_end',
+    /c->cbCurV = c->cbCurF = 0;/.test(batchEnd));
+  check('batch_begin leaves the constant-region cursor alone',
+    batchBegin !== '' && !/cbCurV|cbCurF|cbOffV|cbOffF/.test(batchBegin));
+
+  // ---- THE DEFERRED-RELEASE PIN --------------------------------------------------
+  // A D3D12 resource handed to s3d_defer_release while a batch is being RECORDED is
+  // already bound by that batch's earlier draws, and its submission has not happened
+  // yet -- so the last SIGNALLED fence value says nothing about it. Recording fenceNext
+  // there released the resource out from under the GPU: measured on
+  // examples/air-starling-demo after a scene switch, 171 of 171 releases happened with
+  // a batch open, the recycled memory became the NEXT texture's storage, one text quad
+  // sampled another text's pixels and the device was removed (Present: 0x887A0005).
+  // ONE bug, TWO symptoms -- they must not be debugged separately. All three parts
+  // below are load-bearing.
+  const defer = bodyOfIn(d3d, 'static void s3d_defer_release(');
+  check('a release deferred while a batch is open is parked on fence 0 (tie it to the NEXT submission)',
+    /c->rel\[c->nrel\]\.fence = c->listOpen \? 0 : c->fenceNext;/.test(defer)
+    && /next submission/.test(defer) && /listOpen/.test(defer));
+  check('both drain loops skip entries parked on fence 0 and keep them queued',
+    (d3d.match(/c->rel\[i\]\.fence != 0 && c->rel\[i\]\.fence <= done/g) || []).length === 2
+    && (d3d.match(/c->rel\[i\]\.fence <= done/g) || []).length === 2
+    && (d3d.match(/else c->rel\[w\+\+\] = c->rel\[i\];/g) || []).length === 2);
+  check('batch_end stamps every parked entry with the fence THAT submission signed',
+    /const uint64_t v = \+\+c->fenceNext;/.test(batchEnd)
+    && batchEnd.indexOf('ExecuteCommandLists') < batchEnd.indexOf('c->rel[i].fence = v;')
+    && batchEnd.indexOf('const uint64_t v = ++c->fenceNext;') < batchEnd.indexOf('c->rel[i].fence = v;')
+    && /for \(int i = 0; i < c->nrel; i\+\+\) if \(c->rel\[i\]\.fence == 0\) c->rel\[i\]\.fence = v;/.test(batchEnd));
+
+  // The rule is worth a doc line where it bit, because the symptom (a text quad showing
+  // another text) points at the TEXTURE path, not at the release path.
+  const win32Doc = readFileSync(join(root, 'docs', 'zh-cn', 'win32.md'), 'utf8');
+  check('win32.md 3.6 records the release-lifetime rule and the measurement',
+    /### 3\.6 [^\n]*延迟释放/.test(win32Doc)
+    && /下一次提交/.test(win32Doc)
+    && /171/.test(win32Doc) && /listOpen/.test(win32Doc));
+
+  // ---- THE BLEND-MODE PINS -------------------------------------------------------
+  // Starling's Blend Modes scene drives DisplayObject.blendMode -> BlendMode.activate()
+  // -> Context3D.setBlendFactors(), and "switching does nothing" was THREE independent
+  // defects, each measured against adl 51.4.1 on examples/air-starling-demo (pixel
+  // difference vs adl: multiply 13.7% -> 3.5%, screen 10.6% -> 2.0%, add 10.2% -> 1.7%,
+  // erase 13.8% -> 1.9%, none 62.4% -> 3.8%, with the untouched "normal" mode staying
+  // at 3.7% as the control):
+  //   a) the PSO key carried only "is blending on", so the first factor pair a program
+  //      was drawn with (Starling's normal) was reused for every later mode;
+  //   b) D3D12 rejects a *_COLOR factor in an ALPHA slot, so multiply/screen built NO
+  //      pipeline and every draw of those modes was dropped;
+  //   c) the window composite used the default kSrcOver while AIR presents the Stage3D
+  //      back buffer with its alpha IGNORED (erase drew a WHITE silhouette, adl black).
+  const mtl = readFileSync(join(root, 'vendor', 'metal_glue.mm'), 'utf8');
+  const gl = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const pso = bodyOfIn(d3d, 'static ID3D12PipelineState* s3d_select_pso(');
+  check('the PSO key carries the blend FACTOR PAIR, not just "is blending on"',
+    pso !== ''
+    && /\|\%d\|\%s\|\%s\|\%x"/.test(pso)
+    && /\(int\)\(c->blendSource != NULL \|\| c->blendDest != NULL\),/.test(pso)
+    && /c->blendSource \? c->blendSource : ""/.test(pso)
+    && /c->blendDest \? c->blendDest : ""/.test(pso));
+  const alphaOf = bodyOfIn(d3d, 'static D3D12_BLEND s3d_blend_factor_alpha(');
+  check('a *_COLOR blend factor is translated to its alpha twin for the alpha slots',
+    alphaOf !== ''
+    && /D3D12_BLEND_SRC_COLOR\) return D3D12_BLEND_SRC_ALPHA;/.test(alphaOf)
+    && /D3D12_BLEND_INV_SRC_COLOR\) return D3D12_BLEND_INV_SRC_ALPHA;/.test(alphaOf)
+    && /D3D12_BLEND_DEST_COLOR\) return D3D12_BLEND_DEST_ALPHA;/.test(alphaOf)
+    && /D3D12_BLEND_INV_DEST_COLOR\) return D3D12_BLEND_INV_DEST_ALPHA;/.test(alphaOf)
+    && /return b;/.test(alphaOf));
+  check('both alpha slots go through that translation, never the raw colour factor',
+    /rt->SrcBlendAlpha = s3d_blend_factor_alpha\(sf\);/.test(d3d)
+    && /rt->DestBlendAlpha = s3d_blend_factor_alpha\(df\);/.test(d3d)
+    && !/rt->SrcBlendAlpha = sf;/.test(stripComments(d3d))
+    && !/rt->DestBlendAlpha = df;/.test(stripComments(d3d)));
+  check('all four Stage3D composite paths draw with kSrc (AIR ignores the back buffer alpha)',
+    /paint\.setBlendMode\(SkBlendMode::kSrc\);/.test(glue)
+    && /drawImageRect\(img, dst, SkSamplingOptions\(SkFilterMode::kLinear, SkMipmapMode::kNone\), &paint\)/.test(glue)
+    && (stripComments(mtl).match(/setBlendMode\(SkBlendMode::kSrc\)/g) || []).length === 1
+    && /drawImageRect\(img\.get\(\), dst, SkSamplingOptions\(\), &paint\)/.test(mtl)
+    && (stripComments(gl).match(/setBlendMode\(SkBlendMode::kSrc\)/g) || []).length === 2
+    && /drawImageRect\(img\.get\(\), dst, SkSamplingOptions\(\), &paint\)/.test(gl)
+    && /drawImageRect\(image\.get\(\), dst, SkSamplingOptions\(\), &paint\)/.test(gl));
+  check('no Stage3D composite path is left on the default SrcOver paint',
+    !/drawImageRect\(img\.get\(\), dst, SkSamplingOptions\(\)\);/.test(stripComments(mtl))
+    && !/drawImageRect\(img\.get\(\), dst, SkSamplingOptions\(\)\);/.test(stripComments(gl))
+    && !/drawImageRect\(image\.get\(\), dst, SkSamplingOptions\(\)\);/.test(stripComments(gl)));
+
+  // The rule is worth a doc line where it bit: the symptom ("switching has no effect")
+  // points at the AS3 blend-mode plumbing, not at three separate backend states.
+  const display3dDoc = readFileSync(join(root, 'docs', 'zh-cn', 'display3d.md'), 'utf8');
+  check('display3d.md 10.6 records all three blend-mode causes and the adl numbers',
+    /### 10\.6 [^\n]*混合模式/.test(display3dDoc)
+    && /blendSource\|blendDest/.test(display3dDoc)
+    && /12\.93%/.test(display3dDoc) && /13\.68%/.test(display3dDoc)
+    && /kSrcOver/.test(display3dDoc) && /s3d_blend_factor_alpha/.test(display3dDoc));
+
+  // ---- THE UPLOAD-HEAP POOL PIN --------------------------------------------------
+  // s3d_make_upload used to build a fresh committed UPLOAD resource on EVERY call
+  // (CreateCommittedResource + Map + memcpy + Unmap, the old one deferred-released),
+  // and at examples/air-starling-demo's ~66k objects that is 20-27 uploads and 4-5 MB
+  // per frame. ASC_VB_PROBE measured the fixed cost at ~100 us per upload REGARDLESS of
+  // size (64 boot-time 0.5 KiB uploads = 7.55 ms), i.e. 4.4-6.5 ms of a 16.7 ms frame:
+  // the benchmark plateaued at 67,728 and pools to 147,488. Metal never pays it -- its
+  // upload is a replaceRegion into a persistent buffer.
+  //
+  // Every part below is load-bearing, and one of them is not a performance bug but a
+  // RENDERING bug: with no `listOpen` guard on the stamp, the immediate list (texture
+  // uploads) cleared every pending flag while a batch was still open, so the first
+  // frame's 12 menu-button uploads all landed in ONE buffer and 11 of the 12 buttons
+  // vanished for the rest of the run -- while the benchmark number looked BETTER
+  // (150,992). A rendering regression hides much better than a performance one.
+  const poolNew = bodyOfIn(d3d, 'static S3DUploadBuf* s3d_ubuf_new(');
+  const poolGet = bodyOfIn(d3d, 'static S3DUploadBuf* s3d_acquire_upload(');
+  const uploadV = bodyOfIn(d3d, 'int s3d_upload_vertex(');
+  const uploadI = bodyOfIn(d3d, 'int s3d_upload_index(');
+  const destroy = bodyOfIn(d3d, 'void s3d_destroy(void* ctx) {');
+  const ubufMax = /#define S3D_UBUF_MAX (\d+)/.exec(d3d);
+  check('an upload buffer is created once, permanently mapped, and pooled',
+    ubufMax != null && Number(ubufMax[1]) >= 16
+    && poolNew !== '' && /b->map = map;/.test(poolNew) && /b->fence = 0;/.test(poolNew)
+    && /could not be created/.test(poolNew) && /could not be mapped/.test(poolNew));
+  check('a pooled buffer is only handed out when the GPU is provably done with it',
+    poolGet !== '' && /GetCompletedValue\(\)/.test(poolGet)
+    && /b->pending \|\| b->bytes < bytes/.test(poolGet)
+    && /if \(b->fence != 0 && b->fence > done\) continue;/.test(poolGet));
+  check('a buffer still bound to a stream or the index stage is never handed out',
+    /static int s3d_ubuf_bound\(S3DContext\* c, ID3D12Resource\* res\) \{/.test(d3d)
+    && /c->streams\[i\]\.buf == res/.test(d3d) && /return c->indexBuffer == res;/.test(d3d)
+    && /s3d_ubuf_bound\(c, b->res\)\) continue;/.test(poolGet));
+  check('the upload paths convert straight into the pool, with no per-call malloc',
+    uploadV !== '' && uploadV.includes('s3d_acquire_upload(c,') && uploadV.includes('b->map')
+    && /float\* dst = \(float\*\)b->map;/.test(uploadV) && !/CreateCommittedResource/.test(uploadV)
+    && uploadI !== '' && /memcpy\(b->map, data, nbytes\);/.test(uploadI));
+  check('a buffer replaced while a batch is open is re-marked for that batch',
+    /static void s3d_mark_batch_ref\(S3DContext\* c, int ub\) \{/.test(d3d)
+    && /c->ubuf\[ub\]\.pending = 1;/.test(d3d)
+    && (d3d.match(/s3d_mark_batch_ref\(c, c->streams\[stream\]\.ub\);/g) || []).length === 1
+    && (d3d.match(/s3d_mark_batch_ref\(c, c->indexUb\);/g) || []).length === 1);
+  check('the stamp refuses to make an open batch\'s buffers reclaimable',
+    /static void s3d_stamp_uploads\(S3DContext\* c, uint64_t v\) \{\r?\n  if \(c->listOpen\) return;\r?\n  for \(int i = 0; i < c->nubuf; i\+\+\)/.test(d3d)
+    && /next 12 button uploads all landed in ONE buffer/.test(d3d));
+  check('the pool is bounded and reports saturation instead of dropping an upload',
+    /upload pool saturated/.test(poolGet) && /s3d_wait_idle\(c\);/.test(poolGet)
+    && /e->res->Release\(\);/.test(poolGet));
+  check('teardown releases the pool and never the borrowed stream/index buffers',
+    destroy !== ''
+    && /for \(int i = 0; i < c->nubuf; i\+\+\) if \(c->ubuf\[i\]\.res\) c->ubuf\[i\]\.res->Release\(\);/.test(destroy)
+    && !/indexBuffer->Release\(\)|streams\[i\]\.buf->Release\(\)/.test(destroy));
+  check('win32.md 3.10 records the pool, the measured plateau and the stamp guard',
+    /### 3\.10 [^\n]*上传/.test(win32Doc)
+    && /67,728 → 147,488 对象/.test(win32Doc)
+    && /s3d_stamp_uploads/.test(win32Doc) && /listOpen/.test(win32Doc));
 
   console.log(`     [stage3d] ${ok} check(s) passed`);
   return bad;

@@ -3,6 +3,7 @@
 
 import type { Program, Stmt, Expr, ASType, Param, ClassMember, Block } from './ast.ts';
 import { RUNTIME_PREAMBLE } from './runtime.ts';
+import { FRE_BODY, FRE_HEAD, FRE_STUBS, type AneDescriptor } from './fre.ts';
 import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, setGenPos, codegenBareMessage, checkTypeAnnotation } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 import type { SwcResourceSpec, SwcBake } from './swc.ts';
@@ -557,6 +558,13 @@ export class Emitter {
   // returns a minimal empty <application/> element rather than inventing one.
   private appDescriptorXml: string | undefined;
 
+  // The native extensions the build was given, resolved from their extension.xml
+  // at COMPILE time (see ane.ts). Empty for a build with no --ane-path, which
+  // emits an empty descriptor table: createExtensionContext then reports "no
+  // native extension with this ID is part of the build" instead of fabricating
+  // a context that can never reach native code.
+  private aneDescriptors: readonly AneDescriptor[];
+
   constructor(
     program: Program,
     symbols: SymbolTable,
@@ -564,7 +572,8 @@ export class Emitter {
     swcResources: readonly SwcResourceSpec[] = [],
     swcBake: SwcBake | undefined = undefined,
     embedResources: readonly EmbedResourceSpec[] = [],
-    appDescriptorXml: string | undefined = undefined
+    appDescriptorXml: string | undefined = undefined,
+    aneDescriptors: readonly AneDescriptor[] = []
   ) {
     this.program = program;
     this.symbols = symbols;
@@ -582,6 +591,7 @@ export class Emitter {
     // `ns::versionNumber` is "" (talkmed-meeting's Config.CurrentAppVersion then
     // answered an empty version and the update check compared nothing).
     this.appDescriptorXml = appDescriptorXml;
+    this.aneDescriptors = aneDescriptors;
   }
 
   // ---------- top level ----------
@@ -589,6 +599,7 @@ export class Emitter {
   run(): string {
     this.line(RUNTIME_PREAMBLE.trimEnd());
     this.line('');
+    this.emitAnePreamble();
     for (const s of this.program.body) {
       if (s.kind === 'ClassDecl') this.userClasses.add(qualifiedName(s.name, s.packageName));
     }
@@ -613,12 +624,19 @@ export class Emitter {
     this.emitInterfaceVtables();
     this.emitVtables();
     this.emitClassRegistry();
+    this.emitDescribeType();
     this.emitAmfCodec();
     this.emitShellClasses();
+    this.emitFreWiring();
     this.emitArrayBackedWire();
     this.emitStaticFields();
     this.emitStaticInits();
     this.emitDefinitions();
+    // Every hand-written built-in constructor body is now on the page, so the
+    // class registry's factory slots can be settled (see emitBuiltinFactories).
+    // Before emitMain because -O2's call graph starts there and an unreferenced
+    // wrapper has to be visible to it as dead.
+    this.emitBuiltinFactories();
     this.emitSqlClasses();
     this.emitExportWrappers();
     this.emitGCRoots();
@@ -1463,6 +1481,11 @@ export class Emitter {
       // dynamic operation is then served by the flash_proxy interceptor methods
       // instead of the `_dyn` slot table (see as_dyn_get / as_proxy_get_miss).
       this.line('int cls_is_proxy;');
+      // isDynamic/isFinal for the reflection consumers (describeType's <type>
+      // attributes); mirrors as_vtable_header.is_dynamic/is_final, which sit at
+      // the same offsets so a class vtable can be cast to that header.
+      this.line('int cls_is_dynamic;');
+      this.line('int cls_is_final;');
       for (const slot of info.vtableSlots ?? []) {
         if (slot.kind === 'method') this.line(`${this.methodPtrField(slot.info, slot.name)};`);
         else if (slot.kind === 'getter') this.line(`${this.getterPtrField(slot.info, slot.name)};`);
@@ -2239,6 +2262,9 @@ export class Emitter {
     // NativeApplication bodies that call as_win_active).
     this.line('static NativeWindow* as_win_wrapper(int id);');
     this.line('static NativeWindow* as_win_active(void);');
+    // NativeApplication.openedWindows. Defined with the window table (it needs
+    // ASC_wins), but the getter that calls it is emitted long before that.
+    this.line('static as_array* as_win_opened_windows(void);');
     // The drag follower (defined with the drag state, AFTER Sprite/startDrag's body
     // which calls it to place the object at the press point).
     this.line('static void as_drag_follow(double x, double y);');
@@ -2333,7 +2359,8 @@ export class Emitter {
       // (reflectFqn for built-ins), used by #1034/#1056/#1069 messages via
       // as_fqn_dotted. Distinct from the class-value gate described in symbols.ts.
       const fqn = info.fqn ?? info.reflectFqn ?? name;
-      const entries: string[] = [`"${name}"`, superVt, ifaceArr, props, methods, getters, setters, dynOffset, `"${this.escapeCString(fqn)}"`, info.isProxy ? '1' : '0'];
+      // isDynamic/isFinal feed describeType's <type isDynamic=... isFinal=...>.
+      const entries: string[] = [`"${name}"`, superVt, ifaceArr, props, methods, getters, setters, dynOffset, `"${this.escapeCString(fqn)}"`, info.isProxy ? '1' : '0', info.isDynamic ? '1' : '0', info.isFinal ? '1' : '0'];
       for (const slot of info.vtableSlots ?? []) {
         if (slot.kind === 'method') entries.push(`${slot.info.owner}_${slot.name}`);
         else if (slot.kind === 'getter') entries.push(`${slot.info.owner}_get_${slot.name}`);
@@ -2360,6 +2387,75 @@ export class Emitter {
   // default, so this MUST be keyed on the count of REQUIRED parameters, not the
   // total (a bug that made `new (Object(x).constructor as Class)()` dereference
   // a NULL pointer for all-optional-parameter classes).
+  // ---- flash.utils.describeType support ----
+  // The AIR type NAME of a declared type, in the `pkg::Cls` spelling
+  // getQualifiedClassName returns (getDefinitionByName accepts both spellings).
+  // These strings go into the reflection tables' as_method.sig and the
+  // as_dt_ctors side table; emitDescribeType is the consumer.
+  private reflectTypeName(t: ASType, info: ClassInfo): string {
+    return this.reflectTypeNameOf(resolveType(t, info.importAlias));
+  }
+  private reflectTypeNameOf(ct: CType): string {
+    switch (ct.kind) {
+      case 'int': return 'int';
+      case 'uint': return 'uint';
+      case 'number': return 'Number';
+      case 'bool': return 'Boolean';
+      case 'string': return 'String';
+      case 'void': return 'void';
+      case 'null': return '*';
+      case 'any': return '*';
+      case 'array': return 'Array';
+      case 'vector': return `__AS3__.vec::Vector.<${this.reflectTypeNameOf(ct.elem)}>`;
+      case 'object': {
+        const c = this.symbols.getClass(ct.className);
+        return c !== undefined ? (c.fqn ?? c.reflectFqn ?? ct.className) : ct.className;
+      }
+      case 'interface': {
+        const i = this.symbols.interfaces.get(ct.name);
+        return i?.reflectFqn ?? ct.name;
+      }
+      case 'function': return 'Function';
+      case 'class': return 'Class';
+      case 'dict': return 'flash.utils::Dictionary';
+      case 'regexp': return 'RegExp';
+      case 'xml': return 'XML';
+      case 'xmllist': return 'XMLList';
+      case 'int64': case 'uint64': return 'Number';
+      case 'record': return 'Object';
+      default: return '*';
+    }
+  }
+  // as_method.sig for a method: "returnType;?param;param", where '?' marks a
+  // parameter that has a default. A rest parameter is NOT listed -- AIR omits it
+  // from the <parameter> children (measured on adl 51.4.1, temp/dtor).
+  private reflectSigOfMethod(m: MethodInfo, info: ClassInfo): string {
+    const parts = [this.reflectTypeNameOf(m.returnType)];
+    for (const p of m.params) {
+      if (p.isRest) continue;
+      parts.push((p.defaultValue !== null ? '?' : '') + this.reflectTypeName(p.type, info));
+    }
+    return parts.join(';');
+  }
+  // as_method.sig for a getter table entry: the PROPERTY type, which the consumer
+  // reads directly (a sig without ';' is not a method signature).
+  private reflectSigOfType(ct: CType): string {
+    return this.reflectTypeNameOf(ct);
+  }
+  private reflectSigOfSetter(s: MethodInfo, info: ClassInfo): string {
+    return s.params.length > 0 ? this.reflectTypeName(s.params[0].type, info) : 'void';
+  }
+  // The constructor signature for the as_dt_ctors row of `info`, or null when AIR
+  // would print no <constructor> node at all (it only prints one when the
+  // constructor takes parameters).
+  private reflectCtorSig(info: ClassInfo): string | null {
+    const real = info.constructor.params.filter((p) => !p.isRest);
+    if (real.length === 0) return null;
+    const parts = ['void'];
+    for (const p of real) parts.push((p.defaultValue !== null ? '?' : '') + this.reflectTypeName(p.type, info));
+    return parts.join(';');
+  }
+
   private ctorFactoryExpr(name: string): string {
     const info = this.symbols.classes.get(name);
     const params = info ? info.constructor.params : [];
@@ -2374,6 +2470,70 @@ export class Emitter {
   // emits both `X_new_default` and the registry-visible `X_ctor`/`X_new` bodies).
   private hasGeneratedFactory(name: string): boolean {
     return this.userClasses.has(name) || this.symbols.getClass(name)?.shell === true;
+  }
+
+  // A built-in's factory SLOT, as a placeholder emitBuiltinFactories settles.
+  //
+  // Built-ins are in the class registry (so their names work as Class values),
+  // but their C constructors are hand-written with bespoke signatures
+  // (`Point_new(double x, double y)`, `Sprite_new(void)`) and a whole family of
+  // them (SoundMixer, MouseCursor, FileMode, ...) are constant holders with NO
+  // constructor at all. So whether `X_new` exists -- and with which signature --
+  // is only knowable by looking at the emitted C, which is what the placeholder
+  // exists for: it is a verbatim token this emitter replaces after every
+  // constructor body is on the page, with NULL for the classes that have none.
+  //
+  // AIR's own `new Foo()` is illegal when a parameter has no default, so only
+  // two shapes can be wired at all: a zero-parameter constructor (whose C entry
+  // point IS `X_new(void)`) and an all-defaulted one (for which a
+  // `X_new_default()` wrapper is generated).
+  private builtinFactoryPlaceholder(name: string): string {
+    const info = this.symbols.classes.get(name);
+    if (info === undefined) return 'NULL';
+    const params = info.constructor.params;
+    if (params.some((p) => p.isRest)) return 'NULL';
+    if (params.some((p) => p.defaultValue === null)) return 'NULL';
+    return `__ASC_CTOR_FACTORY_${name}__`;
+  }
+
+  // Settle every built-in factory slot, and emit the `X_new_default()` wrappers
+  // the all-defaulted ones need. Runs after emitDefinitions, so `this.out`
+  // already holds every hand-written built-in constructor body -- which is the
+  // only way to tell `Point_new` (exists, 2 params) from `SoundMixer_new`
+  // (does not exist: the class is a constant holder).
+  private emitBuiltinFactories(): void {
+    const text = this.out.join('\n');
+    const wrappers: string[] = [];
+    for (const [name, info] of this.symbols.classes) {
+      if (info.fqn !== undefined || info.reflectFqn === undefined) continue;
+      if (this.builtinFactoryPlaceholder(name) === 'NULL') continue;
+      const params = info.constructor.params;
+      // A DEFINITION, not a prototype and not a call: the emitter writes
+      // `X* X_new(...) {` for a body and `X* X_new(...);` for a forward
+      // declaration, so the `{` is what separates "this class has a C
+      // constructor" from "this class merely announces one".
+      const hasCtor = new RegExp(`\\b${name}\\s*\\*\\s*${name}_new\\([^;]*\\)\\s*\\{`).test(text);
+      if (!hasCtor) {
+        this.replaceAllInOut(`__ASC_CTOR_FACTORY_${name}__`, 'NULL');
+        continue;
+      }
+      if (params.length === 0) {
+        this.replaceAllInOut(`__ASC_CTOR_FACTORY_${name}__`, `(void*(*)(void))${name}_new`);
+        continue;
+      }
+      const defaults = params
+        .map((p) => this.convert(this.emitExpr(p.defaultValue!), this.rt(p.type)))
+        .join(', ');
+      wrappers.push(`${name}* ${name}_new_default(void) { return ${name}_new(${defaults}); }`);
+      this.replaceAllInOut(`__ASC_CTOR_FACTORY_${name}__`, `(void*(*)(void))${name}_new_default`);
+    }
+    this.out.push('', ...wrappers, '');
+  }
+
+  private replaceAllInOut(from: string, to: string): void {
+    for (let i = 0; i < this.out.length; i++) {
+      if (this.out[i].includes(from)) this.out[i] = this.out[i].split(from).join(to);
+    }
   }
 
   // The argument-carrying constructor thunk registered for `name`, or 'NULL'.
@@ -2689,16 +2849,22 @@ export class Emitter {
       entries.push(`{ "${this.escapeCString(info.reflectFqn)}", &${name}_cls }`);
       // The Object class alone gets a uniform no-arg constructor (a plain object,
       // which is exactly what `new Object()` and `new Object(5)` answer in AIR --
-      // unlike the Object(x) CONVERSION, which yields x). Every other built-in has
-      // a bespoke C constructor with no uniform entry point, so dynamic
-      // instantiation of it stays a loud #1063.
+      // unlike the Object(x) CONVERSION, which yields x). Object is the ONE
+      // built-in whose C constructor the emitter writes with a fixed signature;
+      // see builtinFactoryExpr for the rest.
       const ctorFn = name === 'Object' ? 'as_core_cls_ctor' : 'NULL';
+      const factory = this.builtinFactoryPlaceholder(name);
+      // Declare the wrapper now (the registry is earlier in the file than the
+      // wrappers themselves, see emitBuiltinFactories) and settle the factory
+      // slot once every constructor body has actually been emitted. A prototype
+      // that ends up unused is inert.
+      if (factory !== 'NULL') this.line(`static ${name}* ${name}_new_default(void);`);
       // Wire the static-member table just like user classes: a built-in's static
       // getter/method/field is reachable through a Class value too (AIR: measured
       // temp/adlprobe/adl.txt section 1; the app's Application.NativeApplication goes
       // through flash.desktop.NativeApplication's static getter this way). Leaving it
       // NULL used to read undefined, silently skipping the caller's branch.
-      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, NULL, ${ctorFn}, "${this.escapeCString(info.reflectFqn)}", 0, ${staticTables.get(name) ?? 'NULL'} };`);
+      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, ${factory}, ${ctorFn}, "${this.escapeCString(info.reflectFqn)}", 0, ${staticTables.get(name) ?? 'NULL'} };`);
     }
     // The core language classes (Object/String/Number/Boolean/int/uint/Array) have
     // no ClassInfo, so the two loops above never see them; they still need a class
@@ -3410,9 +3576,9 @@ export class Emitter {
           // so carry the target vtable + fqn rather than only the tag.
           const cls = (f.type as { className: string }).className;
           const cinfo = this.symbols.getClass(cls)!;
-          this.line(`{ "${label}", 11, ${off}, (void*)&${cls}_vt, "${this.escapeCString(cinfo.fqn ?? cinfo.reflectFqn ?? cls)}", ${vis} },`);
+          this.line(`{ "${label}", 11, ${off}, (void*)&${cls}_vt, "${this.escapeCString(cinfo.fqn ?? cinfo.reflectFqn ?? cls)}", ${vis}, ${f.isAccessor ? 1 : 0}, ${f.isConst ? 1 : 0} },`);
         } else {
-          this.line(`{ "${label}", ${tag}, ${off}, NULL, NULL, ${vis} },`);
+          this.line(`{ "${label}", ${tag}, ${off}, NULL, NULL, ${vis}, ${f.isAccessor ? 1 : 0}, ${f.isConst ? 1 : 0} },`);
         }
       }
       // `class X extends Array` (arrayBacked): the element storage is a GC array
@@ -3583,7 +3749,8 @@ export class Emitter {
         // while as_proxy_invoke --- which dispatches the interceptor protocol ---
         // does. AIR declares them in the flash_proxy namespace, not the public one.
         const key = m.isProxyNs ? `flash_proxy::${mname}` : mname;
-        this.line(`{ "${this.escapeCString(key)}", ${name}_${mname}__dyn },`);
+        const vis = m.visibility === 'public' ? 0 : 1;
+        this.line(`{ "${this.escapeCString(key)}", ${name}_${mname}__dyn, ${vis}, "${this.reflectSigOfMethod(m, info)}" },`);
       }
       this.line('{ NULL, NULL }');
       this.indent--;
@@ -3650,7 +3817,8 @@ export class Emitter {
       this.indent++;
       for (const [sname, s] of info.setters) {
         if (s.owner !== name) continue;
-        this.line(`{ "${this.escapeCString(sname)}", ${name}_set_${sname}__dyn },`);
+        const svis = s.visibility === 'public' ? 0 : 1;
+        this.line(`{ "${this.escapeCString(sname)}", ${name}_set_${sname}__dyn, ${svis}, "${this.reflectSigOfSetter(s, info)}" },`);
       }
       this.line('{ NULL, NULL }');
       this.indent--;
@@ -3675,7 +3843,7 @@ export class Emitter {
         // deliberately ignores vis -- AIR serves a private accessor to dynamic
         // access -- so only JSON.stringify filters on it.
         const vis = g.visibility === 'public' ? 0 : 1;
-        this.line(`{ "${this.escapeCString(gname)}", ${name}_get_${gname}__dyn, ${vis} },`);
+        this.line(`{ "${this.escapeCString(gname)}", ${name}_get_${gname}__dyn, ${vis}, "${this.reflectSigOfType(g.returnType)}" },`);
       }
       this.line('{ NULL, NULL, 0 }');
       this.indent--;
@@ -3859,6 +4027,395 @@ export class Emitter {
   // as_sql_* ABI; plain (unencrypted) AIR databases ARE standard SQLite files, so
   // the semantics here are SQLite's own. Encryption is NOT implemented and is
   // reported loudly (never a silent plaintext write).
+  // ---------- flash.utils.describeType ----------
+  // Emits the AIR-shaped trait dump. It is NOT part of the runtime preamble
+  // because it has to see the class registry (as_dt_class_named) and the two side
+  // tables emitted here, both of which come later in the file. Every function in
+  // the block is static, so clang -O2 strips all of it -- including the tables --
+  // whenever describeType is never called.
+  //
+  // The interface pair table exists because an interface vtable struct carries
+  // only its sanitized C identifier (foo_IFoo), while AIR names an interface
+  // `foo::IFoo`: the map KEY and reflectFqn are exactly that pair.
+  private emitDescribeType(): void {
+    this.line('// Interface C identifier -> AIR interface name, for describeType.');
+    this.line('typedef struct { const char* cname; const char* fqn; } as_dt_iface_name;');
+    this.line('static const as_dt_iface_name as_dt_iface_names[] = {');
+    for (const [iname, ifo] of this.symbols.interfaces) {
+      this.line(`  { "${this.escapeCString(iname)}", "${this.escapeCString(ifo.reflectFqn ?? iname)}" },`);
+    }
+    this.line('  { NULL, NULL }');
+    this.line('};');
+    // A table of its own, not a row in as_method's: a class whose constructor
+    // takes parameters but which declares no methods of its own has no method
+    // table at all, so the constructor signature needs a home outside it.
+    this.line('// Class FQN -> constructor signature, for the classes whose constructor');
+    this.line('// takes parameters (AIR prints no <constructor> node otherwise).');
+    this.line('typedef struct { const char* fqn; const char* sig; } as_dt_ctor_row;');
+    this.line('static const as_dt_ctor_row as_dt_ctors[] = {');
+    for (const [name, info] of this.symbols.classes) {
+      const sig = this.reflectCtorSig(info);
+      if (sig === null) continue;
+      const fqn = info.fqn ?? info.reflectFqn ?? name;
+      this.line(`  { "${this.escapeCString(fqn)}", "${sig}" },`);
+    }
+    this.line('  { NULL, NULL }');
+    this.line('};');
+    this.line('');
+    const C = `
+// flash.utils.describeType(value:*):XML -- AIR's trait dump, MEASURED on adl 51.4.1
+// (harness temp/dtor). The operand picks AIR's SHAPE:
+//   * a Class value describes the CLASS: base="Class", isDynamic/isFinal/isStatic
+//     all "true", and the instance traits nested in <factory type="FQN">;
+//   * anything else describes the INSTANCE: base = the DIRECT superclass,
+//     isDynamic/isFinal from the class, isStatic="false".
+// Both list the whole ancestry (<extendsClass>, nearest first, "Object" last) and
+// every interface of the chain, then the PUBLIC traits: <variable> per public
+// field, <constant> per public const, <accessor access="readonly|writeonly|
+// readwrite"> per getter/setter pair, <method returnType="..."> per public method
+// (with <parameter index/type/optional> children) and a <constructor> when the
+// constructor takes parameters.
+// Every name uses the 'pkg::Cls' spelling getQualifiedClassName returns -- NOT the
+// dotted getDefinitionByName form; that function accepts BOTH (measured), so a
+// reflected type name still round-trips through it, which is exactly what
+// a model mapper does with property.@type.
+// The payload is driven by the reflection tables the vtables ALREADY carry
+// (as_prop.is_accessor/is_const, as_method.vis/sig) plus the vtable super chain
+// for declaredBy, so no per-class describeType data is emitted and -O2 can strip
+// the whole block when describeType is never called.
+//
+// Deliberate gaps, documented in docs/zh-cn/xml.md:
+//   * <factory> lists no STATIC members (we carry no static reflection table);
+//   * <metadata> is never emitted;
+//   * an int literal and a Number box both report "Number" (box tag 1 cannot tell
+//     them apart; AIR reports "int" for describeType(1));
+//   * a built-in trait our reflection tables do not model at all cannot appear,
+//     and a modelled built-in accessor pair whose getter is listed without a
+//     setter in our tables reports "readwrite";
+//   * trait ORDER is ours (nearest class first), not AIR's internal table order.
+static as_xml_node* as_dt_shape(const as_vtable_header* h, const char* fqn, int is_cls);
+static void as_dt_add_child(as_xml_node* n, as_xml_node* c) {
+    int nc = n->child_count + 1;
+    as_xml_node** buf = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, (size_t)nc * sizeof(as_xml_node*));
+    for (int i = 0; i < n->child_count; i++) { buf[i] = n->children[i]; gc_write_barrier((void*)buf[i]); }
+    buf[n->child_count] = c;
+    gc_write_barrier((void*)c);
+    n->children = buf;
+    n->child_count = nc;
+    gc_write_barrier((void*)buf);
+    c->parent = n;
+}
+static as_xml_node* as_dt_child(as_xml_node* parent, const char* name) {
+    as_xml_node* c = as_xml_node_new((char*)name);
+    as_dt_add_child(parent, c);
+    return c;
+}
+// The 'pkg::Iface' name behind an interface vtable's C identifier. An interface
+// vtable struct carries only the sanitized C name (it has no fqn slot, unlike a
+// class vtable), so the emitter publishes this side table.
+static const char* as_dt_iface_fqn(const char* cname) {
+    for (int i = 0; as_dt_iface_names[i].cname != NULL; i++)
+        if (strcmp(as_dt_iface_names[i].cname, cname) == 0) return as_dt_iface_names[i].fqn;
+    return cname;
+}
+// The as_class registered under 'fqn', for the operands that have no usable
+// vtable of their own (Number/String/Boolean/Array/Function primitives).
+static as_class* as_dt_class_named(const char* fqn) {
+    for (int i = 0; as_class_registry[i].fqn != NULL; i++)
+        if (strcmp(as_class_registry[i].fqn, fqn) == 0) return as_class_registry[i].cls;
+    return NULL;
+}
+// The registered class a boxed value is an INSTANCE of (or the Class object it IS,
+// with *is_cls set). A Dictionary / Array / monomorphized Vector carries no vtable
+// as its first word (see as_dyn_kind) and neither does an XML node or a RegExp
+// wrapper, so a class instance is recognized by matching the candidate's first
+// word against the registry's vtables: that word is only ever COMPARED, never
+// dereferenced, so a container whose head is a data pointer or a name simply fails
+// to match instead of crashing.
+static as_class* as_dt_class_of(as_value v, int* is_cls) {
+    *is_cls = 0;
+    if (v.tag == 4 && as_v_is_class(v)) { *is_cls = 1; return (as_class*)v.ptr; }
+    if (v.tag != 4 || v.ptr == NULL) return NULL;
+    // An Array, a Dictionary and a monomorphized Vector are GC bodies whose FIRST
+    // word is a data pointer (as_dyn_kind reports them), so reading a vtable slot
+    // off them is meaningless -- they get their name from the shape table instead.
+    if (as_dyn_kind(v.ptr) != 0) return NULL;
+    const void* cand = ((as_object_header*)v.ptr)->vtable;
+    for (int i = 0; as_class_registry[i].fqn != NULL; i++) {
+        as_class* c = as_class_registry[i].cls;
+        if (c != NULL && c->vtable == cand) return c;
+    }
+    return NULL;
+}
+// The AIR @type string for a reflection table entry, from its storage tag (the
+// tag numbers are as_prop's).
+static const char* as_dt_prop_type(const as_prop* p) {
+    switch (p->type) {
+        case 1: return "Number";
+        case 2: return "Boolean";
+        case 3: return "String";
+        case 4: return "int";
+        case 5: return "uint";
+        case 8: case 9: return "Number";
+        case 10: return "Array";
+        case 11: return (p->fqn != NULL && p->fqn[0] != 0) ? p->fqn : "*";
+        case 12: return "Object";
+        case 13: return "String";
+        default: return "*";
+    }
+}
+// Record 'name' in the caller's seen list; 1 when it was already there (the caller
+// then skips the trait). A subclass contributes its own override before the
+// ancestor it overrides, and AIR lists each trait exactly once.
+static int as_dt_seen(const char*** arr, int* n, int* cap, const char* name) {
+    for (int i = 0; i < *n; i++) if (strcmp((*arr)[i], name) == 0) return 1;
+    if (*n == *cap) {
+        int nc = (*cap == 0) ? 32 : (*cap * 2);
+        const char** na = (const char**)realloc((void*)*arr, sizeof(char*) * (size_t)nc);
+        if (na == NULL) return 0;
+        *arr = na;
+        *cap = nc;
+    }
+    (*arr)[(*n)++] = name;
+    return 0;
+}
+// as_method.sig is ONE string: a method spells "returnType;?param;param" (a
+// leading '?' marks a parameter with a default), while a getter/setter entry
+// spells just its own property/parameter type. This fills a <method> /
+// <constructor> node: segment 0 becomes returnType and each remaining segment a
+// <parameter> child. A sig without ';' is a getter/setter type, which the caller
+// reads directly.
+static void as_dt_method_sig(as_xml_node* m, const char* sig) {
+    int idx = 1;
+    if (sig == NULL || sig[0] == 0) { as_xml_set_attr(m, "returnType", "*"); return; }
+    const char* p = sig;
+    const char* semi = strchr(p, ';');
+    if (semi == NULL) { as_xml_set_attr(m, "returnType", (char*)p); return; }
+    size_t rl = (size_t)(semi - p);
+    char* rt = as_str_alloc(rl + 1);
+    memcpy(rt, p, rl);
+    rt[rl] = 0;
+    as_xml_set_attr(m, "returnType", rt);
+    p = semi + 1;
+    while (p[0] != 0) {
+        const char* nx = strchr(p, ';');
+        size_t nl = (nx == NULL) ? strlen(p) : (size_t)(nx - p);
+        int opt = (nl > 0 && p[0] == '?');
+        const char* tp = opt ? p + 1 : p;
+        size_t tl = nl - (size_t)(opt ? 1 : 0);
+        char* tv = as_str_alloc(tl + 1);
+        memcpy(tv, tp, tl);
+        tv[tl] = 0;
+        as_xml_node* par = as_dt_child(m, "parameter");
+        as_xml_set_attr(par, "index", as_str_from_int(idx));
+        as_xml_set_attr(par, "type", tv);
+        as_xml_set_attr(par, "optional", (char*)(opt ? "true" : "false"));
+        idx++;
+        p = (nx == NULL) ? (p + nl) : (nx + 1);
+    }
+}
+// The public instance traits of 'h' and its ancestors. AIR emits its own
+// (hash-like) trait order, which is not reproducible and differs between a base
+// class and its subclass; the trait SET is what a consumer acts on, so this walks
+// the chain nearest-class-first and lets as_dt_seen drop the overridden repeats.
+// AIR prints a <constructor> node only when the constructor takes parameters, so
+// the emitter publishes a side table with exactly those (fqn -> signature); a
+// no-argument constructor appears nowhere, which is AIR's own rule.
+static const char* as_dt_ctor_sig(const char* fqn) {
+    for (int i = 0; as_dt_ctors[i].fqn != NULL; i++)
+        if (strcmp(as_dt_ctors[i].fqn, fqn) == 0) return as_dt_ctors[i].sig;
+    return NULL;
+}
+static void as_dt_traits(as_xml_node* parent, const as_vtable_header* h) {
+    const char** seen = NULL;
+    int nseen = 0;
+    int scap = 0;
+    for (const as_vtable_header* c = h; c != NULL; c = (const as_vtable_header*)c->super) {
+        // AIR never lists Object's own traits (toString, hasOwnProperty, ...) -- not
+        // for a subclass and not for a plain object either (measured, temp/dtor).
+        if (c->name != NULL && strcmp(c->name, "Object") == 0) break;
+        const char* decl = (c->fqn != NULL && c->fqn[0] != 0) ? c->fqn : c->name;
+        const as_method* gs = (const as_method*)c->getters;
+        const as_method* ss = (const as_method*)c->setters;
+        const as_prop* ps = (const as_prop*)c->props;
+        for (int i = 0; gs != NULL && gs[i].name != NULL; i++) {
+            if (gs[i].vis != 0) continue;
+            if (as_dt_seen(&seen, &nseen, &scap, gs[i].name)) continue;
+            int has_set = 0;
+            for (int j = 0; ss != NULL && ss[j].name != NULL; j++)
+                if (ss[j].vis == 0 && strcmp(ss[j].name, gs[i].name) == 0) { has_set = 1; break; }
+            as_xml_node* a = as_dt_child(parent, "accessor");
+            as_xml_set_attr(a, "name", (char*)gs[i].name);
+            as_xml_set_attr(a, "access", (char*)(has_set ? "readwrite" : "readonly"));
+            as_xml_set_attr(a, "type", (char*)(gs[i].sig != NULL ? gs[i].sig : "*"));
+            as_xml_set_attr(a, "declaredBy", (char*)decl);
+        }
+        for (int i = 0; ss != NULL && ss[i].name != NULL; i++) {
+            if (ss[i].vis != 0) continue;
+            if (as_dt_seen(&seen, &nseen, &scap, ss[i].name)) continue;
+            as_xml_node* a = as_dt_child(parent, "accessor");
+            as_xml_set_attr(a, "name", (char*)ss[i].name);
+            as_xml_set_attr(a, "access", "writeonly");
+            as_xml_set_attr(a, "type", (char*)(ss[i].sig != NULL ? ss[i].sig : "*"));
+            as_xml_set_attr(a, "declaredBy", (char*)decl);
+        }
+        // A user 'public var' reaches the field table; a built-in property that
+        // AIR declares as an accessor pair is stored as a field for speed, so the
+        // field table also carries those (FieldInfo.isAccessor): an accessor node
+        // is what AIR prints for them.
+        for (int i = 0; ps != NULL && ps[i].name != NULL; i++) {
+            if (ps[i].vis != 0) continue;
+            if (as_dt_seen(&seen, &nseen, &scap, ps[i].name)) continue;
+            const char* kind = ps[i].is_accessor ? "accessor" : (ps[i].is_const ? "constant" : "variable");
+            as_xml_node* v = as_dt_child(parent, kind);
+            as_xml_set_attr(v, "name", (char*)ps[i].name);
+            if (ps[i].is_accessor) as_xml_set_attr(v, "access", "readwrite");
+            as_xml_set_attr(v, "type", (char*)as_dt_prop_type(&ps[i]));
+            if (ps[i].is_accessor) as_xml_set_attr(v, "declaredBy", (char*)decl);
+        }
+    }
+    for (const as_vtable_header* c = h; c != NULL; c = (const as_vtable_header*)c->super) {
+        if (c->name != NULL && strcmp(c->name, "Object") == 0) break;
+        const char* decl = (c->fqn != NULL && c->fqn[0] != 0) ? c->fqn : c->name;
+        const as_method* ms = (const as_method*)c->methods;
+        for (int i = 0; ms != NULL && ms[i].name != NULL; i++) {
+            if (ms[i].vis != 0) continue;
+            // A method name never starts with '<' in AS3: a reflection-table entry
+            // that does is an internal marker, not a trait.
+            if (ms[i].name[0] == '<') continue;
+            if (as_dt_seen(&seen, &nseen, &scap, ms[i].name)) continue;
+            as_xml_node* m = as_dt_child(parent, "method");
+            as_xml_set_attr(m, "name", (char*)ms[i].name);
+            as_xml_set_attr(m, "declaredBy", (char*)decl);
+            as_dt_method_sig(m, ms[i].sig);
+        }
+    }
+    free((void*)seen);
+}
+static as_xml_node* as_describe_type(as_value v) {
+    // describeType(null) has no shape at all in AIR (it returns an empty value),
+    // and describeType(undefined) throws #1010 (measured, temp/dtor).
+    if (v.tag == 5) as_throw(TypeError_new((char*)"Error #1010: A term is undefined and has no properties.", 1010));
+    if (v.tag == 0) return as_xml_node_new((char*)"");
+    int is_cls = 0;
+    as_class* cls = as_dt_class_of(v, &is_cls);
+    const as_vtable_header* h = (cls != NULL && cls->vtable != NULL) ? (const as_vtable_header*)cls->vtable : NULL;
+    const char* fqn = NULL;
+    if (h != NULL) fqn = (h->fqn != NULL && h->fqn[0] != 0) ? h->fqn : h->name;
+    if (h == NULL) {
+        // A core class whose box carries no vtable of its own -- the primitives, an
+        // Array, a Dictionary, a Vector specialization, or a value we cannot type
+        // at all. AIR still reports a name plus the class flags, and the container
+        // names/flags are fixed (measured on adl 51.4.1: Array is dynamic and not
+        // final with a 'length' accessor, a Vector is dynamic AND final, a
+        // Dictionary is 'flash.utils::Dictionary').
+        const char* nm = NULL;
+        int dyn = 1;
+        int fin = 0;
+        int is_vec = 0;
+        if (v.tag == 1 || v.tag == 8 || v.tag == 9) { nm = "Number"; dyn = 0; fin = 1; }
+        else if (v.tag == 2) { nm = "Boolean"; dyn = 0; fin = 1; }
+        else if (v.tag == 3) { nm = "String"; dyn = 0; fin = 1; }
+        else if (v.tag == 6) nm = "Array";
+        else if (v.tag == 7) nm = "Function";
+        else if (v.tag == 4 && v.ptr != NULL) {
+            int dk = as_dyn_kind(v.ptr);
+            if (dk == 1) nm = "flash.utils::Dictionary";
+            else { nm = as_get_qualified_class_name(v); if (dk == 3) { fin = 1; is_vec = 1; } }
+        }
+        if (nm == NULL) nm = "Object";
+        as_xml_node* t0 = as_xml_node_new((char*)"type");
+        as_xml_set_attr(t0, "name", (char*)nm);
+        as_xml_set_attr(t0, "isDynamic", (char*)(dyn ? "true" : "false"));
+        as_xml_set_attr(t0, "isFinal", (char*)(fin ? "true" : "false"));
+        as_xml_set_attr(t0, "isStatic", "false");
+        // A plain object has neither a base nor an extendsClass row; everything
+        // else extends Object.
+        if (strcmp(nm, "Object") != 0) {
+            as_xml_set_attr(t0, "base", "Object");
+            as_xml_set_attr(as_dt_child(t0, "extendsClass"), "type", "Object");
+        }
+        if (is_vec) {
+            as_xml_node* fa = as_dt_child(t0, "accessor");
+            as_xml_set_attr(fa, "name", "fixed");
+            as_xml_set_attr(fa, "access", "readwrite");
+            as_xml_set_attr(fa, "type", "Boolean");
+            as_xml_set_attr(fa, "declaredBy", (char*)nm);
+            as_xml_node* la = as_dt_child(t0, "accessor");
+            as_xml_set_attr(la, "name", "length");
+            as_xml_set_attr(la, "access", "readwrite");
+            as_xml_set_attr(la, "type", "uint");
+            as_xml_set_attr(la, "declaredBy", (char*)nm);
+        } else if (v.tag == 6 || strcmp(nm, "Array") == 0) {
+            as_xml_node* la = as_dt_child(t0, "accessor");
+            as_xml_set_attr(la, "name", "length");
+            as_xml_set_attr(la, "access", "readwrite");
+            as_xml_set_attr(la, "type", "uint");
+            as_xml_set_attr(la, "declaredBy", "Array");
+        }
+        return t0;
+    }
+    return as_dt_shape(h, fqn, is_cls);
+}
+static as_xml_node* as_dt_shape(const as_vtable_header* h, const char* fqn, int is_cls) {
+    as_xml_node* t = as_xml_node_new((char*)"type");
+    as_xml_set_attr(t, "name", (char*)fqn);
+    if (is_cls) {
+        // The Class-value view. AIR's Class trait set is fixed, so it is spelled
+        // out here: base Class, the two extendsClass rows, Class.prototype, then
+        // the instance traits under <factory>.
+        as_xml_set_attr(t, "base", "Class");
+        as_xml_set_attr(t, "isDynamic", "true");
+        as_xml_set_attr(t, "isFinal", "true");
+        as_xml_set_attr(t, "isStatic", "true");
+        as_xml_set_attr(as_dt_child(t, "extendsClass"), "type", "Class");
+        as_xml_set_attr(as_dt_child(t, "extendsClass"), "type", "Object");
+        as_xml_node* pr = as_dt_child(t, "accessor");
+        as_xml_set_attr(pr, "name", "prototype");
+        as_xml_set_attr(pr, "access", "readonly");
+        as_xml_set_attr(pr, "type", "*");
+        as_xml_set_attr(pr, "declaredBy", "Class");
+        as_xml_node* fac = as_dt_child(t, "factory");
+        as_xml_set_attr(fac, "type", (char*)fqn);
+        const char* fsig = as_dt_ctor_sig(fqn);
+        if (fsig != NULL) as_dt_method_sig(as_dt_child(fac, "constructor"), fsig);
+        as_dt_traits(fac, h);
+        return t;
+    }
+    // The instance view: AIR omits base and <extendsClass> for Object (nothing to
+    // inherit), and that falls out of walking the super chain below.
+    if (h->super != NULL) {
+        const as_vtable_header* sup = (const as_vtable_header*)h->super;
+        as_xml_set_attr(t, "base", (char*)((sup->fqn != NULL && sup->fqn[0] != 0) ? sup->fqn : sup->name));
+    }
+    as_xml_set_attr(t, "isDynamic", (char*)(h->is_dynamic ? "true" : "false"));
+    as_xml_set_attr(t, "isFinal", (char*)(h->is_final ? "true" : "false"));
+    as_xml_set_attr(t, "isStatic", "false");
+    for (const as_vtable_header* s = (const as_vtable_header*)h->super; s != NULL; s = (const as_vtable_header*)s->super)
+        as_xml_set_attr(as_dt_child(t, "extendsClass"), "type", (char*)((s->fqn != NULL && s->fqn[0] != 0) ? s->fqn : s->name));
+    const char** iseen = NULL;
+    int niseen = 0;
+    int icap = 0;
+    for (const as_vtable_header* s = h; s != NULL; s = (const as_vtable_header*)s->super) {
+        void** ip = s->ifaces;
+        for (int i = 0; ip != NULL && ip[i] != NULL; i++) {
+            const as_vtable_header* ih = (const as_vtable_header*)ip[i];
+            const char* in = as_dt_iface_fqn(ih->name);
+            if (as_dt_seen(&iseen, &niseen, &icap, in)) continue;
+            as_xml_set_attr(as_dt_child(t, "implementsInterface"), "type", (char*)in);
+        }
+    }
+    free((void*)iseen);
+    const char* csig = as_dt_ctor_sig(fqn);
+    if (csig != NULL) as_dt_method_sig(as_dt_child(t, "constructor"), csig);
+    as_dt_traits(t, h);
+    return t;
+}
+`;
+    for (const ln of C.split('\n')) this.line(ln);
+    this.line('');
+  }
+
   private emitSqlClasses(): void {
     const C = `
 // ---------- flash.data: SQLConnection / SQLStatement / SQLResult ----------
@@ -5350,6 +5907,55 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('char* NativeWindow_toString(void* _this) { (void)_this; return (char*)"[object NativeWindow]"; }');
+    // menu: this runtime has no NativeMenu subsystem at all (a registered
+    // lingering gap), so a window never has one and the getter answers AIR's null
+    // -- adl 51.4.1 reports null for both NativeApplication.menu and
+    // NativeWindow.menu unless one was set (temp/nwor/adl-oracle.txt sections A/C).
+    this.line('Object* NativeWindow_get_menu(void* _this) { (void)_this; return NULL; }');
+    // orderInFrontOf()/orderInBackOf(): adl 51.4.1 answers true for a normal pair
+    // and reports no bounds change, so the observable effect is the z-order move
+    // orderToFront/orderToBack already perform. Those two do the work and the
+    // result is true; a target that does not identify a live OTHER window (null,
+    // self, or a closed one) is reported false rather than silently succeeding.
+    this.line('bool NativeWindow_orderInFrontOf(void* _this, NativeWindow* window) {');
+    this.indent++;
+    this.line('if (window == NULL) return false;');
+    this.line('int me = ((NativeWindow*)_this)->_win;');
+    this.line('if (window->_win == me) return false;');
+    this.line('ASCWin* o = ASC_w(window->_win);');
+    this.line('if (o == NULL || o->stage == NULL || o->closed) return false;');
+    this.line('as_window_order_front(me);');
+    this.line('return true;');
+    this.indent--;
+    this.line('}');
+    this.line('bool NativeWindow_orderInBackOf(void* _this, NativeWindow* window) {');
+    this.indent++;
+    this.line('if (window == NULL) return false;');
+    this.line('int me = ((NativeWindow*)_this)->_win;');
+    this.line('if (window->_win == me) return false;');
+    this.line('ASCWin* o = ASC_w(window->_win);');
+    this.line('if (o == NULL || o->stage == NULL || o->closed) return false;');
+    this.line('as_window_order_back(me);');
+    this.line('return true;');
+    this.indent--;
+    this.line('}');
+    // globalToScreen(point): window-local -> screen. AIR adds the frame border to
+    // the window's OUTER bounds origin, because globalToScreen counts from the
+    // client area's top-left: adl 51.4.1 measured globalToScreen(0,0) = (34,57)
+    // for a window whose bounds are (26,26). Our bounds is the same frame rect
+    // (sk_window_get_bounds converts), so the same border has to be added back.
+    // A fresh Point every call, like AIR.
+    this.line('Point* NativeWindow_globalToScreen(void* _this, Point* point) {');
+    this.indent++;
+    this.line('if (point == NULL) return NULL;');
+    this.line('int x = 0, y = 0, w = 0, h = 0, bt = 0, bl = 0, bb = 0, br = 0;');
+    this.line('int id = ((NativeWindow*)_this)->_win;');
+    this.line('as_window_get_bounds(id, &x, &y, &w, &h);');
+    this.line('as_window_get_borders(id, &bt, &bl, &bb, &br);');
+    this.line('(void)w; (void)h; (void)bb; (void)br;');
+    this.line('return Point_new((double)(x + bl) + point->x, (double)(y + bt) + point->y);');
+    this.indent--;
+    this.line('}');
     // close() only REQUESTS teardown; the glue retires the window at the next frame
     // boundary and then calls back into ASC_window_on_close, which is where `closed`
     // flips and Event.CLOSE is dispatched. That ordering is what makes `closed` read
@@ -9345,6 +9951,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // returning a real window -- `!activeWindow` sends it down its "no window to
     // show the alert in" branch, silently swallowing the alert.
     this.line('NativeWindow* NativeApplication_get_activeWindow(void* _this) { (void)_this; return as_win_active(); }');
+    // NativeApplication.openedWindows: AIR's Array of every window the app has
+    // open, in slot order, where open[0] is the initial window and is the SAME
+    // object as stage.nativeWindow (measured on adl 51.4.1,
+    // temp/nwor/adl-oracle.txt sections A/F: length 1 -> 2 -> 1 across a new and a
+    // close, every element identity-true against its own stage.nativeWindow). It
+    // is an Array, not a Vector -- adl reports cls=Array. Built by reverse lookup
+    // over ASC_wins, so it can never disagree with the windows the glue has.
+    this.line('as_array* NativeApplication_get_openedWindows(void* _this) { (void)_this; return as_win_opened_windows(); }');
+    // NativeApplication.exit(): end the application now. AIR's shutdown on the
+    // last window's close (autoExit) and exit() are the same teardown; ours just
+    // starts it with windows still open, so the CLOSE dispatch and the ordering
+    // stay identical (see sk_window_request_exit in the glue).
+    this.line('void NativeApplication_exit(void* _this) { (void)_this; as_window_request_exit(); }');
     this.line('');
     // flash.ui.Multitouch: inputMode is a global string (default "none").
     this.line('static char* ASC_multitouch_input_mode = (char*)"none";');
@@ -10638,7 +11257,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // runs the whole text pipeline for it (measured: textInput "\n" -> change,
     // text gains CR), but SDL2/Cocoa never delivers a text commit for Return --
     // its text-input class implements insertText:replacementRange: and has NO
-    // insertNewline: (checked in vendor/sdl2/arm64/lib/libSDL2.a), so a real key
+    // insertNewline: (checked in vendor/sdl2/lib/macos-arm64/libSDL2.a), so a real key
     // press produces SDL_KEYDOWN and no SDL_TEXTINPUT. Synthesizing the commit here
     // puts Return on the same path as a typed character (a prevented keyDown still
     // suppresses it, via as_key_text_suppressed consumed inside as_tf_insert_text).
@@ -12017,8 +12636,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // (callers addEventListener(StatusEvent.STATUS, ...) on it directly, and that
     // must not dereference NULL), call() answers null -- the honest "no native side"
     // reply (§1.5) -- and dispose() returns true. getExtensionDirectory() returns a
-    // live (pathless) File so callers can inspect it instead of crashing; nothing
-    // is ever dispatched, so no StatusEvent is fabricated.
+    // live (pathless) File so callers can inspect it instead of crashing, and says
+    // why it has no path (below); nothing is ever dispatched, so no StatusEvent is
+    // fabricated.
     this.line('void StatusEvent_ctor(StatusEvent* o, char* type, bool bubbles, bool cancelable, char* code, char* level) { Event_ctor((Event*)o, type, bubbles, cancelable); o->code = code; gc_write_barrier((void*)code); o->level = level; gc_write_barrier((void*)level); }');
     this.line('StatusEvent* StatusEvent_new(char* type, bool bubbles, bool cancelable, char* code, char* level) { StatusEvent* o = (StatusEvent*)gc_alloc(GCT_CLASS, sizeof(StatusEvent)); o->vtable = &StatusEvent_vt; StatusEvent_ctor(o, type, bubbles, cancelable, code, level); return o; }');
     this.line('void StatusEvent_updateAfterEvent(void* _this) { (void)_this; }');
@@ -12030,17 +12650,88 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('void KeyboardEvent_updateAfterEvent(void* _this) { (void)_this; }');
     this.line('void TouchEvent_updateAfterEvent(void* _this) { (void)_this; }');
     this.line('void TimerEvent_updateAfterEvent(void* _this) { (void)_this; }');
-    this.line('void ExtensionContext_ctor(ExtensionContext* o, char* extensionID, char* contextType) { EventDispatcher_ctor((EventDispatcher*)o, NULL); (void)contextType; o->_extID = extensionID; gc_write_barrier((void*)extensionID); o->actionScriptData = NULL; }');
+    // The extension id is a constructor parameter, not a property: AIR's
+    // ExtensionContext does not expose one (see the note on the class in symbols.ts).
+    this.line('void ExtensionContext_ctor(ExtensionContext* o, char* extensionID, char* contextType) { EventDispatcher_ctor((EventDispatcher*)o, NULL); (void)extensionID; (void)contextType; o->actionScriptData = NULL; }');
     this.line('ExtensionContext* ExtensionContext_new(char* extensionID, char* contextType) { ExtensionContext* o = (ExtensionContext*)gc_alloc(GCT_CLASS, sizeof(ExtensionContext)); o->vtable = &ExtensionContext_vt; ExtensionContext_ctor(o, extensionID, contextType); return o; }');
-    this.line('char* ExtensionContext_get_extensionID(void* _this) { return ((ExtensionContext*)_this)->_extID; }');
     // AIR types call() as `*`, so the ANE wrapper sources may hand its result to ANY
     // parameter without a coercion error (ANEQcloud.as:179 `return _extCtx.call(...)`
-    // in a `:Boolean` method). No FRe host is loaded, so the honest answer stays the
-    // null box -- as_shell_unsupported already reported the omission.
+    // in a `:Boolean` method).
+    //
+    // With a FRE host this is the real bridge: the arguments are the boxed values
+    // of the AS3 Array, the extension's registered function runs, and its returned
+    // FREObject comes back as a boxed value. A context whose extension is absent
+    // is the one case AIR also answers with null -- and createExtensionContext has
+    // already reported why, so this body names the call site rather than inventing
+    // a result.
+    this.line('#ifdef ASC_HAVE_FRE');
+    this.line('as_value ExtensionContext_call(void* _this, char* functionName, as_array* args) {');
+    this.indent++;
+    this.line('as_fre_ctx* c = as_fre_ctx_find((void*)_this);');
+    this.line('if (c == NULL) {');
+    this.indent++;
+    this.line('as_shell_unsupported("ExtensionContext.call on a context whose extension never loaded");');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('int argc = (args != NULL) ? args->length : 0;');
+    this.line('int handled = 0;');
+    this.line('as_value r = as_ext_call((void*)c, functionName, argc > 0 ? args->data : NULL, argc, &handled);');
+    this.line('(void)handled;');
+    this.line('return r;');
+    this.indent--;
+    this.line('}');
+    this.line('#else');
     this.line('as_value ExtensionContext_call(void* _this, char* functionName, as_array* args) { (void)_this; (void)functionName; (void)args; as_shell_unsupported("ExtensionContext.call"); return as_v_null(); }');
-    this.line('bool ExtensionContext_dispose(void* _this) { (void)_this; return true; }');
-    this.line('ExtensionContext* ExtensionContext_createExtensionContext_static(char* extensionID, char* contextType) { return ExtensionContext_new(extensionID, contextType); }');
-    this.line('File* ExtensionContext_getExtensionDirectory_static(char* extensionID) { (void)extensionID; return File_new(NULL); }');
+    this.line('#endif // ASC_HAVE_FRE');
+    // AIR types dispose() as `():void` (measured against the language reference);
+    // the runtime notifies the native side so it can release its resources and
+    // stops this context from being dispatched to. Without a FRE host there is
+    // nothing to notify, so the body is the honest no-op rather than a fabricated
+    // `true` (the pre-stage-172 shape returned bool).
+    this.line('#ifdef ASC_HAVE_FRE');
+    this.line('void ExtensionContext_dispose(void* _this) {');
+    this.indent++;
+    this.line('as_fre_ctx* c = as_fre_ctx_find((void*)_this);');
+    this.line('if (c != NULL) as_ext_dispose((void*)c);');
+    this.indent--;
+    this.line('}');
+    this.line('#else');
+    this.line('void ExtensionContext_dispose(void* _this) { (void)_this; }');
+    this.line('#endif // ASC_HAVE_FRE');
+    // createExtensionContext returns null in exactly two AIR cases: no extension
+    // entry for this ID/platform, and an Initializer or ContextInitializer that
+    // failed to run. With no FRE host it must NOT pretend success -- a context
+    // that silently cannot reach native code is the failure mode section 1.5 is
+    // about -- so the no-FRE build reports and returns null too.
+    this.line('#ifdef ASC_HAVE_FRE');
+    this.line('ExtensionContext* ExtensionContext_createExtensionContext_static(char* extensionID, char* contextType) {');
+    this.indent++;
+    this.line('ExtensionContext* o = ExtensionContext_new(extensionID, contextType);');
+    this.line('if (as_ext_create(extensionID, contextType, (void*)o) == NULL) return NULL;');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    this.line('#else');
+    this.line('ExtensionContext* ExtensionContext_createExtensionContext_static(char* extensionID, char* contextType) {');
+    this.indent++;
+    this.line('(void)extensionID; (void)contextType;');
+    this.line('as_shell_unsupported("ExtensionContext.createExtensionContext (this build has no native-extension host)");');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('#endif // ASC_HAVE_FRE');
+    // getExtensionDirectory() names the directory the extension's OWN files live in.
+    // This build now stages each extension's native library into a directory of its
+    // own, <exeDir>/extensions/<extensionID>/<platform>/ (see ane.ts
+    // stageAneNatives), but that directory holds the LIBRARY and nothing else: the
+    // rest of the .ane is not unpacked, so the data files an extension ships are not
+    // there. Handing back that path would therefore look right and immediately fail
+    // one level later (a FileNotFound inside the extension, with nothing on stderr),
+    // which is the shape AGENTS.md section 1.5 forbids: it reports instead, and the
+    // gap is registered in TODO.md 遗留待开发. Fixing it means unpacking the whole
+    // .ane into <extensionID>/, not just its native library.
+    this.line('File* ExtensionContext_getExtensionDirectory_static(char* extensionID) { (void)extensionID; as_shell_unsupported("ExtensionContext.getExtensionDirectory (this build stages only the native library, under extensions/<extensionID>/<platform>; the rest of the package is not unpacked)"); return File_new(NULL); }');
     // ---- flash.net.NetConnection / NetStream + flash.media.Video (stage 110) ----
     // The transport surface away3d's SimpleVideoPlayer drives. There is no media
     // transport and no video decoder in this subset: the connection state machine
@@ -13797,9 +14488,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     // AIR File static directory shortcuts, resolved from the process environment.
-    // applicationDirectory is the app's own directory (mapped to the CWD in this
-    // subset); userDirectory/desktopDirectory/documentsDirectory read $HOME and
-    // append the standard sub-path.
+    // userDirectory/desktopDirectory/documentsDirectory read $HOME and append the
+    // standard sub-path; applicationDirectory is described at as_app_dir below.
     this.line('static char* as_home_dir(void) {');
     this.indent++;
     this.line('#ifdef _WIN32');
@@ -13811,7 +14501,62 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('#endif');
     this.indent--;
     this.line('}');
-    this.line('static char* as_app_dir(void) { return (char*)"."; }');
+    // AIR: applicationDirectory is the directory the application was INSTALLED
+    // into. A native build has no installer to ask, so it is derived from the
+    // running executable's own path -- the same anchor fre.ts's as_ext_dir uses
+    // for `extensions/`, so both answer to one notion of "the app directory".
+    // Deliberately NOT the working directory: AIR resolves an app's `assets/...`
+    // against the app directory however the app was started (Explorer, a shortcut,
+    // or a shell parked in some unrelated folder), and an app that reads
+    // `File.applicationDirectory.nativePath + "/assets/<tool>.exe"` -- the real
+    // which is what a real AIR app does -- would otherwise find nothing whenever the CWD is
+    // not the app directory. WASI and Emscripten have no executable path at all,
+    // so they keep "."; the browser build instead packs the app root into the FS
+    // image at that path (see preloadPaths in build.ts).
+    // Known gap, reported rather than guessed at (AGENTS 1.5): a macOS .app
+    // bundle's executable lives in Contents/MacOS while AIR's applicationDirectory
+    // is Contents/Resources, and --package xcode-project stages no app data into
+    // the bundle yet -- so a bundle build gets Contents/MacOS (see TODO.md).
+    this.line('static char as_app_dir_buf[4096];');
+    this.line('static int  as_app_dir_ready = 0;');
+    this.line('static char* as_app_dir(void) {');
+    this.indent++;
+    this.line('if (!as_app_dir_ready) {');
+    this.indent++;
+    this.line('as_app_dir_buf[0] = \'\\0\';');
+    this.line('#ifdef _WIN32');
+    this.line('DWORD n = GetModuleFileNameA(NULL, as_app_dir_buf, (DWORD)sizeof(as_app_dir_buf));');
+    this.line('if (n == 0 || n >= (DWORD)sizeof(as_app_dir_buf)) as_app_dir_buf[0] = \'\\0\';');
+    this.line('#elif defined(__APPLE__)');
+    this.line('uint32_t sz = (uint32_t)sizeof(as_app_dir_buf);');
+    this.line('if (_NSGetExecutablePath(as_app_dir_buf, &sz) != 0) as_app_dir_buf[0] = \'\\0\';');
+    this.line('#elif !defined(__wasi__) && !defined(__EMSCRIPTEN__)');
+    this.line('ssize_t n = readlink("/proc/self/exe", as_app_dir_buf, sizeof(as_app_dir_buf) - 1);');
+    this.line('if (n <= 0) as_app_dir_buf[0] = \'\\0\'; else as_app_dir_buf[n] = \'\\0\';');
+    this.line('#endif');
+    this.line('// Drop the executable\'s own file name -- and the separator with it, so a');
+    this.line('// caller can spell app_dir + "/assets/..." instead of having to decide');
+    this.line('// whether the app dir already ends in one.');
+    this.line('if (as_app_dir_buf[0] != \'\\0\') {');
+    this.indent++;
+    this.line('int last = -1, i;');
+    this.line('for (i = 0; as_app_dir_buf[i] != \'\\0\'; i++) {');
+    this.indent++;
+    this.line('if (as_app_dir_buf[i] == \'\\\\\' || as_app_dir_buf[i] == \'/\') last = i;');
+    this.indent--;
+    this.line('}');
+    this.line('if (last > 0) as_app_dir_buf[last] = \'\\0\';');
+    this.indent--;
+    this.line('}');
+    this.line('// No executable path (a platform without one, or a probe that failed):');
+    this.line('// "." is what this function returned unconditionally before, so a program');
+    this.line('// that relied on CWD resolution keeps working.');
+    this.line('if (as_app_dir_buf[0] == \'\\0\') { as_app_dir_buf[0] = \'.\'; as_app_dir_buf[1] = \'\\0\'; }');
+    this.indent--;
+    this.line('}');
+    this.line('return as_app_dir_buf;');
+    this.indent--;
+    this.line('}');
     this.line('static char* as_user_dir(void) { return as_home_dir(); }');
     this.line('static char* as_desktop_dir(void) { return as_path_join(as_home_dir(), "Desktop"); }');
     this.line('static char* as_documents_dir(void) { return as_path_join(as_home_dir(), "Documents"); }');
@@ -13867,16 +14612,27 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('');
     // Writable per-app storage (AIR applicationStorageDirectory). A bundled .app is
     // launched with a non-writable CWD (Xcode runs it with CWD="/"), so "." is not
-    // a safe write target; resolve a stable directory under $HOME and create it.
-    // AIR scopes applicationStorageDirectory by the descriptor's <id>, so the app
-    // id has to reach the generated C: without it every AOT app shared one store
-    // (D11; adl writes "Application Support/<id>/Local Store").
+    // a safe write target; resolve a stable directory and create it. AIR scopes
+    // applicationStorageDirectory by the descriptor's <id>, so the app id has to
+    // reach the generated C: without it every AOT app shared one store (D11).
+    //
+    // The per-OS root is adl's own, measured byte-for-byte against AIR SDK 51.4.1:
+    //   macOS    ~/Library/Application Support/<id>/Local Store  -- the AIR 3.3+
+    //            path (a sandboxed build would nest it under
+    //            ~/Library/Containers/<bundle-id>/Data instead).
+    //   Windows  %APPDATA%\<id>\Local Store                      -- i.e. Roaming.
+    //   other    ~/.as3aot/<id> -- no AIR value to copy for a POSIX host, where a
+    //            dot-directory under $HOME is the convention.
+    // On Windows %APPDATA% is what the shell's CSIDL_APPDATA known folder resolves
+    // to, and is the same env-var route as_home_dir already takes for USERPROFILE;
+    // the fallback is that folder's documented default, so a host which does not
+    // export APPDATA still lands in the same tree.
     this.line('#ifndef ASC_APP_ID');
     this.line('#define ASC_APP_ID "as3aot"');
     this.line('#endif');
     // The descriptor's <content>, i.e. the SWF that AIR nests local objects under:
-    // "#SharedObjects/assets/app/TalkMED-Meeting.swf/...". Empty for a bare build
-    // (no descriptor), where AIR has no SWF URL to derive the directory from.
+    // "#SharedObjects/<content path>/...". Empty for a bare build (no descriptor),
+    // where AIR has no SWF URL to derive the directory from.
     this.line('#ifndef ASC_SWF_PATH');
     this.line('#define ASC_SWF_PATH ""');
     this.line('#endif');
@@ -13884,7 +14640,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('char* home = as_home_dir();');
     this.line('char* base = NULL;');
-    this.line('#ifdef __APPLE__');
+    this.line('#ifdef _WIN32');
+    this.line('char* appdata = getenv("APPDATA");');
+    this.line('if (appdata == NULL || *appdata == \'\\0\') appdata = as_path_join(home, "AppData/Roaming");');
+    this.line('base = as_path_join(appdata, ASC_APP_ID);');
+    this.line('base = as_path_join(base, "Local Store");');
+    this.line('#elif defined(__APPLE__)');
     this.line('base = as_path_join(home, "Library/Application Support/" ASC_APP_ID "/Local Store");');
     this.line('#else');
     this.line('base = as_path_join(home, ".as3aot");');
@@ -14267,8 +15028,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('static unsigned int ASC_so_default_encoding = 3u;');
     this.line('static bool ASC_so_prevent_backup = false;');
     // mkdir -p for the parent directory of a storage file. A shared-object name
-    // may itself contain slashes (AIR example: getLocal("work/addresses")), and
-    // a non-null localPath becomes a subdirectory.
+    // may itself contain slashes (AIR example: getLocal("work/addresses")) and a
+    // localPath value REPLACES the <content> layer -- both therefore contribute
+    // intermediate directories, and a name's first component carries the "#"
+    // prefix that as_so_file_name writes.
     this.line('static void as_so_mkparent(const char* p) {');
     this.indent++;
     this.line('if (p == NULL) return;');
@@ -14281,47 +15044,120 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_mkdirs(dir);');
     this.indent--;
     this.line('}');
-    // AIR caps a local-store path component at 31 bytes: the FILE keeps the last
-    // 27 characters of the name (27 + ".sol"), and the remainder is folded into
-    // directories of at most 30 characters, each suffixed with '#'. Measured with
-    // adl 51.4.1 (temp/solprobe2, /solprobe5): the 35-character name
-    // "eDoctor_TalkMED_Meeting_Windows_DEV" is stored as
-    // "eDoctor_#/TalkMED_Meeting_Windows_DEV.sol", and an 80-character name as
-    // "<23>#/<30>#/<27>.sol". Names holding characters AIR escapes ('#', ':', ' ',
-    // non-ASCII, ...) are written literally here instead -- adl rejects several of
-    // them outright with Error #2134 and hashes the rest, which this subset does
-    // not reproduce (docs/zh-cn/flash-net.md).
-    this.line('static char* as_so_encode_name(const char* name) {');
+    // ---- how AIR derives the storage path (adl 51.4.1 measured; temp/sotor So5..SoD) ----
+    //
+    //     <storage>/#SharedObjects/[<layer>/][#]<name>.sol
+    //
+    // <layer> is the descriptor's <content> path, and a non-null localPath REPLACES
+    // that whole layer -- it is NOT appended to it. Measured with
+    // <content>=assets/So6.swf: localPath "/" writes straight into #SharedObjects/,
+    // "/assets" and "/assets/" into #SharedObjects/assets/, and "/assets/So6.swf"
+    // into the content directory itself. A localPath that is not a component-prefix
+    // of <content> raises Error #2134, and so does the EMPTY STRING -- which is
+    // therefore NOT the same as null (SoD p7 throws, p8 with "/" does not). A bare
+    // build has no <content> to compare against, so any layer is taken verbatim,
+    // keeping <storage>/#SharedObjects/<localPath>/<name>.sol.
+    //
+    // The name is a relative path in its own right: "work/addresses" (AIR's own
+    // documented example) creates a subdirectory, and the FIRST component of such a
+    // name is written with a "#" prefix -- measured "x/y" -> "#x/y.sol", "x/y/z" ->
+    // "#x/y/z.sol", "a/b/c" -> "#a/b/c.sol" -- while a single-component name is
+    // written verbatim. ONE leading "/" and one leading "./" are dropped before
+    // that ("/x" -> "x.sol", "./x" -> "x.sol"), and "." / ".." components are left
+    // to the filesystem ("." -> "..sol", ".." -> "...sol", "trail/" ->
+    // "#trail/.sol"). A name that resolves outside the layer ("../x") or that holds
+    // an empty inner component ("x//y", "//x") raises Error #2134 too.
+    //
+    // The characters AIR rejects raise Error #2134 from getLocal, not from flush
+    // (SoA: e.name == "Error", e.message == "Error #2134: Cannot create
+    // SharedObject."): every C0 control (TAB/LF/CR included) plus " # & ' , : ; <
+    // > ? \ ~. This is the MEASURED set, not the documented one -- "%" and 0x7F are
+    // accepted. "*" and "|" pass getLocal and only fail at flush with Error #2130
+    // (they are illegal in a Windows file name; macOS takes them), so they are
+    // deliberately not rejected here.
+    //
+    // NOT reproduced: AIR hex-escapes a non-ASCII name ("has中wen" is stored as
+    // "hasE#4B#8A#Dwen.sol"), and once the absolute path reaches the OS limit it
+    // rewrites the file as "##<16 hex>/<8 digits>.sol" (verbatim at 255 characters,
+    // rewritten at 263). An earlier revision folded the name into 31-byte
+    // components; that rule is not reproducible on adl either, and with it in place
+    // the AOT build and AIR kept *different* files for one shared object -- the D11
+    // symptom this layer exists to remove. All three residuals are reported in
+    // docs/zh-cn/flash-net.md.
+    this.line('static void as_so_reject(void) { as_throw(Error_new((char*)"Error #2134: Cannot create SharedObject.", 2134)); }');
+    this.line('static bool as_so_name_bad(int c) {');
     this.indent++;
-    this.line('size_t n = strlen(name);');
-    this.line('if (n <= 27) return as_str_concat((char*)name, (char*)".sol");');
-    this.line('size_t prefix = n - 27;');
-    this.line('size_t head = prefix > 30 ? (prefix % 30 == 0 ? 30 : prefix % 30) : prefix;');
-    this.line('char* out = as_str_alloc(n + 8 + (prefix / 30 + 2) * 2);');
-    this.line('size_t w = 0, pos = 0;');
-    this.line('while (1) {');
-    this.indent++;
-    this.line('size_t clen = pos == 0 ? head : 30;');
-    this.line('memcpy(out + w, name + pos, clen);');
-    this.line('w += clen; pos += clen;');
-    this.line('if (pos >= prefix) break;');
-    this.line('out[w++] = \'#\'; out[w++] = \'/\';');
+    this.line('if (c <= 0x20) return true;  // space plus every C0 control, TAB/LF/CR included');
+    this.line('return c != 0 && strchr("\\"#&\',:;<>?\\\\~", c) != NULL;');
     this.indent--;
     this.line('}');
-    this.line('out[w++] = \'#\'; out[w++] = \'/\';');
-    this.line('memcpy(out + w, name + prefix, 27); w += 27;');
-    this.line('memcpy(out + w, ".sol", 4); w += 4;');
-    this.line('out[w] = \'\\0\';');
+    // A name has to survive as a file name; the shape checks below are the part
+    // that also keeps a name-derived path inside the layer.
+    this.line('static void as_so_check_name(const char* name) {');
+    this.indent++;
+    this.line('if (name[0] == \'\\0\') as_so_reject();  // an empty name is #2134, not #2007');
+    this.line('for (const char* s = name; *s != \'\\0\'; s++) if (as_so_name_bad((unsigned char)*s)) as_so_reject();');
+    this.line('const char* n = name;');
+    this.line('if (n[0] == \'/\') n++;');
+    this.line('if (n[0] == \'.\' && n[1] == \'/\') n += 2;');
+    this.line('for (const char* c = n; ; ) {');
+    this.indent++;
+    this.line('const char* e = strchr(c, \'/\');');
+    this.line('if (e == NULL) break;  // the last component may be empty ("trail/")');
+    this.line('if (e == c) as_so_reject();  // empty component');
+    this.line('if (c == n && e == c + 2 && c[0] == \'.\' && c[1] == \'.\') as_so_reject();  // escapes the layer');
+    this.line('c = e + 1;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('static char* as_so_layer(const char* localPath) {');
+    this.indent++;
+    this.line('if (localPath == NULL) return (char*)ASC_SWF_PATH;');
+    this.line('if (localPath[0] == \'\\0\') as_so_reject();  // "" is not null (SoD p7)');
+    this.line('const char* s = localPath;');
+    this.line('if (s[0] == \'/\') s++;');
+    this.line('size_t len = strlen(s);');
+    this.line('if (len > 0 && s[len - 1] == \'/\') len--;');
+    this.line('const char* c = ASC_SWF_PATH;');
+    this.line('for (size_t i = 0; i < len; ) {');
+    this.indent++;
+    this.line('size_t j = i;');
+    this.line('while (j < len && s[j] != \'/\') j++;');
+    this.line('if (j == i) as_so_reject();  // empty component ("//x", "x//y")');
+    this.line('if (ASC_SWF_PATH[0] != \'\\0\') {');
+    this.indent++;
+    this.line('size_t k = 0;');
+    this.line('while (k < j - i && c[k] != \'\\0\' && c[k] != \'/\') k++;');
+    this.line('if (k != j - i || memcmp(s + i, c, k) != 0) as_so_reject();  // not a prefix of <content>');
+    this.line('c += (c[k] == \'/\') ? k + 1 : k;');
+    this.indent--;
+    this.line('}');
+    this.line('i = j + 1;');
+    this.indent--;
+    this.line('}');
+    this.line('char* out = as_alloc(len + 1);');
+    this.line('memcpy(out, s, len);');
+    this.line('out[len] = \'\\0\';');
     this.line('return out;');
+    this.indent--;
+    this.line('}');
+    this.line('static char* as_so_file_name(const char* name) {');
+    this.indent++;
+    this.line('const char* n = name;');
+    this.line('if (n[0] == \'/\') n++;');
+    this.line('if (n[0] == \'.\' && n[1] == \'/\') n += 2;');
+    this.line('if (strchr(n, \'/\') != NULL) return as_str_concat(as_str_concat((char*)"#", (char*)n), (char*)".sol");');
+    this.line('return as_str_concat((char*)n, (char*)".sol");');
     this.indent--;
     this.line('}');
     this.line('static char* as_so_path(const char* name, const char* localPath) {');
     this.indent++;
     this.line('char* base = as_app_storage_dir();');
     this.line('base = as_path_join(base, "#SharedObjects");');
-    this.line('if (ASC_SWF_PATH[0] != \'\\0\') base = as_path_join(base, ASC_SWF_PATH);');
-    this.line('if (localPath != NULL && localPath[0] != \'\\0\') base = as_path_join(base, localPath);');
-    this.line('return as_path_join(base, as_so_encode_name(name == NULL ? (char*)"" : name));');
+    this.line('char* layer = as_so_layer(localPath);');
+    this.line('if (layer[0] != \'\\0\') base = as_path_join(base, layer);');
+    this.line('return as_path_join(base, as_so_file_name(name == NULL ? (char*)"" : name));');
     this.indent--;
     this.line('}');
     // Whole-file read into arena memory (NULL when the file does not exist). The
@@ -14475,7 +15311,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('SharedObject* SharedObject_getLocal_static(char* name, char* localPath, bool secure) {');
     this.indent++;
     this.line('(void)secure;  // this subset has no encrypted local store');
-    this.line('if (name == NULL || name[0] == \'\\0\') { as_throw(Error_new((char*)"SharedObject.getLocal: the name parameter must be a non-empty String", 0)); return NULL; }');
+    this.line('if (name == NULL) { as_throw(Error_new((char*)"Error #2007: Parameter name must be non-null.", 2007)); return NULL; }');
+    // The name/localPath checks run BEFORE the cache lookup, so a rejected call throws
+    // exactly where adl throws it (adl throws from getLocal, not from flush -- SoA).
+    this.line('as_so_check_name(name);  // #2134: empty name, a rejected character, an escaping shape');
     this.line('char* path = as_so_path(name, localPath);');
     this.line('if (SharedObject__cache == NULL) { SharedObject__cache = as_array_new(); atexit(as_so_flush_all); }');
     this.line('for (int i = 0; i < SharedObject__cache->length; i++) {');
@@ -19019,7 +19858,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     // drawTrianglesInstanced (AGAL3): same geometry, numInstances copies drawn.
-    this.line('void Context3D_drawTrianglesInstanced(void* _this, IndexBuffer3D* indexBuffer, int firstIndex, int numTriangles, int numInstances) {');
+    this.line('void Context3D_drawTrianglesInstanced(void* _this, IndexBuffer3D* indexBuffer, int numInstances, int firstIndex, int numTriangles) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
     this.line('o->indexBuffer = indexBuffer; gc_write_barrier((void*)indexBuffer);');
@@ -19433,6 +20272,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('void Stage_dispatchFrame(void* _this) {');
     this.indent++;
     this.line('(void)_this;');
+    // Uncaught-error recovery point. AIR does not kill the process on an uncaught
+    // error -- it reports it and the loop carries on (see as_frame_jmp in the
+    // preamble). Only the OUTERMOST frame plants the buffer, so a nested frame
+    // cannot leave it pointing at a stack that has already returned; _fguard keeps
+    // the pairing exact on both the normal return and the longjmp path.
+    this.line('int _fguard = 0;');
+    this.line('if (as_frame_guard == 0) { if (setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; return; } _fguard = 1; as_frame_guard = 1; }');
     // Frame-boundary GC safe point: all user frame callbacks have returned, so
     // only permanent roots (static fields, stage, event registry, timers) are
     // live. Each frame advances the incremental mark/sweep by a fixed budget
@@ -19444,6 +20290,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // gc_alloc's non-GUI allocation trigger (see gc_frame_driven in the preamble).
     this.line('gc_step();');
     this.line('as_dbg_frame(as_now_ms() - asc_frame_t0);');
+    // Status events a native extension queued from any thread, now that no AS3
+    // frame is on the stack. ExtensionContext.call already pumped once on the way
+    // back to AS3; this is the second drain point, for an extension that pushes
+    // notifications on its own clock (a socket's status codes, a device's
+    // hotplug) with no call in flight.
+    this.line('as_fre_pump();');
     // Collect finished asynchronous IO/decode jobs before anything else this
     // frame: their finish thunks dispatch PROGRESS/COMPLETE, which user code
     // (AssetManager chains) reacts to by queueing the next load. Doing it first
@@ -19469,6 +20321,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('EventDispatcher_dispatchEvent(as_ef_objs[i], evt);');
     this.indent--;
     this.line('}');
+    this.line('if (_fguard) as_frame_guard = 0;');
     this.indent--;
     this.line('}');
     this.line('void TextField_appendText(void* _this, char* s) {');
@@ -20380,7 +21233,27 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('if (o->filters != NULL && o->filters->length > 0) as_filters_expand(o->filters, &bl, &bt, &br, &bb);');
-    this.line('int lw = (int)ceil(br - bl); int lh = (int)ceil(bb - bt);');
+    // Snap the bake's ORIGIN down to the destination canvas' device pixel grid.
+    //
+    // The blit below is a whole-image drawImageRect with the default sampling
+    // options (nearest), so a surface whose origin sits on a half device pixel has
+    // the whole image rounded to an integer one -- while the content inside was
+    // rasterized against the UNROUNDED origin. The bake therefore lands up to one
+    // device pixel away from the live rendering of the very same subtree, and
+    // because a fingerprint change drops the bake for ASC_AUTO_BAKE_FRAMES frames,
+    // every roll-over / press / edit pops the content by that pixel and pops it
+    // back when the bake re-engages. Measured on a real app's home card with the
+    // window layer capture (temp/hover/): the roll-over renders the card's title
+    // band as an exact 1 px translation of itself (best-fit residual 0.00 at
+    // (dx,dy)=(1,1)) for exactly 3 frames, and with ASC_NO_AUTO_BAKE=1 the same
+    // sweep shows no offset at all -- the reported "the button jitters on hover".
+    // With the origin ON the grid the surface's pixels coincide with the screen's,
+    // the blit is a 1:1 copy with nothing left to round, and a cached subtree
+    // renders exactly like an uncached one: the invariant as_bake_scale2 exists
+    // for, and now independent of where the object happens to sit.
+    this.line('double bxo = bl, byo = bt;');
+    this.line('{ double tx = 0.0, ty = 0.0; as_skia_canvas_total_scale(canvas, &tx, &ty); if (tx > 0.0 && ty > 0.0) { bxo = floor(bl * tx) / tx; byo = floor(bt * ty) / ty; } }');
+    this.line('int lw = (int)ceil(br - bxo); int lh = (int)ceil(bb - byo);');
     this.line('if (lw <= 0 || lh <= 0) { as_render_object_content(canvas, o); return; }');
     // Bake at the DESTINATION resolution, not at the device pixel ratio alone.
     //
@@ -20407,7 +21280,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('void* c2 = as_skia_surface_canvas(surface);');
     this.line('as_skia_canvas_clear_transparent(c2);');
     this.line('as_skia_canvas_scale(c2, sx, sy);');
-    this.line('as_skia_canvas_translate(c2, -bl, -bt);');
+    this.line('as_skia_canvas_translate(c2, -bxo, -byo);');
     this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y;');
     this.line('as_skia_canvas_total_scale(canvas, &ASC_bake_ctm_x, &ASC_bake_ctm_y);');
     this.line('if (ASC_bake_ctm_x <= 0.0) ASC_bake_ctm_x = sx;');
@@ -20430,7 +21303,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // destination's, i.e. each surface pixel covers exactly one device pixel. The
     // rect is therefore pw/sx logical units wide (sx = device pixels per logical
     // unit inside the surface), not lw -- see as_bake_scale2.
-    this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bl, bt, (double)pw / sx, (double)ph / sy);');
+    this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bxo, byo, (double)pw / sx, (double)ph / sy);');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -21145,6 +22018,15 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('w->cx = cx; w->cy = cy; w->ox = ox; w->oy = oy;');
     this.line('ASC_window_apply_stage_size(id);');
+    // A frame of this cached canvas must start pristine. The save()+scale(w->scale) pair
+    // below is skipped by an AS3 exception unwinding out of the renderer (longjmp), and a
+    // leaked pair on a REUSED canvas compounds the device scale every time it happens
+    // (measured 1.5 -> 2.25 -> 3.375 = the whole window grows), so drop any pending save and
+    // reset the base matrix before composing. Restores are balanced within a frame, so on a
+    // clean frame this is a no-op.
+    this.line('as_skia_canvas_reset(canvas);');
+
+
     this.line('as_skia_canvas_clear(canvas, st->stage_color);');
     this.line('as_skia_canvas_save(canvas);');
     this.line('as_skia_canvas_scale(canvas, w->scale, w->scale);');
@@ -21539,6 +22421,26 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // else the app's initial (first open) window, which is what AIR reports for an
     // application whose single window holds the focus. NULL when no window exists
     // at all -- AIR's null, which callers such as Alert.as test for.
+    // NativeApplication.openedWindows (see the getter, emitted with the
+    // NativeApplication bodies). Same liveness rule as as_win_active: a slot with
+    // no stage or a retired window is skipped, and the wrapper is the cached
+    // identity object, so an element compares === to that window's
+    // stage.nativeWindow.
+    this.line('static as_array* as_win_opened_windows(void) {');
+    this.indent++;
+    this.line('as_array* a = as_array_new();');
+    this.line('int i;');
+    this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(i);');
+    this.line('if (w == NULL || w->stage == NULL || w->closed) continue;');
+    this.line('NativeWindow* nw = as_win_wrapper(i);');
+    this.line('if (nw != NULL) as_array_push(a, as_v_obj((void*)nw));');
+    this.indent--;
+    this.line('}');
+    this.line('return a;');
+    this.indent--;
+    this.line('}');
     this.line('static NativeWindow* as_win_active(void) {');
     this.indent++;
     this.line('int i;');
@@ -22680,6 +23582,102 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   private sfWrite(owner: string, name: string, value: string): string {
     if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${owner}_${name} = ${value})`;
     return `(${owner}_${name} = ${value})`;
+  }
+
+  // ---------- native extensions (FRE host + loader) ----------
+
+  // The three-block emission order fre.ts documents: the non-FRE stubs first (so
+  // the no-host build always links the four functions emitted class code calls),
+  // then the FRE header, then the descriptor table codegen resolves from the .ane
+  // files, then the host and loader themselves.
+  private emitAnePreamble(): void {
+    this.line(FRE_STUBS.trimEnd());
+    this.line('');
+    this.line(FRE_HEAD.trimEnd());
+    this.line('');
+    this.line('#ifdef ASC_HAVE_FRE');
+    this.line(`#define ASC_ANE_COUNT ${this.aneDescriptors.length}`);
+    if (this.aneDescriptors.length === 0) {
+      // A zero-length array is not standard C, but the loader still indexes
+      // as_ane_descs[0] in a loop bounded by ASC_ANE_COUNT -- which is 0 -- and
+      // the finalizer match compares addresses, never dereferences. One sentinel
+      // element keeps both compilers and the "no extensions" build honest.
+      this.line('static const as_ane_desc as_ane_descs[1] = { { NULL, NULL, NULL, NULL } };');
+    } else {
+      this.line('static const as_ane_desc as_ane_descs[] = {');
+      this.indent++;
+      for (const d of this.aneDescriptors) {
+        const q = (s: string) => `"${this.escapeCString(s)}"`;
+        this.line(`{ ${q(d.extId)}, ${q(d.nativeLib)}, ${q(d.initializer)}, ${q(d.finalizer)} },`);
+      }
+      this.indent--;
+      this.line('};');
+    }
+    this.line('#endif // ASC_HAVE_FRE');
+    this.line('');
+    this.line(FRE_BODY.trimEnd());
+    this.line('');
+  }
+
+  // The two hooks into generated class code that the FRE entry points need. They
+  // live here rather than in fre.ts because both read a struct layout this emitter
+  // produces: ByteArray's byte storage is a field of the generated struct, and a
+  // status event has to go through the generated StatusEvent/EventDispatcher pair.
+  private emitFreWiring(): void {
+    this.line('#ifdef ASC_HAVE_FRE');
+    // byteArray.bytes must point at the ByteArray's OWN buffer, not a copy: a write
+    // through the acquired pointer has to be visible to AS3 with no write-back
+    // step, which is what makes FREAcquireByteArray/FREReleaseByteArray a pair.
+    this.line('static void* as_fre_ba_data_impl(void* ba, unsigned* len) {');
+    this.indent++;
+    this.line('ByteArray* b = (ByteArray*)ba;');
+    this.line('if (len != NULL) *len = b->length > 0 ? (unsigned)b->length : 0u;');
+    this.line('return b->length > 0 ? b->data : NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('static void* as_fre_ba_new_impl(unsigned len) {');
+    this.indent++;
+    this.line('ByteArray* b = ByteArray_new();');
+    this.line('if (len > 0) ByteArray_set_length(b, len);');
+    this.line('return b;');
+    this.indent--;
+    this.line('}');
+    // A status event is an ordinary AS3 dispatch on the context (which is a real
+    // EventDispatcher), so a listener cannot tell whether the native side pushed
+    // it or AS3 did. The strings are copied into GC strings first: the queue owns
+    // the originals and frees them the moment this returns.
+    this.line('static void as_fre_status_impl(void* as3ctx, const char* code, const char* level) {');
+    this.indent++;
+    this.line('jmp_buf jb;');
+    // A listener that throws must not unwind through the extension's C frames
+    // (FREDispatchStatusEventAsync) or through the frame loop; the throw is
+    // reported like any other uncaught error in an event handler.
+    this.line('if (setjmp(jb) != 0) {');
+    this.indent++;
+    this.line('as_jmp_depth--;');
+    this.line('as_value m = as_exception_boxed ? as_exception_v : as_v_obj(as_exception);');
+    this.line('as_exception = NULL; as_exception_boxed = 0;');
+    this.line('fprintf(stderr, "Uncaught exception in StatusEvent handler: %s\\n", as_v_str_val(m));');
+    this.line('fflush(stderr);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('as_jmp_stack[as_jmp_depth++] = &jb;');
+    this.line('StatusEvent* ev = StatusEvent_new((char*)"status", false, false, as_str_dup(code), as_str_dup(level));');
+    this.line('as_value a = as_v_obj((void*)ev);');
+    this.line('as_dyn_call(as3ctx, "dispatchEvent", &a, 1);');
+    this.line('as_jmp_depth--;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_fre_wire_classes(void) {');
+    this.indent++;
+    this.line('as_fre_ba_data_hook = as_fre_ba_data_impl;');
+    this.line('as_fre_ba_new_hook = as_fre_ba_new_impl;');
+    this.line('as_fre_status_hook = as_fre_status_impl;');
+    this.indent--;
+    this.line('}');
+    this.line('#endif // ASC_HAVE_FRE');
+    this.line('');
   }
 
   private emitMain(): void {
@@ -28090,6 +29088,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       case 'toString':
         if (obj.type.kind === 'xml') return { code: `as_xml_string_value(${obj.code})`, type: { kind: 'string' } };
         return { code: `as_xml_list_to_string(${obj.code})`, type: { kind: 'string' } };
+      case 'toXMLString':
+        // The markup form, ALWAYS -- unlike toString() it never reduces to the text
+        // of a childless element, and a one-item XMLList keeps its item's MARKUP
+        // (<i>a</i> -> "<i>a</i>", where toString() gives "a"). adl 51.4.1;
+        // temp/toxml/ carries the full shape matrix.
+        if (obj.type.kind === 'xml') return { code: `as_xml_to_string(${obj.code})`, type: { kind: 'string' } };
+        return { code: `as_xml_list_to_xml_string(${obj.code})`, type: { kind: 'string' } };
       case 'length':
         if (obj.type.kind === 'xmllist') return { code: `(${obj.code}->length)`, type: { kind: 'int' } };
         return { code: '1', type: { kind: 'int' } }; // XML.length() is always 1
@@ -29059,7 +30064,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       // values, never Class). Returns a real XML so @name/.child/.(pred) all work.
       case 'describeType': {
         const arg = this.emitExpr(args[0]);
-        const cls = `as_v_as_class(${this.boxExpr(arg)})`;
+        const cls = this.boxExpr(arg); // a Class value and an instance describe DIFFERENTLY (is_cls picks the shape), so the box tag must survive to the runtime helper
         return { code: `as_describe_type(${cls})`, type: { kind: 'xml' } };
       }
       // flash.utils.setTimeout(closure, delay, ...): schedule a Function call after

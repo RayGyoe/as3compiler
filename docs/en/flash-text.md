@@ -1,7 +1,7 @@
 # Text Display Alignment (`flash.text` / `TextField`) Investigation and Integration Plan
 
-> **Trigger**: the AOT ↔ `adl` difference report for the real app talkmed-meeting
-> (workspace root `talkmed-meeting-aot-vs-adl-diff.md`, 2026-10-14) collapses 12 visible
+> **Trigger**: the AOT ↔ `adl` difference report for the real app acme-app
+> (workspace root `acme-app-aot-vs-adl-diff.md`, 2026-10-14) collapses 12 visible
 > differences into 4 root causes — of which **R2 (SWC `DefineEditText`/`DefineText` bake neither
 > text nor `TextFormat`)** and **the text items of R3** (`as_str_alloc(1)` without a terminator,
 > `displayAsPassword` masking per byte, font-alias/metric residuals) all land on the single
@@ -81,7 +81,7 @@ defect** (AGENTS §1.5).
 
 | # | Symptom (adl vs us) | Root cause | Code location | Evidence |
 |---|---|---|---|---|
-| **D-T1** | The footer's two lines `eDoctor Healthcare Communications.` / `meeting.talkmed.com` are **missing entirely**; the agreement line's 《隐私政策》/《服务协议》 copy is missing | `DefineEditText`/`DefineText` bake **only an empty `TextField`**; the initial text is never decoded | `src/swc.ts` `SwcText` (§`CHARACTER_TAG_KINDS`); `src/emit.ts` `as_swc_new`'s text branch (`case ${ch.id}: { TextField* t = TextField_new(); t->_fieldWidth=…; }`) | report D2; `temp/cmp/shots/P2_*` |
+| **D-T1** | The footer's two lines `Acme Healthcare Communications.` / `cdn.acme.example` are **missing entirely**; the agreement line's 《隐私政策》/《服务协议》 copy is missing | `DefineEditText`/`DefineText` bake **only an empty `TextField`**; the initial text is never decoded | `src/swc.ts` `SwcText` (§`CHARACTER_TAG_KINDS`); `src/emit.ts` `as_swc_new`'s text branch (`case ${ch.id}: { TextField* t = TextField_new(); t->_fieldWidth=…; }`) | report D2; `temp/cmp/shots/P2_*` |
 | **D-T2** | SWC built-in fields' Latin text renders **serif** (Times-ish); adl is sans | The placeholder `TextField`'s `defaultTextFormat` is `TextField_ctor`'s `TextFormat_new(NULL,12,…)` ⇒ `font == NULL` ⇒ `sk_family_alias` lands on Times | `src/emit.ts:16177` (`o->defaultTextFormat = TextFormat_new(NULL, 12.0, …)`) | report D2 |
 | **D-T3** | SWC built-in fields are **left-aligned** (tab label ~52px left), adl centres within half the pane; `登录` is **black**, adl teal | Same: `align == NULL` ⇒ `as_tf_align_index` returns 0; `color == 0x000000` | `src/emit.ts:16215` `as_tf_align_index` | report D2, `cmp_tabs.png` |
 | **D-T4** | When `SimpleButton.upState == NULL` we draw the **down/hit state** (two grey blocks); adl draws nothing | The baked button has `up=NULL; over=NULL;`, and rendering falls back to down/hit | `src/emit.ts` `as_swc_build_87` region; the `SimpleButton` render branch | report D3 |
@@ -182,7 +182,7 @@ A line-by-line diff of the two reports (`temp/textfield-oracle/{adl,aot}.txt`, *
 
 **D-T13 `htmlText` does not decode HTML character references** ✅ (fixed in stage 149)
 
-- **Symptom**: the second footer line in talkmed is ` &nbsp;&nbsp;…&nbsp;meeting.talkmed.com`; before the
+- **Symptom**: the second footer line in acme-app is ` &nbsp;&nbsp;…&nbsp;cdn.acme.example`; before the
   fix the `&nbsp;` were drawn as visible characters (8 groups = 48 characters wide). AIR decodes both the
   named entities and the numeric references into real characters.
 - **Root cause**: the plain-text accumulation in `as_tf_html_set` was a bare byte copy
@@ -194,7 +194,7 @@ A line-by-line diff of the two reports (`temp/textfield-oracle/{adl,aot}.txt`, *
 
 **D-T14 the whole `DefineEditText` field was not decoded** ✅ (fixed in stage 149, i.e. §4's T2a)
 
-- **Symptom**: **every line of text** a skin shipped was missing (talkmed's agreement paragraph / footer /
+- **Symptom**: **every line of text** a skin shipped was missing (acme-app's agreement paragraph / footer /
   button captions); the child count and index order were right, the fields were just empty.
 - **Root cause**: `swc.ts` read only the text character's `RECT` — `SwcText` had no text or format — and
   `as_swc_new`'s `'text'` branch built an empty `TextField`.
@@ -203,9 +203,10 @@ A line-by-line diff of the two reports (`temp/textfield-oracle/{adl,aot}.txt`, *
 
 ### Cross-references (not on this surface, but exposed by the same report)
 
-- `Capabilities.language` does not return `zh-CN` ⇒ the whole site switches to English (report D1/R1).
-  **Filed under the "language" surface**; not re-chartered here. This plan only references it where it
-  affects **copy**.
+- `Capabilities.language` **fixed in stage one-hundred-eighty-seven** (it used to read the process `LANG` on
+  Windows, so it always answered `"en"` and the whole site switched to English; it now reads the **system UI
+  language** per AIR and normalizes it into the closed set — see [`win32.md`](win32.md) §3.8). **Filed under the
+  "language" surface**; not re-chartered here. This plan only references it where it affects **copy**.
 - `System.totalMemory` scale (report D6), `BitmapData→Bitmap` not drawing (D5),
   `NativeWindow.bounds/title` (D7/D8), `SharedObject` domain (D11) — separate domains each.
 
@@ -252,7 +253,7 @@ Ordered by "small change × big impact", one patch version each (AGENTS §2.7); 
 | Stage | Content | Depends on | Acceptance |
 |---|---|---|---|
 | **T1** | **Memory safety**: write the terminator at the three `as_str_alloc(1)` sites (`TextField_ctor`, `Socket__str` ×2); add a source-level pin "an `as_str_alloc` call must fill `n+1` bytes or go through `as_str_dup("")`" | none | empty fields no longer show residue; a new `test/unit/` pin |
-| **T2** | **SWC text baking**: decode `DefineEditText` (flags/`HasText`/`FontHeight`/`TextColor`/`HasFont`/`FontClass`/`Layout`/`InitialText`) and `DefineText` (`TEXTRECORD` + code table) → bake `t->text` + `t->defaultTextFormat` (incl. `align`); `SimpleButton` draws nothing when `upState==NULL` | T1 (new text must not be a dirty string) | talkmed's footer/agreement/font/alignment six sites align with `adl`; `examples/textfield` gains SWC cases |
+| **T2** | **SWC text baking**: decode `DefineEditText` (flags/`HasText`/`FontHeight`/`TextColor`/`HasFont`/`FontClass`/`Layout`/`InitialText`) and `DefineText` (`TEXTRECORD` + code table) → bake `t->text` + `t->defaultTextFormat` (incl. `align`); `SimpleButton` draws nothing when `upState==NULL` | T1 (new text must not be a dirty string) | acme-app's footer/agreement/font/alignment six sites align with `adl`; `examples/textfield` gains SWC cases |
 | **T3** | **`displayAsPassword` code-unit masking** + placeholder grey | none | 5 CJK chars → 5 stars (grey); `temp/pwdhtml` contract regression |
 | **T4** | **`TextFormat`: more fields + 11-param ctor** (`indent`/`blockIndent`/`leftMargin`/`rightMargin`/`bullet`/`tabStops`/`url`/`target`) | none | measure each field against `adl` before landing |
 | **T5** | **Rich-text line boxes**: `getLineText` + fold a rule's `leading` into the run + run line-box contract | T4 | line heights converge on `adl` (re-measure with `temp/ssprobe`) |
@@ -330,16 +331,16 @@ write a 4 MB bitmap on every run.
 
 | Category | Path |
 |---|---|
-| Difference report (trigger) | workspace root `talkmed-meeting-aot-vs-adl-diff.md` |
+| Difference report (trigger) | workspace root `acme-app-aot-vs-adl-diff.md` |
 | This plan's display-matrix example | `examples/textfield/{Main.as,UiMain.as,entry.as,entry-ui.as,app.xml,run-adl.sh,run-aot.sh,run-adl-ui.sh,run-aot-ui.sh,grid.py,README.md}` |
 | Dual-end reports | `temp/textfield-oracle/{adl,aot}.txt` |
 | Dual-end grids | `temp/textfield-oracle-ui/{adl,aot}.raw` → `grid.py` → `grid-cmp.png` (plus `-adl/-aot.png` singles) |
 | adl generic probe harness | `temp/tryadl.sh <dir>` (`mxmlc` + `adl`, fast) |
 | Line-metric oracle bench | `temp/metricprobe/` (12-family matrix + leading matrix) |
 | Rich-text oracle benches | `temp/ssprobe/` (`StyleSheet`), `temp/richprobe/`, `temp/pwdhtml/` |
-| Font alias/metrics | `vendor/skia_glue.cc` `sk_family_alias`/`sk_air_line_metrics`, `docs/zh-cn/skia.md` §8 |
-| SWC side | `docs/zh-cn/swc.md` §3.3/§9.2 F5, `src/swc.ts` `SwcText`, `src/emit.ts` `as_swc_new` |
-| Generated-C index (talkmed) | `temp/tkmeet-mac/talkmed.c`: `as_swc_new`@373915, `as_swc_build_87/93`@362987 region, `TextField_ctor`@227037, `as_tf_paragraph`@227103 |
+| Font alias/metrics | `vendor/skia_glue.cc` `sk_family_alias`/`sk_air_line_metrics`, `docs/en/skia.md` §8 |
+| SWC side | `docs/en/swc.md` §3.3/§9.2 F5, `src/swc.ts` `SwcText`, `src/emit.ts` `as_swc_new` |
+| Generated-C index (acme-app) | `temp/acme-mac/acme-app.c`: `as_swc_new`@373915, `as_swc_build_87/93`@362987 region, `TextField_ctor`@227037, `as_tf_paragraph`@227103 |
 
 ---
 
@@ -379,8 +380,8 @@ After normalising `align`, the remaining systematic differences fall into three 
 2. **Password masking (D-T6/N4)** — see the table above.
 3. **Default read-backs (N1/N2/N3)**.
 
-**Relation to talkmed's visual diffs**: this report measures **numbers only** and contains no SWC static
-string (D-T1/2/3 need a `.swc`) — that part is compared separately by running the talkmed app under
+**Relation to acme-app's visual diffs**: this report measures **numbers only** and contains no SWC static
+string (D-T1/2/3 need a `.swc`) — that part is compared separately by running the acme-app under
 `adl` (see the difference report and environment).
 
 > Key takeaway: **the first thing to fix is still D-T7 (`_sans`/`_serif` line height)** — it is not a small
@@ -410,7 +411,7 @@ stitches them into `grid-cmp.png`. Visible in the image but not measurable by th
 ## 9. Landed (stage 149, v0.4.120)
 
 Working through §4's order; the first batch lands three things. All three were verified on the **real
-talkmed app** against `adl`.
+acme-app** against `adl`.
 
 **T1 empty-string memory safety (`emit.ts` ×2 / `runtime.ts`)**
 
@@ -441,14 +442,14 @@ talkmed app** against `adl`.
 
 **T2c HTML character-reference decoding (`emit.ts`)**
 
-- New finding: `as_tf_html_set` decoded **no** entities at all, so talkmed's second footer line would draw
+- New finding: `as_tf_html_set` decoded **no** entities at all, so acme-app's second footer line would draw
   8 literal `&nbsp;` (`D-T13`). New `as_tf_html_entity`: the named set `&amp; &lt; &gt; &quot; &apos;
   &nbsp;` plus decimal/hex numeric references (surrogate range rejected).
 - Verified: three new `examples/textfield` cases align with `adl` value by value — `html-entity-nbsp`
   20.00/20.02, `html-entity-named` 55.50/55.51, `html-entity-numeric` 32.00/32.00 (the deltas are the known
   glyph-advance residual).
 
-**Effect on the real app (talkmed → native macOS)**: the whole footer line plus `meeting.talkmed.com`, the
+**Effect on the real app (acme-app → native macOS)**: the whole footer line plus `cdn.acme.example`, the
 entire fix-window explanation plus the "Try to repair" caption, and the agreement paragraph (`#92`, "我已了解
 并阅读《隐私政策》/《服务协议》") appear **for the first time**. Evidence image:
 `temp/cmp/shots/aot_entities_login.png`.

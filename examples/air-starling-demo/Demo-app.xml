@@ -8,6 +8,7 @@
     
     <supportedProfiles>extendedDesktop</supportedProfiles>
 
+    <architecture>64</architecture>
 
     <!-- Settings for the application's initial window. Required. -->
     <initialWindow>

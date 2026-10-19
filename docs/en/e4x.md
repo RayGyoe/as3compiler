@@ -95,9 +95,9 @@ DOM, and the highest-cost part to land.
 | `System.disposeXML(xml)` | explicit release (6 places, a `System` builtin) |
 | `describeType(x):XML` | reflection description (2 places) |
 
-### 2.6 String Value and `XML(ByteArray)` (stage one-hundred-forty-three, `adl 51.4.1` value logs `temp/tkmeet-mac/{xmlstr,xmlba}/`)
+### 2.6 String Value and `XML(ByteArray)` (stage one-hundred-forty-three, `adl 51.4.1` value logs `temp/acme-mac/{xmlstr,xmlba}/`)
 
-The real app talkmed-meeting loads its language resource via `XML(new language_en())`
+The real app acme-app loads its language resource via `XML(new language_en())`
 (`[Embed(..., mimeType="application/octet-stream")]` ⇒ the generated resource class is a **ByteArray subclass**),
 and measuring it pinned down two rules:
 
@@ -115,17 +115,33 @@ ByteArray subclass (`as_is` walks the `super` chain, so every `[Embed]` class ma
 
 | Shape | `toString()` | `toXMLString()` |
 |---|---|---|
-| text node `XML("plaintext")` | `plaintext` | — |
+| text node `new XML("plaintext")` | `plaintext` | `plaintext` (our build fails at **construction**, see ① below) |
 | `<a b='1'>txt</a>` (**no** element children) | `txt` | `<a b="1">txt</a>` |
 | `<a b='1'/>` (no children) | `""` | `<a b="1"/>` |
-| `<a b='1'><c d='2'/></a>` (**has** element children) | the markup | the markup |
-| `<a>x<b/>y</a>` | the markup | the markup |
-| `XMLList`: 0 / **1** / ≥2 items | `""` / **that item's string value** (`"a"`) / the items' **markup** joined by a newline | — |
+| `<a> </a>` (whitespace-only text) | `""` | `<a/>` |
+| `<a b='1'><c d='2'/></a>` (**has** element children) | the markup (indented 2 spaces) | same as `toString()` |
+| `<a>x<b/>y</a>` | the markup (**interleaved** in document order) | same as `toString()` |
+| `XMLList`: 0 / **1** / ≥2 items | `""` / **that item's string value** (`"a"`) / the items' **markup** joined by a newline | `""` / **that item's markup** (`<i>a</i>`) / same as the left |
 
-**Not yet aligned** (measured in the same batch, registered in `TODO.md`'s leftover table): ① **`toXMLString()` is
-unimplemented** (loud `CodegenError: unsupported XML/XMLList method 'toXMLString'`); ② the markup output **keeps the
-source form**, while AIR **re-indents** (`<a><b/></a>` → `<a>\n  <b/>\n</a>`) and **drops whitespace-only text
-nodes** (`<a> </a>` → `<a/>`).
+**Landed in stage one-hundred-ninety-three** (measured against the same `adl 51.4.1` batch, `temp/toxml/`: all 24
+XML + XMLList cells match verbatim): `toXMLString()` now lowers to the markup serialiser `as_xml_to_string`
+(`as_xml_list_to_xml_string` for an `XMLList`), and that markup **re-indents** the way AIR does — **no** element
+children ⇒ a single inline line (`<a b="1">txt</a>`); **has** element children ⇒ one item per line, 2 spaces per
+level, the closing tag back at its own level, with whitespace-only text nodes **dropped**; attributes are always
+**double-quoted**; comments and the `<?xml …?>` declaration are dropped. The end-to-end assertions live in
+`examples/e4x-toxmlstring.as`, the structural pins in `test/unit/emit.ts` under `unit: e4x/ToXMLString`.
+
+**Not yet aligned** (three items, registered in `TODO.md`'s leftover table):
+
+① **Text-node construction**: `new XML("plaintext")` is a text node in AIR (`toString()` and `toXMLString()` both
+give `plaintext`), while our `as_xml_parse` returns NULL for "stray text before the root element" ⇒ a **loud**
+`XML parse error` at **construction**. That is a **parser** gap, independent of serialisation (stage
+one-hundred-ninety-three did not touch the parser).
+② **Mixed content**: we fold every text run into **one** (trimmed) blob at parse time, so `<a>a<b/>b</a>` prints
+`<a>\n  ab\n  <b/>\n</a>` where AIR **interleaves** in document order (`<a>\n  a\n  <b/>\n  b\n</a>`).
+③ **Entities**: the parser does **not** decode entities, so the output echoes them verbatim (`&amp;` happens to
+match AIR, but `&#65;` never becomes `A`); for the same reason the output side must **not** add escaping (it would
+double-escape).
 
 ### 2.7 An XML/XMLList in a Dynamic Slot Must Be Its String Value Too (stage one-hundred-forty-four, measured in `temp/xmlstr3` + `temp/apv/adl`)
 
@@ -134,7 +150,7 @@ But as soon as the value travels through a **dynamic slot** — `Object`, `*`, a
 dynamic property, an `Object` parameter — it lands in the **object vtable's string conversion slot** (`box_to_str`)
 instead, which answered `[object XML]`.
 
-What is emitted today: talkmed-meeting stores its localized labels in an XML document and resolves them through
+What is emitted today: acme-app stores its localized labels in an XML document and resolves them through
 **dynamic lookups**, so **every label** on its login page (and the window title) rendered `[object XML]`.
 
 | Shape | `adl` | Before the fix | Now |
@@ -150,6 +166,48 @@ What is emitted today: talkmed-meeting stores its localized labels in an XML doc
 `box_to_str` slot instead of `as_object_box_to_str` (both delegate to `as_xml_string_value`/
 `as_xml_list_to_string`). Behaviour: `examples/xml-dynamic-str.as`; the last three checks of
 `unit: e4x/StringValue` pin the wiring.
+
+### 2.8 The XML Shape of `describeType` (stage one-hundred-eighty-six, measured in `temp/dtor` + `temp/t1`)
+
+`describeType`'s output is the **only** input of the app's model mapper (`BaseModel.fromJSON`): it walks
+`describeType(this)..variable` / `..accessor` and assigns JSON fields onto the model by `@name`/`@type`. The
+implementation used to emit a **childless** `<type name="pkg::class"/>`, so `..variable` was always empty, every
+field kept its AS3 default, a nested model stayed `null`, and the next read threw an uncaught `#1009` (the root
+cause of the real app freezing on a meeting click). Stage one-hundred-eighty-six aligns it with `adl 51.4.1`:
+
+| Semantics | Measured form |
+|---|---|
+| `@name` / `@type` | use **`::`** (`pkg::PackThing`, `flash.display::Sprite`, `__AS3__.vec::Vector.<int>`), not dots |
+| instance view | `base="<direct superclass>"`, `isStatic="false"`, traits inline; **an `Object` instance has no `base` and no `<extendsClass>`** |
+| class view | `base="Class"`, `isStatic="true"`, `<extendsClass type="Class"/>` + `<extendsClass type="Object"/>` + `<accessor name="prototype" access="readonly" type="*" declaredBy="Class"/>`, traits under `<factory type="Name">` |
+| inheritance | `<extendsClass>`/`<implementsInterface>` list the **full chain** (nearest first, `Object` included) |
+| visibility | **public members only** |
+| `variable` / `constant` | **no** `declaredBy`; an absent attribute reads as the **empty string** (as in AIR) |
+| `accessor` / `method` | **have** `declaredBy`; an accessor carries `access="readonly\|writeonly\|readwrite"` |
+| `method` | carries `returnType` and one `<parameter index/type/optional>` per parameter; a **rest parameter is not listed** |
+| `<constructor>` | only when the constructor **has parameters** (the signature lives in the `as_dt_ctors[]` side table -- a class with a parameterized ctor and no methods of its own has no place for it in the method tables) |
+| interface names | via the `as_dt_iface_names[]` side table (an interface vtable has only a 5-field prefix, no `fqn` slot) |
+| `Object`'s own traits | **never listed** (neither for a subclass nor for a plain object) ⇒ `describeType({})` is a bare `<type name="Object" isDynamic="true" isFinal="false" isStatic="false"/>` |
+| primitives / containers | `int`/`Number`/`String`/`Boolean` → `isDynamic=false`, `isFinal=true` (plus a readonly `length` for `String`); `Array` → dyn=true/fin=false + a readwrite `length`(uint); `Vector.<int>` → dyn=true/**fin=true**; `flash.utils::Dictionary` → dyn=true; `Date` has no package |
+| `describeType(null)` | the **empty string**; `describeType(undefined)` throws `#1010` |
+| member order | AIR uses an **unreproducible hash order**; we use declaration order -- a **deliberate** difference (`adl`'s own order varies between runs) |
+
+**Approach**: rather than a new per-class describeType blob, the **existing reflection tables** were widened
+(`as_prop` gained `is_accessor`/`is_const`, `as_method` gained `sig`, the vtable header gained
+`is_dynamic`/`is_final`) and the XML is assembled from them at runtime. That keeps the size low, and when
+`describeType` is never called `-O2` strips the whole block (it is `static`).
+
+**Two safety rules to remember**:
+
+1. **"Is this a class instance?" may only be answered by COMPARING the candidate's first word against
+   `as_class_registry[i].cls->vtable`** -- the GC body of an `Array`/`Dictionary`/`Vector`/`XML` starts with a
+   **data/name pointer**, and dereferencing it as a vtable crashes. Comparing never dereferences, and pairing it
+   with an `as_dyn_kind(v.ptr) != 0` gate removes both the misclassification and the crash.
+2. **`as_prop_read`'s tag 10 (a field whose declared type is `Array`) must box as `as_v_arr` (tag 6)**, not as an
+   object -- otherwise the array's **data pointer** is exposed as a vtable to every reflective consumer
+   (`String(x)`, `is Array`, a dynamic access).
+
+Behaviour: `examples/describe-type.as`; structural pins: `unit: reflect/DescribeType`, `unit: reflect/PropBoxing`.
 
 ---
 
@@ -195,8 +253,8 @@ the parser is only a small piece of it, so pulling in an external dependency for
 | `lexer.ts` | ✅ `@` is recognized as a postfix operator (E4X attribute access); ✅ **XML literal** mode (landed in stage one-hundred-six for `<a b="1">…</a>`: recursive name-stack balancing, comments/CDATA/PI, `{expr}` interpolation **loudly rejected**; stage one-hundred-eight fixed the scan defect "text between sibling elements was not skipped ⇒ an indented multi-line literal reported `unterminated regular expression`") |
 | `parser.ts` | ✅ `expr.@attr`, `.child` E4X navigation, `.(pred)` filter predicate, the **descendant axis** `x..name`/`x..*` (stage one-hundred-six), the **two computed-name axes** `x.ns::[expr]` (child axis) and `x.@[expr]` (attribute axis) (stage one-hundred-eight, the `ns` qualifier folded away as "namespace compile-time transparent"), `XML`/`XMLList` type annotations |
 | `symbols.ts` | ✅ `XML`/`XMLList` modeled (`kind:'xml'/'xmllist'`); `System.disposeXML` modeled |
-| `emit.ts` | ✅ `describeType` really implemented as `as_describe_type` (`<type name="pkg::class"/>` XML tree, falling back to `<type name="Object"/>` for non-Classes); ✅ computed names dispatch by receiver (xml/xmllist → `as_xml_*`, Proxy/dynamic-object attribute axis → `as_dyn_get`, all other receivers **loudly** `CodegenError`) |
-| `runtime.ts` | ✅ Embedded `as_xml_parse` minimal DOM parser + the whole `as_xml_attr`/`as_xml_children`/`as_xml_filter`/`as_xml_descendants`/`as_xml_list_*`/`as_describe_type` helper set; **the child axis compares by "local name"** (`as_xml_local()`, stage one-hundred-eight) |
+| `emit.ts` | ✅ `describeType` really implemented (stage one-hundred-eighty-six aligns it fully with `adl 51.4.1`, see §2.8): the reflection tables are emitted per class (`as_prop` carries `is_accessor`/`is_const`, `as_method` carries `sig`, the vtable carries `is_dynamic`/`is_final`) and the XML tree is assembled at runtime by `as_dt_shape`/`as_dt_traits` (`<type>`/`<extendsClass>`/`<implementsInterface>`/`<variable>`/`<constant>`/`<accessor>`/`<method>`/`<parameter>`/`<factory>`); ✅ computed names dispatch by receiver (xml/xmllist → `as_xml_*`, Proxy/dynamic-object attribute axis → `as_dyn_get`, all other receivers **loudly** `CodegenError`) |
+| `runtime.ts` | ✅ Embedded `as_xml_parse` minimal DOM parser + the whole `as_xml_attr`/`as_xml_children`/`as_xml_filter`/`as_xml_descendants`/`as_xml_list_*` helper set; **the child axis compares by "local name"** (`as_xml_local()`, stage one-hundred-eight); ✅ the `describeType` assembler (`as_dt_class_of`/`as_dt_shape`/`as_dt_traits`, stage one-hundred-eighty-six, see §2.8), where a candidate object is **only ever compared against a registry vtable, never dereferenced** |
 
 ---
 
@@ -212,6 +270,7 @@ Split into four stages by "dependency order + verifiable per stage", **all lande
 | ninety-one | `@attr` attribute access + `.child` child-node navigation | to be bumped | `stage91.as` |
 | ninety-two | E4X filter predicate `.(@attr == value)` | to be bumped | `stage92.as` |
 | ninety-three | `describeType`'s XML output | to be bumped | `stage93.as` |
+| one-hundred-eighty-six | `describeType`'s XML shape **fully aligned with `adl`** (it used to emit a childless `<type name="pkg::class"/>` ⇒ the model mapper got nothing ⇒ an uncaught `#1009`) | v0.4.166 → v0.4.167 | `describe-type.as` |
 
 > **Correction (stage one-hundred-eight)**: the old conclusion in the row above is **outdated** — XML literals and
 > the `..` descendant axis landed in **stage one-hundred-six** (see the §4 table), and `ns::[expr]`/`@[expr]`

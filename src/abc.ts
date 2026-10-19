@@ -56,6 +56,16 @@ export interface AbcSymbolClass {
   /** Frame scripts registered by the constructor, in registration order. */
   frames: AbcFrameScript[];
   /**
+   * Fully-qualified name of the symbol class's superclass (from the instance's
+   * `super_index`), or `''` when it could not be read. AIR's own symbol classes
+   * extend `flash.display.MovieClip`/`SimpleButton`, but a library may also link a
+   * symbol to a class extending one the PROJECT compiles from source —
+   * `com.example.controls.ComBoBox` for the app's combo boxes. That case is the
+   * only way a symbol can carry behaviour the SWC's artwork alone cannot express,
+   * so the emitter needs the name to bind the symbol to the real base class.
+   */
+  baseName: string;
+  /**
    * Fully-qualified names the decoded methods reach through the scope chain
    * (`flash.events.MouseEvent` for a `MouseEvent.CLICK`). The synthesized class
    * declaration imports these so the emitter resolves the short names the same way
@@ -75,6 +85,27 @@ export interface AbcTagRef {
   length: number;
 }
 
+/**
+ * What a symbol class's `InstanceInfo` says about the class itself: the declared
+ * superclass and whether the class is DYNAMIC.
+ *
+ * Both come from the same ABC record, and both are needed to make a baked symbol
+ * behave like AIR's. `dynamic` is not an inference: AVM2 decides it from the
+ * `flags` byte alone (bit 0 = sealed, bit 2 = interface; neither set = dynamic,
+ * i.e. the instance owns a property table). Flash's generated symbol classes rely
+ * on it — `skin.swc`'s `AIAsrComBox` is `dynamic` even though its declared base
+ * `com.example.controls.ComBoBox` and that class's own base
+ * `com.example.proxy.ViewControl` are sealed. That is exactly how the combo box's
+ * `this["title"]` resolves: the RUNTIME class is dynamic, so a name that is not a
+ * trait lands in the instance's own table instead of raising #1069.
+ */
+export interface AbcSymbolBase {
+  /** Fully-qualified superclass name, `''` when it could not be read. */
+  baseName: string;
+  /** `true` when the ABC declares the class dynamic (neither sealed nor interface). */
+  dynamic: boolean;
+}
+
 /** `DoABC` tag code in the SWF tag stream. */
 const TAG_DO_ABC = 82;
 
@@ -90,7 +121,7 @@ export function decodeSymbolScripts(
   tags: readonly AbcTagRef[],
   classNames: ReadonlyMap<number, string>,
   charKinds: ReadonlyMap<number, string>
-): { scripts: Map<number, AbcSymbolClass>; skipped: string[] } {
+): { scripts: Map<number, AbcSymbolClass>; skipped: string[]; bases: Map<number, AbcSymbolBase> } {
   // A DoABC tag is `flags:u32`, the ABC name as a NUL-terminated string, then the
   // ABC body. The tag's own name uses the package separator
   // (`skin_fla/元件172_339`) while SymbolClass uses a dot, so normalize to match.
@@ -105,13 +136,18 @@ export function decodeSymbolScripts(
 
   const out = new Map<number, AbcSymbolClass>();
   const skipped: string[] = [];
+  // Every symbol class's superclass name and dynamic flag, whether or not its
+  // scripts decode: the emitter binds a symbol to a PROJECT base class by this name,
+  // and reproduces AVM2's `dynamic` trait from this flag. Both are independent of
+  // the symbol having frame scripts at all.
+  const bases = new Map<number, AbcSymbolBase>();
   for (const [charId, className] of classNames) {
     const kind = charKinds.get(charId);
     if (kind !== 'sprite' && kind !== 'button') continue;
     const abc = byName.get(className);
     // No DoABC under this name simply means "this symbol has no timeline script".
     if (abc === undefined) continue;
-    const decoded = decodeSymbolClass(abc, className);
+    const decoded = decodeSymbolClass(abc, className, (b) => bases.set(charId, b));
     // Only a clean decode is trustworthy: a `notes`-bearing result means we could not
     // read part of the timeline, so leaving the character scriptless (and reporting it
     // upward) beats wiring a half-decoded one.
@@ -119,17 +155,19 @@ export function decodeSymbolScripts(
     if (decoded.notes.length === 0) out.set(charId, decoded);
     else skipped.push(`#${charId} (${className}): ${decoded.notes.join('; ')}`);
   }
-  return { scripts: out, skipped };
+  return { scripts: out, skipped, bases };
 }
 
-/** Decode one symbol class's ABC into frame scripts + methods. */
-function decodeSymbolClass(abc: Buffer, className: string): AbcSymbolClass | null {
+/** Decode one symbol class's ABC into frame scripts + methods. `onBase` receives the
+ *  class's superclass name and dynamic flag even when the scripts themselves cannot
+ *  be decoded. */
+function decodeSymbolClass(abc: Buffer, className: string, onBase?: (base: AbcSymbolBase) => void): AbcSymbolClass | null {
   const notes: string[] = [];
   let parsed: AbcFile;
   try {
     parsed = parseAbc(abc);
   } catch (err) {
-    return { frames: [], methods: [], imports: [], notes: [`the ABC of '${className}' could not be parsed: ${(err as Error).message}`] };
+    return { frames: [], methods: [], imports: [], notes: [`the ABC of '${className}' could not be parsed: ${(err as Error).message}`], baseName: '' };
   }
   // The DoABC tag is named after the class it carries, so select that instance:
   // a symbol ABC may also declare helper classes, and picking one at random would
@@ -143,12 +181,17 @@ function decodeSymbolClass(abc: Buffer, className: string): AbcSymbolClass | nul
       methods: [],
       imports: [],
       notes: [`the ABC of '${className}' declares no class by that name (declares: ${shown})`],
+      baseName: '',
     };
   }
   if (matches.length > 1) {
-    return { frames: [], methods: [], imports: [], notes: [`the ABC of '${className}' declares ${matches.length} classes by that name`] };
+    return { frames: [], methods: [], imports: [], notes: [`the ABC of '${className}' declares ${matches.length} classes by that name`], baseName: '' };
   }
   const inst = matches[0];
+  // AVM2's rule, straight from the InstanceInfo flags: bit 0 is `sealed`, bit 2 is
+  // `interface`; a class with neither is dynamic. The protectedNs bit (0x08) is an
+  // encoding detail, not a class property.
+  if (onBase) onBase({ baseName: inst.superName, dynamic: (inst.flags & 0x05) === 0 });
   const tr = new Translator(parsed);
 
   // Frame scripts come from the constructor's `addFrameScript(i, this.frameN)` calls
@@ -189,11 +232,11 @@ function decodeSymbolClass(abc: Buffer, className: string): AbcSymbolClass | nul
       notes.push(`frame ${f.frame} of '${className}' references '${f.method}', which was not decoded`);
     }
   }
-  if (notes.length > 0) return { frames: [], methods: [], notes };
+  if (notes.length > 0) return { frames: [], methods: [], imports: [], notes, baseName: inst.superName };
   if (frames.length === 0 && methods.length === 0) return null;
   // Sorted: the import list feeds the synthesized class declaration, and a stable
   // order keeps the generated C byte-identical between runs.
-  return { frames, methods, imports: [...tr.externalRefs].sort(), notes };
+  return { frames, methods, imports: [...tr.externalRefs].sort(), notes, baseName: inst.superName };
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +267,14 @@ interface AbcTrait {
 interface AbcInstance {
   /** Qualified class name, e.g. `skin_fla.元件172_339`. */
   name: string;
+  /** Qualified name of the superclass (the instance's `super_index`). */
+  superName: string;
+  /** The raw `InstanceInfo.flags` byte. Bit 0 is `sealed`; a class with neither
+   *  `sealed` nor `interface` set is DYNAMIC (`_dyn` slot table present). Flash's
+   *  generated symbol classes rely on this: `this["title"]` on a combo-box symbol
+   *  resolves through the instance's own dynamic table even though the class's
+   *  DECLARED base (`flash.display.Sprite`) is sealed. */
+  flags: number;
   ctorMethod: number;
   traits: AbcTrait[];
 }
@@ -485,11 +536,19 @@ export function parseAbc(buf: Buffer): AbcFile {
   const instanceTraits: AbcTrait[][] = [];
   const ctorMethods: number[] = [];
   const instanceNames: string[] = [];
+  const baseNames: string[] = [];
+  const instanceFlags: number[] = [];
   for (let i = 0; i < instanceCount; i++) {
     const mn = mnAt(r.u30());
     instanceNames.push(mn.ns === '' ? (mn.name ?? '?') : `${mn.ns}.${mn.name ?? '?'}`);
-    r.u30(); // base class (a multiname)
+    // The base class is a multiname too, and it is the difference between a symbol
+    // that is merely a picture and one that behaves: `AIAsrComBox` extends the
+    // project's `com.example.controls.ComBoBox`, so dropping it leaves the SWC
+    // class without the combo box's own code (swc.md §3.3 addendum).
+    const base = mnAt(r.u30());
+    baseNames.push(base.ns === '' ? (base.name ?? '') : `${base.ns}.${base.name ?? ''}`);
     const flags = r.u8();
+    instanceFlags.push(flags);
     // `protectedNs` is a NAMESPACE index (not a multiname): talkmed's checkbox
     // symbol points at its own ProtectedNamespace entry here.
     if ((flags & 0x08) !== 0) r.u30();
@@ -537,6 +596,8 @@ export function parseAbc(buf: Buffer): AbcFile {
     bodies,
     instances: instanceTraits.map((traits, i) => ({
       name: instanceNames[i],
+      superName: baseNames[i],
+      flags: instanceFlags[i],
       ctorMethod: ctorMethods[i],
       traits,
     })),

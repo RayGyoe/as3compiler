@@ -14,13 +14,14 @@
 // so fanning them out would buy nothing), while these ~190 subprocess units were
 // awaited one at a time.
 import { execFile } from 'node:child_process';
-import { readdirSync, existsSync, mkdirSync } from 'node:fs';
+import { readdirSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 import { promisify } from 'node:util';
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
 import { root } from './harness.ts';
+import { aneHostDirName, currentAnePlatform, readAne } from '../src/ane.ts';
 
 const runAsync = promisify(execFile);
 
@@ -89,7 +90,13 @@ const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as']);
 // a language one. Like air-starling-demo / Flappy-Starling
 // this is a third-party read-only reference, skipped rather than treated as a
 // passing unit. The directory is gitignored (.gitignore `examples/away3d-core`).
-const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core']);
+// `ane-app` is here rather than in the pool because it is not an ordinary native
+// build: its whole point is an AIR descriptor's <extensions>, which only --air-app
+// reads, so compiling its .as files the way this pool does would produce a program
+// whose createExtensionContext() answers null for the very id under test. Its own
+// serial case is registered after the pool (see "example: ane-app" below), the same
+// arrangement air-native has.
+const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'ane-app']);
 // GreenSock core files that air-native's TweenDemo actually reaches. Only these
 // are pulled in; the rest of com/greensock (easing/loading/other plugins) stays
 // outside the subset and is not compiled.
@@ -163,6 +170,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // draw 必须变），而且它要靠 `stage.render` 跑每帧指纹 pass 才会真的进入烘焙态，
   // 两者都只在 Skia 构建下存在，故同样链 Skia。
   'autobake-scrollrect.as': ['--manifest', join(dir, 'autobake-scrollrect.build.json')],
+  // autobake-origin.as（阶段一百九十一）断言的是**自动烘焙的原点口径**：分数坐标上的对象被烘焙
+  // 后必须与活态逐像素相同（真机上这是用户报的「按钮鼠标悬停抖动」）。同 autobake-scrollrect 一样，
+  // 它要靠 `stage.render` 跑每帧指纹 pass 才会真的进入烘焙态，而且断言是像素 —— 纯 C 构建没有
+  // 光栅后端，故同样链 Skia。
+  'autobake-origin.as': ['--manifest', join(dir, 'autobake-origin.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
   // autosize-metrics.as 断言的是**字体度量**（`textWidth`/`textHeight`/`numLines`）与
@@ -185,6 +197,15 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // `textWidth`/`textHeight`/`getLineMetrics` 只有在 Skia 文本后端下才存在，故目录单元
   // 与 bakecrisp.as 一样链 Skia。键带尾部 `/` 以区分目录单元与同名 .as。
   'textfield/': ['--manifest', join(dir, 'textfield', 'textfield.build.json')],
+  // ane/ is the FRE host end-to-end: a real ExtensionContext.call() crossing into a
+  // native extension and back (docs/zh-cn/ane.md). The manifest is what turns --ane
+  // on, and what it points at is a STAGING TREE (ext-aot/com.example.probe), not a
+  // packed .ane -- §4.6's default shape. Without either, the build is an ordinary
+  // native build and createExtensionContext correctly answers null. The unit is
+  // SKIPPED loudly on hosts that cannot load a native extension at all (see
+  // aneHostSkipReason). Its --air-app twin is examples/ane-app/, whose own case is
+  // registered below the pool.
+  'ane/': ['--manifest', join(dir, 'ane', 'ane.build.json')],
 };
 // Examples that need an input file absent from the tree. Skipped loudly so the
 // suite never reports coverage it did not exercise.
@@ -193,6 +214,54 @@ const EXAMPLE_REQUIRES: Record<string, string> = {
   'swc-shape.as': join(root, '..', 'temp', 'skin.swc'),
   'swc-mc-button.as': join(root, '..', 'temp', 'skin.swc'),
 };
+
+// Why the extension-bearing example units (`ane/`, `ane-app/`) are skipped instead
+// of run on some hosts.
+//
+// Loading a native extension needs THREE things to agree at once, and all three
+// are host-specific: an AIR platform key for this host (currentAnePlatform), a
+// built FRE host library for that key's directory (lib/bin/<dir>/asaot.*), and a
+// package that actually declares that key. On the arm64 macOS CI runner the second
+// one is missing -- only the Windows host library is built today -- and on a
+// Windows x86 host the third one is (the fixture ships a Windows-x64 DLL).
+// Returning the reason here, rather than hardcoding 'skip on darwin', keeps the
+// gate derived from the SAME three decisions the build itself makes: a host that
+// can build the example is a host the build would not reject.
+//
+// `pkg` is whatever the build would be handed as `--ane`: either a package or, for
+// a staging tree, the directory holding extension.xml. Both examples share ONE
+// fixture tree (examples/ane/build-ane.bat writes both copies), so they answer this
+// question identically -- but the path is a parameter rather than a constant so a
+// future example cannot silently reuse another's answer.
+//
+// Names the same file the BUILD names when it decides a host library is present
+// (src/index.ts stages `asaot.dll` next to the executable and errors if it is not
+// in lib/bin/<dir>/), so the gate cannot disagree with the build. Deliberately
+// not `asaot.lib`: that is the IMPORT library for linking, not the runtime the
+// executable loads.
+//
+// That the name is Windows-specific is exactly the registered gap
+// (TODO.md 遗留待开发: no macOS/iOS host library is built yet); when one lands,
+// the name has to come from one place shared with index.ts rather than being
+// guessed here.
+const HOST_LIB_NAME = 'asaot.dll';
+function aneHostSkipReason(pkg: string): string | null {
+  const key = currentAnePlatform();
+  if (key === '') return 'this host has no AIR platform key (see docs/zh-cn/ane.md §3.4)';
+  const hostLib = join(root, 'lib', 'bin', aneHostDirName(key), HOST_LIB_NAME);
+  if (!existsSync(hostLib)) return `the FRE host library (lib/bin/${aneHostDirName(key)}/${HOST_LIB_NAME}) is not built for this host`;
+  let declares = false;
+  try {
+    declares = readAne(pkg).platforms.some((p) => p.name === key);
+  } catch {
+    return 'the ANE fixture could not be read';
+  }
+  if (!declares) return `the ANE fixture declares no <platform name="${key}"> entry`;
+  return null;
+}
+// The fixture both extension examples are built against. Named once so the two
+// units cannot drift onto different trees.
+const ANE_FIXTURE = 'com.example.probe';
 
 // The concurrency the example suite actually runs at.
 //
@@ -262,7 +331,15 @@ describe(`examples (jobs=${JOBS})`, { concurrency: JOBS }, () => {
       const names = subFiles.map((f) => f.slice(subDir.length + 1));
       const label = `${e.name}/ (${names.join(', ')})`;
       const out = scratchOut(label);
-      test(`example: ${e.name}/ (dir unit)`, async () => {
+      test(`example: ${e.name}/ (dir unit)`, async (t) => {
+        if (e.name === 'ane') {
+          const why = aneHostSkipReason(join(subDir, 'ext-aot', ANE_FIXTURE));
+          if (why) {
+            console.log(`SKIP  ${label} (needs a platform that can load a native extension: ${why})`);
+            t.skip(why);
+            return;
+          }
+        }
         // Live guard: the directory unit must leave its source tree untouched.
         // Snapshot before/after so the assertion covers whatever the compiler
         // happens to write (a future `-o` default change would show up here, not in
@@ -324,4 +401,68 @@ test('example: air-native (--air-app + renderMode=direct: compile+link only)', a
     '--target', 'native', '-o', scratchOut('air-native-app')],
     { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
   console.log('PASS  air-native (--air-app)');
+});
+
+// The DESCRIPTOR-to-extension chain, end to end: an app whose app.xml declares
+// `<extensions><extensionID>` and knows no path at all.
+//
+// Four separate mechanisms have to agree, and each one is invisible to every other
+// test in this file:
+//   1. parseAirApp() reads the <extensions> id out of the descriptor.
+//   2. --air-app resolves that id over the app directory's ext-aot/ (then lib/, then
+//      ext-folder/) -- unit: air-app/Extensions pins the resolution itself, but only
+//      against temp directories it writes.
+//   3. the resolved path reaches the MANIFEST as `ane-paths`, which is what turns
+//      --ane on and makes the generated C carry as_ane_descs[].
+//   4. the build stages the library as <out>/extensions/<id>/<platform>/ and the
+//      program actually loads it -- the only step that proves a real tree rather
+//      than a well-shaped path.
+//
+// Unlike air-native's case directly above, this one CAN run: the descriptor is
+// <visible>false</visible>, so the program renders one frame offscreen and exits
+// instead of opening a window that never returns. That is what makes the assertions
+// inside examples/ane-app/src/Main.as (a context for the declared id, native code
+// answering, a native status event, dispose) part of the coverage rather than prose.
+//
+// Serial, and gated three ways, all of which are host facts rather than
+// preferences: the native Skia vendor libs (this compiles skia_glue.cc and links
+// ~20 MB of static libraries -- and `needs a real GDI` is what the two src/air-app.ts
+// link-set defects above were), the FRE host library, and a fixture that declares
+// this host's AIR platform key. On the arm64 macOS CI runner the last two fail, so
+// the case SKIPS loudly there instead of pretending to have covered it.
+test('example: ane-app (--air-app + "<extensions>" id -> ext-aot: build+stage+run)', async (t) => {
+  const appDir = join(dir, 'ane-app');
+  const xml = join(appDir, 'ane-app.xml');
+  const vendorLibs = ['skia', 'sdl2', 'curl'].map((v) => join(root, 'vendor', v));
+  if (!existsSync(xml) || !vendorLibs.every((p) => existsSync(p))) {
+    console.log('SKIP  ane-app (--air-app: needs the native Skia/SDL2/curl vendor libs)');
+    t.skip('needs vendor/skia, vendor/sdl2 and vendor/curl');
+    return;
+  }
+  const fixture = join(appDir, 'ext-aot', ANE_FIXTURE);
+  const why = aneHostSkipReason(fixture);
+  if (why) {
+    console.log(`SKIP  ane-app (needs a platform that can load a native extension: ${why})`);
+    t.skip(why);
+    return;
+  }
+  const out = scratchOut('ane-app');
+  await runAsync('node', ['src/index.ts', '--air-app', xml, '--main-class', 'aneapp.Main',
+    '--target', 'native', '-o', out, '--run'],
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
+
+  // The two artifacts of step 3/4 above, asserted where they land. The run already
+  // proves the library loaded (a null context throws no Error but fails an assertion
+  // -- see Main.as), so these two exist to catch the quieter shape of the same
+  // failure: a manifest that records the path but a `load` that resolves somewhere
+  // else (the runtime resolves `extensions/` next to the EXECUTABLE, so an -o that
+  // puts the executable outside the build directory is a real trap).
+  const manifest = JSON.parse(readFileSync(join(appDir, 'ane-app.build.json'), 'utf8')) as Record<string, unknown>;
+  assert.deepStrictEqual(manifest['ane-paths'], [`ext-aot/${ANE_FIXTURE}`],
+    'the descriptor id must resolve to the ext-aot staging tree');
+  // Next to the EXECUTABLE, which on Windows means the same directory with a `.exe`
+  // appended to the basename -- so the directory is `dirname(out)`, not `out`.
+  const staged = join(dirname(out), 'extensions', ANE_FIXTURE);
+  assert.ok(existsSync(staged), `the extension was not staged beside the executable: ${staged}`);
+  console.log('PASS  ane-app (--air-app)');
 });

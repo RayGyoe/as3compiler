@@ -336,7 +336,7 @@ unguarded deref: TypeError #1009 Error #1009: Cannot access a property or method
   **不需要**自写 VFS 或 `-DSQLITE_OS_OTHER`：wasi-libc 的 POSIX 文件面足够 SQLite 的
   默认 unix VFS 使用，只需 `-DSQLITE_THREADSAFE=0`（wasi-ld 无 pthread）。
 - **ANE 相关**：`ANELame` / `ANECrypto` 里也触及 `EncryptedLocalStore` 等符号，属
-  「Windows ANE 宿主未实现」那条既有遗留项，不在本文范围。
+  「ANE 宿主（`asaot` FRE 运行时）」这条既有缺口（见 `TODO.md` 阶段一百七十八），不在本文范围。
 
 ---
 

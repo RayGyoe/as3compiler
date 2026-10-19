@@ -517,7 +517,7 @@ must be written before `showWindow`, with `showWindow` as the last statement. Th
    CJK scenarios should swap in a smaller character set as needed).
    - **Font coverage = the range of text that can be displayed**: a missing glyph is per-character and does not
      error. `url-test` prints the login response's JSON as-is into a TextField, containing Chinese
-     (`住友制药`/`视频通话`/`我的会议`…), so it carries a 7.9 MB `MiSans-Regular.ttf` (measured: Arial's and
+     (`Acme Pharma`/`视频通话`/`我的会议`…), so it carries a 7.9 MB `MiSans-Regular.ttf` (measured: Arial's and
      Ubuntu-R's cmap hit 0/8 for these characters, MiSans 8/8). With only a Western font, those Chinese
      characters render as ▯, **without erroring**.
    - **Fonts are downloaded only once (since stage eighty-nine / fifty-eight)**: a font's actual source is the
@@ -570,7 +570,7 @@ must be written before `showWindow`, with `showWindow` as the last statement. Th
       **displayed** in the browser (`<img>` does not need CORS), but its **pixels cannot be read** (the canvas
       gets tainted, `getImageData` throws) — and rendering to Skia needs the pixels, so a remote `Loader.load`
       is essentially a read that requires CORS. Measured: the response of
-      `https://meeting.talkmed.com/img/*.png` has **no** `Access-Control-Allow-Origin` (only
+      `https://cdn.acme.example/img/*.png` has **no** `Access-Control-Allow-Origin` (only
       `timing-allow-origin: *`), so those two URLs get only an honest CORS `ioError` on web, while
       native/`adl` works normally (curl is not bound by the same-origin policy). To display them, the CDN must
       add `Access-Control-Allow-Origin`, or the page must fetch images through a **same-origin proxy**.

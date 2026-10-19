@@ -31,6 +31,7 @@
 #include "include/core/SkCanvas.h"
 #include "include/core/SkData.h"
 #include "include/core/SkImage.h"
+#include "include/core/SkPaint.h"
 #include "include/core/SkPixmap.h"
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkImage.h"
@@ -407,7 +408,14 @@ void sk_mtl_draw_texture(void* canvas, void* mtlTexture, int w, int h,
     }
   }
   SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
-  ((SkCanvas*)canvas)->drawImageRect(img.get(), dst, SkSamplingOptions());
+  // kSrc, NOT Skia's default kSrcOver: AIR composites the Stage3D back buffer with
+  // its alpha channel ignored (see sk_gpu_draw_texture in d3d_glue.cc for the adl
+  // measurement). Without this, Starling's ERASE mode -- which zeroes RGB *and*
+  // alpha -- lets the stage colour through and the Blend Modes demo draws a white
+  // rocket silhouette where AIR draws a black one.
+  SkPaint paint;
+  paint.setBlendMode(SkBlendMode::kSrc);
+  ((SkCanvas*)canvas)->drawImageRect(img.get(), dst, SkSamplingOptions(), &paint);
 }
 
 int sk_gpu_init(int win_id, void* layer) { return sk_mtl_init(win_id, layer); }

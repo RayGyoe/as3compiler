@@ -215,7 +215,7 @@ function checkTextInput(): string[] {
   check('TextFieldType exposes INPUT/DYNAMIC as measured constants',
     c.includes('TextFieldType_INPUT') && c.includes('"input"') && c.includes('"dynamic"'));
   check('TextEvent carries a text payload and the TEXT_INPUT constant',
-    c.includes('{ "text", 3, offsetof(TextEvent, text), NULL, NULL, 0 }')
+    c.includes('{ "text", 3, offsetof(TextEvent, text), NULL, NULL, 0, 0, 0 }')
     && c.includes('static char* const TextEvent_TEXT_INPUT = "textInput";'));
   check('TextEvent constructs through the measured (type, bubbles, cancelable, text) shape',
     c.includes('static TextEvent* TextEvent_new(char* type, bool bubbles, bool cancelable, char* text) {')
@@ -470,8 +470,8 @@ function checkTextSelection(): string[] {
   // border/borderColor 是真实槽（反射表里要有），默认值按 adl 实测。
   check('TextField declares border/borderColor slots',
     c.includes('bool border;') && c.includes('unsigned int borderColor;')
-    && c.includes('{ "border", 2, offsetof(TextField, border), NULL, NULL, 0 }')
-    && c.includes('{ "borderColor", 5, offsetof(TextField, borderColor), NULL, NULL, 0 }'));
+    && c.includes('{ "border", 2, offsetof(TextField, border), NULL, NULL, 0, 0, 0 }')
+    && c.includes('{ "borderColor", 5, offsetof(TextField, borderColor), NULL, NULL, 0, 0, 0 }'));
   check('the constructor defaults match adl (border false, borderColor 0, backgroundColor 0xFFFFFF)',
     c.includes('o->border = false;') && c.includes('o->borderColor = 0x000000u;')
     && c.includes('o->backgroundColor = 0xFFFFFFu;'));
@@ -483,7 +483,7 @@ function checkTextSelection(): string[] {
     && c.includes('((TextField*)_this)->textColor = value & 0xFFFFFFu;'));
   check('the colour properties keep plain field reads and only write through setters',
     c.includes('unsigned int TextField_get_borderColor')
-    || c.includes('{ "borderColor", 5, offsetof(TextField, borderColor), NULL, NULL, 0 }'));
+    || c.includes('{ "borderColor", 5, offsetof(TextField, borderColor), NULL, NULL, 0, 0, 0 }'));
 
   // 边框渲染：背景之后、文本 clip 之前画四条像素对齐的填充矩形（非 1px 描边）。
   // 阶段九十四·二十一 起厚度不再是常量 1 局部单位，而是屏幕空间的
@@ -807,3 +807,51 @@ function checkStyleSheet(): string[] {
 }
 
 registerGroup('unit: text-input/StyleSheet', checkStyleSheet);
+
+// ---- TODO L12205：「窗口键盘通道把 Shift 自身的 keyDown/keyUp 各派发两次」 -------
+// macOS 上 cocoa 后端把「一次修饰键按下」投递两次：Cocoa_DispatchEvent 同时把
+// KeyDown/KeyUp 与 FlagsChanged 送进 Cocoa_HandleKeyEvent，后者经 HandleModifiers
+// 又发一次同样的 SDL_SendKeyboardKey（SDL 只把第二次标成 repeat 后照常 post）。
+// 修法是胶水层按 (scancode, 方向) 去重，且只在 __APPLE__ 下生效——Windows 的修饰键
+// 会自动重复，那里的重复是真输入。adl 51.4.1 只发一次 ⇒ 多的那次是保真缺口。
+function checkModifierKeyChannel(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [modkey] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [modkey] ${label}`); }
+  };
+
+  const src = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8')
+    .replace(/\r\n/g, '\n');
+
+  check('the glue enumerates the eight modifier scancodes',
+    /static int sk_is_modifier_scancode\(SDL_Scancode sc\) \{[\s\S]*?SDL_SCANCODE_LSHIFT[\s\S]*?SDL_SCANCODE_RGUI[\s\S]*?\n\}/.test(src));
+
+  check('the helper and its state live behind #if defined(__APPLE__)',
+    /#if defined\(__APPLE__\)[\s\S]{0,900}?sk_is_modifier_scancode[\s\S]{0,900}?g_mod_last_valid = 0;/.test(src));
+
+  check('the drop keys on (scancode, direction), not on SDL repeat (the KEYUP half carries no repeat flag)',
+    src.includes('int down = (e.type == SDL_KEYDOWN) ? 1 : 0;')
+    && src.includes('g_mod_last_scancode == e.key.keysym.scancode &&')
+    && src.includes('g_mod_last_down == down'));
+
+  // 位置断言：过滤必须在 on_key 派发之前、且落在 KEYDOWN/KEYUP 分支内——回调为空的
+  // 窗口不得让共享的去重状态失同步。
+  const keyCase = src.slice(src.indexOf('case SDL_KEYDOWN:'));
+  const gi = keyCase.indexOf('sk_is_modifier_scancode(e.key.keysym.scancode)');
+  const di = keyCase.indexOf('c->on_key(id, e.type == SDL_KEYDOWN');
+  check('the filter runs inside the KEYDOWN/KEYUP case, before the on_key dispatch',
+    gi > 0 && di > gi && gi < keyCase.indexOf('case SDL_TEXTEDITING:'));
+
+  check('the keyDown/keyUp dispatch site is still single (the fix is a filter, not a second call)',
+    (src.match(/c->on_key\(id, e\.type == SDL_KEYDOWN \? "keyDown" : "keyUp"/g) || []).length === 1);
+
+  check('the rationale cites the SDL sources that produce the duplicate',
+    src.includes('SDL_cocoaevents.m') && src.includes('SDL_cocoakeyboard.m')
+    && src.includes('SDL_keyboard.c'));
+
+  return bad;
+}
+
+registerGroup('unit: text-input/ModifierKey', checkModifierKeyChannel);

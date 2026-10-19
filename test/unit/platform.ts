@@ -911,13 +911,52 @@ function checkAudioWiring(): string[] {
   const plainNative = airManifest('../../vendor', true, true, true, false, 'direct',
     true, true, [], [], [], [], false, false) as Record<string, unknown>;
 
-  check('an app using flash.media compiles vendor/audio_glue.c in',
-    list(audioNative, 'sources').some((p) => p.endsWith('vendor/audio_glue.c')));
+  // Host-dependent by construction, in exactly one place: miniaudio picks its
+  // backend from the TARGET (CoreAudio on Apple, WASAPI/DirectSound/WinMM on
+  // Windows), so the glue source + define pair belongs on every host that has a
+  // backend built, while the framework flags exist only where a `-framework`
+  // argument does. Windows is where that asymmetry bit: an unconditional
+  // `frameworks: ['CoreAudio','AudioToolbox']` compiled fine (clang only warns)
+  // and then failed at LINK time -- `lld-link: ignoring unknown argument
+  // '-framework'`, then `could not open 'CoreAudio'` -- leaving the app with no
+  // audio at all. macOS must keep its two frameworks; every other host must get
+  // an empty list rather than flags its linker cannot read.
+  const apples = process.platform === 'darwin';
+  const hostHasAudioBackend = apples || process.platform === 'win32';
+  const readSrc = (rel: string): string =>
+    readFileSync(join(root, rel), 'utf8').replace(/\r\n/g, '\n');
+  const airApp = readSrc('src/air-app.ts');
+  const audioFw = list(audioNative, 'frameworks');
+
+  check('an app using flash.media compiles vendor/audio_glue.c in (wherever a backend was built)',
+    !hostHasAudioBackend || list(audioNative, 'sources').some((p) => p.endsWith('vendor/audio_glue.c')));
   check('an app using flash.media defines ASC_HAVE_AUDIO',
     list(audioNative, 'defines').includes('ASC_HAVE_AUDIO=1'));
-  check('an app using flash.media links miniaudio\'s CoreAudio backend',
-    list(audioNative, 'frameworks').includes('CoreAudio')
-    && list(audioNative, 'frameworks').includes('AudioToolbox'));
+  check('the backend hosts are named as data (darwin + win32), not as a single-platform check',
+    /const audioGlueHosts = \['darwin', 'win32'\];/.test(airApp)
+    && /audioGlueHosts\.includes\(process\.platform\)/.test(airApp));
+  check(apples
+    ? 'macOS names miniaudio\'s CoreAudio backend (CoreAudio + AudioToolbox)'
+    : 'Windows names no -framework at all (miniaudio LoadLibrary\'s WASAPI/DirectSound/WinMM)',
+    apples ? audioFw.includes('CoreAudio') && audioFw.includes('AudioToolbox') : audioFw.length === 0);
+  const darwinGate = airApp.indexOf("if (process.platform === 'darwin') {");
+  check('...because the CoreAudio/AudioToolbox push sits inside the darwin branch (readable on any host)',
+    darwinGate >= 0
+    && airApp.slice(darwinGate, darwinGate + 240).includes("'CoreAudio'")
+    && airApp.slice(darwinGate, darwinGate + 240).includes("'AudioToolbox'"));
+  check('the rationale records the measured Windows link set (no -l: LoadLibrary/GetProcAddress)',
+    airApp.includes('reaches all three of its Windows backends through LoadLibrary/GetProcAddress')
+    && airApp.includes('is not even a Windows flag'));
+  check('the no-backend warning names the glue, the hosts that have one, and this host',
+    /it carries a backend for \$\{audioGlueHosts\.join\('\/'\)\}, and this host is \$\{process\.platform\}/.test(airApp));
+  check('and the CLI hint only offers `frameworks` where the flag exists (no Apple flags on Windows)',
+    ((): boolean => {
+      const idx = readSrc('src/index.ts');
+      const at = idx.indexOf("const audioLinked = cfg.defines.some((d) => d === 'ASC_HAVE_AUDIO'");
+      if (at < 0) return false;
+      const hint = idx.slice(at, at + 900);
+      return hint.includes("process.platform === 'darwin' ? `, plus") && hint.includes('frameworks');
+    })());
   check('an app that does not use flash.media gets no audio backend (and no stray frameworks)',
     !list(plainNative, 'sources').some((p) => p.endsWith('vendor/audio_glue.c'))
     && !list(plainNative, 'defines').includes('ASC_HAVE_AUDIO=1')
@@ -1025,24 +1064,92 @@ function checkPresentScale(): string[] {
   check('...and the swapchain is still created at the client rect it will be shown in',
     /GetClientRect\(hwnd, &rc\);/.test(d3d) && /sd\.Width = \(UINT\)cw;/.test(d3d));
 
+  // ---- D3D12: a SPARE back buffer, so moving a window cannot stall the frame ----
+  // Windows-only and measured on real hardware (temp/dragtrace, 2026-10-17): with
+  // two buffers, DXGI's presentation queue can hold BOTH of them while the
+  // compositor is busy with the window -- which is exactly when the user is moving
+  // it -- so sk_gpu_begin_frame's acquire wait blocks for two vblanks per frame
+  // (~31 ms). Our frames can run inside the OS modal move loop dispatch
+  // (live_resize_watch -> sk_pump_frame), so that wait is time the move loop never
+  // gets: the window advanced in rock-steady 66.6 ms (four vblank) steps while
+  // being dragged, where a plain Win32 window, a CPU-rendered SDL window and adl
+  // all move in ~3 ms steps. With a third buffer the wait measures 0.0 ms and the
+  // drag 3.1-4.4 ms steps (max 14 ms, zero gaps over 20 ms), still animating.
+  // Harness: temp/dragtrace/dragtrace2.c (a real SendInput caption drag) + run2.cjs.
+  check('the D3D12 swapchain keeps a spare back buffer (3, not the flip-model minimum 2)',
+    /#define SK_D3D_NUM_FRAMES 3\b/.test(d3d));
+  check('...and that one count sizes the swapchain and its per-buffer fences together',
+    /sd\.BufferCount = SK_D3D_NUM_FRAMES;/.test(d3d) &&
+    /buffers\[SK_D3D_NUM_FRAMES\]/.test(d3d) &&
+    /fence_values\[SK_D3D_NUM_FRAMES\]/.test(d3d));
+
+  // ---- D3D12: the resize path must not corrupt the fence ledger, and must not ----
+  // ---- block forever if the compositor stalls (stages 177 and 177-one) --------
+  // Windows-only and measured on real hardware (temp/dragtrace, 2026-10-17): the
+  // flip-model acquire waits on fence_values[<the buffer about to be drawn into>],
+  // which begin_frame fills in as "<the value that slot held> + 1". Resizing used to
+  // re-read GetCurrentBackBufferIndex() right after ResizeBuffers -- pointing that
+  // "value this slot held" lookup at whichever buffer the rebuilt swapchain landed
+  // on, possibly an OLDER slot -- so the value assigned could be one the fence had
+  // already passed. A fence never moves backwards, so Signal() on a passed value is
+  // a no-op: that buffer lost its "the GPU is done with me" marker and the NEXT
+  // resize's per-slot drain waited forever on a value that could never be reached
+  // (measured: the window wedged solid after three corner-resize steps; 34 no-op
+  // signals in 72 size changes before the fix, 0 in 298 after). The drain is also
+  // bounded now, and on timeout it must release NOTHING -- the swapchain and every
+  // surface stay as they are and the next frame retries.
+  // Harness: temp/dragtrace/resizetrace.c (a real HTBOTTOMRIGHT SendInput drag).
+  const iResize = d3d.indexOf('if (width != w->width || height != w->height)');
+  const iAcq = d3d.indexOf('const UINT64 current = w->fence_values[w->buffer_index];');
+  const resizeBlock = iResize >= 0 && iAcq > iResize ? d3d.slice(iResize, iAcq) : '';
+  check('the resize drain waits with a bound, not INFINITE',
+    /#define SK_D3D_DRAIN_MS \d+\b/.test(d3d) &&
+    /WaitForSingleObjectEx\(w->fence_event, SK_D3D_DRAIN_MS, FALSE\)/.test(resizeBlock) &&
+    !/INFINITE/.test(resizeBlock));
+  check('...and on a timeout it skips the frame instead of releasing anything',
+    // The releases must stay BEFORE ResizeBuffers (you cannot resize a swapchain
+    // while still holding its back buffers), and the skip-the-frame return must
+    // come before both -- that ordering is what makes an abandoned drain harmless.
+    resizeBlock.length > 0 &&
+    /if \(!drained\)/.test(resizeBlock) &&
+    resizeBlock.indexOf('return nullptr;') > 0 &&
+    resizeBlock.indexOf('return nullptr;') < resizeBlock.indexOf('surfaces[i].reset()') &&
+    resizeBlock.indexOf('surfaces[i].reset()') < resizeBlock.indexOf('ResizeBuffers('));
+  check('...and the resize path never re-reads the back-buffer index',
+    resizeBlock.length > 0 && !/w->buffer_index\s*=/.test(resizeBlock) &&
+    (d3d.match(/w->buffer_index = w->swapchain->GetCurrentBackBufferIndex\(\);/g) ?? []).length === 1);
   if (ok > 0) console.log(`[presentscale] ${ok} presentation-scaling checks passed`);
   return bad;
 }
 
 // ---- Capabilities.language / Capabilities.languages ----------------
-// AIR reports the SYSTEM UI language, not the process locale: measured on adl
-// 51.4.1 / macOS 26.6.2, the process LANG is "en_US.UTF-8" while
-// Capabilities.language is "zh-CN" and Capabilities.languages is ["zh-CN"]. The
-// emitter used to read LANG and cut it to two letters, so a program testing
-// `Capabilities.language == "zh-CN"` (TalkMED's cn.edoctor.utils.Language.as)
-// silently fell back to English — the single widest-reaching defect in the
-// talkmed-meeting AOT-vs-adl diff (D1). This group pins the two halves that can
-// regress independently:
-//   (1) the tag normalizer's BEHAVIOUR, which is a pure function of its input tag
-//       and therefore checked by running it with a fixed tag table (no dependence
-//       on the host locale), and
-//   (2) the wiring — emitter -> runtime helper, and the darwin framework the
-//       helper's CoreFoundation calls need at link time.
+// AIR reports the USER INTERFACE language here, in a CLOSED SET, plus the OS's
+// preferred-UI-language list. Measured on adl 51.4.1:
+//   - macOS 26.6.2: language == "zh-CN" and languages == ["zh-CN"] while the
+//     process LANG is "en_US.UTF-8";
+//   - Windows 11: language == "zh-CN" and languages == ["zh-CN","en-US"], and BOTH
+//     stayed exactly that after the region format was switched to de-DE and again
+//     after de-DE was moved to the head of the OS language list — so neither the
+//     user locale (GetUserDefaultLocaleName answered de-DE, LangID 0x0407) nor that
+//     list is the source. The reference agrees for Windows: this property "returns
+//     the user interface (UI) language, which refers to the language used for all
+//     menus, dialog boxes, error messages, and help files".
+// The format is not a locale tag either: the reference states the value is "a
+// lowercase two-letter language code from ISO 639-1" with an ISO 3166 region
+// appended for Chinese only, lists every value it can take, and warns that the
+// property "is limited to the possible values on this list" (which is why it tells
+// applications to read languages[0] instead). Anything outside the table is "xu".
+//
+// The runtime used to read the process LANG and cut it to two letters, so a program
+// testing `Capabilities.language == "zh-CN"` never saw the Chinese value on Windows
+// (LANG is unset there) and silently switched to English. Three independently
+// regressible halves are pinned here:
+//   (1) the two formatters, BEHAVIOURALLY, compiled from the real shipped text —
+//       on every host, because the tables below are fixed inputs and so no host
+//       locale is involved;
+//   (2) the host wiring end to end, which needs CoreFoundation and therefore runs
+//       on darwin only;
+//   (3) the source-level wiring pins and the darwin link requirement.
 function checkCapabilitiesLocale(): string[] {
   let ok = 0;
   const bad: string[] = [];
@@ -1050,59 +1157,142 @@ function checkCapabilitiesLocale(): string[] {
     if (cond) { ok++; console.log(`PASS  [capabilities] ${label}`); }
     else { bad.push(label); console.log(`FAIL  [capabilities] ${label}`); }
   };
+  const LF = String.fromCharCode(10);
+  // A C driver's stdout goes through the CRT, which turns each newline into CRLF on
+  // Windows; strip the CR so the printed records compare equal on every host.
+  const CR = String.fromCharCode(13);
 
-  // (1) Behaviour. The preamble alone does not link: it forward-declares helpers
-  // that the generated C defines (as_v_is_class, as_class_fqn_of_ptr, ...). The
-  // driver below calls none of them, so the link runs with -undefined
-  // dynamic_lookup — the point of this test is as_cap_lang_normalize, not a build.
+  // Fixed inputs. `tags` drives the "language-REGION" normalizer that the entries of
+  // Capabilities.languages go through; `airTags` drives Capabilities.language
+  // itself, where a region survives for Chinese only, AIR's table decides the rest,
+  // and anything outside that table collapses to "xu".
+  const tags = ['zh_CN', 'zh-Hans-CN', 'en_US.UTF-8', 'en', 'zh_CN@currency=CNY', 'sr-Latn-RS'];
+  const want = ['zh-CN', 'zh-CN', 'en-US', 'en', 'zh-CN', 'sr-RS'];
+  const airTags = ['zh_CN', 'zh-Hans-CN', 'zh-Hant-TW', 'zh-HK', 'zh-TW', 'zh', 'en_US.UTF-8',
+    'en', 'de-DE', 'fr', 'nb-NO', 'nn-NO', 'es-419', 'ar-SA', 'sr-Latn-RS'];
+  const airWant = ['zh-CN', 'zh-CN', 'zh-TW', 'zh-TW', 'zh-TW', 'zh-CN', 'en',
+    'en', 'de', 'fr', 'nb', 'xu', 'es', 'xu', 'xu'];
+
+  // (1) Behaviour, compiled from the REAL text: the two helpers are sliced out of
+  // the preamble, so there is no second copy of the rules to drift out of sync.
+  {
+    const from = RUNTIME_PREAMBLE.indexOf('static const char* const as_cap_air_langs[] = {');
+    const upto = RUNTIME_PREAMBLE.indexOf('static const char* as_cap_language(void) {');
+    const sliced = from >= 0 && upto > from ? RUNTIME_PREAMBLE.slice(from, upto) : '';
+    const dir = join(root, 'temp', 'caploc-fmt');
+    mkdirSync(dir, { recursive: true });
+    const fmtC = join(dir, 'fmt.c');
+    // Windows appends .exe to the output of -o <name>.
+    const fmtExe = join(dir, 'fmt' + (process.platform === 'win32' ? '.exe' : ''));
+    const inList = airTags.map((t) => `"${t}"`).join(', ');
+    writeFileSync(fmtC, [
+      '#include <stdio.h>',
+      '#include <string.h>',
+      '#include <stddef.h>',
+      '',
+      sliced,
+      'int main(void) {',
+      `  static const char* in[] = { ${inList} };`,
+      `  for (int i = 0; i < ${airTags.length}; i++) {`,
+      '    char out[32];',
+      '    const char* got = as_cap_language_from_tag(in[i], out, sizeof(out));',
+      '    printf("%s %s", in[i], got);',
+      '    fputc(10, stdout);',
+      '  }',
+      '  return 0;',
+      '}',
+      '',
+    ].join(LF));
+    let fOut = '';
+    let fErr = '';
+    try {
+      execFileSync('cc', ['-O1', '-w', fmtC, '-o', fmtExe], { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS });
+      fOut = execFileSync(fmtExe, [], { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS }).toString().split(CR).join('');
+    } catch (e) {
+      fErr = String((e as { stderr?: Buffer }).stderr ?? e).split(LF).slice(0, 3).join(' | ');
+    }
+    const gotLines = fOut.trim() === '' ? [] : fOut.trim().split(LF);
+    check(`the language formatter compiles and runs on this host${fErr ? ` -- ${fErr}` : ''}`,
+      fErr === '' && gotLines.length === airTags.length);
+    for (let i = 0; i < airTags.length; i++) {
+      const line = gotLines[i] ?? '';
+      check(`language("${airTags[i]}") == "${airWant[i]}" (${line})`,
+        line === `${airTags[i]} ${airWant[i]}`);
+    }
+  }
+
+  // (2) The host wiring end to end, plus the normalizer that the list entries go
+  // through. Needs CoreFoundation, so it runs on darwin (where CI runs). The
+  // preamble alone does not link: it forward-declares helpers that the generated C
+  // defines (as_v_is_class, as_class_fqn_of_ptr, ...), so the link runs with
+  // -undefined dynamic_lookup — the driver calls only helpers that resolve, and what
+  // is pinned here is the host VALUE, not a build.
   if (process.platform === 'darwin') {
-    const tags = ['zh_CN', 'zh-Hans-CN', 'en_US.UTF-8', 'en', 'zh_CN@currency=CNY', 'sr-Latn-RS'];
-    const want = ['zh-CN', 'zh-CN', 'en-US', 'en', 'zh-CN', 'sr-RS'];
     const scratch = join(root, 'temp', 'caploc-unit');
     mkdirSync(scratch, { recursive: true });
-    const cfile = join(scratch, 'norm.c');
-    const exe = join(scratch, 'norm');
+    const hostC = join(scratch, 'norm.c');
+    const hostExe = join(scratch, 'norm' + (process.platform === 'win32' ? '.exe' : ''));
     const list = tags.map((t) => `"${t}"`).join(', ');
-    writeFileSync(cfile, RUNTIME_PREAMBLE + [
+    writeFileSync(hostC, RUNTIME_PREAMBLE + [
+      'static void caploc_line(const char* prefix, const char* value) {',
+      '  printf("%s %s", prefix, value);',
+      '  fputc(10, stdout);',
+      '}',
       'int main(void) {',
       `  static const char* tags[] = { ${list} };`,
       `  for (int i = 0; i < ${tags.length}; i++) {`,
       '    char out[32];',
       '    as_cap_lang_normalize(tags[i], out, sizeof(out));',
-      '    printf("%s\\n", out);',
+      '    caploc_line("N", out);',
       '  }',
-      '  // The AIR invariant: languages[0] is the same tag as language.',
+      '  // language vs languages[0]: AIR documents that the two "generally" share the',
+      '  // PRIMARY language, NOT that they are equal (an en-US host reports "en" for',
+      '  // language and "en-US" for languages[0], so same= is reported but not pinned).',
       '  {',
       '    as_array* ls = as_cap_languages();',
+      '    const char* lang = as_cap_language();',
       '    const char* first = (ls->length > 0) ? (const char*)as_v_obj_val(ls->data[0]) : NULL;',
-      '    printf("lang=%s first=%s same=%d n=%d\\n",',
-      '      as_cap_language(), first != NULL ? first : "",',
-      '      (first != NULL && strcmp(first, as_cap_language()) == 0) ? 1 : 0, (int)ls->length);',
+      '    size_t n = strlen(lang);',
+      '    size_t m = (first != NULL) ? strlen(first) : 0;',
+      '    size_t p = 0;',
+      '    int same = (first != NULL && strcmp(first, lang) == 0) ? 1 : 0;',
+      '    int prim = 0;',
+      '    while (p < n && lang[p] != 45) p++;',
+      '    if (first != NULL) {',
+      '      if (strcmp(lang, "xu") == 0) prim = 1;',
+      '      else if (m >= p && strncmp(lang, first, p) == 0 && (m == p || first[p] == 45)) prim = 1;',
+      '    }',
+      '    printf("L lang=%s first=%s same=%d prim=%d n=%d", lang, first != NULL ? first : "", same, prim, (int)ls->length);',
+      '    fputc(10, stdout);',
       '  }',
       '  return 0;',
       '}',
       '',
-    ].join('\n'));
+    ].join(LF));
     let out = '';
     let err = '';
     try {
-      execFileSync('cc', ['-O1', '-w', cfile, '-o', exe, '-lm', '-lz',
+      execFileSync('cc', ['-O1', '-w', hostC, '-o', hostExe, '-lm', '-lz',
         '-framework', 'CoreFoundation', '-Wl,-undefined,dynamic_lookup'],
         { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS });
-      out = execFileSync(exe, [], { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS }).toString();
+      out = execFileSync(hostExe, [], { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS }).toString().split(CR).join('');
     } catch (e) {
-      err = String((e as { stderr?: Buffer }).stderr ?? e).split('\n').slice(0, 3).join(' | ');
+      err = String((e as { stderr?: Buffer }).stderr ?? e).split(LF).slice(0, 3).join(' | ');
     }
-    const lines = out.trim() === '' ? [] : out.trim().split('\n');
-    check(`the locale probe builds and runs${err ? ` -- ${err}` : ''}`, err === '' && lines.length === tags.length + 1);
+    const lines = out.trim() === '' ? [] : out.trim().split(LF);
+    const gotNorm = lines.filter((l) => l.startsWith('N ')).map((l) => l.slice(2));
+    const tail = lines.find((l) => l.startsWith('L ')) ?? '';
+    check(`the host probe builds and runs${err ? ` -- ${err}` : ''}`,
+      err === '' && gotNorm.length === tags.length && tail !== '');
     for (let i = 0; i < tags.length; i++) {
-      check(`normalize("${tags[i]}") == "${want[i]}"`, lines[i] === want[i]);
+      check(`normalize("${tags[i]}") == "${want[i]}"`, gotNorm[i] === want[i]);
     }
-    const tail = lines[tags.length] ?? '';
-    check(`the system tag is a language-REGION tag: ${tail}`, /^lang=[a-z]{2}(-[A-Z0-9]{2,3})? first=/.test(tail));
-    check(`Capabilities.languages[0] == Capabilities.language: ${tail}`, tail.includes('same=1') && !tail.includes('n=0'));
+    check(`the host value is xx / zh-CN / zh-TW / xu shaped: ${tail}`,
+      /^L lang=([a-z]{2}|zh-(CN|TW)|xu) first=/.test(tail));
+    check(`language and languages[0] agree on the primary language: ${tail}`,
+      tail.includes('prim=1') && !tail.includes('n=0'));
   } else {
-    console.log('SKIP  [capabilities] the locale probe needs macOS (CoreFoundation)');
+    console.log('SKIP  [capabilities] the host-value probe needs macOS (CoreFoundation)');
   }
 
   // (2) Wiring. `language`/`languages` must be resolved to the runtime helpers, and
@@ -1128,14 +1318,32 @@ function checkCapabilitiesLocale(): string[] {
   check('language reads CFLocaleCopyCurrent() before ever consulting LANG',
     langBody.indexOf('CFLocaleCopyCurrent()') >= 0
     && langBody.indexOf('CFLocaleCopyCurrent()') < langBody.indexOf('getenv("LANG")'));
-  check('language still falls back to the process locale and then "en"',
-    langBody.includes('getenv("LANG")') && langBody.includes('return "en";'));
   const normBody = (() => {
     const i = pre.indexOf('static void as_cap_lang_normalize(const char* tag, char* out, size_t cap) {');
     return i < 0 ? '' : pre.slice(i, pre.indexOf('\n}', i));
   })();
   check('the normalizer detects a region subtag as 2 letters or 3 digits',
     normBody.includes("if (len == 2 || (len == 3 && start[0] >= '0' && start[0] <= '9')) {"));
+
+  // (3) The Windows half: `language` is the UI language (the reference: "On Microsoft
+  // Windows systems, this property returns the user interface (UI) language"), and
+  // the list is the OS preferred-UI-language list. The process locale is only the
+  // last resort, tried after both platform sources.
+  check('on Windows language comes from the UI language, never from LANG',
+    langBody.includes('#if defined(_WIN32)')
+    && langBody.indexOf('GetUserDefaultUILanguage') > langBody.indexOf('#if defined(_WIN32)')
+    && langBody.indexOf('getenv("LANG")') > langBody.indexOf('GetUserDefaultUILanguage'));
+  check('the Windows value is rebuilt from the ISO 639-1 name plus the ISO 3166 region',
+    langBody.includes('LOCALE_SISO639LANGNAME') && langBody.includes('LOCALE_SISO3166CTRYNAME'));
+  check('the Windows list comes from GetUserPreferredUILanguages',
+    pre.includes('GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &cnt, wbuf, &cap)'));
+  check('language is a closed set: AIR own table is spelled out',
+    pre.includes('"cs", "da", "nl", "en", "fi", "fr", "de", "hu", "it", "ja", "ko", "nb",')
+    && pre.includes('"pl", "pt", "ru", "es", "sv", "tr", NULL'));
+  check('Chinese keeps a region, and it is the only language that does',
+    pre.includes('strcmp(lang, "zh") == 0') && pre.includes('"zh-TW" : "zh-CN"'));
+  check('a language outside the table reports xu',
+    pre.includes('return "xu";') && pre.includes('as_cap_air_langs[i] != NULL'));
 
   // The runtime's CoreFoundation calls have to be resolved by the link, and only
   // where the declarations exist (darwin native). Missing it is a link error the
@@ -1225,6 +1433,147 @@ function checkDrawableReadable(): string[] {
   return bad;
 }
 
+// Display metrics: AIR mixes two display spaces in one run, and both have to be ITS
+// space. Measured on this box (3840x2560 desktop, 150% scaling, adl 51.4.1):
+//   Stage.fullScreenWidth/Height        2560x1707   <- logical points (DIP)
+//   Capabilities.screenResolutionX/Y    2560x1707   <- logical points (DIP)
+//   flash.display.Screen.mainScreen.bounds 3840x2560 <- physical pixels
+//   Capabilities.screenDPI              96          <- a platform baseline
+// (SDL's own DisplayDPI answers 144, and its DisplayMode answers 3840x2560.) Using the
+// DISPLAY MODE for fullScreen* is what made a Stage3D app that sizes its viewport from
+// it (examples/air-starling-demo -> Starling's projection) diverge from adl on Windows
+// while macOS -- where both queries agree -- matched: the fix is a different QUERY
+// (SDL_GetDisplayBounds, DIP-aware), not a divide, because the numbers alone cannot
+// tell the two spaces apart at 100% scaling.
+function checkDisplayMetrics(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [displaymetrics] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [displaymetrics] ${label}`); }
+  };
+
+  const readSrc = (rel: string): string =>
+    readFileSync(join(root, rel), 'utf8').replace(/\r\n/g, '\n');
+  const glue = readSrc('vendor/window_glue.cc');
+  const runtime = readSrc('src/runtime.ts');
+  const emit = readSrc('src/emit.ts');
+  const bodyOfIn = (src: string, sig: string): string => {
+    const i = src.indexOf(sig);
+    if (i < 0) return '';
+    const m = /\r?\n\}\r?\n/.exec(src.slice(i));
+    return m == null ? '' : src.slice(i, i + m.index);
+  };
+
+  // The query, not just the number: SDL_GetDisplayBounds is DIP-aware once
+  // SDL_HINT_WINDOWS_DPI_SCALING is set, SDL_GetCurrentDisplayMode is not.
+  const size = bodyOfIn(glue, 'int sk_window_get_display_size(');
+  check('the fullScreen*/screenResolution* query is the DIP-aware one',
+    size !== '' && /SDL_GetDisplayBounds\(0, &r\)/.test(size)
+    && !/SDL_GetCurrentDisplayMode/.test(size.replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')));
+  check('the DIP-vs-pixels rationale is written down where it bit',
+    glue.includes('SDL_GetDisplayBounds is DIP-aware') && glue.includes('150% scaling')
+    && glue.includes('matching adl value for'));
+
+  // screenDPI is a platform baseline, explicitly NOT the panel's DPI.
+  const dpi = bodyOfIn(runtime, 'static double as_cap_screen_dpi(');
+  check('Capabilities.screenDPI is a platform baseline (96 on Windows, 72 elsewhere)',
+    /#ifdef _WIN32[\s\S]*?return 96\.0;[\s\S]*?#else[\s\S]*?return 72\.0;[\s\S]*?#endif/.test(dpi));
+  check('...and the rationale names the trap (SDL_GetDisplayDPI answers 144)',
+    /SDL_GetDisplayDPI answers 144/.test(runtime.slice(runtime.indexOf('as_cap_screen_dpi') - 700,
+      runtime.indexOf('static double as_cap_screen_dpi('))));
+
+  // One seam for all four accessors: changing the query changes Stage and Capabilities
+  // together, which is what keeps the two from drifting apart.
+  check('Stage.fullScreenWidth/Height read the same seam',
+    (emit.match(/Stage_get_fullScreenWidth\(void\* _this\) \{ \(void\)_this; int w = 0, h = 0; as_window_get_display_size\(&w, &h\); return \(unsigned int\)w; \}/g) || []).length === 1
+    && (emit.match(/as_window_get_display_size\(&w, &h\)/g) || []).length === 2);
+  check('Capabilities.screenResolutionX/Y read the same seam',
+    (runtime.match(/as_window_get_display_size\(&w, &h\)/g) || []).length === 2);
+
+  // The remaining half is a KNOWN divergence, so it has to be written down in both
+  // places rather than look like an oversight.
+  check('the Screen.bounds physical-pixel divergence is registered at the code site and in TODO.md',
+    glue.includes('SPACE NOTE (open divergence') && readSrc('TODO.md').includes('sk_display_pixel_bounds'));
+
+  console.log(`     [displaymetrics] ${ok} check(s) passed`);
+  return bad;
+}
+
+// ---- Capabilities.os (阶段一百八十七) ----
+// AIR reports an OS *name plus version* here — "Windows 11", "Windows Server 2012 R2" —
+// and apps read the version back out of it: a device-info field does
+// `Capabilities.os.split(" ")[1]`, and the same string is hashed into a device
+// fingerprint. Returning the bare family name "Windows" silently blanked that field and
+// changed the fingerprint; it is also what made an extension's
+// `Capabilities.os.search('Windows') > -1` gate false under AOT while it was true under
+// adl (the gate used to read `manufacturer`, which is deliberately "AS-AOT").
+//
+// The Windows mapping is AIR 51.4.1's OWN table, recovered from `Adobe AIR.dll` (the
+// VerifyVersionInfoW chain feeding its string pool, plus its build-22000 promotion and
+// its wProductType server split). AIR asks VerifyVersionInfoW, which is subject to the
+// manifest version lie — an app without a supportedOS manifest is told 6.2 on Windows
+// 8.1+ — so the runtime reads the true version from ntdll's RtlGetVersion instead and
+// feeds that same table. What is pinned here are the invariants that no AS-level example
+// can see; the behaviour itself is pinned end to end by examples/stage65.as, which runs
+// the real compiled binary on both Windows and macOS (§2.7).
+function checkCapabilitiesOs(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [capos] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [capos] ${label}`); }
+  };
+
+  const from = RUNTIME_PREAMBLE.indexOf('static const char* as_win_os_name(');
+  const upto = RUNTIME_PREAMBLE.indexOf('static const char* as_cap_os(void) {');
+  const map = from >= 0 && upto > from ? RUNTIME_PREAMBLE.slice(from, upto) : '';
+
+  // Every name AIR can answer on Windows must survive edits to the table. Dropping any of
+  // them turns a real OS into the "Windows" fallback, which is the silent-degradation
+  // shape this whole change exists to remove.
+  const names = [
+    'Windows 11 Server', 'Windows 11', 'Windows 10 Server', 'Windows 10',
+    'Windows Server 2012 R2', 'Windows 8.1', 'Windows Server 2012', 'Windows 8',
+    'Windows 7', 'Windows Server 2008 R2', 'Windows Vista', 'Windows Server 2008',
+    'Windows Server 2003 R2', 'Windows Server 2003', 'Windows Home Server',
+    'Windows XP 64', 'Windows XP', 'Windows 2000',
+  ];
+  const missing = names.filter((n) => !map.includes(`"${n}"`));
+  check(`the mapping carries every name AIR can answer on Windows (${names.length} of them)`,
+    map !== '' && missing.length === 0);
+  if (missing.length > 0) console.log(`       missing: ${missing.join(', ')}`);
+
+  // Windows 11 is 10.0 with build >= 22000 — not a separate major version. Getting this
+  // wrong reports "Windows 10" on every Windows 11 machine, which is exactly the kind of
+  // wrong-but-plausible value that goes unnoticed.
+  check('Windows 11 is derived from the build number (>= 22000), not from major == 11',
+    /major == 10 && minor == 0/.test(map) && /build >= 22000/.test(map));
+
+  // Server SKUs differ only by wProductType (1 == VER_NT_WORKSTATION).
+  check('the server/workstation split keys on wProductType, like AIR',
+    /wProductType != 1/.test(RUNTIME_PREAMBLE) && /server \?/.test(map));
+
+  // Load-bearing: this helper is compiled into EVERY build, including headless ones,
+  // which do not link user32. A static GetSystemMetrics import therefore breaks those
+  // links outright (measured: `lld-link: error: undefined symbol: GetSystemMetrics`),
+  // so the SM_SERVERR2 probe has to go through GetProcAddress.
+  check('as_cap_os adds no user32 dependency (headless builds do not link it)',
+    !/\bGetSystemMetrics\s*\(/.test(map) && /GetProcAddress\(user32, "GetSystemMetrics"\)/.test(map));
+  check('...and RtlGetVersion is resolved dynamically too, so no import library is added',
+    /GetProcAddress\(ntdll, "RtlGetVersion"\)/.test(RUNTIME_PREAMBLE));
+
+  // The two facts a future editor would otherwise "fix" the wrong way.
+  check('the comment names the manifest version lie that forces RtlGetVersion',
+    /manifest version lie/.test(RUNTIME_PREAMBLE) && /supportedOS/.test(RUNTIME_PREAMBLE));
+  check('...and states that macOS/Linux still report the bare family name',
+    /macOS\/Linux\/WASI still report the bare family name/.test(RUNTIME_PREAMBLE));
+
+  console.log(`     [capos] ${ok} check(s) passed`);
+  return bad;
+}
+
 registerGroup('unit: platform/DrawableReadable', checkDrawableReadable);
 registerGroup('unit: platform/AudioWiring', checkAudioWiring);
 registerGroup('unit: platform/Screen', checkScreen);
@@ -1235,3 +1584,288 @@ registerGroup('unit: platform/PresentScale', checkPresentScale);
 registerGroup('unit: platform/NullRef', checkNullRef);
 registerGroup('unit: platform/Intervals', checkIntervals);
 registerGroup('unit: platform/CapabilitiesLocale', checkCapabilitiesLocale);
+registerGroup('unit: platform/DisplayMetrics', checkDisplayMetrics);
+// ---- NativeWindow/NativeApplication window-table surface (阶段一百九十) ----
+// Every member in this group answers from ONE source of truth: the runtime's
+// window table (ASC_wins). AIR keeps openedWindows, stage.nativeWindow and the
+// application's exit bookkeeping in the same place, and the failure mode of
+// keeping a second copy is an Array whose elements are not the very window
+// objects the rest of the program holds. So these pins are about derivation and
+// identity, not about the getters merely being present.
+//
+// Oracle: adl 51.4.1, temp/nwor/adl-oracle.txt -- openedWindows is an Array
+// (cls=Array, not Vector) whose element n is identity-equal to that window's
+// stage.nativeWindow, its length going 1 -> 2 -> 1 across a new and a close;
+// orderInFrontOf/orderInBackOf answer true; globalToScreen(0,0) is the bounds
+// frame origin plus the non-client border inset (measured bounds (26,26) with
+// borders (8,31) -> (34,57)); NativeWindow.menu is null.
+function checkNativeWindowSurface(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [win-surface] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [win-surface] ${label}`); }
+  };
+
+  // A program that touches every member of the group, so nothing here is pinned
+  // on a class the emitter had no reason to emit.
+  const c = generateC(parse(
+    'import flash.display.NativeWindow;\n' +
+    'import flash.display.NativeWindowInitOptions;\n' +
+    'import flash.display.Stage;\n' +
+    'import flash.desktop.NativeApplication;\n' +
+    'import flash.events.NativeWindowDisplayStateEvent;\n' +
+    'import flash.geom.Point;\n' +
+    'var stage:Stage = new Stage();\n' +
+    'var app:NativeApplication = NativeApplication.nativeApplication;\n' +
+    'var w:NativeWindow = new NativeWindow(new NativeWindowInitOptions());\n' +
+    'var arr:* = app.openedWindows;\n' +
+    'var n:int = arr.length;\n' +
+    'var m:* = w.menu;\n' +
+    'var f1:Boolean = w.orderInFrontOf(w);\n' +
+    'var f2:Boolean = w.orderInBackOf(null);\n' +
+    'var pt:Point = w.globalToScreen(new Point(0, 0));\n' +
+    'var ds:String = NativeWindowDisplayStateEvent.CHANGE;\n' +
+    'var ds2:String = NativeWindowDisplayStateEvent.NORMAL;\n' +
+    'app.exit();\n'
+  )).c;
+  const preamble = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
+
+  const body = (sig: string): string => {
+    const i = c.indexOf(sig);
+    return i < 0 ? '' : c.slice(i, c.indexOf('\n}', i) + 2);
+  };
+  const glueBody = (sig: string): string => {
+    const i = glue.indexOf(sig);
+    return i < 0 ? '' : glue.slice(i, glue.indexOf('\n}', i) + 2);
+  };
+
+  // (1) openedWindows is a VIEW of the window table. A separate list would drift
+  // as soon as a window is retired, and fresh wrappers instead of the cached ones
+  // would make `app.openedWindows[0] === stage.nativeWindow` false -- adl says true.
+  check('openedWindows is emitted as an Array getter (AIR: cls=Array, not Vector)',
+    c.includes('as_array* NativeApplication_get_openedWindows(void* _this)')
+    && c.includes('{ "openedWindows", NativeApplication_get_openedWindows__dyn, 0, "Array" }'));
+  const ow = body('static as_array* as_win_opened_windows(void) {');
+  check('...derived by walking the live window table, not a parallel list',
+    ow.includes('as_array_new()') && ow.includes('ASC_MAX_WINDOWS')
+    && ow.includes('ASC_w(i)') && ow.includes('w->stage == NULL || w->closed')
+    && ow.includes('as_win_wrapper(i)'));
+  check('...and its elements are the cached wrappers, so an element IS stage.nativeWindow',
+    c.includes('static NativeWindow* as_win_wrapper(int id);')
+    && body('static NativeWindow* as_win_wrapper(int id) {').includes('w->window = (void*)nw;'));
+
+  // (2) exit() has to reach the GLUE. Ending the app is the window backend's job
+  // (the SDL_QUIT-equivalent teardown), so the CLOSE dispatches and their order
+  // stay the ones a user-initiated close produces; a compiler-side "return from
+  // main" would skip every CLOSE handler.
+  check('NativeApplication.exit() is emitted and routed to the window backend',
+    c.includes('void NativeApplication_exit(void* _this)')
+    && c.includes('{ "exit", NativeApplication_exit__dyn, 0, "void" }')
+    && body('static void NativeApplication_exit(void* _this) {').includes('as_window_request_exit()')
+    && preamble.includes('sk_window_request_exit();'));
+  check('...and the glue turns that request into a normal window retire, not a hard exit',
+    glueBody('void sk_window_request_exit(void) {').includes('g_exit_requested = 1;')
+    && glue.includes('if (g_exit_requested) {')
+    && glue.includes('destroy_pending = 1;'));
+
+  // (3) menu answers AIR's null rather than inventing an object: this runtime has
+  // no NativeMenu subsystem. The C return type has to stay Object* -- that is
+  // AIR's declared type, and the prototype/signature mismatch is a link error.
+  check('NativeWindow.menu is declared Object and answers null (no NativeMenu subsystem)',
+    c.includes('static Object* NativeWindow_get_menu(void* _this);')
+    && body('static Object* NativeWindow_get_menu(void* _this) {').includes('return NULL;')
+    && c.includes('{ "menu", NativeWindow_get_menu__dyn, 0, "Object" }'));
+
+  // (4) The z-order pair reports true for a live OTHER window (adl), and a null /
+  // self / retired target is a no-op that must not be reported as success.
+  const front = body('bool NativeWindow_orderInFrontOf(void* _this, NativeWindow* window) {');
+  const back = body('bool NativeWindow_orderInBackOf(void* _this, NativeWindow* window) {');
+  check('orderInFrontOf/orderInBackOf perform the existing z-order move and return true',
+    front.includes('as_window_order_front(me);') && front.includes('return true;')
+    && back.includes('as_window_order_back(me);') && back.includes('return true;'));
+  check('...but reject a null, self, or retired target instead of reporting success',
+    [front, back].every((b) => b.includes('if (window == NULL) return false;')
+      && b.includes('int me = ((NativeWindow*)_this)->_win;')
+      && b.includes('if (window->_win == me) return false;')
+      && b.includes('o->stage == NULL || o->closed) return false;')));
+
+  // (5) globalToScreen counts from the CLIENT area's top-left, so the frame border
+  // is added back to the (frame-rect) bounds origin: adl's (26,26) with borders
+  // (8,31) became (34,57). Using the bounds origin alone is off by exactly the
+  // title bar and the left frame.
+  const g2s = body('Point* NativeWindow_globalToScreen(void* _this, Point* point) {');
+  check('globalToScreen adds the non-client border to the bounds origin',
+    g2s.includes('as_window_get_bounds(id, &x, &y, &w, &h);')
+    && g2s.includes('as_window_get_borders(id, &bt, &bl, &bb, &br);')
+    && g2s.includes('Point_new((double)(x + bl) + point->x, (double)(y + bt) + point->y)')
+    && g2s.includes('if (point == NULL) return NULL;'));
+
+  // (6) The event class exists with the measured constant strings, so a listener
+  // written against AIR compiles and compares equal. The state constants mirror
+  // NativeWindowDisplayState's three values.
+  check('NativeWindowDisplayStateEvent carries AIR\'s measured constants',
+    c.includes('static char* const NativeWindowDisplayStateEvent_CHANGE = "displayStateChange";')
+    && c.includes('static char* const NativeWindowDisplayStateEvent_CHANGING = "displayStateChanging";')
+    && c.includes('static char* const NativeWindowDisplayStateEvent_NORMAL = "normal";')
+    && c.includes('static char* const NativeWindowDisplayStateEvent_MINIMIZED = "minimized";')
+    && c.includes('static char* const NativeWindowDisplayStateEvent_MAXIMIZED = "maximized";'));
+  check('...and the class carries AIR\'s before/afterDisplayState pair',
+    c.includes('"beforeDisplayState"') && c.includes('"afterDisplayState"')
+    && c.includes('{ "clone", NativeWindowDisplayStateEvent_clone__dyn, 0, "flash.events::Event" }'));
+
+  // (7) The two new glue entry points sit behind the window seam, so a headless /
+  // browser build (ASC_USE_WINDOW undefined) still links: the wrappers degrade to
+  // no-ops instead of pulling SDL in.
+  check('the new glue calls are inside the ASC_USE_WINDOW seam (headless stays link-clean)',
+    /as_window_get_borders\(int id, int\* top, int\* left, int\* bottom, int\* right\) \{\n#ifdef ASC_USE_WINDOW\n    sk_window_get_borders\(id, top, left, bottom, right\);\n#else\n    \(void\)id; if \(top\) \*top = 0;/.test(preamble)
+    && /as_window_request_exit\(void\) \{\n#ifdef ASC_USE_WINDOW\n    sk_window_request_exit\(\);\n#endif/.test(preamble));
+  // The seam has TWO branches, and a wrapper present only in the ASC_USE_WINDOW
+  // one compiles everywhere EXCEPT the headless build -- which is exactly how
+  // these two first landed (air-native's dir unit: "call to undeclared function
+  // 'as_window_request_exit'"). Both entry points need the no-window branch too.
+  check('...and the headless branch declares them as well (stub out both, not just the real one)',
+    /as_window_get_borders\(int id, int\* top, int\* left, int\* bottom, int\* right\) \{ \(void\)id; if \(top\) \*top = 0;/.test(preamble)
+    && /as_window_request_exit\(void\) \{ \}/.test(preamble));
+
+  console.log(`     [win-surface] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/WindowSurface', checkNativeWindowSurface);
+registerGroup('unit: platform/CapabilitiesOs', checkCapabilitiesOs);
+
+// Windows per-character font fallback. GDI's manager has no system cascade at all:
+// SkFontMgrGDI::onMatchFamilyStyleCharacter is an unconditional `return nullptr`
+// (src/ports/SkFontHost_win.cpp ~2267), while SkParagraph asks the manager for a
+// fallback face for EVERY code point the run's own face does not map. A family GDI
+// cannot match therefore renders as a whole field of .notdef boxes -- not a stray
+// glyph: measured on the host app, the AI-subtitle window's tag-37 field whose SWC
+// family is "微软雅黑" (an en-US UI locale exposes that family to GDI only as
+// "Microsoft YaHei") drew 创建同传 as four .notdef glyphs, which is the garble the
+// user reported. temp/fntface reproduces it headlessly: the 微软雅黑 row and a
+// deliberately bogus family drew the same .notdef for the same text.
+//
+// The fix is deliberately NOT a DirectWrite swap and NOT SkOrderedFontMgr: an ordered
+// manager lets DirectWrite answer the STRUCTURED (family/style) queries as well, and a
+// DirectWrite typeface then reaches SkParagraph's structured path -- the one our AIR
+// strut / height-override machinery drives -- which measured textHeight -Infinity with
+// that row painting nothing at all. GDI therefore stays primary for every query but
+// the character one.
+function checkFontFallback(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [fontfallback] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [fontfallback] ${label}`); }
+  };
+
+  // The glue is CRLF in a Windows checkout; normalise before matching. Prose matters
+  // here (the rationale names the Windows API entry points), so keep a raw copy.
+  const read = (rel: string): string =>
+    readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const raw = read('skia_glue.cc');
+  const glue = strip(raw);
+
+  const win = glue.indexOf('#elif defined(_WIN32)');
+  const cls = glue.indexOf('class SkAirFontMgr : public SkFontMgr {');
+  const clsEnd = cls < 0 ? -1 : glue.indexOf('\n};', cls);
+  const mb = cls >= 0 && clsEnd > cls ? glue.slice(cls, clsEnd) : '';
+  const ovBody = (sig: string): string => {
+    const i = mb.indexOf(sig);
+    if (i < 0) return '';
+    const j = mb.indexOf('\n  }', i);
+    return mb.slice(i, j < 0 ? mb.length : j);
+  };
+
+  // (1) The manager is a two-tier wrapper, primary first.
+  check('the Windows font manager is a primary + fallback wrapper',
+    cls > win && win > 0 &&
+    mb.includes('SkAirFontMgr(sk_sp<SkFontMgr> primary, sk_sp<SkFontMgr> fallback)') &&
+    mb.includes(': fPrimary(std::move(primary)), fFallback(std::move(fallback)) {}') &&
+    mb.includes('sk_sp<SkFontMgr> fPrimary;') && mb.includes('sk_sp<SkFontMgr> fFallback;'));
+
+  // (2) Exactly ONE query crosses to the fallback tier: the per-character one. This is
+  // the whole point of not using an ordered manager -- every name/style answer, and so
+  // every face that resolves today, must be GDI's.
+  const charSig = 'sk_sp<SkTypeface> onMatchFamilyStyleCharacter(const char familyName[], const SkFontStyle& style,';
+  const charBody = ovBody(charSig);
+  check('the fallback tier is reached from exactly one place: the character query',
+    charBody !== '' && (mb.match(/fFallback->/g) ?? []).length === 1 &&
+    (charBody.match(/fFallback->/g) ?? []).length === 1 &&
+    charBody.includes('fFallback->matchFamilyStyleCharacter(familyName, style, bcp47, bcp47Count, character);'));
+  check('...and only after the primary tier declines (primary first, then fallback)',
+    charBody.includes('if (auto tf = fPrimary->matchFamilyStyleCharacter(familyName, style, bcp47, bcp47Count,') &&
+    charBody.includes('character)) {') && charBody.includes('return tf;') &&
+    charBody.indexOf('fPrimary->') < charBody.indexOf('fFallback->'));
+
+  // (3) Every other override -- all 10 of SkFontMgr's remaining pure virtuals -- goes to
+  // the primary untouched, so no family that resolves today can change face.
+  const primarySigs: string[] = [
+    'int onCountFamilies() const override {',
+    'void onGetFamilyName(int index, SkString* familyName) const override {',
+    'sk_sp<SkFontStyleSet> onCreateStyleSet(int index) const override {',
+    'sk_sp<SkFontStyleSet> onMatchFamily(const char familyName[]) const override {',
+    'sk_sp<SkTypeface> onMatchFamilyStyle(const char familyName[],',
+    'sk_sp<SkTypeface> onMakeFromData(sk_sp<SkData> data, int ttcIndex) const override {',
+    'sk_sp<SkTypeface> onMakeFromStreamIndex(std::unique_ptr<SkStreamAsset> stream,',
+    'sk_sp<SkTypeface> onMakeFromStreamArgs(std::unique_ptr<SkStreamAsset> stream,',
+    'sk_sp<SkTypeface> onMakeFromFile(const char path[], int ttcIndex) const override {',
+    'sk_sp<SkTypeface> onLegacyMakeTypeface(const char familyName[],',
+  ];
+  check('all 10 remaining queries delegate to the primary tier, untouched',
+    primarySigs.every((s) => ovBody(s).includes('fPrimary->')) &&
+    // 10 delegations plus the character override's own primary-first query
+    (mb.match(/fPrimary->/g) ?? []).length === primarySigs.length + 1 &&
+    primarySigs.every((s) => !ovBody(s).includes('fFallback')));
+
+  // (4) On Windows the two tiers are GDI (naming) + DirectWrite (character fallback),
+  // and a machine where either factory fails still gets the old single-tier manager
+  // rather than a null manager.
+  const fac = glue.slice(cls, glue.indexOf('#else\nstatic sk_sp<SkFontMgr> sk_platform_fontmgr()'));
+  check('the Windows factory builds GDI + DirectWrite and degrades to GDI alone',
+    fac.includes('sk_sp<SkFontMgr> gdi = SkFontMgr_New_GDI();') &&
+    fac.includes('sk_sp<SkFontMgr> dw = SkFontMgr_New_DirectWrite();') &&
+    fac.includes('if (!gdi || !dw) return gdi ? gdi : dw;') &&
+    fac.includes('return sk_sp<SkFontMgr>(new SkAirFontMgr(std::move(gdi), std::move(dw)));') &&
+    fac.includes('static sk_sp<SkFontMgr> cached = []() -> sk_sp<SkFontMgr> {'));
+  // The rejected approach must not creep back: an ordered manager would hand the
+  // structured family/style queries to DirectWrite too.
+  check('the ordered-manager approach is not used',
+    !glue.includes('SkOrderedFontMgr') && !raw.includes('SkOrderedFontMgr.h'));
+
+  // (5) Windows-only: the macOS branch stays the cached CoreText manager.
+  const apple = glue.slice(glue.indexOf('#else\nstatic sk_sp<SkFontMgr> sk_platform_fontmgr()'));
+  check('the two-tier manager is Windows-only; macOS keeps CoreText',
+    win > glue.indexOf('#ifdef __EMSCRIPTEN__') && cls > win &&
+    apple.startsWith('#else\nstatic sk_sp<SkFontMgr> sk_platform_fontmgr() {\n  static sk_sp<SkFontMgr> cached = SkFontMgr_New_CoreText(nullptr);\n  return cached;\n}') &&
+    !apple.slice(0, 400).includes('SkAirFontMgr'));
+
+  // (6) The rationale has to stay written down next to the class: WHY GDI alone cannot
+  // render the field, why the fallback is confined to the character query, and that
+  // DirectWrite costs no link dependency (Skia reaches it through LoadLibraryW).
+  check('the rationale is documented next to the class',
+    raw.includes('onMatchFamilyStyleCharacter to an unconditional') &&
+    raw.includes('SkFontHost_win.cpp') && raw.includes('.notdef') &&
+    // the diagnosis line and the measurement line are separate evidence, so pin both
+    raw.includes('"微软雅黑", which an en-US UI locale exposes only as') &&
+    raw.includes('the 微软雅黑 row and the') &&
+    raw.includes('MapCharacters') &&
+    raw.includes('LoadLibraryW("dwrite.dll")') && raw.includes('SkDWrite.cpp') &&
+    raw.includes('this adds no link dependency to any manifest'));
+
+  // (7) Both doc mirrors carry the finding.
+  const zh = readFileSync(join(root, 'docs', 'zh-cn', 'skia.md'), 'utf8');
+  const en = readFileSync(join(root, 'docs', 'en', 'skia.md'), 'utf8');
+  check('the Windows fallback tier is documented in skia.md (zh + en)',
+    zh.includes('SkAirFontMgr') && zh.includes('Microsoft YaHei') && en.includes('SkAirFontMgr')
+    && en.includes('Microsoft YaHei'));
+
+  console.log(`     [font-fallback] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/FontFallback', checkFontFallback);

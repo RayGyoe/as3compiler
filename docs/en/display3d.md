@@ -622,9 +622,22 @@ hand:
   slot's command allocator; `s3d_batch_end` signals `fenceValues[idx] = ++fenceNext` and advances the slot
   number. Each slot has its own upload heap (UPLOAD heap), so with three frames in flight the CPU writing a
   constant buffer never trips "the buffer is still in use by the previous frame".
-- **One constant buffer per frame slot** (256-aligned, growable, `S3D_CB_BYTES = 16384`), but the CPU
-  **must `s3d_wait_slot` before `memcpy`** — otherwise the CPU may write UPLOAD memory the GPU is still
-  reading (measured; the symptom was constants "skipping a frame").
+- **Constant buffer: regions versioned per draw** (stage one-hundred-seventy-three). **D3D12 reads constants
+  when the GPU executes the command list** (at frame end), while the generated C re-uploads the whole register
+  file before **every** `drawTriangles` ⇒ one constant buffer per frame slot makes every draw in that frame
+  read the matrix uploaded **last**. Measured (`examples/air-starling-demo`): all 12 buttons were transformed
+  by the last button's mvp, and only that last one stayed in place. Metal copies inline with `setVertexBytes`
+  and is **immune by construction** ⇒ this only ever showed up on Windows. Now each upload gets its own 4096 B
+  region (`S3D_CB_REGION` = 256 float4 = the largest cbuffer HLSL can declare, `S3D_CB_BYTES = S3D_CB_REGION * S3D_DRAWS_PER_FRAME`),
+  and a draw binds **the region last uploaded for that stage**
+  (`GetGPUVirtualAddress() + cbOffV/cbOffF`; 4096 alignment is exactly what makes a CBV legal). **The cursor is
+  reset in `s3d_batch_end`, not in `batch_begin`**: a frame's **first** upload happens **before** the batch is
+  opened (the generated C passes constants between the state setting and `drawTriangles`), so resetting at
+  begin wipes the region it just wrote — measured as the **first two draws sharing region 0** (`cbV=0,0,4096,…`),
+  with the background and the logo both vanishing from the picture. Likewise **`s3d_wait_slot` stays inside
+  `s3d_upload_constants`** (the first upload has no `batch_begin` wait protecting it, and the rest are
+  no-ops), otherwise the CPU may write UPLOAD memory the GPU is still reading. When the register file exceeds
+  one region it is **rejected loudly** (`need > S3D_CB_REGION` returns 0 and prints, never truncating).
 - **Deferred-release queue** (`S3DRelease rel[4096]`, each carrying a fence value; `s3d_defer_release` drains
   by `fence->GetCompletedValue()`) — D3D12 has no "command buffer drops its references on release", so every
   replaced resource must wait until the frame that last used it has really finished before `Release()`.
@@ -638,9 +651,12 @@ hand:
 
 D3D12 has no Metal-style encoder that can change state on the fly: `ID3D12PipelineState` is **immutable**, and
 every drawing state must be baked into it. So the cache key is a concatenation of every pipeline-affecting
-field (`srcHash|writeMask|depthWrite|depthCompare|stencil*|dsNeeded|cullMode|blendOn|streamSig`), at most
-`S3D_MAX_PSOVAR = 16` variants per program, `S3D_KEY_CAP 256` global, LRU eviction. This is harder than the
-Metal side (§9.13's DSS cache): `SetPipelineState` is a pure pointer binding, but **building a PSO is
+field (`srcHash|writeMask|depthWrite|depthCompare|stencil*|dsNeeded|cullMode|blendOn|blendSource|blendDest|streamSig`),
+at most `S3D_MAX_PSOVAR = 16` variants per program, `S3D_KEY_CAP 256` global, LRU eviction.
+**The key has to be the *factor pair*, not just *is blending on***: blend factors are baked into the PSO, so
+changing a pair means changing a PSO, and recording only `blendOn` lets the pair a program first used
+(Starling's `normal`) be reused for every mode — symptoms and the settled fix are in §10.6. This is harder
+than the Metal side (§9.13's DSS cache): `SetPipelineState` is a pure pointer binding, but **building a PSO is
 expensive** (it compiles `vs_5_1`/`ps_5_1` bytecode).
 
 ### 10.3 A D3D12 Linkage Rule Only Measurement Could Teach: **Field Declaration Order Is the Register Number**
@@ -689,18 +705,90 @@ so a disabled scissor expands to the whole target rect at draw time and is clipp
   code**; `get_render_target`'s diagnostic line is kept but made **periodic** (`n++ % 120 == 0`), and it was
   exactly that which printed out the dangling-pointer root cause above.
 
+**Also completed (stage one-hundred-seventy-three, 2026-10-16, local machine x86 `--air-app`)**:
+
+- `examples/air-starling-demo` (127 source files + a complete Starling) **now runs on real hardware**: the
+  window opens, resources finish loading, and **26 draws / 246 triangles** (12×9 nine-slice + 12 labels +
+  background/logo/`infoText`, no geometry missing) all land. The **structural** defect fixed along the way is
+  §10.1's "constant region versioned per draw" above (one constant buffer per frame slot ⇒ every draw in a
+  frame read the last mvp uploaded).
+- **Item-by-item comparison against `adl 51.4.1`** (same machine, same 150% scaling; the `adl` side captured
+  the window's client area with `temp/win_shot.ps1`, our side used `ASC_GPU_DUMP`'s presented back buffer):
+  the logo's red-pixel bounding box is **identically `x32..173 y10..196` in client coordinates**, the button
+  pitch is identically **69 px** (= 46 pt × 1.5), and the two button columns' row/column offsets match the 12
+  labels one by one.
+
 **Not accepted (do not claim a wider scope)**:
 
-- `examples/air-starling-demo` **has not been run** on the Windows target — it is the Stage3D project with the
-  widest external-dependency surface (127 source files + a complete Starling), and it is the **key control** for
-  whether this backend is really general.
 - **Back-face culling / winding order**: `FrontCounterClockwise = FALSE` + a positive-height viewport (no Y
   flip) is a **paper inference** (consistent with §"D3D also has row 0 at the top"), with no culling A/B
   measurement. Likewise the DXGI **debug layer** was off this round (the PSO `E_INVALIDARG` was poked out with
   `temp/psoprobe.cc`'s InfoQueue; the product path does not enable it).
-- **Mip-drop / alpha blending / cube maps**: these semantics were ported per §9 one by one and have text-level
-  nails, but they **were not separately re-measured on D3D12** (`shmup-stage3d` covers only 2D sprites +
-  blending + depth-off, a small slice of the combinations).
+- **Mip-drop / cube maps**: these semantics were ported per §9 one by one and have text-level nails, but they
+  **were not separately re-measured on D3D12** (`air-starling-demo` covers `setProgram` switching,
+  depth/stencil, multi-stream `drawTriangles` and the texture atlas, but not cube maps). **Blend factors are
+  now covered**: stage one-hundred-seventy-five compared all six factor pairs against `adl` with the Blend
+  Modes scene (§10.6).
+- `Context3D.drawTriangles`'s `firstIndex` **is ignored** (`(void)firstIndex;`, the index buffer is uploaded
+  whole). Harmless for Starling (it always calls `drawTriangles(ib, 0, n)`), a potential divergence for other
+  Stage3D apps — filed in the legacy table.
+
+### 10.6 Blend modes (`Context3D.setBlendFactors`) alignment: three things have to be right at once (stage one-hundred-seventy-five)
+
+In `examples/air-starling-demo`'s **Blend Modes** scene (`DisplayObject.blendMode` → `BlendMode.activate()` →
+`context.setBlendFactors(sf, df)`) "switching has no effect" is **not** one defect but three stacked on top of
+each other, each of a different kind. Every number below is that one scene compared pixel by pixel against
+`adl 51.4.1` (same machine, same 150% scaling; the `adl` side captured the window's client area, our side the
+client area too):
+
+| Mode (Starling) | Factor pair (sf, df) | Before the fix vs adl | After the fix vs adl |
+|---|---|---|---|
+| normal | one / oneMinusSourceAlpha | 3.69% | 3.70% (control: correct to begin with) |
+| multiply | destinationColor / oneMinusSourceAlpha | 13.68% | 3.54% |
+| screen | one / oneMinusSourceColor | 10.59% | 2.00% |
+| add | one / one | 10.22% | 1.71% |
+| erase | zero / oneMinusSourceAlpha | 13.80% | 1.91% |
+| none | one / zero | 12.93% | 3.75% |
+
+(Percentages = share of differing pixels; the baseline is the **3.7% of the same scene's unaffected normal
+mode**, which is the inherent font/anti-aliasing difference, not a blending defect. `erase`'s visible symptom is
+the most direct: before the fix it was a **white** rocket silhouette where `adl` is **black**; `none`'s 12.93%
+before the fix comes next.)
+
+(Contract: our window's client area 480×870 and adl's 459×814 are aligned at **@0,0** and compared point by
+point (every 2 px, counting a difference when `|ΔR|+|ΔG|+|ΔB| > 24`); the recomputation script is
+`temp/pngdiff2.cjs`, and the alignment offset was found by search (the result being 0,0). Run-to-run
+determinism is 0.02% ⇒ any difference ≥2% is a real one.)
+
+1. **The PSO key has to contain the factor pair** (§10.2). The key originally held only a boolean "is blending
+   on", so the factor pair a program first blended with (Starling's `normal`) was **reused** for every mode —
+   measured, five presses of "Switch Mode" moved only 0.3% of the pixels, and all of those were the label.
+   The Metal side's `stage3d_glue.mm` had been keying by factor pair all along (its file-header comment says
+   exactly this).
+2. **The alpha slot's factors have to be translated `*_COLOR → *_ALPHA`**. Stage3D has only **one pair** of
+   factors (colour and alpha share it), and handing that same pair to two colour-attachment slots is legal in
+   Metal but **not** in D3D12: a `*_COLOR` value in the alpha slot is an illegal enum, and
+   `CreateGraphicsPipelineState` rejects the **whole** PSO as `E_INVALIDARG (0x80070057)`, the debug layer's
+   exact words being
+   `SrcBlendAlpha[0] is trying to use a D3D11_BLEND value (0x9) that manipulates color, which is invalid`
+   (reproduced independently with `temp/blendprobe.cc` + the debug layer). No PSO ⇒ **every draw of that mode
+   is silently dropped**, which is the direct cause of multiply/screen "having no effect at all". Translating
+   to the alpha twin factor (`s3d_blend_factor_alpha`) is not just error avoidance: ERASE
+   (`zero / oneMinusSourceAlpha`) only erases when the erased pixel's **alpha really reaches 0** (that is what
+   Starling erases RenderTextures with).
+3. **Compositing has to ignore the back buffer's alpha** (§10.4). When AIR presents the Stage3D back buffer it
+   **does not look at alpha**: clearing the context to `(1, 0, 0, 0.25)` versus `(1, 0, 0, 1.0)` (with the
+   stage colour set to opaque green) gives the **same `(255,0,0)`** for the same pixel in the adl window —
+   green never shows through a semi-transparent back buffer. So all four compositing paths —
+   `sk_gpu_draw_texture` (D3D12) / `sk_mtl_draw_texture` (Metal) / `sk_gl_draw_texture` (web GL) /
+   `sk_canvas_draw_bgra` (CPU raster) — now use **`SkBlendMode::kSrc`** instead of the default `kSrcOver`:
+   ERASE zeroes RGB **and** alpha, and `kSrcOver` would let the stage colour show through (a white silhouette),
+   while `kSrc` yields adl's black. **This one only differs from the old behaviour when the back buffer has a
+   pixel whose alpha is not 1**, so the other 12 scenes are essentially unchanged pixel-wise (measured:
+   `BlendModes` / `RenderTexture` differ from before the fix by 0.06%).
+
+**Nails**: the `stage3d/d3d-glue` group in `test/unit/stage3d.ts` (the key contains the factor pair, the alpha
+slot's translation function and its two call sites, and all four compositing paths using `kSrc`).
 
 ## 11. Reference Links
 

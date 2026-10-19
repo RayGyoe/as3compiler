@@ -69,12 +69,15 @@
 #include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
 #else
 #if defined(_WIN32)
-// Windows font backend: GDI (Skia's default font manager on Windows). It
-// enumerates the installed system font collection through gdi32 — an import lib
-// already on the Windows link line for SDL2 — so it adds no dependency, unlike
-// DirectWrite (dwrite.lib). The factory lives in SkTypeface_win.h, exposed under
-// SK_BUILD_FOR_WIN (which SkFeatures.h derives from _WIN32); the mac_ct port
-// below is CoreText-only and cannot compile for Windows.
+// Windows font backends: GDI for family/style resolution, DirectWrite for the
+// per-character fallback tier (see SkAirFontMgr below). Both factories live in
+// SkTypeface_win.h, exposed under SK_BUILD_FOR_WIN (which SkFeatures.h derives
+// from _WIN32); the mac_ct port below is CoreText-only and cannot compile for
+// Windows. SkStream.h is here (rather than only in the SVG block further down)
+// because SkAirFontMgr forwards SkFontMgr::makeFromStream's
+// unique_ptr<SkStreamAsset> parameter, and moving/destroying it needs the
+// complete type.
+#include "include/core/SkStream.h"
 #include "include/ports/SkTypeface_win.h"
 #else
 #include "include/ports/SkFontMgr_mac_ct.h"
@@ -240,7 +243,14 @@ void sk_gl_draw_texture(void* canvas, unsigned textureId, int w, int h,
       kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr);
   if (!img) return;
   SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
-  ((SkCanvas*)canvas)->drawImageRect(img.get(), dst, SkSamplingOptions());
+  // kSrc, NOT Skia's default kSrcOver: AIR composites the Stage3D back buffer with
+  // its alpha channel ignored (see sk_gpu_draw_texture in d3d_glue.cc for the adl
+  // measurement). Without this, Starling's ERASE mode -- which zeroes RGB *and*
+  // alpha -- lets the stage colour through and the Blend Modes demo draws a white
+  // rocket silhouette where AIR draws a black one.
+  SkPaint paint;
+  paint.setBlendMode(SkBlendMode::kSrc);
+  ((SkCanvas*)canvas)->drawImageRect(img.get(), dst, SkSamplingOptions(), &paint);
   // Ganesh may retune this texture's GL filter/wrap while executing the draw
   // above (during the next flushAndSubmit), which invalidates the Stage3D
   // backend's per-texture sampler cache — tell it to re-apply on next use.
@@ -289,6 +299,16 @@ void sk_canvas_clear_transparent(void* canvas) {
 
 void sk_canvas_save(void* canvas)   { ((SkCanvas*)canvas)->save(); }
 void sk_canvas_restore(void* canvas){ ((SkCanvas*)canvas)->restore(); }
+// Frame-start hygiene for a canvas that outlives one frame (the cached GPU back-buffer
+// canvas). A save/scale pair leaked by an exception unwinding out of the renderer would
+// otherwise COMPOUND frame over frame -- measured 1.0 -> 1.5 -> 2.25 -> 3.375 on the window
+// canvas, i.e. the whole picture grows without bound after every AS3 error thrown mid-frame.
+void sk_canvas_reset(void* canvas) {
+  SkCanvas* c = (SkCanvas*)canvas;
+  if (c == nullptr) return;
+  c->restoreToCount(1);
+  c->resetMatrix();
+}
 void sk_canvas_translate(void* canvas, double x, double y) {
   ((SkCanvas*)canvas)->translate((SkScalar)x, (SkScalar)y);
 }
@@ -1073,7 +1093,14 @@ void sk_canvas_draw_bgra(void* canvas, const uint8_t* bgra, int w, int h,
   sk_sp<SkImage> image = SkImages::RasterFromPixmapCopy(SkPixmap(info, bgra, (size_t)w * 4));
   if (!image) return;
   SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
-  ((SkCanvas*)canvas)->drawImageRect(image.get(), dst, SkSamplingOptions());
+  // kSrc, NOT Skia's default kSrcOver: AIR composites the Stage3D back buffer with
+  // its alpha channel ignored (see sk_gpu_draw_texture in d3d_glue.cc for the adl
+  // measurement). Without this, Starling's ERASE mode -- which zeroes RGB *and*
+  // alpha -- lets the stage colour through and the Blend Modes demo draws a white
+  // rocket silhouette where AIR draws a black one.
+  SkPaint paint;
+  paint.setBlendMode(SkBlendMode::kSrc);
+  ((SkCanvas*)canvas)->drawImageRect(image.get(), dst, SkSamplingOptions(), &paint);
 }
 
 // ---------- text ----------
@@ -1114,11 +1141,99 @@ int sk_fontmgr_register_data(const void* data, int len) {
   return 1;
 }
 #elif defined(_WIN32)
+// Windows font manager: GDI for naming, DirectWrite for per-character fallback.
+//
+// GDI cannot do per-character font fallback AT ALL, and that is a rendering
+// correctness hole, not a nicety: SkFontMgrGDI overrides
+// onMatchFamilyStyleCharacter to an unconditional `return nullptr` (see
+// src/ports/SkFontHost_win.cpp ~2267), and Windows' GDI port has no system
+// cascade to fall back on the way CoreText has on macOS. SkParagraph asks the
+// manager for a fallback face for EVERY code point the run's own face does not
+// map, so when the field's family is one GDI's table cannot match — e.g. the
+// Chinese family name "微软雅黑", which an en-US UI locale exposes only as
+// "Microsoft YaHei" — the resolved face is the Latin-only default and every
+// character of the field renders as .notdef: a whole field of identical boxes,
+// not a stray one (measured: temp/fntface, where the 微软雅黑 row and the
+// deliberately bogus-family row drew the same .notdef for 创建会议).
+//
+// So the manager is a GDI primary with DirectWrite appended as the fallback
+// tier, and ONLY the character query crosses over. Every name/style call goes to
+// GDI exactly as before, so no family that resolves today changes face, and no
+// DirectWrite typeface reaches SkParagraph's structured paths: those metrics run
+// through our AIR strut / height-override machinery, and the measured
+// DirectWrite-resolved row reported textHeight -Infinity and painted nothing at
+// all (see the same probe). DirectWrite's own IDWriteFontFallback::MapCharacters
+// cascade — the one DirectWrite-based browsers use, and the closest thing to
+// what AIR does for a code point the run's face lacks — then answers the
+// character query. Skia reaches DirectWrite through
+// LoadLibraryW("dwrite.dll")/GetProcAddress (src/utils/win/SkDWrite.cpp), so
+// this adds no link dependency to any manifest.
+class SkAirFontMgr : public SkFontMgr {
+public:
+  SkAirFontMgr(sk_sp<SkFontMgr> primary, sk_sp<SkFontMgr> fallback)
+      : fPrimary(std::move(primary)), fFallback(std::move(fallback)) {}
+
+protected:
+  int onCountFamilies() const override { return fPrimary->countFamilies(); }
+  void onGetFamilyName(int index, SkString* familyName) const override {
+    fPrimary->getFamilyName(index, familyName);
+  }
+  sk_sp<SkFontStyleSet> onCreateStyleSet(int index) const override {
+    return fPrimary->createStyleSet(index);
+  }
+  sk_sp<SkFontStyleSet> onMatchFamily(const char familyName[]) const override {
+    return fPrimary->matchFamily(familyName);
+  }
+  sk_sp<SkTypeface> onMatchFamilyStyle(const char familyName[],
+                                      const SkFontStyle& style) const override {
+    return fPrimary->matchFamilyStyle(familyName, style);
+  }
+  // The one query GDI answers with nullptr for every code point.
+  sk_sp<SkTypeface> onMatchFamilyStyleCharacter(const char familyName[], const SkFontStyle& style,
+                                               const char* bcp47[], int bcp47Count,
+                                               SkUnichar character) const override {
+    if (auto tf = fPrimary->matchFamilyStyleCharacter(familyName, style, bcp47, bcp47Count,
+                                                      character)) {
+      return tf;
+    }
+    return fFallback->matchFamilyStyleCharacter(familyName, style, bcp47, bcp47Count, character);
+  }
+  // Typeface-from-data/file never comes from the fallback tier: those paths mean
+  // "this exact font file", which is what a stream/file query is about.
+  sk_sp<SkTypeface> onMakeFromData(sk_sp<SkData> data, int ttcIndex) const override {
+    return fPrimary->makeFromData(std::move(data), ttcIndex);
+  }
+  sk_sp<SkTypeface> onMakeFromStreamIndex(std::unique_ptr<SkStreamAsset> stream,
+                                          int ttcIndex) const override {
+    return fPrimary->makeFromStream(std::move(stream), ttcIndex);
+  }
+  sk_sp<SkTypeface> onMakeFromStreamArgs(std::unique_ptr<SkStreamAsset> stream,
+                                         const SkFontArguments& args) const override {
+    return fPrimary->makeFromStream(std::move(stream), args);
+  }
+  sk_sp<SkTypeface> onMakeFromFile(const char path[], int ttcIndex) const override {
+    return fPrimary->makeFromFile(path, ttcIndex);
+  }
+  sk_sp<SkTypeface> onLegacyMakeTypeface(const char familyName[],
+                                         SkFontStyle style) const override {
+    return fPrimary->legacyMakeTypeface(familyName, style);
+  }
+
+private:
+  sk_sp<SkFontMgr> fPrimary;
+  sk_sp<SkFontMgr> fFallback;
+};
+
 static sk_sp<SkFontMgr> sk_platform_fontmgr() {
   // GDI enumerates the Windows system font collection (the analogue of CoreText
   // on macOS). Cached for the same reason as the CoreText path: construction
   // walks the whole installed family list and must not repeat per draw call.
-  static sk_sp<SkFontMgr> cached = SkFontMgr_New_GDI();
+  static sk_sp<SkFontMgr> cached = []() -> sk_sp<SkFontMgr> {
+    sk_sp<SkFontMgr> gdi = SkFontMgr_New_GDI();
+    sk_sp<SkFontMgr> dw = SkFontMgr_New_DirectWrite();
+    if (!gdi || !dw) return gdi ? gdi : dw;  // no fallback tier: GDI as before
+    return sk_sp<SkFontMgr>(new SkAirFontMgr(std::move(gdi), std::move(dw)));
+  }();
   return cached;
 }
 #else

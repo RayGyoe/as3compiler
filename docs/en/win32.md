@@ -31,10 +31,17 @@ decides:
 
 | `<architecture>` | vendor directories | Target triple | x86/x64 |
 |---|---|---|---|
-| `32` (default) | `vendor/*/windows-x86` | `i686-pc-windows-msvc` | — |
-| `64` | `vendor/*/windows-x64` | `x86_64-pc-windows-msvc` | — |
+| `32` (default) | `vendor/*/lib/windows-x86` | `i686-pc-windows-msvc` | — |
+| `64` | `vendor/*/lib/windows-x64` | `x86_64-pc-windows-msvc` | — |
+| `arm64` (**manifest field only**) | `vendor/*/lib/windows-arm64` | `aarch64-pc-windows-msvc` | see §2.11 |
 
-Three paths switch accordingly: `vendor/skia/lib/windows-xN`, `vendor/sdl2/windows-xN/{lib,include}`,
+`arm64` is **not among `<architecture>`'s accepted values** — it exists only as a build-manifest field
+(`architecture`): AIR has no Windows ARM64 runtime (measurements in §2.11), so writing it in a descriptor has
+no consumer, and `parseAirApp` therefore still takes only `"32"`/`"64"`. Each of the two validates its own value
+domain, and an unknown value is always **reported loudly** (`src/build.ts`'s manifest validation does not fall
+back to `x86_64`).
+
+Three paths switch accordingly: `vendor/skia/lib/windows-xN`, `vendor/sdl2/{lib,include}/windows-xN`,
 `vendor/curl/lib/windows-xN`. (`vendor/` is a **checked-in** directory; `build-tools/` is not checked in and is
 re-downloaded on Windows.)
 
@@ -43,12 +50,22 @@ re-downloaded on Windows.)
 ## 2. Building the Dependency Libraries: `vendor/build-windows-deps.ps1`
 
 ```powershell
-pwsh vendor/build-windows-deps.ps1 -Arch x64    # produces vendor/*/windows-x64
-pwsh vendor/build-windows-deps.ps1 -Arch x86    # produces vendor/*/windows-x86
+pwsh vendor/build-windows-deps.ps1 -Arch x64    # produces vendor/*/lib/windows-x64
+pwsh vendor/build-windows-deps.ps1 -Arch x86    # produces vendor/*/lib/windows-x86
+pwsh vendor/build-windows-deps.ps1 -Arch arm64  # produces vendor/*/lib/windows-arm64 (needs the ARM64 toolset installed first, see §2.11)
 ```
 
 Built from source: **Skia m124** (`build-tools/skia-src`, with `bin/gn` + ninja), **SDL2 2.32.10**,
 **curl 8.11.1**, **zlib**, **nghttp2**. The toolchain is LLVM's **`clang-cl`** (MSVC ABI).
+
+The three packages follow **one layout rule**: archives in `<pkg>/lib/<arch>/`, headers in
+`<pkg>/include/` (Skia's `-I` is the package ROOT, since the glue spells its headers
+`include/core/SkCanvas.h`) — **except SDL2, whose headers are split by arch too**
+(`<pkg>/include/<arch>/SDL2/`), because its `SDL_config.h` is generated per platform by the build, whereas
+Skia's and curl's headers are
+byte-identical across platforms (sharing one copy is what keeps them from drifting apart). The macOS side
+has the same shape (`vendor/sdl2/lib/macos-arm64`, `vendor/sdl2/include/macos-arm64`), with the arch key
+carrying its OS prefix so it cannot be confused with Windows ARM64.
 
 ### 2.1 Three Hard Constraints (measured; do not try other routes)
 
@@ -190,8 +207,14 @@ the first a crash, the last two semantic gaps in `flash.filesystem` on Windows, 
 3. **`File.deleteDirectory` cannot delete a directory**. The implementation called `remove(nativePath)` — POSIX
    `remove()` is equivalent to `rmdir()` for a directory (deletes an empty directory), but MSVC `remove()` is
    just `_unlink` (**files only**), so the `d.exists == false` assertion failed. Fix: added `as_rmdir_one`
-   (Windows `RemoveDirectoryA`, POSIX `rmdir`, isomorphic to `as_mkdir_one`'s `CreateDirectoryA`/`mkdir`), and
+   (Windows `RemoveDirectoryA`, POSIX `remove`, isomorphic to `as_mkdir_one`'s `CreateDirectoryA`/`mkdir`), and
    `deleteDirectory` calls it.
+   > **2026-10-12 addendum**: the non-Windows branch moved from `rmdir()` to **`remove()`** — `rmdir` is declared
+   > in `<unistd.h>`, and that header is **deliberately skipped under WASI** (there is no `fork/exec` there), so
+   > **every** `--target wasm` build died on `call to undeclared function 'rmdir'` (implicit declaration has been
+   > a hard error since ISO C99, and newer `clang` no longer tolerates it). `remove()` is in `<stdio.h>` (always
+   > present), and both POSIX and wasi-libc treat a directory as rmdir, so one call covers both ends; the Windows
+   > branch is still `RemoveDirectoryA` (MSVC's `remove()` deletes files only, as above).
 
 ### 2.8 High-DPI Mode and Three Drag/Resize Defects (hit on the real-machine second run 2026-10-10, fixed)
 
@@ -343,6 +366,82 @@ nails are required).
 
 ---
 
+### 2.11 ARM64: the Third Value on the Width Axis — Why It Is Not a Default, and Why It Can Fail Loudly on Its Own
+
+#### 1. AIR Has No Windows ARM64, and That Was Measured
+
+| Evidence | Measured result |
+|---|---|
+| The platform keys of the two Windows runtimes (scanning the DLLs one by one) | **Exactly one each**: `win/` → `Windows-x86`; `win64/` → `Windows-x86-64`. Together that is the whole set (**no** `Windows-arm64`) |
+| The Windows runtime directories the SDK ships | Only `win/` (whose `Adobe AIR.dll` carries only `Windows-x86`) and `win64/` |
+| The SDK's native side, `lib/` | `win`, `win64`, `android`, `linux_arm64`, `mac`… **no win-arm64** |
+| arm64 in the 51.4.1 release notes | Only Linux / iOS / macOS |
+| All 44 jars in the SDK | No `Windows-x86-64` literal anywhere ⇒ the platform-key vocabulary is not in the jars; **the runtime DLLs are the authoritative witness** |
+
+Three consequences, none of them avoidable: ① no extension can declare an ARM64 Windows slice (the
+`<platform name>` in `extension.xml` can only be written with a key the runtime recognizes); ② no runtime will
+look for one — on Windows-on-ARM AIR runs the **x64 build** (under emulation) and still loads x64 native
+libraries; ③ so `lib/bin/` **deliberately has no** `windows-arm64`: a host library nothing can load is not
+"support", it is inventory. The host-width set is a **closed set** at this point
+(`windows-x86`/`windows-x64`), and on Windows ARM64 `as-aot --ane` **errors out** directly, naming
+`--ane-platform Windows-x86-64` (plus `"architecture": "64"`), rather than guessing at a key AIR has never had.
+
+#### 2. So Why Does the Dependency Script Still Take `-Arch arm64`
+
+Because "AIR's Windows side does not support ARM64" and "this compiler has no ARM64 capability" are two
+different statements. On Windows-on-ARM **non-AIR artifacts** (an ordinary `as-aot` build that does not go
+through `--air-app`) can have an arm64 form, and the `windows-arm64` dependency prefix exists precisely for
+that. But the **default (`both`) still means x64+x86 only**: `both` means "the two widths an AIR descriptor can
+ask for", and quietly turning it into three would make the "default artifact" correspond to no declarable
+target.
+
+#### 3. There Is No ARM64 Toolset on This Machine ⇒ This Path Must Be Able to Fail Loudly on Its Own
+
+Measured (this machine's VS 2022 Community): all three MSVC toolsets (14.16 / 14.29 / 14.43) have **only**
+`bin/Hostx64/{x64,x86}` and `lib/{x64,x86}`, **no arm64**; Windows Kits 10.0.22621.0 does have
+`Lib/<ver>/{um,ucrt}/arm64`. So `vcvarsall.bat arm64` on this machine **returns exit code 0 while preparing
+nothing** — judging by the exit code alone would mistake "the toolset does not exist" for "the environment is
+ready", and then compile a pile of mis-architected objects downstream. `Import-MsvcEnv` therefore became a
+**file-reading** self-check that names the component to install
+(`MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools`) whenever any one check fails, and exits 1 **before
+downloading anything**:
+
+| Self-check | Criterion |
+|---|---|
+| The MSVC library directory is non-empty | at least one `*.lib` under `…\VC\Tools\MSVC\<ver>\lib\arm64\` |
+| `cl.exe` really belongs to that architecture | `Get-Command cl`'s `.Source` must match `\arm64\cl.exe` |
+| The Windows SDK has that architecture | `…\Windows Kits\10\Lib\<ver>\um\arm64\` exists |
+
+**Both states measured**: `-Arch arm64 -Only curl` → **exit 1**, the message naming the missing `lib\arm64` and
+the component to install, **and no download having taken place**; `-Arch x86 -Only curl` → prints
+`[ok] … the x86-width toolset self-check passed (…HostX86\x86\cl.exe)` ⇒ this is a **real criterion**, not a
+blanket refusal. `-Arch arm32` → `ValidateSet` errors out and lists the legal values.
+
+#### 4. Skia's clang-cl Defaults to the Host Architecture — arm64 Must Pin the Triple In
+
+The win branch in `build-tools/skia-src/gn/toolchain/BUILD.gn` passes `-m32` **for x86 only**, and the arm64
+branch passes **no architecture flag at all** (it only appends `HostX64\x64` to `PATH`), with the `bin` path
+hard-coded to `HostX64`: running `target_cpu=arm64` on an x64 host makes clang-cl **silently produce x64
+objects**. So for arm64 we add `extra_cflags = [ "--target=aarch64-pc-windows-msvc" ]` to gn (that arg is
+declared by `gn/skia/BUILD.gn`). The product's identity is then re-checked after the build by
+`Assert-LibBitness` (reading the COFF machine field, **not** trusting clang's exit code).
+
+#### 5. Stated Plainly: This Path Was Not Run to Completion on This Machine
+
+This machine has no ARM64 toolset, so "`-Arch arm64` produces correct arm64 dependencies" **has not been
+verified**; what has been verified is its **guard** (the three checks above plus the post-build bitness
+re-check) and its **failure path** (exit 1 + naming the component). It is logged under `TODO.md`'s
+`### 遗留待开发`. The macOS runtime-side instance of the **same class of observation was fixed in a later
+round**: that SDK's macOS runtime carries only the two ANE keys `MacOS-x86-64`/`MacOS-x86` (`Adobe AIR` is a
+universal binary and both slices contain `MacOS-x86-64`; `MacOS-AOT` has 0 hits across the whole SDK), while
+`currentAnePlatform()` used to return `MacOS-AOT` on darwin/arm64 ⇒ a real macOS ANE could **not be matched** on
+Apple Silicon (a false negative). Now both darwin architectures return `MacOS-x86-64`; the evidence and the nail
+are in `TODO.md` stage one-hundred-seventy-eight · six; the complete platform-key-to-`lib/bin/`-directory table
+and the **step-by-step procedure for migrating an existing ANE into AOT** are in [`ane.md`](ane.md)
+(§3.4 / §4).
+
+---
+
 ## 3. Compiler-Side Wiring
 
 ### 3.1 `<renderMode>`'s Two Branches on Windows
@@ -418,15 +517,384 @@ rather than raising an `AirAppError`:
 - **Evidence**: `examples/shmup-stage3d` reached **281 frames / 5 s** (~56 fps) with zero PSO or compositing
   errors, and the **presented back buffer** exported through `ASC_GPU_DUMP` (a 1500x900 BMP) contains the
   demo's Stage3D sprites.
-- **Not verified**: `examples/air-starling-demo` **has not been run** on the Windows target yet; the culling
-  state and winding order are still a paper decision (`FrontCounterClockwise=FALSE` + a positive viewport
-  height, no Y flip) with no culling A/B measurement.
+- **`examples/air-starling-demo` now runs for real** (stage one-hundred-seventy-three, 127 source files + the
+  full Starling): the window opens, resources finish loading, and all **26 draws / 246 triangles** (the 12×9
+  nine-slice + 12 labels + background/logo/`infoText`) are in place, not a single piece of geometry missing.
+  Along the way one **structural** defect was fixed: **the constant buffer used to be one per frame slot**, and
+  D3D12 reads constants when the GPU **executes** the command list ⇒ **every** draw in that frame read the mvp
+  uploaded **last** (measured: all 12 buttons transformed by the last button's matrix); Metal copies inline with
+  `setVertexBytes` and is immune by construction — which is exactly why **only Windows** was broken. Changed to
+  **constant regions versioned per draw** (`S3D_CB_REGION` 4096 B per upload, the cursor reset in
+  `s3d_batch_end`, `s3d_wait_slot` kept inside `s3d_upload_constants`) — the details and the three measurements
+  that settled it are in [`display3d.md`](display3d.md) §10.1.
+- **Item-by-item comparison with `adl 51.4.1`** (same machine, same 150% scaling; the adl side captured the
+  window's client area with `temp/win_shot.ps1`, ours is `ASC_GPU_DUMP`'s presented back buffer): the logo's red
+  pixel bounding box is **the same `x32..173 y10..196` in client coordinates**, the button pitch is the same
+  **69 px** (= 46 pt × 1.5), and the two button columns' row/column offsets line up with the 12 labels one by one.
+- **Not accepted**: back-face culling and winding order are still a paper decision
+  (`FrontCounterClockwise=FALSE` + a positive viewport height, no Y flip), with no culling A/B measurement;
+  `Context3D.drawTriangles`'s `firstIndex` is currently **ignored** (`(void)firstIndex;`, the whole index buffer
+  is uploaded) — harmless for Starling (which always calls `drawTriangles(ib, 0, n)`), but a potential deviation
+  for other Stage3D apps (logged in `TODO.md`'s leftover list).
 
 See also §2.9 for the Skia D3D `gr_cp` ownership contract that this composite had to satisfy (`retain()`
 instead of the adopting bare-pointer constructor) — it is the deepest third-party-API trap this project has hit
 so far.
 
 ---
+
+### 3.5 Display Metrics: **Logical Points vs Physical Pixels** (stage one-hundred-seventy-three)
+
+Within one run AIR mixes two display spaces, and **both have to be its two** (measured on the same machine with
+`adl 51.4.1` / a 3840×2560 desktop / 150% scaling):
+
+| Quantity | Value `adl` reports | Space |
+|---|---|---|
+| `Stage.fullScreenWidth`/`Height` | 2560×1707 | **logical points (DIP)** |
+| `Capabilities.screenResolutionX`/`Y` | 2560×1707 | **logical points (DIP)** |
+| `flash.display.Screen.mainScreen.bounds` | 3840×2560 (`visibleBounds` 3840×2488) | **physical pixels** |
+| `Capabilities.screenDPI` | 96 | a platform baseline (**not** the panel DPI: SDL reports 144 on the same machine) |
+| `Stage.contentsScaleFactor` | 1.5 | window physical/logical ratio |
+
+We used to answer `fullScreen*` with `SDL_GetCurrentDisplayMode` — that is the **physical** mode (3840×2560) ⇒
+a Stage3D app that sizes its viewport from `fullScreenWidth` (the Starling projection in
+`air-starling-demo`) got a stage coordinate system 1.5× adl's. The fix is to **change the query**, not to
+multiply/divide: `SDL_GetDisplayBounds` (under `SDL_HINT_WINDOWS_DPI_SCALING`) already returns logical-point
+space, **value-for-value identical** to `adl`; the `Screen.bounds` route (`sk_display_bounds`) is
+**deliberately left as-is**, because it shares SDL's logical space with window centering, and switching it to
+physical would break centering at the same time.
+
+`Capabilities.screenDPI` is likewise a **constant baseline** rather than a reading: 96 on Windows, 72
+elsewhere (macOS is 72 as well). Reporting the real panel DPI (144) would silently deviate on **every** HiDPI
+desktop. **Residual deviation**: per AIR, `Screen.bounds`/`visibleBounds` should be physical pixels while we
+still report logical values (`sk_display_pixel_bounds` is unimplemented), and that is logged in `TODO.md`'s
+`遗留待开发`.
+
+### 3.6 Stage3D Resource **Deferred Release** Must Be Bound to the **Next Submission** (stage one-hundred-seventy-four)
+
+In D3D12's release queue **the release timing is itself part of correctness**: a signalled `fence` only means
+**that submission finished**, and says nothing about "is anyone still reading this resource". The original
+implementation had `s3d_defer_release` always record `c->fenceNext` (**the last signaled** value); if a resource
+is destroyed while the **batch is still being recorded** (`c->listOpen == 1`), it **has already been bound into
+the command list by an earlier draw in that batch**, while that submission **has not happened yet** ⇒ the
+resource is freed before the GPU reads it, and D3D12 immediately hands the memory to the **next texture**.
+Measured (temporary `ASC_S3D_LIFE` instrumentation, `examples/air-starling-demo` changing scenes): **all 171 of
+171 releases happened at `listOpen=1`**, a typical line being
+`defer 1B242EB0 fence=31` → `RELEASE 1B242EB0 rel_fence=31 done=32 next=32 listOpen=1` (already **completed** at
+record time).
+
+This is one root cause with **two symptoms**: ① scrambled picture — an old descriptor samples **someone else's
+pixels** (the `colorTF` box in TextScene drew an enlarged "Back", and the background and back button
+vanished); ② `DXGI_ERROR_DEVICE_REMOVED` — `Present` reports `0x887a0005` for **still sampling** a destroyed
+resource through an SRV (`vendor/d3d_glue.cc`; Stage3D **borrows** the same `ID3D12Device` via
+`sk_d3d_shared_device()`, so an illegal operation on the Stage3D side is reported by the composite layer's
+`Present`).
+
+The fix (three places; missing any one reproduces it):
+
+1. `s3d_defer_release` parks an entry **at fence 0** while the batch is open (`c->listOpen ? 0 : c->fenceNext`)
+   — 0 means "attach it to the **next** submission".
+2. Both drains (the bounded reclaim in `s3d_defer_release` plus `s3d_drain_releases`) skip entries with
+   `fence == 0` and **keep** them (not discard — discarding would amount to releasing early).
+3. `s3d_batch_end` stamps every entry parked at 0 with this submission's fence value, after `Signal`.
+
+**Acceptance**: after stripping all instrumentation and rebuilding, entering all 12 scenes from the menu and
+backing out of each to the menu, **3 rounds in a row (36 switches) with zero `Present` failures and zero
+`0x887A0005`**; TextScene's render-target dump and the `ASC_GPU_DUMP` window dump both match `adl 51.4.1` on the
+same machine. Instrumented comparison: before the fix `RELEASE … listOpen=1` counted **171/171**; after the fix
+**all 156 releases had `listOpen=0` and `rel_fence == done`**.
+
+---
+
+### 3.7 The Audio Backend: **WASAPI** (stage one-hundred-seventy-six)
+
+The audio backend (`vendor/audio_glue.c`, miniaudio) is **independent of the rendering backend** — one
+translation unit covers every desktop OS: `as_audio_pick_backends()` yields `wasapi, dsound, winmm` (in
+fallback order) for `_WIN32`, and `coreaudio` for Apple. On the Windows side **the extra link items are zero**:
+all three backends go through `LoadLibrary`/`GetProcAddress` (ole32 / dsound / winmm / avrt), and the object
+this file compiles to on this machine measured **no undefined imports beyond kernel32 and the CRT**.
+
+Before stage one-hundred-seventy-six, "no sound" on Windows was **not** a missing backend: the build layer in
+`src/air-app.ts` gated the backend off (the gate was hard-coded to darwin) and unconditionally stuffed
+`CoreAudio`/`AudioToolbox` into `frameworks` (`-framework` is not a clang argument on Windows). The former made
+the seam fall back to a "no sound card" stub and print one of our warnings; the latter would have broken the
+link even if the former were lifted. A Windows manifest is now **two entries, source + define**, and
+`frameworks` **must be empty**. The layer-by-layer evidence (backend name / loopback recording / demo frame
+sounds / negative controls) and how to write the manifest by hand are in [`audio.md`](audio.md) **§15**.
+
+---
+
+### 3.8 Drag Stutter: the Flip-Model Acquire Stall (stage one-hundred-seventy-seven)
+
+Dragging an AOT-built window by its caption moved it in ~15 Hz steps, where the same program under `adl`
+glides. Measured with a real pressed drag (`temp/dragtrace/dragtrace2.exe` + `run2.cjs`; `GetWindowRect` at
+every step, recording only the changes and computing gap quantiles; the app's
+stdout/stderr must go to FILES — the harness blocks in `spawnSync` while dragging, so a pipe stops being
+drained and a writer that blocks makes a still-animating app look frozen):
+
+| target | position changes | gap p50 | gaps > 20 ms | CPU while dragging |
+|---|---|---|---|---|
+| plain Win32 control window (`dumbwin.exe`) | 1745 | 1.8 ms | 0 | 1-6% |
+| same glue, **CPU-rendered** SDL window (`win_cpu.exe`) | 1462 | 3.0 ms | 1 | - |
+| `adl` (AIR reference, same program) | 1174 | 3.0 ms | 0 | 13% |
+| **AOT demo (D3D12 flip, `SK_D3D_NUM_FRAMES 2`)** | 87-120 | **66.4-66.6 ms** | **58-88** | 1-3% |
+
+**Piece-by-piece forensics (each step ruled out one hypothesis)**:
+
+1. Not "the app is starved by the modal move loop": during the drag the app **is still producing frames**
+   (`live_resize_watch` is triggered about 30 times a second by WM_PAINT/MOVED, ~33 ms each), and a
+   `SendMessage(WM_NULL)` to the window thread answers in 1.2 ms ⇒ the thread is neither busy-dead nor frozen.
+2. Not the vsync wait inside `Present`: switching `Present(1,0)` to `Present(0,0)` still leaves every redraw at 33.3 ms.
+3. Only phase timing inside `vendor/d3d_glue.cc` (fence acquire / flush / submit / present / signal) localised it:
+   during the drag the fence acquire in `sk_gpu_begin_frame` waits **470 ms out of every 500 ms** (~31 ms per frame),
+   while flush 1.0 ms, submit 1.7 ms and present 2.6 ms are all negligible; the same redraw costs
+   **0.37 ms** when idle.
+4. Mechanism: with `BufferCount=2`, DXGI's presentation queue **holds both back buffers** while the compositor is
+   moving the window, so no writable buffer is available and acquire waits out **two vblanks (33.3 ms)**. And our
+   frames happen to be able to run inside the **OS modal move loop's dispatch**
+   (`live_resize_watch -> sk_pump_frame`), so that 33 ms is time the move loop never gets ⇒ the window advances
+   one frame per step; when `MOVED` and `EXPOSED` each trigger a pump it doubles to exactly 66.6 ms (= 4 vblanks).
+
+**Fix**: `SK_D3D_NUM_FRAMES` **2 -> 3** (one spare back buffer). The acquire wait drops to 0.0 ms and the drag
+to 3.1-4.4 ms steps (max 14 ms, zero gaps over 20 ms) with the app still animating through the drag. Cost: one
+extra back buffer (~1.7 MB for 480x870) and about one frame of latency. Only `d3d_glue.cc` (a Windows-only
+file) changes, so Metal/WASM are unaffected by construction. A minimal control (`temp/dragtrace/gputest.cc`:
+raw Win32 + D3D12 flip, 2 buffers, clear+Present per frame) drags at 4.9 ms and its D3D11 bitblt variant at
+4.5 ms, so the flip model itself is not the problem — only "2 buffers AND frames running inside the modal
+loop" is.
+### 3.9 Resizing by the Bottom-Right Corner **Wedges**: `ResizeBuffers` Corrupted the Fence Ledger (stage one-hundred-seventy-seven · one)
+
+**Symptom**: reported as "dragging the bottom-right corner to resize crashes it". It is **not a crash — it is a
+permanent hang**: the window freezes at some intermediate size, `SendMessage(WM_NULL)` goes unanswered for 3-5 s,
+`IsHungAppWindow` is 1, the title is still readable, and the process burns **0% CPU over one second** — so it is
+blocked on a wait that will never be signalled (not a spin, not an access violation). It froze at 526x950 after
+only 3 size changes (~93 ms in).
+
+**Harness** (`temp/dragtrace/resizetrace.c`, `runresize.cjs`, `rzloop.cjs`): a real `SendInput` press on
+`HTBOTTOMRIGHT` (found via `WM_NCHITTEST`; **not** `SetCursorPos`, which bypasses the input queue and never enters
+the modal resize loop) dragged outward pixel by pixel while the window size is sampled; afterwards it times a
+`WM_NULL` round trip, checks `IsHungAppWindow`, measures the process CPU time delta over 1 s and probes liveness
+with `OpenProcess(SYNCHRONIZE)`. `dumbwin.exe` is **not** a usable resize control (its `WM_NCLBUTTONDOWN` path
+yields `hwndCapture == 0`); `gputest.exe` (raw Win32 + D3D12 flip) and `adl` are — both resize smoothly.
+
+**Root cause**: the fence ledger in `d3d_glue.cc` got corrupted. `fence_values[i]` is "the last submission on back
+buffer i"; `sk_gpu_begin_frame`'s acquire wait means "wait until that value is reached". But `begin_frame` first
+takes `current = w->fence_values[w->buffer_index]` (an OLD slot's value, used as the counter) and only then
+overwrites `buffer_index` from `GetCurrentBackBufferIndex()`. Before the fix we also wrote
+
+```c
+w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
+```
+
+right after `ResizeBuffers`, which pointed the counter's source slot at whichever buffer the rebuilt swapchain
+happened to land on — possibly an **older** slot — so `fence_values[new] = current + 1` became a value the fence
+had **already passed**. A fence never moves backwards, so `Signal()` on a passed value is a **no-op**: that buffer
+loses the "the GPU is done with me" marker, and the **next** resize (whose drain waits for **every** slot) blocks
+forever on a value that will never be reached. The intermittency comes from which slot the index lands on.
+
+**Quantified** (`ASC_RZ_TRACE=1` ledger): before the fix, 34 of 72 size changes produced a no-op signal
+(`V <= completed`); one process wedged on its 2nd resize. After the fix: **0 of 298** across four drags.
+
+**Why the `SK_D3D_NUM_FRAMES 2 -> 3` fix (§3.8) is what detonated it** (**inference**, no single-variable A/B
+was run): with two buffers the ~31 ms acquire wait was itself a throttle — one frame per watch event, two vblanks
+apart — so `ResizeBuffers` practically never overlapped an in-flight frame. With a spare buffer the frames really
+run, and this latent ledger bug bit for the first time.
+
+**Fix** (`vendor/d3d_glue.cc`, three places): (1) **delete** that post-`ResizeBuffers` index re-read — the next
+`begin_frame` reads it anyway, and reading it early breaks the invariant "every value assigned is strictly greater
+than every value already signalled", which is what makes each wait reachable; Skia's own reference
+(`build-tools/skia-src/tools/window/win/D3D12WindowContext_win.cpp`, `resize()`) likewise does not re-read the
+index there. (2) **bound the drain**: `#define SK_D3D_DRAIN_MS 250`, so the pre-resize "wait for the GPU to
+release each slot" waits at most 250 ms per slot instead of an unbounded `INFINITE` (the queue/Present really can
+stall during a resize). (3) on timeout **release nothing**: skip the frame (`return nullptr`) after a one-time
+honest stderr note, leaving the swapchain and every surface untouched so the next frame retries; the
+`surfaces[i]`/`buffers[i]` releases moved into a separate loop after a successful drain.
+
+**Verified** (clean rebuild, Windows x64): 3/3 real corner drags (502x926 -> 2101x2497, 70 size changes)
+**survived**, all responsive (`WM_NULL` answered in 7.7-11.3 ms, `IsHungAppWindow` 0, exit code 0). **No
+regression**: the same 6 s caption drag measures p50 **3.0 ms** / p95 4.6 / p99 4.9 / max 8.9 with **zero gaps
+over 20 ms**, tracking 1799 of 1800 cursor pixels ⇒ §3.8's drag fix is intact. The post-resize picture matches
+`adl` structurally (blank margin beyond the fixed-size stage): `temp/dragtrace/after_resize.png` against
+`adl_after_resize.png`. Only `d3d_glue.cc` (a Windows-only file) changes, so Metal/WASM are
+unaffected by construction, and the `window_glue.cc` live-resize watch is untouched.
+
+### 3.10 Rebuilding the Vertex/Index Upload Every Call Was the Bulk of a Windows Frame (stage one-hundred-seventy-nine)
+
+**Symptom**: `examples/air-starling-demo`'s benchmark scene (`BenchmarkScene`) only reached **61k objects** on Windows,
+while the macOS record is **120k**. The benchmark adds objects every frame (`addTestObjects(16)`); at **66k** objects the
+frame time jumps from 0.2 ms to **~17 ms**, which eats the entire 16.67 ms budget, so its convergence criterion
+(`measuredFps < 0.985 * 60`) fails 100 times in a row and the ramp plateaus at 66-68k.
+
+**Harness**: `temp/benchperf/runbench.cjs` (the `bench-auto` marker drives straight into `BenchmarkScene`; `System.output`
+concatenates `BENCH` records with **no newline**, so the peak can only be read with `/obj=(\d+)/g` over the whole log),
+plus the `ASC_VB_PROBE` probe (reverted) and `ASC_FRAME_STATS=1`. Evidence: a **static frame** (same 65.8k objects, no
+additions) measures `tick p50 = 0.203 ms` / `present 0.431 ms` / `period 16.894` / `fps 59.2`, while a **mutating frame**
+measures `tick p50 = 15.6 -> 17.2 ms`. Those 17 ms are **not GC** (`FRAME` probe: `gcmax=0.00 gcavg=0.00`) and **not the
+display-list API** (micro-probe `temp/benchhot/addcost.as`: 60k Sprites' `addChild` totals 287 ms, property writes cost
+2-9 ns) -- the cost lives on Starling's quad-batch rebuild **plus our vertex upload**.
+
+**Root cause**: `s3d_make_upload` in `vendor/stage3d_d3d.cc` **built a fresh committed resource on every call**
+(`CreateCommittedResource` + `Map` + `memcpy` + `Unmap`, with the old buffer deferred-released). Measured fixed overhead
+is **~100 us per call, independent of size** (64 boot-time 0.5 KiB uploads = 7.55 ms); at 66k objects a frame does
+**20-27 uploads / 4-5 MB / `make_ms` 4.4-6.5 ms** (a third of the frame or more), whereas the scalar conversion loop
+itself is only ~0.16 ms/frame (`-O2` vectorizes it). Metal never pays this: its upload is a `replaceRegion` into a
+**persistent** buffer.
+
+**Fix** (`vendor/stage3d_d3d.cc`, an upload-heap pool):
+
+1. `s3d_ubuf_new` creates a **permanently mapped** committed buffer (legal for an UPLOAD heap) with a power-of-two
+   capacity floored at 4 KiB; the pool is bounded by `S3D_UBUF_MAX = 1024` and says so **loudly** when full instead of
+   silently dropping an upload.
+2. `s3d_acquire_upload` hands out the **smallest free entry that fits** -- a candidate must have `pending == 0`,
+   `fence == 0 || fence <= GetCompletedValue()`, and must not currently be bound to any stream or the index stage
+   (`s3d_ubuf_bound`) -- and only creates a new buffer when nothing fits. When saturated it calls `s3d_wait_idle` and then
+   evicts a too-small entry, so the pool is **bounded but self-cleaning** (otherwise capacity that outgrew an older class
+   would sit dead for the rest of the run).
+3. `s3d_upload_vertex` **converts straight into `b->map`** (dropping the per-call `malloc` + `memcpy`), and
+   `s3d_upload_index` memcpy's straight into it.
+4. "This buffer may be reused" is **always decided by the fence a submission stamped** (`s3d_stamp_uploads`), never by
+   CPU bookkeeping alone: memory the GPU may still be reading is never overwritten. A buffer **replaced** while a batch is
+   open is re-marked `pending` (`s3d_mark_batch_ref`), because the open batch already holds its GPU virtual address.
+5. `s3d_destroy` releases the pool; the stream/index buffers are **borrowed**, so releasing them there would double-free.
+
+**Trap worth recording on its own**: `s3d_stamp_uploads` must **return immediately while a batch is open**. The first
+version lacked that guard -- the immediate list (texture uploads) cleared every `pending` flag mid-batch, so the 12 menu
+buttons' vertex uploads on the first frame **all landed in ONE buffer** and **11 of the 12 buttons vanished for good**
+(Starling never re-uploads an unchanged QuadBatch, so the corrupted buffers survived the whole process: `ASC_GPU_DUMP`
+pictures at frame 60 and frame 300 are bit-identical). **A rendering regression is far more discreet than a performance
+one** -- the benchmark number looked great (150,992) at the time. The fix is one line: `if (c->listOpen) return;` (with a
+batch unsubmitted, **no** fence value can prove the GPU is finished with the buffer).
+
+**Verified** (clean rebuild, Windows x64):
+
+- Peak **67,728 -> 147,488 objects (2.18x)** (the unguarded version gave 150,992; the guard costs ~2% in reuse).
+- **Pixels**: `temp/verify_tour.cjs` drove all **13 scenes** (`temp/verify_ub/`) -- the static menu is **bit-identical** to
+  the pre-fix build (**0** differing pixels), and every other scene's difference falls in an animated region or the bottom
+  `Fps` text (Sprite3D 3.85% = the spinning cube, Masks 1.14% = the rotating mask, Textures/Animations/TextFields 0.042%
+  each = the same small dynamic text). 38 log lines, **0** error-ish.
+- Full `node test.ts`: **tests 349 / pass 323 / fail 23**, item-for-item the baseline (`stage3d/flush-policy` is red both
+  before and after, i.e. a pre-existing failure, not this change).
+- Unit pins: 9 new checks in `stage3d/d3d-glue` (each pool invariant, "no stamping while a batch is open", and the doc),
+  taking that group from 28 to 37; **9 of 9 mutations were caught** (drop the stamp guard, drop the fence-usability test,
+invert `pending`, offset the direct write into `b->map`, change the `memcpy` length, make `s3d_ubuf_bound` always
+true, skip the pool release loop, rename the saturation message, change the doc's number).
+
+**Controls and exclusions**:
+
+- The same demo under `adl 51.4.1` on the same machine reaches only **16,610-16,896 objects** -- our Windows AOT was
+  already ~**4x** faster before the fix, so "Windows AOT is slow" does not hold.
+- `ASC_FORCE_REFRESH=30` (a 33.3 ms budget) plateaus at **148,384 = 2.19x**, so the stop point scales **linearly** with the
+  frame budget: it is not a throughput ceiling. The fix now reaches that "double-budget" rank inside the 16.67 ms budget.
+- The **"4090d" display-driver text is not ours**: `driverInfo` is the compile-time placeholder `Direct3D12 (Stage3D)` and
+  `4090|RTX|GeForce` has **0 hits** in the exe, the generated C and `Demo-app.xml`; that text comes from the `adl` run or
+  from some system tool.
+
+**Observation (not fixed, not entered in the remaining-work table)**: the stock pacer lands at **16.947 ms (59.0 fps)**
+(`SDL_GetTicks`' whole milliseconds plus `SDL_Delay` overshoot, ~0.28 ms late per frame); a QPC + hybrid-sleep pacer
+restores 16.667 ms / 60.0 fps but does **not** move the plateau (67,488), so it is an independent precision issue and not
+the cause here. `adl`'s frame interval was **not** measured on this machine, so the hard criterion of S1.5 is not met and no
+debt is registered.
+
+**Scope**: only `vendor/stage3d_d3d.cc` changes, and it compiles **only** into Windows/D3D12 builds, so Metal and WASM are
+unaffected by construction.
+
+### 3.11 `Capabilities.language` / `languages`: the source is the **system UI language**, and `language` is a **closed set** (stage one-hundred-eighty-seven)
+
+**Symptom**: a real application came up entirely in English — its test `Capabilities.language == "zh-CN"` was false.
+
+**Root cause**: the Windows branch of `as_cap_language()` read only the process environment (`LANG`/`LC_ALL`).
+On Windows that is normally unset (started from Explorer) and, when started from git-bash, happens to be
+`en_US.UTF-8` — so it always answered `"en"`, while `adl 51.4.1` on the same machine answers `zh-CN`.
+
+**Measured with `adl` (three-state experiment; machine: region format `zh-CN`, display language `en-US`)**
+
+| Change to the machine | `GetUserDefaultLocaleName` | `adl` `language` / `languages` |
+|---|---|---|
+| — | `zh-CN` | `zh-CN` / `["zh-CN","en-US"]` |
+| `Set-Culture de-DE` | `de-DE` | still `zh-CN` / `["zh-CN","en-US"]` |
+| `Set-WinUserLanguageList de-DE,zh-Hans-CN,en-US` | `zh-CN` | still `zh-CN` / `["zh-CN","en-US"]` |
+
+⇒ It is neither the user locale nor the registry language list but the **effective UI language**, matching the
+reference (“returns the user interface (UI) language … used for all menus, dialog boxes, error messages, and
+help files”).
+
+**The contract**: `language` is a **closed set** — a lowercase ISO 639-1 two-letter code, with an ISO 3166 region
+appended for **Chinese only** (`zh-CN`/`zh-TW`), and `"xu"` for anything outside AIR's table. `languages` is the
+list of RFC 4646 tags (**region kept**) in preference order. The two agree on the **primary language** only
+(“generally has the same primary language ID”, not equality: on an en-US machine `language == "en"` while
+`languages[0] == "en-US"`).
+
+**Where each target reads it**
+
+| Target | `language` | `languages` |
+|---|---|---|
+| macOS | `CFLocaleCopyCurrent()`, normalized | same source |
+| Windows | `GetUserDefaultUILanguage()` → `MAKELCID` → `LOCALE_SISO639LANGNAME` + `LOCALE_SISO3166CTRYNAME` | `GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, …)` |
+| other POSIX | process `LANG`/`LC_ALL` (**last resort**) | same source |
+
+The tag then goes through `as_cap_language_from_tag()`: Chinese is split into CN/TW by region (`zh-HK`/`zh-MO`
+count as TW), every other language is looked up in AIR's table (`as_cap_air_langs[]`, transcribed entry by entry)
+and collapses to `"xu"` when absent; the entries of `languages` go through `as_cap_lang_normalize()` (which keeps
+the language-region shape). Probes and assertions: `unit: platform/CapabilitiesLocale` (30 checks — the behaviour
+table is compiled from the **real sliced source text**, so it runs on any host, while the host value only runs on
+darwin) and `examples/capabilities.as`.
+
+### 3.12 `Capabilities.os`: a **family name plus a version** — the bare family name blanked downstream fields and the device fingerprint too (stage one-hundred-eighty-nine)
+
+**Symptom**: an extension's Windows gate `Capabilities.os.search('Windows') > -1` was permanently `false`, so the
+extension was unusable under AOT while `adl` answered `true` on the same machine. (The gate used to read
+`manufacturer`, which this project deliberately reports as `"AS-AOT"` — see the `manufacturer` row in `TODO.md`;
+switching the application side to `os` is what exposed this.)
+
+**Root cause**: the Windows branch of `as_cap_os()` returned the bare family name `"Windows"`, while AIR returns
+**`"Windows 11"`**. It is not only about the gate: applications read the version back **out of the string** — a
+device-info field takes `Capabilities.os.split(" ")[1]` (permanently `undefined` under a bare name) and hashes the
+whole string into a **device fingerprint** (change the string, change the fingerprint).
+
+**Measured against `adl 51.4.1` (Windows 11, build 26200)**
+
+| `Capabilities.*` | AOT (before) | AOT (after) | `adl 51.4.1` |
+|---|---|---|---|
+| `os` | `Windows` | **`Windows 11`** | `Windows 11` |
+| `manufacturer` | `AS-AOT` | `AS-AOT` (deliberate) | `Adobe Windows` |
+| `version` | `WIN 50,0,0,0` | `WIN 50,0,0,0` | `WIN 51,4,1,1` |
+
+Gate expressions measured on the AOT build (`adl` in parentheses): `os.search('Windows') > -1` = **true** (true),
+`os.search('Android') > -1` = `false` (false), `os.indexOf('Windows') == 0` = **true** (true — this is the one
+Starling uses).
+
+**The name table was recovered from AIR's own binary**, not guessed
+(`runtimes/air/win64/Adobe AIR/Versions/1.0/Adobe AIR.dll`): a 22-entry table (`Windows 95` … `Windows 11 Server`,
+defaulting to `"Windows"`) produced by exact `VerifyVersionInfoW` + `VER_EQUAL` comparisons. Three facts matter:
+
+1. **Windows 11 is not a new major version** — it is a promotion applied on top of `10.0` when `build >= 22000`
+   (`0x55F0`), so `VerifyVersionInfoW(11,0)` never matches and the build number decides;
+2. server SKUs differ only by `wProductType != VER_NT_WORKSTATION` (`Windows 11` vs `Windows 11 Server`);
+3. within `5.2`, `SM_SERVERR2` (89) and `VER_SUITE_WH_SERVER` (0x8000) separate `Windows Server 2003 R2` /
+   `Windows Home Server` / `Windows XP 64`.
+
+**The version source is `ntdll!RtlGetVersion` — the one deliberate deviation from AIR in this stage.** Measured here
+with a **manifest-less** native executable (exactly what we produce):
+
+| Query | Result |
+|---|---|
+| `VerifyVersionInfoW(==10.0)` | `0` (`GetLastError = 1150` `ERROR_OLD_WIN_VERSION`) |
+| `GetVersionExW` | `6.2 build 9200` ← **the manifest version lie** |
+| `ntdll!RtlGetVersion` | `10.0 build 26200` (the truth) |
+
+⇒ AIR only gets the truth because of its own `app.xml` manifest; copying its query verbatim would report Windows 11
+as **Windows 8**. Both `GetSystemMetrics(89)` and `RtlGetVersion` are resolved through `GetProcAddress`: this helper
+is compiled into **every** build, and headless builds do **not** link user32, so a static reference breaks the link
+outright (`undefined symbol: GetSystemMetrics`).
+
+**Left unaligned (stated, not guessed)**: macOS / Linux / WASI still report the bare family name
+(`"Mac OS"` / `"Linux"` / `"WASI"`). AIR appends a version there too, but this host is Windows and no Darwin/Linux
+release→name table can be verified from it, so nothing is invented; the gap is written down in the code comment
+instead of being filled with a plausible-looking value.
+
+Pins: `unit: platform/CapabilitiesOs` (all 18 returnable names present / the `build >= 22000` promotion / the
+`wProductType` split / **no static user32 dependency** / the rationale on record) and `examples/stage65.as` (on
+Windows it asserts `os` splits into a non-empty version token; macOS skips it automatically).
 
 ## 4. Runtime Form (D3D12 Direct)
 
@@ -501,6 +969,7 @@ re-verification; **stage one-hundred-thirty-two added 13/14 confirmed, 15 not ac
 | 14 | ✅ queue sharing works: `stage3d_d3d:` prints `context 1000x600 ready (Direct3D 12)` and there is **no** loud "no shared D3D12 device"-class warning | a loud warning appears ⇒ Stage3D built its own device and pixels never reach the window (black but no error) |
 | 15 | ⚠ complete compile/link/run of `examples/air-starling-demo` on the Windows target (the demo with the widest external-dependency surface) | not run; still unaccepted |
 | 16 | ⚠ **the picture is not stretched while dragging to resize** (stage one-hundred-thirty-three): whether `sd.Scaling = DXGI_SCALING_NONE` really removes the whole-picture rescale on the D3D12 side (any ghosting/jitter left, and whether it stops after the mouse is released), and whether 1:1 presentation leaves an uncovered strip at the edges | still ghosting/jittering (DXGI did not honour `Scaling`); or a new 1 px uncovered strip. **Criterion**: really drag the window (user speed, not a slow scripted drag) and compare by eye; the scripted criterion for the same defect class on this macOS machine is the 15/93 vs 0/151 in [`skia.md`](skia.md) §6.7 |
+| 17 | ⚠ **the arm64 dependency prefix really builds** (§2.11): on a machine with `MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools` installed, run `-Arch arm64` and have the COFF machine field that `Assert-LibBitness` reads out of the artifact be **ARM64** (`0xaa64`) rather than x64 (`0x8664`) | right now it is **guard verified, product unverified**: this machine has no such toolset, so all that is proven is that `-Arch arm64` **exits 1 and names the missing component**, and that the positive branch of the x86 path really passes the self-check |
 
 **How to verify Stage3D reaches the screen (important)**: **do not** judge by screen capture — a flip-model
 swapchain's contents cannot be captured through GDI/BitBlt (you get a stale or all-black frame). The only
@@ -531,10 +1000,19 @@ backend files must implement the five neutral names (`unit: backendparity`).
 
 ## 6. Follow-ups
 
-- **Stage3D on Windows**: ✅ **done** (stage one-hundred-thirty-two) — `vendor/stage3d_d3d.cc` + the HLSL
-  translator target + the `ASC_S3D_HLSL`/`d3d12`/`dxgi`/`d3dcompiler` wiring; `examples/shmup-stage3d` runs on
-  D3D12 with its frames composited into the window. Remaining: run `examples/air-starling-demo` on the Windows
-  target, and settle culling/winding with a real A/B measurement.
+- **A new window-creation path must install the listener + run `sk_pump_frame`** (§2.8): during a drag/resize the
+  loop is blocked, so frames can only be driven by the `SDL_AddEventWatch` listener — and it must call the shared
+  pump rather than tick once itself, otherwise "multiple windows" and "`frameRate` is not rewritten by dragging"
+  each regress. The 16 pins in `unit: platform/WindowFrame` pin exactly this (including "the whole app has exactly
+  **one** `on_frame`"); look there first when adding a backend or a window-creation path.
+- **Stage3D on Windows**: ✅ **both halves are done** — stage one-hundred-thirty-one's AGAL→HLSL translator (a single
+  `target` grown from two tiers to three) + stage one-hundred-thirty-two's `vendor/stage3d_d3d.cc` (the D3D12 side's
+  buffer/texture/pipeline/offscreen RT/blend-state cache) + the build wiring
+  (`ASC_S3D_HLSL`/`d3d12`/`dxgi`/`d3dcompiler`). **What remains is verification**: a full run of
+  `examples/air-starling-demo` on the Windows target, and a real A/B measurement of back-face culling / winding.
 - **`sk_gpu_draw_texture`**: ✅ **implemented** (stage one-hundred-thirty-two) — the render target's
   `DXGI_FORMAT` and current `D3D12_RESOURCE_STATE` come from the Stage3D context (`s3d_get_render_target`
-  returns the raw `ID3D12Resource*`; the composite takes a temporary `retain()`ed reference).
+  returns the raw `ID3D12Resource*`; the composite takes a temporary `retain()`ed reference). Wrapping it MUST
+  `retain()` and **must not** go through `gr_cp`'s raw-pointer constructor — see §2.9.
+- The ledger is in `TODO.md`'s `### 遗留待开发` (5 rows registered this round) and the stage
+  one-hundred-twenty-six section.

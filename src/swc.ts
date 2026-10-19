@@ -29,7 +29,7 @@ import { inflateRawSync, inflateSync, deflateSync } from 'node:zlib';
 import type { ASType, Block, Expr, Method, Param, Stmt, Visibility } from './ast.ts';
 import { qualifiedName } from './symbols.ts';
 import { decodeSymbolScripts } from './abc.ts';
-import type { AbcFrameScript, AbcSymbolClass } from './abc.ts';
+import type { AbcFrameScript, AbcSymbolBase, AbcSymbolClass } from './abc.ts';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -152,6 +152,15 @@ export interface SwcLibrary {
   /** Timeline scripts of Flash-generated symbol classes, keyed by character id
    *  (diff doc D17). A symbol absent here has no timeline script of its own. */
   scripts: Map<number, AbcSymbolClass>;
+  /** Superclass name and dynamic flag of each symbol class that HAS a DoABC, keyed
+   *  by character id (from the DoABC instance's `super_index` / `flags`). A symbol
+   *  linked to a class the project compiles from source shows that class here — the
+   *  artwork comes from the SWC, the behaviour from the project (swc.md §3.3
+   *  addendum). `dynamic` is AVM2's own trait and must be reproduced: a symbol class
+   *  is dynamic even when its declared base is sealed, and `this["title"]` inside
+   *  such a symbol's base class only resolves through the instance's own dynamic
+   *  property table. */
+  bases: Map<number, AbcSymbolBase>;
 }
 
 /** The named bitmaps only — the ones a user's AS3 can name (swc.md §6). */
@@ -237,6 +246,27 @@ export interface SwcCharacterClass {
   charId: number;
   kind: 'sprite' | 'button';
   /**
+   * Fully-qualified superclass of the symbol's own Flash class, straight out of the
+   * library's `DoABC` (abc.ts::AbcInstance.superName). `flash.display.MovieClip` /
+   * `...SimpleButton` means a plain artwork symbol. A name the PROJECT compiles from
+   * source means the symbol is a widget: the library supplies the display tree, the
+   * project supplies the behaviour, and the emitter binds the ctor to that base
+   * class (all four of the app's combo boxes extend `com.example.controls.ComBoBox`).
+   * `''` when the symbol has no `DoABC` at all.
+   */
+  baseName: string;
+  /**
+   * AVM2's `dynamic` trait for the symbol's own class, straight from the ABC's
+   * `InstanceInfo.flags`. A dynamic class owns a property table, so a name that is
+   * not a declared trait is read/written there instead of raising #1069 — which is
+   * how every named timeline child (`title`, `btndown`, `endmc` on a combo box) is
+   * reachable as `this["title"]` from a base class whose own declared base is the
+   * sealed `flash.display.Sprite`. Inheriting `dynamic` from the base is NOT
+   * equivalent: the classic base is `flash.display.MovieClip` (dynamic, so it used
+   * to work by accident), but a project base is usually sealed.
+   */
+  dynamic: boolean;
+  /**
    * The timeline scripts the symbol's own DoABC registers with
    * `addFrameScript(frame - 1, this.frameN)` (abc.ts), decoded at compile time.
    * The emitter turns them into `as_swc_frames`, the one place a frame change runs
@@ -285,8 +315,9 @@ export function swcCompileInputs(lib: SwcLibrary): {
     if (kind !== 'sprite' && kind !== 'button') continue;
     const { name, pkg } = splitFqn(className);
     const script = lib.scripts.get(charId);
-    decls.push(swcDisplayClassDecl(name, pkg, kind, script));
-    chars.push({ cname: qualifiedName(name, pkg), charId, kind, frames: script?.frames ?? [] });
+    const baseName = lib.bases.get(charId) ?? { baseName: '', dynamic: false };
+    decls.push(swcDisplayClassDecl(name, pkg, kind, script, baseName.baseName, baseName.dynamic));
+    chars.push({ cname: qualifiedName(name, pkg), charId, kind, baseName: baseName.baseName, dynamic: baseName.dynamic, frames: script?.frames ?? [] });
   }
   return { decls, specs, chars };
 }
@@ -300,22 +331,44 @@ export function swcCompileInputs(lib: SwcLibrary): {
  * (`as_swc_bind`), because the construction is C — not AS3 — and therefore cannot
  * live in an AST body (AGENTS.md §2.8).
  */
-function swcDisplayClassDecl(name: string, pkg: string | null, kind: 'sprite' | 'button', script: AbcSymbolClass | undefined): Stmt {
+function swcDisplayClassDecl(name: string, pkg: string | null, kind: 'sprite' | 'button', script: AbcSymbolClass | undefined, baseName: string, dynamic: boolean): Stmt {
+  // A base class the PROJECT compiles from source outranks the stock artwork
+  // superclass: AIR links a code library's symbol class to whatever its `DoABC`
+  // declared, and when that base is a class the application itself provides (same
+  // FQN, compiled into the app's own ABC) the behaviour comes from the source. The
+  // library's OWN copy of that base is not executed here — general SWC code (methods
+  // of non-symbol classes) is out of scope (swc.md §3.3) — so binding the symbol to
+  // the source class is the only way an exported widget behaves the way AIR's does.
+  //
+  // `flash.display.*` (and an absent `DoABC`) keeps the old behaviour: a symbol with
+  // no code of its own is a `MovieClip`/`SimpleButton` subclass and nothing else.
+  const projectBase = baseName.length > 0 && !baseName.startsWith('flash.display.') ? baseName : '';
+  const builtin = kind === 'sprite' ? 'flash.display.MovieClip' : 'flash.display.SimpleButton';
   return {
     kind: 'ClassDecl',
     name,
     packageName: pkg,
-    // Fully-qualified so resolveType maps it to the short-keyed built-in.
-    superClass: kind === 'sprite' ? 'flash.display.MovieClip' : 'flash.display.SimpleButton',
+    // Fully-qualified so resolveType maps it to the short-keyed built-in; a project
+    // base is named the way a hand-written `extends` clause names it (short name,
+    // fully-qualified in the import list below) because that is how the semantic
+    // layer's import table resolves a user class.
+    superClass: projectBase.length > 0 ? splitFqn(projectBase).name : builtin,
     isFinal: false,
-    isDynamic: false,
+    // AVM2's own trait for the symbol's class, read from its ABC (see
+    // SwcCharacterClass.dynamic). Reproducing it is what lets the bound base class
+    // reach the symbol's named timeline children through `this["title"]`: the class
+    // must OWN a dynamic property table, because the symbol's declared base chain
+    // (a project widget, itself usually a sealed `Sprite` subclass) does not provide
+    // one. `as_swc_child_name` writes exactly that table when it exists.
+    isDynamic: dynamic,
     implements: [],
     metadata: [],
     // The symbol's own Flash class imports what ITS code reaches through the scope
     // chain (`MouseEvent.CLICK`), because the decoded methods are emitted as
     // ordinary methods of this class and resolve their names through this list.
     imports: [
-      kind === 'sprite' ? 'flash.display.MovieClip' : 'flash.display.SimpleButton',
+      projectBase.length > 0 ? projectBase : builtin,
+      ...(projectBase.length > 0 ? [builtin] : []),
       ...(script?.imports ?? []),
     ],
     fileId: null,
@@ -325,10 +378,13 @@ function swcDisplayClassDecl(name: string, pkg: string | null, kind: 'sprite' | 
         params: [],
         // SimpleButton_ctor takes all four states positionally in C (no defaults
         // survive into the generated function), so the no-arg AS3 ctor must pass
-        // them explicitly. MovieClip takes none, so an empty body is complete.
+        // them explicitly. MovieClip takes none, so an empty body is complete — and
+        // so is one over a project base: the semantic layer fills the base ctor's
+        // own default arguments in (`super()` over `ComBoBox(maxheight = -1)` emits
+        // `ComBoBox_ctor(o, -1)`), which is exactly AIR's no-arg super call.
         body: {
           kind: 'Block',
-          body: kind === 'button'
+          body: kind === 'button' && projectBase.length === 0
             ? [{ kind: 'SuperCall', args: [{ kind: 'Null' }, { kind: 'Null' }, { kind: 'Null' }, { kind: 'Null' }] }]
             : [],
         },
@@ -365,7 +421,8 @@ function swcScriptMethod(m: { name: string; params: Param[]; returnType: ASType;
 // ZIP container
 // ---------------------------------------------------------------------------
 
-interface ZipEntry {
+/** A ZIP central-directory entry with its payload already inflated. */
+export interface ZipEntry {
   name: string;
   method: number; // 0 = stored, 8 = deflate
   data: Buffer; // fully decompressed contents
@@ -383,7 +440,11 @@ function findEocd(zip: Buffer): number {
 }
 
 /** Parse the ZIP central directory and inflate every entry (swc.md §4 step ①). */
-function unzip(zip: Buffer): ZipEntry[] {
+// The same ZIP reader serves .ane packages (extensions/ane.ts): an ANE is a ZIP
+// with extension.xml at the root plus one native library per platform, so
+// sharing the reader keeps one set of edge cases (EOCD comment scan, local vs.
+// central header lengths, stored vs. deflate) instead of two that can drift.
+export function unzip(zip: Buffer): ZipEntry[] {
   const eocd = findEocd(zip);
   const count = zip.readUInt16LE(eocd + 10);
   let p = zip.readUInt32LE(eocd + 16); // central directory offset
@@ -2735,7 +2796,7 @@ export function extractSwc(path: string): SwcLibrary {
   // guessed at (AGENTS.md §1.5).
   const charKinds = new Map<number, string>();
   for (const [id, c] of characters) charKinds.set(id, c.kind);
-  const { scripts: scriptsDecoded, skipped: scriptNotes } = decodeSymbolScripts(body, tags, classNames, charKinds);
+  const { scripts: scriptsDecoded, skipped: scriptNotes, bases: scriptBases } = decodeSymbolScripts(body, tags, classNames, charKinds);
   if (scriptNotes.length > 0) {
     process.stderr.write(
       `\x1b[33mwarning: SWC symbol timeline scripts not decoded (those symbols keep ` +
@@ -2745,6 +2806,6 @@ export function extractSwc(path: string): SwcLibrary {
 
   return {
     source: path, bitmaps, shapes, sprites, buttons, texts, fonts, scalingGrids,
-    classNames, characters, scripts: scriptsDecoded,
+    classNames, characters, scripts: scriptsDecoded, bases: scriptBases,
   };
 }

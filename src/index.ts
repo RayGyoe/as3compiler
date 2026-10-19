@@ -3,12 +3,13 @@
 // Pipeline: AS source -> tokenize -> parse -> generate C -> clang -> native
 // executable (or WASI .wasm with --target wasm).
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { dirname, resolve, basename, relative } from 'node:path';
+import { dirname, resolve, basename, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parser.ts';
 import { generateC, type ExportedSymbol } from './codegen.ts';
+import { aneHostDirName, anePlatformForBuild, anePlatformHint, resolveAneDescriptors, stageAneNatives, type AneResolution } from './ane.ts';
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
@@ -44,12 +45,18 @@ interface Options {
   // (com/org/net) the demo-oriented default skips, so a real app's own `com.*`
   // framework layer joins the reachability closure.
   includeThirdParty: boolean;
+  // `--extdir <dir>`: --air-app only, repeatable. Where to look for the packages
+  // the descriptor's <extensions> names, overriding air-app's DEFAULT_EXT_DIRS.
+  // Not part of BuildConfig: it is consumed while the manifest is generated (the
+  // descriptor names extensions by ID, and the IDs are resolved into the manifest's
+  // `ane-paths`), not while the build runs.
+  extDirs: string[];
   overrides: Partial<BuildConfig>;
 }
 
 function parseArgs(argv: string[]): Options {
-  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, overrides: {} };
-  const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths', v: string): void => {
+  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, extDirs: [], overrides: {} };
+  const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths' | 'anePaths', v: string): void => {
     (opts.overrides[key] ??= [] as string[]).push(v);
   };
   for (let i = 0; i < argv.length; i++) {
@@ -65,6 +72,7 @@ function parseArgs(argv: string[]): Options {
     else if (a === '--main-class') opts.mainClass = argv[++i];
     else if (a === '--all-sources') opts.allSources = true;
     else if (a === '--include-third-party') opts.includeThirdParty = true;
+    else if (a === '--extdir') opts.extDirs.push(argv[++i]);
     else if (a === '--opt') opts.overrides.opt = argv[++i];
     else if (a === '--debug-info') opts.overrides.debugInfo = true;
     else if (a === '--lto') opts.overrides.lto = true;
@@ -94,6 +102,8 @@ function parseArgs(argv: string[]): Options {
     else if (a === '--framework') push('frameworks', argv[++i]);
     else if (a === '--source') push('sources', argv[++i]);
     else if (a === '--swc') push('swcPaths', argv[++i]);
+    else if (a === '--ane') push('anePaths', argv[++i]);
+    else if (a === '--ane-platform') opts.overrides.anePlatform = argv[++i];
     else if (a === '--export') push('exports', argv[++i]);
     else if (a === '--help' || a === '-h') {
       console.log(usage());
@@ -107,6 +117,12 @@ function parseArgs(argv: string[]): Options {
   if (opts.inputs.length === 0 && !opts.airApp) {
     console.error(usage());
     process.exit(1);
+  }
+  // --extdir names where the descriptor's <extensions> packages live, and only a
+  // descriptor declares extensions. Accepting it without --air-app would look like
+  // it had been honoured and quietly contribute nothing.
+  if (opts.extDirs.length > 0 && !opts.airApp) {
+    throw new Error(`--extdir only applies to --air-app (it locates the packages <extensions> names); use --ane <package> for an explicit extension`);
   }
   return opts;
 }
@@ -125,6 +141,7 @@ function usage(): string {
     '  --air-app <xml> AIR app descriptor: generate bootstrap + build manifest',
     '  --main-class <n> main class for --air-app (default: infer src/**/Main.as)',
     '  --include-third-party  --air-app: also sweep src/com, src/org, src/net (a real app\n                 keeps its own framework layer there; skipped by default)',
+    '  --extdir <dir> --air-app: where the <extensions> packages live (repeatable;\n                 default: ext-aot then lib then ext-folder). Each extensionID the\n                 descriptor names is resolved to a package there, so no --ane is needed\n                 per extension',
     '  --all-sources  --air-app: compile every .as under src/ instead of the main class\n                 reachable closure (pre-阶段一百二十四 behaviour; see reach.ts)',
     '  -I <dir>       include path (repeatable)',
     '  -L <dir>       library search path (repeatable)',
@@ -138,6 +155,15 @@ function usage(): string {
   '  --swc <f>      .swc library: bake bitmap resources, vector shapes and the display tree at',
   '                 compile time (repeatable; see docs/zh-cn/swc.md §5/§6/§9)',
     '  --export <name> export a C symbol into the .wasm export table (repeatable)',
+    '  --ane <f>      AIR native extension: load its native library through the FRE host',
+    '                 (<f> may be an .ane package or an unpacked directory: extension.xml',
+    '                 beside <platform>/<nativeLibrary>)',
+    '                 (repeatable; needs the host library from lib/build-asaot.bat, and an',
+    '                 ANE recompiled against it — see docs/zh-cn/ane.md §4)',
+    '  --ane-platform <key> override the ANE platform entry, e.g. Windows-x86-64 |',
+    '                 Windows-x86 | MacOS-x86-64 | iPhone-ARM; also selects',
+    '                 which host-library width under lib/bin/ is used (default: this host;',
+    '                 Windows ARM64 has no AIR key: pass Windows-x86-64 + a 64-bit build)',
     '  --opt <flags>  optimization flags (default: -O2)',
     '  --debug-info   keep DWARF: add -g to every backend and stop stripping it from the',
     '                 default wasm build (default: off — artifacts carry no debug info)',
@@ -239,13 +265,25 @@ function main(): void {
     for (const [k, v] of emb.fieldInits) embedFieldInits.set(k, v);
   };
 
+  // SWC libraries are extracted ONCE, up here, for two reasons: the reachability
+  // closure below needs the superclass of every symbol class as an extra root (an SWC
+  // symbol bound to a class the project compiles from source drags that class's
+  // source into the build — see reach.ts::computeReachable), and the SWC block
+  // further down must not parse the same 700 KB library twice.
+  const swcLibs = new Map<string, SwcLibrary>();
+  const swcLib = (path: string): SwcLibrary => {
+    let l = swcLibs.get(path);
+    if (l === undefined) { l = extractSwc(path); swcLibs.set(path, l); }
+    return l;
+  };
+
   if (opts.airApp) {
     const vendorAbs = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
     // --package web selects the browser backend for the generated manifest; the
     // window backend (SDL2/Cocoa) is native-only and cannot link under wasm-ld.
     // `opts.output` reaches the adapter because the web preload set must not sweep
     // this build's own output dir into the page's FS image (see findPreloadPaths).
-    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output, opts.includeThirdParty);
+    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output, opts.includeThirdParty, opts.extDirs);
     // The adapter reports what it can see but must not silently ship (e.g. a web
     // build whose text has no font to draw with). Yellow, not red: the build is
     // still usable, but the output would be wrong in a way the user cannot guess.
@@ -283,7 +321,22 @@ function main(): void {
     const fileLevelCollisions = new Set<string>();
     let reachNote = `${air.asFiles.length} sources`;
     if (!opts.allSources) {
-      const reach = computeReachable(parsedFiles, air.mainClass);
+      // Roots the AS3 source cannot name: a symbol class's base class that the SWC
+      // links to (see the swcLib cache above). Only project-declared FQNs matter
+      // (`computeReachable` ignores the rest), and the stock display classes are
+      // skipped so an artwork-only library adds nothing.
+      //
+      // The CLI's `--swc` flags are merged into cfg.swcPaths further down (after this
+      // branch, with the rest of the CLI overrides), so reading cfg alone would miss a
+      // library named only on the command line — which is exactly how the app itself is
+      // built (`--swc lib/skin.swc`).
+      const swcBaseRoots: string[] = [];
+      for (const p of [...cfg.swcPaths, ...(opts.overrides.swcPaths ?? [])]) {
+        for (const base of swcLib(p).bases.values()) {
+          if (base.baseName.length > 0 && !base.baseName.startsWith('flash.')) swcBaseRoots.push(base.baseName);
+        }
+      }
+      const reach = computeReachable(parsedFiles, air.mainClass, swcBaseRoots);
       const keep = new Set(reach.kept);
       keptFiles = parsedFiles.filter((f) => keep.has(f.path));
       reachNote = reach.dropped.length > 0
@@ -355,10 +408,16 @@ function main(): void {
   if (opts.overrides.pgo) cfg.pgo = opts.overrides.pgo;
   if (opts.overrides.pgoDir) cfg.pgoDir = opts.overrides.pgoDir;
   if (opts.overrides.dry) cfg.dry = true;
+  // --ane-platform had no line here until 阶段一百七十八·三: the flag was parsed
+  // into opts.overrides and then dropped, so a build that named Windows-x86 was
+  // resolved, linked and staged as whatever the HOST is -- silently, with a
+  // success exit code. The default happens to equal the host platform, which is
+  // exactly why nothing caught it until a cross-width build was attempted.
+  if (opts.overrides.anePlatform) cfg.anePlatform = opts.overrides.anePlatform;
   // Unlike -D (which appends to the manifest's defines), --features REPLACES the
   // set: see resolveFeatures for why.
   if (explicitFeatures) cfg.features = explicitFeatures;
-  for (const k of ['includePaths', 'linkLibs', 'linkPaths', 'defines', 'exports', 'frameworks', 'sources', 'swcPaths'] as const) {
+  for (const k of ['includePaths', 'linkLibs', 'linkPaths', 'defines', 'exports', 'frameworks', 'sources', 'swcPaths', 'anePaths'] as const) {
     const extra = opts.overrides[k];
     if (extra) cfg[k].push(...extra);
   }
@@ -376,7 +435,7 @@ function main(): void {
       if (s.kind === 'ClassDecl') declared.add(qualifiedName(s.name, s.packageName));
     }
     for (const libPath of cfg.swcPaths) {
-      const lib = extractSwc(libPath);
+      const lib = swcLib(libPath);
       const inputs = swcCompileInputs(lib);
       for (const spec of inputs.specs) {
         if (declared.has(spec.cname)) {
@@ -421,6 +480,53 @@ function main(): void {
     throw new Error(`unknown --package '${cfg.package}' (expected: raw | xcode-project | android-project | web)`);
   }
 
+  // Native extensions (阶段一百七十二). Each .ane is resolved to the native library
+  // THIS platform loads, out of its own extension.xml, at compile time — and the
+  // three flags it takes to make the generated C a FRE host are added here, in
+  // one place, ONLY when a build asked for an extension. A build with no --ane
+  // stays byte-identical to what it produced before this stage: no -DASC_HAVE_FRE,
+  // no asaot.lib, no extra include path.
+  let aneResolution: AneResolution | undefined;
+  if (cfg.anePaths.length > 0) {
+    // The key follows the TARGET this build produces, not the host that runs the
+    // compiler: `architecture` "32" means a 32-bit program, and AIR would give it
+    // the x86 runtime's slice (see anePlatformForBuild).
+    const platform = cfg.anePlatform !== '' ? cfg.anePlatform : anePlatformForBuild(cfg.architecture, cfg.target);
+    if (platform === '') {
+      // Two hosts land here and the advice differs: Linux has an AIR runtime but no
+      // asaot build, while Windows ARM64 has no AIR key at all — where naming a
+      // nonexistent 'Windows-arm64' is exactly the wrong way out (measured: in AIR SDK
+      // 51.4.1 each Windows runtime carries exactly ONE platform key -- win/Adobe AIR.dll
+      // has Windows-x86, the win64 one has Windows-x86-64 -- so the whole closed set is
+      // those two). The
+      // sentence itself lives in ane.ts with the rest of the platform-key knowledge,
+      // so it is testable without a Windows-on-ARM machine.
+      // The host is what usually decides this, but a Windows build can also be told
+      // to produce a bitness that has no key of its own (see anePlatformForBuild).
+      // Say WHICH of the two lost the key: pointing at a host that still has its
+      // own key is how someone ends up passing --ane-platform to "fix" a problem
+      // that the flag does not describe.
+      const targetLostKey = process.platform === 'win32' && cfg.architecture === 'arm64';
+      throw new Error(
+        `--ane for this ${targetLostKey ? 'target (architecture "arm64")' : `host (${process.platform}/${process.arch})`} ` +
+          'has no AIR platform key; pass --ane-platform <Windows-x86-64|Windows-x86|MacOS-x86-64|iPhone-ARM> to name the target' +
+          anePlatformHint(process.platform, targetLostKey ? 'arm64' : process.arch)
+      );
+    }
+    aneResolution = resolveAneDescriptors(cfg.anePaths, platform);
+    // The include path points at lib/ itself (the shim header every recompiled ANE
+    // is given resolves `#include "asaot.h"` from there), while the LINK path points
+    // at the platform's own subdirectory: the header is one contract shared by all
+    // platforms, the import library is that platform's build product.
+    const libDir = resolve(dirname(fileURLToPath(import.meta.url)), '../lib');
+    cfg.includePaths.push(libDir);
+    cfg.linkPaths.push(resolve(libDir, 'bin', aneHostDirName(platform)));
+    cfg.defines.push('ASC_HAVE_FRE=1');
+    // asaot.lib is the import library of asaot.dll, generated by the linker
+    // (/IMPLIB:) from lib/build-asaot.bat — one source of truth, the DLL.
+    cfg.linkLibs.push('asaot');
+  }
+
   console.log(`== as-aot: AS3 subset -> C -> ${cfg.target} ==`);
   // An enhancement that is ON must never be silent (§1.5): it is what separates
   // this artifact from what `adl` would do with the same input, so name it and
@@ -434,6 +540,15 @@ function main(): void {
   console.log('[2/4] parse       tokenize + AST');
   if (cfg.swcPaths.length > 0) {
     console.log(`      swc         ${cfg.swcPaths.length} library(ies): ${swcResources.length} embedded resource(s)`);
+  }
+  if (aneResolution) {
+    // Every resolved extension, by id and by the file that has to be beside the
+    // executable. An extension whose native library went missing is otherwise a
+    // runtime null from createExtensionContext with nothing to explain it.
+    console.log(`      ane         ${aneResolution.descriptors.length} extension(s)`);
+    for (const d of aneResolution.descriptors) {
+      console.log(`                  ${d.extId} <- extensions/${d.nativeLib} (${d.initializer})`);
+    }
   }
   if (embedResources.length > 0) {
     // Which asset KIND each `[Embed]` became, and from which file: `mimeType`
@@ -483,7 +598,7 @@ function main(): void {
   if (opts.airApp) {
     try { appDescriptorXml = readFileSync(opts.airApp, 'utf8'); } catch { appDescriptorXml = undefined; }
   }
-  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml);
+  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml, aneResolution?.descriptors ?? []);
   writeFileSync(cPath, c);
 
   // ---- flash.data / SQLite engine wiring ----------------------------------
@@ -541,7 +656,9 @@ function main(): void {
     const how =
       cfg.target === 'wasm'
         ? `the browser build has no audio backend yet, so nothing will play (docs/zh-cn/audio.md)`
-        : `add \`vendor/audio_glue.c\` to the manifest's \`sources\` and \`ASC_HAVE_AUDIO=1\` to \`defines\` (docs/zh-cn/audio.md)`;
+        : `add \`vendor/audio_glue.c\` to the manifest's \`sources\` and \`ASC_HAVE_AUDIO=1\` to \`defines\`` +
+          (process.platform === 'darwin' ? `, plus \`CoreAudio\`/\`AudioToolbox\` to \`frameworks\`` : ``) +
+          ` (docs/zh-cn/audio.md)`;
     console.warn(
       `warning: this program uses flash.media, but this build links no audio backend: play() returns null and ` +
         `SoundMixer.areSoundsInaccessible() is true.\n` +
@@ -650,6 +767,31 @@ function main(): void {
   // would otherwise surface later as a SIGILL on the first text-shaping call.
   if (deploySkiaIcuData(cfg, outPath)) {
     console.log(`[4/4] data        icudtl.dat -> ${dirname(resolve(outPath))}`);
+  }
+
+  // The recompiled ANE native libraries and the FRE host DLL go next to the
+  // executable, which is where as_ext_dir()/LoadLibraryA look. Staged rather
+  // than referenced in place so the build directory is self-contained: copy the
+  // exe somewhere else and its extensions still load.
+  if (aneResolution) {
+    const written = stageAneNatives(aneResolution, outPath);
+    const hostDir = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      '../lib',
+      'bin',
+      aneHostDirName(aneResolution.platform)
+    );
+    const dll = resolve(hostDir, 'asaot.dll');
+    if (!existsSync(dll)) {
+      throw new Error(
+        `asaot.dll is missing from ${hostDir}. Build it first: run lib/build-asaot.bat ` +
+          '(it needs clang; see as3compiler/lib/asaot_host.c). Only the Windows host ' +
+          'library is built today, so an --ane-platform for another OS has no host side yet.'
+      );
+    }
+    copyFileSync(dll, join(dirname(resolve(outPath)), 'asaot.dll'));
+    console.log(`[4/4] ane         asaot.dll + ${written.length} native library(ies) -> ${join(dirname(resolve(outPath)), 'extensions')}`);
+    for (const w of written) console.log(`                  extensions/${w}`);
   }
 
   console.log(`Build successful: ${outPath}`);

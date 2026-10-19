@@ -173,13 +173,26 @@ double sk_window_probe_scale(int w, int h, int highdpi, int* pw, int* ph) {
   return (w > 0) ? (double)dw / (double)w : 1.0;
 }
 
-// Query the primary display's current mode (pixels). Returns 1 on success.
+// Screen size for Stage.fullScreenWidth/Height and
+// Capabilities.screenResolutionX/Y, in **logical** units (AIR calls them DIP).
+//
+// Which SDL query, and why it matters on Windows: adl 51.4.1 on a 3840x2560
+// desktop at 150% scaling reports fullScreen 2560x1707 and screenDPI 96, while
+// flash.display.Screen.bounds on the SAME display is 3840x2560 -- AIR mixes a
+// DIP-space Stage property with a pixel-space Screen one. SDL hands back exactly
+// those two spaces, one query each: SDL_GetDisplayBounds is DIP-aware once the
+// DPI_SCALING hint above is set (measured 0,0 2560x1707, matching adl value for
+// value), whereas SDL_GetCurrentDisplayMode stays in physical pixels (3840x2560).
+// macOS reports points for BOTH, so the two agree there and nothing changes.
+// Using the mode here was what made a Stage3D app (examples/air-starling-demo,
+// which sizes its Starling viewport from fullScreenWidth/Height) diverge from adl
+// on Windows while macOS matched -- see docs/zh-cn/win32.md.
 int sk_window_get_display_size(int* w, int* h) {
   if (g_display_w <= 0 || g_display_h <= 0) {
     if (sk_video_init() != 0) return 0;
-    SDL_DisplayMode dm;
-    if (SDL_GetCurrentDisplayMode(0, &dm) == 0) {
-      g_display_w = dm.w; g_display_h = dm.h;
+    SDL_Rect r;
+    if (SDL_GetDisplayBounds(0, &r) == 0) {
+      g_display_w = r.w; g_display_h = r.h;
     }
     SDL_Quit();
   }
@@ -194,6 +207,13 @@ int sk_window_get_display_size(int* w, int* h) {
 // full extent; `usable bounds` excludes the menu bar and the Dock — the two are
 // different quantities on the same display (measured against adl: bounds
 // 0,0 1800x1169 vs visibleBounds 47,39 1753x1130 on a dock-left desktop).
+//
+// SPACE NOTE (open divergence, TODO.md): AIR reports Screen.bounds/visibleBounds in
+// PHYSICAL pixels (3840x2560 on the desktop where Stage.fullScreenWidth is 2560, i.e.
+// a 2560x1707 DIP space), while this query answers the same point space the Stage
+// property uses. It is deliberately left alone: the window frame/centering math shares
+// this function and is written in SDL's logical space, so converting only Screen would
+// break centering. See docs/zh-cn/win32.md 3.5.
 //
 // These queries may run from inside the window event loop (AS3 code reading
 // Screen.mainScreen in a frame callback), so they must never call SDL_Quit —
@@ -357,6 +377,9 @@ struct WinCtx {
 };
 
 static WinCtx g_wins[SK_MAX_WINDOWS];
+// NativeApplication.exit() sets this; sk_run_loop consumes it and retires every
+// window through the normal teardown path (see sk_window_request_exit).
+static int g_exit_requested = 0;
 // -1 until the first window exists; the "main" window is simply the first slot
 // ever filled, so it stays index 0 in every build.
 static int g_main = -1;
@@ -906,6 +929,30 @@ int sk_clipboard_get_text(char* buf, int cap) {
   return n;
 }
 
+#if defined(__APPLE__)
+// True for the eight modifier scancodes. Used by the macOS duplicate filter
+// below; the modifier KEYS are the only ones whose platform path can report a
+// single physical transition twice, so only this build needs the helper.
+static int sk_is_modifier_scancode(SDL_Scancode sc) {
+  switch (sc) {
+    case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_RSHIFT:
+    case SDL_SCANCODE_LCTRL:  case SDL_SCANCODE_RCTRL:
+    case SDL_SCANCODE_LALT:   case SDL_SCANCODE_RALT:
+    case SDL_SCANCODE_LGUI:   case SDL_SCANCODE_RGUI:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+// The last modifier transition actually handed to the AS3 side. File scope
+// because SDL keeps ONE keystate[] for the whole process (src/events/
+// SDL_keyboard.c), not one per window.
+static Uint32 g_mod_last_scancode = 0;
+static int    g_mod_last_down = -1;
+static int    g_mod_last_valid = 0;
+#endif
+
 // The shared event loop. Every window is polled, paced and presented from here;
 // the loop runs until no window is left (AIR's NativeApplication.autoExit
 // behaviour, which is what SDL's own "quit on last window close" matches).
@@ -915,6 +962,17 @@ static void sk_run_loop(void) {
   g_app_next = now;
   SDL_Event e;
   while (sk_any_open()) {
+    // NativeApplication.exit(): retire everything and leave, even though windows
+    // are still open. It goes through the same deferred teardown as a natural
+    // close, so the CLOSE dispatch and the ordering are identical. A separate
+    // path (destroying the SDL windows here) would be observable: the loop would
+    // stop pumping events while AS3 still held live window objects.
+    if (g_exit_requested) {
+      g_exit_requested = 0;
+      for (int i = 0; i < SK_MAX_WINDOWS; i++) {
+        if (g_wins[i].used) g_wins[i].destroy_pending = 1;
+      }
+    }
     // 1. Frame boundary: retire windows whose close was requested last frame.
     sk_service_destroy();
     if (!sk_any_open()) break;
@@ -1001,6 +1059,40 @@ static void sk_run_loop(void) {
           break;
         case SDL_KEYDOWN:
         case SDL_KEYUP:
+#if defined(__APPLE__)
+          // MODIFIER DOUBLE-SOURCE SUPPRESSION (macOS only).
+          //
+          // The cocoa backend reports ONE physical modifier transition TWICE:
+          // `Cocoa_DispatchEvent` (src/video/cocoa/SDL_cocoaevents.m:95-99)
+          // feeds BOTH `NSEventTypeKeyDown`/`KeyUp` AND
+          // `NSEventTypeFlagsChanged` into `Cocoa_HandleKeyEvent`. A modifier
+          // press therefore reaches `SDL_SendKeyboardKey` from keyDown:/keyUp:
+          // (SDL_cocoakeyboard.m:413/437) and AGAIN from `flagsChanged:` ->
+          // `HandleModifiers` (SDL_cocoakeyboard.m:200, 232-236). The second
+          // call finds keystate[scancode] already in the requested state, sets
+          // `repeat = SDL_TRUE` and posts anyway (src/events/SDL_keyboard.c:
+          // 846-861) -- two byte-identical SDL_KEYDOWN for the same scancode.
+          //
+          // adl delivers exactly ONE, so the extra one is our fidelity gap
+          // (TODO.md "窗口键盘通道把 Shift 自身的 keyDown/keyUp 各派发两次").
+          // A real macOS keyboard cannot auto-repeat a modifier -- holding
+          // Shift yields no `repeat` keyDowns -- so two CONSECUTIVE events with
+          // the same scancode AND the same direction cannot come from hardware.
+          // `repeat` alone is not a sufficient test (the KEYUP half of the
+          // artefact carries no repeat flag at all), hence (scancode,
+          // direction). Deliberately NOT done on Windows, which does
+          // auto-repeat modifiers: there the repetition is real input.
+          if (sk_is_modifier_scancode(e.key.keysym.scancode)) {
+            int down = (e.type == SDL_KEYDOWN) ? 1 : 0;
+            if (g_mod_last_valid && g_mod_last_scancode == e.key.keysym.scancode &&
+                g_mod_last_down == down) {
+              break;
+            }
+            g_mod_last_scancode = e.key.keysym.scancode;
+            g_mod_last_down = down;
+            g_mod_last_valid = 1;
+          }
+#endif
           // Auto-repeat is NOT filtered: measured on adl 51.4.1 by posting
           // 1 plain keyDown + 8 keyDowns flagged kCGKeyboardEventAutorepeat=1
           // (temp/xformcmp/seldir/repeat_probe.py); AIR delivered all 9
@@ -1655,6 +1747,32 @@ void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h) {
   if (y) *y = py - c->b_top;   // SDL reports the client top; the frame starts above it
   if (w) *w = cw + c->b_left + c->b_right;
   if (h) *h = ch + c->b_top + c->b_bottom;
+}
+
+// Frame borders of a chrome-decorated window, in physical pixels: top, left,
+// bottom, right. The counterparts of the b_* fields sk_measure_borders fills in.
+// NativeWindow.globalToScreen is the caller that needs them -- AIR's bounds is
+// the OUTER frame rect while globalToScreen counts from the CLIENT area's
+// top-left, so the border has to be added back. Measured on adl 51.4.1: bounds
+// (26,26) with borders (8,31) answers globalToScreen(0,0) = (34,57).
+void sk_window_get_borders(int id, int* top, int* left, int* bottom, int* right) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL) {
+    if (top) *top = 0; if (left) *left = 0; if (bottom) *bottom = 0; if (right) *right = 0;
+    return;
+  }
+  if (top) *top = c->b_top;
+  if (left) *left = c->b_left;
+  if (bottom) *bottom = c->b_bottom;
+  if (right) *right = c->b_right;
+}
+
+// NativeApplication.exit(): stop the shared event loop at the next turn even
+// though windows are still open. The flag is consumed in sk_run_loop, which then
+// lets sk_service_destroy retire every window exactly like a natural shutdown, so
+// the process exits with the same status either way.
+void sk_window_request_exit(void) {
+  g_exit_requested = 1;
 }
 
 // Request teardown. The window is NOT destroyed here: it is retired at the next

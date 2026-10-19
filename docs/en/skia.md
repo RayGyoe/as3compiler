@@ -460,7 +460,7 @@ files); reverting both fixes to their pre-fix shape turns **5 of them red on the
 
 ### 6.8 The drawable must be allowed to be sampled as a texture (advanced blend modes, stage one-hundred-sixty)
 
-**Symptom**: the AOT build of the TalkMED desktop app (`talkmed-meeting`) shows **large magenta regions** on
+**Symptom**: the AOT build of the AcmeApp desktop app (`acme-app`) shows **large magenta regions** on
 its home page (`(255,0,255)`, or `(117,20,124)` where the app's own dimming scrim covers it): the whole
 background band under the toolbar and the gaps between the cards, while the cards, icons and text themselves
 render correctly — in **every** frame, as soon as the cursor moves inside the window (and also when the window
@@ -473,7 +473,7 @@ Everything except `add` (`kPlus`) and `layer` (`kSrcOver`) — `darken`/`multipl
 express it, so Ganesh has to **read the destination back as a texture** and blend in a shader. On the Metal
 backend that destination is the **CAMetalLayer drawable** we wrapped, and a CAMetalLayer's drawables default to
 **`framebufferOnly = YES`** — a write-only storage mode that **forbids being used as a shader input**; when
-forced, Apple GPUs answer with **uninitialized memory**. The TalkMED home-page skin carries a
+forced, Apple GPUs answer with **uninitialized memory**. The AcmeApp home-page skin carries a
 `BlendMode.DARKEN` (baked from the SWC `PlaceObject3` BlendMode tag) whose clip covers the whole canvas, so
 that layer composites the garbage it read back (magenta) over the **entire window** with SrcOver semantics;
 whatever is drawn afterwards (cards, icons, dialog) simply lands on top — which is exactly the observed
@@ -488,7 +488,7 @@ test red, it just makes **any** app using one of those 7 modes render a fully ma
 spared because they never read the destination, which is also why earlier acceptance runs never caught it:
 the Starling demo and every `examples/` program used none of them).
 
-**Measurements** (`temp/tkmeet-mac/`, diff D26):
+**Measurements** (`temp/acme-mac/`, diff D26):
 
 | Step | Result |
 |---|---|
@@ -512,7 +512,7 @@ measured) — registered in `TODO.md`.
 > machine/CI requires applying that patch first, otherwise fonts like 微软雅黑 silently paint the wrong
 > characters. Patch list + rebuild steps: `vendor/skia/patches/README.md`.
 
-**Symptom** (TalkMED's 「创建同传」): the same source renders `创建同传` under `adl 51.4.1` but
+**Symptom** (AcmeApp's 「创建同传」): the same source renders `创建同传` under `adl 51.4.1` but
 `初开名伤` on our side; **ASCII/Latin is untouched and so are other CJK families** (PingFang SC,
 华文细黑) — only family `微软雅黑`, and only on a machine that has that particular pair of files.
 
@@ -586,6 +586,37 @@ machine** (CI machines do not have them), so no example assertion is provided; t
 `temp/tfswc/`.
 
 ---
+
+### 6.10 The frame boundary must reset the canvas state (stage 185; a real app whose "picture grows")
+
+The window compositing canvas **outlives a frame** (on the GPU path it is one reused `SkCanvas` per
+back buffer), and `ASC_window_render` is written as `save()` -> `scale(w->scale)` -> ... -> `restore()`.
+**When AS3 throws, longjmp unwinds through the renderer and skips those C-level `restores`**, so one
+`save` plus one device `scale` stay on the canvas; the next frame scales an already-scaled canvas and the
+damage **compounds frame over frame**. Measured on a real application (frame-start
+`getSaveCount()` / `getTotalMatrix()`):
+
+| Frame start | Base matrix scale | Effective content scale |
+|---|---|---|
+| pristine | `depth=1` / 1.0 | 1.5 (device scale only -- correct) |
+| after a boot exception | `depth=2` / 1.5 | 2.25 |
+| after one more | `depth=3` / 2.25 | **3.375 = 1.5^3** |
+
+Pixel ruler (`Fps` draws exactly 70x100 DIP): 105x150 px when correct, 236x337 px (~2.25x) when broken --
+and the **whole window** grows (HUD, SWC skin, login page), which is what separates this from a scaled
+display-list node. Rule the display list out first: every `scaleX/scaleY` and every `transform.matrix` was
+1 (dumped per level for `self`/`LoginView`/`stageView`/`Stage`/`skin`), `w->scale` stayed 1.5, and the
+per-object enter/exit CTM comparison showed **0 mismatches** -- yet the picture was scaled, so the scale
+lives in the canvas state itself.
+
+Fix: `sk_canvas_reset()` = `restoreToCount(1)` + `resetMatrix()`, called in `ASC_window_render` after
+`ASC_window_apply_stage_size` and **before this frame's own `save()` and device scale** (the order is the
+whole point -- resetting after the scale would throw the device scale away). Restores are balanced inside a
+frame, so on a clean frame this is a no-op; what it guarantees is that **no frame is ever contaminated by
+the previous one**. An exception still ruins only the frame it lands in (matching AIR: an uncaught error
+aborts the rest of that frame), and the next frame is pristine. The fix lives in the EMITTED code, so it is
+backend-agnostic (Metal / GL / D3D12 / raster share it; builds without a canvas API get a no-op stub).
+Source-level pin: `unit: render/FrameCanvasHygiene`.
 
 ## 7. Multi-target: native and wasm
 
@@ -689,7 +720,7 @@ Both live in the text layer (`vendor/skia_glue.cc` / `src/emit.ts`), and both we
 (290→28 for "中文", 100→523.5 for a long run). The old code unconditionally wrote
 `width = longest line of the already-wrapped layout + 4`, which is a **self-reinforcing loop**: a narrower
 field shortens the longest line, the shorter line narrows the field again, and every repaint shrinks it once
-more (measured 290 → 64.66 → 50.66 → 36.66 → 32). That is what broke the `title` of the TalkMED AI
+more (measured 290 → 64.66 → 50.66 → 36.66 → 32). That is what broke the `title` of the AcmeApp AI
 subtitle list item: it wrapped into three lines and ran over the `ctime`. One more observable point: `adl`
 reports the new box **right after assignment, with no draw in between** (`autoSize=LEFT` then `h=18`), so the
 generated `as_do_extents` (where both the `width` and `height` reads land) calls `as_tf_apply_autosize` too.
@@ -708,9 +739,9 @@ cached, so the strut and the runs both land on one face.
 Regression: `examples/autosize-metrics.as` (behavioural assertions, links Skia) +
 `unit: display/AutoSizeMetrics` (generated-C / glue structural nails, reverse-mutation verified).
 
-### 8.3 Metrics and glyph normalisation for a scaled field (阶段一百六十九)
+### 8.3 Metrics and glyph normalisation for a scaled field (stage one-hundred-sixty-nine)
 
-When a field's CTM carries a **non-uniform** scale (common with SWC placements — e.g. the TalkMED subtitle
+When a field's CTM carries a **non-uniform** scale (common with SWC placements — e.g. the AcmeApp subtitle
 skin's `ctime` child is `scaleX = 1.2246, scaleY = 1`), `adl`'s contract differs from ours in **two** places.
 Both were pinned against the `adl 51.4.1` same-source dual-end probe (`temp/tfswc` cases ⑯⑯b⑯c⑰b, size 12,
 nominal `166.00/12.00`):
@@ -752,12 +783,67 @@ issued **after** the `clipRect`: Skia maps a clip through the CTM in force at cl
 Regression: `examples/tf-scale-metrics.as` (6 relative metric assertions + 3 ink-width assertions through
 `draw(container)`, links Skia) + `unit: display/TfScaleMetrics` (10 nails, two reverse-mutation verified).
 
-### 8.1 `flash.text.StyleSheet` and HTML's **block-level** model (阶段一百四十八)
+### 8.4 Windows per-character font fallback: GDI primary + DirectWrite fallback (stage one-hundred-ninety-one)
 
-`StyleSheet` was upgraded in 阶段一百四十八 from a "reports but does nothing" shell into a **real class**
+**GDI's font manager has no per-character fallback at all** -- `SkFontMgrGDI::onMatchFamilyStyleCharacter`
+is an unconditional `return nullptr` (`build-tools/skia-src/src/ports/SkFontHost_win.cpp` ~2267), and Windows
+has no system-wide cascade of the kind CoreText provides on macOS. SkParagraph asks the manager for a fallback
+face for **every** code point the run's own face does not map, so when the field's family is a name GDI's family
+table cannot match, the resolved face is the Latin-only default and the **whole field** paints as `.notdef` --
+a block of identical boxes, not a stray glyph or two.
+
+Measured (`temp/fntface/`, 8 TextFields, size 18, text `创建会议 abc 0123`, `Stage.render` to a PNG + trace):
+
+| family | before textWidth/Height | after | before, pixels |
+|---|---|---|---|
+| `微软雅黑` | 153/16 | 153/16 | **4 `.notdef`** |
+| `MiSans Regular` | 153.532/18 | 153.532/18 | fine (the app registers MiSans itself) |
+| `Microsoft YaHei` | 157/20 | 157/20 | fine |
+| `SimSun` | 153/18 | 153/18 | fine |
+| `Arial` | 135/17 | 151/17 | fine |
+| `NoSuchFamilyXYZ` | 153/16 | 153/16 | **4 `.notdef`** |
+| `""` | 127/16 | 143/16 | **4 `.notdef`** |
+
+The trigger is the **same family, different spelling** problem: this box reports `Get-WinSystemLocale = zh-CN`
+but its **UI language is en-US**, so the 874 families GDI+ enumerates carry **English names only** -- there is
+`Microsoft YaHei`, there is no `微软雅黑`. And the family the SWC's tag-37 text characters declare
+(`createaisubtitleskin.title` / `stime` / `sourcetxt` / `targettxt` / `typetxt`, ...) is exactly `微软雅黑`.
+That is the garble the user reported: the AI-subtitle window's card painted its first line, 创建同传, as four
+`.notdef` glyphs; after the fix the same window at the same position renders 创建同传 normally (the other fields
+use MiSans or other families and were never garbled).
+
+**The fix: the Windows branch of `vendor/skia_glue.cc` becomes `SkAirFontMgr : public SkFontMgr`, GDI as
+`fPrimary` and DirectWrite as `fFallback`, with only `onMatchFamilyStyleCharacter` allowed across.** The other
+10 queries (`countFamilies` / `getFamilyName` / `createStyleSet` / `matchFamily` / `matchFamilyStyle` /
+`makeFromData` / `makeFromStream{Index,Args}` / `makeFromFile` / `legacyMakeTypeface`) are forwarded verbatim to
+GDI, so **a family that resolves today changes face in zero cases** (`MiSans Regular` / `Microsoft YaHei` /
+`SimSun` are byte-identical before and after in the table above). DirectWrite answers through its own
+`IDWriteFontFallback::MapCharacters` cascade -- the same one DirectWrite-based browsers use -- and only for the
+"the face lacks this code point" query. `Arial` and `""` got wider because the CJK they never used to draw now
+draws.
+
+**Why not a full DirectWrite swap, and why not `SkOrderedFontMgr`:** an ordered manager lets DirectWrite answer
+the **structured** (family/style) queries as well, and once a DirectWrite typeface reaches SkParagraph's
+structured path the AIR strut / height-override machinery stops working -- that row measured
+`textHeight = -Infinity` and painted nothing at all. Keeping GDI primary is what guarantees the
+"already-resolving families stay byte-identical" half.
+
+**No new link dependency:** Skia reaches DirectWrite through `LoadLibraryW("dwrite.dll")` +
+`GetProcAddress("DWriteCreateFactory")` (`build-tools/skia-src/src/utils/win/SkDWrite.cpp`), so no `.build.json`
+needs a `dwrite` entry and no manifest was changed. The block is inside `#if defined(_WIN32)`, so macOS and wasm
+are untouched; this Windows-side change is **not covered by CI** (CI is macOS), so the local pixel A/B is the
+only verification.
+
+Regression: `unit: platform/FontFallback` (9 nails: the single crossing point / the 10 `fPrimary->` delegations /
+the factory and its degradation / the macOS branch untouched / `SkOrderedFontMgr` excluded in reverse / both doc
+mirrors).
+
+### 8.1 `flash.text.StyleSheet` and HTML's **block-level** model (stage one-hundred-forty-eight)
+
+`StyleSheet` was upgraded in stage one-hundred-forty-eight from a "reports but does nothing" shell into a **real class**
 (`superClass: EventDispatcher`, reflect name `flash.text::StyleSheet`): `setStyle`/`getStyle`/`clear`/`styleNames`
-all land, and it becomes the **rule source** for `htmlText` layout. The trigger was talkmed-meeting's FPS overlay
-(`com.vsdevelop.controls.Fps.as`), which puts `htmlText` plus a `styleSheet` on a `TextField` whose `multiline`
+all land, and it becomes the **rule source** for `htmlText` layout. The trigger was acme-app's FPS overlay
+(`com.example.controls.Fps.as`), which puts `htmlText` plus a `styleSheet` on a `TextField` whose `multiline`
 stays at its default `false`: AIR shows **four lines** (FPS / MS / MEM / MAX), we squeezed the four values onto one.
 
 **The root cause is the block-level rule, not `<br>`.** Item-by-item measurement against `adl 51.4.1` (probes in
@@ -950,7 +1036,7 @@ right after decoding and nulled `bytes/len` (the comment said "only needed to de
 stayed `NULL`: `bitmapData.width/height` and `getPixel32` were **all correct** (the pixels really
 were decoded) and the screen **painted nothing**, without any error.
 
-TalkMED's login captcha takes exactly this path (the server returns `data:image/jpeg;base64,...`,
+AcmeApp's login captcha takes exactly this path (the server returns `data:image/jpeg;base64,...`,
 the app runs `Base64.decodeToByteArray` and then `Loader.loadBytes`): after the request started
 succeeding the captcha slot stayed blank while `adl` showed the image. It was localised by
 **temporarily instrumenting the app** (`content=[object Bitmap]`, `bitmapData 100x50`,

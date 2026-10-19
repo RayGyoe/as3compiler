@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
+import { SymbolTable } from '../../src/symbols.ts';
 import { registerGroup, root } from '../harness.ts';
 
 // A left-nested chain of N string literals, which is what the emitter sees for
@@ -726,10 +727,13 @@ function checkEmitE4xStringValue(): string[] {
   // is stringified by the object vtable, not by the emitter, so the vtable's
   // box_to_str slot must be the E4X string value -- otherwise every label the real
   // app resolves out of an XML document renders "[object XML]".
+  // The three int slots before the toString hook are is_proxy / is_dynamic /
+  // is_final; the last one is what describeType reports as <type isFinal="...">
+  // (XML is final in AIR, Object is not).
   check('the XML vtable stringifies through as_xml_box_to_str',
-    pre.includes('static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, as_xml_box_to_str,'));
+    pre.includes('static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, 0, 1, as_xml_box_to_str,'));
   check('the XMLList vtable stringifies through as_xml_list_box_to_str',
-    pre.includes('static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, as_xml_list_box_to_str,'));
+    pre.includes('static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, 0, 1, as_xml_list_box_to_str,'));
   check('...and both helpers delegate to the string-value rules',
     pre.includes('static char* as_xml_box_to_str(void* o) { return as_xml_string_value((as_xml_node*)o); }')
     && pre.includes('static char* as_xml_list_box_to_str(void* o) { return as_xml_list_to_string((as_xml_list*)o); }'));
@@ -737,6 +741,80 @@ function checkEmitE4xStringValue(): string[] {
   return bad;
 }
 registerGroup('unit: e4x/StringValue', checkEmitE4xStringValue);
+// ---- E4X markup serialisation (`toXMLString()`), 阶段一百九十三 ----------------
+// `toXMLString()` used to be a LOUD CodegenError (TODO.md leftover row "E4X 序列化
+// 残差"). It now lowers to the runtime markup serialiser, and that serialiser
+// re-indents the way adl does instead of keeping the source form. Every rule pinned
+// here was measured on adl 51.4.1 (temp/toxml/: mxmlc + adl, XML and XMLList);
+// examples/e4x-toxmlstring.as carries the values end to end.
+function checkEmitE4xToXMLString(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [toxml] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [toxml] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const count = (hay: string, needle: string): number => hay.split(needle).length - 1;
+  // Wiring is only observable in the generated C: the emitter decides the lowering.
+  // A CodegenError here is a MISSING lowering, not a harness crash -- record it as a
+  // failed label so this group reports the reason instead of dying whole.
+  const gen = (src: string): string => {
+    try { return generateC(parse(src)).c; }
+    catch (e) { return '<<codegen error: ' + String(e) + '>>'; }
+  };
+  const cXml = gen('var doc:XML = new XML("<a/>");\ntrace(doc.toXMLString());\n');
+  const cList = gen('var doc:XML = new XML("<r><i>a</i></r>");\nvar l:XMLList = doc.i;\ntrace(l.toXMLString());\n');
+  check('toXMLString() on an XML lowers to the markup serialiser',
+    cXml.includes('as_xml_to_string('));
+  check('toXMLString() on an XMLList lowers to the LIST markup helper',
+    cList.includes('as_xml_list_to_xml_string('));
+  check('…and the emitted call is the list MARKUP helper',
+    count(cList, 'as_xml_list_to_xml_string') >= 2); // once as the definition, once as the call
+  check('…never the string-value helper at the call site',
+    !/as_xml_list_to_string\(\(\(/.test(cList));
+  // The shape rules. A childless element stays INLINE; an element with element
+  // children puts one item per line and indents the closing tag back to its level.
+  check('a childless element with no text self-closes',
+    pre.includes('if (!n->text) { as_xml_append(&out, &len, &cap, "/>", 2); return out; }'));
+  check('children are serialised one level deeper',
+    pre.includes('char* cs = as_xml_markup(n->children[i], level + 1);'));
+  check('the item indent is one level deeper than the element',
+    pre.includes('as_xml_indent(ib, level + 1);'));
+  check('the closing tag returns to the element own level',
+    pre.includes('as_xml_indent(ib, level);'));
+  check('indentation is two spaces per level',
+    pre.includes("for (int i = 0; i < level && ind < 62; i++) { buf[ind++] = ' '; buf[ind++] = ' '; }"));
+  // Whitespace-only text is pruned at PARSE time, which is why <a> </a> prints as
+  // <a/> and not <a></a> -- the reason the inline branch above can be trusted.
+  check('a whitespace-only text node is stored as NULL by the parser',
+    pre.includes('if (node->text && node->text[0] == 0) node->text = NULL;'));
+  // toXMLString is the markup, ALWAYS: unlike toString() it must not reduce a
+  // childless element to its text, and a one-item XMLList keeps its item's markup.
+  check('the XML markup branch is reachable without the child-count test',
+    pre.includes('static char* as_xml_to_string(as_xml_node* n) { return as_xml_markup(n, 0); }'));
+  // A substring that occurs in TWO helpers cannot pin either one: `as_xml_list_to_string`
+  // and `as_xml_list_to_xml_string` differ only in which reader they call per item.
+  // Extract the body under test, so the pin discriminates the helper it names.
+  const bodyOf = (name: string): string => {
+    const i = pre.indexOf('static char* ' + name + '(');
+    if (i < 0) return '<<no such helper>>';
+    return pre.slice(i, pre.indexOf('\n}\n', i) + 3);
+  };
+  check('a one-item XMLList keeps the item MARKUP for toXMLString',
+    bodyOf('as_xml_list_to_xml_string').includes('as_xml_to_string(l->items[i])')
+    && !bodyOf('as_xml_list_to_xml_string').includes('as_xml_string_value'));
+  check('…while toString() of a one-item XMLList still delegates to the string value',
+    bodyOf('as_xml_list_to_string').includes('if (l->length == 1) return as_xml_string_value(l->items[0]);'));
+  // The attribute quote is built as a char array, not as an escaped literal: the
+  // preamble is a TS template literal, so "\\\"" in the source would reach the C
+  // half-eaten (see the as_xml_markup comment). Pin the working form.
+  check('attributes are quoted with a char array, not an escaped literal',
+    pre.includes("char q[2]; q[0] = '\"'; q[1] = 0;"));
+  console.log(`     [toxml] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: e4x/ToXMLString', checkEmitE4xToXMLString);
 
 // ---- an Object slot holding a primitive / a function value ----
 // Our Object-typed slots are raw pointers, so a scalar must be BOXED to live in one
@@ -1569,3 +1647,200 @@ function checkEmitGeneratedNameReservation(): string[] {
   return bad;
 }
 registerGroup('unit: emit/GeneratedNameReservation', checkEmitGeneratedNameReservation);
+
+// ---- the ANE-facing ExtensionContext surface (docs/zh-cn/ane.md) ----
+//
+// These pin the AS3 half of the native-extension bridge as EMITTED C -- the exact
+// text a build produces. That matters here because each of these bodies is a §1.5
+// decision: an API this build cannot honour answers null / an empty File AND says
+// so, rather than fabricating a value. A body that silently returns something
+// plausible is the failure mode the pins exist for: the old
+// getExtensionDirectory() handed back a pathless File with no announcement at all,
+// which reads exactly like "this extension genuinely has no directory".
+function checkAneExtensionContextSurface(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [ane] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [ane] ${label}`); }
+  };
+  // `mxmlc` 51.4.1 requires BOTH arguments of createExtensionContext (measured: the
+  // one-argument call is rejected with 「参数的数量不正确。要求 2 个」), so the second
+  // argument is passed explicitly here -- the pins below are about the emitted ANE
+  // surface, not about this call's arity (see unit: builtin/Arity).
+  const c = generateC(parse('import flash.external.ExtensionContext;\nvar x:* = ExtensionContext.createExtensionContext("a.b", null);\ntrace(x);\n')).c;
+
+  // getExtensionDirectory() names the directory the extension's OWN files live in.
+  // The build stages each extension's native library into a directory of its own,
+  // but that directory holds the library alone -- the rest of the package is not
+  // unpacked -- so it has to say so rather than hand back a path that looks right
+  // and fails one level deeper inside the extension.
+  const dir = /File\* ExtensionContext_getExtensionDirectory_static\(char\* extensionID\) \{[^}]*\}/.exec(c);
+  check('getExtensionDirectory has an emitted body', dir !== null);
+  check('…and reports the gap instead of silently returning a pathless File',
+    dir !== null && /as_shell_unsupported\("/.test(dir[0]));
+  check('…still returns a live File so a caller can inspect it',
+    dir !== null && /return File_new\(NULL\);/.test(dir[0]));
+  // …and the report is not a guess about the platform: it names this build's own
+  // staging layout and what is missing from it, which is what a reader needs to know
+  // to work around it.
+  check('…naming the staging layout rather than guessing a path',
+    dir !== null && /extensions\/<extensionID>\/<platform>/.test(dir[0]));
+  check('…and saying what that directory does NOT hold',
+    dir !== null && /the rest of the package is not unpacked/.test(dir[0]));
+
+  // AIR has no ExtensionContext.extensionID member (mxmlc rejects it, adl raises
+  // #1069). The struct must not grow one just to look more complete: the id is an
+  // argument to createExtensionContext, not a property of the context.
+  const struct = /struct ExtensionContext \{[^}]*\}/.exec(c);
+  check('the ExtensionContext struct is emitted', struct !== null);
+  check('…with actionScriptData as a real member', struct !== null && /actionScriptData/.test(struct[0]));
+  check('…and no extensionID member', struct !== null && !/extensionID/.test(struct[0]));
+
+  // A context whose extension never loaded is the one case AIR also answers with
+  // null; the call site must be named rather than folded into a generic miss.
+  check('call() on a never-loaded context names that case',
+    c.includes('ExtensionContext.call on a context whose extension never loaded'));
+
+  console.log(`     [ane-ctx] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: ane/ExtensionContextSurface', checkAneExtensionContextSurface);
+
+// Built-in arity vs AIR (阶段一百九十五, TODO.md 遗留项 #75).
+//
+// The defect was a table defect, not an emitter one: `gnum` handed every numeric
+// built-in parameter a `0` default, so AIR-REQUIRED parameters looked optional
+// (`g.moveTo(1)`, `m.rotate()`, `new ShaderData()` all compiled here although
+// `mxmlc` 51.4.1 rejects them), while parameters AIR really does default were
+// declared REQUIRED (`ctx.drawTriangles(ib)`). Every arity was measured cell by
+// cell against `mxmlc` (temp/optarg/: 4964 cells, the acceptance oracle) and the
+// default VALUES come from the AS3 reference pages (temp/asdoc/docs.json).
+//
+// This group pins the DATA (the parameter list a built-in method declares) and the
+// EMISSION (the C call the omitted argument produces); the negative half -- what
+// must NOT compile -- lives in unit: diagnostics/Codegen, because a CodegenError
+// cannot be asserted from an example.
+
+function checkBuiltinArity(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [arity] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [arity] ${label}`); }
+  };
+  // `name` + `?` marks an optional parameter (a default the caller may omit);
+  // the value itself is asserted separately where the VALUE is the contract.
+  const table = new SymbolTable();
+  table.collect(parse('var x:int = 1;'));
+  const params = (cls: string, name: string, isStatic = false) => {
+    const info = table.classes.get(cls);
+    const m = info ? (isStatic ? info.staticMethods : info.methods).get(name) : undefined;
+    return m ? m.params : undefined;
+  };
+  const shapeOf = (cls: string, name: string, isStatic = false): string => {
+    const ps = params(cls, name, isStatic);
+    return ps ? ps.map((p) => p.name + (p.defaultValue === null ? '' : '?')).join(',') : '<<no such method>>';
+  };
+  const defOf = (cls: string, name: string, param: string, isStatic = false): string => {
+    const p = (params(cls, name, isStatic) ?? []).find((q) => q.name === param);
+    return p ? JSON.stringify(p.defaultValue) : '<<no such parameter>>';
+  };
+
+  check('a built-in required parameter carries no default (Graphics.moveTo)',
+    shapeOf('Graphics', 'moveTo') === 'x,y');
+  check('…the invented `0` default is gone from the data, not just the emitter',
+    params('Graphics', 'moveTo')!.every((p) => p.defaultValue === null));
+  check('Matrix.rotate has one required parameter', shapeOf('Matrix', 'rotate') === 'angle');
+  check('Point.normalize / Rectangle.contains are required again too',
+    shapeOf('Point', 'normalize') === 'thickness' && shapeOf('Rectangle', 'contains') === 'x,y');
+
+  check('an AIR-optional parameter keeps its place (Graphics.beginFill)',
+    shapeOf('Graphics', 'beginFill') === 'color,alpha?');
+  check('…with AIR the documented default value (alpha = 1)',
+    defOf('Graphics', 'beginFill', 'alpha') === JSON.stringify({ kind: 'Num', value: 1, isInt: false }));
+
+  // Context3D: the AIR signatures, parameter by parameter.
+  check('Context3D.drawTriangles takes (indexBuffer, firstIndex = 0, numTriangles = -1)',
+    shapeOf('Context3D', 'drawTriangles') === 'indexBuffer,firstIndex?,numTriangles?'
+    && defOf('Context3D', 'drawTriangles', 'firstIndex') === JSON.stringify({ kind: 'Num', value: 0, isInt: true })
+    && defOf('Context3D', 'drawTriangles', 'numTriangles') === JSON.stringify({ kind: 'Num', value: -1, isInt: true }));
+  // ORDER is semantic: AIR puts numInstances SECOND, so a table with
+  // (indexBuffer, firstIndex, numTriangles, numInstances) would silently read
+  // firstIndex where the caller wrote numInstances.
+  check('Context3D.drawTrianglesInstanced puts numInstances SECOND (AIR order)',
+    shapeOf('Context3D', 'drawTrianglesInstanced') === 'indexBuffer,numInstances,firstIndex?,numTriangles?');
+  check('…and only the first TWO parameters are required',
+    defOf('Context3D', 'drawTrianglesInstanced', 'numInstances') === 'null'
+    && defOf('Context3D', 'drawTrianglesInstanced', 'firstIndex') !== 'null');
+  check('Context3D.configureBackBuffer keeps antiAlias REQUIRED (AIR: no default)',
+    shapeOf('Context3D', 'configureBackBuffer') === 'width,height,antiAlias,enableDepthAndStencil?,wantsBestResolution?,wantsBestResolutionOnBrowserZoom?'
+    && defOf('Context3D', 'configureBackBuffer', 'enableDepthAndStencil') === JSON.stringify({ kind: 'Bool', value: true }));
+  check('Context3D.setProgramConstantsFromMatrix defaults only transposedMatrix',
+    shapeOf('Context3D', 'setProgramConstantsFromMatrix') === 'programType,firstRegister,matrix,transposedMatrix?'
+    && defOf('Context3D', 'setProgramConstantsFromMatrix', 'transposedMatrix') === JSON.stringify({ kind: 'Bool', value: false }));
+  check('Context3D.setRenderToTexture / setVertexBufferAt / setProgramConstantsFromVector match AIR',
+    shapeOf('Context3D', 'setRenderToTexture') === 'texture,enableDepthAndStencil?,antiAlias?,surfaceSelector?'
+    && shapeOf('Context3D', 'setVertexBufferAt') === 'index,buffer,bufferOffset?,format?'
+    && shapeOf('Context3D', 'setProgramConstantsFromVector') === 'programType,firstRegister,data,numRegisters?');
+  check('Stage3D.requestContext3D names its parameter as AIR does, defaulting to "auto"',
+    shapeOf('Stage3D', 'requestContext3D') === 'context3DRenderMode?'
+    && defOf('Stage3D', 'requestContext3D', 'context3DRenderMode') === JSON.stringify({ kind: 'Str', value: 'auto' }));
+
+  // The shell-block classes still go through the old `shReq` helpers -- the audit
+  // had to fix their parameters by hand (their class blocks are built by `shell`).
+  check('StageWebView.loadString defaults mimeType to text/html (shell-block class)',
+    shapeOf('StageWebView', 'loadString') === 'text,mimeType?'
+    && defOf('StageWebView', 'loadString', 'mimeType') === JSON.stringify({ kind: 'Str', value: 'text/html' }));
+  check('Microphone.setLoopBack defaults state to true (shell-block class)',
+    shapeOf('Microphone', 'setLoopBack') === 'state?'
+    && defOf('Microphone', 'setLoopBack', 'state') === JSON.stringify({ kind: 'Bool', value: true }));
+  check('Clipboard.clearData requires its mimeType again',
+    shapeOf('Clipboard', 'clearData') === 'mimeType');
+  check('in the Matrix3D block BOTH the instance and the static interpolate lost the 0 default',
+    shapeOf('Matrix3D', 'interpolate') === 'thisMat,toMat,percent'
+    && shapeOf('Matrix3D', 'interpolate', true) === 'thisMat,toMat,percent');
+  check('Object.hasOwnProperty/propertyIsEnumerable take `name` as optional-null (AIR accepts the empty call)',
+    shapeOf('Object', 'hasOwnProperty') === 'name?' && defOf('Object', 'hasOwnProperty', 'name') === JSON.stringify({ kind: 'Null' })
+    && shapeOf('Object', 'propertyIsEnumerable') === 'name?');
+
+  // ---- the emission half: an omitted argument becomes AIR's default in the call ----
+  const src = [
+    'import flash.display3D.Context3D;',
+    'import flash.display3D.IndexBuffer3D;',
+    'import flash.geom.Matrix3D;',
+    'function probe(ctx:Context3D, ib:IndexBuffer3D, m:Matrix3D):void {',
+    '  ctx.drawTriangles(ib);',
+    '  ctx.drawTrianglesInstanced(ib, 3);',
+    '  ctx.drawTrianglesInstanced(ib, 3, 1);',
+    '  ctx.configureBackBuffer(1, 1, 0);',
+    '  ctx.setProgramConstantsFromMatrix("vertex", 0, m);',
+    '  trace("probe");',
+    '}',
+    'probe(null, null, null);',
+    '',
+  ].join('\n');
+  let c: string;
+  try { c = generateC(parse(src)).c; }
+  catch (e) { c = '<<codegen error: ' + String(e) + '>>'; }
+  const callLine = (needle: string, nth = 0): string =>
+    c.split('\n').filter((l) => l.includes(needle))[nth] ?? '<<no such call>>';
+  check('drawTriangles(ib) emits the AIR defaults (idx 0, triangles -1)',
+    callLine('->drawTriangles(').trim().endsWith('ib, 0, -1));'));
+  check('drawTrianglesInstanced(ib, 3) fills numInstances (NOT firstIndex) with 3',
+    callLine('->drawTrianglesInstanced(').trim().endsWith('ib, 3, 0, -1));'));
+  check('…and a three-argument call fills firstIndex after numInstances',
+    callLine('->drawTrianglesInstanced(', 1).trim().endsWith('ib, 3, 1, -1));'));
+  check('configureBackBuffer(1,1,0) emits depth/stencil true and both resolution flags false',
+    callLine('->configureBackBuffer(').trim().endsWith('((unsigned int)(0)), true, false, false));'));
+  check('setProgramConstantsFromMatrix(..., 0, m) emits transposedMatrix false',
+    callLine('->setProgramConstantsFromMatrix(').trim().endsWith('"vertex", 0, m, false));'));
+  // The C helper signature must use the SAME order as the AS3 parameter list --
+  // otherwise the call above would compile and silently swap the two ints.
+  check('the C helper takes the AIR order too (numInstances before firstIndex)',
+    c.includes('Context3D_drawTrianglesInstanced(void* _this, IndexBuffer3D* indexBuffer, int numInstances, int firstIndex, int numTriangles) {'));
+
+  console.log(`     [arity] ${ok} built-in arity check(s) passed`);
+  return bad;
+}
+registerGroup('unit: builtin/Arity', checkBuiltinArity);

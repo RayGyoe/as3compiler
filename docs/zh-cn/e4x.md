@@ -102,16 +102,29 @@ Starling 连纹理图集和位图字体都加载不了**，是渲染管线的硬
 
 | 形状 | `toString()` | `toXMLString()` |
 |---|---|---|
-| 文本节点 `XML("plaintext")` | `plaintext` | — |
+| 文本节点 `new XML("plaintext")` | `plaintext` | `plaintext`（本子集**构造**即报错，见下 ①） |
 | `<a b='1'>txt</a>`（**无**元素子节点） | `txt` | `<a b="1">txt</a>` |
 | `<a b='1'/>`（无子节点） | `""` | `<a b="1"/>` |
-| `<a b='1'><c d='2'/></a>`（**有**元素子节点） | 标记 | 标记 |
-| `<a>x<b/>y</a>` | 标记 | 标记 |
-| `XMLList`：0 / **1** / ≥2 项 | `""` / **该项的字符串值**（`"a"`） / 各项**标记**以换行连接 | — |
+| `<a> </a>`（纯白空格文本） | `""` | `<a/>` |
+| `<a b='1'><c d='2'/></a>`（**有**元素子节点） | 标记（2 空格缩进） | 同 `toString()` |
+| `<a>x<b/>y</a>` | 标记（按文档序**交错**） | 同 `toString()` |
+| `XMLList`：0 / **1** / ≥2 项 | `""` / **该项的字符串值**（`"a"`） / 各项**标记**以换行连接 | `""` / **该项的标记**（`<i>a</i>`） / 同左 |
 
-**仍未对齐**（同一批实测，已登记 `TODO.md` 遗留表）：① **`toXMLString()` 未实现**（响亮
-`CodegenError: unsupported XML/XMLList method 'toXMLString'`）；② 标记输出**保持源形态**，而 AIR 会**重新缩进**
-（`<a><b/></a>` → `<a>\n  <b/>\n</a>`）并**剪掉纯白空格文本节点**（`<a> </a>` → `<a/>`）。
+**阶段一百九十三补齐**（同一段 `adl 51.4.1` 实测，`temp/toxml/`：XML + XMLList 共 24 格逐字一致）：`toXMLString()`
+接线到标记序列化器 `as_xml_to_string`（`XMLList` 走 `as_xml_list_to_xml_string`），且标记按 AIR **重新缩进** ——
+**无**元素子节点 ⇒ 单行内联（`<a b="1">txt</a>`）；**有** ⇒ 每行一项、每层 2 空格、闭合标签回本层，并**剪掉纯白
+空格文本节点**；属性一律**双引号**；注释与 `<?xml …?>` 声明被丢弃。端到端断言见 `examples/e4x-toxmlstring.as`，
+结构钉见 `test/unit/emit.ts` 的 `unit: e4x/ToXMLString`。
+
+**仍未对齐**（三条，已登记 `TODO.md` 遗留表）：
+
+① **文本节点构造**：`new XML("plaintext")` 在 AIR 是文本节点（`toString()`/`toXMLString()` 均为 `plaintext`），
+我们 `as_xml_parse` 对「根元素之前的游离文本」返回 NULL ⇒ **构造时**响亮 `XML parse error`。属**解析器**欠账，
+与序列化无关（阶段一百九十三未动解析器）。
+② **混合内容**：我们解析时把每个文本 run 并成**一个**（且 trim 过的）块，故 `<a>a<b/>b</a>` 输出
+`<a>\n  ab\n  <b/>\n</a>`，而 AIR 按**文档序交错**（`<a>\n  a\n  <b/>\n  b\n</a>`）。
+③ **实体**：解析**不解码**实体，故输出原样回显（`&amp;` 恰与 AIR 一致，但 `&#65;` 不会还原成 `A`）；同样因为
+未解码，输出侧**不能**补转义（会重复转义）。
 
 ### 2.7 动态槽里的 XML/XMLList 也必须是字符串值（阶段一百四十四，实测 `temp/xmlstr3` + `temp/apv/adl`）
 
@@ -134,6 +147,47 @@ Starling 连纹理图集和位图字体都加载不了**，是渲染管线的硬
 **实现**：`as_xml_vt`/`as_xml_list_vt` 的 `box_to_str` 从 `as_object_box_to_str` 换成
 `as_xml_box_to_str`/`as_xml_list_box_to_str`（委托给 `as_xml_string_value`/`as_xml_list_to_string`）。
 例：`examples/xml-dynamic-str.as`；结构钉：`unit: e4x/StringValue` 后三条。
+
+例：`examples/xml-dynamic-str.as`；结构钉：`unit: e4x/StringValue` 后三条。
+
+### 2.8 `describeType` 的 XML 形状（阶段一百八十六，实测 `temp/dtor` + `temp/t1`）
+
+`describeType` 的产物是 应用侧模型映射器（`BaseModel.fromJSON`）的**唯一输入**：它遍历
+`describeType(this)..variable` / `..accessor`，按 `@name`/`@type` 把 JSON 字段赋到模型上。此前的实现只发一个
+**无子节点**的 `<type name="包::类"/>`，于是 `..variable` 恒为空、所有字段停在 AS3 默认值、嵌套模型保持
+`null`，下一次读取就抛未捕获的 `#1009`（真应用「点击某会议即卡死」的根因）。阶段一百八十六按
+`adl 51.4.1` 逐项对齐：
+
+| 语义 | 实测口径 |
+|---|---|
+| `@name` / `@type` | 用 **`::`**（`pkg::PackThing`、`flash.display::Sprite`、`__AS3__.vec::Vector.<int>`），不是点号 |
+| 实例视图 | `base="<直接父类>"`、`isStatic="false"`，成员直接内联；**`Object` 实例无 `base`、无 `<extendsClass>`** |
+| 类视图 | `base="Class"`、`isStatic="true"`，`<extendsClass type="Class"/>` + `<extendsClass type="Object"/>` + `<accessor name="prototype" access="readonly" type="*" declaredBy="Class"/>`，成员挂在 `<factory type="类名">` 下 |
+| 继承链 | `<extendsClass>`/`<implementsInterface>` 列**完整链**（最近的在前，含 `Object`） |
+| 成员可见性 | **只列 public** |
+| `variable` / `constant` | **无** `declaredBy`；不存在的属性读出来是**空串**（AIR 同） |
+| `accessor` / `method` | **有** `declaredBy`；`accessor` 带 `access="readonly\|writeonly\|readwrite"` |
+| `method` | 带 `returnType` 与每个参数的 `<parameter index/type/optional>`；**rest 参数不列** |
+| `<constructor>` | 仅当构造器**有参数**时出现（签名走 `as_dt_ctors[]` 侧表 —— 只有带参构造器、自身又无方法的类，方法表里没有它的位置） |
+| 接口名 | 走 `as_dt_iface_names[]` 侧表（接口 vtable 只有 5 字段前缀，没有 `fqn` 槽位） |
+| `Object` 自身成员 | **从不列**（子类与普通对象都一样）⇒ `describeType({})` 就是一个裸的 `<type name="Object" isDynamic="true" isFinal="false" isStatic="false"/>` |
+| 基元 / 容器 | `int`/`Number`/`String`/`Boolean` → `isDynamic=false`、`isFinal=true`（`String` 另有只读 `length`）；`Array` → dyn=true/fin=false + 可读写 `length`(uint)；`Vector.<int>` → dyn=true/**fin=true**；`flash.utils::Dictionary` → dyn=true；`Date` 无包名 |
+| `describeType(null)` | **空串**；`describeType(undefined)` 抛 `#1010` |
+| 成员顺序 | AIR 是**不可复现的哈希序**，我们按声明序 —— 这是**刻意**的差异（`adl` 自己的顺序每次运行都可能不同） |
+
+**实现取径**：不新造「每类一个 describeType 大 blob」，而是**扩充已有反射表**（`as_prop` 增
+`is_accessor`/`is_const`、`as_method` 增 `sig`、vtable 头增 `is_dynamic`/`is_final`），XML 在运行时由这些表拼装。
+体积小，且 `describeType` 从未被调用时 `-O2` 能把整块（`static` 函数）剪掉。
+
+**两个必须记住的安全口径**：
+
+1. **判定「是不是类实例」只能是「把候选对象的第一个字拿去和 `as_class_registry[i].cls->vtable` 比」** ——
+   `Array`/`Dictionary`/`Vector`/`XML` 的 GC 体第一个字是**数据/名字指针**，一旦当 vtable 解引用就崩。比较**不解引用**，
+   再配合 `as_dyn_kind(v.ptr) != 0` 前置闸门，错认与崩溃一起消掉。
+2. **`as_prop_read` 的 tag 10（声明类型是 `Array` 的字段）必须 box 成 `as_v_arr`（tag 6）**，不能 box 成对象 ——
+   否则数组的**数据指针**会被当成 vtable 暴露给所有反射消费者（`String(x)`、`is Array`、动态访问）。
+
+例：`examples/describe-type.as`；结构钉：`unit: reflect/DescribeType`、`unit: reflect/PropBoxing`。
 
 ---
 
@@ -174,8 +228,8 @@ E4X 是 ES4 规范的产物，AS3 完全继承。翻译时必须显式处理的�
 | `lexer.ts` | ✅ `@` 已识别为后置运算符（E4X 属性访问）；✅ **XML 字面量**模式（阶段一百零六 落地 `<a b="1">…</a>`：递归 name-stack 配平、注释/CDATA/PI、`{expr}` 插值**响亮拒绝**；阶段一百零八 修掉「兄弟元素之间的文本未跳过 ⇒ 缩进过的多行字面量报 `unterminated regular expression`」的扫描缺陷） |
 | `parser.ts` | ✅ `expr.@attr`、`.child` E4X 导航、`.(pred)` 过滤谓词、**后代轴** `x..name`/`x..*`（阶段一百零六）、**计算名两轴** `x.ns::[expr]`（孩子轴）与 `x.@[expr]`（属性轴）（阶段一百零八，`ns` 限定词按「命名空间编译期透明」折叠丢弃）、`XML`/`XMLList` 类型注解 |
 | `symbols.ts` | ✅ `XML`/`XMLList` 已建模（`kind:'xml'/'xmllist'`）；`System.disposeXML` 已建模 |
-| `emit.ts` | ✅ `describeType` 真实现 `as_describe_type`（`<type name="包::类"/>` XML 树，非 Class 退回 `<type name="Object"/>`）；✅ 计算名按接收者分派（xml/xmllist → `as_xml_*`，Proxy/动态对象属性轴 → `as_dyn_get`，其余接收者**响亮** `CodegenError`） |
-| `runtime.ts` | ✅ 内嵌 `as_xml_parse` 极小 DOM 解析器 + `as_xml_attr`/`as_xml_children`/`as_xml_filter`/`as_xml_descendants`/`as_xml_list_*`/`as_describe_type` 全套助手；**孩子轴按「本地名」比对**（`as_xml_local()`，阶段一百零八） |
+| `emit.ts` | ✅ `describeType` 真实现（阶段一百八十六 按 `adl 51.4.1` 完整对齐，见 §2.8）：反射表随类发射（`as_prop` 带 `is_accessor`/`is_const`、`as_method` 带 `sig`、vtable 带 `is_dynamic`/`is_final`），XML 树由 `as_dt_shape`/`as_dt_traits` 运行时拼装（`<type>`/`<extendsClass>`/`<implementsInterface>`/`<variable>`/`<constant>`/`<accessor>`/`<method>`/`<parameter>`/`<factory>`）；✅ 计算名按接收者分派（xml/xmllist → `as_xml_*`，Proxy/动态对象属性轴 → `as_dyn_get`，其余接收者**响亮** `CodegenError`） |
+| `runtime.ts` | ✅ 内嵌 `as_xml_parse` 极小 DOM 解析器 + `as_xml_attr`/`as_xml_children`/`as_xml_filter`/`as_xml_descendants`/`as_xml_list_*` 全套助手；**孩子轴按「本地名」比对**（`as_xml_local()`，阶段一百零八）；✅ `describeType` 拼装器（`as_dt_class_of`/`as_dt_shape`/`as_dt_traits`，阶段一百八十六，见 §2.8），**候选对象只与注册表里的 vtable 比较、从不解引用** |
 
 ---
 
@@ -190,6 +244,7 @@ E4X 是 ES4 规范的产物，AS3 完全继承。翻译时必须显式处理的�
 | 九十一 | `@attr` 属性访问 + `.child` 子节点导航 | 待递增 | `stage91.as` |
 | 九十二 | E4X 过滤谓词 `.(@attr == value)` | 待递增 | `stage92.as` |
 | 九十三 | `describeType` 的 XML 输出 | 待递增 | `stage93.as` |
+| 一百八十六 | `describeType` 的 XML 形状**按 `adl` 完整对齐**（此前只发一个无子节点的 `<type name="包::类"/>` ⇒ 模型映射器全空 ⇒ 未捕获 `#1009`） | v0.4.166 → v0.4.167 | `describe-type.as` |
 
 > **修正（阶段一百零八）**：上面这行旧结论**已过时** —— XML 字面量与 `..` 后代轴在**阶段一百零六** 落地（见 §4 表），`ns::[expr]`/`@[expr]` 计算名与命名空间前缀处理在**阶段一百零八** 落地。仍未实现：
 > ① **命名空间建模**（限定词透明 ⇒ 同局部名不同 uri 无法区分，`Namespace` 值只是占位）；② `..*` **不计文本节点**（AIR 计，`5.desc-any` 我们 2 / AIR 4）；③ **一般过滤谓词** `.(<expr>)`（只支持 `.(@attr ==/!= value)` 形态）；④ `+`/`+=` 的 XML 拼接。

@@ -110,15 +110,15 @@ new SoundTransform(volume, pan)                                // 音量/声道
 
 ## 4. 后端选型：先说一个**会让人踩空**的实测
 
-「仓库已经 vendored 了 SDL2（`vendor/sdl2/arm64/`），SDL2 自带 `SDL_OpenAudioDevice`，所以直接用它放音就行」
+「仓库已经 vendored 了 SDL2（`vendor/sdl2/`），SDL2 自带 `SDL_OpenAudioDevice`，所以直接用它放音就行」
 ——**这条路是断的**。三重证据（均可复现）：
 
 ```
-$ ar t vendor/sdl2/arm64/lib/libSDL2.a | grep -iE "coreaudio|audio"
+$ ar t vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -iE "coreaudio|audio"
 SDL_audio.o  SDL_audiocvt.o  SDL_audiodev.o  SDL_audiotypecvt.o  SDL_dummyaudio.o
-$ nm -gU vendor/sdl2/arm64/lib/libSDL2.a | grep -icE "COREAUDIO|AudioUnit|kAudioUnit"
+$ nm -gU vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -icE "COREAUDIO|AudioUnit|kAudioUnit"
 0
-$ strings vendor/sdl2/arm64/lib/libSDL2.a | grep -i coreaudio
+$ strings vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -i coreaudio
 (空)
 ```
 
@@ -147,7 +147,7 @@ $ strings vendor/sdl2/arm64/lib/libSDL2.a | grep -i coreaudio
 
 | 维度 | A. miniaudio | C. 重编 SDL2 |
 |---|---|---|
-| **native 出声** | 编 `miniaudio.h` 即得 CoreAudio 后端，无需任何外部库 | 须从源码重建 `vendor/sdl2/arm64/`（今天只有 arm64 macOS 的**预编译产物**，`vendor/` 内无源码） |
+| **native 出声** | 编 `miniaudio.h` 即得 CoreAudio 后端，无需任何外部库 | 须从源码重建 `vendor/sdl2/`（今天只有 arm64 macOS 的**预编译产物**，`vendor/` 内无源码） |
 | **native 波及面** | 新增 1 个头文件，**完全不碰窗口后端** | 重建的 SDL2 **同时服务窗口** ⇒ 改 SDL2 = 动窗口，回归面从「音频」扩到「窗口/事件/光标」 |
 | **web 出声** | 用 emsdk **自带**的 `emscripten/webaudio.h`（AudioWorklet）——**在树内、离线可用** | `-sUSE_SDL=2` 会**联网下载** `SDL-release-2.24.2.zip`（本机 emsdk **未装**该 port：`cache/ports/` 只有 `zlib`） |
 | **native / web 版本一致性** | 同一份 `miniaudio.h`，两端同版本 | native 已 vendored **SDL 2.32**，而 emscripten port 是 **2.24.2** ⇒ **两端 SDL 版本错配** |
@@ -294,10 +294,10 @@ sed -n '1387,1450p' src/symbols.ts
 grep -rniE "SDL_OpenAudioDevice|CoreAudio|AudioToolbox|webaudio|miniaudio|minimp3" src/ vendor/*.cc   # 除注释外零命中
 
 # 2) vendored SDL2 没有 CoreAudio 后端（关键结论）
-ar t vendor/sdl2/arm64/lib/libSDL2.a | grep -iE "coreaudio|audio"
-nm -gU vendor/sdl2/arm64/lib/libSDL2.a | grep -icE "COREAUDIO|AudioUnit|kAudioUnit"    # 0
-strings vendor/sdl2/arm64/lib/libSDL2.a | grep -i coreaudio                            # 空
-grep -nE "SDL_AUDIO_DRIVER_COREAUDIO" vendor/sdl2/arm64/include/SDL2/SDL_config.h      # undef
+ar t vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -iE "coreaudio|audio"
+nm -gU vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -icE "COREAUDIO|AudioUnit|kAudioUnit"    # 0
+strings vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -i coreaudio                            # 空
+grep -nE "SDL_AUDIO_DRIVER_COREAUDIO" vendor/sdl2/include/macos-arm64/SDL2/SDL_config.h      # undef
 
 # 3) web 后端的可用通道（emscripten 自带）
 ls build-tools/emsdk/upstream/emscripten/system/include/emscripten/webaudio.h
@@ -315,7 +315,7 @@ grep -cE "0x49, 0x44, 0x33|0xff, 0xfb" examples/Flappy-Starling/Flappy-Starling.
 ls build-tools/emsdk/upstream/emscripten/cache/ports/                                        # 只有 zlib
 ls build-tools/emsdk/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten/ | grep -i sdl  # 空
 grep -nE "^TAG|fetch_project" build-tools/emsdk/upstream/emscripten/tools/ports/sdl2.py      # release-2.24.2, 从 GitHub 拉
-grep -hE "define SDL_(MAJOR|MINOR)_VERSION" vendor/sdl2/arm64/include/SDL2/SDL_version.h     # 2.32 ⇒ 两端错配
+grep -hE "define SDL_(MAJOR|MINOR)_VERSION" vendor/sdl2/include/macos-arm64/SDL2/SDL_version.h     # 2.32 ⇒ 两端错配
 
 # 7) 只有 native 清单链接 SDL2；web 侧是仓库刻意排除的
 grep -rn '"SDL2"' examples/ --include=*.build.json          # 全部落在 "target":"native" 的清单
@@ -346,7 +346,7 @@ python3 -m http.server 8137          # 之后开 http://127.0.0.1:8137/probe-was
 | 语义层 | `src/symbols.ts`（`Sound`/`SoundChannel`/`SoundTransform`/`SoundMixer`/`SoundLoaderContext`/`ID3Info` 的字段与方法签名、`SoundTransform.pan` 的**派生**形状） | 类型与 API 形状 |
 | 生成层 | `src/emit.ts`（`Sound_*`/`SoundChannel_*`/`SoundMixer_*`/`Sound__finish`/`Sound__applyID3`） | 语义 + 生成 C，唯一接触 `as_audio_*` 的地方 |
 | 接缝 | `src/runtime.ts` 的 `ASC_HAVE_AUDIO` 声明块（+ 无后端时的 no-op 桩） | 与后端解耦；**生成的 C 逐字节相同**，有无后端的区别只在链接清单 |
-| 后端 | `vendor/audio_glue.c`（miniaudio，含 `MINIAUDIO_IMPLEMENTATION`，独立 TU） | CoreAudio / (web: Web Audio)；解码 + 混音 + 采集环 |
+| 后端 | `vendor/audio_glue.c`（miniaudio，含 `MINIAUDIO_IMPLEMENTATION`，独立 TU） | CoreAudio（macOS）/ WASAPI·DirectSound·WinMM（Windows，按序回退）/ (web: Web Audio)；解码 + 混音 + 采集环 |
 | 构建 | `src/build.ts`（`fpFlags`：`-ffp-contract=off`）、`src/air-app.ts`（`detectAudio` → 链接 glue + `ASC_HAVE_AUDIO`） | 目标/清单编排 |
 
 ### 13.2 语义对照表
@@ -431,8 +431,9 @@ node src/index.ts --air-app temp/demosound/probe.xml --main-class DemoSoundProbe
 cd temp/demosound && ./Probe
 ```
 
-**附带结论**：`--air-app` 会因 demo 用到 `flash.media` 而**自动**把 `vendor/audio_glue.c` / `ASC_HAVE_AUDIO=1` /
-`CoreAudio`+`AudioToolbox` 写进生成的 `Starling-Demo.build.json`，无需手工维护清单。
+**附带结论**：`--air-app` 会因 demo 用到 `flash.media` 而**自动**把 `vendor/audio_glue.c` / `ASC_HAVE_AUDIO=1` 写进
+生成的 `Starling-Demo.build.json`，无需手工维护清单。`CoreAudio`+`AudioToolbox` 只在 **macOS** 上追加（`-framework`
+不是 Windows 链接器的参数），Windows 侧一个额外 `-l` 都不需要 —— 这一条 2026-10-17 才补上，见 **§15**。
 
 ---
 
@@ -451,3 +452,70 @@ cd temp/demosound && ./Probe
 | 14.6 | **`play(startTime ≥ length)`** | **卡死**（实测） | 夹取到 `frames`（首块即结束） | 同上：不复刻卡死 |
 | 14.7 | **`app:/` URL 文本** | `File.applicationDirectory` 相对路径解析成 `app:/…`（文件缺失与负载不可解码两种 `Sound.load` 失败的 `ioError.text` 亦然） | 绝对路径文本；**`errorID`（2032）、`len=0`、`buffering=true`、`url` 非 null 全部一致**（轮 10） | 属 `flash.filesystem` 的 URL 文本口径（非音频），已由 §13.2 的 `url` 语义覆盖「null vs 非 null」 |
 | 14.8 | **动态音频（`SampleDataEvent`）与 WASI/web 后端** | `play()` 派发 `sampleData` 让我们自己喂 PCM；`Sound` 加上 `SampleDataEvent.SAMPLE_DATA` 监听器后 `play()` 返回**真实 channel**（实测 `F dyn play=true len=0`） | 未实现 `SampleDataEvent`（录制到遗留）；WASI 无后端（`areSoundsInaccessible()=true`，`play()` 返回 `null`）；web 端当前清单**不接** glue，构建期**会警告**「this app uses flash.media, but the web build has no audio backend yet」 | 均**如实报明**，不静默假成功（§1.5）。`SampleDataEvent` 已入 `TODO.md` 遗留待开发 |
+
+---
+
+## 15. Windows 接线：后端一直都在，是**构建层把它 gate 掉了**（阶段一百七十六，2026-10-17）
+
+**现象**：macOS 构建出声正常；Windows 构建只打一行黄字
+
+```
+warning: this program uses flash.media, but this build links no audio backend: play() returns null and SoundMixer.areSoundsInaccessible() is true.
+```
+
+—— 运行时**正确地**走了「无声卡」路径（§1.5 要求的诚实降级），可这台机器有 **3 个播放设备**。
+
+**根因不是「没有 Windows 后端」，是接线断在两处**（都在 `src/air-app.ts`）：
+
+| # | 位置 | 症状 |
+|---|---|---|
+| 1 | `audioLinked` 的闸门写死 `process.platform === 'darwin'` | Windows 上 `usesAudio` 为真却 `audioLinked` 为假 ⇒ 不编 `vendor/audio_glue.c`、不定义 `ASC_HAVE_AUDIO`，接缝退化成诚实桩，并**多打一条我们自己的警告**（正是用户看到的那条） |
+| 2 | `airManifest()` 的音频块**无条件** `frameworks.push('CoreAudio','AudioToolbox')` | Windows 链接行出现 `-framework CoreAudio`：`lld-link: ignoring unknown argument '-framework'` 紧跟 `could not open 'CoreAudio'` ⇒ **即使只放开第 1 条，构建仍会失败** |
+
+而 `vendor/audio_glue.c` 一直是**跨平台**的：`as_audio_pick_backends()` 对 `_WIN32` 给
+`wasapi, dsound, winmm`（按序回退）、Apple 给 `coreaudio`、emscripten 给 `webaudio`。
+**唯一缺的就是「让它进链接行」**。
+
+**修法**（净效果 = `+1` 个翻译单元、`+1` 个 define，其余构建行逐字不变）：
+
+| 平台 | `sources` | `defines` | `frameworks` | 额外 `-l` |
+|---|---|---|---|---|
+| macOS | `vendor/audio_glue.c` | `ASC_HAVE_AUDIO=1` | `CoreAudio` + `AudioToolbox` | 无 |
+| Windows | `vendor/audio_glue.c` | `ASC_HAVE_AUDIO=1` | **一个都不加** | **无**（miniaudio 三个 Windows 后端全走 `LoadLibrary/GetProcAddress`：ole32 / dsound / winmm / avrt） |
+| wasm | 不加 | 不加 | — | — 构建期**响亮**警告（§14.8） |
+
+代码落点：`src/air-app.ts` 的 `audioGlueHosts = ['darwin','win32']` + `audioLinked`（警告文案改为点名
+「glue 路径 / 有后端的主机列表 / 当前主机」）、`airManifest()` 里用 `process.platform === 'darwin'` 包住 framework
+追加、`src/index.ts` 的 CLI 提示同样只在 darwin 上提 `frameworks`。
+
+**验收（Windows 实机，逐层取证，全部可复现）**：
+
+| 层 | 手段 | 结果 |
+|---|---|---|
+| 构建 | `temp/audio_win_baseline.log` vs `temp/audio_win_after.log` | 修前：2 条音频警告、链接行**无** `audio_glue.o`、**无** `-D ASC_HAVE_AUDIO=1`；修后：音频警告 **0** 条、`audio_glue.o` 在链接行、defines 有 `ASC_HAVE_AUDIO=1`；两侧同为 359 条 clang 警告 / **0 error**（都是既有的 `getenv`/`strcpy` 弃用提示，与本次改动无关） |
+| 后端 | `temp/audwin/backendprobe.c`（直接链 glue、不经 AS3） | `ready=1 backend=WASAPI last_error=(none)`；`ASC_AUDIO_NULL=1` → `backend=Null` |
+| AS3 | `temp/audwin/probe.as`（`loadPCMFromByteArray` 合成 440 Hz / 4 s / 幅度 0.5） | `areSoundsInaccessible=false`；忙等 3000 ms 期间 `SoundChannel.position` 前进 **3041.81 ms**（ratio 1.0139 —— position 只在设备混音回调里前进，故这是「真有设备在搬数据」的判据） |
+| 出声 | WASAPI **环回**录制（`temp/audloop.c`，miniaudio 的 `ma_device_type_loopback`） | 8 s 窗口抓到 149940 帧（3.400 s）、`peak=0.016334`、最响 1 s 窗 `dominant=440Hz` ⇒ 纯音真的到了端点 |
+| 出声（对照） | 同一段 WAV 交给 Windows 自家 `Media.SoundPlayer` | 幅度与我们的**同级**（0.016333 vs 0.016334）⇒ 「源幅度 0.5 → 端点 0.0163」= **-29.7 dB** 是**该端点自己的**音量/数字输出衰减，不是我们的混音增益 |
+| demo | `temp/audwalk.cjs`（启动 → 点进「Movie Clip」→ 环回） | 22 s 录制窗里点击**之前一帧数据都没有**（环回只在有会话渲染时交付），点进场景后抓到 4.9 s 周期脉冲（100 ms 包络 `0025400000002540000001452000001452000000254000000`），间隔 ≈0.88 s，与 `MovieClip(frames=14, 15fps)` 的 0.93 s 循环同量级（对应 `MovieScene` 第 2 帧的 `wing_flap`） |
+| demo（负对照） | 同一 exe + `ASC_AUDIO_NULL=1` | 环回 **0 帧**：miniaudio 的 dummy 后端让 `ma_device_start` 成功、位置照常前进，而端点收不到任何数据 ⇒ 「应用以为在播」与「OS 真的响了」被彻底分开 |
+
+**未在本机复测的**：darwin 清单里 `CoreAudio`/`AudioToolbox` 的输出**按规则保持不变**（闸门就是
+`process.platform === 'darwin'`，本机跑不了 darwin 清单）；web/WASI 仍如实报明无后端（§14.8）。
+
+**回归钉子**：`test/unit/platform.ts` 的 `platform/AudioWiring` **8 → 13 条**。其中「macOS 链接 CoreAudio」一条改为
+**按宿主分支**（darwin 断言两个 framework 在册；其余宿主断言 `frameworks` **为空**）⇒ macOS CI 与本机 Windows 都能绿；
+新增：后端宿主列表是数据（`['darwin','win32']`）、darwin 闸门可读（源码级）、Windows 无需 `-l` 的理由在案、
+警告点名 glue + 宿主 + 当前宿主、CLI 提示只在 darwin 提 `frameworks`。
+
+**手工清单（`--manifest`）在 Windows 上写什么**：用户给的修法方向是对的，但**只对一半** —— Windows 上要写的是
+
+```json
+{ "sources": ["<vendor>/audio_glue.c"], "defines": ["ASC_HAVE_AUDIO=1"] }
+```
+
+**不要**写 `frameworks`（那是 Apple framework 名，Windows 链接器不认），也**不要**指望补 `link-libs`（miniaudio 的三个
+Windows 后端都是运行期 `LoadLibrary`）。走 `--air-app` 时这一切已自动完成，无需手工维护清单；`examples/audio.build.json`
+仍是 **macOS 形态**（与仓库其它带 framework 的示例一致）—— 清单 schema 只有 `targets.<native|wasm>` 这一层，表达不了
+「按 OS」，故本机 Windows 上该示例仍红（属**宿主工具链缺口**，与既有基线一致），Windows 侧要复验请按上面两行手写清单。
+

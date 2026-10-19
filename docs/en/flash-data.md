@@ -40,11 +40,11 @@
 app can create/open `.db` files, execute SQL, and read result sets. It is the most common **persistence**
 mechanism for AIR desktop apps.
 
-It came up while migrating the real AIR app `talkmed-meeting-desktop-app`:
+It came up while migrating the real AIR app `acme-app-desktop`:
 
 - The app does **not** use `flash.data` directly; it goes through a **home-grown wrapper**
-  `com.vsdevelop.air.data.{SQLConnect, SQLStartment}`
-  (`/Users/ray.lei/Documents/TalkMED/ActionScript-Lib/`).
+  `com.example.air.data.{SQLConnect, SQLStartment}`
+  (`/Users/<user>/Documents/AcmeLib/`).
 - The wrapper uses **`getDefinitionByName` to resolve `flash.data` / `flash.events` dynamically**
   (`SQLConnect.as:73-76`, `SQLStartment.as:59-61`); there is **not a single `import flash.data` anywhere in the
   sources**.
@@ -239,7 +239,7 @@ Other facts (which determine the value of compatibility):
 - Key: `Config.DEBUG=false` ⇒ password `"<redacted-16ch>"` (exactly 16 characters ⇒ a 16-byte key); and it is
   only used via `writeUTFBytes(password)` when `destoplocal=false`, so **the production path does not go through
   ELS**.
-- Database path: `<appDir>/assets/database/talkmed-meeting.db`; **the app ships no database** — it is created on
+- Database path: `<appDir>/assets/database/acme-app.db`; **the app ships no database** — it is created on
   first run.
 - `createSqLite`'s `catch` **deletes** the broken database file (self-healing) ⇒ **the value of cross-format
   compatibility is essentially zero**.
@@ -363,7 +363,7 @@ inside the **target app** (though it can at the `examples/` layer).
   self-written VFS or `-DSQLITE_OS_OTHER`: wasi-libc's POSIX file surface is enough for SQLite's default unix
   VFS, needing only `-DSQLITE_THREADSAFE=0` (wasi-ld has no pthread).
 - **ANE-related**: `ANELame` / `ANECrypto` also touch symbols like `EncryptedLocalStore`, which belong to the
-  existing "Windows ANE host not implemented" leftover entry and are out of scope here.
+  existing "ANE host (`asaot` FRE runtime)" gap (see `TODO.md` stage 178) and are out of scope here.
 
 ---
 

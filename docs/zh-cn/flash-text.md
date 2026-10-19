@@ -185,7 +185,8 @@ divergence（见 [`swc.md`](swc.md) §9.2 F5 与 AGENTS.md 的 SWC 实测口径�
 
 ### 交叉引用（不属本面，但由同一份报告暴露）
 
-- `Capabilities.language` 不返 `zh-CN` ⇒ 整站切英文（报告 D1/R1）。**归类到「语言」面**，
+- `Capabilities.language` **已在阶段一百八十七修好**（此前 Windows 上只读进程 `LANG` ⇒ 恒 `"en"`，整站切英文；
+  现按 AIR 口径读**系统 UI 语言**并归一到闭集，详见 [`win32.md`](win32.md) §3.11）。**归类到「语言」面**，
   不重复立项；本方案只在其影响**文案**时引用。
 - `System.totalMemory` 量级（报告 D6）、`BitmapData→Bitmap` 画不出（D5）、`NativeWindow.bounds/title`
   （D7/D8）、`SharedObject` 域（D11）——各自独立域。

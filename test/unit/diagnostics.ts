@@ -188,6 +188,40 @@ function checkCodegenDiagnostics(): string[] {
   check('a missing argument names the parameter',
     g6?.message === "Codegen error at 2:1: missing argument for parameter 'a' in <top>.<top>");
 
+  // #75 / 阶段一百九十五: a BUILT-IN parameter that AIR requires must not be
+  // defaulted. The `gnum` helper used to hand EVERY numeric built-in parameter a
+  // `0` default, so the calls below compiled here although `mxmlc` 51.4.1 rejects
+  // them all (measured cell-by-cell in temp/optarg/). The AIR-documented optional
+  // parameters keep their defaults -- that half is pinned in unit: builtin/Arity.
+  const a1 = gen('import flash.display.Shape;\nvar s:Shape = new Shape();\ns.graphics.moveTo(1);');
+  check('a built-in required parameter is no longer defaulted (Graphics.moveTo(1))',
+    a1?.message === "Codegen error at 3:1: missing argument for parameter 'y' in <top>.<top>");
+  const a2 = gen('import flash.geom.Matrix;\nvar m:Matrix = new Matrix();\nm.rotate();');
+  check('…and the zero-argument form of a required parameter is refused (Matrix.rotate())',
+    a2?.message === "Codegen error at 3:1: missing argument for parameter 'angle' in <top>.<top>");
+  const a3 = gen('import flash.geom.Rectangle;\nvar r:Rectangle = new Rectangle(0,0,10,10);\nr.contains(5);');
+  check('…a partially supplied list still fails on the next parameter (Rectangle.contains(x, y))',
+    a3?.message === "Codegen error at 3:1: missing argument for parameter 'y' in <top>.<top>");
+  // AIR's own parameter ORDER is part of the contract: drawTrianglesInstanced takes
+  // (indexBuffer, numInstances, firstIndex, numTriangles), so omitting numInstances
+  // is an error even though firstIndex/numTriangles have defaults.
+  const a4 = gen('import flash.display3D.Context3D;\nimport flash.display3D.IndexBuffer3D;\nvar ctx:Context3D = null;\nvar ib:IndexBuffer3D = null;\nctx.drawTrianglesInstanced(ib);');
+  check('the AIR parameter order puts numInstances second (drawTrianglesInstanced(ib))',
+    a4?.message === "Codegen error at 5:1: missing argument for parameter 'numInstances' in <top>.<top>");
+  const a5 = gen('import flash.ui.ContextMenuItem;\nvar c:ContextMenuItem = new ContextMenuItem();');
+  check('a built-in CONSTRUCTOR enforces AIR requiredness too (ContextMenuItem caption)',
+    a5?.message === "Codegen error at 2:1: missing argument for parameter 'caption' in <top>.<top> (constructor of ContextMenuItem, args=0, params=[caption, separatorBefore?, enabled?, visible?])");
+  // The other direction, which a tightening must not break: AIR's optional
+  // parameters stay omittable (every one of these was measured `ok` with mxmlc).
+  const a6 = gen('import flash.display.Shape;\nvar s:Shape = new Shape();\ns.graphics.beginFill(0xff0000);');
+  check('an AIR-optional parameter may still be omitted (Graphics.beginFill alpha = 1)', a6 === null);
+  const a7 = gen('import flash.display.NativeMenuItem;\nvar n:NativeMenuItem = new NativeMenuItem();');
+  check('…including a constructor whose parameters are all optional (NativeMenuItem label = "")', a7 === null);
+  const a8 = gen('import flash.display3D.Context3D;\nimport flash.display3D.IndexBuffer3D;\nvar ctx:Context3D = null;\nvar ib:IndexBuffer3D = null;\nctx.drawTriangles(ib);');
+  check('…and Context3D.drawTriangles needs only the index buffer', a8 === null);
+  const a9 = gen('import flash.display3D.Context3D;\nimport flash.display3D.IndexBuffer3D;\nvar ctx:Context3D = null;\nvar ib:IndexBuffer3D = null;\nctx.drawTrianglesInstanced(ib, 3);');
+  check('…while the two-argument drawTrianglesInstanced form is accepted (AIR-legal)', a9 === null);
+
   // The statement stamp must report the statement's OWN line, not the file start.
   const g7 = gen('class A { }\n\n\nclass B extends Nope {}');
   check('the reported line is the offending statement, not 1:1',

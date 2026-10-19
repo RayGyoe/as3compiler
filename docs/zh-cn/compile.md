@@ -89,7 +89,10 @@ ActionScript 源码 (.as)
 Usage: as-aot <input.as> [more.as ...] [options]
 
 Options:
-  -o <path>      output path (native: executable; wasm: .wasm appended)
+  -o <path>      output path (native: executable; wasm: .wasm appended); also the base
+                 for every sibling artifact — the generated .c, the .o/.lib, icudtl.dat
+                 and the staged extensions/ all land beside it, so `-o bin-aot/App.exe`
+                 keeps the source tree free of build output
   --run          run the compiled output after building
   --cc <name>    C compiler to use (default: cc)
   --target <t>   native (default) | wasm (WASI)
@@ -107,6 +110,16 @@ Options:
   --source <f>   extra C/C++ source to compile and link (repeatable)
   --swc <f>      .swc library: bake its named bitmap resources, vector shapes and
                  display tree at compile time (repeatable; see docs/zh-cn/swc.md §5/§6/§9)
+  --ane <f>      AIR native extension: load its native library through the FRE host
+                 (repeatable; needs the host library from lib/build-asaot.bat, and an
+                 ANE recompiled against it — see docs/zh-cn/ane.md §4)
+  --ane-platform <key> override the ANE platform entry, e.g. Windows-x86-64 |
+                 Windows-x86 | MacOS-x86-64 | iPhone-ARM; also selects
+                 which host-library width under lib/bin/ is used (default: this host;
+                 Windows ARM64 has no AIR key: pass Windows-x86-64 + a 64-bit build)
+  --extdir <dir> where the .ane packages an --air-app descriptor declares live
+                 (repeatable; replaces the default <appDir>/ext-aot then
+                 <appDir>/lib then <appDir>/ext-folder — see docs/zh-cn/ane.md §3.6)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
   --debug-info   keep DWARF: add -g to every backend and stop stripping it from the
@@ -422,7 +435,36 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 （跳过反向域名第三方库目录 `com/org/net`，但显式回加 air-native demo 实际用到的 GreenSock 核心
 `TweenLite/TweenCore/SimpleTimeline/PropTween/TweenPlugin`）→
 在 app.xml 同目录写出 `<filename>.build.json`（链接 Skia + SDL2）→ 编链出 `<filename>` 可执行
-（产物名可用 `-o` 覆盖）。
+（**产物名与全部产物的落点**都可用 `-o` 覆盖：`-o` 决定 `base`，故生成的 `.c`、`.o`/`.lib`、
+`icudtl.dat`、暂存的 `extensions/` 与 `asaot.dll` 全跟着走 —— `-o bin-aot/App.exe` 即可让源码树
+零产物；运行期 `File.applicationDirectory` 与 `extensions/` 按 **exe 所在目录**解析，产物可整体搬走）。
+
+#### 3.5.0 原生扩展从描述符来（不用拼 `--ane`）
+
+描述符里的 `<extensions><extensionID>` 会被读进来，按 ID 从 `<appDir>/ext-aot`、`<appDir>/lib`、
+`<appDir>/ext-folder`（或 `--extdir <dir>`，可重复且**顶掉**这三个默认）解析成包路径，写进
+`<filename>.build.json` 的 `ane-paths`：
+
+```bash
+as-aot --air-app app.xml                        # 扩展包从 <appDir>/ext-aot、lib、ext-folder 找
+as-aot --air-app app.xml --extdir vendor/anes   # 换个地方找（写了就不再扫上面三个）
+```
+
+四条硬口径（全文见 [`ane.md`](ane.md) §3.6 / §3.7）：
+
+1. **按声明解析，不扫目录**——目录里有什么不算数。实测一个真项目：`lib/` 里 14 个 `.ane`，描述符
+   只要 5 个，其余 9 个（Android 专用包、工具包、共享依赖包）不该进来。
+2. **多根先命中先赢**——同一个扩展在 `lib/`（打包形态）与 `ext-folder/`（解包树）都有是常态
+   （前者是 `adt -package -extdir` 吃的，后者是 `adl -extdir` 吃的）。
+3. **重编成 AOT 版的那个放 `<appDir>/ext-aot/`，排在默认根最前**——它与 AIR 原版声明同一个
+   `<extensionID>`，所以「用哪个」完全由根顺序决定；这必须是个点名的目录，不能靠同目录里的名字
+   排序撞运气（实测：同一个根里 `ANEWinCore-aot` 赢、改叫 `WinCore-aot` 就轮到 AIR 原件赢）。
+   `ext-aot` 里没有的 ID 照旧从 `lib/` 来，迁移可以一个扩展一个扩展地推。
+4. **声明了却找不到 ⇒ 硬错误**，照 `adl` 的口径列出找过的目录与目录里有什么。**没有逃生口**：
+   `adl` 遇到同样情况直接拒绝启动（实测 exit 5），静默少一个扩展比报错更坏。
+
+`--extdir` 单独给（不带 `--air-app`）会被拒绝——它说的是「描述符声明的包在哪」，没有描述符就
+无可解。仍然想手写清单或命令行时，`--ane <包>` 照旧可用。
 
 #### 3.5.1 编译面 = 主类的传递闭包（阶段一百二十四）
 
@@ -514,6 +556,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 |---|---|---|
 | `target` | `"native" \| "wasm"` | 目标平台，默认 `native` |
 | `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | 分发形态，默认 `raw`（§6）；`web` 要求 `target=wasm`，产出浏览器产物（见 [`html5-web.md`](html5-web.md)） |
+| `architecture` | `"32" \| "64" \| "arm64"` | 目标位宽（Windows 专属，缺省按宿主）。决定依赖目录（`vendor/*/windows-xN`）与目标三元组（`i686-` / `x86_64-` / `aarch64-pc-windows-msvc`）；未知值**响亮报错**而不回退 x86_64。**`arm64` 只服务非 AIR 的 Windows-on-ARM 产物**：AIR 没有 Windows ARM64 运行时，故 `--air-app` 描述符的 `<architecture>` 仍只接受 `32`/`64`（见 [`win32.md`](win32.md) §1/§2.11） |
 | `c-compiler` | string | C 编译器，默认 `cc` |
 | `opt` | string | 优化标志，默认 `-O2` |
 | `debug-info` | boolean | 是否保留调试信息，默认 `false`。默认产物在三个后端都**不带 DWARF**（wasm 链接因此加 `-Wl,--strip-debug`，见 §4.3）；设 `true` 则三端均加 `-g` 且 wasm 不再剥离（CLI `--debug-info`） |
@@ -522,6 +565,8 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `pgo-dir` | string | `pgo` 两阶段共用的剖析目录（相对清单目录解析）。clang 从该目录读 `<dir>/default.profdata`，故两阶段**必须同名** |
 | `sources` | string[] | 额外 C/C++ 源文件（与生成的 `.c` 一起编译） |
 | `swc-paths` | string[] | `.swc` 库（路径相对清单目录解析）。两半都在**编译期**处理：**命名位图资源**被提取（`DefineBitsLossless/2` 反预乘后重编码为 PNG，`DefineBitsJPEG2/3` 原字节直搬）并合成为 `dynamic class X extends BitmapData`（构造器 `(width, height)` 但**实参被忽略**），**矢量 shape 与显示树**（`DefineShape*`/`DefineSprite`/`PlaceObject*`、`clipDepth` 遮罩、`PlaceObject3` 可见性、**九宫格** `DefineScalingGrid`、**按钮四态** `DefineButton2`）烘焙为运行时绘制调用，导出符号合成为 AST 类。于是 `new logo(0, 0)` 与 `getDefinitionByName("logo")` 两条引用路都可用；资源字节内嵌进生成的 `.c`，运行时由 Skia 解码（矢量侧零新增运行时 API）。实现与实测见 [`swc.md`](swc.md) §5/§6/§9；语义/限制见 [`swc.md`](swc.md) §10 |
+| `ane-paths` | string[] | AIR 原生扩展 `.ane`（路径相对清单目录解析）。打开后生成程序变成 **FRE 宿主**（`ASC_HAVE_FRE`），并在**编译期**从每个 ANE 的 `extension.xml` 定下平台条目、**后链接阶段**把原生库与宿主库 `asaot` 一起落到 `<exe 同目录>/extensions/<extensionID>/<平台>/`（**一扩展一目录**：多个扩展各带一个同名库时不会合并成一个文件）。**`--air-app` 时一般不用手填**：描述符里的 `<extensions><extensionID>` 会驱动解析——从 `<appDir>/ext-aot`、`<appDir>/lib`、`<appDir>/ext-folder`（或 `--extdir <dir>`）找到包，把**相对清单目录的路径**按描述符顺序写进这个字段（声明了却找不到 ⇒ 硬错误，照 `adl` 的口径，见 `ane.md` §3.6；重编成 AOT 版的扩展放哪个根、以及为什么它必须排在前面，见 §3.7）。**前提**：宿主库得先构建（`as3compiler/lib/build-asaot.bat`，默认产出 `lib/bin/windows-x86`/`windows-x64` 两个位宽），且 **ANE 必须是对着 `asaot` 重编过的版本**（其 FRE 导入要解析到 `asaot.dll`）。不设该字段的构建**逐字节不受影响**。完整口径见 [`ane.md`](ane.md)（迁移流程 + 缺口清单）；概览见 [`../README-CN.md`](../README-CN.md) 的「ANE 加载」 |
+| `ane-platform` | string | 覆盖 ANE 平台条目名（`Windows-x86-64` / `Windows-x86` / `MacOS-x86-64` / `iPhone-ARM`），默认按构建宿主推导。它同时决定**取哪个位宽的宿主库**（`lib/bin/<小写目录名>/`），未知键**报错**而不猜；指定的条目该 ANE 未声明时同样报错并列出它实际声明的平台。**Windows ARM64 宿主没有键**（AIR 无 Windows ARM 运行时），该值在那种机器上要显式传 `Windows-x86-64` + 64 位构建。**macOS 的键不编码架构**：运行时是 universal 二进制、两个切片里的 ANE 键都是 `MacOS-x86-64`（实测），故 darwin 的 arm64/x64 **返回同一个键**、架构由 ANE 的 `.dylib` 决定；`MacOS-AOT` 不是 AIR 的键。**平台键与 `lib/bin/` 目录是两套词汇**（前者是 `.ane` 内的 ZIP 子目录、后者是宿主库产物），对照表见 [`ane.md`](ane.md) §3.4 |
 | `include-paths` | string[] | 头文件搜索路径（→ `-I`） |
 | `link-libs` | string[] | 链接库（→ `-l`） |
 | `link-paths` | string[] | 库搜索路径（→ `-L`） |
@@ -949,7 +994,7 @@ Skia surface 的像素经 `vendor/window_glue.cc` 上屏到 SDL2 窗口（事件
 **环境要求**：SDL2 必须是 **arm64** 架构（与 arm64 Skia 静态库一致）。本机若已有 x86_64 的
 `brew install sdl2`（Intel Homebrew，装在 `/usr/local`），直接链接会报 `file built for
 macOS-x86_64`；需用 arm64 Homebrew（`/opt/homebrew`）重装，或像本项目一样**源码编译 arm64 静态库**
-放进 `vendor/sdl2/arm64/`（`include/` + `lib/`，`configure --host=arm64-apple-darwin --disable-shared`）。
+放进 `vendor/sdl2/{include,lib}/macos-arm64/`（`configure --host=arm64-apple-darwin --disable-shared`）。
 
 编译（等价于下面的构建清单）：
 
@@ -961,7 +1006,7 @@ as-aot examples/window.as --manifest examples/window.build.example.json
 额外声明：
 
 - `sources` 追加 `../vendor/window_glue.cc`（SDL2 窗口 + 上屏 + 事件循环）；
-- `include-paths` 追加 `../vendor/sdl2/arm64/include`，`link-paths` 追加 `../vendor/sdl2/arm64/lib`；
+- `include-paths` 追加 `../vendor/sdl2/include/macos-arm64`，`link-paths` 追加 `../vendor/sdl2/lib/macos-arm64`；
 - `link-libs` 追加 `SDL2`、`objc`（SDL2 静态链接需 Objective-C 运行时）；
 - `frameworks` 追加 `CoreVideo`/`Cocoa`/`Carbon`/`IOKit`/`Metal`/`QuartzCore`（SDL2 的 macOS 视频/Metal
   渲染后端依赖）；

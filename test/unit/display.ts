@@ -575,7 +575,9 @@ function checkLineMetrics(): string[] {
     gen.includes('TextLineMetrics* (*getLineMetrics)(void*, int);'));
   check('TextField\'s vtable and method table expose it through both call forms',
     gen.includes('TextField_getLineMetrics,') &&
-    gen.includes('{ "getLineMetrics", TextField_getLineMetrics__dyn }') &&
+    // as_method is { name, fn, vis, sig }: the trailing sig is describeType's
+    // <method><parameter/></method> source.
+    gen.includes('{ "getLineMetrics", TextField_getLineMetrics__dyn, 0, "flash.text::TextLineMetrics;int" }') &&
     // The dynamic thunk's argument is a typed `int` parameter, so it COERCES
     // (ES3 ToInt32); the raw as_v_int_val would read .num and turn a String index
     // into 0 (see unit: emit/DynamicSlotCoercion).

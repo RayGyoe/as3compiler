@@ -116,15 +116,15 @@ Plus (observable, and read by Starling): `SoundChannel.position`, `Event.SOUND_C
 
 ## 4. Backend Choice: First, an Empirical Trap That Will Catch You
 
-"The repo already vendors SDL2 (`vendor/sdl2/arm64/`), SDL2 ships `SDL_OpenAudioDevice`, so just use it" —
+"The repo already vendors SDL2 (`vendor/sdl2/`), SDL2 ships `SDL_OpenAudioDevice`, so just use it" —
 **that road is closed.** Three pieces of evidence (all reproducible):
 
 ```
-$ ar t vendor/sdl2/arm64/lib/libSDL2.a | grep -iE "coreaudio|audio"
+$ ar t vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -iE "coreaudio|audio"
 SDL_audio.o  SDL_audiocvt.o  SDL_audiodev.o  SDL_audiotypecvt.o  SDL_dummyaudio.o
-$ nm -gU vendor/sdl2/arm64/lib/libSDL2.a | grep -icE "COREAUDIO|AudioUnit|kAudioUnit"
+$ nm -gU vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -icE "COREAUDIO|AudioUnit|kAudioUnit"
 0
-$ strings vendor/sdl2/arm64/lib/libSDL2.a | grep -i coreaudio
+$ strings vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -i coreaudio
 (empty)
 ```
 
@@ -155,7 +155,7 @@ measured on this machine:
 
 | Dimension | A. miniaudio | C. Rebuild SDL2 |
 |---|---|---|
-| **native output** | Compile `miniaudio.h` → CoreAudio backend, no external library | Must rebuild `vendor/sdl2/arm64/` from source (today it holds only **prebuilt arm64 macOS artifacts**; no source under `vendor/`) |
+| **native output** | Compile `miniaudio.h` → CoreAudio backend, no external library | Must rebuild `vendor/sdl2/` from source (today it holds only **prebuilt arm64 macOS artifacts**; no source under `vendor/`) |
 | **native blast radius** | One new header; **never touches the window backend** | The rebuilt SDL2 **also serves the window** ⇒ touching SDL2 touches the window; regression surface grows from "audio" to "window/events/cursor" |
 | **web output** | Uses emsdks's **bundled** `emscripten/webaudio.h` (AudioWorklet) — **in-tree, offline-usable** | `-sUSE_SDL=2` **downloads** `SDL-release-2.24.2.zip` over the network (this emsdk has **no** such port installed: `cache/ports/` holds only `zlib`) |
 | **native/web version parity** | One `miniaudio.h`, same version on both ends | native vendors **SDL 2.32**, while the emscripten port is **2.24.2** ⇒ **version skew between the two ends** |
@@ -315,10 +315,10 @@ sed -n '1387,1450p' src/symbols.ts
 grep -rniE "SDL_OpenAudioDevice|CoreAudio|AudioToolbox|webaudio|miniaudio|minimp3" src/ vendor/*.cc   # zero outside comments
 
 # 2) The vendored SDL2 has no CoreAudio backend (the key finding)
-ar t vendor/sdl2/arm64/lib/libSDL2.a | grep -iE "coreaudio|audio"
-nm -gU vendor/sdl2/arm64/lib/libSDL2.a | grep -icE "COREAUDIO|AudioUnit|kAudioUnit"    # 0
-strings vendor/sdl2/arm64/lib/libSDL2.a | grep -i coreaudio                            # empty
-grep -nE "SDL_AUDIO_DRIVER_COREAUDIO" vendor/sdl2/arm64/include/SDL2/SDL_config.h      # undef
+ar t vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -iE "coreaudio|audio"
+nm -gU vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -icE "COREAUDIO|AudioUnit|kAudioUnit"    # 0
+strings vendor/sdl2/lib/macos-arm64/libSDL2.a | grep -i coreaudio                            # empty
+grep -nE "SDL_AUDIO_DRIVER_COREAUDIO" vendor/sdl2/include/macos-arm64/SDL2/SDL_config.h      # undef
 
 # 3) The available web channel (ships with emscripten)
 ls build-tools/emsdk/upstream/emscripten/system/include/emscripten/webaudio.h
@@ -336,7 +336,7 @@ grep -cE "0x49, 0x44, 0x33|0xff, 0xfb" examples/Flappy-Starling/Flappy-Starling.
 ls build-tools/emsdk/upstream/emscripten/cache/ports/                                        # only zlib
 ls build-tools/emsdk/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten/ | grep -i sdl  # empty
 grep -nE "^TAG|fetch_project" build-tools/emsdk/upstream/emscripten/tools/ports/sdl2.py      # release-2.24.2, pulled from GitHub
-grep -hE "define SDL_(MAJOR|MINOR)_VERSION" vendor/sdl2/arm64/include/SDL2/SDL_version.h     # 2.32 ⇒ skew
+grep -hE "define SDL_(MAJOR|MINOR)_VERSION" vendor/sdl2/include/macos-arm64/SDL2/SDL_version.h     # 2.32 ⇒ skew
 
 # 7) Only native manifests link SDL2; the web side deliberately excludes it
 grep -rn '"SDL2"' examples/ --include=*.build.json          # all land in "target":"native" manifests
@@ -367,7 +367,7 @@ Every row below was measured on `adl` first and only then implemented; the evide
 | Semantics | `src/symbols.ts` (the six classes' fields/signatures, and `SoundTransform.pan` as a **derived** value) | API shape |
 | Emitter | `src/emit.ts` (`Sound_*` / `SoundChannel_*` / `SoundMixer_*` / `Sound__finish` / `Sound__applyID3`) | semantics + C, the only place that touches `as_audio_*` |
 | Seam | `src/runtime.ts` `ASC_HAVE_AUDIO` declarations (+ no-op stubs without a backend) | decouples the backend; the **generated C is byte-identical either way**, the choice lives in the build manifest |
-| Backend | `vendor/audio_glue.c` (miniaudio, own TU with `MINIAUDIO_IMPLEMENTATION`) | CoreAudio / (web) Web Audio; decode + mix + capture ring |
+| Backend | `vendor/audio_glue.c` (miniaudio, own TU with `MINIAUDIO_IMPLEMENTATION`) | CoreAudio (macOS) / WASAPI, DirectSound, WinMM (Windows, in that fallback order) / (web) Web Audio; decode + mix + capture ring |
 | Build | `src/build.ts` (`fpFlags`: `-ffp-contract=off`), `src/air-app.ts` (`detectAudio` -> link the glue + `ASC_HAVE_AUDIO`) | target/manifest orchestration |
 
 ### 13.2 The contract, item by item
@@ -454,8 +454,10 @@ cd temp/demosound && ./Probe
 ```
 
 **Side finding**: because the demo uses `flash.media`, `--air-app` **automatically** writes
-`vendor/audio_glue.c` / `ASC_HAVE_AUDIO=1` / `CoreAudio`+`AudioToolbox` into the generated
-`Starling-Demo.build.json` — no hand-maintained manifest is needed.
+`vendor/audio_glue.c` / `ASC_HAVE_AUDIO=1` into the generated `Starling-Demo.build.json` — no
+hand-maintained manifest is needed. `CoreAudio`+`AudioToolbox` are added on **macOS only** (a
+`-framework` argument is not a Windows linker flag), and Windows needs no extra `-l` at all. Fixed
+2026-10-17; see **§15**.
 
 ---
 
@@ -470,8 +472,80 @@ do / why".
 | 14.1 | **implicit string conversion of a class instance** (not an audio issue; the probes surface it) | `"x" + new Plain()` uses the class's own `toString()` (`PLAIN-TOSTR`); `[object Bare]`; `Error: boom` | prints the bare class name (`Plain`/`Bare`/`Error`); `Error.name` is missing too | a **pre-existing language gap**, recorded in `TODO.md` (遗留待开发); out of scope here. An explicit `p.toString()` agrees on both sides |
 | 14.2 | **adl's PCM transfer path yields no samples on this platform** | every `extract()`/raw-sample dump reads `0.000000` | we decode real samples | we do not copy adl's broken path (§1.5). Byte counts, return values, cursor and channel layout are identical (rounds 9b/9c/9d/9k2) |
 | 14.3 | **decoder priming offset** | `extract(ts,100,20000)` first sample `L=0.0838623046875` | `L=-0.1396608203649521` | the same PCM, a few samples apart (our index 0 == ffmpeg sample 0; adl is slightly ahead). Sizes/returns/cursor/channels agree; a decoder-level difference |
-| 14.4 | **`computeSpectrum` window phase and FFT shaping** | the waveform peak index moves with the block boundary and its magnitude differs from ours by **1 int16 LSB** (0.112762451171875 vs 0.11279296875); the FFT is AIR's own shaping: a bin-20 tone peaks at **bin 9/21** with ~6.49x (stretch 0) / 6.87x (stretch >= 1) the tone amplitude; `stretchFactor` is only observable as "0 vs non-zero" (`F1 == F2` bit-exactly) | the same capture ring, a different window start; a standard 2048-point Hann FFT (the tone lands at its true bin 20, amplitude-normalized) | **implement the documented transform and record the difference**: AIR's shaping cannot be inferred from outside, and **no demo or example uses `computeSpectrum`** (a repo-wide grep matches only the probes). The waveform path is compared quantitatively (2-decimal shared precision) |
+| 14.4 | **`computeSpectrum` window phase and FFT shaping** | the waveform peak index moves with the block boundary and its magnitude differs from ours by **1 int16 LSB** (0.112762451171875 vs 0.11279296875); the FFT is AIR's own shaping: a bin-20 tone peaks at **bin 9/21** with ~6.49x (stretch 0) / 6.87x (stretch >= 1) the tone amplitude; `stretchFactor` is only observable as "0 vs non-zero" (`F1 == F2` bit-exactly) | the same capture ring, a different window start; a standard 2048-point Hann FFT (the tone lands at its true bin 20, amplitude-normalized) | **implement the documented transform and record the difference**: AIR's shaping cannot be inferred from outside (there is no `DoABC` and no source to read), and **no demo or example uses `computeSpectrum`** (a repo-wide grep matches only the probes). The waveform path is compared quantitatively (2-decimal shared precision) |
 | 14.5 | **VBR/Xing MP3s** | `vbr.mp3` (LAME VBR: Xing declares 78 frames, 79 physical) **never dispatches open/complete** on adl (only `START` within a 120 s watchdog) -- it hangs | we follow the **physical frame walk**: 79 frames -> `2063.6734693878 ms` (ffprobe reads the Xing count, 2038.37 ms) | a hang is not a behaviour to copy. Our walk matches adl bit-exactly for all 10 CBR fixtures; the Xing duration and the physical frame count are two different things, and we take the latter |
 | 14.6 | **`play(startTime >= length)`** | **hangs** (measured) | clamps to `frames` (the voice ends on the first block) | as above: no hangs |
-| 14.7 | **`app:/` URL text** | a `File.applicationDirectory` relative path resolves to `app:/...` | the absolute path text; `ioError`, `len=0` and `buffering=true` agree | a `flash.filesystem` URL-text convention (not audio); the audio contract (`null` vs non-null) is covered in §13.2 |
-| 14.8 | **dynamic audio (`SampleDataEvent`) and the WASI/web backends** | `play()` dispatches `sampleData` for the app to feed PCM; with a `SAMPLE_DATA` listener `play()` returns a **real channel** (measured `F dyn play=true len=0`) | `SampleDataEvent` is unimplemented (recorded as a gap); WASI has no backend (`areSoundsInaccessible()=true`, `play()` returns `null`); the web manifest does not link the glue and a build-time **warning** says so | all of it is **reported, never faked** (§1.5). `SampleDataEvent` is recorded in `TODO.md` |
+| 14.7 | **`app:/` URL text** | a `File.applicationDirectory` relative path resolves to `app:/...` | the absolute path text; `errorID` (2032), `len=0`, `buffering=true` and a non-null `url` all agree | a `flash.filesystem` URL-text convention (not audio); the audio contract (`null` vs non-null) is covered in §13.2 |
+| 14.8 | **dynamic audio (`SampleDataEvent`) and the WASI/web backends** | `play()` dispatches `sampleData` for the app to feed PCM; with a `SampleDataEvent.SAMPLE_DATA` listener `play()` returns a **real channel** (measured `F dyn play=true len=0`) | `SampleDataEvent` is unimplemented (recorded as a gap); WASI has no backend (`areSoundsInaccessible()=true`, `play()` returns `null`); the web manifest does not link the glue and a build-time **warning** says so | all of it is **reported, never faked** (§1.5). `SampleDataEvent` is recorded in `TODO.md` |
+
+---
+
+## 15. Windows wiring: the backend was always there, the BUILD LAYER gated it off (stage 176, 2026-10-17)
+
+**Symptom**: the macOS build plays sound; the Windows build prints one yellow line
+
+```
+warning: this program uses flash.media, but this build links no audio backend: play() returns null and SoundMixer.areSoundsInaccessible() is true.
+```
+
+— the runtime **honestly** took the "no sound card" path (§1.5), on a box with **3 playback devices**.
+
+**The cause is not "Windows has no backend"; the wiring was cut in two places** (both in `src/air-app.ts`):
+
+| # | Site | Symptom |
+|---|---|---|
+| 1 | `audioLinked` gated on `process.platform === 'darwin'` | with `usesAudio` true, Windows did not compile `vendor/audio_glue.c` and did not define `ASC_HAVE_AUDIO` ⇒ the seam degraded to the honest stub and **our own warning** was printed (the one quoted above) |
+| 2 | `airManifest()`'s audio block pushed `'CoreAudio','AudioToolbox'` **unconditionally** | the Windows link line contained `-framework CoreAudio`: `lld-link: ignoring unknown argument '-framework'` followed by `could not open 'CoreAudio'` ⇒ **fixing #1 alone still fails the build** |
+
+`vendor/audio_glue.c` was cross-platform all along: `as_audio_pick_backends()` returns
+`wasapi, dsound, winmm` for `_WIN32`, `coreaudio` for Apple and `webaudio` for emscripten.
+**All that was missing was letting it onto the link line.**
+
+**Fix** (net effect: `+1` translation unit, `+1` define; every other build line is byte-identical):
+
+| Platform | `sources` | `defines` | `frameworks` | Extra `-l` |
+|---|---|---|---|---|
+| macOS | `vendor/audio_glue.c` | `ASC_HAVE_AUDIO=1` | `CoreAudio` + `AudioToolbox` | none |
+| Windows | `vendor/audio_glue.c` | `ASC_HAVE_AUDIO=1` | **none** | **none** (all three Windows backends are reached via `LoadLibrary/GetProcAddress`: ole32 / dsound / winmm / avrt) |
+| wasm | not added | not added | — | — build-time **warning** instead (§14.8) |
+
+Where it landed: `audioGlueHosts = ['darwin','win32']` + `audioLinked` in `src/air-app.ts` (the warning now
+names the glue path, the hosts that have a backend and the current host), the framework push wrapped in
+`process.platform === 'darwin'`, and the CLI hint in `src/index.ts` offering `frameworks` on darwin only.
+
+**Verification (real Windows box, layer by layer, all reproducible)**:
+
+| Layer | How | Result |
+|---|---|---|
+| Build | `temp/audio_win_baseline.log` vs `temp/audio_win_after.log` | before: 2 audio warnings, no `audio_glue.o` on the link line, no `-D ASC_HAVE_AUDIO=1`; after: **0** audio warnings, `audio_glue.o` linked, `ASC_HAVE_AUDIO=1` defined; both logs carry the same 359 clang warnings / **0 errors** (the pre-existing `getenv`/`strcpy` deprecation notes) |
+| Backend | `temp/audwin/backendprobe.c` (links the glue directly, no AS3) | `ready=1 backend=WASAPI last_error=(none)`; with `ASC_AUDIO_NULL=1` → `backend=Null` |
+| AS3 | `temp/audwin/probe.as` (`loadPCMFromByteArray`, synthesised 440 Hz / 4 s / amplitude 0.5) | `areSoundsInaccessible=false`; over a 3000 ms busy wait `SoundChannel.position` advanced **3041.81 ms** (ratio 1.0139 — position only moves inside the device mix callback, which is the "a real device is moving data" test) |
+| Sound out | WASAPI **loopback** capture (`temp/audloop.c`, miniaudio `ma_device_type_loopback`) | 149940 frames (3.400 s) within an 8 s window, `peak=0.016334`, loudest 1 s window `dominant=440Hz` ⇒ the pure tone really reached the endpoint |
+| Sound out (control) | the same WAV handed to Windows' own `Media.SoundPlayer` | same magnitude as ours (0.016333 vs 0.016334) ⇒ "source 0.5 → endpoint 0.0163" (**-29.7 dB**) is **the endpoint's own** volume / digital-output attenuation, not our mix gain |
+| Demo | `temp/audwalk.cjs` (launch → click "Movie Clip" → loopback) | in a 22 s recording **nothing arrives before the click** (loopback only delivers while a session renders); after entering the scene, 4.9 s of periodic bursts (100 ms envelope `0025400000002540000001452000001452000000254000000`), spacing ≈0.88 s, the same order as the `MovieClip(frames=14, 15fps)` 0.93 s loop (the `wing_flap` frame sound on frame 2 in `MovieScene`) |
+| Demo (negative control) | same exe + `ASC_AUDIO_NULL=1` | loopback captured **0 frames**: miniaudio's dummy backend lets `ma_device_start` succeed and the position advance, yet the endpoint receives nothing ⇒ "the app believes it played" and "the OS really played" are cleanly separated |
+
+**Not re-measured here**: the darwin manifest output (`CoreAudio`/`AudioToolbox`) is **unchanged by
+construction** (the gate *is* `process.platform === 'darwin'`, and a darwin manifest cannot be produced on this
+box); web/WASI still report no backend honestly (§14.8).
+
+**Unit pins**: `platform/AudioWiring` in `test/unit/platform.ts` went **8 → 13 checks**. "macOS links CoreAudio"
+became **host-branched** (darwin asserts both frameworks are listed; other hosts assert `frameworks` is **empty**),
+so macOS CI and this Windows box both pass; the new checks pin the host list as data (`['darwin','win32']`), the
+darwin gate as readable source, the measured reason Windows needs no `-l`, the warning naming glue + hosts + host,
+and the CLI hint offering `frameworks` on darwin only.
+
+**What a hand-written manifest (`--manifest`) needs on Windows**: the suggested fix was right, but only **half** of it — on
+Windows the two lines are
+
+```json
+{ "sources": ["<vendor>/audio_glue.c"], "defines": ["ASC_HAVE_AUDIO=1"] }
+```
+
+**Do not** add `frameworks` (those are Apple framework names; a Windows linker rejects them) and do **not** expect to add
+`link-libs` either (all three miniaudio Windows backends are reached by runtime `LoadLibrary`). `--air-app` now does all of
+this automatically; `examples/audio.build.json` stays **macOS-shaped** (like every other framework-carrying example in this
+repo) — the manifest schema only has a `targets.<native|wasm>` layer and cannot express "per OS", so that example is still
+red on this Windows box (a **host toolchain gap**, matching the existing baseline). To re-verify on Windows, write the two
+lines above by hand.
+

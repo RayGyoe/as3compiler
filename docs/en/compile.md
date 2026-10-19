@@ -54,7 +54,7 @@ ActionScript source (.as)
   └────────────────┘
 ```
 
-Key division of labor (see [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md) §2.8):
+Key division of labor (see `AGENTS.md` §2.8, the project's development-conventions document):
 
 | Module | Responsibility |
 |---|---|
@@ -98,7 +98,10 @@ Key division of labor (see [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md)
 Usage: as-aot <input.as> [more.as ...] [options]
 
 Options:
-  -o <path>      output path (native: executable; wasm: .wasm appended)
+  -o <path>      output path (native: executable; wasm: .wasm appended); also the base
+                 for every sibling artifact — the generated .c, the .o/.lib, icudtl.dat
+                 and the staged extensions/ all land beside it, so `-o bin-aot/App.exe`
+                 keeps the source tree free of build output
   --run          run the compiled output after building
   --cc <name>    C compiler to use (default: cc)
   --target <t>   native (default) | wasm (WASI)
@@ -107,7 +110,7 @@ Options:
   --air-app <xml> AIR app descriptor: generate bootstrap + build manifest
   --main-class <n> main class for --air-app (default: infer src/**/Main.as)
   --all-sources  --air-app: compile every .as under src/ instead of the main class
-                 reachable closure (see §3.5; pre-阶段一百二十四 behaviour)
+                 reachable closure (see §3.5; pre-stage one-hundred-twenty-four behaviour)
   -I <dir>       include path (repeatable)
   -L <dir>       library search path (repeatable)
   -l <lib>       link library (repeatable)
@@ -465,9 +468,47 @@ recursively scan `src/**/*.as` (skip reverse-domain third-party library director
 explicitly re-add the GreenSock core `TweenLite/TweenCore/SimpleTimeline/PropTween/TweenPlugin` actually used
 by the air-native demo) →
 write `<filename>.build.json` in the same directory as app.xml (linking Skia + SDL2) →
-compile/link into the `<filename>` executable (output name overridable with `-o`).
+compile/link into the `<filename>` executable (**both the artifact name and the location of every
+artifact** are overridable with `-o`: `-o` decides `base`, so the generated `.c`, the `.o`/`.lib`,
+`icudtl.dat` and the staged `extensions/` + `asaot.dll` all follow it — `-o bin-aot/App.exe` leaves the
+source tree free of build output. At run time `File.applicationDirectory` and `extensions/` resolve
+against the **executable's own directory**, so the artifacts move as a unit).
 
-#### 3.5.1 Compile face = the main class's transitive closure (阶段一百二十四)
+#### 3.5.0 Native extensions come from the descriptor (no hand-written `--ane`)
+
+The descriptor's `<extensions><extensionID>` entries are read, resolved by ID against
+`<appDir>/ext-aot`, `<appDir>/lib`, `<appDir>/ext-folder` (or `--extdir <dir>`, repeatable and
+**replacing** those three defaults) into package paths, and written into `<filename>.build.json`'s
+`ane-paths`:
+
+```bash
+as-aot --air-app app.xml                        # packages come from <appDir>/ext-aot, lib, ext-folder
+as-aot --air-app app.xml --extdir vendor/anes   # look elsewhere (once given, the three above are not scanned)
+```
+
+Four hard rules (full text in [`ane.md`](ane.md) §3.6 / §3.7):
+
+1. **Resolve by declaration, do not scan the directory** -- whatever happens to sit in a directory does
+   not count. Measured on a real project: `lib/` holds 14 `.ane` files, the descriptor wants 5, and the
+   other 9 (Android-only packages, tooling packages, shared-dependency packages) must not come in.
+2. **With several roots, first hit wins** -- it is normal for one and the same extension to exist both in
+   `lib/` (packaged form) and in `ext-folder/` (unpacked tree): the former is what `adt -package -extdir`
+   consumes, the latter what `adl -extdir` consumes.
+3. **The AOT-rebuilt one goes in `<appDir>/ext-aot/`, ordered ahead of the default roots** -- it declares
+   the same `<extensionID>` as the original AIR build, so *which one is used* is decided **entirely by
+   root order**; this has to be a named directory, never a gamble on name sorting inside one directory
+   (measured: within a single root the AOT copy wins only because its directory name happens to sort
+   first -- rename that directory and the original AIR package wins instead). An ID that is not in
+   `ext-aot` still comes from `lib/`, so a migration can be pushed one extension at a time.
+4. **Declared but not found => a hard error**, listing the directories searched and what each contains,
+   following `adl`'s line. **There is no escape hatch**: `adl` refuses to start in the same situation
+   (measured: exit 5), and silently dropping one extension is worse than an error.
+
+`--extdir` on its own (without `--air-app`) is rejected -- it says *where the packages the descriptor
+declares live*, and with no descriptor there is nothing to resolve. When you still want a hand-written
+manifest or command line, `--ane <package>` remains available.
+
+#### 3.5.1 Compile face = the main class's transitive closure (stage one-hundred-twenty-four)
 
 Which `.as` files `--air-app` compiles is decided by the **class-reference closure from the main class**
 (`src/reach.ts`), matching `mxmlc`/`adl`: AIR links only the transitive closure reachable from the
@@ -494,7 +535,7 @@ serves `is Class`, `new x()`, `getDefinitionByName` and the GC roots) — what s
 To restore the old whole-tree face:
 
 ```bash
-as-aot --air-app app.xml --all-sources     # compile every .as under src/ (pre-阶段一百二十四 behaviour)
+as-aot --air-app app.xml --all-sources     # compile every .as under src/ (pre-stage one-hundred-twenty-four behaviour)
 ```
 
 Measured (away3d `Basic_SkyBox`, same sources, `--all-sources` vs default): sources **485 → 165**,
@@ -574,6 +615,7 @@ kebab-case.
 |---|---|---|
 | `target` | `"native" \| "wasm"` | Target platform, default `native` |
 | `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | Distribution form, default `raw` (§6); `web` requires `target=wasm`, producing browser artifacts (see [`html5-web.md`](html5-web.md)) |
+| `architecture` | `"32" \| "64" \| "arm64"` | Target bit width (Windows-only; defaults to the host). Decides the dependency directory (`vendor/*/windows-xN`) and the target triple (`i686-` / `x86_64-` / `aarch64-pc-windows-msvc`); an unknown value **errors loudly** instead of falling back to x86_64. **`arm64` serves only non-AIR Windows-on-ARM artifacts**: AIR has no Windows ARM64 runtime, so `--air-app`'s descriptor `<architecture>` still accepts only `32`/`64` (see [`win32.md`](win32.md) §1/§2.11) |
 | `c-compiler` | string | C compiler, default `cc` |
 | `opt` | string | Optimization flags, default `-O2` |
 | `debug-info` | boolean | Whether to keep debug info, default `false`. By default artifacts carry **no DWARF** on any of the three backends (the wasm link therefore adds `-Wl,--strip-debug`, see §4.3); setting `true` adds `-g` to all three and stops stripping wasm (CLI `--debug-info`) |
@@ -582,6 +624,8 @@ kebab-case.
 | `pgo-dir` | string | Profile directory shared by the two `pgo` phases (relative to the manifest dir). Clang reads `<dir>/default.profdata`, so both phases **must name the same one** |
 | `sources` | string[] | Extra C/C++ source files (compiled together with the generated `.c`) |
 | `swc-paths` | string[] | `.swc` libraries (paths resolve relative to the manifest dir). Both halves are processed at **compile time**: **named bitmap resources** are extracted (`DefineBitsLossless/2` de-premultiplied and re-encoded as PNG, `DefineBitsJPEG2/3` copied byte-for-byte) and synthesized as `dynamic class X extends BitmapData` (constructor `(width, height)` but the **arguments are ignored**), while the **vector shapes and display tree** (`DefineShape*`/`DefineSprite`/`PlaceObject*`, `clipDepth` masks, `PlaceObject3` visibility, the **nine-slice** `DefineScalingGrid`, the **button four states** `DefineButton2`) are baked into runtime drawing calls and their exported symbols synthesized as AST classes. Thus both reference paths work — `new logo(0, 0)` and `getDefinitionByName("logo")`; the asset bytes are embedded into the generated `.c` and decoded by Skia at runtime (zero new runtime API on the vector side). Implementation and measurements: [`swc.md`](swc.md) §5/§6/§9; semantics/limits: [`swc.md`](swc.md) §10 |
+| `ane-paths` | string[] | AIR native extensions (`.ane`), paths resolved relative to the manifest dir. Turning it on makes the generated program an **FRE host** (`ASC_HAVE_FRE`), settles each ANE's platform entry from its `extension.xml` at **compile time**, and in a **post-link step** drops the native library together with the host library `asaot` into `<exe's own directory>/extensions/<extensionID>/<platform>/` (**one directory per extension**: when several extensions each carry a library of the same name they are not merged into one file). **With `--air-app` you normally do not fill this in by hand**: the descriptor's `<extensions><extensionID>` drives resolution -- the package is found under `<appDir>/ext-aot`, `<appDir>/lib`, `<appDir>/ext-folder` (or `--extdir <dir>`) and its **manifest-relative path** is written into this field in descriptor order (declared but not found => a hard error, following `adl`'s line, see `ane.md` §3.6; which root an AOT-rebuilt extension goes in, and why it must be ordered first, see §3.7). **Preconditions**: the host library has to be built first (`as3compiler/lib/build-asaot.bat`, producing the two widths `lib/bin/windows-x86`/`windows-x64` by default), and **the ANE has to be one rebuilt against `asaot`** (its FRE imports must resolve to `asaot.dll`). A build that does not set this field is **byte-for-byte unaffected**. Full contract in [`ane.md`](ane.md) (migration flow + gap list); overview in [`../../README.md`](../../README.md) (the `--ane` block) |
+| `ane-platform` | string | Overrides the ANE platform entry name (`Windows-x86-64` / `Windows-x86` / `MacOS-x86-64` / `iPhone-ARM`); defaults to the one derived from the build host. It also decides **which bit width of host library is taken** (`lib/bin/<lower-case directory name>/`); an unknown key **errors** instead of guessing, and naming an entry the ANE does not declare errors too, listing the platforms it does declare. **There is no key for a Windows ARM64 host** (AIR has no Windows ARM runtime), so on such a machine this value has to be passed explicitly as `Windows-x86-64` plus a 64-bit build. **macOS's key does not encode the architecture**: the runtime is a universal binary and the ANE key is `MacOS-x86-64` in both slices (measured), so darwin's arm64/x64 **return the same key** and the architecture is decided by the ANE's `.dylib`; `MacOS-AOT` is not an AIR key. **Platform keys and `lib/bin/` directories are two separate vocabularies** (the former a ZIP subdirectory inside the `.ane`, the latter a host-library artifact); the mapping table is in [`ane.md`](ane.md) §3.4 |
 | `include-paths` | string[] | Header search paths (→ `-I`) |
 | `link-libs` | string[] | Libraries to link (→ `-l`) |
 | `link-paths` | string[] | Library search paths (→ `-L`) |
@@ -842,8 +886,12 @@ macOS-only today (the SDL2/Skia static libraries only have macOS arm64 builds).
    resources into an `.xcodeproj` / Gradle skeleton. So they are an independent generation step in the build
    layer, rather than being stuffed into `cc/clang`'s compile arguments.
 2. **Windows `.exe` needs no new argument at all**. `native` on Windows is already a PE executable; the only
-   small gap is that `-o app` does not auto-append `.exe` (`index.ts` only appends a suffix in the wasm
-   branch). Appending the default extension by host OS is enough; it is not a new form.
+   small gap was that `-o app` did not auto-append `.exe` — the default extension is now appended by host OS
+   (with `process.platform === 'win32'` a native artifact gets the `.exe` suffix; POSIX does not). That is not
+   just a naming convention: Windows' `CreateProcessW` only looks an executable up along the
+   `.exe`/`.cmd`/`.bat`/`.com` extension sequence, and an extensionless PE file is `ENOENT` as far as
+   `spawnSync` is concerned — so `--run` started on macOS but silently failed to start on Windows; with `.exe`
+   appended the two agree. Not a new form.
 3. **Project metadata goes into the manifest, not flattened into CLI flags**. The generator needs a lot of
    metadata: bundle id, icon, signing identity, min SDK, permissions, resource directory… these are **not
    arguments, they are project configuration**. The project already has a manifest mechanism analogous to
@@ -1057,7 +1105,7 @@ system, supporting click interaction and post-event re-rendering).
 **Environment requirement**: SDL2 must be **arm64** (matching the arm64 Skia static library). If the local
 machine already has x86_64 `brew install sdl2` (Intel Homebrew, installed at `/usr/local`), linking directly
 will report `file built for macOS-x86_64`; reinstall with arm64 Homebrew (`/opt/homebrew`), or, as this project
-does, **compile an arm64 static library from source** into `vendor/sdl2/arm64/` (`include/` + `lib/`,
+does, **compile an arm64 static library from source** into `vendor/sdl2/{include,lib}/macos-arm64/`,
 `configure --host=arm64-apple-darwin --disable-shared`).
 
 Compile (equivalent to the build manifest below):
@@ -1070,7 +1118,7 @@ The build manifest [`examples/window.build.example.json`](../../examples/window.
 additionally declares, on top of Skia:
 
 - `sources` adds `../vendor/window_glue.cc` (SDL2 window + blit + event loop);
-- `include-paths` adds `../vendor/sdl2/arm64/include`, `link-paths` adds `../vendor/sdl2/arm64/lib`;
+- `include-paths` adds `../vendor/sdl2/include/macos-arm64`, `link-paths` adds `../vendor/sdl2/lib/macos-arm64`;
 - `link-libs` adds `SDL2`, `objc` (SDL2 static linking needs the Objective-C runtime);
 - `frameworks` adds `CoreVideo`/`Cocoa`/`Carbon`/`IOKit`/`Metal`/`QuartzCore` (SDL2's macOS video/Metal
   rendering backend dependencies);
@@ -1089,6 +1137,13 @@ Retina hi-DPI rendering (`ASC_DISPLAY_HIGH=1`):
   `scale(scale, scale)` on the canvas, so the coordinate system in AS3 code is unchanged.
 - `Stage.contentsScaleFactor` returns the measured scale (2.0 on Retina, 1.0 under `standard`). Note it is
   only written during `render`/`showWindow`; the document class reads the initial `1.0` during construction.
+- `Stage.nativeWindow` is **already non-`null`** during the document class's construction (aligned with AIR's
+  "the OS window exists before the document class"): our window would only be created at `showWindow`, so
+  `Stage_get_nativeWindow` **lazily binds** `ASC_wins[0]` while the root `Stage` has no window slot yet
+  (`ASC_win_claim_main` correspondingly became a non-destructive claim), after which `showWindow` claims the
+  same slot without losing the binding; a read of `nativeWindow` during construction is a real wrapper
+  (`nativeWindow === nativeWindow` is identity), and writes (`bounds`/`title`) on an OS window that does not
+  exist yet are a safe no-op in the glue layer.
 - Verification: `screencapture -x -o -l<windowid> out.png` then check the size; a 2x window should be twice
   the logical size (e.g. a 1000×712 window → 2000×1424 image).
 
@@ -1133,10 +1188,10 @@ Key implementation points:
 
 ## 8. Related Documents
 
-- [`README-CN.md`](../../README-CN.md) — project overview, supported language subset, type mapping
+- [`README.md`](../../README.md) — project overview, supported language subset, type mapping
 - [`TODO.md`](../../TODO.md) — staged roadmap (stage twenty-nine is "build manifest + multi-target backend")
 - [`as3-semantics.md`](as3-semantics.md) — AS3 semantic-fidelity red lines and specification sources
 - [`html5-web.md`](html5-web.md) — browser rendering target (`--target wasm --package web`) implementation and usage
 - [`win32.md`](win32.md) — Windows native backend (`<architecture>` bit width, `vendor/build-windows-deps.ps1`, Skia D3D12 direct GPU, first-run checklist)
 - [`skia.md`](skia.md) — rendering backend (Skia rasterization + wasm font injection)
-- [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md) — development conventions (§2.9 build & link)
+- `AGENTS.md` — development conventions (§2.9 build & link); kept with the project's developer documentation, not inside this repo

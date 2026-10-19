@@ -1,0 +1,18 @@
+{
+  "target": "native",
+  "c-compiler": "clang",
+  "opt": "-O2",
+  "architecture": "64",
+  "ane-paths": [
+    "ext-aot/com.example.probe"
+  ],
+  "include-paths": [
+    "../../vendor/curl/include"
+  ],
+  "link-paths": [
+    "../../vendor/curl/lib/windows-x64"
+  ],
+  "link-libs": [
+    "zlib"
+  ]
+}

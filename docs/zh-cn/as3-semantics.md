@@ -152,6 +152,27 @@ AGENTS.md §2.4 语义红线（已定的硬性决策）
 
 ---
 
+### 3.3 内建签名的实参对齐（阶段一百九十五 · 全表实测）
+
+AIR 的内建方法形参表**不能凭文档抄**：AS3 参考页会漏掉真实默认值（`DisplayObject.getBounds`、`IndexBuffer3D.uploadFromVector` 都显示「无默认」，而 `mxmlc` 实际接受少参调用），也会写错（`Context3D.configureBackBuffer` 的 `antiAlias` 看起来可选，实测**必填**）。故本阶段的口径是：**可选性（能否省略）以 `mxmlc 51.4.1` 接受与否为唯一权威**（它读的是 `airglobal.swc` 里的真实 trait），**默认值取文档给出的那个值**。做法：对每个内建类的每个实例方法/静态方法/构造器的**每一个实参个数** `j = 0..n+1` 各造一格，用 `mxmlc` 判接受、用本编译器判接受，逐格比对（共 4964 格；脚本、原始判定与逐类签名留档在 `temp/optarg/` 与 `temp/asdoc/`）。
+
+| 类别 | 现象 | 数量 | 例子 | 处理 |
+|------|------|------|------|------|
+| A | AIR 接受，而**我们要求补齐实参** | 300 → 0 | `ctx.drawTriangles(ib)`、`ctx.configureBackBuffer(1, 1, 0)`、`new NativeMenuItem()`、`hasOwnProperty()` | ✅ 已修：按文档值补默认（`greq`/`gopt` 两组形参助手） |
+| B | **我们发明了 AIR 没有的默认** | 48 → 0 | `g.moveTo(1)`、`m.rotate()`、`r.inflate(1)`、`p.normalize()`、`new ShaderData()` | ✅ 已修：改回必填（收紧——不再接受 `mxmlc` 拒绝的程序） |
+| C | 我们声明了**多余的形参**（AIR 不许传这么多） | 9 | `File.moveTo` 多一个 `force`、`BitmapData.encode` 多一个 `byteArrayOffset`、`FileListEvent` 多一个 `directory` | 登记遗留（需改 C 侧签名与实现） |
+| D | AIR 接受**更多实参**（`...rest` 或更长的形参表） | 27+ | `NetConnection.connect(…rest)`；`MouseEvent` 构造器缺 `commandKey`/`controlKey`/`clickCount`；`TextFormat` 构造器缺 7 个尾参 | 登记遗留（需 C 侧接受并忽略多出的实参） |
+| E | 成员**根本没实现**（与实参无关） | 3 | `BitmapData.floodFill`/`merge`、`SharedObject.name` | 登记遗留 |
+
+**实测定案**（A/B 两类逐格清零，C/D/E 逐条记账）：
+
+1. `Context3D.drawTrianglesInstanced` 的形参序是 `(indexBuffer, numInstances, firstIndex = 0, numTriangles = -1)`——`numInstances` 在**第二位**，与 `drawTriangles` 的 `firstIndex` 在前**不同**。我们此前序也错，于是 AIR 合法的两参调用 `drawTrianglesInstanced(ib, 3)` 会被读成 `firstIndex = 3`（静默几何错）；本阶段把**形参序与 C 侧签名**一起改齐，并用「两参调用发出 `numInstances`」的钉子锁住。
+2. `Object.hasOwnProperty()`/`propertyIsEnumerable()` 允许**空参**调用（`mxmlc` 不报错），故形参是「可省、默认 null」；二者在 `Object` 上声明一次、被全部类继承，早期审计把 145 份继承副本误读成 145 处独立缺陷（按声明处改一次即可）。
+3. `Stage3D.requestContext3D` 的形参名是 `context3DRenderMode`、默认 `"auto"`；AIR 还有第二形参 `profile = "baseline"`，本后端不消费（登记遗留）。
+4. **文档不是可选性 oracle**：默认值抄文档，可选性必须实测。同理，内建形参表**斜**（我们比 AIR 短或长）时，靠「按我们的形参个数造格」的扫描**发现不了**——D 类因此是「文档形参数 vs 我们的形参数」的交叉比对补出来的。
+
+---
+
 ## 4. 保真与增强原则
 
 §2 的红线与 §3 的分歧点都在回答「**怎么和 AIR 对齐**」。本节补上另一半：**对齐之外，什么算「增强」**。

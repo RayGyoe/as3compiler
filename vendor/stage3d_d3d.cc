@@ -16,9 +16,9 @@
 //      the pipeline state. Stage3D's setDepthTest/setStencilActions are settable
 //      between two draws that share one Program3D (Starling alternates depth state
 //      on every batch), so the pipeline cache below is keyed on the WHOLE draw
-//      state -- program, blend, colour mask, depth, stencil, culling, vertex
-//      layout and whether a depth attachment is bound -- not on the blend pair
-//      alone. S3D_MAX_PSOVAR bounds it, LRU-evicted.
+//      state -- program, the blend-FACTOR PAIR (not merely "blending on": see
+//      s3d_select_pso), colour mask, depth, stencil, culling, vertex layout and
+//      whether a depth attachment is bound. S3D_MAX_PSOVAR bounds it, LRU-evicted.
 //   2. There is no render pass either: clears are explicit command-list calls and
 //      resource states must be transitioned by hand. The state machine below keeps
 //      ONE invariant that both sides of the seam rely on: at the end of every
@@ -94,10 +94,22 @@ extern "C" {
 // heap may not exceed (a 12288-descriptor heap is E_INVALIDARG, not a warning).
 #define S3D_MAX_SMPLCFG 256
 #define S3D_RELEASE_QUEUE 4096
-// Constant-buffer slot size: 1024 float4. Stage3D's own limits are 128 vertex and
-// 64 fragment vec4 registers (the generated C uploads the whole register file on
-// every submit), so this is headroom, not a real bound.
-#define S3D_CB_BYTES 16384
+// Constant registers are versioned PER DRAW. The generated C re-uploads the whole
+// register file immediately before every drawTriangles (Context3D_submit), but a
+// D3D12 command list reads its constant buffers only when the GPU EXECUTES it --
+// at the end of the frame, after every upload of that frame has landed. One shared
+// buffer per frame slot therefore makes every draw in the frame read the LAST
+// upload's matrix: measured on examples/air-starling-demo, all 12 menu buttons were
+// transformed by the last button's mvp, so only that one landed where it belonged
+// (and the previous button's label was squashed by another TextField's scale).
+// Metal is immune because setVertexBytes copies the values inline into the command
+// buffer, which is why this only ever showed up on the D3D12 backend. Each upload
+// gets its own region instead, and a draw binds the region of the last upload.
+// 4096 bytes = 256 float4 registers: the largest cbuffer the HLSL translator can
+// declare (runtime.ts sizes vc[]/fc[] from the program's highest AGAL register), so
+// a region is always at least as large as the range its shader may read.
+#define S3D_CB_REGION 4096
+#define S3D_CB_BYTES (S3D_CB_REGION * S3D_DRAWS_PER_FRAME)
 #define S3D_KEY_CAP 256
 
 // The live-program slots: `live` is one of these, an index into progs[], or
@@ -196,9 +208,39 @@ typedef struct {
 
 typedef struct {
   ID3D12Resource* buf;     // UPLOAD heap: written by the CPU, read by the IA
+  int ub;                  // which pooled buffer owns `buf` (see S3DUploadBuf)
   int components;          // 1..4
   int numVertices;
 } S3DStream;
+
+// Upload buffers are POOLED, never created per upload. A D3D12 committed resource
+// costs ~100 us of driver/kernel time to make -- measured on
+// examples/air-starling-demo, where 64 boot-time uploads took 7.55 ms regardless of
+// size -- while the generated C re-uploads its vertex and index buffers on every
+// CHANGED frame (20..27 uploads per frame at 66 k objects, 4.4..6.5 ms of a 16.7 ms
+// frame, essentially all of it inside CreateCommittedResource). Metal never pays
+// this: its upload is a replaceRegion into a persistent buffer (stage3d_glue.mm).
+// An UPLOAD-heap resource may stay mapped for its whole life, so the pool hands out
+// the smallest FREE entry that fits and writes in place, creating a resource only
+// when nothing is free.
+//
+// "Free" is decided by the fence of the submission that last referenced the buffer
+// (stamped in s3d_stamp_uploads at submit time), never by CPU bookkeeping alone: a
+// buffer the GPU may still read must not be overwritten. Two further rules keep the
+// batch being RECORDED safe, which is what makes this correct rather than merely fast:
+//   - a buffer currently bound to a stream (or to the index stage) is never handed
+//     out again -- the open batch has already referenced its GPU virtual address;
+//   - a buffer REPLACED while a batch is open is re-marked pending for the same
+//     reason (s3d_mark_batch_ref).
+#define S3D_UBUF_MAX 1024
+typedef struct {
+  ID3D12Resource* res;
+  void* map;              // permanently mapped: legal for UPLOAD heap, and it removes
+                          // a Map/Unmap round trip from every upload
+  UINT bytes;             // committed capacity
+  uint64_t fence;         // submission that may still read it (0 = none ever did)
+  int pending;            // written since the last submit, so not stamped yet
+} S3DUploadBuf;
 
 // Deferred release: a resource handed to the GPU is not freed when the CPU
 // replaces it (the generated C re-uploads its vertex buffer on every submit),
@@ -270,11 +312,16 @@ typedef struct S3DContext {
   ID3D12Resource* indexBuffer;
   int numIndices;
   int indexBytes;
+  int indexUb;                     // which pooled buffer owns indexBuffer
+  S3DUploadBuf ubuf[S3D_UBUF_MAX];
+  int nubuf;                       // entries ever handed out (a freed one keeps its slot)
   ID3D12Resource* vcBuf[S3D_FRAMES_IN_FLIGHT];
   ID3D12Resource* fcBuf[S3D_FRAMES_IN_FLIGHT];
   void* vcMap[S3D_FRAMES_IN_FLIGHT];
   void* fcMap[S3D_FRAMES_IN_FLIGHT];
   UINT vcBytes, fcBytes;           // slot sizes (256-aligned, grown on demand)
+  UINT cbOffV, cbOffF;             // region of the CURRENT draw inside vcBuf/fcBuf
+  UINT cbCurV, cbCurF;             // bump cursor into vcBuf/fcBuf (per batch)
   S3DTexture* textures[S3D_MAX_TEX];
 
   float clearR, clearG, clearB, clearA;
@@ -315,6 +362,10 @@ typedef struct S3DContext {
   long statDraws, statFrames, statCompiles, statPsos;
   double statT0;
 } S3DContext;
+
+// Defined with the upload pool far below; s3d_batch_end / s3d_run_immediate need it
+// to tie a frame's uploaded buffers to the submission that first references them.
+static void s3d_stamp_uploads(S3DContext* c, uint64_t v);
 
 static S3DContext* s3d_live[S3D_MAX_CTX];
 static int s3d_live_n = 0;
@@ -391,14 +442,23 @@ static void s3d_defer_release(S3DContext* c, IUnknown* o) {
     const uint64_t done = c->fence->GetCompletedValue();
     int w = 0;
     for (int i = 0; i < c->nrel; i++) {
-      if (c->rel[i].fence <= done) { c->rel[i].obj->Release(); }
+      // fence 0 = parked on the open batch (see s3d_defer_release); not releasable yet.
+      if (c->rel[i].fence != 0 && c->rel[i].fence <= done) { c->rel[i].obj->Release(); }
       else c->rel[w++] = c->rel[i];
     }
     c->nrel = w;
     if (c->nrel >= S3D_RELEASE_QUEUE) { o->Release(); return; }
   }
   c->rel[c->nrel].obj = o;
-  c->rel[c->nrel].fence = c->fenceNext;
+  // A resource disposed WHILE A BATCH IS STILL BEING RECORDED may already be bound by
+  // that batch's earlier draws, and its submission has not happened yet -- so the last
+  // signalled value (fenceNext) says nothing about it. Such an entry is parked on fence
+  // 0, meaning "tie me to the next submission", and s3d_batch_end stamps it with the
+  // value that submission signs. Releasing it on fenceNext instead let the GPU sample
+  // memory D3D12 had already handed to the NEXT texture: measured on the Starling demo
+  // (device removed + a text quad showing another text's pixels after a scene switch,
+  // where 171 of 171 releases happened with a batch still open).
+  c->rel[c->nrel].fence = c->listOpen ? 0 : c->fenceNext;
   c->nrel++;
 }
 static void s3d_drain_releases(S3DContext* c) {
@@ -406,7 +466,8 @@ static void s3d_drain_releases(S3DContext* c) {
   const uint64_t done = c->fence->GetCompletedValue();
   int w = 0;
   for (int i = 0; i < c->nrel; i++) {
-    if (c->rel[i].fence <= done) { c->rel[i].obj->Release(); }
+    // fence 0 = parked on the open batch (see s3d_defer_release); not releasable yet.
+    if (c->rel[i].fence != 0 && c->rel[i].fence <= done) { c->rel[i].obj->Release(); }
     else c->rel[w++] = c->rel[i];
   }
   c->nrel = w;
@@ -482,12 +543,29 @@ static void s3d_batch_end(S3DContext* c, int wait) {
   c->listOpen = 0;
   c->boundRT = NULL;
   c->boundDs = -1;
+  // Constant regions are handed out from the start of the slot's buffer, and this
+  // is where that start is established -- NOT in batch_begin: the FIRST draw of a
+  // frame uploads its constants before anything opens the batch, so a reset there
+  // discards the region that upload just wrote and leaves the frame's first two
+  // draws sharing one region (measured in the per-draw dump: cbV=0 on BOTH draw 0
+  // and draw 1, so draw 0 rendered with draw 1's matrix). The wait in
+  // s3d_batch_begin is what makes it safe to overwrite the regions the GPU read
+  // from this slot's previous frame.
+  c->cbCurV = c->cbCurF = 0;
+  c->cbOffV = c->cbOffF = 0;
   if (FAILED(c->list->Close())) return;
   ID3D12CommandList* lists[1] = { (ID3D12CommandList*)c->list };
   c->queue->ExecuteCommandLists(1, lists);
   const uint64_t v = ++c->fenceNext;
   c->queue->Signal(c->fence, v);
   c->fenceValues[idx] = v;
+  // Stamp the entries parked by s3d_defer_release: they were disposed while THIS batch
+  // was being recorded, so this submission is the first fence that can prove the GPU is
+  // finished with them.
+  for (int i = 0; i < c->nrel; i++) if (c->rel[i].fence == 0) c->rel[i].fence = v;
+  // ... and the same submission is what makes this frame's pooled upload buffers
+  // reclaimable (s3d_acquire_upload refuses any buffer the GPU may still read).
+  s3d_stamp_uploads(c, v);
   // The next batch gets the next slot. Only the LAST batch of a frame is submitted
   // before the composite, so the target's final state is PIXEL_SHADER_RESOURCE
   // whichever batch wrote it.
@@ -509,6 +587,10 @@ static int s3d_run_immediate(S3DContext* c) {
   ID3D12CommandList* lists[1] = { (ID3D12CommandList*)c->upList };
   c->queue->ExecuteCommandLists(1, lists);
   s3d_wait_idle(c);
+  // The immediate list is not what reads a vertex/index upload, but it IS a submit:
+  // stamping here keeps the pool's bookkeeping in step when an upload happens with no
+  // batch open (s3d_wait_idle just signalled c->fenceNext).
+  if (c->fence != NULL) s3d_stamp_uploads(c, c->fenceNext);
   return 1;
 }
 
@@ -878,6 +960,25 @@ static D3D12_BLEND s3d_blend_factor(const char* name) {
   if (!strcmp(name, "oneMinusDestinationAlpha")) return D3D12_BLEND_INV_DEST_ALPHA;
   return D3D12_BLEND_ONE;
 }
+// Translate a colour blend factor to its alpha twin, for the ALPHA slots of the
+// blend state. D3D12 (like D3D11) forbids a *_COLOR factor there: the alpha blend
+// unit can only reach the alpha channels, so "destinationColor" in an alpha slot is
+// an invalid enum and CreateGraphicsPipelineState rejects the WHOLE pipeline with
+// E_INVALIDARG (0x80070057). The debug layer says so explicitly:
+//   "SrcBlendAlpha[0] is trying to use a D3D11_BLEND value (0x9) that manipulates
+//    color, which is invalid"
+// Stage3D has ONE factor pair for both channels, so the translation is the only
+// way to express the same blend on D3D12 -- and it is semantically required, not
+// just a workaround: ERASE (ZERO / ONE_MINUS_SOURCE_ALPHA) only erases when the
+// alpha of the erased texel actually reaches 0 instead of keeping the
+// destination's (Starling erases a RenderTexture this way).
+static D3D12_BLEND s3d_blend_factor_alpha(D3D12_BLEND b) {
+  if (b == D3D12_BLEND_SRC_COLOR) return D3D12_BLEND_SRC_ALPHA;
+  if (b == D3D12_BLEND_INV_SRC_COLOR) return D3D12_BLEND_INV_SRC_ALPHA;
+  if (b == D3D12_BLEND_DEST_COLOR) return D3D12_BLEND_DEST_ALPHA;
+  if (b == D3D12_BLEND_INV_DEST_COLOR) return D3D12_BLEND_INV_DEST_ALPHA;
+  return b;
+}
 static UINT s3d_write_mask_bits(const S3DContext* c) {
   UINT m = 0;
   if (c->colorMaskR) m |= D3D12_COLOR_WRITE_ENABLE_RED;
@@ -921,6 +1022,17 @@ static void s3d_prog_release(S3DProg* e) {
 // Build (or fetch) the pipeline for the state currently recorded on the context.
 // The key is the WHOLE draw state -- see the file header for why D3D12 needs this
 // where Metal had a separate MTLDepthStencilState.
+//
+// The blend part of the key is the FACTOR PAIR, not "blending on/off": D3D12,
+// like Metal and unlike GL, has no per-draw blend-factor call, so the pair is
+// baked into the pipeline state and a *changed* pair needs a *new* pipeline. The
+// key used to carry only (blendSource != NULL || blendDest != NULL), so the first
+// pair a program was ever drawn with -- Starling's "normal", ONE /
+// ONE_MINUS_SOURCE_ALPHA, which the frame's background establishes -- was reused
+// for every later pair. Measured on examples/air-starling-demo's Blend Modes
+// scene: five "Switch Mode" presses moved 0.3% of the pixels and every one of
+// them was the label (the image never changed) -- the very symptom stage3d_glue.mm
+// records for Metal in its own header.
 static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
   const int dsNeeded = s3d_ds_needed(c);
   unsigned streamSig = 0;
@@ -929,7 +1041,7 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
 
   char sk[S3D_KEY_CAP];
   snprintf(sk, sizeof sk,
-           "%016llx|%x|%d|%s|%s|%s|%s|%s|%s|%d|%d|%d|%s|%d|%x",
+           "%016llx|%x|%d|%s|%s|%s|%s|%s|%s|%d|%d|%d|%s|%d|%s|%s|%x",
            (unsigned long long)(pr ? pr->srcHash : 0),
            s3d_write_mask_bits(c),
            c->depthWrite ? 1 : 0,
@@ -942,7 +1054,11 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
            (int)c->stencilReadMask, (int)c->stencilWriteMask,
            dsNeeded,
            c->cullMode ? c->cullMode : "",
+           // Both: the boolean still distinguishes "blending off" (NULL/NULL) from
+           // an empty factor name, which maps to ONE/ONE (see s3d_blend_factor).
            (int)(c->blendSource != NULL || c->blendDest != NULL),
+           c->blendSource ? c->blendSource : "",
+           c->blendDest ? c->blendDest : "",
            streamSig);
 
   for (int i = 0; i < pr->npso; i++) {
@@ -973,11 +1089,16 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
     rt->BlendEnable = TRUE;
     rt->SrcBlend = sf;
     rt->DestBlend = df;
-    // Stage3D has ONE set of factors: alpha uses them too (Starling sets
-    // ONE/ONE_MINUS_SOURCE_ALPHA and expects the alpha channel to blend the same
-    // way, which is what the Metal backend's colour-attachment factors do as well).
-    rt->SrcBlendAlpha = sf;
-    rt->DestBlendAlpha = df;
+    // Stage3D has ONE factor pair for both channels -- the Metal backend hands the
+    // same factor to both colour-attachment slots and Metal accepts that. D3D12
+    // does NOT, so a colour factor must go through s3d_blend_factor_alpha here.
+    // Measured failure without it (adl 51.4.1 as the oracle, named by the D3D12
+    // debug layer): Starling's Multiply (destinationColor / oneMinusSourceAlpha) and
+    // Screen (one / oneMinusSourceColor) modes built NO pipeline and therefore
+    // dropped EVERY draw -- the Blend Modes demo cycled its label while the image
+    // never changed at all.
+    rt->SrcBlendAlpha = s3d_blend_factor_alpha(sf);
+    rt->DestBlendAlpha = s3d_blend_factor_alpha(df);
   } else {
     // Stage3D's initial state is (ONE, ZERO) -- "no blending" expressed as a blend.
     rt->BlendEnable = FALSE;
@@ -1344,8 +1465,9 @@ void s3d_destroy(void* ctx) {
   s3d_batch_end(c, 1);
   s3d_unregister_ctx(c);
 
-  for (int i = 0; i < S3D_MAX_STREAMS; i++) if (c->streams[i].buf) c->streams[i].buf->Release();
-  if (c->indexBuffer) c->indexBuffer->Release();
+  // The stream and index buffers are BORROWED from the pool: releasing them here
+  // would double-free (and leave dangling ubuf entries). The pool owns them all.
+  for (int i = 0; i < c->nubuf; i++) if (c->ubuf[i].res) c->ubuf[i].res->Release();
   for (int i = 0; i < S3D_FRAMES_IN_FLIGHT; i++) {
     if (c->vcBuf[i]) c->vcBuf[i]->Release();
     if (c->fcBuf[i]) c->fcBuf[i]->Release();
@@ -1419,13 +1541,29 @@ int s3d_resize(void* ctx, int width, int height) {
 
 // ---- buffers ---------------------------------------------------------------
 
-static ID3D12Resource* s3d_make_upload(S3DContext* c, const void* data, UINT bytes) {
-  if (bytes == 0) return NULL;
+// Allocate one pool entry of at least `bytes` capacity. Capacities are rounded to a
+// POWER OF TWO: this workload grows monotonically (the benchmark's ring adds 16
+// objects per frame), so an exact-size pool would find "nothing fits" on every single
+// frame and re-create exactly the resource the pool exists to avoid creating. Waste is
+// bounded by 2x on a 4 KB floor. A freed entry keeps its index so the `ub` fields in
+// S3DStream stay valid.
+static S3DUploadBuf* s3d_ubuf_new(S3DContext* c, UINT bytes) {
+  int slot = -1;
+  for (int i = 0; i < c->nubuf; i++) if (c->ubuf[i].res == NULL) { slot = i; break; }
+  if (slot < 0) {
+    if (c->nubuf >= S3D_UBUF_MAX) return NULL;
+    slot = c->nubuf++;
+  }
+  UINT cap = 4096;
+  while (cap < bytes) {
+    if (cap > 0x40000000u) { cap = bytes; break; }
+    cap <<= 1;
+  }
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_UPLOAD;
   D3D12_RESOURCE_DESC bd = {};
   bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  bd.Width = bytes;
+  bd.Width = cap;
   bd.Height = 1;
   bd.DepthOrArraySize = 1;
   bd.MipLevels = 1;
@@ -1434,14 +1572,108 @@ static ID3D12Resource* s3d_make_upload(S3DContext* c, const void* data, UINT byt
   ID3D12Resource* res = NULL;
   if (FAILED(c->device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
                                                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                                                __uuidof(ID3D12Resource), (void**)&res)))
+                                                __uuidof(ID3D12Resource), (void**)&res))) {
+    // Never silent (AGENTS.md 2.5): a failure here silently drops a vertex or index
+    // buffer and the affected draws read garbage.
+    fprintf(stderr, "stage3d_d3d: upload buffer (%u bytes) could not be created\n", (unsigned)cap);
+    fflush(stderr);
     return NULL;
+  }
   void* map = NULL;
   D3D12_RANGE rr = { 0, 0 };
-  if (FAILED(res->Map(0, &rr, &map)) || map == NULL) { res->Release(); return NULL; }
-  memcpy(map, data, bytes);
-  res->Unmap(0, NULL);
-  return res;
+  if (FAILED(res->Map(0, &rr, &map)) || map == NULL) {
+    fprintf(stderr, "stage3d_d3d: upload buffer (%u bytes) could not be mapped\n", (unsigned)cap);
+    fflush(stderr);
+    res->Release();
+    return NULL;
+  }
+  S3DUploadBuf* b = &c->ubuf[slot];
+  b->res = res;              // stays mapped forever: the pool writes through b->map
+  b->map = map;
+  b->bytes = cap;
+  b->fence = 0;
+  b->pending = 0;
+  return b;
+}
+
+// A buffer the batch being recorded already points at (bound to a stream, or the index
+// stage) must never be handed out again.
+static int s3d_ubuf_bound(S3DContext* c, ID3D12Resource* res) {
+  if (res == NULL) return 1;
+  for (int i = 0; i < S3D_MAX_STREAMS; i++)
+    if (c->streams[i].buf == res) return 1;
+  return c->indexBuffer == res;
+}
+
+static S3DUploadBuf* s3d_acquire_upload(S3DContext* c, UINT bytes) {
+  if (bytes == 0) return NULL;
+  const uint64_t done = c->fence != NULL ? c->fence->GetCompletedValue() : ~(uint64_t)0;
+  S3DUploadBuf* best = NULL;
+  for (int i = 0; i < c->nubuf; i++) {
+    S3DUploadBuf* b = &c->ubuf[i];
+    if (b->res == NULL || b->pending || b->bytes < bytes) continue;
+    if (b->fence != 0 && b->fence > done) continue;
+    if (s3d_ubuf_bound(c, b->res)) continue;
+    if (best == NULL || b->bytes < best->bytes) best = b;   // smallest that fits
+  }
+  if (best != NULL) return best;
+  int room = c->nubuf < S3D_UBUF_MAX;
+  for (int i = 0; i < c->nubuf && !room; i++) if (c->ubuf[i].res == NULL) room = 1;
+  if (room) return s3d_ubuf_new(c, bytes);   // ... which reports its own failure
+  // Saturated. Retire everything already submitted and then drop the smallest entry
+  // that is still too small for this request, so the pool is BOUNDED but also
+  // self-cleaning: a workload whose buffers have grown past an older class would
+  // otherwise sit on dead capacity for the rest of the run.
+  s3d_wait_idle(c);
+  if (c->fence != NULL) s3d_stamp_uploads(c, c->fenceNext);   // nothing is in flight now
+  for (int i = 0; i < c->nubuf; i++) {
+    S3DUploadBuf* e = &c->ubuf[i];
+    if (e->res == NULL || e->pending || s3d_ubuf_bound(c, e->res)) continue;
+    if (e->bytes >= bytes) return e;
+  }
+  for (int i = 0; i < c->nubuf; i++) {
+    S3DUploadBuf* e = &c->ubuf[i];
+    if (e->res == NULL || e->pending || s3d_ubuf_bound(c, e->res)) continue;
+    if (e->bytes >= bytes) continue;
+    e->res->Release();
+    e->res = NULL;
+    e->map = NULL;
+    e->bytes = 0;
+    e->pending = 0;
+    e->fence = 0;
+    return s3d_ubuf_new(c, bytes);
+  }
+  // Every entry is bound to a stream, a state no Stage3D program can reach: the
+  // app holds S3D_MAX_STREAMS + 1 buffers at most. Report it, never fail silently.
+  fprintf(stderr, "stage3d_d3d: upload pool saturated (%d buffers) for %u bytes\n",
+          (int)S3D_UBUF_MAX, (unsigned)bytes);
+  fflush(stderr);
+  return NULL;
+}
+
+// Tie every buffer written since the last submit to the fence value that submission
+// signed. Anything written before a submit is referenced by that submission (or a later
+// one), so the value is always conservative -- and a buffer never referenced at all
+// keeps fence 0, i.e. "the GPU has never seen me".
+//
+// NEVER stamps while a batch is open, which is what makes the rule above safe: a buffer
+// written (or replaced) since the last submit is referenced by the OPEN batch, whose
+// draws are recorded but NOT submitted, so no fence value can prove the GPU is finished
+// with it. Stamping there hands the next upload a buffer whose contents the pending draw
+// still reads. Measured on the Starling demo: the immediate list (texture uploads) stamped
+// the first frame mid-batch, the next 12 button uploads all landed in ONE buffer, and 11
+// of the 12 menu buttons vanished from every subsequent frame (Starling never re-uploads
+// an unchanged QuadBatch, so the corrupted buffers survived the whole run).
+static void s3d_stamp_uploads(S3DContext* c, uint64_t v) {
+  if (c->listOpen) return;
+  for (int i = 0; i < c->nubuf; i++)
+    if (c->ubuf[i].pending) { c->ubuf[i].pending = 0; c->ubuf[i].fence = v; }
+}
+
+// The batch being recorded already holds this buffer's GPU virtual address, so it is
+// not reusable until that batch's fence lands.
+static void s3d_mark_batch_ref(S3DContext* c, int ub) {
+  if (ub >= 0 && ub < c->nubuf && c->ubuf[ub].res != NULL) c->ubuf[ub].pending = 1;
 }
 
 int s3d_upload_vertex(void* ctx, int stream, const double* data, int numVertices, int components) {
@@ -1449,14 +1681,17 @@ int s3d_upload_vertex(void* ctx, int stream, const double* data, int numVertices
   S3DContext* c = (S3DContext*)ctx;
   if (components < 1 || components > 4 || numVertices <= 0 || data == NULL) return 0;
   const size_t n = (size_t)numVertices * (size_t)components;
-  float* tmp = (float*)malloc(n * sizeof(float));
-  if (tmp == NULL) return 0;
-  for (size_t i = 0; i < n; i++) tmp[i] = (float)data[i];
-  ID3D12Resource* nb = s3d_make_upload(c, tmp, (UINT)(n * sizeof(float)));
-  free(tmp);
-  if (nb == NULL) return 0;
-  if (c->streams[stream].buf != NULL) s3d_defer_release(c, (IUnknown*)c->streams[stream].buf);
-  c->streams[stream].buf = nb;
+  // Convert straight into the pooled buffer. The old code malloc'd a float copy first,
+  // and at megabytes of vertices per frame that malloc + memcpy was itself a visible
+  // part of the frame.
+  S3DUploadBuf* b = s3d_acquire_upload(c, (UINT)(n * sizeof(float)));
+  if (b == NULL) return 0;
+  float* dst = (float*)b->map;
+  for (size_t i = 0; i < n; i++) dst[i] = (float)data[i];
+  b->pending = 1;
+  if (c->listOpen && c->streams[stream].buf != NULL) s3d_mark_batch_ref(c, c->streams[stream].ub);
+  c->streams[stream].buf = b->res;
+  c->streams[stream].ub = (int)(b - c->ubuf);
   c->streams[stream].components = components;
   c->streams[stream].numVertices = numVertices;
   if (stream + 1 > c->numStreams) c->numStreams = stream + 1;
@@ -1466,10 +1701,14 @@ int s3d_upload_vertex(void* ctx, int stream, const double* data, int numVertices
 int s3d_upload_index(void* ctx, const uint32_t* data, int numIndices) {
   if (ctx == NULL || numIndices <= 0 || data == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
-  ID3D12Resource* nb = s3d_make_upload(c, data, (UINT)((size_t)numIndices * sizeof(uint32_t)));
-  if (nb == NULL) return 0;
-  if (c->indexBuffer != NULL) s3d_defer_release(c, (IUnknown*)c->indexBuffer);
-  c->indexBuffer = nb;
+  const size_t nbytes = (size_t)numIndices * sizeof(uint32_t);
+  S3DUploadBuf* b = s3d_acquire_upload(c, (UINT)nbytes);
+  if (b == NULL) return 0;
+  memcpy(b->map, data, nbytes);
+  b->pending = 1;
+  if (c->listOpen && c->indexBuffer != NULL) s3d_mark_batch_ref(c, c->indexUb);
+  c->indexBuffer = b->res;
+  c->indexUb = (int)(b - c->ubuf);
   c->numIndices = numIndices;
   c->indexBytes = numIndices * 4;
   return 1;
@@ -1479,21 +1718,42 @@ int s3d_upload_constants(void* ctx, int isFragment, const double* data, int coun
   if (ctx == NULL || count <= 0 || data == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
   const UINT need = (UINT)count * 4u;
-  const int slot = c->slot;
-  if (!s3d_ensure_cb(c, slot, isFragment, need)) return 0;
-  const UINT cap = isFragment ? c->fcBytes : c->vcBytes;
-  if (need > cap) {
-    fprintf(stderr, "stage3d_d3d: %s constants need %u bytes, slot holds %u\n",
-            isFragment ? "fragment" : "vertex", need, cap);
+  if (need > S3D_CB_REGION) {
+    // Loud, never silent (AGENTS.md 2.5): a file this large cannot fit one region,
+    // and truncating it would hand the shader wrong constants. The AGAL constant
+    // files are 256 registers, so this is unreachable with the generated C.
+    fprintf(stderr, "stage3d_d3d: %s constants need %u bytes, one region holds %u\n",
+            isFragment ? "fragment" : "vertex", need, (UINT)S3D_CB_REGION);
+    fflush(stderr);
     return 0;
   }
-  // The CPU write must not race the GPU reading this slot's constants from the
-  // previous use of the slot (see s3d_wait_slot).
+  const int slot = c->slot;
+  if (!s3d_ensure_cb(c, slot, isFragment, S3D_CB_BYTES)) return 0;
+  UINT* cur = isFragment ? &c->cbCurF : &c->cbCurV;
+  if (*cur + (UINT)S3D_CB_REGION > (UINT)S3D_CB_BYTES) {
+    static int warned = 0;
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr, "stage3d_d3d: constant regions exhausted (%d uploads in one "
+                      "frame) -- reusing the first region; the draws after this one "
+                      "may read stale constants\n", S3D_DRAWS_PER_FRAME);
+      fflush(stderr);
+    }
+    *cur = 0;
+  }
+  const UINT off = *cur;
+  *cur = off + (UINT)S3D_CB_REGION;
+  // The wait cannot be left to batch_begin: the FIRST upload of a frame happens
+  // before anything opens the batch (the generated C uploads the register file
+  // between the state setters and drawTriangles), so this is the only thing keeping
+  // the CPU from overwriting a region the GPU may still be reading. For every later
+  // upload of the same batch it is a no-op (the fence value is already satisfied).
   s3d_wait_slot(c, slot);
-  float* dst = (float*)(isFragment ? c->fcMap[slot] : c->vcMap[slot]);
+  float* dst = (float*)((char*)(isFragment ? c->fcMap[slot] : c->vcMap[slot]) + off);
   if (dst == NULL) return 0;
   const UINT n = need / 4u;
   for (UINT i = 0; i < n; i++) dst[i] = (float)data[i];
+  if (isFragment) c->cbOffF = off; else c->cbOffV = off;
   return 1;
 }
 
@@ -1774,6 +2034,10 @@ void s3d_set_scissor(void* ctx, int on, int x, int y, int w, int h) {
   c->scissorOn = on;
   c->scissorX = x; c->scissorY = y; c->scissorW = w; c->scissorH = h;
 }
+// Record the blend factors for the draws that follow. They take effect at the
+// next draw, which selects the pipeline carrying this pair (s3d_select_pso) --
+// Stage3D is a state machine and setBlendFactors may change between two draws
+// that share one Program3D.
 void s3d_set_blend(void* ctx, const char* sourceFactor, const char* destFactor) {
   if (ctx == NULL) return;
   S3DContext* c = (S3DContext*)ctx;
@@ -1962,12 +2226,13 @@ int s3d_draw(void* ctx, int numTriangles) {
 
   if (s3d_env("ASC_S3D_DUMP")) {
     fprintf(stderr, "S3DDRAW(d3d) tris=%d streams=%d depth=(%s,w=%d) cull=%s blend=(%s,%s) "
-                    "cmask=%d%d%d%d\n", numTriangles, c->numStreams,
+                    "cmask=%d%d%d%d cbV=%u cbF=%u\n", numTriangles, c->numStreams,
             c->depthCompare ? c->depthCompare : "null", c->depthWrite,
             c->cullMode ? c->cullMode : "null",
             c->blendSource ? c->blendSource : "null",
             c->blendDest ? c->blendDest : "null",
-            c->colorMaskR, c->colorMaskG, c->colorMaskB, c->colorMaskA);
+            c->colorMaskR, c->colorMaskG, c->colorMaskB, c->colorMaskA,
+            (unsigned)c->cbOffV, (unsigned)c->cbOffF);
   }
 
   c->list->SetGraphicsRootSignature(c->rootSig);
@@ -2058,11 +2323,13 @@ int s3d_draw(void* ctx, int numTriangles) {
 
   // Constant buffers: the HLSL declares register(b0) in BOTH stages, so the two
   // root parameters carry the vertex and fragment register files respectively.
+  // Each draw binds the region the LAST upload for that stage left its values in
+  // (see S3D_CB_REGION): the region offsets are 4096-aligned, hence CBV-legal.
   ID3D12Resource* vcb = c->vcBuf[c->slot];
   ID3D12Resource* fcb = c->fcBuf[c->slot];
   if (vcb == NULL || fcb == NULL) return 0;
-  c->list->SetGraphicsRootConstantBufferView(0, vcb->GetGPUVirtualAddress());
-  c->list->SetGraphicsRootConstantBufferView(1, fcb->GetGPUVirtualAddress());
+  c->list->SetGraphicsRootConstantBufferView(0, vcb->GetGPUVirtualAddress() + c->cbOffV);
+  c->list->SetGraphicsRootConstantBufferView(1, fcb->GetGPUVirtualAddress() + c->cbOffF);
 
   // Stage3D's stencil reference is per-draw state (setStencilReferenceValue): the
   // generated C walks it while stencilling, so it is re-set on every draw.

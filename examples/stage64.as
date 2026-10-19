@@ -13,10 +13,19 @@ check(FileMode.READ == "read" && FileMode.WRITE == "write", "FileMode READ/WRITE
 check(FileMode.APPEND == "append" && FileMode.UPDATE == "update", "FileMode APPEND/UPDATE");
 
 // --- File: path bundle + url + existence ---
-var f:File = new File("stage64_test.txt");
+// temp/ is the repo's scratch area (gitignored): the example must not litter its
+// source dir. The suite runs every example with cwd = the repo root, so a bare
+// relative path here lands in the checkout itself.
+var f:File = new File("temp/stage64_test.txt");
 check(f is File && f is EventDispatcher, "File is EventDispatcher");
-check(f.nativePath == "stage64_test.txt", "File nativePath stored");
-check(f.url == "file://stage64_test.txt", "File url is file:// + path");
+check(f.nativePath == "temp/stage64_test.txt", "File nativePath stored");
+check(f.url == "file://temp/stage64_test.txt", "File url is file:// + path");
+// A leftover from an earlier run that threw mid-way (this example deletes its
+// file at the end, so an aborted run leaves one behind) would fail the
+// fresh-path assertion below for the wrong reason -- and does so only on the
+// second run, which is the confusing part. Same guard, same reason as
+// examples/sqlite-basic.as.
+if (f.exists) f.deleteFile();
 check(f.exists == false, "file does not exist yet");
 
 // --- FileStream: write then read roundtrip ---
@@ -37,8 +46,8 @@ inp.close();
 
 // --- File: resolvePath + directory create/delete ---
 var child:File = f.resolvePath("subdir");
-check(child.nativePath == "stage64_test.txt/subdir", "resolvePath joins with /");
-var d:File = new File("stage64_dir");
+check(child.nativePath == "temp/stage64_test.txt/subdir", "resolvePath joins with /");
+var d:File = new File("temp/stage64_dir");
 d.createDirectory();
 check(d.exists && d.isDirectory, "createDirectory makes a directory");
 d.deleteDirectory();
@@ -46,7 +55,17 @@ check(d.exists == false, "deleteDirectory removes it");
 
 // --- File static directory shortcuts (resolved from the environment) ---
 check(File.applicationDirectory != null, "applicationDirectory non-null");
-check(File.applicationDirectory.nativePath == ".", "applicationDirectory maps to CWD");
+// applicationDirectory is the EXECUTABLE's directory, NOT the CWD: as_app_dir()
+// derives it from the process's own path (GetModuleFileNameA / _NSGetExecutablePath
+// / /proc/self/exe), i.e. the `-o` directory -- which is AIR's install-directory
+// semantics and what lets a build be moved wholesale (docs/zh-cn/swc.md §11,
+// docs/zh-cn/compile.md). There is no portable AS3 way to name that directory
+// other than through this API, so pin the shape rather than a literal: it resolves
+// to a real directory and resolvePath stays under it.
+check(File.applicationDirectory.nativePath.length > 0, "applicationDirectory has a nativePath");
+check(File.applicationDirectory.isDirectory, "applicationDirectory is a directory");
+check(File.applicationDirectory.resolvePath("x").nativePath.indexOf(File.applicationDirectory.nativePath) == 0,
+      "resolvePath stays under applicationDirectory");
 check(File.userDirectory != null, "userDirectory non-null");
 check(File.documentsDirectory != null, "documentsDirectory non-null");
 check(File.desktopDirectory != null, "desktopDirectory non-null");

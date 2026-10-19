@@ -202,6 +202,25 @@ function checkXmlLiterals(): string[] {
   ok('an embedded {expr} in a literal is still a loud LexError',
     /E4X embedded expressions/.test(throws('var x:XML = <a>{n}</a>;') ?? ''));
 
+  // CRLF checkouts only. The whole repo is CRLF and CI is LF, so this drift is
+  // invisible in CI -- but advance() swallows a CRLF pair in a SINGLE call, so
+  // advancing the literal by "text.length calls" over-consumed one character per
+  // CRLF inside it. The index then drifted past the literal and swallowed the
+  // following `//` comment, whose `/` was lexed as division (so the comment's CJK
+  // text was reported as "unexpected character '的'"). Exactly the failure seen on
+  // examples/e4x-name.as, which lexes fine on an LF checkout. Pin the whole shape:
+  // it lexes, keeps the markup, and leaves the file position exact so the comment
+  // is recognised and the next line's token carries the right line number (阶段一百九十三).
+  const crlf = 'var x:XML =\r\n  <items>\r\n    <a/>\r\n    <b/>\r\n  </items>;\r\n// 中文注释的\r\ntrace(x);';
+  ok('a multi-line literal on a CRLF checkout lexes without error',
+    throws(crlf) === null);
+  ok('...and keeps the CRLF markup intact',
+    xmlTok(crlf) === '<items>\r\n    <a/>\r\n    <b/>\r\n  </items>');
+  ok('...and the following // comment is recognised (no CJK "unexpected character")',
+    !lex(crlf).some((t) => t.value === '的' || t.value === '中文注释的'));
+  ok('...and line bookkeeping stays exact through the literal',
+    lex(crlf).find((t) => t.value === 'trace')?.line === 7);
+
   if (bad.length === 0) console.log(`[xmllit] ${n} checks passed`);
   return bad;
 }

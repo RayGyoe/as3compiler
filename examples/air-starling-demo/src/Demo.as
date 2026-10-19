@@ -38,7 +38,7 @@ package
             // iPhone and iPhone 4/4S. The contents is then centered on the screen. Nowadays,
             // you'd use a different approach, of course. See the "Scaffold" project for a sample.
 
-            stage.frameRate = 120;
+            stage.frameRate = 60;
 
             // Adapt the frame rate to the display the window is actually on. AIR has no
             // refresh-rate query, so our runtime reports the panel's rate through

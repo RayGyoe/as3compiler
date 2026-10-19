@@ -6,6 +6,7 @@ import { SymbolTable, type ExportedSymbol } from './symbols.ts';
 import { Emitter } from './emit.ts';
 import type { SwcResourceSpec, SwcBake } from './swc.ts';
 import type { EmbedResourceSpec } from './embed.ts';
+import type { AneDescriptor } from './fre.ts';
 
 export { CodegenError } from './symbols.ts';
 export type { ExportedSymbol } from './symbols.ts';
@@ -27,11 +28,12 @@ export function generateC(
   swcBake: SwcBake | undefined = undefined,
   embedResources: readonly EmbedResourceSpec[] = [],
   embedFieldInits?: ReadonlyMap<string, string>,
-  appDescriptorXml?: string
+  appDescriptorXml?: string,
+  aneDescriptors: readonly AneDescriptor[] = []
 ): CodegenResult {
   const symbols = new SymbolTable();
   symbols.collect(program, embedFieldInits);
-  const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources, appDescriptorXml);
+  const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources, appDescriptorXml, aneDescriptors);
   const c = emitter.run();
   return { c, exports: [...symbols.exports] };
 }

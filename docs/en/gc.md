@@ -877,7 +877,7 @@ water mark.
 "header" is read out of the **payload bytes**: the tag is ASCII and the size is arbitrary, so
 the GC greys a **bogus block**, `gc_scan` then reads its vtable/values and pushes garbage onto
 the grey stack, and the next sweep links that garbage into a free list or into `gc_all`. The
-price is a **heap collapse a few seconds later**. Measured on TalkMED the fault was literally in
+price is a **heap collapse a few seconds later**. Measured on AcmeApp the fault was literally in
 `gc_sweep_step`'s `gc_header* next = h->next;`, with the faulting address being **ASCII** -- the
 FPS overlay's own per-frame text, `"FPS: 121"`.
 
@@ -907,7 +907,7 @@ FPS overlay's own per-frame text, `"FPS: 121"`.
 
 **Rule**: an entry in a class's `as_prop` reflection table is only **half** of the contract -- `gc_scan` must also **follow** that tag. The tags that carry a pointer are 3 (`char*` string), 6 (unchecked ref), 7 (boxed `as_value`), 10/11/12 (typed ref) and **13** (`DisplayObject.name`); 1/2/4/5 are raw values and 8/9 (`int64`/`uint64`) hold no pointer at all (a range test there would mark raw integer bits as a heap reference).
 
-**What a missing tag costs**: `DisplayObject.name` is stored exactly like any other String slot -- tag 13 exists for the **write** side only, where a *dynamic* write of `null` has to throw `TypeError #2007` -- but the marker's switch listed 3/6/7/10/11/12 and not 13, so the name string was **never greyed**. The first collection that reached the object reclaimed it, and the freed block was handed straight to the next short-lived string. Measured on the live TalkMED app: the FPS overlay allocates a `"MS: N"` string every frame, so after a few seconds every click target's `name` read back as one of those, `HomeView.clickTabList` parsed the tab index out of `e.target.name`, and every tab click collapsed to index 0 -- the `打开网页` tab -- and opened a web page.
+**What a missing tag costs**: `DisplayObject.name` is stored exactly like any other String slot -- tag 13 exists for the **write** side only, where a *dynamic* write of `null` has to throw `TypeError #2007` -- but the marker's switch listed 3/6/7/10/11/12 and not 13, so the name string was **never greyed**. The first collection that reached the object reclaimed it, and the freed block was handed straight to the next short-lived string. Measured on the live AcmeApp app: the FPS overlay allocates a `"MS: N"` string every frame, so after a few seconds every click target's `name` read back as one of those, `HomeView.clickTabList` parsed the tab index out of `e.target.name`, and every tab click collapsed to index 0 -- the `打开网页` tab -- and opened a web page.
 
 **How it is guarded**:
 

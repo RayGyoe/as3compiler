@@ -467,7 +467,14 @@ export function lex(source: string): Token[] {
         if (lit.interp > 0) {
           throw new LexError('E4X embedded expressions ({...}) inside XML literals are not supported by this subset', startLine, startCol);
         }
-        for (let k = 0; k < text.length; k++) advance();
+        // Advance to the scan's END INDEX, not "text.length times": advance()
+        // consumes a CRLF pair (two characters) in a single call, so counting
+        // calls over-consumed by one character per CRLF inside the literal.
+        // On a CRLF checkout a multi-line literal therefore drifted past
+        // `lit.end` and swallowed the following `//` comment -- its `/` was
+        // then lexed as division and the comment's CJK text was reported as
+        // "unexpected character". Same loop shape as the regex branch above.
+        while (i < lit.end) advance();
         tokens.push({ kind: 'xml', value: text, line: startLine, col: startCol });
         continue;
       }

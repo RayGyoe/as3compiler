@@ -521,8 +521,18 @@ Metal 的 `MTLCommandBuffer` 天然是「提交即对象化」，D3D12 那边一
   `s3d_wait_slot(idx)` 等该槽的 fence 值走完、再 `Reset` 该槽的命令分配器；`s3d_batch_end` 信号
   `fenceValues[idx] = ++fenceNext` 并推进槽号。每槽各有一份上传堆（UPLOAD heap），故三帧并行时 CPU
   写常量缓冲不会触发为上一帧缓冲区已在使用中。
-- **常量缓冲每帧槽一份**（256 对齐、可增长、`S3D_CB_BYTES = 16384`），但 **CPU `memcpy` 前必须先
-  `s3d_wait_slot`** ——否则 CPU 可能写一块正被 GPU 读的 UPLOAD 内存（实测踩过，表现为常量"跳一帧"）。
+- **常量缓冲：区域按 draw 版本化**（阶段一百七十三）。**D3D12 在 GPU 执行命令列表时才读常量**（帧末），
+  而生成的 C 在**每次** `drawTriangles` 前重传整个寄存器文件 ⇒ 每帧槽一份常量缓冲会让该帧**所有** draw 都读到
+  **最后一次**上传的矩阵。实测（`examples/air-starling-demo`）：12 个按钮**全部**被最后一个按钮的 mvp 变换，
+  只有最后一个落在原位。Metal 用 `setVertexBytes` 内联拷贝，**天生免疫** ⇒ 只在 Windows 暴露。
+  现改为每次上传独占一个 4096 B 区域（`S3D_CB_REGION` = 256 float4 = HLSL 能声明的最大 cbuffer，
+  `S3D_CB_BYTES = S3D_CB_REGION * S3D_DRAWS_PER_FRAME`），draw 绑定**该 stage 最后一次上传的区域**
+  （`GetGPUVirtualAddress() + cbOffV/cbOffF`，4096 对齐即 CBV 合法）。**游标在 `s3d_batch_end` 归零**，
+  **不在 `batch_begin`**：一帧的**首次**上传发生在批次打开**之前**（生成 C 在状态设置与 `drawTriangles` 之间
+  传常量），在 begin 归零会抹掉它刚写的区域 —— 实测表现为**前两个 draw 共用区域 0**（`cbV=0,0,4096,…`），
+  画面上背景与 logo 一起消失。同理 **`s3d_wait_slot` 留在 `s3d_upload_constants` 内**（首次上传没有
+  `batch_begin` 的等待保护，其余上传是空操作），否则 CPU 可能写一块正被 GPU 读的 UPLOAD 内存。
+  寄存器文件超过一个区域时**响亮拒绝**（`need > S3D_CB_REGION` 直接返回 0 并打印，绝不截断）。
 - **延迟释放队列**（`S3DRelease rel[4096]`，每条带一个 fence 值；`s3d_defer_release` 按
   `fence->GetCompletedValue()` 排空）——D3D12 没有"命令缓冲释放时自动降引用"这回事，任何换掉的
   资源都必须等其最后一帧真的跑完再 `Release()`。
@@ -534,8 +544,10 @@ Metal 的 `MTLCommandBuffer` 天然是「提交即对象化」，D3D12 那边一
 ### 10.2 PSO 缓存：键是**整个绘制状态**
 
 D3D12 没有 Metal 那种"随时能改状态"的 encoder，`ID3D12PipelineState` 是**不可变**的，一切可绘状态都必须
-烘进 PSO。故缓存键是所有影响管线的字段的拼接（`srcHash|writeMask|depthWrite|depthCompare|stencil*|dsNeeded|cullMode|blendOn|streamSig`），
-每条程序最多 `S3D_MAX_PSOVAR = 16` 个变体、全局 `S3D_KEY_CAP 256`、LRU 淘汰。这比 Metal 侧（§9.13 的 DSS 缓存）
+烘进 PSO。故缓存键是所有影响管线的字段的拼接（`srcHash|writeMask|depthWrite|depthCompare|stencil*|dsNeeded|cullMode|blendOn|blendSource|blendDest|streamSig`），
+每条程序最多 `S3D_MAX_PSOVAR = 16` 个变体、全局 `S3D_KEY_CAP 256`、LRU 淘汰。
+**键里必须是「因子对」，不能只是「开不开混合」**：混合因子烘进 PSO，换一对因子就要换一条 PSO，
+只记 `blendOn` 会让第一次用的那对因子（Starling 的 `normal`）被复用到所有模式 —— 症状与定案见 §10.6。这比 Metal 侧（§9.13 的 DSS 缓存）
 更硬：`SetPipelineState` 是纯指针绑定，但**建 PSO 很贵**（需编译 vs_5_1/ps_5_1 字节码）。
 
 ### 10.3 一个只能实测发现的 D3D12 链接规则：**字段声明顺序即寄存器号**
@@ -562,6 +574,8 @@ VS 侧的 `TEXCOORD0` 在 reg 1、PS 侧的 `TEXCOORD0` 在 reg 0 ⇒
   CPU 侧等待；但**优先级**仍是 "Stage3D 的批已提交、提交序在合成之前"。
 - 目标必须是 `R8G8B8A8`/`BGRA8` 且非多重采样，否则**响亮拒绝**且不画（`unsupported render target ...`，
   只打一次）。
+- 合成用 **`SkBlendMode::kSrc`**（不是默认的 `kSrcOver`）：AIR 呈现 Stage3D 后缓冲时**忽略其 alpha**，
+  四条合成路径（D3D12 / Metal / web-GL / CPU 光栅）都必须如此，理由与 adl 实测见 §10.6。
 
 ### 10.5 验收（已做）与**未验收**（不静默）
 
@@ -577,15 +591,68 @@ VS 侧的 `TEXCOORD0` 在 reg 1、PS 侧的 `TEXCOORD0` 在 reg 0 ⇒
 - 开发期的脚手架（`s3d_watch` 一族生命周期探针）**已从产品代码移除**；`get_render_target` 的诊断行保留
   但改成**周期性**（`n++ % 120 == 0`），正是它把上面那个悬空指针的根因印了出来。
 
-**未验收（不得宣称更大范围）**：
+**已补做（阶段一百七十三，2026-10-16 本机 x86 `--air-app`）**：
 
-- `examples/air-starling-demo` **尚未在 Windows 目标上跑过** —— 它是外部依赖面最广的 Stage3D 工程
-  （127 个源文件 + 完整 Starling），是本后端是否真的通用的**关键对照**。
+- `examples/air-starling-demo`（127 个源文件 + 完整 Starling）**已实机跑通**：开窗、资源加载完成、
+  **26 个 draw / 246 个三角形**（12×9 九宫格 + 12 条标签 + 背景/logo/`infoText`，几何一个不少）全部就位。
+  期间修掉的**结构性**缺陷 = 上面 §10.1 的「常量区域按 draw 版本化」（每帧槽一份常量缓冲 ⇒ 一帧内所有
+  draw 都读最后一次上传的 mvp）。
+- **与 `adl 51.4.1` 逐项对照**（同机、同 150% 缩放；adl 侧用 `temp/win_shot.ps1` 抓窗口客户区，我们侧用
+  `ASC_GPU_DUMP` 的 presented 后缓冲）：logo 的红像素包围盒在**客户端坐标下同为 `x32..173 y10..196`**、
+  按钮节距同为 **69 px**（= 46 pt × 1.5）、两列按钮的行/列偏移与 12 条标签逐一对应。
+
+**未验收（不得宣称更大范围）**：
 - **背面剔除/绕序**：`FrontCounterClockwise = FALSE` + 正高度 viewport（不 Y 翻转）是**纸面推论**
   （与 §关于 D3D 也是行 0 在顶一致），未做剔除的 A/B 实测。同理：DXGI **调试层**本轮未开（PSO 的
   `E_INVALIDARG` 靠 `temp/psoprobe.cc` 的 InfoQueue 戳出来的，产品路径未开）。
-- **Mip-drop / 透明混合 / 立方体贴图**这些语义已按 §9 逐条移植且有文本级钉子，但**未在 D3D12 上单独复测**
-  （`shmup-stage3d` 只覆盖了 2D 精灵 + 混合 + 深度关闭的一小部分组合）。
+- **Mip-drop / 立方体贴图**这些语义已按 §9 逐条移植且有文本级钉子，但**未在 D3D12 上单独复测**
+  （`air-starling-demo` 覆盖了 `setProgram` 切换、深度/模具、多流 `drawTriangles` 与纹理图集，
+  但没覆盖立方体贴图）。**混合因子已补齐**：阶段一百七十五 用 Blend Modes 场景把 6 对因子逐一对过 adl（§10.6）。
+- `Context3D.drawTriangles` 的 `firstIndex` **被忽略**（`(void)firstIndex;`，索引缓冲整段上传）。
+  对 Starling（恒 `drawTriangles(ib, 0, n)`）无影响，对别的 Stage3D 应用是潜在偏离 —— 放入遗留表。
+
+### 10.6 混合模式（`Context3D.setBlendFactors`）对齐：三处必须同时正确（阶段一百七十五）
+
+`examples/air-starling-demo` 的 **Blend Modes** 场景（`DisplayObject.blendMode` → `BlendMode.activate()` →
+`context.setBlendFactors(sf, df)`）里「切换没有效果」**不是**一个缺陷，而是三个叠在一起、各管一类的缺陷。
+所有数字都是同一场景逐像素对 adl 51.4.1（同机、同 150% 缩放；adl 侧抓窗口客户区，我们侧抓客户区）：
+
+| 模式（Starling） | 因子对 (sf, df) | 修复前 vs adl | 修复后 vs adl |
+|---|---|---|---|
+| normal | one / oneMinusSourceAlpha | 3.69% | 3.70%（对照：本就正确） |
+| multiply | destinationColor / oneMinusSourceAlpha | 13.68% | 3.54% |
+| screen | one / oneMinusSourceColor | 10.59% | 2.00% |
+| add | one / one | 10.22% | 1.71% |
+| erase | zero / oneMinusSourceAlpha | 13.80% | 1.91% |
+| none | one / zero | 12.93% | 3.75% |
+
+（百分比 = 差异像素占比；基准是**同一场景未受影响的 normal 模式的 3.7%**，那 3.7% 是字体/抗锯齿层面的固有差异，
+不是混合缺陷。`erase` 的可见症状最直观：修复前是**白色**火箭剪影、adl 是**黑色**；`none` 修复前的 12.93% 次之。）
+
+（口径：我们的窗口客户区 480×870 与 adl 的 459×814 裁剪在 **@0,0** 对齐后逐点比（隔 2 px、`|ΔR|+|ΔG|+|ΔB| > 24` 记一次差异）；
+复算脚本 `temp/pngdiff2.cjs`，对齐偏移由搜索得出（结果就是 0,0）。运行间确定性 0.02% ⇒ ≥2% 的差异都是真差异。）
+
+1. **PSO 键必须含因子对**（§10.2）。键里原本只有「是否开混合」这一个布尔，于是程序第一次混合用的因子对
+   （Starling 的 `normal`）被**复用**到所有模式 —— 实测 5 次「Switch Mode」只动了 0.3% 的像素，动的全是标签。
+   Metal 侧的 `stage3d_glue.mm` 早就按因子对建键（它的文件头注释写的就是这条症状）。
+2. **alpha 槽的因子必须做 `*_COLOR → *_ALPHA` 翻译**。Stage3D 只有**一对**因子（色彩与 alpha 共用同一对），
+   Metal 把同一对交给两个色彩附件 slot 是合法的，D3D12 **不是**：alpha 槽里出现 `*_COLOR` 是非法枚举，
+   `CreateGraphicsPipelineState` 把**整条** PSO 判成 `E_INVALIDARG (0x80070057)`，调试层原话
+   `SrcBlendAlpha[0] is trying to use a D3D11_BLEND value (0x9) that manipulates color, which is invalid`
+   （用 `temp/blendprobe.cc` + 调试层独立复现）。建不出 PSO ⇒ 该模式**每一次 draw 都被静默丢掉**，
+   这正是 multiply/screen 「完全没效果」的直接原因。翻译到 alpha 孪生因子（`s3d_blend_factor_alpha`）不只是绕开报错：
+   ERASE (`zero / oneMinusSourceAlpha`) 只有在被擦像素的 **alpha 真的到 0** 时才算擦掉
+   （Starling 就是靠它擦 RenderTexture）。
+3. **合成必须忽略后缓冲的 alpha**（§10.4）。AIR 呈现 Stage3D 后缓冲时**不看 alpha**：把上下文清成
+   `(1, 0, 0, 0.25)` 与 `(1, 0, 0, 1.0)`（stage 颜色设成不透明绿），adl 窗口里同一像素**都是 `(255,0,0)`** ——
+   绿色从不透过半透明后缓冲。故 `sk_gpu_draw_texture`（D3D12）/ `sk_mtl_draw_texture`（Metal）/
+   `sk_gl_draw_texture`（web GL）/ `sk_canvas_draw_bgra`（CPU 光栅）四条合成路径都改用 **`SkBlendMode::kSrc`**，
+   而非默认的 `kSrcOver`：ERASE 把 RGB **和** alpha 一起清零，`kSrcOver` 会让 stage 颜色透出来（白色剪影），
+   `kSrc` 才得到 adl 的黑色。**这一条只在「后缓冲有像素的 alpha 不为 1」时才与旧行为不同**，
+   故其余 12 个场景逐像素基本不变（实测 `BlendModes` / `RenderTexture` 与修复前差异 0.06%）。
+
+**钉子**：`test/unit/stage3d.ts` 的 `stage3d/d3d-glue` 组（键含因子对、alpha 槽翻译函数及其两处使用、
+四条合成路径都 `kSrc`）。
 
 ## 11. 参考链接
 

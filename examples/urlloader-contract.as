@@ -92,7 +92,10 @@ check(log2 == "open;progress;complete;", "a load after close() completes normall
 
 // --- dataFormat = URLVariables turns the payload into a URLVariables object.
 // AIR's one dataFormat where `data` is neither a String nor a ByteArray. ---
-var fixture:File = new File("urlloader_contract_query.txt");
+// temp/ is the repo's scratch area (gitignored): the suite runs every example with
+// cwd = the repo root, so a bare relative path would write this fixture into the
+// checkout itself -- and leave it there for good if an assertion above threw.
+var fixture:File = new File("temp/urlloader_contract_query.txt");
 var fout:FileStream = new FileStream();
 fout.open(fixture, FileMode.WRITE);
 fout.writeUTFBytes("name=John%20Doe&age=42&empty=");
@@ -103,7 +106,7 @@ l3.dataFormat = URLLoaderDataFormat.VARIABLES;
 var l3done:Boolean = false;
 function onComplete3(e:Event):void { l3done = true; }
 l3.addEventListener(Event.COMPLETE, onComplete3);
-l3.load(new URLRequest("urlloader_contract_query.txt"));
+l3.load(new URLRequest("temp/urlloader_contract_query.txt"));
 tickTimers();
 check(l3done, "a VARIABLES load completes");
 check(l3.data is URLVariables, "dataFormat=VARIABLES yields a URLVariables, not a String");

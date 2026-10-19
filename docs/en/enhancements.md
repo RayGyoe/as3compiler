@@ -9,7 +9,7 @@
 > counterpart at all** is the scope of an enhancement.
 >
 > Adjacent docs: [`as3-semantics.md`](as3-semantics.md) §4/§5 (principles and divergences), `TODO.md`'s
-> `### 增强待做` (scheduling), and the "Beyond AIR" section in [`README-CN.md`](../../README-CN.md).
+> `### 增强待做` (scheduling), and the "Beyond AIR" section in [`README.md`](../../README.md).
 
 ---
 

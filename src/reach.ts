@@ -422,7 +422,13 @@ function hasWasmExport(md: Metadata[] | undefined): boolean {
 //
 // Files carrying module-level statements or free functions are always kept: they
 // are emitted for the whole program regardless of which class reached them.
-export function computeReachable(files: ReachFile[], mainClassFqn: string): ReachResult {
+//
+// `extraRoots` are additional FQNs that must stay in the closure even though no AS3
+// source references them: an SWC symbol class whose `DoABC` base is a class the
+// project compiles from source (the combo boxes extending
+// `com.example.controls.ComBoBox`) is one — the library links the symbol to that
+// class, so AIR's linker keeps it and ours must too (index.ts feeds the SWC bases in).
+export function computeReachable(files: ReachFile[], mainClassFqn: string, extraRoots: readonly string[] = []): ReachResult {
   const decls: Decl[] = [];
   const byFqn = new Map<string, Decl>();
   const byShort = new Map<string, Decl[]>();
@@ -482,6 +488,12 @@ export function computeReachable(files: ReachFile[], mainClassFqn: string): Reac
     );
   }
   roots.add(mainDecl.fqn);
+  for (const r of extraRoots) {
+    const d = byFqn.get(r);
+    // A base class the project does not declare (a library-only class) cannot be
+    // added: the SWC emitter reports that case on its own, so silence here is right.
+    if (d !== undefined) roots.add(d.fqn);
+  }
   const forced = new Set<string>();
   for (const f of files) {
     let pins = false;

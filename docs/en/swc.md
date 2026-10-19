@@ -138,7 +138,8 @@ Resource-related tags (measured tag type distribution):
 | PNG/lossless bitmap | `DefineBitsLossless` | 20 | SWF's own bitmap format, **no alpha** (see §3.1) |
 | PNG/lossless bitmap (with alpha) | `DefineBitsLossless2` | 36 | SWF's own bitmap format, **with alpha** (see §3.1) |
 | JPEG | `DefineBitsJPEG2` | 21 | `characterID` + **the complete JPEG bytes** (starting `FF D8`) |
-| JPEG (with alpha) | `DefineBitsJPEG3/4` | 35/90 | JPEG + alpha data |
+| JPEG (with alpha) | `DefineBitsJPEG3` | 35 | `characterID` + `alphaDataOffset` + the JPEG bytes + a **separate zlib alpha plane** (see §3.2③) |
+| JPEG4 (with alpha) | `DefineBitsJPEG4` | 90 | same family as 35; absent from this library by measurement; **unsupported** (see §10) |
 | Raw bytes | `DefineBinaryData` | 87 | `characterID` + raw bytes |
 | Fonts / sounds | `DefineFont*` / `DefineSound` | 10/48/14/75 | font/audio data |
 | **symbol → class name** | `SymbolClass` | 76 | `{id → "class name"}` mapping |
@@ -246,7 +247,7 @@ DefineBitsJPEG3 (tag 35) body:
 ```
 
 AIR composites the two; feed only the JPEG to Skia and the transparent area is painted as a **black
-rectangle** (measured on the two TalkMED home cards `#1113` 186×160 / `#1118` 167×162: the JPEG's four
+rectangle** (measured on the two AcmeApp home cards `#1113` 186×160 / `#1118` 167×162: the JPEG's four
 corners are exactly `(0,0,0)`, while the plane's corners are `0` and its centre is `255`).
 
 **Correct approach**: **decompress the plane at compile time** (Node's built-in `zlib`), **composite at
@@ -284,13 +285,13 @@ bytecode of 254 classes**, not empty placeholders. Measured (a self-written pars
 modules exactly; method in §11):
 
 > **It is in the way right now (real-machine evidence, 2026-10-14)**: a skin symbol's **own timeline script**
-> also lives in `DoABC`. On the TalkMED login page nothing in AS3 ever writes the agreement switch
+> also lives in `DoABC`. On the AcmeApp login page nothing in AS3 ever writes the agreement switch
 > `agreebtn` — the app only **reads** `agreebtn.currentFrame != 3` (`SmsAccount.as:270`,
-> `TalkMEDAccount.as:129`) and the toggling lives inside the symbol's script. We never run it, so
+> `AcmeAccount.as:129`) and the toggling lives inside the symbol's script. We never run it, so
 > `currentFrame` stays at frame 1 => the switch **cannot be clicked** and pressing "sign in" always raises
 > the "please read the privacy policy and terms of service" toast: **the login flow ends there**. Measured
 > side by side: `adl 51.4.1` turns it into a green check on one click; the AOT build does not change after
-> four. See `as3compiler/talkmed-meeting-aot-vs-adl-diff.md` §2 D17 and the `TODO.md` legacy row.
+> four. See `as3compiler/acme-app-aot-vs-adl-diff.md` §2 D17 and the `TODO.md` legacy row.
 
 **Closed out on 2026-10-14 (stage 156): the frame-script half has landed; this "scope declaration" narrows to
 "real logic is not executed, frame scripts are".** A new `src/abc.ts` (`parseAbc` / `decodeSymbolScripts` /
@@ -320,14 +321,14 @@ The content is real logic, not symbolic placeholders (sorted by single-module by
 
 | Module | Bytecode | Note |
 |---|---|---|
-| `com/vsdevelop/utils/StringCore` | 4,373 B | in-house utility library (largest) |
-| `com/vsdevelop/air/download/DownLoader` | 3,576 B | in-house downloader |
+| `com/example/utils/StringCore` | 4,373 B | in-house utility library (largest) |
+| `com/example/air/download/DownLoader` | 3,576 B | in-house downloader |
 | `com/greensock/TweenLite` | 2,799 B | Greensock tweening library |
 | `com/adobe/crypto/MD5` | 2,616 B | AS3 crypto |
 | `mx/core/BitmapAsset` | 2,515 B | Flex framework |
 | `com/adobe/serialization/json/JSONTokenizer` | 2,480 B | JSON parser |
-| `com/vsdevelop/controls/scrollbar/MWIOSScrollBar` | 2,195 B | scrollbar component |
-| `com/vsdevelop/controls/ComBoBox` | 1,557 B | combo box component |
+| `com/example/controls/scrollbar/MWIOSScrollBar` | 2,195 B | scrollbar component |
+| `com/example/controls/ComBoBox` | 1,557 B | combo box component |
 
 #### 3.3.0 The Full Breakdown of the 254 Classes (including **source availability** — the real data deciding feasibility)
 
@@ -474,9 +475,7 @@ library's resources (and vectors are precisely Flash's core capability).
 | Total edges | **5,052** (straight 3,059 / **quadratic Bézier 1,993**) |
 | Subpaths (`moveTo`) / style switches | 905 / 998 |
 | Fill styles 401 | solid 326, **bitmap 73**, linear gradient 2, radial/focal **0** |
-
 | Strokes (`LineStyle`) | 86; **80 shapes have strokes**; **43 shapes have multiple fills** |
-|---|---|
 | Referenced bitmaps | **39 distinct bitmaps** used as fills |
 | v4 `UsesFillWindingRule` | **no shape uses it** (i.e. no even-odd fill rule) |
 | Largest shape | 284×432 px |
@@ -585,7 +584,8 @@ biggest waste of source size (see §5.1); it should be changed to **embedding th
 
 | Resource format | Embedded content (**encoded bytes**) | Runtime decode |
 |---------|----------------------|-----------|
-| `DefineBitsJPEG2/3` (21/35) | **raw JPEG byte copy** (zero conversion) | existing `as_skia_image_decode_bytes_argb` |
+| `DefineBitsJPEG2` (21) | **raw JPEG byte copy** (zero conversion) | existing `as_skia_image_decode_bytes_argb` |
+| `DefineBitsJPEG3` (35) | raw JPEG byte copy **+ the decompressed alpha plane** (two arrays, §3.2③) | `as_swc_image_alpha` / `BitmapData_adoptEncodedAlpha` (decode with Skia first, then composite) |
 | `DefineBitsLossless2` (36) | **de-premultiply** at compile time (§3.2), then **re-encode as PNG** | same as above |
 | `DefineBitsLossless` (20) | same as above, but the source data has no alpha → write `A=0xFF` | same as above |
 
@@ -702,7 +702,7 @@ platform**:
 
 | Platform | Existing mechanism | Code location |
 |---|---|---|
-| desktop native | the executable runs with **CWD = app directory**, and `File.applicationDirectory` resolves to that directory → resources are just **ordinary files** (`assets/...` placed alongside), matching `adl`'s install-directory semantics | `air-app.ts` |
+| desktop native | `File.applicationDirectory` resolves to the **executable's own directory** (`as_app_dir()` derives it from the process image path: Windows `GetModuleFileNameA` / macOS `_NSGetExecutablePath` / Linux `/proc/self/exe`, degrading to `.` on WASI/Emscripten — the same convention as `extensions/`'s `as_ext_dir()`) → resources are just **ordinary files** (`assets/...` placed alongside the exe), matching `adl`'s install-directory semantics. It does **not** depend on the CWD, so the artifacts move as a unit (`-o bin-aot/App.exe` makes the app dir `bin-aot/`) | `emit.ts` (`as_app_dir`), `air-app.ts` |
 | web (wasm) | the browser sandbox FS is empty → under `--package web`, `findPreloadPaths()` hands the entries under the app directory (excluding `src/`, the `<filename>*` artifact prefix, dotfiles) to **`--preload-file <root>@<dest>`** to pack a FS image (+ `-s FORCE_FILESYSTEM=1`), so **the same `assets/...` path** is readable in the browser too | `build.ts` (`preloadPaths`), `air-app.ts::findPreloadPaths` |
 | macOS / iOS (`.app`) | `--package xcode-project` generates an application bundle, and resources go through **PBXResourcesBuildPhase** (currently `icon` is implemented; fonts via `font-urls`) | `xcode-project.ts`, `pbxproj.ts` |
 | **Fonts (a ready precedent)** | `<embedFonts><font><fontPath>` → manifest `font-urls` → **on web, fetched at runtime and injected into Skia's font manager** | `air-app.ts`, `html5-web.md §3` |
@@ -781,17 +781,17 @@ bitmaps having no class name** (referenced by `Sprite`/`DefineShape` as children
 
 ```
 desktopicon  logo  imgback  cambitmap
-com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wbottom,wleft,wmiddle,wtop,wright}SkinClass
-com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wright}SkinClass_200
+com.example.controls.scrollbar.ScrollSkin_{top,middle,bottom,wbottom,wleft,wmiddle,wtop,wright}SkinClass
+com.example.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wright}SkinClass_200
 ```
 
 > **The earlier version had two errors here**:
 > ① The examples **`small_gift`/`checkbom` do not belong to these 16** — measured, they are
 > **`DefineSprite` (tag 39)**, i.e. `small_gift` = symbol 19, `checkbom` = symbol 154, falling into the
 > "display tree must be parsed" tier (the next section).
-> ② **12 of the 16 are fully qualified names** (`com.vsdevelop.controls.scrollbar.*`). This is a hard
+> ② **12 of the 16 are fully qualified names** (`com.example.controls.scrollbar.*`). This is a hard
 > constraint on "approach one: directly `new resourceClass`" — real code would hardly write
-> `new com.vsdevelop....(...)`, and scrollbar skins are usually referenced inside a component class or fetched
+> `new com.example....(...)`, and scrollbar skins are usually referenced inside a component class or fetched
 > via `getDefinitionByName`. **So on a library like `skin.swc`, what is actually usable is approach two**, and
 > approach one is only convenient when the library has short-named resource classes (such as a top-level short
 > name like `logo`).
@@ -1315,7 +1315,7 @@ morph geometry, the rest precision-level differences ≤ 0.021px).
   InitialText (`hasText`), `HasFont`'s `FontID` → `FontName` + `FontHeight`, `HasTextColor`'s **RGBA**,
   `HasLayout`'s align/margins/indent/leading, and the Multiline/WordWrap/Password/ReadOnly/NoSelect/
   Border/HTML/MaxLength flags. Every line of text a skin ships now really draws — before this the
-  agreement paragraph, the footer line and the button captions in talkmed were **entirely absent**
+  agreement paragraph, the footer line and the button captions in acme-app were **entirely absent**
   (the fields were empty).
 - **The flags are a MSB-first 16-bit word** (a sequence of bit fields) and must **not** be read as a
   little-endian `UI16`: the two bytes of #92 in this library are `ad 36`, which MSB-first is `0xad36`
@@ -1399,7 +1399,7 @@ A `clipDepth` mask's outline is used directly as a clip path (`as_swc_clip_path_
 `skin.swc`, mask `#346` is `moveTo/lineTo×4` with **no `close`** — five verbs — and under `kWinding` such a
 path fills **nothing**, so the masked login-page ticker `banner` (and `con`/`titletext`/`confbtn2`) came out
 **entirely blank** (the user saw "the ticker only ever shows the first image / is blank"). Measured
-(`temp/tkmeet-mac/`, temporary glue probe `sk_path_dbg`): `SRC346 fillType=1 verbs=5 pts=5
+(`temp/acme-mac/`, temporary glue probe `sk_path_dbg`): `SRC346 fillType=1 verbs=5 pts=5
 bounds=0,0,36.25,18.5 empty=0` / `DST346 fillType=0 verbs=5 pts=5 bounds=0,0,354,402.5`. Control
 experiments: a hand-built closed rectangle rendered ✓, the baked path + `as_skia_path_close()` rendered ✓,
 a hand-built **closed triangle** rendered ✓ ⇒ **closed contours of any shape clip fine; an unclosed contour
@@ -1421,7 +1421,7 @@ travelled with the object. For the login ticker (`banner` sliding via
 `TweenLite.to(..., {x:-(index-1)*354})` under a fixed mask) that is exactly the user's "**only the first
 image shows**": only at `x==0` (local ≡ parent) does the mask coincide with the viewport and reveal slide 1;
 after that the mask slides out of the card with the film ⇒ **entirely blank**. Measured
-(`temp/tkmeet-mac/shots/`): before the fix `spc_early` (x≈0) had an image and `spc_late` (x≈-725.7, from the
+(`temp/acme-mac/shots/`): before the fix `spc_early` (x≈0) had an image and `spc_late` (x≈-725.7, from the
 `[diag] banner visit=150 x=-725.7` log) was **blank**; after the fix `fix_early` and `fix_late` each have
 content and show **two different slides** (`ImageChops` diff `changed_px=33476`).
 
@@ -1483,9 +1483,7 @@ of API output, and after explicitly normalizing the known differences (child `na
 | Observation | `adl` semantics |
 |---|---|
 | `totalFrames` | = the SWF's number of `ShowFrame`s (`desktopshareitem` 21, `devicesitemskin` 23, `元件16_124` 17, `checkbom`/`toastbtn` 2, `元件172_339` 3) |
-| Initial state of a fresh clip | `currentFrame == 1`, **`isPlaying == false`**, and it **does not self-advance across 12 frames** while on the display list (same offscreen and onscreen) ⇒ the skin symbol's `stop()` is in the DoABC; **since v0.4.127 frame scripts are decoded at compile time and
-actually executed** (§3.3 close-out), so this is no longer "we cannot read it, so we must stay on frame 1" — the
-file simply *says* `stop()`, and running it is what matches AIR |
+| Initial state of a fresh clip | `currentFrame == 1`, **`isPlaying == false`**, and it **does not self-advance across 12 frames** while on the display list (same offscreen and onscreen) ⇒ the skin symbol's `stop()` is in the DoABC; **since v0.4.127 frame scripts are decoded at compile time and actually executed** (§3.3 close-out), so this is no longer "we cannot read it, so we must stay on frame 1" — the file simply *says* `stop()`, and running it is what matches AIR |
 | Property name | it is **`isPlaying`** (there is no `playing`) |
 | `currentLabel` / `currentFrameLabel` | that frame's `FrameLabel` name, or `null` |
 | `currentLabels` | an **`Array` of `FrameLabel`** (`{name, frame}`), item-by-item identical to our parse (e.g. `_up@1 _over@8 _down@15`) |
@@ -1560,9 +1558,9 @@ at the same (parent, depth), keep the existing object** — its application-writ
   then `as_swc_tl_apply` up to the target frame, and finally drop what nobody claimed **by object pointer**
   (not by depth). Every baked child knows which character it came from (`_tl_char` moved from `MovieClip` to
   `DisplayObject`, stamped centrally by `as_swc_new`).
-- Symptom and field evidence: the TalkMED home cards have their titles written into the skin `TextField` by
+- Symptom and field evidence: the AcmeApp home cards have their titles written into the skin `TextField` by
   the app; the old path wiped them back to the skin design text ("快速入会" → "加入会议") after a single
-  hover. After the fix `temp/tkmeet-mac/s172labels.py` measures **0 pixel difference across the whole window
+  hover. After the fix `temp/acme-mac/s172labels.py` measures **0 pixel difference across the whole window
   (FPS overlay excluded)** and 0 in each label band, before vs after a hover.
 
 **Residual (D43b)**: in the **forward** direction a `Move` record **with a new character** keeps the original
@@ -1617,7 +1615,7 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 
 ### 9.2 F7 `DefineBitsJPEG3`'s alpha plane (stage one hundred fifty-nine, v0.4.130, diff doc D25)
 
-**Symptom**: on the TalkMED home page the two cards' illustrations ("Quick join" / "Create meeting") were
+**Symptom**: on the AcmeApp home page the two cards' illustrations ("Quick join" / "Create meeting") were
 **black rectangles**, while the same page under `adl` showed them transparent. `temp/alphaprobe/probe.mjs`
 scans out exactly two tag-35 bitmaps in the whole library (`#1113` 186×160, `#1118` 167×162) — those two
 pictures.
@@ -1652,7 +1650,7 @@ was painted as a black rectangle. This is not a PNG-encoding problem: an entire 
 
 **Acceptance**:
 
-- **Visual**: `temp/tkmeet-mac/d25-boot.png` / `d25-home.png` — the black rectangles are gone and the
+- **Visual**: `temp/acme-mac/d25-boot.png` / `d25-home.png` — the black rectangles are gone and the
   illustrations are transparent (same shape as `adl`).
 - **Unit**: `unit: render/SwcJpeg3Alpha`, **14 pins** (a self-made minimal SWC: a SOF0 "JPEG" plus a
   self-made alpha plane, in a hand-written STORE-method ZIP container) pinning plane inflation/values,
@@ -1664,7 +1662,7 @@ was painted as a black rectangle. This is not a PNG-encoding problem: an entire 
 
 ### 9.2 F8 MovieClip's three button states (`buttonMode` + `_up`/`_over`/`_down`) (stage one hundred seventy-one, v0.4.142, diff doc D42/R29)
 
-**Symptom**: TalkMED's two home cards ("quick join" / "create meeting"), the login button, the nine-grid
+**Symptom**: AcmeApp's two home cards ("quick join" / "create meeting"), the login button, the nine-grid
 icon buttons and the dialog buttons all give obvious visual feedback on hover/press under `adl` (the home
 card changes 15524 px on roll-over and 105227 px on press), while our window changed only 423 / 440 px —
 and that little change was the debug overlay animating. In other words **every button feedback in the app
@@ -1674,7 +1672,7 @@ was dead**.
 `buttonMode == true` and the timeline has the `_up` / `_over` / `_down` `FrameLabel`s, roll-over / press /
 roll-out move the **playhead for real** (`currentFrame` and `currentLabel` both change, and that frame's
 frame script runs too). We had implemented `FrameLabel` and `gotoAndStop` (§9.2 F6) but not this state
-machine. The TalkMED skin contains **29** such symbols.
+machine. The AcmeApp skin contains **29** such symbols.
 
 **Measured AIR behavior (`temp/btnprobe/`: `Probe.as` is the adl-side probe plus `p4`~`p7` captures;
 `Aot.as` / `Card.as` drive the same timeline script on our side)**
@@ -1727,7 +1725,7 @@ recipe did not" still invalidates the cache.
   generation, both settle sites, the frame in the fingerprint, the refresh points, the example registration).
 - **Mutation check**: deleting the settle call inside `as_render_fp` turns the example **red in 11 places**
   (including all three home-card levels).
-- **On-device**: `temp/tkmeet-mac/sweep.py` — the home card's roll-over changes 41591 px, matching `adl`'s
+- **On-device**: `temp/acme-mac/sweep.py` — the home card's roll-over changes 41591 px, matching `adl`'s
   shape; the tabs/gear/user-info spots change nothing, also matching `adl`.
 - **Regression**: full `node test.ts` green.
 
@@ -1758,7 +1756,7 @@ pointer**); `as_swc_tl_link` does nothing when the child already sits under the 
 
 **Acceptance**: `examples/swc-mc-button.as` level ⑪ (reuse + text survival + `inkDiff == 0` against the
 pre-hover `_up` + child count unchanged + the changed-character depth really gets a new object);
-`unit: render/SwcTimeline` **+7 pins**; on-device `temp/tkmeet-mac/s172labels.py` measures **0 pixel
+`unit: render/SwcTimeline` **+7 pins**; on-device `temp/acme-mac/s172labels.py` measures **0 pixel
 difference across the whole window (FPS overlay excluded)** before vs after a hover.
 
 **Three unfixed gaps registered in the same round**: ① the pointer leaving the window does not roll out (the
@@ -1767,6 +1765,138 @@ window backend never reports "left the window", so a hover latches); ② `ROLL_O
 the same object in `adl` but builds a new instance here (one baked class per character).
 
 ---
+
+### 9.2 F10 Binding an SWC symbol class to a **project-side base class** (stage 191, v0.4.172)
+
+**Symptom**: the two drop-downs in the AI-interpretation settings window showed nothing but a
+border and a "▽" — no selected label, no reaction to a click.
+
+**Root cause**: the symbol class's superclass was thrown away. Of the 214 `SymbolClass` entries
+in `skin.swc`, four (`ComBox`, `AsrComBox`, `ComBoxSmall`, `AIAsrComBox`) declare
+`extends com.example.controls.ComBoBox` in their own `DoABC` — and the project compiles that
+very class from source (`src/com/example/controls/ComBoBox.as`, whose own base
+`com.example.proxy.ViewControl` is project source too). Those four `DoABC` bodies contain **no
+frame scripts and no methods at all**: every bit of their behaviour is the project base class.
+`parseAbc` used to read the instance name and then *drop* the `super_index` multiname
+(`r.u30(); // base class`), so the synthesized class was always a `MovieClip`/`SimpleButton`
+subclass: the artwork was baked (`as_swc_bind`), the widget code never ran.
+
+**Fix** (three places, in data-flow order):
+
+1. `abc.ts`: new `AbcInstance.superName` / `AbcSymbolClass.baseName`; `decodeSymbolClass` reports
+   the base through an `onBase` callback (**even when the frame scripts fail to decode**), and
+   `decodeSymbolScripts` returns `bases: Map<charId, baseName>`, carried on `SwcLibrary.bases`.
+2. `swc.ts`: the synthesized declaration's `superClass` becomes that base whenever it is not a
+   `flash.display.*` class (short name as the superclass, fully-qualified in the import list —
+   the shape a hand-written `extends` clause has). `SwcCharacterClass.baseName` reports it too.
+   The ctor body stays empty: the semantic layer fills the base ctor's default arguments in
+   (measured: `super()` over `ComBoBox(maxheight = -1)` emits `…_ctor(o, (-1))`).
+3. `index.ts` + `reach.ts`: `computeReachable` grows `extraRoots`, and `--air-app` seeds the
+   closure with every library's `bases` (minus `flash.*`) — **without that the project's
+   `ComBoBox.as` is never compiled**, because the AS3 sources only ever name the SWC-side
+   symbols and the reachability graph cannot see this edge. Library parsing is cached
+   (`swcLib()`), so the closure and the emitter share one parse; a command-line `--swc` counts
+   too (it is merged into `cfg.swcPaths` after the closure is computed).
+
+**Measured** (the app's own build, the `bin-aot/build-aot.bat` recipe): reachable sources
+619 → **620** (the extra one is `ComBoBox.as`), and the generated C now reads
+
+```c
+static void AIAsrComBox_ctor(AIAsrComBox* o) {
+  AIAsrComBox* this = o;
+  com_example_controls_ComBoBox_ctor((com_example_controls_ComBoBox*)o, (-1));
+  as_swc_bind((DisplayObject*)o, 230);
+}
+```
+
+(it was `MovieClip_ctor((MovieClip*)o);`), identically for all four symbols, while the other 192
+`MovieClip` and 2 `SimpleButton` symbols are byte-identical to before.
+
+**Still blocked**: the library's *own* general class code (the library's `ViewControl`,
+`ScrollIndicator`, `MHIOSScrollBar`, …) still does not execute — only symbol classes are emitted
+and only symbol-class frame scripts run; general SWC ABC is out of scope (§3.3). A symbol bound
+to a library class the project does NOT provide fails loudly with `unknown superclass`, never
+silently degrading.
+
+**Regression**: new `unit: swc/BaseClassBinding` (14 pins at the time, including a behavioural one over an in-memory
+library; extended to 34 in §9.2 F11) plus 2 new `unit: reach/wiring` pins; both mutations were detected by
+`temp/swcgap/mutate-base.cjs` and `src/swc.ts` restored byte-identically (sha256 checked).
+
+**Interaction re-check (added in stage 192)**: the drop-down's *interaction* IS now measured on the
+real AOT build — clicking `识别语言` lists every language (中英混合/中文/英文/日文/粤语) and picking
+one makes the row show it and closes the list. The whole chain (`comboxboxstart` → `ComBoxlist`
+itemSkin → `MHIOSScrollBar` → `myclickComplete`) runs the project-side base class. See §9.2 F11.
+
+### 9.2 F11 An SWC symbol class must **copy** its ABC `dynamic` flag, never inherit it (stage 192, v0.4.173)
+
+**Symptom**: after F10, clicking 创建同传 in the AI-subtitle window raises
+`Error #1069: Property title not found on AIAsrComBox and there is no default value` and the view
+stops half-built (which looks like a freeze from the user's side).
+
+**Root cause**: F10 swapped the symbol class's base from `flash.display.MovieClip` to the
+project-side `com.example.controls.ComBoBox` (which is `extends ViewControl extends Sprite` —
+**sealed**), while the synthesized class's `dynamic` flag was previously **inherited from its base**
+(`symbols.ts`: `if (!info.isDynamic && sup?.isDynamic) info.isDynamic = true;`). `MovieClip` is
+dynamic ⇒ every symbol class used to own a `_dyn` property table *by accident*, which is where
+`as_swc_child_name` puts the baked named children (`endmc`/`btndown`/`title`). With a sealed base
+that table is gone, `as_swc_child_name` returns immediately, and the base class's `this["title"]`
+falls into the sealed branch of `as_dyn_get` → `#1069`.
+
+**Why `title` and not the earlier `endmc`**: `ComBoBox.addTostage` really does read
+`endmc` → `btndown` → `title` in that order, but `addTostage` hangs off `ADDED_TO_STAGE`, and
+`CreateAiSubTitleView.as` does
+
+```as3
+targetList = new AIAsrComBox();
+targetList.dataProvider = LanguageName;
+targetList.selectData = targetList.dataProvider[0];   // ← runs first: the setter does this["title"].text = …
+skin.addChild(targetList);                            // ← ADDED_TO_STAGE comes after
+```
+
+so that `this["title"]` inside the `selectData` setter is the **first dynamic lookup actually
+executed**, and it is the one reported.
+
+**The real AVM2 rule** (measured, not inferred): in `InstanceInfo.flags`, bit 0 is sealed and bit 2
+is interface; **a class with neither bit is dynamic**. Bit 3 (`0x08`) is the `protectedNs` index,
+not the sealed bit. Measured over `skin.swc`'s 254 classes: **all 198 symbol classes that carry
+`DoABC` are `0x08` (dynamic)**, while the library's own `com.example.controls.ComBoBox` is `0x09`
+(sealed + `protectedNs`). So `dynamic` is the symbol class's *own* trait and must be copied —
+inferring it from the base silently seals every symbol whose base is sealed (`SimpleButton`).
+
+**Fix** (`src/abc.ts` + `src/swc.ts`): `AbcInstance` gains `flags`; `AbcSymbolBase` /
+`SwcCharacterClass` go from `{baseName}` to `{baseName, dynamic}`, and `decodeSymbolClass` reports
+`(inst.flags & 0x05) === 0`; the synthesized class's `isDynamic` uses that value directly instead of
+leaving it `undefined` for the inheritance logic to fill in.
+
+**Measured** (the app's own build, the `bin-aot/build-aot.bat` recipe):
+
+```c
+static void AIAsrComBox_ctor(AIAsrComBox* o) {
+  o->_dyn = as_object_new();
+  gc_write_barrier((void*)o->_dyn);
+  AIAsrComBox* this = o;
+  com_example_controls_ComBoBox_ctor((com_example_controls_ComBoBox*)o, (-1));
+  as_swc_bind((DisplayObject*)o, 230);
+}
+```
+
+The vtable goes from `… NULL, -1, "AIAsrComBox", 0, 0, 0, …` to
+`… (int)offsetof(AIAsrComBox, _dyn), "AIAsrComBox", 0, 1, 0, …` (`dyn_offset` no longer −1,
+`isDynamic=1`); all 4 ComBox-family symbol classes are like this.
+
+**Verified on the real build** (`temp/task4/`): clicking 创建同传 raises nothing (zero `Uncaught`
+on stderr), the view renders, both drop-downs show their selected value (中英混合 / 中文), the open
+list shows every language, and picking 英文 updates the row and closes the list.
+
+**Regression**: `unit: swc/BaseClassBinding` grew from 14 to **34 pins** — the ABC flags read and
+the `(flags & 0x05) === 0` derivation, `isDynamic: dynamic`, the `_dyn` struct slot + vtable
+`dyn_offset` + the `as_swc_child_name` seal guard, plus three **source → C** behavioural pins (the
+synthesized ctor initialises `_dyn`, runs the project base ctor, then `as_swc_bind`; `probeBtn`
+whose base is `SimpleButton` still gets `offsetof(…, _dyn)`, which only holds when the ABC flag is
+copied; and "a symbol that declares itself sealed but extends the dynamic `MovieClip` still owns a
+table", the very inheritance that hid this bug). All 6 two-state mutations are detected
+(`temp/task4/mutate.cjs`) and `src/swc.ts`/`abc.ts`/`emit.ts`/`runtime.ts` were restored
+byte-identically (sha256 checked each).
 
 ## 10. Explicit deferrals / limitations
 
@@ -1840,7 +1970,7 @@ Pitfalls (all hit during this work):
 | Bitmap tags | 59 = `DefineBitsLossless2`×53 + `DefineBitsLossless`×1 + `DefineBitsJPEG2`×3 + `DefineBitsJPEG3`×2 |
 | `SymbolClass` | 1 tag, 214 mappings; of the 59 mapped to bitmaps, **16 have class names / 43 do not** |
 | `catalog.xml` | 255 `<script>` entries (= the class count; `library.swf`'s `DoABC` is also 255) |
-| The 16 named resources | `desktopicon`(342×194) `logo`(100×72) `imgback`(200×200) `cambitmap`(700×393, tag20) + 12 `com.vsdevelop.controls.scrollbar.*SkinClass[_200]` |
+| The 16 named resources | `desktopicon`(342×194) `logo`(100×72) `imgback`(200×200) `cambitmap`(700×393, tag20) + 12 `com.example.controls.scrollbar.*SkinClass[_200]` |
 | Pixel byte order | `A,R,G,B` (7200/7200 first byte == AIR alpha) |
 | Premultiplied | yes (340,644 samples: `R\|G\|B > A` is 0; `A=0` with non-zero RGB is 0) |
 | AIR de-premultiply | `floor(stored*255/A + t)`, `t ∈ [0.329, 0.413)`; `floor(x+1/3)` = 219/219 exact |

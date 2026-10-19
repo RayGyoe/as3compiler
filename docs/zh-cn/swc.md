@@ -620,7 +620,7 @@ static const int __res_skin_logo_h = 72;
 
 | 平台 | 现有机制 | 代码位置 |
 |---|---|---|
-| 桌面 native | 可执行文件以 **CWD = app 目录**运行，`File.applicationDirectory` 解析到该目录 → 资源就是**普通文件**（`assets/...` 放在旁边），与 `adl` 的安装目录语义一致 | `air-app.ts` |
+| 桌面 native | `File.applicationDirectory` 解析到**可执行文件所在目录**（`as_app_dir()` 从自身路径推导：Windows `GetModuleFileNameA` / macOS `_NSGetExecutablePath` / Linux `/proc/self/exe`，WASI·Emscripten 退化为 `.`；与 `extensions/` 的 `as_ext_dir()` 同口径）→ 资源就是**普通文件**（`assets/...` 放在 exe 旁边），与 `adl` 的安装目录语义一致。**不依赖 CWD**，故产物可整体搬走（`-o bin-aot/App.exe` 时 app dir 就是 `bin-aot/`） | `emit.ts`（`as_app_dir`）、`air-app.ts` |
 | web（wasm） | 浏览器沙箱 FS 是空的 → `--package web` 时 `findPreloadPaths()` 把 app 目录下（排除 `src/`、`<filename>*` 产物前缀、dotfile）的条目交给 **`--preload-file <root>@<dest>`** 打成 packed FS（+ `-s FORCE_FILESYSTEM=1`），于是**同一份 `assets/...` 路径**在浏览器里也能读 | `build.ts`（`preloadPaths`）、`air-app.ts::findPreloadPaths` |
 | macOS / iOS（`.app`） | `--package xcode-project` 生成 application bundle，资源走 **PBXResourcesBuildPhase**（目前实现了 `icon`；字体经 `font-urls`） | `xcode-project.ts`、`pbxproj.ts` |
 | **字体（现成先例）** | `<embedFonts><font><fontPath>` → 清单 `font-urls` → **web 上运行时 fetch 后注入 Skia 字体管理器** | `air-app.ts`、`html5-web.md §3` |
@@ -1521,6 +1521,128 @@ App 写在皮肤 `TextField` 实例上的文字随旧对象一起丢掉。AIR �
 `adl` 里是同一对象换图，我方换实例（烘焙类一个角色一个类）。
 
 ---
+
+### 9.2 F10 SWC 符号类绑定到**工程侧基类**（阶段一百九十一，v0.4.172）
+
+**症状**：AI 同传「设置」窗口里的两个下拉框只有边框与「▽」——没有选中文字、点击无反应。
+
+**根因**：符号类的基类被丢弃。`skin.swc` 的 214 个 `SymbolClass` 里有 4 个（`ComBox`、
+`AsrComBox`、`ComBoxSmall`、`AIAsrComBox`）在自己的 `DoABC` 里声明
+`extends com.vsdevelop.controls.ComBoBox`，而 `ComBoBox`（及其基类
+`com.vsdevelop.proxy.ViewControl`）**工程源码里就有**（`src/com/vsdevelop/controls/ComBoBox.as`）。
+这 4 个符号类的 `DoABC` 里**没有任何帧脚本或方法**——它们的全部行为来自工程侧基类。
+此前 `parseAbc` 只读实例名、把 `super_index` 那个 multiname **读掉就丢**
+（`r.u30(); // base class`），于是合成类恒为 `MovieClip`/`SimpleButton` 子类：画面被烘了出来
+（`as_swc_bind`），下拉框的代码却从不执行。
+
+**修复**（三处，按数据流顺序）：
+
+1. `abc.ts`：新增 `AbcInstance.superName` / `AbcSymbolClass.baseName`；`decodeSymbolClass`
+   通过 `onBase` 回调把基类名交给调用者（**帧脚本解析失败也照报**），`decodeSymbolScripts`
+   返回 `bases: Map<charId, 基类名>`，`SwcLibrary.bases` 带上它。
+2. `swc.ts`：符号类声明的 `superClass` 改为「基类不是 `flash.display.*` 就用它」（短名进
+   `superClass`、全限定名进 import 表，与手写 `extends` 同形）；`SwcCharacterClass.baseName`
+   同步上报。构造成员仍留空体——语义层会补齐基类构造器的默认参数
+   （实测 `super()` 对 `ComBoBox(maxheight = -1)` 生成 `…_ctor(o, (-1))`）。
+3. `index.ts` + `reach.ts`：`computeReachable` 新增 `extraRoots`，`--air-app` 把每个 SWC 的
+   `bases`（跳过 `flash.*`）作为闭包种子——**否则工程侧 `ComBoBox.as` 根本不被编译**
+   （源码只按 SWC 侧类名引用，可达性看不到这条边）。SWC 解析同时缓存为 `swcLib()`，
+   闭包与发射阶段共用一次解析；命令行 `--swc` 也必须计入种子（它比 reach 更晚合并进
+   `cfg.swcPaths`）。
+
+**实测**（应用自身构建，`bin-aot/build-aot.bat` 配方）：可达源 619 → **620**（多出的正是
+`ComBoBox.as`）；生成的 C 中
+
+```c
+static void AIAsrComBox_ctor(AIAsrComBox* o) {
+  AIAsrComBox* this = o;
+  com_vsdevelop_controls_ComBoBox_ctor((com_vsdevelop_controls_ComBoBox*)o, (-1));
+  as_swc_bind((DisplayObject*)o, 230);
+}
+```
+
+（修复前为 `MovieClip_ctor((MovieClip*)o);`），4 个符号类全部如此；其余 192 个 `MovieClip`
+符号与 2 个 `SimpleButton` 符号**逐字未变**。
+
+**仍然堵着的**：库**自有**的一般类代码（`ScrollIndicator`/`MHIOSScrollBar`、库版 `ViewControl`
+等）依旧不执行——我们只发射符号类、只执行符号类的帧脚本，SWC 的通用 ABC 不在范围内（§3.3）。
+符号类若绑定到**工程里没有**的库类，语义层以 `unknown superclass` 报错，不静默降级。
+
+**回归**：新增 `unit: swc/BaseClassBinding`（当时 14 钉，含内存库的行为钉；后于 §9.2 F11 扩到 34 钉），`unit: reach/wiring`
+新增 2 钉；两态变异实测（`temp/swcgap/mutate-base.cjs`）两条全部命中，`src/swc.ts` 还原后
+sha256 一致。
+
+**交互复核（阶段一百九十二补测）**：下拉框的**交互**已在本机取证（真机 AOT 构建）——
+点开「识别语言」列出全部语言（中英混合/中文/英文/日文/粤语），点「英文」后该行变为「英文」、
+列表收起。即 `comboxboxstart` → `ComBoxlist` itemSkin → `MHIOSScrollBar` → `myclickComplete`
+整条链路跑的都是工程侧基类代码。见 §9.2 F11。
+
+### 9.2 F11 SWC 符号类的 `dynamic` 必须**照抄 ABC**，不能从基类继承（阶段一百九十二，v0.4.173）
+
+**症状**：F10 落地后，AI 同传窗口点「创建同传」抛
+`Error #1069: Property title not found on AIAsrComBox and there is no default value`，
+窗口建到一半就停住（从用户视角看像卡死）。
+
+**根因**：F10 把符号类的基类从 `flash.display.MovieClip` 换成工程侧的
+`com.vsdevelop.controls.ComBoBox`（`extends ViewControl extends Sprite`，**sealed**），
+而合成类的 `dynamic` 标志此前是**从基类继承**的（`symbols.ts`：
+`if (!info.isDynamic && sup?.isDynamic) info.isDynamic = true;`）。`MovieClip` 是 dynamic
+⇒ 修复前每个符号类都**顺带**拥有一张 `_dyn` 动态属性表，`as_swc_child_name` 才能把烘焙出的
+具名子件（`endmc`/`btndown`/`title`）写进去；基类换成 sealed 之后这张表没了，
+`as_swc_child_name` 一进门就 `return`，基类里的 `this["title"]` 于是落到 `as_dyn_get` 的
+sealed 分支 → `#1069`。
+
+**为什么报的是 `title`，而不是更早访问的 `endmc`**：`ComBoBox.addTostage` 的顺序确实是
+`endmc` → `btndown` → `title`，但 `addTostage` 挂在 `ADDED_TO_STAGE` 上，而
+`CreateAiSubTitleView.as` 是
+
+```as3
+targetList = new AIAsrComBox();
+targetList.dataProvider = LanguageName;
+targetList.selectData = targetList.dataProvider[0];   // ← 先跑：setter 里 this["title"].text = …
+skin.addChild(targetList);                            // ← ADDED_TO_STAGE 在后面
+```
+
+`selectData` 的 setter 里那次 `this["title"]` 是**第一个真正执行**的动态查找，所以报的是 `title`。
+
+**AVM2 的真规则**（不是推断）：`InstanceInfo.flags` 的 bit 0 = sealed、bit 2 = interface，
+**两者都没有就是 dynamic**；bit 3（`0x08`）是 `protectedNs`，不是 sealed。实测 `skin.swc`
+的 254 个类：**198 个带 `DoABC` 的符号类全是 `0x08`（dynamic）**，而库自有的
+`com.vsdevelop.controls.ComBoBox` 是 `0x09`（sealed + protectedNs）。所以 `dynamic` 是符号类
+**自己的** trait，必须照抄：从基类推断会把 `SimpleButton`（sealed）基类的按钮符号悄悄弄成 sealed。
+
+**修复**（`src/abc.ts` + `src/swc.ts`）：`AbcInstance` 增加 `flags`；`AbcSymbolBase` /
+`SwcCharacterClass` 由 `{基类名}` 扩成 `{baseName, dynamic}`，`decodeSymbolClass` 按
+`(inst.flags & 0x05) === 0` 上报；合成类的 `isDynamic` 直接用这个值，不再交给继承逻辑兜。
+
+**实测**（应用自身构建，`bin-aot/build-aot.bat` 配方）：
+
+```c
+static void AIAsrComBox_ctor(AIAsrComBox* o) {
+  o->_dyn = as_object_new();
+  gc_write_barrier((void*)o->_dyn);
+  AIAsrComBox* this = o;
+  com_vsdevelop_controls_ComBoBox_ctor((com_vsdevelop_controls_ComBoBox*)o, (-1));
+  as_swc_bind((DisplayObject*)o, 230);
+}
+```
+
+vtable 由 `… NULL, -1, "AIAsrComBox", 0, 0, 0, …` 变为
+`… (int)offsetof(AIAsrComBox, _dyn), "AIAsrComBox", 0, 1, 0, …`（`dyn_offset` 不再为 −1、
+`isDynamic=1`）；4 个 ComBox 族符号类（`ComBox`/`AsrComBox`/`ComBoxSmall`/`AIAsrComBox`）全部如此。
+
+**真机复核**（真机 AOT 构建，`temp/task4/`）：点「创建同传」不再抛异常（stderr 零 `Uncaught`）；
+创建窗口正常渲染；两个下拉框显示已选值（「中英混合」/「中文」）；点开下拉框列出全部语言；
+选中「英文」后识别语言变为「英文」、列表收起。
+
+**回归**：`unit: swc/BaseClassBinding` 由 14 钉扩到 **34 钉**，新增内容是 ABC 的 flags 读取与
+`(flags & 0x05) === 0` 推导、`isDynamic: dynamic`、`_dyn` 结构体槽 + vtable `dyn_offset` +
+`as_swc_child_name` 的 sealed 守卫，以及三条**源码 → C** 行为钉（合成类 ctor 里有
+`_dyn = as_object_new()`、跑工程基类 ctor、再 `as_swc_bind`；`probeBtn` 以 `SimpleButton`
+为基类而 vtable 仍带 `offsetof(…, _dyn)` —— 这条**只有**照抄 ABC 才成立；以及
+「声明 sealed 但继承 dynamic `MovieClip` 的符号仍带表」这条，正是当初掩盖该 bug 的继承行为）。
+6 条两态变异全部命中（`temp/task4/mutate.cjs`），`src/swc.ts`/`abc.ts`/`emit.ts`/`runtime.ts`
+还原后 sha256 逐一一致。
 
 ## 10. 明确延后 / 限制
 

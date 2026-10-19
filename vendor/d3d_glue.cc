@@ -121,9 +121,39 @@ static double d3d_now_ms(void) {
 // all of those tables, and the generated C mints ids from the same generator.
 #define SK_D3D_MAX_WINDOWS 16
 
-// Frames in flight. Two is what the Skia reference uses and what flip-model
-// swapchains are designed around; more only buys latency, fewer stalls the GPU.
-#define SK_D3D_NUM_FRAMES 2
+// Frames in flight == swapchain buffer count (one buffer per frame in flight).
+//
+// THREE, not the two the Skia reference uses. The reason is not throughput but a
+// measured drag defect on Windows: with two buffers, DXGI's presentation queue can
+// hold BOTH of them while the compositor is busy with the window -- and it is busy
+// at roughly half rate exactly while the user is moving the window. The acquire wait
+// in sk_gpu_begin_frame then blocks for two vblanks per frame (~31 ms measured), and
+// since our frames can run *inside* the OS's modal move loop dispatch
+// (live_resize_watch -> sk_pump_frame), that wait is time the move loop never gets:
+// the window advanced in rock-steady 66.6 ms steps while being dragged (four
+// vblanks), where a plain Win32 window, a CPU-rendered SDL window and adl all move in
+// ~3 ms steps. A spare buffer means DXGI never has to stall the acquire (measured:
+// the wait drops from 31 ms to 0.0 ms and the drag from 66.6 ms to 3.1 ms steps,
+// matching adl, with the app still animating through the drag). The cost is one
+// extra back buffer (~1.7 MB for a 480x870 window) and about one frame of latency.
+#define SK_D3D_NUM_FRAMES 3
+
+// How long the resize path may wait for the GPU to release the old back buffers
+// before it gives up and skips the frame.
+//
+// ResizeBuffers requires every back-buffer reference to be gone, so that wait is
+// unavoidable -- but it must not be unbounded. DXGI retires a flip-model present
+// only when the compositor takes it, and the compositor is exactly what is busy
+// while the user drags a window edge, so an unbounded wait here can block the one
+// thread that would otherwise let it through: measured, dragging the bottom-right
+// corner wedged the app outright (the window stopped following and stopped
+// redrawing, IsHungAppWindow went true, 0% CPU, only a kill ended it). 250 ms is
+// far longer than any real drain (a live resize frame is 16 ms, and the whole
+// teardown measured at ~0-2 ms when it works) and far shorter than the point where
+// a user calls the app hung. Skipping a frame instead leaves the swapchain intact
+// and retries on the next one, which is exactly what a NULL return from
+// sk_gpu_begin_frame already means.
+#define SK_D3D_DRAIN_MS 250
 
 // Swapchain back-buffer format. R8G8B8A8_UNORM + kRGBA_8888_SkColorType is the
 // pair Skia's own Windows window context uses (D3D12WindowContext_win.cpp), and
@@ -458,12 +488,34 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
       g_context->flush();
       g_context->submit(GrSyncCpu::kYes);
     }
+    int drained = 1;
     for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) {
       if (w->fence.get() != nullptr && w->fence_event != NULL &&
           w->fence->GetCompletedValue() < w->fence_values[i]) {
         D3D_OK_OR_WARN(w->fence->SetEventOnCompletion(w->fence_values[i], w->fence_event));
-        WaitForSingleObjectEx(w->fence_event, INFINITE, FALSE);
+        if (WaitForSingleObjectEx(w->fence_event, SK_D3D_DRAIN_MS, FALSE) != WAIT_OBJECT_0) {
+          drained = 0;
+          break;
+        }
       }
+    }
+    if (!drained) {
+      // The GPU is still reading an old back buffer and the compositor has not let
+      // go of it (see SK_D3D_DRAIN_MS). Nothing has been released yet, so the only
+      // safe move is to abandon this frame: the swapchain and every surface stay
+      // exactly as they were and the next frame retries the resize. Reported once,
+      // not once per frame -- a stall lasts as long as the drag does.
+      static int told = 0;
+      if (!told) {
+        told = 1;
+        fprintf(stderr, "d3d_glue: resize to %dx%d timed out after %d ms waiting for the "
+                        "GPU to release the old back buffers; skipping frames until it "
+                        "does\n", width, height, SK_D3D_DRAIN_MS);
+        fflush(stderr);
+      }
+      return nullptr;
+    }
+    for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) {
       w->surfaces[i].reset();
       w->buffers[i].reset();
     }
@@ -472,7 +524,21 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
     w->width = width;
     w->height = height;
     if (!d3d_setup_surfaces(w)) return nullptr;
-    w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
+    // Deliberately NOT
+    //   w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
+    // here. The next begin_frame re-reads the index anyway, and reading it early is
+    // what corrupted the fence ledger: begin_frame takes the value to count up from
+    // out of the slot named by w->buffer_index, so pointing that at a rebuilt
+    // swapchain's current index -- which is whichever buffer the resize happened to
+    // land on, not the one just presented -- can name an OLDER slot, and the value
+    // assigned to the new buffer is then one the fence has already passed. Signal()
+    // on a passed value is a no-op (a fence never moves backwards), so that buffer
+    // loses the "the GPU is finished with me" marker the acquire wait below relies
+    // on, and the next resize (whose drain waits for every slot) blocks on a value
+    // that no longer means anything. Measured before this line was removed: the
+    // window wedged solid after three corner-resize steps. Leaving the index alone
+    // keeps every assigned value strictly greater than every value signalled before
+    // it, which is what makes each wait reachable.
   }
 
   // Frame pacing: if the back buffer we are about to draw into is still being read
@@ -752,7 +818,21 @@ void sk_gpu_draw_texture(void* canvas, void* d3dTexture, int w, int h,
   // Linear filtering, not Skia's nearest default: the destination is the render
   // target's LOGICAL size while the source is its DEVICE size under HiDPI, so this
   // is a real scale-down and nearest would alias the game's sprites.
-  c->drawImageRect(img, dst, SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNone));
+  //
+  // kSrc, NOT Skia's default kSrcOver: AIR presents the Stage3D back buffer with
+  // its alpha channel IGNORED -- the alpha is not a compositing input, because
+  // nothing in an AIR scene is ever layered BEHIND Stage3D (the 2D display list is
+  // always drawn on top). Measured against the adl oracle (51.4.1, D3D11): a
+  // context cleared to (1, 0, 0, 0.25) and one cleared to (1, 0, 0, 1.0), both over
+  // an opaque GREEN stage colour, produce the SAME window pixel (255, 0, 0) -- the
+  // green never shows through a translucent back buffer.
+  // Under kSrcOver the alpha written by the LAST blend mode does show through:
+  // Starling's ERASE (ZERO / ONE_MINUS_SOURCE_ALPHA) zeroes RGB *and* alpha, so the
+  // erased pixels let the stage colour through and Starling's Blend Modes demo
+  // renders a WHITE rocket silhouette where AIR renders a black one.
+  SkPaint paint;
+  paint.setBlendMode(SkBlendMode::kSrc);
+  c->drawImageRect(img, dst, SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNone), &paint);
 }
 
 }  // extern "C"

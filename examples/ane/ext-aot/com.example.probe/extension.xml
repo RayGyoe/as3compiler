@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The extension descriptor of the example's fixture extension.
+
+  It sits in a STAGING TREE, not inside a packed `.ane`:
+  `ext-aot/com.example.probe/{extension.xml, Windows-x86-64/ProbeANE.dll}`. The
+  directory name is the <id> below -- that is what makes one directory per
+  extension self-describing, and it is the same layout the runtime stages such an
+  extension into (`<appDir>/extensions/com.example.probe/Windows-x86-64/`).
+  docs/zh-cn/ane.md §4.6 explains why the recompiled artifact is left unpacked:
+  a `.ane` is a ZIP whose mandatory `library.swf` holds the DoABC the AVM2 would
+  read, and an AOT build has none -- so the archive would carry dead weight, and
+  nothing in this pipeline consumes it. `adl` still reads the ORIGINAL packed
+  `.ane` from `lib/`; only this build reads the tree.
+
+  `<platform name="...">` is the closed AIR platform-key vocabulary
+  (docs/zh-cn/ane.md §3.3), and only the entry for the platform being built is
+  usable. The name here is Windows-x86-64 because the fixture's native library is
+  a Windows x64 DLL; a macOS build of this descriptor would have to add a
+  MacOS-x86-64 entry with a .dylib. (This comment quoting the very tags the build
+  parses is deliberate: `stripXmlComments` exists because that naive-to-allow
+  pattern once made a descriptor's own real <platform> entry disappear.)
+-->
+<extension xmlns="http://ns.adobe.com/air/extension/51.0">
+  <id>com.example.probe</id>
+  <versionNumber>1.0</versionNumber>
+  <platforms>
+    <platform name="Windows-x86-64">
+      <applicationDeployment>
+        <!-- The sibling file, recompiled against asaot.lib -- NOT the AIR SDK's
+             import library, which is why this copy imports asaot.dll and the
+             original in lib/ imports Adobe AIR.dll. -->
+        <nativeLibrary>ProbeANE.dll</nativeLibrary>
+        <initializer>ProbeExtInitializer</initializer>
+        <finalizer>ProbeExtFinalizer</finalizer>
+      </applicationDeployment>
+    </platform>
+  </platforms>
+</extension>

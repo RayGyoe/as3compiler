@@ -11,7 +11,7 @@
   ],
   "include-paths": [
     "../../vendor/skia",
-    "../../vendor/sdl2/arm64/include",
+    "../../vendor/sdl2/include/macos-arm64",
     "../../vendor/curl/include"
   ],
   "link-libs": [
@@ -45,7 +45,7 @@
   ],
   "link-paths": [
     "../../vendor/skia/lib/macos-arm64",
-    "../../vendor/sdl2/arm64/lib",
+    "../../vendor/sdl2/lib/macos-arm64",
     "../../vendor/curl/lib/macos-arm64"
   ],
   "frameworks": [

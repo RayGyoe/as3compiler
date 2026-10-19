@@ -4,6 +4,21 @@
   产物直接落到 as3compiler/vendor/<pkg>/ 里 —— **x64 与 x86（win32）两套**，
   由 AIR 描述符的 <application><architecture>（"32" / "64"，**缺省 32**）决定用哪一套。
 
+  第三套 **windows-arm64** 是**选择加入**的（-Arch arm64），且**不是给 AIR 用的**：AIR 没有
+  Windows ARM64 运行时（实测 AIR SDK 51.4.1 的每个 Windows 运行时各只认一个平台键：win/ 那份是
+  Windows-x86、win64 那份是 Windows-x86-64，合起来就这两个；SDK 也只带 win/ 与 win64/ 两套
+  Windows 运行时，51.4.1 的发行说明只在 Linux/iOS/macOS 上提 arm64），所以 AIR 应用在 Windows ARM64 上
+  本就是 x64 模拟运行，<architecture> 永远只该是 32/64。windows-arm64 服务的是**本项目
+  自己的 AOT 原生目标**（清单里 "architecture": "arm64"，见 src/build.ts 的
+  windowsTargetTriple）：在 ARM 机器上要产原生产物，依赖库就得是 arm64 的，否则会拿着
+  x86_64 的归档集去链接——那正是「静默错目标」这一类失败。
+
+  诚实边界：本机（x64 开发机）**从未成功编过 arm64**，因为缺 MSVC 的 ARM64 工具集
+  （实测：vcvarsall arm64 返回 0，而 VC\Tools\MSVC\*\lib\arm64 与 HostX64\arm64\cl.exe
+  一个都不存在——退出码证明不了工具集装没装）。所以这条路径**未经实测**；脚本的对策是
+  两道会红的守卫：开头按文件核对工具集（缺件即报出要装的组件名），构建后核对产物真实位宽
+  （Assert-LibBitness，错位即报错，不让一份 x64 归档冒充 arm64 静默出货）。
+
 .DESCRIPTION
   背景：build-tools/ 不在 git 里（Windows 上 clone 本仓库不会有它），所以本脚本自己把源码下到
   build-tools/ 下再编译；而 vendor/ 在 git 里，产物落在那里才能被后续复用/提交。
@@ -32,14 +47,23 @@
   用法（PowerShell）：
     cd as3compiler\vendor
     powershell -ExecutionPolicy Bypass -File .\build-windows-deps.ps1
-    常用开关：-Arch both|x64|x86（缺省 both）   -Only skia,sdl2,curl
+    常用开关：-Arch both|x64|x86|arm64（缺省 both；both = x64+x86，**不含** arm64）
+              -Only skia,sdl2,curl
               -SkipSkia / -SkipSdl2 / -SkipCurl
               -Clean（清构建目录重编） -SkipDownload（源码下好了，跳过下载） -LlvmHome 'C:\Program Files\LLVM'
 
-  产物布局（<arch> = windows-x64 | windows-x86）：
-    vendor/skia/lib/<arch>/*.lib               （无 lib 前缀：skia.lib / skottie.lib / libpng.lib ...）
-    vendor/sdl2/<arch>/{include,lib}           （SDL2.lib / SDL2main.lib）
-    vendor/curl/{include,lib/<arch>}           （curl.lib / nghttp2.lib / zlib.lib / z.lib）
+  产物布局（<arch> = windows-x64 | windows-x86）—— 三个库**一条规则**：
+    **库产物一律 <pkg>/lib/<arch>/；头文件与平台无关就共用 <pkg>/include/（Skia 的 `-I` 指包根，
+    因为胶水层写的是 `include/core/SkCanvas.h`），逐平台生成才分层到 <pkg>/include/<arch>/**。
+      vendor/skia/lib/<arch>/*.lib             （无 lib 前缀：skia.lib / skottie.lib / libpng.lib ...）
+      vendor/skia/include/                     （Skia 源码形状的 include 树，跨平台共用）
+      vendor/sdl2/lib/<arch>/*.lib             （SDL2.lib / SDL2main.lib，附带 cmake/ 与 pkgconfig/）
+      vendor/sdl2/include/<arch>/SDL2/*.h      （SDL_config.h 是逐平台生成的，故按位宽分层）
+      vendor/sdl2/licenses/SDL2/LICENSE.txt    （两套位宽字节相同，共用一份）
+      vendor/curl/lib/<arch>/*.lib             （curl.lib / nghttp2.lib / zlib.lib / z.lib）
+      vendor/curl/include/                     （头与平台无关，两套位宽共享）
+    macOS 侧同形，且位宽键也带 OS 前缀：vendor/sdl2/<lib|include|bin|share>/macos-arm64/。
+    这里的 sdl2 三件产物由本脚本落盘，macOS 的 macos-arm64 那套是 configure 手工构建的（不在本脚本内）。
 
   注意：Skia 编一次很久（30~60 分钟、几千个 C++ 文件），属正常，不是卡死。两套位宽就是两棵
   独立的 out 目录，时间与磁盘大致翻倍。
@@ -79,7 +103,10 @@
 [CmdletBinding()]
 param(
   # 目标位宽。both = 两套都产（对应 AIR 描述符 <architecture> 可 32 也可 64）。
-  [ValidateSet('x64', 'x86', 'both')]
+  # arm64 要显式点：它不是 AIR 的位宽（AIR 没有 Windows ARM64 运行时），而是本项目 AOT
+  # 原生目标用的第三套；把 arm64 悄悄塞进 both，会让每次默认构建都多出一份没人能用来
+  # 跑 AIR 应用的归档。
+  [ValidateSet('x64', 'x86', 'arm64', 'both')]
   [string]$Arch = 'both',
 
   # 只构建其中一部分：skia / sdl2 / curl
@@ -189,6 +216,7 @@ if ($SkipCurl) { $Want = @($Want | Where-Object { $_ -ne 'curl' }) }
 if ($Want.Count -eq 0) { Fail '没有要构建的目标（-Only / -Skip* 全被关掉了）。' }
 
 # 位宽列表。x64 与 x86 是两棵独立的 Skia out 目录、两套 CMake 构建目录、两个中间前缀。
+# both 刻意**不含** arm64：both 的语义是「AIR 描述符可能取的两种位宽」，而 arm64 不是其中之一。
 $Arches = @()
 if ($Arch -eq 'both') { $Arches = @('x64', 'x86') } else { $Arches = @($Arch) }
 Write-Step "本次要构建：$($Want -join ', ')   位宽：$($Arches -join ', ')"
@@ -366,6 +394,33 @@ function Import-MsvcEnv([string]$arch) {
     }
   }
   if (-not $env:VCToolsInstallDir) { Fail "vcvarsall $arch 执行后仍没有 VCToolsInstallDir，环境导入失败。" }
+
+  # 位宽工具集自检（写入文件为准，不信退出码）。**vcvarsall 的退出码证明不了这个位宽的
+  # 工具集装没装**：实测本机 `vcvarsall arm64` 返回 0，而 HostX64\arm64\cl.exe 与
+  # lib\arm64 一个都不存在。若就此放行，arm64 会一路走到 ninja 才炸，报出来的是
+  # 「找不到 cl.exe / 一堆未解析符号」，真因（少装一个 VS 组件）反而看不见。
+  # 三道核对：MSVC 的该位宽库目录、PATH 上解析到的 cl.exe 是否就是该位宽的那支、
+  # Windows SDK 的该位宽 um 库。
+  $libDir = Join-Path $env:VCToolsInstallDir "lib\$arch"
+  if (@(Get-ChildItem -Path $libDir -Filter '*.lib' -File -ErrorAction SilentlyContinue).Count -eq 0) {
+    Fail @"
+MSVC 的 $arch 工具集没有库目录：$libDir
+就是【Visual Studio Installer → 修改 → 单个组件】里勾上：
+  MSVC v143 - VS 2022 C++ $arch build tools（arm64 的正式名是 "MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools"）
+注意：vcvarsall.bat $arch 会照样返回 0，所以这一步必须查文件，不能信退出码。
+"@
+  }
+  $clCmd = Get-Command 'cl.exe' -ErrorAction SilentlyContinue
+  if (-not $clCmd) { Fail "vcvarsall $arch 之后 PATH 上仍然没有 cl.exe——$arch 位宽的工具集没装全。" }
+  if ($clCmd.Source -notmatch "\\$arch\\cl\.exe") {
+    Fail "vcvarsall $arch 之后解析到的 cl.exe 不是 $arch 那支：$($clCmd.Source)（期望路径含 \$arch\cl.exe）"
+  }
+  $sdkUmArm = Join-Path $env:WindowsSdkDir "Lib\$env:WindowsSDKVersion\um\$arch"
+  if (-not (Test-Path $sdkUmArm)) {
+    Fail "Windows SDK 缺 $arch 的 um 库：$sdkUmArm（补装 Windows SDK 的对应组件）"
+  }
+  Write-Ok "$arch 位宽工具集自检通过（$($clCmd.Source)）"
+
   Write-Ok "已导入 vcvarsall $arch 环境（VSCMD_ARG_TGT_ARCH=$env:VSCMD_ARG_TGT_ARCH）"
 }
 
@@ -937,6 +992,14 @@ function Build-Skia([string]$arch) {
     $g += ''
     $g += 'target_os = "win"'
     $g += "target_cpu = `"$arch`""
+    if ($arch -eq 'arm64') {
+      # clang-cl 的目标架构**默认跟着宿主走**，而 gn 的 win toolchain 只为 x86 传架构旗标
+      # （gn/toolchain/BUILD.gn 的 cl_m32_flag = "-m32"），arm64 分支一个都不传——于是在 x64
+      # 宿主上编 target_cpu=arm64 会安安静静产出 x64 目标文件（上游假设宿主就是 arm64，或者走
+      # cl.exe 那条「按可执行文件身份定架构」的路径）。extra_cflags 是 Skia 自己声明的 gn 参数
+      # （gn/skia/BUILD.gn），用它把三元组显式钉进每一条编译命令行。
+      $g += 'extra_cflags = [ "--target=aarch64-pc-windows-msvc" ]'
+    }
     $g += ''
     $g += 'is_debug = false'
     $g += 'is_official_build = true'        # 关 tools/tests/fuzzers，字体与编解码全用自带静态源码
@@ -1097,6 +1160,7 @@ function Invoke-CmakeBuild {
   # 探测结果与实际产物不一致（后继还可能误判库 ABI）。
   $archFlags = @()
   if ($Arch -eq 'x86') { $archFlags = @('--target=i686-pc-windows-msvc') }
+  elseif ($Arch -eq 'arm64') { $archFlags = @('--target=aarch64-pc-windows-msvc') }
   $cFlags = (@($archFlags) + @($ExtraCFlags)) -join ' '
 
   $cmakeArgs = @(
@@ -1148,7 +1212,16 @@ function Build-Sdl2([string]$arch) {
     if ($SkipDownload) { Fail "-SkipDownload 指定了，但 $src 不存在。" }
     Get-SourceTarball 'sdl2' $src
   }
-  $dest = Join-Path $Vendor "sdl2\windows-$arch"
+  # 安装前缀是 **vendor/sdl2 本身**，再由下面三个 DESTINATION 变量把产物摊进
+  # <pkg>/<kind>/<arch> 的统一样式（与 vendor/skia/lib/<arch>、vendor/curl/lib/<arch> 同形）：
+  #   -DCMAKE_INSTALL_LIBDIR     = lib/windows-<arch>      -> SDL2.lib / cmake/ / pkgconfig/
+  #   -DCMAKE_INSTALL_INCLUDEDIR = include/windows-<arch>  -> include/windows-<arch>/SDL2/*.h
+  #   -DSDL_INSTALL_CMAKEDIR     = lib/windows-<arch>/cmake/SDL2
+  # 最后一项是对齐上游的**非 Windows** 默认值：SDL2 的 CMakeLists.txt:3638-3642 里，Windows 把
+  # CMake 包配置硬编码成 <prefix>/cmake，其它平台用 <libdir>/cmake/SDL2 —— 不覆盖它，同一个库在
+  # Windows 与 macOS 上会长成两副样子。licenses/ 不是可覆盖变量，按上游固定落在
+  # <prefix>/licenses/SDL2（两套位宽同一份文件，内容逐位相同）。
+  $dest = Join-Path $Vendor 'sdl2'
 
   Invoke-CmakeBuild -SrcDir $src `
     -BuildDir (Build-DirFor 'sdl2' $arch) `
@@ -1160,6 +1233,9 @@ function Build-Sdl2([string]$arch) {
       '-DSDL_STATIC=ON',
       '-DSDL_TEST=OFF',
       '-DSDL_TESTS=OFF',
+      "-DCMAKE_INSTALL_LIBDIR=lib/windows-$arch",
+      "-DCMAKE_INSTALL_INCLUDEDIR=include/windows-$arch",
+      "-DSDL_INSTALL_CMAKEDIR=lib/windows-$arch/cmake/SDL2",
       # SDL2 同样不用 CMake 的 CMAKE_MSVC_RUNTIME_LIBRARY，而是自带 SDL_FORCE_STATIC_VCRT
       # 开关（CMakeLists.txt:267）：开启后把 CMAKE_C/CXX_FLAGS 里的 /MD 换成 /MT。不开启会
       # 编成 /MD（每个 obj 带 /DEFAULTLIB:msvcrt.lib），与 /MT 的 skia/curl 混链时 msvcrt.lib
@@ -1169,7 +1245,7 @@ function Build-Sdl2([string]$arch) {
     )
 
   # SDL2 的 CMake 静态库叫 SDL2-static.lib；补一个 SDL2.lib，让 -lSDL2 能解析。
-  $libDir = Join-Path $dest 'lib'
+  $libDir = Join-Path $dest "lib\windows-$arch"
   if (-not (Test-Path $libDir)) { Fail "SDL2 安装后没有 lib 目录：$libDir" }
   foreach ($f in @(Get-ChildItem $libDir -Filter 'SDL2*.lib' -File)) {
     if ($f.Name -eq 'SDL2-static.lib') {
@@ -1331,7 +1407,7 @@ Write-Step '完成，产物清单'
 $summaryPaths = @()
 foreach ($a in $Arches) {
   $summaryPaths += "skia\lib\windows-$a"
-  $summaryPaths += "sdl2\windows-$a"
+  $summaryPaths += "sdl2\lib\windows-$a"
   $summaryPaths += "curl\lib\windows-$a"
 }
 foreach ($p in $summaryPaths) {
@@ -1349,14 +1425,17 @@ $nextSteps = @'
 
 下一步（编译侧还需要处理的）：
   * 位宽由 AIR 描述符决定：<application><architecture> 取 "32" 或 "64"，**缺省 32**。
-    对应关系（即将在 src/air-app.ts 里落地）：
-      <architecture>64</architecture> -> vendor/*/windows-x64 + clang --target=x86_64-pc-windows-msvc
-      <architecture>32</architecture> -> vendor/*/windows-x86 + clang --target=i686-pc-windows-msvc
-    （src/air-app.ts 目前**完全没解析**这个元素，且把链接路径写死成 macOS 的
-      vendor/skia/lib/macos-arm64 与 vendor/sdl2/arm64/lib；link-libs 也按 macOS 命名 ——
-      macOS 是 libskia.a，Windows 是 skia.lib / libpng.lib / libcurl.lib，没有 lib 前缀。）
+    对应关系（已在 src/air-app.ts 落地）：
+      <architecture>64</architecture> -> vendor/*/lib/windows-x64 + clang --target=x86_64-pc-windows-msvc
+      <architecture>32</architecture> -> vendor/*/lib/windows-x86 + clang --target=i686-pc-windows-msvc
+    （macOS 侧同形但键带 OS 前缀：vendor/skia/lib/macos-arm64、vendor/sdl2/lib/macos-arm64、
+      vendor/sdl2/include/macos-arm64。link-libs 的命名两端不同 —— macOS 是 libskia.a，
+      Windows 是 skia.lib / libpng.lib / libcurl.lib，没有 lib 前缀。）
     32 位与 64 位不能混链：Capabilities.cpuAddressSize / supports32BitProcesses 也必须与
     所选三元组一致，否则会与描述符自相矛盾。
+  * Windows ARM64 **不是** <architecture> 的取值（AIR 只认 32/64，它自己没有 ARM64 运行时）：
+    它是本项目 AOT 原生目标的选择加入项，用清单里的 "architecture": "arm64" 配对
+    vendor/*/lib/windows-arm64 + clang --target=aarch64-pc-windows-msvc。
   * 程序本体用 clang --target=<三元组> 编译（GNU 风格旗标可用：-O2 -I -L -l -o），
     与上面这些 clang-cl 产出的 .lib 同为 MSVC ABI，可直接互链。
   * --target native 在 Windows 上还缺原生后端（Win32 + D3D/Skia），见 as3compiler/TODO.md。

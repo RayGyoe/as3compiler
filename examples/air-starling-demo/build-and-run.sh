@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# build-and-run.sh — compile the Starling demo (Demo.as) with mxmlc and run it
-# with adl (AIR Debug Launcher). The AIR SDK is auto-detected exactly like the
-# other examples in this repository.
+# build-and-run.sh — build the Starling demo (Demo.as) and run it either under
+# adl (AIR Debug Launcher, the default) or as an AOT-compiled native binary.
+# The AIR SDK is auto-detected exactly like the other examples in this repository.
 #
 # Usage:
-#   ./build-and-run.sh
+#   ./build-and-run.sh           build with mxmlc and run under adl (default)
+#   ./build-and-run.sh aot       build with as-aot and run the native binary
 #
 # AIR SDK discovery order:
 #   1. $AIRSDK_HOME environment variable (point it at the SDK root).
@@ -13,6 +14,47 @@
 #   3. A sibling directory named AIRSDK_* under the detected root.
 
 set -euo pipefail
+
+# Paths are resolved relative to this script, so it works from any CWD.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Mode selection. No argument = adl (mxmlc + AIR Debug Launcher); `aot` builds
+# with as-aot (src/index.ts --air-app) and runs the resulting native binary.
+# ---------------------------------------------------------------------------
+MODE="adl"
+for arg in "$@"; do
+  case "$arg" in
+    aot) MODE="aot" ;;
+    -*) echo "ERROR: unknown option '$arg' (supported: aot)." >&2; exit 2 ;;
+    *)  echo "ERROR: unknown argument '$arg' (supported: aot)." >&2; exit 2 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# AOT mode: no AIR SDK / mxmlc / adl needed. as-aot reads the descriptor,
+# regenerates the build manifest for this platform, and --run launches the
+# native binary. File.applicationDirectory maps to the process CWD (as_app_dir
+# returns "."), so the build runs from the demo directory to keep assets/ and
+# the relative source tree reachable.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "aot" ]]; then
+  if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: node not found (as-aot runs src/index.ts under Node >= 22)." >&2
+    exit 1
+  fi
+  cd "$SCRIPT_DIR"
+  echo "Building AOT (main class: Demo) with as-aot..."
+  echo "----------------------------------------"
+  node ../../src/index.ts \
+    --air-app Demo-app.xml \
+    --main-class Demo \
+    -o Starling-Demo \
+    --run
+  echo "----------------------------------------"
+  echo "Done."
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Locate the AIR SDK root (directory containing bin/mxmlc and bin/adl).
@@ -90,8 +132,6 @@ if [[ -z "$ADL" ]]; then
   exit 1
 fi
 
-# Paths are resolved relative to this script, so it works from any CWD.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$SCRIPT_DIR/src"
 MAIN_CLASS="$SRC_DIR/Demo.as"
 OUTPUT_SWF="$SCRIPT_DIR/Demo.swf"

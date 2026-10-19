@@ -5,16 +5,19 @@
 //   node --test --test-name-pattern='build/' test/unit/*.ts
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { readdirSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readdirSync, writeFileSync, readFileSync, mkdirSync, existsSync, copyFileSync, rmSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import { aneHostDirName, anePlatformForBuild, anePlatformHint, currentAnePlatform, parseExtensionXml, resolveAneDescriptors, resolveExtensionPackages } from '../../src/ane.ts';
+import type { AneResolution } from '../../src/ane.ts';
+import { ANE_COUNT_MAX } from '../../src/fre.ts';
 
 // ---- build-manifest per-target layering (阶段八十九·五十) ----
 // Checked separately from the example suite (its own counters) so the "N passed"
@@ -523,6 +526,282 @@ function checkFeatures(): string[] {
   return bad;
 }
 
+// ---- ANE host-library layout (阶段一百七十八·三 / ·四） ----
+// Properties that a green end-to-end run does NOT protect, because the host
+// platform happens to be the only one that EXISTED at the time:
+//   (a) the CLI --ane-platform override must actually REACH the config. It was
+//       parsed and then dropped, so `--ane-platform Windows-x86` resolved, linked
+//       and staged as x64 and exited 0 -- a silent wrong-architecture build.
+//   (b) the include path and the link path must stay on DIFFERENT sides of the
+//       lib/bin/<platform> split: asaot.h is one contract shared by all platforms,
+//       the import library is that platform's product.
+//   (c) the .gitignore whitelist that keeps lib/asaot_host.c (a hand-written build
+//       input) out of the global `*.c` rule. Without it a fresh clone has no host
+//       forwarder, no asaot.dll, and nothing in the checkout to explain why.
+//   (d) build-asaot.bat must build BOTH widths by default. Which width a build
+//       consumes is --ane-platform's job and an extension declares its own, so
+//       "just build the width of this machine" is the same silent-substitution
+//       bug as (a), one level down -- and it was exactly why (a) stayed invisible.
+//   (e) the width set is closed at two, and no ARM64 host may appear: AIR has no
+//       Windows ARM64 runtime, so such a library could never be loaded (see the
+//       unit: build/WindowsArch group for the measurement and the other two
+//       places the ARM axis can go wrong).
+function checkAneHostLayout(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [anehost] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [anehost] ${label}`); }
+  };
+  const indexSrc = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
+
+  check('index.ts applies the CLI --ane-platform override onto cfg',
+    /cfg\.anePlatform = opts\.overrides\.anePlatform/.test(indexSrc));
+  check('index.ts links the host library out of lib/bin/<platform>',
+    /resolve\(libDir, 'bin', aneHostDirName\(platform\)\)/.test(indexSrc));
+  check('index.ts keeps the header include path at lib/ itself',
+    /cfg\.includePaths\.push\(libDir\)/.test(indexSrc));
+
+  const gitignore = readFileSync(join(root, '.gitignore'), 'utf8');
+  check('.gitignore re-includes the hand-written lib/*.c sources',
+    /^!lib\/\*\.c$/m.test(gitignore));
+
+  // (d) build-asaot.bat must build BOTH widths by default. A build's host width is
+  //     chosen by --ane-platform, not by the machine that happens to run the script,
+  //     so "only the host of this box" is the same silent-substitution bug as (a),
+  //     one level down. The paired triple is pinned together with the directory
+  //     because a swap would quietly put a 64-bit DLL in bin/windows-x86/.
+  const batPath = join(root, 'lib', 'build-asaot.bat');
+  check('lib/build-asaot.bat exists', existsSync(batPath));
+  if (existsSync(batPath)) {
+    const bat = readFileSync(batPath, 'utf8');
+    check('the bat builds BOTH widths when given no argument',
+      /^if "%WHICH%"=="" set "WHICH=all"$/m.test(bat));
+    check('the i686 triple is paired with bin\windows-x86',
+      /call :build windows-x86 i686-pc-windows-msvc/.test(bat)
+      && !/call :build windows-x86 x86_64/.test(bat));
+    check('the x86_64 triple is paired with bin\windows-x64',
+      /call :build windows-x64 x86_64-pc-windows-msvc/.test(bat)
+      && !/call :build windows-x64 i686/.test(bat));
+    check('both selectors (x86 / x64) are accepted',
+      /if \/i "%WHICH%"=="x86"/.test(bat) && /if \/i "%WHICH%"=="x64"/.test(bat));
+    check('an unrecognized argument fails instead of silently skipping a width',
+      /unknown argument/.test(bat) && /^exit \/b 2$/m.test(bat));
+    // The import library must name the forwarder module; the guard has to be a
+    // real probe, and it has to be a probe that CAN match -- an ASCII findstr on
+    // the archive is the only shape that works here (measured against a
+    // llvm-lib /DEF: product, which really does come out with a blank module).
+    check('the bat verifies the import library names asaot.dll',
+      /findstr \/c:"asaot\.dll"/.test(bat));
+    // (e) ARM64 is a decision, not an omission: AIR has no Windows ARM64 runtime,
+    //     so a host library for it could never be loaded. Pinned as an inventory
+    //     fact (no triple, no directory) rather than as prose in the script.
+    check('the asaot script builds no ARM64 host library', !/aarch64/.test(bat));
+    check('no lib/bin/ directory exists for a key AIR does not have',
+      !existsSync(join(root, 'lib', 'bin', 'windows-arm64')));
+    // CRLF is load-bearing: cmd.exe's `^` line continuation swallows characters
+    // when the file has bare LF, and this script relies on it for the clang line.
+    check('build-asaot.bat keeps CRLF line endings',
+      bat.includes('\r\n') && !/(?<!\r)\n/.test(bat));
+  }
+
+  // (e) A flag that parses but is absent from --help is a hole in the documented
+  //     interface: --ane / --ane-platform worked and were missing from the usage
+  //     text entirely. The check reads the usage() BODY, not the whole file -- the
+  //     two names also occur in the parse chain and in the override block, so a
+  //     whole-file search would still pass with the help lines deleted (a false pin).
+  const usageStart = indexSrc.indexOf('function usage()');
+  const usageEnd = indexSrc.indexOf(".join('\\n');", usageStart);
+  check('the usage() body was located (precondition for the two pins below)',
+    usageStart >= 0 && usageEnd > usageStart);
+  const usageBody = usageStart >= 0 && usageEnd > usageStart ? indexSrc.slice(usageStart, usageEnd) : '';
+  check('--ane <path> is listed in the --help text', usageBody.includes('--ane <f>'));
+  check('--ane-platform is listed in the --help text', usageBody.includes('--ane-platform <key>'));
+
+  // The offered keys and the mappable keys are two copies of ONE vocabulary, and a
+  // divergence is a bug either way: an offered key throws when actually used, a
+  // mappable key is undiscoverable. Read the usage() BODY (the interface), not the
+  // file, and ask the product rather than a literal list -- `MacOS-AOT` was wrong in
+  // all three places at once (offered, mapped, and returned by currentAnePlatform),
+  // which is the shape a per-site text pin cannot see.
+  const AIR_KEYS = ['Windows-x86-64', 'Windows-x86', 'MacOS-x86', 'MacOS-x86-64', 'MacOS-AOT', 'iPhone-ARM'];
+  // Boundary-aware: 'MacOS-x86' is a substring of 'MacOS-x86-64', so a plain
+  // `includes` would report a key as offered that the help text never lists.
+  const offeredIn = (body: string, k: string): boolean =>
+    new RegExp(`(^|[^\\w-])${k}(?![\\w-])`).test(body);
+  const offered = AIR_KEYS.filter((k) => offeredIn(usageBody, k));
+  const mappable = AIR_KEYS.filter((k) => {
+    try { aneHostDirName(k); return true; } catch { return false; }
+  });
+  check('the keys --help offers and the keys with a lib/bin directory are the same set',
+    offered.join(',') === mappable.join(','));
+
+  // Behavioural half: the AIR platform key -> directory-name translation. The
+  // unknown-key case must THROW rather than invent a directory, or a build would
+  // go looking for a host library that was never built for that platform.
+  const mapped: Array<[string, string]> = [
+    ['Windows-x86-64', 'windows-x64'],
+    ['Windows-x86', 'windows-x86'],
+    ['MacOS-x86-64', 'macos-x86-64'],
+    ['iPhone-ARM', 'ios-arm64'],
+  ];
+  check('every AIR platform key maps to its lowercase lib/bin directory',
+    mapped.every(([key, expected]) => aneHostDirName(key) === expected));
+  let threw = false;
+  try { aneHostDirName('Android-ARM64'); } catch { threw = true; }
+  check('an unmapped platform key throws instead of guessing a directory', threw);
+  // `MacOS-AOT` was a row of the table above, mapped to macos-arm64. It is not an AIR
+  // key anywhere in SDK 51.4.1 (0 hits in 2079 files), and its only producer --
+  // currentAnePlatform on darwin/arm64 -- no longer answers it. So it has to throw like
+  // any other unknown key: a surviving case would keep advertising a lib/bin directory
+  // that nothing can ever ask for, and would let the wrong key come back unnoticed.
+  let aotThrew = false;
+  try { aneHostDirName('MacOS-AOT'); } catch { aotThrew = true; }
+  check('MacOS-AOT, which AIR never emits, no longer names a host-library directory', aotThrew);
+
+  console.log(`[anehost] ${ok} passed, ${bad.length} failed`);
+  return bad;
+}
+
+// ---- Windows architecture axis: ARM64 must be a decision, never a default ----
+// AIR has no Windows ARM64 runtime. Measured on AIR SDK 51.4.1: each Windows runtime
+// carries exactly ONE platform key -- win/Adobe AIR.dll has Windows-x86, the win64 one
+// has Windows-x86-64 -- so the closed set is those two, and neither is arm64. win/ and
+// win64/ are the only Windows runtimes the SDK ships, and the 51.4.1 release notes name
+// arm64 for Linux / iOS / macOS only. Windows ARM64 is wrong in
+// four places, and each one failed differently -- or not at all:
+//   (a) currentAnePlatform() ended the win32 branch in `arch === 'ia32' ? x86 : x64`,
+//       so an arm64 host silently claimed the x64 key: the same silent-substitution
+//       shape as the --ane-platform override bug, one level up. It returns '' now,
+//       which makes index.ts demand an explicit key instead of guessing one.
+//   (b) aneHostDirName() must have NO Windows-arm64 case: lib/bin/windows-arm64
+//       would be a host library that no runtime could ever load (the same mistake
+//       as a wasm/ directory), so the key falls through to the throw.
+//   (c) the target triple: `arm64` is a MANIFEST-only value (AIR's <architecture>
+//       takes 32/64 only) mapping to aarch64, so a Windows-on-ARM host cannot reach
+//       the linker holding an x86_64 archive set while believing it built arm64.
+//   (d) build-windows-deps.ps1 grew a real arm64 axis, plus the two properties that
+//       keep it honest: `both` does NOT silently include arm64 (both means "the
+//       widths an AIR descriptor can ask for"), and vcvarsall's exit code is not
+//       trusted -- `vcvarsall arm64` exits 0 on this machine with no arm64 toolset
+//       installed at all, so the check has to look at files.
+function checkWindowsArch(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [winarch] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [winarch] ${label}`); }
+  };
+
+  // (a) the host-platform table, every row reachable because the parameters
+  //     default to process.* but can be supplied (an x64 machine cannot otherwise
+  //     exercise the arm64 row, and an untested branch is where this hid).
+  const hosts: Array<[string, string, string]> = [
+    ['win32', 'x64', 'Windows-x86-64'],
+    ['win32', 'ia32', 'Windows-x86'],
+    ['darwin', 'arm64', 'MacOS-x86-64'],
+    ['darwin', 'x64', 'MacOS-x86-64'],
+  ];
+  check('each host/arch pair maps to its AIR platform key',
+    hosts.every(([p, a, key]) => currentAnePlatform(p, a) === key));
+  // The macOS key carries no architecture (measured: AIR's macOS runtime is one
+  // universal x86_64+arm64 binary whose single 64-bit ANE key, MacOS-x86-64, sits in
+  // both slices next to the ANE-loader strings). So the two macOS hosts must agree, and
+  // an arm64 Mac must NOT be handed a key of its own -- `MacOS-AOT` was exactly that,
+  // and it matched no .ane while `adl` on the same machine loaded MacOS-x86-64 fine.
+  check('both macOS architectures yield the same key, and it is AIR\'s own',
+    currentAnePlatform('darwin', 'arm64') === currentAnePlatform('darwin', 'x64') &&
+    currentAnePlatform('darwin', 'arm64') === 'MacOS-x86-64' &&
+    currentAnePlatform('darwin', 'arm64') !== 'MacOS-AOT');
+  check('a Windows ARM64 host yields NO key (never a silent x64 claim)',
+    currentAnePlatform('win32', 'arm64') === '' && currentAnePlatform('win32', 'arm64') !== 'Windows-x86-64');
+  check('a host with no AIR key at all yields none (Linux)',
+    currentAnePlatform('linux', 'x64') === '');
+
+  // (b) no directory for a key AIR does not have.
+  for (const key of ['Windows-arm64', 'Windows-ARM64', 'windows-arm64']) {
+    let threw = false;
+    try { aneHostDirName(key); } catch { threw = true; }
+    check(`aneHostDirName('${key}') throws instead of naming a host library`, threw);
+  }
+
+  // (c) the triple, and the manifest gate in front of its default.
+  check('manifest architecture 32/64/arm64 map to i686/x86_64/aarch64',
+    windowsTargetTriple('32') === 'i686-pc-windows-msvc' &&
+    windowsTargetTriple('64') === 'x86_64-pc-windows-msvc' &&
+    windowsTargetTriple('arm64') === 'aarch64-pc-windows-msvc');
+  const manifestPath = join(root, 'examples', 'windows-arch.pin.json');
+  const withArch = (a: string): BuildConfig =>
+    applyManifest(defaultBuildConfig(), { architecture: a } as Manifest, manifestPath);
+  check('a manifest may ask for arm64', withArch('arm64').architecture === 'arm64');
+  let badArchThrew = false;
+  try { withArch('arm65'); } catch { badArchThrew = true; }
+  check('an unknown manifest architecture fails instead of defaulting to x86_64', badArchThrew);
+  // The gate that makes the triple reach every step: nativeTargetFlags and
+  // deploySkiaIcuData both used to test `!== '32' && !== '64'`, which would have
+  // left an arm64 build compiling with the host ABI and /MD against /MT archives.
+  const buildSrc = readFileSync(join(root, 'src', 'build.ts'), 'utf8');
+  const arm64Gates = buildSrc.match(/!== '64' && cfg\.architecture !== 'arm64'/g) ?? [];
+  check('every architecture gate also accepts arm64', arm64Gates.length === 2);
+
+  // (d) the dependency script's arm64 axis, and the guard that must not be a
+  //     blanket reject: the self-check reads FILES, and it names the component.
+  const ps1 = readFileSync(join(root, 'vendor', 'build-windows-deps.ps1'), 'utf8');
+  check('build-windows-deps.ps1 accepts -Arch arm64',
+    /\[ValidateSet\('x64', 'x86', 'arm64', 'both'\)\]/.test(ps1));
+  check('`both` still means the two AIR widths, not three',
+    /if \(\$Arch -eq 'both'\) \{ \$Arches = @\('x64', 'x86'\) \}/.test(ps1));
+  check('arm64 maps to the aarch64 CMake triple',
+    /\$Arch -eq 'arm64'\) \{ \$archFlags = @\('--target=aarch64-pc-windows-msvc'\) \}/.test(ps1));
+  check('arm64 pins the triple into Skia too (clang-cl defaults to the host arch)',
+    /extra_cflags = \[ "--target=aarch64-pc-windows-msvc" \]/.test(ps1));
+  check('the arm64 toolset is verified by reading files, not by the exit code',
+    /vcvarsall\.bat \$arch 会照样返回 0/.test(ps1) &&
+    /Get-ChildItem -Path \$libDir -Filter '\*\.lib'/.test(ps1));
+  check('the missing-toolset failure names the component to install',
+    /MSVC v143 - VS 2022 C\+\+ \$arch build tools/.test(ps1));
+  check('the positive branch is a real check, not a collective reject',
+    /\$arch 位宽工具集自检通过/.test(ps1) &&
+    /\$clCmd\.Source -notmatch/.test(ps1));
+
+  // The Windows ARM64 advice in the CLI error must name the x64 target, not a
+  // nonexistent 'Windows-arm64' key.
+  // The no-key error must send a Windows-on-ARM user to the x64 key, never to a
+  // 'Windows-arm64' one. Pinned on the advice FUNCTION, not on the message text: a
+  // text pin passes with the branch disabled (`(false ? ...)`) because the string is
+  // still in the file -- a false pin. The call site is pinned separately so that
+  // dropping the advice fails too.
+  check('the Windows ARM64 hint names the x64 key and an x64 build',
+    anePlatformHint('win32', 'arm64').includes('Windows-x86-64') &&
+    anePlatformHint('win32', 'arm64').includes('architecture'));
+  check('the hint stays silent where the plain instruction is enough',
+    anePlatformHint('win32', 'x64') === '' && anePlatformHint('linux', 'x64') === '');
+  const indexSrc = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
+  // The semantic half: the arch that LOST its key is the one the hint must cover.
+  // This is what makes the call site below meaningful -- a hint that knows nothing
+  // about the refused arch is advice nobody can act on.
+  check('the arch the hint is consulted about is the arch whose key was refused',
+    anePlatformHint('win32', 'arm64') !== '' &&
+    anePlatformForBuild('arm64', 'native', 'win32', 'x64') === '');
+  // The call-site half. Pinned LOOSELY on purpose: an exact argument-list pattern
+  // has to be re-edited every time the expression grows (it did, twice, while this
+  // branch was written) and a pin you keep editing is a pin that stops meaning
+  // anything. What must not regress is narrower and stable: the host arch is still
+  // asked, AND the target arch is a possible answer -- because on Windows the
+  // build's own architecture can be what has no key, and a message that blames the
+  // host sends the user to a flag that cannot help them.
+  check('the no-key error consults that hint',
+    /anePlatformHint\(process\.platform,/.test(indexSrc));
+  check('…and can name the TARGET, not only the host, as the one with no key',
+    /cfg\.architecture === 'arm64'/.test(indexSrc) && indexSrc.includes("'arm64'"));
+  check('the offered key list holds only keys AIR actually has',
+    /--ane-platform <Windows-x86-64\|Windows-x86\|MacOS-x86-64\|iPhone-ARM>/.test(indexSrc) &&
+    !indexSrc.includes('MacOS-AOT'));
+
+  console.log(`[winarch] ${ok} passed, ${bad.length} failed`);
+  return bad;
+}
+
 // ---- wasm export path: CLI --export and package-level [WasmExport] ----
 //
 // Two silent breaks here — both compile (or parse) "fine" until something
@@ -552,8 +831,13 @@ function checkWasmExport(): string[] {
   // broke `--export fib`, so the two cases must differ.
   check('the same function is static without --export (negative control)',
     /^static int fib\(int n\);/m.test(withoutKeep));
+  // The call site is pinned as a PREFIX through the export list on purpose: this
+  // check is about the CLI --export list reaching codegen, not about generateC's
+  // full arity. Pinning the whole argument list made it go red every time a
+  // parameter was appended for an unrelated stage (the ANE descriptor list was
+  // the one that did it), which is noise, not signal.
   check('index.ts threads the CLI export list into codegen',
-    /generateC\(program, cfg\.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml\)/.test(readFileSync(join(root, 'src', 'index.ts'), 'utf8')));
+    /generateC\(program, cfg\.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml[,)]/.test(readFileSync(join(root, 'src', 'index.ts'), 'utf8')));
 
   // (2) [WasmExport] on a packaged top-level function must be collected.
   const pkgSrc = [
@@ -727,9 +1011,904 @@ registerGroup('unit: build/PerfFlags', checkPerfFlags);
 registerGroup('unit: build/DebugInfo', checkDebugInfo);
 registerGroup('unit: build/Features', checkFeatures);
 registerGroup('unit: build/WasmExport', checkWasmExport);
+registerGroup('unit: build/AneHostLayout', checkAneHostLayout);
+registerGroup('unit: build/WindowsArch', checkWindowsArch);
 registerGroup('unit: build/DocumentedLinkSets', checkDocumentedLinkSets);
 registerGroup('unit: air-app/DescriptorComments', checkAirAppDescriptorComments);
 
+// --- ANE extension.xml: comments must not shadow (or invent) declarations -----
+// The ANE-side twin of air-app/DescriptorComments above, and a real defect that was
+// measured while writing examples/ane/: the descriptor reader was comment-blind, so
+// an author who left a commented-out <platform name="..."> sample in extension.xml
+// got a FAKE platform entry, and -- because `<platform ...>` / `</platform>` were
+// paired by the scanner across the comment boundary -- the real declared platform
+// was swallowed with it. The build then rejected a perfectly loadable .ane with
+// "has no <platform name="Windows-x86-64"> entry", pointing the user at the one
+// thing that was actually correct. Comments are stripped before any tag scanning,
+// so the pins below are stated as behaviour (what parseExtensionXml returns), not
+// as the presence of a strip call.
+function checkAneExtensionXmlComments(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [anexml] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [anexml] ${label}`); }
+  };
+
+  // The measured shape: a commented-out platform sample placed ABOVE the live one.
+  const d = parseExtensionXml(
+    `<?xml version="1.0" encoding="utf-8" ?>\n` +
+    `<extension xmlns="http://ns.adobe.com/air/extension/3.1">\n` +
+    `  <id>com.example.probe</id>\n` +
+    `  <name>Probe</name>\n` +
+    `  <versionNumber>1.0.0</versionNumber>\n` +
+    `  <platforms>\n` +
+    `    <!-- <platform name="MacOS-x86-64"> -->\n` +
+    `    <!--   <applicationDeployment> -->\n` +
+    `    <!--     <nativeLibrary>ProbeANE.dylib</nativeLibrary> -->\n` +
+    `    <!--   </applicationDeployment> -->\n` +
+    `    <!-- </platform> -->\n` +
+    `    <platform name="Windows-x86-64">\n` +
+    `      <applicationDeployment>\n` +
+    `        <nativeLibrary>ProbeANE.dll</nativeLibrary>\n` +
+    `        <initializer>ProbeExtInitializer</initializer>\n` +
+    `        <finalizer>ProbeExtFinalizer</finalizer>\n` +
+    `      </applicationDeployment>\n` +
+    `    </platform>\n` +
+    `  </platforms>\n` +
+    `  <!-- TODO: add a macOS entry once lib/bin/macos-x86-64/ ships -->\n` +
+    `</extension>`,
+    'commented.ane');
+
+  check('the live platform survives a commented-out platform above it',
+    d.platforms.some((p) => p.name === 'Windows-x86-64'));
+  check('…with its native library intact',
+    d.platforms.some((p) => p.name === 'Windows-x86-64' && p.nativeLibrary === 'ProbeANE.dll'));
+  check('…and its initializer/finalizer intact',
+    d.platforms.some((p) => p.name === 'Windows-x86-64'
+      && p.initializer === 'ProbeExtInitializer' && p.finalizer === 'ProbeExtFinalizer'));
+  check('a commented-out platform does NOT become a real entry',
+    !d.platforms.some((p) => p.name === 'MacOS-x86-64'));
+  check('exactly one platform is reported', d.platforms.length === 1);
+  // The id/version live outside <platforms>, so they are a second chance for the
+  // same bug on a different tag name.
+  check('the extension id is read from the live <id>', d.extId === 'com.example.probe');
+  check('the version is read from the live <versionNumber>', d.version === '1.0.0');
+  // A commented-out sample must not become a DECLARATION, but it also must not make
+  // the reader reject the package: the fixture descriptor in examples/ane/ (and its
+  // byte-identical twin in examples/ane-app/) is written this way.
+  check('a comment quoting a whole platform block is tolerated', d.platforms.length === 1);
+  // An unterminated comment is malformed input, not a licence to scan into it: the
+  // generated C would otherwise carry a platform nobody declared.
+  const unterminated = (): boolean => {
+    try {
+      parseExtensionXml(
+        `<extension><id>a.b</id><versionNumber>1</versionNumber>` +
+        `<platforms><!-- <platform name="MacOS-x86-64"><applicationDeployment>` +
+        `<nativeLibrary>x.dylib</nativeLibrary></applicationDeployment></platform>` +
+        `<platform name="Windows-x86-64"><applicationDeployment>` +
+        `<nativeLibrary>x.dll</nativeLibrary></applicationDeployment></platform>` +
+        `</platforms></extension>`,
+        'broken.ane');
+      return false;
+    } catch (e) { return /unterminated XML comment/.test(String(e)) && /broken\.ane/.test(String(e)); }
+  };
+  check('an unterminated comment is refused, naming the package', unterminated());
+
+  console.log(`     [anexml] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: ane/ExtensionXmlComments', checkAneExtensionXmlComments);
+
+// STORE-method ZIP writer: swc.ts's `unzip` walks the EOCD + central directory
+// (it does not scan local headers), so a packed fixture needs both records. Shared
+// by the two groups that need a REAL `.ane` on disk (the package-layout pins and
+// air-app's extdir resolution) -- a hand-rolled "zipped" buffer that happens not to
+// be a ZIP would let the reader's ZIP path go untested behind a green check.
+function zipStore(files: [string, Buffer][]): Buffer {
+  const parts: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  for (const [name, data] of files) {
+    const n = Buffer.from(name, 'utf8');
+    const lh = Buffer.alloc(30 + n.length);
+    lh.writeUInt32LE(0x04034b50, 0);
+    lh.writeUInt16LE(20, 4);
+    lh.writeUInt32LE(data.length, 18);
+    lh.writeUInt32LE(data.length, 22);
+    lh.writeUInt16LE(n.length, 26);
+    n.copy(lh, 30);
+    const ch = Buffer.alloc(46 + n.length);
+    ch.writeUInt32LE(0x02014b50, 0);
+    ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6);
+    ch.writeUInt32LE(data.length, 20);
+    ch.writeUInt32LE(data.length, 24);
+    ch.writeUInt16LE(n.length, 28);
+    ch.writeUInt32LE(offset, 42);
+    n.copy(ch, 46);
+    parts.push(lh, data);
+    central.push(ch);
+    offset += lh.length + data.length;
+  }
+  const cd = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(files.length, 8); eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(cd.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...parts, cd, eocd]);
+}
+
+// The example fixture as a PACKED package: same <id>, same platform, same library
+// name as examples/ane/ext-aot/com.example.probe, but in the flat ZIP-root layout.
+// It is built here rather than copied from the example because the example no longer
+// commits a packed .ane at all -- §4.6 dropped `adt -package`, so the recompiled
+// artifact IS the staging tree. The packed shape still has to be exercised (a
+// descriptor declaring an ID must resolve out of `lib/` too, and telling the packed
+// copy apart from the staging tree of the same ID is what makes ext-aot's priority
+// observable), so the fixture is synthesized.
+function probeAneZip(): Buffer {
+  return zipStore([
+    ['extension.xml', Buffer.from(
+      `<extension xmlns="http://ns.adobe.com/air/extension/51.0"><id>com.example.probe</id>` +
+      `<versionNumber>1.0</versionNumber><platforms>` +
+      `<platform name="Windows-x86-64"><applicationDeployment><nativeLibrary>ProbeANE.dll</nativeLibrary>` +
+      `<initializer>ProbeExtInitializer</initializer><finalizer>ProbeExtFinalizer</finalizer>` +
+      `</applicationDeployment></platform></platforms></extension>`, 'utf8')],
+    ['ProbeANE.dll', Buffer.from('MZ')],
+  ]);
+}
+
+// --- ANE native library: the official package layout must resolve ---------------
+// A second measured defect, found while packaging the recompiled WinCore extension:
+// every ANE that `adt -package -target ane` produces is a SIGNED package whose real
+// content lives under `META-INF/ANE/`, so the native library is at
+// `META-INF/ANE/<platform>/<lib>` and never at the ZIP root. The reader only looked
+// at the root, so it rejected the very package adl loads with "does not contain it"
+// -- a §1.5 defect (adl gets it right, this build did not), which is also why the
+// dual-artifact recipe had to re-ZIP a flat package instead of pointing at the
+// official one. These pins are stated as behaviour on resolveAneDescriptors: which
+// BYTES come out for a given platform, not which candidate string is listed first.
+function checkAnePackageLayout(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [anepkg] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [anepkg] ${label}`); }
+  };
+
+  // The staged key IS the path the generated loader will use, so it belongs to the
+  // pinned contract rather than being an implementation detail:
+  // <extensionID>/<platform>/<nativeLibrary>, one directory per extension.
+  const key = (platform: string, lib = 'Pkg.dll', extId = 'com.example.pkg'): string =>
+    `${extId}/${platform}/${lib}`;
+
+  // STORE-method ZIP writer: swc.ts's `unzip` walks the EOCD + central directory
+  // (it does not scan local headers), so a fixture needs both records.
+  const zip = zipStore;
+
+  const EXT_XML = Buffer.from(
+    `<extension xmlns="http://ns.adobe.com/air/extension/51.0"><id>com.example.pkg</id>` +
+    `<versionNumber>1.0</versionNumber><platforms>` +
+    `<platform name="Windows-x86"><applicationDeployment><nativeLibrary>Pkg.dll</nativeLibrary>` +
+    `<initializer>PkgExtInitializer</initializer><finalizer>PkgExtFinalizer</finalizer>` +
+    `</applicationDeployment></platform>` +
+    `<platform name="Windows-x86-64"><applicationDeployment><nativeLibrary>Pkg.dll</nativeLibrary>` +
+    `<initializer>PkgExtInitializer</initializer><finalizer>PkgExtFinalizer</finalizer>` +
+    `</applicationDeployment></platform></platforms></extension>`, 'utf8');
+
+  // A package with any extensionID and nativeLibrary, for the checks that need more
+  // than one extension (the count limit, and two extensions sharing a file name).
+  const extXml = (id: string, lib = 'Pkg.dll', platforms: string[] = ['Windows-x86-64']): Buffer =>
+    Buffer.from(
+      `<extension xmlns="http://ns.adobe.com/air/extension/51.0"><id>${id}</id>` +
+      `<versionNumber>1.0</versionNumber><platforms>` +
+      platforms.map((p) => `<platform name="${p}"><applicationDeployment><nativeLibrary>${lib}</nativeLibrary>` +
+        `<initializer>ExtInitializer</initializer><finalizer>ExtFinalizer</finalizer></applicationDeployment></platform>`).join('') +
+      `</platforms></extension>`, 'utf8');
+
+  // Two DIFFERENT byte strings under one base name: the whole reason a base-name
+  // scan is not an acceptable lookup.
+  const X64 = Buffer.from('x64-slice-bytes');
+  const X86 = Buffer.from('x86-slice-bytes');
+  const d = join(root, 'temp', 'anepkg');
+  mkdirSync(d, { recursive: true });
+  const write = (name: string, buf: Buffer): string => {
+    const p = join(d, name);
+    writeFileSync(p, buf);
+    return p;
+  };
+
+  // (a) The official adt layout, signed-package shape, extension.xml nested too.
+  const official = write('official.ane', zip([
+    ['mimetype', Buffer.from('application/vnd.adobe.air-application-extension')],
+    ['META-INF/ANE/extension.xml', EXT_XML],
+    ['META-INF/ANE/Windows-x86-64/Pkg.dll', X64],
+    ['META-INF/ANE/Windows-x86/Pkg.dll', X86],
+  ]));
+  const resOfficial = (platform: string): Buffer | string => {
+    try {
+      const r = resolveAneDescriptors([official], platform);
+      return r.staging.get(key(platform)) ?? 'staged-nothing';
+    } catch (e) { return `threw: ${String(e)}`; }
+  };
+  check('an official (META-INF/ANE) package resolves instead of being rejected',
+    resOfficial('Windows-x86-64') instanceof Buffer);
+  check('…and the Windows-x86-64 slice is the one that comes out',
+    String(resOfficial('Windows-x86-64')) === 'x64-slice-bytes');
+  check('…targeting Windows-x86 yields the other slice from the SAME package',
+    String(resOfficial('Windows-x86')) === 'x86-slice-bytes');
+  check('the extensionID is read from the nested extension.xml',
+    (() => { try { return resolveAneDescriptors([official], 'Windows-x86').descriptors[0]!.extId === 'com.example.pkg'; }
+             catch { return false; } })());
+
+  // (b) The flat layout (extension.xml + lib side by side at the root) still works:
+  //     a package produced by a hand-rolled ZIP step is packed this way, and must
+  //     keep resolving. (The example fixture used to be one; §4.6 replaced it with
+  //     the staging tree, so this layout has no committed example left -- which is
+  //     why the pins below synthesize all three shapes instead of borrowing one.)
+  const flat = write('flat.ane', zip([['extension.xml', EXT_XML], ['Pkg.dll', X64]]));
+  check('the flat package layout keeps resolving',
+    (() => { try { return String(resolveAneDescriptors([flat], 'Windows-x86-64').staging.get(key('Windows-x86-64'))) === 'x64-slice-bytes'; }
+             catch { return false; } })());
+
+  // (c) The on-disk staging directory adt is fed (`-C Windows-x86-64 .`), in case a
+  //     user zips that instead of running adt: <platform>/<lib> at the root.
+  const staged = write('staged.ane', zip([['extension.xml', EXT_XML], ['Windows-x86-64/Pkg.dll', X64]]));
+  check('a package holding the adt staging directory resolves',
+    (() => { try { return String(resolveAneDescriptors([staged], 'Windows-x86-64').staging.get(key('Windows-x86-64'))) === 'x64-slice-bytes'; }
+             catch { return false; } })());
+
+  // (d) A package holding ONLY the other platform's slice must NOT resolve for this
+  //     one. Falling back to a base-name hit here is how a 32-bit target silently
+  //     loads a 64-bit library.
+  const wrongOnly = write('wrongonly.ane', zip([
+    ['extension.xml', EXT_XML], ['META-INF/ANE/Windows-x86/Pkg.dll', X86],
+  ]));
+  check('the other platform\'s slice is not silently borrowed',
+    (() => { try { resolveAneDescriptors([wrongOnly], 'Windows-x86-64'); return false; }
+             catch { return true; } })());
+
+  // (e) When it really is missing, the error must name the paths that were looked
+  //     for AND what the ZIP does hold: a wrong-case `META-INF/ANE/` prefix, a ZIP of
+  //     only the staging directory, and an empty package are indistinguishable from
+  //     "does not contain it" alone.
+  const missing = write('missing.ane', zip([
+    ['mimetype', Buffer.from('m')], ['META-INF/ANE/extension.xml', EXT_XML],
+    ['META-INF/ANE/Windows-x86-64/Other.dll', X64],
+  ]));
+  const msg = ((): string => {
+    try { resolveAneDescriptors([missing], 'Windows-x86-64'); return ''; } catch (e) { return String(e); }
+  })();
+  check('a missing native library is an error', msg !== '');
+  check('…naming all three candidate paths it looked for',
+    msg.includes("'Pkg.dll'") && msg.includes("'META-INF/ANE/Windows-x86-64/Pkg.dll'") &&
+    msg.includes("'Windows-x86-64/Pkg.dll'"));
+  check('…and listing what the package actually holds',
+    msg.includes('META-INF/ANE/Windows-x86-64/Other.dll'));
+
+  // (f) The UNPACKED DIRECTORY form, which is what a recompiled package is shipped
+  //     as (see src/ane.ts readAne: such a library imports asaot.dll and so has no
+  //     consumer AIR could satisfy, and the DoABC in a library.swf is out of scope
+  //     anyway -- so the staging tree is the whole artifact and there is no ZIP to
+  //     read). Two things are pinned beyond "it opens": the lookup is
+  //     platform-scoped through this path too, and entry names are slash-separated,
+  //     which on Windows is the difference between matching a candidate and never
+  //     matching one (path.join would hand back `Windows-x86-64\Pkg.dll`).
+  const dirstage = join(d, 'dirstage');
+  const put = (dir: string, rel: string, buf: Buffer | string): void => {
+    const abs = join(dir, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, buf);
+  };
+  put(dirstage, 'extension.xml', EXT_XML);
+  put(dirstage, 'Windows-x86-64/Pkg.dll', X64);
+  put(dirstage, 'Windows-x86/Pkg.dll', X86);
+  const dirSlice = (platform: string): Buffer | string => {
+    try { return resolveAneDescriptors([dirstage], platform).staging.get(key(platform)) ?? 'staged-nothing'; }
+    catch (e) { return `threw: ${String(e)}`; }
+  };
+  check('a staging DIRECTORY resolves for Windows-x86-64', String(dirSlice('Windows-x86-64')) === 'x64-slice-bytes');
+  check('…and targeting Windows-x86 yields the other slice from the same directory',
+    String(dirSlice('Windows-x86')) === 'x86-slice-bytes');
+  check('a directory is platform-scoped too: the other slice is not borrowed from it',
+    (() => {
+      const only = join(d, 'dirwrongonly');
+      put(only, 'extension.xml', EXT_XML);
+      put(only, 'Windows-x86/Pkg.dll', X86);
+      try { resolveAneDescriptors([only], 'Windows-x86-64'); return false; } catch { return true; }
+    })());
+  // Recursion + slash-normalisation in one: an official package unzipped by hand
+  // nests the library two levels down, so a flat readdir (or a backslash address)
+  // finds nothing even though the tree is complete.
+  check('a hand-unzipped META-INF/ANE tree resolves, so the walk is recursive',
+    (() => {
+      const nested = join(d, 'dirnested');
+      put(nested, 'META-INF/ANE/extension.xml', EXT_XML);
+      put(nested, 'META-INF/ANE/Windows-x86-64/Pkg.dll', X64);
+      try { return String(resolveAneDescriptors([nested], 'Windows-x86-64').staging.get(key('Windows-x86-64'))) === 'x64-slice-bytes'; }
+      catch { return false; }
+    })());
+  check('a directory with no extension.xml is refused by name',
+    (() => {
+      const bare = join(d, 'dirbare');
+      put(bare, 'Windows-x86-64/Pkg.dll', X64);
+      try { resolveAneDescriptors([bare], 'Windows-x86-64'); return false; }
+      catch (e) { return /no extension.xml/.test(String(e)) && /dirbare/.test(String(e)); }
+    })());
+  // The message must be the ANE-prefixed one, not a bare ENOENT from readdirSync:
+  // both would "mention it is missing", but only one names the ANE path in the form
+  // every other ANE diagnostic uses, and the pin has to tell them apart.
+  check('a path that is neither file nor directory says so, ANE-prefixed',
+    (() => {
+      try { resolveAneDescriptors([join(d, 'nope-ane')], 'Windows-x86-64'); return false; }
+      catch (e) { return /ANE '.*nope-ane': no such file or directory/.test(String(e)); }
+    })());
+
+  // (g) THE LAYOUT: one directory per extension, two levels deep, named after the
+  //     extensionID and the platform. Pinned on the DESCRIPTOR (what the emitted
+  //     as_ane_descs[] row carries and the loader joins onto <exeDir>/extensions/)
+  //     and on the staged map, because those two drifting apart is exactly the bug
+  //     this replaced.
+  const one = ((): { desc: string; keys: string[] } => {
+    try { const r = resolveAneDescriptors([flat], 'Windows-x86-64'); return { desc: r.descriptors[0]?.nativeLib ?? '<none>', keys: [...r.staging.keys()] }; }
+    catch (e) { return { desc: `threw: ${e}`, keys: [] }; }
+  })();
+  check('the descriptor names the library <extensionID>/<platform>/<lib>',
+    one.desc === key('Windows-x86-64'));
+  check('…and the staged map is keyed by that same path',
+    one.keys.length === 1 && one.keys[0] === key('Windows-x86-64'));
+  check('…so nothing is staged under the bare file name any more',
+    !one.keys.includes('Pkg.dll'));
+
+  // (h) Two extensions that ship a library of the SAME file name, which is the
+  //     defect this layout exists for: before it, both descriptors pointed at one
+  //     staged file (the second overwrote the first, and the summary read
+  //     "2 extension(s)" beside "1 native library(ies)"), so the first extension
+  //     loaded the second's library. AIR keeps them apart -- measured under adl,
+  //     where a second package shipping a sentinel under the same file name left the
+  //     first extension passing 13/13 -- so this build has to as well.
+  const two = ((): AneResolution | string => {
+    try {
+      return resolveAneDescriptors([
+        write('same-a.ane', zip([['extension.xml', extXml('com.example.a')], ['Pkg.dll', X64]])),
+        write('same-b.ane', zip([['extension.xml', extXml('com.example.b')], ['Pkg.dll', X86]])),
+      ], 'Windows-x86-64');
+    } catch (e) { return `threw: ${e}`; }
+  })();
+  check('two extensions may ship a library of the same file name',
+    typeof two !== 'string' && two.descriptors.length === 2);
+  check('…each addressed by its own extension directory',
+    typeof two !== 'string' &&
+    two.descriptors[0]?.nativeLib === key('Windows-x86-64', 'Pkg.dll', 'com.example.a') &&
+    two.descriptors[1]?.nativeLib === key('Windows-x86-64', 'Pkg.dll', 'com.example.b'));
+  check('…so both libraries are staged, not one',
+    typeof two !== 'string' && two.staging.size === 2);
+  check('…and each holds its own bytes',
+    typeof two !== 'string' &&
+    String(two.staging.get(key('Windows-x86-64', 'Pkg.dll', 'com.example.a'))) === 'x64-slice-bytes' &&
+    String(two.staging.get(key('Windows-x86-64', 'Pkg.dll', 'com.example.b'))) === 'x86-slice-bytes');
+
+  // (i) A library declared in a SUBDIRECTORY keeps that relative path: flattening it
+  //     onto a base name would recreate the collision above, and would rename a file
+  //     the extension itself may look for (AIR keeps the declared relative path too).
+  check('a library declared in a subdirectory keeps that subdirectory',
+    (() => {
+      try {
+        const sub = resolveAneDescriptors([write('sub.ane', zip([
+          ['extension.xml', extXml('com.example.sub', 'libs/Pkg.dll')], ['libs/Pkg.dll', X64],
+        ]))], 'Windows-x86-64');
+        return sub.descriptors[0]?.nativeLib === key('Windows-x86-64', 'libs/Pkg.dll', 'com.example.sub');
+      } catch { return false; }
+    })());
+
+  // (j) The count is a HARD limit, not a hint. One descriptor row is one as_anes[]
+  //     slot in the generated program (fre.ts ANE_COUNT_MAX), so a 33rd extension has
+  //     to be refused while the build can still say so. Measured before this gate: 33
+  //     packages compiled, linked, staged and exited 0 with no warning anywhere, and
+  //     only failed as an out-of-bounds write on the first createExtensionContext for
+  //     the 33rd.
+  const many = (n: number): string[] => Array.from({ length: n }, (_, i) =>
+    write(`many-${i}.ane`, zip([['extension.xml', extXml(`com.example.many${i}`)], ['Pkg.dll', X64]])));
+  const atLimit = ((): string => {
+    try { return String(resolveAneDescriptors(many(ANE_COUNT_MAX), 'Windows-x86-64').descriptors.length); }
+    catch (e) { return `threw: ${e}`; }
+  })();
+  check(`exactly ANE_COUNT_MAX (${ANE_COUNT_MAX}) extensions resolve`, atLimit === String(ANE_COUNT_MAX));
+  const over = ((): string => {
+    try { resolveAneDescriptors(many(ANE_COUNT_MAX + 1), 'Windows-x86-64'); return 'accepted'; }
+    catch (e) { return String(e); }
+  })();
+  check('one more than ANE_COUNT_MAX is refused, not emitted', over !== 'accepted');
+  check('…naming the limit, the count it would reach, and the constant to raise',
+    /at most 32/.test(over) && /number 33/.test(over) && /ANE_COUNT_MAX in src\/fre\.ts/.test(over));
+
+  console.log(`     [anepkg] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: ane/PackageLayout', checkAnePackageLayout);
+
+// --- The ANE platform key must follow the TARGET, not the build host -----------
+// Third measured defect, found while packaging the recompiled WinCore extension for
+// both bitnesses: the key used to come from currentAnePlatform(), i.e. from
+// process.arch. On an x64 host with `"architecture": "32"` that compiled i686
+// objects, linked the x64 asaot.lib, staged the x64 slice of the ANE, and then
+// failed at run time -- 64-bit DLL into a 32-bit process. AIR gives a 32-bit captive
+// app the x86 runtime, so the key it would use is Windows-x86.
+//
+// The pins below are the mapping itself. The cross-module one is the important
+// kind: the object triple and the ANE key are decided in two different files, and
+// a bitness agreement between them is the invariant, not either answer alone.
+function checkAnePlatformForBuild(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [aneplat] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [aneplat] ${label}`); }
+  };
+
+  const key = (architecture: string, target = 'native', host = 'win32', arch = 'x64') =>
+    anePlatformForBuild(architecture, target, host, arch);
+
+  // (a) The defect itself: the manifest's own architecture decides the slice.
+  check('architecture "32" on an x64 Windows host resolves Windows-x86', key('32') === 'Windows-x86');
+  check('architecture "64" resolves Windows-x86-64', key('64') === 'Windows-x86-64');
+  // (b) A 32-bit host building 32-bit agrees with itself -- the branch that worked
+  //     by luck before is not the only one that has to stay right.
+  check('architecture "32" on an ia32 Windows host is also Windows-x86',
+    key('32', 'native', 'win32', 'ia32') === 'Windows-x86');
+  // (c) Unchanged defaults: "" means "let clang pick the host default", so the
+  //     host's own answer has to survive, and so does the arm64 refusal (AIR has no
+  //     Windows ARM64 runtime, so there is no key to invent).
+  check('an empty architecture keeps the host answer', key('') === currentAnePlatform('win32', 'x64'));
+  check('architecture "arm64" invents no Windows key', key('arm64') === '');
+  // (d) `architecture` is inert off a Windows native build (exactly nativeTargetFlags'
+  //     condition), which matters because AIR's descriptor default is "32": a macOS
+  //     --air-app build carries architecture === '32' and must NOT become Windows-x86.
+  check('architecture is inert for a wasm target', key('32', 'wasm') === currentAnePlatform('win32', 'x64'));
+  check('architecture is inert on macOS, whose --air-app default is "32"',
+    key('32', 'native', 'darwin', 'arm64') === 'MacOS-x86-64' &&
+    key('32', 'native', 'darwin', 'x64') === 'MacOS-x86-64');
+  check('the macOS arm64 host still gets one architecture-neutral key',
+    key('', 'native', 'darwin', 'arm64') === 'MacOS-x86-64');
+  check('an explicit override is still the caller\'s business (no key is unreachable)',
+    key('64') === 'Windows-x86-64' && key('32') === 'Windows-x86');
+
+  // (e) Cross-module: the same "32" must mean the same bitness in the ANE key and in
+  //     the object triple the compiler emits. Two independent readings of one
+  //     manifest field drifting apart is precisely how the x64-slice bug appeared.
+  const is32 = (t: string) => /i686/.test(t);
+  check('"32" gives i686 objects AND Windows-x86 (bitness agrees across modules)',
+    key('32') === 'Windows-x86' && is32(windowsTargetTriple('32')));
+  check('"64" gives x86_64 objects AND Windows-x86-64',
+    key('64') === 'Windows-x86-64' && /x86_64/.test(windowsTargetTriple('64')));
+
+  console.log(`     [aneplat] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: ane/PlatformForBuild', checkAnePlatformForBuild);
+
+// --- the two extension examples share ONE fixture (阶段一百八十四) ---------------
+// examples/ane/ and examples/ane-app/ reach the same extension by two different
+// routes -- a manifest's `ane-paths` versus a descriptor's `<extensions>` -- and
+// they are the before/after pair a reader compares. build-ane.bat compiles
+// ProbeANE.c ONCE and copies the result into both trees, with a findstr guard on
+// each descriptor, so the two cannot disagree about what com.example.probe is.
+//
+// Nothing in the build enforces that: they are two independent directories, and a
+// fixture tree that lost its descriptor still compiles AND still links -- the only
+// symptom is `as_ane_load` failing at run time, on one example, on one platform.
+// The edit that will actually happen is one-sided too: adding a `MacOS-...
+// <platform>` to make the example runnable on the arm64 CI runner, in one tree.
+function checkAneExampleFixtureTrees(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [anefix] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [anefix] ${label}`); }
+  };
+  const trees = ['ane', 'ane-app'].map((e) => join(root, 'examples', e, 'ext-aot', 'com.example.probe'));
+  const xmls = trees.map((t) => join(t, 'extension.xml'));
+  const libs = trees.map((t) => join(t, 'Windows-x86-64', 'ProbeANE.dll'));
+  check('both example fixture trees exist', trees.every((t) => existsSync(t)));
+  if (!trees.every((t) => existsSync(t))) { return bad; }
+  // Byte-identity rather than a semantic comparison: the point is that one compile
+  // produced both, and a semantic diff would accept two descriptors that describe
+  // subtly different platforms.
+  const sameFile = (a: string, b: string): boolean =>
+    existsSync(a) && existsSync(b) && readFileSync(a).equals(readFileSync(b));
+  check('the two descriptors are byte-identical', sameFile(xmls[0], xmls[1]));
+  check('the two native libraries are byte-identical', sameFile(libs[0], libs[1]));
+  const xml = readFileSync(xmls[0], 'utf8');
+  check('...and declare one id, one platform and one library',
+    xml.includes('<id>com.example.probe</id>')
+    && xml.includes('<platform name="Windows-x86-64">')
+    && xml.includes('<nativeLibrary>ProbeANE.dll</nativeLibrary>'));
+  // The wiring: each example must resolve to the SAME tree the identity checks
+  // above just compared, or those two pins would be pinning a fixture that neither
+  // example is built against. Both routes are driven here -- the resolver (what
+  // --air-app does with a descriptor's IDs, over the app directory's ext-aot/) and
+  // the manifest (what --ane reads) -- so a rename that satisfied only one of them
+  // fails rather than half-works.
+  const appRoot = join(root, 'examples', 'ane-app', 'ext-aot');
+  const resolved = (() => {
+    try { return resolveExtensionPackages([appRoot], ['com.example.probe']); }
+    catch (e) { return String(e); }
+  })();
+  check('the descriptor id resolves to the staging tree under the app directory',
+    typeof resolved !== 'string' && resolved.get('com.example.probe') === join(appRoot, 'com.example.probe'));
+  const manifest = JSON.parse(readFileSync(join(root, 'examples', 'ane', 'ane.build.json'), 'utf8')) as Record<string, unknown>;
+  check('ane.build.json points at the same tree',
+    JSON.stringify(manifest['ane-paths']) === JSON.stringify(['ext-aot/com.example.probe']));
+  const app = parseAirApp(readFileSync(join(root, 'examples', 'ane-app', 'ane-app.xml'), 'utf8'));
+  check('the app descriptor declares that same id',
+    app.extensionIDs.length === 1 && app.extensionIDs[0] === 'com.example.probe');
+  console.log(`     [anefix] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: ane/ExampleFixtureTrees', checkAneExampleFixtureTrees);
+
+// --- The descriptor's <extensions> block is what says an app NEEDS an extension ---
+//
+// Found by asking "how are multiple extensions supported?": --air-app read no
+// `<extensions>` element at all, so a descriptor naming extensions built green
+// with an extension table of zero and nothing on stderr. Measured under adl, the
+// same descriptor with an extdir that cannot supply the ID is refused outright
+// (`Requested extension com.… could not be found.`, exit 5) — so silence here is a
+// §1.5 defect, not a gap to document.
+//
+// The three decisions these pins encode, each measured before it was chosen:
+//   * the ID list comes from the descriptor and is resolved against an extdir —
+//     AIR's own split (app.xml names IDs, `-extdir` names the packages);
+//   * the search roots default to `ext-aot` then `lib` then `ext-folder`. `ext-aot`
+//     is this build's own root for recompiled-for-AOT packages and it is FIRST
+//     because an extension's AIR and AOT packages declare one and the SAME
+//     <extensionID>, so which one a build uses is decided by root order alone;
+//     `--extdir` replaces all three;
+//   * resolution is by DECLARED ID, never by "whatever is in the directory" — on a
+//     real project `lib/` carries 14 `.ane` files while the descriptor declares 5,
+//     and sweeping all of them in aborts on a package the app never asked for.
+function checkAirAppExtensions(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [airext] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [airext] ${label}`); }
+  };
+
+  // (a) The parser. The commented-out placeholder is the SDK template's own shape
+  //     (`<!--<extensionID></extensionID>-->`), so a reader that ignores comments
+  //     both invents an empty ID and resurrects an extension a user switched off.
+  const ids = (body: string): string[] =>
+    parseAirApp(
+      `<?xml version="1.0"?>\n<application xmlns="http://ns.adobe.com/air/application/51.0">\n` +
+        `<id>com.example.a</id><filename>a</filename>\n` +
+        `<initialWindow><content>a.swf</content><width>10</width><height>10</height></initialWindow>\n` +
+        body +
+        `\n</application>\n`
+    ).extensionIDs;
+  check('a descriptor with no <extensions> declares none', ids('').length === 0);
+  check('extensionIDs are read in descriptor order',
+    JSON.stringify(ids('<extensions><extensionID>com.b</extensionID><extensionID>com.a</extensionID></extensions>')) ===
+      JSON.stringify(['com.b', 'com.a']));
+  check('a commented-out extensionID is not requested',
+    JSON.stringify(ids('<extensions><!--<extensionID>com.off</extensionID>--><extensionID>com.on</extensionID></extensions>')) ===
+      JSON.stringify(['com.on']));
+  check('...and the empty placeholder yields no ID',
+    JSON.stringify(ids('<extensions>\n<!--<extensionID></extensionID>-->\n<extensionID>com.on</extensionID>\n</extensions>')) ===
+      JSON.stringify(['com.on']));
+  // An UNcommented empty element is the other way a user clears an extension (a
+  // template placeholder edited rather than deleted). Comment-stripping does not
+  // reach it, so the empty-body rule has to stand on its own — without it the empty
+  // ID is handed to the resolver and the build fails on an extension nobody named.
+  check('an uncommented empty extensionID is not an extension either',
+    JSON.stringify(ids('<extensions><extensionID></extensionID><extensionID>com.on</extensionID></extensions>')) ===
+      JSON.stringify(['com.on']));
+
+  // (b) Resolution. Three shapes are on disk for the same package: the packed `.ane`
+  //     (what `adt -package -extdir` is fed), the unpacked tree (what `adl -extdir`
+  //     is fed), and the staging tree (what `adt` is fed, and what this project's
+  //     recompiled-for-AOT artifact IS). A project that ran its own unzip step has
+  //     the first two at once, under the same ID — which is why root order is
+  //     load-bearing rather than cosmetic.
+  const d = join(root, 'temp', 'air-extdir');
+  // Wiped first: this group builds several app directories under here, and a
+  // leftover from the previous run would decide checks that mean to read the
+  // defaults (a stale `ext-aot/` makes "resolved out of the default lib/" read the
+  // package it no longer expects). Measured: without this the group passes once and
+  // fails on every run after it.
+  rmSync(d, { recursive: true, force: true });
+  const rootA = join(d, 'rootA');
+  const rootB = join(d, 'rootB');
+  const rootC = join(d, 'rootC-absent'); // never created
+  const rootD = join(d, 'rootD-staging');
+  mkdirSync(rootA, { recursive: true });
+  const extensionXml = (id: string): string =>
+    `<extension xmlns="http://ns.adobe.com/air/extension/51.0"><id>${id}</id><versionNumber>1.0</versionNumber>` +
+    `<platforms><platform name="Windows-x86-64"><applicationDeployment><nativeLibrary>P.dll</nativeLibrary>` +
+    `<initializer>I</initializer><finalizer>F</finalizer></applicationDeployment></platform></platforms></extension>`;
+  const unpack = (root: string, id: string): void => {
+    const meta = join(root, `${id}.ane`, 'META-INF', 'ANE');
+    mkdirSync(meta, { recursive: true });
+    writeFileSync(join(meta, 'extension.xml'), extensionXml(id));
+  };
+  // The packed half is a real package, not a hand-rolled ZIP: probeAneZip() writes a
+  // genuine STORE-method .ane with the example fixture's own id/platform/library, so
+  // the checks below compare two real packages that declare the SAME extension.
+  const probeAne = join(rootA, 'Probe.ane');
+  writeFileSync(probeAne, probeAneZip());
+  unpack(rootB, 'com.example.probe');
+  unpack(rootB, 'com.example.other');
+  // Not packages, and therefore not errors: the same directory legitimately holds
+  // an unzip helper and documentation (measured: the SDK template's ext-folder
+  // ships unzip.exe + unzipane.bat beside the trees).
+  writeFileSync(join(rootB, 'unzip.exe'), 'not-a-package');
+  writeFileSync(join(rootB, 'notes.txt'), 'not-a-package');
+
+  const resolveIds = (roots: string[], idList: string[]): Map<string, string> | string => {
+    try { return resolveExtensionPackages(roots, idList); } catch (e) { return `threw: ${String(e)}`; }
+  };
+  const one = resolveIds([rootA], ['com.example.probe']);
+  check('a packed .ane in an extdir resolves', typeof one !== 'string' && one.get('com.example.probe') === join(rootA, 'Probe.ane'));
+  const two = resolveIds([rootB], ['com.example.probe', 'com.example.other']);
+  check('an unpacked META-INF/ANE tree in an extdir resolves',
+    typeof two !== 'string' &&
+    two.get('com.example.probe') === join(rootB, 'com.example.probe.ane') &&
+    two.get('com.example.other') === join(rootB, 'com.example.other.ane'));
+  // The third shape: the staging tree, `extension.xml` beside its `<platform>/`
+  // directories. It has to resolve HERE too, not only through `--ane <tree>` — an
+  // extension artifact that the scan cannot see is worse than not supporting it,
+  // because the AIR package sitting beside it then wins without a word (measured:
+  // the build stages the AIR library, the program loads it, and it dies on
+  // `Win32 error 126 … must be recompiled against asaot.lib`).
+  const stagedPkg = join(rootD, 'com.example.staged');
+  mkdirSync(join(stagedPkg, 'Windows-x86-64'), { recursive: true });
+  writeFileSync(join(stagedPkg, 'extension.xml'), extensionXml('com.example.staged'));
+  writeFileSync(join(stagedPkg, 'Windows-x86-64', 'P.dll'), 'not-a-real-dll');
+  const three = resolveIds([rootD], ['com.example.staged']);
+  check('a staging tree (extension.xml beside <platform>/) in an extdir resolves',
+    typeof three !== 'string' && three.get('com.example.staged') === stagedPkg);
+  // A directory that is not a package still is not one, and is not an error: the
+  // SDK template's ext-folder ships helper files (and a stray subdirectory is no
+  // different) beside the trees. This is what stops the staging-tree rule above
+  // from degenerating into "every directory in the extdir is a package".
+  mkdirSync(join(rootD, 'not-a-package'), { recursive: true });
+  writeFileSync(join(rootD, 'not-a-package', 'readme.txt'), 'not-a-package');
+  const beside = resolveIds([rootD, rootB], ['com.example.staged', 'com.example.probe']);
+  check('a non-package directory beside a package is skipped, not an error',
+    typeof beside !== 'string' &&
+    beside.get('com.example.staged') === stagedPkg &&
+    beside.get('com.example.probe') === join(rootB, 'com.example.probe.ane'));
+  const both = resolveIds([rootA, rootB], ['com.example.probe']);
+  check('the first root wins when both hold the same ID',
+    typeof both === 'string' ? false : both.get('com.example.probe') === join(rootA, 'Probe.ane'));
+  const onlyB = resolveIds([rootA, rootB], ['com.example.other']);
+  check('...and a later root still supplies an ID the first one lacks',
+    typeof onlyB === 'string' ? false : onlyB.get('com.example.other') === join(rootB, 'com.example.other.ane'));
+
+  // The directory-driven reading this refuses: `com.example.other` sits in the same
+  // root and is NOT asked for, so it must not come back. Getting this wrong is the
+  // measured real-project failure — its lib/ holds 14 `.ane` files beside a
+  // descriptor that names 5, and sweeping them all in aborts on a package the app
+  // never requested.
+  const declaredOnly = resolveIds([rootB], ['com.example.probe']);
+  check('a package the descriptor does not name is not returned',
+    typeof declaredOnly !== 'string' && declaredOnly.size === 1);
+
+  // The diagnosis. adl's own sentence, plus what was searched and what was there:
+  // "could not be found" alone cannot distinguish a typo'd --extdir from an empty
+  // directory from an ID that is simply misspelled in the descriptor.
+  const miss = resolveIds([rootA, rootB, rootC], ['com.example.probe', 'com.example.absent']);
+  check('a declared ID with no package is refused, not skipped', typeof miss === 'string');
+  check('...in adl\'s own wording', typeof miss === 'string' && miss.includes('Requested extension com.example.absent could not be found.'));
+  check('...naming every directory that was searched, and the absent one as absent',
+    typeof miss === 'string' && miss.includes(rootA) && miss.includes(rootB) && miss.includes(`${rootC} (absent)`));
+  check('...listing what those directories do offer',
+    typeof miss === 'string' && miss.includes('com.example.probe <-') && miss.includes('com.example.other <-'));
+  check('...and naming both ways out (drop the package in, or --extdir)',
+    typeof miss === 'string' && miss.includes('--extdir <dir>'));
+  // All THREE shapes readAne accepts, not the two the AIR SDK template ships. The
+  // staging tree (`<dir>/extension.xml` beside its `<platform>/` libraries) is what
+  // a recompiled-for-AOT extension IS (docs/zh-cn/ane.md §4.6), so a hint that
+  // omits it stops naming the way out for exactly the user most likely to read it.
+  check('...and naming all three package shapes, staging tree included',
+    typeof miss === 'string'
+    && miss.includes('<dir>/META-INF/ANE/extension.xml')
+    && miss.includes('<dir>/extension.xml'));
+
+  // (c) The adapter: the descriptor's IDs, the resolved paths, and the manifest.
+  //     Driven through prepareAirApp rather than the helper alone, because the
+  //     ordering and the manifest-relative spelling are decided there.
+  const appDir = join(d, 'app');
+  mkdirSync(join(appDir, 'src'), { recursive: true });
+  mkdirSync(join(appDir, 'lib'), { recursive: true });
+  writeFileSync(join(appDir, 'lib', 'Probe.ane'), probeAneZip());
+  writeFileSync(join(appDir, 'src', 'Main.as'),
+    'package {\n  import flash.display.Sprite;\n' +
+    '  public class Main extends Sprite {\n    public function Main() {}\n  }\n}\n');
+  const appXml = (extBlock: string): string => {
+    const p = join(appDir, 'ext-app.xml');
+    writeFileSync(p,
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<application xmlns="http://ns.adobe.com/air/application/51.3">\n` +
+      `  <id>com.example.extapp</id><versionNumber>1.0</versionNumber>\n  <filename>extapp</filename>\n` +
+      `  <architecture>64</architecture>\n` +
+      `  <initialWindow><content>extapp.swf</content><visible>true</visible><width>400</width><height>300</height></initialWindow>\n` +
+      extBlock + `\n</application>\n`);
+    return p;
+  };
+  const vendorAbs = resolve(root, 'vendor');
+  const manifestOf = (xmlPath: string, extDirs: string[] = []): Record<string, unknown> | string => {
+    try {
+      const prep = prepareAirApp(xmlPath, 'Main', vendorAbs, false, null, null, false, extDirs);
+      return JSON.parse(readFileSync(prep.manifestPath, 'utf8')) as Record<string, unknown>;
+    } catch (e) { return `threw: ${String(e)}`; }
+  };
+
+  const withExts = manifestOf(appXml('<extensions><extensionID>com.example.probe</extensionID></extensions>'));
+  check('the adapter resolves the declared ID out of the default lib/',
+    typeof withExts !== 'string' && JSON.stringify(withExts['ane-paths']) === JSON.stringify(['lib/Probe.ane']));
+  // Manifest-relative, slash-separated: the manifest sits in the app directory, and
+  // a Windows-style `lib\\Probe.ane` would not resolve on the path-join side.
+  check('...written manifest-relative and slash-separated',
+    typeof withExts === 'string' || !String((withExts['ane-paths'] as string[])[0]).includes('\\'));
+  const noExts = manifestOf(appXml(''));
+  check('a descriptor with no <extensions> gets no ane-paths key at all',
+    typeof noExts !== 'string' && noExts['ane-paths'] === undefined);
+
+  const missing = manifestOf(appXml('<extensions><extensionID>com.example.probe</extensionID><extensionID>com.example.absent</extensionID></extensions>'));
+  check('--air-app refuses a declared extension it cannot locate (no silent empty table)',
+    typeof missing === 'string' && missing.includes('Requested extension com.example.absent could not be found.'));
+
+  // `ext-aot`, and why it is searched FIRST. An app that is being moved onto this
+  // build has, for every migrated extension, an AIR package in `lib/` and a
+  // recompiled one — and the two declare the SAME <extensionID>, on purpose: the app
+  // must not need a source change to switch which build it runs under. So root order
+  // is the entire selection mechanism, and it has to be an explicitly named
+  // directory rather than a name-sort accident inside `lib/`. The AIR originals stay
+  // untouched where `adl` and `adt` look for them.
+  const aotDir = join(appDir, 'ext-aot');
+  const aotPkg = join(aotDir, 'zz-probe-recompiled');
+  mkdirSync(join(aotPkg, 'Windows-x86-64'), { recursive: true });
+  writeFileSync(join(aotPkg, 'extension.xml'), extensionXml('com.example.probe'));
+  writeFileSync(join(aotPkg, 'Windows-x86-64', 'ProbeANE.dll'), 'recompiled-for-aot');
+  // The name sorts AFTER `Probe.ane`, so only root order can make this win — a
+  // same-root name sort would hand the build the AIR package.
+  const withAot = manifestOf(appXml('<extensions><extensionID>com.example.probe</extensionID></extensions>'));
+  check('a staging tree in ext-aot wins over the AIR package of the same ID in lib/',
+    typeof withAot !== 'string' && JSON.stringify(withAot['ane-paths']) === JSON.stringify(['ext-aot/zz-probe-recompiled']));
+  unpack(aotDir, 'com.example.other');
+  const mixAot = manifestOf(appXml('<extensions><extensionID>com.example.probe</extensionID><extensionID>com.example.other</extensionID></extensions>'));
+  check('...while an ID ext-aot does not hold still comes from lib/, not from nowhere',
+    typeof mixAot !== 'string' &&
+    JSON.stringify(mixAot['ane-paths']) === JSON.stringify(['ext-aot/zz-probe-recompiled', 'ext-aot/com.example.other.ane']));
+
+  // --extdir replaces the defaults outright rather than adding to them: a project
+  // that keeps its packages elsewhere says so once, and a stale lib/ must not then
+  // still be consulted.
+  const elsewhere = join(d, 'elsewhere');
+  mkdirSync(elsewhere, { recursive: true });
+  writeFileSync(join(elsewhere, 'Probe.ane'), probeAneZip());
+  const byExtdir = manifestOf(appXml('<extensions><extensionID>com.example.probe</extensionID></extensions>'), [elsewhere]);
+  check('--extdir is where the package is looked for',
+    typeof byExtdir !== 'string' &&
+    String((byExtdir['ane-paths'] as string[])[0]).includes('elsewhere') &&
+    !String((byExtdir['ane-paths'] as string[])[0]).startsWith('lib/'));
+  const extdirButNoExts = manifestOf(appXml(''), [elsewhere]);
+  check('--extdir with a descriptor that declares no <extensions> is refused, not ignored',
+    typeof extdirButNoExts === 'string' && extdirButNoExts.includes('declares no <extensions>'));
+
+  // The ID list is the descriptor's, so the ORDER is too: the emitted as_ane_descs[]
+  // table is built from this array, and a root-scan order would reorder an app's
+  // extensions whenever a filename changed.
+  writeFileSync(join(appDir, 'lib', 'Zzz.ane'), probeAneZip());
+  const orderXml = appXml('<extensions><extensionID>com.example.other</extensionID><extensionID>com.example.probe</extensionID></extensions>');
+  const ordered = manifestOf(orderXml, [rootB, join(appDir, 'lib')]);
+  check('ane-paths follows descriptor order, not the scan order',
+    typeof ordered !== 'string' &&
+    String((ordered['ane-paths'] as string[])[0]).includes('com.example.other') &&
+    String((ordered['ane-paths'] as string[])[1]).includes('com.example.probe'));
+
+  // (d) Structural: everything above calls the adapter with an explicit --extdir
+  //     list, so none of it would notice the CLI never handing one over, or
+  //     accepting --extdir where it means nothing (--extdir names where a
+  //     DESCRIPTOR's <extensions> packages live; without --air-app there is no
+  //     descriptor, and accepting it would look honoured while contributing
+  //     nothing).
+  const indexSource = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
+  const callSite = /prepareAirApp\([^;]*?\);/s.exec(indexSource)?.[0] ?? '';
+  check('the CLI hands the --extdir list to the adapter', callSite.includes('opts.extDirs'));
+  // Behavioural, not a grep: the guard's own message survives any change to the
+  // condition in front of it, so only running the CLI can tell whether the flag is
+  // actually refused without --air-app. It fires in argument parsing — before any
+  // input is read — so the input path below never has to be buildable.
+  const cli = spawnSync(process.execPath,
+    [join(root, 'src', 'index.ts'), join(root, 'examples', 'ane', 'driver.as'), '--extdir', elsewhere, '-o', join(d, 'cli-probe.exe')],
+    { cwd: root, encoding: 'utf8', timeout: 60000 });
+  const cliText = String(cli.stdout ?? '') + String(cli.stderr ?? '');
+  check('--extdir without --air-app exits non-zero', cli.status !== 0);
+  check('...naming where it does apply and what to use instead',
+    cliText.includes('--extdir only applies to --air-app') && cliText.includes('--ane <package>'));
+
+  console.log(`     [airext] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: air-app/Extensions', checkAirAppExtensions);
+
+// --- the Windows OFFSCREEN link set (阶段一百八十四) ----------------------------
+// A `<visible>false</visible>` app has no window, but it is not a smaller build:
+// `skia_glue.cc` is compiled into EVERY native app, and the GDI font manager it
+// registers is reached by `SkFontMgr::Factory()` before any pixel is drawn --
+// CreateCompatibleDC / ExtTextOutW / GetGlyphOutlineW / GetFontUnicodeRanges
+// (18 unresolved symbols, measured) live in gdi32, `SystemParametersInfoA` in
+// user32, and the COM/registry calls behind the GDI fallback in ole32/advapi32.
+// Those four sat in the `visible` branch, so the offscreen build failed to LINK on
+// Windows while its macOS twin -- which reaches GDI nowhere and resolves the whole
+// font stack through CoreText -- linked fine. No macOS CI run could see it, so the
+// pin drives `airManifest` with `process.platform` faked, which is the only way to
+// exercise the Windows branch from either host (the same lever build/VendorLayout
+// uses, and the reason both defects were reachable only by running the real
+// pipeline with the platform faked).
+function checkAirAppOffscreenLinkSet(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [offscreen] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [offscreen] ${label}`); }
+  };
+  // visible=false, resizable/highDpi inert, no Stage3D, no fonts, no networking,
+  // no audio, x64. Every argument is explicit so the assertion set below is the
+  // whole manifest rather than a slice of it.
+  const realPlatform = process.platform;
+  const offscreen = (platform: string, arch: string): Record<string, unknown> => {
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    try {
+      return airManifest('vendor', false, true, false, false, 'auto', false, false,
+        [], [], [], [], false, false, arch) as Record<string, unknown>;
+    } finally {
+      Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+    }
+  };
+  const win = offscreen('win32', '64');
+  const winLibs = win['link-libs'] as string[];
+  const winSrc = win['sources'] as string[];
+  const winDef = win['defines'] as string[];
+  check('offscreen is still a Skia build (the rasterizer, not a window)',
+    winSrc.indexOf('vendor/skia_glue.cc') >= 0 && winDef.indexOf('ASC_USE_SKIA=1') >= 0);
+  check('...with no window and no GPU window backend compiled in',
+    winDef.indexOf('ASC_USE_WINDOW=1') < 0 && winSrc.indexOf('vendor/window_glue.cc') < 0
+    && winDef.indexOf('ASC_RENDER_WINGPU=1') < 0);
+  check('...and it still links skia_glue.cc\'s GDI font manager (gdi32/user32)',
+    winLibs.indexOf('gdi32') >= 0 && winLibs.indexOf('user32') >= 0);
+  check('...plus the COM/registry entry points behind the GDI fallback',
+    winLibs.indexOf('ole32') >= 0 && winLibs.indexOf('advapi32') >= 0);
+  check('...and the Uniscribe shaper it shapes text with', winLibs.indexOf('usp10') >= 0);
+  check('...and the Windows zlib our generated C calls, with no transport',
+    winLibs.indexOf('z') >= 0 && winDef.indexOf('ASC_HAVE_CURL=1') < 0);
+  // The window-only half must NOT be dragged in: a headless build that links SDL2
+  // is a headless build that lied (and on Windows SDL2-static pulls a second,
+  // unrequested Win32 import set).
+  check('...and none of the window-only link set (SDL2/window/D3D)',
+    ['SDL2', 'winmm', 'imm32', 'oleaut32', 'version', 'uuid', 'setupapi', 'shell32',
+     'dinput8', 'd3d12', 'dxgi', 'd3dcompiler', 'd3d12allocator', 'curl', 'nghttp2']
+      .every((l) => winLibs.indexOf(l) < 0));
+  // The macOS twin: same shape, and GDI is not merely unused but absent -- a
+  // `user32` here would be an lld-link "ignoring unknown argument" warning away
+  // from a silent no-op.
+  const mac = offscreen('darwin', '64');
+  const macLibs = mac['link-libs'] as string[];
+  check('the macOS offscreen build keeps its CoreText/CoreGraphics frameworks',
+    (mac['frameworks'] as string[]).indexOf('CoreText') >= 0);
+  check('...and carries none of the Windows system import libs',
+    macLibs.indexOf('gdi32') < 0 && macLibs.indexOf('user32') < 0 && macLibs.indexOf('usp10') < 0);
+  check('the platform fake was undone', process.platform === realPlatform);
+  console.log(`     [offscreen] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: air-app/OffscreenLinkSet', checkAirAppOffscreenLinkSet);
 // --- vendor/skia 本地补丁的出处守卫（阶段一百六十七）------------------------
 // The macOS arm64 libskia.a we ship is NOT the upstream prebuilt: it is compiled
 // from build-tools/skia-src with the patch below applied. Nothing in this repo can
@@ -769,3 +1948,137 @@ function checkSkiaLocalPatch(): string[] {
 }
 
 registerGroup('unit: build/SkiaLocalPatch', checkSkiaLocalPatch);
+
+// ---- vendor layout: one path rule for every package (阶段一百八十) ----
+// The vendor tree had exactly one exception: SDL2 kept its archives AND headers in
+// `<pkg>/<platform>/{lib,include}`, and its macOS key was the bare, OS-less `arm64`,
+// while Skia and curl were `<pkg>/lib/<platform>`. The asymmetry is invisible until
+// someone builds on the other host — a stale path fails to link on ONE platform, on
+// the machine of whoever pulls next — so it is pinned three ways: the tree on disk,
+// the manifest `--air-app` emits (on both hosts), and every checked-in manifest.
+//
+// The rule a package must satisfy: its direct children are KIND directories, and a
+// platform key only ever appears UNDER a kind — `lib/<platform>/`, or
+// `include/<platform>/` when the headers are generated per platform (only SDL2:
+// SDL_config.h names the host's subsystems, while Skia's and curl's headers are
+// byte-identical across platforms, where a second copy could only drift).
+function checkVendorLayout(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log('PASS  [vendorl] ' + label); }
+    else { bad.push(label); console.log('FAIL  [vendorl] ' + label); }
+  };
+  const KINDS = ['lib', 'include', 'licenses', 'bin', 'share'];
+  // True when a path mentions the package but does not go through a kind dir,
+  // i.e. the retired `vendor/sdl2/<platform>/…` shape. String surgery rather than
+  // a regex so the pin reads the same as the rule it encodes.
+  const retired = (p: string): boolean => {
+    const at = p.indexOf('vendor/sdl2/');
+    if (at < 0) return false;
+    const first = p.slice(at + 'vendor/sdl2/'.length).split('/')[0];
+    return KINDS.indexOf(first) < 0;
+  };
+
+  const sdl2 = join(root, 'vendor', 'sdl2');
+  const top = readdirSync(sdl2, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  check('vendor/sdl2 holds only kind directories, no platform one', top.every((e) => KINDS.indexOf(e) >= 0));
+  const platforms = existsSync(join(sdl2, 'lib'))
+    ? readdirSync(join(sdl2, 'lib'), { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)
+    : [];
+  check('vendor/sdl2 still vendors at least one platform', platforms.length > 0);
+  check('platform keys carry their OS prefix (never a bare "arm64")',
+    platforms.every((p) => p.indexOf('windows-') === 0 || p.indexOf('macos-') === 0));
+  check('every vendored platform has BOTH a lib/ and an include/ directory',
+    platforms.every((p) => existsSync(join(sdl2, 'lib', p)) && existsSync(join(sdl2, 'include', p))));
+  // Not vacuous: the archives and headers are really where the rule says.
+  const archives = ['SDL2.lib', 'SDL2-static.lib', 'libSDL2.a', 'libSDL2main.a'];
+  check('an SDL2 archive really sits in lib/<platform>/',
+    platforms.some((p) => readdirSync(join(sdl2, 'lib', p)).some((f) => archives.indexOf(f) >= 0)));
+  check('and its headers really sit in include/<platform>/SDL2/',
+    platforms.every((p) => existsSync(join(sdl2, 'include', p, 'SDL2', 'SDL.h'))));
+  check('the license is shared, not per platform',
+    existsSync(join(sdl2, 'licenses', 'SDL2', 'LICENSE.txt')));
+
+  // `--air-app` is the only consumer of these paths and it derives the platform key
+  // from `process.platform`, so the key is faked to check BOTH hosts from one
+  // machine: the key is precisely what used to differ, and leaving macOS unchecked
+  // would pin nothing on a Windows box (and vice versa).
+  const realPlatform = process.platform;
+  const nativePaths = (arch: string): string[] => {
+    const m = airManifest('vendor', true, true, true, false, 'auto', false, true,
+      [], [], [], [], true, false, arch) as Record<string, unknown>;
+    return [...(m['include-paths'] as string[]), ...(m['link-paths'] as string[])];
+  };
+  // The same call with `usesNetworking = false`, returning the INCLUDE list alone.
+  // src/runtime.ts `#include <zlib.h>`s in EVERY native build, and on Windows
+  // neither that header nor the unprefixed `z` exists outside curl's dependency
+  // stack (`vendor/build-windows-deps.ps1` builds both into curl/); macOS reaches
+  // the system <zlib.h> and needs neither. So on Windows the include dir belongs to
+  // the build, not to the transport -- emitting only the `-L` (what this did until
+  // 阶段一百八十四) left every non-networking Windows app failing at
+  // `#include <zlib.h>` while the arm64 macOS CI runner, whose system header serves
+  // it, stayed green.
+  const nonNetIncludes = (arch: string): string[] => {
+    const m = airManifest('vendor', true, true, true, false, 'auto', false, true,
+      [], [], [], [], false, false, arch) as Record<string, unknown>;
+    return m['include-paths'] as string[];
+  };
+  const expectHost = (host: string, platform: string, key: (arch: string) => string): void => {
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    try {
+      for (const arch of ['64', '32']) {
+        const k = key(arch);
+        const p = nativePaths(arch);
+        const tag = host + ' arch=' + arch;
+        check(tag + ': SDL2 archives resolve under lib/<platform>', p.indexOf('vendor/sdl2/lib/' + k) >= 0);
+        check(tag + ': SDL2 headers resolve under include/<platform>', p.indexOf('vendor/sdl2/include/' + k) >= 0);
+        check(tag + ': Skia and curl use the same lib/<platform> shape',
+          p.indexOf('vendor/skia/lib/' + k) >= 0 && p.indexOf('vendor/curl/lib/' + k) >= 0);
+        check(tag + ': no retired <pkg>/<platform>/ path remains', !p.some(retired));
+        // curl's lib dir is wanted for two INDEPENDENT reasons on Windows (the
+        // standard zlib our generated C calls, and the network transport); the
+        // emitted lists are sets, so it must appear once.
+        check(tag + ': the path lists carry no duplicate entry', new Set(p).size === p.length);
+        // The zlib half of the curl tree follows the HEADER, not the transport: on
+        // Windows it is wanted with the network switched off (see nonNetIncludes),
+        // and on macOS it must NOT be there -- pushing it would link the vendored
+        // curl headers ahead of the system ones for an app that never asked for
+        // curl, i.e. an unrequested toolchain swap.
+        const inc = nonNetIncludes(arch);
+        check(tag + ': the zlib include dir follows the header, not the transport',
+          host === 'windows' ? inc.indexOf('vendor/curl/include') >= 0 : inc.indexOf('vendor/curl/include') < 0);
+      }
+    } finally {
+      Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+    }
+  };
+  expectHost('windows', 'win32', (a) => 'windows-' + (a === '32' ? 'x86' : 'x64'));
+  expectHost('macos', 'darwin', () => 'macos-arm64');
+  check('the platform fake was undone', process.platform === realPlatform);
+
+  // Checked-in manifests — hand-written examples and `--air-app` snapshots alike.
+  const manifests: string[] = [];
+  const walk = (d: string): void => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory()) { if (e.name !== 'node_modules') walk(join(d, e.name)); }
+      else if (e.name.indexOf('.build.') >= 0 && e.name.endsWith('.json')) manifests.push(join(d, e.name));
+    }
+  };
+  walk(join(root, 'examples'));
+  const offenders: string[] = [];
+  const re = new RegExp('vendor/sdl2/([A-Za-z0-9_.-]+)', 'g');
+  for (const f of manifests) {
+    const text = readFileSync(f, 'utf8');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      if (KINDS.indexOf(m[1]) < 0) offenders.push(f.slice(root.length + 1) + ' -> ' + m[1]);
+    }
+  }
+  check('all ' + manifests.length + ' example manifests use the kind-directory shape', offenders.length === 0);
+  if (offenders.length > 0) console.log('  ' + offenders.join('\n  '));
+  console.log('[vendorl] ' + ok + ' vendor-layout checks passed');
+  return bad;
+}
+
+registerGroup('unit: build/VendorLayout', checkVendorLayout);

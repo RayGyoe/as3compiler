@@ -5,6 +5,8 @@
 // compile helper, or a fixed desktop-native value. `version` is a fixed AIR-compatible
 // "<platform-prefix> 50,0,0,0" (the AS-AOT marker lives in `manufacturer`). screen size
 // is 0 in headless builds (no SDL2 window backend) and the real display otherwise.
+// `os` is a family name, plus a version on the platforms where AIR's own table has been
+// reproduced (Windows today): apps read the version back out of the string.
 // Deferred (platform/backend dependent): languages, serverString, hasMP3/hasTLS/
 // hasVideoEncoder, maxLevelIDC, hasAccessibility/hasIME, and hasMultiChannelAudio.
 
@@ -17,8 +19,21 @@ check(v.charAt(3) == " ", "version has platform prefix + space at index 3: " + v
 check(v.indexOf(",") > 0, "version has comma-separated fields: " + v);
 check(parseInt(v.substr(4).split(",").shift()) >= 19, "version major >= 19: " + v);
 
-// --- os / cpuArchitecture: conditional-compile constants ---
-check(Capabilities.os != null && Capabilities.os.length > 0, "os non-empty");
+// --- os: family name, plus a version where AIR's table is reproduced (Windows) ---
+var os:String = Capabilities.os;
+check(os != null && os.length > 0, "os non-empty");
+// AIR reports "family + version" ("Windows 11", "Windows Server 2012 R2"), and apps do
+// rely on the version being there: Capabilities.os.split(" ")[1] feeds a device-info
+// field, and the whole string is hashed into a device fingerprint. A bare family name is
+// therefore a behavioural regression, not a cosmetic one. Windows is the platform whose
+// table is recovered from AIR (see src/runtime.ts's as_win_os_name); macOS/Linux/WASI
+// still report the bare family name, so the assertion is Windows-only.
+if (os.indexOf("Windows") > -1) {
+  check(os.indexOf("Windows ") == 0, "windows os starts with the family name: " + os);
+  var osWords:Array = os.split(" ");
+  check(osWords.length >= 2, "windows os splits into family + version: " + os);
+  check(osWords[1] != null && osWords[1].length > 0, "windows os carries a version: " + os);
+}
 check(Capabilities.cpuArchitecture != null && Capabilities.cpuArchitecture.length > 0, "cpuArchitecture non-empty");
 
 // --- cpuAddressSize + derived process-width flags ---

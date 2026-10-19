@@ -7,13 +7,18 @@
 // The generated code only sees the plain-C prototypes in src/runtime.ts.
 //
 // Backend = miniaudio v0.11.25 (public domain / MIT-0), the decision recorded in
-// docs/zh-cn/audio.md §4. It is the ONE implementation that covers native
-// (Core Audio) and web (Web Audio / AudioWorklet) and carries its own decoders
+// docs/zh-cn/audio.md §4. It is the ONE implementation that covers every desktop
+// target -- Core Audio on Apple, WASAPI/DirectSound/WinMM on Windows, Web Audio on
+// emscripten (see as_audio_pick_backends below) -- and carries its own decoders
 // (dr_wav/dr_flac/dr_mp3 are embedded in the single header). Build: add
-// `"sources": ["<vendor>/audio_glue.c"]` + the frameworks miniaudio's CoreAudio
-// backend needs, plus the define ASC_HAVE_AUDIO.
+// `"sources": ["<vendor>/audio_glue.c"]` + the define ASC_HAVE_AUDIO, and on Apple
+// also the two frameworks miniaudio's CoreAudio backend needs. Windows adds
+// NOTHING to the link line: miniaudio reaches its three Windows backends through
+// LoadLibrary/GetProcAddress (measured: a Windows compile of this file has no
+// undefined import beyond kernel32 and the CRT), and `-framework` is not a Windows
+// flag at all. Which hosts wire this in is src/air-app.ts's audioGlueHosts.
 //
-// NOT the vendored SDL2: `vendor/sdl2/arm64/lib/libSDL2.a` contains only
+// NOT the vendored SDL2: `vendor/sdl2/lib/macos-arm64/libSDL2.a` contains only
 // SDL_dummyaudio.o (measured: zero AudioUnit symbols), so SDL_OpenAudioDevice
 // SUCCEEDS and never makes a sound. That silent-success trap is exactly why the
 // backend list below is explicit (see as_audio_pick_backends) and why a build

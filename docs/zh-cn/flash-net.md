@@ -416,9 +416,9 @@ SNI、ALPN、系统根证书库。
 | 目录 | 角色 | 现有内容 |
 |---|---|---|
 | `build-tools/` | **构建输入区**：需要自己重编的**源码 + 工具链**，**不参与运行时链接** | `skia-src/`（完整 Skia 源码，gn+ninja 可重编）、`emsdk/`（Emscripten 工具链） |
-| `as3compiler/vendor/` | **消费区**：**预编译产物**，构建清单 `include-paths`/`link-paths`/`link-libs` 指向此处 | `skia/{include,lib/macos-arm64,lib/wasm}`、`sdl2/arm64/{include,lib}`（静态 `.a`）、各胶水 `.cc/.mm` + `.o` |
+| `as3compiler/vendor/` | **消费区**：**预编译产物**，构建清单 `include-paths`/`link-paths`/`link-libs` 指向此处 | `skia/{include,lib/macos-arm64,lib/wasm}`、`sdl2/{include,lib}/macos-arm64`（静态 `.a`）、各胶水 `.cc/.mm` + `.o` |
 
-即既有范式是「**要重编的源码放 `build-tools/`，编好的静态库落 `vendor/<lib>/<platform>-<arch>/{include,lib}`**」
+即既有范式是「**要重编的源码放 `build-tools/`，编好的静态库落 `vendor/<pkg>/{include,lib}/<platform>`**」
 ——Skia 之所以走这条路，是因为官方预编译包不含 Metal，**必须自己重编**。libcurl 未必如此。
 
 **路线一（首期推荐）：用系统库——零下载、零编译、零 vendor**
@@ -1173,16 +1173,53 @@ AIR 没有这一信息（它总能联网），但丢掉它会让「被 CORS 拦�
 <applicationStorageDirectory>/#SharedObjects/[<描述符 <content>>/][<localPath>/]<编码名>.sol
 ```
 
-- `applicationStorageDirectory` 由描述符 `<id>` 限定：macOS = `~/Library/Application Support/<id>/Local Store`。
+- `applicationStorageDirectory` 由描述符 `<id>` 限定，根目录**逐 OS 抄 `adl`**（阶段一百八十八 实测）：
+  macOS = `~/Library/Application Support/<id>/Local Store`（AIR 3.3+ 路径）、
+  Windows = `%APPDATA%\<id>\Local Store`（即 Roaming；`%APPDATA%` 与 shell 的 `CSIDL_APPDATA` 同一处，
+  缺失时回退到该已知文件夹的文档缺省 `%USERPROFILE%\AppData\Roaming`）、
+  其他 POSIX 宿主 = `~/.as3aot/<id>`（AIR 无对应物可抄，取 `$HOME` 下点目录的惯例）。
   描述符的 id / content 经 `-DASC_APP_ID` / `-DASC_SWF_PATH` 注入生成的 C（`air-app.ts` 自动注入），
   裸构建缺省为 `"as3aot"` / 空（空则省掉 `<content>` 这一层，与 AIR 无 SWF 时同一形状）。
-- **名字编码**：本地存储**每个路径分量上限 31 字节**。文件名 = 名字**末 27 字符** + `.sol`；
-  其余前缀从**尾部**按 **30** 切成目录、每段后缀 `#`。实测：35 字符的
-  `eDoctor_TalkMED_Meeting_Windows_DEV` → `eDoctor_#/TalkMED_Meeting_Windows_DEV.sol`；
-  80 字符 → `<23>#/<30>#/<27>.sol`（`head = prefix > 30 ? (prefix % 30 == 0 ? 30 : prefix % 30) : prefix`）。
-- ⚠️ **§1.5 报明**：名字含 `#`/`:`/空格/`\`/`?` 等字符时 AIR 要么直接 `Error #2134: Cannot create SharedObject`、
-  要么另走 `#XX` 转义 / 哈希目录，**本子集不复现**——这类名字按字面写文件（TalkMED 的共享对象名仅含
-  `[A-Za-z_]`，不受影响）。
+- **文件名 = 名字 + `.sol`；名字本身是一条相对路径**（阶段一百九十四 实测修正；探测台 `temp/sotor` 的
+  `So5..SoE`，逐格回放见 `temp/sorow/lpcell.as`，与 adl 的 **55/55 格完全一致**）。规则三步：① 去掉
+  **一个**前导 `/`，再去掉**一个**前导 `./`；② 剩下的部分**若仍含 `/`**，在**第一段**前加 `#`；③ 末尾接 `.sol`。
+  实测样例：`x/y`→`#x/y.sol`、`x/y/z`→`#x/y/z.sol`、`x/`→`#x/.sol`、`trail/`→`#trail/.sol`、`/x`→`x.sol`、
+  `./x`→`x.sol`、`.`→`..sol`、`a/..`→`#a/...sol`；单段名就只是 `<名字>.sol` 逐字（35 字符的
+  `eDoctor_TalkMED_Meeting_Windows_DEV` 即 `eDoctor_TalkMED_Meeting_Windows_DEV.sol`）。**不折叠长名**：
+  `adl 51.4.1`（Windows 11）实测 32 / 35 / 40 / 60 / 80 / 120 / 138 / 150 / 160 / 166 / 168 / 170 / 172 字符的
+  名字**全部**落成 `<名字>.sol`，52 字符的 `<content>` 分量也逐字当目录名。**AIR 唯一做的编码是操作系统路径
+  极限处的兜底**：绝对路径 255 字符时仍逐字、263 字符时变成 `##<16 位十六进制>/<8 位序号>.sol` —— 这条
+  **本子集不复现**（见下）。
+  > 更正（阶段一百八十八）：本文件此前记的是「每个路径分量上限 31 字节：文件取**末 27 字符**、其余前缀
+  > 从尾部按 30 折叠成后缀 `#` 的目录」。该规则在本机 `adl` 上**不复现**（探测台 `temp/sotor` 的
+  > `SoProbe`/`So3`/`SO2`/`SO3`），且它会让 AOT 与 AIR 对**同一个**共享对象各写一份文件 —— 正是 D11 的症状。
+- 名字**可以含 `/`**（AIR 文档的例子是 `getLocal("work/addresses")`）⇒ 写盘前先建父目录。
+- **名字的拒绝集是实测的那一组，不是文档那一组**（`temp/sotor/So7/SoB/SoC`）：每个 **C0 控制字符**
+  （含 TAB/LF/CR）与**空格**，以及 `"` `#` `&` `'` `,` `:` `;` `<` `>` `?` `\` `~`，一律由 `getLocal`
+  当场抛 `Error #2134: Cannot create SharedObject.`（抛的是 `Error`，不是 flush 期的事）。文档里常见的
+  列表**是错的**：`%`、`.` 与 `0x7F` 其实**被接受**，而**空格文档里没写**。`*` 与 `|` 不在集合里：
+  adl 让它们通过 `getLocal`、只在 `flush()` 抛 `Error #2130`（Windows 文件名非法；macOS 会照收）
+  ⇒ 本子集**刻意不拒**这两个，保持跨平台一致。空名字 `""` 也是 `#2134`；名字为 `null` 则是
+  `Error #2007: Parameter name must be non-null.`（同一个抛出点）。名字里还有两种形状被拒：
+  **非末段出现空分量**（`x//y`、`//x`）与**首段是 `..`**（`../up`）⇒ `#2134`；末段留空（`x/`）合法。
+- **`localPath` 替换 `<content>` 那一层，且必须是它的分量前缀**（阶段一百九十四 对齐；此前是「拼在
+  `<content>` 之下且从不抛错」）。规则：去掉**一个**前导与**一个**尾随 `/` 后，余下部分必须**没有空分量**、
+  且是 `ASC_SWF_PATH` 的**分量前缀**（相等也算），空（`/`）表示「不要这一层」。实测（内容
+  `assets/So6.swf`）：`null` → `<content>` 层；`"/"` → `#SharedObjects/<名字>.sol`（根层，**上跳一层**）；
+  `"assets"` / `"assets/"` → `#SharedObjects/assets/`；`"/assets/So6.swf"` / `"assets/So6.swf"` → 内容目录。
+  **空串 `""` 与 `null` 不是一回事**：`""` 抛 `Error #2134`（`temp/sotor/SoD` 的 p7 vs p8）。
+  `"./assets"`、`"/assets/sub"`、`"//assets//"`、`"/assets/../assets"` 一律 `#2134`（把目录建出来也一样抛）。
+  **裸构建放宽**（本子集特有，§1.5 报明）：没有描述符、`ASC_SWF_PATH` 为空时没有 `<content>` 可比，
+  于是**逐字采用** `localPath` 并只做上面那些形状检查（否则 `examples/sharedobject.as` 这类裸构建用不了 `"/"`）。
+- ⚠️ **§1.5 报明（三条仍未对齐的边界）**：① 名字含非 ASCII 时 adl 会把非 ASCII 字节**十六进制转义**进
+  文件名（`has中wen` → `hasE#4B#8A#Dwen.sol`；4 个样本，规律是把 UTF-8 字节按「奇数下标前插 `#`」输出），
+  本子集按字面写名字，Windows 的窄字符 `fopen` 还会把它转成 GBK（`has涓瓀en.sol`）；② 绝对路径越过
+  操作系统极限时 AIR 退到 `##<16 位十六进制>/<8 位序号>.sol` 哈希目录（本子集仍按字面写，路径过长时由
+  操作系统自己报错）；③ `SharedObject.name`（AIR 的只读属性）**尚未实现**，取它会报未定义字段。
+  三条均已登记在 `TODO.md` 的「遗留待开发」。
+- ⚠️ **升级说明（Windows）**：根目录改到 `%APPDATA%\<id>\Local Store` 之后，旧版写在 `<home>\.as3aot\<id>` 树里的
+  存档**不再被读取**（两棵树互不可见，与 macOS 改 3.3 命名空间时同一现象）。要保留旧会话，把旧树里的 `.sol`
+  按**逐字名字**（注意日期版曾把长名字折叠成 `#` 目录）拷到新树同一相对路径即可 —— 容器格式两端相同。
 
 **字节格式**（12+ 个真 `.sol` / 7 种值类型实测）：
 

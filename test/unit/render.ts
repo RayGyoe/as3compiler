@@ -300,11 +300,31 @@ function checkBakeResolution(): string[] {
     (emitted.match(/as_bake_scale2\(canvas, /g) ?? []).length === 1 &&
     !emitted.includes('double sc = ASC_render_scale;'));
   check('the bake blits back 1:1 in device pixels',
-    emitted.includes('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bl, bt, (double)pw / sx, (double)ph / sy);') &&
+    emitted.includes('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bxo, byo, (double)pw / sx, (double)ph / sy);') &&
     emitted.includes('as_skia_canvas_scale(c2, sx, sy);') &&
     // as_bake_scale (max-of-axes) survives for the ONLY caller whose rect is
     // computed in logical units by itself: the 9-slice path.
     (emitted.match(/double sc = as_bake_scale\(canvas, /g) ?? []).length === 1);
+  // (1b) The bake's ORIGIN is snapped down to the destination canvas' device pixel
+  // grid. The blit is a whole-image drawImageRect under the default sampling options
+  // (nearest), so a surface anchored on a half device pixel has the entire image
+  // rounded to an integer pixel while its content was rasterized against the
+  // unrounded origin: the bake then lands up to one device pixel away from the live
+  // rendering of the same subtree. Because a fingerprint change drops the bake for
+  // ASC_AUTO_BAKE_FRAMES frames, every roll-over/press/edit popped the content by
+  // that pixel and popped it back -- measured on the host app's home card
+  // (temp/hover/, window-layer capture): the roll-over rendered the card's title band
+  // as an exact 1 px translation of itself (residual 0.00 at (dx,dy)=(1,1)) for
+  // exactly 3 frames, and with ASC_NO_AUTO_BAKE=1 the same sweep showed no offset at
+  // all. On the grid the blit is a 1:1 copy with nothing left to round.
+  check('the bake origin is snapped to the destination device pixel grid',
+    emitted.includes('double bxo = bl, byo = bt;') &&
+    emitted.includes('{ double tx = 0.0, ty = 0.0; as_skia_canvas_total_scale(canvas, &tx, &ty); if (tx > 0.0 && ty > 0.0) { bxo = floor(bl * tx) / tx; byo = floor(bt * ty) / ty; } }') &&
+    emitted.includes('int lw = (int)ceil(br - bxo); int lh = (int)ceil(bb - byo);') &&
+    // the snapped origin feeds BOTH the surface transform and the blit rect (same
+    // call site, so the two can never drift apart again)
+    emitted.includes("as_skia_canvas_scale(c2, sx, sy);\nas_skia_canvas_translate(c2, -bxo, -byo);") &&
+    !emitted.includes('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bl, bt,'));
   check('the bake scale is capped in ratio and in pixels',
     emitted.includes('#define AS_BAKE_MAX_PIXELS 4000000.0') &&
     (emitted.match(/double cap = 4\.0 \* ASC_render_scale; if \(cap < 1\.0\) cap = 1\.0;/g) ?? []).length === 2 &&
@@ -802,6 +822,7 @@ function checkSwcJpeg3Alpha(): string[] {
       [10, { id: 10, kind: 'sprite', tag: 39 }],
     ]),
     scripts: new Map(),
+    bases: new Map(),
   };
   const fillInputs = swcCompileInputs(fillLib);
   const fillBake = swcBakePlan(fillLib, fillInputs.specs, fillInputs.chars);
@@ -1137,6 +1158,57 @@ function checkDrawComposite(): string[] {
   return bad;
 }
 
+// ---- Frame-start canvas hygiene (the "window grows after a while" bug) ----
+//
+// The window pass is save() -> scale(w->scale) -> ... -> restore() on a canvas that
+// OUTLIVES the frame (the cached GPU back-buffer canvas). An AS3 exception thrown while
+// the frame is being composed unwinds through the renderer with longjmp, so that
+// restore() never runs and the leaked save+scale stay on the canvas. The next frame then
+// scales an already-scaled canvas, and the damage COMPOUNDS: measured on the real app
+// 1.0 -> 1.5 -> 2.25 -> 3.375 device scale, which is exactly the user-visible symptom
+// (the whole window, its HUD and its SWC skin all render 2.25x too big, then grow again).
+// Resetting at the frame entry makes every frame independent of the previous one; restores
+// are balanced within a frame, so on a clean frame it is a no-op. The ORDER is the whole
+// point -- a reset after the scale(w->scale) would throw the device scale away.
+function checkFrameCanvasHygiene(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [canvasreset] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [canvasreset] ${label}`); }
+  };
+  const c = generateC(parse('var n:int = 1;\n')).c;
+  const head = 'static void ASC_window_render(int id) {';
+  const at = c.indexOf(head);
+  check('the window pass is emitted', at >= 0);
+  const body = at >= 0 ? c.slice(at, c.indexOf('\n}', at)) : '';
+  const call = 'as_skia_canvas_reset(canvas);';
+  const clear = 'as_skia_canvas_clear(canvas, st->stage_color);';
+  const save = 'as_skia_canvas_save(canvas);';
+  const scale = 'as_skia_canvas_scale(canvas, w->scale, w->scale);';
+  check('the frame entry drops any pending save and resets the base matrix', body.includes(call));
+  check('...and does so before this frame\'s own save()',
+    body.indexOf(call) >= 0 && body.indexOf(save) >= 0 && body.indexOf(call) < body.indexOf(save));
+  check('...before the device scale, so the reset cannot undo it',
+    body.indexOf(call) >= 0 && body.indexOf(scale) >= 0 && body.indexOf(call) < body.indexOf(scale));
+  check('...and before the stage-colour clear of the same pass',
+    body.indexOf(call) >= 0 && body.indexOf(clear) >= 0 && body.indexOf(call) < body.indexOf(clear));
+  check('the reset is emitted once per frame, not per object', c.split(call).length - 1 === 1);
+  check('the preamble declares the glue entry point',
+    RUNTIME_PREAMBLE.includes('extern void sk_canvas_reset(void* canvas);'));
+  check('the preamble wraps it for the emitted code',
+    RUNTIME_PREAMBLE.includes('static inline void as_skia_canvas_reset(void* c) { sk_canvas_reset(c); }'));
+  check('a build without a canvas API still compiles (no-op stub)',
+    RUNTIME_PREAMBLE.includes('static inline void as_skia_canvas_reset(void* c) { (void)c; }'));
+  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  check('sk_canvas_reset drops every pending save and clears the matrix',
+    glue.includes('c->restoreToCount(1);') && glue.includes('c->resetMatrix();'));
+  check('...and refuses a NULL canvas instead of dereferencing it',
+    /void sk_canvas_reset\(void\* canvas\) \{[^}]*if \(c == nullptr\) return;/.test(glue));
+
+  console.log(`[canvasreset] ${ok} frame-canvas hygiene checks passed`);
+  return bad;
+}
 registerGroup('unit: render/DrawComposite', checkDrawComposite);
 registerGroup('unit: render/ScrollRectWindow', checkScrollRectWindow);
 registerGroup('unit: render/ScrollRectBake', checkScrollRectBakeInvalidation);
@@ -1151,3 +1223,184 @@ registerGroup('unit: render/SwcTimeline', checkSwcTimeline);
 registerGroup('unit: render/SwcJpeg3Alpha', checkSwcJpeg3Alpha);
 registerGroup('unit: render/AirAppFonts', checkAirAppFonts);
 registerGroup('unit: render/SkiaAbi', checkSkiaAbi);
+registerGroup('unit: render/FrameCanvasHygiene', checkFrameCanvasHygiene);
+
+// ---- SWC symbol classes bound to a PROJECT base class (阶段一百九十一) ---------
+//
+// A code library can export a symbol whose Flash class extends one of the LIBRARY's
+// own widget classes — and when the project compiles that same class from source, the
+// behaviour belongs to the project (`AIAsrComBox` extends
+// `com.example.controls.ComBoBox`, and the app's own `ComBoBox.as` is that class).
+// Before this stage the synthesized class was always a `MovieClip`/`SimpleButton`
+// subclass, so the symbol rendered but its widget never ran. These pins hold the whole
+// chain: the superclass is read out of the DoABC, carried through the library, used as
+// the class's base, and that class's source is seeded into the reachability closure.
+function checkSwcBaseClass(): string[] {
+  const bad: string[] = [];
+  const ck = (ok: boolean, msg: string): void => { if (!ok) bad.push(msg); };
+  const readSrc = (rel: string): string => readFileSync(join(root, 'src', rel), 'utf8');
+  const abc = readSrc('abc.ts');
+  const swc = readSrc('swc.ts');
+  const index = readSrc('index.ts');
+  const reach = readSrc('reach.ts');
+  const rt = readSrc('runtime.ts');
+  const emit = readSrc('emit.ts');
+
+  // --- what the ABC tells us about a symbol class: its base AND its dynamic trait ---
+  ck(/const base = mnAt\(r\.u30\(\)\);/.test(abc) && /baseNames\.push\(/.test(abc) &&
+    /superName: baseNames\[i\],/.test(abc),
+    "abc.ts reads each instance's super multiname instead of discarding it");
+  ck(/const flags = r\.u8\(\);\s+instanceFlags\.push\(flags\);/.test(abc) &&
+    /flags: instanceFlags\[i\],/.test(abc),
+    '...and keeps the InstanceInfo flags byte, which is what AVM2 derives `dynamic` from');
+  ck(/if \(\(flags & 0x08\) !== 0\) r\.u30\(\);/.test(abc),
+    'the protectedNs index stays consumed -- it is not the sealed bit (skin.swc uses both 0x08 and 0x09)');
+  ck(/interface AbcSymbolBase \{/.test(abc) && /baseName: string;/.test(abc) && /dynamic: boolean;/.test(abc),
+    'AbcSymbolBase carries both the superclass name and the dynamic trait');
+  ck(/if \(onBase\) onBase\(\{ baseName: inst\.superName, dynamic: \(inst\.flags & 0x05\) === 0 \}\);/.test(abc),
+    'a class with neither the sealed nor the interface bit is dynamic (AVM2 rule, not an inference)');
+  ck(/function decodeSymbolClass\(abc: Buffer, className: string, onBase\?: \(base: AbcSymbolBase\) => void\)/.test(abc),
+    '...reported even when the scripts themselves cannot be decoded');
+  ck(/bases: Map<number, AbcSymbolBase> \}/.test(abc) && /const bases = new Map<number, AbcSymbolBase>\(\);/.test(abc),
+    'decodeSymbolScripts returns those bases keyed by character id');
+  ck(/bases: Map<number, AbcSymbolBase>;/.test(swc) && /scripts: scriptsDecoded, bases: scriptBases,/.test(swc),
+    'swc.ts carries them on the extracted library');
+
+  // --- binding the symbol to a project base class (the stage-191 fix) ---
+  ck(/const baseName = lib\.bases\.get\(charId\) \?\? \{ baseName: '', dynamic: false \};/.test(swc) &&
+    /swcDisplayClassDecl\(name, pkg, kind, script, baseName\.baseName, baseName\.dynamic\)/.test(swc),
+    'the character binding reports each symbol class its base AND its dynamic trait');
+  ck(/const projectBase = baseName\.length > 0 && !baseName\.startsWith\('flash\.display\.'\) \? baseName : '';/.test(swc),
+    'a base the project compiles from source outranks the stock artwork superclass');
+  ck(/superClass: projectBase\.length > 0 \? splitFqn\(projectBase\)\.name : builtin,/.test(swc),
+    '...and becomes the synthesized class superclass (short name, as a source `extends` clause)');
+  ck(/projectBase\.length > 0 \? projectBase : builtin,/.test(swc),
+    '...with the fully-qualified name in the import list, which is how the semantic layer resolves it');
+
+  // --- the stage-192 fix: reproduce the ABC's own `dynamic`, never inherit it ---
+  //
+  // Inheriting was the trap. Before this, the trait came from the base chain, and the
+  // base was `flash.display.MovieClip` (dynamic) -- so every symbol owned a `_dyn`
+  // table by accident, and the bug stayed invisible until a symbol was bound to a
+  // project widget (a SEALED `Sprite` subclass). A sealed instance has nowhere for the
+  // baker to put the timeline children, so `this["title"]` inside the bound base
+  // raised #1069 (CreateAiSubTitleView sets `selectData` before `addChild`).
+  ck(/isDynamic: dynamic,/.test(swc),
+    'the synthesized class reproduces the ABC dynamic trait instead of inheriting it from the base');
+  const declBody = swc.slice(swc.indexOf('function swcDisplayClassDecl'), swc.indexOf('isDynamic: dynamic,'));
+  ck(/must OWN a dynamic property table/.test(declBody),
+    'the reason is written down next to the field (an own table, not an inherited one)');
+
+  // --- the two halves that actually make `this["title"]` resolve at runtime ---
+  ck(/if \(info\.isDynamic\) this\.line\('as_object\* _dyn;'\)/.test(emit),
+    'a dynamic class gets the `_dyn` slot table in its C struct');
+  ck(/const dynOffset = info\.isDynamic \? `\(int\)offsetof\(\$\{name\}, _dyn\)` : '-1';/.test(emit),
+    '...and a non-negative vtable dyn_offset, which is how as_dyn_get decides it may look there');
+  ck(/static void as_swc_child_name\(void\* parent, const char\* name, void\* child\)/.test(rt) &&
+    /if \(hv->dyn_offset < 0\) return;/.test(rt) && /as_object_set\(dyn, name, as_v_obj\(child\)\);/.test(rt),
+    'the baker registers each named timeline child in exactly that table (and no-ops when sealed)');
+  ck(/as_swc_child_name\(\(void\*\)\(/.test(emit),
+    '...and the emitter calls it for every named placement');
+
+  // Behavioural: build a library in memory. The symbols differ only in the base their
+  // DoABC declares and in the flags byte, so the emitted declarations answer exactly
+  // the question the fix is about.
+  const mkLib = (bases: [number, string, boolean][]): SwcLibrary =>
+    ({
+      source: 'probe.swc',
+      bitmaps: [], shapes: [],
+      sprites: [
+        { id: 230, frames: 1, placements: [], frameStarts: [0], labels: [] },
+        { id: 231, frames: 1, placements: [], frameStarts: [0], labels: [] },
+        { id: 233, frames: 1, placements: [], frameStarts: [0], labels: [] },
+      ],
+      buttons: [{ id: 232, trackAsMenu: false, records: [] }],
+      texts: [], fonts: new Map(), scalingGrids: new Map(),
+      classNames: new Map([[230, 'probeWidget'], [231, 'probeArt'], [232, 'probeBtn'], [233, 'probeSealed']]),
+      characters: new Map([
+        [230, { id: 230, kind: 'sprite', tag: 39 }],
+        [231, { id: 231, kind: 'sprite', tag: 39 }],
+        [232, { id: 232, kind: 'button', tag: 34 }],
+        [233, { id: 233, kind: 'sprite', tag: 39 }],
+      ]),
+      scripts: new Map(),
+      bases: new Map(bases.map(([id, n, d]) => [id, { baseName: n, dynamic: d }])),
+    }) as unknown as SwcLibrary;
+
+  const lib = mkLib([
+    [230, 'com.example.controls.ComBoBox', true],
+    [231, 'flash.display.MovieClip', true],
+    [232, 'flash.display.SimpleButton', true],
+    [233, 'flash.display.MovieClip', false],
+  ]);
+  const inputs = swcCompileInputs(lib);
+  type Decl = { kind: string; name: string; superClass?: string | null; isDynamic?: boolean; imports?: string[] };
+  const declOf = (n: string): Decl | undefined =>
+    (inputs.decls as unknown as Decl[]).find((d) => d.kind === 'ClassDecl' && d.name === n);
+  const widget = declOf('probeWidget');
+  const art = declOf('probeArt');
+  const btn = declOf('probeBtn');
+  const sealed = declOf('probeSealed');
+  ck(widget !== undefined && widget.superClass === 'ComBoBox',
+    'a symbol based on a project class is emitted as a subclass of THAT class');
+  ck(widget !== undefined && (widget.imports ?? []).includes('com.example.controls.ComBoBox'),
+    '...with the base imported so symbol collection resolves it');
+  ck(art !== undefined && art.superClass === 'flash.display.MovieClip',
+    '...while an artwork-only symbol keeps MovieClip (nothing changes for the 194 others)');
+  ck(widget?.isDynamic === true,
+    'the dynamic symbol class stays dynamic even though its project base (a sealed Sprite subclass) is not');
+  ck(btn?.isDynamic === true,
+    'a BUTTON symbol is dynamic too -- SimpleButton is sealed, so inheriting would silently reseal it');
+  ck(sealed?.isDynamic === false,
+    'a symbol whose ABC really is sealed stays sealed (the trait is reproduced, not forced on)');
+  ck(inputs.chars.length === 4 && inputs.chars[0].baseName === 'com.example.controls.ComBoBox',
+    'the emitted character spec carries the base too (the emitter can report on it)');
+  ck(inputs.chars[0].dynamic === true && inputs.chars[3].dynamic === false,
+    '...and the dynamic trait, so the bake can report a sealed symbol loudly');
+
+  // Behavioural, source -> C: the same declarations through the real emitter. The
+  // AST field is not the fix on its own -- the trait has to reach the generated
+  // struct and vtable, which is what as_dyn_get and as_swc_child_name read.
+  const prog = parse(
+    'package com.example.controls {\n' +
+      '  import flash.display.Sprite;\n' +
+      '  public class ComBoBox extends Sprite {\n' +
+      '    public function ComBoBox(maxheight:int = -1) { super(); }\n' +
+      '  }\n' +
+      '}\n' +
+      'var a:probeWidget = new probeWidget();\n' +
+      'var b:probeBtn = new probeBtn();\n' +
+      'var d:probeSealed = new probeSealed();\n',
+  );
+  prog.body.push(...inputs.decls);
+  const c = generateC(prog, [], inputs.specs, swcBakePlan(lib, inputs.specs, inputs.chars)).c;
+  const ctorOf = (n: string): string => {
+    const m = new RegExp(`static void ${n}_ctor\\(${n}\\* o\\) \\{([\\s\\S]*?)\\n\\}`).exec(c);
+    return m ? m[1] : '';
+  };
+  const vtableOf = (n: string): string => {
+    const m = new RegExp(`static ${n}_vtable ${n}_vt = \\{([\\s\\S]*?)\\n\\};`).exec(c);
+    return m ? m[1] : '';
+  };
+  ck(/_dyn = as_object_new\(\)/.test(ctorOf('probeWidget')) &&
+    /com_example_controls_ComBoBox_ctor\(\(com_example_controls_ComBoBox\*\)o, \(-1\)\);/.test(ctorOf('probeWidget')) &&
+    /as_swc_bind\(\(DisplayObject\*\)o, 230\);/.test(ctorOf('probeWidget')),
+    'the bound symbol compiles to a ctor that initialises `_dyn`, runs the project base ctor, then bakes its own artwork');
+  ck(/offsetof\(probeWidget, _dyn\)/.test(vtableOf('probeWidget')) && /"probeWidget", 0, 1, 0,/.test(vtableOf('probeWidget')),
+    '...and its vtable carries a non-negative dyn_offset with isDynamic=1');
+  ck(/offsetof\(probeBtn, _dyn\)/.test(vtableOf('probeBtn')) && /"probeBtn", 0, 1, 0,/.test(vtableOf('probeBtn')),
+    'a button symbol is dynamic too (SimpleButton is sealed, so only the ABC trait can make it so)');
+  ck(/_dyn = as_object_new\(\)/.test(ctorOf('probeSealed')),
+    'a symbol that declares itself sealed but extends the dynamic MovieClip still owns a table -- the inheritance that used to hide this bug');
+
+  ck(/\[\.\.\.cfg\.swcPaths, \.\.\.\(opts\.overrides\.swcPaths \?\? \[\]\)\]/.test(index),
+    '--air-app seeds the closure with those bases, including a CLI-only --swc');
+  ck(/computeReachable\(parsedFiles, air\.mainClass, swcBaseRoots\)/.test(index),
+    '...and passes them to the closure computation');
+  ck(/extraRoots: readonly string\[\] = \[\]/.test(reach) && /for \(const r of extraRoots\)/.test(reach),
+    'reach.ts keeps the extra roots in the kept set');
+  ck(/const swcLibs = new Map<string, SwcLibrary>\(\)/.test(index) && /const lib = swcLib\(libPath\);/.test(index),
+    'each library is parsed once and shared (the closure and the emitter see the same parse)');
+  return bad;
+}
+registerGroup('unit: swc/BaseClassBinding', checkSwcBaseClass);

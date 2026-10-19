@@ -233,6 +233,84 @@ expect(File.applicationStorageDirectory.resolvePath("#SharedObjects/as3aot-examp
        "localPath becomes a subdirectory of #SharedObjects");
 expect(SharedObject.getLocal("lp").data.v == null, "the same name without localPath is a distinct store");
 
+// ---- 5b. the NAME is a path of its own (stage 194) -----------------------
+// AIR writes the FIRST component of a name that holds a slash with a "#"
+// prefix, so getLocal("sp/leaf") is not the store of "leaf" (adl: temp/sotor
+// So9 -- "x/y" -> "#x/y.sol", "x/" -> "#x/.sol", both reproduced here).
+var soSlashed:SharedObject = SharedObject.getLocal("sp/leaf");
+soSlashed.data.v = 1;
+soSlashed.flush();
+expect(solPath("#sp/leaf").exists, "a name with a slash lands under a #-prefixed first component");
+expect(!solPath("sp/leaf").exists, "a name with a slash is not written under the literal name");
+var soTrail:SharedObject = SharedObject.getLocal("trail/");
+soTrail.data.v = 1;
+soTrail.flush();
+expect(solPath("#trail/").exists, "a trailing slash keeps the last component empty (adl: \"#trail/.sol\")");
+// ONE leading "/" and one leading "./" are dropped before the "#" rule.
+var soLead:SharedObject = SharedObject.getLocal("/lead");
+soLead.data.v = 1;
+soLead.flush();
+expect(solPath("lead").exists, "a leading slash is dropped from the name");
+var soDots:SharedObject = SharedObject.getLocal("./dotlead");
+soDots.data.v = 1;
+soDots.flush();
+expect(solPath("dotlead").exists, "...and so is a leading \"./\"");
+var soDot:SharedObject = SharedObject.getLocal(".");
+soDot.data.v = 1;
+soDot.flush();
+expect(solPath(".").exists, "a \".\" name is written verbatim, so the file is \"..sol\"");
+
+// ---- 5c. names AIR rejects: Error #2134, thrown BY getLocal --------------
+// Measured with adl 51.4.1 (temp/sotor So7/SoB/SoC): every C0 control plus
+// space " # & ' , : ; < > ? \ ~. This is NOT the documented set -- "%" and "."
+// are accepted, space is missing from the documentation. "*" and "|" are not in
+// it either: adl fails those at flush() (Error #2130), because they are illegal
+// in a Windows file name, not at getLocal.
+function rejects(name:String):Boolean {
+  try {
+    SharedObject.getLocal(name);
+  } catch (e:Error) {
+    return e.errorID == 2134;
+  }
+  return false;
+}
+expect(rejects(""), "an empty name is #2134");
+expect(rejects("has space"), "a space is #2134 (the documented list omits it)");
+expect(rejects("has#hash"), "a literal # is #2134");
+expect(rejects("has:colon"), "a colon is #2134");
+expect(rejects("has\\bs"), "a backslash is #2134");
+expect(rejects("has~tl"), "a tilde is #2134");
+expect(rejects("s" + String.fromCharCode(9) + "z"), "TAB is #2134");
+expect(rejects("s" + String.fromCharCode(1) + "z"), "an arbitrary C0 control is #2134");
+expect(rejects("m//n"), "an empty inner path component is #2134");
+expect(rejects("//lead"), "a doubled leading slash is #2134");
+expect(rejects("../up"), "a name that resolves out of the layer is #2134");
+expect(!rejects("has%pc") && !rejects("has.dot") && !rejects("has*star"),
+       "\"%\", \".\" and \"*\" are accepted -- adl fails \"*\" at flush, not at getLocal");
+
+// ---- 5d. localPath: null vs "" vs the layer -----------------------------
+// In an AIR build the value REPLACES the <content> layer and must be a
+// component-prefix of it; a bare build has no <content> to compare against, so
+// the value is taken verbatim and only the shape checks apply (as_so_layer).
+// Both halves are measured: temp/sorow/lpcell.as replays adl's cells 55/55.
+function lpRejects(lp:String):Boolean {
+  try {
+    SharedObject.getLocal("lp-bad", lp);
+  } catch (e:Error) {
+    return e.errorID == 2134;
+  }
+  return false;
+}
+var soRoot:SharedObject = SharedObject.getLocal("lp-root", "/");
+soRoot.data.v = 1;
+soRoot.flush();
+expect(solPath("lp-root").exists, "\"/\" is the layer with no components, so the file sits directly in #SharedObjects");
+expect(lpRejects(""), "an empty localPath is NOT null -- adl raises #2134");
+expect(lpRejects("m//n"), "an empty localPath component is #2134");
+var nullId:int = 0;
+try { SharedObject.getLocal(null); } catch (e2:Error) { nullId = e2.errorID; }
+expect(nullId == 2007, "a null name is Error #2007, not #2134 (got " + nullId + ")");
+
 // ---- 6. clear() purges the table and deletes the file -------------------
 so.clear();
 expect(so.data.topScore == null, "clear() purges the table");

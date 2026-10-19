@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The application descriptor of an AIR app that USES a native extension -- the
+  same document a real project ships, read by the same --air-app adapter
+  (examples/air-native/air-native-app.xml is the descriptor-only sibling).
+
+  The one element this example is about is <extensions>: the app NAMES the
+  extension by id and never by path, exactly as AIR requires. Where that id is
+  found is the build's business, and the answer is a search over the app
+  directory's ext-aot/, lib/ and ext-folder/ (docs/zh-cn/ane.md §4.6) -- the
+  staging tree built by examples/ane/build-ane.bat is what ext-aot/ holds here.
+  Both halves matter: the id is stable across the AIR build and the recompiled
+  one, so switching which of the two an app runs under is a directory order,
+  not a source edit.
+-->
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+  <id>com.example.aneapp</id>
+  <versionNumber>1.0</versionNumber>
+  <filename>ane-app</filename>
+  <!-- The fixture ships a Windows x64 slice only, so the target architecture is
+       stated rather than left to the descriptor default (32). This is also what
+       makes the manifest anePlatformForBuild() resolves deterministic: the
+       platform key follows the MANIFEST, not the build host. -->
+  <architecture>64</architecture>
+  <initialWindow>
+    <content>main.swf</content>
+    <!-- Offscreen: the app renders one frame to a PNG and exits. That is what
+         lets this example be a real --run instead of a compile-only check (a
+         visible window would never return), and it is why the offscreen link
+         set in src/air-app.ts is exercised here at all. -->
+    <visible>false</visible>
+    <width>400</width>
+    <height>300</height>
+  </initialWindow>
+  <extensions>
+    <extensionID>com.example.probe</extensionID>
+  </extensions>
+  <!-- AIR requires an extension-bearing app to declare the desktop profile. -->
+  <supportedProfiles>extendedDesktop</supportedProfiles>
+</application>

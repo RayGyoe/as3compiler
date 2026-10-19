@@ -387,7 +387,18 @@ function checkWiring(): string[] {
   c.check('the --air-app branch prepares sources through reach.ts (one shared rewrite path)',
     /prepareReachFiles\(air\.asFiles, srcDir\)/.test(index));
   c.check('...and compiles the closure the adapter computed',
-    /computeReachable\(parsedFiles, air\.mainClass\)/.test(index));
+    /computeReachable\(parsedFiles, air\.mainClass, swcBaseRoots\)/.test(index));
+  // The closure's extra roots: a symbol class whose SWC-declared base is a project
+  // class must keep that class's source, or the binding (swc.ts) has nothing to bind
+  // to and AIR would have linked the class while we dropped it.
+  c.check('...seeding the closure with the SWC symbols\' project base classes',
+    /const swcBaseRoots: string\[\] = \[\];/.test(index) &&
+    /for \(const base of swcLib\(p\)\.bases\.values\(\)\)/.test(index) &&
+    /base\.baseName\.length > 0 && !base\.baseName\.startsWith\('flash\.'\)/.test(index));
+  c.check('...and parsing each SWC library exactly once (the cache both users share)',
+    /const swcLibs = new Map<string, SwcLibrary>\(\)/.test(index) &&
+    /const lib = swcLib\(libPath\);/.test(index) &&
+    !/const lib = extractSwc\(libPath\);/.test(index));
   c.check('the closure is skipped only by the --all-sources escape hatch',
     /if \(!opts\.allSources\)/.test(index));
 

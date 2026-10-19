@@ -13,6 +13,7 @@
 
 import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve, dirname, relative, basename, sep, isAbsolute } from 'node:path';
+import { resolveExtensionPackages } from './ane.ts';
 
 // A single <font> entry under <embedFonts>. AIR uses these for StageText custom
 // fonts: <fontPath> is the ttf relative to the app root, <fontName> is the name
@@ -40,6 +41,11 @@ export interface AirAppInfo {
   // application#architecture), so that is what a descriptor without it means.
   architecture: string;
   fonts: EmbedFont[];
+  // <extensions><extensionID>…</extensionID></extensions> — the native extensions
+  // this app requires, named by ID. AIR declares them here and never by path; the
+  // packages are located through an `-extdir` on the command line instead. Kept in
+  // descriptor order, because that order decides the build's extension table.
+  extensionIDs: string[];
 }
 
 export class AirAppError extends Error {}
@@ -170,6 +176,44 @@ function childText(xml: string, name: string): string | null {
   return m ? m[1].trim() : null;
 }
 
+// Strip XML comments (`<!-- … -->`) from a descriptor.
+//
+// Not cosmetic: every reader below is regex-based, and the SDK's own descriptor
+// template comments whole element examples out (`<!-- <width></width> -->`,
+// `<!-- <visible></visible> -->`, `<!-- <extensionID></extensionID> -->` …). A tag
+// name spelled inside a comment would then be read as a live element: an empty
+// <width> parses to NaN and trips the width/height check, and a commented-out
+// <extensionID> asks the build for an extension the app has switched off.
+// Comments carry no descriptor data, so comment-free descriptors parse as before.
+//
+// Deliberately not imported from ane.ts, which strips comments from an
+// extension.xml: air-app parses the DESCRIPTOR and reads no ANEs (§2.8's table),
+// and the two are different inputs sharing only a syntax.
+function stripXmlComments(xml: string): string {
+  return xml.replace(/<!--[\s\S]*?-->/g, '');
+}
+
+// Parse <extensions> into the extensionID list.
+//
+//   <extensions>
+//     <extensionID>com.example.MyExtension</extensionID>…
+//   </extensions>
+//
+// Comments are stripped first, for the reason above.
+function parseExtensionIDs(xml: string): string[] {
+  const wrap = stripXmlComments(xml).match(/<extensions\b[^>]*>([\s\S]*?)<\/extensions>/);
+  if (!wrap) return [];
+  const ids: string[] = [];
+  const re = /<extensionID\b[^>]*>([\s\S]*?)<\/extensionID>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(wrap[1])) !== null) {
+    // A whitespace-only body is the template's placeholder, not an extension.
+    const id = m[1].trim();
+    if (id !== '') ids.push(id);
+  }
+  return ids;
+}
+
 // Parse <embedFonts> into [{ path, name }]. AIR nests it as
 //   <embedFonts><font><fontPath>ttf/x.ttf</fontPath><fontName>x</fontName></font>…</embedFonts>
 // with any number of <font> children. Empty (the common case) yields [].
@@ -188,15 +232,9 @@ function parseEmbedFonts(xml: string): EmbedFont[] {
 }
 
 export function parseAirApp(xml: string): AirAppInfo {
-  // Comments are dropped before any element is read. They are legal anywhere in
-  // an AIR descriptor, and the SDK's own descriptor template comments whole
-  // element examples out (`<!-- <width></width> -->`, `<!-- <visible></visible> -->`,
-  // `<!-- <renderMode></renderMode> -->` …). childText matches with a plain regex,
-  // so a tag name spelled inside a comment would be read as a live element: an
-  // empty <width> then parses to NaN and trips the width/height check below, i.e.
-  // a descriptor AIR accepts verbatim would be rejected here. Comments carry no
-  // descriptor data, so comment-free descriptors parse exactly as before.
-  const doc = xml.replace(/<!--[\s\S]*?-->/g, '');
+  // Comments are dropped before any element is read; see stripXmlComments for why
+  // an AIR-accepted descriptor would otherwise be rejected here.
+  const doc = stripXmlComments(xml);
   const id = childText(doc, 'id') ?? '';
   const versionNumber = childText(doc, 'versionNumber') ?? '';
   const filename = childText(doc, 'filename') ?? '';
@@ -237,6 +275,7 @@ export function parseAirApp(xml: string): AirAppInfo {
   const width = parseInt(widthStr, 10);
   const height = parseInt(heightStr, 10);
   const fonts = parseEmbedFonts(doc);
+  const extensionIDs = parseExtensionIDs(xml);
 
   if (!id || !filename) {
     throw new AirAppError('air-app.xml is missing <id> or <filename>');
@@ -244,7 +283,7 @@ export function parseAirApp(xml: string): AirAppInfo {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     throw new AirAppError('air-app.xml <initialWindow> width/height must be positive integers');
   }
-  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, architecture: architectureStr, fonts };
+  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, architecture: architectureStr, fonts, extensionIDs };
 }
 
 // Short name of a fully-qualified class: `demo.Main` -> `Main`.
@@ -264,6 +303,13 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
   const lines: string[] = [
     `// auto-generated bootstrap by as-aot --air-app (main class: ${mainClass})`,
     `import ${mainClass};`,
+    // Only the offscreen branch needs a File (see below). Emitted at the head
+    // because an AS3 import is only legal at the top of the compilation unit --
+    // and by SHORT name, not fully qualified: `flash.filesystem.File.x` is a
+    // member read on a Class VALUE, which goes through the reflection helper
+    // (as_class_member_value), and the built-in File carries no static member
+    // table, so it reads undefined and throws #1010 at run time (measured).
+    ...(info.visible ? [] : ['import flash.filesystem.File;']),
     '',
     // Resolve Stage via its fully-qualified name so the built-in flash.display
     // Stage (keyed by short name 'Stage' in classMap) is used, not a user
@@ -282,7 +328,16 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
     lines.push(`stage.showWindow(${info.width}, ${info.height}, "${escapeAsString(info.title)}");`);
     lines.push('trace("window closed");');
   } else {
-    lines.push(`stage.render(${info.width}, ${info.height}, "${escapeAsString(info.filename)}.png");`);
+    // The offscreen frame goes into the app's OWN directory, not the process's
+    // CWD: `File.applicationDirectory` is the executable's directory for a
+    // native build (= the `-o` dir, see docs/zh-cn/swc.md §11) and the page's
+    // directory on web, and both the extensions/ staging and icudtl.dat land
+    // there too — so the PNG is a build product that moves with the output
+    // rather than a side effect on whatever directory the program was started
+    // from. Measured: with a bare `"<filename>.png"` the regression suite (which
+    // runs examples with cwd = the repo root) collected ane-app.png IN THE
+    // SOURCE TREE, because a relative path is resolved against the CWD.
+    lines.push(`stage.render(${info.width}, ${info.height}, File.applicationDirectory.resolvePath("${escapeAsString(info.filename)}.png").nativePath);`);
     lines.push(`trace("${escapeAsString(info.filename)} rendered");`);
   }
   lines.push('');
@@ -395,10 +450,20 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // the vendor libraries themselves are host artifacts (build-windows-deps.ps1
   // writes windows-<arch> on Windows, build-static.sh writes macos-arm64 on macOS).
   // So the running compiler's platform IS the target's.
-  //   * macOS   — flat `macos-arm64` directories, Cocoa/Metal frameworks, libobjc;
-  //   * Windows — `windows-<arch>` directories (built by build-windows-deps.ps1,
+  //   * macOS   — platform key `macos-arm64`, Cocoa/Metal frameworks, libobjc;
+  //   * Windows — platform key `windows-<arch>` (built by build-windows-deps.ps1,
   //     named after AIR's own wording), D3D12/Win32 system libraries, and NO
   //     `-framework` at all (that flag does not exist in lld-link).
+  // Both platforms key off the SAME `libDir`, because every vendor package now uses one
+  // layout: archives under `<pkg>/lib/<platform>/` and headers under `<pkg>/include/`
+  // — shared when they are platform-independent, split into `<pkg>/include/<platform>/`
+  // when they are not. SDL2 is the only package that needs the split: its SDL_config.h is
+  // generated by the build (CMake on Windows, configure on macOS) and names the platform's
+  // subsystems, while Skia's and curl's headers are byte-identical across platforms, where
+  // a second copy could only drift. (Skia's `-I` is the package ROOT, not `include/`,
+  // because the glue spells its headers `include/core/SkCanvas.h`.) Until this landed, SDL2
+  // alone used `<pkg>/<platform>/{lib,include}` and macOS's key was the bare `arm64`,
+  // with no OS prefix to tell it apart from a Windows ARM64 tree.
   // <architecture> chooses x64 vs x86 on Windows and is inert elsewhere.
   // What DOES need care: the `-l` stems. gn names an archive `<target>.lib` on
   // Windows but `lib<target>.a` on POSIX, while clang resolves `-l<stem>` to
@@ -411,7 +476,6 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   const onWin = process.platform === 'win32';
   const winArch = architecture === '32' ? 'x86' : 'x64';
   const libDir = onWin ? `windows-${winArch}` : 'macos-arm64';
-  const sdlDir = onWin ? `windows-${winArch}` : 'arm64';
   const defines = visible ? ['ASC_USE_SKIA=1', 'ASC_USE_WINDOW=1'] : ['ASC_USE_SKIA=1'];
   // ASC_WINDOW_FIXED mirrors AIR's <resizable>false</resizable>: the window is
   // created without SDL_WINDOW_RESIZABLE, matching adl's fixed-size window.
@@ -472,30 +536,43 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
       sources.push(mtlSrc);
     }
   }
+  const includePaths = [`${vendorRel}/skia`, `${vendorRel}/sdl2/include/${libDir}`];
+  const linkPaths = [`${vendorRel}/skia/lib/${libDir}`, `${vendorRel}/sdl2/lib/${libDir}`];
   // Standard zlib: compress/uncompress/compressBound (what ByteArray.compress/
   // uncompress calls) plus the unprefixed deflate/inflate. macOS reaches it as
-  // the system libz (`z`). Windows has no system zlib, and Skia's own `zlib`
-  // target above is Chromium's *prefixed* fork (`_Cr_z_compress` etc.) that
-  // libpng/libwebp consume but which does NOT expose the unprefixed names our
-  // generated C calls. The standard library on Windows is curl's bundled zlib
-  // (`z.lib` in curl/lib/<arch>), so `z` is linked on both hosts and the curl
-  // lib dir is pushed below on Windows.
-  const includePaths = [`${vendorRel}/skia`, `${vendorRel}/sdl2/${sdlDir}/include`];
-  const linkPaths = [`${vendorRel}/skia/lib/${libDir}`, `${vendorRel}/sdl2/${sdlDir}/lib`];
-  // Standard zlib: compress/uncompress/compressBound (what ByteArray.compress/
-  // uncompress calls) plus the unprefixed deflate/inflate. macOS reaches it as
-  // the system libz (`z`). Windows has no system zlib, and Skia's own `zlib`
-  // target above is Chromium's *prefixed* fork (`_Cr_z_compress` etc.) that
-  // libpng/libwebp consume but which does NOT expose the unprefixed names our
-  // generated C calls. The standard library on Windows is curl's bundled zlib
-  // (`z.lib` in curl/lib/<arch>), so `z` is linked on both hosts and the curl
-  // lib dir is pushed below on Windows.
+  // the system libz (`z`) and the system <zlib.h>. Windows has neither, and
+  // Skia's own `zlib` target above is Chromium's *prefixed* fork
+  // (`_Cr_z_compress` etc.) that libpng/libwebp consume but which does NOT
+  // expose the unprefixed names our generated C calls. Windows' standard zlib --
+  // library AND header -- is the one curl's dependency stack builds (`z.lib` and
+  // `zlib.h` in curl/lib/<arch> + curl/include; see vendor/build-windows-deps.ps1).
+  //
+  // Both halves are pushed together, and on Windows UNCONDITIONALLY: the
+  // generated C includes <zlib.h> in every native build (src/runtime.ts), so a
+  // Windows app that never makes a request needs the header just as much as one
+  // that does. `-L` alone (what this did until 阶段一百八十四) is therefore a
+  // half-link that fails at `#include <zlib.h>` for every non-networking Windows
+  // app -- invisible on macOS, where the system header serves it and the arm64
+  // CI runner lives.
   linkLibs.push('z');
-  if (onWin) {
+  const needsCurlTree = onWin || usesNetworking;
+  if (needsCurlTree) {
+    includePaths.push(`${vendorRel}/curl/include`);
     linkPaths.push(`${vendorRel}/curl/lib/${libDir}`);
+  }
+  if (onWin) {
     // skia_glue.cc's SkFontMgr_New_GDI backend shapes text with Uniscribe
     // (ScriptItemize/ScriptShape/ScriptFreeCache), all in the system usp10.lib.
     linkLibs.push('usp10');
+    // The GDI font manager lives in skia_glue.cc, which is compiled into EVERY
+    // native app -- so gdi32 (the whole CreateCompatibleDC / ExtTextOutW /
+    // GetGlyphOutlineW family, measured as 18 unresolved symbols) and user32
+    // (SystemParametersInfoA) are needed even when <visible>false</visible> has
+    // taken SDL2 and the window out of the build. They used to sit in the
+    // `visible` branch below, which made a Windows offscreen/headless app fail to
+    // LINK -- while the same manifest's macOS twin (which reaches GDI nowhere)
+    // linked fine, so no macOS CI run could see it.
+    linkLibs.push('user32', 'gdi32', 'ole32', 'advapi32');
   }
   const frameworks = onWin ? [] : [
     'CoreFoundation', 'CoreGraphics', 'CoreText', 'CoreServices',
@@ -508,8 +585,10 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
       // reference is ours to supply (SDL2's own CMakeLists puts these in
       // INTERFACE_LINK_LIBRARIES for the static build; with a bare archive we
       // restate them). Direct3D/DXGI come from the <renderMode> branch above.
-      linkLibs.push('user32', 'gdi32', 'winmm', 'imm32', 'ole32', 'oleaut32',
-                    'version', 'uuid', 'advapi32', 'setupapi', 'shell32', 'dinput8');
+      // user32/gdi32 are NOT here: skia_glue.cc needs both whether or not the
+      // window exists, so they are pushed with usp10 above.
+      linkLibs.push('winmm', 'imm32', 'oleaut32',
+                    'version', 'uuid', 'setupapi', 'shell32', 'dinput8');
     } else {
       // libobjc is the NSWindow border shim in window_glue.cc (SDL_GetWindowBordersSize
       // is unimplemented by the Cocoa driver); there is no libobjc on Windows.
@@ -527,8 +606,8 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // TLS (Secure Transport) and system-proxy dependencies; nghttp2 is its HTTP/2
   // framing library (only exercised when ASC_HTTP2 is also defined).
   if (usesNetworking) {
-    includePaths.push(`${vendorRel}/curl/include`);
-    linkPaths.push(`${vendorRel}/curl/lib/${libDir}`);
+    // The curl include/lib dirs are already pushed above (needsCurlTree); what is
+    // networking-specific is the transport itself.
     linkLibs.push('curl', 'nghttp2');
     defines.push('ASC_HAVE_CURL=1');
     if (onWin) {
@@ -582,26 +661,42 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   }
   // Audio (flash.media, see detectAudio): compile vendor/audio_glue.c into the app
   // and define ASC_HAVE_AUDIO, which is what turns the as_audio_* seam from "no
-  // backend" into a real CoreAudio device (src/runtime.ts). The glue carries the
-  // 4 MB MINIAUDIO_IMPLEMENTATION in its own translation unit, so the generated C
-  // stays a single readable file. CoreAudio/AudioToolbox are miniaudio's macOS
-  // backend; CoreFoundation is already in the list above.
+  // backend" into a real device -- CoreAudio on macOS, WASAPI on Windows
+  // (src/runtime.ts). The glue carries the 4 MB MINIAUDIO_IMPLEMENTATION in its own
+  // translation unit, so the generated C stays a single readable file.
   if (usesAudio) {
     sources.push(`${vendorRel}/audio_glue.c`);
     defines.push('ASC_HAVE_AUDIO=1');
-    for (const fw of ['CoreAudio', 'AudioToolbox']) {
-      if (!frameworks.includes(fw)) frameworks.push(fw);
+    // The backend's SYSTEM dependencies are the one thing that cannot be shared.
+    // On macOS miniaudio's CoreAudio implementation is resolved through the two
+    // Apple frameworks (CoreFoundation is already in the list above); on Windows
+    // all three backends are reached via LoadLibrary/GetProcAddress (ole32.dll,
+    // dsound.dll, winmm.dll, avrt.dll) and so add nothing to the link line -- and
+    // `-framework` is not even a Windows flag (lld-link: "ignoring unknown
+    // argument '-framework'" followed by "could not open 'CoreAudio'").
+    if (process.platform === 'darwin') {
+      for (const fw of ['CoreAudio', 'AudioToolbox']) {
+        if (!frameworks.includes(fw)) frameworks.push(fw);
+      }
     }
   }
+  // Two *independent* reasons can want the same directory: curl's lib dir is pushed
+  // once on Windows for the zlib our own generated C links against (`z.lib` —
+  // compress/uncompress) and again for the network transport, so a networked Windows
+  // app used to emit the identical `-L` twice. `-I`/`-L` are sets (order and
+  // repetition are inert), so they are emitted as one — first occurrence wins, which
+  // keeps the list stable. `link-libs` is deliberately NOT deduplicated: `-l` order
+  // is significant to the linker.
+  const unique = (paths: string[]): string[] => [...new Set(paths)];
   return {
     target: 'native',
     'c-compiler': 'clang',
     opt: '-O2',
     architecture,
     sources,
-    'include-paths': includePaths,
+    'include-paths': unique(includePaths),
     'link-libs': linkLibs,
-    'link-paths': linkPaths,
+    'link-paths': unique(linkPaths),
     frameworks,
     defines,
     features,
@@ -703,6 +798,27 @@ function findPreloadPaths(dir: string, filename: string, outputDir: string | nul
 // The `<content>` SWF and the descriptor itself stay in (they are part of the
 // app's install directory for adl too, and tiny next to the asset tree).
 
+// Where an AIR project keeps its native extension packages, relative to the app
+// directory. AIR has no descriptor element for this location — both tools that
+// consume extensions take it as a command-line argument (`-extdir`) — so these are
+// the two directories the SDK's own project template establishes: `lib` holds the
+// packed `.ane` files (`adt -package … -extdir lib`), and `ext-folder` holds the
+// unpacked trees `adl -extdir ext-folder` reads (the template's `unzipane.bat`
+// builds it from `lib`). Both are searched, `lib` first, and `--extdir <dir>`
+// replaces the pair outright — a project that keeps its packages elsewhere says so
+// once instead of relying on a guess.
+//
+// `ext-aot` is this build's own third convention, and it is searched FIRST. It holds
+// the recompiled-for-AOT copy of an extension whose AIR original also lives in `lib`
+// — the two declare the SAME <extensionID>, because an app must not need a source
+// change to switch which one it is built against. Order is the entire mechanism, so
+// the choice has to be a named directory rather than a name-sort accident, and the
+// originals stay untouched where `adl` and `adt` look for them. Getting this wrong
+// is silent at build time and fatal at run time, measured: with the AIR package
+// resolved instead, the program stages it, loads it, and dies on
+// `Win32 error 126 … an ANE that still imports Adobe AIR.dll must be recompiled`.
+const DEFAULT_EXT_DIRS = ['ext-aot', 'lib', 'ext-folder'];
+
 export interface PreparedAirApp {
   info: AirAppInfo;
   mainClass: string;
@@ -725,7 +841,9 @@ export interface PreparedAirApp {
 // (com/org/net) — required by a real AIR app whose OWN framework layer lives under
 // `com/` (the TalkMED meeting app's com.vsdevelop.*, com.greensock, com.hurlant…),
 // which is otherwise invisible to the reachability closure.
-export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean, features: string[] | null = null, outputPath: string | null = null, includeThirdParty = false): PreparedAirApp {
+// `extDirOpts` is `--extdir <dir>`, repeated: the directories to locate the
+// descriptor's `<extensions>` packages in, overriding DEFAULT_EXT_DIRS.
+export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean, features: string[] | null = null, outputPath: string | null = null, includeThirdParty = false, extDirOpts: readonly string[] = []): PreparedAirApp {
   const xml = readFileSync(appXmlPath, 'utf8');
   const info = parseAirApp(xml);
   const dir = dirname(resolve(appXmlPath));
@@ -807,22 +925,41 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // is the §2.5 rule applied to the build layer rather than the frontend.
   const usesNetworking = detectNetworking(asFiles);
   const usesAudio = detectAudio(asFiles);
-  // A native audio build links the miniaudio glue translation unit, and the glue
-  // shipped in this workspace is the CoreAudio/AudioToolbox (macOS) backend, whose
-  // frameworks are Apple-only (`-framework CoreAudio` is not a clang argument on
-  // Windows). Claiming ASC_HAVE_AUDIO without a glue that exists would make the
-  // manifest name a source file that is not there (clang: "no such file or
-  // directory: vendor/audio_glue.c") -- a build failure with no hint of the real
-  // cause. Without the define the runtime's as_audio_* seam answers honestly
-  // (play() returns null, which is AIR's own no-sound-card result), so this is a
-  // missing capability to name, not a wrong result to hide (§1.5).
+  // A native audio build links the miniaudio glue translation unit. The glue is
+  // ONE file for every desktop OS: miniaudio picks its backend from the target
+  // (`MA_HAS_WASAPI` / `MA_SUPPORT_*`), and vendor/audio_glue.c's own
+  // as_audio_pick_backends() names CoreAudio on Apple and WASAPI/DirectSound/WinMM
+  // on Windows. Windows is not a special case for the LINKER either: miniaudio
+  // reaches all three of its Windows backends through LoadLibrary/GetProcAddress
+  // (measured: the compiled Windows object's only undefined imports are kernel32
+  // and the CRT), so that link line needs no `-l` at all -- while macOS needs its
+  // two Apple frameworks named (see airManifest's audio block). This list is thus
+  // "hosts where a backend was built AND measured"; every other host keeps the
+  // honest no-backend answer (play() returns null, which is AIR's own
+  // no-sound-card result) rather than -- `-framework CoreAudio` is not a clang
+  // argument on Windows -- a build failure with no hint of the real cause. Without
+  // the define the seam answers honestly, so this is a missing capability to name,
+  // not a wrong result to hide (§1.5).
   const audioGluePath = resolve(vendorAbs, 'audio_glue.c');
-  const audioLinked = usesAudio && existsSync(audioGluePath) && process.platform === 'darwin';
-  if (usesNetworking && !web && !existsSync(resolve(vendorAbs, 'curl', 'include', 'curl', 'curl.h'))) {
+  const audioGlueHosts = ['darwin', 'win32'];
+  const audioLinked = usesAudio && existsSync(audioGluePath) && audioGlueHosts.includes(process.platform);
+  // The curl tree is needed by EVERY Windows native build, not only a networking
+  // one: Windows has no system zlib, so both halves of the generated C's zlib use
+  // -- the unconditional `#include <zlib.h>` and `-l z` -- resolve inside that
+  // tree (see airManifest's zlib block). Checking only for networking is how a
+  // pure offscreen app ended up failing at the header with no mention of curl.
+  const curlHeader = resolve(vendorAbs, 'curl', 'include', 'curl', 'curl.h');
+  const needsCurlTree = !web && (usesNetworking || process.platform === 'win32');
+  if (needsCurlTree && !existsSync(curlHeader)) {
     throw new AirAppError(
-      `this app uses flash.net / URLRequest, so its build must link the HTTP transport, but the static curl tree is missing:\n` +
-      `  expected: ${resolve(vendorAbs, 'curl', 'include', 'curl', 'curl.h')}\n` +
-      `  build it with: build-tools/curl-src/build-static.sh`
+      (usesNetworking
+        ? 'this app uses flash.net / URLRequest, so its build must link the HTTP transport'
+        : 'a Windows native build takes zlib from the static curl tree -- Windows has no system zlib, and the generated C includes <zlib.h> in every native build') +
+      ', but that tree is missing:\n' +
+      `  expected: ${curlHeader}\n` +
+      `  build it with: ${process.platform === 'win32'
+        ? 'as3compiler/vendor/build-windows-deps.ps1 (it builds the curl + nghttp2 + zlib stack; -Only curl for just that)'
+        : 'build-tools/curl-src/build-static.sh'}`
     );
   }
   // A web build that draws text but resolves no font renders blank (see
@@ -836,7 +973,7 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   if (usesAudio && !audioLinked && !web) {
     warnings.push(
       `this app uses flash.media, but this native build has no audio backend available, so nothing will play:\n` +
-      `  glue: ${audioGluePath}${existsSync(audioGluePath) ? ' (present, but only the macOS CoreAudio backend is shipped)' : ' (missing)'}\n` +
+      `  glue: ${audioGluePath}${existsSync(audioGluePath) ? ` (present; it carries a backend for ${audioGlueHosts.join('/')}, and this host is ${process.platform})` : ' (missing)'}\n` +
       `  sounds report AIR's own no-sound-card result: play() returns null and SoundMixer.areSoundsInaccessible() is true\n` +
       `  fix: provide a vendor/audio_glue.c for this platform (see docs/zh-cn/audio.md)`
     );
@@ -880,6 +1017,37 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   const keptFromManifest = features === null && persistedFeatures.length > 0;
 
   const generated = airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures);
+  // Native extensions. The descriptor names them by ID and never by path — AIR is
+  // the same, locating the packages through `-extdir` — so the two halves are put
+  // together here and written into the manifest as resolved paths.
+  //
+  // Not silent, and not optional: measured under adl, a descriptor declaring an
+  // extension that `-extdir` cannot supply is refused outright (`Requested
+  // extension com.… could not be found.` — exit 5). Before this, `--air-app` read
+  // no `<extensions>` element at all, so a descriptor declaring extensions built
+  // green with an extension table of zero and every createExtensionContext missing
+  // at run time: a §1.5 defect (adl right, this build wrong), not a gap to document.
+  //
+  // Resolving to paths rather than to "everything in the directory" is what keeps
+  // a directory holding OTHER platforms' packages from failing the build: measured
+  // on a real project, `lib/` carries 14 `.ane` files while the descriptor declares
+  // 5, and sweeping all of them in aborts on a package the app never asked for.
+  const extDirs = extDirOpts.length > 0 ? extDirOpts.map((p) => resolve(p)) : DEFAULT_EXT_DIRS.map((d) => resolve(dir, d));
+  if (info.extensionIDs.length > 0) {
+    const packages = resolveExtensionPackages(extDirs, info.extensionIDs);
+    // Descriptor order, relative to the manifest (which sits in the app directory),
+    // the same rule `swc-paths` and `sources` follow.
+    generated['ane-paths'] = info.extensionIDs.map((id) => relative(dir, packages.get(id)!).replace(/\\/g, '/'));
+  } else if (extDirOpts.length > 0) {
+    // --extdir names where the extension packages are, and the descriptor asks for
+    // none: there is nothing to resolve from it. Saying so beats accepting the flag
+    // and quietly building an app with no extensions.
+    throw new AirAppError(
+      `--extdir was given, but ${basename(appXmlPath)} declares no <extensions>: there is nothing to resolve.\n` +
+        `  either add the <extensionID> entries the app needs to ${basename(appXmlPath)},\n` +
+        `  or name each package directly with --ane <package>`
+    );
+  }
   // applicationStorageDirectory is per application id, and AIR nests local shared
   // objects under "#SharedObjects/<content path>/" (the descriptor's <content>).
   // Both ride along as defines so the generated C can place ".sol" files exactly

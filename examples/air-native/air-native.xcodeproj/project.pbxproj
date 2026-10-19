@@ -177,11 +177,11 @@
 				GCC_OPTIMIZATION_LEVEL = 2;
 				HEADER_SEARCH_PATHS = (
 					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia",
-					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/arm64/include",
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/include/macos-arm64",
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia/lib/macos-arm64",
-					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/arm64/lib",
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/lib/macos-arm64",
 				);
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"ASC_USE_SKIA=1",
@@ -265,11 +265,11 @@
 				GCC_OPTIMIZATION_LEVEL = 2;
 				HEADER_SEARCH_PATHS = (
 					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia",
-					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/arm64/include",
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/include/macos-arm64",
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/skia/lib/macos-arm64",
-					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/arm64/lib",
+					"/Users/ray.lei/Documents/as3compiler-aot/as3compiler/vendor/sdl2/lib/macos-arm64",
 				);
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"ASC_USE_SKIA=1",

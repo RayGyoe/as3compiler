@@ -503,6 +503,37 @@ if (copy && !sk_fonts_share_file(baseFont, copy.get()))
 
 ---
 
+### 6.10 帧边界必须复位画布状态（阶段一百八十二 → 一百八十五，一个真应用的「画面变大」）
+
+窗口合成用的画布**跨帧存活**（GPU 路径下是每个后缓冲一份、被反复复用的 `SkCanvas`），而
+`ASC_window_render` 的写法是 `save()` → `scale(w->scale)` → … → `restore()`。**AS3 抛异常时，
+longjmp 会穿过渲染器跳过这些 C 层的 `restore`**，于是「一次 save + 一次设备缩放」就留在画布上；
+下一帧在已缩放的画布上再乘一次，**逐帧累积**。这不是理论担忧，是在真应用上量出来的：
+
+| 帧首读数（`getSaveCount()` / `getTotalMatrix()`） | 基矩阵缩放 | 内容实际缩放 |
+|---|---|---|
+| 干净态 | `depth=1` / 1.0 | 1.5（仅设备缩放，正确）|
+| 启动抛过异常后 | `depth=2` / 1.5 | 2.25 |
+| 再抛一次后 | `depth=3` / 2.25 | **3.375 = 1.5³** |
+
+像素口径（`Fps` HUD 正好画 70×100 DIP，可当尺子）：正常 105×150 px，故障 236×337 px（≈2.25×）；
+故障时**整个窗口**（HUD、SWC 皮肤、登录页）一起变大——这与「显示列表某一层被缩放」完全不同，
+所以排查时先把显示列表排除：`scaleX/scaleY` 与 `transform.matrix` 全是 1（`self`/`LoginView`/
+`stageView`/`Stage`/`skin` 逐层 dump），`w->scale` 恒 1.5，逐对象进入/退出 CTM 比对 **0 次失配**。
+三者同时成立还看到放大，就说明**放大发生在画布状态本身**。
+
+修法：`sk_canvas_reset()` = `restoreToCount(1)` + `resetMatrix()`，插在 `ASC_window_render` 的
+`ASC_window_apply_stage_size` 之后、**本帧自己的 `save()` 与设备缩放之前**。顺序是全部要点——
+放在缩放之后会把设备缩放一起丢掉。帧内 save/restore 本来是配平的，所以干净帧上它是一次 no-op；
+它保证的是「**任何一帧都不被上一帧的残留污染**」。异常本身仍只毁掉它出现的那一帧（与 AIR 一致：
+未捕获异常中止该帧余下的工作），下一帧即恢复。修复落在**发射代码**里，因此**与后端无关**
+（Metal / GL / D3D12 / raster 走同一处；没有画布 API 的构建里包一层 no-op 桩）。
+源级钉子：`unit: render/FrameCanvasHygiene`。
+
+> 排查方法的教训：**凡是「内容整体按同一倍数变大」的故障，先怀疑画布/表面状态而不是显示列表**；
+> 而验证「有没有泄漏」不能只看进入/退出的净差（那对本帧内的 save 不配对天然免疫），要看
+> **帧边界的 `getSaveCount()` 与基矩阵**。
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。
@@ -633,6 +664,54 @@ transform**（scaleY=2 的字段画出来与未缩放**逐字节相同**）⇒ �
 
 回归：`examples/tf-scale-metrics.as`（度量 6 组相对断言 + `draw(容器)` 的 ink 宽 3 组，链 Skia）+
 `unit: display/TfScaleMetrics`（10 钉，含两处反向 mutation 验证）。
+
+### 8.4 Windows 的逐字符字体回退：GDI 主语 + DirectWrite 兜底（阶段一百九十一）
+
+**GDI 的字体管理器根本没有逐字符回退**——`SkFontMgrGDI::onMatchFamilyStyleCharacter` 是无条件
+`return nullptr`（`build-tools/skia-src/src/ports/SkFontHost_win.cpp` ~2267），Windows 也没有 macOS
+CoreText 那样的系统级级联。而 SkParagraph 对**每一个**本 run 字脸不映射的码点都要向管理器要一张回退脸：
+于是当字段的字族是 GDI 家族表里**匹配不上**的名字时，解析出的脸是拉丁默认脸，**整个字段**都画成
+`.notdef`——一片相同的方框，不是零星几个。
+
+实测（`temp/fntface/`，8 行 TextField，size 18，文本 `创建会议 abc 0123`，`Stage.render` 出图 + trace）：
+
+| 字族 | 修前 textWidth/Height | 修后 | 修前像素 |
+|---|---|---|---|
+| `微软雅黑` | 153/16 | 153/16 | **4 个 `.notdef`** |
+| `MiSans Regular` | 153.532/18 | 153.532/18 | 正常（app 自己注册了 MiSans） |
+| `Microsoft YaHei` | 157/20 | 157/20 | 正常 |
+| `SimSun` | 153/18 | 153/18 | 正常 |
+| `Arial` | 135/17 | 151/17 | 正常 |
+| `NoSuchFamilyXYZ` | 153/16 | 153/16 | **4 个 `.notdef`** |
+| `""` | 127/16 | 143/16 | **4 个 `.notdef`** |
+
+关键在「**同名不同文**」：本机 `Get-WinSystemLocale = zh-CN` 但 **UI 语言是 en-US**，GDI+ 枚举出的
+874 个字族**只有英文名**——有 `Microsoft YaHei`，**没有 `微软雅黑`**。而 SWC 里的 tag-37 文本字符
+（`createaisubtitleskin.title` / `stime` / `sourcetxt` / `targettxt` / `typetxt` 等）声明的字族正是
+`微软雅黑`。用户看到的乱码就是它：AI 同传窗口卡片首行的「创建同传」被画成 4 个 `.notdef`；
+修后同一个窗口同一位置正常显示「创建同传」（其余字段用 MiSans/其它族，本来就不乱）。
+
+**修法：`vendor/skia_glue.cc` 的 Windows 分支改成 `SkAirFontMgr : public SkFontMgr`，GDI 作
+`fPrimary`、DirectWrite 作 `fFallback`，且只有 `onMatchFamilyStyleCharacter` 过桥。** 其余 10 个查询
+（`countFamilies` / `getFamilyName` / `createStyleSet` / `matchFamily` / `matchFamilyStyle` /
+`makeFromData` / `makeFromStream{Index,Args}` / `makeFromFile` / `legacyMakeTypeface`）逐字转给 GDI——
+所以**今天能解析的字族换脸为零**（上表 `MiSans Regular` / `Microsoft YaHei` / `SimSun` 三行修前修后
+逐字相同）；DirectWrite 侧走它自己的 `IDWriteFontFallback::MapCharacters` 级联（DirectWrite 系浏览器
+用的同一条），只在「字脸缺码点」这一条查询上回答。`Arial` 与 `""` 的宽度修后变大，正是过去画不出
+的 CJK 现在画出来了。
+
+**为什么不是整体换 DirectWrite、也不是 `SkOrderedFontMgr`：** 有序管理器会把**结构化**（族/样式）查询
+也交给 DirectWrite，而一张 DirectWrite 脸走到 SkParagraph 的结构化路径时，我们那套 AIR strut / 高度
+覆盖机制就失效——实测该行 `textHeight = -Infinity`、**整行不画**。GDI 作主语同时保证了「已能解析的
+字族逐字节不变」。
+
+**无新增链接依赖**：Skia 通过 `LoadLibraryW("dwrite.dll")` + `GetProcAddress("DWriteCreateFactory")`
+访问 DirectWrite（`build-tools/skia-src/src/utils/win/SkDWrite.cpp`），所以任何 `.build.json` 都**不需要**
+加 `dwrite`，构建清单未改。该分支在 `#if defined(_WIN32)` 内，macOS/wasm 不受影响；Windows 侧的这次
+改动**不在 CI 覆盖内**（CI 是 macOS），本机像素 A/B 是唯一验证。
+
+回归：`unit: platform/FontFallback`（9 钉：单点过桥 / 10 处 `fPrimary->` / 工厂与降级 / macOS 分支未动 /
+反向排除 `SkOrderedFontMgr` / 两处文档镜像）。
 
 ### 8.1 `flash.text.StyleSheet` 与 HTML 的**块级**模型（阶段一百四十八）
 

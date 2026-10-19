@@ -355,9 +355,24 @@ function checkClassStaticMember(): string[] {
   // A BUILT-IN class object must carry its statics table: this is what makes
   // `Application.NativeApplication`'s `myClass.nativeApplication` resolve instead
   // of returning undefined (the branch that used to be silently skipped).
+  // Its FACTORY slot is no longer hardcoded NULL -- a built-in whose constructor
+  // can be called with no arguments is now reachable by name too, which is what
+  // `FRENewObject("flash.geom.Point", 0, NULL, ...)` needs (see
+  // emitBuiltinFactories). So the pin names the exact form per shape: a
+  // zero-parameter constructor IS the C entry point, an all-defaulted one gets a
+  // generated `_new_default` wrapper, and a constant holder (SoundMixer, a class
+  // with no constructor at all) keeps NULL.
   const c2 = generateC(parse('var c:Class = null;\nvar n:Object = c.nativeApplication;\n')).c;
   check('a built-in class object wires its static-member table',
-    /static as_class NativeApplication_cls = \{ &NativeApplication_vt, NULL, NULL, "flash\.desktop::NativeApplication", 0, NativeApplication_statics \};/.test(c2));
+    /static as_class NativeApplication_cls = \{ &NativeApplication_vt, \(void\*\(\*\)\(void\)\)NativeApplication_new, NULL, "flash\.desktop::NativeApplication", 0, NativeApplication_statics \};/.test(c2));
+  check('a no-arg built-in constructor is registered directly',
+    /static as_class Sprite_cls = \{ &Sprite_vt, \(void\*\(\*\)\(void\)\)Sprite_new, NULL, "flash\.display::Sprite", 0, NULL \};/.test(
+      generateC(parse('var s:Sprite = new Sprite();\n')).c));
+  check('an all-defaulted built-in constructor gets a _new_default wrapper',
+    /static as_class Point_cls = \{ &Point_vt, \(void\*\(\*\)\(void\)\)Point_new_default, NULL, "flash\.geom::Point", 0, NULL \};/.test(c2)
+    && c2.includes('Point* Point_new_default(void) { return Point_new('));
+  check('a constant holder with no constructor keeps a NULL factory',
+    /static as_class SoundMixer_cls = \{ &SoundMixer_vt, NULL, NULL, "flash\.media::SoundMixer", 0, /.test(c2));
   check('the built-in static getter row is kind 3 (computed, invoked)',
     /\{ "nativeApplication", 3, NativeApplication__statget_nativeApplication, 0, NULL, 0, /.test(c2));
   check('the struct documents kind 3 as a computed static',
@@ -533,7 +548,7 @@ function checkMemberShadow(): string[] {
   // its layout is pinned in platform.ts, and it still must read for a receiver that
   // does not shadow it.
   check('the EventDispatcher `parent` slot survives as the runtime ABI anchor',
-    c.includes('{ "parent", 12, offsetof(EventDispatcher, parent), NULL, NULL, 0 },'));
+    c.includes('{ "parent", 12, offsetof(EventDispatcher, parent), NULL, NULL, 0, 0, 0 },'));
   const cu = generateC(parse('class U extends Sprite { }\nvar u:U = new U();\nu.name = "k";\nvar n:String = u.name;\n')).c;
   // The write still goes straight to the slot (no setter); it is only wrapped by
   // the DisplayObject.name #2007 guard (AIR rejects a null name; measured on
@@ -558,7 +573,7 @@ function checkMemberShadow(): string[] {
     threw === '' && setterOnly.includes('if ((this->y == v)) {'));
   check('...while the setter itself is still emitted for writes',
     setterOnly.includes('static void T_set_y(void* _this, double v) {')
-    && setterOnly.includes('{ "y", T_set_y__dyn },'));
+    && setterOnly.includes('{ "y", T_set_y__dyn, 0, "Number" },'));
 
   // Source-level: the rule lives in one place and every member-resolution site
   // consults it — the three read paths plus the two type-inference paths in

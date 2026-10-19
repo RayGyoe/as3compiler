@@ -621,7 +621,10 @@ export class SymbolTable {
       fields: new Map(),
       methods: new Map([
         ['toString', { returnType: { kind: 'string' }, params: [], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
-        ['hasOwnProperty', { returnType: { kind: 'bool' }, params: [{ name: 'name', type: 'String', defaultValue: null, isRest: false }], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // AIR accepts `hasOwnProperty()` with NO argument (mxmlc 51.4.1 does not reject
+        // the empty call), so the parameter carries a null default rather than being
+        // required -- measured in the stage-195 arity sweep.
+        ['hasOwnProperty', { returnType: { kind: 'bool' }, params: [{ name: 'name', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
         // Object.propertyIsEnumerable(name): TRUE only when `name` is a DYNAMIC
         // property of the receiver -- an instance trait (field, accessor, method) is
         // never enumerable in this sense, unlike hasOwnProperty. Measured on adl
@@ -632,7 +635,7 @@ export class SymbolTable {
         // for an index and an added named property but FALSE for 'length'; a Vector
         // and a String answer false. Implemented by as_dyn_enumerable (runtime.ts),
         // i.e. hasOwnProperty minus the trait walk.
-        ['propertyIsEnumerable', { returnType: { kind: 'bool' }, params: [{ name: 'name', type: 'String', defaultValue: null, isRest: false }], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['propertyIsEnumerable', { returnType: { kind: 'bool' }, params: [{ name: 'name', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'Object', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
@@ -1177,7 +1180,13 @@ export class SymbolTable {
     // listener table so addEventListener works for ACTIVATE/DEACTIVATE.
     this.classMap.set('NativeApplication', {
       fields: new Map(),
-      methods: new Map(),
+      methods: new Map([
+        // exit(): end the application now, tearing down every window. AIR's
+        // autoExit does this on the last window's close; exit() is the explicit
+        // form (adl 51.4.1: exit() and the last-window CLOSE teardown are the
+        // same shutdown, ours just starts it with windows still open).
+        ['exit', { returnType: { kind: 'void' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map([
@@ -1208,6 +1217,13 @@ export class SymbolTable {
         // the version string — and AIR's missing-property error is #1069 with the
         // exact wording above, so only this member-table entry was missing.
         ['applicationDescriptor', { returnType: { kind: 'xml' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // openedWindows: every window the application currently has open, as a
+        // plain Array in window-slot order (adl 51.4.1: `openedWindows.length`
+        // tracks new/close, `open[0]` is the initial window and is the SAME
+        // object as `stage.nativeWindow`). Built by reverse lookup over the
+        // generated C's ASC_wins[] table, so it can never drift from the windows
+        // the glue actually has.
+        ['openedWindows', { returnType: { kind: 'array' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       staticGetters: new Map([
         // nativeApplication: the application singleton (AIR's static getter that
@@ -1728,7 +1744,9 @@ export class SymbolTable {
         // `minSize` is AIR's minimum window size (a Point). The backend imposes no
         // minimum, so it is stored and read back verbatim -- the property is real
         // (apps use it to keep a window from being dragged smaller than its
-        // content) but there is nothing to enforce here.
+        // content) but there is nothing to enforce here. Its adl default is the
+        // OS's own minimum track size (136x39 on Windows), which is why the
+        // initial value is a lingering gap rather than a literal: see TODO.md.
         fields: new Map<string, FieldInfo>([
           ['minSize', { type: { kind: 'object', className: 'Point' } as CType, init: null, visibility: 'public', owner: 'NativeWindow', isStatic: false, isConst: false }],
         ]),
@@ -1746,13 +1764,25 @@ export class SymbolTable {
           // notifyUser(type): AIR asks the OS to draw attention to the window (a
           // flashing taskbar button on Windows, a bouncing Dock icon on macOS).
           // Purely cosmetic, so it is accepted and does nothing (see emit.ts).
-          ['notifyUser', nwMethod('NativeWindow', { kind: 'void' }, [{ name: 'type', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }])],
+          ['notifyUser', nwMethod('NativeWindow', { kind: 'void' }, [{ name: 'type', type: 'String', defaultValue: null, isRest: false }])],
           // startMove()/startResize(edgeOrCorner="BR"): AIR hands the drag over to
-          // the window manager; this runtime has no backend hook for it, so both
-          // report themselves once and return false (see the C bodies in emit.ts).
+          // the window manager (and answers true); this runtime has no backend hook
+          // for it, so both report themselves once and return false -- the value AIR
+          // itself returns for a window it cannot drag (see the C bodies in emit.ts).
+          // Registered as a lingering gap in TODO.md rather than passed off as done.
           ['startMove', nwMethod('NativeWindow', { kind: 'bool' }, [])],
           ['startResize', nwMethod('NativeWindow', { kind: 'bool' }, [{ name: 'edgeOrCorner', type: 'String', defaultValue: { kind: 'Str', value: 'BR' }, isRest: false }])],
           ['toString', nwMethod('NativeWindow', { kind: 'string' }, [])],
+          // orderInFrontOf(window)/orderInBackOf(window): reorder relative to
+          // another window; adl 51.4.1 answers true for a normal pair. Ours maps
+          // onto the same backend raise/lower that orderToFront/orderToBack use.
+          ['orderInFrontOf', nwMethod('NativeWindow', { kind: 'bool' }, [{ name: 'window', type: 'NativeWindow', defaultValue: null, isRest: false }])],
+          ['orderInBackOf', nwMethod('NativeWindow', { kind: 'bool' }, [{ name: 'window', type: 'NativeWindow', defaultValue: null, isRest: false }])],
+          // globalToScreen(point): window-local -> screen coordinates. adl 51.4.1
+          // measured globalToScreen(0,0) = (34,57) for a window whose bounds are
+          // (26,26): the frame origin plus the non-client border (8,31), i.e. the
+          // CLIENT area's top-left rather than the frame's.
+          ['globalToScreen', nwMethod('NativeWindow', { kind: 'object', className: 'Point' }, [{ name: 'point', type: 'Point', defaultValue: null, isRest: false }])],
         ]),
         staticFields: new Map<string, FieldInfo>([
           ['isSupported', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'NativeWindow', isStatic: true, isConst: true }],
@@ -1782,6 +1812,12 @@ export class SymbolTable {
           ['renderMode', nwGet('NativeWindow', { kind: 'string' })],
           ['transparent', nwGet('NativeWindow', { kind: 'bool' })],
           ['owner', nwGet('NativeWindow', { kind: 'object', className: 'NativeWindow' })],
+          // menu: AIR hands back the window's NativeMenu, null unless one was
+          // set. This runtime has no NativeMenu subsystem at all (a registered
+          // lingering gap outside the AOT closure), so there is never one to
+          // hand back and the declared type is Object rather than inventing a
+          // NativeMenu class that answers nothing.
+          ['menu', nwGet('NativeWindow', { kind: 'object', className: 'Object' })],
         ]),
         setters: new Map<string, MethodInfo>([
           // x/y/width/height write straight through to bounds (measured: setting
@@ -3234,9 +3270,9 @@ export class SymbolTable {
         ['getDirectoryListingAsync', filemeth({ kind: 'void' }, [])],
         ['deleteFileAsync', filemeth({ kind: 'void' }, [])],
         ['deleteDirectoryAsync', filemeth({ kind: 'void' }, [{ name: 'deleteDirectory', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
-        ['browseForDirectory', filemeth({ kind: 'void' }, [{ name: 'title', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }])],
+        ['browseForDirectory', filemeth({ kind: 'void' }, [{ name: 'title', type: 'String', defaultValue: null, isRest: false }])],
         ['browseForOpen', filemeth({ kind: 'void' }, [
-          { name: 'title', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'title', type: 'String', defaultValue: null, isRest: false },
           { name: 'typeFilter', type: 'Array', defaultValue: { kind: 'Null' }, isRest: false },
         ])],
         ['openWithDefaultApplication', filemeth({ kind: 'void' }, [])],
@@ -3860,48 +3896,55 @@ export class SymbolTable {
       implements: [],
       fqn: 'flash.events::StatusEvent',
     });
-    // flash.external.ExtensionContext (AIR native-extension bridge, stage 135).
-    // The AS3 half of an ANE: createExtensionContext() resolves the extension by
-    // id and hands back a context whose call() reaches the native side, whose
+    // flash.external.ExtensionContext (AIR native-extension bridge, stage 135; the
+    // AS3 half of an ANE). createExtensionContext() resolves the extension by id
+    // and hands back a context whose call() reaches the native side, whose
     // getExtensionDirectory() locates its bundled files, and which dispatches
-    // StatusEvent. This build has NO FRE host (no <Name>ExtInitializer DLL
-    // loader), so the context is a SHELL: it exists, carries its id, accepts
-    // listeners and returns null from call() — the honest "extension not loaded"
-    // answer (§1.5), never a fake success. Modelling it lets the ANE's own AS3
-    // API sources type-check and compile; the native wiring is a separate task.
+    // StatusEvent. The member list is AIR's, and only AIR's: actionScriptData is a
+    // real property and call()/dispose() are the real bridge when the build has a
+    // FRE host (see fre.ts and the ASC_HAVE_FRE bodies in emit.ts). With no --ane
+    // the bodies degrade to a reported no-op rather than a fake success (§1.5).
+    //
+    // `extensionID` is deliberately NOT modelled. It looks like it should exist --
+    // the class is created FROM an extension id -- but AIR does not have it, and
+    // every case here must match AIR rather than intuition: the language reference
+    // lists exactly actionScriptData / functions / knownExtensions, mxmlc rejects
+    // `ctx.extensionID` as a possibly-undefined property, and reading it at run
+    // time under adl throws "Error #1069: Property extensionID not found on
+    // flash.external.ExtensionContext". Modelling it would let a program compile
+    // here that mxmlc refuses, which is a divergence in the wrong direction.
+    // The AIR 50.0 additions (functions, knownExtensions, getExtensionInfo,
+    // loadExtension) are not modelled either -- see TODO.md 遗留待开发.
     const ecObj = (): CType => ({ kind: 'object', className: 'Object' });
     this.classMap.set('ExtensionContext', {
       fields: new Map([
         ['actionScriptData', { type: ecObj(), init: null, visibility: 'public', owner: 'ExtensionContext', isStatic: false, isConst: false }],
-        ['_extID', { type: { kind: 'string' }, init: null, visibility: 'private', owner: 'ExtensionContext', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['call', { returnType: { kind: 'any' }, params: [
           { name: 'functionName', type: 'String', defaultValue: null, isRest: false },
           { name: 'args', type: 'Array', defaultValue: null, isRest: true },
         ], owner: 'ExtensionContext', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
-        ['dispose', { returnType: { kind: 'bool' }, params: [], owner: 'ExtensionContext', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['dispose', { returnType: { kind: 'void' }, params: [], owner: 'ExtensionContext', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
       staticMethods: new Map([
         ['createExtensionContext', { returnType: { kind: 'object', className: 'ExtensionContext' }, params: [
           { name: 'extensionID', type: 'String', defaultValue: null, isRest: false },
-          { name: 'contextType', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+          { name: 'contextType', type: 'String', defaultValue: null, isRest: false },
         ], owner: 'ExtensionContext', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
         ['getExtensionDirectory', { returnType: { kind: 'object', className: 'File' }, params: [
           { name: 'extensionID', type: 'String', defaultValue: null, isRest: false },
         ], owner: 'ExtensionContext', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
       ]),
-      getters: new Map([
-        ['extensionID', { returnType: { kind: 'string' }, params: [], owner: 'ExtensionContext', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
-      ]),
+      getters: new Map(),
       setters: new Map(),
       constructor: { params: [
         { name: 'extensionID', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
         { name: 'contextType', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
       ] },
       superClass: 'EventDispatcher',
-      isFinal: false,
+      isFinal: true,
       implements: [],
       fqn: 'flash.external::ExtensionContext',
     });
@@ -3921,6 +3964,15 @@ export class SymbolTable {
     const shIntP = (name: string, def: number): Param => ({ name, type: 'int', defaultValue: { kind: 'Num', value: def, isInt: true }, isRest: false });
     const shNullP = (name: string, type: string): Param => ({ name, type, defaultValue: { kind: 'Null' }, isRest: false });
     const shReq = (name: string, type: string): Param => ({ name, type, defaultValue: null, isRest: false });
+    // AIR-REQUIRED parameter: no default, so omitting the argument is a CodegenError
+    // just like in AIR (`mxmlc` 51.4.1 refuses `g.moveTo(1)`). The stage-195 arity
+    // audit moved every built-in parameter onto this helper or `gopt` after
+    // measuring each call shape against `mxmlc`; the numeric `gnum`/`gegnum`
+    // helpers used to hand out `0` defaults that AIR does not have.
+    const greq = (name: string, type: string = 'Number'): Param => ({ name, type, defaultValue: null, isRest: false });
+    // OPTIONAL parameter carrying AIR's documented default value: `mxmlc` accepts the
+    // call with this argument omitted, so the emitted C must pass this value.
+    const gopt = (name: string, type: string, def: Expr): Param => ({ name, type, defaultValue: def, isRest: false });
     const shMethod = (owner: string, ret: CType, params: Param[], isStatic = false): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic, isFinal: false, isGetter: false, isSetter: false });
     const shConst = (owner: string, value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true });
     const shField = (owner: string, t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
@@ -3988,6 +4040,18 @@ export class SymbolTable {
       [['beforeBounds', shObj('Rectangle')], ['afterBounds', shObj('Rectangle')]],
       [['MOVE', 'move'], ['MOVING', 'moving'], ['RESIZE', 'resize'], ['RESIZING', 'resizing']],
       [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNullP('beforeBounds', 'Rectangle'), shNullP('afterBounds', 'Rectangle')],
+      [['clone', shObj('Event'), []]]);
+    // flash.events.NativeWindowDisplayStateEvent: minimize/maximize/restore.
+    // Both halves of the pair exist (CHANGING before, CHANGE after), and the
+    // class also carries the three display-state strings, measured on adl
+    // 51.4.1 (temp/nwor/adl-oracle.txt section E: CHANGING/CHANGE =
+    // displayStateChanging/displayStateChange, NORMAL/MINIMIZED/MAXIMIZED =
+    // normal/minimized/maximized).
+    shell('NativeWindowDisplayStateEvent', 'flash.events::NativeWindowDisplayStateEvent', 'Event',
+      [['beforeDisplayState', { kind: 'string' }], ['afterDisplayState', { kind: 'string' }]],
+      [['CHANGING', 'displayStateChanging'], ['CHANGE', 'displayStateChange'],
+       ['NORMAL', 'normal'], ['MINIMIZED', 'minimized'], ['MAXIMIZED', 'maximized']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNullP('beforeDisplayState', 'String'), shNullP('afterDisplayState', 'String')],
       [['clone', shObj('Event'), []]]);
     // flash.events.InvokeEvent: the AIR "launch with a document/argument" event.
     shell('InvokeEvent', 'flash.events::InvokeEvent', 'Event',
@@ -4064,7 +4128,7 @@ export class SymbolTable {
        ['dispose', { kind: 'void' }, []],
        ['drawViewPortToBitmapData', { kind: 'void' }, [shReq('bitmapData', 'BitmapData')]],
        ['historyBack', { kind: 'void' }, []], ['historyForward', { kind: 'void' }, []],
-       ['loadString', { kind: 'void' }, [shReq('text', 'String'), shReq('mimeType', 'String')]],
+       ['loadString', { kind: 'void' }, [shReq('text', 'String'), gopt('mimeType', 'String', { kind: 'Str', value: 'text/html' })]],
        ['loadURL', { kind: 'void' }, [shReq('url', 'String')]],
        ['reload', { kind: 'void' }, []], ['stop', { kind: 'void' }, []]],
       [], [], ['isSupported']);
@@ -4075,7 +4139,7 @@ export class SymbolTable {
        ['keyEquivalentModifiers', { kind: 'array' }], ['mnemonicIndex', { kind: 'int' }],
        ['data', shObj('Object')], ['menu', shObj('Object')], ['submenu', shObj('Object')]],
       [],
-      [shReq('label', 'String'), shBoolP('isSeparator', false)]);
+      [gopt('label', 'String', { kind: 'Str', value: '' }), shBoolP('isSeparator', false)]);
     // flash.net.NetworkInterface / NetworkInfo: the interface inventory.
     shell('NetworkInterface', 'flash.net::NetworkInterface', 'EventDispatcher',
       [['name', { kind: 'string' }], ['displayName', { kind: 'string' }], ['hardwareAddress', { kind: 'string' }],
@@ -4110,7 +4174,7 @@ export class SymbolTable {
       [], [],
       [['setSilenceLevel', { kind: 'void' }, [shReq('silenceLevel', 'Number'), shIntP('timeout', -1)]],
        ['setUseEchoSuppression', { kind: 'void' }, [shReq('useEchoSuppression', 'Boolean')]],
-       ['setLoopBack', { kind: 'void' }, [shReq('state', 'Boolean')]],
+       ['setLoopBack', { kind: 'void' }, [gopt('state', 'Boolean', { kind: 'Bool', value: true })]],
        ['setCodec', { kind: 'void' }, [shReq('codec', 'String')]],
        ['setRate', { kind: 'void' }, [shIntP('rate', 11)]]],
       [['getMicrophone', shObj('Microphone'), [shIntP('index', -1)]],
@@ -4122,7 +4186,7 @@ export class SymbolTable {
     shell('Clipboard', 'flash.desktop::Clipboard', 'Object',
       [['formats', { kind: 'array' }]], [], [],
       [['clear', { kind: 'void' }, []],
-       ['clearData', { kind: 'void' }, [shNullP('mimeType', 'String')]],
+       ['clearData', { kind: 'void' }, [shReq('mimeType', 'String')]],
        ['getData', { kind: 'any' }, [{ name: 'format', type: 'String', defaultValue: null, isRest: false },
          { name: 'transferMode', type: 'String', defaultValue: { kind: 'Str', value: 'originalPreferred' }, isRest: false }]],
        ['hasFormat', { kind: 'bool' }, [shReq('format', 'String')]],
@@ -4781,7 +4845,7 @@ export class SymbolTable {
       getters: new Map(),
       setters: new Map(),
       constructor: { params: [
-        cmiP('caption', 'String', { kind: 'Str', value: '' }),
+        cmiP('caption', 'String', null),
         cmiP('separatorBefore', 'Boolean', { kind: 'Bool', value: false }),
         cmiP('enabled', 'Boolean', { kind: 'Bool', value: true }),
         cmiP('visible', 'Boolean', { kind: 'Bool', value: true }),
@@ -5010,10 +5074,10 @@ export class SymbolTable {
         ['_clx', gpf2()], ['_cly', gpf2()], ['_clw', gpf2()], ['_clh', gpf2()],
       ]),
       methods: new Map([
-        ['moveTo', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0)])],
-        ['lineTo', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0)])],
-        ['curveTo', gpm({ kind: 'void' }, [gnum('controlX', 0), gnum('controlY', 0), gnum('anchorX', 0), gnum('anchorY', 0)])],
-        ['beginFill', gpm({ kind: 'void' }, [guint('color', 0), gnum('alpha', 1)])],
+        ['moveTo', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number')])],
+        ['lineTo', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number')])],
+        ['curveTo', gpm({ kind: 'void' }, [greq('controlX', 'Number'), greq('controlY', 'Number'), greq('anchorX', 'Number'), greq('anchorY', 'Number')])],
+        ['beginFill', gpm({ kind: 'void' }, [greq('color', 'uint'), gnum('alpha', 1)])],
         // AIR: beginBitmapFill(bitmap:BitmapData, matrix:Matrix = null,
         // repeat:Boolean = true, smooth:Boolean = false). A null matrix is the
         // identity, i.e. the bitmap's own pixel rect at the shape's origin.
@@ -5053,11 +5117,11 @@ export class SymbolTable {
           { name: 'interpolationMethod', type: 'String', defaultValue: { kind: 'Str', value: 'rgb' }, isRest: false },
           gnum('focalPointRatio', 0),
         ])],
-        ['drawRect', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0)])],
-        ['drawRoundRect', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0), gnum('ellipseWidth', 0), gnum('ellipseHeight', 0)])],
-        ['drawCircle', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('radius', 0)])],
+        ['drawRect', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('width', 'Number'), greq('height', 'Number')])],
+        ['drawRoundRect', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('width', 'Number'), greq('height', 'Number'), greq('ellipseWidth', 'Number'), gnum('ellipseHeight', 0)])],
+        ['drawCircle', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('radius', 'Number')])],
         // AIR's drawEllipse(x, y, width, height): the oval inscribed in that rect.
-        ['drawEllipse', gpm({ kind: 'void' }, [gnum('x', 0), gnum('y', 0), gnum('width', 0), gnum('height', 0)])],
+        ['drawEllipse', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('width', 'Number'), greq('height', 'Number')])],
         // AIR: drawTriangles(vertices:Vector.<Number>, indices:Vector.<int> = null,
         // uvtData:Vector.<Number> = null, culling:String = "none"). Note the vertices
         // come FIRST here, unlike Context3D.drawTriangles (WireframeMapGenerator calls
@@ -5198,7 +5262,7 @@ export class SymbolTable {
         ['encode', bdm({ kind: 'void' }, [
           { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
           { name: 'compressor', type: 'Object', defaultValue: null, isRest: false },
-          { name: 'byteArray', type: 'ByteArray', defaultValue: null, isRest: false },
+          { name: 'byteArray', type: 'ByteArray', defaultValue: { kind: 'Null' }, isRest: false },
           { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         ])],
         ['setPixels', bdm({ kind: 'void' }, [
@@ -5588,13 +5652,13 @@ export class SymbolTable {
     this.classMap.set('StyleSheet', {
       fields: new Map(),
       methods: new Map([
-        ['setStyle', ssm({ kind: 'void' }, [ssv('styleName', 'String'), ssv('styleObject', 'Object')])],
+        ['setStyle', ssm({ kind: 'void' }, [greq('styleName', 'String'), greq('styleObject', 'Object')])],
         // `getStyle` hands back a plain Object (AIR: "a copy of the style object, or
         // null if there is none"). Code reads its properties dynamically --
         // `getStyle('fps').color` -- which is why the return type is Object and not
         // the runtime's record type: Object member access goes through the dynamic
         // property path (as_dyn_get), exactly as AIR's untyped Object does.
-        ['getStyle', ssm({ kind: 'object', className: 'Object' }, [ssv('styleName', 'String')])],
+        ['getStyle', ssm({ kind: 'object', className: 'Object' }, [greq('styleName', 'String')])],
         ['clear', ssm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
@@ -5632,7 +5696,7 @@ export class SymbolTable {
         ['pause', nsm({ kind: 'void' }, [])],
         ['resume', nsm({ kind: 'void' }, [])],
         ['togglePause', nsm({ kind: 'void' }, [])],
-        ['seek', nsm({ kind: 'void' }, [{ name: 'offset', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false }])],
+        ['seek', nsm({ kind: 'void' }, [{ name: 'offset', type: 'Number', defaultValue: null, isRest: false }])],
         ['close', nsm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
@@ -5669,7 +5733,7 @@ export class SymbolTable {
         ['_connected', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'NetConnection', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
-        ['connect', ncm({ kind: 'void' }, [nsv('command', 'String')])],
+        ['connect', ncm({ kind: 'void' }, [greq('command', 'String')])],
         ['close', ncm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
@@ -5701,8 +5765,8 @@ export class SymbolTable {
         ['_videoH', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Video', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
-        ['attachNetStream', vdm({ kind: 'void' }, [nsv('netStream', 'NetStream')])],
-        ['attachCamera', vdm({ kind: 'void' }, [nsv('camera', 'Object')])],
+        ['attachNetStream', vdm({ kind: 'void' }, [greq('netStream', 'NetStream')])],
+        ['attachCamera', vdm({ kind: 'void' }, [greq('camera', 'Object')])],
         ['clear', vdm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
@@ -5952,9 +6016,9 @@ export class SymbolTable {
         methods: new Map([
           ['add', pm({ kind: 'object', className: 'Point' }, [geptParam('v')])],
           ['subtract', pm({ kind: 'object', className: 'Point' }, [geptParam('v')])],
-          ['offset', pm({ kind: 'void' }, [gegnum('dx', 0), gegnum('dy', 0)])],
-          ['normalize', pm({ kind: 'void' }, [gegnum('thickness', 0)])],
-          ['setTo', pm({ kind: 'void' }, [gegnum('xa', 0), gegnum('ya', 0)])],
+          ['offset', pm({ kind: 'void' }, [greq('dx', 'Number'), greq('dy', 'Number')])],
+          ['normalize', pm({ kind: 'void' }, [greq('thickness', 'Number')])],
+          ['setTo', pm({ kind: 'void' }, [greq('xa', 'Number'), greq('ya', 'Number')])],
           ['copyFrom', pm({ kind: 'void' }, [geptParam('sourcePoint')])],
           ['clone', pm({ kind: 'object', className: 'Point' }, [])],
           ['equals', pm({ kind: 'bool' }, [geptParam('toCompare')])],
@@ -5963,8 +6027,8 @@ export class SymbolTable {
         staticFields: new Map(),
         staticMethods: new Map([
           ['distance', ps({ kind: 'number' }, [geptParam('pt1'), geptParam('pt2')])],
-          ['interpolate', ps({ kind: 'object', className: 'Point' }, [geptParam('pt1'), geptParam('pt2'), gegnum('f', 0)])],
-          ['polar', ps({ kind: 'object', className: 'Point' }, [gegnum('len', 0), gegnum('angle', 0)])],
+          ['interpolate', ps({ kind: 'object', className: 'Point' }, [geptParam('pt1'), geptParam('pt2'), greq('f', 'Number')])],
+          ['polar', ps({ kind: 'object', className: 'Point' }, [greq('len', 'Number'), greq('angle', 'Number')])],
         ]),
         getters: new Map([['length', pg({ kind: 'number' })]]),
         setters: new Map(),
@@ -5987,16 +6051,16 @@ export class SymbolTable {
         methods: new Map([
           ['intersection', rm({ kind: 'object', className: 'Rectangle' }, [rp('toIntersect')])],
           ['union', rm({ kind: 'object', className: 'Rectangle' }, [rp('toUnion')])],
-          ['contains', rm({ kind: 'bool' }, [gegnum('x', 0), gegnum('y', 0)])],
+          ['contains', rm({ kind: 'bool' }, [greq('x', 'Number'), greq('y', 'Number')])],
           ['containsPoint', rm({ kind: 'bool' }, [geptParam('point')])],
           ['containsRect', rm({ kind: 'bool' }, [rp('rect')])],
           ['intersects', rm({ kind: 'bool' }, [rp('toIntersect')])],
           ['equals', rm({ kind: 'bool' }, [rp('toCompare')])],
-          ['inflate', rm({ kind: 'void' }, [gegnum('dx', 0), gegnum('dy', 0)])],
-          ['offset', rm({ kind: 'void' }, [gegnum('dx', 0), gegnum('dy', 0)])],
+          ['inflate', rm({ kind: 'void' }, [greq('dx', 'Number'), greq('dy', 'Number')])],
+          ['offset', rm({ kind: 'void' }, [greq('dx', 'Number'), greq('dy', 'Number')])],
           ['clone', rm({ kind: 'object', className: 'Rectangle' }, [])],
           ['copyFrom', rm({ kind: 'void' }, [rp('sourceRect')])],
-          ['setTo', rm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('width', 0), gegnum('height', 0)])],
+          ['setTo', rm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('width', 'Number'), greq('height', 'Number')])],
           ['setEmpty', rm({ kind: 'void' }, [])],
           ['isEmpty', rm({ kind: 'bool' }, [])],
           ['toString', rm({ kind: 'string' }, [])],
@@ -6033,18 +6097,18 @@ export class SymbolTable {
         fields: new Map([['a', mf({ kind: 'number' })], ['b', mf({ kind: 'number' })], ['c', mf({ kind: 'number' })], ['d', mf({ kind: 'number' })], ['tx', mf({ kind: 'number' })], ['ty', mf({ kind: 'number' })]]),
         methods: new Map([
           ['identity', mm({ kind: 'void' }, [])],
-          ['translate', mm({ kind: 'void' }, [gegnum('dx', 0), gegnum('dy', 0)])],
-          ['scale', mm({ kind: 'void' }, [gegnum('sx', 0), gegnum('sy', 0)])],
-          ['rotate', mm({ kind: 'void' }, [gegnum('angle', 0)])],
+          ['translate', mm({ kind: 'void' }, [greq('dx', 'Number'), greq('dy', 'Number')])],
+          ['scale', mm({ kind: 'void' }, [greq('sx', 'Number'), greq('sy', 'Number')])],
+          ['rotate', mm({ kind: 'void' }, [greq('angle', 'Number')])],
           ['concat', mm({ kind: 'void' }, [mp('m')])],
           ['invert', mm({ kind: 'void' }, [])],
           ['transformPoint', mm({ kind: 'object', className: 'Point' }, [geptParam('point')])],
           ['deltaTransformPoint', mm({ kind: 'object', className: 'Point' }, [geptParam('point')])],
-          ['createBox', mm({ kind: 'void' }, [gegnum('scaleX', 0), gegnum('scaleY', 0), gegnum('rotation', 0), gegnum('tx', 0), gegnum('ty', 0)])],
-          ['createGradientBox', mm({ kind: 'void' }, [gegnum('width', 0), gegnum('height', 0), gegnum('rotation', 0), gegnum('tx', 0), gegnum('ty', 0)])],
+          ['createBox', mm({ kind: 'void' }, [greq('scaleX', 'Number'), greq('scaleY', 'Number'), gegnum('rotation', 0), gegnum('tx', 0), gegnum('ty', 0)])],
+          ['createGradientBox', mm({ kind: 'void' }, [greq('width', 'Number'), greq('height', 'Number'), gegnum('rotation', 0), gegnum('tx', 0), gegnum('ty', 0)])],
           ['clone', mm({ kind: 'object', className: 'Matrix' }, [])],
           ['copyFrom', mm({ kind: 'void' }, [mp('sourceMatrix')])],
-          ['setTo', mm({ kind: 'void' }, [gegnum('a', 0), gegnum('b', 0), gegnum('c', 0), gegnum('d', 0), gegnum('tx', 0), gegnum('ty', 0)])],
+          ['setTo', mm({ kind: 'void' }, [greq('a', 'Number'), greq('b', 'Number'), greq('c', 'Number'), greq('d', 'Number'), greq('tx', 'Number'), greq('ty', 'Number')])],
           ['toString', mm({ kind: 'string' }, [])],
         ]),
         staticFields: new Map(),
@@ -6131,14 +6195,14 @@ export class SymbolTable {
         methods: new Map([
           ['add', vm({ kind: 'object', className: 'Vector3D' }, [v3('a')])],
           ['subtract', vm({ kind: 'object', className: 'Vector3D' }, [v3('a')])],
-          ['scaleBy', vm({ kind: 'void' }, [gegnum('s', 0)])],
+          ['scaleBy', vm({ kind: 'void' }, [greq('s', 'Number')])],
           ['negate', vm({ kind: 'void' }, [])],
           ['normalize', vm({ kind: 'number' }, [])],
           ['dotProduct', vm({ kind: 'number' }, [v3('a')])],
           ['crossProduct', vm({ kind: 'object', className: 'Vector3D' }, [v3('a')])],
           ['clone', vm({ kind: 'object', className: 'Vector3D' }, [])],
           ['copyFrom', vm({ kind: 'void' }, [v3('sourceVector3D')])],
-          ['setTo', vm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
+          ['setTo', vm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('z', 'Number')])],
           ['project', vm({ kind: 'void' }, [])],
           ['equals', vm({ kind: 'bool' }, [v3('toCompare'), { name: 'allFour', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
           ['toString', vm({ kind: 'string' }, [])],
@@ -6186,8 +6250,8 @@ export class SymbolTable {
           ['transformVector', mm({ kind: 'object', className: 'Vector3D' }, [v3p('v')])],
           ['transformVectors', mm({ kind: 'void' }, [{ name: 'vin', type: 'Vector.<Number>', defaultValue: null, isRest: false }, { name: 'vout', type: 'Vector.<Number>', defaultValue: null, isRest: false }])],
           ['deltaTransformVector', mm({ kind: 'object', className: 'Vector3D' }, [v3p('v')])],
-          ['pointAt', mm({ kind: 'void' }, [v3p('pos'), v3p('at'), v3p('up')])],
-          ['interpolate', mm({ kind: 'void' }, [m3('thisMat'), m3('toMat'), gegnum('percent', 0)])],
+          ['pointAt', mm({ kind: 'void' }, [v3p('pos'), gopt('at', 'Vector3D', { kind: 'Null' }), gopt('up', 'Vector3D', { kind: 'Null' })])],
+          ['interpolate', mm({ kind: 'void' }, [m3('thisMat'), m3('toMat'), greq('percent', 'Number')])],
           ['recompose', mm({ kind: 'bool' }, [{ name: 'components', type: 'Vector.<Vector3D>', defaultValue: null, isRest: false }, orient])],
           ['decompose', mm(vv3(), [orient])],
           ['copyFrom', mm({ kind: 'void' }, [m3('sourceMatrix3D')])],
@@ -6206,17 +6270,17 @@ export class SymbolTable {
             { name: 'transpose', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           ])],
           ['clone', mm({ kind: 'object', className: 'Matrix3D' }, [])],
-          ['appendTranslation', mm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
-          ['prependTranslation', mm({ kind: 'void' }, [gegnum('x', 0), gegnum('y', 0), gegnum('z', 0)])],
-          ['appendScale', mm({ kind: 'void' }, [gegnum('xScale', 0), gegnum('yScale', 0), gegnum('zScale', 0)])],
-          ['prependScale', mm({ kind: 'void' }, [gegnum('xScale', 0), gegnum('yScale', 0), gegnum('zScale', 0)])],
+          ['appendTranslation', mm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('z', 'Number')])],
+          ['prependTranslation', mm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('z', 'Number')])],
+          ['appendScale', mm({ kind: 'void' }, [greq('xScale', 'Number'), greq('yScale', 'Number'), greq('zScale', 'Number')])],
+          ['prependScale', mm({ kind: 'void' }, [greq('xScale', 'Number'), greq('yScale', 'Number'), greq('zScale', 'Number')])],
           ['appendRotation', mm({ kind: 'void' }, [gegnum('degrees', 0), v3p('axis'), { name: 'pivotPoint', type: 'Vector3D', defaultValue: { kind: 'Null' }, isRest: false }])],
           ['prependRotation', mm({ kind: 'void' }, [gegnum('degrees', 0), v3p('axis'), { name: 'pivotPoint', type: 'Vector3D', defaultValue: { kind: 'Null' }, isRest: false }])],
           ['toString', mm({ kind: 'string' }, [])],
         ]),
         staticFields: new Map(),
         staticMethods: new Map([
-          ['interpolate', ms({ kind: 'object', className: 'Matrix3D' }, [m3('thisMat'), m3('toMat'), gegnum('percent', 0)])],
+          ['interpolate', ms({ kind: 'object', className: 'Matrix3D' }, [m3('thisMat'), m3('toMat'), greq('percent', 'Number')])],
           ['identity', ms({ kind: 'object', className: 'Matrix3D' }, [])],
         ]),
         getters: new Map([
@@ -6395,8 +6459,8 @@ export class SymbolTable {
       ]),
       methods: new Map([
         ['dispose', { returnType: { kind: 'void' }, params: [], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
-        ['attachCamera', { returnType: { kind: 'void' }, params: [{ name: 'camera', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
-        ['attachNetStream', { returnType: { kind: 'void' }, params: [{ name: 'netStream', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['attachCamera', { returnType: { kind: 'void' }, params: [{ name: 'camera', type: 'Object', defaultValue: null, isRest: false }], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['attachNetStream', { returnType: { kind: 'void' }, params: [{ name: 'netStream', type: 'Object', defaultValue: null, isRest: false }], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(), staticMethods: new Map(), getters: new Map(), setters: new Map(),
       constructor: { params: [] }, superClass: 'TextureBase', isFinal: false, implements: [],
@@ -6444,7 +6508,7 @@ export class SymbolTable {
           ])],
           ['uploadCompressedTextureFromByteArray', txm({ kind: 'void' }, [
             { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
-            { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: null, isRest: false },
             { name: 'async', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           ])],
           ['dispose', txm({ kind: 'void' }, [])],
@@ -6476,7 +6540,7 @@ export class SymbolTable {
         methods: new Map([
           ['uploadFromBitmapData', cum({ kind: 'void' }, [
             { name: 'bitmapData', type: 'BitmapData', defaultValue: null, isRest: false },
-            { name: 'side', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'side', type: 'uint', defaultValue: null, isRest: false },
             { name: 'miplevel', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
           ])],
           // AIR declares uploadFromByteArray(data, byteArrayOffset, side) on
@@ -6493,7 +6557,7 @@ export class SymbolTable {
           // Texture's body, whose struct layout it does not share.
           ['uploadCompressedTextureFromByteArray', cum({ kind: 'void' }, [
             { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
-            { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'byteArrayOffset', type: 'uint', defaultValue: null, isRest: false },
             { name: 'async', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           ])],
         ]),
@@ -6613,7 +6677,7 @@ export class SymbolTable {
             { name: 'width', type: 'uint', defaultValue: null, isRest: false },
             { name: 'height', type: 'uint', defaultValue: null, isRest: false },
             { name: 'antiAlias', type: 'uint', defaultValue: null, isRest: false },
-            { name: 'enableDepthAndStencil', type: 'Boolean', defaultValue: null, isRest: false },
+            { name: 'enableDepthAndStencil', type: 'Boolean', defaultValue: { kind: 'Bool', value: true }, isRest: false },
             { name: 'wantsBestResolution', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
             { name: 'wantsBestResolutionOnBrowserZoom', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           ])],
@@ -6632,8 +6696,8 @@ export class SymbolTable {
           ['present', c3m({ kind: 'void' }, [])],
           ['drawTriangles', c3m({ kind: 'void' }, [
             { name: 'indexBuffer', type: 'IndexBuffer3D', defaultValue: null, isRest: false },
-            { name: 'firstIndex', type: 'int', defaultValue: null, isRest: false },
-            { name: 'numTriangles', type: 'int', defaultValue: null, isRest: false },
+            { name: 'firstIndex', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'numTriangles', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false },
           ])],
           ['setProgram', c3m({ kind: 'void' }, [{ name: 'program', type: 'Program3D', defaultValue: null, isRest: false }])],
           ['setBlendFactors', c3m({ kind: 'void' }, [
@@ -6644,7 +6708,7 @@ export class SymbolTable {
             { name: 'programType', type: 'String', defaultValue: null, isRest: false },
             { name: 'firstRegister', type: 'int', defaultValue: null, isRest: false },
             { name: 'matrix', type: 'Matrix3D', defaultValue: null, isRest: false },
-            { name: 'transposedMatrix', type: 'Boolean', defaultValue: null, isRest: false },
+            { name: 'transposedMatrix', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           ])],
           ['setTextureAt', c3m({ kind: 'void' }, [
             { name: 'first', type: 'int', defaultValue: null, isRest: false },
@@ -6699,10 +6763,17 @@ export class SymbolTable {
             { name: 'texture', type: 'RectangleTexture', defaultValue: null, isRest: false },
           ])],
           ['drawTrianglesInstanced', c3m({ kind: 'void' }, [
+            // AIR's parameter ORDER is (indexBuffer, numInstances, firstIndex = 0,
+            // numTriangles = -1) -- note numInstances comes SECOND, unlike the
+            // firstIndex-second order of drawTriangles. Ours matched neither the
+            // order nor the defaults, so `drawTrianglesInstanced(ib, 3)` (an
+            // AIR-legal call, measured with mxmlc 51.4.1) failed to compile and,
+            // had it compiled, would have set firstIndex instead of numInstances.
+            // The emitted C helper takes the same order.
             { name: 'indexBuffer', type: 'IndexBuffer3D', defaultValue: null, isRest: false },
-            { name: 'firstIndex', type: 'int', defaultValue: null, isRest: false },
-            { name: 'numTriangles', type: 'int', defaultValue: null, isRest: false },
             { name: 'numInstances', type: 'int', defaultValue: null, isRest: false },
+            { name: 'firstIndex', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+            { name: 'numTriangles', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false },
           ])],
           ['setProgramConstantsFromVector', c3m({ kind: 'void' }, [
             { name: 'programType', type: 'String', defaultValue: null, isRest: false },
@@ -6748,7 +6819,7 @@ export class SymbolTable {
           ])],
           // setScissorRectangle(null) disables scissoring.
           ['setScissorRectangle', c3m({ kind: 'void' }, [
-            { name: 'rectangle', type: 'Rectangle', defaultValue: { kind: 'Null' }, isRest: false },
+            { name: 'rectangle', type: 'Rectangle', defaultValue: null, isRest: false },
           ])],
           ['setStencilReferenceValue', c3m({ kind: 'void' }, [
             { name: 'referenceValue', type: 'uint', defaultValue: null, isRest: false },
@@ -6792,7 +6863,10 @@ export class SymbolTable {
           ['renderMode', s3f({ kind: 'string' })],
         ]),
         methods: new Map([
-          ['requestContext3D', s3m({ kind: 'void' }, [{ name: 'renderMode', type: 'String', defaultValue: null, isRest: false }])],
+          // AIR's parameter name is `context3DRenderMode` (AIR also declares
+          // `profile:String = "baseline"`, which this backend does not consume);
+          // the default is what makes `requestContext3D()` an AIR-legal call.
+          ['requestContext3D', s3m({ kind: 'void' }, [{ name: 'context3DRenderMode', type: 'String', defaultValue: { kind: 'Str', value: 'auto' }, isRest: false }])],
         ]),
         staticFields: new Map(), staticMethods: new Map(),
         getters: new Map([
@@ -6923,6 +6997,7 @@ export class SymbolTable {
       FileFilter: 'flash.net::FileFilter',
       FileListEvent: 'flash.events::FileListEvent',
       NativeWindowBoundsEvent: 'flash.events::NativeWindowBoundsEvent',
+      NativeWindowDisplayStateEvent: 'flash.events::NativeWindowDisplayStateEvent',
       InvokeEvent: 'flash.events::InvokeEvent',
       LocationChangeEvent: 'flash.events::LocationChangeEvent',
       NativeDragEvent: 'flash.events::NativeDragEvent',

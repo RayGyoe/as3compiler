@@ -13,6 +13,7 @@ import './unit/ime.ts';
 import './unit/numeric.ts';
 import './unit/bytearray-amf.ts';
 import './unit/reflection.ts';
+import './unit/reflect.ts';
 import './unit/vector.ts';
 import './unit/platform.ts';
 import './unit/stage3d.ts';

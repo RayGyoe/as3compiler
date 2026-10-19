@@ -65,6 +65,8 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_init.h>
+// _NSGetExecutablePath backs File.applicationDirectory (see as_app_dir in emit.ts).
+#include <mach-o/dyld.h>
 // malloc_zone_pressure_relief: the macOS allocator only returns freed pages to
 // the OS when asked (see gc_trim_os below).
 #include <malloc/malloc.h>
@@ -1095,7 +1097,7 @@ typedef struct { void* vtable; } as_object_header;
 // relies on the toString slot to honor a class's override (AIR calls the virtual
 // toString for String(x) / "" + x; a ShaderRegisterElement must render as 'vt0',
 // not as its C class name -- measured on adl 51.4.1).
-typedef struct { const char* name; void* super; void** ifaces; void* props; void* methods; void* getters; void* setters; int dyn_offset; const char* fqn; int is_proxy; char* (*toString)(void*); bool (*hasOwnProperty)(void*, char*); } as_vtable_header;
+typedef struct { const char* name; void* super; void** ifaces; void* props; void* methods; void* getters; void* setters; int dyn_offset; const char* fqn; int is_proxy; int is_dynamic; int is_final; char* (*toString)(void*); bool (*hasOwnProperty)(void*, char*); } as_vtable_header;
 
 // Reflection table entry: one reflectable field of a class. 'type' encodes the
 // boxed storage kind (1 number, 2 bool, 3 string, 4 int, 5 uint, 6 ref, 7 any;
@@ -1115,7 +1117,7 @@ typedef struct { const char* name; void* super; void** ifaces; void* props; void
 // is the first consumer: AIR serializes only public fields and public getters
 // (measured on adl 51.4.1 -- temp/jsonair5 emits {"p":3} for a class whose only
 // public member is the getter of a private field).
-typedef struct { const char* name; int type; size_t offset; void* vt; const char* fqn; int vis; } as_prop;
+typedef struct { const char* name; int type; size_t offset; void* vt; const char* fqn; int vis; int is_accessor; int is_const; } as_prop;
 
 // Look up an interface vtable by name from the object's vtable interface list.
 // Returns NULL when the object's class does not implement the interface.
@@ -1253,7 +1255,12 @@ static as_value as_prop_read(void* base, const as_prop* p) {
         case 3: case 13: return as_v_str(*(char**)((char*)base + p->offset));
         case 4: return as_v_num((double)(*(int*)((char*)base + p->offset)));
         case 5: return as_v_num((double)(*(unsigned*)((char*)base + p->offset)));
-        case 6: case 10: case 11: case 12: return as_v_obj(*(void**)((char*)base + p->offset));
+        case 6: case 11: case 12: return as_v_obj(*(void**)((char*)base + p->offset));
+        // An Array-typed field must box as tag 6 (Array): as_v_obj would hand out
+        // a tag-4 value whose first word is the array's DATA pointer, so every
+        // reflective consumer of that box (String(field), typeof, a dynamic
+        // access on the result) would read the data pointer as a vtable instead.
+        case 10: return as_v_arr(*(void**)((char*)base + p->offset));
         case 7: return *(as_value*)((char*)base + p->offset);
         case 8: return as_v_i64(*(int64_t*)((char*)base + p->offset));
         case 9: return as_v_u64(*(uint64_t*)((char*)base + p->offset));
@@ -1700,7 +1707,7 @@ static bool as_v_is_nullish(as_value v) { return v.tag == 0 || v.tag == 5; }
 // Method-reflective table entry: 'vis' is the same public/non-public flag as on
 // as_prop, so JSON.stringify emits only public getters. Last field again, so an
 // initializer that omits it spells a public member.
-typedef struct { const char* name; as_value (*fn)(void* _this, as_value* args, int argc); int vis; } as_method;
+typedef struct { const char* name; as_value (*fn)(void* _this, as_value* args, int argc); int vis; const char* sig; } as_method; static as_value as_refl_ctor_stub(void* _this, as_value* args, int argc) { (void)_this; (void)args; (void)argc; return as_v_null(); }
 // ES3 ToNumber(Object): the NUMBER-hint ToPrimitive (valueOf first, then
 // toString) followed by stringToDouble on the primitive. Defined here because
 // it needs the as_method struct above; as_v_to_number forward-declares it.
@@ -3195,7 +3202,7 @@ static as_array* as_array_sort_cb(as_array* a, as_fn cb) { as_array_sort_impl(a,
 // walk, and Object_toString is as_obj_to_str, so the semantics match exactly.
 typedef struct {
     const char* name; void* super; void** ifaces; void* props; void* methods;
-    void* getters; void* setters; int dyn_offset; const char* fqn; int is_proxy;
+    void* getters; void* setters; int dyn_offset; const char* fqn; int is_proxy; int is_dynamic; int is_final;
     char* (*toString)(void*);
     bool (*hasOwnProperty)(void*, char*);
     bool (*propertyIsEnumerable)(void*, char*);
@@ -3216,7 +3223,7 @@ static char* as_object_box_to_str(void* o) { return as_obj_default_str(o); }
 static char* as_number_box_to_str(void* o);
 static char* as_string_box_to_str(void* o);
 
-static as_object_vtable as_object_vt = { "Object", NULL, NULL, NULL, NULL, NULL, NULL, -1, "Object", 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_object_vt = { "Object", NULL, NULL, NULL, NULL, NULL, NULL, -1, "Object", 0, 1, 0, as_object_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 // ---------- boxed Number (Object slot holding a scalar) ----------
 // AS3's Object is the universal base AND auto-boxes scalars: 'var data:Object =
@@ -3232,7 +3239,7 @@ typedef struct as_number {
 
 static char* as_number_box_to_str(void* o) { return as_str_from_double(((as_number*)o)->value); }
 
-static as_object_vtable as_number_vt = { "Number", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Number", 0, as_number_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_number_vt = { "Number", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Number", 0, 1, 0, as_number_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_number* as_number_new(double value) {
     as_number* n = (as_number*)gc_alloc(GCT_NUMBER, sizeof(as_number));
@@ -3263,7 +3270,7 @@ typedef struct as_string {
 
 static char* as_string_box_to_str(void* o) { return ((as_string*)o)->value; }
 
-static as_object_vtable as_string_vt = { "String", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "String", 0, as_string_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_string_vt = { "String", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "String", 0, 1, 0, as_string_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_string* as_string_new(char* value) {
     // AS3 converts the VALUE null to Object as null, not as a String wrapper
@@ -3307,7 +3314,7 @@ typedef struct {
 // tag 7); both now answer the AIR constant.
 static char* as_function_box_to_str(void* o) { (void)o; return "function Function() {}"; }
 
-static as_object_vtable as_function_vt = { "Function", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Function", 0, as_function_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_function_vt = { "Function", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Function", 0, 1, 0, as_function_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_function* as_function_new(as_fn value) {
     // Null-preserving, exactly like as_string_new above: assigning a null Function to
@@ -3344,7 +3351,7 @@ typedef struct as_boolean {
 
 static char* as_boolean_box_to_str(void* o) { return as_str_from_bool(((as_boolean*)o)->value); }
 
-static as_object_vtable as_boolean_vt = { "Boolean", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Boolean", 0, as_boolean_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_boolean_vt = { "Boolean", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "Boolean", 0, 1, 0, as_boolean_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_boolean* as_boolean_new(bool value) {
     as_boolean* b = (as_boolean*)gc_alloc(GCT_BOOLEAN, sizeof(as_boolean));
@@ -3449,8 +3456,8 @@ typedef struct as_xml_list {
 static char* as_xml_box_to_str(void* o);
 static char* as_xml_list_box_to_str(void* o);
 
-static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, as_xml_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
-static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, as_xml_list_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_xml_vt = { "XML", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XML", 0, 0, 1, as_xml_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
+static as_object_vtable as_xml_list_vt = { "XMLList", &as_object_vt, NULL, NULL, NULL, NULL, NULL, -1, "XMLList", 0, 0, 1, as_xml_list_box_to_str, as_object_own_has_own_property, as_object_own_enumerable };
 
 static as_xml_node* as_xml_node_new(char* name) {
     as_xml_node* n = (as_xml_node*)gc_alloc(GCT_XML, sizeof(as_xml_node));
@@ -3996,29 +4003,6 @@ static as_xml_list* as_xml_filter(as_xml_list* l, const char* attr, const char* 
     return as_xml_list_new((as_xml_node**)buf.items, buf.length);
 }
 
-// flash.utils.describeType(value:*):XML — build a minimal <type name="fqn"/> DOM
-// tree describing a Class reference. Starling's AssetManager reads typeXml.@name
-// plus constant/variable nodes of type "Class"; the demo enqueues File values
-// (never Class), so those child lists stay empty — only @name is structurally
-// needed there. The tree is a real as_xml_node, so @name / .child / .(pred) all
-// operate on it exactly as on parsed XML.
-static as_xml_node* as_describe_type(as_class* cls) {
-    const char* fqn = "Object";
-    if (cls && cls->vtable) {
-        const char* f = ((as_vtable_header*)cls->vtable)->fqn;
-        if (f) fqn = f;
-    }
-    as_xml_node* n = as_xml_node_new((char*)"type");
-    as_xml_buf anames = { NULL, 0, 0 };
-    as_xml_buf avals = { NULL, 0, 0 };
-    as_xml_buf_push(&anames, (void*)"name");
-    as_xml_buf_push(&avals, (void*)(char*)fqn);
-    n->attr_count = anames.length;
-    n->attr_names = (char**)anames.items;
-    n->attr_vals = (char**)avals.items;
-    return n;
-}
-
 // Serialize an element back to XML text (best-effort, for toString()).
 // Grow a char* buffer in place (reallocating via as_str_alloc when full) and
 // append a length-delimited chunk. Used by the serializer below; a plain helper
@@ -4043,54 +4027,100 @@ static void as_xml_append(char** outp, size_t* lenp, size_t* capp, const char* c
     *capp = cap;
 }
 
-static char* as_xml_to_string(as_xml_node* n) {
+// 2 spaces per nesting level. Clamped to 62 columns: deeper nesting only widens
+// the output, it never changes what the markup says (there is no real document
+// nested 30 levels deep).
+static void as_xml_indent(char* buf, int level) {
+    int ind = 0;
+    for (int i = 0; i < level && ind < 62; i++) { buf[ind++] = ' '; buf[ind++] = ' '; }
+    buf[ind] = 0;
+}
+
+// MARKUP serialiser -- the value of toXMLString(), and the value toString() falls
+// back to for an element WITH element children. Measured on adl 51.4.1
+// (temp/toxml/), two shape rules:
+//   * element with NO element children -> INLINE: <a b="1">txt</a> and <a b="1"/>
+//   * element WITH element children    -> PRETTY-PRINTED, one item per line,
+//     indented 2 spaces per level: <a> + newline + 2sp + <b/> + newline + </a>
+// Whitespace-only text nodes are pruned -- our parser already trims an element's
+// text and stores NULL for it, so <a> </a> serialises as <a/>, which is also what
+// adl prints. Attributes always use double quotes: a source '<a b=''1''/>' becomes
+// <a b="1"/>.
+// KNOWN DEVIATION (registered in TODO.md): our parser folds every text run of a
+// mixed-content element into ONE trimmed blob, so <a>a<b/>b</a> prints its text as
+// a single item where adl interleaves text and elements. Entities are also not
+// decoded on the way in (a separate parser gap), so text is echoed verbatim.
+static char* as_xml_markup(as_xml_node* n, int level) {
     if (!n) return "";
     if (!n->name) return as_str_dup(n->text ? n->text : "");
-    // <name attr="v" ...>...</name>
+    // <name attr="v" ...>
     size_t cap = 64;
     char* out = as_str_alloc(cap);
     size_t len = 0;
     char q[2]; q[0] = '"'; q[1] = 0;
-    char eq[2]; eq[0] = '='; eq[1] = 0;
     as_xml_append(&out, &len, &cap, "<", 1);
     as_xml_append(&out, &len, &cap, n->name, strlen(n->name));
     for (int i = 0; i < n->attr_count; i++) {
         as_xml_append(&out, &len, &cap, " ", 1);
         as_xml_append(&out, &len, &cap, n->attr_names[i], strlen(n->attr_names[i]));
-        as_xml_append(&out, &len, &cap, eq, 1);
+        as_xml_append(&out, &len, &cap, "=", 1);
         as_xml_append(&out, &len, &cap, q, 1);
         as_xml_append(&out, &len, &cap, n->attr_vals[i], strlen(n->attr_vals[i]));
         as_xml_append(&out, &len, &cap, q, 1);
     }
-    if (n->child_count == 0 && !n->text) {
-        as_xml_append(&out, &len, &cap, "/>", 2);
+    char ib[68];
+    if (n->child_count == 0) {
+        if (!n->text) { as_xml_append(&out, &len, &cap, "/>", 2); return out; }
+        as_xml_append(&out, &len, &cap, ">", 1);
+        as_xml_append(&out, &len, &cap, n->text, strlen(n->text));
+        as_xml_append(&out, &len, &cap, "</", 2);
+        as_xml_append(&out, &len, &cap, n->name, strlen(n->name));
+        as_xml_append(&out, &len, &cap, ">", 1);
         return out;
     }
     as_xml_append(&out, &len, &cap, ">", 1);
-    for (int i = 0; i < n->child_count; i++) {
-        char* cs = as_xml_to_string(n->children[i]);
-        as_xml_append(&out, &len, &cap, cs, strlen(cs));
+    as_xml_indent(ib, level + 1);
+    as_xml_append(&out, &len, &cap, "\\n", 1);
+    if (n->text) {
+        as_xml_append(&out, &len, &cap, ib, strlen(ib));
+        as_xml_append(&out, &len, &cap, n->text, strlen(n->text));
+        as_xml_append(&out, &len, &cap, "\\n", 1);
     }
-    if (n->text) as_xml_append(&out, &len, &cap, n->text, strlen(n->text));
+    for (int i = 0; i < n->child_count; i++) {
+        char* cs = as_xml_markup(n->children[i], level + 1);
+        as_xml_append(&out, &len, &cap, ib, strlen(ib));
+        as_xml_append(&out, &len, &cap, cs, strlen(cs));
+        as_xml_append(&out, &len, &cap, "\\n", 1);
+    }
+    as_xml_indent(ib, level);
+    as_xml_append(&out, &len, &cap, ib, strlen(ib));
     as_xml_append(&out, &len, &cap, "</", 2);
     as_xml_append(&out, &len, &cap, n->name, strlen(n->name));
     as_xml_append(&out, &len, &cap, ">", 1);
     return out;
 }
 
+// Shallow entry point: the markup at indent 0 (the form every other reader uses).
+static char* as_xml_to_string(as_xml_node* n) { return as_xml_markup(n, 0); }
+
 // E4X string value -- what XML.toString(), String(xml) and xml + "" all yield.
 // MEASURED on adl 51.4.1 (temp/tkmeet-mac/xmlstr): a TEXT node yields its text; an
 // element with NO element children yields its text content ("<a b='1'>txt</a>" ->
 // "txt", "<a b='1'/>" -> ""); an element WITH element children yields the MARKUP
-// ("<a><b/></a>" -> "<a>\\n  <b/>\\n</a>"). Our parser already trims an element's
-// text, which is why the whitespace-only case agrees. Known remaining deviations,
-// deliberately not modelled here: AIR prunes whitespace-only text nodes and
-// pretty-prints the markup; as_xml_to_string keeps the source form (TODO.md).
+// ("<a><b/></a>" -> "<a>\\n  <b/>\\n</a>"). Whitespace-only text nodes are pruned
+// (our parser trims, storing NULL), and the markup branch pretty-prints exactly
+// like toXMLString() -- adl prints the SAME string for both (temp/toxml/).
 static char* as_xml_string_value(as_xml_node* n) {
     if (!n) return "";
     // A String handed to AS3 is a VALUE: always copy the node's own buffer (see
     // as_str_dup) -- the node may be collected while AS3 still holds the string.
     if (!n->name) return as_str_dup(n->text ? n->text : "");
+    // NOTE: an element with attributes but no children still reduces to its
+    // TEXT here, and that is deliberate: AIR's XML string value follows the JSX
+    // rule (children => markup, otherwise the text), and xml.text() shares this
+    // path. Long-form markup is as_xml_markup's job (toXMLString). Written the
+    // other way round it broke Language.init()'s embedded-XML parsing: every
+    // localised constant came back as its raw '<label name=...>' template.
     if (n->child_count == 0) return as_str_dup(n->text ? n->text : "");
     return as_xml_to_string(n);
 }
@@ -4102,6 +4132,21 @@ static char* as_xml_string_value(as_xml_node* n) {
 static char* as_xml_list_to_string(as_xml_list* l) {
     if (!l || l->length == 0) return "";
     if (l->length == 1) return as_xml_string_value(l->items[0]);
+    char* out = (char*)"";
+    for (int i = 0; i < l->length; i++) {
+        if (i > 0) out = as_str_concat(out, "\\n");
+        out = as_str_concat(out, as_xml_to_string(l->items[i]));
+    }
+    return out;
+}
+
+// XMLList.toXMLString(): ALWAYS markup. That is the whole difference from
+// toString() above, which hands a ONE-item list over to the item's string value
+// (adl 51.4.1, temp/toxml/: <i>a</i> -> toString "a" but toXMLString "<i>a</i>").
+// 0 items -> "", otherwise the item markups joined by a newline (same join as
+// toString's multi-item form).
+static char* as_xml_list_to_xml_string(as_xml_list* l) {
+    if (!l || l->length == 0) return "";
     char* out = (char*)"";
     for (int i = 0; i < l->length; i++) {
         if (i > 0) out = as_str_concat(out, "\\n");
@@ -5649,6 +5694,16 @@ static as_value as_exception_v = {0, 0.0, NULL};
 static int as_exception_boxed = 0;
 static jmp_buf* as_jmp_stack[64];
 static int as_jmp_depth = 0;
+// Frame-boundary recovery for an UNCAUGHT error. AIR does not terminate the
+// process on an uncaught error -- it reports it and keeps running, so one bad
+// listener costs its own dispatch rather than the whole application. (Calling
+// exit(1) here instead used to strand the process: with 50+ live threads the
+// native teardown deadlocks in CEF/ANE DLL-detach, which is what a Windows AOT
+// build did on the very first uncaught #1009.) Stage_dispatchFrame plants this
+// jmp_buf; longjmp'ing to it gives AIR's behaviour. With no frame on the stack
+// (a non-GUI program, or an error before the first frame) exit(1) still applies.
+static jmp_buf as_frame_jmp;
+static int as_frame_guard = 0;
 
 static const char* as_error_message(void* e) {
     return e ? ((as_error_view*)e)->message : "unknown";
@@ -5665,6 +5720,14 @@ static _Noreturn void as_throw_val(as_value v) {
         // message); a non-object thrown value has no message slot, so stringify
         // it. (The adl-exact uncaught format is a separate, still-open item.)
         const char* m = (v.tag == 4 && v.ptr != NULL) ? as_error_message(v.ptr) : as_v_str_val(v);
+        // An uncaught error inside a frame is recovered at the frame boundary
+        // (see as_frame_jmp): report it and let the loop carry on.
+        if (as_frame_guard != 0) {
+            fprintf(stderr, "Uncaught exception: %s\\n", m);
+            fflush(stderr);
+            as_frame_guard = 0;
+            longjmp(as_frame_jmp, 1);
+        }
         fprintf(stderr, "Uncaught exception: %s\\n", m);
         fflush(stderr);
         exit(1);
@@ -5684,6 +5747,13 @@ static _Noreturn void as_throw(void* e) {
     as_exception = e;
     as_exception_boxed = 0;
     if (as_jmp_depth == 0) {
+        // Recover at the frame boundary when a frame is on the stack.
+        if (as_frame_guard != 0) {
+            fprintf(stderr, "Uncaught exception: %s\\n", as_error_message(e));
+            fflush(stderr);
+            as_frame_guard = 0;
+            longjmp(as_frame_jmp, 1);
+        }
         fprintf(stderr, "Uncaught exception: %s\\n", as_error_message(e));
         fflush(stderr);
         exit(1);
@@ -6208,6 +6278,11 @@ static void gc_scan(gc_header* h) {
 static void as_async_mark_roots(void);
 static void as_sock_mark_roots(void);
 static void as_audio_mark_roots(void);
+// Native-extension roots: the AS3 ExtensionContext objects a live FREContext
+// points at, plus every FREObject handle the running extension call created.
+// Defined in the FRE preamble (fre.ts), which is emitted after this file, so it
+// follows the same forward-declaration shape as the three walks above.
+static void as_fre_mark_ctx_roots(void);
 static void gc_mark_internal_roots(void) {
     for (int i = 0; i < as_timer_count; i++) {
         if (as_timers[i].alive) {
@@ -6224,6 +6299,7 @@ static void gc_mark_internal_roots(void) {
     as_async_mark_roots();
     as_sock_mark_roots();
     as_audio_mark_roots();
+    as_fre_mark_ctx_roots();
     if (as_exception_boxed) gc_mark_value(as_exception_v);
     else gc_mark_ptr(as_exception);
 }
@@ -8180,6 +8256,7 @@ extern void sk_canvas_clear(void* canvas, unsigned rgb);
 extern void sk_canvas_clear_transparent(void* canvas);
 extern void sk_canvas_save(void* canvas);
 extern void sk_canvas_restore(void* canvas);
+extern void sk_canvas_reset(void* canvas);
 extern void sk_canvas_translate(void* canvas, double x, double y);
 extern void sk_canvas_rotate(void* canvas, double degrees);
 extern void sk_canvas_scale(void* canvas, double sx, double sy);
@@ -8363,6 +8440,7 @@ static inline void as_skia_canvas_concat(void* c, double a, double b, double cc,
 static inline void as_skia_canvas_save_layer_alpha(void* c, double a) { sk_canvas_save_layer_alpha(c, a); }
 static inline void as_skia_canvas_save(void* c) { sk_canvas_save(c); }
 static inline void as_skia_canvas_restore(void* c) { sk_canvas_restore(c); }
+static inline void as_skia_canvas_reset(void* c) { sk_canvas_reset(c); }
 static inline void* as_skia_path_new(void) { return sk_path_new(); }
 static inline void as_skia_path_delete(void* p) { sk_path_delete(p); }
 static inline void as_skia_path_move_to(void* p, double x, double y) { sk_path_move_to(p, x, y); }
@@ -8499,6 +8577,10 @@ extern int sk_window_get_visible(int id);
 extern void sk_window_set_title(int id, const char* title);
 extern void sk_window_set_bounds(int id, int x, int y, int w, int h);
 extern void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h);
+// Frame borders (title bar / edges), for NativeWindow.globalToScreen.
+extern void sk_window_get_borders(int id, int* top, int* left, int* bottom, int* right);
+// NativeApplication.exit(): end the event loop with windows still open.
+extern void sk_window_request_exit(void);
 extern void sk_window_close(int id);
 extern int sk_window_is_closed(int id);
 extern void sk_window_activate(int id);
@@ -8699,6 +8781,27 @@ static inline void as_window_get_bounds(int id, int* x, int* y, int* w, int* h) 
     (void)id; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0;
 #endif
 }
+// Frame borders (title bar / window edge) of a chrome-decorated window, in
+// physical pixels. NativeWindow.globalToScreen needs them: AIR's bounds is the
+// OUTER frame rect while globalToScreen is measured from the CLIENT area's
+// top-left, so the border has to be added back on the way out -- the inverse of
+// what sk_window_get_bounds does. adl 51.4.1: bounds (26,26) with borders
+// (8,31) answers globalToScreen(0,0) = (34,57).
+static inline void as_window_get_borders(int id, int* top, int* left, int* bottom, int* right) {
+#ifdef ASC_USE_WINDOW
+    sk_window_get_borders(id, top, left, bottom, right);
+#else
+    (void)id; if (top) *top = 0; if (left) *left = 0; if (bottom) *bottom = 0; if (right) *right = 0;
+#endif
+}
+// NativeApplication.exit(): ask the event loop to end now, with every window
+// still open. The loop tears the windows down as usual and then returns, so the
+// process exits with the same code as an autoExit teardown.
+static inline void as_window_request_exit(void) {
+#ifdef ASC_USE_WINDOW
+    sk_window_request_exit();
+#endif
+}
 // Requests teardown; the window is retired at the next frame boundary, which is
 // what makes NativeWindow.closed remain false for the rest of the call that
 // invoked close() (measured against adl).
@@ -8835,7 +8938,11 @@ static inline void as_skia_gpu_draw_texture(void* c, void* tex, int w, int h, do
     (void)c; (void)tex; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh;
 #endif
 }
-// Query the primary display resolution (Stage.fullScreenWidth/fullScreenHeight).
+// Query the primary display size for Stage.fullScreenWidth/fullScreenHeight and
+// Capabilities.screenResolutionX/Y. These are LOGICAL units (AIR's DIP), which on
+// a HiDPI Windows desktop is NOT the pixel count -- adl 51.4.1 reports 2560x1707
+// on a 3840x2560 desktop at 150% scaling, and screenDPI 96. The glue picks the
+// SDL query that reports that space (see sk_window_get_display_size).
 // Returns 0 (and writes 0) when the SDL2 window backend is not linked in.
 static inline int as_window_get_display_size(int* w, int* h) {
 #ifdef ASC_USE_WINDOW
@@ -8919,6 +9026,7 @@ static inline void as_skia_canvas_concat(void* c, double a, double b, double cc,
 static inline void as_skia_canvas_save_layer_alpha(void* c, double a) { (void)c; (void)a; }
 static inline void as_skia_canvas_save(void* c) { (void)c; }
 static inline void as_skia_canvas_restore(void* c) { (void)c; }
+static inline void as_skia_canvas_reset(void* c) { (void)c; }
 static inline void* as_skia_path_new(void) { return NULL; }
 static inline void as_skia_path_delete(void* p) { (void)p; }
 static inline void as_skia_path_move_to(void* p, double x, double y) { (void)p; (void)x; (void)y; }
@@ -9008,6 +9116,16 @@ static inline int as_window_get_visible(int id) { (void)id; return 0; }
 static inline void as_window_set_title(int id, const char* title) { (void)id; (void)title; }
 static inline void as_window_set_bounds(int id, int x, int y, int w, int h) { (void)id; (void)x; (void)y; (void)w; (void)h; }
 static inline void as_window_get_bounds(int id, int* x, int* y, int* w, int* h) { (void)id; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; }
+// No window => no non-client frame, so globalToScreen degenerates to the window's
+// own origin (a headless build has no screen to convert into anyway).
+static inline void as_window_get_borders(int id, int* top, int* left, int* bottom, int* right) { (void)id; if (top) *top = 0; if (left) *left = 0; if (bottom) *bottom = 0; if (right) *right = 0; }
+// No event loop to end: NativeApplication.exit() in a headless build is a no-op
+// whose observable effect is simply that the program stops there.
+static inline void as_window_request_exit(void) { }
+// No window => no non-client frame, so globalToScreen degenerates to the window's
+// own origin (a headless build has no screen to convert into anyway).
+// No event loop to end: NativeApplication.exit() in a headless build is a no-op
+// whose observable effect is simply that the program stops there.
 static inline void as_window_close(int id) { (void)id; }
 static inline int as_window_is_closed(int id) { (void)id; return 1; }
 static inline void as_window_activate(int id) { (void)id; }
@@ -11556,14 +11674,86 @@ static void as_system_output(const char* s) {
 
 // ---------- flash.system.Capabilities environment info ----------
 // Capabilities is a 'final' static read-only class (no instantiable ClassInfo);
-// these helpers back its static getters. os/cpuArchitecture are conditional-
-// compile constants; version is injected at codegen time from package.json (NOT
-// a runtime lookup — the compiled binary has no package.json to read).
+// these helpers back its static getters. cpuArchitecture is a conditional-compile
+// constant; version is injected at codegen time from package.json (NOT a runtime
+// lookup — the compiled binary has no package.json to read).
+//
+// os reports an OS *name plus version* ("Windows 11", "Windows Server 2012 R2"), because
+// AIR's does and apps depend on it: they read the version out of the string
+// (Capabilities.os.split(" ")[1]) and hash the whole thing into a device fingerprint.
+// The Windows branch therefore reproduces AIR 51.4.1's version->name table, recovered from
+// the shipped runtime binary (the VerifyVersionInfoW chain that feeds its string pool).
+// AIR queries VerifyVersionInfoW, which is subject to the manifest version lie: a process
+// that does not declare the supportedOS compatibility element is answered 6.2 no matter
+// how new the OS is: VerifyVersionInfoW(==10.0) answers false and GetVersionExW answers
+// "6.2 build 9200", while RtlGetVersion answers "10.0 build 26200" — copying AIR's query
+// verbatim would thus report Windows 11 as Windows 8. Our binaries carry no manifest, so
+// the true version comes from ntdll's RtlGetVersion (resolved dynamically, so no import
+// library is added) and feeds that same table; the observable result then matches AIR's.
+// macOS/Linux/WASI still report the bare family name. AIR appends a version there too,
+// but no Darwin/Linux release->name table can be verified from a Windows dev host, so the
+// gap is left stated rather than guessed at.
+#ifdef _WIN32
+typedef struct {
+    unsigned long dwOSVersionInfoSize;
+    unsigned long dwMajorVersion;
+    unsigned long dwMinorVersion;
+    unsigned long dwBuildNumber;
+    unsigned long dwPlatformId;
+    wchar_t szCSDVersion[128];
+    unsigned short wServicePackMajor;
+    unsigned short wServicePackMinor;
+    unsigned short wSuiteMask;
+    unsigned char wProductType;   // 1 = VER_NT_WORKSTATION, anything else is a server SKU
+    unsigned char wReserved;
+} as_os_version_info;
+typedef long (__stdcall *as_rtl_get_version_fn)(as_os_version_info*);
+typedef int (__stdcall *as_get_system_metrics_fn)(int);
+// AIR's table verbatim. Windows 11 is 10.0 with build >= 22000, which AIR applies as a
+// promotion on top of the 10.0 entry; server SKUs differ only by wProductType.
+static const char* as_win_os_name(unsigned long major, unsigned long minor, unsigned long build,
+                                 unsigned short suite, int server) {
+    if (major == 10 && minor == 0) {
+        if (build >= 22000) return server ? "Windows 11 Server" : "Windows 11";
+        return server ? "Windows 10 Server" : "Windows 10";
+    }
+    if (major == 6 && minor == 3) return server ? "Windows Server 2012 R2" : "Windows 8.1";
+    if (major == 6 && minor == 2) return server ? "Windows Server 2012" : "Windows 8";
+    if (major == 6 && minor == 1) return server ? "Windows Server 2008 R2" : "Windows 7";
+    if (major == 6 && minor == 0) return server ? "Windows Server 2008" : "Windows Vista";
+    if (major == 5 && minor == 2) {
+        if (!server && suite == 0x8000) return "Windows Home Server";   // VER_SUITE_WH_SERVER
+        if (!server) return "Windows XP 64";                            // XP x64 Edition
+        // SM_SERVERR2 (= 89) tells 2003 R2 from plain 2003. Resolved dynamically because
+        // headless builds do not link user32, and this helper is always compiled in.
+        HMODULE user32 = GetModuleHandleA("user32.dll");
+        as_get_system_metrics_fn metrics = user32
+            ? (as_get_system_metrics_fn)(void*)GetProcAddress(user32, "GetSystemMetrics") : NULL;
+        if (metrics != NULL && metrics(89) != 0) return "Windows Server 2003 R2";
+        return "Windows Server 2003";
+    }
+    if (major == 5 && minor == 1) return "Windows XP";
+    if (major == 5 && minor == 0) return "Windows 2000";
+    return "Windows";   // AIR's fallback for anything its table does not name
+}
+#endif
 static const char* as_cap_os(void) {
 #ifdef __APPLE__
     return "Mac OS";
 #elif defined(_WIN32)
-    return "Windows";
+    // Resolve once: the OS cannot change while the process runs.
+    static const char* cached = NULL;
+    if (cached) return cached;
+    as_os_version_info vi;
+    memset(&vi, 0, sizeof(vi));
+    vi.dwOSVersionInfoSize = (unsigned long)sizeof(vi);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    as_rtl_get_version_fn rtl = ntdll
+        ? (as_rtl_get_version_fn)(void*)GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    // Unreachable in practice (ntdll is always loaded) -> degrade to the family name.
+    if (rtl == NULL || rtl(&vi) != 0) return (cached = "Windows");
+    return (cached = as_win_os_name(vi.dwMajorVersion, vi.dwMinorVersion, vi.dwBuildNumber,
+                                    vi.wSuiteMask, vi.wProductType != 1));
 #elif defined(__wasi__)
     return "WASI";
 #else
@@ -11635,14 +11825,22 @@ static char* as_user_agent_default(void) {
     return (char*)"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) AdobeAIR/50.0";
 #endif
 }
-// Capabilities.language / Capabilities.languages report the SYSTEM language as a
-// BCP-47 tag, NOT the process locale. Measured on adl 51.4.1 / macOS 26.6.2:
-// Capabilities.language == "zh-CN" and Capabilities.languages == ["zh-CN"] while
-// this process's LANG is "en_US.UTF-8" — the process locale is simply a different
-// thing from the user's UI language, and AIR reads the latter (CFLocale). The old
-// implementation read LANG and truncated it to two letters, so "zh-CN" could never
-// be produced: an application that compares against the exact "zh-CN" (TalkMED's
-// cn.edoctor.utils.Language.as) then silently fell back to English.
+// Capabilities.language / Capabilities.languages are the USER INTERFACE language,
+// never the process locale and never the region format. Measured on adl 51.4.1:
+//   - macOS 26.6.2: language == "zh-CN", languages == ["zh-CN"], while this
+//     process's LANG is "en_US.UTF-8";
+//   - Windows 11: language == "zh-CN", languages == ["zh-CN","en-US"] — and both
+//     STAYED exactly that after Set-Culture moved the region format to de-DE and
+//     again after de-DE was put at the head of the OS language list, so neither
+//     the user locale (GetUserDefaultLocaleName answered de-DE, LangID 0x0407)
+//     nor the OrderedLanguageList registry value is the source. Only the
+//     region-format switch was visible to a fresh process; the language list
+//     takes effect at the next sign-in, but AIR ignored both.
+// The old implementation read LANG and truncated it to two letters. On Windows
+// LANG is unset (launched from Explorer) or whatever the shell exported, so it
+// answered "en" there unconditionally: the app's utils.Language.as
+// switches to English unless Capabilities.language == "zh-CN", so a Chinese
+// Windows box silently got an English UI.
 //
 // The CoreFoundation HEADERS cannot be included here — they pull in MacTypes.h,
 // which defines struct Point, the name this compiler gives flash.geom.Point
@@ -11701,41 +11899,145 @@ static void as_cap_lang_normalize(const char* tag, char* out, size_t cap) {
     out[n] = 0;
 }
 
-// Capabilities.language ("zh-CN"). On Apple this is the current locale's
-// identifier, i.e. CFLocaleCopyCurrent() — the same source AIR reads, so a user
-// override made with 'defaults write -g AppleLocale' is picked up here too. The
-// process locale is the fallback for non-Apple targets and for an Apple build
-// where CoreFoundation yields nothing.
+// The values Capabilities.language is ALLOWED to report. It is a closed set, not a
+// locale tag: the ActionScript 3.0 reference (flash.system.Capabilities.language)
+// says the value is "a lowercase two-letter language code from ISO 639-1" with an
+// uppercase ISO 3166 country code appended for Chinese only, lists exactly these
+// languages (plus zh-CN / zh-TW), and warns that "the value of Capabilities.language
+// property is limited to the possible values on this list" — which is why it tells
+// applications to read Capabilities.languages[0] instead. A language outside the
+// table therefore reports "xu", the documented "Other/unknown" value, and not its
+// own code.
+static const char* const as_cap_air_langs[] = {
+    "cs", "da", "nl", "en", "fi", "fr", "de", "hu", "it", "ja", "ko", "nb",
+    "pl", "pt", "ru", "es", "sv", "tr", NULL
+};
+
+// Split a BCP-47/POSIX locale tag into its primary language (lower-cased) and its
+// region (upper-cased, empty when the tag has none). Script and variant subtags are
+// skipped: AIR's language value never carries one, and for the one case where the
+// script matters (Chinese) the region already picks between the only two values AIR
+// has ever reported for it.
+static void as_cap_lang_split(const char* tag, char* lang, size_t lang_cap, char* region, size_t region_cap) {
+    size_t ln = 0, rn = 0;
+    if (lang_cap > 0) lang[0] = 0;
+    if (region_cap > 0) region[0] = 0;
+    if (tag == NULL) return;
+    while (*tag != 0 && *tag != '-' && *tag != '_' && *tag != '.' && *tag != '@') {
+        char c = *tag++;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (ln + 1 < lang_cap) lang[ln++] = c;
+    }
+    if (lang_cap > 0) lang[ln] = 0;
+    while (*tag == '-' || *tag == '_') {
+        const char* start;
+        size_t len = 0;
+        tag++;
+        start = tag;
+        while (start[len] != 0 && start[len] != '-' && start[len] != '_' && start[len] != '.' && start[len] != '@') len++;
+        // A region subtag is two letters or three digits; anything else here is a
+        // script ("Hans") or a variant, neither of which this value reports.
+        if (len == 2 || (len == 3 && start[0] >= '0' && start[0] <= '9')) {
+            size_t i;
+            for (i = 0; i < len && rn + 1 < region_cap; i++) {
+                char c = start[i];
+                if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+                region[rn++] = c;
+            }
+            break;
+        }
+        tag += len;
+    }
+    if (region_cap > 0) region[rn] = 0;
+}
+
+// Map a locale tag onto Capabilities.language. See as_cap_air_langs for why a
+// non-table language collapses to "xu". Chinese keeps its region because zh-CN and
+// zh-TW are the only two Chinese values AIR reports (a bare "zh" -- LANGID
+// SUBLANG_NEUTRAL, or a script-only tag -- is Simplified Chinese).
+static const char* as_cap_language_from_tag(const char* tag, char* out, size_t cap) {
+    char lang[16];
+    char region[16];
+    int i;
+    as_cap_lang_split(tag, lang, sizeof(lang), region, sizeof(region));
+    if (lang[0] == 0) return "xu";
+    if (strcmp(lang, "zh") == 0) {
+        int traditional = (strcmp(region, "TW") == 0 || strcmp(region, "HK") == 0 || strcmp(region, "MO") == 0);
+        snprintf(out, cap, "%s", traditional ? "zh-TW" : "zh-CN");
+        return out;
+    }
+    for (i = 0; as_cap_air_langs[i] != NULL; i++) {
+        if (strcmp(lang, as_cap_air_langs[i]) == 0) {
+            snprintf(out, cap, "%s", lang);
+            return out;
+        }
+    }
+    return "xu";
+}
+
+// Capabilities.language ("zh-CN"). AIR reports the UI language here, which the
+// reference spells out for Windows: "this property returns the user interface (UI)
+// language, which refers to the language used for all menus, dialog boxes, error
+// messages, and help files". macOS reads CFLocaleCopyCurrent() (the same source adl
+// uses there, so a 'defaults write -g AppleLocale' override is picked up); Windows
+// rebuilds AIR's tag from GetUserDefaultUILanguage(); any other target falls back to
+// the process locale, which is all a POSIX target offers.
 static const char* as_cap_language(void) {
+    static char tag[64];
     static char out[32];
+    tag[0] = 0;
 #if defined(ASC_HAVE_CFLOCALE)
-    ASC_CFRef loc = CFLocaleCopyCurrent();
-    if (loc != NULL) {
-        ASC_CFRef id = CFLocaleGetIdentifier(loc);
-        char buf[96];
-        int ok = 0;
-        buf[0] = 0;
-        if (id != NULL) ok = CFStringGetCString((ASC_CFStringRef)id, buf, (long)sizeof(buf), ASC_CF_UTF8) ? 1 : 0;
-        CFRelease(loc);
-        if (ok) {
-            as_cap_lang_normalize(buf, out, sizeof(out));
-            if (out[0] != 0) return out;
+    {
+        ASC_CFRef loc = CFLocaleCopyCurrent();
+        if (loc != NULL) {
+            ASC_CFRef id = CFLocaleGetIdentifier(loc);
+            int ok = 0;
+            if (id != NULL) ok = CFStringGetCString((ASC_CFStringRef)id, tag, (long)sizeof(tag), ASC_CF_UTF8) ? 1 : 0;
+            CFRelease(loc);
+            if (!ok) tag[0] = 0;
         }
     }
 #endif
-    {
-        const char* lang = getenv("LANG");
-        if (!lang) lang = getenv("LC_ALL");
-        if (!lang || !lang[0]) return "en";
-        as_cap_lang_normalize(lang, out, sizeof(out));
-        return out[0] != 0 ? out : "en";
+#if defined(_WIN32)
+    // The ISO 639-1 name plus the ISO 3166 region of the UI language is the pair
+    // AIR's own table is keyed by (the region is what separates Simplified from
+    // Traditional Chinese). GetLocaleInfoW on the concrete LCID is used because
+    // LOCALE_SISO639LANGNAME reports "zh" for every Chinese LANGID.
+    if (tag[0] == 0) {
+        LCID lcid = MAKELCID(GetUserDefaultUILanguage(), SORT_DEFAULT);
+        WCHAR wname[64];
+        if (GetLocaleInfoW(lcid, LOCALE_SISO639LANGNAME, wname, 64) > 0 &&
+            WideCharToMultiByte(CP_UTF8, 0, wname, -1, tag, (int)sizeof(tag), NULL, NULL) > 0) {
+            size_t n = strlen(tag);
+            if (GetLocaleInfoW(lcid, LOCALE_SISO3166CTRYNAME, wname, 64) > 0 && n + 2 < sizeof(tag)) {
+                tag[n] = '-';
+                if (WideCharToMultiByte(CP_UTF8, 0, wname, -1, tag + n + 1, (int)(sizeof(tag) - n - 1), NULL, NULL) <= 0) tag[n] = 0;
+            }
+        } else {
+            tag[0] = 0;
+        }
     }
+#endif
+    if (tag[0] == 0) {
+        const char* env = getenv("LANG");
+        if (!env) env = getenv("LC_ALL");
+        if (env && env[0]) {
+            size_t n = strlen(env);
+            if (n >= sizeof(tag)) n = sizeof(tag) - 1;
+            memcpy(tag, env, n);
+            tag[n] = 0;
+        }
+    }
+    if (tag[0] == 0) return "en";
+    return as_cap_language_from_tag(tag, out, sizeof(out));
 }
 
 // Capabilities.languages: the user's preferred languages, most preferred first,
-// each normalized exactly like 'language'. Falls back to the single entry that
-// 'language' reports when no preference list is available, so the AIR invariant
-// "languages[0] == language" always holds.
+// each normalized exactly like 'language'. When no preference list is available the
+// single entry that 'language' reports is used instead, which is what keeps the AIR
+// relation between the two -- languages[0] and language agree on the PRIMARY language
+// (the reference says "generally has the same primary language ID"; they are not
+// always equal, e.g. "en" vs "en-US") -- true even on such a host.
 static as_array* as_cap_languages(void) {
     as_array* list = as_array_new();
 #if defined(ASC_HAVE_CFLOCALE)
@@ -11756,6 +12058,33 @@ static as_array* as_cap_languages(void) {
         CFRelease(prefs);
     }
 #endif
+#if defined(_WIN32)
+    // GetUserPreferredUILanguages answers the same list adl does, as a
+    // double-NUL-terminated run of RFC 4646 tags ("zh-CN", "en-US") in preference
+    // order — verified byte-for-byte against adl 51.4.1 on the machine used for the
+    // measurements above. NOTE it reflects the EFFECTIVE UI languages: a language
+    // moved to the head of the OS list reads back here (and in AIR) only after the
+    // next sign-in. The buffer length is passed in WCHARs, which is also valid (and
+    // merely conservative) should the API measure it in bytes.
+    {
+        WCHAR wbuf[512];
+        ULONG cnt = 0;
+        ULONG cap = (ULONG)(sizeof(wbuf) / sizeof(WCHAR));
+        if (GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &cnt, wbuf, &cap)) {
+            const WCHAR* w = wbuf;
+            ULONG i;
+            for (i = 0; i < cnt && w[0] != 0; i++) {
+                char buf[96];
+                if (WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, (int)sizeof(buf), NULL, NULL) > 0) {
+                    char norm[32];
+                    as_cap_lang_normalize(buf, norm, sizeof(norm));
+                    if (norm[0] != 0 && strcmp(norm, "C") != 0) as_array_push(list, as_v_str(as_str_dup(norm)));
+                }
+                w += lstrlenW(w) + 1;
+            }
+        }
+    }
+#endif
     if (list->length == 0) as_array_push(list, as_v_str(as_str_dup((char*)as_cap_language())));
     return list;
 }
@@ -11771,11 +12100,17 @@ static int as_cap_screen_resolution_y(void) {
     as_window_get_display_size(&w, &h);
     return h;
 }
-// DPI: AIR reports the primary display's dots-per-inch. The window backend does
-// not expose a per-display DPI query, so this is a fixed 72 (AIR's standard
-// fallback) — a documented subset, not a real physical-DPI read.
+// Capabilities.screenDPI: a platform BASELINE, not the display's real DPI and not
+// scaled by the desktop's zoom. Measured against adl 51.4.1 at 150% Windows
+// scaling (where SDL_GetDisplayDPI answers 144): adl says 96. macOS says 72. Both
+// are constants on the platform rather than a read of the panel, so answering the
+// physical DPI here would be a silent divergence on every HiDPI desktop.
 static double as_cap_screen_dpi(void) {
+#ifdef _WIN32
+    return 96.0;
+#else
     return 72.0;
+#endif
 }
 // Capabilities.serverString: AIR returns a URL-encoded summary of the runtime —
 // "a URL-encoded string containing the properties of the player, including version,
