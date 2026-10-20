@@ -40,6 +40,12 @@ rem Intermediates land in temp\ (git-ignored) rather than beside the sources. Th
 rem staged DLLs are the committed fixture, so those two copies are the only things
 rem this script writes into the example trees.
 rem
+rem The macOS half of this recipe is examples/ane/build-ane.sh -- the same one
+rem compile, the same two trees, the same guards, with the platform's own file
+rem names (a .dylib linked against libasaot.dylib instead of a .dll against
+rem asaot.lib). Neither script can substitute for the other, and the descriptor
+rem declares both platform entries so either host finds the one it asks for.
+rem
 rem Usage: build-ane.bat
 
 setlocal

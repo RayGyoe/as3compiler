@@ -17,3 +17,9 @@
 # `text` normalizes to LF in the repository and `eol=crlf` restores CRLF on
 # checkout, on every host, so the result no longer depends on who clones it.
 *.bat text eol=crlf
+
+# The shell siblings (lib/build-asaot.sh, examples/ane/build-ane.sh) are the same
+# kind of file with the opposite requirement: a CRLF checkout would make sh treat
+# the trailing \r as part of every command. Declared rather than left to the
+# cloner's autocrlf, for the same reason as above.
+*.sh text eol=lf

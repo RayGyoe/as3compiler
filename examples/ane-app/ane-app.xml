@@ -8,7 +8,8 @@
   extension by id and never by path, exactly as AIR requires. Where that id is
   found is the build's business, and the answer is a search over the app
   directory's ext-aot/, lib/ and ext-folder/ (docs/zh-cn/ane.md §4.6) -- the
-  staging tree built by examples/ane/build-ane.bat is what ext-aot/ holds here.
+  staging tree built by examples/ane/build-ane.bat (Windows) / build-ane.sh
+  (macOS) is what ext-aot/ holds here.
   Both halves matter: the id is stable across the AIR build and the recompiled
   one, so switching which of the two an app runs under is a directory order,
   not a source edit.

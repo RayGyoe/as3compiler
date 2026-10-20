@@ -155,6 +155,42 @@ export function aneHostDirName(platform: string): string {
 }
 
 /**
+ * The host library FILE NAME for an AIR platform key.
+ *
+ * Deliberately derived from aneHostDirName's answer rather than from the key a
+ * second time: the directory and the file name are decided together
+ * (`lib/bin/<dir>/<file>`), so one switch keeps them from drifting apart. A key
+ * with no directory throws through aneHostDirName, which is the same answer
+ * src/index.ts and `as-aot doctor` already give.
+ *
+ * Windows splits the two roles -- `asaot.dll` is what the running program loads,
+ * `asaot.lib` is what an extension LINKS against -- while on macOS one
+ * `libasaot.dylib` is both. That is why this returns a single name while the C side
+ * carries two macros (AS_FRE_LIB_NAME / AS_FRE_LINK_NAME).
+ */
+export function aneHostLibName(platform: string): string {
+  switch (aneHostDirName(platform)) {
+    case 'windows-x64':
+    case 'windows-x86':
+      return 'asaot.dll';
+    case 'macos-x86-64':
+      return 'libasaot.dylib';
+    case 'ios-arm64':
+      // Named rather than guessed: lib/bin/ios-arm64/ would hold a STATIC archive an
+      // iOS application links into its own image, which is the opposite of a library
+      // dlopen()ed at run time -- so lending it the macOS name would promise a file
+      // no build could ever load.
+      throw new Error(
+        `no FRE host library is built for AIR platform '${platform}': iOS links its extensions ` +
+          'statically into the application image rather than loading one at run time, so there is no ' +
+          'lib/bin/ios-arm64/ to name',
+      );
+    default:
+      throw new Error(`no FRE host library name is defined for AIR platform '${platform}'`);
+  }
+}
+
+/**
  * The AIR platform key a *build* should resolve its ANEs for.
  *
  * `currentAnePlatform()` answers for the machine doing the compile, which is the

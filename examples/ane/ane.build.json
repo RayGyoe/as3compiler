@@ -13,6 +13,6 @@
     "../../vendor/curl/lib/windows-x64"
   ],
   "link-libs": [
-    "zlib"
+    "z"
   ]
 }

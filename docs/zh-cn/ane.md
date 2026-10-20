@@ -16,12 +16,15 @@
 > * **D 面（渲染管线 / 原生窗口句柄 / Context3D）本期不实现**，11 个入口点一律返回
 >   `FRE_ILLEGAL_STATE` **并在 stderr 自报**，不静默成功、不编造描述符。
 >
-> **状态（v0.4.161 复核）**：A/B/C 三面已落地，宿主平台目前只有 **Windows x86 / x86-64**
-> 两个位宽；`macOS`/`iOS` 的宿主库**没有**（`--ane` 在那个平台上会响亮报错并给出缺失路径，
-> 见 §5）。端到端证据：`examples/ane/`（**43 条断言全过**）与 `examples/ane-app/`（**8 条**，描述符那条路）、`test/unit/emit.ts` 的
+> **状态（v0.4.188 复核）**：A/B/C 三面已落地，宿主平台有 **Windows x86 / x86-64** 两个位宽与
+> **macOS x86-64（通用二进制，一个键服务两种架构）** —— macOS 那一半于 2026-10-20（阶段二百零七）落地，
+> 含宿主库、C 面的 POSIX 分支、夹具与示例（见 §5.1）。仍未做的只有 **iOS**：它把扩展**静态链进应用镜像**、
+> 没有 `dlopen` 这一步，故不是一个可加载的宿主库，`aneHostLibName()` 对它**响亮抛错并说明原因**
+> （其余任何没有宿主库的平台，`--ane` 同样响亮报错并给出缺失路径，见 §5）。端到端证据：`examples/ane/`（**46 条断言全过**，Windows 与 macOS 都真跑）与 `examples/ane-app/`（**8 条**，描述符那条路）、`test/unit/emit.ts` 的
 > `unit: ane/ExtensionContextSurface`、`test/unit/build.ts` 的 `unit: ane/ExtensionXmlComments`
-> / `unit: ane/PackageLayout` / `unit: ane/PlatformForBuild` / `build/AneHostLayout` /
-> `build/WindowsArch`。
+> / `unit: ane/PackageLayout` / `unit: ane/PlatformForBuild` / `unit: ane/ExampleFixtureTrees` /
+> `unit: ane/HostLibrary` / `build/AneHostLayout` / `build/WindowsArch`、`test/unit/fre.ts` 的
+> `unit: fre/PlatformSplit`。
 
 ---
 
@@ -135,8 +138,8 @@ AIR 的平台键是**闭集**，且**不是每个键都有对应宿主库**：
 |---|---|---|---|
 | `Windows-x86` | `windows-x86` | ✅ `asaot.dll` + `asaot.lib` | 32 位 |
 | `Windows-x86-64` | `windows-x64` | ✅ `asaot.dll` + `asaot.lib` | 64 位 |
-| `MacOS-x86-64` | `macos-x86-64` | ❌ | 键是对的，宿主库**未构建**（§5 缺陷 2） |
-| `iPhone-ARM` | `ios-arm64` | ❌ | 同上 |
+| `MacOS-x86-64` | `macos-x86-64` | ✅ `libasaot.dylib` | **通用**（x86_64 + arm64），一个键服务两个架构 |
+| `iPhone-ARM` | `ios-arm64` | ❌ | iOS 把扩展**链进应用镜像**、不 `dlopen`，所以没有「可加载的宿主库」这回事；`aneHostLibName()` **直接抛**并说明原因，不借用 macOS 的名字（§5 缺陷 2） |
 | `MacOS-x86` | — | — | AIR 真有的键，但我们没有宿主库 ⇒ `aneHostDirName()` **直接抛**，不猜目录 |
 
 两个容易踩的点，都是**实测**出来的：
@@ -161,12 +164,23 @@ AIR 的 Windows 键自带位宽。两套词汇的差别在这里是**有信息�
 
 ```
 编译期：-D ASC_HAVE_FRE=1
-        include 路径 += <repo>/lib            （放 asaot.h / shim 用的那一个契约头）
-        link 路径   += <repo>/lib/bin/windows-x64
-        link 库     += asaot
-后链接：拷贝 asaot.dll 到 <exe 目录>
+        include 路径 += <repo>/lib                   （放 asaot.h / shim 用的那一个契约头）
+        link 路径   += <repo>/lib/bin/<平台目录>      （windows-x64 / macos-x86-64）
+        link 库     += asaot                        （-lasaot；Windows 命中 asaot.lib，
+                                                      macOS 命中 libasaot.dylib 本身）
+后链接：拷贝 <宿主库> 到 <exe 目录>
         写出 <exe 目录>/extensions/<extID>/<平台>/<nativeLibrary>（每个 --ane 一个）
 ```
+
+**宿主库的文件名只有一处decision**：`src/ane.ts` 的 `aneHostLibName()`（Windows = `asaot.dll`，
+macOS = `libasaot.dylib`），而 `aneHostDirName()` 给目录名。`src/index.ts`（后链接拷贝）、
+`src/checks.ts`（`doctor` 报「有没有编出来」）、`test/examples.ts`（两个 ANE 示例的 skip 闸门）
+**都调它**，谁也不自己写一个字面量。这四家以前各写各的，能对上只因为**四家都写的是
+`asaot.dll`**——换成 macOS 的名字后，留在任何一处的那一个字面量都会把「本机跑得起来」变成
+**静默 skip**（闸门）或从**不存在的文件**拷贝（构建），两者都不响亮。
+
+`-lasaot` 之所以两端同名，是因为 ld 的 `-l` 会自己拼前缀后缀：Windows 上找到 `asaot.lib`
+（`asaot.dll` 的导入库），macOS 上找到 `libasaot.dylib`（dylib 本身就是导入 + 运行同一个文件）。
 
 清单字段（`src/build.ts`，kebab-case）：`ane-paths`（数组）、`ane-platform`（字符串）。
 CLI 优先于清单（TypePHP 的「CLI beats YAML」）。`--ane` 可重复。
@@ -329,6 +343,29 @@ build-asaot.bat            :: 不给参数 = 两个位宽都编（windows-x86 + 
 断言的）。**这个检查不是装饰**：一个没记模块名的导入库在构建期**完全静默**，只在很久之后
 表现为「连重编过的 ANE 都还在要 `Adobe AIR.dll`」。
 
+macOS 上是同一件事的另一个文件形态（`asaot_host.c` **一个字都没改**，它本来就是与平台无关的
+薄转发器）：
+
+```sh
+cd as3compiler/lib
+./build-asaot.sh                 # 默认通用（arm64 + x86_64）
+./build-asaot.sh --platform native   # 只编宿主架构，给改-编循环用
+```
+
+产物：`lib/bin/macos-x86-64/libasaot.dylib`（52 KB，53 导出）。**这个 dylib 就是 macOS 侧的
+`asaot.dll` + `asaot.lib` 两份合一**：macOS 上「导入库」与「运行库」是同一个文件，所以既被
+`-lasaot` 链进去、又被运行时 `dlopen` 打开。
+
+两条 macOS 特有的、必须做对的：
+
+* **install name 必须是 `@executable_path/libasaot.dylib`**。它是可重定位的关键：dyld 按**主
+  可执行文件**所在目录解析它，于是「`src/index.ts` 拷到 exe 旁边的那一份」就是被打开的那一份。
+  写成绝对路径（例如 `/Users/me/.../libasaot.dylib`）会**在作者机器上正常、别处失败**——而这
+  个错误在构建期是**完全静默**的，所以 `build-asaot.sh` 用 `otool -D` 把产物**验一遍**（不是
+  信任那条 `-install_name` 参数）。脚本同时断言两个切片的 install name 一致。
+* **两个切片都要有**。`MacOS-x86-64` 这个键不编码架构（§3.4），AIR 自己的 macOS 运行时就是
+  通用二进制——所以只编 arm64 的夹具在 Intel 上会被 dyld 直接拒掉。
+
 ### 4.3 步骤 2：加一个 shim 头（3 行）
 
 ANE 的原生源码写的是 `#include "FlashRuntimeExtensions.h"`——SDK 发的就是这个名字，扩展从
@@ -361,6 +398,21 @@ clang-cl /nologo /LD /O2 /MD /EHsc /W3 -Wno-invalid-source-encoding ^
   /link /INCREMENTAL:NO /MACHINE:X64 ^
   /LIBPATH:"<repo>\as3compiler\lib\bin\windows-x64" asaot.lib
 ```
+
+**命令行（macOS / `clang -dynamiclib`）**——同一个配方的 macOS 形态，本仓示例走的就是它
+（`examples/ane/build-ane.sh`）：
+
+```sh
+clang -O2 -dynamiclib -fPIC \
+  -I "<你的工程>/shim" -I "<repo>/as3compiler/lib" \
+  "<你的工程>/MyExt.c" -o build/MyExt.dylib \
+  -L "<repo>/as3compiler/lib/bin/macos-x86-64" -lasaot
+```
+
+与 Windows 那条**唯一**的差别只有名字：`/LD /MD` → `-dynamiclib -fPIC`，`/LIBPATH: … asaot.lib`
+→ `-L … -lasaot`，`/Fe:MyExt.dll` → `-o MyExt.dylib`。**`-I shim` 必须排在前面**这条两端一样。
+`-dynamiclib` 而不是 `-shared`：macOS 上可加载 bundle 与 dylib 是两种东西，而我们要的是后者
+（可执行文件要**链接**它，bundle 会被拒）。
 
 **VS 工程（`.vcxproj`，真实项目基本是这条）**——只改三处，其余（工具集、`/MD`、宏定义）
 **一个字都不改**：
@@ -395,6 +447,18 @@ llvm-objdump -p build\MyExt.dll | findstr /I /C:"DLL Name" /C:"ExtInitializer" /
 * **导入表里没有 `Adobe AIR.dll`**；
 * **导出表里有 `<Name>ExtInitializer` 与 `<Name>ExtFinalizer`**，名字与 `extension.xml` 里写的
   一字不差（AIR 与我们都按**名字** `GetProcAddress`）。
+
+macOS 侧的等价物（`otool` 而不是 `llvm-objdump`，验的是同一组性质）：
+
+```sh
+otool -L build/MyExt.dylib      # 必须出现 @executable_path/libasaot.dylib，且不得出现 Adobe AIR
+nm -gU build/MyExt.dylib        # 必须有 _<Name>ExtInitializer / _<Name>ExtFinalizer
+lipo -archs build/MyExt.dylib   # 通用时是 arm64 x86_64
+```
+
+`examples/ane/build-ane.sh` 把这四条都做成断言，**外加**一条 Windows 侧没有的：依赖名必须是
+**可重定位**的 `@executable_path/libasaot.dylib`。一条记成绝对路径的依赖在构建期一样完全静默，
+它让夹具「在本机编得出来、换个地方加载不了」。
 
 附带一句：重编不会改变扩展自身对**系统依赖**的要求（例如某真项目仍导入 `MFPlat.dll` /
 `MFReadWrite.dll` / VC 运行时）。那些是扩展原本就有的要求，`adl` 跑它时也一样。
@@ -555,16 +619,19 @@ this build: ...`。按症状查：
 
 ### 4.9 最小可跑示例：`examples/ane/`（两条路子，同一个夹具）
 
-本仓有一个完整、可重复生成的最小闭环（43 条断言全过）。**重编产物是暂存目录树，不是 `.ane`**
+本仓有一个完整、可重复生成的最小闭环（**46 条断言全过**，两端同一份 `driver.as`）。
+**重编产物是暂存目录树，不是 `.ane`**
 （§4.6 已不再打包），所以示例目录的形状就是运行期 `extensions/` 的形状——`<扩展 id>/<平台>/<库>`：
 
 | 文件 | 作用 |
 |---|---|
 | `examples/ane/ProbeANE.c` | 扩展的**原生半边**，2.1 万字节，覆盖整数/浮点/UTF8/布尔/数组/字节数组/对象属性/方法调用/原生数据/状态事件/线程与互斥/抛异常/**FRE 字符串长度契约**（`stringInfo`） |
 | `examples/ane/shim/FlashRuntimeExtensions.h` | §4.3 的 shim，且**故意让 `ProbeANE.c` 用 AIR 的 include 名**，这样 shim 真的被走到了 |
-| `examples/ane/build-ane.bat` | §4.4 的重编配方（clang-cl），编完自动跑 §4.5 的导入表检查，并把结果装进**两棵**暂存树 |
-| `examples/ane/ext-aot/com.example.probe/extension.xml` | §4.6 的描述符（目录名 = 扩展 id） |
+| `examples/ane/build-ane.bat` | §4.4 的重编配方（clang-cl，Windows），编完自动跑 §4.5 的导入表检查，并把结果装进**两棵**暂存树 |
+| `examples/ane/build-ane.sh` | §4.4 的重编配方（`clang -dynamiclib`，macOS），**同一次编译装两处**，断言的是一组性质（依赖名可重定位 / 无 Adobe AIR / 导出 initializer / 两个切片 / 描述符里那个平台条目还在） |
+| `examples/ane/ext-aot/com.example.probe/extension.xml` | §4.6 的描述符（目录名 = 扩展 id），**两个平台条目都有** |
 | `examples/ane/ext-aot/com.example.probe/Windows-x86-64/ProbeANE.dll` | 重编产物（19,456 字节，导入 `asaot.dll`） |
+| `examples/ane/ext-aot/com.example.probe/MacOS-x86-64/ProbeANE.dylib` | 重编产物（通用二进制，依赖 `@executable_path/libasaot.dylib`） |
 | `examples/ane/driver.as` | AS3 驱动，**每一行都是断言**，最后打印 `RESULT passed=N failed=0` |
 | `examples/ane/ane.build.json` | 构建清单（`ane-paths` 指向那棵暂存树） |
 | `examples/ane-app/` | §4.9.1：同一个夹具，走 `--air-app` + 描述符 `<extensions>` 那条路 |
@@ -590,7 +657,7 @@ node --test --test-name-pattern='example: ane' test/examples.ts
 |---|---|
 | `examples/ane-app/ane-app.xml` | 描述符：`<extensions>` 声明 **一个** id；`<visible>false</visible>`（离屏，编完就能 `--run` 然后退出） |
 | `examples/ane-app/src/Main.as` | AS3 入口（`extends Sprite`），8 条断言：未声明的 id 解析为 null、声明的能建 context、`ping`/`addInt`/原生数据/`truthy('')`/`StatusEvent`/`dispose` |
-| `examples/ane-app/ext-aot/com.example.probe/` | 与 `examples/ane/` 的暂存树**逐字节相同**（同一个 `build-ane.bat` 写两处，并有钉子钉住这份同一性） |
+| `examples/ane-app/ext-aot/com.example.probe/` | 与 `examples/ane/` 的暂存树**逐字节相同**（同一份脚本写两处——Windows 用 `build-ane.bat`、macOS 用 `build-ane.sh`——并有钉子钉住这份同一性，**两个平台的产物各钉一条**） |
 | `examples/ane-app/ane-app.build.json` | `--air-app` 每次跑**自动重写**的副产物（`ane-paths` = `["ext-aot/com.example.probe"]`），所以**不入库** |
 
 跑法（`--air-app` 会把 `ane-paths` 写进清单、加载器再把库落到 `<exeDir>/extensions/<扩展 id>/<平台>/`）：
@@ -645,18 +712,17 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 | # | 缺口 | 现象 | 是否自报 | 落地路径 |
 |---|---|---|---|---|
 | 1 | **D 面渲染管线**（11 个入口点） | 视频/呈现类扩展拿不到渲染模式、拿不到媒体缓冲、拿不到窗口句柄 | ✅ `FRE_ILLEGAL_STATE` + 自报 | 需要真正的呈现后端（Skia/D3D 互操作 + 窗口 HWND 暴露），独立工程 |
-| 2 | **macOS / iOS 没有宿主库** | `lib/bin/macos-x86-64/`、`ios-arm64/` 不存在，macOS 上 `--ane` 一定失败 | ✅ 构建期报错并给出该路径 | `lib/asaot_host.c` 是与位宽无关的薄转发器；macOS 侧需要 `dlopen`/`dlsym` 分支 + 一个 `build-asaot.sh`。**平台键已经修对了**（§3.4），缺的就是这个库 |
+| 2 | **iOS 没有（也不会有同样的）宿主库** | `lib/bin/ios-arm64/` 不存在 | ✅ `aneHostLibName()` 直接抛并说明原因 | 这一行**不是**「macOS 那一半还没做」（那半已于 2026-10-20 落地，见 §5.1）。iOS 的平台模型不一样：扩展被**静态链进应用镜像**，没有 `dlopen` 这一步，于是 `asaot` 会成为一份**静态库**、initializer 由**直接符号引用**到达，而不是运行期按名字查。要落地得先定「谁调用 initializer」这件事，不是重编一遍 |
 | 3 | **Windows ARM64 未验证** | 有守卫（拒绝猜键、要求显式 64 位），但 arm64 依赖链从未构建过（本机没有 MSVC arm64 工具集） | ✅ 拒绝并给建议 | 需要一台 arm64 Windows + 工具集 |
 | 4 | **扩展只被部分解包** | 每个扩展现在有自己的目录 `<exe 目录>/extensions/<extID>/<平台>/`（本次新加，§3.3），但里面**只有那个原生库**：扩展随包带的其它文件（数据文件、附属 DLL）不在。所以 `getExtensionDirectory()` 仍只**自报**、不返回该目录 | ✅ 自报 | 把**整包**倒进 `extensions/<extID>/`（布局这一半已经做了，剩下的是解包全部条目），之后 `getExtensionDirectory()` 才能返回真目录 |
 | 5 | **没有 `.as` 源码的 ANE 类无法 AOT** | 扩展的 AS3 包装类只存在于 `library.swf` 的 `DoABC` 里时，这个扩展用不了 | ✅ 编译期缺类就报未定义 | 需要反编译器或 AVM2 解释器，本项目范围外（§3.3 结论） |
 | 6 | **`ExtensionContext` 的 AIR 50 成员未建模** | `functions` / `knownExtensions` / `getExtensionInfo` / `loadExtension` 不存在 | ✅ 未定义即报错 | 前三者是只读反射面；`loadExtension` **不是小修**：它是**延迟加载**（首次 `call` 时才 `LoadLibrary` + Initializer），要把 C 面加载时机从「构造时」挪到「首次调用时」并缓存 |
 | 7 | **`File.applicationDirectory` 缺失** | 真实 AIR 应用用它定位随包资源（也是 `extensions/` 布局的基准） | ✅ 未定义即报错 | 按 `adl` 实测的 `url`/`nativePath` 落地 |
 | 8 | **描述符表上限 32** | 第 33 个扩展在**编译期**被拒绝。**这道闸门是本次补的**：此前 33 个扩展会编译、链接、暂存**全绿、exit 0、一句提示都没有**，直到运行期第 33 次 `createExtensionContext` 越界写 `as_anes[32]`（实测） | ✅ 编译期报错并给出去处 | 提高 `src/fre.ts` 的 `ANE_COUNT_MAX` 即可（`FRE_HEAD` 的 `ASC_ANE_COUNT_MAX` 由它插值，只有一个真源），只是当前值是个有意留的界 |
-| 9 | **C 面是 Windows 专用** | `LoadLibraryA` / `CRITICAL_SECTION` / `GetModuleFileNameA` / `Sleep` 全是 Win32 | —— | 与缺陷 2 是同一件事的两半：宿主库 + C 面的 POSIX 分支要一起做 |
 
 ### 5.1 已修的缺陷（留作教训）
 
-六条都是**「`adl` 跑得对、我们跑不出」**那一类，都是在拿真实三方 ANE 做迁移时量出来的；
+八条都是**「`adl` 跑得对、我们跑不出」**那一类，都是在拿真实三方 ANE 做迁移时量出来的；
 现在都修了并配了行为钉。列在这儿的价值在于它们的共同形态：**都是「看起来对、结果错」**。
 
 | 缺陷 | 症状 | 修法 | 钉（条数） |
@@ -668,6 +734,9 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 | ANE 平台键按**宿主**取而不按**构建目标**取 | 32 位构建链 x64 宿主库、暂存 x64 切片，编译链接全绿、**运行期**才炸 | win32 原生构建下键 = `architecture` 的位宽；arm64 目标无键（拒绝并指名目标） | `unit: ane/PlatformForBuild`（11） |
 
 | **FRE 字符串长度多算了一个终止符** | 我方 `FREGetObjectAsUTF8` 返回 `strlen+1`（照着 SDK 头文件那句「Includes the null terminator」写的），而 `adl` 实测返回的是**不含**终止符的字节数。扩展若**携带长度**——`ANEUtils::getString` 正是 `std::string(val, val + length)`——它读到的每个字符串都会多出一个 NUL 字节；字符串被原样嵌进协议帧时（WebSocket URL 进 HTTP 请求行）就变成 `GET /node1?...\0 HTTP/1.1`，服务端不回响应直接关闭。宿主应用 AOT 后**所有 wss 连接**都以 `status_code 0` + `websocketpp.transport:7`（EOF）失败，而**同一台机器**上 `adl` 加载同一份原生库、同一个 URL、同一个 token 却 `101` 成功并收到业务帧。只把指针交给 `printf`/`strcmp` 的扩展察觉不到这个字节，凡自己带长度的（`std::string`、协议帧、哈希）都会中招 | 按 `adl` 实测改成 `strlen(s)`，并把「**头文件那句话与实测不符**」连同证据写进注释，免得后人照字面「修」回 `+1`；反方向的 `FRENewObjectFromUTF8` 仍按文档接受调用方传入的终止符（写 `strlen+1` 的调用方遍地在写） | `unit: fre/Utf8LengthContract`（8；变异 7/7 全被抓）+ `examples/ane/` 的原生回显断言 `stringInfo`（3：ASCII 6 字节、4 个 CJK 字符 12 字节、空串 0 字节，`extra` 必须为 0——把 `src/fre.ts` 改回 `+1` 这条必红） |
+
+| **C 面是 Windows 专用**（`LoadLibraryA` / `CRITICAL_SECTION` / `GetModuleFileNameA` / `Sleep`） | 在 Windows 上**看不见**（那些分支照常编过），在 macOS 上第一次编就红。而宿主库（缺陷 2 的另一半）做出来之后，这一半才第一次有消费者 | 在 `FRE_BODY` 里加一层平台 shim：`as_fre_lib_open`/`as_fre_lib_sym`/`as_fre_lib_err`（`dlopen`+`RTLD_NOW`+`RTLD_LOCAL` / `dlsym` / `dlerror`）、`as_fre_exe_dir`（macOS 用 `_NSGetExecutablePath`、Linux 用 `/proc/self/exe`——因为 install name 是 `@executable_path/`，只有知道 exe 在哪才知道库在哪）、状态队列的锁改成 `AS_FRE_Q_LOCK`/`AS_FRE_Q_UNLOCK` 两个宏（Windows 是 `CRITICAL_SECTION`，macOS 是**显式递归**的 `pthread_mutex_t`——`FREDispatchStatusEventAsync` 会从已经在 `as_fre_pump` 里的线程到达，普通互斥锁在那里**死锁**）、线程族给 pthread 实现 | `unit: fre/PlatformSplit`（8）——核心那条**按预处理器**判断：任何 Win32 专有名字只要落在「macOS 会编译的那一行」上就红。名单式断言只有写下它那天是对的，分支判断在下一次伸手拿 Win32 API 时仍然对 |
+| **`asaot.h` 的 POSIX 分支没有 `ASAOT_HOST` 这一态** | 第一次用 macOS 宿主库编程序，`clang` 在**每一行** FRE 函数上停住：`error: static declaration of 'FREGetObjectType' follows non-static declaration`。根因不是新代码——`asaot.h` 的 Windows 分支有**三态**（`ASAOT_BUILD` / `ASAOT_HOST` / 其余），POSIX 分支只有**一句** `visibility("default")`；而宿主程序**定义**那 51 个入口点、尺寸优化又把它们标成 `static`，于是「非 static 的声明」与「static 的定义」相撞。**Windows 上同一处不匹配只给一条警告**（`redeclared without 'dllimport' attribute`），这正是该分支长期没被发现的原因 | POSIX 分支补上第三态：`ASAOT_HOST` ⇒ `#define ASAOT_API static`（不是空——见括号里那条）。dylib 那一侧仍拿 `visibility("default")`，所以 `build-asaot.sh` 不需要 `-fvisibility=hidden` 也能导出那 53 个 | `unit: ane/HostLibrary`（20 之一）——钉住「POSIX 分支存在且生效」「dylib 分支仍带属性」以及**那条实测的报错原文写在注释里**（免得后人当 tidiness 删掉） |
 
 配套的一条诊断改进：加载失败的两处自报现在**带上 Win32 错误码**（`193` = 位宽不符、
 `126` = 找不到）。此前它们无条件归咎于「库没重编」——当一个纯位宽问题被套上「你重编错了」的
@@ -688,15 +757,17 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 
 | 证据 | 内容 | 怎么复现 |
 |---|---|---|
-| `examples/ane/` | 端到端示例，**46 条断言全过**，末行 `RESULT passed=46 failed=0` | `node --test --test-name-pattern='example: ane' test/examples.ts` |
+| `examples/ane/` | 端到端示例，**46 条断言全过**，末行 `RESULT passed=46 failed=0`。**Windows 与 macOS 跑的是同一份 `driver.as`、同一个夹具源码、同一组断言**（macOS 侧加载的是真 `dlopen` 的 `ProbeANE.dylib`） | `node --test --test-name-pattern='example: ane' test/examples.ts` |
 | `examples/ane-app/` | 端到端示例·**描述符那一半**：`--air-app` 把描述符里的 `<extensions>` 解析成 `ane-paths`、把库落到 `extensions/<扩展 id>/<平台>/`，再运行；**8 条断言全过**，末行 `RESULT passed=8 failed=0`（另有一行是未声明 id 的自报原文） | 同上 |
 | `test/unit/emit.ts` → `unit: ane/ExtensionContextSurface` | 9 条：钉**发射出来的 C** 里 `getExtensionDirectory` 必须自报、必须仍返回活着的 `File`、自报必须**点名本构建的布局**并说清那个目录里**没有**整包、`actionScriptData` 是真成员而 `extensionID` **不是**、`call` 的「扩展从未加载」自报必须具名 | `node --test --test-name-pattern='ane/ExtensionContextSurface' test/unit/emit.ts` |
 | `test/unit/fre.ts` → `unit: fre/Utf8LengthContract`（8 条） | FRE 字符串边界的两向契约：`FREGetObjectAsUTF8` 的 `length` 必须是 `strlen`（**不得**加上终止符，也不得变成别的计数）、`value` 必须是字符串本身、非 String 仍须 `FRE_TYPE_MISMATCH`；反方向 `FRENewObjectFromUTF8` 必须容忍调用方传入的终止符，且不得把它算进字符串。变异 7/7（`+1u`、`+1`、换掉 `value` 指针、放开 tag 判定、去掉容忍、把终止符拷进字符串、不写结尾 0） | `node --test --test-name-pattern='fre/' test/unit.ts` |
 | `test/unit/build.ts` → `unit: ane/ExtensionXmlComments` | 9 条：注释不得凭空造出平台条目、不得吞掉真实条目、未闭合注释必须拒绝并指名包 | 同上换成 `test/unit/build.ts` |
 | `test/unit/build.ts` → `unit: ane/PackageLayout`（27 条） | 官方 `adt` 布局、扁平布局、`adt` 暂存布局都认；**解包后的目录**也认（含递归与 `/` 分隔名字两条，所以手工解压的 `META-INF/ANE` 树可读）；目录形式同样按平台取切片、不借另一平台的切片；找不到时不得只说「没有」，要列出候选路径；**落盘路径必须是 `<extID>/<平台>/<库>`**（描述符与暂存键两处都要，且不得再出现裸文件名）；**两个扩展可以各带一个同名库且各留各的字节**；声明在子目录里的库**保留那个子目录**；**扩展数上限是硬闸门**（正好 32 过、33 拒绝并给出计数与常量名） | 同上换成 `test/unit/build.ts` |
+| `test/unit/build.ts` → `unit: ane/HostLibrary`（20 条） | 「宿主库叫什么」只有**一个**答案：`aneHostLibName()` 对两个 Windows 键给 `asaot.dll`、对 `MacOS-x86-64` 给 `libasaot.dylib`、对 `iPhone-ARM` **抛且说明**（不借 macOS 的名字）、未知键也抛；四个消费者（`src/index.ts` 的后链接拷贝、`checks.ts` 的 doctor 检查、`test/examples.ts` 的 skip 闸门、`src/fre.ts` 里的两个宏）**都从那一个函数取**，任何一处退回字面量就红；`lib/asaot.h` 的 POSIX 分支必须把 `ASAOT_HOST` 映成 `static`、dylib 分支必须留着属性、那条实测报错必须写在注释里；`lib/build-asaot.sh` 与 `examples/ane/build-ane.sh` 必须存在、可执行、且带着产物断言（install name / 可重定位依赖名 / 无 Adobe AIR / 导出 initializer / 两个切片 / 描述符里那个平台条目） | 同上 |
+| `test/unit/fre.ts` → `unit: fre/PlatformSplit`（8 条） | `FRE_BODY` 里**没有**任何 Win32 专有名字落在「macOS 会编译的那一行」上（按 `#if defined(_WIN32)` 的嵌套分支逐行判，注释行除外——首次跑就抓到两条**注释**里的名字，那正是要放行的）；POSIX 半边**真的实现了**四件事（`dlopen`/`dlsym`、exe 自身目录、递归锁、pthread 线程），而不是留个空 `#else`；库名/链接名是两个宏且各有两个拼法；状态队列的临界区**只走宏** | `node --test --test-name-pattern='fre/' test/unit.ts` |
 | `test/unit/build.ts` → `unit: ane/PlatformForBuild`（11 条） | 平台键跟随 `architecture`；留空保留宿主答案；wasm/darwin 下 `architecture` 无效（AIR 描述符默认就是 `32`，不能因此变成 `Windows-x86`）；arm64 目标不发明键；**位宽在 ANE 键与目标三元组两处读数一致** | 同上 |
 | `test/unit/build.ts` → `unit: air-app/Extensions`（30 条） | **描述符驱动那一半**：`<extensions>` 按描述符顺序读、**注释里的 ID 不算**（SDK 模板里就留着那个占位）、**未注释的空 `<extensionID>` 也不算**；打包 `.ane`、解包树、**暂存树**三种形态都认，而不是包的目录照旧跳过（不是错误）；多个根**先命中先赢**，后面的根仍能补前一个没有的 ID；`ext-aot` **排在默认根最前**，所以同一个 ID 的重编包压过 `lib/` 里的 AIR 原件，而 `ext-aot` 没有的 ID 仍从 `lib/` 来；**目录里的包不算数——只有描述符要的才返回**；声明了却找不到就拒绝（`adl` 原文、看过的目录、`(absent)` 标记、目录里有什么、**三条出路**）；`--extdir` 顶掉默认，且不给 `--air-app` 时被拒；清单写出来是**相对清单目录的 `/` 分隔路径**、无声明时**一个键都不写**。变异 5/5（去掉暂存树形态 / 认错路径 / 把所有目录都当包 / 把 `lib` 排到 `ext-aot` 前 / 干脆去掉 `ext-aot`） | 同上 |
-| `test/unit/build.ts` → `unit: ane/ExampleFixtureTrees`（7 条） | 两个示例共享**同一个夹具**这件事本身要钉：两棵暂存树都在；`extension.xml` 与 `Windows-x86-64/ProbeANE.dll` **逐字节相同**（`readFileSync(a).equals(b)`）；两处都只声明一个 id / 一个平台 / 一个库；用真描述符在那个应用目录上走 `resolveExtensionPackages` 能解析到那棵树；清单的 `ane-paths` 指向它；应用描述符声明的是同一个 id。有了这组，「两个示例其实各跑着不同的东西」这件事不会静默发生 | 同上 |
+| `test/unit/build.ts` → `unit: ane/ExampleFixtureTrees`（9 条） | 两个示例共享**同一个夹具**这件事本身要钉：两棵暂存树都在；`extension.xml` 与 `Windows-x86-64/ProbeANE.dll` **逐字节相同**（`readFileSync(a).equals(b)`）；**`MacOS-x86-64/ProbeANE.dylib` 同样逐字节相同**（两处都有，缺一处就红）；两处都只声明一个 id / 一个平台 / 一个库；用真描述符在那个应用目录上走 `resolveExtensionPackages` 能解析到那棵树；清单的 `ane-paths` 指向它；应用描述符声明的是同一个 id。有了这组，「两个示例其实各跑着不同的东西」这件事不会静默发生 | 同上 |
 | `test/unit/build.ts` → `unit: air-app/OffscreenLinkSet`（10 条） | Windows **离屏**构建的链接集（`<visible>false</visible>` 没有窗口，但不是「更小的构建」：`skia_glue.cc` 每个 native 产物都编，它的 GDI 字体管理器在任何像素画出来之前就被 `SkFontMgr::Factory()` 走到）；把 `process.platform` 伪造成 win32 之后断言 `gdi32/user32/ole32/advapi32/usp10` 与 `z` 在、而 `SDL2/winmm/imm32/oleaut32/version/uuid/setupapi/shell32/dinput8/d3d12*` 与 `curl` **不在**；defines 里有 `ASC_USE_SKIA=1` 而没有 `ASC_USE_WINDOW=1`；sources 只有 `skia_glue.cc`；macOS 分支仍走 CoreText。变异 2/2（把四个库挪回 `visible` 分支 ⇒ 2 条红） | 同上 |
 | `test/unit/build.ts` → `build/AneHostLayout`（21 条）/ `build/WindowsArch`（24 条） | `--help` 提供的键集合 ≡ 真的有 `lib/bin/` 目录的键集合；每个键映射到唯一的目录；未知键抛错；`MacOS-AOT` 这个 AIR 从不发射的键不再指向任何目录 | 同上 |
 | 变异测试（`temp/`，脚手架，非交付物） | 对上述每组**逐条**注入破坏（把自报删掉、把 `extensionID` 加回去、把注释剥离去掉、把正则改成贪婪……），确认**每一条都会变红**；对照组保持绿；改完**逐字节还原**并校验哈希 | —— |
@@ -707,9 +778,13 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 | 真项目·**六扩展全量重编 + 逐扩展运行期加载**（`temp/ext-aot/`） | 一个真应用的扩展清单里有 **7** 个扩展，其中 6 个按 §4 重编为 AOT（第 7 个是前一抡已完成的两个位宽那一份）：每个库都**导入 `asaot.dll`、都不含 `Adobe AIR.dll`**、导出名与各自描述符一致，且**位宽与原包实际发布的切片逐项相同**（其中一个是描述符声明了 `Windows-x86-64` 而原包也只发 x86——按原包来，不凭空多出一个位宽）。按 §3.7 装进 `ext-aot/<扩展 id>/<平台>/` 后，用**真描述符**驱动 `--air-app` 走一遍：声明 7 个 id → `ane-paths` 恰为 **7 条 `ext-aot/<id>`、顺序与描述符一致**；再编一个**对每个 id 各建一次 context** 的探针（§4.10 末段）并运行：`exit 0`、7 行 `E2E OK`、末行 `E2E DONE 7/7`，其中一个扩展的 Initializer 还打出了它自己的版本横幅——证明原生码真的**执行**了，而不是「文件在、没报错」。CEF 那一份从 `git HEAD` 的**提交态源码 + 提交态 3.2987.1601 依赖**编出，**零补丁**（过程与三条坑见 §4.10） | —— |
 
 
-**CI 口径要说清**：`.github/workflows/test.yml` 跑在 **macOS arm64** 运行器上，那里没有 Windows
-宿主库，所以 `examples/ane/` 与 `examples/ane-app/` 会**响亮 skip**（不是 pass、不是 fail）；CI 上
-真正跑的是 `test/unit/` 里那几组结构钉。也就是说：「示例通过」这件事目前只在 Windows 上被实测过。
+**CI 口径要说清**：`.github/workflows/test.yml` 跑在 **macOS arm64** 运行器上。这条线以前写的是
+「那里没有 Windows 宿主库，所以两个扩展示例会响亮 skip，真正跑的只有 `test/unit/` 的结构钉」——
+现在**不成立了**：macOS 宿主库与夹具产物都是**入库**的（`lib/bin/macos-x86-64/libasaot.dylib`
+通用二进制、`ext-aot/…/MacOS-x86-64/ProbeANE.dylib` 同为通用），所以在那个运行器上两个示例是
+**真跑**（`skipped 0`），加载的是经 `dlopen` 的真 dylib，46 条断言照旧。仍然 skip 的情形只有一种：
+**该宿主没有宿主库**（目前只剩 iOS 这一族，`aneHostLibName()` 抛），理由行会点名缺的是哪个文件——
+不是「跳过」，是「说清缺什么」。
 
 ---
 
@@ -719,8 +794,11 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 |---|---|
 | `lib/asaot.h` | FRE ABI 契约头（与 SDK 的 `FlashRuntimeExtensions.h` 逐字节可换） |
 | `lib/asaot_host.c` | `asaot.dll` 的源码：51 个入口点的**薄转发器**，全部转发进 `asaot_bind` 装进来的表 |
-| `lib/build-asaot.bat` | 编宿主库（默认两个位宽）；自带「导入库记录 `asaot.dll`」断言 |
-| `lib/bin/windows-{x86,x64}/` | 宿主库产物（`asaot.dll` + `asaot.lib`） |
+| `lib/build-asaot.bat` | 编 Windows 宿主库（默认两个位宽）；自带「导入库记录 `asaot.dll`」断言 |
+| `lib/build-asaot.sh` | 编 macOS 宿主库（默认通用 arm64 + x86_64）；自带一组**产物**断言：install name 是 `@executable_path/libasaot.dylib`（且两个切片一致）、导出 `asaot_bind`、53 个导出、不依赖 Adobe AIR |
+| `lib/bin/windows-{x86,x64}/` | Windows 宿主库产物（`asaot.dll` + `asaot.lib`） |
+| `lib/bin/macos-x86-64/` | macOS 宿主库产物（`libasaot.dylib`，通用二进制；`asaot.dll` 与 `asaot.lib` 两份在这里合成一份） |
+| `src/ane.ts` → `aneHostDirName` / `aneHostLibName` | 「哪个目录 + 哪个文件名」这**一个**决定的唯一出处（Windows = `asaot.dll`，macOS = `libasaot.dylib`，iOS **抛**） |
 | `src/ane.ts` | `.ane` 的编译期解析：`extension.xml`（先剥注释）、平台键、目录名、描述符解析、原生库落盘（**一扩展一目录** `<extID>/<平台>/`，并守住 `ANE_COUNT_MAX`）。**既吃 ZIP 也吃解包目录**（§4.6） |
 | `src/fre.ts` | FRE 宿主：`FRE_HEAD` / 描述符块 / `FRE_BODY`（51 入口 + 加载器 + 分派）/ `FRE_STUBS`（无 FRE 构建的空实现）。`ANE_COUNT_MAX`（描述符表上限的唯一真源）也在这里 |
 | `src/emit.ts` | 描述符表与 hook 体的发射、`ExtensionContext` 的 AS3 半边、`as_fre_pump` |
@@ -728,7 +806,8 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 | `src/air-app.ts` | AIR 描述符适配：读 `<extensions>`（先剥注释）→ 按声明的 ID 从 `lib`/`ext-folder`（或 `--extdir`）解析出包路径 → 写进清单的 `ane-paths` |
 | `src/index.ts` | `--ane` / `--ane-platform` / `--extdir`，以及那三处 `-D`/include/link 的注入与后链接落盘 |
 | `src/build.ts` | 清单字段 `ane-paths` / `ane-platform`（`ane-paths` 按绝对路径去重后追加） |
-| `examples/ane/` | 端到端最小闭环（§4.9） |
+| `examples/ane/` | 端到端最小闭环（§4.9），两个平台各一份夹具产物 + 各自的重编脚本 |
+| `examples/ane/shim/FlashRuntimeExtensions.h` | §4.3 的 shim（3 行）：让扩展源码不改一个字就能链到 `asaot` 的 ABI |
 | `examples/ane-app/` | 同一夹具的**描述符那条路**（§4.9.1） |
 | `docs/zh-cn/compile.md` | CLI 参数与清单字段的完整清单 |
 | `README-CN.md` | 「ANE 加载」一节（概览） |

@@ -112,7 +112,7 @@ as-aot app.as --swc assets/skin.swc
 as-aot app.as --manifest examples/skia-link.build.example.json
 
 # 加载 AIR 原生扩展（ANE，阶段一百七十八）：宿主 FRE 运行时接进来，
-# 重编版 ANE 与 asaot.dll 会随构建落到 <exe 同目录>/extensions/<extID>/<平台>/
+# 重编版 ANE 与宿主库（asaot.dll / libasaot.dylib）会随构建落到 <exe 同目录>/extensions/<extID>/<平台>/
 as-aot app.as --manifest app.build.json --ane lib/ANENDI.ane
 as-aot app.as --manifest app.build.json --ane lib/ANENDI.ane --ane-platform Windows-x86-64
 
@@ -142,13 +142,14 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
 
 **ANE 加载（阶段一百七十八）**：`--ane` / 清单 `ane-paths` 打开 `ASC_HAVE_FRE` 并接上宿主 FRE 运行时。
 每一项可以是 `.ane` 包，也可以是**解包后的目录**（`extension.xml` + `<平台键>/<原生库>`，即 `adt` 的暂存布局）——
-后者是重编给 AOT 用的那份产物的默认形态：其原生库导入 `asaot.dll`（转发进**生成程序自己的表**），
+后者是重编给 AOT 用的那份产物的默认形态：其原生库导入宿主库（Windows `asaot.dll` / macOS
+`libasaot.dylib`，转发进**生成程序自己的表**），
 AIR 没有那张表，故**签不签名都载不进**，打包没有消费者；`.ane` 强制要求的 `library.swf` 也是死重量
 （`DoABC` 不在编译器范围内，扩展的 AS3 类必须从 `.as` 源码编）。原版已签名 `.ane` 仍正常读（`META-INF/ANE/` 布局）。
 宿主库 `lib/bin/<platform>/asaot.{dll,dylib,a}`（头文件 `lib/asaot.h`，与 AIR SDK 的 `FlashRuntimeExtensions.h`
 **ABI 逐字节对齐**）是**薄转发器**：51 个 FRE 入口全部经 `AsaotHost` 函数表回到**生成程序自己**的实现，
 故 AS3 语义只有一个堆、一个类注册表。`lib/` 只放**手写源**（`asaot.h` 契约、`asaot_host.c` 实现、
-`build-asaot.bat` 配方），构建产物按平台落在 `lib/bin/`（如 `lib/bin/windows-x64/`）：
+`build-asaot.bat` / `build-asaot.sh` 配方），构建产物按平台落在 `lib/bin/`（如 `lib/bin/windows-x64/`）：
 `-I` 指向 `lib/`、`-L` 指向该平台子目录——头文件是所有平台共用的一份契约，导入库是某平台的产物。
 平台目录名小写（`windows-x64`/`windows-x86`/`macos-x86-64`…），与 `vendor/sdl2/lib/windows-x64`、
 `vendor/curl/lib/windows-x64` 同一口径；**不是** AIR 的平台键原文（那是 `extension.xml` 里 ZIP 子目录的名字，
@@ -156,8 +157,16 @@ AIR 没有那张表，故**签不签名都载不进**，打包没有消费者；
 不编码架构**：SDK 的 macOS 运行时是一份 universal 二进制（`x86_64`+`arm64` 两个切片），两个切片里的
 ANE 加载器键都是 `MacOS-x86-64` 一个（实测）——架构在 `.dylib` 里，所以 darwin 的两种架构推导出**同一个键**，
 `MacOS-AOT` 不是 AIR 的键（全 SDK 0 命中），故不设该目录。
-目前只有 Windows 宿主库，其它平台的 `lib/bin/<platform>/` 不存在，
-此时构建**直接报错并给出该路径**，不会去找一个没编过的东西。
+宿主库现出**两个平台**：Windows（`lib/bin/windows-{x86,x64}/asaot.dll` + `asaot.lib`）与
+macOS（`lib/bin/macos-x86-64/libasaot.dylib`，**默认通用二进制** `x86_64`+`arm64` —— 因为
+`MacOS-x86-64` 这个键**不编码架构**，AIR 自己的 macOS 运行时就是通用的）。
+`lib/build-asaot.sh` 编 macOS 那份（`--platform native` 只出宿主架构，供改-编循环），它不只编译还**验产物**：
+install name 必须是可重定位的 `@executable_path/libasaot.dylib`（且两个切片一致）、必须导出 `asaot_bind`、
+导出数 53、不得依赖 `Adobe AIR` —— 因为「写成绝对路径」在作者机器上照常工作、在别的机器上加载失败，
+而构建期**一句话都不说**。
+仍未做的只有 **iOS**：它把扩展**静态链进应用镜像**、没有 `dlopen` 这一步，故不是一个可加载的宿主库；
+`aneHostLibName()` 对它**直接抛错并说明原因**，不借 macOS 的名字。其余任何没有宿主库的平台，
+构建都**直接报错并给出该路径**，不会去找一个没编过的东西。
 `build-asaot.bat` **默认同时构建两个宽度**（`bin/windows-x86/` 与 `bin/windows-x64/`），
 可用 `build-asaot.bat x86` / `x64` 只重编其中一个，未知参数**报错退出**（不静默跳过）；
 取哪个宽度由 `--ane-platform` 决定，而扩展包自己声明平台，所以「只编本机那个宽度」底噪
@@ -176,9 +185,10 @@ ANE 加载器键都是 `MacOS-x86-64` 一个（实测）——架构在 `.dylib`
 （依赖脚本 `vendor/provision/windows.ps1` 另有 `-Arch arm64`，那是给**非 AIR** 的 Windows-on-ARM
 产物用的，不对应任何 ANE 平台键；`both` 仍只指 x64+x86。参见 [`docs/zh-cn/win32.md`](docs/zh-cn/win32.md) §2.11。）
 加载协议完整实现在生成程序里：**编译期**解析 `extension.xml`
-并定下平台条目 → **后链接阶段**把 ANE 的原生库与 `asaot` 一起落到 `<exe 同目录>/extensions/<extID>/<平台>/` →
-运行时 `LoadLibraryA` + `GetProcAddress(<initializer>)` → 按 `FRENamedFunction[]` 分派。
-关键前提：**ANE 必须是对着 `asaot` 重编过的版本**（其 FRE 导入必须解析到 `asaot.dll`，而不是硬编码的
+并定下平台条目 → **后链接阶段**把 ANE 的原生库与宿主库一起落到 `<exe 同目录>/extensions/<extID>/<平台>/` →
+运行时按名字加载宿主库（Windows `LoadLibraryA` / macOS `dlopen`，install name 是 `@executable_path/` 所以
+加载的正是旁边那一份）+ 取 `<initializer>` 符号 → 按 `FRENamedFunction[]` 分派。
+关键前提：**ANE 必须是对着 `asaot` 重编过的版本**（其 FRE 导入必须解析到宿主库，而不是硬编码的
 `Adobe AIR.dll`——后者是 AIR 自家导入库记录的模块名，不得用作我们的产物名）；不影响 adl 侧继续用
 原版 ANE，两者互不干扰。
 `ExtensionContext` 按 AIR 建模：`createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` /
@@ -189,7 +199,8 @@ ANE 加载器键都是 `MacOS-x86-64` 一个（实测）——架构在 `.dylib`
 
 **迁移一个现成 ANE 的完整流程**（双产物 + 重编换名、shim 头、三个工程属性、症状→病因对照表、
 以及全部缺口清单）见 [`docs/zh-cn/ane.md`](docs/zh-cn/ane.md)；最小可跑闭环见
-[`examples/ane/`](examples/ane)（43 条断言，命令行/清单直接指名包）与
+[`examples/ane/`](examples/ane)（46 条断言，命令行/清单直接指名包；**Windows 与 macOS 都真跑**，
+macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 [`examples/ane-app/`](examples/ane-app)（8 条断言，走 `--air-app` + 描述符 `<extensions>`）。
 重编产物是一棵**暂存目录树**（`extension.xml` + `<平台>/<库>`，不打包），放进 `<appDir>/ext-aot/<扩展 id>/`
 就会被自动选中，所以 `adl` 侧继续用原版 ANE、两条路互不干扰。

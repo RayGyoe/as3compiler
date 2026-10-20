@@ -86,7 +86,8 @@ export const ANE_COUNT_MAX = 32;
 export const FRE_HEAD = `
 #ifdef ASC_HAVE_FRE
 
-// Needs the Windows SDK (HMODULE/CRITICAL_SECTION) and the AIR-compatible FRE
+// Needs the platform's own dynamic loader (HMODULE/LoadLibraryA on Windows,
+// dlopen on macOS) and the AIR-compatible FRE
 // declarations; -I as3compiler/lib supplies it (see build.ts).
 //
 // ASAOT_HOST tells the header this translation unit DEFINES the 51 entry points
@@ -122,6 +123,138 @@ typedef struct {
  */
 export const FRE_BODY = `
 #ifdef ASC_HAVE_FRE
+
+// ---------- platform shim: the dynamic loader, the executable's own path, and
+// the status queue's lock ----------
+//
+// Loading a native extension is the one thing this runtime does that is an
+// OPERATING SYSTEM call rather than a library call: an extension is a file the
+// program was TOLD about at compile time (as_ane_descs[]) and opens at run time.
+// That is also where the two supported platforms genuinely differ, so the
+// difference is spelled once here and every call site above and below it stays
+// platform-free.
+//
+// The names are Windows-flavoured (as_fre_lib_open) rather than dlopen-flavoured
+// because the Windows path is the one the FRE host was built and measured on
+// first; macOS is the half added later. Both have to answer the same three
+// questions: how to open a library, how to take a symbol from it, and how to
+// describe a failure in terms a user can act on.
+#if defined(_WIN32)
+  // A bare name: "asaot.dll" is found beside the executable, which is the first
+  // place the Win32 loader searches.
+  typedef HMODULE as_fre_lib;
+  static as_fre_lib as_fre_lib_open(const char* path) { return LoadLibraryA(path); }
+  static void*     as_fre_lib_sym(as_fre_lib lib, const char* name) { return (void*)GetProcAddress(lib, name); }
+  // Windows reports WHY as a NUMBER, and the number is the whole diagnosis: 193
+  // (ERROR_BAD_EXE_FORMAT) means the file IS there but this process cannot load it
+  // -- a 64-bit library beside a 32-bit program -- while 126
+  // (ERROR_MOD_NOT_FOUND) is the genuinely-missing one. Both slices of an
+  // extension carry the same file name, so a report without the code makes the two
+  // indistinguishable.
+  static const char* as_fre_lib_err(void) {
+      static char as_fre_err_buf[96];
+      snprintf(as_fre_err_buf, sizeof(as_fre_err_buf),
+               "Win32 error %lu; 193 = wrong bitness, 126 = not found",
+               (unsigned long)GetLastError());
+      return as_fre_err_buf;
+  }
+  // The host library beside the executable, and the thing an extension LINKS
+  // against. They are different files on Windows -- an import library is what a
+  // link line names, and the DLL is what loads -- and the same file on macOS, where
+  // a dylib is both.
+  #define AS_FRE_LIB_NAME  "asaot.dll"
+  #define AS_FRE_LINK_NAME "asaot.lib"
+#else
+  // RTLD_NOW rather than RTLD_LAZY, so an extension whose FRE imports were never
+  // resolved fails HERE, with the loader's own sentence, instead of aborting the
+  // program at the first FRE call.
+  //
+  // RTLD_LOCAL, not RTLD_GLOBAL: an extension links this library explicitly (that
+  // is what "recompiled for AOT" means on this platform -- the macOS counterpart of
+  // the Windows import-library swap), so its symbols resolve through that
+  // dependency and there is no reason to publish the whole 53-entry table into the
+  // global namespace of the process.
+  #include <dlfcn.h>
+  #include <errno.h>
+  #include <time.h>
+  #include <unistd.h>
+  #if defined(__APPLE__)
+    #include <mach-o/dyld.h>
+  #endif
+  typedef void* as_fre_lib;
+  static as_fre_lib as_fre_lib_open(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+  static void*     as_fre_lib_sym(as_fre_lib lib, const char* name) { return dlsym(lib, name); }
+  // dlerror() gives a SENTENCE rather than a code, so this slot carries whatever
+  // the loader said. A NULL return means "nothing to report", which can only be read
+  // right after a failed call.
+  static const char* as_fre_lib_err(void) {
+      const char* e = dlerror();
+      return e != NULL ? e : "no loader diagnostic";
+  }
+  #define AS_FRE_LIB_NAME  "libasaot.dylib"
+  #define AS_FRE_LINK_NAME "libasaot.dylib"
+#endif
+
+// One lock for every context's status queue. On Windows a CRITICAL_SECTION, which
+// is recursive by construction; on macOS a pthread mutex made recursive
+// explicitly, because FREDispatchStatusEventAsync can be reached from a thread
+// that is itself inside as_fre_pump and a default mutex would deadlock there.
+//
+// Mutex initialization cannot be spelled statically in C on either platform, hence
+// the init-on-first-use flag.
+static int as_fre_qcs_ready = 0;
+#if defined(_WIN32)
+  static CRITICAL_SECTION as_fre_qcs;
+  static void as_fre_qcs_init(void) {
+      if (!as_fre_qcs_ready) { InitializeCriticalSection(&as_fre_qcs); as_fre_qcs_ready = 1; }
+  }
+  #define AS_FRE_Q_LOCK()   EnterCriticalSection(&as_fre_qcs)
+  #define AS_FRE_Q_UNLOCK() LeaveCriticalSection(&as_fre_qcs)
+#else
+  static pthread_mutex_t as_fre_qcs;
+  static void as_fre_qcs_init(void) {
+      if (as_fre_qcs_ready) return;
+      pthread_mutexattr_t a;
+      if (pthread_mutexattr_init(&a) != 0) return;
+      pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+      if (pthread_mutex_init(&as_fre_qcs, &a) != 0) { pthread_mutexattr_destroy(&a); return; }
+      pthread_mutexattr_destroy(&a);
+      as_fre_qcs_ready = 1;
+  }
+  #define AS_FRE_Q_LOCK()   pthread_mutex_lock(&as_fre_qcs)
+  #define AS_FRE_Q_UNLOCK() pthread_mutex_unlock(&as_fre_qcs)
+#endif
+
+// The directory the running executable lives in -- AIR's "application directory",
+// and the root every extension path is resolved against (as_ext_dir below).
+//
+// Windows needs no helper: as_ext_dir() reads GetModuleFileNameA directly and the
+// host library is opened by its bare name. POSIX has neither, so the path is
+// obtained here once and every caller derives from it. The macOS and Linux
+// sources of "where am I" differ; anything else is a loud compile error rather
+// than a silent empty path (AGENTS.md 1.5).
+#if !defined(_WIN32)
+static int as_fre_exe_dir(char* out, size_t n) {
+    char path[2048];
+    path[0] = 0;
+  #if defined(__APPLE__)
+    uint32_t sz = (uint32_t)sizeof(path);
+    if (_NSGetExecutablePath(path, &sz) != 0) return 0;
+  #elif defined(__linux__)
+    ssize_t got = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (got <= 0) return 0;
+    path[got] = 0;
+  #else
+    #error "as_fre_exe_dir: no source of the running executable's path for this platform"
+  #endif
+    char* slash = strrchr(path, '/');
+    if (slash == NULL) return 0;
+    *slash = 0;
+    if (strlen(path) + 1 > n) return 0;
+    strcpy(out, path);
+    return 1;
+}
+#endif
 
 // ---------- per-call FRE object arena ----------
 //
@@ -249,14 +382,6 @@ typedef struct as_fre_ctx {
 
 static as_fre_ctx* as_fre_ctxs = NULL;
 
-// One CRITICAL_SECTION for every context's queue. Initialized on first use:
-// file-scope CRITICAL_SECTION initialization cannot be spelled statically in C.
-static CRITICAL_SECTION as_fre_qcs;
-static int as_fre_qcs_ready = 0;
-static void as_fre_qcs_init(void) {
-    if (!as_fre_qcs_ready) { InitializeCriticalSection(&as_fre_qcs); as_fre_qcs_ready = 1; }
-}
-
 static as_fre_ctx* as_fre_ctx_find(void* as3ctx) {
     for (as_fre_ctx* c = as_fre_ctxs; c != NULL; c = c->next) if (c->as3ctx == as3ctx) return c;
     return NULL;
@@ -278,11 +403,11 @@ static as_fre_ctx* as_fre_ctx_add(const as_ane_desc* desc, void* as3ctx) {
 static void as_fre_pump(void) {
     if (!as_fre_qcs_ready) return;
     for (as_fre_ctx* c = as_fre_ctxs; c != NULL; c = c->next) {
-        EnterCriticalSection(&as_fre_qcs);
+        AS_FRE_Q_LOCK();
         as_fre_status* s = c->status_head;
         c->status_head = NULL;
         c->status_tail = NULL;
-        LeaveCriticalSection(&as_fre_qcs);
+        AS_FRE_Q_UNLOCK();
         while (s != NULL) {
             as_fre_status* n = s->next;
             if (as_fre_status_hook != NULL && c->as3ctx != NULL && !c->disposed)
@@ -863,11 +988,17 @@ static FREResult FREGetNativeContext3DHandle(FREObject context3D, void** handle)
 
 // ---------- threading ----------
 //
-// Served here rather than in asaot.dll, so the module that INITIALIZES a
+// Served here rather than in the host library, so the module that INITIALIZES a
 // caller-allocated FREMutex is always the one that locks and destroys it. The
-// struct is a CRITICAL_SECTION the CALLER owns, and splitting init from lock
+// struct is the CALLER's own (a CRITICAL_SECTION on Windows, a pthread_mutex_t on
+// macOS -- asaot.h picks the type per platform), and splitting init from lock
 // across two modules would be a lifetime bug waiting to happen.
-
+//
+// The two platforms also disagree about what an FREThread IS, which is why "the
+// null thread" is produced here instead of being assumed by a caller: a Win32
+// thread id is a 32-bit number whose 0 no live thread takes (they start at 4),
+// whereas a pthread_t is an opaque handle.
+#if defined(_WIN32)
 static FREThread FRECurrentThread(void) { return (FREThread)(uintptr_t)GetCurrentThreadId(); }
 // FREThread is a 32-bit id on Windows, where 0 is the value no thread id takes
 // (they start at 4) -- so it is the null this platform can express.
@@ -914,6 +1045,65 @@ static uint32_t FRERecursiveMutexTryLock(FREMutex* mutex) {
 }
 static void FRERecursiveMutexUnlock(FREMutex* mutex) { if (mutex != NULL) LeaveCriticalSection(mutex); }
 
+#else   // POSIX (macOS): pthreads, whose types asaot.h already declares for this side
+
+static FREThread FRECurrentThread(void) { return pthread_self(); }
+// A pthread_t is an opaque handle, so unlike the Windows branch there is no
+// value no live thread takes; a zeroed one is the null this platform can express.
+static FREThread FRENullThread(void) { return (FREThread)0; }
+
+static uint32_t FREThreadCreate(FREThread* thread, FREThreadFunction start_fn, FREThreadArg arg) {
+    if (thread == NULL || start_fn == NULL) return 0;
+    pthread_t t;
+    if (pthread_create(&t, NULL, start_fn, arg) != 0) return 0;
+    *thread = t;
+    return 1;
+}
+
+// Detach is the documented Windows behaviour (the created thread's handle is
+// closed at once, so its resources are reclaimed when it exits), and
+// pthread_detach is its direct counterpart. Detaching is why FREThreadJoin below
+// is best-effort: a detached thread cannot be joined on either platform.
+static uint32_t FREThreadDetach(FREThread thread) { return pthread_detach(thread) == 0 ? 1u : 0u; }
+
+static void FREThreadSleep(int32_t timeout_millis) {
+    if (timeout_millis <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = timeout_millis / 1000;
+    ts.tv_nsec = (long)(timeout_millis % 1000) * 1000000L;
+    // nanosleep resumes on a signal rather than failing, so the loop is what makes
+    // the sleep the FULL requested duration.
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+}
+
+static void FREThreadJoin(FREThread thread) { (void)pthread_join(thread, NULL); }
+
+// PTHREAD_MUTEX_RECURSIVE, because that is exactly what the FRERecursiveMutex*
+// family promises and what Windows' CRITICAL_SECTION is by construction. A default
+// (non-recursive) mutex would deadlock the first time an extension re-locked its
+// own mutex, which is a real pattern.
+static uint32_t FRERecursiveMutexInit(FREMutex* mutex) {
+    if (mutex == NULL) return 0;
+    pthread_mutexattr_t a;
+    if (pthread_mutexattr_init(&a) != 0) return 0;
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    int rc = pthread_mutex_init(mutex, &a);
+    pthread_mutexattr_destroy(&a);
+    return rc == 0 ? 1u : 0u;
+}
+static uint32_t FRERecursiveMutexDestroy(FREMutex* mutex) {
+    if (mutex == NULL) return 0;
+    return pthread_mutex_destroy(mutex) == 0 ? 1u : 0u;
+}
+static void FRERecursiveMutexLock(FREMutex* mutex) { if (mutex != NULL) pthread_mutex_lock(mutex); }
+static uint32_t FRERecursiveMutexTryLock(FREMutex* mutex) {
+    if (mutex == NULL) return 0;
+    return pthread_mutex_trylock(mutex) == 0 ? 1u : 0u;
+}
+static void FRERecursiveMutexUnlock(FREMutex* mutex) { if (mutex != NULL) pthread_mutex_unlock(mutex); }
+
+#endif  // threading
+
 // ---------- callbacks ----------
 
 static FREResult FREDispatchStatusEventAsync(FREContext ctx, const uint8_t* code, const uint8_t* level) {
@@ -934,10 +1124,10 @@ static FREResult FREDispatchStatusEventAsync(FREContext ctx, const uint8_t* code
     memcpy(s->code, code, cl + 1);
     memcpy(s->level, level, ll + 1);
     as_fre_qcs_init();
-    EnterCriticalSection(&as_fre_qcs);
+    AS_FRE_Q_LOCK();
     if (c->status_tail == NULL) c->status_head = s; else c->status_tail->next = s;
     c->status_tail = s;
-    LeaveCriticalSection(&as_fre_qcs);
+    AS_FRE_Q_UNLOCK();
     return FRE_OK;
 }
 
@@ -945,32 +1135,51 @@ static FREResult FREDispatchStatusEventAsync(FREContext ctx, const uint8_t* code
 
 static int as_fre_bound = 0;
 
-// Load asaot.dll and hand it the 51 implementations above. The DLL is a pure
+// Load the host library and hand it the 51 implementations above. It is a pure
 // forwarder: it holds no AS3 state, so everything an extension does lands in
 // this executable's heap and class registry.
+//
+// The library sits beside the EXECUTABLE, which is what makes the build
+// relocatable -- the same thing AIR does relative to the application directory.
+// On Windows a bare LoadLibraryA("asaot.dll") is found there by the loader's own
+// search order. On macOS the path is composed from the running executable's
+// directory rather than left to the loader's search paths, so the copy opened is
+// the one src/index.ts staged and not some other build on the machine.
 static void as_fre_install(void) {
     if (as_fre_bound) return;
-    HMODULE lib = LoadLibraryA("asaot.dll");
+#if defined(_WIN32)
+    as_fre_lib lib = as_fre_lib_open(AS_FRE_LIB_NAME);
+#else
+    char exedir[2048];
+    // NOT named host: an AsaotHost named host is built further down this same
+    // function, and a same-scope char array under that name makes every later
+    // host.FREFoo assignment report "member reference base type 'char[2300]' is not
+    // a structure or union" -- which names neither the array nor the shadowing.
+    char hostpath[2300];
+    if (!as_fre_exe_dir(exedir, sizeof(exedir))) {
+        as_shell_unsupported("the running executable's directory could not be determined, so "
+                             AS_FRE_LIB_NAME " cannot be loaded and native extensions are unavailable");
+        return;
+    }
+    snprintf(hostpath, sizeof(hostpath), "%s/%s", exedir, AS_FRE_LIB_NAME);
+    as_fre_lib lib = as_fre_lib_open(hostpath);
+#endif
     if (lib == NULL) {
-        // The Win32 code is what separates the two possible causes, and the old
-        // sentence named only one of them. Measured: 193 (ERROR_BAD_EXE_FORMAT)
-        // means the file IS there but this process cannot load it -- a 64-bit
-        // asaot.dll beside a 32-bit executable -- and that case used to be
-        // reported as "not next to the executable"; 126 (ERROR_MOD_NOT_FOUND) is
-        // the genuinely-missing one. Both slices of an ANE are named the same, so
-        // a report without the code makes the two indistinguishable.
-        char amsg[192];
+        // The loader's own diagnostic is what separates the possible causes. On
+        // Windows the code is the whole diagnosis (see as_fre_lib_err): a wrong
+        // bitness and a missing file used to be reported identically. On macOS
+        // dlerror() names the path it tried and why it gave up.
+        char amsg[2400];
         snprintf(amsg, sizeof(amsg),
-                 "asaot.dll could not be loaded from beside the executable (Win32 error %lu; "
-                 "193 = wrong bitness, 126 = not found); native extensions cannot be loaded",
-                 (unsigned long)GetLastError());
+                 AS_FRE_LIB_NAME " could not be loaded from beside the executable (%s); "
+                 "native extensions cannot be loaded", as_fre_lib_err());
         as_shell_unsupported(amsg);
         return;
     }
     typedef int (*AsaotBindFn)(const AsaotHost*);
-    AsaotBindFn bind = (AsaotBindFn)(void*)GetProcAddress(lib, "asaot_bind");
+    AsaotBindFn bind = (AsaotBindFn)as_fre_lib_sym(lib, "asaot_bind");
     if (bind == NULL) {
-        as_shell_unsupported("asaot.dll does not export asaot_bind (stale or foreign build)");
+        as_shell_unsupported(AS_FRE_LIB_NAME " does not export asaot_bind (stale or foreign build)");
         return;
     }
     static AsaotHost host;
@@ -1030,7 +1239,7 @@ static void as_fre_install(void) {
     host.FREDispatchStatusEventAsync = FREDispatchStatusEventAsync;
     int rc = bind(&host);
     if (rc != 0) {
-        as_shell_unsupported(rc == 2 ? "asaot.dll was built against a different ABI version" : "asaot_bind rejected the host table");
+        as_shell_unsupported(rc == 2 ? AS_FRE_LIB_NAME " was built against a different ABI version" : "asaot_bind rejected the host table");
         return;
     }
     as_fre_bound = 1;
@@ -1040,7 +1249,7 @@ static void as_fre_install(void) {
 
 typedef struct {
     const as_ane_desc* desc;
-    HMODULE lib;
+    as_fre_lib lib;
     void* ext_data;
     FREContextInitializer ctx_init;
     FREContextFinalizer ctx_final;
@@ -1057,6 +1266,7 @@ static int  as_ext_dir_ready = 0;
 
 static const char* as_ext_dir(void) {
     if (!as_ext_dir_ready) {
+#if defined(_WIN32)
         DWORD n = GetModuleFileNameA(NULL, as_ext_dir_buf, (DWORD)sizeof(as_ext_dir_buf));
         if (n == 0 || n >= (DWORD)sizeof(as_ext_dir_buf)) {
             as_ext_dir_buf[0] = 0;
@@ -1066,6 +1276,18 @@ static const char* as_ext_dir(void) {
             }
         }
         strncat(as_ext_dir_buf, "\\\\extensions", sizeof(as_ext_dir_buf) - strlen(as_ext_dir_buf) - 1);
+#else
+        // The same layout with POSIX separators: the directory holding the
+        // executable, then /extensions. An executable whose own directory cannot be
+        // determined leaves this empty, and as_ane_load's report then names the
+        // empty path -- the honest answer, rather than a guess at a relative one.
+        char exedir[2048];
+        if (as_fre_exe_dir(exedir, sizeof(exedir))) {
+            snprintf(as_ext_dir_buf, sizeof(as_ext_dir_buf), "%s/extensions", exedir);
+        } else {
+            as_ext_dir_buf[0] = 0;
+        }
+#endif
         as_ext_dir_ready = 1;
     }
     return as_ext_dir_buf;
@@ -1074,11 +1296,12 @@ static const char* as_ext_dir(void) {
 // Load (once) the native library behind descriptor i, and run its Initializer.
 // Returns 1 when a ContextInitializer is available.
 //
-// The path is as_ext_dir() (which ends in a backslash) joined with the
-// descriptor's own relative path '<extensionID>/<platform>/<lib>'. The mix of
-// separators is deliberate: the descriptor keeps AIR's forward-slash convention
-// (it mirrors the address inside the .ane), and Win32 file APIs take '/' as a
-// separator, so LoadLibraryA resolves it either way.
+// The path is as_ext_dir() (which ends with the platform's separator plus
+// "extensions") joined with the descriptor's own relative path
+// '<extensionID>/<platform>/<lib>'. The mix of separators is deliberate: the
+// descriptor keeps AIR's forward-slash convention (it mirrors the address inside
+// the .ane), and both Win32 file APIs and POSIX take '/' as a separator, so the
+// loader resolves it either way.
 //
 // Every failure names itself. AIR's contract is that createExtensionContext
 // returns null when the initializer "cannot be loaded or run", which makes a
@@ -1091,8 +1314,12 @@ static int as_ane_load(int i) {
     const as_ane_desc* d = &as_ane_descs[i];
     as_anes[i].desc = d;
     char path[2300];
+#if defined(_WIN32)
     snprintf(path, sizeof(path), "%s\\\\%s", as_ext_dir(), d->native_lib);
-    HMODULE lib = LoadLibraryA(path);
+#else
+    snprintf(path, sizeof(path), "%s/%s", as_ext_dir(), d->native_lib);
+#endif
+    as_fre_lib lib = as_fre_lib_open(path);
     if (lib == NULL) {
         // Same two-cause split as as_fre_install. This sentence used to blame
         // Adobe AIR.dll unconditionally, which sends a user off to recompile a
@@ -1104,20 +1331,20 @@ static int as_ane_load(int i) {
         // the directory.
         char emsg[2400];
         snprintf(emsg, sizeof(emsg),
-                 "extension native library not loadable: %s (Win32 error %lu; 193 = wrong bitness, "
-                 "126 = not found; an ANE that still imports Adobe AIR.dll must be recompiled against asaot.lib)",
-                 path, (unsigned long)GetLastError());
+                 "extension native library not loadable: %s (%s; an ANE that still imports "
+                 "Adobe AIR must be recompiled against " AS_FRE_LINK_NAME ")",
+                 path, as_fre_lib_err());
         as_shell_unsupported(emsg);
         as_anes[i].state = 2;
         return 0;
     }
     as_anes[i].lib = lib;
-    FREInitializer init = (FREInitializer)(void*)GetProcAddress(lib, d->initializer);
+    FREInitializer init = (FREInitializer)as_fre_lib_sym(lib, d->initializer);
     if (init == NULL) {
         const char* parts[3];
         parts[0] = "extension exports no Initializer named ";
         parts[1] = d->initializer;
-        parts[2] = " (is this ANE recompiled against asaot.lib?)";
+        parts[2] = " (is this ANE recompiled against " AS_FRE_LINK_NAME "?)";
         as_shell_unsupported(as_str_concat_n(3, parts));
         as_anes[i].state = 2;
         return 0;

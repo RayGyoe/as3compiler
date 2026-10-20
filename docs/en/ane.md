@@ -20,13 +20,18 @@
 >   all 11 entry points return `FRE_ILLEGAL_STATE` **and report themselves on stderr** — no silent
 >   success, no fabricated descriptor.
 >
-> **Status (re-checked at v0.4.161)**: faces A/B/C are landed; the host platform is currently only
-> **Windows x86 / x86-64** (two widths); there is **no** `macOS`/`iOS` host library (`--ane` on such a
-> platform reports loudly and quotes the missing path, see §5). End-to-end evidence: `examples/ane/`
-> (**all 43 assertions pass**) and `examples/ane-app/` (**8**, the descriptor route),
+> **Status (re-checked at v0.4.188)**: faces A/B/C are landed; the host platforms are **Windows x86 /
+> x86-64** (two widths) and **macOS x86-64 (a universal binary -- one key serves both architectures)**.
+> The macOS half landed on 2026-10-20 (stage 207): the host library, face C's POSIX branch, the fixture
+> and the examples (see §5.1). The only platform still missing is **iOS**: it links extensions
+> **statically into the application image** with no `dlopen` step, so it is not a loadable host library,
+> and `aneHostLibName()` **throws loudly with the reason** for it (any other platform without a host
+> library gets the same loud error quoting the missing path, see §5). End-to-end evidence: `examples/ane/`
+> (**all 46 assertions pass**, and it really runs on both Windows and macOS) and `examples/ane-app/` (**8**, the descriptor route),
 > `unit: ane/ExtensionContextSurface` in `test/unit/emit.ts`, and
 > `unit: ane/ExtensionXmlComments` / `unit: ane/PackageLayout` / `unit: ane/PlatformForBuild` /
-> `build/AneHostLayout` / `build/WindowsArch` in `test/unit/build.ts`.
+> `unit: ane/ExampleFixtureTrees` / `unit: ane/HostLibrary` / `build/AneHostLayout` /
+> `build/WindowsArch` in `test/unit/build.ts`, and `unit: fre/PlatformSplit` in `test/unit/fre.ts`.
 
 ---
 
@@ -156,8 +161,8 @@ AIR's platform keys are a **closed set**, and **not every key has a matching hos
 |---|---|---|---|
 | `Windows-x86` | `windows-x86` | ✅ `asaot.dll` + `asaot.lib` | 32-bit |
 | `Windows-x86-64` | `windows-x64` | ✅ `asaot.dll` + `asaot.lib` | 64-bit |
-| `MacOS-x86-64` | `macos-x86-64` | ❌ | the key is right, the host library is **not built** (§5 defect 2) |
-| `iPhone-ARM` | `ios-arm64` | ❌ | as above |
+| `MacOS-x86-64` | `macos-x86-64` | ✅ `libasaot.dylib` | **universal** (x86_64 + arm64); one key serves both architectures |
+| `iPhone-ARM` | `ios-arm64` | ❌ | iOS links extensions **into the application image** rather than `dlopen`ing one, so "a loadable host library" does not exist there; `aneHostLibName()` **throws** and says why, instead of borrowing the macOS name (§5 defect 2) |
 | `MacOS-x86` | — | — | a key AIR really has, but we have no host library ⇒ `aneHostDirName()` **throws**, it does not guess a directory |
 
 Two easy pitfalls, both **measured**:
@@ -185,13 +190,26 @@ without `--ane` is byte-for-byte identical to before these changes**: no `-DASC_
 
 ```
 compile time:  -D ASC_HAVE_FRE=1
-               include path += <repo>/lib            (the one contract header for asaot.h / shim)
-               link path    += <repo>/lib/bin/windows-x64
-               link library += asaot
-post-link:     copy asaot.dll to <exe directory>
+               include path += <repo>/lib                     (the one contract header for asaot.h / shim)
+               link path    += <repo>/lib/bin/<platform dir>  (windows-x64 / macos-x86-64)
+               link library += asaot                          (-lasaot; resolves to asaot.lib on
+                                                               Windows and to libasaot.dylib itself on macOS)
+post-link:     copy <the host library> to <exe directory>
                write <exe directory>/extensions/<extID>/<platform>/<nativeLibrary> (one per --ane)
 ```
 
+**The host library's FILE NAME is decided in exactly one place**: `aneHostLibName()` in `src/ane.ts`
+(Windows = `asaot.dll`, macOS = `libasaot.dylib`), with `aneHostDirName()` giving the directory.
+`src/index.ts` (the post-link copy), `src/checks.ts` (`doctor` reporting whether it is built) and
+`test/examples.ts` (the skip gate of both ANE examples) **all call it**; none of them spells a literal.
+Those four used to answer independently and happened to agree only because **all four said
+`asaot.dll`** -- once the name is platform-specific, a leftover literal in any one of them turns "this
+machine can run it" into a **silent skip** (the gate) or a copy **from a file that is not there** (the
+build). Neither of those is loud.
+
+`-lasaot` is spelled the same on both platforms because `ld` supplies the prefix and suffix itself:
+`asaot.lib` on Windows (the import library of `asaot.dll`) and `libasaot.dylib` on macOS (where a dylib
+is the import AND the runtime artefact in one file).
 Manifest fields (`src/build.ts`, kebab-case): `ane-paths` (array), `ane-platform` (string). CLI beats
 manifest (TypePHP's "CLI beats YAML"). `--ane` is repeatable.
 
@@ -382,6 +400,32 @@ itself with `findstr`). **That check is not decoration**: an import library with
 **completely silent** at build time and only much later shows up as "even the recompiled ANE still
 wants `Adobe AIR.dll`".
 
+macOS is the same job in the other file shape (`asaot_host.c` is **unchanged** -- it was always a
+platform-neutral forwarder):
+
+```sh
+cd as3compiler/lib
+./build-asaot.sh                      # universal by default (arm64 + x86_64)
+./build-asaot.sh --platform native    # host architecture only, for the edit/build loop
+```
+
+Products: `lib/bin/macos-x86-64/libasaot.dylib` (52 KB, 53 exports). **This dylib is macOS's
+`asaot.dll` and `asaot.lib` in one file**: on macOS the import library and the runtime library ARE the
+same file, so it is both linked (`-lasaot`) and `dlopen`ed at run time.
+
+Two macOS-specific things that have to be right:
+
+* **The install name must be `@executable_path/libasaot.dylib`.** That is what makes it relocatable:
+  dyld resolves it against the **main executable's** directory, so "the copy `src/index.ts` placed
+  beside the executable" IS the one that gets opened. An absolute path (e.g.
+  `/Users/me/.../libasaot.dylib`) works **on the author's machine and nowhere else** -- and that
+  mistake is **completely silent** at build time, which is why `build-asaot.sh` **inspects the
+  artefact** with `otool -D` rather than trusting the `-install_name` flag. The script also asserts the
+  two slices agree about it.
+* **Both slices must be present.** The `MacOS-x86-64` key does not encode an architecture (§3.4) and
+  AIR's own macOS runtime is a universal binary -- so an arm64-only fixture is rejected outright by dyld
+  on Intel.
+
 ### 4.3 Step 2: add a shim header (3 lines)
 
 An ANE's native sources say `#include "FlashRuntimeExtensions.h"` — that is the name the SDK ships, and
@@ -417,6 +461,22 @@ clang-cl /nologo /LD /O2 /MD /EHsc /W3 -Wno-invalid-source-encoding ^
   /link /INCREMENTAL:NO /MACHINE:X64 ^
   /LIBPATH:"<repo>\as3compiler\lib\bin\windows-x64" asaot.lib
 ```
+
+**Command line (macOS / `clang -dynamiclib`)** -- the macOS shape of the same recipe, and the one this
+repo's example uses (`examples/ane/build-ane.sh`):
+
+```sh
+clang -O2 -dynamiclib -fPIC \
+  -I "<your project>/shim" -I "<repo>/as3compiler/lib" \
+  "<your project>/MyExt.c" -o build/MyExt.dylib \
+  -L "<repo>/as3compiler/lib/bin/macos-x86-64" -lasaot
+```
+
+The **only** differences from the Windows line are names: `/LD /MD` becomes `-dynamiclib -fPIC`,
+`/LIBPATH: ... asaot.lib` becomes `-L ... -lasaot`, `/Fe:MyExt.dll` becomes `-o MyExt.dylib`. **`-I shim`
+must come first** on both. `-dynamiclib` rather than `-shared`: on macOS a loadable bundle and a dylib
+are different things, and we want the latter (the executable must **link** it; a bundle would be
+refused).
 
 **VS project (`.vcxproj`, which is what real projects use)** — change three places only; everything
 else (toolset, `/MD`, macro definitions) stays **completely untouched**:
@@ -456,6 +516,19 @@ All of the following must hold at once:
 * **the import table does not contain `Adobe AIR.dll`**;
 * **the export table contains `<Name>ExtInitializer` and `<Name>ExtFinalizer`**, spelled exactly as in
   `extension.xml` (both AIR and we `GetProcAddress` **by name**).
+
+The macOS equivalent (`otool` instead of `llvm-objdump`, asserting the same set of properties):
+
+```sh
+otool -L build/MyExt.dylib      # must show @executable_path/libasaot.dylib, and must NOT show Adobe AIR
+nm -gU build/MyExt.dylib        # must show _<Name>ExtInitializer / _<Name>ExtFinalizer
+lipo -archs build/MyExt.dylib   # "arm64 x86_64" when universal
+```
+
+`examples/ane/build-ane.sh` turns all of these into assertions, **plus** one Windows has no counterpart
+for: the dependency must be the **relocatable** `@executable_path/libasaot.dylib`. A dependency recorded
+as an absolute path is just as silent at build time, and it makes the fixture "build here, fail to load
+anywhere else".
 
 One aside: recompiling does not change the extension's own **system** requirements (a certain real
 project still imports `MFPlat.dll` / `MFReadWrite.dll` / the VC runtime, for instance). Those are
@@ -640,7 +713,8 @@ Every AOT-side problem goes to stderr on **the same rate-limited self-report cha
 
 ### 4.9 The smallest runnable example: `examples/ane/` (two routes, one fixture)
 
-This repo has a complete, reproducibly generated minimal loop (all 43 assertions pass). **The rebuilt
+This repo has a complete, reproducibly generated minimal loop (**all 46 assertions pass**, and both
+platforms run the *same* `driver.as`). **The rebuilt
 product is a staging directory tree, not a `.ane`** (§4.6 no longer packages), so the example
 directory's shape is the shape of the run-time `extensions/` directory —
 `<extension id>/<platform>/<library>`:
@@ -649,9 +723,11 @@ directory's shape is the shape of the run-time `extensions/` directory —
 |---|---|
 | `examples/ane/ProbeANE.c` | the extension's **native half**, 21 KB, covering integers/floats/UTF8/booleans/arrays/byte arrays/object properties/method calls/native data/status events/threads and mutexes/throwing/the **FRE string length contract** (`stringInfo`) |
 | `examples/ane/shim/FlashRuntimeExtensions.h` | the §4.3 shim, and it **deliberately makes `ProbeANE.c` use AIR's include name** so the shim is really exercised |
-| `examples/ane/build-ane.bat` | the §4.4 recompile recipe (clang-cl); after building it automatically runs the §4.5 import-table check and installs the result into **two** staging trees |
+| `examples/ane/build-ane.bat` | the §4.4 recompile recipe for **Windows** (clang-cl); after building it automatically runs the §4.5 import-table check and installs the result into **two** staging trees |
+| `examples/ane/build-ane.sh` | the §4.4 recompile recipe for **macOS** (`clang -dynamiclib`), one compile staged into both trees, and it asserts a set of **artefact** properties (relocatable dependency name / no Adobe AIR / the initializer export / both slices / the descriptor still declaring its platform entry) |
 | `examples/ane/ext-aot/com.example.probe/extension.xml` | the §4.6 descriptor (directory name = extension id) |
 | `examples/ane/ext-aot/com.example.probe/Windows-x86-64/ProbeANE.dll` | the rebuilt product (19,456 bytes, imports `asaot.dll`) |
+| `examples/ane/ext-aot/com.example.probe/MacOS-x86-64/ProbeANE.dylib` | the rebuilt product (universal binary, depends on `@executable_path/libasaot.dylib`) |
 | `examples/ane/driver.as` | the AS3 driver, where **every line is an assertion**, ending with `RESULT passed=N failed=0` |
 | `examples/ane/ane.build.json` | the build manifest (`ane-paths` pointing at that staging tree) |
 | `examples/ane-app/` | §4.9.1: the same fixture going through `--air-app` + the descriptor's `<extensions>` |
@@ -680,7 +756,7 @@ example:
 |---|---|
 | `examples/ane-app/ane-app.xml` | the descriptor: `<extensions>` declaring **one** id; `<visible>false</visible>` (offscreen, so after building you can `--run` and exit) |
 | `examples/ane-app/src/Main.as` | the AS3 entry point (`extends Sprite`), 8 assertions: an undeclared id resolves to null, a declared one builds a context, `ping`/`addInt`/native data/`truthy('')`/`StatusEvent`/`dispose` |
-| `examples/ane-app/ext-aot/com.example.probe/` | **byte-for-byte identical** to `examples/ane/`'s staging tree (the same `build-ane.bat` writes both, and a pin holds that identity) |
+| `examples/ane-app/ext-aot/com.example.probe/` | **byte-for-byte identical** to `examples/ane/`'s staging tree (one script writes both — `build-ane.bat` on Windows, `build-ane.sh` on macOS — and a pin holds that identity, **one pin per platform**) |
 | `examples/ane-app/ane-app.build.json` | a by-product that `--air-app` **rewrites on every run** (`ane-paths` = `["ext-aot/com.example.probe"]`), so it is **not committed** |
 
 How to run (`--air-app` writes `ane-paths` into the manifest and the loader then drops the library into
@@ -749,18 +825,17 @@ loudly + logged"** — not one of them is a silent degradation.
 | # | Gap | Phenomenon | Self-reported? | Path to landing it |
 |---|---|---|---|---|
 | 1 | **Face D render pipeline** (11 entry points) | a video/presentation-class extension gets no render mode, no media buffer, no window handle | ✅ `FRE_ILLEGAL_STATE` + self-report | needs a real presentation backend (Skia/D3D interop + exposing the window HWND), a separate project |
-| 2 | **no host library for macOS / iOS** | `lib/bin/macos-x86-64/`, `ios-arm64/` do not exist, so `--ane` on macOS always fails | ✅ build-time error quoting that path | `lib/asaot_host.c` is a width-independent thin forwarder; the macOS side needs a `dlopen`/`dlsym` branch + a `build-asaot.sh`. **The platform key is already fixed** (§3.4); the library is what is missing |
+| 2 | **iOS has no (equivalent) host library** | `lib/bin/ios-arm64/` does not exist | ✅ `aneHostLibName()` throws and says why | This row is **not** "the macOS half is still to do" (that landed on 2026-10-20, see §5.1). iOS's platform model differs: an extension is **statically linked into the application image**, so there is no `dlopen` step, and `asaot` would become a **static library** reached through a **direct symbol reference** to the initializer rather than a name lookup at run time. Landing it starts with deciding *who calls the initializer* -- it is not a recompile |
 | 3 | **Windows ARM64 unverified** | guards exist (refuses to guess a key, demands an explicit 64-bit build), but the arm64 dependency chain has never been built (no MSVC arm64 toolset on this machine) | ✅ refuses and advises | needs an arm64 Windows machine + toolset |
 | 4 | **the extension is only partially unpacked** | each extension now has its own directory `<exe directory>/extensions/<extID>/<platform>/` (new here, §3.3), but **only the native library** is in it: the extension's other packaged files (data files, auxiliary DLLs) are not. So `getExtensionDirectory()` still only **self-reports** and does not return that directory | ✅ self-report | drop the **whole package** into `extensions/<extID>/` (half the layout work is done; the rest is unpacking all entries), after which `getExtensionDirectory()` can return a real directory |
 | 5 | **an ANE class without `.as` sources cannot be AOT'd** | when the extension's AS3 wrapper classes exist only in `library.swf`'s `DoABC`, the extension is unusable | ✅ undeclared class = compile-time error | needs a decompiler or an AVM2 interpreter, outside this project's scope (the §3.3 conclusion) |
 | 6 | **AIR 50 members of `ExtensionContext` are not modelled** | `functions` / `knownExtensions` / `getExtensionInfo` / `loadExtension` do not exist | ✅ undefined ⇒ error | the first three are a read-only reflection surface; `loadExtension` is **not a small change**: it is **lazy loading** (`LoadLibrary` + Initializer at the first `call`), requiring face C's load timing to move from "at construction" to "at first call" plus caching |
 | 7 | **`File.applicationDirectory` is missing** | real AIR apps use it to locate packaged resources (and it is also the basis of the `extensions/` layout) | ✅ undefined ⇒ error | land it with the `url`/`nativePath` measured on `adl` |
 | 8 | **the descriptor table caps at 32** | the 33rd extension is rejected **at compile time**. **This gate is new here**: previously 33 extensions would compile, link and stage **all green, exit 0, with not a word of warning**, until the 33rd `createExtensionContext` at run time wrote past `as_anes[32]` (measured) | ✅ compile-time error with the way out | raise `ANE_COUNT_MAX` in `src/fre.ts` (the `FRE_HEAD`'s `ASC_ANE_COUNT_MAX` is interpolated from it — one source of truth); the current value is simply a deliberate bound |
-| 9 | **face C is Windows-only** | `LoadLibraryA` / `CRITICAL_SECTION` / `GetModuleFileNameA` / `Sleep` are all Win32 | —— | the two halves of the same thing as defect 2: the host library and face C's POSIX branch must be done together |
 
 ### 5.1 Fixed defects (kept as lessons)
 
-All six are of the "**`adl` gets it right, we do not**" kind, and all were measured while migrating a
+All eight are of the "**`adl` gets it right, we do not**" kind, and all were measured while migrating a
 real third-party ANE; all are fixed now and have behavioural pins. Their value in being listed here is
 their common shape: **every one of them "looks right and turns out wrong"**.
 
@@ -773,6 +848,9 @@ their common shape: **every one of them "looks right and turns out wrong"**.
 | the ANE platform key came from the **host** rather than the **build target** | a 32-bit build linked the x64 host library and staged the x64 slice: compiling and linking all green, exploding **at run time** | for a win32 native build the key = the width of `architecture`; an arm64 target has no key (refused, naming the target) | `unit: ane/PlatformForBuild` (11) |
 
 | **the FRE string length counted one byte too many** | our `FREGetObjectAsUTF8` returned `strlen+1` (written from the SDK header's own sentence, "Includes the null terminator") while `adl` was measured to return the byte count **without** it. An extension that **carries the length** — `ANEUtils::getString` is exactly `std::string(val, val + length)` — gets one extra NUL byte appended to every string it reads; when that string is embedded verbatim in a protocol frame (a WebSocket URL in an HTTP request line) it becomes `GET /node1?...\0 HTTP/1.1`, and the server closes without answering. Every **wss** connect in the host app's AOT build failed as `status_code 0` + `websocketpp.transport:7` (EOF), while on **the same machine** `adl` loaded the same native library with the same URL and the same token, got `101` and received application frames. Extensions that only hand the pointer to `printf`/`strcmp` never noticed the byte; anything carrying its own length (`std::string`, a protocol frame, a hash) did | changed to `strlen(s)`, matching the `adl` measurement, with the "**the header sentence and the measurement disagree**" fact written into the comment together with the evidence, so nobody "fixes" it back to `+1` from the documentation; the reverse direction, `FRENewObjectFromUTF8`, keeps accepting a caller-supplied terminator (callers spelling `strlen+1` are everywhere) | `unit: fre/Utf8LengthContract` (8; mutation 7/7 all caught) + the native echo assertions in `examples/ane/`'s `stringInfo` (3: 6 ASCII bytes, four CJK chars as 12 bytes, the empty string as 0 bytes, `extra` must be 0 — putting `src/fre.ts` back to `+1` turns this red) |
+
+| **face C is Windows-only** (`LoadLibraryA` / `CRITICAL_SECTION` / `GetModuleFileNameA` / `Sleep`) | **invisible on Windows** (those branches compile as usual) and red on the first macOS build. And this half only acquired a consumer once the host library (the other half of defect 2) existed | added a platform shim inside `FRE_BODY`: `as_fre_lib_open` / `as_fre_lib_sym` / `as_fre_lib_err` (`dlopen` + `RTLD_NOW` + `RTLD_LOCAL` / `dlsym` / `dlerror`), `as_fre_exe_dir` (macOS uses `_NSGetExecutablePath`, Linux `/proc/self/exe` -- because the install name is `@executable_path/`, only the exe's directory says where the library is), the status-queue lock turned into the two macros `AS_FRE_Q_LOCK` / `AS_FRE_Q_UNLOCK` (a `CRITICAL_SECTION` on Windows, an **explicitly recursive** `pthread_mutex_t` on macOS -- `FREDispatchStatusEventAsync` arrives from a thread already inside `as_fre_pump`, where a plain mutex would **deadlock**), and pthread implementations for the thread family | `unit: fre/PlatformSplit` (8) -- the central check **reads the preprocessor**: any Win32-only name sitting on a line "macOS would compile" is red. A name list is only right on the day it is written; the branch test stays right the next time someone reaches for a Win32 API |
+| **`asaot.h`'s POSIX branch had no `ASAOT_HOST` mode** | the first time a program was compiled against the macOS host library, `clang` stopped on **every** FRE line: `error: static declaration of 'FREGetObjectType' follows non-static declaration`. The cause is not new code -- `asaot.h`'s Windows branch has **three modes** (`ASAOT_BUILD` / `ASAOT_HOST` / the rest), while the POSIX branch was a **single line** of `visibility("default")`; and the host program **defines** those 51 entry points, which the size pass then marks `static`, so a "non-static declaration" collided with a "static definition". **On Windows the same mismatch is only a warning** (`redeclared without 'dllimport' attribute`), which is exactly why the branch stayed unnoticed | gave the POSIX branch the third mode too: `ASAOT_HOST` ⇒ `#define ASAOT_API static` (not empty -- see the parenthesis above). The dylib side keeps `visibility("default")`, which is how `build-asaot.sh` exports all 53 without `-fvisibility=hidden` | `unit: ane/HostLibrary` (one of 20) -- pins that the POSIX branch exists and takes effect, that the dylib branch keeps the attribute, and that **the measured error text is quoted in the comment** (so nobody deletes it as tidiness) |
 
 One accompanying diagnostic improvement: the two load-failure self-reports now **carry the Win32 error
 code** (`193` = width mismatch, `126` = not found). Previously they blamed "the library was not
@@ -795,15 +873,17 @@ people fix things in the wrong direction for a long time.
 
 | Evidence | Content | How to reproduce |
 |---|---|---|
-| `examples/ane/` | the end-to-end example, **all 46 assertions pass**, last line `RESULT passed=46 failed=0` | `node --test --test-name-pattern='example: ane' test/examples.ts` |
+| `examples/ane/` | the end-to-end example, **all 46 assertions pass**, last line `RESULT passed=46 failed=0`. **Windows and macOS run the same `driver.as`, the same fixture source and the same assertions** (macOS loads a real `dlopen`ed `ProbeANE.dylib`) | `node --test --test-name-pattern='example: ane' test/examples.ts` |
 | `examples/ane-app/` | the end-to-end example, **the descriptor half**: `--air-app` resolves the descriptor's `<extensions>` into `ane-paths`, drops the library into `extensions/<extension id>/<platform>/` and runs it; **all 8 assertions pass**, last line `RESULT passed=8 failed=0` (plus one line of the undeclared-id self-report verbatim) | as above |
 | `test/unit/emit.ts` → `unit: ane/ExtensionContextSurface` | 9 checks: in the **emitted C**, `getExtensionDirectory` must self-report, must still return a live `File`, and the self-report must **name this build's layout** and say that the directory does **not** hold the whole package; `actionScriptData` is a real member while `extensionID` **is not**; `call`'s "extension never loaded" self-report must be named | `node --test --test-name-pattern='ane/ExtensionContextSurface' test/unit/emit.ts` |
 | `test/unit/fre.ts` → `unit: fre/Utf8LengthContract` (8) | both directions of the FRE string boundary: `FREGetObjectAsUTF8`'s `length` must be `strlen` (**not** plus the terminator, and not some other count), `value` must be the string itself, and a non-String must stay `FRE_TYPE_MISMATCH`; in the reverse direction `FRENewObjectFromUTF8` must tolerate a caller-supplied terminator and must not count it as part of the string. Mutation 7/7 (`+1u`, `+1`, swap the `value` pointer, loosen the tag check, drop the tolerance, copy the terminator into the string, omit the terminating 0) | `node --test --test-name-pattern='fre/' test/unit.ts` |
 | `test/unit/build.ts` → `unit: ane/ExtensionXmlComments` | 9 checks: a comment must not invent a platform entry, must not swallow the real entry, and an unterminated comment must be rejected by package name | as above, with `test/unit/build.ts` |
 | `test/unit/build.ts` → `unit: ane/PackageLayout` (27) | the official `adt` layout, the flat layout and `adt`'s staging layout are all accepted; **unpacked directories** are accepted too (including the two cases of recursion and `/`-separated names, so a manually unzipped `META-INF/ANE` tree is readable); the directory form likewise takes its slice by platform and never borrows another platform's; on failure it must not merely say "no", it must list the candidate paths; **the on-disk path must be `<extID>/<platform>/<library>`** (both in the descriptor and in the staging key, with no bare file name left anywhere); **two extensions may each carry a same-named library and each keep its own bytes**; a library declared in a subdirectory **keeps that subdirectory**; **the extension count cap is a hard gate** (exactly 32 passes, 33 is rejected with the count and the constant name) | as above with `test/unit/build.ts` |
+| `test/unit/build.ts` → `unit: ane/HostLibrary` (20) | "what the host library is called" has exactly **one** answer: `aneHostLibName()` gives `asaot.dll` for both Windows keys, `libasaot.dylib` for `MacOS-x86-64`, **throws with an explanation** for `iPhone-ARM` (it does not borrow the macOS name), and throws for an unknown key; the four consumers (the post-link copy in `src/index.ts`, the `doctor` check in `checks.ts`, the skip gate in `test/examples.ts`, the two macros in `src/fre.ts`) **all take it from that one function**, and any of them falling back to a literal goes red; `lib/asaot.h`'s POSIX branch must map `ASAOT_HOST` to `static`, the dylib branch must keep the attribute, and the measured error text must be quoted in the comment; `lib/build-asaot.sh` and `examples/ane/build-ane.sh` must exist, be executable, and carry artefact assertions (install name / relocatable dependency name / no Adobe AIR / the initializer export / both slices / the descriptor's platform entry) | as above |
+| `test/unit/fre.ts` → `unit: fre/PlatformSplit` (8) | **no** Win32-only name in `FRE_BODY` sits on a line "macOS would compile" (each line judged against the nesting of `#if defined(_WIN32)`, comment lines excluded — the first run caught two such names **in comments**, which is precisely what has to be allowed through); the POSIX half **really implements** four things (`dlopen`/`dlsym`, the exe's own directory, a recursive lock, pthread threads) rather than leaving an empty `#else`; the library name and link name are two macros with two spellings each; the status queue's critical section goes **only through the macros** | `node --test --test-name-pattern='fre/' test/unit.ts` |
 | `test/unit/build.ts` → `unit: ane/PlatformForBuild` (11) | the platform key follows `architecture`; an absent value keeps the host's answer; on wasm/darwin `architecture` has no effect (an AIR descriptor defaults to `32`, which must not become `Windows-x86`); an arm64 target does not invent a key; **the width reads the same in the ANE key and in the target triple** | as above |
 | `test/unit/build.ts` → `unit: air-app/Extensions` (30) | **the descriptor-driven half**: `<extensions>` is read in descriptor order, **an ID inside a comment does not count** (the SDK template leaves exactly that placeholder), and **an uncommented empty `<extensionID>` does not count either**; packaged `.ane`, unpacked trees and **staging trees** are all accepted, while an unrelated package directory is still skipped (not an error); with several roots **first hit wins** and later roots still fill in IDs the earlier one lacks; `ext-aot` is ordered **ahead of the default roots**, so a rebuilt package with the same ID beats the AIR original in `lib/`, while an ID absent from `ext-aot` still comes from `lib/`; **packages in the directory do not count — only what the descriptor asks for is returned**; declared but not found is refused (AIR's own wording, the directories looked at, `(absent)` markers, what they offer, **three ways out**); `--extdir` overrides the defaults and is refused without `--air-app`; the written manifest holds **`/`-separated paths relative to the manifest directory**, and with no declaration **not a single key is written**. Mutation 5/5 (drop the staging-tree form / resolve the wrong path / treat every directory as a package / put `lib` before `ext-aot` / drop `ext-aot` entirely) | as above |
-| `test/unit/build.ts` → `unit: ane/ExampleFixtureTrees` (7) | the very fact that the two examples share **one fixture** needs pinning: both staging trees exist; `extension.xml` and `Windows-x86-64/ProbeANE.dll` are **byte-for-byte identical** (`readFileSync(a).equals(b)`); both declare one id / one platform / one library; running `resolveExtensionPackages` over that app directory with the real descriptor resolves to that tree; the manifest's `ane-paths` points at it; the app descriptor declares the same id. With this group in place, "the two examples are actually running different things" cannot happen silently | as above |
+| `test/unit/build.ts` → `unit: ane/ExampleFixtureTrees` (9) | the very fact that the two examples share **one fixture** needs pinning: both staging trees exist; `extension.xml` and `Windows-x86-64/ProbeANE.dll` are **byte-for-byte identical** (`readFileSync(a).equals(b)`); **`MacOS-x86-64/ProbeANE.dylib` is byte-for-byte identical too** (present in both trees; lose one and this goes red); both declare one id / one platform / one library; running `resolveExtensionPackages` over that app directory with the real descriptor resolves to that tree; the manifest's `ane-paths` points at it; the app descriptor declares the same id. With this group in place, "the two examples are actually running different things" cannot happen silently | as above |
 | `test/unit/build.ts` → `unit: air-app/OffscreenLinkSet` (10) | the link set of a Windows **offscreen** build (`<visible>false</visible>` has no window, but is not "a smaller build": `skia_glue.cc` compiles into every native product and its GDI font manager is reached by `SkFontMgr::Factory()` before any pixel is drawn); with `process.platform` faked to win32 it asserts that `gdi32/user32/ole32/advapi32/usp10` and `z` are in while `SDL2/winmm/imm32/oleaut32/version/uuid/setupapi/shell32/dinput8/d3d12*` and `curl` are **not**; `defines` has `ASC_USE_SKIA=1` but no `ASC_USE_WINDOW=1`; `sources` is only `skia_glue.cc`; the macOS branch still goes through CoreText. Mutation 2/2 (move the four libraries back into the `visible` branch ⇒ 2 red) | as above |
 | `test/unit/build.ts` → `build/AneHostLayout` (21) / `build/WindowsArch` (24) | the key set `--help` offers ≡ the key set that really has a `lib/bin/` directory; every key maps to a unique directory; an unknown key throws; the key `MacOS-AOT`, which AIR never emits, no longer points at any directory | as above |
 | mutation testing (`temp/`, scaffolding, not a deliverable) | inject breakage into each of the above groups **check by check** (delete the self-report, add `extensionID` back, drop comment stripping, make the regex greedy…), confirming **each one goes red**; the control group stays green; then **restore byte-for-byte** and verify the hash | —— |
@@ -814,10 +894,15 @@ people fix things in the wrong direction for a long time.
 | a real project, **six extensions fully rebuilt + per-extension run-time loading** (`temp/ext-aot/`) | one real app's extension list has **7** extensions, 6 of which were rebuilt for AOT per §4 (the 7th being the both-widths one finished in the previous round): every library **imports `asaot.dll`, contains no `Adobe AIR.dll`**, and its export names match its descriptor, with **the width identical item by item to the slice the original package actually ships** (for one of them the descriptor declares `Windows-x86-64` while the original package only ships x86 — the original package wins, no extra width is invented). After installing per §3.7 under `ext-aot/<extension id>/<platform>/`, `--air-app` is driven with the **real descriptor**: 7 declared IDs → `ane-paths` is exactly **7 `ext-aot/<id>` entries in descriptor order**; then a probe that **builds one context per id** (§4.10's last paragraph) is compiled and run: `exit 0`, 7 `E2E OK` lines, last line `E2E DONE 7/7`, and one extension's Initializer even prints its own version banner — proof that native code really **executed**, not just that "the files are there and nothing errored". The CEF one was built from `git HEAD`'s **committed sources + the committed 3.2987.1601 dependencies**, with **zero patches** (the process and the three pitfalls are in §4.10) | —— |
 
 
-**The CI policy needs stating**: `.github/workflows/test.yml` runs on a **macOS arm64** runner, which has
-no Windows host library, so `examples/ane/` and `examples/ane-app/` **skip loudly** there (not pass, not
-fail); what really runs on CI is the structural pins in `test/unit/`. In other words, "the examples
-pass" has so far only been measured on Windows.
+**The CI policy needs stating**: `.github/workflows/test.yml` runs on a **macOS arm64** runner. This
+paragraph used to say "that runner has no Windows host library, so both extension examples skip loudly
+and only the structural pins in `test/unit/` really run" -- **that no longer holds**: the macOS host
+library and the fixture product are both **committed** (`lib/bin/macos-x86-64/libasaot.dylib`, universal,
+and `ext-aot/.../MacOS-x86-64/ProbeANE.dylib`, also universal), so on that runner both examples **really
+run** (`skipped 0`), loading a genuine `dlopen`ed dylib, with the same 46 assertions. The only remaining
+skip is **a host that has no host library** (today just the iOS family, where `aneHostLibName()` throws),
+and the reason line names the missing file -- that is not "skipped", that is "says exactly what is
+missing".
 
 ---
 
@@ -827,8 +912,11 @@ pass" has so far only been measured on Windows.
 |---|---|
 | `lib/asaot.h` | the FRE ABI contract header (byte-for-byte swappable with the SDK's `FlashRuntimeExtensions.h`) |
 | `lib/asaot_host.c` | the source of `asaot.dll`: a **thin forwarder** for the 51 entry points, all forwarding into the table `asaot_bind` installs |
-| `lib/build-asaot.bat` | builds the host library (both widths by default); carries its own "the import library records `asaot.dll`" assertion |
-| `lib/bin/windows-{x86,x64}/` | the host library products (`asaot.dll` + `asaot.lib`) |
+| `lib/build-asaot.bat` | builds the **Windows** host library (both widths by default); carries its own "the import library records `asaot.dll`" assertion |
+| `lib/build-asaot.sh` | builds the **macOS** host library (universal arm64 + x86_64 by default); carries a set of **artefact** assertions: the install name is `@executable_path/libasaot.dylib` (and both slices agree), `asaot_bind` is exported, 53 exports, no Adobe AIR dependency |
+| `lib/bin/windows-{x86,x64}/` | the Windows host library products (`asaot.dll` + `asaot.lib`) |
+| `lib/bin/macos-x86-64/` | the macOS host library product (`libasaot.dylib`, universal; the two Windows files are one file here) |
+| `src/ane.ts` → `aneHostDirName` / `aneHostLibName` | the single home of the one decision "which directory + which file name" (Windows = `asaot.dll`, macOS = `libasaot.dylib`, iOS **throws**) |
 | `src/ane.ts` | compile-time `.ane` parsing: `extension.xml` (comments stripped first), platform keys, directory names, descriptor resolution, native-library staging (**one directory per extension** `<extID>/<platform>/`, honouring `ANE_COUNT_MAX`). **Accepts both ZIPs and unpacked directories** (§4.6) |
 | `src/fre.ts` | the FRE host: `FRE_HEAD` / the descriptor block / `FRE_BODY` (51 entry points + the loader + dispatch) / `FRE_STUBS` (the empty implementation for builds without FRE). `ANE_COUNT_MAX` (the single source of truth for the descriptor table cap) lives here too |
 | `src/emit.ts` | emission of the descriptor table and the hook bodies, `ExtensionContext`'s AS3 half, `as_fre_pump` |
@@ -836,7 +924,8 @@ pass" has so far only been measured on Windows.
 | `src/air-app.ts` | AIR descriptor adaptation: read `<extensions>` (comments stripped first) → resolve the declared IDs into package paths from `lib`/`ext-folder` (or `--extdir`) → write them into the manifest's `ane-paths` |
 | `src/index.ts` | `--ane` / `--ane-platform` / `--extdir`, plus the three injections (`-D`/include/link) and the post-link staging |
 | `src/build.ts` | the manifest fields `ane-paths` / `ane-platform` (`ane-paths` is deduplicated by absolute path before being appended) |
-| `examples/ane/` | the end-to-end minimal loop (§4.9) |
+| `examples/ane/` | the end-to-end minimal loop (§4.9), with a fixture product per platform and a build script for each |
+| `examples/ane/shim/FlashRuntimeExtensions.h` | the §4.3 shim (3 lines): lets the extension source link against the `asaot` ABI without changing a character |
 | `examples/ane-app/` | the **descriptor route** over the same fixture (§4.9.1) |
 | `docs/en/compile.md` | the complete list of CLI arguments and manifest fields |
 | `README.md` | the "ANE loading" section (an overview) |

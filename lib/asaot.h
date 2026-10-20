@@ -99,7 +99,19 @@
  * points (it is the host, see fre.ts), so it must see them undecorated. Without
  * it the exe's own definitions are second declarations of dllimport symbols and
  * clang warns "'FREGetObjectAsInt32' redeclared without 'dllimport' attribute"
- * once per entry point. */
+ * once per entry point.
+ *
+ * POSIX needs the same three modes for a different reason, so it cannot just be
+ * the one-line `else` it looks like: here a bare attribute IS the whole
+ * decoration, and `visibility("default")` -- unlike the empty expansion on
+ * Windows -- also gives the declaration EXTERNAL linkage. The generated
+ * executable's entry points are then marked `static` by the size pass
+ * (AGENTS 2.6), and `static` after a non-static declaration is a hard error
+ * ("static declaration of 'FREGetObjectType' follows non-static declaration"),
+ * not the warning Windows gives. So ASAOT_HOST must mark them `static` on BOTH
+ * sides, in the two ways each side spells that; the dylib build (ASAOT_BUILD) is
+ * what keeps the visibility attribute, which is how lib/build-asaot.sh gets its 53
+ * exports without -fvisibility=hidden. */
 #if defined(_WIN32)
   #if defined(ASAOT_BUILD)
     #define ASAOT_API __declspec(dllexport)
@@ -109,7 +121,21 @@
     #define ASAOT_API __declspec(dllimport)
   #endif
 #else
-  #define ASAOT_API __attribute__((visibility("default")))
+  #if defined(ASAOT_HOST)
+    /* `static`, not nothing: the host TU defines every one of these further down,
+     * and the size pass (AGENTS 2.6) gives those definitions internal linkage.
+     * A non-static declaration here would make that a hard error -- "static
+     * declaration of 'FREGetObjectType' follows non-static declaration", measured
+     * on macOS -- whereas Windows tolerates the same mismatch with a warning
+     * ("redeclared without 'dllimport' attribute"), which is why the missing mode
+     * went unnoticed here: the non-_WIN32 branch had no consumer until a macOS FRE
+     * host library existed. Declaring them `static` too is what makes the two
+     * agree; the whole list IS defined in that TU, so none is left declared-only
+     * (which would draw -Wunused-function). */
+    #define ASAOT_API static
+  #else
+    #define ASAOT_API __attribute__((visibility("default")))
+  #endif
 #endif
 
 #ifdef __cplusplus

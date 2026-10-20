@@ -85,3 +85,116 @@ function checkFreUtf8Length(): string[] {
 }
 
 registerGroup('unit: fre/Utf8LengthContract', checkFreUtf8Length);
+
+// --- the host side of the FRE body on POSIX (阶段二百零三) ----------------------
+//
+// FRE_BODY was Windows-only INSIDE: LoadLibraryA, a CRITICAL_SECTION status-queue
+// lock, CreateThread, GetModuleFileNameA. None of that is visible on Windows, and
+// it is a compile error on macOS -- measured, in two rounds: first "static
+// declaration of 'FREGetObjectType' follows non-static declaration" (asaot.h
+// declaring the 51 entry points with external linkage while the size pass makes
+// the host's definitions `static`; Windows only WARNS about the same mismatch,
+// which is why the branch had gone unnoticed), then "use of undeclared identifier
+// 'HMODULE'" once that was fixed. The repair and the regression look identical in
+// a diff of the Windows branch, so the branch is what gets pinned.
+//
+// The rule is read off the PREPROCESSOR rather than off a list of function names:
+// a Win32-only identifier is a defect exactly when it sits on a line macOS would
+// COMPILE, i.e. outside the Windows branch of every enclosing `#if defined(_WIN32)`.
+// A name list is only as complete as the day it was written; the branch test stays
+// right the next time a Win32 API is reached for.
+const WIN32_IDENT = /\b(HMODULE|HINSTANCE|DWORD|HANDLE|LPSTR|WINAPI|__declspec|GetModuleFileNameA|LoadLibraryA|GetProcAddress|GetLastError|CreateThread|OpenThread|WaitForSingleObject|CloseHandle|InitializeCriticalSection|EnterCriticalSection|TryEnterCriticalSection|LeaveCriticalSection|DeleteCriticalSection|GetCurrentThreadId|Sleep)\b/;
+
+// The lines of `c` that macOS compiles AND that match `pattern`. Frames are the
+// enclosing `#if`s; `win` marks a frame whose test mentions _WIN32 and `negated`
+// whether the branch being read is the NEGATION of it (`#else`, or `#ifndef` /
+// `!defined`). Nesting is why this is a stack: `#if !defined(_WIN32)` wrapped
+// around `#if defined(__APPLE__)` must leave a macOS line looking like one.
+//
+// Comments are skipped. Naming GetModuleFileNameA in a sentence that explains why
+// the POSIX side computes the same thing differently is prose, not a call -- and the
+// two leaks this pin found on its first run were exactly that. Since FRE_BODY has no
+// `/* */` comments (checked), skipping `//` and `*` lines cannot mis-frame the
+// stack: no `#if` hides inside a comment here.
+function macosCompiledLines(c: string, pattern: RegExp): string[] {
+  const frames: Array<{ win: boolean; negated: boolean }> = [];
+  const hits: string[] = [];
+  for (const line of c.split('\n')) {
+    const d = line.match(/^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$/);
+    if (d) {
+      const kind = d[1];
+      const rest = d[2];
+      if (kind === 'if' || kind === 'ifdef' || kind === 'ifndef') {
+        const mentionsWin = /_WIN32/.test(rest);
+        frames.push({ win: mentionsWin, negated: mentionsWin && (kind === 'ifndef' || /!\s*defined/.test(rest)) });
+      } else if (kind === 'endif') {
+        frames.pop();
+      } else if (kind === 'else') {
+        const top = frames[frames.length - 1];
+        if (top) top.negated = !top.negated;
+      } else {
+        // `#elif`: the branch now being read is any branch but the one just closed,
+        // so an `#elif !defined(_WIN32)` is the non-Windows one and an `#elif
+        // defined(_WIN32)` is the Windows one. Only the former occurs today.
+        const top = frames[frames.length - 1];
+        if (top && top.win) top.negated = !/_WIN32/.test(rest) || /!\s*defined/.test(rest);
+      }
+      continue;
+    }
+    if (/^\s*(\/\/|\*)/.test(line)) continue;
+    const onWindows = frames.some((f) => f.win && !f.negated);
+    if (!onWindows && pattern.test(line)) hits.push(line.trim());
+  }
+  return hits;
+}
+
+function checkFrePlatformSplit(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [freplat] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [freplat] ${label}`); }
+  };
+  const c = FRE_BODY;
+
+  const leaks = macosCompiledLines(c, WIN32_IDENT);
+  check('no Win32-only call survives outside a `#if defined(_WIN32)` branch',
+    leaks.length === 0);
+  for (const l of leaks.slice(0, 5)) console.log(`      leak: ${l}`);
+
+  // The POSIX half has to exist, not merely be free of Windows names: an empty
+  // `#else` would pass the check above while failing to compile.
+  const posix = [
+    ['the dynamic loader', '#include <dlfcn.h>', 'dlopen(', 'dlsym('],
+    ['the executable\'s own directory', '_NSGetExecutablePath', '/proc/self/exe'],
+    ['a recursive lock for the status queue', 'pthread_mutexattr_settype', 'PTHREAD_MUTEX_RECURSIVE'],
+    ['threads', 'pthread_create', 'pthread_detach'],
+  ] as const;
+  for (const [what, ...needles] of posix) {
+    check(`POSIX ${what} is implemented, not stubbed out`,
+      needles.every((n) => c.includes(n)));
+  }
+
+  // The two macros are what keep the library's NAME from being hardcoded at the
+  // five call sites that mention it, and the names differ per platform on purpose
+  // (see ane.ts aneHostLibName).
+  check('the runtime library name is one macro with both spellings',
+    /#define AS_FRE_LIB_NAME\s+"asaot\.dll"/.test(c)
+    && /#define AS_FRE_LIB_NAME\s+"libasaot\.dylib"/.test(c));
+  check('the extension LINKS against a distinct link name on Windows only',
+    /#define AS_FRE_LINK_NAME\s+"asaot\.lib"/.test(c)
+    && /#define AS_FRE_LINK_NAME\s+"libasaot\.dylib"/.test(c));
+
+  // One lock for every context's status queue, reached through the macros only: a
+  // bare `EnterCriticalSection(&as_fre_qcs)` on a POSIX build names a type that does
+  // not exist there, and the two used to be mixed (the macro's own definition IS a
+  // Windows-branch line, which is why this goes through the same branch test rather
+  // than being grepped for the identifier).
+  check('every status-queue critical section goes through the lock macros',
+    macosCompiledLines(c, /(Enter|Leave|TryEnter)CriticalSection\s*\(\s*&as_fre_qcs/).length === 0
+    && c.includes('#define AS_FRE_Q_LOCK()') && c.includes('#define AS_FRE_Q_UNLOCK()'));
+
+  console.log(`     [freplat] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: fre/PlatformSplit', checkFrePlatformSplit);

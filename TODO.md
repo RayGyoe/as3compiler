@@ -13178,7 +13178,67 @@ ffmpeg 拆轨 + 重编为 MP3 128 kbps / 44.1 kHz / 立体声 ⇒ `examples/audi
 判据属**遗留缺陷**，不是增强；`<fullScreen>` 保持不解析（SDK 的 `Descriptor.51.4.xsd` 明确注明 mobile-only）。
 
 
+### 阶段二百零七：macOS 也能加载 ANE 了 —— 宿主库、C 面的 POSIX 分支、一个只有 macOS 会红的头文件分支（v0.4.187 → v0.4.188）✅ 已完成
+
+> **立项**：`examples/ane/` 与 `examples/ane-app/` 此前**只有 Windows 版**：夹具只编 `Windows-x86-64\ProbeANE.dll`、
+> 描述符只声明一个平台、宿主库只存在 `lib/bin/windows-{x86,x64}/`。本阶段把这条线在 macOS 上做完（用户
+> 明确要求），产物与断言与 Windows 侧**同构**：同一份 `driver.as`、同一份夹具源码、同一组 46 条断言。
+
+> **三层根因（不是一个缺陷，是三个叠在一起）**：
+> ① **没有宿主库**：`lib/bin/macos-x86-64/` 不存在 ⇒ 后链接阶段响亮报错（这是**设计如此**，见 §5 缺陷 2）。
+> ② **C 面全是 Win32**：`LoadLibraryA` / `CRITICAL_SECTION` / `GetModuleFileNameA` / `Sleep`。这一半在 Windows 上
+> **永远看不见**（分支照常编过），只有真的做出 macOS 宿主库、第一次去编它时才现形。
+> ③ **`lib/asaot.h` 的 POSIX 分支少一态**：Windows 分支有**三态**（`ASAOT_BUILD` / `ASAOT_HOST` / 其余），POSIX 分支
+> 只有一句 `visibility("default")`；而宿主程序**定义**那 51 个 FRE 入口点、尺寸优化又把它们标成 `static` ⇒
+> `error: static declaration of 'FREGetObjectType' follows non-static declaration`，**每一行**都停。**Windows 上
+> 同一处不匹配只给一条警告**（`redeclared without 'dllimport' attribute`）—— 这正是该分支长期没被发现的原因。
+
+> **修法**：
+> ① `lib/build-asaot.sh`（新增）：`clang -O2 -dynamiclib -fPIC` 编 `lib/bin/macos-x86-64/libasaot.dylib`，**默认通用**
+> （`-arch arm64 -arch x86_64`；`--platform native` 出宿主架构，供改-编循环）。它不只编，还**验产物**：`otool -D`
+> 必须是 `@executable_path/libasaot.dylib` 且**两个切片一致**、必须导出 `asaot_bind`、导出数 53、不得依赖
+> `Adobe AIR`。理由见「closure ①」。
+> ② `src/fre.ts` 加平台 shim：`as_fre_lib_open`/`as_fre_lib_sym`/`as_fre_lib_err`（`dlopen`+`RTLD_NOW`/`dlsym`/
+> `dlerror`）、`as_fre_exe_dir`（macOS 走 `_NSGetExecutablePath`、Linux 走 `/proc/self/exe` —— 因为 install name 是
+> `@executable_path/`，**只有知道 exe 在哪才知道库在哪**）、状态队列锁改成 `AS_FRE_Q_LOCK`/`AS_FRE_Q_UNLOCK` 两个宏
+> （Windows 是 `CRITICAL_SECTION`，macOS 是**显式递归**的 `pthread_mutex_t` —— `FREDispatchStatusEventAsync` 会从
+> **已经在 `as_fre_pump` 里**的线程到达，普通互斥锁在那里**死锁**）、线程族给 pthread 实现；扩展目录的路径分隔符
+> 也按平台给。
+> ③ `lib/asaot.h` 的 POSIX 分支补第三态：`ASAOT_HOST` ⇒ `#define ASAOT_API static`（dylib 那侧仍留
+> `visibility("default")`，所以不需要 `-fvisibility=hidden` 也能导出那 53 个）。**那条实测报错原文写进注释**。
+> ④ 「宿主库叫什么」收成**一个**答案：`src/ane.ts` 的 `aneHostLibName()`（Windows = `asaot.dll`、macOS =
+> `libasaot.dylib`、iOS **抛**），四个消费者（`src/index.ts` 的后链接拷贝、`checks.ts` 的 `doctor`、`test/examples.ts`
+> 的 skip 闸门、`src/fre.ts` 的两个宏）**全部从它取**。此前四处各自回答、只是**恰好都写 `asaot.dll`** ⇒ 名字一旦
+> 分平台，任何一处残留字面量都会把「本机能跑」变成**静默 skip**、或从**不存在的文件**拷贝。
+> ⑤ 夹具与示例：`examples/ane/build-ane.sh`（新增，一次编译写两棵暂存树）、描述符补 `<platform name="MacOS-x86-64">`、
+> `examples/ane/ane.build.json` 的链接面按平台收敛（macOS 用系统 `-lz`）。
+
+> **实测**：
+> ① `lib/build-asaot.sh` → `lib/bin/macos-x86-64/libasaot.dylib`（52 KB / 52944 B，`x86_64 arm64`，53 导出）。
+> ② `examples/ane/build-ane.sh` → 两棵树里的 `MacOS-x86-64/ProbeANE.dylib`（86 KB，通用）。
+> ③ **两个扩展示例在本机 macOS 全部真跑**（不是 skip）：`node --test --test-name-pattern='example: ane' test/examples.ts`
+> ⇒ `pass 2 / fail 0 / skipped 0`，加载的是经 `dlopen` 的真 dylib，`RESULT passed=46 failed=0`。
+> ④ 单元钉：`unit: ane/HostLibrary` 20 条、`unit: fre/PlatformSplit` 8 条（**按预处理器**判 Win32 名字有没有落在
+> 「macOS 会编译的那一行」上）、`unit: ane/ExampleFixtureTrees` 7 → **9** 条（macOS 夹具同样逐字节相同）。
+> ⑤ **全量回归** `node test.ts`：**402 用例 / 399 pass / 0 fail / 3 skipped**（rc=0，日志 `temp/regress-207-final.log`（定稿树））。
+> 三条 skip 全是缺外部夹具 `temp/skin.swc` 的 SWC 示例 —— **两个扩展示例已不在 skip 之列**（此前 macOS 上它们正是
+> 「没有 Windows 宿主库 ⇒ 响亮 skip」，现在真跑），即本阶段把 CI 上那条线从「skip」变成了「跑」。
+
+> **遗留（如实登记）**：**iOS 那一族仍未做**，且**不是重编一遍**：iOS 把扩展**静态链进应用镜像**，没有 `dlopen`
+> 这一步，initializer 由**直接符号引用**到达而不是运行期按名字查 ⇒ 要落地得先定「谁调用 initializer」。
+> 该行已按实测收窄（见遗留表）。
+
+**closure 三条必须写下来的**：① **「构建成功」不是「装得对」** —— install name 写成绝对路径（`/Users/…/libasaot.dylib`）
+**在作者机器上照常工作、在任何别的机器上加载失败**，而它在构建期**一句话都不说**（`-install_name` 传了值就没人再看它）。
+所以脚本必须**验产物**（`otool -D`）而不是信任传进去的标志，且**两个切片都要验**（通用二进制的两个切片可以有不同的
+install name）；② **一个平台分支能藏多久，取决于另一个平台给不给警告** —— `asaot.h` 的 POSIX 分支少一态这件事，
+在 Windows 上只表现为一条 `redeclared without 'dllimport' attribute` 警告，于是「警告不是错误」就把一个**编译不过**的
+分支养了整整几轮；③ **`MacOS-x86-64` 这个键不编码架构**（阶段一百七十八·六 的结论）在此处**再次成为设计约束**：一个键
+服务两种架构 ⇒ 夹具与宿主库**必须**默认通用，arm64-only 的夹具在 Intel 机器上会被 dyld 直接拒掉，而 AIR 自己的 macOS
+运行时就是通用的。
+
 ### 遗留待开发
+> **2026-10-20 追加（阶段二百零七：macOS 也能加载 ANE 了）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 表内项数不变（**96 项**）。改写的那一行是「**macOS / iOS 上的 ANE 没有宿主库**」—— macOS 这一半**已完成**（宿主库、C 面 POSIX 分支、夹具、示例、宿主库名的唯一出处全落地，两个扩展示例在 macOS 上真跑、46 条断言），故状态由「未开始」收窄为「**部分完成**」，并把落地路径改写成 iOS 一侧的真实障碍（静态链、无 `dlopen`）。本阶段修的三层都是**「`adl` 跑得对、我们跑不出」**（macOS 上 `adl` 能加载同一个 ANE 而我们编不出宿主库），按 §1.5 判据属**遗留缺陷**、不是增强，**不改任何 AIR 已定义语义**。**closure 三条必须写下来的**：① **构建成功不等于装得对** —— dylib 的 install name 写成绝对路径在**作者机器上照常工作、在别的机器上加载失败**，而构建期**一句话都不说**（传了 `-install_name` 就再没人看它）⇒ 脚本必须 `otool -D` **验产物**、且**两个切片分别验**；② **一个平台分支能藏多久，取决于另一个平台给不给警告** —— `asaot.h` 的 POSIX 分支少一态这件事，在 Windows 上只是一条 `redeclared without 'dllimport' attribute` 警告，于是「警告不是错误」把一个**编译不过**的分支养了几轮；③ **`MacOS-x86-64` 不编码架构** ⇒ 一个键服务两种架构，夹具与宿主库**必须**默认通用（arm64-only 夹具在 Intel 上被 dyld 直接拒），与 AIR 自己的 macOS 运行时同形。
 > **2026-10-19 追加（阶段二百零五：描述符只描述「第一扇窗」—— Windows 端窗口缺陷全部修复）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 表内项数 **95 → 96 项**。新行 = 「初始窗的框/客户区单位」（**两端都有、非 Windows 专属**）；改写行 = 「窗口几何的 Windows 端残余」——它当年列的四处里已有三处（最大化口径 / 横向边框 / 描述符成员未接线）在本阶段**已定或已修**，故把该行收窄到真正剩下的两处。本阶段修的仍是「AIR 会做、我们在 Windows 上静默不做」（`<maximizable>` 对最大化尺寸的影响、`<x>/<y>` 与横向边框、纸面上写了却没接线的七个描述符成员），按 §1.5 判据属**遗留缺陷**而非增强，故**不改任何 AIR 已定义语义**。**closure 三条必须写下来的**：① **「构建级 define 污染」的正确判据是同进程的第二扇窗**，不是单窗读数 —— 这类污染只在「一个进程里既有被描述符描述的窗、又有程序自建的窗」时才现形，单窗探针（阶段二百零四 之前的全部探针）永远绿；② **CI 看不见 `#ifdef` 掉的分支** ⇒ 「改了函数签名就顺手数一遍调用点实参」这件事必须**机器化**（本阶段新增的调用点参数个数审计钉子是本机唯一能提前拦下 macOS 编译错的东西）；③ **「这一项缺席」与「这一项有值」是两支，必须各给一钉** —— 一个 `string | null` 与一个写成 `undefined` 的守卫，让「描述符少写一行就 build 不出来」，而这种缺陷在只测「有这一项」的钉子里是**结构性不可见**的。
 > **2026-10-20 追加（阶段二百零六：显示度量缓存被物理像素覆盖）**：**新登记 0 行 / 改写 2 行 / 移出 0 行** ⇒ 表内项数不变（**96 项**）。改写 2 行：① 「`Stage.fullScreenWidth/Height` 取「完整显示模式」而非 AIR 的「可用区」」—— 该行**只对 macOS 成立**（Windows 实测 `adl` 的 `fullScreen*` 与 `Capabilities.screenResolution*` **同值**、都是整块显示器），故状态收窄为「部分完成 + 只剩 macOS 一端」；② 「Stage3D 的 Windows 后端」的证据列 —— 那句「已改用 `SDL_GetDisplayBounds`」当时**只是纸面**修好（值被 show 路径用显示模式覆盖），本阶段补记更正。本阶段修的是「AIR 会做、我们在 Windows 上静默不做」（AIR 报 DIP、我们报物理），按 §1.5 判据属**遗留缺陷**而非增强，**不改任何 AIR 已定义语义**。**closure 两条必须写下来的**：① **缓存型量必须按「写入者唯一」来钉** —— 本缺陷的现场是**两个写入者、两个空间、其中一个还是死代码**，而它在 100% 缩放的机器上**读数完全正常**（两个查询同值）⇒ 只钉数值的钉子对这种缺陷**结构性失明**，必须钉「谁在写、写在哪几个点」；② **「症状出现在 B 量上」不等于「B 量的实现坏了」** —— 用户报的是窗口尺寸（`MeetingWindow` 由 `Capabilities.screenResolution*` 算出），而同一个根因把 `Screen.bounds` 推到了**相反**的偏离上（它成了唯一的 DIP 读者）⇒ 判根因时要把**同源量的读数一起取**，否则会在错的量上改来改去。
 > **2026-10-19 追加（阶段二百零四：Windows 侧窗口最大化与子窗可缩放）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 表内项数 **94 → 95 项**。新行 = 「窗口几何的 Windows 端残余（最大化口径 / 横向边框 / 描述符成员 / 四类未测面）」；改写行 = `NativeWindow` 家族行（状态列补**第四批：Windows 端两处缺陷**）。本阶段修的是「AIR 会做、我们在 Windows 上静默不做」（`<resizable>false</resizable>` 的固定窗 `maximize()`、程序显式 `resizable=true` 的子窗），按 §1.5 判据属**遗留缺陷**而非增强，故**不改任何 AIR 已定义语义**。
@@ -13294,7 +13354,7 @@ ffmpeg 拆轨 + 重编为 MP3 128 kbps / 44.1 kHz / 立体声 ⇒ `examples/audi
 |--------|------|------|------|
 | **E4X 序列化残差**：`toXMLString()` **未实现** + 标记不按 AIR 重排 —— **两条均已修（阶段一百九十三）**，本行改记修完后**剩下的三条残余** | **已修**（`toXMLString()` 接线 + 标记重缩进均已落地，2026-10-19 阶段一百九十三；残余见右） | ① **文本节点构造**：`new XML("plaintext")` 在 AIR 是文本节点（`toString()`/`toXMLString()` 都是 `plaintext`），我们 `as_xml_parse` 对「根元素之前的游离文本」返回 NULL ⇒ **构造时**响亮 `XML parse error`（**解析器**欠账，阶段一百九十三 未动解析器）；② **混合内容**：我们把每个文本 run 并成**一个**（trim 过的）块，故 `<a>a<b/>b</a>` 给 `<a>\n  ab\n  <b/>\n</a>`，而 AIR 按文档序**交错**（`<a>\n  a\n  <b/>\n  b\n</a>`）；③ **实体**：解析**不解码**，故输出原样回显（`&amp;` 恰与 AIR 一致，但 `&#65;` 不会还原成 `A`；同理输出侧**不能**补转义，否则重复转义）。`adl 51.4.1` 真值矩阵与我方逐格对照见 [`docs/zh-cn/e4x.md`](docs/zh-cn/e4x.md) §2.6 与 `temp/toxml/` | 三条**同源**（都在解析器）：先让「游离文本」也能建节点（①），再让**文本与子件按文档序**一起建模（②，现 DOM 只有 `text` 一个槽），最后在解析期解码实体（③）——解码落地后输出侧才允许补转义。改动面覆盖所有 `XML(...)` 构造点 ⇒ 需与 `as_xml_parse_str_checked` 的**报错口径**一并定；成本**中** |
 | **`ExtensionContext` 还有 4 个 AIR 50 成员未建模**（`functions` / `knownExtensions` / `getExtensionInfo` / `loadExtension`） | 未开始（2026-10-17 阶段一百七十八·二 逐项查 AIR 参考时登记） | 已落地的 A 面是 `createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` / `actionScriptData` + `StatusEvent`（与 `ANEWinCore` 的真实用量完全覆盖）。**`loadExtension` 不是小修**：它是**延迟加载**——扩展在**首次 `call` 时**才 `LoadLibrary` + initializer，要把 C 面的加载时机从「构造 `ExtensionContext` 时」移到「首次调用时」并缓存；`functions`/`knownExtensions`/`getExtensionInfo` 是只读反射面。（另：`extensionID` **已删** —— AIR 没有这个属性，`mxmlc` 拒绝 + `adl` 报 `#1069`，已按 AIR 对齐，不入本表） | 先补 `adl` 实测采集这四个成员的真实形态（`functions` 是 `Object` 还是数组、未知 id 时是 `null` 还是空表），再按实测落地；`loadExtension` 独立立项（它要动 C 面时序） |
-| **macOS / iOS 上的 ANE 没有宿主库** —— FRE 宿主运行时 `asaot` 只编了 Windows 两个位宽（`lib/bin/windows-x86`、`windows-x64`），`lib/bin/macos-x86-64/`（与 `ios-arm64/`）不存在 | 未开始（2026-10-17 阶段一百七十八·六 修平台键时**量出来的残余**） | 阶段一百七十八·六 修掉了上游那一环（`currentAnePlatform()` 在 darwin/arm64 上返回 AIR 根本不存在的 `MacOS-AOT` ⇒ 真 macOS ANE 在 Apple Silicon 上匹配不上；见本节），**但键修对了宿主库还是没有**。硬判据成立：同一份源码 + 同一个 macOS ANE，`adl` 在 macOS 上能加载，我们编不出对应宿主库。**当前行为**：后链接阶段**响亮报错并给出该路径**（给的就是 `lib/bin/macos-x86-64/`），不静默降级。**落地路径**：`lib/asaot_host.c` 是薄转发器、与位宽无关，macOS 侧只需把加载/取符号换成 `dlopen`/`dlsym` + 一份 `build-asaot.sh` 出 `libasaot.dylib`；ANE 那侧 macOS 的原生库通常做成 universal（AIR 的 macOS 运行时本身就是 universal，两个切片都按 `MacOS-x86-64` 找） |
+| **iOS 上的 ANE 没有（也不会有同样形态的）宿主库** —— FRE 宿主运行时 `asaot` 已出 Windows 两个位宽与 **macOS**（`lib/bin/macos-x86-64/libasaot.dylib`，通用二进制，阶段二百零七）；`ios-arm64/` 仍不存在 | **部分完成**（macOS 端 2026-10-20 阶段二百零七 落地并实测；iOS 端未开始） | macOS 端**已完成**：`lib/build-asaot.sh` 出通用 dylib、`src/fre.ts` 有 POSIX 分支（`dlopen`/`dlsym`/`_NSGetExecutablePath`/递归锁/pthread）、`lib/asaot.h` 的 POSIX 侧补齐 `ASAOT_HOST` 三态、`examples/ane`+`ane-app` 在 macOS 上真跑（46 条断言）、宿主库名收成 `aneHostLibName()` 一处。**iOS 不是把同一件事重做一遍**：iOS 把扩展**静态链进应用镜像**，没有 `dlopen` 这一步，`asaot` 会是一份静态库、initializer 由**直接符号引用**到达 ⇒ 落地起点是定「**谁调用 initializer**」（应用侧还是运行时侧的启动钩子），而不是重编一遍宿主库。当前行为仍是**响亮抛错并说明原因**（`aneHostLibName()` 对 `iPhone-ARM` 抛），不静默降级。 | iOS 端：先定 initializer 的调用方，再出 `lib/bin/ios-arm64/` 的静态库形态
 | `extends <内建类型>`（含 **`extends Array`**）不支持 —— 闭包内 **2 个文件**用它（`src/com/hurlant/util/der/Sequence.as`、`src/com/fiCharts/utils/graphic/StyleManager.as`），AIR 合法 | **部分完成**（2026-10-08 阶段一百一十八 重评估闭包时实测登记；**2026-10-11 阶段一百三十六**：`extends Array` 已落地——`ClassInfo.arrayBacked` + 隐藏 `as_array* _arr` 槽承担全部 Array 操作，C 侧超类记 `Object` 保指针布局兼容，`arrayBacked` 沿超链传递；**`String`/`Number`/`int`/`XML`/`Function` 等内建仍响亮报错**） | `resolveType('Array')` 给 `{kind:'array'}`、**无 `className`** ⇒ 旧码盲取 `.className` 报一字面的 `unknown superclass 'undefined' of 'Sequence'`（离原因很远）。现按 kind 分派：接口 ⇒ `cannot extend interface 'I'`；其余非类 ⇒ `unsupported superclass 'Array' of 'E': subclassing built-in types is not implemented`（带行列号）。**AIR 接受 `extends Array`**（mxmlc 51.4.1 实测），故这是**遗留缺陷**而非增强：子类数组需真实运行期支持（元素存储 / `length` / 全部 Array 方法在子类上的行为、`Vector` 与 `Array` 的元数据、`is Array` 沿链判定） | 立项前先量清面上：用 `adl` 实测「子类数组」的全部可观测差异（`a.length`、索引、`push` 等方法返回的是子类还是 `Array`、`getQualifiedClassName`、`is Array`/`is E`），再决定是「真做子类存储」还是「仅报精确错误 + 建议改写」。**先实测再动**（不得凭直觉定语义） |
 | AGAL `nrm` 的**归一化分量数**未实测（我方两个后端都用 **4 分量**模长，AGAL/AIR 的口径可能是 **xyz**） | 未开始（2026-10-08 阶段一百一十六 **代码观察后登记为待实测**；**未实测项**，不是实测结论） | `src/runtime.ts` 的 AGAL→着色器翻译对 `nrm`（opcode 0x0e）只有两种形态，**且两后端共用同一份格式串**（无 `target == 0` 分支）：全掩码分支发 `normalize(<src>)`（`runtime.ts:9855`）、部分掩码分支逐分量发 `normalize(<src>).<c>`（`runtime.ts:9814`）——两种都用 **vec4** 求模。故 `nrm ft0.xyz, v0`（away3d 环体镜面反射的常态写法）我方按 `(x,y,z,w)` 的模长归一化后再取 `x/y/z`，**`w` 分量参与模长**。若 AGAL 的 `nrm` 只以 `xyz` 求模（AIR 口径），源向量 `w != 0` 时我方与 AIR 会有**尺度差**（`w=0` 的常见情形无差别，`Basic_SkyBox` 的环体镜面反射看不出差别）。**跨后端一致性无问题**（两后端文本相同） | 立项实测：写一个 `nrm` 的 AGAL 小程序，让**源寄存器 `w` 非 0 且 `xyz` 模长 ≠ 1**，同帧对照 `adl` 与两后端的渲染像素（逐 draw 探针法同阶段一百一十五）；据实测把两后端的 `nrm` 改成 `normalize(<src>.xyz)` 形态或维持现状，并补一条单元钉子。**成本低**（单点格式串 + 一次双端渲染对照），但**先实测再改**（当前无 adl 口径，不得凭直觉改语义） |
 | web 目标无音频后端时，`Sound.loadCompressedDataFromByteArray` **直接抛 `#2068`**（AIR 是载入成功、到 `play()` 才体现「无声」） | 未开始（2026-10-08 阶段一百一十六 web 验收中实测；属既有已文档化限制的**口径差异**） | Starling web 版实测 `Error creating wing_flap: Could not load sound data: Error #2068: Invalid sound.`；native（同一份 AS3、miniaudio 后端）正常载入/播放。根因是**无后端时 `as_audio_decode` 是恒返 −1 的桩**（`src/runtime.ts:1745`），而 `Sound_loadCompressedDataFromByteArray` 把解码失败如实翻成 `#2068`（`src/emit.ts:8023`，抛错点 `:8049`）。`src/air-app.ts:686` 的构建期黄字警告说的是「web 构建尚无音频后端，`play()` 返 null、`areSoundsInaccessible()` 为 true」——**那条口径只在「声音已载入」的路径上成立**（零长 `Sound`/PCM 路径），走压缩数据装载的程序在 web 上是**载入即失败** | web 音频后端（`vendor/audio_glue.c` 的 wasm 版：miniaudio 的 web 后端或 `AudioWorklet`）落地后自然消失；在那之前二选一：维持「响亮失败」（当前，信息量大）或把桩改成「返回空缓冲」以贴合 `air-app.ts` 的警告口径。**先定口径再动**（`docs/zh-cn/audio.md` 与 `src/air-app.ts:686` 的措辞必须一致），**成本低** |

@@ -5,7 +5,7 @@
 //   node --test --test-name-pattern='build/' test/unit/*.ts
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { readdirSync, writeFileSync, readFileSync, mkdirSync, existsSync, copyFileSync, rmSync } from 'node:fs';
+import { readdirSync, writeFileSync, readFileSync, mkdirSync, existsSync, copyFileSync, rmSync, statSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
@@ -15,7 +15,7 @@ import { airManifest, prepareAirApp, parseAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
-import { aneHostDirName, anePlatformForBuild, anePlatformHint, currentAnePlatform, parseExtensionXml, resolveAneDescriptors, resolveExtensionPackages } from '../../src/ane.ts';
+import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, currentAnePlatform, parseExtensionXml, resolveAneDescriptors, resolveExtensionPackages } from '../../src/ane.ts';
 import type { AneResolution } from '../../src/ane.ts';
 import { ANE_COUNT_MAX } from '../../src/fre.ts';
 
@@ -1517,6 +1517,7 @@ function checkAneExampleFixtureTrees(): string[] {
   const trees = ['ane', 'ane-app'].map((e) => join(root, 'examples', e, 'ext-aot', 'com.example.probe'));
   const xmls = trees.map((t) => join(t, 'extension.xml'));
   const libs = trees.map((t) => join(t, 'Windows-x86-64', 'ProbeANE.dll'));
+  const macLibs = trees.map((t) => join(t, 'MacOS-x86-64', 'ProbeANE.dylib'));
   check('both example fixture trees exist', trees.every((t) => existsSync(t)));
   if (!trees.every((t) => existsSync(t))) { return bad; }
   // Byte-identity rather than a semantic comparison: the point is that one compile
@@ -1526,11 +1527,19 @@ function checkAneExampleFixtureTrees(): string[] {
     existsSync(a) && existsSync(b) && readFileSync(a).equals(readFileSync(b));
   check('the two descriptors are byte-identical', sameFile(xmls[0], xmls[1]));
   check('the two native libraries are byte-identical', sameFile(libs[0], libs[1]));
+  // The macOS half (阶段二百零三): one compile of the same source by build-ane.sh,
+  // staged into both trees just like the DLL. Both artifacts are pinned because both
+  // are committed, and a tree that lost only its dylib still compiles and still links
+  // on Windows -- the failure is a load error on macOS.
+  check('the two macOS dylibs are byte-identical too', sameFile(macLibs[0], macLibs[1]));
   const xml = readFileSync(xmls[0], 'utf8');
   check('...and declare one id, one platform and one library',
     xml.includes('<id>com.example.probe</id>')
     && xml.includes('<platform name="Windows-x86-64">')
     && xml.includes('<nativeLibrary>ProbeANE.dll</nativeLibrary>'));
+  check('...plus the macOS platform key and its dylib',
+    xml.includes('<platform name="MacOS-x86-64">')
+    && xml.includes('<nativeLibrary>ProbeANE.dylib</nativeLibrary>'));;
   // The wiring: each example must resolve to the SAME tree the identity checks
   // above just compared, or those two pins would be pinning a fixture that neither
   // example is built against. Both routes are driven here -- the resolver (what
@@ -1555,6 +1564,109 @@ function checkAneExampleFixtureTrees(): string[] {
 }
 
 registerGroup('unit: ane/ExampleFixtureTrees', checkAneExampleFixtureTrees);
+
+// --- the FRE host library's NAME is one decision, not four (阶段二百零三) ---------
+//
+// Four places need to know what the host library is called: src/index.ts (it copies
+// it beside the executable), src/checks.ts (doctor reports whether it is built),
+// test/examples.ts (the ane/ane-app skip gate), and each platform's build script.
+// They used to answer independently, which worked only because every one of them
+// said 'asaot.dll' -- the macOS name is `libasaot.dylib`, and a single stale
+// 'asaot.dll' left anywhere turns a runnable example into a SILENT skip (the gate)
+// or a copy from a file that is not there (the build). The pins below hold the one
+// shared answer together, and hold the C side's two macros in step with it.
+function checkAneHostLibrary(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [anehost] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [anehost] ${label}`); }
+  };
+  const src = (p: string) => readFileSync(join(root, p), 'utf8');
+  const throwsWith = (fn: () => unknown, needle: string): boolean => {
+    try { fn(); return false; } catch (e) { return String(e).includes(needle); }
+  };
+
+  check('aneHostLibName: a Windows key gives the DLL',
+    aneHostLibName('Windows-x86-64') === 'asaot.dll' && aneHostLibName('Windows-x86') === 'asaot.dll');
+  check('aneHostLibName: the macOS key gives the dylib',
+    aneHostLibName('MacOS-x86-64') === 'libasaot.dylib');
+  // iOS is named and refused rather than lent the macOS name: lib/bin/ios-arm64/ would
+  // hold an archive an application links INTO itself, which no dlopen could load.
+  check('aneHostLibName: iOS is refused by name, not guessed at',
+    throwsWith(() => aneHostLibName('iPhone-ARM'), 'statically'));
+  check('aneHostLibName: an unknown key is refused',
+    throwsWith(() => aneHostLibName('Solaris-sparc'), 'no lib/bin/ directory is defined'));
+  check('aneHostLibName delegates the directory decision to aneHostDirName',
+    throwsWith(() => aneHostLibName('iPhone-ARM'), 'ios-arm64'));
+
+  // One source, four consumers. Each of these three is a place where the name is
+  // DERIVED; a literal would pass a grep for the Windows name and then be wrong on
+  // macOS, so the pins are on the call rather than on the absence of a literal.
+  check('src/index.ts stages the file under the name from src/ane.ts',
+    src('src/index.ts').includes('aneHostLibName(aneResolution.platform)')
+    && src('src/index.ts').includes('copyFileSync(hostLib, join(dirname(resolve(outPath)), hostName))'));
+  check('as-aot doctor probes that same name', src('src/checks.ts').includes('aneHostLibName(platform)'));
+  check('the example suite\'s skip gate asks for that same name',
+    src('test/examples.ts').includes('aneHostLibName(key)')
+    && !src('test/examples.ts').includes('HOST_LIB_NAME'));
+
+  // The C side has to agree with the TypeScript side, or the build copies
+  // libasaot.dylib beside the executable and the runtime opens `asaot.dll`.
+  const fre = src('src/fre.ts');
+  check('the emitted runtime loads the dylib on macOS (macros agree with ane.ts)',
+    fre.includes('"libasaot.dylib"') && fre.includes('"asaot.dll"') && fre.includes('"asaot.lib"'));
+
+  // The header's POSIX branch needs the same three modes Windows has: the host TU
+  // defines the 51 entry points and the size pass makes them `static`, so a
+  // non-static declaration here is a hard error on clang/POSIX but only a warning on
+  // Windows -- measured, and the reason the branch went unnoticed.
+  const h = src('lib/asaot.h');
+  check('asaot.h makes ASAOT_API `static` for the host on POSIX',
+    h.includes('#define ASAOT_API static')
+    && h.indexOf('#define ASAOT_API static') > h.indexOf('#if defined(_WIN32)'))
+  check('asaot.h keeps the attribute for the dylib build on POSIX',
+    h.includes('#define ASAOT_API __attribute__((visibility("default")))'));
+  check('the measurement behind that branch is recorded, not implied',
+    h.includes('follows non-static declaration'));
+
+  // The build scripts, which are the only place a wrong name survives to run time.
+  const dylibSh = join(root, 'lib', 'build-asaot.sh');
+  const aniSh = join(root, 'examples', 'ane', 'build-ane.sh');
+  check('lib/build-asaot.sh exists and is executable',
+    existsSync(dylibSh) && (statSync(dylibSh).mode & 0o111) !== 0);
+  const d = existsSync(dylibSh) ? readFileSync(dylibSh, 'utf8') : '';
+  // The install name is what makes the copy beside the executable the one dyld opens:
+  // an absolute path baked in at build time would work here and nowhere else.
+  check('it bakes the relocatable install name into the dylib',
+    d.includes('-install_name @executable_path/libasaot.dylib'));
+  check('...and asserts the artifact carries it, rather than trusting the flag',
+    d.includes('otool -D') && d.includes('"$NAME" != "@executable_path/libasaot.dylib"'));
+  check('it builds both slices (the macOS key encodes no architecture)',
+    d.includes('-arch arm64 -arch x86_64') && d.includes('lipo -archs'));
+
+  check('examples/ane/build-ane.sh exists and is executable',
+    existsSync(aniSh) && (statSync(aniSh).mode & 0o111) !== 0);
+  const a = existsSync(aniSh) ? readFileSync(aniSh, 'utf8') : '';
+  // The same three artifact guards the .bat has, in the macOS spelling: the recipe is
+  // identical, and a dylib still importing Adobe AIR builds and links and then fails
+  // to load, which is precisely what the guard is for.
+  check('build-ane.sh keeps the import guard, the export guard and both trees',
+    a.includes("grep -qi 'Adobe AIR'") && a.includes('_ProbeExtInitializer')
+    && a.includes('"$EX/ext-aot" "$EX/../ane-app/ext-aot"'));
+  check('...and refuses to stage unless the descriptor declares its platform key',
+    a.includes(String.raw`<platform name=\"$PLAT\">`));
+  // Cross-file agreement on the names themselves: the descriptor, the script and the
+  // runtime's own dir name all have to say MacOS-x86-64 / ProbeANE.dylib.
+  check('the script, the descriptor and ane.ts agree on the macOS key and file',
+    a.includes('PLAT="MacOS-x86-64"') && a.includes('LIB="ProbeANE.dylib"')
+    && aneHostDirName('MacOS-x86-64') === 'macos-x86-64'
+    && existsSync(join(root, 'lib', 'bin', 'macos-x86-64')));
+
+  console.log(`     [anehost] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: ane/HostLibrary', checkAneHostLibrary);
 
 // --- The descriptor's <extensions> block is what says an app NEEDS an extension ---
 //

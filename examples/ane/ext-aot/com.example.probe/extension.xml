@@ -3,10 +3,11 @@
   The extension descriptor of the example's fixture extension.
 
   It sits in a STAGING TREE, not inside a packed `.ane`:
-  `ext-aot/com.example.probe/{extension.xml, Windows-x86-64/ProbeANE.dll}`. The
-  directory name is the <id> below -- that is what makes one directory per
-  extension self-describing, and it is the same layout the runtime stages such an
-  extension into (`<appDir>/extensions/com.example.probe/Windows-x86-64/`).
+  `ext-aot/com.example.probe/{extension.xml, <platform>/ProbeANE.{dll,dylib}}` --
+  one directory per platform, named by the AIR platform key below. The directory
+  name is the <id>, which is what makes one directory per extension
+  self-describing, and it is the same layout the runtime stages such an extension
+  into (`<appDir>/extensions/com.example.probe/<platform>/`).
   docs/zh-cn/ane.md §4.6 explains why the recompiled artifact is left unpacked:
   a `.ane` is a ZIP whose mandatory `library.swf` holds the DoABC the AVM2 would
   read, and an AOT build has none -- so the archive would carry dead weight, and
@@ -15,9 +16,11 @@
 
   `<platform name="...">` is the closed AIR platform-key vocabulary
   (docs/zh-cn/ane.md §3.3), and only the entry for the platform being built is
-  usable. The name here is Windows-x86-64 because the fixture's native library is
-  a Windows x64 DLL; a macOS build of this descriptor would have to add a
-  MacOS-x86-64 entry with a .dylib. (This comment quoting the very tags the build
+  usable -- so a descriptor that is missing the one this host asks for is refused
+  by the BUILD (not at load), naming the key it wanted. Both are declared here:
+  Windows-x86-64 (a DLL recompiled against asaot.lib, by build-ane.bat) and
+  MacOS-x86-64 (a universal dylib recompiled against libasaot.dylib, by
+  build-ane.sh). (This comment quoting the very tags the build
   parses is deliberate: `stripXmlComments` exists because that naive-to-allow
   pattern once made a descriptor's own real <platform> entry disappear.)
 -->
@@ -31,6 +34,19 @@
              import library, which is why this copy imports asaot.dll and the
              original in lib/ imports Adobe AIR.dll. -->
         <nativeLibrary>ProbeANE.dll</nativeLibrary>
+        <initializer>ProbeExtInitializer</initializer>
+        <finalizer>ProbeExtFinalizer</finalizer>
+      </applicationDeployment>
+    </platform>
+    <platform name="MacOS-x86-64">
+      <applicationDeployment>
+        <!-- The macOS sibling of the DLL above, recompiled against libasaot.dylib
+             by examples/ane/build-ane.sh. The dylib records
+             @executable_path/libasaot.dylib -- NOT Adobe AIR.framework -- which is
+             what lets it load under a generated executable that has no AIR beside
+             it. Universal (x86_64 + arm64): this key does not encode an
+             architecture, so AIR's own macOS runtime carries it in both slices. -->
+        <nativeLibrary>ProbeANE.dylib</nativeLibrary>
         <initializer>ProbeExtInitializer</initializer>
         <finalizer>ProbeExtFinalizer</finalizer>
       </applicationDeployment>

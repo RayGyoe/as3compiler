@@ -122,7 +122,8 @@ as-aot app.as --swc assets/skin.swc
 as-aot app.as --manifest examples/skia-link.build.example.json
 
 # Load AIR native extensions (ANE, stage one-hundred-seventy-eight): the host FRE runtime is wired in,
-# and the rebuilt ANE plus asaot.dll land under <exe directory>/extensions/<extID>/<platform>/
+# and the rebuilt ANE plus the host library (asaot.dll / libasaot.dylib) land under
+# <exe directory>/extensions/<extID>/<platform>/
 as-aot app.as --manifest app.build.json --ane lib/WinCore.ane
 as-aot app.as --manifest app.build.json --ane lib/WinCore.ane --ane-platform Windows-x86-64
 
@@ -152,20 +153,20 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
 
 **ANE loading (stage one-hundred-seventy-eight)**: `--ane` / the manifest's `ane-paths` switch on `ASC_HAVE_FRE` and wire in the host FRE runtime.
 Each entry may be an `.ane` package **or an unpacked directory** (`extension.xml` + `<platform key>/<native library>`, i.e. `adt`'s staging layout) —
-the latter is the default form of the artifact rebuilt for AOT: its native library imports `asaot.dll` (which forwards into **the generated program's own table**),
+the latter is the default form of the artifact rebuilt for AOT: its native library imports the host library (`asaot.dll` on Windows, `libasaot.dylib` on macOS, which forwards into **the generated program's own table**),
 AIR has no such table, so it **cannot be loaded whether it is signed or not** and there is no consumer for a packaged one; the `library.swf` that an `.ane`
 requires is dead weight too (`DoABC` is outside the compiler's scope and an extension's AS3 classes must be compiled from `.as` sources). An original signed `.ane` still reads fine (the `META-INF/ANE/` layout).
 The host library `lib/bin/<platform>/asaot.{dll,dylib,a}` (header `lib/asaot.h`, **byte-for-byte ABI-aligned** with the AIR SDK's `FlashRuntimeExtensions.h`)
 is a **thin forwarder**: all 51 FRE entry points go back through the `AsaotHost` function table to **the generated program's own** implementations,
 so AS3 semantics has exactly one heap and one class registry. `lib/` holds only **hand-written sources** (the `asaot.h` contract, the `asaot_host.c` implementation,
-the `build-asaot.bat` recipe) and build products land per platform under `lib/bin/` (e.g. `lib/bin/windows-x64/`):
+the `build-asaot.bat` / `build-asaot.sh` recipes) and build products land per platform under `lib/bin/` (e.g. `lib/bin/windows-x64/`):
 `-I` points at `lib/` and `-L` at that platform subdirectory — the header is one contract shared by all platforms, the import library is one platform's product.
 Platform directory names are lowercase (`windows-x64`/`windows-x86`/`macos-x86-64`…), the same convention as `vendor/sdl2/lib/windows-x64` and
 `vendor/curl/lib/windows-x64`; they are **not** AIR's platform keys verbatim (those are the names of ZIP subdirectories inside `extension.xml` and are handled separately by `ane-platform`).
 The macOS cell **follows AIR's key spelling** (`macos-x86-64`), because **macOS's key does not encode the architecture**: the SDK's macOS runtime is a single universal binary
 (two slices, `x86_64`+`arm64`) and the ANE-loader key is the same `MacOS-x86-64` in both slices (measured) — the architecture lives in the `.dylib`, so darwin's two architectures derive **the same key**,
 and `MacOS-AOT` is not an AIR key (0 hits across the whole SDK), so no such directory is created.
-Only the Windows host library exists today; for other platforms `lib/bin/<platform>/` does not exist and the build **errors out directly, quoting that path** rather than looking for something never built.
+The host library now exists for **two** platforms: Windows (`lib/bin/windows-{x86,x64}/asaot.dll` + `asaot.lib`) and macOS (`lib/bin/macos-x86-64/libasaot.dylib`, **a universal binary by default** -- the `MacOS-x86-64` key does **not** encode an architecture, and AIR's own macOS runtime is universal). `lib/build-asaot.sh` builds the macOS one (`--platform native` gives the host architecture only, for the edit/build loop) and **inspects the artefact** rather than trusting its own flags: the install name must be the relocatable `@executable_path/libasaot.dylib` (both slices agreeing), `asaot_bind` must be exported, 53 exports, no `Adobe AIR` dependency -- because an absolute-path install name **works on the author's machine and fails to load anywhere else**, while the build says nothing at all. The only platform still missing is **iOS**: it links extensions **into the application image** with no `dlopen` step, so there is no loadable host library to produce; `aneHostLibName()` **throws and explains** rather than borrowing the macOS name. Any other platform without a host library gets a build that **errors out directly, quoting that path** rather than looking for something never built.
 `build-asaot.bat` **builds both widths by default** (`bin/windows-x86/` and `bin/windows-x64/`), and `build-asaot.bat x86` / `x64` rebuilds just one; an unknown argument **errors out** (no silent skip).
 Which width is used is decided by `--ane-platform`, and the extension package declares its own platforms, so defaulting to "build only this machine's width"
 would mean `--ane-platform Windows-x86` could be satisfied by a 64-bit host library — exactly the failure mode this default removes.
@@ -178,9 +179,9 @@ Hence `lib/bin/` **deliberately has no** `windows-arm64` (a library nobody can l
 `--ane-platform Windows-x86-64` (with `architecture: "64"`), rather than guessing at a key AIR has never had.
 (The dependency script `vendor/provision/windows.ps1` does have `-Arch arm64`, but that is for **non-AIR** Windows-on-ARM artifacts and corresponds to no ANE platform key; `both` still means x64+x86 only. See [`docs/en/win32.md`](docs/en/win32.md) §2.11.)
 The complete loading protocol is implemented in the generated program: at **compile time** `extension.xml` is parsed
-and the platform entry fixed → in a **post-link stage** the ANE's native library and `asaot` land under `<exe directory>/extensions/<extID>/<platform>/` →
+and the platform entry fixed → in a **post-link stage** the ANE's native library and the host library land under `<exe directory>/extensions/<extID>/<platform>/` →
 at runtime `LoadLibraryA` + `GetProcAddress(<initializer>)` → dispatch through `FRENamedFunction[]`.
-The key prerequisite: **the ANE must be the version rebuilt against `asaot`** (its FRE imports must resolve to `asaot.dll`, not to a hard-coded
+The key prerequisite: **the ANE must be the version rebuilt against `asaot`** (its FRE imports must resolve to the host library, not to a hard-coded
 `Adobe AIR.dll` — the latter is the module name AIR's own import library records and must not be used as our product's name); nothing about this affects `adl`, which keeps using the original ANE, and the two do not interfere.
 `ExtensionContext` is modelled on AIR: `createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` /
 `actionScriptData` + asynchronous `StatusEvent` dispatch; AIR has **no** `extensionID` property (measured: `mxmlc` rejects it, `adl` reports `Error #1069`), and this runtime has none either — we do not invent an extra property just to "look more complete".
@@ -188,7 +189,7 @@ The rendering pipeline (`FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBuf
 only stubs are exported and they **report loudly** when called, never silently returning a fabricated render mode.
 
 **The complete procedure for migrating an existing ANE** (dual products + rebuild-with-renaming, the shim header, the three project properties, a symptom→cause table, and the full list of gaps) is in
-[`docs/en/ane.md`](docs/en/ane.md); the smallest runnable loop is in [`examples/ane/`](examples/ane) (43 assertions, naming the package on the command line / in a manifest) and
+[`docs/en/ane.md`](docs/en/ane.md); the smallest runnable loop is in [`examples/ane/`](examples/ane) (46 assertions, naming the package on the command line / in a manifest; **it really runs on both Windows and macOS**, and on macOS it loads a genuine `dlopen`ed `ProbeANE.dylib`) and
 [`examples/ane-app/`](examples/ane-app) (8 assertions, going through `--air-app` + the descriptor's `<extensions>`).
 A rebuilt product is a **staging directory tree** (`extension.xml` + `<platform>/<library>`, unpackaged); dropping it into `<appDir>/ext-aot/<extension id>/`
 makes it get picked up automatically, so `adl` keeps using the original ANE and the two paths do not interfere.

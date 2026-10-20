@@ -27,7 +27,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { nonWindowsVendorKey, wasmToolchainError, webToolchainError, type BuildConfig } from './build.ts';
-import { aneHostDirName, anePlatformForBuild } from './ane.ts';
+import { aneHostDirName, aneHostLibName, anePlatformForBuild } from './ane.ts';
 
 export type CheckKind = 'hard' | 'warn' | 'info';
 
@@ -387,26 +387,28 @@ export const CHECKS: Check[] = [
           'Pass `--ane-platform <Windows-x86-64|Windows-x86|MacOS-x86-64|iPhone-ARM>` to name the target.',
         );
       }
-      let hostDir: string;
+      let dir: string;
+      let hostName: string;
       try {
-        hostDir = aneHostDirName(platform);
+        dir = join(ctx.repoDir, 'lib', 'bin', aneHostDirName(platform));
+        hostName = aneHostLibName(platform);
       } catch (e) {
-        return fail(`no lib/bin/ directory is defined for AIR platform '${platform}'`, String((e as Error).message));
+        return fail(`no lib/bin/ host library for AIR platform '${platform}'`, String((e as Error).message));
       }
-      const dir = join(ctx.repoDir, 'lib', 'bin', hostDir);
-      // The host library's name is platform-specific: the Windows one is an
-      // import library for asaot.dll. Probing all three keeps the check from
-      // hardcoding a Windows-only filename into a cross-platform report.
-      const names = ['asaot.dll', 'libasaot.dylib', 'libasaot.so'];
-      const found = names.map((n) => join(dir, n)).find((p) => existsSync(p));
-      if (found === undefined) {
+      // The name comes from the SAME function the build stages the file under, so
+      // this check cannot disagree with what src/index.ts will look for. (It used to
+      // probe three candidate names, which let a Windows key be satisfied by a
+      // libasaot.so sitting in its directory -- a file no Windows loader can open.)
+      const hostLib = join(dir, hostName);
+      if (!existsSync(hostLib)) {
         return fail(
-          `missing ${join(dir, 'asaot.dll')}`,
-          'Build it first: run `lib/build-asaot.bat` (it needs clang; the source is lib/asaot_host.c). '
-          + 'Only the Windows host library is built today, so an --ane-platform for another OS has no host side yet.',
+          `missing ${hostLib}`,
+          'Build it first: `lib/build-asaot.bat` on Windows or `lib/build-asaot.sh` on macOS '
+          + '(both need clang; the source is lib/asaot_host.c). A platform key whose host library has '
+          + 'not been built has no host side to load, so --ane cannot work for it.',
         );
       }
-      return ok(found);
+      return ok(hostLib);
     },
   },
 

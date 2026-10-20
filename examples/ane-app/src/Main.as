@@ -7,7 +7,8 @@
 //   <extensions><extensionID>com.example.probe</extensionID></extensions>
 //
 //   -> --air-app resolves that id over the app directory's ext-aot/ (the staging
-//      tree examples/ane/build-ane.bat writes), then lib/, then ext-folder/
+//      tree examples/ane/build-ane.bat or build-ane.sh writes), then lib/, then
+//      ext-folder/
 //   -> the manifest records the resolved path in `ane-paths`, which is what turns
 //      --ane on and makes the generated C carry as_ane_descs[]
 //   -> the build stages the library as <out>/extensions/com.example.probe/<platform>/

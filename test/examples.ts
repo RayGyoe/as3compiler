@@ -16,12 +16,12 @@
 import { execFile } from 'node:child_process';
 import { readdirSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve, dirname, basename } from 'node:path';
 import { promisify } from 'node:util';
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
 import { root } from './harness.ts';
-import { aneHostDirName, currentAnePlatform, readAne } from '../src/ane.ts';
+import { aneHostDirName, aneHostLibName, currentAnePlatform, readAne } from '../src/ane.ts';
 
 const runAsync = promisify(execFile);
 
@@ -251,7 +251,7 @@ const EXAMPLE_REQUIRES: Record<string, string> = {
 //
 // `pkg` is whatever the build would be handed as `--ane`: either a package or, for
 // a staging tree, the directory holding extension.xml. Both examples share ONE
-// fixture tree (examples/ane/build-ane.bat writes both copies), so they answer this
+// fixture tree (examples/ane/build-ane.{bat,sh} writes both copies), so they answer this
 // question identically -- but the path is a parameter rather than a constant so a
 // future example cannot silently reuse another's answer.
 //
@@ -261,16 +261,25 @@ const EXAMPLE_REQUIRES: Record<string, string> = {
 // not `asaot.lib`: that is the IMPORT library for linking, not the runtime the
 // executable loads.
 //
-// That the name is Windows-specific is exactly the registered gap
-// (TODO.md 遗留待开发: no macOS/iOS host library is built yet); when one lands,
-// the name has to come from one place shared with index.ts rather than being
-// guessed here.
-const HOST_LIB_NAME = 'asaot.dll';
+// The NAME is no longer a constant here: it comes from aneHostLibName, the same
+// place src/index.ts and `as-aot doctor` get it, so a host whose library is called
+// something else (`libasaot.dylib` on macOS) cannot be gated on the Windows name
+// and skipped for a file that is right there. The Windows/macOS split is in
+// docs/zh-cn/ane.md §3.5.
 function aneHostSkipReason(pkg: string): string | null {
   const key = currentAnePlatform();
   if (key === '') return 'this host has no AIR platform key (see docs/zh-cn/ane.md §3.4)';
-  const hostLib = join(root, 'lib', 'bin', aneHostDirName(key), HOST_LIB_NAME);
-  if (!existsSync(hostLib)) return `the FRE host library (lib/bin/${aneHostDirName(key)}/${HOST_LIB_NAME}) is not built for this host`;
+  const dirName = aneHostDirName(key);
+  let hostLib: string;
+  try {
+    hostLib = join(root, 'lib', 'bin', dirName, aneHostLibName(key));
+  } catch (e) {
+    // A key that exists but has no host library (iOS links its extensions into the
+    // application image) is a host fact, not a missing build step, so it skips with
+    // the header's own wording instead of "build it first".
+    return String((e as Error).message);
+  }
+  if (!existsSync(hostLib)) return `the FRE host library (lib/bin/${dirName}/${basename(hostLib)}) is not built for this host`;
   let declares = false;
   try {
     declares = readAne(pkg).platforms.some((p) => p.name === key);

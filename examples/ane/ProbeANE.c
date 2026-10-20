@@ -41,13 +41,19 @@ typedef struct {
 
 /* The extension's OWN exports. Note this is deliberately NOT asaot.h's ASAOT_API:
  * that one is dllimport here (it decorates the FRE symbols the extension IMPORTS
- * from asaot.dll), and applying it to a definition is an error. A real ANE
+ * from the host library), and applying it to a definition is an error. A real ANE
  * decorates its ExtInitializer/ExtFinalizer its own way (ANENDI's .vcxproj does it
  * with a .def file); the FRE header has nothing to say about them. */
 #ifdef _WIN32
   #define PROBE_EXPORT __declspec(dllexport)
 #else
-  #define PROBE_EXPORT
+  /* Default visibility, spelled out rather than relied on: a dylib exports
+   * non-static symbols by default anyway, but the build script's guard asserts
+   * that ProbeExtInitializer IS exported, and a future -fvisibility=hidden would
+   * otherwise turn a working fixture into one that fails to load with a message
+   * about a missing initializer. The two halves of the recipe (source decoration
+   * and artifact guard) stay in agreement this way. */
+  #define PROBE_EXPORT __attribute__((visibility("default")))
 #endif
 
 /* ---- registered functions ------------------------------------------------- */
