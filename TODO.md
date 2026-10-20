@@ -13393,7 +13393,45 @@ trim 规则、注释切分文本 run、`&#32;` 的空节点、属性 `>`）是�
 
 **closure 三条**：① **宿主相关的值必须留成运行时助手**，不能折成编译期字面量 —— 否则同一份源码在所有目标上给出同一个值，而那必然对至少一端是错的；② **一个 `#ifdef` 只有两半都测过才算测过** —— 本机编得过不能证明另一端的分支存在，所以钉子钉的是「两个分支都在」，而不是「值等于某个特定字符」；③ **平台相关的值不要写成「等于常数」的运行期断言**，要断言 AIR **定义的关系**（CRLF ⇔ 反斜杠、末位是 LF），否则那条断言只在一种宿主机上成立。
 
+### 阶段二百二十：`requestContext3D` 的两参签名 + `Context3DProfile.ENHANCED` —— 让 AIR 的 profile 阶梯站得上去（v0.4.194 → v0.4.195）✅ 已完成
+
+**编号说明**：`TODO.md` 里没有阶段二百一十九 的小节 —— 那个编号已被提交 `62acfd2`（动态字符串方法 + 原生入口的未捕获异常恢复点）用在提交信息里，但那一轮没有落 TODO 小节；本节顺延为二百二十，避免同一个编号指两件事。
+
+**触发**：用户在做 `adl` 对齐时先撞上 `Error #2044: Unhandled ErrorEvent ... #3702: Context3D not available`（「你的 app.xml 缺少参数」），随后纠正了元素位置（「你放错位置了」），并指出 profile 的选择顺序是「**从最高到低**」。顺着这条线查我方实现，量出**三处缺陷**。
+
+**先修的工具面根因**：`<renderMode>` 属于 `<initialWindow>` 的子元素（`Descriptor.51.4.xsd` 里它在 `initialWindow` 的 `xs:all` 中，与 `content`/`width`/`depthAndStencil` 同级），而 `<supportedProfiles>` 是 `<application>` 的**顶层**子元素。把 `renderMode` 写成顶层兄弟 ⇒ 不在 schema 里、被静默忽略 ⇒ Stage3D 被禁用 ⇒ `requestContext3D` 异步回 `ErrorEvent #3702`（没人听就是 `#2044`）。**修正后**用同一份探针重跑了 7 档（`temp/adlprof/`，此前那批 `out-*.txt` 全部作废）。
+
+**`adl` 真值台**（adl 51.4.1 / Windows，修正描述符后 7 正 6 负）：
+
+| 事实 | 实测 |
+|---|---|
+| 7 个 `Context3DProfile` 值 | 全部接受，**原样回显**（`enhanced` 请求 ⇒ 回读 `enhanced`），**从不降级** |
+| 非法 `renderMode` | **同步** `#2008 ArgumentError: Parameter renderMode must be one of the accepted values.` |
+| 非法 `profile` | **同步** `#2008 ... Parameter profile must be one of the accepted values.` |
+| 校验顺序 | **renderMode 先、profile 后**（`("direct","nonsense")` 报 renderMode 那条）；抛错在创建 `Context3D` **之前**，事后 `context3D` 仍为 `null` |
+| `renderMode` 合法集 | 只有 `"auto"` / `"software"`（**大小写敏感**；描述符的 `gpu`/`cpu`/`direct` 在这里**不合法**） |
+| `"software"` 的效果 | `driverInfo` → `Software Hw_disabled=explicit`，`maxBackBuffer` 16384 → **2048** |
+| 单参形式 | profile 取默认 `"baseline"` |
+| `apply(…3 个参数)` | `#1063 Argument count mismatch on flash.display::Stage3D/requestContext3D(). **Expected 0**, got 3.` —— `Expected` 是**无默认值形参个数**，不是形参总数 |
+
+**三处缺陷与修法**：
+
+1. **`requestContext3D` 只声明 1 个形参**（`src/symbols.ts`）。AIR 的两参调用 ⇒ **编译期** `too many arguments (expected 1, got 2)`；Starling 走 `Function.apply` 的真实路径 ⇒ **运行期** `#1063 Argument count mismatch`。7 级阶梯**在第一级就断**（Starling 的 `_nf80__impl` 用 catch 驱动降级，它的 7 个字符串全被拒 ⇒ 走完 7 档后 rethrow）。修法：补 `profile:String = "baseline"` 形参。
+2. **`Context3DProfile.ENHANCED` 缺失**（`src/symbols.ts` 只定义了 6 个常量）。阶梯的第一级就是 `enhanced`，故按 AIR 常量的应用**编译不过**。修法：补齐第 7 个。
+3. **两个参数都不校验**（`src/emit.ts` 的 `Stage3D_requestContext3D`）。AIR 的同步 `#2008` 被我们变成「什么值都接受」。修法：按实测补两条校验，**故意保持 renderMode 在前**，文案逐字照抄；`profile` 走 `as_s3d_profile_ok()`（7 个字符串，`NULL` 先挡掉再 `strcmp`），校验放在**创建 `Context3D` 之前**。
+
+**回读值为什么是 `"baseline"` 而不是回显**：AIR 能同时满足 7 档，所以它回显；我们只实现 baseline 能力（AGAL1、128 `vc`、无 MRT/浮点纹理）。`Context3D.profile` 的语义是「你**真正拿到的** context 的能力」，因此报 `"baseline"` 才是诚实上报 —— 这也正是 Starling 安全的另一半：它读的是**回读值**（`Painter.get_profile()` → `context3D.profile`），不是请求值，于是整个阶梯仍然落在 tier-A 路径上。若把 `enhanced` 原样回显，Starling 会切成 4096 贴图 / `RenderTexture` 关双缓冲的 tier-B，而该路径本后端**没有验证过** —— 那不是对齐，是谎报。
+
+**验收**（三层）：
+
+1. **示例层** `examples/stage3d-profile.as`（自断言 25 条）：7 个常量值、七个档位逐个请求均不抛、非法 `profile`/`renderMode`/大小写敏感/校验顺序的 `errorID` **与文案逐字**、`software` 被接受、单参形式仍可用、回读为 `baseline`。
+2. **源级钉**：`stage3d/request-context-profile`（`test/unit/stage3d.ts`，6 条：两参签名 / 校验顺序按**索引先后**比较 / 7 个字符串**集合相等** / `NULL` 先挡 / 校验先于 `Context3D_new` / 回读为 `baseline`）；`unit: builtin/Arity` 的形参表钉从 `context3DRenderMode?` 改写为 `context3DRenderMode?,profile?`（并钉住两个默认值）；`unit: diagnostics/Codegen` 增 1 条 —— **多给第三个参数**仍报错且消息里**两个形参名都在**（`expected 2, got 3 ... (params: context3DRenderMode,profile)`），防「把签名又缩回一个参数」。
+3. **全量回归** `node test.ts`（本机 shim 下）：**427 项 / 395 通过 / 32 红**；同一命令在**改动前的干净树**上是 **425 / 393 / 32** ⇒ 失败集合**逐条相同**（32 条全是本机 Windows 侧的既有红：Skia/Metal/WebGL 夹具、CRLF 敏感的跨行正则钉等），新增的 2 项（1 示例 + 1 单元组）全绿。A/B 用 `git stash push -u` 做的，改动的补丁另存 `temp/profimpl/mychanges.patch` 以防被吃掉。
+
+**closure 三条**：① **「AIR 会不会降级」与「谁在读这个值」是两个问题** —— AIR 不降级，但 Starling 读的是**回读值**，所以「接受请求、如实上报」比「回显请求」既更诚实也更安全；判断一个上报值对不对，要看**它的消费者拿它做什么**；② **同一对参数有校验顺序** —— 顺序是可观测行为（两个都错时报哪条），钉它要用**索引先后**而不是「两条都在」；③ **描述符元素的位置是语义** —— `renderMode` 放错层不会报错，只会让 Stage3D 静默消失，症状（`#2044`/`#3702`）离根因隔了两层，先查 XSD 再改代码。
+
 ### 遗留待开发
+> **2026-10-21 追加（阶段二百二十：`requestContext3D` 两参签名 + `Context3DProfile.ENHANCED`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内实际行数不变（**95 项**）。本阶段修的三处（缺形参、缺常量、缺同步校验）**都是 `adl` 跑得对而我们跑不出**，按 §1.5 硬判据属**遗留缺陷**且在阶段内修完，故不入表（与阶段一百七十八·七 同例）。唯一新增的**已知差异**是「`renderMode="software"` 被接受但不改变后端」（我们始终用编译期选定的 Stage3D 后端），它已写在 `docs/zh-cn/display3d.md` §7 的 `profile` 行里 —— 不单列成表行，因为该差异只在「机器根本没有可用 GPU」时才有可观测后果，而我们的窗口后端本身就依赖 GPU。
 > **2026-10-21 追加（阶段二百一十八：`File.separator` / `File.lineEnding` 落地）**：**新登记 0 行 / 改写 1 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数（口径：`|` 开头的行 − 表头行 − 分隔行 = 表内项数，状态取**状态列首个词**），表内项数 **96 → 95 项**（`未开始` **73 → 72**，`部分完成` 18 / `已修` 3 / `调研完成 · 实现暂缓` 1 / `已记录` 1 不变），与「只移出 1 行、其余不动」自洽。**另报一处口径差**：上一轮 note 的绝对项数记作 **97**（`未开始` **74**），而按 HEAD（`5ce625b`：**94 项** / `未开始` 71）叠加阶段二百一十六（+1）、二百一十七（+2 −1）推得**应为 96 项 / `未开始` 73** —— 若这期间没有别的改动删过行，则上一轮的**绝对标签比表内实际多 1**（增量本身没错，只是标签多算了一个，`未开始` 同样多 1）；表内**行数**是准的，本轮起按实测行数记账，这 1 的来历留待下次核对。**移出 1 行**是「**`File.separator` / `File.lineEnding` 未实现**」—— 本阶段已落地（短名与全限定名两式走同一份静态 traits，`adl 51.4.1` 双写对照逐字相同，示例层在 Windows 上真跑通），按「已完成项一经落地即移出」移除。**改写 1 行**是「**点链首段被变量遮蔽时仍被当类引用解析**」—— 本阶段顺手量到**同源的第二个面**：全限定名读一个**不存在**的静态成员时**静默回 `undefined`**（`as_class_member_value` 的兜底），而短名当场报编译错；两者同属「点链当 Class 值解析」，故并入同一行的证据列、不另立行（这也是该行继续留在表内的原因）。
 > **2026-10-21 追加（阶段二百一十七：类引用的全限定名不再退化成动态查表）**：**新登记 2 行 / 改写 0 行 / 移出 1 行** ⇒ 表内项数 **96 → 97 项**（`未开始` 73 → **74**，其余不变）。**移出 1 行**是「**类引用写全限定名时静态成员特化失效**」—— 它就是本阶段修掉的那条（触发即此表），读/写/调用/内置四类形态全部改为按 `classRefName` 判定，`adl 51.4.1` 双写对照逐字相同，故按本表「已完成项一经落地即移出」移除。**新登记 2 行**都是本轮**顺手量出来、但不在批准范围内修**的真缺陷：① 「**点链首段被变量遮蔽时仍被当类引用解析**」（`adl` 抛 `#1009`，我们在 HEAD 上就已静默读出静态值/undefined —— 静默错值，且同源面还包括「点链当 Class 值解析」与 `Cls["member"]`，故不动旧路径）；② 「**`File.separator` / `File.lineEnding` 未实现**」（`adl` 两式都打印，我们两式都在**编译期**硬报 `undefined static field 'separator' on class 'File'` ⇒ 属「`adl` 跑得对、我们跑不出」，是缺常量而非特化退化）。
 > **2026-10-21 追加（阶段二百一十六：SWC 夹具换代）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **95 → 96 项**（`未开始` 72 → **73**，其余不变）。新登记的是本轮顺手量出来的一项**真缺陷**（不在本轮批准范围内修）：**类引用的「全限定名」形式会让静态成员特化失效** —— `flash.filesystem.File.applicationDirectory` 在 `mxmlc` 里**合法**（加了 `import flash.filesystem.File` 后编译通过）、在 `adl 51.4.1` 里**打印正常**，而我们生成的是动态查表 `as_class_member_value(&File_cls, "applicationDirectory")` ⇒ 目录类静态（`applicationDirectory`/`userDirectory`/`desktopDirectory`/`documentsDirectory`）**根本没进 props 表** ⇒ `as_req_box(NULL)` ⇒ `Error #1010`。

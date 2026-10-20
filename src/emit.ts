@@ -20640,6 +20640,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('#endif');
     this.indent--;
     this.line('}');
+    // Profile of the context we actually created. AIR echoes whatever was requested
+    // because it can satisfy all seven rungs; we implement only the baseline feature set
+    // (AGAL1: 128 vc / 28 fc / 8 ft, no MRT, no float textures), so "baseline" is the
+    // truthful answer for every request -- see Stage3D_requestContext3D for why we do not
+    // echo the request back.
     this.line('char* Context3D_get_profile(void* _this) { (void)_this; return (char*)"baseline"; }');
     // totalGPUMemory: AIR reports how much GPU memory this context holds. We do not
     // account for every buffer, so report the one allocation we always know — the
@@ -20684,9 +20689,46 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return as_v_null();');
     this.indent--;
     this.line('}');
-    this.line('void Stage3D_requestContext3D(void* _this, char* renderMode) {');
+    // requestContext3D(context3DRenderMode = "auto", profile = "baseline").
+    //
+    // AIR validates BOTH arguments synchronously (measured against adl 51.4.1 with
+    // temp/adlprof/):
+    //   - renderMode: only "auto" / "software" (case-sensitive). Anything else --
+    //     including the descriptor's own vocabulary gpu/cpu/direct -- throws
+    //     ArgumentError #2008 "Parameter renderMode must be one of the accepted values."
+    //     There is NO async ErrorEvent path for a bad argument.
+    //   - profile: the seven Context3DProfile strings; anything else (e.g. "auto")
+    //     throws #2008 "Parameter profile must be one of the accepted values."
+    //   - ORDER: renderMode is checked BEFORE profile. requestContext3D("baseline",
+    //     "auto") reports the renderMode error, not the profile one; gotcha for anyone
+    //     writing a negative test.
+    // All seven profiles are accepted on a desktop AIR runtime and AIR echoes the
+    // requested one back from context3D.profile (it never silently downgrades -- the
+    // ladder in Starling is for runtimes that CANNOT satisfy a rung, which is why it is
+    // try/catch driven).
+    //
+    // We accept all seven strings but always create a baseline context, so
+    // context3D.profile reports "baseline" (see Context3D_get_profile). That is the
+    // honest report for a runtime whose Stage3D only implements AGAL1/small constants,
+    // and it keeps every reader on its tier-A path: Starling reads profile back (never
+    // the requested value) to pick 2048 vs 4096 textures and whether to double-buffer
+    // RenderTexture. Echoing "enhanced" back would make Starling take a path this
+    // backend cannot honour.
+    this.line('static bool as_s3d_profile_ok(const char* p) {');
+    this.indent++;
+    this.line('if (p == NULL) return false;');
+    this.line('return !strcmp(p, "baseline") || !strcmp(p, "baselineExtended") || !strcmp(p, "baselineConstrained")');
+    this.line('    || !strcmp(p, "enhanced") || !strcmp(p, "standard") || !strcmp(p, "standardConstrained")');
+    this.line('    || !strcmp(p, "standardExtended");');
+    this.indent--;
+    this.line('}');
+    this.line('void Stage3D_requestContext3D(void* _this, char* renderMode, char* profile) {');
     this.indent++;
     this.line('Stage3D* o = (Stage3D*)_this;');
+    this.line('if (renderMode == NULL || (strcmp(renderMode, "auto") && strcmp(renderMode, "software")))');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #2008: Parameter renderMode must be one of the accepted values.", 2008));');
+    this.line('if (!as_s3d_profile_ok(profile))');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #2008: Parameter profile must be one of the accepted values.", 2008));');
     this.line('o->renderMode = renderMode;');
     this.line('if (o->context3d == NULL) { o->context3d = Context3D_new(); gc_write_barrier((void*)o->context3d); }');
     this.line('as_set_timeout(as_fn_make(Stage3D__contextReady, (void*)o, 0), 0.0);');

@@ -6388,7 +6388,11 @@ export class SymbolTable {
     constClass('Context3DCompareMode', { ALWAYS: 'always', NEVER: 'never', LESS: 'less', LESS_EQUAL: 'lessEqual', EQUAL: 'equal', GREATER_EQUAL: 'greaterEqual', GREATER: 'greater', NOT_EQUAL: 'notEqual' });
     constClass('Context3DFillMode', { NONE: 'none', SOLID: 'solid' });
     constClass('Context3DMipFilter', { MIPNONE: 'mipnone', MIPNEAREST: 'mipnearest', MIPLINEAR: 'miplinear' });
-    constClass('Context3DProfile', { BASELINE: 'baseline', BASELINE_EXTENDED: 'baselineExtended', BASELINE_CONSTRAINED: 'baselineConstrained', STANDARD: 'standard', STANDARD_CONSTRAINED: 'standardConstrained', STANDARD_EXTENDED: 'standardExtended' });
+    // AIR's Context3DProfile carries SEVEN values. `enhanced` used to be missing here,
+    // which made `Context3DProfile.ENHANCED` a codegen error -- and that matters more than
+    // a missing constant: Starling's profile ladder starts at `enhanced`, so any app
+    // naming the top rung could not compile at all.
+    constClass('Context3DProfile', { BASELINE: 'baseline', BASELINE_EXTENDED: 'baselineExtended', BASELINE_CONSTRAINED: 'baselineConstrained', ENHANCED: 'enhanced', STANDARD: 'standard', STANDARD_CONSTRAINED: 'standardConstrained', STANDARD_EXTENDED: 'standardExtended' });
     constClass('Context3DProgramType', { VERTEX: 'vertex', FRAGMENT: 'fragment' });
     constClass('Context3DRenderMode', { AUTO: 'auto', SOFTWARE: 'software' });
     constClass('Context3DStencilAction', { KEEP: 'keep', DECREMENT_SATURATE: 'decrementSaturate', DECREMENT_WRAP: 'decrementWrap', INCREMENT_SATURATE: 'incrementSaturate', INCREMENT_WRAP: 'incrementWrap', INVERT: 'invert', REPLACE: 'replace', SET: 'set', ZERO: 'zero' });
@@ -6912,10 +6916,19 @@ export class SymbolTable {
           ['renderMode', s3f({ kind: 'string' })],
         ]),
         methods: new Map([
-          // AIR's parameter name is `context3DRenderMode` (AIR also declares
-          // `profile:String = "baseline"`, which this backend does not consume);
-          // the default is what makes `requestContext3D()` an AIR-legal call.
-          ['requestContext3D', s3m({ kind: 'void' }, [{ name: 'context3DRenderMode', type: 'String', defaultValue: { kind: 'Str', value: 'auto' }, isRest: false }])],
+          // AIR's signature is
+          //   requestContext3D(context3DRenderMode:String = "auto",
+          //                    profile:String = "baseline"):void
+          // Both parameters are load-bearing and both are validated SYNCHRONOUSLY
+          // (measured against adl 51.4.1, see emit.ts Stage3D_requestContext3D).
+          // Omitting `profile` here made every AIR-legal two-argument call a compile
+          // error ("too many arguments (expected 1, got 2)") and, when it went through
+          // Function.apply, a runtime "#1063 Argument count mismatch" -- which is the
+          // path Starling actually takes, so its profile ladder died on rung one.
+          ['requestContext3D', s3m({ kind: 'void' }, [
+            { name: 'context3DRenderMode', type: 'String', defaultValue: { kind: 'Str', value: 'auto' }, isRest: false },
+            { name: 'profile', type: 'String', defaultValue: { kind: 'Str', value: 'baseline' }, isRest: false },
+          ])],
         ]),
         staticFields: new Map(), staticMethods: new Map(),
         getters: new Map([

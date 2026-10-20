@@ -187,6 +187,13 @@ function checkCodegenDiagnostics(): string[] {
   const g6 = gen('function f(a:int):void {}\nf();');
   check('a missing argument names the parameter',
     g6?.message === "Codegen error at 2:1: missing argument for parameter 'a' in <top>.<top>");
+  // Stage3D.requestContext3D is the AIR-legal place where this matters: AIR declares
+  // (context3DRenderMode = "auto", profile = "baseline"), so passing a THIRD argument
+  // must still be an error, and the message must name BOTH real parameters — a stale
+  // one-parameter signature used to make every two-argument call fail instead.
+  const s3d1 = gen('import flash.display.Stage;\nvar st:Stage = new Stage();\nst.stage3Ds[0].requestContext3D("auto", "baseline", "x");');
+  check('requestContext3D accepts exactly two arguments, and the message names both',
+    s3d1?.message === 'Codegen error at 3:1: too many arguments (expected 2, got 3) for (params: context3DRenderMode,profile) in <top>.<top>');
 
   // #75 / 阶段一百九十五: a BUILT-IN parameter that AIR requires must not be
   // defaulted. The `gnum` helper used to hand EVERY numeric built-in parameter a

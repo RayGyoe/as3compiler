@@ -176,6 +176,21 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 
 **内核翻译器支持 AGAL1/2/3 三代；`Context3D.profile` 至今固定上报 `"baseline"`**（`Context3D_get_profile` 恒返回 `"baseline"`：AGAL1 能力 + 非压缩 2D/cube 纹理）——这正好覆盖 Stage3D 的最大真实消费者 **Starling**（2D-on-GPU 框架）。
 
+**`requestContext3D` 的两参签名（阶段二百二十，对 `adl` 51.4.1 实测）**：AIR 声明 `requestContext3D(context3DRenderMode:String = "auto", profile:String = "baseline")`，两个参数都在**调用点上同步校验**（`ArgumentError #2008`，无异步 `ErrorEvent` 路径）：
+
+| 参数 | 合法值 | 越界的报错文案 |
+|---|---|---|
+| `context3DRenderMode` | 只有 `"auto"` / `"software"`（**大小写敏感**；描述符里的 `gpu`/`cpu`/`direct` 在这里**不合法**） | `Error #2008: Parameter renderMode must be one of the accepted values.` |
+| `profile` | `Context3DProfile` 的 7 个字符串（含 **`"enhanced"`**） | `Error #2008: Parameter profile must be one of the accepted values.` |
+
+校验顺序是 **`renderMode` 先、`profile` 后**（`requestContext3D("direct","nonsense")` 报的是 renderMode 那条），抛错发生在创建 `Context3D` **之前**（故失败后 `stage3D.context3D` 仍为 `null`）。
+
+走 `Function.apply`（Starling 的真实路径）多给一个参数时，AIR 报 `#1063 Argument count mismatch on flash.display::Stage3D/requestContext3D(). Expected 0, got 3.` —— 注意 `Expected` 是「无默认值的形参个数」（这里是 0），不是形参总数；我们生成的同一句文案已与之逐字相同（`adl` 51.4.1 实测）。
+
+回读值与请求值的关系要分清：**AIR 能同时满足全部 7 档，所以原样回显请求值**（实测 7 档请求 7 档回显，从不降级）；我们只实现 baseline 能力，因此**接受全部 7 个字符串、但一律上报 `"baseline"`**——这是对「真实建出来的 context」的诚实上报，也正是 Starling 的降级阶梯（`enhanced → … → baselineConstrained`，靠 `try/catch` 驱动）能安全落在 tier-A 的原因：它读的是**回读值**（`context3D.profile`），不是请求值。反过来说，若把 `enhanced` 原样回显，Starling 会走 4096 贴图 / `RenderTexture` 关双缓冲的 tier-B 路径，而该路径本后端并未验证——那不是对齐，是谎报。
+
+历史缺陷（阶段二百二十 修掉）：`requestContext3D` 曾只声明 1 个形参，于是任何按 AIR 签名的两参调用**编译期**即报 `too many arguments (expected 1, got 2)`；Starling 走 `Function.apply` 的真实路径则在**运行期**报 `#1063 Argument count mismatch`，整条 profile 阶梯在第一级就断掉。同时 `Context3DProfile.ENHANCED` 常量缺失（只定义了 6 个）。
+
 ### 6.1 最终验收 demo：`examples/shmup-stage3d`
 
 > 该 demo 是阶段七十九~八十三的**最终端到端验收目标**，**阶段八十四 已跑通**——本项目把它从 `.as`
@@ -230,7 +245,7 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 |---|---|
 | `VideoTexture` | ⚠️ **无解码器，但类与对象齐备**：`Context3D.createVideoTexture()` 返回一个空的 `VideoTexture`（`videoWidth`/`videoHeight` 恒 0），`Context3D.supportsVideoTexture` 常量为 `true`，`attachCamera`/`attachNetStream` 是**空实现**——对象存在是为了让 Starling 的 `ConcreteVideoTexture` 能持有/挂接一个基底，不会画错、只是不出视频像素 |
 | 压缩纹理（ATF/DXT/PVRTC） | ⚠️ **部分**（阶段八十九·二十一）：ATF 容器的 `format 3/5`（裸 DXT1/DXT5）已实现——运行时 `as_atf_decode_dxt` 在 CPU 解码为直通-alpha ARGB 后走普通纹理上传路径（不预乘，与 adl 把裸 DXT5 交给 GPU 一致；mip 1+ 未解码、只取 level 0）；ETC1/PVRTC、cubemap 与 `format 0xc/0xd`（JPEG-XR 有损）仍**响亮报错**（`Error #3680`），不静默出空图 |
-| `driverInfo`/`totalGPUMemory`/`profile` 精确上报 | `driverInfo` 按**构建期后端宏**上报四档：`ASC_S3D_GLSL` → `"WebGL2 (Stage3D)"`、`ASC_S3D_HLSL` → `"Direct3D12 (Stage3D)"`、`ASC_RENDER_STAGE3D` → `"Metal (Stage3D)"`、否则 `"Software (state machine)"`；判定入口是 `ASC_RENDER_STAGE3D`（**不是**只表示窗口合成后端的 `ASC_RENDER_WINGPU`/`ASC_RENDER_METAL`，见 `emit.ts` 该函数上的注释）。`profile` 固定 `"baseline"`；`totalGPUMemory` 已实现但为**近似值**（阶段八十九·二十一：后台缓冲 BGRA8 字节数 + 有深度模板时再加 D32S8 字节数）——它必须存在，因为 Starling `StatsDisplay.supportsGpuMem` 用 `"totalGPUMemory" in context` 探测并据此增删整个 HUD 行。D3D12 那串标签尚无 adl 实测（adl 无可用 D3D 后端），是**诚实的占位**，已入遗留表 |
+| `driverInfo`/`totalGPUMemory`/`profile` 精确上报 | `driverInfo` 按**构建期后端宏**上报四档：`ASC_S3D_GLSL` → `"WebGL2 (Stage3D)"`、`ASC_S3D_HLSL` → `"Direct3D12 (Stage3D)"`、`ASC_RENDER_STAGE3D` → `"Metal (Stage3D)"`、否则 `"Software (state machine)"`；判定入口是 `ASC_RENDER_STAGE3D`（**不是**只表示窗口合成后端的 `ASC_RENDER_WINGPU`/`ASC_RENDER_METAL`，见 `emit.ts` 该函数上的注释）。`profile` 固定 `"baseline"`（理由见 §6 末：我们只实现 baseline 能力，7 个请求值都接受但不回显）；**`context3DRenderMode="software"` 被接受但不改变后端**——AIR 在软件模式下会禁用硬件（实测 `driverInfo` 变成 `Software Hw_disabled=explicit`、`maxBackBuffer` 从 16384 掉到 2048），我们永远用**编译期选定的 Stage3D 后端**（Metal/D3D12/WebGL2/纯 C 状态机）绘制，`driverInfo`/`maxBackBufferWidth` 也不随该参数变化。这只影响「明明该走 CPU 光栅化」的极端场景（无可用 GPU），且我们的窗口后端本身就需要 GPU，故不单列欠账；`totalGPUMemory` 已实现但为**近似值**（阶段八十九·二十一：后台缓冲 BGRA8 字节数 + 有深度模板时再加 D32S8 字节数）——它必须存在，因为 Starling `StatsDisplay.supportsGpuMem` 用 `"totalGPUMemory" in context` 探测并据此增删整个 HUD 行。D3D12 那串标签尚无 adl 实测（adl 无可用 D3D 后端），是**诚实的占位**，已入遗留表 |
 | `enableErrorChecking=true` 的同步抛错 | **未实现**：`Context3D.enableErrorChecking` 的 setter 目前是 no-op，`true` 时不产生 AIR 的同步校验抛错（我们的 draw 走批量提交、帧边界统一退休，本身没有可同步抛错的时机）。不影响 Starling/Away3D |
 | AGAL2/AGAL3 的 GPU 端到端上屏（MRT/实例化） | **实例化已上屏**（阶段八十三：`drawTrianglesInstanced` → 三端的 `instanceCount`），AGAL2 控制流/导数三档都翻译。**未闭合的是三条跨档差异**：片元 **MRT**（`oc1..oc3`）与 **`od`**、AGAL3 **`iid`** 寄存器目前只有 **HLSL 档完整**，MSL/GLSL 折叠单输出 / MSL `od` 未声明 / `iid` 译成未声明的 `r<num>`（详见 §3 末的差异说明，已入 `TODO.md` 遗留表） |
 

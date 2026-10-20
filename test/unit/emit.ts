@@ -2104,9 +2104,14 @@ function checkBuiltinArity(): string[] {
     shapeOf('Context3D', 'setRenderToTexture') === 'texture,enableDepthAndStencil?,antiAlias?,surfaceSelector?'
     && shapeOf('Context3D', 'setVertexBufferAt') === 'index,buffer,bufferOffset?,format?'
     && shapeOf('Context3D', 'setProgramConstantsFromVector') === 'programType,firstRegister,data,numRegisters?');
-  check('Stage3D.requestContext3D names its parameter as AIR does, defaulting to "auto"',
-    shapeOf('Stage3D', 'requestContext3D') === 'context3DRenderMode?'
-    && defOf('Stage3D', 'requestContext3D', 'context3DRenderMode') === JSON.stringify({ kind: 'Str', value: 'auto' }));
+  // AIR declares BOTH parameters: requestContext3D(context3DRenderMode = "auto",
+  // profile = "baseline"). The one-parameter form this used to pin made every
+  // two-argument call a compile error, and Starling's profile ladder calls it through
+  // Function.apply (=> #1063 at runtime), so the profile half is not optional.
+  check('Stage3D.requestContext3D declares (context3DRenderMode, profile) with AIR\'s defaults',
+    shapeOf('Stage3D', 'requestContext3D') === 'context3DRenderMode?,profile?'
+    && defOf('Stage3D', 'requestContext3D', 'context3DRenderMode') === JSON.stringify({ kind: 'Str', value: 'auto' })
+    && defOf('Stage3D', 'requestContext3D', 'profile') === JSON.stringify({ kind: 'Str', value: 'baseline' }));
 
   // The shell-block classes still go through the old `shReq` helpers -- the audit
   // had to fix their parameters by hand (their class blocks are built by `shell`).

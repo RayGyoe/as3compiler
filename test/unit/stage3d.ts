@@ -1062,3 +1062,66 @@ function checkStage3dD3dGlue(): string[] {
 }
 
 registerGroup('stage3d/d3d-glue', checkStage3dD3dGlue);
+
+// Stage3D.requestContext3D(context3DRenderMode, profile) — the AIR contract for the two
+// argument form, measured against adl 51.4.1 (temp/adlprof/run-all.js + run-modes.js on a
+// descriptor whose <renderMode> lives inside <initialWindow>).
+//
+// Why a structural pin and not just examples/stage3d-profile.as: the example proves the
+// behaviour of ONE call sequence, but what keeps breaking is the *contract* — the
+// parameter existing at all, the two values being validated in AIR's order with AIR's
+// words, and the reported profile staying honest. Any one of those regressing makes an
+// AIR-legal app fail at runtime: Starling's profile ladder calls this with two arguments
+// through Function.apply, so a missing parameter surfaces as #1063 inside its retry loop.
+function checkStage3dRequestContextProfile(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const emitted = emittedLines();
+
+  // 1. Two parameters, in AIR's order and with AIR's names.
+  check('requestContext3D takes (renderMode, profile), not a single argument',
+    emitted.includes('void Stage3D_requestContext3D(void* _this, char* renderMode, char* profile) {'));
+
+  // 2. renderMode is validated BEFORE profile — adl reports the renderMode error for a
+  //    call where both values are wrong. Comparing the two indices makes this a pin about
+  //    ORDER rather than about the two checks merely existing.
+  const iMode = emitted.indexOf('Parameter renderMode must be one of the accepted values.');
+  const iProf = emitted.indexOf('Parameter profile must be one of the accepted values.');
+  check('both arguments are validated synchronously with AIR\'s exact #2008 text',
+    iMode > 0 && iProf > iMode
+    && emitted.includes('if (renderMode == NULL || (strcmp(renderMode, "auto") && strcmp(renderMode, "software")))')
+    && emitted.includes('as_throw(ArgumentError_new((char*)"Error #2008: Parameter renderMode must be one of the accepted values.", 2008));')
+    && emitted.includes('as_throw(ArgumentError_new((char*)"Error #2008: Parameter profile must be one of the accepted values.", 2008));'));
+
+  // 3. The accepted profile set is exactly AIR's seven rungs — no more, no less.
+  const body = emitted.slice(emitted.indexOf('static bool as_s3d_profile_ok'),
+                            emitted.indexOf('void Stage3D_requestContext3D'));
+  const accepted = [...body.matchAll(/!strcmp\(p, "([^"]+)"\)/g)].map((m) => m[1]).sort();
+  check('all seven Context3DProfile strings are accepted (enhanced included)',
+    accepted.join(',') ===
+      'baseline,baselineConstrained,baselineExtended,enhanced,standard,standardConstrained,standardExtended');
+  check('a NULL profile is rejected instead of reaching strcmp',
+    /if \(p == NULL\) return false;/.test(body));
+
+  // 4. Validation precedes context creation, so a bad call leaves stage3D.context3D null
+  //    — exactly what adl prints ("final context3D=null").
+  const iCreate = emitted.indexOf('if (o->context3d == NULL) { o->context3d = Context3D_new();', iProf);
+  check('validation precedes context creation (a bad argument leaves context3D null)',
+    iProf > 0 && iCreate > iProf);
+
+  // 5. The reported profile is the context we actually built, never an echo of the
+  //    request. AIR echoes because it can satisfy all seven rungs; we implement the
+  //    baseline set only, and Starling branches on the read-back value.
+  check('context3D.profile reports the baseline context we really create',
+    emitted.includes('char* Context3D_get_profile(void* _this) { (void)_this; return (char*)"baseline"; }'));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/request-context-profile', checkStage3dRequestContextProfile);
