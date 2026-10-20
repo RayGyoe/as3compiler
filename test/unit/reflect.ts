@@ -183,7 +183,11 @@ function checkFrameErrorRecovery(): string[] {
   check('the outermost frame plants the buffer', body.includes('setjmp(as_frame_jmp)'));
   check('...only when no frame is already active',
     /if \(as_frame_guard == 0\) \{\s*if \(setjmp\(as_frame_jmp\) != 0\)/.test(body));
-  check('...and clears the guard on the recovery path', body.includes('as_frame_guard = 0; return;'));
+  // The recovery path also restores the dispatch nesting depth: a listener that
+  // threw unwound a dispatchEvent that could not decrement it itself (as_disp_arr
+  // picks its snapshot buffer by depth, so a stale value would corrupt later walks).
+  check('...and clears the guard (and the dispatch depth) on the recovery path',
+    body.includes('as_frame_guard = 0; as_disp_depth = 0; return;'));
   check('the frame releases the buffer when it returns normally',
     body.includes('if (_fguard) as_frame_guard = 0;'));
   check('the buffer is planted once per frame, not per dispatch',

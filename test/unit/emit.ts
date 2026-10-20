@@ -1606,6 +1606,97 @@ function checkEmitListenerIdentity(): string[] {
   return bad;
 }
 registerGroup('unit: emit/ListenerIdentity', checkEmitListenerIdentity);
+// Dispatch-time listener snapshot (阶段二百零九). AIR walks the listener list as it
+// stood when the phase started, so a listener may add or remove listeners without
+// disturbing the dispatch in flight; measured on adl 51.4.1 (temp/disprem):
+//   C1 self-removal keeps the NEXT listener running, C2 removing the next one keeps
+//   IT running this time, C3 an addition waits for the next dispatch, C4 remove +
+//   re-add runs each once. examples/listener-mutation.as asserts all of that.
+// Walking the live array instead made the loop skip the entry after a removed one --
+// which silently swallowed the app's own Event.CLOSE handler (the window could be
+// opened once and never again, temp/nwreopen).
+function checkEmitListenerSnapshot(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [listener-snap] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [listener-snap] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.Sprite;\n' +
+    'import flash.events.MouseEvent;\n' +
+    'var s:Sprite = new Sprite();\n' +
+    'function h(e:MouseEvent):void { trace("hit"); }\n' +
+    's.addEventListener(MouseEvent.CLICK, h);\n' +
+    's.removeEventListener(MouseEvent.CLICK, h);\n' +
+    's.dispatchEvent(new MouseEvent(MouseEvent.CLICK));\n')).c.replace(/\r\n/g, '\n');
+
+  const fnBody = (sig: string): string => {
+    for (let from = 0; ;) {
+      const i = c.indexOf(sig, from);
+      if (i < 0) return '';
+      const semi = c.indexOf(';', i);
+      const brace = c.indexOf('{', i);
+      if (brace >= 0 && (semi < 0 || brace < semi)) {
+        let depth = 0;
+        for (let j = brace; j < c.length; j++) {
+          if (c[j] === '{') depth++;
+          else if (c[j] === '}') { depth--; if (depth === 0) return c.slice(i, j + 1); }
+        }
+        return '';
+      }
+      from = i + sig.length;
+    }
+  };
+
+  const arr = fnBody('static bool as_disp_arr(');
+  const rem = fnBody('static void EventDispatcher_removeEventListener(');
+  const add = fnBody('static void EventDispatcher_addEventListener(');
+  const disp = fnBody('bool EventDispatcher_dispatchEvent(');
+  check('the fixture emitted the walk plus add/remove/dispatch',
+    arr.length > 0 && rem.length > 0 && add.length > 0 && disp.length > 0);
+
+  // The walk runs on a COPY of the list, taken before the first listener runs.
+  check('as_disp_arr copies the list into a per-depth buffer',
+    /for \(int i = 0; i < arr->length; i\+\+\) as_array_push\(snap, arr->data\[i\]\);/.test(arr) &&
+    /arr = snap;/.test(arr));
+  check('the copy happens BEFORE the first listener is invoked',
+    arr.indexOf('arr = snap;') < arr.indexOf('fn->fn(fn->env, arg, 1);'));
+  // Length is captured, so an addition during the walk cannot extend it (C3).
+  check('the walk freezes the length it started with',
+    /int n = arr->length;/.test(arr) && /for \(int i = 0; i < n; i\+\+\) \{/.test(arr));
+  check('the one-entry case skips the copy (no per-event allocation in the hot path)',
+    /if \(arr->length > 1 && slot >= 0 && slot < AS_DISP_SNAP_SLOTS\)/.test(arr));
+  // The buffers are GC roots: a closure an earlier listener removed must not be
+  // collected while the snapshot still holds it.
+  check('the snapshot buffers are registered as GC roots',
+    c.includes('gc_root_register((void**)&as_disp_snaps[i]);'));
+
+  // Add/remove must stay IMMEDIATE on the live list -- a tombstone would make a
+  // removal invisible to this dispatch's own walk (C2 wants the removed entry to
+  // still run) and to hasEventListener / re-add dedupe afterwards.
+  check('removeEventListener shifts the live list immediately',
+    /for \(int j = i; j < arr->length - 1; j\+\+\) arr->data\[j\] = arr->data\[j \+ 1\];\s*arr->length--;/.test(rem));
+  check('removeEventListener leaves no tombstone behind',
+    !rem.includes('as_v_null()') && !rem.includes('as_disp_depth'));
+  check('addEventListener appends immediately',
+    add.includes('as_array_push(arr, as_v_obj((void*)listener));') && !add.includes('as_disp_depth'));
+
+  // Depth bookkeeping: one increment for the whole dispatch (nested dispatches take
+  // deeper snapshot slots), decremented before returning, and reset by the frame
+  // guard when an uncaught exception unwinds a dispatch.
+  check('dispatchEvent bumps the depth exactly once',
+    disp.split('as_disp_depth++;').length === 2);
+  check('the depth is restored before dispatchEvent returns',
+    disp.indexOf('as_disp_depth++;') < disp.indexOf('as_disp_depth--;') &&
+    disp.indexOf('as_disp_depth--;') < disp.indexOf('return !event->cancelled;'));
+  check('the frame guard resets the depth after a longjmp',
+    c.includes('as_frame_guard = 0; as_disp_depth = 0; return;'));
+
+  console.log(`     [listener-snap] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ListenerSnapshot', checkEmitListenerSnapshot);
 
 // int(x) / uint(x) must be ES3 ToInt32 / ToUint32 for EVERY source type, never a
 // bare C cast. `(int)` of a double is UNDEFINED BEHAVIOUR once the value is NaN,

@@ -9808,6 +9808,32 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.indent--;
     this.line('}');
+    // ---- dispatch-time listener snapshot ----
+    // AIR (AVM2) walks the listener list AS IT STOOD when the phase started:
+    //   C1 a listener removes ITSELF      -> the next one still runs         (A,B)
+    //   C2 a listener removes the NEXT    -> that one still runs this time   (A,B)
+    //   C3 a listener ADDS one            -> waits for the next dispatch     (A)
+    //   C4 remove itself, then re-add     -> both run, exactly once          (A,B)
+    // measured on adl 51.4.1, temp/disprem (C1b/C3b cover the follow-up dispatch).
+    //
+    // Walking the live array in place cannot express that: a removal shifted the
+    // rest down (so the loop's index skipped the entry AFTER the removed one) and an
+    // addition could appear mid-walk. The skipped entry is not academic -- the app
+    // registers FixStageDpi's Event.CLOSE handler before the window's own one, and
+    // that first handler removes itself, so the window's cleanup never ran, its
+    // static singleton stayed behind, and the 设置/资料库 window could never be
+    // opened a second time (temp/nwreopen: closeCount=0 before, 1 after).
+    //
+    // So a phase walks a SNAPSHOT copy while add/remove stay immediate on the live
+    // list. The copies live in rooted buffers reused per dispatch nesting level: no
+    // allocation in the steady state, and a closure an earlier listener removed is
+    // still reachable from the GC even if some listener calls System.gc().
+    // `as_disp_depth` counts nested dispatchEvent calls (the frame guard restores it
+    // to 0 when an uncaught exception unwinds a dispatch).
+    this.line('#define AS_DISP_SNAP_SLOTS 8');
+    this.line('static as_array* as_disp_snaps[AS_DISP_SNAP_SLOTS];');
+    this.line('static int as_disp_snaps_reg = 0;');
+    this.line('static int as_disp_depth = 0;');
     // Invoke each listener in an array with the single Event argument. An as_fn
     // closure takes (env, as_value*, argc); immStopped stops the remaining ones.
     // Returns whether at least one listener actually ran. AIR uses that fact:
@@ -9816,8 +9842,27 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // target == null), while a delivering dispatch claims it.
     this.line('static bool as_disp_arr(as_array* arr, Event* evt) {');
     this.indent++;
+    // A one-entry list has nothing that a mutation could hide (the single listener
+    // is already running), so the common case skips the copy entirely.
+    this.line('int slot = as_disp_depth - 1;');
+    this.line('if (arr->length > 1 && slot >= 0 && slot < AS_DISP_SNAP_SLOTS) {');
+    this.indent++;
+    this.line('if (!as_disp_snaps_reg) {');
+    this.indent++;
+    this.line('as_disp_snaps_reg = 1;');
+    this.line('for (int i = 0; i < AS_DISP_SNAP_SLOTS; i++) gc_root_register((void**)&as_disp_snaps[i]);');
+    this.indent--;
+    this.line('}');
+    this.line('as_array* snap = as_disp_snaps[slot];');
+    this.line('if (snap == NULL) { snap = as_array_new(); as_disp_snaps[slot] = snap; }');
+    this.line('snap->length = 0;');
+    this.line('for (int i = 0; i < arr->length; i++) as_array_push(snap, arr->data[i]);');
+    this.line('arr = snap;');
+    this.indent--;
+    this.line('}');
     this.line('bool ran = false;');
-    this.line('for (int i = 0; i < arr->length; i++) {');
+    this.line('int n = arr->length;');
+    this.line('for (int i = 0; i < n; i++) {');
     this.indent++;
     this.line('if (evt->immStopped) break;');
     this.line('as_fn fn = (as_fn)as_v_obj_val(arr->data[i]);');
@@ -10028,6 +10073,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (d->listeners == NULL) return false;');
     this.line('as_value vc = as_listeners_get(d->listeners, type, true);');
     this.line('as_value vb = as_listeners_get(d->listeners, type, false);');
+    // The live list is the answer: add/remove stay immediate, only the walk order is
+    // frozen (see as_disp_arr), so a handler that removed itself is really gone by the
+    // time anyone asks afterwards.
     this.line('return (vc.tag == 6 && ((as_array*)vc.ptr)->length > 0) || (vb.tag == 6 && ((as_array*)vb.ptr)->length > 0);');
     this.indent--;
     this.line('}');
@@ -10049,6 +10097,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     //     re-dispatching a lens event from the camera) -> swap for the duration and
     //     restore the previous target afterwards (nested re-dispatch included).
     this.line('EventDispatcher* disp = (EventDispatcher*)_this;');
+    // Entering a dispatch: as_disp_arr takes its snapshot from the nesting level
+    // (see AS_DISP_SNAP_SLOTS above), so the depth must be exact.
+    this.line('as_disp_depth++;');
     this.line('void* own = disp->_evtarget != NULL ? disp->_evtarget : _this;');
     this.line('Object* savedTarget = event->target;');
     this.line('event->target = (Object*)own;');
@@ -10065,6 +10116,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('event->eventPhase = 3; // BUBBLING (target parent -> outermost)');
     this.line('if (event->bubbles) { for (int i = 0; i < anc_count; i++) { if (event->propStopped) break; if (as_disp_phase(event, ancestors[i], false)) ran = true; } }');
     this.line('if (!ran || savedTarget != NULL) event->target = savedTarget;');
+    this.line('as_disp_depth--;');
     this.line('return !event->cancelled;');
     this.indent--;
     this.line('}');
@@ -20510,7 +20562,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // cannot leave it pointing at a stack that has already returned; _fguard keeps
     // the pairing exact on both the normal return and the longjmp path.
     this.line('int _fguard = 0;');
-    this.line('if (as_frame_guard == 0) { if (setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; return; } _fguard = 1; as_frame_guard = 1; }');
+    this.line('if (as_frame_guard == 0) { if (setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; } _fguard = 1; as_frame_guard = 1; }');
     // Frame-boundary GC safe point: all user frame callbacks have returned, so
     // only permanent roots (static fields, stage, event registry, timers) are
     // live. Each frame advances the incremental mark/sweep by a fixed budget
