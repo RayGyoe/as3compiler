@@ -564,6 +564,20 @@ space, **value-for-value identical** to `adl`; the `Screen.bounds` route (`sk_di
 **deliberately left as-is**, because it shares SDL's logical space with window centering, and switching it to
 physical would break centering at the same time.
 
+**Changing the query was not enough on its own (stage two-hundred-six)**: the value is **cached** in the glue
+(`g_display_w/h`), and all three `sk_window_show*` paths were still refilling that cache from the **display
+mode** ⇒ as soon as an app had shown a window (i.e. **every** real app) the DIP query was **dead code**: the whole
+app kept reporting `3840×2560`, while `Screen.bounds` became the **only** DIP reader — the two spaces were
+**swapped**, quantity for quantity (a host's meeting window therefore came out 1.5× too big). There is now exactly
+**one writer**: `sk_refresh_display_size_cache()` (using `SDL_GetDisplayBounds` only), called by all three show
+paths and by the lazy branch, pinned by `unit: platform/DisplayMetrics` as "one query + four refresh sites +
+nobody refilling from `SDL_DisplayMode`" (on a 100%-scaled display the **readings cannot tell the two spaces
+apart**, so what is pinned is the **shape**, not the number). macOS is **unaffected**: SDL's Cocoa backend already
+reports display modes in **points** (`SDL_cocoamodes.c`: `mode->w = CGDisplayModeGetWidth`), the same space as
+`CGDisplayBounds` ⇒ the change is a **no-op** there; macOS has a **neighbouring** divergence (`Stage.fullScreen*`
+takes the usable area while `Capabilities.screenResolution*` takes the whole display — two different quantities in
+AIR itself) that stays in the leftover table.
+
 `Capabilities.screenDPI` is likewise a **constant baseline** rather than a reading: 96 on Windows, 72
 elsewhere (macOS is 72 as well). Reporting the real panel DPI (144) would silently deviate on **every** HiDPI
 desktop. **Residual deviation**: per AIR, `Screen.bounds`/`visibleBounds` should be physical pixels while we
@@ -986,6 +1000,7 @@ re-verification; **stage one-hundred-thirty-two added 13/14 confirmed, 15 not ac
 | 24 | ✅ **the descriptor members are wired up** (stage two-hundred-five): `<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>` are parsed into `AirAppInfo.style` → build defines → the main window's style and geometry (`systemChrome:none` goes through `SDL_WINDOW_BORDERLESS`). **Still unwired**: `<transparent>` (parsed as an attribute only; neither end has real transparent windows) | Writing `<x>50</x><y>60</y>` and finding the window elsewhere ⇒ check whether `ASC_WIN_X/Y` reaches `sk_open_window`'s `is_main` branch (note it adds the **frame** offset `+ c->b_left`) |
 | 25 | ⚠ **the initial window's `<width>/<height>` are FRAME numbers; we treat them as CLIENT** : for `<width>366</width><height>630</height>` adl reads back `bounds=366x630` with `stage=350x591`; we read back `bounds=382x669` (stage still `366x630`) — a difference of **16x39 = the border** (macOS runs the same code path ⇒ expect the 32pt title bar, not measurable on this machine) | A host app laying out to `<width>` gets a 350x591 stage in AIR. See the `TODO.md` leftover row "the initial window's frame/client unit" — it exists **on both ends, not Windows-specific**, and touching it moves every window's initial geometry, so it needs a stage of its own |
 | 26 | ✅ **when `maximize()`/`restore()` take effect** (stage two-hundred-five): adl is **asynchronous** for both — the call itself leaves `ds` and `bounds` untouched (`normal 366x630`) and only the next frame reports `maximized 2576x1723`; `restore()` likewise needs another frame to come back to `normal`. Ours takes effect in the same statement; the **end state is identical** (the difference is only "the instant after the call") | Observable only in code that reads the state immediately after the call (the host's `if (stage.displayState == NORMAL) maximize()` is unaffected); matching it verbatim would mean deferring both calls to a frame boundary |
+| 27 | ✅ **display metrics: one query, one writer** (stage two-hundred-six): at 150% scaling `Capabilities.screenResolutionX/Y` and `Stage.fullScreenWidth/Height` must be **logical points** (`2560x1707`, value-for-value identical to adl), while `Screen.bounds` is **physical pixels** (`3840x2560`) | Reading `3840x2560` (1.5×, and a host window 1.5× too big) ⇒ the glue's `g_display_w/h` is **being refilled from the display mode again**: it is a **cache**, so any `sk_window_show*` path that reintroduces a `dm.w`/`dm.h` write turns the DIP branch into dead code (nail: `unit: platform/DisplayMetrics` — one query + four refresh sites + nobody refilling from `SDL_DisplayMode`). **Note**: on a 100%-scaled machine the **readings cannot tell the two spaces apart** ⇒ only the shape can |
 
 > **The measurement evidence stage two-hundred-four adds (18–20 are the behaviour to align with after the fix)**: the probe `temp/nwwin/probe.c` (**driving SDL 2.32.10 directly, without any of our code**) plus `adl 51.4.1` runs under three descriptors, `temp/nwwin/{mx-def,mx-nomax,mx-fix}.xml` (`temp/nwwin/out-mx-*.txt`); the end-to-end evidence of the fixes is in `TODO.md`, stage two-hundred-four.
 > **Two traps when collecting traces**: on Windows `adl`'s `trace()` goes to **stderr** (not stdout), and the SWF must be compiled with `mxmlc -debug=true`, or not a single line arrives.

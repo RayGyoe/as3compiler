@@ -80,7 +80,8 @@ void sk_gpu_destroy(int id);
 
 // Cached primary-display size so Stage.fullScreenWidth/fullScreenHeight can be
 // read without holding SDL initialized. Populated lazily here and refreshed
-// whenever a window is shown.
+// whenever a window is shown -- both writers go through sk_refresh_display_size_cache,
+// so the cache can only ever hold the DIP-space value those properties are defined in.
 static int g_display_w = 0;
 static int g_display_h = 0;
 // Cached primary-display refresh rate (Hz) for Stage.frameRate's "unset"
@@ -187,14 +188,34 @@ double sk_window_probe_scale(int w, int h, int highdpi, int* pw, int* ph) {
 // Using the mode here was what made a Stage3D app (examples/air-starling-demo,
 // which sizes its Starling viewport from fullScreenWidth/Height) diverge from adl
 // on Windows while macOS matched -- see docs/zh-cn/win32.md.
+// Refresh the cached primary-display size from the DIP-AWARE query, with SDL already up.
+// EVERY writer of g_display_w comes through here, and that is the point: a second writer in
+// another space silently wins, which is exactly what happened. The window paths used to
+// fill the cache from SDL_GetCurrentDisplayMode, which on a scaled Windows desktop answers
+// the PHYSICAL mode (3840x2560 at 150%) while Stage.fullScreenWidth/Height and
+// Capabilities.screenResolutionX/Y are DIP (2560x1707, what adl reports) -- so every app
+// that shows a window reported the pixel count and the lazy branch below became dead code
+// (`Screen.bounds` went on answering the DIP space, so the two reads came out swapped).
+// macOS is unaffected either way: SDL reports its display modes in POINTS
+// (SDL_cocoamodes.c: mode->w = CGDisplayModeGetWidth), the same space CGDisplayBounds
+// gives, so both queries already agreed there.
+static void sk_refresh_display_size_cache(void) {
+  SDL_Rect r;
+  if (SDL_GetDisplayBounds(0, &r) == 0) {
+    if (r.w > 0) g_display_w = r.w;
+    if (r.h > 0) g_display_h = r.h;
+  }
+}
+
 int sk_window_get_display_size(int* w, int* h) {
   if (g_display_w <= 0 || g_display_h <= 0) {
+    // Whether SDL was already up decides whether this call may tear it down again: a Screen
+    // query that ran before any window (ensure_video()) leaves it initialized, and the
+    // SDL_Quit below would then destroy the video subsystem a live window loop is on.
+    int we_inited = (SDL_WasInit(SDL_INIT_VIDEO) == 0);
     if (sk_video_init() != 0) return 0;
-    SDL_Rect r;
-    if (SDL_GetDisplayBounds(0, &r) == 0) {
-      g_display_w = r.w; g_display_h = r.h;
-    }
-    SDL_Quit();
+    sk_refresh_display_size_cache();
+    if (we_inited) SDL_Quit();
   }
   if (w) *w = g_display_w;
   if (h) *h = g_display_h;
@@ -1606,10 +1627,11 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
     return 0;
   }
 
-  // Refresh the cached display size while SDL is initialized.
+  // Refresh the cached display size (DIP space -- see sk_refresh_display_size_cache)
+  // while SDL is initialized.
+  sk_refresh_display_size_cache();
   SDL_DisplayMode dm;
   if (SDL_GetCurrentDisplayMode(0, &dm) == 0) {
-    g_display_w = dm.w; g_display_h = dm.h;
     g_display_refresh = (double)dm.refresh_rate;
   }
 
@@ -1758,9 +1780,9 @@ int sk_window_show_metal(int w, int h, const char* title, int fullscreen,
     return 0;
   }
 
+  sk_refresh_display_size_cache();
   SDL_DisplayMode dm;
   if (SDL_GetCurrentDisplayMode(0, &dm) == 0) {
-    g_display_w = dm.w; g_display_h = dm.h;
     g_display_refresh = (double)dm.refresh_rate;
   }
 
@@ -1840,9 +1862,9 @@ int sk_window_show_gpu(int w, int h, const char* title, int fullscreen,
     return 0;
   }
 
+  sk_refresh_display_size_cache();
   SDL_DisplayMode dm;
   if (SDL_GetCurrentDisplayMode(0, &dm) == 0) {
-    g_display_w = dm.w; g_display_h = dm.h;
     g_display_refresh = (double)dm.refresh_rate;
   }
 

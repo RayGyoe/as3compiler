@@ -485,6 +485,16 @@ adl 的 1.5 倍。修法是**换查询**而不是乘除：`SDL_GetDisplayBounds`
 返回的就是逻辑点空间，与 `adl` **逐值相同**；`Screen.bounds` 那条路（`sk_display_bounds`）**刻意保持原样**，
 它与窗口居中同在 SDL 逻辑空间，改成物理会同时打坏居中。
 
+**换查询本身还不够（阶段二百零六）**：这个值在胶水里是**缓存**（`g_display_w/h`），而三条 `sk_window_show*`
+路径当时仍用**显示模式**回填它 ⇒ 只要程序开过一扇窗（即**每一个**真应用），DIP 查询就是**死代码**：整程序仍报
+`3840×2560`，而 `Screen.bounds` 成了**唯一**的 DIP 读者 —— 两套空间在两个量上**恰好对调**（宿主会议窗因此大
+1.5 倍）。现在**只有一个写入者**：`sk_refresh_display_size_cache()`（只用 `SDL_GetDisplayBounds`），三条 show
+路径与懒查询分支全部改调它，由 `unit: platform/DisplayMetrics` 钉住「一个查询 + 四个刷新点 + 无人从
+`SDL_DisplayMode` 回填」（这个缺陷在 100% 缩放的屏上**读数分不出空间**，故钉的是**形状**而不是数）。macOS
+**不受影响**：SDL 的 Cocoa 后端报显示模式本来就用**点**（`SDL_cocoamodes.c` 的 `mode->w =
+CGDisplayModeGetWidth`），与 `CGDisplayBounds` 同空间 ⇒ 这次改动在那边是 **no-op**；macOS 另有**相邻的一条**
+（`Stage.fullScreen*` 取可用区、`Capabilities.screenResolution*` 取整块，二者在 AIR 里本来就不同）仍在遗留表。
+
 `Capabilities.screenDPI` 同理是**常量基线**而非读取：Windows 96、其余平台 72（macOS 也是 72）。回答真实
 面板 DPI（144）会在**每一台** HiDPI 桌面上静默偏离。**残留偏离**：`Screen.bounds`/`visibleBounds` 按 AIR
 应是物理像素而我们仍报逻辑值（`sk_display_pixel_bounds` 未实装），已在 `TODO.md` 的 `遗留待开发` 登记。
@@ -869,6 +879,7 @@ macOS 自动跳过）。
 | 24 | ✅ **描述符成员已接线**（阶段二百零五）：`<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>` 七项解析进 `AirAppInfo.style` → 构建 define → 主窗的样式与几何（`systemChrome:none` 走 `SDL_WINDOW_BORDERLESS`）。**仍未接线**：`<transparent>`（只解析成属性，两端都没有真透明窗） | 写了 `<x>50</x><y>60</y>` 而窗口不在 `50,60` ⇒ 查 `ASC_WIN_X/Y` 是否落进 `sk_open_window` 的 `is_main` 分支（注意加的是**框**坐标 `+ c->b_left`） |
 | 25 | ⚠ **初始窗的 `<width>/<height>` 是「框」尺寸，我们当「客户区」**：adl 对 `<width>366</width><height>630</height>` 回读 `bounds=366x630` 而 `stage=350x591`；我们回读 `bounds=382x669`（stage 仍是 `366x630`），差 **16x39 = 边框**（macOS 同一条代码路径 ⇒ 预计差 32 的标题栏高度，本机不可实测） | 宿主程序按 `<width>` 摆的版式在 AIR 里是 350x591 的舞台。见 `TODO.md` 遗留行「初始窗的框/客户区单位」——**两端都有、非 Windows 专属**，改动会动到每扇窗的初始几何，须单独立项 |
 | 26 | ✅ **`maximize()`/`restore()` 的时点**（阶段二百零五）：adl 两者**都是异步**的 —— 调用当拍 `ds` 与 `bounds` 都不变（`normal 366x630`），下一拍才 `maximized 2576x1723`；`restore()` 同理，须再等一拍才回 `normal`。我们**同拍即达**，**终态一致**（差异只在「调用后的那一瞬间」） | 只在「调用后立刻读状态」的代码里可观测（宿主的 `if (stage.displayState == NORMAL) maximize()` 不受影响）；若要逐字对齐须把这两次调用排到帧边界 |
+| 27 | ✅ **显示度量：一个查询、一个写入者**（阶段二百零六）：150% 缩放下 `Capabilities.screenResolutionX/Y` 与 `Stage.fullScreenWidth/Height` 必须是**逻辑点**（`2560x1707`，与 adl 逐值相同），而 `Screen.bounds` 是**物理像素**（`3840x2560`） | 读到 `3840x2560`（1.5 倍，宿主窗口随之大 1.5 倍）⇒ 胶水里的 `g_display_w/h` **又被显示模式回填了**：它是个**缓存**，`sk_window_show*` 的任一条路径只要重新引入 `dm.w`/`dm.h` 写入，DIP 那条路立刻变死代码（钉 `unit: platform/DisplayMetrics`：一个查询 + 四个刷新点 + 无人从 `SDL_DisplayMode` 回填）。**注意**：100% 缩放的机器上**读数分不出**这两个空间 ⇒ 只能靠形状判 |
 
 > **阶段二百零四 补的实测证据（18–20 是修好后应对齐的口径）**：探针
 > `temp/nwwin/probe.c`（**直驱 SDL 2.32.10，不经我们任何代码**）+ `temp/nwwin/{mx-def,mx-nomax,mx-fix}.xml`

@@ -1467,6 +1467,12 @@ function checkDrawableReadable(): string[] {
 // while macOS -- where both queries agree -- matched: the fix is a different QUERY
 // (SDL_GetDisplayBounds, DIP-aware), not a divide, because the numbers alone cannot
 // tell the two spaces apart at 100% scaling.
+//
+// The query alone was not enough (阶段二百零六): that value is CACHED in the glue, and every
+// window-show path went on refilling the cache from the display MODE -- so the DIP query was
+// unreachable in any app that has a window, and the whole app answered 3840x2560 (with
+// Screen.bounds swapped against it: that one read 2560x1707 where adl reads 3840x2560). One
+// writer, one space.
 function checkDisplayMetrics(): string[] {
   let ok = 0;
   const bad: string[] = [];
@@ -1488,15 +1494,27 @@ function checkDisplayMetrics(): string[] {
   };
 
   // The query, not just the number: SDL_GetDisplayBounds is DIP-aware once
-  // SDL_HINT_WINDOWS_DPI_SCALING is set, SDL_GetCurrentDisplayMode is not.
-  const size = bodyOfIn(glue, 'int sk_window_get_display_size(');
+  // SDL_HINT_WINDOWS_DPI_SCALING is set, SDL_GetCurrentDisplayMode is not. It also has to be
+  // the ONLY writer of the cache, since the value is cached: a second writer in the pixel
+  // space makes the DIP query unreachable, which is exactly what shipped. Pinned as the
+  // invariant (one query, every refresh site) rather than as "the number is 2560", because
+  // the numbers alone cannot tell the two spaces apart on a 100% display.
+  const code = glue.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+  const refresh = bodyOfIn(code, 'static void sk_refresh_display_size_cache(');
+  const size = bodyOfIn(code, 'int sk_window_get_display_size(');
   check('the fullScreen*/screenResolution* query is the DIP-aware one',
-    size !== '' && /SDL_GetDisplayBounds\(0, &r\)/.test(size)
-    && !/SDL_GetCurrentDisplayMode/.test(size.replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/^[ \t]*\/\/.*$/gm, '')));
+    refresh !== '' && /SDL_GetDisplayBounds\(0, &r\)/.test(refresh)
+    && !/SDL_GetCurrentDisplayMode/.test(refresh));
+  check('...and nothing refills the cache from the physical display mode (one writer only)',
+    !/g_display_[wh] *= *dm\./.test(code)
+    && /if \(r\.w > 0\) g_display_w = r\.w;/.test(refresh)
+    // 3 window-show paths + the lazy branch in sk_window_get_display_size.
+    && (code.match(/sk_refresh_display_size_cache\(\);/g) || []).length === 4
+    && /sk_refresh_display_size_cache\(\);\n\s*if \(we_inited\) SDL_Quit\(\);/.test(size));
   check('the DIP-vs-pixels rationale is written down where it bit',
     glue.includes('SDL_GetDisplayBounds is DIP-aware') && glue.includes('150% scaling')
-    && glue.includes('matching adl value for'));
+    && glue.includes('matching adl value for')
+    && glue.includes('the cache can only ever hold the DIP-space value'));
 
   // screenDPI is a platform baseline, explicitly NOT the panel's DPI.
   const dpi = bodyOfIn(runtime, 'static double as_cap_screen_dpi(');
