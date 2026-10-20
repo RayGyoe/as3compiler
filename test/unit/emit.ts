@@ -2389,3 +2389,77 @@ function checkRenderBitmapLivePixels(): string[] {
 }
 registerGroup('unit: render/BitmapLivePixels', checkRenderBitmapLivePixels);
 
+// ---- a package class must not hijack a bare spelling of a language built-in ----
+//
+// The host app compiles as3corelib's `com.adobe.serialization.json.JSON`
+// alongside its own sources (it is under `src/`, so `--include-third-party` puts
+// it in the same class table). `resolveType`'s last-resort short-name alias then
+// maps the bare name `JSON` to that FQN, and a bare `JSON.parse(...)` with NO
+// import at all (BaseModel.as:21) looked like a static call on the third-party
+// class -- which declares only encode/decode/stringify -- so the whole app build
+// died with `undefined static method 'parse' on class 'JSON'`.
+//
+// AS3 precedence: a package-less built-in (JSON/System/Math/Capabilities) is
+// always in scope, while a package class is visible only after an import, so the
+// built-in must win for the bare spelling. The SECOND check pins the other half:
+// an explicit import still shadows the built-in, which is why the guard consults
+// the file's import alias before trusting the set.
+function checkStaticOnlyClassShadowing(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [shadow] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [shadow] ${label}`); }
+  };
+  // Two packages, because the hijack needs the foreign class to be OUT of the
+  // referring file's own package (a same-package class really does shadow, and
+  // that case must keep failing). Concatenating the two parses is exactly what
+  // the `--air-app` path hands codegen.
+  const merge = (parts: { body: unknown[]; imports: string[] }[]): { body: never; imports: string[] } =>
+    ({ body: parts.flatMap((p) => p.body) as never, imports: parts.flatMap((p) => p.imports) });
+  const lib = parse(`package acme.json {
+  public class JSON {
+    public static function decode(s:String):Object { return null; }
+  }
+}`);
+  const plain = parse(`package acme.app {
+  public class Probe {
+    public static function run(s:String):Object { return JSON.parse(s); }
+  }
+}`);
+  // The helper's own definition is always in the runtime preamble, so the number
+  // of occurrences -- not mere presence -- tells a CALL apart from the definition.
+  const calls = (c: string): number => [...c.matchAll(/as_json_parse\(/g)].length;
+
+  let cPlain = '';
+  let threw = '';
+  try {
+    cPlain = generateC(merge([lib, plain])).c;
+  } catch (e) {
+    threw = String(e);
+  }
+  check('a bare JSON.parse compiles even when another package declares a JSON class', threw === '');
+  if (threw !== '') console.log(`      (threw: ${threw.split('\n')[0]})`);
+  check('...and it CALLS the built-in parse helper (definition + call)',
+    calls(cPlain) === 2);
+  check('...while the foreign class is still emitted under its own package',
+    cPlain.includes('acme_json_JSON'));
+
+  // The other half of AS3 precedence: an explicit import wins over the built-in.
+  const imported = parse(`package acme.app {
+  import acme.json.JSON;
+  public class Probe2 {
+    public static function run(s:String):Object { return JSON.decode(s); }
+  }
+}`);
+  const cImported = generateC(merge([lib, imported])).c;
+  check('an explicit import still resolves the foreign class',
+    cImported.includes('acme_json_JSON_decode_static('));
+  check('...and the built-in parse helper is never called in that build',
+    calls(cImported) === 1);
+
+  console.log(`     [shadow] ${ok} built-in shadowing check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/StaticOnlyClassShadowing', checkStaticOnlyClassShadowing);
+
