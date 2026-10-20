@@ -9610,8 +9610,18 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('');
     // built-in RegExp: compiles the pattern at construction (runtime), exposes
-    // source/flags/lastIndex and the boolean flags, and provides exec/test. A
-    // compile error throws SyntaxError (an Error subclass).
+    // source/flags/lastIndex and the boolean flags, and provides exec/test.
+    //
+    // A pattern that does not compile is NOT an error in AVM2. RegExpObject's
+    // completeInitialization() calls RegExp::compile() and then throws the
+    // reported error away (avmplus core/RegExp.cpp stores it in *errorptr and
+    // core/RegExpObject.cpp never reads it back), so the object survives with
+    // m_compiledData == NULL and every exec returns < 0, i.e. "no match". ES3
+    // says SyntaxError; AIR is the oracle here, so we keep the inert regex:
+    // exec -> null, test -> false, String.replace -> subject unchanged.
+    // Evidence: talkmed-meeting builds new RegExp("[") on EVERY recognised
+    // real-time-translation sentence (AISubTitleSetupWindow.sqliteEscape), which
+    // runs fine on adl but threw here and swallowed the whole subtitle stream.
     this.line('void RegExp_ctor(RegExp* o, char* pattern, char* flags) {');
     this.indent++;
     this.line('o->source = pattern;');
@@ -9625,7 +9635,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('o->dotall = (flags != NULL && strchr(flags, \'s\') != NULL);');
     this.line('o->extended = (flags != NULL && strchr(flags, \'x\') != NULL);');
     this.line('o->compiled = as_regex_compile(pattern, flags);');
-    this.line('if (o->compiled->err) as_throw(SyntaxError_new((char*)o->compiled->errmsg, 0));');
+    this.line('// Inert when the pattern failed to compile: as_regex_search returns -1 on err.');
     this.indent--;
     this.line('}');
     this.line('RegExp* RegExp_new(char* pattern, char* flags) {');

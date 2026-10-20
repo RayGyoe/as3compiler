@@ -8021,6 +8021,10 @@ static int as_re_vm(as_re_ctx* ctx, int pc, int sp, int depth) {
 // fills cap (group 0 = whole match, groups 1..n = captures) and returns the
 // match start; out_end receives the match end. Returns -1 on no match.
 static int as_regex_search(as_regex* re, const char* str, int len, int from, int* cap, int* out_end) {
+    // A pattern that did not compile never matches (AVM2 keeps the PCRE error
+    // silent instead of throwing -- see RegExp_ctor). Without this guard the VM
+    // would run the zero-instruction program, where ins[0] is a zeroed AS_RE_CHAR.
+    if (re == NULL || re->err) return -1;
     as_re_ctx ctx;
     ctx.re = re; ctx.str = str; ctx.len = len; ctx.cap = cap; ctx.steps = 0;
     for (int i = from; i <= len; i++) {
@@ -8083,6 +8087,12 @@ static as_regex* as_regex_compile(const char* pattern, const char* flags) {
     c.ngroups = 0;
 
     as_re_comp_alt(&c);
+    // A leftover ')' at top level is an error (PCRE2: unmatched closing
+    // parenthesis). Without this check the sequence compiler simply stops at the
+    // ')' and the program collapses to "match the empty string", so a pattern
+    // like ")" would match at every position instead of being inert -- that is
+    // exactly what String.replace does NOT do on AIR.
+    if (!re->err && c.pos < c.len) as_re_err(&c, "unmatched closing parenthesis");
     if (!re->err) as_re_emit(re, AS_RE_MATCH, 0, 0, 0);
     re->ngroups = c.ngroups;
 

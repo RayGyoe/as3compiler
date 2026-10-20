@@ -2243,3 +2243,60 @@ function checkRuntimeUnwindStackPerThread(): string[] {
   return bad;
 }
 registerGroup('unit: runtime/UnwindStackPerThread', checkRuntimeUnwindStackPerThread);
+
+// ---- RegExp construction is INERT on an uncompilable pattern (adl 51.4.1) ----
+// This is the real-time-translation bug in talkmed-meeting: every recognised
+// sentence goes through AISubTitleSetupWindow.sqliteEscape, which does
+// StringCore.replaceAllByRegex(keyWord, "[", "/[") and therefore builds
+// new RegExp("[") -> a PCRE2 compile failure. AVM2 keeps that failure silent
+// (core/RegExpObject.cpp::completeInitialization calls RegExp::compile and never
+// reads the reported error back), so on AIR the object merely never matches; our
+// emitter used to throw SyntaxError there, which aborted the recognition message
+// handler BEFORE the AI_SUBTITLE_MSG dispatch, so the subtitle window opened and
+// stayed empty forever. The runtime behaviour is pinned by examples/regexp.as;
+// the emitter shape is pinned here, because that is what a refactor re-breaks.
+function checkRegExpInertConstruction(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [regexp-inert] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [regexp-inert] ${label}`); }
+  };
+  const c = generateC(parse('var r:RegExp = new RegExp("a", "g");\ntrace(r);\n')).c;
+  const body = (sig: string): string => {
+    const i = c.indexOf(sig);
+    if (i < 0) return '';
+    const j = c.indexOf('\n}', i);
+    return c.slice(i, j < 0 ? c.length : j);
+  };
+
+  // 1. The constructor never throws: the compile error is recorded on the regex
+  //    (as_regex.err) and surfaces as "no match", exactly like AVM2.
+  const ctor = body('void RegExp_ctor(RegExp* o, char* pattern, char* flags) {');
+  check('RegExp_ctor is emitted', ctor.length > 0);
+  check('RegExp_ctor does not throw on a bad pattern', !/as_throw|SyntaxError_new/.test(ctor));
+  check('RegExp_ctor still compiles the pattern', ctor.includes('o->compiled = as_regex_compile(pattern, flags);'));
+
+  // 2. Every consumer must consult that error flag, or the zero-instruction
+  //    program would run and match at position 0.
+  check('as_regex_search bails out on err', c.includes('if (re == NULL || re->err) return -1;'));
+  check('RegExp_exec bails out on err', c.includes('if (re->compiled == NULL || re->compiled->err) return NULL;'));
+  check('RegExp_test bails out on err', c.includes('if (re->compiled == NULL || re->compiled->err) return false;'));
+
+  // 3. A stray ')' must be a COMPILE error, not a silent stop. A sequence
+  //    compiler that merely stops at the ')' leaves a zero-instruction program,
+  //    which matches the empty string at every offset -- String.replace on such
+  //    a "never matching" pattern would splice the replacement between every
+  //    pair of characters.
+  check('a stray ) is reported as a compile error',
+    c.includes('unmatched closing parenthesis') &&
+    c.includes('if (!re->err && c.pos < c.len) as_re_err(&c, "unmatched closing parenthesis");'));
+
+  // 4. A lone ']' outside a class stays an ordinary literal (PCRE2), so the
+  //    check above must not turn into a blanket "reject anything odd".
+  check('the class compiler still owns [..]', c.includes('static int as_re_comp_class(as_re_comp* c) {'));
+
+  console.log(`     [regexp-inert] ${ok} RegExp-inert check(s) passed`);
+  return bad;
+}
+registerGroup('unit: runtime/RegExpInertConstruction', checkRegExpInertConstruction);
