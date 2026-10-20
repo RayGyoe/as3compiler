@@ -23,11 +23,11 @@
 // both asserted here: a CHILDLESS element (markup vs text) and a ONE-item XMLList
 // (the item's markup vs the item's string value).
 //
-// KNOWN DEVIATION, deliberately NOT asserted (registered in TODO.md): our parser
-// folds every text run of a mixed-content element into ONE trimmed blob, so
-// <a>a<b/>b</a> emits "<a>\n  ab\n  <b/>\n</a>" where adl interleaves the runs
-// ("<a>\n  a\n  <b/>\n  b\n</a>"). Entities are likewise echoed verbatim rather
-// than decoded and re-escaped (a parser gap, not a serialiser one).
+// Mixed content, text nodes and entity handling used to be the parser's gap (that
+// file asserted NOTHING about them). They are implemented now -- text runs and
+// elements keep document order, and entities decode on input and re-escape on
+// output -- so those values live in examples/e4x-text-mixed.as, which pins the
+// three parser residuals.
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 

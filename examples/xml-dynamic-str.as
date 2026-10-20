@@ -35,9 +35,13 @@ var bag:Object = { k: x };
 check(bag.k == "你好", "a dynamic property holding an XML");
 
 // --- 3. an XMLList takes the same path (0 items -> "", 1 item -> the item's text)
-var emptyList:XMLList = x.*;
+// The empty list comes from a NAMED axis with no match: the WILDCARD axis `.*`
+// includes TEXT nodes (adl 51.4.1: <a>t<b/></a> has two children for `.*`), so
+// x.* on <a>你好</a> is a one-item list holding the text node, not an empty list.
+var emptyList:XMLList = x.nope;
 var s0:String = emptyList;
 check(s0 == "", "an empty XMLList stringifies to the empty string, got '" + s0 + "'");
+check(x.*.length() == 1 && String(x.*) == "你好", "the wildcard axis includes the text child");
 var attr:XMLList = <b n="v"/>.@n;
 check(attr.toString() == "v", "an attribute list stringifies to the attribute value");
 

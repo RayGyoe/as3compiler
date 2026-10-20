@@ -982,16 +982,22 @@ int sk_clipboard_get_text(char* buf, int cap) {
 }
 
 #if defined(__APPLE__)
-// True for the eight modifier scancodes. Used by the macOS duplicate filter
-// below; the modifier KEYS are the only ones whose platform path can report a
-// single physical transition twice, so only this build needs the helper.
-static int sk_is_modifier_scancode(SDL_Scancode sc) {
+// The AIR keyCode of a modifier scancode, or 0 when the key is not a modifier.
+//
+// KEYED ON AIR'S KEYCODE, NOT ON THE SDL SCANCODE — that is the whole point.
+// AS3's KeyboardEvent cannot see sides: both Shift keys are keyCode 16, both
+// Control keys 17, both Alt keys 18, both Command keys 15. Measured on
+// adl 51.4.1 (macOS 26.6.2): pressing LSHIFT then RSHIFT yields exactly ONE
+// keyDown + ONE keyUp on the AS3 side, and the same holds for L/R Control, Alt
+// and Command -- harness and per-variant logs in temp/shiftdup/. SDL reports
+// them as four separate scancodes, so a scancode-keyed filter cannot collapse
+// them -- and collapsing is what AIR does.
+static int sk_modifier_keycode(SDL_Scancode sc) {
   switch (sc) {
-    case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_RSHIFT:
-    case SDL_SCANCODE_LCTRL:  case SDL_SCANCODE_RCTRL:
-    case SDL_SCANCODE_LALT:   case SDL_SCANCODE_RALT:
-    case SDL_SCANCODE_LGUI:   case SDL_SCANCODE_RGUI:
-      return 1;
+    case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_RSHIFT: return 16;
+    case SDL_SCANCODE_LCTRL:  case SDL_SCANCODE_RCTRL:  return 17;
+    case SDL_SCANCODE_LALT:   case SDL_SCANCODE_RALT:   return 18;
+    case SDL_SCANCODE_LGUI:   case SDL_SCANCODE_RGUI:   return 15;
     default:
       return 0;
   }
@@ -1000,9 +1006,9 @@ static int sk_is_modifier_scancode(SDL_Scancode sc) {
 // The last modifier transition actually handed to the AS3 side. File scope
 // because SDL keeps ONE keystate[] for the whole process (src/events/
 // SDL_keyboard.c), not one per window.
-static Uint32 g_mod_last_scancode = 0;
-static int    g_mod_last_down = -1;
-static int    g_mod_last_valid = 0;
+static int g_mod_last_keycode = 0;
+static int g_mod_last_down = -1;
+static int g_mod_last_valid = 0;
 #endif
 
 // ---------- system move/resize (NativeWindow.startMove / startResize) ----------
@@ -1234,37 +1240,44 @@ static void sk_run_loop(void) {
         case SDL_KEYDOWN:
         case SDL_KEYUP:
 #if defined(__APPLE__)
-          // MODIFIER DOUBLE-SOURCE SUPPRESSION (macOS only).
+          // MODIFIER COALESCING (macOS only).
           //
-          // The cocoa backend reports ONE physical modifier transition TWICE:
-          // `Cocoa_DispatchEvent` (src/video/cocoa/SDL_cocoaevents.m:95-99)
-          // feeds BOTH `NSEventTypeKeyDown`/`KeyUp` AND
-          // `NSEventTypeFlagsChanged` into `Cocoa_HandleKeyEvent`. A modifier
-          // press therefore reaches `SDL_SendKeyboardKey` from keyDown:/keyUp:
-          // (SDL_cocoakeyboard.m:413/437) and AGAIN from `flagsChanged:` ->
-          // `HandleModifiers` (SDL_cocoakeyboard.m:200, 232-236). The second
-          // call finds keystate[scancode] already in the requested state, sets
-          // `repeat = SDL_TRUE` and posts anyway (src/events/SDL_keyboard.c:
-          // 846-861) -- two byte-identical SDL_KEYDOWN for the same scancode.
+          // AIR dispatches a modifier by KEYCODE, so the two physical sides of
+          // one modifier look like the same key to AS3: LSHIFT and RSHIFT are
+          // both keyCode 16 (measured on adl 51.4.1, macOS 26.6.2 -- press L
+          // then R and the app sees ONE keyDown and ONE keyUp; likewise for
+          // Control 17, Alt 18, Command 15). SDL, on the other hand, reports
+          // four distinct scancodes, and the Cocoa backend can also emit BOTH
+          // sides from one `NSEventTypeFlagsChanged`: `Cocoa_DispatchEvent`
+          // (src/video/cocoa/SDL_cocoaevents.m:95-99) hands every keyboard
+          // NSEvent to `Cocoa_HandleKeyEvent` ONCE, and that function's
+          // FlagsChanged arm calls `HandleModifiers`
+          // (src/video/cocoa/SDL_cocoakeyboard.m:200), which consults the
+          // event's modifier flags for EVERY scancode in the family. A
+          // synthetic event carrying only the generic Shift bit therefore
+          // presses LSHIFT and RSHIFT at once. Either way the AS3 side would
+          // receive two byte-identical keyDowns where adl delivers one.
           //
-          // adl delivers exactly ONE, so the extra one is our fidelity gap
-          // (TODO.md "窗口键盘通道把 Shift 自身的 keyDown/keyUp 各派发两次").
-          // A real macOS keyboard cannot auto-repeat a modifier -- holding
-          // Shift yields no `repeat` keyDowns -- so two CONSECUTIVE events with
-          // the same scancode AND the same direction cannot come from hardware.
-          // `repeat` alone is not a sufficient test (the KEYUP half of the
-          // artefact carries no repeat flag at all), hence (scancode,
-          // direction). Deliberately NOT done on Windows, which does
-          // auto-repeat modifiers: there the repetition is real input.
-          if (sk_is_modifier_scancode(e.key.keysym.scancode)) {
-            int down = (e.type == SDL_KEYDOWN) ? 1 : 0;
-            if (g_mod_last_valid && g_mod_last_scancode == e.key.keysym.scancode &&
-                g_mod_last_down == down) {
-              break;
+          // So the filter keys on (AIR keyCode, direction), not on the SDL
+          // scancode and not on SDL's `repeat` (a modifier's KEYUP half
+          // carries no repeat flag at all). Holding a modifier produces no
+          // repeats on macOS, hence a repeat of the same (keyCode, direction)
+          // cannot be real input. Deliberately NOT done on Windows, which does
+          // auto-repeat modifiers: there the repetition is real input. (The
+          // TODO.md row about Shift being dispatched twice was removed in stage
+          // 209, when all of this was re-measured on macOS.)
+          {
+            int mod_kc = sk_modifier_keycode(e.key.keysym.scancode);
+            if (mod_kc != 0) {
+              int down = (e.type == SDL_KEYDOWN) ? 1 : 0;
+              if (g_mod_last_valid && g_mod_last_keycode == mod_kc &&
+                  g_mod_last_down == down) {
+                break;
+              }
+              g_mod_last_keycode = mod_kc;
+              g_mod_last_down = down;
+              g_mod_last_valid = 1;
             }
-            g_mod_last_scancode = e.key.keysym.scancode;
-            g_mod_last_down = down;
-            g_mod_last_valid = 1;
           }
 #endif
           // Auto-repeat is NOT filtered: measured on adl 51.4.1 by posting

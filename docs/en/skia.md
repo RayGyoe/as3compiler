@@ -993,6 +993,13 @@ no parseable face can reproduce it. We **do not** hard-code a table interpolated
 bench and register it as a leftover item in `TODO.md`. Likewise the line heights of `Courier New` / `Arial`
 each have a 0.5 px residual (Skia's internal rounding direction for half pixels), also recorded.
 
+> **Thinking of replacing this layout engine? Read [`rust-text-backend.md`](rust-text-backend.md) first** —
+> that document evaluates, platform by platform, the pros and cons of swapping SkParagraph for a
+> cosmic-text + swash static library, with the measured size account (the ICU data is **one indivisible
+> 9.71 MB object**, and **an application that draws no text pays it too**), and explains why the
+> conclusion is "do `-dead_strip` and `skia_use_icu4x` first; only touch the Rust backend for mobile
+> plus a hard size constraint".
+
 ---
 
 ## 9. Image Decoding (`BitmapData.loadBytes` / `Loader`)

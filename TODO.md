@@ -12119,17 +12119,22 @@ AIR 唯一做的编码是**操作系统路径极限处的兜底**（`##<哈希>/
 
 现象（2026-10-04 用 `Quartz.CGEventCreateKeyboardEvent` 只 post 一次 Shift，vk=56）：`adl` 记 1 条 `KEY keyDown kc=16` + 1 条 `KEYUP`，AOT 记 **2 条**（同一毫秒、内容逐字相同）。
 
-读 SDL 2.32.10 源码定位到根因（**不是我方重复派发** —— `sk_run_loop` 一轮只转一次 `SDL_PollEvent`，`ASC_window_on_key` 也只有一个 `Stage_dispatchKey` 调用点）：
+读 SDL 2.32.10 源码时的**第一版根因写法是错的**，已在阶段二百零九 复核时就地改正（保留在此是为了让后来人看到纠正过程，而不是让错的说法继续流传）：
 
-1. Cocoa 后端把 `NSEventTypeKeyDown/KeyUp` **和** `NSEventTypeFlagsChanged` **都**喂进同一条 `Cocoa_HandleKeyEvent`（`src/video/cocoa/SDL_cocoaevents.m:95-99`）；
-2. 而 `keyDown:`/`keyUp:`（`SDL_cocoakeyboard.m:413/437`）与 `flagsChanged:` → `HandleModifiers`（`:200`，在 `:440-450` 被调用）**各自**调一次 `SDL_SendKeyboardKey`；
-3. 第二次发现 `keystate[scancode]` 已按下，只把 `repeat` 置 `SDL_TRUE` 并**照常投递**（`src/events/SDL_keyboard.c:846-861`）⇒ 两条逐字节相同的 `SDL_KEYDOWN`。
+1. ~~Cocoa 后端把 `NSEventTypeKeyDown/KeyUp` 和 `NSEventTypeFlagsChanged` 都喂进同一条 `Cocoa_HandleKeyEvent`~~ —— 这一条**对**（`src/video/cocoa/SDL_cocoaevents.m:95-99`），但它是**按 `[theEvent type]` 分派**，一个 `NSEvent` 只进一个分支；
+2. ~~`keyDown:`/`keyUp:` 与 `flagsChanged:` → `HandleModifiers` 各自调一次 `SDL_SendKeyboardKey`~~ —— 这一条**把两个不同事件的分支读成了同一次事件的两次调用**。`Cocoa_HandleKeyEvent`（`SDL_cocoakeyboard.m:386-455`）在 `NSEventTypeKeyDown` 分支调**一次** `SDL_SendKeyboardKey`，在 `NSEventTypeFlagsChanged` 分支调 `HandleModifiers`，二者互斥；
+3. 因此「一次物理跳变 → 两条 `SDL_KEYDOWN`」在 2.32.10 上**不成立**。真正会多出事件的两种形态是：① 同一修饰键的**左右两侧**（SDL 是 LSHIFT 225 / RSHIFT 229 两个 scancode，而 `adl` 只有 keyCode 16）；② `HandleModifiers`（`:200`）按事件的 `modflags` 把**整个修饰键家族**逐个数一遍，于是「只带通用 Shift 位的合成事件」会同时按下 LSHIFT 与 RSHIFT。两者在 AS3 侧都表现为**两条逐字相同的 `kc=16`**。
 
-**判据**：真实键盘的修饰键**不会**自动重复，所以「连续两条同 `(scancode, 方向)` 的修饰键跳变」不可能来自硬件，只能是上述双路径。我方 `sk_run_loop` 刻意**不过滤**重复键（`adl` 对字母键确实派发 9/9 次重复），所以第二条被照转 ⇒ AOT 记 2、`adl` 记 1。
+**判据**：真实键盘的修饰键**不会**自动重复，所以「连续两条同 `(AIR keyCode, 方向)` 的修饰键跳变」不可能来自硬件。我方 `sk_run_loop` 刻意**不过滤**重复键（`adl` 对字母键确实派发 9/9 次重复），所以多出来的那条被照转 ⇒ AOT 记 2、`adl` 记 1。
 
-**修法**（`vendor/window_glue.cc`）：新增 `sk_is_modifier_scancode()`（LSHIFT/RSHIFT/LCTRL/RCTRL/LALT/RALT/LGUI/RGUI 八个）+ 三个文件级状态 `g_mod_last_scancode`/`g_mod_last_down`/`g_mod_last_valid`，**仅在 `#if defined(__APPLE__)` 内**丢弃「与上一跳变同 `(scancode, 方向)`」的修饰键事件。**Windows 刻意不动**：那边的修饰键**确实**会自动重复，未实测不盲改。
+**修法**（`vendor/window_glue.cc`）：新增 `sk_modifier_keycode()`（把八个修饰键 scancode 映回 **AIR 的 keyCode**：Shift 16 / Ctrl 17 / Alt 18 / Cmd 15）+ 三个文件级状态 `g_mod_last_keycode`/`g_mod_last_down`/`g_mod_last_valid`，**仅在 `#if defined(__APPLE__)` 内**丢弃「与上一跳变同 `(AIR keyCode, 方向)`」的修饰键事件。**刻意不按 scancode 去重**：那样只能抓住「同一条 scancode 出现两次」，而 2.32.10 的实际多余来源是**同族不同侧**。**Windows 刻意不动**：那边的修饰键**确实**会自动重复，未实测不盲改。
 
-**未复核（不静默）**：本机是 Windows，**无法运行时复现 macOS-only 现象**。已钉 `unit: text-input/ModifierKey`（6 项：scancode 覆盖齐全、`#if defined(__APPLE__)` 作用域、按 `(scancode, 方向)` 配对、位置在派发**之前**、派发点仍只有一处、SDL 源文件行号引用在位）；**待 macOS 复核**：用原 `temp/editprobe/` 驱动重跑，确认 AOT 侧 Shift 只剩 1 条且字母键 9/9 重复不受影响。
+**2026-10-20 复核（阶段二百零九，macOS 26.6.2 + SDL 2.32.10）**：证据台 `temp/shiftdup/`（`measure.py` 每个 variant 都起**全新进程**，激活用 `NSRunningApplication` + `osascript` 双口径校验，探针把每条 KEY 事件立即写入固定路径的日志）。结论：
+
+- **原症状不复现**：单次 Shift 跳变（plain）两端都是 1 条 keyDown + 1 条 keyUp；把 SDL 事件层逐条打出来也只有**一条** `type=768 sc=225` + 一条 `type=769` ⇒ 不是「被我们滤掉了」，而是**本来就只有一条**。
+- **左右两侧才是真差异**：同时按 L+R 时 `adl` 只发一对，AOT 原先发两对（两条 `kc=16` 下 + 两条上）；Ctrl/Alt/Cmd 各自同样（`kc=17/18/15`）。这正是「两条逐字相同」的签名，而按 scancode 去重的旧守卫**对它无效**（225≠229）。
+- **改按 AIR keyCode 合并后，8 组 stimulus 双端逐行相同**（`temp/shiftdup/results/summary.txt` 全部 `IDENTICAL`）：plain、Shift+字母（`kc=65 cc=65`）、字母 9/9 重复、左右 Shift、左右 Ctrl、左右 Alt、左右 Cmd、只剩通用修饰位的合成事件。
+- **不误伤真输入**：字母/方向键的自动重复仍 9/9 全过（`seqrepeat` 两端 12 行逐行相同），因为合并只作用于修饰键且键在 `(keyCode, 方向)`。
 
 ---
 
@@ -13237,7 +13242,80 @@ install name）；② **一个平台分支能藏多久，取决于另一个平�
 服务两种架构 ⇒ 夹具与宿主库**必须**默认通用，arm64-only 的夹具在 Intel 机器上会被 dyld 直接拒掉，而 AIR 自己的 macOS
 运行时就是通用的。
 
+### 阶段二百零八：E4X 的最后三条残余 —— 文本节点、混合内容、实体（v0.4.188 → v0.4.189）✅ 已完成
+
+**立项**：遗留表最后一条 E4X 行。阶段一百九十三 修掉了它的前两条（`toXMLString()` 未实现、标记不按 AIR 重排），
+行内改记**剩下的三条残余**：① `new XML("plaintext")` 在 AIR 是**文本节点**，我们对「根元素之前的游离文本」
+返回 NULL ⇒ 构造时就响亮 `XML parse error`；② 混合内容被折叠成**一个** trim 过的文本块（`<a>a<b/>b</a>` 输出
+`<a>\n  ab\n  <b/>\n</a>`），而 AIR 按**文档序交错**；③ 解析**不解码**实体（`&#65;` 永远出不来 `A`），
+且因为不解码，输出侧**不能**补转义。
+
+**三条同源，全在解析器**——DOM 用单个 `text` 槽建模，把「文本」与「子件」当成两个正交维度，而它们在 E4X 里
+是**同一个序列**的两种元素。于是这轮不是「修三个 bug」，而是**换掉一个数据模型**：
+
+1. **文本节点即普通节点**（`as_xml_node.name == NULL` 即文本/CDATA，另带 `int cdata` 区分标记形态）。
+   `new XML(...)` 的参数里**没有 `<`** 就是文本节点，`localName()`/`name()` 返回 `null`、`text()` 返回 `""`
+   （`text()` 选的是**文本子节点**，文本节点自己没有子节点）、`length()` 为 1。
+2. **子件序列按文档序**：`as_xml_sc_element` 每遇一个文本 run 就 `as_xml_buf_push(children, as_xml_text_new(...))`，
+   元素与文本**交错**落进同一个 `children` 数组；节点自带的 `text` 槽降级为**直接文本子件的拼接缓存**（供
+   `text()` 与字符串值用）。随之定死两条口径：**恰好一个**非元素子节点才内联（否则逐层缩进），**纯白空格 run
+   丢弃、解码后才变空的 run 保留为空节点**（`<a>&#32;</a>` 输出 `<a></a>`）。
+3. **实体在解析期解码、在输出期按上下文转义**（两条互斥的规则终于各归一侧）：命名实体五个 + `&nbsp;`→**U+FFA0**
+   （AIR 怪癖，不是 U+00A0）+ 数值引用（`&#DDD;`/`&#xHHH;`，**仅 ≤ U+FFFF**）；未知实体、`&#0;`、超 BMP 的
+   引用**原样保留**。转义集分两类：文本 `&`/`<`/`>`；属性值 `&`/`<`/`"` + TAB/LF/CR → `&#x9;`/`&#xA;`/`&#xD;`
+   （`>` 与 `'` **不转**）。CDATA 内容字面量保留，序列化时**仍以 CDATA 形态**重发。
+
+**报错口径也一并收口**：旧实现一律 `#1090`，现在按 `adl` 分成**三类**——`#1085`（未闭合/不匹配，文案点名
+**打开**的那个元素）、`#1088`（根元素之外还有标记或游离文本）、`#1090`（标签畸形/起始标签内 EOF/属性未加引号），
+且都是 `TypeError`，`errorID` 可直接断言。
+
+**验收**：差分探针 `temp/e4xres/diff/`（同一份断言体，一边跑 `adl 51.4.1`、一边跑 AOT 产物）**63 条记录逐字节一致**；
+端到端 `examples/e4x-text-mixed.as`（57 条断言）；结构钉 `unit: e4x/TextNodes`（29 条）。顺带被这轮**逼出来**的
+两处旧断言已按其真值改写：`examples/xml-dynamic-str.as` 曾把 `x.*` 当「空列表」用（AIR 的通配轴**含文本节点**，
+故 `<a>你好</a>` 的 `.*` 是**一项**），`examples/lang-superset.as` 曾把 `xml..*` 的文本节点差记作「已知分歧」
+（现为 4 = 2 元素 + 2 文本）。`unit: e4x/ToXMLString` 与 `unit: reflect/PropBoxing` 里四条按旧 DOM 写法钉的
+断言同步改到新写法（「无元素子节点」而非「无子节点」）。
+
+**closure 三条**：① **「模型错了，补丁就永远是补丁」** —— 前两条残余当年被记成「解析器欠账、序列化无关」，
+修的时候才发现序列化的内联/缩进规则**依赖** DOM 的形状（`child_count == 0` 这个判据本身就是折叠模型的产物）；
+② **AIR 的怪癖要照抄，不要顺手修正** —— `&nbsp;`→U+FFA0、超 BMP 引用不解码、属性 `>` 不转义，三条都「看起来像
+bug」，但它们是可观测行为，改「对」了就是偏差；③ **同一份断言体两边跑**比读文档可靠：63 条里有一半（CDATA 的
+trim 规则、注释切分文本 run、`&#32;` 的空节点、属性 `>`）是文档里没有、只能实测出来的。
+
+---
+
+### 阶段二百零九：Shift 双派发的 macOS 复核 —— 修饰键按 AIR keyCode 合并（v0.4.189 → v0.4.190）✅ 已完成
+
+**触发**：`### 遗留待开发` 的「窗口键盘通道把 Shift 自身的 keyDown/keyUp 各派发两次」行 —— 状态栏自阶段一百九十 起写着「已修 + macOS 运行时**待复核**」（那一轮在 Windows 上写的守卫），用户要求复核并在确认后移除该行。
+
+**证据台**：`temp/shiftdup/`（同一份 AS3 探针 `probe.Main`、同一个 pyobjc CGEvent 驱动，adl 与 AOT 各跑一遍；每个 variant 起**全新进程**，用法与四个坑见其 `README.md`）。
+
+**实测**（macOS 26.6.2 / SDL 2.32.10 / `adl 51.4.1`）：
+
+| stimulus | `adl` | 复核前 AOT | 复核后 AOT |
+|---|---|---|---|
+| 单次 Shift（vk=56 down/up） | 1 keyDown + 1 keyUp | 同 | 同 |
+| Shift + `a`（字母带 Shift 位） | Shift 1+1；`a` `kc=65 cc=65` | 同 | 同 |
+| Shift + `a` 再 8 条 autorepeat | `a` **9 条 keyDown** + 1 keyUp | 同 | 同 |
+| 左右 Shift 先后 | **1+1** | **2+2** | 1+1 |
+| 左右 Ctrl / Alt / Cmd | **1+1**（`kc=17/18/15`） | **2+2** | 1+1 |
+| 只带通用修饰位的合成事件 | **1 条 keyDown** | **2 条 keyDown** | 1 条 keyDown |
+
+**结论**：
+
+1. **原症状不复现**。单次 Shift 跳变时 SDL 事件层只产生**一条** `type=768 sc=225` + 一条 `type=769`（临时把 `sk_run_loop` 收到的每条 SDL_KEY 事件写盘后数出来的）⇒ 不是「被我们滤掉了」，而是本来就只有一条。
+2. **阶段一百九十 的根因写法是错的**，已在原节就地改正（保留纠正痕迹）：`Cocoa_DispatchEvent` 确实把三类键盘事件都送进 `Cocoa_HandleKeyEvent`，但那是**按 `[theEvent type]` 分派**，一个 `NSEvent` 只进一个分支；`keyDown:`/`keyUp:` 与 `flagsChanged:` → `HandleModifiers` 是**不同事件**的分支，不是同一次事件的两次调用。
+3. **「两条逐字相同的 `kc=16`」的真来源是修饰键的左右两侧**：AS3 的 `KeyboardEvent` 只有一维 keyCode（Shift 16 / Ctrl 17 / Alt 18 / Cmd 15），`adl` 对同时按下的 L+R 只派发一对；SDL 按 scancode 报两个键。另一条同源路径是 `HandleModifiers` 按 `modflags` 把整个家族逐个数一遍，于是「只带通用 Shift 位的合成事件」会同时按下 LSHIFT 与 RSHIFT。
+4. **旧守卫按 scancode 去重，对这两种形态都不生效**（225≠229）—— 这正是该行「修了又回来」的原因。现改为按 **(AIR keyCode, 方向)** 合并：`sk_modifier_keycode()` 把八个修饰键 scancode 折回 16/17/18/15，仍**只在 `#if defined(__APPLE__)` 内**生效（Windows 的修饰键**确实**会自动重复，那里的重复是真输入）。
+
+**验收**：`temp/shiftdup/results/summary.txt` 八行全部 `IDENTICAL`（双端逐行相同，含 9/9 重复与四种修饰键的左右两侧）；结构钉 `unit: text-input/ModifierKey` **7 条**（新增「LSHIFT/RSHIFT 折叠到同一 keyCode」这一条 —— 没有它，只按 scancode 匹配的旧写法照样全绿）；`node --test --test-name-pattern=… text-input.ts` 绿。遗留表**移出 1 行**（总项数 95 → 94，`已修` 4 → 3；分状态计数按实际行数重数后见遗留表头部那条笔记）。版本 → **v0.4.190**。
+
+**closure 三条**：① **「钉住一个症状，不等于钉住它的原因」** —— 阶段一百九十 的守卫对**同 scancode 重复**有效，但可观测症状的来源是**同族不同侧**，于是「守卫在、症状回」；删行前必须用**症状签名**（两条逐字相同的 `kc=16`）去反推输入，而不是用当时的假设去反推。② **按实现细节去重，会漏掉同一语义的另一种表示** —— scancode 是 SDL 的坐标，keyCode 才是 AS3 的坐标；过滤器的键必须与**被观测的那一层**同构。③ **跨平台 `#if` 里的守卫没有本机运行时证据就是未验证的假设** —— 本轮把它从「假设」变成「实测」，顺带发现原来那段源码论证也是误读。
+
 ### 遗留待开发
+> **2026-10-20 追加（阶段二百零九：Shift 双派发的 macOS 复核与收口）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数（**且本轮顺带按状态首词重新统计了一遍 —— 此前几条笔记里的分状态计数已经漂了，以本行为新基准**）：本表 **95 → 94 项**；`未开始` **71** / `部分完成` **18**（其中 4 行未加粗）/ `已修` **4 → 3** / `调研完成·实现暂缓` **1** / `已记录` **1**。**移出 1 行**是「窗口键盘通道把 **Shift 自身**的 keyDown/keyUp **各派发两次**（AOT 独有）」—— 该行状态栏自阶段一百九十 起就是「已修 + macOS 运行时**待复核**」，本轮在 macOS 上把它复核到底：**原症状不成立**（一次真实 Shift 跳变两端都是 1 条 keyDown + 1 条 keyUp，SDL 事件层也只投一条），而**同一签名（两条逐字相同的 `kc=16`）的唯一可复现来源**是「同一修饰键的左右两侧」—— `adl` 的 `KeyboardEvent` 只有一维 keyCode（Shift 16 / Ctrl 17 / Alt 18 / Cmd 15），同时按左右两侧只派发一对，而 SDL 按 scancode 报两个键，旧守卫按 scancode 去重因此**对它不生效**（这正是该行反复复活的根因）。已把守卫改为按 **(AIR keyCode, 方向)** 合并，双端 8 组 stimulus（单次 Shift / Shift+字母 / 字母 9/9 重复 / 左右 Shift / 左右 Ctrl / 左右 Alt / 左右 Cmd / 只剩通用修饰位的合成事件）**逐行相同**。**同时更正阶段一百九十 的一处源码误读**：`Cocoa_HandleKeyEvent` 在 SDL 2.32.10 里按 `[event type]` 分支，一个 `NSEvent` 只调一次 `SDL_SendKeyboardKey`，不存在「同一次事件走两条路」——那一节的「双路径」说法已就地改正。证据台 `temp/shiftdup/`（`measure.py` 每 variant 一个全新进程、`results/summary.txt` 八行全 `IDENTICAL`）；钉子 `unit: text-input/ModifierKey`（7 条，新增「左右两侧折叠到同一 keyCode」一条）。
+> **2026-10-20 追加（阶段二百零八：E4X 的最后三条残余）**：**新登记 0 行 / 移出 1 行 / 改写 0 行** ⇒ 表内项数 **96 → 95 项**（`未开始` 71 → **70**，其余不变）。移出的是「**E4X 序列化残差**」—— 该行自 2026-10-13（阶段一百四十三）登记，阶段一百九十三 修掉前两条后收窄为文本节点/混合内容/实体三条残余，本阶段**全部修掉**并移出。三条同源（都源于 DOM 用单个 `text` 槽建模），故本轮是**换数据模型**而不是打三个补丁：文本节点成为普通节点（`name == NULL`）、子件序列按文档序交错、实体在解析期解码且序列化按上下文转义；顺带把解析报错从「一律 `#1090`」收成 `adl` 的 `#1085`/`#1088`/`#1090` 三类。验收 = 差分探针 `temp/e4xres/diff/` 63 条记录**与 `adl 51.4.1` 逐字节一致** + `examples/e4x-text-mixed.as`（57 条断言）+ `unit: e4x/TextNodes`（29 条）。**本轮顺带改正的两处旧断言**（不是新缺口）：`examples/xml-dynamic-str.as` 把 `x.*` 当空列表（AIR 的通配轴含文本节点）、`examples/lang-superset.as` 把 `..*` 的文本节点差记作已知分歧。**仍未做**（不影响上述三条，已行内注明）：元素名不转义、CDATA 含 `]]>` 不拆分、`attributes()` 仍只回第一个属性的值。
+
 > **2026-10-20 追加（阶段二百零七：macOS 也能加载 ANE 了）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 表内项数不变（**96 项**）。改写的那一行是「**macOS / iOS 上的 ANE 没有宿主库**」—— macOS 这一半**已完成**（宿主库、C 面 POSIX 分支、夹具、示例、宿主库名的唯一出处全落地，两个扩展示例在 macOS 上真跑、46 条断言），故状态由「未开始」收窄为「**部分完成**」，并把落地路径改写成 iOS 一侧的真实障碍（静态链、无 `dlopen`）。本阶段修的三层都是**「`adl` 跑得对、我们跑不出」**（macOS 上 `adl` 能加载同一个 ANE 而我们编不出宿主库），按 §1.5 判据属**遗留缺陷**、不是增强，**不改任何 AIR 已定义语义**。**closure 三条必须写下来的**：① **构建成功不等于装得对** —— dylib 的 install name 写成绝对路径在**作者机器上照常工作、在别的机器上加载失败**，而构建期**一句话都不说**（传了 `-install_name` 就再没人看它）⇒ 脚本必须 `otool -D` **验产物**、且**两个切片分别验**；② **一个平台分支能藏多久，取决于另一个平台给不给警告** —— `asaot.h` 的 POSIX 分支少一态这件事，在 Windows 上只是一条 `redeclared without 'dllimport' attribute` 警告，于是「警告不是错误」把一个**编译不过**的分支养了几轮；③ **`MacOS-x86-64` 不编码架构** ⇒ 一个键服务两种架构，夹具与宿主库**必须**默认通用（arm64-only 夹具在 Intel 上被 dyld 直接拒），与 AIR 自己的 macOS 运行时同形。
 > **2026-10-19 追加（阶段二百零五：描述符只描述「第一扇窗」—— Windows 端窗口缺陷全部修复）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 表内项数 **95 → 96 项**。新行 = 「初始窗的框/客户区单位」（**两端都有、非 Windows 专属**）；改写行 = 「窗口几何的 Windows 端残余」——它当年列的四处里已有三处（最大化口径 / 横向边框 / 描述符成员未接线）在本阶段**已定或已修**，故把该行收窄到真正剩下的两处。本阶段修的仍是「AIR 会做、我们在 Windows 上静默不做」（`<maximizable>` 对最大化尺寸的影响、`<x>/<y>` 与横向边框、纸面上写了却没接线的七个描述符成员），按 §1.5 判据属**遗留缺陷**而非增强，故**不改任何 AIR 已定义语义**。**closure 三条必须写下来的**：① **「构建级 define 污染」的正确判据是同进程的第二扇窗**，不是单窗读数 —— 这类污染只在「一个进程里既有被描述符描述的窗、又有程序自建的窗」时才现形，单窗探针（阶段二百零四 之前的全部探针）永远绿；② **CI 看不见 `#ifdef` 掉的分支** ⇒ 「改了函数签名就顺手数一遍调用点实参」这件事必须**机器化**（本阶段新增的调用点参数个数审计钉子是本机唯一能提前拦下 macOS 编译错的东西）；③ **「这一项缺席」与「这一项有值」是两支，必须各给一钉** —— 一个 `string | null` 与一个写成 `undefined` 的守卫，让「描述符少写一行就 build 不出来」，而这种缺陷在只测「有这一项」的钉子里是**结构性不可见**的。
 > **2026-10-20 追加（阶段二百零六：显示度量缓存被物理像素覆盖）**：**新登记 0 行 / 改写 2 行 / 移出 0 行** ⇒ 表内项数不变（**96 项**）。改写 2 行：① 「`Stage.fullScreenWidth/Height` 取「完整显示模式」而非 AIR 的「可用区」」—— 该行**只对 macOS 成立**（Windows 实测 `adl` 的 `fullScreen*` 与 `Capabilities.screenResolution*` **同值**、都是整块显示器），故状态收窄为「部分完成 + 只剩 macOS 一端」；② 「Stage3D 的 Windows 后端」的证据列 —— 那句「已改用 `SDL_GetDisplayBounds`」当时**只是纸面**修好（值被 show 路径用显示模式覆盖），本阶段补记更正。本阶段修的是「AIR 会做、我们在 Windows 上静默不做」（AIR 报 DIP、我们报物理），按 §1.5 判据属**遗留缺陷**而非增强，**不改任何 AIR 已定义语义**。**closure 两条必须写下来的**：① **缓存型量必须按「写入者唯一」来钉** —— 本缺陷的现场是**两个写入者、两个空间、其中一个还是死代码**，而它在 100% 缩放的机器上**读数完全正常**（两个查询同值）⇒ 只钉数值的钉子对这种缺陷**结构性失明**，必须钉「谁在写、写在哪几个点」；② **「症状出现在 B 量上」不等于「B 量的实现坏了」** —— 用户报的是窗口尺寸（`MeetingWindow` 由 `Capabilities.screenResolution*` 算出），而同一个根因把 `Screen.bounds` 推到了**相反**的偏离上（它成了唯一的 DIP 读者）⇒ 判根因时要把**同源量的读数一起取**，否则会在错的量上改来改去。
@@ -13352,7 +13430,6 @@ install name）；② **一个平台分支能藏多久，取决于另一个平�
 >
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
-| **E4X 序列化残差**：`toXMLString()` **未实现** + 标记不按 AIR 重排 —— **两条均已修（阶段一百九十三）**，本行改记修完后**剩下的三条残余** | **已修**（`toXMLString()` 接线 + 标记重缩进均已落地，2026-10-19 阶段一百九十三；残余见右） | ① **文本节点构造**：`new XML("plaintext")` 在 AIR 是文本节点（`toString()`/`toXMLString()` 都是 `plaintext`），我们 `as_xml_parse` 对「根元素之前的游离文本」返回 NULL ⇒ **构造时**响亮 `XML parse error`（**解析器**欠账，阶段一百九十三 未动解析器）；② **混合内容**：我们把每个文本 run 并成**一个**（trim 过的）块，故 `<a>a<b/>b</a>` 给 `<a>\n  ab\n  <b/>\n</a>`，而 AIR 按文档序**交错**（`<a>\n  a\n  <b/>\n  b\n</a>`）；③ **实体**：解析**不解码**，故输出原样回显（`&amp;` 恰与 AIR 一致，但 `&#65;` 不会还原成 `A`；同理输出侧**不能**补转义，否则重复转义）。`adl 51.4.1` 真值矩阵与我方逐格对照见 [`docs/zh-cn/e4x.md`](docs/zh-cn/e4x.md) §2.6 与 `temp/toxml/` | 三条**同源**（都在解析器）：先让「游离文本」也能建节点（①），再让**文本与子件按文档序**一起建模（②，现 DOM 只有 `text` 一个槽），最后在解析期解码实体（③）——解码落地后输出侧才允许补转义。改动面覆盖所有 `XML(...)` 构造点 ⇒ 需与 `as_xml_parse_str_checked` 的**报错口径**一并定；成本**中** |
 | **`ExtensionContext` 还有 4 个 AIR 50 成员未建模**（`functions` / `knownExtensions` / `getExtensionInfo` / `loadExtension`） | 未开始（2026-10-17 阶段一百七十八·二 逐项查 AIR 参考时登记） | 已落地的 A 面是 `createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` / `actionScriptData` + `StatusEvent`（与 `ANEWinCore` 的真实用量完全覆盖）。**`loadExtension` 不是小修**：它是**延迟加载**——扩展在**首次 `call` 时**才 `LoadLibrary` + initializer，要把 C 面的加载时机从「构造 `ExtensionContext` 时」移到「首次调用时」并缓存；`functions`/`knownExtensions`/`getExtensionInfo` 是只读反射面。（另：`extensionID` **已删** —— AIR 没有这个属性，`mxmlc` 拒绝 + `adl` 报 `#1069`，已按 AIR 对齐，不入本表） | 先补 `adl` 实测采集这四个成员的真实形态（`functions` 是 `Object` 还是数组、未知 id 时是 `null` 还是空表），再按实测落地；`loadExtension` 独立立项（它要动 C 面时序） |
 | **iOS 上的 ANE 没有（也不会有同样形态的）宿主库** —— FRE 宿主运行时 `asaot` 已出 Windows 两个位宽与 **macOS**（`lib/bin/macos-x86-64/libasaot.dylib`，通用二进制，阶段二百零七）；`ios-arm64/` 仍不存在 | **部分完成**（macOS 端 2026-10-20 阶段二百零七 落地并实测；iOS 端未开始） | macOS 端**已完成**：`lib/build-asaot.sh` 出通用 dylib、`src/fre.ts` 有 POSIX 分支（`dlopen`/`dlsym`/`_NSGetExecutablePath`/递归锁/pthread）、`lib/asaot.h` 的 POSIX 侧补齐 `ASAOT_HOST` 三态、`examples/ane`+`ane-app` 在 macOS 上真跑（46 条断言）、宿主库名收成 `aneHostLibName()` 一处。**iOS 不是把同一件事重做一遍**：iOS 把扩展**静态链进应用镜像**，没有 `dlopen` 这一步，`asaot` 会是一份静态库、initializer 由**直接符号引用**到达 ⇒ 落地起点是定「**谁调用 initializer**」（应用侧还是运行时侧的启动钩子），而不是重编一遍宿主库。当前行为仍是**响亮抛错并说明原因**（`aneHostLibName()` 对 `iPhone-ARM` 抛），不静默降级。 | iOS 端：先定 initializer 的调用方，再出 `lib/bin/ios-arm64/` 的静态库形态
 | `extends <内建类型>`（含 **`extends Array`**）不支持 —— 闭包内 **2 个文件**用它（`src/com/hurlant/util/der/Sequence.as`、`src/com/fiCharts/utils/graphic/StyleManager.as`），AIR 合法 | **部分完成**（2026-10-08 阶段一百一十八 重评估闭包时实测登记；**2026-10-11 阶段一百三十六**：`extends Array` 已落地——`ClassInfo.arrayBacked` + 隐藏 `as_array* _arr` 槽承担全部 Array 操作，C 侧超类记 `Object` 保指针布局兼容，`arrayBacked` 沿超链传递；**`String`/`Number`/`int`/`XML`/`Function` 等内建仍响亮报错**） | `resolveType('Array')` 给 `{kind:'array'}`、**无 `className`** ⇒ 旧码盲取 `.className` 报一字面的 `unknown superclass 'undefined' of 'Sequence'`（离原因很远）。现按 kind 分派：接口 ⇒ `cannot extend interface 'I'`；其余非类 ⇒ `unsupported superclass 'Array' of 'E': subclassing built-in types is not implemented`（带行列号）。**AIR 接受 `extends Array`**（mxmlc 51.4.1 实测），故这是**遗留缺陷**而非增强：子类数组需真实运行期支持（元素存储 / `length` / 全部 Array 方法在子类上的行为、`Vector` 与 `Array` 的元数据、`is Array` 沿链判定） | 立项前先量清面上：用 `adl` 实测「子类数组」的全部可观测差异（`a.length`、索引、`push` 等方法返回的是子类还是 `Array`、`getQualifiedClassName`、`is Array`/`is E`），再决定是「真做子类存储」还是「仅报精确错误 + 建议改写」。**先实测再动**（不得凭直觉定语义） |
@@ -13367,7 +13444,6 @@ install name）；② **一个平台分支能藏多久，取决于另一个平�
 | `IMEEvent` 事件族（`imeCompositionStart`/`Update`/`End`）**不可达** | **部分完成**（2026-10-11 阶段一百三十五：类已实现，事件仍无源可发） | mxmlc **拒绝** `IME.addEventListener(...)` 的静态调用（「可能未定义」）；AIR 文档口径是「未设 `imeClient` 时运行时用 out-of-line 合成，最终结果作为 `TextEvent.TEXT_INPUT` 送出」⇒ TextField 路径上唯一可观测的口径就是**提交时的 `TEXT_INPUT`**（阶段九十四·十七 已接）。**2026-10-11 补测（`adl 51.3.2`，`temp/imeprobe/`）**：`IMEEvent.IME_COMPOSITION == "imeComposition"`、`IME_START_COMPOSITION == "imeStartComposition"`；`new IMEEvent("imeComposition").text` 是 **`""`**（继承自 `TextEvent`）、**没有 `data`**（`#1069`）、`imeClient` 存在；类参考确认继承链是 `IMEEvent → TextEvent → Event`、构造器 `(type, bubbles=false, cancelable=false, text="", imeClient=null)`、`bubbles=false`。 | **已实现类本身**（`src/symbols.ts` 的 `IMEEvent` + `src/emit.ts` 的 `IMEEvent_ctor`/`_new`，示例与单元组同上）：可 `new`/可 `dispatchEvent`/`text` 默认 `""`、`imeClient` 带写屏障，与 AIR 同形状；**我们永不由运行时派发**（无输入法源）。 | 事件序仍**未实测**（需真实输入法环境 + `imeClient` 协议）；`IME_START_COMPOSITION` 的派发条件仍未定 ⇒ 保持「不发」不静默 |
 | web 目标**合成事件未接**（`compositionstart`/`compositionupdate`/`compositionend`） | 未开始（2026-10-04 阶段九十四·十七 主动登记） | native 侧已接 `SDL_TEXTEDITING` → `"textEditing"` 通道；web 侧 `vendor/web_glue.cc` 既没有键盘通道（既有遗留行）也没有合成事件通道，故浏览器下 IME 的 marked text **完全不可见**（提交路径 `input` 事件同样未接）。属**明确的未支持**，不静默降级 | 与「web 目标键盘与剪贴板未接线」同批立项：DOM 的 `compositionstart/update/end` → 帧边界队列 → 与 native 同一条 `"textEditing"` 语义（marked text + caret）；`beforeinput`/`input` → `sk_window_text_take` 等价物 | **2026-10-11 阶段一百三十五 复核**：web 侧仍是**未接线**（`vendor/web_glue.cc` 既无键盘通道也无合成事件通道），属明确未支持、不静默降级；本轮只做了 native 侧的 `flash.system.IME`/`IMEEvent`，未动 web |
 | 字符串内嵌 **NUL**（`"a\u0000b"`）在本运行时截断 | 未开始（2026-10-04 阶段九十四·十八 实测登记；属**字符串表示**的既定边界） | 阶段九十四·十八 已让 `\uXXXX`/`\xXX` 正确解码，但解码出的 `\u0000` 是真正的 NUL 字节，而本运行时的字符串是 **C 串**（`char*`）：`strlen` 在 NUL 处停止 ⇒ `"a\u0000b".length` 我们 **1**、`adl` **3**（AIR 的字符串是 UTF-16 码元序列，NUL 是普通码元）。影响面 = 用 NUL 做分隔/填充的协议代码（真实工程里 `ByteArray` 那侧另有 API，字符串这侧少见） | 要忠实须把字符串改成**带长度的表示**（`{char* , int len}` 或 UTF-16），触及运行时字符串层与全部示例 ⇒ 与「`String` 是 UTF-8 字节索引」行**同源同批**；当前只在示例里钉住可观测的那一面并写明偏差 |
-| 窗口键盘通道把 **Shift 自身**的 keyDown/keyUp **各派发两次**（**AOT 独有**） | **已修**（守卫已落地；macOS 运行时**待复核**）（2026-10-04 阶段九十四·十三 实测登记；2026-10-19 阶段一百九十 定位根因并落地） | 同一个驱动（`Quartz.CGEventCreateKeyboardEvent`，Shift vk=56 只 post 一次）下，`adl 51.4.1` 每个 Shift 按键只记 1 条 `KEY keyDown kc=16` + 1 条 `KEYUP kc=16`，而 AOT 产物记 **2 条**（同一毫秒、内容逐字相同，`temp/editprobe/aot_run2d.txt` 与 `aot_ed10.txt` 都可复现）。**根因（本轮读 SDL 2.32.10 源码定位，不是我方重复派发）**：Cocoa 后端把 `NSEventTypeKeyDown/KeyUp` **和** `NSEventTypeFlagsChanged` 都喂进同一条 `Cocoa_HandleKeyEvent`（`src/video/cocoa/SDL_cocoaevents.m:95-99`），而 `keyDown:`/`keyUp:`（`SDL_cocoakeyboard.m:413/437`）与 `flagsChanged:`→`HandleModifiers`（`:200`，在 `:440-450` 被调用）**各自**调一次 `SDL_SendKeyboardKey`；第二次发现 `keystate[scancode]` 已按下，只把 `repeat` 置 `SDL_TRUE` 并**照常投递**（`src/events/SDL_keyboard.c:846-861`）⇒ 两条逐字节相同的 SDL_KEYDOWN。真实键盘的修饰键**不会**自动重复，故「连续两条同 (scancode, 方向) 的修饰键跳变」不可能来自硬件。我方 `sk_run_loop` 刻意**不过滤**重复键（`adl` 对字母键确实派发 9/9 次重复），于是第二条被照转 ⇒ AOT 记 2、`adl` 记 1。**修法**：`vendor/window_glue.cc` 新增 `sk_is_modifier_scancode()`（LSHIFT/RSHIFT/LCTRL/RCTRL/LALT/RALT/LGUI/RGUI）与 `g_mod_last_scancode`/`g_mod_last_down`/`g_mod_last_valid`，**仅在 `#if defined(__APPLE__)` 内**丢弃「与上一跳变同 (scancode, 方向)」的修饰键事件（Windows 的修饰键**确实**会自动重复，未实测故不动）。**未复核（不静默）**：本机为 Windows，**无法运行时复现 macOS-only 现象**；已钉 `unit: text-input/ModifierKey`（6 项：scancode 覆盖、`#if defined(__APPLE__)` 作用域、(scancode,方向) 键、位置在派发之前、单派发点、SDL 源码行号引用）。**待 macOS 复核**：用 `temp/editprobe/` 同一驱动重跑，确认 AOT 侧 Shift 只剩 1 条、且字母键 9/9 重复不受影响 | 复核直接用原 harness 重跑（无需新工具）；若 macOS 上仍是两条，说明还有第三条投递路径，下一步查 `SDL_KEYMAPCHANGED` 与 `live_resize_watch` 是否参与 |
 | `TextField.textWidth` 不含行尾空格（AIR 含） | 未开始（本轮实测发现，**与断行无关，是独立口径**） | 同字体同字号下 `textWidth` 对 `"Multitouch "`：AIR **133**（含 1 个空格 8.5px）、对 `"Multitouch  "` **141.5**；我们恒为 **124.945**（SkParagraph 不计尾部空白） | AIR 是权威（§1.5），该差异是**遗留**不是增强。**风险点**：Starling 的 `TrueTypeCompositor` 正是按 `textWidth` 定尺建 BitmapData，改动会**同时影响**它与 `textfield-align` 的居中期望值，须重跑 Starling 12 场景 + 相关 examples 才能收 |
 | AMF 编解码（`URLStream.readObject`/`writeObject`、`registerClassAlias`/`getClassByAlias`） | **部分完成**（2026-10-03 阶段九十四·四：**AMF3 读写双向已实现并与 `adl 51.4.1` 逐字节一致**——`ByteArray`/`URLStream` 的 `readObject`/`writeObject`、`registerClassAlias`/`getClassByAlias`、引用表/trait 表/别名表齐备（`examples/stage94d.as` 67 条断言 + `test.ts` `[amf]`/`[bytearray]` 钉子）。**未完成**：①**AMF0 完全未实现**（`objectEncoding != AMF3` 时**响亮抛错**；AMF0 语义已采全：number `00`+double、布尔 `01`、null `05`、undefined `06`、string `02`、**Array 走 ECMA 数组 `08`**、object `03`、typed object `10`、Date `0b`）；②`IExternalizable`/外部化对象（`bit2`）**响亮报不支持**（AIR 自己也会以 `#2173` 拒这类手工流）；③Function/XML 值 AMF3 下**响亮报不支持**；④`ByteArray` 引用（`#3`）不支持 | AMF 是二进制**对象图**序列化（AMF0/AMF3 双版本 + 引用表 + trait 编码 + 别名注册表），与现有「对象当纯数据」的 `Dictionary`/record 反射表**不重合**，需独立编解码器。**语义面本身也没采集全**：`adl` 探针只测到空 `URLStream` 的 `readObject()` 抛 `#2029`（`temp/air-probe/air-probe-result.txt`）。原为 `flash.net` 两个汇总行的共有未收尾子项，本轮汇总行移出时**提升为独立行**以免丢失 | 独立立项：先用 `mxmlc + adl` 采全语义（别名注册表、AMF0/AMF3 切换、引用表、`ByteArray` 读写对、`writeObject` 的 `trait` 形状），再实现编解码器；验收用本地服务器**回放固定 AMF 字节**并与 `adl` 逐字节对照。**成本中**（编解码器本体 + 反射表对接）。**2026-10-03 已立项为阶段九十四·四**（与该子阶段的 `ByteArray.readObject`/`writeObject` 合并推进，避免两处各写一份编解码器） |
 | `SecureSocket` 的 TLS 状态机 | 未开始（当前是**诚实失败**而非错误实现：`isSupported=false`、`connect()` 派 `#2031`） | 缺的是「非阻塞传输之上的 TLS 状态机 + AIR 的 `serverCertificateValidate` 握手回调」。可链接的现成 TLS 库与静态 curl 的取舍同源（`vendor/curl` 已把 nghttp2/zlib 静态化，TLS 后端仍是系统 SecureTransport）。**不实现比假装实现正确**——静默明文连接是最坏的失败模式 | 立项时改 `as_sock` 的连接状态机（CONNECTING 之后插入 TLS 握手态），并补齐证书事件面；验收用本地 TLS 服务器 + `adl` 对照 |

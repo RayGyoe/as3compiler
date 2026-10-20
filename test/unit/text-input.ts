@@ -823,12 +823,13 @@ function checkStyleSheet(): string[] {
 
 registerGroup('unit: text-input/StyleSheet', checkStyleSheet);
 
-// ---- TODO L12205：「窗口键盘通道把 Shift 自身的 keyDown/keyUp 各派发两次」 -------
-// macOS 上 cocoa 后端把「一次修饰键按下」投递两次：Cocoa_DispatchEvent 同时把
-// KeyDown/KeyUp 与 FlagsChanged 送进 Cocoa_HandleKeyEvent，后者经 HandleModifiers
-// 又发一次同样的 SDL_SendKeyboardKey（SDL 只把第二次标成 repeat 后照常 post）。
-// 修法是胶水层按 (scancode, 方向) 去重，且只在 __APPLE__ 下生效——Windows 的修饰键
-// 会自动重复，那里的重复是真输入。adl 51.4.1 只发一次 ⇒ 多的那次是保真缺口。
+// ---- TODO「窗口键盘通道把 Shift 自身的 keyDown/keyUp 各派发两次」 ---------------
+// adl 51.4.1 的修饰键是「按 keyCode 一维」的：LSHIFT 与 RSHIFT 都是 keyCode 16，
+// L/R Control 17、L/R Alt 18、L/R Command 15，且同时按住两侧只派发一对
+// keyDown/keyUp（macOS 26.6.2 实测，temp/shiftdup/）。SDL 却按 scancode 报四个键，
+// 而且 Cocoa 后端一次 FlagsChanged 会按 modflags 把整个家族都按下去。修法是胶水层
+// 按 (AIR keyCode, 方向) 合并同一修饰键的连续重复，且只在 __APPLE__ 下生效——
+// Windows 的修饰键会自动重复，那里的重复是真输入。
 function checkModifierKeyChannel(): string[] {
   let ok = 0;
   const bad: string[] = [];
@@ -840,21 +841,29 @@ function checkModifierKeyChannel(): string[] {
   const src = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8')
     .replace(/\r\n/g, '\n');
 
-  check('the glue enumerates the eight modifier scancodes',
-    /static int sk_is_modifier_scancode\(SDL_Scancode sc\) \{[\s\S]*?SDL_SCANCODE_LSHIFT[\s\S]*?SDL_SCANCODE_RGUI[\s\S]*?\n\}/.test(src));
+  check('the helper enumerates the eight modifier scancodes and returns AIR\'s keyCode',
+    /static int sk_modifier_keycode\(SDL_Scancode sc\) \{[\s\S]*?SDL_SCANCODE_LSHIFT[\s\S]*?SDL_SCANCODE_RGUI[\s\S]*?\n\}/.test(src));
+
+  // 本条的**全部意义**在于「两侧同一个 keyCode」——只按 scancode 匹配去重是修不掉的：
+  // 同一修饰键的左右两侧在 SDL 里是四个不同 scancode。
+  check('LSHIFT/RSHIFT collapse onto one keyCode (and so do L/R Control/Alt/Command)',
+    /case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_RSHIFT: return 16;/.test(src)
+    && /case SDL_SCANCODE_LCTRL:  case SDL_SCANCODE_RCTRL:  return 17;/.test(src)
+    && /case SDL_SCANCODE_LALT:   case SDL_SCANCODE_RALT:   return 18;/.test(src)
+    && /case SDL_SCANCODE_LGUI:   case SDL_SCANCODE_RGUI:   return 15;/.test(src));
 
   check('the helper and its state live behind #if defined(__APPLE__)',
-    /#if defined\(__APPLE__\)[\s\S]{0,900}?sk_is_modifier_scancode[\s\S]{0,900}?g_mod_last_valid = 0;/.test(src));
+    /#if defined\(__APPLE__\)[\s\S]{0,1600}?sk_modifier_keycode[\s\S]{0,1600}?g_mod_last_valid = 0;/.test(src));
 
-  check('the drop keys on (scancode, direction), not on SDL repeat (the KEYUP half carries no repeat flag)',
+  check('the coalescing keys on (AIR keyCode, direction), not on SDL repeat (the KEYUP half carries no repeat flag)',
     src.includes('int down = (e.type == SDL_KEYDOWN) ? 1 : 0;')
-    && src.includes('g_mod_last_scancode == e.key.keysym.scancode &&')
+    && src.includes('g_mod_last_keycode == mod_kc &&')
     && src.includes('g_mod_last_down == down'));
 
   // 位置断言：过滤必须在 on_key 派发之前、且落在 KEYDOWN/KEYUP 分支内——回调为空的
   // 窗口不得让共享的去重状态失同步。
   const keyCase = src.slice(src.indexOf('case SDL_KEYDOWN:'));
-  const gi = keyCase.indexOf('sk_is_modifier_scancode(e.key.keysym.scancode)');
+  const gi = keyCase.indexOf('sk_modifier_keycode(e.key.keysym.scancode)');
   const di = keyCase.indexOf('c->on_key(id, e.type == SDL_KEYDOWN');
   check('the filter runs inside the KEYDOWN/KEYUP case, before the on_key dispatch',
     gi > 0 && di > gi && gi < keyCase.indexOf('case SDL_TEXTEDITING:'));
@@ -862,9 +871,9 @@ function checkModifierKeyChannel(): string[] {
   check('the keyDown/keyUp dispatch site is still single (the fix is a filter, not a second call)',
     (src.match(/c->on_key\(id, e\.type == SDL_KEYDOWN \? "keyDown" : "keyUp"/g) || []).length === 1);
 
-  check('the rationale cites the SDL sources that produce the duplicate',
+  check('the rationale cites the SDL sources and the measured AIR coalescing fact',
     src.includes('SDL_cocoaevents.m') && src.includes('SDL_cocoakeyboard.m')
-    && src.includes('SDL_keyboard.c'));
+    && src.includes('SDL_keyboard.c') && src.includes('temp/shiftdup/'));
 
   return bad;
 }

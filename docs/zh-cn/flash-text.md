@@ -11,6 +11,9 @@
 > 已相当完整，欠的主要是两族——**A. SWC 静态文本与 `TextFormat` 从未烘焙**（最大的一座山，
 > 一个改动覆盖 6 处外观差）、**B. 运行时口径缺口**（内存安全、掩码、别名、度量、`TextFormat` 子集）。
 > 唯一 oracle 是 **AIR 51.4.1 的 `adl`**，逐值对齐；`adl` 能跑对我们跑不出 ⇒ 遗留缺陷（AGENTS §1.5）。
+>
+> **另一个问题另立一文**：「这套排版引擎本身要不要换掉（SkParagraph → Rust）」见
+> [`rust-text-backend.md`](rust-text-backend.md)——本文假定引擎不变，只谈口径。
 
 ---
 

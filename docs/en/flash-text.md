@@ -15,6 +15,10 @@
 > appearance diffs), and **B. runtime-contract gaps** (memory safety, masking, aliases, metrics,
 > `TextFormat` subset). The only oracle is **AIR 51.4.1's `adl`**, aligned value by value; if `adl`
 > runs it right and we cannot ⇒ it is a legacy defect (AGENTS §1.5).
+>
+> **A different question has its own document**: "should this layout engine itself be replaced
+> (SkParagraph → Rust)?" — see [`rust-text-backend.md`](rust-text-backend.md). This document assumes
+> the engine stays put and only discusses conventions.
 
 ---
 

@@ -839,6 +839,11 @@ Monaco 的 12+3、但 14 px 起就与 Monaco 分道）——没有一个可解�
 表（那会把未测尺寸的数值也说成「实测」），只把 9 档尺寸的实测值留在证据台，并在 `TODO.md` 登记为遗留项。
 同理 `Courier New` / `Arial` 的行高各有 0.5 px 残差（Skia 内部对半像素的取整方向），也一并记录。
 
+> **想换掉这套排版引擎？先读 [`rust-text-backend.md`](rust-text-backend.md)**——那篇逐端评估了
+> 「把 SkParagraph 换成 cosmic-text + swash 静态库」的优劣、实测体积账（ICU 数据是**一个不可分的
+> 9.71 MB 对象**，而且**不画文字的应用也照付**）、以及为什么结论是「先做 `-dead_strip` 与
+> `skia_use_icu4x`，Rust 后端只在移动端 + 体积硬约束时才动」。
+
 ---
 
 ## 9. 图片解码（`BitmapData.loadBytes` / `Loader`）

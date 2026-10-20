@@ -132,8 +132,11 @@ function checkPropBoxing(): string[] {
   // element with attributes but no children must still reduce to its TEXT, or
   // every localised constant parsed from an embedded XML file comes back as its
   // raw '<label name=...>' template (Language.init).
-  check('a childless element reduces to its text (the JSX rule AIR uses)',
-    RUNTIME_PREAMBLE.includes('if (n->child_count == 0) return as_str_dup(n->text ? n->text : "");'));
+  // 阶段二百零八: the test is "no ELEMENT child" rather than "child_count == 0" --
+  // an element whose content is a single text run now HAS a child (the text node),
+  // and it must still reduce to that text.
+  check('an element with only text content reduces to its text (the JSX rule AIR uses)',
+    RUNTIME_PREAMBLE.includes('if (!has_elem) return as_str_dup(n->text ? n->text : "");'));
   check('an empty element yields the empty string, not a markup form',
     RUNTIME_PREAMBLE.includes('if (!n->name) return as_str_dup(n->text ? n->text : "");'));
   check('an element WITH children still serialises as markup',

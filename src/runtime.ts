@@ -3429,7 +3429,9 @@ static as_value as_obj_to_value(void* obj) {
 typedef struct as_xml_node {
     void* vtable;               // &as_xml_vt (Object subclass)
     char* name;                 // element name (localName); NULL for text nodes
-    char* text;                 // trimmed direct text content (NULL when empty)
+    char* text;                 // element: its direct text content, concatenated;
+                                // text node: its own value (may be "")
+    int cdata;                  // text node came from <![CDATA[...]]> (markup only)
     char** attr_names;          // GCT_PTR_ARRAY of GCT_STRING names
     char** attr_vals;           // GCT_PTR_ARRAY of GCT_STRING values
     int attr_count;
@@ -3466,6 +3468,18 @@ static as_xml_node* as_xml_node_new(char* name) {
     as_xml_node* n = (as_xml_node*)gc_alloc(GCT_XML, sizeof(as_xml_node));
     n->vtable = (void*)&as_xml_vt;
     n->name = name;
+    return n;
+}
+
+// A TEXT (or CDATA) node: an as_xml_node with no name, so the whole runtime can
+// distinguish it from an element by n->name == NULL. The cdata flag only affects the
+// MARKUP form -- nodeKind()/toString() report a CDATA section as text, exactly as
+// adl 51.4.1 does -- and is what keeps <![CDATA[<b/>]]> from turning into escaped
+// text when the document is serialised again.
+static as_xml_node* as_xml_text_new(char* text, int cdata) {
+    as_xml_node* n = as_xml_node_new(NULL);
+    n->text = text;
+    n->cdata = cdata;
     return n;
 }
 
@@ -3516,8 +3530,7 @@ static as_xml_list* as_xml_list_ctor(as_value v) {
             return as_xml_list_new(buf, n);
         }
     }
-    as_xml_node* t = as_xml_node_new(NULL);
-    t->text = as_v_str_val(v);
+    as_xml_node* t = as_xml_text_new(as_str_dup(as_v_str_val(v)), 0);
     as_xml_node** buf = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, sizeof(as_xml_node*));
     buf[0] = t;
     return as_xml_list_new(buf, 1);
@@ -3542,8 +3555,130 @@ static void as_xml_buf_push(as_xml_buf* b, void* p) {
     gc_write_barrier(p);
 }
 
-// Parser cursor over the raw XML text.
+// ---------- character data: whitespace, entities, text runs ----------
+// XML whitespace. This is the ONLY set the parser trims, and it trims because
+// AIR's XML.ignoreWhitespace defaults to true (measured, temp/e4xres/): a
+// whitespace-only run between elements disappears, and a run's leading/trailing
+// whitespace is cut while its INNER whitespace survives ('x  y' stays 'x  y').
+static int as_xml_is_ws(unsigned char c) {
+    return c == ' ' || c == '\\t' || c == '\\r' || c == '\\n';
+}
+
+// UTF-8 encode one code point into out; returns the byte count (BMP only -- the
+// parser never decodes anything above 0xFFFF, see as_xml_decode).
+static int as_xml_utf8_put(unsigned int cp, char* out) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    out[0] = (char)(0xE0 | (cp >> 12));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (cp & 0x3F));
+    return 3;
+}
+
+static int as_xml_hexval(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Decode entity references in a length-delimited slice (TEXT and ATTRIBUTE values
+// both decode -- measured). Always returns a fresh GC string, never a slice of the
+// input, so callers may trim or hand the result to AS3.
+//
+// MEASURED on adl 51.4.1 (temp/e4xres/, 40 named probes + numeric probes):
+//   * the five predefined entities decode, and so does &nbsp; -- whose code point
+//     AIR reports as U+FFA0 (not U+00A0). That is an AIR quirk, reproduced here so
+//     the VALUE matches the reference runtime rather than the spec.
+//   * &#DDD; / &#xHHH; decode up to U+FFFF in either base (&#25991; -> 文).
+//   * an UNKNOWN name stays verbatim ('&copy;' -> "&copy;", not ©), and a code
+//     point above 0xFFFF also stays verbatim ('&#x1F600;' -> "&#x1F600;").
+// Because unknown references survive DECODING, the serialiser must escape every
+// '&' it writes or the round trip would double-decode (that is residual (3)).
+static char* as_xml_decode(const char* s, int len) {
+    char* out = as_str_alloc((size_t)len * 4 + 1);
+    int o = 0;
+    int i = 0;
+    while (i < len) {
+        if (s[i] != '&') { out[o++] = s[i++]; continue; }
+        // A reference name is short; give up (and copy '&' verbatim) after 12.
+        int j = i + 1;
+        while (j < len && j - i <= 12 && s[j] != ';') j++;
+        if (j >= len || s[j] != ';') { out[o++] = s[i++]; continue; }
+        const char* nm = s + i + 1;
+        int nl = j - i - 1;
+        unsigned int cp = 0xFFFFFFFFu;
+        if (nl == 3 && strncmp(nm, "amp", 3) == 0) cp = 38u;
+        else if (nl == 2 && strncmp(nm, "lt", 2) == 0) cp = 60u;
+        else if (nl == 2 && strncmp(nm, "gt", 2) == 0) cp = 62u;
+        else if (nl == 4 && strncmp(nm, "quot", 4) == 0) cp = 34u;
+        else if (nl == 4 && strncmp(nm, "apos", 4) == 0) cp = 39u;
+        else if (nl == 4 && strncmp(nm, "nbsp", 4) == 0) cp = 0xFFA0u;
+        else if (nl >= 2 && nm[0] == '#') {
+            int base = 10;
+            int k = 1;
+            unsigned int v = 0;
+            int ok = 1;
+            if (nm[k] == 'x' || nm[k] == 'X') { base = 16; k++; }
+            if (k >= nl) ok = 0;
+            for (; ok && k < nl; k++) {
+                int d = base == 16 ? as_xml_hexval((unsigned char)nm[k])
+                                   : ((nm[k] >= '0' && nm[k] <= '9') ? nm[k] - '0' : -1);
+                if (d < 0) { ok = 0; break; }
+                v = v * (unsigned int)base + (unsigned int)d;
+                if (v > 0x10FFFFu) { ok = 0; break; }
+            }
+            // Out-of-BMP and NUL stay verbatim, exactly as AIR leaves them.
+            if (ok && v != 0 && v <= 0xFFFFu) cp = v;
+        }
+        if (cp == 0xFFFFFFFFu) { out[o++] = s[i++]; continue; }
+        o += as_xml_utf8_put(cp, out + o);
+        i = j + 1;
+    }
+    out[o] = 0;
+    return out;
+}
+
+// One raw text run -> the value of a text node, or NULL when the run is DROPPED.
+// Two rules, both measured (temp/e4xres/):
+//   * a run that is whitespace IN THE SOURCE is pruned completely, so <a> </a>
+//     serialises as <a/> and contributes no child;
+//   * a run that only BECOMES whitespace after decoding KEEPS its node with an
+//     EMPTY value, so <a>&#32;</a> and <a>&#10;</a> serialise as <a></a> (an
+//     empty text child) rather than self-closing.
+static char* as_xml_text_run(const char* s, int len) {
+    int a = 0;
+    int b = len;
+    while (a < b && as_xml_is_ws((unsigned char)s[a])) a++;
+    while (b > a && as_xml_is_ws((unsigned char)s[b - 1])) b--;
+    if (a == b) return NULL;
+    char* dec = as_xml_decode(s + a, b - a);
+    int dl = (int)strlen(dec);
+    int da = 0;
+    int db = dl;
+    while (da < db && as_xml_is_ws((unsigned char)dec[da])) da++;
+    while (db > da && as_xml_is_ws((unsigned char)dec[db - 1])) db--;
+    if (da == 0 && db == dl) return dec;
+    char* t = as_str_alloc((size_t)(db - da) + 1);
+    memcpy(t, dec + da, (size_t)(db - da));
+    t[db - da] = 0;
+    return t;
+}
+
+// Parser cursor over the raw XML text. as_xml_err records WHY a NULL return
+// happened; the ids are the ones adl 51.4.1 raises, so as_xml_parse_checked can
+// throw the same TypeError: 1 = malformed element (#1090), 2 = element not
+// terminated (#1085, with the element's name), 3 = markup outside the root
+// element (#1088). It is a FILE-level variable rather than a scanner field
+// because a nested element reports the failure and every enclosing frame just
+// returns NULL.
 typedef struct { const char* s; int i; int n; } as_xml_sc;
+static int as_xml_err = 0;
+static char* as_xml_err_name = NULL;
 
 // Scan an XML name (letters/digits/_/-/./:). Returns a GC string or NULL.
 static char* as_xml_sc_name(as_xml_sc* sc) {
@@ -3566,7 +3701,9 @@ static void as_xml_sc_ws(as_xml_sc* sc) {
         else break;
     }
 }
-// Scan a quoted attribute value; returns a GC string or NULL (unterminated).
+// Scan a quoted attribute value (entities decoded); NULL when unterminated.
+// Attribute values are NOT trimmed: adl 51.4.1 keeps "<a b=' x  y '/>" as
+// b=" x  y " (temp/e4xres/), unlike text runs.
 static char* as_xml_sc_attrval(as_xml_sc* sc) {
     if (sc->i >= sc->n) return NULL;
     char q = sc->s[sc->i];
@@ -3575,29 +3712,9 @@ static char* as_xml_sc_attrval(as_xml_sc* sc) {
     int start = sc->i;
     while (sc->i < sc->n && sc->s[sc->i] != q) sc->i++;
     if (sc->i >= sc->n) return NULL;
-    char* r = as_str_alloc((size_t)(sc->i - start) + 1);
-    memcpy(r, sc->s + start, (size_t)(sc->i - start));
-    r[sc->i - start] = 0;
+    char* r = as_xml_decode(sc->s + start, sc->i - start);
     sc->i++; // closing quote
     return r;
-}
-
-// Trim leading/trailing whitespace in place; returns the trimmed start pointer.
-// Trim leading/trailing XML whitespace into a FRESH GC string. It must COPY: the
-// trimmed result is stored in the node (as_xml_node.text), so advancing a pointer
-// into the caller's buffer would leave the node owning an INTERIOR pointer. An
-// interior pointer is unmarkable (gc_mark_ptr reads a header at p - sizeof) and
-// would be handed to the GC grey stack as a bogus header -- and the source buffer
-// was also being NUL-terminated in place, mutating text shared with other nodes.
-static char* as_xml_trim(const char* s) {
-    if (!s) return NULL;
-    while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;
-    size_t n = strlen(s);
-    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\\t' || s[n-1] == '\\r' || s[n-1] == '\\n')) n--;
-    char* out = as_str_alloc(n + 1);
-    memcpy(out, s, n);
-    out[n] = 0;
-    return out;
 }
 
 static as_xml_node* as_xml_sc_element(as_xml_sc* sc);
@@ -3606,7 +3723,7 @@ static as_xml_node* as_xml_sc_element(as_xml_sc* sc);
 static as_xml_node* as_xml_sc_element(as_xml_sc* sc) {
     sc->i++; // '<'
     char* name = as_xml_sc_name(sc);
-    if (!name) return NULL;
+    if (!name) { as_xml_err = 1; return NULL; }
     as_xml_node* node = as_xml_node_new(name);
 
     // attributes
@@ -3618,33 +3735,50 @@ static as_xml_node* as_xml_sc_element(as_xml_sc* sc) {
         if (c == '>') { sc->i++; break; }
         if (c == '/') {
             if (sc->i + 1 < sc->n && sc->s[sc->i + 1] == '>') { sc->i += 2; node->child_count = 0; node->children = NULL; goto as_xml_done_attrs; }
+            as_xml_err = 1;
             return NULL;
         }
-        if (c < 0) return NULL;
+        // EOF inside the start tag is MALFORMED (#1090), not "unterminated":
+        // adl 51.4.1 reports 'a<b' as #1090 while a complete '<a>' is #1085.
+        if (c < 0) { as_xml_err = 1; return NULL; }
         char* an = as_xml_sc_name(sc);
-        if (!an) return NULL;
+        if (!an) { as_xml_err = 1; return NULL; }
         as_xml_sc_ws(sc);
-        if (sc->i >= sc->n || sc->s[sc->i] != '=') return NULL;
+        if (sc->i >= sc->n || sc->s[sc->i] != '=') { as_xml_err = 1; return NULL; }
         sc->i++;
         as_xml_sc_ws(sc);
         char* av = as_xml_sc_attrval(sc);
-        if (!av) return NULL;
+        if (!av) { as_xml_err = 1; return NULL; }
         as_xml_buf_push(&anames, (void*)an);
         as_xml_buf_push(&avals, (void*)av);
     }
 
-    // children / text until the matching close tag
+    // children: ELEMENTS and TEXT/CDATA nodes, in DOCUMENT ORDER. That ordering is
+    // what makes mixed content round-trip (<a>x<b/>y</a> keeps x before b and y
+    // after it) -- the old model had a single text slot and folded every run
+    // into one blob, which is residual (2).
     as_xml_buf children = { NULL, 0, 0 };
-    char* text = NULL;
-    size_t textlen = 0;
     for (;;) {
-        if (sc->i >= sc->n) return NULL; // unterminated
+        if (sc->i >= sc->n) {
+            // Unterminated element: AIR names the OPEN element.
+            as_xml_err = 2;
+            as_xml_err_name = as_str_dup(node->name);
+            return NULL;
+        }
         if (sc->s[sc->i] == '<') {
             if (sc->i + 1 < sc->n && sc->s[sc->i + 1] == '/') {
                 sc->i += 2;
-                as_xml_sc_name(sc);
+                char* cn = as_xml_sc_name(sc);
                 as_xml_sc_ws(sc);
                 if (sc->i < sc->n && sc->s[sc->i] == '>') sc->i++;
+                // A mismatched close tag is #1085 in AIR, and the message names
+                // the OPEN element ('<a></b>' -> 'element type "a" must be
+                // terminated ...'), so the open name is what gets reported.
+                if (!cn || strcmp(cn, node->name) != 0) {
+                    as_xml_err = 2;
+                    as_xml_err_name = as_str_dup(node->name);
+                    return NULL;
+                }
                 break;
             }
             if (sc->i + 1 < sc->n && sc->s[sc->i + 1] == '?') {
@@ -3666,14 +3800,12 @@ static as_xml_node* as_xml_sc_element(as_xml_sc* sc) {
                     int start = sc->i;
                     while (sc->i + 2 < sc->n && !(sc->s[sc->i] == ']' && sc->s[sc->i + 1] == ']' && sc->s[sc->i + 2] == '>')) sc->i++;
                     int tlen = sc->i - start;
-                    if (tlen > 0) {
-                        char* merged = as_str_alloc(textlen + (size_t)tlen + 1);
-                        if (textlen > 0) memcpy(merged, text, textlen);
-                        memcpy(merged + textlen, sc->s + start, (size_t)tlen);
-                        merged[textlen + tlen] = 0;
-                        text = merged;
-                        textlen += (size_t)tlen;
-                    }
+                    // CDATA content is LITERAL: not decoded, not trimmed (adl
+                    // 51.4.1 prints <a><![CDATA[  x  ]]></a> with the spaces).
+                    char* raw = as_str_alloc((size_t)tlen + 1);
+                    if (tlen > 0) memcpy(raw, sc->s + start, (size_t)tlen);
+                    raw[tlen] = 0;
+                    as_xml_buf_push(&children, (void*)as_xml_text_new(raw, 1));
                     if (sc->i + 2 < sc->n) sc->i += 3;
                     continue;
                 }
@@ -3690,25 +3822,15 @@ static as_xml_node* as_xml_sc_element(as_xml_sc* sc) {
         } else {
             int start = sc->i;
             while (sc->i < sc->n && sc->s[sc->i] != '<') sc->i++;
-            int tlen = sc->i - start;
-            if (tlen > 0) {
-                char* piece = as_str_alloc((size_t)tlen + 1);
-                memcpy(piece, sc->s + start, (size_t)tlen);
-                piece[tlen] = 0;
-                char* merged = as_str_alloc(textlen + (size_t)tlen + 1);
-                if (textlen > 0) memcpy(merged, text, textlen);
-                memcpy(merged + textlen, piece, (size_t)tlen);
-                merged[textlen + tlen] = 0;
-                text = merged;
-                textlen += (size_t)tlen;
-            }
+            char* t = as_xml_text_run(sc->s + start, sc->i - start);
+            if (t != NULL) as_xml_buf_push(&children, (void*)as_xml_text_new(t, 0));
         }
     }
-    // Install children and trimmed text.
+    // Install children.
     node->child_count = children.length;
     node->children = (as_xml_node**)children.items;
-    // Back pointers for XML.parent(): every child (and text node) records its
-    // parent. Written with a write barrier because the child may already be
+    // Back pointers for XML.parent(): every child (text nodes included) records
+    // its parent. Written with a write barrier because the child may already be
     // reachable (it was pushed into the parent's buffer) and could have been
     // marked black while the new parent is still white.
     for (int i = 0; i < children.length; i++) {
@@ -3718,8 +3840,28 @@ static as_xml_node* as_xml_sc_element(as_xml_sc* sc) {
             gc_write_barrier((void*)node);
         }
     }
-    node->text = as_xml_trim(text);
-    if (node->text && node->text[0] == 0) node->text = NULL;
+    // text(): the element's direct text content, i.e. every text/cdata child in
+    // document order concatenated. Cached in the node because text() and the
+    // childless string value read it without walking the children.
+    size_t ttotal = 0;
+    for (int i = 0; i < children.length; i++) {
+        as_xml_node* c = (as_xml_node*)children.items[i];
+        if (c != NULL && c->name == NULL && c->text != NULL) ttotal += strlen(c->text);
+    }
+    if (ttotal > 0) {
+        char* t = as_str_alloc(ttotal + 1);
+        size_t o = 0;
+        for (int i = 0; i < children.length; i++) {
+            as_xml_node* c = (as_xml_node*)children.items[i];
+            if (c != NULL && c->name == NULL && c->text != NULL) {
+                size_t l = strlen(c->text);
+                memcpy(t + o, c->text, l);
+                o += l;
+            }
+        }
+        t[o] = 0;
+        node->text = t;
+    }
 
 as_xml_done_attrs:
     node->attr_count = anames.length;
@@ -3728,38 +3870,120 @@ as_xml_done_attrs:
     return node;
 }
 
-// Parse a complete XML document. Returns the root node, or NULL on malformed
-// input (the caller throws an AS3 Error — see emitNew for new XML(...)).
+// Parse a complete XML document (or, for text-only input, build a TEXT node).
+// Returns NULL on malformed input with as_xml_err/as_xml_err_name describing the
+// failure; as_xml_parse_checked turns that into the TypeError AIR throws.
+//
+// The three shapes, all measured on adl 51.4.1 (temp/e4xres/):
+//   * NO '<' anywhere      -> a TEXT node. "plaintext" stays a text node
+//     (nodeKind "text", localName null, toString/toXMLString both the value),
+//     a padded "  hi  " trims to "hi", and whitespace/empty input is a text node
+//     whose value is "". This is residual (1): it used to be a hard parse error.
+//   * one well-formed<root> -> that element; leading/trailing whitespace and the
+//     XML declaration are ignored.
+//   * anything else        -> #1088. "text<a/>" and "<a/>trail" both raise it,
+//     while a malformed tag raises #1090/#1085 from the element parser itself.
+// A root CDATA section is a node in its own right (new XML("<![CDATA[x]]>")).
 static as_xml_node* as_xml_parse(const char* src, int len) {
+    as_xml_err = 0;
+    as_xml_err_name = NULL;
     if (!src) return NULL;
     as_xml_sc sc = { src, 0, len };
+    int has_markup = 0;
+    for (int k = 0; k < len; k++) if (src[k] == '<') { has_markup = 1; break; }
+    if (!has_markup) {
+        char* t = as_xml_text_run(src, len);
+        if (t == NULL) t = as_str_empty();
+        return as_xml_text_new(t, 0);
+    }
     as_xml_node* root = NULL;
-    while (sc.i < sc.n) {
-        if (sc.s[sc.i] == '<') {
-            if (sc.i + 1 < sc.n && (sc.s[sc.i + 1] == '?' || sc.s[sc.i + 1] == '!')) {
-                // leading XML declaration / DOCTYPE
-                if (sc.s[sc.i + 1] == '?') {
-                    sc.i += 2;
-                    while (sc.i + 1 < sc.n && !(sc.s[sc.i] == '?' && sc.s[sc.i + 1] == '>')) sc.i++;
-                    if (sc.i + 1 < sc.n) sc.i += 2;
-                } else {
-                    sc.i += 2;
-                    while (sc.i < sc.n && sc.s[sc.i] != '>') sc.i++;
-                    if (sc.i < sc.n) sc.i++;
-                }
+    int free_text = 0;
+    for (;;) {
+        as_xml_sc_ws(&sc);
+        if (sc.i >= sc.n) break;
+        if (sc.s[sc.i] != '<') {
+            // Free text between markup tokens: legal nowhere in an XML document.
+            while (sc.i < sc.n && sc.s[sc.i] != '<') sc.i++;
+            if (root != NULL) { as_xml_err = 3; return NULL; }  // "<a/>trail"
+            free_text = 1;
+            continue;
+        }
+        char n1 = sc.i + 1 < sc.n ? sc.s[sc.i + 1] : 0;
+        if (n1 == '?') {
+            // XML declaration / processing instruction.
+            sc.i += 2;
+            while (sc.i + 1 < sc.n && !(sc.s[sc.i] == '?' && sc.s[sc.i + 1] == '>')) sc.i++;
+            if (sc.i + 1 < sc.n) sc.i += 2;
+            continue;
+        }
+        if (n1 == '!') {
+            if (sc.n - sc.i >= 4 && strncmp(sc.s + sc.i, "<!--", 4) == 0) {
+                sc.i += 4;
+                while (sc.i + 2 < sc.n && !(sc.s[sc.i] == '-' && sc.s[sc.i + 1] == '-' && sc.s[sc.i + 2] == '>')) sc.i++;
+                if (sc.i + 2 < sc.n) sc.i += 3;
                 continue;
             }
-            root = as_xml_sc_element(&sc);
-            if (!root) return NULL;
-        } else {
-            unsigned char c = (unsigned char)sc.s[sc.i];
-            if (c == ' ' || c == '\\t' || c == '\\r' || c == '\\n') { sc.i++; continue; }
-            return NULL; // stray text before root element
+            if (sc.n - sc.i >= 9 && strncmp(sc.s + sc.i, "<![CDATA[", 9) == 0) {
+                if (root != NULL) { as_xml_err = 3; return NULL; }
+                sc.i += 9;
+                int start = sc.i;
+                while (sc.i + 2 < sc.n && !(sc.s[sc.i] == ']' && sc.s[sc.i + 1] == ']' && sc.s[sc.i + 2] == '>')) sc.i++;
+                int tlen = sc.i - start;
+                char* raw = as_str_alloc((size_t)tlen + 1);
+                if (tlen > 0) memcpy(raw, sc.s + start, (size_t)tlen);
+                raw[tlen] = 0;
+                if (sc.i + 2 < sc.n) sc.i += 3;
+                root = as_xml_text_new(raw, 1);
+                continue;
+            }
+            // DOCTYPE or other declaration: skipped, as before.
+            sc.i += 2;
+            while (sc.i < sc.n && sc.s[sc.i] != '>') sc.i++;
+            if (sc.i < sc.n) sc.i++;
+            continue;
         }
+        if (root != NULL) { as_xml_err = 3; return NULL; }  // a SECOND root element
+        as_xml_node* e = as_xml_sc_element(&sc);
+        if (!e) return NULL;                            // err set by the element
+        // The element parsed, so the free text in front of it is what makes the
+        // document ill-formed -- AIR reports #1088 here, not #1090.
+        if (free_text) { as_xml_err = 3; return NULL; }
+        root = e;
     }
     return root;
 }
 
+// A parse failure as the AS3 TypeError the reference runtime raises. The ids and
+// the wording are adl 51.4.1's, measured in temp/e4xres/:
+//   #1085  The element type "a" must be terminated by the matching end-tag "</a>".
+//   #1088  The markup in the document following the root element must be well-formed.
+//   #1090  XML parser failure: element is malformed.
+// The quotes are built from a char array rather than escaped literals: this whole
+// preamble is a template string, so an escaped quote would reach the C half-eaten.
+static int as_xml_error_id(void) {
+    if (as_xml_err == 2) return 1085;
+    if (as_xml_err == 3) return 1088;
+    return 1090;
+}
+static char* as_xml_error_message(void) {
+    if (as_xml_err == 2) {
+        const char* nm = as_xml_err_name != NULL ? as_xml_err_name : "";
+        char q[2]; q[0] = '"'; q[1] = 0;
+        char* out = as_str_concat("Error #1085: The element type ", q);
+        out = as_str_concat(out, nm);
+        out = as_str_concat(out, q);
+        out = as_str_concat(out, " must be terminated by the matching end-tag ");
+        out = as_str_concat(out, q);
+        out = as_str_concat(out, "</");
+        out = as_str_concat(out, nm);
+        out = as_str_concat(out, ">");
+        out = as_str_concat(out, q);
+        out = as_str_concat(out, ".");
+        return out;
+    }
+    if (as_xml_err == 3) return (char*)"Error #1088: The markup in the document following the root element must be well-formed.";
+    return (char*)"Error #1090: XML parser failure: element is malformed.";
+}
 // ---------- E4X navigation helpers ----------
 // The LOCAL part of a node's qualified name ('n:item' -> 'item'). Namespaces are
 // transparent in the AOT translation (the parser drops a ns:: qualifier), so the
@@ -3776,8 +4000,10 @@ static const char* as_xml_local(const char* qname) {
 }
 // localName() is an AS3 String value too: as_xml_local returns an INTERIOR pointer
 // (past the 'prefix:' part), so it must be copied before it leaves the runtime.
+// A text node has NO name, and adl 51.4.1 reports null (not "") for it.
 static char* as_xml_local_name(as_xml_node* n) {
-    return n ? as_str_dup(as_xml_local(n->name)) : NULL;
+    if (n == NULL || n->name == NULL) return NULL;
+    return as_str_dup(as_xml_local(n->name));
 }
 
 // XML.attributes() / XMLList.attributes() (E4X). AIR returns an XMLList of the
@@ -3860,6 +4086,11 @@ static void as_xml_list_set_attr(as_xml_list* l, const char* name, const char* v
 // children, and "*" is AIR's documented child(propertyName:Object = "*")
 // wildcard). The requested name is always a bare local name (a source identifier
 // or a computed string), so only the node side is local-ized.
+// The WILDCARD axis includes TEXT nodes -- measured on adl 51.4.1: on
+// <a>t1<b>bt</b>t2<c/></a>, children(), child("*") and the .* operator all report
+// FOUR items (text, element, text, element), while elements() reports two. A named
+// lookup never matches a text node (it has no name), which is why the usages in
+// the wild (xml.pages.page) are unaffected.
 static int as_xml_name_all(const char* name) {
     return name == NULL || name[0] == 0 || (name[0] == '*' && name[1] == 0);
 }
@@ -3868,10 +4099,42 @@ static as_xml_list* as_xml_children(as_xml_node* n, const char* name) {
     as_xml_buf buf = { NULL, 0, 0 };
     for (int i = 0; i < n->child_count; i++) {
         as_xml_node* c = n->children[i];
-        if (!c->name) continue;
+        if (!c->name) {
+            // Text nodes take part in the WILDCARD axis only.
+            if (as_xml_name_all(name)) as_xml_buf_push(&buf, (void*)c);
+            continue;
+        }
         if (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0) as_xml_buf_push(&buf, (void*)c);
     }
     return as_xml_list_new((as_xml_node**)buf.items, buf.length);
+}
+
+// XML.elements(): the ELEMENT axis only -- children() with text nodes excluded
+// (adl 51.4.1 reports 2 elements against 4 children on <a>t1<b>bt</b>t2<c/></a>).
+static as_xml_list* as_xml_elements(as_xml_node* n, const char* name) {
+    if (!n || n->child_count == 0) return as_xml_list_new(NULL, 0);
+    as_xml_buf buf = { NULL, 0, 0 };
+    for (int i = 0; i < n->child_count; i++) {
+        as_xml_node* c = n->children[i];
+        if (c->name == NULL) continue;
+        if (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0) as_xml_buf_push(&buf, (void*)c);
+    }
+    return as_xml_list_new((as_xml_node**)buf.items, buf.length);
+}
+
+// XML.nodeKind(): "text" for text/cdata nodes, "element" otherwise. AIR reports a
+// CDATA section as kind "text" too (its markup still keeps the CDATA wrapper).
+static char* as_xml_node_kind(as_xml_node* n) {
+    if (n != NULL && n->name == NULL) return (char*)"text";
+    return (char*)"element";
+}
+
+// XML.text(): the element's own text content. A TEXT node has none -- adl 51.4.1
+// answers "" for new XML("abc").text(), not "abc" -- because text() selects the
+// text CHILDREN, and a text node has no children.
+static char* as_xml_text_of(as_xml_node* n) {
+    if (n == NULL || n->name == NULL) return (char*)"";
+    return n->text != NULL ? n->text : (char*)"";
 }
 
 // Flatten a list's children of a given name across all its nodes (.a.b).
@@ -3910,6 +4173,17 @@ static void as_xml_set_child(as_xml_node* n, const char* name, const char* text)
         memcpy(nn, name, nl + 1);
         as_xml_node* c = as_xml_node_new(nn);
         c->text = nt;
+        // The new child also gets a TEXT child, so the content is in the SAME
+        // place the parser puts it: a pretty-printed parent then interleaves it
+        // like any other text run instead of reading a stale cache.
+        as_xml_node** cb = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, sizeof(as_xml_node*));
+        as_xml_node* tc = as_xml_text_new(as_str_dup(nt), 0);
+        tc->parent = c;
+        cb[0] = tc;
+        gc_write_barrier((void*)tc);
+        gc_write_barrier((void*)cb);
+        c->children = cb;
+        c->child_count = 1;
         // The new child is attached to its parent, so XML.parent() sees it -- the
         // parser does the same for parsed nodes (the tree is otherwise immutable).
         c->parent = n;
@@ -3925,7 +4199,18 @@ static void as_xml_set_child(as_xml_node* n, const char* name, const char* text)
     as_xml_node* tgt = n->children[first];
     tgt->text = nt;
     gc_write_barrier((void*)nt);
-    tgt->children = NULL; tgt->child_count = 0;
+    // Replacing the content DROPS the old children (element and text alike) and
+    // installs the assigned string as the single text child.
+    {
+        as_xml_node** cb = (as_xml_node**)gc_alloc(GCT_PTR_ARRAY, sizeof(as_xml_node*));
+        as_xml_node* tc = as_xml_text_new(as_str_dup(nt), 0);
+        tc->parent = tgt;
+        cb[0] = tc;
+        gc_write_barrier((void*)tc);
+        gc_write_barrier((void*)cb);
+        tgt->children = cb;
+        tgt->child_count = 1;
+    }
     int keep = 0;
     for (int i = 0; i < n->child_count; i++) {
         as_xml_node* c = n->children[i];
@@ -3957,7 +4242,13 @@ static void as_xml_desc_walk(as_xml_buf* buf, as_xml_node* n, const char* name) 
     if (!n) return;
     for (int i = 0; i < n->child_count; i++) {
         as_xml_node* c = n->children[i];
-        if (c->name && (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0)) as_xml_buf_push(buf, (void*)c);
+        if (c->name) {
+            if (as_xml_name_all(name) || strcmp(as_xml_local(c->name), name) == 0) as_xml_buf_push(buf, (void*)c);
+        } else if (as_xml_name_all(name)) {
+            // TEXT nodes on the wildcard axis: descendants() includes them
+            // (adl 51.4.1 reports 5 for <a>t1<b>bt</b>t2<c/></a>).
+            as_xml_buf_push(buf, (void*)c);
+        }
         as_xml_desc_walk(buf, c, name);
     }
 }
@@ -4006,7 +4297,7 @@ static as_xml_list* as_xml_filter(as_xml_list* l, const char* attr, const char* 
     return as_xml_list_new((as_xml_node**)buf.items, buf.length);
 }
 
-// Serialize an element back to XML text (best-effort, for toString()).
+// Serialize a node back to XML text.
 // Grow a char* buffer in place (reallocating via as_str_alloc when full) and
 // append a length-delimited chunk. Used by the serializer below; a plain helper
 // avoids a function-like macro, whose line-continuation backslashes would be
@@ -4039,27 +4330,62 @@ static void as_xml_indent(char* buf, int level) {
     buf[ind] = 0;
 }
 
+// Append s with the escapes the reference runtime uses, which are DIFFERENT for
+// text and for attribute values (both measured on adl 51.4.1, temp/e4xres/):
+//   TEXT (mode 0):      '&' -> &amp;   '<' -> &lt;   '>' -> &gt;
+//                       quotes, tabs and newlines stay RAW
+//   ATTRIBUTE (mode 1): '&' -> &amp;   '<' -> &lt;   '"' -> &quot;
+//                       TAB/LF/CR -> &#x9;/&#xA;/&#xD;   '>' stays RAW
+// Escaping is required now that entities are DECODED on the way in: an unknown
+// reference arrives as the literal text "&copy;", and writing it back unescaped
+// would make the next parse decode it (that was residual (3)).
+static void as_xml_append_esc(char** outp, size_t* lenp, size_t* capp, const char* s, int mode) {
+    if (s == NULL) return;
+    for (size_t i = 0; s[i] != 0; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '&') as_xml_append(outp, lenp, capp, "&amp;", 5);
+        else if (c == '<') as_xml_append(outp, lenp, capp, "&lt;", 4);
+        else if (c == '>' && mode == 0) as_xml_append(outp, lenp, capp, "&gt;", 4);
+        else if (c == '"' && mode == 1) as_xml_append(outp, lenp, capp, "&quot;", 6);
+        else if (c == '\\n' && mode == 1) as_xml_append(outp, lenp, capp, "&#xA;", 5);
+        else if (c == '\\r' && mode == 1) as_xml_append(outp, lenp, capp, "&#xD;", 5);
+        else if (c == '\\t' && mode == 1) as_xml_append(outp, lenp, capp, "&#x9;", 5);
+        else as_xml_append(outp, lenp, capp, (const char*)&s[i], 1);
+    }
+}
+
 // MARKUP serialiser -- the value of toXMLString(), and the value toString() falls
 // back to for an element WITH element children. Measured on adl 51.4.1
-// (temp/toxml/), two shape rules:
-//   * element with NO element children -> INLINE: <a b="1">txt</a> and <a b="1"/>
-//   * element WITH element children    -> PRETTY-PRINTED, one item per line,
-//     indented 2 spaces per level: <a> + newline + 2sp + <b/> + newline + </a>
-// Whitespace-only text nodes are pruned -- our parser already trims an element's
-// text and stores NULL for it, so <a> </a> serialises as <a/>, which is also what
-// adl prints. Attributes always use double quotes: a source '<a b=''1''/>' becomes
-// <a b="1"/>.
-// KNOWN DEVIATION (registered in TODO.md): our parser folds every text run of a
-// mixed-content element into ONE trimmed blob, so <a>a<b/>b</a> prints its text as
-// a single item where adl interleaves text and elements. Entities are also not
-// decoded on the way in (a separate parser gap), so text is echoed verbatim.
+// (temp/toxml/ + temp/e4xres/), three shape rules:
+//   * no children                            -> <a b="1"/>
+//   * exactly ONE text/CDATA child           -> INLINE: <a>txt</a>
+//   * anything else (an element child, or two or more children) -> PRETTY:
+//     one child per line, 2 spaces per level, closing tag back at its level
+// A text child is escaped, a CDATA child is written back AS CDATA (its content is
+// literal, so <![CDATA[<b/>]]> survives the round trip instead of turning into
+// escaped text). Whitespace-only text runs never reach here -- the parser drops
+// them -- while an EMPTY run created by an entity prints as <a></a>, which is what
+// adl does too. Attributes always use double quotes.
+// KNOWN DEVIATION (registered in TODO.md): element names are not escaped, and a
+// CDATA section whose content contains "]]>" is not split.
 static char* as_xml_markup(as_xml_node* n, int level) {
     if (!n) return "";
-    if (!n->name) return as_str_dup(n->text ? n->text : "");
-    // <name attr="v" ...>
     size_t cap = 64;
     char* out = as_str_alloc(cap);
     size_t len = 0;
+    out[0] = 0;
+    if (!n->name) {
+        // A bare text/cdata node (the document itself, or a CDATA child).
+        if (n->cdata) {
+            as_xml_append(&out, &len, &cap, "<![CDATA[", 9);
+            if (n->text) as_xml_append(&out, &len, &cap, n->text, strlen(n->text));
+            as_xml_append(&out, &len, &cap, "]]>", 3);
+        } else {
+            as_xml_append_esc(&out, &len, &cap, n->text, 0);
+        }
+        return out;
+    }
+    // <name attr="v" ...>
     char q[2]; q[0] = '"'; q[1] = 0;
     as_xml_append(&out, &len, &cap, "<", 1);
     as_xml_append(&out, &len, &cap, n->name, strlen(n->name));
@@ -4068,35 +4394,34 @@ static char* as_xml_markup(as_xml_node* n, int level) {
         as_xml_append(&out, &len, &cap, n->attr_names[i], strlen(n->attr_names[i]));
         as_xml_append(&out, &len, &cap, "=", 1);
         as_xml_append(&out, &len, &cap, q, 1);
-        as_xml_append(&out, &len, &cap, n->attr_vals[i], strlen(n->attr_vals[i]));
+        as_xml_append_esc(&out, &len, &cap, n->attr_vals[i], 1);
         as_xml_append(&out, &len, &cap, q, 1);
     }
-    char ib[68];
     if (n->child_count == 0) {
-        if (!n->text) { as_xml_append(&out, &len, &cap, "/>", 2); return out; }
-        as_xml_append(&out, &len, &cap, ">", 1);
-        as_xml_append(&out, &len, &cap, n->text, strlen(n->text));
-        as_xml_append(&out, &len, &cap, "</", 2);
-        as_xml_append(&out, &len, &cap, n->name, strlen(n->name));
-        as_xml_append(&out, &len, &cap, ">", 1);
+        as_xml_append(&out, &len, &cap, "/>", 2);
         return out;
     }
-    as_xml_append(&out, &len, &cap, ">", 1);
-    as_xml_indent(ib, level + 1);
-    as_xml_append(&out, &len, &cap, "\\n", 1);
-    if (n->text) {
-        as_xml_append(&out, &len, &cap, ib, strlen(ib));
-        as_xml_append(&out, &len, &cap, n->text, strlen(n->text));
-        as_xml_append(&out, &len, &cap, "\\n", 1);
-    }
+    int has_elem = 0;
     for (int i = 0; i < n->child_count; i++) {
-        char* cs = as_xml_markup(n->children[i], level + 1);
-        as_xml_append(&out, &len, &cap, ib, strlen(ib));
-        as_xml_append(&out, &len, &cap, cs, strlen(cs));
-        as_xml_append(&out, &len, &cap, "\\n", 1);
+        if (n->children[i] != NULL && n->children[i]->name != NULL) { has_elem = 1; break; }
     }
-    as_xml_indent(ib, level);
-    as_xml_append(&out, &len, &cap, ib, strlen(ib));
+    as_xml_append(&out, &len, &cap, ">", 1);
+    char ib[68];
+    if (!has_elem && n->child_count == 1) {
+        char* cs = as_xml_markup(n->children[0], level + 1);
+        as_xml_append(&out, &len, &cap, cs, strlen(cs));
+    } else {
+        for (int i = 0; i < n->child_count; i++) {
+            as_xml_indent(ib, level + 1);
+            as_xml_append(&out, &len, &cap, "\\n", 1);
+            as_xml_append(&out, &len, &cap, ib, strlen(ib));
+            char* cs = as_xml_markup(n->children[i], level + 1);
+            as_xml_append(&out, &len, &cap, cs, strlen(cs));
+        }
+        as_xml_indent(ib, level);
+        as_xml_append(&out, &len, &cap, "\\n", 1);
+        as_xml_append(&out, &len, &cap, ib, strlen(ib));
+    }
     as_xml_append(&out, &len, &cap, "</", 2);
     as_xml_append(&out, &len, &cap, n->name, strlen(n->name));
     as_xml_append(&out, &len, &cap, ">", 1);
@@ -4107,27 +4432,23 @@ static char* as_xml_markup(as_xml_node* n, int level) {
 static char* as_xml_to_string(as_xml_node* n) { return as_xml_markup(n, 0); }
 
 // E4X string value -- what XML.toString(), String(xml) and xml + "" all yield.
-// MEASURED on adl 51.4.1 (temp/tkmeet-mac/xmlstr): a TEXT node yields its text; an
-// element with NO element children yields its text content ("<a b='1'>txt</a>" ->
-// "txt", "<a b='1'/>" -> ""); an element WITH element children yields the MARKUP
-// ("<a><b/></a>" -> "<a>\\n  <b/>\\n</a>"). Whitespace-only text nodes are pruned
-// (our parser trims, storing NULL), and the markup branch pretty-prints exactly
-// like toXMLString() -- adl prints the SAME string for both (temp/toxml/).
+// MEASURED on adl 51.4.1 (temp/tkmeet-mac/xmlstr + temp/e4xres/): a TEXT node
+// yields its text; an element WITH element children yields the MARKUP; every other
+// element yields its own direct text content (the concatenation of its text/cdata
+// children, in document order). So <a>x<b/>y</a> -> markup, while <a>pre<![CDATA[
+// mid]]>post</a> -> "premidpost".
+// A String handed to AS3 is a VALUE: always copy the node's own buffer (see
+// as_str_dup) -- the node may be collected while AS3 still holds the string.
 static char* as_xml_string_value(as_xml_node* n) {
     if (!n) return "";
-    // A String handed to AS3 is a VALUE: always copy the node's own buffer (see
-    // as_str_dup) -- the node may be collected while AS3 still holds the string.
     if (!n->name) return as_str_dup(n->text ? n->text : "");
-    // NOTE: an element with attributes but no children still reduces to its
-    // TEXT here, and that is deliberate: AIR's XML string value follows the JSX
-    // rule (children => markup, otherwise the text), and xml.text() shares this
-    // path. Long-form markup is as_xml_markup's job (toXMLString). Written the
-    // other way round it broke Language.init()'s embedded-XML parsing: every
-    // localised constant came back as its raw '<label name=...>' template.
-    if (n->child_count == 0) return as_str_dup(n->text ? n->text : "");
+    int has_elem = 0;
+    for (int i = 0; i < n->child_count; i++) {
+        if (n->children[i] != NULL && n->children[i]->name != NULL) { has_elem = 1; break; }
+    }
+    if (!has_elem) return as_str_dup(n->text ? n->text : "");
     return as_xml_to_string(n);
 }
-
 // XMLList string value: 0 items -> "", 1 item -> that item's string value, more
 // than one -> each item's MARKUP joined by a newline (adl 51.4.1: a list of two
 // <i>a</i>/<i>b</i> nodes prints "<i>a</i>\\n<i>b</i>", while a ONE-item list prints
@@ -4550,8 +4871,11 @@ static void as_swc_child_name(void* parent, const char* name, void* child) {
 // yields empty strings instead of throwing. Defined here, after as_object_set, so
 // the record helpers are already declared.
 static as_value as_xml_qname(as_xml_node* n) {
+    // A text node has no name at all: adl 51.4.1 answers null, so reading .localName
+    // off it raises #1009 rather than yielding "".
+    if (n == NULL || n->name == NULL) return as_v_null();
     as_object* q = as_object_new();
-    const char* ln = (n != NULL && n->name != NULL) ? as_xml_local(n->name) : "";
+    const char* ln = as_xml_local(n->name);
     as_object_set(q, "localName", as_v_str((char*)ln));
     as_object_set(q, "uri", as_v_str((char*)""));
     return as_v_obj((void*)q);

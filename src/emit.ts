@@ -9339,7 +9339,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('static as_xml_node* as_xml_parse_checked(const char* src, int len) {');
     this.indent++;
     this.line('as_xml_node* n = as_xml_parse(src, len);');
-    this.line('if (n == NULL) as_throw(Error_new((char*)"XML parse error", 0));');
+    // The reference runtime raises a TypeError here, not a generic Error: #1085 for
+    // an unterminated element, #1088 for markup outside the root element and #1090
+    // for a malformed tag. The runtime records which one applied, so the message
+    // and the id are the ones adl 51.4.1 prints (temp/e4xres/).
+    this.line('if (n == NULL) as_throw(TypeError_new(as_xml_error_message(), as_xml_error_id()));');
     this.line('return n;');
     this.indent--;
     this.line('}');
@@ -29555,6 +29559,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         const a = this.emitExpr(args[0]);
         nameExpr = a.type.kind === 'string' ? a.code : this.toStringExpr(a);
       }
+      // elements() is the ELEMENT axis; child()/children() are the whole child
+      // axis, which includes TEXT nodes (measured on adl 51.4.1: 4 children vs 2
+      // elements for <a>t1<b>bt</b>t2<c/></a>).
+      if (method === 'elements') {
+        if (obj.type.kind === 'xmllist') return { code: `as_xml_list_children(${obj.code}, ${nameExpr})`, type: { kind: 'xmllist' } };
+        return { code: `as_xml_elements(${obj.code}, ${nameExpr})`, type: { kind: 'xmllist' } };
+      }
       if (obj.type.kind === 'xmllist') return { code: `as_xml_list_children(${obj.code}, ${nameExpr})`, type: { kind: 'xmllist' } };
       return { code: `as_xml_children(${obj.code}, ${nameExpr})`, type: { kind: 'xmllist' } };
     }
@@ -29597,15 +29608,17 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         // toString() on it (DAEParser: trimString(element.text().toString())). We
         // return the text string directly -- same observed value, and TextField-
         // style XMLList text access (text()[0], text().length()) is not modelled.
+        // A TEXT node answers "" (its children, not itself, are the text), which is
+        // what adl 51.4.1 does for new XML("abc").text().
         if (obj.type.kind === 'xmllist') return { code: `as_xml_list_to_string(${obj.code})`, type: { kind: 'string' } };
-        return { code: `${obj.code} != NULL && ${obj.code}->text != NULL ? ${obj.code}->text : (char*)""`, type: { kind: 'string' } };
+        return { code: `as_xml_text_of(${obj.code})`, type: { kind: 'string' } };
       }
       if (method === 'nodeKind') {
-        // Every node this subset can produce is an ELEMENT (the parser stores an
-        // element's text as a trimmed string and does not model text/comment/
-        // attribute nodes), so nodeKind() answers the element kind -- the value
-        // com/adobe/utils/XMLUtil compares against its ELEMENT constant.
-        return { code: '"element"', type: { kind: 'string' } };
+        // "text" for a text/CDATA node, "element" otherwise -- the values
+        // com/adobe/utils/XMLUtil compares its constants against. The parser models
+        // text nodes now (mixed content and new XML("plaintext")), so this can no
+        // longer be the constant "element".
+        return { code: `as_xml_node_kind(${obj.code})`, type: { kind: 'string' } };
       }
       if (obj.type.kind === 'xmllist') throw new CodegenError(`${method}() is not supported on an XMLList`);
       return { code: `as_xml_parent(${obj.code})`, type: { kind: 'xml' } };

@@ -88,10 +88,10 @@ check(xml.item.length() == 2, "E4X child axis");
 check(xml..item.length() == 2, "E4X descendant axis x..name");
 // `x..*` 在 AIR 里连**文本节点**一起数（`<items><item>a</item><item>b</item></items>`
 // 的 `..*` 得 4 = 2 元素 + 2 文本节点；adl 51.4.1 实测，temp/langair/cases.as 的
-// `5.desc-any`）。本实现不建模文本节点，故此处用纯元素文档验证「元素后代」这一半，
-// 文本节点差异记在报告已知分歧里。
+// `5.desc-any`）。阶段二百零八 起文本节点已建模，两半都按 AIR 断言。
 var elemsOnly:XML = <items><item id="1"/><item id="2"/></items>;
 check(elemsOnly..*.length() == 2, "E4X descendant axis x..* (any name), element-only content");
+check(xml..*.length() == 4, "…and text nodes count too (2 elements + 2 text nodes)");
 check(xml..items.length() == 0, "x..name excludes the receiver itself");
 var only2:XMLList = xml..item.(@id == "2");
 check(only2.length() == 1, "descendant axis composes with an attribute predicate");

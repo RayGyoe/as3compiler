@@ -115,7 +115,7 @@ ByteArray subclass (`as_is` walks the `super` chain, so every `[Embed]` class ma
 
 | Shape | `toString()` | `toXMLString()` |
 |---|---|---|
-| text node `new XML("plaintext")` | `plaintext` | `plaintext` (our build fails at **construction**, see ① below) |
+| text node `new XML("plaintext")` | `plaintext` | `plaintext` (✅ since stage two-hundred-eight, see below) |
 | `<a b='1'>txt</a>` (**no** element children) | `txt` | `<a b="1">txt</a>` |
 | `<a b='1'/>` (no children) | `""` | `<a b="1"/>` |
 | `<a> </a>` (whitespace-only text) | `""` | `<a/>` |
@@ -131,17 +131,68 @@ level, the closing tag back at its own level, with whitespace-only text nodes **
 **double-quoted**; comments and the `<?xml …?>` declaration are dropped. The end-to-end assertions live in
 `examples/e4x-toxmlstring.as`, the structural pins in `test/unit/emit.ts` under `unit: e4x/ToXMLString`.
 
-**Not yet aligned** (three items, registered in `TODO.md`'s leftover table):
+**Stage two-hundred-eight: the three parser residuals are aligned** (measured verbatim against `adl 51.4.1` with a
+differential probe in `temp/e4xres/diff/` — 63 records **byte-identical**; end-to-end assertions in
+`examples/e4x-text-mixed.as`, structural pins in `unit: e4x/TextNodes`). All three lived in the **parser**; the
+serialiser was only dragged along by the shape of the DOM:
 
-① **Text-node construction**: `new XML("plaintext")` is a text node in AIR (`toString()` and `toXMLString()` both
-give `plaintext`), while our `as_xml_parse` returns NULL for "stray text before the root element" ⇒ a **loud**
-`XML parse error` at **construction**. That is a **parser** gap, independent of serialisation (stage
-one-hundred-ninety-three did not touch the parser).
-② **Mixed content**: we fold every text run into **one** (trimmed) blob at parse time, so `<a>a<b/>b</a>` prints
-`<a>\n  ab\n  <b/>\n</a>` where AIR **interleaves** in document order (`<a>\n  a\n  <b/>\n  b\n</a>`).
-③ **Entities**: the parser does **not** decode entities, so the output echoes them verbatim (`&amp;` happens to
-match AIR, but `&#65;` never becomes `A`); for the same reason the output side must **not** add escaping (it would
-double-escape).
+**① Text-node construction.** When the argument of `new XML(...)` contains **no `<`**, the argument itself IS a text
+node (not an error):
+
+| Input | `nodeKind()` | `localName()`/`name()` | `toString()`/`toXMLString()` | `text()` | `length()` | `children()` |
+|---|---|---|---|---|---|---|
+| `"plaintext"` | `"text"` | `null` / `null` | `plaintext` | `""` | 1 | 0 |
+| `"  hi there  "` | `"text"` | — | `hi there` (edges trimmed) | `""` | 1 | 0 |
+| `""` / `"   "` | `"text"` | — | `""` | `""` | 1 | 0 |
+
+`text()` is **not** the node's value: it selects the text **children**, and a text node has none. `name`/`localName`
+are `null`, so a named axis (`x.foo`) never matches a text node. Markup or stray text **outside** the root element is
+still a document-level `#1088` (see the error table below).
+
+**② Mixed content in document order.** The DOM no longer folds into a single `text` slot; every text run becomes a
+**child** inserted at its position, interleaved with elements:
+
+| Shape | old (wrong) | now = `adl` |
+|---|---|---|
+| `<a>a<b/>b</a>` | `<a>\n  ab\n  <b/>\n</a>` | `<a>\n  a\n  <b/>\n  b\n</a>` |
+| `<a>x<b/>y<c/>z</a>` | folded into `xyz` | `<a>\n  x\n  <b/>\n  y\n  <c/>\n  z\n</a>` |
+| `<a> a <b/> b </a>` | — | each run is trimmed **on its own** |
+| `<a>x<!--c-->y</a>` | — | a comment **splits** the run ⇒ two text children, two lines |
+| `<a> <b/> </a>` | — | whitespace-only runs are **dropped** ⇒ `children()` = 1 |
+| `<a>&#32;</a>` | — | empty only **after decoding** ⇒ keeps an empty text node, prints `<a></a>` |
+
+The axes follow: `children()` / `child("*")` / `.*` / the **descendant axis `..*`** all **include** text nodes
+(`.*` = 4 and `..*` = 5 for `<a>t1<b>bt</b>t2<c/></a>`), while `elements()` is the element-only axis (2). The
+inlining rule also changed shape: **exactly one** text/CDATA child stays inline, everything else pretty-prints — so
+`<a>pre<![CDATA[mid]]>post</a>` is three lines while `<a>txt</a>` stays one.
+
+**③ Entities: decode on input, escape per context on output.** The old parser did not decode, so the output could
+only echo (`&#65;` never became `A`) and the serialiser could not escape (it would double-escape). Now the two
+directions are separated:
+
+| Input | `toString()` | `toXMLString()` |
+|---|---|---|
+| `<a>&#65;&amp;&lt;&gt;&quot;&apos;&#x42;</a>` | `A&<>"'B` | `<a>A&amp;&lt;&gt;"'B</a>` |
+| `<a>&foo;</a>` (unknown named) | `&foo;` (verbatim) | `<a>&amp;foo;</a>` (only `&` escaped) |
+| `<a>&amp;lt;</a>` | `&lt;` (decoded **once**) | `<a>&amp;lt;</a>` |
+| `<a>&#x1F600;</a>` / `<a>&#0;</a>` | verbatim | escaped, still verbatim |
+| `<a><![CDATA[<b/> & raw]]></a>` | `<b/> & raw` | `<a><![CDATA[<b/> & raw]]></a>` (re-emitted **as CDATA**, not decoded, not trimmed) |
+
+Two AIR quirks are copied deliberately: `&nbsp;` decodes to **U+FFA0** (not U+00A0), and numeric references decode
+only up to **U+FFFF** (anything above the BMP, and `&#0;`, stay verbatim). The escape sets differ per context: text
+escapes `&`/`<`/`>` (quotes and whitespace raw); attribute values escape `&`/`<`/`"` and write TAB/LF/CR as
+`&#x9;`/`&#xA;`/`&#xD;` (`>` and `'` stay raw, and attribute values are **not** trimmed).
+
+Errors are `TypeError`s whose `errorID` can be asserted directly (the old parser raised `#1090` for everything):
+
+| Trigger | `adl` |
+|---|---|
+| unterminated element / mismatched close tag | `#1085: The element type "a" must be terminated by the matching end-tag "</a>".` (names the **open** element) |
+| markup or stray text outside the root | `#1088: The markup in the document following the root element must be well-formed.` |
+| malformed tag / EOF inside a start tag / unquoted attribute | `#1090: XML parser failure: element is malformed.` |
+
+**Still left on this row** (independent of the three above): element names are not escaped; a CDATA section
+containing `]]>` is not split; `attributes()` still returns only the first attribute's value.
 
 ### 2.7 An XML/XMLList in a Dynamic Slot Must Be Its String Value Too (stage one-hundred-forty-four, measured in `temp/xmlstr3` + `temp/apv/adl`)
 

@@ -710,8 +710,10 @@ function checkEmitE4xStringValue(): string[] {
   // of the node (as_str_dup) instead of lending the node's own buffer. Lending it
   // left ~1000 Language statics pointing into a parsed tree that then died, and
   // the freed blocks corrupted the GC free list (SIGSEGV in gc_sweep_step).
+  // 阶段二百零八: the element/childless test became "no ELEMENT child" -- an element
+  // whose content is only text (now possibly several runs) still reduces to text.
   check('as_xml_string_value copies the node text',
-    pre.includes('if (n->child_count == 0) return as_str_dup(n->text ? n->text : "");'));
+    pre.includes('if (!has_elem) return as_str_dup(n->text ? n->text : "");'));
   check('…and the text-node branch copies too',
     pre.includes('if (!n->name) return as_str_dup(n->text ? n->text : "");'));
   check('...and falls back to the markup serializer otherwise',
@@ -776,8 +778,9 @@ function checkEmitE4xToXMLString(): string[] {
     !/as_xml_list_to_string\(\(\(/.test(cList));
   // The shape rules. A childless element stays INLINE; an element with element
   // children puts one item per line and indents the closing tag back to its level.
-  check('a childless element with no text self-closes',
-    pre.includes('if (!n->text) { as_xml_append(&out, &len, &cap, "/>", 2); return out; }'));
+  check('a childless element self-closes',
+    pre.includes('if (n->child_count == 0) {')
+    && pre.includes('as_xml_append(&out, &len, &cap, "/>", 2);'));
   check('children are serialised one level deeper',
     pre.includes('char* cs = as_xml_markup(n->children[i], level + 1);'));
   check('the item indent is one level deeper than the element',
@@ -788,8 +791,11 @@ function checkEmitE4xToXMLString(): string[] {
     pre.includes("for (int i = 0; i < level && ind < 62; i++) { buf[ind++] = ' '; buf[ind++] = ' '; }"));
   // Whitespace-only text is pruned at PARSE time, which is why <a> </a> prints as
   // <a/> and not <a></a> -- the reason the inline branch above can be trusted.
-  check('a whitespace-only text node is stored as NULL by the parser',
-    pre.includes('if (node->text && node->text[0] == 0) node->text = NULL;'));
+  // 阶段二百零八 moved that pruning into as_xml_text_run (a run that is whitespace
+  // IN THE SOURCE is dropped, while one that only BECOMES whitespace after entity
+  // decoding keeps an empty node: <a>&#32;</a> prints <a></a>, as adl does).
+  check('a whitespace-only source run is dropped by the parser',
+    pre.includes('if (a == b) return NULL;'));
   // toXMLString is the markup, ALWAYS: unlike toString() it must not reduce a
   // childless element to its text, and a one-item XMLList keeps its item's markup.
   check('the XML markup branch is reachable without the child-count test',
@@ -816,6 +822,130 @@ function checkEmitE4xToXMLString(): string[] {
   return bad;
 }
 registerGroup('unit: e4x/ToXMLString', checkEmitE4xToXMLString);
+
+// ---- E4X text nodes, mixed content and entities (阶段二百零八) ----------------
+// The three residuals of TODO.md's "E4X 序列化残差" row all lived in the PARSER:
+//   ① new XML("plaintext") must build a TEXT node, not fail;
+//   ② text runs and elements must keep DOCUMENT ORDER (the DOM used to have a
+//     single `text` slot, so every run was folded into one blob);
+//   ③ entities must decode on input, which is what forces the serialiser to
+//     escape -- per context, with the two different sets adl uses.
+// Every rule pinned here was measured on adl 51.4.1; the differential probe is
+// temp/e4xres/diff/ (63 records, byte-identical) and the end-to-end assertions
+// live in examples/e4x-text-mixed.as.
+function checkEmitE4xTextNodes(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [e4xtext] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [e4xtext] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const gen = (src: string): string => {
+    try { return generateC(parse(src)).c; }
+    catch (e) { return '<<codegen error: ' + String(e) + '>>'; }
+  };
+
+  // ---- the node model ----
+  check('a text node is an as_xml_node with no name',
+    pre.includes('static as_xml_node* as_xml_text_new(char* text, int cdata) {')
+    && pre.includes('as_xml_node* n = as_xml_node_new(NULL);'));
+  check('…and carries a CDATA flag for the MARKUP form only',
+    pre.includes('int cdata;') && pre.includes('n->cdata = cdata;'));
+
+  // ---- ① text-only input ----
+  // The "<" search decides the whole branch: without markup the input IS a text
+  // node, so new XML("") / new XML("   ") / new XML("plaintext") all succeed.
+  check('an input with no markup builds a text node',
+    pre.includes('int has_markup = 0;')
+    && pre.includes('if (!has_markup) {'));
+  check('…and whitespace-only text still yields an EMPTY node, not NULL',
+    pre.includes('if (t == NULL) t = as_str_empty();'));
+
+  // ---- ② mixed content ----
+  check('text runs become children in document order',
+    pre.includes('as_xml_buf_push(&children, (void*)as_xml_text_new(t, 0));'));
+  check('the element text cache is rebuilt from those children',
+    pre.includes('c->name == NULL && c->text != NULL) ttotal += strlen(c->text);'));
+
+  // ---- ③ entities ----
+  check('the five predefined entities decode',
+    pre.includes('strncmp(nm, "amp", 3)') && pre.includes('strncmp(nm, "apos", 4)'));
+  check('&nbsp; decodes to the code point AIR reports (U+FFA0, not U+00A0)',
+    pre.includes('else if (nl == 4 && strncmp(nm, "nbsp", 4) == 0) cp = 0xFFA0u;'));
+  check('numeric references decode in both bases',
+    pre.includes('if (nm[k] == \'x\' || nm[k] == \'X\') { base = 16; k++; }'));
+  check('…but anything above the BMP stays VERBATIM (as adl leaves it)',
+    pre.includes('if (ok && v != 0 && v <= 0xFFFFu) cp = v;'));
+  check('a decoded code point is UTF-8 encoded',
+    pre.includes('static int as_xml_utf8_put(unsigned int cp, char* out) {'));
+
+  // ---- the serialiser side of ③: two DIFFERENT escape sets ----
+  const esc = pre.slice(pre.indexOf('static void as_xml_append_esc('),
+    pre.indexOf('// MARKUP serialiser'));
+  check('text escapes & < > only',
+    esc.includes('if (c == \'&\') as_xml_append(outp, lenp, capp, "&amp;", 5);')
+    && esc.includes('else if (c == \'>\' && mode == 0) as_xml_append(outp, lenp, capp, "&gt;", 4);'));
+  check('attribute values ALSO escape the quote',
+    esc.includes('else if (c == \'"\' && mode == 1) as_xml_append(outp, lenp, capp, "&quot;", 6);'));
+  check('…and write whitespace as numeric references (attribute normalisation)',
+    esc.includes('"&#xA;", 5') && esc.includes('"&#xD;", 5') && esc.includes('"&#x9;", 5'));
+  check('an attribute > stays raw (mode 1 has no &gt; arm)',
+    esc.includes('c == \'>\' && mode == 0'));
+  check('CDATA content is written literally, never escaped',
+    pre.includes('as_xml_append(&out, &len, &cap, "<![CDATA[", 9);'));
+
+  // ---- the pretty-print rule changed shape ----
+  // One text/CDATA child stays INLINE; two or more children, or any element
+  // child, pretty-print. <a>pre<![CDATA[mid]]>post</a> is the case that separates
+  // the new rule from the old "no element children => inline".
+  check('an element with ONE non-element child stays inline',
+    pre.includes('if (!has_elem && n->child_count == 1) {'));
+
+  // ---- the axes ----
+  check('the wildcard child axis counts text nodes',
+    pre.includes('// Text nodes take part in the WILDCARD axis only.')
+    && pre.includes('if (as_xml_name_all(name)) as_xml_buf_push(&buf, (void*)c);'));
+  check('elements() is the element axis only',
+    pre.includes('static as_xml_list* as_xml_elements(as_xml_node* n, const char* name) {'));
+  check('the descendant axis counts them too',
+    (() => {
+      const i = pre.indexOf('static void as_xml_desc_walk(');
+      if (i < 0) return false;
+      const body = pre.slice(i, pre.indexOf('\n}\n', i) + 3);
+      return body.includes('} else if (as_xml_name_all(name)) {');
+    })());
+
+  // ---- the emit lowerings ----
+  const c = gen('var x:XML = new XML("t");\ntrace(x.nodeKind());\ntrace(x.text());\nvar l:XMLList = x.elements();\ntrace("" + l);\n');
+  check('nodeKind() lowers to the node-kind helper, not a constant',
+    c.includes('as_xml_node_kind('));
+  check('text() lowers to the text helper (a text node answers "")',
+    c.includes('as_xml_text_of('));
+  check('elements() lowers to the element axis',
+    c.includes('as_xml_elements('));
+
+  // ---- parse failures raise the reference TypeError ----
+  const perr = gen('var x:XML = new XML("t");\ntrace(x);\n');
+  check('a parse failure throws a TypeError with the measured id',
+    perr.includes('as_throw(TypeError_new(as_xml_error_message(), as_xml_error_id()));'));
+  check('#1085 names the open element',
+    pre.includes('Error #1085: The element type '));
+  check('#1088 is the document-level error',
+    pre.includes('Error #1088: The markup in the document following the root element must be well-formed.'));
+  check('#1090 is the malformed-element error',
+    pre.includes('Error #1090: XML parser failure: element is malformed.'));
+
+  // ---- the localName() nullptr must stay comparable ----
+  check('localName() is null for a text node',
+    pre.includes('if (n == NULL || n->name == NULL) return NULL;'));
+  check('name() is null for a text node',
+    pre.includes('if (n == NULL || n->name == NULL) return as_v_null();'));
+
+  console.log(`     [e4xtext] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: e4x/TextNodes', checkEmitE4xTextNodes);
 
 // ---- an Object slot holding a primitive / a function value ----
 // Our Object-typed slots are raw pointers, so a scalar must be BOXED to live in one
@@ -1200,8 +1330,12 @@ function checkEmitNoInteriorPointers(): string[] {
   check('as_str_dup allocates a fresh string and copies into it',
     pre.includes('static char* as_str_dup(const char* s) {')
     && pre.includes('char* out = as_str_alloc(n + 1);'));
-  check('as_xml_trim copies rather than advancing the pointer (it used to advance)',
-    pre.includes('as_xml_trim(const char* s)'));
+  // The trimmer copies into a FRESH GC string rather than advancing the pointer:
+  // an interior pointer is unmarkable and used to corrupt the free list. 阶段二百零八
+  // renamed it as_xml_text_run (one raw run -> one text node value).
+  check('the text-run trimmer copies rather than advancing the pointer',
+    pre.includes('static char* as_xml_text_run(const char* s, int len) {')
+    && pre.includes('char* t = as_str_alloc((size_t)(db - da) + 1);'));
 
   console.log(`     [interior] ${ok} check(s) passed`);
   return bad;
