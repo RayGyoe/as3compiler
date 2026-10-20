@@ -8,10 +8,10 @@
 //
 // 实测口径（adl 51.4.1，temp/btnprobe：Probe.as + p4~p7 截图；Aot.as 是本仓库侧的双端对照）：
 //   · 门是 **buttonMode**，不是标签本身：同一个类把 buttonMode 置 false 后永远停在第 1 帧；
-//     另一个「有标签但没脚本」（buttonMode 默认 false）的符号 `BtnRootResources_99复制_362`
+//     另一个「有标签但没脚本」（buttonMode 默认 false）的符号 `BtnRootResources_99复制_64`
 //     悬停/按下也永远停在第 1 帧。
-//   · 帧由**标签**决定，不是帧号：元件17_125 的 _over/_down 在 4/7 帧，
-//     BtnRootResources_99复制_362 在 5/10 帧，各自落到自己标签那一帧。
+//   · 帧由**标签**决定，不是帧号：元件17_55 的 _over/_down 在 4/7 帧，
+//     BtnRootResources_99复制_64 在 5/10 帧，各自落到自己标签那一帧。
 //   · 移开 → `_up`；滚入 → `_over`；按下 → `_down`。
 //   · 按压**锁在按下的对象上**：在别处按下再拖进来只有 `_over`；在这里按下再拖出去仍保持 `_down`。
 //   · 松开：指针在内回到 `_over`，在外回到 `_up`。
@@ -28,7 +28,7 @@
 // （悬停只改了调试浮层的 306 像素，而 adl 改的是卡片上 15524 像素）。所以下面每一档状态都
 // 先 `stage.render` 足够多帧（自动烘焙阈值是 3 帧）再断言，并且额外用像素差断言「真的变了」。
 //
-// 依赖样本皮肤 temp/skin.swc（与 swc-shape.as / swc-bitmap.as 同一份），缺席时该单元会被跳过：
+// 依赖样本皮肤 examples/embed-assets/skin.swc（与 swc-shape.as / swc-bitmap.as 同一份），缺席时该单元会被跳过：
 //   as-aot examples/swc-mc-button.as --manifest examples/swc-bitmap.build.json --run
 
 import flash.display.BitmapData;
@@ -83,12 +83,15 @@ function findByName(o:DisplayObjectContainer, nm:String):DisplayObject {
   return null;
 }
 
-// ---- ① 符号本身：元件17_125（_up@1 / _over@4 / _down@7，自带脚本设 buttonMode）----
-var clsA:Class = getDefinitionByName("skin_fla.\u5143\u4ef617_125") as Class;
-check(clsA != null, "getDefinitionByName must resolve skin_fla.元件17_125");
+// ---- ① 符号本身：元件17_55（_up@1 / _over@4 / _down@7，自带脚本设 buttonMode）----
+// 入库夹具里这个符号导出为 `skin_fla.元件17_55`（Animate 的 `_<符号id>` 后缀随库变化：
+// 旧的 `_125`、`_362` 是同一批符号在另一份导出里的后缀）。**标签帧与行为逐条相同**，
+// 所以下面所有断言（帧号、buttonMode 门、像素差）都直接沿用。
+var clsA:Class = getDefinitionByName("skin_fla.\u5143\u4ef617_55") as Class;
+check(clsA != null, "getDefinitionByName must resolve skin_fla.元件17_55");
 var A:MovieClip = new clsA() as MovieClip;
-check(A.totalFrames == 11, "元件17_125 has 11 frames, got " + A.totalFrames);
-check(labelFrames(A) == "_up@1,_over@4,_down@7", "元件17_125 labels are _up@1,_over@4,_down@7, got " + labelFrames(A));
+check(A.totalFrames == 11, "元件17_55 has 11 frames, got " + A.totalFrames);
+check(labelFrames(A) == "_up@1,_over@4,_down@7", "元件17_55 labels are _up@1,_over@4,_down@7, got " + labelFrames(A));
 // 符号自身的 frame1 脚本（SWC 的 DoABC）在构造时就跑了，和 adl 一样把 buttonMode 打开。
 check(A.buttonMode, "the symbol's own frame-1 script must set buttonMode (adl parity)");
 A.x = 20; A.y = 20;
@@ -101,10 +104,10 @@ B.x = 20; B.y = 160;
 stage.addChild(B);
 
 // ---- ② 有标签但没脚本的符号（buttonMode 默认 false）也要不动 ----
-var clsC:Class = getDefinitionByName("skin_fla.BtnRootResources_99\u590d\u5236_362") as Class;
-check(clsC != null, "getDefinitionByName must resolve BtnRootResources_99复制_362");
+var clsC:Class = getDefinitionByName("skin_fla.BtnRootResources_99\u590d\u5236_64") as Class;
+check(clsC != null, "getDefinitionByName must resolve BtnRootResources_99复制_64");
 var C:MovieClip = new clsC() as MovieClip;
-check(labelFrames(C) == "_up@1,_over@5,_down@10", "BtnRootResources_99复制_362 labels are _up@1,_over@5,_down@10, got " + labelFrames(C));
+check(labelFrames(C) == "_up@1,_over@5,_down@10", "BtnRootResources_99复制_64 labels are _up@1,_over@5,_down@10, got " + labelFrames(C));
 check(!C.buttonMode, "a symbol with no script keeps buttonMode at its default false");
 C.x = 200; C.y = 20;
 stage.addChild(C);

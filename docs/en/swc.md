@@ -52,10 +52,33 @@
 > shapes have multiple fills** — **the existing runtime's `Graphics` model (single `SkPath` + single fill +
 > single stroke) simply cannot carry that** (see the new §3.4, §5.3).
 >
-> The technical conclusions here are all based on **unpacking measurements** of the real `temp/skin.swc`
-> (743,520 B, 255 classes, 59 bitmap resources), cross-verified against the AIR SDK's `adl` for
-> `getPixel32` ground truth (method in §11). Note that this file lives in the **repository root**'s `temp/`,
-> not `as3compiler/temp/`.
+> The technical conclusions here are all based on **unpacking measurements** of the real `skin.swc`,
+> cross-verified against the AIR SDK's `adl` for `getPixel32` ground truth (method in §11). **The fixture has
+> changed generation once**: the measurements in the earlier sections come from the earlier export (a
+> repository-root SWC, 743,520 B / 255 classes / 59 bitmap resources, **no longer in the repository**), and
+> every number marked "the earlier export" below refers to it; **what is checked into the repository now is
+> `examples/embed-assets/skin.swc`** (454,007 B, md5 `f644237c…`, 35 exported symbols, 15 bitmap tags), whose
+> item-by-item measurements are in §0.1. The mechanism conclusions hold for both, but **inventory numbers do
+> not carry across fixtures**.
+
+### 0.1 The checked-in fixture, measured
+
+> Every number in this section was taken fresh from that `.swc` in the repository by `temp/skinaudit.mts`
+> (the probe self-locks the md5, so swapping the file fails immediately); it is the only "follows the
+> fixture" inventory source in the whole document, while the earlier export's measured values in the later
+> sections are kept as-is and labelled one by one.
+
+| Item | Value |
+|---|---|
+| File | `examples/embed-assets/skin.swc`, **454,007 B**, md5 `f644237cfa1559d81c3b84786fb0d204` |
+| ZIP entries | `catalog.xml` (9,457 B) + `library.swf` (452,958 B); the latter is **CWS**, `declared length` 505,130, decompressed body **505,122 B** |
+| stage header | `nbits=15` → RECT 9 B + `frameRate`/`frameCount` = **13 B** (24 fps / 12 frames) |
+| Exported symbols | **35** (`catalog.xml` scripts × `SymbolClass` × `DoABC`, all three agree): **34 symbol classes + 1 bitmap resource class `desktopicon`**; this export's `SymbolClass` **contains no `#0`** (document-class entry), so it never hits the "exported character has no definition" error |
+| Bitmap resources | **15 tags** (`DefineBitsLossless2`×13 + `DefineBitsJPEG3`×2), of which **only 1 is a named resource class `desktopicon`(342×194)**; the other 14 are unnamed embedded bitmaps (`DefineBitsLossless` tag 20 **not present at all**) |
+| Shapes | `DefineShape`×54 + `DefineShape2`×10 + `DefineShape3`×4 + `DefineShape4`×22 = **90 characters**; plus `DefineMorphShape`×1 (baked to an empty placeholder) |
+| Movie clips | `DefineSprite`×**66** (**21 of them multi-frame**), `DefineButton2`×4, `DefineScalingGrid`×5 (nine-slice) |
+| Text | `DefineEditText`×56 (with InitialText, baked to a `TextField`) + `DefineText`×2 (glyphs need the embedded font's CodeTable, baked to an empty box); `DefineFont3`×5 |
+| Timeline | `FrameLabel`×36 (11 of the multi-frame clips carry `_up/_over/_down`), `PlaceObject2`×403 + `PlaceObject3`×18, `RemoveObject2`×4 |
 
 ---
 
@@ -68,9 +91,10 @@ In the Flash/Flex ecosystem, resources (skin bitmaps, icons, fonts) have two pos
 | Own project + `[Embed(source="a.png")]` | the original image is still in the source directory | low — read the original directly, **no need to touch the SWC** | **also unimplemented**: `parser.ts` only does generic metadata parsing (`parseMetadataIfPresent`), and `Embed` has no semantic-layer consumer; apart from comments and `EmbedFont` (app.xml fonts), `src/` has no Embed handling |
 | Third-party library / a skin library exported by Flash IDE | the original image is unavailable, only the `.swc` | high — must unpack the SWC + parse the SWF | covered by this plan |
 
-The user's scenario is the latter: `temp/skin.swc` is a UI skin library exported by Flash IDE (with resource
-classes `logo`/`imgback`/`desktopicon`/`cambitmap` etc.), whose original images are lost, so they can only be
-extracted from the SWC.
+The user's scenario is the latter: `examples/embed-assets/skin.swc` is a UI skin library exported by Flash
+IDE (**the earlier export** had `logo`/`imgback`/`cambitmap` and 12 scrollbar skins plus 4 self-owned resource
+classes; **the checked-in fixture** is left with just `desktopicon`, one bitmap resource class, plus 34
+display-object symbols), whose original images are lost, so they can only be extracted from the SWC.
 
 > Both roads require writing code, so don't treat the first row as an "existing shortcut" — its only advantage
 > is **not needing to parse SWF**.
@@ -88,13 +112,13 @@ skin.swc (ZIP archive)
 └── library.swf    737,552 B (uncompressed) / 737,700 B (after deflate) — the build product: an SWF container (CWS = zlib compressed)
 ```
 
-The structure of `catalog.xml` (measured on `temp/skin.swc`):
+The structure of `catalog.xml` (measured on `examples/embed-assets/skin.swc`):
 
 ```xml
 <swc xmlns="http://www.adobe.com/swccatalog/9">
   <libraries>
     <library path="library.swf">
-      <script name="logo" mod="..." signatureChecksum="...">
+      <script name="logo" mod="..." signatureChecksum="...">      <!-- fragment from the earlier export -->
         <def id="logo" />
         <dep id="flash.display:BitmapData" type="s" />
         <dep id="Object" type="i" />
@@ -123,13 +147,17 @@ Measured addendum: `catalog.xml` has **255** `<script>` entries in total; `libra
 ## 3. The Real Storage Form of the Resource: SWF Tags
 
 `library.swf` is a standard SWF container; the first 8 bytes `CWS` mean zlib compression (`FWS` =
-uncompressed, `ZWS` = LZMA). Measured, `temp/skin.swc`'s `library.swf` is **CWS** (decompressed body =
-1,031,069 B). After decompression comes the tag stream, each tag being a `(code:length) header + data body`.
+uncompressed, `ZWS` = LZMA). Measured, **the earlier export**'s `library.swf` is **CWS** (decompressed body =
+1,031,069 B); the checked-in fixture is likewise CWS (decompressed
+**505,122 B**, see §0.1). After decompression comes the tag stream, each tag being a `(code:length) header +
+data body`.
 
 > **Important**: before scanning the tag stream you must skip the SWF stage header — `RECT` (`nbits` starts
-> with 5 bits, total `5+4*nbits` bits) + `frameRate`(UI16) + `frameCount`(UI16). Measured, this file has
-> `nbits=17` and a **14-byte** header. An earlier implementation that scanned from body offset 0 would get a
-> pile of meaningless tag codes (easily misjudging "there are no bitmaps").
+> with 5 bits, total `5+4*nbits` bits) + `frameRate`(UI16) + `frameCount`(UI16). Measured, the earlier export
+> has `nbits=17` (a 14-byte header), while **the checked-in fixture is `nbits=15` → 13 bytes**, so the header
+> length must not be hard-coded but computed as `ceil((5+4*nbits)/8) + 4`. An earlier implementation that
+> scanned from body offset 0 would get a pile of meaningless tag codes (easily misjudging "there are no
+> bitmaps").
 
 Resource-related tags (measured tag type distribution):
 
@@ -145,9 +173,19 @@ Resource-related tags (measured tag type distribution):
 | **symbol → class name** | `SymbolClass` | 76 | `{id → "class name"}` mapping |
 | Timeline movie clip | `DefineSprite` | 39 | display tree (`PlaceObject` children) |
 
-Measured, `temp/skin.swc`'s `library.swf` has **59 bitmap tags** (`DefineBitsLossless2`×53 +
+Measured, the earlier export's `library.swf` has **59 bitmap tags** (`DefineBitsLossless2`×53 +
 `DefineBitsLossless`×1 + `DefineBitsJPEG2`×3 + `DefineBitsJPEG3`×2), and **214 mappings** in `SymbolClass`;
-plus `DefineSprite`×333, `DefineShape*`×378, `DefineButton2`×29, **`DefineFont3`×7**.
+plus `DefineSprite`×333, `DefineShape*`×378, `DefineButton2`×29, **`DefineFont3`×7**; two of the
+`DefineBitsJPEG3` (`#1113` 186×160, `#1118` 167×162) are exactly the illustrations on TalkMED's home-page
+cards, whose alpha planes must be composited (§3.2③).
+
+**The checked-in fixture is much smaller** (§0.1): **15 bitmap tags** (`DefineBitsLossless2`×13 +
+`DefineBitsJPEG3`×2, **no tag 20 / tag 21**), **35 mappings** in `SymbolClass`, `DefineSprite`×66,
+`DefineShape`×54 + `DefineShape2`×10 + `DefineShape3`×4 + `DefineShape4`×22 (90 shape characters in total),
+**`DefineButton2`×4**, `DefineFont3`×5. In other words: **the bitmap count, the tag mix and the named-resource
+table have all changed**, but the mechanism conclusion of "which tags must be handled" is unchanged (the two
+JPEG3 images' earlier 186×160 and 167×162 samples become `#156` 186×160 and `#165` 167×162 in the current
+fixture — same sizes, different character ids).
 
 ### 3.1 Important Pitfall: `DefineBitsLossless` Stores **Not PNG**, and tag 20 ≠ tag 36
 
@@ -164,16 +202,19 @@ DefineBitsLossless2 (tag 36) data body:
   zlibData      ...   (zlib-compressed pixel data)
 ```
 
-Measured, extracting `symbol#2` (`logo`): `characterID=2, format=5, 100×72`, decompressed pixels
-`28800 bytes = 100×72×4`, the first 16 bytes all 0 (transparent edge), non-zero pixels 37.1% — valid image
-content.
+Measured (**the earlier export**), extracting `symbol#2` (`logo`): `characterID=2, format=5, 100×72`,
+decompressed pixels `28800 bytes = 100×72×4`, the first 16 bytes all 0 (transparent edge), non-zero pixels
+37.1% — valid image content. The current fixture's equivalent sample is `#1 desktopicon` (`format=5`,
+342×194, `265,392 B = 342×194×4`); those "numbers" below hold just the same with the new sample.
 
 **tag 20 and tag 36 must not be conflated**: their data-body layouts are almost identical, but **tag 20's
 format 5 is 24-bit RGB (XRGB, the first byte is padding with no alpha semantics)**, while only tag 36's
 format 5 is true ARGB. Treating tag 20's first byte as alpha would make a whole image fully transparent on a
-product where the padding bit is `0x00`. Measured, the only tag 20 in `temp/skin.swc` happens to be the
-**largest resource**, `cambitmap` (700×393, 1,100,400 B of pixels, whose padding bit is exactly `0xFF`, so it
-happens to display correctly — and that "happening to" is exactly what must be avoided).
+product where the padding bit is `0x00`. Measured (**the earlier export**), the only tag 20 in that `skin.swc`
+happens to be the **largest resource**, `cambitmap` (700×393, 1,100,400 B of pixels, whose padding bit is
+exactly `0xFF`, so it happens to display correctly — and that "happening to" is exactly what must be avoided);
+**the current fixture has no tag 20 at all** (all 15 bitmaps are tag 36/35), so this pitfall can only be
+regression-tested on the earlier export.
 
 **Conclusion**: `DefineBitsLossless*` requires "decompress zlib → get the raw pixels" and **cannot** be fed
 directly to Skia's `MakeFromEncoded` (which only recognizes encoded formats such as PNG/JPEG). Whereas
@@ -184,8 +225,10 @@ directly to Skia's `MakeFromEncoded` (which only recognizes encoded formats such
 A raw bitmap's pixels have two properties that must be clarified first: **byte order** and **whether it is
 premultiplied**. Both have been settled against `adl` ground truth.
 
-**① Byte order = `A, R, G, B` (the first byte is alpha)** — verified pixel by pixel on 7200/7200: the
-`px[0]` we parse out and `logo.getPixel32()`'s alpha channel are **exactly equal**, without exception.
+**① Byte order = `A, R, G, B` (the first byte is alpha)** — verified pixel by pixel on 7,200/7,200 (**the
+earlier export**'s 100×72 `logo`, whose alpha channel is **exactly equal** to `logo.getPixel32()`, without
+exception; in the current fixture the same path is pinned to concrete pixels by `desktopicon` in
+`examples/swc-bitmap.as`, see §9.1 acceptance baseline ②).
 
 **② The data is "premultiplied ARGB", whereas AIR's `getPixel32` returns "straight ARGB".**
 
@@ -338,7 +381,7 @@ only methods attached to instance/class traits):
 
 | Category | Count | Class-level bytecode | Content | Source availability |
 |---|---|---|---|---|
-| Bitmap resource classes (`extends BitmapData`×4 / `BitmapAsset`×12) | 16 | **152 B** | content=bitmap, the class is just a 9–11 B constructor | must be synthesized from the SWC (§5) |
+| (**the whole table below is the earlier export's ABC profile**) Bitmap resource classes (`extends BitmapData`×4 / `BitmapAsset`×12) | 16 | **152 B** | content=bitmap, the class is just a 9–11 B constructor | must be synthesized from the SWC (§5) |
 | Flash IDE symbol classes with `extends MovieClip` | **192** | **5,489 B** | UI skin components (`alertskin`/`popgiftskin`/`homeskin`…); **the vast majority are 9 B empty constructors**, only a few have real code (`checkbom` 132 B, `toastbtn` 73 B, `devicesitemskin` 62 B, `PPTNextPage(Pre)Button` 51 B) | code can be ignored; the **content** is timeline/bitmap |
 | Interfaces (`extends null`) | 6 | 6 B | empty | — |
 | `mx.core` / `mx.utils` (Flex) | **8** (of which 5 are the interfaces in the row above) | **3,135 B** | see below | **no source (the only such group)** |
@@ -454,7 +497,7 @@ The earlier version equated "resources" with bitmaps; `DefineShape*×378` appear
 distribution table, **with neither a section nor a plan**. Measured, these tags are the **bulk** of this
 library's resources (and vectors are precisely Flash's core capability).
 
-**① Measured tag profile** (recursively scanning into `DefineSprite`; `temp/skin.swc`):
+**① Measured tag profile** (recursively scanning into `DefineSprite`; `examples/embed-assets/skin.swc`):
 
 | tag | Count | Note |
 |---|---|---|
@@ -569,7 +612,7 @@ giving the method; now measured and solved):
 ```
 
 That is, "LZMA raw filter + lc/lp/pb/dict recovered from props" is enough; no mangled-header patch like
-`make_lzma_reader` is needed (that one is for the 13-byte LZMA-alone header). `temp/skin.swc` is `CWS`, so this
+`make_lzma_reader` is needed (that one is for the 13-byte LZMA-alone header). `examples/embed-assets/skin.swc` is `CWS`, so this
 path can be skipped in the first iteration, but since the layout is settled, implementing it is cheap.
 
 ---
@@ -638,7 +681,7 @@ biggest waste of source size (see §5.1); it should be changed to **embedding th
 
 ### 5.1 Embedding Form and Source-Size Cost (**three forms measured item by item**; earlier estimate corrected)
 
-Measured item by item for `temp/skin.swc`'s **16 named resources**:
+Measured item by item for **the earlier export**'s **16 named resources**:
 
 | Form | Total | Note |
 |---|---|---|
@@ -648,19 +691,35 @@ Measured item by item for `temp/skin.swc`'s **16 named resources**:
 | PNG embedded in C source (`\xNN` escaped string) | **43,723 B ≈ 42.7 KB** | **the form to adopt** |
 | Raw ARGB embedded in C source (`0xNN,`) | **7,777,060 B ≈ 7.42 MB** | **the earlier plan — wrong** |
 
-Looking at only the largest, `cambitmap` (700×393, tag 20): raw ARGB **1,100,400 B** → PNG **8,070 B**.
+Looking at only the earlier export's largest, `cambitmap` (700×393, tag 20): raw ARGB **1,100,400 B** → PNG
+**8,070 B**. (tag 20 is unique to the earlier export: **the current fixture has not a single
+`DefineBitsLossless`**.)
 
-**A 178× difference in source size**. So the resource section should look like this (encoded bytes, not
-pixels):
+**A 178× difference in source size** (the earlier export's numbers) — so the resource section can only be
+encoded bytes, never pixels.
+
+**The checked-in fixture** has only **1** named bitmap resource (`desktopicon` 342×194, §0.1), and the set
+actually embedded is exactly one PNG: `encoded` **1,671 B** ↔ raw ARGB **265,392 B** (**159×**); the 14
+**unnamed** bitmaps (referenced only as shape fills) are not embedded at all — together their raw ARGB is
+**10,300,716 B** (the single `#46`, 2832×805, is 9.1 MB on its own). This contrast is exactly why "resources
+must be embedded encoded" is not a convenience but the only viable form.
+
+The resource section actually looks like this (below is the current fixture's `desktopicon`, **the real
+emission result**):
 
 ```c
-/* SWC resource: skin.swc#logo (100x72) — PNG bytes; decoded at runtime by
-   as_skia_image_decode_bytes_argb (same path as Loader.loadBytes). */
-static const unsigned char __res_skin_logo_png[] =
-  "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR...";   /* PNG total 1,651 B */
-static const int __res_skin_logo_w = 100;
-static const int __res_skin_logo_h = 72;
+// SWC resource: <path>/skin.swc#desktopicon (342x194) — png bytes;
+// decoded at runtime by as_skia_image_decode_bytes_argb (same path as Loader.loadBytes).
+static const unsigned char __res_desktopicon[] =
+  "\x89PNG\x0d\x0a\x1a\x0a\x00\x00\x00\x0dIHDR\x00\x00\x01V..."   /* PNG total 1,671 B */;
+
+// In the resource class's own constructor (the size needs no separate constant):
+BitmapData_adoptEncoded((BitmapData*)o, __res_desktopicon, (size_t)1671);
 ```
+
+> The earlier document wrote two constants `__res_skin_logo_w/_h` here — **they are no longer emitted**: the
+> width/height are self-described by the encoded bytes (the PNG's IHDR), removing the risk of "a constant
+> disagreeing with the IHDR".
 
 **No longer in conflict with stage seventy-eight**: the resources total about **42.7 KB of C source** (5%
 relative to `hello.as`'s 854 KB), entirely embeddable within a **single `.c`**, consistent with "a single-file
@@ -676,22 +735,25 @@ conclusion**:
 
   > **Measurement correction (2026-10-05, implementation)**: the first half of that sentence **holds but needs a
   > qualifier**. Under native `-O2`, comparing `hello.as` (referencing no resource at all) with the same plus
-  > `--swc temp/skin.swc`: the binary goes **130,552 → 195,880 B (+≈65 KB)**, of which `__text` 59,012 → 99,556
+  > `--swc examples/embed-assets/skin.swc`: the binary goes **130,552 → 195,880 B (+≈65 KB)**, of which `__text` 59,012 → 99,556
   > (**+40.5 KB of code**) and `__data` 4,088 → 17,384 (**+13.3 KB of tables**). **The embedded PNG bytes
   > themselves are indeed discarded** (no resource's complete bytes can be found in the artifact), but **the 16
   > synthesized resource classes are not trimmed** — their constructors/`_new`/vtables/props tables/registry
   > entries reference one another into a cluster that the linker cannot drop from the reachable roots (and this
   > is **the semantics §6 wants**: `getDefinitionByName("logo")` must be resolvable at any time). So the
   > accurate statement is: **unreferenced resources' "bytes" are discarded, but the resource "classes'" cost
-  > stays in the artifact** (16 classes, about 53 KB, i.e. ≈3.3 KB per class). Only when a resource is
-  > referenced do its bytes truly enter the artifact.
+  > stays in the artifact** (16 classes, about 53 KB, i.e. ≈3.3 KB per class; **this is the earlier export's
+  > 16 classes**, while the current fixture has only 1 resource class, so the scale drops to ≈3 KB
+  > accordingly). Only when a resource is referenced do its bytes truly enter the artifact.
 
 > **A PNG encoder is needed at compile time**: implementable with Node's built-in `zlib` (IHDR/IDAT/IEND + a
 > filter 0 per row, about 100 lines, zero third-party dependencies). `DefineBitsJPEG2` tags already store a
 > complete JPEG, so **the raw bytes are copied, with no encoder needed**; `DefineBitsJPEG3` additionally
 > carries a zlib alpha plane that is decompressed at compile time and composited at runtime (§3.2③).
-> Measured, all 16 named resources in
-> this sample are lossless (no JPEG hit), so the first iteration must implement the PNG encoder.
+> Measured, **the earlier export**'s 16 named resources are all lossless (no JPEG hit), so the PNG encoder is
+> a first-iteration must; **the current fixture**'s 15 bitmaps include **2 `DefineBitsJPEG3`** (with a separate
+> zlib alpha plane): their JPEG raw bytes can be copied, but they must go through "runtime Skia decodes the
+> JPEG + composites the alpha plane" (§3.2③ / §9.2 F7), which the PNG path cannot cover.
 
 ### 5.2 Resources That Should *Not* Be Embedded: the Desktop / Web / Mobile Channel (**already exists — do not rebuild it**)
 
@@ -757,7 +819,7 @@ records).
 
 ## 6. AS3-Side Reference Semantics: Resource Class = `BitmapData` Subclass
 
-This is the key to how codegen lands resource references. In the ABC of `temp/skin.swc`'s `library.swf`:
+This is the key to how codegen lands resource references. In **the earlier export**'s `library.swf` ABC:
 
 ```
 public dynamic class logo extends flash.display::BitmapData
@@ -767,47 +829,62 @@ public dynamic class desktopicon extends flash.display::BitmapData
 public dynamic class cambitmap extends flash.display::BitmapData
 ```
 
-**Resource classes (`logo`/`imgback`/`desktopicon`/`cambitmap` etc.) are dynamic subclasses of
-`flash.display.BitmapData`**, constructor signature `(int width, int height)`. This is the standard form of a
-skin library exported by Flash IDE.
+**The checked-in fixture**'s ABC is left with `desktopicon` as the only resource class (scanning the ABC
+string table for `BitmapData` hits exactly once), and all the other 34 exports are **display-object** symbols:
 
-> **The constructor arguments are ignored** — measured, `new logo(0, 0)` yields a `BitmapData` of **100×72**
-> (the real size comes from the SWF tag), not `0×0`. The factory **must use the resource's own width/height**
-> and must not trust the arguments (writing `new logo(0,0)` is the customary style in the Flash IDE ecosystem;
-> the parameter is a placeholder).
+```
+public dynamic class desktopicon extends flash.display::BitmapData
+  public function desktopicon(int,int):*     // constructor signature matches the earlier export
+upvpage     -> flash.display.SimpleButton
+applistskin -> flash.display.MovieClip
+```
 
-And of the 214 mappings in `SymbolClass`, **only 16 bitmaps map directly to class names**, the other **43
-bitmaps having no class name** (referenced by `Sprite`/`DefineShape` as children). Those 16 are:
+**A resource class (any dynamic subclass of `flash.display.BitmapData`) has the constructor signature
+`(int width, int height)`**. This is the standard form of a skin library exported by Flash IDE.
+
+> **The constructor arguments are ignored** — measured (**the earlier export**), `new logo(0, 0)` yields a
+> `BitmapData` of **100×72**, and (**the checked-in fixture**) `new desktopicon(0, 0)` yields **342×194** (the
+> real size comes from the SWF tag), neither `0×0`. The factory **must use the resource's own width/height**
+> and must not trust the arguments (writing `new desktopicon(0,0)` is the customary style in the Flash IDE
+> ecosystem; the parameter is a placeholder).
+
+**The earlier export**'s `SymbolClass` has 214 mappings, of which only 16 **bitmaps** map directly to class
+names and the other 43 bitmaps have no class name (referenced by `Sprite`/`DefineShape` as children):
 
 ```
 desktopicon  logo  imgback  cambitmap
-com.example.controls.scrollbar.ScrollSkin_{top,middle,bottom,wbottom,wleft,wmiddle,wtop,wright}SkinClass
-com.example.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wright}SkinClass_200
+com.example.controls.scrollbar.ScrollSkin_{top,middle,bottom,...}SkinClass[_200]   (12 fully qualified names)
 ```
 
-> **The earlier version had two errors here**:
-> ① The examples **`small_gift`/`checkbom` do not belong to these 16** — measured, they are
-> **`DefineSprite` (tag 39)**, i.e. `small_gift` = symbol 19, `checkbom` = symbol 154, falling into the
-> "display tree must be parsed" tier (the next section).
-> ② **12 of the 16 are fully qualified names** (`com.example.controls.scrollbar.*`). This is a hard
-> constraint on "approach one: directly `new resourceClass`" — real code would hardly write
-> `new com.example....(...)`, and scrollbar skins are usually referenced inside a component class or fetched
-> via `getDefinitionByName`. **So on a library like `skin.swc`, what is actually usable is approach two**, and
-> approach one is only convenient when the library has short-named resource classes (such as a top-level short
-> name like `logo`).
+**The checked-in fixture** has only **35 mappings** (§0.1), and **only 1 bitmap** (`desktopicon`) has a class
+name — the other 34 map to **display-object symbols** (`DefineSprite`/`DefineButton2`/`DefineEditText`),
+falling into the "display tree must be parsed" tier: `desktopshareitem` `homeskin` `checkbom` `toastbtn`
+`upvpage`(button) `元件97` …; the other 14 bitmaps are unnamed and serve only as shape fills.
+
+> **The earlier version had two errors here** (against the earlier export at the time, and equally checkable on
+> the current fixture):
+> ① The example **`checkbom` does not belong to the bitmap tier** — measured, it is **`DefineSprite`
+> (tag 39)** (symbol 154 in the earlier export, #26 in the current fixture), falling into the "display tree
+> must be parsed" tier (the next section).
+> ② 12 of the earlier export's 16 named resources are **fully qualified names**
+> (`com.example.controls.scrollbar.*`), a hard constraint on "approach one: directly `new resourceClass`" —
+> real code would hardly write `new com.example....(...)`. **The current fixture drops those 12 fully qualified
+> resources entirely** (there is no scrollbar component), and its only resource class `desktopicon` is a
+> top-level short name — but approach two is still the primary landing (reason below).
 
 **AS3-side reference approaches (two, by user code style)**:
 
 | Reference approach | Typical code | codegen landing | Applicability |
 |---------|---------|-------------|---------|
-| Direct `new resourceClass(w,h)` | `var b:Bitmap = new Bitmap(new logo(0,0));` | the resource class is registered as a `BitmapData` subclass, and `new` dispatches to an "embedded pixel fill" factory (ignoring the arguments, using the tag's width/height) | top-level short-named resources (measured 4/16) |
-| `SymbolClass` reflection | `getDefinitionByName("logo")` | a resource registry `{name → factory pointer}`, looked up dynamically | all 16 (including the 12 fully qualified names) |
+| Direct `new resourceClass(w,h)` | `var b:Bitmap = new Bitmap(new desktopicon(0,0));` | the resource class is registered as a `BitmapData` subclass, and `new` dispatches to an "embedded pixel fill" factory (ignoring the arguments, using the tag's width/height) | top-level short-named resources (measured 4/16 in the earlier export; 1/1 in the current fixture) |
+| `SymbolClass` reflection | `getDefinitionByName("desktopicon")` | a resource registry `{name → factory pointer}`, looked up dynamically | all named resource classes (16 in the earlier export, including 12 fully qualified names; 1 in the current fixture) |
 
 > The reflection path is **no longer a "later extension"**: `emit.ts` already has a
 > `flash.utils.getDefinitionByName` registry (`getQualifiedClassName` ↔ `getDefinitionByName` round trip), so
 > registering the resource classes into it is a reuse.
-> Given that 12/16 of `skin.swc` are fully qualified names, **approach two is recommended as the primary
-> landing**, with approach one as a convenience supplement.
+> 12/16 of the earlier export are fully qualified names (the current fixture has no fully qualified resource
+> class at all, but that is a fixture difference, not a mechanism difference), so **approach two is still
+> recommended as the primary landing**, with approach one as a convenience supplement.
 
 ---
 
@@ -956,7 +1033,7 @@ parsing), **but it is not portable** (Rust + `gc_arena` GC). Its value is as a *
 
 ### 9.1 E measurement results (2026-10-05, reproducible)
 
-**Method**: `temp/swc-render/` (the harness's `gen.ts` generates a shared body from `temp/skin.swc`; both
+**Method**: `temp/swc-render/` (the harness's `gen.ts` generates a shared body from `examples/embed-assets/skin.swc`; both
 sides render the same batch of exported symbols to `ours.txt` / `adl.txt`, respectively with this compiler and
 with `adl`; the comparator is `compare.ts`). Each symbol gets a fingerprint from the 64-cell 8×8 alpha-weighted
 cell means (`fp`), the non-transparent pixel count `nz`, and a raw ARGB dump
@@ -1017,8 +1094,8 @@ structural difference and every **already-colored** cell (both sides' alpha mean
   difference. Original reproduction command:
   `cd temp/swc-render && node gen.ts && node ../../src/index.ts scene.as --manifest t.build.json --run && ./run_adl.sh && node compare.ts`.
 
-**Acceptance baseline (this re-verification's data can be reused directly)**: run the extractor on
-`temp/skin.swc`:
+**Acceptance baseline (the earlier export; that re-verification's data can be reused directly)**: run the
+extractor on that `skin.swc`:
 ① all 16 named resources extracted; ② `logo` is 100×72 and holds the **de-premultiplied** values (first solve
 straight ARGB, then encode as PNG); ③ **compared point by point with `adl`'s `getPixel32`** (§11's method),
 allowing ±1 channel deviation; ④ size: the 16 resources' encoded bytes total ≈ **14.6 KB** (PNG), C source ≈
@@ -1026,6 +1103,26 @@ allowing ±1 channel deviation; ④ size: the 16 resources' encoded bytes total 
 closure's (322 shapes / 327 sprites) rendering is compared against `adl` screenshots (§3.4, §11⑤);
 ⑥ nine-slice scaling (22 `DefineScalingGrid`) and button four states (29 `DefineButton2`) compared against
 `adl` screenshots.
+
+**Acceptance baseline (the checked-in fixture, `examples/embed-assets/skin.swc`)** — the same criteria with
+freshly measured values:
+① **all 15 bitmap tags extracted** (`DefineBitsLossless2`×13 + `DefineBitsJPEG3`×2, the latter with a separate
+   alpha plane), of which **only 1 is the named resource class `desktopicon`** and the other 14 are unnamed and
+   serve only as shape fills (§0.1);
+② `desktopicon` is **342×194** and holds the **de-premultiplied** values (`examples/swc-bitmap.as` pins it to
+   concrete pixels: `(0,0)` fully transparent, `(1,97)=0xffcccccc`, `(171,97)=0xfff6f6f6`, `(341,193)` alpha
+   `0xcf`);
+③ the same bytes compared point by point with `adl`'s `getPixel32` (§11's method), allowing ±1 channel
+   deviation;
+④ size: the named resource's `encoded` **1,671 B** (PNG) → the `\xNN` string in C source ≈ **6.7 KB**; all 15
+   bitmaps' raw ARGB totals **10,300,716 B**, not one of them embedded;
+⑤ vectors: **90 shape characters** (`DefineShape`×54 + `DefineShape2`×10 + `DefineShape3`×4 + `DefineShape4`×22)
+   all parsed and baked; a stroke-only, fill-less character (e.g. #36) must emit only `as_swc_stroke`, not
+   `as_swc_fill`;
+⑥ nine-slice (**5** `DefineScalingGrid`) and button four states (**4** `DefineButton2`, of which `upvpage` is
+   exported as a `SimpleButton`) compared against `adl`;
+⑦ timeline: the frame scripts, backward reuse and `currentLabels` of the **21 multi-frame baked clips**
+   (`FrameLabel`×36, 11 of which carry `_up/_over/_down`) agree with `adl` (§9.2 F6/F8/F9).
 
 ### 9.2 F measurement results (2026-10-05, reproducible)
 
@@ -1137,7 +1234,7 @@ states.
 #### F3 `PlaceObject3`'s attributes: visibility implemented, Filter / BlendMode / BitmapCache still discarded
 
 **Origin (found by a survey on 2026-10-06)**: `readSwfPlacement` had always read `PlaceObject3`'s three
-attributes and thrown them away. Surveying `temp/skin.swc` (`temp/swc_po3_visible.ts`): **64 `PlaceObject3`
+attributes and thrown them away. Surveying `examples/embed-assets/skin.swc` (`temp/swc_po3_visible.ts`): **64 `PlaceObject3`
 records, 63 of them inside the baked closure of exported symbols** — `hasVisible` 38, `FILTERLIST` 13,
 `BlendMode` 8, `BitmapCached` 2.
 
@@ -1178,14 +1275,14 @@ precisely the signature of a hidden object over an opaque white rectangle).
 
 ```
 # PlaceObject3 attribute survey (how many records, whether inside the baked closure, the actual Visible values)
-node temp/swc_po3_visible.ts ../temp/skin.swc
+node temp/swc_po3_visible.ts ../examples/embed-assets/skin.swc
 # Object-tree comparison (one each for ours and adl, per-child visible)
 cd temp/vishidden && node gen.ts && ../../src/index.ts ours.as --manifest t.build.json --run && ./run_adl.sh && diff adl.txt ours.txt
 # 1× full pixel re-test (the same harness as §9.1)
 cd temp/swc-render && <ours> && ./run_adl.sh && node compare.ts
 
 # Structural regression (vectors/display tree/nine-slice/button four states, both builds succeed)
-cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../temp/skin.swc --run
+cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../examples/embed-assets/skin.swc --run
 # F1 nine-slice (entry 103 = 元件97; #545 has a grid)
 cd temp/swc-render && RAW=103 SCALE=2,2 node gen.ts && <ours> && ./run_adl.sh && node rawpng.ts 103
 # F2 button four states (offscreen, deterministic)
@@ -1203,7 +1300,7 @@ cd temp/btnstate && node gen.ts && python3 drive.py <repo>/temp/btnstate/ours <A
 wholesale** (`SwcPlacement` did not even have the fields). They are all AIR-defined behavior ⇒ legacy defects,
 all closed in one pass in this stage.
 
-**Owner distribution** (`node temp/swc_po3_detail.ts ../temp/skin.swc`, counting only records inside the baked
+**Owner distribution** (`node temp/swc_po3_detail.ts ../examples/embed-assets/skin.swc`, counting only records inside the baked
 closure):
 
 | Attribute | Count | Detail |
@@ -1323,7 +1420,7 @@ baseline).
 
 ```
 # Po3 attribute survey (with a kind histogram and per-record shape)
-node temp/swc_po3_detail.ts ../temp/skin.swc
+node temp/swc_po3_detail.ts ../examples/embed-assets/skin.swc
 # Strength model / box-blur model / invariants (run once per side; CHK identical line by line)
 cd temp/filterprobe && node gen.ts && ../../src/index.ts ours.as --manifest ../swc-render/t.build.json --run && ./run_adl.sh
 # Attribute fingerprint (filtered children, blendMode, cacheAsBitmap item by item against adl)
@@ -1333,7 +1430,7 @@ cd temp/swc-render && RAW=29 node gen.ts && <ours> && ./run_adl.sh && node rawpn
 # 1× full pixel re-test
 cd temp/swc-render && <ours> && ./run_adl.sh && node compare.ts
 # Structural regression (tree and field assertions for glow / darken / layer / cacheAsBitmap; pure structure, no Skia)
-cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../temp/skin.swc --run
+cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../examples/embed-assets/skin.swc --run
 ```
 
 ---
@@ -1497,7 +1594,7 @@ cd temp/childfx && node gen.ts && ../../src/index.ts ours.as --manifest ../swc-r
 # Declared rect vs path union (survey of 378 shapes)
 node temp/shbox.ts
 # Structural regression
-node src/index.ts examples/swc-shape.as --swc ../temp/skin.swc --run
+node src/index.ts examples/swc-shape.as --swc ../examples/embed-assets/skin.swc --run
 # 1x full pixels (must be line-identical to rep_final.txt)
 cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node compare.ts
 ```
@@ -1521,7 +1618,7 @@ of API output, and after explicitly normalizing the known differences (child `na
 
 | Observation | `adl` semantics |
 |---|---|
-| `totalFrames` | = the SWF's number of `ShowFrame`s (`desktopshareitem` 21, `devicesitemskin` 23, `元件16_124` 17, `checkbom`/`toastbtn` 2, `元件172_339` 3) |
+| `totalFrames` | = the SWF's number of `ShowFrame`s (the earlier export: `desktopshareitem` 21, `devicesitemskin` 23, `元件16_124` 17, `checkbom`/`toastbtn` 2, `元件172_339` 3; **the current fixture**: `元件77_50` 100, `元件16复制12_68` 23… see §0.1 and `skin_fla.元件16_54` 17 / `元件17_55` 11 / `checkbom`/`toastbtn`/`元件20_57` 2) |
 | Initial state of a fresh clip | `currentFrame == 1`, **`isPlaying == false`**, and it **does not self-advance across 12 frames** while on the display list (same offscreen and onscreen) ⇒ the skin symbol's `stop()` is in the DoABC; **since v0.4.127 frame scripts are decoded at compile time and actually executed** (§3.3 close-out), so this is no longer "we cannot read it, so we must stay on frame 1" — the file simply *says* `stop()`, and running it is what matches AIR |
 | Property name | it is **`isPlaying`** (there is no `playing`) |
 | `currentLabel` / `currentFrameLabel` | that frame's `FrameLabel` name, or `null` |
@@ -1607,8 +1704,11 @@ object in AIR, while we build a new one — a baked class carries its artwork (o
 character change necessarily means a new instance. D43b cannot lose application text (it only fires when the
 character really changed) and is tracked in the difference doc for a later architectural decision.
 
-**Baked counts (`temp/tlcheck.ts`)**: 79 multi-frame sprites, of which **75** change after frame 1, **448**
-op frames, **514** ops (**102** add/replace, **404** modify, **8** delete); **89** `FrameLabel`s (31 sprites).
+**Baked counts (`temp/tlcheck.ts`):** the earlier export: 79 multi-frame sprites, of which **75** change after
+frame 1, **448** op frames, **514** ops (**102** add/replace, **404** modify, **8** delete), **89**
+`FrameLabel`s (31 sprites). **The current fixture**, freshly measured: **21** multi-frame baked clips,
+**36** `FrameLabel`s (11 clips carry `_up/_over/_down`), **4** `RemoveObject2`, **403** `PlaceObject2` + **18**
+`PlaceObject3` (§0.1).
 
 **Acceptance**
 
@@ -1641,7 +1741,7 @@ additions).
 
 ```
 # Timeline API item by item against adl (68 lines)
-cd temp/tlprobe && node gen.ts && ../../src/index.ts ours.as --swc ../../temp/skin.swc --run && ./run_adl.sh && python3 cmp.py adl.txt ours.txt
+cd temp/tlprobe && node gen.ts && ../../src/index.ts ours.as --swc ../../examples/embed-assets/skin.swc --run && ./run_adl.sh && python3 cmp.py adl.txt ours.txt
 # Baked counts and op counts
 node temp/tlcheck.ts
 # Child tree (15 symbols / 99 children)
@@ -1718,8 +1818,8 @@ machine. The AcmeApp skin contains **29** such symbols.
 
 | Observation | `adl` behavior |
 |---|---|
-| Gate | it is **`buttonMode`**, not "labels make it a button": switching the same class's `buttonMode` off pins it to frame 1 forever, and another symbol that has labels but no script (`BtnRootResources_99复制_362`, `buttonMode` default `false`) also stays on frame 1 |
-| Frame | decided by the **label**, not by an index: `元件17_125` is `_up@1/_over@4/_down@7`, `BtnRootResources_99复制_362` is `_up@1/_over@5/_down@10`; each lands on its own label's frame |
+| Gate | it is **`buttonMode`**, not "labels make it a button": switching the same class's `buttonMode` off pins it to frame 1 forever, and another symbol that has labels but no script (the earlier export's `BtnRootResources_99复制_362`; **the current fixture**'s `skin_fla.BtnRootResources_99复制_64`) also stays on frame 1 |
+| Frame | decided by the **label**, not by an index: the earlier export's `元件17_125` is `_up@1/_over@4/_down@7` and `BtnRootResources_99复制_362` is `_up@1/_over@5/_down@10`; **the current fixture**'s counterparts are `skin_fla.元件17_55` (`_up@1/_over@4/_down@7`) and `skin_fla.BtnRootResources_99复制_64` (`_up@1/_over@5/_down@10`), each landing on its own label's frame |
 | Three levels | away → `_up`; roll-over → `_over`; press → `_down` (**a real navigation**: both `currentFrame` and `currentLabel` change) |
 | Press latch | latched to the object where `mouseDown` happened: pressing elsewhere and dragging in shows only `_over`; pressing here and dragging out still holds `_down` |
 | Release | release inside goes back to `_over`, outside to `_up` |
@@ -1752,9 +1852,9 @@ recipe did not" still invalidates the cache.
 
 **Acceptance**
 
-- **Two-ended comparison**: `temp/btnprobe/` agrees level by level on frames and labels (`元件17_125`
-  `1:_up`→`4:_over`→`7:_down`, dragging off while held keeps `7:_down`, releasing outside gives `1:_up`,
-  releasing in place returns to `4:_over`, a press that started elsewhere shows only `4:_over`), with pixel
+- **Two-ended comparison**: `temp/btnprobe/` agrees level by level on frames and labels (the earlier export's
+  `元件17_125` `1:_up`→`4:_over`→`7:_down`, dragging off while held keeps `7:_down`, releasing outside gives
+  `1:_up`, releasing in place returns to `4:_over`, a press that started elsewhere shows only `4:_over`), with pixel
   differences of the same magnitude; under `ASC_NO_AUTO_BAKE=1` the window's roll-over/press pixel counts
   are 16094/105076 vs adl's 15524/105227.
 - **Example**: `examples/swc-mc-button.as` (structure + the eight level transitions + two negative
@@ -1944,7 +2044,7 @@ byte-identically (sha256 checked each).
 | The ±1 channel drift of runtime decoding (semi-transparent pixels) | Skia's `readPixels(kUnpremul)` does premultiply → unpremultiply, two roundings, for a straight-alpha PNG, drifting the RGB of pixels with A∈(0,255) by ±1 (alpha bit-exact). Measured, 206 of 388,648 pixels differ (0.053%), all within §11③'s allowance. Eliminating it entirely would require shipping our own PNG decoder (bypassing Skia's alpha transform), at a cost disproportionate to the benefit. See §5's "fidelity" measurement correction |
 | ~~One occlusion difference on `vbitemskin` (charId 293), unlocated~~ **located and fixed** (§9.2 F3) | Root cause = `PlaceObject3`'s `Visible = 0` (depth 6's #286) was parsed and then discarded ⇒ AIR hides it, we draw it. After the fix that symbol's `maxdcS 76 → 30`, and all 42 entries in the same batch improve (`fileitemdoctorskin` 205 → 2 etc.). The residual 30 is antialiasing/color-level difference |
 | ~~`PlaceObject3`'s `FILTERLIST` / `BlendMode` / `BitmapCached` parsed and then discarded~~ **implemented** (§9.2 F4, v0.4.65) | All 13 filters (11 Glow + 2 DropShadow), 8 `BlendMode` (7 = `layer`, 1 = `darken`) and 2 `BitmapCached` landed; including the AIR alignment of `strength` and blur σ. On the 1× harness every symbol is uniformly better, worse nowhere |
-| Filters' `inner` (inner glow / inner shadow) and `knockout` | Both are parsed out of the SWC record and go into the AS3 filter object, but the **raster path is unimplemented**: we always draw an outer glow / outer shadow. Measured, the 13 records in `temp/skin.swc` have `inner = 0`, `knockout = 0`, so there is currently no pixel impact. Expressing "inner" on the Skia side needs extra construction (invert the silhouette + `Blend(kSrcIn)`), not done |
+| Filters' `inner` (inner glow / inner shadow) and `knockout` | Both are parsed out of the SWC record and go into the AS3 filter object, but the **raster path is unimplemented**: we always draw an outer glow / outer shadow. Measured, the 13 records in `examples/embed-assets/skin.swc` have `inner = 0`, `knockout = 0`, so there is currently no pixel impact. Expressing "inner" on the Skia side needs extra construction (invert the silhouette + `Blend(kSrcIn)`), not done |
 | Bevel / GradientGlow / Convolution / GradientBevel / ColorMatrix in `FILTERLIST` (FilterID 3–7) | Skip bytes only by the documented length and **report** via `swcBake.notes`, never silently drop; measured 0 in this library. "Implement when encountered" |
 | Blur profile: we use a **Gaussian approximation**, AIR uses a **true box** | Already variance-matched (`sigma = blur*sqrt(quality)/sqrt(12)`), but the center/tail still differ (`blur6q1` ours 217/161/94/38/9 vs AIR 191/148/106/63/21). A true box needs `MatrixConvolution` (36~256 taps per layer, non-separable), a performance risk outweighing the benefit |
 | `BlendMode` modes Skia cannot express (subtract / invert / alpha / erase) | The glue returns 0 (treated as `kSrcOver`) and **reports** via `notes`, with no approximation — measured, all 8 in this library are in the expressible set (`layer`/`darken`) |
@@ -1953,13 +2053,13 @@ byte-identically (sha256 checked each).
 | A child's **class-name identity** differs from AIR | AIR reports the **class name** for characters linked by SymbolClass (e.g. `popbgskin`) and `MorphShape` for morph; we uniformly report the base class `Sprite`/`Shape` (observable via `getQualifiedClassName`). Pixels and tree are unaffected |
 | AIR's bbox **quantization/accumulation convention** differs from ours (not settled) | Measured, `temp/childfx/` has 33 `width/height` differences with `\|Δ\| ≤ 0.021px` (most ≤ 0.005, and **in both directions**): e.g. `userskin c4` AIR `260×30` vs ours `260.0006×30.0001` (the same 280×46 rect × the same 16.16 matrix scale; AIR's value looks like its own internal rounding), `homeskin c6` `354×580` vs `353.999×580.021`. The two models differ by under 0.4 twip, not settled. **Also**: baked coordinates themselves have a last-digit difference (in the timeline probe a text child's `y = 0.9500000000000002` vs `adl 0.95`, ≤2 ULP, caused by two `/20` additions), likewise only affecting string printing |
 | ~~Timeline placement matrices not back-filled into the child's **own** `x/y/scaleX/scaleY`~~ **`x/y` fixed** (§9.2 F5, v0.4.66) | The translation is now written into the child's own `x/y` (measured `vbitemskin c4` `41,23.75`, text child `x = tx + RECT.xmin`, both bit-identical). **Deliberately preserved**: the 2×2 (scale/rotation/skew) stays only in `transform.matrix` — F1 measured that AIR's nine-slice does **not** recognize placement stretching (only that way do the 42 stretched gridded entries match), so `child.scaleX/scaleY` we report as 1 while AIR sometimes reports the decomposed value (e.g. `popchatitem c0` `1.4973`). Pixels and the `transform.matrix` readback agree; only code that reads `child.scaleX` directly can observe it |
-| `ZWS` (LZMA) SWC | `temp/skin.swc` is `CWS`; the layout is given in §4, so implementation cost is low, but the value is limited, hence deferred |
-| Fonts (`DefineFont*`) | Two roads must be distinguished: the **app.xml `<embedFonts>` path is already implemented in `air-app.ts`** (producing manifest `font-urls` / `preload-paths`); **SWC-embedded fonts are not yet handled** — measured, `temp/skin.swc` contains **7 `DefineFont3`**, belonging to the separate decoding domain of "getting fonts from an SWC" |
+| `ZWS` (LZMA) SWC | `examples/embed-assets/skin.swc` is `CWS`; the layout is given in §4, so implementation cost is low, but the value is limited, hence deferred |
+| Fonts (`DefineFont*`) | Two roads must be distinguished: the **app.xml `<embedFonts>` path is already implemented in `air-app.ts`** (producing manifest `font-urls` / `preload-paths`); **SWC-embedded fonts are not yet handled** — measured, `examples/embed-assets/skin.swc` contains **7 `DefineFont3`**, belonging to the separate decoding domain of "getting fonts from an SWC" |
 | The **settle timing** of MovieClip button states | The three button states settle in the **paint/fingerprint pass** (the same convention as `as_sbtn_state`), so in an off-screen program that never calls `render` and has no window, `currentFrame` does not change by itself after `dispatchMouse`; in a real app (the window runs that pass every frame) and under `stage.render` the behavior matches `adl` level by level (§9.2 F8) |
-| Sound (`DefineSound`) | Measured, `temp/skin.swc` has **no** `DefineSound` (0); if encountered in the future, it is a separate decoding domain |
+| Sound (`DefineSound`) | Measured, `examples/embed-assets/skin.swc` has **no** `DefineSound` (0); if encountered in the future, it is a separate decoding domain |
 | Bitmaps referenced by `Sprite` without a class name (43) | Requires parsing the complete display tree of `DefineSprite`/`PlaceObject`; **note `small_gift`/`checkbom` belong to this bucket** (an earlier version wrongly listed them among the 16) |
 | `[Embed]` metadata syntax | **not an "existing shortcut"**: `Embed` currently has no semantic-layer consumer (§1), and the own-project scenario equally needs implementation |
-| `DefineBitsJPEG4` (tag 90) | Measured, `temp/skin.swc` has none; same family as JPEG3 (tag 35 **is supported**, §3.2③), support it casually. **Note**: `CHARACTER_TAG_KINDS` already classifies it as `bitmap`, but the extractor only handles 20/21/35/36 ⇒ a real tag 90 would fail on `swcBakePlan`'s bitmap branch with a **misleading** `bitmap fill references missing bitmap #N` (it should report as JPEG4) |
+| `DefineBitsJPEG4` (tag 90) | Measured, `examples/embed-assets/skin.swc` has none; same family as JPEG3 (tag 35 **is supported**, §3.2③), support it casually. **Note**: `CHARACTER_TAG_KINDS` already classifies it as `bitmap`, but the extractor only handles 20/21/35/36 ⇒ a real tag 90 would fail on `swcBakePlan`'s bitmap branch with a **misleading** `bitmap fill references missing bitmap #N` (it should report as JPEG4) |
 | ~~Nine-slice scaling (`DefineScalingGrid`, measured 22)~~ **implemented** (§9 F/§9.2 F1); but the **AS3-side `DisplayObject.scale9Grid` property is not yet implemented** | The project only bakes nine-slice from the SWF tag, and the runtime **has no** readable/writable `scale9Grid` property (AIR does). That is: scaling in an SWF skin does not blur, but user code cannot set/query it itself. Recorded per §1.5 in `TODO.md`'s `### 遗留待开发` |
 | `BitmapData.draw(source, matrix)` handling of source's **own transform** differs from AIR | Measured with `adl`: setting `o.scaleX = 2` on the drawn object has **no effect** in `draw(source, matrix)` (only the `matrix` argument matters); our implementation applies it. The probe was therefore uniformly changed to wrap in a container first and then draw. **Not settled**, recorded in `### 遗留待开发` |
 | Morph shapes (`DefineMorphShape`/`2`, measured 6) | Requires two sets of geometry + interpolation; only 6 in this library, low value, hence deferred. **Current state**: already baked as an **empty `Shape` placeholder child** (§9.2 F5) ⇒ the tree aligns and no wrong pixels are drawn, but geometry and interpolation remain gaps; its timeline `Ratio` records (270 in this library) are discarded and reported (§9.2 F6) |

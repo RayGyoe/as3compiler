@@ -537,9 +537,9 @@ function checkSwcTimeline(): string[] {
     if (cond) { ok++; console.log(`PASS  [swctimeline] ${label}`); }
     else { bad.push(label); console.log(`FAIL  [swctimeline] ${label}`); }
   };
-  const swcPath = join(root, '..', 'temp', 'skin.swc');
+  const swcPath = join(dir, 'embed-assets', 'skin.swc');
   if (!existsSync(swcPath)) {
-    console.log('SKIP  [swctimeline] sample SWC temp/skin.swc not present');
+    console.log('SKIP  [swctimeline] sample SWC examples/embed-assets/skin.swc not present');
     return bad;
   }
   const lib = extractSwc(swcPath);
@@ -547,24 +547,31 @@ function checkSwcTimeline(): string[] {
   const bake = swcBakePlan(lib, inputs.specs, inputs.chars);
   const byId = new Map(bake.characters.map((c) => [c.id, c]));
 
-  const dsi = byId.get(426); // desktopshareitem: the rollover skins' home symbol
-  const cb = byId.get(154);  // checkbom: a frame-2 replace + a frame-2 modify
-  const tb = byId.get(634);  // toastbtn: a frame-2 RemoveObject2 + a re-place
+  // 按**类名反查**字符号，而不是把某次导出的字符号写死：符号 id 由 Animate 的导出顺序决定，
+  // 同一份 FLA 每重导出一次就会整体平移（实测：旧的 426/154/634/84 → 入库夹具的 40/26/32）。
+  // 类名才是稳定锚点；id 只当查找键用，断言里一律不再出现字面量字符号。
+  const idOf = (name: string): number => {
+    for (const [id, n] of lib.classNames) if (n === name) return id;
+    return -1;
+  };
+  const dsi = byId.get(idOf('desktopshareitem')); // the rollover skins' home symbol
+  const cb = byId.get(idOf('checkbom'));           // a frame-2 replace + a frame-2 place
+  const tb = byId.get(idOf('toastbtn'));           // a frame-2 RemoveObject2 + a re-place
   check('FrameLabel records become the bake\'s label table in SWF frame order',
     (dsi?.labels ?? []).map((l) => `${l.name}@${l.frame}`).join(',') === '_up@1,_over@8,_down@15');
   const cbOps = cb?.frames?.[0]?.ops ?? [];
-  check('a frame-2 modify inherits the transform it omits and a replace inherits the placement',
-    cbOps.some((o) => o.depth === 2 && o.charId === 152 && o.replace === true && o.matrix?.join(',') === '1,0,0,1,0,0'));
+  check('a frame-2 replace at depth 2 inherits the placement it omits (identity matrix)',
+    cbOps.some((o) => o.depth === 2 && o.charId != null && o.replace === true && o.matrix?.join(',') === '1,0,0,1,0,0'));
   // The frame-2 label sits at SWF x=200 twips (10 px) + the text RECT origin (-2)
-  // == x 8 in adl, and the text origin must be applied to a MODIFY record too.
+  // == x 8 in adl, and the same origin rule must be applied to a frame-2 record too.
   check('a frame-2 place at depth 3 carries 200 twips + the text origin as x=10-2=8',
-    cbOps.some((o) => o.depth === 3 && o.charId === 153 && o.matrix?.join(',') === '1,0,0,1,10,3'));
-  // toastbtn frame 2 = RemoveObject2(depth 2) + place #633 at depth 3: adl keeps 3
+    cbOps.some((o) => o.depth === 3 && o.charId != null && o.matrix?.join(',') === '1,0,0,1,10,3'));
+  // toastbtn frame 2 = RemoveObject2(depth 2) + a fresh place at depth 3: adl keeps 3
   // children (depths 1, 3, 4) with the artwork swapped, so BOTH halves are the pin.
   check('the frame-2 RemoveObject2 is parsed and the re-place is a fresh object',
     tb?.totalFrames === 2 &&
     (tb?.frames?.[0]?.ops ?? []).some((o) => o.depth === 2 && o.del === true) &&
-    (tb?.frames?.[0]?.ops ?? []).some((o) => o.depth === 3 && o.charId === 633 && !o.replace));
+    (tb?.frames?.[0]?.ops ?? []).some((o) => o.depth === 3 && o.charId != null && !o.replace));
 
   const prog = parse('import flash.display.MovieClip;\nvar m:MovieClip = new (getDefinitionByName("desktopshareitem") as Class)() as MovieClip;\n');
   prog.body.push(...inputs.decls);
@@ -588,8 +595,12 @@ function checkSwcTimeline(): string[] {
     /void\* p = as_skia_path_new\(\);\s*as_skia_path_add_transformed\(p, src, a, b, c, d, tx, ty\);\s*as_skia_path_close_all\(p\);/.test(c));
   // A clipDepth mask is a SIBLING of what it clips, so it must not travel with it:
   // the clip is set before the object's translate/rotate/scale (parent space).
+  // The window (rather than an exact-adjacency regex) is deliberate: statements may be
+  // inserted between the save and the translate (e.g. the `alpha_on` local that pairs
+  // with the saveLayerAlpha restore) without changing what this pin is about.
+  const clipBlock = /as_skia_canvas_save\(canvas\);[\s\S]{0,400}?as_skia_canvas_translate\(canvas, o->x, o->y\);/.exec(c);
   check('the clipDepth clip is applied BEFORE the object transform',
-    /as_skia_canvas_save\(canvas\);\s*int clip_on = \(o->_clip_path != NULL\);\s*if \(clip_on\) as_skia_canvas_clip_path\(canvas, o->_clip_path, 1\);\s*if \(o->alpha < 1\.0\) as_skia_canvas_save_layer_alpha\(canvas, o->alpha\);\s*as_skia_canvas_translate\(canvas, o->x, o->y\);/.test(c));
+    !!clipBlock && clipBlock[0].includes('if (clip_on) as_skia_canvas_clip_path(canvas, o->_clip_path, 1);'));
   // The MovieClip runtime calls as_swc_bind long before the bake defines it, and a
   // build with NO swc has no bake to define it: the stub is what keeps it linking.
   const plain = generateC(parse('import flash.display.MovieClip;\nvar m:MovieClip = new MovieClip();\nm.gotoAndStop(2);\n')).c;
@@ -606,34 +617,46 @@ function checkSwcTimeline(): string[] {
     noTl.includes('static void as_swc_tl_apply(int charId, DisplayObject* o, int frame) { (void)charId; (void)o; (void)frame; }'));
 
   // ---- SWC 符号级 DoABC 帧脚本（D17）----
-  // 协议勾选框 `agreebtn`（char#84 = skin_fla.元件172_339）的勾选态**不在 AS3 代码里**，
+  // 协议的勾选框 `agreebtn`（char#84 = skin_fla.元件172_339）的勾选态**不在 AS3 代码里**，
   // 而在符号自己的时间轴脚本（DoABC）里：`this.stop(); this.buttonMode = true;
   // addEventListener(CLICK, function(){ _self.gotoAndStop(_self.currentFrame < 3 ? 3 : 2) })`。
-  // 编译器在**编译期**把这些字节码解成 AST、复用现有发射器（`src/abc.ts` 新模块）。
-  // 一个反向改动会让"点一下变绿勾"默默回到"点了没反应"，这里就钉住发射出的 C：
-  //   · 帧脚本函数体真的被翻译出来（stop + buttonMode + CLICK 监听，且 `_self` 经闭包 cell 捕获）；
-  //   · 闭包里那个三元 `gotoAndStop` 没被丢掉（丢了就永远只有第 1 帧）；
-  //   · 只有一帧但带脚本的符号也要 `as_swc_tl_start`，否则 `currentFrame` 没有意义；
-  //   · `as_swc_frames` 按 charId/frame 两级 switch 分发，且 `gotoAndStop` 是第二个入口。
-  check('the DoABC frame script of the agree checkbox is decoded and translated',
-    c.includes('static as_value skin_fla__u5143_u4ef6172_339_frame1(void* _this) {') &&
-    /->_self = as_v_obj\(\(void\*\)\(this\)\);\s*\(this->vtable->stop\(this\)\);\s*\(\(this->buttonMode\) = true\);\s*as_fn _once\d+ = as_fn_make\(_fn\d+__call, _fn\d+_env_make\(/.test(c) &&
-    c.includes('addEventListener(this, MouseEvent_CLICK, _once'));
-  check('the CLICK handler\'s ternary gotoAndStop survives translation',
-    /as_any_get\(as_req_box\(env->\w+->_self\), "currentFrame"\)\) < \(\(double\)\(3\)\)\) \? 3 : 2\);/.test(c) &&
-    /as_any_call\(env->\w+->_self, "gotoAndStop",/.test(c));
+  // 编译器在**编译期**把这些字节码解成 AST、复用现有发射器（`src/abc.ts`）。
+  //
+  // **入库夹具里没有那个符号**：`examples/embed-assets/skin.swc` 的 35 个导出符号里没有任何
+  // 一个的 DoABC 引用 `gotoAndStop` 或 `CLICK`（全库实测），所以下面两条与它绑定的钉子
+  // **注释保留**（按“缺样本即显式停用、不静默通过”的口径；夹具补齐后原样恢复）：
+  //
+  //   check('the DoABC frame script of the agree checkbox is decoded and translated',
+  //     c.includes('static as_value skin_fla__u5143_u4ef6172_339_frame1(void* _this) {') &&
+  //     /->_self = as_v_obj\(\(void\*\)\(this\)\);\s*\(this->vtable->stop\(this\)\);\s*\(\(this->buttonMode\) = true\);/.test(c));
+  //   check('the CLICK handler\'s ternary gotoAndStop survives translation',
+  //     /as_any_get\(as_req_box\(env->\w+->_self\), "currentFrame"\)\) < \(\(double\)\(3\)\)\) \? 3 : 2\);/.test(c) &&
+  //     /as_any_call\(env->\w+->_self, "gotoAndStop",/.test(c));
+  //
+  // 同一个机制的另一半样本在夹具里**存在**，下面三条钉的就是它（`checkbom` 自带两个帧脚本，
+  // 且第 1 帧脚本真的执行 stop + buttonMode，与那个勾选框的脚本原文一致）：
+  check('the DoABC frame scripts of checkbom are decoded and translated',
+    c.includes('static as_value checkbom_frame1(void* _this) {') &&
+    /checkbom\* this = \(checkbom\*\)_this;\s*\(this->vtable->stop\(this\)\);\s*\(\(this->buttonMode\) = true\);/.test(c));
+  check('a frame-2 script is decoded too and its ternary survives translation',
+    c.includes('static as_value checkbom_frame2(void* _this) {') &&
+    c.includes('as_any_set_v(as_req_box(as_dyn_get((void*)(this), "label")), "text",') &&
+    c.includes('as_v_truthy(as_dyn_get((void*)(this), "labelOn")) ? as_v_str_val('));
   check('a one-frame symbol with a script still starts its timeline and runs frame 1',
-    /as_swc_bind\(\(DisplayObject\*\)o, 84\);\s*as_swc_tl_start\(\(MovieClip\*\)o, 84\);\s*as_swc_frames\(84, 1, \(DisplayObject\*\)o\);/.test(c));
-  check('as_swc_frames dispatches per character and per frame; gotoAndStop is the 2nd entry',
+    /as_swc_bind\(\(DisplayObject\*\)o, 136\);\s*as_swc_tl_start\(\(MovieClip\*\)o, 136\);\s*as_swc_frames\(136, 1, \(DisplayObject\*\)o\);/.test(c));
+  check('as_swc_frames dispatches per character and per frame',
     c.includes('static void as_swc_frames(int charId, int frame, DisplayObject* o) {') &&
-    c.includes('case 1: audio_volume_frame1((void*)o); break;') &&
-    c.includes('case 12: audio_volume_frame12((void*)o); break;') &&
+    c.includes('case 1: checkbom_frame1((void*)o); break;') &&
+    c.includes('case 2: checkbom_frame2((void*)o); break;') &&
     c.includes('as_swc_frames(o->_tl_char, f, (DisplayObject*)o);'));
   // 勾选框的描边色来自 LINESTYLE 的 rgba：#00948C（而不是 fillStyle，也不是默认黑）——
-  // shape#83（那个对勾）是**只有描边**的字符，取错色就变成黑勾。
+  // 夹具里 shape #36 是**只有描边**的字符（`line>0 && fill0==0 && fill1==0`），所以它的
+  // 函数体里必须**一次 `as_swc_fill` 都没有**：取错色就成黑框，把描边当填充画就多出一个面。
+  const shape36 = /static void as_swc_shape_36\(Graphics\* g\) \{[\s\S]*?\n\}/.exec(c)?.[0] ?? '';
   check('a stroke-only SWC shape takes its colour from the LINESTYLE rgba',
-    c.includes('as_swc_stroke(g, as_swc_paint_solid(0xff00948cu), 2.0, 0, 0, 3.0);') &&
-    c.includes('as_swc_move_to(g, 15.0, 6.6);'));
+    shape36.includes('as_swc_stroke(g, as_swc_paint_solid(0xff00948cu), 1.0, 0, 0, 3.0);') &&
+    shape36.includes('as_swc_move_to(g, 7.9, 0.0);') &&
+    !shape36.includes('as_swc_fill(g,'));
 
   // ---- D43：回退到旧帧时子件必须**复用**（而不是重建第 1 帧）----
   // AIR 实测（temp/btnprobe/Rewind2.as）：从 _over(5) 退回 _up(1) 时 label1/label2 仍是同一批对象
@@ -664,6 +687,111 @@ function checkSwcTimeline(): string[] {
     c.includes('if (c != NULL) as_swc_tl_unlink(o, c);'));
 
   if (ok > 0) console.log(`[swctimeline] ${ok} timeline-bake checks passed`);
+  return bad;
+}
+
+// ---- SWC `SymbolClass` id 0 = the document class (阶段二百一十二) ----
+//
+// Animate emits a `SymbolClass` entry mapping character id 0 to the FLA's MAIN
+// TIMELINE class (`skin_fla.MainTimeline`) as soon as that FLA carries a
+// main-timeline script -- which a real skin FLA does (the TalkMED skin's 动作 layer).
+// Id 0 names the loaded SWF's ROOT timeline, so it owns no character definition by
+// design. The closure walk in `swcBakePlan` used to visit it like any other linked
+// symbol and abort the whole library with "exported character #0 has no definition",
+// so a library our own extractor reads without a single warning took every swc-*
+// example down as a codegen crash instead of an assertion.
+//
+// The pairing below is the point: id 0 is skipped AND named in a note, while any
+// OTHER linked id that the library does not define stays a hard error. Keeping only
+// the first half would turn a loud failure into a silent one (AGENTS.md §1.5).
+function checkSwcDocumentClass(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [swcdoc] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [swcdoc] ${label}`); }
+  };
+  const u16 = (v: number): Buffer => { const b = Buffer.alloc(2); b.writeUInt16LE(v, 0); return b; };
+  const tag = (code: number, payload: Buffer): Buffer => {
+    const head = Buffer.alloc(2);
+    head.writeUInt16LE((code << 6) | payload.length, 0);
+    return Buffer.concat([head, payload]);
+  };
+  // STORE-method ZIP writer: swc.ts's `unzip` walks the EOCD + central directory.
+  const zip = (name: string, data: Buffer): Buffer => {
+    const n = Buffer.from(name, 'utf8');
+    const lh = Buffer.alloc(30 + n.length);
+    lh.writeUInt32LE(0x04034b50, 0);
+    lh.writeUInt16LE(20, 4);
+    lh.writeUInt32LE(data.length, 18);
+    lh.writeUInt32LE(data.length, 22);
+    lh.writeUInt16LE(n.length, 26);
+    n.copy(lh, 30);
+    const ch = Buffer.alloc(46 + n.length);
+    ch.writeUInt32LE(0x02014b50, 0);
+    ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6);
+    ch.writeUInt32LE(data.length, 20);
+    ch.writeUInt32LE(data.length, 24);
+    ch.writeUInt16LE(n.length, 28);
+    n.copy(ch, 46);
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(1, 8); eocd.writeUInt16LE(1, 10);
+    eocd.writeUInt32LE(ch.length, 12);
+    eocd.writeUInt32LE(lh.length + data.length, 16);
+    return Buffer.concat([lh, data, ch, eocd]);
+  };
+  // RECT with nbits=0 is one zero byte, then frameRate + frameCount (swc.md §4).
+  const swf = (tags: Buffer[]): Buffer => {
+    const stage = Buffer.alloc(5);
+    stage.writeUInt16LE(0x0100, 1);
+    stage.writeUInt16LE(1, 3);
+    const body = Buffer.concat([stage, ...tags, tag(0, Buffer.alloc(0))]);
+    const head = Buffer.alloc(8);
+    head.write('FWS', 0, 'latin1');
+    head[3] = 6;
+    head.writeUInt32LE(8 + body.length, 4);
+    return Buffer.concat([head, body]);
+  };
+  const symbolClass = (entries: [number, string][]): Buffer =>
+    tag(76, Buffer.concat([u16(entries.length), ...entries.flatMap(([id, name]) => [u16(id), Buffer.from(`${name}\0`, 'utf8')])]));
+
+  const d = join(root, 'temp', 'swcdoc');
+  mkdirSync(d, { recursive: true });
+
+  // #1 is a real (empty) sprite; id 0 is the document class Animate adds for the
+  // main timeline. Two entries keep the payload under the long-form length limit.
+  const docClass = join(d, 'docclass.swc');
+  writeFileSync(docClass, zip('library.swf', swf([
+    tag(39, Buffer.concat([u16(1), u16(1), tag(0, Buffer.alloc(0))])),
+    symbolClass([[0, 'skin_fla.MainTimeline'], [1, 'probeArt']]),
+  ])));
+  const lib = extractSwc(docClass);
+  check('the document-class entry is kept as a SymbolClass binding (faithful read)',
+    lib.classNames.get(0) === 'skin_fla.MainTimeline' && lib.classNames.get(1) === 'probeArt');
+  const inputs = swcCompileInputs(lib);
+  let msg = '';
+  let bake: ReturnType<typeof swcBakePlan> | undefined;
+  try { bake = swcBakePlan(lib, inputs.specs, inputs.chars); } catch (err) { msg = (err as Error).message; }
+  check('a SymbolClass entry for character id 0 no longer aborts the library',
+    msg === '' && bake !== undefined);
+  check('id 0 is not baked as artwork while the real symbol still is',
+    (bake?.characters ?? []).some((c) => c.id === 1) && !(bake?.characters ?? []).some((c) => c.id === 0));
+  check('the skipped document class is reported, never silently dropped',
+    (bake?.notes ?? []).some((n) => n.includes('skin_fla.MainTimeline') && n.includes('DOCUMENT class')));
+
+  // The other half: an id OTHER than 0 that SymbolClass links but the library never
+  // defines is a broken library, not a document class.
+  const ghost = join(d, 'ghost.swc');
+  writeFileSync(ghost, zip('library.swf', swf([symbolClass([[9, 'ghostArt']])])));
+  const glib = extractSwc(ghost);
+  const gin = swcCompileInputs(glib);
+  let ghostMsg = '';
+  try { swcBakePlan(glib, gin.specs, gin.chars); } catch (err) { ghostMsg = (err as Error).message; }
+  check('any other linked character without a definition is still a hard error',
+    ghostMsg.includes('exported character #9 has no definition'));
+
+  if (ok > 0) console.log(`[swcdoc] ${ok} document-class checks passed`);
   return bad;
 }
 
@@ -1269,7 +1397,6 @@ function checkAlphaLayerBalance(): string[] {
   console.log(`[alphalayer] ${ok} alpha-layer balance checks passed`);
   return bad;
 }
-
 registerGroup('unit: render/DrawComposite', checkDrawComposite);
 registerGroup('unit: render/ScrollRectWindow', checkScrollRectWindow);
 registerGroup('unit: render/ScrollRectBake', checkScrollRectBakeInvalidation);
@@ -1281,6 +1408,7 @@ registerGroup('unit: render/BakeResolution', checkBakeResolution);
 registerGroup('unit: render/ColorPath', checkColorPath);
 registerGroup('unit: render/FilterRaster', checkFilterRaster);
 registerGroup('unit: render/SwcTimeline', checkSwcTimeline);
+registerGroup('unit: swc/DocumentClass', checkSwcDocumentClass);
 registerGroup('unit: render/SwcJpeg3Alpha', checkSwcJpeg3Alpha);
 registerGroup('unit: render/AirAppFonts', checkAirAppFonts);
 registerGroup('unit: render/SkiaAbi', checkSkiaAbi);

@@ -41,9 +41,28 @@
 > **现有运行时的 `Graphics` 模型（单 `SkPath` + 单 fill + 单 stroke）根本不足以承载**
 > （见新增 §3.4、§5.3）。
 >
-> 本文的技术结论均基于对真实 `temp/skin.swc`（743,520 B，255 个类，59 个位图资源）的**解包实测**，
-> 并以 AIR SDK 的 `adl` 取 `getPixel32` 真值交叉验证（方法见 §11）。注意该文件位于
-> **仓库根**的 `temp/`，不在 `as3compiler/temp/`。
+> 本文的技术结论均基于对真实 `skin.swc` 的**解包实测**，并以 AIR SDK 的 `adl` 取 `getPixel32`
+> 真值交叉验证（方法见 §11）。**夹具换过一次代**：早期章节的实测取自旧导出（仓库根的 `temp/skin.swc`，
+> 743,520 B / 255 个类 / 59 个位图资源，**该文件已不在仓库**），下文凡标「旧导出」的数字都指它；
+> **当前随仓库入库的是 `examples/embed-assets/skin.swc`**（454,007 B，md5 `f644237c…`，35 个导出符号、
+> 15 个位图 tag），对它的逐项实测见 §0.1。机制结论两者一致，但**清单类数字不可跨夹具套用**。
+
+### 0.1 当前入库夹具实测摘要（`examples/embed-assets/skin.swc`）
+
+> 本节数字全部由 `temp/skinaudit.mts` 对仓库里那个 `.swc` 现测（探针自锁 md5，换文件即报错），
+> 是全文唯一「随夹具走」的清单来源；下文各章的旧导出实测值保留原样并逐处标注。
+
+| 项 | 值 |
+|---|---|
+| 文件 | `examples/embed-assets/skin.swc`，**454,007 B**，md5 `f644237cfa1559d81c3b84786fb0d204` |
+| ZIP 条目 | `catalog.xml`(9,457 B) + `library.swf`(452,958 B)；后者是 **CWS**，`declared length` 505,130，解压后 body **505,122 B** |
+| stage header | `nbits=15` → RECT 9 B + `frameRate`/`frameCount` = **13 B**（24 fps / 12 帧） |
+| 导出符号 | **35**（`catalog.xml` scripts × `SymbolClass` × `DoABC` 三者一致）：**34 个符号类 + 1 个位图资源类 `desktopicon`**；本次导出的 `SymbolClass` **不含 `#0`**（文档类条目），所以不会踩到「导出字符无定义」那条报错 |
+| 位图资源 | **15 个 tag**（`DefineBitsLossless2`×13 + `DefineBitsJPEG3`×2），其中**只有 1 个是命名资源类 `desktopicon`(342×194)**，其余 14 个是无名内嵌位图（`DefineBitsLossless` tag 20 **一个都没有**） |
+| shape | `DefineShape`×54 + `DefineShape2`×10 + `DefineShape3`×4 + `DefineShape4`×22 = **90 个字符**；另有 `DefineMorphShape`×1（烘成空占位） |
+| 影片剪辑 | `DefineSprite`×**66**（其中 **21 个是多帧**）、`DefineButton2`×4、`DefineScalingGrid`×5（九宫格） |
+| 文本 | `DefineEditText`×56（带 InitialText，烘成 `TextField`）+ `DefineText`×2（字形需内嵌字体的 CodeTable，烘成空框）；`DefineFont3`×5 |
+| 时间轴 | `FrameLabel`×36（其中 11 个多帧剪辑带 `_up/_over/_down`）、`PlaceObject2`×403 + `PlaceObject3`×18、`RemoveObject2`×4 |
 
 ---
 
@@ -56,8 +75,7 @@
 | 自有项目 + `[Embed(source="a.png")]` | 原图还在源码目录 | 低——直接读原图，**不用碰 SWC** | **同样未实现**：`parser.ts` 只做通用元数据解析（`parseMetadataIfPresent`），`Embed` 没有任何语义层消费者；`src/` 内除注释与 `EmbedFont`（app.xml 字体）外无 Embed 处理 |
 | 第三方库 / Flash IDE 导出的皮肤库 | 原图不可得，只有 `.swc` | 高——必须解 SWC + 解 SWF | 本方案覆盖 |
 
-用户场景是后者：`temp/skin.swc` 是一个 Flash IDE 导出的 UI 皮肤库（含 `logo`/`imgback`/`desktopicon`/
-`cambitmap` 等资源类），原图已丢失，只能从 SWC 里提取。
+用户场景是后者：`examples/embed-assets/skin.swc` 是一个 Flash IDE 导出的 UI 皮肤库（**旧导出**含 `logo`/`imgback`/`cambitmap` 等 12 个滚动条皮肤 + 4 个自有资源类；**当前夹具**只剩 `desktopicon` 一个位图资源类 + 34 个显示对象符号），原图已丢失，只能从 SWC 里提取。
 
 > 两条路都要写代码，不要把第一行当成「已有捷径」——它的优势仅在**不需要解析 SWF**。
 
@@ -73,13 +91,13 @@ skin.swc (ZIP 归档)
 └── library.swf    737,552 B（未压缩）/ 737,700 B（deflate 后）—— 编译产物：SWF 容器（CWS = zlib 压缩）
 ```
 
-`catalog.xml` 的结构（实测 `temp/skin.swc`）：
+`catalog.xml` 的结构（实测 `examples/embed-assets/skin.swc`）：
 
 ```xml
 <swc xmlns="http://www.adobe.com/swccatalog/9">
   <libraries>
     <library path="library.swf">
-      <script name="logo" mod="..." signatureChecksum="...">
+      <script name="logo" mod="..." signatureChecksum="...">      <!-- 旧导出片段 -->
         <def id="logo" />
         <dep id="flash.display:BitmapData" type="s" />
         <dep id="Object" type="i" />
@@ -105,11 +123,13 @@ skin.swc (ZIP 归档)
 ## 3. 资源的真实存放形式：SWF tag
 
 `library.swf` 是标准 SWF 容器，头 8 字节 `CWS` 表示 zlib 压缩（`FWS`=未压缩、`ZWS`=LZMA）。
-实测 `temp/skin.swc` 的 `library.swf` 是 **CWS**（解压后 body = 1,031,069 B）。解压后是 tag 流，
+实测旧导出的 `library.swf` 是 **CWS**（解压后 body = 1,031,069 B）；当前夹具同样是 CWS（解压后
+**505,122 B**，见 §0.1）。解压后是 tag 流，
 每个 tag 由 `(code:length) 头 + 数据体` 组成。
 
 > **重要**：扫描 tag 流前必须先跳过 SWF 的 stage header——`RECT`（`nbits` 以 5 bit 起始，共
-> `5+4*nbits` bit）+ `frameRate`(UI16) + `frameCount`(UI16)。实测该文件 `nbits=17`，头部共 **14 字节**。
+> `5+4*nbits` bit）+ `frameRate`(UI16) + `frameCount`(UI16)。旧导出实测 `nbits=17`（头部 14 字节），
+> **当前夹具是 `nbits=15` → 13 字节**，所以头部长度不能写死，必须按 `ceil((5+4*nbits)/8) + 4` 算。
 > 早期实现若从 body 偏移 0 开始扫，会得到一堆无意义的 tag code（很容易误判为「没有位图」）。
 
 资源相关的 tag（实测 tag 类型分布）：
@@ -126,11 +146,18 @@ skin.swc (ZIP 归档)
 | **symbol → 类名** | `SymbolClass` | 76 | `{id → "类名"}` 映射 |
 | 时间轴影片剪辑 | `DefineSprite` | 39 | 显示树（`PlaceObject` 子对象） |
 
-实测 `temp/skin.swc` 的 `library.swf` 有 **59 个位图 tag**（`DefineBitsLossless2`×53 +
+实测旧导出的 `library.swf` 有 **59 个位图 tag**（`DefineBitsLossless2`×53 +
 `DefineBitsLossless`×1 + `DefineBitsJPEG2`×3 + `DefineBitsJPEG3`×2），`SymbolClass` 里 **214 条映射**；
-另有 `DefineSprite`×333、`DefineShape*`×378、`DefineButton2`×29、**`DefineFont3`×7**。
-两个 `DefineBitsJPEG3`（`#1113` 186×160、`#1118` 167×162）正是 TalkMED 首页两张卡片的插画，
+另有 `DefineSprite`×333、`DefineShape*`×378、`DefineButton2`×29、**`DefineFont3`×7**；
+其中两个 `DefineBitsJPEG3`（`#1113` 186×160、`#1118` 167×162）正是 TalkMED 首页两张卡片的插画，
 其 alpha 平面必须合成（§3.2③）。
+
+**当前入库夹具要小得多**（§0.1）：**15 个位图 tag**（`DefineBitsLossless2`×13 + `DefineBitsJPEG3`×2，
+**没有 tag 20 / tag 21**）、`SymbolClass` **35 条映射**、`DefineSprite`×66、
+`DefineShape`×54 + `DefineShape2`×10 + `DefineShape3`×4 + `DefineShape4`×22（共 90 个 shape 字符）、
+**`DefineButton2`×4**、`DefineFont3`×5。也就是说：**位图数量、tag 组合、命名资源表都换了**，
+但「哪些 tag 必须处理」这个机制结论不变（两张 JPEG3 图分别 186×160 与 167×162 的旧样本，
+在当前夹具里换成 #156 186×160 与 #165 167×162——尺寸一致、字符号不同）。
 
 ### 3.1 重要陷阱：`DefineBitsLossless` 存的**不是 PNG**，且 tag 20 与 tag 36 语义不同
 
@@ -146,14 +173,17 @@ DefineBitsLossless2 (tag 36) 数据体：
   zlibData      ...   （zlib 压缩的像素数据）
 ```
 
-实测提取 `symbol#2`（`logo`）：`characterID=2, format=5, 100×72`，解压后像素
+实测（**旧导出**）提取 `symbol#2`（`logo`）：`characterID=2, format=5, 100×72`，解压后像素
 `28800 字节 = 100×72×4`，前 16 字节全 0（透明边缘），非零像素占 37.1%——是有效图片内容。
+当前夹具的等价样本是 `#1 desktopicon`（`format=5`，342×194，`265,392 B = 342×194×4`）；
+下面那些「数字»换成新样本也一样成立。
 
 **tag 20 与 tag 36 不能混为一谈**：两者数据体布局几乎相同，但 **tag 20 的 format 5 是 24-bit RGB
 （XRGB，第 1 字节是填充位，没有 alpha 语义）**，而 tag 36 的 format 5 才是真正的 ARGB。
-把 tag 20 的第 1 字节当 alpha 用，在填充位为 `0x00` 的产物上会整张变全透明。实测
-`temp/skin.swc` 里唯一一个 tag 20 恰好是**最大的资源** `cambitmap`（700×393，1,100,400 B 像素，
-填充位恰为 `0xFF`，所以碰巧能显示正确——这种「碰巧」正是要避免的）。
+把 tag 20 的第 1 字节当 alpha 用，在填充位为 `0x00` 的产物上会整张变全透明。实测（**旧导出**）
+当时那份 `skin.swc` 里唯一一个 tag 20 恰好是**最大的资源** `cambitmap`（700×393，1,100,400 B 像素，
+填充位恰为 `0xFF`，所以碰巧能显示正确——这种「碰巧」正是要避免的）；**当前夹具干脆一个 tag 20 都没有**
+（15 个位图全是 tag 36/35），所以这条陷阱只能靠旧导出样本回归。
 
 **结论**：`DefineBitsLossless*` 需要「解 zlib → 得到原始像素」，**不能**直接喂 Skia 的
 `MakeFromEncoded`（它只认 PNG/JPEG 等编码格式）。而 `DefineBitsJPEG2` 存的**就是完整 JPEG**，
@@ -163,8 +193,9 @@ DefineBitsLossless2 (tag 36) 数据体：
 
 原始位图的像素有两条必须先讲清的性质：**字节序**与**是否预乘**。两条都已用 `adl` 取真值定案。
 
-**① 字节序 = `A, R, G, B`（第 1 字节是 alpha）**——7200/7200 像素逐一验证：我们解析出的
-`px[0]` 与 `logo.getPixel32()` 的 alpha 通道**完全相等**，无一例外。
+**① 字节序 = `A, R, G, B`（第 1 字节是 alpha）**——7,200/7,200 像素逐一验证（**旧导出**的 100×72
+`logo`，与 `logo.getPixel32()` 的 alpha 通道**完全相等**，无一例外；当前夹具同一路径由 `desktopicon`
+在 `examples/swc-bitmap.as` 里钉住具体像素，见 §9.1 验收基线②）。
 
 **② 数据是「预乘（premultiplied）ARGB」，而 AIR 的 `getPixel32` 返回的是「直通（straight）ARGB」。**
 
@@ -300,7 +331,7 @@ static void as_argb_apply_alpha(unsigned* p, int n, const unsigned char* alpha) 
 
 | 类别 | 数量 | 类级字节码 | 内容 | 源码可得性 |
 |---|---|---|---|---|
-| 位图资源类（`extends BitmapData`×4 / `BitmapAsset`×12） | 16 | **152 B** | 内容=位图，类只是 9–11 B 构造器 | 需从 SWC 合成（§5） |
+| （**下表整体是旧导出的 ABC 画像**）位图资源类（`extends BitmapData`×4 / `BitmapAsset`×12） | 16 | **152 B** | 内容=位图，类只是 9–11 B 构造器 | 需从 SWC 合成（§5） |
 | `extends MovieClip` 的 Flash IDE 符号类 | **192** | **5,489 B** | UI 皮肤元件（`alertskin`/`popgiftskin`/`homeskin`…）；**绝大多数是 9 B 空构造器**，仅少数有真代码（`checkbom` 132 B、`toastbtn` 73 B、`devicesitemskin` 62 B、`PPTNextPage(Pre)Button` 51 B） | 代码可忽略；**内容**是时间轴/位图 |
 | 接口（`extends null`） | 6 | 6 B | 空 | — |
 | `mx.core` / `mx.utils`（Flex） | **8**（其中 5 个就是上行的接口） | **3,135 B** | 见下 | **无源码（唯一一组）** |
@@ -400,7 +431,7 @@ error: class 'mx.core.BitmapAsset' is only available as AVM2 bytecode inside
 早期版本把「资源」等同于位图，`DefineShape*×378` 只在 §3 的 tag 分布表里出现过一次计数，
 **既无章节也无方案**。实测这类 tag 才是本库资源的**主体**（且矢量正是 Flash 的核心能力）。
 
-**① 实测 tag 画像**（递归扫进 `DefineSprite`；`temp/skin.swc`）：
+**① 实测 tag 画像**（递归扫进 `DefineSprite`；`examples/embed-assets/skin.swc`）：
 
 | tag | 数量 | 说明 |
 |---|---|---|
@@ -510,7 +541,7 @@ SWF body（跳过 stage header：RECT + frameRate + frameCount）
 ```
 
 即用「LZMA raw filter + 从 props 还原的 lc/lp/pb/dict」即可解，无需 `make_lzma_reader` 之类的
-mangled-header 补丁（那是给 LZMA-alone 13 字节头用的）。`temp/skin.swc` 是 `CWS`，此路径首期可不做，
+mangled-header 补丁（那是给 LZMA-alone 13 字节头用的）。`examples/embed-assets/skin.swc` 是 `CWS`，此路径首期可不做，
 但既然布局已定，实现成本很低。
 
 ---
@@ -569,7 +600,7 @@ mangled-header 补丁（那是给 LZMA-alone 13 字节头用的）。`temp/skin.
 
 ### 5.1 嵌入形态与源码体积代价（**三种形态逐项实测**，早期估计已修正）
 
-对 `temp/skin.swc` 的 **16 个命名资源**逐项实测：
+**旧导出**（16 个命名资源）逐项实测：
 
 | 形态 | 合计 | 说明 |
 |---|---|---|
@@ -579,18 +610,30 @@ mangled-header 补丁（那是给 LZMA-alone 13 字节头用的）。`temp/skin.
 | PNG 嵌入 C 源码（`\xNN` 转义字符串） | **43,723 B ≈ 42.7 KB** | **应采用的形态** |
 | 原始 ARGB 嵌入 C 源码（`0xNN,`） | **7,777,060 B ≈ 7.42 MB** | **早期方案，错** |
 
-单看最大的 `cambitmap`（700×393，tag 20）：原始 ARGB **1,100,400 B** → PNG **8,070 B**。
+单看旧导出最大的 `cambitmap`（700×393，tag 20）：原始 ARGB **1,100,400 B** → PNG **8,070 B**。
+（tag 20 是旧导出独有：**当前夹具连一个 `DefineBitsLossless` 都没有**。）
 
-**源码体积差 178×**。所以资源段应长这样（编码字节，不是像素）：
+**源码体积差 178×**（旧导出数字）——所以资源段只能是编码字节，不能是像素。
+
+**当前入库夹具**的命名位图资源只有 **1 个**（`desktopicon` 342×194，§0.1），真正内嵌的集合就是一张 PNG：
+`encoded` **1,671 B** ↔ 原始 ARGB **265,392 B**（**159×**）；而 14 个**未命名**位图（只被 shape 当填充引用）
+一个都不内嵌——它们合计原始 ARGB **10,300,716 B**（仅 `#46` 2832×805 一张就 9.1 MB），这一对比正好说明
+「资源必须编码后内嵌」不是省事，而是唯一可行形态。
+
+资源段实际长这样（下面是当前夹具 `desktopicon` 的**真实发射结果**）：
 
 ```c
-/* SWC resource: skin.swc#logo (100x72) — PNG bytes; decoded at runtime by
-   as_skia_image_decode_bytes_argb (same path as Loader.loadBytes). */
-static const unsigned char __res_skin_logo_png[] =
-  "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR...";   /* PNG 总计 1,651 B */
-static const int __res_skin_logo_w = 100;
-static const int __res_skin_logo_h = 72;
+// SWC resource: <path>/skin.swc#desktopicon (342x194) — png bytes;
+// decoded at runtime by as_skia_image_decode_bytes_argb (same path as Loader.loadBytes).
+static const unsigned char __res_desktopicon[] =
+  "\x89PNG\x0d\x0a\x1a\x0a\x00\x00\x00\x0dIHDR\x00\x00\x01V..."   /* PNG 总计 1,671 B */;
+
+// 在资源类自己的构造器里（尺寸不必另存常量）：
+BitmapData_adoptEncoded((BitmapData*)o, __res_desktopicon, (size_t)1671);
 ```
+
+> 早期文档这里写的是 `__res_skin_logo_w/_h` 两个常量——**现在不再发射**：宽高由编码字节（PNG 的 IHDR）
+> 自描述，少一份「常量与 IHDR 不一致」的隐患。
 
 **与阶段七十八已不再冲突**：资源合计约 **42.7 KB C 源码**（相对 `hello.as` 的 854 KB 是 5%），
 完全可以在**单个 `.c`** 内嵌，与「单文件 `.c` 是默认形态」一致。早期版本因选了原始像素形态，
@@ -602,16 +645,19 @@ static const int __res_skin_logo_h = 72;
 - 两种形态下 `-O2` 都会丢弃未被引用的资源段，不影响最终二进制体积。
 
   > **实测修正（2026-10-05，实施期）**：前半句**成立但须限定**。native `-O2` 下拿 `hello.as`（完全不引用任何资源）
-  > 与加上 `--swc temp/skin.swc` 比：二进制 **130,552 → 195,880 B（+約 65 KB）**，其中 `__text` 59,012 → 99,556
+  > 与加上 `--swc examples/embed-assets/skin.swc` 比：二进制 **130,552 → 195,880 B（+約 65 KB）**，其中 `__text` 59,012 → 99,556
   > （**+40.5 KB 代码**）、`__data` 4,088 → 17,384（**+13.3 KB 表格**）。**嵌入的 PNG 字节本身确实被丢掉**
   > （在产物里搜不到任何一张资源的完整字节），但**合成出来的 16 个资源类并不被裁**——它们的构造器/`_new`/虚表/
   > props 表/注册表项互相引用成一簇，链接器从可达根出发删不掉（且这是 **§6 要的语义**：`getDefinitionByName("logo")`
   > 必须随时能解析）。所以准确说法是：**未引用的资源“字节”会被丢弃，但资源“类”的开销会留在产物里**
-  > （16 类约 53 KB / 即 ≈3.3 KB 每类）。引用到某个资源时，其字节才真正进入产物。
+  > （16 类约 53 KB / 即 ≈3.3 KB 每类；**这是旧导出的 16 类**，当前夹具只有 1 个资源类，量级相应降到 ≈3 KB）。
+> 引用到某个资源时，其字节才真正进入产物。
 
 > **编译期需要一个 PNG 编码器**：Node 内置 `zlib` 即可实现（IHDR/IDAT/IEND + 每行 filter 0，
 > 约 100 行，零第三方依赖）。`DefineBitsJPEG2/3` 的 tag 本来就存着完整 JPEG，**原字节直搬、无需编码器**。
-> 实测本样本的 16 个命名资源全为 lossless（无 JPEG 命中），故首期必须实现 PNG 编码器。
+> **旧导出**的 16 个命名资源全为 lossless（无 JPEG 命中），故 PNG 编码器是首期必须品；
+> **当前夹具**的 15 个位图里有 **2 个 `DefineBitsJPEG3`**（带独立 zlib alpha 平面）：JPEG 原字节可以直搬，
+> 但必须走「运行时 Skia 解 JPEG + 合成 alpha 平面」（§3.2③ / §9.2 F7），PNG 路径覆盖不到它们。
 
 ### 5.2 不该内嵌的资源：桌面 / web / 移动三端的资源通道（**已存在，勿另造**）
 
@@ -669,7 +715,7 @@ shape 要**在编译期翻译成「构建 `SkPath` + 画笔」的 C 代码**（A
 
 ## 6. AS3 侧的引用语义：资源类 = `BitmapData` 子类
 
-这是决定 codegen 怎么落地资源引用的关键。实测 `temp/skin.swc` 的 `library.swf` ABC 里：
+这是决定 codegen 怎么落地资源引用的关键。**旧导出**的 `library.swf` ABC 里：
 
 ```
 public dynamic class logo extends flash.display::BitmapData
@@ -679,40 +725,55 @@ public dynamic class desktopicon extends flash.display::BitmapData
 public dynamic class cambitmap extends flash.display::BitmapData
 ```
 
-**资源类（`logo`/`imgback`/`desktopicon`/`cambitmap` 等）是 `flash.display.BitmapData` 的动态子类**，
-构造器签名 `(int width, int height)`。这是 Flash IDE 导出皮肤库的标准形态。
+**当前入库夹具**的 ABC 里只剩 `desktopicon` 一个资源类（在 ABC 字符串表里扫 `BitmapData` 只命中一次），
+其余 34 个导出全是**显示对象**符号：
 
-> **构造器参数会被忽略**——实测 `new logo(0, 0)` 得到的 `BitmapData` 是 **100×72**（真实尺寸来自
-> SWF tag），不是 `0×0`。工厂里**必须用资源自身的宽高**，不能采信实参（写成 `new logo(0,0)` 是
-> Flash IDE 生态的惯用写法，参数位形同占位）。
+```
+public dynamic class desktopicon extends flash.display::BitmapData
+  public function desktopicon(int,int):*     // 构造器签名与旧导出一致
+upvpage     -> flash.display.SimpleButton
+applistskin -> flash.display.MovieClip
+```
 
-而 `SymbolClass` 里 214 条映射中，**只有 16 个位图直接映射到类名**，其余 **43 个位图没有类名**
-（被 `Sprite`/`DefineShape` 作为子对象引用）。这 16 个是：
+**资源类（任何 `flash.display.BitmapData` 的动态子类）的构造器签名是 `(int width, int height)`**。
+这是 Flash IDE 导出皮肤库的标准形态。
+
+> **构造器参数会被忽略**——实测（旧导出）`new logo(0, 0)` 得到的 `BitmapData` 是 **100×72**、（当前夹具）
+> `new desktopicon(0, 0)` 得 **342×194**（真实尺寸来自 SWF tag），都不是 `0×0`。工厂里**必须用资源自身的
+> 宽高**，不能采信实参（写成 `new desktopicon(0,0)` 是 Flash IDE 生态的惯用写法，参数位形同占位）。
+
+**旧导出**的 `SymbolClass` 有 214 条映射，其中只有 16 个**位图**直接映射到类名、其余 43 个位图没有类名
+（被 `Sprite`/`DefineShape` 作为子对象引用）：
 
 ```
 desktopicon  logo  imgback  cambitmap
-com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wbottom,wleft,wmiddle,wtop,wright}SkinClass
-com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,wmiddle,wtop,wright}SkinClass_200
+com.vsdevelop.controls.scrollbar.ScrollSkin_{top,middle,bottom,...}SkinClass[_200]   （12 个全限定名）
 ```
 
-> **早期版本此处有两处错误**：
-> ① 举例里的 **`small_gift`/`checkbom` 不属于这 16 个**——实测它们是 **`DefineSprite`（tag 39）**，
-> 即 `small_gift` = symbol 19、`checkbom` = symbol 154，落在「需要解析显示树」的那一档（下一节）。
-> ② **16 个里有 12 个是全限定名**（`com.vsdevelop.controls.scrollbar.*`）。这对「方式一：直接
-> `new 资源类`」是硬约束——现实代码几乎不会写 `new com.vsdevelop....(...)`，滚动条皮肤通常由组件类
-> 内部引用或用 `getDefinitionByName` 取。**因此在 `skin.swc` 这类库上，真正可用的是方式二**，
-> 只有当库里存在短名资源类（如 `logo` 这种顶层短名）时方式一才好用。
+**当前入库夹具**只有 **35 条映射**（§0.1），且**只有 1 个位图**（`desktopicon`）有类名——其余 34 条映射到
+的全是**显示对象符号**（`DefineSprite`/`DefineButton2`/`DefineEditText`），落在「需要解析显示树」那一档：
+`desktopshareitem` `homeskin` `checkbom` `toastbtn` `upvpage`(button) `元件97` …；另 14 个位图无名，只作
+shape 填充。
+
+> **早期版本此处有两处错误**（当时针对旧导出，当前夹具同理可验）：
+> ① 举例里的 **`checkbom` 不属于位图那一档**——实测它是 **`DefineSprite`（tag 39）**（旧导出里
+> symbol 154，当前夹具是 #26），落在「需要解析显示树」那一档（下一节）。
+> ② 旧导出 16 个命名资源里有 **12 个是全限定名**（`com.vsdevelop.controls.scrollbar.*`），这对
+> 「方式一：直接 `new 资源类`」是硬约束——现实代码几乎不会写 `new com.vsdevelop....(...)`。
+> **当前夹具把这 12 个全限定名资源整个去掉了**（没有 scrollbar 组件），唯一资源类 `desktopicon`
+> 就是顶层短名——但方式二仍是首选落地（理由见下）。
 
 **AS3 侧引用方式（两种，按用户代码风格分）**：
 
 | 引用方式 | 典型代码 | codegen 落地 | 适用范围 |
 |---------|---------|-------------|---------|
-| 直接 `new 资源类(w,h)` | `var b:Bitmap = new Bitmap(new logo(0,0));` | 资源类注册为 `BitmapData` 子类，`new` 分发到「嵌入像素填充」工厂（忽略实参、用 tag 宽高） | 顶层短名资源（实测 4/16） |
-| `SymbolClass` 反射 | `getDefinitionByName("logo")` | 资源注册表 `{name → 工厂指针}`，动态查表 | 全部 16 个（含全限定名 12 个） |
+| 直接 `new 资源类(w,h)` | `var b:Bitmap = new Bitmap(new desktopicon(0,0));` | 资源类注册为 `BitmapData` 子类，`new` 分发到「嵌入像素填充」工厂（忽略实参、用 tag 宽高） | 顶层短名资源（旧导出实测 4/16；当前夹具 1/1） |
+| `SymbolClass` 反射 | `getDefinitionByName("desktopicon")` | 资源注册表 `{name → 工厂指针}`，动态查表 | 全部命名资源类（旧导出 16 个、含 12 个全限定名；当前夹具 1 个） |
 
 > 反射路径**不再是「后续扩展」**：`emit.ts` 已有 `flash.utils.getDefinitionByName` 注册表
 > （`getQualifiedClassName` ↔ `getDefinitionByName` 往返），把资源类登记进去即可复用。
-> 鉴于 `skin.swc` 的 12/16 是全限定名，**建议把方式二作为首选落地**，方式一作为便利补充。
+> 旧导出有 12/16 是全限定名（当前夹具根本没有全限定名资源类，但那是夹具差异、不是机制差异），
+> **仍建议把方式二作为首选落地**，方式一作为便利补充。
 
 ---
 
@@ -830,7 +891,7 @@ Ruffle 的 `swf` crate 有完整的 `read_tag_with_code`（含 `DefineBitsLossle
 
 ### 9.1 E 实测结果（2026-10-05，可复现）
 
-**方法**：`temp/swc-render/`（harness 由 `gen.ts` 从 `temp/skin.swc` 生成一份共享 body，两侧分别用
+**方法**：`temp/swc-render/`（harness 由 `gen.ts` 从 `examples/embed-assets/skin.swc` 生成一份共享 body，两侧分别用
 本编译器与 `adl` 渲染同一批导出符号到 `ours.txt` / `adl.txt`；比较器 `compare.ts`）。每个符号给出
 64 格 8×8 的 alpha 加权格均值指纹（`fp`）、非透明像素数 `nz`、以及原始 ARGB dump
 （`raw_<id>_{ours,adl}.png` + `cmp_<id>.png`）。
@@ -881,13 +942,28 @@ alpha 差 > 64（即无结构性缺失）；`colour-ok` = 无结构性差异且*
   `maxdcS 76 → 30`，残留属抗锯齿/色彩级差。原复现命令：
   `cd temp/swc-render && node gen.ts && node ../../src/index.ts scene.as --manifest t.build.json --run && ./run_adl.sh && node compare.ts`。
 
-**验收基线（可直接复用本次复核的数据）**：对 `temp/skin.swc` 跑提取器，
+**验收基线（旧导出，可直接复用该次复核的数据）**：对当时的 `skin.swc` 跑提取器，
 ① 16 个命名资源全部提取；② `logo` 为 100×72 且为**反预乘后**的值（先解出 straight ARGB，再编码成 PNG）；
 ③ **与 `adl` 的 `getPixel32` 逐点比对**（§11 的方法），允许 ±1 通道偏差；
 ④ 体积：16 个资源的编码字节合计 ≈ **14.6 KB**（PNG），C 源码 ≈ **43 KB**（而非 7.42 MB）；
 ⑤ 矢量：**378/378** shape 解析 round-trip 全中，且导出符号闭包（322 shapes / 327 sprites）的渲染结果
 与 `adl` 截图对照（§3.4、§11⑤）；
 ⑥ 九宫格缩放（22 个 `DefineScalingGrid`）与按钮四态（29 个 `DefineButton2`）与 `adl` 截图对照；
+
+**验收基线（当前入库夹具，`examples/embed-assets/skin.swc`）**——同一套判据，换成现测值：
+① **15 个位图 tag 全部解出**（`DefineBitsLossless2`×13 + `DefineBitsJPEG3`×2，后者带独立 alpha 平面），
+   其中只有 **1 个是命名资源类 `desktopicon`**，其余 14 个无名、仅作 shape 填充（§0.1）；
+② `desktopicon` 为 **342×194** 且为**反预乘后**的值（`examples/swc-bitmap.as` 把它钉到了具体像素：
+   `(0,0)` 全透明、`(1,97)=0xffcccccc`、`(171,97)=0xfff6f6f6`、`(341,193)` alpha `0xcf`）；
+③ 同一份字节与 `adl` 的 `getPixel32` 逐点比（§11 的方法），允许 ±1 通道偏差；
+④ 体积：命名资源的 `encoded` **1,671 B**（PNG）→ C 源码里的 `\xNN` 串 ≈ **6.7 KB**；
+   全部 15 个位图的原始 ARGB 合计 **10,300,716 B**，一个都不内嵌；
+⑤ 矢量：**90 个 shape 字符**（`DefineShape`×54 + `DefineShape2`×10 + `DefineShape3`×4 + `DefineShape4`×22）
+   全部解析并烘焙；带描边无填充的字符（如 #36）必须只发 `as_swc_stroke`、不发 `as_swc_fill`；
+⑥ 九宫格（**5** 个 `DefineScalingGrid`）与按钮四态（**4** 个 `DefineButton2`，其中 `upvpage` 导出为
+   `SimpleButton`）与 `adl` 对照；
+⑦ 时间轴：**21 个多帧烘焙剪辑**（`FrameLabel`×36，其 11 个带 `_up/_over/_down`）的帧脚本、回退复用与
+   `currentLabels` 与 `adl` 一致（§9.2 F6/F8/F9）。
 
 ### 9.2 F 实测结果（2026-10-05，可复现）
 
@@ -980,7 +1056,7 @@ Stage 各有一份指针**（AIR 一个 NativeWindow 一个 Stage），别的窗
 #### F3 `PlaceObject3` 的属性：可见性已实现，Filter / BlendMode / BitmapCache 仍丢弃
 
 **缘起（2026-10-06 普查发现）**：`readSwfPlacement` 一直把 `PlaceObject3` 的三个属性读完就扔。
-普查 `temp/skin.swc`（`temp/swc_po3_visible.ts`）：**64 条 `PlaceObject3`，其中 63 条落在导出符号的
+普查 `examples/embed-assets/skin.swc`（`temp/swc_po3_visible.ts`）：**64 条 `PlaceObject3`，其中 63 条落在导出符号的
 烘焙闭包内**——`hasVisible` 38 条、`FILTERLIST` 13 条、`BlendMode` 8 条、`BitmapCached` 2 条。
 
 **① 可见性（`Visible`，已实现）**：38 条带 `Visible` 字段的记录**全部是 `0`**（AIR 不画）。
@@ -1015,14 +1091,14 @@ Stage 各有一份指针**（AIR 一个 NativeWindow 一个 Stage），别的窗
 
 ```
 # PlaceObject3 属性普查（有多少条、在不在烘焙闭包内、Visible 的实际取值）
-node temp/swc_po3_visible.ts ../temp/skin.swc
+node temp/swc_po3_visible.ts ../examples/embed-assets/skin.swc
 # 对象树对照（ours 与 adl 各一份，逐子件 visible）
 cd temp/vishidden && node gen.ts && ../../src/index.ts ours.as --manifest t.build.json --run && ./run_adl.sh && diff adl.txt ours.txt
 # 1× 全量像素重测（§9.1 的同一套 harness）
 cd temp/swc-render && <ours> && ./run_adl.sh && node compare.ts
 
 # 结构回归（矢量/显示树/九宫格/按钮四态，两侧构建都成立）
-cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../temp/skin.swc --run
+cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../examples/embed-assets/skin.swc --run
 # F1 九宫格（entry 103 = 元件97，#545 有 grid）
 cd temp/swc-render && RAW=103 SCALE=2,2 node gen.ts && <ours> && ./run_adl.sh && node rawpng.ts 103
 # F2 按钮四态（离屏，确定性）
@@ -1039,7 +1115,7 @@ cd temp/btnstate && node gen.ts && python3 drive.py <repo>/temp/btnstate/ours <A
 2 条带 `BitmapCached`，而这三项此前**被解析后整段丢弃**（`SwcPlacement` 连字段都没有）。
 它们全是 AIR 已定义行为 ⇒ 遗留缺陷，本阶段一次补齐。
 
-**属主分布**（`node temp/swc_po3_detail.ts ../temp/skin.swc`，只统计在烘焙闭包内的条数）：
+**属主分布**（`node temp/swc_po3_detail.ts ../examples/embed-assets/skin.swc`，只统计在烘焙闭包内的条数）：
 
 | 属性 | 条数 | 细节 |
 |---|---|---|
@@ -1142,7 +1218,7 @@ params: ours lines 200, adl lines 200, ERR ours/adl 0/0
 
 ```
 # Po3 属性普查（含种类直方图与逐条形态）
-node temp/swc_po3_detail.ts ../temp/skin.swc
+node temp/swc_po3_detail.ts ../examples/embed-assets/skin.swc
 # 强度模型 / box 模糊模型 / 不变量（两侧各跑一次，CHK 逐行相同）
 cd temp/filterprobe && node gen.ts && ../../src/index.ts ours.as --manifest ../swc-render/t.build.json --run && ./run_adl.sh
 # 属性指纹（滤镜子件、blendMode、cacheAsBitmap 逐项对 adl）
@@ -1152,7 +1228,7 @@ cd temp/swc-render && RAW=29 node gen.ts && <ours> && ./run_adl.sh && node rawpn
 # 1× 全量像素重测
 cd temp/swc-render && <ours> && ./run_adl.sh && node compare.ts
 # 结构回归（glow / darken / layer / cacheAsBitmap 的树与字段断言，纯结构、不依赖 Skia）
-cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../temp/skin.swc --run
+cd as3compiler && node src/index.ts examples/swc-shape.as --swc ../examples/embed-assets/skin.swc --run
 ```
 
 ---
@@ -1289,7 +1365,7 @@ cd temp/childfx && node gen.ts && ../../src/index.ts ours.as --manifest ../swc-r
 # 声明矩形 vs 路径并集（378 个 shape 普查）
 node temp/shbox.ts
 # 结构回归
-node src/index.ts examples/swc-shape.as --swc ../temp/skin.swc --run
+node src/index.ts examples/swc-shape.as --swc ../examples/embed-assets/skin.swc --run
 # 1× 全量像素（须与 rep_final.txt 逐行相同）
 cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node compare.ts
 ```
@@ -1311,7 +1387,7 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 
 | 观测项 | `adl` 口径 |
 |---|---|
-| `totalFrames` | = SWF 的 `ShowFrame` 条数（`desktopshareitem` 21、`devicesitemskin` 23、`元件16_124` 17、`checkbom`/`toastbtn` 2、`元件172_339` 3） |
+| `totalFrames` | = SWF 的 `ShowFrame` 条数（旧导出：`desktopshareitem` 21、`devicesitemskin` 23、`元件16_124` 17、`checkbom`/`toastbtn` 2、`元件172_339` 3；**当前夹具**：`元件77_50` 100、`元件16复制12_68` 23… 见 §0.1 与 `skin_fla.元件16_54` 17 / `元件17_55` 11 / `checkbom`/`toastbtn`/`元件20_57` 2） |
 | 新建剪辑的初态 | `currentFrame == 1`、**`isPlaying == false`**，且在显示列表上**跨 12 帧也不自走**（离屏与上屏都一样）⇒ 皮肤符号的 `stop()` 在 DoABC 里；**帧脚本从 v0.4.127 起由编译期解码并真的执行**（§3.3 收口），所以这不再是"读不到而不得不停在第 1 帧"——而是**文件里就写着 `stop()`**，执行它才是对齐 AIR |
 | 属性名 | 是 **`isPlaying`**（没有 `playing`） |
 | `currentLabel` / `currentFrameLabel` | 该帧的 `FrameLabel` 名，或 `null` |
@@ -1382,8 +1458,10 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 因为烘培类是把图**画进类里**的（一个角色一个类），换角色就必然换实例。D43b 不影响文字保留
 （只有角色真的变了才会触发），记在差异文档里待后续架构层处理。
 
-**烘焙口径的数量（`temp/tlcheck.ts`）**：79 个多帧 sprite、其中 **75 个**帧 1 之后有变化、**448** 个 op 帧、
-**514** 个 op（**102** 增/替、**404** 改、**8** 删）；**89** 条 `FrameLabel`（31 个 sprite）。
+**烘焙口径的数量（`temp/tlcheck.ts`）：** 旧导出：79 个多帧 sprite、其中 **75 个**帧 1 之后有变化、
+**448** 个 op 帧、**514** 个 op（**102** 增/替、**404** 改、**8** 删）、**89** 条 `FrameLabel`（31 个 sprite）。
+**当前夹具**现测：多帧烘焙剪辑 **21** 个、`FrameLabel` **36** 条（11 个剪辑带 `_up/_over/_down`）、
+`RemoveObject2` **4** 条、`PlaceObject2` **403** + `PlaceObject3` **18**（§0.1）。
 
 **验收**
 
@@ -1411,7 +1489,7 @@ cd temp/swc-render && node gen.ts && <ours> && ./run_adl.sh && VERBOSE=1 node co
 
 ```
 # 时间轴 API 逐项对 adl（68 行）
-cd temp/tlprobe && node gen.ts && ../../src/index.ts ours.as --swc ../../temp/skin.swc --run && ./run_adl.sh && python3 cmp.py adl.txt ours.txt
+cd temp/tlprobe && node gen.ts && ../../src/index.ts ours.as --swc ../../examples/embed-assets/skin.swc --run && ./run_adl.sh && python3 cmp.py adl.txt ours.txt
 # 烘焙口径与 op 计数
 node temp/tlcheck.ts
 # 子件树（15 符号 / 99 子件）
@@ -1476,8 +1554,8 @@ FLA 导出时透明区被填**黑**，于是透明区画成黑矩形。这不是
 
 | 观测项 | `adl` 口径 |
 |---|---|
-| 门 | 是 **`buttonMode`**，不是「有标签就算按钮」：同一个类把 `buttonMode` 置 false 就永远停在第 1 帧；另一个「有标签、没有脚本」（默认 `false`）的符号 `BtnRootResources_99复制_362` 悬停/按下也永远停在第 1 帧 |
-| 帧 | 由**标签**决定，不是帧号：`元件17_125` 是 `_up@1/_over@4/_down@7`，`BtnRootResources_99复制_362` 是 `_up@1/_over@5/_down@10`，各自落到自己标签那一帧 |
+| 门 | 是 **`buttonMode`**，不是「有标签就算按钮」：同一个类把 `buttonMode` 置 false 就永远停在第 1 帧；另一个「有标签、没有脚本」（默认 `false`）的符号（旧导出 `BtnRootResources_99复制_362`；**当前夹具** `skin_fla.BtnRootResources_99复制_64`）悬停/按下也永远停在第 1 帧 |
+| 帧 | 由**标签**决定，不是帧号：旧导出 `元件17_125` 是 `_up@1/_over@4/_down@7`、`BtnRootResources_99复制_362` 是 `_up@1/_over@5/_down@10`；**当前夹具** 对位的是 `skin_fla.元件17_55`（`_up@1/_over@4/_down@7`）与 `skin_fla.BtnRootResources_99复制_64`（`_up@1/_over@5/_down@10`），各自落到自己标签那一帧 |
 | 三档 | 移开 → `_up`；滚入 → `_over`；按下 → `_down`（是**真导航**，`currentFrame`/`currentLabel` 都变） |
 | 按压锁 | 锁在 `mouseDown` 的那个对象上：在别处按下再拖进来只有 `_over`；在这里按下再拖出去仍保持 `_down` |
 | 松开 | 指针在内回到 `_over`，在外回到 `_up` |
@@ -1506,7 +1584,7 @@ FLA 导出时透明区被填**黑**，于是透明区画成黑矩形。这不是
 
 **验收**
 
-- **双端对照**：`temp/btnprobe/` 逐档帧号/标签一致（`元件17_125` `1:_up`→`4:_over`→`7:_down`、
+- **双端对照**：`temp/btnprobe/` 逐档帧号/标签一致（旧导出 `元件17_125` `1:_up`→`4:_over`→`7:_down`、
   按住拖出仍 `7:_down`、外面松开 `1:_up`、原地松开回 `4:_over`、别处按下再拖进来只有 `4:_over`），
   像素差同量级；`ASC_NO_AUTO_BAKE=1` 下两侧窗口的 hover/按下像素差为 16094/105076 vs adl 15524/105227。
 - **示例**：`examples/swc-mc-button.as`（结构 + 8 档迁移 + 两个负例 + 首页卡片在自动烘焙下的
@@ -1680,7 +1758,7 @@ vtable 由 `… NULL, -1, "AIAsrComBox", 0, 0, 0, …` 变为
 | 运行时解码的 ±1 通道漂移（半透明像素） | Skia `readPixels(kUnpremul)` 对 straight-alpha PNG 会做预乘→反预乘两次取整，使 A∈(0,255) 的像素 RGB 漂 ±1（alpha 逐位精确）。实测 388,648 像素中 206 个不符（0.053%），均在 §11③ 允许范围内。彻底消除需自带 PNG 解码器（绕开 Skia 的 alpha 变换），代价与收益不成比例。见 §5「保真」实测修正 |
 | ~~`vbitemskin`(charId 293) 的一处遮挡差异（未定位）~~ **已定位并修复**（§9.2 F3） | 根因 = `PlaceObject3` 的 `Visible = 0`（depth 6 的 #286）被解析后丢弃 ⇒ AIR 隐藏、我们画出。修后该符号 `maxdcS 76 → 30`，同批 42 个 entry 全部变好（`fileitemdoctorskin` 205 → 2 等）。残留的 30 属抗锯齿/色彩级差 |
 | ~~`PlaceObject3` 的 `FILTERLIST` / `BlendMode` / `BitmapCached` 三个属性解析后丢弃~~ **已实现**（§9.2 F4，v0.4.65） | 13 条滤镜（11 Glow + 2 DropShadow）、8 条 `BlendMode`（7=`layer`、1=`darken`）、2 条 `BitmapCached` 全部落地；含 `strength` 与模糊 σ 的 AIR 对齐。1× harness 逐符号一边倒变好、无一处变差 |
-| 滤镜的 `inner`（内发光/内阴影）与 `knockout` | 两者都在 SWC 记录里解析出来并进了 AS3 滤镜对象，但**光栅路径未实现**：我们一律按外发光/外阴影画。实测 `temp/skin.swc` 的 13 条记录 `inner = 0`、`knockout = 0`，故当前无像素影响。Skia 侧要表达「内」需要额外构造（用剪影取反 + `Blend(kSrcIn)`），未做 |
+| 滤镜的 `inner`（内发光/内阴影）与 `knockout` | 两者都在 SWC 记录里解析出来并进了 AS3 滤镜对象，但**光栅路径未实现**：我们一律按外发光/外阴影画。实测 `examples/embed-assets/skin.swc` 的 13 条记录 `inner = 0`、`knockout = 0`，故当前无像素影响。Skia 侧要表达「内」需要额外构造（用剪影取反 + `Blend(kSrcIn)`），未做 |
 | `FILTERLIST` 里的 Bevel / GradientGlow / Convolution / GradientBevel / ColorMatrix（FilterID 3–7） | 只按文档长度跳字节并进 `swcBake.notes`**报明**，不静默丢弃；实测本库 0 条。属于「遇到再实现」 |
 | 模糊剖面：我们用的是**高斯近似**，AIR 是**真 box** | 已按方差匹配（`sigma = blur*sqrt(quality)/sqrt(12)`），中心/尾部仍不同（`blur6q1` ours 217/161/94/38/9 vs AIR 191/148/106/63/21）。求真 box 需 `MatrixConvolution`（每层 36~256 抽头、非可分离），性能风险大于收益 |
 | `BlendMode` 中 Skia 无法表达的模式（subtract / invert / alpha / erase） | glue 返回 0（按 `kSrcOver` 处理）并由 `notes` **报明**，不做近似 —— 实测本库 8 条全在可表达集合内（`layer`/`darken`） |
@@ -1689,12 +1767,12 @@ vtable 由 `… NULL, -1, "AIAsrComBox", 0, 0, 0, …` 变为
 | 子件的**类名身份**与 AIR 不同 | AIR 对 SymbolClass 链接过的字符报**类名**（如 `popbgskin`）、对 morph 报 `MorphShape`；我们统一按基类报 `Sprite`/`Shape`（`getQualifiedClassName` 可观测）。像素与树形不受影响 |
 | AIR 的包围盒**量化/累积口径**与我们不同（未定案） | 实测 `temp/childfx/` 里 33 处 `width/height` 差 `\|Δ\| ≤ 0.021px`（多数 ≤0.005，且**两个方向都有**）：例如 `userskin c4` AIR `260×30` vs 我们 `260.0006×30.0001`（同一个 280×46 的矩形 × 同一个 16.16 矩阵 scale，AIR 的值看着像是它自己的内部取整）、`homeskin c6` `354×580` vs `353.999×580.021`。两个模型的差在 0.4 twip 以内，未定案。**另**：烘焙坐标自身也有末位差（时间轴探针里文本子件 `y = 0.9500000000000002` vs `adl 0.95`，≤2 ULP，成因是两次 `/20` 相加），同样只影响字符串打印 |
 | ~~时间轴 placement 的矩阵不回填到子件**自己的** `x/y/scaleX/scaleY`~~ **`x/y` 已修**（§9.2 F5，v0.4.66） | 平移现在写进子件自身 `x/y`（实测 `vbitemskin c4` `41,23.75`、文本子件 `x = tx + RECT.xmin`，均逐位相同）。**刻意保留**：2×2（scale/rotation/skew）仍只在 `transform.matrix` 里 —— F1 实测 AIR 的九宫格**不认** placement 拉伸（42 个被拉伸的 gridded entry 只有那样才对得上），故 `child.scaleX/scaleY` 我们报 1、AIR 有时报 decomposed 值（如 `popchatitem c0` `1.4973`）。像素与 `transform.matrix` 读回一致，只有直接读 `child.scaleX` 的代码可观测 |
-| `ZWS`(LZMA) SWC | `temp/skin.swc` 是 `CWS`；布局已在 §4 给出，实现成本低，但价值有限故延后 |
-| 字体（`DefineFont*`） | 需分两条路看：**app.xml 的 `<embedFonts>` 路径 `air-app.ts` 已实现**（产出清单 `font-urls` / `preload-paths`）；**SWC 内嵌字体尚未处理**——实测 `temp/skin.swc` 含 **7 个 `DefineFont3`**，属「从 SWC 取字体」这一独立解码域 |
-| 声音（`DefineSound`） | 实测 `temp/skin.swc` **无** `DefineSound`（0 个）；若将来遇到，是独立解码域 |
+| `ZWS`(LZMA) SWC | `examples/embed-assets/skin.swc` 是 `CWS`；布局已在 §4 给出，实现成本低，但价值有限故延后 |
+| 字体（`DefineFont*`） | 需分两条路看：**app.xml 的 `<embedFonts>` 路径 `air-app.ts` 已实现**（产出清单 `font-urls` / `preload-paths`）；**SWC 内嵌字体尚未处理**——实测 `examples/embed-assets/skin.swc` 含 **7 个 `DefineFont3`**，属「从 SWC 取字体」这一独立解码域 |
+| 声音（`DefineSound`） | 实测 `examples/embed-assets/skin.swc` **无** `DefineSound`（0 个）；若将来遇到，是独立解码域 |
 | 被 `Sprite` 引用的无类名位图（43 个） | 需解析 `DefineSprite`/`PlaceObject` 的完整显示树；**注意 `small_gift`/`checkbom` 属于这一档**（早期版本误列为 16 个之一） |
 | `[Embed]` 元数据语法 | **不是「已有捷径」**：`Embed` 目前无任何语义层消费者（§1），自有项目场景同样需要实现 |
-| `DefineBitsJPEG4`（tag 90） | 实测 `temp/skin.swc` 无；与 JPEG3 同族（tag 35 **已支持**，§3.2③），随手支持即可。**注意**：`CHARACTER_TAG_KINDS` 已把它归为 `bitmap`，但提取器只处理 20/21/35/36 ⇒ 真遇到 tag 90 会在 `swcBakePlan` 的位图分支上以一句**误导性**的 `bitmap fill references missing bitmap #N` 失败（应按 JPEG4 报明） |
+| `DefineBitsJPEG4`（tag 90） | 实测 `examples/embed-assets/skin.swc` 无；与 JPEG3 同族（tag 35 **已支持**，§3.2③），随手支持即可。**注意**：`CHARACTER_TAG_KINDS` 已把它归为 `bitmap`，但提取器只处理 20/21/35/36 ⇒ 真遇到 tag 90 会在 `swcBakePlan` 的位图分支上以一句**误导性**的 `bitmap fill references missing bitmap #N` 失败（应按 JPEG4 报明） |
 | ~~九宫格缩放（`DefineScalingGrid`，实测 22 个）~~ **已实现**（§9 F/§9.2 F1）；但 **AS3 侧的 `DisplayObject.scale9Grid` 属性尚未实现** | 工程只从 SWF tag 烘焙九宫格，运行时**没有**可读写的 `scale9Grid` 属性（AIR 有）。即：SWF 皮肤里的缩放不会糊，但用户代码无法自己设置/查询它。 已按 §1.5 记入 `TODO.md` 的 `### 遗留待开发` |
 | `BitmapData.draw(source, matrix)` 对 source **自身变换**的处理与 AIR 不同 | 实测 `adl`：给被绘对象设 `o.scaleX = 2` 在 `draw(source, matrix)` 中**无效**（只受 `matrix` 参量影响）； 我们的实现会应用它。探针因此统一改为先包一层容器再 draw。**未定案**，记入 `### 遗留待开发` |
 | 形变 shape（`DefineMorphShape`/`2`，实测 6 个） | 需两套几何 + 插值；本库仅 6 个，价值低故延后。**现状**：已烘成**空 `Shape` 占位子件**（§9.2 F5）⇒ 树形对齐、不画错像素，几何与插值仍是缺口；其时间轴的 `Ratio` 记录（本库 270 条）被丢弃并报明（§9.2 F6） |

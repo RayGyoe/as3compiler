@@ -250,7 +250,7 @@ miniaudio **v0.11.25**，4,108,168 B / 95,864 行。）
 | `Microphone` / `Camera` 采集 | 设备采集，独立域 |
 | `NetStream` / RTMP | 流媒体协议栈，独立域 |
 | `[Embed]` 的 mp3 / 图片 | `Embed` 元数据**整体无消费者**（`EmbeddedAssets_flap = NULL`），是另一条独立缺口 |
-| SWC 里的 `DefineSound` | 实测 `temp/skin.swc` **0 个**；若遇到属独立解码域（同 `swc.md` §10 口径） |
+| SWC 里的 `DefineSound` | 实测（旧导出与当前夹具都）**0 个**；若遇到属独立解码域（同 `swc.md` §10 口径） |
 | WASI 音频 | 平台硬边界，如实报明「本后端不支持」 |
 
 ---
@@ -386,7 +386,7 @@ temp/audioprobe/diffall.sh
 temp/audioprobe/diffall.sh 3 8 9k2          # 挑选轮次
 
 # adl 参考怎么来的（每轮 gen*.ts 会同时写出 AdlScene.as 与 ours.as）
-temp/audioprobe/run_adl.sh adl3.txt         # 需 AIRSDK_51.4.1 + temp/skin.swc，看门狗 120s
+temp/audioprobe/run_adl.sh adl3.txt         # 需 AIRSDK_51.4.1 + examples/embed-assets/skin.swc，看门狗 120s
 
 # 后端级（不经 AS3 层）的定点验证
 cd temp/audiomini && cc -O2 -o dectest dectest.c -lm && ./dectest   # 标称帧数逐文件对齐

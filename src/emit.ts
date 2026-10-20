@@ -1329,6 +1329,63 @@ export class Emitter {
     return false;
   }
 
+  // The C class name a member RECEIVER statically denotes as a class reference, for
+  // both spellings AS3 allows: a bare class name (`File`) or a fully-qualified
+  // package chain (`flash.filesystem.File`). Null when the receiver is an ordinary
+  // object expression (a variable, a call, a member of a value). See the call site
+  // in emitMember for why the two spellings must resolve alike -- the FQN spelling
+  // used to degrade to the dynamic Class-value path and read undefined.
+  private classRefName(e: Expr): string | null {
+    if (e.kind === 'Var') {
+      // A BARE spelling of a package-less language built-in (System/Capabilities/
+      // Math/JSON/int/uint) denotes the built-in, not a package class that merely
+      // SHARES the simple name: those names are always in scope, while a package
+      // class needs an import. Letting resolveClassName answer here would let the
+      // global short-name alias table hijack the spelling -- e.g. the as3corelib
+      // class `com.adobe.serialization.json.JSON` (declared by this app's own
+      // sources) turned a bare `JSON.parse(...)` into that class, which has no
+      // `parse` at all, so the build died with "undefined static method 'parse'"
+      // (BaseModel.as:21). An EXPLICIT or wildcard import still wins (AS3 import
+      // precedence), which is why the alias table is consulted first.
+      const imported = this.currentClass ? this.symbols.getClass(this.currentClass)?.importAlias : null;
+      if (imported?.has(e.name) !== true && Emitter.STATIC_ONLY_CLASSES.has(e.name)) return e.name;
+      return this.resolveClassName(e.name);
+    }
+    if (e.kind !== 'Member') return null;
+    const chain = this.flattenDotChain(e);
+    if (chain === null || chain.length < 2) return null;
+    if (this.chainRootIsValue(chain[0])) return null;
+    const fq = this.resolveClassName(chain.join('.'));
+    // The static-only pseudo-classes (System/Capabilities/Math/JSON/int/uint) have
+    // NO ClassInfo -- their statics live in the hardcoded emitters of emitMember /
+    // emitCall -- so a registered-class test alone would reject the FQN spelling of
+    // every one of them.
+    if (Emitter.STATIC_ONLY_CLASSES.has(fq)) return fq;
+    const ci = this.symbols.getClass(fq);
+    if (ci === undefined) return null;
+    if (ci.fqn === undefined && ci.reflectFqn === undefined) return null;
+    return fq;
+  }
+
+  // True when the FIRST segment of a dotted chain (`pkg.sub.Cls.member`) is bound as a
+  // variable, which makes the whole chain a member walk on that VALUE rather than a
+  // package path. AS3 scoping: a declared name shadows a package name, so
+  // `var pkg:Object = null; pkg.C.field` must fail with #1009 (null receiver) --
+  // measured on adl 51.4.1 (temp/fqnadl/), and it is a SILENT WRONG VALUE when the
+  // chain is resolved as a class reference instead (we printed the static's value).
+  // Both the module (script-scope) table and the local scope stack must be consulted:
+  // top-level `var`s live in `moduleScope`, not in `scopes`.
+  //
+  // Scope: this guards the paths that go through classRefName. The PRE-EXISTING FQN
+  // branch in emitMember (and the dotted-chain class-VALUE resolution, and
+  // `Cls["member"]`) still resolve such a chain as a class reference -- a family-wide
+  // gap logged in TODO.md 遗留待开发 and deliberately left alone here. A BARE name
+  // (`File.x`) also still specializes when a variable shadows the class name, exactly
+  // as before this change (the Var arm of classRefName keeps that parity).
+  private chainRootIsValue(root: string): boolean {
+    return this.varInScope(root) || this.moduleScope.has(root);
+  }
+
   // Flatten a dot-separated member chain (`a.b.c.d`) into [a, b, c, d] when it is
   // rooted at a Var (the package's first segment in a fully-qualified reference
   // like `starling.events.Event.ROOT_CREATED`). Returns null for anything else.
@@ -14779,6 +14836,33 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('static char* as_user_dir(void) { return as_home_dir(); }');
     this.line('static char* as_desktop_dir(void) { return as_path_join(as_home_dir(), "Desktop"); }');
     this.line('static char* as_documents_dir(void) { return as_path_join(as_home_dir(), "Documents"); }');
+    // AIR File.separator / File.lineEnding: the host OS's path component separator
+    // and line-ending sequence. Their VALUE is a property of the host, so the build
+    // target answers them: Windows is the only platform AIR gives a backslash and
+    // CRLF ("the carriage return character ... followed by the line-feed character"
+    // -- File.lineEnding, airsdk.dev), while macOS, Linux, WASI and the browser build
+    // all get '/' and LF. The browser has no AIR counterpart at all; POSIX is the
+    // honest answer there rather than a silent Windows-ism. Note these are compared
+    // as ordinary AS3 strings on the C side, so the backslash needs no escaping at
+    // the call site -- that is what returning a literal (instead of boxing) buys.
+    this.line('static char* as_file_separator(void) {');
+    this.indent++;
+    this.line('#ifdef _WIN32');
+    this.line('return (char*)"\\\\";');
+    this.line('#else');
+    this.line('return (char*)"/";');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
+    this.line('static char* as_file_line_ending(void) {');
+    this.indent++;
+    this.line('#ifdef _WIN32');
+    this.line('return (char*)"\\r\\n";');
+    this.line('#else');
+    this.line('return (char*)"\\n";');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
     this.line('static int as_mkdir_one(const char* p) {');
     this.indent++;
     this.line('#ifdef _WIN32');
@@ -26041,11 +26125,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   // appear in chained-assignment RHS position, since the setter itself is void).
   private resolveInstanceSetter(target: Expr): { owner: string; property: string; paramType: CType; objCode: string; isStatic: boolean } | null {
     if (target.kind !== 'Member') return null;
-    // static setter: ClassName.prop = v
-    if (target.object.kind === 'Var') {
-      const cname = this.resolveClassName(target.object.name);
-      if (this.symbols.hasClass(cname)) {
-        const cinfo = this.symbols.getClass(cname)!;
+    // static setter: ClassName.prop = v (either spelling of the class name)
+    const setRef = this.classRefName(target.object);
+    if (setRef !== null) {
+      const cinfo = this.symbols.getClass(setRef);
+      if (cinfo !== undefined) {
         const ss = cinfo.staticSetters?.get(target.property);
         if (ss) {
           return { owner: ss.owner, property: target.property, paramType: this.setterParamType(ss), objCode: 'NULL', isStatic: true };
@@ -26121,10 +26205,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       }
       return sf ? { owner: sf.owner, name: target.name } : null;
     }
-    if (target.kind === 'Member' && target.object.kind === 'Var') {
-      const cname = this.resolveClassName(target.object.name);
-      if (this.symbols.hasClass(cname)) {
-        const sf = this.symbols.getClass(cname)!.staticFields.get(target.property);
+    if (target.kind === 'Member') {
+      const setRef = this.classRefName(target.object);
+      if (setRef !== null) {
+        const sf = this.symbols.getClass(setRef)?.staticFields.get(target.property);
         if (sf) return { owner: sf.owner, name: target.property };
       }
     }
@@ -28285,22 +28369,23 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           return { code: `DisplayObject_set_transform_matrix((void*)(${tm.ownerCode}), (Matrix*)(${mv.code}))`, type: { kind: 'void' } };
         }
       }
-      // static field: ClassName.field = v
-      if (target.object.kind === 'Var') {
+      // static field: ClassName.field = v -- for EITHER spelling of the class name
+      // (`File.x` and `flash.filesystem.File.x` resolve against the same traits).
+      const setRef = this.classRefName(target.object);
+      if (setRef !== null) {
         // `System.useCodePage = v` is the one WRITABLE property of the static-only
         // pseudo-class System (every other System name is a read-only constant, so
         // the read side lives in emitSystemConst and a write there has no receiver
         // object at all -- without this branch the identifier `System` fell through
         // to the variable path and reported "undefined variable 'System'").
-        if (target.object.name === 'System' && target.property === 'useCodePage') {
+        if (setRef === 'System' && target.property === 'useCodePage') {
           const code = expr.op === '='
             ? this.convert(this.emitExpr(expr.value), { kind: 'bool' })
             : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), { kind: 'bool' });
           return { code: `as_sys_set_use_code_page(${code})`, type: { kind: 'void' } };
         }
-        const cname = this.resolveClassName(target.object.name);
-        if (this.symbols.hasClass(cname)) {
-          const cinfo = this.symbols.getClass(cname)!;
+        const cinfo = this.symbols.getClass(setRef);
+        if (cinfo !== undefined) {
           const sf = cinfo.staticFields.get(target.property);
           if (sf) {
             // Compound assignment folds the old value in (`C.f += v` =>
@@ -28635,47 +28720,56 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
 
     // method call obj.method(...)
     if (callee.kind === 'Member') {
+      // The receiver as a statically-known class reference -- the bare class name
+      // (`System`) or the fully-qualified package chain (`flash.system.System`). AIR
+      // resolves a static CALL against the same class traits for EITHER spelling
+      // (`flash.filesystem.File` reads alike -- see emitMember); without this the FQN
+      // spelling fell to the dynamic `as_class_call_static`, whose statics table has
+      // no row for an FQN receiver (walkInferType cannot type a `pkg.Cls` chain), so
+      // valid code threw #1006 (temp/fqn/b.as).
+      const calleeClassRef = this.classRefName(callee.object);
+      const isSystemClass = calleeClassRef === 'System';
       // System.gc(): force a stop-the-world collection (offscreen loops use this
       // to bound memory; window builds collect incrementally via gc_step).
-      if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'gc') {
+      if (isSystemClass && callee.property === 'gc') {
         return { code: 'as_system_gc()', type: { kind: 'void' } };
       }
       // System.output(str): write a string verbatim to stdout (AIR 33.1 console).
-      if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'output') {
+      if (isSystemClass && callee.property === 'output') {
         const a = this.emitExpr(expr.args[0]);
         return { code: `as_system_output(${a.code})`, type: { kind: 'void' } };
       }
       // System.pauseForGCIfCollectionImminent(n): a GC hint; no-op under AOT
       // (the managed heap is precise and incrementally collected at frame
       // boundaries, so there is no stop-the-world collection to forestall).
-      if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'pauseForGCIfCollectionImminent') {
+      if (isSystemClass && callee.property === 'pauseForGCIfCollectionImminent') {
         return { code: '(void)0', type: { kind: 'void' } };
       }
       // System.setClipboard(str): a real Clipboard request on a real OS. This
       // build has no clipboard backend (no OS clipboard binding in the runtime),
       // so the call reports itself once and copies nothing — a silent no-op would
       // make a "copied!" toast a lie.
-      if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'setClipboard') {
+      if (isSystemClass && callee.property === 'setClipboard') {
         const a = this.emitExpr(expr.args[0]);
         return { code: `(void)(${a.code}), (as_shell_unsupported((char*)"flash.system.System.setClipboard"), (void)0)`, type: { kind: 'void' } };
       }
       // System.disposeXML(xml): AIR hint to release an XML object early. Our GC
       // reclaims XML automatically, so it is a no-op (the argument is still
       // evaluated to preserve any side effects).
-      if (callee.object.kind === 'Var' && callee.object.name === 'System' && callee.property === 'disposeXML') {
+      if (isSystemClass && callee.property === 'disposeXML') {
         const a = this.emitExpr(expr.args[0]);
         return { code: `(void)(${a.code})`, type: { kind: 'void' } };
       }
       // Math.abs(...) etc.
-      if (callee.object.kind === 'Var' && callee.object.name === 'Math') {
+      if (calleeClassRef === 'Math') {
         return this.emitMathMethod(callee.property, expr.args);
       }
       // String.fromCharCode(...) static method.
-      if (callee.object.kind === 'Var' && callee.object.name === 'String') {
+      if (calleeClassRef === 'String') {
         return this.emitStringStatic(callee.property, expr.args);
       }
       // JSON.stringify(...) / JSON.parse(...) top-level static methods.
-      if (callee.object.kind === 'Var' && callee.object.name === 'JSON') {
+      if (calleeClassRef === 'JSON') {
         return this.emitJSONMethod(callee.property, expr.args);
       }
       // static method: ClassName.method(...)
@@ -28717,6 +28811,37 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         const argsArray = this.emitExpr(expr.args[1]);
         if (target.type.kind === 'vector') {
           return { code: `as_vector_${this.vectorCName(target.type.elem)}_push_all(${target.code}, ${argsArray.code})`, type: { kind: 'int' } };
+        }
+      }
+      // A static METHOD called through a statically-known class reference: the same
+      // direct call the bare-name branch above emits, reached from the FQN spelling
+      // (`com.example.C.m()`, `flash.net.URLRequest.defaultPreventCache()`). Only a
+      // name the class really declares as a static method takes this path; anything
+      // else keeps the dynamic `as_class_call_static` fallback below, which is what a
+      // genuinely dynamic Class VALUE needs (and what reports a SWC symbol's invisible
+      // member LOUDLY instead of failing the build -- see swcSymbolClass).
+      if (calleeClassRef !== null) {
+        const crefInfo = this.symbols.getClass(calleeClassRef);
+        const sm = crefInfo?.staticMethods.get(callee.property);
+        if (sm !== undefined) {
+          if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
+            throw new CodegenError(`static method '${callee.property}' is not accessible here`);
+          }
+          const args = this.emitArgs(sm.params, expr.args, this.declAliasOf(sm.owner));
+          return { code: `${sm.owner}_${callee.property}_static(${args})`, type: sm.returnType };
+        }
+        // A static FIELD holding a callable value, the FQN spelling of the branch the
+        // bare class name takes above (`static var getTime:Function = getTimer;`
+        // then `LibCore.getTime()`): AIR dispatches through the field's value, so it
+        // is called like any other Function-typed value.
+        const csf = crefInfo?.staticFields.get(callee.property);
+        if (csf !== undefined && (csf.type.kind === 'function' || csf.type.kind === 'any')) {
+          const ce = this.emitExpr(callee);
+          if (ce.type.kind === 'function') return this.emitFunctionCall(ce, expr.args);
+          const items = expr.args.map((a) => this.boxExpr(this.emitExpr(a)));
+          const n = items.length;
+          const arr = n > 0 ? `(as_value[${n}]){ ${items.join(', ')} }` : 'NULL';
+          return { code: `as_fn_call_dyn(${ce.code}, ${arr}, ${n}, "${this.escapeCString(callee.property)}")`, type: { kind: 'any' } };
         }
       }
       const obj = this.emitExpr(callee.object);
@@ -29408,26 +29533,41 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         return { code: `DisplayObject_get_transform_matrix((void*)(${tm.ownerCode}))`, type: { kind: 'object', className: 'Matrix' } };
       }
     }
+    // The receiver as a statically-known CLASS reference, for BOTH spellings AS3
+    // allows: the bare class name (`File`, `Math`) and the fully-qualified package
+    // chain (`flash.filesystem.File`). AIR resolves a member against the SAME
+    // static traits for either spelling -- measured on mxmlc + adl 51.4.1
+    // (temp/fqnadl/): 19 trace lines, both spellings, byte-identical to ours. The
+    // FQN spelling used to fall through to the dynamic Class-value path
+    // (`as_class_member_value`), which only knows the names walkExpr collected -- and
+    // walkInferType cannot type a `pkg.Cls` chain, so it collected none of them: the
+    // lookup answered undefined and the trailing `.nativePath` threw #1010
+    // (reported against `flash.filesystem.File.applicationDirectory`, temp/appdir3.as).
+    const classRef = this.classRefName(expr.object);
+    // The hardcoded static emitters below are for the built-ins and for the core
+    // language classes (which carry no ClassInfo at all). A class declared by the
+    // sources -- or by the SWC baker -- owns its own traits, so it must not be
+    // captured by them; it resolves through the static-trait lookups below instead.
+    const classRefBuiltin = classRef !== null && !this.userClasses.has(classRef);
     // flash.system.System static read-only memory stats (System is final and has
     // no instantiable class, so it is handled here like Math/Number constants).
-    if (expr.object.kind === 'Var' && expr.object.name === 'System') {
+    if (classRefBuiltin && classRef === 'System') {
       return this.emitSystemConst(expr.property);
     }
     // flash.system.Capabilities static read-only environment info (same final
     // static-readonly-class pattern as System; version is injected at compile time).
-    if (expr.object.kind === 'Var' && expr.object.name === 'Capabilities') {
+    if (classRefBuiltin && classRef === 'Capabilities') {
       return this.emitCapabilitiesConst(expr.property);
     }
-    // flash.filesystem.File static directory shortcuts (applicationDirectory /
-    // applicationStorageDirectory / desktopDirectory / documentsDirectory /
-    // userDirectory), resolved at runtime from the process environment rather than
-    // a compile-time path.
-    if (expr.object.kind === 'Var' && expr.object.name === 'File') {
-      const c = this.emitFileStaticDir(expr.property);
+    // flash.filesystem.File static READ-ONLY members: the five directory
+    // shortcuts (resolved at runtime from the process environment rather than a
+    // compile-time path) plus the host-OS strings separator / lineEnding.
+    if (classRefBuiltin && classRef === 'File') {
+      const c = this.emitFileStaticReadOnly(expr.property);
       if (c) return c;
     }
     // Math.PI / Math.E
-    if (expr.object.kind === 'Var' && expr.object.name === 'Math') {
+    if (classRefBuiltin && classRef === 'Math') {
       return this.emitMathConst(expr.property);
     }
     // String.fromCharCode used as a VALUE (a Function), not called. AIR hands
@@ -29436,20 +29576,20 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // specialised emission (emitStringStatic); the value form is a closure over
     // the variadic thunk emitted in emitFunctionValues, so .apply/.call and
     // assignment to a Function-typed slot all ride the normal as_fn machinery.
-    if (expr.object.kind === 'Var' && expr.object.name === 'String' && expr.property === 'fromCharCode') {
+    if (classRefBuiltin && classRef === 'String' && expr.property === 'fromCharCode') {
       return { code: 'as_fn_make(as_static_fromCharCode_thunk, NULL, 1)', type: { kind: 'function' } };
     }
     // Array sort-option constants (values per the AS3 Array class).
-    if (expr.object.kind === 'Var' && expr.object.name === 'Array') {
+    if (classRefBuiltin && classRef === 'Array') {
       const c = this.emitArrayConst(expr.property);
       if (c !== null) return c;
     }
     // Number.MAX_VALUE / int.MAX_VALUE / uint.MAX_VALUE etc.
-    if (expr.object.kind === 'Var' && (expr.object.name === 'Number' || expr.object.name === 'int' || expr.object.name === 'uint')) {
-      const c = this.emitNumConst(expr.object.name, expr.property);
+    if (classRefBuiltin && (classRef === 'Number' || classRef === 'int' || classRef === 'uint')) {
+      const c = this.emitNumConst(classRef, expr.property);
       if (!c) {
-        if (as3Gap('constant', `${expr.object.name}.${expr.property}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
-        throw new CodegenError(`undefined constant '${expr.object.name}.${expr.property}'`);
+        if (as3Gap('constant', `${classRef}.${expr.property}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
+        throw new CodegenError(`undefined constant '${classRef}.${expr.property}'`);
       }
       return c;
     }
@@ -29457,6 +29597,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // The parser emits a nested Member chain rooted at a Var holding the package's
     // first segment; flatten it and resolve the longest class prefix, the trailing
     // segment being a static member of that class (e.g. `starling.events.Event.ROOT_CREATED`).
+    // NOTE: this pre-existing branch does NOT consult chainRootIsValue, so a variable
+    // that shadows a package root is still read as a class reference here (AIR throws
+    // #1009 instead) -- a family-wide gap logged in TODO.md 遗留待开发, deliberately not
+    // changed in this phase because it predates the FQN work and covers more paths
+    // (this branch, the Class-value resolution, `Cls["member"]`).
     const chain = this.flattenDotChain(expr);
     if (chain && chain.length >= 2) {
       for (let split = chain.length - 1; split >= 1; split--) {
@@ -29485,6 +29630,23 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           }
           if (split === chain.length - 1) {
             return { code: `as_fn_make(${sm.owner}_${memberName}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+          }
+          break;
+        }
+        // A COMPUTED static (getter pair) reached through the FQN spelling. Same
+        // order as the bare-name path (`Class.prop` reads a field before a
+        // getter), and the same C call the bare-name path emits. Without this the
+        // read fell to the dynamic Class-value path, whose statics table only holds
+        // the names walkExpr collected -- an FQN chain is not one of them, so a
+        // built-in static getter (`flash.desktop.NativeApplication.nativeApplication`)
+        // answered undefined and the caller's next `.member` threw #1010.
+        const sg = cinfo.staticGetters?.get(memberName);
+        if (sg) {
+          if (!this.symbols.isAccessible(sg.visibility, sg.owner, this.currentClass)) {
+            throw new CodegenError(`static getter '${memberName}' is not accessible here`);
+          }
+          if (split === chain.length - 1) {
+            return { code: `${sg.owner}_get_${memberName}_static(NULL)`, type: sg.returnType };
           }
           break;
         }
@@ -30618,16 +30780,22 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     }
   }
 
-  // flash.filesystem.File static directory shortcuts, resolved at runtime from the
-  // process environment. Returns null for a non-directory member so the caller
-  // falls through to ordinary static-field resolution.
-  private emitFileStaticDir(name: string): { code: string; type: CType } | null {
+  // flash.filesystem.File static read-only members: the five directory shortcuts
+  // plus separator / lineEnding (both `[static] [read-only]`: String getters on
+  // File -- airsdk.dev, flash.filesystem.File). Returns null for any other member
+  // so the caller falls through to ordinary static-field resolution.
+  private emitFileStaticReadOnly(name: string): { code: string; type: CType } | null {
     switch (name) {
       case 'applicationDirectory': return { code: 'File_new(as_app_dir())', type: { kind: 'object', className: 'File' } };
       case 'applicationStorageDirectory': return { code: 'File_new(as_app_storage_dir())', type: { kind: 'object', className: 'File' } };
       case 'desktopDirectory': return { code: 'File_new(as_desktop_dir())', type: { kind: 'object', className: 'File' } };
       case 'documentsDirectory': return { code: 'File_new(as_documents_dir())', type: { kind: 'object', className: 'File' } };
       case 'userDirectory': return { code: 'File_new(as_user_dir())', type: { kind: 'object', className: 'File' } };
+      // The two host-OS strings. Runtime helpers rather than compile-time literals
+      // because the value is a property of the HOST, not of the source: one emitter
+      // serves every target and the target picks the answer (see as_file_separator).
+      case 'separator': return { code: 'as_file_separator()', type: { kind: 'string' } };
+      case 'lineEnding': return { code: 'as_file_line_ending()', type: { kind: 'string' } };
       default: return null;
     }
   }

@@ -1785,6 +1785,57 @@ function checkNativeWindowSurface(): string[] {
 registerGroup('unit: platform/WindowSurface', checkNativeWindowSurface);
 registerGroup('unit: platform/CapabilitiesOs', checkCapabilitiesOs);
 
+// flash.filesystem.File's two host-OS string statics (阶段二百一十八): separator and
+// lineEnding.
+//
+// Why this is a PLATFORM pin and not merely a File one: the answer to both is a
+// property of the HOST, so the honest way to produce it in an AOT compiler is a
+// conditional in the emitted code -- which is precisely the shape that rots silently
+// when only one of its branches is ever compiled by the machine you develop on (this
+// repo's developer is on Windows; the CI runner is arm64 macOS). Same discipline as
+// the "both branches of the seam" pins above, and it is the Windows bug class
+// recorded with it: a helper written for the host you can test compiles fine
+// everywhere EXCEPT the platforms that take the other branch.
+//
+// The values themselves are AIR's, not ours (airsdk.dev): File.separator is "the
+// forward slash (/) character" on Mac OS and Linux and "the backslash (\) character"
+// on Windows; File.lineEnding is the line-feed character on Mac OS and Linux, and on
+// Windows "the carriage return character ... followed by the line-feed character".
+// The browser build has no AIR counterpart at all and keeps the POSIX pair -- the
+// honest answer there, not a silent Windows-ism.
+function checkFileHostConstants(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [file-host] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [file-host] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'import flash.filesystem.File;\n' +
+    'trace("x" + File.separator + File.lineEnding);\n' +
+    'trace("y" + flash.filesystem.File.separator + flash.filesystem.File.lineEnding);\n'
+  )).c;
+  const fn = (sig: string): string => {
+    const i = c.indexOf(sig);
+    return i < 0 ? '' : c.slice(i, c.indexOf('\n}', i));
+  };
+  const sep = fn('static char* as_file_separator(void) {');
+  const eol = fn('static char* as_file_line_ending(void) {');
+
+  check('File.separator is emitted with BOTH platform branches, each with AIR\'s value',
+    sep.includes('#ifdef _WIN32') && sep.includes('#else')
+    && sep.includes('return (char*)"\\\\";') && sep.includes('return (char*)"/";'));
+  check('File.lineEnding is emitted with BOTH platform branches (CRLF on Windows, LF elsewhere)',
+    eol.includes('#ifdef _WIN32') && eol.includes('#else')
+    && eol.includes('return (char*)"\\r\\n";') && eol.includes('return (char*)"\\n";'));
+
+  console.log(`     [file-host] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/FileHostConstants', checkFileHostConstants);
+
 // Windows per-character font fallback. GDI's manager has no system cascade at all:
 // SkFontMgrGDI::onMatchFamilyStyleCharacter is an unconditional `return nullptr`
 // (src/ports/SkFontHost_win.cpp ~2267), while SkParagraph asks the manager for a

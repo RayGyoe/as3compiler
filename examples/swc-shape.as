@@ -1,6 +1,6 @@
 // swc-shape.as — 阶段九十五 E/F：SWC 矢量 shape + 显示树 + 九宫格 + 按钮四态的结构回归。
 //
-// 与 swc-bitmap.as 同一套样本（`temp/skin.swc`），但看的是**另一半资源**：`DefineShape*`
+// 与 swc-bitmap.as 同一套样本（`examples/embed-assets/skin.swc`），但看的是**另一半资源**：`DefineShape*`
 // 与 `DefineSprite` 烘焙出的显示树、`DefineScalingGrid` 九宫格、`DefineButton2` 按钮四态。
 // 判据刻意只取**与后端无关的结构层**：
 //   · 导出符号（sprite `元件97`、按钮 `upvpage`）在编译期被合成为 AST 类，
@@ -11,7 +11,7 @@
 // 纯 C 构建（无 Skia）下 `sk_path_*`/`as_skia_*` 都是空桩、画不出像素，但**对象树本身仍然建起来**，
 // 故上述结构断言两侧都成立；渲染层面的九宫格/四态对照见 docs/zh-cn/swc.md §9.2。
 //
-// 编译（结构层）：  as-aot examples/swc-shape.as --swc ../temp/skin.swc --run
+// 编译（结构层）：  as-aot examples/swc-shape.as --swc examples/embed-assets/skin.swc --run
 // 编译（渲染层）：  as-aot examples/swc-shape.as --manifest examples/swc-bitmap.build.json --run
 
 import flash.display.DisplayObject;
@@ -204,8 +204,17 @@ check(cb.currentFrame == 2 && cb.getChildAt(1).x == 8, "a frame-2 modify must mo
 cb.prevFrame();
 check(cb.currentFrame == 1 && cb.getChildAt(1).x == 24, "a backward jump must rebuild the frame-1 placement");
 
-var m3:MovieClip = new (getDefinitionByName("skin_fla.元件172_339") as Class)() as MovieClip;
-check(m3.totalFrames == 3 && m3.numChildren == 1, "元件172_339 must report AIR's 3 frames / 1 child");
+// ---- ⑨ 带时间轴脚本的符号（`skin_fla.元件172_339`，协议勾选框）----
+// **入库夹具里没有这个符号**：它靠**符号自己的 DoABC 帧脚本**工作（`stop()` / `buttonMode` /
+// CLICK 里 `gotoAndStop(_self.currentFrame < 3 ? 3 : 2)`，所以表面上只有 1 帧、实际能在 2/3 帧间跳，
+// 原用例断言它 `totalFrames == 3` / 1 个子件）。而 `examples/embed-assets/skin.swc` 的 35 个导出符号里
+// **没有任何一个的 DoABC 含 `gotoAndStop` 或 `CLICK`**（最接近的只有 `stop()` + `buttonMode`，如
+// `checkbom`/`toastbtn`）⇒ 这个名字在新夹具里必然 `#1065`。所以在夹具补齐之前这一段**显式停用**，
+// 而不是把一个“常红”的名字留在用例里（缺失要报明，不能靠沉默通过）：
+// var m3:MovieClip = new (getDefinitionByName("skin_fla.元件172_339") as Class)() as MovieClip;
+// check(m3.totalFrames == 3 && m3.numChildren == 1, "元件172_339 must report AIR's 3 frames / 1 child");
+// 同一个机制（符号自带帧脚本会被解释并执行）在新夹具里由 `checkbom` 承担：它的第 1 帧脚本真的
+// 被跑过（`stop()` + 打开 `buttonMode`），见上面 `checkbom` 那段与 `unit: render/SwcTimeline`。
 
 check(true, "swc-shape structural checks passed");
 trace("swc-shape-ok");

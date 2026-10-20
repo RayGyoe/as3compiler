@@ -72,6 +72,22 @@ check(File.desktopDirectory != null, "desktopDirectory non-null");
 check(File.documentsDirectory.nativePath.indexOf("Documents") >= 0, "documentsDirectory ends with Documents");
 check(File.desktopDirectory.nativePath.indexOf("Desktop") >= 0, "desktopDirectory ends with Desktop");
 
+// --- File.separator / File.lineEnding (阶段二百一十八) ---
+// The host OS's path component separator and line-ending sequence: both are
+// `[static] [read-only]` String getters on File (airsdk.dev), so their VALUES differ
+// per OS and the assertions have to be host-agnostic. What gets pinned is the relation
+// AIR defines -- one character; LF last; CRLF exactly where the separator is a
+// backslash -- plus the short/FQN equivalence of the 阶段二百一十七 seam.
+check(File.separator.length == 1, "separator is one character");
+check(File.lineEnding.charCodeAt(File.lineEnding.length - 1) == 10, "lineEnding ends with LF");
+check(File.lineEnding == (File.separator == "\\" ? "\r\n" : "\n"),
+      "lineEnding is CRLF exactly where the separator is a backslash");
+check(flash.filesystem.File.separator == File.separator, "FQN separator == short");
+check(flash.filesystem.File.lineEnding == File.lineEnding, "FQN lineEnding == short");
+// The documented use, from File.lineEnding's own example: normalize to the host terminator.
+check("a\nb".replace(/\n/g, File.lineEnding).length == 2 + File.lineEnding.length,
+      "replace(newline, File.lineEnding) uses the host terminator");
+
 // --- FileStream: asynchronous open (PROGRESS + COMPLETE deferred to next tick) ---
 var asyncFs:FileStream = new FileStream();
 var asyncProgress:Boolean = false;

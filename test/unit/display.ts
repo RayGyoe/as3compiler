@@ -846,8 +846,14 @@ function checkSwcTextChildOrigin(): string[] {
     else { bad.push(label); console.log(`FAIL  [swcxy] ${label}`); }
   };
 
-  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
-  const swcSource = readFileSync(join(root, 'src', 'swc.ts'), 'utf8');
+  // Normalize CRLF: this repo keeps sources CRLF on Windows (only *.bat is pinned
+  // by .gitattributes), while two pins below match a literal '\n' between two lines
+  // of src/emit.ts. Unnormalized, the same untouched code is green on the LF CI
+  // checkout and false-red here -- a line-ending artifact reported as a code
+  // regression. Generated C is emitted with '\n' on every host, so only these two
+  // source-file reads need it.
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8').replace(/\r\n/g, '\n');
+  const swcSource = readFileSync(join(root, 'src', 'swc.ts'), 'utf8').replace(/\r\n/g, '\n');
 
   // ① 原点走线性部分，并把结果落到 AIR 的 twip 栅格上
   const helper = emitSource.slice(emitSource.indexOf('private swcTextChildXY('));
@@ -955,7 +961,7 @@ function checkMcButtonState(): string[] {
   // ⑦ 示例与登记
   check('the example is registered with the Skia manifest and the skin requirement',
     registry.includes("'swc-mc-button.as': ['--manifest', join(dir, 'swc-bitmap.build.json')]") &&
-    registry.includes("'swc-mc-button.as': join(root, '..', 'temp', 'skin.swc')"));
+    registry.includes("'swc-mc-button.as': join(dir, 'embed-assets', 'skin.swc')"));
   check('the example asserts the exact label frames measured on adl',
     example.includes('_up@1,_over@4,_down@7') && example.includes('_up@1,_over@5,_down@10') &&
     example.includes('home card roll-over -> 5:_over'));

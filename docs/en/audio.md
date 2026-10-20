@@ -267,7 +267,7 @@ decision: all of A–D** (all four steps ship, as four sub-stages; A+B remains t
 | `Microphone` / `Camera` capture | Device capture, a separate domain |
 | `NetStream` / RTMP | Streaming protocol stack, a separate domain |
 | `[Embed]`ed mp3 / images | `Embed` metadata has **no consumer at all** (`EmbeddedAssets_flap = NULL`) — a separate gap |
-| `DefineSound` inside SWC | Measured `temp/skin.swc` has **zero**; if encountered it is a separate decode domain (same stance as `swc.md` §10) |
+| `DefineSound` inside SWC | Measured in both the earlier export and the checked-in fixture: **zero**; if encountered it is a separate decode domain (same stance as `swc.md` §10) |
 | WASI audio | Platform hard boundary; honestly report "this backend does not support it" |
 
 ---

@@ -29,4 +29,5 @@ import './unit/vsync.ts';
 import './unit/npm-package.ts';
 import './unit/cli.ts';
 import './unit/fre.ts';
+import './unit/fqn-static.ts';
 import './unit/testinfra.ts';

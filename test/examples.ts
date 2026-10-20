@@ -162,12 +162,14 @@ const EXAMPLE_ENV: Record<string, Record<string, string>> = {
 
 // Per-example extra CLI arguments. The SWC example needs a resource library on
 // the command line (`--swc`); every other unit is driven by EXAMPLE_ENV or by a
-// build manifest it names explicitly. `../temp/skin.swc` (the repo-root temp/, as
-// swc.md §11 names it) is the sample the doc's measurements are written against;
-// without it the unit is skipped (see below) rather than silently passing.
+// build manifest it names explicitly. The sample is the repo-TRACKED
+// `examples/embed-assets/skin.swc` — an out-of-tree `../temp/skin.swc` would make
+// every fresh clone (and CI) skip the three swc units silently, which is exactly
+// the coverage shortfall the loud skip below exists to surface. If the fixture is
+// absent the unit is skipped loudly rather than silently passing.
 const EXAMPLE_ARGS: Record<string, string[]> = {
-  'swc-bitmap.as': ['--swc', join(root, '..', 'temp', 'skin.swc')],
-  'swc-shape.as': ['--swc', join(root, '..', 'temp', 'skin.swc')],
+  'swc-bitmap.as': ['--swc', join(dir, 'embed-assets', 'skin.swc')],
+  'swc-shape.as': ['--swc', join(dir, 'embed-assets', 'skin.swc')],
   // The audio backend is a build-layer choice: audio.build.json compiles
   // vendor/audio_glue.c (miniaudio) in and defines ASC_HAVE_AUDIO, which is what
   // turns the as_audio_* seam into a real device. Without it the example cannot
@@ -217,7 +219,7 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   'sbtn-null-up.as': ['--manifest', join(dir, 'sbtn-null-up.build.json')],
   // swc-mc-button.as（阶段一百七十一）是 MovieClip 按钮态的渲染层回归：状态在绘制 pass 里结算，
   // 必须真的走一帧（`stage.render`）才观察得到，而且要用像素差断言「状态真的画出来了」——两者都
-  // 只在 Skia 构建下存在，故链 swc-bitmap.build.json（它已经带上了 temp/skin.swc，与 swc-shape.as
+  // 只在 Skia 构建下存在，故链 swc-bitmap.build.json（它已经带上了 examples/embed-assets/skin.swc，与 swc-shape.as
   // 的渲染层变体同一路子）。
   'swc-mc-button.as': ['--manifest', join(dir, 'swc-bitmap.build.json')],
   // bitmap-setpixels-endian.as（阶段二百一十六）断言两件事：setPixels 必须按
@@ -245,9 +247,9 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
 // Examples that need an input file absent from the tree. Skipped loudly so the
 // suite never reports coverage it did not exercise.
 const EXAMPLE_REQUIRES: Record<string, string> = {
-  'swc-bitmap.as': join(root, '..', 'temp', 'skin.swc'),
-  'swc-shape.as': join(root, '..', 'temp', 'skin.swc'),
-  'swc-mc-button.as': join(root, '..', 'temp', 'skin.swc'),
+  'swc-bitmap.as': join(dir, 'embed-assets', 'skin.swc'),
+  'swc-shape.as': join(dir, 'embed-assets', 'skin.swc'),
+  'swc-mc-button.as': join(dir, 'embed-assets', 'skin.swc'),
 };
 
 // Why the extension-bearing example units (`ane/`, `ane-app/`) are skipped instead

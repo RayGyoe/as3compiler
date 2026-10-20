@@ -39,8 +39,9 @@ export interface SwcBitmap {
   /** SWF character id (used by `SymbolClass` and by shape fills). */
   tagId: number;
   /** Fully-qualified AS3 class name from `SymbolClass`, or null when unnamed.
-   *  In `temp/skin.swc` 16 of 59 bitmaps are named; the other 43 are referenced
-   *  only as fills by shapes/sprites (swc.md §6). */
+   *  In the checked-in `examples/embed-assets/skin.swc` 1 of 15 bitmaps is named
+   *  (`desktopicon`); the other 14 are referenced only as fills by shapes/sprites
+   *  (swc.md §0.1/§6). An earlier export of the same library had 16 of 59 named. */
   className: string | null;
   /** Encoding of `encoded`. Both are decoded by Skia at runtime. */
   format: 'png' | 'jpeg' | 'gif';
@@ -527,8 +528,8 @@ function swfBody(swf: Buffer): Buffer {
   if (sig === 'CWS') return inflateSync(swf.subarray(8)); // zlib
   if (sig === 'ZWS') {
     // LZMA layout is documented (swc.md §4) but Node has no built-in LZMA codec
-    // and the project forbids third-party deps. `temp/skin.swc` is CWS, and ZWS
-    // support is explicitly deferred (§10) — fail loudly rather than silently.
+    // and the project forbids third-party deps. The checked-in skin.swc is CWS,
+    // and ZWS support is explicitly deferred (§10) — fail loudly, not silently.
     throw new Error(
       'SWC: this library uses ZWS (LZMA) compression, which is not yet supported ' +
         '(see docs/zh-cn/swc.md §10); re-export the SWC as CWS/FWS.'
@@ -1877,7 +1878,14 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
     wantChars.add(id);
     queue.push(id);
   };
-  for (const id of lib.classNames.keys()) visit(id);
+  // `SymbolClass` id 0 is the DOCUMENT class, not an exported symbol: Animate emits
+  // one entry mapping id 0 to the main timeline's class (e.g. `skin_fla.MainTimeline`)
+  // whenever the FLA carries a main-timeline script. It names the SWF's ROOT
+  // timeline, which has no character definition by design, so walking it like any
+  // other linked symbol aborted the entire library with "exported character #0 has
+  // no definition" -- on a library our own extractor reads without a single warning.
+  const docClassName = lib.classNames.get(0) ?? null;
+  for (const id of lib.classNames.keys()) if (id !== 0) visit(id);
   const placementsOf = (sp: SwcSprite): SwcPlacement[] => sp.placements;
   while (queue.length > 0) {
     const id = queue.shift() as number;
@@ -2325,6 +2333,15 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
   }
   for (const [v, n] of [...unmappedBlends].sort((a, b) => a[0] - b[0])) {
     notes.push(`${n} PlaceObject3 record(s) use BlendMode ${v}, which has no equivalent here and is rendered as normal`);
+  }
+  if (docClassName !== null) {
+    notes.push(
+      `SymbolClass registers character id 0 as '${docClassName}': that is the library's DOCUMENT class ` +
+      `(its main timeline), not artwork, so it owns no character definition and is not registered as a ` +
+      `resource class. AIR resolves that name to the loaded SWF's root timeline; this backend has no root ` +
+      `timeline to hand out, so getDefinitionByName('${docClassName}') reports #1065 here. Any OTHER ` +
+      `SymbolClass entry naming a class the library does not define is still a hard error`
+    );
   }
 
   // The placeholders are a tree-shape match, not text rendering: say so once,
