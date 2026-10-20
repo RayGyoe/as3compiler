@@ -372,6 +372,11 @@ The full 16-item list (the rest being Lottie, native shaders, FFI, server-side r
 - `examples/autobake.as` — incremental-redraw auto cacheAsBitmap verification (offscreen + manifest: a static subtree rendered across several frames triggers fingerprint-driven auto-baking, f4/f5 pixel-identical to the direct f1; moving the subtree invalidates and re-bakes, moved/f8 identical and distinct from f1), requires `examples/autobake.build.json` to link Skia (off-screen, included in regression)
 - `examples/autobake-origin.as` — bake-origin alignment with the destination device-pixel grid (offscreen + manifest: an anti-aliased circle at a fractional origin `20.4`, the one shape where the cached blit used to land 1 physical pixel off the live render; identical before/after the fix on the snapped siblings), requires `examples/autobake-origin.build.json` to link Skia
 - `examples/bakecrisp.as` — bake resolution and `BitmapData.draw` geometry behavior (aligned with `adl`)
+- `examples/bitmap-setpixels-endian.as` — `BitmapData.setPixels` interprets its 32-bit words through `ByteArray.endian`
+  (`bigEndian` = `A,R,G,B` in memory, `littleEndian` = `B,G,R,A` -- the order a raw ANE camera frame arrives in), plus
+  "a bitmap built by `new BitmapData` + `setPixels` must actually paint on the display list, and must repaint when its
+  pixels change" (a `TextField` probe gates the display-list half on a real raster backend; requires
+  `examples/bitmap-setpixels-endian.build.json` to link Skia)
 - `examples/stage83.as` — Stage3D alignment hardening (CubeTexture/RectangleTexture, render-to-texture pixel assertions, instanced drawing)
 - `examples/stage86.as` — `flash.utils` reflection (`getQualifiedClassName`/`getDefinitionByName`/dynamic instantiation)
 - `examples/stage87.as` — `Context3D` skeleton method completion (stencil/scissor/buffer upload readback/`drawTriangles`)

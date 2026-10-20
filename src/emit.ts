@@ -16711,6 +16711,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('o->width = width; o->height = height; o->transparent = transparent;');
     this.line('o->image = NULL; o->pixels = NULL;');
+    this.line('o->_live_image = NULL; o->_px_ver = 0; o->_live_ver = 0;');
     this.line('if (width > 0 && height > 0) {');
     this.indent++;
     // GC heap, not malloc: `pixels` is a GC-traced field (the props table tags it
@@ -16734,6 +16735,41 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return o;');
     this.indent--;
     this.line('}');
+    // ---- live pixel view ----
+    //
+    // `image` is the SkImage the display-list Bitmap draws, but only a DECODED
+    // source (loadFile / Loader / a baked SWC image) ever had one: a bitmap built
+    // by `new BitmapData(...)` -- the shape every raw-pixel producer uses, e.g.
+    // ANEVideo's `new BitmapData(w, h, ...)` + setPixels(w) per camera frame --
+    // left it NULL, so as_render_object_content drew NOTHING and the video area
+    // stayed black at a healthy 26 fps. `pixels` alone was never sampled.
+    //
+    // So the pixels are given their own cached SkImage view, rebuilt only when the
+    // version counter says the buffer changed (every mutator bumps it). A copy is
+    // unavoidable here: Skia never owns a GC-heap buffer, and the buffer is
+    // rewritten in place by the next setPixels (see sk_image_from_argb).
+    this.line('static void* as_bmd_live_image(BitmapData* bd) {');
+    this.indent++;
+    this.line('if (bd == NULL || bd->pixels == NULL || bd->width <= 0 || bd->height <= 0) return NULL;');
+    this.line('if (bd->_live_image != NULL && bd->_live_ver == bd->_px_ver) return bd->_live_image;');
+    this.line('if (bd->_live_image != NULL) { as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
+    this.line('bd->_live_image = as_skia_image_from_argb(bd->pixels, bd->width, bd->height);');
+    this.line('bd->_live_ver = bd->_px_ver;');
+    this.line('return bd->_live_image;');
+    this.indent--;
+    this.line('}');
+    // The image a display-list Bitmap paints. An un-mutated decoded bitmap keeps
+    // its zero-copy deferred view (`_px_ver == 0`); anything whose pixels were
+    // written since -- or that never had a decoded view at all -- renders from the
+    // live buffer, which is what AIR does in both cases (a setPixels AFTER a load
+    // is visible on screen in AIR).
+    this.line('static void* as_bmd_visible_image(BitmapData* bd) {');
+    this.indent++;
+    this.line('if (bd == NULL) return NULL;');
+    this.line('if (bd->image != NULL && bd->_px_ver == 0) return bd->image;');
+    this.line('return as_bmd_live_image(bd);');
+    this.indent--;
+    this.line('}');
     this.line('unsigned BitmapData_getPixel(void* _this, int x, int y) {');
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
@@ -16745,6 +16781,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('if (bd->pixels == NULL || x < 0 || y < 0 || x >= bd->width || y >= bd->height) return;');
+    this.line('bd->_px_ver++;');
     this.line('((unsigned*)bd->pixels)[y * bd->width + x] = 0xFF000000u | (color & 0xFFFFFFu);');
     this.indent--;
     this.line('}');
@@ -16763,6 +16800,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('if (bd->pixels == NULL || x < 0 || y < 0 || x >= bd->width || y >= bd->height) return;');
+    this.line('bd->_px_ver++;');
     this.line('((unsigned*)bd->pixels)[y * bd->width + x] = bd->transparent ? color : (0xFF000000u | (color & 0xFFFFFFu));');
     this.indent--;
     this.line('}');
@@ -16805,6 +16843,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (w <= 0 || h <= 0) return;');
     this.line('unsigned a = bd->transparent ? (color >> 24) : 0xFFu;');
     this.line('unsigned argb = (a << 24) | (color & 0xFFFFFFu);');
+    this.line('bd->_px_ver++;');
     this.line('unsigned* p = (unsigned*)bd->pixels;');
     this.line('for (int y = y0; y < y0 + h; y++) for (int x = x0; x < x0 + w; x++) p[y * bd->width + x] = argb;');
     this.indent--;
@@ -16857,6 +16896,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('if (source == NULL || bd->pixels == NULL) return;');
+    this.line('bd->_px_ver++;');
     this.line('if (blendMode != NULL && strcmp(blendMode, "normal") != 0) { as_throw(Error_new((char*)"BitmapData.draw: blendMode not implemented", 0)); return; }');
     this.line('int cx0 = 0, cy0 = 0, cx1 = bd->width, cy1 = bd->height;');
     this.line('if (clipRect != NULL) { cx0 = (int)clipRect->x; cy0 = (int)clipRect->y; cx1 = cx0 + (int)clipRect->width; cy1 = cy0 + (int)clipRect->height; if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0; if (cx1 > bd->width) cx1 = bd->width; if (cy1 > bd->height) cy1 = bd->height; }');
@@ -17109,6 +17149,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('unsigned* blurred = (unsigned*)malloc(sizeof(unsigned) * (size_t)(sw * sh));');
     this.line('as_blur_apply(blurred, region, sw, sh, blurX / 2, blurY / 2, quality);');
     this.line('unsigned* dp = (unsigned*)dst->pixels;');
+    this.line('dst->_px_ver++;');
     this.line('for (int y = 0; y < sh; y++) { int ty = dy + y; if (ty < 0 || ty >= dst->height) continue; for (int x = 0; x < sw; x++) { int tx = dx + x; if (tx < 0 || tx >= dst->width) continue; dp[(size_t)ty * dst->width + tx] = blurred[(size_t)y * sw + x]; } }');
     this.line('free(region); free(blurred);');
     this.indent--;
@@ -17121,6 +17162,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('(void)baseX; (void)baseY; (void)numOctaves; (void)stitch; (void)fractalNoise;');
     this.line('if (bd->pixels == NULL) return;');
+    this.line('bd->_px_ver++;');
     this.line('unsigned* p = (unsigned*)bd->pixels;');
     this.line('unsigned seed = (unsigned)randomSeed;');
     this.line('for (int y = 0; y < bd->height; y++) {');
@@ -17149,14 +17191,22 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // releases the memory immediately; here the next collection reclaims it.
     this.line('bd->pixels = NULL;');
     this.line('if (bd->image != NULL) { as_skia_image_delete(bd->image); bd->image = NULL; }');
+    this.line('if (bd->_live_image != NULL) { as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
+    this.line('bd->_px_ver++;');
     this.indent--;
     this.line('}');
     // setPixels(rect, inputByteArray): copy 32-bit ARGB pixel values out of the
     // byte array into this bitmap's rectangle. AIR's contract is "32-bit ARGB
-    // pixel values", and ByteArray is BIG-endian by default, so a
-    // writeUnsignedInt(0xAARRGGBB) lands in the array as A,R,G,B bytes -- read
-    // them in that order. Composing the word from individual bytes keeps this
-    // endian-independent (a raw 32-bit load would not be).
+    // pixel values" read as 32-bit WORDS, so `inputByteArray.endian` decides
+    // which of the four bytes holds the alpha:
+    //   bigEndian    (default) word = b0<<24|b1<<16|b2<<8|b3 => bytes A,R,G,B
+    //   littleEndian           word = b3<<24|b2<<16|b1<<8|b0 => bytes B,G,R,A
+    // Both orders are load-bearing in the real app: a raw ANE frame is libyuv
+    // I420ToARGB output, i.e. B,G,R,A in memory, and ANEVideo sets
+    // `VideoByteArray.endian = Endian.LITTLE_ENDIAN` right before this call. With
+    // only the big-endian order honoured the camera preview came out channel
+    // swapped and near-black (the alpha byte read was really the blue channel) --
+    // see examples/bitmap-setpixels-endian.as.
     this.line('void BitmapData_setPixels(void* _this, Rectangle* rect, ByteArray* ba) {');
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
@@ -17164,11 +17214,15 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
     this.line('int w = (int)rect->width, h = (int)rect->height;');
     this.line('unsigned char* src = (unsigned char*)ba->data;');
+    this.line('int le = ba->endian != NULL && strcmp(ba->endian, "littleEndian") == 0;');
+    this.line('bd->_px_ver++;');
     this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
     this.line('int px = x0 + x, py = y0 + y;');
     this.line('if (px < 0 || py < 0 || px >= bd->width || py >= bd->height) continue;');
     this.line('int i = (y * w + x) * 4;');
-    this.line('unsigned a = src[i], r = src[i + 1], g = src[i + 2], b = src[i + 3];');
+    this.line('unsigned a, r, g, b;');
+    this.line('if (le) { a = src[i + 3]; r = src[i + 2]; g = src[i + 1]; b = src[i]; }');
+    this.line('else { a = src[i]; r = src[i + 1]; g = src[i + 2]; b = src[i + 3]; }');
     this.line('((unsigned*)bd->pixels)[py * bd->width + px] = (a << 24) | (r << 16) | (g << 8) | b;');
     this.line('} }');
     this.indent--;
@@ -17179,6 +17233,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('(void)alphaBmp; (void)alphaPt; (void)mergeAlpha;');
     this.line('if (bd == NULL || bd->pixels == NULL || src == NULL || src->pixels == NULL || srcRect == NULL || dest == NULL) return;');
+    this.line('bd->_px_ver++;');
     this.line('int sx0 = (int)srcRect->x, sy0 = (int)srcRect->y;');
     this.line('int w = (int)srcRect->width, h = (int)srcRect->height;');
     this.line('int dx0 = (int)dest->x, dy0 = (int)dest->y;');
@@ -17205,6 +17260,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('int w = (int)srcRect->width, h = (int)srcRect->height;');
     this.line('int dx0 = (int)dest->x, dy0 = (int)dest->y;');
     this.line('unsigned mask = 0xFFu << ds;');
+    this.line('bd->_px_ver++;');
     this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
     this.indent++;
     this.line('int sx = sx0 + x, sy = sy0 + y, dx = dx0 + x, dy = dy0 + y;');
@@ -17245,6 +17301,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (src == NULL) return;');
     this.line('memcpy(src, bd->pixels, sizeof(unsigned) * (size_t)(w * h));');
     this.line('unsigned* dst = (unsigned*)bd->pixels;');
+    this.line('bd->_px_ver++;');
     this.line('for (int y = 0; y < h; y++) {');
     this.indent++;
     this.line('int sy = y - dy;');
@@ -17271,6 +17328,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (bd->pixels == NULL || rect == NULL || v == NULL) return;');
     this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
     this.line('int rw = (int)rect->width, rh = (int)rect->height;');
+    this.line('bd->_px_ver++;');
     this.line('for (int yy = 0; yy < rh; yy++) { for (int xx = 0; xx < rw; xx++) {');
     this.indent++;
     this.line('int px = x0 + xx, py = y0 + yy;');
@@ -21408,6 +21466,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('BitmapData* bd = ((Bitmap*)o)->bitmapData;');
     this.line('if (bd != NULL) h = as_fp_ptr(h, bd->image);');
+    // A Bitmap painted from its LIVE pixels (a bitmap built by `new BitmapData`,
+    // or a decoded one whose pixels were rewritten since) must re-bake when those
+    // pixels change: `image` stays NULL/constant on that path, so the version
+    // counter is the only input that moves. Without it a cacheAsBitmap video view
+    // froze on its first frame.
+    this.line('if (bd != NULL) h = as_fp_u32(h, bd->_px_ver);');
     this.indent--;
     this.line('} else if (as_is(o, &TextField_vt)) {');
     this.indent++;
@@ -21894,7 +21958,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('} else if (as_is(o, &Bitmap_vt)) {');
     this.indent++;
     this.line('BitmapData* bd = ((Bitmap*)o)->bitmapData;');
-    this.line('if (bd != NULL && bd->image != NULL) as_skia_canvas_draw_image_rect(canvas, bd->image, 0.0, 0.0, (double)bd->width, (double)bd->height);');
+    // as_bmd_visible_image picks the decoded SkImage view or, for a bitmap built
+    // from raw pixels, a cached view of `pixels` -- a `new BitmapData(...)` has no
+    // decoded view at all, and requiring one here painted NOTHING: the real app's
+    // ANEVideo camera preview (new BitmapData + setPixels per frame) stayed a
+    // black rectangle while its FPS text kept counting.
+    this.line('void* bd_img = as_bmd_visible_image(bd);');
+    this.line('if (bd_img != NULL) as_skia_canvas_draw_image_rect(canvas, bd_img, 0.0, 0.0, (double)bd->width, (double)bd->height);');
     this.indent--;
     this.line('} else if (as_is(o, &TextField_vt)) {');
     this.indent++;

@@ -377,6 +377,10 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/autobake.as` — 增量重绘自动 `cacheAsBitmap`（静止触发烘焙、移动失效重烘焙）
 - `examples/autobake-origin.as` — 烘焙原点对齐设备像素栅格（抗锯齿圆在小数原点：修前与实时绘制差 1 物理像素、修后逐位相同；需 `examples/autobake-origin.build.json` 链 Skia）
 - `examples/bakecrisp.as` — 烘焙分辨率与 `BitmapData.draw` 几何口径（对齐 `adl`）
+- `examples/bitmap-setpixels-endian.as` — `BitmapData.setPixels` 按 `ByteArray.endian` 解析 32 位字（`bigEndian` = 内存 `A,R,G,B`、
+  `littleEndian` = 内存 `B,G,R,A`，真应用 ANE 摄像头帧正是后者），以及「`new BitmapData` + `setPixels` 填出来的位图在显示列表里
+  必须真的画出像素、改像素后跟着变」（纯 C 构建用 `TextField` 探针判断有无光栅后端，无则跳过显示列表段；需
+  `examples/bitmap-setpixels-endian.build.json` 链 Skia）
 - `examples/stage83.as` — Stage3D 对齐加固（CubeTexture/RectangleTexture、render-to-texture 像素断言、实例化绘制）
 - `examples/stage86.as` — `flash.utils` 反射（`getQualifiedClassName`/`getDefinitionByName`/动态实例化）
 - `examples/stage87.as` — `Context3D` 骨架补方法（stencil/scissor/缓冲上传读回/`drawTriangles`）

@@ -220,6 +220,14 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 只在 Skia 构建下存在，故链 swc-bitmap.build.json（它已经带上了 temp/skin.swc，与 swc-shape.as
   // 的渲染层变体同一路子）。
   'swc-mc-button.as': ['--manifest', join(dir, 'swc-bitmap.build.json')],
+  // bitmap-setpixels-endian.as（阶段二百一十六）断言两件事：setPixels 必须按
+  // `ByteArray.endian` 解析 32 位字（真应用 ANEVideo 的摄像头帧是 libyuv 的
+  // B,G,R,A，靠 littleEndian 声明），以及「`new BitmapData` + setPixels 填出来的
+  // 位图在显示列表里必须真的画出像素、改像素后必须跟着变」。前半段是纯算术，
+  // 后半段要像素 —— 纯 C 构建没有光栅后端（draw 是空桩），示例自带 TextField 探针
+  // 判断后端是否存在并跳过显示列表段，故与 bakecrisp.as 一样链 Skia，保证 CI 真的
+  // 跑到后半段。
+  'bitmap-setpixels-endian.as': ['--manifest', join(dir, 'bitmap-setpixels-endian.build.json')],
   // examples/textfield/ 是 TextField 显示矩阵探针（docs/zh-cn/flash-text.md §3）：它报的
   // `textWidth`/`textHeight`/`getLineMetrics` 只有在 Skia 文本后端下才存在，故目录单元
   // 与 bakecrisp.as 一样链 Skia。键带尾部 `/` 以区分目录单元与同名 .as。

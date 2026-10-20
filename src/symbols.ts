@@ -5240,6 +5240,14 @@ export class SymbolTable {
         ['transparent', bdf({ kind: 'bool' })],
         ['pixels', bdf({ kind: 'null' })],
         ['image', bdf({ kind: 'null' })],
+        // Internal render bookkeeping for bitmaps built from raw pixels (see
+        // as_bmd_live_image in emit.ts): `_live_image` is the cached SkImage view
+        // of `pixels`, `_px_ver` is bumped by every mutator, `_live_ver` records
+        // the version the cache was built from. Named with a leading underscore so
+        // they read as backend state, like the other `_`-prefixed fields.
+        ['_live_image', bdf({ kind: 'null' })],
+        ['_px_ver', bdf({ kind: 'uint' })],
+        ['_live_ver', bdf({ kind: 'uint' })],
       ]),
       methods: new Map([
         ['getPixel', bdm({ kind: 'uint' }, [

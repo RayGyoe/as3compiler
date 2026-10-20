@@ -2300,3 +2300,92 @@ function checkRegExpInertConstruction(): string[] {
   return bad;
 }
 registerGroup('unit: runtime/RegExpInertConstruction', checkRegExpInertConstruction);
+
+// ---- BitmapData pixels reach the screen, and setPixels honours ByteArray.endian ----
+// The real-app bug (stage 216): the ANEVideo camera preview was a blank rectangle at a
+// healthy fps. Two independent gaps stacked up --
+//   1. BitmapData_setPixels read the buffer as A,R,G,B unconditionally, while ANEVideo
+//      declares VideoByteArray.endian = Endian.LITTLE_ENDIAN because libyuv's
+//      I420ToARGB output is B,G,R,A in memory, so every frame came out channel-swapped
+//      with a bogus alpha; and
+//   2. as_render_object_content only painted a Bitmap when bd->image != NULL, but a
+//      decoded SkImage is only ever produced by loadFile/Loader/[Embed] -- a bitmap
+//      built by "new BitmapData(...)" + setPixels (the shape every raw-pixel producer
+//      uses) never got one, so the display list drew NOTHING.
+// examples/bitmap-setpixels-endian.as pins the behaviour; this pins the emitted shape,
+// because a refactor is what would quietly reintroduce either gap.
+function checkRenderBitmapLivePixels(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [bmd-live] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [bmd-live] ${label}`); }
+  };
+  const src = 'var b:Bitmap = new Bitmap(new BitmapData(2, 2, false, 0));\ntrace(b);\n';
+  const c = generateC(parse(src)).c;
+  const body = (sig: string): string => {
+    const i = c.indexOf(sig);
+    if (i < 0) return '';
+    const j = c.indexOf('\n}', i);
+    return c.slice(i, j < 0 ? c.length : j);
+  };
+
+  // 1. setPixels consults the source ByteArray's endian flag and flips the read order.
+  const sp = body('void BitmapData_setPixels(void* _this, Rectangle* rect, ByteArray* ba) {');
+  check('BitmapData_setPixels is emitted', sp.length > 0);
+  check('setPixels reads ByteArray.endian', sp.includes('strcmp(ba->endian, "littleEndian") == 0'));
+  check('littleEndian reads B,G,R,A (alpha last)',
+    sp.includes('if (le) { a = src[i + 3]; r = src[i + 2]; g = src[i + 1]; b = src[i]; }'));
+  check('bigEndian keeps reading A,R,G,B (alpha first)',
+    sp.includes('else { a = src[i]; r = src[i + 1]; g = src[i + 2]; b = src[i + 3]; }'));
+  check('setPixels bumps the pixel version', sp.includes('bd->_px_ver++;'));
+
+  // 2. Every pixel mutator invalidates the cached view, or the screen freezes.
+  const mutators = [
+    'void BitmapData_setPixel(void* _this, int x, int y, unsigned color) {',
+    'void BitmapData_setPixel32(void* _this, int x, int y, unsigned color) {',
+    'void BitmapData_fillRect(void* _this, Rectangle* rect, unsigned color) {',
+    'void BitmapData_copyPixels(void* _this, BitmapData* src,',
+  ];
+  for (const sig of mutators) {
+    const fn = body(sig);
+    const name = sig.slice('void '.length, sig.indexOf('('));
+    check(name + ' bumps _px_ver', fn.length > 0 && fn.includes('_px_ver++'));
+  }
+  // draw/filter are emitted inline with their argument list on the same line.
+  for (const [name, sig] of [
+    ['draw', 'void BitmapData_draw(void* _this, BitmapData* source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {'],
+    ['copyChannel', 'void BitmapData_copyChannel(void* _this, BitmapData* src'],
+    ['setVector', 'void BitmapData_setVector(void* _this, Rectangle* rect, as_vector_uint* v) {'],
+    ['scroll', 'void BitmapData_scroll(void* _this, int dx, int dy) {'],
+    ['perlinNoise', 'void BitmapData_perlinNoise(void* _this, double baseX, double baseY, unsigned numOctaves, int randomSeed, bool stitch, bool fractalNoise) {'],
+    ['applyFilter', 'void BitmapData_applyFilter(void* _this, BitmapData* source, Rectangle* sourceRect, Point* destPoint, BitmapFilter* filter) {'],
+  ]) {
+    const fn = body(sig);
+    check(name + ' bumps _px_ver', fn.length > 0 && fn.includes('_px_ver++'));
+  }
+
+  // 3. The render branch draws the live pixel view, not only a decoded image.
+  check('the Bitmap render branch samples as_bmd_visible_image',
+    c.includes('void* bd_img = as_bmd_visible_image(bd);'));
+  check('the Bitmap render branch no longer requires bd->image',
+    !c.includes('if (bd != NULL && bd->image != NULL) as_skia_canvas_draw_image_rect'));
+  const live = body('static void* as_bmd_live_image(BitmapData* bd) {');
+  check('as_bmd_live_image is emitted', live.length > 0);
+  check('as_bmd_live_image caches on the version counter',
+    live.includes('bd->_live_image != NULL && bd->_live_ver == bd->_px_ver'));
+  check('as_bmd_live_image rebuilds from the pixel buffer',
+    live.includes('as_skia_image_from_argb(bd->pixels, bd->width, bd->height)'));
+  check('as_bmd_visible_image prefers the decoded view while unmutated',
+    body('static void* as_bmd_visible_image(BitmapData* bd) {')
+      .includes('if (bd->image != NULL && bd->_px_ver == 0) return bd->image;'));
+
+  // 4. The cacheAsBitmap fingerprint must include the pixel version, or an
+  //    auto-baked video view bakes once and never updates again.
+  check('the auto-bake fingerprint hashes _px_ver', c.includes('h = as_fp_u32(h, bd->_px_ver);'));
+
+  console.log(`     [bmd-live] ${ok} BitmapData live-pixel check(s) passed`);
+  return bad;
+}
+registerGroup('unit: render/BitmapLivePixels', checkRenderBitmapLivePixels);
+
