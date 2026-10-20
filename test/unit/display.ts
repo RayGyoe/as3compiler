@@ -1071,10 +1071,81 @@ function checkPerStagePointer(): string[] {
   return bad;
 }
 
+// unit: window/SlotReuse — 后端的窗口槽位会被回收，两侧都必须「重新出生」（阶段二百零八）。
+// 症状实测来自真应用（TalkMED Meeting）：开着 3 个副窗口时，非主窗的关闭按钮全部失灵，点主窗里的
+// 设置也不开新窗 / 焦点跑到同传窗上。根因不在输入路由，而在**槽位复用**：`sk_alloc_slot()` 只发
+// 「最低空闲槽位」，window_glue.cc 的 `sk_alloc_slot_ex` 会在发放前 memset 该槽位，而生成侧只有
+// `ASC_win_claim_main`（槽 0）做了同样的事，`NativeWindow_ctor` 没有 —— 于是新窗口继承了上一个
+// 窗口的 `closed = 1`，`ASC_win_poll` 第一行就 `return`（关闭请求永不落地）、`ASC_win_fire` 丢掉
+// CLOSING/ACTIVATE、openedWindows/activeWindow 也跳过它；同时死窗口对象的 `_win` 仍指着这个槽位，
+// 对它 `activate()` 等于把**别的**窗口抬起来（「点设置焦点跑到同传窗」就是这个）。
+// 行为钉子：examples/native-window.as 的 phase5/phase6（带窗口后端手动跑；A/B 实测 26 全过 vs
+// 去掉这两处后 4 条红）。CI 无窗口后端，所以这里钉源级结构。
+function checkWindowSlotReuse(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [slotreuse] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [slotreuse] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
+  const example = readFileSync(join(root, 'examples', 'native-window.as'), 'utf8');
+
+  const ctor = emitSource.slice(emitSource.indexOf("this.line('void NativeWindow_ctor(NativeWindow* o, NativeWindowInitOptions* options) {'"));
+  const ctorHead = ctor.slice(0, ctor.indexOf("this.line('w->window = (void*)o;'"));
+  const onClose = emitSource.slice(
+    emitSource.indexOf("this.line('static void ASC_window_on_close(int id) {'"),
+    emitSource.indexOf("this.line('static NativeWindow* as_win_wrapper(int id) {'"));
+
+  // ① 发放槽位的两侧都清零：后端一侧（本来就对）+ 生成侧（本轮补上）
+  check('the backend zeroes a slot before handing it out',
+    glue.includes('memset(&g_wins[i], 0, sizeof(g_wins[i]));') &&
+    glue.includes('if (!g_wins[i].used) {'));
+  check('the main-window slot is zeroed before it is seeded',
+    emitSource.includes("this.line('  memset(&ASC_wins[0], 0, sizeof(ASCWin));')"));
+  check('a NativeWindow resets its (possibly recycled) slot before installing itself',
+    ctorHead.includes("this.line('memset(w, 0, sizeof(*w));')"));
+  // “先清后装”：写在 w->window/w->title/stage 之前，否则清掉了刚装上的东西
+  check('...and the reset happens BEFORE any field of the new window is written',
+    ctor.indexOf("this.line('memset(w, 0, sizeof(*w));')") < ctor.indexOf("this.line('w->window = (void*)o;')") &&
+    ctor.indexOf("this.line('memset(w, 0, sizeof(*w));')") < ctor.indexOf("this.line('w->stage = (Stage*)Stage_new();')") &&
+    ctor.indexOf("this.line('memset(w, 0, sizeof(*w));')") < ctor.indexOf("this.line('w->is_gpu = gpu;')"));
+
+  // ② 死窗口对象脱钩：CLOSE 派发之后、槽位清空之前
+  check('a destroyed window detaches its object from the slot',
+    onClose.includes("this.line('if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1;')"));
+  check('...after Event.CLOSE was dispatched (listeners still see their stage)',
+    onClose.indexOf("EventDispatcher_dispatchEvent(w->window, Event_new((char*)\"close\"")
+    < onClose.indexOf("'if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1;'"));
+  check('...and before the slot itself is cleared',
+    onClose.indexOf("'if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1;'")
+    < onClose.indexOf("this.line('w->stage = NULL;')"));
+  // 槽位释放后 id 会被再发出去，所以每个访问器都必须走 _win，而 _win = -1 必须是安全的：
+  // ASC_w 对越界 id 回 NULL，所有访问器也就蓝成了空操作（AIR：已关闭窗口的调用无效果）。
+  check('every NativeWindow accessor resolves the slot through _win',
+    (emitSource.match(/NativeWindow\*\)_this\)->_win/g) ?? []).length >= 40 &&
+    emitSource.includes("this.line('o->_win = -1;')"));
+  check('ASC_w answers NULL for out-of-range ids (so _win = -1 is a no-op everywhere)',
+    emitSource.includes("this.line('static ASCWin* ASC_w(int id) { return (id >= 0 && id < ASC_MAX_WINDOWS) ? &ASC_wins[id] : NULL; }')"));
+
+  // ③ 行为钉子必须在场（带窗口后端手动跑；见文件头）
+  check('the behavior pin creates a window in a just-freed slot and checks its state',
+    example.includes('a window created in a recycled slot starts out open') &&
+    example.includes('...and is listed in openedWindows') &&
+    example.includes('the closed window does not alias the new occupant') &&
+    example.includes('a second recycled window is open again'));
+
+  if (ok > 0) console.log(`[slotreuse] ${ok} window slot-reuse checks passed`);
+  return bad;
+}
+
 registerGroup('unit: display/HitShape', checkHitShape);
 registerGroup('unit: swc/TextChildOrigin', checkSwcTextChildOrigin);
 registerGroup('unit: display/McButtonState', checkMcButtonState);
 registerGroup('unit: display/PerStagePointer', checkPerStagePointer);
+registerGroup('unit: window/SlotReuse', checkWindowSlotReuse);
 registerGroup('unit: display/DisplayGeometry', checkDisplayGeometry);
 registerGroup('unit: display/TransformMatrix', checkTransformMatrix);
 registerGroup('unit: display/Scale9Grid', checkScale9Grid);

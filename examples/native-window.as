@@ -11,6 +11,8 @@
 //   * listOwnedWindows()：Vector.<NativeWindow>，元素就是 owner 本人持有的那个窗口对象
 //   * 帧边界的 RESIZE/MOVE：before 是**本帧开始**的矩形（不是半更新状态），顺序 RESIZE→MOVE
 //   * close()：当帧 closed 仍为 false、CLOSE 在帧边界送达
+//   * 槽位复用：关掉的窗口把后端槽位还回去，下一个窗口拿到同一槽位后必须是一个**全新**窗口
+//     （closed=false、能进 openedWindows），而关掉的那个对象永远不再指向该槽位（阶段二百零八）
 //   * startMove()/startResize()：真实系统拖拽，回 true（放在最后，拖拽闩锁随进程退出消失）
 //
 // 纯 C 构建（没有 window 后端）里 `new NativeWindow()` 会**响亮**地抛 #2012（不静默 fallback），
@@ -76,6 +78,7 @@ if (hasBackend) {
   setTimeout(phase2, 1200);
   setTimeout(phase3, 1800);
   setTimeout(phase4, 2400);
+  setTimeout(phase5, 3000);
 }
 
 function phase1():void {
@@ -127,6 +130,35 @@ function phase3():void {
 function phase4():void {
   eq("the window is closed at the next frame boundary", w2.closed, true);
   eq("...and Event.CLOSE arrived", gotClose, true);
+}
+
+// 槽位复用（阶段二百零八）。后端只把「最低空闲槽位」发出去：w2 死后它的槽位会立刻被下一个
+// NativeWindow 拿走。AIR 的语义是两边都干净——新窗口是新的（closed=false、在 openedWindows 里），
+// 旧对象也不再指那个槽位（改 w3.title 不许把 w2.title 一起改掉）。旧实现只清了后端一侧，
+// ASC_wins 里的 closed 还是 1：新窗口一出生就是「已关闭」，于是 ASC_win_poll 直接 return，
+// 它的关闭按钮永远不会被受理、CLOSING/ACTIVATE 全被丢掉、openedWindows/activeWindow 里也找不到它。
+var w3:NativeWindow = null;
+var w4:NativeWindow = null;
+function phase5():void {
+  w3 = new NativeWindow(new NativeWindowInitOptions());
+  w3.title = "reuse";
+  eq("a window created in a recycled slot starts out open", w3.closed, false);
+  eq("...and has its own Stage", w3.stage === null, false);
+  eq("...and is listed in openedWindows",
+    NativeApplication.nativeApplication.openedWindows.indexOf(w3) >= 0, true);
+  // 旧对象必须彻底脱钩：它现在指 -1，读自己的 title 再也不会读到别人的。
+  eq("the closed window does not alias the new occupant", w2.title, "");
+  eq("...and is still closed", w2.closed, true);
+  w3.close();
+  setTimeout(phase6, 600);
+}
+
+function phase6():void {
+  eq("the recycled window closes normally", w3.closed, true);
+  w4 = new NativeWindow(new NativeWindowInitOptions());
+  eq("a second recycled window is open again", w4.closed, false);
+  eq("the previously closed one stays shut", w3.closed, true);
+  w4.close();
   // 真实系统拖拽：AIR 回 true（本示例放在最后，拖拽闩锁随进程退出一起消失）。
   eq("startMove() reports a started drag", w.startMove(), true);
   eq("startResize(bottomRight) reports a started resize", w.startResize(NativeWindowResize.BOTTOM_RIGHT), true);

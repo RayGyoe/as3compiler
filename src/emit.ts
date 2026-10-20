@@ -5765,6 +5765,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('o->_win = id;');
     this.line('ASCWin* w = ASC_w(id);');
+    // The backend hands out the LOWEST free slot, so this id is very often a
+    // RECYCLED one: ASC_window_on_close only cleared `stage`/`window` there, and
+    // every other field still describes the window that just died. In particular
+    // `closed` stays 1, which silently disables the whole new window -- measured
+    // (temp/nwreuse): a window created after another one closed reads
+    // `closed == true` for its entire life, so ASC_win_poll returns early and its
+    // close button never does anything, ASC_win_fire drops its CLOSING/ACTIVATE,
+    // and openedWindows/activeWindow skip it. Reset the slot first, exactly as
+    // ASC_win_claim_main does for slot 0.
+    this.line('memset(w, 0, sizeof(*w));');
     this.line('w->window = (void*)o;');
     this.line('w->title = (char*)"";');
     this.line('w->system_chrome = (options != NULL && options->systemChrome != NULL) ? options->systemChrome : (char*)"standard";');
@@ -22889,6 +22899,17 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('EventDispatcher_dispatchEvent(w->window, Event_new((char*)"close", false, false));');
     this.indent--;
     this.line('}');
+    // Detach the object from the slot it was using. The backend frees the id the
+    // moment the window is gone, so the NEXT window may be given this very id --
+    // and every NativeWindow accessor addresses its window through `_win`, so a
+    // stale object kept pointing at the new occupant: measured (temp/nwreuse) a
+    // closed window's `title` turned into the next window's title, and
+    // `activate()`/`close()` on it would raise/close ANOTHER window (that is the
+    // "focus jumps to the other window instead of opening this one" report).
+    // AIR keeps `closed` true for the rest of the object's life and no call on a
+    // closed window has any effect, so -1 makes every accessor a no-op. `stage`
+    // and `window` are cleared below for the slot's own bookkeeping.
+    this.line('if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1;');
     this.line('w->stage = NULL;');
     // Drop the NativeWindow reference: the glue has already freed its side, so the
     // id may be handed out again and must not keep this object alive through
