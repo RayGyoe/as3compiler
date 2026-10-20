@@ -703,12 +703,13 @@ CoreText 那样的系统级级联。而 SkParagraph 对**每一个**本 run 字�
 修后同一个窗口同一位置正常显示「创建同传」（其余字段用 MiSans/其它族，本来就不乱）。
 
 **修法：`vendor/skia_glue.cc` 的 Windows 分支改成 `SkAirFontMgr : public SkFontMgr`，GDI 作
-`fPrimary`、DirectWrite 作 `fFallback`，且只有 `onMatchFamilyStyleCharacter` 过桥。** 其余 10 个查询
-（`countFamilies` / `getFamilyName` / `createStyleSet` / `matchFamily` / `matchFamilyStyle` /
-`makeFromData` / `makeFromStream{Index,Args}` / `makeFromFile` / `legacyMakeTypeface`）逐字转给 GDI——
+`fPrimary`、DirectWrite 作 `fFallback`；`onMatchFamilyStyleCharacter` 无条件过桥**（GDI 这一路对每个码点
+都答 `nullptr`），**族名查询只在 GDI 匹配不上时才过桥，且只当「本地化名 → 英文名」的翻译器**（见
+§8.4.1）。`countFamilies` / `getFamilyName` / `createStyleSet` / `makeFromData` /
+`makeFromStream{Index,Args}` / `makeFromFile` / `legacyMakeTypeface` 这 8 个查询逐字转给 GDI——
 所以**今天能解析的字族换脸为零**（上表 `MiSans Regular` / `Microsoft YaHei` / `SimSun` 三行修前修后
 逐字相同）；DirectWrite 侧走它自己的 `IDWriteFontFallback::MapCharacters` 级联（DirectWrite 系浏览器
-用的同一条），只在「字脸缺码点」这一条查询上回答。`Arial` 与 `""` 的宽度修后变大，正是过去画不出
+用的同一条），只在「字脸缺码点」这一条查询上回答。`Arial` 与空字族的宽度修后变大，正是过去画不出
 的 CJK 现在画出来了。
 
 **为什么不是整体换 DirectWrite、也不是 `SkOrderedFontMgr`：** 有序管理器会把**结构化**（族/样式）查询
@@ -721,8 +722,47 @@ CoreText 那样的系统级级联。而 SkParagraph 对**每一个**本 run 字�
 加 `dwrite`，构建清单未改。该分支在 `#if defined(_WIN32)` 内，macOS/wasm 不受影响；Windows 侧的这次
 改动**不在 CI 覆盖内**（CI 是 macOS），本机像素 A/B 是唯一验证。
 
-回归：`unit: platform/FontFallback`（9 钉：单点过桥 / 10 处 `fPrimary->` / 工厂与降级 / macOS 分支未动 /
-反向排除 `SkOrderedFontMgr` / 两处文档镜像）。
+回归：`unit: platform/FontFallback`（16 钉：字符查询单点无条件过桥 / 名字查询先用 GDI、只在 GDI 全失手后
+才取 DirectWrite 脸 / 两个名字查询都走翻译器 / `<族> <样式词>` 基名重拼 / 未安装族 → Times（macOS 仍问
+CoreText）/ 8 处原样委托 / 工厂与降级 / macOS 分支未动 / 反向排除 `SkOrderedFontMgr` / 两处文档镜像）。
+
+#### 8.4.1 本地化族名：DirectWrite 只当名字翻译器（阶段二百一十二）
+
+上节的过桥只解决了「码点回退」，度量仍是错的，而且错得更显眼：`微软雅黑` 依然解析不到脸，于是落到 GDI
+的**默认脸**——Windows/GDI 的默认脸是**等宽**的。实测（adl 51.4.1 + `temp/fontprobe`，size 12，
+10×`W` / 10×`i` / 10×`m` 的前进宽）：
+
+| 字族 | adl | 修前 | 修后 |
+|---|---|---|---|
+| `微软雅黑` | 120/30/110 | 80/80/80（等宽） | 120/30/110 |
+| `微软雅黑 Light` | 120/30/110 | 80/80/80 | 120/30/110 |
+| `Microsoft YaHei`（含 Light） | 120/30/110 | 120/30/110 | 120/30/110 |
+| 未安装族 `NoSuchFaceXYZ` | 110/30/90 | 80/80/80 | 110/30/90 |
+
+两处根因：
+
+1. **GDI 的家族表按英文名匹配、只把本地化名报回来**，所以 `微软雅黑` 在 en-US UI 语言下永远匹配不上。
+   DirectWrite 的 `IDWriteFontCollection::FindFamilyName` **能**匹配本地化名，但它的度量未 hint：同一台
+   机上 DirectWrite 的 `Microsoft YaHei` 是 `122.109/31.934/112.441`，而 GDI（= AIR）是 `120/30/110`。
+   所以 DirectWrite **只当名字翻译器**：在它那儿解析出字脸、读出英文族名（Skia 返回字体 name 表第 0
+   条，系统字体即 en-US），**再拿英文名回去问 GDI**——度量因此始终是 GDI 的。
+2. `微软雅黑 Light` 需要多一步：本机 Windows **没有**这个 DirectWrite 家族（Light 脸注册在
+   `Microsoft YaHei` 家族**内**），它是 GDI 侧的独立家族 `Microsoft YaHei Light`。所以先翻译基名、再把
+   样式词拼回去问 GDI（基名作最后一试）。AIR 对 Light 与 Regular 报同一组度量，所以「退到基名」观测
+   等价，先试带样式词只是因为它正是皮肤点名的字脸。
+
+顺带把**未安装族**的落点写死：AIR 在 Windows 上的默认脸是 Times 档（`110/30/90`，正好等于空字族那行）。
+过去我们什么都不问就交给平台默认脸——Windows 上那是等宽脸（`80/80/80`），于是「皮肤写了一个本机没装的
+族」整块变成打字机。现在 `sk_family_alias` 的 `_WIN32` 分支把未安装族解析成 Times；macOS 仍取 CoreText
+的默认脸（那里平台默认**就是** AIR 的默认，见 `temp/tfswc` case 6/9）。
+
+**`onMatchFamily` 也必须翻译**：SkParagraph 解析 `TextStyle` 的族名走的是
+`FontCollection::matchTypeface`（先 `matchFamily` 拿 styleset、再 `matchStyle`），**不是**
+`matchFamilyStyle`。只改后者的结果是段落根本不用这个族、直接以默认脸排版——第一次修就是这么翻车的：
+`微软雅黑` 量出 DirectWrite 的 `122.109`，`微软雅黑 Light` 量出 `60/60/60`。
+
+回归：上面的 16 钉已含本节四项（字族名的翻译与回问 GDI 的**顺序**、`<族> <样式词>` 基名重拼、
+未安装族 → Times、macOS 仍问 CoreText）。像素级验证：`temp/fontprobe` 10 行与 adl 逐格相同。
 
 ### 8.1 `flash.text.StyleSheet` 与 HTML 的**块级**模型（阶段一百四十八）
 

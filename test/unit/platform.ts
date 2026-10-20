@@ -1837,13 +1837,13 @@ function checkFontFallback(): string[] {
     mb.includes(': fPrimary(std::move(primary)), fFallback(std::move(fallback)) {}') &&
     mb.includes('sk_sp<SkFontMgr> fPrimary;') && mb.includes('sk_sp<SkFontMgr> fFallback;'));
 
-  // (2) Exactly ONE query crosses to the fallback tier: the per-character one. This is
-  // the whole point of not using an ordered manager -- every name/style answer, and so
-  // every face that resolves today, must be GDI's.
+  // (2) Exactly ONE query crosses to the fallback tier UNCONDITIONALLY: the per-character
+  // one. Skia's GDI port answers that with nullptr for every code point, so it is not a
+  // preference, it is the only way a run whose face lacks a glyph can render at all.
   const charSig = 'sk_sp<SkTypeface> onMatchFamilyStyleCharacter(const char familyName[], const SkFontStyle& style,';
   const charBody = ovBody(charSig);
-  check('the fallback tier is reached from exactly one place: the character query',
-    charBody !== '' && (mb.match(/fFallback->/g) ?? []).length === 1 &&
+  check('the character query is the only unconditional cross to the fallback tier',
+    charBody !== '' &&
     (charBody.match(/fFallback->/g) ?? []).length === 1 &&
     charBody.includes('fFallback->matchFamilyStyleCharacter(familyName, style, bcp47, bcp47Count, character);'));
   check('...and only after the primary tier declines (primary first, then fallback)',
@@ -1851,24 +1851,45 @@ function checkFontFallback(): string[] {
     charBody.includes('character)) {') && charBody.includes('return tf;') &&
     charBody.indexOf('fPrimary->') < charBody.indexOf('fFallback->'));
 
-  // (3) Every other override -- all 10 of SkFontMgr's remaining pure virtuals -- goes to
-  // the primary untouched, so no family that resolves today can change face.
+  // (2b) The NAME queries additionally cross over, but only as a last resort and only
+  // through the localized-name translator: GDI's family table matches the English face
+  // name and merely REPORTS the localized one, so a zh-CN skin's 微软雅黑 was unmatched and
+  // fell to GDI's default -- a monospace face, i.e. every such field read like a
+  // typewriter (adl 51.4.1 + temp/fontprobe: AIR 120/30/110 for 微软雅黑). DirectWrite does
+  // index localized names, but its metrics are unhinted (122.109/31.934/112.441 for the
+  // same probe), so it is a NAME TRANSLATOR: its English family name is handed back to
+  // GDI, and the DWrite face is used only when GDI cannot name any translation.
+  const styleBody = ovBody('sk_sp<SkTypeface> onMatchFamilyStyle(const char familyName[],');
+  const famBody = ovBody('sk_sp<SkFontStyleSet> onMatchFamily(const char familyName[]) const override {');
+  check('a name query asks the primary tier first, so every face that resolves today is unchanged',
+    // onMatchFamilyStyle delegates to matchAir, which opens with the GDI query; a
+    // style-set query asks GDI before it considers a translation.
+    styleBody.includes('return this->matchAir(familyName, style);') &&
+    mb.includes('if (sk_sp<SkTypeface> g = fPrimary->matchFamilyStyle(familyName, style)) return g;') &&
+    famBody.indexOf('fPrimary->') < famBody.indexOf('airFamilyNames('));
+  check('both name queries go through the localized-name translator',
+    famBody.includes('airFamilyNames(familyName, alt)') && styleBody.includes('matchAir(familyName, style)') &&
+    mb.includes('int airFamilyNames(const char* familyName, SkString out[2]) const {'));
+  check('a DirectWrite face is taken only after GDI misses every translated spelling',
+    mb.includes('int n = this->airFamilyNames(familyName, alt);') &&
+    mb.includes('if (fFallback != nullptr) return fFallback->matchFamilyStyle(familyName, style);') &&
+    mb.includes('if (fb && fb->count() > 0) return fb;'));
+
+  // (3) The remaining overrides -- everything that is not a name query or the character
+  // query -- still goes to the primary untouched, so no family that resolves today can
+  // change face.
   const primarySigs: string[] = [
     'int onCountFamilies() const override {',
     'void onGetFamilyName(int index, SkString* familyName) const override {',
     'sk_sp<SkFontStyleSet> onCreateStyleSet(int index) const override {',
-    'sk_sp<SkFontStyleSet> onMatchFamily(const char familyName[]) const override {',
-    'sk_sp<SkTypeface> onMatchFamilyStyle(const char familyName[],',
     'sk_sp<SkTypeface> onMakeFromData(sk_sp<SkData> data, int ttcIndex) const override {',
     'sk_sp<SkTypeface> onMakeFromStreamIndex(std::unique_ptr<SkStreamAsset> stream,',
     'sk_sp<SkTypeface> onMakeFromStreamArgs(std::unique_ptr<SkStreamAsset> stream,',
     'sk_sp<SkTypeface> onMakeFromFile(const char path[], int ttcIndex) const override {',
     'sk_sp<SkTypeface> onLegacyMakeTypeface(const char familyName[],',
   ];
-  check('all 10 remaining queries delegate to the primary tier, untouched',
+  check('the 8 untouched queries delegate to the primary tier as before',
     primarySigs.every((s) => ovBody(s).includes('fPrimary->')) &&
-    // 10 delegations plus the character override's own primary-first query
-    (mb.match(/fPrimary->/g) ?? []).length === primarySigs.length + 1 &&
     primarySigs.every((s) => !ovBody(s).includes('fFallback')));
 
   // (4) On Windows the two tiers are GDI (naming) + DirectWrite (character fallback),
@@ -1912,6 +1933,25 @@ function checkFontFallback(): string[] {
   check('the Windows fallback tier is documented in skia.md (zh + en)',
     zh.includes('SkAirFontMgr') && zh.includes('Microsoft YaHei') && en.includes('SkAirFontMgr')
     && en.includes('Microsoft YaHei'));
+  check('...and so is the localized-name translation and the Times default (zh + en)',
+    zh.includes('名字翻译器') && zh.includes('Times') && en.includes('name translator') && en.includes('Times'));
+
+  // (8) The OTHER half of the same Windows defect (stage 212): the localized name must
+  // be translated, and an uninstalled family must land on AIR's default tier.
+  // SkParagraph resolves a TextStyle's family through onMatchFamily (style set +
+  // matchStyle), NOT through onMatchFamilyStyle, so a translator wired into only the
+  // latter is invisible to every paragraph -- the first attempt measured DirectWrite's
+  // 122.109/31.934/112.441 for 微软雅黑 and 60/60/60 for 微软雅黑 Light (adl: 120/30/110).
+  check('a "<family> <style word>" name translates the base and re-appends the style',
+    mb.includes('if (sp == nullptr || sp[1] == 0 || !isStyleWord(sp + 1)) return 0;') &&
+    mb.includes('out[0] = en;') && mb.includes('out[0].append(" ");') &&
+    // 微软雅黑 Light is NOT a DirectWrite family: the base is translated, the style word
+    // re-appended, and the bare base kept as the last spelling to try.
+    mb.includes('out[1] = en;'));
+  check('an uninstalled family resolves to AIR\'s Windows default (Times), not the platform default',
+    /if \(mgr && !mgr->matchFamilyStyle\(family, SkFontStyle\(\)\)\) \{\s*#if defined\(_WIN32\)[\s\S]{0,900}?resolved = "Times";/.test(glue));
+  check('...while macOS keeps asking CoreText for its own default face',
+    /#if defined\(_WIN32\)[\s\S]{0,1600}?#else[\s\S]{0,700}?mgr->matchFamilyStyle\(nullptr, SkFontStyle\(\)\)/.test(glue));
 
   console.log(`     [font-fallback] ${ok} check(s) passed`);
   return bad;

@@ -1157,17 +1157,50 @@ int sk_fontmgr_register_data(const void* data, int len) {
 // deliberately bogus-family row drew the same .notdef for 创建会议).
 //
 // So the manager is a GDI primary with DirectWrite appended as the fallback
-// tier, and ONLY the character query crosses over. Every name/style call goes to
-// GDI exactly as before, so no family that resolves today changes face, and no
-// DirectWrite typeface reaches SkParagraph's structured paths: those metrics run
-// through our AIR strut / height-override machinery, and the measured
-// DirectWrite-resolved row reported textHeight -Infinity and painted nothing at
-// all (see the same probe). DirectWrite's own IDWriteFontFallback::MapCharacters
-// cascade — the one DirectWrite-based browsers use, and the closest thing to
-// what AIR does for a code point the run's face lacks — then answers the
-// character query. Skia reaches DirectWrite through
-// LoadLibraryW("dwrite.dll")/GetProcAddress (src/utils/win/SkDWrite.cpp), so
-// this adds no link dependency to any manifest.
+// tier, and BOTH the name query and the character query cross over (the
+// character query always, the name query only when GDI misses). Every name/style
+// call still goes to GDI FIRST, so no family that resolves today changes face.
+//
+// The name-query cross-over is what fixes the Chinese family names. GDI's family
+// table exposes each family under its ENGLISH face name only -- the localized
+// name is what GDI reports back, not what it matches on -- so a field whose
+// DefineEditText says 微软雅黑 (what a zh-CN skin carries) missed, fell through to
+// the default face, and Windows' GDI default is a MONOSPACE face (measured:
+// 10x'W'/10x'i'/10x'm' all 80 px), so a whole button read like a typewriter.
+// DirectWrite's IDWriteFontCollection::FindFamilyName DOES match localized family
+// names, but its metrics are unhinted and do not match AIR's: measured on this
+// machine at size 12, DirectWrite's Microsoft YaHei measures 122.109/31.934/
+// 112.441 for 10x'W'/10x'i'/10x'm' where GDI -- and adl 51.4.1, which uses the
+// GDI path -- reports 120/30/110. So DirectWrite is used as a NAME TRANSLATOR,
+// not as the face source: resolve the localized name there, read the typeface's
+// English family name (Skia returns entry 0 of the font's name table, en-US for
+// every system font that ships one), and ask GDI again with that.
+//
+// Measured on adl 51.4.1 + temp/fontprobe (both sides, same machine):
+//   微软雅黑       AIR 120/30/110   ours before 80/80/80   after 120/30/110
+//   微软雅黑 Light AIR 120/30/110   ours before 80/80/80   after 120/30/110
+//   1095 Uninstalled family AIR 110/30/90 -- see sk_family_alias, which now
+//   lands there instead of on the monospace default.
+//
+// "微软雅黑 Light" needs one extra step: it is not a DirectWrite family at all
+// (this Windows registers the Light face as its own GDI family, "Microsoft YaHei
+// Light", with the localized name 微软雅黑 Light), so the base name is translated
+// and the style word appended back before GDI is asked. AIR reports the same
+// 120/30/110 for the Light family as for the regular one, so falling back to the
+// base family would be observationally identical -- the appended-style lookup is
+// tried first only because it is the exact face the skin asked for.
+//
+// DirectWrite's own IDWriteFontFallback::MapCharacters cascade — the one
+// DirectWrite-based browsers use, and the closest thing to what AIR does for a
+// code point the run's face lacks — answers the character query. Skia reaches
+// DirectWrite through LoadLibraryW("dwrite.dll")/GetProcAddress
+// (src/utils/win/SkDWrite.cpp), so this adds no link dependency to any manifest.
+//
+// NOTE the earlier probe that reported DirectWrite faces as unrenderable
+// (textHeight -Infinity) was a MIXED paragraph: the strut still named the
+// unresolvable family while a DWrite face supplied the glyphs. Once the same
+// face is used for the strut, the runs and the typeface (which is what the
+// alias + this cross-over ensure), the paragraph lays out normally.
 class SkAirFontMgr : public SkFontMgr {
 public:
   SkAirFontMgr(sk_sp<SkFontMgr> primary, sk_sp<SkFontMgr> fallback)
@@ -1182,11 +1215,30 @@ protected:
     return fPrimary->createStyleSet(index);
   }
   sk_sp<SkFontStyleSet> onMatchFamily(const char familyName[]) const override {
-    return fPrimary->matchFamily(familyName);
+    // SkParagraph resolves a TextStyle's family through THIS call (FontCollection
+    // ::matchTypeface asks for a style set and then matchStyle), not through
+    // matchFamilyStyle -- so the localized-name translation must live here too:
+    // returning GDI's empty set for 微软雅黑 made the paragraph skip the family
+    // entirely and render with the legacy default face.
+    sk_sp<SkFontStyleSet> set = fPrimary->matchFamily(familyName);
+    if (set && set->count() > 0) return set;
+    SkString alt[2];
+    int n = this->airFamilyNames(familyName, alt);
+    for (int i = 0; i < n; i++) {
+      sk_sp<SkFontStyleSet> g = fPrimary->matchFamily(alt[i].c_str());
+      if (g && g->count() > 0) return g;
+    }
+    // Last resort: DirectWrite's own collection (localized names, unhinted
+    // metrics -- see the class comment for why GDI is preferred).
+    if (fFallback != nullptr) {
+      sk_sp<SkFontStyleSet> fb = fFallback->matchFamily(familyName);
+      if (fb && fb->count() > 0) return fb;
+    }
+    return set;
   }
   sk_sp<SkTypeface> onMatchFamilyStyle(const char familyName[],
                                       const SkFontStyle& style) const override {
-    return fPrimary->matchFamilyStyle(familyName, style);
+    return this->matchAir(familyName, style);
   }
   // The one query GDI answers with nullptr for every code point.
   sk_sp<SkTypeface> onMatchFamilyStyleCharacter(const char familyName[], const SkFontStyle& style,
@@ -1220,6 +1272,81 @@ protected:
   }
 
 private:
+  // The style words AIR's own lookup accepts as part of a family name. A GDI
+  // family named "Microsoft YaHei Light" is spelled that way, while the same
+  // face's localized name is 微软雅黑 Light -- and DirectWrite has no family under
+  // either spelling on this Windows (it registers the Light face inside the
+  // Microsoft YaHei family). Measured: matchFamilyStyle("Microsoft YaHei Light")
+  // on DirectWrite returns nullptr, on GDI 120/30/110.
+  static bool isStyleWord(const char* w) {
+    static const char* const kWords[] = {
+        "Light", "Bold", "Italic", "Oblique", "Regular", "Normal", "Medium",
+        "SemiBold", "Semibold", "DemiBold", "Demi", "Black", "Heavy", "Thin",
+        "ExtraLight", "Extralight", "UltraLight", "ExtraBold", "Book",
+    };
+    for (const char* k : kWords) {
+      if (strcmp(w, k) == 0) return true;
+    }
+    return false;
+  }
+
+  // English family name of a family DirectWrite can name, or false.
+  bool englishFamilyName(const char* familyName, SkString* out) const {
+    if (fFallback == nullptr) return false;
+    sk_sp<SkTypeface> dw = fFallback->matchFamilyStyle(familyName, SkFontStyle());
+    if (dw == nullptr) return false;
+    dw->getFamilyName(out);
+    return out->size() > 0 && strcmp(out->c_str(), familyName) != 0;
+  }
+
+  // The spellings of `familyName` that GDI can actually MATCH, in preference
+  // order, for a name GDI itself could not name. DirectWrite indexes localized
+  // family names, so it is used here purely as a localized->English translator
+  // (its own metrics are unhinted and do not match AIR's, see the class comment).
+  // Returns 0 for a name no tier can resolve -- which is what keeps
+  // sk_family_alias's "not installed" test meaningful.
+  int airFamilyNames(const char* familyName, SkString out[2]) const {
+    if (fFallback == nullptr || familyName == nullptr) return 0;
+    // (a) DirectWrite knows the name as given: use its English family name.
+    if (sk_sp<SkTypeface> dw = fFallback->matchFamilyStyle(familyName, SkFontStyle())) {
+      SkString en;
+      dw->getFamilyName(&en);
+      if (en.size() > 0 && strcmp(en.c_str(), familyName) != 0) {
+        out[0] = en;
+        return 1;
+      }
+      return 0;  // same spelling: GDI has nothing else to try
+    }
+    // (b) "<localized base> <style word>": translate the base and re-append the
+    // style (the exact face GDI knows), with the base alone as the last try.
+    const char* sp = strrchr(familyName, ' ');
+    if (sp == nullptr || sp[1] == 0 || !isStyleWord(sp + 1)) return 0;
+    SkString base(familyName, (size_t)(sp - familyName));
+    SkString en;
+    if (!this->englishFamilyName(base.c_str(), &en)) return 0;
+    out[0] = en;
+    out[0].append(" ");
+    out[0].append(sp + 1);
+    out[1] = en;
+    return 2;
+  }
+
+  // GDI first (unchanged faces for every family it can name), then the
+  // localized-name translation described in the class comment. Only a real miss
+  // in every step returns nullptr.
+  sk_sp<SkTypeface> matchAir(const char* familyName, const SkFontStyle& style) const {
+    if (familyName == nullptr) return fPrimary->matchFamilyStyle(familyName, style);
+    if (sk_sp<SkTypeface> g = fPrimary->matchFamilyStyle(familyName, style)) return g;
+    SkString alt[2];
+    int n = this->airFamilyNames(familyName, alt);
+    for (int i = 0; i < n; i++) {
+      if (sk_sp<SkTypeface> g = fPrimary->matchFamilyStyle(alt[i].c_str(), style)) return g;
+    }
+    // DirectWrite's own face only when GDI cannot name any translation.
+    if (fFallback != nullptr) return fFallback->matchFamilyStyle(familyName, style);
+    return nullptr;
+  }
+
   sk_sp<SkFontMgr> fPrimary;
   sk_sp<SkFontMgr> fFallback;
 };
@@ -1511,18 +1638,37 @@ static const char* sk_family_alias(const char* family) {
   // (stage 168). Substituting the default family keeps the strut, the runs and
   // the typeface lookup on ONE face. Cached: the lookup walks the whole installed
   // family list, and CSS family names of a TextField never change at runtime.
+  //
+  // WHICH default face differs per platform: on macOS it is whatever CoreText
+  // answers (Helvetica), on Windows AIR is Times while GDI's own default is a
+  // monospace face -- see the _WIN32 branch below.
   static std::map<std::string, std::string> alias_cache;
   auto it = alias_cache.find(std::string(family));
   if (it != alias_cache.end()) return it->second.c_str();
   std::string resolved(family);
   sk_sp<SkFontMgr> mgr = sk_platform_fontmgr();
   if (mgr && !mgr->matchFamilyStyle(family, SkFontStyle())) {
+#if defined(_WIN32)
+    // AIR's Windows default face is Times (measured on adl 51.4.1,
+    // temp/fontprobe: a bogus family "NoSuchFaceXYZ" lays out 10x'W'/10x'i'/
+    // 10x'm' as 110/30/90, exactly the NULL-family row). We used to take
+    // whatever the platform calls its default face -- and GDI's default on
+    // Windows is a MONOSPACE face (80/80/80), i.e. every field with an
+    // uninstalled family silently became a typewriter. The NULL-family branch
+    // above already maps to "Times", so this makes both miss paths agree.
+    resolved = "Times";
+#else
+    // macOS: the platform default face IS AIR's default (measured: an
+    // unresolvable family -- "MiSans Regular", or "宋体" without Songti SC --
+    // reports Helvetica's line box, which is what matchFamilyStyle(nullptr)
+    // returns), so keep asking CoreText.
     sk_sp<SkTypeface> dflt = mgr->matchFamilyStyle(nullptr, SkFontStyle());
     if (dflt) {
       SkString n;
       dflt->getFamilyName(&n);
       if (n.size() > 0) resolved = n.c_str();
     }
+#endif
   }
   return alias_cache.emplace(std::string(family), std::move(resolved)).first->second.c_str();
 }

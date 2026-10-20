@@ -828,14 +828,16 @@ That is the garble the user reported: the AI-subtitle window's card painted its 
 use MiSans or other families and were never garbled).
 
 **The fix: the Windows branch of `vendor/skia_glue.cc` becomes `SkAirFontMgr : public SkFontMgr`, GDI as
-`fPrimary` and DirectWrite as `fFallback`, with only `onMatchFamilyStyleCharacter` allowed across.** The other
-10 queries (`countFamilies` / `getFamilyName` / `createStyleSet` / `matchFamily` / `matchFamilyStyle` /
-`makeFromData` / `makeFromStream{Index,Args}` / `makeFromFile` / `legacyMakeTypeface`) are forwarded verbatim to
-GDI, so **a family that resolves today changes face in zero cases** (`MiSans Regular` / `Microsoft YaHei` /
-`SimSun` are byte-identical before and after in the table above). DirectWrite answers through its own
+`fPrimary` and DirectWrite as `fFallback`; `onMatchFamilyStyleCharacter` crosses over unconditionally** (the GDI
+port answers that one with `nullptr` for every code point), **while a family-name query crosses only when GDI
+misses it, and only as a localized-name to English-name translator** (see §8.4.1).
+`countFamilies` / `getFamilyName` / `createStyleSet` / `makeFromData` / `makeFromStream{Index,Args}` /
+`makeFromFile` / `legacyMakeTypeface` are the 8 queries still forwarded verbatim to GDI, so **a family that
+resolves today changes face in zero cases** (`MiSans Regular` / `Microsoft YaHei` / `SimSun` are byte-identical
+before and after in the table above). DirectWrite answers through its own
 `IDWriteFontFallback::MapCharacters` cascade -- the same one DirectWrite-based browsers use -- and only for the
-"the face lacks this code point" query. `Arial` and `""` got wider because the CJK they never used to draw now
-draws.
+"the face lacks this code point" query. `Arial` and the empty family got wider because the CJK they never used
+to draw now draws.
 
 **Why not a full DirectWrite swap, and why not `SkOrderedFontMgr`:** an ordered manager lets DirectWrite answer
 the **structured** (family/style) queries as well, and once a DirectWrite typeface reaches SkParagraph's
@@ -849,9 +851,56 @@ needs a `dwrite` entry and no manifest was changed. The block is inside `#if def
 are untouched; this Windows-side change is **not covered by CI** (CI is macOS), so the local pixel A/B is the
 only verification.
 
-Regression: `unit: platform/FontFallback` (9 nails: the single crossing point / the 10 `fPrimary->` delegations /
-the factory and its degradation / the macOS branch untouched / `SkOrderedFontMgr` excluded in reverse / both doc
-mirrors).
+Regression: `unit: platform/FontFallback` (16 nails: the character query as the single unconditional crossing / a
+name query asking GDI first and taking a DirectWrite face only after GDI misses every translation / both name
+queries routed through the translator / the `<family> <style word>` base re-spelling / uninstalled -> Times while
+macOS keeps asking CoreText / the 8 verbatim delegations / the factory and its degradation / the macOS
+branch untouched / `SkOrderedFontMgr` excluded in reverse / both doc mirrors).
+
+#### 8.4.1 Localized family names: DirectWrite as a name translator only (stage two-hundred-twelve)
+
+The crossing above fixed code-point fallback, but the METRICS were still wrong -- and wrong in the loudest
+possible way: `微软雅黑` still resolved to nothing, so it fell through to GDI's **default** face, which on
+Windows is **monospace**. Measured (adl 51.4.1 + `temp/fontprobe`, size 12, advances of 10×`W` / 10×`i` /
+10×`m`):
+
+| family | adl | before | after |
+|---|---|---|---|
+| `微软雅黑` | 120/30/110 | 80/80/80 (monospace) | 120/30/110 |
+| `微软雅黑 Light` | 120/30/110 | 80/80/80 | 120/30/110 |
+| `Microsoft YaHei` (and Light) | 120/30/110 | 120/30/110 | 120/30/110 |
+| uninstalled `NoSuchFaceXYZ` | 110/30/90 | 80/80/80 | 110/30/90 |
+
+Two root causes:
+
+1. **GDI's family table matches English face names and merely REPORTS the localized one**, so under an en-US UI
+   language `微软雅黑` never matches. DirectWrite's `IDWriteFontCollection::FindFamilyName` DOES match localized
+   names, but its metrics are unhinted: on the same machine DirectWrite's `Microsoft YaHei` measures
+   `122.109/31.934/112.441` where GDI -- and AIR -- report `120/30/110`. So DirectWrite is used **only as a name
+   translator**: resolve the typeface there, read its English family name (Skia returns entry 0 of the font's
+   name table, en-US for system fonts), and **ask GDI again with that** -- which keeps the metrics GDI's.
+2. `微软雅黑 Light` needs one extra step: this Windows has **no such DirectWrite family** (the Light face is
+   registered INSIDE `Microsoft YaHei`), it is a separate GDI family `Microsoft YaHei Light`. So the base name
+   is translated and the style word appended back before GDI is asked (with the bare base name as the last
+   try). AIR reports the same 120/30/110 for Light as for Regular, so falling back to the base family would be
+   observationally identical; the appended-style lookup is tried first only because it is the exact face the
+   skin asked for.
+
+This also pins down where an **uninstalled** family lands: AIR's Windows default face is the Times tier
+(`110/30/90`, exactly the empty-family row). We used to hand the name to whatever the platform calls default --
+on Windows a monospace face (`80/80/80`), so a skin naming a family this machine does not have turned a whole
+field into a typewriter. `sk_family_alias`'s `_WIN32` branch now resolves an uninstalled family to Times; macOS
+still asks CoreText for its default (there the platform default IS AIR's default, see `temp/tfswc` cases 6/9).
+
+**`onMatchFamily` has to translate too**: SkParagraph resolves a `TextStyle`'s family through
+`FontCollection::matchTypeface` (a `matchFamily` style set followed by `matchStyle`), **not** through
+`matchFamilyStyle`. Fixing only the latter makes the paragraph skip the family and lay out on the default face --
+which is exactly how the first attempt failed: `微软雅黑` measured DirectWrite's `122.109` and
+`微软雅黑 Light` measured `60/60/60`.
+
+Regression: the same 16 nails above cover this section's four items (the ORDER of translation-then-ask-GDI, the
+`<family> <style word>` base re-spelling, uninstalled -> Times, macOS still asking CoreText). Pixel proof:
+`temp/fontprobe`'s 10 rows now match adl cell for cell.
 
 ### 8.1 `flash.text.StyleSheet` and HTML's **block-level** model (stage one-hundred-forty-eight)
 

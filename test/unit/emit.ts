@@ -1698,6 +1698,57 @@ function checkEmitListenerSnapshot(): string[] {
 }
 registerGroup('unit: emit/ListenerSnapshot', checkEmitListenerSnapshot);
 
+// 动态写（`obj[key] = v`）的解析顺序：**最近一层优先，层内 setter 优先于字段**。
+// AS3 里访问器压过同名存储槽，而这个运行时故意让一批属性「字段 + setter」并存：
+// text/type/borderColor/backgroundColor/textColor（TextField）、length（ByteArray）、
+// delay/repeatCount（Timer）、quality/align（Stage）、filters（DisplayObject）、
+// totalFrames（MovieClip）、x/y/visible（Stage3D）——字段是实现细节，副作用（_para/_runs
+// 失效、缓冲区 resize + position 钳位、Timer 重启、RGB 去 alpha、范围校验）全在 setter 里。
+// 先走字段表时，动态写（烘焙 SWC 子件全走这条路）会静默跳过所有副作用：真应用里
+// `item.note.text = ...` 保留了上一次 htmlText 的 _runs=[0,12)，只排 12 字节并把一个字
+// 劈成两半（两个 U+FFFD，temp/shareitem）。examples/textfield-dyn-set.as 端到端钉行为，
+// 这里钉发射形态——纯 C 构建没有排版后端时宽度恒 0，测不出差别。
+function checkRuntimeDynSetAccessorFirst(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [dynset] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [dynset] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const i = pre.indexOf('static void as_dyn_set(void* obj, const char* key, as_value v) {');
+  check('the preamble still defines as_dyn_set', i >= 0);
+  const body = i < 0 ? '' : pre.slice(i, pre.indexOf('\nstatic ', i + 10));
+
+  // 1. 同层内 setter 扫描必须先于 props 扫描（顺序即优先级）。
+  const setScan = body.indexOf('setters[i].name');
+  const propScan = body.indexOf('props[i].name');
+  check('the setter table is scanned before the field table',
+    setScan >= 0 && propScan > setScan);
+  check('a setter hit invokes the accessor and returns at once',
+    /if \(strcmp\(setters\[i\]\.name, key\) == 0\) \{ setters\[i\]\.fn\(obj, &v, 1\); return; \}/.test(body));
+  check('a field hit still returns after the coercing store (accessor is not re-scanned)',
+    body.indexOf('props[i].name') >= 0 && body.indexOf('as_v_to_number(v); return;') > propScan);
+
+  // 2. 只有一处 setter 调用点：修前的实现是「先遍历所有层查字段，循环外再查一遍
+  //    setter」，那等于让**远端层**的字段压过**近端层**的访问器，也会漏掉副作用。
+  const setterCalls = body.split('setters[i].fn(obj, &v, 1)').length - 1;
+  check('there is exactly one setter dispatch site (no second pass after the loop)', setterCalls === 1);
+  check('both scans live inside the per-layer loop',
+    body.indexOf('while (vt != NULL)') < setScan && body.indexOf('while (vt != NULL)') < propScan);
+  check('the layer advance comes after both scans',
+    body.indexOf('vt = ((as_vtable_header*)vt)->super;') > Math.max(setScan, propScan));
+
+  // 3. 特殊容器先分流（Dictionary/Array/Vector），不能被 setter 表挡住。
+  check('Dictionary/Array/Vector still short-circuit before the vtable walk',
+    body.indexOf('as_dict_set(') < setScan && body.indexOf('as_array_key_set(') < setScan
+    && body.indexOf('as_vec_set_hook') < setScan);
+
+  console.log(`     [dynset] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: runtime/DynSetAccessorFirst', checkRuntimeDynSetAccessorFirst);
+
 // int(x) / uint(x) must be ES3 ToInt32 / ToUint32 for EVERY source type, never a
 // bare C cast. `(int)` of a double is UNDEFINED BEHAVIOUR once the value is NaN,
 // infinite or outside int32 -- the same expression printed 1, 1073741824,

@@ -5346,6 +5346,26 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
     if (dk == 3) { if (as_vec_set_hook != NULL) as_vec_set_hook(obj, key, v); return; }
     void* vt = ((as_object_header*)obj)->vtable;
     while (vt != NULL) {
+        // ACCESSOR BEFORE FIELD, PER LAYER. AS3 resolves a property write to the
+        // accessor whenever one exists -- a same-named storage slot is an
+        // implementation detail of ours, never an AS3-visible alternative. This
+        // runtime deliberately keeps text/type/borderColor/backgroundColor/
+        // textColor (TextField), length (ByteArray), delay/repeatCount (Timer),
+        // quality/align (Stage), filters (DisplayObject), totalFrames (MovieClip)
+        // and x/y/visible (Stage3D) as field+setter pairs, and the setter is where
+        // the side effects live: _para/_runs invalidation, buffer resize, Timer
+        // restart, RGB alpha drop, range validation. Walking the field table
+        // first meant a DYNAMIC write (obj[key] = v, as every baked SWC child
+        // field is reached) silently skipped all of it -- measured on the real
+        // app: item.note.text = ... on an htmlText field kept the old [0,12)
+        // run and rendered two U+FFFD (temp/shareitem). Nearest layer wins, and
+        // within a layer the accessor wins, which is exactly AS3's rule.
+        as_method* setters = (as_method*)((as_vtable_header*)vt)->setters;
+        if (setters != NULL) {
+            for (int i = 0; setters[i].name != NULL; i++) {
+                if (strcmp(setters[i].name, key) == 0) { setters[i].fn(obj, &v, 1); return; }
+            }
+        }
         as_prop* props = (as_prop*)((as_vtable_header*)vt)->props;
         if (props != NULL) {
             for (int i = 0; props[i].name != NULL; i++) {
@@ -5393,21 +5413,10 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
         }
         vt = ((as_vtable_header*)vt)->super;
     }
-    // Setter reflection: a dynamic write (obj[key] = v) must reach accessors, not
-    // just fields. Starling's Juggler tweens accessor-backed properties
+    // Setter reflection already ran inside the layer walk above (accessor before
+    // field, per layer), which is also what serves Starling's Juggler tweens
     // (DisplayObject.alpha/x/y/scaleX, Sprite3D.rotationX...) through an
-    // Object-typed target, so without this branch every such tween silently did
-    // nothing. A getter without a setter stays read-only, as in AS3.
-    vt = ((as_object_header*)obj)->vtable;
-    while (vt != NULL) {
-        as_method* setters = (as_method*)((as_vtable_header*)vt)->setters;
-        if (setters != NULL) {
-            for (int i = 0; setters[i].name != NULL; i++) {
-                if (strcmp(setters[i].name, key) == 0) { setters[i].fn(obj, &v, 1); return; }
-            }
-        }
-        vt = ((as_vtable_header*)vt)->super;
-    }
+    // Object-typed target. A getter without a setter stays read-only, as in AS3.
     as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
     // Proxy receiver: a write that is not a real field/setter is served by
     // setProperty (AIR never lands it in the '_dyn' slot table, measured).
