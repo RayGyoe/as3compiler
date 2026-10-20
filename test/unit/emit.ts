@@ -1749,6 +1749,50 @@ function checkRuntimeDynSetAccessorFirst(): string[] {
 }
 registerGroup('unit: runtime/DynSetAccessorFirst', checkRuntimeDynSetAccessorFirst);
 
+// `String.prototype.substr` 是 AVM2 对 ES3 的**偏离**：`String::AS3_substr` 把 `start`
+// 与 `start + count` 都过 ClampIndex（负数从尾部回算），所以 `substr(0,-3)` 是「砍掉
+// 最后 3 个字符」而不是空串（avmplus core/StringObject.cpp + NativeObjectHelpers.h）。
+// 我们原来按 ES3 把负 len 夹到 0，真应用 myMeetingRenderers 的
+// `start_at.substr(0,-3)` 因此整条时间变空——卡片上只剩「开始时间：」。
+// examples/string-substr.as 端到端钉行为（含动态接收者路径），这里钉发射形态，
+// 防止有人「顺手」把它改回 ES3 的夹 0 写法。
+function checkRuntimeSubstrNegativeLen(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [substr] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [substr] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const ci = pre.indexOf('static int as_clamp_index(int n, int length) {');
+  check('the preamble defines as_clamp_index', ci >= 0);
+  const clampBody = ci < 0 ? '' : pre.slice(ci, pre.indexOf('\nstatic ', ci + 10));
+  // ClampIndex 的三条分支：负数回算（仍越界 → 0）、正向越界 → length、其余原值。
+  check('negative indices count from the end and clamp to 0',
+    /if \(n < 0\) \{\s*if \(n \+ length < 0\) return 0;\s*return n \+ length;\s*\}/.test(clampBody));
+  check('positive indices past the end clamp to length', clampBody.indexOf('if (n > length) return length;') >= 0);
+
+  const si = pre.indexOf('static char* as_str_substr(const char* s, int from, int len) {');
+  check('the preamble defines as_str_substr', si >= 0);
+  const body = si < 0 ? '' : pre.slice(si, pre.indexOf('\nstatic ', si + 10));
+  check('start goes through as_clamp_index', body.indexOf('as_clamp_index(from, slen)') >= 0);
+  // 关键一行：end 也要过 as_clamp_index，且入参是「夹过的 start + 原始 len」
+  // ——这正是 AVM2 让负长度从尾部回算的地方。
+  check('end takes start+len through as_clamp_index too',
+    body.indexOf('as_clamp_index(start + len, slen)') >= 0);
+  check('end is pulled back to start before slicing', body.indexOf('if (end < start) end = start;') >= 0);
+  check('the old ES3 clamp of a negative length is gone', body.indexOf('if (len < 0) len = 0;') < 0);
+  // slice / substring 的负数语义各自不同，不能被这次改动带偏。
+  check('as_str_substring still treats a negative bound as 0',
+    /static char\* as_str_substring\([^)]*\) \{[\s\S]*?if \(to < 0\) to = 0;/.test(pre));
+  check('as_str_slice still resolves a negative bound from the end',
+    /static char\* as_str_slice\([^)]*\) \{[\s\S]*?if \(to < 0\) to = slen \+ to;/.test(pre));
+
+  console.log(`     [substr] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: runtime/SubstrNegativeLen', checkRuntimeSubstrNegativeLen);
+
 // int(x) / uint(x) must be ES3 ToInt32 / ToUint32 for EVERY source type, never a
 // bare C cast. `(int)` of a double is UNDEFINED BEHAVIOUR once the value is NaN,
 // infinite or outside int32 -- the same expression printed 1, 1073741824,

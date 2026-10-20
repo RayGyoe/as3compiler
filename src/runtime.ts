@@ -5870,16 +5870,31 @@ static char* as_str_substring(const char* s, int from, int to) {
     r[n] = 0;
     return r;
 }
+// AVM2's ClampIndex (core/NativeObjectHelpers.h): negative values count from the end.
+// Out-of-range results clamp to [0, length]; NaN lands on 0.
+static int as_clamp_index(int n, int length) {
+    if (n < 0) {
+        if (n + length < 0) return 0;
+        return n + length;
+    }
+    if (n > length) return length;
+    return n;
+}
+// AVM2's substr is NOT the ES3 one: String::AS3_substr runs BOTH 'start' and
+// 'start + count' through ClampIndex (see avmplus core/StringObject.cpp), so a negative
+// length counts back from the end -- "2023-02-10 17:50:00".substr(0,-3) is
+// "2023-02-10 17:50", not "" (ES3 would clamp a negative length to 0). Measured
+// against adl 51.4.1; the real app relies on it for the 我的会议 start-time label.
 static char* as_str_substr(const char* s, int from, int len) {
     int slen = (int)strlen(s);
-    if (from < 0) from = slen + from;
-    if (from < 0) from = 0;
-    if (from > slen) from = slen;
-    if (len < 0) len = 0;
-    if (from + len > slen) len = slen - from;
-    char* r = as_str_alloc(len + 1);
-    memcpy(r, s + from, len);
-    r[len] = 0;
+    int start = as_clamp_index(from, slen);
+    // 0x7fffffff is the AS3 default for count; guard the addition against overflow.
+    int end = (len == 0x7fffffff) ? slen : as_clamp_index(start + len, slen);
+    if (end < start) end = start;
+    int n = end - start;
+    char* r = as_str_alloc(n + 1);
+    memcpy(r, s + start, n);
+    r[n] = 0;
     return r;
 }
 static char* as_str_slice(const char* s, int from, int to) {
