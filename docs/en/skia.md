@@ -633,6 +633,42 @@ aborts the rest of that frame), and the next frame is pristine. The fix lives in
 backend-agnostic (Metal / GL / D3D12 / raster share it; builds without a canvas API get a no-op stub).
 Source-level pin: `unit: render/FrameCanvasHygiene`.
 
+### 6.11 Every layer an object opens must be closed by that object (stage 214; a "card jumps down")
+
+The frame-boundary reset of 6.10 only keeps **frames** apart; **within** a frame every fragment owes its own
+balanced save/restore. `as_render_object` opened a `saveLayerAlpha` for `alpha < 1` objects but forgot the
+matching restore:
+
+```c
+as_skia_canvas_save(canvas);                       // the object's own save
+if (o->alpha < 1.0) as_skia_canvas_save_layer_alpha(canvas, o->alpha);  // <- used to have no restore
+as_skia_canvas_translate(canvas, o->x, o->y);      // applied after that layer
+...
+if (scroll_on) as_skia_canvas_restore(canvas);
+if (ct_on)     as_skia_canvas_restore(canvas);
+if (blend_on)  as_skia_canvas_restore(canvas);
+as_skia_canvas_restore(canvas);                    // only enough to close "the object's own save"
+```
+
+Being one level off raises no error, but it **shifts the blame upward**: the child's missing restore is
+consumed by the parent's restore, so the parent's own save -- together with the `translate/rotate/scale` and
+layer alpha it applied after it -- **stays on the canvas**, and everything painted later in that frame
+inherits the parent's offset. The real-app chain is short: a list row (`AiSubtitleRenderers`) sets
+`skin.bg.alpha = 0.5` on `MOUSE_DOWN`; as soon as a drag starts the scrollbar sets
+`viewContainer.mouseChildren = false`, so the row never receives its `MOUSE_UP` and the 0.5 sticks -- which
+means every later sibling of that row (notably the taller "create" card at a higher depth) is painted
+translated to the row's y, i.e. jumps far down, until the list is rebuilt. That is exactly what the user
+reported: "after dragging the list below, clicking refresh makes the card above jump down and then come
+back".
+
+Fix: remember the condition when the layer is opened and add
+`if (alpha_on) as_skia_canvas_restore(canvas);` after the blend/ct/scrollRect restores and before the
+object's own restore (restores must be in reverse save order). The change is on the emit side, so it is
+backend-agnostic; the pairing of `save_layer_paint`, `save_layer_paint_bounds` and `scrollRect` was
+re-audited site by site. Source pin: `unit: render/AlphaLayerBalance` (which also asserts pushes and pops
+match in the renderer). Pixel pin: `examples/alpha-sibling.as` (a sibling drawn after a translucent
+subtree stays at its own position, and a second `draw` pass is pixel-identical).
+
 ## 7. Multi-target: native and wasm
 
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.

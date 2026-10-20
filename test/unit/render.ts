@@ -1230,6 +1230,46 @@ function checkFrameCanvasHygiene(): string[] {
   console.log(`[canvasreset] ${ok} frame-canvas hygiene checks passed`);
   return bad;
 }
+function checkAlphaLayerBalance(): string[] {
+  // `saveLayerAlpha` is a SAVE, not a cosmetic flag: it pushes a layer that must be
+  // popped by its own restore. The unbalanced version (阶段二百一十四 前的真缺陷) let a
+  // child's save leak upward, so the PARENT's save -- and the translate/rotate/scale
+  // it had applied -- stayed on the canvas for the rest of the frame, dragging every
+  // later sibling along with that child's position. In the app one list row sets
+  // `bg.alpha = 0.5` on MOUSE_DOWN and never sees its MOUSE_UP once a drag starts
+  // (the scrollbar turns mouseChildren off), so the "创建同传" card was painted shifted
+  // down by that row's y until the list was rebuilt.
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [alphalayer] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [alphalayer] ${label}`); }
+  };
+  const c = generateC(parse('var n:int = 1;\n')).c;
+  const head = 'static void as_render_object(void* canvas, DisplayObject* o) {';
+  const at = c.indexOf(head);
+  check('the per-object renderer is emitted', at >= 0);
+  const body = at >= 0 ? c.slice(at, c.indexOf('\n}', at)) : '';
+  const opens = body.match(/as_skia_canvas_save(?:_layer_\w+)?\(/g) ?? [];
+  const closes = body.match(/as_skia_canvas_restore\(/g) ?? [];
+  check('the object-level alpha layer is opened conditionally',
+    body.includes('if (o->alpha < 1.0) as_skia_canvas_save_layer_alpha(canvas, o->alpha);'));
+  check('...and its condition is remembered for the restore',
+    body.includes('int alpha_on = (o->alpha < 1.0);'));
+  check('...and the layer is popped again', body.includes('if (alpha_on) as_skia_canvas_restore(canvas);'));
+  const blendPop = body.indexOf('if (blend_on) as_skia_canvas_restore(canvas);');
+  const alphaPop = body.indexOf('if (alpha_on) as_skia_canvas_restore(canvas);');
+  check('...in reverse order, after blend/colour-transform/scrollRect',
+    blendPop >= 0 && alphaPop > blendPop);
+  check('...but before the last unconditional restore that closes the object',
+    alphaPop >= 0 && alphaPop < body.lastIndexOf('as_skia_canvas_restore(canvas);'));
+  check('every canvas push in the renderer has a matching restore (save/restore balance)',
+    opens.length === closes.length && opens.length >= 5);
+
+  console.log(`[alphalayer] ${ok} alpha-layer balance checks passed`);
+  return bad;
+}
+
 registerGroup('unit: render/DrawComposite', checkDrawComposite);
 registerGroup('unit: render/ScrollRectWindow', checkScrollRectWindow);
 registerGroup('unit: render/ScrollRectBake', checkScrollRectBakeInvalidation);
@@ -1245,6 +1285,7 @@ registerGroup('unit: render/SwcJpeg3Alpha', checkSwcJpeg3Alpha);
 registerGroup('unit: render/AirAppFonts', checkAirAppFonts);
 registerGroup('unit: render/SkiaAbi', checkSkiaAbi);
 registerGroup('unit: render/FrameCanvasHygiene', checkFrameCanvasHygiene);
+registerGroup('unit: render/AlphaLayerBalance', checkAlphaLayerBalance);
 
 // ---- SWC symbol classes bound to a PROJECT base class (阶段一百九十一) ---------
 //

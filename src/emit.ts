@@ -21643,6 +21643,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('int clip_on = (o->_clip_path != NULL);');
     this.line('if (clip_on) as_skia_canvas_clip_path(canvas, o->_clip_path, 1);');
     this.line('if (o->alpha < 1.0) as_skia_canvas_save_layer_alpha(canvas, o->alpha);');
+    this.line('int alpha_on = (o->alpha < 1.0);');
     this.line('as_skia_canvas_translate(canvas, o->x, o->y);');
     this.line('as_skia_canvas_rotate(canvas, o->rotation);');
     this.line('as_skia_canvas_scale(canvas, o->scaleX, o->scaleY);');
@@ -21770,6 +21771,15 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (scroll_on) as_skia_canvas_restore(canvas);');
     this.line('if (ct_on) as_skia_canvas_restore(canvas);');
     this.line('if (blend_on) as_skia_canvas_restore(canvas);');
+    // saveLayerAlpha is a save like any other: without this restore the layer (and
+    // the translate/rotate/scale applied after it) stayed in force for the REST of
+    // the frame, so every sibling painted after a半透明 object inherited its
+    // transform and its 50% alpha. In the real app a list row sets itself to
+    // alpha 0.5 on MOUSE_DOWN and never gets the matching MOUSE_UP once a drag
+    // starts (the scrollbar flips mouseChildren off), and every card below the
+    // list was then painted shifted down by that row's position until the list
+    // was rebuilt -- "拖动列表后点刷新，上面的按钮跳下来再恢复".
+    this.line('if (alpha_on) as_skia_canvas_restore(canvas);');
     this.line('as_skia_canvas_restore(canvas);');
     this.indent--;
     this.line('}');

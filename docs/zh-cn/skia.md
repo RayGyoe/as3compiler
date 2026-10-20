@@ -545,6 +545,37 @@ longjmp 会穿过渲染器跳过这些 C 层的 `restore`**，于是「一次 sa
 > 而验证「有没有泄漏」不能只看进入/退出的净差（那对本帧内的 save 不配对天然免疫），要看
 > **帧边界的 `getSaveCount()` 与基矩阵**。
 
+### 6.11 每个对象自己开的图层必须自己关（阶段二百一十四，一个「卡片往下跳」）
+
+§6.10 的帧边界复位只保证**跨帧**不串味；**帧内**的 save/restore 必须由每段代码自己配平。
+`as_render_object` 里给 `alpha < 1` 的对象开了一层 `saveLayerAlpha`，却漏了配对的 restore：
+
+```c
+as_skia_canvas_save(canvas);                       // 对象自己的 save
+if (o->alpha < 1.0) as_skia_canvas_save_layer_alpha(canvas, o->alpha);  // ← 曾经没有配对 restore
+as_skia_canvas_translate(canvas, o->x, o->y);      // 在这之后施加的位移
+...
+if (scroll_on) as_skia_canvas_restore(canvas);
+if (ct_on)     as_skia_canvas_restore(canvas);
+if (blend_on)  as_skia_canvas_restore(canvas);
+as_skia_canvas_restore(canvas);                    // 只够关掉「对象自己的 save」
+```
+
+栈差一格并不报错，但它会**逐层顶替**：子件漏掉的那次 restore 被父对象的那次 restore 吃掉，
+于是父对象自己的 save（以及它 save 之后施加的 `translate/rotate/scale` 与图层 alpha）**继续
+留在画布上**，这一帧之后画的**所有**东西都带着那个父对象的位移。真应用里的链条很短：列表行
+（`AiSubtitleRenderers`）在 `MOUSE_DOWN` 时把 `skin.bg.alpha` 置为 0.5；一拖动列表，滚动条就把
+`viewContainer.mouseChildren = false`，行的 `MOUSE_UP` 再也收不到 ⇒ 那个 0.5 一直留着 ⇒ 该行之后
+的同级（depth 更大的「创建同传」大卡片）全被平移到该行的 y（往下跳一大截），直到列表重建才恢复
+——用户报的「只要拖动过下面的列表，点刷新上面的卡片会跳下来再恢复」。
+
+修法：条件开图层就**记住条件**，在 blend/ct/scrollRect 之后、对象自己的 restore 之前补一次
+`if (alpha_on) as_skia_canvas_restore(canvas);`（restore 顺序必须是 save 的逆序）。发射侧改动，
+与后端无关；`save_layer_paint`/`save_layer_paint_bounds`/`scrollRect` 的配对位置已逐处复核。
+源级钉子：`unit: render/AlphaLayerBalance`（顺带钉住「渲染器里 push 与 pop 数量相等」）；
+像素钉子：`examples/alpha-sibling.as`（半透明子件之后的同级必须留在自己的位置，且第二遍 `draw`
+逐像素相同）。
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

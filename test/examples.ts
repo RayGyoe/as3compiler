@@ -198,6 +198,12 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   'autobake-origin.as': ['--manifest', join(dir, 'autobake-origin.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
+  // alpha-sibling.as（阶段二百一十四）断言「半透明子件不能把父对象的位移留给同帧里
+  // 之后画的东西」：Skia 的 save/restore 是一叠栈，漏一次 restore 会被父对象的 restore
+  // 顶掉，于是半透明兄弟之后的**所有**内容都被平移到它的位置上。真应用里这是「拖列表
+  // 后刷新，上面的卡片跳下来再恢复」。断言是像素（白色画布上蓝块的落点），纯 C 构建
+  // 没有光栅后端（draw 是空桩），故与 draw-over.as 一样链 Skia。
+  'alpha-sibling.as': ['--manifest', join(dir, 'alpha-sibling.build.json')],
   // autosize-metrics.as 断言的是**字体度量**（`textWidth`/`textHeight`/`numLines`）与
   // 「反复 `BitmapData.draw` 后字段宽度不得自噬」，两者都只在 Skia 文本后端下存在，
   // 故与 bakecrisp.as 一样链 Skia（阶段一百六十八的 autoSize/字族兜底回归）。
