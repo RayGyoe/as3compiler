@@ -2463,3 +2463,152 @@ function checkStaticOnlyClassShadowing(): string[] {
 }
 registerGroup('unit: emit/StaticOnlyClassShadowing', checkStaticOnlyClassShadowing);
 
+// The body of a generated C function, located by its exact signature. Used to
+// tell WHERE a call lives (the wrapper or the _impl it delegates to), which a
+// plain includes() cannot express.
+function fnBody(c: string, sig: string): string {
+  const i = c.indexOf(sig);
+  if (i < 0) return '';
+  const j = c.indexOf('\n}', i);
+  return j < 0 ? c.slice(i) : c.slice(i, j + 2);
+}
+
+// Uncaught errors raised from a NATIVE ENTRY POINT must not end the process.
+//
+// The SDL callbacks (mouse/wheel/key), the window RESIZE/CLOSE notifications and
+// the frame clock all run AS3 OUTSIDE any frame, so as_frame_guard is 0 when a
+// handler throws and as_throw's fallback -- exit(1) -- used to fire. On Windows
+// that exit deadlocks in the CRT/ANE DLL-detach teardown, so the process never
+// dies: the window stays on screen and unresponsive. Measured:
+// ShareWindowView.selectItemView threw #1009 (a missing dynamic String method) and
+// the 分享屏幕 window froze as "(未响应)" instead of reporting and carrying on. AIR
+// reports and keeps the player running, so every entry point plants the SAME
+// recovery buffer Stage_dispatchFrame uses -- at most once per thread, never nested.
+//
+// The guard has to be released on EVERY exit path, including the early returns the
+// bodies already had: a guard left planted against a returned stack frame would
+// make every later entry point skip planting (leaving the old, dead buffer armed)
+// and swallow the frame clock's own recovery point. `planted` is read before
+// setjmp and never written after it, so longjmp cannot clobber it.
+function checkEntryPointRecovery(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [entry] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [entry] ${label}`); }
+  };
+  const c = generateC(parse('trace(1);')).c;
+  // (`dispatch` is how this entry point reaches AS3; it must still be here, not
+  // moved into a helper the glue never calls.)
+  const entry = (name: string, sig: string, dispatch: string): void => {
+    const body = fnBody(c, sig);
+    check(`${name} is the function the glue is handed`, body !== '');
+    check(`${name}: plants the recovery buffer in its own frame`,
+      body.includes('int planted = (as_frame_guard == 0);')
+      && body.includes('if (planted && setjmp(as_frame_jmp) != 0)'));
+    check(`${name}: takes the guard`, body.includes('as_frame_guard = 1;'));
+    check(`${name}: still runs the dispatch itself`, body.includes(dispatch));
+    // Every return must release the guard: either the recovery line itself, or an
+    // explicit `if (planted) as_frame_guard = 0;` immediately before it.
+    const lines = body.split('\n');
+    const unguarded = lines.filter((l, k) => /\breturn\b/.test(l)
+      && !l.includes('as_frame_guard = 0')
+      && !(lines[k - 1] || '').includes('if (planted) as_frame_guard = 0;'));
+    check(`${name}: releases the guard on every exit path`, unguarded.length === 0);
+    if (unguarded.length > 0) console.log('      (unguarded: ' + unguarded.map((s) => s.trim()).join(' | ') + ')');
+  };
+  entry('ASC_window_on_mouse',
+    'static void ASC_window_on_mouse(int id, double x, double y, const char* type) {',
+    'Stage_dispatchMouse(');
+  entry('ASC_window_on_wheel',
+    'static void ASC_window_on_wheel(int id, double x, double y, double delta) {',
+    'Stage_dispatchWheel(');
+  entry('ASC_window_on_key',
+    'static void ASC_window_on_key(int id, const char* type, int keyCode, int charCode, int mod) {',
+    'Stage_dispatchKey(');
+  entry('ASC_window_on_frame',
+    'static void ASC_window_on_frame(int id) {',
+    'Stage_dispatchFrame(');
+  entry('ASC_window_on_resize',
+    'static void* ASC_window_on_resize(int id, int lw, int lh, int pw, int ph, double scale) {',
+    'EventDispatcher_dispatchEvent(');
+  entry('ASC_window_on_close',
+    'static void ASC_window_on_close(int id) {',
+    'EventDispatcher_dispatchEvent(');
+
+  // A resize that throws must still hand the glue a surface. It keeps the OLD one
+  // when the callback answers NULL -- and by then this function has already freed
+  // that surface and installed the replacement, so NULL would be a use-after-free.
+  check('a resize that throws still hands back the NEW surface',
+    fnBody(c, 'static void* ASC_window_on_resize(int id, int lw, int lh, int pw, int ph, double scale) {')
+      .includes('return (w != NULL) ? w->surface : NULL;'));
+  // A close that throws must still detach the object, or a later window that
+  // reuses this id inherits a stale NativeWindow pointing at it.
+  const closeBody = fnBody(c, 'static void ASC_window_on_close(int id) {');
+  check('a close that throws still detaches the window slot',
+    closeBody.includes('as_disp_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return;'));
+  // The callbacks are handed to the native layer by these exact names, so no
+  // _impl/body split may reappear: both halves would have to be installed, and a
+  // missed rename leaves the window with a dead handler.
+  check('no entry point is split into a helper the glue does not know about',
+    !/_impl\b/.test(c.slice(c.indexOf('static void ASC_window_on_mouse('), c.indexOf('static double ASC_window_on_frame_delay('))));
+  console.log(`     [entry] ${ok} entry-point recovery check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/EntryPointRecovery', checkEntryPointRecovery);
+
+// A String reached through a * / Object slot dispatches on a DIFFERENT table from
+// a statically typed one (as_any_call -> as_str_dyn_call). Two of AVM2's String
+// methods are implemented in AS3 rather than native (core/String.as:
+// `prototype.toLowerCase = prototype.toLocaleLowerCase = ...`, same pairing for
+// toUpperCase), and four more are ordinary members, so the dynamic table has to
+// carry all of them:
+//
+//   var d:Object = { name: "WPS" };
+//   var n:String = d.name.toLocaleLowerCase();   // was null -> #1009 on n.indexOf
+//
+// That exact pair of lines is ShareWindowView.selectItemView in talkmed-meeting,
+// and the #1009 it raised is what froze the 分享屏幕 window. An unknown name still
+// answers null (the documented as_dyn_call contract), so a MISSING method is
+// silent -- which is why the whole surface is pinned here, not just the two that
+// bit us.
+function checkDynamicStringMethods(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [dynstr] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [dynstr] ${label}`); }
+  };
+  const c = generateC(parse("trace(1);")).c;
+  const body = fnBody(c, "static as_value as_str_dyn_call(char* s, const char* name, as_value* args, int argc) {");
+  check("the dynamic string dispatch table exists", body !== "");
+  const has = (m: string): boolean => body.includes(`strcmp(name, "${m}") == 0`);
+  // The two locale aliases must map to the PLAIN helpers, exactly as AVM2 does
+  // (a separate locale table would diverge the moment one side changed).
+  check("toLocaleLowerCase is dispatched", has("toLocaleLowerCase"));
+  check("...to the plain lowercase helper",
+    body.includes('strcmp(name, "toLocaleLowerCase") == 0) return as_v_str(as_str_toLower(s));'));
+  check("toLocaleUpperCase is dispatched", has("toLocaleUpperCase"));
+  check("...to the plain uppercase helper",
+    body.includes('strcmp(name, "toLocaleUpperCase") == 0) return as_v_str(as_str_toUpper(s));'));
+  check("concat is dispatched", has("concat"));
+  check("...folding every argument through as_str_concat",
+    body.includes("r = as_str_concat(r, as_v_str_val(args[i]));"));
+  check("localeCompare is dispatched", has("localeCompare"));
+  check("...through as_str_localeCompare", body.includes("as_str_localeCompare(s,"));
+  check("startsWith is dispatched", has("startsWith"));
+  check("endsWith is dispatched", has("endsWith"));
+  // The rest of the ES3 surface that was already there must stay (a rewrite of
+  // the table that dropped one would be just as fatal as a missing locale alias).
+  for (const m of ["charAt", "charCodeAt", "indexOf", "lastIndexOf", "slice", "split",
+                   "substr", "substring", "toLowerCase", "toUpperCase", "match",
+                   "replace", "search", "toString", "valueOf"]) {
+    check(`the pre-existing ${m} dispatch survives`, has(m));
+  }
+  console.log(`     [dynstr] ${ok} dynamic String dispatch check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/DynamicStringMethods', checkDynamicStringMethods);
+
+
+

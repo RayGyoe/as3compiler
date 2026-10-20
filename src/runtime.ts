@@ -6090,14 +6090,23 @@ static void as_jmp_pop(void) {
     // Push/pop sites are balanced, but a stray pop must never go negative.
     if (as_jmp_depth > 0) as_jmp_depth--;
 }
-// Frame-boundary recovery for an UNCAUGHT error. AIR does not terminate the
-// process on an uncaught error -- it reports it and keeps running, so one bad
-// listener costs its own dispatch rather than the whole application. (Calling
-// exit(1) here instead used to strand the process: with 50+ live threads the
-// native teardown deadlocks in CEF/ANE DLL-detach, which is what a Windows AOT
-// build did on the very first uncaught #1009.) Stage_dispatchFrame plants this
-// jmp_buf; longjmp'ing to it gives AIR's behaviour. With no frame on the stack
-// (a non-GUI program, or an error before the first frame) exit(1) still applies.
+// Recovery point for an UNCAUGHT error. AIR does not terminate the process on an
+// uncaught error -- it reports it and keeps running, so one bad listener costs its
+// own dispatch rather than the whole application. (Calling exit(1) here instead
+// used to strand the process: with 50+ live threads the native teardown deadlocks
+// in CEF/ANE DLL-detach, which is what a Windows AOT build did on the very first
+// uncaught #1009 → the window stayed visible and unresponsive instead of dying.)
+//
+// EVERY entry point that runs AS3 code plants this jmp_buf, not just the frame:
+//   Stage_dispatchFrame              the frame clock itself
+//   ASC_window_on_mouse/_wheel/_key  SDL callbacks, which run OUTSIDE any frame
+//   ASC_window_on_frame              the per-window sweep (NativeWindow events) + frame
+//   ASC_window_on_resize/_close      the window-manager notifications the glue sends
+// Each one checks as_frame_guard before setjmp'ing, so exactly ONE guard stands per
+// thread and a nested entry reuses the outer buffer. Every exit path of those
+// functions clears the guard again (a guard left planted against a returned stack
+// frame would silently disable all later recovery). With no guard at all (a
+// non-GUI program, or an error before the first window exists) exit(1) applies.
 static ASC_TLS jmp_buf as_frame_jmp;
 static ASC_TLS int as_frame_guard = 0;
 

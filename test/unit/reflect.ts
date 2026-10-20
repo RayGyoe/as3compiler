@@ -146,14 +146,19 @@ function checkPropBoxing(): string[] {
   return bad;
 }
 
-// ---- uncaught errors are recovered at the FRAME BOUNDARY ------------------
+// ---- uncaught errors are recovered at every ENTRY POINT ------------------
 //
 // AIR reports an uncaught error and keeps running; the runtime called exit(1)
 // instead, which tore down 50+ threads through CEF and the ANE DLLs and left the
 // process hung (0% CPU, no window) -- the first uncaught #1009 froze the whole
-// app. The guard is only ever planted by the OUTERMOST frame, and only in a GUI
-// build: with no frame active the historical exit(1) path is unchanged, so the
-// non-GUI test behaviour (examples, --run) is byte-for-byte the same.
+// app. The guard is planted by the OUTERMOST frame AND by the input/native
+// entry points, because those run AS3 with no frame above them: SDL delivers a
+// mouse click from its own event loop, so a #1009 raised in a click handler had
+// as_frame_guard == 0 and reached exit(1) -- measured: ShareWindowView's screen
+// list froze the window on click. Planting is per thread and never nested (a
+// nested setjmp would re-arm the buffer the outer frame still needs).
+// With nothing armed (console programs, --run) the historical exit(1) path is
+// unchanged, so the non-GUI test behaviour is byte-for-byte the same.
 function checkFrameErrorRecovery(): string[] {
   let ok = 0;
   const bad: string[] = [];
@@ -190,8 +195,16 @@ function checkFrameErrorRecovery(): string[] {
     body.includes('as_frame_guard = 0; as_disp_depth = 0; return;'));
   check('the frame releases the buffer when it returns normally',
     body.includes('if (_fguard) as_frame_guard = 0;'));
-  check('the buffer is planted once per frame, not per dispatch',
-    c.split('setjmp(as_frame_jmp)').length - 1 === 1);
+  // One plant per ENTRY POINT, and none inside the event machinery: a setjmp in
+  // as_dispatchEvent would be per dispatch (defeating the frame's single
+  // recovery point) and would unwind out of a listener rather than out of the
+  // frame. So the count is exactly 1 (Stage_dispatchFrame) + 6 (mouse, wheel,
+  // key, frame clock, resize, close -- every callback the native layer can call
+  // back into AS3 through).
+  check('the buffer is planted once per entry point, not per dispatch',
+    c.split('setjmp(as_frame_jmp)').length - 1 === 7);
+  check('...and never inside the event-dispatch machinery',
+    !/static void as_dispatchEvent[\s\S]{0,4000}setjmp\(as_frame_jmp\)/.test(c));
 
   console.log(`[frameguard] ${ok} frame-error recovery checks passed`);
   return bad;

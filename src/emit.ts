@@ -9795,6 +9795,45 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (strcmp(name, "split") == 0) return as_v_arr((void*)as_str_split(s, as_v_str_val(args[0])));');
     this.line('if (strcmp(name, "toUpperCase") == 0) return as_v_str(as_str_toUpper(s));');
     this.line('if (strcmp(name, "toLowerCase") == 0) return as_v_str(as_str_toLower(s));');
+    // AVM2 implements the locale aliases with the plain methods themselves --
+    // core/String.as: `prototype.toLowerCase = prototype.toLocaleLowerCase = ...`
+    // and the same pairing for toUpperCase. Missing them here is not a silent
+    // miss: the call fell through to as_v_null(), the String-typed slot then held
+    // NULL, and the next `name.indexOf(...)` (emitted with the #1009 null-receiver
+    // guard) threw "Error #1009" out of ShareWindowView.selectItemView. AIR runs
+    // that exact line (sourceName.toLocaleLowerCase()) and matches "wps office".
+    this.line('if (strcmp(name, "toLocaleLowerCase") == 0) return as_v_str(as_str_toLower(s));');
+    this.line('if (strcmp(name, "toLocaleUpperCase") == 0) return as_v_str(as_str_toUpper(s));');
+    // concat(...args) folds the receiver with each argument in order, exactly like
+    // the static path's as_str_concat_n; as_str_concat substitutes "null" for a
+    // NULL part (ES3 ToString(null)), so a null argument cannot strlen(NULL).
+    this.line('if (strcmp(name, "concat") == 0) {');
+    this.indent++;
+    this.line('char* r = s;');
+    this.line('for (int i = 0; i < argc; i++) r = as_str_concat(r, as_v_str_val(args[i]));');
+    this.line('return as_v_str(r);');
+    this.indent--;
+    this.line('}');
+    // localeCompare/startsWith/endsWith take `other:*`, so the argument is a
+    // boxed value that must be stringified the same way the static path does.
+    this.line('if (strcmp(name, "localeCompare") == 0) {');
+    this.indent++;
+    this.line('const char* o = argc >= 1 ? as_v_str_val(args[0]) : "undefined";');
+    this.line('return as_v_num((double)as_str_localeCompare(s, o == NULL ? "null" : o));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(name, "startsWith") == 0) {');
+    this.indent++;
+    this.line('const char* o = argc >= 1 ? as_v_str_val(args[0]) : "undefined";');
+    this.line('return as_v_bool(as_str_startsWith(s, o == NULL ? "null" : o));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(name, "endsWith") == 0) {');
+    this.indent++;
+    this.line('const char* o = argc >= 1 ? as_v_str_val(args[0]) : "undefined";');
+    this.line('return as_v_bool(as_str_endsWith(s, o == NULL ? "null" : o));');
+    this.indent--;
+    this.line('}');
     this.line('if (strcmp(name, "toString") == 0 || strcmp(name, "valueOf") == 0) return as_v_str(s);');
     this.line('return as_v_null();');
     this.indent--;
@@ -20710,9 +20749,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('(void)_this;');
     // Uncaught-error recovery point. AIR does not kill the process on an uncaught
     // error -- it reports it and the loop carries on (see as_frame_jmp in the
-    // preamble). Only the OUTERMOST frame plants the buffer, so a nested frame
+    // preamble). Only the OUTERMOST entry plants the buffer, so a nested frame
     // cannot leave it pointing at a stack that has already returned; _fguard keeps
-    // the pairing exact on both the normal return and the longjmp path.
+    // the pairing exact on both the normal return and the longjmp path. The input
+    // and window-sweep entry points plant the same buffer (ASC_window_on_*), which
+    // is why this one checks the flag first instead of assuming it is free.
     this.line('int _fguard = 0;');
     this.line('if (as_frame_guard == 0) { if (setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; } _fguard = 1; as_frame_guard = 1; }');
     // Frame-boundary GC safe point: all user frame callbacks have returned, so
@@ -22850,13 +22891,30 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_window_set_cursor(id, kind);');
     this.indent--;
     this.line('}');
+    // ---- native entry points: uncaught-error recovery ----
+    // These callbacks run AS3 *outside* any frame, so as_frame_guard is 0 when a
+    // handler throws and as_throw's fallback (exit(1)) used to fire. On Windows
+    // that exit deadlocks in the CRT/ANE DLL-detach teardown, so the process never
+    // died and its window just sat there as "(未响应)" -- measured:
+    // ShareWindowView.selectItemView threw #1009 and the 分享屏幕 window froze
+    // instead of reporting. AIR reports the error and keeps the player running, so
+    // each entry point plants the SAME recovery point Stage_dispatchFrame uses: one
+    // buffer per thread, and only when no frame already holds it (setjmp has to run
+    // in THIS frame; a longjmp into an outer one would skip this function's work).
+    // `planted` is read before setjmp and never written after it, so longjmp cannot
+    // clobber it, and the release is exact -- these bodies have early returns, and a
+    // guard left planted against a returned stack frame would disable every later
+    // recovery.
     this.line('static void ASC_window_on_mouse(int id, double x, double y, const char* type) {');
     this.indent++;
+    this.line('int planted = (as_frame_guard == 0);');
+    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('as_frame_guard = 1;');
     // SDL reports mouse coordinates in logical *window* points, so they must be
     // mapped back through the align offset and the content scale before they mean
     // anything in stage coordinates. Under NO_SCALE + TOP_LEFT this is the identity.
     this.line('ASCWin* w = ASC_w(id);');
-    this.line('if (w == NULL || w->stage == NULL) return;');
+    this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
     // Reserved type sent by the glue when the pointer leaves the window
     // (SDL_WINDOWEVENT_LEAVE): AIR rolls the roll-over state back to up and dispatches
     // mouseOut/rollOut on the hovered object followed by "mouseLeave" on the STAGE,
@@ -22866,6 +22924,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (strcmp(type, "mouseLeave") == 0) {');
     this.indent++;
     this.line('Stage_dispatchMouse((void*)w->stage, 0.0, 0.0, (char*)type);');
+    this.line('if (planted) as_frame_guard = 0;');
     this.line('return;');
     this.indent--;
     this.line('}');
@@ -22898,6 +22957,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('drag_anchor = -1;');
     this.indent--;
     this.line('}');
+    this.line('if (planted) as_frame_guard = 0;');
     this.line('return;');
     this.indent--;
     this.line('}');
@@ -22921,22 +22981,34 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('void* hit = as_pick_hit((void*)w->stage, sx, sy);');
     this.line('int dce = (hit != NULL && as_is(hit, &InteractiveObject_vt)) ? ((InteractiveObject*)hit)->doubleClickEnabled : 0;');
     this.line('Stage_dispatchMouse((void*)w->stage, sx, sy, dce ? (char*)"doubleClick" : (char*)"click");');
+    this.line('if (planted) as_frame_guard = 0;');
     this.line('return;');
     this.indent--;
     this.line('}');
     this.line('Stage_dispatchMouse((void*)w->stage, sx, sy, (char*)type);');
     // The pointer shape is sampled AFTER the dispatch so a listener that sets
     // Mouse.cursor (or toggles selectable) is reflected on the very same event.
+    // The pointer shape is sampled AFTER the dispatch so a listener that sets
+    // Mouse.cursor (or toggles selectable) is reflected on the very same event.
+    // The guard is released first: only native code runs past this point, so the
+    // recovery frame is not needed here -- and keeping the sample as the LAST
+    // statement is what unit: display/TransformMatrix pins.
+    this.line('if (planted) as_frame_guard = 0;');
     this.line('if (strcmp(type, "mouseMove") == 0 || strcmp(type, "mouseDown") == 0) ASC_window_update_cursor(id, sx, sy);');
     this.indent--;
     this.line('}');
+    // Same recovery point as ASC_window_on_mouse (see the comment there).
     this.line('static void ASC_window_on_wheel(int id, double x, double y, double delta) {');
     this.indent++;
+    this.line('int planted = (as_frame_guard == 0);');
+    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
-    this.line('if (w == NULL || w->stage == NULL) return;');
+    this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
     this.line('double sx = (x - w->ox) / w->cx;');
     this.line('double sy = (y - w->oy) / w->cy;');
     this.line('Stage_dispatchWheel((void*)w->stage, sx, sy, delta);');
+    this.line('if (planted) as_frame_guard = 0;');
     this.indent--;
     this.line('}');
     // Keyboard transport: the glue has already turned SDL's keysym into AIR's
@@ -22944,8 +23016,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // AS3 side (which is where focus decides the target).
     this.line('static void ASC_window_on_key(int id, const char* type, int keyCode, int charCode, int mod) {');
     this.indent++;
+    this.line('int planted = (as_frame_guard == 0);');
+    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
-    this.line('if (w == NULL || w->stage == NULL) return;');
+    this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
     // Composed text rides the key channel under this reserved type (window_glue.cc
     // sk_key_cb): the bytes come from SDL_TEXTINPUT, so Option/dead-key composition
     // and non-US layouts deliver the same text adl would. Everything else is a
@@ -22954,6 +23029,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('char buf[256];');
     this.line('if (sk_window_text_take(id, buf, (int)sizeof(buf)) > 0) Stage_dispatchText((void*)w->stage, buf);');
+    this.line('if (planted) as_frame_guard = 0;');
     this.line('return;');
     this.indent--;
     this.line('}');
@@ -22974,6 +23050,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('sk_window_set_text_input_rect(id, w->ox + ASC_ime_roi[0] * w->cx, w->oy + ASC_ime_roi[1] * w->cy, (ASC_ime_roi[2] - ASC_ime_roi[0]) * w->cx, (ASC_ime_roi[3] - ASC_ime_roi[1]) * w->cy);');
     this.indent--;
     this.line('}');
+    this.line('if (planted) as_frame_guard = 0;');
     this.line('return;');
     this.indent--;
     this.line('}');
@@ -22981,6 +23058,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // NOTE: the repaint request is raised by the GLUE (WinCtx.dirty, like mouse
     // events do) rather than here — the generated ASCWin has no `dirty` field;
     // dirty state belongs to the window backend, not to the AS3-visible window.
+    this.line('if (planted) as_frame_guard = 0;');
     this.indent--;
     this.line('}');
     this.line('static void ASC_window_on_redraw(int id) { ASC_window_render(id); }');
@@ -23013,10 +23091,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // registry — after which every window repaints its own stage separately.
     // `id` only names the window that happens to hold the clock; Stage_dispatchFrame
     // is an application-wide broadcast and ignores its argument.
+    // The frame callback is the widest entry point: ASC_win_poll below fires the
+    // NativeWindow events (resize/move/activate/displayStateChange) BEFORE
+    // Stage_dispatchFrame plants its own guard, so a listener that threw there had
+    // the same exit(1)/freeze fate as an input handler. Planting here covers the
+    // poll sweep and the frame in one place; Stage_dispatchFrame then sees the
+    // guard already held and does not plant a second one.
     this.line('static void ASC_window_on_frame(int id) {');
     this.indent++;
+    this.line('int planted = (as_frame_guard == 0);');
+    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
-    this.line('if (w == NULL) return;');
+    this.line('if (w == NULL) { if (planted) as_frame_guard = 0; return; }');
     // Report anything the window manager did to ANY window since the last frame
     // (moved, resized, focused, lost focus, changed display state, asked to close)
     // BEFORE the frame runs, so a listener that reacts by re-laying out sees a
@@ -23029,6 +23116,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) ASC_win_poll(i);');
     this.line('ASC_dispatch_vsync_event(id, (void*)w->stage);');
     this.line('Stage_dispatchFrame((void*)w->stage);');
+    this.line('if (planted) as_frame_guard = 0;');
     this.indent--;
     this.line('}');
     // The application frame rate drives the one cadence: 1000/frameRate ms per
@@ -23072,10 +23160,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // (macOS contentsScaleFactor); use it verbatim — do NOT re-derive pw/lw here,
     // which can be stale while the window straddles two displays with different
     // backing scales (Retina 2x vs external 1x).
+    // ...and it runs AS3 (the RESIZE listeners), so it is an entry point too: see
+    // the wrapper below for why every such point needs the recovery guard.
     this.line('static void* ASC_window_on_resize(int id, int lw, int lh, int pw, int ph, double scale) {');
     this.indent++;
+    this.line('int planted = (as_frame_guard == 0);');
     this.line('ASCWin* w = ASC_w(id);');
-    this.line('if (w == NULL || lw <= 0 || lh <= 0 || pw <= 0 || ph <= 0) return NULL;');
+    // On recovery the glue still needs a surface: it keeps the old one only when the
+    // callback hands back NULL, and by then this function has already freed it and
+    // installed the replacement in w->surface. `w` is assigned before setjmp and
+    // never after, so longjmp cannot clobber it.
+    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return (w != NULL) ? w->surface : NULL; }');
+    this.line('as_frame_guard = 1;');
+    this.line('if (w == NULL || lw <= 0 || lh <= 0 || pw <= 0 || ph <= 0) { if (planted) as_frame_guard = 0; return NULL; }');
     this.line('if (scale <= 0.0) scale = 1.0;');
     this.line('#ifdef ASC_RENDER_WINGPU');
     // GPU window: there is no persistent surface to rebuild — the frame canvas is
@@ -23094,6 +23191,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('EventDispatcher_dispatchEvent((void*)w->stage, Event_new((char*)"resize", false, false));');
     this.indent--;
     this.line('}');
+    this.line('if (planted) as_frame_guard = 0;');
     this.line('return NULL;');
     this.indent--;
     this.line('}');
@@ -23101,7 +23199,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (w->surface != NULL) as_skia_surface_delete(w->surface);');
     this.line('w->surface = NULL; w->canvas = NULL;');
     this.line('void* s = as_skia_surface_new(pw, ph);');
-    this.line('if (s == NULL) return NULL;');
+    this.line('if (s == NULL) { if (planted) as_frame_guard = 0; return NULL; }');
     this.line('w->surface = s;');
     this.line('w->canvas = as_skia_surface_canvas(s);');
     this.line('w->lw = lw; w->lh = lh; w->pw = pw; w->ph = ph;');
@@ -23116,6 +23214,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // AIR fires Event.RESIZE on the stage after the new size is in effect, so an
     // app that relayouts on resize (the NO_SCALE idiom) sees the updated values.
     this.line('if (w->stage != NULL) EventDispatcher_dispatchEvent((void*)w->stage, Event_new((char*)"resize", false, false));');
+    this.line('if (planted) as_frame_guard = 0;');
     this.line('return s;');
     this.indent--;
     this.line('}');
@@ -23123,17 +23222,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // the close button). This is the point where AIR's `closed` flips to true and
     // Event.CLOSE is dispatched: close() only REQUESTS teardown, which is why
     // reading `closed` immediately afterwards still says false under adl.
-    this.line('static void ASC_window_on_close(int id) {');
-    this.indent++;
-    this.line('ASCWin* w = ASC_w(id);');
-    this.line('if (w == NULL) return;');
-    this.line('w->closed = 1;');
-    this.line('if (w->surface != NULL) { as_skia_surface_delete(w->surface); w->surface = NULL; w->canvas = NULL; }');
-    this.line('if (w->window != NULL) {');
-    this.indent++;
-    this.line('EventDispatcher_dispatchEvent(w->window, Event_new((char*)"close", false, false));');
-    this.indent--;
-    this.line('}');
+    //
+    // The dispatch runs AS3, so the wrapper below plants the recovery point: a
+    // CLOSE listener that throws must still leave the object detached (see the
+    // note further down), which is why the recovery path repeats those three
+    // lines instead of skipping them.
     // Detach the object from the slot it was using. The backend frees the id the
     // moment the window is gone, so the NEXT window may be given this very id --
     // and every NativeWindow accessor addresses its window through `_win`, so a
@@ -23143,14 +23236,29 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // "focus jumps to the other window instead of opening this one" report).
     // AIR keeps `closed` true for the rest of the object's life and no call on a
     // closed window has any effect, so -1 makes every accessor a no-op. `stage`
-    // and `window` are cleared below for the slot's own bookkeeping.
+    // and `window` are cleared for the slot's own bookkeeping. Slot 0 (the initial
+    // window) has no NativeWindow object -- `window` is NULL there and the slot is
+    // simply cleared. Dropping the reference also matters for GC: the id may be
+    // handed out again and must not keep this object alive through
+    // gc_mark_user_roots.
+    this.line('static void ASC_window_on_close(int id) {');
+    this.indent++;
+    this.line('int planted = (as_frame_guard == 0);');
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL) { if (planted) as_frame_guard = 0; return; }');
+    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return; }');
+    this.line('as_frame_guard = 1;');
+    this.line('w->closed = 1;');
+    this.line('if (w->surface != NULL) { as_skia_surface_delete(w->surface); w->surface = NULL; w->canvas = NULL; }');
+    this.line('if (w->window != NULL) {');
+    this.indent++;
+    this.line('EventDispatcher_dispatchEvent(w->window, Event_new((char*)"close", false, false));');
+    this.indent--;
+    this.line('}');
     this.line('if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1;');
     this.line('w->stage = NULL;');
-    // Drop the NativeWindow reference: the glue has already freed its side, so the
-    // id may be handed out again and must not keep this object alive through
-    // gc_mark_user_roots. Slot 0 (the initial window) has no NativeWindow object —
-    // `window` stays NULL there and the slot is simply cleared.
     this.line('w->window = NULL;');
+    this.line('if (planted) as_frame_guard = 0;');
     this.indent--;
     this.line('}');
     // Stage.nativeWindow: the NativeWindow the stage is drawn in. The window table
