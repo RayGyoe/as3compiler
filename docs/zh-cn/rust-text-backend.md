@@ -368,7 +368,8 @@ codegen-units = 1
 | # | 优势 | 量级 / 证据 | 适用端 |
 |---|---|---|---|
 | A1 | **砍掉 ICU 数据块** | 9.71 MB 单对象，见 §2.2 | 全端 |
-| A2 | **砍掉 skunicode + harfbuzz + skshaper + paragraph** | 合计约 3.4 MB（18.53 − 5.43 − 9.71） | 全端 || A3 | **纯 Rust 无 C++ 依赖** | 消除 `SK_TRIVIAL_ABI` / `-std=c++17` / MSVC ABI 互链等约束（`html5-web.md` §5.1、`provision/README.md`） | 全端 |
+| A2 | **砍掉 skunicode + harfbuzz + skshaper + paragraph** | 合计约 3.4 MB（18.53 − 5.43 − 9.71） | 全端 |
+| A3 | **纯 Rust 无 C++ 依赖** | 消除 `SK_TRIVIAL_ABI` / `-std=c++17` / MSVC ABI 互链等约束（`html5-web.md` §5.1、`provision/README.md`） | 全端 |
 | A4 | **静态库形态适配移动端** | iOS 无 `dlopen`，静态链是唯一形态 | iOS / Android |
 | A5 | **整形语义同源** | `rustybuzz` 是 HarfBuzz 的 Rust 移植 ⇒ 迁移风险低于换一门新整形器 | 全端 |
 | A6 | **单一引擎跨全端** | 现在 macOS/Windows/web 是**三套**字体管理器 + 两条整形路径 | 全端 |
