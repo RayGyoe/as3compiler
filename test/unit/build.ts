@@ -15,6 +15,7 @@ import { airManifest, prepareAirApp, parseAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import { generateXcodeProject } from '../../src/xcode-project.ts';
 import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, currentAnePlatform, parseExtensionXml, resolveAneDescriptors, resolveExtensionPackages } from '../../src/ane.ts';
 import type { AneResolution } from '../../src/ane.ts';
 import { ANE_COUNT_MAX } from '../../src/fre.ts';
@@ -569,6 +570,15 @@ function checkAneHostLayout(): string[] {
   const gitignore = readFileSync(join(root, '.gitignore'), 'utf8');
   check('.gitignore re-includes the hand-written lib/*.c sources',
     /^!lib\/\*\.c$/m.test(gitignore));
+  // 阶段二百一十: two per-machine snapshots stopped being tracked. The Xcode sidecar
+  // holds ABSOLUTE paths and its merge REMOVES files it no longer recognises, so a
+  // committed copy would delete other machines' entries; the xcuserdata tree is Xcode
+  // IDE state with the developer's username in the directory name. Both are pinned as
+  // ignore rules because "someone re-adds the file with git add -f" is otherwise silent.
+  check('.gitignore ignores the generated Xcode sidecar (absolute paths, not an input)',
+    /^examples\/\*\*\/\.as3aot-managed\.json$/m.test(gitignore));
+  check('.gitignore ignores Xcode per-user IDE state',
+    /^\*\*\/xcuserdata\/$/m.test(gitignore) && /^\*\.xcuserstate$/m.test(gitignore));
 
   // (d) build-asaot.bat must build BOTH widths by default. A build's host width is
   //     chosen by --ane-platform, not by the machine that happens to run the script,
@@ -607,6 +617,26 @@ function checkAneHostLayout(): string[] {
     // when the file has bare LF, and this script relies on it for the clang line.
     check('build-asaot.bat keeps CRLF line endings',
       bat.includes('\r\n') && !/(?<!\r)\n/.test(bat));
+    // (f) The ARTIFACT guards (阶段二百一十). build-asaot.sh always asserted the
+    //     artifact -- the entry point, the export count, and "no Adobe AIR" --
+    //     while the .bat asserted only the import library. A host library with the
+    //     right name but the wrong contents builds and links cleanly here and only
+    //     explodes later, when some extension is loaded, so the .bat now runs the
+    //     same three probes. Pinned one guard at a time rather than as "the two
+    //     files look alike", because the failure mode is precisely one end going
+    //     its own way.
+    // (A `dumpbin` INVOCATION is what is pinned absent -- the header comment
+      //  mentioning it while explaining why it is not used is fine, and matching
+      //  the bare word here would fail on that comment.)
+    check('the bat inspects the built DLL with llvm-objdump (no VS prompt needed)',
+      /^llvm-objdump -p .*?asaot\.dll/m.test(bat) && !/^dumpbin/m.test(bat));
+    check('the bat asserts the DLL exports asaot_bind',
+      /findstr \/c:"asaot_bind"/.test(bat));
+    check('the bat asserts the 53-export count (exactly, not "at least")',
+      /if not "%EXPORTS%"=="53"/.test(bat));
+    check('the bat asserts the DLL does NOT import Adobe AIR.dll',
+      /findstr \/i \/c:"Adobe AIR\.dll"/.test(bat)
+      && /still imports Adobe AIR\.dll/.test(bat));
   }
 
   // (e) A flag that parses but is absent from --help is a hole in the documented
@@ -1011,6 +1041,64 @@ function checkDocumentedLinkSets(): string[] {
   return bad;
 }
 
+// ---- --package xcode-project flag parity (raw link == .app link) ----
+//
+// The generated .xcodeproj is a SECOND build of the same C: if it does not carry
+// the exact flags the raw `cc` path carries, the same manifest compiles into two
+// different programs with no warning (§1.5). Three are load-bearing and pinned
+// here: -ffp-contract=off (SEMANTIC — one IEEE rounding per AS3 op, not a perf
+// knob, so an .app built by Xcode must have it too), -liconv on macOS (the
+// generated C references iconv_* unconditionally under AS_HAVE_ICONV), and the
+// feature macros from effectiveDefines (--features svg -> ASC_USE_SVG=1).
+function checkXcodeProjectParity(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [xcode] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [xcode] ${label}`); }
+  };
+
+  // Scratch dir under temp/ (gitignored): generate a real project from a tiny
+  // stub .c and read back project.pbxproj, using the shipped generator rather
+  // than grepping xcode-project.ts (what matters is the emitted project).
+  const outDir = join(root, 'temp', 'unit-xcode-parity');
+  rmSync(outDir, { recursive: true, force: true });
+  mkdirSync(outDir, { recursive: true });
+  const cPath = join(outDir, 'Parity.c');
+  writeFileSync(cPath, 'int main(void) { return 0; }\n');
+  // --features svg is native-only, which is exactly the target xcode-project builds.
+  const cfg: BuildConfig = { ...defaultBuildConfig(), package: 'xcode-project', features: ['svg'] };
+  const proj = generateXcodeProject(cfg, cPath, outDir, 'Parity');
+  const pbx = readFileSync(join(proj.projectPath, 'project.pbxproj'), 'utf8');
+
+  // Read each build-setting block back so "present somewhere" cannot pass for
+  // "present on the right surface": fpFlags must be on BOTH the compile
+  // (OTHER_CFLAGS) and link (OTHER_LDFLAGS) lists, or the .app rounds differently
+  // than the raw single-command build does. GCC_PREPROCESSOR_DEFINITIONS appears
+  // twice (the project-wide "$(inherited)" block first, then the per-target one),
+  // so join every occurrence rather than trusting the first.
+  const blocksOf = (key: string): string =>
+    [...pbx.matchAll(new RegExp(`${key} = \\(([\\s\\S]*?)\\);`, 'g'))].map((m) => m[1]).join('\n');
+  const cflags = blocksOf('OTHER_CFLAGS');
+  const ldflags = blocksOf('OTHER_LDFLAGS');
+  const defines = blocksOf('GCC_PREPROCESSOR_DEFINITIONS');
+
+  check('the raw compile surface is present (OTHER_CFLAGS is emitted)', pbx.includes('OTHER_CFLAGS = ('));
+  check('the project disables FP contraction on the COMPILE step (-ffp-contract=off)',
+    cflags.includes('"-ffp-contract=off"'));
+  check('…and on the LINK step (OTHER_LDFLAGS), matching the raw single command',
+    ldflags.includes('"-ffp-contract=off"'));
+  if (process.platform === 'darwin') {
+    check('macOS: the project links the runtime iconv (-liconv), like the raw link',
+      ldflags.includes('"-liconv"'));
+  }
+  check('a --features macro reaches GCC_PREPROCESSOR_DEFINITIONS (ASC_USE_SVG=1)',
+    defines.includes('"ASC_USE_SVG=1"'));
+
+  if (ok > 0) console.log(`[xcode] ${ok} xcode-project parity checks passed`);
+  return bad;
+}
+
 registerGroup('unit: build/ManifestLayering', checkManifestLayering);
 registerGroup('unit: build/PreloadExcludes', checkPreloadExcludes);
 registerGroup('unit: build/PreloadOutputDir', checkPreloadOutputDir);
@@ -1021,6 +1109,7 @@ registerGroup('unit: build/WasmExport', checkWasmExport);
 registerGroup('unit: build/AneHostLayout', checkAneHostLayout);
 registerGroup('unit: build/WindowsArch', checkWindowsArch);
 registerGroup('unit: build/DocumentedLinkSets', checkDocumentedLinkSets);
+registerGroup('unit: build/XcodeProjectParity', checkXcodeProjectParity);
 registerGroup('unit: air-app/DescriptorComments', checkAirAppDescriptorComments);
 
 // --- ANE extension.xml: comments must not shadow (or invent) declarations -----
@@ -1656,6 +1745,35 @@ function checkAneHostLibrary(): string[] {
     && a.includes('"$EX/ext-aot" "$EX/../ane-app/ext-aot"'));
   check('...and refuses to stage unless the descriptor declares its platform key',
     a.includes(String.raw`<platform name=\"$PLAT\">`));
+
+  // 阶段二百一十: the same two PRE-checks on the Windows recipe. The macOS .sh had
+  // them first and the .bat had neither, so a descriptor missing its platform entry
+  // was staged silently on Windows and only the packaging step complained. Both ends
+  // are pinned here -- the cross-platform rule is "one fix, all branches", and a
+  // guard that lives on one end only is exactly the defect shape it exists for.
+  const aniBat = join(root, 'examples', 'ane', 'build-ane.bat');
+  check('examples/ane/build-ane.bat exists', existsSync(aniBat));
+  const nb = existsSync(aniBat) ? readFileSync(aniBat, 'utf8') : '';
+  // Named failure, not a linker error: without the pre-check the message for a
+  // missing asaot.lib is about a search path, not about the library nobody built.
+  check('build-ane.bat pre-checks the host library before linking',
+    nb.includes('asaot.lib is not built') && nb.includes('build-asaot.bat first'));
+  check('...and its own copy of the descriptor platform-entry guard',
+    /findstr \/r \/c:"<platform name=\.%PLAT%\."/.test(nb) && nb.includes('declares no'));
+  check('...still staging into both fixture trees',
+    nb.includes('"%EX%ext-aot" "%EX%..\\ane-app\\ext-aot"'));
+
+  // Cross-recipe agreement on the one number both guards assert. Writing "53" into
+  // two checks in THIS file would still pass with the two recipes disagreeing --
+  // which is the very thing the guards exist to prevent -- so the counts are read
+  // out of the shell and the batch file and compared to each other.
+  const hostBat = readFileSync(join(root, 'lib', 'build-asaot.bat'), 'utf8');
+  const shCount = (d.match(/"\$EXPORTS" -ne (\d+)/) || [])[1];
+  const batCount = (hostBat.match(/if not "%EXPORTS%"=="(\d+)"/) || [])[1];
+  check('both host-library recipes assert the SAME export count',
+    shCount !== undefined && shCount === batCount);
+  check('...and it is the FRE count (51 entry points + asaot_bind + asaot_is_bound)',
+    shCount === '53');
   // Cross-file agreement on the names themselves: the descriptor, the script and the
   // runtime's own dir name all have to say MacOS-x86-64 / ProbeANE.dylib.
   check('the script, the descriptor and ane.ts agree on the macOS key and file',

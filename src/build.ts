@@ -767,7 +767,7 @@ function posixLinkLibs(): string[] {
 // boat as wasm (no <iconv.h> in the CRT, and no libiconv in vendor/), so it takes
 // no flag here either -- see AS_HAVE_ICONV in runtime.ts, which is what makes the
 // Windows build report the unsupported charsets loudly instead of mis-encoding.
-function platformLinkLibs(): string[] {
+export function platformLinkLibs(): string[] {
   if (process.platform !== 'darwin') return [];
   return ['iconv'];
 }

@@ -115,6 +115,61 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem --- artifact guards on the built DLL, mirroring lib/build-asaot.sh -------------
+rem A host library that merely has the right NAME can still be the wrong library:
+rem it can be missing the forwarding entry point, export the wrong set of FRE
+rem symbols, or -- worst of all -- still import Adobe AIR. Each of those builds and
+rem links cleanly here and only fails much later, when some extension is loaded, so
+rem the artifact is what gets asserted rather than the flags above. Same discipline
+rem as the import-library guard just above, and the same three guards the .sh runs
+rem on the macOS artifact. `llvm-objdump -p` dumps the PE import/export tables; no
+rem dumpbin, so no VS developer prompt is required (see the header comment).
+set "DUMP=..\temp\asaot-%PLATFORM%.dump.txt"
+if not exist "..\temp" mkdir "..\temp"
+llvm-objdump -p "%OUT%\asaot.dll" > "%DUMP%" 2>&1
+if errorlevel 1 (
+  echo [asaot] %PLATFORM%: FAILED - could not inspect %OUT%\asaot.dll
+  endlocal
+  exit /b 1
+)
+
+rem 1. It must export the forwarding entry point. A library that lost asaot_bind
+rem    would link and load, and then report "asaot.dll does not export asaot_bind"
+rem    at run time. (The .sh asserts this with `nm -gU`.)
+findstr /c:"asaot_bind" "%DUMP%" >nul
+if errorlevel 1 (
+  echo [asaot] %PLATFORM%: FAILED - %OUT%\asaot.dll does not export asaot_bind
+  endlocal
+  exit /b 1
+)
+
+rem 2. The export COUNT, which is what makes this library FRE rather than something
+rem    that merely carries the right name: 51 FRE entry points + asaot_bind +
+rem    asaot_is_bound. 53 is the single number lib/build-asaot.sh pins with
+rem    `nm -gU | grep -c ' T _'`; if the artifact here ever reports a different
+rem    count the two recipes disagree, and the reply is to reconcile them (the .sh
+rem    is the source of truth), never to quietly relax this number.
+set "EXPORTS=0"
+for /f "usebackq delims=" %%L in (`findstr /i /r /c:"^ *[0-9][0-9]*  *0x[0-9a-f][0-9a-f]*  *[A-Za-z_]" "%DUMP%"`) do set /a EXPORTS+=1
+if not "%EXPORTS%"=="53" (
+  echo [asaot] %PLATFORM%: FAILED - %OUT%\asaot.dll exports %EXPORTS% symbols, expected 53
+  endlocal
+  exit /b 1
+)
+
+rem 3. It must NOT import Adobe AIR.dll. The whole point of a recompiled-for-AOT
+rem    host is that no Adobe runtime sits beside a generated executable; a library
+rem    that still references one would load only on a machine that has AIR
+rem    installed. (The .sh asserts the same with `otool -L`.)
+findstr /i /c:"Adobe AIR.dll" "%DUMP%" >nul
+if not errorlevel 1 (
+  echo [asaot] %PLATFORM%: FAILED - %OUT%\asaot.dll still imports Adobe AIR.dll
+  endlocal
+  exit /b 1
+)
+
+del "%DUMP%" >nul 2>nul
+
 echo [asaot] %PLATFORM%: ok
 endlocal
 exit /b 0

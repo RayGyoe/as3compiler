@@ -15,7 +15,7 @@
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import type { BuildConfig } from './build.ts';
-import { platformFrameworks } from './build.ts';
+import { platformFrameworks, platformLinkLibs, fpFlags, perfFlags, debugInfoFlags, effectiveDefines } from './build.ts';
 import { parsePlist, serializePlist, asDict, asArray, scalarText, dictEntry, type PlistValue } from './pbxproj.ts';
 
 // A .xcodeproj is a directory containing project.pbxproj plus an optional
@@ -415,14 +415,31 @@ function pushTargetConfig(
   displayName: string,
 ): void {
   // OTHER_LDFLAGS mirrors the raw native link step: -lm -lz are always linked,
-  // then the manifest's link libs, objects, and frameworks.
+  // then the platform's own native lib (-liconv on macOS, the same
+  // platformLinkLibs() the raw link applies), the manifest's link libs, objects,
+  // and frameworks. Without the iconv entry the .app would fail to link the
+  // iconv_open/iconv/iconv_close the generated C references unconditionally on
+  // __APPLE__ (runtime.ts AS_HAVE_ICONV=1): `Undefined symbol: _iconv` for any
+  // app whose charset path survives -O2.
   const ldflags: string[] = ['-lm', '-lz'];
+  for (const l of platformLinkLibs()) ldflags.push(`-l${l}`);
   for (const l of cfg.linkLibs) ldflags.push(`-l${l}`);
   for (const o of cfg.objects) ldflags.push(resolve(o));
   for (const f of cfg.frameworks) ldflags.push('-framework', f);
   // The runtime's own macOS frameworks (CoreFoundation for Capabilities.language) —
   // the generated .app must link exactly what the raw link step links.
   for (const f of platformFrameworks(cfg)) ldflags.push('-framework', f);
+
+  // The raw native command carries perfFlags (LTO/PGO), fpFlags (-ffp-contract=off)
+  // and debugInfoFlags (-g) on its compile step, and buildCompileSteps repeats them
+  // on the link step of the multi-step C/C++ path. An Xcode target has TWO separate
+  // flag surfaces where a raw `cc` line has one command that both compiles and links,
+  // so the same flags must be on both or the .app would compile/link differently than
+  // the raw build. fpFlags in particular is SEMANTIC, not a perf knob (one IEEE
+  // rounding per AS3 op — see its comment in build.ts), and LTO/PGO are only valid if
+  // both phases see the same switches.
+  const cflags: string[] = [...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
+  for (const f of cflags) ldflags.push(f);
 
   // Optimization flag: the raw build uses cfg.opt (default -O2). Xcode exposes
   // optimization via GCC_OPTIMIZATION_LEVEL, so map the common -O{0,1,2,3,s}.
@@ -455,7 +472,20 @@ function pushTargetConfig(
   for (const p of libPaths) push(`\t\t\t\t\t"${esc(p)}",`);
   push('\t\t\t\t);');
   push('\t\t\t\tGCC_PREPROCESSOR_DEFINITIONS = (');
-  for (const d of cfg.defines) push(`\t\t\t\t\t"${esc(d)}",`);
+  // effectiveDefines, not cfg.defines: the feature macros (--features svg ->
+  // ASC_USE_SVG=1, …) come from the same per-target cfg the raw builders feed to
+  // their -D list, so the project must see them too or the same manifest would
+  // build two different programs. The project-wide config's
+  // GCC_PREPROCESSOR_DEFINITIONS (pushProjectConfig) only forwards "$(inherited)";
+  // the real per-target defines belong here, where the per-target cfg lives.
+  for (const d of effectiveDefines(cfg)) push(`\t\t\t\t\t"${esc(d)}",`);
+  push('\t\t\t\t);');
+  // OTHER_CFLAGS carries the raw native compile flags (perfFlags/fpFlags/
+  // debugInfoFlags, see cflags above). It is per-target for the same reason the
+  // defines are: these flags derive from the per-target cfg (features, lto/pgo,
+  // debug-info), so they must not be hoisted into the project-wide config.
+  push('\t\t\t\tOTHER_CFLAGS = (');
+  for (const f of cflags) push(`\t\t\t\t\t"${esc(f)}",`);
   push('\t\t\t\t);');
   push('\t\t\t\tOTHER_LDFLAGS = (');
   for (const f of ldflags) push(`\t\t\t\t\t"${esc(f)}",`);

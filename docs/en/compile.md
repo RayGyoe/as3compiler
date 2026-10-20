@@ -1051,11 +1051,19 @@ Implementation notes (`src/xcode-project.ts`):
 - **Ad-hoc signing**: `CODE_SIGN_STYLE = Manual` + `CODE_SIGN_IDENTITY = "-"`, so `xcodebuild` produces a
   runnable `.app` with no provisioning profile or Apple ID (ad-hoc); formal distribution adds
   `signing-identity` in the manifest (§6.4, planned).
-- **Compile config mirrors the raw link**: `OTHER_LDFLAGS` always contains `-lm -lz` then the manifest's
-  `link-libs`/`objects`/`frameworks`; `HEADER_SEARCH_PATHS`/`LIBRARY_SEARCH_PATHS` mirror
-  `include-paths`/`link-paths`; `GCC_PREPROCESSOR_DEFINITIONS` mirrors `defines`; `GCC_OPTIMIZATION_LEVEL` is
-  mapped from `--opt`'s `-O{0,1,2,3,s}`. Path-type fields are written as absolute paths so Xcode resolves them
-  from any working directory.
+- **Compile config mirrors the raw link**: `OTHER_LDFLAGS` always contains `-lm -lz` plus the platform's
+  own native lib (macOS's `platformLinkLibs()` `-liconv`; without it any app whose charset path survives
+  `-O2` fails with `Undefined symbol: _iconv`), then the manifest's `link-libs`/`objects`/`frameworks` and
+  `platformFrameworks`; the compile-side flags (`perfFlags`/`fpFlags`/`debugInfoFlags`) land on **both**
+  `OTHER_CFLAGS` and `OTHER_LDFLAGS`, matching the raw build's single command that both compiles and links.
+  `-ffp-contract=off` in particular is a **semantic** flag, not a perf knob: AS3 arithmetic is one IEEE
+  rounding per operation, and clang's default contraction changes observable results (AIR's
+  `SoundTransform.pan` computes `1 - ltl*ltl` and gives `0.2604000000000001` uncontracted vs `0.2604`
+  contracted). `HEADER_SEARCH_PATHS`/`LIBRARY_SEARCH_PATHS` mirror `include-paths`/`link-paths`;
+  `GCC_PREPROCESSOR_DEFINITIONS` mirrors `effectiveDefines` (including the `--features` macros, e.g.
+  `svg`→`ASC_USE_SVG=1`, rather than dropping them silently); `GCC_OPTIMIZATION_LEVEL` is mapped from
+  `--opt`'s `-O{0,1,2,3,s}`. Path-type fields are written as absolute paths so Xcode resolves them from any
+  working directory.
 - **Disable `-fmodules` (critical)**: the generated C uses bare type names (`Point`/`Rectangle`…) that collide
   with macOS SDK types (e.g. `MacTypes.h`'s `Point`). Raw `cc` is fine because `-fmodules` is off by default;
   Xcode enables it by default and would let the SDK's `Point` shadow the generated struct, causing
@@ -1086,7 +1094,9 @@ would clobber those edits. So the generator performs an **object-level smart mer
   relative-path files are left alone. Xcode's `/* comments */` are dropped by the parser (pure readability
   hints, no semantic weight) and regenerated on Xcode's next save.
 - The extra `.as3aot-managed.json` (recording the managed source set) is ignored by Xcode and does not affect
-  the build.
+  the build. It is **generated output** (written on every create/merge) and is **not tracked in the repo**;
+  when it is absent (a fresh clone, or a hand-made project), the merge only **adds** managed sources and
+  **never removes** any existing source.
 
 To force a full regeneration, delete the `.xcodeproj` and re-run.
 

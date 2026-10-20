@@ -400,6 +400,12 @@ itself with `findstr`). **That check is not decoration**: an import library with
 **completely silent** at build time and only much later shows up as "even the recompiled ANE still
 wants `Adobe AIR.dll`".
 
+`build-asaot.bat` also **inspects the artefact itself** (the same set of assertions `build-asaot.sh` makes
+on macOS): `asaot.dll` must export `asaot_bind`, its PE export count must be **exactly 53** (51 FRE entry
+points + `asaot_bind` + `asaot_is_bound`), and it must **not** import `Adobe AIR.dll`. The reason is the
+same: a host library with the right name but the wrong contents still builds and links cleanly, and only
+explodes when some extension is loaded.
+
 macOS is the same job in the other file shape (`asaot_host.c` is **unchanged** -- it was always a
 platform-neutral forwarder):
 
@@ -529,6 +535,12 @@ lipo -archs build/MyExt.dylib   # "arm64 x86_64" when universal
 for: the dependency must be the **relocatable** `@executable_path/libasaot.dylib`. A dependency recorded
 as an absolute path is just as silent at build time, and it makes the fixture "build here, fail to load
 anywhere else".
+
+`examples/ane/build-ane.bat` now carries the two pre-checks `build-ane.sh` already had and Windows was
+missing: **it confirms `lib\bin\windows-x64\asaot.lib` is built before linking** (without it the linker's
+message is about a search path rather than the library that was never built), and **it requires the
+descriptor to contain the current platform's `<platform name="Windows-x86-64">` entry** (a descriptor
+missing its platform entry used to be staged silently on Windows, failing only at packaging time).
 
 One aside: recompiling does not change the extension's own **system** requirements (a certain real
 project still imports `MFPlat.dll` / `MFReadWrite.dll` / the VC runtime, for instance). Those are
@@ -723,7 +735,7 @@ directory's shape is the shape of the run-time `extensions/` directory —
 |---|---|
 | `examples/ane/ProbeANE.c` | the extension's **native half**, 21 KB, covering integers/floats/UTF8/booleans/arrays/byte arrays/object properties/method calls/native data/status events/threads and mutexes/throwing/the **FRE string length contract** (`stringInfo`) |
 | `examples/ane/shim/FlashRuntimeExtensions.h` | the §4.3 shim, and it **deliberately makes `ProbeANE.c` use AIR's include name** so the shim is really exercised |
-| `examples/ane/build-ane.bat` | the §4.4 recompile recipe for **Windows** (clang-cl); after building it automatically runs the §4.5 import-table check and installs the result into **two** staging trees |
+| `examples/ane/build-ane.bat` | the §4.4 recompile recipe for **Windows** (clang-cl); it first checks the host `asaot.lib` and the descriptor's platform entry, then after building automatically runs the §4.5 import-table check and installs the result into **two** staging trees |
 | `examples/ane/build-ane.sh` | the §4.4 recompile recipe for **macOS** (`clang -dynamiclib`), one compile staged into both trees, and it asserts a set of **artefact** properties (relocatable dependency name / no Adobe AIR / the initializer export / both slices / the descriptor still declaring its platform entry) |
 | `examples/ane/ext-aot/com.example.probe/extension.xml` | the §4.6 descriptor (directory name = extension id) |
 | `examples/ane/ext-aot/com.example.probe/Windows-x86-64/ProbeANE.dll` | the rebuilt product (19,456 bytes, imports `asaot.dll`) |
@@ -912,7 +924,7 @@ missing".
 |---|---|
 | `lib/asaot.h` | the FRE ABI contract header (byte-for-byte swappable with the SDK's `FlashRuntimeExtensions.h`) |
 | `lib/asaot_host.c` | the source of `asaot.dll`: a **thin forwarder** for the 51 entry points, all forwarding into the table `asaot_bind` installs |
-| `lib/build-asaot.bat` | builds the **Windows** host library (both widths by default); carries its own "the import library records `asaot.dll`" assertion |
+| `lib/build-asaot.bat` | builds the **Windows** host library (both widths by default); carries its own "the import library records `asaot.dll`" assertion, plus a set of **artefact** assertions (exports `asaot_bind` / exactly 53 PE exports / no `Adobe AIR.dll`) |
 | `lib/build-asaot.sh` | builds the **macOS** host library (universal arm64 + x86_64 by default); carries a set of **artefact** assertions: the install name is `@executable_path/libasaot.dylib` (and both slices agree), `asaot_bind` is exported, 53 exports, no Adobe AIR dependency |
 | `lib/bin/windows-{x86,x64}/` | the Windows host library products (`asaot.dll` + `asaot.lib`) |
 | `lib/bin/macos-x86-64/` | the macOS host library product (`libasaot.dylib`, universal; the two Windows files are one file here) |

@@ -941,10 +941,17 @@ open build/…/Debug/Main.app                        # 双击/命令行启动正
 - **ad-hoc 签名**：`CODE_SIGN_STYLE = Manual` + `CODE_SIGN_IDENTITY = "-"`，让 `xcodebuild` 无需
   provisioning profile 或 Apple ID 即可产出可运行的 `.app`（ad-hoc 签名）；正式上架再在 manifest 加
   `signing-identity`（§6.4 规划）。
-- **编译配置镜像 raw 链接**：`OTHER_LDFLAGS` 恒含 `-lm -lz`，再拼 manifest 的 `link-libs`/`objects`/
-  `frameworks`；`HEADER_SEARCH_PATHS`/`LIBRARY_SEARCH_PATHS` 镜像 `include-paths`/`link-paths`；
-  `GCC_PREPROCESSOR_DEFINITIONS` 镜像 `defines`；`GCC_OPTIMIZATION_LEVEL` 从 `--opt` 的 `-O{0,1,2,3,s}`
-  映射。路径类字段按绝对路径写入，保证 Xcode 从任意工作目录都能解析。
+- **编译配置镜像 raw 链接**：`OTHER_LDFLAGS` 恒含 `-lm -lz` + 平台自带库（macOS 上即
+  `platformLinkLibs()` 的 `-liconv`；少了它，任何字符集路径过了 `-O2` 仍存活的 app 都会
+  `Undefined symbol: _iconv`），再拼 manifest 的 `link-libs`/`objects`/`frameworks` 与
+  `platformFrameworks`；编译侧 flags（`perfFlags`/`fpFlags`/`debugInfoFlags`）**同时**落在
+  `OTHER_CFLAGS` 与 `OTHER_LDFLAGS` 上，与 raw 的「一条命令既编译又链接」对齐。其中
+  `-ffp-contract=off` 是**语义**旗标而非性能旋钮：AS3 每个运算只一次 IEEE 舍入，clang 默认的
+  contraction 会改变可观测结果（AIR 的 `SoundTransform.pan` 算 `1 - ltl*ltl` 给
+  `0.2604000000000001`，contraction 后成 `0.2604`）。`HEADER_SEARCH_PATHS`/`LIBRARY_SEARCH_PATHS`
+  镜像 `include-paths`/`link-paths`；`GCC_PREPROCESSOR_DEFINITIONS` 镜像 `effectiveDefines`（含
+  `--features` 的宏，如 `svg`→`ASC_USE_SVG=1`，不再静默丢失）；`GCC_OPTIMIZATION_LEVEL` 从 `--opt`
+  的 `-O{0,1,2,3,s}` 映射。路径类字段按绝对路径写入，保证 Xcode 从任意工作目录都能解析。
 - **关闭 `-fmodules`（关键）**：生成的 C 使用裸类型名（`Point`/`Rectangle`…），会与 macOS SDK 的
   `MacTypes.h` 里的 `Point` 冲突。raw `cc` 默认不启用 `-fmodules` 所以没事；Xcode 默认启用，会让 SDK
   的 `Point` 遮蔽生成的 struct，导致 `no member named 'x' in 'struct Point'`。因此工程里显式
@@ -971,7 +978,9 @@ open build/…/Debug/Main.app                        # 双击/命令行启动正
 - **识别依据是绝对路径**：只有 `sourceTree = "<absolute>"` 的 file ref 才会被管理；用户手加的
   相对路径文件不受影响。Xcode 的 `/* 注释 */` 会被解析器丢弃（纯可读性提示，不参与语义），下次
   Xcode 保存时自动重新生成。
-- 工程里额外生成 `.as3aot-managed.json`（记录受管源文件集合），Xcode 忽略该文件，不会影响构建。
+- 工程里额外生成 `.as3aot-managed.json`（记录受管源文件集合），Xcode 忽略该文件，不会影响构建。它是**生成产物**
+  （每次创建/合并都会写出），**不进仓库**；当它不存在时（刚 clone、或工程是手建的），合并只**新增**受管源文件，
+  **绝不删除任何**现有源文件。
 
 若用户确需整体重建工程，删除 `.xcodeproj` 后重跑即可。
 

@@ -230,8 +230,9 @@ static void main_loop(void) {
 #endif
 }
 
-// Left-button pointer input. Coordinates are CSS pixels relative to the canvas,
-// matching SDL2's logical window points (the AS3 side maps through align/scale).
+// Pointer input on the canvas: movement plus the left-button down/up/click gate.
+// Coordinates are CSS pixels relative to the canvas, matching SDL2's logical
+// window points (the AS3 side maps through align/scale).
 static EM_BOOL on_mouse_evt(int eventType, const EmscriptenMouseEvent* e, void* ud) {
   (void)ud;
   if (g_on_mouse == nullptr) return EM_TRUE;
@@ -240,6 +241,20 @@ static EM_BOOL on_mouse_evt(int eventType, const EmscriptenMouseEvent* e, void* 
   } else if (eventType == EMSCRIPTEN_EVENT_MOUSEUP && e->button == 0) {
     g_on_mouse(0, (double)e->targetX, (double)e->targetY, "mouseUp");
     g_on_mouse(0, (double)e->targetX, (double)e->targetY, "click");
+  } else if (eventType == EMSCRIPTEN_EVENT_MOUSEMOVE) {
+    // Hover, dragging and text-selection all ride this one channel, exactly as
+    // SDL_MOUSEMOTION does in window_glue.cc; without it the web backend has no
+    // hover at all.
+    g_on_mouse(0, (double)e->targetX, (double)e->targetY, "mouseMove");
+  } else if (eventType == EMSCRIPTEN_EVENT_MOUSELEAVE) {
+    // The pointer left the canvas: AIR rolls the window's roll-over state back to
+    // its up/out state. The coordinates are deliberately 0,0 -- a leave carries
+    // none, and AIR does NOT touch mouseX/mouseY on one, so the AS3 side keeps its
+    // last in-window values and ignores these. Kept in step with window_glue.cc's
+    // SDL_WINDOWEVENT_LEAVE block: same reserved "mouseLeave" type, same 0,0 (the
+    // cursor reset and dirty flag there are SDL-only; on web CSS owns the cursor
+    // and the rAF loop presents every frame).
+    g_on_mouse(0, 0.0, 0.0, "mouseLeave");
   }
   return EM_TRUE;
 }
@@ -377,6 +392,8 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   // Pointer/wheel input is registered on the canvas element itself.
   emscripten_set_mousedown_callback("#canvas", nullptr, EM_FALSE, on_mouse_evt);
   emscripten_set_mouseup_callback("#canvas", nullptr, EM_FALSE, on_mouse_evt);
+  emscripten_set_mousemove_callback("#canvas", nullptr, EM_FALSE, on_mouse_evt);
+  emscripten_set_mouseleave_callback("#canvas", nullptr, EM_FALSE, on_mouse_evt);
   emscripten_set_wheel_callback("#canvas", nullptr, EM_FALSE, on_wheel_evt);
 
   // Initial frame (the surface is already rasterized by Stage_showWindow).
@@ -481,12 +498,18 @@ int sk_window_start_resize(int id, const char* edge) { (void)id; (void)edge; ret
 // there is never a pending request -- but the generated C asks once per frame, so
 // the stub has to exist for this backend to link.
 int sk_window_take_close_request(int id) { (void)id; return 0; }
-// NativeApplication.exit(): ask the shared event loop to end. A page cannot end its
-// own browser process, and this backend never defines ASC_USE_WINDOW today, so the
-// call is not even compiled -- the stub exists so that the two backends stay in
-// step if web ever gains a window loop (the seam parity pin in
-// test/unit/platform.ts checks exactly this pair).
-void sk_window_request_exit(void) {}
+// NativeApplication.exit(): ask the frame loop to end. A page cannot end its own
+// browser process, but this backend DOES define ASC_USE_WINDOW=1 (src/air-app.ts,
+// examples/web/hello-web.build.json), so the generated C really does compile the
+// call -- leaving this a silent no-op would swallow NativeApplication.exit(),
+// which the project's "a capability gap is never silent" rule forbids. This is the
+// web analogue of window_glue.cc's g_exit_requested flag that ends the SDL pump:
+// emscripten_cancel_main_loop() stops the loop sk_window_show started with
+// emscripten_set_main_loop(main_loop, 0, 1), whose simulate_infinite_loop=1 is
+// what keeps main() from returning.
+void sk_window_request_exit(void) {
+  emscripten_cancel_main_loop();
+}
 // Composed-text seam (native window_glue.cc drains SDL_TEXTINPUT/SDL_TEXTEDITING
 // through these). On web the whole keyboard transport is unwired — see the note in
 // sk_window_show above — so there is no composed-text queue to drain and no OS

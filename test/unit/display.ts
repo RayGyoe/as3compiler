@@ -991,6 +991,7 @@ function checkPerStagePointer(): string[] {
   const symbolsSource = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
   const example = readFileSync(join(root, 'examples', 'pointer-per-stage.as'), 'utf8');
   const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
+  const webGlue = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8');
   const owner = emitSource.slice(emitSource.indexOf('static Stage* as_mouse_owner_stage'));
   const sbtn = emitSource.slice(emitSource.indexOf("this.line('static DisplayObject* as_sbtn_state(DisplayObject* o) {'"));
   const dispatch = emitSource.slice(emitSource.indexOf("this.line('void Stage_dispatchMouse(void* _this"));
@@ -1043,6 +1044,17 @@ function checkPerStagePointer(): string[] {
     glue.includes('e.window.event == SDL_WINDOWEVENT_LEAVE') &&
     glue.includes('c->on_mouse(id, 0.0, 0.0, "mouseLeave");') &&
     glue.includes('c->dirty = 1;'));
+  // web 那一半同样要有：阶段二百零七只修了 native，web 至今没有 mouseMove / mouseLeave
+  // （「指针移出窗口必须 roll-out」同一缺陷只补了一边，本项目禁止这种单侧修复）。两边
+  // 一起钉住，谁再只改一边就会红。
+  check('the web backend registers mousemove/mouseleave on the canvas',
+    webGlue.includes('emscripten_set_mousemove_callback("#canvas", nullptr, EM_FALSE, on_mouse_evt);') &&
+    webGlue.includes('emscripten_set_mouseleave_callback("#canvas", nullptr, EM_FALSE, on_mouse_evt);'));
+  check('the web backend forwards mousemove and mouseleave on the mouse channel',
+    webGlue.includes('EMSCRIPTEN_EVENT_MOUSEMOVE') &&
+    webGlue.includes('g_on_mouse(0, (double)e->targetX, (double)e->targetY, "mouseMove");') &&
+    webGlue.includes('EMSCRIPTEN_EVENT_MOUSELEAVE') &&
+    webGlue.includes('g_on_mouse(0, 0.0, 0.0, "mouseLeave");'));
   // 但「报上来的 LEAVE」不等于真的离开：窗口在静止指针下被抬起/激活时，Windows 会发
   // WM_MOUSELEAVE，SDL 随之报一个指针仍在窗内的 LEAVE（实测 temp/mouse2w GLUE-DBG：
   // 指针 1268,301 落在该窗 1108,181 304x201 客户区里）。没这个过滤，应用会收到假的

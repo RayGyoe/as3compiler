@@ -143,7 +143,7 @@ glue files:
 | Font backend | `SkFontMgr_New_CoreText()` (enumerates macOS system fonts) | `SkFontMgr_New_Custom_Data()` + runtime injection (§4) |
 | Window / presentation | SDL2 `SDL_PollEvent` blocking loop | `vendor/web_glue.cc`: cpu mode `putImageData` blit; direct/gpu mode `GrDirectContext::flush` |
 | Frame driving | SDL event loop (when self-driving, `SDL_Delay` until the deadline) | `emscripten_set_main_loop` + **rAF whole-tick pacing** (§3.2) |
-| Input | SDL events | `emscripten_set_mousedown_callback`/`mouseup`/`wheel` |
+| Input | SDL events | `emscripten_set_mousedown_callback`/`mouseup`/`mousemove`/`mouseleave`/`wheel` (the keyboard transport and `on_resize`/`on_close` are **still unwired**, see §6) |
 | Stage3D | `vendor/stage3d_glue.mm` (Metal + MSL shaders) | `vendor/stage3d_webgl.cc` (WebGL2 + GLSL ES shaders, §3.3) |
 | Network (`flash.net`) | libcurl (opt-in `ASC_HAVE_CURL`) | browser `fetch` (opt-in `ASC_HAVE_FETCH`, see §3.4); honest `ioError` with no backend |
 
@@ -598,6 +598,19 @@ must be written before `showWindow`, with `showWindow` as the last statement. Th
     3.1.44) + add a third Stage3D backend; and WebGPU uses **WGSL**, on a different path from native shader
     pass-through toward GLSL ES on the web side. The basis for the determination and the quantified restart
     trigger condition are in `TODO.md` stage eighty-nine / twenty-nine (the WebGPU determination re-review).
+13. **The web input channel is pointer-only**: `web_glue.cc` registers
+    `mousedown`/`mouseup`/`mousemove`/`mouseleave`/`wheel` on `#canvas`. `mousemove` arrives as
+    `mouseMove` (hover, dragging and text-selection drag all ride it); `mouseleave` carries `0,0` —
+    AIR **does not touch** `mouseX`/`mouseY` on a leave, so the coordinates are ignored and the
+    window's roll-over state rolls back to up/out (the same contract as native's
+    `SDL_WINDOWEVENT_LEAVE`; stage 207 fixed only native, this round adds the web
+    half). The keyboard transport and `on_resize`/`on_close` are **still unwired** (`(void)`-ignored in the
+    glue; the keyboard path is additionally recorded in `TODO.md`, rather than silently dropping keys);
+    `NativeWindow` creation still **fails by design** (a browser cannot open a second OS window; it throws
+    naming the limitation).
+    `NativeApplication.exit()` now really stops the frame loop: `sk_window_request_exit` calls
+    `emscripten_cancel_main_loop()` (it used to be a silent no-op), stopping only the rAF loop
+    `sk_window_show` started; the page process itself is not ended.
 
 ## 7. Toolchain Reuse
 

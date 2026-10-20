@@ -130,7 +130,7 @@ present 只是 `GrDirectContext::flush()`，不再有 CPU↔JS 逐像素拷贝�
 | 字体后端 | `SkFontMgr_New_CoreText()`（枚举 macOS 系统字体） | `SkFontMgr_New_Custom_Data()` + 运行时注入（§4） |
 | 窗口 / 上屏 | SDL2 `SDL_PollEvent` 阻塞循环 | `vendor/web_glue.cc`：cpu 模式 `putImageData` blit；direct/gpu 模式 `GrDirectContext::flush` |
 | 帧驱动 | SDL 事件循环（自走时，`SDL_Delay` 到截止期） | `emscripten_set_main_loop` + **rAF 整 tick 节拍**（§3.2） |
-| 输入 | SDL 事件 | `emscripten_set_mousedown_callback`/`mouseup`/`wheel` |
+| 输入 | SDL 事件 | `emscripten_set_mousedown_callback`/`mouseup`/`mousemove`/`mouseleave`/`wheel`（键盘传输与 `on_resize`/`on_close` **仍未接线**，见 §6） |
 | Stage3D | `vendor/stage3d_glue.mm`（Metal + MSL 着色器） | `vendor/stage3d_webgl.cc`（WebGL2 + GLSL ES 着色器，§3.3） |
 | 网络（`flash.net`） | libcurl（opt-in `ASC_HAVE_CURL`） | 浏览器 `fetch`（opt-in `ASC_HAVE_FETCH`，见 §3.4）；无后端时诚实 `ioError` |
 
@@ -524,6 +524,16 @@ try { Module._main(); } catch (e) { if (e !== 'unwind') throw e; }
     wasm32 拉 Dawn 重编 + 升级 Emscripten（现 3.1.44）+ 新增第三个 Stage3D 后端；且 WebGPU 用
     **WGSL**，与原生着色器直通在 web 侧的目标 GLSL ES 不同路。判定依据与重启的量化触发条件
     见 `TODO.md` 阶段八十九·二十九（WebGPU 判定复核）。
+13. **web 的输入通道只有指针一族**：`web_glue.cc` 在 `#canvas` 上注册
+    `mousedown`/`mouseup`/`mousemove`/`mouseleave`/`wheel`。`mousemove` 送 `mouseMove`
+    （悬停、拖拽、文字选择拖动都靠它）；`mouseleave` 送 `0,0` —— AIR 在指针离开时**不碰**
+    `mouseX`/`mouseY`，故坐标被忽略、窗口的 roll-over 状态回滚到 up/out（与 native 的
+    `SDL_WINDOWEVENT_LEAVE` 同一口径；阶段二百零七只修了 native，本轮把 web 那一半补齐）。
+    键盘传输与 `on_resize`/`on_close` **仍未接线**（在胶水里 `(void)` 显式忽略；键盘一路另登记在
+    `TODO.md`，不静默丢键）；`NativeWindow` 创建仍**按设计失败**（浏览器开不了第二个 OS 窗口，抛错报明）。
+    `NativeApplication.exit()` 现在真的停帧：`sk_window_request_exit` 调
+    `emscripten_cancel_main_loop()`（此前是静默空操作），只停 `sk_window_show` 起的 rAF 循环，
+    页进程本身不会被结束。
 
 ## 7. 工具链复用
 

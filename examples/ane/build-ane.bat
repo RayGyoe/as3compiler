@@ -63,6 +63,16 @@ set "EX=%~dp0"
 set "REPO=%~dp0..\.."
 set "SCRATCH=%REPO%\temp\ane-probe-build"
 
+rem The host library must exist before the fixture can link against it. Named here
+rem rather than left to the linker, whose message for a missing asaot.lib is about a
+rem search path rather than about the library that was never built (the mirror of
+rem examples/ane/build-ane.sh's pre-check).
+if not exist "%REPO%\lib\bin\windows-x64\asaot.lib" (
+  echo [ane] FAILED - lib\bin\windows-x64\asaot.lib is not built
+  echo [ane] run lib\build-asaot.bat first
+  exit /b 1
+)
+
 set "CC=clang-cl"
 where %CC% >nul 2>nul || set "PATH=C:\Program Files\LLVM\bin;%PATH%"
 
@@ -122,6 +132,16 @@ for %%T in ("%EX%ext-aot" "%EX%..\ane-app\ext-aot") do (
   findstr /c:"<nativeLibrary>%DLL%</nativeLibrary>" "%%~fT\%ID%\extension.xml" >nul
   if errorlevel 1 (
     echo [ane] FAILED - %%~fT\%ID%\extension.xml does not name %DLL%
+    exit /b 1
+  )
+  rem The platform entry too: a descriptor that names the library but not the key it
+  rem belongs to would stage a DLL no build ever looks for, and the symptom is the
+  rem build refusing the package with "has no <platform name=Windows-x86-64> entry".
+  rem (`findstr /r` with `.` standing for the quotes keeps the pattern free of the
+  rem embedded `"` a literal /c: search string cannot carry.)
+  findstr /r /c:"<platform name=.%PLAT%." "%%~fT\%ID%\extension.xml" >nul
+  if errorlevel 1 (
+    echo [ane] FAILED - %%~fT\%ID%\extension.xml declares no ^<platform name="%PLAT%"^> entry
     exit /b 1
   )
   if not exist "%%~fT\%ID%\%PLAT%" mkdir "%%~fT\%ID%\%PLAT%"

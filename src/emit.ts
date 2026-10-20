@@ -17871,8 +17871,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return;');
     this.indent--;
     this.line('}');
+    // On WASI/wasi-sdk there is NO zlib, so compress() cannot be implemented. The
+    // previous silent `return` made the caller believe the operation succeeded
+    // while the bytes were left untouched -- a WRONG RESULT, which is worse than a
+    // loud error. This is a platform boundary (the library simply is not in the
+    // WASI toolchain), not a missing feature to be faked, so we fail loudly exactly
+    // like the unsupported-`algorithm` branch above (AGENTS.md 1.5).
     this.line('#ifdef __wasi__');
-    this.line('(void)o; // no zlib on WASI: compress is a documented no-op');
+    this.line('as_throw_unsupported(as_str_concat("ByteArray.compress is not supported on the WASI backend: ", "wasi-sdk provides no zlib, so it cannot be implemented"));');
     this.line('#else');
     this.line('uLongf dst = compressBound((uLong)o->length);');
     this.line('unsigned char* tmp = (unsigned char*)gc_alloc(GCT_BYTES, (size_t)dst);');
@@ -17893,8 +17899,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return;');
     this.indent--;
     this.line('}');
+    // Same platform boundary as compress() above: no zlib in wasi-sdk, so
+    // uncompress() must throw rather than silently leave the bytes as-is (a wrong
+    // result masquerading as success).
     this.line('#ifdef __wasi__');
-    this.line('(void)o; // no zlib on WASI');
+    this.line('as_throw_unsupported(as_str_concat("ByteArray.uncompress is not supported on the WASI backend: ", "wasi-sdk provides no zlib, so it cannot be implemented"));');
     this.line('#else');
     this.line('uLongf cap = (uLong)o->length * 4 + 64;');
     this.line('for (int attempt = 0; attempt < 8; attempt++) {');

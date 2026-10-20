@@ -343,6 +343,11 @@ build-asaot.bat            :: 不给参数 = 两个位宽都编（windows-x86 + 
 断言的）。**这个检查不是装饰**：一个没记模块名的导入库在构建期**完全静默**，只在很久之后
 表现为「连重编过的 ANE 都还在要 `Adobe AIR.dll`」。
 
+`build-asaot.bat` 还会**验一遍产物本身**（与 macOS 的 `build-asaot.sh` 同一组断言）：
+`asaot.dll` 必须导出 `asaot_bind`、PE 导出数必须**恰好 53**（51 个 FRE 入口 + `asaot_bind` +
+`asaot_is_bound`）、且**不得导入 `Adobe AIR.dll`**。理由同源：名字对但内容错的宿主库照样能
+编过、能链接，直到某个扩展被加载才炸。
+
 macOS 上是同一件事的另一个文件形态（`asaot_host.c` **一个字都没改**，它本来就是与平台无关的
 薄转发器）：
 
@@ -459,6 +464,11 @@ lipo -archs build/MyExt.dylib   # 通用时是 arm64 x86_64
 `examples/ane/build-ane.sh` 把这四条都做成断言，**外加**一条 Windows 侧没有的：依赖名必须是
 **可重定位**的 `@executable_path/libasaot.dylib`。一条记成绝对路径的依赖在构建期一样完全静默，
 它让夹具「在本机编得出来、换个地方加载不了」。
+
+`examples/ane/build-ane.bat` 现在补齐 `build-ane.sh` 早已有、而 Windows 侧此前缺的两道前置检查：
+**链接前先确认 `lib\bin\windows-x64\asaot.lib` 已构建**（少了它，链接器报的是搜索路径、而不是
+「这个库根本没编」），以及**描述符里必须有当前平台的 `<platform name="Windows-x86-64">` 条目**
+（此前缺平台条目的描述符在 Windows 上会被静默暂存，直到打包才报）。
 
 附带一句：重编不会改变扩展自身对**系统依赖**的要求（例如某真项目仍导入 `MFPlat.dll` /
 `MFReadWrite.dll` / VC 运行时）。那些是扩展原本就有的要求，`adl` 跑它时也一样。
@@ -627,7 +637,7 @@ this build: ...`。按症状查：
 |---|---|
 | `examples/ane/ProbeANE.c` | 扩展的**原生半边**，2.1 万字节，覆盖整数/浮点/UTF8/布尔/数组/字节数组/对象属性/方法调用/原生数据/状态事件/线程与互斥/抛异常/**FRE 字符串长度契约**（`stringInfo`） |
 | `examples/ane/shim/FlashRuntimeExtensions.h` | §4.3 的 shim，且**故意让 `ProbeANE.c` 用 AIR 的 include 名**，这样 shim 真的被走到了 |
-| `examples/ane/build-ane.bat` | §4.4 的重编配方（clang-cl，Windows），编完自动跑 §4.5 的导入表检查，并把结果装进**两棵**暂存树 |
+| `examples/ane/build-ane.bat` | §4.4 的重编配方（clang-cl，Windows），链接前先查宿主库 `asaot.lib` 与描述符的平台条目、编完自动跑 §4.5 的导入表检查，并把结果装进**两棵**暂存树 |
 | `examples/ane/build-ane.sh` | §4.4 的重编配方（`clang -dynamiclib`，macOS），**同一次编译装两处**，断言的是一组性质（依赖名可重定位 / 无 Adobe AIR / 导出 initializer / 两个切片 / 描述符里那个平台条目还在） |
 | `examples/ane/ext-aot/com.example.probe/extension.xml` | §4.6 的描述符（目录名 = 扩展 id），**两个平台条目都有** |
 | `examples/ane/ext-aot/com.example.probe/Windows-x86-64/ProbeANE.dll` | 重编产物（19,456 字节，导入 `asaot.dll`） |
@@ -794,7 +804,7 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 |---|---|
 | `lib/asaot.h` | FRE ABI 契约头（与 SDK 的 `FlashRuntimeExtensions.h` 逐字节可换） |
 | `lib/asaot_host.c` | `asaot.dll` 的源码：51 个入口点的**薄转发器**，全部转发进 `asaot_bind` 装进来的表 |
-| `lib/build-asaot.bat` | 编 Windows 宿主库（默认两个位宽）；自带「导入库记录 `asaot.dll`」断言 |
+| `lib/build-asaot.bat` | 编 Windows 宿主库（默认两个位宽）；自带「导入库记录 `asaot.dll`」断言 + 一组**产物**断言（导出 `asaot_bind`、PE 导出数恰好 53、不含 `Adobe AIR.dll`） |
 | `lib/build-asaot.sh` | 编 macOS 宿主库（默认通用 arm64 + x86_64）；自带一组**产物**断言：install name 是 `@executable_path/libasaot.dylib`（且两个切片一致）、导出 `asaot_bind`、53 个导出、不依赖 Adobe AIR |
 | `lib/bin/windows-{x86,x64}/` | Windows 宿主库产物（`asaot.dll` + `asaot.lib`） |
 | `lib/bin/macos-x86-64/` | macOS 宿主库产物（`libasaot.dylib`，通用二进制；`asaot.dll` 与 `asaot.lib` 两份在这里合成一份） |
