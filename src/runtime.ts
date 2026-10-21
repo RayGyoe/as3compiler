@@ -8771,7 +8771,7 @@ extern void* sk_image_decode_bytes_argb(const void* data, size_t len, int* width
 // Channel order is resolved in skia_glue (kN32 differs by platform), so generated
 // C never assumes a byte order of a Skia surface.
 extern int sk_surface_read_argb(void* surface, uint32_t* dst, int width, int height);
-extern void sk_canvas_draw_image_rect(void* canvas, void* image, double dx, double dy, double dw, double dh);
+extern void sk_canvas_draw_image_rect(void* canvas, void* image, double dx, double dy, double dw, double dh, int smooth);
 extern void sk_canvas_draw_bgra(void* canvas, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh);
 extern void sk_canvas_draw_text(void* canvas, const char* text, double x, double y, double size, int bold, int italic, void* paint);
 extern void sk_canvas_draw_text_n(void* canvas, const char* text, int len, double x, double y, double size, int bold, int italic, void* paint);
@@ -8925,7 +8925,7 @@ static inline void* as_skia_image_from_bytes(const void* data, size_t len) { ret
 static inline void* as_skia_image_decode_argb(const char* path, int* width, int* height) { return sk_image_decode_argb(path, width, height); }
 static inline void* as_skia_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) { return sk_image_decode_bytes_argb(data, len, width, height); }
 static inline int as_skia_surface_read_argb(void* s, uint32_t* dst, int w, int h) { return sk_surface_read_argb(s, dst, w, h); }
-static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh) { sk_canvas_draw_image_rect(c, img, dx, dy, dw, dh); }
+static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh, int smooth) { sk_canvas_draw_image_rect(c, img, dx, dy, dw, dh, smooth); }
 static inline void as_skia_canvas_draw_bgra(void* c, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh) { sk_canvas_draw_bgra(c, bgra, w, h, dx, dy, dw, dh); }
 // Composite the Stage3D render target straight from its GL texture — the web
 // counterpart of as_skia_gpu_draw_texture (no CPU readback, no re-upload).
@@ -9656,7 +9656,7 @@ static inline void* as_skia_image_from_bytes(const void* data, size_t len) { (vo
 static inline void* as_skia_image_decode_argb(const char* path, int* width, int* height) { (void)path; (void)width; (void)height; return NULL; }
 static inline void* as_skia_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) { (void)data; (void)len; (void)width; (void)height; return NULL; }
 static inline int as_skia_surface_read_argb(void* s, uint32_t* dst, int w, int h) { (void)s; (void)dst; (void)w; (void)h; return 0; }
-static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh) { (void)c; (void)img; (void)dx; (void)dy; (void)dw; (void)dh; }
+static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh, int smooth) { (void)c; (void)img; (void)dx; (void)dy; (void)dw; (void)dh; (void)smooth; }
 static inline void as_skia_canvas_draw_bgra(void* c, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh) { (void)c; (void)bgra; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh; }
 static inline void as_skia_gl_draw_texture(void* c, void* tex, int w, int h, double dx, double dy, double dw, double dh) { (void)c; (void)tex; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh; }
 static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, double y, double sz, int bold, int italic, void* p) { (void)c; (void)t; (void)x; (void)y; (void)sz; (void)bold; (void)italic; (void)p; }
@@ -10260,11 +10260,11 @@ static struct curl_slist* as_http_add_headers(struct curl_slist* list, const cha
 static CURLSH* as_http_share = NULL;
 
 #ifdef _WIN32
-// Windows has no pthread.h. The Win32 backend runs transfers inline on the AS3
-// thread (ASC_ASYNC_THREADS is off below), so the share's cookie jar is never
-// actually contended; libcurl still rejects CURLSHOPT_SHARE without a LOCKFUNC,
-// so the callbacks below are backed by a CRITICAL_SECTION (correct if threaded
-// Win32 curl ever arrives) and one-time init by InitOnceExecuteOnce.
+// Windows has no pthread.h. The CRITICAL_SECTION array below does the same job a
+// pthread_mutex_t array does on POSIX, and since stage 230 it is load-bearing:
+// the Win32 backend runs transfers on the worker pool too (ASC_ASYNC_THREADS),
+// so four workers really do share this cookie jar concurrently. One-time init
+// needs the Win32 stand-in for pthread_once, which is InitOnceExecuteOnce.
 static CRITICAL_SECTION as_http_share_locks[CURL_LOCK_DATA_LAST];
 static INIT_ONCE as_http_share_once = INIT_ONCE_STATIC_INIT;
 
@@ -10354,8 +10354,9 @@ extern int as_sysproxy_get(const char* url, char* proxy, int proxy_cap, char* no
 #endif
 
 // The blocking transfer, called from as_job_run — i.e. on a worker thread
-// whenever ASC_ASYNC_THREADS is set (it is, on every POSIX native target), so
-// the AS3 thread never blocks on the network. A 4xx/5xx is NOT a curl error:
+// whenever ASC_ASYNC_THREADS is set (it is, on every native target: POSIX
+// pthreads, Windows over the SRWLOCK shim above), so the AS3 thread never blocks
+// on the network. A 4xx/5xx is NOT a curl error:
 // the status is carried out and the thunk decides what AIR would dispatch.
 // Shared by URLLoader (ctx->stream == NULL: one body buffer, published at the
 // end) and URLStream (ctx->stream != NULL: appended live into the job).
@@ -10375,6 +10376,12 @@ static void as_http_perform(as_job* j, as_http_ctx* ctx) {
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, 20L);
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(h, CURLOPT_TIMEOUT, 30L);
+    // libcurl's default progress meter prints a transfer table to stderr on EVERY
+    // request. AIR prints nothing for a URLLoader, and now that Windows transfers
+    // run on four workers the rows interleave into unreadable noise -- disable it
+    // rather than leave the stream polluted (it also hid our own [as3-aot] http:
+    // failure lines behind a progress block).
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 1L);
 #ifdef ASC_HTTP2
     // Opt-in HTTP/2 over TLS: ALPN offers h2 first, and libcurl silently falls
     // back to 1.1 when the server does not. It is NOT the default because AIR's
@@ -10932,27 +10939,56 @@ static void as_job_run(as_job* j) {
     }
 }
 
-// POSIX targets get real threads. WASI Preview 1 has no thread primitives at
-// all, and Emscripten threads need -pthread plus SharedArrayBuffer and COOP/COEP
-// response headers (which the demo's plain static server does not send) while on
-// web the assets are already packed into the in-memory FS, so there is nothing
-// left to overlap. Windows is excluded because this preamble has no Win32 thread
-// path yet. Those targets keep the inline strategy.
-#if !defined(__wasi__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)
+// Real threads wherever the platform can give them. WASI Preview 1 has no thread
+// primitives at all, and Emscripten threads need -pthread plus SharedArrayBuffer
+// and COOP/COEP response headers (which the demo's plain static server does not
+// send) while on web the assets are already packed into the in-memory FS, so
+// there is nothing left to overlap. Those two keep the inline strategy.
+//
+// Windows used to be excluded as well ("no Win32 thread path yet"), so EVERY
+// transfer ran on the AS3 thread: the loop stalled for the full round trip of
+// each request, and a queue that fetches one item per COMPLETE -- the meeting
+// client's filmstrip does exactly that, 32 slides deep -- stalled it once per
+// item. AIR never blocks the UI thread for the network, and the measured symptom
+// was a document preview frozen for several seconds while its slides streamed in.
+// Windows therefore gets the same worker pool, over a thin SRWLOCK +
+// CONDITION_VARIABLE shim: the closest Win32 pair to pthread_mutex_t /
+// pthread_cond_t (one waiter per wakeup, no lost-signal window).
+#if !defined(__wasi__) && !defined(__EMSCRIPTEN__)
 #define ASC_ASYNC_THREADS 1
 #endif
 
 #ifdef ASC_ASYNC_THREADS
-#include <pthread.h>
 
 // Four workers: enough that the asset fan-out of a loader queue overlaps, small
 // enough not to oversubscribe a laptop. Claiming is first-come; there is no
 // priority, matching AIR's internal queue.
 #define AS_ASYNC_WORKERS 4
 
-static pthread_t as_worker_ids[AS_ASYNC_WORKERS];
-static pthread_mutex_t as_job_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t as_job_wake = PTHREAD_COND_INITIALIZER;
+#ifdef _WIN32
+// _beginthreadex, not CreateThread: the workers malloc, fopen and call libcurl,
+// and the MSVC CRT needs the per-thread block CreateThread does not set up.
+#include <process.h>
+typedef SRWLOCK as_jm_t;
+typedef CONDITION_VARIABLE as_jc_t;
+static as_jm_t as_job_lock = SRWLOCK_INIT;
+static as_jc_t as_job_wake = CONDITION_VARIABLE_INIT;
+#define AS_JOB_LOCK(m)      AcquireSRWLockExclusive(m)
+#define AS_JOB_UNLOCK(m)    ReleaseSRWLockExclusive(m)
+#define AS_JOB_WAIT(c, m)   SleepConditionVariableSRW((c), (m), INFINITE, 0)
+#define AS_JOB_WAKE_ALL(c)  WakeAllConditionVariable(c)
+#else
+#include <pthread.h>
+typedef pthread_mutex_t as_jm_t;
+typedef pthread_cond_t as_jc_t;
+static as_jm_t as_job_lock = PTHREAD_MUTEX_INITIALIZER;
+static as_jc_t as_job_wake = PTHREAD_COND_INITIALIZER;
+#define AS_JOB_LOCK(m)      pthread_mutex_lock(m)
+#define AS_JOB_UNLOCK(m)    pthread_mutex_unlock(m)
+#define AS_JOB_WAIT(c, m)   pthread_cond_wait((c), (m))
+#define AS_JOB_WAKE_ALL(c)  pthread_cond_broadcast(c)
+#endif
+
 static int as_workers_started = 0;
 
 // Requires as_job_lock held.
@@ -10967,22 +11003,48 @@ static as_job* as_job_claim_locked(void) {
     return NULL;
 }
 
-static void* as_job_worker(void* arg) {
-    (void)arg;
+// The pool loop, shared by both spawners. Never returns.
+static void as_job_worker_loop(void) {
     for (;;) {
-        pthread_mutex_lock(&as_job_lock);
+        AS_JOB_LOCK(&as_job_lock);
         as_job* j = as_job_claim_locked();
         while (j == NULL) {
-            pthread_cond_wait(&as_job_wake, &as_job_lock);
+            AS_JOB_WAIT(&as_job_wake, &as_job_lock);
             j = as_job_claim_locked();
         }
-        pthread_mutex_unlock(&as_job_lock);
+        AS_JOB_UNLOCK(&as_job_lock);
         as_job_run(j);
-        pthread_mutex_lock(&as_job_lock);
+        AS_JOB_LOCK(&as_job_lock);
         j->state = AS_JOB_DONE;
-        pthread_cond_broadcast(&as_job_wake);
-        pthread_mutex_unlock(&as_job_lock);
+        AS_JOB_WAKE_ALL(&as_job_wake);
+        AS_JOB_UNLOCK(&as_job_lock);
     }
+}
+
+#ifdef _WIN32
+static unsigned __stdcall as_job_worker_win(void* arg) {
+    (void)arg;
+    as_job_worker_loop();
+    return 0;
+}
+
+static void as_async_start_workers(void) {
+    if (as_workers_started) return;
+    as_workers_started = 1;
+    for (int i = 0; i < AS_ASYNC_WORKERS; i++) {
+        // Handles are detached at once: the pool lives for the whole process, and
+        // a spawn that fails just leaves one worker fewer (the queue is claimed
+        // first-come, so a short pool is slower but still correct).
+        HANDLE h = (HANDLE)_beginthreadex(NULL, 0, as_job_worker_win, NULL, 0, NULL);
+        if (h != NULL) CloseHandle(h);
+    }
+}
+#else
+static pthread_t as_worker_ids[AS_ASYNC_WORKERS];
+
+static void* as_job_worker(void* arg) {
+    (void)arg;
+    as_job_worker_loop();
     return NULL;
 }
 
@@ -10991,6 +11053,7 @@ static void as_async_start_workers(void) {
     as_workers_started = 1;
     for (int i = 0; i < AS_ASYNC_WORKERS; i++) pthread_create(&as_worker_ids[i], NULL, as_job_worker, NULL);
 }
+#endif
 #endif // ASC_ASYNC_THREADS
 
 // Publish a fully built job. This is the instant a worker may claim it, so it
@@ -11008,7 +11071,7 @@ static int as_job_publish(as_job* j) {
 #endif
 #ifdef ASC_ASYNC_THREADS
     as_async_start_workers();
-    pthread_mutex_lock(&as_job_lock);
+    AS_JOB_LOCK(&as_job_lock);
 #endif
     // A target that already has a job in flight is superseded: AIR restarts the
     // load when load()/openAsync() is called again, and the stale job must not
@@ -11019,14 +11082,14 @@ static int as_job_publish(as_job* j) {
     }
     if (!as_job_grow()) {
 #ifdef ASC_ASYNC_THREADS
-        pthread_mutex_unlock(&as_job_lock);
+        AS_JOB_UNLOCK(&as_job_lock);
 #endif
         return 0;
     }
     as_jobs[as_job_count++] = j;
 #ifdef ASC_ASYNC_THREADS
-    pthread_cond_broadcast(&as_job_wake);
-    pthread_mutex_unlock(&as_job_lock);
+    AS_JOB_WAKE_ALL(&as_job_wake);
+    AS_JOB_UNLOCK(&as_job_lock);
 #else
     // Inline strategy: the payload runs here and now, so the job is already
     // finished when publish returns and the frame boundary only runs the thunk.
@@ -11803,14 +11866,14 @@ static int as_async_tick_with(int sock_wait_ms) {
         as_job* live[8];
         int ln = 0;
 #ifdef ASC_ASYNC_THREADS
-        pthread_mutex_lock(&as_job_lock);
+        AS_JOB_LOCK(&as_job_lock);
 #endif
         for (int i = 0; i < as_job_count && ln < (int)(sizeof(live) / sizeof(live[0])); i++) {
             as_job* j = as_jobs[i];
             if (j != NULL && j->state == AS_JOB_RUNNING && j->net_events && !j->dead) live[ln++] = j;
         }
 #ifdef ASC_ASYNC_THREADS
-        pthread_mutex_unlock(&as_job_lock);
+        AS_JOB_UNLOCK(&as_job_lock);
 #endif
         for (int i = 0; i < ln; i++) as_net_pre_events((void*)live[i]);
     }
@@ -11822,7 +11885,7 @@ static int as_async_tick_with(int sock_wait_ms) {
 
         // Phase 1 (locked): pick the thunks that are due.
 #ifdef ASC_ASYNC_THREADS
-        pthread_mutex_lock(&as_job_lock);
+        AS_JOB_LOCK(&as_job_lock);
 #endif
         for (int i = 0; i < as_job_count; i++) {
             as_job* j = as_jobs[i];
@@ -11831,7 +11894,7 @@ static int as_async_tick_with(int sock_wait_ms) {
             if (n < (int)(sizeof(ready) / sizeof(ready[0]))) { ready[n++] = j; j->state = AS_JOB_FINISHING; }
         }
 #ifdef ASC_ASYNC_THREADS
-        pthread_mutex_unlock(&as_job_lock);
+        AS_JOB_UNLOCK(&as_job_lock);
 #endif
 
         // Phase 2 (lock released): publish the staged results.
@@ -11843,7 +11906,7 @@ static int as_async_tick_with(int sock_wait_ms) {
         // ones. A superseded FS_OPEN still closes the handle it opened: its thunk
         // never ran, so nothing else took ownership.
 #ifdef ASC_ASYNC_THREADS
-        pthread_mutex_lock(&as_job_lock);
+        AS_JOB_LOCK(&as_job_lock);
 #endif
         int keep = 0;
         for (int i = 0; i < as_job_count; i++) {
@@ -11860,7 +11923,7 @@ static int as_async_tick_with(int sock_wait_ms) {
         }
         as_job_count = keep;
 #ifdef ASC_ASYNC_THREADS
-        pthread_mutex_unlock(&as_job_lock);
+        AS_JOB_UNLOCK(&as_job_lock);
 #endif
 
         finished += n;
@@ -11881,7 +11944,7 @@ static int as_async_tick(void) { return as_async_tick_with(0); }
 static void as_async_tick_wait(void) {
     for (int pass = 0; pass < 16; pass++) {
 #ifdef ASC_ASYNC_THREADS
-        pthread_mutex_lock(&as_job_lock);
+        AS_JOB_LOCK(&as_job_lock);
         for (;;) {
             int pending = 0;
             for (int i = 0; i < as_job_count; i++) {
@@ -11889,9 +11952,9 @@ static void as_async_tick_wait(void) {
                 if (j != NULL && !j->dead && (j->state == AS_JOB_QUEUED || j->state == AS_JOB_RUNNING)) { pending = 1; break; }
             }
             if (!pending) break;
-            pthread_cond_wait(&as_job_wake, &as_job_lock);
+            AS_JOB_WAIT(&as_job_wake, &as_job_lock);
         }
-        pthread_mutex_unlock(&as_job_lock);
+        AS_JOB_UNLOCK(&as_job_lock);
 #endif
         // The 10 ms socket wait is what makes a loopback round trip (connect ->
         // write -> peer echo -> socketData) land inside one tickTimers() call
@@ -12067,7 +12130,7 @@ static int as_async_cancel(void* obj) {
 // the lock compiles out and every access is trivially ordered.
 static int as_stream_append(as_job* j, const void* p, size_t n) {
 #ifdef ASC_ASYNC_THREADS
-    pthread_mutex_lock(&as_job_lock);
+    AS_JOB_LOCK(&as_job_lock);
 #endif
     int ok = 1;
     if (j->len + n + 1 > j->bytes_cap) {
@@ -12083,7 +12146,7 @@ static int as_stream_append(as_job* j, const void* p, size_t n) {
         ((unsigned char*)j->bytes)[j->len] = 0;
     }
 #ifdef ASC_ASYNC_THREADS
-    pthread_mutex_unlock(&as_job_lock);
+    AS_JOB_UNLOCK(&as_job_lock);
 #endif
     return ok;
 }
@@ -12095,11 +12158,11 @@ static unsigned as_stream_available(void* job) {
     as_job* j = (as_job*)job;
     if (j == NULL) return 0u;
 #ifdef ASC_ASYNC_THREADS
-    pthread_mutex_lock(&as_job_lock);
+    AS_JOB_LOCK(&as_job_lock);
 #endif
     size_t n = (j->len > j->consumed) ? (j->len - j->consumed) : 0;
 #ifdef ASC_ASYNC_THREADS
-    pthread_mutex_unlock(&as_job_lock);
+    AS_JOB_UNLOCK(&as_job_lock);
 #endif
     return (unsigned)n;
 }
@@ -12112,14 +12175,14 @@ static int as_stream_read(void* job, void* dst, int n) {
     as_job* j = (as_job*)job;
     if (j == NULL || n <= 0) return 0;
 #ifdef ASC_ASYNC_THREADS
-    pthread_mutex_lock(&as_job_lock);
+    AS_JOB_LOCK(&as_job_lock);
 #endif
     size_t avail = (j->len > j->consumed) ? (j->len - j->consumed) : 0;
     size_t k = ((size_t)n < avail) ? (size_t)n : avail;
     if (k > 0 && dst != NULL) memcpy(dst, j->bytes + j->consumed, k);
     j->consumed += k;
 #ifdef ASC_ASYNC_THREADS
-    pthread_mutex_unlock(&as_job_lock);
+    AS_JOB_UNLOCK(&as_job_lock);
 #endif
     return (int)k;
 }

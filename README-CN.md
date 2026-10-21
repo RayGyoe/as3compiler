@@ -384,6 +384,9 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/autobake.as` — 增量重绘自动 `cacheAsBitmap`（静止触发烘焙、移动失效重烘焙）
 - `examples/autobake-origin.as` — 烘焙原点对齐设备像素栅格（抗锯齿圆在小数原点：修前与实时绘制差 1 物理像素、修后逐位相同；需 `examples/autobake-origin.build.json` 链 Skia）
 - `examples/bakecrisp.as` — 烘焙分辨率与 `BitmapData.draw` 几何口径（对齐 `adl`）
+- `examples/bitmap-smoothing.as` — `Bitmap.smoothing` 采样模式（阶段二百三十）：默认 `false` 是最近邻、`true` 是双线性；
+  同一张 16x1 黑白位图按 0.25 缩到 4x1，最近邻只会给出纯 0x00/0xFF、双线性必然混出中间灰。此前渲染分支恒用
+  Skia 的默认采样（最近邻）而把该属性丢掉了（需 `examples/bitmap-smoothing.build.json` 链 Skia）
 - `examples/bitmap-setpixels-endian.as` — `BitmapData.setPixels` 按 `ByteArray.endian` 解析 32 位字（`bigEndian` = 内存 `A,R,G,B`、
   `littleEndian` = 内存 `B,G,R,A`，真应用 ANE 摄像头帧正是后者），以及「`new BitmapData` + `setPixels` 填出来的位图在显示列表里
   必须真的画出像素、改像素后跟着变」（纯 C 构建用 `TextField` 探针判断有无光栅后端，无则跳过显示列表段；需
@@ -437,7 +440,12 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/loop-once.as` — 循环条件与 `for` update 每轮只求值一次
 - `examples/field-shadow.as` — 同名字段遮蔽各占一个 C 槽 + 容器元素自增 + 分支内副作用不外泄
 - `examples/null-eq.as` — null 只有一种表示（`==`/`!=`/`===`/`!==`/`typeof`/真值/`is Object`）
-- `examples/async-io.as` — 异步 IO 契约（终态事件前 `data` 为 `null`、`PROGRESS` 先于 `COMPLETE`、并发请求）
+- `examples/async-io.as` — 异步 IO 契约（终态事件前 `data` 为 `null`、`PROGRESS` 先于 `COMPLETE`、并发请求）；
+  阶段二百三十起 **Windows 与 POSIX 一样跑 4 个工作线程**：此前 Windows 没有线程后端，传输全内联在 AS3
+  线程上，`load()` 本身阻塞整个往返（实测 150 ms 的服务端延迟 ⇒ `load()` 阻塞 154 ms），而「每收到
+  `COMPLETE` 再取下一张」的胶片条（真应用的文档预览 32 页）会把 UI 卡住几秒；现在 `load()` 返回 1 ms、
+  4 个 400 ms 并发请求 417 ms 全部完成（内联需 ~1600 ms）。锁/唤醒走 `SRWLOCK` + `CONDITION_VARIABLE`
+  薄包层，POSIX 仍是 pthread，两侧共用同一份池循环（`test/unit/async-workers.ts` 钉住两侧形态）
 - `examples/socket.as` — `flash.net` 套接字层（`Socket`/`ServerSocket`/`XMLSocket` 环回断言）
 - `examples/proxy.as` — `flash.utils.Proxy` / `flash_proxy` 拦截
 - `examples/with.as` — `with` 语句

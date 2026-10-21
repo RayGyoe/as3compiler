@@ -301,7 +301,14 @@ function checkBakeResolution(): string[] {
     (emitted.match(/as_bake_scale2\(canvas, /g) ?? []).length === 1 &&
     !emitted.includes('double sc = ASC_render_scale;'));
   check('the bake blits back 1:1 in device pixels',
-    emitted.includes('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bxo, byo, (double)pw / sx, (double)ph / sy);') &&
+    // The sampler is derived, not fixed: 0 while the surface really is at the
+    // destination scale (nearest is then identical to linear and the pixel-identity
+    // invariant holds), 1 when as_bake_scale2's clamps left the blit as a
+    // minification (nearest aliases a photograph there -- see the note in
+    // as_render_cached).
+    emitted.includes('double bl_bx = 1.0, bl_by = 1.0; as_skia_canvas_total_scale(canvas, &bl_bx, &bl_by);') &&
+    emitted.includes('int bl_smooth = (fabs(bl_bx - sx) > 0.001 || fabs(bl_by - sy) > 0.001) ? 1 : 0;') &&
+    emitted.includes('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bxo, byo, (double)pw / sx, (double)ph / sy, bl_smooth);') &&
     emitted.includes('as_skia_canvas_scale(c2, sx, sy);') &&
     // as_bake_scale (max-of-axes) survives for the ONLY caller whose rect is
     // computed in logical units by itself: the 9-slice path.

@@ -22024,7 +22024,22 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // destination's, i.e. each surface pixel covers exactly one device pixel. The
     // rect is therefore pw/sx logical units wide (sx = device pixels per logical
     // unit inside the surface), not lw -- see as_bake_scale2.
-    this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bxo, byo, (double)pw / sx, (double)ph / sy);');
+    //
+    // The sampler is chosen from whether that 1:1 actually holds, not fixed:
+    // as_bake_scale2 clamps the scale UP to 1.0 (`if (dt_x < 1.0) dt_x = 1.0`, a bake
+    // is never rasterized below logical size) and further down by AS_BAKE_MAX_PIXELS,
+    // so on a canvas that is DOWNSCALED or whose scale moved since the bake the blit
+    // is a minification, and nearest sampling aliases it. Measured on the meeting
+    // client (ASC_BAKE_TRACE, temp/applog): a 1632x918 slide bitmap inside a
+    // cacheAsBitmap container bakes at sx=1.0 while its canvas runs at 0.784, i.e. a
+    // 0.784x nearest minification of a photograph -- and because the bake scale also
+    // comes out as 1.089 in other states, the aliasing pattern flipped with every
+    // rebuild, which is the "clear, then mushy, then clear again" the user sees.
+    // When bx == sx the two samplers are identical, so the pixel-identity invariant
+    // (uncached == cached, pinned by autobake-origin.as) is untouched.
+    this.line('double bl_bx = 1.0, bl_by = 1.0; as_skia_canvas_total_scale(canvas, &bl_bx, &bl_by);');
+    this.line('int bl_smooth = (fabs(bl_bx - sx) > 0.001 || fabs(bl_by - sy) > 0.001) ? 1 : 0;');
+    this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bxo, byo, (double)pw / sx, (double)ph / sy, bl_smooth);');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -22318,8 +22333,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // decoded view at all, and requiring one here painted NOTHING: the real app's
     // ANEVideo camera preview (new BitmapData + setPixels per frame) stayed a
     // black rectangle while its FPS text kept counting.
+    // Bitmap.smoothing decides the sampler: AIR defaults it to false (nearest,
+    // hard pixel edges on an upscaled bitmap) and true is bilinear. The meeting
+    // client's slide preview sets it true; ignoring it made a half-pixel scale
+    // wobble flicker between a sharp and a mushy image every frame.
     this.line('void* bd_img = as_bmd_visible_image(bd);');
-    this.line('if (bd_img != NULL) as_skia_canvas_draw_image_rect(canvas, bd_img, 0.0, 0.0, (double)bd->width, (double)bd->height);');
+    this.line('if (bd_img != NULL) as_skia_canvas_draw_image_rect(canvas, bd_img, 0.0, 0.0, (double)bd->width, (double)bd->height, ((Bitmap*)o)->smoothing ? 1 : 0);');
     this.indent--;
     this.line('} else if (as_is(o, &TextField_vt)) {');
     this.indent++;

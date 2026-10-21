@@ -230,6 +230,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 判断后端是否存在并跳过显示列表段，故与 bakecrisp.as 一样链 Skia，保证 CI 真的
   // 跑到后半段。
   'bitmap-setpixels-endian.as': ['--manifest', join(dir, 'bitmap-setpixels-endian.build.json')],
+  // bitmap-smoothing.as（阶段二百三十）断言的是 Bitmap.smoothing 的**采样结果**：
+  // 16x1 黑白相间的位图按 0.25 缩到 4x1，最近邻只能取到纯 0x00/0xFF，双线性必然混出一个
+  // 中间灰。这只有真的跑光栅后端才观察得到（纯 C 构建 draw() 是空桩），故与 bakecrisp.as
+  // 一样链 Skia —— 否则这条 pin 在 CI 上会走「skipped」，等于没钉。
+  'bitmap-smoothing.as': ['--manifest', join(dir, 'bitmap-smoothing.build.json')],
   // examples/textfield/ 是 TextField 显示矩阵探针（docs/zh-cn/flash-text.md §3）：它报的
   // `textWidth`/`textHeight`/`getLineMetrics` 只有在 Skia 文本后端下才存在，故目录单元
   // 与 bakecrisp.as 一样链 Skia。键带尾部 `/` 以区分目录单元与同名 .as。

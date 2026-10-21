@@ -1343,10 +1343,20 @@ void* sk_image_decode_bytes_argb(const void* data, size_t len, int* width, int* 
   return buf;
 }
 
+// Draw an image scaled into a destination rect. `smooth` is Bitmap.smoothing:
+// AIR's default is false, which is nearest-neighbour (a scaled-up 2x sprite keeps
+// hard pixel edges, adl-verified), and true is bilinear. Same pairing as
+// sk_paint_set_bitmap_shader below, so the two bitmap paths cannot drift apart.
+// Before stage 230 the flag was ignored and every Bitmap was nearest: the meeting
+// client sets smoothing=true on its slide bitmaps and the nearest blit turned a
+// half-pixel scale wobble into a visible sharp/mushy flicker.
 void sk_canvas_draw_image_rect(void* canvas, void* image,
-                               double dx, double dy, double dw, double dh) {
+                               double dx, double dy, double dw, double dh, int smooth) {
   SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
-  ((SkCanvas*)canvas)->drawImageRect((SkImage*)image, dst, SkSamplingOptions());
+  const SkSamplingOptions so =
+      smooth ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNearest)
+             : SkSamplingOptions(SkFilterMode::kNearest, SkMipmapMode::kNone);
+  ((SkCanvas*)canvas)->drawImageRect((SkImage*)image, dst, so);
 }
 
 // Draw one SUB-RECT of an image into a destination rect. Nine-slice scaling needs

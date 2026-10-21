@@ -11,7 +11,7 @@ import { generateC } from '../../src/codegen.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
 import { FRE_BODY } from '../../src/fre.ts';
 import { SymbolTable } from '../../src/symbols.ts';
-import { registerGroup, root } from '../harness.ts';
+import { registerGroup, root, readNorm } from '../harness.ts';
 
 // A left-nested chain of N string literals, which is what the emitter sees for
 // `"a" + "b" + ... + "z"` (and what Away3D's AGAL code builders produce with
@@ -2852,3 +2852,59 @@ function checkBitmapDrawableParam(): string[] {
   return bad;
 }
 registerGroup('unit: emit/BitmapDrawableParam', checkBitmapDrawableParam);
+// Bitmap.smoothing (stage 230). AIR's default is false = nearest-neighbour
+// sampling; true = bilinear. The Bitmap render branch used to pass Skia's default
+// SkSamplingOptions() (== nearest) no matter what the property said, so
+// `bitmap.smoothing = true` -- which the meeting client sets on every slide and
+// screen-share bitmap -- was silently ignored, and a sub-pixel scale wobble showed
+// up as a sharp/mushy flicker instead of a smooth interpolation.
+//
+// The pin covers the three places the flag has to travel through (the extern
+// declaration, the ASC_USE_SKIA wrapper, the no-Skia stub) plus the two call
+// sites, because a signature change that misses the stub only fails on a build
+// that has no Skia -- i.e. exactly the configuration the examples suite runs.
+function checkBitmapSmoothing(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [smoothing] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [smoothing] ${label}`); }
+  };
+
+  const glue = readNorm(join(root, 'vendor', 'skia_glue.cc'));
+  const pre = RUNTIME_PREAMBLE;
+  const c = generateC(parse('var bm:Bitmap = new Bitmap(new BitmapData(2, 2, false, 0));\nbm.smoothing = true;\n')).c;
+
+  // 1. The glue takes the flag and maps it onto the SAME sampling pair the bitmap
+  //    shader path already uses (kLinear/kNearest for smooth, kNearest/kNone for
+  //    the AIR default).
+  const gi = glue.indexOf('void sk_canvas_draw_image_rect(');
+  const gbody = gi < 0 ? '' : glue.slice(gi, glue.indexOf('\n}', gi));
+  check('the glue draw_image_rect takes an int smooth', /sk_canvas_draw_image_rect\(void\* canvas, void\* image,[\s\S]{0,160}int smooth\)/.test(glue));
+  check('...and no longer draws with the bare default sampler', !/drawImageRect\(\(SkImage\*\)image, dst, SkSamplingOptions\(\)\)/.test(gbody));
+  check('...smooth=true is kLinear', /smooth \? SkSamplingOptions\(SkFilterMode::kLinear, SkMipmapMode::kNearest\)/.test(gbody));
+  check('...smooth=false is kNearest', /SkSamplingOptions\(SkFilterMode::kNearest, SkMipmapMode::kNone\)/.test(gbody));
+
+  // 2. The flag must cross the C boundary in all three declarations, or the
+  //    skia and no-skia builds disagree about the signature.
+  check('the extern declaration carries int smooth',
+    pre.includes('extern void sk_canvas_draw_image_rect(void* canvas, void* image, double dx, double dy, double dw, double dh, int smooth);'));
+  check('the ASC_USE_SKIA wrapper carries int smooth',
+    /static inline void as_skia_canvas_draw_image_rect\(void\* c, void\* img, double dx, double dy, double dw, double dh, int smooth\) \{ sk_canvas_draw_image_rect\(c, img, dx, dy, dw, dh, smooth\); \}/.test(pre));
+  check('the no-Skia stub carries int smooth',
+    pre.includes('static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh, int smooth) { (void)c; (void)img; (void)dx; (void)dy; (void)dw; (void)dh; (void)smooth; }'));
+
+  // 3. The Bitmap branch passes the AS3 property, not a constant.
+  check('the Bitmap render branch passes ((Bitmap*)o)->smoothing',
+    c.includes('as_skia_canvas_draw_image_rect(canvas, bd_img, 0.0, 0.0, (double)bd->width, (double)bd->height, ((Bitmap*)o)->smoothing ? 1 : 0);'));
+
+  // 4. The cache-bake blit derives its sampler (see as_render_cached): nearest while
+  //    the surface is exactly at the destination scale, linear while as_bake_scale2's
+  //    up-clamp left it a minification.
+  check('the cache bake blit derives its sampler from the canvas scale',
+    c.includes('int bl_smooth = (fabs(bl_bx - sx) > 0.001 || fabs(bl_by - sy) > 0.001) ? 1 : 0;'));
+
+  console.log(`     [smoothing] ${ok} Bitmap.smoothing check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/BitmapSmoothing', checkBitmapSmoothing);
