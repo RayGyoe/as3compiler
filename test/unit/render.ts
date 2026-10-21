@@ -353,8 +353,13 @@ function checkBakeResolution(): string[] {
     (emitted.match(/ASC_render_scale = keep_render_scale;/g) ?? []).length >= 5);
 
   // (3) The source's own transform is zeroed for the raster and restored after.
+  //
+  // The source is reached through the interface's object half (`src`), not through
+  // the raw parameter, because the parameter is an IBitmapDrawable pair -- a
+  // BitmapData argument has no DisplayObject fields at all, so there is nothing to
+  // zero for it (that arm samples pixels instead).
   check('draw ignores the source transform',
-    emitted.includes('DisplayObject* sdo = (DisplayObject*)source;') &&
+    emitted.includes('DisplayObject* sdo = (DisplayObject*)src;') &&
     emitted.includes('sdo->x = 0.0; sdo->y = 0.0; sdo->rotation = 0.0; sdo->scaleX = 1.0; sdo->scaleY = 1.0;') &&
     emitted.includes('if (sdo->transform != NULL) sdo->transform->matrix = NULL;') &&
     emitted.includes('as_render_object(canvas, sdo);') &&

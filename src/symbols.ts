@@ -691,6 +691,21 @@ export class SymbolTable {
     // interface; only the field reads/writes Canvas performs are needed.
     interfaceNames.add('IGraphicsData');
     this.interfaceMap.set('IGraphicsData', { methods: new Map(), getters: new Map(), setters: new Map(), reflectFqn: 'flash.display::IGraphicsData' });
+    // flash.display.IBitmapDrawable — the declared type of BitmapData.draw()'s
+    // `source` (and of Graphics.beginBitmapFill's bitmap is NOT it: that one really
+    // is BitmapData). AIR's implementors are exactly BitmapData and DisplayObject —
+    // in AVM2 BitmapData is NOT a DisplayObject, so the two are unrelated roots —
+    // which is why the parameter cannot be typed as either one: typed as BitmapData
+    // a MovieClip throws #1034, typed as DisplayObject a BitmapData throws #1034.
+    // Measured symptom: the real app's ppt-share capture
+    // (ShareWindowView/FilePreviewView `pBitmapData.draw(skinView.view, ...)`,
+    // where `view` is a dynamic child read) threw
+    // "Error #1034: cannot convert [object MovieClip] to flash.display.BitmapData"
+    // on every capture tick, so the shared-document frame was never produced.
+    // Marker interface like IGraphicsData: it declares no members, so nothing can
+    // dispatch through the `vt` half of the pair (see emit.ts as_v_req_drawable).
+    interfaceNames.add('IBitmapDrawable');
+    this.interfaceMap.set('IBitmapDrawable', { methods: new Map(), getters: new Map(), setters: new Map(), reflectFqn: 'flash.display::IBitmapDrawable' });
     const gsff = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'GraphicsSolidFill', isStatic: false, isConst: false });
     this.classMap.set('GraphicsSolidFill', {
       fields: new Map([
@@ -1417,7 +1432,11 @@ export class SymbolTable {
       constructor: { params: [] },
       superClass: 'EventDispatcher',
       isFinal: false,
-      implements: [],
+      // AIR: DisplayObject implements IBitmapDrawable (see the interface's
+      // registration). Registered HERE rather than on every display subclass so
+      // describeType, which walks the vtable super chain, still reports it once for
+      // the whole family.
+      implements: ['IBitmapDrawable'],
     });
     // InteractiveObject adds mouse/focus interaction flags (mouseEnabled/mouseChildren
     // drive the hit-test three-state machine, mouseChildren=false makes a parent
@@ -5278,8 +5297,14 @@ export class SymbolTable {
           { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
           { name: 'color', type: 'uint', defaultValue: null, isRest: false },
         ])],
+        // draw(source:IBitmapDrawable, ...) -- AIR's parameter type, NOT BitmapData.
+        // A statically typed MovieClip/Sprite/Loader/Stage argument passes straight
+        // through (DisplayObject branch of the runtime), a BitmapData samples its
+        // pixels, and a dynamic (`*`) argument is checked at run time: BitmapData or
+        // any DisplayObject is accepted, everything else throws
+        // #1034 "cannot convert <v> to flash.display.IBitmapDrawable."
         ['draw', bdm({ kind: 'void' }, [
-          { name: 'source', type: 'BitmapData', defaultValue: null, isRest: false },
+          { name: 'source', type: 'IBitmapDrawable', defaultValue: null, isRest: false },
           { name: 'matrix', type: 'Matrix', defaultValue: { kind: 'Null' }, isRest: false },
           { name: 'colorTransform', type: 'ColorTransform', defaultValue: { kind: 'Null' }, isRest: false },
           { name: 'blendMode', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
@@ -5386,7 +5411,9 @@ export class SymbolTable {
       ] },
       superClass: 'Object',
       isFinal: false,
-      implements: [],
+      // The second IBitmapDrawable implementor (the first is DisplayObject):
+      // BitmapData is not a DisplayObject, it is a sibling root.
+      implements: ['IBitmapDrawable'],
     });
     // flash.display.BitmapDataChannel: uint channel selectors used by
     // BitmapData.copyChannel / DisplacementMapFilter componentX/Y.

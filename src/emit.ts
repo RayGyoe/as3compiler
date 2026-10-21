@@ -2262,6 +2262,10 @@ export class Emitter {
     this.line('static char* as_app_dir(void);');
     this.line('static void URLRequest__navigate(URLRequest* request, char* window);');
     this.line('static as_value as_any_call(as_value v, const char* name, as_value* args, int argc);');
+    // The IBitmapDrawable conversion for a dynamic argument. Defined next to
+    // BitmapData_draw (it needs the two accepted vtables); declared here because the
+    // `__dyn`/`__bound` thunks that call it are emitted before the class bodies.
+    this.line('static void* as_v_req_drawable(as_value v, const char* fqn);');
     this.line('');
   }
 
@@ -16995,6 +16999,26 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('for (int y = y0; y < y0 + h; y++) for (int x = x0; x < x0 + w; x++) p[y * bd->width + x] = argb;');
     this.indent--;
     this.line('}');
+    // flash.display.IBitmapDrawable exists as a marker interface with exactly two
+    // implementors and no members, so a DYNAMIC argument is validated here and the
+    // pair's vtable half is left NULL (nothing can dispatch through it). AIR's
+    // acceptance set is BitmapData | DisplayObject -- and BitmapData is not a
+    // DisplayObject, so both roots have to be tested. Anything else throws #1034
+    // naming the interface, which is the message AIR prints; `null`/`undefined` are
+    // valid references and stay null (the draw body then paints nothing).
+    this.line('static void* as_v_req_drawable(as_value v, const char* fqn) {');
+    this.indent++;
+    this.line('if (v.tag == 0 || v.tag == 5) return NULL;');
+    this.line('if (v.tag == 4) {');
+    this.indent++;
+    this.line('void* p = as_v_obj_val(v);');
+    this.line('if (as_heap_kind(p) == GCT_CLASS && (as_is(p, &BitmapData_vt) || as_is(p, &DisplayObject_vt))) return p;');
+    this.indent--;
+    this.line('}');
+    this.line('as_throw_1034(v, fqn);');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
     // draw: composite `source` into this bitmap under an affine matrix. AS3 semantics:
     // the matrix maps source-space into destination-space, so each destination pixel
     // samples source via the INVERSE transform (pixel-center mapping). smoothing toggles
@@ -17039,10 +17063,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('dp[i] = (ao << 24) | (ro << 16) | (go << 8) | bo;');
     this.indent--;
     this.line('}');
-    this.line('void BitmapData_draw(void* _this, BitmapData* source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {');
+    this.line('void BitmapData_draw(void* _this, IBitmapDrawable source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {');
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
-    this.line('if (source == NULL || bd->pixels == NULL) return;');
+    // The parameter is IBitmapDrawable (AIR's type), i.e. a `{ obj, vt }` pair. Only
+    // the object half is meaningful: the interface declares no members, so the
+    // partner vtable is never dispatched through. Accepting the pair here rather
+    // than a `BitmapData*` is what lets `draw(mc)` reach the DisplayObject branch
+    // below instead of failing the call-site coercion with #1034.
+    this.line('void* src = source.obj;');
+    this.line('if (src == NULL || bd->pixels == NULL) return;');
     this.line('bd->_px_ver++;');
     this.line('if (blendMode != NULL && strcmp(blendMode, "normal") != 0) { as_throw(Error_new((char*)"BitmapData.draw: blendMode not implemented", 0)); return; }');
     this.line('int cx0 = 0, cy0 = 0, cx1 = bd->width, cy1 = bd->height;');
@@ -17074,9 +17104,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('const unsigned* sp;');
     this.line('int sw = 0, sh = 0;');
     this.line('unsigned* owned = NULL;');
-    this.line('if (as_is(source, &TextField_vt)) {');
+    this.line('if (as_is(src, &TextField_vt)) {');
     this.indent++;
-    this.line('TextField* tf = (TextField*)source;');
+    this.line('TextField* tf = (TextField*)src;');
     this.line('as_tf_apply_autosize(tf);');
     // +1 when bordered: AIR's own draw() captures the outer border lines at
     // x=width/y=height (measured, Ed6.as), so the raster must be one pixel wider
@@ -17101,7 +17131,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_skia_surface_delete(surface);');
     this.line('sp = owned;');
     this.indent--;
-    this.line('} else if (as_is(source, &DisplayObject_vt)) {');
+    this.line('} else if (as_is(src, &DisplayObject_vt)) {');
     this.indent++;
     // Any other DisplayObject (a Sprite, a Shape, a whole Stage): AS3 types the
     // parameter IBitmapDrawable, so this is the same call as `bd.draw(stage)`.
@@ -17130,7 +17160,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // only, i.e. the two do NOT multiply. Appearance (alpha, visible, filters,
     // children) still applies, so the transform fields are zeroed for the duration
     // of the raster and restored right after instead of skipping as_render_object.
-    this.line('DisplayObject* sdo = (DisplayObject*)source;');
+    this.line('DisplayObject* sdo = (DisplayObject*)src;');
     this.line('double sx_kx = sdo->x, sx_ky = sdo->y, sx_kr = sdo->rotation, sx_ksx = sdo->scaleX, sx_ksy = sdo->scaleY;');
     this.line('Matrix* sx_km = (sdo->transform != NULL) ? sdo->transform->matrix : NULL;');
     this.line('sdo->x = 0.0; sdo->y = 0.0; sdo->rotation = 0.0; sdo->scaleX = 1.0; sdo->scaleY = 1.0;');
@@ -17145,11 +17175,25 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_skia_surface_delete(surface);');
     this.line('sp = owned;');
     this.indent--;
+    this.line('} else if (as_is(src, &BitmapData_vt)) {');
+    this.indent++;
+    // A real BitmapData samples its OWN pixels. The vtable test is what separates
+    // it from the two branches above: BitmapData is NOT a DisplayObject in AVM2, so
+    // neither `as_is(src, &TextField_vt)` nor `as_is(src, &DisplayObject_vt)` can
+    // match it, and reading its `pixels`/`width` without the test would reinterpret
+    // a Sprite's fields.
+    this.line('BitmapData* sbd = (BitmapData*)src;');
+    this.line('if (sbd->pixels == NULL) { ASC_render_scale = keep_render_scale; return; }');
+    this.line('sp = (const unsigned*)sbd->pixels;');
+    this.line('sw = sbd->width; sh = sbd->height;');
+    this.indent--;
     this.line('} else {');
     this.indent++;
-    this.line('if (source->pixels == NULL) { ASC_render_scale = keep_render_scale; return; }');
-    this.line('sp = (const unsigned*)source->pixels;');
-    this.line('sw = source->width; sh = source->height;');
+    // Neither drawable root: nothing to paint. AIR never reaches here (the
+    // parameter conversion rejects anything that is not BitmapData/DisplayObject
+    // with #1034 before the method body runs), so this is the defensive arm for a
+    // hand-written C caller, not a semantic branch.
+    this.line('ASC_render_scale = keep_render_scale; return;');
     this.indent--;
     this.line('}');
     this.line('ASC_render_scale = keep_render_scale;');
@@ -32939,6 +32983,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       }
       case 'interface': {
         const iname = (target as { name: string }).name;
+        // IBitmapDrawable accepts BitmapData | DisplayObject and rejects everything
+        // else with AIR's #1034, so its dynamic conversion cannot use the generic
+        // interface lookup (which answers NULL-vt for a subclass of a built-in
+        // implementor). The marker interface has no members: the vt half stays NULL.
+        if (iname === 'IBitmapDrawable') {
+          return `(IBitmapDrawable){ (void*)as_v_req_drawable(${e.code}, "flash.display::IBitmapDrawable"), NULL }`;
+        }
         return `(${iname}){ (void*)as_v_obj_val(${e.code}), (${iname}_vtable*)as_iface_lookup(as_v_obj_val(${e.code}), "${iname}") }`;
       }
       case 'function': return `((as_fn)as_v_obj_val(${e.code}))`;
@@ -33199,6 +33250,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       if (e.type.kind === 'object') {
         const cls = (e.type as { className: string }).className;
         const iname = (target as { name: string }).name;
+        // IBitmapDrawable's two implementors are roots of DIFFERENT hierarchies, so
+        // only BitmapData/DisplayObject themselves own a per-class vtable for it
+        // (`Sprite` and every other subclass reaches the interface by inheritance,
+        // which emits no separate vtable). The pair's vt half is therefore left
+        // NULL for this marker interface -- it has no members to dispatch.
+        if (iname === 'IBitmapDrawable') return `(${iname}){ (void*)(${e.code}), NULL }`;
         const cinfo = this.symbols.getClass(cls);
         // A class that declares this interface directly owns a per-class vtable
         // symbol, so the pair is built statically. Everything else must look the

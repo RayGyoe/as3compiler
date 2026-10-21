@@ -2358,8 +2358,9 @@ function checkRenderBitmapLivePixels(): string[] {
     check(name + ' bumps _px_ver', fn.length > 0 && fn.includes('_px_ver++'));
   }
   // draw/filter are emitted inline with their argument list on the same line.
+  // draw's first parameter is IBitmapDrawable (AIR's declared type), not BitmapData.
   for (const [name, sig] of [
-    ['draw', 'void BitmapData_draw(void* _this, BitmapData* source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {'],
+    ['draw', 'void BitmapData_draw(void* _this, IBitmapDrawable source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {'],
     ['copyChannel', 'void BitmapData_copyChannel(void* _this, BitmapData* src'],
     ['setVector', 'void BitmapData_setVector(void* _this, Rectangle* rect, as_vector_uint* v) {'],
     ['scroll', 'void BitmapData_scroll(void* _this, int dx, int dy) {'],
@@ -2765,3 +2766,89 @@ function checkStageSizeFollowsScaleMode(): string[] {
   return bad;
 }
 registerGroup('unit: emit/StageSizeFollowsScaleMode', checkStageSizeFollowsScaleMode);
+
+// BitmapData.draw() takes an IBitmapDrawable, and that interface has TWO unrelated
+// implementors: DisplayObject and BitmapData (in AVM2 a BitmapData is NOT a
+// DisplayObject). Typing the parameter as either one made every capture path throw
+// #1034 -- measured on the real app, whose capture is
+//   bd.draw(skinView.view, matrix, null, Normal, null, true)
+// where `view` is a dynamically read child (a MovieClip), so the call site coerced
+// with as_v_req_inst(..., &BitmapData_vt, "flash.display::BitmapData") and every
+// share-screen frame died with
+//   Error #1034: Type Coercion failed: cannot convert [object MovieClip] to
+//   flash.display.BitmapData.
+// (temp/bmdraw, linked and run: sprite / movieclip / shape+textfield / typed
+// DisplayObject / dynamic DisplayObject all paint pixels, a dynamic number throws
+// #1034 naming flash.display.IBitmapDrawable, and null does not throw.)
+//
+// Pinned here: the declared parameter type (reflection signature too, since
+// describeType reads the same table), the marker-interface registration that makes
+// `x is IBitmapDrawable` true for BOTH roots, the explicit three-way vtable dispatch
+// in the method body, and the dynamic coercion helper. Reintroducing the single-root
+// type fails all of these at once.
+function checkBitmapDrawableParam(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [drawable] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [drawable] ${label}`); }
+  };
+  const c = generateC(parse('var b:BitmapData = new BitmapData(2, 2, false, 0);\nb.draw(new Sprite());\n')).c;
+  const fnBody = (sig: string): string => {
+    const i = c.indexOf(sig);
+    if (i < 0) return '';
+    const j = c.indexOf('\n}', i);
+    return c.slice(i, j < 0 ? c.length : j);
+  };
+
+  // 1. The declared parameter type is the interface, in C and in reflection.
+  const sig = 'void BitmapData_draw(void* _this, IBitmapDrawable source, Matrix* matrix, ColorTransform* ct, char* blendMode, Rectangle* clipRect, bool smoothing) {';
+  check('BitmapData_draw takes IBitmapDrawable', c.includes(sig));
+  check('describeType reports flash.display::IBitmapDrawable for the source parameter',
+    c.includes('"void;flash.display::IBitmapDrawable;?flash.geom::Matrix;'));
+  check('the old BitmapData-typed parameter is gone',
+    !c.includes('void BitmapData_draw(void* _this, BitmapData* source'));
+
+  // 2. The marker interface is registered and both roots implement it.
+  check('IBitmapDrawable is emitted as an interface type', c.includes('struct IBitmapDrawable {'));
+  check('DisplayObject implements IBitmapDrawable',
+    c.includes('static IBitmapDrawable_vtable DisplayObject_IBitmapDrawable_vt'));
+  check('BitmapData implements IBitmapDrawable (a separate root)',
+    c.includes('static IBitmapDrawable_vtable BitmapData_IBitmapDrawable_vt'));
+  check('the implemented-interface table names the reflect FQN',
+    c.includes('{ "IBitmapDrawable", "flash.display::IBitmapDrawable" }'));
+
+  // 3. The body dispatches by vtable on the object half, one arm per root, and only
+  //    an explicit BitmapData test reads its pixels.
+  const body = fnBody(sig);
+  check('the body reads the pair, object half', body.includes('void* src = source.obj;'));
+  check('the TextField arm tests the vtable', body.includes('if (as_is(src, &TextField_vt)) {'));
+  check('the DisplayObject arm tests the vtable', body.includes('} else if (as_is(src, &DisplayObject_vt)) {'));
+  check('the BitmapData arm tests its own vtable before touching pixels',
+    body.includes('} else if (as_is(src, &BitmapData_vt)) {') && body.includes('BitmapData* sbd = (BitmapData*)src;'));
+  check('nothing dereferences the raw parameter as a BitmapData',
+    !body.includes('(BitmapData*)source') && !body.includes('source->pixels'));
+
+  // 4. A static call site passes the object straight through (no coercion), and a
+  //    dynamic one goes through the runtime helper.
+  check('a static DisplayObject argument builds the pair without a vtable lookup',
+    /\(IBitmapDrawable\)\{ \(void\*\)\([a-z_0-9]+(\[[0-9]+\])?\), NULL \}/.test(c));
+  check('draw is no longer coerced to BitmapData anywhere',
+    !/BitmapData_draw(_\w+)?\([^;]{0,400}?as_v_req_inst\(args\[0\], &BitmapData_vt/.test(c));
+
+  // 5. The dynamic helper accepts both roots and rejects everything else with the
+  //    interface name (AIR's message), letting null through.
+  const req = fnBody('static void* as_v_req_drawable(as_value v, const char* fqn) {');
+  check('as_v_req_drawable is emitted', req.length > 0);
+  check('...accepts BitmapData and DisplayObject',
+    req.includes('as_is(p, &BitmapData_vt)') && req.includes('as_is(p, &DisplayObject_vt)'));
+  check('...requires a heap class instance', req.includes('as_heap_kind(p) == GCT_CLASS'));
+  check('...throws #1034 for anything else', req.includes('as_throw_1034(v, fqn)'));
+  check('...lets null/undefined through', req.includes('if (v.tag == 0 || v.tag == 5) return NULL;'));
+  check('the dynamic thunk routes through as_v_req_drawable',
+    c.includes('as_v_req_drawable(args[0], "flash.display::IBitmapDrawable")'));
+
+  console.log(`     [drawable] ${ok} IBitmapDrawable draw check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/BitmapDrawableParam', checkBitmapDrawableParam);
