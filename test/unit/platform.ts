@@ -1068,6 +1068,32 @@ function checkPresentScale(): string[] {
   check('...so the drawable size stays what SDL reported (the gravity is the only change)',
     /m->layer\.drawableSize = CGSizeMake\(\(CGFloat\)width, \(CGFloat\)height\);/.test(mtl));
 
+  // ---- The device scale must not be read out of two SDL size queries ----
+  // Measured on macOS (temp/resizeprobe, 2026-10-21) while dragging a window edge:
+  // SDL_GetWindowSize reads SDL's CACHED logical size (written from the resize
+  // event) while SDL_GetWindowSizeInPixels asks Cocoa live, so mid-drag the pair is
+  // one step apart — the layer was truly 329x580 pt / 658x1160 px while SDL still
+  // reported lw=320, i.e. pw/lw = 2.056 instead of the display's 2.0. The stage size
+  // and the canvas were then computed from that same bogus ratio, so the picture was
+  // scaled ~3% too big and shrank back on the next step: the content visibly
+  // "breathes" while the window is dragged. Measured over four drags (L/R/SE/SW):
+  // 151/151 resize events reported contentsScaleFactor != 2 before the fix, 0/151
+  // after. A right/bottom drag hides it behind the stage background the app paints
+  // in the exposed area, which is why only the other corners were reported.
+  const glue = strip(read('window_glue.cc'));
+  const iDevScale = glue.indexOf('static int do_resize(WinCtx* c) {');
+  const iDevNext = glue.indexOf('static void sk_measure_borders(');
+  const resizeBody = (iDevScale >= 0 && iDevNext > iDevScale) ? glue.slice(iDevScale, iDevNext) : '';
+  check('do_resize takes the device scale from the window/display, never by dividing SDL\'s two size queries',
+    resizeBody.includes('sk_window_device_scale(') &&
+    !/\(double\)npw \/ \(double\)nw/.test(resizeBody));
+  check('...the seam asks the NSWindow for its own backing scale (stable for one display)',
+    /sel_registerName\("backingScaleFactor"\)/.test(glue));
+  check('...and reconciles a logical size that lags the live pixel size',
+    /if \(dw > \*lw\) \*lw = dw;/.test(glue) && /if \(dh > \*lh\) \*lh = dh;/.test(glue));
+  check('...while a platform without that query keeps SDL\'s own ratio unchanged',
+    /return \(\*lw > 0\) \? \(double\)pw \/ \(double\)\*lw : 1\.0;/.test(glue));
+
   // ---- D3D12: present the back buffer 1:1, never stretch it to the client rect ----
   const d3d = strip(read('d3d_glue.cc'));
   check('dxgi1_4.h is included (it is what defines the scaling enum)',

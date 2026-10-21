@@ -1109,8 +1109,11 @@ Retina 高清渲染（`ASC_DISPLAY_HIGH=1`）：
   窗口，用 `SDL_GL_GetDrawableSize` 读出物理像素尺寸与倍率——因为 Skia surface 必须在窗口存在**之前**
   按物理像素创建。`Stage.render` 与 `Stage.showWindow` 都走 `as_window_device_scale()` 拿倍率，
   并在 canvas 上 `scale(scale, scale)` 后按逻辑坐标绘制，所以 AS3 代码里的坐标系不变。
-- `Stage.contentsScaleFactor` 返回实测倍率（Retina 上 2.0，`standard` 下 1.0）。注意它只在
-  `render`/`showWindow` 时写入，document class 构造期读到的是初始 `1.0`。
+- `Stage.contentsScaleFactor` 返回实测倍率（Retina 上 2.0，`standard` 下 1.0），值取自**窗口所在
+  显示器的 backing scale**（macOS 直接问 NSWindow 的 `backingScaleFactor`），所以窗口创建后立刻可读，
+  document class 构造期就是 2.0 —— 与 `adl` 一致。**不要**用“物理像素 / 逻辑点”现算：拖动窗口时 SDL 的
+  像素尺寸（现场问 Cocoa）与逻辑尺寸（SDL 缓存、由 resize 事件写入）会差一档，商给出 2.006–2.0625 这类
+  假倍率，画布与舞台同源同错 ⇒ 整幅画面被放大 ~3%，拖起来一胀一缩地“呼吸”（阶段二百二十四）。
 - `Stage.nativeWindow` 在 document class 构造期**已非 `null`**（对齐 AIR 的「OS 窗口先于文档类存在」）：
   我们的窗口本要到 `showWindow` 才建，故 `Stage_get_nativeWindow` 在根 Stage 尚未绑定窗口槽位时
   **惰性绑定** `ASC_wins[0]`（`ASC_win_claim_main` 相应改为非摧毁式占用），此后 `showWindow` 再认领

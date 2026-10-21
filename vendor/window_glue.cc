@@ -508,6 +508,11 @@ static void present_frame(SDL_Renderer* ren, SDL_Texture* tex, void* pixels, int
   SDL_RenderPresent(ren);
 }
 
+// Defined below, together with its rationale (a window whose size SDL is still
+// reporting across a resize): the device pixel ratio plus a logical size that is
+// consistent with the physical one.
+static double sk_window_device_scale(SDL_Window* win, int* lw, int* lh, int pw, int ph);
+
 // Rebuild the offscreen surface + streaming texture to the window's current
 // size. Returns 1 when a resize happened, 0 when the size is unchanged, -1 when
 // the new surface no longer exposes pixels (fatal).
@@ -529,11 +534,9 @@ static int do_resize(WinCtx* c) {
   SDL_GetWindowSizeInPixels(c->win, &npw, &nph);
   if (nw <= 0 || nh <= 0 || npw <= 0 || nph <= 0) return 0;
   if (npw == c->pw && nph == c->ph) return 0;
-  // Device pixel ratio (contentsScaleFactor) = physical / logical. Compute it
-  // here from SDL's own queries — the single reliable source — and hand it to
-  // the AS3 side instead of letting it re-derive pw/lw (which can disagree
-  // while the window straddles two displays with different scales).
-  double scale = (double)npw / (double)nw;
+  // Device pixel ratio (contentsScaleFactor) + a self-consistent logical size
+  // (see sk_window_device_scale for why dividing SDL's two queries is wrong).
+  double scale = sk_window_device_scale(c->win, &nw, &nh, npw, nph);
   if (c->on_resize != NULL) {
     void* ns = c->on_resize(c->win == NULL ? -1 : (int)(c - g_wins), nw, nh, npw, nph, scale);
     if (c->is_gpu) {
@@ -574,7 +577,59 @@ static sk_nsrect sk_ns_msg_content_rect(void* nswin, sk_nsrect frame) {
   sk_nsrect (*fn)(void*, SEL, sk_nsrect) = (sk_nsrect (*)(void*, SEL, sk_nsrect))objc_msgSend;
   return fn(nswin, sel_registerName("contentRectForFrameRect:"), frame);
 }
+
+// The backing scale the window's backing store is actually drawn at (1.0 on a
+// non-Retina display, 2.0 on Retina) — queried from the NSWindow, so it is
+// stable for as long as the window stays on one display. Returns 0 when it
+// cannot be read, so the caller falls back to SDL's own queries.
+static double sk_window_backing_scale(SDL_Window* win) {
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (win == NULL || !SDL_GetWindowWMInfo(win, &info)) return 0.0;
+  if (info.subsystem != SDL_SYSWM_COCOA || info.info.cocoa.window == NULL) return 0.0;
+  double (*fn)(void*, SEL) = (double (*)(void*, SEL))objc_msgSend;
+  return fn(info.info.cocoa.window, sel_registerName("backingScaleFactor"));
+}
+#else
+static double sk_window_backing_scale(SDL_Window* win) { (void)win; return 0.0; }
 #endif
+
+// Device pixel ratio (contentsScaleFactor) + the logical client size, kept
+// MUTUALLY CONSISTENT by construction — the AS3 side maps its stage (in logical
+// points) onto a canvas of pw x ph physical pixels with exactly this ratio, so a
+// ratio that does not match the pair stretches the whole picture.
+//
+// Do NOT divide SDL's two queries on macOS: SDL_GetWindowSize reads SDL's cached
+// logical size (written from the resize event) while SDL_GetWindowSizeInPixels
+// asks Cocoa live, so during a live resize they are one step apart. Measured
+// during a left-edge drag: the layer was truly 329x580 pt / 658x1160 px while
+// SDL still reported lw=320, giving scale 2.056 instead of 2.0 — and because the
+// canvas and the stage were both derived from that same bogus ratio, the picture
+// did not merely sit in the wrong place, the WHOLE thing was scaled up by ~3%,
+// so the content visibly breathed (and shrank back) on every resize step (the
+// "picture distorts while dragging" report; a right/bottom drag hides it behind
+// the stage background the app already paints there). A stage size lagging its
+// own canvas also meant stageWidth/stageHeight could be a step behind the window.
+//
+// The window's own backing scale is the stable answer (it changes only when the
+// display does), so take it and read the logical size back out of the live pixel
+// size whenever the cached one disagrees. On platforms without it, SDL's ratio is
+// what we have (and there the cross-display case is the one that matters).
+static double sk_window_device_scale(SDL_Window* win, int* lw, int* lh, int pw, int ph) {
+  double bs = sk_window_backing_scale(win);
+  if (bs > 0.0) {
+    const int dw = (int)((double)pw / bs + 0.5);
+    const int dh = (int)((double)ph / bs + 0.5);
+    // Only override a logical size that is BEHIND the live pixel size: when SDL
+    // is ahead (a resize that just shrank) relying on it merely clips a sliver of
+    // the new content for one frame, while trusting a stale smaller size is what
+    // stretches.
+    if (dw > *lw) *lw = dw;
+    if (dh > *lh) *lh = dh;
+    return bs;
+  }
+  return (*lw > 0) ? (double)pw / (double)*lw : 1.0;
+}
 
 // Frame borders (title bar / window edges): AIR's bounds is the OUTER frame rect
 // while SDL sizes and positions the CLIENT area, so both bounds conversions go
@@ -1826,7 +1881,7 @@ int sk_window_show_metal(int w, int h, const char* title, int fullscreen,
   int lw = w, lh = h, pw = w, ph = h;
   SDL_GetWindowSize(c->win, &lw, &lh);
   SDL_GetWindowSizeInPixels(c->win, &pw, &ph);
-  double scale = (lw > 0) ? (double)pw / (double)lw : 1.0;
+  double scale = sk_window_device_scale(c->win, &lw, &lh, pw, ph);
   c->pw = pw; c->ph = ph;
   if (on_resize) on_resize(id, lw, lh, pw, ph, scale);
 
