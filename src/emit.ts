@@ -11822,9 +11822,33 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     for (const [an, cf, ct] of stageFieldAccessors) {
       this.line(`${ct} Stage_get_${an}(void* _this) { return ((Stage*)_this)->${cf}; }`);
     }
+    // scaleMode is the one stage field whose WRITE changes another field's value:
+    // stageWidth/stageHeight are DERIVED from (window client size, scaleMode), and
+    // AIR re-derives them the moment the mode changes. Its setter therefore cannot
+    // be field-backed (it is emitted by hand below); the helper that does the
+    // re-derivation lives with the window table much further down the file, so it
+    // is forward-declared here.
+    this.line('static void ASC_stage_size_refresh(void* stage);');
     for (const [an, cf, ct] of stageFieldAccessors) {
+      if (an === 'scaleMode') continue;
       this.line(`void Stage_set_${an}(void* _this, ${ct} value) { ((Stage*)_this)->${cf} = value; }`);
     }
+    // The ordering this fixes is the ONE every AIR app with a NativeWindow uses
+    // (measured on this runtime, temp/nworder/):
+    //   super(opts)            -> window 400x200, stage mode "showAll" -> stage 400x200
+    //   bounds = rect          -> window 1792x1038, stage STILL 400x200 (showAll =
+    //                             the design rect, which for a secondary window is
+    //                             the ctor default, not a real design)
+    //   stage.scaleMode = NO_SCALE -> stage must now read 1792x1038; without the
+    //                             refresh it read 400x200 and the app laid its whole
+    //                             tree out in the corner of a maximized window (the
+    //                             next resize never comes, so it never recovered).
+    this.line('void Stage_set_scaleMode(void* _this, char* value) {');
+    this.indent++;
+    this.line('((Stage*)_this)->scale_mode = value;');
+    this.line('ASC_stage_size_refresh(_this);');
+    this.indent--;
+    this.line('}');
     // frameRate is deliberately NOT field-backed: AIR keeps ONE frame rate for the
     // whole application, so any Stage's getter/setter reads and writes the same
     // value (measured: adl, set 12 on a secondary window's stage -> the main
@@ -22876,6 +22900,21 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('const char* sm = st->scale_mode;');
     this.line('if (sm == NULL || strcmp(sm, "noScale") == 0) { st->stage_w = w->lw; st->stage_h = w->lh; }');
     this.line('else { st->stage_w = w->design_w; st->stage_h = w->design_h; }');
+    this.indent--;
+    this.line('}');
+    // Re-derive one stage's size from the window that owns it. Called by the
+    // Stage.scaleMode setter (see the forward declaration near the Stage
+    // accessors): a stage that belongs to no window — a headless Stage.render()
+    // root, or the boot stage before Stage_showWindow claims slot 0 — has nothing
+    // to re-derive and is left alone.
+    this.line('static void ASC_stage_size_refresh(void* stage) {');
+    this.indent++;
+    this.line('if (stage == NULL) return;');
+    this.line('for (int i = 0; i < ASC_MAX_WINDOWS; i++) {');
+    this.indent++;
+    this.line('if (ASC_wins[i].stage == (Stage*)stage) { ASC_window_apply_stage_size(i); return; }');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     // Rasterize one window's tree into its current surface. The canvas transform is

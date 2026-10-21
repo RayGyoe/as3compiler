@@ -2690,5 +2690,61 @@ function checkDynamicStringMethods(): string[] {
 }
 registerGroup('unit: emit/DynamicStringMethods', checkDynamicStringMethods);
 
-
-
+// stageWidth/stageHeight are DERIVED values — (window client size, scaleMode) — and
+// AIR re-derives them the moment scaleMode changes. Ours only re-derived them on a
+// resize or a render, which yields the same answer ONLY while the app never touches
+// the mode after the window exists. Every AIR app with a NativeWindow does exactly
+// that (measured: talkmed-meeting cn.edoctor.view.meeting.MeetingWindow, plus all
+// its Toast/Files/Subtitle windows, which all follow `super(opts)` -> `bounds = rect`
+// -> `stage.scaleMode = NO_SCALE` -> read stageWidth on the NEXT line to lay out):
+//   temp/nworder/ , Windows 11 150%: after `bounds` the window was 1792x1038 while
+//   stageWidth still read 400x200 (the ctor default, which is what showAll pins the
+//   stage to), and it read 400x200 AFTER the scaleMode write too -- so the whole tree
+//   was laid out for a 400x200 stage inside a maximized window, and the resize that
+//   would have corrected it never came (the RESIZE listener is added after the layout).
+//
+// The fix is that Stage_set_scaleMode is no longer field-backed: it writes the field
+// and then re-derives the size for the window that owns this Stage. Pinned here: the
+// write order (field first, then refresh), the forward declaration (the window table
+// is emitted far below, so without it the generated C is not C99-clean), and the fact
+// that ONLY scaleMode got this treatment -- align and the rest stay plain field writes.
+function checkStageSizeFollowsScaleMode(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stagesize] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stagesize] ${label}`); }
+  };
+  const c = generateC(parse('trace(1);')).c;
+  const setter = fnBody(c, 'void Stage_set_scaleMode(void* _this, char* value) {');
+  check('the scaleMode setter is hand-written, not the generic field assignment', setter !== '');
+  check('...it still writes the field', setter.includes('((Stage*)_this)->scale_mode = value;'));
+  check('...and then re-derives the stage size for the owning window',
+    setter.includes('ASC_stage_size_refresh(_this);'));
+  // Field BEFORE refresh: the refresh reads w->lw/design, not scale_mode, but a
+  // future reader of the mode inside it would silently see the old value.
+  check('...in that order', setter.indexOf('scale_mode = value') < setter.indexOf('ASC_stage_size_refresh'));
+  check('no generic field-backed scaleMode setter survives to clash with it',
+    !c.includes('void Stage_set_scaleMode(void* _this, char* value) { ((Stage*)_this)->scale_mode = value; }'));
+  // A forward declaration must PRECEDE the definition: ASC_wins/ASCWin are emitted
+  // with the multi-window block, long after the Stage accessors. Without the
+  // prototype the definition is an implicit declaration at the call site (a hard
+  // error in C99, which is what emcc compiles as).
+  const decl = c.indexOf('static void ASC_stage_size_refresh(void* stage);');
+  const def = c.indexOf('static void ASC_stage_size_refresh(void* stage) {');
+  check('the helper is forward-declared', decl >= 0);
+  check('...before its definition', decl >= 0 && def > decl);
+  const body = fnBody(c, 'static void ASC_stage_size_refresh(void* stage) {');
+  check('a NULL stage (boot stage, headless render) is not dereferenced',
+    body.includes('if (stage == NULL) return;'));
+  check('it finds the window that owns this Stage', body.includes('ASC_wins[i].stage == (Stage*)stage'));
+  check('...and re-derives through the single stage-size writer',
+    body.includes('ASC_window_apply_stage_size(i);') && !body.includes('stage_w = '));
+  // Only scaleMode. align/quality/color are plain writes; adding the refresh to them
+  // would turn every stage property write into a window-table scan.
+  const align = 'void Stage_set_align(void* _this, char* value) { ((Stage*)_this)->align = value; }';
+  check('align stays a plain field write', c.includes(align));
+  console.log(`     [stagesize] ${ok} scaleMode stage-size check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/StageSizeFollowsScaleMode', checkStageSizeFollowsScaleMode);

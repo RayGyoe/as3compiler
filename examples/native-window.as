@@ -13,6 +13,8 @@
 //   * close()：当帧 closed 仍为 false、CLOSE 在帧边界送达
 //   * 槽位复用：关掉的窗口把后端槽位还回去，下一个窗口拿到同一槽位后必须是一个**全新**窗口
 //     （closed=false、能进 openedWindows），而关掉的那个对象永远不再指向该槽位（阶段二百零八）
+//   * stage.scaleMode 写入即重算 stageWidth/stageHeight（阶段二百二十六）：先 `bounds` 后改模式
+//     与先改模式后 `bounds` 必须收敛到同一尺寸，而 showAll 仍钉在 design 矩形
 //   * startMove()/startResize()：真实系统拖拽，回 true（放在最后，拖拽闩锁随进程退出消失）
 //
 // 纯 C 构建（没有 window 后端）里 `new NativeWindow()` 会**响亮**地抛 #2012（不静默 fallback），
@@ -22,6 +24,7 @@ import flash.display.Stage;
 import flash.display.NativeWindow;
 import flash.display.NativeWindowInitOptions;
 import flash.display.NativeWindowResize;
+import flash.display.StageScaleMode;
 import flash.events.Event;
 import flash.events.NativeWindowBoundsEvent;
 import flash.desktop.NativeApplication;
@@ -139,6 +142,8 @@ function phase4():void {
 // 它的关闭按钮永远不会被受理、CLOSING/ACTIVATE 全被丢掉、openedWindows/activeWindow 里也找不到它。
 var w3:NativeWindow = null;
 var w4:NativeWindow = null;
+var w5:NativeWindow = null;
+var w6:NativeWindow = null;
 function phase5():void {
   w3 = new NativeWindow(new NativeWindowInitOptions());
   w3.title = "reuse";
@@ -162,7 +167,37 @@ function phase6():void {
   // 真实系统拖拽：AIR 回 true（本示例放在最后，拖拽闩锁随进程退出一起消失）。
   eq("startMove() reports a started drag", w.startMove(), true);
   eq("startResize(bottomRight) reports a started resize", w.startResize(NativeWindowResize.BOTTOM_RIGHT), true);
+  setTimeout(phase7, 600);
+}
 
+// stage.scaleMode 的写入必须**当场**重算 stageWidth/stageHeight（阶段二百二十六）。
+// AIR 的 stageWidth 是 (客户区, scaleMode) 的派生物，改模式立刻生效；真实 App（本仓库的
+// cn.edoctor.view.meeting.MeetingWindow）的顺序是 `super(opts)` -> `bounds = rect` ->
+// `stage.scaleMode = NO_SCALE`，然后**下一行**就按 stageWidth 排版。旧实现只在 resize/渲染时
+// 重算，而那次 resize 永远不来，于是整棵树排在大窗的左上角（temp/nworder/ 实测：窗口
+// 1792x1038、舞台仍 400x200）。这里用「同一组 bounds、两种写入顺序」比对，不写死像素值，
+// 这样 macOS/Windows 边框差异和「框 vs 客户区」口径都不影响断言。
+function phase7():void {
+  var opts:NativeWindowInitOptions = new NativeWindowInitOptions();
+  w5 = new NativeWindow(opts);
+  w5.bounds = new Rectangle(100, 100, 600, 400);
+  w5.stage.scaleMode = StageScaleMode.NO_SCALE;
+  w6 = new NativeWindow(opts);
+  w6.stage.scaleMode = StageScaleMode.NO_SCALE;
+  w6.bounds = new Rectangle(100, 100, 600, 400);
+  eq("scaleMode set after bounds reaches the same stage size as before bounds",
+    w5.stage.stageWidth + "x" + w5.stage.stageHeight,
+    w6.stage.stageWidth + "x" + w6.stage.stageHeight);
+  eq("...and that size is the client area, not the 400x200 ctor default",
+    w5.stage.stageWidth > 400, true);
+  // showAll 下舞台停在 design 矩形（400x200），这一步**不能**被上面的修复带偏。
+  var w7:NativeWindow = new NativeWindow(opts);
+  w7.bounds = new Rectangle(100, 100, 600, 400);
+  eq("showAll still pins the stage to the design rect",
+    w7.stage.stageWidth + "x" + w7.stage.stageHeight, "400x200");
+  w5.close();
+  w6.close();
+  w7.close();
   if (fails.length == 0) {
     trace("native-window: " + pass + " checks passed");
   } else {
