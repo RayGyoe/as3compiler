@@ -1784,6 +1784,13 @@ int s3d_readback(void* ctx, uint8_t* out) {
 int s3d_width(void* ctx) { return ctx ? ((S3DContext*)ctx)->width : 0; }
 int s3d_height(void* ctx) { return ctx ? ((S3DContext*)ctx)->height : 0; }
 
+// Largest 2D texture edge this backend can allocate. Every Metal GPU family macOS
+// supports reports 16384 (MTLDevice.maxTextureWidth), so the value is a property of
+// the platform, not of the individual device. The generated C reads it to decide both
+// the Context3D profile it reports and the #3683 "Texture too big" ceiling -- the
+// profile claim and the enforced limit must never disagree.
+int s3d_max_texture_size(void) { return 16384; }
+
 // ---- render-to-texture (stage 83) ----
 // A render-target texture (optimizeForRenderToTexture=true) is an MTLTexture with
 // both RenderTarget and ShaderRead usage: drawTriangles renders into it when it is

@@ -9098,6 +9098,7 @@ extern int sk_window_display_index(int id);
 extern void sk_window_get_pixel_size(int id, int* pw, int* ph);
 extern void sk_window_get_client_size(int id, int* lw, int* lh);
 extern int sk_window_is_active(int id);
+extern int sk_window_os_display_state(int id);
 extern void sk_window_set_always_in_front(int id, int on);
 // NativeWindow.minSize/maxSize. The limits live in the glue (0 = unlimited) and
 // are what the window manager enforces while the user drags an edge; the AS3 side
@@ -9426,6 +9427,17 @@ static inline int as_window_is_active(int id) {
     (void)id; return 0;
 #endif
 }
+// Display state as the window manager reports it (0 normal, 1 minimized,
+// 2 maximized, -1 unknown) -- see sk_window_os_display_state. Kept apart from the
+// AS3 record so the generated poll can tell an OS-driven change from one it already
+// reported itself.
+static inline int as_window_os_display_state(int id) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_os_display_state(id);
+#else
+    (void)id; return -1;
+#endif
+}
 static inline void as_window_set_always_in_front(int id, int on) {
 #ifdef ASC_USE_WINDOW
     sk_window_set_always_in_front(id, on);
@@ -9726,6 +9738,7 @@ static inline void as_window_order_back(int id) { (void)id; }
 static inline int as_window_display_index(int id) { (void)id; return 0; }
 static inline void as_window_get_pixel_size(int id, int* pw, int* ph) { (void)id; if (pw) *pw = 0; if (ph) *ph = 0; }
 static inline void as_window_get_client_size(int id, int* lw, int* lh) { (void)id; if (lw) *lw = 0; if (lh) *lh = 0; }
+static inline int as_window_os_display_state(int id) { (void)id; return -1; }
 static inline int as_window_is_active(int id) { (void)id; return 0; }
 static inline void as_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
 static inline void as_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh) {
@@ -13530,6 +13543,10 @@ extern void s3d_flush_all_async(void);
 extern int s3d_readback(void* ctx, uint8_t* out);
 extern int s3d_width(void* ctx);
 extern int s3d_height(void* ctx);
+// Largest 2D texture edge the linked backend can allocate. Read by the generated C
+// both to report Context3D.profile and to enforce the #3683 ceiling, so the claim and
+// the limit are always derived from the same number.
+extern int s3d_max_texture_size(void);
 extern void* s3d_create_render_texture(void* ctx, int width, int height);
 extern void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil);
 extern int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain);
@@ -13881,6 +13898,18 @@ static inline int as_s3d_height(void* ctx) {
     return s3d_height(ctx);
 #else
     (void)ctx; return 0;
+#endif
+}
+// Largest 2D texture edge available to this build. A build without a GPU backend
+// keeps textures in the CPU-side state machine, where a 4096 edge costs nothing, so
+// it answers 4096 too -- but a real backend is always asked, never assumed: a WebGL2
+// driver capped at 2048 must make the generated C report "baseline" rather than
+// promise a texture it cannot allocate.
+static inline int as_s3d_max_texture_size(void) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_max_texture_size();
+#else
+    return 4096;
 #endif
 }
 static inline void* as_s3d_create_render_texture(void* ctx, int w, int h) {

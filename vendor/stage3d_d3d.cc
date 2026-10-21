@@ -2461,6 +2461,13 @@ int s3d_readback_render(void* ctx, uint8_t* out) {
 int s3d_width(void* ctx) { return ctx ? ((S3DContext*)ctx)->width : 0; }
 int s3d_height(void* ctx) { return ctx ? ((S3DContext*)ctx)->height : 0; }
 
+// Largest 2D texture edge this backend can allocate. The device is created at
+// D3D_FEATURE_LEVEL_11_0 (see s3d_create), which guarantees 16384, so a constant is
+// exact here rather than an approximation. The generated C reads it to decide both
+// the Context3D profile it reports and the #3683 "Texture too big" ceiling -- the
+// profile claim and the enforced limit must never disagree.
+int s3d_max_texture_size(void) { return 16384; }
+
 // ---- render-to-texture -----------------------------------------------------
 
 void* s3d_create_render_texture(void* ctx, int width, int height) {

@@ -20446,9 +20446,66 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('Program3D* Context3D_createProgram(void* _this) { (void)_this; return Program3D_new(); }');
+    // ---- AIR's texture-size validation (measured against adl 51.4.1, temp/adlprof/
+    //      edge mode) ----
+    //
+    // The ORDER of the checks is observable and is pinned by test/unit/stage3d.ts:
+    // zero -> power-of-two -> ceiling. A 4097 request reports #3682 (not #3683)
+    // because the power-of-two rule runs first, and 0/-1 report #3681. All four
+    // codes are ArgumentError (not Error), so `catch (e:ArgumentError)` sees them.
+    //
+    // The ceiling message quotes the LIMIT ("max is 2048x2048"), not the request.
+    // Only two 2D ceilings exist, so both texts stay string LITERALS: a shared
+    // snprintf buffer would be rewritten by the next throw and silently corrupt an
+    // error object that is still live (Error_ctor stores the pointer, not a copy).
+    //
+    // Cube maps do NOT scale with the profile: 1024 at every rung up to enhanced
+    // (measured), unlike 2D/RectangleTexture which go 2048 -> 4096.
+    this.line('static bool as_tex_is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }');
+    this.line('static int as_tex_ceiling(void) { return as_s3d_max_texture_size() >= 4096 ? 4096 : 2048; }');
+    this.line('static void as_tex_check_2d(int w, int h) {');
+    this.indent++;
+    this.line('if (w <= 0 || h <= 0)');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #3681: Texture size is zero.", 3681));');
+    this.line('if (!as_tex_is_pow2(w) || !as_tex_is_pow2(h))');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #3682: Texture size not a power of two.", 3682));');
+    this.line('int m = as_tex_ceiling();');
+    this.line('if (w > m || h > m)');
+    this.line('  as_throw(ArgumentError_new((char*)(m >= 4096');
+    this.line('    ? "Error #3683: Texture too big (max is 4096x4096)."');
+    this.line('    : "Error #3683: Texture too big (max is 2048x2048)."), 3683));');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_tex_check_cube(int size) {');
+    this.indent++;
+    this.line('if (size <= 0)');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #3681: Texture size is zero.", 3681));');
+    this.line('if (!as_tex_is_pow2(size))');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #3682: Texture size not a power of two.", 3682));');
+    this.line('if (size > 1024)');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #3705: Cubemap texture too big (max is 1024x1024).", 3705));');
+    this.indent--;
+    this.line('}');
+    // RectangleTexture has its own ceiling and NO power-of-two rule (rect(4097) is
+    // rejected as "too big", not "not a power of two"). AIR's rule is the larger of
+    // the profile ceiling and the backbuffer, which is why the context is passed in.
+    this.line('static void as_tex_check_rect(Context3D* ctx, int w, int h) {');
+    this.indent++;
+    this.line('if (w <= 0 || h <= 0)');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #3681: Texture size is zero.", 3681));');
+    this.line('int m = as_tex_ceiling();');
+    this.line('if (ctx->backBufferWidth > m) m = ctx->backBufferWidth;');
+    this.line('if (ctx->backBufferHeight > m) m = ctx->backBufferHeight;');
+    this.line('if (w > m || h > m)');
+    this.line('  as_throw(ArgumentError_new((char*)(as_tex_ceiling() >= 4096');
+    this.line('    ? "Error #3766: RectangleTexture too big (max is the larger of 4096x4096 or the size of the backbuffer)."');
+    this.line('    : "Error #3766: RectangleTexture too big (max is the larger of 2048x2048 or the size of the backbuffer)."), 3766));');
+    this.indent--;
+    this.line('}');
     this.line('Texture* Context3D_createTexture(void* _this, int width, int height, char* format, bool optimizeForRenderToTexture) {');
     this.indent++;
     this.line('Context3D* ctx = (Context3D*)_this;');
+    this.line('as_tex_check_2d(width, height);');
     this.line('Texture* t = Texture_new();');
     this.line('t->width = width; t->height = height; t->format = format;');
     // optimizeForRenderToTexture=true allocates a render-target MTLTexture up
@@ -20463,6 +20520,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('CubeTexture* Context3D_createCubeTexture(void* _this, int size, char* format, bool optimizeForRenderToTexture) {');
     this.indent++;
     this.line('(void)_this; (void)optimizeForRenderToTexture;');
+    this.line('as_tex_check_cube(size);');
     this.line('CubeTexture* t = CubeTexture_new();');
     this.line('t->width = size; t->height = size; t->format = format;');
     this.line('return t;');
@@ -20471,6 +20529,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('RectangleTexture* Context3D_createRectangleTexture(void* _this, int width, int height, char* format, bool optimizeForRenderToTexture) {');
     this.indent++;
     this.line('Context3D* ctx = (Context3D*)_this;');
+    this.line('as_tex_check_rect(ctx, width, height);');
     // Same contract as createTexture: optimizeForRenderToTexture=true allocates a
     // render-target MTLTexture up front (Starling's FragmentFilter renders its
     // offscreen passes into such a texture through setRenderToTexture); false
@@ -20640,12 +20699,30 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('#endif');
     this.indent--;
     this.line('}');
-    // Profile of the context we actually created. AIR echoes whatever was requested
-    // because it can satisfy all seven rungs; we implement only the baseline feature set
-    // (AGAL1: 128 vc / 28 fc / 8 ft, no MRT, no float textures), so "baseline" is the
-    // truthful answer for every request -- see Stage3D_requestContext3D for why we do not
-    // echo the request back.
-    this.line('char* Context3D_get_profile(void* _this) { (void)_this; return (char*)"baseline"; }');
+    // Profile of the context we actually created. AIR echoes the requested value
+    // because its D3D11/GL backends satisfy every rung; we report the highest rung
+    // THIS build can honour, and never more:
+    //
+    //   baselineExtended  <=> the backend can allocate 4096x4096 2D textures
+    //   baseline          <=> it tops out at 2048
+    //
+    // 4096 textures are the ONLY capability baselineExtended adds over baseline
+    // (measured against adl 51.4.1: at baselineExtended the ceiling is 4096x4096
+    // while float textures still answer #3759 and MRT #3779 -- those two belong to
+    // the standard rung and only appear at standard/standardConstrained/
+    // standardExtended/enhanced).
+    //
+    // Deriving the claim from the SAME backend query that enforces #3683 is what
+    // keeps the promise and the limit from drifting apart: a WebGL2 device whose
+    // GL_MAX_TEXTURE_SIZE is 2048 answers baseline, a D3D12 one answers
+    // baselineExtended. Echoing the requested value instead would put Starling on
+    // its 4096-texture path on hardware that cannot allocate one.
+    this.line('char* Context3D_get_profile(void* _this) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('return (char*)(as_s3d_max_texture_size() >= 4096 ? "baselineExtended" : "baseline");');
+    this.indent--;
+    this.line('}');
     // totalGPUMemory: AIR reports how much GPU memory this context holds. We do not
     // account for every buffer, so report the one allocation we always know — the
     // back buffer (BGRA8 + 4 bytes/pixel) — plus the depth/stencil surface when the
@@ -22602,6 +22679,24 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('int x = 0, y = 0, cw = 0, ch = 0;');
     this.line('as_window_get_bounds(id, &x, &y, &cw, &ch);');
     this.line('int active = as_window_is_active(id);');
+    // displayState follows the WINDOW, not the last call the app made: the maximize
+    // box, a title-bar double-click and a taskbar minimize all change it without
+    // touching NativeWindow, and nothing else would ever record that. Reconcile the
+    // record before the code below reads it, so this frame's before/after pair is the
+    // real transition (measured on Windows 11: a real caption double-click left
+    // displayState pinned at "normal" on a maximized 2582x1692 window; adl reports
+    // "maximized"). A PROGRAMMATIC call needs no help -- it writes the record itself
+    // and SDL's flag agrees by the next pump, so the comparison below sees no change
+    // and the event it already dispatched is not repeated. "fullScreen" is left alone:
+    // that state is AS3's own and the glue answers -1 for it.
+    this.line('int osds = as_window_os_display_state(id);');
+    this.line('bool ds_owned = (w->display_state != NULL && strcmp(w->display_state, "fullScreen") == 0);');
+    this.line('if (osds >= 0 && !ds_owned) {');
+    this.indent++;
+    this.line('char* want = (osds == 1) ? (char*)"minimized" : (osds == 2) ? (char*)"maximized" : (char*)"normal";');
+    this.line('if (w->display_state == NULL || strcmp(w->display_state, want) != 0) { w->display_state = want; gc_write_barrier((void*)w->display_state); }');
+    this.indent--;
+    this.line('}');
     this.line('int ds = ASC_win_ds_code(w);');
     // The frame's starting state, so every event dispatched below describes the same
     // before/after pair (see the note on the move branch).

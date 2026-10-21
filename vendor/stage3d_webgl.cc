@@ -504,6 +504,21 @@ int s3d_resize(void* ctx, int width, int height) {
 int s3d_width(void* ctx) { return ctx ? ((S3DContext*)ctx)->width : 0; }
 int s3d_height(void* ctx) { return ctx ? ((S3DContext*)ctx)->height : 0; }
 
+// Largest 2D texture edge this context can allocate. Unlike D3D12/Metal there is no
+// platform-wide guarantee for WebGL2 -- GL_MAX_TEXTURE_SIZE is 2048 on some drivers,
+// so it has to be asked for rather than assumed. Cached because the answer is
+// invariant for the life of the page. When no GL context is current the query yields
+// 0 and we fall back to 2048, which makes the generated C report "baseline" instead
+// of claiming a 4096 ceiling the device may not have.
+int s3d_max_texture_size(void) {
+  static int cached = 0;
+  if (cached != 0) return cached;
+  GLint v = 0;
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &v);
+  cached = (v >= 2048) ? (int)v : 2048;
+  return cached;
+}
+
 // ---- buffers ---------------------------------------------------------------
 
 int s3d_upload_vertex(void* ctx, int stream, const double* data, int numVertices, int components) {

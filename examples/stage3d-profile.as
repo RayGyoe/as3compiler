@@ -16,12 +16,13 @@
 //   4. profile accepts the seven Context3DProfile strings, including "enhanced"
 //      (the rung Starling's ladder starts from). "auto" is not one of them.
 //   5. AIR echoes the requested profile back from context3D.profile because it can
-//      satisfy all seven rungs; we implement only the baseline feature set, so we
-//      report "baseline" for every request (see Stage3D_requestContext3D in emit.ts).
-//      Starling reads the value back rather than trusting what it asked for, so it
-//      stays on its tier-A path -- which is why this is honest rather than broken.
+//      satisfy all seven rungs. We report the highest rung THIS build can honour:
+//      "baselineExtended" when the backend grants 4096x4096 textures, "baseline"
+//      when it tops out at 2048. Starling reads the value back rather than trusting
+//      what it asked for, so the report — not the request — decides its texture set.
 import flash.display.Stage;
 import flash.display.Stage3D;
+import flash.display3D.Context3D;
 import flash.display3D.Context3DProfile;
 
 // The pass count is printed too: a case that silently never runs would otherwise look
@@ -60,7 +61,11 @@ for (var i:int = 0; i < profiles.length; i++) {
   s3d.requestContext3D("auto", profiles[i]);
   check(s3d.context3D != null, "context3D exists after requesting " + profiles[i]);
 }
-check(s3d.context3D.profile == "baseline", "profile reports the context we really have");
+check(s3d.context3D.profile == "baselineExtended", "profile reports the rung this build honours");
+// Requesting a higher rung must NOT raise the report: the value describes the
+// context that exists, not the one that was asked for.
+s3d.requestContext3D("auto", Context3DProfile.ENHANCED);
+check(s3d.context3D.profile == "baselineExtended", "profile never echoes a rung we cannot honour");
 check(s3d.renderMode == "auto", "renderMode is stored");
 
 // Illegal values throw #2008 synchronously. The message text is AIR's, verbatim.
@@ -102,6 +107,53 @@ var s3d2:Stage3D = st2.stage3Ds[0];
 s3d2.requestContext3D();
 check(s3d2.context3D != null, "single-argument form still creates a context");
 check(s3d2.renderMode == "auto", "renderMode defaults to auto");
+
+// ---- texture-size validation (adl 51.4.1, temp/adlprof/ edge mode) ----
+// The check ORDER is observable: zero -> power-of-two -> ceiling. A 4097 request is
+// rejected as "not a power of two" (not "too big"), and 0/-1 as "size is zero".
+// Every code below is an ArgumentError, not an Error.
+var c:Context3D = s3d.context3D;
+
+function expectArgError(fn:Function, id:int, msg:String):void {
+  try {
+    fn();
+    check(false, "expected #" + id + " " + msg);
+  } catch (e:Error) {
+    check(e.errorID == id, "#" + id + " errorID, got " + e.errorID + " for " + msg);
+    check(e.message == msg, "#" + id + " message: got [" + e.message + "]");
+  }
+}
+
+check(c.createTexture(4096, 4096, "bgra", false) != null, "4096 texture is legal at this rung");
+check(c.createTexture(2048, 1, "bgra", false) != null, "2048 texture is legal");
+check(c.createTexture(1024, 1024, "bgra", false) != null, "non-square-but-pow2 is legal");
+
+expectArgError(function():void { c.createTexture(0, 1, "bgra", false); },
+  3681, "Error #3681: Texture size is zero.");
+expectArgError(function():void { c.createTexture(-1, 1, "bgra", false); },
+  3681, "Error #3681: Texture size is zero.");
+expectArgError(function():void { c.createTexture(2049, 1, "bgra", false); },
+  3682, "Error #3682: Texture size not a power of two.");
+expectArgError(function():void { c.createTexture(3000, 3000, "bgra", false); },
+  3682, "Error #3682: Texture size not a power of two.");
+expectArgError(function():void { c.createTexture(8192, 8192, "bgra", false); },
+  3683, "Error #3683: Texture too big (max is 4096x4096).");
+
+// Cube maps stay at 1024 on every profile (measured), and are checked for pow2 first.
+check(c.createCubeTexture(1024, "bgra", false) != null, "1024 cube is legal");
+expectArgError(function():void { c.createCubeTexture(0, "bgra", false); },
+  3681, "Error #3681: Texture size is zero.");
+expectArgError(function():void { c.createCubeTexture(2049, "bgra", false); },
+  3682, "Error #3682: Texture size not a power of two.");
+expectArgError(function():void { c.createCubeTexture(2048, "bgra", false); },
+  3705, "Error #3705: Cubemap texture too big (max is 1024x1024).");
+
+// RectangleTexture has no power-of-two rule: 4097 is "too big", not "not pow2".
+check(c.createRectangleTexture(4096, 1, "bgra", false) != null, "4096x1 rectangle is legal");
+expectArgError(function():void { c.createRectangleTexture(0, 1, "bgra", false); },
+  3681, "Error #3681: Texture size is zero.");
+expectArgError(function():void { c.createRectangleTexture(4097, 1, "bgra", false); },
+  3766, "Error #3766: RectangleTexture too big (max is the larger of 4096x4096 or the size of the backbuffer).");
 
 if (failures != 0) throw new Error("stage3d-profile: " + failures + " of " + checks + " assertion(s) failed");
 trace("stage3d-profile: " + checks + " assertions passed");

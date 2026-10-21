@@ -1114,14 +1114,92 @@ function checkStage3dRequestContextProfile(): string[] {
   check('validation precedes context creation (a bad argument leaves context3D null)',
     iProf > 0 && iCreate > iProf);
 
-  // 5. The reported profile is the context we actually built, never an echo of the
-  //    request. AIR echoes because it can satisfy all seven rungs; we implement the
-  //    baseline set only, and Starling branches on the read-back value.
-  check('context3D.profile reports the baseline context we really create',
-    emitted.includes('char* Context3D_get_profile(void* _this) { (void)_this; return (char*)"baseline"; }'));
+  // 5. The reported profile is the highest rung this build can honour, derived from the
+  //    SAME backend query that enforces #3683 — never an echo of the request. AIR echoes
+  //    because its D3D11/GL backends satisfy all seven rungs; Starling branches on the
+  //    READ-BACK value (Painter.get_profile), so echoing "enhanced" would push it onto a
+  //    4096-texture + double-buffered path on a backend that may not be able to serve it.
+  const iProfile = emitted.indexOf('char* Context3D_get_profile');
+  const profileBody = emitted.slice(iProfile, emitted.indexOf('Context3D_get_totalGPUMemory', iProfile));
+  check('context3D.profile is derived from the backend ceiling, never echoed',
+    iProfile > 0
+    && profileBody.includes('as_s3d_max_texture_size() >= 4096 ? "baselineExtended" : "baseline"')
+    && !profileBody.includes('return (char*)"baseline";'));
 
   console.log(`     [stage3d] ${ok} check(s) passed`);
   return bad;
 }
 
 registerGroup('stage3d/request-context-profile', checkStage3dRequestContextProfile);
+
+// Texture-size validation. Every number and message below is a measurement against
+// adl 51.4.1 (temp/adlprof/, PROBE_MODE=edge), not an inference from the docs:
+//   createTexture      0/negative -> #3681, non-pow2 -> #3682, > ceiling -> #3683
+//   createCubeTexture  0/negative -> #3681, non-pow2 -> #3682, > 1024 -> #3705
+//   createRectangle*   0/negative -> #3681, no pow2 rule, > ceiling -> #3766
+// The ceiling is 2048 at baseline and 4096 from baselineExtended up, and it is the
+// same query the profile report is derived from, so the claim and the limit cannot
+// drift apart.
+function checkStage3dTextureLimits(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const emitted = emittedLines();
+  const i2d = emitted.indexOf('static void as_tex_check_2d');
+  const body2d = emitted.slice(i2d, emitted.indexOf('static void as_tex_check_cube'));
+
+  // 1. The ORDER of the checks is observable: a 4097 request reports "not a power of
+  //    two", and 0 reports "size is zero". Pinning the relative indices makes this a
+  //    statement about order, not about the three messages merely existing.
+  const iZero = body2d.indexOf('Error #3681: Texture size is zero.');
+  const iPow = body2d.indexOf('Error #3682: Texture size not a power of two.');
+  const iBig = body2d.indexOf('Error #3683: Texture too big');
+  check('#3681 (zero) before #3682 (pow2) before #3683 (ceiling)',
+    i2d > 0 && iZero > 0 && iPow > iZero && iBig > iPow);
+
+  // 2. The ceiling is the profile ceiling, not a hard-coded 2048/4096 decision made
+  //    here: it must come from as_s3d_max_texture_size(), i.e. the backend.
+  check('the 2D ceiling is derived from the backend query',
+    body2d.includes('int m = as_tex_ceiling();')
+    && emitted.includes('static int as_tex_ceiling(void) { return as_s3d_max_texture_size() >= 4096 ? 4096 : 2048; }'));
+
+  // 3. Both legal ceilings exist with AIR's verbatim text. The message quotes the
+  //    LIMIT, so a 4097 request still says "max is 4096x4096".
+  check('both ceiling messages are AIR-verbatim (2048 and 4096 variants)',
+    body2d.includes('"Error #3683: Texture too big (max is 2048x2048)."')
+    && body2d.includes('"Error #3683: Texture too big (max is 4096x4096)."'));
+
+  // 4. Cube maps do NOT scale with the profile: 1024 at every rung up to enhanced.
+  const iCube = emitted.indexOf('static void as_tex_check_cube');
+  const bodyCube = emitted.slice(iCube, emitted.indexOf('static void as_tex_check_rect'));
+  check('cube maps stay capped at 1024 on every profile (#3705)',
+    iCube > 0 && bodyCube.includes('if (size > 1024)')
+    && bodyCube.includes('Error #3705: Cubemap texture too big (max is 1024x1024).')
+    && !bodyCube.includes('as_tex_ceiling()'));
+
+  // 5. RectangleTexture has no power-of-two rule — 4097 is "too big", not "not pow2".
+  const iRect = emitted.indexOf('static void as_tex_check_rect');
+  const bodyRect = emitted.slice(iRect, emitted.indexOf('Texture* Context3D_createTexture'));
+  check('RectangleTexture has a ceiling but no power-of-two rule (#3766)',
+    iRect > 0 && bodyRect.includes('Error #3766: RectangleTexture too big')
+    && !bodyRect.includes('Error #3682')
+    && bodyRect.includes('as_tex_ceiling()'));
+
+  // 6. Each factory runs its validator before allocating anything, so a rejected call
+  //    leaves no half-built texture behind (adl leaves context3D untouched too).
+  const iCreate = emitted.indexOf('Texture* Context3D_createTexture');
+  check('all three factories validate before allocating',
+    iCreate > 0
+    && emitted.indexOf('as_tex_check_2d(width, height);') < emitted.indexOf('Texture* t = Texture_new();')
+    && emitted.indexOf('as_tex_check_cube(size);') < emitted.indexOf('CubeTexture* t = CubeTexture_new();')
+    && emitted.indexOf('as_tex_check_rect(ctx, width, height);') < emitted.indexOf('RectangleTexture* t = RectangleTexture_new();'));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/texture-size-limits', checkStage3dTextureLimits);

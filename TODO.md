@@ -13648,7 +13648,55 @@ GEO req=658x1160 model{bnd=329x580}   ← 层真实是 329 pt / 658 px
 
 **closure**：① **同一症状可能落在两层**——"画面抖动"既可能是节拍（帧率）也可能是**几何**（倍率）；先量**产物不变量**（本阶段是 `contentsScaleFactor`）比先猜机制省得多，三条机制假设全被这一个数字否掉；② **同一个源里"缓存值/现场值"成对出现时，永远不要拿它们相除**——两者更新时刻不同，商就是误差放大器（这里是 3%，将来可能是任何东西）；③ **改法必须有实测收益才留**：给 drawable 加 padding 能省下池重建，但拖动中的 7 ms 全在合成器背压上，所以那处改动**没有留下**（否则就是"看起来对、量下来没用的复杂度"）。
 
+### 阶段二百二十六：`Context3D.profile` 不再是一句固定话术 —— 逐档爬的第一级：4096 贴图与它的五条尺寸校验（v0.4.199 → v0.4.200）✅ 已完成
+
+**触发**：用户问「我们现在都是返回 `Context3DProfile.enhanced` 吧？我们用的是 D3D12 啊，也和 AIR 没对齐？现在的情况是什么」。三个问题各自有不同答案：回读值**不是** `enhanced`（此前恒为 `"baseline"`）；后端**确实是** D3D12，而 AIR 是 D3D11，`driverInfo` 从来就不可能逐字相同；真正该问的是「回读值凭什么是那个值」。
+
+**一、`adl` 51.4.1 逐档实测（`temp/adlprof/`，`caps:` / `edge:` 两种探针模式）**
+
+| 请求档 | 4096 贴图 | `rgbaHalfFloat` | `setRenderToTexture(...,1)`（MRT） | `driverInfo` 回读 |
+|---|---|---|---|---|
+| `enhanced` / `standardExtended` / `standard` | ✅ | ✅ | ✅ | `DirectX11 (Enhanced)` / `(Standard Extended)` / `(Standard)` |
+| `baselineExtended` | ✅ | ❌ `#3759` | ❌ `#3779` | `DirectX11 (Baseline Extended)` |
+| `baseline` | ❌ `#3683 (max is 2048x2048)` | ❌ `#3759` | ❌ `#3779` | `DirectX11` |
+
+关键的一条是：**`enhanced` 不是「baseline + 顶点纹理取值」，它是 `standard` 的超集**（Adobe 只写了它相对 `standard` 新增的 AGAL4/VTF，没写它同时也含 MRT 与浮点纹理）。而 `baselineExtended` 相对 `baseline` 的**唯一**增量就是 4096 贴图。所以档位只能逐级爬：**4096 → `baselineExtended`；MRT + 浮点纹理 → `standard`；VTF/AGAL4 → `enhanced`**。
+
+同时量清了两组容易搞混的常量：所有档 `maxBackBuffer` 都是 **16384×16384**；**cube 恒为 1024**（`enhanced` 也是 1024），只有 2D 与 RectangleTexture 随档位 2048 → 4096。
+
+**二、尺寸校验的顺序本身就是可观测行为**
+
+| 调用 | 规则（按判定顺序） |
+|---|---|
+| `createTexture(w,h)` | `0`/负数 → `#3681`；非 2 的幂 → `#3682`；超档位上界 → `#3683`（文案引用**上限**，2048/4096 两式） |
+| `createCubeTexture(n)` | `#3681` → `#3682` → **`#3705`**（恒 1024，与档位无关） |
+| `createRectangleTexture(w,h)` | `#3681` → **无 2 的幂规则** → `#3766`（上限 = max(档位上界, 后台缓冲)） |
+
+因此 `4097` 报的是 `#3682`（非 2 的幂）而**不是** `#3683`；`RectangleTexture(4097,64)` 报的是 `#3766`（此处无 pow2 规则）。四个码都是 **`ArgumentError`**，且都在**分配任何东西之前**抛出（失败后不留半个纹理对象）。
+
+**三、修法：让「承诺」与「强制」共用同一个后端查询**
+
+- 三后端各加一条 `int s3d_max_texture_size(void)`：D3D12/Metal 恒 `16384`，WebGL2 现查 `GL_MAX_TEXTURE_SIZE` 并静态缓存（`<2048` 回落 2048）；纯 C 状态机回 4096。
+- `runtime.ts` 加 `as_s3d_max_texture_size()` 薄封装（无 `ASC_RENDER_STAGE3D` 时回 4096——此时纹理只存在 CPU 状态机里，4096 不花任何显存）。
+- `Context3D_get_profile` 由 `return "baseline";` 改为 `as_s3d_max_texture_size() >= 4096 ? "baselineExtended" : "baseline"`。
+- `#3683` 的上界用**同一个** `as_tex_ceiling()`（`>=4096 ? 4096 : 2048`）。
+
+这不是「顺手把常量抬一档」：如果回读值与校验各写各的数字，就会演出「报 `enhanced`、却在 4097 上抛 `#3683 (max is 2048)`」这种自相矛盾。同源是这一级唯一站得住的写法，也让 WebGL2 的弱显卡**自动**落回 `baseline`。
+
+`#3683`/`#3766` 的两式文案是**字符串字面量**而不是共用的 `snprintf` 缓冲：`Error_ctor` 存的是指针不拷贝，缓冲被下一次抛错改写会静默篡改一个仍然活着的错误对象。
+
+**四、验收**
+
+- `examples/stage3d-profile.as` 扩到 51 条断言：回读 `"baselineExtended"`、**请求 `enhanced` 也不得抬升回读值**，并逐个触发 `#3681/#3682/#3683/#3705/#3766` 五条（含「`4097` 必须是 `#3682`」这条顺序钉）。
+- `unit: stage3d/texture-size-limits`（新组，6 条：顺序、上界同源、两式文案、cube 不随档位、rect 无 pow2、三个工厂都先校验后分配）；`unit: stage3d/request-context-profile` 第 5 条由「恒 baseline」改为「由后端上界推导，且**不许**出现恒返回 `"baseline"`」。
+- `vendor/stage3d_d3d.cc` 用 clang 单独编过（`-c -std=c++17`，零错误）；`.mm` / `.cc` 本机无法编译，新增函数是纯 C 形态、只用各文件已有的符号。
+
+**closure**：① **「我们报的档位」是一个关于能力的断言，不是关于请求的回显** —— AIR 能回显是因为它七档全满足；回显一个自己无法兑现的值，就是在读者（Starling）身上制造一条未验证路径，而 Starling 恰恰是按回读值分支的；② **可观测行为不止是「报什么错」，还包括「先报哪个错」** —— `4097` 落在 `#3682` 而不是 `#3683`，只有把三条判定的相对顺序钉住才防得住将来有人「优化」成一条 `max()`；③ **凡是对外承诺能力的量，都必须与执行该能力的那个查询同源**（这里是 `s3d_max_texture_size()` 同时喂 `#3683` 与 `profile`）—— 两份数字迟早会漂，而漂的那一刻通常没人报 bug，只是 Starling 在弱显卡上黑屏一次。
+
+**仍未做的（下一级，已登记）**：MRT（`colorOutputIndex`/`NumRenderTargets=1`/单 `colorAttachments[0]`）、`Context3DTextureFormat.RGBA_HALF_FLOAT`（三后端只建 `BGRA8`）、AGAL4 + VTF（`runtime.ts` 显式拒绝 `version > 3`，GLSL 顶点阶段不声明 sampler）—— 这三处落地后才允许把回读值抬到 `standard`/`enhanced`。
+
 ### 遗留待开发
+> **2026-10-21 追加（阶段二百二十六：`Context3D.profile` 分档上报）**：**新登记 3 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **95 → 98 项**（`未开始` **72 → 75**）。本阶段修的是「`adl` 跑得对、我们跑不出」（`adl` 会把 4097 拦下来，我们照单全收），按 §1.5 硬判据属**遗留缺陷**且**阶段内已修净**，故不进表；**但**逐档爬把后面两级的真实缺口量成了三行独立的表项（MRT、浮点纹理、AGAL4/VTF），它们是**可执行的欠账**而不是「以后再说」——登记它们是为了让「报 `enhanced`」这件事有明确的完工判据。**旧口径「`profile` 固定 baseline」在本阶段已作废**，凡按它写过的正文（`docs/zh-cn/display3d.md` §6/§7、`README-CN.md` 示例说明）已同步改写。
 > **2026-10-21 追加（阶段二百二十四：拖动时画面呼吸的设备倍率修复）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内实际行数不变（**95 项**）。本阶段修的是**我们自己**在 macOS 上把"缓存逻辑尺寸／现场像素尺寸"相除得到的错误倍率（`adl` 始终报 2.0、我们中途会给出 2.006–2.0625），属"`adl` 跑得对而跑不出 ⇒ 遗留缺陷"，且**阶段内已修净并量过**（151/151 → 0/151），故不入表（与阶段二百二十 同例）。**如实报明一处仍未做的**：同一处"两个尺寸相除"的写法在 **Windows 主窗口入口**（`sk_window_open_gpu_d3d` 一族）**未改**——D3D 那端的 `SDL_GetWindowSizeInPixels` 是否也会与逻辑尺寸错档，本机无法测量，故按"没量过就不动"处理（新缝在无 `backingScaleFactor` 的平台上原样返回 `pw/lw`，行为与改前一字不差）。
 > **2026-10-21 追加（阶段二百二十三：对象按配置分目录 + ICU 判据与版本金丝雀）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内实际行数不变（**95 项**）。本阶段两处都是**构建层**的静默面（共享对象路径、ICU 替换判据），不碰任何 AIR 已定义行为 ⇒ 既不新增也不清偿语义欠账，故不入表。**如实报明两处仍未做的，都与阶段二百二十二 同一族（且都是体积项、不是语义缺口）**：① Windows 的 ICU 数据对象在 `skunicode.lib` 里且是 COFF，本机无法验证 ⇒ Windows 仍付 10.19 MB，**并且**本阶段新增的版本金丝雀只读 Mach-O 归档，Windows 那端没有对应探测（返回 null = 不报）；② Linux 的 `--gc-sections` 需先给编译期加 `-ffunction-sections -fdata-sections`（含每个预编译 archive）才有效，本机无 Linux Skia 预编译树，**未做也未发旗标**。
 > **2026-10-21 追加（阶段二百二十二：链接期 `-dead_strip -x` + 小 ICU 数据包）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内实际行数不变（**95 项**）。本阶段两刀都不碰 AIR 语义：`-dead_strip`/`-x` 只改**链接可达性与符号表**，小 ICU 数据包换的是**数据选择**（Skia 自己的 wasm 构建早就在用同一份），断行/bidi/NFKC 的行为由全量 429 项回归兜住 ⇒ 既不清偿也不新增语义欠账。**如实报明两处仍未做的**：① Windows 的 ICU 数据对象在 `skunicode.lib` 里且是 COFF，需在 Windows 上重编，本机无法验证，故 **Windows 仍付 10.19 MB**；② Linux 的 `--gc-sections` 需先给编译期加 `-ffunction-sections -fdata-sections`（含每个预编译 archive）才有效，本机无 Linux Skia 预编译树，**未做也未发旗标**。两者都是**体积项、不是语义缺口**，故不入表。
@@ -13870,6 +13918,9 @@ GEO req=658x1160 model{bnd=329x580}   ← 层真实是 329 pt / 658 px
 | **窗口几何的 Windows 端残余**（`<transparent>` 未接线 / 四类未测面剩下的两项） | 部分完成（2026-10-19 阶段二百零四 实测登记；**阶段二百零五 收窄**：原来列的四处里，① 最大化尺寸口径 **已定** —— 那是 `WS_MAXIMIZEBOX` 这一位（在 ⇒ 可用区 `2576x1675`，不在 ⇒ 整块显示器 `2576x1723`，adl 与我们在两档描述符下**逐字相同**），② 横向边框 **已修**（`b_left` 四处同源），③ 描述符成员 **已接线**（`<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>`），只剩下面两处） | **① `<transparent>` 未接线**：`Descriptor.51.4.xsd` 里的合法桌面元素，`src/air-app.ts` 现在只把它当属性存下，两端都没有真透明窗（win32 要 `WS_EX_LAYERED` + 逐帧 alpha，macOS 要先解 `SDL_WINDOW_TRANSPARENT` 与 Skia 的预乘 alpha 口径）；**② 四类未测面剩下的两项**：红叉 `closing` 的可取消序（`WM_CLOSE` 通路）与 `resizeToScreen` 在每屏 DPI（per-monitor v2）下的单位（本机单屏 150%，量不出跨屏差值）。另：手势拖拽（`startMove`/`startResize`）与 `minimize`/`restore`/`maximize` 的事件顺序在阶段二百零五 已端到端量过，不再是欠账 | 均属「AIR 有、我们没接线/没量」：① 先定 alpha 口径再动手（`<transparent>` 会连带动到 `Stage` 的清屏色与 `opaqueBackground`），且必须**两端同批**；② `closing` 用外部 `PostMessage(WM_CLOSE)` 驱动（本机真实鼠标注入一直有失败率，绕开它），DPI 那项需多屏或改成注入式 DPI 假造。 |
 | **初始窗的框/客户区单位**（描述符 `<width>/<height>` 是**框**，我们当**客户区** ⇒ 窗大一圈、舞台也大一圈） | 未开始（2026-10-19 阶段二百零五 实测登记；**两端同源，非 Windows 专属**） | Windows 实机孪生探针（`temp/nwwin/wprobe/`，`<width>366</width><height>630</height>`）：adl `bounds=366x630` + `stage=350x591`；我们 `bounds=382x669` + `stage=366x630`，**恰好差 16x39 = 左右边框 8+8 与标题栏 31 + 下边框 8**。根因在生成侧：引导代码把描述符的 `width`/`height` 当**客户区**交给 `Stage_showWindow`（它拿同一对数去置 `design_w/h`、`lw/lh`、`pw/ph`），窗口又按同一对数开 ⇒ **两道都大一圈**（AIR 的 `stage` 才是客户区，`NativeWindow.bounds` 是框）。macOS 走同一条生成路径 ⇒ 同一缺陷在 macOS 上应表现为差一个 `32pt` 标题栏，**本机不可实测** | 需与之俱动：① 窗口按**框**尺寸建（或建完读回客户区再定尺寸）；② 舞台/表面用**真实客户区**；③ `Stage.stageWidth/Height` 与 `design_*` 的口径一次对齐；④ 全 GUI 示例 + 像素 harness 同批回归（改的是**每扇窗的初始几何**）。半修（只改窗口不改舞台）会得到**被缩放**的画面，比现状更糟 ⇒ 必须成批做，先立项再动手。 |
 | **点链首段被变量遮蔽时仍被当类引用解析**（`var pkg:Object = null; pkg.C.field` —— 我们静默给出静态值/undefined，`adl` 抛 `#1009`） | 未开始（阶段二百一十七 实测登记；**先于该阶段就存在**；阶段二百一十八 追加实测证据：**全限定名读一个不存在的静态成员是静默 `undefined`**，而短名当场报编译错 —— 见行内证据） | 证据：`adl 51.4.1`（`temp/fqnadl/`）在两种拼写上都抛 `Error #1009`（那是**值上的成员链**，null 接收者）；我们在 HEAD（`5ce625b`）上就已发射 `(pkg_C_cinit(), pkg_C_field)`（静态字段直接读出 5），本轮加闸门后该名字改走 `as_class_member_value(&pkg_C_cls, "field")`（仍把 `pkg.C` 当 Class 值）。**静默错值**按 AGENTS §2.5 是最重的一类。同源面比「静态字段读」更宽：`emitMember` 的全限定名分支（读数整体不查闸门；本轮只为新增的 getter 路径在 `classRefName` 内加闸门 `chainRootIsValue`，旧分支保留原行为以免扩散风险）、「点链当 Class 值解析」、`Cls["member"]` 的 `expr.object.kind === 'Var'` 分支 | 把「链首段是作用域内变量」这一判定提到**所有**点链解析的必经处（单一入口 `resolveFqnClass(chain)`，内部查 `scopes` + `moduleScope`），再逐处替换；钉子必须能区分「值上的链」与「包路径」，且**必须是运行期断言**（`#1009` vs 静默值）—— 源级钉只能看形状 |
+| **MRT（`setRenderToTexture(..., colorOutputIndex)` 与 AGAL 的 `oc1..oc3`）** | 部分完成（阶段二百二十六 分档实测登记：**这是 `standard` 档的越线条件**；`baselineExtended` 起 `adl` 仍抛 `#3779`） | 我方 `symbols.ts` 的 `Context3D.setRenderToTexture` 只有 4 形参（缺 `colorOutputIndex`）、`vendor/stage3d_d3d.cc` `NumRenderTargets=1`、`vendor/stage3d_glue.mm` 仅写 `colorAttachments[0]`、`stage3d_webgl.cc` 单渲染目标；而 HLSL 档的 `oc1..oc3` 出码早已存在（阶段八十三，仅未接上多附件）。完工判据：形参补齐 + MSL/GLSL 多附件 + 三后端同步，且 `adl` 的 `#3779` 在 `standard` 起不再出现 |
+| **浮点纹理 `Context3DTextureFormat.RGBA_HALF_FLOAT`** | 未开始（阶段二百二十六 分档实测登记：`baselineExtended` 抛 `#3759`，`standard` 起接受） | 我方 `Context3DTextureFormat` **无该常量**（编译期即报 undefined），三后端只建 `BGRA8`（`stage3d_d3d.cc` 的 `DXGI_FORMAT` 选择、`stage3d_glue.mm` 的 `MTLPixelFormat` 选择、WebGL 的 `internalformat`）。Starling 不用它，但 `RenderTexture` 的 HDR 路径会 |
+| **AGAL4 与顶点纹理取值（VTF）** | 未开始（阶段二百二十六 分档实测登记：这是 `enhanced` 相对 `standard` 唯一新增的东西） | `runtime.ts` 的 AGAL 前置对 `version > 3` **显式拒绝**、指令数上限硬编码 200；GLSL 翻译器**只在片元阶段声明 sampler**（`isFragment` 分支）⇒ WebGL2 上顶点取样会编译失败；MSL/HLSL 的顶点入口也没有对应的 `texture` 绑定槽。完工判据：AGAL4 解析 + 顶点 sampler 声明 + 三后端绑定与取样 |
 
 
 
