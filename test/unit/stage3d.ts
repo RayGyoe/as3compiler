@@ -1133,13 +1133,18 @@ function checkStage3dRequestContextProfile(): string[] {
 registerGroup('stage3d/request-context-profile', checkStage3dRequestContextProfile);
 
 // Texture-size validation. Every number and message below is a measurement against
-// adl 51.4.1 (temp/adlprof/, PROBE_MODE=edge), not an inference from the docs:
+// adl 51.4.1 (temp/adlprof/, PROBE_MODE=edge and PROBE_MODE=ign), not an inference
+// from the docs:
 //   createTexture      0/negative -> #3681, non-pow2 -> #3682, > ceiling -> #3683
 //   createCubeTexture  0/negative -> #3681, non-pow2 -> #3682, > 1024 -> #3705
 //   createRectangle*   0/negative -> #3681, no pow2 rule, > ceiling -> #3766
 // The ceiling is 2048 at baseline and 4096 from baselineExtended up, and it is the
 // same query the profile report is derived from, so the claim and the limit cannot
 // drift apart.
+//
+// Context3D.ignoreResourceLimits (AIR 50.0+) lifts the CEILING paths only. Measured:
+// #3681 and #3682 keep throwing with the flag on, and the beyond-ceiling failure
+// changes from ArgumentError #3683/#3705/#3766 to Error #3684.
 function checkStage3dTextureLimits(): string[] {
   const bad: string[] = [];
   let ok = 0;
@@ -1194,9 +1199,42 @@ function checkStage3dTextureLimits(): string[] {
   const iCreate = emitted.indexOf('Texture* Context3D_createTexture');
   check('all three factories validate before allocating',
     iCreate > 0
-    && emitted.indexOf('as_tex_check_2d(width, height);') < emitted.indexOf('Texture* t = Texture_new();')
-    && emitted.indexOf('as_tex_check_cube(size);') < emitted.indexOf('CubeTexture* t = CubeTexture_new();')
+    && emitted.indexOf('as_tex_check_2d(ctx, width, height);') < emitted.indexOf('Texture* t = Texture_new();')
+    && emitted.indexOf('as_tex_check_cube(ctx->ignoreResourceLimits, size);') < emitted.indexOf('CubeTexture* t = CubeTexture_new();')
     && emitted.indexOf('as_tex_check_rect(ctx, width, height);') < emitted.indexOf('RectangleTexture* t = RectangleTexture_new();'));
+
+  // 7. ignoreResourceLimits does not switch validation off: the zero and pow2 checks
+  //    have to sit ABOVE the flag branch, and the flag must be the context field (a
+  //    compile-time constant would let a caller's setter be ignored).
+  check('zero/pow2 checks precede the ignoreResourceLimits branch',
+    iZero > 0 && iPow > iZero
+    && body2d.indexOf('ctx->ignoreResourceLimits') > iPow
+    && bodyRect.indexOf('ctx->ignoreResourceLimits') > 0);
+
+  // 8. With the flag set, the ceiling comes from the DEVICE query, not the profile
+  //    ceiling: AIR's own post-bypass limit is still the profile ceiling, which is the
+  //    one documented divergence and the reason the switch exists at all.
+  const ignore2d = body2d.slice(body2d.indexOf('if (ctx != NULL && ctx->ignoreResourceLimits)'),
+    body2d.indexOf('int m = as_tex_ceiling();'));
+  check('flag-on 2D ceiling uses the device maximum',
+    ignore2d.includes('int d = as_s3d_max_texture_size();') && ignore2d.includes('as_tex_alloc_failed();'));
+
+  // 9. #3684 is an Error (not an ArgumentError) with AIR's verbatim text, and it is
+  //    the answer from all three validators once the flag is on.
+  check('#3684 is an Error with AIR text, reachable from all three validators',
+    emitted.includes('static void as_tex_alloc_failed(void) {')
+    && emitted.includes('as_throw(Error_new((char*)"Error #3684: Texture creation failed. Internal error.", 3684));')
+    && body2d.includes('as_tex_alloc_failed();')
+    && bodyCube.includes('as_tex_alloc_failed();')
+    && bodyRect.includes('as_tex_alloc_failed();'));
+
+  // 10. Cube maps keep AIR's 1024 hard cap even with the flag (measured: cube(2048)
+  //     still fails, only the error type changes), so the device query must NOT appear
+  //     in the cube validator.
+  check('cube keeps 1024 even with the flag, error type becomes #3684',
+    bodyCube.includes('if (ignoreLimits) as_tex_alloc_failed();')
+    && bodyCube.includes('else as_throw(ArgumentError_new((char*)"Error #3705')
+    && !bodyCube.includes('as_s3d_max_texture_size()'));
 
   console.log(`     [stage3d] ${ok} check(s) passed`);
   return bad;

@@ -392,7 +392,8 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   常量（含 `ENHANCED`）；非法 `renderMode`/`profile` 是**同步** `#2008`（AIR 文案逐字，且 `renderMode` 先于 `profile`
   校验）；回读 `profile` 报本构建真正能兑现的最高档（现为 `"baselineExtended"`），外加 `createTexture`/
   `createCubeTexture`/`createRectangleTexture` 的尺寸校验（`#3681` 零尺寸 → `#3682` 非 2 的幂 → `#3683`/`#3705`/`#3766` 超上限，
-  AIR 文案逐字；对 `adl` 51.4.1 实测）
+  AIR 文案逐字；对 `adl` 51.4.1 实测）；`Context3D.ignoreResourceLimits`（AIR 50.0+）关时与 AIR 逐字一致、
+  开时放开到**设备上限**（D3D12/Metal 16384），超限改报 `Error #3684`，而 `#3681`/`#3682` 仍照旧
 - `examples/stage86.as` — `flash.utils` 反射（`getQualifiedClassName`/`getDefinitionByName`/动态实例化）
 - `examples/stage87.as` — `Context3D` 骨架补方法（stencil/scissor/缓冲上传读回/`drawTriangles`）
 - `examples/stage88.as` — AS3 语言特性缺口补齐（对象字面量字符串键、逻辑赋值、`for each`、命名空间等）

@@ -20485,14 +20485,49 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     //
     // Cube maps do NOT scale with the profile: 1024 at every rung up to enhanced
     // (measured), unlike 2D/RectangleTexture which go 2048 -> 4096.
+    //
+    // ---- Context3D.ignoreResourceLimits (AIR 50.0+, default false) ----
+    //
+    // Measured on adl 51.4.1 with the flag flipped (temp/adlprof/ ign mode, all of
+    // baseline / baselineExtended / enhanced agree). It does NOT mean "no validation":
+    //
+    //   check            flag off                        flag on
+    //   zero size        #3681 ArgumentError             #3681 ArgumentError  (same)
+    //   power of two     #3682 ArgumentError             #3682 ArgumentError  (same)
+    //   2D ceiling       #3683 ArgumentError 2048/4096   skipped, then #3684 Error
+    //   cube 1024        #3705 ArgumentError             skipped, then #3684 Error
+    //   rect ceiling     #3766 ArgumentError             skipped, up to device max
+    //   object counts    4096 documented                no limit observed either way
+    //
+    // Two things that surprise people, both pinned in temp/adlprof:
+    //   * the ERROR TYPE changes on the ceiling paths (ArgumentError -> Error), so
+    //     `catch (e:ArgumentError)` stops seeing it;
+    //   * AIR's own post-bypass 2D ceiling is still the profile ceiling — at baseline
+    //     even createTexture(4096,1) fails with #3684, and at enhanced 8192 does. The
+    //     documented text says only that the "resource limits" table stops applying.
+    //
+    // We therefore bypass to the DEVICE maximum (as_s3d_max_texture_size(), 16384 on
+    // D3D12/Metal) rather than to AIR's profile ceiling. That is the one intentional
+    // divergence and it is opt-in twice over (AIR-legal property, default false), so
+    // default builds stay byte-compatible with AIR. Cube stays at 1024 even with the
+    // flag: a 16384 cube is 6 GB of texture and AIR does not lift it either.
     this.line('static bool as_tex_is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }');
     this.line('static int as_tex_ceiling(void) { return as_s3d_max_texture_size() >= 4096 ? 4096 : 2048; }');
-    this.line('static void as_tex_check_2d(int w, int h) {');
+    // #3684 is an Error, not an ArgumentError, and its text is AIR's verbatim.
+    this.line('static void as_tex_alloc_failed(void) {');
+    this.line('  as_throw(Error_new((char*)"Error #3684: Texture creation failed. Internal error.", 3684));');
+    this.line('}');
+    this.line('static void as_tex_check_2d(Context3D* ctx, int w, int h) {');
     this.indent++;
     this.line('if (w <= 0 || h <= 0)');
     this.line('  as_throw(ArgumentError_new((char*)"Error #3681: Texture size is zero.", 3681));');
     this.line('if (!as_tex_is_pow2(w) || !as_tex_is_pow2(h))');
     this.line('  as_throw(ArgumentError_new((char*)"Error #3682: Texture size not a power of two.", 3682));');
+    this.line('if (ctx != NULL && ctx->ignoreResourceLimits) {');
+    this.line('  int d = as_s3d_max_texture_size();');
+    this.line('  if (w > d || h > d) as_tex_alloc_failed();');
+    this.line('  return;');
+    this.line('}');
     this.line('int m = as_tex_ceiling();');
     this.line('if (w > m || h > m)');
     this.line('  as_throw(ArgumentError_new((char*)(m >= 4096');
@@ -20500,14 +20535,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('    : "Error #3683: Texture too big (max is 2048x2048)."), 3683));');
     this.indent--;
     this.line('}');
-    this.line('static void as_tex_check_cube(int size) {');
+    this.line('static void as_tex_check_cube(bool ignoreLimits, int size) {');
     this.indent++;
     this.line('if (size <= 0)');
     this.line('  as_throw(ArgumentError_new((char*)"Error #3681: Texture size is zero.", 3681));');
     this.line('if (!as_tex_is_pow2(size))');
     this.line('  as_throw(ArgumentError_new((char*)"Error #3682: Texture size not a power of two.", 3682));');
-    this.line('if (size > 1024)');
-    this.line('  as_throw(ArgumentError_new((char*)"Error #3705: Cubemap texture too big (max is 1024x1024).", 3705));');
+    this.line('if (size > 1024) {');
+    this.line('  if (ignoreLimits) as_tex_alloc_failed();');
+    this.line('  else as_throw(ArgumentError_new((char*)"Error #3705: Cubemap texture too big (max is 1024x1024).", 3705));');
+    this.line('}');
     this.indent--;
     this.line('}');
     // RectangleTexture has its own ceiling and NO power-of-two rule (rect(4097) is
@@ -20517,6 +20554,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('if (w <= 0 || h <= 0)');
     this.line('  as_throw(ArgumentError_new((char*)"Error #3681: Texture size is zero.", 3681));');
+    this.line('if (ctx != NULL && ctx->ignoreResourceLimits) {');
+    this.line('  int d = as_s3d_max_texture_size();');
+    this.line('  if (w > d || h > d) as_tex_alloc_failed();');
+    this.line('  return;');
+    this.line('}');
     this.line('int m = as_tex_ceiling();');
     this.line('if (ctx->backBufferWidth > m) m = ctx->backBufferWidth;');
     this.line('if (ctx->backBufferHeight > m) m = ctx->backBufferHeight;');
@@ -20529,7 +20571,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('Texture* Context3D_createTexture(void* _this, int width, int height, char* format, bool optimizeForRenderToTexture) {');
     this.indent++;
     this.line('Context3D* ctx = (Context3D*)_this;');
-    this.line('as_tex_check_2d(width, height);');
+    this.line('as_tex_check_2d(ctx, width, height);');
     this.line('Texture* t = Texture_new();');
     this.line('t->width = width; t->height = height; t->format = format;');
     // optimizeForRenderToTexture=true allocates a render-target MTLTexture up
@@ -20543,8 +20585,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('CubeTexture* Context3D_createCubeTexture(void* _this, int size, char* format, bool optimizeForRenderToTexture) {');
     this.indent++;
-    this.line('(void)_this; (void)optimizeForRenderToTexture;');
-    this.line('as_tex_check_cube(size);');
+    this.line('Context3D* ctx = (Context3D*)_this;');
+    this.line('(void)optimizeForRenderToTexture;');
+    this.line('as_tex_check_cube(ctx->ignoreResourceLimits, size);');
     this.line('CubeTexture* t = CubeTexture_new();');
     this.line('t->width = size; t->height = size; t->format = format;');
     this.line('return t;');

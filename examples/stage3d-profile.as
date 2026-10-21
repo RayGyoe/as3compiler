@@ -155,5 +155,67 @@ expectArgError(function():void { c.createRectangleTexture(0, 1, "bgra", false); 
 expectArgError(function():void { c.createRectangleTexture(4097, 1, "bgra", false); },
   3766, "Error #3766: RectangleTexture too big (max is the larger of 4096x4096 or the size of the backbuffer).");
 
+// ---- Context3D.ignoreResourceLimits (AIR 50.0+, default false) ----
+// Measured on adl 51.4.1 (temp/adlprof/ ign mode). The flag does NOT switch validation
+// off: zero-size and power-of-two keep throwing #3681/#3682, and the beyond-ceiling
+// answer changes both TYPE and CODE — ArgumentError #3683/#3705/#3766 become
+// Error #3684. That type change is the part apps can observe with
+// `catch (e:ArgumentError)`, so it is what this example pins.
+check(c.ignoreResourceLimits == false, "ignoreResourceLimits defaults to false");
+
+try {
+  c.createTexture(8192, 1, "bgra", false);
+  check(false, "8192 must be rejected while limits are on");
+} catch (e0:Error) {
+  check(e0.errorID == 3683, "limits on: 8192 is #3683, got " + e0.errorID);
+}
+
+c.ignoreResourceLimits = true;
+check(c.ignoreResourceLimits == true, "ignoreResourceLimits read-back");
+
+// Argument validity is independent of the flag.
+expectArgError(function():void { c.createTexture(0, 1, "bgra", false); },
+  3681, "Error #3681: Texture size is zero.");
+expectArgError(function():void { c.createTexture(2049, 1, "bgra", false); },
+  3682, "Error #3682: Texture size not a power of two.");
+
+// The ceiling itself is gone. Whether the DEVICE can honour 8192 decides between
+// "object" and #3684 — both are correct, and neither may be #3683.
+try {
+  check(c.createTexture(8192, 1, "bgra", false) != null, "8192 accepted once limits are off");
+} catch (e1:Error) {
+  check(e1.errorID == 3684, "limits off: beyond the device max is #3684, got " + e1.errorID);
+  check(e1.message == "Error #3684: Texture creation failed. Internal error.",
+        "#3684 message: " + e1.message);
+}
+
+// Cube maps keep AIR's 1024 hard cap even with the flag, but the failure changes from
+// ArgumentError #3705 to Error #3684 (measured: cube(2048) -> #3684 on every rung).
+try {
+  c.createCubeTexture(2048, "bgra", false);
+  check(false, "2048 cube must still be rejected");
+} catch (e2:Error) {
+  check(e2.errorID == 3684, "limits off: 2048 cube is #3684, got " + e2.errorID);
+  check(e2.message == "Error #3684: Texture creation failed. Internal error.",
+        "#3684 message for cube: " + e2.message);
+}
+
+// RectangleTexture goes to the device maximum (AIR reaches 16384 there too).
+try {
+  check(c.createRectangleTexture(8192, 1, "bgra", false) != null, "8192x1 rectangle accepted");
+} catch (e3:Error) {
+  check(e3.errorID == 3684, "rect beyond device max is #3684, got " + e3.errorID);
+}
+
+// Flipping it back restores AIR's default answers.
+c.ignoreResourceLimits = false;
+check(c.ignoreResourceLimits == false, "ignoreResourceLimits turns back off");
+expectArgError(function():void { c.createTexture(8192, 1, "bgra", false); },
+  3683, "Error #3683: Texture too big (max is 4096x4096).");
+
+// The flag never rewrites the profile: it widens what we will ACCEPT, it does not
+// claim a higher AGAL feature set.
+check(c.profile == "baselineExtended", "ignoreResourceLimits does not change profile");
+
 if (failures != 0) throw new Error("stage3d-profile: " + failures + " of " + checks + " assertion(s) failed");
 trace("stage3d-profile: " + checks + " assertions passed");

@@ -13695,7 +13695,49 @@ GEO req=658x1160 model{bnd=329x580}   ← 层真实是 329 pt / 658 px
 
 **仍未做的（下一级，已登记）**：MRT（`colorOutputIndex`/`NumRenderTargets=1`/单 `colorAttachments[0]`）、`Context3DTextureFormat.RGBA_HALF_FLOAT`（三后端只建 `BGRA8`）、AGAL4 + VTF（`runtime.ts` 显式拒绝 `version > 3`，GLSL 顶点阶段不声明 sampler）—— 这三处落地后才允许把回读值抬到 `standard`/`enhanced`。
 
+### 阶段二百二十七：`Context3D.ignoreResourceLimits` —— 把「软上限」放开，但不悄悄换语义（v0.4.200 → v0.4.201）✅ 已完成
+
+**触发**：用户读了阶段二百二十六 之后提出「AIR 有 `ignoreResourceLimits`，可以强制设 `true`，我们可不按官方限制来，能支持多大就放宽到多大」。这个想法一半成立、一半正好相反，于是先**实测**再动手，不拿文档措辞当结论。
+
+**一、`adl` 51.4.1 实测：这个开关到底放开了什么（`temp/adlprof/`，`PROBE_MODE=ign`）**
+
+`baseline` / `baselineExtended` / `enhanced` 三档结论一致：
+
+| 检查 | 旗标关闭 | 旗标打开 |
+|---|---|---|
+| 零尺寸 | `#3681` ArgumentError | `#3681` ArgumentError（**不变**） |
+| 2 的幂 | `#3682` ArgumentError | `#3682` ArgumentError（**不变**） |
+| 2D 上界 | `#3683` ArgumentError | 跳过 → 真分配 → 超硬上限报 **`#3684` Error** |
+| cube 1024 | `#3705` ArgumentError | 跳过 → **仍然** 1024，报 `#3684` |
+| rect 上界 | `#3766` ArgumentError | 跳过 → 一路放到**设备上限 16384** |
+| 对象个数 4096 | 4300 个仍可建（约束是内存不是计数） | 同左 |
+
+两条反直觉的事实：
+
+1. **错误类型会变**（`ArgumentError` → `Error`）。`catch (e:ArgumentError)` 再也接不到，这在 AIR 上就是既成事实。
+2. **AIR 自己并没有把 2D 贴图放大**。旁路之后 `baseline` 下连 `createTexture(4096,1)` 都报 `#3684`，`enhanced` 下 `8192` 报 `#3684` —— 也就是说这个开关在 AIR 上对 2D 只是「把参数错误换成了分配失败」，真正被放开到设备上限的是 **RectangleTexture** 与**对象数量/显存预算**。
+
+**二、修法：默认逐字对齐 AIR，打开旗标才走设备上限**
+
+- `as_tex_check_2d(ctx, w, h)`：`#3681` → `#3682` → **旗标分支**。关闭时走原来的 `#3683`；打开时上界改为 `as_s3d_max_texture_size()`（D3D12/Metal 16384），超了报 `Error #3684: Texture creation failed. Internal error.`。
+- `as_tex_check_cube(bool ignoreLimits, size)`：**始终 1024**，旗标打开只把 `#3705` 换成 `#3684`（与 AIR 逐字一致）。16384 的立方体贴图 = 6 GB，放大它只会把「明确报错」变成「后端分配失败」。
+- `as_tex_check_rect(ctx, w, h)`：关闭时 = max(档位上界, 后台缓冲)；打开时 = 设备上限。
+- `#3681`/`#3682` **永远在旗标分支之前**——这是 adl 实测的顺序，也是「旗标不是关掉校验」的判据。
+
+旗标读的是 **context 字段**（`ctx->ignoreResourceLimits`）而不是编译期常量，所以运行中翻转它会立刻生效。
+
+**三、验收**
+
+- `examples/stage3d-profile.as` 51 → **67 条断言**：默认 `false`、`#3681`/`#3682` 不受影响、`#3683` → `#3684`（且文案逐字）、cube 仍是 `#3684` 而非 `#3705`、rect 放宽、复位后恢复 `#3683`、**旗标不改 `profile`**。
+- `unit: stage3d/texture-size-limits` 6 → **10 条**：新增「零/幂次检查必须在旗标分支之前」「打开时用设备查询而非档位查询」「`#3684` 是 `Error` 且三个校验器共用」「cube 仍不引用设备查询」。
+- 全量回归见下方收尾记录。
+
+**closure**：① **「放宽限制」不能靠改一个常量** —— `ignoreResourceLimits` 是 AIR 50.0 起就有的**公开属性**，它有明确的语义边界（只放软上限，保留参数合法性检查），照自己的意思实现等于给同一个开关两种行为；② **没量过就不要复述文档** —— 文档说「忽略软限制」，实测却是「2D 仍卡在 profile 上限」，这条差异不实测就会被写成「我们已经支持 8K 贴图」；③ **放行的上限必须与真正能分配的那个后端同源** —— 用的仍是阶段二百二十六 的 `as_s3d_max_texture_size()`，而不是另写一个 16384。
+
+**仍未做的（不静默，已入表）**：旗标打开后我们只按**设备上限**放行，不预检像素总量；2D/rect 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `gpu` 留空，上传时才建），后端分配失败目前不会立刻冒成 `#3684`。
+
 ### 遗留待开发
+> **2026-10-22 追加（阶段二百二十七：`Context3D.ignoreResourceLimits`）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**。本阶段修的是「`adl` 会报 `#3683`、我们照单全收」之后的下一层：`ignoreResourceLimits` 这个 AIR 公开属性的语义（软上限放开、`#3681`/`#3682` 保留、超限改报 `Error #3684`）在阶段内**已逐字对齐**，故不进表；新登记的一行是「旗标打开后缺少显存预检/分配失败上报」——它是**我们这边**的缺口（`adl` 在 `#3684` 处同步失败，而我们的惰性分配会把失败推到上传之后），属可执行欠账。**一处刻意分歧已记入正文**：旗标打开时 2D 上界用设备上限（16384）而非 AIR 的 profile 上限——这是本阶段唯一的主动分歧，且双重 opt-in（AIR 合法属性 + 默认 `false`），默认产物仍与 AIR 同构。
 > **2026-10-21 追加（阶段二百二十六：`Context3D.profile` 分档上报）**：**新登记 3 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **95 → 98 项**（`未开始` **72 → 75**）。本阶段修的是「`adl` 跑得对、我们跑不出」（`adl` 会把 4097 拦下来，我们照单全收），按 §1.5 硬判据属**遗留缺陷**且**阶段内已修净**，故不进表；**但**逐档爬把后面两级的真实缺口量成了三行独立的表项（MRT、浮点纹理、AGAL4/VTF），它们是**可执行的欠账**而不是「以后再说」——登记它们是为了让「报 `enhanced`」这件事有明确的完工判据。**旧口径「`profile` 固定 baseline」在本阶段已作废**，凡按它写过的正文（`docs/zh-cn/display3d.md` §6/§7、`README-CN.md` 示例说明）已同步改写。
 > **2026-10-21 追加（阶段二百二十四：拖动时画面呼吸的设备倍率修复）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内实际行数不变（**95 项**）。本阶段修的是**我们自己**在 macOS 上把"缓存逻辑尺寸／现场像素尺寸"相除得到的错误倍率（`adl` 始终报 2.0、我们中途会给出 2.006–2.0625），属"`adl` 跑得对而跑不出 ⇒ 遗留缺陷"，且**阶段内已修净并量过**（151/151 → 0/151），故不入表（与阶段二百二十 同例）。**如实报明一处仍未做的**：同一处"两个尺寸相除"的写法在 **Windows 主窗口入口**（`sk_window_open_gpu_d3d` 一族）**未改**——D3D 那端的 `SDL_GetWindowSizeInPixels` 是否也会与逻辑尺寸错档，本机无法测量，故按"没量过就不动"处理（新缝在无 `backingScaleFactor` 的平台上原样返回 `pw/lw`，行为与改前一字不差）。
 > **2026-10-21 追加（阶段二百二十三：对象按配置分目录 + ICU 判据与版本金丝雀）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内实际行数不变（**95 项**）。本阶段两处都是**构建层**的静默面（共享对象路径、ICU 替换判据），不碰任何 AIR 已定义行为 ⇒ 既不新增也不清偿语义欠账，故不入表。**如实报明两处仍未做的，都与阶段二百二十二 同一族（且都是体积项、不是语义缺口）**：① Windows 的 ICU 数据对象在 `skunicode.lib` 里且是 COFF，本机无法验证 ⇒ Windows 仍付 10.19 MB，**并且**本阶段新增的版本金丝雀只读 Mach-O 归档，Windows 那端没有对应探测（返回 null = 不报）；② Linux 的 `--gc-sections` 需先给编译期加 `-ffunction-sections -fdata-sections`（含每个预编译 archive）才有效，本机无 Linux Skia 预编译树，**未做也未发旗标**。
@@ -13921,6 +13963,7 @@ GEO req=658x1160 model{bnd=329x580}   ← 层真实是 329 pt / 658 px
 | **MRT（`setRenderToTexture(..., colorOutputIndex)` 与 AGAL 的 `oc1..oc3`）** | 部分完成（阶段二百二十六 分档实测登记：**这是 `standard` 档的越线条件**；`baselineExtended` 起 `adl` 仍抛 `#3779`） | 我方 `symbols.ts` 的 `Context3D.setRenderToTexture` 只有 4 形参（缺 `colorOutputIndex`）、`vendor/stage3d_d3d.cc` `NumRenderTargets=1`、`vendor/stage3d_glue.mm` 仅写 `colorAttachments[0]`、`stage3d_webgl.cc` 单渲染目标；而 HLSL 档的 `oc1..oc3` 出码早已存在（阶段八十三，仅未接上多附件）。完工判据：形参补齐 + MSL/GLSL 多附件 + 三后端同步，且 `adl` 的 `#3779` 在 `standard` 起不再出现 |
 | **浮点纹理 `Context3DTextureFormat.RGBA_HALF_FLOAT`** | 未开始（阶段二百二十六 分档实测登记：`baselineExtended` 抛 `#3759`，`standard` 起接受） | 我方 `Context3DTextureFormat` **无该常量**（编译期即报 undefined），三后端只建 `BGRA8`（`stage3d_d3d.cc` 的 `DXGI_FORMAT` 选择、`stage3d_glue.mm` 的 `MTLPixelFormat` 选择、WebGL 的 `internalformat`）。Starling 不用它，但 `RenderTexture` 的 HDR 路径会 |
 | **AGAL4 与顶点纹理取值（VTF）** | 未开始（阶段二百二十六 分档实测登记：这是 `enhanced` 相对 `standard` 唯一新增的东西） | `runtime.ts` 的 AGAL 前置对 `version > 3` **显式拒绝**、指令数上限硬编码 200；GLSL 翻译器**只在片元阶段声明 sampler**（`isFragment` 分支）⇒ WebGL2 上顶点取样会编译失败；MSL/HLSL 的顶点入口也没有对应的 `texture` 绑定槽。完工判据：AGAL4 解析 + 顶点 sampler 声明 + 三后端绑定与取样 |
+| **旗标打开后的显存预检与分配失败上报**（`Context3D.ignoreResourceLimits = true`） | 未开始（2026-10-22 阶段二百二十七 实测登记：`adl` 在 `#3684` 处**同步**失败，我们的惰性分配会把失败推到上传之后） | 旗标打开后我们只按**设备上限**（`as_s3d_max_texture_size()`，D3D12/Metal 16384）放行尺寸，**不预检像素总量**；而 2D/`RectangleTexture` 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `t->gpu` 留空，等 `uploadFromBitmapData`/`uploadFromByteArray` 才建），所以「设备上限允许、实际建不出来」这一档现在**不会**冒成 `#3684`——它会在上传时静默变成一张空贴图。`adl 51.4.1` 实测（`temp/adlprof/`，`PROBE_MODE=ign`）：旗标打开后 `baseline` 的 `createTexture(4096,1)`、`enhanced` 的 `createTexture(8192,1)` 都在**创建时**同步抛 `Error #3684: Texture creation failed. Internal error.`，即 AIR 在创建点就把分配做完了 | ① 给 `Texture`/`RectangleTexture` 的创建补一次**总量估算**（`w*h*bpp`，带 mip 时再乘 4/3，累加到 context 上），超过一个可配置的显存预算就抛 `#3684`（文案照 AIR）；② 或把 `as_s3d_create_render_texture` 的返回 `NULL` 立刻变成 `#3684`（目前只对 `optimizeForRenderToTexture=true` 有这条路径，且未检查返回值）。**成本中**，且要与「`ignoreResourceLimits=false` 时 AIR 的对象数量/显存预算」一起量（本阶段实测：`adl` 关旗标时 4300 个 1×1 贴图仍可建，即计数上限实际未生效，约束在显存） |
 
 
 

@@ -6672,11 +6672,14 @@ export class SymbolTable {
         ['backBufferHeight', c3f({ kind: 'int' })],
         ['antiAlias', c3f({ kind: 'int' })],
         ['enableDepthAndStencil', c3f({ kind: 'bool' })],
-        // ignoreResourceLimits (AIR 50, read-write): "specifies whether to ignore
-        // all 'soft' resource limits associated with a profile". This backend
-        // imposes no GPU resource limits of its own, so there is nothing to lift;
-        // the request is stored so a read-back reports what was set (Starling sets
-        // it from its rootCreated handler and traces the value straight back).
+        // ignoreResourceLimits (AIR 50.0, read-write, default false): "specifies whether
+        // to ignore all 'soft' resource limits associated with a profile". Read and
+        // written as a plain field -- measured to be what AIR does, and what the
+        // emitter's texture-size checks consult (as_tex_check_2d / _cube / _rect):
+        // the flag lifts the #3683/#3705/#3766 ceilings but NOT #3681 (zero) or
+        // #3682 (power of two), and the beyond-ceiling failure becomes Error #3684
+        // instead of an ArgumentError. See the block comment above those checks in
+        // emit.ts for the full adl 51.4.1 measurement.
         ['ignoreResourceLimits', c3f({ kind: 'bool' })],
         ['blendSource', c3f({ kind: 'string' })],
         ['blendDest', c3f({ kind: 'string' })],

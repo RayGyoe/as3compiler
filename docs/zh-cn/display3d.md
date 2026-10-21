@@ -539,6 +539,63 @@ Stage3D 构建（链 `stage3d_glue` 而不链 `metal_glue`）会链接失败；�
 `dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")` 惰性查找（函数指针缓存，取不到用自有队列），
 普通清单即可链接。钉子在 `stage3d/gpu-queue-sharing`。
 
+### 9.14 纹理尺寸上限与 `Context3D.ignoreResourceLimits`（阶段二百二十七）
+
+AIR 的纹理尺寸校验**不是一条规则，而是三条**，顺序也是可观测的：`#3681` 零尺寸 →
+`#3682` 非 2 的幂 → `#3683` / `#3705` / `#3766` 超上限。全部是 `ArgumentError`，全部在
+分配之前抛。数值来自 adl 51.4.1 实测（`temp/adlprof/`，`PROBE_MODE=edge`）：
+
+| 入口 | 上限 | 上限随 profile 变？ |
+|---|---|---|
+| `createTexture` | 2048 / 4096 | ✅ `baseline` = 2048，`baselineExtended` 起 = 4096 |
+| `createCubeTexture` | **恒 1024** | ❌ 七档全一样 |
+| `createRectangleTexture` | 2048 / 4096，**且不小于 backbuffer** | ✅ 但**没有** 2 的幂规则（4097 报 `#3766` 不是 `#3682`） |
+
+**上限与 `profile` 回读同源**，两者都取自 `as_s3d_max_texture_size()`：`>= 4096` ⇒ 报
+`baselineExtended` 并按 4096 校验；只有 2048 ⇒ 报 `baseline` 并按 2048 校验。
+**承诺与强制不会漂**——不会出现「报了 4096 却按 2048 拒绝」或反过来。
+该查询由三后端各自回答：D3D12 / Metal 恒 16384（`D3D_FEATURE_LEVEL_11_0` / Apple GPU 家族下限），
+WebGL2 现查 `GL_MAX_TEXTURE_SIZE`（`< 2048` 回落 2048），无渲染后端的纯 C 状态机给 4096。
+
+#### `ignoreResourceLimits`（AIR 50.0+，默认 `false`）实际做了什么
+
+文档只说「忽略 profile 关联的**软**资源上限」，没说什么算软。逐项实测（`PROBE_MODE=ign`，
+`baseline` / `baselineExtended` / `enhanced` 三档结论一致）：
+
+| 检查 | 旗标关闭 | 旗标打开 |
+|---|---|---|
+| 零尺寸 | `#3681` ArgumentError | `#3681` ArgumentError（**不变**） |
+| 2 的幂 | `#3682` ArgumentError | `#3682` ArgumentError（**不变**） |
+| 2D 上限 | `#3683` ArgumentError | 跳过 → 真分配 → 超硬上限报 `#3684` |
+| cube 1024 | `#3705` ArgumentError | 跳过 → **仍然** 1024，报 `#3684` |
+| rect 上限 | `#3766` ArgumentError | 跳过 → 一路放到**设备上限 16384** |
+| 对象个数（4096） | 实测 4300 个仍可建（约束是内存不是计数） | 同左 |
+
+两件容易踩的事：① **错误类型会变**（`ArgumentError` → `Error`），`catch (e:ArgumentError)`
+再也接不到；② AIR **自己**在旁路之后 2D 仍然卡在 profile 上限——`baseline` 下即使打开旗标，
+`createTexture(4096,1)` 也报 `#3684`，`enhanced` 下 `8192` 同样报 `#3684`。也就是说这个开关
+在 AIR 上**并没有真正把 2D 纹理放大**，只是把错误从参数错误换成了分配失败。
+
+#### 我们的取舍：默认与 AIR 逐字一致，打开旗标后放到设备上限
+
+`ignoreResourceLimits = false`（默认）：与 AIR 完全一致，包括三个错误号、文案与判定顺序。
+`= true`：`#3681`/`#3682` 照旧，`#3683`/`#3766` 跳过，**上限改为设备上限**
+（`as_s3d_max_texture_size()`，D3D12/Metal 为 16384）而不是 AIR 的 profile 上限，超出时报
+`Error #3684: Texture creation failed. Internal error.`。这是**唯一的刻意分歧**，且是
+**双重 opt-in**（AIR 合法属性 + 默认关），默认产物仍与 AIR 同构。
+
+**cube 刻意不放大**：保持 1024，旗标打开时只把错误号换成 `#3684`（与 AIR 同）。理由是
+16384 的立方体贴图 = 6 GB 纹理内存，现实中零需求，而放大它只会把「明确报错」变成「后端分配失败」。
+若将来真要放开，改 `as_tex_check_cube` 一处即可。
+
+**未闭合（不静默）**：旗标打开后，我们只按**设备上限**放行，并不预检像素总量；
+2D/rect 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `gpu` 留空，等上传时再建），
+后端分配失败目前不会立刻变成 `#3684`。该缺口已在 `TODO.md` 遗留表登记。
+
+**验收**：`examples/stage3d-profile.as` 67 条断言（含旗标默认值、`#3681`/`#3682` 不受影响、
+`#3683` → `#3684` 的类型变化、复位后恢复）；`test/unit/stage3d.ts` 的
+`stage3d/texture-size-limits` 10 条源级钉子（含「零/幂次检查必须在旗标分支之前」）。
+
 ## 10. Windows / Direct3D 12 后端（阶段一百三十二 落地）
 
 第三份后端 `vendor/stage3d_d3d.cc`（~2,290 行）与 `stage3d_glue.mm`（Metal）/**结构同形**：同一套 `s3d_*` ABI、
