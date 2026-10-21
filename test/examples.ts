@@ -214,6 +214,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 以及「字形按 scaleY 整体缩放、scaleX 不拉宽」的 ink 宽），两者都只在 Skia 文本后端下存在，
   // 故与 bakecrisp.as 一样链 Skia（阶段一百六十九的缩放口径回归）。
   'tf-scale-metrics.as': ['--manifest', join(dir, 'tf-scale-metrics.build.json')],
+  // tf-autosize-empty.as（阶段二百三十七）断言的是**空 autoSize 字段的文本度量**：Skia 对
+  // 「没有 run 的空段落」把 longestLine 设成 FLT_MIN - FLT_MAX（-3.4028e38），autoSize 把它
+  // 写进 _fieldWidth 后整个子树（含 Stage）的 getBounds 变成 +-3.4028235e38。度量只在 Skia
+  // 文本后端下存在，故与 autosize-metrics.as 一样链 Skia。
+  'tf-autosize-empty.as': ['--manifest', join(dir, 'tf-autosize-empty.build.json')],
   // sbtn-null-up.as 断言的也是**像素**（`upState==NULL` 时 `BitmapData.draw` 什么都不能画、
   // 有 up 态时画的正是 up 态），而纯 C 构建没有光栅后端（draw 是空桩），故与 bakecrisp.as 一样链 Skia。
   'sbtn-null-up.as': ['--manifest', join(dir, 'sbtn-null-up.build.json')],

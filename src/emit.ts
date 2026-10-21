@@ -18652,6 +18652,22 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // Starling's TrueTypeCompositor depends on it. The 2px text inset AIR keeps on
     // the left and right edges cancels out for centering and is subtracted for
     // right alignment.
+    // Skia answers FLT_MIN - FLT_MAX (= -3.4028e38) for the longest line of a
+    // paragraph that produced no text runs at all (empty text -- see
+    // ParagraphImpl::layout). AS3 never reports a negative text extent, and every
+    // reader below treats the value as a pixel width: autoSize does
+    // `_fieldWidth = tw + 4`, which stored -3.4028e38 into the field, and
+    // as_bounds_walk then reported the whole VideoPlayer subtree -- and with it the
+    // stage -- as [-3.4028235e38 .. 0]. That is the +-3.4028235e38 getBounds the real
+    // TalkMED meeting client showed for MeetingView (ASC_MOUSE_TRACE=3,
+    // temp/applog/err-bb1.log: `flash.text::TextField own=0,0 -3.40282e+38x15`).
+    // Clamp at the single read point instead of at each of the five use sites.
+    this.line('static double as_tf_longest_line(void* para) {');
+    this.indent++;
+    this.line('double w = as_skia_textlayout_max_width(para);');
+    this.line('return (w > 0.0 && w < 1e30) ? w : 0.0;');
+    this.indent--;
+    this.line('}');
     this.line('static double as_tf_align_dx(TextField* tf) {');
     this.indent++;
     this.line('if (tf->defaultTextFormat == NULL) return 0.0;');
@@ -18660,7 +18676,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (a != 1 && a != 2) return 0.0;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para == NULL) return 0.0;');
-    this.line('double tw = as_skia_textlayout_max_width(para);');
+    this.line('double tw = as_tf_longest_line(para);');
     this.line('if (a == 2) return (tf->_fieldWidth - 4.0 - tw) / 2.0;');
     this.line('return tf->_fieldWidth - 4.0 - tw;');
     this.indent--;
@@ -18734,7 +18750,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (tf->autoSize == NULL || strcmp(tf->autoSize, "none") == 0) return;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para == NULL) return;');
-    this.line('double tw = as_skia_textlayout_max_width(para);');
+    this.line('double tw = as_tf_longest_line(para);');
     this.line('double th = as_skia_textlayout_height(para);');
     this.line('if (!tf->wordWrap) tf->_fieldWidth = tw + 4.0;');
     this.line('tf->_fieldHeight = th + 4.0;');
@@ -18802,7 +18818,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // back -FLT_MAX rather than 0; AIR reports 0 for an empty field (measured,
     // temp/metricprobe/Metrics6.as: `tw=0` alongside `th=0`).
     this.line('if (as_skia_textlayout_line_count(para) == 0) return 0.0;');
-    this.line('return as_skia_textlayout_max_width(para) * as_tf_scale_ratio(tf);');
+    this.line('return as_tf_longest_line(para) * as_tf_scale_ratio(tf);');
     this.indent--;
     this.line('}');
     this.line('double TextField_get_textHeight(void* _this) {');
@@ -18905,7 +18921,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (!tf->hscroll) return 0;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para == NULL) return 0;');
-    this.line('double tw = as_skia_textlayout_max_width(para);');
+    this.line('double tw = as_tf_longest_line(para);');
     this.line('double over = tw + 4.0 - tf->_fieldWidth;');
     this.line('return (over > 0.0) ? (int)(over + 0.999) : 0;');
     this.indent--;
@@ -22729,7 +22745,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double py = 2.0 - scrollY + ccy;');
     this.line('as_skia_textlayout_paint(cpara, canvas, px, py);');
     this.line('void* up = as_skia_paint_fill(ccol, 1.0);');
-    this.line('as_skia_canvas_draw_rect(canvas, px, py + as_skia_textlayout_height(cpara), as_skia_textlayout_max_width(cpara), 1.0, up);');
+    this.line('as_skia_canvas_draw_rect(canvas, px, py + as_skia_textlayout_height(cpara), as_tf_longest_line(cpara), 1.0, up);');
     this.line('as_skia_paint_delete(up);');
     this.line('as_skia_textlayout_delete(cpara);');
     this.indent--;
@@ -23409,18 +23425,40 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('static const char* as_dbg_cls(void* o) { if (o == NULL) return "-"; as_vtable_header* vt = (as_vtable_header*)((as_object_header*)o)->vtable; if (vt == NULL) return "?"; if (vt->fqn != NULL && vt->fqn[0] != 0) return vt->fqn; return (vt->name != NULL) ? vt->name : "?"; }');
+    // Invoked with ASC_MOUSE_TRACE=3 (the level test compares the first CHARACTER's
+    // ASCII code, so '3' == 51): prints the path from the stage down to every object
+    // whose own bounds are non-finite.
     this.line('static int as_dbg_bad_n = 0;');
     this.line('static void as_dbg_bad_bounds(DisplayObject* o) {');
     this.indent++;
-    this.line('if (o == NULL || as_dbg_bad_n >= 24) return;');
+    this.line('if (o == NULL || as_dbg_bad_n >= 200) return;');
     this.line('double l = 0.0, t = 0.0, r = 0.0, b = 0.0;');
-    this.line('if (as_bounds_walk(o, 0, 0, &l, &t, &r, &b) && (l < -1e30 || r > 1e30 || t < -1e30 || b > 1e30)) {');
-    this.indent++;
+    // Prune clean subtrees. as_bounds_walk unions every child's transformed box, so
+    // a container whose union is finite cannot hide a bad leaf: descending only into
+    // the nodes that are themselves bad prints the exact path from the root to the
+    // culprit instead of a 300-line tree dump.
+    this.line('if (!as_bounds_walk(o, 0, 0, &l, &t, &r, &b) || !(l < -1e30 || r > 1e30 || t < -1e30 || b > 1e30)) return;');
     this.line('as_dbg_bad_n++;');
-    this.line('fprintf(stderr, "    bad_bounds %s %p l=%.6g t=%.6g r=%.6g b=%.6g parent=%s\\n", as_dbg_cls((void*)o), (void*)o, l, t, r, b, as_dbg_cls((void*)o->parent));');
+    this.line('fprintf(stderr, "    bad_bounds %s %p l=%.6g t=%.6g r=%.6g b=%.6g x=%.6g y=%.6g sx=%.6g sy=%.6g rot=%.6g parent=%s\\n", as_dbg_cls((void*)o), (void*)o, l, t, r, b, o->x, o->y, o->scaleX, o->scaleY, o->rotation, as_dbg_cls((void*)o->parent));');
+    this.line('if (as_is((void*)o, &TextField_vt)) { TextField* tf = (TextField*)o; fprintf(stderr, "        textfield w=%.6g h=%.6g\\n", tf->_fieldWidth, tf->_fieldHeight); }');
+    this.line('if (as_is((void*)o, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* cc = (DisplayObjectContainer*)o;');
+    this.line('if (cc->children != NULL) {');
+    this.indent++;
+    this.line('for (int i = 0; i < cc->children->length; i++) {');
+    this.indent++;
+    this.line('DisplayObject* ch = (DisplayObject*)as_v_obj_val(cc->children->data[i]);');
+    this.line('if (ch == NULL) continue;');
+    this.line('double cl = 0.0, ct = 0.0, cr = 0.0, cb = 0.0;');
+    this.line('if (as_bounds_walk(ch, 0, 0, &cl, &ct, &cr, &cb)) fprintf(stderr, "        child[%d] %s own=%.6g,%.6g %.6gx%.6g\\n", i, as_dbg_cls((void*)ch), cl, ct, cr - cl, cb - ct);');
     this.indent--;
     this.line('}');
-    this.line('if (as_is((void*)o, &DisplayObjectContainer_vt)) { DisplayObjectContainer* cc = (DisplayObjectContainer*)o; if (cc->children != NULL) for (int i = 0; i < cc->children->length; i++) as_dbg_bad_bounds((DisplayObject*)as_v_obj_val(cc->children->data[i])); }');
+    this.indent--;
+    this.line('}');
+    this.line('for (int i = 0; i < cc->children->length; i++) as_dbg_bad_bounds((DisplayObject*)as_v_obj_val(cc->children->data[i]));');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('static void as_dbg_hit_chain(void* o) {');

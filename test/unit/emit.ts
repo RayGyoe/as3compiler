@@ -3026,3 +3026,64 @@ function checkTraceNullString(): string[] {
   return bad;
 }
 registerGroup('unit: emit/TraceNullString', checkTraceNullString);
+// ---- Skia's "no runs" longest-line sentinel must never reach a TextField size -----
+// 阶段二百三十七: `Paragraph::getLongestLine()` answers `FLT_MIN - FLT_MAX` (i.e.
+// -3.4028e38) for a paragraph that produced no text runs at all, and autoSize did
+// `_fieldWidth = tw + 4` with that raw value. The field's local box then ran
+// [0 .. _fieldWidth] BACKWARDS, as_bounds_walk's union gave the parent l=-3.4028e38,
+// and that propagated up the whole tree: the real TalkMED meeting client reported
+// MeetingView.getBounds (and the Stage's) as +-3.4028235e38 every frame
+// (ASC_MOUSE_TRACE=3 path dump, temp/applog/err-bb1.log:
+// `flash.text::TextField own=0,0 -3.40282e+38x15`). examples/tf-autosize-empty.as
+// pins the runtime side (with the clamp removed it fails with
+// `empty width=3.4028234663852886e+38`); the checks below pin that every consumer
+// reads the clamped helper, so the sentinel cannot come back through one of them.
+function checkTextFieldLongestLine(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [emit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [emit] ${label}`); }
+  };
+
+  const src = [
+    'import flash.text.TextField;',
+    'import flash.text.TextFieldAutoSize;',
+    'var tf:TextField = new TextField();',
+    'tf.autoSize = TextFieldAutoSize.LEFT;',
+    'trace(tf.textWidth);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  check('the emitted C defines as_tf_longest_line and clamps the sentinel to 0',
+    c.includes('static double as_tf_longest_line(void* para) {')
+    && c.includes('return (w > 0.0 && w < 1e30) ? w : 0.0;'));
+
+  const helperAt = c.indexOf('static double as_tf_longest_line(void* para) {');
+  const consumers = [
+    'static double as_tf_align_dx(TextField* tf) {',
+    'static void as_tf_apply_autosize(TextField* tf) {',
+    'double TextField_get_textWidth(void* _this) {',
+    'int TextField_get_maxScrollH(void* _this) {',
+  ];
+  check('...before every one of its callers (C has no implicit declarations)',
+    helperAt >= 0 && consumers.every((s) => c.indexOf(s) > helperAt));
+
+  check('autoSize takes its width from the clamped helper',
+    /double tw = as_tf_longest_line\(para\);\s*double th = as_skia_textlayout_height\(para\);\s*if \(!tf->wordWrap\) tf->_fieldWidth = tw \+ 4\.0;/.test(c));
+  check('TextAlignment dx does too',
+    /double tw = as_tf_longest_line\(para\);\s*if \(a == 2\) return \(tf->_fieldWidth - 4\.0 - tw\) \/ 2\.0;/.test(c));
+  check('TextField.textWidth does too (and still reports 0 for an empty paragraph)',
+    /if \(as_skia_textlayout_line_count\(para\) == 0\) return 0\.0;\s*return as_tf_longest_line\(para\) \* as_tf_scale_ratio\(tf\);/.test(c));
+  check('maxScrollH does too',
+    /double tw = as_tf_longest_line\(para\);\s*double over = tw \+ 4\.0 - tf->_fieldWidth;/.test(c));
+  check('the caret underline rect is sized by the helper, not by the raw sentinel',
+    /as_skia_textlayout_height\(cpara\), as_tf_longest_line\(cpara\), 1\.0, up\)/.test(c));
+  check('no size decision is left reading as_skia_textlayout_max_width directly',
+    !/double tw = as_skia_textlayout_max_width\(para\);/.test(c));
+
+  console.log(`     [tf-line] ${ok} TextField longest-line check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/TextFieldLongestLine', checkTextFieldLongestLine);

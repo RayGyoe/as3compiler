@@ -646,8 +646,12 @@ function checkLineMetrics(): string[] {
     emitted.includes('if (as_skia_textlayout_line_count(para) == 0) return 0.0;') &&
     emitted.includes('const char* t = as_tf_layout_text(tf);') &&
     emitted.includes('if (t == NULL || t[0] == 0) return 0.0;'));
+// 阶段二百三十七: the raw accessor answers -FLT_MAX for a paragraph that produced
+  // no text runs, and autoSize wrote that into _fieldWidth (examples/tf-autosize-empty.as),
+  // so BOTH guards must stay: no line box => 0, and the remaining value must come from
+  // as_tf_longest_line (clamped to >= 0) rather than from the raw accessor.
   check('textWidth guards the empty paragraph instead of reporting -FLT_MAX',
-    /static double TextField_get_textWidth\(void\* _this\) \{[\s\S]{0,260}?if \(as_skia_textlayout_line_count\(para\) == 0\) return 0\.0;[\s\S]{0,120}?as_skia_textlayout_max_width\(para\)/.test(gen));
+    /static double TextField_get_textWidth\(void\* _this\) \{[\s\S]{0,400}?if \(as_skia_textlayout_line_count\(para\) == 0\) return 0\.0;[\s\S]{0,160}?as_tf_longest_line\(para\)/.test(gen));
 
   // ---- the example -----------------------------------------------------
   check('the example asserts the adl-measured model (#2006, leading per line, height identity)',
@@ -825,7 +829,7 @@ function checkTfScaleMetrics(): string[] {
   check('the ratio is scaleY/scaleX',
     emitted.includes('return (sx > 0.0) ? sy / sx : 1.0;'));
   check('textWidth is scaled by the ratio',
-    emitted.includes('return as_skia_textlayout_max_width(para) * as_tf_scale_ratio(tf);'));
+    emitted.includes('return as_tf_longest_line(para) * as_tf_scale_ratio(tf);'));
   check('textHeight is scaled by the ratio (Skia path)',
     emitted.includes('return h * as_tf_scale_ratio(tf);'));
   check('textHeight is scaled by the ratio (pure-C path)',
