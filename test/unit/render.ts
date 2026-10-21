@@ -328,7 +328,7 @@ function checkBakeResolution(): string[] {
   check('the bake origin is snapped to the destination device pixel grid',
     emitted.includes('double bxo = bl, byo = bt;') &&
     emitted.includes('{ double tx = 0.0, ty = 0.0; as_skia_canvas_total_scale(canvas, &tx, &ty); if (tx > 0.0 && ty > 0.0) { bxo = floor(bl * tx) / tx; byo = floor(bt * ty) / ty; } }') &&
-    emitted.includes('int lw = (int)ceil(br - bxo); int lh = (int)ceil(bb - byo);') &&
+    emitted.includes('int lw = (int)ceil(bw); int lh = (int)ceil(bh);') &&
     // the snapped origin feeds BOTH the surface transform and the blit rect (same
     // call site, so the two can never drift apart again)
     emitted.includes("as_skia_canvas_scale(c2, sx, sy);\nas_skia_canvas_translate(c2, -bxo, -byo);") &&
@@ -356,9 +356,22 @@ function checkBakeResolution(): string[] {
     emitted.includes('if (o->_auto_baked && !o->_cache_flag) {') &&
     emitted.includes('double bdt_x = 0.0, bdt_y = 0.0;') &&
     emitted.includes('if (sx < bdt_x - 0.001 || sy < bdt_y - 0.001) {') &&
-    emitted.includes('else as_render_object_content(canvas, o);\nreturn;') &&
+    emitted.includes('as_render_live(canvas, o);\nreturn;') &&
     emitted.indexOf('as_bake_scale2(canvas, lw, lh, &sx, &sy);') <
       emitted.indexOf('if (sx < bdt_x - 0.001 || sy < bdt_y - 0.001) {'));
+  // (1d) Every "cannot bake / must not bake" branch paints through as_render_live, so
+  // none of them can drop the filters branch or paint nothing. The span is checked
+  // in double space first: a degenerated transform yields the +-3.4028235e38 bounds
+  // sentinel and (int) of 6.8e38 is UB. A failed surface allocation falls back live
+  // instead of leaving the object invisible.
+  check('no bake branch can silently paint nothing',
+    emitted.includes('static void as_render_live(void* canvas, DisplayObject* o) {') &&
+    emitted.includes('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(canvas, o, o->filters, o->filters->length - 1);\nelse as_render_object_content(canvas, o);') &&
+    emitted.includes('double bw = br - bxo, bh = bb - byo;') &&
+    emitted.includes('if (!(bw > 0.0) || !(bh > 0.0) || bw > 32768.0 || bh > 32768.0) { as_render_live(canvas, o); return; }') &&
+    (emitted.match(/as_render_live\(canvas, o\);\nreturn;/g) ?? []).length >= 2 &&
+    emitted.includes('else as_render_live(canvas, o);') &&
+    !emitted.includes('int lw = (int)ceil(br - bxo); int lh = (int)ceil(bb - byo);'));
 
   // (2) BitmapData.draw rasterizes a DisplayObject source at the matrix's scale
   // and reads the raster back 1:1 (source coords are multiplied by that scale).
@@ -1284,7 +1297,7 @@ function checkScrollRectBakeInvalidation(): string[] {
   const cacheEnd = cacheStart < 0 ? -1 : c.indexOf('\nstatic ', cacheStart + 10);
   const cache = cacheStart < 0 || cacheEnd < 0 ? '' : c.slice(cacheStart, cacheEnd);
   check('as_render_cached bakes the CONTENT only (clip/translate stay outside the bake)',
-    cache.includes('as_render_object_content(canvas, o)') && !cache.includes('clip_rect(canvas, 0.0, 0.0, o->_scroll_rect'));
+    cache.includes('as_render_object_content(c2, o)') && !cache.includes('clip_rect(canvas, 0.0, 0.0, o->_scroll_rect'));
 
   check('a moved fingerprint drops the bake',
     c.includes('if (o->_auto_baked) { o->_auto_baked = 0; o->_cache_valid = 0; }'));

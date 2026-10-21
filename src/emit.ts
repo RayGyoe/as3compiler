@@ -21943,13 +21943,21 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // the bounds size; toggling cacheAsBitmap off/on (via the setter) invalidates
     // it. Objects without deterministic bounds (empty containers) fall through to
     // the normal path.
+    // Paint an object straight into the live canvas. Every "cannot bake / must not
+    // bake" branch in as_render_cached goes through here, so none of them can
+    // forget the filters branch or paint nothing at all.
+    this.line('static void as_render_live(void* canvas, DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(canvas, o, o->filters, o->filters->length - 1);');
+    this.line('else as_render_object_content(canvas, o);');
+    this.indent--;
+    this.line('}');
     this.line('static void as_render_cached(void* canvas, DisplayObject* o) {');
     this.indent++;
     this.line('double bl = 0.0, bt = 0.0, br = 0.0, bb = 0.0;');
     this.line('if (!as_render_bounds(o, &bl, &bt, &br, &bb)) {');
     this.indent++;
-    this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(canvas, o, o->filters, o->filters->length - 1);');
-    this.line('else as_render_object_content(canvas, o);');
+    this.line('as_render_live(canvas, o);');
     this.line('return;');
     this.indent--;
     this.line('}');
@@ -21974,8 +21982,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // for, and now independent of where the object happens to sit.
     this.line('double bxo = bl, byo = bt;');
     this.line('{ double tx = 0.0, ty = 0.0; as_skia_canvas_total_scale(canvas, &tx, &ty); if (tx > 0.0 && ty > 0.0) { bxo = floor(bl * tx) / tx; byo = floor(bt * ty) / ty; } }');
-    this.line('int lw = (int)ceil(br - bxo); int lh = (int)ceil(bb - byo);');
-    this.line('if (lw <= 0 || lh <= 0) { as_render_object_content(canvas, o); return; }');
+    // The span has to be finite and sane BEFORE it is converted to int: a degenerated
+    // child transform makes as_render_bounds answer the +-3.4028235e38 sentinel (a
+    // real app reported bl=-3.4028235e38 br=+3.4028235e38 for a 4810-wide subtree,
+    // every frame), and (int) of 6.8e38 is UB -- the compilers do differ on what it
+    // yields. NaN is caught too, by writing the test as !(x > 0.0). The upper bound is
+    // Skia's own surface limit: beyond it no bake surface can exist, so asking is moot.
+    this.line('double bw = br - bxo, bh = bb - byo;');
+    this.line('if (!(bw > 0.0) || !(bh > 0.0) || bw > 32768.0 || bh > 32768.0) { as_render_live(canvas, o); return; }');
+    this.line('int lw = (int)ceil(bw); int lh = (int)ceil(bh);');
+    this.line('if (lw <= 0 || lh <= 0) { as_render_live(canvas, o); return; }');
     // Bake at the DESTINATION resolution, not at the device pixel ratio alone.
     //
     // The canvas this bake runs on already carries dpr x ancestor scale x this
@@ -22014,8 +22030,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (sx < bdt_x - 0.001 || sy < bdt_y - 0.001) {');
     this.indent++;
     this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { static int _bcapped = 0; if (_bcapped < 60) { _bcapped++; fprintf(stderr, "t=%.0f bake_capped o=%p lw=%d lh=%d sx=%.5f sy=%.5f dt=%.5f\\n", as_now_ms(), (void*)o, lw, lh, sx, sy, bdt_x); } }');
-    this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(canvas, o, o->filters, o->filters->length - 1);');
-    this.line('else as_render_object_content(canvas, o);');
+    this.line('as_render_live(canvas, o);');
     this.line('return;');
     this.indent--;
     this.line('}');
@@ -22047,6 +22062,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('o->_cache_valid = 1;');
     this.indent--;
     this.line('}');
+    // A bake surface that cannot be created (too large, out of memory) must not paint
+    // NOTHING: the object would vanish from the frame. Fall back to the live path,
+    // which is the uncached rendering this cache is supposed to be indistinguishable
+    // from. Reachable in practice through the 32768px span limit above.
+    this.line('else as_render_live(canvas, o);');
     this.indent--;
     this.line('}');
     this.line('if (o->_cache_image != NULL) {');
