@@ -342,6 +342,23 @@ function checkBakeResolution(): string[] {
     emitted.includes('if (dt_y * f > cap) f = cap / dt_y;') &&
     emitted.includes('double area = sqrt(AS_BAKE_MAX_PIXELS / ((double)lw * (double)lh));') &&
     emitted.includes('if (area > AS_BAKE_MAX_PIXELS) f *= sqrt(AS_BAKE_MAX_PIXELS / area);'));
+  // (1c) When either cap had to shrink the surface, an AUTO-bake is skipped
+  // entirely and the object renders live at the exact device resolution. A
+  // magnified bake is strictly softer than live rendering, and because a
+  // content change drops the bake for ASC_AUTO_BAKE_FRAMES frames the object
+  // flipped between soft and sharp at the change rate (the meeting client's
+  // "clear, then blurry, then clear again": container at ctx 2.76562 capped to
+  // sx 2.08333, i.e. a 1.33x magnified blit, next to a 10 fps BitmapData.draw
+  // pass that re-baked the same pointers at ctx 0.78431). An explicit
+  // cacheAsBitmap keeps the degraded fallback -- that cache is what the author
+  // asked for, and AIR's own cache is a fixed-resolution bitmap too.
+  check('an auto-bake the caps had to shrink falls back to the live path',
+    emitted.includes('if (o->_auto_baked && !o->_cache_flag) {') &&
+    emitted.includes('double bdt_x = 0.0, bdt_y = 0.0;') &&
+    emitted.includes('if (sx < bdt_x - 0.001 || sy < bdt_y - 0.001) {') &&
+    emitted.includes('else as_render_object_content(canvas, o);\nreturn;') &&
+    emitted.indexOf('as_bake_scale2(canvas, lw, lh, &sx, &sy);') <
+      emitted.indexOf('if (sx < bdt_x - 0.001 || sy < bdt_y - 0.001) {'));
 
   // (2) BitmapData.draw rasterizes a DisplayObject source at the matrix's scale
   // and reads the raster back 1:1 (source coords are multiplied by that scale).

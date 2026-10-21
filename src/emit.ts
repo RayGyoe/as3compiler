@@ -21930,7 +21930,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (getenv("ASC_NO_AUTO_BAKE") == NULL && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
-    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", (void*)o, bl, bt, br - bl, bb - bt); } else o->_auto_still = 0;');
+    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "t=%.0f bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", as_now_ms(), (void*)o, bl, bt, br - bl, bb - bt); } else o->_auto_still = 0;');
     this.indent--;
     this.line('}');
     this.line('return h;');
@@ -21989,11 +21989,43 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // vs off is pixel-identical at scale 1/2/3, temp/bakeprobe/).
     this.line('double sx = 1.0, sy = 1.0;');
     this.line('as_bake_scale2(canvas, lw, lh, &sx, &sy);');
+    // An AUTO-bake that the caps had to shrink is WORSE than not baking, and it
+    // flickers: the blit magnifies a downscaled surface, so the object renders
+    // soft while baked and sharp while live -- and any content change drops the
+    // bake for ASC_AUTO_BAKE_FRAMES frames, i.e. the object flips between the two
+    // at the change rate. Measured on the meeting client (ASC_BAKE_TRACE,
+    // temp/applog): the file-preview container (1280x720) is painted at a
+    // destination scale of 2.76562, but AS_BAKE_MAX_PIXELS caps its surface at
+    // 2.08333 (px 2667x1500), so the blit magnifies by 1.33 and the slide inside
+    // it reads as "mushy"; the same tree is also drawn at 10 fps into a
+    // 1280x720 BitmapData (ctx 0.78431), which re-bakes every object at ANOTHER
+    // resolution -- two identical bake_rebuild lines per frame for the same
+    // pointer. Users describe it as "clear, then blurry, then clear again" and
+    // it stops when the subtree changes constantly. Skiping the bake here keeps
+    // the object on the live path, i.e. at the exact device resolution: an
+    // auto-bake is an optimisation of OUR making (no AS3 counterpart), so it may
+    // never trade visual fidelity for speed. An explicit cacheAsBitmap
+    // (_cache_flag) keeps the degraded fallback: there the cache is what the
+    // author asked for, and AIR's own cache is a fixed-resolution bitmap too.
+    this.line('if (o->_auto_baked && !o->_cache_flag) {');
+    this.indent++;
+    this.line('double bdt_x = 0.0, bdt_y = 0.0;');
+    this.line('as_skia_canvas_total_scale(canvas, &bdt_x, &bdt_y);');
+    this.line('if (sx < bdt_x - 0.001 || sy < bdt_y - 0.001) {');
+    this.indent++;
+    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { static int _bcapped = 0; if (_bcapped < 60) { _bcapped++; fprintf(stderr, "t=%.0f bake_capped o=%p lw=%d lh=%d sx=%.5f sy=%.5f dt=%.5f\\n", as_now_ms(), (void*)o, lw, lh, sx, sy, bdt_x); } }');
+    this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(canvas, o, o->filters, o->filters->length - 1);');
+    this.line('else as_render_object_content(canvas, o);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.line('int pw = (int)ceil((double)lw * sx); int ph = (int)ceil((double)lh * sy);');
     this.line('if (!o->_cache_valid || o->_cache_image == NULL || o->_cache_w != (double)pw || o->_cache_h != (double)ph) {');
     this.indent++;
-    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f\\n", (void*)o, bl, bt, lw, lh, pw, ph, sx, sy);');
-    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { double _tx = 0.0, _ty = 0.0; as_skia_canvas_total_scale(canvas, &_tx, &_ty); double _ex = (_tx > 0.0) ? fabs((double)pw / ((double)lw * _tx) - 1.0) : 0.0; if (_ex > 0.002 || _tx != _ty) fprintf(stderr, "bake_anis o=%p lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f ctx=%.5f cty=%.5f ex=%.5f\\n", (void*)o, lw, lh, pw, ph, sx, sy, _tx, _ty, _ex); }');
+    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "t=%.0f bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f\\n", as_now_ms(), (void*)o, bl, bt, lw, lh, pw, ph, sx, sy);');
+    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { double _tx = 0.0, _ty = 0.0; as_skia_canvas_total_scale(canvas, &_tx, &_ty); double _ex = (_tx > 0.0) ? fabs((double)pw / ((double)lw * _tx) - 1.0) : 0.0; if (_ex > 0.002 || _tx != _ty) fprintf(stderr, "t=%.0f bake_anis o=%p lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f ctx=%.5f cty=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, lh, pw, ph, sx, sy, _tx, _ty, _ex); }');
     this.line('if (o->_cache_image != NULL) { as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('void* surface = as_skia_surface_bake_new(pw, ph);');
     this.line('if (surface != NULL) {');
@@ -22019,7 +22051,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('if (o->_cache_image != NULL) {');
     this.indent++;
-    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { static int _bc = 0; double _bx = 0.0, _by = 0.0; as_skia_canvas_total_scale(canvas, &_bx, &_by); double _ex2 = (_bx > 0.0) ? fabs((double)pw / ((double)lw * _bx) - 1.0) : 0.0; if (_bc < 80 && (_ex2 > 0.002 || _bx != _by)) { _bc++; fprintf(stderr, "bake_blit o=%p lw=%d pw=%d bx=%.5f by=%.5f ex=%.5f\\n", (void*)o, lw, pw, _bx, _by, _ex2); } }');
+    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { static int _bc = 0; double _bx = 0.0, _by = 0.0; as_skia_canvas_total_scale(canvas, &_bx, &_by); double _ex2 = (_bx > 0.0) ? fabs((double)pw / ((double)lw * _bx) - 1.0) : 0.0; if (_bc < 80 && (_ex2 > 0.002 || _bx != _by)) { _bc++; fprintf(stderr, "t=%.0f bake_blit o=%p lw=%d pw=%d bx=%.5f by=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, pw, _bx, _by, _ex2); } }');
     // Blit 1:1 in device pixels: the surface's pixel grid has to land on the
     // destination's, i.e. each surface pixel covers exactly one device pixel. The
     // rect is therefore pw/sx logical units wide (sx = device pixels per logical
