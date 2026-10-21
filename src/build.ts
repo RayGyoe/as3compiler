@@ -8,8 +8,11 @@
 // targeting*, not optimization or machine-code generation.
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, existsSync, copyFileSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { resolve, dirname, join, basename } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 
 export type Target = 'native' | 'wasm';
 
@@ -473,6 +476,207 @@ export function wasmStripFlags(cfg: BuildConfig): string[] {
   return cfg.target === 'wasm' && !cfg.debugInfo ? ['-Wl,--strip-debug'] : [];
 }
 
+// Link-time trimming (阶段二百二十二). Unlike every flag above, this is a LINKER
+// decision, and it is the only remaining lever that changes what a Skia build
+// drags in now that the text engine is a separate object file (阶段二百二十一):
+//
+//   -dead_strip  ld64 drops unreachable code/data blocks BEFORE resolving the
+//                references inside them, so a glue .o that mentions a Skia API
+//                the program never calls no longer pulls that archive member in.
+//                It also makes the ICU data object below droppable when nothing
+//                references it, which is what keeps text-free builds at 3.55 MB.
+//   -x           drops the local symbols from the __LINKEDIT symbol table. Global
+//                text symbols survive, so a dlopen'd extension's entry points
+//                still resolve.
+//
+// Measured on examples/tf-scale-metrics.as (text build, our 0.80 MB data set in
+// place): 9,985,352 B with NO trim -> 7,224,000 B with -dead_strip -> 6,049,032 B
+// with both. The 1.17 MB step is the local symbol table, so the two flags are
+// worth emitting as a pair rather than just the first one.
+//
+// Deliberately NOT applied here:
+//   * LTO stays the opt-in `--lto` (E12) and is not part of this set: measured on
+//     the split artifact it produces 3,567,592 bytes against 3,554,632 -- 13 KB
+//     LARGER, because Skia's archives carry no bitcode, so -flto can only
+//     optimize our own two TUs.
+//   * --gc-sections on ELF / COFF: it needs -ffunction-sections/-fdata-sections at
+//     COMPILE time (including inside every prebuilt archive) before it saves a
+//     byte. Emitting it now would buy a flag that looks like it works and does
+//     nothing, so the whole family stays off rather than silently ineffective.
+//   * `-x` under --debug-info: that build asked for symbols.
+export function linkTrimFlags(cfg: BuildConfig): string[] {
+  if (cfg.target !== 'native' || process.platform !== 'darwin') return [];
+  const flags = ['-Wl,-dead_strip'];
+  if (!cfg.debugInfo) flags.push('-Wl,-x');
+  return flags;
+}
+
+// ---- ICU data: link the 0.80 MB blob, not the 10.19 MB default ---------------
+//
+// vendor/skia/lib/macos-arm64/{libskunicode.a,libicu.a} each carry a one-member
+// `icudtl_dat.o` holding the WHOLE desktop ICU data set (`_icudt69_dat`, 10.19 MB).
+// Only one of the two ever gets linked -- the skunicode one, because `-l skunicode`
+// precedes `-l icu` -- and the choice is pure DATA, not code: Skia itself already
+// ships a filtered data set for wasm (third_party/icu/BUILD.gn sends wasm to
+// `flutter/icudtl.dat`, 0.80 MB). The desktop `common` data set pays 9.4 MB for
+// resources this pipeline never opens (collation, locales, currency, region, rbnf,
+// transliteration, converters, unames); what it needs -- UAX#14 line-break rules,
+// bidi properties, NFKC, grapheme/word/char breakers -- is in the small one.
+//
+// Defining the symbol in OUR OWN object is what makes the archive member moot: an
+// archive member is only pulled when one of its symbols is still undefined, so the
+// 10.19 MB object is never even read. That keeps this a per-build decision against a
+// STOCK vendor tree (no archive surgery, nothing to re-provision); the price is that
+// the object must precede the -l flags, which is where cfg.objects already lands.
+//
+// Only the text engine consumes this data, so a build without ASC_HAVE_TEXT skips
+// the step entirely (and would anyway: -dead_strip drops an unreferenced blob).
+//
+// The gate is ASC_HAVE_TEXT ALONE -- deliberately NOT "the manifest lists -l icu"
+// (阶段二百二十三). Gating on the link library looked equivalent and was not: a
+// manifest that links skia but happens to omit `icu` still shapes text, because
+// libskunicode.a carries its own copy of the data member, so the old gate skipped
+// the substitution and the build silently shipped the 10.19 MB data set again.
+// Measured on examples/tf-scale-metrics.as with `icu` removed from link-libs:
+// 15,510,408 B instead of 6,049,032 B, exit code 0, not one word of output. The
+// object is harmless when nothing consumes it (it is one blob; -dead_strip drops
+// it), so the wider gate is also the safer direction.
+const ICU_FLUTTER_DAT = '../vendor/skia/icu/icudtl_flutter.dat';
+
+// The ICU data version the LINKED archives expect, read out of the archive that
+// actually donates the member (libskunicode.a -- `-l skunicode` precedes `-l icu`,
+// which is why replacing libicu.a alone changed nothing). The data symbol is
+// version-tagged (`_icudt69_dat`), so a mismatch cannot corrupt a build: the
+// wrong-version blob is simply never referenced and both data sets end up linked.
+// It is a SIZE canary, not a correctness guard -- which is exactly why it has to
+// be reported: the symptom is 9.46 MB that reappears with no other trace.
+// Returns null when no such archive is reachable, which is not a mismatch.
+export function icuArchiveDataVersion(cfg: BuildConfig): string | null {
+  for (const dir of cfg.linkPaths) {
+    const archive = join(dir, 'libskunicode.a');
+    if (!existsSync(archive)) continue;
+    const res = spawnSync('nm', ['-g', archive], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
+    if (res.status !== 0 || !res.stdout) return null;
+    // A definition line looks like `0000000000000000 S _icudt69_dat`; an
+    // undefined one (`U`) is a reference, not a data set, so require a letter
+    // other than U.
+    const m = res.stdout.match(/^[0-9a-f]+\s+(?!U\b)[A-Za-z?]\s+_icudt(\d\d)_dat$/m);
+    return m ? m[1] : null;
+  }
+  return null;
+}
+
+let icuWarned = false;
+function icuWarn(msg: string): void {
+  if (icuWarned) return;
+  icuWarned = true;
+  process.stderr.write(`warning: ${msg}\n`);
+}
+
+// The vendored data blob this build would substitute, or null when the substitute
+// does not apply: only a macOS native link can take an externally supplied data
+// object. `version` is the `icudtNN` marker the blob actually carries. Internal: the
+// two public entry points below are what callers want (paths / materialise).
+function icuBlob(cfg: BuildConfig): { dat: string; version: string } | null {
+  if (cfg.target !== 'native' || process.platform !== 'darwin') return null;
+  if (!cfg.defines.some((d) => d === 'ASC_HAVE_TEXT' || d.startsWith('ASC_HAVE_TEXT='))) return null;
+  const dat = resolve(dirname(fileURLToPath(import.meta.url)), ICU_FLUTTER_DAT);
+  if (!existsSync(dat)) {
+    icuWarn(
+      `the vendored ICU data set is missing (${dat}), so the linked Skia will carry its ` +
+      `own 10.19 MB desktop data set instead of the 0.80 MB one (size only; text layout is unaffected).`,
+    );
+    return null;
+  }
+  const version = readIcuVersion(dat);
+  if (!version) {
+    throw new Error(`${dat} is not an ICU data package (no 'icudt' version marker)`);
+  }
+  // The substitute is only usable if it matches the ARCHIVE that donates the data
+  // member; checking the pair here covers every caller (CLI link and Xcode project).
+  warnOnIcuVersion(cfg, version);
+  return { dat, version };
+}
+
+// Write the Mach-O assembly that defines _icudtNN_dat for a blob. Same shape as
+// ICU's own scripts/make_data_assembly.py --mac: the blob is a little-endian data
+// package, so each .long is written from its bytes reversed. Returns false when this
+// build takes no substitute at all (text-free manifest, non-native target, or no
+// vendored blob), in which case nothing is written and the caller adds no source.
+//
+// This is a build INPUT, materialised by the runner before the steps that consume it
+// -- the command builder itself stays free of side effects (see runCompile).
+export function writeIcuAssembly(cfg: BuildConfig, dest: string): boolean {
+  const blob = icuBlob(cfg);
+  if (!blob) return false;
+  const bytes = readFileSync(blob.dat);
+  const lines = [
+    `.globl _icudt${blob.version}_dat`,
+    '#ifdef U_HIDE_DATA_SYMBOL',
+    `\t.private_extern _icudt${blob.version}_dat`,
+    '#endif',
+    '\t.data',
+    '\t.const',
+    '\t.align 4',
+    `_icudt${blob.version}_dat:`,
+  ];
+  for (let i = 0; i < bytes.length; i += 4) {
+    const word = bytes.subarray(i, Math.min(i + 4, bytes.length));
+    let value = 0;
+    for (let b = word.length - 1; b >= 0; b--) value = value * 256 + word[b];
+    lines.push(`\t.long 0x${value.toString(16).toUpperCase()}`);
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, `${lines.join('\n')}\n`);
+  return true;
+}
+
+// Where this build's ICU data object and its assembler source live, or null when the
+// substitute does not apply. Pure: it names the paths, the runner materialises them.
+//
+// Both are inside THIS build's scratch like every other object. They used to live next
+// to the .dat and be assembled once (the same 800 KB for every build, so sharing looked
+// free) -- but the compile step ran on every text build regardless, and `clang -c`
+// truncates its output at open time, so a sibling build linking the same path read an
+// empty file: `ld: file is empty in .../icudtl_flutter.o`, hit twice in three runs of
+// the example suite. Assembling per build costs 0.2 s (measured: 45 ms to write 3.4 MB
+// of hex, 155 ms to assemble) and removes the shared write entirely.
+export function icuDataPaths(cfg: BuildConfig): { source: string; object: string; version: string } | null {
+  const blob = icuBlob(cfg);
+  if (!blob) return null;
+  const dir = objectDir(cfg);
+  return {
+    source: join(dir, 'icudtl_flutter.s'),
+    object: join(dir, 'icudtl_flutter.o'),
+    version: blob.version,
+  };
+}
+
+// The `icudtNN` marker in a data package's header (offset 308 in the vendored
+// blob, well inside the first page, which is why the canary can read a slice).
+// Single source of truth for the version: the assembly step and the archive
+// canary must never disagree about which symbol this blob defines.
+function icuVersionOf(bytes: Buffer): string {
+  const at = bytes.indexOf('icudt');
+  return at < 0 ? '' : bytes.subarray(at + 5, at + 7).toString('latin1');
+}
+
+// The version of the vendored blob, read from its first page.
+function readIcuVersion(dat: string): string {
+  return icuVersionOf(readFileSync(dat).subarray(0, 4096));
+}
+
+// Report the one combination that silently costs 9.46 MB: our blob defines
+// `_icudtNN_dat` but the linked archive wants a different NN.
+function warnOnIcuVersion(cfg: BuildConfig, mine: string): void {
+  const theirs = icuArchiveDataVersion(cfg);
+  if (!mine || !theirs || mine === theirs) return;
+  icuWarn(
+    `the vendored ICU data set is icudt${mine} but the linked libskunicode.a expects icudt${theirs}, ` +
+    `so its 10.19 MB desktop data set will be linked as well (0.80 MB substitute unusable; size only, no behavioural change).`,
+  );
+}
+
 // The named enhancement switches and the opt-in macro each one turns on.
 //
 // Every entry here is an AIR-superset capability (§1.5): `adl` errors or has no
@@ -725,7 +929,14 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
     for (const f of wasmStripFlags(cfg)) args.push(f);
     args.push('-o', outPath);
   } else {
-    args.push(...nativeTargetFlags(cfg), cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg));
+    args.push(
+      ...nativeTargetFlags(cfg),
+      cfg.opt,
+      ...perfFlags(cfg),
+      ...fpFlags(cfg),
+      ...debugInfoFlags(cfg),
+      ...linkTrimFlags(cfg)
+    );
     for (const l of posixLinkLibs()) args.push(l);
     for (const l of platformLinkLibs()) args.push('-l', l);
     args.push('-o', outPath);
@@ -805,6 +1016,80 @@ function cxxCompiler(cfg: BuildConfig): string {
   return `${cfg.cCompiler}++`;
 }
 
+// ---- Per-config object paths (阶段二百二十三) --------------------------------
+//
+// An object file is linked WHOLE (阶段二百二十一), and its CONTENTS depend on the
+// flags it was compiled with -- so "one path per source name" is only correct
+// while every build agrees on those flags, and they do not agree. The example
+// suite compiles vendor/window_glue.cc from `examples/swc-bitmap.build.json`
+// (ASC_USE_WINDOW, no GPU backend) and from the away3d / air-native manifests
+// (+ASC_RENDER_METAL) *concurrently* (test/examples.ts, jobs=min(cores,6)), and
+// both wrote vendor/window_glue.o. Measured: those two define sets produce
+// 29,216 vs 30,896 byte objects, so whichever build finished last silently
+// decided what the other one linked -- either handing it a channel its manifest
+// never asked for, or (as when relinking leftover objects by hand) failing with
+// `Undefined symbols: _sk_window_show_gpu`.
+//
+// A leftover object is the same defect one build later, and stage 89-32 fixed
+// one face of it already (native `.o` vs web `.wasm.o`, because the two targets
+// clobbered each other). This is the general form of that fix: objects live in
+// one directory per CONFIG, named by a hash of everything that can change their
+// bytes (compiler, target, -O, perf/fp/debug flags, defines, include paths --
+// NOT sorted, because -I order changes which header wins), plus a hash of the
+// source path so two same-named sources cannot collide.
+//
+// Nothing is cached: every source is still recompiled on every build, exactly as
+// before. This changes where the output lands, never how often it is produced,
+// so it costs no time -- it only stops one build from answering for another.
+// The ICU data object is deliberately NOT part of this: its bytes are the same
+// for every config, so sharing it (mtime-cached, next to the vendored .dat) is
+// correct.
+function objectConfigKey(cfg: BuildConfig): string {
+  const parts: string[] = [
+    `target=${cfg.target}`,
+    `cc=${cfg.cCompiler}`,
+    `opt=${cfg.opt}`,
+    `dbg=${cfg.debugInfo ? '1' : '0'}`,
+    ...nativeTargetFlags(cfg),
+    ...perfFlags(cfg),
+    ...fpFlags(cfg),
+    ...effectiveDefines(cfg).map((d) => `-D${d}`),
+    ...cfg.includePaths.map((p) => `-I${p}`),
+  ];
+  return createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 16);
+}
+
+// The directory holding the objects of ONE build. Under the OS temp dir on
+// purpose: these are pure intermediates, and a compiler should not drop a `temp/`
+// tree into whatever project it was pointed at. `--dry` prints the real paths (so
+// they stay discoverable) but creates nothing.
+//
+// The PID is load-bearing, not decoration: objects must be private to the process
+// that compiles them. `cc -o` writes in place (truncate, then write), so two builds
+// sharing a path let a concurrent link read a truncated file -- not theory, it cost a
+// real failure: the example suite runs six text builds at once, and one of them died
+// with `ld: file is empty in .../icudtl_flutter.o`. "The bytes are identical anyway"
+// is exactly what made a shared path look safe; identical content does not make a
+// non-atomic overwrite safe, only a private path does. The config hash stays in the
+// name so a mid-build `ld` line (or `--dry`) still says which configuration wrote it.
+export function objectDir(cfg: BuildConfig): string {
+  return join(tmpdir(), 'as-aot-obj', `${objectConfigKey(cfg)}-${process.pid}`);
+}
+
+// Drop one build's scratch once it has linked: the objects are intermediates, and
+// they are the biggest thing this compiler writes (~3 MB for a text example). Called
+// on success only -- a FAILED build deliberately keeps its objects, because that is
+// the state a post-mortem wants.
+export function cleanObjectScratch(cfg: BuildConfig): void {
+  rmSync(objectDir(cfg), { recursive: true, force: true });
+}
+
+// The object for one source inside that config's directory.
+function objectPathFor(cfg: BuildConfig, src: string, suffix: string): string {
+  const tag = createHash('sha256').update(src).digest('hex').slice(0, 12);
+  return join(objectDir(cfg), `${tag}-${basename(src).replace(/\.[^.]+$/, '')}${suffix}`);
+}
+
 // Build the full set of compiler invocations. Pure-C builds are a single command
 // (unchanged); when the manifest adds C++ sources (.cc/.cpp), we compile C and
 // C++ separately and link with the C++ driver so libstdc++ is pulled in. The
@@ -821,17 +1106,24 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
 
   const cxx = cxxCompiler(cfg);
   const cFiles = [cPath, ...cfg.sources.filter((s) => !isCppSource(s))];
-  // Native objects stay `<name>.o`. `objOf` used to be target-agnostic, so this
-  // path and the Emscripten web path wrote the *same* `vendor/*.o` file — a
-  // later incremental rebuild that reused the other target's object died in
-  // wasm-ld with "unknown file type" (stage 89-32). The web path now suffixes
-  // `.wasm.o` (see buildWebCompileSteps) so both sets coexist.
-  const objOf = (src: string): string => src.replace(/\.[^.]+$/, '.o');
+  // Per-config objects (see objectPathFor): the stage-89-32 target suffix is kept
+  // on top of that as a second, human-readable guard, since the config key
+  // already separates the targets. The scratch directory is created by runCompile.
+  const objOf = (src: string): string => objectPathFor(cfg, src, '.o');
   const compileCommon: string[] = [...nativeTargetFlags(cfg), cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const d of effectiveDefines(cfg)) compileCommon.push('-D', d);
   for (const p of cfg.includePaths) compileCommon.push('-I', p);
 
   const steps: string[][] = [];
+  // 0) ICU data blob (text builds only): assemble the vendored 0.80 MB data set
+  //    into the object that defines _icudtNN_dat (see icuDataPaths). Assembling
+  //    needs no -I/-D and takes ~0.2 s; it is an object like any other, so it lives
+  //    in this build's own scratch and never in a path another build writes. The
+  //    source itself is materialised by the runner, not here (this stays pure).
+  const icuData = icuDataPaths(cfg);
+  if (icuData) {
+    steps.push([cfg.cCompiler, '-c', ...nativeTargetFlags(cfg), icuData.source, '-o', icuData.object]);
+  }
   // 1) C sources (including the generated .c) -> .o on the C compiler.
   for (const f of cFiles) {
     steps.push([cfg.cCompiler, '-c', ...compileCommon, f, '-o', objOf(f)]);
@@ -843,9 +1135,22 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
     steps.push([cxx, '-c', '-std=c++17', ...compileCommon, f, '-o', objOf(f)]);
   }
   // 3) link everything with the C++ driver (pulls in libstdc++).
-  const linkArgs: string[] = [cxx, ...nativeTargetFlags(cfg), cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg), '-o', outPath];
+  const linkArgs: string[] = [
+    cxx,
+    ...nativeTargetFlags(cfg),
+    cfg.opt,
+    ...perfFlags(cfg),
+    ...fpFlags(cfg),
+    ...debugInfoFlags(cfg),
+    ...linkTrimFlags(cfg),
+    '-o',
+    outPath,
+  ];
   for (const f of cFiles) linkArgs.push(objOf(f));
   for (const f of cppFiles) linkArgs.push(objOf(f));
+  // Before the -l flags: this is what keeps the archives' 10.19 MB ICU data
+  // member unreadable-by-necessity rather than merely unread.
+  if (icuData) linkArgs.push(icuData.object);
   for (const o of cfg.objects) linkArgs.push(o);
   for (const p of cfg.linkPaths) linkArgs.push('-L', p);
   for (const l of cfg.linkLibs) linkArgs.push('-l', l);
@@ -905,10 +1210,21 @@ export function wasmToolchainError(cfg: BuildConfig): string | null {
   return null;
 }
 
+// Create the directory a compiler invocation writes into. The output directory belongs
+// to the RUNNER, not to the command builder: composing a command line must not touch the
+// filesystem (that is what made `--dry` need a special case, and what left scratch
+// directories behind from purely structural checks). Exported so a caller that drives the
+// compiler itself reaches the same place production does.
+export function ensureOutDir(argv: string[]): void {
+  const outAt = argv.indexOf('-o');
+  if (outAt >= 0 && argv[outAt + 1]) mkdirSync(dirname(argv[outAt + 1]), { recursive: true });
+}
+
 // Run the compiler and propagate failure. Returns true on success. `extraEnv`
 // (e.g. the Emscripten toolchain's PATH) is merged over the inherited
 // environment rather than replacing it, so unrelated env vars survive.
 export function runCompile(argv: string[], extraEnv?: Record<string, string>): boolean {
+  ensureOutDir(argv);
   const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
   const res = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', env });
   if (res.stderr) process.stderr.write(res.stderr);
@@ -1007,8 +1323,12 @@ export function buildWebCompileSteps(cfg: BuildConfig, cPath: string, base: stri
   // incremental rebuild (reusing existing objects) failed in wasm-ld with
   // "unknown file type: skia_glue.o" (stage 89-32). Emscripten objects get
   // `.wasm.o` so the native and web object sets can coexist.
+  //
+  // 阶段二百二十三 moved both sets into a per-config directory (objectPathFor),
+  // which already separates the targets by the config key; the suffix is kept as
+  // a readable second guard, not as the mechanism.
   const objSuffix = cfg.target === 'wasm' ? '.wasm.o' : '.o';
-  const objOf = (src: string): string => src.replace(/\.[^.]+$/, objSuffix);
+  const objOf = (src: string): string => objectPathFor(cfg, src, objSuffix);
 
   const compileCommon: string[] = [cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const d of effectiveDefines(cfg)) compileCommon.push('-D', d);

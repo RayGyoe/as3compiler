@@ -13,7 +13,7 @@ import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, r
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, type BuildConfig } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, cleanObjectScratch, icuDataPaths, writeIcuAssembly, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { BuildConfig, Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp, airManifest } from './air-app.ts';
@@ -1084,6 +1084,9 @@ async function main(): Promise<void> {
       console.log(`[4/4] compile     ${s.join(' ')}`);
       if (!runCompile(s, env)) process.exit(1);
     }
+    // 对象是中间产物（文本构建约 3 MB），链接成功后连同本次构建的 scratch 一并
+    // 丢弃；构建失败则刻意保留，那才是事后分析想要的状态。
+    cleanObjectScratch(cfg);
     const htmlPath = writeWebIndex(base, cfg.fontUrls);
     console.log(`Build successful: ${base}.html (${basename(base)}.js + ${basename(base)}.wasm)`);
     console.log(`Generated C kept at: ${cPath}`);
@@ -1100,6 +1103,13 @@ async function main(): Promise<void> {
     return;
   }
 
+  // The ICU data object is a build INPUT (3.4 MB of assembler source), so the runner
+  // materialises it before the steps that consume it -- the same relationship the
+  // generated .c has to its compile step. Nothing is written here in --dry mode; the
+  // command list printed above is exactly what a real run executes.
+  const icuData = icuDataPaths(cfg);
+  if (icuData) writeIcuAssembly(cfg, icuData.source);
+
   if (cfg.target === 'wasm') {
     const missing = requireCheck('wasi.sdk', buildCheckCtx(cfg));
     if (missing !== null) {
@@ -1110,6 +1120,8 @@ async function main(): Promise<void> {
     console.log(`[4/4] compile     ${s.join(' ')}`);
     if (!runCompile(s)) process.exit(1);
   }
+  // 同上：链接成功即回收对象，失败保留（见 build.ts::cleanObjectScratch）。
+  cleanObjectScratch(cfg);
 
   // Skia text shaping on a Windows native build needs icudtl.dat beside the exe
   // (see deploySkiaIcuData). Deploy it after a successful link; a missing file

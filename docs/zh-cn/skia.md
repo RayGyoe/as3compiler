@@ -131,6 +131,31 @@ skia::textlayout::StrutStyle::StrutStyle()`），只给最终二进制加 `-dead
 | `vendor/skia_text_glue.cc` | 文本半边（`sk_text_measure*`、`sk_canvas_draw_text*`、全部 `sk_textlayout_*`、AIR 行盒/strut 换算、设备字体别名） | 只有程序用到 `flash.text`（含 SWC 烘焙出的文本字符）时 |
 | `vendor/skia_glue_internal.h` | 两半唯一的共享声明 `sk_platform_fontmgr()`（C++ 链接，**故意不 inline**） | 头文件 |
 
+#### 3.2 链接期两刀 + ICU 数据只取 0.80 MB（阶段二百二十二）
+
+拆完对象之后还剩两块纯浪费，都不改任何语义：**链进来但跑不到**的代码，和**链进来但读不到**的数据。
+
+- **`-Wl,-dead_strip -Wl,-x`**（`src/build.ts::linkTrimFlags`）：前者让 ld64 先丢不可达块再解析块内引用，
+  胶水 `.o` 里提到而程序没调用的 Skia API 不再拉成员进来；后者砍 `__LINKEDIT` 的局部符号表，
+  全局符号不动。`--debug-info` 时只发 `-dead_strip`（那个构建要符号）。ELF/COFF 的 `--gc-sections`
+  需要编译期 `-ffunction-sections -fdata-sections`（含预编译 archive）才有效，故**整族不发**；
+  `-flto` 实测在这套 archive 上**反而大 13 KB**，维持 opt-in。
+- **ICU 数据**：`libskunicode.a` 里那个单成员 `icudtl_dat.o` 是**整份桌面数据集**（10.19 MB）。
+  构建期把 `vendor/skia/icu/icudtl_flutter.dat`（0.80 MB，Skia 自己给 wasm 用的那份）汇编成对象，
+  **放在 `-l` 之前**定义了 `_icudt69_dat` ⇒ archive 成员**根本不会被读**，无需改 `vendor/` 里的任何 `.a`。
+  汇编出的 `.s`/`.o` 与其它对象一样落在**本次构建独占**的临时目录（`$TMPDIR/as-aot-obj/<配置指纹>-<pid>/`），
+  源树里只留被跟踪的 `.dat`（见 `docs/zh-cn/compile.md` §3.5 与 `rust-text-backend.md` §3.2）。
+  断行规则、bidi 属性、NFKC 都在小份里；被裁掉的是 collation/locales/curr/region/rbnf/translit/转换表/unames。
+
+| 构建 | 拆分后 | + 两刀 | + 小 ICU 数据 |
+|---|---|---|---|
+| 不画文字 | 6.53 MB | **3.55 MB** | 3.55 MB |
+| 画文字 | 19.43 MB | 15.51 MB | **6.05 MB** |
+| `--air-app` Skia app | — | 18.80 MB | **9.34 MB** |
+
+已知缺口：**Windows** 的数据对象在 `skunicode.lib` 里且是 COFF，需在 Windows 上重编（本机无法验证）；
+**Linux** 没有预编译树，且分节要编译期旗标。两者都记在 [`rust-text-backend.md`](rust-text-backend.md) §10。
+
 **接缝不变**：生成的 C 仍只调那 15 个 `sk_*`（`runtime.ts:8763–8789`），搬的只是实现。
 **字体管理器刻意留在图形半边**——SVG 的 `<text>` 要把它交给 `SkSVGDOM`，而 web 的字体注入
 `sk_fontmgr_register_data` 改的是同一个缓存、且 `EXPORTED_FUNCTIONS` **无条件**导出它；
@@ -934,9 +959,9 @@ Monaco 的 12+3、但 14 px 起就与 Monaco 分道）——没有一个可解�
 同理 `Courier New` / `Arial` 的行高各有 0.5 px 残差（Skia 内部对半像素的取整方向），也一并记录。
 
 > **想换掉这套排版引擎？先读 [`rust-text-backend.md`](rust-text-backend.md)**——那篇逐端评估了
-> 「把 SkParagraph 换成 cosmic-text + swash 静态库」的优劣、实测体积账（ICU 数据是**一个不可分的
-> 9.71 MB 对象**，而且**不画文字的应用也照付**）、以及为什么结论是「先做 `-dead_strip` 与
-> `skia_use_icu4x`，Rust 后端只在移动端 + 体积硬约束时才动」。
+> 「把 SkParagraph 换成 cosmic-text + swash 静态库」的优劣、实测体积账（ICU 数据原本是**一个不可分的
+> 10.19 MB 对象**：阶段二百二十一之后它只跟着**画文字**的构建走，阶段二百二十二又把这份数据换成 Skia
+> 自己给 wasm 用的 0.80 MB 那份）⇒ 换引擎如今最多再省约 2.5 MB，只在移动端 + 体积硬约束时才值得。
 
 ---
 

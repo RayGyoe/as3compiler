@@ -1,14 +1,18 @@
 # Text layout backend: split the text engine out of the link first (done), then decide about Rust
 
-> **Status: step 1 has landed (stage 221, `v0.4.195 → v0.4.196`); step 2 (swapping in a Rust engine) is
-> still an evaluation — not implemented, no version number.**
+> **Status: everything on the size side has landed — step 1, the split (stage 221,
+> `v0.4.195 → v0.4.196`), plus the two closing cuts (stage 222, `v0.4.196 → v0.4.197`). Only "swap in
+> a Rust engine" is still an evaluation: not implemented, no version number.**
 >
 > This document answers two questions, in an order that cannot be swapped:
 >
-> 1. **Can a program that draws no text stop paying for the text engine?** — **Yes. Done, and
->    measured**: the text half of the glue is now its own source file / object, and the build layer
->    decides whether to link it from whether the program touches `flash.text`. On the same
->    text-free program: **19.43 MB → 6.53 MB (−12.90 MB, −66.4%)**, with zero semantic change.
+> 1. **Can a program pay only for what it actually uses?** — **Yes. Done, and measured**:
+>    ① the text half of the glue is now its own source file / object, and the build layer decides
+>    whether to link it from whether the program touches `flash.text` (**19.43 MB → 6.53 MB**);
+>    ② link-time `-Wl,-dead_strip -Wl,-x` (**→ 3.55 MB** for text-free builds, every build benefits);
+>    ③ the ICU data set switches from the desktop bundle (10.19 MB) to the one Skia already ships
+>    for wasm (0.80 MB) ⇒ **a text-drawing build goes 19.43 MB → 6.05 MB (−69%)**, zero semantic
+>    change.
 > 2. **Should the layout engine be replaced with a pure-Rust stack (cosmic-text + swash +
 >    rustybuzz)?** — **The seam already exists** (15 opaque functions), **but the set of situations
 >    where it pays off is very narrow**: not desktop, not web. The only account that balances is a
@@ -16,9 +20,10 @@
 >    every layout convention calibrated value-by-value against `adl` on a completely different
 >    engine (§9).
 >
-> The previous revision (2026-10-20) filed "split it into an independent object" under §2.4 as a
-> *precondition for swapping engines*. It turns out the split **is itself the win**, and it needs
-> **no engine swap at all** — the biggest structural change in this revision.
+> Two revisions changed the structure of this document. The old one (2026-10-20) filed "split it
+> into an independent object" as a *precondition for swapping engines* — the split **is itself the
+> win** and needs no engine swap. And after stage 222 the "remaining 13 MB of text stack" is gone
+> too: **882 KB of data selection plus two link flags** removed 12.4 MB of it (§3, §10).
 
 ---
 
@@ -28,13 +33,17 @@
 `vendor/skia_text_glue.cc`, so a build that does not use text **never puts it in the link** at all.
 This changes no AS3 or rendering semantics — only the **link graph**.
 
-**Step 2 (evaluation, §4–§12 here)**: replace the *implementation* behind those 15 seam functions,
+**Size close-out (done, L1/L2a in §3 here)**: `-Wl,-dead_strip -Wl,-x` plus the 0.80 MB ICU data
+set. Also semantic-free: it removes the parts that are linked but never executed or never read.
+
+**Step 2 (evaluation, §4–§11 here)**: replace the *implementation* behind those 15 seam functions,
 from SkParagraph to a Rust static library. This does change semantics, and every layout calibration
 must be redone.
 
 **Out of scope**: the AS3 semantics of `TextField` itself ([`flash-text.md`](flash-text.md)); the
 overall Skia integration and the Metal backend ([`skia.md`](skia.md)); SWC static-text baking
-([`swc.md`](swc.md)); "should the frontend TS be ported to Rust" (verdict in §11).
+([`swc.md`](swc.md)). The frontend stays TypeScript (no Rust port); that is a separate decision
+unrelated to this topic and is not discussed here.
 
 **Single oracle**: `adl` from AIR 51.4.1. Any "matches / doesn't match" in this document is decided
 value-by-value against `adl` (AGENTS §1.5).
@@ -247,6 +256,10 @@ contradiction: **the text-free one does not link the text half yet still exports
 moved to the text half, that build would fail to link. Both `--air-app` examples
 (`air-starling-demo` 8.97 MB, `air-native` 7.43 MB) now build for web as well.
 
+> "A text build is unchanged" is a fact about **this** stage: the very next stage (222) took the same
+> program down to **6.05 MB** with L1 + L2a (§3.1, §10). Those cuts remove what is linked but
+> unreachable or never read; they do not substitute for the split.
+
 ### 2.7 The four traps of this split (all written into comments)
 
 | Trap | Symptom | Handling |
@@ -258,24 +271,150 @@ moved to the text half, that build would fail to link. Both `--air-app` examples
 
 ---
 
-## 3. Step 2's account: what is left after the split
+## 3. Step 2's account: what is left after the split (fully settled)
 
-The split **made the difference explicit**: "draws text or not" is now an **optional 12.90 MB**
-instead of something everyone pays. What remains, ordered by risk/benefit:
+The split **made the difference explicit**: it went from "everyone pays" to an **optional 12.90 MB**.
+The three items that were left were all measured in stage 222 — two landed, two were struck out:
 
-| Route | How | Expected gain | Risk | Status |
+| Route | How | Measured gain | Risk | Status |
 |---|---|---|---|---|
-| **L0** | **this split** (no text ⇒ no text stack) | **−12.90 MB** (for builds that draw no text) | absorbed | ✅ **done** |
-| **L1** | link-time `-Wl,-dead_strip` (`grep` finds none in `build.ts`) | **−2.74 MB** (every build) | low (ObjC categories / typeinfo under `-dead_strip` need a full regression) | ⏸ not done (§10) |
-| **L2** | rebuild Skia with `skia_use_icu=false` + `skia_use_icu4x=true` | could remove most of the 10.19 MB | medium (must verify SkParagraph's line breaking/bidi still match) | ⏸ not done |
-| **L3** | rebuild Skia with `skia_use_libgrapheme=true` + `skia_use_icu=false` | same, more aggressive | high (libgrapheme **does no bidi**) | ⚠️ generally not advised |
-| **L4** | prune the codecs that `air-app.ts` lists 1:1 (`skottie`/`svg`/`dng_sdk`/`piex`/`expat`) | ~2.5 MB | low | partly covered by L1 |
-| **L5** | **swap in the Rust text engine** (this document's step 2) | another ~13 MB for **text-using** builds | **high** (§9 B1/B2) | ⏸ only for mobile + a hard size constraint |
+| **L0** | **the split** (no text ⇒ no text stack) | **−12.90 MB** (for builds that draw no text) | absorbed | ✅ done (stage 221) |
+| **L1** | link-time `-Wl,-dead_strip -Wl,-x` | text-free **−2.98 MB**, text **−3.92 MB**, Skia app **−5.17 MB** | low (full 429-case regression covered ObjC categories/typeinfo) | ✅ done (stage 222) |
+| **L2a** | **switch the ICU data set**: the `flutter/icudtl.dat` Skia already ships for wasm (0.80 MB) | a further **−9.46 MB** for text builds | low (the web target has shipped this same file all along; full suite green) | ✅ done (stage 222) |
+| **L2b** | rebuild Skia with `skia_use_icu=false` + `skia_use_icu4x=true` | overlaps L2a (both target the ICU data); L2a already removes it with 0.80 MB | medium (needs a Rust toolchain + a rebuild on both targets + re-verification) | ⏸ **superseded by L2a**, revisit only for ICU4X locale features |
+| **L3** | rebuild Skia with `skia_use_libgrapheme=true` + `skia_use_icu=false` | same ballpark as L2a, more aggressive | high (libgrapheme **does no bidi**) | ⚠️ rejected |
+| **L4** | prune the codecs `air-app.ts` lists 1:1 (`skottie`/`svg`/`dng_sdk`/`piex`/`expat`) | **0 bytes** (measured: dropping those libraries produces an identical binary) | — | ✅ fully covered by L1, **no action needed** |
+| **L5** | **swap in the Rust text engine** (this document's step 2) | the old value was "another ~13 MB for text builds" — **that 13 MB no longer exists**; what is left is ≈2.7 MB | **high** (§9 B1/B2) | ⏸ only for mobile + a hard size constraint |
 
-**How to read this table**: L0 has already banked the largest single amount, and it **touches no
-layout semantics**. L5's gain does **not** stack with L0's — L0 saves the *text-free* program, L5
-saves what is left of the *text-using* one. L5 only enters the picture when "uses text + hard size
-constraint" hold at the same time.
+**How to read this table**: ① L0 saves the *text-free* program, L1 saves what is *linked but
+unreachable* in every program, L2a saves the *data nothing reads* in a text build — the three do not
+stack and do not substitute for each other, and **all three have landed**. ② L5's pitch shrank
+badly after stage 222: a text-drawing build went from 19.43 MB to 6.05 MB and the Skia + shaping
+stack in it is ~4.9 MB — and **that 4.9 MB is exactly what an engine swap would have to reimplement**.
+Re-calibrating every layout convention to buy 2.7 MB is only worth it under a mobile store size
+constraint (§11).
+
+### 3.1 How L1 and L2a landed (stage 222)
+
+**L1: `src/build.ts::linkTrimFlags`** — `-Wl,-dead_strip` makes ld64 **drop unreachable code/data
+blocks first and resolve the references inside them later**, so a glue `.o` that mentions a Skia API
+the program never calls stops pulling that archive member in (this is also the precondition that
+makes §2 pay off). `-Wl,-x` drops the **local symbol table** in `__LINKEDIT`; global symbols survive.
+
+**Three things deliberately not done, each with a number**: `-flto` across the whole link measured
+**3,567,592 B vs 3,554,632 B — 13 KB LARGER** (Skia's archives carry no bitcode); `--gc-sections` on
+ELF/COFF needs `-ffunction-sections -fdata-sections` at *compile* time (including inside every
+prebuilt archive) before it saves a byte, so the whole family stays off rather than becoming a flag
+that looks like it works and does nothing; and `--debug-info` builds do not get `-x` (they asked for
+symbols) though they still get `-dead_strip`.
+
+**L2a: `src/build.ts::icuDataPaths`** — the source is `vendor/skia/icu/icudtl_flutter.dat` (0.80 MB,
+the same file Skia uses for wasm). It is assembled into a `.s` and compiled to a `.o` at build time
+(~0.2 s: 45 ms to write the 3.4 MB of assembler text, 155 ms to assemble it) and **passed as an
+ordinary object before the `-l` flags**.
+
+Why that is enough: **an archive member is only pulled when one of its symbols is still undefined.**
+Our object defines `_icudt69_dat` first, so the 10.19 MB member inside `libskunicode.a` is **never
+even read** — no archive surgery, and therefore nothing that a re-provision would silently undo.
+
+Three traps (all in the code comments):
+
+1. **There are two `icudtl_dat.o` copies** — one in `libskunicode.a`, one in `libicu.a`, and the one
+   that gets linked is **the skunicode copy** (`-l skunicode` precedes `-l icu`). Swapping only
+   `libicu.a` changed the binary by **exactly zero bytes**, with no error. This trap **no longer
+   exists** in what actually shipped (we define the symbol rather than swap an archive), but it left
+   two silent faces behind — see §3.2.
+2. **The Xcode project path needs its own hook**: the generated `.s` has to be a *source file* in the
+   target (`sourcecode.asm`), or an app built through Xcode pays the 10.19 MB again.
+3. **`--dry` must not write**: the assembler source is materialised by the runner (`index.ts`) before
+   the steps it feeds, and command composition (`buildCompileSteps`) touches nothing — so a dry run is
+   clean **structurally**, not by an `if (dry)` branch that has to be remembered.
+
+### 3.2 Closing the two silent faces (stage 223)
+
+Each lever in §3.1 left a **silent** hole behind: shared object paths, and an ICU gate wired to the
+wrong condition. Neither changes any semantics, but either can let the size crawl back or let a build
+link the wrong thing — so both are closed. A third face turned up while verifying them (a shared write
+path that is a race even when the bytes match) and is closed in the same pass.
+
+**1. Objects are keyed by CONFIG, not by source name (`src/build.ts::objectDir`)**
+
+An object is linked **whole** (§2.1) and its contents are a function of **the flags it was compiled
+with** — so "one path per source name" only holds while every build agrees on those flags, and they
+do not agree: `examples/swc-bitmap.build.json` compiles `vendor/window_glue.cc` without a GPU
+backend, the away3d / air-native manifests add `ASC_RENDER_METAL`, and those builds run
+**concurrently** (`test/examples.ts`, jobs = min(cores, 6)) — all writing `vendor/window_glue.o`.
+Measured, same source two define sets: **29,216 vs 30,896 B** (`skia_glue.cc`: 33,416 vs 38,200). So
+whichever build finished last decided what the other one linked: either handing it a channel its
+manifest never asked for, or (when relinking leftover objects by hand) ending in
+`Undefined symbols: _sk_window_show_gpu`.
+
+The fix puts objects in `$TMPDIR/as-aot-obj/<config key>-<build pid>/<source-path key>-<base><suffix>.o`,
+where the key covers the compiler, target, `-O`, the perf/fp/debug flags, the defines and the include
+paths (**not sorted** — `-I` order decides which header wins). **Nothing is cached**: every source is
+still recompiled on every build, just no longer answering for another one. Stage 89-32's `.wasm.o`
+suffix stays as a readable second guard. Why the directory also carries a pid, and why a successful
+build deletes it, is face **3** below.
+
+**2. The ICU gate moved from "the manifest links `-l icu`" to "the text engine is linked", plus a
+version canary**
+
+The old guard was `linkLibs.includes('icu')`, which looked equivalent and was not: as soon as a
+manifest omits `icu`, the data member still travels inside `libskunicode.a`, so the substitution was
+skipped and the 10.19 MB came back. Measured, `examples/tf-scale-metrics.as` with `-l icu` removed:
+**15,510,408 B (15.51 MB) instead of 6,049,032 B (6.05 MB)** — exit code 0, not one word of output.
+The condition is now `ASC_HAVE_TEXT` alone (the text engine is the only consumer, and an unreferenced
+object is dropped by `-dead_strip`, so the wider gate is also the safer direction).
+
+On top of that, a **canary**: `nm -g libskunicode.a` reveals the `_icudtNN_dat` it expects, which is
+compared with our `.dat` marker, and a mismatch prints **one line** ("both data sets will be linked,
++9.46 MB, size only"). The symbol is version-tagged, so a mismatch cannot corrupt anything — it can
+only let the size crawl back, and **because size is the only symptom, it has to be reported**.
+
+**3. A shared WRITE path is a race in itself (objects must be private to the building process)**
+
+This is the half that keying by config **did not** close, and it was not reasoned out — it was run out
+of a red suite: `node test.ts` failed 2 runs in 3, on `textfield/ (Main.as, UiMain.as, entry.as)`, with
+one line:
+
+```
+ld: file is empty in '.../vendor/skia/icu/icudtl_flutter.o'
+clang++: error: linker command failed with exit code 1
+```
+
+Mechanism: the ICU data object was **deliberately shared** ("the bytes are the same for every build,
+so sharing keeps it assembled once"), but that assemble step ran on **every** text build, and
+`clang -c` opens (truncates) its output first and writes it when compilation finishes — so the 800 KB
+`.o` was an **empty file for the whole ~150 ms** while a sibling build was linking it. The lesson is in
+the comment now: **identical content does not make sharing safe**; a non-atomic overwrite is only safe
+if the path is private.
+
+The fix is three things at once: ① `objectDir` carries `-<pid>`, so two builds cannot even name the
+same file; ② the ICU `.s`/`.o` move into that directory too (`icuDataPaths`), leaving only the tracked
+`.dat` in the source tree and letting the `vendor/skia/icu/*.s` line disappear from `.gitignore`;
+③ a successful link calls `cleanObjectScratch`, which removes the whole directory (~3 MB for a text
+build), while a **failed** build keeps it deliberately — that is the state a post-mortem wants, which
+is why the cleanup sits at the `index.ts` call site rather than in a `finally`. The same pass moved the
+"composing a command line writes to disk" side effect out of the builder and into `runCompile`
+(`ensureOutDir`), so `buildCompileSteps` is now pure.
+
+Measured with `temp/pitfall/stress-shared-obj.sh` (120 concurrent text builds sharing one config):
+
+| Version | Failures | Symptom |
+|---|---|---|
+| before (shared path, no cleanup) | **9 / 120** | `ld: file is empty in .../icudtl_flutter.o` |
+| after (pid-private, reclaimed on success) | **0 / 120** | — |
+
+`--dry` behaves as before (prints the object paths, creates nothing), but now for a structural reason:
+command composition does not touch the filesystem. One note on the Xcode path — its `.s` is written
+**into the generated project directory** (self-contained; Xcode compiles it long after this process
+exits), so the source tree keeps only inputs.
+
+| Situation | Before | After |
+|---|---|---|
+| text build, manifest omits `-l icu` | 15,510,408 B, silent | **6,049,032 B** |
+| two builds with different defines, concurrent | shared `vendor/*.o`, race | separate directories, invisible to each other |
+| vendor tree upgraded to another ICU major | silent +9.46 MB | one stderr line |
 
 ---
 
@@ -291,8 +430,9 @@ constraint" hold at the same time.
 | `parley` (alternative) | line breaking + paragraphs | SkParagraph | from linebender like `swash`, more active |
 
 **The key trade-off**: shaping with `rustybuzz` keeps the semantics "same-origin" (good for `adl`
-alignment), but **does not remove the shaping logic itself**; what is actually removed is **ICU's
-unicode data tables** (10.19 MB) and the C++ HarfBuzz implementation.
+alignment), but **does not remove the shaping logic itself**; and "drop ICU's unicode data tables"
+**no longer needs an engine swap** (L2a already took 10.19 MB down to 0.80 MB) — what an engine swap
+actually removes is the C++ HarfBuzz + SkParagraph implementation, about 2.7 MB (the L5 row in §3).
 
 ---
 
@@ -404,7 +544,7 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
 
 | Stage | Contents | Acceptance |
 |---|---|---|
-| P0 | ~~do the low-risk items in §3 first~~: **L0 is done**; remaining are `-dead_strip` (L1) and `icu4x` (L2) | size + full regression |
+| P0 | ~~the low-risk items in §3~~: **L0 + L1 + L2a are all done** (stages 221 / 222); `icu4x` (L2b) is superseded by L2a | size + full regression |
 | P1 | desktop **A/B two backends** (tier 3): run the same `textfield` example twice and diff the two-sided `adl` report into a **divergence list** | `flash-text.md` §5.1 numeric report |
 | P2 | calibrate item by item against that list; switch the default once it converges | divergence list at zero (or recorded honestly) |
 | P3 | once a mobile target lands, enable the Rust backend for that target only | per-target layering (`compile.md` §4.1) |
@@ -417,8 +557,8 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
 
 | Platform | Status | Who does text today | Gain from Rust | Cost / risk | Verdict |
 |---|---|---|---|---|---|
-| **macOS native** | ✅ shipped | CoreText (fonts) + SkParagraph (layout) + this repo's CoreText patch | size ~13 MB | loses the benefit of `skia.md` §6.9's patch, emoji (Apple Color Emoji), and all `adl` calibration | ❌ don't |
-| **Windows native** | ✅ shipped | GDI + DirectWrite two-tier fallback + Uniscribe shaping | size ~13 MB | must rebuild an equivalent DirectWrite fallback chain; emoji (Segoe UI Emoji) | ❌ don't |
+| **macOS native** | ✅ shipped | CoreText (fonts) + SkParagraph (layout) + this repo's CoreText patch | size ~4.9 MB (after L2a; was ~13 MB) | loses the benefit of `skia.md` §6.9's patch, emoji (Apple Color Emoji), and all `adl` calibration | ❌ don't |
+| **Windows native** | ✅ shipped | GDI + DirectWrite two-tier fallback + Uniscribe shaping | size ~4.9 MB + 10.19 MB ICU data (L2a not yet ported to Windows, see §10) | must rebuild an equivalent DirectWrite fallback chain; emoji (Segoe UI Emoji) | ❌ don't |
 | **Linux native** | ⛔ not provisioned | — (`vendor/skia/lib/` has no linux) | — | — | ⛔ nothing to analyse |
 | **web (emcc)** | ✅ shipped | `SkFontMgr_New_Custom_Data` + runtime injection of `font-urls` | size (wasm text stack archive 22.1 MB; the `.wasm` first-load payload could shed on the order of ~7 MB) | the font-injection contract must be redone; but the **relative** first-load gain is the largest | ⚠️ **the most valuable tier** |
 | **WASI (raw)** | ✅ shipped (no GUI) | **none** (all `as_skia_*` are zero stubs, `runtime.ts:9592+`) | 0 | 0 | ⛔ not involved |
@@ -439,8 +579,8 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
 - **After Rust**: that patch's benefit disappears (the Rust side does not go through CoreText), while
   its own font-matching problems arrive; Apple Color Emoji's colour rendering is provided by CoreText,
   and `swash` is weak on CBDT/sbix.
-- **Size**: ~13 MB.
-- **Verdict**: ❌ **don't**. The gain is pure size; the cost is every behaviour already pinned down.
+- **Size**: after L2a the text stack is **~4.9 MB** (0.80 MB ICU data, ~4.2 MB Skia + shaping); it was ~13 MB before L2a.
+- **Verdict**: ❌ **don't**. The gain is pure size and the cost is every behaviour already pinned down — and the gain itself shrank from 13 MB to 4.9 MB.
 
 ### 7.2 Windows native
 
@@ -448,7 +588,7 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
   backend shapes with Uniscribe (comment at `air-app.ts:676`). Skia ships x64/x86 libraries.
 - **After Rust**: an equivalent fallback chain must be rebuilt (`fontdb` can read `C:\Windows\Fonts`,
   but DirectWrite's script-aware fallback is ours to write); emoji goes through Segoe UI Emoji.
-- **Size**: ~13 MB (41.4 MB of archives → roughly 13 MB saved, same order as macOS).
+- **Size**: ~4.9 MB + 10.19 MB of ICU data (what gets pulled out of the 41.4 MB of archives; the ICU part disappears on Windows as soon as L2a is ported, see §10).
 - **Verdict**: ❌ **don't**, for the same reason as macOS.
 
 ### 7.3 Linux native
@@ -512,8 +652,8 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
 
 | # | Advantage | Magnitude / evidence | Platforms |
 |---|---|---|---|
-| A1 | **Drops the ICU data block** | a single 10.19 MB object, see §3 | all |
-| A2 | **Drops skunicode + harfbuzz + skshaper + paragraph** | ≈2.7 MB together (measured by the split: 12.90 saved − 10.19 of ICU data) | all |
+| A1 | ~~Drops the ICU data block~~ | **no longer needs an engine swap**: L2a already turned 10.19 MB into 0.80 MB (stage 222); taking those 9.4 MB does not require touching layout | all |
+| A2 | **Drops skunicode + harfbuzz + skshaper + paragraph** | ≈2.7 MB together (measured by the split: 12.90 saved − 10.19 of ICU data; L2a only touched data, not this code) — **the only L5 benefit still standing** (Skia's canvas/raster still stays; an engine swap cannot take it) | all |
 | A3 | **Pure Rust, no C++ dependency** | removes the `SK_TRIVIAL_ABI` / `-std=c++17` / MSVC ABI interlink constraints (`html5-web.md` §5.1, `provision/README.md`) | all |
 | A4 | **Static-library shape suits mobile** | iOS has no `dlopen`; static linking is the only shape | iOS / Android |
 | A5 | **Same shaping semantics** | `rustybuzz` is a Rust port of HarfBuzz ⇒ lower migration risk than a genuinely new shaper | all |
@@ -566,27 +706,34 @@ probe by probe, against `adl`.** That is where B2's severity comes from.
 
 ---
 
-## 10. Side-by-side: slimming further after the split
+## 10. End state: the full account for three kinds of build
 
-**L0 is already banked (§2.6).** The remaining tiers are mutually compatible and differ by an order of
-magnitude in cost:
+All three cuts have landed (L0 in stage 221, L1/L2a in stage 222). The table below is the actual byte
+count of the **same programs**, measured tier by tier:
 
-| Route | How | Expected gain | Risk | Recommendation |
+| Build | initial | +L0 split | +L1 | +L2a |
 |---|---|---|---|---|
-| **L1** | Link-time `-Wl,-dead_strip` (currently absent entirely) | **measured −2.74 MB** (19.43 → 16.69, `temp/textsize/notxt_ds`) | low (full regression needed to check ObjC categories/typeinfo) | ✅ **next thing to do** |
-| **L2** | Rebuild Skia with `skia_use_icu=false` + `skia_use_icu4x=true` | could remove most of the 10.19 MB (ICU4X data is **modular and prunable**, and ICU4X is itself **Rust**) | medium (must verify SkParagraph's line breaking/bidi still match; `build-tools/skia-src` already has the rebuild flow) | ✅ **immediately after L1** |
-| **L4** | Prune the codecs that `air-app.ts` lists 1:1 (`skottie`/`svg`/`dng_sdk`/`piex`/`expat`) | ~2.5 MB | low | largely covered by L1 |
+| text-free (`draw-over`) | 19.43 MB | 6.53 MB | **3.55 MB** | 3.55 MB (no ICU, unchanged) |
+| draws text (`tf-scale-metrics`) | 19.43 MB | 19.43 MB | 15.51 MB | **6.05 MB** |
+| `--air-app air-native` (Metal+SDL+curl+text) | 23.97 MB | — | 18.80 MB | **9.34 MB** |
 
-> L2 deserves emphasis: **ICU4X is Rust**. So the idea "use a Rust unicode library" does **not** require
-> replacing the whole text engine — Skia itself exposes the `skia_use_icu4x` switch, at the cost of
-> rebuilding Skia once.
-> **Replace the ICU data block via L2 first, then decide whether the text engine needs touching at all.**
+19.43 → 6.05 MB for a text build (**−69%**), 23.97 → 9.34 MB for the Skia app (**−61%**), and
+19.43 → 3.55 MB for a text-free build (**−82%**). Of the 6.05 MB a text build still carries: 0.80 MB
+ICU data, ~4.2 MB Skia + shaping stack, ~1.0 MB our own runtime and generated C.
 
-The current `build-tools/skia-src/out/{macos-arm64,wasm}/args.gn` (identical in both):
+**Two known gaps (reported, not done)**:
+
+| Platform | State |
+|---|---|
+| **Windows** | `icudtl_dat.obj` lives inside `skunicode.lib` and is COFF; the data object has to be rebuilt on Windows, which cannot be verified on this machine ⇒ **Windows still pays 10.19 MB** |
+| **Linux** | no Skia prebuilt tree at all; and `--gc-sections` needs compile-time `-ffunction-sections -fdata-sections` (including prebuilt archives) ⇒ **not done, and no flag emitted** |
+
+The current `build-tools/skia-src/out/{macos-arm64,wasm}/args.gn` (identical in both; `skia_use_icu`
+stays `true` — L2a swaps the *data set*, not the ICU implementation):
 
 ```
 skia_use_icu = true
-skia_use_icu4x = false          ← ICU4X is itself a modular Rust unicode library
+skia_use_icu4x = false          ← only needed if ICU4X locale features are wanted
 skia_use_libgrapheme = false
 skia_use_harfbuzz = true
 skia_enable_skparagraph = true
@@ -595,50 +742,34 @@ skia_enable_skshaper = true
 
 ---
 
-## 11. A side note: "so should the frontend TS be ported to Rust?"
-
-**Two different things. Do not conflate them.**
-
-| Question | Meaning | Impact | Verdict |
-|---|---|---|---|
-| A. What language is the artifact | generated C → generated Rust | runtime architecture, size, semantics | ❌ rejected (three hard blockers: cyclic GC / `setjmp` exceptions / "readable C") |
-| B. What the compiler is written in | frontend TS → Rust | affects only the compiler's own distribution | ❌ rejected (~55k lines portable, and the 736 KB C runtime is kept as-is ⇒ "ported to Rust and still emits C") |
-| C. **This document's**: replace one **native component** with a Rust static library | one more `.a` under `vendor/` | size / no Node | ⏸ **the only legitimate shape, and only for mobile + a hard size constraint** |
-
-C is **orthogonal** to the first two: it does not touch the generated C, the frontend, or the runtime —
-it only adds a static library under `vendor/`, linked through the manifest's `objects`. That is exactly
-the shape §2.9 permits.
-
----
-
-## 12. Trigger conditions and decision tree
+## 11. Trigger conditions and decision tree
 
 ```
 Is size a hard constraint?
-├─ No ──────────────────────────► Don't do L5. The ~13 MB text stack is a tolerable cost,
-│                                 while the re-calibration cost of §9 B1/B2 far exceeds the gain.
-│                                 (But L0 has already handed text-free builds 12.9 MB for free.)
+├─ No ──────────────────────────► Don't do L5. L0/L1/L2a already apply automatically.
 └─ Yes
    ├─ Does that build draw text?
    │  ├─ No ──► Already solved automatically (stage 221); nobody has to decide anything. ◄── banked
    │  └─ Yes
-   │     ├─ Does that platform have rebuildable prebuilt Skia libraries?
-   │     │  ├─ Yes ──► Do L1 (-dead_strip) + L2 (icu4x) first. That is usually enough. ◄── recommended stopping point
-   │     │  └─ No  ──► Provision first (neither Linux nor Android has Skia libraries yet)
-   │     └─ Still insufficient after L1+L2?
-   │        └─ Yes ──► Only then L5 (the Rust text engine),
-   │                   and **only for that target** (targets.<target> layering, replace semantics)
+   │     ├─ Is that platform macOS?
+   │     │  ├─ Yes ──► Already solved automatically (L1+L2a, stage 222). 6.05 MB is usually enough. ◄── banked
+   │     │  └─ No  ──► Port this stage's two cuts first (§10 gap table: the COFF data object on
+   │     │             Windows; provision + compile-side sections on Linux). Don't jump to an engine swap
+   │     └─ Still over budget after the port?
+   │        └─ Yes ──► Only then L5 (the Rust text engine), and **only for that target**
+   │                   (targets.<target> layering, replace semantics); expect ~2.7 MB, not 13 MB
 ```
 
-**Concrete trigger** (all three must hold before starting L5):
+**Concrete trigger** (all four must hold before starting L5):
 
 1. `--target ios` or `--target android` **has landed** (both are "planned" today, `compile.md` §6.1);
 2. that platform's **size is externally constrained** (app store / first-load budget);
-3. L1 + L2 have been executed and **still fall short**, leaving measured data.
+3. L0/L1/L2a **are in effect on that target** (including the 0.80 MB ICU data set);
+4. it is still over budget, with measured data on record.
 
 ---
 
-## 13. Appendices
+## 12. Appendices
 
 ### A. The 15 seam functions (complete current inventory)
 
@@ -679,6 +810,32 @@ Declarations: `src/runtime.ts:8763–8789`; implementation: `vendor/skia_text_gl
 | `notxt_o0` | 6,809,608 | generated C compiled at `-O0`, proving the link does not rely on dead-code elimination |
 | `tf` (uses text, after the split) | 19,430,208 | `examples/tf-scale-metrics.as`, classified "has text", same order as the baseline |
 | `tf_notxt` (text half deliberately not linked) | 6,548,376 | prints the three warning lines of §2.4 and stops on its own `textWidth <= 0` check |
+
+**B.1b Link-time cuts + small ICU data (2026-10-21, macOS arm64, `temp/icuprobe/`)**
+
+| Build | baseline | `-dead_strip` | `+ -x` | `+ 0.80 MB ICU data` |
+|---|---|---|---|---|
+| text-free `draw-over` | 6,531,688 | 4,345,176 | **3,554,632** | 3,554,632 (no ICU) |
+| text `tf-scale-metrics` | 19,430,208 | 16,685,384 | 15,510,408 | **6,049,032** |
+| `--air-app air-native` | 23,968,296 | 20,772,344 | 18,797,064 | **9,335,688** |
+
+| Extra control | Result |
+|---|---|
+| LTO (whole-link `-flto`) | 3,567,592 — **13 KB larger** than without, so not done |
+| L4: drop `skottie/sksg/svg/skresources/dng_sdk/piex/expat/bentleyottmann` from the link line | 3,554,632 — **byte-identical**, so L4 needs no action |
+| Swap the data object only in `libicu.a` (leaving `libskunicode.a` alone) | 15,510,408 — **not one byte changed** (trap: the linked copy is skunicode's) |
+| Full regression (small ICU data + both L1 cuts) | `node test.ts` **429 / 429 pass**, 0 fail, 0 skip |
+
+**B.1c Closing the two silent faces (2026-10-21, macOS arm64, `temp/pitfall/`)**
+
+| Item | Value | Note |
+|---|---|---|
+| Same source, two define sets | `window_glue.cc` **29,216 vs 30,896 B**; `skia_glue.cc` **33,416 vs 38,200 B** | proof that a shared path really races |
+| Text build, manifest omits `-l icu` (before) | 15,510,408 B, exit 0, no output | `libskunicode.a` carries its own data member |
+| Same (after) | **6,049,032 B** | gate is `ASC_HAVE_TEXT` now |
+| Text and text-free builds run **concurrently** | **6,049,032 / 3,554,632 B**, both run | separate config directories, no race left |
+| web side (`--package web`, emcc) | `hello-web` 5,868,096 B / `air-native` 7,428,052 B, objects in the wasm config directory | `EMSDK_HOME=../build-tools/emsdk` |
+| Full regression (after) | `node test.ts` **430 / 430 pass**, 0 fail, 0 skip | new `unit: build/ObjectPaths` (14 checks) |
 
 **B.2 The original measurements before the split (2026-10-20, `temp/textsize/`)**
 

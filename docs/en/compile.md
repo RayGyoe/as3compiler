@@ -496,10 +496,19 @@ explicitly re-add the GreenSock core `TweenLite/TweenCore/SimpleTimeline/PropTwe
 by the air-native demo) →
 write `<filename>.build.json` in the same directory as app.xml (linking Skia + SDL2) →
 compile/link into the `<filename>` executable (**both the artifact name and the location of every
-artifact** are overridable with `-o`: `-o` decides `base`, so the generated `.c`, the `.o`/`.lib`,
-`icudtl.dat` and the staged `extensions/` + `asaot.dll` all follow it — `-o bin-aot/App.exe` leaves the
-source tree free of build output. At run time `File.applicationDirectory` and `extensions/` resolve
-against the **executable's own directory**, so the artifacts move as a unit).
+artifact** are overridable with `-o`: `-o` decides `base`, so the generated `.c`, `icudtl.dat`
+and the staged `extensions/` + `asaot.dll` all follow it — `-o bin-aot/App.exe` leaves the
+source tree free of build output. The `.o` files are the exception: they are **intermediates**, not
+artifacts, and since stage 223 they live in a scratch directory **private to one build**
+(`$TMPDIR/as-aot-obj/<config key>-<pid>/`, real paths printed by `--dry`), which a successful link
+removes entirely (a failed build keeps it deliberately — that is the state a post-mortem wants).
+Two guards, two distinct silent failures: an object's contents are a function of the compile flags, so
+two builds with different flags sharing one path would leak into each other, and — even when the bytes
+are *identical* — `cc -o` truncates in place, so two builds sharing one path hand a **linking** build an
+empty file (measured: six concurrent text builds in the example suite, `ld: file is empty in
+.../icudtl_flutter.o`, two runs in three red); at run time `File.applicationDirectory` and
+`extensions/` resolve against the
+**executable's own directory**, so the artifacts move as a unit).
 
 #### 3.5.0 Native extensions come from the descriptor (no hand-written `--ane`)
 

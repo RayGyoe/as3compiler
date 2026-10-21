@@ -113,6 +113,8 @@ as-aot app.as --manifest examples/skia-link.build.example.json
 
 # 用到 flash.text 才链文本排版栈；不画字的程序自动省掉整条 SkParagraph/HarfBuzz/ICU 链
 # （实测 19.43 MB → 6.53 MB，阶段二百二十一；构建时打印 + / - 判定）
+# 链接期固定带 -Wl,-dead_strip -Wl,-x（--debug-info 保留符号），ICU 数据只取 0.80 MB 那份：
+# 不画字 3.55 MB / 画字 6.05 MB（阶段二百二十二）
 as-aot notxt.as --manifest examples/draw-over.build.json
 
 # 加载 AIR 原生扩展（ANE，阶段一百七十八）：宿主 FRE 运行时接进来，

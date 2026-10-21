@@ -1,19 +1,23 @@
 # 文本排版后端：先把文本引擎拆出链接（已完成），再决定要不要换 Rust
 
-> **状态：第一步已落地（阶段二百二十一，`v0.4.195 → v0.4.196`）；第二步（换 Rust 引擎）仍是评估，未实施、无版本号。**
+> **状态：体积部分全部落地——第一步拆分（阶段二百二十一，`v0.4.195 → v0.4.196`）+
+> 两刀收尾（阶段二百二十二，`v0.4.196 → v0.4.197`）；只有"换 Rust 引擎"仍是评估，未实施、无版本号。**
 >
 > 本文回答两个问题，顺序不能颠倒：
 >
-> 1. **能不能让"不画文字的程序"不付文本引擎的链接钱？** ——**能，已做，已实测**：
->    把文本 glue 拆成独立源文件 / 独立对象，构建层按程序是否用到 `flash.text` 决定链不链它。
->    同一个不画文字的程序：**19.43 MB → 6.53 MB（−12.90 MB，−66.4%）**，语义零改动。
+> 1. **能不能让程序只为它真正用到的部分付链接钱？** ——**能，已做，已实测**：
+>    ① 把文本 glue 拆成独立源文件 / 独立对象，构建层按程序是否用到 `flash.text` 决定链不链它
+>    （**19.43 MB → 6.53 MB**）；② 链接期 `-Wl,-dead_strip -Wl,-x`（**→ 3.55 MB**，全构建生效）；
+>    ③ 把 ICU 数据从桌面整份（10.19 MB）换成 Skia 自己给 wasm 用的那份（0.80 MB）
+>    ⇒ **画文字的构建 19.43 MB → 6.05 MB（−69%）**，语义零改动。
 > 2. **要不要把排版引擎换成纯 Rust（cosmic-text + swash + rustybuzz）？** ——**接点现成
 >   （15 个函数的不透明接缝），但值得做的场景极窄**：桌面与 web 不值得，唯一算得过账的是
 >   移动端 + 体积硬约束，且真正的成本不是链接，是把 `adl` 逐值校准出来的排版口径在一个
 >   算法完全不同的引擎上**重做一遍**（§9）。
 >
-> 旧版本（2026-10-20）把"拆成独立对象"写在 §2.4 的结论里，当作"换引擎的前置条件"。
-> 实际上它**本身就是收益**，而且**不需要换引擎**——这是本文修订后最大的结构变化。
+> 两处修订改变了本文的结构：旧稿（2026-10-20）把"拆成独立对象"写成"换引擎的前置条件"，
+> 实际上它**本身就是收益**；而阶段二百二十二之后连"文本栈剩下的 13 MB"也不成立了——
+> 882 KB 的数据选择 + 两条链接旗标就吃掉了其中 12.4 MB（§3、§10）。
 
 ---
 
@@ -23,12 +27,15 @@
 `vendor/skia_text_glue.cc`，让"不使用文本"的构建**根本不把它放进链接**。这一步不改任何
 AS3/渲染语义，只改**链接图**。
 
-**第二步（评估，本文 §4–§12）**：把 §1.1 那 15 个接缝函数的**实现**从 SkParagraph 换成
+**体积收尾（已做完，本文 §3 的 L1/L2a）**：`-Wl,-dead_strip -Wl,-x` 与 0.80 MB 的 ICU 数据包。
+同样不碰语义，是把"链进来了但从不执行/从不读取"的部分去掉。
+
+**第二步（评估，本文 §4–§11）**：把 §1.1 那 15 个接缝函数的**实现**从 SkParagraph 换成
 Rust 静态库。这一步会改语义，要重做全部排版校准。
 
 **不在范围内**：`TextField` 的 AS3 语义本身（见 [`flash-text.md`](flash-text.md)）；
-Skia 的整体集成与 Metal 后端（见 [`skia.md`](skia.md)）；SWC 静态文本烘焙（见 [`swc.md`](swc.md)）；
-"前端 TS 要不要转 Rust"（结论见 §11）。
+Skia 的整体集成与 Metal 后端（见 [`skia.md`](skia.md)）；SWC 静态文本烘焙（见 [`swc.md`](swc.md)）。
+前端保持 TypeScript（不转 Rust），那是与本议题无关的独立决定，本文不再讨论。
 
 **唯一 oracle**：AIR 51.4.1 的 `adl`。凡本文提到"对得上/对不上"，都以 `adl` 逐值为准
 （AGENTS §1.5）。
@@ -225,6 +232,9 @@ warning: flash.text is not linked into this build, so every TextField operation 
 若搬去文本半边，这个构建会直接链接失败。两个 `--air-app` 示例（`air-starling-demo` 8.97 MB、
 `air-native` 7.43 MB）也已实编通过。
 
+> 表中"用文本的程序不变"是**本阶段**的事实：紧接着的阶段二百二十二用 L1 + L2a 把同一份程序
+> 压到 **6.05 MB**（§3.1、§10）。两刀切的是"链进来但不可达/读不到"的部分，与拆分互不替代。
+
 ### 2.7 这次拆分的四个坑（都写进注释了）
 
 | 坑 | 症状 | 处理 |
@@ -236,23 +246,86 @@ warning: flash.text is not linked into this build, so every TextField operation 
 
 ---
 
-## 3. 第二步的账：拆完之后还剩多少
+## 3. 第二步的账：拆完之后还剩多少（已全部结算）
 
-拆分把"画不画文字"的差**明确化**了：现在它是一笔**可选的 12.90 MB**，而不是"人人有份"。
-剩下可做的，按"风险 / 收益"排序：
+拆分把"画不画文字"的差**明确化**了：它从"人人有份"变成一笔**可选的 12.90 MB**。
+剩下的三项已经在阶段二百二十二全部量完、落地两项、否掉两项，见下表（数字都是同一份产物逐档加料量的）：
 
-| 路线 | 做法 | 预期收益 | 风险 | 状态 |
+| 路线 | 做法 | 实测收益 | 风险 | 状态 |
 |---|---|---|---|---|
-| **L0** | **本次拆分**（不用文本 → 不链文本栈） | **−12.90 MB**（对不用文本的构建） | 已消化 | ✅ **已完成** |
-| **L1** | 链接期 `-Wl,-dead_strip`（`build.ts` 里 `grep` 不到） | **−2.74 MB**（全构建） | 低（ObjC 类别 / typeinfo 在 `-dead_strip` 下需全量回归验证） | ⏸ 未做（§10） |
-| **L2** | Skia 重编：`skia_use_icu=false` + `skia_use_icu4x=true` | 可能砍掉 10.19 MB 的大部分 | 中（需验 SkParagraph 的断行/bidi 仍对） | ⏸ 未做 |
-| **L3** | Skia 重编：`skia_use_libgrapheme=true` + `skia_use_icu=false` | 同上，更激进 | 高（libgrapheme **不做 bidi**） | ⚠️ 一般不建议 |
-| **L4** | 裁 `air-app.ts` 里 1:1 列出的 codec（`skottie`/`svg`/`dng_sdk`/`piex`/`expat`） | ~2.5 MB | 低 | 部分被 L1 覆盖 |
-| **L5** | **换 Rust 文本引擎**（本文第二步） | 对**用文本**的构建再省 ~13 MB | **高**（§9 B1/B2） | ⏸ 只在移动端 + 体积硬约束时 |
+| **L0** | **拆分**（不用文本 → 不链文本栈） | **−12.90 MB**（对不用文本的构建） | 已消化 | ✅ 已完成（阶段二百二十一） |
+| **L1** | 链接期 `-Wl,-dead_strip -Wl,-x` | 不画字 **−2.98 MB**、画字 **−3.92 MB**、Skia app **−5.17 MB** | 低（全量 429 项回归验过 ObjC 类别/typeinfo） | ✅ 已完成（阶段二百二十二） |
+| **L2a** | **换 ICU 数据包**：Skia 自己给 wasm 用的 `flutter/icudtl.dat`（0.80 MB） | 画字的构建再 **−9.46 MB** | 低（web 一直用的是同一份；全量回归绿） | ✅ 已完成（阶段二百二十二） |
+| **L2b** | Skia 重编：`skia_use_icu=false` + `skia_use_icu4x=true` | 与 L2a 目标重叠（都是 ICU 数据），L2a 已用 0.80 MB 把它拿掉 | 中（需 Rust 工具链 + 重编两端 + 重验排版） | ⏸ **已被 L2a 取代**，仅在需要 ICU4X 的 locale 能力时再看 |
+| **L3** | Skia 重编：`skia_use_libgrapheme=true` + `skia_use_icu=false` | 与 L2a 同级，但更激进 | 高（libgrapheme **不做 bidi**） | ⚠️ 否决 |
+| **L4** | 裁 `air-app.ts` 里 1:1 列出的 codec（`skottie`/`svg`/`dng_sdk`/`piex`/`expat`） | **0 字节**（实测：删掉这些库产物一模一样） | — | ✅ 已被 L1 完全覆盖，**无需动手** |
+| **L5** | **换 Rust 文本引擎**（本文第二步） | 原本值是"用文本的构建再省 ~13 MB"，**那 13 MB 已经不在了**；现在最多再省 ≈2.7 MB | **高**（§9 B1/B2） | ⏸ 只在移动端 + 体积硬约束时 |
 
-**这张表的读法**：L0 已经拿到最大的一笔，而它**不需要碰任何排版语义**。L5 的收益与 L0
-**不叠加**——L0 省的是"不用文本的程序"，L5 省的是"用文本的程序剩下的那 13 MB"。只有当
-"用文本 + 体积硬约束"同时成立时，L5 才进入视野。
+**这张表的读法**：① L0 省的是"不用文本的程序"，L1 省的是"所有程序里链进但不可达的部分"，
+L2a 省的是"用文本的程序里读不到的数据"——三者互不叠加、也不互相替代，**都已落袋**。
+② L5 的卖点在阶段二百二十二之后大幅缩水：一个画文字的构建从 19.43 MB 降到 6.05 MB，
+其中 Skia+整形栈只剩 ~4.9 MB，而**换引擎要动的恰恰是这 4.9 MB**——用重新校准全部排版口径的
+代价去换 2.7 MB，只在"移动端 + 商店体积硬约束"下才值得（§11）。
+
+### 3.1 L1 与 L2a 是怎么落的（阶段二百二十二）
+
+**L1：`src/build.ts::linkTrimFlags`** —— `-Wl,-dead_strip` 让 ld64 **先丢不可达代码块、再解析块内引用**，于是胶水 `.o` 里提到而程序没调用的 Skia API 不再把 archive 成员拉进来（这也是 §2 那刀能兑现的前提）；`-Wl,-x` 砍的是 `__LINKEDIT` 里的**局部符号表**，全局符号不动。
+
+**刻意不做的三件，都留了数**：`-flto` 全链实测 **3,567,592 B vs 3,554,632 B（反而大 13 KB**，Skia archive 不带 bitcode）；ELF/COFF 的 `--gc-sections` 需要编译期 `-ffunction-sections -fdata-sections`（含每个预编译 archive）才有效，现在发出去只会得到"看起来在工作、其实零收益"的旗标，故整族不发；`--debug-info` 时不发 `-x`（那个构建就是要符号），`-dead_strip` 仍发。
+
+**L2a：`src/build.ts::icuDataPaths`** —— 数据源是 `vendor/skia/icu/icudtl_flutter.dat`（0.80 MB，与 Skia 自己给 wasm 用的是同一份），构建期汇编成 `.s` 再编成 `.o`（~0.2 s：3.4 MB 汇编文本 45 ms，汇编 155 ms），**作为普通对象塞在 `-l` 之前**。
+
+为什么这样就够：**archive 成员只在"它的符号还没定义"时才被拉取**。我们的对象先定义了 `_icudt69_dat`，`libskunicode.a` 里那个 10.19 MB 的成员就**根本不会被读**——不需要动 vendor 里的任何二进制，也就不存在"换掉 `.a` 之后被别人重新 provision 覆盖"的问题。
+
+三个坑（都写进注释了）：
+
+1. **`icudtl_dat.o` 有两份**：`libskunicode.a` 与 `libicu.a` 各一份，真正被链接的是 **skunicode 那份**（`-l skunicode` 在 `-l icu` 前面）。只换 `libicu.a` 时二进制**一个字节都没变**，且没有任何报错。——这条陷阱在落地方案下**已经不存在**（我们定义符号、不是换 `.a`），但它留下了两条静默面，见 §3.2。
+2. **Xcode 工程那条路要单独接**：那个 `.s` 必须作为**源文件**进 target（文件类型 `sourcecode.asm`），否则走 Xcode 构建的 App 又会付回 10.19 MB。
+3. **`--dry` 不能写文件**：汇编源由 runner（`index.ts`）在跑步骤前物化，命令组装阶段（`buildCompileSteps`）一个字节都不写，所以预演天然干净——不是靠 `if (dry)` 分支堵出来的。
+
+### 3.2 把两处静默面收口（阶段二百二十三）
+
+§3.1 的两个杠杆各自留下一处**静默**：对象路径共享、ICU 判据挂错了条件。两处都不改任何语义，但都能让体积悄悄涨回去、或让构建悄悄链错东西，故都收口。
+
+**一、对象文件按「配置」分目录（`src/build.ts::objectDir`）**
+
+对象文件是**整份**参与链接的（§2.1），内容是**编译它的那组旗标**的函数——所以「一个源文件一个路径」只在所有构建都同意那组旗标时才成立，而它们不同意：示例套件里 `examples/swc-bitmap.build.json` 编 `vendor/window_glue.cc` 时不带 GPU 后端，away3d / air-native 那几张清单带 `ASC_RENDER_METAL`，而它们**并发**跑（`test/examples.ts`，jobs = min(核数, 6)），两条都写 `vendor/window_glue.o`。实测同一源文件两组宏的对象大小：**29,216 B vs 30,896 B**（`skia_glue.cc` 是 33,416 vs 38,200），⇒ 谁后编完谁说了算：另一条要么拿到自己没申请的通道，要么（手工重链残留对象时）以 `Undefined symbols: _sk_window_show_gpu` 收场。
+
+修法：对象落在 `$TMPDIR/as-aot-obj/<配置指纹>-<构建进程 pid>/<源路径指纹>-<基名><后缀>.o`，指纹覆盖编译器、target、`-O`、perf/fp/debug 旗标、defines、include 路径（**不排序**——`-I` 顺序决定哪个头文件赢）。**不做缓存**：每个源仍然每次重编，只是不再互相回答。阶段八十九·三十二 的 `.wasm.o` 后缀保留，作为可读的第二道闸。目录名里为什么还要 pid、以及成功后整个目录为什么被删掉，见下面的「三」。
+
+**二、ICU 判据从「链了 `-l icu`」改成「文本引擎进链接了」+ 版本金丝雀**
+
+原来的守卫是 `linkLibs.includes('icu')`，看着等价其实不是：清单里只要漏了 `icu`，那个数据成员仍由 `libskunicode.a` 自己带上，于是替换被跳过、10.19 MB 又跟了进来。实测 `examples/tf-scale-metrics.as` 去掉 `-l icu`：**15,510,408 B（15.51 MB）而非 6,049,032 B（6.05 MB）**，退出码 0、一个字都不说。现在判据只看 `ASC_HAVE_TEXT`（文本引擎是唯一消费者；对象没人引用时 `-dead_strip` 会丢掉，所以放宽是安全方向）。
+
+再加一条**金丝雀**：`nm -g libskunicode.a` 读出它期望的 `_icudtNN_dat`，与 `.dat` 标记比对，不一致就**报一行**（「两套数据都会链进来，+9.46 MB，仅体积」）。符号带版本号 ⇒ 不一致不可能产生错数据、只会让体积悄悄回去——**正因为唯一的症状是体积，才必须报出来**。
+
+**三、共享写路径本身就是竞态（对象必须按构建进程私有）**
+
+这是「一」只按配置分目录**没堵住**的那半，而且它不是推理出来的，是把红了的套件跑出来的：`node test.ts` 三轮里红两轮，失败的单元是 `textfield/ (Main.as, UiMain.as, entry.as)`，报错一行：
+
+```
+ld: file is empty in '.../vendor/skia/icu/icudtl_flutter.o'
+clang++: error: linker command failed with exit code 1
+```
+
+机理：ICU 数据对象当时**故意共享**（「字节对每个构建都一样，共享才能只汇编一次」），但那条汇编步骤**每次文本构建都跑**，而 `clang -c` 是**先开（截断）输出文件、编译完再写**——于是那 800 KB 的 `.o` 在整整 ~150 ms 里是**空文件**，此刻另一条构建正在链接它。教训写进注释了：**内容相同不等于共享安全**，非原子覆盖只有「路径私有」能救。
+
+修法（三条一起）：① `objectDir` 带 `-<pid>`，两个构建**连名字都撞不上**；② ICU 的 `.s`/`.o` 也进这个目录（`icuDataPaths`），源树里只剩被跟踪的 `.dat`，`.gitignore` 里那条 `vendor/skia/icu/*.s` 随之删除；③ 链接成功后 `cleanObjectScratch` 把整个目录删掉（文本构建约 3 MB），**失败则刻意保留**——那是事后分析要的现场，这也正是回收点写在 `index.ts` 而不是 `finally` 的原因。顺带把「组装命令行会写盘」这个副作用也挪走了：建目录改在 `runCompile`（`ensureOutDir`），所以 `buildCompileSteps` 变成纯函数。
+
+实测（`temp/pitfall/stress-shared-obj.sh`，120 次并发文本构建共用一个配置）：
+
+| 版本 | 失败 | 症状 |
+|---|---|---|
+| 修复前（共享路径、无回收） | **9 / 120** | `ld: file is empty in .../icudtl_flutter.o` |
+| 修复后（按 pid 私有 + 成功后回收） | **0 / 120** | — |
+
+`--dry` 的行为不变（打印对象路径、不创建任何东西），但现在是**结构上**成立：组装阶段不碰文件系统。Xcode 那条路另说一句——`.s` 改成写进**生成出来的工程目录**（自包含，Xcode 在本进程退出后很久才编它），源树保持只有输入。
+
+| 场景 | 收口前 | 收口后 |
+|---|---|---|
+| 文本构建，清单漏 `-l icu` | 15,510,408 B，静默 | **6,049,032 B** |
+| 两条不同宏的构建并发 | 共享 `vendor/*.o`，可串 | 各自独立目录，互不可见 |
+| vendor 树升到别的 ICU 大版本 | 静默 +9.46 MB | stderr 一行报明 |
 
 ---
 
@@ -268,7 +341,8 @@ warning: flash.text is not linked into this build, so every TextField operation 
 | `parley`（备选） | 断行 + 段落 | SkParagraph | 与 `swash` 同属 linebender，更活跃 |
 
 **关键取舍**：整形用 `rustybuzz` 意味着"语义同源"（对 AIR 对齐有利），但**省不掉整形逻辑本身**；
-真正省掉的只有 **ICU 的 unicode 数据表**（10.19 MB）与 HarfBuzz/C++ 那份实现。
+而"去掉 ICU 的数据表"这件事**已经不需要换引擎了**（L2a 已把 10.19 MB 换成 0.80 MB）——所以换 Rust
+真正能省的只剩 **HarfBuzz + SkParagraph 那份 C++ 实现，约 2.7 MB**（§3 表 L5 行）。
 
 ---
 
@@ -375,7 +449,7 @@ codegen-units = 1
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| P0 | ~~先做 §3 的低风险项~~：**L0 已完成**；余下 `-dead_strip`（L1）与 `icu4x`（L2） | 体积 + 全量回归 |
+| P0 | ~~§3 的低风险项~~：**L0 + L1 + L2a 全部已完成**（阶段二百二十一 / 二百二十二）；`icu4x`（L2b）已被 L2a 取代 | 体积 + 全量回归 |
 | P1 | 桌面 **A/B 双后端**（档 3）：同一份 `textfield` 示例跑两遍，用 `adl` 双端报告 diff 出**差异清单** | `flash-text.md` §5.1 数值报告 |
 | P2 | 按差异清单逐项校准；差异收敛后切默认 | 差异清单归零（或如实登记） |
 | P3 | 移动端 target 落地时，只在该 target 打开 Rust 后端 | 按 target 分层（`compile.md` §4.1） |
@@ -388,8 +462,8 @@ codegen-units = 1
 
 | 端 | 状态 | 现在谁在做文本 | 换 Rust 的**收益** | 换 Rust 的**代价/风险** | 结论 |
 |---|---|---|---|---|---|
-| **macOS native** | ✅ 已上线 | CoreText（字体）+ SkParagraph（排版）+ 本仓 CoreText 补丁 | 体积 ~13 MB | 丢掉 `skia.md` §6.9 的补丁收益、emoji（Apple Color Emoji）、全部 adl 校准 | ❌ 不做 |
-| **Windows native** | ✅ 已上线 | GDI + DirectWrite 双回退 + Uniscribe 整形 | 体积 ~13 MB | 要自建 DirectWrite 等价回退链；emoji（Segoe UI Emoji） | ❌ 不做 |
+| **macOS native** | ✅ 已上线 | CoreText（字体）+ SkParagraph（排版）+ 本仓 CoreText 补丁 | 体积 ~4.9 MB（L2a 之后；曾 ~13 MB） | 丢掉 `skia.md` §6.9 的补丁收益、emoji（Apple Color Emoji）、全部 adl 校准 | ❌ 不做 |
+| **Windows native** | ✅ 已上线 | GDI + DirectWrite 双回退 + Uniscribe 整形 | 体积 ~4.9 MB + 10.19 MB ICU 数据（Windows 尚未 port L2a，见 §10） | 要自建 DirectWrite 等价回退链；emoji（Segoe UI Emoji） | ❌ 不做 |
 | **Linux native** | ⛔ 未 provision | —（`vendor/skia/lib/` 无 linux） | — | — | ⛔ 无对象 |
 | **web (emcc)** | ✅ 已上线 | `SkFontMgr_New_Custom_Data` + 运行时注入 `font-urls` | 体积（wasm 文本栈归档 22.1 MB；`.wasm` 首屏体积可省 ~7 MB 量级） | 字体注入契约要重做；但**首屏体积收益相对量级最大** | ⚠️ **最有价值的一档** |
 | **WASI (raw)** | ✅ 已上线（无 GUI） | **无**（`as_skia_*` 全 0 桩，`runtime.ts:9592+`） | 0 | 0 | ⛔ 不涉及 |
@@ -408,8 +482,8 @@ codegen-units = 1
   `adl` IoU 100%。
 - **换 Rust 后**：这条补丁的收益自动消失（Rust 侧不走 CoreText），但会引入自己的字体匹配问题；
   Apple Color Emoji 的彩色渲染由 CoreText 提供，`swash` 在 CBDT/sbix 上偏弱。
-- **体积**：~13 MB。
-- **结论**：❌ **不做**。收益是纯体积，代价是已经钉住的全部行为。
+- **体积**：L2a 之后文本栈只剩 **~4.9 MB**（其中 ICU 数据 0.80 MB、Skia+整形 ~4.2 MB）；L2a 之前是 ~13 MB。
+- **结论**：❌ **不做**。收益是纯体积，代价是已经钉住的全部行为——而收益已经从 13 MB 缩到 4.9 MB。
 
 ### 7.2 Windows native
 
@@ -417,7 +491,7 @@ codegen-units = 1
   GDI 后端用 Uniscribe 整形（`air-app.ts:676` 注释）。Skia 库有 x64/x86 两套。
 - **换 Rust 后**：要自建等价回退链（`fontdb` 读 `C:\Windows\Fonts` 可行，但 DirectWrite 的
   script-aware fallback 要自己写）；emoji 走 Segoe UI Emoji。
-- **体积**：~13 MB（41.4 MB 归档 → 约 13 MB 可省，量级同 macOS）。
+- **体积**：~4.9 MB + 10.19 MB ICU 数据（41.4 MB 归档里被拉进来的部分；ICU 那 10.19 MB 在 Windows 上是 port L2a 就能拿掉的，见 §10）。
 - **结论**：❌ **不做**，理由同 macOS。
 
 ### 7.3 Linux native
@@ -473,8 +547,8 @@ codegen-units = 1
 
 | # | 优势 | 量级 / 证据 | 适用端 |
 |---|---|---|---|
-| A1 | **砍掉 ICU 数据块** | 10.19 MB 单对象，见 §3 | 全端 |
-| A2 | **砍掉 skunicode + harfbuzz + skshaper + paragraph** | 合计 ≈2.7 MB（本次拆分实测：省下的 12.90 − ICU 数据 10.19） | 全端 |
+| A1 | ~~砍掉 ICU 数据块~~ | **已不需要换引擎**：L2a 已把 10.19 MB 换成 0.80 MB（阶段二百二十二），要拿下这 9.4 MB 不必动排版 | 全端 |
+| A2 | **砍掉 skunicode + harfbuzz + skshaper + paragraph** | 合计 ≈2.7 MB（拆分实测：省下的 12.90 − ICU 数据 10.19；L2a 只动数据、不动这段代码）——**这是 L5 现在唯一还站得住的收益**（Skia 的画布/光栅化仍在，换引擎拿不走） | 全端 |
 | A3 | **纯 Rust 无 C++ 依赖** | 消除 `SK_TRIVIAL_ABI` / `-std=c++17` / MSVC ABI 互链等约束（`html5-web.md` §5.1、`provision/README.md`） | 全端 |
 | A4 | **静态库形态适配移动端** | iOS 无 `dlopen`，静态链是唯一形态 | iOS / Android |
 | A5 | **整形语义同源** | `rustybuzz` 是 HarfBuzz 的 Rust 移植 ⇒ 迁移风险低于换一门新整形器 | 全端 |
@@ -523,25 +597,32 @@ strut.setHeight((SkScalar)(box * am.rawFull / (am.rawSum * size)));   // skia_te
 
 ---
 
-## 10. 横向对比：拆分之后还能怎么瘦身
+## 10. 终态：三种构建的完整账
 
-**L0 已经落袋（§2.6）**，剩下三档互不冲突，成本相差一个数量级：
+三刀都已落地（L0 阶段二百二十一；L1/L2a 阶段二百二十二），下表是**同一批程序**逐档加料的实际字节数：
 
-| 路线 | 做法 | 预期收益 | 风险 | 建议 |
+| 构建 | 初始 | +L0 拆分 | +L1 | +L2a |
 |---|---|---|---|---|
-| **L1** | 链接期 `-Wl,-dead_strip`（当前完全没有） | **实测 −2.74 MB**（19.43 → 16.69，`temp/textsize/notxt_ds`） | 低（需全量回归验 ObjC 类别/typeinfo） | ✅ **下一步先做** |
-| **L2** | Skia 重编：`skia_use_icu=false` + `skia_use_icu4x=true` | 可能砍掉 10.19 MB 的大部分（ICU4X 数据是**模块化、可裁剪**的，且 ICU4X 本身是 **Rust**） | 中（需验 SkParagraph 的断行/bidi 仍对；`build-tools/skia-src` 已有重编流程） | ✅ **L1 之后立刻做** |
-| **L4** | 裁 `air-app.ts` 里 1:1 列出的 codec（`skottie`/`svg`/`dng_sdk`/`piex`/`expat`） | ~2.5 MB | 低 | 已被 L1 部分覆盖 |
+| 不画文字（`draw-over`） | 19.43 MB | 6.53 MB | **3.55 MB** | 3.55 MB（无 ICU，不变） |
+| 画文字（`tf-scale-metrics`） | 19.43 MB | 19.43 MB | 15.51 MB | **6.05 MB** |
+| `--air-app air-native`（Metal+SDL+curl+文本） | 23.97 MB | — | 18.80 MB | **9.34 MB** |
 
-> L2 值得强调：**ICU4X 是 Rust**。也就是说"用 Rust 的 unicode 库"这个想法**不必**通过替换
-> 整个文本引擎来实现——Skia 自己就留了 `skia_use_icu4x` 这个开关，代价只是重编一次 Skia。
-> **先用 L2 把 ICU 数据块换掉，再决定要不要动文本引擎。**
+画文字的构建 19.43 → 6.05 MB（**−69%**），Skia app 23.97 → 9.34 MB（**−61%**），不画文字的 19.43 → 3.55 MB（**−82%**）。
+画文字构建剩下的 6.05 MB 里，ICU 数据 0.80 MB、Skia+整形栈约 4.2 MB、我们自己的运行时与 C 约 1.0 MB。
 
-`build-tools/skia-src/out/{macos-arm64,wasm}/args.gn` 现状（两个文件一致）：
+**两项明知的缺口（如实报明，未做）**：
+
+| 平台 | 状态 |
+|---|---|
+| **Windows** | `icudtl_dat.obj` 在 `skunicode.lib` 里且是 COFF，需在 Windows 上重编数据对象；本机无法验证 ⇒ **Windows 仍付 10.19 MB** |
+| **Linux** | 没有 Skia 预编译树；且 `--gc-sections` 需先给编译期加 `-ffunction-sections -fdata-sections`（含预编译 archive），属独立工程 ⇒ **未做也未发旗标** |
+
+`build-tools/skia-src/out/{macos-arm64,wasm}/args.gn` 现状（两个文件一致，`skia_use_icu` 保持 `true`——
+L2a 换的是**数据包**，不是 ICU 实现）：
 
 ```
 skia_use_icu = true
-skia_use_icu4x = false          ← ICU4X 本身是 Rust 的模块化 unicode 库
+skia_use_icu4x = false          ← 只有真要 ICU4X 的 locale 能力时才需要
 skia_use_libgrapheme = false
 skia_use_harfbuzz = true
 skia_enable_skparagraph = true
@@ -550,49 +631,34 @@ skia_enable_skshaper = true
 
 ---
 
-## 11. 顺带澄清："那前端 TS 要不要转 Rust"
-
-**两件事，不要混。**
-
-| 问题 | 含义 | 影响 | 结论 |
-|---|---|---|---|
-| A. 产物是什么语言 | 生成 C → 生成 Rust | 运行时架构、体积、语义 | ❌ 不采（有环 GC / `setjmp` 异常 / "可读 C" 三条硬伤） |
-| B. 编译器用什么写 | 前端 TS → Rust | 只影响编译器自身的分发 | ❌ 不采（~55k 行可移植，运行时那份 736 KB C 原样保留 ⇒ "转了 Rust 仍生成 C"） |
-| C. **本文的**：把某个**原生组件**换成 Rust 静态库 | `vendor/` 多一个 `.a` | 体积 / 免 Node | ⏸ **唯一正当形态，且只在移动端 + 体积硬约束时** |
-
-C 与前两者**正交**：它不碰生成的 C、不碰前端、不碰运行时——只在 `vendor/` 加一个静态库，
-经构建清单的 `objects` 链接。这也正是 §2.9 允许的形态。
-
----
-
-## 12. 触发条件与决策树
+## 11. 触发条件与决策树
 
 ```
 体积是硬约束？
-├─ 否 ──────────────────────────► 不做 L5。文本栈 ≈13 MB 是"能忍"的成本，
-│                                 而 §9 B1/B2 的重校准成本远大于收益。
-│                                 （但 L0 已经让不画文字的构建白赚 12.9 MB。）
+├─ 否 ──────────────────────────► 不做 L5。L0/L1/L2a 已经自动生效，什么都不用做。
 └─ 是
    ├─ 该构建画文字吗？
    │  ├─ 否 ──► 已经自动解决（阶段二百二十一），不需要任何人做决定。◄── 已落袋
    │  └─ 是
-   │     ├─ 该端有 Skia 的预编译库可重编？
-   │     │  ├─ 是 ──► 先做 L1(-dead_strip) + L2(icu4x)。到这一步通常已经够了。◄── 推荐终点
-   │     │  └─ 否 ──► 先 provision（Linux/Android 都还没 Skia 库）
-   │     └─ L1+L2 之后仍不够？
-   │        └─ 是 ──► 才轮到 L5（Rust 文本引擎），
-   │                  且**只在该 target 打开**（targets.<target> 分层，替换语义）
+   │     ├─ 该端是 macOS？
+   │     │  ├─ 是 ──► 已经自动解决（L1+L2a，阶段二百二十二）。6.05 MB，通常已经够了。◄── 已落袋
+   │     │  └─ 否 ──► 先把本阶段的两刀 port 过去（§10 缺口表：Windows 的 COFF 数据对象、
+   │     │             Linux 的 provision + 编译期分节），别急着换引擎
+   │     └─ port 完之后仍不达标？
+   │        └─ 是 ──► 才轮到 L5（Rust 文本引擎），且**只在该 target 打开**
+   │                   （targets.<target> 分层，替换语义）；预期收益约 2.7 MB，不是 13 MB
 ```
 
-**具体触发**（三条同时成立才启动 L5）：
+**具体触发**（四条同时成立才启动 L5）：
 
 1. `--target ios` 或 `--target android` **已落地**（现在是"规划"，`compile.md` §6.1）；
 2. 该端的**体积被外部硬约束**（应用商店 / 首屏预算）；
-3. L1 + L2 已执行且**仍不达标**，并留下实测数据。
+3. L0/L1/L2a 在该 target 上**已生效**（含把 ICU 数据换成 0.80 MB 那份）；
+4. 仍然超标，并留下实测数据。
 
 ---
 
-## 13. 附录
+## 12. 附录
 
 ### A. 15 个接缝函数（现状全清单）
 
@@ -631,6 +697,32 @@ C 与前两者**正交**：它不碰生成的 C、不碰前端、不碰运行时
 | `notxt_o0` | 6,809,608 | 生成的 C 用 `-O0` 编，证明链接不依赖死代码消除 |
 | `tf`（用文本，拆分后） | 19,430,208 | `examples/tf-scale-metrics.as`，判成"有文本"，与基线同量级 |
 | `tf_notxt`（故意不链文本半边） | 6,548,376 | 跑起来打 §2.4 那三行警告，程序自检停在 `textWidth <= 0` |
+
+**B.1b 链接期两刀 + 小 ICU 数据（2026-10-21，macOS arm64，`temp/icuprobe/`）**
+
+| 构建 | 基线 | `-dead_strip` | `+ -x` | `+ 0.80 MB ICU 数据` |
+|---|---|---|---|---|
+| 不画字 `draw-over` | 6,531,688 | 4,345,176 | **3,554,632** | 3,554,632（无 ICU） |
+| 画字 `tf-scale-metrics` | 19,430,208 | 16,685,384 | 15,510,408 | **6,049,032** |
+| `--air-app air-native` | 23,968,296 | 20,772,344 | 18,797,064 | **9,335,688** |
+
+| 额外对照 | 结果 |
+|---|---|
+| LTO（`-flto` 全链） | 3,567,592 —— 比不带 LTO 的 **大 13 KB**，故不做 |
+| L4：链接行删掉 `skottie/sksg/svg/skresources/dng_sdk/piex/expat/bentleyottmann` | 3,554,632 —— **完全一样的字节**，故 L4 无需动手 |
+| 只换 `libicu.a` 的数据对象（不动 `libskunicode.a`） | 15,510,408 —— **一字节没变**（踩坑记录：真正被链接的是 skunicode 那份） |
+| 全量回归（换小 ICU 数据 + L1 两刀） | `node test.ts` **429 / 429 通过**、0 红、0 跳过 |
+
+**B.1c 两处静默面收口（2026-10-21，macOS arm64，`temp/pitfall/`）**
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 同一源文件、两组宏的对象大小 | `window_glue.cc` **29,216 vs 30,896 B**；`skia_glue.cc` **33,416 vs 38,200 B** | 证明「共享路径」真的会串 |
+| 文本构建 + 清单漏 `-l icu`（收口前） | 15,510,408 B，退出码 0，无输出 | `libskunicode.a` 自带数据成员 |
+| 同上（收口后） | **6,049,032 B** | 判据改为 `ASC_HAVE_TEXT` |
+| 文本 / 非文本两条构建**并发**跑 | **6,049,032 / 3,554,632 B**，都真跑通过 | 各自配置目录，已不可串 |
+| web 侧（`--package web`，emcc） | `hello-web` 5,868,096 B / `air-native` 7,428,052 B，对象落 wasm 配置目录 | `EMSDK_HOME=../build-tools/emsdk` |
+| 全量回归（收口后） | `node test.ts` **430 / 430 通过**、0 红、0 跳过 | 新增 `unit: build/ObjectPaths`（14 条） |
 
 **B.2 拆分前的原始测量（2026-10-20，`temp/textsize/`）**
 

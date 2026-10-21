@@ -123,7 +123,8 @@ as-aot app.as --manifest examples/skia-link.build.example.json
 
 # The text layout stack is linked only when the program uses flash.text; a program that draws no text
 # automatically drops the whole SkParagraph/HarfBuzz/ICU chain (measured 19.43 MB -> 6.53 MB, stage 221;
-# the build prints the + / - verdict)
+# the build prints the + / - verdict). Links also carry -Wl,-dead_strip -Wl,-x (symbols kept under
+# --debug-info), and ICU data is the 0.80 MB set: 3.55 MB text-free / 6.05 MB with text (stage 222)
 as-aot notxt.as --manifest examples/draw-over.build.json
 
 # Load AIR native extensions (ANE, stage one-hundred-seventy-eight): the host FRE runtime is wired in,

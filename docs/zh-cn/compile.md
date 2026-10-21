@@ -460,9 +460,15 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 （跳过反向域名第三方库目录 `com/org/net`，但显式回加 air-native demo 实际用到的 GreenSock 核心
 `TweenLite/TweenCore/SimpleTimeline/PropTween/TweenPlugin`）→
 在 app.xml 同目录写出 `<filename>.build.json`（链接 Skia + SDL2）→ 编链出 `<filename>` 可执行
-（**产物名与全部产物的落点**都可用 `-o` 覆盖：`-o` 决定 `base`，故生成的 `.c`、`.o`/`.lib`、
+（**产物名与全部产物的落点**都可用 `-o` 覆盖：`-o` 决定 `base`，故生成的 `.c`、
 `icudtl.dat`、暂存的 `extensions/` 与 `asaot.dll` 全跟着走 —— `-o bin-aot/App.exe` 即可让源码树
-零产物；运行期 `File.applicationDirectory` 与 `extensions/` 按 **exe 所在目录**解析，产物可整体搬走）。
+零产物。`.o` 例外：它是**中间产物**而非发行物，自阶段二百二十三 起落在**本次构建独占**的临时目录
+（`$TMPDIR/as-aot-obj/<配置指纹>-<构建进程 pid>/`，`--dry` 会打印真实路径），链接成功后整个目录
+被回收（失败则刻意保留，那才是事后分析想要的现场）。两道闸各自堵一类静默：对象内容是编译旗标
+的函数，两条配置不同的构建共用一条路径会互相串；而**即使内容完全相同**，`cc -o` 也是就地截断
+再写，两个构建共写一条路径会让**正在链接的一方读到空文件**（实测：示例套件并发六路文本构建，
+`ld: file is empty in .../icudtl_flutter.o`，三轮里红两轮）。运行期 `File.applicationDirectory` 与 `extensions/` 按
+**exe 所在目录**解析，产物可整体搬走）。
 
 #### 3.5.0 原生扩展从描述符来（不用拼 `--ane`）
 

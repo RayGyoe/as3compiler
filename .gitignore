@@ -10,6 +10,11 @@ node_modules/
 *.wasm
 build/
 
+# The ICU data input vendor/skia/icu/icudtl_flutter.dat is tracked; the assembler
+# source and object derived from it are NOT written here -- they go into the build's
+# own scratch under $TMPDIR (see src/build.ts::objectDir), so this tree has nothing
+# to ignore. A missing .dat is a loud failure in src/build.ts::icuBlob, not a fallback.
+
 # The npm publish artifact: src/*.ts -> dist/*.js, produced by scripts/build-dist.ts
 # (wired to `prepare`, so `npm pack` and `npm publish` regenerate it). It is a build
 # OUTPUT of tracked sources -- tracking it too would only give the next publish a

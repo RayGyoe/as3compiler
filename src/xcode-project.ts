@@ -15,7 +15,7 @@
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import type { BuildConfig } from './build.ts';
-import { platformFrameworks, platformLinkLibs, fpFlags, perfFlags, debugInfoFlags, effectiveDefines } from './build.ts';
+import { platformFrameworks, platformLinkLibs, fpFlags, perfFlags, debugInfoFlags, effectiveDefines, writeIcuAssembly } from './build.ts';
 import { parsePlist, serializePlist, asDict, asArray, scalarText, dictEntry, type PlistValue } from './pbxproj.ts';
 
 // A .xcodeproj is a directory containing project.pbxproj plus an optional
@@ -43,11 +43,22 @@ function oid(): string {
 // `<base>.xcodeproj` (with Info.plist embedded inside it), typically in the same
 // directory as the generated .c. Returns the project layout.
 export function generateXcodeProject(
-  cfg: BuildConfig,
+  cfgIn: BuildConfig,
   cPath: string,
   outDir: string,
   productName: string,
 ): XcodeProject {
+  // The ICU data blob (阶段二百二十二) is an ASSEMBLED source, not a library: the
+  // Xcode target has to compile it itself, or the app silently pays the archives'
+  // 10.19 MB default data set instead of the vendored 0.80 MB one. It is written into
+  // the generated project rather than next to the vendored .dat, so the project stays
+  // self-contained (Xcode builds it long after this process exits) and the source tree
+  // keeps only the tracked input. `writeIcuAssembly` writes nothing and answers false
+  // for text-free / non-native builds, so only text apps gain a file.
+  const asmPath = join(outDir, 'icudtl_flutter.s');
+  const cfg: BuildConfig = writeIcuAssembly(cfgIn, asmPath)
+    ? { ...cfgIn, sources: [...cfgIn.sources, asmPath] }
+    : cfgIn;
   const projectPath = join(outDir, `${productName}.xcodeproj`);
   const pbxDir = join(projectPath, 'project.pbxproj');
 
@@ -326,6 +337,10 @@ function fileType(path: string): string {
   // `enum`, `<cstdint>`) then fail to parse.
   if (/\.mm$/i.test(path)) return 'sourcecode.cpp.objcpp';
   if (/\.m$/i.test(path)) return 'sourcecode.c.objc';
+  // The generated ICU data blob is a .s: Xcode runs the assembler on it, which
+  // it only does when the file type says so (sourcecode.c.c would have it fed to
+  // the C compiler, which chokes on the .long directives).
+  if (/\.s$/i.test(path)) return 'sourcecode.asm';
   if (/\.(cc|cpp|cxx)$/i.test(path)) return 'sourcecode.cpp.cpp';
   return 'sourcecode.c.c';
 }

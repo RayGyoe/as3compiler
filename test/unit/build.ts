@@ -7,9 +7,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readdirSync, writeFileSync, readFileSync, mkdirSync, existsSync, copyFileSync, rmSync, statSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, linkTrimFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
@@ -1032,7 +1033,12 @@ function checkDocumentedLinkSets(): string[] {
     writeFileSync(cfile, cSource);
     const step = buildCompileSteps(cfg, cfile, join(scratch, s.name))[0];
     let firstError = '';
-    try { execFileSync(step[0], step.slice(1), { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS }); }
+    try {
+      // Same directory rule as production: the object lands in this build's own scratch
+      // under $TMPDIR, and the runner (not the builder) is what creates it.
+      ensureOutDir(step);
+      execFileSync(step[0], step.slice(1), { stdio: 'pipe', timeout: EXAMPLE_TIMEOUT_MS });
+    }
     catch (e) { firstError = String((e as { stderr?: Buffer }).stderr ?? e).split('\n')[0]; }
     check(`${s.name}: the generated C compiles under the manifest defines${firstError ? ` -- ${firstError}` : ''}`,
       firstError === '');
@@ -2405,3 +2411,257 @@ function checkTextEngineSplit(): string[] {
 }
 
 registerGroup('unit: build/TextEngineSplit', checkTextEngineSplit);
+
+// ---- link-time trimming + the small ICU data set (阶段二百二十二) ----------------
+// Two levers that shave what a Skia build ends up carrying WITHOUT touching text
+// semantics (docs/zh-cn/rust-text-backend.md §3 L1/L2a). Both are measured, and
+// both have a failure mode that is invisible at compile time, hence the pins:
+//
+//   L1 (`-Wl,-dead_strip -Wl,-x`) is only worth anything if it reaches the link
+//   command, and it must NOT reach it when the user asked for symbols.
+//
+//   L2a works by DEFINING `_icudtNN_dat` in our own object so the archive member
+//   holding the 10.19 MB default data set is never pulled. Two things must hold
+//   or the build silently pays the 9.4 MB again: the object has to precede the -l
+//   flags, and the .o has to be the small data set (the vendored .dat is the pin).
+function checkLinkTrim(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [trim] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [trim] ${label}`); }
+  };
+  const darwin = process.platform === 'darwin';
+  const text = (): BuildConfig => ({
+    ...defaultBuildConfig(),
+    cCompiler: 'clang',
+    sources: [join(root, 'vendor', 'skia_glue.cc'), join(root, 'vendor', 'skia_text_glue.cc')],
+    defines: ['ASC_USE_SKIA=1', 'ASC_HAVE_TEXT'],
+    linkLibs: ['skia', 'skunicode', 'icu'],
+  });
+  const linkStep = (cfg: BuildConfig): string[] => {
+    const steps = buildCompileSteps(cfg, 'x.c', 'x.out');
+    return steps[steps.length - 1];
+  };
+
+  // (1) The flags themselves.
+  check('native macOS link trims dead code and local symbols',
+    darwin && JSON.stringify(linkTrimFlags({ ...defaultBuildConfig() })) === JSON.stringify(['-Wl,-dead_strip', '-Wl,-x']));
+  check('--debug-info keeps its local symbols (dead_strip still applies)',
+    darwin && JSON.stringify(linkTrimFlags({ ...defaultBuildConfig(), debugInfo: true })) === JSON.stringify(['-Wl,-dead_strip']));
+  check('wasm links are untouched (its own --strip-debug covers it)',
+    JSON.stringify(linkTrimFlags({ ...defaultBuildConfig(), target: 'wasm' })) === JSON.stringify([]));
+
+  // (2) They actually reach the command, and the ICU object lands before every -l.
+  const link = linkStep(text());
+  check('the trim flags reach the real link command',
+    !darwin || (link.includes('-Wl,-dead_strip') && link.includes('-Wl,-x')));
+  const objAt = link.findIndex((a) => a.endsWith('icudtl_flutter.o'));
+  const firstL = link.findIndex((a) => a === '-l');
+  check('the ICU data object precedes the archive flags', objAt > 0 && firstL > objAt);
+  check('the single-command (pure C) path trims too',
+    !darwin || buildCompileCommand({ ...defaultBuildConfig(), target: 'native' }, 'x.c', 'x.out').includes('-Wl,-dead_strip'));
+
+  // (3) The object is only built when something consumes it. The gate is
+  // ASC_HAVE_TEXT, NOT "the manifest lists -l icu": the data member travels inside
+  // libskunicode.a too, so a manifest that links skia and forgets `icu` still shapes
+  // text -- and with the old gate it silently shipped the 10.19 MB set again
+  // (measured: examples/tf-scale-metrics.as at 15,510,408 B instead of 6,049,032 B,
+  // exit 0, not one word of output).
+  check('no text engine -> no ICU data object', icuDataPaths({ ...defaultBuildConfig(), linkLibs: ['icu'] }) === null);
+  check('wasm never assembles it (Skia wasm already ships flutter data)',
+    icuDataPaths({ ...text(), target: 'wasm' }) === null);
+  check('a text build assembles it even when the manifest omits -l icu',
+    icuDataPaths({ ...text(), linkLibs: ['skia'] }) !== null);
+
+  // (4) The vendored blob is the small one, and its symbol is derived, not guessed.
+  const dat = join(root, 'vendor', 'skia', 'icu', 'icudtl_flutter.dat');
+  check('the flutter ICU data set is vendored', existsSync(dat));
+  if (existsSync(dat)) {
+    const size = statSync(dat).size;
+    check('...and it is the small one (<1 MB, not the 10.19 MB desktop set)', size > 0 && size < 1_000_000);
+    const blob = readFileSync(dat);
+    const major = blob.subarray(blob.indexOf('icudt') + 5, blob.indexOf('icudt') + 7).toString('latin1');
+    check('...with a version marker', /^[0-9]{2}$/.test(major));
+    const obj = icuDataPaths(text());
+    check('a text build resolves the object', obj !== null);
+    if (obj) {
+      // 阶段二百二十三：the blob is an object like any other -- in this build's own
+      // scratch, never next to the tracked input (a shared path here is what let a
+      // sibling build's link read an empty file; see the ObjectPaths group below).
+      check('...built into this build\'s scratch, not the source tree',
+        obj.source.startsWith(tmpdir()) && !obj.source.startsWith(root) && obj.object.endsWith('icudtl_flutter.o'));
+      check('...materialised by the runner (the builder writes nothing)',
+        writeIcuAssembly(text(), obj.source) && existsSync(obj.source));
+      const asm = readFileSync(obj.source, 'utf8');
+      check(`...defining the symbol the archives use (_icudt${major}_dat)`,
+        asm.includes(`.globl _icudt${major}_dat`) && asm.includes(`_icudt${major}_dat:`));
+      check('...and carrying exactly the vendored bytes',
+        asm.split('\n').filter((l) => l.startsWith('\t.long ')).length * 4 >= statSync(dat).size);
+      check('...and reporting the version it defines', obj.version === major);
+    }
+
+    // (5) The substitute is checked as a PAIR (our blob + the archive that donates
+    // the member). A Skia upgrade to another ICU major would make the substitute
+    // unusable while both files still look perfectly fine -- the symptom is 9.46 MB
+    // reappearing with no other trace, so it must be a reported condition.
+    const realTree: BuildConfig = { ...text(), linkPaths: [join(root, 'vendor', 'skia', 'lib', 'macos-arm64')] };
+    check('the canary reads the version the linked archive expects',
+      !darwin || icuArchiveDataVersion(realTree) === major);
+    check('...which today matches the vendored blob (nothing to warn about)',
+      !darwin || icuArchiveDataVersion(realTree) === icuDataPaths(text())?.version);
+    check('an unreachable archive is "unknown", not a mismatch',
+      icuArchiveDataVersion({ ...text(), linkPaths: ['/nonexistent-archive-pin'] }) === null);
+  }
+
+  console.log(`     [trim] ${ok} check(s) passed`);
+  sweepOwnScratch();
+  return bad;
+}
+
+registerGroup('unit: build/LinkTrim', checkLinkTrim);
+
+// ---- per-config object paths (阶段二百二十三) ----------------------------------
+// Two faces of one defect. The first is silent: two builds that disagree on a flag
+// write the SAME object path, both succeed, and one links the other's code -- gaining a
+// channel its manifest never asked for, or failing with `Undefined symbols:
+// _sk_window_show_gpu` (seen when relinking leftover vendor objects by hand). Measured on
+// the real sources, vendor/window_glue.cc is 29,216 bytes without ASC_RENDER_METAL and
+// 30,896 with it, and the suite runs configs that use both at once.
+//
+// The second face is loud, and it is the one that actually cost us a red suite run: the
+// ICU data object was deliberately shared by every build ("identical bytes, so sharing is
+// free") while `clang -c` truncated it on every text build. Identical CONTENT does not
+// make a non-atomic overwrite safe -- a sibling link reads an empty file:
+// `ld: file is empty in .../icudtl_flutter.o`. So the rule pinned below is not "key the
+// path by config", it is stronger: the path is private to the build process.
+function checkObjectPaths(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [objpath] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [objpath] ${label}`); }
+  };
+  const base = (over: Partial<BuildConfig> = {}): BuildConfig => ({
+    ...defaultBuildConfig(),
+    cCompiler: 'clang',
+    sources: [join(root, 'vendor', 'skia_glue.cc')],
+    ...over,
+  });
+  // Every object a config produces (the compile steps) and the object the link
+  // step consumes, read out of the real command lines rather than recomputed.
+  const producedObjs = (cfg: BuildConfig): string[] =>
+    buildCompileSteps(cfg, 'x.c', 'x.out').slice(0, -1)
+      .map((s) => s[s.indexOf('-o') + 1])
+      .filter((p) => p.endsWith('.o'));
+
+  // (1) Two configs that disagree on anything that changes the bytes get different
+  // directories; the same config stays put.
+  const plain = producedObjs(base());
+  const svg = producedObjs(base({ defines: ['ASC_USE_SKIA=1', 'ASC_USE_SVG=1'] }));
+  check('two define sets never share an object', plain.every((p) => !svg.includes(p)) && svg.length > 0);
+  check('...while each keeps the readable source name',
+    plain.some((p) => p.endsWith('-skia_glue.o')) && svg.some((p) => p.endsWith('-skia_glue.o')));
+  check('the same config resolves to the same paths',
+    JSON.stringify(producedObjs(base())) === JSON.stringify(plain));
+  check('native and wasm never share a directory',
+    objectDir(base()) !== objectDir({ ...base(), target: 'wasm' }));
+  // -O and the include set are part of the key too; include ORDER is deliberately
+  // NOT normalized away, because -I order decides which header wins.
+  check('the optimisation level is part of the key', objectDir(base()) !== objectDir({ ...base(), opt: '-O0' }));
+  check('include PATHS are part of the key',
+    objectDir(base({ includePaths: ['/a'] })) !== objectDir(base({ includePaths: ['/b'] })));
+  check('...and so is their order (it picks which header wins)',
+    objectDir(base({ includePaths: ['/a', '/b'] })) !== objectDir(base({ includePaths: ['/b', '/a'] })));
+
+  // (2) The shared vendor path is gone. `vendor/skia_glue.o` was the whole bug.
+  check('no object lands next to the source any more',
+    plain.every((p) => !p.startsWith(join(root, 'vendor')) && p.startsWith(tmpdir())));
+  check('the generated C is compiled out of tree as well',
+    producedObjs(base()).every((p) => !p.startsWith(join(root, 'examples'))));
+
+  // (3) Two same-named sources from different directories cannot collide: the
+  // source PATH is hashed into the name, not just its basename.
+  const twins = producedObjs(base({
+    sources: [join(root, 'vendor', 'skia_glue.cc'), join(root, 'temp', 'pin', 'skia_glue.cc')],
+  }));
+  check('two same-named sources in different directories get different objects',
+    new Set(twins).size === twins.length && twins.length >= 3);
+
+  // (4) The compile half and the link half cannot drift apart: every object the
+  // steps produce is the exact path the link step consumes. A mismatch here is
+  // what makes a build link a stale object and pass.
+  const steps = buildCompileSteps(base(), 'x.c', 'x.out');
+  const produced = steps.slice(0, -1).map((s) => s[s.indexOf('-o') + 1]);
+  check('the link line consumes exactly the objects the compile steps produce',
+    produced.length > 0 && produced.every((p) => steps[steps.length - 1].includes(p)));
+
+  // (5) Composing a command line must not touch the filesystem: the output directory
+  // belongs to the runner (runCompile creates it), which is why `--dry` needs no special
+  // case and why the test layer leaves no scratch behind. The unique include path keeps
+  // this config's directory provably fresh for the whole process.
+  const probe = base({ includePaths: [`/nonexistent-objpath-pin-${process.pid}-${Date.now()}`] });
+  const probeDir = objectDir(probe);
+  const drySteps = buildCompileSteps({ ...probe, dry: true }, 'x.c', 'x.out');
+  check('--dry prints the object paths but creates nothing',
+    drySteps.length > 1 && !existsSync(probeDir));
+  check('...and neither does a real build, until it actually runs',
+    buildCompileSteps(probe, 'x.c', 'x.out').length === drySteps.length && !existsSync(probeDir));
+
+  // (6) Every object is private to the PROCESS that compiles it, which is what makes the
+  // write race impossible rather than unlikely: two builds cannot even name the same file.
+  // Reproduced on the old behaviour with temp/pitfall/stress-shared-obj.sh (120 concurrent
+  // builds sharing one config): 9 links died with `ld: file is empty in
+  // .../icudtl_flutter.o`, 0 after. The ICU data object below was the one the example
+  // suite actually hit, twice in three runs.
+  check('every object path is namespaced by the owning pid',
+    plain.length > 0 && producedObjs(base()).every((p) => p.includes(`-${process.pid}/`)));
+  const t1 = base({ defines: ['ASC_USE_SKIA=1', 'ASC_HAVE_TEXT'] });
+  const t2 = base({ opt: '-O0', defines: ['ASC_USE_SKIA=1', 'ASC_HAVE_TEXT'] });
+  const i1 = icuDataPaths(t1);
+  const i2 = icuDataPaths(t2);
+  check('the ICU data object is private as well (it was the shared one)',
+    process.platform !== 'darwin' ||
+      (i1 !== null && i2 !== null && i1.object !== i2.object && i1.object.includes(`-${process.pid}/`)));
+
+  // (7) The scratch belongs to one build, and it ends with that build: a successful link
+  // takes its objects with it (~3 MB for a text example), so repeated builds cannot pile
+  // up in the temp dir. A FAILED build keeps them on purpose -- that is the state a
+  // post-mortem wants -- which is why the call lives at the index.ts call site.
+  const swept = objectDir(base());
+  mkdirSync(swept, { recursive: true });
+  check('the scratch exists while the build is running', existsSync(swept));
+  cleanObjectScratch(base());
+  check('...and a successful build takes it away', !existsSync(swept));
+
+  // (8) Nothing is written into the source tree any more, not even the ICU assembler
+  // source (it used to be generated next to the tracked .dat, which is why .gitignore
+  // carried an entry for it). Build output belongs in the scratch.
+  const vendorIcu = join(root, 'vendor', 'skia', 'icu');
+  check('no build output lands in the vendored tree',
+    !existsSync(join(vendorIcu, 'icudtl_flutter.s')) && !existsSync(join(vendorIcu, 'icudtl_flutter.o')));
+
+  // Leave nothing behind: these checks drive the real command builder and materialise
+  // real inputs, so they name real directories. Sweeping by pid also exercises the
+  // naming rule itself.
+  sweepOwnScratch();
+
+  console.log(`     [objpath] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: build/ObjectPaths', checkObjectPaths);
+
+// Remove every scratch directory this test process created under $TMPDIR/as-aot-obj.
+// The checks drive the real command builder, so they name real directories; the build
+// cleans up after a successful link, but a process that only *composes* commands has
+// nothing of its own to clean, hence this sweep. Matching on the pid suffix is also what
+// keeps the naming rule honest: if a future change stops namespacing by pid, this stops
+// matching and the directories pile up visibly instead of being silently shared.
+function sweepOwnScratch(): void {
+  const baseDir = join(tmpdir(), 'as-aot-obj');
+  if (!existsSync(baseDir)) return;
+  for (const e of readdirSync(baseDir)) {
+    if (e.endsWith(`-${process.pid}`)) rmSync(join(baseDir, e), { recursive: true, force: true });
+  }
+}

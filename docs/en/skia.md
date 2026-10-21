@@ -148,6 +148,38 @@ shortcuts were measured and rejected: compiling the glue with `-ffunction-sectio
 | `vendor/skia_text_glue.cc` | text half (`sk_text_measure*`, `sk_canvas_draw_text*`, every `sk_textlayout_*`, the AIR line-box/strut conversions, device-font aliases) | only when the program uses `flash.text` (including text characters baked from an SWC) |
 | `vendor/skia_glue_internal.h` | the single shared declaration `sk_platform_fontmgr()` (C++ linkage, **deliberately not inline**) | header |
 
+#### 3.2 Two link-time cuts + an 0.80 MB ICU data set (stage 222)
+
+After the object split, two kinds of pure waste remained, and neither touches semantics: code that is
+**linked but unreachable**, and data that is **linked but never read**.
+
+- **`-Wl,-dead_strip -Wl,-x`** (`src/build.ts::linkTrimFlags`): the first makes ld64 drop unreachable
+  blocks before it resolves the references inside them, so a glue `.o` mentioning a Skia API the program
+  never calls stops pulling that archive member in; the second drops the local symbol table in
+  `__LINKEDIT` (global symbols survive). `--debug-info` builds get `-dead_strip` but not `-x` (they asked
+  for symbols). `--gc-sections` on ELF/COFF needs compile-time `-ffunction-sections -fdata-sections`
+  (including inside prebuilt archives) before it saves anything, so the whole family stays off; `-flto`
+  measured **13 KB larger** on this archive set and stays opt-in.
+- **ICU data**: the single-member `icudtl_dat.o` inside `libskunicode.a` holds the **whole desktop data
+  set** (10.19 MB). The build assembles `vendor/skia/icu/icudtl_flutter.dat` (0.80 MB — the same file
+  Skia ships for wasm) into an object and places it **before the `-l` flags**, defining `_icudt69_dat`
+  so the archive member is **never read**; no file under `vendor/` is modified. The assembled `.s`/`.o`
+  live in the scratch directory **private to one build** (`$TMPDIR/as-aot-obj/<config key>-<pid>/`)
+  like every other object, leaving only the tracked `.dat` in the source tree (see `docs/en/compile.md`
+  §3.5 and `rust-text-backend.md` §3.2). Line-breaking rules,
+  bidi properties and NFKC are all in the small set; the pruned parts are collation, locales, curr,
+  region, rbnf, translit, converters and unames.
+
+| Build | after the split | + both cuts | + small ICU data |
+|---|---|---|---|
+| text-free | 6.53 MB | **3.55 MB** | 3.55 MB |
+| draws text | 19.43 MB | 15.51 MB | **6.05 MB** |
+| `--air-app` Skia app | — | 18.80 MB | **9.34 MB** |
+
+Known gaps: **Windows** keeps its data object inside `skunicode.lib` as COFF and needs a rebuild on
+Windows (not verifiable here); **Linux** has no prebuilt tree and its section-level GC needs the
+compile-side flags. Both are logged in [`rust-text-backend.md`](rust-text-backend.md) §10.
+
 **The seam is unchanged**: the generated C still calls only those 15 `sk_*` functions
 (`runtime.ts:8763–8789`); only the implementation moved. **The font manager deliberately stays in the
 graphics half** — the SVG rasterizer hands it to `SkSVGDOM` for `<text>`, and the web font injection
@@ -1108,9 +1140,9 @@ each have a 0.5 px residual (Skia's internal rounding direction for half pixels)
 > **Thinking of replacing this layout engine? Read [`rust-text-backend.md`](rust-text-backend.md) first** —
 > that document evaluates, platform by platform, the pros and cons of swapping SkParagraph for a
 > cosmic-text + swash static library, with the measured size account (the ICU data is **one indivisible
-> 9.71 MB object**, and **an application that draws no text pays it too**), and explains why the
-> conclusion is "do `-dead_strip` and `skia_use_icu4x` first; only touch the Rust backend for mobile
-> plus a hard size constraint".
+> 10.19 MB object**: since stage 221 it only follows builds that **draw text**, and stage 222 replaced it
+> with the 0.80 MB set Skia itself ships for wasm) ⇒ an engine swap would now save at most ~2.5 MB, and
+> only pays off on mobile targets under a hard size constraint.
 
 ---
 
