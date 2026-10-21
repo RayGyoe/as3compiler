@@ -12311,6 +12311,13 @@ static double as_dbg_frame_ms[AS_DBG_FRAME_CAP];
 static double as_dbg_gc_ms[AS_DBG_FRAME_CAP];
 static double as_dbg_sort_ms[AS_DBG_FRAME_CAP];
 static int as_dbg_frame_n = 0;
+// Render-path counters shared with the generated code (emit.ts): how many
+// subtrees were painted live vs. blitted from a bake inside the reporting
+// window. They separate "the frame got slower" from "the frame got slower
+// because the auto-bake gave up", which is the FPS question after the
+// AS_BAKE_MAX_PIXELS fallback.
+static int as_dbg_live_n = 0;
+static int as_dbg_cached_n = 0;
 static double as_dbg_prev_ms = 0.0;
 static int as_dbg_frame_on = -1;
 static size_t as_dbg_free_bytes = 0;
@@ -12350,15 +12357,17 @@ static void as_dbg_frame(double gc_ms) {
     for (int li = 0; li < GC_SMALL_CLASSES + 2; li++)
         for (gc_header* h = *gc_free_list_at(li); h != NULL; h = h->next) freeb += h->size;
     as_dbg_free_bytes = freeb;
-    fprintf(stderr, "FRAME n=%d p50=%.2f p95=%.2f p99=%.2f max=%.2f(worstgc=%.2f) over8ms=%d over17ms=%d | gcmax=%.2f gcavg=%.2f gcshare=%.1f%% | rss=%.0fMB heaptotal=%.0fMB inuse=%.0fMB/%ldobj segs=%zu freeb=%.0fMB\\n",
+    fprintf(stderr, "FRAME n=%d p50=%.2f p95=%.2f p99=%.2f max=%.2f(worstgc=%.2f) over8ms=%d over17ms=%d | gcmax=%.2f gcavg=%.2f gcshare=%.1f%% | rss=%.0fMB arena=%.0fMB heaptotal=%.0fMB inuse=%.0fMB/%ldobj segs=%zu freeb=%.0fMB | live=%d cached=%d\\n",
             n, as_dbg_sort_ms[n / 2], as_dbg_sort_ms[n * 95 / 100], as_dbg_sort_ms[n * 99 / 100],
             as_dbg_sort_ms[n - 1], as_dbg_gc_ms[worst], over8, over17,
             gc_max, gc_sum / (double)n, frame_sum > 0 ? 100.0 * gc_sum / frame_sum : 0.0,
-            as_system_private_memory() / 1048576.0, gc_heap_total_bytes() / 1048576.0,
+            as_system_private_memory() / 1048576.0, (double)as_arena_used_bytes() / 1048576.0, gc_heap_total_bytes() / 1048576.0,
             (double)gc_dbg_inuse_bytes() / 1048576.0, gc_dbg_inuse_count(), segs,
-            (double)as_dbg_free_bytes / 1048576.0);
+            (double)as_dbg_free_bytes / 1048576.0, as_dbg_live_n, as_dbg_cached_n);
     fflush(stderr);
     as_dbg_frame_n = 0;
+    as_dbg_live_n = 0;
+    as_dbg_cached_n = 0;
 }
 
 // System.gc(): force a stop-the-world collection. AIR exposes this for manual

@@ -15828,6 +15828,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // delegate to the button helper. That helper lives next to the state machine
     // (below, with the paint path), hence this forward declaration.
     this.line('static int as_sbtn_contains_local(SimpleButton* b, double lx, double ly);');
+    this.line('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly, int pick);');
     this.line('static bool as_pick_hit_local(DisplayObject* o, double lx, double ly);');
     this.line('static void* as_pick_hit_m(void* obj, double x, double y, double a, double b, double c, double d, double tx, double ty);');
     // The object's own local transform (translate * rotate * scale * userMatrix),
@@ -15923,22 +15924,40 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return lx >= l && lx <= r && ly >= t && ly <= b;');
     this.indent--;
     this.line('}');
-    // The MOUSE PICK region. For everything but a button it IS as_obj_hit_local
-    // above; a SimpleButton differs: AIR hit-tests a button through its HIT state,
-    // which is the very same predicate that decides hover (as_sbtn_contains_local).
-    // Why the box test cannot stand in: a "down-only" SWC button (a down record + a
-    // hit record, no up) is an INVISIBLE click target -- upState is NULL, so
-    // as_bounds_walk finds no box at all and the button could never be clicked. That
-    // is exactly the shape of 29 characters / 73 placements in the real app's
-    // skin.swc: the TalkMED personal-centre rows and the 选择企业 back arrow -- all
-    // dead to the mouse, while the Sprite-shaped buttons beside them
-    // (submitbtn/agreebtn) worked, which is what pointed here.
-    // NOTE hitTestPoint(x, y, false) keeps the bounding-box path above: a button with
-    // no up state reports a 0x0 box there, and that IS the measured AIR answer.
+    // The MOUSE PICK region: what the pointer may TARGET on this object.
+    //
+    // For a button it is the HIT state (see below). For everything else it is the
+    // object's PAINTED CONTENT -- the region hitTestPoint(x, y, true) reports -- and
+    // NOT the bounding box that its descendants span.
+    //
+    // Why the box is wrong here: as_obj_hit_local unions every descendant, so a
+    // container that paints nothing of its own answers "hit" for EVERY point inside
+    // its children's union, gaps between them included. AIR does not: a Sprite with
+    // no graphics is not a mouse target anywhere (that is why every Flash "catch the
+    // clicks over this panel" idiom draws a transparent fill first) and the gap
+    // between two shapes of one Sprite is a miss. This is not merely a wrong target
+    // REPORT: the box-hitting container is usually an empty layer added for later
+    // popups, i.e. it sits ON TOP of the app's real widgets and swallows their
+    // clicks. Measured on the TalkMED meeting client (ASC_MOUSE_TRACE=2,
+    // temp/applog): every point of the document/video pane's box -- the bottom
+    // toolbar and the header buttons included -- picked
+    // com.vsdevelop.proxy::ViewControl, an empty popup layer, while the buttons
+    // beneath it were never reached.
+    //
+    // Why a button differs: AIR hit-tests a button through its HIT state, which is
+    // the very same predicate that decides hover (as_sbtn_contains_local). A
+    // "down-only" SWC button (a down record + a hit record, no up) is an INVISIBLE
+    // click target -- upState is NULL, so as_bounds_walk finds no box at all and the
+    // button could never be clicked. That is exactly the shape of 29 characters /
+    // 73 placements in the real app's skin.swc: the TalkMED personal-centre rows and
+    // the 选择企业 back arrow -- all dead to the mouse, while the Sprite-shaped
+    // buttons beside them (submitbtn/agreebtn) worked, which is what pointed here.
+    // NOTE hitTestPoint(x, y, false) keeps the bounding-box path (as_obj_hit_local):
+    // a bounding box is what that flag asks for, so the two paths must not be merged.
     this.line('static bool as_pick_hit_local(DisplayObject* o, double lx, double ly) {');
     this.indent++;
     this.line('if (as_is((void*)o, &SimpleButton_vt)) return as_sbtn_contains_local((SimpleButton*)o, lx, ly) != 0;');
-    this.line('return as_obj_hit_local(o, lx, ly);');
+    this.line('return as_obj_region_hit_local(o, lx, ly, 1);');
     this.indent--;
     this.line('}');
     // ---- shape-flag hit test (stage 94·22) ----
@@ -15980,8 +15999,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return false;');
     this.indent--;
     this.line('}');
-    this.line('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly) {');
+    this.line('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly, int pick) {');
     this.indent++;
+    // `pick` selects the mouse-pick flavour of the same region: an invisible subtree
+    // is not a target (AIR never dispatches into one), and a SimpleButton contributes
+    // its HIT state instead of nothing. hitTestPoint(shapeFlag=true) passes 0 and keeps
+    // the measured behaviour -- it ignores `visible` and, for a button, answers false
+    // (Ed24 §2..§4).
+    this.line('if (pick && !o->visible) return false;');
     // A SimpleButton draws its STATES but owns no shape of its own (the four states
     // are separate DisplayObjects, per the SimpleButton docs). So its shapeFlag=true
     // region is EMPTY: adl answers false for hitTestPoint(x, y, true) on a button
@@ -15989,7 +16014,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // display list (temp/sbtnstate2, seven probes). The hitTestState is the *input*
     // hit area only -- that is what as_sbtn_contains uses for hover; it is not a
     // shape region, so it must NOT leak into hitTestPoint here.
-    this.line('if (as_is((void*)o, &SimpleButton_vt)) return false;');
+    this.line('if (as_is((void*)o, &SimpleButton_vt)) return pick ? as_sbtn_contains_local((SimpleButton*)o, lx, ly) != 0 : false;');
     this.line('if (as_shape_region_hit(o, lx, ly)) return true;');
     this.line('if (as_is((void*)o, &Bitmap_vt) || as_is((void*)o, &TextField_vt)) {');
     this.indent++;
@@ -16013,7 +16038,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double ia, ib, ic, id, itx, ity;');
     this.line('if (!as_mat_invert(ca, cb, ccn, cd, ctx, cty, &ia, &ib, &ic, &id, &itx, &ity)) continue;');
     this.line('double clx = ia * lx + ic * ly + itx, cly = ib * lx + id * ly + ity;');
-    this.line('if (as_obj_region_hit_local(ch, clx, cly)) return true;');
+    this.line('if (as_obj_region_hit_local(ch, clx, cly, pick)) return true;');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -16105,7 +16130,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (o == NULL) return false;');
     this.line('double lx = 0.0, ly = 0.0;');
     this.line('if (!as_local_point(o, x, y, &lx, &ly)) return false;');
-    this.line('return as_obj_region_hit_local(o, lx, ly);');
+    this.line('return as_obj_region_hit_local(o, lx, ly, 0);');
     this.indent--;
     this.line('}');
     this.line('static bool as_obj_hit(void* obj, double x, double y) {');
@@ -17164,6 +17189,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double sx_kx = sdo->x, sx_ky = sdo->y, sx_kr = sdo->rotation, sx_ksx = sdo->scaleX, sx_ksy = sdo->scaleY;');
     this.line('Matrix* sx_km = (sdo->transform != NULL) ? sdo->transform->matrix : NULL;');
     this.line('sdo->x = 0.0; sdo->y = 0.0; sdo->rotation = 0.0; sdo->scaleX = 1.0; sdo->scaleY = 1.0;');
+    this.line('double _bdt0 = as_now_ms();');
     this.line('if (sdo->transform != NULL) sdo->transform->matrix = NULL;');
     this.line('as_skia_canvas_scale(canvas, rs, rs);');
     this.line('as_render_object(canvas, sdo);');
@@ -17174,6 +17200,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (!as_skia_surface_read_argb(surface, owned, sw, sh)) { free(owned); as_skia_surface_delete(surface); ASC_render_scale = keep_render_scale; return; }');
     this.line('as_skia_surface_delete(surface);');
     this.line('sp = owned;');
+    this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _bdt1 = as_now_ms(); if (_bdt1 - _bdt0 >= 3.0) fprintf(stderr, "t=%.0f pass capture-rast ms=%.2f %dx%d rs=%.3f\\n", as_now_ms(), _bdt1 - _bdt0, sw, sh, rs); }');
     this.indent--;
     this.line('} else if (as_is(src, &BitmapData_vt)) {');
     this.indent++;
@@ -17197,34 +17224,76 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('ASC_render_scale = keep_render_scale;');
+    // The sampler maps every destination texel back through the inverse matrix, and
+    // the two shapes below are the same arithmetic: (a) the exact 1:1 case, where the
+    // destination texel IS the source texel, so a plain copy is bit-identical to the
+    // bilinear result (fx == fy == 0 collapses the four weights to (1,0,0,0)); (b) the
+    // general affine case, which walks the source coordinate incrementally instead of
+    // re-evaluating the matrix per texel. Both keep the SourceOver rule of as_bd_over:
+    // a fully transparent source texel leaves the destination alone.
     this.line('unsigned* dp = (unsigned*)bd->pixels;');
     this.line('double rm = 1, gm = 1, bm = 1, am = 1, ro = 0, go = 0, bo = 0, ao = 0;');
     this.line('if (ct != NULL) { rm = ct->redMultiplier; gm = ct->greenMultiplier; bm = ct->blueMultiplier; am = ct->alphaMultiplier; ro = ct->redOffset; go = ct->greenOffset; bo = ct->blueOffset; ao = ct->alphaOffset; }');
-    this.line('for (int dy = cy0; dy < cy1; dy++) { for (int dx = cx0; dx < cx1; dx++) {');
-    this.indent++;
-    // Source coordinates are in raster pixels, and the raster was taken at rs
-    // bitmap pixels per source unit (see above).
-    this.line('double scx = (ia * (dx + 0.5) + ic * (dy + 0.5) + itx) * rs;');
-    this.line('double scy = (ib * (dx + 0.5) + id * (dy + 0.5) + ity) * rs;');
-    this.line('unsigned sr = 0, sg = 0, sb = 0, sa = 0;');
-    this.line('if (!smoothing) { int sx = (int)floor(scx), sy = (int)floor(scy); if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) continue; unsigned c = sp[sy * sw + sx]; sr = (c >> 16) & 0xFF; sg = (c >> 8) & 0xFF; sb = c & 0xFF; sa = c >> 24; }');
-    this.line('else { double u = scx - 0.5, v = scy - 0.5; int x0 = (int)floor(u), y0 = (int)floor(v); double fx = u - x0, fy = v - y0; unsigned c00 = 0, c10 = 0, c01 = 0, c11 = 0;');
-    this.indent++;
-    this.line('if (x0 >= 0 && y0 >= 0 && x0 < sw && y0 < sh) c00 = sp[y0 * sw + x0];');
-    this.line('if (x0 + 1 >= 0 && y0 >= 0 && x0 + 1 < sw && y0 < sh) c10 = sp[y0 * sw + x0 + 1];');
-    this.line('if (x0 >= 0 && y0 + 1 >= 0 && x0 < sw && y0 + 1 < sh) c01 = sp[(y0 + 1) * sw + x0];');
-    this.line('if (x0 + 1 >= 0 && y0 + 1 >= 0 && x0 + 1 < sw && y0 + 1 < sh) c11 = sp[(y0 + 1) * sw + x0 + 1];');
-    this.line('double w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;');
-    this.line('sa = (unsigned)((c00 >> 24) * w00 + (c10 >> 24) * w10 + (c01 >> 24) * w01 + (c11 >> 24) * w11 + 0.5);');
-    this.line('sr = (unsigned)(((c00 >> 16) & 0xFF) * w00 + ((c10 >> 16) & 0xFF) * w10 + ((c01 >> 16) & 0xFF) * w01 + ((c11 >> 16) & 0xFF) * w11 + 0.5);');
-    this.line('sg = (unsigned)(((c00 >> 8) & 0xFF) * w00 + ((c10 >> 8) & 0xFF) * w10 + ((c01 >> 8) & 0xFF) * w01 + ((c11 >> 8) & 0xFF) * w11 + 0.5);');
-    this.line('sb = (unsigned)((c00 & 0xFF) * w00 + (c10 & 0xFF) * w10 + (c01 & 0xFF) * w01 + (c11 & 0xFF) * w11 + 0.5);');
-    this.indent--;
+    this.line('const int _dw2 = bd->width, _dh2 = bd->height;');
+    this.line('const int _hasct = (ct != NULL);');
+    this.line('const double _dscx = ia * rs, _dscy = ib * rs;');
+    this.line('double _smp0 = as_now_ms();');
+    this.line('if (getenv("ASC_PASS_TRACE") != NULL) fprintf(stderr, "t=%.0f capture-xform ia=%.4f ib=%.4f ic=%.4f id=%.4f tx=%.3f ty=%.3f rs=%.3f sm=%d\\n", as_now_ms(), ia, ib, ic, id, itx, ity, rs, (int)smoothing);');
+    this.line('if (!_hasct && rs == 1.0 && ia == 1.0 && ib == 0.0 && ic == 0.0 && id == 1.0 && itx == 0.0 && ity == 0.0) {');
+    this.line('    for (int dy = cy0; dy < cy1; dy++) {');
+    this.line('        if (dy < 0 || dy >= sh || dy >= _dh2) continue;');
+    this.line('        int x0 = (cx0 < 0) ? 0 : cx0;');
+    this.line('        int x1 = (cx1 > sw) ? sw : cx1;');
+    this.line('        if (x1 > _dw2) x1 = _dw2;');
+    this.line('        unsigned* dr = dp + (size_t)dy * (size_t)_dw2;');
+    this.line('        const unsigned* sw_ = sp + (size_t)dy * (size_t)sw;');
+    this.line('        for (int dx = x0; dx < x1; dx++) {');
+    this.line('            unsigned c = sw_[dx];');
+    this.line('            unsigned a = c >> 24;');
+    this.line('            if (a == 255) { dr[dx] = c; continue; }');
+    this.line('            if (a == 0) continue;');
+    this.line('            as_bd_over(dp, _dw2, dx, dy, (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF, a);');
+    this.line('        }');
+    this.line('    }');
+    this.line('} else {');
+    this.line('    for (int dy = cy0; dy < cy1; dy++) {');
+    this.line('        if (dy < 0 || dy >= _dh2) continue;');
+    this.line('        double scx = (ia * ((double)cx0 + 0.5) + ic * ((double)dy + 0.5) + itx) * rs;');
+    this.line('        double scy = (ib * ((double)cx0 + 0.5) + id * ((double)dy + 0.5) + ity) * rs;');
+    this.line('        for (int dx = cx0; dx < cx1; dx++) {');
+    this.line('            unsigned sr = 0, sg = 0, sb = 0, sa = 0;');
+    this.line('            if (!smoothing) {');
+    this.line('                int sx = (int)floor(scx), sy = (int)floor(scy);');
+    this.line('                scx += _dscx; scy += _dscy;');
+    this.line('                if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) continue;');
+    this.line('                unsigned c = sp[(size_t)sy * (size_t)sw + sx];');
+    this.line('                sr = (c >> 16) & 0xFF; sg = (c >> 8) & 0xFF; sb = c & 0xFF; sa = c >> 24;');
+    this.line('            } else {');
+    this.line('                double u = scx - 0.5, v = scy - 0.5;');
+    this.line('                scx += _dscx; scy += _dscy;');
+    this.line('                int x0 = (int)floor(u), y0 = (int)floor(v);');
+    this.line('                double fx = u - (double)x0, fy = v - (double)y0;');
+    this.line('                unsigned c00 = 0, c10 = 0, c01 = 0, c11 = 0;');
+    this.line('                const unsigned* r0 = (y0 >= 0 && y0 < sh) ? (sp + (size_t)y0 * (size_t)sw) : NULL;');
+    this.line('                const unsigned* r1 = (y0 + 1 >= 0 && y0 + 1 < sh) ? (sp + (size_t)(y0 + 1) * (size_t)sw) : NULL;');
+    this.line('                if (r0 != NULL && x0 >= 0 && x0 < sw) c00 = r0[x0];');
+    this.line('                if (r0 != NULL && x0 + 1 >= 0 && x0 + 1 < sw) c10 = r0[x0 + 1];');
+    this.line('                if (r1 != NULL && x0 >= 0 && x0 < sw) c01 = r1[x0];');
+    this.line('                if (r1 != NULL && x0 + 1 >= 0 && x0 + 1 < sw) c11 = r1[x0 + 1];');
+    this.line('                double w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;');
+    this.line('                sa = (unsigned)((c00 >> 24) * w00 + (c10 >> 24) * w10 + (c01 >> 24) * w01 + (c11 >> 24) * w11 + 0.5);');
+    this.line('                sr = (unsigned)(((c00 >> 16) & 0xFF) * w00 + ((c10 >> 16) & 0xFF) * w10 + ((c01 >> 16) & 0xFF) * w01 + ((c11 >> 16) & 0xFF) * w11 + 0.5);');
+    this.line('                sg = (unsigned)(((c00 >> 8) & 0xFF) * w00 + ((c10 >> 8) & 0xFF) * w10 + ((c01 >> 8) & 0xFF) * w01 + ((c11 >> 8) & 0xFF) * w11 + 0.5);');
+    this.line('                sb = (unsigned)((c00 & 0xFF) * w00 + (c10 & 0xFF) * w10 + (c01 & 0xFF) * w01 + (c11 & 0xFF) * w11 + 0.5);');
+    this.line('            }');
+    this.line('            if (_hasct) { double rr = (sr * rm + ro), gg = (sg * gm + go), bb = (sb * bm + bo), aa = (sa * am + ao); if (rr < 0) rr = 0; if (rr > 255) rr = 255; if (gg < 0) gg = 0; if (gg > 255) gg = 255; if (bb < 0) bb = 0; if (bb > 255) bb = 255; if (aa < 0) aa = 0; if (aa > 255) aa = 255; sr = (unsigned)rr; sg = (unsigned)gg; sb = (unsigned)bb; sa = (unsigned)aa; }');
+    this.line('            if (sa == 0) continue;');
+    this.line('            if (sa == 255) { dp[(size_t)dy * (size_t)_dw2 + (size_t)dx] = (255u << 24) | (sr << 16) | (sg << 8) | sb; continue; }');
+    this.line('            as_bd_over(dp, _dw2, dx, dy, sr, sg, sb, sa);');
+    this.line('        }');
+    this.line('    }');
     this.line('}');
-    this.line('if (ct != NULL) { double rr = (sr * rm + ro), gg = (sg * gm + go), bb = (sb * bm + bo), aa = (sa * am + ao); if (rr < 0) rr = 0; if (rr > 255) rr = 255; if (gg < 0) gg = 0; if (gg > 255) gg = 255; if (bb < 0) bb = 0; if (bb > 255) bb = 255; if (aa < 0) aa = 0; if (aa > 255) aa = 255; sr = (unsigned)rr; sg = (unsigned)gg; sb = (unsigned)bb; sa = (unsigned)aa; }');
-    this.line('as_bd_over(dp, bd->width, dx, dy, sr, sg, sb, sa);');
-    this.indent--;
-    this.line('} }');
+    this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _smp1 = as_now_ms(); if (_smp1 - _smp0 >= 3.0) fprintf(stderr, "t=%.0f pass capture-sample ms=%.2f %dx%d\\n", as_now_ms(), _smp1 - _smp0, cx1 - cx0, cy1 - cy0); }');
     this.line('if (owned != NULL) free(owned);');
     this.indent--;
     this.line('}');
@@ -21128,7 +21197,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('double ha, hb, hc, hd, htx, hty;');
     this.line('as_do_matrix(hs, &ha, &hb, &hc, &hd, &htx, &hty);');
     this.line('double hlx = ha * lx + hc * ly + htx, hly = hb * lx + hd * ly + hty;');
-    this.line('return as_obj_region_hit_local(hs, hlx, hly) ? 1 : 0;');
+    this.line('return as_obj_region_hit_local(hs, hlx, hly, 0) ? 1 : 0;');
     this.indent--;
     this.line('}');
     this.line('static int as_sbtn_contains(SimpleButton* b, double x, double y) {');
@@ -21948,11 +22017,17 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // forget the filters branch or paint nothing at all.
     this.line('static void as_render_live(void* canvas, DisplayObject* o) {');
     this.indent++;
+    this.line('as_dbg_live_n++;');
+    this.indent--;
+    this.indent++;
     this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(canvas, o, o->filters, o->filters->length - 1);');
     this.line('else as_render_object_content(canvas, o);');
     this.indent--;
     this.line('}');
     this.line('static void as_render_cached(void* canvas, DisplayObject* o) {');
+    this.indent++;
+    this.line('as_dbg_cached_n++;');
+    this.indent--;
     this.indent++;
     this.line('double bl = 0.0, bt = 0.0, br = 0.0, bb = 0.0;');
     this.line('if (!as_render_bounds(o, &bl, &bt, &br, &bb)) {');
@@ -23092,12 +23167,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // commits without waiting because it orders the batch ahead of the composite
     // on the GPU side only (see as_s3d_flush_all_async).
     this.line('as_s3d_flush_all_async();');
+    this.line('double _p0 = as_now_ms();');
     this.line('#ifdef ASC_RENDER_WINGPU');
     this.line('if (w->is_gpu) { canvas = as_skia_gpu_begin_frame(id, w->pw, w->ph); if (canvas == NULL) return; }');
     this.line('else');
     this.line('#endif');
     this.line('{ canvas = w->canvas; if (canvas == NULL) return; }');
     this.line('if (st == NULL) return;');
+    this.line('double _p1 = as_now_ms();');
     this.line('ASC_win_scale = w->scale;');
     this.line('double cx = 1.0, cy = 1.0;');
     this.line('const char* sm = st->scale_mode;');
@@ -23186,9 +23263,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_render_object(canvas, (DisplayObject*)st);');
     this.line('ASC_caret_pass = 0;');
     this.line('as_skia_canvas_restore(canvas);');
+    this.line('double _p2 = as_now_ms();');
     this.line('#ifdef ASC_RENDER_WINGPU');
     this.line('if (w->is_gpu) as_skia_gpu_flush(id);');
     this.line('#endif');
+    this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _p3 = as_now_ms(); if (_p3 - _p0 >= 4.0) fprintf(stderr, "t=%.0f pass paint acquire=%.2f draw=%.2f flush=%.2f live=%d cached=%d\\n", as_now_ms(), _p1 - _p0, _p2 - _p1, _p3 - _p2, as_dbg_live_n, as_dbg_cached_n); }');
     this.indent--;
     this.line('}');
     // ---- mouse pointer shape (AIR parity) ----
@@ -23239,6 +23318,84 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // clobber it, and the release is exact -- these bodies have early returns, and a
     // guard left planted against a returned stack frame would disable every later
     // recovery.
+    // ---- ASC_MOUSE_TRACE=2: WHY did that pick happen? ----
+    // The chain of the picked object plus the DEEPEST object whose OWN painted
+    // content covers the point. Together they separate the three ways "the button
+    // stopped responding" can happen: the pick and the visual disagree (a hit-test
+    // bug), an ancestor with mouseChildren=false absorbs the hit (app structure), or
+    // a sibling layer is drawn on top (z-order).
+    this.line('static int as_dbg_own_content(DisplayObject* o, double lx, double ly) {');
+    this.indent++;
+    this.line('if (o == NULL) return 0;');
+    this.line('if (as_is((void*)o, &SimpleButton_vt)) return as_sbtn_contains_local((SimpleButton*)o, lx, ly) != 0;');
+    this.line('if (as_shape_region_hit(o, lx, ly)) return 1;');
+    this.line('if (as_is((void*)o, &Bitmap_vt) || as_is((void*)o, &TextField_vt)) { double l = 0.0, t = 0.0, r = 0.0, b = 0.0; if (!as_bounds_walk(o, 0, 0, &l, &t, &r, &b)) return 0; return lx >= l && lx <= r && ly >= t && ly <= b; }');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
+    this.line('static void* as_dbg_deep_content(void* obj, double x, double y, double a, double b, double c, double d, double tx, double ty) {');
+    this.indent++;
+    this.line('DisplayObject* o = (DisplayObject*)obj;');
+    this.line('if (o == NULL || !o->visible || o->_mask_object) return NULL;');
+    this.line('double ia = 0.0, ib = 0.0, ic = 0.0, id = 0.0, itx = 0.0, ity = 0.0;');
+    this.line('if (!as_mat_invert(a, b, c, d, tx, ty, &ia, &ib, &ic, &id, &itx, &ity)) return NULL;');
+    this.line('double lx = ia * x + ic * y + itx, ly = ib * x + id * y + ity;');
+    this.line('double oa = a, ob = b, oc = c, od = d, otx = tx, oty = ty;');
+    this.line('if (o->_scroll_rect != NULL) { Rectangle* sr = o->_scroll_rect; if (lx < 0 || ly < 0 || lx > sr->width || ly > sr->height) return NULL; otx -= oa * sr->x + oc * sr->y; oty -= ob * sr->x + od * sr->y; }');
+    this.line('if (as_is(obj, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* cc = (DisplayObjectContainer*)obj;');
+    this.line('if (cc->children != NULL) {');
+    this.indent++;
+    this.line('for (int i = cc->children->length - 1; i >= 0; i--) {');
+    this.indent++;
+    this.line('DisplayObject* ch = (DisplayObject*)as_v_obj_val(cc->children->data[i]);');
+    this.line('if (ch == NULL) continue;');
+    this.line('double ca = 1.0, cb = 0.0, ccn = 0.0, cd = 1.0, ctx = 0.0, cty = 0.0;');
+    this.line('as_do_matrix(ch, &ca, &cb, &ccn, &cd, &ctx, &cty);');
+    this.line('double ga = 1.0, gb = 0.0, gc = 0.0, gd = 1.0, gtx = 0.0, gty = 0.0;');
+    this.line('as_mat_mul(oa, ob, oc, od, otx, oty, ca, cb, ccn, cd, ctx, cty, &ga, &gb, &gc, &gd, &gtx, &gty);');
+    this.line('void* res = as_dbg_deep_content(ch, x, y, ga, gb, gc, gd, gtx, gty);');
+    this.line('if (res != NULL) return res;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('if (as_dbg_own_content(o, lx, ly)) return obj;');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('static const char* as_dbg_cls(void* o) { if (o == NULL) return "-"; as_vtable_header* vt = (as_vtable_header*)((as_object_header*)o)->vtable; if (vt == NULL) return "?"; if (vt->fqn != NULL && vt->fqn[0] != 0) return vt->fqn; return (vt->name != NULL) ? vt->name : "?"; }');
+    this.line('static int as_dbg_bad_n = 0;');
+    this.line('static void as_dbg_bad_bounds(DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o == NULL || as_dbg_bad_n >= 24) return;');
+    this.line('double l = 0.0, t = 0.0, r = 0.0, b = 0.0;');
+    this.line('if (as_bounds_walk(o, 0, 0, &l, &t, &r, &b) && (l < -1e30 || r > 1e30 || t < -1e30 || b > 1e30)) {');
+    this.indent++;
+    this.line('as_dbg_bad_n++;');
+    this.line('fprintf(stderr, "    bad_bounds %s %p l=%.6g t=%.6g r=%.6g b=%.6g parent=%s\\n", as_dbg_cls((void*)o), (void*)o, l, t, r, b, as_dbg_cls((void*)o->parent));');
+    this.indent--;
+    this.line('}');
+    this.line('if (as_is((void*)o, &DisplayObjectContainer_vt)) { DisplayObjectContainer* cc = (DisplayObjectContainer*)o; if (cc->children != NULL) for (int i = 0; i < cc->children->length; i++) as_dbg_bad_bounds((DisplayObject*)as_v_obj_val(cc->children->data[i])); }');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_dbg_hit_chain(void* o) {');
+    this.indent++;
+    this.line('int d = 0;');
+    this.line('for (DisplayObject* p = (DisplayObject*)o; p != NULL && d < 12; p = (DisplayObject*)p->parent, d++) {');
+    this.indent++;
+    this.line('double l = 0.0, t = 0.0, r = 0.0, b = 0.0;');
+    this.line('int has = as_bounds_walk(p, 0, 0, &l, &t, &r, &b);');
+    this.line('int me = as_is((void*)p, &InteractiveObject_vt) ? ((InteractiveObject*)p)->mouseEnabled : -1;');
+    this.line('int mc = as_is((void*)p, &InteractiveObject_vt) ? ((InteractiveObject*)p)->mouseChildren : -1;');
+    this.line('fprintf(stderr, "    chain[%d] %s %p me=%d mc=%d vis=%d bounds=%d %.2f,%.2f %.2fx%.2f\\n", d, as_dbg_cls((void*)p), (void*)p, me, mc, p->visible, has, l, t, r - l, b - t);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.line('static void ASC_window_on_mouse(int id, double x, double y, const char* type) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
@@ -23264,6 +23421,31 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('double sx = (x - w->ox) / w->cx;');
     this.line('double sy = (y - w->oy) / w->cy;');
+    // Diagnostic (ASC_MOUSE_TRACE): dump every pointer event in BOTH coordinate
+    // spaces plus what the hit test answered. "The buttons stopped responding
+    // after a resize" cannot be told apart from "the window transform is stale"
+    // on screen, so the mapping inputs (lw/lh/cx/ox, the device scale and
+    // stageWidth/stageHeight at this instant) are printed next to the result.
+    // mouseMove is rate-limited to 5/s; every other type prints.
+    this.line('if (getenv("ASC_MOUSE_TRACE") != NULL) {');
+    this.indent++;
+    this.line('static double _mt_last = 0.0;');
+    this.line('double _mt_now = as_now_ms();');
+    this.line('const char* _mt_lv = getenv("ASC_MOUSE_TRACE");');
+    this.line('if (strcmp(type, "mouseMove") != 0 || _mt_now - _mt_last >= 200.0) {');
+    this.indent++;
+    this.line('_mt_last = _mt_now;');
+    this.line('void* _mt_hit = as_pick_hit((void*)w->stage, sx, sy);');
+    this.line('const char* _mt_cls = "-";');
+    this.line('if (_mt_hit != NULL) { as_vtable_header* _mt_vt = (as_vtable_header*)((as_object_header*)_mt_hit)->vtable; _mt_cls = (_mt_vt->fqn != NULL && _mt_vt->fqn[0] != 0) ? _mt_vt->fqn : _mt_vt->name; }');
+    this.line('fprintf(stderr, "t=%.0f mouse %s win=(%.1f,%.1f) stage=(%.2f,%.2f) lw=%d lh=%d sw=%d sh=%d scale=%.4f cx=%.4f cy=%.4f ox=%.2f oy=%.2f hit=%s@%p\\n", _mt_now, type, x, y, sx, sy, w->lw, w->lh, (w->stage != NULL) ? w->stage->stage_w : -1, (w->stage != NULL) ? w->stage->stage_h : -1, w->scale, w->cx, w->cy, w->ox, w->oy, _mt_cls, _mt_hit);');
+    this.line('if (_mt_lv != NULL && _mt_lv[0] == 50) { void* _vp = as_dbg_deep_content((void*)w->stage, sx, sy, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0); fprintf(stderr, "    pick=%s content=%s\\n", _mt_cls, as_dbg_cls(_vp)); as_dbg_hit_chain(_mt_hit); }');
+    this.line('if (_mt_lv != NULL && _mt_lv[0] == 51) { as_dbg_bad_n = 0; as_dbg_bad_bounds((DisplayObject*)w->stage); fprintf(stderr, "    bad_bounds total capped=%d\\n", as_dbg_bad_n); }');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+
     // Feed the live pointer state a SimpleButton reads at paint time: mouseMove and
     // the click notifications refresh the position, mouseDown/mouseUp the button.
     // Reserved type sent by the glue for the SECOND click of a double click
@@ -23395,7 +23577,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (planted) as_frame_guard = 0;');
     this.indent--;
     this.line('}');
-    this.line('static void ASC_window_on_redraw(int id) { ASC_window_render(id); }');
+    this.line('static void ASC_window_on_redraw(int id) {');
+    this.indent++;
+    this.line('double _pt0 = as_now_ms(); int _pl = as_dbg_live_n, _pc = as_dbg_cached_n;');
+    this.line('ASC_window_render(id);');
+    this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _pdt = as_now_ms() - _pt0; if (_pdt >= 4.0) fprintf(stderr, "t=%.0f pass paint ms=%.2f live=%d cached=%d\\n", as_now_ms(), _pdt, as_dbg_live_n - _pl, as_dbg_cached_n - _pc); }');
+    this.indent--;
+    this.line('}');
     // One-shot-at-startup + on-change reporter for the display refresh rate. AIR
     // fires VsyncStateChangeAvailabilityEvent once at startup and exposes no
     // refresh-rate query at all, so we reuse that event as the vehicle for our
@@ -23446,10 +23634,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // first visible one) -- polling only `id` would leave every other open window's
     // events undispatched until it happened to become the clock. One poll sweep per
     // application frame is also exactly AIR's cadence.
+    this.line('double _ft0 = as_now_ms();');
     this.line('int i;');
     this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) ASC_win_poll(i);');
     this.line('ASC_dispatch_vsync_event(id, (void*)w->stage);');
     this.line('Stage_dispatchFrame((void*)w->stage);');
+    this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _fdt = as_now_ms() - _ft0; if (_fdt >= 4.0) fprintf(stderr, "t=%.0f pass frame ms=%.2f\\n", as_now_ms(), _fdt); }');
     this.line('if (planted) as_frame_guard = 0;');
     this.indent--;
     this.line('}');

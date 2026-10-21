@@ -375,11 +375,16 @@ function checkBakeResolution(): string[] {
 
   // (2) BitmapData.draw rasterizes a DisplayObject source at the matrix's scale
   // and reads the raster back 1:1 (source coords are multiplied by that scale).
+  // The sampler walks a destination row incrementally instead of re-evaluating the
+  // matrix per texel: moving one texel right adds exactly the column basis vector
+  // of the inverse matrix (ia, ib) scaled by rs, so the coordinates are the same.
   check('the draw raster scale comes from the destination matrix',
     emitted.includes('double rs = 1.0;') &&
     emitted.includes('{ double rsx = sqrt(a * a + b * b), rsy = sqrt(c * c + d * d); rs = rsx > rsy ? rsx : rsy; if (rs < 1.0) rs = 1.0; }') &&
-    emitted.includes("double scx = (ia * (dx + 0.5) + ic * (dy + 0.5) + itx) * rs;") &&
-    emitted.includes("double scy = (ib * (dx + 0.5) + id * (dy + 0.5) + ity) * rs;"));
+    emitted.includes('const double _dscx = ia * rs, _dscy = ib * rs;') &&
+    emitted.includes('double scx = (ia * ((double)cx0 + 0.5) + ic * ((double)dy + 0.5) + itx) * rs;') &&
+    emitted.includes('double scy = (ib * ((double)cx0 + 0.5) + id * ((double)dy + 0.5) + ity) * rs;') &&
+    emitted.includes('scx += _dscx; scy += _dscy;'));
   check('both draw raster branches are scaled and the source rect +1 is one bitmap px',
     (emitted.match(/as_skia_canvas_scale\(canvas, rs, rs\);/g) ?? []).length === 2 &&
     emitted.includes("sw = (int)ceil(tf->_fieldWidth * rs) + (tf->border ? 1 : 0); if (sw < 1) sw = 1;") &&
@@ -1335,12 +1340,24 @@ function checkDrawComposite(): string[] {
   check('BitmapData.draw is emitted', start >= 0 && end > start);
   const body = start < 0 || end < 0 ? '' : c.slice(start, end);
 
+  // The sampler has three arms and all of them end in SourceOver:
+  //  (a) the exact 1:1 case (identity matrix, rs == 1) where the destination texel
+  //      IS the source texel -- opaque texels are copied, transparent ones skipped
+  //      (as_bd_over's `sa == 0` rule), partly transparent ones still blended;
+  //  (b) the general affine case -- opaque results stored directly, the rest blended.
   check('the source pixel is combined with the destination, not stored over it',
-    body.includes('as_bd_over(dp, bd->width, dx, dy, sr, sg, sb, sa);'));
+    body.includes('as_bd_over(dp, _dw2, dx, dy, sr, sg, sb, sa);') &&
+    body.includes('as_bd_over(dp, _dw2, dx, dy, (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF, a);'));
   check('...and the helper really is SourceOver (straight-ARGB un-premultiply)',
     c.includes('double oa = s + df * ia;') && c.includes('static void as_bd_over('));
+  check('the direct-store arms only fire for a fully opaque sample',
+    body.includes('if (a == 255) { dr[dx] = c; continue; }') &&
+    body.includes('if (sa == 255) { dp[(size_t)dy * (size_t)_dw2 + (size_t)dx] = (255u << 24) | (sr << 16) | (sg << 8) | sb; continue; }') &&
+    body.includes('if (sa == 0) continue;'));
+  check('the 1:1 fast arm is gated on an exactly integral destination mapping',
+    body.includes('if (!_hasct && rs == 1.0 && ia == 1.0 && ib == 0.0 && ic == 0.0 && id == 1.0 && itx == 0.0 && ity == 0.0) {'));
   check('a sampled pixel with no coverage leaves the destination alone',
-    body.includes('if (sa == 0) return;'));
+    body.includes('if (sa == 0) return;') && body.includes('if (a == 0) continue;'));
   check('missing source coverage no longer writes 0 over the destination',
     !body.includes('dp[dy * bd->width + dx] = 0u;'));
   check('the sampler never assigns the destination directly any more',

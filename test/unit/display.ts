@@ -55,12 +55,12 @@ function checkHitShape(): string[] {
     emitted.includes('as_skia_path_set_even_odd(o->path, 1);'));
   // No alpha/pixel sampling anywhere in the region path.
   check('the region test never samples pixels',
-    emitted.includes('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly) {') &&
-    !/as_obj_region_hit_local\(DisplayObject\* o, double lx, double ly\) \{[\s\S]{0,1200}?getPixel32/.test(emitted) &&
+    emitted.includes('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly, int pick) {') &&
+    !/as_obj_region_hit_local\(DisplayObject\* o, double lx, double ly, int pick\) \{[\s\S]{0,1200}?getPixel32/.test(emitted) &&
     emitted.includes('if (as_is((void*)o, &Bitmap_vt) || as_is((void*)o, &TextField_vt)) {'));
   // Containers recurse (gap = miss) instead of falling back to their own box.
   check('containers recurse into children',
-    /as_obj_region_hit_local\(DisplayObject\* o, double lx, double ly\) \{[\s\S]{0,2600}?if \(as_obj_region_hit_local\(ch, clx, cly\)\) return true;/.test(emitted));
+    /as_obj_region_hit_local\(DisplayObject\* o, double lx, double ly, int pick\) \{[\s\S]{0,2600}?if \(as_obj_region_hit_local\(ch, clx, cly, pick\)\) return true;/.test(emitted));
   // The box flag includes the stroke, which also makes stroke-only Shapes pickable.
   check('the box hit test includes the stroke',
     emitted.includes('if (!as_bounds_walk(o, 1, 0, &l, &t, &r, &b)) return false;') &&
@@ -74,8 +74,8 @@ function checkHitShape(): string[] {
   // （四态是独立 DisplayObject，hitTestState 只是**事件输入**的命中区），且 upState==NULL 时
   // 什么都不画、width/height/getRect 全 0。
   check('a SimpleButton has no shapeFlag region of its own',
-    emitted.includes('if (as_is((void*)o, &SimpleButton_vt)) return false;') &&
-    !/as_obj_region_hit_local\(DisplayObject\* o, double lx, double ly\) \{[\s\S]{0,1500}?as_sbtn_contains_local/.test(emitted));
+    emitted.includes('if (as_is((void*)o, &SimpleButton_vt)) return pick ? as_sbtn_contains_local((SimpleButton*)o, lx, ly) != 0 : false;') &&
+    emitted.includes('return as_obj_region_hit_local(o, lx, ly, 0);'));
   // ---- 鼠标拾取与 hitTestPoint 是两条路（阶段一百五十七 D20）----
   // 真应用里 29 个 `DefineButton2` / 73 处 placement 全点不动，而同类位置的 Sprite 按钮能点：
   // 那些按钮是「**隐形点击靶**」（SWF 里只有 down + hit 两条记录、没有 up），`upState == NULL`
@@ -87,9 +87,27 @@ function checkHitShape(): string[] {
     /as_pick_hit_local\(DisplayObject\* o, double lx, double ly\) \{[\s\S]{0,400}?if \(as_is\(\(void\*\)o, &SimpleButton_vt\)\) return as_sbtn_contains_local\(\(SimpleButton\*\)o, lx, ly\) != 0;/.test(emitted) &&
     emitted.includes('if (as_pick_hit_local(o, lx, ly) && ((InteractiveObject*)obj)->mouseEnabled) return obj;') &&
     !emitted.includes('if (as_obj_hit_local(o, lx, ly) && ((InteractiveObject*)obj)->mouseEnabled) return obj;'));
-  check('hitTestPoint keeps the bounding-box path for a button',
-    /static bool as_pick_hit_local[\s\S]{0,400}?return as_obj_hit_local\(o, lx, ly\);/.test(emitted) &&
-    emitted.includes('if (shapeFlag) return as_obj_region_hit(_this, x, y);'));
+  check('hitTestPoint keeps the bounding-box path for shapeFlag=false',
+    emitted.includes('bool DisplayObject_hitTestPoint(void* _this, double x, double y, bool shapeFlag) {') &&
+    emitted.includes('if (shapeFlag) return as_obj_region_hit(_this, x, y);') &&
+    emitted.includes('return as_obj_hit(_this, x, y);'));
+  // ---- 阶段二百三十三：鼠标拾取问的是「画出来的区域」，不是子件的包围盒 ----
+  //
+  // 真应用症状：窗口 resize 后整片文档面板（连同底部工具栏、标题栏按钮）都点不到，
+  // 而同一份代码在最大化窗口下工具栏又能点。ASC_MOUSE_TRACE=2 的实测给出根因：
+  // `as_pick_hit_m` 自下而上问每个节点 `as_pick_hit_local`，而旧的拾取判据是
+  // `as_obj_hit_local`——它把「所有子件包围盒的并集」当作本节点的命中区。于是任何
+  // **自己不画任何东西**的容器（应用里为弹层预留的空 ViewControl / 各种层）都成了
+  // 它整块矩形里的命中者，而它按添加顺序压在真控件之上。AIR 不是这样：不画的 Sprite
+  // 在任何位置都不是命中目标（这正是 Flash 里「画一块透明 fill 来吃掉点击」这个惯例
+  // 的来源），两个子件之间的空隙也是 miss。所以拾取必须与 hitTestPoint(…, true) 同源，
+  // 只多两条拾取特有的规则：不可见子树不是目标、按钮问命中态。
+  check('the mouse pick asks the PAINTED region, not the descendant bounding box',
+    emitted.includes('static bool as_pick_hit_local(DisplayObject* o, double lx, double ly) {') &&
+    /as_pick_hit_local\(DisplayObject\* o, double lx, double ly\) \{[\s\S]{0,400}?return as_obj_region_hit_local\(o, lx, ly, 1\);/.test(emitted) &&
+    !/as_pick_hit_local\(DisplayObject\* o, double lx, double ly\) \{[\s\S]{0,400}?as_obj_hit_local\(o, lx, ly\)/.test(emitted));
+  check('an invisible subtree is not a pick target (hitTestPoint still ignores visible)',
+    emitted.includes('if (pick && !o->visible) return false;'));
   check('the SimpleButton hit region never falls back to the button itself',
     emitted.includes('DisplayObject* hs = (b->hitTestState != NULL) ? b->hitTestState : b->upState;') &&
     emitted.includes('if (hs == NULL) return 0;') &&
