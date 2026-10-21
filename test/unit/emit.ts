@@ -2744,6 +2744,23 @@ function checkStageSizeFollowsScaleMode(): string[] {
   // would turn every stage property write into a window-table scan.
   const align = 'void Stage_set_align(void* _this, char* value) { ((Stage*)_this)->align = value; }';
   check('align stays a plain field write', c.includes(align));
+  // ---- 跨端：这段实现是目标无关的 ----
+  // generateC 不按 --target/--package 分叉（native 与 wasm 产出的 .c 逐字节相同，实测
+  // 2561482 字节完全相等），所以 macOS 与 web 拿到的是**同一份** setter + 助手。这里钉住
+  // 两件事，免得将来有人给 web/mac 加 #ifdef 把它悄悄切窄：
+  //   1) 两者都不在任何 #if 里；
+  //   2) 它们只读共享窗口表（ASC_wins/ASCWin->lw）与舞台字段，不调任何后端入口。
+  // 于是「后端答不上来」也不会把尺寸猜坏：web 后端是单窗口、画布尺寸即舞台尺寸，
+  // sk_window_get_client_size 恒答 0（见 vendor/web_glue.cc），助手只在这条链表里找不到
+  // 归属窗口时 no-op；macOS 侧的 lw 由 sk_client_size_live（NSWindow 倍率 + 活像素）给出。
+  const noIf = (s: string): boolean => !/#\s*if/.test(s);
+  check('the scaleMode setter is not behind a #ifdef (macOS/web compile it verbatim)', noIf(setter));
+  check('...nor is the refresh helper', noIf(body));
+  check('...and neither of them calls a backend entry point (shared window table only)',
+    !/sk_window_|as_window_/.test(setter) && !/sk_window_|as_window_/.test(body));
+  const writer = fnBody(c, 'static void ASC_window_apply_stage_size(int id) {');
+  check('the single stage-size writer derives NO_SCALE from the window table alone',
+    writer.includes('st->stage_w = w->lw;') && !/sk_window_|as_window_/.test(writer));
   console.log(`     [stagesize] ${ok} scaleMode stage-size check(s) passed`);
   return bad;
 }
