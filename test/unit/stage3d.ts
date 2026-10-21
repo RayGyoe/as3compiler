@@ -1236,6 +1236,24 @@ function checkStage3dTextureLimits(): string[] {
     && bodyCube.includes('else as_throw(ArgumentError_new((char*)"Error #3705')
     && !bodyCube.includes('as_s3d_max_texture_size()'));
 
+  // 11. The no-backend fallback stays 4096 ON PURPOSE. AIR's software render mode is
+  //     locked to baseline (requesting baselineExtended/enhanced answers #3702, and even
+  //     the context it does hand out rejects 4096 with #3683 "max is 2048x2048"), so this
+  //     is a documented divergence registered as enhancement E17 -- see display3d.md
+  //     §9.14. Pinned here because "4096 looks like a typo next to AIR's 2048" is exactly
+  //     the kind of line a future reader will want to "fix", and doing so would silently
+  //     drop every no-backend build to baseline.
+  //     Source is runtime.ts, not emittedLines(): emittedLines() scans emit.ts only, and
+  //     this helper lives in the runtime preamble.
+  const runtimeSrc = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const iMax = runtimeSrc.indexOf('static inline int as_s3d_max_texture_size(void) {');
+  const bodyMax = runtimeSrc.slice(iMax, runtimeSrc.indexOf('static inline void* as_s3d_create_render_texture'));
+  check('a build with no GPU backend answers 4096 on purpose (E17), a real backend is asked',
+    iMax > 0
+    && bodyMax.includes('#ifdef ASC_RENDER_STAGE3D')
+    && bodyMax.includes('return s3d_max_texture_size();')
+    && bodyMax.includes('return 4096;'));
+
   console.log(`     [stage3d] ${ok} check(s) passed`);
   return bad;
 }

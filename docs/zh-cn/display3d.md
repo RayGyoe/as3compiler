@@ -557,6 +557,16 @@ AIR 的纹理尺寸校验**不是一条规则，而是三条**，顺序也是可
 该查询由三后端各自回答：D3D12 / Metal 恒 16384（`D3D_FEATURE_LEVEL_11_0` / Apple GPU 家族下限），
 WebGL2 现查 `GL_MAX_TEXTURE_SIZE`（`< 2048` 回落 2048），无渲染后端的纯 C 状态机给 4096。
 
+**一条刻意的跨端差异：无后端路径 ≠ AIR 的 `software` 模式。** adl 51.4.1 实测
+（`temp/adlprof/run-caps.js`，`PROBE_MODE=caps`）：AIR 的 `requestContext3D("software", p)` 只在
+`p == "baseline"` 时交出上下文，`baselineExtended` / `enhanced` **一律异步**抛
+`ErrorEvent #3702: Context3D not available.`；而拿到上下文的那一档也锁在 baseline——
+`createTexture(4096)` 报 `#3683 (max is 2048x2048)`、`rgbaHalfFloat` 报 `#3759`、MRT 5 参报 `#3779`，
+`maxBackBuffer` 也只有 2048×2048。**我们未链接 Stage3D 后端的纯 C 状态机则照常建上下文、
+报 `baselineExtended`、按 4096 校验**——理由是此时纹理只存在于 CPU 状态机里，4096 的两维边界
+不占一分显存。这条差异**不静默**（`driverInfo` 如实报 `"Software (state machine)"`），并已按
+AGENTS.md §1.5 登记为增强（`TODO.md`「增强待做」与该文件的 E17），刻意保留、不随 AIR 收紧。
+
 #### `ignoreResourceLimits`（AIR 50.0+，默认 `false`）实际做了什么
 
 文档只说「忽略 profile 关联的**软**资源上限」，没说什么算软。逐项实测（`PROBE_MODE=ign`，

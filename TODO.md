@@ -13736,6 +13736,41 @@ GEO req=658x1160 model{bnd=329x580}   ← 层真实是 329 pt / 658 px
 
 **仍未做的（不静默，已入表）**：旗标打开后我们只按**设备上限**放行，不预检像素总量；2D/rect 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `gpu` 留空，上传时才建），后端分配失败目前不会立刻冒成 `#3684`。
 
+### 阶段二百二十八：WebGL2 后端的编译验证 + 无后端档位差异登记（v0.4.201 → v0.4.202）✅ 已完成
+
+**一、WebGL2 后端首次真的过编译器**
+
+阶段二百二十六 给三后端各加了 `int s3d_max_texture_size(void)`，当时只有 D3D12 在本机编过（`.mm` 无 Objective-C++ 工具链、wasm 无 emsdk）。本轮在 `build-tools/skia-src/third_party/externals/emsdk`（Skia 源码树里自带的副本，**不是** `build-tools/emsdk`）找到 emcc，补上验证：
+
+- `emcc -c -std=c++17 -O1 vendor/stage3d_webgl.cc` → **零错误**（`temp/webglcheck/stage3d_webgl.o`）。
+- 加 `-Wall -Wextra` 后只剩一条**既有**警告（`:1189` `depthFail` 未使用，与本次改动无关）；新函数零诊断。
+
+Metal（`stage3d_glue.mm`）仍是唯一**未经编译器验证**的后端：本机 win32 没有 Objective-C++ 工具链，只能等 arm64 macOS 的 CI。改动本身是一条 `return 16384;` 的纯函数。
+
+**二、无后端路径的档位差异：实测 + 登记，不改代码**
+
+`adl 51.4.1` 逐档实测（`temp/adlprof/run-caps.js`，`PROBE_MODE=caps`，请求串 `<profile>|software`）：
+
+| 请求 | AIR 的 software 后端 |
+|---|---|
+| `baseline` | ✅ 上下文建立，`profile=baseline`、`driverInfo=Software Hw_disabled=explicit`、`maxBackBuffer=2048x2048`；`createTexture(2048)` ok，`4096` → `#3683 (max is 2048x2048)`；`rgbaHalfFloat` → `#3759`；MRT 5 参 → `#3779` |
+| `baselineExtended` | ❌ 异步 `ErrorEvent #3702: Context3D not available.` |
+| `enhanced` | ❌ 同上 `#3702` |
+
+即 **AIR 的 software 后端锁死在 `baseline`**，连 `baselineExtended` 都不给。而我方**未链接 Stage3D 后端**（纯 C 状态机）时仍建上下文、报 `baselineExtended`、按 4096 校验。
+
+这是**默认产物上的刻意分歧**，不能只靠一段注释存在：
+
+- 它不是「待做」——**现状即增强**（此时纹理只活在 CPU 状态机里，4096 不占一分显存）；
+- 它**不静默**——`driverInfo` 如实报 `"Software (state machine)"`；
+- 已登记为 **E17**（[`enhancements.md`](docs/zh-cn/enhancements.md) §3 与「增强待做」表），并在 [`display3d.md`](docs/zh-cn/display3d.md) §9.14 写明实测差异与理由。
+
+**三、钉子**
+
+`test/unit/stage3d.ts` 的 `stage3d/texture-size-limits` 10 → **11 条**：新增一条把 `as_s3d_max_texture_size()` 的 `#else return 4096;` 钉住。理由写在钉子注释里——「4096 摆在 AIR 的 2048 旁边看着像个笔误」，下一个读者最想“顺手改对”的就是这一行，而改对的那一刻，所有无后端构建会静默掉回 `baseline`。（顺手记一笔：`emittedLines()` 只扫 `emit.ts`，runtime 前导里的函数得直接读 `src/runtime.ts`。）
+
+**closure**：① **「对齐」是逐维度的** —— 三个真后端共享同一份校验（都由 `emit.ts` 生成），唯一分端的只有「上限」这一个数，所以「三端都对齐」只对那三个后端成立，第四路径（无后端）不在同一个契约里；② **没编过的后端不能记作已验证** —— 阶段二百二十六 的 Metal/WebGL2 当时只有契约推理，本轮补上 WebGL2 之前，那两个文件的状态是「看起来对」而不是「编过」；③ **默认产物上的分歧必须进增强表** —— 否则它只是一段注释，而下一个把 `4096` 改成 `2048` 的人会以为自己在修 bug。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百二十七：`Context3D.ignoreResourceLimits`）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**。本阶段修的是「`adl` 会报 `#3683`、我们照单全收」之后的下一层：`ignoreResourceLimits` 这个 AIR 公开属性的语义（软上限放开、`#3681`/`#3682` 保留、超限改报 `Error #3684`）在阶段内**已逐字对齐**，故不进表；新登记的一行是「旗标打开后缺少显存预检/分配失败上报」——它是**我们这边**的缺口（`adl` 在 `#3684` 处同步失败，而我们的惰性分配会把失败推到上传之后），属可执行欠账。**一处刻意分歧已记入正文**：旗标打开时 2D 上界用设备上限（16384）而非 AIR 的 profile 上限——这是本阶段唯一的主动分歧，且双重 opt-in（AIR 合法属性 + 默认 `false`），默认产物仍与 AIR 同构。
 > **2026-10-21 追加（阶段二百二十六：`Context3D.profile` 分档上报）**：**新登记 3 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **95 → 98 项**（`未开始` **72 → 75**）。本阶段修的是「`adl` 跑得对、我们跑不出」（`adl` 会把 4097 拦下来，我们照单全收），按 §1.5 硬判据属**遗留缺陷**且**阶段内已修净**，故不进表；**但**逐档爬把后面两级的真实缺口量成了三行独立的表项（MRT、浮点纹理、AGAL4/VTF），它们是**可执行的欠账**而不是「以后再说」——登记它们是为了让「报 `enhanced`」这件事有明确的完工判据。**旧口径「`profile` 固定 baseline」在本阶段已作废**，凡按它写过的正文（`docs/zh-cn/display3d.md` §6/§7、`README-CN.md` 示例说明）已同步改写。
@@ -13973,7 +14008,7 @@ GEO req=658x1160 model{bnd=329x580}   ← 层真实是 329 pt / 658 px
 ### 增强待做
 
 > **与「遗留待开发」的区别**：上表是**欠账**（AIR 有、我们没有，或我们有但不忠实——`adl` 一跑就知道差在哪）；本表是**增益**（AIR **本来就报错、或压根不存在**，我们做出来才算增强）。判据与五条入库标准见 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1/§2；原则亦见 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §4。
-> **状态（2026-10-05 复核，v0.4.61）**：下表 **15 项**，已完成 **5 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**已有** 2 项、未排期 **8 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`），登记未实现的开关等于「看着开了、实际没编进去」。
+> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202）**：下表 **16 项**，已完成 **5 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**已有** 3 项、未排期 **8 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`），登记未实现的开关等于「看着开了、实际没编进去」。
 
 | 增强项 | AIR 现状 | 目标端 | 成本 | 状态 |
 |--------|---------|--------|------|------|
@@ -13992,6 +14027,7 @@ GEO req=658x1160 model{bnd=329x580}   ← 层真实是 329 pt / 658 px
 | **LTO / PGO 构建开关** | — | 两端 | 低 | **已完成（八十九·六十四）**：清单 `lto`/`pgo`/`pgo-dir` + CLI `--lto`/`--pgo`/`--pgo-dir`，默认全关；`-flto` 逐步骤断言 + 反向对照（4 变异全捕获） |
 | **帧录制 / 确定性重放** | ✗ | 两端 | 中 | 未排期 |
 | **可读 C 作为一等交付物**（嵌入宿主工程 / 人工审改） | ✗ | 两端 | 已有（README 已承诺） | 已有 |
+| **无 GPU 后端时 `Context3D.profile` 报 `baselineExtended`** | ✗ AIR 的 `software` 渲染模式**锁死 `baseline`**：`requestContext3D("software", "baselineExtended"|"enhanced")` 异步抛 `ErrorEvent #3702: Context3D not available.`，拿到上下文那一档也 `createTexture(4096)` 报 `#3683 (max is 2048x2048)`、`maxBackBuffer` 只有 2048×2048（`adl 51.4.1` 实测，`temp/adlprof/run-caps.js`） | 未链接 Stage3D 后端（纯 C 状态机）时仍建上下文、报 `baselineExtended`、按 4096 校验：纹理只存在于 CPU 状态机里，4096 不占显存。**不静默**——`driverInfo` 如实报 `"Software (state machine)"` | 两端（纯 C，无胶水依赖） | — | **已有（刻意保留，非开关）** |
 
 ---
 

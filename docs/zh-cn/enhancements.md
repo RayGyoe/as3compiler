@@ -105,6 +105,9 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 ## 3. 增强待做清单
 
 > **已完成 6 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询。
+> **另有 1 项现状即增强、无需开工**：E17（无 GPU 后端时 `Context3D.profile` 报 `baselineExtended`）——
+> AIR 的 `software` 渲染模式在这里会直接 `#3702`，我们照常给上下文；详细实测见
+> [`display3d.md`](display3d.md) §9.14。
 >
 > 状态口径：**已有** = 现在就能用（可能只是没写文档/没写示例）；**半成品** = 库已在、缺 AS3 面；
 > **待建** = 需要新胶水或改工具链。目标端里的「web 需重编」= 需要改 `build-tools/skia-src/out/wasm/args.gn`
@@ -128,6 +131,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 | E14 | **帧录制 / 确定性重放** | ✗ | 运行时自持（帧边界、事件、随机源都在我们手里） | 两端 | 中 |
 | E15 | **可读 C 作为一等交付物**（嵌入宿主工程 / 人工审改） | ✗ | **已承诺**（README：「保留 `.c` 便于阅读」） | 两端 | 已有 |
 | E16 | **显示器刷新率查询**（`VsyncStateChangeAvailabilityEvent.refreshRate`） | ✗ **无任何刷新率查询 API**（实测 `adl 51.4.1` 只派发 `vSyncStateChangeAvailability` 且只带只读的 `available=false`） | ✅ **已实现**：事件增加只读 `refreshRate:Number`（构造器第 5 个**可选**参数，缺省 `0`）；启动后首个已知帧 + 窗口落到不同速率显示器时各派发一次 | 两端（**web/离屏无对应物 ⇒ 如实不派发**，不伪造 `0`） | **已完成** |
+| E17 | **无 GPU 后端时的 `Context3D.profile`**（纯 C 状态机报 `baselineExtended`） | ✗ AIR 的 `software` 渲染模式**锁死 `baseline`**：请求 `baselineExtended`/`enhanced` 异步抛 `#3702`，`createTexture(4096)` 报 `#3683 (max is 2048x2048)`、`maxBackBuffer` 只有 2048×2048 | ✅ **现状即增强**：未链接 Stage3D 后端时仍建上下文、报 `baselineExtended`、按 4096 校验（纹理只在 CPU 里，不占显存）；`driverInfo` 如实报 `"Software (state machine)"` | 两端（纯 C，无胶水依赖） | **已有（刻意保留，非开关）** |
 
 ---
 
