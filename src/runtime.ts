@@ -1695,6 +1695,16 @@ static bool as_num_truthy(double x) { return x != 0.0 && !isnan(x); }
 // when it is a call: if (nextName()).
 static bool as_str_truthy(const char* s) { return s != NULL && s[0] != 0; }
 
+// Display text of a statically String-typed value (what trace() and String()
+// produce): a String slot legitimately holds C NULL (var s:String = null), and
+// AS3's String(null) is the four characters "null". Handing that NULL straight to
+// printf is not merely wrong output -- Windows ucrt rejects the null pointer through
+// _invalid_parameter -> __fastfail(FAST_FAIL_INVALID_ARG) and kills the process with
+// 0xC0000409 (measured on the TalkMED gift panel, where GiftListView.updateList()
+// does trace(targetUrl) with targetUrl:String = null and clang folds the printf into
+// puts), while Apple libc silently prints "(null)" instead.
+static char* as_str_or_null(const char* s) { return s != NULL ? (char*)s : (char*)"null"; }
+
 static bool as_v_truthy(as_value v) {
     switch (v.tag) {
         case 0:

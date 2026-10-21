@@ -1423,7 +1423,8 @@ export class Emitter {
   // the subclass happened to put there. emitStructs therefore emits each of these
   // right after the owning base class's own declared fields (阶段一百四十五).
   private hasBaseClassSlots(cls: string): boolean {
-    return cls === 'Screen' || cls === 'NativeWindow' || cls === 'Matrix3D' || cls === 'SharedObject';
+    if (cls === 'Screen' || cls === 'NativeWindow' || cls === 'Matrix3D' || cls === 'SharedObject') return true;
+    return this.trailingSlotLines(cls).length > 0;
   }
 
   private emitBaseClassSlots(cls: string): void {
@@ -1465,6 +1466,79 @@ export class Emitter {
       this.line('unsigned int _objectEncoding;');
       this.line('double _fps;');
     }
+    for (const slot of this.trailingSlotLines(cls)) this.line(slot);
+  }
+
+  // Which class INTRODUCES a trailing C-runtime-only slot: the topmost class in
+  // the chain whose predicate holds. Only that class emits the member (see
+  // trailingSlotLines); every subclass inherits it at the same offset.
+  private trailingSlotOwner(name: string, pred: (cls: string) => boolean): string | null {
+    let owner: string | null = null;
+    for (let cur: string | null = name; cur !== null; cur = this.symbols.getClass(cur)?.superClass ?? null) {
+      if (pred(cur)) owner = cur;
+    }
+    return owner;
+  }
+
+  // C-runtime-only slots that sit after the LAST declared field of the class that
+  // owns them: `_arr` for `class X extends Array`, `_dyn` for a dynamic class,
+  // URLStream's transfer state, StyleSheet's rule record, a socket's borrowed
+  // handle. They are inheritance-flattened like any declared field -- exactly what
+  // emitBaseClassSlots does for Screen / NativeWindow / Matrix3D / SharedObject.
+  //
+  // `_dyn` used to be appended at the end of EVERY class in the chain, which left
+  // the base's copy's bytes unused and handed them to the subclass's first own
+  // field. mheader (dynamic skin MovieClip) keeps `_dyn` at 0x130 -- right after
+  // MovieClip's last field `_playing` -- and HeaderView's own fields started at
+  // 0x130, so `HeaderView.popInfoView` shared that slot with `mheader._dyn`.
+  // mheader_ctor's `o->_dyn = as_object_new()` thus overwrote the still-NULL
+  // popInfoView with a plain Object; the info button's
+  // `popInfoView.visible = !popInfoView.visible` dispatched through `_as_object_vt`
+  // at slot 0x13c (which holds the constant 1) and the app died with an execute AV
+  // at 0x1 on the very first click (measured, 阶段二百三十五).
+  private trailingSlotLines(cls: string): string[] {
+    const out: string[] = [];
+    if (this.trailingSlotOwner(cls, (c) => this.symbols.getClass(c)?.arrayBacked === true) === cls) {
+      // `class X extends Array` (arrayBacked): AIR's Array has no C struct to
+      // inherit, so the element storage lives in this hidden backing array, and
+      // every inherited Array member operates on it. It is a GC object, so the
+      // props reflection table marks it (see emitPropTables).
+      out.push('as_array* _arr;');
+    }
+    if (this.trailingSlotOwner(cls, (c) => this.symbols.getClass(c)?.isDynamic === true) === cls) {
+      // Dynamic classes (AS3 `dynamic class`) carry a runtime slot table for
+      // arbitrary undeclared string-keyed properties. Its byte offset is emitted
+      // into the vtable so as_dyn_get/set can reach it.
+      out.push('as_object* _dyn;');
+    }
+    if (cls === 'URLStream') {
+      // URLStream owns its transfer: `_job` is the live streaming job (a plain
+      // malloc structure, NOT traced by the GC), and `_buf`/`_buf_pos` are the
+      // remainder copied out of it when the load completes, so reads keep working
+      // after the job retires. `_buf` is a GC ByteArray and is marked through the
+      // props table (see emitPropTables); `_job` must never be -- pointer-tagging
+      // a malloc block would send gc_scan into non-heap memory.
+      out.push('void* _job;', 'void* _buf;', 'int _buf_pos;');
+    }
+    if (cls === 'StyleSheet') {
+      // flash.text.StyleSheet keeps its rules in a C-runtime-only slot: a record
+      // mapping a selector to a declaration record. Not an AS3-visible member (the
+      // AS3 surface is setStyle/getStyle/clear/styleNames), so the props reflection
+      // table marks it (emitPropTables). It is a GC object, hence the explicit entry.
+      out.push('as_object* _rules;');
+    }
+    if (this.trailingSlotOwner(cls, (c) => this.symbols.isSubclassOf(c, 'Socket') || c === 'XMLSocket' || c === 'ServerSocket') === cls) {
+      // flash.net sockets: `_sock` is a BORROWED handle to the transport owned by
+      // RUNTIME_PREAMBLE's socket registry (see the socket seam). Not AS3-visible
+      // -- the AS3 surface is the getters, and close() drops the handle. It must
+      // never be a GC pointer: the registry owns the as_sock's lifetime.
+      out.push('void* _sock;');
+      // A closed ServerSocket cannot be reopened (the reference says to create a
+      // new instance), but the object still has to answer a later bind() with the
+      // documented error instead of quietly rebinding to a new port.
+      if (cls === 'ServerSocket') out.push('int _closed;');
+    }
+    return out;
   }
 
   private emitStructs(): void {
@@ -1694,44 +1768,11 @@ export class Emitter {
         }
       }
       while (slotsPending.length > 0) this.emitBaseClassSlots(slotsPending.shift()!);
-      // `class X extends Array` (arrayBacked): AIR's Array has no C struct to
-      // inherit, so the element storage lives in this hidden backing array, and
-      // every inherited Array member operates on it. It is a GC object, so the
-      // props reflection table marks it (see emitPropTables).
-      if (info.arrayBacked) this.line('as_array* _arr;');
-      // Dynamic classes (AS3 `dynamic class`) carry a runtime slot table for
-      // arbitrary undeclared string-keyed properties. Its byte offset is emitted
-      // into the vtable so as_dyn_get/set can reach it.
-      if (info.isDynamic) this.line('as_object* _dyn;');
-      // URLStream owns its transfer: `_job` is the live streaming job (a plain
-      // malloc structure, NOT traced by the GC), and `_buf`/`_buf_pos` are the
-      // remainder copied out of it when the load completes, so reads keep working
-      // after the job retires. `_buf` is a GC ByteArray and is marked through the
-      // props table (see emitPropTables); `_job` must never be — pointer-tagging
-      // a malloc block would send gc_scan into non-heap memory.
-      if (name === 'URLStream') {
-        this.line('void* _job;');
-        this.line('void* _buf;');
-        this.line('int _buf_pos;');
-      }
-      // flash.text.StyleSheet keeps its rules in a C-runtime-only slot: a record
-      // mapping a selector to a declaration record. Not an AS3-visible member (the
-      // AS3 surface is setStyle/getStyle/clear/styleNames), so the props reflection
-      // table marks it (emitPropTables). It is a GC object, hence the explicit entry.
-      if (name === 'StyleSheet') {
-        this.line('as_object* _rules;');
-      }
-      // flash.net sockets: `_sock` is a BORROWED handle to the transport owned by
-      // RUNTIME_PREAMBLE's socket registry (see the socket seam). Not AS3-visible
-      // — the AS3 surface is the getters, and close() drops the handle. It must
-      // never be a GC pointer: the registry owns the as_sock's lifetime.
-      if (this.symbols.isSubclassOf(name, 'Socket') || name === 'XMLSocket' || name === 'ServerSocket') {
-        this.line('void* _sock;');
-        // A closed ServerSocket cannot be reopened (the reference says to create a
-        // new instance), but the object still has to answer a later bind() with the
-        // documented error instead of quietly rebinding to a new port.
-        if (name === 'ServerSocket') this.line('int _closed;');
-      }
+      // Trailing C-runtime-only slots (`_arr`, `_dyn`, URLStream's transfer block,
+      // StyleSheet's rule record, a socket's borrowed handle) are emitted by the
+      // slotsPending machinery above: for the class that introduces them they land
+      // at the end of its own field list, and for every subclass right after the
+      // introducer's last declared field (see trailingSlotLines).
       this.indent--;
       this.line('};');
       this.line('');
@@ -29842,7 +29883,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         case 'int64': formats.push('%s'); vals.push(`as_str_from_i64(${e.code})`); break;
         case 'uint64': formats.push('%s'); vals.push(`as_str_from_u64(${e.code})`); break;
         case 'bool': formats.push('%s'); vals.push(`as_str_from_bool(${e.code})`); break;
-        case 'string': formats.push('%s'); vals.push(e.code); break;
+        // A String-typed slot can hold AS3 null (C NULL): trace(null) must print
+        // "null" (String(null)), and printf("%s") on a null pointer is a fatal
+        // invalid-parameter fastfail on Windows ucrt.
+        case 'string': formats.push('%s'); vals.push(`as_str_or_null(${e.code})`); break;
         case 'array': formats.push('%s'); vals.push(`as_array_join(${e.code}, ",")`); break;
         case 'vector': formats.push('%s'); vals.push(`${e.code} == NULL ? (char*)"null" : as_vector_${this.vectorCName(e.type.elem)}_join(${e.code}, ",")`); break;
         case 'any': formats.push('%s'); vals.push(`as_v_str_val(${e.code})`); break;

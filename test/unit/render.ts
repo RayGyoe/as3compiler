@@ -1550,8 +1550,13 @@ function checkSwcBaseClass(): string[] {
     'the reason is written down next to the field (an own table, not an inherited one)');
 
   // --- the two halves that actually make `this["title"]` resolve at runtime ---
-  ck(/if \(info\.isDynamic\) this\.line\('as_object\* _dyn;'\)/.test(emit),
-    'a dynamic class gets the `_dyn` slot table in its C struct');
+  // 阶段二百三十五: the slot is no longer appended at the end of EVERY class in the
+  // chain (which let a subclass own field share its offset); the class that
+  // INTRODUCES the dynamic trait emits it, subclasses inherit it at that offset.
+  ck(/if \(this\.trailingSlotOwner\(cls, \(c\) => this\.symbols\.getClass\(c\)\?\.isDynamic === true\) === cls\) {/.test(emit) &&
+    /out\.push\('as_object\* _dyn;'\);/.test(emit) &&
+    /for \(const slot of this\.trailingSlotLines\(cls\)\) this\.line\(slot\);/.test(emit),
+    'a dynamic class gets the `_dyn` slot table in its C struct (flattened into the class that introduces it)');
   ck(/const dynOffset = info\.isDynamic \? `\(int\)offsetof\(\$\{name\}, _dyn\)` : '-1';/.test(emit),
     '...and a non-negative vtable dyn_offset, which is how as_dyn_get decides it may look there');
   ck(/static void as_swc_child_name\(void\* parent, const char\* name, void\* child\)/.test(rt) &&

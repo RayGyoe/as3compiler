@@ -2908,3 +2908,121 @@ function checkBitmapSmoothing(): string[] {
   return bad;
 }
 registerGroup('unit: emit/BitmapSmoothing', checkBitmapSmoothing);
+// ---- trailing C-runtime-only slots must be inheritance-flattened ----------------
+// `_arr` / `_dyn` / URLStream's transfer block / a socket's borrowed handle live
+// after the last declared field of the class that INTRODUCES them, so a subclass
+// pointer cast to its base reads the same offset. Appending a fresh copy at the end
+// of every class in the chain instead left the inherited copy's bytes unused and
+// handed them to the subclass's FIRST own field: `mheader._dyn` and
+// `HeaderView.popInfoView` shared offset 0x130, so mheader_ctor's
+// `_dyn = new Object()` made the info button's toggle dispatch through
+// _as_object_vt slot 0x13c (which holds 1) — execute AV at 0x1 on the first click
+// (阶段二百三十五). examples/dyn-layout.as pins the runtime side of this; the
+// checks below pin the emitted layout itself.
+function structBody(c: string, name: string): string {
+  const start = c.indexOf(`struct ${name} {`);
+  if (start < 0) return '';
+  const end = c.indexOf('\n};', start);
+  return end < 0 ? '' : c.slice(start, end);
+}
+
+function membersOf(body: string): string[] {
+  return body.split('\n').map((l) => l.trim()).filter((l) => l !== '' && !l.startsWith('struct '));
+}
+
+function checkRuntimeSlotLayout(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [emit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [emit] ${label}`); }
+  };
+
+  const src = [
+    'dynamic class SlotBase { public var slotBaseField:int = 1; }',
+    'class SlotSub extends SlotBase { public var slotOwnField:Object; public var slotOwnInt:int = 2; }',
+    'class SlotStream extends URLStream { public var slotStreamField:int = 3; }',
+    'class SlotArray extends Array { public var slotArrayField:int = 4; }',
+    'class SlotArray2 extends SlotArray { public var slotArrayOwn2:int = 5; }',
+    'var sub:SlotSub = new SlotSub();',
+    'var stm:SlotStream = new SlotStream();',
+    'var arr:SlotArray = new SlotArray();',
+    'trace(sub.slotOwnInt + stm.slotStreamField + arr.slotArrayField);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+  const base = membersOf(structBody(c, 'SlotBase'));
+  const sub = membersOf(structBody(c, 'SlotSub'));
+  const stream = membersOf(structBody(c, 'SlotStream'));
+  const array = membersOf(structBody(c, 'SlotArray'));
+
+  const count = (ms: string[], m: string): number => ms.filter((x) => x === m).length;
+
+  check('the dynamic base keeps _dyn as its last member', base[base.length - 1] === 'as_object* _dyn;');
+  check('the subclass declares exactly one _dyn', count(sub, 'as_object* _dyn;') === 1);
+  check('...and it sits right after the inherited field, not at the end',
+    sub.indexOf('as_object* _dyn;') === sub.indexOf('int slotBaseField;') + 1);
+  check('the subclass own fields follow the inherited _dyn slot',
+    sub.indexOf('as_object* _dyn;') < sub.indexOf('Object* slotOwnField;'));
+
+  check('URLStream keeps its transfer block after its last declared field',
+    count(stream, 'void* _job;') === 1 && stream.indexOf('void* _job;') === stream.indexOf('void* _buf;') - 1);
+  check('...and a URLStream subclass inherits it instead of re-declaring it',
+    count(stream, 'void* _job;') === 1 && stream.indexOf('void* _job;') < stream.indexOf('int slotStreamField;'));
+
+  const array2 = membersOf(structBody(c, 'SlotArray2'));
+  check('an Array subclass keeps _arr as its last member', array[array.length - 1] === 'as_array* _arr;');
+  check('...and ITS subclass declares exactly one _arr', count(array2, 'as_array* _arr;') === 1);
+  check('...placed before the subclass own field',
+    array2.indexOf('as_array* _arr;') < array2.indexOf('int slotArrayOwn2;'));
+
+  console.log(`     [slots] ${ok} runtime-slot layout check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/RuntimeSlotLayout', checkRuntimeSlotLayout);
+
+// ---- trace() of an AS3-null String must print "null", never hand NULL to printf --
+// 阶段二百三十六: a statically String-typed slot holds AS3 null as C NULL, and
+// String(null) is the four characters "null". Passing that NULL to printf("%s")
+// is a hard fault on Windows ucrt (_invalid_parameter -> __fastfail(FAST_FAIL_
+// INVALID_ARG), which is exactly how the TalkMED gift panel died: updateList()
+// does trace(targetUrl) with targetUrl:String = null) and prints "(null)" on
+// Apple libc. examples/trace-null.as reproduces the fatal path here (removing the
+// wrapper from its generated C makes it exit 0xC0000409); these checks pin the
+// emitted call shape and the runtime helper so the wrapper cannot silently go away.
+function checkTraceNullString(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [emit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [emit] ${label}`); }
+  };
+
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  check('the runtime defines a NULL-safe display helper for static Strings',
+    pre.includes('static char* as_str_or_null(const char* s) { return s != NULL ? (char*)s : (char*)"null"; }'));
+
+  const src = [
+    'class TraceHolder { public var neverSet:String; public var empty:String = ""; }',
+    'var th:TraceHolder = new TraceHolder();',
+    'function traceIt(s:String):void { trace(s); }',
+    'traceIt("x");',
+    'trace(th.neverSet);',
+    'trace(th.empty);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  check('trace(String param) goes through as_str_or_null',
+    c.includes('printf("%s\\n", as_str_or_null(s));'));
+  check('...and never passes the raw String slot to printf',
+    !c.includes('printf("%s\\n", s);'));
+  check('trace(String field read) goes through as_str_or_null too',
+    /printf\("%s\\n", as_str_or_null\([^;]*neverSet\)\)\);/.test(c));
+  check('trace("" ) still goes through the helper (empty stays empty, not "null")',
+    /printf\("%s\\n", as_str_or_null\([^;]*empty\)\)\);/.test(c));
+
+  console.log(`     [trace-null] ${ok} trace-null check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/TraceNullString', checkTraceNullString);
