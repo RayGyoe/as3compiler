@@ -590,6 +590,43 @@ static double sk_window_backing_scale(SDL_Window* win) {
   double (*fn)(void*, SEL) = (double (*)(void*, SEL))objc_msgSend;
   return fn(info.info.cocoa.window, sel_registerName("backingScaleFactor"));
 }
+#elif defined(_WIN32)
+// The DPI scale Windows actually lays this window out at (144/96 = 1.5 on this
+// machine's 150% panel) — the Windows half of the very same rule the Cocoa query
+// above exists for: SDL_GetWindowSize is a CACHE that is written when the resize
+// event is *processed*, while SDL_GetWindowSizeInPixels asks the HWND live, so on
+// any transition that moves and resizes at once the two disagree. Measured on this
+// box with a real title-bar double-click on a 1000x680 window: on maximize the
+// cached logical size was still 1000 while the client rect was already
+// 3840x2454 px, so dividing them gave 3.84 instead of 1.5 and the whole picture
+// was blown up 2.56x; on restore the pair was 1500/2560 = 0.586 and it shrank to
+// 39% — the reported "double-click the header to maximize, the scale is wrong;
+// double-click again and it is wrong the other way".
+//
+// GetDpiForWindow is resolved dynamically on purpose: it only exists from Windows
+// 10 1607 on, and a static import would stop the binary from STARTING on anything
+// older, while a missing export simply falls back to SDL's own ratio (0.0 here).
+typedef UINT (WINAPI *sk_getdpi_fn)(HWND);
+static sk_getdpi_fn sk_getdpi_lookup(void) {
+  static sk_getdpi_fn fn = NULL;
+  static int done = 0;
+  if (!done) {
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    if (user32 != NULL) fn = (sk_getdpi_fn)(void*)GetProcAddress(user32, "GetDpiForWindow");
+    done = 1;
+  }
+  return fn;
+}
+static double sk_window_backing_scale(SDL_Window* win) {
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (win == NULL || !SDL_GetWindowWMInfo(win, &info)) return 0.0;
+  if (info.subsystem != SDL_SYSWM_WINDOWS || info.info.win.window == NULL) return 0.0;
+  sk_getdpi_fn fn = sk_getdpi_lookup();
+  if (fn == NULL) return 0.0;
+  UINT dpi = fn(info.info.win.window);
+  return (dpi > 0) ? (double)dpi / 96.0 : 0.0;
+}
 #else
 static double sk_window_backing_scale(SDL_Window* win) { (void)win; return 0.0; }
 #endif
@@ -599,7 +636,9 @@ static double sk_window_backing_scale(SDL_Window* win) { (void)win; return 0.0; 
 // points) onto a canvas of pw x ph physical pixels with exactly this ratio, so a
 // ratio that does not match the pair stretches the whole picture.
 //
-// Do NOT divide SDL's two queries on macOS: SDL_GetWindowSize reads SDL's cached
+// Do NOT divide SDL's two queries where the platform can report a backing scale
+// (macOS: NSWindow.backingScaleFactor; Windows: GetDpiForWindow): SDL_GetWindowSize
+// reads SDL's cached
 // logical size (written from the resize event) while SDL_GetWindowSizeInPixels
 // asks Cocoa live, so during a live resize they are one step apart. Measured
 // during a left-edge drag: the layer was truly 329x580 pt / 658x1160 px while
@@ -613,22 +652,48 @@ static double sk_window_backing_scale(SDL_Window* win) { (void)win; return 0.0; 
 //
 // The window's own backing scale is the stable answer (it changes only when the
 // display does), so take it and read the logical size back out of the live pixel
-// size whenever the cached one disagrees. On platforms without it, SDL's ratio is
-// what we have (and there the cross-display case is the one that matters).
+// size — always, not just when the cached size disagrees (see the note inside).
+// On platforms that cannot answer, SDL's ratio is what we have, and there the
+// cross-display case is the one that matters.
 static double sk_window_device_scale(SDL_Window* win, int* lw, int* lh, int pw, int ph) {
   double bs = sk_window_backing_scale(win);
   if (bs > 0.0) {
     const int dw = (int)((double)pw / bs + 0.5);
     const int dh = (int)((double)ph / bs + 0.5);
-    // Only override a logical size that is BEHIND the live pixel size: when SDL
-    // is ahead (a resize that just shrank) relying on it merely clips a sliver of
-    // the new content for one frame, while trusting a stale smaller size is what
-    // stretches.
-    if (dw > *lw) *lw = dw;
-    if (dh > *lh) *lh = dh;
+    // Both directions, and the stated logical size is REPLACED rather than only
+    // repaired when it lags. The pair is only ever consumed as "stage size in
+    // points + the ratio that maps it onto pw x ph pixels", so it is consistent by
+    // construction only when both halves come out of the same live measurement.
+    // A one-sided rule leaves the other half of this bug alive — and latches it:
+    // do_resize returns early as soon as the PIXEL size matches, so a logical size
+    // that is too LARGE is never revisited. Measured after restore-from-maximize
+    // with the one-sided rule in place: the stage stayed 2560x1636 inside a
+    // 1000x680 window for the rest of the run (the picture was correctly scaled
+    // but the app laid itself out for a window 2.5x wider than the real one).
+    if (dw > 0) *lw = dw;
+    if (dh > 0) *lh = dh;
     return bs;
   }
   return (*lw > 0) ? (double)pw / (double)*lw : 1.0;
+}
+
+// The window's logical (client) size, read exactly the way do_resize reads it: the
+// live pixel size over the window's own backing scale. Anything reached from inside
+// a resize transition must NOT use SDL_GetWindowSize, whose value is written when
+// the RESIZE event is *processed* — one step behind the client rect that
+// SDL_GetWindowSizeInPixels queries live. That is not only do_resize's business:
+// NativeWindow.bounds/clientSize are read from an app's Event.RESIZE handler, and
+// measured on this machine a title-bar double-click to maximize answered
+// NativeWindow.width = 1022 (the previous frame) while the stage was already 2560
+// wide — so the app laid itself out for a window 2.5x too small (the TalkMED
+// meeting window derives a content scale from nativeWindow.width).
+static void sk_client_size_live(WinCtx* c, int* lw, int* lh) {
+  int w = 0, h = 0, pw = 0, ph = 0;
+  SDL_GetWindowSize(c->win, &w, &h);
+  SDL_GetWindowSizeInPixels(c->win, &pw, &ph);
+  if (pw > 0 && ph > 0) (void)sk_window_device_scale(c->win, &w, &h, pw, ph);
+  if (lw != NULL) *lw = w;
+  if (lh != NULL) *lh = h;
 }
 
 // Frame borders (title bar / window edges): AIR's bounds is the OUTER frame rect
@@ -1958,10 +2023,13 @@ int sk_window_show_gpu(int w, int h, const char* title, int fullscreen,
 
   // Report the initial physical size + device scale, exactly as the Metal path
   // does: the first frame is sized from the swapchain's real back-buffer size.
+  // The scale comes from sk_window_device_scale for the same reason it does on the
+  // Metal path — dividing the two SDL sizes is only ever right while they are in
+  // step, and this entry used to be the one Windows-only place that still did it.
   int lw = w, lh = h, pw = w, ph = h;
   SDL_GetWindowSize(c->win, &lw, &lh);
   SDL_GetWindowSizeInPixels(c->win, &pw, &ph);
-  double scale = (lw > 0) ? (double)pw / (double)lw : 1.0;
+  double scale = sk_window_device_scale(c->win, &lw, &lh, pw, ph);
   c->pw = pw; c->ph = ph;
   if (on_resize) on_resize(id, lw, lh, pw, ph, scale);
 
@@ -2157,7 +2225,10 @@ void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h) {
   }
   int px = 0, py = 0, cw = 0, ch = 0;
   SDL_GetWindowPosition(c->win, &px, &py);
-  SDL_GetWindowSize(c->win, &cw, &ch);
+  // The live pair, not SDL's cached one — see sk_client_size_live. The position needs
+  // no such treatment: SDL writes window->x/y before it pushes the MOVED event, and
+  // MOVED is what reaches us first.
+  sk_client_size_live(c, &cw, &ch);
   // SDL reports the CLIENT origin; AIR's bounds is the frame, so both frame borders go
   // back on. b_left is 0 on macOS and 8 on Windows, which is why the x was right there
   // and 8px off here (see sk_window_set_bounds).
@@ -2431,7 +2502,7 @@ void sk_window_get_pixel_size(int id, int* pw, int* ph) {
 // after `w.bounds = rect` for a 600x410 frame).
 void sk_window_get_client_size(int id, int* lw, int* lh) {
   WinCtx* c = sk_slot(id);
-  if (c != NULL && c->win != NULL) { SDL_GetWindowSize(c->win, lw, lh); return; }
+  if (c != NULL && c->win != NULL) { sk_client_size_live(c, lw, lh); return; }
   if (lw) *lw = 0;
   if (lh) *lh = 0;
 }
@@ -2446,6 +2517,28 @@ int sk_window_is_active(int id) {
   // this, true with it; adl reports activate() -> active == true).
   SDL_PumpEvents();
   return (SDL_GetWindowFlags(c->win) & SDL_WINDOW_INPUT_FOCUS) ? 1 : 0;
+}
+// The display state as the WINDOW sees it: 0 normal, 1 minimized, 2 maximized,
+// -1 = cannot say. AIR's NativeWindow.displayState follows the window manager, not
+// the last call the app made: the maximize box, a title-bar double-click and a
+// taskbar minimize all change it without calling anything on the AS3 side, and
+// adl reports "maximized" for exactly those (the poll in the generated C then sees
+// the transition it must dispatch displayStateChange for). An app that decides
+// maximize-vs-restore from displayState -- the TalkMED meeting window does -- would
+// otherwise call maximize() again on an already maximized window and never restore.
+//
+// Full screen answers -1 on purpose: whether a window is "fullScreen" is an AS3-side
+// notion (the OS flag pair is also set by backends that keep displayState "normal"),
+// so the caller must keep its own record there rather than have it overwritten.
+int sk_window_os_display_state(int id) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL || c->win == NULL) return -1;
+  SDL_PumpEvents();
+  Uint32 f = SDL_GetWindowFlags(c->win);
+  if (f & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) return -1;
+  if (f & SDL_WINDOW_MINIMIZED) return 1;
+  if (f & SDL_WINDOW_MAXIMIZED) return 2;
+  return 0;
 }
 // NativeWindow.alwaysInFront. SDL_SetWindowAlwaysOnTop exists since 2.0.16
 // (we pin 2.32).

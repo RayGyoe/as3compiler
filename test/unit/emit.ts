@@ -2562,6 +2562,81 @@ function checkEntryPointRecovery(): string[] {
 }
 registerGroup('unit: emit/EntryPointRecovery', checkEntryPointRecovery);
 
+// displayState must follow the WINDOW, not the last call the app made.
+//
+// NativeWindow.minimize/maximize/restore write w->display_state (and dispatch their
+// own displayStateChange), so an app that decides "maximize or restore?" from
+// displayState -- the TalkMED meeting window's header does exactly that -- works as
+// long as nobody else moves the window. The window manager does: a caption
+// double-click, the maximize box and a taskbar minimize change the state without
+// calling anything on the AS3 side, and the record then stays "normal" for the rest
+// of the run. Measured on Windows 11: a real caption double-click left
+// displayState pinned at "normal" on a maximized 2582x1692 window, so the app's next
+// header click called maximize() again instead of restore(). adl reports
+// "maximized" there (and dispatches displayStateChange), because its own record is
+// fed by the platform events.
+//
+// The fix is in ASC_win_poll: ask the window what it is, write the answer back into
+// the record, then let the existing snapshot comparison dispatch the event. The
+// record stays the single source the getter reads, so no second code path can
+// disagree with it, and a PROGRAMMATIC change needs no help -- it writes the record
+// itself and SDL's flag agrees by the next pump, so the comparison sees no change
+// and the event is not reported twice (verified: one displayStateChange per
+// maximize() and per restore()).
+function checkDisplayStateFollowsWindow(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [dsfollow] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [dsfollow] ${label}`); }
+  };
+  const c = generateC(parse('trace(1);')).c;
+  const body = fnBody(c, 'static void ASC_win_poll(int id) {');
+  check('ASC_win_poll is the poll the frame boundary calls', body !== '' &&
+    c.includes('ASC_win_poll('));
+  check('the poll asks the window for its own display state',
+    body.includes('int osds = as_window_os_display_state(id);'));
+  // Order matters: the code below compares against w->display_state, so a stale
+  // record would make the transition invisible for exactly the frame that carried it.
+  const iAsk = body.indexOf('int osds = as_window_os_display_state(id);');
+  const iRead = body.indexOf('int ds = ASC_win_ds_code(w);');
+  check('...and reconciles the record BEFORE the snapshot comparison reads it',
+    iAsk >= 0 && iRead > iAsk);
+  check('...writing it back as the one record the displayState getter answers',
+    /w->display_state = want;\s*gc_write_barrier\(\(void\*\)w->display_state\);/.test(body));
+  check('...mapping all three states the window manager can report',
+    body.includes('(osds == 1) ? (char*)"minimized"') &&
+    body.includes('(osds == 2) ? (char*)"maximized"') &&
+    body.includes('(char*)"normal"'));
+  // "fullScreen" is AS3's own notion (Stage.displayState / NativeWindow fallback);
+  // a backend that reports fullscreen through the same flags must not overwrite it.
+  check('...but never overwrites an AS3-owned fullScreen record',
+    body.includes('strcmp(w->display_state, "fullScreen") == 0') &&
+    body.includes('if (osds >= 0 && !ds_owned) {'));
+  // The state code the poll compares with is still derived from the record, so the
+  // getter, the snapshot and the event payload can never disagree.
+  const dsCode = fnBody(c, 'static int ASC_win_ds_code(ASCWin* w) {');
+  check('the code the poll compares is still taken from the record',
+    dsCode.includes('char* ds = (w != NULL) ? w->display_state : NULL;') &&
+    !dsCode.includes('os_display_state'));
+
+  // Seam: both build flavours must provide it, or the generated C stops linking in
+  // one of them (the exact failure mode unit: platform/BackendParity guards).
+  const rt = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  check('the seam is declared once in runtime.ts',
+    (rt.match(/extern int sk_window_os_display_state\(int id\);/g) ?? []).length === 1);
+  check('...has a real body under ASC_USE_WINDOW',
+    /static inline int as_window_os_display_state\(int id\) \{\s*#ifdef ASC_USE_WINDOW\s*return sk_window_os_display_state\(id\);/.test(rt));
+  check('...and an inert -1 stub for builds without a window backend',
+    rt.includes('static inline int as_window_os_display_state(int id) { (void)id; return -1; }'));
+  const web = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8');
+  check('the web backend answers "no opinion" rather than a wrong state',
+    /int sk_window_os_display_state\(int id\) \{ \(void\)id; return -1; \}/.test(web));
+  console.log(`     [dsfollow] ${ok} display-state check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/DisplayStateFollowsWindow', checkDisplayStateFollowsWindow);
+
 // A String reached through a * / Object slot dispatches on a DIFFERENT table from
 // a statically typed one (as_any_call -> as_str_dyn_call). Two of AVM2's String
 // methods are implemented in AS3 rather than native (core/String.as:

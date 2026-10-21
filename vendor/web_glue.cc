@@ -470,6 +470,12 @@ int sk_window_display_index(int id) { (void)id; return 0; }
 void sk_window_get_pixel_size(int id, int* pw, int* ph) { (void)id; if (pw) *pw = 0; if (ph) *ph = 0; }
 void sk_window_get_client_size(int id, int* lw, int* lh) { (void)id; if (lw) *lw = 0; if (lh) *lh = 0; }
 int sk_window_is_active(int id) { (void)id; return 0; }
+// The browser owns the window, so it cannot answer "is this page maximized" the way
+// a native window manager does (and a page's own fullscreen request is already
+// recorded on the AS3 side). -1 means "no opinion": the generated poll then keeps
+// whatever NativeWindow.maximize/restore/Stage.displayState wrote. Answering 0 would
+// be a lie that overwrites that record on every frame.
+int sk_window_os_display_state(int id) { (void)id; return -1; }
 void sk_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
 // minSize/maxSize and the system move/resize drags have no browser counterpart:
 // a page's window belongs to the browser, so there is no frame to size-limit and

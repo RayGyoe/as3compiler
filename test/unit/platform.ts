@@ -1090,7 +1090,20 @@ function checkPresentScale(): string[] {
   check('...the seam asks the NSWindow for its own backing scale (stable for one display)',
     /sel_registerName\("backingScaleFactor"\)/.test(glue));
   check('...and reconciles a logical size that lags the live pixel size',
-    /if \(dw > \*lw\) \*lw = dw;/.test(glue) && /if \(dh > \*lh\) \*lh = dh;/.test(glue));
+    /if \(dw > 0\) \*lw = dw;/.test(glue) && /if \(dh > 0\) \*lh = dh;/.test(glue));
+  // One-sided repair is not enough, and that is a second, independent bug: do_resize
+  // returns early as soon as the PIXEL size matches, so a logical size that is too
+  // LARGE is never revisited. Measured on Windows with a real caption double-click:
+  // after restore the stage stayed 2560x1636 inside a 1000x680 window for the rest of
+  // the run. So the pin is on the REPLACEMENT (no comparison against *lw at all).
+  check('...by replacing both halves, not only repairing the one that lags',
+    !/if \(dw > \*lw\)/.test(glue) && !/if \(dh > \*lh\)/.test(glue));
+  // Windows counterpart of the NSWindow query (phase 225): GetDpiForWindow is looked
+  // up dynamically so the binary still starts on a pre-1607 system, and a missing
+  // export leaves the SDL ratio in charge rather than guessing a scale.
+  check('...and Windows asks the HWND for its DPI, resolved at run time',
+    /#elif defined\(_WIN32\)[\s\S]{0,600}?GetProcAddress\([\s\S]{0,120}?"GetDpiForWindow"/.test(glue) &&
+    /dpi \/ 96\.0/.test(glue));
   check('...while a platform without that query keeps SDL\'s own ratio unchanged',
     /return \(\*lw > 0\) \? \(double\)pw \/ \(double\)\*lw : 1\.0;/.test(glue));
 
