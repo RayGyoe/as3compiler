@@ -111,6 +111,10 @@ as-aot app.as --swc assets/skin.swc
 # 构建清单（JSON，路径相对清单目录解析）
 as-aot app.as --manifest examples/skia-link.build.example.json
 
+# 用到 flash.text 才链文本排版栈；不画字的程序自动省掉整条 SkParagraph/HarfBuzz/ICU 链
+# （实测 19.43 MB → 6.53 MB，阶段二百二十一；构建时打印 + / - 判定）
+as-aot notxt.as --manifest examples/draw-over.build.json
+
 # 加载 AIR 原生扩展（ANE，阶段一百七十八）：宿主 FRE 运行时接进来，
 # 重编版 ANE 与宿主库（asaot.dll / libasaot.dylib）会随构建落到 <exe 同目录>/extensions/<extID>/<平台>/
 as-aot app.as --manifest app.build.json --ane lib/ANENDI.ane

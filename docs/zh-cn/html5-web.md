@@ -298,7 +298,10 @@ python3 -m http.server 8099 --directory examples/air-starling-demo
 ### 3.4 `flash.net` 的 web 后端：`fetch` + 帧边界 pump
 
 GL 后端放在 `vendor/`，网络后端不——它整个在 `src/runtime.ts` 的 `RUNTIME_PREAMBLE` 里
-（`ASC_HAVE_FETCH` 分支，EM_JS/EM_ASM 胶水），因为它是**运行时行为**而非渲染库。
+（`ASC_HAVE_FETCH` 分支，**全部是 `EM_JS`**，没有一个 `EM_ASM`：后者是内联汇编，clang 的 wasm
+后端不允许它和 `setjmp` 同处一个函数，而 `-O2` 会把 pump 内联进持 `setjmp` 的帧派发器——阶段
+二百二十一 修掉的正是这个「**链接 fetch 后端的 web 构建一律编不过**」的编译期致命错误，
+细节见 [`flash-net.md`](flash-net.md) §6.5 的坑清单），因为它是**运行时行为**而非渲染库。
 
 形状是**拉取/轮询**而非回调：`as_web_fetch_go`（EM_JS）启动 `fetch()` 并把条目推入
 `globalThis.__ascHttpQ`；`as_web_fetch_pump()` 在 **`as_async_tick` 顶部**排空队列。

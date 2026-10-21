@@ -121,6 +121,11 @@ as-aot app.as --swc assets/skin.swc
 # Build manifest (JSON, paths resolved relative to the manifest directory)
 as-aot app.as --manifest examples/skia-link.build.example.json
 
+# The text layout stack is linked only when the program uses flash.text; a program that draws no text
+# automatically drops the whole SkParagraph/HarfBuzz/ICU chain (measured 19.43 MB -> 6.53 MB, stage 221;
+# the build prints the + / - verdict)
+as-aot notxt.as --manifest examples/draw-over.build.json
+
 # Load AIR native extensions (ANE, stage one-hundred-seventy-eight): the host FRE runtime is wired in,
 # and the rebuilt ANE plus the host library (asaot.dll / libasaot.dylib) land under
 # <exe directory>/extensions/<extID>/<platform>/

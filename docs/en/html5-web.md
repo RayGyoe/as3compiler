@@ -330,8 +330,11 @@ measured fps to be ≥ 99% of the target frame rate before adding objects, unrel
 ### 3.4 `flash.net`'s web backend: `fetch` + frame-boundary pump
 
 The GL backend lives in `vendor/`, the network backend does not — it is entirely inside `src/runtime.ts`'s
-`RUNTIME_PREAMBLE` (the `ASC_HAVE_FETCH` branch, EM_JS/EM_ASM glue), because it is **runtime behavior** rather
-than a rendering library.
+`RUNTIME_PREAMBLE` (the `ASC_HAVE_FETCH` branch, **all `EM_JS`** — not one `EM_ASM`: the latter is inline asm,
+and clang's wasm backend forbids it in the same function as `setjmp`, while `-O2` inlines the pump into the
+frame dispatcher that holds the `setjmp`. Stage 221 fixed exactly that **compile-time fatal: every web build
+that linked the fetch backend failed to compile**; details in [`flash-net.md`](flash-net.md) §6.5's pitfall
+list), because it is **runtime behavior** rather than a rendering library.
 
 The shape is **pull/poll** rather than callback: `as_web_fetch_go` (EM_JS) starts `fetch()` and pushes an entry
 into `globalThis.__ascHttpQ`; `as_web_fetch_pump()` drains the queue at **the top of `as_async_tick`**.

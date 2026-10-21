@@ -8,6 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 
 // The package root. This file lives in <root>/test/, so the original
 // `root = import.meta.dirname` (test.ts used to sit at the package root) is now
@@ -28,4 +29,22 @@ export function registerGroup(name: string, fn: () => string[]): void {
     const bad = fn();
     assert.deepStrictEqual(bad, [], `${bad.length} check(s) failed in ${name}`);
   });
+}
+
+// The Skia glue is TWO translation units since stage 221: vendor/skia_glue.cc is
+// the graphics half and vendor/skia_text_glue.cc the text engine (SkParagraph +
+// HarfBuzz + ICU), split so that a build whose program draws no text can leave the
+// second one out of the link entirely -- one object file is linked whole, so while
+// they shared one .o every Skia build resolved skia::textlayout::* and dragged
+// ~13 MB in (docs/zh-cn/rust-text-backend.md).
+//
+// Source-level pins about the glue ask "what does the glue do", not "which half
+// does it in", so they read the pair. The split itself is pinned separately
+// (unit: build/TextEngineSplit), which is what keeps the two statements honest.
+export function readGlue(): string {
+  return (
+    readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8') +
+    '\n' +
+    readFileSync(join(root, 'vendor', 'skia_text_glue.cc'), 'utf8')
+  );
 }

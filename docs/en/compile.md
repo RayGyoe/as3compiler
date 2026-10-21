@@ -747,6 +747,15 @@ resolve **relative to the directory containing the manifest file** (same as Type
 **Priority**: CLI arguments override same-named manifest fields (mirroring TypePHP's "CLI beats YAML").
 Merge order: default config → manifest top level → manifest `targets.<final target>` (§4.1) → CLI overrides.
 
+> **A source may be added even when `sources` does not name it**: `skia_glue.cc` is the **graphics half**
+> and `vendor/skia_text_glue.cc` the **text half**. When the manifest names only the former, the build
+> layer **adds the latter** together with `ASC_HAVE_TEXT` whenever the program uses `flash.text`
+> (stage 221; see [`rust-text-backend.md`](rust-text-backend.md) §2) — a program that draws no text
+> therefore does **not link** SkParagraph/HarfBuzz/ICU at all (measured 19.43 MB → 6.53 MB). Conversely,
+> a manifest that **explicitly** names `skia_text_glue.cc` always gets it linked (the manifest wins).
+> The decision is printed during the build: `+ flash.text: text engine linked (...)` or
+> `- flash.text: no text in this program -- ...`.
+
 ### 4.1 Per-target layering (`targets`)
 
 Top-level fields are the **shared default**; the `targets.<target>` block takes effect only for the

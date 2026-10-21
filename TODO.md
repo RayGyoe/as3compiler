@@ -13430,7 +13430,84 @@ trim 规则、注释切分文本 run、`&#32;` 的空节点、属性 `>`）是�
 
 **closure 三条**：① **「AIR 会不会降级」与「谁在读这个值」是两个问题** —— AIR 不降级，但 Starling 读的是**回读值**，所以「接受请求、如实上报」比「回显请求」既更诚实也更安全；判断一个上报值对不对，要看**它的消费者拿它做什么**；② **同一对参数有校验顺序** —— 顺序是可观测行为（两个都错时报哪条），钉它要用**索引先后**而不是「两条都在」；③ **描述符元素的位置是语义** —— `renderMode` 放错层不会报错，只会让 Stage3D 静默消失，症状（`#2044`/`#3702`）离根因隔了两层，先查 XSD 再改代码。
 
+### 阶段二百二十一：文本引擎不再进"不画字"的链接 —— Skia 胶水拆两半（v0.4.195 → v0.4.196）✅ 已完成
+
+**触发**：用户指着 [`docs/zh-cn/rust-text-backend.md`](docs/zh-cn/rust-text-backend.md)（2026-10-20 写的调研稿）说：它建议先把文本 glue 从 `vendor/skia_glue.cc` 拆成**独立对象 / 独立源文件**；按要求走**两步**——**第一步现在做：拆分 + 优化体积**；第二步（换 Rust 文本后端）以后再谈。并要求**按实际计划与结果重写那份文档**。
+
+**范围**：只改**链接图**，不改任何 AS3/渲染语义。生成的 C **一个字节都没变**。
+
+**一、根因：对象文件是整份参与链接的**
+
+`vendor/skia_glue.cc` 原本 2106 行、编成**一个** `skia_glue.o`，里面同时装着图形与文本。只要它的任何一个函数引用 `skia::textlayout::*`，链接器就必须解析 `libskparagraph.a → libskunicode.a → libharfbuzz.a → libicu.a → libicu.icudtl_dat.o`，于是**哪怕一行字都不画**也把整条整形栈拉进二进制。两条被实测否掉的路：
+
+| 试过的办法 | 结果 |
+|---|---|
+| glue 加 `-ffunction-sections` + 链接 `-Wl,-dead_strip` | **仍然链接失败**（`Undefined symbols: skia::textlayout::StrutStyle::StrutStyle()`）——分节救不了"未定义符号必须可解析" |
+| 只给最终二进制 `-Wl,-dead_strip` | 少 2.74 MB，但 ICU 仍在（文本符号已进链接图） |
+
+⇒ **拆源文件是唯一能改链接图的手段**：只有把引用 SkParagraph 的代码放进**另一个** `.o`，那个 `.o` 才有可能不参与链接。
+
+**二、拆法（判据一条：图形半边不得出现任何 SkParagraph 符号）**
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `vendor/skia_glue.cc`（图形半边） | 1492 | surface/GPU/canvas/paint/blend/path/gradient/rich-fills/filters/bitmap、SVG、图像编解码、**平台字体管理器** |
+| `vendor/skia_text_glue.cc`（文本半边，新） | 695 | `sk_default_typeface`、AIR 设备字体别名、`sk_text_measure*`、`sk_canvas_draw_text*`、全部 `sk_textlayout_*`、AIR 行盒/strut 换算（`sk_air_line_metrics`/`sk_round_half`/`sk_set_air_strut`） |
+| `vendor/skia_glue_internal.h`（新） | 18 | 两半**唯一**共享声明 `sk_sp<SkFontMgr> sk_platform_fontmgr();`（C++ 链接，**故意不 inline**） |
+
+**接缝一个字没改**——15 个函数的签名、语义、生成的 C 全部不动，搬的只是实现。这就是 §2.9 那条不透明接缝的价值。**字体管理器刻意留在图形半边**：SVG 的 `<text>` 要它（`skia_glue.cc:1431`），web 的字体注入 `sk_fontmgr_register_data` 改的是同一个缓存，而 `EXPORTED_FUNCTIONS` **无条件**导出它 ⇒ 搬过去会让"不画字的 web 构建"直接链接失败。它是两半唯一的共享符号，故有那张内部头。
+
+**三、判定与门控（都不许静默）**
+
+| 面 | 实现 |
+|---|---|
+| 谁决定链哪一半 | `src/index.ts::usesTextEngine`（源级扫描：`flash.text.` 包名 **或** 裸类名 `TextField`/`TextFormat`/`StyleSheet`/… —— AS3 允许不 import 就写全限定名，两种都要抓） |
+| SWC 烘焙 | `swcBake.characters` 里 `kind === 'text'` 的字符被烘成**真 `TextField`**，而源码里一个字都不提 `flash.text` ⇒ 必须并进判定（否则 `--air-app` 的皮肤应用静默丢文字） |
+| 清单优先 | 清单显式写了 `vendor/skia_text_glue.cc` ⇒ 一律链（用户说了算） |
+| 源码与宏同分支 | `cfg.sources.push(...)` 与 `cfg.defines.push('ASC_HAVE_TEXT')` 在**同一个 if 分支**里，不可能只加一个（只加源码=白带体积，只加宏=undefined symbol） |
+| 构建期打印 | `+ flash.text: text engine linked (...)` / `- flash.text: no text in this program -- text engine NOT linked (~12.9 MB smaller)` |
+| 运行时两态 | `runtime.ts:8927` 起接缝三分支：`ASC_HAVE_TEXT` → 真转发；`#else` → 同形 no-op + **一次性 stderr 警告** `as_text_engine_absent()`；`#ifndef ASC_USE_SKIA` → 原有全 0 桩（**未动**） |
+
+**四、实测（同一份不画字的程序、同一份清单，唯一差别是判定结果）**
+
+| | 二进制 | ICU 数据 |
+|---|---|---|
+| 拆分前基线 | **19,429,928 B = 19.43 MB** | 有（`_icudt69_dat`） |
+| 拆分后（自动判定"无文本"） | **6,531,688 B = 6.53 MB** | **无** |
+| 拆分后但生成的 C 用 `-O0` 编 | 6,809,608 B，链接通过 | 无 |
+| 用文本的示例（`tf-scale-metrics`） | 19,430,208 B（判定"有文本"，与基线同量级） | 有 |
+| 故意不链文本半边跑**用文本**的程序 | 6,548,376 B，打出那三行警告 + 程序自检停在 `textWidth <= 0` | 无 |
+
+**省 12,898,240 B（−66.4%）**：ICU 数据块 10.19 MB + 其余 ≈2.7 MB（skunicode + harfbuzz + skshaper + skparagraph）。`-O0` 那一行是**刻意**的——若新链接只在 `-O2` 剪掉死分支后才成立，说明我们依赖优化器而不是链接图，换个 `opt` 就会炸。
+
+**五、四个坑（都写进注释了）**：① `RUNTIME_PREAMBLE` 是**反引号模板串** ⇒ C 注释里不能出现反引号（否则 TS 语法错）；② 同一原因 `\n` 必须写两遍，否则在生成的 C 里变成真换行 + 断串；③ 五个单元组按"单个 glue 文件"读源码，文本代码一搬走**全红** ⇒ 加 `test/harness.ts::readGlue()`（两文件拼接），**拆分本身**另由新组 `unit: build/TextEngineSplit`（13 条）单独钉；④ `sk_platform_fontmgr` 去掉 `static` 后 `platform/FontFallback` 的锚点串失效，锚点同步改。
+
+**六、验收**：`node test.ts` **428 项 / 428 通过 / 0 红 / 0 跳过**（225 示例 + 203 单元组，新增 1 组）；新组 `unit: build/TextEngineSplit` 13 条（图形半边无 skparagraph 头/类型、16 个接缝入口全在文本半边、共享字体管理器两式、web 注入入口仍在图形半边、`ASC_HAVE_TEXT` 两态、无引擎臂必须警告、源码与宏同分支、清单优先、SWC 计数）；文档按实际计划重写 [`docs/zh-cn/rust-text-backend.md`](docs/zh-cn/rust-text-backend.md) 与 [`docs/en/rust-text-backend.md`](docs/en/rust-text-backend.md)（两步走 + 阶段二百二十一 实测 + 单位统一为十进制 MB）；产物在 `temp/split/`（scratch，不入库）。
+
+**七、顺带修掉一个"并非本阶段引入"的编译期致命错误（先如实定位，不顺手改语义）**：验收 `--air-app` 的
+web 路径时发现**两个 `--air-app` 示例都编不出 wasm**。先在 `3493eed` 上 `git stash` 复现，确认
+**改动前就红**（与本阶段无关）：`fatal error: error in backend: Cannot use EM_ASM* alongside
+setjmp/longjmp in Stage_dispatchFrame`。根因链完整：`air-app` 检测到联网 ⇒ 清单带
+`ASC_HAVE_FETCH=1` ⇒ fetch pump 的 12 处 `EM_ASM`/`EM_ASM_INT` ⇒ **内联汇编** ⇒ `-O2` 把 pump 内联进
+帧派发器，而帧派发器持有该帧异常恢复点的 `setjmp` ⇒ clang 的 wasm 后端直接报致命错误。
+修法：**全部换 `EM_JS`**（`as_web_q_next`/`as_web_cur_job`/`_serial`/`_buflen`/`_buf`/`_status`/`_redirected`/
+`_clen`/`_clear`/`_jsstr_len`/`_jsstr_copy` + `as_web_open_tab`），语义逐句等价；`[web]` 组加两条钉子
+（"代码里不得出现任何 `EM_ASM`" + "pump 经 `as_web_q_next` 取队"）。修后两端都通：
+
+| 构建 | 结果 |
+|---|---|
+| `--air-app air-starling-demo --target wasm --package web` | 31 s，`demo3.wasm` **8.97 MB** |
+| `--air-app air-native --target wasm --package web` | 15 s，`anweb.wasm` **7.43 MB** |
+| 同一份 web 清单、不画字的小程序 | `- flash.text: ... NOT linked`，**2.77 MB** |
+| 同上、改用 `TextField` | `+ flash.text: ... linked`，**5.85 MB** |
+
+⇒ **判定的收益在 web 端同样成立**（+3.08 MB 就是 web 侧 ICU + 整形栈），且"字体管理器留在图形半边"那条
+决定被反证：不画字的那份**没链文本半边**却仍然导出了 `_sk_fontmgr_register_data`。
+
+**closure 三条**：① **"换引擎"与"别链引擎"是两个收益，后者不需要前者** —— 旧稿把拆分写成"换 Rust 的前置条件"，实际上它是**独立且最大的一笔**（−12.90 MB），且零语义风险；判断该不该动 A 之前，先问"不用 A 的人能不能不链 A"；② **判定时机由它改变的东西决定** —— `ASC_HAVE_TEXT` 改的是**生成 C 的内容**，所以判定必须发生在编译之前 ⇒ 源级扫描（可能过判）而不是"事后看目标的未定义符号"（精确但太晚）；过判的代价是体积，漏判的代价是**静默无文字**，故必须做成"过判 + 警告"而不是"精确 + 静默"；③ **拆出来的东西要按"谁还需要它"逐个判** —— 文本段整块搬走很容易顺手把**平台字体管理器**也搬走，而它同时被 SVG 与 web 字体注入需要；"两半共享的符号"必须显式只剩一个（内部头 + 非 inline），否则每次拆都会把图形侧的能力一起搬空。
+
 ### 遗留待开发
+> **2026-10-21 追加（阶段二百二十一：文本引擎不再进"不画字"的链接）**：**新登记 0 行 / 改写 0 行 / 移出 0 行**（**同阶段发现并修掉的 web `EM_ASM`/`setjmp` 编译期致命错误也不入表**——它不是 AIR 语义缺口，是**我们自己 web 后端的编译缺陷**且当场修净——它是**我方 web 后端的实现缺陷**，不是 AIR 已定义行为在我们这儿的缺失，故按「同阶段发现、同阶段修好 ⇒ 记在阶段记录里」处理） ⇒ 表内实际行数不变（**95 项**）。本阶段是**链接图**的改动（Skia 胶水拆成图形/文本两个翻译单元 + 构建层按 `flash.text` 判定链不链），生成的 C 逐字节不变、不涉及任何 AIR 已定义行为 ⇒ 既不新增也不清偿语义欠账，故不入表（与阶段二百 / 二百零一 / 二百零二 / 二百零三 同理）。**如实报明一处仍未做的**：`docs/zh-cn/rust-text-backend.md` 的 L1（链接期 `-Wl,-dead_strip`，实测 −2.74 MB）**仍未落地**，它不属本阶段批准范围，也从未登记成表行（是体积项、不是语义缺口），故此处只记一笔。**closure 一条**：`-dead_strip` 与本次拆分**不叠加**——拆分省的是"不用文本的程序"（12.90 MB），`-dead_strip` 省的是所有程序（2.74 MB），两者互不覆盖，但都与"换 Rust 文本引擎"无关。
 > **2026-10-21 追加（阶段二百二十：`requestContext3D` 两参签名 + `Context3DProfile.ENHANCED`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内实际行数不变（**95 项**）。本阶段修的三处（缺形参、缺常量、缺同步校验）**都是 `adl` 跑得对而我们跑不出**，按 §1.5 硬判据属**遗留缺陷**且在阶段内修完，故不入表（与阶段一百七十八·七 同例）。唯一新增的**已知差异**是「`renderMode="software"` 被接受但不改变后端」（我们始终用编译期选定的 Stage3D 后端），它已写在 `docs/zh-cn/display3d.md` §7 的 `profile` 行里 —— 不单列成表行，因为该差异只在「机器根本没有可用 GPU」时才有可观测后果，而我们的窗口后端本身就依赖 GPU。
 > **2026-10-21 追加（阶段二百一十八：`File.separator` / `File.lineEnding` 落地）**：**新登记 0 行 / 改写 1 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数（口径：`|` 开头的行 − 表头行 − 分隔行 = 表内项数，状态取**状态列首个词**），表内项数 **96 → 95 项**（`未开始` **73 → 72**，`部分完成` 18 / `已修` 3 / `调研完成 · 实现暂缓` 1 / `已记录` 1 不变），与「只移出 1 行、其余不动」自洽。**另报一处口径差**：上一轮 note 的绝对项数记作 **97**（`未开始` **74**），而按 HEAD（`5ce625b`：**94 项** / `未开始` 71）叠加阶段二百一十六（+1）、二百一十七（+2 −1）推得**应为 96 项 / `未开始` 73** —— 若这期间没有别的改动删过行，则上一轮的**绝对标签比表内实际多 1**（增量本身没错，只是标签多算了一个，`未开始` 同样多 1）；表内**行数**是准的，本轮起按实测行数记账，这 1 的来历留待下次核对。**移出 1 行**是「**`File.separator` / `File.lineEnding` 未实现**」—— 本阶段已落地（短名与全限定名两式走同一份静态 traits，`adl 51.4.1` 双写对照逐字相同，示例层在 Windows 上真跑通），按「已完成项一经落地即移出」移除。**改写 1 行**是「**点链首段被变量遮蔽时仍被当类引用解析**」—— 本阶段顺手量到**同源的第二个面**：全限定名读一个**不存在**的静态成员时**静默回 `undefined`**（`as_class_member_value` 的兜底），而短名当场报编译错；两者同属「点链当 Class 值解析」，故并入同一行的证据列、不另立行（这也是该行继续留在表内的原因）。
 > **2026-10-21 追加（阶段二百一十七：类引用的全限定名不再退化成动态查表）**：**新登记 2 行 / 改写 0 行 / 移出 1 行** ⇒ 表内项数 **96 → 97 项**（`未开始` 73 → **74**，其余不变）。**移出 1 行**是「**类引用写全限定名时静态成员特化失效**」—— 它就是本阶段修掉的那条（触发即此表），读/写/调用/内置四类形态全部改为按 `classRefName` 判定，`adl 51.4.1` 双写对照逐字相同，故按本表「已完成项一经落地即移出」移除。**新登记 2 行**都是本轮**顺手量出来、但不在批准范围内修**的真缺陷：① 「**点链首段被变量遮蔽时仍被当类引用解析**」（`adl` 抛 `#1009`，我们在 HEAD 上就已静默读出静态值/undefined —— 静默错值，且同源面还包括「点链当 Class 值解析」与 `Cls["member"]`，故不动旧路径）；② 「**`File.separator` / `File.lineEnding` 未实现**」（`adl` 两式都打印，我们两式都在**编译期**硬报 `undefined static field 'separator' on class 'File'` ⇒ 属「`adl` 跑得对、我们跑不出」，是缺常量而非特化退化）。

@@ -272,6 +272,22 @@ function checkWebTransport(): string[] {
   check('the web pump decodes a remote image payload before its thunk runs',
     /AS_JOB_IMAGE_URL/.test(pump) && /as_skia_image_decode_bytes_argb/.test(pump));
 
+  // (4) The browser glue must go through EM_JS, never EM_ASM. EM_ASM expands to
+  // inline asm, and clang's wasm backend refuses to compile a function that holds
+  // both inline asm and setjmp: "fatal error: error in backend: Cannot use
+  // EM_ASM* alongside setjmp/longjmp in Stage_dispatchFrame". -O2 inlines the
+  // fetch pump into the frame dispatcher, which owns the frame's exception
+  // recovery point, so while the pump's accessors were EM_ASM EVERY web build
+  // that linked the fetch backend failed to compile -- including both documented
+  // --air-app examples (measured on examples/air-native and
+  // examples/air-starling-demo; the fatal names whichever setjmp frame the pump
+  // lands in, so the anchor below is the RULE, not that one function name).
+  const codeOnly = p.split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n');
+  check('the browser glue uses EM_JS, never EM_ASM (inline asm may not share a function with setjmp)',
+    !/\bEM_ASM(_INT|_INT64|_FLOAT)?\s*\(/.test(codeOnly));
+  check('the fetch pump reads the queue through EM_JS accessors',
+    /EM_JS\(int, as_web_q_next/.test(p) && /int kind = as_web_q_next\(\);/.test(p));
+
   if (ok > 0) console.log(`[web] ${ok} transport checks passed`);
   return bad;
 }

@@ -18426,7 +18426,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // The field's own default style: AIR lays out everything the runs do NOT
     // cover in it (the gaps between runs, and the line box of a line no run
     // reaches), so it is handed to the glue separately from runs[0] (measured on
-    // adl -- see sk_set_air_run_height in vendor/skia_glue.cc).
+    // adl -- see sk_set_air_run_height in vendor/skia_text_glue.cc).
     this.line('sk_text_run dr;');
     this.line('dr.start = 0; dr.end = 0; dr.family = fmt->font; dr.size = size;');
     this.line('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading;');

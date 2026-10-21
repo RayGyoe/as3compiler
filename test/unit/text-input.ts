@@ -15,6 +15,7 @@ import { airManifest, prepareAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import { readGlue } from '../harness.ts';
 
 // ---- 阶段九十四·七 C2：可编辑 TextField / 键盘与文本输入 ----------------
 // 口径全部来自 temp/editprobe/ 的 adl ↔ AOT 双端对照（探针 src/Ed2.as…Ed4.as，
@@ -209,7 +210,7 @@ function checkTextInput(): string[] {
     else { bad.push(label); console.log(`FAIL  [textinput] ${label}`); }
   };
   const c = generateC(parse('import flash.text.TextField;\nimport flash.text.TextFieldType;\nimport flash.events.TextEvent;\nvar f:TextField = new TextField();\nf.type = TextFieldType.INPUT;\nf.maxChars = 5;\nvar e:TextEvent = new TextEvent(TextEvent.TEXT_INPUT, true, true, "x");\n')).c;
-  const skiaGlue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const skiaGlue = readGlue();
 
   // 常量与构造：TextFieldType 是普通 const 类，TextEvent 继承 Event 且带 text 槽。
   check('TextFieldType exposes INPUT/DYNAMIC as measured constants',
@@ -423,7 +424,7 @@ function checkTextInput(): string[] {
   check('the no-window build stubs both new glue entry points',
     preamble.includes('static inline int sk_window_text_edit_take(int id, char* buf, int cap, int* start, int* length)') &&
     preamble.includes('static inline void sk_window_set_text_input_rect(int id, double x, double y, double w, double h)'));
-  const skia = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const skia = readGlue();
   check('skia_glue exposes the caret rect lookup used to place the preview',
     skia.includes('int sk_textlayout_caret_rect(void* para, int index, double* x, double* y, double* h)'));
   check('the caret rect falls back to the previous glyph box at the end of the text',

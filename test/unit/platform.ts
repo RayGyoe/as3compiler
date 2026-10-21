@@ -1867,7 +1867,11 @@ function checkFontFallback(): string[] {
     readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
   const strip = (s: string): string =>
     s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
-  const raw = read('skia_glue.cc');
+  // Both halves of the Skia glue: the platform font manager lives in the graphics
+  // half, but sk_family_alias (which resolves an UNINSTALLED family to the
+  // platform default) went with the text engine in stage 221 -- see
+  // docs/zh-cn/rust-text-backend.md.
+  const raw = read('skia_glue.cc') + '\n' + read('skia_text_glue.cc');
   const glue = strip(raw);
 
   const win = glue.indexOf('#elif defined(_WIN32)');
@@ -1959,10 +1963,10 @@ function checkFontFallback(): string[] {
     !glue.includes('SkOrderedFontMgr') && !raw.includes('SkOrderedFontMgr.h'));
 
   // (5) Windows-only: the macOS branch stays the cached CoreText manager.
-  const apple = glue.slice(glue.indexOf('#else\nstatic sk_sp<SkFontMgr> sk_platform_fontmgr()'));
+  const apple = glue.slice(glue.indexOf('#else\nsk_sp<SkFontMgr> sk_platform_fontmgr()'));
   check('the two-tier manager is Windows-only; macOS keeps CoreText',
     win > glue.indexOf('#ifdef __EMSCRIPTEN__') && cls > win &&
-    apple.startsWith('#else\nstatic sk_sp<SkFontMgr> sk_platform_fontmgr() {\n  static sk_sp<SkFontMgr> cached = SkFontMgr_New_CoreText(nullptr);\n  return cached;\n}') &&
+    apple.startsWith('#else\nsk_sp<SkFontMgr> sk_platform_fontmgr() {\n  static sk_sp<SkFontMgr> cached = SkFontMgr_New_CoreText(nullptr);\n  return cached;\n}') &&
     !apple.slice(0, 400).includes('SkAirFontMgr'));
 
   // (6) The rationale has to stay written down next to the class: WHY GDI alone cannot

@@ -740,8 +740,16 @@ bash temp/run_webprobe.sh          # → webprobe: DONE checks=15 failures=0
 - **`showWindow` 会「拔栈」**：web 上它调 `emscripten_set_main_loop(..., simulateInfiniteLoop)`，
   后者抛 `unwind` 哨兵穿透 `main`——**写在 `showWindow` 之后的语句永不执行**。启动链必须先跑，
   `showWindow` 放最后。
-- **EM_ASM 里不要用 Emscripten JS 库函数**（`stringToUTF8`/`lengthBytesUTF8`）：库函数只在
-  **编译后的 C** 调用它们时才被链进构建，从 EM_ASM 里摸是 `ReferenceError`（实测）。UTF-8
+- **web 侧一律用 `EM_JS`，不要用 `EM_ASM`**（阶段二百二十一 实测的**编译期**致命错误）：
+  `EM_ASM` 展开成**内联汇编**，而 clang 的 wasm 后端**拒绝编译同时含内联汇编与 `setjmp` 的函数**
+  —— `fatal error: error in backend: Cannot use EM_ASM* alongside setjmp/longjmp in
+  Stage_dispatchFrame`。`-O2` 把 `as_web_fetch_pump` 内联进帧派发器，而帧派发器正是这一帧的
+  异常恢复点（持有 `setjmp`），于是**每一个链接了 fetch 后端的 web 构建都编不过**（两个
+  `--air-app` 示例都中招；错误里点名的是 pump 恰好落进去的那个 `setjmp` 函数，故症状会随内联
+  位置变化）。`as_web_q_next`/`as_web_cur_*`/`as_web_jsstr_*`/`as_web_open_tab` 即为此拆出的
+  `EM_JS` 访问器，结构性钉子见 `test/unit/transport.ts` 的 `[web]` 组。
+- **`EM_JS` 里也不要调 Emscripten JS 库函数**（`stringToUTF8`/`lengthBytesUTF8`）：库函数只在
+  **编译后的 C** 调用它们时才被链进构建，从 JS 体里摸是 `ReferenceError`（实测）。UTF-8
   编解码改用内置 `TextEncoder` + `HEAPU8.set`，不依赖 Emscripten 库。
 - **单线程 `HTTPServer` + `HTTP/1.1` keep-alive 会死锁**：服务器停在一个连接的处理循环里，
   浏览器开第二条连接（并行写 POST/GET）时请求永远到不了；用 `ThreadingHTTPServer`。

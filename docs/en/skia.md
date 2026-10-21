@@ -130,6 +130,33 @@ This is the most important technical conclusion of this plan, and a detail that 
 }
 ```
 
+#### 3.1 The glue layer is two translation units: a graphics half and a text half (stage 221)
+
+Since stage 221, `skia_glue.cc` is **split into two `.cc` files**, and the reason is not "the file got
+big" but **link semantics**: **an object file is linked whole**. Before the split it held graphics and
+text together, so as long as the text section referenced `skia::textlayout::*`, the linker had to resolve
+`libskparagraph.a → libskunicode.a → libharfbuzz.a → libicu.a → libicu.icudtl_dat.o` (that 10.19 MB is
+**one indivisible data object**) ⇒ **a program that draws no glyphs still dragged the whole shaping
+stack into the binary** (measured 19.43 MB — the *same size* as a program that does draw text). Two
+shortcuts were measured and rejected: compiling the glue with `-ffunction-sections` and linking with
+`-Wl,-dead_strip` **still fails** (`Undefined symbols: skia::textlayout::StrutStyle::StrutStyle()`), and
+`-dead_strip` on the final binary alone does not save ICU either.
+
+| File | Contents | When it enters the link |
+|---|---|---|
+| `vendor/skia_glue.cc` | graphics half (surface/canvas/paint/path/gradients/filters/bitmaps/SVG/codecs) + **the platform font manager** | **always**, on a Skia build |
+| `vendor/skia_text_glue.cc` | text half (`sk_text_measure*`, `sk_canvas_draw_text*`, every `sk_textlayout_*`, the AIR line-box/strut conversions, device-font aliases) | only when the program uses `flash.text` (including text characters baked from an SWC) |
+| `vendor/skia_glue_internal.h` | the single shared declaration `sk_platform_fontmgr()` (C++ linkage, **deliberately not inline**) | header |
+
+**The seam is unchanged**: the generated C still calls only those 15 `sk_*` functions
+(`runtime.ts:8763–8789`); only the implementation moved. **The font manager deliberately stays in the
+graphics half** — the SVG rasterizer hands it to `SkSVGDOM` for `<text>`, and the web font injection
+`sk_fontmgr_register_data` mutates the same cache while `EXPORTED_FUNCTIONS` exports it
+**unconditionally**; moving it would break the link of a text-free web build. The build-layer decision
+(`src/index.ts::usesTextEngine`), the two-state runtime seam (`ASC_HAVE_TEXT`, with a **one-time stderr
+warning** when the engine is absent), the measurements and the traps are documented in
+[`rust-text-backend.md`](rust-text-backend.md) §2.
+
 > The above only sketches the **shape** (`link-libs` actually has twenty-odd entries, and copying the whole
 > thing into the docs would only go stale — an earlier version of this file did exactly that and got
 > `skia_glue.c` and `include-paths: ["../vendor/skia/include"]` wrong). **The only authority is
@@ -761,7 +788,7 @@ assertion-style regressions in `examples/textrich.as` (`examples/textflow.as` is
 
 ### 8.2 `autoSize` sizing contract and the fallback face for an uninstalled family (stage 168)
 
-Both live in the text layer (`vendor/skia_glue.cc` / `src/emit.ts`), and both were pinned against the
+Both live in the text layer (`vendor/skia_text_glue.cc` / `src/emit.ts`), and both were pinned against the
 `adl 51.4.1` same-source dual-end probe (`temp/tfswc` cases 6/7/8/9/10; after the fix the AOT report is
 **byte-identical** to `adl`'s).
 
@@ -863,7 +890,7 @@ That is the garble the user reported: the AI-subtitle window's card painted its 
 `.notdef` glyphs; after the fix the same window at the same position renders 创建同传 normally (the other fields
 use MiSans or other families and were never garbled).
 
-**The fix: the Windows branch of `vendor/skia_glue.cc` becomes `SkAirFontMgr : public SkFontMgr`, GDI as
+**The fix: the Windows branch of `vendor/skia_glue.cc` becomes `SkAirFontMgr : public SkFontMgr` (since stage 221 that font manager belongs to the **graphics half**, see §3.1), GDI as
 `fPrimary` and DirectWrite as `fFallback`; `onMatchFamilyStyleCharacter` crosses over unconditionally** (the GDI
 port answers that one with `nullptr` for every code point), **while a family-name query crosses only when GDI
 misses it, and only as a localized-name to English-name translator** (see §8.4.1).

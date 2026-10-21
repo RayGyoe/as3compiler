@@ -18,6 +18,7 @@ import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
 import type { SwcLibrary } from '../../src/swc.ts';
 import { deflateSync } from 'node:zlib';
+import { readGlue } from '../harness.ts';
 
 // ---- E1: the opt-in SVG decode channel (+ the GC red line it exposed) ----
 //
@@ -54,7 +55,7 @@ function checkSvgChannel(): string[] {
   check('every pixel-adoption site keeps the GC write barrier',
     adoptSites > 0 && (emitted.match(/gc_write_barrier\(bd->pixels\)/g) ?? []).length === adoptSites);
 
-  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const glue = readGlue();
   // Opt-in is the whole point (AIR has no SVG at all, so per §1.5 the default
   // build must stay byte-for-byte AIR). Split the file on the guards and require
   // that nothing SVG-flavoured survives outside one.
@@ -113,7 +114,7 @@ function checkFontMetrics(): string[] {
     else { bad.push(label); console.log(`FAIL  [fontmetrics] ${label}`); }
   };
 
-  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const glue = readGlue();
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
   const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
 
@@ -227,7 +228,7 @@ function checkBorderWidth(): string[] {
     else { bad.push(label); console.log(`FAIL  [border1px] ${label}`); }
   };
 
-  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const glue = readGlue();
   const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
   const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
@@ -467,7 +468,7 @@ function checkFilterRaster(): string[] {
     '',
   ].join('\n');
   const c = generateC(parse(src)).c;
-  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const glue = readGlue();
   const preamble = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
 
   check('the blur/blow-up sigma helper is variance-matched to AIR\'s box blur',
@@ -1349,7 +1350,7 @@ function checkFrameCanvasHygiene(): string[] {
     RUNTIME_PREAMBLE.includes('static inline void as_skia_canvas_reset(void* c) { sk_canvas_reset(c); }'));
   check('a build without a canvas API still compiles (no-op stub)',
     RUNTIME_PREAMBLE.includes('static inline void as_skia_canvas_reset(void* c) { (void)c; }'));
-  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const glue = readGlue();
   check('sk_canvas_reset drops every pending save and clears the matrix',
     glue.includes('c->restoreToCount(1);') && glue.includes('c->resetMatrix();'));
   check('...and refuses a NULL canvas instead of dereferencing it',

@@ -15,6 +15,7 @@ import { airManifest, prepareAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import { readGlue } from '../harness.ts';
 
 // ---- hitTestPoint(x, y, shapeFlag) region test (stage 94.22) ----
 //
@@ -31,7 +32,7 @@ function checkHitShape(): string[] {
     else { bad.push(label); console.log(`FAIL  [hitshape] ${label}`); }
   };
 
-  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const glue = readGlue();
   const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
   const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
@@ -499,7 +500,7 @@ function checkLineMetrics(): string[] {
     else { bad.push(label); console.log(`FAIL  [linemetrics] ${label}`); }
   };
 
-  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const glue = readGlue();
   const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
   const symbols = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
@@ -742,7 +743,7 @@ function checkAutoSizeMetrics(): string[] {
   };
 
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
-  const glue = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const glue = readGlue();
   const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
   const example = readFileSync(join(root, 'examples', 'autosize-metrics.as'), 'utf8');
   const registry = readFileSync(join(root, 'test', 'examples.ts'), 'utf8');

@@ -676,6 +676,13 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 **优先级**：CLI 参数覆盖清单同名字段（对标 TypePHP 的「CLI beats YAML」）。
 合并顺序：默认配置 → 清单顶层 → 清单 `targets.<最终目标>`（§4.1）→ CLI 覆盖。
 
+> **`sources` 里没写也可能被加进来**：`skia_glue.cc` 是**图形半边**，`vendor/skia_text_glue.cc` 是
+> **文本半边**。清单只写前者时，构建层会按「程序是否用到 `flash.text`」**自动补上后者**并同时加
+> `ASC_HAVE_TEXT`（阶段二百二十一，见 [`rust-text-backend.md`](rust-text-backend.md) §2）——
+> 用不到文本的程序因此**根本不链** SkParagraph/HarfBuzz/ICU（实测 19.43 MB → 6.53 MB）。
+> 反过来，清单**显式**写了 `skia_text_glue.cc` 就一律链（此时清单说了算）。构建时会打印判定：
+> `+ flash.text: text engine linked (...)` 或 `- flash.text: no text in this program -- ...`。
+
 ### 4.1 按目标分层（`targets`）
 
 顶层字段是**公共默认**；`targets.<目标>` 块只对**匹配的目标**生效，并把块内声明的字段**整体替换**（replace，而非追加）同名顶层值。这样**一份清单**就能服务链接集互斥的多目标——典型场景是 `flash.net` 的 HTTP 后端：native 链接 curl，而 WASI preview1 没有 socket/TLS，`-lcurl` 会让 `wasm-ld` 直接失败（`unable to find library -lcurl`），必须为 wasm 去掉它。
@@ -1027,8 +1034,8 @@ as-aot examples/web/hello-web.as \
 | 形态 | 编译命令 | 关键 `defines` | 关键 `sources` / `-l` |
 |---|---|---|---|
 | 纯命令行（无图形） | `as-aot examples/hello.as --run` | 无 | 无（默认 `cc -O2 -lm`） |
-| 离屏渲染（Skia 出 PNG，无窗口） | `as-aot app.as --manifest examples/skia-link.build.example.json` | `ASC_USE_SKIA=1` | `skia_glue.cc` + `-l skia ...` |
-| GUI 窗口（SDL2 上屏 + 事件循环） | `as-aot examples/window_click.as --manifest examples/window_click.build.example.json` | `ASC_USE_SKIA=1` + `ASC_USE_WINDOW=1` | `skia_glue.cc` + `window_glue.cc` + `-l SDL2 -l objc` |
+| 离屏渲染（Skia 出 PNG，无窗口） | `as-aot app.as --manifest examples/skia-link.build.example.json` | `ASC_USE_SKIA=1` | `skia_glue.cc` +（用到 `flash.text` 时自动加 `skia_text_glue.cc`）+ `-l skia ...` |
+| GUI 窗口（SDL2 上屏 + 事件循环） | `as-aot examples/window_click.as --manifest examples/window_click.build.example.json` | `ASC_USE_SKIA=1` + `ASC_USE_WINDOW=1` | `skia_glue.cc` +（同上）+ `window_glue.cc` + `-l SDL2 -l objc` |
 
 核心机制：`ASC_USE_WINDOW=1` 决定 `Stage.showWindow(...)` 是「真正弹窗进入事件循环」还是「退化为
 no-op」（见下文 `runtime.ts` 的条件编译）。因此同一个 `.as` 换 manifest 即可在「离屏 PNG」与「GUI

@@ -380,6 +380,27 @@ function usesFlashData(texts: string[]): boolean {
   return false;
 }
 
+// Does this program DRAW TEXT? This decides whether the build links the text
+// engine -- vendor/skia_text_glue.cc, the SkParagraph + skunicode + HarfBuzz +
+// ICU half of the Skia glue (stage 221; ~12.9 MB of a default Skia build, of
+// which 9.71 MB is ICU's single udata object).
+//
+// Same shape and same bias as `usesFlashData`: over-inclusive, never silently
+// wrong. A false positive only costs the size the build had before the split; a
+// false negative is loud twice over -- the build prints the omission while it
+// runs, and the seam's no-op stub warns once on stderr the first time a TextField
+// actually tries to lay something out (as_text_engine_absent, src/runtime.ts).
+//
+// The markers are the package AND the bare class names, because AS3 lets a program
+// name a class without importing it (`new flash.text.TextField()` is one
+// expression, while a bare `TextField` needs the import). StyleSheet and StaticText
+// ride along: same package, never used without a TextField in sight.
+function usesTextEngine(texts: string[]): boolean {
+  const re = /flash\.text\.|(?:^|[^A-Za-z0-9_.$])(?:TextField|TextFormat|TextLineMetrics|StyleSheet|TextFieldAutoSize|TextFieldType|TextInteractionMode|AntiAliasType|GridFitType|StaticText)(?![A-Za-z0-9_])/;
+  for (const t of texts) if (re.test(t)) return true;
+  return false;
+}
+
 // `as-aot doctor`. The check table lives in src/checks.ts and the rendering in
 // src/doctor.ts; what belongs HERE is the one decision neither of them can make:
 // *which build is being asked about*. That answer is a real BuildConfig rather
@@ -543,7 +564,7 @@ async function main(): Promise<void> {
   const embedFieldInits = new Map<string, string>();
   // Source texts of every participating .as file, kept only to decide whether this
   // program touches flash.data (below). See `usesFlashData`.
-  const sqliteScanTexts: string[] = [];
+  const featureScanTexts: string[] = [];
   const sourceRoot = opts.airApp
     ? resolve(dirname(opts.airApp), 'src')
     : dirname(resolve(opts.inputs[0]));
@@ -583,7 +604,7 @@ async function main(): Promise<void> {
 
     program = { body: [], imports: [] };
     const bootSrc = generateBootstrap(air.info, air.mainClass);
-    sqliteScanTexts.push(bootSrc);
+    featureScanTexts.push(bootSrc);
     const boot = parse(bootSrc);
     program.body.push(...boot.body);
     program.imports.push(...boot.imports);
@@ -633,7 +654,7 @@ async function main(): Promise<void> {
         : `${air.asFiles.length} sources`;
     }
     for (const f of keptFiles) {
-      sqliteScanTexts.push(readFileSync(f.path, 'utf8'));
+      featureScanTexts.push(readFileSync(f.path, 'utf8'));
       program.body.push(...f.body);
       program.imports.push(...f.imports);
       // [SWF(frameRate=...)] rides along with the file that declares it (the merged
@@ -663,7 +684,7 @@ async function main(): Promise<void> {
     program = { body: [], imports: [] };
     for (const input of opts.inputs) {
       const text = readFileSync(input, 'utf8');
-      sqliteScanTexts.push(text);
+      featureScanTexts.push(text);
       const p = parse(text);
       program.body.push(...p.body);
       program.imports.push(...p.imports);
@@ -907,7 +928,7 @@ async function main(): Promise<void> {
   // because compiling the 9 MB amalgamation costs ~7 s and must not be paid by
   // every unrelated example or test. The amalgamation is the exact-semantics
   // choice: AIR's PLAINTEXT databases ARE standard SQLite files.
-  if (usesFlashData(sqliteScanTexts)) {
+  if (usesFlashData(featureScanTexts)) {
     const vendorDir = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
     cfg.sources.push(resolve(vendorDir, 'sqlite_glue.c'), resolve(vendorDir, 'sqlite', 'sqlite3.c'));
     cfg.includePaths.push(resolve(vendorDir, 'sqlite'));
@@ -916,6 +937,47 @@ async function main(): Promise<void> {
     // not compile there; our compiler and runtime are single-threaded anyway.
     if (cfg.target === 'wasm') cfg.defines.push('SQLITE_THREADSAFE=0');
     console.log('   + flash.data: linking the SQLite engine (vendor/sqlite)');
+  }
+
+  // ---- flash.text: the text engine is a SEPARATE link unit (阶段二百二十一) ----
+  // vendor/skia_glue.cc is the graphics half; vendor/skia_text_glue.cc is the text
+  // half (SkParagraph + HarfBuzz + ICU). Splitting them is what makes the decision
+  // possible at all -- an object file is linked WHOLE, so while both halves shared
+  // one .o, every Skia build resolved skia::textlayout::* and dragged ~13 MB in,
+  // including programs that never draw a glyph (measured: 19.43 MB either way).
+  //
+  // Two inputs decide, and the manifest wins when it speaks:
+  //   * the manifest NAMES skia_text_glue.cc -> the build wants text, always;
+  //   * otherwise the program's own sources are scanned (`usesTextEngine`), plus
+  //     the SWC bake, whose text characters are real TextFields the app never
+  //     mentions in its AS3 (swc.md §9.2: DefineEditText is baked with its string).
+  // ASC_HAVE_TEXT is what turns the seam from no-ops into the real entry points, so
+  // it must be set exactly when the source is in the build -- the two can never be
+  // decided separately without one of them lying.
+  const nameOf = (p: string): string => basename(p);
+  const skiaGlue = cfg.sources.some((p) => nameOf(p) === 'skia_glue.cc');
+  if (skiaGlue) {
+    const manifestWantsText = cfg.sources.some((p) => nameOf(p) === 'skia_text_glue.cc');
+    const swcTextChars = (swcBake?.characters ?? []).filter((c) => c.kind === 'text').length;
+    const programUsesText = usesTextEngine(featureScanTexts) || swcTextChars > 0;
+    if (manifestWantsText || programUsesText) {
+      if (!manifestWantsText) {
+        const vendorDir = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
+        cfg.sources.push(resolve(vendorDir, 'skia_text_glue.cc'));
+      }
+      if (!cfg.defines.some((d) => d === 'ASC_HAVE_TEXT' || d.startsWith('ASC_HAVE_TEXT='))) {
+        cfg.defines.push('ASC_HAVE_TEXT');
+      }
+      console.log(
+        `   + flash.text: text engine linked (${manifestWantsText
+          ? 'named by the manifest'
+          : swcTextChars > 0
+            ? `SWC bake has ${swcTextChars} text character(s)`
+            : 'program uses flash.text'})`
+      );
+    } else {
+      console.log('   - flash.text: no text in this program -- text engine NOT linked (~12.9 MB smaller)');
+    }
   }
 
   // [WasmExport] declarations are auto-exported: append their C symbols (or alias

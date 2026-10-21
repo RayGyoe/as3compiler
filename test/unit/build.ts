@@ -2319,3 +2319,89 @@ function checkVendorLayout(): string[] {
 }
 
 registerGroup('unit: build/VendorLayout', checkVendorLayout);
+
+// ---- the two-half Skia glue: graphics vs text engine (阶段二百二十一) ----
+// The split is not cosmetic: it is the ONLY way a build can drop the shaping stack.
+// An object file is linked whole, so while both halves shared vendor/skia_glue.o,
+// every Skia program resolved skia::textlayout::* and therefore pulled
+// libskparagraph -> libskunicode -> libharfbuzz -> libicu, whose data is a single
+// 9.71 MB object. Measured before/after on the same no-text program:
+// 19.43 MB -> 6.53 MB. These pins keep the two halves from drifting back together
+// and keep the source/define decisions from separating (either one alone is a lie:
+// glue without the define = dead weight, define without the glue = undefined symbol).
+function checkTextEngineSplit(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [textsplit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [textsplit] ${label}`); }
+  };
+  const gfx = readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8');
+  const txt = readFileSync(join(root, 'vendor', 'skia_text_glue.cc'), 'utf8');
+  const hdr = readFileSync(join(root, 'vendor', 'skia_glue_internal.h'), 'utf8');
+
+  // (1) The invariant that makes the split worth anything: the graphics half must
+  // reference NOTHING from SkParagraph. A single include or a single
+  // skia::textlayout:: use puts the whole shaping stack back into every build.
+  check('the graphics half includes no skparagraph header',
+    !gfx.includes('modules/skparagraph'));
+  // ...and only the file COMMENT may name it (it explains the split); no code.
+  const gfxCode = gfx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  check('the graphics half uses no skparagraph type',
+    !/skia::textlayout::/.test(gfxCode));
+
+  // (2) Every seam entry point lives in the text half -- the 15-function seam the
+  // generated C calls (docs/zh-cn/rust-text-backend.md §1.1) plus the two direct
+  // draw paths that bypass the paragraph.
+  const seam = [
+    'sk_text_measure', 'sk_text_measure_n',
+    'sk_textlayout_new', 'sk_textlayout_new_leading', 'sk_textlayout_new_runs',
+    'sk_textlayout_height', 'sk_textlayout_max_width', 'sk_textlayout_line_metrics',
+    'sk_textlayout_line_box', 'sk_textlayout_line_count', 'sk_textlayout_paint',
+    'sk_textlayout_delete', 'sk_textlayout_glyph_position_at',
+    'sk_textlayout_rects_for_range', 'sk_textlayout_caret_rect',
+    'sk_canvas_draw_text', 'sk_canvas_draw_text_n',
+  ];
+  const missing = seam.filter((n) => !new RegExp(`^(void|double|int)\\*?\\s+${n}\\(`, 'm').test(txt));
+  check('the text half defines all 16 text seam entry points', missing.length === 0);
+  if (missing.length > 0) console.log('  missing: ' + missing.join(', '));
+
+  // (3) The one symbol BOTH halves need stays in the graphics half: the SVG
+  // rasterizer hands the platform font manager to SkSVGDOM, and the web build's
+  // EXPORTED_FUNCTIONS always names _sk_fontmgr_register_data (which mutates the
+  // same cache) -- a no-text web build must still link. Declared in the header
+  // with C++ linkage because the return type is sk_sp<SkFontMgr>.
+  check('the shared platform font manager stays in the graphics half',
+    gfx.includes('sk_sp<SkFontMgr> sk_platform_fontmgr() {') &&
+    !txt.includes('sk_sp<SkFontMgr> sk_platform_fontmgr() {'));
+  check('...and is declared once for the text half', hdr.includes('sk_sp<SkFontMgr> sk_platform_fontmgr();'));
+  check('the web font-injection entry point stays in the graphics half',
+    gfx.includes('int sk_fontmgr_register_data(const void* data, int len)') &&
+    buildWebCompileSteps({ ...defaultBuildConfig(), target: 'wasm', package: 'web' }, 'x.c', 'x')
+      .some((s) => s.some((a) => a.includes('_sk_fontmgr_register_data'))));
+
+  // (4) The seam has exactly two implementations, chosen by ASC_HAVE_TEXT.
+  check('the runtime seam is gated on ASC_HAVE_TEXT',
+    RUNTIME_PREAMBLE.includes('#ifdef ASC_HAVE_TEXT') && RUNTIME_PREAMBLE.includes('#else'));
+  check('the no-engine arm is a no-op that warns instead of failing silently',
+    RUNTIME_PREAMBLE.includes('static inline void as_text_engine_absent(void)') &&
+    RUNTIME_PREAMBLE.includes('flash.text is not linked into this build'));
+  check('the real arm is the only place the seam calls the glue',
+    !/#ifndef ASC_HAVE_TEXT[\s\S]{0,4000}sk_textlayout_new\(/.test(RUNTIME_PREAMBLE.split('#else')[0]));
+
+  // (5) index.ts decides the source and the define together, and says which way.
+  const idx = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
+  check('the build adds the text glue AND its define in the same branch',
+    /if \(manifestWantsText \|\| programUsesText\) \{[\s\S]{0,600}?cfg\.sources\.push\(resolve\(vendorDir, 'skia_text_glue\.cc'\)\)[\s\S]{0,300}?cfg\.defines\.push\('ASC_HAVE_TEXT'\)/.test(idx));
+  check('the decision is reported, not silent', idx.includes('flash.text: text engine linked') &&
+    idx.includes('flash.text: no text in this program'));
+  check('a manifest that names the text glue always wins',
+    idx.includes("const manifestWantsText = cfg.sources.some((p) => nameOf(p) === 'skia_text_glue.cc');"));
+  check('the SWC bake counts as a text user (its text characters are real TextFields)',
+    idx.includes("(swcBake?.characters ?? []).filter((c) => c.kind === 'text').length"));
+
+  console.log(`     [textsplit] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: build/TextEngineSplit', checkTextEngineSplit);

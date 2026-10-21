@@ -42,9 +42,11 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #if !defined(__wasi__) && !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <sys/statvfs.h>
 #endif
-// Emscripten glue (EM_ASM / EM_ASM_INT / EM_JS / UTF8ToString / HEAPU8). Needed
-// by the web target regardless of the network backend: navigateToURL alone uses
-// EM_ASM to call window.open, and the fetch backend adds the rest.
+// Emscripten glue (EM_JS / UTF8ToString / HEAPU8). Needed by the web target
+// regardless of the network backend: navigateToURL alone opens a tab, and the
+// fetch backend adds the rest. Everything here goes through EM_JS, never
+// EM_ASM: inline asm may not share a function with setjmp (see the pump
+// helpers near as_web_take_jsstr for the fatal that taught us).
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -196,12 +198,22 @@ static void as_show_redraw_regions(int on, double color) {
 // fork+exec, not system(): the URL comes from application input, and going through
 // a shell would turn navigateToURL(userInput) into a command-injection hole (a URL
 // containing a semicolon and an rm -rf would run). One argv entry, no shell.
+#ifdef __EMSCRIPTEN__
+// Web: a real new tab/window. Being popup-blocked outside a user gesture is the
+// browser's documented behaviour, not something this layer can fix.
+//
+// EM_JS, not EM_ASM: EM_ASM is inline asm, and clang refuses to compile any
+// function that contains BOTH inline asm and setjmp (see the pump helpers
+// further down for the full story).
+EM_JS(void, as_web_open_tab, (const char* url), {
+    window.open(UTF8ToString(url), '_blank');
+});
+#endif
+
 static int as_open_external(const char* url) {
     if (url == NULL || url[0] == '\\0') return 0;
 #ifdef __EMSCRIPTEN__
-    // Web: a real new tab/window. Being popup-blocked outside a user gesture is
-    // the browser's documented behaviour, not something this layer can fix.
-    EM_ASM({ window.open(UTF8ToString($0), '_blank'); }, url);
+    as_web_open_tab(url);
     return 1;
 #elif defined(_WIN32)
     return (int)(ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL) > (HINSTANCE)32);
@@ -8924,6 +8936,26 @@ static inline void as_skia_gl_draw_texture(void* c, void* tex, int w, int h, dou
     (void)c; (void)tex; (void)w; (void)h; (void)dx; (void)dy; (void)dw; (void)dh;
 #endif
 }
+// ---- the text seam: one gate, two implementations (stage 221) ----
+// The text engine is a SEPARATE source file (vendor/skia_text_glue.cc) so that a
+// build which draws no text can leave it out of the link entirely. That has to be
+// a build-level decision rather than a link-time hope: one object file is linked
+// WHOLE, so as long as anything in the glue referenced skia::textlayout::*, the
+// linker had to resolve libskparagraph.a -> libskunicode.a -> libharfbuzz.a ->
+// libicu.a, whose data is a single 9.71 MB object -- and a program that never drew
+// a glyph still paid for every byte of it (measured: 19.43 MB, against 6.53 MB for
+// the same program once the split let the text half drop out of the link).
+//
+// ASC_HAVE_TEXT is what the build sets when it links that file; index.ts decides
+// from the program's own sources (see usesTextEngine there). Without it the seam
+// collapses to the same no-ops the pure-C runtime uses, so the generated C still
+// compiles and links with no text symbol at all.
+//
+// This is NOT a silent downgrade: index.ts prints the decision while building, and
+// the no-op path below warns once on stderr the first time it is actually driven.
+// Reaching that warning means the detector missed a text user (a TextField conjured
+// through getDefinitionByName, say) -- rebuild with the engine linked.
+#ifdef ASC_HAVE_TEXT
 static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, double y, double sz, int bold, int italic, void* p) { sk_canvas_draw_text(c, t, x, y, sz, bold, italic, p); }
 static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, double x, double y, double sz, int bold, int italic, void* p) { sk_canvas_draw_text_n(c, t, len, x, y, sz, bold, italic, p); }
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { return sk_text_measure(t, sz, bold, italic); }
@@ -8941,6 +8973,36 @@ static inline void as_skia_textlayout_delete(void* p) { sk_textlayout_delete(p);
 static inline int as_skia_textlayout_glyph_position_at(void* p, double x, double y) { return sk_textlayout_glyph_position_at(p, x, y); }
 static inline int as_skia_textlayout_rects_for_range(void* p, int s, int e, int skip, double* l, double* t, double* r, double* b, int max) { return sk_textlayout_rects_for_range(p, s, e, skip, l, t, r, b, max); }
 static inline int as_skia_textlayout_caret_rect(void* p, int i, double* x, double* y, double* h) { return sk_textlayout_caret_rect(p, i, x, y, h); }
+#else
+// No text engine in this build: a TextField still exists (it is a built-in class in
+// every program, so the display list keeps its branch), it just cannot lay anything
+// out. Same shape as the pure-C stubs further down, plus the one-time warning.
+static int as_text_engine_absent_warned = 0;
+static inline void as_text_engine_absent(void) {
+    if (as_text_engine_absent_warned) return;
+    as_text_engine_absent_warned = 1;
+    fprintf(stderr, "warning: flash.text is not linked into this build, so every TextField operation is a no-op.\\n"
+                    "         The build found no flash.text class in the program's sources, so it skipped the text engine;\\n"
+                    "         rebuild with it linked (docs/zh-cn/rust-text-backend.md) if that verdict was wrong.\\n");
+}
+static inline void as_skia_canvas_draw_text(void* c, const char* t, double x, double y, double sz, int bold, int italic, void* p) { (void)c; (void)t; (void)x; (void)y; (void)sz; (void)bold; (void)italic; (void)p; as_text_engine_absent(); }
+static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, double x, double y, double sz, int bold, int italic, void* p) { (void)c; (void)t; (void)len; (void)x; (void)y; (void)sz; (void)bold; (void)italic; (void)p; as_text_engine_absent(); }
+static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { (void)t; (void)sz; (void)bold; (void)italic; as_text_engine_absent(); return 0.0; }
+static inline double as_skia_text_measure_n(const char* t, int len, double sz, int bold, int italic) { (void)t; (void)len; (void)sz; (void)bold; (void)italic; as_text_engine_absent(); return 0.0; }
+static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
+static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
+static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)def; (void)runs; (void)n; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
+static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
+static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }
+static inline int as_skia_textlayout_line_count(void* p) { (void)p; return 0; }
+static inline int as_skia_textlayout_line_metrics(void* p, int* s, int* e, double* t, double* b, int cap) { (void)p; (void)s; (void)e; (void)t; (void)b; (void)cap; return 0; }
+static inline int as_skia_textlayout_line_box(void* p, int i, double ld, const char* fam, double sz, int b, int it, double* a, double* d, double* l, double* w) { (void)p; (void)i; (void)ld; (void)fam; (void)sz; (void)b; (void)it; (void)a; (void)d; (void)l; (void)w; return 0; }
+static inline void as_skia_textlayout_paint(void* p, void* c, double x, double y) { (void)p; (void)c; (void)x; (void)y; as_text_engine_absent(); }
+static inline void as_skia_textlayout_delete(void* p) { (void)p; }
+static inline int as_skia_textlayout_glyph_position_at(void* p, double x, double y) { (void)p; (void)x; (void)y; return -1; }
+static inline int as_skia_textlayout_rects_for_range(void* p, int s, int e, int skip, double* l, double* t, double* r, double* b, int max) { (void)p; (void)s; (void)e; (void)skip; (void)l; (void)t; (void)r; (void)b; (void)max; return 0; }
+static inline int as_skia_textlayout_caret_rect(void* p, int i, double* x, double* y, double* h) { (void)p; (void)i; (void)x; (void)y; (void)h; return 0; }
+#endif
 static inline void as_skia_paint_set_blur(void* p, double sx, double sy) { sk_paint_set_image_filter_blur(p, sx, sy); }
 static inline void as_skia_paint_set_drop_shadow(void* p, double dx, double dy, double sx, double sy, unsigned rgb, double a, double st, int drawSource) { sk_paint_set_image_filter_drop_shadow(p, dx, dy, sx, sy, rgb, a, st, drawSource); }
 static inline void as_skia_paint_set_glow(void* p, double sx, double sy, unsigned rgb, double a, double st) { sk_paint_set_image_filter_glow(p, sx, sy, rgb, a, st); }
@@ -10564,29 +10626,67 @@ EM_JS(void, as_web_fetch_stop, (unsigned job, unsigned serial), {
   delete A[key];
 });
 
+// ---- the pump's JS side, as EM_JS functions -------------------------------
+// NOT EM_ASM bodies: EM_ASM expands to inline asm, and clang's wasm backend
+// refuses to compile a function that contains inline asm AND setjmp -- "fatal
+// error: error in backend: Cannot use EM_ASM* alongside setjmp/longjmp in
+// Stage_dispatchFrame". -O2 inlines this pump into the frame dispatcher, which
+// is the frame's exception recovery point (so it holds the setjmp), hence every
+// web build that links the fetch backend failed to compile while these bodies
+// were EM_ASM (measured on examples/air-native and examples/air-starling-demo;
+// the same fatal appears at any -O2, and the error moves to whichever setjmp
+// frame the pump lands in). One small EM_JS function per accessor keeps the JS
+// opaque to the C optimizer, which is what the backend needs.
+//
+// Each body is a single statement chain with no empty JS string literal: EM_JS
+// bodies go through the C preprocessor as pp-tokens, where an empty quoted
+// string is not a valid
+// token (docs/zh-cn/flash-net.md §…). And they must not call Emscripten JS
+// library helpers -- those are only linked when COMPILED code calls them.
+EM_JS(int, as_web_q_next, (void), {
+    var Q = globalThis.__ascHttpQ;
+    if (!Q || Q.length === 0) { globalThis.__ascCur = null; return 0; }
+    globalThis.__ascCur = Q.shift();
+    return globalThis.__ascCur.kind;
+});
+EM_JS(unsigned, as_web_cur_job, (void), { return globalThis.__ascCur.job; });
+EM_JS(unsigned, as_web_cur_serial, (void), { return globalThis.__ascCur.serial; });
+EM_JS(int, as_web_cur_buflen, (void), {
+    var e = globalThis.__ascCur;
+    return (e && e.buf) ? e.buf.length : 0;
+});
+EM_JS(void, as_web_cur_buf, (unsigned dst), {
+    var e = globalThis.__ascCur;
+    if (e && e.buf) HEAPU8.set(e.buf, dst);
+});
+EM_JS(int, as_web_cur_status, (void), { return globalThis.__ascCur.status; });
+EM_JS(int, as_web_cur_redirected, (void), { return globalThis.__ascCur.redirected ? 1 : 0; });
+EM_JS(unsigned, as_web_cur_clen, (void), { return globalThis.__ascCur.clen; });
+EM_JS(void, as_web_cur_clear, (void), { globalThis.__ascCur = null; });
+EM_JS(int, as_web_jsstr_len, (const char* key), {
+    var e = globalThis.__ascCur;
+    var s = e ? e[UTF8ToString(key)] : 0;
+    return s ? new TextEncoder().encode(s).length : 0;
+});
+EM_JS(void, as_web_jsstr_copy, (unsigned dst, const char* key, int n), {
+    var e = globalThis.__ascCur;
+    var b = new TextEncoder().encode(e[UTF8ToString(key)]);
+    HEAPU8.set(b.subarray(0, n), dst);
+});
+
 // Copy one string field of the entry under the pump's cursor into malloc'd
 // memory. The UTF-8 length is taken first and the buffer sized exactly.
 //
 // The bytes are encoded with TextEncoder rather than Emscripten's stringToUTF8:
 // the JS library functions are only linked into the build when COMPILED code
-// calls them, so reaching for one from an EM_ASM body is a runtime
-// ReferenceError (observed: "stringToUTF8 is not defined"). TextEncoder is a
-// browser built-in and needs nothing from the Emscripten library.
+// calls them, so reaching for one from a JS body is a runtime ReferenceError
+// (observed: "stringToUTF8 is not defined"). TextEncoder is a browser built-in
+// and needs nothing from the Emscripten library.
 static char* as_web_take_jsstr(const char* key) {
-    int n = EM_ASM_INT({
-        var e = globalThis.__ascCur;
-        var s = e ? e[UTF8ToString($0)] : 0;
-        return s ? new TextEncoder().encode(s).length : 0;
-    }, key);
+    int n = as_web_jsstr_len(key);
     char* out = (char*)malloc((size_t)n + 1);
     if (out == NULL) return NULL;
-    if (n > 0) {
-        EM_ASM({
-            var e = globalThis.__ascCur;
-            var b = new TextEncoder().encode(e[UTF8ToString($1)]);
-            HEAPU8.set(b.subarray(0, $2), $0);
-        }, (unsigned)(uintptr_t)out, key, n);
-    }
+    if (n > 0) as_web_jsstr_copy((unsigned)(uintptr_t)out, key, n);
     out[n] = '\\0';
     return out;
 }
@@ -10597,24 +10697,19 @@ static char* as_web_take_jsstr(const char* key) {
 static int as_web_fetch_pump(void) {
     int consumed = 0;
     for (;;) {
-        int kind = EM_ASM_INT({
-            var Q = globalThis.__ascHttpQ;
-            if (!Q || Q.length === 0) { globalThis.__ascCur = null; return 0; }
-            globalThis.__ascCur = Q.shift();
-            return globalThis.__ascCur.kind;
-        });
+        int kind = as_web_q_next();
         if (kind == 0) break;
         consumed++;
-        unsigned jobp = (unsigned)EM_ASM_INT({ return globalThis.__ascCur.job; });
-        unsigned serial = (unsigned)EM_ASM_INT({ return globalThis.__ascCur.serial; });
+        unsigned jobp = as_web_cur_job();
+        unsigned serial = as_web_cur_serial();
         as_job* j = as_job_find((void*)(uintptr_t)jobp, serial);
-        int n = EM_ASM_INT({ var e = globalThis.__ascCur; return (e && e.buf) ? e.buf.length : 0; });
+        int n = as_web_cur_buflen();
         unsigned char* buf = NULL;
         if (n > 0) {
             buf = (unsigned char*)malloc((size_t)n + 1);
             if (buf != NULL) {
                 buf[n] = 0;
-                EM_ASM({ var e = globalThis.__ascCur; HEAPU8.set(e.buf, $0); }, (unsigned)(uintptr_t)buf);
+                as_web_cur_buf((unsigned)(uintptr_t)buf);
             }
         }
         // A cancelled job is skipped, not resurrected: its stream buffer and its
@@ -10627,9 +10722,9 @@ static int as_web_fetch_pump(void) {
                 // A URLLoader job has no live buffer to append to; its whole body
                 // arrives with the terminal entry (JS only streams for a stream).
             } else if (kind == AS_WEB_DONE) {
-                j->status = EM_ASM_INT({ return globalThis.__ascCur.status; });
-                j->redirected = EM_ASM_INT({ return globalThis.__ascCur.redirected ? 1 : 0; });
-                j->expected_total = (unsigned)EM_ASM_INT({ return globalThis.__ascCur.clen; });
+                j->status = as_web_cur_status();
+                j->redirected = as_web_cur_redirected();
+                j->expected_total = as_web_cur_clen();
                 if (j->kind != AS_JOB_HTTP_STREAM) {
                     j->bytes = buf;
                     j->len = (size_t)n;
@@ -10671,7 +10766,7 @@ static int as_web_fetch_pump(void) {
             }
         }
         free(buf);
-        EM_ASM({ globalThis.__ascCur = null; });
+        as_web_cur_clear();
     }
     return consumed;
 }

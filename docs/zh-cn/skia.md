@@ -115,6 +115,29 @@ Skia 的一切围绕 `SkCanvas`（画布）组织。绘制调用 `canvas->drawRe
 }
 ```
 
+#### 3.1 胶水层是两个翻译单元：图形半边 + 文本半边（阶段二百二十一）
+
+`skia_glue.cc` 从阶段二百二十一 起**拆成两个 `.cc`**，理由不是"文件太大"，而是**链接语义**：
+**对象文件是整份参与链接的**。拆之前它同时装着图形与文本，只要文本段引用了
+`skia::textlayout::*`，链接器就必须解析 `libskparagraph.a → libskunicode.a → libharfbuzz.a →
+libicu.a → libicu.icudtl_dat.o`（那 10.19 MB 是**一个不可分的数据对象**）⇒ **一行字都不画的程序
+也把整条整形栈拉进二进制**（实测 19.43 MB，与画字的程序**同尺寸**）。实测也排除了两条捷径：
+`-ffunction-sections` 编胶水 + `-Wl,-dead_strip` 链接**仍然失败**（`Undefined symbols:
+skia::textlayout::StrutStyle::StrutStyle()`），只给最终二进制加 `-dead_strip` 也救不了 ICU。
+
+| 文件 | 内容 | 何时进链接 |
+|---|---|---|
+| `vendor/skia_glue.cc` | 图形半边（surface/canvas/paint/path/渐变/滤镜/位图/SVG/编解码）+ **平台字体管理器** | Skia 构建**总是** |
+| `vendor/skia_text_glue.cc` | 文本半边（`sk_text_measure*`、`sk_canvas_draw_text*`、全部 `sk_textlayout_*`、AIR 行盒/strut 换算、设备字体别名） | 只有程序用到 `flash.text`（含 SWC 烘焙出的文本字符）时 |
+| `vendor/skia_glue_internal.h` | 两半唯一的共享声明 `sk_platform_fontmgr()`（C++ 链接，**故意不 inline**） | 头文件 |
+
+**接缝不变**：生成的 C 仍只调那 15 个 `sk_*`（`runtime.ts:8763–8789`），搬的只是实现。
+**字体管理器刻意留在图形半边**——SVG 的 `<text>` 要把它交给 `SkSVGDOM`，而 web 的字体注入
+`sk_fontmgr_register_data` 改的是同一个缓存、且 `EXPORTED_FUNCTIONS` **无条件**导出它；
+搬过去会让"不画字的 web 构建"链接失败。构建层的判定（`src/index.ts::usesTextEngine`）、运行时的
+两态接缝（`ASC_HAVE_TEXT`，无引擎时**一次性 stderr 警告**）、实测与坑详见
+[`rust-text-backend.md`](rust-text-backend.md) §2。
+
 > 上面只画**形态**（`link-libs` 实际有二十余项，整段抄进文档只会过期——本文件早先的版本就是这样把
 > `skia_glue.c` 与 `include-paths: ["../vendor/skia/include"]` 写错的）。**唯一权威是
 > [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json)**，
@@ -645,7 +668,7 @@ SkParagraph 的富文本能力（`htmlText`、多 `TextFormat` 区间样式、�
 
 ### 8.2 `autoSize` 的大小口径与「装不上的字族」的兜底脸（阶段一百六十八）
 
-两条都在 `vendor/skia_glue.cc` / `src/emit.ts` 的文本层，判据来自 `adl 51.4.1` 双端同源探针
+两条都在 `vendor/skia_text_glue.cc` / `src/emit.ts` 的文本层，判据来自 `adl 51.4.1` 双端同源探针
 （`temp/tfswc` 的 case ⑥⑦⑧⑨⑩；修后 AOT 侧与 `adl` 的报告**逐字相同**）。
 
 **① `autoSize != "none"` 时宽度只在 `wordWrap=false` 才跟文本走。** 实测：`wordWrap=true` 时
@@ -733,7 +756,7 @@ CoreText 那样的系统级级联。而 SkParagraph 对**每一个**本 run 字�
 `微软雅黑`。用户看到的乱码就是它：AI 同传窗口卡片首行的「创建同传」被画成 4 个 `.notdef`；
 修后同一个窗口同一位置正常显示「创建同传」（其余字段用 MiSans/其它族，本来就不乱）。
 
-**修法：`vendor/skia_glue.cc` 的 Windows 分支改成 `SkAirFontMgr : public SkFontMgr`，GDI 作
+**修法：`vendor/skia_glue.cc` 的 Windows 分支改成 `SkAirFontMgr : public SkFontMgr`（阶段二百二十一 起该字体管理器属**图形半边**，理由见 §3.1），GDI 作
 `fPrimary`、DirectWrite 作 `fFallback`；`onMatchFamilyStyleCharacter` 无条件过桥**（GDI 这一路对每个码点
 都答 `nullptr`），**族名查询只在 GDI 匹配不上时才过桥，且只当「本地化名 → 英文名」的翻译器**（见
 §8.4.1）。`countFamilies` / `getFamilyName` / `createStyleSet` / `makeFromData` /

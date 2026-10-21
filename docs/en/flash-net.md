@@ -836,9 +836,18 @@ bash temp/run_webprobe.sh          # → webprobe: DONE checks=15 failures=0
 - **`showWindow` "unwinds the stack"**: on web it calls `emscripten_set_main_loop(..., simulateInfiniteLoop)`,
   and the latter throws an `unwind` sentinel through `main` — **statements written after `showWindow` never
   execute**. The startup chain must run first, with `showWindow` last.
-- **Do not use Emscripten JS library functions inside EM_ASM** (`stringToUTF8`/`lengthBytesUTF8`): the library
-  functions are only linked into the build when the **compiled C** calls them, and reaching for them from
-  EM_ASM gives a `ReferenceError` (measured). UTF-8
+- **On the web side use `EM_JS`, never `EM_ASM`** (a **compile-time** fatal measured in stage 221):
+  `EM_ASM` expands to **inline asm**, and clang's wasm backend **refuses to compile a function that holds both
+  inline asm and `setjmp`** — `fatal error: error in backend: Cannot use EM_ASM* alongside setjmp/longjmp in
+  Stage_dispatchFrame`. `-O2` inlines `as_web_fetch_pump` into the frame dispatcher, which owns this frame's
+  exception recovery point (it holds the `setjmp`), so **every web build that linked the fetch backend failed
+  to compile** (both `--air-app` examples were hit; the fatal names whichever `setjmp` function the pump lands
+  in, so the symptom moves with inlining). `as_web_q_next`/`as_web_cur_*`/`as_web_jsstr_*`/`as_web_open_tab`
+  are the `EM_JS` accessors split out for that reason; the structural pin is the `[web]` group in
+  `test/unit/transport.ts`.
+- **Do not use Emscripten JS library functions inside `EM_JS` either** (`stringToUTF8`/`lengthBytesUTF8`): the
+  library functions are only linked into the build when the **compiled C** calls them, and reaching for them
+  from a JS body gives a `ReferenceError` (measured). UTF-8
 
   encoding/decoding instead uses the built-in `TextEncoder` + `HEAPU8.set`, not depending on the Emscripten
   library.
