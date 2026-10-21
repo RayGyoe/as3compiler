@@ -290,10 +290,18 @@ export const CHECKS: Check[] = [
         // Say WHY, not just what. The two triggers are unrelated -- a transport
         // needs the HTTP client, while a Windows build needs the very same tree
         // for zlib -- and a bare "missing curl.h" reads as a mistake when the
-        // app never touched flash.net.
-        const why = onWindows()
-          ? 'a Windows native build takes zlib from the static curl tree (Windows has no system zlib, and the generated C includes <zlib.h> in every native build)'
-          : 'this app uses flash.net / URLRequest, so its build must link the HTTP transport';
+        // app never touched flash.net. Both can hold at once (a networked Windows
+        // app), and then BOTH belong in the sentence: reporting only the zlib
+        // half hides that the transport is what asked for the tree in the first
+        // place, which is the one an app author can act on.
+        const why = [
+          ...(usesTransport(ctx)
+            ? ['this app uses flash.net / URLRequest, so its build must link the HTTP transport']
+            : []),
+          ...(onWindows()
+            ? ['a Windows native build takes zlib from the static curl tree (Windows has no system zlib, and the generated C includes <zlib.h> in every native build)']
+            : []),
+        ].join('; and ');
         return fail(
           `missing ${header} -- ${why}`,
           provisionHint === ''

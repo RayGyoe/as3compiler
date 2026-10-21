@@ -13,7 +13,7 @@
 // stage background (Basic_SkyBox rendered pure white for exactly this reason).
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { registerGroup, root } from '../harness.ts';
+import { registerGroup, root, readNorm } from '../harness.ts';
 
 // The emitter builds the generated C from `this.line('...')` string literals.
 // Assert on the emitted statements, not on the raw source: comments in emit.ts
@@ -435,8 +435,8 @@ function checkStage3dFlushPolicy(): string[] {
     else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
   };
 
-  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
-  const glue = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
+  const runtime = readNorm(join(root, 'src', 'runtime.ts'));
+  const glue = readNorm(join(root, 'vendor', 'stage3d_glue.mm'));
   const emitted = emittedLines();
 
   // One implementation, two policies: the wait is the only difference.
@@ -477,7 +477,7 @@ function checkStage3dFlushPolicy(): string[] {
     && /if \(asc_dbg_prev\.status == MTLCommandBufferStatusCompleted\)/.test(glue));
 
   // ABI parity: the web backend has no batch, so both flavours are glFlush().
-  const webgl = readFileSync(join(root, 'vendor', 'stage3d_webgl.cc'), 'utf8');
+  const webgl = readNorm(join(root, 'vendor', 'stage3d_webgl.cc'));
   for (const sig of ['void s3d_flush(void* ctx)', 'void s3d_flush_async(void* ctx)',
                      'void s3d_flush_all(void)', 'void s3d_flush_all_async(void)']) {
     check(`stage3d_webgl keeps the ABI: ${sig.split('(')[0]}`,

@@ -52,7 +52,9 @@ check(!created, "CONTEXT3D_CREATE is dispatched asynchronously (matches AIR)");
 
 var ctx:Context3D = s3d.context3D;
 check(ctx != null, "context3D lazily created");
-check(ctx.profile == "baseline", "profile getter");
+// The honoured rung is derived from the backend's texture limit (4096 here, so
+// baselineExtended); echoing "baseline" was stale until stage 226.
+check(ctx.profile == "baselineExtended", "profile getter");
 check(ctx.driverInfo != "" && ctx.driverInfo != null, "driverInfo getter");
 
 // --- 3. 状态机方法（全链路调用，无崩溃） ---

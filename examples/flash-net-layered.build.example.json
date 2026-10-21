@@ -4,8 +4,17 @@
   "opt": "-O2",
   "targets": {
     "native": {
-      "link-libs": ["curl", "nghttp2", "z"],
-      "link-paths": ["../vendor/curl/lib/macos-arm64"],
+      "link-libs": [
+        "curl",
+        "nghttp2",
+        "z",
+        "${win:crypt32}",
+        "${win:ws2_32}",
+        "${win:secur32}",
+        "${win:bcrypt}",
+        "${win:iphlpapi}"
+      ],
+      "link-paths": ["../vendor/curl/lib/${host}"],
       "include-paths": ["../vendor/curl/include"],
       "frameworks": ["CoreFoundation", "CoreServices", "Security", "SystemConfiguration"],
       "defines": ["ASC_HAVE_CURL"]

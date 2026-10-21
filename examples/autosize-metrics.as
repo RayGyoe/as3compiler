@@ -24,6 +24,7 @@
 //   as-aot examples/autosize-metrics.as --manifest examples/autosize-metrics.build.json --run
 
 import flash.display.BitmapData;
+import flash.system.Capabilities;
 import flash.text.TextField;
 import flash.text.TextFieldAutoSize;
 import flash.text.TextFormat;
@@ -81,7 +82,17 @@ if (backend.textWidth <= 0) {
   check(w2.width > before && Math.abs(w2.width - (w2.textWidth + 4)) < 0.01,
         'wordWrap=false 时宽度放大到 textWidth + 4，got w=' + fmt(w2.width) + ' tw=' + fmt(w2.textWidth));
 
-  // ④ 装不上的字族 = 平台默认脸（Helvetica）的度量，不是 CJK 兜底脸的行盒
+  // ④ 装不上的字族 = 平台默认脸的行盒，不是 CJK 兜底脸的行盒。
+  //
+  // 参考脸的**名字**是平台事实，不能写死：AIR 让装不上的字族落到平台默认脸，而那张脸在
+  // macOS 上是 Helvetica、在 Windows 上是 Times（本文件顶部 ② 的口径只写了 macOS 那半句）。
+  // 两个名字都由 adl 51.4.1 实测得到，实现侧对应 vendor/skia_text_glue.cc::sk_family_alias
+  // 的 _WIN32 分支。
+  //
+  // 写死 "Helvetica" 会让这条断言只在 macOS 成立：Windows 上 GDI 把 "Helvetica" 替换成 Arial
+  // （16px 行盒 69x15），而默认脸 Times 是 70x14 —— 断言本身的**意图**（未知字族拿到默认脸的
+  // 行盒、而不是 CJK 兜底脸的 1.4em）在两端都成立，只是对照物不同。
+  var defaultFace:String = Capabilities.os.indexOf('Windows') == 0 ? 'Times' : 'Helvetica';
   var fmtUn:TextFormat = new TextFormat();
   fmtUn.font = 'NoSuchFamilyXYZ12345';
   fmtUn.size = 16;
@@ -93,7 +104,7 @@ if (backend.textWidth <= 0) {
   w3.height = 30;
   w3.text = '中文-英文';
   var fmtHv:TextFormat = new TextFormat();
-  fmtHv.font = 'Helvetica';
+  fmtHv.font = defaultFace;
   fmtHv.size = 16;
   var w4:TextField = new TextField();
   w4.defaultTextFormat = fmtHv;
@@ -104,7 +115,7 @@ if (backend.textWidth <= 0) {
   w4.text = '中文-英文';
   check(w3.textWidth == w4.textWidth && w3.textHeight == w4.textHeight,
         '装不上的字族必须用平台默认脸的行盒：unknown(' + fmt(w3.textWidth) + ',' + fmt(w3.textHeight)
-        + ') vs Helvetica(' + fmt(w4.textWidth) + ',' + fmt(w4.textHeight) + ')');
+        + ') vs ' + defaultFace + '(' + fmt(w4.textWidth) + ',' + fmt(w4.textHeight) + ')');
 
   trace('autosize-metrics: autoSize 只改高度(wordWrap=true)/改宽度(textWidth+4, wordWrap=false)、'
         + '未知字族回落平台默认脸 — assertions passed');

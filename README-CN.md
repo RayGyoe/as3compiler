@@ -230,6 +230,11 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 路径类字段相对清单文件所在目录解析。示例见
 [`examples/skia-link.build.example.json`](examples/skia-link.build.example.json)。
 
+**列表字段支持宿主占位符**，所以一份清单同时服务 macOS 与 Windows（`vendor/` 的四套依赖目录各自只有
+一套归档）：`${host}` 展开成 `macos-arm64`/`windows-x64`/`windows-x86`/`wasm`、`${lib:png}` 在 Windows 展开成
+`libpng`（归档名带 `lib` 前缀）、`${win:gdi32}`/`${mac:objc}` 是「整条只在那个宿主上存在」。`frameworks` 不需要
+占位符——非 macOS 一律不发射。词表与拒绝规则见 `compile.md` §4.1.1。
+
 **按目标分层链接（`targets`）**：顶层字段为公共默认；`targets.<native|wasm>` 块只对**匹配的目标**生效，
 并把它声明的字段**整体替换**（replace，非追加）同名顶层值——使**一份清单**即可服务链接集互斥的多目标
 （典型：native 链接 curl，而 WASI 无 socket、`-lcurl` 会让 `wasm-ld` 失败，需为 wasm 去掉它）。合并顺序：

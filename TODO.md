@@ -13771,7 +13771,58 @@ Metal（`stage3d_glue.mm`）仍是唯一**未经编译器验证**的后端：本
 
 **closure**：① **「对齐」是逐维度的** —— 三个真后端共享同一份校验（都由 `emit.ts` 生成），唯一分端的只有「上限」这一个数，所以「三端都对齐」只对那三个后端成立，第四路径（无后端）不在同一个契约里；② **没编过的后端不能记作已验证** —— 阶段二百二十六 的 Metal/WebGL2 当时只有契约推理，本轮补上 WebGL2 之前，那两个文件的状态是「看起来对」而不是「编过」；③ **默认产物上的分歧必须进增强表** —— 否则它只是一段注释，而下一个把 `4096` 改成 `2048` 的人会以为自己在修 bug。
 
+### 阶段二百三十一：示例清单跨宿主 —— 一份 JSON 同时描述 macOS 与 Windows（v0.4.202 → v0.4.203）✅ 已完成
+
+**一、问题：21 份手写清单只在「CI 那个宿主」上成立**
+
+Windows 上的全量回归有 16 条红是同一类：`examples/` 下 15 个示例 + `build/DocumentedLinkSets`，死法只有两种——`#include <zlib.h>` 找不到（清单没带 `vendor/curl/include`），或 `lld-link: could not open 'Cocoa'`（`frameworks` 被当成输入文件丢给 COFF 链接器）。根因不是写错了，而是这 21 份清单全部按 macOS 写：`vendor/skia/lib/macos-arm64`、`png`（Windows 的归档叫 `libpng.lib`）、`CoreText`/`Cocoa`/`Metal`。
+
+`targets` 救不了这一层：它只按**目标**（`native`/`wasm`）分层，而 macOS 与 Windows 是**同一个目标、不同的依赖目录与系统库**。也不能靠「每份再写一份 `.win.build.json`」——这些清单**同时是文档里的标准例子**（[`compile.md`](docs/zh-cn/compile.md) §4 直接引 `skia-link`/`flash-net-layered`/`window_click` 三份），分裂成两份之后，被 CI 验证的那份与被文档讲的那份迟早不是同一份。
+
+**二、契约：四个占位符（解析期展开，解析期报错）**
+
+| 占位符 | 展开 | 用处 |
+|---|---|---|
+| `${host}` | `windows-x64` / `windows-x86` / `macos-arm64` / `wasm` | 依赖目录名；算不出（Linux 宿主无预编译树）时**硬报错**，不给空路径 |
+| `${lib:NAME}` | macOS `NAME` / Windows `libNAME` | 归档文件名差异（`libpng.a` vs `libpng.lib`） |
+| `${win:TOKEN}` | Windows 保留 / 其他宿主整条丢弃 | 系统导入库（`gdi32`/`usp10`/`winmm`…）、只有 Windows 才要的 `-L` |
+| `${mac:TOKEN}` | macOS 保留 / 其他宿主整条丢弃 | `objc`（`window_glue.cc` 的 NSWindow 边框垫片） |
+
+拒绝规则：`${win:}`/`${mac:}` **必须是整条**（拼在字符串中间会在另一宿主上留下半截路径，而半截路径不报错、只链错）；`${host:xxx}` 这种带参形态、`${lib:}` 空参、未闭合占位符，全部抛**带清单文件名**的错误。`architecture` 的合法性校验**提前到展开之前**（否则 `${host}` 会按一个非法位宽查目录），`targets.<目标>` 块与顶层走同一套展开。
+
+`frameworks` 刻意**不收占位符**，而在发射端按宿主门控（`frameworkFlags`，非 darwin + native 一律不发）——这样一份清单可以同时列着 `Cocoa`/`Metal` 与 `${win:gdi32}`，两边各取所需，也不需要读者去记「框架名要不要包一层」。
+
+**三、22 份清单改造，以及一个不是装饰的字段**
+
+22 份按上述词表重写（`${host}` 替目录、`${lib:}` 替四个 Skia 归档、`${win:}` 替 Windows 导入库与 curl 路径、`${mac:objc}` 替 objc），并顺手修了两处**少一级的路径**：`examples/audio/player.build.json` 与 `examples/textfield/textfield.build.json` 里的 `../vendor/curl` → `../../vendor/curl`（它们住在子目录里，那条路径在 macOS 上也一直是错的，只是没人走到）。
+
+同时给所有 native 清单补上 `"architecture": "64"`。**这不是装饰**：`build.ts::nativeTargetFlags` 和 `deploySkiaIcuData` 都以它为前置条件，缺了它 ① 拿不到 `--target=x86_64-pc-windows-msvc` 与 `-fms-runtime-lib=static`（动态 CRT 配 `/MT` 归档），② `icudtl.dat` **根本不会被部署** ⇒ 首次排版（`SkParagraph` 读 grapheme 表越界）直接 `ud2` 陷阱。
+
+**四、真正的坑：并发部署 `icudtl.dat`**
+
+上一段第二重后果当场变成了红：`node test.ts` 用 6 路并发，**所有** Skia 示例共享同一个 `temp/regress-out/` 作为 `-o` 目录，于是六份构建同时 `CopyFile` 同一个 `icudtl.dat`——而其中一个已经跑起来、正把该文件**打开着**读。Windows 上这会 `UNKNOWN: unknown error, copyfile`（macOS 的 `copyfile(2)` 覆盖同名文件不报这个错，所以这条路径以前从没被发现）。
+
+修法在 `deploySkiaIcuData()` 本身（而不是去给每个示例分目录，因为「多个构建共用一个输出目录」是**合法用法**）：
+
+1. 先比后拷（同尺寸 + 不比源旧 ⇒ 已就位，一次 `stat` 的代价）；
+2. 写 `<dst>.<pid>.tmp` 再 `rename`，半截文件永远不会被观察到；
+3. `rename` 失败且目标**已经**是同一份（输给正在读它的进程）⇒ 视为成功；目标真的是另一份文件 ⇒ 原样抛错。
+
+**五、钉子**
+
+- `build/HostTemplates` **23 条**：`hostVendorKey` 全表、`${host}` 展开与无树报错、`${lib:}` 两端、`${win:}`/`${mac:}` 的保留与丢弃（含 wasm）、四条拒绝路径、`-framework` 在 win32 与 darwin 上的门控（假宿主跑，跑完还原）。
+- `build/ExampleManifestHosts` **3 条**：把 `examples/` 下**每一份** native 清单在**当前宿主**上展开，断言 ① 没有 `${...}` 残留，② 每条 source/include/link 路径真的存在，③ 每个 `-lNAME` 真能在它的 `-L` 目录里找到归档（系统导入库以白名单放行）。这条钉子才是「跨宿主」的判据：模板代码正确不等于 22 个 JSON 正确。
+- `build/IcuDataDeploy` **5 条**：首拷、二次不重写（用未来 mtime 探测）、尺寸不符则覆盖、无 `icudtl.dat` 答 false、不链 skia 跳过。
+
+**六、回归**
+
+`node test.ts`：**441 项 / 438 过 / 3 红**（本阶段前 20 红）。剩下 3 条全是**真后端缺口**、与宿主假设无关：`socket.as`（`bind(0)` 不自动分配端口）、`stage94d.as`（该后端不支持 `UTF-16LE` 字符集）、`urlstream-api.as`（链接集缺 `shell32`），已按 §1.5 硬判据归入「遗留待开发」。
+
+**closure**：① **「跨宿主」不等于「处处可编」** —— `air-native` / `ane` / `ane-app` 三份仍写死 `windows-x64`，而且**是有理由的**（`air-native` 绑死 D3D 后端）；钉子按**内容**跳过它们并**打印**名单，于是「迁移完了」是一句可核对的断言，而不是一句声明；② **能在解析期失败，就不该拖到链接期** —— 半截路径、空 `-L`、不存在的归档，全都在读清单时就有了答案，而这些错误在链接期会伪装成「缺符号」；③ **一个字段可以同时是两个机制的前提** —— 补 `architecture` 时只想着「位宽对了」，结果把 `icudtl.dat` 的部署路径**第一次**打开了，而这个坑在 macOS 上不存在；凡「补一个前置条件」，要把它的**第二重消费者**也量一遍。
+
+
 ### 遗留待开发
+> **2026-10-22 追加（阶段二百三十一：示例清单跨宿主）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **99 → 100 项**。本阶段修的是「同一份清单在 macOS 上编得过、在 Windows 上死在 `#include <zlib.h>`」（16 条红），按 §1.5 判据属**我们这边的构建层缺陷**且阶段内已修净，故不进表；新登记的一行是「`air-native`/`ane`/`ane-app` 三份清单仍写死 `windows-x64`」——它们**不是**遗漏（`air-native` 绑死 D3D 后端，宿主是后端的结果），但「换个宿主就编不了」仍然是可执行欠账，且钉子 `build/ExampleManifestHosts` 会**打印**这份名单，随时可核对还剩几份。**移出 0 行**（16 条示例红是同一处构建层缺陷的 16 个症状，症状在阶段内消失，不构成欠账）；`未开始` **75 → 76**。
 > **2026-10-22 追加（阶段二百二十七：`Context3D.ignoreResourceLimits`）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**。本阶段修的是「`adl` 会报 `#3683`、我们照单全收」之后的下一层：`ignoreResourceLimits` 这个 AIR 公开属性的语义（软上限放开、`#3681`/`#3682` 保留、超限改报 `Error #3684`）在阶段内**已逐字对齐**，故不进表；新登记的一行是「旗标打开后缺少显存预检/分配失败上报」——它是**我们这边**的缺口（`adl` 在 `#3684` 处同步失败，而我们的惰性分配会把失败推到上传之后），属可执行欠账。**一处刻意分歧已记入正文**：旗标打开时 2D 上界用设备上限（16384）而非 AIR 的 profile 上限——这是本阶段唯一的主动分歧，且双重 opt-in（AIR 合法属性 + 默认 `false`），默认产物仍与 AIR 同构。
 > **2026-10-21 追加（阶段二百二十六：`Context3D.profile` 分档上报）**：**新登记 3 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **95 → 98 项**（`未开始` **72 → 75**）。本阶段修的是「`adl` 跑得对、我们跑不出」（`adl` 会把 4097 拦下来，我们照单全收），按 §1.5 硬判据属**遗留缺陷**且**阶段内已修净**，故不进表；**但**逐档爬把后面两级的真实缺口量成了三行独立的表项（MRT、浮点纹理、AGAL4/VTF），它们是**可执行的欠账**而不是「以后再说」——登记它们是为了让「报 `enhanced`」这件事有明确的完工判据。**旧口径「`profile` 固定 baseline」在本阶段已作废**，凡按它写过的正文（`docs/zh-cn/display3d.md` §6/§7、`README-CN.md` 示例说明）已同步改写。
 > **2026-10-21 追加（阶段二百二十四：拖动时画面呼吸的设备倍率修复）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内实际行数不变（**95 项**）。本阶段修的是**我们自己**在 macOS 上把"缓存逻辑尺寸／现场像素尺寸"相除得到的错误倍率（`adl` 始终报 2.0、我们中途会给出 2.006–2.0625），属"`adl` 跑得对而跑不出 ⇒ 遗留缺陷"，且**阶段内已修净并量过**（151/151 → 0/151），故不入表（与阶段二百二十 同例）。**如实报明一处仍未做的**：同一处"两个尺寸相除"的写法在 **Windows 主窗口入口**（`sk_window_open_gpu_d3d` 一族）**未改**——D3D 那端的 `SDL_GetWindowSizeInPixels` 是否也会与逻辑尺寸错档，本机无法测量，故按"没量过就不动"处理（新缝在无 `backingScaleFactor` 的平台上原样返回 `pw/lw`，行为与改前一字不差）。
@@ -13999,6 +14050,7 @@ Metal（`stage3d_glue.mm`）仍是唯一**未经编译器验证**的后端：本
 | **浮点纹理 `Context3DTextureFormat.RGBA_HALF_FLOAT`** | 未开始（阶段二百二十六 分档实测登记：`baselineExtended` 抛 `#3759`，`standard` 起接受） | 我方 `Context3DTextureFormat` **无该常量**（编译期即报 undefined），三后端只建 `BGRA8`（`stage3d_d3d.cc` 的 `DXGI_FORMAT` 选择、`stage3d_glue.mm` 的 `MTLPixelFormat` 选择、WebGL 的 `internalformat`）。Starling 不用它，但 `RenderTexture` 的 HDR 路径会 |
 | **AGAL4 与顶点纹理取值（VTF）** | 未开始（阶段二百二十六 分档实测登记：这是 `enhanced` 相对 `standard` 唯一新增的东西） | `runtime.ts` 的 AGAL 前置对 `version > 3` **显式拒绝**、指令数上限硬编码 200；GLSL 翻译器**只在片元阶段声明 sampler**（`isFragment` 分支）⇒ WebGL2 上顶点取样会编译失败；MSL/HLSL 的顶点入口也没有对应的 `texture` 绑定槽。完工判据：AGAL4 解析 + 顶点 sampler 声明 + 三后端绑定与取样 |
 | **旗标打开后的显存预检与分配失败上报**（`Context3D.ignoreResourceLimits = true`） | 未开始（2026-10-22 阶段二百二十七 实测登记：`adl` 在 `#3684` 处**同步**失败，我们的惰性分配会把失败推到上传之后） | 旗标打开后我们只按**设备上限**（`as_s3d_max_texture_size()`，D3D12/Metal 16384）放行尺寸，**不预检像素总量**；而 2D/`RectangleTexture` 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `t->gpu` 留空，等 `uploadFromBitmapData`/`uploadFromByteArray` 才建），所以「设备上限允许、实际建不出来」这一档现在**不会**冒成 `#3684`——它会在上传时静默变成一张空贴图。`adl 51.4.1` 实测（`temp/adlprof/`，`PROBE_MODE=ign`）：旗标打开后 `baseline` 的 `createTexture(4096,1)`、`enhanced` 的 `createTexture(8192,1)` 都在**创建时**同步抛 `Error #3684: Texture creation failed. Internal error.`，即 AIR 在创建点就把分配做完了 | ① 给 `Texture`/`RectangleTexture` 的创建补一次**总量估算**（`w*h*bpp`，带 mip 时再乘 4/3，累加到 context 上），超过一个可配置的显存预算就抛 `#3684`（文案照 AIR）；② 或把 `as_s3d_create_render_texture` 的返回 `NULL` 立刻变成 `#3684`（目前只对 `optimizeForRenderToTexture=true` 有这条路径，且未检查返回值）。**成本中**，且要与「`ignoreResourceLimits=false` 时 AIR 的对象数量/显存预算」一起量（本阶段实测：`adl` 关旗标时 4300 个 1×1 贴图仍可建，即计数上限实际未生效，约束在显存） |
+| **`examples/air-native`、`examples/ane`、`examples/ane-app` 的构建清单仍写死 `windows-x64`** | 未开始（2026-10-22 阶段二百三十一 登记：`build/ExampleManifestHosts` 会按内容跳过它们并打印名单） | 22 份清单已改成 `${host}`/`${lib:}`/`${win:}`/`${mac:}` 占位符形态，同一份在两个宿主都成立；这三份**刻意**没改——`air-native` 同时写死 `ASC_RENDER_D3D` + `vendor/d3d_glue.cc`，主机是**后端的结果**，把它写成 `${mac:...metal_glue.mm}` 需要先证明 macOS 侧那一串（`-lcocoa`/`-lobjc`/Metal 框架/`ASC_RENDER_METAL`）真的能编能跑，而本机没有 Objective-C++ 工具链、无法验证；`ane`/`ane-app` 同族（宿主库 `asaot.dll` 与 ANE 平台键都只在 Windows 上量过） | 等 arm64 macOS CI 能跑通 `metal_glue.mm` 之后，把 `air-native` 的 `sources`/`defines`/`link-libs` 按 `${mac:}`/`${win:}` 展开（对照 `src/air-app.ts` 的 `mtlSrc`/`d3dSrc` 两分支，那里已经是同一条配方的权威版），再让钉子不再打印它 |
 
 
 

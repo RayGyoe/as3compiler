@@ -2,8 +2,14 @@
   "target": "native",
   "c-compiler": "clang",
   "opt": "-O2",
-  "sources": ["../vendor/skia_glue.cc"],
-  "include-paths": ["../vendor/skia"],
+  "architecture": "64",
+  "sources": [
+    "../vendor/skia_glue.cc"
+  ],
+  "include-paths": [
+    "../vendor/skia",
+    "${win:../vendor/curl/include}"
+  ],
   "link-libs": [
     "skia",
     "skparagraph",
@@ -16,10 +22,10 @@
     "bentleyottmann",
     "skcms",
     "wuffs",
-    "png",
-    "jpeg",
-    "webp",
-    "webp_sse41",
+    "${lib:png}",
+    "${lib:jpeg}",
+    "${lib:webp}",
+    "${lib:webp_sse41}",
     "dng_sdk",
     "piex",
     "expat",
@@ -27,9 +33,17 @@
     "harfbuzz",
     "icu",
     "zlib",
-    "z"
+    "z",
+    "${win:usp10}",
+    "${win:user32}",
+    "${win:gdi32}",
+    "${win:ole32}",
+    "${win:advapi32}"
   ],
-  "link-paths": ["../vendor/skia/lib/macos-arm64"],
+  "link-paths": [
+    "../vendor/skia/lib/${host}",
+    "${win:../vendor/curl/lib/${host}}"
+  ],
   "frameworks": [
     "CoreFoundation",
     "CoreGraphics",
@@ -39,6 +53,8 @@
     "ImageIO",
     "Accelerate"
   ],
-  "defines": ["ASC_USE_SKIA=1"],
+  "defines": [
+    "ASC_USE_SKIA=1"
+  ],
   "objects": []
 }

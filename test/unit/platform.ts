@@ -14,7 +14,7 @@ import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, parseAirApp, prepareAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
-import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS, readNorm } from '../harness.ts';
 
 // ---- flash.display.Screen (阶段八十九·七十一) ----
 // Screen's contract is not "return some display info" — it is a set of measured
@@ -572,7 +572,7 @@ function checkBackendParity(): string[] {
   // 这条钉直接变红）。
   const defRe = /^(?:int|void|double|float|long|unsigned|char|size_t|short|bool)\s*\**\s*(sk_window_\w+)\s*\(/gm;
   const seamDefs = (rel: string): Set<string> =>
-    new Set([...readFileSync(join(root, rel), 'utf8').matchAll(defRe)].map((m) => m[1]));
+    new Set([...readNorm(join(root, rel)).matchAll(defRe)].map((m) => m[1]));
   const nativeDefs = seamDefs(join('vendor', 'window_glue.cc'));
   const webDefs = seamDefs(join('vendor', 'web_glue.cc'));
   const nativeOnly = [...nativeDefs].filter((n) => !webDefs.has(n));
@@ -586,7 +586,7 @@ function checkBackendParity(): string[] {
     unlisted.length === 0);
   check('the GPU-only exemption is real: runtime.ts declares it under ASC_RENDER_WINGPU',
     /#ifdef ASC_RENDER_WINGPU[\s\S]{0,400}?extern int sk_window_show_gpu\s*\(/.test(
-      readFileSync(join(root, 'src', 'runtime.ts'), 'utf8')));
+      readNorm(join(root, 'src', 'runtime.ts'))));
   // 反向：web 不得凭空多出 native 没有的 seam 符号（那说明两边已经分叉）。
   const webOnly = [...webDefs].filter((n) => !nativeDefs.has(n));
   check('web defines no sk_window_* seam symbol that native lacks', webOnly.length === 0);
@@ -596,7 +596,7 @@ function checkBackendParity(): string[] {
       .every((n) => nativeDefs.has(n) && webDefs.has(n)));
 
   // ---- socket fd seam ----
-  const preamble = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const preamble = readNorm(join(root, 'src', 'runtime.ts'));
   check('as_sock_close_fd has a real POSIX body and an inert non-POSIX stub',
     preamble.includes('static inline void as_sock_close_fd(int fd) { if (fd >= 0) close(fd); }') &&
     preamble.includes('static inline void as_sock_close_fd(int fd) { (void)fd; }'));

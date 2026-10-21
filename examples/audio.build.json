@@ -1,8 +1,19 @@
 {
   "target": "native",
+  "c-compiler": "clang",
   "opt": "-O2",
+  "architecture": "64",
   "sources": [
     "../vendor/audio_glue.c"
+  ],
+  "include-paths": [
+    "${win:../vendor/curl/include}"
+  ],
+  "link-paths": [
+    "${win:../vendor/curl/lib/${host}}"
+  ],
+  "link-libs": [
+    "${win:z}"
   ],
   "defines": [
     "ASC_HAVE_AUDIO=1"

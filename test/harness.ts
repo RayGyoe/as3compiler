@@ -31,6 +31,18 @@ export function registerGroup(name: string, fn: () => string[]): void {
   });
 }
 
+// Read a source file with line endings normalised to LF.
+//
+// .gitattributes only pins *.bat, so a Windows checkout is CRLF while CI (arm64
+// macOS) is LF. Any pin whose regex spans lines (`...;\n  if (...)`,
+// `\{\n ... glFlush();\n\}`) therefore passed on CI and failed here -- the pin
+// was measuring the checkout, not the code. Normalise at the read, not by
+// loosening every regex: `\r?` sprinkled around is easy to miss in one spot of
+// a large alternation, and the miss is silent.
+export function readNorm(path: string): string {
+  return readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+}
+
 // The Skia glue is TWO translation units since stage 221: vendor/skia_glue.cc is
 // the graphics half and vendor/skia_text_glue.cc the text engine (SkParagraph +
 // HarfBuzz + ICU), split so that a build whose program draws no text can leave the

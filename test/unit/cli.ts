@@ -41,10 +41,22 @@ interface Run {
 function run(args: string[], env: Record<string, string> = {}, cwd: string = root): Run {
   // Absolute, because some checks run the CLI from a scratch directory: the
   // entry point has to be found no matter which cwd the check established.
+  //
+  // Every inherited `npm_config_*` variable is dropped first. Windows environment
+  // variables are CASE-INSENSITIVE, so a machine-wide `NPM_CONFIG_REGISTRY` wins
+  // over the lower-case one a check passes, and the update check then talks to
+  // whatever registry that shell was pointed at (the observed symptom: a 404 from
+  // a mirror, so the report never named 127.0.0.1:45999 and the pin went red for
+  // a reason no compiler change could fix). Dropping the family is right on every
+  // host: a test that discovers a registry is the only one that may choose it.
+  const inherited: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && !/^npm_config_/i.test(k)) inherited[k] = v;
+  }
   const r = spawnSync('node', [join(root, 'src', 'index.ts'), ...args], {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, ...env },
+    env: { ...inherited, ...env },
   });
   return { out: r.stdout ?? '', err: r.stderr ?? '', code: r.status ?? -1 };
 }

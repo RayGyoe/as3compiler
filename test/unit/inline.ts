@@ -210,7 +210,10 @@ function checkWriteBarrierInline(): string[] {
   if (built) {
     const calls = callCount(built.asm, 'gc_write_barrier');
     check(`every gc_write_barrier call site is inlined (out-of-line calls: ${calls})`, calls === 0);
-    const slowRefs = (built.asm.match(/_gc_write_barrier_slow_fn/g) ?? []).length;
+    // Mach-O prefixes C symbols with '_'; COFF and ELF do not. The invariant is
+    // "the inlined form still reaches the slow path through the pointer", which
+    // is a reference to the symbol wherever the assembler names it.
+    const slowRefs = (built.asm.match(/(?:^|[^\w])_?gc_write_barrier_slow_fn\b/g) ?? []).length;
     check(`the inlined form reaches the slow path via the pointer (refs: ${slowRefs})`, slowRefs > 0);
     // The slow path itself must stay out of line: if it were inlined everywhere
     // the pointer indirection would just be a detour.

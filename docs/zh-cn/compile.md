@@ -263,9 +263,12 @@ as-aot app.as -I vendor/curl/include -L vendor/curl/lib/macos-arm64 \
   -l curl -l nghttp2 -l z -D ASC_HAVE_CURL \
   --framework Security --framework SystemConfiguration --source vendor/sysproxy_glue.c
 
-# 或走构建清单（推荐，可版本化复用）
+# 或走构建清单（推荐，可版本化复用）—— 一份清单同时服务 macOS 与 Windows
 as-aot app.as --manifest examples/skia-link.build.example.json
 ```
+
+命令行的 `-I/-L/-l` 是**字面量**（不展开占位符，§4.1.1）：手工写 Windows 那条就是
+`-L vendor/curl/lib/windows-x64 -l curl ...` 不加 `--framework`，另加 `-l gdi32 -l ws2_32` 等导入库。
 
 #### 3.4.1 `flash.net` 的网络后端是 **opt-in 宏**，不是默认行为
 
@@ -629,7 +632,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 |---|---|---|
 | `target` | `"native" \| "wasm"` | 目标平台，默认 `native` |
 | `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | 分发形态，默认 `raw`（§6）；`web` 要求 `target=wasm`，产出浏览器产物（见 [`html5-web.md`](html5-web.md)） |
-| `architecture` | `"32" \| "64" \| "arm64"` | 目标位宽（Windows 专属，缺省按宿主）。决定依赖目录（`vendor/*/windows-xN`）与目标三元组（`i686-` / `x86_64-` / `aarch64-pc-windows-msvc`）；未知值**响亮报错**而不回退 x86_64。**`arm64` 只服务非 AIR 的 Windows-on-ARM 产物**：AIR 没有 Windows ARM64 运行时，故 `--air-app` 描述符的 `<architecture>` 仍只接受 `32`/`64`（见 [`win32.md`](win32.md) §1/§2.11） |
+| `architecture` | `"32" \| "64" \| "arm64"` | 目标位宽（Windows 专属，缺省按宿主）。决定依赖目录（`vendor/*/windows-xN`）与目标三元组（`i686-` / `x86_64-` / `aarch64-pc-windows-msvc`）；未知值**响亮报错**而不回退 x86_64。同时决定 `${host}` 展开成哪个依赖目录（§4.1.1）：`"32"` ⇒ `windows-x86`，`"64"`/`arm64` 或未设 ⇒ 按宿主。**`arm64` 只服务非 AIR 的 Windows-on-ARM 产物**：AIR 没有 Windows ARM64 运行时，故 `--air-app` 描述符的 `<architecture>` 仍只接受 `32`/`64`（见 [`win32.md`](win32.md) §1/§2.11） |
 | `c-compiler` | string | C 编译器，默认 `cc` |
 | `opt` | string | 优化标志，默认 `-O2` |
 | `debug-info` | boolean | 是否保留调试信息，默认 `false`。默认产物在三个后端都**不带 DWARF**（wasm 链接因此加 `-Wl,--strip-debug`，见 §4.3）；设 `true` 则三端均加 `-g` 且 wasm 不再剥离（CLI `--debug-info`） |
@@ -646,7 +649,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `defines` | string[] | 预处理宏（→ `-D`） |
 | `features` | string[] | **具名增强开关**（§3.4.2），如 `["svg"]`。默认空。未知名字报错；开了会在构建横幅里点名，不开则产物与 `adl` 同构。`--features` 在 CLI 侧是**替换**整个集合（`-D` 才是追加） |
 | `objects` | string[] | 预编译 `.o` 直接加入链接 |
-| `frameworks` | string[] | macOS 框架（→ `-framework X`，Skia 的 CoreText/CoreGraphics 后端需要） |
+| `frameworks` | string[] | macOS 框架（→ `-framework X`，Skia 的 CoreText/CoreGraphics 后端需要）。**只在 `darwin` + `target=native` 上发射**：其他宿主静默丢弃（不报错），因此同一份清单可以同时写着 `Cocoa`/`Metal` 与 `gdi32`（后者走 `link-libs` 的 `${win:}`，见 §4.1.1）；以前在 Windows 上它们会被当成**输入文件**丢给链接器，报 `lld-link: could not open 'Cocoa'` |
 | `font-urls` | string[] | 字体字节流 URL 列表（`--package web` 时写入 `index.html`，运行时网络加载注入 Skia；见 [`html5-web.md`](html5-web.md) §4） |
 | `preload-paths` | string[] | 打进 wasm FS 镜像的数据根，`src@dest` 或裸路径（`--package web` 专属；浏览器沙箱初始 FS 为空，`File`/`FileStream` 会一文件都看不到） |
 | `preload-excludes` | string[] | 从上述镜像里**排除**的宿主路径或 fnmatch 模式（→ `emcc --exclude-file`，同样是 `--package web` 专属）。emcc 的目录 preload 没有逐文件开关，只能反向命名要排除的文件；模式匹配的是 preload 遍历产出的**宿主路径**（绝对），故同样相对清单目录解析。**路径里含 `*?[` 时它是模式而非字面量**（`weird[1].png` 会排掉无关的 `weird1.png`），要按字面排除需转义为 `[[]` `[]]` `[*]` `[?]`；无命中的模式静默忽略。`--air-app` 用它把已由页面 `fetch` 的字体撤出 FS（见 [`html5-web.md`](html5-web.md) §6），并自动排除 `-o` 指向的**本次构建输出目录**——否则 `-o temp/<x>` 会把正在写的 `.c`/`.o`/产物自己也 preload 进镜像（Flappy-Starling 实测 1.9 MB → 36 MB）；未指定 `-o` 时不做任何猜测 |
@@ -665,19 +668,23 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
   "target": "native",
   "c-compiler": "clang",
   "opt": "-O2",
+  "architecture": "64",
   "sources": ["../vendor/skia_glue.cc"],
-  "include-paths": ["../vendor/skia"],
+  "include-paths": ["../vendor/skia", "${win:../vendor/curl/include}"],
   "link-libs": ["skia", "skparagraph", "skshaper", "skunicode", "skottie",
     "sksg", "svg", "skresources", "bentleyottmann", "skcms", "wuffs",
-    "png", "jpeg", "webp", "webp_sse41", "dng_sdk", "piex", "expat",
-    "freetype2", "harfbuzz", "icu", "zlib", "z"],
-  "link-paths": ["../vendor/skia/lib/macos-arm64"],
+    "${lib:png}", "${lib:jpeg}", "${lib:webp}", "${lib:webp_sse41}",
+    "dng_sdk", "piex", "expat", "freetype2", "harfbuzz", "icu", "zlib", "z",
+    "${win:usp10}", "${win:user32}", "${win:gdi32}", "${win:ole32}", "${win:advapi32}"],
+  "link-paths": ["../vendor/skia/lib/${host}", "${win:../vendor/curl/lib/${host}}"],
   "frameworks": ["CoreFoundation", "CoreGraphics", "CoreText", "CoreServices",
     "ApplicationServices", "ImageIO", "Accelerate"],
   "defines": ["ASC_USE_SKIA=1"],
   "objects": []
 }
 ```
+
+（这就是 [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json) 的当前内容：一份清单同时描述 macOS 与 Windows，`${...}` 的含义见 §4.1.1。）
 
 **优先级**：CLI 参数覆盖清单同名字段（对标 TypePHP 的「CLI beats YAML」）。
 合并顺序：默认配置 → 清单顶层 → 清单 `targets.<最终目标>`（§4.1）→ CLI 覆盖。
@@ -702,8 +709,9 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
   "opt": "-O2",
   "targets": {
     "native": {
-      "link-libs": ["curl", "nghttp2", "z"],
-      "link-paths": ["../vendor/curl/lib/macos-arm64"],
+      "link-libs": ["curl", "nghttp2", "z",
+        "${win:crypt32}", "${win:ws2_32}", "${win:secur32}", "${win:bcrypt}", "${win:iphlpapi}"],
+      "link-paths": ["../vendor/curl/lib/${host}"],
       "include-paths": ["../vendor/curl/include"],
       "frameworks": ["CoreFoundation", "CoreServices", "Security", "SystemConfiguration"],
       "defines": ["ASC_HAVE_CURL"]
@@ -714,6 +722,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 
 - `as-aot app.as --manifest m.json`（默认 native）→ 链接 `-l curl -l nghttp2 -l z -D ASC_HAVE_CURL` + 四个 `-framework`；
 - `as-aot app.as --manifest m.json --target wasm`（wasm）→ **两者都不加**（无 `native` 块匹配）。
+- 同一份 `native` 块在 Windows 上自动换成 `windows-x64` 目录 + 五个系统导入库（TLS 需要），八个 `-framework` 一个都不发（§4.1.1）。
 
 规则：
 
@@ -721,6 +730,30 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 - 块可选择的目标只有 `native` / `wasm`，**未知目标名报错**；块内**不允许** `target`/`package`（目标由选择它的块决定，不可在块内重定义）或嵌套 `targets`；块内**未知字段报错**（AGENTS.md §2.5，防拼写错误被静默忽略）。
 - 块内路径类字段（`sources`/`include-paths`/`link-paths`/`objects`/`icon`）与顶层一样**相对清单目录解析**。
 - 覆盖块由**最终目标**（含 CLI `--target` 的影响）选择，且**先于** CLI 覆盖应用，故 CLI 的 `-l/-I/-L/-D` 仍叠加在分层结果之上——「CLI beats 清单」不变。
+
+### 4.1.1 宿主占位符（一份清单同时描述 macOS 与 Windows）
+
+`targets` 只能按**目标**（`native`/`wasm`）分层，而 macOS 与 Windows 是**同一个目标、不同的依赖目录与系统库**。若靠两个文件解决，示例清单（同时也是文档里的标准例子）就会一半在另一半宿主上编译失败——事实上在引入这一节之前，`examples/` 下的 21 份手写清单都写着 `lib/macos-arm64`、`CoreText`、`png`（macOS 的归档名没有 `lib` 前缀），在 Windows 上**全部**死在 `#include <zlib.h>` 或 `could not open 'Cocoa'`。
+
+因此列表字段里的字符串支持四个占位符（**只在构建清单里**，CLI 的 `-I/-L/-l` 不收）：
+
+| 占位符 | 展开为 | 说明 |
+|---|---|---|
+| `${host}` | `windows-x64` / `windows-x86` / `macos-arm64` / `wasm` | 依赖目录名（`vendor/*/lib/<host>`）。由**最终目标 + `architecture` + 宿主**算出；算不出（如 Linux 宿主没有预编译树）时**硬报错**而不是给一个空路径 |
+| `${lib:NAME}` | `NAME` / `libNAME` | 同一个库在两边归档文件名不同：Windows 的 Skia 归档带 `lib` 前缀（`libpng.lib`），macOS 是 `libpng.a` ⇒ `-lpng` 找得到，Windows 的 `-lpng` 则找不到 `png.lib`。只该用于**文件名有此差异**的库 |
+| `${win:TOKEN}` | `TOKEN`（Windows）/ 整条**丢弃**（其他宿主） | 只属于一个宿主的条目：Windows 系统导入库（`gdi32`/`usp10`/`winmm`…）、`../vendor/curl/lib/${host}` 这类只有 Windows 才需要的路径 |
+| `${mac:TOKEN}` | `TOKEN`（macOS）/ 整条**丢弃**（其他宿主） | 同上，如 `objc`（`window_glue.cc` 的 NSWindow 边框垫片需要；Windows 上没有这个库） |
+
+规则：
+
+- `${win:}` / `${mac:}` **必须是整条**（`"${win:gdi32}"`），不能拼在字符串中间——拼进去意味着这条东西在另一个宿主上变成半截字符串，而半截路径不会报错、只会链错。
+- `${lib:}` 后面为空、占位符未闭合、写了 `${host:xxx}` 这类不认识的形态，都以**带上清单文件名**的错误报出（AGENTS.md §2.5：宁可 `throw`，也不产出「编过但结果错」的 C/链接命令行）。
+- 展开发生在**解析时**，且 `architecture` 的合法性校验提前到展开之前（否则 `${host}` 会按一个非法位宽去查目录）；`targets.<目标>` 块与顶层字段走**同一套**展开。
+- `frameworks` **没有**占位符：它由发射端按宿主门控（非 darwin 一律不发），所以一份清单可以同时列着 `Cocoa`/`Metal` 与 `${win:gdi32}`，两边各取所需。
+
+示例清单 [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json) 与 [`examples/window_click.build.example.json`](../../examples/window_click.build.example.json) 就是这种形态；`node test.ts` 的 `build/HostTemplates` 把每个占位符、每条拒绝路径都钉了一遍，`build/ExampleManifestHosts` 则把**每一份**示例清单在当前宿主上展开，并断言每个路径真的存在、每个 `-lNAME` 真能在它的 `-L` 目录里找到归档（少了这条钉子，清单只在「CI 的宿主」上被验证过）。
+
+> **不是每个宿主都有预编译树**：Linux 宿主上 `${host}` 直接报错，这是刻意的——`vendor/` 只有 macos-arm64 / windows-x64 / windows-x86 / wasm 四套，静默退回 `windows-x64` 会去链一套 COFF 归档并报一堆无关的符号错误。
 
 ### 4.2 链接时优化与分阶段优化（`lto` / `pgo`）
 

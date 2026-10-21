@@ -2,6 +2,7 @@
   "target": "native",
   "c-compiler": "clang",
   "opt": "-O2",
+  "architecture": "64",
   "sources": [
     "../../vendor/skia_glue.cc",
     "../../vendor/window_glue.cc",
@@ -9,7 +10,8 @@
   ],
   "include-paths": [
     "../../vendor/skia",
-    "../../vendor/sdl2/include/macos-arm64"
+    "../../vendor/sdl2/include/${host}",
+    "${win:../../vendor/curl/include}"
   ],
   "link-libs": [
     "skia",
@@ -23,10 +25,10 @@
     "bentleyottmann",
     "skcms",
     "wuffs",
-    "png",
-    "jpeg",
-    "webp",
-    "webp_sse41",
+    "${lib:png}",
+    "${lib:jpeg}",
+    "${lib:webp}",
+    "${lib:webp_sse41}",
     "dng_sdk",
     "piex",
     "expat",
@@ -36,11 +38,25 @@
     "zlib",
     "z",
     "SDL2",
-    "objc"
+    "${mac:objc}",
+    "${win:usp10}",
+    "${win:user32}",
+    "${win:gdi32}",
+    "${win:ole32}",
+    "${win:advapi32}",
+    "${win:winmm}",
+    "${win:imm32}",
+    "${win:oleaut32}",
+    "${win:version}",
+    "${win:uuid}",
+    "${win:setupapi}",
+    "${win:shell32}",
+    "${win:dinput8}"
   ],
   "link-paths": [
-    "../../vendor/skia/lib/macos-arm64",
-    "../../vendor/sdl2/lib/macos-arm64"
+    "../../vendor/skia/lib/${host}",
+    "../../vendor/sdl2/lib/${host}",
+    "${win:../../vendor/curl/lib/${host}}"
   ],
   "frameworks": [
     "CoreFoundation",

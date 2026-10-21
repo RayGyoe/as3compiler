@@ -9,7 +9,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync, statSync, renameSync } from 'node:fs';
 import { resolve, dirname, join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -275,56 +275,11 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   const next: BuildConfig = { ...cfg };
   if (m.target) next.target = m.target;
   if (m.package) next.package = m.package;
-  if (m['c-compiler']) next.cCompiler = m['c-compiler'];
-  if (m.opt) next.opt = m.opt;
-  if (m['debug-info'] !== undefined) next.debugInfo = m['debug-info'];
-  if (m.lto !== undefined) next.lto = m.lto;
-  if (m.pgo) next.pgo = m.pgo;
-  if (m['pgo-dir']) next.pgoDir = resolveFromManifest(manifestPath, m['pgo-dir']);
-  if (m.sources) next.sources = [...cfg.sources, ...m.sources.map((p) => resolveFromManifest(manifestPath, p))];
-  if (m['swc-paths']) next.swcPaths = [...cfg.swcPaths, ...m['swc-paths'].map((p) => resolveFromManifest(manifestPath, p))];
-  if (m['ane-paths']) {
-    // Appended to the CLI's --ane list (a manifest adds packages), but never the
-    // same package twice. An --air-app build now DERIVES ane-paths from the
-    // descriptor's <extensions> (see air-app.ts), so a user mid-migration who still
-    // passes the package with --ane would hand one package in twice and get "two
-    // ANEs declare the same extensionID" -- a wrong-cause diagnosis for a list that
-    // simply names one package more than once (§2.5). Compared as resolved paths,
-    // because the CLI's are cwd-relative and the manifest's are manifest-relative.
-    const have = new Set(cfg.anePaths.map((p) => resolve(p)));
-    next.anePaths = [...cfg.anePaths];
-    for (const p of m['ane-paths'].map((q) => resolveFromManifest(manifestPath, q))) {
-      if (have.has(resolve(p))) continue;
-      have.add(resolve(p));
-      next.anePaths.push(p);
-    }
-  }
-  if (m['ane-platform']) next.anePlatform = m['ane-platform'];
-  if (m['include-paths']) next.includePaths = [...cfg.includePaths, ...m['include-paths'].map((p) => resolveFromManifest(manifestPath, p))];
-  if (m['link-libs']) next.linkLibs = [...cfg.linkLibs, ...m['link-libs']];
-  if (m['link-paths']) next.linkPaths = [...cfg.linkPaths, ...m['link-paths'].map((p) => resolveFromManifest(manifestPath, p))];
-  if (m.defines) next.defines = [...cfg.defines, ...m.defines];
-  if (m.features) next.features = [...cfg.features, ...m.features];
-  if (m.objects) next.objects = [...cfg.objects, ...m.objects.map((p) => resolveFromManifest(manifestPath, p))];
-  if (m.frameworks) next.frameworks = [...cfg.frameworks, ...m.frameworks];
-  if (m.exports) next.exports = [...cfg.exports, ...m.exports];
-  if (m['font-urls']) next.fontUrls = [...cfg.fontUrls, ...m['font-urls']];
-  if (m['preload-paths']) {
-    next.preloadPaths = [
-      ...cfg.preloadPaths,
-      ...m['preload-paths'].map((p) => resolvePreloadSpec(manifestPath, p)),
-    ];
-  }
-  if (m['preload-excludes']) {
-    next.preloadExcludes = [
-      ...cfg.preloadExcludes,
-      ...m['preload-excludes'].map((p) => resolveFromManifest(manifestPath, p)),
-    ];
-  }
-  if (m['bundle-id']) next.bundleId = m['bundle-id'];
-  if (m['display-name']) next.displayName = m['display-name'];
-  if (m.icon) next.icon = resolveFromManifest(manifestPath, m.icon);
-  if (m['deployment-target']) next.deploymentTarget = m['deployment-target'];
+  // `architecture` is resolved HERE, before any list is templated, because
+  // ${host} needs it: on Windows it is what picks windows-x64 vs windows-x86, and
+  // a template expanded against the wrong one produces a plausible, wrong -L path
+  // (see the host-template block below). It is a top-level-only field (not in
+  // TARGET_LAYER_FIELDS), so no later step can change it out from under us.
   if (m.architecture) {
     // "32"/"64" are AIR's own values (parseAirApp rejects anything else in a
     // descriptor). `arm64` is a manifest-only extension naming a Windows ARM64
@@ -337,6 +292,58 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
     }
     next.architecture = m.architecture;
   }
+  const ht = hostTemplate(next.target, next.architecture);
+  const T = (list: string[]): string[] => expandTemplateList(list, ht, manifestPath);
+  if (m['c-compiler']) next.cCompiler = m['c-compiler'];
+  if (m.opt) next.opt = m.opt;
+  if (m['debug-info'] !== undefined) next.debugInfo = m['debug-info'];
+  if (m.lto !== undefined) next.lto = m.lto;
+  if (m.pgo) next.pgo = m.pgo;
+  if (m['pgo-dir']) next.pgoDir = resolveFromManifest(manifestPath, m['pgo-dir']);
+  if (m.sources) next.sources = [...cfg.sources, ...T(m.sources).map((p) => resolveFromManifest(manifestPath, p))];
+  if (m['swc-paths']) next.swcPaths = [...cfg.swcPaths, ...T(m['swc-paths']).map((p) => resolveFromManifest(manifestPath, p))];
+  if (m['ane-paths']) {
+    // Appended to the CLI's --ane list (a manifest adds packages), but never the
+    // same package twice. An --air-app build now DERIVES ane-paths from the
+    // descriptor's <extensions> (see air-app.ts), so a user mid-migration who still
+    // passes the package with --ane would hand one package in twice and get "two
+    // ANEs declare the same extensionID" -- a wrong-cause diagnosis for a list that
+    // simply names one package more than once (§2.5). Compared as resolved paths,
+    // because the CLI's are cwd-relative and the manifest's are manifest-relative.
+    const have = new Set(cfg.anePaths.map((p) => resolve(p)));
+    next.anePaths = [...cfg.anePaths];
+    for (const p of T(m['ane-paths']).map((q) => resolveFromManifest(manifestPath, q))) {
+      if (have.has(resolve(p))) continue;
+      have.add(resolve(p));
+      next.anePaths.push(p);
+    }
+  }
+  if (m['ane-platform']) next.anePlatform = m['ane-platform'];
+  if (m['include-paths']) next.includePaths = [...cfg.includePaths, ...T(m['include-paths']).map((p) => resolveFromManifest(manifestPath, p))];
+  if (m['link-libs']) next.linkLibs = [...cfg.linkLibs, ...T(m['link-libs'])];
+  if (m['link-paths']) next.linkPaths = [...cfg.linkPaths, ...T(m['link-paths']).map((p) => resolveFromManifest(manifestPath, p))];
+  if (m.defines) next.defines = [...cfg.defines, ...T(m.defines)];
+  if (m.features) next.features = [...cfg.features, ...T(m.features)];
+  if (m.objects) next.objects = [...cfg.objects, ...T(m.objects).map((p) => resolveFromManifest(manifestPath, p))];
+  if (m.frameworks) next.frameworks = [...cfg.frameworks, ...T(m.frameworks)];
+  if (m.exports) next.exports = [...cfg.exports, ...T(m.exports)];
+  if (m['font-urls']) next.fontUrls = [...cfg.fontUrls, ...T(m['font-urls'])];
+  if (m['preload-paths']) {
+    next.preloadPaths = [
+      ...cfg.preloadPaths,
+      ...T(m['preload-paths']).map((p) => resolvePreloadSpec(manifestPath, p)),
+    ];
+  }
+  if (m['preload-excludes']) {
+    next.preloadExcludes = [
+      ...cfg.preloadExcludes,
+      ...T(m['preload-excludes']).map((p) => resolveFromManifest(manifestPath, p)),
+    ];
+  }
+  if (m['bundle-id']) next.bundleId = m['bundle-id'];
+  if (m['display-name']) next.displayName = m['display-name'];
+  if (m.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(m.icon, ht, manifestPath));
+  if (m['deployment-target']) next.deploymentTarget = m['deployment-target'];
   return next;
 }
 
@@ -380,30 +387,32 @@ export function applyManifestOverlay(cfg: BuildConfig, m: Manifest, manifestPath
   }
   const next: BuildConfig = { ...cfg };
   const L = layer;
+  const ht = hostTemplate(target, cfg.architecture);
+  const T = (list: string[]): string[] => expandTemplateList(list, ht, manifestPath);
   if (L['c-compiler']) next.cCompiler = L['c-compiler'];
   if (L.opt) next.opt = L.opt;
   if (L['debug-info'] !== undefined) next.debugInfo = L['debug-info'];
   if (L.lto !== undefined) next.lto = L.lto;
   if (L.pgo) next.pgo = L.pgo;
   if (L['pgo-dir']) next.pgoDir = resolveFromManifest(manifestPath, L['pgo-dir']);
-  if (L.sources) next.sources = L.sources.map((p) => resolveFromManifest(manifestPath, p));
-  if (L['swc-paths']) next.swcPaths = L['swc-paths'].map((p) => resolveFromManifest(manifestPath, p));
-  if (L['ane-paths']) next.anePaths = L['ane-paths'].map((p) => resolveFromManifest(manifestPath, p));
+  if (L.sources) next.sources = T(L.sources).map((p) => resolveFromManifest(manifestPath, p));
+  if (L['swc-paths']) next.swcPaths = T(L['swc-paths']).map((p) => resolveFromManifest(manifestPath, p));
+  if (L['ane-paths']) next.anePaths = T(L['ane-paths']).map((p) => resolveFromManifest(manifestPath, p));
   if (L['ane-platform']) next.anePlatform = L['ane-platform'];
-  if (L['include-paths']) next.includePaths = L['include-paths'].map((p) => resolveFromManifest(manifestPath, p));
-  if (L['link-libs']) next.linkLibs = [...L['link-libs']];
-  if (L['link-paths']) next.linkPaths = L['link-paths'].map((p) => resolveFromManifest(manifestPath, p));
-  if (L.defines) next.defines = [...L.defines];
-  if (L.features) next.features = [...L.features];
-  if (L.objects) next.objects = L.objects.map((p) => resolveFromManifest(manifestPath, p));
-  if (L.frameworks) next.frameworks = [...L.frameworks];
-  if (L.exports) next.exports = [...L.exports];
-  if (L['font-urls']) next.fontUrls = [...L['font-urls']];
-  if (L['preload-paths']) next.preloadPaths = L['preload-paths'].map((p) => resolvePreloadSpec(manifestPath, p));
-  if (L['preload-excludes']) next.preloadExcludes = L['preload-excludes'].map((p) => resolveFromManifest(manifestPath, p));
+  if (L['include-paths']) next.includePaths = T(L['include-paths']).map((p) => resolveFromManifest(manifestPath, p));
+  if (L['link-libs']) next.linkLibs = T(L['link-libs']);
+  if (L['link-paths']) next.linkPaths = T(L['link-paths']).map((p) => resolveFromManifest(manifestPath, p));
+  if (L.defines) next.defines = T(L.defines);
+  if (L.features) next.features = T(L.features);
+  if (L.objects) next.objects = T(L.objects).map((p) => resolveFromManifest(manifestPath, p));
+  if (L.frameworks) next.frameworks = T(L.frameworks);
+  if (L.exports) next.exports = T(L.exports);
+  if (L['font-urls']) next.fontUrls = T(L['font-urls']);
+  if (L['preload-paths']) next.preloadPaths = T(L['preload-paths']).map((p) => resolvePreloadSpec(manifestPath, p));
+  if (L['preload-excludes']) next.preloadExcludes = T(L['preload-excludes']).map((p) => resolveFromManifest(manifestPath, p));
   if (L['bundle-id']) next.bundleId = L['bundle-id'];
   if (L['display-name']) next.displayName = L['display-name'];
-  if (L.icon) next.icon = resolveFromManifest(manifestPath, L.icon);
+  if (L.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(L.icon, ht, manifestPath));
   if (L['deployment-target']) next.deploymentTarget = L['deployment-target'];
   return next;
 }
@@ -836,6 +845,179 @@ export function nonWindowsVendorKey(platform: string, hostArch: string): string 
   return platform === 'darwin' && hostArch === 'arm64' ? 'macos-arm64' : '';
 }
 
+// ---------------------------------------------------------------------------
+// Host templates in build manifests (阶段二百二十七)
+//
+// A manifest used to be able to describe exactly ONE host: every
+// `examples/*.build.json` spelled `../vendor/skia/lib/macos-arm64`, listed
+// `png`/`jpeg`/`webp` under the names macOS archives them as, and asked for
+// CoreFoundation/Cocoa frameworks. On Windows the same file therefore died at
+// `#include <zlib.h>` (no curl include tree in the -I list), and the ones that got
+// past that handed lld-link `-framework CoreAudio` ("could not open 'CoreAudio'").
+// The manifests were not wrong, they were mac-only -- and 15 examples' worth of
+// build coverage did not exist on any other host.
+//
+// The fix is a deliberately tiny template vocabulary rather than one manifest per
+// host: `targets.<name>` cannot express this, because it layers by TARGET and
+// macOS/Windows are both `native`.
+//
+//   ${host}       the vendor platform key for THIS build
+//                 (macos-arm64 | windows-x64 | windows-x86 | wasm)
+//   ${lib:NAME}   `libNAME` on Windows, `NAME` elsewhere -- the four Skia
+//                 third-party targets (png/jpeg/webp/webp_sse41) are literally
+//                 named `lib*` in Skia's BUILD.gn, so the Windows archive is
+//                 libpng.lib while macOS/wasm carry libpng.a
+//   ${win:TOKEN}  TOKEN on a Windows native build, the ENTRY IS DROPPED elsewhere
+//   ${mac:TOKEN}  TOKEN on a macOS native build, the ENTRY IS DROPPED elsewhere
+//
+// `${win:}`/`${mac:}` must be the whole entry: "drop part of a string" has no
+// meaning, and expanding to "" instead would produce a plausible-but-wrong
+// spelling (`vendor/skia/lib/${host}` with an empty host is a real, wrong
+// directory rather than a visible mistake). For the same reason ${host} on a host
+// with no vendor tree is a hard error, never an empty expansion.
+//
+// `frameworks` deliberately gets NO placeholder: it is emitted only for a darwin
+// native link (see buildCompileCommand), since `-framework` is an Apple-linker
+// concept. A shared manifest can therefore list Cocoa/Metal unconditionally.
+// ---------------------------------------------------------------------------
+
+// The vendor platform key for a build described by (target, architecture). ''
+// means "this build has no prebuilt tree", which a `${host}` template must report
+// rather than paper over.
+//
+// Exported and fully parameterised so every row is pinnable from any machine: a
+// windows/x64 box cannot otherwise exercise the macos-arm64 or windows-x86 row.
+export function hostVendorKey(target: Target, platform: string, hostArch: string, architecture: string): string {
+  if (target === 'wasm') return 'wasm';
+  if (platform === 'win32') {
+    // No Windows ARM64 archive set exists (air-app.ts refuses that combination
+    // for the same reason), so a manifest that asks for one has to say so itself.
+    if (architecture === 'arm64') return '';
+    if (architecture === '32') return 'windows-x86';
+    if (architecture === '64') return 'windows-x64';
+    return hostArch === 'ia32' ? 'windows-x86' : 'windows-x64';
+  }
+  return nonWindowsVendorKey(platform, hostArch);
+}
+
+interface HostTemplate {
+  key: string;
+  win: boolean;
+  mac: boolean;
+}
+
+function hostTemplate(target: Target, architecture: string): HostTemplate {
+  const native = target === 'native';
+  return {
+    key: hostVendorKey(target, process.platform, process.arch, architecture),
+    win: native && process.platform === 'win32',
+    mac: native && process.platform === 'darwin',
+  };
+}
+
+// Read one `${name}` / `${name:arg}` starting at `s[i]`. Nesting is honoured so
+// `${win:../vendor/curl/lib/${host}}` keeps its inner placeholder for the second
+// pass instead of ending the token at the first `}`.
+function readTemplateAt(s: string, i: number): { name: string; arg: string | null; end: number } | null {
+  if (s[i] !== '$' || s[i + 1] !== '{') return null;
+  let depth = 0;
+  for (let j = i; j < s.length; j++) {
+    if (s[j] === '$' && s[j + 1] === '{') { depth++; j++; continue; }
+    if (s[j] === '}') {
+      depth--;
+      if (depth === 0) {
+        const body = s.slice(i + 2, j);
+        const colon = body.indexOf(':');
+        return colon < 0
+          ? { name: body, arg: null, end: j + 1 }
+          : { name: body.slice(0, colon), arg: body.slice(colon + 1), end: j + 1 };
+      }
+    }
+  }
+  return null;
+}
+
+const TEMPLATE_NAMES = ['host', 'lib', 'win', 'mac'];
+
+function expandTemplateToken(
+  t: { name: string; arg: string | null },
+  ht: HostTemplate,
+  manifestPath: string,
+  whole: string,
+): string {
+  switch (t.name) {
+    case 'host':
+      if (t.arg !== null) {
+        throw new Error(`build manifest: \${host} takes no argument (got "${whole}") — ${manifestPath}`);
+      }
+      if (ht.key === '') {
+        throw new Error(
+          `build manifest: \${host} has no prebuilt vendor tree for this build ` +
+          `(${process.platform}/${process.arch}` +
+          `${process.platform === 'win32' ? ', architecture "arm64" has no Windows archive set' : ''}) — ${manifestPath}`);
+      }
+      return ht.key;
+    case 'lib':
+      if (t.arg === null || t.arg === '') {
+        throw new Error(`build manifest: \${lib:...} needs a library name — ${manifestPath}`);
+      }
+      return ht.win ? `lib${t.arg}` : t.arg;
+    case 'win':
+    case 'mac':
+      // Only reachable when the conditional is not the whole entry; the whole-entry
+      // form is consumed by expandTemplateEntry before this runs.
+      throw new Error(
+        `build manifest: \${${t.name}:...} must be a whole entry, not part of "${whole}" — ${manifestPath}`);
+    default:
+      throw new Error(
+        `build manifest: unknown template placeholder \${${t.name}...} in "${whole}" ` +
+        `(supported: ${TEMPLATE_NAMES.map((n) => `\${${n}}`).join(', ')}) — ${manifestPath}`);
+  }
+}
+
+function expandTemplateText(s: string, ht: HostTemplate, manifestPath: string): string {
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '$' && s[i + 1] === '{') {
+      const t = readTemplateAt(s, i);
+      if (t === null) {
+        throw new Error(`build manifest: unterminated template placeholder in "${s.slice(i)}" — ${manifestPath}`);
+      }
+      out += expandTemplateToken(t, ht, manifestPath, s);
+      i = t.end;
+      continue;
+    }
+    out += s[i++];
+  }
+  return out;
+}
+
+// One manifest entry -> zero (dropped conditional) or one fully expanded string.
+function expandTemplateEntry(raw: string, ht: HostTemplate, manifestPath: string): string | null {
+  const whole = readTemplateAt(raw, 0);
+  if (whole !== null && whole.end === raw.length && (whole.name === 'win' || whole.name === 'mac')) {
+    const keep = whole.name === 'win' ? ht.win : ht.mac;
+    if (!keep) return null;
+    if (whole.arg === null || whole.arg === '') {
+      throw new Error(`build manifest: \${${whole.name}:...} needs a value — ${manifestPath}`);
+    }
+    // The token's own argument may carry further placeholders (for example
+    // `${win:../vendor/curl/lib/${host}}`), so it still takes the inline pass.
+    return expandTemplateText(whole.arg, ht, manifestPath);
+  }
+  return expandTemplateText(raw, ht, manifestPath);
+}
+
+function expandTemplateList(list: readonly string[], ht: HostTemplate, manifestPath: string): string[] {
+  const out: string[] = [];
+  for (const raw of list) {
+    const v = expandTemplateEntry(raw, ht, manifestPath);
+    if (v !== null) out.push(v);
+  }
+  return out;
+}
+
 // Extra flags every native step (C compile, C++ compile, link) needs on Windows
 // so all three drivers agree on the same ABI; empty elsewhere and for non-AIR
 // builds (architecture === ''), which keep clang's host default.
@@ -863,7 +1045,15 @@ function nativeTargetFlags(cfg: BuildConfig): string[] {
 // `vendor/provision/windows.ps1` already copies icudtl.dat next to the skia .lib; here
 // we mirror it next to the freshly linked exe (SkLoadICU only probes the exe and
 // library directories, so shipping it beside the .lib is not enough). Returns
-// true when a copy happened.
+// true when the destination now holds the data (copied, or already identical).
+//
+// Several builds CAN share one output directory (`node test.ts` links every Skia
+// example into the same temp/regress-out/ under a 6-wide pool), so this copy is
+// not exclusive: on Windows a plain CopyFile onto a destination another process
+// has open fails with `UNKNOWN: unknown error, copyfile ...` — and a running Skia
+// example *is* holding icudtl.dat open to read it. Hence: compare first (the
+// overwhelmingly common case is "already deployed", costing one stat), and write
+// through a pid-suffixed temp name so a half-written file is never observable.
 export function deploySkiaIcuData(cfg: BuildConfig, outPath: string): boolean {
   if (process.platform !== 'win32' || cfg.target !== 'native') return false;
   if (cfg.architecture !== '32' && cfg.architecture !== '64' && cfg.architecture !== 'arm64') return false;
@@ -871,11 +1061,40 @@ export function deploySkiaIcuData(cfg: BuildConfig, outPath: string): boolean {
   for (const p of cfg.linkPaths) {
     const src = join(p, 'icudtl.dat');
     if (existsSync(src)) {
-      copyFileSync(src, join(dirname(resolve(outPath)), 'icudtl.dat'));
+      copyIcuData(src, join(dirname(resolve(outPath)), 'icudtl.dat'));
       return true;
     }
   }
   return false;
+}
+
+// Same bytes, or "built from the same vendor tree": size + not-older-than-source
+// is enough for a data file that only changes when ICU is upgraded, and it avoids
+// reading 0.8 MB on every build of every Skia example.
+function icuDataUpToDate(src: string, dst: string): boolean {
+  try {
+    const a = statSync(src);
+    const b = statSync(dst);
+    return a.size === b.size && b.mtimeMs >= a.mtimeMs;
+  } catch {
+    return false;
+  }
+}
+
+function copyIcuData(src: string, dst: string): void {
+  if (icuDataUpToDate(src, dst)) return;
+  const tmp = `${dst}.${process.pid}.tmp`;
+  copyFileSync(src, tmp);
+  try {
+    renameSync(tmp, dst);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    // Lost the race against a process that loaded the file between our stat and
+    // our rename. If the destination ended up with the right bytes anyway, the
+    // build's requirement ("icudtl.dat beside the exe") is met, so this is not an
+    // error; a genuinely different file must still fail loudly.
+    if (!icuDataUpToDate(src, dst)) throw e;
+  }
 }
 
 // Build the full argv for the C compiler. Pure data -> string[] so the caller
@@ -949,8 +1168,7 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
   for (const o of cfg.objects) args.push(o);
   for (const p of cfg.linkPaths) args.push('-L', p);
   for (const l of cfg.linkLibs) args.push('-l', l);
-  for (const f of cfg.frameworks) args.push('-framework', f);
-  for (const f of platformFrameworks(cfg)) args.push('-framework', f);
+  args.push(...frameworkFlags(cfg));
   // Static-archive order: libraries must follow the objects that reference
   // them, hence -lsetjmp here rather than in the wasm branch above.
   if (cfg.target === 'wasm' && wasiSetjmpLib()) args.push('-lsetjmp');
@@ -1156,11 +1374,33 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
   for (const l of cfg.linkLibs) linkArgs.push('-l', l);
   linkArgs.push(...posixLinkLibs());
   for (const l of platformLinkLibs()) linkArgs.push('-l', l);
-  for (const f of cfg.frameworks) linkArgs.push('-framework', f);
-  for (const f of platformFrameworks(cfg)) linkArgs.push('-framework', f);
+  linkArgs.push(...frameworkFlags(cfg));
   steps.push(linkArgs);
 
   return steps;
+}
+
+// macOS frameworks on the link line — the manifest's own list plus the ones the
+// runtime platform layer needs (see platformFrameworks).
+//
+// `-framework` is an Apple-linker spelling: GNU ld has no such switch and lld-link
+// does not even fail on it — it treats the FRAMEWORK NAME as an input file, so a
+// shared manifest that lists Cocoa produced `lld-link: error: could not open
+// 'Cocoa'`, a message naming the wrong problem entirely. Gated HERE rather than in
+// the manifests so that one `frameworks` list can honestly describe the Apple
+// build and be inert on every other host (this is the third of the three fields
+// that stopped a single manifest from describing macOS and Windows at once -- the
+// other two are the vendor platform key and the Skia archive names, see the host
+// template block above).
+//
+// Shared by both link builders (buildCompileCommand for the C-only path and
+// buildCompileSteps for the C++ one) so the two cannot drift apart.
+function frameworkFlags(cfg: BuildConfig): string[] {
+  if (process.platform !== 'darwin' || cfg.target !== 'native') return [];
+  const out: string[] = [];
+  for (const f of cfg.frameworks) out.push('-framework', f);
+  for (const f of platformFrameworks(cfg)) out.push('-framework', f);
+  return out;
 }
 
 // The compiler for a wasm build: WASI_SDK_HOME/bin/clang when the SDK is

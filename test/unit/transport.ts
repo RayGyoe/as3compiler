@@ -191,15 +191,31 @@ function checkAirAppTransport(): string[] {
   const list = (m: Record<string, unknown>, k: string): string[] => (m[k] as string[]) ?? [];
 
   const netNative = manifestOf('net', ['--target', 'native']);
+  // The archive tree a host links is `vendor/curl/lib/<host key>`, and the key is a
+  // per-host fact (air-app.ts computes it from process.platform + the descriptor's
+  // <architecture>, which defaults to 32 on Windows): pinning 'macos-arm64' here
+  // made the check read "Windows emitted the wrong path" when it had emitted
+  // exactly the right one.
+  const hostLibKey = process.platform === 'win32'
+    ? `windows-${netNative.architecture === '32' ? 'x86' : 'x64'}`
+    : 'macos-arm64';
   check('a networked app links curl', list(netNative, 'link-libs').includes('curl'));
   check('a networked app links nghttp2 (curl\'s HTTP/2 framing)', list(netNative, 'link-libs').includes('nghttp2'));
   check('a networked app defines ASC_HAVE_CURL', list(netNative, 'defines').includes('ASC_HAVE_CURL=1'));
   check('a networked app adds curl\'s include path',
     list(netNative, 'include-paths').some((p) => p.endsWith('vendor/curl/include')));
   check('a networked app adds curl\'s static lib path',
-    list(netNative, 'link-paths').some((p) => p.endsWith('vendor/curl/lib/macos-arm64')));
-  check('a networked app links curl\'s TLS + proxy frameworks',
-    list(netNative, 'frameworks').includes('Security') && list(netNative, 'frameworks').includes('SystemConfiguration'));
+    list(netNative, 'link-paths').some((p) => p.endsWith(`vendor/curl/lib/${hostLibKey}`)));
+  // TLS + proxy, two ways: Secure Transport through two Apple frameworks on macOS,
+  // Schannel + Winsock + CNG as link libraries on Windows (the same split
+  // air-app.ts documents next to its `-framework` branch -- `-framework` is not a
+  // linker flag there at all).
+  const netFrameworks = list(netNative, 'frameworks');
+  check('a networked app links curl\'s TLS + proxy stack',
+    process.platform === 'win32'
+      ? netFrameworks.length === 0
+        && ['crypt32', 'ws2_32', 'secur32'].every((l) => list(netNative, 'link-libs').includes(l))
+      : netFrameworks.includes('Security') && netFrameworks.includes('SystemConfiguration'));
 
   const netWeb = airManifest('../../vendor', true, true, true, true, 'auto', false, false, [], [], [], [], true) as Record<string, unknown>;
   check('the web build defines ASC_HAVE_FETCH instead', list(netWeb, 'defines').includes('ASC_HAVE_FETCH=1'));

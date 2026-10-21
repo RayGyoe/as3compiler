@@ -14,7 +14,7 @@ import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
-import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS, readNorm } from '../harness.ts';
 
 // ---- 64-bit integers (stage 94.24, enhancement E9) ----
 //
@@ -98,12 +98,12 @@ function checkNoreturn(): string[] {
     else { bad.push(label); console.log(`FAIL  [noreturn] ${label}`); }
   };
 
-  const preamble = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
-  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const preamble = readNorm(join(root, 'src', 'runtime.ts'));
+  const emitSource = readNorm(join(root, 'src', 'emit.ts'));
   // The A/B numbers live in the roadmap entry (阶段九十四·二十六), NOT in the
   // original scratch harness under temp/ -- temp/ is disposable and the pin went
   // red the moment that directory was pruned. TODO.md is the durable record.
-  const ev = readFileSync(join(root, 'TODO.md'), 'utf8');
+  const ev = readNorm(join(root, 'TODO.md'));
 
   check('as_throw carries the standard C11 _Noreturn specifier',
     preamble.includes('static _Noreturn void as_throw(void* e) {'));

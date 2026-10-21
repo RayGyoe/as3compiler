@@ -5,12 +5,12 @@
 //   node --test --test-name-pattern='build/' test/unit/*.ts
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { readdirSync, writeFileSync, readFileSync, mkdirSync, existsSync, copyFileSync, rmSync, statSync } from 'node:fs';
-import { join, dirname, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { readdirSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, existsSync, copyFileSync, rmSync, statSync, utimesSync } from 'node:fs';
+import { join, dirname, resolve, sep, basename } from 'node:path';
+import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, linkTrimFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
@@ -20,6 +20,23 @@ import { generateXcodeProject } from '../../src/xcode-project.ts';
 import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, currentAnePlatform, parseExtensionXml, resolveAneDescriptors, resolveExtensionPackages } from '../../src/ane.ts';
 import type { AneResolution } from '../../src/ane.ts';
 import { ANE_COUNT_MAX } from '../../src/fre.ts';
+
+// The executable bit a SCRIPT needs, asked in a way that works on every host.
+//
+// NTFS has no execute bit: Node reports 0o666 for every regular file, so
+// `(statSync(p).mode & 0o111) !== 0` can never hold on Windows and the pin went
+// red for a reason that had nothing to do with the scripts. The durable fact is
+// the mode GIT records, because that is what a POSIX checkout (and the arm64
+// macOS CI runner) materialises -- so on Windows ask the index instead. Returns
+// null when this is not a git checkout at all, which is an environment fact to
+// report rather than a pass or a failure.
+function recordedExecutable(rel: string): boolean | null {
+  if (process.platform !== 'win32') return (statSync(join(root, rel)).mode & 0o111) !== 0;
+  const r = spawnSync('git', ['ls-files', '-s', '--', rel], { cwd: root, encoding: 'utf8' });
+  const line = (r.stdout ?? '').trim();
+  if (r.status !== 0 || line === '') return null;
+  return line.startsWith('100755 ');
+}
 
 // ---- build-manifest per-target layering (阶段八十九·五十) ----
 // Checked separately from the example suite (its own counters) so the "N passed"
@@ -1728,8 +1745,12 @@ function checkAneHostLibrary(): string[] {
   // The build scripts, which are the only place a wrong name survives to run time.
   const dylibSh = join(root, 'lib', 'build-asaot.sh');
   const aniSh = join(root, 'examples', 'ane', 'build-ane.sh');
-  check('lib/build-asaot.sh exists and is executable',
-    existsSync(dylibSh) && (statSync(dylibSh).mode & 0o111) !== 0);
+  const execCheck = (label: string, rel: string): void => {
+    const exec = recordedExecutable(rel);
+    if (exec === null) { console.log(`SKIP  [anehost] ${rel}: no git checkout to read the index mode from`); return; }
+    check(label, exec);
+  };
+  execCheck('lib/build-asaot.sh exists and is executable', 'lib/build-asaot.sh');
   const d = existsSync(dylibSh) ? readFileSync(dylibSh, 'utf8') : '';
   // The install name is what makes the copy beside the executable the one dyld opens:
   // an absolute path baked in at build time would work here and nowhere else.
@@ -1740,8 +1761,7 @@ function checkAneHostLibrary(): string[] {
   check('it builds both slices (the macOS key encodes no architecture)',
     d.includes('-arch arm64 -arch x86_64') && d.includes('lipo -archs'));
 
-  check('examples/ane/build-ane.sh exists and is executable',
-    existsSync(aniSh) && (statSync(aniSh).mode & 0o111) !== 0);
+  execCheck('examples/ane/build-ane.sh exists and is executable', 'examples/ane/build-ane.sh');
   const a = existsSync(aniSh) ? readFileSync(aniSh, 'utf8') : '';
   // The same three artifact guards the .bat has, in the macOS spelling: the recipe is
   // identical, and a dylib still importing Adobe AIR builds and links and then fails
@@ -2104,14 +2124,22 @@ function checkAirAppOffscreenLinkSet(): string[] {
   // visible=false, resizable/highDpi inert, no Stage3D, no fonts, no networking,
   // no audio, x64. Every argument is explicit so the assertion set below is the
   // whole manifest rather than a slice of it.
+  //
+  // `arch` is faked too, not only `platform`: air-app.ts resolves the vendor key
+  // from BOTH (nonWindowsVendorKey), so a darwin platform on this x64 host used
+  // to ask for `macos-x64` -- a tree vendor/ does not ship -- and threw
+  // "no prebuilt dependency tree for this host" out of the group.
   const realPlatform = process.platform;
+  const realArch = process.arch;
   const offscreen = (platform: string, arch: string): Record<string, unknown> => {
     Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    Object.defineProperty(process, 'arch', { value: platform === 'darwin' ? 'arm64' : 'x64', configurable: true });
     try {
       return airManifest('vendor', false, true, false, false, 'auto', false, false,
         [], [], [], [], false, false, arch) as Record<string, unknown>;
     } finally {
       Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+      Object.defineProperty(process, 'arch', { value: realArch, configurable: true });
     }
   };
   const win = offscreen('win32', '64');
@@ -2146,7 +2174,7 @@ function checkAirAppOffscreenLinkSet(): string[] {
     (mac['frameworks'] as string[]).indexOf('CoreText') >= 0);
   check('...and carries none of the Windows system import libs',
     macLibs.indexOf('gdi32') < 0 && macLibs.indexOf('user32') < 0 && macLibs.indexOf('usp10') < 0);
-  check('the platform fake was undone', process.platform === realPlatform);
+  check('the platform fake was undone', process.platform === realPlatform && process.arch === realArch);
   console.log(`     [offscreen] ${ok} check(s) passed`);
   return bad;
 }
@@ -2248,6 +2276,7 @@ function checkVendorLayout(): string[] {
   // machine: the key is precisely what used to differ, and leaving macOS unchecked
   // would pin nothing on a Windows box (and vice versa).
   const realPlatform = process.platform;
+  const realHostArch = process.arch;
   const nativePaths = (arch: string): string[] => {
     const m = airManifest('vendor', true, true, true, false, 'auto', false, true,
       [], [], [], [], true, false, arch) as Record<string, unknown>;
@@ -2268,7 +2297,12 @@ function checkVendorLayout(): string[] {
     return m['include-paths'] as string[];
   };
   const expectHost = (host: string, platform: string, key: (arch: string) => string): void => {
+    const realArch = process.arch;
     Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    // The vendor key is derived from platform AND arch (build.ts
+    // nonWindowsVendorKey), so an x64 build host faking `darwin` alone asks for
+    // macos-x64 -- absent from vendor/ -- and throws instead of checking.
+    Object.defineProperty(process, 'arch', { value: platform === 'darwin' ? 'arm64' : 'x64', configurable: true });
     try {
       for (const arch of ['64', '32']) {
         const k = key(arch);
@@ -2294,11 +2328,12 @@ function checkVendorLayout(): string[] {
       }
     } finally {
       Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+      Object.defineProperty(process, 'arch', { value: realArch, configurable: true });
     }
   };
   expectHost('windows', 'win32', (a) => 'windows-' + (a === '32' ? 'x86' : 'x64'));
   expectHost('macos', 'darwin', () => 'macos-arm64');
-  check('the platform fake was undone', process.platform === realPlatform);
+  check('the platform fake was undone', process.platform === realPlatform && process.arch === realHostArch);
 
   // Checked-in manifests — hand-written examples and `--air-app` snapshots alike.
   const manifests: string[] = [];
@@ -2444,11 +2479,16 @@ function checkLinkTrim(): string[] {
     return steps[steps.length - 1];
   };
 
-  // (1) The flags themselves.
-  check('native macOS link trims dead code and local symbols',
-    darwin && JSON.stringify(linkTrimFlags({ ...defaultBuildConfig() })) === JSON.stringify(['-Wl,-dead_strip', '-Wl,-x']));
+  // (1) The flags themselves. Both sides are asserted, not just the macOS one:
+  // the flags are Mach-O ld flags (see build.ts), so a non-darwin link must get
+  // NONE of them -- emitting them there is a hard linker error, and "we are not on
+  // macOS so we cannot check" is how that shipped once already.
+  check(`link trimming is ${darwin ? 'applied on Mach-O' : 'OFF on this host (its ld does not know -dead_strip)'}`,
+    JSON.stringify(linkTrimFlags({ ...defaultBuildConfig() })) ===
+      JSON.stringify(darwin ? ['-Wl,-dead_strip', '-Wl,-x'] : []));
   check('--debug-info keeps its local symbols (dead_strip still applies)',
-    darwin && JSON.stringify(linkTrimFlags({ ...defaultBuildConfig(), debugInfo: true })) === JSON.stringify(['-Wl,-dead_strip']));
+    JSON.stringify(linkTrimFlags({ ...defaultBuildConfig(), debugInfo: true })) ===
+      JSON.stringify(darwin ? ['-Wl,-dead_strip'] : []));
   check('wasm links are untouched (its own --strip-debug covers it)',
     JSON.stringify(linkTrimFlags({ ...defaultBuildConfig(), target: 'wasm' })) === JSON.stringify([]));
 
@@ -2456,9 +2496,14 @@ function checkLinkTrim(): string[] {
   const link = linkStep(text());
   check('the trim flags reach the real link command',
     !darwin || (link.includes('-Wl,-dead_strip') && link.includes('-Wl,-x')));
+  // The ICU data object only exists on a Mach-O link (it is Mach-O assembly
+  // defining `_icudtNN_dat`), so on any other host the invariant is the mirror
+  // image: the link carries no such object at all instead of half of the scheme.
   const objAt = link.findIndex((a) => a.endsWith('icudtl_flutter.o'));
   const firstL = link.findIndex((a) => a === '-l');
-  check('the ICU data object precedes the archive flags', objAt > 0 && firstL > objAt);
+  check(darwin ? 'the ICU data object precedes the archive flags'
+               : 'no Mach-O ICU data object on a non-Mach-O link',
+    darwin ? objAt > 0 && firstL > objAt : objAt < 0);
   check('the single-command (pure C) path trims too',
     !darwin || buildCompileCommand({ ...defaultBuildConfig(), target: 'native' }, 'x.c', 'x.out').includes('-Wl,-dead_strip'));
 
@@ -2472,7 +2517,8 @@ function checkLinkTrim(): string[] {
   check('wasm never assembles it (Skia wasm already ships flutter data)',
     icuDataPaths({ ...text(), target: 'wasm' }) === null);
   check('a text build assembles it even when the manifest omits -l icu',
-    icuDataPaths({ ...text(), linkLibs: ['skia'] }) !== null);
+    darwin ? icuDataPaths({ ...text(), linkLibs: ['skia'] }) !== null
+           : icuDataPaths({ ...text(), linkLibs: ['skia'] }) === null);
 
   // (4) The vendored blob is the small one, and its symbol is derived, not guessed.
   const dat = join(root, 'vendor', 'skia', 'icu', 'icudtl_flutter.dat');
@@ -2483,8 +2529,11 @@ function checkLinkTrim(): string[] {
     const blob = readFileSync(dat);
     const major = blob.subarray(blob.indexOf('icudt') + 5, blob.indexOf('icudt') + 7).toString('latin1');
     check('...with a version marker', /^[0-9]{2}$/.test(major));
+    // Same split as above: the substitute is a Mach-O-only scheme, so on another
+    // host the fact to pin is that nothing is injected.
     const obj = icuDataPaths(text());
-    check('a text build resolves the object', obj !== null);
+    check(darwin ? 'a text build resolves the object' : 'a non-Mach-O build takes no substitute',
+      darwin ? obj !== null : obj === null);
     if (obj) {
       // 阶段二百二十三：the blob is an object like any other -- in this build's own
       // scratch, never next to the tracked input (a shared path here is what let a
@@ -2614,15 +2663,18 @@ function checkObjectPaths(): string[] {
   // builds sharing one config): 9 links died with `ld: file is empty in
   // .../icudtl_flutter.o`, 0 after. The ICU data object below was the one the example
   // suite actually hit, twice in three runs.
+  // Separator-agnostic: the same path is `…-1234\x.o` on Windows and `…-1234/x.o`
+  // elsewhere, and the invariant is about the directory, not the slash.
+  const slashed = (p: string): string => p.replace(/\\/g, '/');
   check('every object path is namespaced by the owning pid',
-    plain.length > 0 && producedObjs(base()).every((p) => p.includes(`-${process.pid}/`)));
+    plain.length > 0 && producedObjs(base()).every((p) => slashed(p).includes(`-${process.pid}/`)));
   const t1 = base({ defines: ['ASC_USE_SKIA=1', 'ASC_HAVE_TEXT'] });
   const t2 = base({ opt: '-O0', defines: ['ASC_USE_SKIA=1', 'ASC_HAVE_TEXT'] });
   const i1 = icuDataPaths(t1);
   const i2 = icuDataPaths(t2);
   check('the ICU data object is private as well (it was the shared one)',
     process.platform !== 'darwin' ||
-      (i1 !== null && i2 !== null && i1.object !== i2.object && i1.object.includes(`-${process.pid}/`)));
+      (i1 !== null && i2 !== null && i1.object !== i2.object && slashed(i1.object).includes(`-${process.pid}/`)));
 
   // (7) The scratch belongs to one build, and it ends with that build: a successful link
   // takes its objects with it (~3 MB for a text example), so repeated builds cannot pile
@@ -2651,6 +2703,289 @@ function checkObjectPaths(): string[] {
 }
 
 registerGroup('unit: build/ObjectPaths', checkObjectPaths);
+
+// ---- host templates in build manifests (阶段二百二十七) ----
+//
+// `targets.<name>` layers by TARGET, and macOS/Windows are both `native`, so one
+// manifest could not describe both hosts: the 15 Skia examples spelled
+// `vendor/skia/lib/macos-arm64`, listed `png`/`jpeg`/`webp` under their macOS
+// archive names, and asked lld-link for `-framework CoreAudio`. The template
+// vocabulary (${host} / ${lib:} / ${win:} / ${mac:}) is what closes that, and these
+// pins exist because every failure mode of it is SILENT: an empty ${host} produces
+// a plausible directory, `${lib:}` forgotten yields `-lpng` which lld resolves to
+// nothing, and a dropped `${win:}` entry yields a link error hundreds of lines
+// away. Both directions are exercised from one machine by faking the platform (the
+// same trick build/VendorLayout uses).
+function checkHostTemplates(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [hosttmpl] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [hosttmpl] ${label}`); }
+  };
+  const fake = (platform: string, arch: string, fn: () => void): void => {
+    const rp = process.platform;
+    const ra = process.arch;
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    Object.defineProperty(process, 'arch', { value: arch, configurable: true });
+    try { fn(); } finally {
+      Object.defineProperty(process, 'platform', { value: rp, configurable: true });
+      Object.defineProperty(process, 'arch', { value: ra, configurable: true });
+    }
+  };
+  // A throw helper: the message matters, because a silently-empty expansion is the
+  // failure this whole mechanism has to avoid.
+  const throwsWith = (fn: () => void, frag: string): boolean => {
+    try { fn(); return false; } catch (e) { return String((e as Error).message).includes(frag); }
+  };
+  const expand = (entries: string[]): BuildConfig => applyManifest(
+    defaultBuildConfig(), { target: 'native', architecture: '64', 'link-libs': entries } as Manifest, 'x.build.json');
+
+  // (1) The vendor key itself, every row, from any host.
+  check('win32/x64 with architecture "64" -> windows-x64',
+    hostVendorKey('native', 'win32', 'x64', '64') === 'windows-x64');
+  check('win32/x64 with architecture "32" -> windows-x86 (the AIR 32-bit build)',
+    hostVendorKey('native', 'win32', 'x64', '32') === 'windows-x86');
+  check('an unset architecture follows the HOST width, not always x64',
+    hostVendorKey('native', 'win32', 'ia32', '') === 'windows-x86');
+  check('darwin/arm64 -> macos-arm64', hostVendorKey('native', 'darwin', 'arm64', '') === 'macos-arm64');
+  check('wasm -> wasm regardless of the build host',
+    hostVendorKey('wasm', 'win32', 'x64', '') === 'wasm' && hostVendorKey('wasm', 'darwin', 'arm64', '') === 'wasm');
+  check('a host with no prebuilt tree answers EMPTY, so the caller has to say so',
+    hostVendorKey('native', 'linux', 'x64', '') === '' && hostVendorKey('native', 'win32', 'x64', 'arm64') === '');
+
+  // (2) ${host} expands, and an empty key is a hard error rather than an empty path.
+  fake('win32', 'x64', () => {
+    const c = applyManifest(defaultBuildConfig(),
+      { target: 'native', architecture: '64', 'link-paths': ['../vendor/skia/lib/${host}'] } as Manifest, 'x.build.json');
+    check('win32: link-paths/${host} names the windows tree',
+      c.linkPaths.length === 1 && c.linkPaths[0].endsWith(join('skia', 'lib', 'windows-x64')));
+    check('a ${host} with no tree is an ERROR naming the host, never an empty path',
+      throwsWith(() => applyManifest({ ...defaultBuildConfig(), architecture: 'arm64' },
+        { target: 'native', 'link-paths': ['../vendor/skia/lib/${host}'] } as Manifest, 'x.build.json'),
+      'no prebuilt vendor tree'));
+  });
+  fake('darwin', 'arm64', () => {
+    const c = applyManifest(defaultBuildConfig(),
+      { target: 'native', 'link-paths': ['../vendor/skia/lib/${host}'] } as Manifest, 'x.build.json');
+    check('darwin: link-paths/${host} names the macos tree', c.linkPaths[0].endsWith(join('skia', 'lib', 'macos-arm64')));
+  });
+
+  // (3) ${lib:} follows the Windows `lib` prefix, which is the ONLY reason -lpng
+  //     can be spelled once (Skia's BUILD.gn names those targets libpng/libjpeg/...).
+  fake('win32', 'x64', () => {
+    check('win32: ${lib:png} -> libpng', expand(['${lib:png}']).linkLibs.join() === 'libpng');
+  });
+  fake('darwin', 'arm64', () => {
+    check('darwin: ${lib:png} -> png', expand(['${lib:png}']).linkLibs.join() === 'png');
+  });
+
+  // (4) ${win:}/${mac:} drop the WHOLE entry on the other host.
+  fake('win32', 'x64', () => {
+    const c = expand(['z', '${win:usp10}', '${mac:objc}', '${win:../vendor/curl/lib/${host}}']);
+    check('win32 keeps the ${win:} entries and drops ${mac:}',
+      c.linkLibs.join() === 'z,usp10,../vendor/curl/lib/windows-x64');
+  });
+  fake('darwin', 'arm64', () => {
+    const c = expand(['z', '${win:usp10}', '${mac:objc}', '${win:../vendor/curl/lib/${host}}']);
+    check('darwin keeps ${mac:} and drops every ${win:} entry (no -framework illusion left behind)',
+      c.linkLibs.join() === 'z,objc');
+  });
+  // A wasm build is neither win nor mac: both conditionals must vanish, or a
+  // cross target starts asking for Windows import libs.
+  check('a wasm build drops both ${win:} and ${mac:} entries',
+    applyManifest({ ...defaultBuildConfig(), target: 'wasm' },
+      { 'link-libs': ['skia', '${win:usp10}', '${mac:objc}'] } as Manifest, 'x.build.json')
+      .linkLibs.join() === 'skia');
+
+  // (5) The spellings that must be REJECTED (AGENTS §2.5: a typo can never become
+  //     a silent no-op).
+  check('an unknown placeholder is an error, not a literal path',
+    throwsWith(() => expand(['${nope}']), 'unknown template placeholder'));
+  check('${win:} mixed into a longer string is an error ("drop part of a string" has no meaning)',
+    throwsWith(() => expand(['${win:usp10}${mac:objc}']), 'must be a whole entry'));
+  check('${host} takes no argument', throwsWith(() => expand(['${host:1}']), 'takes no argument'));
+  check('${lib:} with no name is an error', throwsWith(() => expand(['${lib:}']), 'needs a library name'));
+  check('an unterminated placeholder is an error',
+    throwsWith(() => expand(['${host']), 'unterminated template placeholder'));
+
+  // (6) `-framework` exists only on an Apple link. This is the third field that kept
+  //     one manifest from describing both hosts; lld-link does not reject the flag,
+  //     it treats the framework NAME as an input file (`could not open 'Cocoa'`).
+  const fwCfg: BuildConfig = { ...defaultBuildConfig(), frameworks: ['Cocoa', 'Metal'] };
+  fake('win32', 'x64', () => {
+    check('win32: a manifest listing Cocoa/Metal emits no -framework at all',
+      !buildCompileCommand(fwCfg, 'x.c', 'x').includes('-framework'));
+    check('win32: ...and the frameworks are still recorded in the config (they describe the APPLE build)',
+      fwCfg.frameworks.length === 2);
+  });
+  fake('darwin', 'arm64', () => {
+    const cc = buildCompileCommand(fwCfg, 'x.c', 'x');
+    check('darwin: the same manifest does emit -framework Cocoa/Metal',
+      cc.includes('-framework') && cc.includes('Cocoa') && cc.includes('Metal'));
+  });
+
+  check('the platform fake was undone', process.platform === osPlatform());
+  console.log(`     [hosttmpl] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: build/HostTemplates', checkHostTemplates);
+
+// ---- every checked-in example manifest resolves on THIS host (阶段二百二十七) ----
+//
+// The template mechanism is only worth anything if the manifests that use it
+// actually point at files that exist. That is not a compile-time property of the
+// template code, it is a property of the 20-odd JSON files, so it is pinned here:
+// expand each one for the host that is running the test and check every link dir,
+// every -l archive and every source. On macOS this is what the examples already
+// did implicitly; on Windows it is the only place the windows-x64 tree is walked
+// without linking 20 MB of static libraries.
+function checkExampleManifestHosts(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [manihost] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [manihost] ${label}`); }
+  };
+  const files: string[] = [];
+  // Import/system libraries the OS supplies -- no -L dir holds them.
+  const OS_PROVIDED = new Set([
+    // Windows SDK
+    'usp10', 'user32', 'gdi32', 'ole32', 'advapi32', 'winmm', 'imm32', 'oleaut32',
+    'version', 'uuid', 'setupapi', 'shell32', 'dinput8',
+    'd3d12', 'dxgi', 'd3dcompiler',
+    'crypt32', 'ws2_32', 'secur32', 'bcrypt', 'iphlpapi',
+    // POSIX / Apple system libs (posixLinkLibs, platformLinkLibs, the C++ runtime)
+    'z', 'iconv', 'objc', 'm', 'c', 'pthread', 'dl', 'stdc++',
+  ]);
+  const walk = (d: string): void => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory()) { if (!['node_modules', 'com', 'org', 'net'].includes(e.name)) walk(join(d, e.name)); }
+      else if (e.name.indexOf('.build.') >= 0 && e.name.endsWith('.json')) files.push(join(d, e.name));
+    }
+  };
+  walk(join(root, 'examples'));
+
+  // Only manifests for THIS host are expandable at all. Two kinds are not, and
+  // both are skipped by CONTENT rather than by a name list, so nothing can rot:
+  //
+  //   * `target: wasm` / `package: web` — a different machine entirely.
+  //   * a manifest that spells a platform key LITERALLY (air-native's D3D build
+  //     names windows-x64 because it also names ASC_RENDER_D3D: the host is a
+  //     consequence of the backend there, not an oversight). Those are counted and
+  //     reported, so "we migrated everything" stays a checkable claim.
+  const leftovers: string[] = [];
+  const missingPaths: string[] = [];
+  const missingArchives: string[] = [];
+  const hostSpecific: string[] = [];
+  let checked = 0;
+  for (const f of files) {
+    const cfg = applyManifest(defaultBuildConfig(), loadManifest(f), f);
+    if (cfg.target !== 'native') continue;
+    const raw = readFileSync(f, 'utf8');
+    if (/(macos-arm64|windows-x64|windows-x86)/.test(raw)) {
+      hostSpecific.push(f.slice(root.length + 1));
+      continue;
+    }
+    checked++;
+    const rel = f.slice(root.length + 1);
+    for (const v of [...cfg.sources, ...cfg.includePaths, ...cfg.linkPaths, ...cfg.objects, ...cfg.anePaths]) {
+      if (v.includes('${')) leftovers.push(`${rel} -> ${v}`);
+      if (!existsSync(v)) missingPaths.push(`${rel} -> ${v}`);
+    }
+    // -lNAME resolves to libNAME.a / NAME.lib / NAME.a inside a -L dir, OR it is an
+    // OS-provided import/system library that no manifest supplies (the Windows SDK's
+    // user32/gdi32 family, and on POSIX the system z/iconv/objc that the link layer
+    // adds itself). The allowlist also makes a NEW vendored archive name fail here
+    // until someone decides which of the two it is.
+    for (const l of cfg.linkLibs) {
+      if (l.includes('${')) { leftovers.push(`${rel} -l -> ${l}`); continue; }
+      if (OS_PROVIDED.has(l)) continue;
+      const hit = cfg.linkPaths.some((p) => ['lib' + l + '.a', l + '.lib', l + '.a'].some((n) => existsSync(join(p, n))));
+      if (!hit) missingArchives.push(`${rel} -> -l${l}`);
+    }
+  }
+  check(`${checked} native example manifests expand with no ${'${'}...} placeholder left over`, leftovers.length === 0);
+  if (leftovers.length > 0) console.log('  ' + leftovers.join('\n  '));
+  check('every source / include / link path they name exists on this host', missingPaths.length === 0);
+  if (missingPaths.length > 0) console.log('  ' + missingPaths.join('\n  '));
+  check('every -lNAME they name resolves to an archive in one of their -L dirs', missingArchives.length === 0);
+  if (missingArchives.length > 0) console.log('  ' + missingArchives.join('\n  '));
+  // Visible, not silent: these still cannot be built on a second host, and that is
+  // a per-file decision someone has to make (air-native's is tied to the D3D
+  // backend, not to a forgotten placeholder).
+  console.log(`     [manihost] ${hostSpecific.length} native manifest(s) still spell a platform key literally: `
+    + hostSpecific.join(', '));
+  console.log(`     [manihost] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: build/ExampleManifestHosts', checkExampleManifestHosts);
+
+// `deploySkiaIcuData` copies icudtl.dat beside the exe, and several builds share one
+// output directory in practice (`node test.ts` links every Skia example into the same
+// temp/regress-out/ under a 6-wide pool). The copy therefore has to survive a
+// destination that already holds the file -- and that a *running* Skia example has it
+// open, which on Windows turns CopyFile into `UNKNOWN: unknown error, copyfile`.
+// Pinned from any host by faking win32, since the function is Windows-only.
+function checkIcuDataDeploy(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [icudat] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [icudat] ${label}`); }
+  };
+  const rp = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const dir = mkdtempSync(join(tmpdir(), 'as-aot-icu-'));
+    const libDir = join(dir, 'lib');
+    const outDir = join(dir, 'out');
+    mkdirSync(libDir, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
+    const src = join(libDir, 'icudtl.dat');
+    writeFileSync(src, 'a'.repeat(64));
+    const dst = join(outDir, 'icudtl.dat');
+    const cfg = { ...defaultBuildConfig(), target: 'native', architecture: '64',
+      linkLibs: ['skia'], linkPaths: [libDir] } as BuildConfig;
+
+    check('first build copies the data beside the exe',
+      deploySkiaIcuData(cfg, join(outDir, 'app.exe')) && readFileSync(dst, 'utf8').length === 64);
+
+    // The point: a second build in the SAME output dir is a no-op, not a second
+    // CopyFile. Same size + not-older-than-source is the up-to-date test, so the
+    // probe stamps a future mtime and then checks it survived.
+    const futures = new Date(Date.now() + 60_000);
+    utimesSync(dst, futures, futures);
+    deploySkiaIcuData(cfg, join(outDir, 'app.exe'));
+    check('a second build does not rewrite an up-to-date file', statSync(dst).mtimeMs === futures.getTime());
+
+    // A stale/truncated destination IS replaced, otherwise a crashed build would
+    // poison the directory forever.
+    writeFileSync(dst, 'stale');
+    utimesSync(dst, futures, futures);
+    deploySkiaIcuData(cfg, join(outDir, 'app.exe'));
+    check('a destination with the wrong size is overwritten', readFileSync(dst, 'utf8').length === 64);
+
+    // No icudtl.dat in any -L dir (Skia absent, or a macOS-style tree) -> false, so
+    // the caller prints nothing and a non-Skia build is untouched.
+    const emptyLib = join(dir, 'nolib');
+    mkdirSync(emptyLib, { recursive: true });
+    check('no icudtl.dat in the link dirs answers false',
+      deploySkiaIcuData({ ...cfg, linkPaths: [emptyLib] }, join(outDir, 'app.exe')) === false);
+    check('a build that does not link skia is skipped',
+      deploySkiaIcuData({ ...cfg, linkLibs: [] }, join(outDir, 'app.exe')) === false);
+
+    rmSync(dir, { recursive: true, force: true });
+  } finally {
+    Object.defineProperty(process, 'platform', { value: rp, configurable: true });
+  }
+  console.log(`     [icudat] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: build/IcuDataDeploy', checkIcuDataDeploy);
 
 // Remove every scratch directory this test process created under $TMPDIR/as-aot-obj.
 // The checks drive the real command builder, so they name real directories; the build

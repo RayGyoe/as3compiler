@@ -120,7 +120,14 @@ function checkPublishForm(): string[] {
     // The shebang is what makes npm's bin shim executable, and the exec bit is
     // what `node_modules/.bin/as-aot` is linked to -- npm does not add either.
     check('dist/<bin> keeps its shebang', head === '#!');
-    check('dist/<bin> is executable (npm links bin straight at it)', (statSync(binPath).mode & 0o111) !== 0);
+    // NTFS has no execute bit, so the file mode says 0o666 on Windows no matter
+    // what the build asked for; the mode the build REQUESTS is the thing to pin
+    // there (writeFileSync cannot represent it), and on POSIX the real bit.
+    check('dist/<bin> is executable (npm links bin straight at it)',
+      process.platform === 'win32'
+        ? readFileSync(join(root, 'scripts', 'build-dist.ts'), 'utf8')
+            .includes("if (name === 'index.js') chmodSync(outPath, 0o755);")
+        : (statSync(binPath).mode & 0o111) !== 0);
   }
 
   // Module-for-module parity, both directions: a module that failed to strip, or a
@@ -196,13 +203,21 @@ function checkPublishForm(): string[] {
 
   const packed = withTempDir((dir) => {
     try {
-      const out = execFileSync('npm', ['pack', '--json', '--pack-destination', dir], {
-        cwd: root,
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      });
+      // Windows installs npm as `npm.cmd`, which execFileSync cannot spawn without
+      // a shell (ENOENT, not a PATH problem): `shell: true` is the documented
+      // answer and the command name is plain `npm` in both cases.
+      const win = process.platform === 'win32';
+      const out = execFileSync(win ? 'npm.cmd' : 'npm',
+        ['pack', '--json', '--pack-destination', dir], {
+          cwd: root,
+          encoding: 'utf8',
+          shell: win,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
       const manifest = (JSON.parse(out) as PackedManifest[])[0];
-      return (manifest.files ?? []).map((f) => f.path);
+      // The tarball lists POSIX paths on every host (npm's own convention), so a
+      // `join()`-built expectation reads `dist\x.js` here and never matches.
+      return (manifest.files ?? []).map((f) => f.path.replace(/\\/g, '/'));
     } catch {
       return null;
     }
@@ -213,7 +228,7 @@ function checkPublishForm(): string[] {
     check('the tarball ships no .ts at all', !packed.some((p) => p.endsWith('.ts')));
     check(
       'the tarball carries the whole dist/ tree',
-      srcModules.every((m) => packed.includes(join(binDir, `${m}.js`)))
+      srcModules.every((m) => packed.includes(`${binDir.replace(/\\/g, '/')}/${m}.js`))
     );
   }
 

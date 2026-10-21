@@ -42,6 +42,10 @@ ARM64 运行时（量值见 §2.11），描述符里写它没有任何消费者�
 三处路径随之切换：`vendor/skia/lib/windows-xN`、`vendor/sdl2/{lib,include}/windows-xN`、
 `vendor/curl/lib/windows-xN`。（`vendor/` 是**入库**目录；`build-tools/` 不入库、在 Windows 上重新下载。）
 
+**手写构建清单不必自己拼这些目录名**：清单里写 `vendor/skia/lib/${host}` 即可，`${host}` 由
+最终目标 + 本字段 + 宿主算成 `windows-x64` / `windows-x86` / `macos-arm64`，同一份清单在两边都成立
+（完整词表与拒绝规则见 [`compile.md`](compile.md) §4.1.1）。
+
 ---
 
 ## 2. 依赖库的构建：`vendor/provision/windows.ps1`

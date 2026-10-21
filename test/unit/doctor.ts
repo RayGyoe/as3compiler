@@ -122,16 +122,27 @@ function checkCheckBehaviour(): string[] {
   const noCurlNet = requireCheck('vendor.curl', ctxWith({ defines: ['ASC_HAVE_CURL=1'] }));
   check('a networking native build without the curl tree is refused, naming the transport',
     noCurlNet !== null && noCurlNet.includes('flash.net') && noCurlNet.includes('curl.h'));
-  // Does NOT fire for a plain macOS build: pushing curl's headers and -L would
-  // link a vendored curl into an app that never asked for one. This is the
-  // regression that matters, because over-firing makes the check useless.
-  check('a plain macOS build is not asked for curl at all',
-    requireCheck('vendor.curl', ctxWith({})) === null);
+  // A plain build asks for the tree only where the host has no system zlib: on
+  // macOS it must NOT fire (pushing curl's headers and -L would link a vendored
+  // curl into an app that never asked for one -- over-firing is what makes the
+  // check useless), while on Windows it deliberately DOES fire (see the zlib
+  // reason below). One check, two hosts, both asserted.
+  check(process.platform === 'win32'
+    ? 'a plain Windows build IS asked for the tree, for zlib only'
+    : 'a plain macOS build is not asked for curl at all',
+    process.platform === 'win32'
+      ? (requireCheck('vendor.curl', ctxWith({})) ?? '').includes('zlib')
+      : requireCheck('vendor.curl', ctxWith({})) === null);
   // The Windows reason is zlib, not networking -- a different sentence for the
   // same missing file, which is exactly why the message is assembled at run time.
   const winReason = requireCheck('vendor.curl', ctxWith({})) ?? '';
   check('the Windows reason is zlib (a build-time need, not an app request)',
     process.platform !== 'win32' || winReason.includes('zlib'));
+  // ...and a networked Windows build carries BOTH reasons: only the zlib half was
+  // reported before, which hid the one an app author can act on.
+  check('a networked Windows build names zlib AND the transport',
+    process.platform !== 'win32'
+      || ((noCurlNet ?? '').includes('zlib') && (noCurlNet ?? '').includes('flash.net')));
 
   // ---- vendor.audio ------------------------------------------------------
   // warn-kind, so it must never reach requireCheck: a missing backend is a build
@@ -181,7 +192,9 @@ function checkCheckBehaviour(): string[] {
   // which must arrive as a failure naming the file, never as a silent pass.
   const noSkia = requireCheck('vendor.skia', ctxWith({ linkLibs: ['skia'] })) ?? '';
   check('a genuinely missing dependency is a failure that names the file',
-    noSkia.includes('libskia.a'));
+    // The archive name is per host (vendor/provision ships skia.lib for MSVC and
+    // libskia.a elsewhere, see src/checks.ts's own onWindows() split).
+    noSkia.includes(process.platform === 'win32' ? 'skia.lib' : 'libskia.a'));
   // ...and it does not fire for a build that links no Skia at all, which is what
   // keeps it usable as a gate rather than as noise on every offscreen build.
   check('a build that links no Skia is not asked for the archives',

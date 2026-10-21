@@ -266,15 +266,20 @@ function checkBuildWiring(): string[] {
   };
 
   const db = dryRun('db');
+  // The dry-run prints HOST paths, so `…\sqlite3.c -o` on Windows and
+  // `…/sqlite3.c -o` elsewhere. Normalise once instead of writing two literals:
+  // the invariant is "the amalgamation is on the compile line", not the slash.
+  const sl = (s: string): string => s.replace(/\\/g, '/');
+  const dbSl = sl(db);
   check('a flash.data app announces the engine wiring', db.includes('+ flash.data: linking the SQLite engine'));
   check('a flash.data app compiles the SQLite amalgamation',
-    db.includes('vendor/sqlite/sqlite3.c -o') || db.includes('vendor/sqlite/sqlite3.c\n'));
+    dbSl.includes('vendor/sqlite/sqlite3.c -o') || dbSl.includes('vendor/sqlite/sqlite3.c\n'));
   check('... and the glue that is the only translation unit including sqlite3.h',
-    db.includes('vendor/sqlite_glue.c -o'));
+    dbSl.includes('vendor/sqlite_glue.c -o'));
   check('... with the engine define', db.includes('-D ASC_HAVE_SQLITE'));
   check('... and the column-metadata option loadSchema needs', db.includes('-D SQLITE_ENABLE_COLUMN_METADATA'));
-  check('... and sqlite\'s include dir', db.includes('-I ' + join(root, 'vendor', 'sqlite')));
-  check('the compile line carries the generated C too', db.includes('unit-sqldata/db/db.c'));
+  check('... and sqlite\'s include dir', dbSl.includes('-I ' + sl(join(root, 'vendor', 'sqlite'))));
+  check('the compile line carries the generated C too', dbSl.includes('unit-sqldata/db/db.c'));
 
   const plain = dryRun('plain');
   check('a plain app links no SQLite at all',
