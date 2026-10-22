@@ -40,9 +40,12 @@ ActionScript 源码 (.as)
 参见「构建与链接」与 AGENTS.md §2.9。
 
 生成的 C 里，**与宿主符号撞名的 AS3 顶层函数会自动改名**（只改 C 符号，AS3 侧可见名一字不动）：
-`function log()` → `_log`（撞 `<math.h>`）、`function Sprite()` → `_Sprite`（撞类 typedef）、
-`function max()` → `_max`（撞 Windows `#define max(a,b)`）。Windows 上还有一族**对象式宏**
-（`near`/`far`/`small`…）由运行时的 `#undef` 块处理。完整判据与残留在 `docs/zh-cn/c-naming.md`。
+`function log()` → `log__`（撞 `<math.h>`）、`function bind()` → `bind__`（撞 socket 的 `bind(2)`）、
+`function max()` → `max__`（撞 Windows 的 `#define max(a,b)`）。判据表由 `scripts/gen-c-reserved.ts`
+从**当前平台的头文件面**机器生成（`src/c-reserved.gen.ts`，与手写 seed 求并），所以漏举一个名字不会再变成
+用户的编译错误；消歧用 `__` **后缀**而不是 `_` 前缀——前缀会被宿主的对象式宏吃掉（MSVC 的
+`#define _stat _stat64i32`）。Windows 上还有一族**对象式宏**（`near`/`far`/`small`…）由运行时的 `#undef` 块处理。
+完整判据与残留在 `docs/zh-cn/c-naming.md` §8。
 
 ## 运行
 

@@ -10,7 +10,8 @@ import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
 import { FRE_BODY } from '../../src/fre.ts';
-import { SymbolTable } from '../../src/symbols.ts';
+import { SymbolTable, C_RESERVED, C_RESERVED_SCOPE, sanitizeCIdent, sanitizeFileCIdent } from '../../src/symbols.ts';
+import { C_RESERVED_HEADERS } from '../../src/c-reserved.gen.ts';
 import { registerGroup, root, readNorm } from '../harness.ts';
 
 // A left-nested chain of N string literals, which is what the emitter sees for
@@ -3200,32 +3201,38 @@ function checkEmitFreeFunctionNameReservation(): string[] {
     + 'var f:Function = log;\n'
     + 'trace("" + v + s + helper() + main() + f(3));\n')).c;
 
-  // The prototypes must not spell a libc/libm/typedef/host-macro name.
-  check('a free function named `log` is emitted as `_log`',
-    c.includes('static double _log(double x);'));
+  // The prototypes must not spell a libc/libm/typedef/host-macro name. The
+  // disambiguation is a `__` SUFFIX (阶段 247, G8 part B): a `_` prefix is defeated
+  // by the host's own object-like macros -- MSVC's `#define _stat _stat64i32`
+  // turned the old `stat -> _stat` rename into a collision with the real
+  // declaration. See sanitizeFileCIdent in src/symbols.ts.
+  check('a free function named `log` is emitted as `log__`',
+    c.includes('static double log__(double x);'));
   check('no prototype is left spelled `log`',
     !/\bdouble log\(double x\)/.test(c) && !/\bstatic double log\(/.test(c));
-  check('a free function named `index` is emitted as `_index`',
-    c.includes('static char* _index(char* s);'));
-  check('a free function named after a C TYPE is renamed (`Sprite` -> `_Sprite`)',
-    c.includes('static int _Sprite();') && !/\bstatic int Sprite\(\)/.test(c));
-  check('function-like host macros are avoided (`max`/`isnan` -> `_max`/`_isnan`)',
-    c.includes('static double _max(double a, double b);') && c.includes('static bool _isnan(double x);'));
+  check('a free function named `index` is emitted as `index__`',
+    c.includes('static char* index__(char* s);'));
+  check('a free function named after a C TYPE is renamed (`Sprite` -> `Sprite__`)',
+    c.includes('static int Sprite__();') && !/\bstatic int Sprite\(\)/.test(c));
+  check('function-like host macros are avoided (`max`/`isnan` -> `max__`/`isnan__`)',
+    c.includes('static double max__(double a, double b);') && c.includes('static bool isnan__(double x);'));
   check('a name that does not collide is left alone',
     c.includes('static int helper();'));
 
-  // The P2 used-set: `log` claimed `_log`, so `_log` must climb to `__log` --
-  // otherwise the two AS3 functions would share one C symbol.
-  check('the sanitize collision pair `log`/`_log` maps to `_log`/`__log`',
-    c.includes('static double _log(double x);') && c.includes('static double __log(double x);'));
+  // Distinct AS3 names must stay distinct C symbols. `log` claims `log__`, and the
+  // AS3 name `_log` is itself free (no header spells `_log`), so it keeps its own
+  // spelling -- the two never alias. (Under the old `_`-prefix scheme this was the
+  // `_log` -> `__log` climb; the suffix scheme makes the pair fall out naturally.)
+  check('the pair `log`/`_log` stays two distinct C symbols',
+    c.includes('static double log__(double x);') && c.includes('static double _log(double x);'));
 
   // Every emission site must use the renamed symbol, not just the prototype.
   check('the definition is renamed too',
-    c.includes('static double _log(double x) {'));
+    c.includes('static double log__(double x) {'));
   check('the call site is renamed',
-    c.includes('_log(((double)(5)))') && c.includes('__log(((double)(2)))'));
+    c.includes('log__(((double)(5)))') && c.includes('_log(((double)(2)))'));
   check('the Function-value thunk is renamed (`__call` names the same symbol)',
-    c.includes('_log__call') && c.includes('as_fn_make(_log__call'));
+    c.includes('log____call') && c.includes('as_fn_make(log____call'));
 
   // `main` keeps its bespoke rename (user-main.as is the end-to-end pin).
   check('a user `main()` still becomes `asc_user_main`',
@@ -3380,3 +3387,98 @@ function checkEmitSystemExit(): string[] {
   return bad;
 }
 registerGroup('unit: emit/SystemExit', checkEmitSystemExit);
+
+// 阶段二百四十七 (G8): a top-level AS3 function is emitted under its own name, so
+// any name a system header already DECLARES or #DEFINES is a hard C compile error --
+// `bind` vs <winsock.h>/<sys/socket.h>, `stat` vs <sys/stat.h>, `printf` vs <stdio.h>.
+// These names are legal AS3 and run under `adl`, so the fix is to rename the C symbol,
+// never to reject the program. Pinned here (not in examples/) because what must not
+// silently change is the SPELLING of the renamed symbol, and the fact that the
+// block-scope table stayed narrow -- a rename that compiles is invisible to an
+// examples/ unit that only observes behaviour.
+function checkEmitCNameCollision(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [cname] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [cname] ${label}`); }
+  };
+  const gen = (src: string) => generateC(parse(src)).c;
+
+  // --- file scope: `__` SUFFIX, never `_` prefix -------------------------------
+  // The suffix is the whole point of G8 part B: MSVC <sys/stat.h> has
+  // `#define _stat _stat64i32`, so the old `stat -> _stat` rename expanded into a
+  // direct collision with the real declaration (`conflicting types for
+  // '_stat64i32'`). C reserves the `__` PREFIX, not the suffix.
+  check('a declared function name gets a `__` suffix (`bind`)',
+    gen("function bind(a:int, b:int):int { return a + b; }\ntrace(bind(1, 2));")
+      .includes('static int bind__(int a, int b);'));
+  check('a macro-only name gets the same suffix (`stat`)',
+    gen("function stat(x:int):int { return x; }\ntrace(stat(1));")
+      .includes('static int stat__(int x);'));
+  check('`stat` is NOT renamed to the macro-eaten `_stat`',
+    !/\bint _stat\(/.test(gen("function stat(x:int):int { return x; }\ntrace(stat(1));")));
+  check('a socket-family name is renamed (`socket`, `listen`)', (() => {
+    const c = gen("function socket(x:int):int { return x; }\n"
+      + "function listen(x:int):int { return x; }\ntrace(socket(1) + listen(2));");
+    return c.includes('static int socket__(int x);') && c.includes('static int listen__(int x);');
+  })());
+  check('a stdio name is renamed (`printf`)',
+    gen("function printf(x:int):int { return x; }\ntrace(printf(1));")
+      .includes('static int printf__(int x);'));
+  check('a function-like host macro is renamed (`min`, `isnan`)', (() => {
+    const c = gen("function min(a:int, b:int):int { return a; }\n"
+      + "function isnan(x:int):int { return x; }\ntrace(min(1, 2) + isnan(3));");
+    return c.includes('static int min__(int a, int b);') && c.includes('static int isnan__(int x);');
+  })());
+  check('an ordinary name is left byte-identical (`helper`)',
+    gen("function helper(x:int):int { return x; }\ntrace(helper(1));")
+      .includes('static int helper(int x);'));
+  check('`main` still maps to asc_user_main',
+    gen('function main():void { trace(1); }').includes('asc_user_main'));
+
+  // A user name that ALREADY ends in `__` must not alias onto the renamed spelling
+  // of its reserved twin (`time` -> `time__`), or two AS3 functions would share one
+  // C symbol.
+  check('a literal trailing-`__` name does not alias the renamed twin', (() => {
+    const c = gen("function time(x:int):int { return x; }\n"
+      + "function time__(x:int):int { return x + 1; }\ntrace(time(1) + time__(2));");
+    return c.includes('static int time__(int x);') && c.includes('static int time____(int x);');
+  })());
+
+  // Class names are file-scope typedefs too: a package-less `class close` would be
+  // `typedef struct close close;`, colliding with close(2).
+  check('a class named after a C function is renamed (`close`)',
+    gen("class close { public var v:int = 1; }\nvar c:close = new close();\ntrace(c.v);")
+      .includes('typedef struct close__ close__;'));
+
+  // --- the two tables must stay SEPARATE --------------------------------------
+  // Locals/fields keep the `_` prefix against the narrow seed table. That is not an
+  // oversight: the built-in classes are emitted with hand-written bodies that spell
+  // their own fields literally (`o->socket`, `o->_time`), so widening the BLOCK-scope
+  // table disconnects those structs from their own bodies -- measured as
+  // `error: no member named 'socket' in 'struct ServerSocketConnectEvent'` the moment
+  // the header sweep was unioned into it. See C_RESERVED_SCOPE.
+  check('the block-scope table stays narrow (no header-sweep names)',
+    !C_RESERVED_SCOPE.has('socket') && !C_RESERVED_SCOPE.has('bind')
+    && !C_RESERVED_SCOPE.has('listen') && !C_RESERVED_SCOPE.has('min'));
+  check('the file-scope table is the union (header sweep included)',
+    C_RESERVED.has('socket') && C_RESERVED.has('bind') && C_RESERVED.has('printf')
+    && C_RESERVED.has('stat'));
+  check('fields keep the `_` prefix spelling the builtin bodies hardcode',
+    sanitizeCIdent('stat') === '_stat' && sanitizeCIdent('time') === '_time');
+  check('file-scope names take the `__` suffix spelling',
+    sanitizeFileCIdent('stat') === 'stat__' && sanitizeFileCIdent('time') === 'time__');
+  // The generator drops everything C reserves to the implementation; keeping that
+  // invariant here means a future generator edit cannot quietly add `__va_start`
+  // (or an `_[A-Z]` name) and change nothing observable. It applies to the
+  // GENERATED half only: the hand-written seed deliberately carries `__restrict`,
+  // a spelling clang accepts as a keyword alias.
+  check('the generated table holds no implementation-reserved names',
+    ![...C_RESERVED_HEADERS].some((n) => n.startsWith('__') || /^_[A-Z]/.test(n)));
+  check('the generated table is non-trivial', C_RESERVED_HEADERS.size > 5000);
+
+  console.log(`     [cname] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/CNameCollision', checkEmitCNameCollision);

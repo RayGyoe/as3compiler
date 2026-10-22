@@ -8,6 +8,7 @@
 > **已实现（阶段七十六，v0.3.87）**：完整保留字表迁至 `src/symbols.ts` 的 `C_RESERVED` + `sanitizeCIdent()`（逐级加前缀
 > `exit → _exit → __exit`），`emit.ts` 经 `this.cIdent()`（带 `usedCIdentifiers` 去重）统一接入，覆盖类名/方法/字段/局部变量/形参。
 > 下述 §1 记录改造前状态，§3/§4 为方案与保留字表。
+> **阶段二百四十七更新（v0.4.211）**：保留名表改为**机器生成**（`scripts/gen-c-reserved.ts` → `src/c-reserved.gen.ts`），且**文件作用域**的消歧从「加 `_` 前缀」改为「加 `__` 后缀」；块作用域仍是 seed + `_` 前缀。原因与验收见 **§8**。
 
 ---
 
@@ -271,6 +272,9 @@ class Widget {
 所以改名只改 C 符号，**AS3 侧一个字都不动**（`var f:Function = log` 照旧可调用，
 `[WasmExport]` 的 JS 面名字也不受影响）。
 
+> **阶段二百四十七重写了这条修法的两半**：判据表改由机器生成（不再手写），消歧从 `_` 前缀改为
+> `__` 后缀（理由：前缀会被宿主对象式宏吃掉）。下面这一段保留为阶段二百四十的原始做法，现行规则见 §8。
+
 ### 为什么「函数式宏」和「对象式宏」不能用同一个办法
 
 - **对象式宏**（`near`/`far`/`small`/`_timezone`/`_daylight`/`_tzname` 等）会重写该标识符**出现的每一处**
@@ -312,3 +316,87 @@ Windows `<windef.h>` 的 `min`/`max`。
 `${owner}_${member}` 拼接统一走一个「按 owner 查已种下后缀」的映射（与 §7 末尾那条闭包 cell 的残余同一类
 工程），属**独立立项**，已作为表行登记（阶段二百四十）。
 
+
+## 8. 阶段二百四十七（G8）：保留名表**机器生成** + 文件作用域改用 `__` **后缀**
+
+§4.10 把顶层自由函数接进了改名器，但那张表是**手工列举**的，于是 G8 一直有两个子问题：
+
+| # | 现象（阶段二百四十七 修复前实测） | 现场 |
+|---|---|---|
+| A | 表漏了 socket 家族 | `function bind(a:int, b:int)` ⇒ `static int bind(int, int);` 与 `<winsock.h>:744`（POSIX 面是 `<sys/socket.h>`）的 `bind(SOCKET, const struct sockaddr*, int)` 冲突：`conflicting types for 'bind'` + 每个调用点 `too few arguments to function call, expected 3, have 2` |
+| B | 「加 `_` 前缀」挡不住对象式宏 | `stat` **在**表里且被改成 `_stat`，而 MSVC `<sys/stat.h>:146` 有 `#define _stat _stat64i32` ⇒ 改完仍撞：`conflicting types for '_stat64i32'` |
+
+两个子问题都是**遗留欠账**（`bind`/`stat` 在 AS3 里是合法标识符，`adl` 跑同一份源码没有任何问题），
+而且已经真实咬过一次：UI 工具链原本设计成 `bind(owner, field)`，实测不可用，被迫改名 `bindTo(...)`。
+
+### 8.1 表：机器生成，不再手写
+
+`scripts/gen-c-reserved.ts` 用**同一条编译器的两种 dump**扫描一个头文件 TU（include 面与 `RUNTIME_PREAMBLE` 一致）：
+
+- `-Xclang -ast-dump` → 所有 **`FunctionDecl`** 名（声明冲突，A 项缺的就是这一类）；
+- `-E -dM` → 所有**宏**名（函数式宏改的是调用点，`_stat` 这类对象式宏改的是声明本身）。
+
+过滤三条，判据都是「用户不会这么写」或「这么写也不会落在文件作用域」：丢掉 `__` 前缀与 `_[A-Z]` 前缀
+（C 把这两个命名空间整个保留给实现）、丢掉 **`ALL_CAPS` 对象式宏**（约 2.4 万个 Win32 常量；模块 const 落地为
+`g_` 前缀、静态字段落地为 `<Owner>_<member>`，都不会成为裸的文件作用域函数名）。
+
+产物 `src/c-reserved.gen.ts` 是**生成文件**（当前 win32 面 **7471 条**，文件头带 provenance 与平台注释）；
+`symbols.ts` 把它与手写 seed 求并，即 `C_RESERVED`。
+
+**口径只覆盖一个平台**：表记录的是「生成它的那台机器」的头文件面。POSIX 面（`fork`/`getpid`/`dup2`…）
+MSVC 没有对应头文件，仍由手写 seed 兜底——两边求并才是**超集**。多做不会错（只有**精确命中**才改名），
+少做就是用户的程序编不过。
+
+### 8.2 两张表必须分开
+
+`C_RESERVED`（并集）只给**文件作用域**用；块作用域的局部量/字段用 `C_RESERVED_SCOPE`（**只有 seed**）。
+
+这不是保守，是硬约束：内置类的方法体是**手写 C 字符串**，字段名逐字写死（`o->socket`、`o->_time`）。
+字段声明与访问都过同一个 `cIdent`，但方法体不会跟着变——把新表并进块作用域的那一刻，`examples/c-name-collision.as`
+**当场编不过**（实测，见 8.4 的 M3）：
+
+```text
+error: no member named 'socket' in 'struct ServerSocketConnectEvent'
+```
+
+块作用域本来也没有要修的冲突：`int time;` 在自己的函数里合法地遮蔽 `time()`；
+对象式宏会把字段声明和每一处使用**一致地**重写（这正是它无害的原因）。
+
+### 8.3 改名策略：`__` 后缀，不是 `_` 前缀
+
+文件作用域的两个改名点（`Emitter.freeCName`、`qualifiedName`）改走 `sanitizeFileCIdent()`：表用并集、消歧用**后缀**。
+
+理由是**命名空间**，不是「前缀一定编不过」（这一点在 8.4 里如实量过）：
+
+- C 只保留 **`__` 开头**的标识符；`__` **结尾**不保留。加前缀式改名会主动把名字搬进保留区——
+  并集生效后 `stat` 会 `_stat → __stat`，能编过纯粹因为 MSVC 恰好没声明 `__stat`（它声明的是 `__stat64`），
+  这种「撞不撞取决于宿主实现了哪个保留名」不该成为正确性的前提。
+- `__` 后缀不会被任何对象式宏拼出来：它对宏面的安全性**不依赖**「宿主恰好没定义 `_X`」。
+- 后缀天然不产生 §4.10 那种连锁：`log` 抢走 `_log`，真正的 `_log` 只好再爬到 `__log`。
+
+### 8.4 验收与变异
+
+- `examples/c-name-collision.as`：`bind`/`socket`/`stat`/`printf`/`listen`/`min`/`isnan` 七个顶层函数
+  + `class close`，每条都 `throw` 断言（改坏任一处即非 0 退出）。
+- `unit: emit/CNameCollision`（16 钉）：拼写（`bind__`/`stat__`/`close__`…）、`stat` **不得**变成 `_stat`、
+  普通名逐字不动、`main` 仍是 `asc_user_main`、`time` 与 `time__` 不互相别名、**块作用域表保持窄**
+  （`socket`/`bind`/`listen`/`min` 不在其中）而文件作用域表是并集、字段仍是 `_stat`/`_time`、
+  生成表里没有实现保留名且数量 > 5000。
+- `unit: emit/FreeFunctionNameReservation`（阶段二百四十的 15 钉）拼写同步改为后缀式
+  （`log__`/`index__`/`Sprite__`/`max__`/`isnan__`、thunk `log____call`）。
+- **变异 3/3 全部被抓**（每步 `src/symbols.ts` 按 sha256 校验还原）：下表是**实测结果**，两条横幅恰好说明
+  「示例守表、钉子守拼写」：
+
+| 变异 | 示例（`--run` 前的编译） | 单元钉 |
+|---|---|---|
+| **M1** `sanitizeFileCIdent` 的 `'suffix'` → `'prefix'`（表仍是并集） | **绿**（并集让 `stat` 爬到 `__stat`，恰好可编） | **红 8 条**（全部拼写钉 + `stat` 不得为 `_stat`） |
+| **M2** `C_RESERVED` 并集 → 只用 seed（回到修复前） | **红**：`conflicting types for 'bind'/'socket'/'listen'` ×2 组 + `too few arguments` ×6 ⇒ **12 errors** | 红 |
+| **M3** `C_RESERVED_SCOPE` → 并集（块作用域也放宽） | **红**：`no member named 'socket' in 'struct ServerSocketConnectEvent'` | **红 2 条**（块表保持窄、字段拼写） |
+
+- 探针前后：`probes/name-collision/Main.as` 与 `NamesMain.as` 各 **4 errors → 0**，输出 `bind(1,2) = 3`、`sum=10`。
+- 全量回归 461 项，红仍是那三项既有（`socket.as` 运行期无 Windows socket 后端、`stage94d.as` UTF-16LE、
+  `unit: inline/StackCanary` 本机 clang 差异）。
+
+**如实报明**：① 本机只有 Windows 头文件面，macOS/Linux 面未在此生成（同一脚本在对应平台重跑即可），
+跨平台一致性靠「并集 + seed」而非实测；② M1 说明**后缀本身不是编译通过的充分必要条件**，它守的是
+「不搬进保留命名空间」，因此这条规则由单元钉守，不要以为示例变绿就等于后缀没坏。

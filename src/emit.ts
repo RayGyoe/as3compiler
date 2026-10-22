@@ -4,7 +4,7 @@
 import type { Program, Stmt, Expr, ASType, Param, ClassMember, Block } from './ast.ts';
 import { RUNTIME_PREAMBLE } from './runtime.ts';
 import { FRE_BODY, FRE_HEAD, FRE_STUBS, type AneDescriptor } from './fre.ts';
-import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation } from './symbols.ts';
+import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, sanitizeFileCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 import type { SwcResourceSpec, SwcBake } from './swc.ts';
 import type { EmbedResourceSpec } from './embed.ts';
@@ -663,7 +663,8 @@ export class Emitter {
   //     collide with it (`conflicting types for 'main'`).
   //   - C/libc/libm/POSIX names (`log`, `index`, ...): emitted verbatim, the
   //     prototype sits next to `<math.h>`'s `log(double)` and clang rejects it
-  //     (`static declaration of 'log' follows non-static declaration`).
+  //     (`static declaration of 'log' follows non-static declaration`). The list
+  //     is C_RESERVED (hand-written POSIX seed + the generated header sweep).
   //   - C TYPE names: a function named after a class (`function Sprite()`) shadows
   //     the typedef, so both its declaration and every call fail to parse
   //     (`redefinition of 'Sprite' as different kind of symbol`, then
@@ -673,22 +674,26 @@ export class Emitter {
   // `var f:Function = log` (the `__call` thunk is renamed too) and the
   // [WasmExport] JS-facing name still work. Applied at every emission site --
   // prototype, definition, call, function value and its thunk.
+  //
+  // Disambiguation is by `__` SUFFIX, never a `_` prefix: a leading underscore is
+  // eaten by object-like host macros (`#define _stat _stat64i32`), which makes the
+  // "renamed" spelling collide where the original did not. See `sanitizeCIdent`.
   private freeCNameCache = new Map<string, string>();
   private usedFreeCNames = new Set<string>();
   private freeCName(asName: string): string {
     const cached = this.freeCNameCache.get(asName);
     if (cached !== undefined) return cached;
-    let c = asName === 'main' ? 'asc_user_main' : sanitizeCIdent(asName, this.usedFreeCNames);
+    let c = asName === 'main' ? 'asc_user_main' : sanitizeFileCIdent(asName, this.usedFreeCNames);
     const types = this.reservedTypeNames();
     // As in cIdent: `sanitizeCIdent` already reserved the first candidate for this
-    // AS3 name, so only PREPENDS must clear every test (else a second AS3 name
-    // would alias onto the same C symbol).
+    // AS3 name, so only the SUFFIX steps must clear every test (else a second AS3
+    // name would alias onto the same C symbol).
     let adjusted = false;
     for (;;) {
       const taken =
         types.has(c) || C_FN_MACRO_RESERVED.has(c) || (adjusted && this.usedFreeCNames.has(c));
       if (!taken) break;
-      c = '_' + c;
+      c = c + '__';
       adjusted = true;
     }
     this.usedFreeCNames.add(c);
@@ -1231,6 +1236,10 @@ export class Emitter {
   // Cached so the same AS3 name always maps to the same C name (declaration and
   // every reference agree); `usedCIdentifiers` keeps distinct names distinct (P2).
   // The result additionally avoids every C TYPE name (reservedTypeNames).
+  //
+  // Prefix style, unchanged since the beginning (see sanitizeCIdent): the
+  // hand-written builtin bodies below spell their fields literally (`o->_time`),
+  // so a different spelling here would disconnect a struct from its own bodies.
   private cIdent(name: string): string {
     const cached = this.cNameCache.get(name);
     if (cached !== undefined) return cached;

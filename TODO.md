@@ -14444,6 +14444,75 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 
 **五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**（属增强/工具链，按 §1.5 不占遗留表）。按表内实际行数重数仍为 **100 项**。
 
+### 阶段二百四十七：G8 —— 保留名表机器化 + 文件作用域改 `__` 后缀（v0.4.210 → v0.4.211）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+`asaotui/compiler-gaps.md` 的 **G8** 有两个子问题，都是**遗留欠账**（`bind`/`stat` 在 AS3 里合法，`adl` 跑同一份
+源码毫无问题）。修复前实测：
+
+- **A 表漏了 socket 家族**：`function bind(a:int,b:int)` ⇒ 发射 `static int bind(int, int);` 与 `<winsock.h>:744`
+  的 `bind(SOCKET, const struct sockaddr*, int)` 冲突（`conflicting types for 'bind'`），且每个调用点
+  `too few arguments to function call, expected 3, have 2`——而相邻的 `div`/`free`/`time` 都在表里，纯属漏举。
+- **B 前缀改写挡不住对象式宏**：`stat` 在表里、被改成 `_stat`，MSVC `<sys/stat.h>:146` 的 `#define _stat _stat64i32`
+  把它展开成真声明 ⇒ 改完**撞得更狠**（`conflicting types for '_stat64i32'`）。
+- 代价已经发生过一次：UI 工具链原本是 `bind(owner, field)`，实测不可用，被迫改名 `bindTo(...)`（**不回退**）。
+
+**二、落地**
+
+- **新生成器** `scripts/gen-c-reserved.ts`：一个 include 面与 `RUNTIME_PREAMBLE` 一致的头文件 TU，用**同一条编译器**
+  取两路 dump——`-Xclang -ast-dump` 的全部 `FunctionDecl`（声明冲突）+ `-E -dM` 的全部宏（调用点/声明被宏改写）。
+  过滤三条：`__` 前缀与 `_[A-Z]` 前缀（C 整体保留给实现）、`ALL_CAPS` 对象式宏（约 2.4 万 Win32 常量，落地为
+  `g_` 前缀或 `<Owner>_<member>`，永远不会是裸的文件作用域函数名）。平台没有的头文件**自动剔除**（按
+  `fatal error: '...' file not found` 重试），无参调用 `node scripts/gen-c-reserved.ts [--cc <clang>]`。
+- **产物** `src/c-reserved.gen.ts`（生成文件，win32 面 **7471 条**，头部记录 provenance/平台/被剔除的头文件）。
+  超集无害：只有**精确命中**才改名；少一条就是用户程序编不过。
+- **`src/symbols.ts` 三件套**：`C_RESERVED_SEED`（原手写表，保留为 MSVC 看不见的 POSIX 兜底）+
+  `C_RESERVED`（并集，**文件作用域**用）+ `C_RESERVED_SCOPE`（**只有 seed**，块作用域用）。`sanitizeWith()` 多一个
+  `'prefix' | 'suffix'` 形参；`sanitizeCIdent()` 行为**逐字节不变**（seed + `_` 前缀），新增
+  `sanitizeFileCIdent()`（并集 + `__` 后缀）。`qualifiedName()` 也改走后者（类 typedef 同属文件作用域）。
+- **`src/emit.ts`**：`freeCName()` 走 `sanitizeFileCIdent()`，`C_FN_MACRO_RESERVED`/保留类型名那个循环的消歧也改成
+  追加 `__`；`main` 仍映射 `asc_user_main`。`cIdent()`（方法/字段/局部量/形参）**刻意不动**。
+- **两张表为何必须分开**（硬约束，不是保守）：内置类的方法体是**手写 C 字符串**，字段名逐字写死（`o->socket`、
+  `o->_time`）；声明与访问都过 `cIdent`，方法体不会跟着变 ⇒ 把并集并进块作用域的那一刻
+  `struct ServerSocketConnectEvent` 与它自己的方法体脱节（M3 实测）。块作用域本来也没有要修的冲突：`int time;`
+  合法地遮蔽 `time()`，对象式宏会把声明与每一处使用**一致地**重写。
+- **新增示例** `examples/c-name-collision.as`：`bind`/`socket`/`stat`/`printf`/`listen`/`min`/`isnan` 七个顶层函数
+  + `class close`，每条 `throw` 断言（改坏任一处即非 0 退出）。
+
+**三、验证**
+
+- 新钉 `unit: emit/CNameCollision`（**16 条**）：七种拼写、`stat` **不得**变成 `_stat`、普通名逐字不动、
+  `main` → `asc_user_main`、`time` 与字面 `time__` 不互相别名（→ `time____`）、类 `close` → `close__`、
+  **块表保持窄**而文件表是并集、字段仍是 `_stat`/`_time`、生成表里没有实现保留名且 > 5000 条。
+- 既有 `unit: emit/FreeFunctionNameReservation`（阶段二百四十，15 条）拼写同步改为后缀式
+  （`log__`/`index__`/`Sprite__`/`max__`/`isnan__`、thunk `log____call`），全绿。
+- **变异 3/3 全部被抓**（每一步 `src/symbols.ts` 按 sha256 校验还原：`029fb44b…`）：
+  | 变异 | 示例 | 单元钉 |
+  |---|---|---|
+  | M1 `'suffix'` → `'prefix'`（表仍是并集） | **绿**（并集让 `stat` 爬到 `__stat`，恰好可编） | **红 8 条** |
+  | M2 并集 → 只用 seed（回到修复前） | **红 12 errors**（`conflicting types for 'bind'/'socket'/'listen'` ×2 组 + `too few arguments` ×6） | 红 |
+  | M3 `C_RESERVED_SCOPE` → 并集 | **红**：`no member named 'socket' in 'struct ServerSocketConnectEvent'` | **红 2 条** |
+  M1 这一格是**有意留下的信息**：它说明后缀**不是**编译通过的必要条件（它守的是「不搬进 `__` 保留命名空间」），
+  所以这条规则由**钉子**守、示例绿不等于后缀没坏。两层钉子分工写在 `docs/zh-cn/c-naming.md` §8.4。
+- 探针前后：`probes/name-collision/Main.as` 与 `NamesMain.as` 各 **4 errors → 0**（`bind(1,2) = 3`、`sum=10`）。
+- **既有钉未破**：字段访问仍是 `_time`/`_stat` 那套逐字拼写，全量回归 **461 项 / 458 过 / 3 红**，红的仍是既有三项
+  （`socket.as` 运行期无 Windows socket 后端、`stage94d.as` UTF-16LE、`unit: inline/StackCanary` 本机 clang 差异）。
+
+**四、如实报明 / 残差**
+
+- **只扫了一个平台面**：表记录的是「生成它的那台机器」（本机 win32 x64）的头文件面，macOS/Linux 面**未生成**；
+  跨平台靠「并集 + seed」而非实测。到对应平台重跑同一脚本即可重生成（脚本无参可用）。
+- **`_[a-z]` 前缀仍在新表之外**（`_stat` 这类名字是否命中取决于它是否作为 `FunctionDecl` 出现），这是**刻意**的：
+  `_` + 小写是 C 的「文件作用域保留」，但头文件里这类名字成百上千（`_IO_*` 之外的服务符号），全收会把
+  `/` 出现的普通名字也改掉；实际影响面由生成表实测覆盖。
+- **没有动类成员粒度**：`<Owner>_<suffix>` 那一家族（`cls`/`vt`/`ctor`/`props`/`amf_members`）仍是独立立项，
+  已登记在 `TODO.md` 的 `### 遗留待开发` 表里（阶段二百四十 那一行）。
+- 文档同步：`docs/zh-cn/c-naming.md` **§8**（新章）+ 头部提示 + §4.10 前置指针，`docs/en/c-naming.md` 同三处。
+
+**五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——G8 本身记在 `asaotui/compiler-gaps.md`（已标已修），
+遗留表里的类成员粒度那行**未动**（仍是独立立项）。按表内实际行数重数仍为 **100 项**。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

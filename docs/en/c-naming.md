@@ -12,6 +12,10 @@
 > it in through `this.cIdent()` (with `usedCIdentifiers` deduplication), covering class names / methods / fields
 > / local variables / parameters.
 > §1 below records the pre-refactor state; §3/§4 are the plan and the reserved-word table.
+> **Stage 247 update (v0.4.211)**: the reserved table is now **machine-generated**
+> (`scripts/gen-c-reserved.ts` → `src/c-reserved.gen.ts`), and **file-scope** disambiguation changed from a `_`
+> **prefix** to a `__` **suffix**; block scope keeps the seed table and the `_` prefix. Why, and the acceptance
+> evidence, are in **§8**.
 
 ---
 
@@ -303,6 +307,10 @@ definition, direct call, Function value, `__call` thunk) go through it, so only 
 **not a single character of the AS3 side moves** (`var f:Function = log` still calls the same function, and the
 `[WasmExport]` JS-facing name is unaffected).
 
+> **Stage 247 rewrote both halves of that fix**: the criteria table is machine-generated instead of hand-written,
+> and disambiguation uses a `__` **suffix** instead of a `_` prefix (a prefix gets eaten by object-like host
+> macros). The paragraph below is kept as the original stage-240 approach; the current rule is **§8**.
+
 ### Why function-like and object-like macros cannot share one fix
 
 - An **object-like macro** (`near`/`far`/`small`/`_timezone`/`_daylight`/`_tzname`, ...) rewrites **every
@@ -351,3 +359,105 @@ local** granularity and is already covered by `cIdent`. Closing it means routing
 `${owner}_${member}` through one "look up this owner's planted suffixes" mapping — the same kind of work as the
 closure-cell residual at the end of §7 — so it is a **separate project**, registered as its own TODO row
 (stage 240).
+
+## 8. Stage 247 (G8): the reserved table is **machine-generated**, and file-scope names take a `__` **suffix**
+
+§4.10 wired top-level free functions into the renamer, but that table was **hand-written**, so G8 kept two
+sub-problems alive:
+
+| # | Symptom (measured before stage 247) | Field evidence |
+|---|---|---|
+| A | the table missed the socket family | `function bind(a:int, b:int)` emits `static int bind(int, int);`, which conflicts with `bind(SOCKET, const struct sockaddr*, int)` from `<winsock.h>:744` (on POSIX, `<sys/socket.h>`): `conflicting types for 'bind'` plus `too few arguments to function call, expected 3, have 2` at every call site |
+| B | a `_` prefix cannot dodge an object-like macro | `stat` **was** in the table and got renamed to `_stat`, but MSVC's `<sys/stat.h>:146` has `#define _stat _stat64i32`, so the renamed spelling still collided: `conflicting types for '_stat64i32'` |
+
+Both are **legacy debt**: `bind` and `stat` are legal AS3 identifiers and `adl` runs the same source happily.
+It had already bitten us once for real — the UI toolkit was designed around `bind(owner, field)`, measured as
+unusable, and had to be renamed to `bindTo(...)`.
+
+### 8.1 The table is generated, not written
+
+`scripts/gen-c-reserved.ts` sweeps one header TU (same include surface as `RUNTIME_PREAMBLE`) with **two dumps
+from the same compiler**:
+
+- `-Xclang -ast-dump` → every **`FunctionDecl`** name (the redeclaration conflict; what item A was missing);
+- `-E -dM` → every **macro** name (function-like macros break the call site; object-like ones such as `_stat`
+  rewrite the declaration itself).
+
+Three filters, each justified by "a user would not write that" or "writing it would not land at file scope":
+drop `__`-prefixed and `_[A-Z]`-prefixed names (both namespaces are reserved to the implementation wholesale),
+and drop **`ALL_CAPS` object-like** macros (~24k Win32 constants; a module `const` becomes a `g_`-prefixed global
+and a static field becomes `<Owner>_<member>`, so neither is ever a bare file-scope function name).
+
+The artifact `src/c-reserved.gen.ts` is **generated** (currently **7471** entries for the win32 surface, with
+provenance and platform notes in its header); `symbols.ts` unions it with the hand-written seed into `C_RESERVED`.
+
+**The dump covers one platform**: it records the header surface of the machine that ran it. The POSIX surface
+(`fork`/`getpid`/`dup2`…) has no MSVC header and is still carried by the seed — the union is the **superset**.
+Over-inclusion is harmless (a name is renamed only on an exact match); under-inclusion is a user's program
+failing to compile.
+
+### 8.2 The two tables must stay separate
+
+`C_RESERVED` (the union) serves **file scope** only; block-scope locals/fields use `C_RESERVED_SCOPE`
+(the **seed alone**).
+
+That is a hard constraint, not caution: the built-in classes ship **hand-written C bodies** that spell their own
+fields literally (`o->socket`, `o->_time`). The field declaration and every access go through the same `cIdent`,
+but the body does not — the moment the sweep is unioned into block scope, `examples/c-name-collision.as`
+**stops compiling** (measured; mutation M3 in 8.4):
+
+```text
+error: no member named 'socket' in 'struct ServerSocketConnectEvent'
+```
+
+Block scope has nothing to fix anyway: `int time;` legally shadows `time()` inside its own function, and an
+object-like macro rewrites the field declaration and every use **consistently** — which is exactly why it is
+harmless there.
+
+### 8.3 Rename style: `__` suffix, not `_` prefix
+
+The two file-scope rename sites (`Emitter.freeCName`, `qualifiedName`) now go through `sanitizeFileCIdent()`:
+union table, suffix disambiguation.
+
+The reason is **namespaces**, not "the prefix provably fails to compile" (8.4 measures that honestly):
+
+- C reserves **`__`-prefixed** identifiers, not `__`-terminated ones. A prefix style walks straight into the
+  reserved namespace: with the union in force, `stat` climbs `_stat → __stat`, and that compiles only because
+  MSVC happens not to declare `__stat` (it declares `__stat64`). "Whether we collide depends on which reserved
+  names the host implements" is not an acceptable premise for correctness.
+- No object-like macro can spell a `__` suffix, so safety against the macro surface does **not** rest on
+  "the host happens not to define `_X`".
+- The suffix does not create the §4.10 cascade where `log` claims `_log` and the real `_log` has to climb to
+  `__log`.
+
+### 8.4 Acceptance and mutations
+
+- `examples/c-name-collision.as`: the seven free functions `bind`/`socket`/`stat`/`printf`/`listen`/`min`/`isnan`
+  plus `class close`, each `throw`-asserted (any regression exits non-zero).
+- `unit: emit/CNameCollision` (16 pins): spellings (`bind__`/`stat__`/`close__`…), `stat` must **not** become
+  `_stat`, an ordinary name stays byte-identical, `main` still maps to `asc_user_main`, `time` and `time__` do
+  not alias each other, the **block-scope table stays narrow** (`socket`/`bind`/`listen`/`min` absent) while the
+  file-scope table is the union, fields still spell `_stat`/`_time`, and the generated table holds no
+  implementation-reserved names and has > 5000 entries.
+- `unit: emit/FreeFunctionNameReservation` (the 15 stage-240 pins) updated to the suffix spellings
+  (`log__`/`index__`/`Sprite__`/`max__`/`isnan__`, thunk `log____call`).
+- **All 3 mutations caught** (each step restored with a sha256 check on `src/symbols.ts`). The table below is the
+  measurement, and the two banners are exactly why both layers of pins exist — *the example guards the table,
+  the unit pins guard the spelling*:
+
+| Mutation | Example (compile before `--run`) | Unit pins |
+|---|---|---|
+| **M1** `'suffix'` → `'prefix'` in `sanitizeFileCIdent` (union kept) | **green** (the union lets `stat` climb to `__stat`, which happens to compile) | **8 red** (every spelling pin + "`stat` must not be `_stat`") |
+| **M2** `C_RESERVED` union → seed only (the pre-fix state) | **red**: `conflicting types for 'bind'/'socket'/'listen'` ×2 groups + 6× `too few arguments` ⇒ **12 errors** | red |
+| **M3** `C_RESERVED_SCOPE` → the union (block scope widened) | **red**: `no member named 'socket' in 'struct ServerSocketConnectEvent'` | **2 red** (narrow-table pin, field-spelling pin) |
+
+- Probes, before → after: `probes/name-collision/Main.as` and `NamesMain.as` each **4 errors → 0**, printing
+  `bind(1,2) = 3` and `sum=10`.
+- Full regression: 461 units, still the same three pre-existing reds (`socket.as` has no Windows socket backend
+  at run time, `stage94d.as` UTF-16LE, `unit: inline/StackCanary` local clang difference).
+
+**Stated plainly**: (1) only the Windows header surface was available here, so the macOS/Linux surface was not
+generated in this stage (re-run the same script on that platform); cross-platform coverage rests on
+"union + seed", not on a measurement. (2) M1 shows the suffix is **not** what makes these examples compile — it
+keeps us out of the implementation-reserved namespace, so that rule is guarded by unit pins; do not read a green
+example as proof the suffix survived.
