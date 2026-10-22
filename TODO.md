@@ -13877,6 +13877,72 @@ Windows 上的全量回归有 16 条红是同一类：`examples/` 下 15 个示�
 不能这么改，这正是钉子要含三个白名单的原因。
 
 
+### 阶段二百三十九：基准套件扩容 —— 新增 `Vector.<int>` 项 `vectorint`（v0.4.204，`src/` 无改动，不升版本号）✅ 已完成
+
+**一、为什么缺的是这一档**
+
+原有 8 项把数值容器的**两端**都盖住了：`spectralnorm` 是 `Vector.<Number>`（AOT **0.73× C**）、
+`array` 是动态 `Array`（AOT **5.57× C**）。中间那档 **4 字节整型 vector**
+（`Vector.<int>` / `Vector.<uint>` / `Vector.<Boolean>`）此前**一项都没有**。补上之后三项构成
+「静态 double / 静态 int / 动态装箱」的完整标尺，AOT 的性能带才钉得全。
+
+起因是一次追问（「JS 的 `Array` 为何能做到这么高效」）追到 `Vector.<int>` 这条路：
+同一份编译器输出换成 `Vector.<int>` 后热循环是裸 `int*` + 裸 `int` 加，实测**追平甚至快过 C**。
+既然如此，套件里就应该有一项把它钉住。
+
+**二、JS 侧的对等物必须选对（否则基准不成立）**
+
+`Vector.<int>` 是「4 字节裸整型、无装箱」的容器，JS 里**布局等价**的只有 `Int32Array`
+（`--allow-natives-syntax --DebugPrint` 确认：V8 → `INT32ELEMENTS`，背面 `ByteArray`，逐元素 4 B，
+与 C 的 `int*` 逐字节相同）。普通 `Array` 是 `FixedArray` 的 8 字节 tagged 槽
+（`PACKED_SMI` / `HOLEY_SMI`），**不是同一表示**，故本项不照抄 `array.js`。
+选型依据写在 `vectorint.js` 顶部注释里，不依赖阅读者去猜。
+
+**三、四路对齐实测（三批中位数）**
+
+| 路径 | ms | 与 C 比 |
+|---|---:|---:|
+| C `int*`（4 B） | 22 | 1.00× |
+| **as3compiler `Vector.<int>`** | **18** | **0.82× 快** |
+| JS `Int32Array`（4 B） | 24 | 1.09× |
+| 原生 AIR `Vector.<int>` | 54 | 2.45× |
+
+四路 `result=959996015` 全等。生成 C 的热循环只有一句
+`g_sum = (g_sum + as_vector_int_get((as_vector_int*)as_req_obj((void*)g_a), g_j));`，
+其中 `as_vector_int_get` 就是 `return v->data[i];`（`int*`）—— 零装箱、无 ToPrimitive、无 double 往返。
+
+**四、JS 为何反而追不上**
+
+`--print-opt-code` 实测：`Int32Array` 的循环体每次迭代都保留 map 检查、**未提升的** bounds check
+与 Smi 溢出检查，约 10 条/迭代；C 只有 `ldr w + adds + cmp + subs + b` 约 5 条。
+这与 `array` 的 5.4× **不是一回事**（那是动态语义的票价），量级完全不同。
+顺带一个反直觉读数：同段 20 M 次累加，JS 普通 `Array`（`push` → `PACKED_SMI`）只要 **22 ms**，
+比它自己的 `Int32Array`（24 ms）还快 —— V8 的 Smi 立即数表示比 typed array 路径更省。
+这也把 `array` 的记账说清楚了：**`array.js` 的 JS 侧本来就没付装箱代价**，那 5.57× 是 AS3 动态语义
+（`int` 累加器与动态值相加必走 double 域再 ToInt32 回绕）的票价，不是 JS 侧拿走的好处。
+
+**五、套件接线与回归**
+
+- `benchmarks/vectorint/` 六件套（`vectorint.c` / `.js` / `.as` / `_air.as` / `_air-app.xml` / `report.md`）；
+  `run.py` 的 `BENCHES` 末位加 `vectorint`；`benchmarks/README.md` 主表扩到 **9 行**并新增「套件扩容」节。
+- **无测试依赖该列表**（`test/unit/inline.ts` 只在注释里引用 bench 名），CI（`.github/workflows/test.yml`）不跑基准。
+- **不升版本号**：本轮**未动 `src/` 一个字节**（`runtime.ts` `15ce0338` / `emit.ts` `ca50a8f5` /
+  `symbols.ts` `30d9ca8b` / `parser.ts` `b49ce3bc` / `ast.ts` `6eb79841` / `build.ts` `7801ede1`，
+  与阶段二百三十八节点逐位一致），编译器仍是 v0.4.204。
+- **全量重跑 9 项 × 三批**：四路 `result` 全 `OK`；8 项旧基准的绝对值与扩容前的首轮相差 ≤3 ms 且
+  C 列漂移方向一致 ⇒ 同一快照。`oop` 保持修复态（95 ms，归一化 **1.86 = 基线 1.86**）。
+- **`Vector.<int>` 路径不回退**：用 v0.4.143 的编译器在 `wt143` worktree 里同机实测，旧 18 ms vs 新 18 ms。
+- `node test.ts`：**449 项 / 449 过 / 0 红**（exit 0）。**遗留待开发表未动**（本轮不构成欠账）。
+
+**closure**：① **基准的「对等物」是一份要写明的结论，不能默认** —— `Vector.<int>` 配普通 `Array`
+会让口径静默失效（实测只差 1 ms，但两者并非同一表示），所以选型依据必须落在 `.js` 文件顶部的注释里；
+② **同一个「数组」在四路里是四个不同的东西** —— V8 `Int32Array`（4 B / 逐次检查）、
+AS3 `Vector.<int>`（4 B / 静态类型）、as3compiler 动态 `Array`（24 B 装箱）、AVM2 `Array`（Atom）——
+不同它们就不该放在同一张表里比；③ **`Vector.<T>` 的红利对 AIR 同样兑现**（54 vs 它自己的动态 `Array` 130，
+快 2.4×），这反向坐实了 `array` 的结论：那一项 AOT（117）与 AIR（130）几乎同档不是我们实现得差，
+而是那条语义链本来就贵。
+
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百三十一：示例清单跨宿主）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **99 → 100 项**。本阶段修的是「同一份清单在 macOS 上编得过、在 Windows 上死在 `#include <zlib.h>`」（16 条红），按 §1.5 判据属**我们这边的构建层缺陷**且阶段内已修净，故不进表；新登记的一行是「`air-native`/`ane`/`ane-app` 三份清单仍写死 `windows-x64`」——它们**不是**遗漏（`air-native` 绑死 D3D 后端，宿主是后端的结果），但「换个宿主就编不了」仍然是可执行欠账，且钉子 `build/ExampleManifestHosts` 会**打印**这份名单，随时可核对还剩几份。**移出 0 行**（16 条示例红是同一处构建层缺陷的 16 个症状，症状在阶段内消失，不构成欠账）；`未开始` **75 → 76**。
 > **2026-10-22 追加（阶段二百二十七：`Context3D.ignoreResourceLimits`）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**。本阶段修的是「`adl` 会报 `#3683`、我们照单全收」之后的下一层：`ignoreResourceLimits` 这个 AIR 公开属性的语义（软上限放开、`#3681`/`#3682` 保留、超限改报 `Error #3684`）在阶段内**已逐字对齐**，故不进表；新登记的一行是「旗标打开后缺少显存预检/分配失败上报」——它是**我们这边**的缺口（`adl` 在 `#3684` 处同步失败，而我们的惰性分配会把失败推到上传之后），属可执行欠账。**一处刻意分歧已记入正文**：旗标打开时 2D 上界用设备上限（16384）而非 AIR 的 profile 上限——这是本阶段唯一的主动分歧，且双重 opt-in（AIR 合法属性 + 默认 `false`），默认产物仍与 AIR 同构。
