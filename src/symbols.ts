@@ -3351,6 +3351,16 @@ export class SymbolTable {
           { name: 'overwrite', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
           { name: 'force', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
         ])],
+        // moveToTrash(): move the item to the system trash (AIR 2). Measured on
+        // adl 51.4.1: declared VOID (not Boolean -- `f.moveToTrash().toString()`
+        // is a compile error), throws #3003 when the path does not exist, #2038
+        // when the filesystem refuses, #2037 on a File with no nativePath, and
+        // leaves nativePath untouched on success. See the C body in emit.ts.
+        ['moveToTrash', filemeth({ kind: 'void' }, [])],
+        // moveToTrashAsync() reports the same failures as events instead of
+        // throwing (measured: ioError with errorID 3003, or COMPLETE); only the
+        // empty-File case throws #2037.
+        ['moveToTrashAsync', filemeth({ kind: 'void' }, [])],
         ['getDirectoryListing', filemeth({ kind: 'array' }, [])],
         // The async half of the File API (AIR delivers the result as an event).
         // getDirectoryListingAsync is implemented for real (it lists now and
@@ -3409,7 +3419,9 @@ export class SymbolTable {
         ['size', filegetr({ kind: 'number' })],
         // spaceAvailable: free bytes on the volume holding the path (AIR 2). Real
         // filesystem query -- GetDiskFreeSpaceExA / statvfs(), see as_file_space_available
-        // in emit.ts. 0 when the OS cannot resolve the path.
+        // in emit.ts. 0 when the OS cannot resolve the path, and 0 for a path that
+        // is neither a regular file nor a directory (measured: /dev/null is 0 while
+        // a plain file reports its volume's figure).
         ['spaceAvailable', filegetr({ kind: 'number' })],
       ]),
       setters: new Map(),

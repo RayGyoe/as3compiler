@@ -25,6 +25,10 @@ import { aneHostDirName, aneHostLibName, currentAnePlatform, readAne } from '../
 
 const runAsync = promisify(execFile);
 
+// The throwaway HOME that `move-to-trash.as` runs against (see EXAMPLE_ENV).
+const trashHome = join(root, 'temp', 'trash-home');
+mkdirSync(trashHome, { recursive: true });
+
 const dir = join(root, 'examples');
 const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
 
@@ -158,6 +162,15 @@ const EXAMPLE_TIMEOUT_MS = 60_000;
 // non-zero exit instead of a report line (see src/runtime.ts gc_audit_fail).
 const EXAMPLE_ENV: Record<string, Record<string, string>> = {
   'gc_seg_reap.as': { ASC_GC_AUDIT_STRICT: '1' },
+  // File.moveToTrash needs a home whose Trash it may write to and then clean up.
+  // The suite must not fill the developer's own Trash with one file per run, and
+  // it must not depend on TCC: a terminal-launched process can stat a known name
+  // inside the real ~/.Trash but cannot enumerate or remove it, so a real-HOME
+  // run could not assert on its result or delete it afterwards. HOME therefore
+  // points at a scratch directory under temp/ (same volume as the repo, which the
+  // trash layout depends on), and the example creates its candidate file inside
+  // that HOME so the two cannot land on different volumes.
+  'move-to-trash.as': { HOME: trashHome },
 };
 
 // Per-example extra CLI arguments. The SWC example needs a resource library on

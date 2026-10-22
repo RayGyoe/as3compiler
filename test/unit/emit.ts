@@ -3248,3 +3248,86 @@ function checkEmitFreeFunctionNameReservation(): string[] {
   return bad;
 }
 registerGroup('unit: emit/FreeFunctionNameReservation', checkEmitFreeFunctionNameReservation);
+
+// File.moveToTrash / moveToTrashAsync / spaceAvailable (阶段二百四十三).
+//
+// Source-level pins for the parts an example cannot see: the error numbers each
+// failure path throws, the fact that the trash layout is chosen per platform
+// (none of the three branches but one is compiled on any given host), the
+// collision-name shape measured on adl, and the regular-file guard that makes
+// spaceAvailable answer 0 for a device. `examples/move-to-trash.as` carries the
+// runtime half on macOS; the Windows branch of as_trash_dir returns NULL by
+// design, so this group is what keeps the whole block honest on one host.
+function checkEmitFileMoveToTrash(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [newfiles] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [newfiles] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'import flash.filesystem.File;\n'
+    + 'var f:File = new File("/tmp/x");\n'
+    + 'f.moveToTrash();\n'
+    + 'f.moveToTrashAsync();\n'
+    + 'var n:Number = f.spaceAvailable;\n'
+    + 'trace("" + n);\n')).c;
+
+  // Signature: AIR declares moveToTrash():void, so the C body must return void
+  // and take no arguments.
+  check('moveToTrash is emitted as a void method',
+    c.includes('static void File_moveToTrash(void* _this);'));
+  check('moveToTrashAsync is emitted as a void method',
+    c.includes('static void File_moveToTrashAsync(void* _this);'));
+  // Both must be reachable through the method table, not just emitted.
+  check('both names are in File\'s method table',
+    c.includes('"moveToTrash"') && c.includes('"moveToTrashAsync"'));
+
+  // The three measured failure numbers, and the measured success semantics.
+  check('a missing path throws #3003',
+    c.includes('if (err == 3003) { as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003)); return; }'));
+  check('a filesystem refusal throws #2038',
+    c.includes('as_throw(IOError_new((char*)"Error #2038: File I/O Error.", 2038));'));
+  check('an empty File throws #2037',
+    c.includes('Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)'));
+  // AIR leaves nativePath alone after a successful move (measured), so the body
+  // must not rewrite it -- File_moveTo, right below, is the member that does.
+  const trashBody = /void File_moveToTrash\(void\* _this\) \{([\s\S]*?)\n\}/.exec(c);
+  check('the receiver is never rewritten to the trash path',
+    trashBody != null && !trashBody[1].includes('nativePath ='));
+
+  // The async half reports through events (measured), and carries errorID.
+  check('moveToTrashAsync dispatches COMPLETE',
+    c.includes('EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false));'));
+  check('moveToTrashAsync dispatches ioError with the AIR error id',
+    c.includes('IOErrorEvent_new((char*)"ioError", false, false, (char*)text)') && c.includes('ev->errorID = (int)err;'));
+
+  // Trash layouts: Finder's on macOS, the freedesktop.org pair on other POSIX,
+  // and NULL on Windows/wasm (reported as unsupported).
+  check('macOS uses ~/.Trash', c.includes('as_path_join(home, ".Trash")'));
+  check('another macOS volume uses .Trashes/<uid>',
+    c.includes('snprintf(owner, sizeof owner, ".Trashes/%d", (int)getuid())'));
+  check('freedesktop uses files/ beside info/',
+    c.includes('as_path_join(base, "files")') && c.includes('as_path_join(base, "info")'));
+  check('freedesktop writes the .trashinfo sidecar',
+    c.includes('[Trash Info]') && c.includes('DeletionDate='));
+  check('a trashed item already inside the trash directory is a no-op',
+    c.includes('if (!nested) return 0;'));
+
+  // Collision naming, measured on adl 51.4.1: "x.txt" -> "x.txt 18-34-09-271.txt"
+  // -- the whole name, a space, HH-MM-SS-mmm, then the extension again.
+  check('the collision suffix is HH-MM-SS-mmm',
+    c.includes('" %02d-%02d-%02d-%03d"'));
+  check('the collision name keeps the whole original name',
+    c.includes('memcpy(stamped + nl, stamp, sl);'));
+
+  // spaceAvailable answers only for a regular file or a directory (measured:
+  // /dev/null is 0), which statvfs()/GetDiskFreeSpaceExA alone would not do.
+  check('spaceAvailable type-checks the path first',
+    c.includes('if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return 0.0;'));
+
+  console.log(`     [newfiles] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/FileMoveToTrash', checkEmitFileMoveToTrash);
