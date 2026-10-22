@@ -1,9 +1,13 @@
 # MacBroom —— macOS 菜单栏清理工具 / as3compiler 推广 demo
 
-> **方案类型**：产品 + 技术方案（未进入实施，不占阶段号、不升版本）
+> **方案类型**：产品 + 技术方案（**能力缺口已进入实施**：G1 / G2 已落地并清偿，其余仍待排期）
 > **形态裁定（2026-10-22）**：菜单栏小工具（`NSStatusItem` 常驻 + 点开浮层）
-> **底座**：`as3compiler` v0.4.206，最大已用阶段号 `阶段二百四十二`
+> **底座**：`as3compiler` v0.4.207，最大已用阶段号 `阶段二百四十三`
 > **所有"现状"断言均在 2026-10-22 于 HEAD 上用 `grep`/读码核实**，出处逐条标注；未核实的一律标注"未实测"。
+>
+> **实施状态（2026-10-22 更新）**：方案本身仍不占阶段号（demo 本体未开工），但**能力缺口已开口**——
+> **G1 + G2 由「阶段二百四十三」（v0.4.206 → v0.4.207）清偿**，详见 §2.2 表的「状态」列与 §2.4。
+> 尚未开工：G3、G4、G5、G7、G8 与 demo 本体。
 
 ---
 
@@ -109,8 +113,8 @@ demo/maccleaner/app.as            ← AS3 入口，装配以下模块
 ├─ StatusItem        菜单栏图标 + 磁盘读数        ← 需新增能力 G4
 ├─ CleanPanel        浮层面板（NativeWindow）      ← 已具备 G6
 ├─ Scanner           递归遍历 + 体积累加           ← 已具备（File API）
-├─ Cleaner           移入废纸篓                    ← 需新增能力 G1
-└─ DiskInfo          卷容量/可用量                 ← 需新增能力 G2
+├─ Cleaner           移入废纸篓                    ← ✅ 已具备 G1（阶段二百四十三）
+└─ DiskInfo          卷容量/可用量                 ← ✅ 可用量已具备 G2；卷总量仍缺 G3
 ```
 
 ### 2.2 底座现状核实（逐条带出处）
@@ -119,9 +123,11 @@ demo/maccleaner/app.as            ← AS3 入口，装配以下模块
 
 | 能力 | 出处 | 说明 |
 |---|---|---|
-| `File.exists` / `isDirectory` / `size` / `name` / `parent` | `src/emit.ts:15139-15241` | 体积累加与遍历的原子操作齐了 |
-| `File.getDirectoryListing()` | `src/emit.ts:15331` | 递归遍历的入口 |
-| `File.deleteFile()` | `src/emit.ts` | 有，但**永久删除**，不能拿来当清理动作（见 G1） |
+| `File.exists` / `isDirectory` / `size` / `name` / `parent` | `src/emit.ts:15139-15251` | 体积累加与遍历的原子操作齐了 |
+| `File.getDirectoryListing()` | `src/emit.ts:15592` | 递归遍历的入口 |
+| `File.deleteFile()` | `src/emit.ts` | 有，但**永久删除**，不能拿来当清理动作 ⇒ 清理一律走下行 |
+| `File.moveToTrash()` / `moveToTrashAsync()` | `src/emit.ts`（阶段二百四十三） | ✅ 已具备（G1）；macOS + freedesktop 双后端，Windows/wasm 响亮报明 |
+| `File.spaceAvailable` | `src/emit.ts`（阶段六十四，阶段二百四十三 校正作用域） | ✅ 已具备（G2）；只给已有文件/目录的卷可用量 |
 | 无边框窗口：`systemChrome` / `resizable` / `maximizable` / `minimizable` / `decorated` | `src/emit.ts:5866-5902` | 浮层窗可以做 |
 | `alwaysInFront` | `src/emit.ts:6087-6101` | 浮层置顶可以做 |
 | `transparent` | `src/emit.ts:6104` | 圆角/透明背景可做 |
@@ -131,16 +137,25 @@ demo/maccleaner/app.as            ← AS3 入口，装配以下模块
 
 **关键缺口（本方案的实施主体）**
 
-| # | 能力 | 现状（核实方式） | 归属判定（AGENTS §1.5） | 工作量 |
-|---|---|---|---|---|
-| **G1** | `File.moveToTrash()` | **零实现**：`grep -c moveToTrash src/emit.ts` = **0**；而 AIR 的 `File` 有此 API | **遗留欠账**（AIR 有、我们跑不出）⇒ 正常阶段 + 版本号 | 小（macOS 走 `NSFileManager trashItemAtURL:` 或 `NSWorkspace recycleURLs:`，需胶水；或三端各自实现） |
-| **G2** | `File.getSpaceAvailable` | **零实现**：`grep -c getSpaceAvailable src/emit.ts` = **0**；AIR 有此属性 | **遗留欠账** ⇒ 正常阶段 + 版本号 | 小（`statfs` 纯 C，native/wasm 可同源） |
-| **G3** | 卷总量 / 已用量 | 无对应 API；`--package` 的构建清单里也没有 | **增强**（AIR 的 `File` 只给 `spaceAvailable`，总量要另取） | 小（同 G2 的 `statfs`：`f_blocks` / `f_bfree`） |
-| **G4** | **菜单栏状态项**（`NSStatusItem`） | **零命中**：`grep -riE "NSStatusItem\|status item\|Shell_NotifyIcon\|tray" src/*.ts vendor/*` 只在无关注释里命中 | **增强**（AIR **没有**对应物）⇒ 必须 opt-in 具名开关，默认关 | **中**（新 `vendor/statusitem_glue.mm` + 接进 SDL2 事件循环，见 §2.4 风险） |
-| **G5** | accessory app（`LSUIElement=1`，无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键** | **增强**（AIR 描述符里没有这个开关）⇒ 构建清单新字段 | 小（plist 加一个键 + 清单字段） |
-| **G6** | 浮层窗（无边框 + 置顶） | ✅ 已具备（见上表） | — | **0** |
-| **G7** | 目录遍历的异步化 | job 池**无** `DIR`/`STAT` 类 job（`src/runtime.ts:9878-9898` 全清单已列） | 可用同步遍历顶 MVP（见 §2.5 对策） | 中 |
-| **G8** | **一条命令出已签名 `.app` / `.dmg`** | `--package` 合法值只有 `raw \| xcode-project \| android-project \| web`（`src/index.ts:291, 798`）；**无 `app` / `dmg`**；`grep -n "codesign\|hdiutil" src/build.ts` = **0 命中**；`--package xcode-project` **只生成工程不构建**（`src/index.ts:1034-1057` 自述"是「生成工程」步骤，不做 cc"） | **增强**（工程化便利，非 AIR 语义） | 中（`xcodebuild` + `codesign --deep` + `hdiutil create` 编排） |
+> **状态列口径（2026-10-22）**：以 `阶段二百四十三`（v0.4.207，commit `1135490`）为界。
+> ✅ = 已落地且有 `adl 51.4.1` 双端探针 + 回归钉子；⬜ = 尚未开工。
+> "现状（核实方式）" 一列保留**当初立项时的核实快照**，已落地的行另注现值，便于对照计划与实际的偏差。
+
+| # | 能力 | 现状（核实方式） | 归属判定（AGENTS §1.5） | 工作量 | 状态 |
+|---|---|---|---|---|---|
+| **G1** | `File.moveToTrash()` **+ `moveToTrashAsync()`** | 立项时**零实现**（`grep -c moveToTrash src/emit.ts` = 0）⇒ **现已落地**（`grep -c` = 6；`File_moveToTrash` / `File_moveToTrashAsync` 在 `src/emit.ts`） | **遗留欠账**（AIR 有、我们跑不出）⇒ 正常阶段 + 版本号 | 小 —— 实测比预估更小：**不需要 Obj-C 胶水**，`rename(2)` 就够（见下方「立项判断与实测的偏差」） | ✅ **已实现（阶段二百四十三）**：签名按实测是 **`void`**；macOS（`~/.Trash` + `<卷>/.Trashes/<uid>`）与 freedesktop（`Trash/{files,info}` + `.trashinfo`）双后端；Windows/wasm 无回收站 ⇒ 响亮报明 + `#2038`（已入 `遗留待开发`） |
+| **G2** | ~~`File.getSpaceAvailable`~~ ⇒ 真名是 **`File.spaceAvailable`（属性）** | 立项时记**零实现**（`grep -c getSpaceAvailable src/emit.ts` = 0）——**这条核实本身错了**：AIR 里没有 `getSpaceAvailable` 这个成员，而 `spaceAvailable` 属性**自阶段六十四 起就已存在** | 原判 **遗留欠账** ⇒ **实为误记**（不是欠账） | 已用：**极小**（只校正作用域） | ✅ **无需新增（阶段二百四十三 查明）**：`'getSpaceAvailable' in f` = `false`、取它抛 `#1069`；`spaceAvailable` 只补「仅对普通文件/目录作答」（`/dev/null` 在 `adl` 回 `0`） |
+| **G3** | 卷总量 / 已用量 | 无对应 API；`--package` 的构建清单里也没有 | **增强**（AIR 的 `File` 只给 `spaceAvailable`，总量要另取） | 小（同 G2 的 `statfs`：`f_blocks` / `f_bfree`） | ⬜ **未开工**（原计划并在阶段二百四十三，本轮只做 G1+G2，顺延） |
+| **G4** | **菜单栏状态项**（`NSStatusItem`） | **零命中**：`grep -riE "NSStatusItem\|status item\|Shell_NotifyIcon\|tray" src/*.ts vendor/*` 只在无关注释里命中 | **增强**（AIR **没有**对应物）⇒ 必须 opt-in 具名开关，默认关 | **中**（新 `vendor/statusitem_glue.mm` + 接进 SDL2 事件循环，见 §2.4 风险） | ⬜ **未开工**（最大风险项，建议先探针） |
+| **G5** | accessory app（`LSUIElement=1`，无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键** | **增强**（AIR 描述符里没有这个开关）⇒ 构建清单新字段 | 小（plist 加一个键 + 清单字段） | ⬜ **未开工** |
+| **G6** | 浮层窗（无边框 + 置顶） | ✅ 已具备（见上表） | — | **0** | ✅ **已具备（历史能力）** |
+| **G7** | 目录遍历的异步化 | job 池**无** `DIR`/`STAT` 类 job（`src/runtime.ts:9878-9898` 全清单已列） | 可用同步遍历顶 MVP（见 §2.5 对策） | 中 | ⬜ **未开工**（MVP 可先用同步遍历） |
+| **G8** | **一条命令出已签名 `.app` / `.dmg`** | `--package` 合法值只有 `raw \| xcode-project \| android-project \| web`（`src/index.ts:291, 798`）；**无 `app` / `dmg`**；`grep -n "codesign\|hdiutil" src/build.ts` = **0 命中**；`--package xcode-project` **只生成工程不构建**（`src/index.ts:1034-1057` 自述"是「生成工程」步骤，不做 cc"） | **增强**（工程化便利，非 AIR 语义） | 中（`xcodebuild` + `codesign --deep` + `hdiutil create` 编排） | ⬜ **未开工** |
+
+> **立项判断与实测的偏差（阶段二百四十三，探针 `temp/trashprobe/`，`adl` 与 AOT 双端对照）**：
+> 1. **`moveToTrash()` 的返回类型不是 `Boolean`** —— AIR 参考文档写 `Boolean`，但 `adl 51.4.1` 上 `f.moveToTrash().toString()` 是 `mxmlc` **编译期错误**，`adl` 求值 `undefined`。真口径是 `void`。照文档实现成 `Boolean` 会让 `if (f.moveToTrash())` 在两端结论相反。
+> 2. **不需要 `NSFileManager` / `NSWorkspace` 胶水**：本项目按 AIR 口径做的是 `rename(2)` + POSIX 目录布局，跨端同源、零 Obj-C；代价是 macOS 侧的「放回原处」(Put Back) 记录缺失（Finder 把它存在卷元数据里），这属于**系统集成便利**，不影响清理语义（文件确实进了废纸篓、可手工恢复）。
+> 3. 由此，**G2 不是缺口**：登记它时误以为属性名是 `getSpaceAvailable`，该成员在 AIR 里不存在。核对类成员前应先查类列表再 `grep`，否则会给"补一个 AIR 没有的 API"这种事开口子。
 
 > **⚠️ 两处需要纠正的前序判断**（我在上一轮口头提到过，此处以码为准）：
 > 1. `--package app` / `dmg` **并不存在**，`docs/zh-cn/compile.md:894` 描述的是规划形态，同文件 `:949` 的表格自己也标了「规划」。实际只有 `xcode-project`，且它**到生成工程为止**，需要用户自己跑 `xcodebuild`。
@@ -148,28 +163,31 @@ demo/maccleaner/app.as            ← AS3 入口，装配以下模块
 
 ### 2.3 控件现实：L3 缺口是已知评估，不在本方案内解决
 
-「UI 工具链待定项（未排期）」（`as3compiler/TODO.md:14438`）已裁定：**L1 渲染与 L2 显示树/事件/命中/文本已有且对 `adl` 校准过；缺的是 L3 控件与作者模型 + L2 自动布局**，并且点名"219 个示例里连一个 Button 都没有"。
+「UI 工具链待定项（未排期）」（`as3compiler/TODO.md:14441`）已裁定：**L1 渲染与 L2 显示树/事件/命中/文本已有且对 `adl` 校准过；缺的是 L3 控件与作者模型 + L2 自动布局**，并且点名"219 个示例里连一个 Button 都没有"。
 
 本 demo 的选择是：**在 demo 内部手搓面板所需的列表行与勾选框，不推进 `asaotui` 控件层**。
 
-- 依据：那个 U1~U5 层是**通用**工具链，前置测量（Yoga 体积/wasm 可编性/与 `-Wl,-dead_strip` 相容性）都还没做（`TODO.md:14451`）。把它绑进一个推广 demo 会让 demo 永远发不出来。
+- 依据：那个 U1~U5 层是**通用**工具链，前置测量（Yoga 体积/wasm 可编性/与 `-Wl,-dead_strip` 相容性）都还没做（`TODO.md:14453`）。把它绑进一个推广 demo 会让 demo 永远发不出来。
 - 代价：demo 里的列表是"专用的、丑的、但能跑"的实现。这是**有意的取舍**，需在 README 里如实说明，不能假装是通用控件。
 - 复用边界：demo 的手搓代码只放在 demo 目录；若将来 `asaotui` 落地，再迁移。
 
-### 2.4 分阶段落地（预留编号，实施时才占）
+### 2.4 分阶段落地（243 ✅ 已实施；其余预留编号）
 
 > 依据 `AGENTS.md` §2.7 / `TODO.md` 备注：每阶段一个 patch 版本号；阶段号取已用最大值 +1 ⇒ 从 **阶段二百四十三**（v0.4.206 → v0.4.207）起。
-> **本方案不占阶段号** —— 与 `TODO.md:14441` 的 UI 工具链评估同一口径（"只有真进入实施才占"）。
+> **本方案不占阶段号** —— 与 `TODO.md:14445` 的 UI 工具链评估同一口径（"只有真进入实施才占"）；
+> **但能力缺口当场占**：G1/G2 已以 `阶段二百四十三` 落地，后续 G4/G5/G8 仍按此表顺序排。
 
-**阶段二百四十三（预留）· G1 + G2 + G3 —— 文件系统补齐**
+**阶段二百四十三（✅ 已完成，v0.4.206 → v0.4.207，commit `1135490`）· 文件系统补齐（G1 + G2）**
 
-- 目标：`File.moveToTrash()` / `File.getSpaceAvailable` / 卷总量，语义逐字对齐 `adl 51.4.1`
-- 必须先做的实测（不可省）：`adl` 量清 `moveToTrash` 的返回语义（成功 `true`？文件不存在 `false`？抛不抛异常？`getSpaceAvailable` 在路径不存在时返回什么）
-- 产出：`examples/move-to-trash.as`（含断言）+ `examples/space-available.as` + `test/unit/` 源级钉
-- 属**遗留欠账**，正常占版本号
+- 目标：`File.moveToTrash()` / `moveToTrashAsync()` / `File.spaceAvailable`，语义逐字对齐 `adl 51.4.1`
+- 已做的实测：`temp/trashprobe/`（`app.xml` + `Main.as` + `mxmlc`/`adl` 双跑）量清了返回类型、错误号（`#3003` / `#2038` / `#2037`）、成功后 `nativePath` 不变而 `exists` 转 `false`、已在废纸篓里是**成功 no-op**、同名冲突的 Finder 命名（`x.txt → "x.txt 18-34-09-271.txt"`）、`spaceAvailable` 的路径作用域
+- 产出（均已落地）：`examples/move-to-trash.as`（运行时断言）+ `test/unit/emit.ts` 的 `unit: emit/FileMoveToTrash`（17 项源级钉）+ `docs/{zh-cn,en}/filesystem.md`（新建）+ 两份 README
+- **未做（顺延）**：**G3 卷总量/已用量**。原计划"G1 + G2 + G3 同阶段"，实际只做了前两项——G3 是**增强**（AIR 无对应物），必须 opt-in 具名开关，与本阶段的"清偿遗留欠账"性质不同，强行合并会把两者口径搞混
+- 顺带登记的遗留：Windows/wasm 回收站后端、空 `File` 成员全线不抛 `#2037`（族级修复要先把 `nativePath` 改成访问器）
 
-**阶段二百四十四（预留）· G4 + G5 + G8 —— 菜单栏与打包**
+**阶段二百四十四（预留）· G3 + G4 + G5 + G8 —— 卷规模、菜单栏与打包**
 
+- G3 卷总量/已用量：`statfs` 的 `f_blocks` / `f_bfree`，走具名开关或清单字段（**增强**，默认产物不变）
 - G4 `NSStatusItem`：新建 `vendor/statusitem_glue.mm`，接进 `vendor/window_glue.cc` 的事件泵
 - G5 `LSUIElement`：构建清单新字段（如 `agent-app`），`src/xcode-project.ts` 的 `infoPlist()` 消费它
 - G8 `.app` / `.dmg` 一键产出：`xcodebuild` + `codesign` + `hdiutil`
@@ -195,8 +213,14 @@ demo/maccleaner/app.as            ← AS3 入口，装配以下模块
 ### 2.6 验收标准（每阶段按 `AGENTS.md` DoD）
 
 - **G1/G2**：`adl` 与 AOT 双端对照探针 0 差异；`examples/*.as` 可跑通且断言通过；`test/unit/` 有源级钉
+  ⇒ ✅ **阶段二百四十三 已满足**（`examples/move-to-trash.as` + `unit: emit/FileMoveToTrash` 17 项）；
+  偏差只剩 macOS 侧缺失「放回原处」记录（见 §2.2 注 2）
 - **G4/G5/G8**：默认构建与现状**逐字节同构**（开关关闭时）；开关打开后原生实测截图；`[native-window]` 类钉子扩项
 - **demo 本体**：端到端跑一遍"扫描 → 清理"，**断言目标文件确实出现在 `~/.Trash` 里**（不是断言"被删了"）
+  ⇒ 这条形式的断言已在 `examples/move-to-trash.as` 里先跑通，但**回归必须把 `HOME` 指向 `temp/trash-home`**：
+  macOS 的 TCC 禁止终端进程枚举/清理真实 `~/.Trash`（`Operation not permitted`，必须请 Finder 代劳），
+  且测试不该往开发机的废纸篓里塞东西（`test/examples.ts` 的 `EXAMPLE_ENV` 已这么做）。
+  demo 的手工验收则必须看**真** `~/.Trash`——这是本条验收不能被自动化测试代替的原因
 - 全量回归：收尾必须 `node test.ts` 全绿
 
 ### 2.7 推广资产清单
