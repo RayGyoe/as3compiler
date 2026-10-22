@@ -14166,6 +14166,103 @@ AS3 `Vector.<int>`（4 B / 静态类型）、as3compiler 动态 `Array`（24 B �
 **七、本表变动**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内 **98 → 99 项**（`未开始` **72 → 73**）。
 ②④ 两条缺陷不在表内（此前没人登记过，用户报障才发现），修好即不占位。
 
+### 阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— macOS 清理工具 demo 的 G1 + G2（v0.4.206 → v0.4.207）✅ 已完成
+
+**一、先把 `adl` 量清楚，再写一行代码**
+
+方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md) 的 G1/G2 是「清理类工具
+只移废纸篓、永不永久删除」这条信任底线的底座。动手前先搭了双端探针 `temp/trashprobe/`
+（一份 `Main.as`，`mxmlc` + `adl 51.4.1`，日志写文件——**`adl` 的 stdout 不可用**），把两个成员的行为逐条量下来。
+**两条量出来的结论推翻了纸面**，这是本阶段最重要的产出：
+
+| 纸面/直觉 | `adl 51.4.1` 实测 |
+|---|---|
+| `moveToTrash()` 返回 `Boolean`（AIR 参考文档如此写） | **`void`**。`f.moveToTrash().toString()` 在 `mxmlc` **编译期就报错**；`adl` 求值是 `undefined` |
+| G2 要补 `File.getSpaceAvailable` | **AIR 没有这个成员**（`'getSpaceAvailable' in f` = `false`，取它抛 `#1069`）；真名是属性 `spaceAvailable`，而它**从阶段六十四 起就在** |
+| 空 `File` 上读 `spaceAvailable` 回 `0`（我们的现状） | 空 `File` 上**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛） |
+
+若照纸面把 `moveToTrash` 写成 `Boolean`，`if (f.moveToTrash())` 会在两端给出**相反**结论——这正是
+AGENTS.md §1.5「语义等价是底线」要拦的那类错误。
+
+**二、`moveToTrash` 的完整口径（全部有探针）**
+
+| 场景 | `adl 51.4.1` | 本实现 |
+|---|---|---|
+| 正常文件 / 目录（带子件） | 移入废纸篓（目录整棵走），返回 `undefined` | 同（一次 `rename`） |
+| 路径不存在 | `Error #3003: File or directory does not exist.` | 同号同文案 |
+| 父目录不可写（EPERM，chmod 555） | `Error #2038: File I/O Error.` | 同 |
+| `new File()` | `Error #2037` | 同 |
+| 成功后 | `nativePath` **不变**、`exists` 转 `false` | 同 |
+| 已在废纸篓里的项 | 成功 **no-op**，原地不动 | 同 |
+| 同名冲突 | `原名 <HH-MM-SS-mmm><扩展名>`：`x.txt` → `x.txt 18-34-09-271.txt`、`dupsub` → `dupsub 18-37-21-029` | 同形状 |
+
+`moveToTrashAsync` 不是「另写一套」：同样的失败**派成事件**而非异常 —— 成功 `Event.COMPLETE`（`target`
+是那个 `File`）、路径不存在派 `ioError` 且 `errorID=3003`、`bubbles=false`、`cancelable=false`，
+只有空 `File` 仍**同步抛** `#2037`。投递时机沿用本仓所有 `File` 异步成员的口径（**inline 完成 + 同一次调用内派发**）：
+AIR 在自己的 IO 线程上做，但调用方唯一能依赖的顺序「先 `addEventListener` 再发起」两端都成立。
+
+**三、废纸篓目录按卷选，跨卷不「复制 + 删除」**
+
+- macOS：与 `$HOME` **同卷** → `~/.Trash`；**其他卷** → `<卷挂载点>/.Trashes/<uid>`。
+  「同卷」用 `st_dev` 比较（`as_trash_dir`），「卷挂载点」用逐级上升直到 `st_dev` 变化（`as_volume_root`）——
+  POSIX 没有可移植的「我在哪个挂载点」调用，而这条路在 APFS firmlink（`/Users` 与 `/` 同 `st_dev`）
+  与真正的独立卷（`/Volumes/Ext` vs `/Volumes`）两种情形下都给出了正确结果。
+- Linux 等 POSIX：freedesktop 的 `Trash/{files,info}`，每个载荷在 `info/` 配一个 `.trashinfo`
+  （`Path=` 百分号转义 + `DeletionDate=`）。这条**未在真机验证**（本机是 macOS），但用 `-U__APPLE__`
+  强制走 `#else` 编过并跑过布局断言。
+- **Windows / wasm**：没有后端 ⇒ `as_shell_unsupported("File.moveToTrash …")` 响亮报明 + 抛 `#2038`
+  （**不静默 no-op**），已入 `遗留待开发`。不写盲代码的理由：`IFileOperation`/`SHFileOperation` 都要给所有
+  Windows 构建加 `shell32`/`ole32`，而本机无法验证。
+- **已知取舍（写在前面）**：Finder 的「放回原处」靠卷上元数据，我们只 `rename` ⇒ 项**能出现在废纸篓、
+  能还原到任意位置，但没有一键「放回原处」记录**。
+
+**四、G2 没有新增成员，只校正了作用域**
+
+`spaceAvailable` 只在**普通文件或目录**上作答（先 `stat`，其余一律 `0`），因为 `/dev/null` 在 `adl` 上回 `0`
+而 `statvfs` 对它会给出卷的可用量。普通文件跟随其所在卷（实测与目录同值）。不存在的路径 / `/Volumes/Nope` 回 `0`。
+
+**五、钉子在两个层面上都钉住了**
+
+- `test/unit/emit.ts` 新增 `unit: emit/FileMoveToTrash`（17 项，源级）：两条成员在**类方法表**里存在、
+  签名是 `void`（不是 `Boolean`）、三条失败号与文案、异步事件名 + `ev->errorID`、`~/.Trash` 与
+  `.Trashes/<uid>` 两条路径、freedesktop 的 `files/`+`info/`+`[Trash Info]`/`DeletionDate=`、
+  「已在废纸篓即 no-op」的 `if (!nested) return 0;`、冲突名的时间戳格式与**保留整名**、
+  以及 `spaceAvailable` 的 `S_ISDIR`/`S_ISREG` 守卫。**接收者不被改写**这条用 body 作用域的正则钉
+  （第一版正则太宽，把 `as_trash_move(_this, ...)` 的传参也算成改写，已收窄）。
+- `examples/move-to-trash.as`（运行时）：API 形状（`typeof` 为 `function`、`'moveToTrash' in f` 为真而
+  `'moveToTrash' in File.prototype` 为假）、普通文件进废纸篓且内容可读回、`nativePath` 不变、
+  同名冲突产生第二个带时间戳的项、目录带子件整体搬移、`#3003`/`#2037` 抛出、异步的 `COMPLETE` +
+  `ioError 3003` + 空 `File` 同步抛、`spaceAvailable > 0`（家目录与普通文件均为正、不可解析路径与 `/dev/null` 为 `0`）。
+  **清理用递归 `purge()`** —— 第一版用 `deleteFile` 收尾，留下了 `stage243-dir/inner.txt`（`deleteFile` 删不掉目录）。
+
+**五、测试不污染开发机的废纸篓**
+
+`test/examples.ts` 给这个示例挂 `EXAMPLE_ENV['move-to-trash.as'] = { HOME: temp/trash-home }`：
+`as_trash_dir` 在 macOS 上读 `HOME` ⇒ 项落进 `temp/trash-home/.Trash`。**不这么做的话**每次回归都会往
+开发者自己的 `~/.Trash` 扔东西，而且 macOS 对终端进程**禁止枚举/清理** `~/.Trash`（实测 `Operation not permitted`，
+必须先请 Finder/`osascript` 代劳），等于把一次测试变成一次人工清理。手工验证那条路径时同理
+（`HOME=$PWD/temp/trash-home … --run`），实测开发机 `~/.Trash` 计数全程停在 10。
+
+**六、钉子与文档**
+
+- `test/unit/emit.ts` 新增 `unit: emit/FileMoveToTrash`（**17 项**，源级）；
+- `examples/move-to-trash.as`（运行时，见四）；
+- 新建 `docs/{zh-cn,en}/filesystem.md`：口径表 + 两处推翻纸面的实测 + 目录选择 + 取舍 + 「没做的部分」；
+- `README{,-CN}.md`：`flash.filesystem` 行补 `moveToTrash`/`moveToTrashAsync` 与其语义，示例清单补一条。
+
+**七、如实报明**
+
+- **残差 1（族级，已登记 1 行）**：空 `File` 的成员访问全线不抛 `#2037`。本轮新增的两个成员**是**抛的，
+  但既有成员的 `nativePath` 是**普通字段**，族级修复要把它改成访问器（牵动 AMF 成员表、结构体布局、
+  codegen 字段访问），不在本轮范围内**半修**。
+- **残差 2（已登记 1 行）**：Windows/wasm 没有回收站后端。
+- **残差 3**：freedesktop 分支**未在真机验证**（本机 macOS），只做过编译 + 布局级运行；
+  冲突名同毫秒兜底 `-<n>` **无实测参照**（概率可忽略，取「不失败」而非「精确复刻」）。
+- 本阶段只实测 macOS 的 `adl` 行为；Linux/Windows 端的 `adl` 口径**未采**。
+
+**八、本表变动**：**新登记 2 行 / 改写 0 行 / 移出 0 行**（G1/G2 属「`adl` 有、我们跑不出」且**阶段内已修净**
+⇒ 落地本身不占表；G2 查明是**误记**，也不占表）。表内 **98 → 100 项**（`未开始` **73 → 75**）。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。
@@ -14499,103 +14596,6 @@ AS3 `Vector.<int>`（4 B / 静态类型）、as3compiler 动态 `Array`（24 B �
 > 均在用户可读范围内，**且不碰 Downloads/Desktop/Documents 以避开 TCC 弹窗**；不做实时 CPU/内存图表；
 > 不做重复文件/相似图片（属 `czkawka` 的活）；不做自动/定时清理。**控件层不推进** `asaot.ui.*`
 > —— demo 内手搓面板零件，理由见上面「UI 工具链待定项」。
-
-### 阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— macOS 清理工具 demo 的 G1 + G2（v0.4.206 → v0.4.207）✅ 已完成
-
-**一、先把 `adl` 量清楚，再写一行代码**
-
-方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md) 的 G1/G2 是「清理类工具
-只移废纸篓、永不永久删除」这条信任底线的底座。动手前先搭了双端探针 `temp/trashprobe/`
-（一份 `Main.as`，`mxmlc` + `adl 51.4.1`，日志写文件——**`adl` 的 stdout 不可用**），把两个成员的行为逐条量下来。
-**两条量出来的结论推翻了纸面**，这是本阶段最重要的产出：
-
-| 纸面/直觉 | `adl 51.4.1` 实测 |
-|---|---|
-| `moveToTrash()` 返回 `Boolean`（AIR 参考文档如此写） | **`void`**。`f.moveToTrash().toString()` 在 `mxmlc` **编译期就报错**；`adl` 求值是 `undefined` |
-| G2 要补 `File.getSpaceAvailable` | **AIR 没有这个成员**（`'getSpaceAvailable' in f` = `false`，取它抛 `#1069`）；真名是属性 `spaceAvailable`，而它**从阶段六十四 起就在** |
-| 空 `File` 上读 `spaceAvailable` 回 `0`（我们的现状） | 空 `File` 上**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛） |
-
-若照纸面把 `moveToTrash` 写成 `Boolean`，`if (f.moveToTrash())` 会在两端给出**相反**结论——这正是
-AGENTS.md §1.5「语义等价是底线」要拦的那类错误。
-
-**二、`moveToTrash` 的完整口径（全部有探针）**
-
-| 场景 | `adl 51.4.1` | 本实现 |
-|---|---|---|
-| 正常文件 / 目录（带子件） | 移入废纸篓（目录整棵走），返回 `undefined` | 同（一次 `rename`） |
-| 路径不存在 | `Error #3003: File or directory does not exist.` | 同号同文案 |
-| 父目录不可写（EPERM，chmod 555） | `Error #2038: File I/O Error.` | 同 |
-| `new File()` | `Error #2037` | 同 |
-| 成功后 | `nativePath` **不变**、`exists` 转 `false` | 同 |
-| 已在废纸篓里的项 | 成功 **no-op**，原地不动 | 同 |
-| 同名冲突 | `原名 <HH-MM-SS-mmm><扩展名>`：`x.txt` → `x.txt 18-34-09-271.txt`、`dupsub` → `dupsub 18-37-21-029` | 同形状 |
-
-`moveToTrashAsync` 不是「另写一套」：同样的失败**派成事件**而非异常 —— 成功 `Event.COMPLETE`（`target`
-是那个 `File`）、路径不存在派 `ioError` 且 `errorID=3003`、`bubbles=false`、`cancelable=false`，
-只有空 `File` 仍**同步抛** `#2037`。投递时机沿用本仓所有 `File` 异步成员的口径（**inline 完成 + 同一次调用内派发**）：
-AIR 在自己的 IO 线程上做，但调用方唯一能依赖的顺序「先 `addEventListener` 再发起」两端都成立。
-
-**三、废纸篓目录按卷选，跨卷不「复制 + 删除」**
-
-- macOS：与 `$HOME` **同卷** → `~/.Trash`；**其他卷** → `<卷挂载点>/.Trashes/<uid>`。
-  「同卷」用 `st_dev` 比较（`as_trash_dir`），「卷挂载点」用逐级上升直到 `st_dev` 变化（`as_volume_root`）——
-  POSIX 没有可移植的「我在哪个挂载点」调用，而这条路在 APFS firmlink（`/Users` 与 `/` 同 `st_dev`）
-  与真正的独立卷（`/Volumes/Ext` vs `/Volumes`）两种情形下都给出了正确结果。
-- Linux 等 POSIX：freedesktop 的 `Trash/{files,info}`，每个载荷在 `info/` 配一个 `.trashinfo`
-  （`Path=` 百分号转义 + `DeletionDate=`）。这条**未在真机验证**（本机是 macOS），但用 `-U__APPLE__`
-  强制走 `#else` 编过并跑过布局断言。
-- **Windows / wasm**：没有后端 ⇒ `as_shell_unsupported("File.moveToTrash …")` 响亮报明 + 抛 `#2038`
-  （**不静默 no-op**），已入 `遗留待开发`。不写盲代码的理由：`IFileOperation`/`SHFileOperation` 都要给所有
-  Windows 构建加 `shell32`/`ole32`，而本机无法验证。
-- **已知取舍（写在前面）**：Finder 的「放回原处」靠卷上元数据，我们只 `rename` ⇒ 项**能出现在废纸篓、
-  能还原到任意位置，但没有一键「放回原处」记录**。
-
-**四、G2 没有新增成员，只校正了作用域**
-
-`spaceAvailable` 只在**普通文件或目录**上作答（先 `stat`，其余一律 `0`），因为 `/dev/null` 在 `adl` 上回 `0`
-而 `statvfs` 对它会给出卷的可用量。普通文件跟随其所在卷（实测与目录同值）。不存在的路径 / `/Volumes/Nope` 回 `0`。
-
-**五、钉子在两个层面上都钉住了**
-
-- `test/unit/emit.ts` 新增 `unit: emit/FileMoveToTrash`（17 项，源级）：两条成员在**类方法表**里存在、
-  签名是 `void`（不是 `Boolean`）、三条失败号与文案、异步事件名 + `ev->errorID`、`~/.Trash` 与
-  `.Trashes/<uid>` 两条路径、freedesktop 的 `files/`+`info/`+`[Trash Info]`/`DeletionDate=`、
-  「已在废纸篓即 no-op」的 `if (!nested) return 0;`、冲突名的时间戳格式与**保留整名**、
-  以及 `spaceAvailable` 的 `S_ISDIR`/`S_ISREG` 守卫。**接收者不被改写**这条用 body 作用域的正则钉
-  （第一版正则太宽，把 `as_trash_move(_this, ...)` 的传参也算成改写，已收窄）。
-- `examples/move-to-trash.as`（运行时）：API 形状（`typeof` 为 `function`、`'moveToTrash' in f` 为真而
-  `'moveToTrash' in File.prototype` 为假）、普通文件进废纸篓且内容可读回、`nativePath` 不变、
-  同名冲突产生第二个带时间戳的项、目录带子件整体搬移、`#3003`/`#2037` 抛出、异步的 `COMPLETE` +
-  `ioError 3003` + 空 `File` 同步抛、`spaceAvailable > 0`（家目录与普通文件均为正、不可解析路径与 `/dev/null` 为 `0`）。
-  **清理用递归 `purge()`** —— 第一版用 `deleteFile` 收尾，留下了 `stage243-dir/inner.txt`（`deleteFile` 删不掉目录）。
-
-**五、测试不污染开发机的废纸篓**
-
-`test/examples.ts` 给这个示例挂 `EXAMPLE_ENV['move-to-trash.as'] = { HOME: temp/trash-home }`：
-`as_trash_dir` 在 macOS 上读 `HOME` ⇒ 项落进 `temp/trash-home/.Trash`。**不这么做的话**每次回归都会往
-开发者自己的 `~/.Trash` 扔东西，而且 macOS 对终端进程**禁止枚举/清理** `~/.Trash`（实测 `Operation not permitted`，
-必须先请 Finder/`osascript` 代劳），等于把一次测试变成一次人工清理。手工验证那条路径时同理
-（`HOME=$PWD/temp/trash-home … --run`），实测开发机 `~/.Trash` 计数全程停在 10。
-
-**六、钉子与文档**
-
-- `test/unit/emit.ts` 新增 `unit: emit/FileMoveToTrash`（**17 项**，源级）；
-- `examples/move-to-trash.as`（运行时，见四）；
-- 新建 `docs/{zh-cn,en}/filesystem.md`：口径表 + 两处推翻纸面的实测 + 目录选择 + 取舍 + 「没做的部分」；
-- `README{,-CN}.md`：`flash.filesystem` 行补 `moveToTrash`/`moveToTrashAsync` 与其语义，示例清单补一条。
-
-**七、如实报明**
-
-- **残差 1（族级，已登记 1 行）**：空 `File` 的成员访问全线不抛 `#2037`。本轮新增的两个成员**是**抛的，
-  但既有成员的 `nativePath` 是**普通字段**，族级修复要把它改成访问器（牵动 AMF 成员表、结构体布局、
-  codegen 字段访问），不在本轮范围内**半修**。
-- **残差 2（已登记 1 行）**：Windows/wasm 没有回收站后端。
-- **残差 3**：freedesktop 分支**未在真机验证**（本机 macOS），只做过编译 + 布局级运行；
-  冲突名同毫秒兜底 `-<n>` **无实测参照**（概率可忽略，取「不失败」而非「精确复刻」）。
-- 本阶段只实测 macOS 的 `adl` 行为；Linux/Windows 端的 `adl` 口径**未采**。
-
-**八、本表变动**：**新登记 2 行 / 改写 0 行 / 移出 0 行**（G1/G2 属「`adl` 有、我们跑不出」且**阶段内已修净**
-⇒ 落地本身不占表；G2 查明是**误记**，也不占表）。表内 **98 → 100 项**（`未开始` **73 → 75**）。
 
 ---
 
