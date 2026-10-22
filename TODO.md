@@ -14336,6 +14336,69 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 > **口径更正**：本阶段占用 **二百四十四**，而方案表（macOS 清理工具 demo 能力缺口）给 G3/G4/G5/G8 的
 > 「预留阶段」一列也写着二百四十四 ⇒ 该列已整体后移一位（**预留号只是拟排期，实现顺序才是硬约束**）。
 
+### 阶段二百四十五：`flash.system.System.exit(code:uint)` —— 与 `NativeApplication.exit()` 共用收尾，并给 AIR 补上「带状态码的退出」（v0.4.208 → v0.4.209）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+`asaotui/compiler-gaps.md` 的 **G1** 记着「`System.exit` 没有」。核实（结论落 `asaotui/reviews/gaps-verify-2026-10-23.md`）时发现两件事，
+第二件比第一件更重要：
+
+- 成员确实不存在，但报错是 `Codegen error at 5:7: undefined variable 'System' in class G1`。`System` 是**认得的**
+  （`System.gc()`、`useCodePage` 一直编得通），错的是它的**成员**。这条文案会把人引向「少写了 import」的错方向。
+- **分类更正**：`adl 51.4.1` 对 `System.exit()` 抛 `#2018`（`IllegalOperationError: The System.exit() method is not
+  supported.`——项目内既有实测记录见本文件阶段一百二十五），参考文档同样把它标为 AIR 不支持。按 AGENTS §1.5 的硬判据，
+  「`adl` 本来就报错」⇒ 这**不是遗留欠账，是 AIR 无对应物的增强**：AIR 里**没有任何**带状态码的退出 API
+  （`NativeApplication.exit()` 在本项目里对齐的是无参签名，`src/symbols.ts:1233`）。所以本阶段落的不是「补齐对齐」，
+  而是「补一个 AIR 明确没有的能力」，并在文档里**显式列出跨端差异**：同一行代码在 `adl` 上抛 `#2018`，在我们这里以 `code` 退出。
+
+**二、落地**（`src/emit.ts` + `src/runtime.ts` + `src/*` 无平台胶水改动）
+
+- **emit 侧**（`isSystemClass` 分支链，紧随 `disposeXML`）：`exit` 走独立分支——实参个数**严格 1**
+  （`System.exit expects 1 argument (code:uint), got N`），实参经既有 `convert(...)` 归一为 `uint`；**分支之外**的
+  任何未知成员一律 `System has no member 'X'`（这条兜底是本阶段真正的 bug 修复：它把「成员没有」与「类不存在」分开）。
+- **类型口径**（实测三种实参形状）：`int`/`uint` 字面量 → `((unsigned int)(0))`；`Number` → `as_to_uint32(...)`；
+  `*` → `as_v_uint_cast(...)`。**刻意不用 C 强转**：`(unsigned)double` 在越界/NaN/±Infinity 上是 **UB**，而 AS3 的
+  `ToUint32` 有定义（NaN/±Infinity → 0，按 2^32 回绕）。
+- **runtime 侧**（两臂各一份）：`static int as_exit_status = 0;` + `as_system_exit(unsigned code)`。窗口臂记码后调
+  **`as_window_request_exit()`** —— 与 `NativeApplication.exit()` **完全同一条**收尾路径（`sk_window_request_exit()`
+  → `g_exit_requested` → `sk_run_loop` 消费后正常收尾），**不新造第二条退出通道**；headless 臂只记码（没有循环可停）。
+- **`emitMain` 末端**：`return 0;` → `return as_exit_status;`。两者缺一不可——只改 helper 不改 `main` 的话，
+  状态码会被丢掉（这正是本轮变异 M1 打的靶）。
+
+**三、验证**
+
+- `examples/system-exit.as`（示例池内，exit 0）：钉「能编能跑 + 调用之后的语句仍执行到帧边界」。
+- `examples/system-exit-status.as`（**在 `SKIP_FILES` 里**——示例池要求每个示例 exit 0，非 0 状态码进去就是一条永远红）：
+  由 `test/examples.ts` 末尾的**串行用例**单独编译、单独运行，断言 `System.exit(7)` 下**进程真的以 7 退出**、
+  且 `before`/`after` 两行都打印（`before` 先断言，否则「压根没跑到调用点」的程序也会 exit 0 而假绿）。
+  顺带修掉一个潜伏问题：`SKIP_FILES` 此前**只对目录收集生效**，顶层 `.as` 根本不看它——现在两处都看。
+- 新钉 `unit: emit/SystemExit`（7 条）：helper 调用形状、`Number`/`*` 的 ToUint32 归一、`main` 返回 `as_exit_status`、
+  两臂 preamble 形状（窗口臂必须含 `as_window_request_exit()`）、`as_exit_status` 全文件只写两处。
+- `unit: diagnostics/Codegen` 新增 2 条（arity 文案、`System has no member`），并把两条新错误并入「每条 `CodegenError`
+  都带行列号」的汇总断言（该组 55 条）。
+- **WASI 侧单独实测**：`int main(void){ return 7; }` 用本仓 `build-tools/wasi` 的 `--sysroot`/`-resource-dir` 编出 wasm，
+  `node:wasi` 实跑 **`WASI_EXIT=7`** ⇒ crt 把 `main` 的返回值当日志状态码，`return as_exit_status;` 在 wasm 上同样生效
+  （这是本阶段唯一与平台相关的半个问题，故用 C 级探针钉，而不是靠推理）。
+- **变异 3/3 全部被抓**，每步按 sha256 校验还原：① `return as_exit_status;` → `return 0;`（`unit: emit/SystemExit`
+  与串行示例用例**同时**转红，报 `got 0`）；② 窗口臂去掉 `as_window_request_exit()`（preamble 形状钉转红）；
+  ③ arity 文案改串（诊断钉转红）。
+- **既有钉未破**：`System.gc()`/`useCodePage` 仍编得通，`examples/native-window.as` 仍能编+链（窗口臂的
+  `as_system_exit` 里确实调 `as_window_request_exit()`）。
+
+**四、如实报明 / 残差**
+
+- **本机无 AIR SDK / `adl`**：`#2018` 这条用的是**项目内既有实测记录**（阶段一百二十五），本轮**未复测**——不留「我测过」的假口径。
+- **`System.exit(true)` 我们接受**（`(unsigned)true`），`mxmlc` 在编译期就拒绝（`Boolean` → `uint` 无隐式转换）。
+  这是「`uint` 形参一律按数值转换」的既有全局口径，不为单个 API 特殊化；登记在此以免被当成已对齐。
+- **延迟语义**：调用点之后的语句仍会执行到本帧边界（与 `NativeApplication.exit()` 同一延迟）。依赖「调用后立即冻结」的
+  程序在两处行为一致，但都不是「立即终止」——这是 AIR 侧就有的事实，不是我们的新分歧。
+- **没有引入 `--features` 开关**：开关的意义是「默认与 AIR 同形」，而 AIR 的行为是**抛错**；照抄只会让这个 API 不可用。
+  只有**显式调用**它的程序才会看到差异，未调用者与 AIR 逐字同形。
+- 增强清单已同步：`docs/zh-cn/enhancements.md` 新增 **E18**（表内一行 + §4.10 说明）。
+
+**五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——`System.exit` 从未进过本表（它只在
+`asaotui/compiler-gaps.md` 的 G1 里），且按 §1.5 属增强、不占遗留表。按表内实际行数重数仍为 **100 项**。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

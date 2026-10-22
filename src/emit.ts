@@ -25623,7 +25623,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.emitTopLevel(stmt);
     }
     this.popScope();
-    this.line('return 0;');
+    // The status is `as_exit_status` rather than a literal 0 so that
+    // flash.system.System.exit(code) can "pass a value to the operating system"
+    // (see the as_system_exit comment in the preamble). Everything that does not
+    // call it leaves the flag at 0, so ordinary builds are unchanged.
+    this.line('return as_exit_status;');
     this.indent--;
     this.line('}');
   }
@@ -29885,6 +29889,36 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       if (isSystemClass && callee.property === 'disposeXML') {
         const a = this.emitExpr(expr.args[0]);
         return { code: `(void)(${a.code})`, type: { kind: 'void' } };
+      }
+      // System.exit(code:uint):void -- "Closes Flash Player ... code: A value to pass
+      // to the operating system" (System.html). Measured fact: the AIR runtime does
+      // NOT support it (adl 51.4.1 throws IllegalOperationError #2018, "The
+      // System.exit() method is not supported."; the reference likewise tells AIR
+      // applications to call NativeApplication.nativeApplication.exit() instead),
+      // and mxmlc still type-checks the signature. So this takes the SAME shutdown
+      // path as that method -- ask the shared event loop to stop and let the
+      // ordinary teardown retire every window -- and the divergence is only that
+      // main() returns the recorded code as the process status (as_exit_status).
+      // That divergence is a registered enhancement, not alignment: docs/zh-cn/
+      // enhancements.md E18.
+      // The 1-argument shape is what AIR enforces (mxmlc: zero arguments is "参数
+      // 个数不正确。需要 1 个"; a Boolean is "Boolean 值无法隐式转换为 uint"), and the
+      // argument goes through the ordinary AS3 ToUint32 coercion.
+      if (isSystemClass && callee.property === 'exit') {
+        if (expr.args.length !== 1) {
+          throw new CodegenError(`System.exit expects 1 argument (code:uint), got ${expr.args.length}`);
+        }
+        const code = this.convert(this.emitExpr(expr.args[0]), { kind: 'uint' });
+        return { code: `as_system_exit(${code})`, type: { kind: 'void' } };
+      }
+      // Any OTHER System member is reported against the class, not the name. Before
+      // this, `System.exit(0)` fell through to the generic identifier path and
+      // reported "undefined variable 'System'" -- which blamed the CLASS for what
+      // is really a missing MEMBER, and sent the reader looking for an import.
+      // (Reads of a System constant go through emitSystemConst, which already names
+      // the class; this is the call path.)
+      if (isSystemClass) {
+        throw new CodegenError(`System has no member '${callee.property}'`);
       }
       // Math.abs(...) etc.
       if (calleeClassRef === 'Math') {

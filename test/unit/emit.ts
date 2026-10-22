@@ -3332,3 +3332,51 @@ function checkEmitFileMoveToTrash(): string[] {
   return bad;
 }
 registerGroup('unit: emit/FileMoveToTrash', checkEmitFileMoveToTrash);
+
+// ---- 阶段二百四十五：flash.system.System.exit(code:uint) ----------------
+// Pins the SHAPE of the emission. The running process status is asserted end to
+// end by `example: system-exit-status.as` in test/examples.ts (an examples/ pool
+// unit cannot: that pool requires status 0), and the two diagnostics by
+// `unit: diagnostics/Codegen`.
+function checkEmitSystemExit(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [sysexit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [sysexit] ${label}`); }
+  };
+  const gen = (src: string) => generateC(parse(src)).c;
+
+  const c0 = gen('System.exit(0);');
+  check('a System.exit call reaches the runtime helper',
+    c0.includes('as_system_exit(((unsigned int)(0)));'));
+  // A Number goes through the AS3 ToUint32 helper (ES3 ToUint32: NaN/±Infinity ->
+  // 0, wrap at 2^32), NOT a C cast -- `(unsigned)double` is UB out of range.
+  check('a Number argument is coerced with as_to_uint32, not a C cast',
+    gen('var n:Number = 7.9;\nSystem.exit(n);').includes('as_system_exit(as_to_uint32(g_n));'));
+  check('a * argument is coerced through the boxed ToUint32 helper',
+    gen('var a:* = 3;\nSystem.exit(a);').includes('as_system_exit(as_v_uint_cast(g_a));'));
+
+  // main returns the RECORDED status: a literal 0 there would silently drop the
+  // code, which is exactly the half an examples/ unit cannot observe.
+  check('main returns as_exit_status instead of a literal 0',
+    c0.includes('return as_exit_status;')
+    && /int main\(void\) \{[\s\S]*?return as_exit_status;/.test(c0));
+
+  // Both preamble arms record the code. The windowed one also asks the shared loop
+  // to stop (the SAME teardown NativeApplication.exit() takes -- AIR's reference
+  // tells AIR apps to call that method instead); the headless arm has no loop.
+  const pre = RUNTIME_PREAMBLE;
+  check('the windowed arm records the code and requests the exit',
+    /static int as_exit_status = 0;\r?\nstatic inline void as_system_exit\(unsigned code\) \{\r?\n {4}as_exit_status = \(int\)code;\r?\n {4}as_window_request_exit\(\);\r?\n\}/.test(pre));
+  check('the headless arm records the code (no loop to stop)',
+    pre.includes('static inline void as_system_exit(unsigned code) { as_exit_status = (int)code; }'));
+  // ...and nothing else in the preamble writes that flag, so the status can only
+  // come from a System.exit call.
+  check('as_exit_status is written in exactly one place per arm',
+    (pre.match(/as_exit_status = \(int\)code;/g) ?? []).length === 2);
+
+  console.log(`     [sysexit] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/SystemExit', checkEmitSystemExit);

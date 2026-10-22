@@ -104,7 +104,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 
 ## 3. 增强待做清单
 
-> **已完成 6 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询。
+> **已完成 7 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询、E18 带状态码退出（`System.exit`）。
 > **另有 1 项现状即增强、无需开工**：E17（无 GPU 后端时 `Context3D.profile` 报 `baselineExtended`）——
 > AIR 的 `software` 渲染模式在这里会直接 `#3702`，我们照常给上下文；详细实测见
 > [`display3d.md`](display3d.md) §9.14。
@@ -137,6 +137,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 | E15 | **可读 C 作为一等交付物**（嵌入宿主工程 / 人工审改） | ✗ | **已承诺**（README：「保留 `.c` 便于阅读」） | 两端 | 已有 |
 | E16 | **显示器刷新率查询**（`VsyncStateChangeAvailabilityEvent.refreshRate`） | ✗ **无任何刷新率查询 API**（实测 `adl 51.4.1` 只派发 `vSyncStateChangeAvailability` 且只带只读的 `available=false`） | ✅ **已实现**：事件增加只读 `refreshRate:Number`（构造器第 5 个**可选**参数，缺省 `0`）；启动后首个已知帧 + 窗口落到不同速率显示器时各派发一次 | 两端（**web/离屏无对应物 ⇒ 如实不派发**，不伪造 `0`） | **已完成** |
 | E17 | **无 GPU 后端时的 `Context3D.profile`**（纯 C 状态机报 `baselineExtended`） | ✗ AIR 的 `software` 渲染模式**锁死 `baseline`**：请求 `baselineExtended`/`enhanced` 异步抛 `#3702`，`createTexture(4096)` 报 `#3683 (max is 2048x2048)`、`maxBackBuffer` 只有 2048×2048 | ✅ **现状即增强**：未链接 Stage3D 后端时仍建上下文、报 `baselineExtended`、按 4096 校验（纹理只在 CPU 里，不占显存）；`driverInfo` 如实报 `"Software (state machine)"` | 两端（纯 C，无胶水依赖） | **已有（刻意保留，非开关）** |
+| E18 | **带状态码的退出**（`flash.system.System.exit(code:uint)`） | ✗ **明确不支持**：`mxmlc` 认得这个签名，但 AIR **运行时**抛 `IllegalOperationError #2018`（`The System.exit() method is not supported.`，`adl 51.4.1` 未打包实测，见 `TODO.md` 阶段一百二十五）；AIR 里**没有任何**带状态码的退出 API（`NativeApplication.exit()` 无参） | ✅ **已实现（阶段二百四十五）**：记下 `code` 后走**与 `NativeApplication.exit()` 同一条**收尾路径（`as_window_request_exit()`），`main` 以它为**进程状态码**返回；`System` 的未知成员改报 `System has no member 'X'`（此前误报 `undefined variable 'System'`）。见 §4.10 | 两端（native：状态码即进程状态；WASI：crt 用 `main` 返回值 `__wasi_proc_exit`，实测 `WASI_EXIT=7`） | **已完成** |
 
 ---
 
@@ -488,7 +489,27 @@ C 侧 `hand.c`/`hand_small.c` 与 AS3 侧 `saxpy.as`/`saxpy_fn.as` **同规模�
 `main` 的反汇编（每元素 **3** 个 `cbz` 空指针守卫 + **4** 次 `length` 比较 + 5 个分支）。
 
 ---
+### 4.10 E18 — `System.exit(code:uint)` 带状态码退出 —— ✅ **已完成（阶段二百四十五）**
 
+- **判定**（AGENTS §1.5 硬判据）：`adl` 对 `System.exit()` **报错**（`#2018`）⇒ AIR 明确不支持 ⇒ 属**增强**，不是遗留欠账。
+  AIR 侧也确实没有等价物：`NativeApplication.exit()` 无参，没有任何 API 能把状态码交给宿主操作系统。
+- **跨端差异（显式列出）**：同一行 `System.exit(7)` 在 `adl` 上抛 `#2018`，在我们这里**以 7 退出**。这是有意的分歧，
+  且只有**显式调用**它的程序才会看到——未调用者与 AIR 逐字同形，故不设 `--features` 开关（开关的本意是「默认与 AIR 同形」，
+  而照抄 AIR 的行为等于把这个 API 变成不可用）。
+- **编译面按 AIR 对齐**（`mxmlc 51.4.1` 实测口径）：实参个数**严格 1**（`System.exit()` 报「参数个数不正确。需要 1 个」），
+  类型 `uint`；`int`/`uint` 字面量直接强转、`Number` 走 `as_to_uint32`、`*` 走 `as_v_uint_cast`。**不用 C 强转**：
+  `(unsigned)double` 在越界/NaN/±Infinity 上是 UB，而 AS3 的 `ToUint32` 有定义（→ 0 或按 2^32 回绕）。
+- **延迟**：**不是立即终止**，与 `NativeApplication.exit()` 同一延迟（本帧收尾完才退出），调用点之后的语句仍会执行。
+- **顺带修掉的诊断缺陷**：`System` 的任何未知成员此前报 `undefined variable 'System'`（把人引向「少写 import」），
+  现在报 `System has no member 'X'`。
+- **证据**：`examples/system-exit.as`（池内，exit 0）+ `examples/system-exit-status.as`（`SKIP_FILES`）+
+  `test/examples.ts` 的串行用例（断言进程**真的以 `7` 退出**，且 `before`/`after` 都打印）；`unit: emit/SystemExit` 7 条；
+  `unit: diagnostics/Codegen` 2 条；变异 3/3 全部被抓（`return as_exit_status;`→`return 0;`、窗口臂去掉
+  `as_window_request_exit()`、arity 文案改串）。
+- **已知比 AIR 宽松的一处**：`System.exit(true)` 我们接受（`(unsigned)true`），`mxmlc` 在编译期拒绝（`Boolean` 无隐式转换到
+  `uint`）。这是「`uint` 形参一律按数值转换」的既有全局口径，未为单个 API 特殊化。
+
+---
 ## 5. 与排期 / 回归的关系
 
 - **排期**：本清单的**待办视图**在 `TODO.md` 的 `### 增强待做`；本文负责「是什么、为什么、依赖什么」。

@@ -9360,6 +9360,18 @@ static inline void as_window_request_exit(void) {
     sk_window_request_exit();
 #endif
 }
+// flash.system.System.exit(code:uint): "a value to pass to the operating system"
+// (System.html). AIR does not support the method at runtime (adl 51.4.1 throws
+// #2018) and points AIR applications at NativeApplication.exit() instead, so this
+// shares that shutdown exactly -- record the code, ask the shared loop to stop --
+// and the only difference is that main() returns the recorded status rather than 0.
+// Statements after the call still run up to the frame boundary, which is the same
+// deferral NativeApplication.exit() has.
+static int as_exit_status = 0;
+static inline void as_system_exit(unsigned code) {
+    as_exit_status = (int)code;
+    as_window_request_exit();
+}
 // Requests teardown; the window is retired at the next frame boundary, which is
 // what makes NativeWindow.closed remain false for the rest of the call that
 // invoked close() (measured against adl).
@@ -9756,6 +9768,10 @@ static inline void as_window_get_borders(int id, int* top, int* left, int* botto
 // No event loop to end: NativeApplication.exit() in a headless build is a no-op
 // whose observable effect is simply that the program stops there.
 static inline void as_window_request_exit(void) { }
+// flash.system.System.exit(code:uint) with no event loop: nothing to stop, so the
+// code is only recorded for main() to return.
+static int as_exit_status = 0;
+static inline void as_system_exit(unsigned code) { as_exit_status = (int)code; }
 // No window => no non-client frame, so globalToScreen degenerates to the window's
 // own origin (a headless build has no screen to convert into anyway).
 // No event loop to end: NativeApplication.exit() in a headless build is a no-op

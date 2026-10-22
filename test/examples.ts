@@ -61,7 +61,12 @@ function scratchOut(label: string): string {
 // turned on (`new Main(true)`), which writes a 4 MB raw bitmap on top of the
 // numeric report. The directory unit must keep the single numeric entry, so the
 // UI variant is compiled only by examples/textfield/run-aot-ui.sh.
-const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as']);
+//
+// `system-exit-status.as` is here for a third reason: the pool runs every example
+// expecting status 0 (node:test turns a non-zero exit into a failure), and this
+// example's whole point is that `System.exit(7)` makes the process exit 7. It is
+// compiled and run by the serial case below instead (阶段二百四十五).
+const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as']);
 // Third-party library directories (e.g. com/greensock) ship with full AIR apps
 // but depend on features outside this compiler's subset; they are not part of
 // the regression suite's input. `shmup-stage3d` is the stage 79-83 end-to-end
@@ -426,7 +431,7 @@ describe(`examples (jobs=${JOBS})`, { concurrency: JOBS }, () => {
         assert.deepStrictEqual(after, before,
           `[no-src-litter] ${e.name}/ wrote into its own source dir: ${after.filter((n) => !before.includes(n)).join(', ')}`);
       });
-    } else if (e.name.endsWith('.as')) {
+    } else if (e.name.endsWith('.as') && !SKIP_FILES.has(e.name)) {
       const required = EXAMPLE_REQUIRES[e.name];
       const out = scratchOut(e.name);
       test(`example: ${e.name}`, async (t) => {
@@ -588,4 +593,42 @@ test('example: ane-app (--air-app + "<extensions>" id -> ext-aot: build+stage+ru
   const staged = join(dirname(out), 'extensions', ANE_FIXTURE);
   assert.ok(existsSync(staged), `the extension was not staged beside the executable: ${staged}`);
   console.log('PASS  ane-app (--air-app)');
+});
+// flash.system.System.exit(code:uint) -- the STATUS half (阶段二百四十五).
+//
+// The pool above runs `examples/system-exit.as`, which proves the ZERO-code case
+// (and is only runnable at all because the status main() returns really is the
+// recorded one). A non-zero code cannot live there -- node:test reads any
+// non-zero exit as a failure -- so its twin is in SKIP_FILES and driven here,
+// where the status is asserted directly. Without this, `return as_exit_status;`
+// could regress to `return 0;` and every other test would still pass.
+test('example: system-exit-status.as (process status = the System.exit code)', async () => {
+  const out = scratchOut('system-exit-status');
+  await runAsync('node', ['src/index.ts', join(dir, 'system-exit-status.as'), '-o', out],
+    { cwd: root, timeout: 120_000, maxBuffer: 16 * 1024 * 1024 });
+  // Windows appends `.exe` to an extensionless -o (lld-link's output name); POSIX
+  // has no such convention, so the executable is the path as given there.
+  const exe = process.platform === 'win32' && !out.toLowerCase().endsWith('.exe') ? `${out}.exe` : out;
+  // execFile RESOLVES only on status 0, so a non-zero exit arrives as a rejection
+  // whose `code` is the status and whose `stdout` is what the program printed.
+  let status = 0;
+  let printed = '';
+  try {
+    const r = await runAsync(exe, [], { timeout: 60_000, maxBuffer: 1024 * 1024 });
+    printed = r.stdout;
+  } catch (e) {
+    const err = e as { code?: number; stdout?: string; stderr?: string };
+    status = typeof err.code === 'number' ? err.code : -1;
+    printed = `${err.stdout ?? ''}${err.stderr ?? ''}`;
+  }
+  // The example's own output is checked BEFORE the status: a program that never
+  // reached the call would also exit 0, and `before` is what proves it did.
+  assert.match(printed, /system-exit-status: before/);
+  assert.strictEqual(status, 7,
+    `System.exit(7) must become the process status; got ${status} (stdout=${printed})`);
+  // The teardown is DEFERRED to the frame boundary (same as NativeApplication.exit),
+  // so the statements after the call still run -- a documented choice, not an
+  // accident, and it is what makes `after` observable at all.
+  assert.match(printed, /system-exit-status: after/);
+  console.log('PASS  system-exit-status (status 7)');
 });

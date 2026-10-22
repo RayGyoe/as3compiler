@@ -369,7 +369,18 @@ function checkCodegenDiagnostics(): string[] {
   check('StyleSheet.transform is not implemented yet, and says so',
     ss2?.message === "Codegen error at 2:1: undefined method 'transform' on class 'StyleSheet'");
 
-  const all = [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g12, g13, gi2, gi3, gi4, t1, t2, t3, t4, t5, t6, t7, t8, t9, i1, i2];
+  // 阶段二百四十五: flash.system.System 是 emitter 里的手写伪类（没有 ClassInfo），
+  // 所以它的成员必须按「成员」报告。此前 `System.exit(0)` 掉到通用标识符路径，
+  // 报 "undefined variable 'System'" —— 把「类认得、成员没有」说成「类不存在」，
+  // 读者会去找 import。实测 AIR 51.4.1 对 0 个实参报「参数个数不正确。需要 1 个」。
+  const s1 = gen('System.exit();');
+  check('System.exit with no argument names the arity, not a missing class',
+    s1?.message === 'Codegen error at 1:1: System.exit expects 1 argument (code:uint), got 0');
+  const s2 = gen('System.notAMemberXYZ();');
+  check('an unknown System member is reported as a missing MEMBER',
+    s2?.message === "Codegen error at 1:1: System has no member 'notAMemberXYZ'");
+
+  const all = [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g12, g13, gi2, gi3, gi4, t1, t2, t3, t4, t5, t6, t7, t8, t9, i1, i2, s1, s2];
   check('every CodegenError carries a numeric line and col',
     all.every((e) => e !== null && typeof e.line === 'number' && typeof e.col === 'number')
     && all.every((e) => /^Codegen error at \d+:\d+: /.test(e!.message)));
