@@ -261,6 +261,13 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 `.debug_*`，`name` 函数名段保留 ⇒ trap 仍打印符号化栈）。开 `--debug-info` 则三端均加 `-g` 且 wasm 不再剥离
 （`fib.wasm` ~640 KB，含我们生成的 C 的行号 ⇒ 可在 DevTools 里源码级调试）。
 
+**清单顶层键必须拼对（阶段二百五十二）**：`loadManifest` 逐个核对顶层键，不认识的名字**硬报错**并点名文件
+（`targets.<目标>` 块从阶段八十九·五十 起就是这么做的，顶层一直漏着）。以前拼错一个键不会失败，只会**悄悄少做一件事**：
+`link-lib` 少了 `s` ⇒ 库没进链接、之后才报一个无关的 `undefined symbol`；`define` ⇒ 宏没进来、C 照常编过而常量与分支是错的。
+报错会尽量给出**近似名**（`link-lib` → `did you mean 'link-libs'?`），或指出它其实是**命令行选项**（`as-class-path` /
+`main-class` / `all-sources` 这类没有清单写法的旗标），并附上全部合法键；`$` 前缀的元数据键（如 `$schema`）放行。
+仓库自带的 31 份清单全部通过。详见 [`compile.md`](docs/zh-cn/compile.md) §4.4。
+
 
 ## 支持的语言子集
 

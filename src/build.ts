@@ -252,6 +252,67 @@ interface Manifest extends ManifestFields {
   targets?: Partial<Record<Target, TargetLayer>>;
 }
 
+// Every key a TOP-LEVEL manifest object may carry. The `Record<..., true>` type is
+// the drift guard, not decoration: adding a field to ManifestFields without
+// listing it here (or misspelling it here) fails to compile, so this list cannot
+// rot into a stale second copy of the interface. `targets` is listed even though
+// it is not a ManifestFields member -- the overlay block IS a top-level key.
+//
+// loadManifest rejects anything missing from it. Without that check a typo is a
+// silent no-op: `"link-lib": ["skia"]` (one `s` short) dropped the library and
+// surfaced much later as an unrelated `undefined symbol`, while `"define"` left
+// the macro out of the compile and the build still reported success -- exactly the
+// "compiles, but wrong" outcome AGENTS.md §2.5 forbids. It is the same rule
+// TARGET_LAYER_FIELDS has enforced one level down since 阶段八十九·五十; the top
+// level simply never got it.
+const MANIFEST_FIELD_NAMES: Record<keyof ManifestFields | 'targets', true> = {
+  target: true,
+  package: true,
+  'c-compiler': true,
+  opt: true,
+  'debug-info': true,
+  lto: true,
+  pgo: true,
+  'pgo-dir': true,
+  sources: true,
+  'swc-paths': true,
+  'ane-paths': true,
+  'ane-platform': true,
+  'include-paths': true,
+  'link-libs': true,
+  'link-paths': true,
+  defines: true,
+  'c-flags': true,
+  features: true,
+  objects: true,
+  frameworks: true,
+  exports: true,
+  'font-urls': true,
+  'preload-paths': true,
+  'preload-excludes': true,
+  'bundle-id': true,
+  'display-name': true,
+  icon: true,
+  'deployment-target': true,
+  architecture: true,
+  targets: true,
+};
+const MANIFEST_FIELDS: ReadonlySet<string> = new Set(Object.keys(MANIFEST_FIELD_NAMES));
+
+// Keys that are command-line options with no manifest spelling. A user who writes
+// one has not made a typo, they have put it on the wrong side of the tool, and the
+// error should say so instead of guessing at a near-miss field: `as-class-path` is
+// an AS-side input (docs/zh-cn/compile.md §3.5.2) that the build layer never
+// reads, so a manifest entry for it could only ever be ignored.
+// Names that ARE one edit from a real field (`source` -> `sources`, `swc` ->
+// `swc-paths`, `cflag` -> `c-flags`) are deliberately absent here: the near-miss
+// suggestion is the better answer for those, and it is tried first.
+const CLI_ONLY_KEYS: ReadonlySet<string> = new Set([
+  'main-class', 'all-sources', 'include-third-party', 'as-class-path',
+  'air-app', 'manifest', 'run', 'dry', 'json', 'fix', 'verbose', 'version',
+  'help', 'check-update', 'extdir', 'output', 'ane',
+]);
+
 // Fields a `targets.<name>` block is allowed to override. Anything else is a
 // typo and must fail loudly (AGENTS.md §2.5), not be silently ignored.
 const TARGET_LAYER_FIELDS: ReadonlySet<string> = new Set([
@@ -263,6 +324,41 @@ const TARGET_LAYER_FIELDS: ReadonlySet<string> = new Set([
   'ane-paths', 'ane-platform',
   'bundle-id', 'display-name', 'icon', 'deployment-target',
 ]);
+
+// Plain Levenshtein, two rows of state (no dependency, no per-cell allocation).
+// Exported because the CLI's `--flag` suggester in index.ts needs the same
+// distance: two copies would drift the first time either threshold is retuned,
+// and index.ts already imports from here (so this direction adds no cycle).
+export function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// Same two shapes suggestFlag() guesses at -- a misspelling of a long name, and a
+// name the user stopped typing halfway -- and the same reluctance to guess: a
+// confident wrong suggestion costs more than none, so closeness is measured
+// relative to the key's own length rather than with an absolute threshold.
+function suggestManifestField(key: string): string {
+  let best = '';
+  let bestDist = 3;
+  for (const f of MANIFEST_FIELDS) {
+    const d = editDistance(key, f);
+    if (d < bestDist && d * 3 <= key.length) { bestDist = d; best = f; }
+  }
+  if (best !== '') return best;
+  // Nothing near, but the user may simply have stopped typing: `swc` is five
+  // edits from `swc-paths`, far enough that Levenshtein says no and a prefix test
+  // says yes. Only when it is unambiguous -- two candidates means a coin flip.
+  const candidates = [...MANIFEST_FIELDS].filter((f) => f.length > key.length && f.startsWith(key));
+  return candidates.length === 1 ? candidates[0] : '';
+}
 
 export function loadManifest(path: string): Manifest {
   let raw: string;
@@ -280,7 +376,24 @@ export function loadManifest(path: string): Manifest {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`build manifest must be a JSON object: ${path}`);
   }
-  return parsed as Manifest;
+  const obj = parsed as Record<string, unknown>;
+  // `$`-prefixed keys are metadata rather than build settings (`$schema` being the
+  // usual one), so letting them through avoids pushing people into
+  // JSON-with-pseudo-comments hacks.
+  const unknown = Object.keys(obj).filter((k) => !MANIFEST_FIELDS.has(k) && !k.startsWith('$'));
+  if (unknown.length > 0) {
+    const named = unknown.map((k) => {
+      const near = suggestManifestField(k);
+      if (near !== '') return `'${k}' (did you mean '${near}'?)`;
+      if (CLI_ONLY_KEYS.has(k)) return `'${k}' (a command-line option -- set it there, not in a manifest)`;
+      return `'${k}'`;
+    });
+    throw new Error(
+      `build manifest: unknown ${unknown.length === 1 ? 'field' : 'fields'} ${named.join(', ')} ` +
+      `(known: ${[...MANIFEST_FIELDS].join(', ')}) — ${path}`,
+    );
+  }
+  return obj as Manifest;
 }
 
 // Merge a manifest over the base config. CLI flags take precedence (they are

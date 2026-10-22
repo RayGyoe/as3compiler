@@ -991,6 +991,46 @@ Manifest spelling: `{ "debug-info": true }`, overridable per target by `targets.
 > assertion for the **default command** of each of the three backends (`[debuginfo]`), and a reverse control
 > proves they really pin down this policy.
 
+### 4.4 Unknown fields are a hard error (stage two-hundred-fifty-two)
+
+Every **top-level key** must be spelled correctly: after parsing, `loadManifest` checks them one by one and
+**fails loudly**, naming the file, instead of accepting a name it will never read. The `targets.<target>`
+blocks have enforced exactly this since stage 89·50 (`TARGET_LAYER_FIELDS`, §4.1); this round only closed the
+**top level**, which was the loosest layer of all.
+
+```text
+$ as-aot examples/hello.as --manifest bad.json
+build manifest: unknown field 'link-lib' (did you mean 'link-libs'?)
+  (known: target, package, c-compiler, …, architecture, targets) — bad.json
+```
+
+It gets its own section because **a misspelled key does not fail the build, it silently makes the build do
+less**:
+
+| Misspelled key | What used to happen |
+|---|---|
+| `"link-lib": ["skia"]` (one `s` short) | the library never reached the link line → a later `undefined symbol` that says nothing about the typo |
+| `"define": ["ASC_USE_SKIA=1"]` | the macro never arrived → the C still compiles with the wrong constant and the wrong branch (the "compiles but wrong" outcome AGENTS.md §2.5 forbids) |
+| `"preload-path"` / `"font-url"` | the assets/fonts never enter the artifact → only the runtime notices |
+| `"as-class-path"` | it is simply never read, with no feedback at all (it is an AS-side input, see §3.5.2) |
+
+The message annotates each unknown key in one of three ways, tried in this order:
+
+1. **A near miss**: `link-lib` → `did you mean 'link-libs'?`. Closeness is measured **relative** to the
+   key's own length, and a unique prefix also counts — one edit away or a prefix, otherwise no guess (a
+   confident wrong suggestion costs more than none);
+2. **A command-line option**: `as-class-path` / `main-class` / `all-sources` / `include-third-party` have
+   **no manifest spelling**, and the error says so instead of guessing at a field;
+3. Everything else is just named, with the full list of accepted keys appended so no doc lookup is needed.
+
+Two deliberate gaps: `$`-prefixed keys (metadata such as `$schema`) pass untouched, and the inside of a
+`targets.<target>` block is still validated by `TARGET_LAYER_FIELDS` (§4.1), which is stricter — it does not
+even allow `target`/`package`.
+
+> This guarantees the **name is known**, not that the field does anything in the current shape: `font-urls` is
+> inert for `target=native` and is not rejected. All 31 manifests shipped in this repo (hand-written examples
+> and `--air-app` snapshots alike) load cleanly; the pin is `unit: build/ManifestUnknownKeys`.
+
 ## 5. Multi-target Backends
 
 | Target | Compile command | Artifact |

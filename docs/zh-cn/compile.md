@@ -906,6 +906,41 @@ as-aot examples/wasm-native/fib.as --target wasm --debug-info
 > 不发 `-g` 的 native/web 默认行为**完全未变**；回归里对三个后端的**默认命令**各自有断言
 > （`[debuginfo]`），反向对照证明它们真的钉住了这条策略。
 
+### 4.4 未知字段 = 硬报错（阶段二百五十二）
+
+清单的**顶层键**必须拼对：`loadManifest` 读入后逐个核对，不认识的名字**直接报错**并点名文件，
+不再「读到了、但没人管」。`targets.<目标>` 块从阶段八十九·五十 起就在执行这条规则（`TARGET_LAYER_FIELDS`，§4.1），
+本轮只是把**顶层**补齐——此前它恰恰是最松的一层。
+
+```text
+$ as-aot examples/hello.as --manifest bad.json
+build manifest: unknown field 'link-lib' (did you mean 'link-libs'?)
+  (known: target, package, c-compiler, …, architecture, targets) — bad.json
+```
+
+值得为它单列一节的理由：**拼错一个键不会让构建失败，只会让构建悄悄少做一件事**。
+
+| 写错的键 | 以前的结果 |
+|---|---|
+| `"link-lib": ["skia"]`（少个 `s`） | 库没进链接 → 之后才报 `undefined symbol`，错误信息与「你拼错了」毫无关系 |
+| `"define": ["ASC_USE_SKIA=1"]` | 宏没进来 → C 照常编过、常量与分支是错的（AGENTS.md §2.5 明令禁止的「编译过但结果错」） |
+| `"preload-path"` / `"font-url"` | 资源/字体没打进产物 → 运行期才找不到 |
+| `"as-class-path"` | 它就是不会被读，且没有任何反馈（它属于 AS 侧编译面，见 §3.5.2） |
+
+报错按三种情况给附注，优先级从高到低：
+
+1. **近似名**：`link-lib` → `did you mean 'link-libs'?`。距离阈值按名字长度**相对**计算，且「以它开头的唯一候选」
+   也算——只差一个字符或以它开头才猜，宁可不猜也不乱猜；
+2. **命令行选项**：`as-class-path` / `main-class` / `all-sources` / `include-third-party` 这类**没有清单写法**的旗标，
+   会被告知「这是命令行选项，请在命令行上给」；
+3. 其余只点名键本身，消息末尾附上**全部合法键**，省一次翻文档。
+
+两处刻意留开的缝：`$` 前缀的键（`$schema` 之类元数据）直接放行；`targets.<目标>` 内部仍按 §4.1 的
+`TARGET_LAYER_FIELDS` 校验（那里更窄，连 `target`/`package` 都不许写）。
+
+> 这条只保证**键名认识**，不保证「这个键在当前形态下有用」：`font-urls` 在 `target=native` 里本就无效，
+> 不会被拒。仓库内 31 份自带清单（手写示例与 `--air-app` 快照）全部通过，钉子见 `unit: build/ManifestUnknownKeys`。
+
 ## 5. 多目标后端
 
 | 目标 | 编译命令 | 产物 |

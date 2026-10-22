@@ -104,6 +104,102 @@ function checkManifestLayering(): string[] {
   return bad;
 }
 
+// ---- top-level manifest keys must be known (阶段二百五十二) ----
+// The layer check above catches typos INSIDE a `targets.<name>` block; the top
+// level had no such gate, so `"link-lib"` or `"as-class-path"` sitting at the
+// root of a manifest was accepted and then simply never read (AGENTS.md §2.5).
+// These assertions pin the three answers the gate must give: a real field loads
+// untouched, a near-miss names the field it was meant to be, and a CLI-only key
+// says so rather than guessing at a near-miss that would send the user in circles.
+function checkManifestUnknownKeys(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [mfkey] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [mfkey] ${label}`); }
+  };
+  const tmp = join(root, 'temp', 'manifest-unknown-keys.json');
+  mkdirSync(dirname(tmp), { recursive: true });
+  // Returns the error message, or '' when the manifest loaded.
+  const tryLoad = (body: Record<string, unknown>): string => {
+    writeFileSync(tmp, JSON.stringify(body, null, 2) + '\n');
+    try { loadManifest(tmp); return ''; }
+    catch (e) { return String((e as Error).message); }
+  };
+
+  // 1) A misspelling is refused, and the message is actionable.
+  const typo = tryLoad({ 'link-lib': ['skia'] });
+  check('a misspelled top-level key is an error, not a silent no-op', typo !== '');
+  check('...the message names the key', typo.includes("'link-lib'"));
+  check('...the message names the manifest', typo.includes('manifest-unknown-keys.json'));
+  check('...and proposes the nearest real field', typo.includes("did you mean 'link-libs'?"));
+  check('...and lists what IS accepted', typo.includes('known:') && typo.includes('link-libs'));
+  check('the message is singular for one key', typo.includes('unknown field '));
+  const plural = tryLoad({ 'link-lib': [], 'font-url': [] });
+  check('several typos are reported in one message',
+    plural.includes("'link-lib'") && plural.includes("'font-url'") && plural.includes('unknown fields '));
+  // The suggestion has TWO paths. `link-lib` is a PREFIX of `link-libs`, so it is
+  // answered by the "user stopped typing" rule; an underscore-for-dash slip is not
+  // a prefix and only the edit-distance rule can find it. Without this case the
+  // distance rule could be deleted outright and every assertion above still pass.
+  const slip = tryLoad({ 'link_libs': ['skia'] });
+  check('an underscore-for-dash slip is answered by edit distance',
+    slip.includes("did you mean 'link-libs'?"));
+  const far = tryLoad({ whatever: 1 });
+  check('a key with no near-miss gets no bogus suggestion',
+    far.includes("'whatever'") && !far.includes('did you mean'));
+
+  // 2) A command-line option is named as such. `as-class-path` is the one that
+  //    actually happened: it was written into a manifest to see whether it would
+  //    take effect, and the only feedback available was "nothing changed".
+  const cli = tryLoad({ 'as-class-path': ['../as-library'] });
+  check('a CLI-only key in a manifest is refused', cli.includes("'as-class-path'"));
+  check('...and is named as a command-line option', cli.includes('command-line option'));
+  check('...with no misleading "did you mean" attached to it', !cli.includes('did you mean'));
+  check('the AS-side flags with no manifest spelling are all caught',
+    ['main-class', 'all-sources', 'include-third-party']
+      .every((k) => tryLoad({ [k]: 'x' }).includes('command-line option')));
+
+  // 3) `$`-prefixed metadata passes (a `$schema` must not make a manifest unusable).
+  check('a $-prefixed metadata key is allowed', tryLoad({ $schema: 'https://example/x.json', target: 'native' }) === '');
+
+  // 4) The gate is not accidentally narrow: every documented field must still
+  //    load, or a legitimate build would be rejected for the wrong reason.
+  const every: Record<string, unknown> = {
+    target: 'native', package: 'raw', 'c-compiler': 'cc', opt: '-O2', 'debug-info': true,
+    lto: true, pgo: 'use', 'pgo-dir': 'prof', sources: [], 'swc-paths': [], 'ane-paths': [],
+    'ane-platform': 'windows-x64', 'include-paths': [], 'link-libs': [], 'link-paths': [],
+    defines: [], 'c-flags': [], features: [], objects: [], frameworks: [], exports: [],
+    'font-urls': [], 'preload-paths': [], 'preload-excludes': [], 'bundle-id': 'com.example.x',
+    'display-name': 'X', icon: 'icon.ico', 'deployment-target': '13.0', architecture: '64',
+    targets: { native: {} },
+  };
+  check('all 30 documented fields load', tryLoad(every) === '');
+
+  // 5) Nothing already checked in may start failing. The gate exists to reject
+  //    typos, not the manifests this repo ships -- the 29 example manifests
+  //    (hand-written and `--air-app` snapshots alike) are the standing proof.
+  const manifests: string[] = [];
+  const walk = (d: string): void => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) { if (e.name !== 'node_modules') walk(p); }
+      else if (e.name.indexOf('.build.') >= 0 && e.name.endsWith('.json')) manifests.push(p);
+    }
+  };
+  walk(join(root, 'examples'));
+  const rejected: string[] = [];
+  for (const f of manifests) {
+    try { loadManifest(f); } catch (e) { rejected.push(`${basename(f)}: ${(e as Error).message}`); }
+  }
+  check(`${manifests.length} checked-in example manifests still load`,
+    manifests.length >= 20 && rejected.length === 0);
+  for (const r of rejected) console.log(`      rejected: ${r}`);
+
+  if (ok > 0) console.log(`[mfkey] ${ok} manifest-key checks passed`);
+  return bad;
+}
+
 // ---- preload set trimming (阶段八十九·五十八) ----
 // A web build packs the app's data tree into `<base>.data`, and a font listed in
 // `font-urls` is ALSO fetched over HTTP by the page (that fetch is what puts bytes
@@ -1123,6 +1219,7 @@ function checkXcodeProjectParity(): string[] {
 }
 
 registerGroup('unit: build/ManifestLayering', checkManifestLayering);
+registerGroup('unit: build/ManifestUnknownKeys', checkManifestUnknownKeys);
 registerGroup('unit: build/PreloadExcludes', checkPreloadExcludes);
 registerGroup('unit: build/PreloadOutputDir', checkPreloadOutputDir);
 registerGroup('unit: build/PerfFlags', checkPerfFlags);

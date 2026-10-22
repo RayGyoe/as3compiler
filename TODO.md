@@ -14739,6 +14739,46 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
   `src/com/`（352 个 tracked 文件）已被删除、旁边留了一个未跟踪的 `com.zip`（`git status` 显示 352 个 ` D`），
   `TweenDemo` 的 `com.greensock.easing.Cubic` 因此找不到。恢复 `src/com/` 即可，与 `--as-class-path` 无关。
 
+### 阶段二百五十二：构建清单的**顶层未知键**改硬报错（v0.4.215 → v0.4.216）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+用户测试 `--as-class-path` 时问：「要不要写进 `<app>.build.json`？」——不该进（那份 JSON 描述构建/链接面，AS 侧的
+`asFiles` 从来没在里面）。但试写之后**什么都没发生**：`loadManifest` 只做 JSON 解析，`applyManifest` 没有这个分支，
+`BuildConfig` 上也没有这个字段 ⇒ 写错的键被**静默吞掉**。`targets.<目标>` 层从阶段八十九·五十 起就有
+`TARGET_LAYER_FIELDS` 白名单，**顶层恰恰没有**——同一份文件，两层松紧不一，而松的那层才是最容易写错的那层。
+
+**二、落地（`src/build.ts` / `src/index.ts`）**
+
+- `MANIFEST_FIELD_NAMES` 以 `Record<keyof ManifestFields | 'targets', true>` 声明，再 `new Set(Object.keys(...))`。
+  **类型即漂移护栏**：往接口加字段却忘了登记（或登记时写错名）是**编译错误**，这份表因此不会腐烂成接口的第二份副本。
+- `loadManifest` 解析后逐个核对顶层键，未知键**硬报错**并点名文件；`$` 前缀（`$schema` 之类元数据）放行。
+- 三种附注：① **近似名**（`link-lib` → `did you mean 'link-libs'?`）；② **命令行选项**（`as-class-path`/`main-class`/
+  `all-sources`/`include-third-party` 等**没有清单写法**的旗标，直说「请在命令行上给」）；③ 其余只点名键，末尾附全部合法键。
+- `editDistance` 从 `index.ts` **上移到 `build.ts` 并 export**：`suggestFlag` 与本轮的 `suggestManifestField` 共用同一份
+  距离函数（方向无环——`index.ts` 本来就 import `build.ts`），阈值调一次两边同时生效。
+
+**三、验收（实测）**
+
+- `node --test --test-name-pattern='build/Manifest' test/unit/build.ts`：layering 16 项 + 新组 `unit: build/ManifestUnknownKeys`
+  **14 项**全绿。
+- 新组最后一条把**仓库自带的 31 份清单**（手写示例与 `--air-app` 快照）全过一遍 `loadManifest` ⇒ **0 拒绝**，
+  证明这道闸门不会打红既有项目。
+- **变异 4/4 全抓**（`temp/mfmut.cjs`，每次按 sha256 断言 `src/build.ts` 逐字节还原）：M1 关掉 throw ⇒ 12 项红；
+  M2 关掉编辑距离建议 ⇒ 1 项红；M3 去掉 `$` 豁免 ⇒ 1 项红；M4 去掉 CLI 提示 ⇒ 2 项红。
+- 手工复跑：`--manifest bad1.json` ⇒ `unknown field 'link-lib' (did you mean 'link-libs'?)`；`bad2.json` ⇒
+  `'as-class-path' (a command-line option -- set it there, not in a manifest)`；`good1.json`（`$schema` + `link-libs` +
+  `targets`）⇒ 正常走到 `[4/4] dry-run`。
+
+**四、如实报明**
+
+- 这道闸门只保证**键名认识**，不保证「该键在当前形态下有用」：`font-urls` 在 `target=native` 里本就无效，不会被拒；
+  「值在本目标/本模式下是否生效」是另一件事，本轮未做。
+- 变异 M2 **首次存活**：`link-lib` 恰好是 `link-libs` 的**前缀**，刹的是「用户没打完」那条分支，编辑距离分支根本没被
+  覆盖。补 `link_libs`（下划线当连字符）与 `whatever`（无近似名，不许乱猜）两条钉子后 4/4 才真的全抓。
+- M4 的抓法是 2 项红：`ane` 靠 CLI 提示兜住（它同时是两个合法键的前缀 ⇒ 前缀分支给不出唯一候选）。
+- **全量 `node test.ts`：467 / 462 / 5**。红的 5 项里 3 项是既有基线（`socket.as` 无 Windows socket 后端、`stage94d.as` UTF-16LE、`inline/StackCanary` 本机 clang 差异）；另外 2 项是 `example: air-native`（`ENOENT src/com/greensock/TweenLite.as` 与 `undefined variable Cubic`）——本机工作区里那 352 个文件被删、旁边留了未跟踪的 `com.zip`，与本阶段无关，未擅自恢复。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

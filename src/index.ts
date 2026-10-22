@@ -13,7 +13,7 @@ import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, r
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, cleanObjectScratch, icuDataPaths, writeIcuAssembly, type BuildConfig } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { BuildConfig, Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp, airManifest } from './air-app.ts';
@@ -120,19 +120,6 @@ const KNOWN_FLAGS: readonly string[] = [
   '-I', '-L', '-l', '-D', '--features', '--framework', '--source', '--swc', '--ane',
   '--ane-platform', '--export', '--cflag', '-w', '--version', '-V', '--help', '-h',
 ];
-
-// Plain Levenshtein, two rows of state (no dependency, no per-cell allocation).
-function editDistance(a: string, b: string): number {
-  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
-  for (let i = 1; i <= a.length; i++) {
-    const cur = [i];
-    for (let j = 1; j <= b.length; j++) {
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    prev = cur;
-  }
-  return prev[b.length];
-}
 
 // The nearest known flag, or '' when nothing is close enough to be worth
 // guessing. Two shapes are worth guessing at, and both happen: a misspelling of
