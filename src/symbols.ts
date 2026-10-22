@@ -330,6 +330,36 @@ export const C_RESERVED = new Set<string>([
   'ctime_r', 'asctime_r', 'gmtime_r', 'localtime_r', 'gettimeofday',
 ]);
 
+// FUNCTION-LIKE host macros: a `#define f(a,b) ...` rewrites only a BARE CALL of
+// that exact spelling, never a plain use of the identifier. That makes them a
+// different hazard class from C_RESERVED — and it means the fix belongs in a
+// different place: in the generated C the only bare `name(...)` calls are
+// file-scope FREE FUNCTIONS (instance methods are `Class_method(...)`, a Function
+// value is called through `as_fn`), so renaming just the free-function C symbol is
+// both sufficient and side-effect-free. A local/field spelled `isnan` is emitted
+// verbatim and is harmless precisely because it is never followed by `(`.
+//
+// Measured with the linked header surface (`clang -dM -E` over <math.h>/
+// <string.h>/<stdlib.h>/<stdio.h>/<time.h>/<zlib.h>/<sys/types.h>) — every name
+// below really is a function-like macro there. `min`/`max` are the Windows ones:
+// <windef.h> defines them unless NOMINMAX is set, and the preamble does not set it.
+// Object-like host macros (`near`/`far`/`small`/`_timezone`…) are NOT here: they
+// rewrite the identifier everywhere (struct bodies included), so they cannot be
+// solved by renaming a function — the preamble's `#undef` block handles those.
+// See docs/zh-cn/c-naming.md §4.10.
+export const C_FN_MACRO_RESERVED = new Set<string>([
+  // <math.h> classification macros, all called with one argument like a user helper
+  'isnan', 'isinf', 'isfinite', 'isnormal', 'signbit', 'fpclassify',
+  'isgreater', 'isgreaterequal', 'isless', 'islessequal', 'islessgreater',
+  'isunordered',
+  // <stddef.h>
+  'offsetof',
+  // <sys/types.h> (Darwin reaches these through <zlib.h>)
+  'major', 'minor',
+  // Windows <windef.h>
+  'min', 'max',
+]);
+
 // Sanitize an AS3 identifier into a valid, collision-free C identifier. Prefixes
 // `_` incrementally until the name is neither a C reserved word nor (when a
 // `used` set is supplied) already emitted in this translation unit — Porffor's

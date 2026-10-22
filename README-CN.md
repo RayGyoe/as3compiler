@@ -39,6 +39,11 @@ ActionScript 源码 (.as)
 实现图形（skia/cairo/SDL）等重活时，正确做法是把成熟库**链接**进来（`-lskia`），而不是自研光栅化。
 参见「构建与链接」与 AGENTS.md §2.9。
 
+生成的 C 里，**与宿主符号撞名的 AS3 顶层函数会自动改名**（只改 C 符号，AS3 侧可见名一字不动）：
+`function log()` → `_log`（撞 `<math.h>`）、`function Sprite()` → `_Sprite`（撞类 typedef）、
+`function max()` → `_max`（撞 Windows `#define max(a,b)`）。Windows 上还有一族**对象式宏**
+（`near`/`far`/`small`…）由运行时的 `#undef` 块处理。完整判据与残留在 `docs/zh-cn/c-naming.md`。
+
 ## 运行
 
 安装（得到 `as-aot` 命令）：`npm install -g as3compiler`（或本地开发 `npm link`）。

@@ -105,8 +105,23 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 // real app: AS3 field _timezone hit UCRT <time.h>'s "#define _timezone
 // (*__timezone())" ("field '__timezone' declared as a function") and AS3 field
 // small hit <rpcndr.h>'s "#define small char" ("expected member name or ';' after
-// declaration specifiers"). The generated TU never uses the CRT timezone globals or
-// the legacy 16-bit near/far/small qualifiers, so dropping the macros is lossless.
+// declaration specifiers"); AS3 function near(...) hit <winnt.h>'s "#define near"
+// (its prototype collapsed to  static void (double,double,char*);  -> "expected
+// identifier or '('" in 6 examples). The generated TU never uses the CRT timezone
+// globals or the legacy 16-bit near/far/small/huge/pascal qualifiers, so dropping
+// the macros is lossless.
+//
+// OBJECT-LIKE macros can only be handled HERE, not by renaming: they rewrite every
+// occurrence, and a struct member is emitted bare, so renaming a *function* would
+// leave the field half broken. (FUNCTION-LIKE macros -- min/max/isnan/... -- are
+// the opposite case and are handled by renaming the free function only, see
+// C_FN_MACRO_RESERVED in symbols.ts and docs/zh-cn/c-naming.md §4.10.)
+//
+// The names beyond the six measured above are the rest of the same documented
+// Windows object-like family. Listing them is safe BY CONSTRUCTION (#undef of an
+// undefined name is a no-op) and each was grep-verified not to be used by this
+// preamble or the emitted C; CALLBACK is deliberately absent -- the Win32 path
+// below really calls InitOnceExecuteOnce through a BOOL CALLBACK function.
 #if defined(_WIN32)
 #undef _timezone
 #undef _daylight
@@ -114,6 +129,19 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #undef small
 #undef near
 #undef far
+#undef _small
+#undef _near
+#undef _far
+#undef huge
+#undef _huge
+#undef pascal
+#undef _pascal
+#undef NEAR
+#undef FAR
+#undef PASCAL
+#undef IN
+#undef OUT
+#undef OPTIONAL
 #endif
 
 // __builtin_return_address is a no-op *error* on non-Emscripten wasm (LLVM:

@@ -4,7 +4,7 @@
 import type { Program, Stmt, Expr, ASType, Param, ClassMember, Block } from './ast.ts';
 import { RUNTIME_PREAMBLE } from './runtime.ts';
 import { FRE_BODY, FRE_HEAD, FRE_STUBS, type AneDescriptor } from './fre.ts';
-import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, setGenPos, codegenBareMessage, checkTypeAnnotation } from './symbols.ts';
+import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 import type { SwcResourceSpec, SwcBake } from './swc.ts';
 import type { EmbedResourceSpec } from './embed.ts';
@@ -656,14 +656,44 @@ export class Emitter {
   // `static`, so once their referencing method bodies vanish they vanish too —
   // no manual dependency graph or per-class tree-shaking needed. Only `main`
   // and [WasmExport] symbols stay global (wasm export table / cross-TU glue).
-  // The C name of a top-level free function. Every name maps to itself except
-  // `main`: the emitter hardcodes the C entry point as `int main(void)`, so a
-  // user `function main()` (legal in AIR, and a natural entry-point name) would
-  // otherwise collide with it (`conflicting types for 'main'`). It is renamed at
-  // every emission site -- prototype, definition, call, function value and its
-  // `__call` thunk -- so the user's function stays callable under its own name.
+  // The C name of a top-level free function. Most names map to themselves, but
+  // FOUR classes of AS3 name cannot, each measured on the generated C:
+  //   - `main`: the emitter hardcodes the C entry point as `int main(void)`, so a
+  //     user `function main()` (legal in AIR, and a natural entry-point name) would
+  //     collide with it (`conflicting types for 'main'`).
+  //   - C/libc/libm/POSIX names (`log`, `index`, ...): emitted verbatim, the
+  //     prototype sits next to `<math.h>`'s `log(double)` and clang rejects it
+  //     (`static declaration of 'log' follows non-static declaration`).
+  //   - C TYPE names: a function named after a class (`function Sprite()`) shadows
+  //     the typedef, so both its declaration and every call fail to parse
+  //     (`redefinition of 'Sprite' as different kind of symbol`, then
+  //     `unexpected type name 'Sprite': expected expression`).
+  //   - host function-like macros (`min`/`max`/`isnan`/...): see C_FN_MACRO_RESERVED.
+  // The rename touches ONLY the C symbol: the AS3-visible name is unchanged, so
+  // `var f:Function = log` (the `__call` thunk is renamed too) and the
+  // [WasmExport] JS-facing name still work. Applied at every emission site --
+  // prototype, definition, call, function value and its thunk.
+  private freeCNameCache = new Map<string, string>();
+  private usedFreeCNames = new Set<string>();
   private freeCName(asName: string): string {
-    return asName === 'main' ? 'asc_user_main' : asName;
+    const cached = this.freeCNameCache.get(asName);
+    if (cached !== undefined) return cached;
+    let c = asName === 'main' ? 'asc_user_main' : sanitizeCIdent(asName, this.usedFreeCNames);
+    const types = this.reservedTypeNames();
+    // As in cIdent: `sanitizeCIdent` already reserved the first candidate for this
+    // AS3 name, so only PREPENDS must clear every test (else a second AS3 name
+    // would alias onto the same C symbol).
+    let adjusted = false;
+    for (;;) {
+      const taken =
+        types.has(c) || C_FN_MACRO_RESERVED.has(c) || (adjusted && this.usedFreeCNames.has(c));
+      if (!taken) break;
+      c = '_' + c;
+      adjusted = true;
+    }
+    this.usedFreeCNames.add(c);
+    this.freeCNameCache.set(asName, c);
+    return c;
   }
 
   private staticizeTopLevelFunctions(): void {

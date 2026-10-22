@@ -280,3 +280,74 @@ convention** for that one name: six of its seven emission sites spell it raw and
 declaration) goes through `cIdent`, so any spelling-level reservation would split declaration from use. Closing
 it requires routing every closure-cell emission through one mapping (touches `cellLocal`/`captures`/
 `closureCellEnv`) — a separate project.
+
+## 4.10 Top-Level **Free Function** Name Deconfliction (stage 240, v0.4.205)
+
+The table in §4 has covered **class / method / field / local / parameter / module variable** names since
+stage seventy-six, and `main` has had its own rename (`asc_user_main`, see `examples/user-main.as`) for just as
+long. **Top-level free functions** were the one class left out: their C symbol was the raw AS3 name, so four
+kinds of collision really happened (each measured on the generated C, while `adl`/`mxmlc` run the very same
+source fine => a **legacy defect** by the §1.5 criterion):
+
+| AS3 top-level function | Collides with | clang says |
+|---|---|---|
+| `function log(x:Number)` | `<math.h>`'s `log(double)` | `static declaration of 'log' follows non-static declaration` |
+| `function index(s:String)` | `<string.h>`/`strings.h` legacy alias | same |
+| `function Sprite():int` | a C **type name** (the class typedef `Sprite`) | `redefinition of 'Sprite' as different kind of symbol`, then `unexpected type name 'Sprite': expected expression` at the call |
+| `function max(a,b)` (Windows) | `<windef.h>`'s `#define max(a,b)` | `expected identifier or '('` |
+
+The fix routes `emit.ts`'s `freeCName()` — which used to special-case only `main` — through the same tests as
+`cIdent` (`C_RESERVED` + **type names** + **used set**, prepending `_` step by step), and splits the
+**function-like host macros** into their own `C_FN_MACRO_RESERVED` set. All five emission sites (prototype,
+definition, direct call, Function value, `__call` thunk) go through it, so only the C symbol is renamed and
+**not a single character of the AS3 side moves** (`var f:Function = log` still calls the same function, and the
+`[WasmExport]` JS-facing name is unaffected).
+
+### Why function-like and object-like macros cannot share one fix
+
+- An **object-like macro** (`near`/`far`/`small`/`_timezone`/`_daylight`/`_tzname`, ...) rewrites **every
+  occurrence** of the identifier — struct members included (the generated C puts every AS3 field name verbatim
+  inside the struct). Renaming a *function* cannot fix the field half, so that class is handled by the `#undef`
+  block inside `RUNTIME_PREAMBLE`'s `#if defined(_WIN32)`. This stage widened that block from the six measured
+  names to the rest of the same documented family (`huge`/`_huge`/`pascal`/`_pascal`/`_near`/`_far`/`_small`/
+  `NEAR`/`FAR`/`PASCAL`/`IN`/`OUT`/`OPTIONAL`). **That widening is safe by construction**: `#undef` of an
+  undefined name is a no-op, and every added name was grep-verified unused by the preamble and the emitted C.
+  `CALLBACK` is deliberately absent — the Win32 path really calls `InitOnceExecuteOnce` through a
+  `BOOL CALLBACK` function.
+- A **function-like macro** rewrites only a **bare call** `name(...)`. The only bare calls in the generated C
+  are file-scope free functions (instance methods are `Class_method(...)`, a Function value goes through
+  `as_fn`), so the right place for this class is "rename free functions only" — renaming locals/fields would buy
+  nothing and would needlessly churn a lot of generated text.
+
+`C_FN_MACRO_RESERVED`'s list is **measured**, not copied: `clang -dM -E` over the link-surface headers
+(`<math.h>`/`<string.h>`/`<stdlib.h>`/`<stdio.h>`/`<time.h>`/`<zlib.h>`/`<sys/types.h>`) yields the names that
+really are function-like macros (`isnan`/`isinf`/`isfinite`/`isnormal`/`signbit`/`fpclassify`/`isgreater*`/
+`isless*`/`isunordered`/`offsetof`/`major`/`minor`); Windows `<windef.h>`'s `min`/`max` are added on top.
+
+### Acceptance
+
+- `examples/ident-free-fn.as`: 13 assertions covering the four classes above plus `min`/`max`/`isnan`, the
+  `log`/`_log` deconfliction pair, every function still callable as a Function value, and the user `main()`
+  still callable.
+- `unit: emit/FreeFunctionNameReservation` (11 pins): each C spelling (`_log`/`_index`/`_Sprite`/`_max`/
+  `_isnan`/`__log`) plus proof that **all five emission sites** are renamed (including
+  `as_fn_make(_log__call, …)`).
+- The Windows `#define max(a,b)` mechanism is **verified by contrast** in `temp/freeres/macro_probe.c`: the old
+  spelling under that macro fails with `error: expected identifier or '('`, the new one compiles and returns
+  the right answer. **Stated honestly**: that is mechanism-level verification, not Windows runtime verification
+  (the dev machine is macOS); the object-like half relies on the `#undef` block (`unit:
+  emit/FreeFunctionNameReservation` pins that block's text and that it must NOT undef `CALLBACK`, and
+  `examples/ident-free-fn.as` carries the runtime half on Windows), and was likewise only checked at source
+  level.
+
+### A larger family in the same mould, deliberately **out of scope** here (now registered)
+
+This stage covers top-level free functions only. The same "names the emitter plants itself" idea has a wider
+family at **class-member** granularity: a member's C name is `<Owner>_<member>` and the emitter plants a fixed
+set of `<Owner>_<suffix>` symbols per class, so **any** member whose name equals one of those suffixes collides.
+Measured locally (rc=1, clang reports a redefinition): `cls` (`<Owner>_cls`, the class-registry variable), `vt`,
+`ctor`, `props` and `amf_members` all fail to compile; the `o`/`_this` batch (stage 165) sits at **function
+local** granularity and is already covered by `cIdent`. Closing it means routing the 22 sites that build
+`${owner}_${member}` through one "look up this owner's planted suffixes" mapping — the same kind of work as the
+closure-cell residual at the end of §7 — so it is a **separate project**, registered as its own TODO row
+(stage 240).

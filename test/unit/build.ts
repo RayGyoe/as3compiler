@@ -2956,10 +2956,18 @@ function checkIcuDataDeploy(): string[] {
     // The point: a second build in the SAME output dir is a no-op, not a second
     // CopyFile. Same size + not-older-than-source is the up-to-date test, so the
     // probe stamps a future mtime and then checks it survived.
+    //
+    // Compare the mtime BEFORE and AFTER the call, never against `futures` itself:
+    // APFS stores mtime in 1/1024 ms ticks, so a rounded-back read is X.999 and
+    // `mtimeMs === futures.getTime()` went red at random (2 of 4 runs) while the
+    // file had in fact been left alone. Both sides of this comparison come from the
+    // filesystem, and a real rewrite would stamp "now" (60 s away), so it still
+    // catches the bug the probe is about.
     const futures = new Date(Date.now() + 60_000);
     utimesSync(dst, futures, futures);
+    const stamped = statSync(dst).mtimeMs;
     deploySkiaIcuData(cfg, join(outDir, 'app.exe'));
-    check('a second build does not rewrite an up-to-date file', statSync(dst).mtimeMs === futures.getTime());
+    check('a second build does not rewrite an up-to-date file', statSync(dst).mtimeMs === stamped);
 
     // A stale/truncated destination IS replaced, otherwise a crashed build would
     // poison the directory forever.

@@ -3087,3 +3087,85 @@ function checkTextFieldLongestLine(): string[] {
   return bad;
 }
 registerGroup('unit: emit/TextFieldLongestLine', checkTextFieldLongestLine);
+
+// Top-level FREE FUNCTIONS were the last identifier class outside the C naming
+// sanitizer: `freeCName` returned the raw AS3 name for everything except `main`.
+// Four measured collisions followed (measured on the generated C, and `adl` runs
+// each of these files fine -- §1.5 => 遗留缺陷):
+//   `function log`    vs <math.h>    "static declaration of 'log' follows non-static declaration"
+//   `function index`  vs <string.h>  (legacy BSD alias, same error)
+//   `function Sprite` vs the typedef "redefinition of 'Sprite' as different kind of symbol"
+//   `function max`    vs <windef.h>  `#define max(a,b)` (Windows, NOMINMAX unset)
+// The rename is C-side only, and must reach EVERY emission site, or a call or a
+// Function value would keep naming the clashing symbol. examples/ident-free-fn.as
+// pins the behaviour end to end; this group pins the spellings.
+function checkEmitFreeFunctionNameReservation(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [ffname] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [ffname] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'function log(x:Number):Number { return x * 10; }\n'
+    + 'function _log(x:Number):Number { return x * 100; }\n'
+    + 'function index(s:String):String { return "i:" + s; }\n'
+    + 'function Sprite():int { return 42; }\n'
+    + 'function max(a:Number, b:Number):Number { return a > b ? a : b; }\n'
+    + 'function isnan(x:Number):Boolean { return x !== x; }\n'
+    + 'function helper():int { return 7; }\n'
+    + 'function main():int { return 1; }\n'
+    + 'var v:Number = log(5) + _log(2) + Sprite() + max(1, 2) + (isnan(0) ? 1 : 0);\n'
+    + 'var s:String = index("x");\n'
+    + 'var f:Function = log;\n'
+    + 'trace("" + v + s + helper() + main() + f(3));\n')).c;
+
+  // The prototypes must not spell a libc/libm/typedef/host-macro name.
+  check('a free function named `log` is emitted as `_log`',
+    c.includes('static double _log(double x);'));
+  check('no prototype is left spelled `log`',
+    !/\bdouble log\(double x\)/.test(c) && !/\bstatic double log\(/.test(c));
+  check('a free function named `index` is emitted as `_index`',
+    c.includes('static char* _index(char* s);'));
+  check('a free function named after a C TYPE is renamed (`Sprite` -> `_Sprite`)',
+    c.includes('static int _Sprite();') && !/\bstatic int Sprite\(\)/.test(c));
+  check('function-like host macros are avoided (`max`/`isnan` -> `_max`/`_isnan`)',
+    c.includes('static double _max(double a, double b);') && c.includes('static bool _isnan(double x);'));
+  check('a name that does not collide is left alone',
+    c.includes('static int helper();'));
+
+  // The P2 used-set: `log` claimed `_log`, so `_log` must climb to `__log` --
+  // otherwise the two AS3 functions would share one C symbol.
+  check('the sanitize collision pair `log`/`_log` maps to `_log`/`__log`',
+    c.includes('static double _log(double x);') && c.includes('static double __log(double x);'));
+
+  // Every emission site must use the renamed symbol, not just the prototype.
+  check('the definition is renamed too',
+    c.includes('static double _log(double x) {'));
+  check('the call site is renamed',
+    c.includes('_log(((double)(5)))') && c.includes('__log(((double)(2)))'));
+  check('the Function-value thunk is renamed (`__call` names the same symbol)',
+    c.includes('_log__call') && c.includes('as_fn_make(_log__call'));
+
+  // `main` keeps its bespoke rename (user-main.as is the end-to-end pin).
+  check('a user `main()` still becomes `asc_user_main`',
+    c.includes('static int asc_user_main()') && c.includes('int main(void) {'));
+
+  // The OTHER half of the same defect: object-like Windows macros (`#define small
+  // char`) rewrite a struct member wherever it appears, so renaming a function
+  // cannot fix them — the preamble's `#undef` block does. Pinned at source level
+  // because the block is `#if defined(_WIN32)`-guarded and this suite runs on
+  // macOS; `examples/ident-free-fn.as` carries the runtime half on Windows.
+  const undef = /#if defined\(_WIN32\)([\s\S]*?)#endif/.exec(RUNTIME_PREAMBLE);
+  const block = undef ? undef[1] : '';
+  check('the preamble has a _WIN32 #undef block for object-like host macros', block.includes('#undef _timezone'));
+  check('it covers the measured `small` case', block.includes('#undef small'));
+  check('it covers the measured `near`/`far` case', block.includes('#undef near') && block.includes('#undef far'));
+  check('it does NOT undef CALLBACK (the Win32 path really uses BOOL CALLBACK)',
+    !block.includes('#undef CALLBACK'));
+
+  console.log(`     [ffname] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/FreeFunctionNameReservation', checkEmitFreeFunctionNameReservation);
