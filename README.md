@@ -203,7 +203,7 @@ makes it get picked up automatically, so `adl` keeps using the original ANE and 
 Build manifest (JSON) fields: `target` (`native`/`wasm`), `package` (`raw`/`xcode-project`/`android-project`/`web`,
 default `raw`, see `compile.md` §6), `c-compiler`, `opt`, `debug-info` (keep debug info, default `false`, see below),
 `sources` (additional C/C++ sources),
-`include-paths`, `link-libs`, `link-paths`, `defines`, `objects` (precompiled `.o`), `exports` (C symbols exported to the .wasm export table),
+`include-paths`, `link-libs`, `link-paths`, `defines`, `c-flags` (flags handed verbatim to the C compiler; CLI spelling `--cflag <f>` / `-w`, applied to every compile and link step), `objects` (precompiled `.o`), `exports` (C symbols exported to the .wasm export table),
 `ane-paths` (a list of `.ane` paths to load, see "ANE loading" above), `ane-platform` (overrides the platform entry name,
 derived from the build target by default, e.g. `Windows-x86-64`),
 `swc-paths` (a list of `.swc` libraries; their **named bitmap assets** are extracted at compile time, re-encoded to PNG after un-premultiplying,

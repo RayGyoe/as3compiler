@@ -14399,6 +14399,51 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 **五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——`System.exit` 从未进过本表（它只在
 `asaotui/compiler-gaps.md` 的 G1 里），且按 §1.5 属增强、不占遗留表。按表内实际行数重数仍为 **100 项**。
 
+### 阶段二百四十六：C 编译器旗标透传（`--cflag` / `-w` / 清单 `c-flags`）（v0.4.209 → v0.4.210）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+`asaotui/compiler-gaps.md` 的 **G4**：`-w` 报 `unknown argument: -w`。动机是**纯噪音**——Windows CRT 把
+`getenv`/`fopen` 标成 deprecated，我们生成的每个 C 都带这条告警，而**没有任何开关**能压掉（改 preamble 去用
+`_dupenv_s` 会把 POSIX 路径分叉，不值得）。本阶段先把它量清楚：`examples/any-add.as` 不加旗标 **69 条
+`warning:`**，加 `-w` 后 **0 条**。
+
+判定：**增强/工具链**（AIR 里没有「透传 C 编译器旗标」这个概念），不占遗留表。
+
+**二、落地**（`src/index.ts` + `src/build.ts`）
+
+- **CLI**：`--cflag <flag>`（可重复）+ `-w` 糖（等价 `--cflag -w`）。`--cflag` 的实参**刻意不走 `value()`**：
+  那个助手会拒绝 `KNOWN_FLAGS` 里的名字（为的是 `-o --dry` 不会把开关吃成输出名），而这里要的恰恰是 C 级旗标，
+  `-w` 本身现在也是我们的开关；唯一还算错的只剩「行尾没有实参」，单独报。这条取舍写在代码注释里，不是默会知识。
+- **清单**：`c-flags: string[]`。顶层 **append**（CLI 的 `-w` 与清单的 `-Wno-…` 可以并存），`targets.<目标>` 块
+  **replace**（阶段八十九·五十 的分层规则）。`TARGET_LAYER_FIELDS` 同步登记，写错字段名照旧报错。
+- **三个命令构造器全覆盖**：`buildCompileCommand`（native 单文件 + wasm）、`buildCompileSteps`（native 的
+  C 编译 / C++ 胶水 / 链接三步）、`buildWebCompileSteps`（emcc 的编译与链接）。位置在**对象与 `-l` 之前**——
+  `-Wl,--as-needed` 这类链接旗标对顺序敏感。缺其中任何一个都是「静默的部分生效」，那正是下面每组钉子要打的靶。
+- **默认空** ⇒ 不写旗标的构建与以前**逐字节相同**（§1.5）。
+
+**三、验证**
+
+- 新钉 `unit: build/CFlags`（**14 条**）：默认无旗标；两个旗标都到达 native / wasm / C++ 三步 / emcc 每一步；
+  顺序在对象与库之前；清单 append；分层 replace；`--dry` 打印的命令里确有 `-w`；`-w` 与 `--cflag -w`
+  **逐字符相同**（不是「也能用」）；`--cflag` 接受自家的开关；行尾缺实参**报错并点名**；不写旗标就不多出旗标。
+- **活体两测**：`--cflag -fno-such-flag-xyz` 让构建**失败**并打出 `clang: error: unknown argument:
+  '-fno-such-flag-xyz'`（这是「旗标真的到了编译器」的唯一硬证据，不是 `--dry` 的纸面）；`-w` 把 69 条告警压到 0 条。
+- **变异 3/3 全部被抓**：撤 `buildCompileSteps` 的注入（三步钉转红）、撤 `-w` 糖（「逐字符相同」转红）、
+  把 `--cflag` 改回 `value()`（「接受自家开关」转红）。每步按 sha256 校验还原。
+- **既有钉未破**：`unit: cli/ArgErrors` 15 条全绿——它按解析链与 `KNOWN_FLAGS` **双向**比对，新增的两个名字两边都在。
+
+**四、如实报明 / 残差**
+
+- **只透传，不做白名单也不做别名**：写错的旗标由**编译器**报，我们只保证它到得了。`--cflag --dry` 这种
+  「把我们的开关当 C 旗标」不会被拦下（代价换 `-w` 能直接写）——已写进注释与文档，不留给读者猜。
+- **没有 `examples/*.as`**：这是构建旗标，AS3 侧没有可观察行为；等价的可执行回归是 `unit: build/CFlags` 里
+  那两条 `--dry` 断言 + 上面的活体构建。按 DoD「示例 + 断言回归」折算，钩在这里。
+- 文档三处同步：`--help`、`docs/zh-cn/compile.md`（CLI 段 + 清单字段表）、`docs/en/compile.md` 同两处、
+  两个 README 的清单字段串。
+
+**五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**（属增强/工具链，按 §1.5 不占遗留表）。按表内实际行数重数仍为 **100 项**。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

@@ -137,6 +137,9 @@ Options:
                  <appDir>/lib then <appDir>/ext-folder — see docs/zh-cn/ane.md §3.6)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
+  --cflag <f>    extra C compiler flag for every compile AND link step (repeatable;
+                 passed through verbatim, e.g. --cflag -fno-strict-aliasing)
+  -w             shorthand for --cflag -w (silence warnings)
   --debug-info   keep DWARF: add -g to every backend and stop stripping it from the
                  default wasm build (default: off — artifacts carry no debug info; see §4.3)
   --dry          emit C and print the compile command without compiling
@@ -647,6 +650,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `link-libs` | string[] | 链接库（→ `-l`） |
 | `link-paths` | string[] | 库搜索路径（→ `-L`） |
 | `defines` | string[] | 预处理宏（→ `-D`） |
+| `c-flags` | string[] | **原样透传**给 C/C++ 编译器的旗标（`--cflag <f>` / `-w` 的清单写法）。落在**每一个**编译步骤与链接步骤上（C 源、C++ 胶水层、链接），位置在对象与 `-l` 库**之前**（`-Wl,--as-needed` 这类链接旗标对顺序敏感）。**不做白名单**：编译器不认的旗标必须让构建**响亮的失败**——那正是「旗标真的到了编译器」的唯一证据。默认空 ⇒ 不写就与以前的产物逐字节相同。顶层 append（CLI 与清单可并存）、`targets.<目标>` 块 replace（按 §4.1 的规则） |
 | `features` | string[] | **具名增强开关**（§3.4.2），如 `["svg"]`。默认空。未知名字报错；开了会在构建横幅里点名，不开则产物与 `adl` 同构。`--features` 在 CLI 侧是**替换**整个集合（`-D` 才是追加） |
 | `objects` | string[] | 预编译 `.o` 直接加入链接 |
 | `frameworks` | string[] | macOS 框架（→ `-framework X`，Skia 的 CoreText/CoreGraphics 后端需要）。**只在 `darwin` + `target=native` 上发射**：其他宿主静默丢弃（不报错），因此同一份清单可以同时写着 `Cocoa`/`Metal` 与 `gdi32`（后者走 `link-libs` 的 `${win:}`，见 §4.1.1）；以前在 Windows 上它们会被当成**输入文件**丢给链接器，报 `lld-link: could not open 'Cocoa'` |

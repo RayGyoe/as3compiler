@@ -219,7 +219,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 构建清单（JSON）字段：`target`（`native`/`wasm`）、`package`（`raw`/`xcode-project`/`android-project`/`web`，
 默认 `raw`，见 `compile.md` §6）、`c-compiler`、`opt`、`debug-info`（保留调试信息，默认 `false`，见下）、
 `sources`（额外 C/C++ 源）、
-`include-paths`、`link-libs`、`link-paths`、`defines`、`objects`（预编译 `.o`）、`exports`（导出到 .wasm 导出表的 C 符号）、
+`include-paths`、`link-libs`、`link-paths`、`defines`、`c-flags`（原样透传给 C 编译器的旗标，清单写法；CLI 是 `--cflag <f>` / `-w`，落在每个编译与链接步骤上）、`objects`（预编译 `.o`）、`exports`（导出到 .wasm 导出表的 C 符号）、
 `ane-paths`（要加载的 `.ane` 路径清单，见上「ANE 加载」）、`ane-platform`（覆盖平台条目名，
 默认按构建目标推导，如 `Windows-x86-64`）、
 `swc-paths`（`.swc` 库清单；其中的**命名位图资源**在编译期提取、反预乘后重编码为 PNG 内嵌进产物，

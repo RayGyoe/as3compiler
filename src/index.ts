@@ -111,7 +111,7 @@ const KNOWN_FLAGS: readonly string[] = [
   '--main-class', '--all-sources', '--include-third-party', '--extdir', '--json', '--fix',
   '--check-update', '--verbose', '-v', '--opt', '--debug-info', '--lto', '--pgo', '--pgo-dir',
   '-I', '-L', '-l', '-D', '--features', '--framework', '--source', '--swc', '--ane',
-  '--ane-platform', '--export', '--version', '-V', '--help', '-h',
+  '--ane-platform', '--export', '--cflag', '-w', '--version', '-V', '--help', '-h',
 ];
 
 // Plain Levenshtein, two rows of state (no dependency, no per-cell allocation).
@@ -160,7 +160,7 @@ function suggestFlag(arg: string): string {
 
 function parseArgs(argv: string[], doctorMode = false): Options {
   const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, extDirs: [], overrides: {}, doctor: doctorMode, doctorJson: false, doctorFix: false, doctorVerbose: false, doctorCheckUpdate: false };
-  const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths' | 'anePaths', v: string): void => {
+  const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'cFlags' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths' | 'anePaths', v: string): void => {
     (opts.overrides[key] ??= [] as string[]).push(v);
   };
   // Every value-taking flag reads its operand through here rather than inline
@@ -218,6 +218,26 @@ function parseArgs(argv: string[], doctorMode = false): Options {
     else if (a === '-L') push('linkPaths', value('-L'));
     else if (a === '-l') push('linkLibs', value('-l'));
     else if (a === '-D') push('defines', value('-D'));
+    // Raw C compiler flags, appended to every compile AND link step (阶段二百四十六).
+    // `-w` is a flag of its own because it is the one everybody reaches for (the
+    // Windows CRT's deprecated-declaration noise); `--cflag` is the general form
+    // for anything the compiler understands. Neither is validated here -- a flag
+    // the compiler rejects has to fail the build loudly, which is the only proof
+    // it reached the compiler at all.
+    //
+    // This operand deliberately does NOT go through value(): that helper refuses
+    // anything already in KNOWN_FLAGS (so `-o --dry` cannot silently name the
+    // output after a flag), but the whole point here is C-level flags, and `-w`
+    // IS one of ours now. The only mistake left is a missing operand at the end
+    // of the line, which is what this checks.
+    else if (a === '--cflag') {
+      const v = argv[++i];
+      if (v === undefined) {
+        throw new Error('--cflag: expects a value, but it is the last argument (see `as-aot --help`)');
+      }
+      push('cFlags', v);
+    }
+    else if (a === '-w') push('cFlags', '-w');
     // --features <a,b>: named enhancement switches (AIR supersets, §1.5).
     // Repeatable and/or comma-separated; `none` clears. Stored raw here — the
     // `none`-vs-absent distinction is resolved in main(), because it decides
@@ -299,6 +319,9 @@ function usage(): string {
     '  -L <dir>       library search path (repeatable)',
     '  -l <lib>       link library (repeatable)',
     '  -D <macro>     preprocessor define (repeatable)',
+    '  --cflag <f>    extra C compiler flag for every compile AND link step (repeatable;',
+    '                 passed through verbatim, e.g. --cflag -fno-strict-aliasing)',
+    '  -w             shorthand for --cflag -w (silence warnings)',
   '  --features <list> enable an AIR-superset enhancement (comma-separated, repeatable;',
   '                 `none` clears). Default builds stay AIR-identical.',
   `                 known: ${knownFeatures().join(', ')} (see docs/zh-cn/enhancements.md)`,
@@ -727,7 +750,7 @@ async function main(): Promise<void> {
   // Unlike -D (which appends to the manifest's defines), --features REPLACES the
   // set: see resolveFeatures for why.
   if (explicitFeatures) cfg.features = explicitFeatures;
-  for (const k of ['includePaths', 'linkLibs', 'linkPaths', 'defines', 'exports', 'frameworks', 'sources', 'swcPaths', 'anePaths'] as const) {
+  for (const k of ['includePaths', 'linkLibs', 'linkPaths', 'defines', 'cFlags', 'exports', 'frameworks', 'sources', 'swcPaths', 'anePaths'] as const) {
     const extra = opts.overrides[k];
     if (extra) cfg[k].push(...extra);
   }

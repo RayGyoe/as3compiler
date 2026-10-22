@@ -136,6 +136,9 @@ Options:
                  display tree at compile time (repeatable; see docs/zh-cn/swc.md §5/§6/§9)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
+  --cflag <f>    extra C compiler flag for every compile AND link step (repeatable;
+                 passed through verbatim, e.g. --cflag -fno-strict-aliasing)
+  -w             shorthand for --cflag -w (silence warnings)
   --debug-info   keep DWARF: add -g to every backend and stop stripping it from the
                  default wasm build (default: off — artifacts carry no debug info; see §4.3)
   --dry          emit C and print the compile command without compiling
@@ -718,6 +721,7 @@ kebab-case.
 | `link-libs` | string[] | Libraries to link (→ `-l`) |
 | `link-paths` | string[] | Library search paths (→ `-L`) |
 | `defines` | string[] | Preprocessor macros (→ `-D`) |
+| `c-flags` | string[] | Flags forwarded **verbatim** to the C/C++ compiler (the manifest form of `--cflag <f>` / `-w`). They land on **every** compile step and the link step (C source, C++ glue, link), positioned **before** the objects and `-l` libraries (link flags such as `-Wl,--as-needed` are order sensitive). There is **no allow-list**: a flag the compiler does not understand must fail the build loudly — that is the only proof the flag really reached the compiler. Empty by default, so a build that names none is byte-for-byte what it was. Top level appends (so CLI and manifest can coexist); a `targets.<target>` block replaces (§4.1's rule) |
 | `features` | string[] | **Named enhancement switches** (§3.4.2), e.g. `["svg"]`. Empty by default. An unknown name is an error; when on, the build banner names it, and when off the artifact matches `adl`. On the CLI `--features` **replaces** the whole set (`-D` is the one that appends) |
 | `objects` | string[] | Precompiled `.o` added directly to the link |
 | `frameworks` | string[] | macOS frameworks (→ `-framework X`, needed for Skia's CoreText/CoreGraphics backend) |

@@ -1126,6 +1126,88 @@ registerGroup('unit: build/ManifestLayering', checkManifestLayering);
 registerGroup('unit: build/PreloadExcludes', checkPreloadExcludes);
 registerGroup('unit: build/PreloadOutputDir', checkPreloadOutputDir);
 registerGroup('unit: build/PerfFlags', checkPerfFlags);
+
+// ---- 阶段二百四十六: raw C compiler flags (--cflag / -w / `c-flags`) ----
+//
+// A passthrough is only worth anything if the flag lands on the argv the user's
+// compiler actually receives, on EVERY step: a `-w` that reaches the final link
+// but not the compile steps silences nothing, and one that reaches the C steps
+// but not the C++ glue layer misses the noise in `vendor/*.cc`. So this drives
+// the real command builders, exactly like unit: build/PerfFlags does for LTO.
+function checkCFlags(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [cflags] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [cflags] ${label}`); }
+  };
+  const has = (argv: string[], flag: string): boolean => argv.includes(flag);
+
+  const base = defaultBuildConfig();
+  // Off by default: no flag means the byte-for-byte build it always was (§1.5).
+  check('the default config carries no C flags', Array.isArray(base.cFlags) && base.cFlags.length === 0);
+  check('…and the default command has none either',
+    !has(buildCompileCommand(base, 'x.c', 'x'), '-w'));
+
+  const c = { ...base, cFlags: ['-w', '-fno-strict-aliasing'] };
+  const native = buildCompileCommand(c, 'x.c', 'x');
+  check('both flags reach the native compile+link command',
+    has(native, '-w') && has(native, '-fno-strict-aliasing'));
+  // Position matters on the LINK line: `-Wl,--as-needed` and friends are order
+  // sensitive, so a user flag has to precede the objects and the -l libs.
+  const linkOrder = buildCompileCommand({ ...c, objects: ['obj.o'], linkLibs: ['foo'] }, 'x.c', 'x');
+  check('…before the objects and libraries on the link line',
+    linkOrder.indexOf('-fno-strict-aliasing') < linkOrder.indexOf('obj.o')
+    && linkOrder.indexOf('obj.o') < linkOrder.indexOf('foo'));
+  check('…and the wasm command too', has(buildCompileCommand({ ...c, target: 'wasm' }, 'x.c', 'x'), '-w'));
+
+  // The C++ path has three steps (C compile, C++ glue compile, link) and a flag
+  // missing from any of them is a silently partial build.
+  const steps = buildCompileSteps({ ...c, sources: ['a.cc'] }, 'x.c', 'x');
+  check('native C++ build: every step (C compile, C++ compile, link) carries them',
+    steps.length === 3 && steps.every((argv) => has(argv, '-w') && has(argv, '-fno-strict-aliasing')));
+  const web = buildWebCompileSteps({ ...c, target: 'wasm', package: 'web', sources: ['a.cc'] }, 'x.c', 'x');
+  check('web build: every step carries them',
+    web.length > 0 && web.every((argv) => has(argv, '-w')));
+
+  // Manifest plumbing: the top-level field APPENDS (so a CLI flag and a manifest
+  // can coexist), while a targets.<target> block REPLACES (stage 89-50's rule).
+  const m = { 'c-flags': ['-Wno-unused-parameter'] } as Manifest;
+  const merged = applyManifest({ ...base, cFlags: ['-w'] }, m, join(root, 'temp', 'cflags', 'm.json'));
+  check('a manifest c-flags APPENDS to the config (nothing is dropped)',
+    merged.cFlags.length === 2 && merged.cFlags[0] === '-w' && merged.cFlags[1] === '-Wno-unused-parameter');
+  const layered = applyManifestOverlay({ ...base, cFlags: ['-w'] },
+    { targets: { native: { 'c-flags': ['-O0'] } } } as Manifest, join(root, 'temp', 'cflags', 'm.json'), 'native');
+  check('a targets.<target> block REPLACES them (per-target layering rule)',
+    layered.cFlags.length === 1 && layered.cFlags[0] === '-O0');
+
+  // CLI surface, read from the argv a --dry run prints (no compiler involved).
+  const scratch = join(root, 'temp', 'cflags');
+  mkdirSync(scratch, { recursive: true });
+  const cliDry = (extra: string[]): string => {
+    const r = spawnSync(process.execPath, [join(root, 'src', 'index.ts'), join(dir, 'any-add.as'),
+      '--dry', '-o', join(scratch, 'out'), ...extra], { cwd: root, encoding: 'utf8' });
+    return `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  };
+  const line = (out: string): string => out.split(/\r?\n/).find((l) => l.includes('-ffp-contract') || l.includes(' cc ') || l.includes('clang')) ?? '';
+  const viaCflag = line(cliDry(['--cflag', '-w']));
+  check('--cflag -w puts -w on the printed compile command', /(^| )-w( |$)/.test(viaCflag));
+  // The sugar must produce the SAME command, not merely "also work".
+  check('-w is exactly --cflag -w', line(cliDry(['-w'])) === viaCflag);
+  // `-w` is itself a known CLI flag now, and the --cflag operand deliberately
+  // skips the "this looks like a flag" guard -- the whole point is C-level flags.
+  check('--cflag accepts an operand that is one of our own flags',
+    viaCflag !== '' && !cliDry(['--cflag', '-w']).includes('expects a value'));
+  check('--cflag with no operand left is refused, naming the flag',
+    cliDry(['--cflag']).includes('--cflag: expects a value'));
+  // Nothing is invented: a flag the user did not write never appears.
+  const plain = line(cliDry([]));
+  check('a run with no flag prints no extra flag', plain !== '' && !/(^| )-w( |$)/.test(plain));
+
+  if (ok > 0) console.log(`[cflags] ${ok} C-flag passthrough checks passed`);
+  return bad;
+}
+registerGroup('unit: build/CFlags', checkCFlags);
 registerGroup('unit: build/DebugInfo', checkDebugInfo);
 registerGroup('unit: build/Features', checkFeatures);
 registerGroup('unit: build/WasmExport', checkWasmExport);

@@ -75,6 +75,21 @@ export interface BuildConfig {
   linkLibs: string[];
   linkPaths: string[];
   defines: string[];
+  // Raw flags forwarded verbatim to the C/C++ compiler (and the link line) on
+  // EVERY step of the build -- `--cflag <flag>` / `-w` on the CLI, `c-flags` in
+  // a manifest (阶段二百四十六).
+  //
+  // The motivating case is `-w`: the Windows CRT marks `getenv`/`fopen` as
+  // deprecated, and every generated build prints that noise with no way to turn
+  // it off (`-Wno-deprecated-declarations` did not exist either, and patching the
+  // preamble to use `_dupenv_s` would fork the POSIX path). This is a passthrough,
+  // not a curated flag list: what the compiler understands is the user's business,
+  // and a flag the compiler rejects must fail the build loudly (that is the proof
+  // it really reached the compiler -- pinned in `unit: build/CFlags`).
+  //
+  // Empty by default, so a build that names no flag is byte-for-byte the build it
+  // was before (§1.5's default-artifact rule).
+  cFlags: string[];
   // Named enhancement switches (--features, manifest `features`).
   //
   // These are NOT defines the user spells out: a feature is an AIR-superset
@@ -166,6 +181,7 @@ export function defaultBuildConfig(): BuildConfig {
     linkLibs: [],
     linkPaths: [],
     defines: [],
+    cFlags: [],
     features: [],
     objects: [],
     frameworks: [],
@@ -203,6 +219,7 @@ interface ManifestFields {
   'link-libs'?: string[];
   'link-paths'?: string[];
   defines?: string[];
+  'c-flags'?: string[];
   features?: string[];
   objects?: string[];
   frameworks?: string[];
@@ -240,7 +257,7 @@ interface Manifest extends ManifestFields {
 const TARGET_LAYER_FIELDS: ReadonlySet<string> = new Set([
   'c-compiler', 'opt', 'sources', 'include-paths', 'link-libs', 'link-paths',
   'defines', 'features', 'objects', 'frameworks', 'exports', 'font-urls',
-  'preload-paths', 'preload-excludes',
+  'preload-paths', 'preload-excludes', 'c-flags',
   'debug-info', 'lto', 'pgo', 'pgo-dir',
   'swc-paths',
   'ane-paths', 'ane-platform',
@@ -323,6 +340,9 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m['link-libs']) next.linkLibs = [...cfg.linkLibs, ...T(m['link-libs'])];
   if (m['link-paths']) next.linkPaths = [...cfg.linkPaths, ...T(m['link-paths']).map((p) => resolveFromManifest(manifestPath, p))];
   if (m.defines) next.defines = [...cfg.defines, ...T(m.defines)];
+  // Flags have no path semantics, so they are passed through verbatim -- a
+  // `-Wl,-rpath,/x` or `-fuse-ld=` would be mangled by any "resolve" step.
+  if (m['c-flags']) next.cFlags = [...cfg.cFlags, ...T(m['c-flags'])];
   if (m.features) next.features = [...cfg.features, ...T(m.features)];
   if (m.objects) next.objects = [...cfg.objects, ...T(m.objects).map((p) => resolveFromManifest(manifestPath, p))];
   if (m.frameworks) next.frameworks = [...cfg.frameworks, ...T(m.frameworks)];
@@ -403,6 +423,7 @@ export function applyManifestOverlay(cfg: BuildConfig, m: Manifest, manifestPath
   if (L['link-libs']) next.linkLibs = T(L['link-libs']);
   if (L['link-paths']) next.linkPaths = T(L['link-paths']).map((p) => resolveFromManifest(manifestPath, p));
   if (L.defines) next.defines = T(L.defines);
+  if (L['c-flags']) next.cFlags = T(L['c-flags']);
   if (L.features) next.features = T(L.features);
   if (L.objects) next.objects = T(L.objects).map((p) => resolveFromManifest(manifestPath, p));
   if (L.frameworks) next.frameworks = T(L.frameworks);
@@ -1165,6 +1186,10 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
   for (const s of cfg.sources) args.push(s);
   for (const p of cfg.includePaths) args.push('-I', p);
   for (const d of effectiveDefines(cfg)) args.push('-D', d);
+  // User flags go after the curated ones and before the sources/objects/libs, so
+  // a `-Wl,…` here still precedes the archives it refers to; a duplicate flag is
+  // the compiler's to resolve (last one wins for clang).
+  for (const f of cfg.cFlags) args.push(f);
   for (const o of cfg.objects) args.push(o);
   for (const p of cfg.linkPaths) args.push('-L', p);
   for (const l of cfg.linkLibs) args.push('-l', l);
@@ -1336,6 +1361,7 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
   const compileCommon: string[] = [...nativeTargetFlags(cfg), cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const d of effectiveDefines(cfg)) compileCommon.push('-D', d);
   for (const p of cfg.includePaths) compileCommon.push('-I', p);
+  for (const f of cfg.cFlags) compileCommon.push(f);
 
   const steps: string[][] = [];
   // 0) ICU data blob (text builds only): assemble the vendored 0.80 MB data set
@@ -1369,6 +1395,7 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
     '-o',
     outPath,
   ];
+  for (const f of cfg.cFlags) linkArgs.push(f);
   for (const f of cFiles) linkArgs.push(objOf(f));
   for (const f of cppFiles) linkArgs.push(objOf(f));
   // Before the -l flags: this is what keeps the archives' 10.19 MB ICU data
@@ -1578,6 +1605,7 @@ export function buildWebCompileSteps(cfg: BuildConfig, cPath: string, base: stri
   const compileCommon: string[] = [cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const d of effectiveDefines(cfg)) compileCommon.push('-D', d);
   for (const p of cfg.includePaths) compileCommon.push('-I', p);
+  for (const f of cfg.cFlags) compileCommon.push(f);
   // USE_ZLIB must be on the *compile* steps too (not just the link): the
   // generated .c's RUNTIME_PREAMBLE does `#include <zlib.h>` and emcc only
   // adds that header's include path when USE_ZLIB is set.
@@ -1599,6 +1627,7 @@ export function buildWebCompileSteps(cfg: BuildConfig, cPath: string, base: stri
   }
 
   const linkArgs: string[] = [emcc, cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
+  for (const f of cfg.cFlags) linkArgs.push(f);
   for (const f of cFiles) linkArgs.push(objOf(f));
   for (const f of cppFiles) linkArgs.push(objOf(f));
   for (const o of cfg.objects) linkArgs.push(o);
