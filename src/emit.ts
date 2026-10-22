@@ -1841,9 +1841,33 @@ export class Emitter {
     this.line('return s;');
     this.indent--;
     this.line('}');
+    // The error-message builders below keep their parts table in THREAD-LOCAL
+    // storage instead of on the stack. They are the cold half of guards the
+    // emitter splices into hot code (as_v_req_inst, the as_object_set tag arms,
+    // the Vector coerce_any/argc wrappers), and clang inlines them liberally: an
+    // AUTOMATIC parts[] in an inlined copy makes Apple clang's default
+    // -fstack-protector plant a canary in the caller. benchmarks/oop's
+    // as_v_req_inst runs 20M times, and that canary alone was ~+12% (v0.4.203
+    // measured 102 ms against the v0.4.143 build's 91 ms; the same generated C
+    // rebuilt with -fno-stack-protector timed 89 ms). Marking the tables
+    // thread-local removed the array from the locals set, taking the number of
+    // canary-bearing functions in oop's generated C from 533 back to 53 (the
+    // v0.4.143 build emitted 50).
+    //
+    // Thread-local rather than merely static: the runtime is re-entered from ANE
+    // worker threads, so a bare static table would be shared across them. Within
+    // one thread there is no hazard either way -- each table is filled from
+    // literals and already-computed arguments and consumed by the very next
+    // as_str_concat_n call, and no helper runs a call that could re-enter itself
+    // between the last store and that consume. Helpers that RETURN a message
+    // (as_class_str, Error_toString, the Vector joins) keep their tables on the
+    // stack: a table that outlives the call is exactly where TLS would be wrong.
+    //
+    // unit: inline/StackCanary pins both halves of this (tables are TLS, and the
+    // hot function carries no canary).
     this.line('static void as_throw_sealed_set(const char* key, const char* fqn) {');
     this.indent++;
-    this.line('const char* parts[5];');
+    this.line('static ASC_TLS const char* parts[5];');
     this.line('parts[0] = "Error #1056: Cannot create property ";');
     this.line('parts[1] = key;');
     this.line('parts[2] = " on ";');
@@ -1854,7 +1878,7 @@ export class Emitter {
     this.line('}');
     this.line('static as_value as_throw_sealed_get(const char* key, const char* fqn) {');
     this.indent++;
-    this.line('const char* parts[5];');
+    this.line('static ASC_TLS const char* parts[5];');
     this.line('parts[0] = "Error #1069: Property ";');
     this.line('parts[1] = key;');
     this.line('parts[2] = " not found on ";');
@@ -1890,7 +1914,7 @@ export class Emitter {
     this.line('}');
     this.line('static void as_throw_1034(as_value v, const char* fqn) {');
     this.indent++;
-    this.line('const char* parts[5];');
+    this.line('static ASC_TLS const char* parts[5];');
     this.line('parts[0] = "Error #1034: Type Coercion failed: cannot convert ";');
     this.line('parts[1] = as_v_coerce_src(v);');
     this.line('parts[2] = " to ";');
@@ -1991,7 +2015,7 @@ export class Emitter {
     this.line('void* vt = obj != NULL ? ((as_object_header*)obj)->vtable : NULL;');
     this.line('const char* fqn = vt != NULL ? ((as_vtable_header*)vt)->fqn : NULL;');
     this.line('if (fqn == NULL || fqn[0] == 0) fqn = "Object";');
-    this.line('char* parts[3]; parts[0] = (char*)"Error #1123: Filter operator not supported on type "; parts[1] = (char*)fqn; parts[2] = (char*)".";');
+    this.line('static ASC_TLS char* parts[3]; parts[0] = (char*)"Error #1123: Filter operator not supported on type "; parts[1] = (char*)fqn; parts[2] = (char*)".";');
     this.line('as_throw(TypeError_new(as_str_concat_n(3, parts), 1123));');
     this.line('return as_v_null();');
     this.indent--;
@@ -2109,7 +2133,7 @@ export class Emitter {
     // or a method) is ReferenceError #1074 in AIR (measured via `with (ro) { ro = 6 }`).
     this.line('static void as_throw_readonly(const char* name) {');
     this.indent++;
-    this.line('const char* parts[3];');
+    this.line('static ASC_TLS const char* parts[3];');
     this.line('parts[0] = "Error #1074: Illegal write to read-only property ";');
     this.line('parts[1] = name;');
     this.line('parts[2] = ".";');
@@ -2121,7 +2145,7 @@ export class Emitter {
     // read is a compile error outside `with`, exactly as mxmlc reports it).
     this.line('static as_value as_throw_var_not_defined(const char* name) {');
     this.indent++;
-    this.line('const char* parts[3];');
+    this.line('static ASC_TLS const char* parts[3];');
     this.line('parts[0] = "Error #1065: Variable ";');
     this.line('parts[1] = name;');
     this.line('parts[2] = " is not defined.";');
@@ -2142,7 +2166,7 @@ export class Emitter {
     this.line('}');
     this.line('static void as_throw_delay_range(double delay) {');
     this.indent++;
-    this.line('const char* parts[2];');
+    this.line('static ASC_TLS const char* parts[2];');
     this.line('parts[0] = "Error #2066: The timer delay must be a non-negative number, got ";');
     this.line('parts[1] = as_str_from_double(delay);');
     this.line('as_throw(RangeError_new(as_str_concat_n(2, parts), 2066));');
@@ -2166,7 +2190,7 @@ export class Emitter {
     // per operation; the id list is exhaustive for the ten flash_proxy methods.
     this.line('static as_value as_proxy_throw(const char* mname, int id) {');
     this.indent++;
-    this.line('const char* parts[5];');
+    this.line('static ASC_TLS const char* parts[5];');
     this.line('parts[0] = "Error #";');
     this.line('parts[1] = as_str_from_double((double)id);');
     this.line('parts[2] = ": The Proxy class does not implement ";');
@@ -2183,7 +2207,7 @@ export class Emitter {
     // AVM2's form (this environment's adl only surfaces the short "Error #1006").
     this.line('static as_value as_throw_not_function(const char* name) {');
     this.indent++;
-    this.line('const char* parts[3];');
+    this.line('static ASC_TLS const char* parts[3];');
     this.line('parts[0] = "Error #1006: ";');
     this.line('parts[1] = name != NULL ? name : "value";');
     this.line('parts[2] = " is not a function.";');
@@ -2660,7 +2684,7 @@ export class Emitter {
     // temp/dynnewprobe{,2}: "... on pkg::Bar(). Expected 1, got 3.").
     this.line('static void as_dyn_new_arity_error(as_class* c, int argc) {');
     this.indent++;
-    this.line('const char* parts[7];');
+    this.line('static ASC_TLS const char* parts[7];');
     this.line('parts[0] = "Error #1063: Argument count mismatch on ";');
     this.line('parts[1] = (c->fqn != NULL) ? c->fqn : "";');
     this.line('parts[2] = "(). Expected ";');
@@ -2683,7 +2707,7 @@ export class Emitter {
     // exactly what the thunk generator already uses for the ctor case.
     this.line('static void as_fn_arity_error(const char* qname, int expected, int argc) {');
     this.indent++;
-    this.line('const char* parts[7];');
+    this.line('static ASC_TLS const char* parts[7];');
     this.line('parts[0] = "Error #1063: Argument count mismatch on ";');
     this.line('parts[1] = (qname != NULL) ? qname : "";');
     this.line('parts[2] = "(). Expected ";');
@@ -2822,7 +2846,7 @@ export class Emitter {
     this.indent++;
     this.line('int i = as_class_static_find(c, name);');
     this.line('if (i >= 0 && c->statics[i].addr != NULL && c->statics[i].kind == 2) { as_class_static_write(&c->statics[i], v); return; }');
-    this.line('const char* parts[4];');
+    this.line('static ASC_TLS const char* parts[4];');
     this.line('parts[0] = "Writing ";');
     this.line('parts[1] = name;');
     this.line('parts[2] = " through a Class value is not supported by this subset";');
@@ -2834,7 +2858,7 @@ export class Emitter {
     this.indent++;
     this.line('int i = as_class_static_find(c, name);');
     this.line('if (i >= 0 && c->statics[i].kind == 1) return c->statics[i].fn(NULL, args, argc);');
-    this.line('const char* parts[3];');
+    this.line('static ASC_TLS const char* parts[3];');
     this.line('parts[0] = "Error #1006: ";');
     this.line('parts[1] = name;');
     this.line('parts[2] = " is not a function.";');
@@ -3047,7 +3071,7 @@ export class Emitter {
     this.line('if (*p == \'.\' || *p == \':\') last = p + 1;');
     this.indent--;
     this.line('}');
-    this.line('const char* parts[3];');
+    this.line('static ASC_TLS const char* parts[3];');
     this.line('parts[0] = "Error #1065: Variable ";');
     this.line('parts[1] = last;');
     this.line('parts[2] = " is not defined.";');
@@ -24236,7 +24260,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.line(`if (v.tag == 6) return as_vector_${key}_from_array((as_array*)v.ptr);`);
       this.line('if (v.tag != 4 || v.ptr == NULL) {');
       this.indent++;
-      this.line('const char* parts[5];');
+      this.line('static ASC_TLS const char* parts[5];');
       this.line('parts[0] = "Error #1034: Type Coercion failed: cannot convert ";');
       this.line('parts[1] = as_coerce_operand_str(v);');
       this.line('parts[2] = " to ";');
@@ -24272,7 +24296,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       // `Vector.<int>()` (note the double space AIR prints after the period).
       this.line(`as_vector_${key}* as_vector_${key}_coerce_argc(int got) {`);
       this.indent++;
-      this.line('const char* parts[4];');
+      this.line('static ASC_TLS const char* parts[4];');
       this.line('parts[0] = "Error #1112: Argument count mismatch on class coercion.  Expected 1, got ";');
       this.line('parts[1] = as_str_from_double((double)got);');
       this.line('parts[2] = ".";');

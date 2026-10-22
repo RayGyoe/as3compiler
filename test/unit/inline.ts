@@ -262,3 +262,106 @@ function checkAuditGateGuard(): string[] {
   return bad;
 }
 registerGroup('unit: inline/AuditGate', checkAuditGateGuard);
+
+// A fourth shape of the same failure mode, this one arriving through the stack
+// protector rather than through the call count. Apple clang turns
+// -fstack-protector ON by default, and the canary is driven by the locals set:
+// one automatic ARRAY in a function is enough. The cold error-message builders
+// (as_throw_1034, as_throw_sealed_set, as_fn_arity_error, ...) each end their
+// message with a `const char* parts[N]` table, and clang inlines them into the
+// guards the emitter splices into hot code. From v0.4.144 to v0.4.203 that
+// inlining turned as_v_req_inst -- called 20M times by benchmarks/oop -- into a
+// canary-checked function with a 64-byte frame (v0.4.143: 78 instructions and no
+// canary; v0.4.203: 102 instructions and a canary). oop's AOT number went
+// 91 ms -> 102 ms, and 533 functions in its generated C carried a canary against
+// 50 before.
+//
+// The fix marks those tables ASC_TLS (thread-local) so the array leaves the
+// locals set. The generated C still inlines the builders, so the caller keeps a
+// few instructions of bloat, but the canary -- and its per-call cost -- is gone
+// (533 -> 53 canary-bearing functions). The assembly half below is the real
+// guard: it asserts the hot function carries no canary, with a reverse check
+// that reverting the tables to automatic brings it back.
+//
+//   node --test --test-name-pattern='inline/' test/unit/*.ts
+
+// The shape of benchmarks/oop's hot call: a dynamic value coerced to a class
+// type, in a loop, which is what puts as_v_req_inst in the loop body.
+const CANARY_PROBE_SRC = 'class P { public var x:int = 0; public function P() {} }\n'
+  + 'var o:* = new P();\n'
+  + 'var i:int = 0;\n'
+  + 'var n:int = 0;\n'
+  + 'while (i < 200000) { var p:P = o; n += p.x; i++; }\n'
+  + 'trace("n=" + n);\n';
+
+function checkStackCanary(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [inline] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [inline] ${label}`); }
+  };
+
+  // 1. The source half. Every error builder table has to be TLS; a new helper
+  //    written with a plain array puts the canary straight back. Reading the
+  //    emitter (rather than one program's output) covers helpers that only a
+  //    specific construct emits.
+  const emitSrc = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const tls = emitSrc.match(/this\.line\('static ASC_TLS (?:const )?char\* parts\[/g) ?? [];
+  check(`the error builders keep their tables in thread-local storage (found ${tls.length})`, tls.length >= 16);
+  // The builders that RETURN a message (rather than throwing it) must keep an
+  // ordinary automatic table: their result is consumed by as_str_concat_n before
+  // they return too, but a table that outlives nothing is simply not a TLS case,
+  // and these three are cold. The assertion is that they are the ONLY ones left.
+  const RETURNERS = ['as_class_str', 'Error_toString', 'SQLError_toString'];
+  const autoSites: string[] = [];
+  {
+    const re = /this\.line\('(?:static )?char\* [A-Za-z0-9_]+\(/g;
+    const partsRe = /this\.line\('(?:const )?char\* parts\[/g;
+    let m: RegExpExecArray | null;
+    while ((m = partsRe.exec(emitSrc)) !== null) {
+      const before = emitSrc.slice(Math.max(0, m.index - 1200), m.index);
+      const def = [...before.matchAll(re)].pop();
+      autoSites.push(def === undefined ? '<unknown>' : def[0].replace(/^this\.line\('(?:static )?char\* /, '').replace(/\($/, ''));
+    }
+  }
+  check(`only the message-returning builders keep an automatic table (${autoSites.join(', ') || 'none'})`,
+    autoSites.length === 3 && autoSites.every((s) => RETURNERS.includes(s)));
+
+  // 2. Non-vacuity, then the assembly half on the shape that regressed.
+  const c = generateC(parse(CANARY_PROBE_SRC)).c;
+  check('the probe emits the as_v_req_inst guard',
+    c.includes('static void* as_v_req_inst(as_value v, void* target_vt, const char* fqn) {'));
+  const built = compileToAsm(c, 'canary');
+  check('the canary probe compiles to assembly with cc -O2 -S', built !== null);
+  if (built) {
+    const req = functionBody(built.asm, 'as_v_req_inst');
+    check('as_v_req_inst is emitted as its own function', req !== null);
+    if (req) {
+      check('as_v_req_inst carries no stack canary (it runs 20M times in oop)',
+        !req.includes('stack_chk_guard'));
+    }
+    const main = functionBody(built.asm, 'main');
+    if (main) check('the guard loop in main carries no stack canary', !main.includes('stack_chk_guard'));
+  }
+
+  // 3. Reverse check: with the tables restored to automatic arrays the canary
+  //    must come back in the same function. Without this the assertions above
+  //    would also pass on a build where -fstack-protector had simply been
+  //    turned off for some other reason.
+  const naive = c.replace(/static ASC_TLS (const )?char\* parts\[/g, (_m, konst: string | undefined) =>
+    `${konst ?? ''}char* parts[`);
+  check('the reverse probe actually changed something (tables reverted to automatic)',
+    naive !== c && naive.includes('const char* parts['));
+  const rev = compileToAsm(naive, 'canary-naive');
+  check('the reverse probe compiles to assembly', rev !== null);
+  if (rev) {
+    const req = functionBody(rev.asm, 'as_v_req_inst');
+    check('reverse: an automatic parts table puts the canary back in as_v_req_inst',
+      req !== null && req.includes('stack_chk_guard'));
+  }
+
+  console.log(`     [inline] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: inline/StackCanary', checkStackCanary);
