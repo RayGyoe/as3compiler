@@ -33,7 +33,9 @@
 
 import flash.display.BitmapData;
 import flash.display.Sprite;
+import flash.display.Stage;
 import flash.text.TextField;
+import flash.text.TextFieldType;
 import flash.text.TextFormat;
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
@@ -147,6 +149,58 @@ if (probe.textWidth <= 0) {
   near(w051, w11, 2, 'scaleX=0.5 不得把字形压窄（ink 宽应与 scale 1 相同）');
   near(w12, w11 * 2, 3, 'scaleY=2 时字形整体放大一倍（ink 宽翻倍）');
 
+  // ③ 打字时字段自动滚动（阶段二百四十二）。adl 51.4.1 实测：wordWrap=false 的
+  //    字段一旦溢出就有正的 maxScrollH（trunc(textWidth + 4 - width)），打字把字符推到
+  //    右边界外时按「内宽四分之一」的步长平移 scrollH；中文/英文都一样。AIR **没有**
+  //    `hscroll` 开关（赋它会抛 #1056），所以这条对任何 AIR 程序都成立。
+  //    纵向：打字越过可见行后 scrollV 跟着往下走（光标的行贴到底部）。
+  var st:Stage = new Stage();
+  var typed:TextField = new TextField();
+  typed.width = 200; typed.height = 24;
+  typed.background = true; typed.border = true;
+  typed.defaultTextFormat = new TextFormat('_typewriter', 12, 0x000000);
+  typed.type = TextFieldType.INPUT;
+  typed.multiline = false; typed.wordWrap = false;
+  st.addChild(typed);
+  check(typed.maxScrollH == 0, '空字段的 maxScrollH 必须是 0');
+
+  st.focus = typed;
+  var i:int;
+  for (i = 0; i < 40; i++) st.dispatchText('0');
+  check(typed.text.length == 40, '40 个字符要全部进到 .text 里');
+  check(typed.maxScrollH > 0, '溢出的单行字段必须报正的 maxScrollH（我们曾错误地跟着 hscroll 报 0）');
+  check(typed.scrollH > 0, '打字推到右边界外必须自动左移（scrollH > 0）');
+  check(typed.scrollH <= typed.maxScrollH, 'scrollH 不得越过 maxScrollH');
+  // 渐进：第一次平移发生在 textWidth 超过内宽之后，之后随字符增加继续增大。
+  var seen:Array = [];
+  var prev:int = typed.scrollH;
+  for (i = 0; i < 20; i++) {
+    st.dispatchText('0');
+    check(typed.scrollH >= prev, 'scrollH 只增不减（逐字符打字）');
+    if (typed.scrollH != prev) seen.push(typed.scrollH);
+    prev = typed.scrollH;
+  }
+  check(seen.length > 0, '继续打字必须继续平移（不只第一次）');
+  // scrollH 仍然是可写且被夹在 [0, maxScrollH] 的公有状态。
+  typed.scrollH = 100000;
+  check(typed.scrollH == typed.maxScrollH, 'scrollH 赋值必须夹到 maxScrollH');
+  typed.scrollH = 0;
+  check(typed.scrollH == 0, 'scrollH 可以回到 0');
+
+  // 换行字段不横向平移，但纵向跟着光标走。
+  var wrapped:TextField = new TextField();
+  wrapped.width = 120; wrapped.height = 40;
+  wrapped.defaultTextFormat = new TextFormat('_typewriter', 12, 0x000000);
+  wrapped.type = TextFieldType.INPUT;
+  wrapped.multiline = true; wrapped.wordWrap = true;
+  st.addChild(wrapped);
+  st.focus = wrapped;
+  for (i = 0; i < 80; i++) st.dispatchText('0');
+  check(wrapped.maxScrollH == 0, 'wordWrap=true 的字段不得横向平移（maxScrollH 恒 0）');
+  check(wrapped.scrollH == 0, 'wordWrap=true 的字段 scrollH 恒 0');
+  check(wrapped.numLines > 2, '80 个字符在 120px 宽里必须折成多行');
+  check(wrapped.scrollV > 1, '打字越过可见行后 scrollV 必须跟着走（我们曾一直停在 1）');
+
   trace('tf-scale-metrics: textWidth/textHeight = 名义 × scaleY/scaleX（含祖先）、'
-        + '字形按 scaleY 整体缩放而 scaleX 不拉宽 — assertions passed');
+        + '字形按 scaleY 整体缩放而 scaleX 不拉宽、打字自动横向/纵向滚动 — assertions passed');
 }

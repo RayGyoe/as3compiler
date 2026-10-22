@@ -1,4 +1,4 @@
-// textrich.as — TextField rich features: autoSize, hscroll/maxScrollH/scrollH,
+// textrich.as — TextField rich features: autoSize, maxScrollH/scrollH,
 // selectable, selection indices, leading, htmlText, and setTextFormat runs
 // (stage 38 continuation).
 //
@@ -40,16 +40,23 @@ if (lh1 <= lh0) {
   throw new Error("leading should increase line height: " + lh0 + " -> " + lh1);
 }
 
-// --- hscroll / maxScrollH / scrollH ------------------------------------------
+// --- maxScrollH / scrollH ---------------------------------------------------
 tf.defaultTextFormat = new TextFormat(null, 12, 0x000000, false, false);
 tf.multiline = false;
 tf.wordWrap = false;
 tf.width = 50;
 tf.height = 30;
 tf.text = "this is a much longer single line that overflows";
-// Without hscroll, maxScrollH is 0 (no horizontal pan) in both flavors.
-if (tf.maxScrollH != 0) throw new Error("maxScrollH should be 0 when hscroll=false, got " + tf.maxScrollH);
-tf.hscroll = true;
+// AIR 51.4.1 has no `hscroll` switch (assigning one throws #1056): a
+// wordWrap=false field that overflows always exposes a positive extent, and a
+// wrapping field always reports 0 (measured, temp/tfprobe/scroll/table.txt).
+// (the pure-C stub has no font metrics -- textWidth 0 -- so the assertions only
+// bite when a real text backend is linked, which is where they matter.)
+var tw:Number = tf.textWidth;
+if (tw > 0 && tf.maxScrollH <= 0) throw new Error("maxScrollH should be > 0 for overflowing nowrap text, got " + tf.maxScrollH);
+tf.wordWrap = true;
+if (tw > 0 && tf.maxScrollH != 0) throw new Error("maxScrollH should be 0 when wordWrap is on, got " + tf.maxScrollH);
+tf.wordWrap = false;
 var mh:int = tf.maxScrollH;
 // scrollH is clamped to [0, maxScrollH] on assignment. Setting it far past the
 // extent must land inside the range regardless of the real measured width.
@@ -153,7 +160,7 @@ rf.setTextFormat(boldFmt, 0, 5);
 if (rf.text != "hello world") throw new Error("setTextFormat must not change text, got '" + rf.text + "'");
 if (rf.numLines != 1) throw new Error("setTextFormat single line should stay 1 line, got " + rf.numLines);
 
-trace("textrich: selection/leading/hscroll/autoSize/htmlText/setTextFormat/text-replaces-runs OK");
+trace("textrich: selection/leading/scrollH/autoSize/htmlText/setTextFormat/text-replaces-runs OK");
 
 // --- StyleSheet rules make an unknown tag a BLOCK (阶段一百四十八) -------------
 // AIR's htmlText layout is stylesheet-driven: a tag the player has no inline

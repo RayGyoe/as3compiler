@@ -5987,7 +5987,6 @@ export class SymbolTable {
         ['border', txf({ kind: 'bool' })],
         ['borderColor', txf({ kind: 'uint' })],
         ['scrollV', txf({ kind: 'int' })],
-        ['hscroll', txf({ kind: 'bool' })],
         ['selectable', txf({ kind: 'bool' })],
         ['autoSize', txf({ kind: 'string' })],
         ['textColor', txf({ kind: 'uint' })],

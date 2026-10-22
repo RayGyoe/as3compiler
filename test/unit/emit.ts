@@ -3088,6 +3088,85 @@ function checkTextFieldLongestLine(): string[] {
 }
 registerGroup('unit: emit/TextFieldLongestLine', checkTextFieldLongestLine);
 
+// ---- TextField 的可编辑滚动与插入光标（阶段二百四十二）------------------------
+// 用户（air-native 实测）报的三件事里有两件是真缺陷：
+//   ① 长文本打字不滚动：`maxScrollH` 被一个**我们自己发明的** `hscroll` 开关挡住，
+//      而 AIR 根本没有这个属性（adl 51.4.1 赋值抛 #1056）⇒ 任何 AIR 程序的
+//      `maxScrollH` 恒 0，`scrollH` 也只能是 0，字段永远停在左边/第一行。
+//   ② 动态（非 INPUT）字段画了插入光标：AIR 只在 INPUT 字段画。
+// 另一件（`.text` 读不到）与光标/选区鼠标操作在 adl 与 AOT 双端复现结果一致，不是缺陷。
+// 行为侧由 examples/tf-scale-metrics.as ③ 段（Skia）与 examples/textrich.as 钉住；
+// 这里钉生成代码里的四处形状，防止回退。
+function checkTextFieldScrollAndCaret(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [tfscroll] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [tfscroll] ${label}`); }
+  };
+
+  const src = [
+    'import flash.text.TextField;',
+    'import flash.text.TextFieldType;',
+    'var tf:TextField = new TextField();',
+    'tf.type = TextFieldType.INPUT;',
+    'tf.text = "abc";',
+    'trace(tf.maxScrollH);',
+    'trace(tf.scrollH);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  // ① AIR has no `hscroll`: neither a slot, nor a props-table entry, nor a read.
+  check('the invented `hscroll` slot is gone from the TextField struct',
+    !/bool hscroll;/.test(c));
+  check('...and from the props reflection table',
+    !/"hscroll"/.test(c));
+  check('...and nothing reads tf->hscroll any more',
+    !/tf->hscroll/.test(c));
+
+  // ② maxScrollH is unconditional and wordWrap-gated (measured on adl 51.4.1).
+  check('maxScrollH ignores wrapping only (no hscroll gate)',
+    /int TextField_get_maxScrollH\(void\* _this\) \{\s*TextField\* tf = \(TextField\*\)_this;\s*if \(tf->wordWrap\) return 0;/.test(c));
+  check('maxScrollH truncates textWidth + 4 - width (AIR reports 18 for 214.1 in a 200 px box)',
+    /double over = tw \+ 4\.0 - tf->_fieldWidth;\s*return \(over > 0\.0\) \? \(int\)over : 0;/.test(c));
+
+  // ③ Every painter/hit-tester pans by _scroll_h directly.
+  const leftpx = c.match(/int leftpx = tf->_scroll_h;/g) ?? [];
+  check('all three pan sites read _scroll_h with no ternary', leftpx.length === 3);
+  check('no `tf->hscroll ?` ternary survives',
+    !/tf->hscroll \?/.test(c));
+
+  // ④ The post-edit pan exists, is declared before its use, and is called from splice.
+  const helperDef = c.indexOf('static void as_tf_scroll_after_edit(TextField* tf) {');
+  const fwd = c.indexOf('static void as_tf_scroll_after_edit(TextField* tf);');
+  const splice = c.indexOf('static bool as_tf_splice(TextField* tf, int lo, int hi, const char* ins) {');
+  check('as_tf_scroll_after_edit has a forward declaration', fwd >= 0);
+  check('...placed before as_tf_splice (C needs it)',
+    fwd >= 0 && splice > fwd);
+  check('...defined after maxScrollH (it reads it)',
+    helperDef > c.indexOf('int TextField_get_maxScrollH(void* _this) {'));
+  check('...and every splice ends by panning the caret into view',
+    /as_tf_set_caret\(tf, lo \+ insLen\);\s*as_tf_scroll_after_edit\(tf\);/.test(c));
+  check('the horizontal pan steps by a quarter of the inner width (AIR 200 -> 49)',
+    /int step = \(int\)\(inner \/ 4\.0\); if \(step < 1\) step = 1;/.test(c));
+  check('the vertical pan only moves when the caret line leaves the viewport',
+    /as_tf_scroll_caret\(tf, as_tf_line_of_index\(starts, n, caret\), 0\);/.test(c));
+
+  // ⑤ The caret is an INPUT affordance (measured: a focused dynamic field shows none),
+  //    while the selection band stays a selectable-only thing (dragging a dynamic
+  //    field does paint it). The two gates must therefore differ by exactly the type
+  //    test, or one of the two measured rules breaks.
+  check('the caret gate requires an INPUT field',
+    c.includes('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable && as_tf_is_input(tf)) {'));
+  check('the selection band gate does NOT (dynamic selectable fields still highlight)',
+    c.includes('int selVis = (as_focus_obj == (void*)tf) && tf->_sel_begin >= 0 && tf->_sel_end > tf->_sel_begin;'));
+
+  console.log(`     [tfscroll] ${ok} TextField scroll/caret check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/TextFieldScrollAndCaret', checkTextFieldScrollAndCaret);
+
 // Top-level FREE FUNCTIONS were the last identifier class outside the C naming
 // sanitizer: `freeCName` returned the raw AS3 name for everything except `main`.
 // Four measured collisions followed (measured on the generated C, and `adl` runs

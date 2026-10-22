@@ -688,7 +688,7 @@ as_skia_canvas_restore(canvas);                    // 只够关掉「对象自�
 SkParagraph 的富文本能力（`htmlText`、多 `TextFormat` 区间样式、对齐/字间距/多段落）均已落地：`htmlText`
 解析 `<font>`/`<b>`/`<i>`/`<u>`/`<p>`/`<br>` 子集并生成「字节区间 + `TextFormat`」run 列表，`setTextFormat`
 以同样机制追加 run；`sk_textlayout_new_runs` 按 run 顺序 `pushStyle`/`addText`/`pop`，run 之间的间隙回落到
-段落默认样式（= `runs[0]` 的字体/字号，颜色取自 `defaultTextFormat`）。`autoSize`/`hscroll`/`selectable`/`leading`
+段落默认样式（= `runs[0]` 的字体/字号，颜色取自 `defaultTextFormat`）。`autoSize`/`scrollH`+`maxScrollH`（AIR 没有 `hscroll` 开关，见 `flash-text.md` §11）/`selectable`/`leading`
 亦已落地，断言式回归见 `examples/textrich.as`（`examples/textflow.as` 为布局基线）。
 
 ### 8.2 `autoSize` 的大小口径与「装不上的字族」的兜底脸（阶段一百六十八）

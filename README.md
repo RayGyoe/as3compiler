@@ -353,7 +353,7 @@ The full 16-item list (the rest being Lottie, native shaders, FFI, server-side r
 - `examples/window.as` — stage thirty-nine synthesis: `Stage.showWindow` windowing (`Shape` blue rectangle + `TextField` text → off-screen Skia → SDL2 upload + event loop), using `examples/window.build.example.json` to link Skia + arm64 SDL2
 - `examples/window_click.as` — stage forty: real mouse clicks in the window → AS3 event dispatch (`mouseDown`/`mouseUp`/`click` + bubbling + click color-change re-render), using `examples/window_click.build.example.json`
 - `examples/textflow.as` — stage thirty-eight: TextField layout assertions (`numLines`/`maxScrollV`/`scrollV` viewport math, `wordWrap` wrapping, `appendText`/`textHeight`), valid under pure C / Skia builds
-- `examples/textrich.as` — rich text: `StyleSheet` rules (**a rule-styled unknown tag becomes block-level**, `display:inline`/`none`, case-insensitive selectors, copy semantics on `setStyle`/`getStyle`) plus `htmlText`/`setTextFormat`/`autoSize`/`hscroll`/`leading` assertions
+- `examples/textrich.as` — rich text: `StyleSheet` rules (**a rule-styled unknown tag becomes block-level**, `display:inline`/`none`, case-insensitive selectors, copy semantics on `setStyle`/`getStyle`) plus `htmlText`/`setTextFormat`/`autoSize`/`scrollH`+`maxScrollH` (auto-scroll while typing)/`leading` assertions
 - `examples/autosize-metrics.as` — `TextField.autoSize` sizing contract (with `wordWrap=true` only the height follows and
   the width stays as set; only `wordWrap=false` gives `width = textWidth + 4`, in both directions; a geometry read refreshes it)
   plus an **uninstalled family** falling back to the platform default face's line box

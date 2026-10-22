@@ -477,3 +477,61 @@ Contract in §5.2, measurements in §8.1. Added/changed:
 Nothing in the compiler's output changed (not one line of generated C or the runtime), so **no version
 bump**; and the numeric path (`entry.as` ⇒ `new Main()`) writes no bitmap, so the directory unit's cost
 and artefacts are unchanged.
+
+## 11. Editable scrolling and the insertion caret (stage 242, v0.4.206)
+
+**Trigger**: five defects reported by the user against `air-native` (`.text` unreadable / caret on dynamic
+fields / no scrolling while typing / no caret inside input fields / mouse cannot move the caret or select).
+A two-ended probe (`temp/tfprobe/`, one `Main.as` run under both `adl` and AOT via `slow_type.py`)
+reproduced every one of them: **two were real defects, three were not**.
+
+### 11.1 Root cause: `hscroll` is a property we invented
+
+`TextField`'s slot table carried an `hscroll` (a horizontal-scroll switch added in stage 72) and
+`TextField_get_maxScrollH` read `if (!tf->hscroll) return 0;`. **AIR 51.4.1 has no such property**: under
+`adl`, `f.hscroll = true` throws `Error #1056: Cannot create property hscroll on flash.text.TextField`
+(and `mxmlc` rejects it at compile time). So for *any* AIR-compatible program `maxScrollH` was pinned to 0,
+`scrollH` assignments clamped to 0, and long text never moved.
+
+Fix: the property is gone (slot table entry plus the three `tf->hscroll ?` readers) and `maxScrollH` now
+only returns 0 when `wordWrap` is on, so `scrollH`/`maxScrollH` exist for every non-wrapping field.
+
+### 11.2 Measured against adl 51.4.1 (`temp/tfprobe/scroll/table.txt`)
+
+| Observation | Value |
+|---|---|
+| `maxScrollH`, non-wrapping | `trunc(textWidth + 4 - width)`: tw = 214.1 / 285.45 / 356.8 / 428.15 / 499.55 in a 200 px box gives 18 / 89 / 160 / 232 / 303 |
+| `maxScrollH`, wrapping | always 0 (80 characters, width 192.4) |
+| `scrollH = 100000` | clamps to `maxScrollH`; re-reading `maxScrollH` after `scrollH = 0` is unchanged (the two are independent) |
+| Typing past the right edge | pans in steps of a **quarter of the inner width** (48/49 px for a 200 px box); at 60 characters `scrollH = 244` with the caret just inside the right edge |
+| Clicking inside an already-scrolled field | does **not** pan (a click at local x=16 only moved the caret to index 37; `scrollH` stayed 244) |
+| Typing past the last line | `scrollV` follows the caret (10 lines in a 90 px box leave `scrollV = 6`, i.e. the caret's line pinned to the bottom) |
+| Focused dynamic (non-INPUT) field | draws **no** caret (a dragged selection still highlights) |
+
+The emitter therefore gained `as_tf_scroll_after_edit`, called at the end of `as_tf_splice`: vertically it
+only moves `scrollV` when the caret's line would leave the viewport (reusing `as_tf_scroll_caret(dir=0)`),
+horizontally it steps by a quarter of the inner width, clamped to `maxScrollH`.
+
+### 11.3 The three non-defects (identical on both ends)
+
+- **`.text` readback of typed input**: both ends return the full text (the 60-character STATE lines match).
+- **Caret invisible in an input field**: our window screenshot does contain the 1-device-pixel bar; the
+  earlier scan only looked at the middle third of the crop while the caret sat at its left edge.
+- **Mouse caret/selection**: both ends produce the same sequence — `mouseDown` places the caret, a drag
+  yields `sel=lo,hi`, `mouseUp` keeps the selection; only a click *inside* an existing selection collapses
+  it to a caret (both ends).
+
+### 11.4 Known residuals
+
+- While typing, AIR's `maxScrollH` is about **one step larger** than ours (`tw + 4 - width + step`, e.g.
+  274 vs our 236 at 60 characters); a programmatic `scrollH` assignment puts AIR back at
+  `tw + 4 - width`, so it is not a pure function of the layout. We did not model that history dependence;
+  caret visibility is unaffected.
+- `textWidth` still carries the per-character residual (7.2002 vs AIR 7.135), so absolute `scrollH` values
+  differ by a few pixels; assertions are written as relations and absolute numbers are informative only.
+
+**Pins**: `unit: emit/TextFieldScrollAndCaret` in `test/unit/emit.ts` (15 checks, including "no `hscroll`
+in the props table" and "the caret gate must also test `as_tf_is_input`"); `examples/tf-scale-metrics.as`
+§③ types 60 characters under the Skia build and asserts `maxScrollH > 0`, monotone clamped `scrollH`, and
+vertical follow for the wrapping field; `examples/textrich.as` inverted its old
+"`maxScrollH == 0` without `hscroll`" assertion.

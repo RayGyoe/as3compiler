@@ -582,10 +582,12 @@ function checkCaret(): string[] {
     /static void as_tf_extend_caret\(TextField\* tf, int pos\) \{[\s\S]{0,520}?as_tf_blink_reset\(\);/.test(c));
   // (3) drawn only in a window/compose pass and only on a focused + selectable
   // field, as a 1-device-pixel fill rect at the caret box in the text colour.
-  check('the caret is gated on the window pass and on focused + selectable',
-    c.includes('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable) {'));
+  // 阶段二百四十二: the gate also requires an INPUT field -- measured on adl 51.4.1, a
+  // focused selectable DYNAMIC field draws no caret (the selection band still paints).
+  check('the caret is gated on the window pass, on focused + selectable, and on INPUT',
+    c.includes('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable && as_tf_is_input(tf)) {'));
   check('the caret bar is a 1-device-pixel fill rect at the caret box, in the text colour',
-    /if \(ASC_caret_pass && as_focus_obj == \(void\*\)tf && tf->selectable\) \{[\s\S]{0,900}?as_skia_textlayout_caret_rect\(para, as_tf_utf16_index\(tf, as_tf_caret\(tf\)\), &kcx, &kcy, &kch\)[\s\S]{0,520}?as_skia_paint_fill\(kcol, 1\.0\)[\s\S]{0,180}?as_skia_canvas_draw_rect\(canvas, 2\.0 \+ alignDx - scrollX \+ kcx, 2\.0 - scrollY \+ kcy, kw, kch, kp\)/.test(c));
+    /if \(ASC_caret_pass && as_focus_obj == \(void\*\)tf && tf->selectable && as_tf_is_input\(tf\)\) \{[\s\S]{0,900}?as_skia_textlayout_caret_rect\(para, as_tf_utf16_index\(tf, as_tf_caret\(tf\)\), &kcx, &kcy, &kch\)[\s\S]{0,520}?as_skia_paint_fill\(kcol, 1\.0\)[\s\S]{0,180}?as_skia_canvas_draw_rect\(canvas, 2\.0 \+ alignDx - scrollX \+ kcx, 2\.0 - scrollY \+ kcy, kw, kch, kp\)/.test(c));
   check('the caret width is one DEVICE pixel (scale divided out), like the border',
     /double kw = ASC_render_scale \/ ksx;/.test(c));
   // (4) the window compose pass switches it on; Stage.render (the screenshot hook)

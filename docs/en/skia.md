@@ -815,7 +815,7 @@ spacing/multiple paragraphs) have all landed: `htmlText` parses a subset of
 `<font>`/`<b>`/`<i>`/`<u>`/`<p>`/`<br>` and produces a run list of "byte interval + `TextFormat`", and
 `setTextFormat` appends runs by the same mechanism; `sk_textlayout_new_runs` does `pushStyle`/`addText`/`pop` in
 run order, with the gaps between runs falling back to the paragraph default style (= `runs[0]`'s font/size,
-color from `defaultTextFormat`). `autoSize`/`hscroll`/`selectable`/`leading` have also landed, with
+color from `defaultTextFormat`). `autoSize`/`scrollH`+`maxScrollH` (AIR has no `hscroll` switch — see `flash-text.md` §11)/`selectable`/`leading` have also landed, with
 assertion-style regressions in `examples/textrich.as` (`examples/textflow.as` is the layout baseline).
 
 ### 8.2 `autoSize` sizing contract and the fallback face for an uninstalled family (stage 168)

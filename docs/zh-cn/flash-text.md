@@ -426,3 +426,56 @@ sh examples/textfield/run-aot.sh                    # -> aot.txt
 
 不改任何编译器产物（生成 C 与运行时一行未动），因此**不升版本号**；数值回归路径
 （`entry.as` ⇒ `new Main()`）也不写位图，目录单元回归的耗时与产物不变。
+
+## 11. 可编辑滚动与插入光标（阶段二百四十二，v0.4.206）
+
+**触发**：用户用 `air-native` 实测报 5 条（`.text` 读不到 / 动态字段有插入光标 / 输入后不滚动 /
+输入框里看不见光标 / 鼠标点不动光标也选不中）。双端探针（`temp/tfprobe/`，同一份 `Main.as` 跑
+`adl` 与 AOT，见 `slow_type.py`）逐条复现后，**两条是真缺陷，三条不是**。
+
+### 11.1 根因：`hscroll` 是我们发明的属性
+
+`TextField` 的属性表里有一个 `hscroll`（阶段七十二加的水平滚动开关），`TextField_get_maxScrollH`
+写成 `if (!tf->hscroll) return 0;`。但 **AIR 51.4.1 没有这个属性**——`adl` 里 `f.hscroll = true`
+直接抛 `Error #1056: Cannot create property hscroll on flash.text.TextField`（`mxmlc` 编译期就报
+「所访问的属性 hscroll 可能未定义」）。于是一个**任何 AIR 程序**（不会去设 `hscroll`）的
+`maxScrollH` 恒 0，`scrollH` 赋值也被夹到 0，长文本永远停在左边、行永远停在第一行。
+
+改法：删掉该属性（`symbols.ts` 的属性表 + 三处 `tf->hscroll ?` 读取），`maxScrollH` 改成
+「只在 `wordWrap` 时返回 0」；`scrollH`/`maxScrollH` 对每个非换行字段都成立。
+
+### 11.2 adl 51.4.1 实测口径（`temp/tfprobe/scroll/table.txt`）
+
+| 观测 | 值 |
+|---|---|
+| 非换行字段 `maxScrollH` | `trunc(textWidth + 4 - width)`：tw = 214.1 / 285.45 / 356.8 / 428.15 / 499.55 于 200 px 框内 → 18 / 89 / 160 / 232 / 303 |
+| 换行字段 `maxScrollH` | 恒 0（80 字符全宽度 192.4） |
+| `scrollH = 100000` | 夹到 `maxScrollH`；`scrollH = 0` 后再读 `maxScrollH` **不变**（与该变量无关） |
+| 打字把字符推出右边界 | 按**内宽四分之一**的步长平移（200 px 框 48 / 49 px 一步），打字到 60 字符时 `scrollH = 244`，光标正好贴在右边界内侧 |
+| 鼠标点击一个已滚动的字段 | **不平移**（点在局部 x=16 只把光标挪到 index 37，`scrollH` 仍是 244） |
+| 多行打字越过末行 | `scrollV` 跟着光标走（90 px 框打 10 行后 `scrollV = 6`，即光标所在行贴底） |
+| 动态（非 INPUT）可选中字段 | **不画插入光标**（拖选仍有蓝色选区） |
+
+生成侧因此新增 `as_tf_scroll_after_edit`（在 `as_tf_splice` 末尾调用）：纵向只在光标行离开视口时
+挪 `scrollV`（复用 `as_tf_scroll_caret(dir=0)`），横向按内宽 1/4 步长推进夹到 `maxScrollH`。
+
+### 11.3 不是缺陷的三条（双端一致）
+
+- **`.text` 读输入值**：两端都读得到完整文本（STATE 里 60 字符逐字相同）。
+- **输入框里的光标不可见**：AOT 的窗口截图里有 1 设备像素的竖条（此前一次扫描只看了裁剪图中段，
+  光标在裁剪图左侧，属测量口径错）。
+- **鼠标点不动 / 选不中**：两端事件序列一致——`mouseDown` 定光标、拖拽产生 `sel=lo,hi`、
+  `mouseUp` 保留选区；点在已有选区内再抬起才会收成单光标（两端都如此）。
+
+### 11.4 已知残差
+
+- 打字过程中的 `maxScrollH` **比 AIR 多约一步**（AIR 在已滚动态下报 `tw + 4 - width + 步长`，
+  如 60 字符时 274 而我们 236）。程序化赋 `scrollH` 时 AIR 又回到 `tw + 4 - width`，说明它不是
+  纯函数——我们没有复刻这个历史相关性；光标可见性不受影响。
+- `textWidth` 本身仍有每字符 7.2002 vs AIR 7.135 的进位残差（既有条目），所以 `scrollH` 绝对值
+  会有几像素差；断言写成关系式，绝对数值只作参考。
+
+**钉**：`test/unit/emit.ts` 的 `unit: emit/TextFieldScrollAndCaret`（15 项，含「属性表里不得再有
+`hscroll`」与「光标闸门必须多一个 `as_tf_is_input`」）；`examples/tf-scale-metrics.as` §③ 在 Skia
+构建下打字 60 字符断言 `maxScrollH > 0`、`scrollH` 单调且夹紧、换行字段纵向跟随；
+`examples/textrich.as` 把原来「没有 `hscroll` 就 `maxScrollH == 0`」的断言反了过来。

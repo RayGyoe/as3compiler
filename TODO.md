@@ -635,7 +635,7 @@ adl 里 Log 用 `multiline + wordWrap + scrollV = maxScrollV` 做滚动日志，
 **遗留（待实现）**：
 
 - [x] **富文本排版**（多 `TextFormat` 区间样式、`htmlText`）——`setTextFormat` 与 `htmlText`（`<font>`/`<b>`/`<i>`/`<u>`/`<p>`/`<br>` 子集）已落地，走 `ParagraphBuilder` 多 run 样式；对齐/字间距/多段落仍待后续
-- [x] TextField 已支持 `autoSize` / `hscroll` / `selectable` / HTML 文本
+- [x] TextField 已支持 `autoSize` / `selectable` / HTML 文本（原条目写的 `hscroll` 是**我们发明的属性**，AIR 51.4.1 并没有它——阶段二百四十二 删除并改成 AIR 的 `scrollH`/`maxScrollH` 口径，见 `docs/zh-cn/flash-text.md` §11）
 - [x] `leading` 字段已建模（`TextFormat.leading` 经 `StrutStyle` 接线）
 - [ ] `_para` 缓存随 TextField 被 GC 回收时 C++ 侧 paragraph 不释放（UI 对象长生命周期，影响有限）
 
@@ -1683,11 +1683,11 @@ bundle，让 xcode-project 真正与 raw 分道扬镳。
 ### 阶段七十二：TextField 富文本与排版扩展（目标 v0.3.76 → v0.3.78）✅ 已完成
 
 **依据**：阶段三十八（`TextField` 排版）遗留的「富文本（`htmlText`、多 `TextFormat` 区间样式）、`autoSize`/
-`hscroll`/`selectable`/`leading`」等 AIR 交互/富文本能力，对照 AIR SDK
+`hscroll`（后者经阶段二百四十二 更正为 AIR 的 `scrollH`/`maxScrollH`）/`selectable`/`leading`」等 AIR 交互/富文本能力，对照 AIR SDK
 [`TextField`](https://airsdk.dev/reference/actionscript/3.0/flash/text/TextField.html) 官方参考补齐。
 
 - [x] **`autoSize`**：`TextFieldAutoSize.NONE/LEFT/RIGHT/CENTER` 常量类；按 `textWidth`/`textHeight` 回填尺寸
-- [x] **水平滚动**：`hscroll`/`scrollH`/`maxScrollH`（水平滚动 + 渲染偏移）
+- [x] **水平滚动**：`scrollH`/`maxScrollH`（水平滚动 + 渲染偏移）；当时的 `hscroll` 开关在阶段二百四十二 删除（AIR 无此属性）
 - [x] **`selectable` 与选区**：`setSelection`/`selectionBeginIndex`/`selectionEndIndex`/`caretIndex` + 鼠标拖选 + 选中高亮渲染
 - [x] **`leading`**：`TextFormat.leading` 行间距经 SkParagraph `StrutStyle` 接线
 - [x] **HTML 文本/多 `TextFormat` 区间富文本**：`htmlText` 解析 `<font>`/`<b>`/`<i>`/`<u>`/`<p>`/`<br>` 子集 + `setTextFormat` 区间样式
@@ -14099,7 +14099,76 @@ AS3 `Vector.<int>`（4 B / 静态类型）、as3compiler 动态 `Array`（24 B �
 - 本节**没有**给 box 侧复刻模糊带，也没有引入任何容差；若将来有人确实需要「贴边 0.5px 也算中」，
   必须带上 §3.4 的上界表与 `temp/hitprobe3/FINDINGS.md`，别凭印象写成容差。
 
+### 阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案（v0.4.205 → v0.4.206）✅ 已完成
+
+**一、用户报的五条，两条是真缺陷**
+
+用户用 `air-native` 实测报：① `.text` 读不到输入值；② 动态字段上出现插入光标；③ 输入框里看不见光标；
+④ 长文本打字不滚动（尾巴看不见）；⑤ 鼠标点不动插入点、也选不中。双端探针 `temp/tfprobe/`
+（**同一份 `Main.as`** 跑 `adl 51.4.1` 与 AOT，`drive.py` / `slow_type.py` 用 Quartz 真鼠标真键盘驱动）
+逐条复现：**②④ 是真缺陷，①③⑤ 不是**。
+
+**二、②④ 的同一个根因：`hscroll` 是我们发明的属性**
+
+阶段七十二 给 `TextField` 加了 `hscroll` 开关（当时把「水平滚动」理解成一个 AIR 属性），
+`TextField_get_maxScrollH` 于是写成 `if (!tf->hscroll) return 0;`。但 **AIR 51.4.1 没有这个属性**：
+
+- `adl`：`f.hscroll = true` ⇒ `Error #1056: Cannot create property hscroll on flash.text.TextField`；
+- `mxmlc`：编译期就报「所访问的属性 hscroll 可能未定义」。
+
+也就是说**任何 AIR 程序**都不会去设它 ⇒ `maxScrollH` 恒 0、`scrollH` 被夹成 0 ⇒ 长文本永远停在左边、
+行永远停在第一行。用户看到的「打字不滚动」正是这条的必然后果（④）；而 ② 是另一处独立的口径缺漏：
+光标的闸门只看了「有焦点 + `selectable`」，**没有 `type` 判断**，于是动态字段也画出了插入光标
+（`adl` 实测：焦点在动态可选字段上时**没有光标**，但拖选仍有蓝色选区）。
+
+改法（`src/{emit,symbols}.ts`）：删掉 `hscroll`（属性表 + 三处 `tf->hscroll ?` 读取 + ctor 初值 +
+渲染指纹），`maxScrollH` 改为「只在 `wordWrap` 时 0」；光标闸门加 `as_tf_is_input(tf)`；
+新增 `as_tf_scroll_after_edit`（在 `as_tf_splice` 末尾调用）做编辑后的自动平移。
+
+**三、量出来的 adl 口径（`temp/tfprobe/scroll/table.txt` + 逐字符打字序列）**
+
+| 观测 | adl 51.4.1 |
+|---|---|
+| 非换行字段 `maxScrollH` | `trunc(textWidth + 4 - width)`（214.1/285.45/356.8/428.15/499.55 → 18/89/160/232/303） |
+| 换行字段 `maxScrollH` | 恒 0 |
+| 打字推出右边界 | 按**内宽 1/4** 步进（200px 框 48/49 一步）；60 字符时 `scrollH=244`，光标贴右边界内侧 |
+| 点击**已滚动**的字段 | **不平移**（局部 x=16 只把光标挪到 index 37，`scrollH` 仍 244） |
+| 多行打字越过末行 | `scrollV` 跟随光标（90px 框 10 行后 `scrollV=6`，光标行贴底） |
+| 焦点在动态可选字段 | 无插入光标；选区高亮照常 |
+
+**四、三条「不是缺陷」的取证**
+
+- **`.text` 读得到**：两端 STATE 里 60 字符逐字相同（含输入法提交路径）；
+- **输入框里有光标**：AOT 窗口截图里有 1 设备像素竖条——上一轮那次「扫不到」是**测量口径错**
+  （扫描只取裁剪图中段，光标在左三分之一），不是渲染缺陷；
+- **鼠标点/拖选**：两端事件序一致 —— `mouseDown` 定光标 → 拖拽出 `sel=lo,hi` → `mouseUp` **保留**选区；
+  点在已有选区内再抬起才收成单光标（两端都如此）。
+
+**五、钉子与文档**
+
+- `test/unit/emit.ts` 新增 `unit: emit/TextFieldScrollAndCaret`（15 项）：属性表里**不得再有 `hscroll`**、
+  `maxScrollH` 只按 `wordWrap` 归零且用截断、三处平移读 `_scroll_h`、`as_tf_scroll_after_edit` 的
+  前向声明/定义顺序与「四分之一步长」、光标闸门多一个 `as_tf_is_input`（而选区闸门**不加**）。
+- `examples/tf-scale-metrics.as` 新增 §③（Skia）：打字 60 字符断言 `maxScrollH > 0`、`scrollH` 单调且
+  夹紧、换行字段 `scrollV` 跟随；`examples/textrich.as` 把原来「没有 `hscroll` ⇒ `maxScrollH == 0`」
+  的断言**反过来**（有 `textWidth` 时溢出必须为正）。
+- `docs/{zh-cn,en}/flash-text.md` 新增 §11（根因、口径表、三条非缺陷、残差）；
+  `docs/{zh-cn,en}/skia.md` 与 `README{,-CN}.md` 里「已支持 hscroll」一句更正。
+
+**六、如实报明**
+
+- **残差 1**：打字过程中 `adl` 的 `maxScrollH` 比我们多约**一步**（60 字符时 274 vs 236），而程序化赋
+  `scrollH` 时 `adl` 又回到 `tw+4-width` ⇒ 它不是纯函数，我们没复刻这条历史相关性，已**新登记 1 行**。
+- **残差 2**：`textWidth` 本身仍有每字符 7.2002 vs AIR 7.135 的进位残差（既有行），故 `scrollH` 绝对值
+  会差几像素；断言因此写成关系式。
+- 本阶段只实测 macOS；Windows/wasm 未跑（改动全在发射器与共享运行时，与后端无关，但**未验证**）。
+
+**七、本表变动**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内 **98 → 99 项**（`未开始` **72 → 73**）。
+②④ 两条缺陷不在表内（此前没人登记过，用户报障才发现），修好即不占位。
+
 ### 遗留待开发
+> **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。
+>
 > **2026-10-22 追加（阶段二百四十一：命中测试边界与拾取口径的实测结案）**：**新登记 0 行 / 改写 0 行 / 移出 3 行** ⇒ 表内项数 **101 → 98 项**（`未开始` **75 → 72**，其余不变）。本轮**没有改任何 `src/`**：三行都以「实测结案」而非「改代码」收口 —— ① 两行「边界松紧」（原 14179 的 0.25px、原 14182 的 0.05px）经四组探针证明 `adl` 的边界**不是容差**而是随**绝对位置**锯齿的光栅化相位（对象边缘滑 1 twip×6 步，`adl` 报出的边界六次相同；重复 / 正反扫 / 换序 / 插问邻居全一致 ⇒ 纯函数、不是可修的缓存 bug），幅度 ≤ 半像素且只在「边界 ±0.5px」这条测度为零的带上，复刻要一张绝对网格表且会把「贴边未中」变成「贴边中」⇒ 维持严格几何，上界表与证据留档在 `docs/{zh-cn,en}/as3-semantics.md` §3.4 + `temp/hitprobe3/FINDINGS.md`；② 原 14181（交互拾取是否问内容区域）本轮首次拿到 **adl 真鼠标六点**证据（`temp/hitprobe3/Body7.as` + `pick_probe.py`）：无图形的 Sprite 在**自己盒内、子件之外**（横向缝与纵向缝）**都不是目标**，画了底板的容器在同样的缝里**是**目标，`Shape`（非 `InteractiveObject`）自己不可能是目标、事件落到最近的**可交互祖先** —— 与本实现阶段二百三十三 的改法**逐点一致**，故该行也结案。钉子 = `examples/stage94s.as` 新增 H 节（17 断言：box 闭区间四边 + 0.01px 外侧不中 + region ±0.05 + 含描边带 + 缩放后仍严格）与 `examples/hit-pick-layer.as` 新增 D 节（5 断言），两处都在 **headless 与 Skia 两个后端**跑过。
 >
 > **2026-10-22 追加（阶段二百四十：顶层自由函数名的重名消解 —— 宿主符号 / C 类型名 / 宿主宏）**：**新登记 2 行 / 改写 0 行 / 移出 2 行**（其中「顶层自由函数名撞宿主符号」的两行**重复登记**合并为 1 行）⇒ 表内项数 **101 → 101 项**（`未开始` **76 → 75**、`已修` **3 → 4**，其余不变）。本阶段修的是**顶层自由函数**名直接当 C 符号用：撞 libm/libc（`log`/`pow`/`index`）、撞 C **类型名**（`Sprite`）、撞 Windows **函数式宏**（`min`/`max`）与 **对象式宏**（`near`/`far`/`small`）—— `adl`/`mxmlc` 对同一份源码照跑不误。**新登记的第 2 行**是同一缺陷在**类成员**粒度上的同族（成员名撞发射器给每个类种下的固定后缀，`cls`/`vt`/`ctor`/`props`/`amf_members` 实测全部编不过），属独立立项。
@@ -14333,6 +14402,7 @@ AS3 `Vector.<int>`（4 B / 静态类型）、as3compiler 动态 `Array`（24 B �
 | **AGAL4 与顶点纹理取值（VTF）** | 未开始（阶段二百二十六 分档实测登记：这是 `enhanced` 相对 `standard` 唯一新增的东西） | `runtime.ts` 的 AGAL 前置对 `version > 3` **显式拒绝**、指令数上限硬编码 200；GLSL 翻译器**只在片元阶段声明 sampler**（`isFragment` 分支）⇒ WebGL2 上顶点取样会编译失败；MSL/HLSL 的顶点入口也没有对应的 `texture` 绑定槽。完工判据：AGAL4 解析 + 顶点 sampler 声明 + 三后端绑定与取样 |
 | **旗标打开后的显存预检与分配失败上报**（`Context3D.ignoreResourceLimits = true`） | 未开始（2026-10-22 阶段二百二十七 实测登记：`adl` 在 `#3684` 处**同步**失败，我们的惰性分配会把失败推到上传之后） | 旗标打开后我们只按**设备上限**（`as_s3d_max_texture_size()`，D3D12/Metal 16384）放行尺寸，**不预检像素总量**；而 2D/`RectangleTexture` 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `t->gpu` 留空，等 `uploadFromBitmapData`/`uploadFromByteArray` 才建），所以「设备上限允许、实际建不出来」这一档现在**不会**冒成 `#3684`——它会在上传时静默变成一张空贴图。`adl 51.4.1` 实测（`temp/adlprof/`，`PROBE_MODE=ign`）：旗标打开后 `baseline` 的 `createTexture(4096,1)`、`enhanced` 的 `createTexture(8192,1)` 都在**创建时**同步抛 `Error #3684: Texture creation failed. Internal error.`，即 AIR 在创建点就把分配做完了 | ① 给 `Texture`/`RectangleTexture` 的创建补一次**总量估算**（`w*h*bpp`，带 mip 时再乘 4/3，累加到 context 上），超过一个可配置的显存预算就抛 `#3684`（文案照 AIR）；② 或把 `as_s3d_create_render_texture` 的返回 `NULL` 立刻变成 `#3684`（目前只对 `optimizeForRenderToTexture=true` 有这条路径，且未检查返回值）。**成本中**，且要与「`ignoreResourceLimits=false` 时 AIR 的对象数量/显存预算」一起量（本阶段实测：`adl` 关旗标时 4300 个 1×1 贴图仍可建，即计数上限实际未生效，约束在显存） |
 | **`examples/air-native`、`examples/ane`、`examples/ane-app` 的构建清单仍写死 `windows-x64`** | 未开始（2026-10-22 阶段二百三十一 登记：`build/ExampleManifestHosts` 会按内容跳过它们并打印名单） | 22 份清单已改成 `${host}`/`${lib:}`/`${win:}`/`${mac:}` 占位符形态，同一份在两个宿主都成立；这三份**刻意**没改——`air-native` 同时写死 `ASC_RENDER_D3D` + `vendor/d3d_glue.cc`，主机是**后端的结果**，把它写成 `${mac:...metal_glue.mm}` 需要先证明 macOS 侧那一串（`-lcocoa`/`-lobjc`/Metal 框架/`ASC_RENDER_METAL`）真的能编能跑，而本机没有 Objective-C++ 工具链、无法验证；`ane`/`ane-app` 同族（宿主库 `asaot.dll` 与 ANE 平台键都只在 Windows 上量过） | 等 arm64 macOS CI 能跑通 `metal_glue.mm` 之后，把 `air-native` 的 `sources`/`defines`/`link-libs` 按 `${mac:}`/`${win:}` 展开（对照 `src/air-app.ts` 的 `mtlSrc`/`d3dSrc` 两分支，那里已经是同一条配方的权威版），再让钉子不再打印它 |
+| **打字过程中 `maxScrollH` 比 `adl` 少约一步**（AIR 在「已滚动」状态下报 `textWidth + 4 - width + 步长`） | 未开始（2026-10-22 阶段二百四十二 实测登记；与上面「`textWidth` 字形累进残差」同一族的**可观测读数**差） | `adl 51.4.1` 探针（`temp/tfprobe/`，200px 框 + `_typewriter` 12，逐字符打字）：60 字符时 `scrollH=244 / maxScrollH=274`，而 `textWidth+4-width = 225.9` ⇒ 多出的一步 ≈ 内宽 1/4（48.6）。同一字段**程序化**赋 `scrollH=100` 后 `maxScrollH` 仍是 232（不随之改变）⇒ 这个 +一步只在**打字路径**里出现，不是纯函数，我们没复刻；光标可见性与 `scrollH` 的平移行为不受影响 | 若要复刻，需要在**编辑路径**里把 `maxScrollH` 读成「布局量 + 一个步长」（`scrollH>0` 或「本帧有编辑」时），并在程序化赋值路径上保持旧值；先补一组「打字 / 赋值 / 点击」三态交叉的 adl 矩阵再动手，否则很容易把一条历史相关性固化成错误规则 |
 
 
 

@@ -374,7 +374,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/window_click.as` — 窗口内真实鼠标点击 → AS3 事件分派（`mouseDown`/`mouseUp`/`click` + 冒泡 + 重渲染）
 - `examples/textflow.as` — `TextField` 排版断言（`numLines`/`maxScrollV`/`scrollV`、`wordWrap`、`appendText`/`textHeight`）
 - `examples/textrich.as` — 富文本：`StyleSheet` 规则（**未知标签有规则即成块级**、`display:inline`/`none`、选择器大小写与拷贝语义）
-  + `htmlText`/`setTextFormat`/`autoSize`/`hscroll`/`leading` 断言
+  + `htmlText`/`setTextFormat`/`autoSize`/`scrollH`+`maxScrollH`（打字自动滚动）/`leading` 断言
 - `examples/autosize-metrics.as` — `TextField.autoSize` 的大小口径（`wordWrap=true` 只改高度、宽度保持用户值；
   `wordWrap=false` 才 `width = textWidth + 4` 且两向收放；几何读取即刷新）与**未安装字族**回落到平台默认脸的行盒
 - `examples/tf-scale-metrics.as` — 被缩放的 `TextField` 口径：`textWidth`/`textHeight` = 名义 extents 乘**累积 `scaleY / scaleX`**

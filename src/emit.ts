@@ -11137,6 +11137,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // limit still dispatches textInput with the full payload but inserts nothing and
     // fires no change. A paste that overflows is TRUNCATED to the room left (measured:
     // 10 chars into maxChars=5 -> "ABCDE"), while its textInput payload is not.
+    // Defined next to the caret-scroll machinery far below, but called from every
+    // edit -- a forward declaration keeps the emission order readable.
+    this.line('static void as_tf_scroll_after_edit(TextField* tf);');
     this.line('static bool as_tf_splice(TextField* tf, int lo, int hi, const char* ins) {');
     this.indent++;
     this.line('int len = (int)strlen(as_tf_text(tf));');
@@ -11162,6 +11165,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // the text that was just replaced.
     this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_para_text = NULL;');
     this.line('as_tf_set_caret(tf, lo + insLen);');
+    // AIR pans the field after an edit so the caret never leaves the view (measured:
+    // typing past the right edge scrolls, typing past the last line scrolls down).
+    this.line('as_tf_scroll_after_edit(tf);');
     this.line('return true;');
     this.indent--;
     this.line('}');
@@ -11764,7 +11770,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('int top = tf->scrollV; if (top < 1) top = 1; if (top > maxs) top = maxs;');
     this.line('double scrollY = (double)(top - 1) * lh;');
     this.line('int maxsh = TextField_get_maxScrollH((void*)tf);');
-    this.line('int leftpx = tf->hscroll ? tf->_scroll_h : 0;');
+    this.line('int leftpx = tf->_scroll_h;');
     this.line('if (leftpx < 0) leftpx = 0; if (leftpx > maxsh) leftpx = maxsh;');
     this.line('double alignDx = as_tf_align_dx(tf);');
     this.line('double l = 2.0 + alignDx - (double)leftpx + cx;');
@@ -18456,7 +18462,6 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('o->scrollV = 1;');
     this.line('o->_scroll_h = 0;');
     this.line('o->_goal_col = -1;');
-    this.line('o->hscroll = false;');
     this.line('o->selectable = true;');
     this.line('o->autoSize = (char*)"none";');
     // textColor defaults to 0 (black). A non-zero value overrides the
@@ -18965,19 +18970,23 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('return (m < 1) ? 1 : m;');
     this.indent--;
     this.line('}');
-    // maxScrollH is the horizontal scroll extent in pixels: the widest line minus
-    // the box width (plus a small gutter). It is 0 unless hscroll is on and the
-    // text actually overflows — AIR clips (not wraps) a wordWrap=false field and
-    // lets scrollH pan it.
+    // maxScrollH is the horizontal scroll extent in pixels: the field width minus
+    // the widest line (plus AIR's 4 px gutter), truncated to an int. Measured on adl
+    // 51.4.1 with a 200 px field and `_typewriter` 12 (temp/tfprobe/scroll): for text
+    // widths 214.1 / 285.45 / 356.8 / 428.15 / 499.55 the reported extents were
+    // 18 / 89 / 160 / 232 / 303 -- i.e. trunc(tw + 4 - width), not a rounded value
+    // and not gated on any user switch. AIR has NO `hscroll` property (assigning one
+    // throws #1056), so the extent exists for every wordWrap=false field; a wrapping
+    // field reports 0 because nothing can be panned sideways (same probe).
     this.line('int TextField_get_maxScrollH(void* _this) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
-    this.line('if (!tf->hscroll) return 0;');
+    this.line('if (tf->wordWrap) return 0;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para == NULL) return 0;');
     this.line('double tw = as_tf_longest_line(para);');
     this.line('double over = tw + 4.0 - tf->_fieldWidth;');
-    this.line('return (over > 0.0) ? (int)(over + 0.999) : 0;');
+    this.line('return (over > 0.0) ? (int)over : 0;');
     this.indent--;
     this.line('}');
     // Map a stage-space point to a caret index in the field's paragraph. The
@@ -18998,7 +19007,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('int top = tf->scrollV; if (top < 1) top = 1; if (top > maxs) top = maxs;');
     this.line('double scrollY = (double)(top - 1) * lh;');
     this.line('int maxsh = TextField_get_maxScrollH((void*)tf);');
-    this.line('int leftpx = tf->hscroll ? tf->_scroll_h : 0;');
+    this.line('int leftpx = tf->_scroll_h;');
     this.line('if (leftpx < 0) leftpx = 0; if (leftpx > maxsh) leftpx = maxsh;');
     // x/y arrive in the field's own space already (the caller maps the stage
     // point through the ancestor transforms), so only scrolling is subtracted --
@@ -19024,6 +19033,38 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (value < 0) value = 0;');
     this.line('if (value > m) value = m;');
     this.line('tf->_scroll_h = value;');
+    this.indent--;
+    this.line('}');
+    // Bring the caret back into view after an edit -- the behaviour that makes long
+    // typing usable, and the one AIR ties to editing only (measured: after typing 60
+    // characters into a 200 px field, clicking at local x=16 leaves scrollH at 244
+    // and just moves the caret; a mouse move never pans).
+    //   * Horizontal (wordWrap=false): AIR pans in quarter-pages of the inner width
+    //     (a 200 px field jumps 48/49 px per step) and clamps at maxScrollH, so the
+    //     caret ends just inside the right edge. We reproduce the stepping rather
+    //     than panning minimally, because scrollH is observable.
+    //   * Vertical: scrollV only moves when the caret's line would leave the
+    //     viewport, which is exactly as_tf_scroll_caret(dir = 0); a wrapping field
+    //     ends up with the caret's line pinned to the bottom (measured: 9 typed
+    //     lines in a 90 px field leave adl at scrollV 5).
+    this.line('static void as_tf_scroll_after_edit(TextField* tf) {');
+    this.indent++;
+    this.line('int caret = as_tf_caret(tf);');
+    this.line('int starts[AS_TF_MAX_LINES];');
+    this.line('int n = as_tf_line_table(tf, starts, NULL, NULL, AS_TF_MAX_LINES);');
+    this.line('as_tf_scroll_caret(tf, as_tf_line_of_index(starts, n, caret), 0);');
+    this.line('int maxsh = TextField_get_maxScrollH((void*)tf);');
+    this.line('if (maxsh <= 0) { tf->_scroll_h = 0; return; }');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para == NULL) return;');
+    this.line('double cx = 0.0, cy = 0.0, ch = 0.0;');
+    this.line('if (!as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, caret), &cx, &cy, &ch)) return;');
+    this.line('double inner = (double)tf->_fieldWidth - 4.0;');
+    this.line('if (inner < 1.0) inner = 1.0;');
+    this.line('int step = (int)(inner / 4.0); if (step < 1) step = 1;');
+    this.line('if (tf->_scroll_h > maxsh) tf->_scroll_h = maxsh;');
+    this.line('while (tf->_scroll_h < maxsh && cx + 2.0 > (double)tf->_scroll_h + inner) tf->_scroll_h += step;');
+    this.line('if (tf->_scroll_h > maxsh) tf->_scroll_h = maxsh;');
     this.indent--;
     this.line('}');
     // Selection indices are UTF-16 code-unit offsets per AS3, but the runtime
@@ -22029,7 +22070,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // fingerprint of its own, so a still bordered field would keep blitting its
     // auto-baked image after `border` flips (or the colour changes).
     this.line('h = as_fp_bool(h, tf->border); h = as_fp_u32(h, tf->borderColor);');
-    this.line('h = as_fp_i32(h, tf->scrollV); h = as_fp_bool(h, tf->hscroll);');
+    this.line('h = as_fp_i32(h, tf->scrollV);');
     this.line('h = as_fp_bool(h, tf->multiline); h = as_fp_bool(h, tf->wordWrap);');
     // Every remaining input the TextField render branch (as_render_object_content)
     // and the paragraph cache (as_tf_paragraph) read must be fingerprinted. They
@@ -22640,10 +22681,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('int maxs = lc - vis + 1; if (maxs < 1) maxs = 1;');
     this.line('int top = tf->scrollV; if (top < 1) top = 1; if (top > maxs) top = maxs;');
     this.line('double scrollY = (double)(top - 1) * lh;');
-    // Horizontal scroll: hscroll=false clips at width (no pan); hscroll=true lets
-    // scrollH pan within [0, maxScrollH].
+    // Horizontal pan: a wordWrap=false field clips its text and scrollH pans it
+    // within [0, maxScrollH]; a wrapping field never pans (maxScrollH == 0). AIR has
+    // no `hscroll` switch -- scrollH/maxScrollH always work, which is why the old
+    // gate on an invented `hscroll` property made maxScrollH read 0 for ordinary
+    // AIR-compatible code.
     this.line('int maxsh = TextField_get_maxScrollH((void*)tf);');
-    this.line('int leftpx = tf->hscroll ? tf->_scroll_h : 0;');
+    this.line('int leftpx = tf->_scroll_h;');
     this.line('if (leftpx < 0) leftpx = 0; if (leftpx > maxsh) leftpx = maxsh;');
     this.line('double scrollX = (double)leftpx;');
     // Block shift for horizontalAlign when the paragraph carries none itself
@@ -22745,9 +22789,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_skia_paint_delete(bp);');
     this.indent--;
     this.line('}');
-    // Insertion caret (阶段一百三十五). Drawn ONLY on the FOCUSED, SELECTABLE field
-    // -- the same gate the selection highlight uses (measured rule: a dynamic field
-    // with selectable=false gets no caret at all) -- and ONLY in a window/compose
+    // Insertion caret (阶段一百三十五). Drawn ONLY on the FOCUSED, SELECTABLE, INPUT
+    // field -- the same gate the selection highlight uses, plus the type check AIR
+    // applies: measured on adl 51.4.1, a focused selectable DYNAMIC field shows no
+    // caret at all (it still shows the selection band when dragged), so the caret is
+    // an input affordance rather than a selection one. And ONLY in a window/compose
     // pass (ASC_caret_pass), because AIR's caret is a player overlay rather than
     // part of the field's rasterization (measured: BitmapData.draw excludes it).
     // A 1 DEVICE-pixel vertical bar at the caret's paragraph box, in the field's
@@ -22755,7 +22801,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // caret move / keystroke (as_tf_blink_reset) so it is solid right after the user
     // acts. A focused field is never served from a bake (see the cache guard in
     // as_render_object), so the caret is repainted live each frame.
-    this.line('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable) {');
+    this.line('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable && as_tf_is_input(tf)) {');
     this.indent++;
     this.line('double kcx = 0.0, kcy = 0.0, kch = 0.0;');
     this.line('if (as_tf_caret_on() && as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, as_tf_caret(tf)), &kcx, &kcy, &kch)) {');
