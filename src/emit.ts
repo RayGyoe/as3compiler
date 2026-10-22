@@ -32231,6 +32231,18 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         // are all `true` while int(obj) is 0 and Number(obj) is NaN.
         if (e0!.type.kind === 'null') return { code: 'false', type: { kind: 'bool' } };
         if (e0!.type.kind === 'interface') return { code: `(${e0!.code}.obj != NULL)`, type: { kind: 'bool' } };
+        // The Object ROOT cannot be tested as a bare pointer either: our Object-typed
+        // slots BOX scalars (as_number_new/as_string_new/as_boolean_new, stored by
+        // coerce() below), so a slot holding false/0/NaN/"" is a non-NULL object and a
+        // pointer test called it TRUE -- while AIR keeps the primitive in the slot and
+        // applies ITS ToBoolean. Measured on adl 51.4.1 (asaotui/probes/g9-adl): all
+        // seven Boolean(<Object slot>) cells were false on AIR, true on our AOT, while
+        // typeof/String/is/== and even `if (o)` already agreed (condExpr unboxes). This
+        // is the same unbox-then-ToBoolean rule condExpr uses; concrete subclasses
+        // never hold a boxed scalar, so they keep the pointer test.
+        if (e0!.type.kind === 'object' && (e0!.type as { className: string }).className === 'Object') {
+          return { code: `as_v_truthy(as_obj_to_value((void*)(${e0!.code})))`, type: { kind: 'bool' } };
+        }
         if (e0!.type.kind === 'dict' || e0!.type.kind === 'class' || this.isRefType(e0!.type)) {
           return { code: `(${e0!.code} != NULL)`, type: { kind: 'bool' } };
         }

@@ -14513,6 +14513,61 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 **五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——G8 本身记在 `asaotui/compiler-gaps.md`（已标已修），
 遗留表里的类成员粒度那行**未动**（仍是独立立项）。按表内实际行数重数仍为 **100 项**。
 
+### 阶段二百四十八：G9 —— `Boolean(<静态 Object 槽>)` 补解箱（v0.4.211 → v0.4.212）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+`asaotui/compiler-gaps.md` 的 **G9**：`Boolean(x)` 在 `x` **静态声明为 `Object`** 时退化为指针测试。
+我们的 `Object` 槽会把标量装箱（`as_number_new`/`as_string_new`/`as_boolean_new`），于是装 `false`/`0`/`NaN`/`""`
+的槽是一个**非 NULL 对象**；旧分支对 `isRefType`（含 `object`）一律做 `x != NULL` ⇒ **恒真**。
+
+**判定靠实测，不靠推断**：本机有 AIR SDK 51.4.1（`D:/Adobe/Flex_Sdk/AIRSDK_51.4.1`），用同一份
+26 格用例 `G9Cases.as` 驱动两条工具链（`mxmlc`+`adl` vs 我们的 AOT），修复前 **AIR 0 失败 / 我们 7 失败**，
+七条全是 `Boolean(<Object 槽>)`；而同一值的 `typeof`/`String()`/`is`/`==`/`===`/`Number()`/`== null`
+以及 **`if (o)`** 两臂逐字符相同 ⇒ 缺陷**只在 `Boolean()` 这一个降级入口**（`condExpr` 早就解箱了）。
+
+**二、落地**
+
+- `src/emit.ts` 的 `Boolean` 分支：在 `dict || class || isRefType(...)` 那条**之前**加一条
+  `kind === 'object' && className === 'Object'` ⇒ `as_v_truthy(as_obj_to_value((void*)(x)))`，
+  与 `condExpr`（`if`/`while`/`?:`/`!`/`&&`/`||`）**同一条规则、同一个 helper**。运行时**零改动**。
+- **具体子类刻意不跟**：`Sprite`/用户类/`Array` 的槽里永远不装标量，保留 `(x != NULL)`；`String` 仍是
+  `as_str_truthy` 的 `strlen` 式、`*` 仍是 `as_v_truthy`、`bool` 仍是自身、`int` 仍是 `!= 0.0`。
+- **新增示例** `examples/object-truthy.as`：19 条断言（7 个假值格 + 5 个真值格 + null + 与 `if`/`!`/`?:`
+  的一致性 + 包装器 `new Boolean(false)`），改坏任一处即非 0 退出。
+
+**三、验证**
+
+- **probe A/B 复跑**：同一份 `G9Cases.as`，AOT 臂 **26 checks / 0 failures**（`probes/g9-adl/aot-got-fixed.txt`），
+  与 AIR 臂逐字符一致。
+- **新钉 `unit: emit/ObjectTruthy`（9 条）**：Object 形参/字段两条走解箱、具体子类与 `Array` 保留指针测试、
+  `*`/`String`/`bool` 拼写逐字不变、`if (o)` 与 `Boolean(o)` 用同一 helper。钉的是**拼写与适用范围**——
+  行为已由示例覆盖。
+- **变异 3/3 全部被抓**（`temp/g9mut.cjs`，每步 sha256 校验还原 `394b5d079226f132`）：
+  | 变异 | 示例 | 单元钉 |
+  |---|---|---|
+  | M1 删掉 Object 根分支（回落指针测试） | **红**：`Boolean(Object<false>) got true want false` | **红 3 条** |
+  | M2 保留分支但退回 `(x != NULL)` | **红**（同上） | 红 3 条 |
+  | M3 丢掉 `className === 'Object'` 守卫（所有 object 类型都解箱） | **绿** | **红 1 条**（具体子类保留指针测试） |
+  M3 这一格是**有意留下的信息**：对真对象解箱与指针测试**行为等价**，所以「示例绿」不证明规则没坏——
+  适用范围由钉子守（与阶段二百四十七 的 M1 同一课）。
+- 全量回归 **463 项 / 460 过 / 3 红**，红的仍是既有三项（`socket.as` 无 Windows socket 后端、
+  `stage94d.as` UTF-16LE、`unit: inline/StackCanary` 本机 clang 差异）。
+
+**四、如实报明 / 残差**
+
+- **按用户指示未改 UI kit**：kit 里 6 处「绑定量声明为 `Object` 再 `Boolean()`」的 `*` 规避**保持原样**
+  （它们现在不再必要，但也不是错误；回退是另一件事）。
+- **`new Boolean(false)` 的 AS3 事实已记档**：AIR 的 `typeof` 是 `"boolean"`、`Boolean(wrapper)` 是 `false`
+  （不是 ES3/JS 的 `object`/`true`，AVM2 对 Boolean 包装器透明）；我们这两格本就一致，本轮补进用例。
+- **只覆盖 `Boolean()` 这一个入口**：`!!o` 走 `!`→`condExpr`，本来就对；接口槽 `Boolean(iface)` 仍是
+  `iface.obj != NULL`（接口槽不会装标量，未在 A/B 里出现过差异）。
+- 文档同步：`docs/zh-cn/as3-semantics.md` + `docs/en/as3-semantics.md` 的「`Object` 槽自动装箱」行、
+  `README-CN.md` 的「语义」行；`asaotui/compiler-gaps.md` 的 G9 标题/判定/状态/AB 四处 + 探针 README。
+
+**五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——G9 记在 `asaotui/compiler-gaps.md`（已标已修）。
+按表内实际行数重数仍为 **100 项**。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

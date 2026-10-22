@@ -3482,3 +3482,67 @@ function checkEmitCNameCollision(): string[] {
   return bad;
 }
 registerGroup('unit: emit/CNameCollision', checkEmitCNameCollision);
+
+// 阶段二百四十八 (G9): `Boolean(x)` on a slot STATICALLY declared `Object`.
+// We BOX scalars into Object slots (as_number_new/as_string_new/as_boolean_new), so
+// the holder of false/0/NaN/"" is a non-NULL object and the old `isRefType` branch
+// (a bare pointer test) answered TRUE. AIR keeps the primitive in the slot and
+// applies ITS ToBoolean -- measured, all seven cells false on adl 51.4.1
+// (asaotui/probes/g9-adl). The emitted SPELLING is pinned here because the
+// behaviour is covered by examples/object-truthy.as: what must not silently change
+// is WHICH types take the unboxing path (only the Object ROOT -- a concrete subclass
+// can never hold a boxed scalar, so it keeps the pointer test).
+function checkEmitObjectTruthy(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [objtruthy] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [objtruthy] ${label}`); }
+  };
+  const gen = (src: string) => generateC(parse(src)).c;
+  const body = (c: string, sig: RegExp): string => {
+    const m = c.match(sig);
+    if (m === null) return '';
+    return c.slice(m.index!, (c.indexOf('\r\n}', m.index!) >= 0 ? c.indexOf('\r\n}', m.index!) : c.length));
+  };
+
+  // --- the Object ROOT unboxes first (the G9 fix) ------------------------------
+  const objParam = gen('function t(o:Object):Boolean { return Boolean(o); }\ntrace(t(null));');
+  const objBody = body(objParam, /static bool t\(Object\* _o\) \{/);
+  check('Boolean(<Object param>) unboxes before ToBoolean',
+    objBody.includes('return as_v_truthy(as_obj_to_value((void*)(_o)));'));
+  check('Boolean(<Object param>) is NOT a pointer test',
+    objBody !== '' && !/_o != NULL/.test(objBody));
+
+  const objField = gen('class Holder { public var o:Object; public function f():Boolean { return Boolean(o); } }\ntrace(new Holder());');
+  check('an Object FIELD takes the same path',
+    body(objField, /static bool Holder_f\(void\* _this\) \{/)
+      .includes('return as_v_truthy(as_obj_to_value((void*)(this->_o)));'));
+
+  // --- everything else keeps its old, AIR-matching spelling ---------------------
+  const plain = gen('class Plain { public var v:int = 1; }\n'
+    + 'function t(p:Plain):Boolean { return Boolean(p); }\ntrace(t(null));');
+  check('a CONCRETE subclass keeps the pointer test',
+    body(plain, /static bool t\(Plain\* p\) \{/).includes('return (p != NULL);'));
+  check('an Array keeps the pointer test',
+    body(gen('function t(a:Array):Boolean { return Boolean(a); }\ntrace(t(null));'),
+      /static bool t\(as_array\* a\) \{/).includes('return (a != NULL);'));
+  check('a `*` operand still goes through as_v_truthy',
+    body(gen('function t(d:*):Boolean { return Boolean(d); }\ntrace(t(1));'),
+      /static bool t\(as_value d\) \{/).includes('return as_v_truthy(d);'));
+  check('a static String keeps the empty-string test',
+    body(gen('function t(s:String):Boolean { return Boolean(s); }\ntrace(t(""));'),
+      /static bool t\(char\* s\) \{/).includes('return (s != NULL && strlen(s) > 0);'));
+  check('a bool operand is still the value itself',
+    body(gen('function t(b:Boolean):Boolean { return Boolean(b); }\ntrace(t(true));'),
+      /static bool t\(bool b\) \{/).includes('return b;'));
+
+  // --- condExpr already agreed; the fix must not diverge from it --------------
+  const cond = gen('function t(o:Object):void { if (o) trace(1); }\ntrace(1);');
+  check('`if (o)` and `Boolean(o)` share the same helper',
+    cond.includes('if (as_v_truthy(as_obj_to_value((void*)(_o)))) {'));
+
+  console.log(`     [objtruthy] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ObjectTruthy', checkEmitObjectTruthy);
