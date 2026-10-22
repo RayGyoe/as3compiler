@@ -69,7 +69,7 @@ package demo {
 					+ " menuNull=" + (menu == null)
 					+ " orderInFrontOf=" + orderInFrontOf(opened[0])
 					+ " globalToScreen=" + p.x + "," + p.y
-					+ " displayStateChange=" + NativeWindowDisplayStateEvent.CHANGE);
+					+ " displayStateChange=" + stage.nativeWindow.displayState);
 			}
 			private function initview():void{
 

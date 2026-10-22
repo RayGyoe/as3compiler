@@ -14083,6 +14083,31 @@ Windows 上的全量回归有 16 条红是同一类：`examples/` 下 15 个示�
 
 ---
 
+### UI 工具链待定项（未排期）
+
+> **本节既不是欠账表、也不是增益表**，而是一份**评估的落点**：产物是工作区根目录的
+> [`ui-toolkit-feasibility.md`](../asaotui/ui-toolkit-feasibility.md)（英文镜像 `ui-toolkit-feasibility-en.md`），
+> 结论是「借 GPUI 的作者模型，不借它的每帧重建」。**不占阶段号、不升版本**——只有真进入实施才占。
+>
+> **一句话裁决**：L1 渲染（Skia + Stage3D）与 L2 显示树/事件/命中/文本**已有且对 `adl` 校准过**，
+> **不借**；缺的是 **L3 控件与作者模型**（219 个示例里连一个 Button 都没有）+ L2 的**自动布局**；
+> 焦点/Tab 与快捷键是**形态欠账**而非空白。
+
+| 待定项 | 现状 | 卡在哪 | 入表判据 |
+|---|---|---|---|
+| **U1 布局底座**（`Style` 值表 + flexbox 接缝） | **无任何自动布局**——`grep -riE "flexbox\|yoga\|taffy\|layout_engine"` 于 `src/*.ts` 零命中；x/y/width/height 一律用户手写 | **前置测量未做**：Yoga（C API、MIT）的体积增量、wasm 目标可编性、与现有 `-Wl,-dead_strip` 的相容性。测不过就不做，退回「AS3 侧 flexbox 子集」并如实登记子集边界 | 属**增强**（AIR 无对应物）⇒ 走 `--features` 具名开关，不入两张表 |
+| **U2~U5 元素身份 / 数据流 / 控件 / 键盘优先** | 全无：无 `Observable`/`notify` 重绘调度、无控件集、快捷键仍是 `SDL_KEYDOWN` → `keyCode` 直投（`vendor/window_glue.cc:1360`） | 依赖 U1 的接缝形状先定下来；其中 **U2 的 keyed reconcile 是硬要求**（每帧分配会撞 GC 每帧预算红线，见 [`docs/zh-cn/gc.md`](docs/zh-cn/gc.md)） | 同上（增强） |
+| **`flash.accessibility` 整包缺失** | `grep -rn "accessibility" src/*.ts` 除 `Sound`/`Keyboard.isAccessible` 等无关命中外**零结果**；AIR 有 `Accessibility` / `AccessibilityProperties` / `AccessibilityImplementation` / `ISearchableText` / `ISimpleTextSelection` | 属**欠账**（AIR 有、我们没有），但**本轮按决定不登记进表**；若将来入表：表内项数 **100 → 101**、`未开始` **76 → 77** | 硬判据已成立（`adl` 有该面、我们跑不出）⇒ 可直接入 `遗留待开发` |
+| **Tab 序的 64 个可聚焦对象上限** | `as_tab_scan`（`src/emit.ts:10850`）每次按 Tab **从零重扫全树**、硬上限 **64**（越限「Tab 就不再移动」，代码注释自述），且**无分组**（模态内循环无从做起） | **口径未实测**：`adl` 在 >64 个 tabbable 下的行为还没量过 | §1.5 要求先有 `adl` 实测 ⇒ **暂不入表**，实测后按结果入表或关闭 |
+| **窗口后端不转发触摸事件** | `grep FINGER\|TOUCH` 于 `vendor/window_glue.cc` 零命中；`TouchEvent` 类完整（`src/emit.ts:11987`，阶段九十三）但**输入源不存在**，`Multitouch.maxTouchPoints` 恒 `0` | 与 UI 库同一条路（滚动/拖拽到手势），但也影响 AIR 基线本身 | **口径未实测**（AIR 在支持触摸的宿主上会派发 `TouchEvent`）⇒ 暂不入表 |
+
+> **明确不做**（防范围蔓延，全文见文档 §4.3 / §8 / §9）：不新增第三条 GPU 渲染管线（已有 Skia 与 Stage3D
+> 两条）；不换文本引擎（[`docs/zh-cn/rust-text-backend.md`](docs/zh-cn/rust-text-backend.md) §9 已算过账）；
+> 不做热重载 / inspector / profiler；不做手势识别（输入源都没有）；控件层一律放独立命名空间
+> （`asaot.ui.*`），**不进 `flash.*`**、不改写任何 AIR 已定义行为。
+
+---
+
 ## 备注
 
 - 每个阶段完成后：**回归运行 `examples/` 下所有旧示例**，确保不破坏已有功能；更新 README；版本号按 patch 小版本递增（`v0.4.0 → v0.4.1 → v0.4.2 → …`，自 v0.4.0 起；此前为 v0.3.x），避免 minor 版本过早逼近 1.0.0。
