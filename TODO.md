@@ -14018,7 +14018,90 @@ AS3 `Vector.<int>`（4 B / 静态类型）、as3compiler 动态 `Array`（24 B �
 - 文档：`docs/{zh-cn,en}/c-naming.md` §4.10（含「为什么函数式宏与对象式宏不能用同一个办法」与上面
   那条残留的说明）。
 
+### 阶段二百四十一：命中测试边界与拾取口径的实测结案（v0.4.205，`src/` 无改动，不升版本号）✅ 已完成
+
+**一、这一轮为什么不动 `src/`**
+
+遗留表里属于「命中测试边界/区域」的有三行（原 14179「box 在描边外缘外 0.25px 仍命中」、原 14182
+「贴边 ~0.05px 不一致」、原 14181「交互拾取未实测 adl 口径」）。三行此前都只有**一条窄证据**：
+42 行逐行对照里 2 行不同、以及一次旋转方块的真鼠标点击。本轮用 `temp/hitprobe3/` 把它量透，
+结论是**两行不必复刻、一行本来就已对齐**：
+
+- 边界那两行不是「容差」，而是 **adl 侧随绝对位置锯齿的光栅化相位**（幅度 ≤ 半像素、只在
+  「边界 ±0.5px」这条测度为零的带上）⇒ 复刻要一张绝对网格表，且会把「贴边未中」变成
+  「贴边中」的假阳性；
+- 拾取那行问的是「AIR 的交互拾取是否也问内容区域」——本轮首次拿到 **adl 真鼠标六点**证据，
+  结论与本实现**阶段二百三十三 的改法逐点一致**。
+
+所以既没有行为要改，也没有行为要加 ⇒ 本阶段只落文档与钉子，不改 `src/`、不升版本号。
+
+**二、量出来的东西**
+
+1. **边界不是容差，是绝对网格相位**。`(100,100) 20x20` 填充，1 twip（0.01px）阶梯扫左边界；
+   再把**对象左边缘本身**按 1 twip 从 `100.00` 滑到 `100.25`（`getBounds` 逐次证实边缘真的动了），
+   `adl` 报出的左边界**六次完全相同**（box `100.05`、region `100.20`）——边界不跟对象走。
+2. **是纯函数**。同一查询点重复问 6 次、递增扫 vs 递减扫、两趟、两个对象交错换序、中间插问第三个
+   对象，结果全部一致 ⇒ 不是「上一次查询影响下一次」的缓存 bug（否则它是个可修缺陷）。
+3. **误差矩阵（上界）**。16 个 40x40 填充（左边缘 `200.13 + k*0.13`），每边扫 ±1.2px、步长 0.01：
+
+   | 边 / 判据 | `边界 − 几何边` |
+   |---|---|
+   | box 左边 | −0.41 … 0.00 |
+   | region 左边 | −0.11 … +0.31 |
+   | box 上边 | −0.40 … 0.00 |
+   | region 上边 | −0.40 … +0.25 |
+
+   box 侧 `adl` 恒**更松或相等**（形状像 `floor` 到 0.5px 格子），周期约 **0.5px** 另叠一条更长漂移；
+   `-default-size 500 375`（stage 缩放进 800x600 窗口，scale 1.6）与 `-default-size 800 600`（1:1）
+   量到**同一量级** ⇒ 与舞台缩放 / 设备像素无关。
+4. **交互拾取问的是内容区域**（真鼠标六点，`e.target`）：
+
+   | 舞台点 | 位置 | `adl` 的 `e.target` |
+   |---|---|---|
+   | (210, 260) | 空容器盒内，**纵向缝** | `null`（= stage） |
+   | (220, 220) | 描着色的 `Shape` 子件上 | 父 Sprite |
+   | (250, 220) | 两子件之间的**横向缝**（仍在盒内） | `null`（= stage） |
+   | (270, 220) | 第二个子件上 | 父 Sprite |
+   | (250, 400) | 有底板的容器，子件之间 | 该容器 |
+   | (210, 440) | 有底板的容器，子件下方 | 该容器 |
+
+   三条语义：**自己不画的容器不是目标**（盒内也不行）、**画了底板的就是目标**、**`Shape`
+   （非 `InteractiveObject`）自己不可能是目标**（事件落到最近的**可交互祖先**）。
+
+**三、改法：只有文档与钉子**
+
+- `docs/{zh-cn,en}/as3-semantics.md`：§3 表里那行「命中测试的贴边松紧」**重写**——旧口径
+  「只在贴边 ~0.05px 内」作废（那是单次旋转方块抽样的巧合），改成「位置相关锯齿 + 上界表」；
+  另新增 **§3.4 命中测试边界的光栅化模糊带**（中英双语），四组探针 + 裁决 + 复跑命令。
+- `examples/stage94s.as` 新增 **H 节（17 断言）**：box 判据在四条边**闭区间**（`100.00`/`120.00`/
+  `250.00`/`270.00` 都算中）、`±0.01px` 外不中（**没有模糊带**）、region 在填充边 ±0.05px 的正负例、
+  描边带（中心线两侧各 width/2）在 box 与 region 两侧都算中、以及**缩放后仍严格**（`scale=0.5`，
+  `309.99` 中 / `299.99` 不中）。头注释里那句「0.25px 仍算命中」也一并改为指向 §3.4。
+- `examples/hit-pick-layer.as` 新增 **D 节（5 断言）**：`Shape` 子件不是目标、它的可交互父容器是、
+  两 `Shape` 之间的缝不是目标（而父容器的 **box** 仍跨越那条缝）、纵向缝同样不是目标。
+
+**四、验收**
+
+- 两个后端都跑：headless（纯 C，region 退化走 `_max_sw` 外框）与
+  `--manifest examples/tf-scale-metrics.build.json`（Skia，region 走 `SkPath::contains` + 描边轮廓）
+  都是 `stage94s ok` / `hit-pick-layer ok`。**region 断言刻意留 0.05px 余量就是为这一条**：
+  `SkPath::contains` 是半开的，贴边断言会变成「后端相关」。
+- `node --test --test-name-pattern='stage94s|hit-pick-layer' test/examples.ts` → 2/2 pass。
+- 全量 `node test.ts` → **451 passed / 0 failed**（H/D 是**追加断言**，不新增用例）。
+
+**五、如实报明与残留**
+
+- adl 侧的点击是**屏幕坐标投递**（Quartz，`temp/hitprobe3/pick_probe.py`）：屏幕点与舞台点之间
+  有 ~1.056 的显示倍率差（CGEvent 走显示像素、窗口框与 stage 走逻辑点），故脚本先两点标定、
+  再按残差迭代到 < 0.5px；判读一律以 **`adl` 自己打印的 `stageX/stageY`** 为据。
+- 遗留表里**不在本轮范围**、仍是真缺口的一条：原 14180「多个 `beginFill` 组的嵌套 —— 我们只有一条
+  路径、even-odd 把它当洞」（要保留 fill 组边界，属渲染几何的结构改动），保持原行不动。
+- 本节**没有**给 box 侧复刻模糊带，也没有引入任何容差；若将来有人确实需要「贴边 0.5px 也算中」，
+  必须带上 §3.4 的上界表与 `temp/hitprobe3/FINDINGS.md`，别凭印象写成容差。
+
 ### 遗留待开发
+> **2026-10-22 追加（阶段二百四十一：命中测试边界与拾取口径的实测结案）**：**新登记 0 行 / 改写 0 行 / 移出 3 行** ⇒ 表内项数 **101 → 98 项**（`未开始` **75 → 72**，其余不变）。本轮**没有改任何 `src/`**：三行都以「实测结案」而非「改代码」收口 —— ① 两行「边界松紧」（原 14179 的 0.25px、原 14182 的 0.05px）经四组探针证明 `adl` 的边界**不是容差**而是随**绝对位置**锯齿的光栅化相位（对象边缘滑 1 twip×6 步，`adl` 报出的边界六次相同；重复 / 正反扫 / 换序 / 插问邻居全一致 ⇒ 纯函数、不是可修的缓存 bug），幅度 ≤ 半像素且只在「边界 ±0.5px」这条测度为零的带上，复刻要一张绝对网格表且会把「贴边未中」变成「贴边中」⇒ 维持严格几何，上界表与证据留档在 `docs/{zh-cn,en}/as3-semantics.md` §3.4 + `temp/hitprobe3/FINDINGS.md`；② 原 14181（交互拾取是否问内容区域）本轮首次拿到 **adl 真鼠标六点**证据（`temp/hitprobe3/Body7.as` + `pick_probe.py`）：无图形的 Sprite 在**自己盒内、子件之外**（横向缝与纵向缝）**都不是目标**，画了底板的容器在同样的缝里**是**目标，`Shape`（非 `InteractiveObject`）自己不可能是目标、事件落到最近的**可交互祖先** —— 与本实现阶段二百三十三 的改法**逐点一致**，故该行也结案。钉子 = `examples/stage94s.as` 新增 H 节（17 断言：box 闭区间四边 + 0.01px 外侧不中 + region ±0.05 + 含描边带 + 缩放后仍严格）与 `examples/hit-pick-layer.as` 新增 D 节（5 断言），两处都在 **headless 与 Skia 两个后端**跑过。
+>
 > **2026-10-22 追加（阶段二百四十：顶层自由函数名的重名消解 —— 宿主符号 / C 类型名 / 宿主宏）**：**新登记 2 行 / 改写 0 行 / 移出 2 行**（其中「顶层自由函数名撞宿主符号」的两行**重复登记**合并为 1 行）⇒ 表内项数 **101 → 101 项**（`未开始` **76 → 75**、`已修` **3 → 4**，其余不变）。本阶段修的是**顶层自由函数**名直接当 C 符号用：撞 libm/libc（`log`/`pow`/`index`）、撞 C **类型名**（`Sprite`）、撞 Windows **函数式宏**（`min`/`max`）与 **对象式宏**（`near`/`far`/`small`）—— `adl`/`mxmlc` 对同一份源码照跑不误。**新登记的第 2 行**是同一缺陷在**类成员**粒度上的同族（成员名撞发射器给每个类种下的固定后缀，`cls`/`vt`/`ctor`/`props`/`amf_members` 实测全部编不过），属独立立项。
 >
 
@@ -14176,10 +14259,7 @@ AS3 `Vector.<int>`（4 B / 静态类型）、as3compiler 动态 `Array`（24 B �
 | `flash.text.StyleSheet.parseCSS` / `transform` 未实现（**刻意**：调用处是**响亮**的 `undefined method` 编译错误，不静默接受 AIR 能解析的 CSS） | 未开始（2026-10-13 阶段一百四十八 主动登记） | 本轮把 `StyleSheet` 做成真类（`setStyle`/`getStyle`/`clear`/`styleNames` + 成为 `htmlText` 的规则来源），与 `adl 51.4.1` 逐项实测（`temp/ssprobe/`）。缺的两项：`parseCSS(CSSText)` 把 CSS 文本解析成规则集、`transform(formatObject):TextFormat` 把规则转成 `TextFormat`。AIR 的 CSS 子集很小（14 个属性、只认 `#RRGGBB`、数值只取数字部分），实现面可控 | 独立立项：先用 `adl` 采 `parseCSS` 的**接受面**（选择器形态、逗号分组、注释、未知属性、错误容忍）与 `transform` 的**输出 `TextFormat` 形状**，再实现（都是纯字符串解析，无渲染风险） |
 | `htmlText` 多行 run 的**行高**偏大约 1.5×；规则里的 `leading` 未折进 run | 未开始（2026-10-13 阶段一百四十八 实测登记） | 同段 htmlText、同字段宽（`temp/ssprobe/`，带 Skia）：**行数与宽度逐值吻合**（A: n=5 w=55.03 vs AIR 51.05；A5: n=1 w=157.37 vs 155.3；A9: n=1 16.65 vs 16.1），**行高**却是我们 `h=45` vs AIR `30.1`（A2 60 vs 47.55、A6 36 vs 16.1、A3 20 vs 8.4）。**未做单变量 A/B**，故不排除部分来自「规则 `leading` 未生效」（我们只把 `color`/`fontSize`/`fontFamily`/`fontWeight`/`fontStyle`/`textDecoration` 折进 run）。**顺带登记**：`TextField.getLineText` 未实现（响亮 `undefined method`）⇒ 采证据前先补它 | 独立立项：① 补 `getLineText`，逐 run 采 `adl` 的行盒高度，判定 AIR 是按 run 行盒还是整段行盒；② 把规则 `leading` 折进该 run 的 `TextFormat`（`as_ss_str(rule, "leading")` 现未读）；③ 复核 `numLines` 的口径（AIR 计入尾部空行） |
 | `Stage.fullScreenWidth/Height` 取「完整显示模式」而非 AIR 的「可用区」 | **部分完成**（**本轮实测发现**，八十九·六十八；**2026-10-20 阶段二百零六 收窄到只剩 macOS 一端**：Windows 实测该规则**不成立** —— `adl` 的 `Stage.fullScreenWidth/Height` 与 `Capabilities.screenResolutionX/Y` **同值** `2560x1707` = **整块**显示器（DIP），可用区在那台机器上是 `3840x2488` 物理（`1659` DIP）且只出现在 `Screen.visibleBounds`） | 同机同刻三端对照：`adl` **1800x1137** vs 我们 **1800x1169**（同一显示器时 Δ = 32 = 菜单栏高度）；换到外接显示器后 `adl` 报 **2560x1408**（= 2560x1440 − 32），规则**跨两种显示模式复现**。即 AIR 取**窗口所在显示器的可用边界**，我们取 `SDL_GetDisplayBounds`（display 0 的**整块**显示器；阶段一百七十三 由 `SDL_GetCurrentDisplayMode` 改来 —— 两者都是整块、只是空间不同，macOS 上同空间）。**多显示器下两者甚至不在同一块屏**（native 报内建 1800x1169、adl 报外接 2560x1408），修复须一并考量「窗口在哪块屏」——这与当前实现的「总是 display 0」是两件事。web 侧同源：我们读 `window.screen`（无头 Chrome 实测 800x600，真实浏览器则是整屏尺寸），而舞台其实只有 canvas 那么大 | 独立立项：native 侧把 `SDL_GetCurrentDisplayMode` 换成「窗口所在显示器的可用边界」（`SDL_GetDisplayUsableBounds` + `SDL_GetWindowDisplayIndex`），web 侧把 `window.screen` 换成 `screen.availWidth/availHeight`。**（2026-10-20 阶段二百零六 收窄）**：这条**只对 macOS 成立**（Windows 上 AIR 也取整块，见状态列），故两端**不可共用同一条修法**；且仍只能落在 `Stage` 侧（本行末段 2026-10-02 的「不得顺手把 `Capabilities` 换成可用区」继续有效）。**注意**：`Starling` 的 `ScreenSetup` 正是按这两个值定世界尺寸（`examples/Flappy-Starling` 的布局即由此而来），改动会连带影响所有 GUI 示例与 Starling 场景 ⇒ 与上一行**同批回归**。**2026-10-02 实测澄清（防误修）**：`Capabilities.screenResolutionX/Y` 是**另一个量**——同机同刻 `adl` 报 **1800x1169**、我们也是 **1800x1169**（**已对齐**，`as_cap_screen_resolution_x/y` 走的就是 `SDL_GetCurrentDisplayMode`）；只有 `Stage.fullScreenWidth/Height` 才有 1800x1137 vs 1800x1169 的差。故本行修法**只能落在 `Stage` 侧**，不得顺手把 `Capabilities` 的口径一并换成「可用区」（详见下表新增的 `Screen` 行） |
-| 命中测试的**边界约定**：`adl` 的 box 在描边外缘外 **0.25px** 仍算命中、右/下边界**排他**；我们一律**严格几何 + 闭区间** | 未开始（2026-10-04 阶段九十四·二十二 实测登记，`temp/editprobe/hit25_{adl,aot}.txt`） | 42 行逐行对照里**只有 2 行不同**，且都在边界那 0.25px 的抗锯齿模糊带里：`outer edge x=5.75`（描边外缘 6.0 之外）adl `box=true` / 我们 `false`；`right x=34`（正落在描边外缘）adl `box=false shape=false` / 我们 `true true`。`adl` 自己的边界在三组 bitmap 探针里也不完全自洽（Ed21 §A1 与 Ed23 §A 对同一几何给出不同的右边界），故这是**抗锯齿光栅化**的产物而不是一条可抄的规则 | 立项：若要逐像素对齐，须先搞清 AIR 用的是「4x4 超采样覆盖率 ≥ 某阈值」还是「整数像素网格」，并用更多几何（斜线、圆）定阈值；风险是给命中测试引入半像素模糊。当前取严格几何（可解释、可测），差异登记在此 |
 | 多个 `beginFill/endFill` **组**的嵌套：`adl` 两组都填充，我们只有**一条路径** ⇒ even-odd 把它当洞 | 未开始（2026-10-04 阶段九十四·二十二 实测登记，`temp/editprobe/probe26.py` + `snap_ed26_{adl,aot}.png`） | 同一个 200x200 外框 + 60..140 内框：**一次 fill 两个同向子路径** ⇒ 内层中心 adl `FFFFFF`（洞）、我们 `FFFFFF`（洞）✓ 一致；**两个独立 fill 组** ⇒ 内层中心 adl `FF0000`（填充）、我们 `FFFFFF`（洞）✗。根因是本实现「一个 Graphics = 一条 SkPath + 一对 paint」（注释里已写为单路径子集），fill 组边界在记录几何时丢失 | 立项：把 `Graphics` 的绘制记录成**组**（每组一条路径 + 一对 paint），渲染与命中都按组并集；代价是数据结构与指纹（`as_fp_*`）都要跟着改，属独立阶段。顺带定 **`Graphics` 填充规则的第二个判据**（自相交路径：nonzero 填满星形中心、even-odd 挖空；现在只有「同向嵌套子路径成洞」这一条实测支撑 even-odd） |
-| 鼠标**拾取**（`as_pick_hit`）仍按含描边外框，未按内容区域 | 未开始（2026-10-04 阶段九十四·二十二 主动登记，**未实测 adl 的交互拾取口径**） | 本阶段把 `hitTestPoint` 改成区域判定，拾取只跟着改成「含描边外框」（原来连描边都不算 ⇒ 仅有描边的 `Shape` 本来点不到，这是同批修掉的真缺口）。但 `hitTestPoint(x,y,true)` 的实测说「容器子对象之间的缝不命中」——若 AIR 的交互拾取也用区域，则在缝里点父容器应当**不**命中，我们现在会命中。`adl` 侧未做「缝里点击是否收到事件」的探针 | 立项：写一个 adl 点击探针（在 Ed24 §4 的缝里合成点击，看 `MouseEvent.target`），再决定 `as_pick_hit_m` 是否改用 `as_obj_region_hit_local`（改动很小，但会影响既有鼠标相关示例/Starling 触摸通路，需全量回归） |
-| 命中测试在**边界 ~0.05px 内**与 `adl` 不一致（`adl` 更松） | 未开始（2026-10-03 阶段九十四·六 实测登记；**只在贴边点击时可观测**） | `temp/c1probe/click/` 真鼠标实测：屏幕点 `(310,110)` 打在旋转方块上，`adl` 报 `localX/localY = (14.13, -0.021)` **且判定命中**——按严格几何它在盒外 5e-5（`adl` 把 x/y 量化到 1/20px、中间量走单精度，见 `temp/xformcmp/README.md`）。本子集按严格几何判 ⇒ 该点判**不中**。示例为避免依赖这一口径，命中断言一律用**内部点**（如 `(328,142)` → local `(49.49,9.88)`） | 让判定带一个 adl 量级的小容差（经验值 ~1e-3 px，或取量化步长 0.05 的一半），但**任何容差都要先用点击探针在两端口径上标定**，否则会把「贴边未中」变成「贴边中」的假阳性 |
 | `NativeWindow` 家族**剩余**方法/事件/属性面（多窗口运行时已落地） | **部分完成**（2026-10-02 阶段八十九·七十一 落地；2026-10-19 阶段一百九十 落地**第二批反查面**；2026-10-19 阶段一百九十六 落地**第三批：几何限制面与窗口事件族**；2026-10-19 阶段二百零四 落地**第四批：Windows 端两处窗口缺陷**（`<resizable>false</resizable>` 的固定窗 `maximize()` 被 SDL 的 win32 后端静默拒绝、程序显式 `resizable=true` 的子窗被构建级 `ASC_WINDOW_FIXED` 吃掉），本行只登记其中**尚未实现/未实测**的部分） | **已落地**（native 与 `adl 51.4.1` 逐项对齐，含端到端点击验收）：`new NativeWindow(opts)`（默认 400x232 框、返回时 `visible=false`）、`NativeWindowInitOptions` 八个默认值、`bounds/x/y/width/height/title/visible/closed/active/displayState/alwaysInFront/resizable/maximizable/minimizable/systemChrome/type/renderMode/transparent/owner(get)/stage/toString`、`close/activate/minimize/maximize/restore/orderToFront/orderToBack`、4 个静态常量、5 个 token 常量类、**每窗独立 `Stage`**（`showAll`/`align=""`，帧率继承应用级 `Stage.frameRate`，见阶段八十九·七十三）、`Event.CLOSE`（帧边界延迟一帧收尾）、`resize` 事件。**2026-10-19 第二批（阶段一百九十，oracle `temp/nwor/adl-oracle.txt`）**：`Stage.nativeWindow`、`NativeApplication.openedWindows`（**`Array`**，元素与各窗 `stage.nativeWindow` **恒等**，`adl` 实测长度 1→2→1）、`NativeApplication.exit()`（走 glue 的正常收尾，CLOSE 的派发与顺序不变）、`NativeWindow.menu`（诚实地回 `null`）、`orderInFrontOf()`/`orderInBackOf()`（活着的**另一**窗口回 `true`，`null`/自身/已收尾目标回 `false`）、`globalToScreen(point)`（= bounds 原点 + 非客户区边框；`adl` 实测 `(26,26)` + 边框 `(8,31)` ⇒ `(34,57)`）、`NativeWindowDisplayStateEvent`（类骨架 + `CHANGING='displayStateChanging'`/`CHANGE='displayStateChange'` + `NORMAL/MINIMIZED/MAXIMIZED`）。**尚未实现（AIR 有 ⇒ 遗留）**：`startMove()`/`startResize()`（仍恒回 `false`；系统拖拽/缩放）、`owner` **setter** 与 `listOwnedWindows()`（需 `Vector.<NativeWindow>` 单态化）、`notifyUser()`（通知）、窗口菜单（`NativeMenu` **整个子系统**都没有，故 `menu` 只能回 `null`）、`systemMinSize/systemMaxSize/minSize/maxSize` 四个尺寸限制属性（`minSize/maxSize` 目前是**死字段**恒回 `null`；四者的默认值随 OS 而异，macOS 侧本机不可测）、`Event.ACTIVATE/DEACTIVATE` 的**运行时来源**与 `NativeWindowBoundsEvent` 的 MOVED/RESIZED/CLOSING（常量与 MOVE/MOVING/RESIZE/RESIZING 已在，缺的是 glue 侧转发）、`resizeToScreen()`（oracle 里未见边界变化，**可疑、待重测**）、`supportsMenu`/`supportsNotification` 的**逐平台值**（`adl` Windows 实测 **true/true**，我们恒 `false`）。web 目标无多窗口概念 ⇒ 已按 §1.5 **诚实抛 `#2012`**，不属本行。**2026-10-19 第三批（阶段一百九十六，oracle `temp/nwmac/`，双端孪生探针 `nwmac-{adl,aot}.txt`）**：`minSize`/`maxSize`（默认随 OS `78,32`/`136,39`、写入按 `[平台地板, 当前对侧上限]` 钳制、getter 每次回**新** `Point`、写下去**立刻改活窗口**）、`startMove()`/`startResize(edgeOrCorner)`（真实系统拖拽、拖拽中按帧尺寸钳制；最大化/最小化或不可缩放窗口回 `false`）、`resizeToScreen(screen)`（1× 屏 = 该屏 `visibleBounds`；Retina 屏是 AIR 自己的单位异常，按文档口径实现并在此登记）、`listOwnedWindows()`（`Vector.<NativeWindow>`，元素就是 owner 持有的那个窗口对象）、以及**整个窗口事件族**：`resize`/`move`（`NativeWindowBoundsEvent`，`before` **取帧开始快照** ⇒ 一次同时移动+改尺寸时两条事件是同一对矩形）、`displayStateChange`（`NativeWindowDisplayStateEvent`）、`activate`/`deactivate`、`closing`（**可取消**：`preventDefault()` 即不关）、事件在**帧边界**统一结算（每应用帧对所有活窗口各轮询一次，顺序 `deactivate → resize → displayStateChange → move → activate`）、`supportsMenu`/`supportsNotification` 按 OS 回（macOS `false`/`false`、Windows·Linux `true`）。**尚未实现 / 未实测（AIR 有 ⇒ 遗留）**：① `NativeMenu` **整个子系统**（`NativeWindow.menu` 与 `NativeApplication.menu` 只能诚实地回 `null`）；② `systemMinSize`/`systemMaxSize`（AIR 的只读「系统给的限制」，我们**没有这两个成员** ⇒ 照 AIR 写这行代码**编不过**）；③ 拖拽**进行中**的 `moving`/`resizing`：我们只在帧边界派发 settle 后的 `move`/`resize`（常量 `MOVE`/`MOVING`/`RESIZE`/`RESIZING` 都在，但 `MOVING`/`RESIZING` 无来源），`adl` 侧**本轮未测**（要真拖拽探针才能量）；④ **原登记有误、本轮更正**：`owner` **没有 setter 缺口** —— `mxmlc 51.4.1` 里 `owner` 是**只读**的（赋值即编译错，`temp/nwor/` 实测），故无成员可补 | 分批、每批一个可验收行为：① ~~反查面~~ ✅ 阶段一百九十 已完成；② ~~`startMove`/`startResize`~~ ✅ 阶段一百九十六 已完成（不依赖 `NSEvent`：glue 自己按指针位移驱动系统拖拽，且拖拽中按帧尺寸钳制）；③ ~~事件面~~ ✅ 阶段一百九十六 已完成（`resize`/`move`/`displayStateChange`/`activate`/`deactivate`/`closing` 全部落地，红点关闭走真手势双端同序）；④ 剩下：`NativeMenu` 子系统（依赖面最大，最低优先）→ `systemMinSize`/`systemMaxSize`（与 `minSize`/`maxSize` 的平台地板/默认同源，可一并量）→ `moving`/`resizing`（先用 `temp/tkmeet-mac/drag.py` 真拖拽量 `adl` 的派发频率与终态，再决定补法；**别重复派发**，`live_resize_watch` 已在管拖动中的尺寸）。验收继续用 `temp/nwmac/` 的双端孪生探针 + `temp/nwmac/cls/` 的真手势红点关闭
 | `X.transform.matrix` 的**访问链别名**（`var t = X.transform; t.matrix`）仍是残余槽的裸读写 | 未开始（2026-10-02 阶段八十九·七十六 主动登记的实现边界） | `X.transform.matrix` 本身读写已精确（合成/分解访问器对），但 `Transform` 结构体**没有指回属主的反指针**（加它要给每个 `DisplayObject` 挂一个反向引用字段并补 `gc_write_barrier`，风险面覆盖 GC 与全部显示对象）。故先取 `t` 再经 `t.matrix` 读写时，读到/写到的仍是 **skew 残余槽**（不含 `x/y/rotation/scaleX/scaleY`），与 adl 的「同源单一矩阵」不一致。探针 T5 实测 adl 的 getter 返回拷贝，故这个别名写法**在 AIR 里本来就是无效操作**（改了不动对象），我方目前是「改残余槽」——不报错但语义不同 | 立项时与「矩阵作唯一真源」的重构合并做：`Transform` 加 `owner` 反指针（或用 owner 侧懒查表），读写字面量 `t.matrix` 也走访问器对；**须整批回归** GC 审计（`ASC_GC_AUDIT`）+ Starling 12 场景 + 全部 GUI examples |
 | 两个矩阵的**分解字段**与 adl 不同（矩阵往返与渲染仍精确） | 未开始（2026-10-02 阶段八十九·七十六 探针实测） | ① 纯 flipX `[-1,0,0,1,5,6]`（T10）：adl 给 `rotation 0 / scaleX -1 / scaleY 1`，我方给 `rotation 180 / scaleX 1 / scaleY -1`；**证据**：adl 对结构相同的 `diag(-2,3)`（T19）却给 `rotation 180 / scaleX 2 / scaleY -3`，即 adl 的选择**不是所赋矩阵的函数**（纯 flipX 与 `diag(-1,1)` 是同一矩阵，adl 两者答案不同）。② `[0,0,1,1,5,6]`（T25，零首列且非零首行）：我方渲染链 `translate·rotate·scale·残余` 在 `scaleX=0` 时表示不出「首行非零」，故把线性部分整体寄存到残余（字段报 `scaleX/scaleY = 1`），adl 报 `scaleX 0 / scaleY 1.414`。两例的**矩阵读回与像素都精确**（T10/T25 反向对照：读回逐值等于所赋矩阵） | 收益极低（要改渲染合成顺序或引入 AIR 内部的双存储），暂不排期；若将来做 ①，先扩充 `temp/xformcmp/cmp_probe.py` 的 `KNOWN` 集合口径，并把两例的行为差异写进 `docs/zh-cn/as3-semantics.md` 决策分歧点 |

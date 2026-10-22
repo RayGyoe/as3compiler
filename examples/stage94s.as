@@ -6,9 +6,12 @@
 //
 // adl 实测口径（点一律在 stage 空间）——「内容」= 自己的 Graphics（填充 ∪ 描边）
 // ∪ 子对象内容：
-//   * `shapeFlag=false`（box）：点在内容的**含描边外框**内。实测：20x20 填充带 8px
-//     描边时，x=5.75（描边外缘 6.0 之外 0.25px）仍算命中 ⇒ 框是**画出来的范围**，
-//     不是 getRect 的几何。
+//   * `shapeFlag=false`（box）：点在内容的**含描边外框**内。当初的实测是「20x20 填充带 8px
+//     描边时，x=5.75（描边外缘 6.0 之外 0.25px）仍算命中」——**那条 0.25px 后来被阶段
+//     二百四十一 推翻**：adl 的边界不是「外缘外 0.25px 的容差」，而是**随绝对位置锯齿**的
+//     光栅化相位（box 侧 −0.41…0.00px、周期约 0.5px，见 `docs/zh-cn/as3-semantics.md` §3.4）。
+//     结论不变的是「框 = **画出来的**范围（含 width/2），不是 getRect 的几何」——那是本阶段
+//     真正要钉的东西；模糊带那半边不复刻（H 节）。
 //   * `shapeFlag=true`（region）：点在**内容区域**内：
 //       - 矢量：填充区（**even-odd** —— 同一次 fill 里同向嵌套的两个子路径，内层是洞）
 //         ∪ 描边带（默认圆头圆角，中心线两侧各 width/2；实测 4.5px 命中、5.5px 不中，
@@ -141,6 +144,56 @@ mirrored.scaleX = -1;
 stage.addChild(mirrored);
 check(mirrored.hitTestPoint(195, 205, true), "G: a mirrored bitmap hits on the mirrored side");
 check(!mirrored.hitTestPoint(205, 205, true), "G: and misses on the original side");
+
+// ---- H. 边的松紧：严格几何 + 闭区间（阶段二百四十一 · 三组探针实测） -----------
+// 遗留表曾把这里写成「adl 在描边外缘外 0.25px / 盒外 0.05px 仍算命中，我们更紧」。阶段
+// 二百四十一 用 temp/hitprobe3 把它量透：adl 的边界确实比几何边松，但**不是一个容差**——
+//   * 幅度随**绝对位置**锯齿（box 侧 −0.41…0.00px、region 侧 −0.11…+0.31px、周期约 0.5px）；
+//     把 20x20 填充的左边缘按 1 twip 滑 6 步（getBounds 逐次证实边缘真的动了），adl 报出的
+//     左边界**六次完全相同** ⇒ 边界钉在绝对网格上，不跟着对象走；
+//   * 是**纯函数**（重复问 / 正反扫 / 两趟 / 换序 / 中间插问邻居全一致）⇒ 不是可修的缓存 bug；
+//   * stage 缩放 1.6 与 1:1 量到同一量级 ⇒ 不是缩放/设备像素伪影。
+// 复刻它要一张绝对网格表，且会把「贴边未中」变成「贴边中」的假阳性 ⇒ 我们维持**严格几何 +
+// 闭区间**；可见口径差只有半像素，且只在边界那条**测度为零**的带上（docs/zh-cn/as3-semantics.md
+// §3.4）。本节把这条规则钉住，防止后人在不知情下把判定改成模糊的。
+// 注：box 判据是纯算术，**可以**在边界上断言；region 判据在 Skia 后端经 `SkPath::contains`
+// （半开），故 region 的正/负例各留 0.05px 余量，两个后端才都成立。
+var box2:Sprite = new Sprite();
+box2.x = 100; box2.y = 250;
+box2.graphics.beginFill(0xFFFF00); box2.graphics.drawRect(0, 0, 20, 20); box2.graphics.endFill();
+stage.addChild(box2);
+check(box2.hitTestPoint(100.00, 260, false), "H: the box test includes the left edge exactly");
+check(box2.hitTestPoint(120.00, 260, false), "H: ...and the right edge exactly");
+check(box2.hitTestPoint(110, 250.00, false), "H: ...and the top edge exactly");
+check(box2.hitTestPoint(110, 270.00, false), "H: ...and the bottom edge exactly");
+check(!box2.hitTestPoint(99.99, 260, false), "H: 0.01px outside the left edge misses (no fuzz)");
+check(!box2.hitTestPoint(120.01, 260, false), "H: 0.01px outside the right edge misses");
+check(!box2.hitTestPoint(110, 249.99, false), "H: 0.01px above the top edge misses");
+check(!box2.hitTestPoint(110, 270.01, false), "H: 0.01px below the bottom edge misses");
+check(box2.hitTestPoint(100.05, 260, true), "H: the region hits just inside the fill edge");
+check(!box2.hitTestPoint(99.95, 260, true), "H: ...and misses just outside it");
+
+// 描边：框是「画出来的范围」（中心线两侧各 width/2），区域同此。
+var line:Sprite = new Sprite();
+line.x = 200; line.y = 250;
+line.graphics.lineStyle(4, 0x000000);
+line.graphics.moveTo(0, 0);
+line.graphics.lineTo(40, 0);
+stage.addChild(line);
+check(line.hitTestPoint(220, 248.00, false), "H: the box includes the stroke band (centre line 250, width 4)");
+check(!line.hitTestPoint(220, 247.99, false), "H: ...and stops at its outer edge");
+check(line.hitTestPoint(220, 248.05, true), "H: the region includes the stroked band too");
+check(!line.hitTestPoint(220, 247.95, true), "H: ...and stops just outside it");
+
+// 变换下的严格性：盒是**变换后**的盒，点仍按严格几何判定。
+var scaled:Sprite = new Sprite();
+scaled.x = 300; scaled.y = 250;
+scaled.graphics.beginFill(0x00FFFF); scaled.graphics.drawRect(0, 0, 20, 20); scaled.graphics.endFill();
+scaled.scaleX = 0.5; scaled.scaleY = 0.5;
+stage.addChild(scaled);
+check(scaled.hitTestPoint(310, 255, false), "H: a scaled object hits inside its transformed box");
+check(scaled.hitTestPoint(309.99, 255, false), "H: ...right up to its transformed left edge");
+check(!scaled.hitTestPoint(299.99, 255, false), "H: ...and misses 0.01px outside of it");
 
 if (failCount == 0) trace("stage94s ok");
 else trace("stage94s FAILED: " + failCount);

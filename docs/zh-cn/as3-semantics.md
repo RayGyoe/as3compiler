@@ -114,7 +114,7 @@ AGENTS.md §2.4 语义红线（已定的硬性决策）
 | **`flash.net` 网络加载面** | AIR 的 `URLLoader`/`URLRequest` 支持 `http`/`https`/`file`/`app-storage`/`app` scheme，GET/POST（应用沙箱内可用任意 method、任意请求头），7 个事件（`complete`/`open`/`progress`/`ioError`/`httpStatus`/`httpResponseStatus`/`securityError`）、`bytesLoaded`/`bytesTotal`、`close()` 真中止；`URLRequestMethod` 6 常量（GET/POST/PUT/DELETE/HEAD/OPTIONS） | 本项目是**本地文件读取器套了一个 HTTP API 外壳**：URL 一律当文件系统路径 `fopen`（`URLLoader.load`）；`URLRequest.method`/`.data`/`.contentType` 可写但**从不被读**（**死字段**）；`URLRequestMethod`/`URLRequestHeader`/`URLRequestDefaults`/`URLStream` **四个类不存在**；`open`/`httpStatus`/`httpResponseStatus`/`securityError` **永不派发**；`close()` 是**空函数**；`bytesLoaded`/`bytesTotal` 缺失；**GET/POST 完全没有**（实测：设 `method="POST"` + `data` 后 `load()` 照样把 URL 当地路径读出本地文件） | **明确记录的差距（待实现，非「维持现状」）**——**其主体已于阶段八十九·四十八~五十三 闭合**（A/B 语义面与契约 → 四十八；G + native 探针 → 四十九；构建层 `targets` → 五十；C 内核 + D/E/F/H → 五十一；AIR 保真校正 + 验收 I → 五十二；**`Socket`/`ServerSocket`/`XMLSocket` + 静态自包含 + 代理/cookie/HTTP-2 → 五十三**；仍余 preview2 `wasi:http`、AMF、`SecureSocket` TLS、`DatagramSocket`，见 `TODO.md` 遗留表）。完整官方 API 面、现状偏差表、8 阶段路线与验收方案见 [`flash-net.md`](flash-net.md)（其中 **§4.1.2** 给出 libcurl 的**引入方式**：首期零 vendor 直接用系统库，要静态自包含才走 `build-tools/`→`vendor/`）。**A（语义层补全：常量类/字段/`decode()`）+ B（契约补全：`bytesLoaded`/`open`/`close` 真中止）无网络依赖、低风险，建议先做**（消除「设了 `POST` 却无反应」「`close()` 是空函数」等**误导性**偏差）；**C（HTTP/1.1 + TLS 客户端）之后是独立重工程**，难点是 HTTPS/TLS 与三目标分叉（native socket / web `fetch` / WASI 无 socket → 诚实 `ioError`） |
 | **异步 IO 的执行位置与排空时机** | AIR 单线程 + 帧驱动事件：IO 在后台**确实并发**进行，事件按到达尽快派发；`URLLoader`/`FileStream` 在终态事件前先派 `PROGRESS`（可多次、带水位）；`Loader.load()` 对不可读 URL 与非图 payload 都派 `IOErrorEvent`（#2124「Loaded file is an unknown type」），**不**派 `COMPLETE`，数据/内容只随终态事件可见（`LoaderInfo.complete` = 「dispatched when data has loaded successfully」）；同一目标重复 `load()` 重启加载，旧请求不再派事件 | **执行位置**：native（macOS/Linux pthread）用 4 worker 池真后台 read+decode（`ASC_ASYNC_THREADS`），worker 绝不碰 GC 堆，输入提交时拷到 malloc；web/WASI/Windows 目标**同步内联**（`as_async_submit` 就地跑完，只推迟事件）。**排空时机**：结果落 malloc 暂存，只在**下一个帧边界**由 finish thunk 搬进 AS3 可见状态（`Stage_dispatchFrame` 先 `as_async_tick()` 再 `as_timer_tick()`）；headless `tickTimers()` = 等 worker 排空 + 一次排空全部 DONE（保持例程确定性）。`PROGRESS` 目前**只派一次**（`loaded == total`，读不分块无中间水位）；`LoaderInfo.PROGRESS` 仍不派发（Starling 监听的是 `URLLoader`）；`LoaderInfo.bytesTotal` 在终态才非 0 | **维持现状**——(a) 帧边界派发是 AIR 帧驱动模型的最接近实现，且「入表→thunk 跑完前不移出 job 表」是 GC 根不变式（提前移出会被 sweep 清零，已实测 SIGSEGV）；(b) native 与 web 的差别只在「读/解码是否占主线程」，web 无 worker 是既定取舍（wasm 单线程模型下 pthread 需 COOP/COEP，见 [`html5-web.md`](html5-web.md)）；(c) PROGRESS 单次是「读不分块」的直接后果，要报水位就得改分段读（N 次 read + 逐块重试语义），收益不值；(d) 纯 C 构建无解码器（`as_skia_image_decode_bytes_argb` 为返回 NULL 的桩）→ 图像加载报 IO_ERROR，解码成功路径由 skia 后端覆盖（native demo 验收）。详见阶段八十九·四十五与 `examples/async-io.as` |
 | `adl` 把 `DisplayObject.x/y` 量化到 **1/20 px（twips）** | AS3 规范**无此约定**（avmplus 内部存储口径）：`Matrix.rotate` 算出 `tx=68.94228634059948`，一经 `transform.matrix =` 回来就成 `68.9`；`ty` 同理（`60.58845726811989` → `60.55`） | 保留全精度（`x/y` 就是 `double`） | **维持现状**——twip 量化不是规范语义而是实现细节，复刻它等于**降低**精度且会让所有布局数值被无意义地截断；验证时改用容差（`x/y ±0.05`、`rotation/scale ±2e-4`）而非比对字面量。另：`adl` 的分解中间量走单精度（`scaleX 1.6` → `1.5999908447265625`），同属内部口径 |
-| **命中测试的贴边松紧**（twip 量化的连带后果） | AS3 规范把命中定义为「点落在对象的**边界框**内」，但未定义边界框的浮点口径 | 本实现按**严格几何**（包围盒 `l <= x <= r && t <= y <= b`，全 `double`） | **维持现状，但记为已知差异**——`adl 51.4.1` 真鼠标实测（`temp/c1probe/click/`）：屏幕点 `(310,110)` 打在旋转方块上，`adl` 报 `localX/localY = (14.13, -0.021)` 且**判定命中**，而按严格几何该点在盒外 **5e-5**（`adl` 的 `x/y` 经 twips 量化 + 单精度中间量，见上一行）。可见口径差**只在贴边 ~0.05px 内**：`adl` 更松。复刻它需要给判定加一个 adl 量级的容差，而容差必须先用点击探针在两端标定（否则会把「贴边未中」变成「贴边中」的假阳性）；示例/回归一律用**内部点**断言（如 `(328,142)` → local `(49.49,9.88)`）。见 `TODO.md` 遗留表 |
+| **命中测试的贴边松紧**（不是「半像素容差」，而是位置相关的光栅化相位） | AS3 规范把命中定义为「点落在对象的**边界框/形状**内」，但未定义边界的浮点口径 | 本实现按**严格几何**（包围盒 `l <= x <= r && t <= y <= b`，形状判据同口径，全 `double`） | **维持现状，差异已量成上界**（阶段二百四十一，见 §3.4）：`adl` 的边界相对几何边有**位置相关**的锯齿——box 侧恒**更松**（−0.41…0.00 px）、region 侧两侧都有（−0.11…+0.31 px）、周期约 0.5 px。它是**纯函数**（重复 / 正反扫描 / 换序 / 插问邻居全一致）却**不是可抄的规则**：把 20x20 填充的左边缘按 1 twip 滑 6 步（`getBounds` 逐次证实边缘真的动了），`adl` 报出的左边界**六次完全相同**（钉在绝对网格上）。复刻只会给命中测试引入半像素模糊，而可见口径差 ≤ 半像素、且只在「边界 ±0.5px」这条测度为零的带上 ⇒ 示例/回归一律用**内部点**断言（如 `(328,142)` → local `(49.49,9.88)`）。旧口径「只在贴边 ~0.05px 内」已被本阶段推翻（那是 `temp/c1probe/` 单个旋转方块抽样的巧合，见 §3.4） |
 | **AMF trait 成员序** | AMF3 的 `traits` 里成员顺序在规范里**无要求**（成员名与值同序出现，读取方按名配对；`describeType` 也未约定 `variable` 顺序） | 本实现按**声明序**（生成的 `Class_amf_members[]`，确定性、跨构建可复现） | **维持现状（已实测定案：无可对齐目标）**——`adl 51.4.1` 侧的序**不是**声明序，且**不可对齐**：① 把同一组四成员**反序声明**，`adl` 给出的序与正序**逐字相同**（⇒ 只由成员名字集合决定）；② 同一个 SWF 连跑三次一致（⇒ 由构建产物决定，非运行期随机）；③ 源码**只加一个未被引用的类**时序不变，但加 **3 个无关的（被 `registerClassAlias` 引用的）类**后、**未被触碰**的类 `Mix` 的序从 `n1 u1 s1 o1 s2 i2 i1 b1` 漂到 `o1 n1 s1 u1 i2 b1 i1 s2`，还原源码重建即复原（⇒ AVM2 内部 trait/多重名表布局的副产品）。连 `adl` 自己都不能在源码演进中保持稳定 ⇒ **不存在可对齐的语义目标**；互通不受影响（trait 自带成员名）。证据：`temp/a6probe/`、`examples/stage94e.as`、`test.ts` `[amforder]`。⚠️ 由此阶段九十四·四 的「AMF3 与 `adl` 逐字节一致」应读作「**trait 成员名/值的编码形态**逐字节一致」 |
 
 ---
@@ -171,6 +171,47 @@ AIR 的内建方法形参表**不能凭文档抄**：AS3 参考页会漏掉真�
 2. `Object.hasOwnProperty()`/`propertyIsEnumerable()` 允许**空参**调用（`mxmlc` 不报错），故形参是「可省、默认 null」；二者在 `Object` 上声明一次、被全部类继承，早期审计把 145 份继承副本误读成 145 处独立缺陷（按声明处改一次即可）。
 3. `Stage3D.requestContext3D` 的形参名是 `context3DRenderMode`、默认 `"auto"`；AIR 还有第二形参 `profile = "baseline"`，本后端不消费（登记遗留）。
 4. **文档不是可选性 oracle**：默认值抄文档，可选性必须实测。同理，内建形参表**斜**（我们比 AIR 短或长）时，靠「按我们的形参个数造格」的扫描**发现不了**——D 类因此是「文档形参数 vs 我们的形参数」的交叉比对补出来的。
+
+---
+
+### 3.4 命中测试边界的光栅化模糊带（阶段二百四十一 · 三组探针实测）
+
+遗留表里两行（「box 边界在描边外缘外 0.25px 仍命中」、「贴边 ~0.05px 不一致」）此前只有
+「42 行逐行对照里 2 行不同」这一条窄证据。本阶段用 `temp/hitprobe3/` 把它量透，**结论是两行都不必复刻**，但**旧口径的幅度说错了**（不是 0.05px / 0.25px 的容差，而是位置相关的锯齿）。
+
+**探针 1：边界不是容差，而是绝对网格相位。** 一个 `(100,100)` 20x20 填充的边界，用 1 twip
+（0.01px）阶梯扫描；随后把**左边缘本身**按 1 twip 从 `100.00` 滑到 `100.25`（`getBounds` 逐次
+证实边缘真的动了），`adl` 报出的左边界**六次完全相同**（box `100.05`、region `100.20`）。
+即：边界不跟着对象走，它钉在某个**绝对位置**上。
+
+**探针 2：纯函数。** 同一查询点重复问 6 次、递增扫 vs 递减扫、两趟、两个对象交错换序、
+中间插问第三个对象——结果全部一致。这排除了「上一次查询影响下一次」的缓存/状态 bug 假设
+（否则它就是一个可修的缺陷，而不是平台口径）。
+
+**探针 3：四边误差矩阵（量上界）。** 16 个 40x40 填充（左边缘 `200.13 + k*0.13`），每边扫
+±1.2px、步长 0.01，记 `边界 − 几何边`（负 = `adl` 更松）：
+
+| 边 / 判据 | 偏差范围 |
+|---|---|
+| box 左边 | −0.41 … 0.00 |
+| region 左边 | −0.11 … +0.31 |
+| box 上边 | −0.40 … 0.00 |
+| region 上边 | −0.40 … +0.25 |
+
+box 侧 `adl` 恒**更松或相等**（形状像 `floor` 到 0.5px 格子），region 侧两侧都有（抗锯齿覆盖率
+判定偏移几十个百分之一像素）；周期约 **0.5px**，另叠一条更长的漂移。同一份几何在
+`-default-size 500 375`（stage 缩放进 800x600 窗口，scale 1.6）与 `-default-size 800 600`（1:1）
+量到**同一量级**的锯齿 ⇒ 与舞台缩放 / 设备像素无关。
+
+**探针 4：交互拾取已经问的是内容区域**（遗留表第三行的决定性证据）。真鼠标点击六点：无图形的
+`Sprite` 在**自己盒内、子件之外**的任何位置（横向缝 `(250,220)`、纵向缝 `(210,260)`）都不是目标
+（`e.target` 落到 stage）；画了底板的容器在同样的缝里**是**目标；`Shape`（`Shape extends
+DisplayObject`，不是 `InteractiveObject`）自己不可能是目标，事件落到最近的**可交互祖先**。
+与本实现阶段二百三十三 的改法**逐点一致**，钉子= `examples/hit-pick-layer.as`（A/B/C/D 四节）。
+
+**裁决**：维持严格几何，两行遗留按「平台侧不可抄的光栅化模糊带」结案，只把**上界**留在
+本表；复刻它需要一张绝对网格表，且会把「贴边未中」变成「贴边中」的假阳性。我们的边界规则
+（闭区间、含描边）由 `examples/hit-boundary.as` 钉住，防止后人在不知情的情况下改成模糊判定。
 
 ---
 

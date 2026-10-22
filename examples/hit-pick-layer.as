@@ -92,4 +92,26 @@ check(pickAt(200, 320) == catcher, "a transparent fill still catches the mouse (
 catcher.mouseEnabled = false;
 check(pickAt(200, 320) == stage, "a mouseEnabled=false catcher passes the hit through");
 
+// ---- D. `Shape` 自己不可能是目标，事件落到最近的**可交互祖先**（阶段二百四十一 · adl 真鼠标实测）----
+// `Shape extends DisplayObject`，**不是** `InteractiveObject` ⇒ AIR 的鼠标事件永远不会把 `Shape`
+// 当 target；压在它上面的点击由最近的 Sprite 祖先收下。`adl 51.4.1` 真鼠标六点实测
+// （temp/hitprobe3/Body7.as + pick_probe.py）：两个 Shape 子件上各点一次，`e.target` 两次都是
+// 父 Sprite；而**子件之间那条缝**两次都是 stage（⇒ 父容器不是靠「有子件」命中，而是靠自己的
+// 内容。这正是 A 节的口径，只是把子件换成了 Shape）。
+var shapeHolder:Sprite = new Sprite();
+shapeHolder.x = 200; shapeHolder.y = 500;
+var sleft:Shape = new Shape();
+sleft.graphics.beginFill(0xFF00FF); sleft.graphics.drawRect(0, 0, 40, 40); sleft.graphics.endFill();
+var sright:Shape = new Shape();
+sright.x = 60;
+sright.graphics.beginFill(0x00FF00); sright.graphics.drawRect(0, 0, 40, 40); sright.graphics.endFill();
+shapeHolder.addChild(sleft);
+shapeHolder.addChild(sright);
+stage.addChild(shapeHolder);
+check(pickAt(220, 520) == shapeHolder, "D: a Shape child is never the target; its interactive parent is");
+check(pickAt(270, 520) == shapeHolder, "D: ...likewise for the second Shape child");
+check(pickAt(250, 520) == stage, "D: the gap between the two Shape children is a miss (the parent paints nothing)");
+check(shapeHolder.hitTestPoint(250, 520, false), "D: ...though the parent's BOX does span that gap");
+check(pickAt(210, 560) == stage, "D: and the parent is not a target below the children either (adl: the vertical gap)");
+
 trace("hit-pick-layer ok");
