@@ -717,8 +717,28 @@ default face) keeps **94/97** sources and its four-page tour prints `RESULT: PAS
 prints `RESULT: PASS` (8 assertions). `node tools/reach-dump.cjs ui-demo/air-gallery/src
 demo.GalleryMain seam kit` recomputes `kept 94/97 edges 68`, matching the compiler's own line. Pins:
 `unit: reach/as-class-path` (14 checks: identity rules + the error text) and
-`unit: reach/as-class-path-cli` (5 checks that **really build**: no flag ⇒ fails loudly, with the flag
-⇒ builds and the shared root's class appears in the emitted `.c`); four mutations, all caught.
+`unit: reach/as-class-path-cli` (8 checks that **really build**: no flag ⇒ fails loudly, with the flag
+⇒ builds and the shared root's class appears in the emitted `.c`, a `.as` file is refused as a root, the
+flag is refused without `--air-app`, a `Chart3DMain.as` in the shared root does not disturb main-class
+inference, two real `Main.as` are both named, a shell-mangled drive path gets a quoting hint); four
+mutations, all caught.
+
+**Keep the root small, and make it a PACKAGE-tree root** (two rules measured in stage two-hundred-fifty-one):
+
+- **Main-class inference compares the basename, not a suffix**: with exactly one `Main.as` under `src/`, an
+  extra `Chart3DMain.as` in the shared root (real libraries ship one:
+  `com/fiCharts/charts/chart3D/Chart3DMain.as`) **does not** affect it; only two real `Main.as` are refused,
+  and then **both are named**. This is the same convention as "the unique `src/**/Main.as` is the document
+  class" -- do not expect it to guess at `Chart3DMain`.
+- **Do not point it at a source dump**: a named root is swept **whole** (deliberately, see above), so aiming it
+  at an old 2000+ file library repo (with `-examples/`, `com.rar`, `starling`, several greensock copies) makes
+  every library file that carries **module-level statements or free functions** a "forced" seed (measured here:
+  `away3d/debug/Debug.as`, `com/ObjectPool/construct.as`,
+  `io/asnetty/.../DefaultMessageSizeEstimator.as` and `InternalLoggerFactory.as`), and the closure then fans out
+  into unrelated classes -- one of which, `io/asnetty/util/TraceLogger.as`, references
+  `flash.globalization.DateTimeFormatter` (not implemented by this backend) ⇒ a hard `unknown type`. Give it a
+  small root holding just the package tree you need (move the dozen scattered files into one root) instead of
+  the whole library.
 
 ### 3.6 Build-environment self-check (`as-aot doctor`)
 

@@ -975,14 +975,29 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // because "the flag was accepted and contributed nothing" is the shape of a
   // silent wrong build (§2.5).
   const classPaths = asClassPaths.map((p) => resolve(p));
-  for (const r of classPaths) {
+  for (let ci = 0; ci < classPaths.length; ci++) {
+    const r = classPaths[ci];
     let isDir = false;
     try { isDir = statSync(r).isDirectory(); } catch { isDir = false; }
     if (!isDir) {
+      // A bare Windows path typed into bash/MSYS loses its backslashes before we ever
+      // see it: `E:\Works\eDoctor\Lib` arrives as `E:WorkseDoctorLib`. The refusal
+      // therefore names the path as RECEIVED and says how to quote it -- otherwise the
+      // user compares a flag that looks right on their own command line with a path we
+      // claim does not exist. Only a mangled drive prefix (`E:` not followed by a
+      // separator) can mean this; a real `E:\...` or `E:/...` never matches.
+      // Test the value the shell actually handed over, not the resolved form: `resolve`
+      // turns the mangled `E:WorkseDoctor` back into `E:\WorkseDoctor`, which looks
+      // like a path the user did write.
+      const mangled = /^[A-Za-z]:(?![\\/])/.test(asClassPaths[ci])
+        ? `\n  (the path arrived mangled -- an unquoted backslash is eaten by the shell:\n` +
+          `   quote it, --as-class-path "E:\\path\\to\\root", or use forward slashes)`
+        : '';
       throw new AirAppError(
         `--as-class-path is not a directory: ${r}\n` +
           `  the flag names a source ROOT (the directory holding the package tree),\n` +
-          `  not an individual .as file`
+          `  not an individual .as file` +
+          mangled
       );
     }
     if (r === resolve(srcDir)) {
@@ -1031,10 +1046,18 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
 
   let mainClass = mainClassOpt;
   if (!mainClass) {
-    const mains = asFiles.filter((f) => f.endsWith('Main.as'));
+    // `basename`, NOT a suffix test (阶段二百五十一): a shared root full of unrelated
+    // libraries carries `Chart3DMain.as`, which `endsWith('Main.as')` counted as a
+    // second document class -- so adding one `--as-class-path` broke the unique-Main
+    // convention for an app whose own `src/` holds exactly one Main.as. The candidates
+    // are listed because "found 2" without names leaves the user hunting a file we
+    // already know (§2.5: a diagnostic must locate, not merely refuse).
+    const mains = asFiles.filter((f) => basename(f) === 'Main.as');
     if (mains.length !== 1) {
       throw new AirAppError(
-        `cannot infer the main class: found ${mains.length} Main.as under ${srcDir}; pass --main-class <pkg.Main>`
+        `cannot infer the main class: found ${mains.length} Main.as in the source roots` +
+          (mains.length === 0 ? '' : `\n${mains.map((f) => `  - ${f}`).join('\n')}`) +
+          `\n  pass --main-class <pkg.Main>`
       );
     }
     const src = readFileSync(mains[0], 'utf8');

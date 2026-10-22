@@ -644,8 +644,22 @@ as-aot --air-app app.xml --as-class-path ../seam --as-class-path ../kit
 `kit/`+`seam/` 就地编译；gallery（`--air-app` 默认面）闭包 **94/97**、四页 tour `RESULT: PASS`，登录 demo
 `RESULT: PASS`（8 项断言）；`node tools/reach-dump.cjs ui-demo/air-gallery/src demo.GalleryMain seam kit` 复算
 `kept 94/97 edges 68`，与编译器自报一致。钉子：`unit: reach/as-class-path`（14 项，身份规则 + 硬报错文案）与
-`unit: reach/as-class-path-cli`（5 项，**真编真跑**：无旗标编不过、加旗标编得过且共享根的类出现在 `.c` 里）；
-四个变异各自被咬住。
+`unit: reach/as-class-path-cli`（8 项，**真编真跑**：无旗标编不过、加旗标编得过且共享根的类出现在 `.c` 里、`.as`
+文件当根被拒、无 `--air-app` 时拒绝该旗标、共享根里的 `Chart3DMain.as` 不干扰主类推断、真有两个 `Main.as` 时
+点名两份、被 shell 吃掉反斜杠的路径带引号提示）；四个变异各自被咬住。
+
+**根要小，而且要是「包树根」**（阶段二百五十一的两条实测口径）：
+
+- **主类推断看基名，不看后缀**：`src/` 里恰好一个 `Main.as` 时，共享根里再多一个 `Chart3DMain.as`
+  （`com/fiCharts/charts/chart3D/Chart3DMain.as` 这类库在真实工程里就有）**不影响**推断；真有两个 `Main.as`
+  才报错，并且**两份都点名**。这与 `src/**/Main.as` 唯一即主类的约定是同一件事，别指望它去猜 `Chart3DMain`。
+- **别把「源码堆」当根**：旗标点名的根会被**整棵扫**（刻意如此，见上），所以指向一个 2000+ 文件、
+  混着 `-examples/`、`com.rar`、`starling`、多份 greensock 副本的老库仓库时，其中**带模块级语句/自由函数**的
+  文件会成为「强制保留文件」种子（本机实测命中 `away3d/debug/Debug.as`、`com/ObjectPool/construct.as`、
+  `io/asnetty/.../DefaultMessageSizeEstimator.as` 与 `InternalLoggerFactory.as`），闭包随之扩散到无关类——
+  其中一个 `io/asnetty/util/TraceLogger.as` 引用 `flash.globalization.DateTimeFormatter`（本后端未实现）⇒
+  **硬报 `unknown type`**。正确做法是给它一个**只含所需包树**的小根，把散落的十几个文件归到一个小根下，
+  而不是把整个库根塞进来。
 
 ### 3.6 构建环境自检（`as-aot doctor`）
 

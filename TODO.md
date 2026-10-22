@@ -14697,6 +14697,48 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 **五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——本阶段是工具链能力，不占缺口表；
 按表内实际行数重数仍为 **100 项**。
 
+### 阶段二百五十一：主类推断看**基名** + 共享根被 shell 吃掉反斜杠的提示（v0.4.214 → v0.4.215）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+用户按阶段二百五十 的文档试跑 `examples/air-native`，连报三条。第三条是真缺陷：加了 `--as-class-path` 之后
+报 **`cannot infer the main class: found 2 Main.as under …\src`**，而 `src/` 里**只有一个** `Main.as` —— 推断用的是
+`f.endsWith('Main.as')`，于是共享根里的 `com/fiCharts/charts/chart3D/Chart3DMain.as` 被当成**第二个文档类**。
+后果是：**任何**含 `XxxMain.as` 的类库一进编译面，唯一 `Main.as` 的约定就失效，而且错误信息只说「有 2 个」、
+不说是哪两个（§2.5 要求能定位）。
+
+**二、落地**
+
+- **`src/air-app.ts`**：推断改 `basename(f) === 'Main.as'`；歧义时**逐条列出**候选路径（原来只有计数）。
+- **`src/air-app.ts`**：`--as-class-path is not a directory` 增补一条提示——裸写的 Windows 路径在 bash/MSYS 里
+  先掉反斜杠（`E:\Works\eDoctor\Lib` 到达时已是 `E:WorkseDoctorLib`），用户会拿「自己命令行上看没错的路径」
+  对着一个「我们说不存在」的路径发呆。判定只用**命令行原值**：`resolve('E:WorkseDoctorLib')` 会还原成
+  `E:\WorkseDoctorLib`，看起来正像用户真写过的样子。
+- **钉子**（`test/unit/reach.ts` 的 `unit: reach/as-class-path-cli`，5 → **8** 项）：共享根里有 `Chart3DMain.as`
+  时推断照常通过；真有两个 `Main.as` 时**点名两份**；被吃掉反斜杠的盘符路径带引号提示。
+
+**三、验收（实测）**
+
+- 逐条复跑用户的命令：裸路径 ⇒ 非目录报错 + 引号提示；加引号 ⇒ `[1/4] read … (main demo.Main, 53/2207 sources…)`，
+  推断**通过**（`Chart3DMain.as` 不再干扰）。
+- `node --test test/unit/reach.ts`：**8 组全绿**（`reach/as-class-path-cli` 8 项）。
+- **变异 2/2 全抓**（`temp/mut-main-inference.cjs`）：M1 退回 `endsWith('Main.as')` ⇒ `Chart3DMain` 那项红；
+  M2 去掉 mangled 提示 ⇒ 提示那项红；每次变异后按 sha256 断言 `src/air-app.ts` **逐字节还原**。
+
+**四、如实报明**
+
+- **`--as-class-path` 指向源码堆不是缺陷，是会爆炸的用法**：`E:\Works\eDoctor\ActionScript-Lib` 是 2189 个
+  `.as` 的库仓库（`-examples/`、`com.rar`、`starling`、多份 greensock 副本）。根被**整棵扫**，其中 4 个带
+  **模块级语句/自由函数**的文件成为「强制保留文件」种子（`away3d/debug/Debug.as`、`com/ObjectPool/construct.as`、
+  `io/asnetty/.../DefaultMessageSizeEstimator.as`、`InternalLoggerFactory.as`），闭包扩散到 **35 个无关类**，
+  其中一个 `io/asnetty/util/TraceLogger.as` 引用 `flash.globalization.DateTimeFormatter`（本后端未实现）⇒ 硬报
+  `unknown type`。口径已写进 `docs/{zh-cn,en}/compile.md` §3.5.2：根要小、要是**包树根**。
+- **`Codegen error at 12:5: unknown type '…'` 不带文件名**：多根编译面下光有行列号定位不到文件（lexer/parser 的
+  排除告警是带文件名的）。属诊断口径欠账，未在本次改动范围内，未登记进上表。
+- **`examples/air-native` 这条 demo 的「无旗标 `undefined variable 'Cubic'`」与本阶段无关**：本机工作区里
+  `src/com/`（352 个 tracked 文件）已被删除、旁边留了一个未跟踪的 `com.zip`（`git status` 显示 352 个 ` D`），
+  `TweenDemo` 的 `com.greensock.easing.Cubic` 因此找不到。恢复 `src/com/` 即可，与 `--as-class-path` 无关。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

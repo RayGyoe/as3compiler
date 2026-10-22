@@ -788,6 +788,37 @@ function checkAsClassPathCli(): string[] {
   })();
   c.check('--as-class-path without --air-app is refused (no closure to widen)',
     !noAir.ok && /--as-class-path only applies to --air-app/.test(noAir.out));
+
+  // A library tree carries its own `XxxMain.as -- a real one in the wild is
+  // com/fiCharts/charts/chart3D/Chart3DMain.as. The inference used to ask
+  // `f.endsWith('Main.as')`, so that file read as a SECOND document class and
+  // adding one --as-class-path refused to build an app whose own src/ holds
+  // exactly one `Main.as` (阶段二百五十一: "found 2 Main.as" with one Main.as in
+  // src). `basename(f) === 'Main.as'` is the whole fix, and this pins that a
+  // shared root cannot poison the convention.
+  writeFileSync(join(kitDir, 'Chart3DMain.as'),
+    'package kit.chart {\n  public class Chart3DMain {\n' +
+    '    public function Chart3DMain():void { }\n  }\n}\n');
+  const kitArg = ['--as-class-path', kitDir];
+  const stillInfers = run(kitArg);
+  c.check('a shared root holding `Chart3DMain.as` does not break main-class inference', stillInfers.ok);
+
+  // When there really ARE two, the refusal has to NAME them: "found 2" over a
+  // library root leaves the user hunting a file the compiler already knows.
+  mkdirSync(join(kitDir, 'second'), { recursive: true });
+  writeFileSync(join(kitDir, 'second', 'Main.as'),
+    'package second {\n  public class Main { public function Main():void { } }\n}\n');
+  const two = run(kitArg);
+  c.check('with two real Main.as the refusal lists both paths',
+    !two.ok && /cannot infer the main class: found 2 Main\.as in the source roots/.test(two.out) &&
+    two.out.includes(join('src', 'Main.as')) && two.out.includes(join('second', 'Main.as')));
+
+  // A Windows path typed bare into bash/MSYS arrives with its backslashes eaten
+  // (`E:\Works\Lib` -> `E:WorksLib`). Naming the path we RECEIVED is not enough
+  // when it looks like a path the user never wrote, so the refusal says so.
+  const mangled = run(['--as-class-path', 'C:noSuchRoot']);
+  c.check('a mangled drive path gets a quoting hint (the shell ate the backslashes)',
+    !mangled.ok && /the path arrived mangled/.test(mangled.out));
   return c.done();
 }
 
