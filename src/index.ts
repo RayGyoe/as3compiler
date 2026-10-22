@@ -80,6 +80,13 @@ interface Options {
   // (com/org/net) the demo-oriented default skips, so a real app's own `com.*`
   // framework layer joins the reachability closure.
   includeThirdParty: boolean;
+  // `--as-class-path <dir>`: --air-app only, repeatable (阶段二百五十). Extra SOURCE
+  // ROOTS compiled alongside <appDir>/src, so a library shared by several apps is
+  // one tree on disk instead of a copy under every app. Paths are resolved against
+  // the working directory (the --extdir rule), and the roots feed BOTH halves of the
+  // adapter: the file list walked for the closure and the identity
+  // `prepareReachFiles` derives each file's anonymous-namespace key from.
+  asClassPaths: string[];
   // `--extdir <dir>`: --air-app only, repeatable. Where to look for the packages
   // the descriptor's <extensions> names, overriding air-app's DEFAULT_EXT_DIRS.
   // Not part of BuildConfig: it is consumed while the manifest is generated (the
@@ -108,7 +115,7 @@ interface Options {
 // (the `unit: cli/ArgErrors` group reads the chain and reddens if it does).
 const KNOWN_FLAGS: readonly string[] = [
   '-o', '--run', '--dry', '--cc', '--target', '--package', '--manifest', '--air-app',
-  '--main-class', '--all-sources', '--include-third-party', '--extdir', '--json', '--fix',
+  '--main-class', '--all-sources', '--include-third-party', '--extdir', '--as-class-path', '--json', '--fix',
   '--check-update', '--verbose', '-v', '--opt', '--debug-info', '--lto', '--pgo', '--pgo-dir',
   '-I', '-L', '-l', '-D', '--features', '--framework', '--source', '--swc', '--ane',
   '--ane-platform', '--export', '--cflag', '-w', '--version', '-V', '--help', '-h',
@@ -159,7 +166,7 @@ function suggestFlag(arg: string): string {
 }
 
 function parseArgs(argv: string[], doctorMode = false): Options {
-  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, extDirs: [], overrides: {}, doctor: doctorMode, doctorJson: false, doctorFix: false, doctorVerbose: false, doctorCheckUpdate: false };
+  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, extDirs: [], asClassPaths: [], overrides: {}, doctor: doctorMode, doctorJson: false, doctorFix: false, doctorVerbose: false, doctorCheckUpdate: false };
   const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'cFlags' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths' | 'anePaths', v: string): void => {
     (opts.overrides[key] ??= [] as string[]).push(v);
   };
@@ -199,6 +206,7 @@ function parseArgs(argv: string[], doctorMode = false): Options {
     else if (a === '--all-sources') opts.allSources = true;
     else if (a === '--include-third-party') opts.includeThirdParty = true;
     else if (a === '--extdir') opts.extDirs.push(value('--extdir'));
+    else if (a === '--as-class-path') opts.asClassPaths.push(value('--as-class-path'));
     else if (a === '--json') opts.doctorJson = true;
     else if (a === '--fix') opts.doctorFix = true;
     else if (a === '--check-update') opts.doctorCheckUpdate = true;
@@ -294,6 +302,13 @@ function parseArgs(argv: string[], doctorMode = false): Options {
   if (opts.extDirs.length > 0 && !opts.airApp) {
     throw new Error(`--extdir only applies to --air-app (it locates the packages <extensions> names); use --ane <package> for an explicit extension`);
   }
+  // --as-class-path adds roots to the `--air-app` closure's search space. Without a
+  // descriptor there is no closure: a plain run compiles exactly its input list, so
+  // the flag would look honoured and change nothing. Refusing it is the only honest
+  // answer (the plain form is `as-aot a.as b.as`).
+  if (opts.asClassPaths.length > 0 && !opts.airApp) {
+    throw new Error(`--as-class-path only applies to --air-app (it widens the main class's source roots); list the extra files as inputs instead`);
+  }
   return opts;
 }
 
@@ -314,6 +329,10 @@ function usage(): string {
     '  --main-class <n> main class for --air-app (default: infer src/**/Main.as)',
     '  --include-third-party  --air-app: also sweep src/com, src/org, src/net (a real app\n                 keeps its own framework layer there; skipped by default)',
     '  --extdir <dir> --air-app: where the <extensions> packages live (repeatable;\n                 default: ext-aot then lib then ext-folder). Each extensionID the\n                 descriptor names is resolved to a package there, so no --ane is needed\n                 per extension',
+    '  --as-class-path <dir>  --air-app: an EXTRA source root compiled alongside src/,',
+    '                 so a library shared by several apps lives in one place (repeatable).',
+    '                 Paths are working-directory relative; a class must not be declared',
+    '                 under two roots (that is an error, not last-wins)',
     '  --all-sources  --air-app: compile every .as under src/ instead of the main class\n                 reachable closure (pre-阶段一百二十四 behaviour; see reach.ts)',
     '  -I <dir>       include path (repeatable)',
     '  -L <dir>       library search path (repeatable)',
@@ -616,7 +635,7 @@ async function main(): Promise<void> {
     // window backend (SDL2/Cocoa) is native-only and cannot link under wasm-ld.
     // `opts.output` reaches the adapter because the web preload set must not sweep
     // this build's own output dir into the page's FS image (see findPreloadPaths).
-    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output, opts.includeThirdParty, opts.extDirs);
+    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output, opts.includeThirdParty, opts.extDirs, opts.asClassPaths);
     // The adapter reports what it can see but must not silently ship (e.g. a web
     // build whose text has no font to draw with). Yellow, not red: the build is
     // still usable, but the output would be wrong in a way the user cannot guess.
@@ -635,13 +654,16 @@ async function main(): Promise<void> {
     // bootstrap has none, and an app's own file is merged below only if it declares
     // one (the boot file is deliberately skipped there, see the loop).
     if (boot.swfFrameRate !== undefined) program.swfFrameRate = boot.swfFrameRate;
-    const srcDir = resolve(dirname(opts.airApp), 'src');
     // Pass 1: read + parse + rewrite EVERY source, so the reachability closure can
     // see the whole tree. The rewrite (file-scoped package for an
     // anonymous-namespace class, same-file imports) must run first: it is what
     // gives each declaration the identity the closure resolves against, and what
     // the real build's symbols will carry. See reach.ts::prepareReachFiles.
-    const parsedFiles: ReachFile[] = prepareReachFiles(air.asFiles, srcDir);
+    //
+    // The ROOTS come from the adapter, not from `dirname(app.xml)/src`: with
+    // --as-class-path there are several, and each file's identity is its path
+    // relative to its own root (阶段二百五十).
+    const parsedFiles: ReachFile[] = prepareReachFiles(air.asFiles, air.sourceRoots);
     // Pass 2: the compile face. AIR's own linker keeps only the transitive class
     // closure from the document class (`mxmlc -link-report` on the away3d demos:
     // 158–246 classes each, vs the 485 `.as` files a whole-src compile pulls in),

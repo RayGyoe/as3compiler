@@ -53,7 +53,7 @@
 // (`away3d/debug/Debug.as`).
 
 import { readFileSync } from 'node:fs';
-import { relative } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { parse } from './parser.ts';
 import type { ASType, ClassMember, Expr, Metadata, Param, Stmt } from './ast.ts';
 
@@ -469,14 +469,21 @@ export function computeReachable(files: ReachFile[], mainClassFqn: string, extra
   // `<FileId>.<Name>`. Resolve in that order (exact FQN, then the file-scoped
   // form, then a unique short name) so `--main-class Basic_SkyBox` still finds
   // `Basic_SkyBox.Basic_SkyBox`.
-  const fileIdOfPath = (p: string): string =>
-    (p.split(/[\\/]/).pop() ?? p).replace(/\.as$/i, '').replace(/[^A-Za-z0-9_]/g, '_');
+  // The file-scoped package a packageless class was moved into. `prepareReachFiles`
+  // assigned it relative to the class's OWN source root, so with --as-class-path
+  // there is no single "relative to src/" left to recompute it from -- read it off
+  // the declaration. The basename form is the fallback for decls built by hand.
+  const fileScopedId = (d: Decl): string => {
+    const st = d.stmt as { fileId?: string | null };
+    if (typeof st.fileId === 'string' && st.fileId !== '') return st.fileId;
+    return (d.file.split(/[\\/]/).pop() ?? d.file).replace(/\.as$/i, '').replace(/[^A-Za-z0-9_]/g, '_');
+  };
   const findMainDecl = (name: string): Decl | undefined => {
     const exact = byFqn.get(name);
     if (exact) return exact;
     const cands = byShort.get(shortOf(name)) ?? [];
     if (cands.length <= 1) return cands[0];
-    const fileScoped = cands.find((d) => d.pkg === fileIdOfPath(d.file));
+    const fileScoped = cands.find((d) => d.pkg !== null && d.pkg === fileScopedId(d));
     return fileScoped ?? cands[0];
   };
 
@@ -677,8 +684,55 @@ export function computeReachable(files: ReachFile[], mainClassFqn: string, extra
 //
 // The `fileId` stored on each declaration is also what the real build keys
 // same-file visibility off, so it must match `symbols.ts`'s notion of the file.
-export function prepareReachFiles(asFiles: string[], srcDir: string): ReachFile[] {
+//
+// MULTIPLE SOURCE ROOTS (`--as-class-path`, 阶段二百五十)
+// ------------------------------------------------------
+// `srcDirs` is `[<appDir>/src, ...--as-class-path dirs]`. A library shared by
+// several apps has to live OUTSIDE each of them (three demos each carrying a
+// byte-identical 91-file copy of the UI kit is what made this exist), but a file's
+// identity must stay stable and unique across those roots:
+//
+//   * a file belongs to the DEEPEST root that contains it, so a root nested inside
+//     another does what a reader expects (the file is named relative to the inner
+//     one). `relative` is used rather than a string prefix, so `.../src2/x.as` is
+//     not mistaken for a member of `.../src`;
+//   * `fileId` is the path relative to ITS OWN root, so `kit/ui/Chip.as` keeps one
+//     id (and therefore one anonymous-namespace key, one C symbol) no matter which
+//     app directory the build runs from;
+//   * two files that would land on the SAME id — the same relative path under two
+//     roots — are told apart with a `_2`, `_3`, … suffix. Without it two packageless
+//     `Control.as` under different roots would share one anonymous namespace and
+//     collide as the same class;
+//   * the same FQN declared under TWO roots is a HARD ERROR, never last-wins. That
+//     is the migration trap: adding `--as-class-path ../kit` while `src/asaot`
+//     still holds a copy would otherwise silently be decided by walk order (§2.5).
+export function prepareReachFiles(asFiles: string[], srcDirs: string | readonly string[]): ReachFile[] {
+  const roots = (typeof srcDirs === 'string' ? [srcDirs] : [...srcDirs]).map((d) => resolve(d));
+  if (roots.length === 0) throw new Error('prepareReachFiles: at least one source root is required');
+  // The root a file belongs to, as an index into `roots`.
+  const rootOf = (f: string): number => {
+    let best = -1;
+    let bestLen = Infinity;
+    for (let r = 0; r < roots.length; r++) {
+      const rel = relative(roots[r], f);
+      if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) continue;
+      if (rel.length < bestLen) { best = r; bestLen = rel.length; }
+    }
+    // Outside every declared root: a caller bug (the adapter builds this list by
+    // walking exactly these roots), so fail loudly rather than guess a root.
+    if (best < 0) {
+      throw new Error(`prepareReachFiles: '${f}' is not under any source root (${roots.join(', ')})`);
+    }
+    return best;
+  };
   const out: ReachFile[] = [];
+  // fileId -> the file that claimed it (see the header note on `_2`, `_3`).
+  const claimed = new Map<string, string>();
+  // AS3 FQN -> the file that declared it. Only CROSS-root duplicates are fatal:
+  // two files in the SAME root colliding is pre-existing last-wins behaviour in
+  // symbols.ts, and turning that into an error here would refuse trees that build
+  // today.
+  const declaredIn = new Map<string, { file: string; root: number }>();
   // Files this compiler's front end cannot parse yet (all in vendored third-party
   // packages in practice: E4X-heavy JSON/crypto, one greensock wall). They are
   // EXCLUDED, not silently ignored: the list is printed loudly, and because a
@@ -688,16 +742,19 @@ export function prepareReachFiles(asFiles: string[], srcDir: string): ReachFile[
   // first one, which made a real app impossible to attempt at all.
   const unparsed: string[] = [];
   for (const f of asFiles) {
+    const rootIdx = rootOf(f);
+    const rel = relative(roots[rootIdx], f).replace(/\\/g, '/');
     let p;
     try {
       p = parse(readFileSync(f, 'utf8'));
     } catch (err) {
-      const rel = relative(srcDir, f).replace(/\\/g, '/');
       unparsed.push(`${rel}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
-    const rel = relative(srcDir, f).replace(/\\/g, '/');
-    const fileId = rel.replace(/\.as$/i, '').replace(/[^A-Za-z0-9_]/g, '_');
+    const baseId = rel.replace(/\.as$/i, '').replace(/[^A-Za-z0-9_]/g, '_');
+    let fileId = baseId;
+    for (let n = 2; claimed.has(fileId) && claimed.get(fileId) !== f; n++) fileId = `${baseId}_${n}`;
+    claimed.set(fileId, f);
     // Every top-level class/interface declared in this file (for same-file
     // visibility below).
     const fileClasses: { name: string; packageName: string | null }[] = [];
@@ -720,11 +777,34 @@ export function prepareReachFiles(asFiles: string[], srcDir: string): ReachFile[
         }
       }
     }
+    // The cross-root duplicate check runs AFTER the anonymous rewrite above, so a
+    // packageless class is compared under the file-scoped name it will really be
+    // emitted as.
+    for (const stmt of p.body) {
+      if (stmt.kind !== 'ClassDecl' && stmt.kind !== 'InterfaceDecl') continue;
+      const fqn = stmt.packageName === null ? stmt.name : `${stmt.packageName}.${stmt.name}`;
+      const prev = declaredIn.get(fqn);
+      if (prev === undefined) {
+        declaredIn.set(fqn, { file: f, root: rootIdx });
+        continue;
+      }
+      if (prev.file === f || prev.root === rootIdx) continue;
+      const show = (q: string): string => relative(process.cwd(), q).replace(/\\/g, '/');
+      throw new Error(
+        `the same class is declared under two source roots: '${fqn}'\n` +
+        `  ${show(prev.file)}\n` +
+        `  ${show(f)}\n` +
+        `  (${roots[prev.root]} vs ${roots[rootIdx]})\n` +
+        `  A shared root named by --as-class-path is compiled IN ADDITION to the app's\n` +
+        `  src/, so a stale copy under src/ declares the same class twice. AS3 has one\n` +
+        `  class per qualified name: delete the copy you did not mean to keep.`
+      );
+    }
     out.push({ path: f, body: p.body, imports: p.imports, swfFrameRate: p.swfFrameRate });
   }
   if (unparsed.length > 0) {
     process.stderr.write(
-      `\x1b[33mwarning: ${unparsed.length} source file(s) under src/ could not be parsed and were EXCLUDED from this build:\x1b[0m\n`
+      `\x1b[33mwarning: ${unparsed.length} source file(s) in this build's source roots could not be parsed and were EXCLUDED:\x1b[0m\n`
     );
     for (const l of unparsed) process.stderr.write(`\x1b[33m  - ${l}\x1b[0m\n`);
     process.stderr.write(

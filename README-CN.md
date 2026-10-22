@@ -138,6 +138,12 @@ as-aot --air-app app.xml --extdir vendor/anes    # 换个地方找（可重复�
 # 重编成 AOT 版的扩展放 <appDir>/ext-aot/<名>/（排在默认根最前，阶段一百八十二）——
 # 它与 AIR 原版声明同一个 <extensionID>，靠根顺序而不是目录名排序定胜负；没重编的照旧从 lib/ 拿
 
+# 一个类库被多个 AIR app 共用：把它作为额外的源码根，而不是往每个 src/ 里拷一份（阶段二百五十）
+as-aot --air-app app.xml --as-class-path ../seam --as-class-path ../kit
+# 编译面 = src/ 加上每个 --as-class-path 根；文件身份按「它自己那个根」算，
+# 所以类名与 C 符号不随构建目录漂移；同一个全限定类出现在两个根 ⇒ 硬报错
+# （迁移时忘了删 src/ 里的旧拷贝就是这样撞上的）
+
 # 导出顶层函数给 JS 直调（默认 WASI 命令模块只导出 _start）
 as-aot examples/wasm-native/fib.as --target wasm --export fib
 

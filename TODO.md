@@ -14627,11 +14627,74 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
   两个 runner 的就地注释已改成「若这条错误回来 ⇒ 是闭包回归，去修闭包，**不要**用 `--all-sources` 盖过去」。
 - **G13 与「共享源码根」是两件事**：曾经讨论过是否该加类似 `ane-paths` 的 `--as-class-path`（把公共代码库放到
   一处、三个 demo 不再各存一份 91 文件的 kit）。结论是**先修闭包**——从额外根进来的类会走**同一条**不展开的通路，
-  共享根不会缓解 G13 而只会让它更常触发。共享根仍是独立待办，本轮未动。
+  共享根不会缓解 G13 而只会让它更常触发。共享根仍是独立待办，本轮未动（**阶段二百五十已落地**，见下节）。
 - **编号说明**：本工作区（`asaotui/`）的复核文档一度把同一阶段写作「阶段二百五十」，本轮按
   **TODO 表末尾小节 = 二百四十八** 统一归位为 **二百四十九**，并同步了 `asaotui/` 下全部 16 处引用。
 
 **五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——G13 记在 `asaotui/compiler-gaps.md`（已标已修）。
+按表内实际行数重数仍为 **100 项**。
+
+### 阶段二百五十：`--as-class-path` —— 共享源码根（v0.4.213 → v0.4.214）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+`--air-app` 的采集面是**一个**目录：`<appDir>/src`。于是被多个 app 共用的类库只能**拷进**每个 app——
+`asaotui/ui-demo` 的三个 demo（`air-gallery` / `air-gallery-standard` / `air-uidemo`）各持一份
+**逐字节相同**的 91 文件 UI kit 拷贝（`src/asaot/`，三份 md5 聚合值同为 `9142323c60e3`），
+由 `stage-air.cjs` 每次构建前从 `kit/`+`seam/` 重新复制。**在 `src/` 下挂 junction 不是绕法**：
+目录遍历把符号链接当普通条目跳过（实测，见 `CONTRIBUTING-widget.md` §4）。
+阶段二百四十九 修闭包时**明确推迟**了这件事——「从额外根进来的类会走同一条不展开的通路，共享根不会
+缓解 G13 而只会让它更常触发」——所以先修闭包，再开这条。
+
+**二、落地**
+
+- **`src/reach.ts`**：`prepareReachFiles(asFiles, srcDirs)` 从单根签名改成 `string | readonly string[]`。
+  四条身份规则（头注「MULTIPLE SOURCE ROOTS」）：① 文件属于**最深**的包含它的根（用 `relative` 判定，
+  不是字符串前缀——否则 `…/src2/x.as` 会被当成 `…/src` 的成员）；② `fileId` 相对**它自己那个根**，
+  共享库因此在任何 app 目录下都得到同一个 id（同一个匿名命名空间键、同一个 C 符号）；③ 同一相对路径撞在
+  两个根 ⇒ `_2`/`_3` 后缀（两个**无包名** `Control.as` 才不会合并成同一个类）；④ 同一个全限定类出现在
+  **两个根** ⇒ **硬报错**并点名两个文件——这是**迁移陷阱**（加了 `--as-class-path ../kit` 却忘了删
+  `src/asaot`，若 last-wins 则由 walk 顺序静默决定谁赢，§2.5 禁止）。**同一根内**的重名仍是既有的
+  last-wins 行为（`symbols.ts` 的既有语义，改成报错会拒掉今天能编的树）。
+- **`src/air-app.ts`**：`PreparedAirApp.sourceRoots`；`prepareAirApp(..., asClassPaths = [])` 把额外根
+  解析成绝对路径、**必须是目录**、**不能等于 `src/`**（否则同一个文件两个根）；`src/` 仍走
+  `THIRD_PARTY_DIRS`/`SKIP_FILES` 那套过滤，额外根**整棵扫**（共享库是被显式点名的，不该再被启发式跳过）。
+- **`src/index.ts`**：`--as-class-path <dir>`（可重复，`KNOWN_FLAGS` + 解析 + `usage()`）；
+  **只对 `--air-app` 有效**（否则报错：没有闭包可拓宽）；默认 take 值走的是既有的「以 `-` 开头仍算值」策略。
+- **两个钉子**（`test/unit/reach.ts`）：`unit: reach/as-class-path`（14 项：逐根 id、两个无包名
+  `Control.as` 的 id 相异、根**顺序无关**、嵌套根取最深、跨根保留/丢弃、硬报错三段文案、同根 last-wins）；
+  `unit: reach/as-class-path-cli`（5 项，**真编真跑**：无旗标时长鸣地编不过、加旗标编得过且共享根的类
+  出现在发射的 `.c` 里、`.as` 文件当根被拒、无 `--air-app` 传旗标被拒）。
+- **demo 侧**（不在编译器仓库内）：`asaotui/ui-demo/stage-air.cjs` 只**暂存 demo 自己的源码**并打印共享根；
+  两个 runner 各加两行 `--as-class-path`。三个 demo 的 `src/` 从 **97 个 `.as`** 降到 **6 个**。
+
+**三、验收（实测）**
+
+- gallery（**默认面**，不带 `--all-sources`）：`94/97 sources reachable from demo.GalleryMain`，四页 tour
+  `RESULT: PASS`；登录 demo `RESULT: PASS`（8 项断言，`AOT-CHECK: PASS (0 failures)`）；
+  `ASC_AIR_DIR=air-gallery-standard` 的孪生 app 同样 `RESULT: PASS`。
+- 三个 demo 的 `src/asaot` **目录全部不存在**（`src/` 只剩 6 个自有 `.as`）⇒「三份拷贝」这件事在磁盘上没了。
+- `asaotui/tools/reach-dump.cjs` 改多根后复算 `kept 94/97 edges 68`，与编译器自报一字不差
+  （它是诊断镜像，不是编译器本身）。
+- 全量回归 **466 项 / 463 过 / 3 红**（+2 = 新增两个单元组），红的仍是既有三项（`socket.as` 无 Windows
+  socket 后端、`stage94d.as` UTF-16LE、`unit: inline/StackCanary` 本机 clang 差异）。
+- **变异 4/4 全抓**（`temp/mut-acp.cjs`）：M1 取「第一个匹配的根」而非最深 ⇒ 嵌套根钉子；M2 去掉
+  `_2` 消歧 ⇒ 两个无包名 `Control.as` 合并成同一个类，**整组直接抛错**（不是具名 FAIL）；M3 跨根重名改成
+  静默放行 ⇒ 硬报错三条；M4 适配器不扫额外根 ⇒ CLI 两项。每次变异后按 sha256 断言源码**逐字节还原**。
+
+**四、如实报明**
+
+- **`[Embed]` 的前导 `/` 仍指向 `<appDir>/src`**（`index.ts` 的 `sourceRoot` 未随根列表变化）：相对路径按
+  **声明文件所在目录**解析、这是 AIR 的实测规则，跨根天然正确；但共享根里的类若写 `/` 开头的 `source`，
+  那个 `/` 指的是 app 的 `src/`。文档已写明，未改语义（改了会与 adl 不一致——`/` 在 AIR 里就是 app 相对）。
+- **同根重名不报错**是**刻意**的：那是 `symbols.ts` 的既有权衡，收紧会拒掉今天能编的树；跨根才是新纪元。
+- **M2 的抓法不是具名 FAIL**：两个同名 `Control.as` 失去消歧后会先撞上「同一个类被声明两次」的硬报错，
+  于是检查组在报出自己的 `FAIL` 之前整体抛错。**结论（有牙）不变**，但报告里不该写成「被某条钉子点名抓住」。
+- **`--all-sources` 与共享根正交**：它让**所有根**的文件全编（`parsedFiles` 本来就含全部根），不做闭包；
+  两个开关可以同时用，语义各自独立。
+- **本阶段不动 G5**（无触摸设备，用户明确冻结）。
+
+**五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——本阶段是工具链能力，不占缺口表；
 按表内实际行数重数仍为 **100 项**。
 
 ### 遗留待开发

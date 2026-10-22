@@ -11,7 +11,7 @@
 // So the main class must come from `--main-class`, or (by convention) a unique
 // `src/**/Main.as` whose `package` statement yields the FQN.
 
-import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, statSync, writeFileSync } from 'node:fs';
 import { resolve, dirname, relative, basename, sep, isAbsolute } from 'node:path';
 import { resolveExtensionPackages } from './ane.ts';
 import { AUDIO_GLUE_HOSTS, checkFailure, requireCheck, type CheckCtx } from './checks.ts';
@@ -935,6 +935,10 @@ export interface PreparedAirApp {
   info: AirAppInfo;
   mainClass: string;
   asFiles: string[];
+  // Every root those files were swept from, absolute, `src/` first: what
+  // `prepareReachFiles` needs to give each file a stable identity (a class's
+  // anonymous-namespace key is its path relative to ITS OWN root — see reach.ts).
+  sourceRoots: string[];
   manifestPath: string;
   // Non-fatal problems the adapter can see but not fix (it must not silently
   // produce a build that looks fine and renders wrong). Printed by the caller.
@@ -955,7 +959,7 @@ export interface PreparedAirApp {
 // which is otherwise invisible to the reachability closure.
 // `extDirOpts` is `--extdir <dir>`, repeated: the directories to locate the
 // descriptor's `<extensions>` packages in, overriding DEFAULT_EXT_DIRS.
-export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean, features: string[] | null = null, outputPath: string | null = null, includeThirdParty = false, extDirOpts: readonly string[] = []): PreparedAirApp {
+export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean, features: string[] | null = null, outputPath: string | null = null, includeThirdParty = false, extDirOpts: readonly string[] = [], asClassPaths: readonly string[] = []): PreparedAirApp {
   const xml = readFileSync(appXmlPath, 'utf8');
   const info = parseAirApp(xml);
   const dir = dirname(resolve(appXmlPath));
@@ -964,24 +968,51 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
     throw new AirAppError(`air-app src directory not found: ${srcDir}`);
   }
 
+  // Extra source roots (`--as-class-path`, 阶段二百五十): a library shared by several
+  // apps lives outside each of them, instead of as a byte-identical copy under every
+  // app's src/. CLI paths are resolved against the working directory — the same rule
+  // `--extdir` follows — and a root that is not a directory is refused by name,
+  // because "the flag was accepted and contributed nothing" is the shape of a
+  // silent wrong build (§2.5).
+  const classPaths = asClassPaths.map((p) => resolve(p));
+  for (const r of classPaths) {
+    let isDir = false;
+    try { isDir = statSync(r).isDirectory(); } catch { isDir = false; }
+    if (!isDir) {
+      throw new AirAppError(
+        `--as-class-path is not a directory: ${r}\n` +
+          `  the flag names a source ROOT (the directory holding the package tree),\n` +
+          `  not an individual .as file`
+      );
+    }
+    if (r === resolve(srcDir)) {
+      throw new AirAppError(`--as-class-path names the app's own src/ (${srcDir}); it is already the first source root`);
+    }
+  }
+  const sourceRoots = [srcDir, ...classPaths];
   const asFiles: string[] = [];
   const seen = new Set<string>();
-  const walk = (d: string): void => {
+  // `src/` keeps the demo-oriented skip rules (a vendored reverse-DNS tree stays
+  // invisible unless --include-third-party asks for it, and SKIP_FILES drops the one
+  // dead starling file). An explicitly named root is swept WHOLE: naming it is the
+  // user's decision, and a root that quietly dropped a package would fail far from
+  // the cause.
+  const walk = (d: string, skipThirdParty: boolean, skipListed: boolean): void => {
     for (const e of readdirSync(d, { withFileTypes: true })) {
       const p = resolve(d, e.name);
       if (e.isDirectory()) {
-        if (!includeThirdParty && THIRD_PARTY_DIRS.has(e.name)) continue;
-        walk(p);
+        if (skipThirdParty && THIRD_PARTY_DIRS.has(e.name)) continue;
+        walk(p, skipThirdParty, skipListed);
       } else if (e.name.endsWith('.as')) {
-        const rel = relative(srcDir, p).replace(/\\/g, '/');
-        if (SKIP_FILES.has(rel)) continue;
+        if (skipListed && SKIP_FILES.has(relative(srcDir, p).replace(/\\/g, '/'))) continue;
         if (seen.has(p)) continue;
         seen.add(p);
         asFiles.push(p);
       }
     }
   };
-  walk(srcDir);
+  walk(srcDir, !includeThirdParty, true);
+  for (const r of classPaths) walk(r, false, false);
   // Re-add the GreenSock core the demo reaches (present only in this example; a
   // different project without these vendored files simply gets nothing added).
   // Skipped when the walk already swept them (--include-third-party): a duplicate
@@ -1185,5 +1216,5 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
     );
   }
 
-  return { info, mainClass, asFiles, manifestPath, warnings };
+  return { info, mainClass, asFiles, sourceRoots, manifestPath, warnings };
 }

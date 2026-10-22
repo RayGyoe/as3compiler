@@ -134,6 +134,10 @@ Options:
   --source <f>   extra C/C++ source to compile and link (repeatable)
   --swc <f>      .swc library: bake its named bitmap resources, vector shapes and
                  display tree at compile time (repeatable; see docs/zh-cn/swc.md §5/§6/§9)
+  --as-class-path <dir> --air-app: an EXTRA source root compiled alongside src/, so a
+                 library shared by several apps lives in one place (repeatable; paths
+                 are cwd-relative; a class declared under two roots is an error, never
+                 last-wins — see §3.5.2)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
   --cflag <f>    extra C compiler flag for every compile AND link step (repeatable;
@@ -663,6 +667,58 @@ Three key behaviors aligned with adl:
 - The bootstrap code presets `stage.stageWidth/stageHeight` **before** `new Main()`, so that during document
   class construction `trace(stage.stageWidth, stage.stageHeight)` returns the window size (e.g. `1000 680`)
   rather than `0 0` outside adl.
+
+#### 3.5.2 Multiple source roots: `--as-class-path` (stage two-hundred-fifty)
+
+`--air-app` collects `.as` from **one** directory: `<appDir>/src`. A library shared by several
+apps therefore had to be **copied in** — the three `asaotui/ui-demo` demos each carried a
+byte-identical 91-file copy of the UI kit under `src/asaot/` (same md5 aggregate), refreshed by
+`stage-air.cjs` before every build. A junction under `src/` is not a workaround: the directory
+walker skips symlinked entries (measured, see `CONTRIBUTING-widget.md` §4).
+
+`--as-class-path <dir>` (repeatable, **`--air-app` only**) adds extra source directories to the
+**same** compile face: `src/` **plus** every named root. The three copies are gone: there is one
+`kit/` + `seam/` on disk, compiled where it lives.
+
+```bash
+as-aot --air-app app.xml --as-class-path ../seam --as-class-path ../kit
+```
+
+- Paths are resolved against the **current working directory** and must be **existing directories**;
+  a `.as` file, a missing directory, or `<appDir>/src` itself is refused with an error naming the flag.
+- Unrelated to `--source`, which adds **C/C++** sources; `.as` files stay positional arguments.
+- Passing it without `--air-app` is an error — there is no closure to widen.
+
+**File identity** (header note "MULTIPLE SOURCE ROOTS" in `src/reach.ts`) — a shared root must keep
+class names and C symbols from drifting with the build directory:
+
+| Rule | Why |
+|---|---|
+| A file belongs to the **deepest** root containing it | With both `src/` and `src/shared` declared, `src/shared/X.as` is named after the **inner** root; membership uses `relative`, not a string prefix, so `…/src2/x.as` is not mistaken for a member of `…/src` |
+| `fileId` = path relative to **its own** root | `kit/ui/Chip.as` gets the same id from any app directory ⇒ same anonymous-namespace key, same C symbol |
+| The same relative path under two roots ⇒ `_2`/`_3` suffix | Two **packageless** `Control.as` in different roots would otherwise share one anonymous namespace and collide as the same class |
+| The same qualified class under **two roots** ⇒ **hard error** naming both files | That is the migration trap: adding `--as-class-path ../kit` while `src/asaot` still holds a copy would otherwise be decided silently by walk order (§2.5 forbids that); duplicates **within** one root keep the pre-existing last-wins behaviour |
+
+**Migration recipe**: (1) move the library out of the app's `src/`; (2) add
+`--as-class-path <libroot>` to the build; (3) **delete the old copy under `src/`** (otherwise the hard
+error above fires); (4) rebuild.
+
+**`[Embed]` paths** still resolve relative to the **declaring file's** directory (AIR's measured rule,
+see [`embed.md`](../zh-cn/embed.md)); a `source` with a leading `/` still resolves against
+`<appDir>/src` — inside a shared root that `/` means the app's `src/`, not the shared root.
+
+**It is not a fix for G13**: "the closure does not expand a class first discovered by a forced file"
+is a separate defect, fixed in stage two-hundred-forty-nine. Fix the closure first and add roots
+second, or classes entering through a shared root take the very same unexpanded path.
+
+**Verification (measured)**: each of the three `asaotui/ui-demo` demos went from **97 `.as`** under
+`src/` (91 copied + 6 own) to **6**; `kit/`+`seam/` compile in place. The gallery (`--air-app`
+default face) keeps **94/97** sources and its four-page tour prints `RESULT: PASS`; the login demo
+prints `RESULT: PASS` (8 assertions). `node tools/reach-dump.cjs ui-demo/air-gallery/src
+demo.GalleryMain seam kit` recomputes `kept 94/97 edges 68`, matching the compiler's own line. Pins:
+`unit: reach/as-class-path` (14 checks: identity rules + the error text) and
+`unit: reach/as-class-path-cli` (5 checks that **really build**: no flag ⇒ fails loudly, with the flag
+⇒ builds and the shared root's class appears in the emitted `.c`); four mutations, all caught.
 
 ### 3.6 Build-environment self-check (`as-aot doctor`)
 

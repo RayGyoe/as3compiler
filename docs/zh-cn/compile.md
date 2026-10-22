@@ -135,6 +135,10 @@ Options:
   --extdir <dir> where the .ane packages an --air-app descriptor declares live
                  (repeatable; replaces the default <appDir>/ext-aot then
                  <appDir>/lib then <appDir>/ext-folder — see docs/zh-cn/ane.md §3.6)
+  --as-class-path <dir> --air-app: an EXTRA source root compiled alongside src/, so a
+                 library shared by several apps lives in one place (repeatable; paths
+                 are cwd-relative; a class declared under two roots is an error, never
+                 last-wins — see §3.5.2)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
   --cflag <f>    extra C compiler flag for every compile AND link step (repeatable;
@@ -597,6 +601,51 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
     且 Metal 构建下没有 CPU 回读缓冲（暴露渲染目标纹理正是为了省掉每次回读）——按 AIR 行为处理，非静默降级。
 - 引导代码在 `new Main()` **之前**预设 `stage.stageWidth/stageHeight`，使 document class 构造时
   `trace(stage.stageWidth, stage.stageHeight)` 返回窗口尺寸（如 `1000 680`），而非 adl 之外的 `0 0`。
+
+#### 3.5.2 多个源码根：`--as-class-path`（阶段二百五十）
+
+`--air-app` 收集 `.as` 的默认范围是**一个**目录：`<appDir>/src`。被多个 app 共用的类库因此只能**拷进去**
+——`asaotui/ui-demo` 的三个 demo 曾各自持有一份**逐字节相同**的 91 文件 UI kit（`src/asaot/`，三份 md5 聚合值
+一致），由 `stage-air.cjs` 每次构建前重新复制。在 `src/` 下挂 junction 不是绕法：目录遍历把符号链接当普通条目
+跳过（实测，见 `CONTRIBUTING-widget.md` §4）。
+
+`--as-class-path <dir>`（可重复，**只对 `--air-app` 有效**）把额外的源码目录加进**同一份编译面**：`src/`
+**加上**每个被点名的根。三份拷贝随之消失：`kit/` 与 `seam/` 只有一份，就地编译。
+
+```bash
+as-aot --air-app app.xml --as-class-path ../seam --as-class-path ../kit
+```
+
+- 路径**相对当前工作目录**解析，必须是**已存在的目录**；指向 `.as` 文件、目录不存在、或等于 `<appDir>/src`
+  都直接报错并点出这个旗标。
+- 它与 `--source` 无关：`--source` 加的是 **C/C++** 源文件；`.as` 文件本身仍是位置参数。
+- 没有 `--air-app` 时传它会报错——没有闭包可拓宽，多文件直接用位置参数。
+
+**文件身份**（`src/reach.ts` 头注「MULTIPLE SOURCE ROOTS」）——共享根必须让类名与 C 符号**不随构建目录漂移**：
+
+| 规则 | 为什么 |
+|---|---|
+| 文件属于**最深**的、包含它的根 | 同时声明 `src/` 与 `src/shared` 时，`src/shared/X.as` 按**内层**根命名；用 `relative` 判断而不是字符串前缀，`…/src2/x.as` 不会被误判成 `…/src` 的成员 |
+| `fileId` = 相对**它自己那个根**的路径 | `kit/ui/Chip.as` 在任何 app 目录下都得到同一个 id ⇒ 同一个匿名命名空间键、同一个 C 符号 |
+| 同一相对路径出现在两个根 ⇒ 加 `_2`/`_3` 后缀 | 两个根各有一个**无包名**的 `Control.as` 时，它们的匿名命名空间才不会撞车 |
+| 同一个全限定类出现在**两个根** ⇒ **硬报错**，点名两个文件 | 这是**迁移陷阱**：加了 `--as-class-path ../kit` 却忘了删 `src/asaot` 里的旧拷贝时，walk 顺序会静默决定谁赢（§2.5 禁止）；同一根内的重名仍是既有的 last-wins 行为 |
+
+**迁移配方**：① 把类库移出 app 的 `src/`；② 构建命令加 `--as-class-path <库根>`；③ **删掉 `src/` 里的旧拷贝**
+（不删就撞上面那条硬报错）；④ 重跑。
+
+**`[Embed]` 的相对路径**仍按**声明它的文件所在目录**解析（AIR 的实测规则，见 [`embed.md`](embed.md)）；
+带前导 `/` 的 `source` 仍相对 `<appDir>/src`——共享根里的类若写 `/` 开头的 `source`，那个 `/` 指的是 app 的
+`src/`，不是该共享根。
+
+**它不是 G13 的解药**：闭包不展开「强制文件发现的类」是**另一件事**，已在阶段二百四十九单独修掉。先修闭包再加根，
+否则共享根进来的类会走**同一条**不展开的通路。
+
+**验收（实测）**：`asaotui/ui-demo` 三个 demo 的 `src/` 从 **97 个 `.as`**（91 拷贝 + 6 自有）降到 **6 个**，
+`kit/`+`seam/` 就地编译；gallery（`--air-app` 默认面）闭包 **94/97**、四页 tour `RESULT: PASS`，登录 demo
+`RESULT: PASS`（8 项断言）；`node tools/reach-dump.cjs ui-demo/air-gallery/src demo.GalleryMain seam kit` 复算
+`kept 94/97 edges 68`，与编译器自报一致。钉子：`unit: reach/as-class-path`（14 项，身份规则 + 硬报错文案）与
+`unit: reach/as-class-path-cli`（5 项，**真编真跑**：无旗标编不过、加旗标编得过且共享根的类出现在 `.c` 里）；
+四个变异各自被咬住。
 
 ### 3.6 构建环境自检（`as-aot doctor`）
 

@@ -24,7 +24,8 @@
 // demos: 0 functions present only in the closure build; the only text that
 // differs is the per-build type/root manifest tables, which are themselves
 // subsets).
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { prepareReachFiles, computeReachable } from '../../src/reach.ts';
 import { generateC } from '../../src/codegen.ts';
@@ -385,7 +386,11 @@ function checkWiring(): string[] {
   const reach = readFileSync(join(root, 'src', 'reach.ts'), 'utf8');
 
   c.check('the --air-app branch prepares sources through reach.ts (one shared rewrite path)',
-    /prepareReachFiles\(air\.asFiles, srcDir\)/.test(index));
+    /prepareReachFiles\(air\.asFiles, air\.sourceRoots\)/.test(index));
+  c.check('...with the roots the adapter swept (src/ plus every --as-class-path)',
+    /const sourceRoots = \[srcDir, \.\.\.classPaths\];/.test(
+      readFileSync(join(root, 'src', 'air-app.ts'), 'utf8'))
+    && /--as-class-path/.test(index));
   c.check('...and compiles the closure the adapter computed',
     /computeReachable\(parsedFiles, air\.mainClass, swcBaseRoots\)/.test(index));
   // The closure's extra roots: a symbol class whose SWC-declared base is a project
@@ -561,9 +566,236 @@ function checkForcedFileExpansion(): string[] {
   return c.done();
 }
 
+// ---------------------------------------------------------------------------
+// --as-class-path: source roots beyond the app's src/ (阶段二百五十)
+// ---------------------------------------------------------------------------
+//
+// A library shared by several apps has to live OUTSIDE each of them (three demos
+// each carrying a byte-identical copy of the UI kit is what motivated this), so the
+// compiler must compile from more than one root. Two things can go silently wrong,
+// and both are pinned here:
+//
+//   * a file's identity is its path relative to ITS OWN root, so the same kit gets
+//     the same anonymous-namespace key (and the same C symbols) whichever app builds
+//     it — and two files that would land on one id still stay distinct;
+//   * the same FQN declared under two roots is a HARD ERROR, not walk-order
+//     last-wins. That is the migration trap: adding the shared root while src/ still
+//     holds a copy.
+const MULTI: [string, string][] = [
+  ['src/app/Main.as', `package app {
+  import kit.Widget;
+  public class Main {
+    public function Main():void { trace(new Widget().name()); }
+  }
+}
+`],
+  ['src/app/Dead.as', `package app {
+  public class Dead { public function Dead():void { } }
+}
+`],
+  ['kit/Widget.as', `package kit {
+  public class Widget {
+    public function name():String { return "widget"; }
+  }
+}
+`],
+  ['kit/Unused.as', `package kit {
+  public class Unused { public function Unused():void { } }
+}
+`],
+  // The SAME packageless relative path under both roots: their file-scoped
+  // anonymous namespaces must not merge into one class.
+  ['src/Control.as', `class Control { public function Control():void { } }
+`],
+  ['kit/Control.as', `class Control { public function Control():void { } }
+`],
+];
+
+interface MultiTree { dir: string; srcDir: string; kitDir: string; paths: string[] }
+
+function writeMulti(dirName: string, extra: [string, string][] = []): MultiTree {
+  const dir = join(FIXTURE_ROOT, dirName);
+  rmSync(dir, { recursive: true, force: true });
+  const paths: string[] = [];
+  for (const [rel, source] of [...MULTI, ...extra]) {
+    const p = join(dir, rel);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, source);
+    paths.push(p);
+  }
+  return { dir, srcDir: join(dir, 'src'), kitDir: join(dir, 'kit'), paths };
+}
+
+const declFileId = (f: { body: unknown[] } | undefined): string | undefined => {
+  const d = f?.body[0] as { fileId?: string | null } | undefined;
+  return d?.fileId ?? undefined;
+};
+const declPkg = (f: { body: unknown[] } | undefined): string | null | undefined => {
+  const d = f?.body[0] as { packageName?: string | null } | undefined;
+  return d?.packageName;
+};
+
+function checkAsClassPath(): string[] {
+  const c = checker('reach-roots');
+
+  const t = writeMulti('multi');
+  const files = prepareReachFiles(t.paths, [t.srcDir, t.kitDir]);
+  const byName = (n: string): (typeof files)[number] | undefined => files.find((f) => f.path.endsWith(n));
+
+  c.check('a file under the second root is identified relative to THAT root (`<kit>/Widget.as` -> `Widget`)',
+    declFileId(byName('Widget.as')) === 'Widget');
+  c.check('...and a file under src/ is still identified relative to src/ (`app/Main.as` -> `app_Main`)',
+    declFileId(byName('Main.as')) === 'app_Main');
+  c.check('a kit file is NOT named `.._kit_Widget` (the root is matched, not string-concatenated)',
+    !(declFileId(byName('Widget.as')) ?? '').includes('..'));
+
+  // Two packageless files at the same relative path must not share one anonymous
+  // namespace: AS3's per-file namespace would otherwise collapse them into ONE class.
+  const controls = files.filter((f) => f.path.endsWith('Control.as'));
+  const ids = controls.map((f) => declFileId(f) ?? '');
+  c.check('two packageless `Control.as` under different roots get DISTINCT file ids',
+    controls.length === 2 && new Set(ids).size === 2);
+  c.check('...and therefore distinct anonymous package names',
+    new Set(controls.map((f) => declPkg(f) ?? '')).size === 2);
+  c.check('the first root keeps the plain id (`Control`), the later one is suffixed',
+    ids.includes('Control') && ids.some((i) => i.startsWith('Control_')));
+
+  // Root ORDER must not change identities: the root a file belongs to is the
+  // deepest match, not the first one tried.
+  const reversed = prepareReachFiles(t.paths, [t.kitDir, t.srcDir]);
+  c.check('identities do not depend on the order the roots are named in',
+    JSON.stringify(reversed.map((f) => [(f.body[0] as { fileId?: string }).fileId])) ===
+    JSON.stringify(files.map((f) => [(f.body[0] as { fileId?: string }).fileId])));
+
+  // A root NESTED inside another: the DEEPEST root names the file, so `src/` plus
+  // `src/app/` behaves like a reader expects. A "first matching root" implementation
+  // (or one that string-prefixes instead of using `relative`) names it `app_Main`.
+  const inner = join(t.srcDir, 'app');
+  // (only the files under those two roots: the kit is a third root and would be rejected,
+  //  which is itself the next check)
+  const nested = prepareReachFiles(t.paths.filter((p) => p.startsWith(t.srcDir)), [t.srcDir, inner]);
+  c.check('a root nested inside another: the DEEPEST root names the file (`app/Main.as` -> `Main`)',
+    declFileId(nested.find((f) => f.path.endsWith(join('app', 'Main.as')))) === 'Main');
+
+  // The closure itself works across roots: the kit class Main imports is kept, the
+  // unused kit class is dropped exactly like an unused src/ class.
+  const r = computeReachable(files, 'app.Main');
+  c.check('a class reached across roots is kept', r.kept.map(short).includes('Widget'));
+  c.check('an unreachable class in the shared root is dropped like any other',
+    r.dropped.map(short).includes('Unused'));
+
+  // Cross-root duplicate FQN: hard error, naming both files.
+  const dup = writeMulti('multi-dup', [
+    ['kit/app/Dead.as', `package app {
+  public class Dead { public function Dead():void { } }
+}
+`],
+  ]);
+  const threw = ((): string => {
+    try { prepareReachFiles(dup.paths, [dup.srcDir, dup.kitDir]); return ''; }
+    catch (e) { return e instanceof Error ? e.message : String(e); }
+  })();
+  c.check('the same FQN under two roots is a hard error',
+    /the same class is declared under two source roots: 'app\.Dead'/.test(threw));
+  c.check('...naming BOTH files (the stale copy is what a migration must delete)',
+    threw.includes('src/app/Dead.as') && threw.includes('kit/app/Dead.as'));
+  c.check('...and pointing at --as-class-path as the cause',
+    threw.includes('--as-class-path'));
+
+  // The rule stops at the root boundary: two files in the SAME root colliding is
+  // pre-existing last-wins behaviour (symbols.ts), and refusing it here would break
+  // trees that build today.
+  const same = writeMulti('multi-same', [
+    ['src/dup1/Same.as', `package s { public class Same { public function Same():void { } } }
+`],
+    ['src/dup2/Same.as', `package s { public class Same { public function Same():void { } } }
+`],
+  ]);
+  let sameThrew = '';
+  try { prepareReachFiles(same.paths, [same.srcDir, same.kitDir]); } catch (e) { sameThrew = String(e); }
+  c.check('two same-FQN files inside ONE root keep last-wins (unchanged behaviour)',
+    sameThrew === '');
+  return c.done();
+}
+
+// ---- the CLI end to end: the flag is what makes the shared root compile ------
+//
+// The shipped tree's demos live outside this repo (asaotui/ui-demo), so the only
+// way for `node test.ts` to notice a broken flag is to build a tiny app here. `--dry`
+// still runs the whole frontend (parse -> reach -> codegen -> emit) and writes the
+// `.c`; only the C compiler invocation is skipped.
+function checkAsClassPathCli(): string[] {
+  const c = checker('reach-cp-cli');
+  const base = join(root, 'temp', 'reachunit', 'cp-cli');
+  rmSync(base, { recursive: true, force: true });
+  const xml = (name: string): string =>
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<application xmlns="http://ns.adobe.com/air/application/51.0">\n` +
+    `  <id>com.example.${name}</id>\n  <filename>${name}</filename>\n` +
+    `  <initialWindow><content>main.swf</content><visible>true</visible>` +
+    `<width>200</width><height>200</height></initialWindow>\n</application>\n`;
+
+  const appDir = join(base, 'app');
+  const kitDir = join(base, 'kit');
+  mkdirSync(join(appDir, 'src'), { recursive: true });
+  mkdirSync(kitDir, { recursive: true });
+  writeFileSync(join(appDir, 'cp-app.xml'), xml('cp'));
+  writeFileSync(join(appDir, 'src', 'Main.as'),
+    'package {\n  import flash.display.Sprite;\n  import kit.Widget;\n' +
+    '  public class Main extends Sprite {\n' +
+    '    public function Main() { trace(new Widget().name()); }\n  }\n}\n');
+  writeFileSync(join(kitDir, 'Widget.as'),
+    'package kit {\n  public class Widget {\n    public function name():String { return "widget"; }\n  }\n}\n');
+
+  const run = (args: string[]): { ok: boolean; out: string } => {
+    try {
+      const out = execFileSync('node', ['src/index.ts', '--air-app', join(appDir, 'cp-app.xml'), ...args, '--dry'],
+        { cwd: root, stdio: 'pipe', encoding: 'utf8', timeout: 240_000 }) as string;
+      return { ok: true, out };
+    } catch (e) {
+      const err = e as { stdout?: string; stderr?: string };
+      return { ok: false, out: `${err.stdout ?? ''}${err.stderr ?? ''}` };
+    }
+  };
+
+  // Without the flag the kit class is simply absent -> a LOUD unknown type, not a
+  // silently smaller program.
+  const bare = run([]);
+  c.check('without --as-class-path the app does not build (the class is absent, loudly)',
+    !bare.ok && /Widget/.test(bare.out));
+
+  const withRoot = run(['--as-class-path', kitDir]);
+  c.check('--as-class-path <dir> compiles the app against the shared root', withRoot.ok);
+  const emitted = existsSync(join(appDir, 'cp.c')) ? readFileSync(join(appDir, 'cp.c'), 'utf8') : '';
+  c.check('...and the shared root\'s class is really in the emitted C', emitted.includes('kit_Widget'));
+
+  // The flag names a ROOT; an individual .as file is a different thing.
+  const asFile = run(['--as-class-path', join(kitDir, 'Widget.as')]);
+  c.check('a .as FILE is refused as a root, by name',
+    !asFile.ok && /--as-class-path is not a directory/.test(asFile.out));
+
+  // Without a descriptor there is no closure to widen, so the flag is refused
+  // instead of being accepted and doing nothing.
+  const noAir = ((): { ok: boolean; out: string } => {
+    try {
+      const out = execFileSync('node', ['src/index.ts', 'examples/hello.as', '--as-class-path', kitDir, '--dry'],
+        { cwd: root, stdio: 'pipe', encoding: 'utf8', timeout: 240_000 }) as string;
+      return { ok: true, out };
+    } catch (e) {
+      const err = e as { stdout?: string; stderr?: string };
+      return { ok: false, out: `${err.stdout ?? ''}${err.stderr ?? ''}` };
+    }
+  })();
+  c.check('--as-class-path without --air-app is refused (no closure to widen)',
+    !noAir.ok && /--as-class-path only applies to --air-app/.test(noAir.out));
+  return c.done();
+}
+
 registerGroup('unit: reach/closure', checkClosure);
 registerGroup('unit: reach/edge', checkAttribution);
 registerGroup('unit: reach/prepare', checkPrepare);
 registerGroup('unit: reach/emit', checkEmit);
 registerGroup('unit: reach/wiring', checkWiring);
+registerGroup('unit: reach/as-class-path', checkAsClassPath);
+registerGroup('unit: reach/as-class-path-cli', checkAsClassPathCli);
 registerGroup('unit: reach/forced', checkForcedFileExpansion);
