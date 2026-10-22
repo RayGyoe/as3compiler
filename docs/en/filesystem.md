@@ -23,7 +23,7 @@
 
 | Member | Status | Note |
 |---|---|---|
-| `File.moveToTrash()` | ✅ implemented (macOS + freedesktop POSIX) | no Windows backend; reports itself loudly (§6) |
+| `File.moveToTrash()` | ✅ implemented (macOS + freedesktop POSIX + the Windows Recycle Bin) | three backends, see §4; WASI/Emscripten has no trash concept and reports itself loudly (§6) |
 | `File.moveToTrashAsync()` | ✅ implemented | delivery convention in §3 |
 | `File.spaceAvailable` (property) | ✅ existed (stage sixty-four); semantics **corrected** here | answers only for a regular file or a directory (§5) |
 | `File.getSpaceAvailable` | ❌ **AIR has no such member** | not provided either (`in` is `false`, as on `adl`) |
@@ -98,8 +98,8 @@ listener first, then start" — holds at both ends.
 |---|---|---|
 | macOS | same volume as `$HOME`: `~/.Trash`; another volume: `<mount point>/.Trashes/<uid>` | measured: the item appears in `~/.Trash` (visible and restorable in Finder); `<volume>/.Trashes/<uid>` is the Finder / `NSFileManager` layout |
 | Linux and other POSIX | `files/` + `info/` under `$XDG_DATA_HOME/Trash` (default `~/.local/share/Trash`), each payload paired with a `.trashinfo` (`Path=` percent-escaped + `DeletionDate=`) | the freedesktop.org Trash specification (**not verified on a real machine**; this host is macOS) |
-| Windows | **not implemented** | needs `SHFileOperation`/`IFileOperation` to reach the Recycle Bin; this round does not add an unverifiable branch that also changes link libraries — it reports itself loudly (`as_shell_unsupported`) and throws `#2038`, and the gap is registered in `TODO.md` under `遗留待开发` |
-| WASI / Emscripten | no trash concept | same (loud report + `#2038`) |
+| Windows | **the Recycle Bin**: `SHFileOperationW` + `FOF_ALLOWUNDO` — the same path Explorer's Delete takes (into `C:\$Recycle.Bin\<SID>\`, restorable from the Recycle Bin) | measured against `adl 51.4.1` **on Windows** (the two-ended probe in `temp/trashwin/`): a regular file, a **directory with its children**, and the async form all land in the Recycle Bin; the `$I` sidecar records the **original path** (UTF-16LE) and the `$R` payload reads back identical; the failure ids are the same `#3003`/`#2037` as on macOS. Windows has **no trash directory to rename into** (the Recycle Bin is shell-owned storage), so `as_trash_dir`'s `_WIN32` arm stays a `NULL` stub and `as_trash_move` routes to `as_trash_move_shell` ahead of it (path converted with `CP_ACP`, list **double-NUL** terminated — the same convention as every other ANSI call in the runtime); the link layer therefore adds `shell32` for Windows builds |
+| WASI / Emscripten | no trash concept | loud report (`as_shell_unsupported`) + `#2038` |
 
 "Same volume" is decided by comparing `st_dev` (`as_trash_dir`); the **mount
 point of another volume** is found by walking up until `st_dev` changes
@@ -155,8 +155,10 @@ it corrects the semantics.
 
 ## 6. What is not done (on the record)
 
-- **Windows Recycle Bin backend**: unimplemented; the call reports itself loudly
-  and throws `#2038` (a row in `TODO.md` `遗留待开发`).
+- **The WASI / Emscripten trash**: no counterpart API, so the call reports itself
+  loudly and throws `#2038`. A browser has no recycle-bin concept at all, which makes
+  the loud report the end state there (no fake backend). The Windows Recycle Bin
+  backend landed at stage 244 (§4).
 - **Finder "Put Back" metadata**: see the trade-off in §4.
 - **Cross-volume moves**: the target directory is chosen per volume
   (`as_trash_dir`), so `rename` never crosses one; a genuine cross-volume case

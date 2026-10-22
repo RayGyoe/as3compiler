@@ -1192,11 +1192,16 @@ function posixLinkLibs(): string[] {
 // libiconv (so the linker needs -liconv), Linux/BSD ship it inside libc (no
 // flag), and the wasm backends have none at all -- there the generated C drops
 // the iconv path entirely via AS_HAVE_ICONV, and adding -liconv would fail the
-// link, so this list is deliberately empty for wasm/web. Windows is in the same
-// boat as wasm (no <iconv.h> in the CRT, and no libiconv in vendor/), so it takes
-// no flag here either -- see AS_HAVE_ICONV in runtime.ts, which is what makes the
-// Windows build report the unsupported charsets loudly instead of mis-encoding.
+// link, so this list is deliberately empty for wasm/web. Windows has no <iconv.h> in
+// the CRT and no libiconv in vendor/, so it takes no flag for THAT -- see AS_HAVE_ICONV
+// in runtime.ts, which is what makes the Windows build report the unsupported charsets
+// loudly instead of mis-encoding. Windows is not empty outright, though: shell32 is
+// the import library its runtime arm resolves SHFileOperationW through (the Recycle
+// Bin behind File.moveToTrash) and ShellExecuteA (as_open_external, i.e.
+// navigateToURL). Without it the MSVC target's linker rejects both symbols, which is
+// how urlstream-api.as failed with "undefined symbol: ShellExecuteA" until now.
 export function platformLinkLibs(): string[] {
+  if (process.platform === 'win32') return ['shell32'];
   if (process.platform !== 'darwin') return [];
   return ['iconv'];
 }

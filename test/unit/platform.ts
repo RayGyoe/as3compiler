@@ -1875,6 +1875,90 @@ function checkFileHostConstants(): string[] {
 
 registerGroup('unit: platform/FileHostConstants', checkFileHostConstants);
 
+// The Windows arm of the two File host backends (阶段二百四十四): the Recycle Bin behind
+// File.moveToTrash, and the volume query behind File.spaceAvailable.
+//
+// Same bug class as File.separator above -- a conditional whose Windows branch the
+// developer's machine never compiles if you only ever build and run on POSIX -- but
+// found this time from the other end: the POSIX arm was the real implementation and
+// the _WIN32 arm was the stub (as_trash_dir returned NULL, so moveToTrash threw #2038
+// while AIR recycled the item). Measured against adl 51.4.1 ON WINDOWS
+// (temp/trashwin/): the item lands in the Recycle Bin with its payload readable and
+// its original path recorded in the $I sidecar, directories included; the async form
+// dispatches COMPLETE; the failure numbers are the same #3003/#2037 as on macOS; and a
+// regular file reports the same spaceAvailable as the directory that holds it.
+//
+// The half this machine CANNOT run is the POSIX one, so it is pinned structurally:
+// as_trash_move must still reach as_trash_dir on every non-Windows target, and the
+// POSIX body has to survive verbatim inside the new #else -- the whole Windows change
+// being an #ifdef wrap of it is what makes "unchanged" checkable without a Mac.
+function checkWindowsHostBackends(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [win-host] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [win-host] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'import flash.filesystem.File;\n' +
+    'var f:File = new File("x");\n' +
+    'f.moveToTrash();\n' +
+    'f.moveToTrashAsync();\n' +
+    'trace("" + f.spaceAvailable);\n'
+  )).c;
+  const fn = (sig: string): string => {
+    const i = c.indexOf(sig);
+    return i < 0 ? '' : c.slice(i, c.indexOf('\n}', i));
+  };
+
+  const shell = fn('static long as_trash_move_shell(const char* path) {');
+  const move = fn('static long as_trash_move(const char* path) {');
+  const space = fn('static double as_file_space_available(const char* p) {');
+  const dirFn = fn('static char* as_trash_dir(const char* path) {');
+
+  check('the Recycle Bin helper is emitted, guarded for _WIN32 only',
+    c.includes('#ifdef _WIN32\nstatic long as_trash_move_shell')
+    && c.includes('}\n#endif\n\n// as_trash_move:') && c.includes('void File_moveToTrash(void* _this) {'));
+  check('it deletes through SHFileOperationW with FOF_ALLOWUNDO (recycled, not erased)',
+    shell.includes('op.wFunc = FO_DELETE;') && shell.includes('FOF_ALLOWUNDO')
+    && shell.includes('FOF_NOCONFIRMATION') && shell.includes('FOF_NOERRORUI')
+    && shell.includes('if (SHFileOperationW(&op) != 0) return 2038;'));
+  check('the path list is DOUBLE-NUL terminated and converted the way the rest of the runtime converts',
+    shell.includes('MultiByteToWideChar(CP_ACP, 0, path, -1, NULL, 0)')
+    && shell.includes('(size_t)(need + 1) * sizeof(WCHAR)') && shell.includes('from[need] = 0;'));
+  check('as_trash_move reaches it on Windows BEFORE the POSIX trash directory lookup',
+    move.includes('#ifdef _WIN32') && move.includes('return as_trash_move_shell(path);')
+    && move.includes('#else') && move.indexOf('as_trash_move_shell') < move.indexOf('as_trash_dir'));
+  check('...and the POSIX body survives verbatim inside that #else',
+    move.includes('char* dir = as_trash_dir(path);') && move.includes('rename(path, target)')
+    && move.includes('as_trash_note(dir, target, path);') && move.trimEnd().endsWith('#endif'));
+  check('the Windows arm of as_trash_dir stays a stub: this host never renames into a trash directory',
+    dirFn.includes('#elif defined(_WIN32)')
+    && dirFn.slice(dirFn.indexOf('#elif defined(_WIN32)'), dirFn.indexOf('#elif defined(__APPLE__)')).includes('return NULL;')
+    && dirFn.includes('.Trashes'));
+  check('spaceAvailable maps a path to its volume root, so a FILE answers too',
+    space.includes('GetVolumePathNameA(p, root, MAX_PATH)') && space.includes('GetDiskFreeSpaceExA(root, &freeAvail, NULL, NULL)'));
+  check('...gated on existence, because GetVolumePathName walks up to a mounted ancestor',
+    space.includes('if (!as_path_exists(p)) return 0.0;')
+    && space.indexOf('as_path_exists') < space.indexOf('GetVolumePathNameA'));
+
+  const build = readNorm(join(root, 'src', 'build.ts'));
+  check('the Windows link line carries shell32 (SHFileOperationW and ShellExecuteA)',
+    /if \(process\.platform === 'win32'\) return \['shell32'\];/.test(build));
+
+  const ex = readNorm(join(root, 'examples', 'move-to-trash.as'));
+  check('the example proves recoverability on BOTH hosts, not only in the POSIX trash dirs',
+    ex.includes('function isWindows()') && ex.includes('$Recycle.Bin')
+    && ex.includes('recordedPath(k)') && ex.includes('purge(payload)')
+    && ex.includes('every recycled entry this run made is gone'));
+
+  console.log(`     [win-host] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/WindowsHostBackends', checkWindowsHostBackends);
+
 // Windows per-character font fallback. GDI's manager has no system cascade at all:
 // SkFontMgrGDI::onMatchFamilyStyleCharacter is an unconditional `return nullptr`
 // (src/ports/SkFontHost_win.cpp ~2267), while SkParagraph asks the manager for a

@@ -13816,7 +13816,7 @@ Windows 上的全量回归有 16 条红是同一类：`examples/` 下 15 个示�
 
 **六、回归**
 
-`node test.ts`：**441 项 / 438 过 / 3 红**（本阶段前 20 红）。剩下 3 条全是**真后端缺口**、与宿主假设无关：`socket.as`（`bind(0)` 不自动分配端口）、`stage94d.as`（该后端不支持 `UTF-16LE` 字符集）、`urlstream-api.as`（链接集缺 `shell32`），已按 §1.5 硬判据归入「遗留待开发」。
+`node test.ts`：**441 项 / 438 过 / 3 红**（本阶段前 20 红）。剩下 3 条全是**真后端缺口**、与宿主假设无关：`socket.as`（`bind(0)` 不自动分配端口）、`stage94d.as`（该后端不支持 `UTF-16LE` 字符集）、`urlstream-api.as`（链接集缺 `shell32`），已按 §1.5 硬判据归入「遗留待开发」（其中 `urlstream-api.as` 的 `shell32` 一条**已由阶段二百四十四 消掉**：Windows 链接集补上 `shell32` 后该示例转绿）。
 
 **closure**：① **「跨宿主」不等于「处处可编」** —— `air-native` / `ane` / `ane-app` 三份仍写死 `windows-x64`，而且**是有理由的**（`air-native` 绑死 D3D 后端）；钉子按**内容**跳过它们并**打印**名单，于是「迁移完了」是一句可核对的断言，而不是一句声明；② **能在解析期失败，就不该拖到链接期** —— 半截路径、空 `-L`、不存在的归档，全都在读清单时就有了答案，而这些错误在链接期会伪装成「缺符号」；③ **一个字段可以同时是两个机制的前提** —— 补 `architecture` 时只想着「位宽对了」，结果把 `icudtl.dat` 的部署路径**第一次**打开了，而这个坑在 macOS 上不存在；凡「补一个前置条件」，要把它的**第二重消费者**也量一遍。
 ### 阶段二百三十八：冷报错构造器把**栈金丝雀**带进热函数 —— `oop` 回退 12% 的根因（v0.4.203 → v0.4.204）✅ 已完成
@@ -14255,13 +14255,86 @@ AIR 在自己的 IO 线程上做，但调用方唯一能依赖的顺序「先 `a
 - **残差 1（族级，已登记 1 行）**：空 `File` 的成员访问全线不抛 `#2037`。本轮新增的两个成员**是**抛的，
   但既有成员的 `nativePath` 是**普通字段**，族级修复要把它改成访问器（牵动 AMF 成员表、结构体布局、
   codegen 字段访问），不在本轮范围内**半修**。
-- **残差 2（已登记 1 行）**：Windows/wasm 没有回收站后端。
+- **残差 2（已登记 1 行）**：Windows/wasm 没有回收站后端。（**Windows 半已于阶段二百四十四 落地**，wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报明即终态。）
 - **残差 3**：freedesktop 分支**未在真机验证**（本机 macOS），只做过编译 + 布局级运行；
   冲突名同毫秒兜底 `-<n>` **无实测参照**（概率可忽略，取「不失败」而非「精确复刻」）。
 - 本阶段只实测 macOS 的 `adl` 行为；Linux/Windows 端的 `adl` 口径**未采**。
 
 **八、本表变动**：**新登记 2 行 / 改写 0 行 / 移出 0 行**（G1/G2 属「`adl` 有、我们跑不出」且**阶段内已修净**
 ⇒ 落地本身不占表；G2 查明是**误记**，也不占表）。表内 **98 → 100 项**（`未开始` **73 → 75**）。
+
+### 阶段二百四十四：`File.moveToTrash` 的 Windows 回收站后端 + 卷容量口径 + Windows 链接集（v0.4.207 → v0.4.208）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+阶段二百四十三 把 Windows 的回收站记成「无后端 ⇒ 响亮报明」，理由是「本机是 macOS，写了也验证不了」。
+用户当场质疑：**AS3 参考文档并没有说 Windows 不支持**——`File.moveToTrash()` 的原文只有「On operating
+systems that do not support the concept of a recoverable trash folder, the files are removed immediately」
+（AIR 1.0，无平台注记）。质疑是对的：**文档没排除 + `adl` 能跑**，两条同时成立，按 AGENTS §1.5 的硬判据
+这就是**遗留缺陷**，不是增强、也不是平台边界；而本项目开发机正是 Windows，**「验证不了」这个前提不成立**。
+
+**二、实测：Windows 真机的 `adl 51.4.1` 确实进回收站**（探针 `temp/trashwin/`，mxmlc + 真机 adl）
+
+回收站不是「一个目录」，而是 shell 拥有的**成对**存储：系统盘根下的 `$Recycle.Bin` 里，每个 `<SID>` 目录下
+`$I` 记元数据、`$R` 是载荷。探针因此不猜目录，而是**从 `$I` 反查**——把记录按 UTF-16LE 逐字节解出
+（`[8B 头][8B 大小][8B FILETIME][4B 名长][名]`），按本次运行的唯一标记定位，再把 `$R` 载荷读回来，
+以此证明它是**可还原**而不是「被删掉」。
+
+- 普通文件：进回收站，`$I` 记着**原路径**、`$R` 内容读回逐字节一致（修前我方抛 `#2038`）。
+- 目录（含子项）：连同子项整条进去（修前抛 `#2038`）。
+- `moveToTrashAsync`：派 `COMPLETE`（修前抛 `#2038`）。
+- 不存在的路径 / 空 `File`：`#3003` / `#2037`，与 macOS 同号（本来就一致）。
+
+**三、落地**（`src/emit.ts` + `src/build.ts` + `examples/move-to-trash.as`）
+
+- **`as_trash_move_shell`**（`#ifdef _WIN32`）：`SHFileOperationW` + `FO_DELETE` +
+  `FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT`。选 `SHFileOperationW` 而非
+  `IFileOperation`：两者语义上都进回收站，前者是 Win32 老 API、不需要 COM 初始化，**也不给所有
+  Windows 构建再压上 `ole32`**。路径按 `CP_ACP` 转宽字符（与 runtime 其余 ANSI 调用同口径），
+  列表**双 NUL** 结尾。
+- **`as_trash_move` 分派**：`#ifdef _WIN32 return as_trash_move_shell(path);` 先走，`#else` 里是
+  **原样不动的 POSIX 体**。**`as_trash_dir` 的 `_WIN32` 分支继续返回 `NULL` 桩**——Windows 没有
+  「废纸篓目录」可以 `rename` 进去，那条路对这个宿主是**不可达**，不是未实现。
+- **`spaceAvailable` 的 Windows 臂**：`GetDiskFreeSpaceEx` 只认目录，故先把路径映射到所在卷
+  （`GetVolumePathNameA`）再问容量。**必须加 `as_path_exists` 前置门**：`GetVolumePathName` 会
+  **逐级上溯到最近的挂载祖先**，不加门的话一个 OS 解析不了的路径会报出所在卷的容量，而 `adl` 实测报 `0`
+  （这条是跑第二遍才暴露的，第一版就是这么错的）。
+- **链接集**：`platformLinkLibs()` 在 win32 上返回 `['shell32']`——`SHFileOperationW` 与**既有的**
+  `ShellExecuteA`（`as_open_external`，即 `navigateToURL`）都由它解析。**顺带消掉一条既有红**：
+  `urlstream-api.as` 的 `undefined symbol: ShellExecuteA` 是同一个原因，现在也转绿。
+- **示例** `examples/move-to-trash.as`：补 Windows 分支（按 `$I` 反查定位、按卷容量断言、跑完自行清理
+  **并断言清干净**）。清理处踩到一个真坑：**被回收的目录，其 `$R` 载荷本身也是目录**，用 `deleteFile()`
+  删不掉 ⇒ 留下**孤儿载荷**（`$I` 已删 ⇒ 回收站 UI 里看不见，盘上却还占着）。改走递归 `purge()`。
+
+**四、验证**
+
+- `examples/move-to-trash.as`：Windows 上 `stage243-move-to-trash: OK`；另用**独立脚本**复核「零残留」
+  （回收站内本次运行的 `$I`/`$R` 与探针目录双双为 0）。
+- `examples/urlstream-api.as`：Windows 上 exit 0，`URLStream + navigateToURL/sendToURL surface assertions passed`。
+- 新钉 `unit: platform/WindowsHostBackends`（10 条）：回收站助手仅 `_WIN32` 包裹 / `FO_DELETE` + `FOF_ALLOWUNDO`
+  标志位 / 双 NUL 与 `CP_ACP` 转换 / `as_trash_move` 在 POSIX 目录查找**之前**分派 / POSIX 体逐字存活于
+  `#else` / `as_trash_dir` 的 Windows 臂仍是桩 / 卷根映射 / 存在性门 / `shell32` 链接行 / 示例双端可还原性。
+- **变异 6/6 全部被抓**，每步按 sha256 校验还原：撤 `FOF_ALLOWUNDO`、撤 Windows 分派、撤 `shell32`、
+  撤存在性门、撤双 NUL 结尾、把示例的载荷清理改回 `deleteFile()`（各自只让对应那条钉转红）。
+- **既有钉未破**：`unit: emit/FileMoveToTrash`（17 条）全绿，只更新了其中一处已过期的注释口径。
+
+**五、如实报明 / 残差**
+
+- **WASI / Emscripten 不做**：浏览器没有「回收站」这个概念，**响亮报明即为终态**，不做假后端。
+- **POSIX 臂本机跑不了**（开发机是 Windows，编不了 macOS 分支）⇒ 那一半改为**结构钉**：POSIX 体必须
+  逐字存活于新 `#else` 内。
+- **只测了三条路径**（文件 / 目录 / 异步）：**只读文件、撤销记录（undo）语义未采**。
+- 文档口径已同步：`docs/{zh-cn,en}/filesystem.md`（§1 覆盖表、§4 平台表、§6 未做清单）与
+  `README{,-CN}.md`（`File` 成员描述 + 示例清单）。
+
+**六、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 1 行**（`File.moveToTrash` 的 Windows/wasm 行移出：
+Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报明即终态，不再欠账）。按表内实际行数重数
+**101 → 100 项**（`未开始` **76 → 75**）。**另报一处口径差**：上一轮（阶段二百四十三）note 写的绝对数是
+**100 项 / `未开始` 75**，而按 HEAD 实测是 **101 行 / `未开始` 76**——即该轮的**增量**（+2）没错、
+**绝对数低 1**，与它自己已自报的那处口径差同类，本轮起按实测记账。
+
+> **口径更正**：本阶段占用 **二百四十四**，而方案表（macOS 清理工具 demo 能力缺口）给 G3/G4/G5/G8 的
+> 「预留阶段」一列也写着二百四十四 ⇒ 该列已整体后移一位（**预留号只是拟排期，实现顺序才是硬约束**）。
 
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
@@ -14501,7 +14574,6 @@ AIR 在自己的 IO 线程上做，但调用方唯一能依赖的顺序「先 `a
 | **旗标打开后的显存预检与分配失败上报**（`Context3D.ignoreResourceLimits = true`） | 未开始（2026-10-22 阶段二百二十七 实测登记：`adl` 在 `#3684` 处**同步**失败，我们的惰性分配会把失败推到上传之后） | 旗标打开后我们只按**设备上限**（`as_s3d_max_texture_size()`，D3D12/Metal 16384）放行尺寸，**不预检像素总量**；而 2D/`RectangleTexture` 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `t->gpu` 留空，等 `uploadFromBitmapData`/`uploadFromByteArray` 才建），所以「设备上限允许、实际建不出来」这一档现在**不会**冒成 `#3684`——它会在上传时静默变成一张空贴图。`adl 51.4.1` 实测（`temp/adlprof/`，`PROBE_MODE=ign`）：旗标打开后 `baseline` 的 `createTexture(4096,1)`、`enhanced` 的 `createTexture(8192,1)` 都在**创建时**同步抛 `Error #3684: Texture creation failed. Internal error.`，即 AIR 在创建点就把分配做完了 | ① 给 `Texture`/`RectangleTexture` 的创建补一次**总量估算**（`w*h*bpp`，带 mip 时再乘 4/3，累加到 context 上），超过一个可配置的显存预算就抛 `#3684`（文案照 AIR）；② 或把 `as_s3d_create_render_texture` 的返回 `NULL` 立刻变成 `#3684`（目前只对 `optimizeForRenderToTexture=true` 有这条路径，且未检查返回值）。**成本中**，且要与「`ignoreResourceLimits=false` 时 AIR 的对象数量/显存预算」一起量（本阶段实测：`adl` 关旗标时 4300 个 1×1 贴图仍可建，即计数上限实际未生效，约束在显存） |
 | **`examples/air-native`、`examples/ane`、`examples/ane-app` 的构建清单仍写死 `windows-x64`** | 未开始（2026-10-22 阶段二百三十一 登记：`build/ExampleManifestHosts` 会按内容跳过它们并打印名单） | 22 份清单已改成 `${host}`/`${lib:}`/`${win:}`/`${mac:}` 占位符形态，同一份在两个宿主都成立；这三份**刻意**没改——`air-native` 同时写死 `ASC_RENDER_D3D` + `vendor/d3d_glue.cc`，主机是**后端的结果**，把它写成 `${mac:...metal_glue.mm}` 需要先证明 macOS 侧那一串（`-lcocoa`/`-lobjc`/Metal 框架/`ASC_RENDER_METAL`）真的能编能跑，而本机没有 Objective-C++ 工具链、无法验证；`ane`/`ane-app` 同族（宿主库 `asaot.dll` 与 ANE 平台键都只在 Windows 上量过） | 等 arm64 macOS CI 能跑通 `metal_glue.mm` 之后，把 `air-native` 的 `sources`/`defines`/`link-libs` 按 `${mac:}`/`${win:}` 展开（对照 `src/air-app.ts` 的 `mtlSrc`/`d3dSrc` 两分支，那里已经是同一条配方的权威版），再让钉子不再打印它 |
 | **打字过程中 `maxScrollH` 比 `adl` 少约一步**（AIR 在「已滚动」状态下报 `textWidth + 4 - width + 步长`） | 未开始（2026-10-22 阶段二百四十二 实测登记；与上面「`textWidth` 字形累进残差」同一族的**可观测读数**差） | `adl 51.4.1` 探针（`temp/tfprobe/`，200px 框 + `_typewriter` 12，逐字符打字）：60 字符时 `scrollH=244 / maxScrollH=274`，而 `textWidth+4-width = 225.9` ⇒ 多出的一步 ≈ 内宽 1/4（48.6）。同一字段**程序化**赋 `scrollH=100` 后 `maxScrollH` 仍是 232（不随之改变）⇒ 这个 +一步只在**打字路径**里出现，不是纯函数，我们没复刻；光标可见性与 `scrollH` 的平移行为不受影响 | 若要复刻，需要在**编辑路径**里把 `maxScrollH` 读成「布局量 + 一个步长」（`scrollH>0` 或「本帧有编辑」时），并在程序化赋值路径上保持旧值；先补一组「打字 / 赋值 / 点击」三态交叉的 adl 矩阵再动手，否则很容易把一条历史相关性固化成错误规则 |
-| **`File.moveToTrash` 在 Windows / wasm 上没有后端**（回收站） | 未开始（2026-10-22 阶段二百四十三 登记：macOS 与 freedesktop POSIX 已实现并实测，Windows 只有「响亮报明 + 抛 `#2038`」） | `as_trash_dir` 在 `_WIN32` / `__wasi__` / `__EMSCRIPTEN__` 上返回 `NULL` ⇒ 调用方 `as_shell_unsupported("File.moveToTrash …")` 报一次并抛 `Error #2038`（**不静默 no-op**：调用方拿到的语义与「文件系统拒绝」一致）。Windows 的真后端要 `IFileOperation`（COM，带撤销记录与 `FOF_ALLOWUNDO`）或 `SHFileOperation`，两者都会给所有 Windows 构建引入 `shell32`/`ole32` 链接依赖——本机是 macOS，**写了也验证不了**，故按阶段二百四十三 的决定不写盲代码 | 在 Windows 上先量 `adl` 的 `moveToTrash` 落点（回收站内名字、撤销记录、只读文件、`$Recycle.Bin` 路径），再选 `IFileOperation` 并给构建层加 `shell32`；wasm 端**不做**（浏览器无废纸篓概念，响亮报明即为终态） |
 | **空 `File`（`new File()`）的成员访问全线不抛 `#2037`**（`nativePath`/`url`/`size`/`exists`/`isDirectory`/`name`/`extension`/`parent`/`spaceAvailable`/`getDirectoryListing`） | 未开始（2026-10-22 阶段二百四十三 实测登记：`adl 51.4.1` 上这**十个成员全部**抛 `#2037`，连 `nativePath` getter 本身都抛） | 我方 `File` 把 `nativePath` 当**普通字段**（`NULL` 原样返回、`url` 拼出 `"file://"`、`size`/`spaceAvailable` 回 `0`、`exists`/`isDirectory` 回 `false`、`parent` 回 `NULL`、`getDirectoryListing` 回空表）。本轮新增的 `moveToTrash`/`moveToTrashAsync` **是**抛 `#2037` 的（实测口径），但既有成员一个都没改——族级修复要先把 `nativePath` 从字段改成访问器（牵动 AMF 成员表、结构体布局、codegen 的字段访问），不是单点补丁 | 先把 `nativePath` 变访问器（`File_get_nativePath` 抛 `#2037`），再给其余九个成员各加同一守卫；每个成员配一条 `examples/` 断言 + 一条 `unit:` 源级钉。**注意**：`nativePath` 是 AMF 成员名，改成访问器时要同步 `File_amf_members` 与反射表 |
 
 
@@ -14581,11 +14653,11 @@ AIR 在自己的 IO 线程上做，但调用方唯一能依赖的顺序「先 `a
 |---|---|---|---|---|
 | **G1** | `File.moveToTrash()` **+ `moveToTrashAsync()`** | ✅ **已落地（阶段二百四十三，v0.4.207）**：`File_moveToTrash`/`File_moveToTrashAsync` 写入 `src/emit.ts`，签名 `void`（实测口径，见下）。macOS（`~/.Trash` 与其他卷的 `<卷>/.Trashes/<uid>`）与 freedesktop POSIX（`Trash/{files,info}` + `.trashinfo`）都有后端；**Windows/wasm 无回收站后端**，调用响亮报明 + 抛 `#2038`（已入 `遗留待开发`）。口径全文 [`docs/zh-cn/filesystem.md`](docs/zh-cn/filesystem.md) | **遗留欠账** ⇒ 已清偿并移出评估表（落地证据：`unit: emit/FileMoveToTrash` 17 项 + `examples/move-to-trash.as`） | 二百四十三 ✅ |
 | **G2** | ~~`File.getSpaceAvailable`~~ ⇒ 真名是 **`File.spaceAvailable`（属性）** | ✅ **无需新增（阶段二百四十三 查明）**：`getSpaceAvailable` 在 AIR 里**根本不存在**（`adl 51.4.1`：`'getSpaceAvailable' in f` = `false`、取它抛 `#1069`），而 `f.spaceAvailable` **从阶段六十四 起就已落地**（真实 `statvfs`/`GetDiskFreeSpaceExA`）。本阶段只**校正作用域**：普通文件也作答（跟随其卷）、不存在路径与**设备**（`/dev/null`）回 `0` | **原登记是误记**（不是欠账）⇒ 不作为独立项 | 二百四十三 ✅ |
-| **G3** | 卷**总量/已用量** | 无对应 API（AIR 的 `File` 只给 `spaceAvailable`），容量条要它 | **增强**（AIR 无对应物）⇒ 走 `--features` 具名开关 | 二百四十三 |
-| **G4** | **菜单栏状态项**（`NSStatusItem`） | **零命中**：`grep -riE "NSStatusItem\|status item\|Shell_NotifyIcon\|tray" src/*.ts vendor/*` 只在无关注释里命中；**AIR 没有对应物**；SDL2 亦无托盘 API ⇒ 需新 `vendor/statusitem_glue.mm` 并接进 `vendor/window_glue.cc` 的事件泵 | **增强**（AIR 无对应物）⇒ 必须 opt-in、默认产物与现状同构、缺能力时**报明**不静默降级 | 二百四十四 |
-| **G5** | accessory app（`LSUIElement=1`：无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键**；AIR 描述符里也没有这个开关 | **增强** ⇒ 构建清单新字段（如 `agent-app`），默认关 | 二百四十四 |
-| **G7** | 目录遍历的**异步**化 | job 池无 `DIR`/`STAT` 类 job（`src/runtime.ts:9878-9898` 全清单：`READ_TEXT`/`READ_BYTES`/`IMAGE`/`FS_OPEN`/`DECODE`/`HTTP`/`HTTP_STREAM`/`UNSUPPORTED`/`IMAGE_URL`） | demo 先用**同步遍历 + 分帧回填**顶住；不够再补 job 类 | 二百四十四之后 |
-| **G8** | **一条命令出已签名 `.app` / `.dmg`** | `--package` 合法值只有 `raw \| xcode-project \| android-project \| web`（`src/index.ts:291`、`:798`）；**无 `app`/`dmg`**；`grep -n "codesign\|hdiutil" src/build.ts` = **0 命中**；且 `--package xcode-project` **只生成工程不构建**（`src/index.ts:1034-1057` 自述「是『生成工程』步骤，不做 cc」） | **增强**（工程化便利，非 AIR 语义） | 二百四十四 |
+| **G3** | 卷**总量/已用量** | 无对应 API（AIR 的 `File` 只给 `spaceAvailable`），容量条要它 | **增强**（AIR 无对应物）⇒ 走 `--features` 具名开关 | 二百四十五 |
+| **G4** | **菜单栏状态项**（`NSStatusItem`） | **零命中**：`grep -riE "NSStatusItem\|status item\|Shell_NotifyIcon\|tray" src/*.ts vendor/*` 只在无关注释里命中；**AIR 没有对应物**；SDL2 亦无托盘 API ⇒ 需新 `vendor/statusitem_glue.mm` 并接进 `vendor/window_glue.cc` 的事件泵 | **增强**（AIR 无对应物）⇒ 必须 opt-in、默认产物与现状同构、缺能力时**报明**不静默降级 | 二百四十五 |
+| **G5** | accessory app（`LSUIElement=1`：无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键**；AIR 描述符里也没有这个开关 | **增强** ⇒ 构建清单新字段（如 `agent-app`），默认关 | 二百四十五 |
+| **G7** | 目录遍历的**异步**化 | job 池无 `DIR`/`STAT` 类 job（`src/runtime.ts:9878-9898` 全清单：`READ_TEXT`/`READ_BYTES`/`IMAGE`/`FS_OPEN`/`DECODE`/`HTTP`/`HTTP_STREAM`/`UNSUPPORTED`/`IMAGE_URL`） | demo 先用**同步遍历 + 分帧回填**顶住；不够再补 job 类 | 二百四十五之后 |
+| **G8** | **一条命令出已签名 `.app` / `.dmg`** | `--package` 合法值只有 `raw \| xcode-project \| android-project \| web`（`src/index.ts:291`、`:798`）；**无 `app`/`dmg`**；`grep -n "codesign\|hdiutil" src/build.ts` = **0 命中**；且 `--package xcode-project` **只生成工程不构建**（`src/index.ts:1034-1057` 自述「是『生成工程』步骤，不做 cc」） | **增强**（工程化便利，非 AIR 语义） | 二百四十五 |
 
 > **⚠️ 更正一处文档与实现的落差**：`docs/zh-cn/compile.md:894` 以「`app` / `dmg` 走……一键产出最终产物」
 > 的口气描述打包，而该文件 `:949` 的表格自身把 `signing-identity` 标为「规划」；实测 `--package` 取值与

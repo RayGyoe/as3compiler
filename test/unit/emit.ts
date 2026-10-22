@@ -3303,8 +3303,9 @@ function checkEmitFileMoveToTrash(): string[] {
   check('moveToTrashAsync dispatches ioError with the AIR error id',
     c.includes('IOErrorEvent_new((char*)"ioError", false, false, (char*)text)') && c.includes('ev->errorID = (int)err;'));
 
-  // Trash layouts: Finder's on macOS, the freedesktop.org pair on other POSIX,
-  // and NULL on Windows/wasm (reported as unsupported).
+  // Trash layouts: Finder's on macOS, the freedesktop.org pair on other POSIX, the
+  // shell's Recycle Bin on Windows (stage 244 -- pinned by platform/WindowsHostBackends),
+  // and NULL on wasm (the browser has no trash concept: reported, not faked).
   check('macOS uses ~/.Trash', c.includes('as_path_join(home, ".Trash")'));
   check('another macOS volume uses .Trashes/<uid>',
     c.includes('snprintf(owner, sizeof owner, ".Trashes/%d", (int)getuid())'));

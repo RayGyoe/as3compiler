@@ -17,7 +17,7 @@
 
 | 成员 | 状态 | 说明 |
 |---|---|---|
-| `File.moveToTrash()` | ✅ 实现（macOS + freedesktop POSIX） | Windows 无后端，**响亮报明**（§6） |
+| `File.moveToTrash()` | ✅ 实现（macOS + freedesktop POSIX + Windows 回收站） | 三端后端见 §4；WASI/Emscripten 无废纸篓概念，**响亮报明**（§6） |
 | `File.moveToTrashAsync()` | ✅ 实现 | 事件投递口径见 §3 |
 | `File.spaceAvailable`（属性） | ✅ 已有（阶段六十四）；本轮**校正**语义 | 只对普通文件/目录作答（§5） |
 | `File.getSpaceAvailable` | ❌ **AIR 没有这个成员** | 我方也不提供（`in` 为 `false`，与 `adl` 一致） |
@@ -85,8 +85,8 @@ trace(x.moveToTrash());              // adl: undefined（不是 false）
 |---|---|---|
 | macOS | 与 `$HOME` **同卷**：`~/.Trash`；**其他卷**：`<卷挂载点>/.Trashes/<uid>` | 实测：`~/.Trash` 里出现了被搬走的项（Finder 可见、可还原）；`<卷>/.Trashes/<uid>` 是 Finder / `NSFileManager` 的布局 |
 | Linux 等 POSIX | `$XDG_DATA_HOME/Trash`（缺省 `~/.local/share/Trash`）下的 `files/` + `info/`，每个载荷在 `info/` 里配一个 `.trashinfo`（`Path=` 百分号转义 + `DeletionDate=`） | freedesktop.org 的 Trash 规范（**未在真机验证**，本机是 macOS） |
-| Windows | **未实现** | 需要 `SHFileOperation`/`IFileOperation` 才能进回收站；本轮不写不可验证且要动链接库的分支，改为**响亮报明**（`as_shell_unsupported`）+ 抛 `#2038`，并登记在 `TODO.md` 的 `遗留待开发` |
-| WASI / Emscripten | 无废纸篓概念 | 同上（报明 + `#2038`） |
+| Windows | **回收站**：`SHFileOperationW` + `FOF_ALLOWUNDO`（即资源管理器「删除」走的同一条路：进 `C:\$Recycle.Bin\<SID>\`，可在「回收站」里还原） | 实测 `adl 51.4.1` **Windows 真机**（`temp/trashwin/` 双端探针）：普通文件、**目录连同子项**、异步式三条路径全部落进回收站；`$I` 副档里存着**原路径**（UTF-16LE）、`$R` 载荷内容读回一致；失败号与 macOS 同为 `#3003`/`#2037`。**Windows 没有「废纸篓目录」可搬**（回收站是 shell 拥有的存储），故 `as_trash_dir` 的 `_WIN32` 分支保持 `NULL` 桩，而由 `as_trash_move` 在它之前先转到 `as_trash_move_shell`（路径按 `CP_ACP` 转宽字符、列表**双 NUL** 结尾，与 runtime 其余 ANSI 调用同口径）；链接层因此给 Windows 构建补上 `shell32` |
+| WASI / Emscripten | 无废纸篓概念 | 报明（`as_shell_unsupported`）+ 抛 `#2038` |
 
 「同卷判定」用 `st_dev` 比较实现（`as_trash_dir`）；**其他卷的挂载点**用「逐级上升直到 `st_dev`
 变化」求得（`as_volume_root`）——POSIX 没有可移植的「我在哪个挂载点」调用，而这条路在 APFS
@@ -134,7 +134,7 @@ f["getSpaceAvailable"]       // adl: ReferenceError #1069
 
 ## 6. 没做的部分（如实登记）
 
-- **Windows 回收站后端**：未实现，调用会响亮报明并抛 `#2038`（`TODO.md` `遗留待开发` 有行）。
+- **WASI / Emscripten 的废纸篓**：无对应 API，调用响亮报明并抛 `#2038`。浏览器没有「回收站」这个概念，**响亮报明即为终态**（不做假后端）。Windows 回收站后端已于阶段二百四十四 落地（§4）。
 - **Finder「放回原处」元数据**：见 §4 取舍。
 - **跨卷搬运**：目标目录与源同卷（`as_trash_dir` 按卷选目录），因此 `rename` 不会跨卷；
   真跨卷时抛 `#2038` 而不是「复制 + 删除」——后者在演示规模下会看起来卡住，且失败点更多。
