@@ -571,6 +571,17 @@ cannot resolve the string either). The class registry `as_class_registry[]` stay
 serves `is Class`, `new x()`, `getDefinitionByName` and the GC roots) — what shrinks is the
 **emission** face, not the runtime table.
 
+**A forced file's references are followed too** (stage two-hundred-forty-nine): the "always kept"
+files above are **seeded into the queue before it is drained**, so both the classes they declare and
+the classes their non-class code names are **enqueued and expanded**. Those two passes used to run
+**after** the drain loop and marked classes reachable without expanding them, so a class whose only
+entry point is a free function (every widget in the UI kit arrives via a `chip.as → ChipNode`
+factory) was emitted while its superclass and referenced classes were pruned — the build then died
+with `unknown superclass 'Control' of …`. `--all-sources` used to mask that as "working normally"
+and is no longer needed. Regression pin: the `unit: reach/forced` group; the reproduction probe is
+`asaotui/probes/reach-freefn/` (closure 5/5, both compilation faces build and run, and two
+independent mutants prove the pins have teeth).
+
 To restore the old whole-tree face:
 
 ```bash

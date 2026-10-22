@@ -14568,6 +14568,72 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 **五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——G9 记在 `asaotui/compiler-gaps.md`（已标已修）。
 按表内实际行数重数仍为 **100 项**。
 
+### 阶段二百四十九：G13 —— `--air-app` 闭包不展开「强制文件发现的类」，`--all-sources` 绕行删除（v0.4.212 → v0.4.213）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+`asaotui/compiler-gaps.md` 的 **G13**（本工作区登记，判定为**遗留欠账**：`mxmlc` 编整包、没有这道剪枝，
+所以 AIR 能跑对的程序我们编不过）。机制**逐行实读** `src/reach.ts`：
+
+- `while (queue.length > 0)` 是**唯一**的展开循环，它在 609 行就结束了；
+- 紧随其后的两趟「**强制文件**」处理（612~637 行）——① 把强制文件声明的类 `enqueue()`、
+  ② 走强制文件的**非类顶层代码**（自由函数/模块语句）并把命中的类 `reachable.add(n)`——
+  都发生在**排空之后**。①推进了队列却**再没人排空**，②**只标记不展开**。
+- ⇒ 「**首次**由这两趟发现的类」会被**发射**，但它自己的引用（`extends`、字段/参数类型、`new X()`）
+  **永不入队**，父类与被引用类全被裁掉，codegen 报 `unknown superclass 'Control' of 'asaot_ui_AvatarNode'`
+  ——一个**作者从没写过的类名**。
+
+这不只是边角形状：UI kit 里**每个控件都靠小写工厂自由函数进入**（`chip.as` → `ChipNode`），
+于是**所有** `*Node` 类都只在那一趟被发现，`Control` / `kind/*Widget` / `PaintKit` 全被裁。
+此前 `ui-demo` 的两个 runner 一律附 `--all-sources`（整包编译）绕开它——**绕行把缺陷盖成了「正常工作」**。
+
+**二、落地**（`src/reach.ts`，一处调度顺序 + 一处 helper）
+
+- 两趟强制文件处理**移到排空循环之前**，让「所有种子」与「所有展开」分两相：先种（roots + 强制文件），
+  再逐个排空。
+- 非类顶层代码那趟的 `reachable.add(n)` 改成 **`enqueue(n)`**：那是**真实的引用边**，必须参与计数与展开。
+- 模块不变式写进注释：**每个可达类都要被收集引用**，不管它是哪一趟发现的。
+- **新增单元钉 `unit: reach/forced`（9 条）**：两套夹具各盖一半 ——
+  `G13_A` 强制文件的**非类代码**命名 Leaf（`Leaf extends Base` + `new Helper()`），
+  `G13_B` 类是**声明在**强制文件里（`Ui extends Control`，即 kit 的真实形状）；
+  两套都带**归因检查**（删掉那条引用，目标类必须恰好消失）。
+- **探针语义反转**：`asaotui/probes/reach-freefn/run.cjs` 从「默认臂必须红」改为「闭包 5/5 + 两个面都构建运行」，
+  并保留 `--all-sources` 臂当**对照**（两个面必须一致，否则「修法 = 关掉剪枝」也能骗过默认臂）。
+
+**三、验证**
+
+- **闭包层**：`node tools/reach-dump.cjs probes/reach-freefn/src p.Main` 从 **kept 3/5 / edges 1**
+  变为 **5/5 / edges 3**。
+- **构建层**：`run.cjs` 三项全过 —— 闭包 5/5、默认面 `ReachFreeFn` 建→链→跑 `EXIT 0` 并打印 `rendered`、
+  `--all-sources` 臂同样绿（对照未退化）。
+- **ui-demo 去绕行实测**（两个 runner 的 `--all-sources` 已删）：
+  gallery `94/97 sources reachable` → `RESULT: PASS`（含 4 页 tour 与手算矩形，device scale 1.5）；
+  login（`UiDemo`）`RESULT: PASS`（8 项断言全过）。
+- **变异证明两层钉子都有牙**：
+  | 变异 | 探针 `run.cjs` | 单元 `unit: reach/forced` |
+  |---|---|---|
+  | **M1** 非类那趟 `enqueue` → `reachable.add`（标记不展开） | **红 5 条**，报回原形 `unknown superclass 'Base' of 'p_Leaf'` | **红 4 条** |
+  | **M2** 两趟挪回排空循环之后（`src/reach.ts` 逐字复原修前顺序） | **红 5 条**（同一报错） | **红 6 条**（额外杀死 `G13_B` 那套） |
+  两处变异均在 `finally` 里按 **sha256 校验还原**（`4e855c84951f9ecb`，两次都 `identical`）。
+  M2 额外杀死 `G13_B` 这件事说明两套夹具**各自承重**，不是重复。
+- 全量回归 **464 项 / 461 过 / 3 红**（+1 = 新单元组），红的仍是既有三项（`socket.as` 无 Windows
+  socket 后端、`stage94d.as` UTF-16LE、`unit: inline/StackCanary` 本机 clang 差异）。
+
+**四、如实报明**
+
+- **不是改「定位」而是改「调度」**：`resolveInto` 的解析规则（import → 同文件 → 同包 → 全局短名）**一字未动**，
+  闭包仍是**过度近似**的；这次修的只是「发现了却不展开」。
+- **`--all-sources` 语义不变**：仍是「整包编译」的逃生通道，只是 ui-demo 不再需要它；
+  两个 runner 的就地注释已改成「若这条错误回来 ⇒ 是闭包回归，去修闭包，**不要**用 `--all-sources` 盖过去」。
+- **G13 与「共享源码根」是两件事**：曾经讨论过是否该加类似 `ane-paths` 的 `--as-class-path`（把公共代码库放到
+  一处、三个 demo 不再各存一份 91 文件的 kit）。结论是**先修闭包**——从额外根进来的类会走**同一条**不展开的通路，
+  共享根不会缓解 G13 而只会让它更常触发。共享根仍是独立待办，本轮未动。
+- **编号说明**：本工作区（`asaotui/`）的复核文档一度把同一阶段写作「阶段二百五十」，本轮按
+  **TODO 表末尾小节 = 二百四十八** 统一归位为 **二百四十九**，并同步了 `asaotui/` 下全部 16 处引用。
+
+**五、本表变动**：**新登记 0 行 / 改写 0 行 / 移出 0 行**——G13 记在 `asaotui/compiler-gaps.md`（已标已修）。
+按表内实际行数重数仍为 **100 项**。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

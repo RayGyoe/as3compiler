@@ -422,8 +422,148 @@ function checkWiring(): string[] {
   return c.done();
 }
 
+// ---- G13: a class entered through a FORCED file must still be expanded -------
+//
+// A file whose only top-level code is a free function cannot be pruned, so the
+// closure forces it into the kept set. The classes it names used to be marked
+// reachable and emitted WITHOUT being expanded, so their superclass and their own
+// referenced classes were dropped and `--air-app` died in codegen with
+// `unknown superclass 'Base' of 'p_Leaf'` -- a class name the author never wrote.
+// That was G13; the fix (阶段二百四十九) seeds every forced file BEFORE the
+// fixed-point loop and enqueues (rather than merely marking) what it finds.
+//
+// Both halves of the fix are pinned, because each is independently load-bearing:
+//   G13_A  the forced file's NON-CLASS code names the class (pass ②)
+//   G13_B  the class is DECLARED IN the forced file (pass ①)
+// A mutation that reverts either half makes the probe in asaotui/ go red; these
+// checks are what makes the compiler suite itself notice.
+const G13_A: [string, string][] = [
+  ['p/Main.as', `package p {
+  public class Main {
+    public function Main():void { make(); }
+  }
+}
+`],
+  // The forced file: its only top-level declaration is a free function. Keep the
+  // signature free of class types too, so the ONLY edge to Leaf is the body.
+  ['p/Fac.as', `package p {
+  public function make():Leaf { return new Leaf(); }
+}
+`],
+  // Leaf is reached from the forced file only, and hangs two different kinds of
+  // reference off itself: a superclass and a plain `new`.
+  ['p/Leaf.as', `package p {
+  public class Leaf extends Base {
+    public var tag:String;
+    public function Leaf():void {
+      super();
+      var h:Helper = new Helper();
+      this.tag = h.suffix;
+    }
+  }
+}
+`],
+  ['p/Base.as', `package p {
+  public class Base {
+    public var kind:String;
+    public function Base():void { this.kind = "base"; }
+  }
+}
+`],
+  ['p/Helper.as', `package p {
+  public class Helper {
+    public var suffix:String;
+    public function Helper():void { this.suffix = "!"; }
+  }
+}
+`],
+];
+
+// The `Ui extends Control` shape the real UI kit produced: the subclass is
+// DECLARED IN the forced file, so it is the class-declaration pass that has to
+// expand it. Nothing else names Control.
+const G13_B: [string, string][] = [
+  ['p/Main.as', `package p {
+  public class Main {
+    public function Main():void { makeUi(); }
+  }
+}
+`],
+  ['p/Ui.as', `package p {
+  public class Ui extends Control {
+    public function Ui():void { super(); }
+  }
+  public function makeUi():Ui { return new Ui(); }
+}
+`],
+  ['p/Control.as', `package p {
+  public class Control {
+    public function Control():void { }
+  }
+}
+`],
+];
+
+// Write a synthetic tree, optionally applying one replacement to one file, and
+// return the closure's kept/dropped short names.
+function runSynthetic(dirName: string, fixture: [string, string][], edit?: [string, string, string]): { kept: string[]; dropped: string[] } {
+  const dir = join(FIXTURE_ROOT, dirName);
+  rmSync(dir, { recursive: true, force: true });
+  const srcDir = join(dir, 'src');
+  const paths: string[] = [];
+  for (const [rel, source] of fixture) {
+    const p = join(srcDir, rel);
+    mkdirSync(dirname(p), { recursive: true });
+    const text = edit !== undefined && edit[0] === rel ? source.replace(edit[1], edit[2]) : source;
+    if (edit !== undefined && edit[0] === rel && text === source) throw new Error('G13 fixture edit did not apply: ' + edit[1]);
+    writeFileSync(p, text);
+    paths.push(p);
+  }
+  const result = computeReachable(prepareReachFiles(paths, srcDir), 'p.Main');
+  return { kept: result.kept.map(short).sort(), dropped: result.dropped.map(short).sort() };
+}
+
+function checkForcedFileExpansion(): string[] {
+  const c = checker('reach-forced');
+
+  // A: the forced file's non-class code names Leaf -> Leaf, its superclass and its
+  // constructor's `new Helper()` must all be kept.
+  const a = runSynthetic('g13a', G13_A);
+  c.check('a class named only from a forced file is kept',
+    a.kept.includes('Leaf'));
+  c.check('...and so is its SUPERCLASS (was: `unknown superclass Base`)',
+    a.kept.includes('Base'));
+  c.check('...and the class its constructor instantiates',
+    a.kept.includes('Helper'));
+  c.check('the A fixture drops nothing', a.dropped.length === 0);
+  c.check('the A fixture keeps exactly Main, Fac, Leaf, Base, Helper',
+    JSON.stringify(a.kept) === JSON.stringify(['Base', 'Fac', 'Helper', 'Leaf', 'Main']));
+
+  // Attribution: the edge really comes from the forced file's BODY. Dropping the
+  // reference (signature and body together, so no other edge survives) must drop
+  // exactly Leaf + Base + Helper, while Fac stays forced.
+  const aGone = runSynthetic('g13a', G13_A,
+    ['p/Fac.as', 'public function make():Leaf { return new Leaf(); }', 'public function make():Object { return null; }']);
+  c.check('deleting the forced file\'s reference drops exactly [Leaf Base Helper]',
+    JSON.stringify(aGone.kept) === JSON.stringify(['Fac', 'Main'])
+    && JSON.stringify(aGone.dropped) === JSON.stringify(['Base', 'Helper', 'Leaf']));
+
+  // B: the class is DECLARED IN the forced file, so it is the class-declaration
+  // pass that must enqueue (and therefore expand) it.
+  const b = runSynthetic('g13b', G13_B);
+  c.check('a class declared in a forced file has its SUPERCLASS kept (the real kit shape)',
+    b.kept.includes('Ui') && b.kept.includes('Control'));
+  c.check('the B fixture drops nothing', b.dropped.length === 0);
+  const bGone = runSynthetic('g13b', G13_B,
+    ['p/Ui.as', 'public class Ui extends Control {', 'public class Ui {']);
+  c.check('...and that superclass is dropped once the `extends` is gone (attribution)',
+    bGone.dropped.includes('Control'));
+  return c.done();
+}
+
 registerGroup('unit: reach/closure', checkClosure);
 registerGroup('unit: reach/edge', checkAttribution);
 registerGroup('unit: reach/prepare', checkPrepare);
 registerGroup('unit: reach/emit', checkEmit);
 registerGroup('unit: reach/wiring', checkWiring);
+registerGroup('unit: reach/forced', checkForcedFileExpansion);

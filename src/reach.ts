@@ -585,6 +585,45 @@ export function computeReachable(files: ReachFile[], mainClassFqn: string, extra
   for (const r of roots) enqueue(r);
 
   let edges = 0;
+
+  // Every seed must be in the queue BEFORE the fixed-point loop runs, otherwise
+  // the classes seeded below are marked reachable but their own references are
+  // never followed. That was the G13 defect: these two passes used to sit AFTER
+  // the `while` above, so a class whose ONLY entry point is a forced file (a
+  // free-function factory, or a module-level statement) got emitted while its
+  // superclass / referenced classes were pruned -- `unknown superclass 'Control'`
+  // for a class the author never wrote. `--all-sources` masked it by disabling
+  // pruning entirely.
+  //
+  // A forced file is kept whole, so every class it declares is kept with it.
+  for (const f of files) {
+    if (!forced.has(f.path)) continue;
+    for (const d of declsByFile.get(f.path) ?? []) if (!reachable.has(d.fqn)) enqueue(d.fqn);
+  }
+
+  // The forced files' non-class code too: a module statement or free function
+  // can reference classes of its own, and it is emitted either way. These are
+  // real reference edges (not whole-file pinning), so they count and they must
+  // be ENQUEUED -- marking them reachable alone is what stranded their closure.
+  for (const f of files) {
+    if (!forced.has(f.path)) continue;
+    const rc = new RefCollector();
+    for (const s of f.body) {
+      if (s.kind === 'ClassDecl' || s.kind === 'InterfaceDecl') continue;
+      rc.stmt(s);
+    }
+    if (rc.types.size === 0 && rc.names.size === 0) continue;
+    const ctx: ResolveCtx = { file: f.path, ownPkg: null, imports: fileImports.get(f.path) ?? [] };
+    const next = new Set<string>();
+    for (const t of rc.types) resolveInto(t, ctx, next);
+    for (const n of rc.names) resolveInto(n, ctx, next);
+    for (const n of next) {
+      if (reachable.has(n)) continue;
+      edges++;
+      enqueue(n);
+    }
+  }
+
   while (queue.length > 0) {
     const fqn = queue.pop()!;
     const d = byFqn.get(fqn)!;
@@ -605,34 +644,6 @@ export function computeReachable(files: ReachFile[], mainClassFqn: string, extra
       if (reachable.has(n)) continue;
       edges++;
       enqueue(n);
-    }
-  }
-
-  // A forced file is kept whole, so every class it declares is kept with it.
-  for (const f of files) {
-    if (!forced.has(f.path)) continue;
-    for (const d of declsByFile.get(f.path) ?? []) if (!reachable.has(d.fqn)) enqueue(d.fqn);
-  }
-
-  // Now walk the forced files' non-class code too: a module statement or free
-  // function can reference classes of its own, and it is emitted either way.
-  for (const f of files) {
-    if (!forced.has(f.path)) continue;
-    const rc = new RefCollector();
-    for (const s of f.body) {
-      if (s.kind === 'ClassDecl' || s.kind === 'InterfaceDecl') continue;
-      rc.stmt(s);
-    }
-    if (rc.types.size === 0 && rc.names.size === 0) continue;
-    const ctx: ResolveCtx = { file: f.path, ownPkg: null, imports: fileImports.get(f.path) ?? [] };
-    const next = new Set<string>();
-    for (const t of rc.types) resolveInto(t, ctx, next);
-    for (const n of rc.names) resolveInto(n, ctx, next);
-    for (const n of next) {
-      if (!reachable.has(n)) {
-        edges++;
-        reachable.add(n);
-      }
     }
   }
 
