@@ -52,6 +52,19 @@ vendor/sqlite/shell.c
 # next hand-written probe in this fixture stays visible too.
 !examples/ane/*.c
 
+# Same reasoning a fourth time, for the benchmark C baselines: benchmarks/<name>/<name>.c
+# is the HAND-WRITTEN C reference that the JS / AOT / AIR arms are measured against
+# (benchmarks/README.md calls it "C 实现"), i.e. a tracked build INPUT -- the same
+# category as the vendor / lib / fixtures negations above. The generic `*.c` rule was
+# eating it, so `git ls-files benchmarks/` listed not a single .c: a fresh clone could
+# not run benchmarks/run.py at all, because its `cc` step compiles a file that is not in
+# the tree. Un-ignoring the whole directory also re-admits the ONE generated sibling,
+# <name>_asc.c -- src/index.ts writes it next to the executable (`-o benchmarks/<b>/<b>_asc`
+# keeps the C as <b>_asc.c) -- so it is re-ignored on the very next line. Order matters:
+# later rules win.
+!benchmarks/*/*.c
+benchmarks/*/*_asc.c
+
 # Compiled example executables (extensionless, generated from the same-named .as).
 # Keep the .as sources, the build-manifest / exporter configs, and the notes that
 # explain a directory whose SOURCES are external (see examples/EXTERNAL-FIXTURES.md).

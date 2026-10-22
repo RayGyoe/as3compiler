@@ -28,6 +28,7 @@ BENCHES = [
     "spectralnorm",
     "oop",
     "array",
+    "vectorint",
 ]
 RUNS = 3
 
