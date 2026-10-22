@@ -126,6 +126,12 @@ be `Error #2124: Loaded file is an unknown type.`, so "supporting SVG" is an enh
 > **6 items completed**: E1 SVG (native half), E3 multi-format decoding, E4 RAW/DNG (native half), E9 64-bit
 > integers, E13 LTO/PGO, E16 refresh-rate query.
 >
+> **One more item is measured and explicitly not scheduled**: E10 (`Vector.<Number>` batch SIMD) — on arm64
+> AArch64 NEON has only **2** `f64` lanes while Apple-silicon scalar FP ports are already wide: hand-written
+> NEON beats **plain scalar C of the same shape** by 0–8% (elementwise f64), ≈0 (`int32`, 4 lanes) and 0–4%
+> (L1-resident division), and a **reduction** can only be vectorized by reassociating, which conflicts with
+> AS3's "one rounding per step". Measurements, evidence and "where the real gap is" are in **§4.9**.
+>
 > Status contract: **already have** = usable now (may just be undocumented / without an example); **half-done**
 > = the library exists, the AS3 surface is missing; **to build** = needs new glue or a toolchain change. "web
 > needs rebuild" in the target-ends column = needs a change to `build-tools/skia-src/out/wasm/args.gn` and a
@@ -142,7 +148,7 @@ be `Error #2124: Loaded file is an unknown type.`, so "supporting SVG" is an enh
 | E7 | **General-purpose GPU compute** (Metal compute / WebGL2 transform feedback) | ✗ | Needs a new glue layer | both ends | high |
 | E8 | **Windowless / server-side rendering** | half (offscreen possible, but bound to the AIR runtime) | **already present**: headless runs, and `stage.render()` produces a PNG directly | both ends | already have |
 | E9 | **64-bit integers** (`int64` / `uint64`) | ✗ (`int` / `uint` are both 32-bit) | ✅ **implemented (opt-in, pure C, same shape both ends)**: types + `L`/`UL` literals + `int64()`/`uint64()` conversions + 64-bit arithmetic/bitwise/comparison + a dedicated box tag (see §4.7) | both ends (native / web / WASI, the same C) | **done** |
-| E10 | **`Vector.<Number>` batch SIMD** (NEON / SSE) | ✗ | Native C + `-O2` auto-vectorization already partly effective, can be made explicit | both ends | medium-high |
+| E10 | **`Vector.<Number>` batch SIMD** (NEON / SSE) | ✗ | ⛔ **measured: not scheduled** — on arm64, hand-written NEON beats **plain scalar C of the same shape** by only **0–8%** (elementwise f64), **≈0** (int32), **0–4%** (L1-resident division); SIMD on a reduction requires reassociation, which conflicts with AS3's "one rounding per step". What is actually slow is **not arithmetic** but the per-element guards (registered separately in `TODO.md`'s legacy table, and `-O2` already vectorizes once they are gone). See §4.9 | both ends | **not scheduled (measured)** |
 | E11 | **FFI: declare and directly call host C functions** | ✗ | **the unique dividend of "direct-to-C"** (same translation unit as the host) | native | medium |
 | E12 | **Truly-concurrent `Worker` (OS threads)** | partial (AIR Workers are limited, need `flash.concurrent`) | A 4-worker pool already exists (currently serving only async I/O) | native | medium |
 | E13 | **LTO / PGO build switches** | — | ✅ **implemented**: manifest `lto`/`pgo`/`pgo-dir` + CLI `--lto`/`--pgo`/`--pgo-dir`, **all off by default** (see §4.4) | both ends | **done** |
@@ -502,6 +508,61 @@ default `0`); `test/unit/vsync.ts`'s structural nails; the window probe `temp/vs
 back to 120 Hz, dispatch `120` again, with `stage.frameRate` following each time); the Starling demo was
 changed to listen for the event and set `stage.frameRate = e.refreshRate`, with no regression in the benchmark
 scene's peak (`front` 59280 / the old baseline band 61.4k–66.2k).
+
+---
+
+### 4.9 E10 — `Vector.<Number>` batch SIMD — ⛔ **measured: not scheduled**
+
+**Why it was listed**: `Vector.<Number>` is monomorphised into a contiguous `double` array (`spectralnorm`'s
+0.80× vs C is exactly that shape), so it looked like "all that is missing is explicit vectorization".
+**Measured conclusion: it is not.** That gain does not exist on arm64, and the real 5.4×/12× gap is somewhere
+else (per-element guards — registered separately in `TODO.md`'s `### 遗留待开发`).
+
+**Measurement setup** (`temp/simdprobe/`, Apple M2 Max / arm64, `24 × 1M` elements, `-O2 -ffp-contract=off`;
+C side `hand.c`/`hand_small.c` and AS3 side `saxpy.as`/`saxpy_fn.as` are **the same sizes and shapes**; the
+hand-written NEON and the plain scalar C both use **local pointers, no globals**, so they are comparable):
+
+| Shape | plain scalar C | ours (today) | ours **minus** per-element guards | hand NEON | **explicit-SIMD gain** |
+|---|---:|---:|---:|---:|---:|
+| `c[j]=a[j]+b[j]*1.5` (f64 elementwise) | 6.3–6.8 ms | **38–47 ms** | **7 ms** | 6.1–6.2 ms (2 lanes) | **0–8% (mostly noise)** |
+| `ic[j]=ia[j]+ib[j]` (int32 elementwise) | 2.9–4.0 ms | **34–36 ms** | **3 ms** | 2.9 ms (4 lanes) | **≈0** |
+| `s+=a[j]*b[j]` (reduction) | 22.3 ms | 21–22 ms | 22–23 ms | —— | **unusable (semantics)** |
+| `c=a/(b+1)` (L1-resident, 82 M elements) | 13.1–14.8 ms | —— | —— | 13.0–13.7 ms | **0–4%** |
+
+**Three reasons** (all reproducible, none inferred):
+
+1. **AArch64 NEON has only 2 `f64` lanes**, while Apple-silicon scalar FP ports are already wide — elementwise
+   and L1-resident division measured **the same throughput** at 2 lanes as scalar; `int32` (4 lanes) is also 0,
+   because the shape is memory-port bound (2 loads + 1 store per element).
+2. **Reductions are blocked by semantics**: vectorizing one requires reassociation, which conflicts with AS3's
+   "one rounding per step" (with `-ffp-contract=off` even FMA contraction is off). And those are precisely the
+   shapes that are **already at parity with C** (21–22 vs 22.3 ms) — nothing to win there anyway.
+3. **Cost side**: `<arm_neon.h>`/`<immintrin.h>` in the generated C collides head-on with AGENTS.md §2.6
+   ("no platform-coupled constructs") and splits the "native / web / WASI, one and the same C" property into
+   two divergent ends (web would additionally need a wasm `simd128` toolchain).
+
+**The real gap that fell out of the same probe (not part of E10)**: replacing the per-element accessors in
+`c[j]=a[j]+b[j]*1.5` with a bare `->data[j]` (**nothing else touched**) gives **38→7 ms**; `-Rpass` at the same
+time shows clang **already** emitting `vectorization width: 2` (f64), **`width: 4`** (int32), `interleaved
+count: 4` — **the same shape as the hand-written NEON**. In other words `-O2` is already doing the
+"make SIMD explicit" part; what blocks it is the **per-element guards** (the loop body contains a `set`, so it
+**aliases** its input `Vector`, so `v->length` cannot be proven loop-invariant). That fix needs **no intrinsics**
+and keeps both ends identical.
+
+**Semantic counter-check (verified)**: our reduction's checksum `-302163170` is **bit-identical** to a `volatile`
+serial summation in C ⇒ clang is not reassociating our floating-point loops, so the red line is intact. (A
+separate observable: top-level script variables living in memory are worth ~21% — moving the same three loops
+into a **function** gives 38→30 ms.)
+
+**Contract and unmeasured surface (stated plainly)**: the probe uses **synthetic** shapes (covering the two
+fundamental families, elementwise and reduction), not the load profile of any real app; x86/Windows was not
+measured (this machine is arm64) nor was wasm `simd128`; recompiling our generated C with `-O3 -march=native`
+is indistinguishable from `-O2` (⇒ the bottleneck is not the optimization level). `Array` (**not** `Vector`)
+being 5.4× off is a different matter (an `int`↔`double` round-trip dependency chain) and E10 does not cover it.
+
+**Evidence**: `temp/simdprobe/{saxpy.as,saxpy_fn.as,hand.c,hand_small.c,serial.c}`; the evidence includes the
+`-Rpass` reports and the disassembly of `main` (**3** `cbz` null guards + **4** `length` comparisons + 5
+branches per element).
 
 ---
 

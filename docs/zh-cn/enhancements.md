@@ -109,6 +109,11 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 > AIR 的 `software` 渲染模式在这里会直接 `#3702`，我们照常给上下文；详细实测见
 > [`display3d.md`](display3d.md) §9.14。
 >
+> **另有 1 项已实测、明确不排期**：E10（`Vector.<Number>` 批量 SIMD）—— arm64 上 AArch64 NEON 的 `f64`
+> 只有 **2 lane**，而 M 系列标量 FP 端口本来就宽：实测**手写 NEON 相对同形标量 C** 只差 0–8%（元素级 f64）、
+> ≈0（`int32`，4 lane）、0–4%（L1 常驻的除法），而**归约**形状要 SIMD 就必须重结合，与 AS3「每步一次舍入」
+> 冲突。实测表、出处与「真正的缺口在哪儿」见 **§4.9**。
+>
 > 状态口径：**已有** = 现在就能用（可能只是没写文档/没写示例）；**半成品** = 库已在、缺 AS3 面；
 > **待建** = 需要新胶水或改工具链。目标端里的「web 需重编」= 需要改 `build-tools/skia-src/out/wasm/args.gn`
 > 并重建 wasm 版 Skia。
@@ -124,7 +129,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 | E7 | **GPU 通用计算**（Metal compute / WebGL2 transform feedback） | ✗ | 需新胶水层 | 两端 | 高 |
 | E8 | **无窗口 / 服务端出图** | 半（可离屏，但绑死 AIR 运行时） | **已具备**：headless 可跑，`stage.render()` 直接出 PNG | 两端 | 已有 |
 | E9 | **64 位整数**（`int64` / `uint64`） | ✗（`int` / `uint` 都是 32 位） | ✅ **已实现（opt-in，纯 C，两端同形）**：类型 + `L`/`UL` 字面量 + `int64()`/`uint64()` 转换 + 64 位算术/位运算/比较 + 独立装箱 tag（见 §4.7） | 两端（native / web / WASI 同一份 C） | **已完成** |
-| E10 | **`Vector.<Number>` 批量 SIMD**（NEON / SSE） | ✗ | C 原生 + `-O2` 自动向量化已部分生效，可显式化 | 两端 | 中-高 |
+| E10 | **`Vector.<Number>` 批量 SIMD**（NEON / SSE） | ✗ | ⛔ **已实测：不排期** —— arm64 上手写 NEON 相对**同形标量 C** 只差 **0–8%**（元素级 f64）、**≈0**（int32）、**0–4%**（L1 常驻除法）；归约形状要 SIMD 必须重结合，与 AS3「每步一次舍入」冲突。真正慢的**不是算力**而是逐元素守卫（已另登记进 `TODO.md` 遗留表，且 `-O2` 自己就能向量化）。见 §4.9 | 两端 | **不排期（已实测）** |
 | E11 | **FFI：声明并直调宿主 C 函数** | ✗ | **「直接转 C」的独有红利**（与宿主同一编译单元） | native | 中 |
 | E12 | **真并发 `Worker`（OS 线程）** | 部分（AIR Worker 受限、需 `flash.concurrent`） | 已有 4 worker 池（目前只服务异步 IO） | native | 中 |
 | E13 | **LTO / PGO 构建开关** | — | ✅ **已实现**：清单 `lto`/`pgo`/`pgo-dir` + CLI `--lto`/`--pgo`/`--pgo-dir`，**默认全关**（见 §4.4） | 两端 | **已完成** |
@@ -435,6 +440,52 @@ function onVsync(e:VsyncStateChangeAvailabilityEvent):void {
 `temp/vsyncwin/`（native 真机：`VSYNC available=false refreshRate=120` → 移到 60 Hz 外接屏派发
 `refreshRate=60` → 移回 120 Hz 再派发 `120`，`stage.frameRate` 同步跟随）；Starling demo 已改为
 监听该事件并 `stage.frameRate = e.refreshRate`，基准场景峰值无退化（`front` 59280 / 旧基线带 61.4k–66.2k）。
+
+---
+
+### 4.9 E10 — `Vector.<Number>` 批量 SIMD —— ⛔ **已实测：不排期**
+
+**为什么当初列进来**：`Vector.<Number>` 单态化成连续 `double` 数组（`spectralnorm` 0.80× C 就是这个形态），
+看上去「只差显式向量化」。**实测结论：不差。** arm64 上这笔收益不存在，而真正 5.4×/12× 的缺口在**别处**
+（逐元素守卫，已另登记进 `TODO.md` 的 `### 遗留待开发`）。
+
+**实测口径**（`temp/simdprobe/`，Apple M2 Max / arm64，`24 × 1M` 元素，`-O2 -ffp-contract=off`；
+C 侧 `hand.c`/`hand_small.c` 与 AS3 侧 `saxpy.as`/`saxpy_fn.as` **同规模同形状**；手写 NEON 与裸标量 C
+**都用局部指针、无全局**，故可比）：
+
+| 形状 | 裸标量 C | 我们（现状） | 现状**去掉**逐元素守卫 | 手写 NEON | **显式 SIMD 的增量** |
+|---|---:|---:|---:|---:|---:|
+| `c[j]=a[j]+b[j]*1.5`（f64 元素级） | 6.3–6.8 ms | **38–47 ms** | **7 ms** | 6.1–6.2 ms（2 lane） | **0–8%（多在噪声内）** |
+| `ic[j]=ia[j]+ib[j]`（int32 元素级） | 2.9–4.0 ms | **34–36 ms** | **3 ms** | 2.9 ms（4 lane） | **≈0** |
+| `s+=a[j]*b[j]`（归约） | 22.3 ms | 21–22 ms | 22–23 ms | —— | **语义上不能用** |
+| `c=a/(b+1)`（L1 常驻，82 M 元素） | 13.1–14.8 ms | —— | —— | 13.0–13.7 ms | **0–4%** |
+
+**三条原因**（都可复现，不靠推断）：
+
+1. **AArch64 的 NEON `f64` 只有 2 lane**，而 M 系列标量 FP 端口本来就宽 —— 元素级与 L1 常驻的除法
+   实测 2-lane 与标量**同吞吐**；`int32`（4 lane）同样为 0，因为它是「2 读 1 写」的**访存**形状。
+2. **归约形状被语义挡住**：要 SIMD 就必须重结合，与 AS3「每步一次舍入」冲突（`-ffp-contract=off` 连 FMA
+   收缩都关了）。而这恰恰是**已经与 C 持平**的那一类（21–22 vs 22.3 ms），本来也没有可赚的。
+3. **代价面**：生成 C 里出现 `<arm_neon.h>`/`<immintrin.h>` 直接撞 AGENTS.md §2.6「不写平台耦合写法」，
+   并把「native / web / WASI 同一份 C」这条性质拆成两端分叉（web 还要额外开 wasm `simd128` 工具链）。
+
+**顺带量出来、真正的那个缺口（不属 E10）**：把 `c[j]=a[j]+b[j]*1.5` 的逐元素访问换成裸 `->data[j]`
+（**其余一字不动**）⇒ **38→7 ms**；`-Rpass` 同时显示 clang **自动**给出 `vectorization width: 2`（f64）、
+**`width: 4`（int32）** 且 `interleaved count: 4`——**与手写 NEON 同形**。即「显式化 SIMD」这件事 `-O2`
+已经在做，挡住它的是**逐元素守卫**（循环体里有 `set` ⇒ 与输入 `Vector` 别名 ⇒ `v->length` 不能证明
+循环不变）。该优化**不需要 intrinsics**，两端同形。
+
+**语义反证（已验）**：我们那条归约的校验和 `-302163170` 与 C 里 `volatile` 串行加法**逐位相同**
+⇒ clang 没有重结合我们的浮点循环，红线未破。（另一个可观测项：顶层脚本变量落内存值 ~21%，
+同三个循环放进**函数**即 38→30 ms。）
+
+**口径与未测面（如实报明）**：探针是**合成**形状（覆盖「元素级 + 归约」两类基本面），不是某个真应用的
+负载画像；未测 x86/Windows（本机 arm64 无法测）与 wasm 的 `simd128`；`-O3 -march=native` 重编我们的
+生成 C 与 `-O2` 无差别（⇒ 瓶颈不在优化等级）。`Array`（**非** `Vector`）那个 5.4× 是另一码事
+（`int`↔`double` 往返依赖链），E10 不覆盖。
+
+**出处**：`temp/simdprobe/{saxpy.as,saxpy_fn.as,hand.c,hand_small.c,serial.c}`；证据含 `-Rpass` 报告与
+`main` 的反汇编（每元素 **3** 个 `cbz` 空指针守卫 + **4** 次 `length` 比较 + 5 个分支）。
 
 ---
 
