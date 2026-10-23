@@ -5064,6 +5064,13 @@ static as_xml_node* as_xml_parent(as_xml_node* n) { return n != NULL ? n->parent
 //   "Error #1069: Property <key> not found on <qualified class> and there is no default value."
 static void as_throw_sealed_set(const char* key, const char* fqn);
 static as_value as_throw_sealed_get(const char* key, const char* fqn);
+// Writing a name that IS a trait of the class but cannot be assigned: a getter
+// with no setter is ReferenceError #1074, a method is ReferenceError #1037
+// (measured on adl 51.4.1, temp/smeprobe/adl4.txt -- both name the RECEIVER's
+// class, not the declaring one: 'type' written on a ScreenMouseEvent reports
+// "on flash.events.ScreenMouseEvent." even though Event declares it).
+static void as_throw_readonly_set(const char* key, const char* fqn);
+static void as_throw_method_assign(const char* key, const char* fqn);
 // The loud "not supported by this subset" failure (an Error with id 0). It builds
 // an Error object, so like the two above it is defined after the Error class
 // hierarchy and only prototyped here.
@@ -5621,6 +5628,28 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
     // (DisplayObject.alpha/x/y/scaleX, Sprite3D.rotationX...) through an
     // Object-typed target. A getter without a setter stays read-only, as in AS3.
     as_vtable_header* hv = (as_vtable_header*)((as_object_header*)obj)->vtable;
+    // The name may still be a REAL trait that simply cannot be written. AIR
+    // distinguishes that from an unknown name with two other errors, measured on
+    // adl 51.4.1 (temp/smeprobe/adl4.txt):
+    //   obj[k] = v with k = a read-only accessor (own or inherited)
+    //       -> ReferenceError #1074 "Illegal write to read-only property k on F."
+    //   obj[k] = v with k = a method
+    //       -> ReferenceError #1037 "Cannot assign to a method k on F."
+    //   obj[k] = v with k = nothing at all
+    //       -> ReferenceError #1056 "Cannot create property k on F."  (below)
+    // F is always the RECEIVER's class. Checked BEFORE the dynamic/Array/proxy
+    // fallbacks so an accessor wins over a '_dyn' slot, exactly as it wins over a
+    // same-named field above.
+    for (as_vtable_header* t = hv; t != NULL; t = (as_vtable_header*)t->super) {
+        as_method* gs = (as_method*)t->getters;
+        if (gs != NULL) for (int i = 0; gs[i].name != NULL; i++)
+            if (strcmp(gs[i].name, key) == 0) { as_throw_readonly_set(key, hv->fqn); return; }
+    }
+    for (as_vtable_header* t = hv; t != NULL; t = (as_vtable_header*)t->super) {
+        as_method* ms = (as_method*)t->methods;
+        if (ms != NULL) for (int i = 0; ms[i].name != NULL; i++)
+            if (strcmp(ms[i].name, key) == 0) { as_throw_method_assign(key, hv->fqn); return; }
+    }
     // Proxy receiver: a write that is not a real field/setter is served by
     // setProperty (AIR never lands it in the '_dyn' slot table, measured).
     if (hv->is_proxy) { as_proxy_set_miss(obj, key, v); return; }

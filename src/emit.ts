@@ -1462,11 +1462,21 @@ export class Emitter {
   // the subclass happened to put there. emitStructs therefore emits each of these
   // right after the owning base class's own declared fields (阶段一百四十五).
   private hasBaseClassSlots(cls: string): boolean {
-    if (cls === 'Screen' || cls === 'NativeWindow' || cls === 'Matrix3D' || cls === 'SharedObject') return true;
+    if (cls === 'Screen' || cls === 'NativeWindow' || cls === 'Matrix3D' || cls === 'SharedObject' || cls === 'ScreenMouseEvent') return true;
     return this.trailingSlotLines(cls).length > 0;
   }
 
   private emitBaseClassSlots(cls: string): void {
+    if (cls === 'ScreenMouseEvent') {
+      // screenX/screenY are READ-ONLY in AIR (mxmlc rejects `sx = 1`; a dynamic
+      // write is #1074), so the AS3 surface is a getter pair and the storage sits
+      // in C-runtime-only slots -- a declared field would both accept the write
+      // and appear writable in describeType. Plain doubles, so no props-table
+      // entry and no GC root.
+      this.line('double _screen_x;');
+      this.line('double _screen_y;');
+      return;
+    }
     if (cls === 'Screen') {
       // Screen keeps one live Rectangle per display rectangle. AIR hands back the
       // SAME Rectangle object on every read (mutating the value returned by
@@ -1913,6 +1923,31 @@ export class Emitter {
     this.line('parts[3] = as_fqn_dotted(fqn);');
     this.line('parts[4] = ".";');
     this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1056));');
+    this.indent--;
+    this.line('}');
+    // Reads a trait that exists but cannot be assigned (see the prototypes in the
+    // runtime preamble): #1074 for a read-only accessor, #1037 for a method. Both
+    // name the RECEIVER's class, measured on adl 51.4.1 (temp/smeprobe/adl4.txt).
+    this.line('static void as_throw_readonly_set(const char* key, const char* fqn) {');
+    this.indent++;
+    this.line('static ASC_TLS const char* parts[5];');
+    this.line('parts[0] = "Error #1074: Illegal write to read-only property ";');
+    this.line('parts[1] = key;');
+    this.line('parts[2] = " on ";');
+    this.line('parts[3] = as_fqn_dotted(fqn);');
+    this.line('parts[4] = ".";');
+    this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1074));');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_throw_method_assign(const char* key, const char* fqn) {');
+    this.indent++;
+    this.line('static ASC_TLS const char* parts[5];');
+    this.line('parts[0] = "Error #1037: Cannot assign to a method ";');
+    this.line('parts[1] = key;');
+    this.line('parts[2] = " on ";');
+    this.line('parts[3] = as_fqn_dotted(fqn);');
+    this.line('parts[4] = ".";');
+    this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1037));');
     this.indent--;
     this.line('}');
     this.line('static as_value as_throw_sealed_get(const char* key, const char* fqn) {');
@@ -12660,6 +12695,69 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->vtable = &MouseEvent_vt;');
     this.line('MouseEvent_ctor(o, type, bubbles, cancelable, localX, localY, relatedObject, ctrlKey, altKey, shiftKey, buttonDown, delta);');
     this.line('return o;');
+    this.indent--;
+    this.line('}');
+    // flash.events.ScreenMouseEvent (阶段二百五十八): the 11-argument AIR
+    // constructor, in AIR's own order (buttonDown before commandKey/controlKey) --
+    // see the class comment in symbols.ts for the measurements. localX/localY are
+    // NOT parameters and start at 0 (a plain MouseEvent leaves localX NaN).
+    this.line('void ScreenMouseEvent_ctor(ScreenMouseEvent* o, char* type, bool bubbles, bool cancelable, double screenX, double screenY, bool ctrlKey, bool altKey, bool shiftKey, bool buttonDown, bool commandKey, bool controlKey) {');
+    this.indent++;
+    this.line('MouseEvent_ctor((MouseEvent*)o, type, bubbles, cancelable, 0.0, 0.0, NULL, ctrlKey, altKey, shiftKey, buttonDown, 0.0);');
+    this.line('o->_screen_x = screenX;');
+    this.line('o->_screen_y = screenY;');
+    this.line('o->commandKey = commandKey;');
+    this.line('o->controlKey = controlKey;');
+    this.indent--;
+    this.line('}');
+    this.line('ScreenMouseEvent* ScreenMouseEvent_new(char* type, bool bubbles, bool cancelable, double screenX, double screenY, bool ctrlKey, bool altKey, bool shiftKey, bool buttonDown, bool commandKey, bool controlKey) {');
+    this.indent++;
+    this.line('ScreenMouseEvent* o = (ScreenMouseEvent*)gc_alloc(GCT_CLASS, sizeof(ScreenMouseEvent));');
+    this.line('o->vtable = &ScreenMouseEvent_vt;');
+    this.line('ScreenMouseEvent_ctor(o, type, bubbles, cancelable, screenX, screenY, ctrlKey, altKey, shiftKey, buttonDown, commandKey, controlKey);');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    this.line('double ScreenMouseEvent_get_screenX(void* _this) { return ((ScreenMouseEvent*)_this)->_screen_x; }');
+    this.line('double ScreenMouseEvent_get_screenY(void* _this) { return ((ScreenMouseEvent*)_this)->_screen_y; }');
+    // clone() hands back a ScreenMouseEvent and carries the CONSTRUCTOR-level state
+    // over only -- measured on adl: a source with localX=5/delta=3 clones to
+    // localX=0/delta=0, while screenX/screenY survive.
+    this.line('ScreenMouseEvent* ScreenMouseEvent_clone(void* _this) {');
+    this.indent++;
+    this.line('ScreenMouseEvent* e = (ScreenMouseEvent*)_this;');
+    this.line('ScreenMouseEvent* c = ScreenMouseEvent_new(e->type, e->bubbles, e->cancelable, e->_screen_x, e->_screen_y, e->ctrlKey, e->altKey, e->shiftKey, e->buttonDown, e->commandKey, e->controlKey);');
+    this.line('c->target = e->target;');
+    this.line('return c;');
+    this.indent--;
+    this.line('}');
+    // toString(): AIR's own shape -- quoted type, no eventPhase, and the six flags
+    // plus the two screen coordinates (measured on adl 51.4.1).
+    this.line('char* ScreenMouseEvent_toString(void* _this) {');
+    this.indent++;
+    this.line('ScreenMouseEvent* e = (ScreenMouseEvent*)_this;');
+    this.line('char* s = as_str_concat((char*)"[ScreenMouseEvent type=\\"", e->type != NULL ? e->type : (char*)"null");');
+    this.line('s = as_str_concat(s, (char*)"\\" bubbles=");');
+    this.line('s = as_str_concat(s, e->bubbles ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, (char*)" cancelable=");');
+    this.line('s = as_str_concat(s, e->cancelable ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, (char*)" screenX=");');
+    this.line('s = as_str_concat(s, as_str_from_double(e->_screen_x));');
+    this.line('s = as_str_concat(s, (char*)" screenY=");');
+    this.line('s = as_str_concat(s, as_str_from_double(e->_screen_y));');
+    this.line('s = as_str_concat(s, (char*)" ctrlKey=");');
+    this.line('s = as_str_concat(s, e->ctrlKey ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, (char*)" altKey=");');
+    this.line('s = as_str_concat(s, e->altKey ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, (char*)" shiftKey=");');
+    this.line('s = as_str_concat(s, e->shiftKey ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, (char*)" buttonDown=");');
+    this.line('s = as_str_concat(s, e->buttonDown ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, (char*)" commandKey=");');
+    this.line('s = as_str_concat(s, e->commandKey ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, (char*)" controlKey=");');
+    this.line('s = as_str_concat(s, e->controlKey ? (char*)"true" : (char*)"false");');
+    this.line('return as_str_concat(s, (char*)"]");');
     this.indent--;
     this.line('}');
     // AIR's full 12-argument KeyboardEvent constructor: the three modifier flags the
@@ -30371,6 +30469,15 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
             ? this.convert(this.emitExpr(expr.value), paramType)
             : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
           return { code: this.setterCallCode(s.owner, target.property, false, recv, code), type: { kind: 'void' } };
+        }
+        // A getter with no setter is read-only: mxmlc rejects the write outright
+        // ("property X is read-only"), and a dynamic write is ReferenceError #1074
+        // (as_dyn_set raises it). Without this check the write fell through to the
+        // field path below and emitted `get_x(o) = v`, which only failed later as a
+        // C "expression is not assignable" with no AS3 source location
+        // (measured: ScreenMouseEvent.screenX, 阶段二百五十八).
+        if (cinfo?.getters.has(target.property) && !cinfo.setters.has(target.property)) {
+          throw new CodegenError(`cannot assign to read-only property '${target.property}' of '${obj.type.className}'`);
         }
         // Dynamic class (AS3 `dynamic class`): an undeclared member write lands in
         // the runtime slot table via as_dyn_set (falls back to the `_dyn` record).

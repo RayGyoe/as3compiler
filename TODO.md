@@ -15157,7 +15157,92 @@ Windows 那一支按 AGENTS「不给无法本机验证的平台写盲代码」�
 - 端到端双端孪生：`temp/transprobe/Trans.as`（`adl`，描述符路径）与 `temp/transprobe/AotTrans.as`
   （AOT，`NativeWindowInitOptions` 路径 —— 也就是面板走的那条），截图取色见 §二。
 - 全量 `node test.ts`：**472 / 472 / 0**（与阶段二百五十六 同一基线，本阶段只加钉不改行为面）。
+### 阶段二百五十八：`flash.events.ScreenMouseEvent`（v0.4.221 → v0.4.222）✅ 已完成
+
+**一、这一阶段先回答「谁派发它」，再决定要不要写胶水**
+
+`ScreenMouseEvent` 此前**整类不存在**（引用即编译错），而 AIR 有它。按 AGENTS §1.5 的硬判据，
+「同一输入 `adl` 能跑、我们跑不出」属于**遗留欠账**，故走正常阶段 + 版本号，而不是增强开关。
+真正的判断点在动手前：这类事件的实现成本几乎全在**派发侧**（要不要在胶水里多派一种事件），
+所以第一轮探针不量 API，先量**「谁会派发它」**：
+
+| 探 | `adl` 答案 |
+|---|---|
+| 真实舞台的 `mouseMove`/`mouseDown`/`mouseUp`/`click` 是否 `is ScreenMouseEvent` | **恒 `false`**（四次全否） |
+| 它由谁派发 | 只有 `SystemTrayIcon`（见 AIR 参考） |
+| macOS 上有系统托盘吗 | `NativeApplication.supportsSystemTrayIcon` = **`false`**，`new SystemTrayIcon()` 抛 `#2012` |
+
+结论：**在我们的后端上它永远是「只由用户代码构造」的数据类**（与 `TouchEvent` 同一站立点）——
+不需要胶水，也不需要假装派发一个 `adl` 自己都不会派发的事件。
+
+**二、实测口径（`adl 51.4.1` / macOS，探针 `temp/smeprobe/Probe2..4.as`）**
+
+- **构造器 11 参**，顺序是
+  `(type, bubbles=false, cancelable=false, screenX=NaN, screenY=NaN, ctrlKey, altKey, shiftKey, buttonDown, commandKey, controlKey)`。
+  用「逐个槽位只放一个 `true`」的一次性扫描量出来：恰好 6 个布尔槽是
+  `ctrl/alt/shift/buttonDown/commandKey/controlKey` —— **`buttonDown` 夹在 `shiftKey` 与 `commandKey` 之间**，
+  凭直觉很容易写错。`mxmlc` 也在另一侧验证了同一件事：12 个实参报「要求不超过 11 个」。
+- **`localX`/`localY` 不是形参**：`new ScreenMouseEvent("x")` 得
+  `localX=0 localY=0`，而裸 `new MouseEvent("x")` 得 `localX=NaN` —— 它把 `MouseEvent` 那一对
+  显式填 0（`stageX`/`stageY` 也是 0）。
+- **`screenX`/`screenY` 只读**：`mxmlc` 对 `a.screenX = 1` 直接报「属性 screenX 为只读」；
+  动态写（`(x as Object)["screenX"] = 1`）在 `adl` 上抛 `#1074`。
+- **非 `Number` 实参按 `Number` 强制**：`"abc"` ⇒ `sx=0 sy=0`。
+- `toString()` 是**它自己的形状**：`[ScreenMouseEvent type="x" bubbles=false cancelable=false screenX=NaN screenY=NaN ctrlKey=false altKey=false shiftKey=false buttonDown=false commandKey=false controlKey=false]`
+  —— 引号包 `type`，且**没有 `eventPhase`**（与 `Event.toString` 不同）。
+- `clone()` 只带**构造级**字段（`screenX`/`screenY` + 六个布尔 + `type`/`bubbles`/`cancelable`/`target`），
+  `localX`/`localY`/`delta` **归零**；以 `Event` 静态类型调用同样返回 `ScreenMouseEvent`。
+- 六个常量：`CLICK`/`RIGHT_CLICK`/`MOUSE_DOWN`/`MOUSE_UP`/`RIGHT_MOUSE_DOWN`/`RIGHT_MOUSE_UP`。
+- `describeType`：`@base=Class`、`@["extends"]=""`（AS3 源码里 `x.@extends` 是语法错，必须写
+  `x.@["extends"]`）、`isDynamic/isFinal/isStatic` 全 `true`，`getDefinitionByName` 可用。
+
+**三、顺带量清的两条通用规则（写进运行时，不只服务这一个类）**
+
+量「动态写只读 trait」时，`adl` 给的是**三个**错误号，而不是一个：
+
+| 动态写命中什么 | `adl` 报 |
+|---|---|
+| 本类或继承来的**只读访问器**（`screenX`/`screenY`/`type`/`bubbles`/`target`/`clickCount`） | `ReferenceError #1074` "Illegal write to read-only property X on F." |
+| **方法名**（`toString`/`clone`） | `ReferenceError #1037` "Cannot assign to a method X on F." |
+| 真正未知的名字 | 原来的 `#1056` "Cannot create property X on F." |
+
+三条都写**接收者**的类（在 `ScreenMouseEvent` 上写 `type` 报的是 `ScreenMouseEvent`，尽管 `Event`
+才是声明者）。实现上：`as_dyn_set` 在「逐层字段/访问器走查」之后、`_dyn`/Array/proxy 兜底**之前**
+依次查 `getters` 与 `methods` 反射表；静态类型写入则由 codegen 直接拒绝
+（`cannot assign to read-only property 'X' of 'Y'`，把过去 C 层的 `expression is not assignable` 变成带行列号的语义错误）。
+
+**四、实现**
+
+1. `src/symbols.ts`：类注册在 `MouseEvent` 之后，`superClass: 'MouseEvent'`；`commandKey`/`controlKey`
+   **声明在本类**（不去加宽 `MouseEvent` 的字段布局 —— 它只是这两个名字唯一量到的使用者）；
+   `screenX`/`screenY` 放 **`getters`**（**不是** `methods`，放错会发出未定义的 `ScreenMouseEvent_screenX` 符号）；
+   6 个 `staticFields` + 11 参构造器；短名映射与 `TouchEvent` 相邻。
+2. `src/emit.ts`：`ScreenMouseEvent_ctor` 先调 `MouseEvent_ctor(...)`（`localX`/`localY` 传 0）再填
+   `_screen_x`/`_screen_y`/`commandKey`/`controlKey`；`_new`/`_get_screenX`/`_get_screenY`/`_clone`/`_toString`。
+   结构体走 `emitBaseClassSlots` 追加 `double _screen_x; double _screen_y;`（**只活在 C 运行时**，
+   不进 props 表、不是 GC 根）；vtable 的 `getters` 表登记 `screenX`/`screenY`（签名 `"Number"`）、
+   `props` 表只有 `commandKey`/`controlKey`。用到的函数在 emit 前导里有**显式前向声明**，
+   且定义返回类型与声明**逐字一致**（否则 `conflicting types for 'ScreenMouseEvent_clone'`）。
+3. `src/runtime.ts`：`as_throw_readonly_set` / `as_throw_method_assign`（TLS `parts[5]`，`ReferenceError_new(..., 1074|1037)`）
+   紧挨 `as_throw_sealed_get` 发射；`as_dyn_set` 的两处新分支见 §三。
+
+**五、验收**
+
+- 单元组 `unit: emit/ScreenMouseEvent`（**21 钉**）：11 参顺序、`localX/localY` 不是形参、
+  `screenX/screenY` 走 getters 而非字段、`clone` 的构造级语义、`toString` 形状、三条动态写错误号、
+  静态写报错、短名映射、`#1074`/`#1037` 在 `_dyn` 兜底之前判。
+- 示例 `examples/screen-mouse-event.as`（**27 断言**，`--run` 打印 `screen-mouse-event OK`）。
+- **双端孪生**：`temp/smeprobe/AotSme.as` 走 AOT（`--manifest`），与 `adl` 侧 `adl2/3/4.txt` **逐行逐字相同**。
+- 全量 `node test.ts`：**474 / 474 / 0**（基线 472 + 新增 1 组单元 + `examples/` 自动发现多出 1 个示例）。
+
+**六、残留（已登记，本阶段不做）**
+
+`Event` 的 `type`/`bubbles`/`cancelable`/`target`/`currentTarget`/`eventPhase` 在 `adl` 里是**只读访问器**
+（动态写 `#1074`、静态写编译不过），我们这边仍是**普通字段**（照收）⇒ 需要把它们改成
+`Event_get_*` 访问器并同步 AMF 成员表与 `Event_props`，波及面远大于本阶段。已入遗留表。
+
 ### 遗留待开发
+> **2026-10-23 追加（阶段二百五十八：`flash.events.ScreenMouseEvent` —— 先量「谁派发它」再决定要不要写）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**106 项**（`未开始` **78** / `部分完成` 19 / `已修` **6** / `已记录` 2 / `调研完成·实现暂缓` 1）。**改写的 1 行**是阶段二百五十五 收尾时登记的「`ScreenMouseEvent` 整类未实现」⇒ 转为 `已修`。**新登记的 1 行**是量动态写只读 trait 时顺手量出来的**族级**差异：`Event` 的 `type`/`bubbles`/`cancelable`/`target` 在 `adl` 里是**只读访问器**（动态写抛 `#1074`、报文写**接收者**的类），我们这边是**普通字段**（照收）。**这一轮真正学到的是「事件类的形状要先问它由谁派发」**：`ScreenMouseEvent` 的 `describeType` 面（六个常量、两个只读属性、11 个形参）都能量，但**派发者**不能猜 —— 探针证明 `adl` 上真实舞台鼠标事件 `is ScreenMouseEvent` 恒 **false**，它只由 `SystemTrayIcon` 派发，而 macOS 没有系统托盘 ⇒ 它在我们这里是**纯数据类**（与 `TouchEvent` 同属「只由用户代码构造」），不需要任何胶水、也不需要假装派发。**顺带量清的两条通用规则已写进运行时**：动态写命中「getter 无 setter」→ `#1074`、命中「方法名」→ `#1037`、都不命中才是原来的 `#1056`（都按接收者类报，且在 `_dyn` 兜底**之前**判）。**证据**：`temp/smeprobe/`（`Probe.as`/`Probe2.as`/`Probe3.as`/`Probe4.as` 四轮 `adl` 探针 + AOT 侧 `AotSme.as` 逐行对照，两端逐字相同）、`test/unit/emit.ts` 的 `unit: emit/ScreenMouseEvent`（21 钉）、`examples/screen-mouse-event.as`（27 断言）。
 > **2026-10-23 追加（阶段二百五十七：`<transparent>` 与 `NativeWindowInitOptions.transparent` 真的透传）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 表内项数**保持 105 项**（五档分状态不变）。**改写的 1 行**是「窗口几何的 Windows 端残余」：它的 ① 原来写「`<transparent>` 未接线，两端都没有真透明窗」——本阶段把**生成侧与 macOS 侧**全部接上（描述符 → `ASC_WINDOW_TRANSPARENT` → 主窗、`NativeWindowInitOptions` → `sk_window_set_transparent`、合成步与呈现步清 alpha 0、`NSWindow setOpaque:NO` + 内容视图及其子视图 layer 全设非不透明），故该行**收窄到只有 Windows 的原生实现**（要 `WS_EX_LAYERED` + 逐帧 alpha；当前胶水**报明一次**，不给假透明窗）。**不占表**的理由与 G1/G2 相同：`adl` 给得出真透明窗、我们给不出 ⇒ §1.5 的**遗留欠账**，阶段内修净。**证据**：`temp/transprobe/`（`adl` 侧 `Trans.as` + AOT 侧 `AotTrans.as` 双端孪生，含截图）、`test/unit/platform.ts` 五条源级钉。
 > **2026-10-23 追加（阶段二百五十六：`DockIcon.bitmaps` 上屏 —— 先实测「AIR 用哪张」再写一行 C）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**104 → 105 项**（`未开始` **79 → 78**、`已修` **4 → 5**、`已记录` **1 → 2**，其余不变）。**改写的 1 行**是阶段二百五十五 登记的那条「`DockIcon.bitmaps` 不上屏」⇒ 转为 `已修`。**新登记的 1 行**是落地时**量出来、但刻意不跟**的一处渲染差异：AIR 交给 AppKit 的字节已经是预乘的、却按直通 alpha 声明，AppKit 于是又乘一遍 ⇒ 半透明像素是 `a²·src + (1-a)·bg`（整体偏暗），我们是正确的 `a·src + (1-a)·bg`。不透明像素两端**逐字节相同**，所以普通图标看不出差；但圆角图标的抗锯齿边会出现暗边，照抄它等于故意实现一个变暗 bug，故**如实登记而不修**。**证据**：`temp/dockprobe/`（`adl` 侧八轮选图 + 四象限取色）、`temp/dockquad.as`/`temp/dockblend.as`（AOT 侧同一位图）、`docs/{zh-cn,en}/desktop.md` §3.1/§7.6。
 > **2026-10-23 追加（非阶段：`flash.desktop` 图标族实测 —— 一条「AIR 无对应物」的错判被推翻）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**100 → 101 项**（`未开始` **75 → 76**，其余不变）。起因是 macOS 清理工具 demo 方案（[`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md)）把 **G4 菜单栏状态项**整条判为「AIR **没有**对应物 ⇒ 增强」——**这条是错的**：AIR 在 `flash.desktop` 里有完整的一等公民图标 API（详见新登记行），我们**零实现**（连编译都过不去）⇒ 按 §1.5 硬判据是**遗留欠账**，故**新登记 1 行**；**改写 1 行**是「`NativeWindow` 家族剩余面」里「`NativeApplication.menu` 也只能诚实回 `null`」那句 —— 实测**推翻**（详见行内）。**因此 demo 的 G4 拆为 G4a（图标族，遗留）/ G4b（macOS `NSStatusItem`，增强）**，方案文档与 `TODO.md` 的 demo 节已同步。**证据**（全部 `adl 51.4.1` / macOS）：`temp/desktopprobe/{Main.as,adl_out.txt}`（能力位与 `DockIcon` 面）、`{Surface.as,surface.txt}`（`describeType` 权威成员面）、`{MenuProbe.as,menu.txt}`（菜单面）。**（2026-10-23 阶段二百五十五 更新）**：该行已**清偿并移出本表**（图标族 + `NativeMenu` 子系统按 AIR 面逐项落地，见下文阶段条目）；同时按「落地后如实登记残余」的规矩**新登记 3 行**（`DockIcon.bitmaps` 不上屏 / `keyEquivalentModifiers` 未译成 `NSEventModifierFlags` / `NativeMenu.display()` 无模态后端）⇒ 表内项数 **101 → 104**（移出 1、新增 4），分状态 **`未开始` 76 → 79**，其余不变（`部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1）。第 4 行是收尾时补登记的 `flash.events.ScreenMouseEvent`（demo 方案原本把它并进 G4a，但它与图标族无耦合、且形状未实测，故不凭猜测定形状）。
@@ -15402,7 +15487,8 @@ Windows 那一支按 AGENTS「不给无法本机验证的平台写盲代码」�
 | `DockIcon.bitmaps` **不上屏**（模型完整、Dock 图标不变） | **已修**（2026-10-23 阶段二百五十六；原登记 2026-10-23 阶段二百五十五） | 已接 `-[NSApplication setApplicationIconImage:]`：直通 ARGB → **预乘** RGBA 的 `NSBitmapImageRep` → `NSImage`。**选图规则是先实测再写的**（`temp/dockprobe/` 八轮截屏取色）：**取 `abs(max(w,h) − 128)` 最小的一张、并列取数组里更早的那张**（`{16,512}→16` 否掉「越大越好」、`{64,160}→160` 否掉「≤128 的最大者」、`{127,129}`/`{129,127}` 顺序对调换赢家 ⇒ 并列取更早且目标正好 128、`{128×400, 200×200}→200×200` ⇒ 度量是逐轴最大值）。重新赋值立刻重绘、`bitmaps = []` 恢复默认图标、早于 NSApp 的赋值由 `sk_menu_ensure()` 补画。仍带 `ASC_HAS_DOCK_IMAGE`（`ASC_USE_WINDOW && __APPLE__`）条件编译，其余后端维持报明 | 收口；见阶段二百五十六 条目 |
 | `NativeMenuItem.keyEquivalentModifiers` **未翻译成 `NSEventModifierFlags`** | 未开始（2026-10-23 阶段二百五十五） | `keyEquivalent` 本身绑得上（`initWithTitle:action:keyEquivalent:`），但六个合法值（`15..20`，升序去重后存进 `_mods`）**没有映射**，于是快捷键按 AppKit 默认修饰键触发。当前**报明一次**（`as_menu_note_mods`），绝不静默绑一条错的快捷键 | 先用 `adl` 逐值实测六个 modifier 组合在菜单栏里的**显示文本与真实按键**（`⌘S` vs `⌃S` vs `⌥⌘S` 等），得到 `15..20` → `NSEventModifierFlag*` 的权威表再写映射；映射后删掉 `as_menu_note_mods` 的报明与对应单测钉子 |
 | `NativeMenu.display()` **没有模态菜单后端** | 未开始（2026-10-23 阶段二百五十五） | AIR 的 `display(stage, x, y)` 弹一个**模态**原生菜单（阻塞到选中/取消）；本后端是**非阻塞**事件泵，没有可嵌套的模态运行器 ⇒ 现在**报明**并返回 `undefined`（不假装弹过）。`dispatchContextMenuSelect` 同样回 `undefined`（那一条与 `adl` 一致，不是缺口） | 要落地得给 run loop 加一层「嵌套模态泵」：进 `display()` 后跑一个局部 `NSModalSession`/嵌套 `SDL_PumpEvents`（只处理本菜单、吞掉其余输入），返回后恢复；风险是重入整个帧循环（计时器/事件/窗口结算都会停），须先证明普通 AIR 应用不会因此死锁。优先级低——菜单栏与 Dock 右键两条路已覆盖 demo 需求 |
-| `flash.events.ScreenMouseEvent` **整类未实现**（AIR 的「屏幕坐标」鼠标事件） | 未开始（2026-10-23 阶段二百五十五 收尾时如实登记） | `grep -c ScreenMouseEvent src/symbols.ts src/emit.ts` = **0 / 0** ⇒ 照 AIR 写 `e.screenX` 或 `new ScreenMouseEvent(...)` **编不过**。demo 方案（`prune/mac-cleaner-demo-plan.md` §2.4）原本把它并进 **G4a**，是因为菜单栏/Dock 菜单的**浮层定位**需要屏幕坐标；但它与图标族**没有耦合**，故本阶段先把图标族与 `NativeMenu` 落净，这一类单独留在这里 | 独立小阶段：先量清三件事——① 它由**谁**派发（`adl` 上 `NativeWindow`/`Stage` 的鼠标事件是否真带 `screenX`/`screenY`，还是只有显式构造才有）、② 构造器形参与默认值、③ 它与 `MouseEvent.ctrlKey`/`NativeMouseEvent` 的关系；量清后按 `MouseEvent` 子类落地。**本阶段宁可不写，也不凭猜测定形状** |
+| `flash.events.ScreenMouseEvent` **整类未实现**（AIR 的「屏幕坐标」鼠标事件） | **已修**（2026-10-23 阶段二百五十八；原登记 2026-10-23 阶段二百五十五） | 已按 `adl 51.4.1` 实测落地（`src/symbols.ts` 注册 + `src/emit.ts` 的 ctor/new/clone/toString/getter）：**11 个形参**且顺序是 `(type, bubbles, cancelable, screenX, screenY, ctrlKey, altKey, shiftKey, buttonDown, commandKey, controlKey)` —— `buttonDown` 夹在 `shiftKey` 与 `commandKey` 之间（用 six-slot one-hot 逐一验证），`localX`/`localY` **不是形参**且默认 `0`（裸 `MouseEvent` 是 `NaN`）；`screenX`/`screenY` 是**只读**访问器（静态写 = 编译错、动态写 = `#1074`）、默认 `NaN`；`clone()` 返回 `ScreenMouseEvent` 且**只带构造级字段**（`localX`/`delta` 归零）；`toString()` 是 AIR 自己的形状（**引号包 type、无 eventPhase**）。**派发口径也量清了**：`adl` 上真实舞台鼠标事件 `is ScreenMouseEvent` 恒 **false**，它只由 `SystemTrayIcon` 派发，而 macOS 没有系统托盘（`supportsSystemTrayIcon=false`、`new SystemTrayIcon()` 抛 `#2012`）⇒ 与 `TouchEvent` 同属「只由用户代码构造」的事件类 | 收口；见阶段二百五十八 条目 |
+| **`Event` 的只读访问器在我们这里是可写字段**（`type` / `bubbles` / `cancelable` / `target` / `currentTarget` …） | 未开始（2026-10-23 阶段二百五十八 实测登记） | 阶段二百五十八 量动态写只读 trait 时顺手量出来的：`adl 51.4.1` 上 `(new ScreenMouseEvent("x") as Object)["type"] = 1` 抛 **`#1074`**（`type`/`bubbles`/`cancelable`/`target`/`clickCount` 全抛，且报文写的是**接收者的类**而不是声明者），`toString`/`clone` 这类方法名抛 **`#1037`**，只有真正不存在的名字才是 `#1056`；我方 `as_dyn_set` 本轮已按此补齐 `#1074`/`#1037` 两条，但 `type`/`bubbles`/`target` 在 `Event` 里是**普通字段**（`FieldInfo`），于是动态写会**照收**、静态写也编得过 ⇒ 与 `adl` 不一致。成因是 `Event` 从阶段三十五 就是「字段 + 直接访问」，改成访问器要动 `Event_ctor`/AMF 成员表/`X_props` 布局与全部派发点 | 先把 `type`/`target`/`bubbles`/`cancelable`/`currentTarget`/`eventPhase` 从字段改成 `X_get_*` 访问器（只读者不给 setter，写路径自然走 `#1074` 与编译错），同步 AMF 成员表与反射表；`Event_ctor` 与内置派发改用内部写入口。风险面较大（`Event` 是全部事件的基类），需先跑一遍全量回归确定零行为漂移再改 |
 | **Dock 图标的半透明像素比 `adl` 亮**（我们只乘一次 alpha，`adl` 乘两次） | 已记录（2026-10-23 阶段二百五十六 **刻意不跟**） | 同一张四象限位图（不透明蓝/橙 + 50% 蓝/橙）两端取色：不透明像素**逐字节相同**，50% 像素 `adl` 是 `a²·src + (1-a)·bg`、我们是 `a·src + (1-a)·bg`（50% 蓝：`adl` `122.3` vs 我们 `183.6`；背景项两边完全相同 ⇒ alpha 本身没错，只有源色项被多乘了一次）。成因是 AIR 把**已预乘**的字节当直通 alpha 交给 AppKit、AppKit 又乘一遍（双重预乘瑕疵）⇒ `adl` 的半透明像素整体偏暗 | **不修**：这不是 AIR 定义的行为而是一次转换瑕疵，照抄等于故意实现一个变暗 bug（图标圆角的抗锯齿边会出现暗边）。写进 `docs/{zh-cn,en}/desktop.md` §7.6；若将来需要「像素级复刻 adl」，这里就是那一处的开关位置（在胶水里再乘一次 alpha 即可） |
 
 

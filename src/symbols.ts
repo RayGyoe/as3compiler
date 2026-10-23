@@ -4684,6 +4684,81 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // flash.events.ScreenMouseEvent (阶段二百五十八). AIR's mouse event that also
+    // carries the pointer position in SCREEN space. Everything below is measured on
+    // adl 51.4.1 / macOS (temp/smeprobe/):
+    //   * constructor takes AT MOST 11 arguments and they are
+    //     (type, bubbles=false, cancelable=false, screenX=NaN, screenY=NaN,
+    //      ctrlKey=false, altKey=false, shiftKey=false,
+    //      buttonDown=false, commandKey=false, controlKey=false)
+    //     -- note buttonDown sits BETWEEN shiftKey and commandKey, and localX/
+    //     localY are NOT parameters (probe: one-hot over the six booleans turned
+    //     each slot into exactly one flag in that order).
+    //   * screenX/screenY are READ-ONLY (`sx = 1` is an mxmlc error; a dynamic
+    //     write is ReferenceError #1074 "Illegal write to read-only property");
+    //     omitting them yields NaN, and localX/localY stay 0 (a plain MouseEvent
+    //     leaves localX NaN).
+    //   * it is dispatched ONLY by SystemTrayIcon, which this backend does not
+    //     provide on macOS (supportsSystemTrayIcon=false, `new SystemTrayIcon()` is
+    //     #2012). Real stage mouse events are plain MouseEvent -- measured
+    //     `is ScreenMouseEvent` is false for mouseMove/mouseDown/mouseUp/click -- so
+    //     instances only ever come from user code, exactly like TouchEvent.
+    //   * clone() returns a ScreenMouseEvent and copies the ctor-level fields ONLY
+    //     (setting localX/delta on the source leaves the clone at 0), and
+    //     toString() prints its own shape: `[ScreenMouseEvent type="x" bubbles=false
+    //     cancelable=false screenX=NaN screenY=NaN ctrlKey=false altKey=false
+    //     shiftKey=false buttonDown=false commandKey=false controlKey=false]`
+    //     (quoted type, no eventPhase, unlike Event.toString).
+    const sef = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'ScreenMouseEvent', isStatic: false, isConst: false });
+    const sec = (value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner: 'ScreenMouseEvent', isStatic: true, isConst: true });
+    this.classMap.set('ScreenMouseEvent', {
+      fqn: 'flash.events::ScreenMouseEvent',
+      fields: new Map([
+        // commandKey/controlKey live on AIR's MouseEvent, which this runtime does
+        // not carry them on (its KeyboardEvent has the pair, its MouseEvent does
+        // not). ScreenMouseEvent is their only measured user, so they are declared
+        // here rather than widening MouseEvent's field layout.
+        ['commandKey', sef({ kind: 'bool' })],
+        ['controlKey', sef({ kind: 'bool' })],
+      ]),
+      // screenX/screenY are getter-only accessors over C-runtime-only slots (see
+      // emitBaseClassSlots): a plain field would accept the write AIR rejects and
+      // would show up as writable in describeType (measured: [read-only]).
+      methods: new Map([
+        ['clone', { returnType: { kind: 'object', className: 'ScreenMouseEvent' }, params: [], owner: 'ScreenMouseEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        ['toString', { returnType: { kind: 'string' }, params: [], owner: 'ScreenMouseEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      staticFields: new Map([
+        ['CLICK', sec('click')],
+        ['RIGHT_CLICK', sec('rightClick')],
+        ['MOUSE_DOWN', sec('mouseDown')],
+        ['MOUSE_UP', sec('mouseUp')],
+        ['RIGHT_MOUSE_DOWN', sec('rightMouseDown')],
+        ['RIGHT_MOUSE_UP', sec('rightMouseUp')],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['screenX', { returnType: { kind: 'number' }, params: [], owner: 'ScreenMouseEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['screenY', { returnType: { kind: 'number' }, params: [], owner: 'ScreenMouseEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        meBool('bubbles', false),
+        meBool('cancelable', false),
+        { name: 'screenX', type: 'Number', defaultValue: { kind: 'Num', value: NaN, isInt: false }, isRest: false },
+        { name: 'screenY', type: 'Number', defaultValue: { kind: 'Num', value: NaN, isInt: false }, isRest: false },
+        meBool('ctrlKey', false),
+        meBool('altKey', false),
+        meBool('shiftKey', false),
+        meBool('buttonDown', false),
+        meBool('commandKey', false),
+        meBool('controlKey', false),
+      ] },
+      superClass: 'MouseEvent',
+      isFinal: false,
+      implements: [],
+    });
     // flash.events.TouchEvent (stage 93; full AIR shape filled in while clearing
     // away3d-core walls): multi-touch input. Field set and constructor parameter
     // order come from the AIR 3.0 class reference --
@@ -7426,6 +7501,7 @@ export class SymbolTable {
       NetStatusEvent: 'flash.events::NetStatusEvent', DataEvent: 'flash.events::DataEvent',
       HTTPStatusEvent: 'flash.events::HTTPStatusEvent', ContextMenuEvent: 'flash.events::ContextMenuEvent',
       TouchEvent: 'flash.events::TouchEvent', AsyncErrorEvent: 'flash.events::AsyncErrorEvent',
+      ScreenMouseEvent: 'flash.events::ScreenMouseEvent',
       OutputProgressEvent: 'flash.events::OutputProgressEvent',
       StatusEvent: 'flash.events::StatusEvent',
       // flash.external — the ANE bridge's AS3 face (a shell in this build).

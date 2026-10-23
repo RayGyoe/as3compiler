@@ -3749,3 +3749,85 @@ function checkEmitDockIconImage(): string[] {
   return bad;
 }
 registerGroup('unit: emit/DockIconImage', checkEmitDockIconImage);
+
+// ---- 阶段二百五十八：flash.events.ScreenMouseEvent --------------------------
+// The class is a pure data carrier on this backend (AIR dispatches it only from
+// SystemTrayIcon, which macOS does not have), so everything below was measured on
+// adl 51.4.1 with temp/smeprobe/ and is otherwise invisible to the examples suite:
+// the ctor ORDER (buttonDown sits between shiftKey and commandKey, and localX/
+// localY are not parameters), the read-only accessor pair, and the two toString/
+// clone shapes that differ from Event's own.
+function checkEmitScreenMouseEvent(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [sme] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [sme] ${label}`); }
+  };
+  const src = [
+    'import flash.events.ScreenMouseEvent;',
+    'var e:ScreenMouseEvent = new ScreenMouseEvent("t", true, true, 11, 22, true, false, true, true, false, true);',
+    'trace(e.screenX, e.screenY, e.commandKey, e.controlKey);',
+    'var c:ScreenMouseEvent = e.clone() as ScreenMouseEvent;',
+    'trace(c);',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+  // Constructor: 11 parameters, in AIR's own order.
+  check('the ctor takes AIR\'s 11 parameters',
+    c.includes('void ScreenMouseEvent_ctor(ScreenMouseEvent* o, char* type, bool bubbles, bool cancelable, double screenX, double screenY, bool ctrlKey, bool altKey, bool shiftKey, bool buttonDown, bool commandKey, bool controlKey)'));
+  check('buttonDown comes BEFORE commandKey/controlKey (AIR order, not MouseEvent order)',
+    /bool shiftKey, bool buttonDown, bool commandKey, bool controlKey\) \{/.test(c));
+  // localX/localY are not ctor params: they are handed to the MouseEvent base as
+  // 0, not NaN (measured: a plain MouseEvent leaves localX NaN).
+  check('localX/localY start at 0, not NaN',
+    c.includes('MouseEvent_ctor((MouseEvent*)o, type, bubbles, cancelable, 0.0, 0.0, NULL, ctrlKey, altKey, shiftKey, buttonDown, 0.0);'));
+  // Read-only screenX/screenY: getter-only accessors over C-runtime-only slots.
+  check('screenX/screenY are getter-only accessors',
+    c.includes('double ScreenMouseEvent_get_screenX(void* _this)') && !c.includes('void ScreenMouseEvent_set_screenX('));
+  check('...backed by C-runtime-only slots',
+    /struct ScreenMouseEvent \{[\s\S]*?double _screen_x;[\s\S]*?double _screen_y;/.test(c));
+  check('...which the props table never exposes as fields',
+    !(/static as_prop ScreenMouseEvent_props\[\] = \{([^}]*)\}/.exec(c)?.[1] ?? 'screenX').includes('screenX')
+    && /static as_method ScreenMouseEvent_getters\[\] = \{[^}]*"screenX"/.test(c));
+  // The vtable override must go through the slots, not a static call: measured,
+  // `String(e)` and `e.clone()` on a ScreenMouseEvent hit these bodies.
+  check('toString is the ScreenMouseEvent body in its own vtable',
+    /ScreenMouseEvent_vt = \{[^}]*ScreenMouseEvent_toString/.test(c));
+  check('clone shadows Event\'s slot (same position as in Event_vt)',
+    /ScreenMouseEvent_vt = \{[^}]*Object_propertyIsEnumerable, ScreenMouseEvent_clone,/.test(c)
+    && /Event_vt = \{[^}]*Object_propertyIsEnumerable, Event_clone,/.test(c));
+  // clone(): ctor-level state only (measured: localX/delta reset, screenX survives).
+  check('clone copies the screen coordinates and the two extra flags',
+    c.includes('ScreenMouseEvent_new(e->type, e->bubbles, e->cancelable, e->_screen_x, e->_screen_y, e->ctrlKey, e->altKey, e->shiftKey, e->buttonDown, e->commandKey, e->controlKey)')
+    && c.includes('c->target = e->target;'));
+  // toString(): AIR's own shape -- no eventPhase, unlike Event_toString.
+  check('toString has AIR\'s ScreenMouseEvent shape', c.includes('"[ScreenMouseEvent type='));
+  check('...and carries no eventPhase',
+    fnBody(c, 'char* ScreenMouseEvent_toString(void* _this) {').includes('eventPhase') === false);
+  // The six constants, measured by reading them at runtime on adl (values the
+  // describeType dump cannot show: it lists only the names).
+  for (const [name, value] of [['CLICK', 'click'], ['RIGHT_CLICK', 'rightClick'], ['MOUSE_DOWN', 'mouseDown'], ['MOUSE_UP', 'mouseUp'], ['RIGHT_MOUSE_DOWN', 'rightMouseDown'], ['RIGHT_MOUSE_UP', 'rightMouseUp']] as [string, string][]) {
+    check(`${name} is "${value}"`,
+      c.includes(`static char* const ScreenMouseEvent_${name} = "${value}";`));
+  }
+  // Reading a read-only trait through a dynamic write is #1074, not the sealed
+  // #1056 -- a general runtime rule measured in the same probe batch.
+  check('a dynamic write to a getter-only trait raises #1074',
+    c.includes('static void as_throw_readonly_set(const char* key, const char* fqn) {')
+    && c.includes('Error #1074: Illegal write to read-only property '));
+  check('...and a write to a method raises #1037',
+    c.includes('static void as_throw_method_assign(const char* key, const char* fqn) {')
+    && c.includes('Error #1037: Cannot assign to a method '));
+  check('both name the RECEIVER class and sit before the _dyn fallback',
+    /for \(as_vtable_header\* t = hv; t != NULL; t = \(as_vtable_header\*\)t->super\) \{\s*as_method\* gs = \(as_method\*\)t->getters;/.test(c));
+  // The static-type write is rejected at compile time (mxmlc: "property is read-only"),
+  // instead of surfacing as a C "expression is not assignable".
+  let threw = '';
+  try { generateC(parse('import flash.events.ScreenMouseEvent;\nvar e:ScreenMouseEvent = new ScreenMouseEvent("x");\ne.screenX = 1;\n')); }
+  catch (err) { threw = (err as Error).message; }
+  check('a static write to screenX is a codegen error', /cannot assign to read-only property 'screenX' of 'ScreenMouseEvent'/.test(threw));
+
+  console.log(`     [sme] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ScreenMouseEvent', checkEmitScreenMouseEvent);
