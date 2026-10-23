@@ -584,17 +584,29 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
   后四者分别是初始窗的左上角（`xs:int`，可为负）与尺寸上下限（`BoundsSizeType`：空白分隔的两个无符号整数，
   少一个就**报错**而不是取默认）。`WS_MAXIMIZEBOX` 不是摆设：它决定最大化后是铺**可用区**还是盖住任务栏的
   **整块显示器**（见 `win32.md` §5 第 21 条）。
-- `<transparent>true</transparent>` → 构建清单加 `ASC_WINDOW_TRANSPARENT=1`，**两半都要动**（阶段二百五十七）：
-  ① 胶水把原生窗做成非不透明 —— macOS 上 `-[NSWindow setOpaque:NO]` + `clearColor` 背景**并逐个把内容视图
-  及其子视图的 layer 设成非不透明**（SDL 自己的 `SDLView`/`SDL_cocoametalview` 在 content view 里，它若仍
-  不透明，CoreAnimation 会在绘制内容后面铺一块黑）；② **合成步清成 alpha 0 而不是舞台色**
+- `<transparent>true</transparent>` → 构建清单加 `ASC_WINDOW_TRANSPARENT=1`，**两半都要动**（阶段二百五十七，宏观路径见阶段二百五十九）：
+  ① 胶水把原生窗做成非不透明；② **合成步清成 alpha 0 而不是舞台色**
   （`as_skia_canvas_clear_transparent`），否则那块「没人画」的区域会被清成不透明的一整片。`adl 51.4.1` 实测
   口径：`<transparent>true</transparent>` 的窗口 `nativeWindow.transparent` 为 `true`、`stage.color` **仍报
   `0xFFFFFFFF`**（即 `color` 是舞台属性、与窗口是否透传无关），没画的像素在屏幕上是**真透明**。**只作用于
   描述符那扇主窗**：程序自己 `new NativeWindow(opts)` 建的窗按 `opts.transparent` 决定（走
-  `sk_window_set_transparent`），面板类浮层因此也是这条路。**平台面**：macOS 真透传；Windows 与其它后端
-  **没有实现**（要 `WS_EX_LAYERED` + 逐帧 alpha），故**响亮报明一次**而不是给一扇不透明的假透明窗；
-  wasm 无桌面合成器，同为空桩。
+  `sk_window_set_transparent`），面板类浮层因此也是这条路。
+- **macOS 的透明窗不走 SDL 的呈现路径**（阶段二百五十九）。量出来的事实：把 `NSWindow.opaque`、视图与
+  layer 的 `-isOpaque` 全部清掉、alpha 0 的像素也确实送达 `present_frame`，屏幕上**仍是不透明黑**；一份
+  **14 行、零 as3compiler 符号**的裸 SDL2 程序在 Metal 与 OpenGL 两个渲染器上都能复现 ⇒ 这是后端属性
+  （AGENTS.md §1.5 第二类），不是我们的语义错。证据 `temp/transprobe/FINDINGS.md`、`temp/sdltrans.cc`、
+  `temp/sdltrans2.cc`。
+  因此透明窗改走 CALayer：把内容视图做成 **layer-hosting**（`[contentView setLayer:]`，不是 `wantsLayer`），
+  `SDLView` 就不再往自己的 backing store 里铺不透明黑；每帧的像素装成预乘 `CGImage` 交给宿主 layer 的
+  `contents`，并把渲染器自己的视图 `setHidden:YES`。实测窗口 alpha 直方图分裂为 0 / 235、圆角外真透明
+  （`temp/sdl_layer.cc`）。
+  **构建加 `-D ASC_WINDOW_VIBRANT` 则再往前一步**：宿住 layer 下面垫一块 `NSVisualEffectView`
+  （material = popover、blending = behindWindow、state = active，圆角 12），未绘制的像素显示的是**毛玻璃
+  （糊过的桌面）**而不是原样桌面 —— 这是**刻意的、已登记的后端差异**（AIR 显示原桌面），所以 **opt-in、
+  默认关**，浮层面板类产品自己开。实测对照：同一个 50% 蓝矩形，开毛玻璃呈 `(31,29,152)`、不开呈
+  `(104,104,228)`（原桌面透出）。证据 `temp/sdl_layer2.cc`、`temp/aottrans/`（`vib_crop.png` / `plain_crop.png`）。
+  **平台面**：以上仅 macOS；Windows 与其它后端**没有实现**（要 `WS_EX_LAYERED` + 逐帧 alpha），故
+  **响亮报明一次**而不是给一扇不透明的假透明窗；wasm 无桌面合成器，同为空桩。
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → 构建清单加 `ASC_DISPLAY_HIGH=1`，
   窗口开 `SDL_WINDOW_ALLOW_HIGHDPI` 且 surface 按设备倍率创建物理像素（Retina 不模糊）；`standard`
   或缺省保持 1x（与 adl 一致，会被合成器拉伸）。

@@ -45,6 +45,10 @@
 #if defined(__APPLE__)
 #include <objc/message.h>
 #include <objc/runtime.h>
+// CGImage/CGDataProvider for the transparent-window present path (see
+// sk_mac_present_layer below). Plain C header, so this file stays C++.
+#include <CoreGraphics/CoreGraphics.h>
+#include <cstdlib>
 #endif
 
 extern "C" {
@@ -381,6 +385,11 @@ struct WinCtx {
   // present step has to clear the renderer to alpha 0 (SDL's default draw colour is
   // opaque black, which would paint every unpainted pixel black).
   int transparent;
+  // macOS transparent-window present path: the vibrancy backdrop view and the layer
+  // hosting view whose contents carry the frame (see sk_mac_ensure_transparent).
+  // Both NULL on every other backend and on a non-transparent window.
+  void* vib_eff;
+  void* vib_host;
   // The three style-affecting flags the descriptor / NativeWindowInitOptions carry.
   // AIR's win32 mapping is THICKFRAME <=> resizable, MAXIMIZEBOX <=> maximizable,
   // MINIMIZEBOX <=> minimizable (measured off the real window, temp/nwwin/wstyle.exe),
@@ -504,21 +513,22 @@ static int sk_id_from_window_id(Uint32 wid) {
 // macOS). The texture is created once and updated in place each frame instead of
 // being created/destroyed per frame — that per-frame churn was the dominant cost
 // at high Stage.frameRate values.
-static void present_frame(SDL_Renderer* ren, SDL_Texture* tex, void* pixels, int w, int h, int rowBytes, int transparent) {
+#if defined(__APPLE__)
+// Defined with the other transparency glue further down (it needs sk_nsrect).
+static void sk_mac_present_layer(WinCtx* c, void* pixels, int w, int h, int rowBytes);
+#endif
+
+static void present_frame(WinCtx* c, void* pixels, int w, int h, int rowBytes) {
+#if defined(__APPLE__)
+  // A transparent window does not go through SDL's renderer at all: its backing
+  // store is opaque, so the frame is handed to a CALayer instead (rationale in
+  // sk_mac_ensure_transparent below).
+  if (c->transparent) { sk_mac_present_layer(c, pixels, w, h, rowBytes); return; }
+#endif
+  SDL_Renderer* ren = c->ren;
+  SDL_Texture* tex = c->tex;
+  int transparent = c->transparent;
   if (tex == NULL) return;
-  if (getenv("ASC_TRACE_TRANSPARENT") != NULL) {
-    static int n = 0;
-    if (n == 2) {
-      SDL_RendererInfo ri; if (SDL_GetRendererInfo(ren, &ri) == 0) fprintf(stderr, "transparent: renderer=%s flags=%u\n", ri.name, ri.flags);
-      void* ml = SDL_RenderGetMetalLayer(ren);
-      fprintf(stderr, "transparent: metal_layer=%p\n", ml);
-    }
-    if (n++ == 3) {
-      const unsigned char* b = (const unsigned char*)pixels;
-      fprintf(stderr, "transparent: flag=%d corner=%d,%d,%d,%d centerA=%d\n", transparent,
-              b[0], b[1], b[2], b[3], b[(h / 2) * rowBytes + (w / 2) * 4 + 3]);
-    }
-  }
   SDL_UpdateTexture(tex, NULL, pixels, rowBytes);
   // A transparent window is cleared to alpha 0. SDL's default draw colour is opaque
   // black, so without this every pixel the display list did not paint would come out
@@ -846,7 +856,7 @@ static double sk_pump_frame(void) {
     if (!c->used || c->destroy_pending) continue;
     if (c->visible && c->dirty && c->on_redraw != NULL) {
       c->on_redraw(i);
-      if (!c->is_gpu) present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes, c->transparent);
+      if (!c->is_gpu) present_frame(c, c->pixels, c->pw, c->ph, c->rowBytes);
       c->dirty = 0;
     }
   }
@@ -1624,6 +1634,203 @@ static void sk_win_apply_style(WinCtx* c) {
 #endif
 }
 
+// The replacement for SDL's -[SDLView isOpaque]. The signature must match BOOL(id, SEL),
+// and ABI-wise BOOL is a signed char on arm64/x86_64.
+#if defined(__APPLE__)
+static signed char sk_view_is_opaque_no(void* self, SEL _cmd) { (void)self; (void)_cmd; return 0; }
+
+// Clear the two opacity flags a view contributes to compositing: the view's own
+// -isOpaque (swapped on its class, once) and its layer's opaque hint.
+static void sk_view_clear_opaque(void* view, int on) {
+  Class cls = object_getClass((id)view);
+  static Class patched[8];
+  static int patched_n = 0;
+  int seen = 0;
+  for (int i = 0; i < patched_n; i++) { if (patched[i] == cls) { seen = 1; break; } }
+  if (!seen && patched_n < 8) {
+    patched[patched_n++] = cls;
+    Method m = class_getInstanceMethod(cls, sel_registerName("isOpaque"));
+    // Only a class that actually overrides it needs swapping; NSView's own answer is
+    // already NO, and replacing the base implementation would touch every view AppKit
+    // owns (the window frame included).
+    if (m != NULL) {
+      IMP cur = method_getImplementation(m);
+      if (cur != (IMP)sk_view_is_opaque_no) method_setImplementation(m, (IMP)sk_view_is_opaque_no);
+    }
+  }
+  (void)on;
+  void* layer = ((void* (*)(void*, SEL))objc_msgSend)(view, sel_registerName("layer"));
+  if (layer != NULL) {
+    ((void (*)(void*, SEL, signed char))objc_msgSend)(layer, sel_registerName("setOpaque:"), (signed char)0);
+  }
+}
+#endif
+
+// ---- Transparent-window present path (macOS) --------------------------------
+//
+// SDL2 has no transparent-window flag (SDL_WINDOW_TRANSPARENT is SDL3's), and the
+// native route does not work either on this backend: with NSWindow.opaque = NO, a
+// clear background, both view and layer -isOpaque overridden to NO and alpha 0
+// pixels reaching the blit, the screen still showed opaque black. A 14-line bare
+// SDL program reproduces it on both the Metal and the OpenGL renderer, so it is a
+// property of SDL's backing store, not of our drawing (AGENTS.md §1.5;
+// temp/transprobe/FINDINGS.md, temp/sdltrans.cc, temp/sdltrans2.cc).
+//
+// What DOES work (temp/sdl_layer.cc, temp/sdl_layer2.cc): make the content view
+// LAYER-HOSTING — [contentView setLayer:] rather than wantsLayer — so SDLView stops
+// painting its own opaque backing store, and hand each frame to a CALayer's
+// `contents` as a CGImage instead of calling SDL_RenderPresent. The window's alpha
+// channel then reaches the window server (measured: alpha histogram 0 / 235 over the
+// whole window, rounded corners transparent).
+//
+// With ASC_WINDOW_VIBRANT an NSVisualEffectView sits UNDER the frame layer, so
+// unpainted pixels show a blurred backdrop instead of the raw desktop: the macOS
+// 毛玻璃 look, which is what a floating panel wants. That is a deliberate, documented
+// DIVERGENCE from AIR (adl shows the desktop itself), so it is opt-in and off by
+// default; see docs/zh-cn/compile.md.
+#if defined(__APPLE__)
+#define SK_OBJ(o, s) ((void* (*)(void*, SEL))objc_msgSend)((o), sel_registerName(s))
+#define SK_SET_OBJ(o, s, v) ((void (*)(void*, SEL, void*))objc_msgSend)((o), sel_registerName(s), (v))
+#define SK_SET_BOOL(o, s, v) ((void (*)(void*, SEL, signed char))objc_msgSend)((o), sel_registerName(s), (signed char)((v) ? 1 : 0))
+#define SK_SET_INT(o, s, v) ((void (*)(void*, SEL, long))objc_msgSend)((o), sel_registerName(s), (long)(v))
+#define SK_SET_DBL(o, s, v) ((void (*)(void*, SEL, double))objc_msgSend)((o), sel_registerName(s), (double)(v))
+#define SK_ALLOC(cls) ((void* (*)(void*, SEL))objc_msgSend)((void*)objc_getClass(cls), sel_registerName("alloc"))
+#define SK_NSRECT(o, s) ((sk_nsrect (*)(void*, SEL))objc_msgSend)((o), sel_registerName(s))
+#define SK_SET_RECT(o, s, r) ((void (*)(void*, SEL, sk_nsrect))objc_msgSend)((o), sel_registerName(s), (r))
+
+// NSView autoresizing bits: width + height sizable.
+#define SK_AUTORESIZE_WH 18
+// NSWindowLevel of a floating panel; the same 25 used by ak_window_set_level.
+#define SK_PANEL_LEVEL 25
+// 1 = the transparent window gets a frosted (vibrant) backdrop and rounded corners.
+#if defined(ASC_WINDOW_VIBRANT)
+#define SK_VIBRANT 1
+#else
+#define SK_VIBRANT 0
+#endif
+#define SK_PANEL_RADIUS 12.0
+
+static CGColorSpaceRef sk_cg_device_rgb(void) {
+  static CGColorSpaceRef cs = NULL;
+  if (cs == NULL) cs = CGColorSpaceCreateDeviceRGB();
+  return cs;
+}
+
+static void sk_cg_provider_release(void* info, const void* data, size_t size) {
+  (void)info; (void)size;
+  free((void*)data);
+}
+
+// Build the layer tree that replaces SDL's opaque backing store. Idempotent, and a
+// no-op on a non-transparent window.
+static void sk_mac_ensure_transparent(WinCtx* c) {
+  if (c == NULL || c->win == NULL || c->vib_host != NULL) return;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info)) return;
+  if (info.subsystem != SDL_SYSWM_COCOA) return;
+  void* nswin = (void*)info.info.cocoa.window;
+  if (nswin == NULL) return;
+  void* view = SK_OBJ(nswin, "contentView");
+  if (view == NULL) return;
+  sk_nsrect bounds = SK_NSRECT(view, "bounds");
+
+  // Layer-hosting: the view no longer draws, so the alpha the AS3 side leaves in
+  // the frame is what the window server sees. A plain wantsLayer does NOT do this —
+  // SDLView still fills its backing store with opaque black every display pass.
+  SK_SET_BOOL(view, "setWantsLayer:", 1);
+  void* container = SK_OBJ((void*)objc_getClass("CALayer"), "layer");
+  if (container != NULL) {
+    SK_SET_BOOL(container, "setOpaque:", 0);
+    SK_SET_OBJ(view, "setLayer:", container);
+  }
+  // The renderer's own view composites an opaque frame; hide it rather than tear
+  // the renderer down (other code still queries it, and a hidden view costs
+  // nothing).
+  void* subs = SK_OBJ(view, "subviews");
+  if (subs != NULL) {
+    unsigned long n = ((unsigned long (*)(void*, SEL))objc_msgSend)(subs, sel_registerName("count"));
+    for (unsigned long i = 0; i < n; i++) {
+      void* sv = ((void* (*)(void*, SEL, unsigned long))objc_msgSend)(subs, sel_registerName("objectAtIndex:"), i);
+      if (sv != NULL) SK_SET_BOOL(sv, "setHidden:", 1);
+    }
+  }
+
+#if SK_VIBRANT
+  void* eff = SK_ALLOC("NSVisualEffectView");
+  if (eff != NULL) {
+    eff = ((void* (*)(void*, SEL, sk_nsrect))objc_msgSend)(eff, sel_registerName("initWithFrame:"), bounds);
+    // Material 6 = popover, blending 0 = behindWindow (blurs what is BEHIND the
+    // window, which is what makes it read as a floating panel), state 1 = active.
+    SK_SET_INT(eff, "setMaterial:", 6);
+    SK_SET_INT(eff, "setBlendingMode:", 0);
+    SK_SET_INT(eff, "setState:", 1);
+    SK_SET_BOOL(eff, "setWantsLayer:", 1);
+    SK_SET_INT(eff, "setAutoresizingMask:", SK_AUTORESIZE_WH);
+    SK_SET_OBJ(view, "addSubview:", eff);
+    void* effl = SK_OBJ(eff, "layer");
+    if (effl != NULL) {
+      SK_SET_DBL(effl, "setCornerRadius:", SK_PANEL_RADIUS);
+      SK_SET_BOOL(effl, "setMasksToBounds:", 1);
+    }
+    c->vib_eff = eff;
+  }
+#endif
+
+  // The frame host is added LAST so it composites above the backdrop.
+  void* host = SK_ALLOC("NSView");
+  if (host == NULL) return;
+  host = ((void* (*)(void*, SEL, sk_nsrect))objc_msgSend)(host, sel_registerName("initWithFrame:"), bounds);
+  SK_SET_BOOL(host, "setWantsLayer:", 1);
+  SK_SET_INT(host, "setAutoresizingMask:", SK_AUTORESIZE_WH);
+  SK_SET_OBJ(view, "addSubview:", host);
+  void* hl = SK_OBJ(host, "layer");
+  if (hl != NULL) {
+    SK_SET_BOOL(hl, "setOpaque:", 0);
+#if SK_VIBRANT
+    SK_SET_DBL(hl, "setCornerRadius:", SK_PANEL_RADIUS);
+    SK_SET_BOOL(hl, "setMasksToBounds:", 1);
+#endif
+  }
+  c->vib_host = host;
+}
+
+// Copy the frame into a CGImage and hand it to the host layer. The copy is required:
+// the source buffer is Skia's surface, which is rewritten next frame while
+// CoreAnimation still holds the image.
+//
+// Channel order: on macOS Skia's N32 surface stores R,G,B,A bytes (see the masks in
+// sk_window_show), so the image is built as "alpha last" in RGB space. 
+static void sk_mac_present_layer(WinCtx* c, void* pixels, int w, int h, int rowBytes) {
+  sk_mac_ensure_transparent(c);
+  if (c->vib_host == NULL || pixels == NULL || w <= 0 || h <= 0) return;
+  size_t bytes = (size_t)rowBytes * (size_t)h;
+  void* copy = malloc(bytes);
+  if (copy == NULL) return;
+  memcpy(copy, pixels, bytes);
+  CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, copy, bytes, sk_cg_provider_release);
+  if (prov == NULL) { free(copy); return; }
+  CGImageRef img = CGImageCreate((size_t)w, (size_t)h, 8, 32, (size_t)rowBytes, sk_cg_device_rgb(),
+                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrderDefault,
+                                 prov, NULL, false, kCGRenderingIntentDefault);
+  CGDataProviderRelease(prov);
+  if (img == NULL) return;
+  void* hl = SK_OBJ(c->vib_host, "layer");
+  if (getenv("ASC_TRACE_TRANSPARENT") != NULL) {
+    static int n = 0;
+    if (n++ == 1) {
+      sk_nsrect hb = SK_NSRECT(c->vib_host, "frame");
+      sk_nsrect lb = hl ? SK_NSRECT(hl, "bounds") : hb;
+      double sc = hl ? ((double (*)(void*, SEL))objc_msgSend)(hl, sel_registerName("contentsScale")) : 0.0;
+      fprintf(stderr, "trace: img=%dx%d rowBytes=%d hostframe=%.0fx%.0f layerbounds=%.0fx%.0f scale=%.2f\n",
+              w, h, rowBytes, hb.w, hb.h, lb.w, lb.h, sc);
+    }
+  }
+  if (hl != NULL) SK_SET_OBJ(hl, "setContents:", (void*)img);
+  CGImageRelease(img);
+}
+#endif  // __APPLE__
+
 // Per-window transparency. SDL2 has no SDL_WINDOW_TRANSPARENT (that flag is SDL3's),
 // so the platform side has to go through the native window handle. macOS: an NSWindow
 // is opaque by default, which makes the compositor treat the whole client rect as
@@ -1637,7 +1844,6 @@ static void sk_window_apply_transparent(SDL_Window* win, int on) {
   SDL_VERSION(&info.version);
   if (!SDL_GetWindowWMInfo(win, &info)) return;
   void* nswin = (void*)info.info.cocoa.window;
-  if (getenv("ASC_TRACE_TRANSPARENT") != NULL) fprintf(stderr, "transparent: on=%d nswin=%p\n", on, nswin);
   if (nswin == NULL) return;
   ((void (*)(void*, SEL, signed char))objc_msgSend)(nswin, sel_registerName("setOpaque:"), (signed char)(on ? 0 : 1));
   void* color = on
@@ -1646,23 +1852,21 @@ static void sk_window_apply_transparent(SDL_Window* win, int on) {
   ((void (*)(void*, SEL, void*))objc_msgSend)(nswin, sel_registerName("setBackgroundColor:"), color);
   void* view = ((void* (*)(void*, SEL))objc_msgSend)(nswin, sel_registerName("contentView"));
   if (view != NULL) {
-    void* layer = ((void* (*)(void*, SEL))objc_msgSend)(view, sel_registerName("layer"));
-    if (layer != NULL) {
-      ((void (*)(void*, SEL, signed char))objc_msgSend)(layer, sel_registerName("setOpaque:"), (signed char)(on ? 0 : 1));
-    }
-    // SDL puts its own view (SDLView / SDL_cocoametalview) INSIDE the content view, and
-    // that subview's layer is the one actually composited. If it stays opaque the window
-    // shows a black rectangle behind the drawn content, so walk the (one-element) list.
+    // Every view in the window's hierarchy has to agree, on TWO levels, or the window
+    // still composites as filled: the LAYER's -isOpaque (a CALayer hint) and the
+    // VIEW's -isOpaque (what AppKit tells CoreAnimation about the backing store). SDL's
+    // SDLView and SDL_cocoametalview both override the latter to answer YES, and that
+    // answer beats NSWindow.opaque = NO -- measured on a real machine: with the window
+    // and both layer flags cleared, the plaintext window still rendered opaque black
+    // over its own alpha (temp/transprobe/aottrans.c). Swapping the method on each
+    // class we meet is the only hook short of forking SDL, and it is idempotent.
+    sk_view_clear_opaque(view, on);
     void* subs = ((void* (*)(void*, SEL))objc_msgSend)(view, sel_registerName("subviews"));
     if (subs != NULL) {
       unsigned long n = ((unsigned long (*)(void*, SEL))objc_msgSend)(subs, sel_registerName("count"));
       for (unsigned long i = 0; i < n; i++) {
         void* sv = ((void* (*)(void*, SEL, unsigned long))objc_msgSend)(subs, sel_registerName("objectAtIndex:"), i);
-        if (sv == NULL) continue;
-        void* sl = ((void* (*)(void*, SEL))objc_msgSend)(sv, sel_registerName("layer"));
-        if (sl != NULL) {
-          ((void (*)(void*, SEL, signed char))objc_msgSend)(sl, sel_registerName("setOpaque:"), (signed char)(on ? 0 : 1));
-        }
+        if (sv != NULL) sk_view_clear_opaque(sv, on);
       }
     }
   }
@@ -1678,6 +1882,25 @@ static void sk_window_apply_transparent(SDL_Window* win, int on) {
       fprintf(stderr, "window_glue: transparent windows are not implemented on this backend\n");
     }
   }
+#endif
+}
+
+// The renderer's own layer. SDL's macOS renderer is the Metal one (verified with
+// SDL_GetRendererInfo: name="metal"), and it composites through a CAMetalLayer that
+// SDL leaves OPAQUE. Work is therefore split in two: this function kills the layer's
+// opacity, sk_window_apply_transparent above kills the NSWindow's. Both are needed --
+// dropping only one leaves an opaque black rectangle behind the drawn content (that is
+// exactly what the first implementation did on a real machine: window pixels carried
+// alpha 0 and reached here, and the screen still showed black).
+static void sk_renderer_apply_transparent(SDL_Renderer* ren, int on) {
+  if (ren == NULL) return;
+#if defined(__APPLE__)
+  void* layer = SDL_RenderGetMetalLayer(ren);
+  if (layer != NULL) {
+    ((void (*)(void*, SEL, signed char))objc_msgSend)(layer, sel_registerName("setOpaque:"), (signed char)(on ? 0 : 1));
+  }
+#else
+  (void)on;
 #endif
 }
 
@@ -1814,6 +2037,15 @@ static int sk_attach_cpu(WinCtx* c) {
   // cadence stays uniform (and smooth) on every display. SDL_RenderSetVSync has
   // existed since SDL 2.0.18; we pin 2.32.
   SDL_RenderSetVSync(ren, 1);
+  // A transparent window's layer has to be re-flagged here, not in sk_open_window:
+  // the renderer (and with it the CAMetalLayer) only exists once this returns. The
+  // view-level pass has to run again for the same reason -- SDL adds its render view
+  // as a SUBVIEW when the renderer is created, so the walk done at window creation
+  // time never saw it, and that view answers -isOpaque YES.
+  if (c->transparent) {
+    sk_renderer_apply_transparent(ren, 1);
+    sk_window_apply_transparent(c->win, 1);
+  }
   return 1;
 }
 
@@ -1916,7 +2148,7 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   // format is derived from the exact channel masks so it can never mismatch.
   c->tex = SDL_CreateTexture(c->ren, c->pixfmt, SDL_TEXTUREACCESS_STREAMING, pw, ph);
   if (c->tex != NULL) SDL_SetTextureBlendMode(c->tex, SDL_BLENDMODE_NONE);
-  present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes, c->transparent);
+  present_frame(c, c->pixels, c->pw, c->ph, c->rowBytes);
 
   // Register the live-resize filter so a drag keeps rendering (see WinCtx).
   SDL_AddEventWatch(live_resize_watch, c);
@@ -2253,7 +2485,10 @@ void sk_window_set_visible(int id, int visible) {
     // Re-apply the transparency once the view hierarchy is really on screen: the
     // content view's layer may not exist yet when the constructor asked (a window
     // created by the program is transparent BEFORE it is ever shown).
-    if (c->transparent) sk_window_apply_transparent(c->win, 1);
+    if (c->transparent) {
+      sk_window_apply_transparent(c->win, 1);
+      sk_renderer_apply_transparent(c->ren, 1);
+      }
   }
   else SDL_HideWindow(c->win);
 }
@@ -2960,6 +3195,7 @@ void sk_window_set_transparent(int id, int on) {
   if (c == NULL) return;
   c->transparent = on ? 1 : 0;
   sk_window_apply_transparent(c->win, c->transparent);
+  sk_renderer_apply_transparent(c->ren, c->transparent);
   c->dirty = 1;
 }
 

@@ -2487,9 +2487,40 @@ function checkInitialWindowStyle(): string[] {
     && /void sk_window_set_transparent\(int id, int on\) \{/.test(glueWin)
     && /#ifdef ASC_WINDOW_TRANSPARENT\n  if \(is_main\) transparent = 1;\n#endif/.test(glueWin));
   check('the transparent flag reaches the present step (an opaque clear would paint black)',
-    /static void present_frame\(SDL_Renderer\* ren, SDL_Texture\* tex, void\* pixels, int w, int h, int rowBytes, int transparent\)/.test(glueWin)
+    /static void present_frame\(WinCtx\* c, void\* pixels, int w, int h, int rowBytes\)/.test(glueWin)
     && /if \(transparent\) SDL_SetRenderDrawColor\(ren, 0, 0, 0, 0\);/.test(glueWin)
-    && (glueWin.match(/present_frame\(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes, c->transparent\)/g) ?? []).length === 2);
+    && (glueWin.match(/present_frame\(c, c->pixels, c->pw, c->ph, c->rowBytes\)/g) ?? []).length === 2);
+  // A transparent window does not go through SDL's renderer at all. Measured on a real
+  // machine: SDL's backing store is opaque and a bare 14-line SDL program reproduces it
+  // on both the Metal and the OpenGL renderer (temp/transprobe/FINDINGS.md,
+  // temp/sdltrans.cc), so the frame goes to a CALayer instead (temp/sdl_layer.cc).
+  check('a transparent frame is presented through a CALayer, never SDL_RenderPresent',
+    /if \(c->transparent\) \{ sk_mac_present_layer\(c, pixels, w, h, rowBytes\); return; \}/.test(glueWin)
+    && /static void sk_mac_present_layer\(WinCtx\* c, void\* pixels, int w, int h, int rowBytes\);/.test(glueWin));
+  // Layer-HOSTING (setLayer:) is the load-bearing bit: with a plain wantsLayer SDLView
+  // keeps filling its backing store with opaque black every display pass.
+  check('the content view is made layer-hosting so SDLView stops painting its opaque store',
+    /SK_SET_BOOL\(view, "setWantsLayer:", 1\);/.test(glueWin)
+    && /SK_SET_OBJ\(view, "setLayer:", container\);/.test(glueWin)
+    && /if \(sv != NULL\) SK_SET_BOOL\(sv, "setHidden:", 1\);/.test(glueWin));
+  // The surface's own channel order is R,G,B,A bytes on macOS Skia (see the masks in
+  // sk_window_show), i.e. "alpha last" in RGB space -- NOT the BGRA-first layout that
+  // looks like the same thing. Getting it wrong swaps red and blue.
+  check('the frame is handed over as a premultiplied CGImage in the surface\'s own order',
+    /kCGImageAlphaPremultipliedLast \| kCGBitmapByteOrderDefault/.test(glueWin)
+    && /SK_SET_OBJ\(hl, "setContents:", \(void\*\)img\);/.test(glueWin)
+    && /CGDataProviderCreateWithData\(NULL, copy, bytes, sk_cg_provider_release\)/.test(glueWin));
+  check('ASC_WINDOW_VIBRANT puts an NSVisualEffectView under the frame (the 毛玻璃 divergence)',
+    /#if defined\(ASC_WINDOW_VIBRANT\)\n#define SK_VIBRANT 1\n#else\n#define SK_VIBRANT 0\n#endif/.test(glueWin)
+    && /SK_ALLOC\("NSVisualEffectView"\)/.test(glueWin)
+    && /SK_SET_INT\(eff, "setMaterial:", 6\);/.test(glueWin)
+    && /SK_SET_INT\(eff, "setBlendingMode:", 0\);/.test(glueWin)
+    && /SK_SET_INT\(eff, "setState:", 1\);/.test(glueWin));
+  // A selector literal without its trailing colon is an unrecognised-selector CRASH at
+  // run time (-[SDLView setWantsLayer]), and it compiled cleanly twice while this block
+  // was written -- the macros cannot catch it.
+  check('every SK_SET_* selector literal carries its trailing colon',
+    !/SK_SET_(?:BOOL|INT|DBL|OBJ)\([^,\n]+,\s*"set[A-Za-z]+"/.test(glueWin));
   check('a program-made window hands its own flag to the platform layer',
     c.includes('if (w->transparent) as_window_set_transparent(id, 1);'));
   check('the compose step clears to alpha 0 for a transparent window, not to the stage colour',

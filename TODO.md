@@ -15241,7 +15241,78 @@ Windows 那一支按 AGENTS「不给无法本机验证的平台写盲代码」�
 （动态写 `#1074`、静态写编译不过），我们这边仍是**普通字段**（照收）⇒ 需要把它们改成
 `Event_get_*` 访问器并同步 AMF 成员表与 `Event_props`，波及面远大于本阶段。已入遗留表。
 
+
+### 阶段二百五十九：透明窗的 macOS 呈现路径 + `ASC_WINDOW_VIBRANT` 毛玻璃（v0.4.222 → v0.4.223）✅ 已完成
+
+**一、上一阶段只解决了「语义」，没解决「像素」**
+
+阶段二百五十七 把 `<transparent>` 与 `NativeWindowInitOptions.transparent` 一路接到
+`NSWindow setOpaque:NO` + 视图/layer 非不透明 + 合成步清 alpha 0，`nativeWindow.transparent`
+读回正确；但真机截图上未绘制区域**仍是不透明黑**。本阶段先把这条边界量死：
+
+| 探 | 结果 |
+|---|---|
+| 送到 `present_frame` 的像素是不是真的 alpha 0 | **是**（诊断打印：`corner=0,0,0,0 centerA=0`） |
+| `NSWindow.isOpaque` / `SDLView.isOpaque` / 两个子视图的 layer | 全部 **0**（已清干净） |
+| `NSWindow.alphaValue = 0.5` 时空白区 | `(225,234,238)` → `(112,117,119)` = 0.5×**黑** + 0.5×桌面 ⇒ 合成器把内容当 **alpha=1** |
+| 同样 0.5 下红色块内 | `(226,234,238)` → `(230,142,136)` = 0.5×红 + 0.5×桌面 ⇒ 窗口级 alpha 本身是通的 |
+| **14 行、零 as3compiler 符号的裸 SDL2 程序**（Metal 与 OpenGL 两个渲染器） | **同样不透明** |
+
+最后一行是判据落点：按 AGENTS §1.5，这是**后端边界**，不是我们的语义错。
+证据 `temp/transprobe/FINDINGS.md`、`temp/sdltrans.cc`、`temp/sdltrans2.cc`。
+
+**二、哪条路真的通（纯 Cocoa 对照 + SDL 复现）**
+
+先用 40 行纯 Cocoa 探针（`temp/ns_vib.cc`：非不透明无边框窗 + `NSVisualEffectView` +
+带预乘 `CGImage` 的 `CALayer`）证明**这台机器上逐像素 alpha 与毛玻璃都能成立**：
+窗口截图 alpha 直方图 0 / 255 分裂、圆角外 alpha 0、屏幕区可见模糊。
+再用 SDL 复现同一套做法（`temp/sdl_layer.cc` / `temp/sdl_layer2.cc`），得出一条**决定性差别**：
+
+- `[contentView setWantsLayer:YES]` 不够 —— `SDLView` 仍每帧往自己的 backing store 铺不透明黑，
+  于是「我们这块 layer 的 alpha 0」下面是它那片黑（这正是阶段二百五十七 在真机上看到的现象）；
+- **`[contentView setLayer:container]`（layer-hosting）** 才行：视图自己不再绘制，窗口的 alpha 通道
+  才到达窗口服务器。实测窗口 alpha 直方图 `0: 214567 / 235: 25433`、圆角外 576 像素 alpha 0；
+- 毛玻璃要**在内容 layer 之下**：把 `NSVisualEffectView` 作为子视图先加、内容宿主视图后加，顺序才稳定
+  （早一版把内容当「视图 layer 的 sublayer」加，被 AppKit 重排到下面，整个毛玻璃盖住了内容）。
+
+**三、落地（`vendor/window_glue.cc`）**
+
+1. `present_frame` 改为吃 `WinCtx*`；**透明窗一开始就分流**：
+   `if (c->transparent) { sk_mac_present_layer(c, pixels, w, h, rowBytes); return; }` ——
+   透明窗**完全不进 SDL 渲染器**（两个调用点同步改）。
+2. 新增 `sk_mac_ensure_transparent(WinCtx*)`（幂等，首次呈递时建）：
+   layer-hosting 内容视图 → 隐藏渲染器自带的子视图 → `ASC_WINDOW_VIBRANT` 时先加
+   `NSVisualEffectView`（material **6 = popover**、blending **0 = behindWindow**、state **1 = active**、
+   圆角 12 + `masksToBounds`）→ 再加内容宿主视图（同样圆角裁剪）。
+3. 新增 `sk_mac_present_layer`：拷贝一帧像素 → `CGDataProviderCreateWithData`（自带释放回调）→
+   `CGImageCreate(..., kCGImageAlphaPremultipliedLast | kCGBitmapByteOrderDefault)` → 设宿主 layer 的
+   `contents`。**通道序是承重的**：Skia 在 macOS 的 N32 是内存里 R,G,B,A（见 `sk_window_show` 的掩码注释），
+   即 RGB 空间的「alpha 最后」；写成 `PremultipliedFirst|ByteOrder32Little` 会把红蓝互换。
+4. 拷贝是必需的：源缓冲是 Skia 的 surface，下一帧就被重写，而 CoreAnimation 仍持有那张图。
+
+**四、毛玻璃是「已登记的后端差异」，因此 opt-in**
+
+AIR 的 `<transparent>` 语义是**让原桌面透出来**；毛玻璃显示的是**糊过的桌面**。两者不同，
+故 `ASC_WINDOW_VIBRANT` **默认关**：不定义时窗口是 AIR 语义（原桌面透出），定义时才是面板的
+毛玻璃底。实测对照（同一个 50% 蓝矩形盖满窗口）：**开** `(31,29,152)`、**不开** `(104,104,228)`。
+证据 `temp/aottrans/vib_crop.png` / `plain_crop.png`（同一扇 300×200、x=300 y=300 的窗）。
+
+**五、验收**
+
+- 单元组 `unit: platform/InitialWindowStyle` 新增 **6 钉**：`present_frame(WinCtx*,…)` 签名与两条调用点、
+  透明窗分流、layer-hosting 三件套（`setWantsLayer:` / `setLayer:` / 子视图 `setHidden:`）、
+  预乘 `CGImage` 的通道序、`ASC_WINDOW_VIBRANT` 的 material/blending/state，
+  **以及「每个 `SK_SET_*` 选择器字面量必须带冒号」**——这正是本轮踩到的坑：漏冒号编得过、跑起来是
+  `-[SDLView setWantsLayer]: unrecognized selector` 直接崩，宏帮不上忙。
+- 真机双跑：开/不开 `ASC_WINDOW_VIBRANT` 各构建一次 `temp/aottrans/`，窗口截图的 alpha 直方图与屏幕区取色见上。
+
+**六、残留**
+
+Windows/其它后端仍未实现透明窗（要 `WS_EX_LAYERED` + 逐帧 alpha），胶水照旧**报明一次**；
+该行在遗留表里只剩 Windows 侧，本阶段不改表。
+
 ### 遗留待开发
+> **2026-10-23 追加（阶段二百五十九：透明窗的 macOS 呈现路径 —— 先证「裸后端也不行」再换实现）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 106 项**。上一阶段把透明窗的**语义**接好了，本阶段才发现**像素**没通；而判断「是我们的错还是后端的错」只靠一件事：**一份 14 行、零 as3compiler 符号的裸 SDL2 程序也复现不透明**，于是按 AGENTS §1.5 归为后端边界（不登记为缺陷）。落地方式随之从「给 SDL 的窗打补丁」换成「透明窗**绕过 SDL 渲染器**、改走 CALayer 的 `contents`」，并把毛玻璃作为**刻意差异**放进 opt-in 宏 `ASC_WINDOW_VIBRANT`（AIR 显示原桌面、我们显示糊过的桌面 ⇒ 默认关）。**证据**：`temp/transprobe/FINDINGS.md`、`temp/sdltrans.cc`、`temp/sdltrans2.cc`、`temp/ns_vib.cc`、`temp/sdl_layer.cc`、`temp/sdl_layer2.cc`、`temp/aottrans/{vib_crop.png,plain_crop.png}`、`test/unit/platform.ts` 六条新钉。
 > **2026-10-23 追加（阶段二百五十八：`flash.events.ScreenMouseEvent` —— 先量「谁派发它」再决定要不要写）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**106 项**（`未开始` **78** / `部分完成` 19 / `已修` **6** / `已记录` 2 / `调研完成·实现暂缓` 1）。**改写的 1 行**是阶段二百五十五 收尾时登记的「`ScreenMouseEvent` 整类未实现」⇒ 转为 `已修`。**新登记的 1 行**是量动态写只读 trait 时顺手量出来的**族级**差异：`Event` 的 `type`/`bubbles`/`cancelable`/`target` 在 `adl` 里是**只读访问器**（动态写抛 `#1074`、报文写**接收者**的类），我们这边是**普通字段**（照收）。**这一轮真正学到的是「事件类的形状要先问它由谁派发」**：`ScreenMouseEvent` 的 `describeType` 面（六个常量、两个只读属性、11 个形参）都能量，但**派发者**不能猜 —— 探针证明 `adl` 上真实舞台鼠标事件 `is ScreenMouseEvent` 恒 **false**，它只由 `SystemTrayIcon` 派发，而 macOS 没有系统托盘 ⇒ 它在我们这里是**纯数据类**（与 `TouchEvent` 同属「只由用户代码构造」），不需要任何胶水、也不需要假装派发。**顺带量清的两条通用规则已写进运行时**：动态写命中「getter 无 setter」→ `#1074`、命中「方法名」→ `#1037`、都不命中才是原来的 `#1056`（都按接收者类报，且在 `_dyn` 兜底**之前**判）。**证据**：`temp/smeprobe/`（`Probe.as`/`Probe2.as`/`Probe3.as`/`Probe4.as` 四轮 `adl` 探针 + AOT 侧 `AotSme.as` 逐行对照，两端逐字相同）、`test/unit/emit.ts` 的 `unit: emit/ScreenMouseEvent`（21 钉）、`examples/screen-mouse-event.as`（27 断言）。
 > **2026-10-23 追加（阶段二百五十七：`<transparent>` 与 `NativeWindowInitOptions.transparent` 真的透传）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 表内项数**保持 105 项**（五档分状态不变）。**改写的 1 行**是「窗口几何的 Windows 端残余」：它的 ① 原来写「`<transparent>` 未接线，两端都没有真透明窗」——本阶段把**生成侧与 macOS 侧**全部接上（描述符 → `ASC_WINDOW_TRANSPARENT` → 主窗、`NativeWindowInitOptions` → `sk_window_set_transparent`、合成步与呈现步清 alpha 0、`NSWindow setOpaque:NO` + 内容视图及其子视图 layer 全设非不透明），故该行**收窄到只有 Windows 的原生实现**（要 `WS_EX_LAYERED` + 逐帧 alpha；当前胶水**报明一次**，不给假透明窗）。**不占表**的理由与 G1/G2 相同：`adl` 给得出真透明窗、我们给不出 ⇒ §1.5 的**遗留欠账**，阶段内修净。**证据**：`temp/transprobe/`（`adl` 侧 `Trans.as` + AOT 侧 `AotTrans.as` 双端孪生，含截图）、`test/unit/platform.ts` 五条源级钉。
 > **2026-10-23 追加（阶段二百五十六：`DockIcon.bitmaps` 上屏 —— 先实测「AIR 用哪张」再写一行 C）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**104 → 105 项**（`未开始` **79 → 78**、`已修` **4 → 5**、`已记录` **1 → 2**，其余不变）。**改写的 1 行**是阶段二百五十五 登记的那条「`DockIcon.bitmaps` 不上屏」⇒ 转为 `已修`。**新登记的 1 行**是落地时**量出来、但刻意不跟**的一处渲染差异：AIR 交给 AppKit 的字节已经是预乘的、却按直通 alpha 声明，AppKit 于是又乘一遍 ⇒ 半透明像素是 `a²·src + (1-a)·bg`（整体偏暗），我们是正确的 `a·src + (1-a)·bg`。不透明像素两端**逐字节相同**，所以普通图标看不出差；但圆角图标的抗锯齿边会出现暗边，照抄它等于故意实现一个变暗 bug，故**如实登记而不修**。**证据**：`temp/dockprobe/`（`adl` 侧八轮选图 + 四象限取色）、`temp/dockquad.as`/`temp/dockblend.as`（AOT 侧同一位图）、`docs/{zh-cn,en}/desktop.md` §3.1/§7.6。
