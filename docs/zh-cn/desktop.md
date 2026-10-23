@@ -30,12 +30,12 @@
 | `Icon` | ✅ 实现 | **可实例化**（`new Icon()` 合法），`bitmaps` 默认 `null`（读它抛 `#1009`） |
 | `InteractiveIcon` | ✅ 实现（模型层） | `new InteractiveIcon()` 抛 `#2012`；`width`/`height` 是派生只读 |
 | `DockIcon` | ✅ 实现（含 Dock 右键菜单 + 位图上屏） | `new DockIcon()` 抛 `#2012`；选图规则与透明度见 §3.1、§7.6 |
-| `SystemTrayIcon` | ✅ 实现（模型层） | macOS 上 AIR 自己不提供（`#2012`），我们同样不提供 |
+| `SystemTrayIcon` | ✅ 实现（模型层；**`--features tray` 时接真 `NSStatusItem`**） | macOS 上 AIR 自己不提供（`#2012`），**默认**我们同样不提供；打开增强开关后同一段 AS3 拿到真状态项（见 [`enhancements.md`](enhancements.md) §4.11） |
 | `NativeApplication.icon` | ✅ | **只读**（`mxmlc` 报「属性 icon 为只读」）；进程内单例 |
 | `NativeApplication.menu` | ✅ | 可读可写；`= null` 在 `adl` 上**崩溃**，我们**报明并保持原状**（§7.1） |
 | `NativeApplication.autoExit` | ✅ | 行为是真的：`false` + 无可见窗口时进程仍驻留 |
 | `supportsDockIcon` / `supportsMenu` | ✅ | 只在 `ASC_USE_WINDOW && __APPLE__` 报 `true`（§2） |
-| `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ 恒 `false` | 与本后端实际能力一致（§2） |
+| `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ 恒 `false`（`supportsSystemTrayIcon` 在 `--features tray` 下为 `true`） | 默认与本后端实际能力一致（§2）；托盘开关见 [`compile.md`](compile.md) §3.4.5 |
 | `NativeMenu` / `NativeMenuItem` | ✅ 全成员 | 列表语义、错误号、拷贝语义逐项对 `adl`（§4、§5） |
 | `NativeMenu.display()` | ⚠️ 报明 | 本后端跑不了模态原生菜单（§7.3） |
 | `keyEquivalentModifiers` | ⚠️ 报明 | 键绑上了，修饰键位**没有**翻译（§7.2） |
@@ -260,7 +260,7 @@ Windows 侧将来接 `HWND` 菜单栏是**独立阶段**的事；wasm 没有原�
 
 ## 9. 未做（不属于本阶段）
 
-- **G4b：macOS 菜单栏 `NSStatusItem`** —— 属**增强**（AIR 在 macOS 上没有对应物：`supportsSystemTrayIcon`
-  = `false`），必须 opt-in，**本阶段未实施**。可行性探针已通过（`temp/statusprobe/statusprobe.mm`：
-  SDL 窗口 + `NSStatusBar` + `NSMenu`，点击回调经 SDL 自己的 Cocoa 泵派发，无需手写 `NSEvent` 泵）。
-  设计上它以纯 AIR `DockIcon` 形态为退路（Dock 图标 + Dock 右键菜单 + `autoExit=false`）。
+- ~~**G4b：macOS 菜单栏 `NSStatusItem`**~~ —— **已实施（阶段二百六十）**：属**增强**（AIR 在 macOS 上没有
+  对应物：`supportsSystemTrayIcon` = `false`），故做成 opt-in 具名开关 `--features tray`；默认产物仍与 AIR
+  逐字同形（`false` + `#2012`）。行为、坐标口径、真机证据与已知边界见
+  [`enhancements.md`](enhancements.md) §4.11 与 [`compile.md`](compile.md) §3.4.5。

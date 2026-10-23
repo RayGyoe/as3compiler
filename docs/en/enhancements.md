@@ -71,15 +71,15 @@ macro directly:
 | | `-D ASC_USE_SVG=1` | `--features svg` |
 |---|---|---|
 | Discoverability | The macro name appears only in the docs body | `--help` lists the names; errors list the known names too |
-| Typos | Silently ineffective (clang ignores unused macros) — **exactly what (b) forbids** | `unknown feature 'sgg' (known: formats, raw, svg)` and exits before generating code |
+| Typos | Silently ineffective (clang ignores unused macros) — **exactly what (b) forbids** | `unknown feature 'sgg' (known: formats, raw, svg, tray)` and exits before generating code |
 | Cross-end capability | The user must know web cannot build it | `feature 'svg' is not available with --target wasm` stated directly (criterion c) |
 | Once enabled | Silent | A build banner names it `== enhancements: svg (-D ASC_USE_SVG=1) ==`, and states explicitly that this is an AIR superset |
 | Set semantics | Can only append | `--features` **replaces** the whole set (`-D` appends), so "keep only X" is expressible; `--features none` clears it |
 
 **Only channels that are truly implemented end-to-end are registered as names.** Registering an unimplemented
 switch is worse than not providing one — it gives the user something that "looks enabled but is not actually
-compiled in". So three are currently registered: `svg` (E1), `formats` (E3), `raw` (E4); E2 (Lottie) will be
-registered once implemented. The table below lists the currently effective names and macros (`--help` and the
+compiled in". So four are currently registered: `svg` (E1), `formats` (E3), `raw` (E4), `tray` (E19); E2
+(Lottie) will be registered once implemented. The table below lists the currently effective names and macros (`--help` and the
 error text both list them):
 
 | Name | Macro | Available compile targets | Channel opened |
@@ -87,6 +87,7 @@ error text both list them):
 | `svg` | `ASC_USE_SVG=1` | native | E1: `Loader` decodes SVG (web has no svg/sksg/expat archives) |
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | native / wasm | E3: extra image formats WebP / BMP / ICO |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | native | E4: camera RAW / DNG (web has no piex/dng_sdk archives) |
+| `tray` | `ASC_USE_TRAY=1` | native (**and the host must be macOS**) | E19: `SystemTrayIcon` behind a real `NSStatusItem` (AIR has no system tray on macOS at all) |
 
 **Default refusal (stage ninety-four · twenty-five)**: the E3/E4 channels were previously "usable with zero
 code" — our Skia already carries those codecs, so the **default output was wider than AIR**: AIR reports
@@ -155,6 +156,7 @@ be `Error #2124: Loaded file is an unknown type.`, so "supporting SVG" is an enh
 | E14 | **Frame recording / deterministic replay** | ✗ | Self-held by the runtime (frame boundaries, events, and the random source are all in our hands) | both ends | medium |
 | E15 | **Readable C as a first-class deliverable** (embeddable in a host project / hand-auditable) | ✗ | **already promised** (README: "keep the `.c` for readability") | both ends | already have |
 | E16 | **Display refresh-rate query** (`VsyncStateChangeAvailabilityEvent.refreshRate`) | ✗ **no refresh-rate query API at all** (measured: `adl 51.4.1` dispatches `vSyncStateChangeAvailability` once with only a read-only `available=false`) | ✅ **implemented**: the event gains a read-only `refreshRate:Number` (the constructor's 5th, **optional** parameter, default `0`); dispatched once at the first known frame after startup, and again each time the window lands on a display of a different rate | both ends (**web/offscreen has no counterpart ⇒ honestly does not dispatch**, no faking `0`) | **done** |
+| E19 | **macOS menu-bar status item** (`flash.desktop.SystemTrayIcon` behind a real `NSStatusItem`) | ✗ **does not exist on this platform**: measured on `adl 51.4.1` / macOS, `NativeApplication.supportsSystemTrayIcon` is `false` and `new SystemTrayIcon()` throws `#2012` | ✅ **implemented, opt-in named switch `--features tray`**: the default build still reports `supportsSystemTrayIcon=false` + `#2012` (verbatim AIR); with the switch on the same AS3 gets a real status item, a click dispatches `ScreenMouseEvent` (`click`/`rightClick` with screen coordinates and modifiers), and `menu` rides the same tag channel as the app/Dock menus (see §4.11) | native / macOS host | **done (opt-in)** |
 
 ---
 
@@ -563,6 +565,51 @@ being 5.4× off is a different matter (an `int`↔`double` round-trip dependency
 **Evidence**: `temp/simdprobe/{saxpy.as,saxpy_fn.as,hand.c,hand_small.c,serial.c}`; the evidence includes the
 `-Rpass` reports and the disassembly of `main` (**3** `cbz` null guards + **4** `length` comparisons + 5
 branches per element).
+
+---
+
+### 4.11 E19 — macOS menu-bar status item (`SystemTrayIcon`) — ✅ **done (opt-in)**
+
+- **Verdict** (AGENTS §1.5 hard criterion): on **macOS**, `adl 51.4.1` reports
+  `NativeApplication.supportsSystemTrayIcon == false` and `new SystemTrayIcon()` throws
+  `Error #2012: SystemTrayIcon$ class cannot be instantiated.` ⇒ AIR has **no counterpart on this platform**
+  ⇒ building one is an **enhancement**, not closing a gap. (The same AS3 does have a tray under AIR on
+  Windows, so this is "AIR does not support it here", not "AIR does not support it" — which is exactly why it
+  must be opt-in: the default artifact has to match the AIR of *this* platform.)
+- **Switch**: `--features tray` (= `-D ASC_USE_TRAY=1`). The available target is `native`, **and the host has
+  to be macOS** — a `native` build is a binary for *this* machine, so that can be validated up front; on any
+  other host it reports `feature 'tray' needs a darwin host` instead of handing over a switch that does
+  nothing.
+- **Default (switch off)**: `supportsSystemTrayIcon` stays `false`, `new SystemTrayIcon()` still throws
+  `#2012`, and **nothing appears in the menu bar**. Nailed by `unit: emit/SystemTrayIcon` (33 checks).
+- **Behaviour once on** (all measured — evidence at the end of this section):
+  - Construction installs an `NSStatusItem` (`NSVariableStatusItemLength`); the first valid bitmap in
+    `bitmaps` becomes the image (**straight ARGB, premultiplied once in the glue** — the same rule as the Dock
+    icon), `tooltip` is applied verbatim, and `menu` is flattened into an `NSMenu` attached to the item.
+  - **A click dispatches `ScreenMouseEvent`**: left → `MouseEvent.CLICK`, right → `MouseEvent.RIGHT_CLICK`,
+    with `screenX`/`screenY` = the **clicked point** in screen points (top-left origin),
+    `commandKey`/`controlKey`/`altKey`/`shiftKey` from the live modifiers, `isRelatedObjectInaccessible=false`.
+  - **Menu item clicks** go through `as_menu_click_cb`, i.e. the **same tag channel** as the app / Dock menus:
+    the `NativeMenuItem` and its containing `NativeMenu` each receive one `Event.SELECT`. All three install
+    targets share one tag table; the tray's slice starts after `appItems + dockItems`.
+- **Cross-platform divergence (stated explicitly)**: the same AS3 throws `#2012` under `adl` (macOS) and gets a
+  real status item here — a **deliberate divergence**, visible only to programs that explicitly open the
+  switch. On web/WASI the switch is pre-rejected.
+- **Known limits (registered honestly, not glossed over)**:
+  - **One status item per process**: a second `new SystemTrayIcon()` reuses the same menu-bar slot (the glue
+    early-returns on `g_tray_created`), i.e. "the last constructed icon owns it". AIR has no macOS behaviour to
+    copy and the Windows side was not measured here, so the most conservative semantics are fixed and
+    documented.
+  - **`keyEquivalent` modifiers are not mapped** for the tray menu: the same existing rule as the app/Dock
+    menus, registered in `TODO.md`'s legacy table.
+  - **No Windows-style balloon notifications** (AIR's `SystemTrayIcon` has no such thing to begin with).
+- **Evidence**: real-machine acceptance — the item shows up in the menu bar (`menubar.png`); the
+  `ScreenMouseEvent` `screenX`/`screenY` match the AX-reported item position point for point
+  (AX `(1110,7) 40x24` vs click `(1130,19)`); right click → `rightClick`; a menu item click yields
+  `Event.SELECT` (`temp/trayprobe/live-log.txt`: `CLICK` / `RIGHT_CLICK` / `MENU SELECT from Open Panel`).
+  Example `examples/status-item.as` (23 assertions, manifest with `features: ["tray"]`); unit groups
+  `unit: emit/SystemTrayIcon` (33 checks) plus 8 checks in `[features]` (including two reverse controls:
+  "the default build does not link `statusitem_glue.cc`" and "a non-macOS host is refused").
 
 ---
 

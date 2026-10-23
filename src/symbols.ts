@@ -4463,7 +4463,11 @@ export class SymbolTable {
         ['bitmaps', nmSet('Icon', 'Array')],
       ]),
       constructor: { params: [] },
-      superClass: 'Object',
+      // measured (temp/trayprobe/Sup.as, adl 51.4.1): getQualifiedSuperclassName(Icon)
+      // is 'flash.events::EventDispatcher' -- NOT Object. It matters the moment an icon
+      // has to dispatch something (SystemTrayIcon's ScreenMouseEvent): with the wrong
+      // base, addEventListener would not even compile on an Icon-typed receiver.
+      superClass: 'EventDispatcher',
       isFinal: false,
       isDynamic: true,
       implements: [],
@@ -4539,6 +4543,9 @@ export class SymbolTable {
       setters: new Map([
         ['tooltip', nmSet('SystemTrayIcon', 'String')],
         ['menu', nmSet('SystemTrayIcon', 'NativeMenu')],
+        // The OVERRIDE is what pushes the image to the status item: the inherited
+        // InteractiveIcon setter only keeps width/height in step (阶段二百六十).
+        ['bitmaps', nmSet('SystemTrayIcon', 'Array')],
       ]),
       constructor: { params: [] },
       superClass: 'InteractiveIcon',
@@ -4663,6 +4670,12 @@ export class SymbolTable {
         ['ROLL_OUT', mec('MouseEvent', 'rollOut')],
         ['DOUBLE_CLICK', mec('MouseEvent', 'doubleClick')],
         ['MOUSE_WHEEL', mec('MouseEvent', 'mouseWheel')],
+        // The three right-button constants were missing (阶段二百六十): they are
+        // AIR-defined members, and without them the tray's RIGHT_CLICK could only
+        // be listened for with a string literal. Values measured on adl 51.4.1.
+        ['RIGHT_CLICK', mec('MouseEvent', 'rightClick')],
+        ['RIGHT_MOUSE_DOWN', mec('MouseEvent', 'rightMouseDown')],
+        ['RIGHT_MOUSE_UP', mec('MouseEvent', 'rightMouseUp')],
       ]),
       staticMethods: new Map(),
       getters: new Map(),

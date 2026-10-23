@@ -5784,6 +5784,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('gc_mark_ptr((void*)as_focus_obj);');
     this.line('gc_mark_ptr((void*)as_tab_anchor);');
     this.line('gc_mark_ptr((void*)ASC_native_app);');
+    // The flash.desktop icon family and the menus an app installs are reached ONLY
+    // through these C statics: NativeApplication.icon's DockIcon singleton, the tray
+    // icon, the app/Dock/tray NativeMenus, and the tag array that maps a clicked
+    // native menu tag back to its NativeMenuItem. The Cocoa side holds raw pointers
+    // to the same objects, so a collection between frames would leave the menu bar /
+    // status item pointing at reclaimed memory (阶段二百六十 found the tag array and
+    // the DockIcon singleton missing from this list).
+    this.line('gc_mark_ptr((void*)ASC_icon_singleton);');
+    this.line('gc_mark_ptr((void*)ASC_tray_icon);');
+    this.line('gc_mark_ptr((void*)ASC_app_menu);');
+    this.line('gc_mark_ptr((void*)ASC_dock_menu);');
+    this.line('gc_mark_ptr((void*)ASC_tray_menu);');
+    this.line('gc_mark_ptr((void*)ASC_menu_tags);');
     // An in-flight startDrag(): the dragged object and its bounds rectangle are held
     // only by these C statics, and a drag outlives the event that started it.
     this.line('gc_mark_ptr(ASC_drag_obj);');
@@ -9669,11 +9682,29 @@ static void as_menu_sync(NativeMenu* from) {
     dockItems = c.nitems;
     sk_menu_install_dock(c.menus, c.nmenus, c.items, c.nitems, idx, as_menu_click_cb);
   }
+#if ASC_HAS_TRAY
+  // The status item's menu: the third install target. Same tag table, so a click
+  // comes back through as_menu_click_cb exactly like an app- or Dock-menu click.
+  if (ASC_tray_menu != NULL) {
+    int n = as_menu_measure(ASC_tray_menu, 0);
+    as_menu_ctx c;
+    c.nmenus = 0; c.nitems = 0; c.tag_base = appItems + dockItems;
+    c.capmenus = 0; c.capitems = n;
+    c.menus = (sk_menu*)as_alloc(sizeof(sk_menu) * (size_t)(n + 2));
+    c.items = (sk_menu_item*)as_alloc(sizeof(sk_menu_item) * (size_t)(n + 1));
+    int idx = as_menu_fill(ASC_tray_menu, &c, 0);
+    sk_tray_set_menu(c.menus, c.nmenus, c.items, c.nitems, idx, as_menu_click_cb);
+  } else {
+    // tray.menu = null: detach, or the next click would pop the stale menu.
+    sk_tray_set_menu(NULL, 0, NULL, 0, 0, NULL);
+  }
+#else
   (void)dockItems;
+#endif
 }
 
 // ---- Icon / InteractiveIcon / DockIcon / SystemTrayIcon ----
-void Icon_ctor(Icon* o) { Object_ctor((Object*)o); o->_bitmaps = NULL; }
+void Icon_ctor(Icon* o) { EventDispatcher_ctor((EventDispatcher*)o, NULL); o->_bitmaps = NULL; }
 Icon* Icon_new(void) {
   Icon* o = (Icon*)gc_alloc(GCT_CLASS, sizeof(Icon));
   o->vtable = &Icon_vt; Icon_ctor(o); return o;
@@ -9813,6 +9844,53 @@ static void as_dock_icon_sync(Icon* o) {
   }
 #endif
 }
+// ---- flash.desktop.SystemTrayIcon -> a real NSStatusItem (阶段二百六十) ----
+// AIR on macOS has NO system tray (supportsSystemTrayIcon=false, #2012), so this
+// whole block only exists in a '--features tray' build (ASC_HAS_TRAY). With the
+// switch off there is nothing to sync, nothing to report: the class still refuses
+// to be constructed, exactly like adl.
+#if ASC_HAS_TRAY
+static void as_tray_click(int kind, double sx, double sy, int mods);
+ScreenMouseEvent* ScreenMouseEvent_new(char* type, bool bubbles, bool cancelable, double screenX, double screenY, bool ctrlKey, bool altKey, bool shiftKey, bool buttonDown, bool commandKey, bool controlKey);
+#endif
+static void as_tray_sync(SystemTrayIcon* o) {
+#if ASC_HAS_TRAY
+  // Which bitmap the status item paints: the FIRST valid entry. AIR has no macOS
+  // status item, so there is no measured rule to match the way the Dock icon's
+  // "closest to 128" pick was measured -- a single-bitmap array is the shape both
+  // AIR's own examples and this demo use, and picking element 0 is the only rule
+  // that needs no invented metric. An empty list clears the image.
+  BitmapData* img = NULL;
+  if (o->_bitmaps != NULL) {
+    for (int i = 0; i < o->_bitmaps->length; i++) {
+      as_value e = o->_bitmaps->data[i];
+      if (e.tag != 4 || e.ptr == NULL || !as_is(e.ptr, &BitmapData_vt)) continue;
+      img = (BitmapData*)e.ptr;
+      break;
+    }
+  }
+  if (img == NULL || img->pixels == NULL || img->width <= 0 || img->height <= 0) sk_tray_set_image(NULL, 0, 0);
+  else sk_tray_set_image(img->pixels, img->width, img->height);
+  sk_tray_set_tooltip(o->_tooltip);
+  sk_tray_set_callback(as_tray_click);
+#else
+  (void)o;
+#endif
+}
+#if ASC_HAS_TRAY
+// A click on the status item. AIR's SystemTrayIcon dispatches ScreenMouseEvent;
+// there is no macOS behaviour to copy, so the two honest cases are named by AIR's
+// own constants: left -> MouseEvent.CLICK, right -> MouseEvent.RIGHT_CLICK, with
+// the pointer's SCREEN position (top-left origin, points) and the live modifiers.
+static void as_tray_click(int kind, double sx, double sy, int mods) {
+  SystemTrayIcon* o = ASC_tray_icon;
+  if (o == NULL) return;
+  char* type = (char*)(kind == 1 ? "rightClick" : "click");
+  ScreenMouseEvent* e = ScreenMouseEvent_new(type, false, false, sx, sy,
+      (mods & 2) != 0, (mods & 4) != 0, (mods & 8) != 0, kind == 0, (mods & 1) != 0, false);
+  EventDispatcher_dispatchEvent((EventDispatcher*)o, (Event*)e);
+}
+#endif
 void DockIcon_ctor(DockIcon* o) { InteractiveIcon_ctor((InteractiveIcon*)o); o->_menu = NULL; }
 DockIcon* DockIcon_new(void) {
   as_throw(ArgumentError_new((char*)"Error #2012: DockIcon$ class cannot be instantiated.", 2012));
@@ -9832,16 +9910,41 @@ void DockIcon_bounce(void* _this, char* priority) {
 }
 void SystemTrayIcon_ctor(SystemTrayIcon* o) { InteractiveIcon_ctor((InteractiveIcon*)o); o->_tooltip = NULL; o->_menu = NULL; }
 SystemTrayIcon* SystemTrayIcon_new(void) {
+#if ASC_HAS_TRAY
+  // The ONE class AIR refuses to construct that this backend builds: measured on
+  // adl 51.4.1 / macOS, #2012 "SystemTrayIcon$ class cannot be instantiated."
+  // Keep that the default; only '--features tray' (a named, opt-in enhancement)
+  // turns the same three lines of AS3 into a live menu-bar item.
+  SystemTrayIcon* o = (SystemTrayIcon*)gc_alloc(GCT_CLASS, sizeof(SystemTrayIcon));
+  o->vtable = &SystemTrayIcon_vt; SystemTrayIcon_ctor(o);
+  ASC_tray_icon = o;
+  as_tray_sync(o);
+  return o;
+#else
   as_throw(ArgumentError_new((char*)"Error #2012: SystemTrayIcon$ class cannot be instantiated.", 2012));
   return NULL;
+#endif
 }
 char* SystemTrayIcon_get_tooltip(void* _this) { return ((SystemTrayIcon*)_this)->_tooltip; }
 void SystemTrayIcon_set_tooltip(void* _this, char* v) {
   SystemTrayIcon* o = (SystemTrayIcon*)_this;
+  // Stored verbatim: the getter has to round-trip what was assigned, and there is
+  // no macOS AIR behaviour to inherit a truncation rule from (MAX_TIP_LENGTH is
+  // AIR's constant for the WINDOWS tooltip, not a promise about this backend).
   o->_tooltip = v; gc_write_barrier((void*)v);
+  as_tray_sync(o);
+}
+void SystemTrayIcon_set_bitmaps(void* _this, as_array* v) {
+  InteractiveIcon_set_bitmaps(_this, v);
+  as_tray_sync((SystemTrayIcon*)_this);
 }
 NativeMenu* SystemTrayIcon_get_menu(void* _this) { return ((SystemTrayIcon*)_this)->_menu; }
-void SystemTrayIcon_set_menu(void* _this, NativeMenu* v) { ((SystemTrayIcon*)_this)->_menu = v; gc_write_barrier((void*)v); }
+void SystemTrayIcon_set_menu(void* _this, NativeMenu* v) {
+  SystemTrayIcon* o = (SystemTrayIcon*)_this;
+  o->_menu = v; gc_write_barrier((void*)v);
+  ASC_tray_menu = v;
+  as_menu_sync(v);
+}
 // NativeApplication.icon: the ONE InteractiveIcon the platform hands out.
 Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_dock_icon_get(); }
 `);
@@ -11004,6 +11107,12 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('static NativeMenu* ASC_dock_menu = NULL;');
     this.line('static as_array* ASC_menu_tags = NULL;');
     this.line('static DockIcon* ASC_icon_singleton = NULL;');
+    // The tray icon and its menu: C statics on purpose (the Cocoa status item points
+    // at the same NSMenu), so both are permanent GC roots too -- see
+    // gc_mark_user_roots. Declared unconditionally so that block compiles with the
+    // tray switch off.
+    this.line('static SystemTrayIcon* ASC_tray_icon = NULL;');
+    this.line('static NativeMenu* ASC_tray_menu = NULL;');
     this.line('static void as_menu_sync(NativeMenu* from);');
     // autoExit is REAL, not just stored: the shared event loop keeps running with
     // zero open windows while it is false. Measured on adl 51.4.1 (temp/deskprobe2/

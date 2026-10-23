@@ -844,7 +844,15 @@ function warnOnIcuVersion(cfg: BuildConfig, mine: string): void {
 // feature on a backend that cannot carry it is rejected up front rather than
 // surfacing as a wall of `undefined symbol: sk_svg_*` from the linker — same
 // fact, but stated in the project's own words (§1.5: name the cross-backend gap).
-const FEATURES: Readonly<Record<string, { macro: string; targets: readonly Target[]; why: string }>> = {
+const FEATURES: Readonly<Record<string, {
+  macro: string;
+  targets: readonly Target[];
+  why: string;
+  // The host the channel codes against. `--target native` builds for THIS machine,
+  // so a Cocoa-only channel has to be refused up front on any other host rather
+  // than linking to glue that is a stub there (阶段二百六十).
+  host?: 'darwin';
+}>> = {
   svg: {
     macro: 'ASC_USE_SVG=1',
     targets: ['native'],
@@ -858,6 +866,18 @@ const FEATURES: Readonly<Record<string, { macro: string; targets: readonly Targe
     macro: 'ASC_ALLOW_EXTRA_FORMATS=1',
     targets: ['native', 'wasm'],
     why: '',
+  },
+  // `tray` (E19): a real macOS menu-bar status item (NSStatusItem) behind AIR's own
+  // `flash.desktop.SystemTrayIcon`. On macOS `adl` reports
+  // `supportsSystemTrayIcon == false` and `new SystemTrayIcon()` throws #2012, so
+  // this is an AIR-SUPERSET enhancement: without the macro the runtime keeps that
+  // exact refusal, with it the same AS3 code owns a live status item. Cocoa only,
+  // and the compiler builds for the host, hence the `host` guard.
+  tray: {
+    macro: 'ASC_USE_TRAY=1',
+    targets: ['native'],
+    host: 'darwin',
+    why: 'the status item is an NSStatusItem (AppKit), so the channel only exists on macOS',
   },
   // `raw` (E4): camera RAW / DNG via SkRawCodec (piex + dng_sdk). Native only --
   // the wasm Skia ships no piex/dng_sdk archive at all (nm: zero SkRawDecoder
@@ -890,7 +910,7 @@ export function knownFeatures(): string[] {
 // reads as a broken toolchain rather than "this is a native-only channel".
 // Throws for a name that is not a feature at all. Shared by validation and macro
 // resolution so both spell the same list the same way.
-function featureSpec(f: string): { macro: string; targets: readonly Target[]; why: string } {
+function featureSpec(f: string): { macro: string; targets: readonly Target[]; why: string; host?: 'darwin' } {
   const spec = FEATURES[f];
   if (!spec) {
     throw new Error(
@@ -911,6 +931,16 @@ export function validateFeatures(features: readonly string[], target: Target): v
       throw new Error(
         `feature '${f}' is not available with --target ${target}: ${spec.why}\n` +
         `  supported targets: ${spec.targets.join(', ')}; run without --features to get the AIR-identical default`
+      );
+    }
+    // A native build targets THIS machine, so a host-specific channel can be
+    // checked exactly: on a non-macOS host the glue is a compiled-out stub, and
+    // letting the build go ahead would hand the user a switch that silently does
+    // nothing on the one machine it was meant for.
+    if (spec.host !== undefined && process.platform !== spec.host) {
+      throw new Error(
+        `feature '${f}' needs a ${spec.host} host: ${spec.why}\n` +
+        `  this machine is ${process.platform}; run without --features to get the AIR-identical default`
       );
     }
   }

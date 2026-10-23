@@ -3831,3 +3831,157 @@ function checkEmitScreenMouseEvent(): string[] {
   return bad;
 }
 registerGroup('unit: emit/ScreenMouseEvent', checkEmitScreenMouseEvent);
+
+// ---- 阶段二百六十：SystemTrayIcon 背后的真 NSStatusItem（--features tray）------
+// This channel is an ENHANCEMENT, and the compiler's hardest promise here is the
+// DEFAULT: without `--features tray` the artifact must still be AIR-isomorphic --
+// measured on adl 51.4.1 / macOS, `NativeApplication.supportsSystemTrayIcon` is
+// false and `new SystemTrayIcon()` throws #2012, so nothing may appear in the menu
+// bar. Everything below pins one of the two arms, plus the three things the live
+// probe (temp/trayprobe, real clicks + AX on the running app) taught us and no
+// example can see: the click POSITION rules, the action-vs-setMenu: ordering, and
+// the GC roots the Cocoa side points into.
+function checkEmitSystemTrayIcon(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [tray] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [tray] ${label}`); }
+  };
+  const src = [
+    'import flash.display.BitmapData;',
+    'import flash.display.NativeMenu;',
+    'import flash.display.NativeMenuItem;',
+    'import flash.desktop.NativeApplication;',
+    'import flash.desktop.SystemTrayIcon;',
+    'import flash.events.MouseEvent;',
+    'import flash.utils.getQualifiedSuperclassName;',
+    'var b:BitmapData = new BitmapData(22, 22, true, 0xFFFF8800);',
+    'var t:SystemTrayIcon = new SystemTrayIcon();',
+    't.tooltip = "Prune";',
+    't.bitmaps = [b];',
+    'var m:NativeMenu = new NativeMenu();',
+    'm.addItem(new NativeMenuItem("Open"));',
+    't.menu = m;',
+    't.addEventListener(MouseEvent.RIGHT_CLICK, function(e:*):void { trace(e); });',
+    'trace(getQualifiedSuperclassName(SystemTrayIcon));',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  // ---- arm 1: the default build -------------------------------------------
+  // The preamble decides the capability bit from the macro pair, so an ordinary
+  // build cannot accidentally claim a tray it does not have.
+  check('ASC_HAS_TRAY is derived from the macro, not assumed',
+    c.includes('#if defined(ASC_USE_TRAY) && defined(ASC_USE_WINDOW) && defined(__APPLE__)'));
+  check('the refusal AIR gives on macOS is the default arm',
+    c.includes('Error #2012: SystemTrayIcon$ class cannot be instantiated.'));
+  // as_tray_sync is emitted unconditionally (the vtable references it), but with the
+  // switch off its body must be inert -- a stray sk_tray_* call there would be an
+  // undefined symbol in every default app.
+  const sync = fnBody(c, 'static void as_tray_sync(SystemTrayIcon* o) {');
+  check('the sync helper exists', sync !== '');
+  // Both arms are always present in the emitted text (the preprocessor decides), so
+  // the pin is the ARM ORDER: the real work first, then the inert `(void)o;`. A file
+  // that lost the switch would still read the same either way -- what must not
+  // happen is the ON arm falling outside the guard.
+  check('...with the inert arm being the #else of the real one',
+    sync.indexOf('#if ASC_HAS_TRAY') >= 0
+    && sync.indexOf('#if ASC_HAS_TRAY') < sync.indexOf('sk_tray_set_image(img')
+    && sync.indexOf('sk_tray_set_image(img') < sync.indexOf('#else')
+    && sync.slice(sync.indexOf('#else')).includes('(void)o;'));
+  check('the click dispatcher lives inside the same guard',
+    c.includes('#if ASC_HAS_TRAY\n// A click on the status item.'));
+
+  // ---- arm 2: what the switch turns on ------------------------------------
+  check('the switch constructs and registers the singleton',
+    c.includes('ASC_tray_icon = o;') && c.includes('as_tray_sync(o);'));
+  // The click is dispatched as ScreenMouseEvent, i.e. the ONE AIR class that models
+  // "a mouse event on a system icon" -- invented from AIR's own constants, since
+  // macOS has no behaviour to copy.
+  check('a left click is MouseEvent.CLICK and a right click is RIGHT_CLICK',
+    c.includes('char* type = (char*)(kind == 1 ? "rightClick" : "click");'));
+  check('the event carries the SCREEN position and the live modifiers',
+    c.includes('ScreenMouseEvent_new(type, false, false, sx, sy,'));
+  check('the three right-button constants exist (AIR members, previously missing)',
+    c.includes('"rightClick"') && c.includes('"rightMouseDown"') && c.includes('"rightMouseUp"'));
+
+  // ---- the class model ----------------------------------------------------
+  // Measured (temp/trayprobe/Sup.as): Icon's base is EventDispatcher. With the old
+  // `Object` base an icon could not dispatch at all, which is exactly what the tray
+  // click needs.
+  check('Icon extends EventDispatcher (measured, not Object)',
+    /Icon_vt = \{[^}]*&EventDispatcher_vt/.test(c) || c.includes('"flash.desktop::Icon", &EventDispatcher_vt'));
+  check('Icon_ctor chains to EventDispatcher_ctor',
+    c.includes('void Icon_ctor(Icon* o) { EventDispatcher_ctor((EventDispatcher*)o, NULL);'));
+  check('SystemTrayIcon overrides bitmaps (the inherited setter only sizes)',
+    c.includes('void SystemTrayIcon_set_bitmaps(void* _this, as_array* v) {')
+    && c.includes('InteractiveIcon_set_bitmaps(_this, v);'));
+
+  // ---- the menu: a third install target -----------------------------------
+  check('the tray menu is built from the same tag table as app/Dock menus',
+    c.includes('c.tag_base = appItems + dockItems;')
+    && c.includes('sk_tray_set_menu(c.menus, c.nmenus, c.items, c.nitems, idx, as_menu_click_cb);'));
+  check('tray.menu = null detaches instead of leaving a stale menu',
+    c.includes('sk_tray_set_menu(NULL, 0, NULL, 0, 0, NULL);'));
+  // A tag is an index into ASC_menu_tags + 1, and as_menu_sync rebuilds that array
+  // from scratch -- so the tray's tags MUST start after the app's and the Dock's, or
+  // a click on "Open" would fire a Dock item.
+  check('the tag base is exclusive to the three install targets',
+    c.includes('c.tag_base = 0;') && c.includes('c.tag_base = appItems;'));
+
+  // ---- GC roots ------------------------------------------------------------
+  // The Cocoa side holds raw pointers to these objects for the life of the process;
+  // a collection between frames would leave the status item pointing at reclaimed
+  // memory. The tag array and the DockIcon singleton were missing until this stage.
+  const roots = fnBody(c, 'static void gc_mark_user_roots(void) {');
+  for (const st of ['ASC_tray_icon', 'ASC_tray_menu', 'ASC_menu_tags', 'ASC_icon_singleton', 'ASC_app_menu', 'ASC_dock_menu']) {
+    check(`${st} is a GC root`, roots.includes(`gc_mark_ptr((void*)${st});`));
+  }
+  // Unconditional declaration: the roots block above compiles with the switch off.
+  check('the statics are declared with the channel off as well',
+    c.includes('static SystemTrayIcon* ASC_tray_icon = NULL;')
+    && c.includes('static NativeMenu* ASC_tray_menu = NULL;'));
+
+  // ---- the Cocoa half (vendor/statusitem_glue.cc) --------------------------
+  const glue = readFileSync(join(root, 'vendor', 'statusitem_glue.cc'), 'utf8');
+  // Measured (temp/statusprobe/statusprobe2.mm): -[NSStatusItem setMenu:] makes
+  // AppKit swallow the mouse-down for menu tracking, so the action never fires and
+  // AS3 would never see a CLICK. Popping the menu from inside the action gives both.
+  check('the menu is NOT installed with setMenu:',
+    !glue.includes('"setMenu:"'));
+  check('...it is popped from the action instead', glue.includes('"popUpStatusItemMenu:"'));
+  check('right clicks reach the action too (sendActionOn mask)',
+    glue.includes('sk_send_void_int(btn, "sendActionOn:", (long)((1 << 2) | (1 << 4)));'));
+  // The event is dispatched BEFORE the menu opens: the popup runs a nested tracking
+  // loop, so a dispatch after it would only happen once the user dismissed the menu.
+  const fired = fnBody(glue, 'static void sk_tray_fired(void* self, SEL _cmd, void* sender) {');
+  check('the AS3 event is dispatched before the menu pops',
+    fired.indexOf('g_tray_cb(kind') >= 0 && fired.indexOf('g_tray_cb(kind') < fired.indexOf('popUpStatusItemMenu:'));
+  // Position: the event's own point when there IS a mouse event, else the button's
+  // centre. Measured: an accessibility press leaves currentEvent pointing at a stale
+  // event and mouseLocation reporting the resting cursor -- both kilometres off.
+  check('the click position comes from the event itself',
+    fired.includes('sel_registerName("locationInWindow")') && fired.includes('"convertPointToScreen:"'));
+  check('...with the button centre as the no-mouse-event fallback',
+    fired.includes('"convertRectToScreen:"'));
+  check('the y flip uses the PRIMARY display, not mainScreen (multi-display)',
+    fired.includes('"screens"') && !fired.includes('"mainScreen"'));
+  // Same single-premultiply rule as the Dock icon: straight ARGB in, premultiplied
+  // RGBA out (AIR's own Dock icon double-multiplies; that divergence is registered,
+  // not copied).
+  check('the bitmap is premultiplied exactly once',
+    glue.includes('r = (r * a + 127u) / 255u;') && (glue.match(/r = \(r \* a \+ 127u\) \/ 255u;/g) ?? []).length === 1);
+  // One status item per process: a second SystemTrayIcon reuses the same bar slot
+  // (sk_tray_create early-returns), so the LAST constructed icon owns it. No AIR
+  // behaviour exists to copy here -- it is stated in docs/zh-cn/enhancements.md.
+  check('creation is once-per-process', /if \(g_tray_created \|\| NSApp == NULL\) return;/.test(glue));
+  check('an install before NSApp exists is retried, not dropped',
+    glue.includes('"NSApplicationDidFinishLaunchingNotification"') && glue.includes('static void sk_tray_flush(void) {'));
+  check('the non-Cocoa build still defines all four seams',
+    /void sk_tray_set_image\(const void\* argb, int w, int h\) \{ \(void\)argb; \(void\)w; \(void\)h; \}/.test(glue)
+    && glue.includes('void sk_tray_set_tooltip(const char* text) { (void)text; }'));
+
+  console.log(`     [tray] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/SystemTrayIcon', checkEmitSystemTrayIcon);

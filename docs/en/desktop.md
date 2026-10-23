@@ -29,12 +29,12 @@
 | `Icon` | ✅ | **instantiable** (`new Icon()` is legal); `bitmaps` defaults to `null` (reading it throws `#1009`) |
 | `InteractiveIcon` | ✅ model | `new InteractiveIcon()` throws `#2012`; `width`/`height` are derived read-only |
 | `DockIcon` | ✅ (incl. Dock context menu + painted bitmaps) | `new DockIcon()` throws `#2012`; selection rule and alpha in §3.1 / §7.6 |
-| `SystemTrayIcon` | ✅ model | AIR itself refuses it on macOS (`#2012`), and so do we |
+| `SystemTrayIcon` | ✅ model (**a real `NSStatusItem` under `--features tray`**) | AIR itself refuses it on macOS (`#2012`) and **by default** so do we; with the enhancement switch on, the same AS3 gets a real status item (see [`enhancements.md`](enhancements.md) §4.11) |
 | `NativeApplication.icon` | ✅ | **read-only** (`mxmlc`: "property icon is read-only"); process-wide singleton |
 | `NativeApplication.menu` | ✅ | readable and writable; `= null` **crashes** `adl` — we report and keep the old menu (§7.1) |
 | `NativeApplication.autoExit` | ✅ | real: with `false` and no visible window the process stays alive |
 | `supportsDockIcon` / `supportsMenu` | ✅ | `true` only under `ASC_USE_WINDOW && __APPLE__` (§2) |
-| `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ always `false` | matches what this backend actually implements (§2) |
+| `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ always `false` (`supportsSystemTrayIcon` is `true` under `--features tray`) | matches what this backend actually implements by default (§2); the tray switch is in [`compile.md`](compile.md) §3.4.5 |
 | `NativeMenu` / `NativeMenuItem` | ✅ all members | list semantics, error codes and copy semantics match `adl` (§4, §5) |
 | `NativeMenu.display()` | ⚠️ reported | no modal native menu runner in this backend (§7.3) |
 | `keyEquivalentModifiers` | ⚠️ reported | the key is bound, the modifier flags are **not** translated (§7.2) |
@@ -272,8 +272,8 @@ difference only shows on pixels with alpha. **Registered in `TODO.md` (遗留待
 
 ## 9. Not done (out of scope for this stage)
 
-- **G4b: the macOS menu-bar `NSStatusItem`** — an **enhancement** (AIR has no macOS equivalent:
-  `supportsSystemTrayIcon` is `false`), so it must be opt-in and is **not implemented here**. The feasibility
-  probe passed (`temp/statusprobe/statusprobe.mm`: SDL window + `NSStatusBar` + `NSMenu`, clicks dispatched
-  through SDL's own Cocoa pump — no hand-written `NSEvent` pump needed). Its documented fallback is the pure
-  AIR `DockIcon` shape (Dock icon + Dock context menu + `autoExit=false`).
+- ~~**G4b: the macOS menu-bar `NSStatusItem`**~~ — **implemented (stage 260)**: an **enhancement** (AIR has no
+  macOS equivalent: `supportsSystemTrayIcon` is `false`), so it ships as the opt-in named switch
+  `--features tray`; the default artifact stays verbatim AIR (`false` + `#2012`). Behaviour, coordinate rules,
+  real-machine evidence and known limits are in [`enhancements.md`](enhancements.md) §4.11 and
+  [`compile.md`](compile.md) §3.4.5.

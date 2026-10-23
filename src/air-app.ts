@@ -538,6 +538,11 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   const mtlSrc = `${vendorRel}/metal_glue.mm`;
   const d3dSrc = `${vendorRel}/d3d_glue.cc`;
   const sources = visible ? [skiaSrc, winSrc] : [skiaSrc];
+  // The menu-bar status item (阶段二百六十) is Cocoa-only AND opt-in: with
+  // `--features tray` the generated C calls sk_tray_*, so the translation unit has
+  // to be on the link line; without it, compiling ObjC-runtime code into every app
+  // would be dead weight (and the feature is refused off-macOS anyway).
+  if (visible && features.includes('tray')) sources.push(`${vendorRel}/statusitem_glue.cc`);
 
   // ---- Native platform profile -------------------------------------------------
   // The native app is built for the host OS: there is no cross-compilation, because

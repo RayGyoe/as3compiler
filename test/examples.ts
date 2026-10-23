@@ -204,6 +204,10 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // runner links the same glue but has no device, so the example branches on
   // SoundMixer.areSoundsInaccessible() and passes either way.
   'audio.as': ['--manifest', join(dir, 'audio.build.json')],
+  // The menu-bar status item only exists when the build asked for it
+  // (`--features tray`, stage 二百六十): without that manifest the same AS3 must
+  // fail exactly like AIR (#2012), which is the unit pin's job, not this example's.
+  'status-item.as': ['--manifest', join(dir, 'status-item.build.json')],
   // [Embed]: an embedded image is decoded through Skia and an embedded mp3 through
   // the audio seam, so the example links both backends. It is about the AS3
   // contract of the generated classes (Kind, Class-value identity, decoded

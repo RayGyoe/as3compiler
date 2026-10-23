@@ -15311,7 +15311,84 @@ AIR 的 `<transparent>` 语义是**让原桌面透出来**；毛玻璃显示的�
 Windows/其它后端仍未实现透明窗（要 `WS_EX_LAYERED` + 逐帧 alpha），胶水照旧**报明一次**；
 该行在遗留表里只剩 Windows 侧，本阶段不改表。
 
+### 阶段二百六十：macOS 菜单栏状态项 —— `SystemTrayIcon` 背后是真 `NSStatusItem`（v0.4.223 → v0.4.224）✅ 已完成
+
+**一、为什么这是「增强」而不是「补平差距」**
+
+先量 AIR 自己的答案（`adl 51.4.1` / macOS，`temp/trayprobe/`）：
+
+| 探 | `adl` 结果 |
+|---|---|
+| `NativeApplication.supportsSystemTrayIcon` | **`false`** |
+| `new SystemTrayIcon()` | `Error #2012: SystemTrayIcon$ class cannot be instantiated.` |
+| `getQualifiedSuperclassName(Icon)` | **`"flash.events::EventDispatcher"`**（此前我们记成 `Object`，是错的） |
+| `getQualifiedSuperclassName(InteractiveIcon)` / `(SystemTrayIcon)` | `flash.desktop::Icon` / `flash.desktop::InteractiveIcon` |
+
+按 AGENTS §1.5 硬判据：`adl` 对同一份输入**本来就报错** ⇒ 做出来是**增强**（入 `### 增强待做` 的 E19），
+且必须 opt-in。同一条 AS3 在 Windows 的 AIR 上是有托盘的，所以**默认产物仍要与本平台的 AIR 同形**。
+
+**二、开关与默认**
+
+- 新具名开关 `--features tray`（= `-D ASC_USE_TRAY=1`）。`FEATURES` 表新增 `host: 'darwin'` 字段：
+  `native` 编的是**本机**可执行文件，所以宿主可前置校验，在非 macOS 宿主上报
+  `feature 'tray' needs a darwin host: ...`（给一个「开了但明明是空桩」的开关比如实报错更坏）。
+- `ASC_HAS_TRAY` = `#if defined(ASC_USE_TRAY) && defined(ASC_USE_WINDOW) && defined(__APPLE__)`。
+  默认（不开）产物：`supportsSystemTrayIcon` 仍 `false`、`new SystemTrayIcon()` 仍抛 `#2012`、**菜单栏什么也不多**。
+- `statusitem_glue.cc` 只在 `--features tray` 且 `visible` 时才进 `--air-app` 生成的构建清单，
+  默认构建不链它（钉在 `[features]` 组）。
+
+**三、真机验收（先证「能开」再证「点得动」）**
+
+裸 `.app` 与 `NSStatusItem` 的坑是**菜单会把动作吃掉**：`-[NSStatusItem setMenu:]` 让 AppKit 为跑菜单跟踪
+而吞掉 mouse-down，action 永不触发 ⇒ AS3 永远看不到 CLICK。实测（`temp/statusprobe/statusprobe2.mm`）：
+**不调 `setMenu:`**，改为在 action 里 `popUpStatusItemMenu:`，于是**两件事都拿到**——先派发事件，再弹菜单。
+
+真机（`temp/trayprobe/live`，配合 AX 与合成点击）：
+
+| 验收项 | 证据 |
+|---|---|
+| 状态项出现在菜单栏 | `temp/trayprobe/menubar.png`；AX `process "live"` 的 `menu bar 2` item 1 = `(1110,7) 40×24` |
+| 左键派发 `ScreenMouseEvent` | 点击 `(1130,19)` → `CLICK type=click isSME=true screenX=1130 screenY=19`（**与 AX 位置逐点吻合**） |
+| 右键派发 `rightClick` | `RIGHT_CLICK type=rightClick isSME=true screenX=1130 screenY=19` |
+| 菜单上屏且菜单项点得动 | AX 枚举 `Open Panel, <分隔>, Quit`；点 `Open Panel` → `MENU SELECT from Open Panel` |
+
+**四、坐标口径（本轮实测踩到的三个坑，全部修掉）**
+
+1. **不能用 `[NSScreen mainScreen]` 的高度翻 y**：它是「键盘焦点所在屏」，多显示器时常不是主屏；
+   AppKit 全局坐标的原点是**主屏**左下角。本机主屏 1800×1169、副屏 2560×1440 且在**上方**
+   （AX 里副屏是负 y）——用 `mainScreen` 会把副屏的点整体算错一个屏高。改为遍历 `[NSScreen screens]`
+   取 `origin == (0,0)` 那一块的 `size.height`。
+2. **不能用 `[NSEvent mouseLocation]`**：那是**物理指针**的位置；AX 触发的 press 根本不移动指针，
+   于是「点击」会报出光标当前所在处（实测报成主屏的 `(1148,452)`，而状态项在 `(1868,-1437)`）。
+   改为：`currentEvent` 真是鼠标事件（type 1..6）时用 `locationInWindow` + `convertPointToScreen:`；
+   否则（AX/键盘激活）退到**按钮自身矩形的中心**；两者都不行才用 `mouseLocation`。
+3. **事件必须先于菜单派发**：`popUpStatusItemMenu:` 会进嵌套跟踪循环，放在它后面派发等于「等用户关掉菜单再说」。
+
+**五、其它落地**
+
+- `Icon.superClass` 由 `Object` 改为 `EventDispatcher`（实测口径），`Icon_ctor` 相应改调 `EventDispatcher_ctor`
+  ——不然 `addEventListener` 在 Icon 上连编译都过不了，而托盘点击正是靠它。
+- 托盘菜单是**第三个安装目标**（`as_menu_sync`），与 App 菜单 / Dock 菜单共用一张 tag 表，
+  托盘那段从 `appItems + dockItems` 之后开始；`tray.menu = null` 显式解绑（否则下次点击还弹旧菜单）。
+- 补登记 `MouseEvent.RIGHT_CLICK` / `RIGHT_MOUSE_DOWN` / `RIGHT_MOUSE_UP`（AIR 成员，此前缺失，
+  导致托盘的右键只能拿字符串字面量监听）。
+- **顺带修掉的 GC 缺陷**：`ASC_icon_singleton`、`ASC_app_menu`、`ASC_dock_menu`、`ASC_menu_tags`
+  从未进 `gc_mark_user_roots` —— Cocoa 侧持有它们的裸指针，一次回收就会让菜单/状态项指向已释放内存。
+  本轮把四个老的连同新的 `ASC_tray_icon` / `ASC_tray_menu` 一起标上。
+- 位图沿用 Dock 图标的「直通 ARGB、胶水层预乘一次」口径（AIR 的 Dock 图标会二次预乘，那是它的偏差，不抄）。
+
+**六、已知边界（如实登记）**
+
+- **一个进程一个状态项**：第二次 `new SystemTrayIcon()` 复用同一槽位（胶水层 `g_tray_created` 早返回），
+  即「最后构造的图标拥有它」。AIR 在 macOS 无行为可抄、Windows 侧本机未实测 ⇒ 取最保守语义并写进文档。
+- 托盘菜单的 `keyEquivalent` **未映射修饰键**（与 App/Dock 菜单同一条既有口径，仍在遗留表）。
+- **回归**：`unit: emit/SystemTrayIcon`（33 条）、`[features]` 组 +8 条（含「默认构建不链 `statusitem_glue.cc`」
+  与「非 macOS 宿主拒绝」两个反向对照）、`examples/status-item.as`（23 断言，清单带 `features: ["tray"]`）；
+  `example: native-menu.as`（69 断言）在 Icon 换基类后仍全绿。
+
+
 ### 遗留待开发
+> **2026-10-23 追加（阶段二百六十：macOS 菜单栏状态项 —— 「AIR 没有」所以要 opt-in，而不是要补平）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 106 项**（`未开始` 78 / `部分完成` 19 / `已修` 6 / `已记录` 2 / `调研完成·暂缓` 1）。**本阶段主体不占表**：托盘在 macOS 的 `adl` 上**本来就抛 `#2012`**（`supportsSystemTrayIcon=false`）⇒ 按 §1.5 是**增强**（E19，进 `### 增强待做`），落地即 opt-in 具名开关 `--features tray`，默认产物与 AIR 逐字同形。阶段内还**修掉两处族级实错**（不占表：阶段内修净的东西不进本表）：① `Icon` 的父类在 `adl` 上是 **`flash.events::EventDispatcher`**，我们此前记成 `Object`（已按实测改正，`Icon_ctor` 相应改调 `EventDispatcher_ctor`，否则 `addEventListener` 在 Icon 上连编译都过不去——而托盘点击正是靠它）；② `MouseEvent.RIGHT_CLICK` / `RIGHT_MOUSE_DOWN` / `RIGHT_MOUSE_UP` 三个 **AIR 已定义**的静态常量我们**压根没登记**（已补齐，否则右键只能拿字符串字面量监听）。**另外顺带修的是一个真缺陷、不是差异**：`ASC_icon_singleton`/`ASC_app_menu`/`ASC_dock_menu`/`ASC_menu_tags` 四个静态从未进 `gc_mark_user_roots`，而 Cocoa 侧持有它们的裸指针 ⇒ 一次回收就能让菜单/状态项指向已释放内存（本轮连同新的 `ASC_tray_icon`/`ASC_tray_menu` 一起标上，钉在 `unit: emit/SystemTrayIcon`）。**证据**：`temp/trayprobe/`（`Sup.as` 四问 `adl` 探针 + `live.as` 真机驱动脚本 + `live-log.txt` 的 `CLICK`/`RIGHT_CLICK`/`MENU SELECT` 三行 + `menubar.png`）、`temp/statusprobe/statusprobe2.mm`（`setMenu:` vs `popUpStatusItemMenu:` 的因果）、`test/unit/emit.ts` 的 `unit: emit/SystemTrayIcon`（33 钉）、`test/unit/build.ts` 的 `[features]` +8 钉、`examples/status-item.as`（23 断言）。
 > **2026-10-23 追加（阶段二百五十九：透明窗的 macOS 呈现路径 —— 先证「裸后端也不行」再换实现）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 106 项**。上一阶段把透明窗的**语义**接好了，本阶段才发现**像素**没通；而判断「是我们的错还是后端的错」只靠一件事：**一份 14 行、零 as3compiler 符号的裸 SDL2 程序也复现不透明**，于是按 AGENTS §1.5 归为后端边界（不登记为缺陷）。落地方式随之从「给 SDL 的窗打补丁」换成「透明窗**绕过 SDL 渲染器**、改走 CALayer 的 `contents`」，并把毛玻璃作为**刻意差异**放进 opt-in 宏 `ASC_WINDOW_VIBRANT`（AIR 显示原桌面、我们显示糊过的桌面 ⇒ 默认关）。**证据**：`temp/transprobe/FINDINGS.md`、`temp/sdltrans.cc`、`temp/sdltrans2.cc`、`temp/ns_vib.cc`、`temp/sdl_layer.cc`、`temp/sdl_layer2.cc`、`temp/aottrans/{vib_crop.png,plain_crop.png}`、`test/unit/platform.ts` 六条新钉。
 > **2026-10-23 追加（阶段二百五十八：`flash.events.ScreenMouseEvent` —— 先量「谁派发它」再决定要不要写）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**106 项**（`未开始` **78** / `部分完成` 19 / `已修` **6** / `已记录` 2 / `调研完成·实现暂缓` 1）。**改写的 1 行**是阶段二百五十五 收尾时登记的「`ScreenMouseEvent` 整类未实现」⇒ 转为 `已修`。**新登记的 1 行**是量动态写只读 trait 时顺手量出来的**族级**差异：`Event` 的 `type`/`bubbles`/`cancelable`/`target` 在 `adl` 里是**只读访问器**（动态写抛 `#1074`、报文写**接收者**的类），我们这边是**普通字段**（照收）。**这一轮真正学到的是「事件类的形状要先问它由谁派发」**：`ScreenMouseEvent` 的 `describeType` 面（六个常量、两个只读属性、11 个形参）都能量，但**派发者**不能猜 —— 探针证明 `adl` 上真实舞台鼠标事件 `is ScreenMouseEvent` 恒 **false**，它只由 `SystemTrayIcon` 派发，而 macOS 没有系统托盘 ⇒ 它在我们这里是**纯数据类**（与 `TouchEvent` 同属「只由用户代码构造」），不需要任何胶水、也不需要假装派发。**顺带量清的两条通用规则已写进运行时**：动态写命中「getter 无 setter」→ `#1074`、命中「方法名」→ `#1037`、都不命中才是原来的 `#1056`（都按接收者类报，且在 `_dyn` 兜底**之前**判）。**证据**：`temp/smeprobe/`（`Probe.as`/`Probe2.as`/`Probe3.as`/`Probe4.as` 四轮 `adl` 探针 + AOT 侧 `AotSme.as` 逐行对照，两端逐字相同）、`test/unit/emit.ts` 的 `unit: emit/ScreenMouseEvent`（21 钉）、`examples/screen-mouse-event.as`（27 断言）。
 > **2026-10-23 追加（阶段二百五十七：`<transparent>` 与 `NativeWindowInitOptions.transparent` 真的透传）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 表内项数**保持 105 项**（五档分状态不变）。**改写的 1 行**是「窗口几何的 Windows 端残余」：它的 ① 原来写「`<transparent>` 未接线，两端都没有真透明窗」——本阶段把**生成侧与 macOS 侧**全部接上（描述符 → `ASC_WINDOW_TRANSPARENT` → 主窗、`NativeWindowInitOptions` → `sk_window_set_transparent`、合成步与呈现步清 alpha 0、`NSWindow setOpaque:NO` + 内容视图及其子视图 layer 全设非不透明），故该行**收窄到只有 Windows 的原生实现**（要 `WS_EX_LAYERED` + 逐帧 alpha；当前胶水**报明一次**，不给假透明窗）。**不占表**的理由与 G1/G2 相同：`adl` 给得出真透明窗、我们给不出 ⇒ §1.5 的**遗留欠账**，阶段内修净。**证据**：`temp/transprobe/`（`adl` 侧 `Trans.as` + AOT 侧 `AotTrans.as` 双端孪生，含截图）、`test/unit/platform.ts` 五条源级钉。
@@ -15570,7 +15647,7 @@ Windows/其它后端仍未实现透明窗（要 `WS_EX_LAYERED` + 逐帧 alpha�
 ### 增强待做
 
 > **与「遗留待开发」的区别**：上表是**欠账**（AIR 有、我们没有，或我们有但不忠实——`adl` 一跑就知道差在哪）；本表是**增益**（AIR **本来就报错、或压根不存在**，我们做出来才算增强）。判据与五条入库标准见 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1/§2；原则亦见 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §4。
-> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」）**：下表 **16 项**，已完成 **5 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **7 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`），登记未实现的开关等于「看着开了、实际没编进去」。
+> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」；2026-10-23 加入 `System.exit` 与 macOS 状态项，v0.4.224）**：下表 **18 项**，已完成 **7 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **7 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`），登记未实现的开关等于「看着开了、实际没编进去」。
 
 | 增强项 | AIR 现状 | 目标端 | 成本 | 状态 |
 |--------|---------|--------|------|------|
@@ -15589,6 +15666,8 @@ Windows/其它后端仍未实现透明窗（要 `WS_EX_LAYERED` + 逐帧 alpha�
 | **LTO / PGO 构建开关** | — | 两端 | 低 | **已完成（八十九·六十四）**：清单 `lto`/`pgo`/`pgo-dir` + CLI `--lto`/`--pgo`/`--pgo-dir`，默认全关；`-flto` 逐步骤断言 + 反向对照（4 变异全捕获） |
 | **帧录制 / 确定性重放** | ✗ | 两端 | 中 | 未排期 |
 | **可读 C 作为一等交付物**（嵌入宿主工程 / 人工审改） | ✗ | 两端 | 已有（README 已承诺） | 已有 |
+| **带状态码的退出**（`flash.system.System.exit(code:uint)`） | ✗ **明确不支持**：AIR 运行时抛 `IllegalOperationError #2018 The System.exit() method is not supported.`（`adl 51.4.1` 未打包实测） | ✅ **已实现**：记下 `code` 后走与 `NativeApplication.exit()` 同一条收尾路径，`main` 以它为**进程状态码**返回；WASI 侧同样生效 | 两端 | **已完成（阶段二百四十五）** |
+| **macOS 菜单栏状态项**（`SystemTrayIcon` 背后是真 `NSStatusItem`） | ✗ **本平台没有**：`adl 51.4.1`/macOS 的 `NativeApplication.supportsSystemTrayIcon` 为 `false`、`new SystemTrayIcon()` 抛 `#2012` | ✅ **已实现、opt-in**（具名开关 `--features tray`，仅 native + macOS 宿主）：默认仍是 `false` + `#2012`（与 AIR 逐字同形）；开了之后点击派发 `ScreenMouseEvent`（`click`/`rightClick` + 屏幕坐标 + 修饰键），`menu` 走与 App/Dock 菜单同一条 tag 通道 | native / macOS 宿主 | **已完成（阶段二百六十）** |
 | **无 GPU 后端时 `Context3D.profile` 报 `baselineExtended`** | ✗ AIR 的 `software` 渲染模式**锁死 `baseline`**：`requestContext3D("software", "baselineExtended"|"enhanced")` 异步抛 `ErrorEvent #3702: Context3D not available.`，拿到上下文那一档也 `createTexture(4096)` 报 `#3683 (max is 2048x2048)`、`maxBackBuffer` 只有 2048×2048（`adl 51.4.1` 实测，`temp/adlprof/run-caps.js`） | 未链接 Stage3D 后端（纯 C 状态机）时仍建上下文、报 `baselineExtended`、按 4096 校验：纹理只存在于 CPU 状态机里，4096 不占显存。**不静默**——`driverInfo` 如实报 `"Software (state machine)"` | 两端（纯 C，无胶水依赖） | — | **已有（刻意保留，非开关）** |
 
 ---

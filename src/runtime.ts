@@ -8900,7 +8900,17 @@ typedef struct { const char* title; int first; int count; } sk_menu;
 #define ASC_HAS_APP_MENU 0
 #define ASC_HAS_DOCK_IMAGE 0
 #endif
+// A menu-bar status item is an ENHANCEMENT, not a gap: measured on adl 51.4.1 /
+// macOS, NativeApplication.supportsSystemTrayIcon is false and new
+// SystemTrayIcon() throws #2012, i.e. AIR has no macOS counterpart at all. So it
+// only exists when the build asked for it ('--features tray'), and it needs the
+// window backend because the status item lives in the same NSApplication as the
+// menu bar. Without BOTH the runtime keeps AIR's exact refusal.
+#if defined(ASC_USE_TRAY) && defined(ASC_USE_WINDOW) && defined(__APPLE__)
+#define ASC_HAS_TRAY 1
+#else
 #define ASC_HAS_TRAY 0
+#endif
 #define ASC_HAS_LOGIN_ITEM 0
 #define ASC_HAS_DEFAULT_APP 0
 #if defined(ASC_USE_WINDOW)
@@ -8912,6 +8922,16 @@ extern void sk_dock_bounce(int critical);
 // NULL/0/0 to restore the bundle icon. Returns nothing: the glue queues the image if
 // AppKit is not up yet and applies it from the event loop.
 extern void sk_dock_set_icon_image(const void* argb, int w, int h);
+// ---- flash.desktop.SystemTrayIcon (阶段二百六十, --features tray) ----
+// Straight ARGB rows, exactly like the Dock icon (the glue premultiplies once).
+// The menu crosses as the same flattened sk_menu model the app/Dock menus use.
+extern void sk_tray_set_image(const void* argb, int w, int h);
+extern void sk_tray_set_tooltip(const char* text);
+extern int sk_tray_set_menu(const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, void (*cb)(int));
+// kind: 0 = left click, 1 = right click. mods bits: 1 command, 2 control, 4 option,
+// 8 shift -- the glue translates NSEventModifierFlags, so the generated C never
+// sees an AppKit enum value.
+extern void sk_tray_set_callback(void (*cb)(int kind, double sx, double sy, int mods));
 extern void sk_window_set_auto_exit(int on);
 #else
 static inline int sk_menu_supported(void) { return 0; }

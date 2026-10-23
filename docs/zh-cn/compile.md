@@ -342,6 +342,7 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 | `svg` | `ASC_USE_SVG=1` | 仅 `native` | 见 §3.4.3 |
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | `native` / `wasm` | 额外图片格式 WebP / BMP / ICO（AIR 对它们报 `#2124`，故**默认拒绝**——见 §3.4.3.1） |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | 仅 `native` | 相机 RAW / DNG（默认拒绝——见 §3.4.3.1；web 侧 Skia 无 piex/dng_sdk 归档，故目标不支持时就报错） |
+| `tray` | `ASC_USE_TRAY=1` | 仅 `native`，**且宿主须为 macOS** | `SystemTrayIcon` 背后是真 `NSStatusItem`（见 §3.4.5）。AIR 在 macOS 上根本没有托盘（`supportsSystemTrayIcon=false`、`#2012`），故默认关闭 |
 
 清单里同名字段是一份**字符串数组**，语义与 CLI 一致：
 
@@ -353,11 +354,13 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 
 - **默认全关**：不开时产物与以前**逐字节相同**，与 `adl` 同构。开了会打印一行
   `== enhancements: svg (-D ASC_USE_SVG=1) ==`，并在提示里写明它是 AIR 超集。
-- **未知名字报错**，不静默忽略：`--features lottie` 会报 `unknown feature 'lottie' (known: formats, raw, svg)`
+- **未知名字报错**，不静默忽略：`--features lottie` 会报 `unknown feature 'lottie' (known: formats, raw, svg, tray)`
   并在**生成任何代码之前**退出（清单里也已实现的能力才会被登记，登记了却没实现的开关
   等于给用户一个「看着开了、实际没编进去」的东西）。`--features none` 不能与其它名字同用。
 - **目标不支持就报错**：`--target wasm --features svg` 直接报
   `feature 'svg' is not available with --target wasm`，而不是把 `undefined symbol: sk_svg_*` 留给链接器。
+  `native` 编的是**本机**可执行文件，所以宿主相关的通道还能再收紧一层：`--features tray` 在非 macOS 宿主上
+  直接报 `feature 'tray' needs a darwin host: ...`（否则用户会拿到一个「开了、但那个平台上是空桩」的开关）。
 
 `--features` 与 `-D` 的区别：`-D` 是**追加**一条宏，`--features` 是**替换**整个增强集合——
 「本来开着 svg、我只想要别的」这种话只有替换语义能表达。
@@ -447,6 +450,43 @@ as-aot app.as --air-app app.xml -D ASC_USE_SVG=1
 > 同名，靠**库搜索路径顺序**保证静态命中（可能看到 `ld: warning: ignoring duplicate libraries: '-lz'`
 > 的提示，无副作用）。验收口径：`otool -L` 的输出里**不应**出现 `libcurl.4.dylib`/`libz.dylib`。
 > **默认构建（不声明这些宏/库）完全不受影响**。
+
+#### 3.4.5 菜单栏状态项（`tray` / `ASC_USE_TRAY`）
+
+`flash.desktop.SystemTrayIcon` 在 **macOS 的 AIR 上不存在**：`adl 51.4.1` 实测
+`NativeApplication.supportsSystemTrayIcon == false`、`new SystemTrayIcon()` 抛
+`Error #2012: SystemTrayIcon$ class cannot be instantiated.`。所以这条通道是**超集增强**（见
+[`enhancements.md`](enhancements.md) §4.11），默认关闭，且**默认产物与 AIR 逐字同形**。
+
+```bash
+# 默认：menu bar 里什么都不出现，supportsSystemTrayIcon 为 false，构造照旧 #2012
+as-aot app.as --air-app app.xml
+
+# 打开：同一段 AS3 拿到一个真的 NSStatusItem
+as-aot app.as --air-app app.xml --features tray
+```
+
+| 构建 | `NativeApplication.supportsSystemTrayIcon` | `new SystemTrayIcon()` |
+|---|---|---|
+| 默认 | `false`（与 `adl` 相同） | `#2012`（与 `adl` 相同） |
+| `--features tray` | `true` | 构造成功，出现菜单栏图标 |
+
+**可用条件**：`--target native` 且**宿主是 macOS**。两个条件都在**生成代码之前**校验：
+`--target wasm --features tray` 报 `feature 'tray' is not available with --target wasm`；
+在 Windows 宿主上报 `feature 'tray' needs a darwin host: the status item is an NSStatusItem (AppKit), so the channel only exists on macOS`。
+理由与 `raw`/`svg` 同一条：给用户一个「开了但编不进去」的开关比不给开关更坏。
+
+**打开之后的行为**（细节与实测证据见 [`enhancements.md`](enhancements.md) §4.11）：
+
+- `bitmaps` 的第一张有效 `BitmapData` 作为图标（ARGB 直通，胶水层预乘一次）；`tooltip` 原样上屏；
+  `menu` 展平成 `NSMenu` 挂到状态项，菜单项点击与 App / Dock 菜单**走同一条 tag 通道**（`Event.SELECT`）。
+- 点击派发 `flash.events.ScreenMouseEvent`：左键 `MouseEvent.CLICK`、右键 `MouseEvent.RIGHT_CLICK`，
+  `screenX`/`screenY` 是**点击点**的屏幕坐标（左上原点、point；多显示器时按**主显示器**高度翻转 y ——
+  `[NSScreen mainScreen]` 是「键盘焦点所在屏」，用它会在副屏上算错）。
+- **一个进程一个状态项**：再 `new` 一个复用同一槽位，最后构造的那个拥有它（AIR 无 macOS 行为可抄，故固定并写明）。
+
+清单里同名字段：`{ "features": ["tray"] }`；`examples/status-item.as` + `examples/status-item.build.json`
+是最小可用例子。
 
 ### 3.5 AIR 应用描述符（--air-app）
 

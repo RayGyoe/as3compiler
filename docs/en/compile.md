@@ -358,6 +358,7 @@ as-aot app.as --air-app app.xml --features none     # clear (see below: this cle
 | `svg` | `ASC_USE_SVG=1` | `native` only | see §3.4.3 |
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | `native` / `wasm` | extra image formats WebP / BMP / ICO (AIR reports `#2124` for them, hence **denied by default** — see §3.4.3.1) |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | `native` only | camera RAW / DNG (denied by default — see §3.4.3.1; the web-side Skia has no piex/dng_sdk archive, so it errors when the target is unsupported) |
+| `tray` | `ASC_USE_TRAY=1` | `native` only, **and the host must be macOS** | `SystemTrayIcon` behind a real `NSStatusItem` (see §3.4.5). AIR on macOS has no system tray at all (`supportsSystemTrayIcon=false`, `#2012`), hence off by default |
 
 The same-named field in the manifest is a **string array** with CLI-identical semantics:
 
@@ -371,13 +372,17 @@ Rules (all three exist to **not be silent**, AGENTS.md §1.5):
   isomorphic with `adl`. When enabled it prints a line
   `== enhancements: svg (-D ASC_USE_SVG=1) ==` and states in the hint that it is an AIR superset.
 - **An unknown name errors**, not silently ignored: `--features lottie` reports
-  `unknown feature 'lottie' (known: formats, raw, svg)` and exits **before generating any code** (only
+  `unknown feature 'lottie' (known: formats, raw, svg, tray)` and exits **before generating any code** (only
   capabilities already implemented in the manifest are registered; a registered-but-unimplemented switch
   would give the user something that "looks enabled but was never compiled in"). `--features none` cannot be
   combined with other names.
 - **An unsupported target errors**: `--target wasm --features svg` directly reports
   `feature 'svg' is not available with --target wasm`, rather than leaving `undefined symbol: sk_svg_*` to the
   linker.
+
+A `native` build targets **this** machine, so a host-specific channel is checked one level tighter:
+`--features tray` off macOS reports `feature 'tray' needs a darwin host: ...` (otherwise the user gets a switch
+that "works" and does nothing on the very platform it exists for).
 
 The difference between `--features` and `-D`: `-D` **appends** one macro, while `--features` **replaces** the
 whole enhancement set — only replace semantics can express "svg was on, but I want only something else".
@@ -477,6 +482,45 @@ exactly this shape):
 > see a `ld: warning: ignoring duplicate libraries: '-lz'` notice, with no side effects). Acceptance
 > criterion: the output of `otool -L` **should not** contain `libcurl.4.dylib`/`libz.dylib`.
 > **The default build (not declaring these macros/libraries) is entirely unaffected.**
+
+#### 3.4.5 Menu-bar status item (`tray` / `ASC_USE_TRAY`)
+
+`flash.desktop.SystemTrayIcon` **does not exist in AIR on macOS**: measured on `adl 51.4.1`,
+`NativeApplication.supportsSystemTrayIcon == false` and `new SystemTrayIcon()` throws
+`Error #2012: SystemTrayIcon$ class cannot be instantiated.` So this channel is a **superset enhancement**
+(see [`enhancements.md`](enhancements.md) §4.11), off by default, and the default artifact is
+**isomorphic with AIR down to the wording**.
+
+```bash
+# default: nothing appears in the menu bar, supportsSystemTrayIcon is false, construction throws #2012
+as-aot app.as --air-app app.xml
+
+# enabled: the same AS3 gets a real NSStatusItem
+as-aot app.as --air-app app.xml --features tray
+```
+
+| Build | `NativeApplication.supportsSystemTrayIcon` | `new SystemTrayIcon()` |
+|---|---|---|
+| default | `false` (as in `adl`) | `#2012` (as in `adl`) |
+| `--features tray` | `true` | constructs; an icon appears in the menu bar |
+
+**Availability**: `--target native` **and a macOS host** — both validated before any code is generated
+(see §3.4.2). Same rule as `raw`/`svg`: a switch that cannot be compiled in is worse than no switch.
+
+**Behaviour once enabled** (details and measured evidence in [`enhancements.md`](enhancements.md) §4.11):
+
+- The first valid `BitmapData` in `bitmaps` becomes the image (ARGB straight through, premultiplied once in
+  the glue); `tooltip` is applied verbatim; `menu` is flattened into an `NSMenu` whose item clicks go through
+  the **same tag channel** as the app / Dock menus (`Event.SELECT`).
+- A click dispatches `flash.events.ScreenMouseEvent`: left -> `MouseEvent.CLICK`, right ->
+  `MouseEvent.RIGHT_CLICK`, with `screenX`/`screenY` = the **clicked point** in screen points (top-left
+  origin; the y flip uses the **primary** display's height — `[NSScreen mainScreen]` is the
+  keyboard-focus screen and gets this wrong on a second display).
+- **One status item per process**: constructing a second one reuses the same slot, and the last constructed
+  icon owns it (AIR has no macOS behaviour to copy, so this is fixed and documented).
+
+Manifest field: `{ "features": ["tray"] }`; `examples/status-item.as` + `examples/status-item.build.json` are
+the minimal working example.
 
 ### 3.5 AIR Application Descriptor (--air-app)
 

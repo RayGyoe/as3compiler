@@ -65,14 +65,15 @@ as-aot app.as --air-app app.xml --features svg     # 等于 -D ASC_USE_SVG=1
 | 集合语义 | 只能追加 | `--features` **替换**整个集合（`-D` 才是追加），故「只留 X」可表达；`--features none` 清空 |
 
 **只有真正端到端实现过的通道才会登记为名字**。登记一个没实现的开关，等于给用户一个「看着开了、
-实际没编进去」的东西——比不提供开关更坏。故当前登记三个：`svg`（E1）、`formats`（E3）、`raw`（E4）；
-E2（Lottie）实现后才登记。下表是当前生效的名字与宏（`--help` 与报错文案都列它）：
+实际没编进去」的东西——比不提供开关更坏。故当前登记四个：`svg`（E1）、`formats`（E3）、`raw`（E4）、
+`tray`（E19）；E2（Lottie）实现后才登记。下表是当前生效的名字与宏（`--help` 与报错文案都列它）：
 
 | 名字 | 宏 | 可用的编译目标 | 开的通道 |
 |---|---|---|---|
 | `svg` | `ASC_USE_SVG=1` | native | E1：`Loader` 解码 SVG（web 无 svg/sksg/expat 归档） |
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | native / wasm | E3：额外图片格式 WebP / BMP / ICO |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | native | E4：相机 RAW / DNG（web 无 piex/dng_sdk 归档） |
+| `tray` | `ASC_USE_TRAY=1` | native（**且宿主须为 macOS**） | E19：`SystemTrayIcon` 背后是真 `NSStatusItem`（AIR 在 macOS 上根本没有托盘） |
 
 **默认拒绝（阶段九十四·二十五）**：E3/E4 的通道此前是「零代码可用」——我们的 Skia 本来就带这些
 codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `#2124`，我们却解出来了。这违反
@@ -104,7 +105,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 
 ## 3. 增强待做清单
 
-> **已完成 7 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询、E18 带状态码退出（`System.exit`）。
+> **已完成 8 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询、E18 带状态码退出（`System.exit`）、E19 macOS 菜单栏状态项（`SystemTrayIcon`）。
 > **另有 1 项现状即增强、无需开工**：E17（无 GPU 后端时 `Context3D.profile` 报 `baselineExtended`）——
 > AIR 的 `software` 渲染模式在这里会直接 `#3702`，我们照常给上下文；详细实测见
 > [`display3d.md`](display3d.md) §9.14。
@@ -138,6 +139,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 | E16 | **显示器刷新率查询**（`VsyncStateChangeAvailabilityEvent.refreshRate`） | ✗ **无任何刷新率查询 API**（实测 `adl 51.4.1` 只派发 `vSyncStateChangeAvailability` 且只带只读的 `available=false`） | ✅ **已实现**：事件增加只读 `refreshRate:Number`（构造器第 5 个**可选**参数，缺省 `0`）；启动后首个已知帧 + 窗口落到不同速率显示器时各派发一次 | 两端（**web/离屏无对应物 ⇒ 如实不派发**，不伪造 `0`） | **已完成** |
 | E17 | **无 GPU 后端时的 `Context3D.profile`**（纯 C 状态机报 `baselineExtended`） | ✗ AIR 的 `software` 渲染模式**锁死 `baseline`**：请求 `baselineExtended`/`enhanced` 异步抛 `#3702`，`createTexture(4096)` 报 `#3683 (max is 2048x2048)`、`maxBackBuffer` 只有 2048×2048 | ✅ **现状即增强**：未链接 Stage3D 后端时仍建上下文、报 `baselineExtended`、按 4096 校验（纹理只在 CPU 里，不占显存）；`driverInfo` 如实报 `"Software (state machine)"` | 两端（纯 C，无胶水依赖） | **已有（刻意保留，非开关）** |
 | E18 | **带状态码的退出**（`flash.system.System.exit(code:uint)`） | ✗ **明确不支持**：`mxmlc` 认得这个签名，但 AIR **运行时**抛 `IllegalOperationError #2018`（`The System.exit() method is not supported.`，`adl 51.4.1` 未打包实测，见 `TODO.md` 阶段一百二十五）；AIR 里**没有任何**带状态码的退出 API（`NativeApplication.exit()` 无参） | ✅ **已实现（阶段二百四十五）**：记下 `code` 后走**与 `NativeApplication.exit()` 同一条**收尾路径（`as_window_request_exit()`），`main` 以它为**进程状态码**返回；`System` 的未知成员改报 `System has no member 'X'`（此前误报 `undefined variable 'System'`）。见 §4.10 | 两端（native：状态码即进程状态；WASI：crt 用 `main` 返回值 `__wasi_proc_exit`，实测 `WASI_EXIT=7`） | **已完成** |
+| E19 | **macOS 菜单栏状态项**（`flash.desktop.SystemTrayIcon` 背后是真 `NSStatusItem`） | ✗ **这台机器上压根没有**：实测 `adl 51.4.1` / macOS 的 `NativeApplication.supportsSystemTrayIcon` 为 `false`，`new SystemTrayIcon()` 抛 `#2012` | ✅ **已实现、opt-in 具名开关 `--features tray`**：默认构建照旧 `supportsSystemTrayIcon=false` + `#2012`（与 AIR 逐字同形）；开开关后同一段 AS3 拿到一个真状态项，点击派发 `ScreenMouseEvent`（`click`/`rightClick`，带屏幕坐标与修饰键），`menu` 走与 App/Dock 菜单同一条 tag 通道（见 §4.11） | native / macOS 宿主 | **已完成（opt-in）** |
 
 ---
 
@@ -508,6 +510,37 @@ C 侧 `hand.c`/`hand_small.c` 与 AS3 侧 `saxpy.as`/`saxpy_fn.as` **同规模�
   `as_window_request_exit()`、arity 文案改串）。
 - **已知比 AIR 宽松的一处**：`System.exit(true)` 我们接受（`(unsigned)true`），`mxmlc` 在编译期拒绝（`Boolean` 无隐式转换到
   `uint`）。这是「`uint` 形参一律按数值转换」的既有全局口径，未为单个 API 特殊化。
+
+### 4.11 E19 — macOS 菜单栏状态项（`SystemTrayIcon`）—— ✅ **已完成（opt-in）**
+
+- **判定**（AGENTS §1.5 硬判据）：`adl 51.4.1` 在 **macOS** 上 `NativeApplication.supportsSystemTrayIcon == false`、
+  `new SystemTrayIcon()` 抛 `Error #2012: SystemTrayIcon$ class cannot be instantiated.` ⇒ AIR 在本平台**没有对应物**
+  ⇒ 做出来是**增强**，不是补平差距（同一份 AS3 在 Windows 的 AIR 上是有托盘的，所以这不是「AIR 不支持」，而是
+  「AIR 在 macOS 不支持」——这也正是它必须是 opt-in 的原因：默认产物要与本平台的 AIR 同形）。
+- **开关**：`--features tray`（= `-D ASC_USE_TRAY=1`）。可用目标是 `native`，**且要求宿主就是 macOS**——`native` 编的
+  是本机可执行文件，所以这条能前置校验；在别的宿主上直接报
+  `feature 'tray' needs a darwin host`（而不是给一个什么都不做的开关）。
+- **默认（不开开关）**：`supportsSystemTrayIcon` 仍为 `false`，`new SystemTrayIcon()` 仍抛 `#2012`，**菜单栏不出现任何东西**。
+  钉在 `unit: emit/SystemTrayIcon`（33 条）。
+- **开了之后的行为**（全部为实测，证据见本节末尾）：
+  - 构造即安装一个 `NSStatusItem`（`NSVariableStatusItemLength`），`bitmaps` 第一张有效位图作图标（**直通 ARGB、
+    由胶水层预乘一次**，与 Dock 图标同一条规则），`tooltip` 原样上屏，`menu` 展平成 `NSMenu` 挂到状态项上。
+  - **点击派发 `ScreenMouseEvent`**：左键 `MouseEvent.CLICK`、右键 `MouseEvent.RIGHT_CLICK`，`screenX/screenY` 是
+    **点击点**的屏幕坐标（左上原点、point），`commandKey/controlKey/altKey/shiftKey` 取自当时的修饰键，`isRelatedObjectInaccessible=false`。
+  - **菜单项点击**走 `as_menu_click_cb`，即与 App 菜单 / Dock 菜单**同一条 tag 通道**：`NativeMenuItem` 与其所在
+    `NativeMenu` 各收一次 `Event.SELECT`。三个安装目标共用一张 tag 表，托盘的那段从 `appItems + dockItems` 之后开始。
+- **跨端差异（显式列出）**：同一段 AS3 在 `adl`（macOS）上抛 `#2012`，在本构建上拿到真状态项 —— 这是**有意的分歧**，
+  且只有显式打开开关的程序才看得到。web/WASI 目标上这个开关被前置拒绝。
+- **已知边界（如实登记，不假装完备）**：
+  - **一个进程一个状态项**：第二次 `new SystemTrayIcon()` 复用同一个菜单栏槽位（胶水层 `g_tray_created` 早返回），
+    即「最后构造的那个图标拥有它」。AIR 在 macOS 上没有行为可抄，Windows 侧未实测，故按最保守的语义固定并文档化。
+  - **`icon.menu` 的键盘等价键（`keyEquivalent`）未映射修饰键**：与 App/Dock 菜单同一条既有口径，见 `TODO.md` 遗留表。
+  - **不显示 Windows 那种气泡通知**（`SystemTrayIcon` 的 balloon 系列 AIR 本来就没有）。
+- **证据**：真机验收 —— 状态项出现在菜单栏（`menubar.png`）、`ScreenMouseEvent` 的 `screenX/screenY` 与 AX 报告的
+  状态项位置逐点吻合（AX `(1110,7) 40×24` vs 点击 `(1130,19)`）、右键 `rightClick`、菜单项点击收到 `Event.SELECT`
+  （`temp/trayprobe/live-log.txt`：`CLICK` / `RIGHT_CLICK` / `MENU SELECT from Open Panel`）；
+  示例 `examples/status-item.as`（23 断言，带 `features: ["tray"]` 清单）；单元 `unit: emit/SystemTrayIcon`（33 条）
+  与 `[features]` 组的 8 条（含「默认构建不链 `statusitem_glue.cc`」「非 macOS 宿主拒绝」两个反向对照）。
 
 ---
 ## 5. 与排期 / 回归的关系

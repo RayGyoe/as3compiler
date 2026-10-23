@@ -523,7 +523,50 @@ function checkFeatures(): string[] {
     catch (e) { return String(e).includes("unknown feature 'lottie'") && String(e).includes(knownFeatures().join(', ')); }
   })());
   check('only implemented channels are offered as features',
-    knownFeatures().join(',') === 'formats,raw,svg');
+    knownFeatures().join(',') === 'formats,raw,svg,tray');
+
+  // (3c) E6 / 阶段二百六十: `tray` -- a REAL macOS menu-bar status item. The one
+  // claim that has to hold on every machine is the DEFAULT: without the switch the
+  // artifact is AIR-isomorphic (SystemTrayIcon refuses to construct, see
+  // unit: emit/SystemTrayIcon). With it, the channel is native-only and
+  // darwin-only, and both are refused up front rather than left to the linker.
+  const withTray: BuildConfig = { ...dflt, features: ['tray'] };
+  check('feature tray resolves to its macro',
+    effectiveDefines(withTray).includes('ASC_USE_TRAY=1'));
+  check('tray is native-only', (() => {
+    try { validateFeatures(['tray'], 'wasm'); return false; }
+    catch (e) { return String(e).includes('native'); }
+  })());
+  // A native build targets THIS host, so a Cocoa-only channel can be checked
+  // exactly: on a non-macOS host the glue is an inert stub and the switch would do
+  // nothing on the machine it exists for.
+  check('tray is refused off-macOS', (() => {
+    const real = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try { validateFeatures(['tray'], 'native'); return false; }
+    catch (e) { return String(e).includes('needs a darwin host'); }
+    finally { Object.defineProperty(process, 'platform', { value: real, configurable: true }); }
+  })());
+  if (process.platform === 'darwin') {
+    check('tray is accepted on a macOS host', (() => {
+      try { validateFeatures(['tray'], 'native'); return true; } catch { return false; }
+    })());
+  }
+  // The glue translation unit rides on the switch, in the build MANIFEST -- not on
+  // the link line of every app (its definitions would be dead weight, and the
+  // system tray is not part of the AIR surface this compiler mirrors).
+  {
+    const withTrayM = airManifest('vendor', true, true, true, false, 'auto', false, true,
+      [], [], [], [], true, false, '64', ['tray']) as Record<string, unknown>;
+    const withoutTray = airManifest('vendor', true, true, true, false, 'auto', false, true,
+      [], [], [], [], true, false, '64') as Record<string, unknown>;
+    check('--features tray puts statusitem_glue.cc on the link line',
+      (withTrayM['sources'] as string[]).some((p) => p.endsWith('statusitem_glue.cc')));
+    check('a default build links none of it',
+      !(withoutTray['sources'] as string[]).some((p) => p.endsWith('statusitem_glue.cc')));
+    check('...and still links the window glue it depends on',
+      (withTrayM['sources'] as string[]).some((p) => p.endsWith('window_glue.cc')));
+  }
 
   // (3b) E3/E4: the default-deny pair. Two claims, and the second is the whole
   // reason the pair exists -- our Skia CAN decode these, so only the missing macro
