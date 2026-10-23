@@ -222,9 +222,22 @@ function makeOdFragment():ByteArray {
   return ba;
 }
 var odglsl:String = AGALTranslator.translate(makeOdFragment(), "glsl");
-has(odglsl, "gl_FragDepth", "od write maps to gl_FragDepth");
+// ES 1.00 源里没有 gl_FragDepth（那是 ES 3.00 的名字），只有扩展提供的 gl_FragDepthEXT。
+has(odglsl, "gl_FragDepthEXT = od.x;", "od write maps to gl_FragDepthEXT");
+has(odglsl, "vec4 od;", "GLSL declares the four-component od local");
 has(odglsl, "#extension GL_EXT_frag_depth : enable", "od enables GL_EXT_frag_depth");
 check(fglsl.indexOf("#extension GL_EXT_frag_depth") < 0, "programs without od must not request the extension");
+
+// 同一段 AGAL 在 MSL 上必须真的编得过：Metal 没有 gl_FragDepth 这类内建，深度只能从
+// 片段输出结构体的 [[depth(any)]] 成员交出，所以入口返回 FSOut 而不是 float4，od 也必须
+// 先落成 float4 局部（写掩码 0xF 会发 'od = ft0'，标量装不下 float4）。
+var odmsl:String = AGALTranslator.translate(makeOdFragment(), "msl");
+has(odmsl, "struct FSOut {", "MSL od declares a fragment output struct");
+has(odmsl, "float depth [[depth(any)]];", "MSL od writes the [[depth(any)]] member");
+has(odmsl, "fragment FSOut fs_main(", "MSL od changes the entry return type");
+has(odmsl, "float4 od;", "MSL declares the four-component od local");
+has(odmsl, "fso.depth = od.x;", "MSL copies od.x into the depth member");
+check(fmsl.indexOf("depth(any)") < 0, "programs without od must not declare a depth output");
 
 // 全掩码比较指令（sge/slt/seq/sne）：按分量产出 0.0/1.0 掩码。两个目标的实现形态不同
 // （MSL select() 收 float4 分量布尔，GLSL mix()+bvec→vec4 转换），曾因用「三元格式串」
@@ -338,7 +351,8 @@ has(mmhlsl, "ft2.y = fs3.Sample(smp3, input.v1.xy).y;", "HLSL masked tex expands
 // 片段深度输出（od）：HLSL 用 SV_Depth 系统值语义，且要求每条执行路径都写到。
 var odhlsl:String = AGALTranslator.translate(makeOdFragment(), "hlsl");
 has(odhlsl, "float depth : SV_Depth;", "HLSL od write declares the SV_Depth output");
-has(odhlsl, "output.depth = od;", "HLSL od is written unconditionally");
+has(odhlsl, "float4 od;", "HLSL declares the four-component od local");
+has(odhlsl, "output.depth = od.x;", "HLSL od is written unconditionally");
 check(odhlsl.indexOf("gl_FragDepth") < 0, "HLSL must not use gl_FragDepth");
 
 // 比较指令：全掩码在 HLSL 里是「bool4 -> float4 构造」（HLSL 允许这种逐分量转换），
@@ -409,6 +423,37 @@ has(iidhlsl, "VSOut vs_main(uint iid : SV_InstanceID) {", "HLSL iid comes from S
 has(iidhlsl, "vt0 = float4(iid, iid, iid, iid);", "HLSL iid is broadcast to a float4");
 check(iidhlsl.indexOf("struct VSIn") < 0, "HLSL omits the stage-input struct when no attribute is read");
 
+// 同一段 AGAL 在 MSL 上：iid 是 [[instance_id]] 系统值（uint），同样广播成 float4。
+// 这里同时锁住「不读顶点属性也不声明空 VSIn 结构体」。
+var iidmsl:String = AGALTranslator.translate(makeIidVertex(), "msl");
+has(iidmsl, "uint iid [[instance_id]]", "MSL iid comes from instance_id");
+has(iidmsl, "vt0 = float4(iid, iid, iid, iid);", "MSL iid is broadcast to a float4");
+check(iidmsl.indexOf("struct VSIn") < 0, "MSL omits the stage-input struct when no attribute is read");
+check(iidmsl.indexOf("r0") < 0, "MSL must not translate iid to an undeclared register");
+
+// GLSL ES 1.00 没有 gl_InstanceID（那是 ES 3.00），三档里只有它给不出 iid：明确拒绝，
+// 而不是发一个未声明的标识符让驱动去抱怨。
+var iidglslThrew:Boolean = false;
+try { AGALTranslator.translate(makeIidVertex(), "glsl"); } catch (e:Error) { iidglslThrew = true; }
+check(iidglslThrew, "iid must be refused loudly on the GLSL target");
+
+// iid 在 AGAL3 里只读于顶点程序；片段程序读它没有阶段能供给，同样明确拒绝。
+function makeIidFragment():ByteArray {
+  var ba:ByteArray = new ByteArray();
+  ba.writeByte(0xA0); u32le(ba, 1); ba.writeByte(0xA1); ba.writeByte(0x01);
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 0, 0xF));
+  u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(7));
+  u32le(ba, 0); u32le(ba, 0);
+  return ba;
+}
+for (var fi:int = 0; fi < 3; fi++) {
+  var ftgt:String = fi == 0 ? "msl" : (fi == 1 ? "glsl" : "hlsl");
+  var fiThrew:Boolean = false;
+  try { AGALTranslator.translate(makeIidFragment(), ftgt); } catch (e:Error) { fiThrew = true; }
+  check(fiThrew, "iid in a fragment program must be refused for target " + ftgt);
+}
+
 // 同理：不读 varying 的片元程序不能声明 struct FSIn {}，入口也不带参数。
 function makeConstantFragment():ByteArray {
   var ba:ByteArray = new ByteArray();
@@ -423,6 +468,10 @@ function makeConstantFragment():ByteArray {
 var cfhlsl:String = AGALTranslator.translate(makeConstantFragment(), "hlsl");
 has(cfhlsl, "FSOut fs_main() {", "HLSL fragment entry takes no stage-input struct when it reads no varying");
 check(cfhlsl.indexOf("struct FSIn") < 0, "HLSL omits the stage-input struct when no varying is read");
+// MSL 接受空结构体，但没必要发：入口参数跟着实际读的 varying 走，三档同一口径。
+var cfmsl:String = AGALTranslator.translate(makeConstantFragment(), "msl");
+has(cfmsl, "fragment float4 fs_main(\n  constant float4* fc [[buffer(0)]]", "MSL fragment entry drops the unused stage_in");
+check(cfmsl.indexOf("struct FSIn") < 0, "MSL omits the stage-input struct when no varying is read");
 
 // tld（AGAL3 顶点纹理取样）在三个目标上都明确不支持：它的 LOD 来源在 AIR 上无法实测
 // （Adobe 的 AGAL 参考页已 404），而静默丢掉一条指令会让像素悄悄错掉（AGENTS.md 2.5 禁止）。

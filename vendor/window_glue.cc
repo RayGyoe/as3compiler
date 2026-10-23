@@ -2863,6 +2863,33 @@ static void* sk_nsmenu_new(const char* title) {
   return m;
 }
 
+// keyEquivalentModifiers -> AppKit's mask.
+//
+// The four single modifiers were identified by pressing real keys at a real adl
+// menu bar (temp/keyeqprobe): 15 = Cmd, 16 = Shift, 17 = Control, 18 = Option,
+// 19 = none (and an empty array behaves like 19), 20 = INERT -- the item shows a
+// plain "S" in the dropdown yet no combination of the four modifiers ever fired
+// it, while [15,20] fired on Cmd+S exactly like [15]. AS_KEM_DEAD therefore
+// carries 20 on its own: when nothing else is set the shortcut must stay
+// unreachable. NSEventModifierFlagFunction (the Fn key) reproduces that: AppKit
+// renders no glyph for it and none of the four keys can produce it, so the item
+// keeps its "S" text and never fires. The mechanism AIR uses internally is not
+// observable; only these two outcomes are measured.
+#define SK_MOD_CMD     (1UL << 20)  // NSEventModifierFlagCommand
+#define SK_MOD_SHIFT   (1UL << 17)  // NSEventModifierFlagShift
+#define SK_MOD_CTRL    (1UL << 18)  // NSEventModifierFlagControl
+#define SK_MOD_OPT     (1UL << 19)  // NSEventModifierFlagOption
+#define SK_MOD_FN      (1UL << 23)  // NSEventModifierFlagFunction
+static void sk_menu_apply_mods(void* item, int mods) {
+  unsigned long mask = 0;
+  if (mods & 1) mask |= SK_MOD_CMD;
+  if (mods & 2) mask |= SK_MOD_SHIFT;
+  if (mods & 4) mask |= SK_MOD_CTRL;
+  if (mods & 8) mask |= SK_MOD_OPT;
+  if (mask == 0 && (mods & 16)) mask |= SK_MOD_FN;
+  sk_send_void_int(item, "setKeyEquivalentModifierMask:", (long)mask);
+}
+
 // Build one NSMenu (and, recursively, its submenus) out of the flattened model.
 static void* sk_menu_build(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root) {
   if (menus == NULL || root < 0 || root >= nmenus) return NULL;
@@ -2880,9 +2907,7 @@ static void* sk_menu_build(const sk_menu_t* menus, int nmenus, const sk_menu_ite
         sk_nsstring(items[k].label), sel_registerName("skFired:"), sk_nsstring(items[k].key));
     sk_send_void_obj(item, "setTarget:", sk_menu_target());
     sk_send_void_int(item, "setTag:", items[k].tag);
-    // keyEquivalentModifiers is NOT applied: the six legal AS3 values (15..20) are
-    // not mapped to NSEventModifierFlags yet, and the caller reports that loudly
-    // instead of binding a wrong shortcut. See TODO.md 遗留待开发.
+    sk_menu_apply_mods(item, items[k].mods);
     if (items[k].submenu >= 0) {
       void* sub = sk_menu_build(menus, nmenus, items, nitems, items[k].submenu);
       if (sub != NULL) {

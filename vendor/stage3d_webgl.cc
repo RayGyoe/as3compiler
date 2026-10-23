@@ -463,6 +463,15 @@ void* s3d_create(int width, int height) {
   c->colorMaskR = c->colorMaskG = c->colorMaskB = c->colorMaskA = 1;
   c->uniVC[0] = -1;  // memset already zeroed; -1 marks "not linked yet"
   for (int i = 0; i < 256; i++) { c->uniVC[i] = -1; c->uniFC[i] = -1; }
+  // WebGL only lets a shader use '#extension GL_EXT_frag_depth' after the
+  // CONTEXT has enabled it through getExtension -- the shader-side directive alone
+  // is rejected with "extension is not supported" (measured in Chrome/ANGLE:
+  // temp/metalshader/glslcheck.html vs glslcheck2.html, the only difference being
+  // this call). Without it every AGAL program that writes `od` failed to compile
+  // even though its GLSL was valid ES 1.00.
+  // Returns 0 when the platform does not offer it; the od shader then fails to
+  // compile with a clear driver message instead of silently dropping the write.
+  emscripten_webgl_enable_extension(emscripten_webgl_get_current_context(), "EXT_frag_depth");
   if (!s3d_alloc_target(c, width, height)) { delete c; return NULL; }
   glGenVertexArrays(1, &c->vao);
   s3d_register_ctx(c);

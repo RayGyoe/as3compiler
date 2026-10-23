@@ -3669,12 +3669,19 @@ function checkEmitNativeMenu(): string[] {
     c.includes('flash.display.NativeMenu.display (this backend cannot run a modal native menu)'));
   check('startAtLogin throws #2014 like adl',
     c.includes('as_throw(IllegalOperationError_new') && c.includes('2014'));
-  // An unapplied modifier set is REPORTED, not silently dropped: the glue binds
-  // the keyEquivalent without the flags, so the shortcut would fire as if the AS3
-  // code had asked for AppKit's defaults.
-  check('an unapplied keyEquivalentModifiers set is reported once',
-    c.includes('NativeMenuItem.keyEquivalentModifiers (this backend binds the keyEquivalent but does not apply the modifier flags yet)')
-    && c.includes('as_menu_note_mods(it);'));
+  // keyEquivalentModifiers is MAPPED now, not reported away. The table in the
+  // generated C is the measured one (temp/keyeqprobe: real keys at a real adl menu
+  // bar + a screen grab of the open dropdown), and it must stay separate from the
+  // bit the backends treat as "unreachable shortcut".
+  check('keyEquivalentModifiers is translated into portable bits',
+    c.includes('static int as_menu_mods(NativeMenuItem* it)')
+    && c.includes('c->items[k].mods = as_menu_mods(it);'));
+  check('the measured modifier table is in the generated C',
+    c.includes('#define AS_KEM_CMD   1')
+    && c.includes('else if (d == 18.0) m |= AS_KEM_OPT;')
+    && c.includes('else if (d == 20.0) m |= AS_KEM_DEAD;'));
+  check('an unmapped modifier set is no longer reported as unsupported',
+    !c.includes('does not apply the modifier flags yet'));
 
   console.log(`     [menu] ${ok} check(s) passed`);
   return bad;
@@ -3977,6 +3984,23 @@ function checkEmitSystemTrayIcon(): string[] {
   check('creation is once-per-process', /if \(g_tray_created \|\| NSApp == NULL\) return;/.test(glue));
   check('an install before NSApp exists is retried, not dropped',
     glue.includes('"NSApplicationDidFinishLaunchingNotification"') && glue.includes('static void sk_tray_flush(void) {'));
+  // keyEquivalentModifiers reaches AppKit as a real mask now. The four single
+  // modifiers were identified by pressing synthesized keys at a real adl menu bar
+  // and reading the open dropdown's glyph column (temp/keyeqprobe): 15 Cmd,
+  // 16 Shift, 17 Control, 18 Option, 19 none, 20 "shows S but never fires".
+  check('the tray menu applies the modifier mask',
+    glue.includes('sk_menu_apply_mods(item, items[k].mods);')
+    && glue.includes('"setKeyEquivalentModifierMask:"'));
+  check('the tray mask maps the four measured modifiers and keeps 20 unreachable',
+    glue.includes('#define SK_MOD_CMD     (1UL << 20)')
+    && glue.includes('#define SK_MOD_OPT     (1UL << 19)')
+    && glue.includes('if (mask == 0 && (mods & 16)) mask |= SK_MOD_FN;'));
+  const winGlue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
+  check('the app/Dock menus use the same measured table',
+    winGlue.includes('sk_menu_apply_mods(item, items[k].mods);')
+    && winGlue.includes('#define SK_MOD_CTRL    (1UL << 18)')
+    && !winGlue.includes('not mapped to NSEventModifierFlags yet'));
+
   check('the non-Cocoa build still defines all four seams',
     /void sk_tray_set_image\(const void\* argb, int w, int h\) \{ \(void\)argb; \(void\)w; \(void\)h; \}/.test(glue)
     && glue.includes('void sk_tray_set_tooltip(const char* text) { (void)text; }'));

@@ -9301,7 +9301,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
 static bool ASC_menu_reported_unsupported = false;
 
 static void as_menu_sync(NativeMenu* from);
-static void as_menu_note_mods(NativeMenuItem* it);
+// Portable modifier bits handed to the backend glue (see as_menu_mods below).
+#define AS_KEM_CMD   1
+#define AS_KEM_SHIFT 2
+#define AS_KEM_CTRL  4
+#define AS_KEM_OPT   8
+#define AS_KEM_DEAD  16
+static int as_menu_mods(NativeMenuItem* it);
 static DockIcon* as_dock_icon_get(void);
 static void as_dock_icon_sync(Icon* o);
 
@@ -9625,12 +9631,11 @@ static int as_menu_fill(NativeMenu* m, as_menu_ctx* c, int depth) {
     c->items[k].enabled = it->enabled ? 1 : 0;
     c->items[k].checked = it->checked ? 1 : 0;
     c->items[k].key = it->_keyeq != NULL ? it->_keyeq : (char*)"";
-    c->items[k].mods = 0;
+    c->items[k].mods = as_menu_mods(it);
     c->items[k].submenu = -1;
     c->items[k].tag = c->tag_base + k + 1;
     as_array_push(ASC_menu_tags, v);
     c->menus[idx].count++;
-    as_menu_note_mods(it);
   }
   // Pass 2: with the parent's range fixed, append each submenu (depth-first) and
   // patch its index back into the parent's slot.
@@ -9800,16 +9805,34 @@ void DockIcon_set_bitmaps(void* _this, as_array* v) {
 // nothing to report.
 static bool ASC_dock_image_reported = false;
 #endif
-// Same shape for the modifier flags: the glue binds the keyEquivalent but does not
-// translate the six legal AS3 values (15..20) into NSEventModifierFlags yet, so a
-// shortcut would fire with AppKit's defaults instead of what the AS3 code asked
-// for. Reported once instead of binding a wrong shortcut in silence.
-static bool ASC_mods_reported = false;
-static void as_menu_note_mods(NativeMenuItem* it) {
-  if (ASC_mods_reported || it == NULL || it->_keyeq == NULL || it->_keyeq[0] == 0) return;
-  if (it->_mods != NULL && it->_mods->length == 1 && it->_mods->data[0].num == 15.0) return;
-  ASC_mods_reported = true;
-  as_shell_unsupported((char*)"NativeMenuItem.keyEquivalentModifiers (this backend binds the keyEquivalent but does not apply the modifier flags yet)");
+// keyEquivalentModifiers -> a portable bit set the backend turns into ITS modifier
+// flags. The AS3 side keeps only 15..20 (ascending, deduped), and what each number
+// MEANS was measured end to end (temp/keyeqprobe: adl 51.4.1, a real menu bar, real
+// synthesized keystrokes, and a screen grab of the open dropdown):
+//   15 -> Command   (the item displays and answers to Cmd+S)
+//   16 -> Shift     (Shift+S)
+//   17 -> Control   (Ctrl+S)
+//   18 -> Alternate (Opt+S)
+//   19 -> NONE      (plain S; an EMPTY array behaves the same way)
+//   20 -> INERT     (the item displays a plain "S" but NO key combination fires it;
+//                    combined with any of 15..18 it contributes nothing, e.g.
+//                    [15,20] answers to Cmd+S exactly like [15])
+// Hence AS_KEM_DEAD travels separately instead of being OR-ed into the mask: the
+// backend only has to make the shortcut unreachable when it is the sole bit.
+static int as_menu_mods(NativeMenuItem* it) {
+  int m = 0;
+  if (it == NULL || it->_mods == NULL) return 0;
+  for (int i = 0; i < it->_mods->length; i++) {
+    as_value v = it->_mods->data[i];
+    if (v.tag != 1) continue; /* the setter stores AS3 Numbers only (box tag 1) */
+    double d = v.num;
+    if (d == 15.0) m |= AS_KEM_CMD;
+    else if (d == 16.0) m |= AS_KEM_SHIFT;
+    else if (d == 17.0) m |= AS_KEM_CTRL;
+    else if (d == 18.0) m |= AS_KEM_OPT;
+    else if (d == 20.0) m |= AS_KEM_DEAD;
+  }
+  return m;
 }
 static void as_dock_icon_sync(Icon* o) {
   if (o != (Icon*)ASC_icon_singleton) return;

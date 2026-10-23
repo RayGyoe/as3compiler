@@ -216,6 +216,26 @@ static void* sk_nsmenu_new(const char* title) {
   return m;
 }
 
+// keyEquivalentModifiers -> AppKit's mask (same table as window_glue.cc's
+// sk_menu_apply_mods; measured in temp/keyeqprobe: 15 Cmd, 16 Shift, 17 Control,
+// 18 Option, 19 none, 20 INERT). 20 alone leaves the item showing a plain "S" that
+// no key combination can fire -- NSEventModifierFlagFunction reproduces both
+// outcomes (no glyph, unreachable from the four modifiers).
+#define SK_MOD_CMD     (1UL << 20)
+#define SK_MOD_SHIFT   (1UL << 17)
+#define SK_MOD_CTRL    (1UL << 18)
+#define SK_MOD_OPT     (1UL << 19)
+#define SK_MOD_FN      (1UL << 23)
+static void sk_menu_apply_mods(void* item, int mods) {
+  unsigned long mask = 0;
+  if (mods & 1) mask |= SK_MOD_CMD;
+  if (mods & 2) mask |= SK_MOD_SHIFT;
+  if (mods & 4) mask |= SK_MOD_CTRL;
+  if (mods & 8) mask |= SK_MOD_OPT;
+  if (mask == 0 && (mods & 16)) mask |= SK_MOD_FN;
+  sk_send_void_int(item, "setKeyEquivalentModifierMask:", (long)mask);
+}
+
 // Build one NSMenu (and recursively its submenus) out of the flattened model.
 // Same shape as window_glue.cc's sk_menu_build; the difference is the action
 // selector, which routes into this file's own tag callback.
@@ -235,10 +255,7 @@ static void* sk_tray_menu_build(const sk_menu_t* menus, int nmenus, const sk_men
         sk_nsstring(items[k].label), sel_registerName("skTrayItemFired:"), sk_nsstring(items[k].key));
     sk_send_void_obj(item, "setTarget:", sk_tray_target());
     sk_send_void_int(item, "setTag:", items[k].tag);
-    // keyEquivalentModifiers is NOT applied: the six legal AS3 values (15..20) are
-    // not mapped to NSEventModifierFlags yet, and the caller reports that loudly
-    // instead of binding a wrong shortcut (same rule as window_glue.cc's
-    // app/Dock menus). See TODO.md 遗留待开发.
+    sk_menu_apply_mods(item, items[k].mods);
     if (items[k].submenu >= 0) {
       void* sub = sk_tray_menu_build(menus, nmenus, items, nitems, items[k].submenu);
       if (sub != NULL) {

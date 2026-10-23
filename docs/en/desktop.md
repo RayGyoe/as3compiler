@@ -37,7 +37,7 @@
 | `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ always `false` (`supportsSystemTrayIcon` is `true` under `--features tray`) | matches what this backend actually implements by default (§2); the tray switch is in [`compile.md`](compile.md) §3.4.5 |
 | `NativeMenu` / `NativeMenuItem` | ✅ all members | list semantics, error codes and copy semantics match `adl` (§4, §5) |
 | `NativeMenu.display()` | ⚠️ reported | no modal native menu runner in this backend (§7.3) |
-| `keyEquivalentModifiers` | ⚠️ reported | the key is bound, the modifier flags are **not** translated (§7.2) |
+| `keyEquivalentModifiers` | ✅ mapped | `15..20` measured one by one, then translated to `NSEventModifierFlags` (§7.2) |
 
 ---
 
@@ -201,11 +201,33 @@ Measured on `adl 51.4.1`: assigning `null` kills the adl process. Per §1.5 we d
 behaviour, so this is **reported and leaves the menu unchanged**
 (`as_shell_unsupported("flash.desktop.NativeApplication.menu = null …")`).
 
-### 7.2 `keyEquivalentModifiers` is not translated to `NSEventModifierFlags`
+### 7.2 `keyEquivalentModifiers` → `NSEventModifierFlags`: the measured table
 
-The `keyEquivalent` is bound but the six legal values (`15..20`) are **not mapped**, so the shortcut would
-fire with AppKit's default modifiers. **Reported once** — never a silently wrong shortcut. Registered in
-`TODO.md`. (The `DockIcon.bitmaps` gap that used to sit here was paid off in stage 256 — see §3.1.)
+What the six legal values (`15..20`) mean was **measured, not looked up** — this SDK ships no
+`flash.ui.KeyboardModifier` class at all (verified against `airglobal.swc` and `mxmlc`), so behaviour is the
+only oracle: `temp/keyeqprobe/` (`adl 51.4.1`) installs a real menu bar, gives each of six items one value,
+presses synthesized keys through System Events to see which item gets `select`ed, and grabs the open dropdown
+with `screencapture` to read the **glyph column**.
+
+| Value | Meaning | Keys that fire it | Dropdown shows |
+|---|---|---|---|
+| 15 | Command | ⌘S | `⌘S` |
+| 16 | Shift | ⇧S | `⇧S` |
+| 17 | Control | ⌃S | `⌃S` |
+| 18 | Alternate | ⌥S | `⌥S` |
+| 19 | no modifier | plain `s` | `S` |
+| 20 | **inert** | **nothing fires it** | `S` |
+
+Three further measurements: an **empty array `[]` behaves like `[19]`** (plain `s` fires); **`[15,20]` behaves
+like `[15]`** (⌘S fires, 20 contributes nothing); **`[19,20]` reads back as `[20]`** and never fires.
+
+Implementation: the generated C folds the array into five portable bits
+(`AS_KEM_CMD/SHIFT/CTRL/OPT/DEAD`), and the glue's `sk_menu_apply_mods` (`vendor/window_glue.cc` and
+`vendor/statusitem_glue.cc`, one copy each) turns them into `setKeyEquivalentModifierMask:`.
+`20` on its own becomes **`NSEventModifierFlagFunction`**: AppKit draws no glyph for it and the four standard
+modifiers cannot produce it, which reproduces both observables — "shows `S`" and "never fires" (how AIR does it
+internally is **not observable**; only those two outcomes were measured).
+(The `DockIcon.bitmaps` gap that used to sit here was paid off in stage 256 — see §3.1.)
 
 ### 7.3 `NativeMenu.display()` has no modal backend
 

@@ -131,14 +131,25 @@ front-end "translate AS3→C" main pipeline, consistent with AGENTS.md §2.9's "
 iron rule. The real grunt work is in the AGAL validator (40+ errors) and the extensions of AGAL1/2/3's three
 generations (MRT, instancing, the `iid` register, `fragment output index`).
 
-> **Cross-target coverage gaps (faithfully recorded, filed in `TODO.md`'s `### 遗留待开发` table)**: three
-> features — fragment **MRT** (`oc1..oc3` → multiple outputs), the **depth output** (`od`), and the **AGAL3
-> `iid`** register — are currently complete only in the **HLSL target** (`SV_TargetN` / `SV_Depth` /
-> `SV_InstanceID`): MSL/GLSL still fold the fragment into a **single output** (`oc` / `gl_FragColor`), MSL's `od` is
-> **not declared** (GLSL goes through the built-in `gl_FragDepth`), and `iid` is translated into an **undeclared
-> `r<num>`**. These three are **old defects that predate HLSL** — the third target was the first thing that could
-> contrast them. **Do not confuse this with instancing itself**: `drawTrianglesInstanced` → `instanceCount` is
-> **on-screen on all three backends**; what is missing is only the shader's **per-instance ID register**.
+> **Cross-target coverage gaps (faithfully recorded)**: fragment **MRT** (`oc1..oc3` → multiple outputs) is
+> still complete only in the **HLSL target** (`SV_TargetN`); MSL/GLSL fold the fragment into a **single output**
+> (`oc` / `gl_FragColor`). That one is still filed in `TODO.md`'s `### 遗留待开发` table.
+>
+> **The depth output (`od`) and the AGAL3 `iid` register were closed in stage 261** (previously only the HLSL
+> target was right): `od` is a **local `float4 od`** on all three targets (a write mask of `0xF` produces a
+> whole-register store and `0x1` per-component stores, so a scalar cannot hold it) and the entry point copies
+> `od.x` into that target's depth slot — MSL `struct FSOut { … float depth [[depth(any)]]; }`, GLSL
+> `gl_FragDepthEXT = od.x;` (**not** `gl_FragDepth`, which is an ES 3.00 name that does not exist in an ES 1.00
+> source — and WebGL additionally requires the context to `getExtension('EXT_frag_depth')` first, see
+> `s3d_create` in `vendor/stage3d_webgl.cc`), HLSL `output.depth = od.x;`. `iid` comes from the host's system
+> value on MSL/HLSL (`uint iid [[instance_id]]` / `SV_InstanceID`) and is broadcast to a `float4`; **GLSL ES
+> 1.00 has no `gl_InstanceID`** (that is ES 3.00), so the GLSL target **refuses loudly**, and a fragment program
+> reading `iid` is refused on all three targets — no more undeclared `r<num>`. Empty `VSIn`/`FSIn` structs are
+> suppressed from real use, exactly like HLSL. **Do not confuse this with instancing itself**:
+> `drawTrianglesInstanced` → `instanceCount` is **on-screen on all three backends**; what is missing is only the
+> shader's **per-instance ID register** (which the GLSL target still cannot provide, hence the refusal).
+> Acceptance: `xcrun metal` compiles 7/7 (the two old shapes both fail), real WebGL compiles too, evidence in
+> `temp/metalshader/`.
 
 ---
 
@@ -204,7 +215,7 @@ through thirty-eight, doing only an **incremental extension** without introducin
 | **B AGAL kernel** | AGAL bytecode parser (AGAL1/2/3) + validator + →MSL/GLSL translator (**the hardest step**, a stage of its own) | ✅ stage eighty (one target); stage one-hundred-thirty-one added the HLSL target |
 | **C Context3D skeleton** | `Stage3D` + `Context3D` state machine + `VertexBuffer3D`/`IndexBuffer3D`/`Program3D`/`Texture`(BGRA/RGBA) + `drawTriangles`, `enableErrorChecking=false` taking the async path | ✅ stage eighty-one; stage eighty-seven added the Starling prerequisite methods |
 | **D end-to-end** | Land the raw Metal pipeline, get a "colored triangle" demo running, then roll out blend/depth/stencil/cull/scissor/render-to-texture | ✅ stages eighty-two~eighty-three (plus stage one-hundred-four per-frame batching, one-hundred-fifteen frame-boundary commit-only) |
-| **E alignment hardening** | `drawToBitmapData`, `setRenderToTexture`, CubeTexture/RectangleTexture, AGAL2/3 GPU-side end-to-end on-screen (MRT render pass / instancing) | ✅ stage eighty-three "instancing" on-screen; ⚠️ **MRT/`od`/`iid` complete only in HLSL** (see §3 and the `TODO.md` leftover table) |
+| **E alignment hardening** | `drawToBitmapData`, `setRenderToTexture`, CubeTexture/RectangleTexture, AGAL2/3 GPU-side end-to-end on-screen (MRT render pass / instancing) | ✅ stage eighty-three "instancing" on-screen; ✅ stage 261 closed `od`/`iid` on all three targets (the GLSL target refuses `iid`); ⚠️ **MRT is still HLSL-only** (see §3 and the `TODO.md` leftover table) |
 
 **The kernel translator supports all three AGAL1/2/3 generations; `Context3D.profile` still reports a fixed
 `"baseline"`** (`Context3D_get_profile` always returns `"baseline"`: AGAL1 capability + uncompressed 2D/cube
@@ -270,7 +281,7 @@ sprite engine predating Starling). Roughly 1806 lines of AS3:
 | Compressed textures (ATF/DXT/PVRTC) | ⚠️ **partial** (stage eighty-nine / twenty-one): the ATF container's `format 3/5` (raw DXT1/DXT5) is implemented — at runtime `as_atf_decode_dxt` decodes to straight-alpha ARGB on the CPU and takes the ordinary texture-upload path (no premultiply, consistent with adl handing raw DXT5 to the GPU; mip 1+ is not decoded, only level 0 taken); ETC1/PVRTC, cubemap, and `format 0xc/0xd` (JPEG-XR lossy) still **error loudly** (`Error #3680`), not silently producing an empty image |
 | Precise reporting of `driverInfo`/`totalGPUMemory`/`profile` | `driverInfo` reports four cases by **build-time backend macro**: `ASC_S3D_GLSL` → `"WebGL2 (Stage3D)"`, `ASC_S3D_HLSL` → `"Direct3D12 (Stage3D)"`, `ASC_RENDER_STAGE3D` → `"Metal (Stage3D)"`, otherwise `"Software (state machine)"`; the probe is `ASC_RENDER_STAGE3D` (**not** `ASC_RENDER_WINGPU`/`ASC_RENDER_METAL`, which denote only the window-compositing backend, see the comment on that function in `emit.ts`). `profile` is fixed to `"baseline"`; `totalGPUMemory` is implemented but is an **approximation** (stage eighty-nine / twenty-one: the back-buffer BGRA8 byte count plus the D32S8 byte count when depth-stencil is present) — it must exist because Starling's `StatsDisplay.supportsGpuMem` probes with `"totalGPUMemory" in context` and adds/removes a whole HUD row accordingly. The D3D12 string has no adl measurement yet (adl has no usable D3D backend), so it is an **honest placeholder**, filed in the leftover table |
 | Synchronous throw on `enableErrorChecking=true` | **not implemented**: `Context3D.enableErrorChecking`'s setter is currently a no-op, so `true` does not produce AIR's synchronous validation throw (our draws batch-submit and retire once at the frame boundary, so there is no synchronous throw point anyway). Does not affect Starling/Away3D |
-| AGAL2/AGAL3 GPU-side end-to-end on-screen (MRT/instancing) | **instancing is on-screen** (stage eighty-three: `drawTrianglesInstanced` → `instanceCount` on all three backends) and AGAL2 control flow/derivatives are translated on all three. **What is not closed are three cross-target differences**: fragment **MRT** (`oc1..oc3`) and **`od`**, plus the AGAL3 **`iid`** register, are currently complete only in the **HLSL target**; MSL/GLSL fold to a single output / MSL `od` is undeclared / `iid` becomes an undeclared `r<num>` (see the note at the end of §3; filed in `TODO.md`'s leftover table) |
+| AGAL2/AGAL3 GPU-side end-to-end on-screen (MRT/instancing) | **instancing is on-screen** (stage eighty-three: `drawTrianglesInstanced` → `instanceCount` on all three backends) and AGAL2 control flow/derivatives are translated on all three. Stage 261 closed **`od`** and **`iid`** on all three targets (MSL depth slot + `[[instance_id]]`, GLSL `gl_FragDepthEXT` + context-level `EXT_frag_depth`, GLSL target refuses `iid`). **What is not closed is only fragment MRT** (`oc1..oc3`), still HLSL-only (see the note at the end of §3; filed in `TODO.md`'s leftover table) |
 
 ---
 

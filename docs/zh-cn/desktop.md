@@ -38,7 +38,7 @@
 | `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ 恒 `false`（`supportsSystemTrayIcon` 在 `--features tray` 下为 `true`） | 默认与本后端实际能力一致（§2）；托盘开关见 [`compile.md`](compile.md) §3.4.5 |
 | `NativeMenu` / `NativeMenuItem` | ✅ 全成员 | 列表语义、错误号、拷贝语义逐项对 `adl`（§4、§5） |
 | `NativeMenu.display()` | ⚠️ 报明 | 本后端跑不了模态原生菜单（§7.3） |
-| `keyEquivalentModifiers` | ⚠️ 报明 | 键绑上了，修饰键位**没有**翻译（§7.2） |
+| `keyEquivalentModifiers` | ✅ 已映射 | `15..20` 逐值实测后译成 `NSEventModifierFlags`（§7.2） |
 
 ---
 
@@ -195,10 +195,29 @@ NativeMenu/NativeMenuItem  →  sk_menu[] + sk_menu_item[]（dfs 展平，子菜
 `adl 51.4.1` 实测：赋 `null` 会让 adl 进程直接死掉。我方按 §1.5「不静默改写 AIR 已定义行为」处理为
 **报明 + 保持原状**（`as_shell_unsupported("flash.desktop.NativeApplication.menu = null …")`）。
 
-### 7.2 `keyEquivalentModifiers` 不翻译成 `NSEventModifierFlags`
+### 7.2 `keyEquivalentModifiers` → `NSEventModifierFlags` 的实测映射
 
-`keyEquivalent` 本身绑得上，六个合法值（`15..20`）**没有映射**，于是快捷键会按 AppKit 默认修饰键触发。
-**报明一次**，绝不静默绑一个错的快捷键。登记在 `TODO.md` 遗留表。
+六个合法值（`15..20`）的含义**是量出来的，不是查出来的**——这个 SDK 里根本没有
+`flash.ui.KeyboardModifier` 类（`airglobal.swc` 与 `mxmlc` 都证实），所以只能靠行为反推：
+`temp/keyeqprobe/`（`adl 51.4.1`）装一条真菜单栏，六个 item 各占一个值，再用 System Events 合成按键
+看哪个 item 被 `select`，并用 `screencapture` 取打开的下拉菜单看**字形列**。
+
+| 值 | 含义 | 触发它要按 | 下拉菜单显示 |
+|---|---|---|---|
+| 15 | Command | ⌘S | `⌘S` |
+| 16 | Shift | ⇧S | `⇧S` |
+| 17 | Control | ⌃S | `⌃S` |
+| 18 | Alternate | ⌥S | `⌥S` |
+| 19 | 无修饰 | `s` | `S` |
+| 20 | **惰性** | **没有任何组合能触发** | `S` |
+
+三条补充实测：**空数组 `[]` 等价于 `[19]`**（光按 `s` 就触发）；**`[15,20]` 等价于 `[15]`**
+（⌘S 触发，20 不参与）；**`[19,20]` 回读成 `[20]`** 且与 `[20]` 一样不触发。
+
+实现：生成侧折成 `AS_KEM_CMD/SHIFT/CTRL/OPT/DEAD` 五个便携位，胶水层的 `sk_menu_apply_mods`
+（`vendor/window_glue.cc` 与 `vendor/statusitem_glue.cc` 各一份）译成 `setKeyEquivalentModifierMask:`。
+`20` 单独出现时给 **`NSEventModifierFlagFunction`**：AppKit 不为它画字形、四个标准修饰键也凑不出它，
+于是「显示 `S` 但永不触发」两个可观测结果同时成立（AIR 内部怎么做的**不可观测**，量到的只是这两条）。
 （上一轮同在这里的「`DockIcon.bitmaps` 不上屏」已于阶段二百五十六清偿，见 §3.1。）
 
 ### 7.3 `NativeMenu.display()` 没有模态菜单后端

@@ -13340,13 +13340,22 @@ static void agal_reg_name(char* out, int type, int num, int target) {
         case AGAL_FS: // texture sampler
             sprintf(out, "fs%d", num); break;
         case AGAL_OD: // fragment depth output
-            if (target == 1) strcpy(out, "gl_FragDepth"); else strcpy(out, "od"); break;
+            // A LOCAL vec4 named 'od' on ALL three targets, not the target's depth
+            // builtin: the write-mask expander emits per-component stores
+            // ('X.x = ...' for a mask like 0x1) as well as whole-register stores
+            // ('X = ft0' for 0xF), and every depth builtin (gl_FragDepth(EXT),
+            // SV_Depth, Metal's [[depth(any)]]) is a SCALAR. Each entry point
+            // therefore writes the builtin/depth slot from od.x on the way out.
+            strcpy(out, "od"); break;
         case AGAL_IID: // instance id (AGAL3, vertex-only, read-only source)
-            // HLSL feeds it from the SV_InstanceID system value, which is a
-            // uint; it is broadcast to a float4 so the shared swizzle and
-            // component-wise code paths below keep working unchanged.
-            if (target == 2) strcpy(out, "float4(iid, iid, iid, iid)");
-            else sprintf(out, "r%d", num); break;
+            // Metal and D3D both expose it as an unsigned system value, broadcast
+            // to a float4 so the shared swizzle/component paths keep working.
+            // GLSL ES 1.00 has NO equivalent (gl_InstanceID is ES 3.00), so a GLSL
+            // program that reads iid is REFUSED in as_agal_translate before this
+            // is ever called -- never translated to an undeclared identifier.
+            if (target == 1) strcpy(out, "gl_InstanceID");
+            else strcpy(out, "float4(iid, iid, iid, iid)");
+            break;
         default: sprintf(out, "r%d", num); break;
     }
 }
@@ -13685,22 +13694,73 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         n++;
     }
     if (n == 0) { as_agal_errmsg = "AGAL: empty program"; return NULL; }
+    // Two refusals that used to be shader-compile errors with no explanation:
+    //   * 'iid' is a VERTEX-only source in AGAL3 (AGAL.min reference: iid is
+    //     readable only in the vertex program); a fragment program reading it has
+    //     no stage that can supply it.
+    //   * the GLSL target compiles as ES 1.00 (attribute/varying/texture2D), which
+    //     has no gl_InstanceID at all. Refusing says so; emitting it would only move
+    //     the failure into the driver's shader log.
+    if (isFragment && agal_is_used(AGAL_IID, 0)) {
+        as_agal_errmsg = "AGAL: iid is readable only in a vertex program";
+        return NULL;
+    }
+    if (target == 1 && agal_is_used(AGAL_IID, 0)) {
+        as_agal_errmsg = "AGAL: iid is not available on the GLSL target (ES 1.00 has no gl_InstanceID)";
+        return NULL;
+    }
     as_json_buf b; as_json_buf_init(&b);
     if (target == 0) {
         // ---- MSL ----
         as_json_buf_append_cstr(&b, "#include <metal_stdlib>\\nusing namespace metal;\\n\\n");
         if (!isFragment) {
-            as_json_buf_append_cstr(&b, "struct VSIn {\\n");
-            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VA, i)) { char t[64]; sprintf(t, "  float4 a%d [[attribute(%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
-            as_json_buf_append_cstr(&b, "};\\nstruct VSOut {\\n  float4 position [[position]];\\n");
+            // MSL rejects neither an empty struct nor an unused [[stage_in]] the
+            // way HLSL/fxc does, but the empty struct is still dead weight and the
+            // [[attribute(N)]] list is what the pipeline's vertex descriptor must
+            // match, so both structs are built from real use on all three targets.
+            int hasVA = 0; for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VA, i)) { hasVA = 1; break; }
+            if (hasVA) {
+                as_json_buf_append_cstr(&b, "struct VSIn {\\n");
+                for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VA, i)) { char t[64]; sprintf(t, "  float4 a%d [[attribute(%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
+                as_json_buf_append_cstr(&b, "};\\n");
+            }
+            as_json_buf_append_cstr(&b, "struct VSOut {\\n  float4 position [[position]];\\n");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[64]; sprintf(t, "  float4 varying%d [[user(locn%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
-            as_json_buf_append_cstr(&b, "};\\n\\nvertex VSOut vs_main(\\n  VSIn in [[stage_in]],\\n  constant float4* vc [[buffer(0)]]\\n) {\\n  VSOut out;\\n  float4 op;\\n");
+            as_json_buf_append_cstr(&b, "};\\n\\nvertex VSOut vs_main(\\n");
+            // AGAL3's 'iid' is Metal's [[instance_id]] (a uint system value, like
+            // HLSL's SV_InstanceID). It used to be translated to the never-declared
+            // register name 'r0', so ANY program reading it failed to compile.
+            int needComma = 0;
+            if (hasVA) { as_json_buf_append_cstr(&b, "  VSIn in [[stage_in]]"); needComma = 1; }
+            if (agal_is_used(AGAL_IID, 0)) {
+                as_json_buf_append_cstr(&b, needComma ? ",\\n  uint iid [[instance_id]]" : "  uint iid [[instance_id]]");
+                needComma = 1;
+            }
+            as_json_buf_append_cstr(&b, needComma ? ",\\n  constant float4* vc [[buffer(0)]]" : "  constant float4* vc [[buffer(0)]]");
+            as_json_buf_append_cstr(&b, "\\n) {\\n  VSOut out;\\n  float4 op;\\n");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 vt%d;\\n", i); as_json_buf_append_cstr(&b, t); }
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[32]; sprintf(t, "  float4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
         } else {
-            as_json_buf_append_cstr(&b, "struct FSIn {\\n");
-            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[64]; sprintf(t, "  float4 v%d [[user(locn%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
-            as_json_buf_append_cstr(&b, "};\\nfragment float4 fs_main(\\n  FSIn in [[stage_in]],\\n  constant float4* fc [[buffer(0)]]");
+            // Same rule as the vertex stage: the [[stage_in]] struct exists only
+            // when the program really reads a varying, and the parameter list
+            // follows. A fragment program with no inputs must not declare one.
+            int hasV = 0; for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { hasV = 1; break; }
+            if (hasV) {
+                as_json_buf_append_cstr(&b, "struct FSIn {\\n");
+                for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[64]; sprintf(t, "  float4 v%d [[user(locn%d)]];\\n", i, i); as_json_buf_append_cstr(&b, t); }
+                as_json_buf_append_cstr(&b, "};\\n");
+            }
+            // 'od' (fragment depth output) needs somewhere to GO. Metal expresses
+            // it as a '[[depth(any)]]' member of the FRAGMENT OUTPUT STRUCT --
+            // there is no gl_FragDepth-style builtin. The old MSL arm declared
+            // neither the member nor the local, so 'mov od, ft0' emitted a write to
+            // an undeclared identifier: a shader that cannot compile at all.
+            int hasOd = agal_is_used(AGAL_OD, 0);
+            if (hasOd) as_json_buf_append_cstr(&b, "struct FSOut {\\n  float4 color0 [[color(0)]];\\n  float depth [[depth(any)]];\\n};\\n");
+            as_json_buf_append_cstr(&b, hasOd ? "fragment FSOut fs_main(\\n" : "fragment float4 fs_main(\\n");
+            int needComma = 0;
+            if (hasV) { as_json_buf_append_cstr(&b, "  FSIn in [[stage_in]]"); needComma = 1; }
+            as_json_buf_append_cstr(&b, needComma ? ",\\n  constant float4* fc [[buffer(0)]]" : "  constant float4* fc [[buffer(0)]]");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[48]; sprintf(t, ",\\n  %s fs%d [[texture(%d)]]", agal_is_cube(i) ? "texturecube<float>" : "texture2d<float>", i, i); as_json_buf_append_cstr(&b, t); }
             // One sampler per texture register the program samples. Metal keeps no
             // filter/wrap/mip state on the texture object itself, so a single shared
@@ -13711,6 +13771,11 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
             // every [[sampler(N)]] the shader declares to have state bound).
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[48]; sprintf(t, ",\\n  sampler smp%d [[sampler(%d)]]", i, i); as_json_buf_append_cstr(&b, t); }
             as_json_buf_append_cstr(&b, "\\n) {\\n  float4 oc;\\n");
+            // 'od' is four components, not a bare float: the write-mask expander
+            // emits per-component stores ('od.x = ...') and takes the full-mask
+            // path ('od = ft0') for mask 0xF, and AGALMiniAssembler writes 0xF for
+            // 'mov od, ft0'. A scalar local made both spellings illegal C.
+            if (hasOd) as_json_buf_append_cstr(&b, "  float4 od;\\n");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 ft%d;\\n", i); as_json_buf_append_cstr(&b, t); }
         }
         agal_emit_body(&b, ins, n, target);
@@ -13719,6 +13784,11 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
             as_json_buf_append_cstr(&b, "  out.position = op;\\n");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[48]; sprintf(t, "  out.varying%d = v%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
             as_json_buf_append_cstr(&b, "  return out;\\n");
+        } else if (agal_is_used(AGAL_OD, 0)) {
+            // Metal reads depth from component 0 of the float4 the program left in
+            // 'od'; a 'mov od, ft0.z' therefore lands in od.x through the source
+            // swizzle, exactly like the HLSL arm's 'output.depth = od.x;'.
+            as_json_buf_append_cstr(&b, "  FSOut fso;\\n  fso.color0 = oc;\\n  fso.depth = od.x;\\n  return fso;\\n");
         } else {
             as_json_buf_append_cstr(&b, "  return oc;\\n");
         }
@@ -13741,9 +13811,18 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         if (!isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[40]; sprintf(t, "varying vec4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
         if (isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[40]; sprintf(t, "uniform %s fs%d;\\n", agal_is_cube(i) ? "samplerCube" : "sampler2D", i); as_json_buf_append_cstr(&b, t); }
         as_json_buf_append_cstr(&b, "void main() {\\n");
+        // Same four-component local as the other two targets (see the AGAL_OD arm
+        // in agal_reg_name): the depth builtin itself is a scalar.
+        if (isFragment && agal_is_used(AGAL_OD, 0)) as_json_buf_append_cstr(&b, "  vec4 od;\\n");
         for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  vec4 %s%d;\\n", isFragment ? "ft" : "vt", i); as_json_buf_append_cstr(&b, t); }
         agal_emit_body(&b, ins, n, target);
         if (as_agal_errmsg != NULL) { free(b.buf); return NULL; }
+        // The extension builtin is gl_FragDepthEXT, NOT gl_FragDepth: the source is
+        // ES 1.00 (attribute/varying/texture2D), where gl_FragDepth does not exist --
+        // only GL_EXT_frag_depth's gl_FragDepthEXT does. Writing the ES 3.00 name
+        // into an ES 1.00 shader is a compile error in every WebGL implementation.
+        if (isFragment && agal_is_used(AGAL_OD, 0))
+            as_json_buf_append_cstr(&b, "  gl_FragDepthEXT = od.x;\\n");
         // Orientation: AS3 (and Metal, and every AIR backend) stores render-target
         // row 0 at the TOP of the image -- which is also how BitmapData pixels are
         // laid out, hence how texture coordinate v=0 is defined. GL stores row 0 at
@@ -13840,7 +13919,7 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
             as_json_buf_append_cstr(&b, hasV ? "FSOut fs_main(FSIn input) {\\n  float4 oc;\\n" : "FSOut fs_main() {\\n  float4 oc;\\n");
             for (int i = 1; i < 4; i++) if (agal_is_used(AGAL_OP, i)) { char t[32]; sprintf(t, "  float4 oc%d;\\n", i); as_json_buf_append_cstr(&b, t); }
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 ft%d;\\n", i); as_json_buf_append_cstr(&b, t); }
-            if (agal_is_used(AGAL_OD, 0)) as_json_buf_append_cstr(&b, "  float od;\\n");
+            if (agal_is_used(AGAL_OD, 0)) as_json_buf_append_cstr(&b, "  float4 od;\\n");
         }
         agal_emit_body(&b, ins, n, target);
         if (as_agal_errmsg != NULL) { free(b.buf); return NULL; }
@@ -13851,7 +13930,7 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         } else {
             as_json_buf_append_cstr(&b, "  FSOut output;\\n  output.color0 = oc;\\n");
             for (int i = 1; i < 4; i++) if (agal_is_used(AGAL_OP, i)) { char t[48]; sprintf(t, "  output.color%d = oc%d;\\n", i, i); as_json_buf_append_cstr(&b, t); }
-            if (agal_is_used(AGAL_OD, 0)) as_json_buf_append_cstr(&b, "  output.depth = od;\\n");
+            if (agal_is_used(AGAL_OD, 0)) as_json_buf_append_cstr(&b, "  output.depth = od.x;\\n");
             as_json_buf_append_cstr(&b, "  return output;\\n");
         }
         as_json_buf_append_cstr(&b, "}\\n");

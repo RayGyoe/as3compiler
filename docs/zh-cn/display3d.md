@@ -108,12 +108,21 @@ Stage3D 的着色器是 **AGAL（Adobe 图形汇编语言）二进制字节码**
 「重活走链接/胶水」铁律。真正的体力活在 AGAL 校验器（40+ 条错误）与 AGAL1/2/3 三代的扩展
 （MRT、实例化、`iid` 寄存器、`fragment output index`）。
 
-> **三档的覆盖差异（如实记录，已入 `TODO.md` 的 `### 遗留待开发`）**：片元 **MRT**（`oc1..oc3` → 多输出）、
-> **深度输出**（`od`）与 **AGAL3 `iid`** 三条，目前只有 **HLSL 档**完整（`SV_TargetN` / `SV_Depth` /
-> `SV_InstanceID`）：MSL/GLSL 两档仍把片元折叠成**单一输出**（`oc` / `gl_FragColor`），MSL 的 `od` **未声明**
-> （GLSL 走内建 `gl_FragDepth`），`iid` 被译成**未声明的 `r<num>`**。这三条是**先于 HLSL 就存在**的旧缺陷——
-> 第三个目标一出现，才第一次有对照能看出来。**注意区分「实例化」本身**：`drawTrianglesInstanced` →
-> `instanceCount` 三端**都已上屏**，缺的只是着色器里读**每实例 ID 的寄存器**。
+> **三档的覆盖差异（如实记录）**：片元 **MRT**（`oc1..oc3` → 多输出）目前只有 **HLSL 档**（`SV_TargetN`），
+> MSL/GLSL 两档仍把片元折叠成**单一输出**（`oc` / `gl_FragColor`）；这一条仍在 `TODO.md` 的
+> `### 遗留待开发`。
+>
+> **深度输出（`od`）与 AGAL3 `iid` 已于阶段二百六十一 修净**（原来只有 HLSL 档是对的）：`od` 在三档里
+> 都是 `float4 od` **局部**（写掩码 `0xF` 走整寄存器赋值、`0x1` 走逐分量赋值，标量装不下），出口写目标
+> 各自的深度槽 —— MSL `struct FSOut { … float depth [[depth(any)]]; }`、GLSL
+> `gl_FragDepthEXT = od.x;`（**不是** `gl_FragDepth`：ES 1.00 源里只有扩展的名字，且 WebGL 还要求上下文
+> 先 `getExtension('EXT_frag_depth')`，见 `vendor/stage3d_webgl.cc` 的 `s3d_create`）、HLSL
+> `output.depth = od.x;`。`iid` 在 MSL/HLSL 走宿主系统值（`uint iid [[instance_id]]` /
+> `SV_InstanceID`）并广播成 `float4`；**GLSL ES 1.00 没有 `gl_InstanceID`（那是 ES 3.00）**，故 GLSL 档
+> **响亮拒绝**，片元程序读 `iid` 三档一律拒绝 —— 不再发未声明的 `r<num>`。空 `VSIn`/`FSIn` 也与 HLSL 一样
+> 按实际使用抑制。**注意区分「实例化」本身**：`drawTrianglesInstanced` → `instanceCount` 三端**都已上屏**，
+> 缺的只是着色器里读**每实例 ID 的寄存器**（GLSL 档至今给不出，故如实拒绝）。
+> 验收：`xcrun metal` 真编译 7/7 过（旧形态两份都编不过），WebGL 真编译过，证据 `temp/metalshader/`。
 
 ---
 
@@ -172,7 +181,7 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 | **B AGAL 内核** | AGAL 字节码解析器（AGAL1/2/3）+ 校验器 + →MSL/GLSL 翻译器（**最硬的一步**，单独一阶段） | ✅ 阶段八十（单档）；阶段一百三十一 补齐 HLSL 档 |
 | **C Context3D 骨架** | `Stage3D` + `Context3D` 状态机 + `VertexBuffer3D`/`IndexBuffer3D`/`Program3D`/`Texture`(BGRA/RGBA) + `drawTriangles`，`enableErrorChecking=false` 走异步 | ✅ 阶段八十一；阶段八十七 补 Starling 前置方法 |
 | **D 端到端** | Metal 裸管线落地，跑通「彩色三角形」demo，再铺开 blend/depth/stencil/cull/scissor/render-to-texture | ✅ 阶段八十二~八十三（另：阶段一百零四 按帧合批、一百一十五 帧边界 commit-only） |
-| **E 对齐加固** | `drawToBitmapData`、`setRenderToTexture`、CubeTexture/RectangleTexture、AGAL2/3 的 GPU 端到端上屏（MRT render pass / 实例化） | ✅ 阶段八十三「实例化」上屏；⚠️ **MRT/`od`/`iid` 仅 HLSL 档完整**（见 §3 与 `TODO.md` 遗留表） |
+| **E 对齐加固** | `drawToBitmapData`、`setRenderToTexture`、CubeTexture/RectangleTexture、AGAL2/3 的 GPU 端到端上屏（MRT render pass / 实例化） | ✅ 阶段八十三「实例化」上屏；✅ 阶段二百六十一 `od`/`iid` 三档收口（GLSL 档 `iid` 明确拒绝）；⚠️ **MRT 仍只有 HLSL 档**（见 §3 与 `TODO.md` 遗留表） |
 
 **内核翻译器支持 AGAL1/2/3 三代；`Context3D.profile` 按后端真实能力分档上报**（阶段二百二十一）：后端能分配 4096×4096 的 2D 贴图 → `"baselineExtended"`；上限只有 2048 → `"baseline"`。判定与 `#3683` 报错用的是**同一个后端查询** `s3d_max_texture_size()`（D3D12/Metal 恒 16384，WebGL2 现查 `GL_MAX_TEXTURE_SIZE`，纯 C 状态机 4096），所以「对外承诺」与「实际强制」不可能漂移。
 
@@ -267,7 +276,7 @@ Stage3D 的落地复用阶段三十六~三十八已有的「胶水层 + 构建�
 | 压缩纹理（ATF/DXT/PVRTC） | ⚠️ **部分**（阶段八十九·二十一）：ATF 容器的 `format 3/5`（裸 DXT1/DXT5）已实现——运行时 `as_atf_decode_dxt` 在 CPU 解码为直通-alpha ARGB 后走普通纹理上传路径（不预乘，与 adl 把裸 DXT5 交给 GPU 一致；mip 1+ 未解码、只取 level 0）；ETC1/PVRTC、cubemap 与 `format 0xc/0xd`（JPEG-XR 有损）仍**响亮报错**（`Error #3680`），不静默出空图 |
 | `driverInfo`/`totalGPUMemory`/`profile` 精确上报 | `driverInfo` 按**构建期后端宏**上报四档：`ASC_S3D_GLSL` → `"WebGL2 (Stage3D)"`、`ASC_S3D_HLSL` → `"Direct3D12 (Stage3D)"`、`ASC_RENDER_STAGE3D` → `"Metal (Stage3D)"`、否则 `"Software (state machine)"`；判定入口是 `ASC_RENDER_STAGE3D`（**不是**只表示窗口合成后端的 `ASC_RENDER_WINGPU`/`ASC_RENDER_METAL`，见 `emit.ts` 该函数上的注释）。`profile` 按后端能力分档（§6 末：`baselineExtended` / `baseline`），与 `#3683` 同源；**`context3DRenderMode="software"` 被接受但不改变后端**——AIR 在软件模式下会禁用硬件（实测 `driverInfo` 变成 `Software Hw_disabled=explicit`、`maxBackBuffer` 从 16384 掉到 2048），我们永远用**编译期选定的 Stage3D 后端**（Metal/D3D12/WebGL2/纯 C 状态机）绘制，`driverInfo`/`maxBackBufferWidth` 也不随该参数变化。这只影响「明明该走 CPU 光栅化」的极端场景（无可用 GPU），且我们的窗口后端本身就需要 GPU，故不单列欠账；`totalGPUMemory` 已实现但为**近似值**（阶段八十九·二十一：后台缓冲 BGRA8 字节数 + 有深度模板时再加 D32S8 字节数）——它必须存在，因为 Starling `StatsDisplay.supportsGpuMem` 用 `"totalGPUMemory" in context` 探测并据此增删整个 HUD 行。D3D12 那串标签尚无 adl 实测（adl 无可用 D3D 后端），是**诚实的占位**，已入遗留表 |
 | `enableErrorChecking=true` 的同步抛错 | **未实现**：`Context3D.enableErrorChecking` 的 setter 目前是 no-op，`true` 时不产生 AIR 的同步校验抛错（我们的 draw 走批量提交、帧边界统一退休，本身没有可同步抛错的时机）。不影响 Starling/Away3D |
-| AGAL2/AGAL3 的 GPU 端到端上屏（MRT/实例化） | **实例化已上屏**（阶段八十三：`drawTrianglesInstanced` → 三端的 `instanceCount`），AGAL2 控制流/导数三档都翻译。**未闭合的是三条跨档差异**：片元 **MRT**（`oc1..oc3`）与 **`od`**、AGAL3 **`iid`** 寄存器目前只有 **HLSL 档完整**，MSL/GLSL 折叠单输出 / MSL `od` 未声明 / `iid` 译成未声明的 `r<num>`（详见 §3 末的差异说明，已入 `TODO.md` 遗留表） |
+| AGAL2/AGAL3 的 GPU 端到端上屏（MRT/实例化） | **实例化已上屏**（阶段八十三：`drawTrianglesInstanced` → 三端的 `instanceCount`），AGAL2 控制流/导数三档都翻译。阶段二百六十一 把 **`od`** 与 **`iid`** 三档收口（MSL 深度槽 + `[[instance_id]]`、GLSL `gl_FragDepthEXT` + 上下文级 `EXT_frag_depth`、GLSL 档 `iid` 明确拒绝）。**未闭合的只剩片元 MRT**（`oc1..oc3`）只有 HLSL 档（详见 §3 末的差异说明，已入 `TODO.md` 遗留表） |
 
 ---
 

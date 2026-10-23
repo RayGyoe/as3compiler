@@ -10,7 +10,7 @@
     "../../vendor/curl/include"
   ],
   "link-paths": [
-    "../../vendor/curl/lib/windows-x64"
+    "../../vendor/curl/lib/${host}"
   ],
   "link-libs": [
     "z"
