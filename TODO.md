@@ -14170,7 +14170,7 @@ AS3 `Vector.<int>`（4 B / 静态类型）、as3compiler 动态 `Array`（24 B �
 
 **一、先把 `adl` 量清楚，再写一行代码**
 
-方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md) 的 G1/G2 是「清理类工具
+方案 [`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md) 的 G1/G2 是「清理类工具
 只移废纸篓、永不永久删除」这条信任底线的底座。动手前先搭了双端探针 `temp/trashprobe/`
 （一份 `Main.as`，`mxmlc` + `adl 51.4.1`，日志写文件——**`adl` 的 stdout 不可用**），把两个成员的行为逐条量下来。
 **两条量出来的结论推翻了纸面**，这是本阶段最重要的产出：
@@ -14912,7 +14912,7 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
   「参考应用真的这么编」——而后者恰恰是本次两红的现场。
 
 ### 遗留待开发
-> **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
+> **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。
 >
 > **2026-10-22 追加（阶段二百四十一：命中测试边界与拾取口径的实测结案）**：**新登记 0 行 / 改写 0 行 / 移出 3 行** ⇒ 表内项数 **101 → 98 项**（`未开始` **75 → 72**，其余不变）。本轮**没有改任何 `src/`**：三行都以「实测结案」而非「改代码」收口 —— ① 两行「边界松紧」（原 14179 的 0.25px、原 14182 的 0.05px）经四组探针证明 `adl` 的边界**不是容差**而是随**绝对位置**锯齿的光栅化相位（对象边缘滑 1 twip×6 步，`adl` 报出的边界六次相同；重复 / 正反扫 / 换序 / 插问邻居全一致 ⇒ 纯函数、不是可修的缓存 bug），幅度 ≤ 半像素且只在「边界 ±0.5px」这条测度为零的带上，复刻要一张绝对网格表且会把「贴边未中」变成「贴边中」⇒ 维持严格几何，上界表与证据留档在 `docs/{zh-cn,en}/as3-semantics.md` §3.4 + `temp/hitprobe3/FINDINGS.md`；② 原 14181（交互拾取是否问内容区域）本轮首次拿到 **adl 真鼠标六点**证据（`temp/hitprobe3/Body7.as` + `pick_probe.py`）：无图形的 Sprite 在**自己盒内、子件之外**（横向缝与纵向缝）**都不是目标**，画了底板的容器在同样的缝里**是**目标，`Shape`（非 `InteractiveObject`）自己不可能是目标、事件落到最近的**可交互祖先** —— 与本实现阶段二百三十三 的改法**逐点一致**，故该行也结案。钉子 = `examples/stage94s.as` 新增 H 节（17 断言：box 闭区间四边 + 0.01px 外侧不中 + region ±0.05 + 含描边带 + 缩放后仍严格）与 `examples/hit-pick-layer.as` 新增 D 节（5 断言），两处都在 **headless 与 Skia 两个后端**跑过。
@@ -15209,7 +15209,9 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 
 ### macOS 清理工具 demo 能力缺口（未排期）
 
-> **本节是评估落点**，产物是 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)（产品 + 技术方案）。
+> **本节是评估落点**，产物是 [`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md)（产品 + 技术方案）。
+> **该方案已于 2026-10-23 移出本仓库**（原 `docs/projects/` 目录已撤），现位于**工作区根 `prune/`**（与 `asaotui/` 同级，后续单独建 git 仓库），以免本软件信息与编译器交错。
+> 因此上方相对链 `../prune/...` **仅在本地工作区可解析**；单独 clone `as3compiler` 时该链会断开（属预期，非失效）。
 > 形态裁定（2026-10-22）：**菜单栏小工具**（`NSStatusItem` 常驻 + 点开无边框浮层），用途是本项目的推广 demo。
 > **不占阶段号、不升版本** —— 与上面「UI 工具链待定项」同一口径，只有真进入实施才占；届时从
 > **阶段二百四十三**（v0.4.206 → v0.4.207）起。
