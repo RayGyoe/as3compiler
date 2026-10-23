@@ -15752,6 +15752,18 @@ ANE 在这里能跑（macOS 宿主库已落地，阶段二百零七），但代�
 ANE 仍留给 **G3**（卷总量/已用量）：那条 AIR **真没有**（`File` 只有 `spaceAvailable`，`getSpaceAvailable` 在 `adl` 里 `in` 为 `false`），
 按 §1.5 是**增强**，才轮到 opt-in 的原生扩展出场。
 
+> **2026-10-23 补记（阶段二百六十四 收尾后，产品侧实测）**：净扫的 `Scanner` 接上真异步后，本机
+> `~/Library/Caches`（75,536 文件 / 8.0 GB）整次扫描 **4.3–4.7 s → 6.5–7.6 s**，主线程最长单帧
+> **4.97 s → 76 ms**（偶发 ~1.3 s），扫描期间点「详情」能当场打开。**剩下的那 1.3 s 不在遍历层**：
+> `FileListEvent.files` 必须在完成回调里一次造完，Chrome 的 `Cache_Data` 一个目录就是 **49,330** 个
+> `File` 对象，那一下仍在主线程。用 `temp/dircost/` 的探针把它拆开量（headless，`--run`）：
+> `"a" + "b"` 单次 **22 µs**、`new File(s)` **0.04 µs**、`stat` **1.7 µs**（`Cost4.as`，可信）、
+> 而 `getDirectoryListing()` 的 49,330 条 = **1103 ms** ≈ 每条一次路径拼接 ⇒ **病灶在 `gc_alloc`
+> 的字符串路径，不在 `File`、也不在 `readdir`**（裸 C 的 `readdir` 只有 125 ms，见
+> `temp/dircost/statbench.c`）。按本文件既有口径（阶段一百零四 那一段）**性能项不登记为遗留语义行**，
+> 故只在此记账：若将来要把那 1.3 s 也消掉，方向是让 `gc_alloc(GCT_STRING)` 便宜下来，或把 `files`
+> 的 `File` 构造摊到帧边界 —— 两者都要独立立项。
+
 ### 遗留待开发
 > **2026-10-23 追加（阶段二百六十四：`File.getDirectoryListingAsync` 真异步化 —— 改写 1 行 + 新登记 2 行）**：**新登记 2 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **91 → 93 项**（`未开始` **71 → 72**、`部分完成` **19 → 20** / `调研完成·实现暂缓` 1）。**本阶段主体是补平差距，故不占表**：用户提议「用 ANE 做遍历异步化」，但根因不是缺 ARM 链接库（`lib/bin/macos-x86-64/libasaot.dylib` 本就是 **x86_64+arm64 通用二进制**，`macos-x86-64` 是 AIR 自己的平台键、不表架构），而是**该成员此前是同步假实现**（inline 调 `getDirectoryListing()` + 同一次调用内派发 `FileListEvent`，`cancel()` 因此恒为 no-op）——`adl` 上它是真异步，属 §1.5「`adl` 跑得对而我们跑不出」⇒ **遗留缺陷**且阶段内修净（新 `AS_JOB_DIR` 作业 + 完成 thunk + 真 `cancel`），故不入表。**改写的 1 行**是「空 `File` 的成员访问全线不抛 `#2037`」：其中 `getDirectoryListing`/`getDirectoryListingAsync` 两个成员本阶段已按 `adl` 补齐（见该行）。**新登记 2 行**都是本轮**量出来、但不在批准范围内修**的真分歧：① 基类 `EventDispatcher.parent`（一个 C 侧内部链接字段）在**动态读**里压过派生类的 getter；② `File` 其余三个 async 成员仍是 inline 完成。
 > **2026-10-23 追加（阶段二百六十三：AGAL 三条实测定案 —— 移出 3 行 + 收窄 1 行）**：**新登记 0 行 / 改写 1 行 / 移出 3 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **94 → 91 项**（`未开始` **74 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1 / `已记录` 1；`已修` 与 `已记录` 各自归零后仍为 0）。**移出 3 行**：① AGAL `nrm` 的归一化分量数 —— 像素探针定案**只归 `.xyz`**（`w` 既不参与模长也不被写），`src/runtime.ts` 已改并把含 w 的目的掩码按 `adl` 的 **#3628** 响亮拒绝；② 临时寄存器未初始化即被读 —— **不是「初值是多少」而是 upload 期错误**（**#3647**/**#3648**，用官方 `AGALMiniAssembler` 编的字节复现），故落地为 `agal_check_temp_writes` 逐分量线性扫描后**拒收**，而不是零初始化（零初始化会让一个 AIR 上跑不起来的程序在我们这里「碰巧有输出」，属 §2.5 明禁的静默降级）；③ 指针移出窗口不 roll-out —— **早已修**（`vendor/window_glue.cc` 的 `SDL_WINDOWEVENT_LEAVE` + 「仍严格在客户区内则不算离开」守卫），零代码下架。**改写 1 行**：原「`ROLL_OVER` / `ROLL_OUT` / `Stage.MOUSE_LEAVE` 事件完全不派发」**收窄**为只剩前者两个（外加冒泡的 `mouseOver`/`mouseOut`）—— `mouseLeave` 一直有发射点（`src/emit.ts` 的 `Event_new("mouseLeave", …)`，指针离开舞台时按 `mouseOut → rollOut(按钮) → mouseLeave(舞台)` 补一轮），把三条并记在一行会掩盖「已对齐两条」。**证据**：`temp/agalprobe/{out.txt,out-aot.txt}`（adl 与 AOT 逐字节相同）、`temp/metalshader/nrm*.{msl,metal,glsl}` + `glslcheck3.html`（Metal 2/2、WebGL 2/2 真编译；HLSL 本机无 `fxc`，只做文本钉）、`unit: stage3d/agal-nrm`（5 钉）+ `unit: stage3d/agal-temp-writes`（5 钉）+ `examples/stage80/82/83.as`。
