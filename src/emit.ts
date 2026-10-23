@@ -25933,6 +25933,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         // properties. The runtime helper advances an index cursor, so the body stays
         // a plain C loop and AS3 `break`/`continue` keep working (a statically typed
         // receiver still takes the specialised branches below).
+        // `Object` is the universal value slot: the VALUE decides what gets
+        // enumerated (array elements, dictionary values, vector elements, a
+        // record's property values). Boxing it takes the runtime dispatch below --
+        // before this, an Array in an Object slot was walked as an as_object, so
+        // 'for each' read the element buffer as length/vals and silently yielded
+        // nothing (G14).
+        if (this.isObjectRoot(arr.type)) {
+          arr.code = `as_obj_to_value((void*)(${arr.code}))`;
+          arr.type = { kind: 'any' };
+        }
         if (arr.type.kind === 'any') {
           const idx = this.tmpName('i');
           const elem = this.tmpName('v');
@@ -30106,9 +30116,17 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       // instead (measured on adl 51.4.1: `p.getProperty("x")` on a full override
       // returns callProperty's value; on a bare subclass it throws #2090).
       if (m && m.isProxyNs) m = undefined;
-      // `Object` is the dynamic-record convention (as_object*); a method call on
-      // it is resolved at runtime through as_dyn_call (returns null when absent).
-      if (!m && obj.type.className === 'Object') {
+      // `Object` is the universal value slot: a record, a class instance, a boxed
+      // primitive OR a bare as_array* / as_dict* -- and neither an Array nor a
+      // Dictionary has a vtable. Resolving an Object-typed call statically
+      // (Object's toString is a VTABLE SLOT call: `o->vtable->toString(o)`) read the
+      // array's element buffer as a vtable header and segfaulted (G14: 'o.toString()'
+      // crashed on 'var o:Object = [1,2,3]' while 'o.push(4)' reached as_dyn_call).
+      // Route EVERY call on an Object-typed receiver through the runtime, which
+      // dispatches by heap kind -- exactly what a '*' receiver already did. Object's
+      // own four methods stay reachable: the runtime answers them itself by heap kind
+      // (as_dyn_object_builtin, when the receiver has no dynamic member of that name).
+      if (obj.type.className === 'Object') {
         const items = expr.args.map((a) => this.boxExpr(this.emitExpr(a)));
         const n = items.length;
         const arr = n > 0 ? `(as_value[${n}]){ ${items.join(', ')} }` : 'NULL';
@@ -30946,8 +30964,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     if (obj.type.kind === 'object' && (obj.type as { className: string }).className === 'Object') {
       if (expr.property === 'constructor') {
         // Object.constructor: the runtime Class reference of the receiver (used
-        // for polymorphic cloning: `Object(this).constructor as Class`).
-        return { code: `as_v_as_class(as_v_class_of(as_v_obj((void*)(${recv}))))`, type: { kind: 'class' } };
+        // for polymorphic cloning: `Object(this).constructor as Class`). The slot
+        // can hold an Array, which has no vtable for as_v_class_of to walk, so the
+        // runtime picks the answer by heap kind (G14).
+        return { code: `as_v_as_class(as_obj_class_of((void*)(${recv})))`, type: { kind: 'class' } };
       }
       return { code: `as_dyn_get((void*)(${recv}), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
@@ -32581,6 +32601,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       if (o.type.kind === 'object' && this.symbols.getClass(o.type.className)?.arrayBacked) {
         return { code: 'true', type: { kind: 'bool' } };
       }
+      // An `Object` slot holds a bare as_array* for an Array, and an Array has no
+      // vtable for the class-chain test to walk -- folding to `false` made
+      // 'var o:Object = [1]; o is Array' a silent lie (G14).
+      if (this.isObjectRoot(o.type)) return { code: `as_obj_is_array((void*)(${o.code}))`, type: { kind: 'bool' } };
       return { code: 'false', type: { kind: 'bool' } };
     }
     // `x is Class`: a Class reference is boxed as an object (tag 4) but points to a
@@ -32804,7 +32828,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         : `"${this.escapeCString(t.property)}"`;
       return { code: `as_dyn_del(as_v_obj_val(${obj.code}), ${key0})`, type: { kind: 'bool' } };
     }
-    else if (obj.type.kind === 'object' && obj.type.className === 'Object') objCode = `((as_object*)${obj.code})`;
+    // `Object` is the universal value slot: as_object_del assumes a record, so an
+    // Array in the slot was written through as one and 'delete o[0]' silently left
+    // the element in place (G14). as_dyn_del dispatches by heap kind and answers a
+    // plain record identically (it calls as_object_del for GCT_OBJECT).
+    else if (obj.type.kind === 'object' && obj.type.className === 'Object') {
+      const dkey = t.kind === 'Index'
+        ? this.toStringExpr(this.emitExpr(t.index))
+        : `"${this.escapeCString(t.property)}"`;
+      return { code: `as_dyn_del((void*)(${obj.code}), ${dkey})`, type: { kind: 'bool' } };
+    }
     else if (obj.type.kind === 'object') {
       // Any class instance: as_dyn_del decides at runtime — a Proxy intercepts via
       // deleteProperty (#2092 when not overridden), a dynamic class removes the
@@ -32994,6 +33027,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         const ab = this.arrayBackedArrayCode(o, o.code);
         if (ab) return { code: ab.code, type: { kind: 'array' } };
       }
+      // An `Object` slot can hold a bare as_array* (see `is Array`); the cast is a
+      // runtime kind test, NULL on anything else (G14).
+      if (this.isObjectRoot(o.type)) return { code: `as_obj_as_array((void*)(${o.code}))`, type: { kind: 'array' } };
       return { code: 'NULL', type: { kind: 'array' } };
     }
     // `x as Dictionary`: unbox a dynamically-held Dictionary; else NULL.

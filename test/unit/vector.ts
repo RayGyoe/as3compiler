@@ -57,8 +57,15 @@ function checkVectorDynamicAccess(): string[] {
     preamble.includes('if (dk == 3) return as_vec_get_hook != NULL ? as_vec_get_hook(obj, key) : as_v_null();'));
   check('as_dyn_set delegates instead of dropping the write',
     preamble.includes('if (dk == 3) { if (as_vec_set_hook != NULL) as_vec_set_hook(obj, key, v); return; }'));
+  // The ORDER is the point: the generated hook is consulted before the walk that
+  // would deref the mark callback. Assert it positionally, inside as_dyn_call's
+  // own body, so a refactor that keeps the literal but moves it below the walk
+  // is still caught.
+  const dynCallAt = preamble.indexOf('static as_value as_dyn_call(void* obj, const char* name, as_value* args, int argc) {');
+  const vecDetourAt = preamble.indexOf('if (as_vec_call_hook != NULL && dk == 3)', dynCallAt);
+  const walkAt = preamble.indexOf('void* vt = ((as_object_header*)obj)->vtable;', dynCallAt);
   check('as_dyn_call detours BEFORE the super-chain walk (which would deref the mark callback)',
-    preamble.includes('if (as_vec_call_hook != NULL && as_dyn_kind(obj) == 3) return as_vec_call_hook(obj, name, args, argc);'));
+    dynCallAt >= 0 && vecDetourAt > dynCallAt && walkAt > vecDetourAt);
   // `pv.length` and `pv.join(..)` are emitted straight to as_any_length /
   // as_any_join, so those two shortcuts need the same detour or the read returns
   // 0 / "" while as_any_call works -- an inconsistency that shipped once already.

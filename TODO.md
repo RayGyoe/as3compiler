@@ -14779,6 +14779,76 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 - M4 的抓法是 2 项红：`ane` 靠 CLI 提示兜住（它同时是两个合法键的前缀 ⇒ 前缀分支给不出唯一候选）。
 - **全量 `node test.ts`：467 / 462 / 5**。红的 5 项里 3 项是既有基线（`socket.as` 无 Windows socket 后端、`stage94d.as` UTF-16LE、`inline/StackCanary` 本机 clang 差异）；另外 2 项是 `example: air-native`（`ENOENT src/com/greensock/TweenLite.as` 与 `undefined variable Cubic`）——本机工作区里那 352 个文件被删、旁边留了未跟踪的 `com.zip`，与本阶段无关，未擅自恢复。
 
+### 阶段二百五十三：`Object` 槽装 `Array` 的身份识别与崩溃（v0.4.216 → v0.4.217）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+`asaotui/compiler-gaps.md` 的 **G14**：AS3 里 `Object` 是普适槽，`Number`/`String`/`Boolean`/`Array` 都能放。
+我们把前三个**装箱**（`as_number_new`/`as_string_new`/`as_boolean_new`），却把 **Array 裸指针直塞**
+（`(Object*)(as_array_make(...))`）——而 `as_array` 的第一个字是**元素缓冲**，不是 vtable。于是三条全错：
+① `o is Array` 被**编译期常量折成 `false`**（静默错）；② `o is Marker` 落成 `as_is(o, &Marker_vt)`，
+把元素缓冲当 vtable 头读 ⇒ **`0xC0000005`**；③ `o as Array` 得 `NULL`、`o.length` 得 `undefined`、
+`o.push(4)` / `o.toString()` 崩。`*` 槽只有一半毛病（`is Array` 对，`is <用户类>` 崩）。
+
+**二、修法：不改表示，改派发（`src/emit.ts` + `src/runtime.ts`）**
+
+- **不装箱**。装箱要动 `as_value_to_obj` 的 `case 6`，会牵动 `Object*` 与 `as_array*` 的全部既存隐式转换。
+  改成**让 `Object` 接收者走 `*` 接收者早已走通的那条运行时通路**：
+  - 判定：`is Array` / `as Array` 对 `Object` 根类型发 `as_obj_is_array` / `as_obj_as_array`（`as_dyn_kind` 按堆种类分派，
+    与 tag-6 的 `as_v_is_array` 同口径）；`.constructor` 发 `as_obj_class_of`。
+  - 调用：`Object` 接收者的成员调用**一律** `as_dyn_call`（去掉原来的 `!m` 前置条件——静态解析 Object 的
+    `toString` 槽会发 `o->vtable->toString(o)`，对数组正是野读）。运行时按堆种类走 `as_arr_call` /
+    `as_vec_call_hook` / vtable。
+  - 读写删：`as_dyn_get` 的 `dk==2` 分支与 `as_any_get` 的 case 6 都改用 `as_array_key_get`（索引、`length`、
+    命名属性一次到位，旧的分裂会让 `a["length"]` 得 undefined）；`delete` 发 `as_dyn_del`；`for each` 发
+    `as_obj_to_value`；`as_obj_to_str` / `as_obj_to_number` 对 `GCT_ARRAY` 走 `as_arr_to_str`。
+- **两条不变量兜住「野读」这一类**（不只是 Array）：新增 `as_has_vtable(void*)` —— 白名单，只有真带 vtable 的
+  堆种类（`GCT_OBJECT`/`CLASS`/`XML`/`XML_LIST`/`NUMBER`/`STRING_OBJ`/`BOOLEAN`/`FUNCTION_OBJ`）才读首字；
+  `as_is` 与 `as_iface_lookup` 先过它，`as_v_is_inst` 不再对 `tag == 6` 放行去 `as_is`。
+  **白名单而非黑名单**是刻意的：将来新增分配种类时默认「无 vtable」（答错是 `is` = false），而不是野读。
+- **同一族的其余面**：`Dictionary`/`Vector` 同样没有 vtable，`Object` 自有的四个方法
+  （`toString`/`hasOwnProperty`/`propertyIsEnumerable`/`valueOf`）现在由 `as_dyn_object_builtin` **按堆种类**回答
+  （record `[object Object]`、Dictionary `[object Dictionary]`、Vector 用 `join(",")`、`valueOf` 返回自身），
+  `as_arr_call` 的落空分支也接上它。此前 `var o:Object = new Dictionary(); o.toString()` 同样是 SIGSEGV。
+  顺序上它**先于** `as_dyn_get` 但**只在没有同名动态属性时**生效——动态属性该盖过原型方法（AS3），
+  而 `as_dyn_get` 对装箱标量是**抛 `#1069`** 而非返回 null，先问它会把 `var o:Object = 5; o.toString()` 打红。
+
+**三、验收（全部实测）**
+
+- **最小复现包** `asaotui/probes/g14-minimal/run.cjs` ⇒ `exit 1`（**NOT reproduced**：AOT 与 AIR 逐字相同）。
+- **26 格矩阵** `asaotui/probes/obj-array-identity/run.cjs` ⇒ **0 偏离 0 崩溃**（原登记 8 条偏离全部消失）；
+  `expect.json` 的 `knownAotDeviations` 清空；变异 `mutation.cjs` **4/4**、`expect.json` sha256 逐字节还原。
+- **扩展矩阵**（`temp/g14/Ext2.as` 59 例 / `ab.cjs` 双路比对）：**55/55 行与真 AIR 51.4.1 逐字相同**
+  （`is`/`as`/`length`/索引读写/`push`/`pop`/`join`/`toString`/`String()`/`Number()`/`indexOf`/`slice`/`sort`/
+  `unshift`/`valueOf`/`typeof`/`for-in`/`for each`/`constructor`/`in`/`delete`/`Dictionary`/`Vector`/record/null/
+  `*` 槽/Object 参数）。AIR 臂自身曾在 1–24 行复用被改写的数组 ⇒ 6 条假差，改成一例一变量后归零。
+- **新示例** `examples/object-array-identity.as`（79 条断言，期望值全部取自上面两组 adl 实测）+ **新单元组**
+  `unit: object/array-identity`（23 条：`as_has_vtable` 白名单、`as_is` 守卫在读取之前、`as_dyn_call` 的数组
+  detour 在 vtable walk **之前**、发射侧六个调用点、以及**不许退化**的反向钉子：`*` 槽仍走 `as_v_is_array`、
+  `Array` 直声明仍编译期折叠、Number/String 仍走专用测试）。
+- **变异 8/8 全抓**（`temp/g14/mutate.cjs`，每次按 sha256 断言 `src/runtime.ts`/`src/emit.ts` 逐字节还原）：
+  M1 去掉 `as_is` 守卫、M2 恢复 tag-6 放行、M3 关掉数组 detour、M4 把 `as_array_key_get` 换回 prop 表、
+  M5 去掉 `as_obj_to_str` 的数组分支、M6 `is Array` 折回 false、M7 去掉 for-each 装箱、M8 恢复构造函数野读。
+- **单元层** `node --test test/unit/*.ts`：**230 pass / 1 fail**（`inline/StackCanary` 是本机 clang 既有多项，
+  已在 `a035645` 的干净 worktree 上复现同一失败）。
+- **全量 `node test.ts`：469 / 464 / 5**。红的 5 项与阶段二百五十二 **完全相同**（`socket.as` 无 Windows socket 后端、
+  `stage94d.as` UTF-16LE、`inline/StackCanary`、`example: air-native` 两项——本机工作区那 352 个文件被删）。
+  增量是 +2 项（一个新示例、一个新单元组）。
+
+**四、如实报明**
+
+- 修法**没有**让 Array「变成 Object 搭配的装箱体」：`Object` 槽里它仍是裸 `as_array*`，`as_value_to_obj` 的
+  `case 6` 未动。因此「`Object` 槽装 Array 时 GC 怎样标它」等表示层问题仍在原处（本轮未改，也未引入新问题）。
+- 中途踩到一次**自己制造的红**：把 `Object` 接收者的**所有**调用都改走 `as_dyn_call` 后，`o.hasOwnProperty("zz")`
+  在普通 record 上返回 null（`as_dyn_call` 只 walk methods 表，Object 的三个槽不在里面），一次打红 5 个示例
+  （`object-box`/`describe-type`/`with`/`stage94d`/`socket`），由全量回归当场发现 ⇒ 补 `as_dyn_object_builtin` 才收口。
+  这条正是「示例绿 ≠ 规则没坏」的反面：**全量回归**才是那道网。
+- **顺带发现一条相邻缺口，单列不夹带**：`getQualifiedClassName(new Dictionary())` 我们答 `"Object"`、
+  AIR 答 `"flash.utils::Dictionary"`。已在 `a035645` 的干净 worktree 上复现 ⇒ **既有缺陷**，登记为 `compiler-gaps.md`
+  的 **G15**（未修）。同批 14 行小矩阵里 13/14 已与 AIR 逐字一致，唯一不一致的就是它。
+- `docs/zh-cn/as3-semantics.md` 的红线表本轮**未改**：本条的判据已写在 `runtime.ts` 的注释与单元组里，
+  再加一行会与 AGENTS.md §2.4 的表重复维护。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

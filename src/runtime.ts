@@ -1162,10 +1162,32 @@ typedef struct { const char* name; void* super; void** ifaces; void* props; void
 // public member is the getter of a private field).
 typedef struct { const char* name; int type; size_t offset; void* vt; const char* fqn; int vis; int is_accessor; int is_const; } as_prop;
 
+// Does this heap body start with a vtable pointer? An Object-typed slot is the
+// universal value slot, so it can hold things that DO NOT: an Array starts with
+// its element buffer, a Dictionary with its key buffer, a Vector with its mark
+// callback, a String with its characters, a Closure with its function pointer.
+// Reading the first word as an as_object_header and following it as a vtable
+// header segfaulted -- 'var o:Object = [1,2,3]; o is Marker' (0xC0000005) and
+// the same test through a '*' slot (G14). The test WHITELISTS the kinds that do
+// carry one, so a future allocation kind defaults to "no vtable" (a wrong
+// false from is) rather than to a wild read.
+static bool as_has_vtable(void* obj) {
+    if (obj == NULL) return false;
+    // Statics -- a class object, a baked vtable, a string literal -- are safe by
+    // construction; only a GC body needs the kind dispatch.
+    if (!gc_in_heap(obj)) return true;
+    switch (gc_hdr(obj)->type) {
+        case GCT_OBJECT: case GCT_CLASS: case GCT_XML: case GCT_XML_LIST:
+        case GCT_NUMBER: case GCT_STRING_OBJ: case GCT_BOOLEAN: case GCT_FUNCTION_OBJ:
+            return true;
+        default: return false;
+    }
+}
+
 // Look up an interface vtable by name from the object's vtable interface list.
 // Returns NULL when the object's class does not implement the interface.
 static void* as_iface_lookup(void* obj, const char* name) {
-    if (obj == NULL) return NULL;
+    if (!as_has_vtable(obj)) return NULL;
     void* vt = ((as_object_header*)obj)->vtable;
     void** p = ((as_vtable_header*)vt)->ifaces;
     if (p == NULL) return NULL;
@@ -1182,6 +1204,10 @@ static bool as_is(void* obj, void* target_vt) {
     // Vector/Dictionary, so the read itself would be the crash. (The core classes
     // int/uint/Array carry no instance vtable: see Emitter.CORE_CLASS_VT.)
     if (target_vt == NULL) return false;
+    // The same hazard without a NULL target: 'o is Marker' where o:Object holds an
+    // Array read the element buffer as a vtable header and crashed (G14). No
+    // vtable-less body can be an instance of a class, so answer false.
+    if (!as_has_vtable(obj)) return false;
     void* vt = ((as_object_header*)obj)->vtable;
     while (vt != NULL) {
         if (vt == target_vt) return true;
@@ -1199,7 +1225,16 @@ static char* as_proxy_to_str(void* obj);
 // class F, '[object Sprite]' for flash.display.Sprite (measured on adl 51.4.1).
 // The local name is the tail of the fully-qualified name the vtable carries
 // ('pkg::Cls' -> 'Cls'); the C identifier in the name slot is never user-visible.
+// The Array join(",") stringifier, defined with the Array helpers below; needed
+// here because an Array in an Object slot reaches as_obj_to_str AND as_obj_default_str
+// (Object's toString slot).
+static char* as_arr_to_str(void* a);
 static char* as_obj_default_str(void* obj) {
+    // An Array is not an object with a vtable: its first word is the element buffer,
+    // so the vtable reads below segfaulted (G14: 'var o:Object = [1,2,3]' then
+    // 'o.toString()' resolves to Object's slot). Same answer as String(o).
+    if (obj != NULL && gc_in_heap(obj) && gc_hdr(obj)->type == GCT_ARRAY) return as_arr_to_str(obj);
+    if (obj != NULL && gc_in_heap(obj) && gc_hdr(obj)->type == GCT_DICT) return "[object Dictionary]";
     void* vt = obj != NULL ? ((as_object_header*)obj)->vtable : NULL;
     const char* fqn = vt != NULL ? ((as_vtable_header*)vt)->fqn : NULL;
     if (fqn == NULL || fqn[0] == 0) fqn = vt != NULL ? ((as_vtable_header*)vt)->name : "Object";
@@ -1213,6 +1248,15 @@ static char* as_obj_default_str(void* obj) {
 }
 static char* as_obj_to_str(void* obj) {
     if (obj == NULL) return "null";
+    // An Array is not an object with a vtable (first word = element buffer), so the
+    // vtable read below crashed: 'var o:Object = [1,2,3]; String(o)' segfaulted
+    // (G14). Its string form is join(","), the same answer as_v_str_val's tag-6
+    // branch gives a '*' receiver.
+    if (gc_in_heap(obj) && gc_hdr(obj)->type == GCT_ARRAY) return as_arr_to_str(obj);
+    // A Dictionary has no vtable either (its first word is the pair buffer), and AIR
+    // renders it under its class name like any other object (measured: "[object
+    // Dictionary]", temp/g14/DictAir.as).
+    if (gc_in_heap(obj) && gc_hdr(obj)->type == GCT_DICT) return "[object Dictionary]";
     // A Class VALUE is not an instance: the first word of a class object is the
     // INSTANCE vtable of the class it denotes, so running that vtable's toString on
     // it reads the class object as an object of its own class (measured: the
@@ -1772,6 +1816,13 @@ static double as_obj_to_number(void* obj) {
     // a String class object would run as_string_box_to_str on the class struct
     // (measured crash). AIR: Number(SomeClass) is NaN, and '5 == SomeClass' is false.
     if (!gc_in_heap(obj) && as_class_fqn_of_ptr(obj) != NULL) return NAN;
+    // An Array in an Object slot is not an object with a vtable: its first word is
+    // the element buffer. ToNumber runs ToString first (ES3), i.e. the join --
+    // Number([5]) is 5 and Number([1,2]) is NaN, exactly as the '*' path already
+    // answered (as_v_to_number's tag-6 branch). Reading the buffer as a vtable is
+    // what made 'var o:Object = [1,2,3]; Number(o)' undefined behaviour (G14).
+    if (gc_in_heap(obj) && gc_hdr(obj)->type == GCT_ARRAY)
+        return as_str_to_number(as_arr_to_str(obj));
     void* vt = ((as_object_header*)obj)->vtable;
     if (vt == NULL) return 0.0;
     // 1) valueOf(): a user override lives in the method table. The built-in
@@ -1799,10 +1850,17 @@ static as_value as_proxy_call(void* obj, const char* mname, as_value* args, int 
 // the pre-baked record/scalar vtables need it for their Object-level
 // hasOwnProperty slot before the definition appears.
 static bool as_dyn_has(void* obj, const char* key);
+// Prototypes for the two Object-level queries as_dyn_call answers itself when the
+// receiver has no vtable at all (a Dictionary): both are defined further below.
+static bool as_dyn_enumerable(void* obj, const char* key);
+static char* as_coerce_str(as_value v);
 // Prototype for the heap-kind classifier (GCT_DICT/ARRAY/CUSTOM), defined with
 // the Dictionary helpers below. as_dyn_call consults it to spot a Vector before
 // walking a vtable a Vector does not have.
 static int as_dyn_kind(void* obj);
+// The Array method dispatcher (defined with the Array helpers below), taking the
+// receiver as void* so this early forward declaration does not need as_array.
+static as_value as_arr_call(void* a, const char* name, as_value* args, int argc);
 // as_dyn_call's property fallback and the boxed-Function invoker it uses are both
 // defined further down (after the function-value helpers).
 static as_value as_dyn_get(void* obj, const char* key);
@@ -1841,15 +1899,61 @@ static int (*as_ba_has_key_hook)(void* ptr, const char* key) = NULL;
 // ByteArray buffer length needs its own hook; without it a '*' receiver read 0.
 static int (*as_ba_len_hook)(void* ptr) = NULL;
 
+// Object's own four methods -- toString / hasOwnProperty / propertyIsEnumerable /
+// valueOf -- can never be found by a methods-table walk: the generated vtables keep
+// them in three slots AFTER the common header, which no reflection table lists. So
+// an Object-typed receiver whose class does not override them ('o.hasOwnProperty(k)',
+// 'o.toString()') has to be answered here, and the same function serves the heap
+// kinds that have no vtable to walk at all (a Dictionary). Measured on adl 51.4.1
+// (temp/g14/DictAir.as): a record's toString is "[object Object]", a Dictionary's
+// "[object Dictionary]", Vector.<int>(3) is "0,0,0" (join with a comma);
+// hasOwnProperty / propertyIsEnumerable are the same walks as_dyn_get uses, and
+// valueOf() is the receiver itself.
+static as_value as_dyn_object_builtin(void* obj, int dk, const char* name, as_value* args, int argc) {
+    if (name == NULL) return as_v_null();
+    if (strcmp(name, "hasOwnProperty") == 0)
+        return as_v_bool(as_dyn_has(obj, argc > 0 ? as_coerce_str(args[0]) : NULL));
+    if (strcmp(name, "propertyIsEnumerable") == 0)
+        return as_v_bool(as_dyn_enumerable(obj, argc > 0 ? as_coerce_str(args[0]) : NULL));
+    if (strcmp(name, "valueOf") == 0) return as_v_obj(obj);
+    if (strcmp(name, "toString") == 0) {
+        if (dk == 3 && as_vec_call_hook != NULL) {
+            as_value sep[1];
+            sep[0] = as_v_str((char*)",");
+            return as_vec_call_hook(obj, "join", sep, 1);
+        }
+        // as_obj_to_str knows an Array and a Dictionary by heap kind; any other
+        // vtable-less body has no text form to give here.
+        if (as_has_vtable(obj) || dk == 1) return as_v_str(as_obj_to_str(obj));
+        return as_v_null();
+    }
+    return as_v_null();
+}
 // Dynamically invoke a method by name on any object, walking the vtable super
 // chain to find the first method-reflection table (if any) that declares it.
 // Returns as_v_null() when the object is NULL or has no such method.
 static as_value as_dyn_call(void* obj, const char* name, as_value* args, int argc) {
     if (obj == NULL) return as_v_null();
+    int dk = as_dyn_kind(obj);
     // A monomorphized Vector has no vtable (its first word is its mark callback),
     // so the super-chain walk below would dereference garbage. Route every
     // dynamic call on one to the generated per-specialization dispatcher.
-    if (as_vec_call_hook != NULL && as_dyn_kind(obj) == 3) return as_vec_call_hook(obj, name, args, argc);
+    if (as_vec_call_hook != NULL && dk == 3) {
+        as_value rv = as_vec_call_hook(obj, name, args, argc);
+        if (rv.tag != 0) return rv;
+        // A Vector answers its own methods (join / push / slice ...) but inherits
+        // Object's four (measured: Vector.<int>(3).toString() is "0,0,0").
+        return as_dyn_object_builtin(obj, dk, name, args, argc);
+    }
+    // Neither does an Array (its first word is the element buffer):
+    // 'var o:Object = [1,2,3]' followed by 'o.push(4)', 'o.join("-")' or
+    // 'o.toString()' walked the elements as a vtable header and segfaulted (G14).
+    // Same dispatcher the '*' receiver already used (as_any_call's tag-6 branch).
+    if (dk == 2) return as_arr_call(obj, name, args, argc);
+    // A Dictionary has no vtable either (its first word is the pair buffer), so the
+    // walk below would dereference it as one: 'var o:Object = new Dictionary();
+    // o.toString()' segfaulted. Object's own four methods answer by heap kind.
+    if (!as_has_vtable(obj)) return as_dyn_object_builtin(obj, dk, name, args, argc);
     void* vt = ((as_object_header*)obj)->vtable;
     while (vt != NULL) {
         as_method* methods = (as_method*)((as_vtable_header*)vt)->methods;
@@ -1871,6 +1975,16 @@ static as_value as_dyn_call(void* obj, const char* name, as_value* args, int arg
     // walk above never sees. AIR calls such a member ('var o:Object = {n: f};'
     // then 'o.n()'); we returned null without calling anything at all (measured:
     // 2-parameter f raises #1063 in AIR -- temp/pkgA/cbk3/A and cbk4).
+    //
+    // Object's four inherited methods are answered first, and only when the receiver
+    // has NO dynamic property of that name (AS3: an own dynamic member shadows the
+    // prototype method). Order matters for the sealed/boxed kinds: as_dyn_get on a
+    // boxed Number THROWS #1069 rather than answering null, so asking it first broke
+    // 'var o:Object = 5; o.toString()' (examples/object-array-identity.as section L).
+    if (name != NULL && !as_dyn_has(obj, name)) {
+        as_value b = as_dyn_object_builtin(obj, dk, name, args, argc);
+        if (b.tag != 0) return b;
+    }
     as_value pv = as_dyn_get(obj, name);
     if (pv.tag == 7) return as_fn_call_dyn(pv, args, argc, name);
     return as_v_null();
@@ -2024,7 +2138,7 @@ static as_value as_v_class_of(as_value v);
 // Boxed 'any' instance-of check against a concrete class vtable. Only object/
 // array tags carry a vtable pointer; all other boxed values are not instances.
 static bool as_v_is_inst(as_value v, void* target_vt) {
-    if (v.tag != 4 && v.tag != 6) return false;
+    if (v.tag != 4) return false;
     if (!as_is(as_v_obj_val(v), target_vt)) return false;
     // A Class VALUE is not an instance of the class it names: its first word is
     // that class's own vtable (so the class chain walk in as_is() -- and hence
@@ -4998,6 +5112,36 @@ static int as_dyn_kind(void* obj) {
     return 0;
 }
 
+// 'x is Array' / 'x as Array' when x's STATIC type is Object -- the universal
+// value slot, which holds a bare as_array* for an Array. An Array has no vtable
+// (its first word is the element buffer), so the class-chain test cannot answer
+// it: as_is() answered false and as_* cast NULL, and both were silent (G14). A
+// class X extends Array instance IS an Array through the backing-array hook, the
+// same discriminator the dynamic paths use (as_any_length / as_dyn_get).
+static bool as_obj_is_array(void* obj) {
+    if (obj == NULL) return false;
+    return as_dyn_kind(obj) == 2 || as_arrback_is(obj);
+}
+static as_array* as_obj_as_array(void* obj) {
+    if (obj == NULL) return NULL;
+    if (as_dyn_kind(obj) == 2) return (as_array*)obj;
+    return as_arrback_hook != NULL ? as_arrback_hook(obj) : NULL;
+}
+
+// '.constructor' on an Object-typed receiver. as_v_class_of walks the receiver's
+// vtable, which an Array does not have (its first word is the element buffer), so
+// '[1,2,3]' in an Object slot answered nothing -- String(o.constructor) printed
+// '[class Class]' and 'o.constructor == Array' was false (G14). A Dictionary /
+// Vector body does not start with a vtable either; neither trait is modelled
+// here, so answer null rather than read the data pointer as one.
+static as_value as_obj_class_of(void* obj) {
+    if (obj == NULL) return as_v_null();
+    int dk = as_dyn_kind(obj);
+    if (dk == 2) return as_v_class_of(as_v_arr(obj));
+    if (dk != 0) return as_v_null();
+    return as_v_class_of(as_v_obj(obj));
+}
+
 // for each (v in <dynamically-typed expr>): what gets enumerated is decided by the
 // VALUE's runtime kind, exactly as AIR dispatches on it -- an Array yields its
 // elements, a Dictionary its values, a Vector.<T> its elements, a dynamic Object
@@ -5185,7 +5329,16 @@ static as_value as_dyn_get(void* obj, const char* key) {
     if (obj == NULL) return as_v_null();
     int dk = as_dyn_kind(obj);
     if (dk == 1) return as_dict_get((as_dict*)obj, as_v_str((char*)key));
-    if (dk == 2) return as_array_prop_get((as_array*)obj, key);
+    if (dk == 2) {
+        // An Array in an Object slot has no vtable (first word = element buffer),
+        // so it needs the full keyed accessor: a canonical index is an element, a
+        // 'length' is the length, anything else a named property. as_array_prop_get
+        // alone answered undefined for 'o[0]' and 'o.length' (G14). 'constructor'
+        // is Object's own trait, so it answers Array just as the branch below
+        // does for a vtable-bearing receiver.
+        if (strcmp(key, "constructor") == 0) return as_v_class_of(as_v_arr(obj));
+        return as_array_key_get((as_array*)obj, key);
+    }
     if (dk == 3) return as_vec_get_hook != NULL ? as_vec_get_hook(obj, key) : as_v_null();
     // 'constructor' is Object's own instance trait, not a reflected field: every
     // object answers it with its Class reference (AIR: 'var o:* = new Foo();
@@ -5634,12 +5787,11 @@ static as_value as_any_get(as_value box, const char* key) {
     switch (box.tag) {
         case 4: return as_dyn_get(as_v_obj_val(box), key);
         case 6: {
+            // Same keyed accessor as as_dyn_get's array branch: an Array in a '*'
+            // slot answers 'length' and canonical indices too ('a["length"]' was
+            // undefined before G14, and so was 'a["0"]').
             as_array* arr = (as_array*)as_v_obj_val(box);
-            int i;
-            if (as_array_index_key(key, &i)) return as_array_get(arr, i);
-            // Non-index key on a dynamically-typed Array reference: a named
-            // dynamic property (a.bar), NOT element 0 (strtol("bar") == 0).
-            return as_array_prop_get(arr, key);
+            return as_array_key_get(arr, key);
         }
         case 3: return as_v_str((char*)key);
         default: return as_v_null();
@@ -5732,7 +5884,8 @@ static as_array* as_array_sortOn(as_array* a, const char* field, int options) {
 // is resolved here. Without this, as_any_call handed an as_array* to as_dyn_call,
 // which reads the vtable header out of the element buffer -- 'a.toString()'
 // segfaulted and 'a.push(1)' silently did nothing (adl 51.4.1, temp/pkgA/arr3).
-static as_value as_arr_call(as_array* a, const char* name, as_value* args, int argc) {
+static as_value as_arr_call(void* av, const char* name, as_value* args, int argc) {
+    as_array* a = (as_array*)av;
     if (strcmp(name, "toString") == 0 || strcmp(name, "valueOf") == 0) return as_v_str(as_array_join(a, ","));
     if (strcmp(name, "join") == 0)
         return as_v_str(as_array_join(a, (argc > 0 && args[0].tag != 5) ? as_v_str_val(args[0]) : ","));  // join(null) is the separator "null"; join(undefined) picks "," (adl 51.4.1)
@@ -5785,7 +5938,10 @@ static as_value as_arr_call(as_array* a, const char* name, as_value* args, int a
     }
     if (strcmp(name, "sortOn") == 0)
         return as_v_arr((void*)as_array_sortOn(a, argc > 0 ? as_v_str_val(args[0]) : "", argc > 1 ? as_v_to_int(args[1]) : 0));
-    return as_v_null();
+    // Object's inherited four: an Array answers hasOwnProperty (an index or an added
+    // named property), propertyIsEnumerable (the same, but "length" is a trait) and
+    // valueOf (handled above); measured on adl 51.4.1 -- temp/g14/DictAir.as.
+    return as_dyn_object_builtin(av, 2, name, args, argc);
 }
 
 // ---------- Dictionary ----------

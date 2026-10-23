@@ -16,6 +16,7 @@ import './unit/flash-data.ts';
 import './unit/reflection.ts';
 import './unit/reflect.ts';
 import './unit/vector.ts';
+import './unit/object-array.ts';
 import './unit/platform.ts';
 import './unit/stage3d.ts';
 import './unit/emit.ts';
