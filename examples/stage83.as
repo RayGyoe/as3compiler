@@ -21,8 +21,12 @@ const R_VA:int = 0;
 const R_V:int  = 4;
 const SW_ID:int = 0xE4;
 
+// opcode token 只放**裸操作码**：操作数个数由操作码本身决定（AGALMiniAssembler 的
+// agal_op_nreg 表）。早期这里还按 hasDst/hasSrc1/hasSrc2 或上 0x100/0x200/0x400，
+// 那是我方臆造：adl 51.4.1 收到这种字节码直接报
+// Error #3620 "Invalid opcode, value out of range"（实测见 temp/agalprobe）。
 function op(op:int, hasDst:Boolean, hasSrc1:Boolean, hasSrc2:Boolean):int {
-  return op | (hasDst ? 0x100 : 0) | (hasSrc1 ? 0x200 : 0) | (hasSrc2 ? 0x400 : 0);
+  return op;
 }
 function dst(regType:int, num:int, mask:int):int { return (mask << 16) | (regType << 24) | num; }
 function srcLo(num:int, swizzle:int):int { return (swizzle << 24) | num; }

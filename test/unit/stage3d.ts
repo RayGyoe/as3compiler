@@ -412,6 +412,87 @@ function checkStage3dAgalOperandSlots(): string[] {
 
 registerGroup('stage3d/agal-operand-slots', checkStage3dAgalOperandSlots);
 
+// nrm: what adl 51.4.1 ACTUALLY does, measured in temp/agalprobe (a Stage3D pixel
+// probe run under adl AND under our own Metal build -- identical readbacks):
+//   * nrm's divisor is |xyz| only. nrm of (3,4,0,7) reads back 0.6/0.8 in rgb,
+//     i.e. divided by 5, not by |xyzw| = 8.6023.
+//   * a masked nrm leaves the destination's w untouched; `nrm ft0, fc0` (mask that
+//     includes w) is refused at upload with Error #3628, so w has no nrm value at
+//     all.
+// The translator used to normalize all four components ('normalize(ft0)') and to
+// accept a w-masked destination -- two silent divergences from AIR.
+function checkStage3dAgalNrm(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean) => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const bodyOf = (sig: string): string => {
+    const i = runtime.indexOf(sig);
+    if (i < 0) return '';
+    const m = /\r?\n\}\r?\n/.exec(runtime.slice(i));
+    return m == null ? '' : runtime.slice(i, i + m.index);
+  };
+  const body = bodyOf('static void agal_emit_body(');
+
+  check('nrm normalizes the source .xyz, never all four components',
+    /normalize\(%s\.xyz\)/.test(body) && !/normalize\(%s\)/.test(body));
+  check('nrm re-widens its 3-component result before a component is picked',
+    /%s\(normalize\(%s\.xyz\), 0\.0\)\.%c/.test(body));
+  check('a swizzled nrm source is gathered by component (no double swizzle)',
+    /%s\(normalize\(%s\(%s\.%c, %s\.%c, %s\.%c\)\), 0\.0\)\.%c/.test(body));
+  check('nrm picks the DESTINATION component, not the source swizzle component',
+    /normalize\(%s\.xyz\), 0\.0\)\.%c", v4, s1b, ch\)/.test(body));
+  check('a w-masked nrm is refused with adl\'s Error #3628',
+    /if \(op == 0x0e && \(dmask & 0x8\)\)/.test(body)
+    && /nrm must not write w \(adl rejects the program with Error #3628/.test(runtime));
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/agal-nrm', checkStage3dAgalNrm);
+
+// Reading a temporary register before writing it is an UPLOAD ERROR on adl, not a
+// zero read: measured in temp/agalprobe (upload.txt, plus bytes2.txt which feeds
+// Adobe's own AGALMiniAssembler output, so this is not an artefact of our hand
+// encoding) -- Error #3647 for a whole register, #3648 for a single component.
+// Translating such a program would put an uninitialised local in the MSL/GLSL/HLSL
+// we emit, i.e. undefined behaviour.
+function checkStage3dAgalTempWrites(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean) => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const bodyOf = (sig: string): string => {
+    const i = runtime.indexOf(sig);
+    if (i < 0) return '';
+    const m = /\r?\n\}\r?\n/.exec(runtime.slice(i));
+    return m == null ? '' : runtime.slice(i, i + m.index);
+  };
+  const body = bodyOf('static const char* agal_check_temp_writes(');
+
+  check('the write-tracking validator exists and is called before emitting',
+    body !== '' && /agal_check_temp_writes\(ins, n\)/.test(runtime));
+  check('it tracks a component mask per register (not just "written")',
+    /wrote\[num\] & need\) == need/.test(body) && /wrote\[num\] \|= \(unsigned\)\(\(I->dst >> 16\) & 0xFu\)/.test(body));
+  check('the components a read touches come from the source swizzle',
+    /unsigned swz = \(lo >> 24\) & 0xFFu;/.test(body)
+    && /need \|= 1u << \(\(swz >> \(2 \* c\)\) & 3u\)/.test(body));
+  check('a tex/tld sampler slot is not mistaken for a register read',
+    /j == 1 && \(op == 0x28 \|\| op == 0x2e\)/.test(body));
+  check('the refusal names AIR\'s own error numbers',
+    /read before it is written \(adl rejects the program with Error #3647\/#3648\)/.test(body));
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/agal-temp-writes', checkStage3dAgalTempWrites);
+
 // Flush policy: the frame boundary commits WITHOUT waiting, the CPU-readback
 // paths wait.
 //

@@ -28,9 +28,12 @@ const R_V:int  = 4; // varying
 const R_FS:int = 5; // texture sampler（vertex vs / fragment fs）
 const SW_ID:int = 0xE4; // identity swizzle .xyzw（8-bit）
 
-// opcode token：op | hasDst(0x100) | hasSrc1(0x200) | hasSrc2(0x400)
+// opcode token 只放**裸操作码**：操作数个数由操作码本身决定（AGALMiniAssembler 的
+// agal_op_nreg 表）。早期这里还按 hasDst/hasSrc1/hasSrc2 或上 0x100/0x200/0x400，
+// 那是我方臆造：adl 51.4.1 收到这种字节码直接报
+// Error #3620 "Invalid opcode, value out of range"（实测见 temp/agalprobe）。
 function op(op:int, hasDst:Boolean, hasSrc1:Boolean, hasSrc2:Boolean):int {
-  return op | (hasDst ? 0x100 : 0) | (hasSrc1 ? 0x200 : 0) | (hasSrc2 ? 0x400 : 0);
+  return op;
 }
 // dest token：[num:16][mask:8][type:8]
 function dst(regType:int, num:int, mask:int):int {
@@ -49,6 +52,14 @@ function makeVertex():ByteArray {
   u32le(ba, dst(R_OP, 0, 0xF));
   u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_VA));
   u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_VC));
+  // mov vt0, va1：先把四个分量都写满。adl 51.4.1 会**拒绝**读一个从未写过的
+  // 临时寄存器分量（Error #3648「component read without being written to」，
+  // 实测 temp/agalprobe/upload.txt），所以下面那步只有 .xy 的读法必须建立在
+  // 一次完整写入之上。
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 0, 0xF));
+  u32le(ba, srcLo(1, SW_ID)); u32le(ba, srcHi(R_VA));
+  u32le(ba, 0); u32le(ba, 0);
   // mov vt0.xy, va1.zw：.zw swizzle = x<-z,y<-w,z<-w,w<-w = 0xFE；.xy mask = 0x3
   u32le(ba, op(0x00, true, true, false));
   u32le(ba, dst(R_VT, 0, 0x3));
@@ -148,6 +159,11 @@ check(fmsl.indexOf("sampler smp0 [[sampler(0)]]") >= 0, "the single-texture prog
 function makeMaskedSamplerFragment():ByteArray {
   var ba:ByteArray = new ByteArray();
   ba.writeByte(0xA0); u32le(ba, 1); ba.writeByte(0xA1); ba.writeByte(0x01);
+  // mov ft2, fc0：同上，先写满分量，下面才能合法地整体读 ft2（adl 的 #3648）
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 2, 0xF));
+  u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_VC));
+  u32le(ba, 0); u32le(ba, 0);
   // tex ft2.xy, v1, fs3
   u32le(ba, op(0x28, true, true, true));
   u32le(ba, dst(R_VT, 2, 0x3)); // ft2, mask .xy
@@ -214,6 +230,12 @@ check(mglsl.indexOf("uniform vec4 vc5;") < 0, "m44/m34 must not declare untouche
 function makeOdFragment():ByteArray {
   var ba:ByteArray = new ByteArray();
   ba.writeByte(0xA0); u32le(ba, 1); ba.writeByte(0xA1); ba.writeByte(0x01);
+  // mov ft0, v0：先写满 ft0。adl 51.4.1 拒绝读未写过的临时寄存器分量（#3648），
+  // 翻译器现在同样拒绝（见 temp/agalprobe）。
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 0, 0xF));
+  u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_V));
+  u32le(ba, 0); u32le(ba, 0);
   // mov od, ft0：od 的类型码是 6（oc/op 是 3）
   u32le(ba, op(0x00, true, true, false));
   u32le(ba, dst(6, 0, 0xF));
@@ -238,6 +260,129 @@ has(odmsl, "fragment FSOut fs_main(", "MSL od changes the entry return type");
 has(odmsl, "float4 od;", "MSL declares the four-component od local");
 has(odmsl, "fso.depth = od.x;", "MSL copies od.x into the depth member");
 check(fmsl.indexOf("depth(any)") < 0, "programs without od must not declare a depth output");
+
+// ===== nrm：只归一化 xyz，且目的地不许写 w =====
+// adl 51.4.1 实测（temp/agalprobe，像素探针 + 校验器探针）：
+//   1) nrm 归一化的除数只有 |xyz|。把 (3,4,0,7) 交给 nrm 后读回的 rgb 是 0.6/0.8
+//      （即除以 5），不是 0.349/0.465（除以 |xyzw| = 8.6023）；w 分量原样保留。
+//   2) 'nrm ft1, ft0'（掩码含 w）在上传时就被拒：Error #3628 "The destination
+//      operand for the nrm instruction must mask w (use .xyz or less)"。
+// 所以翻译必须：(a) 归一化 source 的 xyz 再补一个 0.0 的 w；(b) 掩码含 w 时响亮拒绝。
+// ft1 先写满再被部分复写，是因为读未写的分量会被 adl 判 #3648。
+function makeNrmFragment(srcSwz:int, dmask:int):ByteArray {
+  var ba:ByteArray = new ByteArray();
+  ba.writeByte(0xA0); u32le(ba, 1); ba.writeByte(0xA1); ba.writeByte(0x01);
+  // mov ft1, fc0（先把四个分量写满）
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 1, 0xF));
+  u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_VC));
+  u32le(ba, 0); u32le(ba, 0);
+  // mov ft0, fc1
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 0, 0xF));
+  u32le(ba, srcLo(1, SW_ID)); u32le(ba, srcHi(R_VC));
+  u32le(ba, 0); u32le(ba, 0);
+  // nrm ft1.<mask>, ft0.<swizzle>
+  u32le(ba, op(0x0e, true, true, false));
+  u32le(ba, dst(R_VT, 1, dmask));
+  u32le(ba, srcLo(0, srcSwz)); u32le(ba, srcHi(R_VT));
+  u32le(ba, 0); u32le(ba, 0);
+  // mov oc, ft1
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_OP, 0, 0xF));
+  u32le(ba, srcLo(1, SW_ID)); u32le(ba, srcHi(R_VT));
+  u32le(ba, 0); u32le(ba, 0);
+  return ba;
+}
+var nrmmsl:String = AGALTranslator.translate(makeNrmFragment(SW_ID, 0x7), "msl");
+has(nrmmsl, "ft1.x = float4(normalize(ft0.xyz), 0.0).x;", "MSL nrm normalizes xyz only and keeps a 3-component result");
+has(nrmmsl, "ft1.z = float4(normalize(ft0.xyz), 0.0).z;", "MSL nrm writes the .z destination component");
+check(nrmmsl.indexOf("normalize(ft0).") < 0, "MSL nrm must not normalize all four components");
+var nrmglsl:String = AGALTranslator.translate(makeNrmFragment(SW_ID, 0x7), "glsl");
+has(nrmglsl, "ft1.x = vec4(normalize(ft0.xyz), 0.0).x;", "GLSL nrm normalizes xyz only");
+var nrmhlsl:String = AGALTranslator.translate(makeNrmFragment(SW_ID, 0x7), "hlsl");
+has(nrmhlsl, "ft1.x = float4(normalize(ft0.xyz), 0.0).x;", "HLSL nrm normalizes xyz only");
+// source 带 swizzle 时，归一化的输入是 .xyz 三个位置取 swizzle 后的值，而目的地分量
+// 按**目的地**的 x/y/z 取（不是 swizzle 的），否则 'nrm ft1.xyz, ft0.zyx' 会读成双重 swizzle。
+var nrmsw:String = AGALTranslator.translate(makeNrmFragment(0x06, 0x7), "msl"); // .zyx：x<-z(2), y<-y(1), z<-x(0)
+has(nrmsw, "float3(ft0.z, ft0.y, ft0.x)", "MSL nrm gathers the swizzled xyz source");
+// 掩码含 w 的三档一律拒绝（先对齐 adl 的 #3628，而不是发一段 AIR 不会跑的程序）。
+for (var ni:int = 0; ni < 3; ni++) {
+  var ntgt:String = ni == 0 ? "msl" : (ni == 1 ? "glsl" : "hlsl");
+  var nfullThrew:Boolean = false;
+  try { AGALTranslator.translate(makeNrmFragment(SW_ID, 0xF), ntgt); } catch (ne1:Error) { nfullThrew = true; }
+  check(nfullThrew, "nrm with a full write mask must be refused for target " + ntgt);
+  var nwThrew:Boolean = false;
+  try { AGALTranslator.translate(makeNrmFragment(SW_ID, 0x9), ntgt); } catch (ne2:Error) { nwThrew = true; }
+  check(nwThrew, "nrm writing w (mask .xw) must be refused for target " + ntgt);
+}
+
+// ===== 临时寄存器：读在写之前必须拒绝（adl 的 #3647/#3648）=====
+// adl 51.4.1 实测（temp/agalprobe/upload.txt 与 bytes2.txt，后者用**官方**
+// AGALMiniAssembler 编码，排除我方手写字节码的干扰）：读一个从未写过的临时寄存器
+// 是**上传错误**，不是「读到 0」。MSL/GLSL/HLSL 里那是一个未初始化局部变量（未定义
+// 行为，渲染成脏像素），所以翻译器同样拒绝，而不是悄悄发出去。
+function makeUnwrittenFragment(dmask:int):ByteArray {
+  var ba:ByteArray = new ByteArray();
+  ba.writeByte(0xA0); u32le(ba, 1); ba.writeByte(0xA1); ba.writeByte(0x01);
+  // mov oc, ft0（ft0 从未写过）
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_OP, 0, 0xF));
+  u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_VT));
+  u32le(ba, 0); u32le(ba, 0);
+  return ba;
+}
+var unwrittenRefused:Boolean = false;
+try { AGALTranslator.translate(makeUnwrittenFragment(0xF), "msl"); } catch (ue1:Error) { unwrittenRefused = true; }
+check(unwrittenRefused, "reading a never-written temporary must be refused");
+// 只写了一部分分量、却整寄存器去读，同样拒绝（adl 的 #3648 是逐分量的）。
+function makePartialWriteFragment():ByteArray {
+  var ba:ByteArray = new ByteArray();
+  ba.writeByte(0xA0); u32le(ba, 1); ba.writeByte(0xA1); ba.writeByte(0x01);
+  // mov ft0.xy, v0
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 0, 0x3));
+  u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_V));
+  u32le(ba, 0); u32le(ba, 0);
+  // mov oc, ft0
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_OP, 0, 0xF));
+  u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_VT));
+  u32le(ba, 0); u32le(ba, 0);
+  return ba;
+}
+var partialRefused:Boolean = false;
+try { AGALTranslator.translate(makePartialWriteFragment(), "msl"); } catch (ue2:Error) { partialRefused = true; }
+check(partialRefused, "reading an unwritten temporary COMPONENT must be refused");
+// 只读已写过的分量则不拒绝：'mov ft0.xy, v0 ; mov oc.xy?' —— oc 不能带掩码（adl #3701），
+// 所以用 'mov ft2.xy, ft0.xy ; mov oc, ft2' 验证「有写的分量可读」。
+function makePartialWriteOkFragment():ByteArray {
+  var ba:ByteArray = new ByteArray();
+  ba.writeByte(0xA0); u32le(ba, 1); ba.writeByte(0xA1); ba.writeByte(0x01);
+  // mov ft0.xy, v0
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 0, 0x3));
+  u32le(ba, srcLo(0, SW_ID)); u32le(ba, srcHi(R_V));
+  u32le(ba, 0); u32le(ba, 0);
+  // mov ft2, v1（写满，供 oc 用）
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 2, 0xF));
+  u32le(ba, srcLo(1, SW_ID)); u32le(ba, srcHi(R_V));
+  u32le(ba, 0); u32le(ba, 0);
+  // mov ft2.xy, ft0.xy（只读 ft0 已写的 .xy；.xy 的 swizzle 是 0x54 = x,y,y,y）
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_VT, 2, 0x3));
+  u32le(ba, srcLo(0, 0x54)); u32le(ba, srcHi(R_VT));
+  u32le(ba, 0); u32le(ba, 0);
+  // mov oc, ft2
+  u32le(ba, op(0x00, true, true, false));
+  u32le(ba, dst(R_OP, 0, 0xF));
+  u32le(ba, srcLo(2, SW_ID)); u32le(ba, srcHi(R_VT));
+  u32le(ba, 0); u32le(ba, 0);
+  return ba;
+}
+var partialOkMsl:String = AGALTranslator.translate(makePartialWriteOkFragment(), "msl");
+has(partialOkMsl, "ft2.x = ft0.x;", "a component that WAS written stays readable");
 
 // 全掩码比较指令（sge/slt/seq/sne）：按分量产出 0.0/1.0 掩码。两个目标的实现形态不同
 // （MSL select() 收 float4 分量布尔，GLSL mix()+bvec→vec4 转换），曾因用「三元格式串」

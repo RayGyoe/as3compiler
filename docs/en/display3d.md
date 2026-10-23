@@ -150,6 +150,35 @@ generations (MRT, instancing, the `iid` register, `fragment output index`).
 > shader's **per-instance ID register** (which the GLSL target still cannot provide, hence the refusal).
 > Acceptance: `xcrun metal` compiles 7/7 (the two old shapes both fail), real WebGL compiles too, evidence in
 > `temp/metalshader/`.
+>
+> **`nrm` normalizes `.xyz` only, and "read before write" is an upload error — both settled in stage 263 against
+> `adl 51.4.1`.** Both were previously a **silent guess**:
+>
+> ① `nrm`'s divisor is **|xyz|**, not |xyzw|. The pixel probe in `temp/agalprobe/` (`nrm ft1.xyz, ft0` with
+> `ft0=(3,4,0,7)`) reads back rgb `0.6/0.8` on `adl` (i.e. divided by 5); dividing by |xyzw| = 8.6023 would give
+> `0x587600` but the measurement is `0xFF99CC00` ⇒ **w neither joins the norm nor gets written**. The translator
+> used to emit `normalize(<src>)` (four components); it now emits `vec4(normalize(<src>.xyz), 0.0)` and then picks
+> by **destination** component (a swizzled source is gathered into `vec3(z,y,x)` first, so no double swizzle).
+> A `nrm` whose destination mask includes w is **refused loudly** (`adl` reports **Error #3628**, "destination …
+> must mask w (use .xyz or less)", measured).
+>
+> ② **Reading a temporary register that was never written is an `upload`-time error**, not "reads as zero".
+> Measured **Error #3647** (whole register) / **#3648** (single component), and reproducing them with bytes
+> assembled by Adobe's own `AGALMiniAssembler` shows this is not an artefact of our hand-rolled encoding.
+> The translator now does a **per-component linear scan** exactly like `adl` (`agal_check_temp_writes`: the write
+> set comes from the destination mask, the read set from the operand count implied by `agal_op_nreg` and
+> `agal_op_nodest` plus the source swizzle, with `tex`/`tld`'s third slot being a sampler and not a read) and
+> **refuses the upload** with the same error numbers — instead of emitting an uninitialised `float4 ft0;` (UB).
+>
+> ③ One misconception of **our own** corrected on the way: the opcode token carries the **bare opcode**
+> (`0x00`–`0x2e`) with no `hasDst/hasSrc1/hasSrc2` flag bits (OR-ing `0x100/0x200/0x400` makes `adl` reject the
+> program with **Error #3620**, "Invalid opcode, value out of range: 768"); the operand count is implied by
+> `agal_op_nreg`. The encoders in `examples/stage80/82/83.as` were fixed.
+>
+> Acceptance: the **`adl` truth and the AOT output in `temp/agalprobe/` are byte-for-byte identical** (`out.txt`
+> vs `out-aot.txt`, all five lines including `nrm-xyz-masked = 0xFF99CC00`); and each of the three targets really
+> compiles — Metal 2/2 (`temp/metalshader/nrm*.msl` through `xcrun metal`), WebGL 2/2 (`glslcheck3.html` doing a
+> real `compileShader`), HLSL pinned by text only (no `fxc` on this machine).
 
 ---
 

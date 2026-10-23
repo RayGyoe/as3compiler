@@ -123,6 +123,29 @@ Stage3D 的着色器是 **AGAL（Adobe 图形汇编语言）二进制字节码**
 > 按实际使用抑制。**注意区分「实例化」本身**：`drawTrianglesInstanced` → `instanceCount` 三端**都已上屏**，
 > 缺的只是着色器里读**每实例 ID 的寄存器**（GLSL 档至今给不出，故如实拒绝）。
 > 验收：`xcrun metal` 真编译 7/7 过（旧形态两份都编不过），WebGL 真编译过，证据 `temp/metalshader/`。
+>
+> **`nrm` 只归一化 `.xyz`，与「读前未写」一起于阶段二百六十三 按 `adl 51.4.1` 实测定案**。两处原先都是
+> **静默猜**：
+>
+> ① `nrm` 的除数是 **|xyz|**，不是 |xyzw|。`temp/agalprobe/` 的像素探针（`nrm ft1.xyz, ft0`，`ft0=(3,4,0,7)`）
+> 在 `adl` 上读回 rgb `0.6/0.8`（= 除 5）；按 |xyzw| = 8.6023 除会得到 `0x587600`，实测是 `0xFF99CC00` ⇒ **w 不参与
+> 模长、也不被写**。翻译器此前发 `normalize(<src>)`（四分量），现已改为 `vec4(normalize(<src>.xyz), 0.0)` 再按
+> **目的**分量取（源带 swizzle 时先 gather 成 `vec3(z,y,x)`，避免二次 swizzle）。`nrm` 的目的写掩码**含 w 时
+> 响亮拒绝**（`adl` 报 **Error #3628**「destination … must mask w (use .xyz or less)」，实测确认）。
+>
+> ② **读一个从未写过的临时寄存器是 `upload` 期错误**，不是「读到 0」。实测 **Error #3647**（整寄存器）/
+> **#3648**（单个分量），且用 Adobe 官方 `AGALMiniAssembler` 编出的字节复现同一对错误号 ⇒ 与我们手写的编码无关。
+> 翻译器现按 `adl` 的做法做**逐分量线性扫描**（`agal_check_temp_writes`：写集来自目的掩码、读集来自
+> `agal_op_nreg`/`agal_op_nodest` 推出的操作数个数与源 swizzle，`tex`/`tld` 的第 3 槽是采样器不算读），
+> 命中即**拒绝上传**并给出同一对错误号 —— 而不是像以前那样发一个未初始化的 `float4 ft0;`（那是 UB）。
+>
+> ③ 顺带纠正一处**我们自己的误解**：opcode token 装的是**裸 opcode**（`0x00`–`0x2e`），没有
+> `hasDst/hasSrc1/hasSrc2` 标志位（`or` 上 `0x100/0x200/0x400` 会被 `adl` 以 **Error #3620**「Invalid opcode,
+> value out of range: 768」拒收）；操作数个数由 `agal_op_nreg` 决定。`examples/stage80/82/83.as` 的编码器已改。
+>
+> 验收：`temp/agalprobe/` 的 **adl 真值与 AOT 输出逐字节相同**（`out.txt` 与 `out-aot.txt` 五行一致，含
+> `nrm-xyz-masked = 0xFF99CC00`）；三档文本各自真编译 —— Metal 2/2 过（`temp/metalshader/nrm*.msl` 走
+> `xcrun metal`）、WebGL 2/2 过（`glslcheck3.html` 真 `compileShader`）、HLSL 只做文本钉（本机无 `fxc`）。
 
 ---
 

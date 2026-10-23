@@ -13386,6 +13386,8 @@ static int agal_is_cube(int num) { return (num >= 0 && num < 256) ? ((agal_cube[
 // component (so write-masks are fully expanded).
 static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int target) {
     const char* v4 = target == 1 ? "vec4" : "float4";
+    // 3-component constructor, needed by nrm (see its arm below).
+    const char* v3 = target == 1 ? "vec3" : "float3";
     // Builtins whose spelling differs between targets but whose call SHAPE is
     // the same, so one format string still serves all three: MSL/GLSL say
     // fract / dfdx / dfdy, HLSL says frac / ddx / ddy.
@@ -13406,6 +13408,16 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         int t2 = 0, n2 = 0; unsigned w2 = 0xE4;
         int isTexOp = (op == 0x28 || op == 0x2e);
         if (hasDst) { dtype = (int)((dst >> 24) & 0xFF); dnum = (int)(dst & 0xFFFF); dmask = (int)((dst >> 16) & 0xF); agal_dst_name(dname, dtype, dnum, target); }
+        // adl 51.4.1 MEASURED (temp/agalprobe/upload.txt): 'nrm ft1, ft0' is
+        // rejected at upload with Error #3628, "The destination operand for the
+        // nrm instruction must mask w (use .xyz or less)". nrm's result is three
+        // components wide (see its arms below), so w is never a legal destination
+        // component -- refusing says so instead of emitting a 4-component
+        // normalize that AIR would never have run.
+        if (op == 0x0e && (dmask & 0x8)) {
+            as_agal_errmsg = "AGAL: nrm must not write w (adl rejects the program with Error #3628: mask the destination .xyz or less)";
+            break;
+        }
         if (hasSrc1) { t1 = (int)(s1hi & 0xFF); n1 = (int)(s1lo & 0xFFFF); w1 = (s1lo >> 24) & 0xFF; agal_reg_name(s1b, t1, n1, target); agal_swizzle(w1, sw1); sw1[4] = 0; agal_src_expr(s1, t1, n1, w1, target); }
         if (hasSrc2) {
             if (isTexOp) { // sampler token: [num:16][lod:8][0:8][samplerbits:32], type fixed FS, no swizzle
@@ -13473,7 +13485,21 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 else if (op == 0x0b) sprintf(rhs, "pow(%s.%c, %s.%c)", s1b, c1, s2b, c2);
                 else if (op == 0x0c) sprintf(rhs, "log2(%s.%c)", s1b, c1);
                 else if (op == 0x0d) sprintf(rhs, "exp2(%s.%c)", s1b, c1);
-                else if (op == 0x0e) sprintf(rhs, "normalize(%s).%c", s1, c1);
+                // nrm normalizes the source's xyz ONLY. adl 51.4.1 MEASURED
+                // (temp/agalprobe/out.txt): nrm of (3,4,0,7) reads back 0.6/0.8 in
+                // rgb, i.e. the divisor is |xyz| = 5, not |xyzw| = 8.60. The
+                // result is 3 components wide, so it is re-widened with a zero w
+                // before the component is picked -- and because the swizzle lives
+                // in the operand fetch, the component index is the DESTINATION one
+                // (ch), not the source swizzle's (a masked nrm of '.zyx' still
+                // writes dst.x from the value's x).
+                else if (op == 0x0e) {
+                    if (strcmp(sw1, "xyzw") == 0)
+                        sprintf(rhs, "%s(normalize(%s.xyz), 0.0).%c", v4, s1b, ch);
+                    else
+                        sprintf(rhs, "%s(normalize(%s(%s.%c, %s.%c, %s.%c)), 0.0).%c",
+                                v4, v3, s1b, sw1[0], s1b, sw1[1], s1b, sw1[2], ch);
+                }
                 else if (op == 0x11) sprintf(rhs, "cross(%s.xyz, %s.xyz).%c", s1, s2, c1);
                 else if (op == 0x0f) sprintf(rhs, "sin(%s.%c)", s1b, c1);
                 else if (op == 0x10) sprintf(rhs, "cos(%s.%c)", s1b, c1);
@@ -13514,7 +13540,8 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         else if (op == 0x0b) sprintf(rhs, "pow(%s, %s)", s1, s2);
         else if (op == 0x0c) sprintf(rhs, "log2(%s)", s1);
         else if (op == 0x0d) sprintf(rhs, "exp2(%s)", s1);
-        else if (op == 0x0e) sprintf(rhs, "normalize(%s)", s1);
+        // 0x0e (nrm) has no full-mask arm on purpose: a mask that includes w is
+        // refused further up (#3628), so a 0xF destination never reaches here.
         else if (op == 0x0f) sprintf(rhs, "sin(%s)", s1);
         else if (op == 0x10) sprintf(rhs, "cos(%s)", s1);
         else if (op == 0x11) sprintf(rhs, "%s(cross(%s.xyz, %s.xyz), 1.0)", v4, s1, s2);
@@ -13641,6 +13668,63 @@ static void as_agal_sampler_flags(const unsigned char* bytes, int len, unsigned 
     }
 }
 
+// A temporary register (vt/ft) that is READ BEFORE IT IS WRITTEN has no defined
+// value. adl 51.4.1 MEASURED (temp/agalprobe/upload.txt, bytes2.txt -- the latter
+// uses Adobe's own AGALMiniAssembler, so the answer is not an artefact of our hand
+// encoding): such a program is REFUSED at upload, with Error #3647 ("Temporary
+// register read without being written to for source operand N") for a whole
+// register and Error #3648 ("... component read ...") when only some components
+// were ever written. d3d and GLSLES behave the same way at compile time. Reading
+// zero is NOT the AIR semantic; translating the program would leave an
+// uninitialised local in the MSL/GLSL/HLSL we emit, i.e. undefined behaviour that
+// shows up as garbage pixels.
+//
+// The scan is LINEAR and per component, exactly like adl's validator: a write that
+// only happens inside an ife/els block does not count for a later read, which is
+// why this is a validator rather than a dataflow analysis. Masked writes only mark
+// the components they actually write, so 'mov ft0.xy, v0' followed by 'mov oc, ft0'
+// is refused too (#3648).
+//
+// What one instruction reads is derived from the same operand-count table the
+// decoder uses, so no second copy of the opcode shape can drift. The sampler token
+// of tex/tld occupies the second source slot and is not a register read; ife/ine/
+// ifg/ifl/kil have no destination, so their operand count is taken as-is.
+static const char* agal_check_temp_writes(const agal_instr* ins, int n) {
+    static char msg[128];
+    unsigned wrote[32];   // one 4-bit component mask per register index
+    memset(wrote, 0, sizeof(wrote));
+    for (int k = 0; k < n; k++) {
+        const agal_instr* I = &ins[k];
+        int op = (int)I->op;
+        int nreg = agal_op_nreg[op];
+        int hasDst = (nreg >= 1) && !agal_op_nodest[op];
+        int nsrc = hasDst ? nreg - 1 : nreg;
+        for (int j = 0; j < nsrc && j < 2; j++) {
+            unsigned lo = j == 0 ? I->s1lo : I->s2lo;
+            unsigned hi = j == 0 ? I->s1hi : I->s2hi;
+            if (lo == 0 && hi == 0) continue;
+            if (j == 1 && (op == 0x28 || op == 0x2e)) continue;  // sampler, not a register
+            if ((int)(hi & 0xFF) != AGAL_VT) continue;
+            int num = (int)(lo & 0xFFFF);
+            if (num < 0 || num > 31) continue;
+            unsigned swz = (lo >> 24) & 0xFFu;
+            unsigned need = 0;
+            for (int c = 0; c < 4; c++) need |= 1u << ((swz >> (2 * c)) & 3u);
+            if ((wrote[num] & need) == need) continue;
+            snprintf(msg, sizeof(msg),
+                     "AGAL: %s%d is read before it is written (adl rejects the program with Error #3647/#3648)",
+                     agal_is_frag ? "ft" : "vt", num);
+            return msg;
+        }
+        if (hasDst) {
+            int t = (int)((I->dst >> 24) & 0xFF);
+            int num = (int)(I->dst & 0xFFFF);
+            if (t == AGAL_VT && num >= 0 && num <= 31) wrote[num] |= (unsigned)((I->dst >> 16) & 0xFu);
+        }
+    }
+    return NULL;
+}
+
 static char* as_agal_translate(const unsigned char* bytes, int len, int target) {
     as_agal_errmsg = NULL;
     if (len < 7) { as_agal_errmsg = "AGAL: bytecode too short for header"; return NULL; }
@@ -13694,6 +13778,11 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         n++;
     }
     if (n == 0) { as_agal_errmsg = "AGAL: empty program"; return NULL; }
+    {   // Read-before-write on a temporary register is an upload error on adl, not
+        // a zero read -- see agal_check_temp_writes.
+        const char* werr = agal_check_temp_writes(ins, n);
+        if (werr != NULL) { as_agal_errmsg = werr; return NULL; }
+    }
     // Two refusals that used to be shader-compile errors with no explanation:
     //   * 'iid' is a VERTEX-only source in AGAL3 (AGAL.min reference: iid is
     //     readable only in the vertex program); a fragment program reading it has
