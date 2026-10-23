@@ -1023,7 +1023,8 @@ anchor/idempotence/`gn format`; the backend-neutral seam being zero-regression o
 all-green — the gate's nondeterminism is registered separately in `TODO.md`'s `### 遗留待开发`).
 
 **And the GPU window path is now covered by tests**: `node src/index.ts --air-app examples/air-native/air-native-app.xml
---main-class Main --target native` (i.e. the user-command form) now runs automatically in `test/examples.ts` as
+--main-class Main --as-class-path examples/as-library --target native` (i.e. the user-command form; GreenSock
+lives outside `src/` now, see [`compile.md`](compile.md) §3.5.2, stage two-hundred-fifty-four) now runs automatically in `test/examples.ts` as
 `example: air-native (--air-app + renderMode=direct: compile+link only)` (verifying only compile+link, since
 `--run` would open a real window and not return; explicitly SKIPped when the vendor library is missing). This
 one is **necessary**: before it, no test had ever compiled that path (the directory-type air-native unit does

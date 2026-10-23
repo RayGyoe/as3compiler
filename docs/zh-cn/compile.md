@@ -459,6 +459,10 @@ as-aot --air-app examples/air-native/air-native-app.xml
 # 显式指定主类（app.xml 不含 document class；缺省扫描 src/**/Main.as 推断）
 as-aot --air-app examples/air-native/air-native-app.xml --main-class demo.Main
 
+# 共享类库作为额外源码根（阶段二百五十）：air-native 的 GreenSock 在 examples/as-library，
+# 往 src/ 里拷一份已经不是必需（见 §3.5.2）
+as-aot --air-app examples/air-native/air-native-app.xml --main-class Main --as-class-path examples/as-library
+
 # 同一 AIR 项目直接编到浏览器（--target wasm --package web）：自动切到 web 后端
 as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package web
 ```
@@ -467,8 +471,8 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 `requestedDisplayResolution`/`renderMode`/`maximizable`/`minimizable`/`systemChrome`/`x`/`y`/`minSize`/`maxSize`）→
 生成等价 `boot-gui.as` 的引导代码（`new Stage()` → 预设 `stageWidth/stageHeight` → `new Main()` →
 `addChild` → `showWindow`；`visible=false` 时改用离屏 `render` 出 PNG）→ 递归扫描 `src/**/*.as`
-（跳过反向域名第三方库目录 `com/org/net`，但显式回加 air-native demo 实际用到的 GreenSock 核心
-`TweenLite/TweenCore/SimpleTimeline/PropTween/TweenPlugin`）→
+（跳过反向域名第三方库目录 `com/org/net`；共享类库改用 `--as-class-path <库根>` 加入编译面，
+见 §3.5.2——air-native 的 GreenSock 核心就在 `examples/as-library`，不再往 `src/` 里拷一份）→
 在 app.xml 同目录写出 `<filename>.build.json`（链接 Skia + SDL2）→ 编链出 `<filename>` 可执行
 （**产物名与全部产物的落点**都可用 `-o` 覆盖：`-o` 决定 `base`，故生成的 `.c`、
 `icudtl.dat`、暂存的 `extensions/` 与 `asaot.dll` 全跟着走 —— `-o bin-aot/App.exe` 即可让源码树

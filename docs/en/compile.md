@@ -490,6 +490,10 @@ as-aot --air-app examples/air-native/air-native-app.xml
 # Explicitly specify the main class (app.xml has no document class; default scans src/**/Main.as to infer)
 as-aot --air-app examples/air-native/air-native-app.xml --main-class demo.Main
 
+# The shared library as an extra source root (stage two-hundred-fifty): air-native's GreenSock
+# now lives in examples/as-library, so a copy under src/ is no longer required (see §3.5.2)
+as-aot --air-app examples/air-native/air-native-app.xml --main-class Main --as-class-path examples/as-library
+
 # Compile the same AIR project directly to the browser (--target wasm --package web): auto-switch to the web backend
 as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package web
 ```
@@ -498,9 +502,9 @@ Flow: parse `<id>/<filename>/<initialWindow>` (`title`/`width`/`height`/`visible
 `requestedDisplayResolution`/`renderMode`/`maximizable`/`minimizable`/`systemChrome`/`x`/`y`/`minSize`/`maxSize`) →
 generate bootstrap code equivalent to `boot-gui.as` (`new Stage()` → preset `stageWidth/stageHeight` →
 `new Main()` → `addChild` → `showWindow`; when `visible=false`, use offscreen `render` to output PNG) →
-recursively scan `src/**/*.as` (skip reverse-domain third-party library directories `com/org/net`, but
-explicitly re-add the GreenSock core `TweenLite/TweenCore/SimpleTimeline/PropTween/TweenPlugin` actually used
-by the air-native demo) →
+recursively scan `src/**/*.as` (skip reverse-domain third-party library directories `com/org/net`; a shared
+library root joins the compile surface through `--as-class-path <libroot>` instead, see §3.5.2 -- air-native's
+GreenSock core now lives in `examples/as-library`, not copied into `src/`) →
 write `<filename>.build.json` in the same directory as app.xml (linking Skia + SDL2) →
 compile/link into the `<filename>` executable (**both the artifact name and the location of every
 artifact** are overridable with `-o`: `-o` decides `base`, so the generated `.c`, `icudtl.dat`

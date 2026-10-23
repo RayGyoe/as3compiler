@@ -385,6 +385,9 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/stage37.as` — `Shape`/`Graphics` 绘制、`Bitmap`/`BitmapData` 像素读写、嵌套 `Sprite` 渲染
 - `examples/stage38.as` — `TextField`/`TextFormat` 文本渲染、`textWidth`/`textHeight`
 - `examples/air-native/` — 多文件 Air 式文档类 demo（`addedToStage` 驱动 + 各内建类演示），链 Skia 输出 `air-native.png`
+- `examples/as-library/` — **共享 AS3 类库根**（GreenSock 核心）：不放在任何 app 的 `src/` 里，编译时用
+  `--air-app … --as-class-path examples/as-library` 加进编译面（§3.5.2）；AIR 对照路径（`examples/air-native/build-and-run.sh`
+  的 `mxmlc`）用同一条 `-source-path`
 - `examples/air-starling-demo/` — Starling 2.x 端到端 demo（`flash.display3D` 渲染管线、着色器、事件、补间），窗口化运行（**外部夹具，不在库内**：见 [`examples/EXTERNAL-FIXTURES.md`](examples/EXTERNAL-FIXTURES.md)；缺席即跳过、不算失败）
 - `examples/window.as` — `Stage.showWindow` 窗口化（离屏 Skia → SDL2 上屏 + 事件循环）
 - `examples/window_click.as` — 窗口内真实鼠标点击 → AS3 事件分派（`mouseDown`/`mouseUp`/`click` + 冒泡 + 重渲染）

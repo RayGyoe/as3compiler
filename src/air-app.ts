@@ -90,6 +90,12 @@ const SKIP_FILES = new Set(['starling/utils/AssetManager.as']);
 // rest of the vendored com/greensock library (TweenMax/TimelineMax/loading/layout/
 // motionPaths/43 plugins/easing/help bundle) stays outside the subset and is left
 // to the mxmlc/adl path (build-and-run.sh). Mirrors test.ts's GREENSOCK_CORE.
+//
+// 阶段二百五十四: examples/air-native no longer vendors these under its own src/ —
+// they live in the shared root examples/as-library and the app reaches them with
+// `--as-class-path`. This re-add therefore finds nothing for THAT demo; it stays
+// because it is a generic convenience for projects that still vendor a greensock
+// core inside their own src/ (where the reverse-DNS walk would skip it).
 const GREEN_SOCK_CORE = [
   'com/greensock/TweenLite.as',
   'com/greensock/core/TweenCore.as',

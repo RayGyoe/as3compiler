@@ -14849,6 +14849,68 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 - `docs/zh-cn/as3-semantics.md` 的红线表本轮**未改**：本条的判据已写在 `runtime.ts` 的注释与单元组里，
   再加一行会与 AGENTS.md §2.4 的表重复维护。
 
+### 阶段二百五十四：参考应用改走 `--as-class-path` —— `examples/as-library`（v0.4.217 → v0.4.218）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+上一阶段收尾时两条测试是红的：`example: air-native/ (dir unit)` 报
+`ENOENT … src\com\greensock\TweenLite.as`，`example: air-native (--air-app …)` 报
+`Codegen error at 37:7: undefined variable 'Cubic'`；当时按「本机工作区那 352 个文件被删」如实报明
+（阶段二百五十三 §四）。随后用户把那棵树真的**分了家**：`examples/air-native/src/com/greensock`
+（**352 个 tracked 条目**）→ `examples/as-library/com/greensock`（**135 个文件**：133 个 `.as` +
+`easing_readme.txt`/`changelog.txt`）。没随行的是 **216 个 `help/` 条目**（asdoc 的 HTML/GIF，以及**一份重复的
+`com/greensock` 类副本**）与 `transform/FlexTransformManager.as`（它 `extends` Flex 框架的
+`mx.managers.TransformManager`，属子集外的依赖）—— 共 **217 项**。
+
+这正是 `--as-class-path`（阶段二百五十）**第一次落在真项目上**：一份类库服务多个 app，而不是整包往
+每个 `src/` 里拷。它补上的是阶段二百五十 留下的空档——那轮分家的是**新写的** asaotui demo（seam/kit），
+**参考应用**本身一直没分，于是它一动，错的不是编译器而是「库该从哪儿拿」。
+
+**二、落地（只动构建/测试面，不碰编译器语义）**
+
+- **`test/examples.ts`**：新增 `AS_LIBRARY = examples/as-library`，`GREENSOCK_CORE` 的 7 条路径改为相对它解析。
+  - `--air-app` 单元（`example: air-native (--air-app + renderMode=direct: compile+link only)`）加
+    `--as-class-path <abs>/examples/as-library`，即**用户命令形态**。**缺库是硬失败，不是 SKIP**：
+    「库没进编译面」就该响亮地失败，而不是把一个真缺陷降级成一条绿。
+  - **pool 的目录单元不能**用这个旗标（`--as-class-path` 只对 `--air-app` 有效，`index.ts` 硬拒），
+    故 7 个 greensock 文件仍以**显式输入**给——编译器给的原话就是 *list the extra files as inputs instead*。
+    标签改用 `relative(dir, f)`：旧的 `slice(subDir.length + 1)` 会把共享根的文件名截成绝对路径的尾巴。
+- **`examples/air-native/build-and-run.sh`**（AIR 参照臂）：`mxmlc` 加 `-source-path+="$SCRIPT_DIR/../as-library"`。
+- **`src/air-app.ts`**：**只改注释**。`GREEN_SOCK_CORE` 的「回加」对本 demo 已无事可做
+  （`<srcDir>/com/greensock` 不存在），机制**保留**——仍在 `src/` 里 vendor 一份核心的项目照旧受益。
+- **文档**：`docs/{zh-cn,en}/compile.md` §3.5 的命令块与流程句、`docs/{zh-cn,en}/win32.md` 的「用户命令形态」、
+  `README.md` / `README-CN.md` 的示例清单（新增 `examples/as-library/` 一条）。
+
+**三、验收（实测）**
+
+- `node --test --test-name-pattern='air-native' test/examples.ts` ⇒ **2/2 pass**（目录单元 4.7 s；
+  `--air-app` 编+链 10.2 s）。
+- `--dry` 探针：`[1/4] read … (main Main, 23/151 sources reachable from Main)` ⇒ 共享根被**整棵扫**
+  （151 个候选，与阶段二百五十 的规则一致：点名一个根就是不跳过任何包），而闭包只取 23 个。
+- **AIR 侧 A/B（`mxmlc` 51.4.1）**：`-source-path+="./src" -source-path+="../as-library"` ⇒ **exit 0**
+  （15 088 字节 swf）；去掉第二条 ⇒ **exit 2**，报 `找不到类型 com.greensock.easing.Cubic`（`TweenDemo.as:8`）
+  与 `TweenLite`/`Cubic` 未定义（`:37`）。AOT 侧的 `undefined variable 'Cubic'` 落在**同一行 37**，
+  两端同一个错——这条 A/B 是本阶段「旗标真的是必要条件」的直接证据，而不是从我们自己的报错反推。
+- **全量 `node test.ts`：469 / 466 / 3**（上一阶段 469 / 464 / 5）。红的 3 项正是既有基线
+  （`socket.as` 无 Windows socket 后端、`stage94d.as` UTF-16LE charset、`inline/StackCanary` 本机 clang 差异，
+  后者在 `a035645` 的干净 worktree 上同样红）。**两条 air-native 红消失**，用例总数不变（没有新增
+  用例，只是把两条既有的改绿）。
+- **迁移保真**：135 个进共享根的文件逐个与 `HEAD~1` 的旧位置**逐字节比对** ⇒ **132 个完全相同**，
+  3 个（`TweenLite.as` / `core/PropTween.as` / `core/SimpleTimeline.as`）多了一个 UTF-8 BOM（+3 字节），
+  其余内容零差异。BOM 不构成风险：`lexer.ts:214` 本来就剥首 BOM，`mxmlc` 也照收（上面那条 A/B 就是
+  带 BOM 的树编出来的）。
+
+**四、如实报明**
+
+- 本次**没有改动编译器语义**（`src/` 里只有一处注释），对 AIR 保真面零影响；它改的是「参考应用怎样
+  拿到它的类库」。因此不进 `docs/zh-cn/as3-semantics.md`，也不构成任何缺口清偿。
+- **217 项是删除，不是遗漏**：`help/` 那棵 asdoc 文档树编译器从不读（其中还有一份**重复的类副本**，
+  留着反而会成为「同一类两份源码」的隐患）；`FlexTransformManager.as` 依赖 Flex 框架。日后若要跑 Flex
+  场景，源头是 GreenSock 官方包——这点记在这里，不在本仓。
+- 池内目录单元与 `--air-app` 单元现在覆盖**同一条库路径的两种取得方式**（显式输入 / `--as-class-path`）。
+  这是有意的：`unit: reach/as-class-path` 系列只钉**机制**（身份规则、硬报错文案、真编真跑），钉不到
+  「参考应用真的这么编」——而后者恰恰是本次两红的现场。
+
 ### 遗留待开发
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`docs/projects/mac-cleaner-demo-plan.md`](docs/projects/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。

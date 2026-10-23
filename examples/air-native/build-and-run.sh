@@ -94,6 +94,12 @@ MXMLC="$SDK/bin/mxmlc"
 # Paths are resolved relative to this script, so it works from any CWD.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$SCRIPT_DIR/src"
+# The demo's GreenSock dependency is a SHARED library root (阶段二百五十四): it used
+# to be vendored inside src/com, which made a third-party tree part of one app.
+# The AOT side reaches it with `--as-class-path ../as-library`; this script is the
+# AIR reference path (mxmlc + adl), so it needs the same root as a source path or
+# `com.greensock.easing.Cubic` cannot be resolved here either.
+LIB_DIR="$SCRIPT_DIR/../as-library"
 OUTPUT_SWF="$SCRIPT_DIR/main.swf"
 APP_XML="$SCRIPT_DIR/air-native-app.xml"
 
@@ -104,6 +110,7 @@ rm -f "$OUTPUT_SWF"
 
 "$MXMLC" \
   -source-path+="$SRC_DIR" \
+  -source-path+="$LIB_DIR" \
   -output="$OUTPUT_SWF" \
   "$SRC_DIR/demo/Main.as"
 

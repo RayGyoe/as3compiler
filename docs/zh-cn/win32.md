@@ -912,7 +912,8 @@ seam 在 macOS 上零回归（最终 `npm test` **258/258 全绿**；但本阶�
 门禁不确定性已单独登记入 `TODO.md` 的 `### 遗留待开发`）。
 
 **并且 GPU 窗口路径现已入测试**：`node src/index.ts --air-app examples/air-native/air-native-app.xml
---main-class Main --target native`（即用户命令形态）已在 `test/examples.ts` 里作为
+--main-class Main --as-class-path examples/as-library --target native`（即用户命令形态；GreenSock 已移出
+`src/`，见 [`compile.md`](compile.md) §3.5.2 阶段二百五十四）已在 `test/examples.ts` 里作为
 `example: air-native (--air-app + renderMode=direct: compile+link only)` 自动跑（只验证编译+链接，
 因为带 `--run` 会开真窗口不返回；vendor 库缺失时显式 SKIP）。这一条是**必要**的：在此之前没有任何测试
 编译过该路径（目录型 air-native 单元不带 `--air-app`，`test/unit/build.ts` 的 `--air-app` 先例全带 `--dry`），

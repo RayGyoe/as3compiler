@@ -16,7 +16,7 @@
 import { execFile } from 'node:child_process';
 import { readdirSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
-import { join, resolve, dirname, basename } from 'node:path';
+import { join, resolve, relative, dirname, basename } from 'node:path';
 import { promisify } from 'node:util';
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
@@ -56,7 +56,9 @@ function scratchOut(label: string): string {
 // directory unit already uses the offscreen entry.
 // air-native's Main instantiates TweenDemo, which depends on the GreenSock core
 // (a third-party library directory excluded by SKIP_DIRS below). Those specific
-// sources are re-added explicitly for the air-native unit (see GREENSOCK_CORE).
+// sources live in the shared root examples/as-library and are named by
+// GREENSOCK_CORE; the app reaches them through `--as-class-path` when the build
+// goes through --air-app, and as explicit file inputs in this pool.
 // `entry-ui.as` is textfield's second entry: it is the same probe with the UI grid
 // turned on (`new Main(true)`), which writes a 4 MB raw bitmap on top of the
 // numeric report. The directory unit must keep the single numeric entry, so the
@@ -127,9 +129,16 @@ const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as
 // the same as examples/audio.as (a top-level file, run normally): that one drives
 // synthesized PCM through loadPCMFromByteArray with no window at all.
 const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'url-test', 'ane-app', 'audio']);
+// The shared AS3 library root (阶段二百五十四). air-native used to VENDOR its
+// third-party sources inside its own source root (examples/air-native/src/com,
+// 352 tracked files), which made a library part of one app and forced this file
+// to name seven of them by hand. They now live in examples/as-library and enter
+// the build through `--as-class-path` -- the shared-source-root feature added in
+// 阶段二百五十 -- so one copy serves every app.
+const AS_LIBRARY = join(dir, 'as-library');
 // GreenSock core files that air-native's TweenDemo actually reaches. Only these
 // are pulled in; the rest of com/greensock (easing/loading/other plugins) stays
-// outside the subset and is not compiled.
+// outside the subset and is not compiled. Paths are relative to AS_LIBRARY.
 const GREENSOCK_CORE = [
   'com/greensock/TweenLite.as',
   'com/greensock/core/TweenCore.as',
@@ -400,9 +409,12 @@ describe(`examples (jobs=${JOBS})`, { concurrency: JOBS }, () => {
       const subFiles = collectAsFiles(subDir);
       if (subFiles.length === 0) continue;
       if (e.name === 'air-native') {
-        for (const g of GREENSOCK_CORE) subFiles.push(join(subDir, 'src', g));
+        for (const g of GREENSOCK_CORE) subFiles.push(join(AS_LIBRARY, g));
       }
-      const names = subFiles.map((f) => f.slice(subDir.length + 1));
+      // The library files are NOT under subDir, so their label is written relative to
+      // examples/ (e.g. `as-library/com/greensock/TweenLite.as`): the old
+      // `slice(subDir.length + 1)` would have printed a truncated absolute path.
+      const names = subFiles.map((f) => (f.startsWith(subDir) ? f.slice(subDir.length + 1) : relative(dir, f)));
       const label = `${e.name}/ (${names.join(', ')})`;
       const out = scratchOut(label);
       test(`example: ${e.name}/ (dir unit)`, async (t) => {
@@ -471,7 +483,13 @@ test('example: air-native (--air-app + renderMode=direct: compile+link only)', a
   // and top-level tests are serial): this one compiles Skia/SDL2/curl glue from
   // source and links ~20 MB of static libraries, so it wants the machine to
   // itself rather than one of the six pool slots.
+  // `--as-class-path` is how the app reaches its library now (阶段二百五十四): the
+  // GreenSock sources left examples/air-native/src/com for examples/as-library.
+  // Without it the reach closure cannot resolve `Cubic` and codegen fails with
+  // "undefined variable 'Cubic'" -- which is the correct, loud failure, not a SKIP:
+  // a missing library must never quietly downgrade this case to a pass.
   await runAsync('node', ['src/index.ts', '--air-app', xml, '--main-class', 'Main',
+    '--as-class-path', AS_LIBRARY,
     '--target', 'native', '-o', scratchOut('air-native-app')],
     { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
   console.log('PASS  air-native (--air-app)');
