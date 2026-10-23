@@ -3340,6 +3340,60 @@ function checkEmitFileMoveToTrash(): string[] {
 }
 registerGroup('unit: emit/FileMoveToTrash', checkEmitFileMoveToTrash);
 
+// ---- 阶段二百六十二：File.isSymbolicLink （唯一不跟随链接的谓词） ----------
+// The member was added because a size walk that follows links over-reports: on this
+// machine ~/Library/Caches answers 124 GB that way and 7.6 GB with the guard (see
+// docs/{zh-cn,en}/filesystem.md §6, which also carries the adl 51.4.1 table). These
+// checks pin the emission; `example: file-symlink.as` pins the values and the walk.
+function checkEmitFileIsSymbolicLink(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [symlink] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [symlink] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'import flash.filesystem.File;\n'
+    + 'var f:File = new File("/tmp/x");\n'
+    + 'var b:Boolean = f.isSymbolicLink;\n'
+    + 'trace("" + b);\n')).c;
+
+  check('isSymbolicLink is emitted as a bool getter',
+    c.includes('bool File_get_isSymbolicLink(void* _this)'));
+  // Reachability, not just emission: an instance property is only callable if it is
+  // in the getter table the property read dispatches through.
+  check('it is reachable through the instance getter table',
+    c.includes('"isSymbolicLink"'));
+
+  // lstat, never stat. Following the link is precisely the bug this member removes,
+  // and `S_ISLNK` is what makes a DANGLING link answer true while exists answers
+  // false -- the one asymmetry that cannot be produced with stat().
+  check('the POSIX probe is lstat()-based',
+    c.includes('static bool as_path_is_symlink(const char* p) {')
+    && c.includes('return lstat(p, &st) == 0 && S_ISLNK(st.st_mode);'));
+  check('the probe answers false for a NULL path instead of crashing',
+    c.substring(c.indexOf('static bool as_path_is_symlink')).includes('if (p == NULL) return false;'));
+  // Windows has no lstat that sees a reparse point, so it asks the attributes
+  // directly; an NTFS junction answers true on adl as well.
+  check('the Windows probe is FILE_ATTRIBUTE_REPARSE_POINT',
+    c.includes('(a & FILE_ATTRIBUTE_REPARSE_POINT) != 0'));
+  check('the two probes are selected at compile time, not at runtime',
+    /#ifdef _WIN32\s*\n\s*DWORD a = GetFileAttributesA\(p\);/.test(c.substring(c.indexOf('static bool as_path_is_symlink')))
+    && c.substring(c.indexOf('static bool as_path_is_symlink')).includes('#else'));
+
+  // The OTHER family must stay on stat(): isDirectory follows the link, so for a
+  // symlink to a directory both predicates are true. Asserted side by side so a
+  // later "unify the two probes" refactor cannot quietly pass.
+  check('isDirectory still follows the link (stat/S_ISDIR)',
+    c.includes('static bool as_path_is_dir(const char* p)')
+    && c.includes('&& stat(p, &st) == 0 && S_ISDIR(st.st_mode);'));
+
+  console.log(`     [symlink] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/FileIsSymbolicLink', checkEmitFileIsSymbolicLink);
+
 // ---- 阶段二百四十五：flash.system.System.exit(code:uint) ----------------
 // Pins the SHAPE of the emission. The running process status is asserted end to
 // end by `example: system-exit-status.as` in test/examples.ts (an examples/ pool

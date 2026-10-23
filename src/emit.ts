@@ -15807,6 +15807,26 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // available on native POSIX and WASI alike.
     this.line('static bool as_path_exists(const char* p) { struct stat st; return p != NULL && stat(p, &st) == 0; }');
     this.line('static bool as_path_is_dir(const char* p) { struct stat st; return p != NULL && stat(p, &st) == 0 && S_ISDIR(st.st_mode); }');
+    // as_path_is_symlink: the ONLY probe that must not follow the link, hence
+    // lstat() rather than stat(). Windows has no lstat that reports reparse points
+    // reliably, so it asks the file attributes directly -- AIR also answers true for
+    // an NTFS junction, which is exactly what FILE_ATTRIBUTE_REPARSE_POINT covers.
+    this.line('static bool as_path_is_symlink(const char* p) {');
+    this.indent++;
+    this.line('if (p == NULL) return false;');
+    this.line('#ifdef _WIN32');
+    this.indent++;
+    this.line('DWORD a = GetFileAttributesA(p);');
+    this.line('return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0;');
+    this.indent--;
+    this.line('#else');
+    this.indent++;
+    this.line('struct stat st;');
+    this.line('return lstat(p, &st) == 0 && S_ISLNK(st.st_mode);');
+    this.indent--;
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
     this.line('static char* as_path_join(const char* a, const char* b) {');
     this.indent++;
     this.line('if (a == NULL || *a == \'\\0\') return (char*)(b ? b : "");');
@@ -16022,6 +16042,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('char* File_get_url(void* _this) { File* o = (File*)_this; return (o->nativePath == NULL) ? (char*)"file://" : as_str_concat((char*)"file://", o->nativePath); }');
     this.line('bool File_get_exists(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_exists(o->nativePath); }');
     this.line('bool File_get_isDirectory(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_is_dir(o->nativePath); }');
+    // isSymbolicLink: about the link, not its target (AIR 1.0). A path that does not
+    // exist is false, a dangling link is true -- lstat() answers both without
+    // resolving, so no extra existence gate is needed.
+    this.line('bool File_get_isSymbolicLink(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_is_symlink(o->nativePath); }');
     // size: the length in bytes, measured with stat() (AIR's File.size is a
     // Number). A path that does not exist reports 0, matching AIR; st_size is an
     // off_t, so it is widened to double rather than truncated to int (a >2 GB file

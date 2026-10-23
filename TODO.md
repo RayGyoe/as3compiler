@@ -15482,7 +15482,85 @@ System Events 合成按键，`screencapture` 取下拉菜单的字形列）：
   缺的只是着色器读每实例 ID（与 MRT 同属 `docs/*/display3d.md` §3 的跨档差异）。
 - 本阶段的 `keyEquivalentModifiers` 实测**只覆盖 macOS**；Windows 侧 `mnemonicIndex` 那条口径未动。
 
+
+### 阶段二百六十二：`File.isSymbolicLink` —— `File` 谓词里唯一不跟随链接的那个（v0.4.225 → v0.4.226）✅ 已完成
+
+**一、这是「补平差距」，不是「增强」**
+
+按 §1.5 的硬判据：同一输入 `adl` 跑得对而我们跑不出 ⇒ 遗留缺陷。`adl 51.4.1` 上
+`File.isSymbolicLink` 是**存在且行为明确**的（见下面实测表），我们此前**压根没登记这个成员** ⇒
+本阶段补平。
+
+**二、它逼出来的方式：一个真实产品报了个错的量级**
+
+工作区根的 `prune`（净扫）用 `getDirectoryListing()` + `isDirectory` 递归计量 `~/Library/Caches`，
+面板上算出 **124 GB**，而同一目录 `du` 是 **7.6 GB**（差 16 倍）。该目录下有一份微信的 Sparkle
+安装包，里面塞着 `WeChatAppEx.app` 与一串 `.framework/Versions/Current`、`.framework/Resources`
+—— **全是指向兄弟目录的软链**，递归进去同一批字节被逐层重复计入。`du` 默认不跟随软链，我们跟随了，
+而当时 `File` 根本没有能问出「这是不是软链」的成员。
+
+**三、语义：`File` 的谓词实际上是两类，混用就会得到错的量级**
+
+| 谓词 | 跟随链接？ | 回答的是 |
+|---|---|---|
+| `exists` / `isDirectory` / `size` / `spaceAvailable` | 是（`stat()`） | **目标** |
+| `isSymbolicLink`（本阶段新增） | **否（`lstat()`）** | **链接本身** |
+
+所以「指向目录的软链」`isDirectory` 与 `isSymbolicLink` **同时为真**；「悬空软链」`exists == false`
+而 `isSymbolicLink == true`；删它删的是链接而不是目标（AIR 明确如此）。实现：POSIX 走 `lstat()` +
+`S_ISLNK`；Windows 走 `GetFileAttributesA()` 的 `FILE_ATTRIBUTE_REPARSE_POINT`（AIR 对 NTFS
+junction 也报 `true`，这个位正好覆盖，而 MSVC 的 `_stat` 认不出重解析点）。`isDirectory` **刻意保持
+`stat()` 不动** —— 两者不是「同一探针的两种名字」，是**两个不同的问题**。
+
+**四、`adl 51.4.1` 实测（探针 `temp/symprobe/`，10/10 两端口径一致）**
+
+一侧 `mxmlc` + `adl`，一侧本项目 AOT，同一份输入（`fx/` 里造真目录 / 真文件 / 软链→目录 /
+软链→文件 / 悬空软链 / 成环软链）：
+
+| 输入 | `exists` | `isDirectory` | `isSymbolicLink` |
+|---|---|---|---|
+| 真目录 / 真文件 | true | true / false | false |
+| 软链 → 目录 | true | **true** | **true** |
+| 软链 → 文件 | true | false | **true** |
+| 悬空软链 | **false** | false | **true** |
+| 不存在的路径 | false | false | false |
+| `/`（卷根） | true | true | false |
+| `new File()`（空） | **抛 `#2037`** | 同左 | 同左 |
+
+探针口径同「阶段二百四十三」：`adl` 的 cwd **不是** app 目录 ⇒ 全部用**绝对路径**；结果经
+`FileStream` 落文件（stdout 被吞）。
+
+**五、遍历里它是边界条件，不是装饰**
+
+不判它，同一棵子树会被逐层重复计入，节点预算全烧在一个目标上，报表给出的是**错的量级**。
+一个诚实的细节：**深度不会被无限拉长** —— macOS 内核自己的 ELOOP 上限（32 层链接）会把含环的
+路径斩断，所以「跟随软链的遍历会挂死」这个说法是**错的**；**重复计数才是真的**。
+`examples/file-symlink.as` 的夹具是一棵只有 **4 个真节点 / 8 字节**的树（含 4 个链接，其中一个
+指回祖先），跟随软链走一遍实测访问 **264 个节点**（且不是被我们设的节点上限截断的，是内核截断的）
+—— 这正是「挂死」之外更阴险的那一半：它跑得很快，只是数目是错的。
+
+**六、回归**
+
+- `unit: emit/FileIsSymbolicLink`（7 条源级钉：`File_get_isSymbolicLink` 已发射、进实例 getter 表、`lstat`
+  而非 `stat`、`NULL` 路径回 `false` 不崩、Windows 走 `FILE_ATTRIBUTE_REPARSE_POINT`、两探针是**编译期**
+  而非运行期选择、以及 `as_path_is_dir` **仍在 `stat`** 的反向对照）；
+- `examples/file-symlink.as`（27 断言：两个族并排 + 带环夹具的**精确**节点/链接/字节计数，并断言
+  不设防的遍历确实多计）；
+- `test/examples.ts` 新增 `temp/sym-home` 夹具（用 `node:fs` 现造，`git` 存不可靠的「软链指向 `.`」
+  与「半途失败的旧夹具」都不可能残留 —— 该示例断言的是**精确数**），`EXAMPLE_ENV` 把 `HOME`/`USERPROFILE`
+  同时指向它。
+- 证据：`temp/symprobe/`（`Sym.as` AOT 侧 + `AdlSym.as` `adl` 侧 + `adl.txt`）、`docs/{zh-cn,en}/filesystem.md` §6。
+
+**七、已知边界（如实登记）**
+
+- **空 `File`（`new File()`）的 `#2037` 在 `isSymbolicLink` 上同样成立** ⇒ 并入 `遗留待开发` 里已有的
+  那行「空 `File` 的成员访问全线不抛 `#2037`」，**不新开一行**：族级修法是先把 `nativePath` 从字段
+  改成访问器，与本条无关（`docs/{zh-cn,en}/filesystem.md` §6.2）。
+- Windows 分支（`FILE_ATTRIBUTE_REPARSE_POINT`）**本机无法实测**，与阶段二百四十四 的回收站分支同属
+  「代码已写出、待 Windows 机验证」。
+
 ### 遗留待开发
+> **2026-10-23 追加（阶段二百六十二：`File.isSymbolicLink` —— `File` 谓词里唯一不跟随链接的那个）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 94 项**。本阶段是**补平差距**（`adl` 上该成员存在且行为明确，我们此前压根没登记）而非增强，按 §1.5 不入增强表。顺带量到的「空 `File` 的 `#2037` 在 `isSymbolicLink` 上同样成立」**并入**已有那行，不新开。
 > **2026-10-23 追加（阶段二百六十一：遗留表清仓（一）—— 移出 10 行 + 两条实错修净再下架 2 行）**：**新登记 0 行 / 改写 0 行 / 移出 12 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **106 → 94 项**（`未开始` **78 → 74** / `部分完成` 19 / `调研完成·实现暂缓` 1；`已修` 6 与 `已记录` 2 **归零**）。（a）**移出 10 行零代码项**：其中 **8 行的状态本就是「已修」/「已记录」**——表头自述「已完成项一经落地即从本表移出」，这 8 行违反了它，结论与证据早已写在各自阶段节里：`ident-free-fn.as` + `unit: emit/FreeFunctionNameReservation`（阶段二百四十）、`builtin-arity.as` + `unit: builtin/Arity`（阶段一百九十五）、`as_so_layer`/`as_so_path` + `[solstore]` 组（阶段一百九十四 ×2）、`setApplicationIconImage` 选图规则（阶段二百五十六）、`ScreenMouseEvent` 11 形参 + 21 钉（阶段二百五十八）；两条 `已记录` 是**刻意不跟**的口径分歧，归属 `docs/{zh-cn,en}/swc.md` §10（D42/R29）与 `docs/{zh-cn,en}/desktop.md` §7.6，不是欠账。**另 2 行是「已过期」**——「CRLF 检出下多行 XML 字面量触发假 Lex error」（`lexer.ts` 已按扫描**结束索引**推进，`temp/crlfcheck/` 复现确认 + `unit: lexer/XmlLiteral` 四条 CRLF 钉子）与「构建清单仍写死 `windows-x64`」（受控手写清单只剩 `examples/ane/ane.build.json`，改 `${host}` 后两宿主都成立；报告里其余 12 份经 `git ls-files --error-unmatch` 逐个核实全是 `.gitignore` 生成物/外部夹具）。（b）**另移出 2 行是「本阶段修净后按规矩下架」**：**AGAL 翻译器 MSL/GLSL 三处实错**（`od` 未声明且当标量、`iid` 译成未声明的 `r0`、空 stage 结构——现在 `od` 三档都是 `float4 od` 局部 + 目标各自的深度槽，`iid` 走 `[[instance_id]]`/`SV_InstanceID`、GLSL 因 ES 1.00 无 `gl_InstanceID` 而**响亮拒绝**，空结构按 `agal_is_used` 抑制；本轮装好 Metal 工具链后**真编译过**：新形态 7/7 过、旧形态两份都编不过）与 **`keyEquivalentModifiers` 未译成 `NSEventModifierFlags`**（`temp/keyeqprobe/` 用真按键 + 下拉菜单截图量出 15=⌘/16=⇧/17=⌃/18=⌥/19=无/20=惰性，`[15,20]`=`[15]`、`[]`=`[19]`），证据与已知边界见阶段二百六十一 节。**口径**：本表只留尚未收尾项，「已修/已记录/已过期」的行一到下一次清仓就该走，不留在表里占位。
 > **2026-10-23 追加（阶段二百六十：macOS 菜单栏状态项 —— 「AIR 没有」所以要 opt-in，而不是要补平）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 106 项**（`未开始` 78 / `部分完成` 19 / `已修` 6 / `已记录` 2 / `调研完成·暂缓` 1）。**本阶段主体不占表**：托盘在 macOS 的 `adl` 上**本来就抛 `#2012`**（`supportsSystemTrayIcon=false`）⇒ 按 §1.5 是**增强**（E19，进 `### 增强待做`），落地即 opt-in 具名开关 `--features tray`，默认产物与 AIR 逐字同形。阶段内还**修掉两处族级实错**（不占表：阶段内修净的东西不进本表）：① `Icon` 的父类在 `adl` 上是 **`flash.events::EventDispatcher`**，我们此前记成 `Object`（已按实测改正，`Icon_ctor` 相应改调 `EventDispatcher_ctor`，否则 `addEventListener` 在 Icon 上连编译都过不去——而托盘点击正是靠它）；② `MouseEvent.RIGHT_CLICK` / `RIGHT_MOUSE_DOWN` / `RIGHT_MOUSE_UP` 三个 **AIR 已定义**的静态常量我们**压根没登记**（已补齐，否则右键只能拿字符串字面量监听）。**另外顺带修的是一个真缺陷、不是差异**：`ASC_icon_singleton`/`ASC_app_menu`/`ASC_dock_menu`/`ASC_menu_tags` 四个静态从未进 `gc_mark_user_roots`，而 Cocoa 侧持有它们的裸指针 ⇒ 一次回收就能让菜单/状态项指向已释放内存（本轮连同新的 `ASC_tray_icon`/`ASC_tray_menu` 一起标上，钉在 `unit: emit/SystemTrayIcon`）。**证据**：`temp/trayprobe/`（`Sup.as` 四问 `adl` 探针 + `live.as` 真机驱动脚本 + `live-log.txt` 的 `CLICK`/`RIGHT_CLICK`/`MENU SELECT` 三行 + `menubar.png`）、`temp/statusprobe/statusprobe2.mm`（`setMenu:` vs `popUpStatusItemMenu:` 的因果）、`test/unit/emit.ts` 的 `unit: emit/SystemTrayIcon`（33 钉）、`test/unit/build.ts` 的 `[features]` +8 钉、`examples/status-item.as`（23 断言）。
 > **2026-10-23 追加（阶段二百五十九：透明窗的 macOS 呈现路径 —— 先证「裸后端也不行」再换实现）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 106 项**。上一阶段把透明窗的**语义**接好了，本阶段才发现**像素**没通；而判断「是我们的错还是后端的错」只靠一件事：**一份 14 行、零 as3compiler 符号的裸 SDL2 程序也复现不透明**，于是按 AGENTS §1.5 归为后端边界（不登记为缺陷）。落地方式随之从「给 SDL 的窗打补丁」换成「透明窗**绕过 SDL 渲染器**、改走 CALayer 的 `contents`」，并把毛玻璃作为**刻意差异**放进 opt-in 宏 `ASC_WINDOW_VIBRANT`（AIR 显示原桌面、我们显示糊过的桌面 ⇒ 默认关）。**证据**：`temp/transprobe/FINDINGS.md`、`temp/sdltrans.cc`、`temp/sdltrans2.cc`、`temp/ns_vib.cc`、`temp/sdl_layer.cc`、`temp/sdl_layer2.cc`、`temp/aottrans/{vib_crop.png,plain_crop.png}`、`test/unit/platform.ts` 六条新钉。

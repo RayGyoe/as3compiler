@@ -3510,6 +3510,13 @@ export class SymbolTable {
         ['parent', filegetr({ kind: 'object', className: 'File' })],
         ['exists', filegetr({ kind: 'bool' })],
         ['isDirectory', filegetr({ kind: 'bool' })],
+        // isSymbolicLink: lstat()/S_ISLNK on POSIX, FILE_ATTRIBUTE_REPARSE_POINT on
+        // Windows (AIR reports true for NTFS junctions too). Note this is the ONE
+        // File predicate that must NOT follow the link: isDirectory answers about
+        // the TARGET, isSymbolicLink about the link itself. A recursive walk that
+        // ignores it re-enters framework `Versions/Current` chains and reports an
+        // inflated size (measured: ~/Library/Caches 7.6 GB -> 124 GB).
+        ['isSymbolicLink', filegetr({ kind: 'bool' })],
         ['isHidden', filegetr({ kind: 'bool' })],
         // size: the file's length in bytes (AIR's File.size:Number). Measured stat()
         // rather than cached, so a file that grows on disk is seen immediately; a

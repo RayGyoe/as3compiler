@@ -1,8 +1,10 @@
-# Filesystem (`flash.filesystem`) — measured semantics: trash and volume space
+# Filesystem (`flash.filesystem`) — measured semantics: trash, volume space and the symlink predicate
 
 > This file records the **measured semantics** and the implementation choices for
-> **`File.moveToTrash()` / `File.moveToTrashAsync()` / `File.spaceAvailable`**
-> (stage two hundred and forty-three, v0.4.207). They are the prerequisite for the
+> **`File.moveToTrash()` / `File.moveToTrashAsync()` / `File.spaceAvailable` /
+> `File.isSymbolicLink`**
+> (stage two hundred and forty-three, v0.4.207; `isSymbolicLink` at stage two hundred and
+> sixty-two). They are the prerequisite for the
 > macOS cleaner demo (see the workspace-root [`prune/mac-cleaner-demo-plan.md`](../../../prune/mac-cleaner-demo-plan.md),
 > G1 / G2).
 >
@@ -18,7 +20,9 @@
 > and two of them contradict it (§2.1, §5.1).
 >
 > Bottom line: **`moveToTrash` is `void`, not `Boolean`; and `spaceAvailable` is
-> the AIR property name (`getSpaceAvailable` does not exist at all)**. The trash
+> the AIR property name (`getSpaceAvailable` does not exist at all); and
+> `isSymbolicLink` is the one `File` predicate that goes through `lstat`** — it does
+> not follow the link. The trash
 > directory is chosen per volume, and the name a colliding item gets is generated
 > by macOS itself.
 
@@ -28,9 +32,10 @@
 
 | Member | Status | Note |
 |---|---|---|
-| `File.moveToTrash()` | ✅ implemented (macOS + freedesktop POSIX + the Windows Recycle Bin) | three backends, see §4; WASI/Emscripten has no trash concept and reports itself loudly (§6) |
+| `File.moveToTrash()` | ✅ implemented (macOS + freedesktop POSIX + the Windows Recycle Bin) | three backends, see §4; WASI/Emscripten has no trash concept and reports itself loudly (§7) |
 | `File.moveToTrashAsync()` | ✅ implemented | delivery convention in §3 |
 | `File.spaceAvailable` (property) | ✅ existed (stage sixty-four); semantics **corrected** here | answers only for a regular file or a directory (§5) |
+| `File.isSymbolicLink` (property) | ✅ implemented (stage two hundred and sixty-two) | `lstat` / `FILE_ATTRIBUTE_REPARSE_POINT`; the one predicate that **does not** follow the link (§6) |
 | `File.getSpaceAvailable` | ❌ **AIR has no such member** | not provided either (`in` is `false`, as on `adl`) |
 | volume total / used | ❌ not done | G3 in the plan (an enhancement, no AIR counterpart), unscheduled |
 
@@ -158,7 +163,77 @@ it corrects the semantics.
 
 ---
 
-## 6. What is not done (on the record)
+## 6. `isSymbolicLink` — the one `File` predicate that does not follow the link
+
+**This one was not copied out of the reference; a real product forced it.** `prune`
+(the macOS cache cleaner in the workspace root) sizes `~/Library/Caches` recursively with
+`getDirectoryListing()` + `isDirectory` and put **124 GB** on the panel where `du` says
+**7.6 GB** — a 16× error. The directory holds a WeChat Sparkle installer whose
+`WeChatAppEx.app` carries a chain of `.framework/Versions/Current` and
+`.framework/Resources` entries — **all symlinks into sibling directories**, so the same
+bytes were counted again at every level. `du` does not follow symlinks by default; we
+did, and `File` had no member that could even ask whether a path is a link.
+
+The root cause is that `File`'s predicates come in two families, and mixing them
+produces a wrong magnitude:
+
+| Predicate | Follows the link? | Answers about |
+|---|---|---|
+| `exists` / `isDirectory` / `size` / `spaceAvailable` | yes (`stat()`) | the **target** |
+| `isSymbolicLink` | **no (`lstat()`)** | the **link itself** |
+
+So for a symlink to a directory, `isDirectory` and `isSymbolicLink` are **both true**;
+for a dangling link `exists == false` while `isSymbolicLink == true`; and deleting it
+removes the link, not the target (AIR says exactly that).
+
+### 6.1 Measured on `adl 51.4.1` (probe `temp/symprobe/`)
+
+One side `mxmlc` + `adl`, the other this project's AOT, from the same input (a `fx/`
+tree holding a real directory, a real file, a link to a directory, a link to a file, a
+dangling link and a cyclic link):
+
+| Input | `exists` | `isDirectory` | `isSymbolicLink` |
+|---|---|---|---|
+| real directory | true | true | false |
+| real file | true | false | false |
+| link → directory | true | **true** | **true** |
+| link → file | true | false | **true** |
+| dangling link | **false** | false | **true** |
+| non-existent path | false | false | false |
+| `/` (volume root) | true | true | false |
+| `new File()` (empty) | **throws `#2037`** | same | same |
+
+**10/10 agree across the two runtimes** (except the empty-`File` row, §6.2).
+Implementation: POSIX uses `lstat()` + `S_ISLNK`; Windows uses
+`GetFileAttributesA()`'s `FILE_ATTRIBUTE_REPARSE_POINT` (AIR reports `true` for an NTFS
+junction too, which that bit covers, whereas MSVC's `_stat` cannot see reparse points).
+
+### 6.2 What else the probe turned up is an EXISTING gap, not a new one
+
+The `#2037` of an empty `File` (`new File()`) holds for `isSymbolicLink` as well, so it
+folds into the `遗留待开发` row that already exists — the whole empty-`File` family fails
+to throw `#2037` — and **does not open a new one**: that family fix is to turn
+`nativePath` from a field into an accessor, which is unrelated to this member.
+
+### 6.3 How a recursive walk should use it
+
+`isSymbolicLink` is a **traversal boundary condition**, not decoration. Without it the
+same subtree is counted again at every level, the node budget is spent on one target,
+and the report carries the **wrong magnitude** (on this machine `~/Library/Caches`
+inflated from 7.6 GB to 124 GB, and no later target was reached at all). The product-side
+rule is **ask first, then decide whether to descend**.
+
+One honest detail: **the depth cannot grow without bound** — macOS's own ELOOP ceiling
+(32 links) cuts a cyclic path off, so "a walk that follows links will hang" is false.
+**Double counting is the real damage**: the fixture in `examples/file-symlink.as` is a
+tree of **4 real nodes / 8 bytes** (plus 4 links, one of them pointing back at an
+ancestor), and a walk that follows links was measured visiting **264 nodes** — cut off by
+the kernel, not by any cap of ours. That is the nastier half: it finishes quickly and the
+number is simply wrong.
+
+---
+
+## 7. What is not done (on the record)
 
 - **The WASI / Emscripten trash**: no counterpart API, so the call reports itself
   loudly and throws `#2038`. A browser has no recycle-bin concept at all, which makes
@@ -174,7 +249,7 @@ it corrects the semantics.
 
 ---
 
-## 7. Reproduce
+## 8. Reproduce
 
 ```sh
 # adl side (probe in temp/trashprobe/, log to adl_log*.txt; adl's stdout is unusable)
@@ -190,5 +265,8 @@ cd temp/trashprobe && cc -O1 -Wall -Wextra -o trash_impl trash_impl.c && HOME=/t
 ```
 
 Pins: `unit: emit/FileMoveToTrash` (17 source-level checks);
-`examples/move-to-trash.as` (runtime; `EXAMPLE_ENV` in `test/examples.ts` points
-`HOME` at `temp/trash-home` so the suite never fills the developer's trash).
+`unit: emit/FileIsSymbolicLink` (7 source-level checks);
+`examples/move-to-trash.as` and `examples/file-symlink.as` (runtime; `EXAMPLE_ENV` in
+`test/examples.ts` points `HOME` at `temp/trash-home` and `temp/sym-home` respectively so
+the suite never fills the developer's trash — the symlink fixture is built with `node:fs`
+by that same file).

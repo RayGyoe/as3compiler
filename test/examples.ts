@@ -14,7 +14,7 @@
 // so fanning them out would buy nothing), while these ~190 subprocess units were
 // awaited one at a time.
 import { execFile } from 'node:child_process';
-import { readdirSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { readdirSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { join, resolve, relative, dirname, basename } from 'node:path';
 import { promisify } from 'node:util';
@@ -28,6 +28,23 @@ const runAsync = promisify(execFile);
 // The throwaway HOME that `move-to-trash.as` runs against (see EXAMPLE_ENV).
 const trashHome = join(root, 'temp', 'trash-home');
 mkdirSync(trashHome, { recursive: true });
+
+// The symlink fixture that `file-symlink.as` runs against (EXAMPLE_ENV points HOME here
+// too). Git can store symlinks, but not a symlink to `.` reliably, and the tree has to be
+// recreated from scratch anyway so a half-finished earlier run cannot leave it wrong: the
+// example asserts exact counts, so it must never see leftovers. `fx/` holds a real dir, a
+// real file, a link to each of those, a dangling link, and a link to `fx` itself -- the
+// cycle that is the difference between a guarded walk and one that runs away.
+const symHome = join(root, 'temp', 'sym-home');
+const symFx = join(symHome, 'fx');
+rmSync(symFx, { recursive: true, force: true });
+mkdirSync(join(symFx, 'sub'), { recursive: true });
+writeFileSync(join(symFx, 'real.txt'), 'hello');       // 5 bytes
+writeFileSync(join(symFx, 'sub', 'inner.txt'), 'xyz'); // 3 bytes
+symlinkSync('real.txt', join(symFx, 'link-file.txt'));
+symlinkSync('sub', join(symFx, 'link-dir'));
+symlinkSync('nope', join(symFx, 'dangling'));
+symlinkSync('.', join(symFx, 'loop'));
 
 const dir = join(root, 'examples');
 const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
@@ -185,6 +202,13 @@ const EXAMPLE_ENV: Record<string, Record<string, string>> = {
   // trash layout depends on), and the example creates its candidate file inside
   // that HOME so the two cannot land on different volumes.
   'move-to-trash.as': { HOME: trashHome },
+  // File.isSymbolicLink needs a tree that actually contains links, and the example
+  // reaches it through File.userDirectory (there is no environment API in AS3 to pass a
+  // path in). Both HOME and USERPROFILE point at the fixture because that is the pair of
+  // names `as_home_dir()` reads on POSIX and Windows respectively; on a Windows HOST the
+  // key below is not what AIR's File.userDirectory reads, so there the example reports
+  // itself skipped instead of asserting nothing (see the fixture check in the source).
+  'file-symlink.as': { HOME: symHome, USERPROFILE: symHome },
 };
 
 // Per-example extra CLI arguments. The SWC example needs a resource library on

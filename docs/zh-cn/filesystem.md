@@ -1,7 +1,8 @@
-# 文件系统（`flash.filesystem`）实测口径 —— 废纸篓与卷容量
+# 文件系统（`flash.filesystem`）实测口径 —— 废纸篓、卷容量与软链谓词
 
-> 本文记录 **`File.moveToTrash()` / `File.moveToTrashAsync()` / `File.spaceAvailable`** 三条成员
-> 的**实测语义**与实现选择（阶段二百四十三，v0.4.207）。它们是 macOS 清理工具 demo 的前置能力
+> 本文记录 **`File.moveToTrash()` / `File.moveToTrashAsync()` / `File.spaceAvailable` /
+> `File.isSymbolicLink`** 四条成员
+> 的**实测语义**与实现选择（阶段二百四十三，v0.4.207；`isSymbolicLink` 为阶段二百六十二）。它们是 macOS 清理工具 demo 的前置能力
 > （方案见工作区根 [`prune/mac-cleaner-demo-plan.md`](../../../prune/mac-cleaner-demo-plan.md) 的 G1 / G2）。
 >
 > **该方案已于 2026-10-23 移出本仓库**（原 `docs/projects/` 目录已撤），现位于工作区根 `prune/`
@@ -13,7 +14,8 @@
 > 探针；**没有一条是从文档转述的**，而且其中两条与官方参考不一致（见 §2.1、§5.1）。
 >
 > 一句话结论：**`moveToTrash` 是 `void` 而不是 `Boolean`，`spaceAvailable` 才是 AIR 的属性名
-> （`getSpaceAvailable` 根本不存在）**；废纸篓目标目录按卷选择，同名冲突的名字由 macOS 自己生成。
+> （`getSpaceAvailable` 根本不存在），而 `isSymbolicLink` 是 `File` 谓词里唯一 `lstat` 的那个
+> （不跟随链接）**；废纸篓目标目录按卷选择，同名冲突的名字由 macOS 自己生成。
 
 ---
 
@@ -21,9 +23,10 @@
 
 | 成员 | 状态 | 说明 |
 |---|---|---|
-| `File.moveToTrash()` | ✅ 实现（macOS + freedesktop POSIX + Windows 回收站） | 三端后端见 §4；WASI/Emscripten 无废纸篓概念，**响亮报明**（§6） |
+| `File.moveToTrash()` | ✅ 实现（macOS + freedesktop POSIX + Windows 回收站） | 三端后端见 §4；WASI/Emscripten 无废纸篓概念，**响亮报明**（§7） |
 | `File.moveToTrashAsync()` | ✅ 实现 | 事件投递口径见 §3 |
 | `File.spaceAvailable`（属性） | ✅ 已有（阶段六十四）；本轮**校正**语义 | 只对普通文件/目录作答（§5） |
+| `File.isSymbolicLink`（属性） | ✅ 实现（阶段二百六十二） | `lstat`/`FILE_ATTRIBUTE_REPARSE_POINT`，**唯一不跟随链接**的谓词（§6） |
 | `File.getSpaceAvailable` | ❌ **AIR 没有这个成员** | 我方也不提供（`in` 为 `false`，与 `adl` 一致） |
 | 卷总量 / 已用量 | ❌ 未做 | 方案里的 G3（增强，AIR 无对应物），尚未排期 |
 
@@ -136,7 +139,66 @@ f["getSpaceAvailable"]       // adl: ReferenceError #1069
 
 ---
 
-## 6. 没做的部分（如实登记）
+## 6. `isSymbolicLink` —— `File` 谓词里唯一不跟随链接的那个
+
+**它不是从参考文档抄的，是被一个真实产品逼出来的。** 工作区根的 `prune`（净扫，
+macOS 缓存清理器）用 `getDirectoryListing()` + `isDirectory` 递归计量 `~/Library/Caches`，
+面板上算出 **124 GB**，而同一目录 `du` 是 **7.6 GB**（差 16 倍）：该目录下有一份微信的
+Sparkle 安装包，里面塞着 `WeChatAppEx.app` 与一串 `.framework/Versions/Current`、
+`.framework/Resources` —— **全是指向兄弟目录的软链**，递归进去同一批字节被逐层重复计入。
+`du` 默认不跟随软链，我们跟随了，而当时 `File` 根本没有能问出「这是不是软链」的成员。
+
+根因是 `File` 的谓词分两类，混用就会得到错的量级：
+
+| 谓词 | 跟随链接？ | 回答的是 |
+|---|---|---|
+| `exists` / `isDirectory` / `size` / `spaceAvailable` | 是（`stat()`） | **目标** |
+| `isSymbolicLink` | **否（`lstat()`）** | **链接本身** |
+
+所以「指向目录的软链」`isDirectory` 与 `isSymbolicLink` **同时为真**；「悬空软链」
+`exists == false` 而 `isSymbolicLink == true`；删它删的是链接而不是目标（AIR 明确如此）。
+
+### 6.1 `adl 51.4.1` 实测（探针 `temp/symprobe/`）
+
+一侧 `mxmlc` + `adl`，一侧本项目 AOT，同一份输入（`fx/` 里造真目录 / 真文件 /
+软链→目录 / 软链→文件 / 悬空软链 / 成环软链）：
+
+| 输入 | `exists` | `isDirectory` | `isSymbolicLink` |
+|---|---|---|---|
+| 真目录 | true | true | false |
+| 真文件 | true | false | false |
+| 软链 → 目录 | true | **true** | **true** |
+| 软链 → 文件 | true | false | **true** |
+| 悬空软链 | **false** | false | **true** |
+| 不存在的路径 | false | false | false |
+| `/`（卷根） | true | true | false |
+| `new File()`（空） | **抛 `#2037`** | 同左 | 同左 |
+
+**10/10 两端口径一致**（除空 `File` 那条，见 §6.2）。实现：POSIX 走 `lstat()` + `S_ISLNK`；
+Windows 走 `GetFileAttributesA()` 的 `FILE_ATTRIBUTE_REPARSE_POINT`（AIR 对 NTFS junction 也报
+`true`，这个位正好覆盖，而 MSVC 的 `_stat` 认不出重解析点）。
+
+### 6.2 顺带量到的，是**既有**缺口而不是新缺口
+
+空 `File`（`new File()`）的 `#2037` 在 `isSymbolicLink` 上同样成立 ⇒ 它并入 `遗留待开发` 里
+已有的那行「**空 `File`（`new File()`）的成员访问全线不抛 `#2037`**」，**不新开一行**：
+族级修法是先把 `nativePath` 从字段改成访问器，与本条无关。
+
+### 6.3 遍历里该怎么用
+
+`isSymbolicLink` 是**遍历的边界条件**，不是装饰：不判它，同一棵子树会被逐层重复计入，
+节点预算全烧在一个目标上，而报表给出的是**错的量级**（本机上 `~/Library/Caches` 从 7.6 GB
+虚报成 124 GB，并且后面的目标一个都没扫到）。产品侧的正确写法是**先判它，再决定要不要下潜**。
+
+一个诚实的细节：**深度不会被无限拉长**——macOS 内核自己的 ELOOP 上限（32 层链接）会把
+含环的路径斩断，所以「跟随软链的遍历会挂死」这个说法是错的。**重复计数才是真的**：
+`examples/file-symlink.as` 的夹具是一棵只有 **4 个真节点 / 8 字节**的树（含 4 个链接，
+其中一个指回祖先），跟随软链走一遍实测会访问 **264 个节点**（且不是被我们设的节点上限截断的，
+是内核截断的）——这正是「挂死」之外更阴险的那一半：它跑得很快，只是数目是错的。
+
+---
+
+## 7. 没做的部分（如实登记）
 
 - **WASI / Emscripten 的废纸篓**：无对应 API，调用响亮报明并抛 `#2038`。浏览器没有「回收站」这个概念，**响亮报明即为终态**（不做假后端）。Windows 回收站后端已于阶段二百四十四 落地（§4）。
 - **Finder「放回原处」元数据**：见 §4 取舍。
@@ -147,7 +209,7 @@ f["getSpaceAvailable"]       // adl: ReferenceError #1069
 
 ---
 
-## 7. 复现
+## 8. 复现
 
 ```sh
 # adl 侧（探针在 temp/trashprobe/，日志写 adl_log*.txt；adl 的 stdout 不可用）
@@ -162,5 +224,7 @@ mkdir -p temp/trash-home && HOME=$PWD/temp/trash-home \
 cd temp/trashprobe && cc -O1 -Wall -Wextra -o trash_impl trash_impl.c && HOME=/tmp/x ./trash_impl
 ```
 
-钉子：`unit: emit/FileMoveToTrash`（17 项，源级）；`examples/move-to-trash.as`（运行时，
-由 `test/examples.ts` 的 `EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，避免污染开发机的废纸篓）。
+钉子：`unit: emit/FileMoveToTrash`（17 项，源级）；`unit: emit/FileIsSymbolicLink`（7 项，源级）；
+`examples/move-to-trash.as`、`examples/file-symlink.as`（运行时，
+由 `test/examples.ts` 的 `EXAMPLE_ENV` 把 `HOME` 分别指到 `temp/trash-home`、`temp/sym-home`，
+避免污染开发机的废纸篓；软链夹具由该文件用 `node:fs` 现造）。
