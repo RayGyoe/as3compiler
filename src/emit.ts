@@ -6134,9 +6134,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('char* NativeWindow_toString(void* _this) { (void)_this; return (char*)"[object NativeWindow]"; }');
     // menu: this runtime has no NativeMenu subsystem at all (a registered
-    // lingering gap), so a window never has one and the getter answers AIR's null
-    // -- adl 51.4.1 reports null for both NativeApplication.menu and
-    // NativeWindow.menu unless one was set (temp/nwor/adl-oracle.txt sections A/C).
+    // lingering gap), so a window never has one and the getter answers AIR's
+    // null. Measured on adl 51.4.1 / macOS (temp/desktopprobe/MenuProbe.as):
+    // NativeWindow.menu is null AND assigning one does not stick, because
+    // NativeWindow.supportsMenu is false on that OS -- so NULL is AIR's exact
+    // answer, not a stand-in.
+    // NOTE (2026-10-23 correction): the original note here also claimed adl
+    // reports null for NativeApplication.menu. That half was WRONG -- it hands
+    // back the app's own 4-item menu (adl / 文件 / 编辑 / 窗口) and accepts a
+    // replacement; we do not declare that member at all. See TODO.md 遗留待开发
+    // (2026-10-23, flash.desktop icon family).
     this.line('Object* NativeWindow_get_menu(void* _this) { (void)_this; return NULL; }');
     // orderInFrontOf()/orderInBackOf(): adl 51.4.1 answers true for a normal pair
     // and reports no bounds change, so the observable effect is the z-order move
@@ -9213,6 +9220,555 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('');
   }
 
+
+  // flash.desktop icon family + flash.display.NativeMenu (阶段二百五十五).
+  //
+  // Every error number, message and list rule below is MEASURED on adl 51.4.1 /
+  // macOS; the probe and its raw output live in temp/deskprobe2/ (probe*.txt).
+  // The model is deliberately data-shaped: a menu is an Array of NativeMenuItem
+  // instances (the same objects the AS3 side holds), and the native side is a
+  // FLATTENED description passed across the glue boundary, so window_glue.cc
+  // never learns a generated C type.
+  private emitDesktopMenus(): void {
+    const raw = (code: string): void => { for (const ln of code.split('\n')) this.line(ln); };
+    raw(`
+// ---- flash.desktop icon family + flash.display.NativeMenu (阶段二百五十五) ----
+// Measured contract (adl 51.4.1 / macOS, temp/deskprobe2/):
+//   * #2005 / #2007 / #2012 are ArgumentError, #2006 is RangeError,
+//     #1009 / #1034 are TypeError, #1069 / #1074 are ReferenceError.
+//   * items/bitmaps/keyEquivalentModifiers getters hand back COPIES.
+//   * keyEquivalentModifiers keeps only 15..20, sorted ascending, deduped.
+//   * getItemByName matches the item NAME (not its label); a null name is #2007.
+//   * addItem with an item already present is a silent no-op; addItemAt with the
+//     same item is #2004; removeItem of a foreign item is #2006.
+//   * clone() copies the tree but NOT the item data field.
+//   * a menu-bar click dispatches select on the ITEM and on its containing MENU
+//     with bubbles=false cancelable=false (temp/deskprobe2/probe4-log.txt).
+static bool ASC_menu_reported_unsupported = false;
+
+static void as_menu_sync(NativeMenu* from);
+static void as_menu_note_mods(NativeMenuItem* it);
+static DockIcon* as_dock_icon_get(void);
+static void as_dock_icon_sync(Icon* o);
+
+// ---- NativeMenuItem ----
+void NativeMenuItem_ctor(NativeMenuItem* o, char* label, bool isSeparator) {
+  EventDispatcher_ctor((EventDispatcher*)o, NULL);
+  o->label = label; gc_write_barrier((void*)label);
+  o->name = NULL;
+  o->_sep = isSeparator;
+  o->enabled = true;
+  o->checked = false;
+  o->mnemonicIndex = -1;
+  o->data = NULL;
+  o->_keyeq = NULL;
+  o->_mods = as_array_new(); gc_write_barrier((void*)o->_mods);
+  // measured default: [15] (this SDK ships no flash.ui.KeyboardModifier class, so
+  // the six legal values 15..20 are matched numerically only)
+  as_array_push(o->_mods, as_v_num(15.0));
+  o->_menu = NULL;
+  o->_submenu = NULL;
+}
+NativeMenuItem* NativeMenuItem_new(char* label, bool isSeparator) {
+  NativeMenuItem* o = (NativeMenuItem*)gc_alloc(GCT_CLASS, sizeof(NativeMenuItem));
+  o->vtable = &NativeMenuItem_vt;
+  NativeMenuItem_ctor(o, label, isSeparator);
+  return o;
+}
+bool NativeMenuItem_get_isSeparator(void* _this) { return ((NativeMenuItem*)_this)->_sep; }
+char* NativeMenuItem_get_keyEquivalent(void* _this) { return ((NativeMenuItem*)_this)->_keyeq; }
+void NativeMenuItem_set_keyEquivalent(void* _this, char* v) {
+  NativeMenuItem* o = (NativeMenuItem*)_this;
+  // measured: "" reads back as null (only a real character survives)
+  if (v != NULL && v[0] == 0) v = NULL;
+  o->_keyeq = v; gc_write_barrier((void*)v);
+}
+as_array* NativeMenuItem_get_keyEquivalentModifiers(void* _this) {
+  NativeMenuItem* o = (NativeMenuItem*)_this;
+  as_array* out = as_array_new();
+  if (o->_mods != NULL) for (int i = 0; i < o->_mods->length; i++) as_array_push(out, o->_mods->data[i]);
+  return out;
+}
+void NativeMenuItem_set_keyEquivalentModifiers(void* _this, as_array* v) {
+  NativeMenuItem* o = (NativeMenuItem*)_this;
+  as_array* out = as_array_new();
+  if (v != NULL) {
+    for (int i = 0; i < v->length; i++) {
+      int n = as_v_to_int(v->data[i]);
+      if (n < 15 || n > 20) continue;  // measured: 0..14 and >=21 are dropped
+      bool dup = false;
+      for (int j = 0; j < out->length; j++) if (as_v_to_int(out->data[j]) == n) dup = true;
+      if (!dup) as_array_push(out, as_v_num((double)n));
+    }
+    for (int i = 1; i < out->length; i++) {  // measured: [18,16,16] -> [16,18]
+      as_value k = out->data[i]; int j = i - 1;
+      while (j >= 0 && as_v_to_int(out->data[j]) > as_v_to_int(k)) { out->data[j + 1] = out->data[j]; j--; }
+      out->data[j + 1] = k;
+    }
+  }
+  o->_mods = out; gc_write_barrier((void*)out);
+}
+NativeMenu* NativeMenuItem_get_menu(void* _this) { return ((NativeMenuItem*)_this)->_menu; }
+NativeMenu* NativeMenuItem_get_submenu(void* _this) { return ((NativeMenuItem*)_this)->_submenu; }
+void NativeMenuItem_set_submenu(void* _this, NativeMenu* v) {
+  NativeMenuItem* o = (NativeMenuItem*)_this;
+  NativeMenu* old = o->_submenu;
+  if (old != NULL && old->_parent == o->_menu) old->_parent = NULL;
+  o->_submenu = v; gc_write_barrier((void*)v);
+  if (v != NULL) { v->_parent = o->_menu; gc_write_barrier((void*)o->_menu); }
+  as_menu_sync(o->_menu != NULL ? o->_menu : v);
+}
+NativeMenuItem* NativeMenuItem_clone(void* _this) {
+  NativeMenuItem* o = (NativeMenuItem*)_this;
+  NativeMenuItem* c = NativeMenuItem_new(o->label, o->_sep);
+  c->name = o->name; gc_write_barrier((void*)o->name);
+  c->enabled = o->enabled;
+  c->checked = o->checked;
+  c->mnemonicIndex = o->mnemonicIndex;
+  // measured: clone() does NOT carry the data field over
+  c->_keyeq = o->_keyeq; gc_write_barrier((void*)o->_keyeq);
+  c->_mods = NativeMenuItem_get_keyEquivalentModifiers(o); gc_write_barrier((void*)c->_mods);
+  if (o->_submenu != NULL) { NativeMenu* s = NativeMenu_clone(o->_submenu); c->_submenu = s; gc_write_barrier((void*)s); s->_parent = c->_menu; }
+  return c;
+}
+char* NativeMenuItem_toString(void* _this) {
+  NativeMenuItem* o = (NativeMenuItem*)_this;
+  char* s = as_str_concat((char*)"[NativeMenuItem label=\\"", o->label != NULL ? o->label : (char*)"null");
+  s = as_str_concat(s, (char*)"\\" keyEquivalent=");
+  s = as_str_concat(s, o->_keyeq != NULL ? o->_keyeq : (char*)"null");
+  s = as_str_concat(s, (char*)" keyEquivalentChar=0 keyEquivalentModifiers={ ");
+  for (int i = 0; o->_mods != NULL && i < o->_mods->length; i++) {
+    if (i > 0) s = as_str_concat(s, (char*)" ");
+    s = as_str_concat(s, as_str_from_int(as_v_to_int(o->_mods->data[i])));
+  }
+  s = as_str_concat(s, (char*)" }]");
+  return s;
+}
+
+// ---- NativeMenu ----
+void NativeMenu_ctor(NativeMenu* o) {
+  EventDispatcher_ctor((EventDispatcher*)o, NULL);
+  o->_items = as_array_new(); gc_write_barrier((void*)o->_items);
+  o->_parent = NULL;
+}
+NativeMenu* NativeMenu_new(void) {
+  NativeMenu* o = (NativeMenu*)gc_alloc(GCT_CLASS, sizeof(NativeMenu));
+  o->vtable = &NativeMenu_vt;
+  NativeMenu_ctor(o);
+  return o;
+}
+bool NativeMenu_get_isSupported_static(void* _this) { (void)_this; return true; }
+static int as_menu_index(NativeMenu* m, NativeMenuItem* item) {
+  if (m == NULL || m->_items == NULL || item == NULL) return -1;
+  for (int i = 0; i < m->_items->length; i++) {
+    as_value v = m->_items->data[i];
+    if (v.tag == 4 && v.ptr == (void*)item) return i;
+  }
+  return -1;
+}
+as_array* NativeMenu_get_items(void* _this) {
+  NativeMenu* m = (NativeMenu*)_this;
+  as_array* out = as_array_new();  // measured: a fresh Array on every read
+  if (m->_items != NULL) for (int i = 0; i < m->_items->length; i++) as_array_push(out, m->_items->data[i]);
+  return out;
+}
+void NativeMenu_set_items(void* _this, as_array* v) {
+  NativeMenu* m = (NativeMenu*)_this;
+  // measured: null is a TypeError #1009 (AIR dereferences it), a non-item element
+  // is #1034 with the offending value in the message.
+  if (v == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }
+  for (int i = 0; i < v->length; i++) {
+    as_value e = v->data[i];
+    if (e.tag != 4 || e.ptr == NULL || !as_is(e.ptr, (void*)&NativeMenuItem_vt)) {
+      char* msg = as_str_concat((char*)"Error #1034: Type Coercion failed: cannot convert ", as_v_str_val(e));
+      msg = as_str_concat(msg, (char*)" to flash.display.NativeMenuItem.");
+      as_throw(TypeError_new(msg, 1034));
+      return;
+    }
+  }
+  for (int i = 0; m->_items != NULL && i < m->_items->length; i++) {
+    as_value e = m->_items->data[i];
+    if (e.tag == 4 && e.ptr != NULL) ((NativeMenuItem*)e.ptr)->_menu = NULL;
+  }
+  m->_items = v; gc_write_barrier((void*)v);
+  for (int i = 0; i < v->length; i++) { as_value e = v->data[i]; ((NativeMenuItem*)e.ptr)->_menu = m; }
+  as_menu_sync(m);
+}
+int NativeMenu_get_numItems(void* _this) {
+  NativeMenu* m = (NativeMenu*)_this;
+  return (m->_items == NULL) ? 0 : m->_items->length;
+}
+NativeMenu* NativeMenu_get_parent(void* _this) { return ((NativeMenu*)_this)->_parent; }
+NativeMenuItem* NativeMenu_addItem(void* _this, NativeMenuItem* item) {
+  NativeMenu* m = (NativeMenu*)_this;
+  if (item == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter item must be non-null.", 2007)); return NULL; }
+  if (as_menu_index(m, item) >= 0) return item;  // measured: silent no-op
+  as_array_push(m->_items, as_v_obj((void*)item));
+  item->_menu = m;
+  // measured (temp/deskprobe2/probe7.txt): adding an item that already carries a
+  // submenu re-parents that submenu to the menu it just joined.
+  if (item->_submenu != NULL) { item->_submenu->_parent = m; gc_write_barrier((void*)m); }
+  as_menu_sync(m);
+  return item;
+}
+NativeMenuItem* NativeMenu_addItemAt(void* _this, NativeMenuItem* item, int index) {
+  NativeMenu* m = (NativeMenu*)_this;
+  if (item == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter item must be non-null.", 2007)); return NULL; }
+  if (as_menu_index(m, item) >= 0) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return NULL; }
+  if (index < 0 || index > (m->_items == NULL ? 0 : m->_items->length)) {
+    as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006));
+    return NULL;
+  }
+  as_array_insertAt(m->_items, index, as_v_obj((void*)item));
+  item->_menu = m;
+  if (item->_submenu != NULL) { item->_submenu->_parent = m; gc_write_barrier((void*)m); }
+  as_menu_sync(m);
+  return item;
+}
+NativeMenuItem* NativeMenu_addSubmenu(void* _this, NativeMenu* menu, char* label) {
+  NativeMenu* m = (NativeMenu*)_this;
+  NativeMenuItem* it = NativeMenuItem_new(label, false);
+  if (menu != NULL) { it->_submenu = menu; gc_write_barrier((void*)menu); menu->_parent = m; gc_write_barrier((void*)m); }
+  return NativeMenu_addItem(m, it);
+}
+NativeMenuItem* NativeMenu_addSubmenuAt(void* _this, NativeMenu* menu, int index, char* label) {
+  NativeMenu* m = (NativeMenu*)_this;
+  NativeMenuItem* it = NativeMenuItem_new(label, false);
+  if (menu != NULL) { it->_submenu = menu; gc_write_barrier((void*)menu); menu->_parent = m; gc_write_barrier((void*)m); }
+  return NativeMenu_addItemAt(m, it, index);
+}
+NativeMenuItem* NativeMenu_removeItem(void* _this, NativeMenuItem* item) {
+  NativeMenu* m = (NativeMenu*)_this;
+  int i = as_menu_index(m, item);
+  // measured: removing an item that is not in this menu is RangeError #2006
+  if (i < 0) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return NULL; }
+  as_array_removeAt(m->_items, i);
+  item->_menu = NULL;
+  // measured: a removed item's submenu loses its parent along with it.
+  if (item->_submenu != NULL) item->_submenu->_parent = NULL;
+  as_menu_sync(m);
+  return item;
+}
+NativeMenuItem* NativeMenu_removeItemAt(void* _this, int index) {
+  NativeMenu* m = (NativeMenu*)_this;
+  if (m->_items == NULL || index < 0 || index >= m->_items->length) {
+    as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006));
+    return NULL;
+  }
+  as_value v = m->_items->data[index];
+  as_array_removeAt(m->_items, index);
+  if (v.tag == 4 && v.ptr != NULL) ((NativeMenuItem*)v.ptr)->_menu = NULL;
+  as_menu_sync(m);
+  return (v.tag == 4) ? (NativeMenuItem*)v.ptr : NULL;
+}
+void NativeMenu_removeAllItems(void* _this) {
+  NativeMenu* m = (NativeMenu*)_this;
+  for (int i = 0; m->_items != NULL && i < m->_items->length; i++) {
+    as_value v = m->_items->data[i];
+    if (v.tag == 4 && v.ptr != NULL) ((NativeMenuItem*)v.ptr)->_menu = NULL;
+  }
+  if (m->_items != NULL) m->_items->length = 0;
+  as_menu_sync(m);
+}
+bool NativeMenu_containsItem(void* _this, NativeMenuItem* item) { return as_menu_index((NativeMenu*)_this, item) >= 0; }
+NativeMenuItem* NativeMenu_getItemAt(void* _this, int index) {
+  NativeMenu* m = (NativeMenu*)_this;
+  if (m->_items == NULL || index < 0 || index >= m->_items->length) {
+    as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006));
+    return NULL;
+  }
+  as_value v = m->_items->data[index];
+  return (v.tag == 4) ? (NativeMenuItem*)v.ptr : NULL;
+}
+int NativeMenu_getItemIndex(void* _this, NativeMenuItem* item) { return as_menu_index((NativeMenu*)_this, item); }
+NativeMenuItem* NativeMenu_getItemByName(void* _this, char* name) {
+  NativeMenu* m = (NativeMenu*)_this;
+  if (name == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter name must be non-null.", 2007)); return NULL; }
+  // measured: matches NativeMenuItem.name only -- NOT the label
+  for (int i = 0; m->_items != NULL && i < m->_items->length; i++) {
+    as_value v = m->_items->data[i];
+    if (v.tag != 4 || v.ptr == NULL) continue;
+    NativeMenuItem* it = (NativeMenuItem*)v.ptr;
+    if (it->name != NULL && strcmp(it->name, name) == 0) return it;
+  }
+  return NULL;
+}
+void NativeMenu_setItemIndex(void* _this, NativeMenuItem* item, int index) {
+  NativeMenu* m = (NativeMenu*)_this;
+  if (m->_items == NULL || index < 0 || index >= m->_items->length) {
+    as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006));
+    return;
+  }
+  int from = as_menu_index(m, item);
+  if (from < 0) return;  // measured: an item that is not in the menu is a silent no-op
+  if (from == index) return;
+  as_array_removeAt(m->_items, from);
+  as_array_insertAt(m->_items, index, as_v_obj((void*)item));
+  as_menu_sync(m);
+}
+void NativeMenu_display(void* _this, Stage* stage, double x, double y) {
+  (void)_this; (void)stage; (void)x; (void)y;
+  // AIR opens a modal native menu here; this backend has no modal menu loop, so
+  // say so once instead of pretending a menu appeared.
+  if (!ASC_menu_reported_unsupported) {
+    ASC_menu_reported_unsupported = true;
+    as_shell_unsupported((char*)"flash.display.NativeMenu.display (this backend cannot run a modal native menu)");
+  }
+}
+NativeMenu* NativeMenu_clone(void* _this) {
+  NativeMenu* m = (NativeMenu*)_this;
+  NativeMenu* c = NativeMenu_new();
+  for (int i = 0; m->_items != NULL && i < m->_items->length; i++) {
+    as_value v = m->_items->data[i];
+    if (v.tag != 4 || v.ptr == NULL) continue;
+    NativeMenuItem* it = NativeMenuItem_clone((NativeMenuItem*)v.ptr);
+    as_array_push(c->_items, as_v_obj((void*)it));
+    it->_menu = c;
+  }
+  return c;
+}
+as_value NativeMenu_dispatchContextMenuSelect(void* _this, Object* mouseEvent) {
+  (void)_this; (void)mouseEvent;
+  return as_v_undefined();  // measured: adl answers undefined
+}
+
+// ---- the native description handed to the window glue ----
+static int as_menu_measure(NativeMenu* m, int depth) {
+  if (m == NULL || m->_items == NULL || depth > 16) return 0;
+  int n = 0;
+  for (int i = 0; i < m->_items->length; i++) {
+    as_value v = m->_items->data[i];
+    if (v.tag != 4 || v.ptr == NULL) continue;
+    NativeMenuItem* it = (NativeMenuItem*)v.ptr;
+    n += 1 + (it->_submenu != NULL ? as_menu_measure(it->_submenu, depth + 1) : 0);
+  }
+  return n;
+}
+typedef struct {
+  sk_menu* menus; int nmenus; int capmenus;
+  sk_menu_item* items; int nitems; int capitems;
+  int tag_base;
+} as_menu_ctx;
+static int as_menu_fill(NativeMenu* m, as_menu_ctx* c, int depth) {
+  int idx = c->nmenus++;
+  c->menus[idx].title = (char*)"";
+  c->menus[idx].first = c->nitems;
+  c->menus[idx].count = 0;
+  if (m == NULL || m->_items == NULL || depth > 16) return idx;
+  // Pass 1: a menu's OWN items must end up contiguous in the flat array, because
+  // the glue indexes them as [first, first+count). Recursing inside this loop
+  // interleaved a submenu's items into the parent's range, so a parent with two
+  // submenus lost everything after the first one (measured: the second top-level
+  // menu simply vanished from the macOS menu bar).
+  int base = c->nitems;
+  for (int i = 0; i < m->_items->length; i++) {
+    as_value v = m->_items->data[i];
+    if (v.tag != 4 || v.ptr == NULL) continue;
+    NativeMenuItem* it = (NativeMenuItem*)v.ptr;
+    int k = c->nitems++;
+    c->items[k].kind = it->_sep ? 1 : 0;
+    c->items[k].label = it->label != NULL ? it->label : (char*)"";
+    c->items[k].enabled = it->enabled ? 1 : 0;
+    c->items[k].checked = it->checked ? 1 : 0;
+    c->items[k].key = it->_keyeq != NULL ? it->_keyeq : (char*)"";
+    c->items[k].mods = 0;
+    c->items[k].submenu = -1;
+    c->items[k].tag = c->tag_base + k + 1;
+    as_array_push(ASC_menu_tags, v);
+    c->menus[idx].count++;
+    as_menu_note_mods(it);
+  }
+  // Pass 2: with the parent's range fixed, append each submenu (depth-first) and
+  // patch its index back into the parent's slot.
+  int j = 0;
+  for (int i = 0; i < m->_items->length; i++) {
+    as_value v = m->_items->data[i];
+    if (v.tag != 4 || v.ptr == NULL) continue;
+    NativeMenuItem* it = (NativeMenuItem*)v.ptr;
+    if (it->_submenu != NULL) c->items[base + j].submenu = as_menu_fill(it->_submenu, c, depth + 1);
+    j++;
+  }
+  return idx;
+}
+static void as_menu_click_cb(int tag) {
+  if (ASC_menu_tags == NULL || tag < 1 || tag > ASC_menu_tags->length) return;
+  as_value v = ASC_menu_tags->data[tag - 1];
+  if (v.tag != 4 || v.ptr == NULL) return;
+  NativeMenuItem* it = (NativeMenuItem*)v.ptr;
+  // measured (temp/deskprobe2/probe4-log.txt): the item and its containing menu
+  // both receive select, with bubbles=false cancelable=false.
+  EventDispatcher_dispatchEvent((EventDispatcher*)it, (Event*)Event_new((char*)"select", false, false));
+  if (it->_menu != NULL) EventDispatcher_dispatchEvent((EventDispatcher*)it->_menu, (Event*)Event_new((char*)"select", false, false));
+}
+static void as_menu_sync(NativeMenu* from) {
+  (void)from;
+  ASC_menu_tags = as_array_new(); gc_write_barrier((void*)ASC_menu_tags);
+  int appItems = 0, dockItems = 0;
+  if (ASC_app_menu != NULL) {
+    int n = as_menu_measure(ASC_app_menu, 0);
+    as_menu_ctx c;
+    c.nmenus = 0; c.nitems = 0; c.tag_base = 0;
+    c.capmenus = 0; c.capitems = n;
+    // A menu tree never has more menus than items (each submenu hangs off one
+    // item, plus the root), so one allocation sized by the item count covers both.
+    c.menus = (sk_menu*)as_alloc(sizeof(sk_menu) * (size_t)(n + 2));
+    c.items = (sk_menu_item*)as_alloc(sizeof(sk_menu_item) * (size_t)(n + 1));
+    int idx = as_menu_fill(ASC_app_menu, &c, 0);
+    appItems = c.nitems;
+    sk_menu_install_app(c.menus, c.nmenus, c.items, c.nitems, idx, as_menu_click_cb);
+  }
+  if (ASC_dock_menu != NULL) {
+    int n = as_menu_measure(ASC_dock_menu, 0);
+    as_menu_ctx c;
+    c.nmenus = 0; c.nitems = 0; c.tag_base = appItems;
+    c.capmenus = 0; c.capitems = n;
+    c.menus = (sk_menu*)as_alloc(sizeof(sk_menu) * (size_t)(n + 2));
+    c.items = (sk_menu_item*)as_alloc(sizeof(sk_menu_item) * (size_t)(n + 1));
+    int idx = as_menu_fill(ASC_dock_menu, &c, 0);
+    dockItems = c.nitems;
+    sk_menu_install_dock(c.menus, c.nmenus, c.items, c.nitems, idx, as_menu_click_cb);
+  }
+  (void)dockItems;
+}
+
+// ---- Icon / InteractiveIcon / DockIcon / SystemTrayIcon ----
+void Icon_ctor(Icon* o) { Object_ctor((Object*)o); o->_bitmaps = NULL; }
+Icon* Icon_new(void) {
+  Icon* o = (Icon*)gc_alloc(GCT_CLASS, sizeof(Icon));
+  o->vtable = &Icon_vt; Icon_ctor(o); return o;
+}
+as_array* Icon_get_bitmaps(void* _this) {
+  Icon* o = (Icon*)_this;
+  // measured: a BARE Icon has no store yet and reading it is #1009, while every
+  // InteractiveIcon starts with an empty array. Each read hands back a COPY (adl:
+  // "bitmaps getter returns SAME array twice? => false", and pushing into the copy
+  // does not stick), so the caller cannot mutate the icon behind AIR's back.
+  if (o->_bitmaps == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return NULL; }
+  as_array* out = as_array_new();
+  for (int i = 0; i < o->_bitmaps->length; i++) as_array_push(out, o->_bitmaps->data[i]);
+  return out;
+}
+void Icon_set_bitmaps(void* _this, as_array* v) {
+  Icon* o = (Icon*)_this;
+  // measured: the BASE Icon accepts anything, including null
+  o->_bitmaps = v; gc_write_barrier((void*)v);
+  as_dock_icon_sync(o);
+}
+void InteractiveIcon_ctor(InteractiveIcon* o) {
+  Icon_ctor((Icon*)o);
+  // measured: a pristine DockIcon answers bitmaps len=0 (not the bare Icon #1009)
+  o->_bitmaps = as_array_new(); gc_write_barrier((void*)o->_bitmaps);
+  o->_w = 0; o->_h = 0;
+}
+InteractiveIcon* InteractiveIcon_new(void) {
+  as_throw(ArgumentError_new((char*)"Error #2012: InteractiveIcon$ class cannot be instantiated.", 2012));
+  return NULL;
+}
+int InteractiveIcon_get_width(void* _this) { return ((InteractiveIcon*)_this)->_w; }
+int InteractiveIcon_get_height(void* _this) { return ((InteractiveIcon*)_this)->_h; }
+void InteractiveIcon_set_bitmaps(void* _this, as_array* v) {
+  InteractiveIcon* o = (InteractiveIcon*)_this;
+  Icon_set_bitmaps(_this, v);
+  // measured: width/height are the per-axis MAXIMUM over the bitmaps and keep
+  // their previous value when the array is empty.
+  if (v != NULL) {
+    int w = 0, h = 0;
+    for (int i = 0; i < v->length; i++) {
+      as_value e = v->data[i];
+      if (e.tag != 4 || e.ptr == NULL) continue;
+      BitmapData* b = (BitmapData*)e.ptr;
+      if (b->width > w) w = b->width;
+      if (b->height > h) h = b->height;
+    }
+    if (w > 0 || h > 0) { o->_w = w; o->_h = h; }
+  }
+}
+static DockIcon* as_dock_icon_get(void) {
+  if (ASC_icon_singleton == NULL) {
+    ASC_icon_singleton = (DockIcon*)gc_alloc(GCT_CLASS, sizeof(DockIcon));
+    ASC_icon_singleton->vtable = &DockIcon_vt;
+    DockIcon_ctor(ASC_icon_singleton);
+  }
+  return ASC_icon_singleton;
+}
+// measured: the DockIcon override rejects null and any non-BitmapData element
+// (#2007 "Parameter bitmaps must be non-null." / #2005 "Parameter 0 is of the
+// incorrect type. Should be type BitmapData."), then behaves like the base class.
+void DockIcon_set_bitmaps(void* _this, as_array* v) {
+  if (v == NULL) {
+    as_throw(ArgumentError_new((char*)"Error #2007: Parameter bitmaps must be non-null.", 2007));
+    return;
+  }
+  for (int i = 0; i < v->length; i++) {
+    as_value e = v->data[i];
+    if (e.tag != 4 || e.ptr == NULL || !as_is(e.ptr, &BitmapData_vt)) {
+      char* msg = as_str_concat((char*)"Error #2005: Parameter ", as_str_from_int(i));
+      msg = as_str_concat(msg, (char*)" is of the incorrect type. Should be type BitmapData.");
+      as_throw(ArgumentError_new(msg, 2005));
+      return;
+    }
+  }
+  InteractiveIcon_set_bitmaps(_this, v);
+}
+
+// Bitmap application to the real Dock icon. The AS3 model is complete; the
+// pixels are not painted yet, which is reported once rather than silently
+// dropped (see TODO.md 遗留待开发, 阶段二百五十五 residue).
+static bool ASC_dock_image_reported = false;
+// Same shape for the modifier flags: the glue binds the keyEquivalent but does not
+// translate the six legal AS3 values (15..20) into NSEventModifierFlags yet, so a
+// shortcut would fire with AppKit's defaults instead of what the AS3 code asked
+// for. Reported once instead of binding a wrong shortcut in silence.
+static bool ASC_mods_reported = false;
+static void as_menu_note_mods(NativeMenuItem* it) {
+  if (ASC_mods_reported || it == NULL || it->_keyeq == NULL || it->_keyeq[0] == 0) return;
+  if (it->_mods != NULL && it->_mods->length == 1 && it->_mods->data[0].num == 15.0) return;
+  ASC_mods_reported = true;
+  as_shell_unsupported((char*)"NativeMenuItem.keyEquivalentModifiers (this backend binds the keyEquivalent but does not apply the modifier flags yet)");
+}
+static void as_dock_icon_sync(Icon* o) {
+  if (o != (Icon*)ASC_icon_singleton) return;
+  if (!sk_menu_supported()) return;
+  if (o->_bitmaps == NULL || o->_bitmaps->length == 0) return;
+  if (!ASC_dock_image_reported) {
+    ASC_dock_image_reported = true;
+    as_shell_unsupported((char*)"flash.desktop.DockIcon.bitmaps (the Dock icon image is not painted by this backend yet)");
+  }
+}
+void DockIcon_ctor(DockIcon* o) { InteractiveIcon_ctor((InteractiveIcon*)o); o->_menu = NULL; }
+DockIcon* DockIcon_new(void) {
+  as_throw(ArgumentError_new((char*)"Error #2012: DockIcon$ class cannot be instantiated.", 2012));
+  return NULL;
+}
+NativeMenu* DockIcon_get_menu(void* _this) { return ((DockIcon*)_this)->_menu; }
+void DockIcon_set_menu(void* _this, NativeMenu* v) {
+  DockIcon* o = (DockIcon*)_this;
+  o->_menu = v; gc_write_barrier((void*)v);
+  ASC_dock_menu = v;
+  as_menu_sync(v);
+}
+void DockIcon_bounce(void* _this, char* priority) {
+  (void)_this;
+  if (priority == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter value must be non-null.", 2007)); return; }
+  sk_dock_bounce(strcmp(priority, "critical") == 0 ? 1 : 0);
+}
+void SystemTrayIcon_ctor(SystemTrayIcon* o) { InteractiveIcon_ctor((InteractiveIcon*)o); o->_tooltip = NULL; o->_menu = NULL; }
+SystemTrayIcon* SystemTrayIcon_new(void) {
+  as_throw(ArgumentError_new((char*)"Error #2012: SystemTrayIcon$ class cannot be instantiated.", 2012));
+  return NULL;
+}
+char* SystemTrayIcon_get_tooltip(void* _this) { return ((SystemTrayIcon*)_this)->_tooltip; }
+void SystemTrayIcon_set_tooltip(void* _this, char* v) {
+  SystemTrayIcon* o = (SystemTrayIcon*)_this;
+  o->_tooltip = v; gc_write_barrier((void*)v);
+}
+NativeMenu* SystemTrayIcon_get_menu(void* _this) { return ((SystemTrayIcon*)_this)->_menu; }
+void SystemTrayIcon_set_menu(void* _this, NativeMenu* v) { ((SystemTrayIcon*)_this)->_menu = v; gc_write_barrier((void*)v); }
+// NativeApplication.icon: the ONE InteractiveIcon the platform hands out.
+Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_dock_icon_get(); }
+`);
+  }
+
   private emitDefinitions(): void {
     this.emitSwcResources();
     this.emitEmbedResources();
@@ -10363,6 +10919,51 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // way AIR reports the mode it is in) but the idle-timer part has no backend, so
     // a KEEP_AWAKE request is reported once rather than silently ignored.
     this.line('void NativeApplication_set_systemIdleMode(void* _this, char* value) { (void)_this; ASC_idle_mode = value; if (value != NULL && strcmp(value, "keepAwake") == 0) as_shell_unsupported((char*)"flash.desktop.NativeApplication.systemIdleMode (this build never inhibits the system idle timer)"); }');
+    // ---- NativeApplication: icon / menu / autoExit / capability bits (阶段二百五十五) ----
+    // The statics live here (not in the menu block below) because the setters and
+    // getters are emitted here; the menu subsystem further down only uses them.
+    this.line('static NativeMenu* ASC_app_menu = NULL;');
+    this.line('static NativeMenu* ASC_dock_menu = NULL;');
+    this.line('static as_array* ASC_menu_tags = NULL;');
+    this.line('static DockIcon* ASC_icon_singleton = NULL;');
+    this.line('static void as_menu_sync(NativeMenu* from);');
+    // autoExit is REAL, not just stored: the shared event loop keeps running with
+    // zero open windows while it is false. Measured on adl 51.4.1 (temp/deskprobe2/
+    // probe5-log.txt): autoExit=false + a hidden window keeps the app alive, which
+    // is the Dock-icon-only shape this demo's fallback needs.
+    this.line('static bool ASC_auto_exit = true;');
+    this.line('bool NativeApplication_get_autoExit(void* _this) { (void)_this; return ASC_auto_exit; }');
+    this.line('void NativeApplication_set_autoExit(void* _this, bool value) { (void)_this; ASC_auto_exit = value; sk_window_set_auto_exit(value ? 1 : 0); }');
+    // Measured: reading na.menu on adl hands back adl's OWN four-item menu, never
+    // null. This backend has no menu model of its own before the app installs one,
+    // so it answers an EMPTY NativeMenu rather than null -- the shape a real AIR app
+    // sees (a menu object) and the one an `if (na.menu) { ... }` guard expects.
+    this.line('NativeMenu* NativeApplication_get_menu(void* _this) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('if (ASC_app_menu == NULL) { ASC_app_menu = NativeMenu_new(); gc_write_barrier((void*)ASC_app_menu); }');
+    this.line('return ASC_app_menu;');
+    this.indent--;
+    this.line('}');
+    // Measured: assigning a NativeMenu really replaces the Cocoa menu bar (the
+    // process's AX tree then reports the new top-level item). AIR CRASHES on
+    // `na.menu = null` (the process dies inside the assignment), so a null write is
+    // refused loudly instead of being replicated.
+    this.line('void NativeApplication_set_menu(void* _this, NativeMenu* value) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('if (value == NULL) { as_shell_unsupported((char*)"flash.desktop.NativeApplication.menu = null (adl crashes on this; the menu is left unchanged)"); return; }');
+    this.line('ASC_app_menu = value; gc_write_barrier((void*)value);');
+    this.line('as_menu_sync(value);');
+    this.indent--;
+    this.line('}');
+    // AIR answers #2014 under adl ("Feature is not available at this time.") because
+    // the app is not installed; this build never had a login-item backend at all, so
+    // it reports the same error rather than inventing a boolean.
+    this.line('bool NativeApplication_get_startAtLogin(void* _this) { (void)_this; as_throw(IllegalOperationError_new((char*)"Error #2014: Feature is not available at this time.", 2014)); return false; }');
+    for (const [flag, macro] of [['supportsDockIcon', 'ASC_HAS_DOCK'], ['supportsSystemTrayIcon', 'ASC_HAS_TRAY'], ['supportsMenu', 'ASC_HAS_APP_MENU'], ['supportsStartAtLogin', 'ASC_HAS_LOGIN_ITEM'], ['supportsDefaultApplication', 'ASC_HAS_DEFAULT_APP']] as const) {
+      this.line(`bool NativeApplication_get_${flag}_static(void* _this) { (void)_this; return ${macro} ? true : false; }`);
+    }
     // applicationDescriptor: the AIR descriptor document itself, embedded at compile
     // time by `--air-app` (a program reads <id>/<versionNumber>/<initialWindow> from
     // it, e.g. cn/edoctor/utils/Config.as). A plain-source build has no descriptor,
@@ -12146,6 +12747,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('AsyncErrorEvent* AsyncErrorEvent_new(char* type, bool bubbles, bool cancelable, char* text) { AsyncErrorEvent* o = (AsyncErrorEvent*)gc_alloc(GCT_CLASS, sizeof(AsyncErrorEvent)); o->vtable = &AsyncErrorEvent_vt; AsyncErrorEvent_ctor(o, type, bubbles, cancelable, text); return o; }');
     this.line('void ContextMenuEvent_ctor(ContextMenuEvent* o, char* type, bool bubbles, bool cancelable, InteractiveObject* mouseTarget, InteractiveObject* contextMenuOwner) { Event_ctor((Event*)o, type, bubbles, cancelable); o->mouseTarget = mouseTarget; gc_write_barrier((void*)mouseTarget); o->contextMenuOwner = contextMenuOwner; gc_write_barrier((void*)contextMenuOwner); }');
     this.line('ContextMenuEvent* ContextMenuEvent_new(char* type, bool bubbles, bool cancelable, InteractiveObject* mouseTarget, InteractiveObject* contextMenuOwner) { ContextMenuEvent* o = (ContextMenuEvent*)gc_alloc(GCT_CLASS, sizeof(ContextMenuEvent)); o->vtable = &ContextMenuEvent_vt; ContextMenuEvent_ctor(o, type, bubbles, cancelable, mouseTarget, contextMenuOwner); return o; }');
+    this.emitDesktopMenus();
     // ---- flash.ui.ContextMenu family (stage 110) ----
     // Faithful data model (temp/constprobe on adl 51.4.1): a fresh menu owns an
     // empty customItems array and a ContextMenuBuiltInItems instance, and a display

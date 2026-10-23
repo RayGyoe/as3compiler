@@ -2,7 +2,11 @@
 
 > 本文记录 **`File.moveToTrash()` / `File.moveToTrashAsync()` / `File.spaceAvailable`** 三条成员
 > 的**实测语义**与实现选择（阶段二百四十三，v0.4.207）。它们是 macOS 清理工具 demo 的前置能力
-> （方案见 [`projects/mac-cleaner-demo-plan.md`](projects/mac-cleaner-demo-plan.md) 的 G1 / G2）。
+> （方案见工作区根 [`prune/mac-cleaner-demo-plan.md`](../../../prune/mac-cleaner-demo-plan.md) 的 G1 / G2）。
+>
+> **该方案已于 2026-10-23 移出本仓库**（原 `docs/projects/` 目录已撤），现位于工作区根 `prune/`
+> （与 `asaotui/` 同级）。因此上方相对链 `../../../prune/...` **仅在本地工作区可解析**；
+> 单独 clone `as3compiler` 时该链会断开（属预期，非失效）。
 >
 > **真值来源**：`adl 51.4.1`（macOS 26）双端探针 `temp/trashprobe/`（同一份 `Main.as` 由 `mxmlc` +
 > `adl` 跑，日志写文件——`adl` 的 stdout 不出现）。所有「AIR 怎样」的断言都能在该目录里找到对应

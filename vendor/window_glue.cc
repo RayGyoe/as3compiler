@@ -432,6 +432,13 @@ static WinCtx g_wins[SK_MAX_WINDOWS];
 // NativeApplication.exit() sets this; sk_run_loop consumes it and retires every
 // window through the normal teardown path (see sk_window_request_exit).
 static int g_exit_requested = 0;
+// NativeApplication.autoExit, inverted: 1 (the default) means the loop ends with
+// the last window, 0 means it keeps running with none (see sk_window_set_auto_exit).
+static int g_auto_exit = 1;
+// Applied from sk_run_loop; declared here because the loop is defined above the
+// menu glue at the bottom of this file.
+static void sk_menu_flush(void);
+static void sk_menu_ensure(void);
 // -1 until the first window exists; the "main" window is simply the first slot
 // ever filled, so it stays index 0 in every build.
 static int g_main = -1;
@@ -762,6 +769,10 @@ static double sk_pump_frame(void) {
   static int in_pump = 0;
   if (in_pump) return g_app_next;
   in_pump = 1;
+
+  // Keep the app's menu bar authoritative against AppKit's own launch-time menu
+  // (see sk_menu_ensure).
+  sk_menu_ensure();
 
   // Resize service + clock election. AIR runs ONE frame clock for the whole
   // application (Stage.frameRate is application-wide), so the cadence is computed
@@ -1215,11 +1226,16 @@ static void sk_sys_drag_step(WinCtx* c) {
 // the loop runs until no window is left (AIR's NativeApplication.autoExit
 // behaviour, which is what SDL's own "quit on last window close" matches).
 static void sk_run_loop(void) {
+  // Anything the app installed before the window opened is applied NOW (see
+  // sk_pending_menu): NSApp only exists once video is up.
+  sk_menu_flush();
   double now = (double)SDL_GetTicks();
   // Rolling deadline of the ONE application frame (see step 4).
   g_app_next = now;
   SDL_Event e;
-  while (sk_any_open()) {
+  // NativeApplication.autoExit = false outlives its last window (see
+  // sk_window_set_auto_exit), so the condition is not simply "a window is open".
+  while (sk_any_open() || !g_auto_exit) {
     // NativeApplication.exit(): retire everything and leave, even though windows
     // are still open. It goes through the same deferred teardown as a natural
     // close, so the CLOSE dispatch and the ordering are identical. A separate
@@ -1486,7 +1502,10 @@ static void sk_run_loop(void) {
       double t = (double)SDL_GetTicks();
       if (earliest > t) SDL_Delay((Uint32)(earliest - t));
     } else {
-      SDL_Delay(1);
+      // No window can hold the frame clock (none is visible), so there is nothing
+      // to pace against. Idle at ~60 Hz rather than spinning at 1000 Hz while an
+      // autoExit=false app waits for its Dock menu.
+      SDL_Delay(sk_any_open() ? 1 : 16);
     }
   }
   sk_service_destroy();
@@ -2376,6 +2395,223 @@ int sk_window_start_resize(int id, const char* edge) {
 void sk_window_request_exit(void) {
   g_exit_requested = 1;
 }
+
+// ---- flash.desktop icon family / NativeMenu glue (阶段二百五十五) ----
+// The generated C hands over a FLATTENED menu tree (see runtime.ts `sk_menu`), so
+// this translation unit never sees a generated C type. A click comes back through
+// `cb` carrying the model's own 1-based tag, which is why the tag is assigned
+// while flattening instead of being derived from an index here.
+// Measured (temp/statusprobe/statuslog1.txt): a real NSStatusItem/NSMenu works
+// inside an SDL app, and SDL's own Cocoa pump dispatches menu actions, so no
+// extra NSEvent loop is needed.
+typedef struct sk_menu_item_t { int kind; const char* label; int enabled; int checked; const char* key; int mods; int submenu; int tag; } sk_menu_item_t;
+typedef struct sk_menu_t { const char* title; int first; int count; } sk_menu_t;
+
+#if defined(__APPLE__)
+static void (*g_menu_cb)(int) = NULL;
+// Kept in statics so ARC-less retain counts never reach zero while the menu is
+// still on screen; both are replaced wholesale on the next install.
+static void* g_app_nsmenu = NULL;
+static void* g_dock_nsmenu = NULL;
+
+static void sk_send_void(void* o, const char* sel) { ((void (*)(void*, SEL))objc_msgSend)(o, sel_registerName(sel)); }
+static void* sk_send_obj(void* o, const char* sel) { return ((void* (*)(void*, SEL))objc_msgSend)(o, sel_registerName(sel)); }
+static void sk_send_void_obj(void* o, const char* sel, void* a) { ((void (*)(void*, SEL, void*))objc_msgSend)(o, sel_registerName(sel), a); }
+static void sk_send_void_int(void* o, const char* sel, long v) { ((void (*)(void*, SEL, long))objc_msgSend)(o, sel_registerName(sel), v); }
+static void sk_send_void_bool(void* o, const char* sel, int v) { ((void (*)(void*, SEL, signed char))objc_msgSend)(o, sel_registerName(sel), (signed char)(v ? 1 : 0)); }
+static int sk_send_int(void* o, const char* sel) { return (int)((long (*)(void*, SEL))objc_msgSend)(o, sel_registerName(sel)); }
+
+// AppKit's NSApp. NEVER call +[NSApplication sharedApplication] from here: menu
+// installation runs from AS3 code that executes BEFORE the window is opened, and
+// creating the application object that early leaves SDL unable to open a window at
+// all (measured: with the old sharedApplication() call the process stayed alive
+// with ZERO windows, while the identical program without the menu install showed
+// its window). So NSApp is read, and an install that arrives too early is queued
+// and applied from sk_run_loop, where video (and NSApp) are already up.
+extern id NSApp;
+static void* sk_nsapp(void) { return (void*)NSApp; }
+static void* sk_nsstring(const char* s) {
+  if (s == NULL) s = "";
+  return ((void* (*)(void*, SEL, const char*))objc_msgSend)((void*)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), s);
+}
+
+static void sk_menu_fired(void* self, SEL _cmd, void* sender) {
+  (void)self; (void)_cmd;
+  if (g_menu_cb != NULL) g_menu_cb(sk_send_int(sender, "tag"));
+}
+// The Dock asks the app DELEGATE (SDL installs its own) for the Dock menu.
+static void* sk_dock_menu_answer(void* self, SEL _cmd, void* sender) {
+  (void)self; (void)_cmd; (void)sender;
+  return g_dock_nsmenu;
+}
+
+// One action target, created on first use. Built through the ObjC runtime so this
+// file stays plain C++ (it is compiled as .cc, not .mm, and cannot include Cocoa).
+static void* sk_menu_target(void) {
+  static void* target = NULL;
+  if (target != NULL) return target;
+  Class cls = objc_getClass("SKMenuTarget");
+  if (cls == NULL) {
+    cls = objc_allocateClassPair((Class)objc_getClass("NSObject"), "SKMenuTarget", 0);
+    if (cls == NULL) return NULL;
+    class_addMethod(cls, sel_registerName("skFired:"), (IMP)sk_menu_fired, "v@:@");
+    objc_registerClassPair(cls);
+  }
+  target = sk_send_obj((void*)cls, "new");
+  return target;
+}
+
+static void* sk_nsmenu_new(const char* title) {
+  void* m = sk_send_obj((void*)objc_getClass("NSMenu"), "alloc");
+  m = ((void* (*)(void*, SEL, void*))objc_msgSend)(m, sel_registerName("initWithTitle:"), sk_nsstring(title));
+  // AppKit otherwise re-derives enabled/checked from the responder chain and
+  // overrides what the AS3 side set.
+  sk_send_void_bool(m, "setAutoenablesItems:", 0);
+  return m;
+}
+
+// Build one NSMenu (and, recursively, its submenus) out of the flattened model.
+static void* sk_menu_build(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root) {
+  if (menus == NULL || root < 0 || root >= nmenus) return NULL;
+  void* menu = sk_nsmenu_new(menus[root].title != NULL ? menus[root].title : "");
+  int first = menus[root].first;
+  for (int i = 0; i < menus[root].count; i++) {
+    int k = first + i;
+    if (k < 0 || k >= nitems) break;
+    if (items[k].kind == 1) {
+      sk_send_void_obj(menu, "addItem:", sk_send_obj((void*)objc_getClass("NSMenuItem"), "separatorItem"));
+      continue;
+    }
+    void* item = sk_send_obj((void*)objc_getClass("NSMenuItem"), "alloc");
+    item = ((void* (*)(void*, SEL, void*, SEL, void*))objc_msgSend)(item, sel_registerName("initWithTitle:action:keyEquivalent:"),
+        sk_nsstring(items[k].label), sel_registerName("skFired:"), sk_nsstring(items[k].key));
+    sk_send_void_obj(item, "setTarget:", sk_menu_target());
+    sk_send_void_int(item, "setTag:", items[k].tag);
+    // keyEquivalentModifiers is NOT applied: the six legal AS3 values (15..20) are
+    // not mapped to NSEventModifierFlags yet, and the caller reports that loudly
+    // instead of binding a wrong shortcut. See TODO.md 遗留待开发.
+    if (items[k].submenu >= 0) {
+      void* sub = sk_menu_build(menus, nmenus, items, nitems, items[k].submenu);
+      if (sub != NULL) {
+        sk_send_void_obj(sub, "setTitle:", sk_nsstring(items[k].label));
+        sk_send_void_obj(item, "setSubmenu:", sub);
+      }
+    } else {
+      sk_send_void_bool(item, "setEnabled:", items[k].enabled);
+      sk_send_void_int(item, "setState:", items[k].checked ? 1 : 0);
+    }
+    sk_send_void_obj(menu, "addItem:", item);
+  }
+  return menu;
+}
+
+// A menu tree installed before NSApp exists is kept here verbatim (the model is
+// arena-allocated by the generated C and never freed, so the pointers stay valid)
+// and applied by sk_menu_flush from the event loop's first turn.
+typedef struct {
+  int set;
+  const sk_menu_t* menus; int nmenus;
+  const sk_menu_item_t* items; int nitems;
+  int root; void (*cb)(int);
+} sk_pending_menu;
+static sk_pending_menu g_pending_app;
+static sk_pending_menu g_pending_dock;
+
+int sk_menu_supported(void) { return 1; }
+
+static int sk_menu_apply_app(const sk_pending_menu* p) {
+  if (p == NULL || !p->set || sk_nsapp() == NULL) return 0;
+  g_menu_cb = p->cb;
+  void* menu = sk_menu_build(p->menus, p->nmenus, p->items, p->nitems, p->root);
+  if (menu == NULL) return 0;
+  g_app_nsmenu = menu;
+  sk_send_void_obj(sk_nsapp(), "setMainMenu:", menu);
+  return 1;
+}
+
+static int sk_menu_apply_dock(const sk_pending_menu* p) {
+  if (p == NULL || !p->set || sk_nsapp() == NULL) return 0;
+  g_menu_cb = p->cb;
+  void* menu = sk_menu_build(p->menus, p->nmenus, p->items, p->nitems, p->root);
+  if (menu == NULL) return 0;
+  g_dock_nsmenu = menu;
+  void* del = sk_send_obj(sk_nsapp(), "delegate");
+  if (del == NULL) return 0;
+  Class dc = object_getClass((id)del);
+  if (!class_respondsToSelector(dc, sel_registerName("applicationDockMenu:"))) {
+    class_addMethod(dc, sel_registerName("applicationDockMenu:"), (IMP)sk_dock_menu_answer, "@@:@");
+  }
+  return 1;
+}
+
+// Apply anything queued while NSApp was still null. Idempotent: re-applying is the
+// same as a fresh install, so calling it every time a window opens is safe.
+static void sk_menu_flush(void) {
+  if (g_pending_app.set) sk_menu_apply_app(&g_pending_app);
+  if (g_pending_dock.set) sk_menu_apply_dock(&g_pending_dock);
+}
+
+// SDL installs its OWN main menu when the application finishes launching, which
+// happens on the first event pump -- i.e. AFTER sk_menu_flush has run. Rather than
+// guess that ordering, the loop re-asserts the app's menu whenever AppKit's
+// current main menu is not the one this app installed, and re-arms the Dock menu
+// answer if the delegate changed. Both are pointer comparisons: no rebuilding.
+static void sk_menu_ensure(void) {
+  void* app = sk_nsapp();
+  if (app == NULL) return;
+  if (g_app_nsmenu != NULL && sk_send_obj(app, "mainMenu") != g_app_nsmenu) {
+    sk_send_void_obj(app, "setMainMenu:", g_app_nsmenu);
+  }
+  if (g_dock_nsmenu != NULL) {
+    static void* armed_for = NULL;
+    void* del = sk_send_obj(app, "delegate");
+    if (del != NULL && del != armed_for) {
+      Class dc = object_getClass((id)del);
+      if (!class_respondsToSelector(dc, sel_registerName("applicationDockMenu:"))) {
+        class_addMethod(dc, sel_registerName("applicationDockMenu:"), (IMP)sk_dock_menu_answer, "@@:@");
+      }
+      armed_for = del;
+    }
+  }
+}
+
+int sk_menu_install_app(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
+  g_pending_app.set = 1;
+  g_pending_app.menus = menus; g_pending_app.nmenus = nmenus;
+  g_pending_app.items = items; g_pending_app.nitems = nitems;
+  g_pending_app.root = root; g_pending_app.cb = cb;
+  return sk_menu_apply_app(&g_pending_app);
+}
+
+int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
+  g_pending_dock.set = 1;
+  g_pending_dock.menus = menus; g_pending_dock.nmenus = nmenus;
+  g_pending_dock.items = items; g_pending_dock.nitems = nitems;
+  g_pending_dock.root = root; g_pending_dock.cb = cb;
+  return sk_menu_apply_dock(&g_pending_dock);
+}
+
+// NSInformationalRequest = 10, NSCriticalRequest = 0.
+void sk_dock_bounce(int critical) {
+  if (sk_nsapp() == NULL) return;
+  ((void (*)(void*, SEL, long))objc_msgSend)(sk_nsapp(), sel_registerName("requestUserAttention:"), critical ? 0 : 10);
+}
+#else
+int sk_menu_supported(void) { return 0; }
+int sk_menu_install_app(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
+  (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
+}
+int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
+  (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
+}
+void sk_dock_bounce(int critical) { (void)critical; }
+#endif
+
+// NativeApplication.autoExit = false: keep the loop alive with zero open windows
+// (the Dock-icon-only shape). Measured on adl 51.4.1: with autoExit=false and only
+// a hidden window the application keeps running, so this is AIR behaviour and not
+// an invention.
+void sk_window_set_auto_exit(int on) { g_auto_exit = on ? 1 : 0; }
 
 // Request teardown. The window is NOT destroyed here: it is retired at the next
 // loop frame boundary, which is what makes NativeWindow.closed stay false for the

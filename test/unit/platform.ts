@@ -590,6 +590,20 @@ function checkBackendParity(): string[] {
   // 反向：web 不得凭空多出 native 没有的 seam 符号（那说明两边已经分叉）。
   const webOnly = [...webDefs].filter((n) => !nativeDefs.has(n));
   check('web defines no sk_window_* seam symbol that native lacks', webOnly.length === 0);
+
+  // 阶段二百五十五 的菜单 seam 与上面同一类断裂：生成的 C 在 ASC_USE_WINDOW 下
+  // 无条件调用 sk_menu_install_app/sk_menu_install_dock/sk_menu_supported/
+  // sk_dock_bounce/sk_window_set_auto_exit，而 web 目标也只链接 web_glue.cc。
+  // 只实现 native 那一半 ⇒ `--target wasm --package web` 链接期报
+  // undefined symbol（浏览器本就没有菜单栏，但**符号必须在**、行为必须是空桩）。
+  const menuRe = /^(?:int|void)\s*\**\s*(sk_menu_\w+|sk_dock_bounce|sk_window_set_auto_exit)\s*\(/gm;
+  const menuSeam = (rel: string): Set<string> =>
+    new Set([...readNorm(join(root, rel)).matchAll(menuRe)].map((m) => m[1]));
+  const nativeMenu = menuSeam(join('vendor', 'window_glue.cc'));
+  const webMenu = menuSeam(join('vendor', 'web_glue.cc'));
+  const missingOnWeb = [...nativeMenu].filter((n) => !webMenu.has(n));
+  check('both backends define the whole flash.desktop menu seam',
+    nativeMenu.size >= 5 && missingOnWeb.length === 0);
   // 文字输入 seam 必须在两个后端都落地（这正是断链的那三个）。
   check('the composed-text seam is implemented by BOTH backends',
     ['sk_window_text_take', 'sk_window_text_edit_take', 'sk_window_set_text_input_rect']

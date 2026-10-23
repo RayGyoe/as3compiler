@@ -3546,3 +3546,126 @@ function checkEmitObjectTruthy(): string[] {
   return bad;
 }
 registerGroup('unit: emit/ObjectTruthy', checkEmitObjectTruthy);
+
+// ---- 阶段二百五十五：flash.desktop 图标族 + flash.display.NativeMenu --------
+// Every assertion below is a MEASURED adl 51.4.1 answer (raw probe output in
+// temp/deskprobe2/probe*.txt and probe7.txt). The end-to-end half -- that a click
+// in the macOS menu bar really fires Event.SELECT -- is driven through AX by
+// `example: native-menu.as` plus the G4App bundle run, not here.
+function checkEmitNativeMenu(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [menu] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [menu] ${label}`); }
+  };
+  const gen = (src: string) => generateC(parse(src)).c;
+  const c = gen([
+    'import flash.display.NativeMenu;',
+    'import flash.display.NativeMenuItem;',
+    'import flash.desktop.NativeApplication;',
+    'import flash.desktop.DockIcon;',
+    'var m:NativeMenu = new NativeMenu();',
+    'm.addItem(new NativeMenuItem("A"));',
+    'NativeApplication.nativeApplication.menu = m;',
+  ].join('\n'));
+
+  // ---- the classes actually exist (a phantom declaration would compile a call
+  // but leave the method table empty) ------------------------------------------
+  for (const cls of ['NativeMenu', 'NativeMenuItem', 'Icon', 'InteractiveIcon', 'DockIcon', 'SystemTrayIcon']) {
+    check(`${cls} is emitted`, c.includes(`${cls}_new(`) || c.includes(`flash.desktop::${cls}`) || c.includes(`flash.display::${cls}`));
+  }
+  check('the menu method table is populated',
+    c.includes('"addSubmenuAt"') && c.includes('"setItemIndex"') && c.includes('"getItemByName"'));
+
+  // ---- measured throwing constructors ---------------------------------------
+  for (const cls of ['InteractiveIcon', 'DockIcon', 'SystemTrayIcon']) {
+    check(`new ${cls}() throws #2012 with AIR's wording`,
+      c.includes(`Error #2012: ${cls}$ class cannot be instantiated.`));
+  }
+  check('new Icon() is allowed (no #2012 for Icon)', !c.includes('Error #2012: Icon$ class cannot be instantiated.'));
+
+  // ---- measured argument / range errors -------------------------------------
+  check('addItem(null) is #2007 item',
+    c.includes('Error #2007: Parameter item must be non-null.'));
+  check('getItemByName(null) is #2007 name',
+    c.includes('Error #2007: Parameter name must be non-null.'));
+  check('bitmaps = null is #2007 bitmaps',
+    c.includes('Error #2007: Parameter bitmaps must be non-null.'));
+  check('bounce(null) is #2007 value',
+    c.includes('Error #2007: Parameter value must be non-null.'));
+  check('a bad bitmaps entry is #2005 naming BitmapData',
+    c.includes('is of the incorrect type. Should be type BitmapData.'));
+  check('duplicate addItemAt is #2004',
+    c.includes('if (as_menu_index(m, item) >= 0) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return NULL; }'));
+  check('a duplicate addItem is a silent no-op',
+    c.includes('if (as_menu_index(m, item) >= 0) return item;  // measured: silent no-op'));
+  check('an out-of-range index is RangeError #2006',
+    c.includes('RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)'));
+
+  // ---- measured copy semantics ----------------------------------------------
+  check('items returns a fresh Array on every read',
+    /NativeMenu_get_items\(void\* _this\) \{\n {2}NativeMenu\* m = [\s\S]{0,120}as_array_new\(\);  \/\/ measured: a fresh Array on every read/.test(c));
+  check('getItemByName matches name, never the label',
+    c.includes('// measured: matches NativeMenuItem.name only -- NOT the label'));
+  check('clone does not carry data over',
+    c.includes('// measured: clone() does NOT carry the data field over'));
+  check('the modifier setter keeps only 15..20',
+    c.includes('n < 15 || n > 20) continue;  // measured: 0..14 and >=21 are dropped'));
+  check('the modifier getter answers a copy',
+    /NativeMenuItem_get_keyEquivalentModifiers\([\s\S]{0,400}?as_array_new\(\)/.test(c));
+
+  // ---- submenu parenting, measured with probe7 ------------------------------
+  check('addItem re-parents an existing submenu',
+    c.includes('adding an item that already carries a\n  // submenu re-parents that submenu to the menu it just joined.'));
+  check('removeItem detaches the submenu',
+    c.includes("// measured: a removed item's submenu loses its parent along with it."));
+
+  // ---- the flattened description handed to the glue -------------------------
+  // A menu's own items must be contiguous in the flat array: recursing inside the
+  // parent's loop made a second top-level menu vanish from the real menu bar.
+  const fill = /static int as_menu_fill\(NativeMenu\* m, as_menu_ctx\* c, int depth\) \{([\s\S]*?)\n\}/.exec(c);
+  check('as_menu_fill lays a menu out in one contiguous run',
+    fill != null && fill[1].indexOf('Pass 1:') >= 0 && fill[1].indexOf('Pass 2:') >= 0
+    && fill[1].indexOf('Pass 2:') > fill[1].lastIndexOf('c->menus[idx].count++'));
+  check('the click tag is 1-based into the tag table',
+    c.includes('c->items[k].tag = c->tag_base + k + 1;'));
+  check('a click dispatches select on the item AND its menu',
+    c.includes('EventDispatcher_dispatchEvent((EventDispatcher*)it, (Event*)Event_new((char*)"select", false, false));')
+    && c.includes('if (it->_menu != NULL) EventDispatcher_dispatchEvent((EventDispatcher*)it->_menu, (Event*)Event_new((char*)"select", false, false));'));
+
+  // ---- capability flags answer for the backend ------------------------------
+  const pre = RUNTIME_PREAMBLE;
+  check('the Dock and the app menu are Cocoa-only',
+    /#if defined\(ASC_USE_WINDOW\) && defined\(__APPLE__\)\r?\n#define ASC_HAS_DOCK 1\r?\n#define ASC_HAS_APP_MENU 1/.test(pre)
+    && /#else\r?\n#define ASC_HAS_DOCK 0\r?\n#define ASC_HAS_APP_MENU 0\r?\n#endif/.test(pre));
+  check('tray / login item / default app are never advertised',
+    pre.includes('#define ASC_HAS_TRAY 0')
+    && pre.includes('#define ASC_HAS_LOGIN_ITEM 0')
+    && pre.includes('#define ASC_HAS_DEFAULT_APP 0'));
+  check('the four capability getters read those macros',
+    ['ASC_HAS_DOCK', 'ASC_HAS_TRAY', 'ASC_HAS_APP_MENU', 'ASC_HAS_LOGIN_ITEM', 'ASC_HAS_DEFAULT_APP']
+      .every((m) => c.includes(`${m} ? true : false`) || c.includes(`${m} != 0`)));
+
+  // ---- NativeApplication.menu / autoExit ------------------------------------
+  check('na.menu is never null (AIR never answers null)',
+    c.includes('if (ASC_app_menu == NULL) { ASC_app_menu = NativeMenu_new();'));
+  check('na.menu = null is a reported no-op, not a crash',
+    c.includes('flash.desktop.NativeApplication.menu = null (adl crashes on this; the menu is left unchanged)'));
+  check('autoExit reaches the shared run loop',
+    c.includes('sk_window_set_auto_exit(value ? 1 : 0);'));
+  check('display() reports the missing modal backend instead of pretending',
+    c.includes('flash.display.NativeMenu.display (this backend cannot run a modal native menu)'));
+  check('startAtLogin throws #2014 like adl',
+    c.includes('as_throw(IllegalOperationError_new') && c.includes('2014'));
+  // An unapplied modifier set is REPORTED, not silently dropped: the glue binds
+  // the keyEquivalent without the flags, so the shortcut would fire as if the AS3
+  // code had asked for AppKit's defaults.
+  check('an unapplied keyEquivalentModifiers set is reported once',
+    c.includes('NativeMenuItem.keyEquivalentModifiers (this backend binds the keyEquivalent but does not apply the modifier flags yet)')
+    && c.includes('as_menu_note_mods(it);'));
+
+  console.log(`     [menu] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/NativeMenu', checkEmitNativeMenu);

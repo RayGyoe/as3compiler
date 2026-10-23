@@ -8847,6 +8847,40 @@ typedef struct as_gdraw {
 #define AS_CURSOR_IBEAM  1
 #define AS_CURSOR_HAND   2
 #define AS_CURSOR_BUTTON 3
+// ---- flash.desktop icon family / flash.display.NativeMenu glue (阶段二百五十五) ----
+// The generated C builds a FLATTENED description of a menu tree and hands it to
+// the window glue, so the glue never learns a generated C type. The tag is the
+// identification the native item carries back on a click; it is 1-based into the
+// C-side tag table, and submenu is an index into the menus array (-1 = none).
+typedef struct { int kind; const char* label; int enabled; int checked; const char* key; int mods; int submenu; int tag; } sk_menu_item;
+typedef struct { const char* title; int first; int count; } sk_menu;
+// Which desktop capabilities this BACKEND implements (see TODO 遗留/增强 records):
+// the Cocoa menu bar and Dock exist, a status item does not, and the login-item /
+// default-application services are not wired at all. Advertising them as present
+// would turn a documented if (supportsX) guard into a silent no-op.
+#if defined(ASC_USE_WINDOW) && defined(__APPLE__)
+#define ASC_HAS_DOCK 1
+#define ASC_HAS_APP_MENU 1
+#else
+#define ASC_HAS_DOCK 0
+#define ASC_HAS_APP_MENU 0
+#endif
+#define ASC_HAS_TRAY 0
+#define ASC_HAS_LOGIN_ITEM 0
+#define ASC_HAS_DEFAULT_APP 0
+#if defined(ASC_USE_WINDOW)
+extern int sk_menu_supported(void);
+extern void sk_menu_install_app(const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, void (*cb)(int));
+extern void sk_menu_install_dock(const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, void (*cb)(int));
+extern void sk_dock_bounce(int critical);
+extern void sk_window_set_auto_exit(int on);
+#else
+static inline int sk_menu_supported(void) { return 0; }
+static inline void sk_menu_install_app(const sk_menu* m, int nm, const sk_menu_item* i, int ni, int root, void (*cb)(int)) { (void)m; (void)nm; (void)i; (void)ni; (void)root; (void)cb; }
+static inline void sk_menu_install_dock(const sk_menu* m, int nm, const sk_menu_item* i, int ni, int root, void (*cb)(int)) { (void)m; (void)nm; (void)i; (void)ni; (void)root; (void)cb; }
+static inline void sk_dock_bounce(int critical) { (void)critical; }
+static inline void sk_window_set_auto_exit(int on) { (void)on; }
+#endif
 #ifdef ASC_USE_SKIA
 extern void* sk_surface_raster_new(int w, int h);
 extern int sk_surface_peek_pixels(void* surface, void** pixels, int* rowBytes);

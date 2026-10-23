@@ -3,8 +3,13 @@
 > This file records the **measured semantics** and the implementation choices for
 > **`File.moveToTrash()` / `File.moveToTrashAsync()` / `File.spaceAvailable`**
 > (stage two hundred and forty-three, v0.4.207). They are the prerequisite for the
-> macOS cleaner demo (see [`projects/mac-cleaner-demo-plan.md`](projects/mac-cleaner-demo-plan.md),
+> macOS cleaner demo (see the workspace-root [`prune/mac-cleaner-demo-plan.md`](../../../prune/mac-cleaner-demo-plan.md),
 > G1 / G2).
+>
+> **That plan left this repository on 2026-10-23** (the former `docs/projects/` directory was
+> removed); it now lives in the workspace-root `prune/` (a sibling of `asaotui/`). The relative
+> link `../../../prune/...` above therefore **resolves only inside the local workspace**;
+> a standalone `as3compiler` clone will see it break (expected, not a defect).
 >
 > **Source of truth**: `adl 51.4.1` (macOS 26), through the two-ended probe in
 > `temp/trashprobe/` (one `Main.as`, compiled with `mxmlc` and run by `adl`; the

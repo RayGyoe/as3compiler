@@ -533,4 +533,26 @@ void sk_window_set_text_input_rect(int id, double x, double y, double w, double 
 // Stage.showWindow, so it must be 0 rather than "none".
 int sk_window_main(void) { return 0; }
 
+// ---- flash.desktop menu seam (stage 255) ----
+// A browser page has no application menu bar and no Dock, so the whole seam is
+// inert here: the AS3 model (flash.display.NativeMenu / NativeMenuItem) still
+// works, and NativeApplication.supportsMenu / .supportsDockIcon answer false
+// because ASC_HAS_APP_MENU / ASC_HAS_DOCK are 0 outside ASC_USE_WINDOW && __APPLE__.
+// These definitions must still EXIST: the generated C references them
+// unconditionally under ASC_USE_WINDOW, so leaving them out is a wasm-ld
+// "undefined symbol: sk_menu_install_app", not a graceful degradation.
+typedef struct sk_menu_item_t { int kind; const char* label; int enabled; int checked; const char* key; int mods; int submenu; int tag; } sk_menu_item_t;
+typedef struct sk_menu_t { const char* title; int first; int count; } sk_menu_t;
+int sk_menu_supported(void) { return 0; }
+int sk_menu_install_app(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
+  (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
+}
+int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
+  (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
+}
+void sk_dock_bounce(int critical) { (void)critical; }
+// autoExit: a page cannot "exit", and the requestAnimationFrame loop is owned by
+// the host, so there is nothing to keep alive here. Accepted and ignored.
+void sk_window_set_auto_exit(int on) { (void)on; }
+
 }  // extern "C"

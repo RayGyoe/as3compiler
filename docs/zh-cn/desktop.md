@@ -1,0 +1,211 @@
+# 桌面集成（`flash.desktop` 图标族 + `flash.display.NativeMenu`）实测口径
+
+> 本文记录 **`Icon` / `InteractiveIcon` / `DockIcon` / `SystemTrayIcon`**、
+> **`NativeApplication.icon` / `menu` / `autoExit` / 五个能力位**，以及 **`flash.display.NativeMenu` /
+> `NativeMenuItem`** 的**实测语义**与实现选择（阶段二百五十五，v0.4.218 → v0.4.219）。
+>
+> 它们是 macOS 清理工具 demo 的 **G4a**（方案见工作区根
+> [`prune/mac-cleaner-demo-plan.md`](../../../prune/mac-cleaner-demo-plan.md)）。该方案已于 2026-10-23
+> 移出本仓库，故上方相对链**仅在本地工作区可解析**；单独 clone `as3compiler` 时该链会断开（属预期）。
+>
+> **真值来源**：`adl 51.4.1`（macOS 26）探针 `temp/deskprobe2/`（`Probe*.as` 由 `mxmlc` 编、`adl` 跑，
+> 日志写文件——`adl` 的 stdout 不出现）。其中 `probe7.txt` / `probe8.txt` 是本轮专门为「子菜单归属」
+> 与「主菜单形态」写的。**本文每一条「AIR 怎样」都有对应探针输出**，没有一条是从文档转述的。
+>
+> 一句话结论：**AIR 在 `flash.desktop` 里有完整的一等公民图标 API（不是「无对应物」）；
+> macOS 上 `supportsDockIcon` 为 `true`、`supportsSystemTrayIcon` 为 `false`；
+> `NativeApplication.menu` 不是 `null` 且可整条替换**。
+
+---
+
+## 1. 覆盖范围
+
+| 成员 | 状态 | 说明 |
+|---|---|---|
+| `Icon` | ✅ 实现 | **可实例化**（`new Icon()` 合法），`bitmaps` 默认 `null`（读它抛 `#1009`） |
+| `InteractiveIcon` | ✅ 实现（模型层） | `new InteractiveIcon()` 抛 `#2012`；`width`/`height` 是派生只读 |
+| `DockIcon` | ✅ 实现（含 Dock 右键菜单） | `new DockIcon()` 抛 `#2012`；**位图不上屏**（§7.2） |
+| `SystemTrayIcon` | ✅ 实现（模型层） | macOS 上 AIR 自己不提供（`#2012`），我们同样不提供 |
+| `NativeApplication.icon` | ✅ | **只读**（`mxmlc` 报「属性 icon 为只读」）；进程内单例 |
+| `NativeApplication.menu` | ✅ | 可读可写；`= null` 在 `adl` 上**崩溃**，我们**报明并保持原状**（§7.1） |
+| `NativeApplication.autoExit` | ✅ | 行为是真的：`false` + 无可见窗口时进程仍驻留 |
+| `supportsDockIcon` / `supportsMenu` | ✅ | 只在 `ASC_USE_WINDOW && __APPLE__` 报 `true`（§2） |
+| `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ 恒 `false` | 与本后端实际能力一致（§2） |
+| `NativeMenu` / `NativeMenuItem` | ✅ 全成员 | 列表语义、错误号、拷贝语义逐项对 `adl`（§4、§5） |
+| `NativeMenu.display()` | ⚠️ 报明 | 本后端跑不了模态原生菜单（§7.3） |
+| `keyEquivalentModifiers` | ⚠️ 报明 | 键绑上了，修饰键位**没有**翻译（§7.2） |
+
+---
+
+## 2. 能力位（`NativeApplication` 五个静态属性）
+
+| 属性 | `adl 51.4.1` / macOS | 我方 | 说明 |
+|---|---|---|---|
+| `supportsDockIcon` | **`true`** | `ASC_HAS_DOCK` | 仅在 `ASC_USE_WINDOW && __APPLE__` 为 `1` |
+| `supportsMenu` | **`true`** | `ASC_HAS_APP_MENU` | 同上 |
+| `supportsSystemTrayIcon` | **`false`** | `0` | macOS 无托盘；AIR 自己也不报 |
+| `supportsStartAtLogin` | **`true`** | **`0`** | **刻意分歧**：本后端没有登录项服务 |
+| `supportsDefaultApplication` | **`true`** | **`0`** | **刻意分歧**：本后端没有默认应用注册 |
+
+**为什么后两项要「比 AIR 报得少」**：这两条不是「AIR 支持的语法」，而是「本后端真的具备的能力」。
+照 `adl` 报 `true` 会让 `if (NativeApplication.supportsStartAtLogin) { … }` 走进一段**什么都不做**的
+分支——那正是 AGENTS §1.5 禁止的静默降级。报 `false` 时同一段守卫会**真的跳过**，调用方由此得知
+「这条路本构建走不通」。`startAtLogin` 的 **getter** 仍按 `adl` 抛 `#2014`
+（`IllegalOperationError`），不因能力位为 `false` 而改口径。
+
+> 无窗口后端（纯 C / wasm）时 `ASC_HAS_DOCK`/`ASC_HAS_APP_MENU` 同为 `0`，而 `NativeApplication.icon`
+> 仍返回一个完整的 `DockIcon` 模型对象——**模型可用、上屏与否由能力位回答**，两件事不混。
+
+---
+
+## 3. 图标族
+
+| 场景 | `adl 51.4.1` 实测 | 我方 |
+|---|---|---|
+| `new Icon()` | 合法 | 同 |
+| `new InteractiveIcon()` / `new DockIcon()` / `new SystemTrayIcon()` | 抛 `Error #2012: X$ class cannot be instantiated.` | 同号同文案 |
+| `new Icon().bitmaps` | 抛 `#1009`（默认 `null`） | 同 |
+| `icon === NativeApplication.nativeApplication.icon` | 同一实例 | 同（进程内单例） |
+| `dockIcon.bitmaps = [bd1, bd2]` | `width`/`height` 取**逐轴最大值** | 同 |
+| `bitmaps = []` | 宽高**保持上一次的值** | 同 |
+| `bitmaps = [1]` | 抛 `#2005: Parameter 0 is of the incorrect type. Should be type BitmapData.` | 同 |
+| `bitmaps = null` | 抛 `#2007: Parameter bitmaps must be non-null.` | 同 |
+| `bitmaps` getter | **每次返回新 `Array`**（改它不影响图标） | 同 |
+| `bounce(null)` | 抛 `#2007: Parameter value must be non-null.` | 同 |
+| `bounce("bogus")` | **不抛**（未知优先级按信息级处理） | 同（`NSCriticalRequest` / `NSInformationalRequest`） |
+| `dockIcon.menu = "string"` | 读回 `null`（类型不符即视为无菜单） | 同 |
+| `SystemTrayIcon.MAX_TIP_LENGTH` | `63` | 同 |
+
+---
+
+## 4. `NativeMenuItem`
+
+默认值（`new NativeMenuItem("Hello")`，逐项 `adl` 实测）：
+
+```
+label="Hello"  name=null  enabled=true  checked=false  isSeparator=false
+keyEquivalent=null  keyEquivalentModifiers=[15]  mnemonicIndex=-1  data=null
+```
+
+- **`toString()` 的形状被逐字复刻**：
+  `[NativeMenuItem label="Hello" keyEquivalent=null keyEquivalentChar=0 keyEquivalentModifiers={ 15 }]`
+- **`keyEquivalentModifiers` 的 setter 只留 `15..20`**，升序去重（`[18,16,16,3,99]` → `[16,18]`），
+  getter **每次返回新 `Array`**；非 `Array` 抛 `#1034`。
+- `keyEquivalent = ""` 读回 **`null`**（空串被归一成 `null`）。
+- `clone()` **不复制 `data`**（`adl` 实测：克隆件的 `data` 是 `null`）；`_submenu` 深拷贝。
+- 分隔符**没有** `NativeMenuItemSeparator` 类——`adl` 里那东西根本不存在（`mxmlc` 报「找不到定义」，
+  它是 Flex 的 `mx` 类）；正确写法是 ctor 第二参：`new NativeMenuItem("", true)`。
+
+---
+
+## 5. `NativeMenu`
+
+**`isSupported` 是静态成员**（`NativeMenu.isSupported` → `true`）；**实例读取抛 `#1069`**。
+
+| 场景 | `adl 51.4.1` 实测 | 我方 |
+|---|---|---|
+| `addItem(已存在)` | **静默 no-op** | 同 |
+| `addItemAt(已存在)` | 抛 `#2004` | 同 |
+| `addItem(null)` / `getItemByName(null)` | `#2007`（`Parameter item` / `Parameter name`） | 同 |
+| `removeItem(外面来的 item)` | `#2006: The supplied index is out of bounds.` | 同 |
+| `addItemAt(99)` / `addItemAt(-1)` / `getItemAt(-1)` / `getItemAt(99)` | `#2006` | 同 |
+| `addItemAt(numItems)` | 追加（不越界） | 同 |
+| `getItemByName` | 只认 **`name`**，不认 `label` | 同 |
+| `items` getter | **每次新 `Array`** | 同 |
+| `items = null` | 抛 `#1009`；`items = [1]` 抛 `#1034` | 同 |
+| `setItemIndex(外部 item)` | 静默 no-op | 同 |
+| `addSubmenu(sub, label)` | `sub.parent` 变成该菜单 | 同 |
+| `addItem(item)` 且 `item.submenu` 已有值 | **`submenu.parent` 变成该菜单**（`probe7.txt`） | 同（本轮补） |
+| `removeItem(item)` | `item.menu` 与 `item.submenu.parent` 都变 `null`（`probe7.txt`） | 同（本轮补） |
+| 同一个 item 加进第二个菜单 | 抛 `#2004` | 同 |
+| `clone()` | 深拷贝 item，`data` 不复制，克隆件的 `submenu.parent` 为 `null` | 同 |
+
+**点击回派（`probe4-log.txt`）**：原生点击让 **`NativeMenuItem` 与它所处的 `NativeMenu` 各收一次
+`Event.SELECT`**，`bubbles=false`、`cancelable=false`，`data` 原样保留。
+
+---
+
+## 6. 原生接线（macOS / Cocoa）
+
+菜单穿过胶水边界时**只以扁平描述出现**（`sk_menu` / `sk_menu_item`），胶水永远不认生成的 C 类型：
+
+```
+生成的 C（模型）             胶水（window_glue.cc）
+NativeMenu/NativeMenuItem  →  sk_menu[] + sk_menu_item[]（dfs 展平，子菜单是下标）
+点击 tag（1 基）            ←  SKMenuTarget.skFired: → as_menu_click_cb
+```
+
+四条硬性约束，全部由实测换来：
+
+1. **不能从生成代码里调 `+[NSApplication sharedApplication]`** —— 在 SDL 视频初始化之前调它会让进程
+   活着但**一个窗口都不建**。生成侧只读 `extern id NSApp`，拿不到就把安装**排队**，由
+   `sk_run_loop` 的第一次 `sk_menu_flush()` 落地。
+2. **AppKit/SDL 会在 launch 后装自己的主菜单**（在第一次事件泵里，晚于 `sk_menu_flush`），故事件循环
+   每帧 `sk_menu_ensure()`：主菜单指针不等于我们装的那份就重新 `setMainMenu:`，Dock 菜单的
+   `applicationDockMenu:` 被换过就重新 swizzle 上去。**都是指针比较，不重建**。
+3. **`autoExit` 是共享循环条件的一部分**：`while (sk_any_open() || !g_auto_exit)`，没有可见窗口时
+   按 ~60 Hz 空转（`SDL_Delay(16)`）。这既是 AIR 的 `autoExit=false` 语义，也是「只有
+   Dock 图标 / 菜单栏」形态能活下来的前提。
+4. **菜单树里一个菜单的直属项在扁平数组里必须连续**（`first..first+count`）。第一版在父循环里递归，
+   子菜单的项被插进父的区间中间，**第二个顶级菜单直接从菜单栏消失**——这是本轮唯一一次靠肉眼
+   （AX 查菜单栏）发现、再看代码确认的结构性 bug。
+
+---
+
+## 7. 平台边界与残余（如实报明）
+
+### 7.1 `NativeApplication.menu = null` 在 `adl` 上**崩溃**，我们不做同样的事
+
+`adl 51.4.1` 实测：赋 `null` 会让 adl 进程直接死掉。我方按 §1.5「不静默改写 AIR 已定义行为」处理为
+**报明 + 保持原状**（`as_shell_unsupported("flash.desktop.NativeApplication.menu = null …")`）。
+
+### 7.2 两处「模型对、像素/修饰键还没到位」（各报明一次）
+
+- **`DockIcon.bitmaps` 不上屏**：模型（列表、`#2005`/`#2007`、宽高派生）完全对齐，但**没有把位图画到
+  Dock 图标上**。照 AIR 写这段代码能跑、行为是「图标不变」。**报明一次**，登记在 `TODO.md` 遗留表。
+- **`keyEquivalentModifiers` 不翻译成 `NSEventModifierFlags`**：`keyEquivalent` 本身绑得上，
+  六个合法值（`15..20`）**没有映射**，于是快捷键会按 AppKit 默认修饰键触发。**报明一次**，
+  绝不静默绑一个错的快捷键。登记在 `TODO.md` 遗留表。
+
+### 7.3 `NativeMenu.display()` 没有模态菜单后端
+
+`display(stage, x, y)` 在 AIR 里弹一个**模态**原生菜单。本后端的循环是非阻塞事件泵，没有可嵌套的
+模态运行器 ⇒ **报明**并返回 `undefined`（不假装弹过）。
+
+### 7.4 主菜单第一个顶级项会被 macOS 改名（**平台行为，非缺陷**）
+
+`adl` 的菜单栏是 `Apple, Alpha, Beta`（**没有**应用菜单槽），而 AOT 应用是
+`Apple, <应用名>, Prune` —— 因为 AppKit 把 `mainMenu` 的 **item 0** 当作应用菜单，**用应用名覆盖它的
+标题**。这不是我们的模型错了（`na.menu.items` 里 label 仍是 `First`），是 Cocoa 的规矩；
+`adl` 不受影响只是因为它自己早就占着那个槽。
+
+**约定**：AOT 应用**第一个顶级菜单就是应用菜单**（和任何原生 Mac 应用一样），宏观上更自然；
+要保住第一项自己的标题，就把它当应用菜单来写（放 `Quit` 之类），从第二项起才是业务菜单。
+
+### 7.5 Windows / wasm
+
+能力位在非 `ASC_USE_WINDOW || !__APPLE__` 时全为 `0`，`sk_menu_*` 退化为 `static inline` 空桩。
+Windows 侧将来接 `HWND` 菜单栏是**独立阶段**的事；wasm 没有原生菜单概念，能力位为 `0` 即为正确的
+诚实回答。
+
+---
+
+## 8. 验收与证据
+
+| 项 | 证据 |
+|---|---|
+| 模型层 66 条断言（纯 C 构建，无窗口后端） | `examples/native-menu.as` → `native-menu: 66 checks passed` |
+| 生成 C 的 38 条源级钉 | `test/unit/emit.ts` 的 `unit: emit/NativeMenu` |
+| 真菜单栏 + 真点击 | `temp/G4App.app`（`NSPrincipalClass=NSApplication`）：AX 读到 `Apple, G4App, Prune`，点 `Prune → PruneTwo` 后 AS3 的 `SELECT` 监听器真的跑了（写 `/tmp/g4click.txt` = `two`） |
+| Dock 右键菜单 | `sk_menu_install_dock` 把 `applicationDockMenu:` swizzle 到 SDL 的 delegate 上（真右键点击未自动化） |
+| `autoExit=false` 驻留 | 同一 bundle：关窗后进程仍在，直到 `NativeApplication.exit()` |
+| 主菜单形态对照 | `probe8.txt`（`adl`：`Apple, Alpha, Beta`）vs 同一模型的 AOT 应用（§7.4） |
+
+---
+
+## 9. 未做（不属于本阶段）
+
+- **G4b：macOS 菜单栏 `NSStatusItem`** —— 属**增强**（AIR 在 macOS 上没有对应物：`supportsSystemTrayIcon`
+  = `false`），必须 opt-in，**本阶段未实施**。可行性探针已通过（`temp/statusprobe/statusprobe.mm`：
+  SDL 窗口 + `NSStatusBar` + `NSMenu`，点击回调经 SDL 自己的 Cocoa 泵派发，无需手写 `NSEvent` 泵）。
+  设计上它以纯 AIR `DockIcon` 形态为退路（Dock 图标 + Dock 右键菜单 + `autoExit=false`）。

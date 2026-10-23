@@ -14911,7 +14911,107 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
   这是有意的：`unit: reach/as-class-path` 系列只钉**机制**（身份规则、硬报错文案、真编真跑），钉不到
   「参考应用真的这么编」——而后者恰恰是本次两红的现场。
 
+### 阶段二百五十五：`flash.desktop` 图标族 + `flash.display.NativeMenu`（v0.4.218 → v0.4.219）✅ 已完成
+
+**一、为什么会有这一阶段**
+
+上一轮的 `### 遗留待开发` 追加里新登记了一行，起因是 macOS 清理工具 demo 的 **G4**：原方案把
+「菜单栏常驻」整条判为「AIR **没有**对应物 ⇒ 增强」。这条判断**是错的** —— AIR 在 `flash.desktop` 里
+有一套完整的一等公民图标 API（`Icon` → `InteractiveIcon` → `DockIcon`/`SystemTrayIcon`，外加
+`NativeApplication.icon`/`menu`/`autoExit` 与 `supports*` 能力位，以及 `flash.display.NativeMenu`），
+而我们**零实现**：照 AIR 写这行代码连编译都过不去。按 AGENTS §1.5 的硬判据，这是**遗留欠账**
+（同一输入 `adl` 能跑对我们跑不出），不是增强 ⇒ 走正常阶段 + 版本号，**不给 `--features` 开关**。
+
+因此 demo 的 G4 拆成两半：**G4a**（本阶段的图标族与 `NativeMenu`，遗留欠账）与 **G4b**
+（macOS `NSStatusItem` 菜单栏状态项，真增强 —— `adl` 在 macOS 上 `supportsSystemTrayIcon` 为 `false`，
+本阶段**未实施**）。G4a 落地后顺手交出一个**零新平台胶水**的退路形态：
+Dock 图标 + `dockIcon.menu` 右键菜单 + `autoExit=false`。
+
+**二、实测（`adl 51.4.1` / macOS，探针 `temp/deskprobe2/`）**
+
+全部结论来自 `Probe*.as` 的 `adl` 真跑（日志写文件，`adl` 不出 stdout）；口径全文见
+[`docs/zh-cn/desktop.md`](docs/zh-cn/desktop.md)（英文 [`docs/en/desktop.md`](docs/en/desktop.md)）。要点：
+
+- **能力位**：`supportsDockIcon`=`true`、`supportsMenu`=`true`、`supportsSystemTrayIcon`=**`false`**、
+  `supportsStartAtLogin`=`true`、`supportsDefaultApplication`=`true`；`NativeWindow.supportsMenu`=`false`。
+- **图标族**：`new Icon()` 合法；`new InteractiveIcon()`/`DockIcon()`/`SystemTrayIcon()` 抛
+  **`#2012 X$ class cannot be instantiated.`**；`na.icon` 是 `DockIcon` 且**只读**（`mxmlc` 报「属性 icon 为只读」）；
+  `bitmaps` 默认 `null`（读它 `#1009`）、赋非 `BitmapData` 抛 `#2005`、置 `null` 抛 `#2007`、
+  getter **每次回新 `Array`**、`width`/`height` 取**逐轴最大值**且清空后**保持旧值**；
+  `bounce(null)` 抛 `#2007`、`bounce("bogus")` **不抛**；`SystemTrayIcon.MAX_TIP_LENGTH`=`63`。
+- **`NativeMenu`**：`isSupported` 是**静态**（实例读抛 `#1069`）；重复 `addItem` **静默 no-op**、
+  重复 `addItemAt` 抛 `#2004`；外来项 `removeItem` 与越界 `getItemAt`/`addItemAt` 抛 `#2006`；
+  `null` 参抛 `#2007`；`getItemByName` **只认 `name`**；`items` getter 回拷贝、`items = null` 抛 `#1009`；
+  `clone()` 深拷贝且**不复制 `data`**。
+- **`probe7.txt`（本轮专为子菜单归属写的）**：`addItem` 一个**已带 `submenu`** 的 item 会把该子菜单的
+  `parent` 改成新菜单；`removeItem` 同时清掉 `item.menu` 与 `item.submenu.parent`；`clone()` 出来的
+  item 其 `submenu.parent` 是 `null`。**这三条我方原先都没有**，本轮补上。
+- **`probe8.txt`（主菜单形态）**：`na.menu = bar` 在 `adl` 上**成功**且 `na.menu === bar`；菜单栏变成
+  `Apple, Alpha, Beta` —— **没有应用菜单槽**。（对照见「五、如实报明」第 4 条。）
+- **点击**（`probe4-log.txt`）：`SELECT` 同时派给 **item** 与**它所在的 `NativeMenu`**，
+  `bubbles=false`/`cancelable=false`，`data` 原样保留。
+- **`na.menu = null` 让 `adl` 崩溃** —— 我方改为**报明 + 保持原状**。
+
+**三、落地**
+
+- **`src/symbols.ts`**：真类注册 `NativeMenuItem`/`NativeMenu`/`Icon`/`InteractiveIcon`/`DockIcon`/`SystemTrayIcon`
+  （字段、getter/setter、能力位与错误的形状全按实测）；`NativeApplication` 补 `icon`/`menu`/`autoExit`/
+  `startAtLogin` 与五个静态能力位。顺带修了三处**真会挡住编译**的注册缺陷：缺 `implements: []`、
+  `Icon`/`NativeMenuItem` 被误标 `final`（`InteractiveIcon extends Icon`、`ContextMenuItem extends NativeMenuItem`
+  因此报错）、`ContextMenuItem` 的继承链需要 `NativeMenuItem` 非 final。
+- **`src/emit.ts`**：新增 `emitDesktopMenus()`（约 600 行 C）：六个类的构造/方法、`as_menu_index`、
+  扁平化 `as_menu_measure`/`as_menu_fill`、点击回调 `as_menu_click_cb`、同步 `as_menu_sync`、
+  `as_dock_icon_sync`，以及 `NativeApplication_{get,set}_autoExit`、`get/set_menu`、`get_startAtLogin`
+  与五个能力位静态。
+- **`src/runtime.ts`**：把 `sk_menu`/`sk_menu_item` 描述结构与 `ASC_HAS_*` 宏**移出** `#ifdef ASC_USE_SKIA`
+  （窗口臂与纯 C 臂都要看得见），`#else` 臂给出 `static inline` 空桩。
+- **`vendor/window_glue.cc`**：ObjC-runtime 直写的 `sk_menu_build`（递归建 `NSMenu`、`setAutoenablesItems:NO`、
+  `SKMenuTarget` + `skFired:`、模型 tag 落到 `setTag:`）、`sk_menu_install_app`/`sk_menu_install_dock`
+  （后者把 `applicationDockMenu:` swizzle 到 SDL 的 delegate 上）、`sk_dock_bounce`、
+  `sk_window_set_auto_exit` + 循环条件 `while (sk_any_open() || !g_auto_exit)`、`sk_menu_flush`/`sk_menu_ensure`。
+
+**四、验收（实测）**
+
+- `node src/index.ts examples/native-menu.as --run` ⇒ `native-menu: 66 checks passed`（纯 C 构建、无窗口后端；
+  模型层与后端无关，所以**这套断言在无窗口构建下也必须绿**）。
+- `node --test --test-name-pattern='emit/NativeMenu' test/unit/emit.ts` ⇒ **38 项全绿**（生成 C 的源级钉：
+  错误号/文案、拷贝语义、`15..20` 过滤、两趟扁平化的连续性、能力位双分支、`autoExit` 接线、
+  `na.menu = null` 的报明、`keyEquivalentModifiers` 的报明）。
+- **真机端到端**（`temp/G4App.app`，`Info.plist` 带 `NSPrincipalClass=NSApplication`）：
+  AX 读到菜单栏 `Apple, G4App, Prune`；用 System Events 点 `Prune → PruneTwo` 之后，AS3 的
+  `SELECT` 监听器**真的执行了**（写 `/tmp/g4click.txt` = `two`）。关窗后进程仍驻留（`autoExit=false`），
+  直到 `NativeApplication.exit()`。
+- `--manifest examples/window.build.example.json` 与纯 C 两条路都 **Build successful**。
+
+**五、如实报明**
+
+1. **`DockIcon.bitmaps` 不上屏**：模型逐项对齐，但像素从未交给 AppKit。第一次赋值时
+   `as_shell_unsupported` **报明一次**，已登记 `### 遗留待开发`（含落地方法）。
+2. **`keyEquivalentModifiers` 没翻译成 `NSEventModifierFlags`**：`keyEquivalent` 绑得上，六个合法值
+   （`15..20`）没映射 ⇒ 快捷键会按 AppKit 默认修饰键触发。同样**报明一次**（`as_menu_note_mods`），
+   绝不静默绑一条错的快捷键，已登记。
+3. **`NativeMenu.display()` 无模态菜单后端**：非阻塞事件泵里没有可嵌套的模态运行器 ⇒ 报明并返回
+   `undefined`，已登记。`dispatchContextMenuSelect` 回 `undefined` 与 `adl` 一致，不算缺口。
+4. **能力位刻意比 AIR 报得少**：`supportsStartAtLogin`/`supportsDefaultApplication` 在 `adl` 上是 `true`，
+   我方是 `false`（没有登录项 / 默认应用后端）。理由：能力位描述的是**本后端真有什么**，报 `true` 会把
+   `if (supportsX)` 变成静默 no-op —— 那正是 §1.5 禁止的降级。`startAtLogin` 的 **getter** 仍按 `adl` 抛 `#2014`。
+5. **主菜单第一项会被 macOS 改名**（平台行为，非缺陷）：`adl` 的菜单栏是 `Apple, Alpha, Beta`（它自己占着
+   应用菜单槽），AOT 应用是 `Apple, <应用名>, Prune` —— AppKit 把 `mainMenu` 的 **item 0** 当应用菜单并
+   **用应用名覆盖它的标题**。我们的模型没错（`na.menu.items[0].label` 仍是 `First`）。约定写进
+   `docs/zh-cn/desktop.md` §7.4：**AOT 应用第一个顶级菜单就是应用菜单**，业务菜单从第二项起。
+6. **Windows / wasm**：能力位全 `0`、`sk_menu_*` 退化为空桩。Windows 的 `HWND` 菜单栏属独立阶段；
+   wasm 没有原生菜单概念，`0` 就是诚实答案。
+7. **G4b（`NSStatusItem` 菜单栏状态项）本阶段未实施** —— 它是**真增强**（`adl` 在 macOS 上
+   `supportsSystemTrayIcon` = `false`），按 §1.5 必须 opt-in。可行性已单独验过
+   （`temp/statusprobe/statusprobe.mm`：SDL 窗口 + `NSStatusBar` + `NSMenu`，点击经 **SDL 自己的 Cocoa 泵**
+   派发，无需手写 `NSEvent` 泵）。设计上以纯 AIR `DockIcon` 形态为退路。
+8. **一处本轮自捉的结构性 bug（值得记下）**：扁平化最初在父循环里递归，子菜单的项被插进父的
+   `[first, first+count)` 区间中间，**第二个顶级菜单直接从菜单栏消失**。是靠 AX 读菜单栏
+   （`Apple, G4App` 里少了 `Prune`）发现的，不是靠单测 —— 故本轮补了
+   「`as_menu_fill` 两趟、父项区间必须连续」的源级钉，并把「菜单栏真的变了」列进端到端验收。
+
 ### 遗留待开发
+> **2026-10-23 追加（非阶段：`flash.desktop` 图标族实测 —— 一条「AIR 无对应物」的错判被推翻）**：**新登记 1 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**100 → 101 项**（`未开始` **75 → 76**，其余不变）。起因是 macOS 清理工具 demo 方案（[`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md)）把 **G4 菜单栏状态项**整条判为「AIR **没有**对应物 ⇒ 增强」——**这条是错的**：AIR 在 `flash.desktop` 里有完整的一等公民图标 API（详见新登记行），我们**零实现**（连编译都过不去）⇒ 按 §1.5 硬判据是**遗留欠账**，故**新登记 1 行**；**改写 1 行**是「`NativeWindow` 家族剩余面」里「`NativeApplication.menu` 也只能诚实回 `null`」那句 —— 实测**推翻**（详见行内）。**因此 demo 的 G4 拆为 G4a（图标族，遗留）/ G4b（macOS `NSStatusItem`，增强）**，方案文档与 `TODO.md` 的 demo 节已同步。**证据**（全部 `adl 51.4.1` / macOS）：`temp/desktopprobe/{Main.as,adl_out.txt}`（能力位与 `DockIcon` 面）、`{Surface.as,surface.txt}`（`describeType` 权威成员面）、`{MenuProbe.as,menu.txt}`（菜单面）。**（2026-10-23 阶段二百五十五 更新）**：该行已**清偿并移出本表**（图标族 + `NativeMenu` 子系统按 AIR 面逐项落地，见下文阶段条目）；同时按「落地后如实登记残余」的规矩**新登记 3 行**（`DockIcon.bitmaps` 不上屏 / `keyEquivalentModifiers` 未译成 `NSEventModifierFlags` / `NativeMenu.display()` 无模态后端）⇒ 表内项数 **101 → 103**（移出 1、新增 3），分状态 **`未开始` 76 → 78**，其余不变（`部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1）。
 > **2026-10-22 追加（阶段二百四十三：`File.moveToTrash` / `spaceAvailable` —— 废纸篓与卷容量的实测口径）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数重数（`|` 开头行 − 表头 − 分隔）**98 → 100 项**；分状态 `未开始` **73 → 75** / `部分完成` 19 / `已修` 4 / `调研完成` 1 / `已记录` 1（合计 100）。**另报一处口径差**：上一轮（阶段二百四十二）note 写的绝对项数是 **99**，而按 HEAD（`e92ae27`）实测是 **98 行 / `未开始` 73**——即该轮的**增量**（+1）没错，绝对行数多记了 1；本轮起按实测行数记账。本轮落地的是 macOS 清理工具 demo 的 **G1 + G2**（方案 [`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md)），两条都有 `adl 51.4.1` 双端探针（`temp/trashprobe/`）垫底，属于「`adl` 有、我们跑不出」⇒ 按 §1.5 是**遗留欠账**、阶段内修净，故落地本身**不占表**。**两条实测结论推翻了纸面**：① `moveToTrash()` 是 **`void`** 而不是参考文档写的 `Boolean`（`f.moveToTrash().toString()` 在 `mxmlc` 编译期就报错、`adl` 求值 `undefined`）——若照文档实现成 `Boolean`，`if (f.moveToTrash())` 会在两端给出相反结论；② G2 记的 `File.getSpaceAvailable` **在 AIR 里根本不存在**（`in` 为 `false`，取它抛 `#1069`），真名是属性 `spaceAvailable`，而它**从阶段六十四 起就已落地** ⇒ 本轮没有新增成员，只校正了它的作用域（只对普通文件/目录作答：`/dev/null` 在 `adl` 是 `0`）。**新登记的第 1 行**是 Windows/wasm 的回收站后端（不写盲代码的理由见行内）；**第 2 行**是本轮顺手量出来的族级缺口——`adl` 上空 `File` 的**每一个**成员都抛 `#2037`（连 `nativePath` getter 都抛），而我们把它当普通字段处理，修它要先把 `nativePath` 变成访问器，故不在本轮半修。**口径**：doc 落 `docs/{zh-cn,en}/filesystem.md`（新建），钉子 `unit: emit/FileMoveToTrash`（17 项）+ `examples/move-to-trash.as`（`EXAMPLE_ENV` 把 `HOME` 指到 `temp/trash-home`，测试不污染开发机废纸篓）。
 > **2026-10-22 追加（阶段二百四十二：`TextField` 的滚动与插入光标 —— 用户五条报障的实测结案）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数 **98 → 99 项**（`未开始` **72 → 73**，其余不变）。用户用 `air-native` 报的五条里，**两条是真缺陷且同一个方向**：`hscroll` 是阶段七十二 我们**发明**的 `TextField` 属性（`adl` 赋值抛 `#1056`、`mxmlc` 编译期就拒），`maxScrollH` 被它挡住 ⇒ 任何 AIR 程序的 `maxScrollH` 恒 0、`scrollH` 被夹成 0，长文本打字永远不滚动；另一条是插入光标的闸门漏了 `type` 判断 ⇒ 动态可选字段也画光标（`adl` 实测无）。两条都在本阶段修掉（删属性 + `as_tf_scroll_after_edit` + 闸门加 `as_tf_is_input`），**不占表**；**新登记的第 1 行**是同一面上的**读数残差**：打字过程中 `adl` 的 `maxScrollH` 比 `textWidth+4-width` 多约一步（60 字符 274 vs 我们 236），而程序化赋 `scrollH` 时又回到旧值 ⇒ 它依赖编辑历史，不是纯函数，我们没复刻（光标可见性不受影响）。另三条报障（`.text` 读不到 / 输入框无光标 / 鼠标点不动选不中）经双端探针证明**两端一致**，不是缺陷——其中「输入框无光标」上一轮是**测量口径错**（扫描只取裁剪图中段）。
 >
@@ -15075,7 +15175,7 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 | `htmlText` 多行 run 的**行高**偏大约 1.5×；规则里的 `leading` 未折进 run | 未开始（2026-10-13 阶段一百四十八 实测登记） | 同段 htmlText、同字段宽（`temp/ssprobe/`，带 Skia）：**行数与宽度逐值吻合**（A: n=5 w=55.03 vs AIR 51.05；A5: n=1 w=157.37 vs 155.3；A9: n=1 16.65 vs 16.1），**行高**却是我们 `h=45` vs AIR `30.1`（A2 60 vs 47.55、A6 36 vs 16.1、A3 20 vs 8.4）。**未做单变量 A/B**，故不排除部分来自「规则 `leading` 未生效」（我们只把 `color`/`fontSize`/`fontFamily`/`fontWeight`/`fontStyle`/`textDecoration` 折进 run）。**顺带登记**：`TextField.getLineText` 未实现（响亮 `undefined method`）⇒ 采证据前先补它 | 独立立项：① 补 `getLineText`，逐 run 采 `adl` 的行盒高度，判定 AIR 是按 run 行盒还是整段行盒；② 把规则 `leading` 折进该 run 的 `TextFormat`（`as_ss_str(rule, "leading")` 现未读）；③ 复核 `numLines` 的口径（AIR 计入尾部空行） |
 | `Stage.fullScreenWidth/Height` 取「完整显示模式」而非 AIR 的「可用区」 | **部分完成**（**本轮实测发现**，八十九·六十八；**2026-10-20 阶段二百零六 收窄到只剩 macOS 一端**：Windows 实测该规则**不成立** —— `adl` 的 `Stage.fullScreenWidth/Height` 与 `Capabilities.screenResolutionX/Y` **同值** `2560x1707` = **整块**显示器（DIP），可用区在那台机器上是 `3840x2488` 物理（`1659` DIP）且只出现在 `Screen.visibleBounds`） | 同机同刻三端对照：`adl` **1800x1137** vs 我们 **1800x1169**（同一显示器时 Δ = 32 = 菜单栏高度）；换到外接显示器后 `adl` 报 **2560x1408**（= 2560x1440 − 32），规则**跨两种显示模式复现**。即 AIR 取**窗口所在显示器的可用边界**，我们取 `SDL_GetDisplayBounds`（display 0 的**整块**显示器；阶段一百七十三 由 `SDL_GetCurrentDisplayMode` 改来 —— 两者都是整块、只是空间不同，macOS 上同空间）。**多显示器下两者甚至不在同一块屏**（native 报内建 1800x1169、adl 报外接 2560x1408），修复须一并考量「窗口在哪块屏」——这与当前实现的「总是 display 0」是两件事。web 侧同源：我们读 `window.screen`（无头 Chrome 实测 800x600，真实浏览器则是整屏尺寸），而舞台其实只有 canvas 那么大 | 独立立项：native 侧把 `SDL_GetCurrentDisplayMode` 换成「窗口所在显示器的可用边界」（`SDL_GetDisplayUsableBounds` + `SDL_GetWindowDisplayIndex`），web 侧把 `window.screen` 换成 `screen.availWidth/availHeight`。**（2026-10-20 阶段二百零六 收窄）**：这条**只对 macOS 成立**（Windows 上 AIR 也取整块，见状态列），故两端**不可共用同一条修法**；且仍只能落在 `Stage` 侧（本行末段 2026-10-02 的「不得顺手把 `Capabilities` 换成可用区」继续有效）。**注意**：`Starling` 的 `ScreenSetup` 正是按这两个值定世界尺寸（`examples/Flappy-Starling` 的布局即由此而来），改动会连带影响所有 GUI 示例与 Starling 场景 ⇒ 与上一行**同批回归**。**2026-10-02 实测澄清（防误修）**：`Capabilities.screenResolutionX/Y` 是**另一个量**——同机同刻 `adl` 报 **1800x1169**、我们也是 **1800x1169**（**已对齐**，`as_cap_screen_resolution_x/y` 走的就是 `SDL_GetCurrentDisplayMode`）；只有 `Stage.fullScreenWidth/Height` 才有 1800x1137 vs 1800x1169 的差。故本行修法**只能落在 `Stage` 侧**，不得顺手把 `Capabilities` 的口径一并换成「可用区」（详见下表新增的 `Screen` 行） |
 | 多个 `beginFill/endFill` **组**的嵌套：`adl` 两组都填充，我们只有**一条路径** ⇒ even-odd 把它当洞 | 未开始（2026-10-04 阶段九十四·二十二 实测登记，`temp/editprobe/probe26.py` + `snap_ed26_{adl,aot}.png`） | 同一个 200x200 外框 + 60..140 内框：**一次 fill 两个同向子路径** ⇒ 内层中心 adl `FFFFFF`（洞）、我们 `FFFFFF`（洞）✓ 一致；**两个独立 fill 组** ⇒ 内层中心 adl `FF0000`（填充）、我们 `FFFFFF`（洞）✗。根因是本实现「一个 Graphics = 一条 SkPath + 一对 paint」（注释里已写为单路径子集），fill 组边界在记录几何时丢失 | 立项：把 `Graphics` 的绘制记录成**组**（每组一条路径 + 一对 paint），渲染与命中都按组并集；代价是数据结构与指纹（`as_fp_*`）都要跟着改，属独立阶段。顺带定 **`Graphics` 填充规则的第二个判据**（自相交路径：nonzero 填满星形中心、even-odd 挖空；现在只有「同向嵌套子路径成洞」这一条实测支撑 even-odd） |
-| `NativeWindow` 家族**剩余**方法/事件/属性面（多窗口运行时已落地） | **部分完成**（2026-10-02 阶段八十九·七十一 落地；2026-10-19 阶段一百九十 落地**第二批反查面**；2026-10-19 阶段一百九十六 落地**第三批：几何限制面与窗口事件族**；2026-10-19 阶段二百零四 落地**第四批：Windows 端两处窗口缺陷**（`<resizable>false</resizable>` 的固定窗 `maximize()` 被 SDL 的 win32 后端静默拒绝、程序显式 `resizable=true` 的子窗被构建级 `ASC_WINDOW_FIXED` 吃掉），本行只登记其中**尚未实现/未实测**的部分） | **已落地**（native 与 `adl 51.4.1` 逐项对齐，含端到端点击验收）：`new NativeWindow(opts)`（默认 400x232 框、返回时 `visible=false`）、`NativeWindowInitOptions` 八个默认值、`bounds/x/y/width/height/title/visible/closed/active/displayState/alwaysInFront/resizable/maximizable/minimizable/systemChrome/type/renderMode/transparent/owner(get)/stage/toString`、`close/activate/minimize/maximize/restore/orderToFront/orderToBack`、4 个静态常量、5 个 token 常量类、**每窗独立 `Stage`**（`showAll`/`align=""`，帧率继承应用级 `Stage.frameRate`，见阶段八十九·七十三）、`Event.CLOSE`（帧边界延迟一帧收尾）、`resize` 事件。**2026-10-19 第二批（阶段一百九十，oracle `temp/nwor/adl-oracle.txt`）**：`Stage.nativeWindow`、`NativeApplication.openedWindows`（**`Array`**，元素与各窗 `stage.nativeWindow` **恒等**，`adl` 实测长度 1→2→1）、`NativeApplication.exit()`（走 glue 的正常收尾，CLOSE 的派发与顺序不变）、`NativeWindow.menu`（诚实地回 `null`）、`orderInFrontOf()`/`orderInBackOf()`（活着的**另一**窗口回 `true`，`null`/自身/已收尾目标回 `false`）、`globalToScreen(point)`（= bounds 原点 + 非客户区边框；`adl` 实测 `(26,26)` + 边框 `(8,31)` ⇒ `(34,57)`）、`NativeWindowDisplayStateEvent`（类骨架 + `CHANGING='displayStateChanging'`/`CHANGE='displayStateChange'` + `NORMAL/MINIMIZED/MAXIMIZED`）。**尚未实现（AIR 有 ⇒ 遗留）**：`startMove()`/`startResize()`（仍恒回 `false`；系统拖拽/缩放）、`owner` **setter** 与 `listOwnedWindows()`（需 `Vector.<NativeWindow>` 单态化）、`notifyUser()`（通知）、窗口菜单（`NativeMenu` **整个子系统**都没有，故 `menu` 只能回 `null`）、`systemMinSize/systemMaxSize/minSize/maxSize` 四个尺寸限制属性（`minSize/maxSize` 目前是**死字段**恒回 `null`；四者的默认值随 OS 而异，macOS 侧本机不可测）、`Event.ACTIVATE/DEACTIVATE` 的**运行时来源**与 `NativeWindowBoundsEvent` 的 MOVED/RESIZED/CLOSING（常量与 MOVE/MOVING/RESIZE/RESIZING 已在，缺的是 glue 侧转发）、`resizeToScreen()`（oracle 里未见边界变化，**可疑、待重测**）、`supportsMenu`/`supportsNotification` 的**逐平台值**（`adl` Windows 实测 **true/true**，我们恒 `false`）。web 目标无多窗口概念 ⇒ 已按 §1.5 **诚实抛 `#2012`**，不属本行。**2026-10-19 第三批（阶段一百九十六，oracle `temp/nwmac/`，双端孪生探针 `nwmac-{adl,aot}.txt`）**：`minSize`/`maxSize`（默认随 OS `78,32`/`136,39`、写入按 `[平台地板, 当前对侧上限]` 钳制、getter 每次回**新** `Point`、写下去**立刻改活窗口**）、`startMove()`/`startResize(edgeOrCorner)`（真实系统拖拽、拖拽中按帧尺寸钳制；最大化/最小化或不可缩放窗口回 `false`）、`resizeToScreen(screen)`（1× 屏 = 该屏 `visibleBounds`；Retina 屏是 AIR 自己的单位异常，按文档口径实现并在此登记）、`listOwnedWindows()`（`Vector.<NativeWindow>`，元素就是 owner 持有的那个窗口对象）、以及**整个窗口事件族**：`resize`/`move`（`NativeWindowBoundsEvent`，`before` **取帧开始快照** ⇒ 一次同时移动+改尺寸时两条事件是同一对矩形）、`displayStateChange`（`NativeWindowDisplayStateEvent`）、`activate`/`deactivate`、`closing`（**可取消**：`preventDefault()` 即不关）、事件在**帧边界**统一结算（每应用帧对所有活窗口各轮询一次，顺序 `deactivate → resize → displayStateChange → move → activate`）、`supportsMenu`/`supportsNotification` 按 OS 回（macOS `false`/`false`、Windows·Linux `true`）。**尚未实现 / 未实测（AIR 有 ⇒ 遗留）**：① `NativeMenu` **整个子系统**（`NativeWindow.menu` 与 `NativeApplication.menu` 只能诚实地回 `null`）；② `systemMinSize`/`systemMaxSize`（AIR 的只读「系统给的限制」，我们**没有这两个成员** ⇒ 照 AIR 写这行代码**编不过**）；③ 拖拽**进行中**的 `moving`/`resizing`：我们只在帧边界派发 settle 后的 `move`/`resize`（常量 `MOVE`/`MOVING`/`RESIZE`/`RESIZING` 都在，但 `MOVING`/`RESIZING` 无来源），`adl` 侧**本轮未测**（要真拖拽探针才能量）；④ **原登记有误、本轮更正**：`owner` **没有 setter 缺口** —— `mxmlc 51.4.1` 里 `owner` 是**只读**的（赋值即编译错，`temp/nwor/` 实测），故无成员可补 | 分批、每批一个可验收行为：① ~~反查面~~ ✅ 阶段一百九十 已完成；② ~~`startMove`/`startResize`~~ ✅ 阶段一百九十六 已完成（不依赖 `NSEvent`：glue 自己按指针位移驱动系统拖拽，且拖拽中按帧尺寸钳制）；③ ~~事件面~~ ✅ 阶段一百九十六 已完成（`resize`/`move`/`displayStateChange`/`activate`/`deactivate`/`closing` 全部落地，红点关闭走真手势双端同序）；④ 剩下：`NativeMenu` 子系统（依赖面最大，最低优先）→ `systemMinSize`/`systemMaxSize`（与 `minSize`/`maxSize` 的平台地板/默认同源，可一并量）→ `moving`/`resizing`（先用 `temp/tkmeet-mac/drag.py` 真拖拽量 `adl` 的派发频率与终态，再决定补法；**别重复派发**，`live_resize_watch` 已在管拖动中的尺寸）。验收继续用 `temp/nwmac/` 的双端孪生探针 + `temp/nwmac/cls/` 的真手势红点关闭
+| `NativeWindow` 家族**剩余**方法/事件/属性面（多窗口运行时已落地） | **部分完成**（2026-10-02 阶段八十九·七十一 落地；2026-10-19 阶段一百九十 落地**第二批反查面**；2026-10-19 阶段一百九十六 落地**第三批：几何限制面与窗口事件族**；2026-10-19 阶段二百零四 落地**第四批：Windows 端两处窗口缺陷**（`<resizable>false</resizable>` 的固定窗 `maximize()` 被 SDL 的 win32 后端静默拒绝、程序显式 `resizable=true` 的子窗被构建级 `ASC_WINDOW_FIXED` 吃掉），本行只登记其中**尚未实现/未实测**的部分） | **已落地**（native 与 `adl 51.4.1` 逐项对齐，含端到端点击验收）：`new NativeWindow(opts)`（默认 400x232 框、返回时 `visible=false`）、`NativeWindowInitOptions` 八个默认值、`bounds/x/y/width/height/title/visible/closed/active/displayState/alwaysInFront/resizable/maximizable/minimizable/systemChrome/type/renderMode/transparent/owner(get)/stage/toString`、`close/activate/minimize/maximize/restore/orderToFront/orderToBack`、4 个静态常量、5 个 token 常量类、**每窗独立 `Stage`**（`showAll`/`align=""`，帧率继承应用级 `Stage.frameRate`，见阶段八十九·七十三）、`Event.CLOSE`（帧边界延迟一帧收尾）、`resize` 事件。**2026-10-19 第二批（阶段一百九十，oracle `temp/nwor/adl-oracle.txt`）**：`Stage.nativeWindow`、`NativeApplication.openedWindows`（**`Array`**，元素与各窗 `stage.nativeWindow` **恒等**，`adl` 实测长度 1→2→1）、`NativeApplication.exit()`（走 glue 的正常收尾，CLOSE 的派发与顺序不变）、`NativeWindow.menu`（诚实地回 `null`）、`orderInFrontOf()`/`orderInBackOf()`（活着的**另一**窗口回 `true`，`null`/自身/已收尾目标回 `false`）、`globalToScreen(point)`（= bounds 原点 + 非客户区边框；`adl` 实测 `(26,26)` + 边框 `(8,31)` ⇒ `(34,57)`）、`NativeWindowDisplayStateEvent`（类骨架 + `CHANGING='displayStateChanging'`/`CHANGE='displayStateChange'` + `NORMAL/MINIMIZED/MAXIMIZED`）。**尚未实现（AIR 有 ⇒ 遗留）**：`startMove()`/`startResize()`（仍恒回 `false`；系统拖拽/缩放）、`owner` **setter** 与 `listOwnedWindows()`（需 `Vector.<NativeWindow>` 单态化）、`notifyUser()`（通知）、窗口菜单（`NativeMenu` **整个子系统**都没有，故 `menu` 只能回 `null`）、`systemMinSize/systemMaxSize/minSize/maxSize` 四个尺寸限制属性（`minSize/maxSize` 目前是**死字段**恒回 `null`；四者的默认值随 OS 而异，macOS 侧本机不可测）、`Event.ACTIVATE/DEACTIVATE` 的**运行时来源**与 `NativeWindowBoundsEvent` 的 MOVED/RESIZED/CLOSING（常量与 MOVE/MOVING/RESIZE/RESIZING 已在，缺的是 glue 侧转发）、`resizeToScreen()`（oracle 里未见边界变化，**可疑、待重测**）、`supportsMenu`/`supportsNotification` 的**逐平台值**（`adl` Windows 实测 **true/true**，我们恒 `false`）。web 目标无多窗口概念 ⇒ 已按 §1.5 **诚实抛 `#2012`**，不属本行。**2026-10-19 第三批（阶段一百九十六，oracle `temp/nwmac/`，双端孪生探针 `nwmac-{adl,aot}.txt`）**：`minSize`/`maxSize`（默认随 OS `78,32`/`136,39`、写入按 `[平台地板, 当前对侧上限]` 钳制、getter 每次回**新** `Point`、写下去**立刻改活窗口**）、`startMove()`/`startResize(edgeOrCorner)`（真实系统拖拽、拖拽中按帧尺寸钳制；最大化/最小化或不可缩放窗口回 `false`）、`resizeToScreen(screen)`（1× 屏 = 该屏 `visibleBounds`；Retina 屏是 AIR 自己的单位异常，按文档口径实现并在此登记）、`listOwnedWindows()`（`Vector.<NativeWindow>`，元素就是 owner 持有的那个窗口对象）、以及**整个窗口事件族**：`resize`/`move`（`NativeWindowBoundsEvent`，`before` **取帧开始快照** ⇒ 一次同时移动+改尺寸时两条事件是同一对矩形）、`displayStateChange`（`NativeWindowDisplayStateEvent`）、`activate`/`deactivate`、`closing`（**可取消**：`preventDefault()` 即不关）、事件在**帧边界**统一结算（每应用帧对所有活窗口各轮询一次，顺序 `deactivate → resize → displayStateChange → move → activate`）、`supportsMenu`/`supportsNotification` 按 OS 回（macOS `false`/`false`、Windows·Linux `true`）。**尚未实现 / 未实测（AIR 有 ⇒ 遗留）**：① `NativeMenu` **整个子系统**（**2026-10-23 按 `adl 51.4.1` 实测更正**：`stage.nativeWindow.menu` 确为 `null` 且**赋了也不生效**（macOS 上 `NativeWindow.supportsMenu`=`false`）⇒ 我们恒回 `NULL` **正确**；但 `NativeApplication.menu` 在 macOS 上**不是 `null`**（是 adl 自己的 4 项菜单且**可整条替换**）⇒ 该成员我们**连声明都没有**，**不是**「诚实回 `null`」；图标族 `DockIcon`/`SystemTrayIcon`/`NativeApplication.icon`/三个能力位同样零实现，已**另立新行**，见 2026-10-23 追加）；② `systemMinSize`/`systemMaxSize`（AIR 的只读「系统给的限制」，我们**没有这两个成员** ⇒ 照 AIR 写这行代码**编不过**）；③ 拖拽**进行中**的 `moving`/`resizing`：我们只在帧边界派发 settle 后的 `move`/`resize`（常量 `MOVE`/`MOVING`/`RESIZE`/`RESIZING` 都在，但 `MOVING`/`RESIZING` 无来源），`adl` 侧**本轮未测**（要真拖拽探针才能量）；④ **原登记有误、本轮更正**：`owner` **没有 setter 缺口** —— `mxmlc 51.4.1` 里 `owner` 是**只读**的（赋值即编译错，`temp/nwor/` 实测），故无成员可补 | 分批、每批一个可验收行为：① ~~反查面~~ ✅ 阶段一百九十 已完成；② ~~`startMove`/`startResize`~~ ✅ 阶段一百九十六 已完成（不依赖 `NSEvent`：glue 自己按指针位移驱动系统拖拽，且拖拽中按帧尺寸钳制）；③ ~~事件面~~ ✅ 阶段一百九十六 已完成（`resize`/`move`/`displayStateChange`/`activate`/`deactivate`/`closing` 全部落地，红点关闭走真手势双端同序）；④ 剩下：`NativeMenu` 子系统（依赖面最大，最低优先）→ `systemMinSize`/`systemMaxSize`（与 `minSize`/`maxSize` 的平台地板/默认同源，可一并量）→ `moving`/`resizing`（先用 `temp/tkmeet-mac/drag.py` 真拖拽量 `adl` 的派发频率与终态，再决定补法；**别重复派发**，`live_resize_watch` 已在管拖动中的尺寸）。验收继续用 `temp/nwmac/` 的双端孪生探针 + `temp/nwmac/cls/` 的真手势红点关闭
 | `X.transform.matrix` 的**访问链别名**（`var t = X.transform; t.matrix`）仍是残余槽的裸读写 | 未开始（2026-10-02 阶段八十九·七十六 主动登记的实现边界） | `X.transform.matrix` 本身读写已精确（合成/分解访问器对），但 `Transform` 结构体**没有指回属主的反指针**（加它要给每个 `DisplayObject` 挂一个反向引用字段并补 `gc_write_barrier`，风险面覆盖 GC 与全部显示对象）。故先取 `t` 再经 `t.matrix` 读写时，读到/写到的仍是 **skew 残余槽**（不含 `x/y/rotation/scaleX/scaleY`），与 adl 的「同源单一矩阵」不一致。探针 T5 实测 adl 的 getter 返回拷贝，故这个别名写法**在 AIR 里本来就是无效操作**（改了不动对象），我方目前是「改残余槽」——不报错但语义不同 | 立项时与「矩阵作唯一真源」的重构合并做：`Transform` 加 `owner` 反指针（或用 owner 侧懒查表），读写字面量 `t.matrix` 也走访问器对；**须整批回归** GC 审计（`ASC_GC_AUDIT`）+ Starling 12 场景 + 全部 GUI examples |
 | 两个矩阵的**分解字段**与 adl 不同（矩阵往返与渲染仍精确） | 未开始（2026-10-02 阶段八十九·七十六 探针实测） | ① 纯 flipX `[-1,0,0,1,5,6]`（T10）：adl 给 `rotation 0 / scaleX -1 / scaleY 1`，我方给 `rotation 180 / scaleX 1 / scaleY -1`；**证据**：adl 对结构相同的 `diag(-2,3)`（T19）却给 `rotation 180 / scaleX 2 / scaleY -3`，即 adl 的选择**不是所赋矩阵的函数**（纯 flipX 与 `diag(-1,1)` 是同一矩阵，adl 两者答案不同）。② `[0,0,1,1,5,6]`（T25，零首列且非零首行）：我方渲染链 `translate·rotate·scale·残余` 在 `scaleX=0` 时表示不出「首行非零」，故把线性部分整体寄存到残余（字段报 `scaleX/scaleY = 1`），adl 报 `scaleX 0 / scaleY 1.414`。两例的**矩阵读回与像素都精确**（T10/T25 反向对照：读回逐值等于所赋矩阵） | 收益极低（要改渲染合成顺序或引入 AIR 内部的双存储），暂不排期；若将来做 ①，先扩充 `temp/xformcmp/cmp_probe.py` 的 `KNOWN` 集合口径，并把两例的行为差异写进 `docs/zh-cn/as3-semantics.md` 决策分歧点 |
 | 光标形状是**进程级一个**（多窗口时跟随最后一个写入者） | 未开始（平台硬边界，2026-10-02 阶段八十九·七十六 落地时实测） | `SDL_SetCursor` 在 SDL2 里**没有 per-window 版本**（窗口参数被忽略），故第二个窗口写 `Mouse.cursor` 会改掉第一个窗口的指针形状；窗口数≥2 且各自需要不同光标时才可观测。指针离开窗口恢复箭头（`SDL_WINDOWEVENT_LEAVE`）已做，故不会把 I-beam 带到菜单栏 | 若要根治需绕开 SDL：macOS 走 `-[NSCursor set]` + `NSTrackingArea`（或在 `mouseMoved` 里按窗口决定）、Windows 走 `WM_SETCURSOR`；属平台耦合，按 §2.9 应隔离在 glue 内。优先级低（AIR 自身也多窗口共享系统光标） |
@@ -15150,6 +15250,9 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 | **`examples/air-native`、`examples/ane`、`examples/ane-app` 的构建清单仍写死 `windows-x64`** | 未开始（2026-10-22 阶段二百三十一 登记：`build/ExampleManifestHosts` 会按内容跳过它们并打印名单） | 22 份清单已改成 `${host}`/`${lib:}`/`${win:}`/`${mac:}` 占位符形态，同一份在两个宿主都成立；这三份**刻意**没改——`air-native` 同时写死 `ASC_RENDER_D3D` + `vendor/d3d_glue.cc`，主机是**后端的结果**，把它写成 `${mac:...metal_glue.mm}` 需要先证明 macOS 侧那一串（`-lcocoa`/`-lobjc`/Metal 框架/`ASC_RENDER_METAL`）真的能编能跑，而本机没有 Objective-C++ 工具链、无法验证；`ane`/`ane-app` 同族（宿主库 `asaot.dll` 与 ANE 平台键都只在 Windows 上量过） | 等 arm64 macOS CI 能跑通 `metal_glue.mm` 之后，把 `air-native` 的 `sources`/`defines`/`link-libs` 按 `${mac:}`/`${win:}` 展开（对照 `src/air-app.ts` 的 `mtlSrc`/`d3dSrc` 两分支，那里已经是同一条配方的权威版），再让钉子不再打印它 |
 | **打字过程中 `maxScrollH` 比 `adl` 少约一步**（AIR 在「已滚动」状态下报 `textWidth + 4 - width + 步长`） | 未开始（2026-10-22 阶段二百四十二 实测登记；与上面「`textWidth` 字形累进残差」同一族的**可观测读数**差） | `adl 51.4.1` 探针（`temp/tfprobe/`，200px 框 + `_typewriter` 12，逐字符打字）：60 字符时 `scrollH=244 / maxScrollH=274`，而 `textWidth+4-width = 225.9` ⇒ 多出的一步 ≈ 内宽 1/4（48.6）。同一字段**程序化**赋 `scrollH=100` 后 `maxScrollH` 仍是 232（不随之改变）⇒ 这个 +一步只在**打字路径**里出现，不是纯函数，我们没复刻；光标可见性与 `scrollH` 的平移行为不受影响 | 若要复刻，需要在**编辑路径**里把 `maxScrollH` 读成「布局量 + 一个步长」（`scrollH>0` 或「本帧有编辑」时），并在程序化赋值路径上保持旧值；先补一组「打字 / 赋值 / 点击」三态交叉的 adl 矩阵再动手，否则很容易把一条历史相关性固化成错误规则 |
 | **空 `File`（`new File()`）的成员访问全线不抛 `#2037`**（`nativePath`/`url`/`size`/`exists`/`isDirectory`/`name`/`extension`/`parent`/`spaceAvailable`/`getDirectoryListing`） | 未开始（2026-10-22 阶段二百四十三 实测登记：`adl 51.4.1` 上这**十个成员全部**抛 `#2037`，连 `nativePath` getter 本身都抛） | 我方 `File` 把 `nativePath` 当**普通字段**（`NULL` 原样返回、`url` 拼出 `"file://"`、`size`/`spaceAvailable` 回 `0`、`exists`/`isDirectory` 回 `false`、`parent` 回 `NULL`、`getDirectoryListing` 回空表）。本轮新增的 `moveToTrash`/`moveToTrashAsync` **是**抛 `#2037` 的（实测口径），但既有成员一个都没改——族级修复要先把 `nativePath` 从字段改成访问器（牵动 AMF 成员表、结构体布局、codegen 的字段访问），不是单点补丁 | 先把 `nativePath` 变访问器（`File_get_nativePath` 抛 `#2037`），再给其余九个成员各加同一守卫；每个成员配一条 `examples/` 断言 + 一条 `unit:` 源级钉。**注意**：`nativePath` 是 AMF 成员名，改成访问器时要同步 `File_amf_members` 与反射表 |
+| `DockIcon.bitmaps` **不上屏**（模型完整、Dock 图标不变） | 未开始（2026-10-23 阶段二百五十五 落地图标族时如实登记） | 模型面已逐项对 `adl 51.4.1`（`bitmaps` 默认 `null`、`#2005`/`#2007`、getter 回拷贝、`width`/`height` 取逐轴最大值、清空后保持旧值），但**像素从未交给 AppKit**：`as_dock_icon_sync` 只在第一次赋值时 `as_shell_unsupported` 报明一次。照 AIR 写这段代码能跑，可观测效果是「图标不变」 | 接 `-[NSApplication setApplicationIconImage:]`：`BitmapData` → `NSImage`（`NSBitmapImageRep` + 预乘 ARGB），按 `bitmaps` 里**最接近 128×128** 的那张取值（AIR 的选图规则需先实测：`adl` 上赋多张不同尺寸、看 Dock 实际用哪张），仍带 `ASC_USE_WINDOW && __APPLE__` 条件编译，Windows/wasm 保持报明 |
+| `NativeMenuItem.keyEquivalentModifiers` **未翻译成 `NSEventModifierFlags`** | 未开始（2026-10-23 阶段二百五十五） | `keyEquivalent` 本身绑得上（`initWithTitle:action:keyEquivalent:`），但六个合法值（`15..20`，升序去重后存进 `_mods`）**没有映射**，于是快捷键按 AppKit 默认修饰键触发。当前**报明一次**（`as_menu_note_mods`），绝不静默绑一条错的快捷键 | 先用 `adl` 逐值实测六个 modifier 组合在菜单栏里的**显示文本与真实按键**（`⌘S` vs `⌃S` vs `⌥⌘S` 等），得到 `15..20` → `NSEventModifierFlag*` 的权威表再写映射；映射后删掉 `as_menu_note_mods` 的报明与对应单测钉子 |
+| `NativeMenu.display()` **没有模态菜单后端** | 未开始（2026-10-23 阶段二百五十五） | AIR 的 `display(stage, x, y)` 弹一个**模态**原生菜单（阻塞到选中/取消）；本后端是**非阻塞**事件泵，没有可嵌套的模态运行器 ⇒ 现在**报明**并返回 `undefined`（不假装弹过）。`dispatchContextMenuSelect` 同样回 `undefined`（那一条与 `adl` 一致，不是缺口） | 要落地得给 run loop 加一层「嵌套模态泵」：进 `display()` 后跑一个局部 `NSModalSession`/嵌套 `SDL_PumpEvents`（只处理本菜单、吞掉其余输入），返回后恢复；风险是重入整个帧循环（计时器/事件/窗口结算都会停），须先证明普通 AIR 应用不会因此死锁。优先级低——菜单栏与 Dock 右键两条路已覆盖 demo 需求 |
 
 
 
@@ -15207,34 +15310,62 @@ Windows 半已落地；wasm 半按 §1.5 属「AIR 无对应物」⇒ 响亮报�
 
 ---
 
-### macOS 清理工具 demo 能力缺口（未排期）
+### macOS 清理工具 demo 能力缺口（评估落点；余 G3/G4a/G4b/G5/G7/G8 待排期）
 
-> **本节是评估落点**，产物是 [`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md)（产品 + 技术方案）。
+> **本节是评估落点，既不是欠账表、也不是增益表** —— 与上面「UI 工具链待定项（未排期）」同一形态与口径。产物是 [`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md)（产品 + 技术方案）。
 > **该方案已于 2026-10-23 移出本仓库**（原 `docs/projects/` 目录已撤），现位于**工作区根 `prune/`**（与 `asaotui/` 同级，后续单独建 git 仓库），以免本软件信息与编译器交错。
 > 因此上方相对链 `../prune/...` **仅在本地工作区可解析**；单独 clone `as3compiler` 时该链会断开（属预期，非失效）。
-> 形态裁定（2026-10-22）：**菜单栏小工具**（`NSStatusItem` 常驻 + 点开无边框浮层），用途是本项目的推广 demo。
-> **不占阶段号、不升版本** —— 与上面「UI 工具链待定项」同一口径，只有真进入实施才占；届时从
-> **阶段二百四十三**（v0.4.206 → v0.4.207）起。
+> **形态裁定（2026-10-22）：**菜单栏小工具**（`NSStatusItem` 常驻 + 点开无边框浮层），用途是本项目的推广 demo。
+> **形态退路（2026-10-23 新增）**：若 G4b 探针失败，退到 **G4a 提供的纯 AIR `DockIcon` 形态**（Dock 图标常驻 + Dock 右键菜单 + `autoExit=false` + 不显示窗口）—— 它是 AIR 官方 `DockIcon` 例子演示的合法形态，**不是降级方案**。
+> **方案本身不占阶段号、不升版本**（与「UI 工具链待定项」同一口径，只有真进入实施才占）；
+> **但能力缺口当场占**：G1/G2 已以 **阶段二百四十三**（v0.4.206 → v0.4.207）落地，余项按 **二百五十五** 预留。
 >
-> **2026-10-22 状态更新（阶段二百四十三 已实施 G1 + G2）**：本表的 **G1 / G2 已落地**（G2 实为误记，见行内更正），
-> **G4（`NSStatusItem`）仍是最大风险项**且未动，**G3/G5/G8 未动**，**G7 仍走「同步遍历 + 分帧回填」**。
-> 因此「是否开整个 demo」这个判断**没有变化** —— 下一步应先做 G4 的最小可行性探针（探针失败则退回普通单窗口形态）。
-> 本节自此不再是「全部未排期」：G1/G2 已完成、G4 起的项仍按上表预留阶段推进。
+> **余项为什么要分两条路登记（2026-10-23 更正）**：原判断把 **G3/G4/G5/G8 全归为「增强」**（AIR 无对应物），
+> **其中 G4 是错的** —— AIR 在 `flash.desktop` 里有完整的一等公民图标 API，而我们**零实现** ⇒ 按 §1.5 硬判据
+> 它是**遗留欠账**。故 G4 拆为 **G4a**（图标族 + `NativeMenu` 子系统，**遗留**）与 **G4b**（macOS 菜单栏
+> `NSStatusItem`，**增强** —— 实测 `supportsSystemTrayIcon` 在 macOS 为 `false`）。
 >
-> **一句话裁决**：文件系统底座（`File` 的 `exists`/`isDirectory`/`size`/`name`/`parent`/`getDirectoryListing`，
-> `src/emit.ts:15139-15241`、`:15331`）与**无边框 + 置顶窗**（`src/emit.ts:5866-5902`、`:6087-6101`）**已具备**，
-> 真正要补的只有下表 5 项；其中 **G4 菜单栏状态项是唯一没有 AIR 对应物、且要新增平台胶水的项**，
-> **建议先做最小可行性探针再决定是否开整个 demo**（探针失败则退回普通单窗口形态）。
+> - **G4a ⇒ 已登记进下方的 `### 遗留待开发` 表**（该表 2026-10-23 的追加行）：遗留项走正常阶段 + 版本号，
+>   **不给开关** —— 照 AIR 写就该能跑，塞进 `--features` 会把「本该默认能跑」变成「必须开开关才跑」。
+> - **G3 / G4b / G5 / G8**（真增强）⇒ 按 §1.5 与 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1.4
+>   一律走 `--features` 具名开关 / 清单字段，**且只登记已端到端实现的开关**（登记未实现的开关等于
+>   「看着开了、实际没编进去」）；四项都还没开工，故**暂不登记进 `### 增强待做`**，与相邻「UI 工具链待定项」
+>   节对 U1~U5 的处置同口径。待开关真的落地时，再按 `### 增强待做` 的入库标准补登记。
+>
+> **⚠️ 编号撞车提醒**：本节的 `G1~G8` 是**方案自用的缺口编号**，与 **阶段二百四十七 / 二百四十八 / 二百四十九**
+> 使用的 `G8`/`G9`/`G13`（另一套缺口表）**同名不同义** —— 引用时务必带「demo 的」或直接引方案节号。
+
+**已落地（不再占表）**
+
+- **G1** `File.moveToTrash()` + `moveToTrashAsync()` —— ✅ **阶段二百四十三**：`File_moveToTrash`/`File_moveToTrashAsync` 写入 `src/emit.ts`，签名 **`void`**（实测口径，与官方参考文档写的 `Boolean` 相反）；macOS（`~/.Trash` 与其他卷的 `<卷>/.Trashes/<uid>`）与 freedesktop POSIX（`Trash/{files,info}` + `.trashinfo`）双后端；**Windows/wasm 无回收站后端** ⇒ 响亮报明 + `#2038`（该残余已入 `遗留待开发`）。口径全文 [`docs/zh-cn/filesystem.md`](docs/zh-cn/filesystem.md)，落地证据 `unit: emit/FileMoveToTrash` 17 项 + `examples/move-to-trash.as`。
+- **G4a** `flash.desktop` 图标族 + `flash.display.NativeMenu` —— ✅ **阶段二百五十五**（v0.4.219）：
+  `Icon`/`InteractiveIcon`/`DockIcon`/`SystemTrayIcon`、`NativeApplication.icon`/`menu`/`autoExit` 与五个能力位、
+  `NativeMenu`/`NativeMenuItem` 全成员（错误号、拷贝语义、子菜单归属逐项对 `adl 51.4.1`），外加 macOS 侧
+  **真菜单栏 + Dock 右键菜单**接线（扁平 `sk_menu` 描述过界、点击按 1 基 tag 回派）。**它同时是 G4b 的退路形态**：
+  Dock 图标 + Dock 右键菜单 + `autoExit=false`，零新平台胶水。口径 [`docs/zh-cn/desktop.md`](docs/zh-cn/desktop.md)。
+- **G2** ~~`File.getSpaceAvailable`~~ ⇒ 真名是 **`File.spaceAvailable`（属性）** —— ✅ **原登记是误记**：`getSpaceAvailable` 在 AIR 里**根本不存在**（`adl 51.4.1`：`'getSpaceAvailable' in f` = `false`、取它抛 `#1069`），而 `f.spaceAvailable` **从阶段六十四 起就已落地**（真实 `statvfs`/`GetDiskFreeSpaceExA`）。阶段二百四十三 只**校正作用域**：普通文件也作答（跟随其卷）、不存在路径与**设备**（`/dev/null`）回 `0`。
 
 | # | 缺口 | 现状（grep/读码核实） | 归属判定（AGENTS §1.5） | 预留阶段 |
 |---|---|---|---|---|
-| **G1** | `File.moveToTrash()` **+ `moveToTrashAsync()`** | ✅ **已落地（阶段二百四十三，v0.4.207）**：`File_moveToTrash`/`File_moveToTrashAsync` 写入 `src/emit.ts`，签名 `void`（实测口径，见下）。macOS（`~/.Trash` 与其他卷的 `<卷>/.Trashes/<uid>`）与 freedesktop POSIX（`Trash/{files,info}` + `.trashinfo`）都有后端；**Windows/wasm 无回收站后端**，调用响亮报明 + 抛 `#2038`（已入 `遗留待开发`）。口径全文 [`docs/zh-cn/filesystem.md`](docs/zh-cn/filesystem.md) | **遗留欠账** ⇒ 已清偿并移出评估表（落地证据：`unit: emit/FileMoveToTrash` 17 项 + `examples/move-to-trash.as`） | 二百四十三 ✅ |
-| **G2** | ~~`File.getSpaceAvailable`~~ ⇒ 真名是 **`File.spaceAvailable`（属性）** | ✅ **无需新增（阶段二百四十三 查明）**：`getSpaceAvailable` 在 AIR 里**根本不存在**（`adl 51.4.1`：`'getSpaceAvailable' in f` = `false`、取它抛 `#1069`），而 `f.spaceAvailable` **从阶段六十四 起就已落地**（真实 `statvfs`/`GetDiskFreeSpaceExA`）。本阶段只**校正作用域**：普通文件也作答（跟随其卷）、不存在路径与**设备**（`/dev/null`）回 `0` | **原登记是误记**（不是欠账）⇒ 不作为独立项 | 二百四十三 ✅ |
-| **G3** | 卷**总量/已用量** | 无对应 API（AIR 的 `File` 只给 `spaceAvailable`），容量条要它 | **增强**（AIR 无对应物）⇒ 走 `--features` 具名开关 | 二百四十五 |
-| **G4** | **菜单栏状态项**（`NSStatusItem`） | **零命中**：`grep -riE "NSStatusItem\|status item\|Shell_NotifyIcon\|tray" src/*.ts vendor/*` 只在无关注释里命中；**AIR 没有对应物**；SDL2 亦无托盘 API ⇒ 需新 `vendor/statusitem_glue.mm` 并接进 `vendor/window_glue.cc` 的事件泵 | **增强**（AIR 无对应物）⇒ 必须 opt-in、默认产物与现状同构、缺能力时**报明**不静默降级 | 二百四十五 |
-| **G5** | accessory app（`LSUIElement=1`：无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键**；AIR 描述符里也没有这个开关 | **增强** ⇒ 构建清单新字段（如 `agent-app`），默认关 | 二百四十五 |
-| **G7** | 目录遍历的**异步**化 | job 池无 `DIR`/`STAT` 类 job（`src/runtime.ts:9878-9898` 全清单：`READ_TEXT`/`READ_BYTES`/`IMAGE`/`FS_OPEN`/`DECODE`/`HTTP`/`HTTP_STREAM`/`UNSUPPORTED`/`IMAGE_URL`） | demo 先用**同步遍历 + 分帧回填**顶住；不够再补 job 类 | 二百四十五之后 |
-| **G8** | **一条命令出已签名 `.app` / `.dmg`** | `--package` 合法值只有 `raw \| xcode-project \| android-project \| web`（`src/index.ts:291`、`:798`）；**无 `app`/`dmg`**；`grep -n "codesign\|hdiutil" src/build.ts` = **0 命中**；且 `--package xcode-project` **只生成工程不构建**（`src/index.ts:1034-1057` 自述「是『生成工程』步骤，不做 cc」） | **增强**（工程化便利，非 AIR 语义） | 二百四十五 |
+| **G3** | 卷**总量/已用量** | 无对应 API（AIR 的 `File` 只给 `spaceAvailable`），容量条要它 | **增强**（AIR 无对应物）⇒ 走 `--features` 具名开关 | 二百五十五 |
+| **G4a** | `flash.desktop` **图标族**：`Icon` / `InteractiveIcon` / `DockIcon` / `SystemTrayIcon` + `NativeApplication.icon` / `supportsDockIcon` / `supportsSystemTrayIcon` / `supportsMenu` / `menu`，以及 `DockIcon.menu` 依赖的 `flash.display.NativeMenu` 子系统 | **零命中**：`grep -cE "DockIcon\|SystemTrayIcon\|InteractiveIcon\|supportsDockIcon\|supportsSystemTrayIcon" src/symbols.ts src/emit.ts` 每项均 **0**；`NativeApplication` 只声明 `nativeApplication`/`exit`/`activeWindow`/`openedWindows`/`applicationDescriptor`/`systemIdleMode`（`src/symbols.ts:1290-1350`），**无 `icon`**；`NativeMenu` 类**根本没声明**（`src/emit.ts:6136` 自述「本运行时没有 `NativeMenu` 子系统」）⇒ 照 AIR 写这行代码**编不过**。而 **AIR 有完整一等公民实现**（`adl 51.4.1`/macOS 实测：`supportsDockIcon`=`true`、`supportsSystemTrayIcon`=`false`、`supportsMenu`=`true`、`icon`=`[flash.desktop::DockIcon]`、`dockIcon.menu` 可设可读回、`new DockIcon()` 抛 `#2012`、`bitmaps` 赋非 `BitmapData` 抛 `#2005`；证据 `temp/desktopprobe/`） | **遗留欠账**（AIR 有、我们跑不出 ⇒ §1.5 硬判据）⇒ **正常阶段 + 版本号**，**不给 `--features` 开关**。**✅ 已清偿（阶段二百五十五，v0.4.219）** —— 图标族与 `NativeMenu` 子系统全部落地，口径 [`docs/zh-cn/desktop.md`](docs/zh-cn/desktop.md)，证据 `unit: emit/NativeMenu` 38 项 + `examples/native-menu.as` 66 断言 + `temp/G4App.app` 真机点击；三条后端残余（Dock 位图/修饰键/模态菜单）已入 `遗留待开发` | 二百五十五 ✅ |
+| **G4b** | **macOS 菜单栏状态项**（`NSStatusItem`） | **零命中** + **AIR 在 macOS 上没有对应物**：实测 `supportsSystemTrayIcon` = **`false`**、`icon` 是 `DockIcon`、`new SystemTrayIcon()` 抛 **`#2012`**；SDL2 亦无托盘 API ⇒ 需新 `vendor/statusitem_glue.mm` 并接进 `vendor/window_glue.cc` 的事件泵 | **增强**（AIR **在 macOS 上**无对应物）⇒ 必须 opt-in、默认产物与现状同构、缺能力时**报明**不静默降级 | 二百五十五 |
+| **G5** | accessory app（`LSUIElement=1`：无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键**；AIR 描述符里也没有这个开关 | **增强** ⇒ 构建清单新字段（如 `agent-app`），默认关 | 二百五十五 |
+| **G7** | 目录遍历的**异步**化 | job 池无 `DIR`/`STAT` 类 job（`src/runtime.ts:9878-9898` 全清单：`READ_TEXT`/`READ_BYTES`/`IMAGE`/`FS_OPEN`/`DECODE`/`HTTP`/`HTTP_STREAM`/`UNSUPPORTED`/`IMAGE_URL`） | demo 先用**同步遍历 + 分帧回填**顶住；不够再补 job 类 | 二百五十五之后 |
+| **G8** | **一条命令出已签名 `.app` / `.dmg`** | `--package` 合法值只有 `raw \| xcode-project \| android-project \| web`（`src/index.ts:291`、`:798`）；**无 `app`/`dmg`**；`grep -n "codesign\|hdiutil" src/build.ts` = **0 命中**；且 `--package xcode-project` **只生成工程不构建**（`src/index.ts:1034-1057` 自述「是『生成工程』步骤，不做 cc」） | **增强**（工程化便利，非 AIR 语义） | 二百五十五 |
+
+> **当前判断（2026-10-23 更正）**：真正要补的是上表 **6 项**，且**必须分两类走**：
+>
+> - **G4a 是地基**（AIR 原生图标族 + `NativeMenu` 子系统）：按 §1.5 是**遗留欠账**，阶段内修净、**不占本表**，
+>   而且它一落地就直接交出一个**退路形态** —— Dock 图标常驻 + `dockIcon.menu` 右键菜单 + `autoExit=false`，
+>   这是 AIR 官方 `DockIcon` 例子演示的合法形态，**零新平台胶水**。
+> - **G4b 仍是最大风险项**（SDL2 没有托盘 API，得自己起一个 Cocoa 侧事件源与 SDL 的 run loop 并存）——
+>   但它属**增强**，失败也**不塌方**：退到上面那个纯 AIR 的 `DockIcon` 形态即可（推广效果只少一个「菜单栏」卖点）。
+> - **建议顺序：先 G4a**（零技术风险、语义有 `adl` 可对照、且是两者共用的地基）→ **再做 G4b 最小可行性探针**
+>   （只出图标 + 点击回回调打日志）→ 探针通过才写面板。
+>
+> 底座已具备：文件系统（`File` 的 `exists`/`isDirectory`/`size`/`name`/`parent`/`getDirectoryListing`，
+> `src/emit.ts:15139-15241`、`:15331`）与**无边框 + 置顶窗**（`src/emit.ts:5866-5902`、`:6087-6101`）。
 
 > **⚠️ 更正一处文档与实现的落差**：`docs/zh-cn/compile.md:894` 以「`app` / `dmg` 走……一键产出最终产物」
 > 的口气描述打包，而该文件 `:949` 的表格自身把 `signing-identity` 标为「规划」；实测 `--package` 取值与

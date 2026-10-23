@@ -1333,17 +1333,48 @@ export class SymbolTable {
         // generated C's ASC_wins[] table, so it can never drift from the windows
         // the glue actually has.
         ['openedWindows', { returnType: { kind: 'array' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // icon: READ-ONLY (mxmlc 51.4.1 rejects `na.icon = ...` with "属性 icon 为只读";
+        // a runtime write through a dynamic path is #1074 "Illegal write to read-only
+        // property icon"). On macOS it IS a DockIcon instance; on a backend with no
+        // dock the same object exists but `supportsDockIcon` is false.
+        ['icon', { returnType: { kind: 'object', className: 'Icon' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // menu: the application menu bar. Measured on adl 51.4.1 / macOS
+        // (temp/deskprobe2/probe3-log.txt): reading it hands back adl's own four-item
+        // menu and ASSIGNING a menu really rewrites the Cocoa menu bar (the AX tree
+        // of the process then reads ["Apple","PruneAlphaMenu"]). `na.menu = null`
+        // CRASHES adl on macOS (the process dies at the assignment), so a null write
+        // is a no-op here and is reported once rather than replicated.
+        ['menu', { returnType: { kind: 'object', className: 'NativeMenu' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // autoExit: AIR's default true. Measured: with autoExit=false and only a
+        // HIDDEN window the app keeps running (temp/deskprobe2/probe5-log.txt), which
+        // is the Dock-only shape the Prune demo needs.
+        ['autoExit', { returnType: { kind: 'bool' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // startAtLogin: air reports "false" only for an INSTALLED app; under adl the
+        // read throws #2014 "Feature is not available at this time." and this build
+        // has no login-item backend at all, so it reports the same #2014.
+        ['startAtLogin', { returnType: { kind: 'bool' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       staticGetters: new Map([
         // nativeApplication: the application singleton (AIR's static getter that
         // Application.NativeApplication resolves through).
         ['nativeApplication', { returnType: { kind: 'object', className: 'NativeApplication' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+        // The capability bits. AIR answers them from the OS; so does this build, but
+        // from what the BACKEND actually implements (runtime.ts ASC_HAS_DOCK /
+        // ASC_HAS_APP_MENU): advertising a capability the backend lacks would turn a
+        // documented `if (supportsDockIcon)` guard into a silent no-op.
+        ['supportsDockIcon', { returnType: { kind: 'bool' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+        ['supportsSystemTrayIcon', { returnType: { kind: 'bool' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+        ['supportsMenu', { returnType: { kind: 'bool' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+        ['supportsStartAtLogin', { returnType: { kind: 'bool' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+        ['supportsDefaultApplication', { returnType: { kind: 'bool' }, params: [], owner: 'NativeApplication', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       setters: new Map([
         // systemIdleMode: a stored String (AIR default "normal"). This build never
         // inhibits the OS idle timer, so the setter reports a KEEP_AWAKE request
         // once on stderr instead of silently pretending the machine stays awake.
-        ['systemIdleMode', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['systemIdleMode', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'NativeApplication', visibility: 'public', isFinal: false, isGetter: false, isSetter: true }],
+        ['menu', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'NativeMenu', defaultValue: null, isRest: false }], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['autoExit', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Boolean', defaultValue: null, isRest: false }], owner: 'NativeApplication', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
       ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
@@ -1956,11 +1987,15 @@ export class SymbolTable {
           ['renderMode', nwGet('NativeWindow', { kind: 'string' })],
           ['transparent', nwGet('NativeWindow', { kind: 'bool' })],
           ['owner', nwGet('NativeWindow', { kind: 'object', className: 'NativeWindow' })],
-          // menu: AIR hands back the window's NativeMenu, null unless one was
-          // set. This runtime has no NativeMenu subsystem at all (a registered
-          // lingering gap outside the AOT closure), so there is never one to
-          // hand back and the declared type is Object rather than inventing a
-          // NativeMenu class that answers nothing.
+          // menu: AIR hands back the window's NativeMenu. This runtime has no
+          // NativeMenu subsystem at all (a registered lingering gap outside the
+          // AOT closure), so there is never one to hand back and the declared
+          // type is Object rather than inventing a NativeMenu class that answers
+          // nothing. Measured on adl 51.4.1 / macOS: a window's menu is null AND
+          // assigning one does not take (NativeWindow.supportsMenu is false),
+          // so answering null matches AIR exactly. (NativeApplication.menu is a
+          // different story -- it is a real 4-item menu there; see emit.ts and
+          // TODO.md 遗留待开发 2026-10-23.)
           ['menu', nwGet('NativeWindow', { kind: 'object', className: 'Object' })],
           // minSize/maxSize: AIR's window size limits (Points, clamped --
           // see emit.ts and window_glue.cc sk_window_size_floor). Measured on adl
@@ -4298,14 +4333,220 @@ export class SymbolTable {
        ['loadURL', { kind: 'void' }, [shReq('url', 'String')]],
        ['reload', { kind: 'void' }, []], ['stop', { kind: 'void' }, []]],
       [], [], ['isSupported']);
-    // flash.display.NativeMenuItem: one native context-menu entry.
-    shell('NativeMenuItem', 'flash.display::NativeMenuItem', 'EventDispatcher',
-      [['label', { kind: 'string' }], ['enabled', { kind: 'bool' }], ['checked', { kind: 'bool' }],
-       ['isSeparator', { kind: 'bool' }], ['keyEquivalent', { kind: 'string' }],
-       ['keyEquivalentModifiers', { kind: 'array' }], ['mnemonicIndex', { kind: 'int' }],
-       ['data', shObj('Object')], ['menu', shObj('Object')], ['submenu', shObj('Object')]],
-      [],
-      [gopt('label', 'String', { kind: 'Str', value: '' }), shBoolP('isSeparator', false)]);
+    // ---- flash.display.NativeMenuItem / NativeMenu (阶段二百五十五) ----
+    // AIR 51.4.1 / macOS surface (temp/deskprobe2/{probe-ext.txt,probe2-ext.txt}):
+    // both classes are [final][dynamic] and extend EventDispatcher; NativeMenuItem
+    // defaults are label="" name=null enabled=true checked=false isSeparator=false
+    // keyEquivalent=null keyEquivalentModifiers=[15] mnemonicIndex=-1 data=null
+    // menu=null submenu=null. `isSeparator` and `menu` are READ-ONLY (the container
+    // writes `menu`), `submenu`'s parent link is the menu that OWNS the item.
+    //
+    // Why these are real classes and not `shell(...)`: every list operation has a
+    // measured AIR answer -- duplicate addItem is a silent no-op while addItemAt of
+    // an item already present is #2004, removeItem(foreign) is #2006, items/bitmaps
+    // getters hand back COPIES, getItemByName matches `name` (not `label`), clone()
+    // copies items but drops `data`, and keyEquivalentModifiers keeps only 15..20 in
+    // ascending deduped order. A stub would silently answer none of them.
+    const nmSlot = (owner: string, t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
+    const nmMeth = (owner: string, ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const nmGet = (owner: string, ret: CType): MethodInfo => ({ returnType: ret, params: [], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const nmSet = (owner: string, paramType: string): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: paramType, defaultValue: null, isRest: false }], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+    const nmObj = (cn: string): CType => ({ kind: 'object', className: cn });
+    this.classMap.set('NativeMenuItem', {
+      fields: new Map([
+        ['label', nmSlot('NativeMenuItem', { kind: 'string' })],
+        ['name', nmSlot('NativeMenuItem', { kind: 'string' })],
+        ['enabled', nmSlot('NativeMenuItem', { kind: 'bool' })],
+        ['checked', nmSlot('NativeMenuItem', { kind: 'bool' })],
+        ['mnemonicIndex', nmSlot('NativeMenuItem', { kind: 'int' })],
+        ['data', nmSlot('NativeMenuItem', shObj('Object'))],
+        ['_sep', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'NativeMenuItem', isStatic: false, isConst: false }],
+        ['_keyeq', { type: { kind: 'string' }, init: null, visibility: 'private', owner: 'NativeMenuItem', isStatic: false, isConst: false }],
+        ['_mods', { type: { kind: 'array' }, init: null, visibility: 'private', owner: 'NativeMenuItem', isStatic: false, isConst: false }],
+        ['_menu', { type: nmObj('NativeMenu'), init: null, visibility: 'private', owner: 'NativeMenuItem', isStatic: false, isConst: false }],
+        ['_submenu', { type: nmObj('NativeMenu'), init: null, visibility: 'private', owner: 'NativeMenuItem', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map([
+        ['clone', nmMeth('NativeMenuItem', nmObj('NativeMenuItem'), [])],
+        ['toString', nmMeth('NativeMenuItem', { kind: 'string' }, [])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['isSeparator', nmGet('NativeMenuItem', { kind: 'bool' })],
+        ['keyEquivalent', nmGet('NativeMenuItem', { kind: 'string' })],
+        ['keyEquivalentModifiers', nmGet('NativeMenuItem', { kind: 'array' })],
+        ['menu', nmGet('NativeMenuItem', nmObj('NativeMenu'))],
+        ['submenu', nmGet('NativeMenuItem', nmObj('NativeMenu'))],
+      ]),
+      setters: new Map([
+        ['keyEquivalent', nmSet('NativeMenuItem', 'String')],
+        ['keyEquivalentModifiers', nmSet('NativeMenuItem', 'Array')],
+        ['submenu', nmSet('NativeMenuItem', 'NativeMenu')],
+      ]),
+      constructor: { params: [gopt('label', 'String', { kind: 'Str', value: '' }), shBoolP('isSeparator', false)] },
+      superClass: 'EventDispatcher',
+      // AIR declares this class final, but the existing flash.ui.ContextMenuItem
+      // shell (stage 110) already derives from it, so finality is left off here;
+      // the only observable difference is that `class X extends NativeMenuItem`
+      // compiles here and is rejected by mxmlc.
+      isFinal: false,
+      isDynamic: true,
+      implements: [],
+      fqn: 'flash.display::NativeMenuItem',
+    });
+    // flash.display.NativeMenu: AIR's native menu container. `isSupported` is a
+    // STATIC read that answers true while the INSTANCE read throws #1069 on
+    // adl 51.4.1 (describeType still lists it as an instance accessor) -- so it is
+    // registered on the static side only, exactly as measured.
+    this.classMap.set('NativeMenu', {
+      fields: new Map([
+        ['_items', { type: { kind: 'array' }, init: null, visibility: 'private', owner: 'NativeMenu', isStatic: false, isConst: false }],
+        ['_parent', { type: nmObj('NativeMenu'), init: null, visibility: 'private', owner: 'NativeMenu', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map([
+        ['addItem', nmMeth('NativeMenu', nmObj('NativeMenuItem'), [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
+        ['addItemAt', nmMeth('NativeMenu', nmObj('NativeMenuItem'), [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }, { name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        ['addSubmenu', nmMeth('NativeMenu', nmObj('NativeMenuItem'), [{ name: 'menu', type: 'NativeMenu', defaultValue: null, isRest: false }, gopt('label', 'String', { kind: 'Str', value: '' })])
+],
+        ['addSubmenuAt', nmMeth('NativeMenu', nmObj('NativeMenuItem'), [{ name: 'menu', type: 'NativeMenu', defaultValue: null, isRest: false }, { name: 'index', type: 'int', defaultValue: null, isRest: false }, gopt('label', 'String', { kind: 'Str', value: '' })])
+],
+        ['removeItem', nmMeth('NativeMenu', nmObj('NativeMenuItem'), [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
+        ['removeItemAt', nmMeth('NativeMenu', nmObj('NativeMenuItem'), [{ name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        ['removeAllItems', nmMeth('NativeMenu', { kind: 'void' }, [])],
+        ['containsItem', nmMeth('NativeMenu', { kind: 'bool' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
+        ['getItemAt', nmMeth('NativeMenu', nmObj('NativeMenuItem'), [{ name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        ['getItemIndex', nmMeth('NativeMenu', { kind: 'int' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
+        ['getItemByName', nmMeth('NativeMenu', nmObj('NativeMenuItem'), [{ name: 'name', type: 'String', defaultValue: null, isRest: false }])],
+        ['setItemIndex', nmMeth('NativeMenu', { kind: 'void' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }, { name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        ['display', nmMeth('NativeMenu', { kind: 'void' }, [{ name: 'stage', type: 'Stage', defaultValue: null, isRest: false }, { name: 'x', type: 'Number', defaultValue: null, isRest: false }, { name: 'y', type: 'Number', defaultValue: null, isRest: false }])],
+        ['clone', nmMeth('NativeMenu', nmObj('NativeMenu'), [])],
+        ['dispatchContextMenuSelect', nmMeth('NativeMenu', { kind: 'any' }, [{ name: 'mouseEvent', type: 'Object', defaultValue: null, isRest: false }])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['items', nmGet('NativeMenu', { kind: 'array' })],
+        ['numItems', nmGet('NativeMenu', { kind: 'int' })],
+        ['parent', nmGet('NativeMenu', nmObj('NativeMenu'))],
+      ]),
+      setters: new Map([
+        ['items', nmSet('NativeMenu', 'Array')],
+      ]),
+      staticGetters: new Map([
+        ['isSupported', { returnType: { kind: 'bool' }, params: [], owner: 'NativeMenu', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: true,
+      isDynamic: true,
+      implements: [],
+      fqn: 'flash.display::NativeMenu',
+    });
+    // ---- flash.desktop icon family (阶段二百五十五) ----
+    // AIR: `Icon` is instantiable (but a bare Icon's `bitmaps` getter throws #1009
+    // until something is assigned), `InteractiveIcon`/`DockIcon`/`SystemTrayIcon`
+    // are NOT (#2012 "<Class>$ class cannot be instantiated."). width/height are
+    // the per-axis MAXIMUM bitmap size and keep their last value after `bitmaps = []`.
+    const icGet = (owner: string, ret: CType): MethodInfo => nmGet(owner, ret);
+    this.classMap.set('Icon', {
+      fields: new Map([
+        ['_bitmaps', { type: { kind: 'array' }, init: null, visibility: 'private', owner: 'Icon', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['bitmaps', icGet('Icon', { kind: 'array' })],
+      ]),
+      setters: new Map([
+        ['bitmaps', nmSet('Icon', 'Array')],
+      ]),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      isDynamic: true,
+      implements: [],
+      fqn: 'flash.desktop::Icon',
+    });
+    this.classMap.set('InteractiveIcon', {
+      fields: new Map([
+        ['_w', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'InteractiveIcon', isStatic: false, isConst: false }],
+        ['_h', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'InteractiveIcon', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['width', icGet('InteractiveIcon', { kind: 'int' })],
+        ['height', icGet('InteractiveIcon', { kind: 'int' })],
+      ]),
+      // The OVERRIDE is what keeps width/height in step with the assigned array:
+      // the base Icon setter only stores it. Measured: width/height are the per-axis
+      // MAXIMUM over the bitmaps, and they keep their previous value when the array
+      // is empty (so this must not reset them).
+      setters: new Map([
+        ['bitmaps', nmSet('InteractiveIcon', 'Array')],
+      ]),
+      constructor: { params: [] },
+      superClass: 'Icon',
+      isFinal: false,
+      isDynamic: true,
+      implements: [],
+      fqn: 'flash.desktop::InteractiveIcon',
+    });
+    this.classMap.set('DockIcon', {
+      fields: new Map([
+        ['_menu', { type: nmObj('NativeMenu'), init: null, visibility: 'private', owner: 'DockIcon', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map([
+        ['bounce', nmMeth('DockIcon', { kind: 'void' }, [gopt('priority', 'String', { kind: 'Str', value: 'informational' })])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['menu', icGet('DockIcon', nmObj('NativeMenu'))],
+      ]),
+      // `bitmaps` is overridden only to add AIR's element check: measured, a
+      // non-BitmapData element is ArgumentError #2005 "Parameter 0 is of the
+      // incorrect type. Should be type BitmapData." (index = the element index),
+      // while the base Icon accepts anything.
+      setters: new Map([
+        ['menu', nmSet('DockIcon', 'NativeMenu')],
+        ['bitmaps', nmSet('DockIcon', 'Array')],
+      ]),
+      constructor: { params: [] },
+      superClass: 'InteractiveIcon',
+      isFinal: true,
+      isDynamic: true,
+      implements: [],
+      fqn: 'flash.desktop::DockIcon',
+    });
+    this.classMap.set('SystemTrayIcon', {
+      fields: new Map([
+        ['_tooltip', { type: { kind: 'string' }, init: null, visibility: 'private', owner: 'SystemTrayIcon', isStatic: false, isConst: false }],
+        ['_menu', { type: nmObj('NativeMenu'), init: null, visibility: 'private', owner: 'SystemTrayIcon', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['MAX_TIP_LENGTH', { type: { kind: 'int' }, init: { kind: 'Num', value: 63, isInt: true }, visibility: 'public', owner: 'SystemTrayIcon', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['tooltip', icGet('SystemTrayIcon', { kind: 'string' })],
+        ['menu', icGet('SystemTrayIcon', nmObj('NativeMenu'))],
+      ]),
+      setters: new Map([
+        ['tooltip', nmSet('SystemTrayIcon', 'String')],
+        ['menu', nmSet('SystemTrayIcon', 'NativeMenu')],
+      ]),
+      constructor: { params: [] },
+      superClass: 'InteractiveIcon',
+      isFinal: true,
+      isDynamic: true,
+      implements: [],
+      fqn: 'flash.desktop::SystemTrayIcon',
+    });
     // flash.net.NetworkInterface / NetworkInfo: the interface inventory.
     shell('NetworkInterface', 'flash.net::NetworkInterface', 'EventDispatcher',
       [['name', { kind: 'string' }], ['displayName', { kind: 'string' }], ['hardwareAddress', { kind: 'string' }],
