@@ -10177,6 +10177,16 @@ static void as_gradient_linearrgb_report(void) {
 // headers, redirects), while AS_JOB_IMAGE is a plain file read — feeding a URL
 // to fopen() is the silently-wrong behaviour the network seam exists to avoid.
 #define AS_JOB_IMAGE_URL   9
+// File.getDirectoryListingAsync: enumerate a directory INTO entry names on the
+// worker thread. This is the one member of the File async family that was
+// implemented for real but synchronously before it existed -- it listed inline
+// and dispatched from the same call, so the AS3 thread paid for the whole walk
+// and a listener registered after the call never fired. adl puts the walk on its
+// own IO thread (measured: a 20,000-entry directory returns from the call in
+// 0 ms with the event ~10.6 s later), which is what this kind reproduces. Only
+// the NAMES are staged here: a worker must never touch the GC heap, and the
+// File objects are generated in the finish thunk, on the AS3 thread.
+#define AS_JOB_DIR        10
 
 #define AS_JOB_QUEUED 0
 #define AS_JOB_RUNNING 1
@@ -10195,6 +10205,11 @@ static void as_gradient_linearrgb_report(void) {
 // turns it into an ioError whose text names the real cause, so an http(s):// URL
 // is never confused with a missing local file.
 #define AS_JOB_ERR_UNSUPPORTED 3
+// AS_JOB_DIR only: the path does not exist at all. adl reports this one as
+// ioError #3003 (measured), which is a DIFFERENT outcome from "exists but is not
+// a directory" -- that one completes with an empty listing and no error. Both
+// are needed to match the member, so the two cases cannot share AS_JOB_ERR_IO.
+#define AS_JOB_ERR_NOT_FOUND 4
 
 typedef struct as_job {
     int kind;
@@ -10212,6 +10227,13 @@ typedef struct as_job {
     int width, height;
     unsigned total; // byte count reported via bytesLoaded / bytesTotal
     void* handle;   // fopen result for AS_JOB_FS_OPEN (ownership: see retire)
+    // AS_JOB_DIR: the entry names the worker enumerated, in the order readdir
+    // returned them (AIR does not sort: measured order is the raw directory
+    // order, and 'files' matches the SYNC member's order for the same path).
+    // Plain malloc'd C strings -- never GC memory -- and freed by retire.
+    char** names;
+    int name_count;
+    int name_cap;
     char* path;     // malloc copies of the inputs, so workers never read GC memory
     char* mode;
     int binary;
@@ -11139,6 +11161,28 @@ static void as_http_stream_run(as_job* j) {
 // The blocking payload, run either on a worker thread or inline (see the two
 // execution strategies above). Never allocates from the GC heap, never fires an
 // event: its only job is to fill the staging fields.
+// Append one entry name to an AS_JOB_DIR job. The names are the ONLY thing
+// staged for that kind: File.isDirectory is a getter and probes the filesystem
+// lazily on the AS3 thread, so the worker does not stat each entry (AIR does not
+// either -- the 20,000-entry measurement comes back with nothing but File
+// objects). Returns 0 on out-of-memory, which the caller turns into an IO error
+// rather than a short listing that looks complete.
+static int as_job_dir_push(as_job* j, const char* name) {
+    if (j->name_count == j->name_cap) {
+        int cap = (j->name_cap == 0) ? 64 : j->name_cap * 2;
+        char** grown = (char**)realloc((void*)j->names, (size_t)cap * sizeof(char*));
+        if (grown == NULL) return 0;
+        j->names = grown;
+        j->name_cap = cap;
+    }
+    size_t n = strlen(name);
+    char* copy = (char*)malloc(n + 1);
+    if (copy == NULL) return 0;
+    memcpy(copy, name, n + 1);
+    j->names[j->name_count++] = copy;
+    return 1;
+}
+
 static void as_job_run(as_job* j) {
     switch (j->kind) {
         case AS_JOB_READ_TEXT:
@@ -11240,6 +11284,61 @@ static void as_job_run(as_job* j) {
             fseek((FILE*)h, 0, SEEK_END);
             j->total = (unsigned)ftell((FILE*)h);
             fseek((FILE*)h, cur, SEEK_SET);
+            break;
+        }
+        case AS_JOB_DIR: {
+            // Enumerating HERE (on the worker) is the point of this kind. The failure
+            // shapes are NOT symmetric, and adl is the authority for all of them
+            // (temp/listingprobe/, adl 51.4.1): a path that does not exist never
+            // completes (ioError #3003); a path that exists and is not a directory
+            // DOES complete, with an empty files array; and an UNREADABLE directory
+            // (opendir EACCES) also completes with an empty listing -- it is NOT an
+            // error. So "the open failed" is not by itself an error here: only a
+            // failed stat() is. AS_JOB_ERR_IO is left to the allocation failure
+            // below, where we could not build the list at all.
+            if (j->path == NULL) { j->error = AS_JOB_ERR_NOT_FOUND; break; }
+#ifdef _WIN32
+            // MSVC has no dirent.h: enumerate with FindFirstFile, which wants a
+            // backslash separator and a "<dir>\\*" pattern (same shape as the sync
+            // member's body in emit.ts).
+            size_t pn = strlen(j->path);
+            char* pat = (char*)malloc(pn + 3);
+            if (pat == NULL) { j->error = AS_JOB_ERR_IO; break; }
+            memcpy(pat, j->path, pn);
+            for (size_t i = 0; i < pn; i++) if (pat[i] == '/') pat[i] = '\\';
+            pat[pn] = '\\'; pat[pn + 1] = '*'; pat[pn + 2] = '\0';
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA(pat, &fd);
+            free(pat);
+            if (h == INVALID_HANDLE_VALUE) {
+                struct stat st;
+                // Only a failed stat() is an error; an unreadable-but-existing
+                // directory completes with an empty listing (measured on adl).
+                if (stat(j->path, &st) != 0) { j->error = AS_JOB_ERR_NOT_FOUND; break; }
+                break;
+            }
+            do {
+                if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+                if (!as_job_dir_push(j, fd.cFileName)) { j->error = AS_JOB_ERR_IO; break; }
+            } while (FindNextFileA(h, &fd) != 0);
+            FindClose(h);
+#else
+            DIR* d = opendir(j->path);
+            if (d == NULL) {
+                struct stat st;
+                // Same rule as the Windows branch above: a failed stat() means the
+                // path is gone (#3003), anything else -- not a directory, EACCES --
+                // completes with an empty listing, exactly as measured on adl.
+                if (stat(j->path, &st) != 0) { j->error = AS_JOB_ERR_NOT_FOUND; break; }
+                break;
+            }
+            struct dirent* e;
+            while ((e = readdir(d)) != NULL) {
+                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+                if (!as_job_dir_push(j, e->d_name)) { j->error = AS_JOB_ERR_IO; break; }
+            }
+            closedir(d);
+#endif
             break;
         }
         case AS_JOB_HTTP: {
@@ -11511,6 +11610,13 @@ static void as_job_retire(as_job* j) {
     if (j->kind == AS_JOB_FS_OPEN && j->handle != NULL) {
         fclose((FILE*)j->handle);
         j->handle = NULL;
+    }
+    if (j->names != NULL) {
+        for (int i = 0; i < j->name_count; i++) free(j->names[i]);
+        free(j->names);
+        j->names = NULL;
+        j->name_count = 0;
+        j->name_cap = 0;
     }
     free((void*)j->bytes);
     free(j->pixels);
@@ -12378,6 +12484,10 @@ static unsigned as_job_mark(void* job, int i) { as_job* j = (as_job*)job; return
 static void* as_job_pixels(void* job) { return ((as_job*)job)->pixels; }
 static int as_job_width(void* job) { return ((as_job*)job)->width; }
 static int as_job_height(void* job) { return ((as_job*)job)->height; }
+// AS_JOB_DIR staging: the thunk walks the names and turns each into a generated
+// File object, so it needs the count and one name at a time (never the array).
+static int as_job_dir_count(void* job) { return ((as_job*)job)->name_count; }
+static char* as_job_dir_name(void* job, int i) { as_job* j = (as_job*)job; return (i >= 0 && i < j->name_count) ? j->names[i] : NULL; }
 // TAKE (not get) an AS_JOB_FS_OPEN's handle: the FILE* changes owner here, so
 // the job must stop pointing at it. as_job_retire() closes whatever is still in
 // the job, and the AS3 FileStream closes the handle itself (the demo closes it
@@ -12424,6 +12534,21 @@ static void as_async_mark_roots(void) {
 // No lock is taken: by the ownership rule above, the job table and j->dead belong
 // to the AS3 thread, and close() is an AS3 call (as_async_mark_roots walks the
 // same table the same way). Returns 1 when a load was actually pending.
+// Is a listing already in flight for 'obj'? AIR rejects a SECOND
+// getDirectoryListingAsync() on a File whose listing has not been delivered yet
+// with #2037 (measured: the first still completes, the second throws), so the
+// guard cannot be "just submit another job" -- as_job_publish would supersede
+// the in-flight one and dispatch only one event, which is the opposite outcome.
+// No lock: the job table belongs to the AS3 thread (same rule as as_async_cancel).
+static int as_async_dir_pending(void* obj) {
+    for (int i = 0; i < as_job_count; i++) {
+        as_job* j = as_jobs[i];
+        if (j == NULL || j->kind != AS_JOB_DIR || j->obj != obj) continue;
+        if (!j->dead && j->state != AS_JOB_FINISHING) return 1;
+    }
+    return 0;
+}
+
 static int as_async_cancel(void* obj) {
     int found = 0;
     for (int i = 0; i < as_job_count; i++) {

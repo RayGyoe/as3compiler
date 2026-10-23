@@ -79,10 +79,8 @@ trace(x.moveToTrash());              // adl: undefined（不是 false）
 | 路径不存在 | **不抛异常**，派发 `IOErrorEvent`：`errorID=3003`、`text="Error #3003: …"`、`bubbles=false`、`cancelable=false` | 同（`errorID` 一并写入） |
 | `new File()` | **同步抛** `#2037`（和同步版一致） | 同 |
 
-**投递时机**：AIR 在自己的 IO 线程上完成并异步派发（实测「调用后立刻检查 `exists` 仍为 `true`」）；
-本构建 **inline 完成 + 同一次调用内派发**，与 `File` 其余 async 成员（`getDirectoryListingAsync` /
-`deleteFileAsync` / `deleteDirectoryAsync`）**同一口径**。调用方唯一能依赖的顺序——「先
-`addEventListener` 再发起」——在两端都成立。
+**投递时机**：AIR 在自己的 IO 线程上完成并异步派发（实测「调用后立刻检查 `exists` 仍为 `true`」）；本构建的 `moveToTrashAsync` / `deleteFileAsync` / `deleteDirectoryAsync` 仍是 **inline 完成 + 同一次调用内派发**（登记在 `遗留待开发`），而 **`getDirectoryListingAsync` 已经是真异步**（枚举在作业池的 worker 线程上跑、帧边界派发，见 §7）。调用方唯一能依赖的顺序——「先
+`addEventListener` 再发起」——在两端都成立，但「调用返回时事件还没到」这条**只有 `getDirectoryListingAsync` 成立**。
 
 ---
 
@@ -198,7 +196,57 @@ Windows 走 `GetFileAttributesA()` 的 `FILE_ATTRIBUTE_REPARSE_POINT`（AIR 对 
 
 ---
 
-## 7. 没做的部分（如实登记）
+## 7. 目录列举 —— 同步/异步两套口径（阶段二百六十四）
+
+`getDirectoryListing()` 与 `getDirectoryListingAsync()` **不是同一个语义的两种写法**：同一个输入，
+一个抛异常、一个正常完成。全部口径逐条对 `adl 51.4.1` 实测（探针 `temp/listingprobe/`、
+`temp/dirasync/`），本构建照抄；示例 [`examples/file-listing-async.as`](../examples/file-listing-async.as)
+把它们逐条钉成断言。
+
+### 7.1 异步：真异步（本阶段之前是同步假实现）
+
+`adl` 上这个成员在**自己的 IO 线程**上枚举、在**稍后**派发 `FileListEvent.DIRECTORY_LISTING`。
+实测口径：
+
+| 观测 | `adl 51.4.1` | 本构建 |
+|---|---|---|
+| 2 万条目目录的**调用耗时** | **0 ms**（事件约 **10.6 s** 后才到） | 同（枚举在 `AS_JOB_DIR` 作业里） |
+| 调用之后才注册的监听器 | **收得到** | 同 |
+| 事件形状 | `type=directoryListing`、`files=File[]`、`bubbles=false`、`cancelable=false`、`target` 是该 `File` | 同 |
+| 路径不存在 | 派 `IOErrorEvent`：`errorID=3003` + `"Error #3003: File or directory does not exist."`（**不抛**） | 同 |
+| 路径**存在但不是目录** | **正常完成，`files` 为空表，无错误** | 同 |
+| 目录**不可读**（EACCES） | **正常完成，空表，无错误** | 同 |
+| `cancel()` | **真的取消**：不再派任何事件 | 同 |
+| 上一次还在飞时再调 | **抛 `#2037`**，且第一次仍会完成 | 同 |
+| 空 `File`（`new File()`） | **同步抛 `#2037`** | 同 |
+| 抵达顺序 | 与同步成员**同序**（都是目录原始序，**两端都不排序**） | 同 |
+
+> 之前本构建是「`getDirectoryListing()` + 同一次调用内派发」的**同步假实现**：调用线程要付完
+> 整个遍历的代价，且 `File.cancel()` 恒为 no-op。这属 §1.5「`adl` 跑得对而我们跑不出」⇒
+> **遗留缺陷**，阶段二百六十四 修净（`AS_JOB_DIR` 作业 + 完成 thunk + 真 `cancel`）。
+
+### 7.2 同步：三种异常输入全抛，且与异步**故意不共用一个实现**
+
+| 输入 | `getDirectoryListing()`（同步） | `getDirectoryListingAsync()`（异步） |
+|---|---|---|
+| 空 `File` | 抛 `#2037` | 抛 `#2037`（同号同文案） |
+| 路径不存在 | 抛 `#3003` | 派 `ioError #3003`，**不抛** |
+| 存在但不是目录 | 抛 **`#3007: Not a directory.`** | **空表完成，无错误** |
+| 目录不可读（EACCES） | **空表，不抛** | **空表完成，无错误** |
+
+最后一行是唯一「两边都不抛」的怪形状，也是清理类程序**最常**遇到的形状：权限拒绝**不是**失败，
+它就是一个空目录——把它当失败会让「跳过的目录数」虚高，把它当成功则与 `adl` 一致。
+
+### 7.3 `FileListEvent` 的成员面（顺带实测）
+
+`describeType(INSTANCE)` 实测：`extends=flash.events::Event`，实例 **var 只有 `files`**；
+**没有 `directory`、没有 `index`**。本构建的壳多声明了一个第四形参（`directory`），
+是已登记的口径差（见 `遗留待开发` 的 arity 行），故完成 thunk 仍把接收者传在第四位、`files` 保持
+`adl` 的位置。
+
+---
+
+## 8. 没做的部分（如实登记）
 
 - **WASI / Emscripten 的废纸篓**：无对应 API，调用响亮报明并抛 `#2038`。浏览器没有「回收站」这个概念，**响亮报明即为终态**（不做假后端）。Windows 回收站后端已于阶段二百四十四 落地（§4）。
 - **Finder「放回原处」元数据**：见 §4 取舍。
@@ -206,10 +254,22 @@ Windows 走 `GetFileAttributesA()` 的 `FILE_ATTRIBUTE_REPARSE_POINT`（AIR 对 
   真跨卷时抛 `#2038` 而不是「复制 + 删除」——后者在演示规模下会看起来卡住，且失败点更多。
 - **卷总量 / 已用量**（方案 G3）：未做。
 - **`spaceAvailable` 对空 `File` 的 `#2037`**：见 §5.2 注（族级缺口，已入 `遗留待开发`）。
+- **`File` 其余三个 async 成员的投递时机**：见 §3（仍是 inline，已入 `遗留待开发`）。
 
 ---
 
-## 8. 复现
+## 9. 复现
+
+```sh
+# 目录列举的 adl 口径（探针在 temp/listingprobe/ 与 temp/dirasync/，日志写 .txt）
+cd temp/dirasync && "$AIRSDK_HOME/bin/mxmlc" -load-config="$AIRSDK_HOME/frameworks/air-config.xml" \
+  -output Probe4.swf Probe4.as && "$AIRSDK_HOME/bin/adl" app4.xml
+
+# AOT 侧（夹具由 test/examples.ts 现造；noread/ 是 chmod 000 的不可读目录）
+node --test --test-name-pattern='file-listing-async' test/examples.ts
+```
+
+## 10. 早期实现的 adl 复现（废纸篓）
 
 ```sh
 # adl 侧（探针在 temp/trashprobe/，日志写 adl_log*.txt；adl 的 stdout 不可用）
@@ -225,6 +285,7 @@ cd temp/trashprobe && cc -O1 -Wall -Wextra -o trash_impl trash_impl.c && HOME=/t
 ```
 
 钉子：`unit: emit/FileMoveToTrash`（17 项，源级）；`unit: emit/FileIsSymbolicLink`（7 项，源级）；
-`examples/move-to-trash.as`、`examples/file-symlink.as`（运行时，
-由 `test/examples.ts` 的 `EXAMPLE_ENV` 把 `HOME` 分别指到 `temp/trash-home`、`temp/sym-home`，
-避免污染开发机的废纸篓；软链夹具由该文件用 `node:fs` 现造）。
+`unit: emit/DirListingAsync`（17 项，源级）；`examples/move-to-trash.as`、`examples/file-symlink.as`、
+`examples/file-listing-async.as`（运行时，由 `test/examples.ts` 的 `EXAMPLE_ENV` 把 `HOME` 分别指到
+`temp/trash-home`、`temp/sym-home`、`temp/listing-home`，避免污染开发机的废纸篓；软链与目录列举
+两套夹具都由该文件用 `node:fs` 现造，其中 `noread/` 的 `chmod 000` 在套件收尾时改回）。

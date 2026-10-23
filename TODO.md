@@ -15654,7 +15654,106 @@ junction 也报 `true`，这个位正好覆盖，而 MSVC 的 `_stat` 认不出�
 - 真机回归：`air-starling-demo` 用 Metal 后端跑通（`[Starling] Context ready. Display Driver: Metal (Stage3D)`，
   资源加载到 100%）—— 说明**拒收逻辑没有误伤真实程序**。
 
+### 阶段二百六十四：`File.getDirectoryListingAsync` 真异步化 —— 遍历搬下 AS3 线程 + 同步成员三条异常口径补齐（v0.4.227 → v0.4.228）✅ 已完成
+
+**一、起因：一条「用 ANE 实现遍历异步化」的提议，两条待核实的前提**
+
+用户提出方案 G7（遍历异步化）时给了两条前提：① 用 **ANE** 来做；② 「编译器中 `lib` 缺个 arm 的链接库」。
+
+两条都得先量再说，量完结论是**都不成立，而真正的缺陷在我们这边**：
+
+| 前提 | 实测 | 结论 |
+|---|---|---|
+| `lib` 缺 arm 链接库 | `lib/bin/macos-x86-64/libasaot.dylib` 是 **x86_64 + arm64 通用二进制**（`lipo -info`） | 目录名 `macos-x86-64` 是 **AIR 自己的平台键**、不表架构（[`ane.md`](docs/zh-cn/ane.md) §6）。ARM 上真正的缺口只有 **iOS**（扩展静态链接、无 `dlopen`，设计上不做）与 **Windows-ARM64**（无 MSVC arm64 工具集），两者都已**响亮报错** |
+| AIR 的目录列举只能靠 ANE 变异步 | AIR **本来就有** `File.getDirectoryListingAsync()`；我们用参考编译器 `mxmlc 51.4.1` 实测：它能编译、**0 参**、返回 **`void`**（对照组 `f.zzNotAThing()` 当场报错） | AIR 有对应物 ⇒ **不是增强**，是**补平差距**（AGENTS §1.5 硬判据） |
+
+而那一处差距是：**我们把它实现成了同步假实现** —— 内联调 `getDirectoryListing()`，并在**同一次调用内**派发 `FileListEvent`
+（`docs/zh-cn/filesystem.md` 旧 §3 自述「inline 完成 + 同一次调用内派发」，同口径也套在
+`moveToTrashAsync`/`deleteFileAsync`/`deleteDirectoryAsync` 上，因此 `File.cancel()` 恒为 no-op）。后果是**调用线程要付完整个遍历的代价**，
+且 `cancel()` 这个 API 毫无意义 ⇒ 属「`adl` 跑得对而我们跑不出」的**遗留缺陷**，按 §1.5 必须正面修掉，
+**不**该用 ANE 把分歧固化成二进制 blob（ANE 留给 G3，那条 AIR 真没有）。
+
+**二、先把 `adl` 的口径量出来（`temp/dirasync/`，双端孪生探针逐行对照）**
+
+`mxmlc` 产物 + `adl 51.4.1`，夹具含 `.hidden`/普通文件/子目录/软链，大盘 2 万条目：
+
+| # | 实测口径 | 当时我们的行为 |
+|---|---|---|
+| 1 | **调用不阻塞**：2 万条目目录 `call returned after 0 ms`，事件 **10.6 s** 后才到 | ❌ 内联枚举，调用线程付完全程 |
+| 2 | **派发在调用返回之后**：调用后立刻注册的监听器（T5）**照样收到** | ❌ 同一次调用内派发，后注册的永远收不到 |
+| 3 | 成功：`FileListEvent`/`directoryListing`、`files=File[]`、`bubbles=false`/`cancelable=false`、`target` 是该 `File` | ✅ 一致 |
+| 4 | 缺失路径：派 `IOErrorEvent` `errorID=3003` + `"Error #3003: File or directory does not exist."`（**不抛**） | ❌ 静默完成 |
+| 5 | 路径**是文件**：**空表完成、无错误**（而**同步**成员对同一输入抛 `#3007`） | ❌ 同样静默完成（没区分「空」与「错」） |
+| 6 | **`cancel()` 真的取消**：此后不派任何事件 | ❌ 恒 no-op |
+| 7 | 在飞时再调：**抛 `#2037`**，且第一次仍会完成 | ❌ 无守卫 |
+| 8 | `FileListEvent` 实例 **只有 `files`**，`extends=Event`，**没有 `directory`/`index`** | 已知多声明（arity 行已登记，见 §五） |
+
+再往下追问「四种怪输入」时又量出一组**同步成员**的口径（`temp/listingprobe/`，`syncTry`/`asyncTry` 并列）：
+
+| 输入 | 同步 `getDirectoryListing()` | 异步 `getDirectoryListingAsync()` |
+|---|---|---|
+| 空 `File` | 抛 `#2037` | **同步抛** `#2037`（同号同文案） |
+| 路径不存在 | 抛 `#3003` | 派 `ioError #3003` |
+| 存在但不是目录 | 抛 **`#3007: Not a directory.`** | **空表完成、无错误** |
+| **目录不可读（EACCES）** | **空表、不抛** | **空表完成、无错误** |
+
+我们四种输入**全部**静默回空表 ⇒ 同步成员缺三条守卫（`#2037`/`#3003`/`#3007`）。
+最后一行是**唯一两边都不抛**的形状，也是**清理类程序最常遇到**的形状（权限拒绝）：在 `adl` 里它
+**不是失败**，就是一个空目录。这一点直接决定 prune 的「跳过计数」该怎么记，故必须照抄而不是「更友好地」报错。
+
+**三、实现**
+
+- `src/runtime.ts`：作业池新增 `AS_JOB_DIR` 类型 + **worker 侧**枚举（POSIX `opendir`/`readdir`、Windows
+  `FindFirstFile`/`FindNextFile`），名字进 **malloc 暂存**（`char** names` / `as_job_dir_push`，不碰 GC 堆 ——
+  守住作业池不变式 A）、退休时 `free`；访问器 `as_job_dir_count`/`as_job_dir_name`；`as_async_dir_pending`（在飞守卫）。
+  **错误只有一种**：`stat()` 失败 ⇒ `AS_JOB_ERR_NOT_FOUND`。**打不开不算错** —— 不可读目录与「不是目录」都按 `adl`
+  完成成空表（`AS_JOB_ERR_IO` 只留给 worker 自己的分配失败）。
+- `src/emit.ts`：`File_getDirectoryListingAsync` 改为提交 `AS_JOB_DIR` + 完成 thunk `File__dirFinish`
+  （在 AS3 线程上按名字造 `File` 并派 `FileListEvent`）；空 `File` 与「在飞」共用同一 `#2037` 守卫；
+  `File.cancel()` 改为 `as_async_cancel`；`File_getDirectoryListing` 补 `#2037`/`#3003`/`#3007` 三条守卫
+  （顺序与 `adl` 一致：先空 `File`，再不存在，再非目录）。**两个成员刻意不共用一个实现** —— 它们对同一输入的行为
+  本来就不同（上表）。
+
+**四、验收**
+
+| 项 | 结果 |
+|---|---|
+| 示例 | `examples/file-listing-async.as`（8 组、30+ 断言，含软链条目与 `chmod 000` 目录）本地 `--run` 通过；套件 1/1 |
+| 夹具 | `test/examples.ts` 现造 `temp/listing-home/fx`（`a.txt`/`b.txt`/`sub/inner.txt`/`link-file.txt`/`noread`），`EXAMPLE_ENV` 指 `HOME`/`USERPROFILE`；`noread` 的 `chmod 000` 在**造夹具时**与 **`after()`** 各改回一次（`rm -rf` 删不掉 000 目录，权限不能外溢） |
+| 单元组 | 新增 `unit: emit/DirListingAsync` **17/17**（作业类型、worker 不碰 GC 堆、名字退休即释放、只认 `stat` 失败为错、`#3003` 文案、`cancel` 真的标记在飞作业、`#2037` 守卫与文案、同步三条守卫及其**先于 `opendir`** 的顺序） |
+| 全量回归 | `node test.ts` 见 §六 |
+
+**五、台账**
+
+- **改写 1 行**：遗留表「空 `File` 的成员访问全线不抛 `#2037`」⇒ 转为 **部分完成**（`getDirectoryListing`/`getDirectoryListingAsync`
+  两个成员本阶段补齐，剩八个 getter 仍缺；族级修复仍要先让 `nativePath` 变访问器）。
+- **新登记 2 行**（都是本轮量出来、**不在本轮批准范围内**修的真分歧）：
+  ① **基类 `EventDispatcher.parent` 字段在动态读里压过派生类 getter** —— `f["parent"]` 恒回 `null`（`adl` 回 `[object File]`），
+  根因是 `as_dyn_get` 把整条 super 链的 **props 表走完**才轮到 getters 表，而 `EventDispatcher_props[]` 把 C 侧内部链接
+  `parent` 当**公开成员**列了出来（`adl` 的 `EventDispatcher` 一个成员都没有）。这是本轮写示例时**先撞上**的：示例里
+  `byName["a.txt"].parent.nativePath` 抛 `#1009`，改用静态类型变量后过 —— 证据 `temp/listingprobe/{Shadow,DynParent}.as` + `adlshadow.txt`。
+  ② **`File` 其余三个 async 成员仍是 inline 完成**（`moveToTrashAsync`/`deleteFileAsync`/`deleteDirectoryAsync`），
+  `cancel()` 对它们仍无意义 —— 本阶段只做遍历这一条，不越界宣称。
+- 表内项数 **91 → 93**（`未开始` 71 → 72 / `部分完成` 19 → 20 / `调研完成·实现暂缓` 1）。
+
+**六、文档**
+
+- `docs/{zh-cn,en}/filesystem.md`：新增 §7「目录列举 —— 同步/异步两套口径」（两张实测表 + §7.3 `FileListEvent` 成员面 + 复现命令），
+  并把 §3 里那句「与 `getDirectoryListingAsync`/`deleteFileAsync`/`deleteDirectoryAsync` **同一口径**（inline）」改写为
+  「只剩另外三个是 inline，遍历已是真异步」；钉子清单补 `unit: emit/DirListingAsync` 与第三条夹具。
+- `README-CN.md`：`flash.filesystem` 的 `File` 条目补 `getDirectoryListing`/`getDirectoryListingAsync` 的两套口径摘要；示例清单补第二条。
+- `package.json` → **v0.4.228**。
+
+**七、为什么不用 ANE 做这一条**
+
+ANE 在这里能跑（macOS 宿主库已落地，阶段二百零七），但代价是**把一条 AIR 本来就有的语义分歧固化成二进制**：
+① 产物不再「可审计」（审计者要读 `.as` + `.c`，而 ANE 是一坨 `.dylib`）；② 分歧会被**永久**保留 —— 以后没人会想起
+「AIR 本来是异步的」；③ 它解决的是**我们自己的缺陷**，而缺陷的正解在编译器里（本阶段 17 个源级钉子 + 1 个示例即可回归）。
+ANE 仍留给 **G3**（卷总量/已用量）：那条 AIR **真没有**（`File` 只有 `spaceAvailable`，`getSpaceAvailable` 在 `adl` 里 `in` 为 `false`），
+按 §1.5 是**增强**，才轮到 opt-in 的原生扩展出场。
+
 ### 遗留待开发
+> **2026-10-23 追加（阶段二百六十四：`File.getDirectoryListingAsync` 真异步化 —— 改写 1 行 + 新登记 2 行）**：**新登记 2 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **91 → 93 项**（`未开始` **71 → 72**、`部分完成` **19 → 20** / `调研完成·实现暂缓` 1）。**本阶段主体是补平差距，故不占表**：用户提议「用 ANE 做遍历异步化」，但根因不是缺 ARM 链接库（`lib/bin/macos-x86-64/libasaot.dylib` 本就是 **x86_64+arm64 通用二进制**，`macos-x86-64` 是 AIR 自己的平台键、不表架构），而是**该成员此前是同步假实现**（inline 调 `getDirectoryListing()` + 同一次调用内派发 `FileListEvent`，`cancel()` 因此恒为 no-op）——`adl` 上它是真异步，属 §1.5「`adl` 跑得对而我们跑不出」⇒ **遗留缺陷**且阶段内修净（新 `AS_JOB_DIR` 作业 + 完成 thunk + 真 `cancel`），故不入表。**改写的 1 行**是「空 `File` 的成员访问全线不抛 `#2037`」：其中 `getDirectoryListing`/`getDirectoryListingAsync` 两个成员本阶段已按 `adl` 补齐（见该行）。**新登记 2 行**都是本轮**量出来、但不在批准范围内修**的真分歧：① 基类 `EventDispatcher.parent`（一个 C 侧内部链接字段）在**动态读**里压过派生类的 getter；② `File` 其余三个 async 成员仍是 inline 完成。
 > **2026-10-23 追加（阶段二百六十三：AGAL 三条实测定案 —— 移出 3 行 + 收窄 1 行）**：**新登记 0 行 / 改写 1 行 / 移出 3 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **94 → 91 项**（`未开始` **74 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1 / `已记录` 1；`已修` 与 `已记录` 各自归零后仍为 0）。**移出 3 行**：① AGAL `nrm` 的归一化分量数 —— 像素探针定案**只归 `.xyz`**（`w` 既不参与模长也不被写），`src/runtime.ts` 已改并把含 w 的目的掩码按 `adl` 的 **#3628** 响亮拒绝；② 临时寄存器未初始化即被读 —— **不是「初值是多少」而是 upload 期错误**（**#3647**/**#3648**，用官方 `AGALMiniAssembler` 编的字节复现），故落地为 `agal_check_temp_writes` 逐分量线性扫描后**拒收**，而不是零初始化（零初始化会让一个 AIR 上跑不起来的程序在我们这里「碰巧有输出」，属 §2.5 明禁的静默降级）；③ 指针移出窗口不 roll-out —— **早已修**（`vendor/window_glue.cc` 的 `SDL_WINDOWEVENT_LEAVE` + 「仍严格在客户区内则不算离开」守卫），零代码下架。**改写 1 行**：原「`ROLL_OVER` / `ROLL_OUT` / `Stage.MOUSE_LEAVE` 事件完全不派发」**收窄**为只剩前者两个（外加冒泡的 `mouseOver`/`mouseOut`）—— `mouseLeave` 一直有发射点（`src/emit.ts` 的 `Event_new("mouseLeave", …)`，指针离开舞台时按 `mouseOut → rollOut(按钮) → mouseLeave(舞台)` 补一轮），把三条并记在一行会掩盖「已对齐两条」。**证据**：`temp/agalprobe/{out.txt,out-aot.txt}`（adl 与 AOT 逐字节相同）、`temp/metalshader/nrm*.{msl,metal,glsl}` + `glslcheck3.html`（Metal 2/2、WebGL 2/2 真编译；HLSL 本机无 `fxc`，只做文本钉）、`unit: stage3d/agal-nrm`（5 钉）+ `unit: stage3d/agal-temp-writes`（5 钉）+ `examples/stage80/82/83.as`。
 > **2026-10-23 追加（阶段二百六十二：`File.isSymbolicLink` —— `File` 谓词里唯一不跟随链接的那个）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 94 项**。本阶段是**补平差距**（`adl` 上该成员存在且行为明确，我们此前压根没登记）而非增强，按 §1.5 不入增强表。顺带量到的「空 `File` 的 `#2037` 在 `isSymbolicLink` 上同样成立」**并入**已有那行，不新开。
 > **2026-10-23 追加（阶段二百六十一：遗留表清仓（一）—— 移出 10 行 + 两条实错修净再下架 2 行）**：**新登记 0 行 / 改写 0 行 / 移出 12 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **106 → 94 项**（`未开始` **78 → 74** / `部分完成` 19 / `调研完成·实现暂缓` 1；`已修` 6 与 `已记录` 2 **归零**）。（a）**移出 10 行零代码项**：其中 **8 行的状态本就是「已修」/「已记录」**——表头自述「已完成项一经落地即从本表移出」，这 8 行违反了它，结论与证据早已写在各自阶段节里：`ident-free-fn.as` + `unit: emit/FreeFunctionNameReservation`（阶段二百四十）、`builtin-arity.as` + `unit: builtin/Arity`（阶段一百九十五）、`as_so_layer`/`as_so_path` + `[solstore]` 组（阶段一百九十四 ×2）、`setApplicationIconImage` 选图规则（阶段二百五十六）、`ScreenMouseEvent` 11 形参 + 21 钉（阶段二百五十八）；两条 `已记录` 是**刻意不跟**的口径分歧，归属 `docs/{zh-cn,en}/swc.md` §10（D42/R29）与 `docs/{zh-cn,en}/desktop.md` §7.6，不是欠账。**另 2 行是「已过期」**——「CRLF 检出下多行 XML 字面量触发假 Lex error」（`lexer.ts` 已按扫描**结束索引**推进，`temp/crlfcheck/` 复现确认 + `unit: lexer/XmlLiteral` 四条 CRLF 钉子）与「构建清单仍写死 `windows-x64`」（受控手写清单只剩 `examples/ane/ane.build.json`，改 `${host}` 后两宿主都成立；报告里其余 12 份经 `git ls-files --error-unmatch` 逐个核实全是 `.gitignore` 生成物/外部夹具）。（b）**另移出 2 行是「本阶段修净后按规矩下架」**：**AGAL 翻译器 MSL/GLSL 三处实错**（`od` 未声明且当标量、`iid` 译成未声明的 `r0`、空 stage 结构——现在 `od` 三档都是 `float4 od` 局部 + 目标各自的深度槽，`iid` 走 `[[instance_id]]`/`SV_InstanceID`、GLSL 因 ES 1.00 无 `gl_InstanceID` 而**响亮拒绝**，空结构按 `agal_is_used` 抑制；本轮装好 Metal 工具链后**真编译过**：新形态 7/7 过、旧形态两份都编不过）与 **`keyEquivalentModifiers` 未译成 `NSEventModifierFlags`**（`temp/keyeqprobe/` 用真按键 + 下拉菜单截图量出 15=⌘/16=⇧/17=⌃/18=⌥/19=无/20=惰性，`[15,20]`=`[15]`、`[]`=`[19]`），证据与已知边界见阶段二百六十一 节。**口径**：本表只留尚未收尾项，「已修/已记录/已过期」的行一到下一次清仓就该走，不留在表里占位。
@@ -15890,7 +15989,9 @@ junction 也报 `true`，这个位正好覆盖，而 MSVC 的 `_stat` 认不出�
 | **AGAL4 与顶点纹理取值（VTF）** | 未开始（阶段二百二十六 分档实测登记：这是 `enhanced` 相对 `standard` 唯一新增的东西） | `runtime.ts` 的 AGAL 前置对 `version > 3` **显式拒绝**、指令数上限硬编码 200；GLSL 翻译器**只在片元阶段声明 sampler**（`isFragment` 分支）⇒ WebGL2 上顶点取样会编译失败；MSL/HLSL 的顶点入口也没有对应的 `texture` 绑定槽。完工判据：AGAL4 解析 + 顶点 sampler 声明 + 三后端绑定与取样 |
 | **旗标打开后的显存预检与分配失败上报**（`Context3D.ignoreResourceLimits = true`） | 未开始（2026-10-22 阶段二百二十七 实测登记：`adl` 在 `#3684` 处**同步**失败，我们的惰性分配会把失败推到上传之后） | 旗标打开后我们只按**设备上限**（`as_s3d_max_texture_size()`，D3D12/Metal 16384）放行尺寸，**不预检像素总量**；而 2D/`RectangleTexture` 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `t->gpu` 留空，等 `uploadFromBitmapData`/`uploadFromByteArray` 才建），所以「设备上限允许、实际建不出来」这一档现在**不会**冒成 `#3684`——它会在上传时静默变成一张空贴图。`adl 51.4.1` 实测（`temp/adlprof/`，`PROBE_MODE=ign`）：旗标打开后 `baseline` 的 `createTexture(4096,1)`、`enhanced` 的 `createTexture(8192,1)` 都在**创建时**同步抛 `Error #3684: Texture creation failed. Internal error.`，即 AIR 在创建点就把分配做完了 | ① 给 `Texture`/`RectangleTexture` 的创建补一次**总量估算**（`w*h*bpp`，带 mip 时再乘 4/3，累加到 context 上），超过一个可配置的显存预算就抛 `#3684`（文案照 AIR）；② 或把 `as_s3d_create_render_texture` 的返回 `NULL` 立刻变成 `#3684`（目前只对 `optimizeForRenderToTexture=true` 有这条路径，且未检查返回值）。**成本中**，且要与「`ignoreResourceLimits=false` 时 AIR 的对象数量/显存预算」一起量（本阶段实测：`adl` 关旗标时 4300 个 1×1 贴图仍可建，即计数上限实际未生效，约束在显存） |
 | **打字过程中 `maxScrollH` 比 `adl` 少约一步**（AIR 在「已滚动」状态下报 `textWidth + 4 - width + 步长`） | 未开始（2026-10-22 阶段二百四十二 实测登记；与上面「`textWidth` 字形累进残差」同一族的**可观测读数**差） | `adl 51.4.1` 探针（`temp/tfprobe/`，200px 框 + `_typewriter` 12，逐字符打字）：60 字符时 `scrollH=244 / maxScrollH=274`，而 `textWidth+4-width = 225.9` ⇒ 多出的一步 ≈ 内宽 1/4（48.6）。同一字段**程序化**赋 `scrollH=100` 后 `maxScrollH` 仍是 232（不随之改变）⇒ 这个 +一步只在**打字路径**里出现，不是纯函数，我们没复刻；光标可见性与 `scrollH` 的平移行为不受影响 | 若要复刻，需要在**编辑路径**里把 `maxScrollH` 读成「布局量 + 一个步长」（`scrollH>0` 或「本帧有编辑」时），并在程序化赋值路径上保持旧值；先补一组「打字 / 赋值 / 点击」三态交叉的 adl 矩阵再动手，否则很容易把一条历史相关性固化成错误规则 |
-| **空 `File`（`new File()`）的成员访问全线不抛 `#2037`**（`nativePath`/`url`/`size`/`exists`/`isDirectory`/`name`/`extension`/`parent`/`spaceAvailable`/`getDirectoryListing`） | 未开始（2026-10-22 阶段二百四十三 实测登记：`adl 51.4.1` 上这**十个成员全部**抛 `#2037`，连 `nativePath` getter 本身都抛） | 我方 `File` 把 `nativePath` 当**普通字段**（`NULL` 原样返回、`url` 拼出 `"file://"`、`size`/`spaceAvailable` 回 `0`、`exists`/`isDirectory` 回 `false`、`parent` 回 `NULL`、`getDirectoryListing` 回空表）。本轮新增的 `moveToTrash`/`moveToTrashAsync` **是**抛 `#2037` 的（实测口径），但既有成员一个都没改——族级修复要先把 `nativePath` 从字段改成访问器（牵动 AMF 成员表、结构体布局、codegen 的字段访问），不是单点补丁 | 先把 `nativePath` 变访问器（`File_get_nativePath` 抛 `#2037`），再给其余九个成员各加同一守卫；每个成员配一条 `examples/` 断言 + 一条 `unit:` 源级钉。**注意**：`nativePath` 是 AMF 成员名，改成访问器时要同步 `File_amf_members` 与反射表 |
+| **空 `File`（`new File()`）的成员访问全线不抛 `#2037`**（`nativePath`/`url`/`size`/`exists`/`isDirectory`/`name`/`extension`/`parent`/`spaceAvailable`） | **部分完成**（2026-10-22 阶段二百四十三 实测登记：`adl 51.4.1` 上这十个成员全部抛 `#2037`，连 `nativePath` getter 本身都抛；**2026-10-23 阶段二百六十四 两个目录列举成员已补齐**） | 我方 `File` 把 `nativePath` 当**普通字段**（`NULL` 原样返回、`url` 拼出 `"file://"`、`size`/`spaceAvailable` 回 `0`、`exists`/`isDirectory` 回 `false`、`parent` 回 `NULL`）。**已对齐的两个**：`getDirectoryListing()`（空 `File` → `#2037`，顺带补齐 `#3003` 缺失 / `#3007` 非目录 / 不可读目录回空表三条实测口径）与 `getDirectoryListingAsync()`（空 `File` 与「上一次还在飞」共用 `#2037`）。**仍缺的八个**是上述 getter：族级修复要先把 `nativePath` 从字段改成访问器（牵动 AMF 成员表、结构体布局、codegen 的字段访问），不是单点补丁 | 先把 `nativePath` 变访问器（`File_get_nativePath` 抛 `#2037`），再给其余八个成员各加同一守卫；每个成员配一条 `examples/` 断言 + 一条 `unit:` 源级钉。**注意**：`nativePath` 是 AMF 成员名，改成访问器时要同步 `File_amf_members` 与反射表 |
+| **基类 `EventDispatcher.parent` 字段在动态读里压过派生类 getter**（`f["parent"]` 恒回 `null`，含 `File` 这种**有** `parent` getter 的类） | 未开始（2026-10-23 阶段二百六十四 实测登记；顺带发现、与异步化无关） | `adl 51.4.1`：`new File("…/a.txt")["parent"]` → `[object File]`、`typeof` 为 `"object"`、`"parent" in f` 为 `true`；我们同一个对象 `f.parent`（静态）正确而 **`f["parent"]` 回 `null`**（`typeof` 也是 `"object"` ⇒ 不是 `undefined`）。根因在 `as_dyn_get`（`src/runtime.ts:5335`）：它把**整条 super 链的 props（字段）表走完**，才轮到 getters 表 ⇒ 基类**字段**永远优先于派生类 **getter**；而 `EventDispatcher_props[]` 把 C 侧内部链接 `parent`（`offsetof(EventDispatcher, parent)`，`vis=0` 即「公开成员」）列了出来。`adl` 的 `EventDispatcher` **没有任何 accessor/variable**（`describeType` 实测为空表），所以这个字段本就不该是反射可见成员 | 两条路选一：① `EventDispatcher` 的 `parent` 链接**不进** `_props`（置 `vis=1`，与 `_arr`/`_runs` 那些 C-runtime-only 槽同口径），派生类的 getter 自然胜出；② 让 `as_dyn_get` 按**类层次**逐级解析（每级先看 props+getters 再看基类），与 AS3「派生遮蔽基类」一致。证据：`temp/listingprobe/{Shadow,DynParent}.as` + `adlshadow.txt`（`adl` 侧）| 先按 ① 改（一行 `vis`，改动面最小），再用 `for-in`/`JSON` 双端对照补验「该字段是否还从别的反射口漏出」；② 是更彻底的口径修复，但会动动态读的解析顺序，需全量回归 |
+| **`File` 的其余三个 async 成员仍是 inline 完成**（`moveToTrashAsync`/`deleteFileAsync`/`deleteDirectoryAsync`） | 未开始（2026-10-23 阶段二百六十四 登记；本阶段只把 `getDirectoryListingAsync` 真异步化，这三条**如实报明**） | `adl` 在自己的 IO 线程上完成再派发（实测「调用后立刻查 `exists` 仍为 `true`」），我们则**在同一次调用内**做完并派发 ⇒ 大盘（如递归删除几万个条目的目录）会照样把 AS3 线程卡住，且 `File.cancel()` 对它们没有可取消的作业（调用返回时作业已退休）。三者的 `#2037`/`#3003` 等**错误口径**已与 `adl` 一致（阶段二百四十三 已量），缺的只是**投递时机**与可取消性 | 与 `AS_JOB_DIR` 同法：各加一个作业类型（`AS_JOB_TRASH`/`AS_JOB_DELETE_FILE`/`AS_JOB_DELETE_DIR`）+ 完成 thunk（在 AS3 线程上派发 `COMPLETE`/`IOErrorEvent`），`File.cancel()` 已经按「按目标对象找在飞作业」实现，接上即可。注意 `moveToTrash` 在 Windows 走 `SHFileOperationW`，作业体里要保留同一条回退链 |
 | `NativeMenu.display()` **没有模态菜单后端** | 未开始（2026-10-23 阶段二百五十五） | AIR 的 `display(stage, x, y)` 弹一个**模态**原生菜单（阻塞到选中/取消）；本后端是**非阻塞**事件泵，没有可嵌套的模态运行器 ⇒ 现在**报明**并返回 `undefined`（不假装弹过）。`dispatchContextMenuSelect` 同样回 `undefined`（那一条与 `adl` 一致，不是缺口） | 要落地得给 run loop 加一层「嵌套模态泵」：进 `display()` 后跑一个局部 `NSModalSession`/嵌套 `SDL_PumpEvents`（只处理本菜单、吞掉其余输入），返回后恢复；风险是重入整个帧循环（计时器/事件/窗口结算都会停），须先证明普通 AIR 应用不会因此死锁。优先级低——菜单栏与 Dock 右键两条路已覆盖 demo 需求 |
 | **`Event` 的只读访问器在我们这里是可写字段**（`type` / `bubbles` / `cancelable` / `target` / `currentTarget` …） | 未开始（2026-10-23 阶段二百五十八 实测登记） | 阶段二百五十八 量动态写只读 trait 时顺手量出来的：`adl 51.4.1` 上 `(new ScreenMouseEvent("x") as Object)["type"] = 1` 抛 **`#1074`**（`type`/`bubbles`/`cancelable`/`target`/`clickCount` 全抛，且报文写的是**接收者的类**而不是声明者），`toString`/`clone` 这类方法名抛 **`#1037`**，只有真正不存在的名字才是 `#1056`；我方 `as_dyn_set` 本轮已按此补齐 `#1074`/`#1037` 两条，但 `type`/`bubbles`/`target` 在 `Event` 里是**普通字段**（`FieldInfo`），于是动态写会**照收**、静态写也编得过 ⇒ 与 `adl` 不一致。成因是 `Event` 从阶段三十五 就是「字段 + 直接访问」，改成访问器要动 `Event_ctor`/AMF 成员表/`X_props` 布局与全部派发点 | 先把 `type`/`target`/`bubbles`/`cancelable`/`currentTarget`/`eventPhase` 从字段改成 `X_get_*` 访问器（只读者不给 setter，写路径自然走 `#1074` 与编译错），同步 AMF 成员表与反射表；`Event_ctor` 与内置派发改用内部写入口。风险面较大（`Event` 是全部事件的基类），需先跑一遍全量回归确定零行为漂移再改 |
 

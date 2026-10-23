@@ -95,10 +95,12 @@ than to be exact.
 
 **Timing**: AIR completes on its own IO thread and dispatches asynchronously
 (measured: `exists` is still `true` right after the call). This build completes
-inline and dispatches from the same call — the convention every other async
-member of `File` follows here (`getDirectoryListingAsync`, `deleteFileAsync`,
-`deleteDirectoryAsync`). The only ordering a caller may rely on — "register the
-listener first, then start" — holds at both ends.
+inline and dispatches from the same call — the convention the remaining async
+members of `File` follow here (`deleteFileAsync`, `deleteDirectoryAsync`).
+`getDirectoryListingAsync` is the exception: it is genuinely async since stage 264 (§7).
+The only ordering a caller may rely on — "register the listener first, then start" — holds at
+both ends, but "the event is not there yet when the call returns" holds ONLY for
+`getDirectoryListingAsync`.
 
 ---
 
@@ -233,7 +235,59 @@ number is simply wrong.
 
 ---
 
-## 7. What is not done (on the record)
+## 7. Directory listings — two contracts, sync and async (stage 264)
+
+`getDirectoryListing()` and `getDirectoryListingAsync()` are **not the same semantics written two
+ways**: for the same input one throws and the other completes. Every row below was measured against
+`adl 51.4.1` (probes in `temp/listingprobe/` and `temp/dirasync/`) and is reproduced here; the
+example [`examples/file-listing-async.as`](../examples/file-listing-async.as) pins them as assertions.
+
+### 7.1 The async member is genuinely async (it used to be a synchronous fake)
+
+On `adl` it enumerates on its **own IO thread** and dispatches
+`FileListEvent.DIRECTORY_LISTING` **later**:
+
+| Observation | `adl 51.4.1` | This build |
+|---|---|---|
+| **Call duration** for a 20,000-entry directory | **0 ms** (the event lands ~**10.6 s** later) | same (enumeration runs in the `AS_JOB_DIR` job) |
+| A listener registered **after** the call | still fires | same |
+| Event shape | `type=directoryListing`, `files=File[]`, `bubbles=false`, `cancelable=false`, `target` is the `File` | same |
+| Path does not exist | dispatches `IOErrorEvent`: `errorID=3003` + `"Error #3003: File or directory does not exist."` (**no throw**) | same |
+| Path exists but is **not a directory** | **completes normally, empty `files`, no error** | same |
+| Directory is **unreadable** (EACCES) | **completes normally, empty, no error** | same |
+| `cancel()` | **really cancels**: no event ever | same |
+| Second call while one is in flight | **throws `#2037`**, and the first one still completes | same |
+| Empty `File` (`new File()`) | **throws `#2037` synchronously** | same |
+| Arrival order | the **same order as the sync member** (raw directory order; **neither sorts**) | same |
+
+> Before stage 264 this build was a **synchronous fake** — `getDirectoryListing()` plus a dispatch
+> from the same call — so the calling thread paid for the whole walk and `File.cancel()` was
+> permanently a no-op. That is §1.5's "`adl` gets it right and we cannot" ⇒ a **legacy defect**,
+> fixed in stage 264 (`AS_JOB_DIR` job + finish thunk + a real `cancel`).
+
+### 7.2 The sync member throws on three odd inputs, and deliberately does not share code
+
+| Input | `getDirectoryListing()` | `getDirectoryListingAsync()` |
+|---|---|---|
+| Empty `File` | throws `#2037` | throws `#2037` (same id, same text) |
+| Path does not exist | throws `#3003` | dispatches `ioError #3003`, **no throw** |
+| Exists, not a directory | throws **`#3007: Not a directory.`** | **completes with an empty listing, no error** |
+| Directory unreadable (EACCES) | **empty, no throw** | **completes with an empty listing, no error** |
+
+The last row is the only odd shape where **neither throws**, and it is the one a cleaner meets most:
+a permission denial is **not** a failure, it is an empty directory. Treating it as a failure inflates
+the "skipped" count; treating it as success is what `adl` does.
+
+### 7.3 The `FileListEvent` surface (measured along the way)
+
+`describeType(INSTANCE)` says: `extends=flash.events::Event`, the only instance **var is `files`**;
+there is **no `directory` and no `index`**. This build's shell over-declares a fourth parameter
+(`directory`) — a registered divergence (the arity row in `遗留待开发`) — so the finish thunk still
+passes the receiver there and keeps `files` in `adl`'s position.
+
+---
+
+## 8. What is not done (on the record)
 
 - **The WASI / Emscripten trash**: no counterpart API, so the call reports itself
   loudly and throws `#2038`. A browser has no recycle-bin concept at all, which makes
@@ -246,10 +300,22 @@ number is simply wrong.
   scale and has more failure points.
 - **Volume total / used** (plan G3): not done.
 - **`#2037` for the whole empty-`File` family**: see §5.2.
+- **Delivery timing of the other three async members**: see §3 (still inline, on the record).
 
 ---
 
-## 8. Reproduce
+## 9. Reproduce
+
+```sh
+# the adl contract for directory listings (probes in temp/listingprobe/ and temp/dirasync/)
+cd temp/dirasync && "$AIRSDK_HOME/bin/mxmlc" -load-config="$AIRSDK_HOME/frameworks/air-config.xml" \
+  -output Probe4.swf Probe4.as && "$AIRSDK_HOME/bin/adl" app4.xml
+
+# AOT side (test/examples.ts builds the fixture; noread/ is chmod 000)
+node --test --test-name-pattern='file-listing-async' test/examples.ts
+```
+
+## 10. An earlier stage's adl reproduction (the trash)
 
 ```sh
 # adl side (probe in temp/trashprobe/, log to adl_log*.txt; adl's stdout is unusable)
@@ -266,7 +332,9 @@ cd temp/trashprobe && cc -O1 -Wall -Wextra -o trash_impl trash_impl.c && HOME=/t
 
 Pins: `unit: emit/FileMoveToTrash` (17 source-level checks);
 `unit: emit/FileIsSymbolicLink` (7 source-level checks);
-`examples/move-to-trash.as` and `examples/file-symlink.as` (runtime; `EXAMPLE_ENV` in
-`test/examples.ts` points `HOME` at `temp/trash-home` and `temp/sym-home` respectively so
-the suite never fills the developer's trash — the symlink fixture is built with `node:fs`
-by that same file).
+`unit: emit/DirListingAsync` (17 source-level checks);
+`examples/move-to-trash.as`, `examples/file-symlink.as` and `examples/file-listing-async.as`
+(runtime; `EXAMPLE_ENV` in `test/examples.ts` points `HOME` at `temp/trash-home`,
+`temp/sym-home` and `temp/listing-home` respectively so the suite never fills the developer's
+trash — both fixture trees are built with `node:fs` by that same file, and `listing-home`'s
+`noread/` directory has its `chmod 000` restored when the suite ends).

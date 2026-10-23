@@ -14,11 +14,11 @@
 // so fanning them out would buy nothing), while these ~190 subprocess units were
 // awaited one at a time.
 import { execFile } from 'node:child_process';
-import { readdirSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { readdirSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { join, resolve, relative, dirname, basename } from 'node:path';
 import { promisify } from 'node:util';
-import { test, describe } from 'node:test';
+import { test, describe, after } from 'node:test';
 import assert from 'node:assert';
 import { root } from './harness.ts';
 import { aneHostDirName, aneHostLibName, currentAnePlatform, readAne } from '../src/ane.ts';
@@ -45,6 +45,30 @@ symlinkSync('real.txt', join(symFx, 'link-file.txt'));
 symlinkSync('sub', join(symFx, 'link-dir'));
 symlinkSync('nope', join(symFx, 'dangling'));
 symlinkSync('.', join(symFx, 'loop'));
+
+// The fixture that `file-listing-async.as` runs against (EXAMPLE_ENV points HOME here for
+// the same reason as file-symlink: the example reaches the tree through File.userDirectory).
+// It is rebuilt from scratch every run because the example asserts exact counts. `noread/`
+// is chmod 000 on purpose: an unreadable directory is the one odd shape that is NOT an
+// error in AIR -- measured on adl 51.4.1, both the sync and the async listing answer an
+// empty array -- so the example pins it, and it is the shape a real cleaner meets most.
+// IMPORTANT: a 000 directory cannot be removed (`rm -rf` reports EACCES and leaves it),
+// so the mode must not outlive the run. It is restored (a) here, which heals a leftover
+// from a killed run, and (b) in the after() hook below, so an ordinary run leaves temp/
+// removable. The directory is left EMPTY so that even a leftover is a one-rmdir fix.
+const listingHome = join(root, 'temp', 'listing-home');
+const listingFx = join(listingHome, 'fx');
+const listingNoread = join(listingFx, 'noread');
+try { chmodSync(listingNoread, 0o755); } catch { /* not there: first run */ }
+rmSync(listingFx, { recursive: true, force: true });
+mkdirSync(join(listingFx, 'sub'), { recursive: true });
+mkdirSync(listingNoread, { recursive: true });
+writeFileSync(join(listingFx, 'a.txt'), 'a');
+writeFileSync(join(listingFx, 'b.txt'), 'bb');
+writeFileSync(join(listingFx, 'sub', 'inner.txt'), 'xyz');
+symlinkSync('a.txt', join(listingFx, 'link-file.txt'));
+chmodSync(listingNoread, 0o000);
+after(() => { try { chmodSync(listingNoread, 0o755); } catch { /* already gone */ } });
 
 const dir = join(root, 'examples');
 const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
@@ -209,6 +233,11 @@ const EXAMPLE_ENV: Record<string, Record<string, string>> = {
   // key below is not what AIR's File.userDirectory reads, so there the example reports
   // itself skipped instead of asserting nothing (see the fixture check in the source).
   'file-symlink.as': { HOME: symHome, USERPROFILE: symHome },
+  // Same shape of fixture problem as file-symlink (the example reaches its tree through
+  // File.userDirectory, and a directory listing cannot be asserted on an empty one). This
+  // one additionally needs a directory it cannot OPEN, since an unreadable directory is the
+  // input that separates "empty listing" from "ioError" (see the fixture comment above).
+  'file-listing-async.as': { HOME: listingHome, USERPROFILE: listingHome },
 };
 
 // Per-example extra CLI arguments. The SWC example needs a resource library on

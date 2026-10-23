@@ -3394,6 +3394,99 @@ function checkEmitFileIsSymbolicLink(): string[] {
 }
 registerGroup('unit: emit/FileIsSymbolicLink', checkEmitFileIsSymbolicLink);
 
+// ---- 阶段二百六十四：File.getDirectoryListingAsync 真异步化（+ 同步成员异常口径） ----
+// The async member used to be a synchronous fake: it called getDirectoryListing()
+// and dispatched FileListEvent from the same call, so the AS3 thread paid for the
+// whole walk and cancel() could not mean anything. The new shape is pinned HERE
+// because the property under test is "the enumeration moved off this thread", and
+// the examples pool can only observe the results, not where they were produced.
+// The measured contract lives in temp/listingprobe/ (adl 51.4.1) and the
+// behavioural end-to-end assertions in examples/file-listing-async.as.
+function checkEmitDirListingAsync(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [dirasync] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [dirasync] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'import flash.events.FileListEvent;\n'
+    + 'import flash.filesystem.File;\n'
+    + 'var f:File = new File("/tmp/x");\n'
+    + 'f.getDirectoryListingAsync();\n'
+    + 'var a:Array = f.getDirectoryListing();\n'
+    + 'trace("" + a.length);\n')).c;
+  const pre = RUNTIME_PREAMBLE;
+  const emitSrc = readNorm(join(root, 'src', 'emit.ts'));
+
+  // 1. The enumeration really happens in the pool: a dedicated job kind, submitted
+  //    with the finish thunk, and the async member's body no longer enumerates.
+  check('the job pool has a directory-listing kind', /#define AS_JOB_DIR\s+10\n/.test(pre));
+  check('the async member submits that kind rather than enumerating',
+    emitSrc.includes("as_async_submit(AS_JOB_DIR, (void*)o, File__dirFinish, o->nativePath, NULL, 0);"));
+  check('the async member no longer calls the sync member',
+    !emitSrc.substring(
+      emitSrc.indexOf("'void File_getDirectoryListingAsync(void* _this) {'"),
+      emitSrc.indexOf("'void File_deleteFileAsync(void* _this) {'"),
+    ).includes('File_getDirectoryListing(_this)'));
+  check('the worker enumerates (opendir on POSIX, FindFirstFile on Windows)',
+    /case AS_JOB_DIR: \{[\s\S]*?opendir\(j->path\)/.test(pre)
+    && pre.includes('FindFirstFileA(pat, &fd)'));
+
+  // 2. The worker must not touch the GC heap: it stages names in malloc'd memory
+  //    and only the finish thunk (on the AS3 thread) builds File objects.
+  check('the worker stages names in malloc memory, not an as_array',
+    /case AS_JOB_DIR: \{[\s\S]*?as_job_dir_push\(j, /.test(pre)
+    // Scoped to the case body: later cases in the same switch do use as_array.
+    && !pre.substring(pre.indexOf('case AS_JOB_DIR: {'), pre.indexOf('case AS_JOB_HTTP: {'))
+      .includes('as_array_push('));
+  check('the staged names are freed when the job retires',
+    /as_job_retire\(as_job\* j\)[\s\S]{0,1200}?free\(j->names\);/.test(pre));
+  check('the finish thunk reads them through accessors',
+    c.includes('as_job_dir_count(job)') && c.includes('as_job_dir_name(job, i)'));
+
+  // 3. Only a MISSING path is an error. An unreadable directory (EACCES) and a path
+  //    that is not a directory both complete with an EMPTY listing on adl, so "the
+  //    open failed" must not be turned into an ioError -- that would be a silent
+  //    wrong answer for a cleaner, which is exactly the caller this matters to.
+  check('a failed stat is the only enumeration error (ioError #3003)',
+    /case AS_JOB_DIR: \{[\s\S]*?stat\(j->path, &st\) != 0\) \{ j->error = AS_JOB_ERR_NOT_FOUND; break; \}/.test(pre));
+  check('an unopenable-but-existing directory is an empty listing, not an error',
+    !/DIR\* d = opendir\(j->path\);\s*\n\s*if \(d == NULL\) \{[\s\S]{0,400}?AS_JOB_ERR_IO/.test(pre));
+  check('the #3003 dispatch carries the measured id and text',
+    c.includes('ev->errorID = 3003;')
+    && c.includes('Error #3003: File or directory does not exist.'));
+
+  // 4. cancel() cancels, and a second call while one is in flight throws #2037.
+  //    Both are what make this member's async-ness observable to a caller.
+  check('cancel() marks the in-flight job dead',
+    emitSrc.includes('void File_cancel(void* _this) {') && emitSrc.includes('as_async_cancel((void*)_this);'));
+  check('the in-flight guard is what raises #2037',
+    emitSrc.includes('as_async_dir_pending((void*)o)')
+    && pre.includes('static int as_async_dir_pending(void* obj)'));
+  check('the #2037 text is the measured one',
+    c.includes('Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.'));
+
+  // 5. The SYNC member's guards, measured on adl side by side with the async ones:
+  //    it THROWS where the async member completes, so sharing an assertion between
+  //    the two would be wrong.
+  check('sync throws #2037 for an empty File',
+    emitSrc.includes('if (o->nativePath == NULL) as_throw(Error_new((char*)"Error #2037:'));
+  check('sync throws #3003 for a path that does not exist',
+    emitSrc.includes('if (!as_path_exists(o->nativePath)) as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003));'));
+  check('sync throws #3007 for a path that is not a directory',
+    emitSrc.includes('if (!as_path_is_dir(o->nativePath)) as_throw(Error_new((char*)"Error #3007: Not a directory.", 3007));'));
+  // The guards must precede the opendir body, or an unreadable directory would be
+  // reported as one of them instead of as the empty listing adl answers.
+  check('the guards run before the enumeration body',
+    emitSrc.indexOf('Error #3007: Not a directory.') < emitSrc.indexOf('opendir(o->nativePath)'));
+
+  console.log(`     [dirasync] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/DirListingAsync', checkEmitDirListingAsync);
+
 // ---- 阶段二百四十五：flash.system.System.exit(code:uint) ----------------
 // Pins the SHAPE of the emission. The running process status is asserted end to
 // end by `example: system-exit-status.as` in test/examples.ts (an examples/ pool

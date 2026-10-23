@@ -16511,16 +16511,79 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('gc_write_barrier((void*)o->nativePath);');
     this.indent--;
     this.line('}');
-    // The async half of the File API. AIR delivers the result as an event, so the
-    // listing is computed synchronously and the event is dispatched from the same
-    // call: every caller in the wild registers its listener BEFORE it asks (that
-    // is the only pattern that works in AIR too), so the delivery order that
-    // matters is preserved. `deleteDirectoryAsync` ignores its flag argument like
-    // AIR does when the directory is already empty; both deletes report COMPLETE.
+    // The async half of the File API. `getDirectoryListingAsync` is the one member
+    // that is genuinely asynchronous in this build: it enumerates on a worker
+    // thread (AS_JOB_DIR) and dispatches at a frame boundary, because that is what
+    // adl does and what the member is FOR. Measured against adl 51.4.1 --
+    // `temp/dirasync/` -- the contract has five parts, and all five are reproduced
+    // below: (1) the call returns immediately even for a 20,000-entry directory
+    // (adl: 0 ms, with the event ~10.6 s later); (2) delivery happens AFTER the
+    // call returns, so a listener registered immediately afterwards still fires;
+    // (3) a path that does not exist dispatches ioError #3003 instead of
+    // completing; (4) a path that exists and is NOT a directory completes with an
+    // empty files array (the sync member throws #3007 for that same input, so the
+    // two are deliberately not shared); (5) a second call while one is in flight
+    // throws #2037, while `cancel()` actually cancels -- the pending event is
+    // dropped, which is what makes cancel() mean anything here.
+    //
+    // The other async members (`moveToTrashAsync`/`deleteFileAsync`/
+    // `deleteDirectoryAsync`) still complete inline; their deferred delivery is
+    // registered in TODO.md's 遗留待开发, not silently claimed here.
+    this.line('static void File__dirFinish(void* job) {');
+    this.indent++;
+    this.line('File* o = (File*)as_job_obj(job);');
+    this.line('if (o == NULL) return;');
+    this.line('int err = as_job_failed(job);');
+    this.line('if (err == AS_JOB_ERR_NOT_FOUND) {');
+    this.indent++;
+    this.line('IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, (char*)"Error #3003: File or directory does not exist.");');
+    this.line('ev->errorID = 3003;');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('if (err != 0) {');
+    this.indent++;
+    // Only the worker's own allocation failure reaches here: a path that cannot be
+    // OPENED (unreadable, or not a directory) completes with an empty listing
+    // instead, which is what adl 51.4.1 does for both (measured in
+    // temp/listingprobe/). #2038 is AIR's File I/O id, but this branch is NOT
+    // measurable against adl -- there is no input that produces it there -- so it
+    // is reported rather than guessed at per-errno.
+    this.line('IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, (char*)"Error #2038: File I/O Error.");');
+    this.line('ev->errorID = 2038;');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('as_array* files = as_array_new();');
+    this.line('int n = as_job_dir_count(job);');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('char* nm = as_job_dir_name(job, i);');
+    this.line('if (nm == NULL) continue;');
+    this.line('as_array_push(files, as_v_obj((void*)File_new(as_path_join(o->nativePath, nm))));');
+    this.indent--;
+    this.line('}');
+    // FileListEvent's fifth parameter is 'files'; our shell also declares a fourth
+    // ('directory') that AIR's class does not have -- that over-declaration is a
+    // registered divergence, so the receiver is passed there and 'files' keeps its
+    // AIR position.
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)FileListEvent_new((char*)"directoryListing", false, false, o, files));');
+    this.indent--;
+    this.line('}');
     this.line('void File_getDirectoryListingAsync(void* _this) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
-    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)FileListEvent_new((char*)"directoryListing", false, false, o, File_getDirectoryListing(_this)));');
+    // Both guards report the SAME #2037 text, which is what adl does: an empty
+    // File and a call-while-in-flight are one error id and one message there.
+    this.line('if (o->nativePath == NULL || as_async_dir_pending((void*)o)) {');
+    this.indent++;
+    this.line('as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037));');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('as_async_submit(AS_JOB_DIR, (void*)o, File__dirFinish, o->nativePath, NULL, 0);');
     this.indent--;
     this.line('}');
     this.line('void File_deleteFileAsync(void* _this) {');
@@ -16529,9 +16592,13 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('EventDispatcher_dispatchEvent((void*)_this, Event_new((char*)"complete", false, false));');
     this.indent--;
     this.line('}');
-    // File.cancel(): nothing is ever in flight (every async member here completes
-    // synchronously), so this is honestly a no-op.
-    this.line('void File_cancel(void* _this) { (void)_this; }');
+    // File.cancel(): cancels the pending directory listing (the only async member
+    // here that has something in flight). AIR's cancel() drops the event, and so
+    // does this: as_async_cancel marks the job dead, so its thunk never runs and
+    // nothing is dispatched. The other async members have already completed by the
+    // time they return, so for them -- and for a cancel() with nothing pending --
+    // this stays a no-op, exactly as adl leaves it.
+    this.line('void File_cancel(void* _this) { as_async_cancel((void*)_this); }');
     this.line('void File_deleteDirectoryAsync(void* _this, bool deleteDirectory) {');
     this.indent++;
     this.line('(void)deleteDirectory;');
@@ -16556,8 +16623,17 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('as_array* File_getDirectoryListing(void* _this) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
+    // The three guards, in the order adl 51.4.1 applies them (measured on all four
+    // odd shapes in temp/listingprobe/): no path at all is #2037, a path that does
+    // not exist is #3003, and a path that exists but is not a directory is #3007.
+    // The sync member THROWS where the async one completes with an empty listing,
+    // so neither may be derived from the other. An UNREADABLE directory is the one
+    // odd shape that does NOT throw: opendir() fails and adl answers an empty
+    // listing, sync and async alike -- which is what the body below already does.
+    this.line('if (o->nativePath == NULL) as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037));');
+    this.line('if (!as_path_exists(o->nativePath)) as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003));');
+    this.line('if (!as_path_is_dir(o->nativePath)) as_throw(Error_new((char*)"Error #3007: Not a directory.", 3007));');
     this.line('as_array* result = as_array_new();');
-    this.line('if (o->nativePath == NULL) return result;');
     this.line('#ifdef _WIN32');
     this.line('// MSVC has no dirent.h; enumerate with FindFirstFile/FindNextFile, which');
     this.line('// want a backslash separator (FindFirstFile rejects the \'/\' as_path_join');
