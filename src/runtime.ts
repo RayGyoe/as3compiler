@@ -8861,9 +8861,15 @@ typedef struct { const char* title; int first; int count; } sk_menu;
 #if defined(ASC_USE_WINDOW) && defined(__APPLE__)
 #define ASC_HAS_DOCK 1
 #define ASC_HAS_APP_MENU 1
+// The Dock IMAGE is a separate capability from the Dock MENU even though both are
+// Cocoa-only today: the menu exists as an NSMenu the glue builds, the image has to
+// cross as premultiplied pixels. Kept apart so a future non-Cocoa backend can paint
+// the icon without pretending it owns a menu bar.
+#define ASC_HAS_DOCK_IMAGE 1
 #else
 #define ASC_HAS_DOCK 0
 #define ASC_HAS_APP_MENU 0
+#define ASC_HAS_DOCK_IMAGE 0
 #endif
 #define ASC_HAS_TRAY 0
 #define ASC_HAS_LOGIN_ITEM 0
@@ -8873,12 +8879,17 @@ extern int sk_menu_supported(void);
 extern void sk_menu_install_app(const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, void (*cb)(int));
 extern void sk_menu_install_dock(const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, void (*cb)(int));
 extern void sk_dock_bounce(int critical);
+// Straight ARGB (0xAARRGGBB) rows, top-down -- i.e. BitmapData.pixels verbatim. Pass
+// NULL/0/0 to restore the bundle icon. Returns nothing: the glue queues the image if
+// AppKit is not up yet and applies it from the event loop.
+extern void sk_dock_set_icon_image(const void* argb, int w, int h);
 extern void sk_window_set_auto_exit(int on);
 #else
 static inline int sk_menu_supported(void) { return 0; }
 static inline void sk_menu_install_app(const sk_menu* m, int nm, const sk_menu_item* i, int ni, int root, void (*cb)(int)) { (void)m; (void)nm; (void)i; (void)ni; (void)root; (void)cb; }
 static inline void sk_menu_install_dock(const sk_menu* m, int nm, const sk_menu_item* i, int ni, int root, void (*cb)(int)) { (void)m; (void)nm; (void)i; (void)ni; (void)root; (void)cb; }
 static inline void sk_dock_bounce(int critical) { (void)critical; }
+static inline void sk_dock_set_icon_image(const void* argb, int w, int h) { (void)argb; (void)w; (void)h; }
 static inline void sk_window_set_auto_exit(int on) { (void)on; }
 #endif
 #ifdef ASC_USE_SKIA
@@ -9328,6 +9339,13 @@ extern void sk_window_get_client_size(int id, int* lw, int* lh);
 extern int sk_window_is_active(int id);
 extern int sk_window_os_display_state(int id);
 extern void sk_window_set_always_in_front(int id, int on);
+// Per-window transparency (NativeWindowInitOptions.transparent, and the initial
+// window's descriptor <transparent> via ASC_WINDOW_TRANSPARENT). The glue owns the
+// platform side (on macOS: NSWindow opaque=NO + clear background + a non-opaque
+// layer); the AS3 side keeps w->transparent because the compose step must clear
+// to alpha 0 instead of the stage colour -- AIR does not fill the stage background
+// in this mode (measured on adl 51.4.1).
+extern void sk_window_set_transparent(int id, int on);
 // NativeWindow.minSize/maxSize. The limits live in the glue (0 = unlimited) and
 // are what the window manager enforces while the user drags an edge; the AS3 side
 // keeps its own copy because AIR's getters report the last value written, even on
@@ -9685,6 +9703,13 @@ static inline void as_window_set_always_in_front(int id, int on) {
     (void)id; (void)on;
 #endif
 }
+static inline void as_window_set_transparent(int id, int on) {
+#ifdef ASC_USE_WINDOW
+    sk_window_set_transparent(id, on);
+#else
+    (void)id; (void)on;
+#endif
+}
 // NativeWindow.minSize/maxSize. The window manager owns the enforcement (a resize
 // drag must respect them), the AS3 side owns the values AIR's getters report — so
 // the two are kept in step by always going through these two calls.
@@ -9985,6 +10010,7 @@ static inline void as_window_get_client_size(int id, int* lw, int* lh) { (void)i
 static inline int as_window_os_display_state(int id) { (void)id; return -1; }
 static inline int as_window_is_active(int id) { (void)id; return 0; }
 static inline void as_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
+static inline void as_window_set_transparent(int id, int on) { (void)id; (void)on; }
 static inline void as_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh) {
     (void)id; if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
 }

@@ -18,11 +18,14 @@
 //   * 列表：重复 addItem 静默忽略、addItemAt(已存在) #2004、removeItem(外来) #2006、
 //     getItemAt 越界 #2006、getItemByName 认 name 不认 label
 //   * 拷贝：items / bitmaps / keyEquivalentModifiers 的 getter 每次回新 Array
+//   * DockIcon.bitmaps 赋值：width/height 取逐轴最大值，清空后沿用旧值（选图规则
+//     本身只在有 Cocoa 的构建里可观测，钉在 unit: emit/DockIconImage）
 //   * modifiers：只留 15..20、升序去重
 //   * submenu：写进去后 submenu.parent 就是「拥有它的那个菜单」
 //   * clone：深拷贝（item 不共享）、但 data 不复制
 //   * 能力位：supportsMenu/supportsDockIcon 反映**后端**（无窗口后端即 false），
 //     na.menu 恒非 null，na.autoExit 可读可写
+import flash.display.BitmapData;
 import flash.display.NativeMenu;
 import flash.display.NativeMenuItem;
 import flash.desktop.NativeApplication;
@@ -155,6 +158,15 @@ eq("SystemTrayIcon.MAX_TIP_LENGTH", SystemTrayIcon.MAX_TIP_LENGTH, 63);
 var na:NativeApplication = NativeApplication.nativeApplication;
 eq("na.icon is an Icon", (na.icon as Object) !== null, true);
 eq("pristine dock bitmaps length", count((na.icon as DockIcon).bitmaps), 0);
+// DockIcon.bitmaps 的「哪张上屏」是纯模型的选图规则（|max(w,h) - 128| 最小，
+// 并列取更早的那张，见 TODO 阶段二百五十六）。纯 C 构建不上屏，但 setter 全路
+// 仍然要跑通：赋值后 width/height 更新，清空后沿用旧值（adl 实测）。
+var dockIcon:DockIcon = na.icon as DockIcon;
+dockIcon.bitmaps = [new BitmapData(1, 1, true, 0xFFFF0000), new BitmapData(2, 2, true, 0xFF00FF00)];
+eq("bitmaps assignment keeps both entries", count(dockIcon.bitmaps), 2);
+eq("bitmaps assignment updates width/height", dockIcon.width + dockIcon.height, 4);
+dockIcon.bitmaps = [];
+eq("clearing bitmaps keeps the last width/height", dockIcon.width + dockIcon.height, 4);
 eq("na.menu is never null", (na.menu as Object) !== null, true);
 eq("autoExit default", na.autoExit, true);
 na.autoExit = false;

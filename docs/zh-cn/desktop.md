@@ -12,6 +12,11 @@
 > 日志写文件——`adl` 的 stdout 不出现）。其中 `probe7.txt` / `probe8.txt` 是本轮专门为「子菜单归属」
 > 与「主菜单形态」写的。**本文每一条「AIR 怎样」都有对应探针输出**，没有一条是从文档转述的。
 >
+> **2026-10-23 追加（阶段二百五十六，v0.4.219 → v0.4.220）**：`DockIcon.bitmaps` 现在真的**上屏**了。
+> 本轮先把「AIR 用哪张」实测出来（`temp/dockprobe/`：纯色位图 → 截屏取色），再把像素交给
+> `-[NSApplication setApplicationIconImage:]`；因此 §3 多出一张**选图规则**表，§7.2 只剩修饰键一项，
+> 另加 §7.6 记录一处**刻意不跟**的渲染差异（AIR 的半透明像素被乘了两次 alpha）。
+>
 > 一句话结论：**AIR 在 `flash.desktop` 里有完整的一等公民图标 API（不是「无对应物」）；
 > macOS 上 `supportsDockIcon` 为 `true`、`supportsSystemTrayIcon` 为 `false`；
 > `NativeApplication.menu` 不是 `null` 且可整条替换**。
@@ -24,7 +29,7 @@
 |---|---|---|
 | `Icon` | ✅ 实现 | **可实例化**（`new Icon()` 合法），`bitmaps` 默认 `null`（读它抛 `#1009`） |
 | `InteractiveIcon` | ✅ 实现（模型层） | `new InteractiveIcon()` 抛 `#2012`；`width`/`height` 是派生只读 |
-| `DockIcon` | ✅ 实现（含 Dock 右键菜单） | `new DockIcon()` 抛 `#2012`；**位图不上屏**（§7.2） |
+| `DockIcon` | ✅ 实现（含 Dock 右键菜单 + 位图上屏） | `new DockIcon()` 抛 `#2012`；选图规则与透明度见 §3.1、§7.6 |
 | `SystemTrayIcon` | ✅ 实现（模型层） | macOS 上 AIR 自己不提供（`#2012`），我们同样不提供 |
 | `NativeApplication.icon` | ✅ | **只读**（`mxmlc` 报「属性 icon 为只读」）；进程内单例 |
 | `NativeApplication.menu` | ✅ | 可读可写；`= null` 在 `adl` 上**崩溃**，我们**报明并保持原状**（§7.1） |
@@ -75,6 +80,37 @@
 | `bounce("bogus")` | **不抛**（未知优先级按信息级处理） | 同（`NSCriticalRequest` / `NSInformationalRequest`） |
 | `dockIcon.menu = "string"` | 读回 `null`（类型不符即视为无菜单） | 同 |
 | `SystemTrayIcon.MAX_TIP_LENGTH` | `63` | 同 |
+
+### 3.1 `bitmaps` 里哪一张真的上屏（实测选图规则）
+
+AIR 不做「交给 AppKit 自己挑」：它**先按一个固定目标尺寸选出一张**，再把那一张交给系统。
+证据是「给两张、看 Dock 变成哪个颜色」的对照实验（`temp/dockprobe/`，纯色位图 + `screencapture` 取色），
+每轮只换尺寸组合：
+
+| 喂进 `bitmaps` 的尺寸（颜色） | Dock 上真的出现的 |
+|---|---|
+| `{32(红), 96(绿), 256(蓝)}` | **96（绿）** |
+| `{64(红), 160(绿)}` | **160（绿）** |
+| `{16(红), 512(绿)}` | **16（红）** ← 16 赢了 512 |
+| `{100(红), 150(绿)}` | **150（绿）** |
+| `{127(红), 129(绿)}` | **127（红）** |
+| `{129(红), 127(绿)}` | **129（红）** ← 顺序反了就换人赢 |
+| `{128(红), 130(绿)}` | **128（红）** |
+| `{128×400(红), 200×200(绿)}` | **200×200（绿）** ← 宽 128 的输了 |
+
+这八轮把规则钉死成一句话：**取 `|max(width, height) − 128|` 最小的那张，并列时取数组里更早的那张**。
+- 「16 赢 512」否定了「越大越好」；「160 赢 64」否定了「不超过 128 的最大者」；
+- 两张只差 2 像素、顺序一反过来赢家就换（127/129）⇒ **并列取更早**，目标值正好是 **128**；
+- 宽 128×高 400 输给 200×200 ⇒ 度量是**逐轴最大值**，不是宽。
+
+其余与上屏有关的实测口径：
+
+| 场景 | `adl 51.4.1` 实测 | 我方 |
+|---|---|---|
+| 重新赋值 `bitmaps` | **立刻重绘**（不用等重启/换焦点） | 同（setter 内同步画） |
+| `bitmaps = []` | 恢复**默认应用图标**（不是留着上一张） | 同（`setApplicationIconImage:nil`） |
+| 半透明位图 | alpha 生效（透明处透出 Dock 背景） | 同（预乘后交给 AppKit，§7.6） |
+| 非正方形位图 | 按原比例放在方形图槽里（不拉伸） | 同 |
 
 ---
 
@@ -159,13 +195,11 @@ NativeMenu/NativeMenuItem  →  sk_menu[] + sk_menu_item[]（dfs 展平，子菜
 `adl 51.4.1` 实测：赋 `null` 会让 adl 进程直接死掉。我方按 §1.5「不静默改写 AIR 已定义行为」处理为
 **报明 + 保持原状**（`as_shell_unsupported("flash.desktop.NativeApplication.menu = null …")`）。
 
-### 7.2 两处「模型对、像素/修饰键还没到位」（各报明一次）
+### 7.2 `keyEquivalentModifiers` 不翻译成 `NSEventModifierFlags`
 
-- **`DockIcon.bitmaps` 不上屏**：模型（列表、`#2005`/`#2007`、宽高派生）完全对齐，但**没有把位图画到
-  Dock 图标上**。照 AIR 写这段代码能跑、行为是「图标不变」。**报明一次**，登记在 `TODO.md` 遗留表。
-- **`keyEquivalentModifiers` 不翻译成 `NSEventModifierFlags`**：`keyEquivalent` 本身绑得上，
-  六个合法值（`15..20`）**没有映射**，于是快捷键会按 AppKit 默认修饰键触发。**报明一次**，
-  绝不静默绑一个错的快捷键。登记在 `TODO.md` 遗留表。
+`keyEquivalent` 本身绑得上，六个合法值（`15..20`）**没有映射**，于是快捷键会按 AppKit 默认修饰键触发。
+**报明一次**，绝不静默绑一个错的快捷键。登记在 `TODO.md` 遗留表。
+（上一轮同在这里的「`DockIcon.bitmaps` 不上屏」已于阶段二百五十六清偿，见 §3.1。）
 
 ### 7.3 `NativeMenu.display()` 没有模态菜单后端
 
@@ -190,12 +224,33 @@ Windows 侧将来接 `HWND` 菜单栏是**独立阶段**的事；wasm 没有原�
 
 ---
 
+### 7.6 半透明像素：AIR 会**多乘一次 alpha**，我们只乘一次（刻意不跟）
+
+同一位图（128×128，左上 `0xFF0000FF` 不透明蓝、右上 `0xFFFF8000` 不透明橙、左下 `0x800000FF`
+50% 蓝、右下 `0x80FF8000` 50% 橙）分别交给 `adl` 与 AOT 构建，同一个 Dock 图标槽位取色：
+
+| 象限 | `adl 51.4.1` | 我方 |
+|---|---|---|
+| 不透明蓝 / 不透明橙 | `(0.2, 0.2, 244.7)` / `(238.8, 134.9, 50.7)` | **完全一致** |
+| 50% 蓝 | `(36.9, 61.0, 122.3)` | `(36.9, 61.0, 183.6)` |
+| 50% 橙 | `(92.2, 81.8, 57.7)` | `(152.0, 115.7, 72.8)` |
+
+拆开看：**背景项完全一致**（`(1-a)·bg` 两边相同，说明 alpha 本身没错），**只有源色项被多乘了一次 `a`**
+（`adl` 是 `a²·src + (1-a)·bg`，正确合成是 `a·src + (1-a)·bg`）。也就是 AIR 把**已经预乘过**的字节
+当成「直通 alpha」的图交给 AppKit，AppKit 又乘一遍 ⇒ 半透明像素整体**偏暗**（经典的双重预乘瑕疵）。
+
+**我方选择：只乘一次（正确合成）**，理由：这不是 AIR *定义*的行为，而是一次转换瑕疵；照抄它等于
+故意实现一个变暗 bug（图标圆角的抗锯齿边会出现暗边）。不透明像素两边**逐字节相同**，所以普通图标
+看不出差别；差异只出现在带 alpha 的像素上。**如实登记在 `TODO.md` 遗留表**，不静默。
+
 ## 8. 验收与证据
 
 | 项 | 证据 |
 |---|---|
-| 模型层 66 条断言（纯 C 构建，无窗口后端） | `examples/native-menu.as` → `native-menu: 66 checks passed` |
-| 生成 C 的 38 条源级钉 | `test/unit/emit.ts` 的 `unit: emit/NativeMenu` |
+| 模型层 69 条断言（纯 C 构建，无窗口后端） | `examples/native-menu.as` → `native-menu: 69 checks passed` |
+| 生成 C 的 39 条源级钉 + 上屏 16 条 | `test/unit/emit.ts` 的 `unit: emit/NativeMenu` 与 `unit: emit/DockIconImage` |
+| **选图规则 8 轮** | `temp/dockprobe/`：`{32,96,256}→96`、`{16,512}→16`、`{129,127}→129`、`{128×400, 200×200}→200×200` …（§3.1 表） |
+| **上屏 / 透明度 / 清除 / 重绘** | `temp/dockquad.as`（AOT 构建）× `temp/dockprobe/Main.as`（`adl`）：不透明像素取色**完全一致**、50% 蓝 `183.6` vs `adl` `122.3`（§7.6）、`bitmaps=[]` 后回默认图标、`t8` 重赋值立刻变色 |
 | 真菜单栏 + 真点击 | `temp/G4App.app`（`NSPrincipalClass=NSApplication`）：AX 读到 `Apple, G4App, Prune`，点 `Prune → PruneTwo` 后 AS3 的 `SELECT` 监听器真的跑了（写 `/tmp/g4click.txt` = `two`） |
 | Dock 右键菜单 | `sk_menu_install_dock` 把 `applicationDockMenu:` swizzle 到 SDL 的 delegate 上（真右键点击未自动化） |
 | `autoExit=false` 驻留 | 同一 bundle：关窗后进程仍在，直到 `NativeApplication.exit()` |

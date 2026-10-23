@@ -3636,9 +3636,20 @@ function checkEmitNativeMenu(): string[] {
 
   // ---- capability flags answer for the backend ------------------------------
   const pre = RUNTIME_PREAMBLE;
+  // The Dock IMAGE capability now shares this block (阶段二百五十五 follow-up), so the
+  // check asserts the block's SHAPE rather than a verbatim three-line run: the
+  // Apple arm must turn DOCK / APP_MENU / DOCK_IMAGE on and the else arm off.
+  const dockBlock = /#if defined\(ASC_USE_WINDOW\) && defined\(__APPLE__\)([\s\S]*?)#else([\s\S]*?)#endif/.exec(pre);
   check('the Dock and the app menu are Cocoa-only',
-    /#if defined\(ASC_USE_WINDOW\) && defined\(__APPLE__\)\r?\n#define ASC_HAS_DOCK 1\r?\n#define ASC_HAS_APP_MENU 1/.test(pre)
-    && /#else\r?\n#define ASC_HAS_DOCK 0\r?\n#define ASC_HAS_APP_MENU 0\r?\n#endif/.test(pre));
+    dockBlock != null
+    && /#define ASC_HAS_DOCK 1/.test(dockBlock[1])
+    && /#define ASC_HAS_APP_MENU 1/.test(dockBlock[1])
+    && /#define ASC_HAS_DOCK 0/.test(dockBlock[2])
+    && /#define ASC_HAS_APP_MENU 0/.test(dockBlock[2]));
+  check('the Dock IMAGE capability follows the same backend test',
+    dockBlock != null
+    && /#define ASC_HAS_DOCK_IMAGE 1/.test(dockBlock[1])
+    && /#define ASC_HAS_DOCK_IMAGE 0/.test(dockBlock[2]));
   check('tray / login item / default app are never advertised',
     pre.includes('#define ASC_HAS_TRAY 0')
     && pre.includes('#define ASC_HAS_LOGIN_ITEM 0')
@@ -3669,3 +3680,72 @@ function checkEmitNativeMenu(): string[] {
   return bad;
 }
 registerGroup('unit: emit/NativeMenu', checkEmitNativeMenu);
+
+// ---- 阶段二百五十六：DockIcon.bitmaps 上屏 ----------------------------------
+// Two things are pinned here that no example can see: (1) the bitmap AIR actually
+// paints, which was derived from screen-grab probes (temp/dockprobe) and is a pure
+// selection rule inside the generated C, and (2) the conversion the Cocoa glue has
+// to do, which failed visibly the first time it was left out (straight-alpha bytes
+// reaching NSBitmapImageRep paint a transparent pixel's colour as a black bar).
+function checkEmitDockIconImage(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [dockimg] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [dockimg] ${label}`); }
+  };
+  const c = generateC(parse([
+    'import flash.display.BitmapData;',
+    'import flash.desktop.NativeApplication;',
+    'var b:BitmapData = new BitmapData(128, 128, true, 0xFFFF0000);',
+    'NativeApplication.nativeApplication.icon.bitmaps = [b];',
+  ].join('\n'))).c;
+  const sync = fnBody(c, 'static void as_dock_icon_sync(Icon* o) {');
+  check('the sync helper is emitted', sync !== '');
+  // The three probes that fix the rule: {16,512}->16, {64,160}->160, {127,129}->127
+  // are "closest to 128"; {129,127}->129 is "first wins" on a tie; 128x400 loses to
+  // 200x200 is "per-axis maximum", not width.
+  check('the pick metric is the per-axis MAXIMUM',
+    sync.includes('int m = b->width > b->height ? b->width : b->height;'));
+  check('...measured against 128', sync.includes('int d = m > 128 ? m - 128 : 128 - m;'));
+  check('...with a tie going to the earlier entry (strict improvement)',
+    sync.includes('if (best == NULL || d < bestd) { best = b; bestd = d; }'));
+  check('the selected bitmap is what gets painted',
+    sync.includes('sk_dock_set_icon_image(best->pixels, best->width, best->height);'));
+  // measured: bitmaps = [] puts the default Dock icon back instead of leaving the
+  // last painted image on screen.
+  check('an empty list CLEARS the icon', sync.includes('sk_dock_set_icon_image(NULL, 0, 0);'));
+  check('a bare Icon holding non-BitmapData elements cannot be painted',
+    sync.includes('!as_is(e.ptr, &BitmapData_vt)'));
+  // The predicate is a compile-time capability, so a backend without a Dock still
+  // reports the gap once instead of silently doing nothing.
+  check('painting is gated on ASC_HAS_DOCK_IMAGE', c.includes('#if ASC_HAS_DOCK_IMAGE'));
+  check('the non-Cocoa arm still reports the missing capability once',
+    sync.includes('the Dock icon image is not painted by this backend yet')
+    && c.includes('as_shell_unsupported'));
+  check('the report latch only exists in the arm that reports',
+    c.includes('#if !ASC_HAS_DOCK_IMAGE') && c.includes('static bool ASC_dock_image_reported = false;'));
+
+  // ---- the Cocoa half (vendor/window_glue.cc) ----
+  const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
+  check('the glue premultiplies instead of handing AppKit straight alpha',
+    glue.includes('r = (r * a + 127u) / 255u;'));
+  check('...into an RGBA NSBitmapImageRep at its OWN bytesPerRow',
+    glue.includes('long rb = (long)sk_send_int(rep, "bytesPerRow");'));
+  check('...and installs it as the application icon (nil restores the bundle icon)',
+    glue.includes('sk_send_void_obj(app, "setApplicationIconImage:", g_dock_image);'));
+  // An icon set before NSApp exists must be retried, not dropped: measured, AS3
+  // code that assigns bitmaps at startup does so before the window opens.
+  check('an early assignment is retried from the event loop',
+    glue.includes('static void sk_dock_image_flush(void) {')
+    && /static void sk_menu_ensure\(void\)([\s\S]*?)sk_dock_image_flush\(\);/.test(glue));
+  check('the non-Cocoa window backend defines the seam so a flipped macro still links',
+    /void sk_dock_set_icon_image\(const void\* argb, int w, int h\) \{ \(void\)argb; \(void\)w; \(void\)h; \}/.test(glue));
+  const web = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8');
+  check('the wasm backend stubs it too (else wasm-ld: undefined symbol)',
+    /void sk_dock_set_icon_image\(const void\* argb, int w, int h\) \{ \(void\)argb; \(void\)w; \(void\)h; \}/.test(web));
+
+  console.log(`     [dockimg] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/DockIconImage', checkEmitDockIconImage);

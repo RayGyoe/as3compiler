@@ -477,6 +477,11 @@ int sk_window_is_active(int id) { (void)id; return 0; }
 // be a lie that overwrites that record on every frame.
 int sk_window_os_display_state(int id) { (void)id; return -1; }
 void sk_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
+// The browser owns the page's compositing: a page cannot ask for a translucent
+// window, so there is nothing to apply. The generated C still keeps the flag, and
+// the compose step clears to alpha 0, which is harmless — the page background
+// shows through exactly as it does for any transparent canvas.
+void sk_window_set_transparent(int id, int on) { (void)id; (void)on; }
 // minSize/maxSize and the system move/resize drags have no browser counterpart:
 // a page's window belongs to the browser, so there is no frame to size-limit and
 // no frame to hand over to the pointer. "No limit" and "the drag did not start"
@@ -551,6 +556,9 @@ int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_
   (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
 }
 void sk_dock_bounce(int critical) { (void)critical; }
+// DockIcon.bitmaps: a browser tab has no Dock icon. Exists only so a build that
+// flips ASC_HAS_DOCK_IMAGE later still links.
+void sk_dock_set_icon_image(const void* argb, int w, int h) { (void)argb; (void)w; (void)h; }
 // autoExit: a page cannot "exit", and the requestAnimationFrame loop is owned by
 // the host, so there is nothing to keep alive here. Accepted and ignored.
 void sk_window_set_auto_exit(int on) { (void)on; }

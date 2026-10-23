@@ -10,6 +10,12 @@
 > `mxmlc`, run with `adl`, logging to files — `adl` prints nothing to stdout). Every "AIR does X" claim
 > below has a matching probe transcript; none is transcribed from documentation.
 >
+> **Addendum (stage 256, v0.4.219 → v0.4.220)**: `DockIcon.bitmaps` now really **reaches the Dock**. The
+> stage first measured *which* bitmap AIR paints (`temp/dockprobe/`: solid colours, sampled out of a screen
+> grab) and then handed the pixels to `-[NSApplication setApplicationIconImage:]` — so §3.1 is a new
+> **selection-rule** table, §7.2 keeps only the modifier gap, and §7.6 records one rendering difference we
+> deliberately do **not** copy (AIR multiplies alpha twice on semi-transparent pixels).
+>
 > One-line summary: **AIR has a first-class icon API in `flash.desktop`** (it is *not* "no equivalent").
 > On macOS `supportsDockIcon` is `true` and `supportsSystemTrayIcon` is `false`; `NativeApplication.menu`
 > is **not** `null` and can be replaced wholesale.
@@ -22,7 +28,7 @@
 |---|---|---|
 | `Icon` | ✅ | **instantiable** (`new Icon()` is legal); `bitmaps` defaults to `null` (reading it throws `#1009`) |
 | `InteractiveIcon` | ✅ model | `new InteractiveIcon()` throws `#2012`; `width`/`height` are derived read-only |
-| `DockIcon` | ✅ (incl. Dock context menu) | `new DockIcon()` throws `#2012`; **bitmaps are not painted** (§7.2) |
+| `DockIcon` | ✅ (incl. Dock context menu + painted bitmaps) | `new DockIcon()` throws `#2012`; selection rule and alpha in §3.1 / §7.6 |
 | `SystemTrayIcon` | ✅ model | AIR itself refuses it on macOS (`#2012`), and so do we |
 | `NativeApplication.icon` | ✅ | **read-only** (`mxmlc`: "property icon is read-only"); process-wide singleton |
 | `NativeApplication.menu` | ✅ | readable and writable; `= null` **crashes** `adl` — we report and keep the old menu (§7.1) |
@@ -74,6 +80,39 @@ same guard skip, so the caller learns the path is unavailable. The `startAtLogin
 | `bounce("bogus")` | **no throw** (unknown priority treated as informational) | same (`NSCriticalRequest` / `NSInformationalRequest`) |
 | `dockIcon.menu = "string"` | reads back `null` | same |
 | `SystemTrayIcon.MAX_TIP_LENGTH` | `63` | same |
+
+### 3.1 Which bitmap actually reaches the Dock (measured)
+
+AIR does **not** hand the whole list to AppKit: it **picks one by a fixed target size** and installs that one.
+The rule comes from two-bitmap A/B probes (`temp/dockprobe/`: solid-colour bitmaps, colour sampled out of a
+`screencapture`) — only the size pair changes between runs:
+
+| Fed to `bitmaps` (colour) | What actually appeared in the Dock |
+|---|---|
+| `{32(red), 96(green), 256(blue)}` | **96 (green)** |
+| `{64(red), 160(green)}` | **160 (green)** |
+| `{16(red), 512(green)}` | **16 (red)** ← 16 beat 512 |
+| `{100(red), 150(green)}` | **150 (green)** |
+| `{127(red), 129(green)}` | **127 (red)** |
+| `{129(red), 127(green)}` | **129 (red)** ← reversing the order flips the winner |
+| `{128(red), 130(green)}` | **128 (red)** |
+| `{128×400(red), 200×200(green)}` | **200×200 (green)** ← the one with width 128 lost |
+
+Those eight runs pin the rule down to one sentence: **minimise `|max(width, height) − 128|`, ties go to the
+earlier entry**.
+- "16 beats 512" rules out "biggest wins"; "160 beats 64" rules out "largest ≤ 128";
+- two entries 2 px apart swap winners when the order is reversed (127/129) ⇒ **ties go to the earlier one**,
+  and the target is exactly **128**;
+- 128×400 loses to 200×200 ⇒ the metric is the **per-axis maximum**, not the width.
+
+Everything else about painting, measured the same way:
+
+| Case | `adl 51.4.1` | Ours |
+|---|---|---|
+| Re-assigning `bitmaps` | **repaints immediately** (no restart, no focus change) | same (drawn in the setter) |
+| `bitmaps = []` | restores the **default application icon** (does not keep the last one) | same (`setApplicationIconImage:nil`) |
+| Semi-transparent bitmap | alpha honoured (the Dock shows through) | same (premultiplied, §7.6) |
+| Non-square bitmap | drawn to fit the square tile, aspect kept | same |
 
 ---
 
@@ -162,14 +201,11 @@ Measured on `adl 51.4.1`: assigning `null` kills the adl process. Per §1.5 we d
 behaviour, so this is **reported and leaves the menu unchanged**
 (`as_shell_unsupported("flash.desktop.NativeApplication.menu = null …")`).
 
-### 7.2 Two "model is right, pixels/flags are not there yet" gaps (each reported once)
+### 7.2 `keyEquivalentModifiers` is not translated to `NSEventModifierFlags`
 
-- **`DockIcon.bitmaps` is not painted**: the model (list, `#2005`/`#2007`, derived width/height) is exact,
-  but the bitmap never reaches the Dock tile. Code written against AIR runs; the observable effect is "the
-  icon does not change". **Reported once** and registered in `TODO.md` (遗留待开发).
-- **`keyEquivalentModifiers` is not translated to `NSEventModifierFlags`**: the `keyEquivalent` is bound but
-  the six legal values (`15..20`) are **not mapped**, so the shortcut would fire with AppKit's default
-  modifiers. **Reported once** — never a silently wrong shortcut. Registered in `TODO.md`.
+The `keyEquivalent` is bound but the six legal values (`15..20`) are **not mapped**, so the shortcut would
+fire with AppKit's default modifiers. **Reported once** — never a silently wrong shortcut. Registered in
+`TODO.md`. (The `DockIcon.bitmaps` gap that used to sit here was paid off in stage 256 — see §3.1.)
 
 ### 7.3 `NativeMenu.display()` has no modal backend
 
@@ -196,12 +232,37 @@ honest answer there.
 
 ---
 
+### 7.6 Semi-transparent pixels: AIR multiplies alpha **twice**, we multiply once (deliberately)
+
+One bitmap (128×128: top-left `0xFF0000FF` opaque blue, top-right `0xFFFF8000` opaque orange, bottom-left
+`0x800000FF` 50% blue, bottom-right `0x80FF8000` 50% orange) was given to `adl` and to an AOT build, and the
+same Dock tile was sampled in both screenshots:
+
+| Quadrant | `adl 51.4.1` | Ours |
+|---|---|---|
+| opaque blue / opaque orange | `(0.2, 0.2, 244.7)` / `(238.8, 134.9, 50.7)` | **identical** |
+| 50% blue | `(36.9, 61.0, 122.3)` | `(36.9, 61.0, 183.6)` |
+| 50% orange | `(92.2, 81.8, 57.7)` | `(152.0, 115.7, 72.8)` |
+
+Split apart: the **background term is identical** (`(1-a)·bg` matches on both sides, so alpha itself is
+fine); only the **source term is multiplied by `a` one extra time** (`adl` renders `a²·src + (1-a)·bg`, correct
+compositing is `a·src + (1-a)·bg`). AIR hands AppKit bytes that are **already premultiplied** while declaring
+them straight-alpha, and AppKit multiplies again ⇒ semi-transparent pixels come out **darker** (the classic
+double-premultiply artifact).
+
+**We premultiply once (correct compositing).** This is a conversion artifact, not AIR-*defined* behaviour;
+reproducing it would mean deliberately shipping a darkening bug (visible as dark fringes on the antialiased
+corners of an icon). Opaque pixels are **byte-identical** on both sides, so ordinary icons look the same; the
+difference only shows on pixels with alpha. **Registered in `TODO.md` (遗留待开发)** — not silent.
+
 ## 8. Verification and evidence
 
 | Item | Evidence |
 |---|---|
-| 66 model assertions (pure-C build, no window backend) | `examples/native-menu.as` → `native-menu: 66 checks passed` |
-| 38 source-level pins on the generated C | `unit: emit/NativeMenu` in `test/unit/emit.ts` |
+| 69 model assertions (pure-C build, no window backend) | `examples/native-menu.as` → `native-menu: 69 checks passed` |
+| 39 source-level pins + 16 painting pins | `unit: emit/NativeMenu` and `unit: emit/DockIconImage` in `test/unit/emit.ts` |
+| **8 selection-rule runs** | `temp/dockprobe/`: `{32,96,256}→96`, `{16,512}→16`, `{129,127}→129`, `{128×400, 200×200}→200×200` … (§3.1) |
+| **Painting / alpha / clear / repaint** | `temp/dockquad.as` (AOT) × `temp/dockprobe/Main.as` (`adl`): opaque pixels **identical**, 50% blue `183.6` vs `adl` `122.3` (§7.6), default icon back after `bitmaps=[]`, colour changes immediately on re-assign |
 | Real menu bar and real click | `temp/G4App.app` (`NSPrincipalClass=NSApplication`): AX reads `Apple, G4App, Prune`; clicking `Prune → PruneTwo` really ran the AS3 `SELECT` listener (wrote `/tmp/g4click.txt` = `two`) |
 | Dock context menu | `sk_menu_install_dock` swizzles `applicationDockMenu:` onto SDL's delegate (the actual right-click is not automated) |
 | `autoExit=false` residency | same bundle: the process survives closing the window until `NativeApplication.exit()` |

@@ -66,6 +66,12 @@ export interface InitialWindowStyle {
   maximizable: boolean;
   minimizable: boolean;
   systemChrome: string;
+  // <transparent>: the window's backing store carries alpha, and the stage's own
+  // colour is NOT filled (measured on adl 51.4.1: `stage.color` still answers
+  // 0xFFFFFFFF while the window image is alpha 0 wherever the display list did not
+  // paint). Consumed as ASC_WINDOW_TRANSPARENT by the glue's window creation and by
+  // the generated compose step's clear.
+  transparent: boolean;
   x?: number;
   y?: number;
   minSize?: { w: number; h: number };
@@ -313,6 +319,9 @@ export function parseAirApp(xml: string): AirAppInfo {
   // fallback: AIR's schema rejects it, so a descriptor carrying one is already broken.
   const maximizable = (childText(iwXml, 'maximizable') ?? 'true').toLowerCase() !== 'false';
   const minimizable = (childText(iwXml, 'minimizable') ?? 'true').toLowerCase() !== 'false';
+  // <transparent> is a plain AIR boolean; an out-of-domain value is treated as false
+  // the same way AIR's schema does for the other booleans above.
+  const transparent = (childText(iwXml, 'transparent') ?? 'false').toLowerCase() !== 'false';
   const systemChrome = (childText(iwXml, 'systemChrome') ?? 'standard').toLowerCase();
   if (systemChrome !== 'standard' && systemChrome !== 'none') {
     throw new AirAppError(`air-app.xml <initialWindow> <systemChrome> must be "standard" or "none" (got "${systemChrome}")`);
@@ -321,6 +330,7 @@ export function parseAirApp(xml: string): AirAppInfo {
     maximizable,
     minimizable,
     systemChrome,
+    transparent,
     x: parseWindowInt(childText(iwXml, 'x'), 'x'),
     y: parseWindowInt(childText(iwXml, 'y'), 'y'),
     minSize: parseBoundsSize(childText(iwXml, 'minSize'), 'minSize'),
@@ -437,7 +447,7 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
 // mirrors the values for the NativeWindow getters) and window_glue.cc (which puts them
 // on the real window), and both must agree. It defaults to AIR's own defaults, so a
 // caller that has no descriptor in hand asks for nothing.
-export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, depthAndStencil: boolean, fonts: EmbedFont[], preloadPaths: string[], preloadExcludes: string[], appFontUrls: string[], usesNetworking: boolean, usesAudio: boolean, architecture: string, features: string[] = [], style: InitialWindowStyle = { maximizable: true, minimizable: true, systemChrome: 'standard' }): Record<string, unknown> {
+export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, depthAndStencil: boolean, fonts: EmbedFont[], preloadPaths: string[], preloadExcludes: string[], appFontUrls: string[], usesNetworking: boolean, usesAudio: boolean, architecture: string, features: string[] = [], style: InitialWindowStyle = { maximizable: true, minimizable: true, systemChrome: 'standard', transparent: false }): Record<string, unknown> {
   // Browser backend: skia_glue.cc + web_glue.cc, the wasm Skia library set, no
   // SDL2/Cocoa/frameworks. Mirrors examples/web/hello-web.build.json. The wasm
   // Skia build omits the native-only animation/image codecs (skottie/svg/...), so
@@ -590,6 +600,10 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   if (visible && !style.maximizable) defines.push('ASC_WINDOW_NOT_MAXIMIZABLE=1');
   if (visible && !style.minimizable) defines.push('ASC_WINDOW_NOT_MINIMIZABLE=1');
   if (visible && style.systemChrome === 'none') defines.push('ASC_WINDOW_NOCHROME=1');
+  // A transparent initial window: the glue makes the NSWindow non-opaque (and the
+  // generated compose step clears to alpha 0 instead of the stage colour), because
+  // AIR does NOT fill the stage background in this mode.
+  if (visible && style.transparent) defines.push('ASC_WINDOW_TRANSPARENT=1');
   if (visible && style.x !== undefined) defines.push(`ASC_WIN_X=${style.x}`);
   if (visible && style.y !== undefined) defines.push(`ASC_WIN_Y=${style.y}`);
   if (visible && style.minSize !== undefined) {

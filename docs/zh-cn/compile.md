@@ -468,7 +468,7 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 ```
 
 流程：解析 `<id>/<filename>/<initialWindow>`（`title`/`width`/`height`/`visible`/`resizable`/
-`requestedDisplayResolution`/`renderMode`/`maximizable`/`minimizable`/`systemChrome`/`x`/`y`/`minSize`/`maxSize`）→
+`requestedDisplayResolution`/`renderMode`/`maximizable`/`minimizable`/`systemChrome`/`transparent`/`x`/`y`/`minSize`/`maxSize`）→
 生成等价 `boot-gui.as` 的引导代码（`new Stage()` → 预设 `stageWidth/stageHeight` → `new Main()` →
 `addChild` → `showWindow`；`visible=false` 时改用离屏 `render` 出 PNG）→ 递归扫描 `src/**/*.as`
 （跳过反向域名第三方库目录 `com/org/net`；共享类库改用 `--as-class-path <库根>` 加入编译面，
@@ -574,7 +574,7 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
 清单每次构建都会重新生成，手改不可能保留。不碰网络的 app 不受影响（仍为零依赖默认形态）。
 （`ASC_HAVE_CURL` 本身仍是 opt-in 宏，设计理由见 §3.4.1。）
 
-对齐 adl 的三个关键行为：
+对齐 adl 的四个关键行为：
 - `<resizable>false</resizable>` → 构建清单加 `ASC_WINDOW_FIXED=1`，窗口创建时不加
   `SDL_WINDOW_RESIZABLE`，得到与 adl 一致的固定尺寸窗口。**只作用于描述符所描述的「第一扇窗」**：
   程序自己 `new NativeWindow(NativeWindowInitOptions)` 建的窗按它自己的 `resizable` 决定，构建级 define
@@ -584,6 +584,17 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
   后四者分别是初始窗的左上角（`xs:int`，可为负）与尺寸上下限（`BoundsSizeType`：空白分隔的两个无符号整数，
   少一个就**报错**而不是取默认）。`WS_MAXIMIZEBOX` 不是摆设：它决定最大化后是铺**可用区**还是盖住任务栏的
   **整块显示器**（见 `win32.md` §5 第 21 条）。
+- `<transparent>true</transparent>` → 构建清单加 `ASC_WINDOW_TRANSPARENT=1`，**两半都要动**（阶段二百五十七）：
+  ① 胶水把原生窗做成非不透明 —— macOS 上 `-[NSWindow setOpaque:NO]` + `clearColor` 背景**并逐个把内容视图
+  及其子视图的 layer 设成非不透明**（SDL 自己的 `SDLView`/`SDL_cocoametalview` 在 content view 里，它若仍
+  不透明，CoreAnimation 会在绘制内容后面铺一块黑）；② **合成步清成 alpha 0 而不是舞台色**
+  （`as_skia_canvas_clear_transparent`），否则那块「没人画」的区域会被清成不透明的一整片。`adl 51.4.1` 实测
+  口径：`<transparent>true</transparent>` 的窗口 `nativeWindow.transparent` 为 `true`、`stage.color` **仍报
+  `0xFFFFFFFF`**（即 `color` 是舞台属性、与窗口是否透传无关），没画的像素在屏幕上是**真透明**。**只作用于
+  描述符那扇主窗**：程序自己 `new NativeWindow(opts)` 建的窗按 `opts.transparent` 决定（走
+  `sk_window_set_transparent`），面板类浮层因此也是这条路。**平台面**：macOS 真透传；Windows 与其它后端
+  **没有实现**（要 `WS_EX_LAYERED` + 逐帧 alpha），故**响亮报明一次**而不是给一扇不透明的假透明窗；
+  wasm 无桌面合成器，同为空桩。
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → 构建清单加 `ASC_DISPLAY_HIGH=1`，
   窗口开 `SDL_WINDOW_ALLOW_HIGHDPI` 且 surface 按设备倍率创建物理像素（Retina 不模糊）；`standard`
   或缺省保持 1x（与 adl 一致，会被合成器拉伸）。

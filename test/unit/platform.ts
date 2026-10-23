@@ -2417,6 +2417,15 @@ function checkInitialWindowStyle(): string[] {
   check('<minSize>/<maxSize> are the BoundsSizeType pairs, both axes required',
     strict.minSize!.w === 300 && strict.minSize!.h === 500
     && strict.maxSize!.w === 800 && strict.maxSize!.h === 900);
+  // <transparent>: AIR's own descriptor key. Measured on adl 51.4.1 (temp/transprobe/):
+  // with it on, the window image is alpha 0 wherever the display list painted nothing,
+  // while stage.color still answers 0xFFFFFFFF — the stage background is not filled.
+  check('<transparent> reaches the style, and an absent one defaults to false',
+    strict.transparent === false && plain.transparent === false
+    && parseAirApp('<?xml version="1.0"?><application xmlns="http://ns.adobe.com/air/application/51.3">' +
+      '<id>t</id><versionNumber>1.0</versionNumber><filename>t</filename><initialWindow>' +
+      '<content>t.swf</content><visible>true</visible><transparent>true</transparent>' +
+      '<width>300</width><height>200</height></initialWindow></application>').style.transparent === true);
   check('a <minSize> that is not two integers is an error, not a silent default',
     (() => {
       try {
@@ -2443,6 +2452,15 @@ function checkInitialWindowStyle(): string[] {
       const d = man(plain)['defines'] as string[];
       return !d.some((x) => /^ASC_WIN_|^ASC_WINDOW_NOT/.test(x));
     })());
+  // <transparent> is the one style flag whose meaning does not live only in the glue:
+  // the compose step has to clear to alpha 0 as well, or an opaque black clear would
+  // paint every unpainted pixel (measured: adl leaves them at alpha 0).
+  check('a transparent descriptor becomes ASC_WINDOW_TRANSPARENT=1',
+    (() => {
+      const on = man({ maximizable: true, minimizable: true, systemChrome: 'none', transparent: true })['defines'] as string[];
+      const off = man(plain)['defines'] as string[];
+      return on.includes('ASC_WINDOW_TRANSPARENT=1') && !off.includes('ASC_WINDOW_TRANSPARENT=1');
+    })());
 
   // The glue half: one place applies AIR's frame style, read off the real window.
   check('the three SK_MAIN_ macros come from the three defines',
@@ -2459,6 +2477,25 @@ function checkInitialWindowStyle(): string[] {
   check('...and it is a Windows-only override (every other platform keeps the bare call)',
     /static void sk_win_apply_style\(WinCtx\* c\) \{\n#ifdef _WIN32\n/.test(glueWin)
     && /#else\n  \(void\)c;\n#endif\n\}/.test(glueWin));
+  // Transparency. SDL2 has no SDL_WINDOW_TRANSPARENT (that flag is SDL3's), so the
+  // platform layer owns it; and the flag must reach BOTH halves — the NSWindow (else
+  // the compositor still treats the client rect as filled) and the compose step (else
+  // SDL's default opaque-black clear paints the transparent area black).
+  check('transparency is applied to the native window, not just latched in AS3',
+    /static void sk_window_apply_transparent\(SDL_Window\* win, int on\)/.test(glueWin)
+    && /sel_registerName\("setOpaque:"\)/.test(glueWin)
+    && /void sk_window_set_transparent\(int id, int on\) \{/.test(glueWin)
+    && /#ifdef ASC_WINDOW_TRANSPARENT\n  if \(is_main\) transparent = 1;\n#endif/.test(glueWin));
+  check('the transparent flag reaches the present step (an opaque clear would paint black)',
+    /static void present_frame\(SDL_Renderer\* ren, SDL_Texture\* tex, void\* pixels, int w, int h, int rowBytes, int transparent\)/.test(glueWin)
+    && /if \(transparent\) SDL_SetRenderDrawColor\(ren, 0, 0, 0, 0\);/.test(glueWin)
+    && (glueWin.match(/present_frame\(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes, c->transparent\)/g) ?? []).length === 2);
+  check('a program-made window hands its own flag to the platform layer',
+    c.includes('if (w->transparent) as_window_set_transparent(id, 1);'));
+  check('the compose step clears to alpha 0 for a transparent window, not to the stage colour',
+    c.includes('if (w->transparent) as_skia_canvas_clear_transparent(canvas);')
+    && c.includes('else as_skia_canvas_clear(canvas, st->stage_color);'));
+
   check('sk_window_set_limits is declared NON-static (a static decl internalises the definition)',
     /\nvoid sk_window_set_limits\(int id, int mnw, int mnh, int mxw, int mxh\);\n/.test(glueWin)
     && !/\nstatic void sk_window_set_limits\(int id, int mnw, int mnh, int mxw, int mxh\);\n/.test(glueWin));

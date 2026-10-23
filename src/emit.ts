@@ -5947,6 +5947,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('w->render_mode = (options != NULL && options->renderMode != NULL) ? options->renderMode : (char*)"auto";');
     this.line('w->owner = (options != NULL) ? (void*)options->owner : NULL;');
     this.line('w->transparent = (options != NULL && options->transparent) ? 1 : 0;');
+    // NativeWindowInitOptions.transparent must reach the OS window as well, not just
+    // the AS3-side flag: on macOS the window is opaque by default, and only the
+    // platform layer can drop that (see sk_window_set_transparent). Done here rather
+    // than in as_window_create's signature because the flag belongs to a window the
+    // program makes, exactly like alwaysInFront.
+    this.line('if (w->transparent) as_window_set_transparent(id, 1);');
     this.line('w->resizable = resizable;');
     this.line('w->maximizable = (options != NULL && options->maximizable) ? 1 : 0;');
     this.line('w->minimizable = (options != NULL && options->minimizable) ? 1 : 0;');
@@ -9711,10 +9717,23 @@ void DockIcon_set_bitmaps(void* _this, as_array* v) {
   InteractiveIcon_set_bitmaps(_this, v);
 }
 
-// Bitmap application to the real Dock icon. The AS3 model is complete; the
-// pixels are not painted yet, which is reported once rather than silently
-// dropped (see TODO.md 遗留待开发, 阶段二百五十五 residue).
+// Bitmap application to the real Dock icon.
+//
+// Which bitmap AIR paints was measured (temp/dockprobe: solid-colour bitmaps, the
+// Dock icon sampled out of a screen grab) rather than guessed from the docs:
+//   {32,96,256} -> 96 | {64,160} -> 160 | {16,512} -> 16 | {100,150} -> 150
+//   {127,129} -> 127 | {129,127} -> 129 | {128,130} -> 128
+// all of which is "minimise |max(width,height) - 128|", with a TIE going to the
+// EARLIER entry in the array (the {127,129}/{129,127} pair is what separates
+// first-wins from last-wins). The 128x400 vs 200x200 pair shows the metric is the
+// per-axis MAXIMUM, not the width: 128x400 loses to 200x200 although its width is
+// nearer 128.
+// Reassigning the array repaints live, and bitmaps=[] restores the bundle icon.
+#if !ASC_HAS_DOCK_IMAGE
+// Only the reporting arm needs this latch; a backend that paints the icon has
+// nothing to report.
 static bool ASC_dock_image_reported = false;
+#endif
 // Same shape for the modifier flags: the glue binds the keyEquivalent but does not
 // translate the six legal AS3 values (15..20) into NSEventModifierFlags yet, so a
 // shortcut would fire with AppKit's defaults instead of what the AS3 code asked
@@ -9728,12 +9747,36 @@ static void as_menu_note_mods(NativeMenuItem* it) {
 }
 static void as_dock_icon_sync(Icon* o) {
   if (o != (Icon*)ASC_icon_singleton) return;
+#if ASC_HAS_DOCK_IMAGE
+  // Pick the bitmap AIR would pick (see the measurement table above). A bare Icon
+  // may hold non-BitmapData values, so the element type is checked here too.
+  BitmapData* best = NULL;
+  int bestd = 0;
+  if (o->_bitmaps != NULL) {
+    for (int i = 0; i < o->_bitmaps->length; i++) {
+      as_value e = o->_bitmaps->data[i];
+      if (e.tag != 4 || e.ptr == NULL || !as_is(e.ptr, &BitmapData_vt)) continue;
+      BitmapData* b = (BitmapData*)e.ptr;
+      int m = b->width > b->height ? b->width : b->height;
+      int d = m > 128 ? m - 128 : 128 - m;
+      if (best == NULL || d < bestd) { best = b; bestd = d; }
+    }
+  }
+  // An empty (or still-bitmapless) list clears the icon: measured, bitmaps=[] puts
+  // the default Dock icon back instead of leaving the last painted one there.
+  if (best == NULL || best->pixels == NULL || best->width <= 0 || best->height <= 0) {
+    sk_dock_set_icon_image(NULL, 0, 0);
+  } else {
+    sk_dock_set_icon_image(best->pixels, best->width, best->height);
+  }
+#else
   if (!sk_menu_supported()) return;
   if (o->_bitmaps == NULL || o->_bitmaps->length == 0) return;
   if (!ASC_dock_image_reported) {
     ASC_dock_image_reported = true;
     as_shell_unsupported((char*)"flash.desktop.DockIcon.bitmaps (the Dock icon image is not painted by this backend yet)");
   }
+#endif
 }
 void DockIcon_ctor(DockIcon* o) { InteractiveIcon_ctor((InteractiveIcon*)o); o->_menu = NULL; }
 DockIcon* DockIcon_new(void) {
@@ -24159,6 +24202,13 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('#ifdef ASC_WINDOW_NOCHROME');
     this.line('w->system_chrome = (char*)"none";');
     this.line('#endif');
+    // The descriptor's <transparent> travels as a build define (the glue makes the
+    // NSWindow non-opaque under the same one, for the SAME window: the initial one).
+    // The compose step keys off this flag to clear to alpha 0 -- AIR does not fill
+    // the stage background in a transparent window (measured on adl 51.4.1).
+    this.line('#ifdef ASC_WINDOW_TRANSPARENT');
+    this.line('w->transparent = 1;');
+    this.line('#endif');
     // minSize/maxSize: the glue holds the effective pair and is the same source a window
     // created by this program reads, so it is read back rather than recomputed. The
     // fallback below covers the ordering AIR imposes: the document class runs BEFORE the
@@ -24295,7 +24345,12 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('as_skia_canvas_reset(canvas);');
 
 
-    this.line('as_skia_canvas_clear(canvas, st->stage_color);');
+    // A transparent window clears to alpha 0, NOT to the stage colour: measured on
+    // adl 51.4.1, `stage.color` still answers 0xFFFFFFFF in that mode while the
+    // window image is alpha 0 wherever the display list painted nothing. That is
+    // also why this is keyed off the window rather than the stage.
+    this.line('if (w->transparent) as_skia_canvas_clear_transparent(canvas);');
+    this.line('else as_skia_canvas_clear(canvas, st->stage_color);');
     this.line('as_skia_canvas_save(canvas);');
     this.line('as_skia_canvas_scale(canvas, w->scale, w->scale);');
     this.line('as_skia_canvas_translate(canvas, ox, oy);');

@@ -499,7 +499,7 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 ```
 
 Flow: parse `<id>/<filename>/<initialWindow>` (`title`/`width`/`height`/`visible`/`resizable`/
-`requestedDisplayResolution`/`renderMode`/`maximizable`/`minimizable`/`systemChrome`/`x`/`y`/`minSize`/`maxSize`) →
+`requestedDisplayResolution`/`renderMode`/`maximizable`/`minimizable`/`systemChrome`/`transparent`/`x`/`y`/`minSize`/`maxSize`) →
 generate bootstrap code equivalent to `boot-gui.as` (`new Stage()` → preset `stageWidth/stageHeight` →
 `new Main()` → `addChild` → `showWindow`; when `visible=false`, use offscreen `render` to output PNG) →
 recursively scan `src/**/*.as` (skip reverse-domain third-party library directories `com/org/net`; a shared
@@ -630,7 +630,7 @@ convenience: the manifest is regenerated on every build, so a hand edit cannot s
 touch the network is unaffected (still the zero-dependency default form).
 (`ASC_HAVE_CURL` itself is still an opt-in macro; the design rationale is in §3.4.1.)
 
-Three key behaviors aligned with adl:
+Four key behaviors aligned with adl:
 - `<resizable>false</resizable>` → build manifest adds `ASC_WINDOW_FIXED=1`; window creation omits
   `SDL_WINDOW_RESIZABLE`, yielding a fixed-size window consistent with adl. **It applies only to the "first
   window" the descriptor describes**: a window the program creates itself with
@@ -642,6 +642,21 @@ Three key behaviors aligned with adl:
   negatives allowed) and its size bounds (`BoundsSizeType`: two whitespace-separated unsigned integers — giving
   only one is an **error**, not a default). `WS_MAXIMIZEBOX` is not cosmetic: it decides whether maximizing
   fills the **work area** or the **whole monitor**, taskbar included (see `win32.md` §5 item 21).
+- `<transparent>true</transparent>` → the build manifest adds `ASC_WINDOW_TRANSPARENT=1`, and **both halves have
+  to move** (stage two-hundred-fifty-seven): ① the glue makes the native window non-opaque — on macOS that is
+  `-[NSWindow setOpaque:NO]` + a `clearColor` background **and setting every layer of the content view and its
+  subviews non-opaque** (SDL's own `SDLView`/`SDL_cocoametalview` lives inside the content view, and if it stays
+  opaque CoreAnimation paints a black rectangle behind the drawn content); ② **the compose step clears to
+  alpha 0 instead of the stage colour** (`as_skia_canvas_clear_transparent`), otherwise the "nobody painted
+  here" area is cleared to one opaque slab. Measured on `adl 51.4.1`: a window with
+  `<transparent>true</transparent>` reports `nativeWindow.transparent` = `true` while `stage.color` **still
+  answers `0xFFFFFFFF`** (i.e. `color` is a stage property, independent of window transparency), and pixels
+  nothing painted are genuinely transparent on screen. **It applies only to the descriptor's main window**: a
+  window the program creates with `new NativeWindow(opts)` follows `opts.transparent` (through
+  `sk_window_set_transparent`), which is also how a panel-style overlay gets there. **Platform matrix**: real
+  transparency on macOS; Windows and the other backends **do not implement it** (`WS_EX_LAYERED` plus per-frame
+  alpha would be needed), so they **report it loudly once** instead of handing back an opaque window that
+  silently ignores the flag; wasm has no desktop compositor and is an inert stub.
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → build manifest adds `ASC_DISPLAY_HIGH=1`;
   the window opens `SDL_WINDOW_ALLOW_HIGHDPI` and the surface is created with physical pixels at device scale
   (Retina is not blurry); `standard` or omitted keeps 1x (consistent with adl, stretched by the compositor).

@@ -16,6 +16,7 @@
 //   * stage.scaleMode 写入即重算 stageWidth/stageHeight（阶段二百二十六）：先 `bounds` 后改模式
 //     与先改模式后 `bounds` 必须收敛到同一尺寸，而 showAll 仍钉在 design 矩形
 //   * startMove()/startResize()：真实系统拖拽，回 true（放在最后，拖拽闩锁随进程退出消失）
+//   * transparent（阶段二百五十六 / G6b）：默认 false、写入后原样读回、与 systemChrome none 共存
 //
 // 纯 C 构建（没有 window 后端）里 `new NativeWindow()` 会**响亮**地抛 #2012（不静默 fallback），
 // 而 examples/ 下的每个 .as 都会被回归套件在纯 C 配置下真跑一遍 —— 所以这里显式分流：没有后端
@@ -24,6 +25,7 @@ import flash.display.Stage;
 import flash.display.NativeWindow;
 import flash.display.NativeWindowInitOptions;
 import flash.display.NativeWindowResize;
+import flash.display.NativeWindowSystemChrome;
 import flash.display.StageScaleMode;
 import flash.events.Event;
 import flash.events.NativeWindowBoundsEvent;
@@ -58,6 +60,13 @@ var w2:NativeWindow = null;
 var got:Array = [];
 var gotClose:Boolean = false;
 var hasBackend:Boolean = true;
+
+// ---- 透明窗（阶段二百五十六 / G6b）--------------------------------------------
+// adl 51.4.1 实测（temp/transprobe/）：<transparent>true</transparent> 时窗口图层的
+// 未绘制像素 alpha = 0，而 stage.color 仍答 0xFFFFFFFF——舞台底色在这个模式下根本
+// 没被填充。我们同一件事分两半做：NSWindow 置非 opaque（vendor/window_glue.cc）+ 合成
+// 时清成 alpha 0（emit 的 compose 步）。这里断言的是 AS3 侧那半（标志原样往返）。
+eq("transparent defaults to false", new NativeWindowInitOptions().transparent, false);
 try {
   w = new NativeWindow(new NativeWindowInitOptions());
   wSize = new NativeWindow(new NativeWindowInitOptions());
@@ -67,6 +76,14 @@ try {
 }
 
 if (hasBackend) {
+  var optTr:NativeWindowInitOptions = new NativeWindowInitOptions();
+  optTr.transparent = true;
+  optTr.systemChrome = NativeWindowSystemChrome.NONE;
+  var wTr:NativeWindow = new NativeWindow(optTr);
+  eq("a transparent, borderless window reads its flag back", wTr.transparent, true);
+  eq("...and its chrome", String(wTr.systemChrome), "none");
+  wTr.close();
+
   w.bounds = new Rectangle(100, 100, 300, 200);
   wSize.bounds = new Rectangle(900, 500, 300, 200);
   wSize.visible = true;

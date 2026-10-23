@@ -377,6 +377,10 @@ struct WinCtx {
   // the flag is cached here because AIR's getter is expected to read back what the
   // last setter wrote even on a platform that cannot honour it.
   int always_in_front;
+  // NativeWindow.transparent / the descriptor's <transparent>. Kept here because the
+  // present step has to clear the renderer to alpha 0 (SDL's default draw colour is
+  // opaque black, which would paint every unpainted pixel black).
+  int transparent;
   // The three style-affecting flags the descriptor / NativeWindowInitOptions carry.
   // AIR's win32 mapping is THICKFRAME <=> resizable, MAXIMIZEBOX <=> maximizable,
   // MINIMIZEBOX <=> minimizable (measured off the real window, temp/nwwin/wstyle.exe),
@@ -500,9 +504,27 @@ static int sk_id_from_window_id(Uint32 wid) {
 // macOS). The texture is created once and updated in place each frame instead of
 // being created/destroyed per frame — that per-frame churn was the dominant cost
 // at high Stage.frameRate values.
-static void present_frame(SDL_Renderer* ren, SDL_Texture* tex, void* pixels, int w, int h, int rowBytes) {
+static void present_frame(SDL_Renderer* ren, SDL_Texture* tex, void* pixels, int w, int h, int rowBytes, int transparent) {
   if (tex == NULL) return;
+  if (getenv("ASC_TRACE_TRANSPARENT") != NULL) {
+    static int n = 0;
+    if (n == 2) {
+      SDL_RendererInfo ri; if (SDL_GetRendererInfo(ren, &ri) == 0) fprintf(stderr, "transparent: renderer=%s flags=%u\n", ri.name, ri.flags);
+      void* ml = SDL_RenderGetMetalLayer(ren);
+      fprintf(stderr, "transparent: metal_layer=%p\n", ml);
+    }
+    if (n++ == 3) {
+      const unsigned char* b = (const unsigned char*)pixels;
+      fprintf(stderr, "transparent: flag=%d corner=%d,%d,%d,%d centerA=%d\n", transparent,
+              b[0], b[1], b[2], b[3], b[(h / 2) * rowBytes + (w / 2) * 4 + 3]);
+    }
+  }
   SDL_UpdateTexture(tex, NULL, pixels, rowBytes);
+  // A transparent window is cleared to alpha 0. SDL's default draw colour is opaque
+  // black, so without this every pixel the display list did not paint would come out
+  // black instead of letting the desktop through (measured on adl 51.4.1: those
+  // pixels are alpha 0).
+  if (transparent) SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
   SDL_RenderClear(ren);
   // Explicit 1:1 destination rect. Passing NULL instead asks SDL to stretch the
   // texture across the whole render target, which is exactly what distorted the
@@ -824,7 +846,7 @@ static double sk_pump_frame(void) {
     if (!c->used || c->destroy_pending) continue;
     if (c->visible && c->dirty && c->on_redraw != NULL) {
       c->on_redraw(i);
-      if (!c->is_gpu) present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes);
+      if (!c->is_gpu) present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes, c->transparent);
       c->dirty = 0;
     }
   }
@@ -1602,8 +1624,72 @@ static void sk_win_apply_style(WinCtx* c) {
 #endif
 }
 
+// Per-window transparency. SDL2 has no SDL_WINDOW_TRANSPARENT (that flag is SDL3's),
+// so the platform side has to go through the native window handle. macOS: an NSWindow
+// is opaque by default, which makes the compositor treat the whole client rect as
+// filled; dropping that plus a clear background is what lets the window's own alpha
+// channel show the desktop through. The CONTENT VIEW's layer must be non-opaque too,
+// or CoreAnimation paints a black rectangle behind whatever the renderer draws.
+static void sk_window_apply_transparent(SDL_Window* win, int on) {
+  if (win == NULL) return;
+#if defined(__APPLE__)
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(win, &info)) return;
+  void* nswin = (void*)info.info.cocoa.window;
+  if (getenv("ASC_TRACE_TRANSPARENT") != NULL) fprintf(stderr, "transparent: on=%d nswin=%p\n", on, nswin);
+  if (nswin == NULL) return;
+  ((void (*)(void*, SEL, signed char))objc_msgSend)(nswin, sel_registerName("setOpaque:"), (signed char)(on ? 0 : 1));
+  void* color = on
+      ? ((void* (*)(void*, SEL))objc_msgSend)((void*)objc_getClass("NSColor"), sel_registerName("clearColor"))
+      : NULL;
+  ((void (*)(void*, SEL, void*))objc_msgSend)(nswin, sel_registerName("setBackgroundColor:"), color);
+  void* view = ((void* (*)(void*, SEL))objc_msgSend)(nswin, sel_registerName("contentView"));
+  if (view != NULL) {
+    void* layer = ((void* (*)(void*, SEL))objc_msgSend)(view, sel_registerName("layer"));
+    if (layer != NULL) {
+      ((void (*)(void*, SEL, signed char))objc_msgSend)(layer, sel_registerName("setOpaque:"), (signed char)(on ? 0 : 1));
+    }
+    // SDL puts its own view (SDLView / SDL_cocoametalview) INSIDE the content view, and
+    // that subview's layer is the one actually composited. If it stays opaque the window
+    // shows a black rectangle behind the drawn content, so walk the (one-element) list.
+    void* subs = ((void* (*)(void*, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+    if (subs != NULL) {
+      unsigned long n = ((unsigned long (*)(void*, SEL))objc_msgSend)(subs, sel_registerName("count"));
+      for (unsigned long i = 0; i < n; i++) {
+        void* sv = ((void* (*)(void*, SEL, unsigned long))objc_msgSend)(subs, sel_registerName("objectAtIndex:"), i);
+        if (sv == NULL) continue;
+        void* sl = ((void* (*)(void*, SEL))objc_msgSend)(sv, sel_registerName("layer"));
+        if (sl != NULL) {
+          ((void (*)(void*, SEL, signed char))objc_msgSend)(sl, sel_registerName("setOpaque:"), (signed char)(on ? 0 : 1));
+        }
+      }
+    }
+  }
+#else
+  // Not implemented on this backend. REPORT it once rather than hand back an opaque
+  // window that silently ignores the flag (AGENTS.md §2.5: never a silent wrong
+  // semantic). Windows would need DwmExtendFrameIntoClientArea + a layered surface.
+  (void)win;
+  if (on) {
+    static int reported = 0;
+    if (!reported) {
+      reported = 1;
+      fprintf(stderr, "window_glue: transparent windows are not implemented on this backend\n");
+    }
+  }
+#endif
+}
+
 static int sk_open_window(int w, int h, const char* title, int decorated, int visible, int fullscreen, int highdpi, int is_main,
                           int resizable, int maximizable, int minimizable) {
+  // The descriptor's <transparent> describes the app's initial window only, exactly
+  // like <systemChrome> above -- a window the program creates carries the flag in
+  // NativeWindowInitOptions and sets it through sk_window_set_transparent.
+  int transparent = 0;
+#ifdef ASC_WINDOW_TRANSPARENT
+  if (is_main) transparent = 1;
+#endif
   // The descriptor's <systemChrome> is the initial window's too: measured on adl 51.4.1,
   // a none-chrome initial window answers a client equal to its frame and 366x630 bounds
   // for a <width>366</width><height>630</height> descriptor, i.e. no frame at all -- what
@@ -1627,6 +1713,7 @@ static int sk_open_window(int w, int h, const char* title, int decorated, int vi
     fprintf(stderr, "window_glue: SDL_CreateWindow failed: %s\n", SDL_GetError());
     return -1;
   }
+  if (transparent) sk_window_apply_transparent(win, 1);
   // Stage.displayState = FULL_SCREEN is applied here, before the event loop
   // (SDL_WINDOW_FULLSCREEN_DESKTOP keeps the desktop resolution).
   if (fullscreen) SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
@@ -1640,6 +1727,7 @@ static int sk_open_window(int w, int h, const char* title, int decorated, int vi
   WinCtx* c = &g_wins[id];
   c->win = win;
   c->visible = visible;
+  c->transparent = transparent;
   c->pixfmt = SDL_MasksToPixelFormatEnum(32, 0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u);
   sk_measure_borders(c, decorated);
   // NativeWindow.minSize/maxSize start at AIR's own defaults for this platform —
@@ -1828,7 +1916,7 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   // format is derived from the exact channel masks so it can never mismatch.
   c->tex = SDL_CreateTexture(c->ren, c->pixfmt, SDL_TEXTUREACCESS_STREAMING, pw, ph);
   if (c->tex != NULL) SDL_SetTextureBlendMode(c->tex, SDL_BLENDMODE_NONE);
-  present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes);
+  present_frame(c->ren, c->tex, c->pixels, c->pw, c->ph, c->rowBytes, c->transparent);
 
   // Register the live-resize filter so a drag keeps rendering (see WinCtx).
   SDL_AddEventWatch(live_resize_watch, c);
@@ -2159,7 +2247,14 @@ void sk_window_set_visible(int id, int visible) {
   WinCtx* c = sk_slot(id);
   if (c == NULL) return;
   c->visible = visible ? 1 : 0;
-  if (visible) { SDL_ShowWindow(c->win); c->dirty = 1; }
+  if (visible) {
+    SDL_ShowWindow(c->win);
+    c->dirty = 1;
+    // Re-apply the transparency once the view hierarchy is really on screen: the
+    // content view's layer may not exist yet when the constructor asked (a window
+    // created by the program is transparent BEFORE it is ever shown).
+    if (c->transparent) sk_window_apply_transparent(c->win, 1);
+  }
   else SDL_HideWindow(c->win);
 }
 
@@ -2435,6 +2530,69 @@ static void* sk_nsstring(const char* s) {
   return ((void* (*)(void*, SEL, const char*))objc_msgSend)((void*)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), s);
 }
 
+// ---- Dock icon image (DockIcon.bitmaps) ----
+// The picked bitmap arrives as STRAIGHT ARGB rows (BitmapData.pixels, 0xAARRGGBB,
+// top-down), but NSBitmapImageRep's non-planar 8-bit format is PREMULTIPLIED RGBA in
+// memory order R,G,B,A. Handing AppKit straight alpha is visible, not cosmetic: every
+// semi-transparent pixel comes out too bright and a fully transparent one paints
+// its colour (a black bar in a corner-cut icon). So the copy below premultiplies.
+// `g_dock_have` records that AS3 owns the icon (even when the value is "clear it"),
+// `g_dock_applied` that the current value already reached AppKit -- a set that
+// arrives before NSApp exists is retried by sk_dock_image_flush from the event loop.
+static void* g_dock_image = NULL;
+static int g_dock_have = 0;
+static int g_dock_applied = 0;
+static void sk_dock_image_flush(void) {
+  if (!g_dock_have || g_dock_applied) return;
+  void* app = sk_nsapp();
+  if (app == NULL) return;
+  // nil restores the bundle's own icon (measured: bitmaps=[] puts the default back).
+  sk_send_void_obj(app, "setApplicationIconImage:", g_dock_image);
+  g_dock_applied = 1;
+}
+void sk_dock_set_icon_image(const void* argb, int w, int h) {
+  if (argb == NULL || w <= 0 || h <= 0) {
+    g_dock_image = NULL; g_dock_have = 1; g_dock_applied = 0;
+    sk_dock_image_flush();
+    return;
+  }
+  void* rep = sk_send_obj((void*)objc_getClass("NSBitmapImageRep"), "alloc");
+  if (rep == NULL) return;
+  rep = ((void* (*)(void*, SEL, void*, long, long, long, long, signed char, signed char, void*, long, long))objc_msgSend)(
+      rep, sel_registerName("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
+      NULL, (long)w, (long)h, 8L, 4L, (signed char)1, (signed char)0,
+      sk_nsstring("NSDeviceRGBColorSpace"), (long)w * 4L, 32L);
+  unsigned char* dst = (unsigned char*)sk_send_obj(rep, "bitmapData");
+  if (dst == NULL) return;
+  // The rep pads rows to its own stride, so write at ITS bytesPerRow, not w*4.
+  long rb = (long)sk_send_int(rep, "bytesPerRow");
+  if (rb < (long)w * 4L) rb = (long)w * 4L;
+  const unsigned* src = (const unsigned*)argb;
+  for (int y = 0; y < h; y++) {
+    unsigned char* row = dst + (size_t)y * (size_t)rb;
+    const unsigned* srow = src + (size_t)y * (size_t)w;
+    for (int x = 0; x < w; x++) {
+      unsigned p = srow[x];
+      unsigned a = (p >> 24) & 0xFFu;
+      unsigned r = (p >> 16) & 0xFFu, g = (p >> 8) & 0xFFu, b = p & 0xFFu;
+      if (a != 255u) {
+        r = (r * a + 127u) / 255u; g = (g * a + 127u) / 255u; b = (b * a + 127u) / 255u;
+      }
+      row[x * 4 + 0] = (unsigned char)r;
+      row[x * 4 + 1] = (unsigned char)g;
+      row[x * 4 + 2] = (unsigned char)b;
+      row[x * 4 + 3] = (unsigned char)a;
+    }
+  }
+  void* img = sk_send_obj((void*)objc_getClass("NSImage"), "alloc");
+  // Points == pixels: the Dock scales the tile to its own size anyway, which is what
+  // makes AIR's "closest to 128" pick look sharp at some sizes and soft at others.
+  img = ((void* (*)(void*, SEL, double, double))objc_msgSend)(img, sel_registerName("initWithSize:"), (double)w, (double)h);
+  sk_send_void_obj(img, "addRepresentation:", rep);
+  g_dock_image = img; g_dock_have = 1; g_dock_applied = 0;
+  sk_dock_image_flush();
+}
+
 static void sk_menu_fired(void* self, SEL _cmd, void* sender) {
   (void)self; (void)_cmd;
   if (g_menu_cb != NULL) g_menu_cb(sk_send_int(sender, "tag"));
@@ -2549,6 +2707,7 @@ static int sk_menu_apply_dock(const sk_pending_menu* p) {
 static void sk_menu_flush(void) {
   if (g_pending_app.set) sk_menu_apply_app(&g_pending_app);
   if (g_pending_dock.set) sk_menu_apply_dock(&g_pending_dock);
+  sk_dock_image_flush();
 }
 
 // SDL installs its OWN main menu when the application finishes launching, which
@@ -2559,6 +2718,9 @@ static void sk_menu_flush(void) {
 static void sk_menu_ensure(void) {
   void* app = sk_nsapp();
   if (app == NULL) return;
+  // A Dock icon set before the application object existed lands here on the first
+  // pumped frame; once applied this is one int compare per frame.
+  sk_dock_image_flush();
   if (g_app_nsmenu != NULL && sk_send_obj(app, "mainMenu") != g_app_nsmenu) {
     sk_send_void_obj(app, "setMainMenu:", g_app_nsmenu);
   }
@@ -2605,6 +2767,10 @@ int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_
   (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
 }
 void sk_dock_bounce(int critical) { (void)critical; }
+// No Dock on the other window backends either, and the generated C only calls this
+// when ASC_HAS_DOCK_IMAGE is 1 (Cocoa). Defined anyway so a future backend that
+// flips the macro cannot fail to link.
+void sk_dock_set_icon_image(const void* argb, int w, int h) { (void)argb; (void)w; (void)h; }
 #endif
 
 // NativeApplication.autoExit = false: keep the loop alive with zero open windows
@@ -2783,6 +2949,18 @@ void sk_window_set_always_in_front(int id, int on) {
   if (c == NULL || c->win == NULL) return;
   c->always_in_front = on ? 1 : 0;
   SDL_SetWindowAlwaysOnTop(c->win, on ? SDL_TRUE : SDL_FALSE);
+}
+
+// NativeWindowInitOptions.transparent for a window the PROGRAM creates (the initial
+// window takes the same path at creation time, from ASC_WINDOW_TRANSPARENT). Latched
+// on the context because the present step reads it every frame, and applied to the
+// native window immediately: the AS3 constructor runs before the window is shown.
+void sk_window_set_transparent(int id, int on) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL) return;
+  c->transparent = on ? 1 : 0;
+  sk_window_apply_transparent(c->win, c->transparent);
+  c->dirty = 1;
 }
 
 // The main window's id, for the generated boot code (Stage.showWindow).
