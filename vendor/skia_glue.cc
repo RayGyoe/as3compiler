@@ -681,6 +681,20 @@ void sk_canvas_total_scale(void* canvas, double* sx, double* sy) {
   *sy = sqrt(c * c + d * d);
 }
 
+// Where the canvas LOCAL ORIGIN lands in its own device pixels -- the second
+// half of the transform that sk_canvas_total_scale reports. A device pixel is
+// the unit a baked image is blitted in, so "which grid is this surface on" is a
+// question about this translation, not about the object coordinates: inside a
+// parent bake (or under any parent with a fractional position, e.g. a 1.5 device
+// scale), local 0 sits on a fractional device pixel and a grid computed from the
+// object own x/y is off by that fraction. Used by as_render_cached origin snap
+// (emit.ts).
+void sk_canvas_total_translate(void* canvas, double* tx, double* ty) {
+  const SkMatrix& m = ((SkCanvas*)canvas)->getTotalMatrix();
+  *tx = (double)m.getTranslateX();
+  *ty = (double)m.getTranslateY();
+}
+
 // Intersect the current clip with a rectangle — used by TextField to keep
 // wrapped lines inside the field box when the text is scrolled (stage 44).
 void sk_canvas_clip_rect(void* canvas, double x, double y, double w, double h) {

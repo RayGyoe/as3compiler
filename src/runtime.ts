@@ -9004,6 +9004,7 @@ extern void sk_canvas_clip_rect(void* canvas, double x, double y, double w, doub
 extern void sk_canvas_clip_path(void* canvas, void* path, int antialias);
 extern void sk_canvas_draw_image_src_rect(void* canvas, void* image, double sx, double sy, double sw, double sh, double dx, double dy, double dw, double dh);
 extern void sk_canvas_total_scale(void* canvas, double* sx, double* sy);
+extern void sk_canvas_total_translate(void* canvas, double* tx, double* ty);
 extern void* sk_paint_new(void);
 extern void sk_paint_delete(void* paint);
 extern void sk_paint_set_color(void* paint, unsigned rgb);
@@ -9168,6 +9169,11 @@ static inline void as_skia_canvas_draw_image_src_rect(void* c, void* img, double
 // sk_canvas_total_scale). Used by screen-space stroking: TextField's border is
 // a 1px line that must not scale with the object.
 static inline void as_skia_canvas_total_scale(void* c, double* sx, double* sy) { sk_canvas_total_scale(c, sx, sy); }
+// Device position of the canvas local origin (see sk_canvas_total_translate).
+// Together with the scale above this is the whole CTM the bake origin snap
+// needs: a bake surface must start on a DEVICE pixel boundary of the canvas it
+// will be blitted onto, and that boundary moves with every parent transform.
+static inline void as_skia_canvas_total_translate(void* c, double* tx, double* ty) { sk_canvas_total_translate(c, tx, ty); }
 static inline void as_skia_canvas_translate(void* c, double x, double y) { sk_canvas_translate(c, x, y); }
 static inline void as_skia_canvas_rotate(void* c, double deg) { sk_canvas_rotate(c, deg); }
 static inline void as_skia_canvas_scale(void* c, double sx, double sy) { sk_canvas_scale(c, sx, sy); }
@@ -9925,6 +9931,7 @@ static inline void as_skia_canvas_draw_rect(void* c, double x, double y, double 
 // makes the screen-space border fall back to one local unit -- the same thing the
 // pure-C rasterizer (if any) would want.
 static inline void as_skia_canvas_total_scale(void* c, double* sx, double* sy) { (void)c; if (sx != NULL) *sx = 1.0; if (sy != NULL) *sy = 1.0; }
+static inline void as_skia_canvas_total_translate(void* c, double* tx, double* ty) { (void)c; if (tx != NULL) *tx = 0.0; if (ty != NULL) *ty = 0.0; }
 static inline void as_skia_canvas_draw_circle(void* c, double cx, double cy, double r, void* p) { (void)c; (void)cx; (void)cy; (void)r; (void)p; }
 static inline void as_skia_canvas_draw_path(void* c, void* path, void* paint) { (void)c; (void)path; (void)paint; }
 static inline void as_skia_canvas_clip_rect(void* c, double x, double y, double w, double h) { (void)c; (void)x; (void)y; (void)w; (void)h; }

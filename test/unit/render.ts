@@ -274,6 +274,7 @@ function checkBorderWidth(): string[] {
 //     scaleX=scaleY=2 draws at 1x (41x21, not 81x41) and with a scale-3 matrix too
 //     the result is 121x61 = matrix only (the two do not multiply).
 function checkBakeResolution(): string[] {
+  const runtimeSource = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
   let ok = 0;
   const bad: string[] = [];
   const check = (label: string, cond: boolean): void => {
@@ -313,7 +314,7 @@ function checkBakeResolution(): string[] {
     // as_bake_scale (max-of-axes) survives for the ONLY caller whose rect is
     // computed in logical units by itself: the 9-slice path.
     (emitted.match(/double sc = as_bake_scale\(canvas, /g) ?? []).length === 1);
-  // (1b) The bake's ORIGIN is snapped down to the destination canvas' device pixel
+  // (1b) The bake's ORIGIN is snapped down to the destination canvas' DEVICE pixel
   // grid. The blit is a whole-image drawImageRect under the default sampling options
   // (nearest), so a surface anchored on a half device pixel has the entire image
   // rounded to an integer pixel while its content was rasterized against the
@@ -325,14 +326,68 @@ function checkBakeResolution(): string[] {
   // as an exact 1 px translation of itself (residual 0.00 at (dx,dy)=(1,1)) for
   // exactly 3 frames, and with ASC_NO_AUTO_BAKE=1 the same sweep showed no offset at
   // all. On the grid the blit is a 1:1 copy with nothing left to round.
+  //
+  // The grid is the CANVAS' device grid, which is not the same thing as the object's
+  // own coordinates: floor(bl*tx)/tx (the shape this pin used to assert) puts bl*tx on
+  // an integer, and the surface then lands on device tx*bxo + otx, i.e. an integer
+  // only when the canvas' own device translation otx is one. That holds at the top
+  // level and fails for every bake nested in another bake or under a fractional
+  // parent -- which at a 1.5 device scale is most of a real UI (the 41-page gallery
+  // demo: 315 baked objects, 47 of them at a fractional device translation, 41 of
+  // those at ~.5, i.e. blitted a whole device pixel off the live rendering). The snap
+  // therefore folds otx in, so the invariant is about where the surface lands rather
+  // than about where the object thinks it is.
   check('the bake origin is snapped to the destination device pixel grid',
-    emitted.includes('double bxo = bl, byo = bt;') &&
-    emitted.includes('{ double tx = 0.0, ty = 0.0; as_skia_canvas_total_scale(canvas, &tx, &ty); if (tx > 0.0 && ty > 0.0) { bxo = floor(bl * tx) / tx; byo = floor(bt * ty) / ty; } }') &&
+    emitted.includes('double bxo = bl, byo = bt, bpx = 0.0, bpy = 0.0;') &&
+    emitted.includes('as_skia_canvas_total_translate(canvas, &otx, &oty);') &&
+    emitted.includes('bxo = (floor(gx) - otx) / tx; byo = (floor(gy) - oty) / ty;') &&
     emitted.includes('int lw = (int)ceil(bw); int lh = (int)ceil(bh);') &&
     // the snapped origin feeds BOTH the surface transform and the blit rect (same
     // call site, so the two can never drift apart again)
     emitted.includes("as_skia_canvas_scale(c2, sx, sy);\nas_skia_canvas_translate(c2, -bxo, -byo);") &&
     !emitted.includes('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bl, bt,'));
+  // (1b-2) A bake is only reusable on the canvas phase it was baked for. The snap puts
+  // the surface origin on an integer device pixel of THAT canvas, so the image is
+  // grid-aligned to it and to no other: a canvas whose translation has a different
+  // fraction (BitmapData.draw zeroes the source transform, a second window, a filter
+  // pass) would blit the image a fraction of a pixel off. Measured with this pin's
+  // own example (autobake-origin.as, container at x=20.4): baked on the stage (phase
+  // .9) and then drawn into the 160x80 BitmapData (phase .5) the anti-aliased circles
+  // gained 9 pixels (333 -> 342) -- the phase is part of the cache key, and a miss
+  // paints LIVE, which is what the cache promises to be indistinguishable from.
+  check('a bake is only reused on the device phase it was baked for',
+    emitted.includes('double gx = bl * tx + otx, gy = bt * ty + oty;') &&
+    emitted.includes('bpx = gx - floor(gx); bpy = gy - floor(gy);') &&
+    emitted.includes('if (o->_cache_valid && o->_cache_image != NULL && (fabs(o->_cache_phx - bpx) > 0.001 || fabs(o->_cache_phy - bpy) > 0.001)) { as_render_live(canvas, o); return; }') &&
+    emitted.includes('o->_cache_phx = bpx; o->_cache_phy = bpy;') &&
+    // the guard runs BEFORE the rebuild branch, so a mis-phased hit re-bakes nothing
+    emitted.indexOf('else { as_render_live(canvas, o); return; }') < 0 &&
+    emitted.indexOf('o->_cache_phx = bpx') > emitted.indexOf('fabs(o->_cache_phx - bpx)') &&
+    // the fields exist in every subclass (inheritance-flattened) and start at 0
+    emitSource.includes("this.line('double _cache_phx;');") &&
+    emitSource.includes('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;'));
+  // (1d) The surface covers the whole DRAWN extent, stroke included. A stroke is
+  // centred on its path, so a surface sized to the path bounds clips half of a 1px
+  // line -- cached then renders with a thinner border than live (0.5 local units
+  // per side). as_paint_bound is the one place that widens a bake/filter box by
+  // _max_sw/2; a baked SWC shape keeps its declared ShapeBounds (g->_clip).
+  check('the bake surface covers the stroke, not just the path',
+    emitted.includes('static int as_paint_bound(DisplayObject* o, double* l, double* t, double* r, double* b) {') &&
+    emitted.includes('if (!g->_clip && g->_max_sw > 0.0) { double half = g->_max_sw * 0.5; *l -= half; *t -= half; *r += half; *b += half; }') &&
+    // both call sites that feed a bake/filter box: Shape, and a Sprite/MovieClip's
+    // own graphics inside a container's union
+    emitted.includes('if (as_is(o, &Shape_vt)) return as_paint_bound(o, l, t, r, b);') &&
+    emitted.includes('if (as_paint_bound(o, l, t, r, b)) found = 1;') &&
+    !emitted.includes('if (as_is(o, &Shape_vt)) return as_graphics_bound(o, l, t, r, b);') &&
+    !emitted.includes('if (as_graphics_bound(o, l, t, r, b)) found = 1;'));
+  // (1e) The snap needs the canvas' device translation, i.e. a second CTM read next
+  // to sk_canvas_total_scale: declared for the Skia build, stubbed to 0 for a pure-C
+  // one (where the snap cannot round anyway, so identity is the honest answer).
+  check('the CTM translate read exists in every build',
+    runtimeSource.includes('extern void sk_canvas_total_translate(void* canvas, double* tx, double* ty);') &&
+    runtimeSource.includes('static inline void as_skia_canvas_total_translate(void* c, double* tx, double* ty) { sk_canvas_total_translate(c, tx, ty); }') &&
+    runtimeSource.includes('static inline void as_skia_canvas_total_translate(void* c, double* tx, double* ty) { (void)c; if (tx != NULL) *tx = 0.0; if (ty != NULL) *ty = 0.0; }') &&
+    readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8').includes('void sk_canvas_total_translate(void* canvas, double* tx, double* ty) {'));
   check('the bake scale is capped in ratio and in pixels',
     emitted.includes('#define AS_BAKE_MAX_PIXELS 4000000.0') &&
     (emitted.match(/double cap = 4\.0 \* ASC_render_scale; if \(cap < 1\.0\) cap = 1\.0;/g) ?? []).length === 2 &&

@@ -1730,6 +1730,15 @@ export class Emitter {
           this.line('void* _cache_image;');
           this.line('double _cache_w;');
           this.line('double _cache_h;');
+          // The object origin's FRACTIONAL device phase on the canvas the image was
+          // baked for (frac(bl*tx + otx), 0..1). The bake snaps its surface origin onto
+          // that canvas' pixel grid, so the resulting image is grid-aligned to THAT
+          // canvas and to no other: a canvas whose translation has a different fraction
+          // (BitmapData.draw zeroes the source transform, a second window, a filter
+          // pass) would blit it a fraction of a pixel off. as_render_cached compares
+          // this and paints live instead of reusing a mis-phased image.
+          this.line('double _cache_phx;');
+          this.line('double _cache_phy;');
           this.line('int _cache_valid;');
           // Incremental-redraw state (auto cacheAsBitmap): _auto_fp is the
           // subtree content fingerprint from the last frame (see
@@ -11246,7 +11255,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_cache_flag = false;');
     this.line('o->_mask_object = false;');
     this.line('o->_cache_image = NULL;');
-    this.line('o->_cache_w = 0.0; o->_cache_h = 0.0;');
+    this.line('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;');
     this.line('o->_cache_valid = 0;');
     this.line('o->_auto_fp = 0;');
     this.line('o->_auto_still = 0;');
@@ -23138,9 +23147,27 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // of the whole canvas clip, which was the per-frame hot spot (20 fps). Shape
     // uses the cached SkPath bounds; Bitmap/TextField use their declared size.
     // Containers fall back to unbounded (as_render_bounds returns 0).
+    // Stroke-INCLUSIVE bounds of the object's own graphics: what a bake or filter
+    // surface has to cover. A stroke is centred on its path, so half of a 1px
+    // line lies OUTSIDE the path bounds, so a surface sized to the path bounds
+    // clips that half and the object renders with a thinner border when cached
+    // than it does live (0.5 local units per side, i.e. 0.75 device px at a 1.5
+    // device scale) -- a cached subtree must paint the same pixels as an uncached
+    // one. A baked SWC shape keeps its declared ShapeBounds instead
+    // (as_bounds_walk's decl path): the authoring tool already unioned the
+    // stroke into that rect.
+    this.line('static int as_paint_bound(DisplayObject* o, double* l, double* t, double* r, double* b) {');
+    this.indent++;
+    this.line('Graphics* g = as_graphics_of(o);');
+    this.line('if (g == NULL || !g->_has_b) return 0;');
+    this.line('*l = g->_bl; *t = g->_bt; *r = g->_br; *b = g->_bb;');
+    this.line('if (!g->_clip && g->_max_sw > 0.0) { double half = g->_max_sw * 0.5; *l -= half; *t -= half; *r += half; *b += half; }');
+    this.line('return 1;');
+    this.indent--;
+    this.line('}');
     this.line('static int as_render_bounds(DisplayObject* o, double* l, double* t, double* r, double* b) {');
     this.indent++;
-    this.line('if (as_is(o, &Shape_vt)) return as_graphics_bound(o, l, t, r, b);');
+    this.line('if (as_is(o, &Shape_vt)) return as_paint_bound(o, l, t, r, b);');
     this.line('if (as_is(o, &SimpleButton_vt)) {');
     this.indent++;
     this.line('DisplayObject* st = as_sbtn_state(o);');
@@ -23181,7 +23208,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('int found = 0;');
     // Own graphics (Sprite/MovieClip) come first, then the children; filters and
     // the auto-bake surface must cover both or the drawing would be clipped away.
-    this.line('if (as_graphics_bound(o, l, t, r, b)) found = 1;');
+    this.line('if (as_paint_bound(o, l, t, r, b)) found = 1;');
     this.line('if (c->children != NULL) {');
     this.indent++;
     this.line('for (int i = 0; i < c->children->length; i++) {');
@@ -23690,26 +23717,46 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('if (o->filters != NULL && o->filters->length > 0) as_filters_expand(o->filters, &bl, &bt, &br, &bb);');
-    // Snap the bake's ORIGIN down to the destination canvas' device pixel grid.
+    // Snap the bake ORIGIN down to a DEVICE pixel of the destination canvas.
     //
-    // The blit below is a whole-image drawImageRect with the default sampling
-    // options (nearest), so a surface whose origin sits on a half device pixel has
-    // the whole image rounded to an integer one -- while the content inside was
-    // rasterized against the UNROUNDED origin. The bake therefore lands up to one
-    // device pixel away from the live rendering of the very same subtree, and
-    // because a fingerprint change drops the bake for ASC_AUTO_BAKE_FRAMES frames,
-    // every roll-over / press / edit pops the content by that pixel and pops it
-    // back when the bake re-engages. Measured on a real app's home card with the
-    // window layer capture (temp/hover/): the roll-over renders the card's title
-    // band as an exact 1 px translation of itself (best-fit residual 0.00 at
-    // (dx,dy)=(1,1)) for exactly 3 frames, and with ASC_NO_AUTO_BAKE=1 the same
-    // sweep shows no offset at all -- the reported "the button jitters on hover".
-    // With the origin ON the grid the surface's pixels coincide with the screen's,
-    // the blit is a 1:1 copy with nothing left to round, and a cached subtree
-    // renders exactly like an uncached one: the invariant as_bake_scale2 exists
-    // for, and now independent of where the object happens to sit.
-    this.line('double bxo = bl, byo = bt;');
-    this.line('{ double tx = 0.0, ty = 0.0; as_skia_canvas_total_scale(canvas, &tx, &ty); if (tx > 0.0 && ty > 0.0) { bxo = floor(bl * tx) / tx; byo = floor(bt * ty) / ty; } }');
+    // The blit below is a whole-image drawImageRect with nearest sampling, so a
+    // surface whose origin sits on a half device pixel has the whole image rounded
+    // to an integer one -- while the content inside was rasterized against the
+    // UNROUNDED origin. The bake therefore lands up to one device pixel away from
+    // the live rendering of the very same subtree, and because a fingerprint change
+    // drops the bake for ASC_AUTO_BAKE_FRAMES frames, every roll-over / press / edit
+    // pops the content by that pixel and pops it back when the bake re-engages.
+    // Measured on a real app's home card with the window layer capture (temp/hover):
+    // the roll-over renders the card's title band as an exact 1 px translation of
+    // itself (best-fit residual 0.00 at (dx,dy)=(1,1)) for exactly 3 frames, and
+    // with ASC_NO_AUTO_BAKE=1 the same sweep shows no offset at all -- the reported
+    // "the button jitters on hover".
+    //
+    // The grid is the DEVICE grid of the canvas being drawn into, NOT the object's
+    // own coordinates: what has to be an integer is where the surface lands on that
+    // canvas, i.e. tx*origin + the canvas' device translation. Snapping in local
+    // space (floor(bl*tx)/tx, the stage-191 fix) is only right when that translation
+    // is itself an integer -- true at the top level, false for every bake nested in
+    // another bake or under a fractional parent (at a 1.5 device scale almost every
+    // ancestor translation is fractional). There the surface lands on the half pixel
+    // anyway, nearest rounds it, and the content moves: measured with
+    // temp/jitter/probe.as at scale 1.5, the nested-card case kept a 0.25-0.75 px
+    // error per level and differed from the live frame in 4423 px (1.6% of the
+    // frame, worst = a whole 1 px vertical shift of the card border, its label and
+    // its rows). With the origin on the device grid the surface pixels coincide with
+    // the canvas', the blit is a 1:1 copy with nothing left to round, and a cached
+    // subtree renders exactly like an uncached one: the invariant as_bake_scale2
+    // exists for, now independent of where the object sits AND of what encloses it.
+    //
+    // Known residual (measured, not hidden): a 1 px non-AA stroke at a .5 device
+    // phase -- a 1.5 device px band, which is exactly what lineStyle(1) is at a 150%
+    // DPI -- still rounds IN inside a bake and OUT in the live pass, i.e. one edge of
+    // one hairline differs by one device px (17 px of a 600x450 frame in
+    // temp/jitter). Everything else in that probe -- fills, glyphs, bars, the card
+    // border -- is pixel-identical, and a lineStyle(2) border is identical too, so it
+    // is the half-pixel tie itself, not a placement or a scale error.
+    this.line('double bxo = bl, byo = bt, bpx = 0.0, bpy = 0.0;');
+    this.line('{ double tx = 0.0, ty = 0.0, otx = 0.0, oty = 0.0; as_skia_canvas_total_scale(canvas, &tx, &ty); as_skia_canvas_total_translate(canvas, &otx, &oty); if (tx > 0.0 && ty > 0.0) { double gx = bl * tx + otx, gy = bt * ty + oty; bxo = (floor(gx) - otx) / tx; byo = (floor(gy) - oty) / ty; bpx = gx - floor(gx); bpy = gy - floor(gy); } }');
     // The span has to be finite and sane BEFORE it is converted to int: a degenerated
     // child transform makes as_render_bounds answer the +-3.4028235e38 sentinel (a
     // real app reported bl=-3.4028235e38 br=+3.4028235e38 for a 4810-wide subtree,
@@ -23765,9 +23812,15 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('int pw = (int)ceil((double)lw * sx); int ph = (int)ceil((double)lh * sy);');
+    // A mis-phased image is not a cache hit: the surface was rasterized against
+    // ANOTHER canvas' pixel grid (see _cache_phx), so blitting it here would shift
+    // the content by a fraction of a device pixel -- the very class of error the
+    // snap above removes. Paint live instead: exact, and no re-bake thrash for a
+    // subtree that keeps moving by sub-pixel steps.
+    this.line('if (o->_cache_valid && o->_cache_image != NULL && (fabs(o->_cache_phx - bpx) > 0.001 || fabs(o->_cache_phy - bpy) > 0.001)) { as_render_live(canvas, o); return; }');
     this.line('if (!o->_cache_valid || o->_cache_image == NULL || o->_cache_w != (double)pw || o->_cache_h != (double)ph) {');
     this.indent++;
-    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "t=%.0f bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f\\n", as_now_ms(), (void*)o, bl, bt, lw, lh, pw, ph, sx, sy);');
+    this.line('{ double _otx = 0.0, _oty = 0.0; as_skia_canvas_total_translate(canvas, &_otx, &_oty); if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "t=%.0f bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f bxo=%.5f byo=%.5f otx=%.5f oty=%.5f bpx=%.5f bpy=%.5f\\n", as_now_ms(), (void*)o, bl, bt, lw, lh, pw, ph, sx, sy, bxo, byo, _otx, _oty, bpx, bpy); }');
     this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { double _tx = 0.0, _ty = 0.0; as_skia_canvas_total_scale(canvas, &_tx, &_ty); double _ex = (_tx > 0.0) ? fabs((double)pw / ((double)lw * _tx) - 1.0) : 0.0; if (_ex > 0.002 || _tx != _ty) fprintf(stderr, "t=%.0f bake_anis o=%p lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f ctx=%.5f cty=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, lh, pw, ph, sx, sy, _tx, _ty, _ex); }');
     this.line('if (o->_cache_image != NULL) { as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('void* surface = as_skia_surface_bake_new(pw, ph);');
@@ -23787,6 +23840,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_cache_image = as_skia_surface_make_snapshot(surface);');
     this.line('as_skia_surface_delete(surface);');
     this.line('o->_cache_w = (double)pw; o->_cache_h = (double)ph;');
+    this.line('o->_cache_phx = bpx; o->_cache_phy = bpy;');
     this.line('o->_cache_valid = 1;');
     this.indent--;
     this.line('}');
