@@ -1470,86 +1470,7 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 - [ ] **Window**/**NativeWindow**（对应 `window_glue.cc` 的多窗口/原生窗口管理，**2026-10-02 已实现**——多窗口运行时注册表、每窗独立 `Stage` 与 `Event.CLOSE` 见 **阶段八十九·七十一**，其关闭窗口崩溃的布局缺陷见 **阶段八十九·七十二**；`Window`（`flash.desktop` 的包装）仍延后）
 - [x] **File**/**FileStream**（`open`/`openAsync`（异步 PROGRESS+COMPLETE）/`read`/`write`，POSIX 文件 IO；静态目录 `applicationDirectory`/`desktopDirectory`/`documentsDirectory`/`userDirectory`）/ **FileMode**（常量）
-- [ ] **SQLConnection**/**SQLStatement**（依赖 SQLite 链接，延后）—— **2026-10-12 选型已定**：引擎链接**官方 SQLite amalgamation**（实测锁定：AIR 的**明文**库就是标准 SQLite 文件、加密库是私有格式），**加密不做**（传密钥时**响亮报明**，绝不静默写明文）。分阶段路线与全部双端实测证据见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md)。**前置**：先修「**`Class` 值的静态 getter 分派缺失**」（否则目标应用的 SQLite 分支**永不进入** + 可达 `#1009`），见 `TODO.md` 的 `### 阶段二百六十九：闭包里的静态字段读取丢掉 `_cinit()` 守卫 —— 惰性初始化被悄悄跳过（v0.4.232 → v0.4.233）✅ 已完成
-
-**一、性质：语义实错，且只在「读点全在闭包里」时显形**
-
-AS3 规定类的静态初始化**先于**该类的第一次静态读（AS3 语言参考 static initializer）。闭包只是一个值，
-从闭包里读静态字段与从普通方法里读**没有任何区别**。我们却让两者走出了不同的 C：普通方法里的读点是
-`(Cls_cinit(), Cls_FIELD)`，闭包体里的读点是裸的 `Cls_FIELD`。于是「数据表写成类常量、读点又在工厂闭包里」
-的代码——也就是任何按「页面即闭包」写的 UI——拿到的是 `NULL`，`NAMES[0]` 抛 `TypeError #1009`。
-
-**二、根因：发射顺序，不是运行时路径**
-
-`sfRead(owner, name)` 只在 `cinitClasses.has(owner)` 时发出守卫读。而 `cinitClasses` 此前**只由**
-`emitClassRegistry` / `emitStaticFields` 填充，两者都跑在 `emitFunctionValues`（闭包体发射器）**之后** ⇒
-发闭包体的时候那个集合还是空的。生成的 C 里表现得很直白：`CONSTS_cinit` 有前向声明、有定义、**调用点 0 处**。
-
-**三、修法（两半，缺一不可）**
-
-① 在 `run()` 里把 `collectCinitClasses()` 提到 `emitFunctionValues()` **之前**，让集合先齐；
-② 在 `emitModuleVars()` 之后、`emitFunctionValues()` 之前补一轮 `static void <Cls>_cinit(void);` 前向声明 ——
-只有守卫没有声明，C 会以「隐式声明」直接拒绝这份程序。
-
-**四、验收**
-
-| 检查 | 修前 | 修后 |
-|---|---|---|
-| `asaotui/probes/g22-closure-statics/run.cjs`（10 格双 runtime + 生成的 C 审计） | 闭包读点裸读，`NAMES` 为 NULL | **10/10 两端逐字相同**，且每个运行时静态读都带 `(Owner_cinit(), …)` |
-| 同一探针 `mutation.cjs` | — | **4/4 命中**（删任一半都变红；M2 是构建失败 exit 2），sha256 逐字节还原 |
-| `examples/closure-statics.as`（11 断言） | — | `closure-statics: all assertions passed` |
-| `unit: closure/statics`（9 条源级钉：顺序 / 守卫 / 声明先于调用 / 纯字面量类不生成 `_cinit`） | — | **9/9** |
-
-**如实报明**：守卫是**类级**开关，不是字段级 —— 一个类只要有任一运行时初始化字段，它所有静态读都会带上
-`_cinit()`（幂等，无害）。单测刻意用一个**只含字面量常量**的类做对照：那个类必须既不生成 `_cinit`、
-读点也保持裸读，否则「多发守卫」这种退化不会被发现。
-
-> **工作区脚手架已删除**：`asaotui/ui-demo/demo` 里 `DocsStyle/DocsDemo/DocsStart/DocsLayout/DocsText/
-> DocsPickers/DocsData` 的 `warmUp()` 与 `DocsMain.onAdded` 的 7 次调用是等这个修复的临时绕行，已一并移除；
-> 留一份「手动热身」就等于把这个缺陷永远盖住。
-
-### 阶段二百七十：`TextField.getTextFormat()` 读回该区间**生效的**格式（v0.4.233 → v0.4.234）✅ 已完成
-
-**一、性质：语义实错，且「读回来 = 我设的值」这条最自然的用法从一开始就是错的**
-
-`TextField_getTextFormat` 曾是一行 `return (tf != NULL) ? tf->defaultTextFormat : NULL;`，注释自述
-「This subset stores ONE format per field」—— 那句写在 run 表存在之前。阶段二百六十八 之后 `_runs` 已经是
-`(begin, end, TextFormat)` 三元组表，函数却没跟上：用 `setTextFormat(fmt(30, 0x0000FF))` 上色定字号后，
-`getTextFormat().color` 仍是 `0`、`size` 仍是 `20`。
-
-**二、AIR 口径（adl 51.4.1，30 格实测，`asaotui/probes/g21-gettextformat/`）**
-
-① 无 run ⇒ 非空范围一律回答 `defaultTextFormat`；② 完全落在一条 run 内 ⇒ 该 run 的格式；③ **跨 run 边界 /
-反序 / 空区间 ⇒ 空 TextFormat（所有建模字段 `null`）**；④ 相邻两条 run **数值相同** ⇒ 仍回答该格式
-（比较的是**值**，不是 run 身份）；⑤ `(0,0)`、空文本、`begin >= length`、`end > length` ⇒ `RangeError #2006`，
-而文本内部的空区间（如 `(3,3)`）回答空格式、**不抛**；⑥ 任一端点给 `-1` 表示「未提供」，不做越界检查
-（`(-1,-1)` 在空文本上回答空格式，`(0,0)` 才抛）。
-
-**三、修法（先补结构前提，再写语义）**
-
-① **结构**：`TextFormat` 的 `size/color/bold/italic/underline/leading/kerning/letterSpacing/leftMargin/
-rightMargin` 由具体 C 类型改为**装箱**（`any`）—— AIR 把这些字段声明成 `Object` 正是为了「未设置 = `null`」；
-不装箱就**无法表达**空格式，这也是旧一行代码看起来还说得通的根本原因。全部读写点同步换成 `as_v_num_val` /
-`as_v_bool_val`，排版（`as_tf_paragraph` / 段度量 / SWC 文本）与自动烘焙指纹逐处适配。
-② **语义**：按 run 表**分段走查** —— 推 `i` 到覆盖 `pos` 的 run、gap 用 `defaultTextFormat`、切到下一个边界，
-逐段用 `as_tf_fmt_eq`（严格 `as_v_eq`，不是宽松相等）比对，全同则 `as_tf_fmt_clone` 返回**副本**，
-否则 `as_tf_fmt_empty`；越界走 `#2006`。返回副本而非原对象：AIR 每次给新对象，调用方改它不能改写字段。
-
-**四、验收**
-
-| 检查 | 修前 | 修后 |
-|---|---|---|
-| `asaotui/probes/g21-gettextformat/run.cjs`（30 格双 runtime + 生成 C 审计） | 读回恒为默认格式 | **30/30 两端逐字相同**，0 分歧 |
-| 同一探针 `mutation.cjs` | — | **5/5 命中**（空格式 / `#2006` / 逐段比对三条改 `emit.ts`，另两条改真值与 AIR 源） |
-| 连带：`probes/g20-settextformat/`（12 格关系式） | case 10/11 是**已登记偏差**（AIR `true` / 我们 `false`） | **12/12 全绿**，`expect.json` 的 `known` 豁免已删除 |
-| `examples/gettextformat.as`（11 组断言：单 run / gap / 跨边界空格式 / `#2006` / 反序 / `-1` / 相邻同值 / 无参 / 空文本 / 副本） | — | `gettextformat: … assertions passed` |
-| `unit: text/getTextFormat`（31 条：字段装箱 / 生成体读 `_runs` / 空格式十字段全 null / 旧一行已消失） | — | **31/31** |
-
-**如实报明**：`TextFormat` 的字段装箱改变了它的 C 结构（`double` → 16 字节 `as_value`），这是一次**结构**
-改动而不是纯语义改动；收益是「未设置」终于可表达，代价是所有读写点都必须显式取值。若将来有人把某个字段改回
-具体类型，空格式路径会静默退化成 `0`/`false`，单测里「空格式十字段全 null」那十条就是为这个写的。
-
-### 遗留待开发`
+- [ ] **SQLConnection**/**SQLStatement**（依赖 SQLite 链接，延后）—— **2026-10-12 选型已定**：引擎链接**官方 SQLite amalgamation**（实测锁定：AIR 的**明文**库就是标准 SQLite 文件、加密库是私有格式），**加密不做**（传密钥时**响亮报明**，绝不静默写明文）。分阶段路线与全部双端实测证据见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md)。**前置**：先修「**`Class` 值的静态 getter 分派缺失**」（否则目标应用的 SQLite 分支**永不进入** + 可达 `#1009`），见 `TODO.md` 的 `### 遗留待开发`
 
 **验收**：`examples/stage64.as`（离屏）断言 `File` 路径束与 `exists`/`isDirectory`/`resolvePath`/`createDirectory`/`deleteFile`/`deleteDirectory` + 静态目录、
 `FileStream` `open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` 读写回环与只读 `position`/`bytesAvailable`、`FileMode` 常量。✅（73 passed / 0 failed；
@@ -15981,6 +15902,84 @@ AIR 的契约是**设置该范围内的格式**（同一区间施加两次 == �
 > **本轮登记的 G21 已在阶段二百七十 修净**：`TextField.getTextFormat()` 曾忽略 run 表、恒返回 `defaultTextFormat`；
 > 现在按实测的 AIR 口径回答该区间**生效的**格式。同一探针的 case 10/11 因此从「已登记偏差」转为正式断言，
 > `expect.json` 的 `known` 豁免已删除。
+
+### 阶段二百六十九：闭包里的静态字段读取丢掉 `_cinit()` 守卫 —— 惰性初始化被悄悄跳过（v0.4.232 → v0.4.233）✅ 已完成
+
+**一、性质：语义实错，且只在「读点全在闭包里」时显形**
+
+AS3 规定类的静态初始化**先于**该类的第一次静态读（AS3 语言参考 static initializer）。闭包只是一个值，
+从闭包里读静态字段与从普通方法里读**没有任何区别**。我们却让两者走出了不同的 C：普通方法里的读点是
+`(Cls_cinit(), Cls_FIELD)`，闭包体里的读点是裸的 `Cls_FIELD`。于是「数据表写成类常量、读点又在工厂闭包里」
+的代码——也就是任何按「页面即闭包」写的 UI——拿到的是 `NULL`，`NAMES[0]` 抛 `TypeError #1009`。
+
+**二、根因：发射顺序，不是运行时路径**
+
+`sfRead(owner, name)` 只在 `cinitClasses.has(owner)` 时发出守卫读。而 `cinitClasses` 此前**只由**
+`emitClassRegistry` / `emitStaticFields` 填充，两者都跑在 `emitFunctionValues`（闭包体发射器）**之后** ⇒
+发闭包体的时候那个集合还是空的。生成的 C 里表现得很直白：`CONSTS_cinit` 有前向声明、有定义、**调用点 0 处**。
+
+**三、修法（两半，缺一不可）**
+
+① 在 `run()` 里把 `collectCinitClasses()` 提到 `emitFunctionValues()` **之前**，让集合先齐；
+② 在 `emitModuleVars()` 之后、`emitFunctionValues()` 之前补一轮 `static void <Cls>_cinit(void);` 前向声明 ——
+只有守卫没有声明，C 会以「隐式声明」直接拒绝这份程序。
+
+**四、验收**
+
+| 检查 | 修前 | 修后 |
+|---|---|---|
+| `asaotui/probes/g22-closure-statics/run.cjs`（10 格双 runtime + 生成的 C 审计） | 闭包读点裸读，`NAMES` 为 NULL | **10/10 两端逐字相同**，且每个运行时静态读都带 `(Owner_cinit(), …)` |
+| 同一探针 `mutation.cjs` | — | **4/4 命中**（删任一半都变红；M2 是构建失败 exit 2），sha256 逐字节还原 |
+| `examples/closure-statics.as`（11 断言） | — | `closure-statics: all assertions passed` |
+| `unit: closure/statics`（9 条源级钉：顺序 / 守卫 / 声明先于调用 / 纯字面量类不生成 `_cinit`） | — | **9/9** |
+
+**如实报明**：守卫是**类级**开关，不是字段级 —— 一个类只要有任一运行时初始化字段，它所有静态读都会带上
+`_cinit()`（幂等，无害）。单测刻意用一个**只含字面量常量**的类做对照：那个类必须既不生成 `_cinit`、
+读点也保持裸读，否则「多发守卫」这种退化不会被发现。
+
+> **工作区脚手架已删除**：`asaotui/ui-demo/demo` 里 `DocsStyle/DocsDemo/DocsStart/DocsLayout/DocsText/DocsPickers/DocsData` 的 `warmUp()` 与 `DocsMain.onAdded` 的 7 次调用是等这个修复的临时绕行，已一并移除；
+> 留一份「手动热身」就等于把这个缺陷永远盖住。
+
+### 阶段二百七十：`TextField.getTextFormat()` 读回该区间**生效的**格式（v0.4.233 → v0.4.234）✅ 已完成
+
+**一、性质：语义实错，且「读回来 = 我设的值」这条最自然的用法从一开始就是错的**
+
+`TextField_getTextFormat` 曾是一行 `return (tf != NULL) ? tf->defaultTextFormat : NULL;`，注释自述
+「This subset stores ONE format per field」—— 那句写在 run 表存在之前。阶段二百六十八 之后 `_runs` 已经是
+`(begin, end, TextFormat)` 三元组表，函数却没跟上：用 `setTextFormat(fmt(30, 0x0000FF))` 上色定字号后，
+`getTextFormat().color` 仍是 `0`、`size` 仍是 `20`。
+
+**二、AIR 口径（adl 51.4.1，30 格实测，`asaotui/probes/g21-gettextformat/`）**
+
+① 无 run ⇒ 非空范围一律回答 `defaultTextFormat`；② 完全落在一条 run 内 ⇒ 该 run 的格式；③ **跨 run 边界 /
+反序 / 空区间 ⇒ 空 TextFormat（所有建模字段 `null`）**；④ 相邻两条 run **数值相同** ⇒ 仍回答该格式
+（比较的是**值**，不是 run 身份）；⑤ `(0,0)`、空文本、`begin >= length`、`end > length` ⇒ `RangeError #2006`，
+而文本内部的空区间（如 `(3,3)`）回答空格式、**不抛**；⑥ 任一端点给 `-1` 表示「未提供」，不做越界检查
+（`(-1,-1)` 在空文本上回答空格式，`(0,0)` 才抛）。
+
+**三、修法（先补结构前提，再写语义）**
+
+① **结构**：`TextFormat` 的 `size/color/bold/italic/underline/leading/kerning/letterSpacing/leftMargin/
+rightMargin` 由具体 C 类型改为**装箱**（`any`）—— AIR 把这些字段声明成 `Object` 正是为了「未设置 = `null`」；
+不装箱就**无法表达**空格式，这也是旧一行代码看起来还说得通的根本原因。全部读写点同步换成 `as_v_num_val` /
+`as_v_bool_val`，排版（`as_tf_paragraph` / 段度量 / SWC 文本）与自动烘焙指纹逐处适配。
+② **语义**：按 run 表**分段走查** —— 推 `i` 到覆盖 `pos` 的 run、gap 用 `defaultTextFormat`、切到下一个边界，
+逐段用 `as_tf_fmt_eq`（严格 `as_v_eq`，不是宽松相等）比对，全同则 `as_tf_fmt_clone` 返回**副本**，
+否则 `as_tf_fmt_empty`；越界走 `#2006`。返回副本而非原对象：AIR 每次给新对象，调用方改它不能改写字段。
+
+**四、验收**
+
+| 检查 | 修前 | 修后 |
+|---|---|---|
+| `asaotui/probes/g21-gettextformat/run.cjs`（30 格双 runtime + 生成 C 审计） | 读回恒为默认格式 | **30/30 两端逐字相同**，0 分歧 |
+| 同一探针 `mutation.cjs` | — | **5/5 命中**（空格式 / `#2006` / 逐段比对三条改 `emit.ts`，另两条改真值与 AIR 源） |
+| 连带：`probes/g20-settextformat/`（12 格关系式） | case 10/11 是**已登记偏差**（AIR `true` / 我们 `false`） | **12/12 全绿**，`expect.json` 的 `known` 豁免已删除 |
+| `examples/gettextformat.as`（11 组断言：单 run / gap / 跨边界空格式 / `#2006` / 反序 / `-1` / 相邻同值 / 无参 / 空文本 / 副本） | — | `gettextformat: … assertions passed` |
+| `unit: text/getTextFormat`（31 条：字段装箱 / 生成体读 `_runs` / 空格式十字段全 null / 旧一行已消失） | — | **31/31** |
+
+**如实报明**：`TextFormat` 的字段装箱改变了它的 C 结构（`double` → 16 字节 `as_value`），这是一次**结构**
+改动而不是纯语义改动；收益是「未设置」终于可表达，代价是所有读写点都必须显式取值。若将来有人把某个字段改回
+具体类型，空格式路径会静默退化成 `0`/`false`，单测里「空格式十字段全 null」那十条就是为这个写的。
 
 ### 遗留待开发
 > **2026-10-24 追加（阶段二百六十九 ~ 二百七十：闭包静态读丢 `_cinit` 守卫 / `getTextFormat` 读 run 表）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。两条都是 `adl` 跑得对、我们跑不出的**语义实错**，且都在阶段内**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表）：① 闭包体内的静态字段读走另一条发射路径，裸读 `Cls_FIELD` 而不带 `(Cls_cinit(), …)` 守卫 ⇒ 只被闭包读的 `static const Array` 运行时仍是 `NULL`（`#1009`），根因是 `cinitClasses` 在闭包体发射之后才被填充；② `TextField.getTextFormat()` 恒返回 `defaultTextFormat`，忽略阶段二百六十八 建立起来的 run 表。两条都在 `asaotui/compiler-gaps.md` 记有完整证据（G22 / G21），此处只留指针。
