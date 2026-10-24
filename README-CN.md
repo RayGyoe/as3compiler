@@ -398,6 +398,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   + `htmlText`/`setTextFormat`/`autoSize`/`scrollH`+`maxScrollH`（打字自动滚动）/`leading` 断言
 - `examples/autosize-metrics.as` — `TextField.autoSize` 的大小口径（`wordWrap=true` 只改高度、宽度保持用户值；
   `wordWrap=false` 才 `width = textWidth + 4` 且两向收放；几何读取即刷新）与**未安装字族**回落到平台默认脸的行盒
+- `examples/gettextformat.as` — `TextField.getTextFormat()` 读回该区间**生效的**格式（阶段二百七十，G21）：单 run / gap 用默认格式 / 跨边界与反序答**全 null 空格式** / `#2006` 越界 / `-1` 表示未提供 / 返回**副本**
 - `examples/tf-scale-metrics.as` — 被缩放的 `TextField` 口径：`textWidth`/`textHeight` = 名义 extents 乘**累积 `scaleY / scaleX`**
   （两个方向同除 `scaleX`、含祖先链），而**字形**只按累积 `scaleY` 整体缩放、`scaleX` 不拉宽（`BitmapData.draw()` 忽略被画对象自身的
   transform，故像素断言挂在中间那层被缩放的 `Sprite` 上）
@@ -469,6 +470,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/gc_barrier.as` — 写屏障压力断言
 - `examples/gc_midframe.as` — 中帧 `System.gc()` 断言（守护保守栈扫描根来源）
 - `examples/closure_const.as` — 类型化 `const` 被闭包捕获的断言
+- `examples/closure-statics.as` — **闭包内**读静态字段（阶段二百六十九，G22）：静态初始化先于第一次静态读，闭包读与普通方法读同口径；运行时初始化的标量与**静态数组/对象**（修前 `NAMES[0]` 抛 `#1009`）、只含字面量的类不生成 `_cinit`
 - `examples/sharedobject.as` — `flash.net.SharedObject` 本地存储（读写/`flush`/磁盘回读/`size`/`clear`；**手写 AIR `.sol` 字节流再读回**两处：① 容器头/路径编码 + 「非空动态属性名进串表、其后条目不丢」；② 「空字符串不占槽」（两处**裸字节**断言把 AIR 的两条串表规则钉死）；③ 名字即相对路径（`#` 前缀、去一层前导 `/` 或 `./`）与 `localPath` 的接受集/拒绝集（第 55 格逐格实测自 `adl 51.4.1`，含 `#2134` 与 `null` 名字的 `#2007`））
 - `examples/gc_alloc_threshold.as` — 非 GUI 目标的分配阈值自动回收
 - `examples/gc_bytes.as` — `ByteArray`/`BitmapData` 字节缓冲纳入 GC
