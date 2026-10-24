@@ -862,9 +862,13 @@ AIR 文档（ActionScript 3.0 语言参考，`TextField.setTextFormat`）的语�
 回归：`examples/settextformat-runs.as`（12 条断言，含「反复 `BitmapData.draw` 宽度不变」与「窄区间切开长 run」）、
 `unit: text/settextformat`（15 条源级钉子，含「插入点在两半之间」这条有序性钉子）。
 
-> 未修的相邻偏差：`TextField.getTextFormat()` 仍返回 `defaultTextFormat`，不读 run 表（AIR 返回该区间
-> **生效的**格式）。同一探针的 case 10/11 把它作为**已登记偏差**持续测量（AIR `true` / 我们 `false`），
-> 在 `asaotui/compiler-gaps.md` 记为 G21（已实测·未修），本轮不夹带。
+> **相邻偏差已修（阶段二百七十）**：`TextField.getTextFormat()` 曾经恒返回 `defaultTextFormat`、不读 run 表
+> （AIR 返回该区间**生效的**格式）。现在按 adl 51.4.1 实测的 30 格口径实现：区间内格式一致则回答该格式（**副本**），
+> 跨 run 边界 / 反序 / 空区间回答**全 `null` 的空 TextFormat**，`(0,0)` / 空文本 / 越界抛 `RangeError #2006`，
+> 端点 `-1` 表示「未提供」。结构前提是 `TextFormat` 的 `Object` 字段改为装箱（否则「未设置」无法表达）。
+> 于是同一探针的 case 10/11 从**已登记偏差**转为正式断言，`expect.json` 的 `known` 豁免已删除。
+> 回归：`asaotui/probes/g21-gettextformat/`（30 格双 runtime，0 分歧；`mutation.cjs` 5/5）、
+> `examples/gettextformat.as`（11 组断言）、`unit: text/getTextFormat`（31 条）。
 
 ### 8.1 `flash.text.StyleSheet` 与 HTML 的**块级**模型（阶段一百四十八）
 

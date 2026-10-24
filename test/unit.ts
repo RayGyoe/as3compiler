@@ -18,6 +18,8 @@ import './unit/reflect.ts';
 import './unit/vector.ts';
 import './unit/object-array.ts';
 import './unit/ternary-null.ts';
+import './unit/closure-statics.ts';
+import './unit/gettextformat.ts';
 import './unit/roundrect.ts';
 import './unit/settextformat-runs.ts';
 import './unit/platform.ts';

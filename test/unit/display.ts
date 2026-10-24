@@ -552,7 +552,7 @@ function checkLineMetrics(): string[] {
   const lmBody = gen.slice(gen.indexOf('static TextLineMetrics* TextField_getLineMetrics(void* _this, int index) {'));
   const lmBodyScoped = lmBody.slice(0, lmBody.indexOf('\n}\n'));
   check('the leading comes from defaultTextFormat and is NOT clamped',
-    lmBodyScoped.includes('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;') &&
+    lmBodyScoped.includes('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;') &&
     !/lead\s*<\s*0/.test(lmBodyScoped));
   check('the per-line box is asked for the default format face plus that leading',
     emitted.includes('as_skia_textlayout_line_box(para, index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);'));

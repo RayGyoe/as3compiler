@@ -820,7 +820,7 @@ function checkStyleSheet(): string[] {
   // styleSheet + htmlText), with AIR's implicit TextFormat defaults.
   check('a field without defaultTextFormat still lays out (implicit 12px/_sans format)',
     c.includes('if (dflt == NULL) { static TextFormat idd; static int idd_init = 0;')
-    && c.includes('idd.font = (char*)"_sans"; idd.size = 12.0; idd.color = 0x000000u;'));
+    && c.includes('idd.font = (char*)"_sans"; idd.size = as_v_num(12.0); idd.color = as_v_num(0.0);'));
   return bad;
 }
 

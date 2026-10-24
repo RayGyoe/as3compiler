@@ -600,6 +600,16 @@ export class Emitter {
     this.line(RUNTIME_PREAMBLE.trimEnd());
     this.line('');
     this.emitAnePreamble();
+    // Which classes own a `_cinit` must be known before ANY body is emitted.
+    // Anonymous-closure and nested-function bodies are emitted by
+    // emitFunctionValues (below), which runs BEFORE emitClassRegistry and
+    // emitStaticFields -- the two places that used to fill this set. A static
+    // field whose only read points sit inside closures was therefore emitted
+    // as a bare slot read: the class initializer never ran and the read saw
+    // C NULL / the default value (G22). Filling it here makes every static
+    // read carry the same `(Owner_cinit(), Owner_FIELD)` guard regardless of
+    // which emitter produced it.
+    this.collectCinitClasses();
     for (const s of this.program.body) {
       if (s.kind === 'ClassDecl') this.userClasses.add(qualifiedName(s.name, s.packageName));
     }
@@ -613,6 +623,12 @@ export class Emitter {
     this.emitSealedPropErrors();
     this.emitForwardDecls();
     this.emitModuleVars();
+    // Forward-declare every class initializer BEFORE any body is emitted: the
+    // first emitter that can call one is emitFunctionValues (closure bodies),
+    // which runs long before emitStaticFields/emitStaticInits define them. Its
+    // own declaration there came too late and C rejected the call as an
+    // implicit declaration (G22).
+    for (const cname of this.cinitClasses) this.line(`static void ${cname}_cinit(void);`);
     this.emitFunctionValues();
     this.emitPropTables();
     this.emitMethodThunks();
@@ -9158,8 +9174,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           const color = e.color === null ? 0 : e.color;
           steps.push(`t->defaultTextFormat = TextFormat_new(${face}, ${this.formatDouble(size)}, 0x${color.toString(16).padStart(6, '0')}u, false, false, ${this.formatDouble(e.leading)});`);
           if (e.align !== null) steps.push(`t->defaultTextFormat->align = (char*)"${e.align}";`);
-          if (e.leftMargin > 0) steps.push(`t->defaultTextFormat->leftMargin = ${this.formatDouble(e.leftMargin)};`);
-          if (e.rightMargin > 0) steps.push(`t->defaultTextFormat->rightMargin = ${this.formatDouble(e.rightMargin)};`);
+          if (e.leftMargin > 0) steps.push(`t->defaultTextFormat->leftMargin = as_v_num(${this.formatDouble(e.leftMargin)});`);
+          if (e.rightMargin > 0) steps.push(`t->defaultTextFormat->rightMargin = as_v_num(${this.formatDouble(e.rightMargin)});`);
           steps.push(`t->multiline = ${e.multiline ? 'true' : 'false'};`);
           steps.push(`t->wordWrap = ${e.wordWrap ? 'true' : 'false'};`);
           steps.push(`t->selectable = ${e.selectable ? 'true' : 'false'};`);
@@ -19750,7 +19766,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // ---- flash.text (stage 38) ----
     this.line('void TextFormat_ctor(TextFormat* o, char* font, double size, unsigned color, bool bold, bool italic, double leading) {');
     this.indent++;
-    this.line('o->font = font; o->size = size; o->color = color; o->bold = bold; o->italic = italic; o->underline = false; o->align = NULL; o->leading = leading; o->kerning = false; o->letterSpacing = 0.0;');
+    this.line('o->font = font; o->size = as_v_num(size); o->color = as_v_num((double)color); o->bold = as_v_bool(bold); o->italic = as_v_bool(italic); o->underline = as_v_bool(false); o->align = NULL; o->leading = as_v_num(leading); o->kerning = as_v_bool(false); o->letterSpacing = as_v_num(0.0);');
     this.line('gc_write_barrier((void*)font);');
     this.indent--;
     this.line('}');
@@ -19904,15 +19920,15 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // defaultTextFormat is ever assigned.
     this.line('if (tf->text == NULL) return NULL;');
     this.line('TextFormat* dflt = tf->defaultTextFormat;');
-    this.line('if (dflt == NULL) { static TextFormat idd; static int idd_init = 0; if (!idd_init) { idd.font = (char*)"_sans"; idd.size = 12.0; idd.color = 0x000000u; idd.bold = false; idd.italic = false; idd.leading = 0.0; idd_init = 1; } dflt = &idd; }');
+    this.line('if (dflt == NULL) { static TextFormat idd; static int idd_init = 0; if (!idd_init) { idd.font = (char*)"_sans"; idd.size = as_v_num(12.0); idd.color = as_v_num(0.0); idd.bold = as_v_bool(false); idd.italic = as_v_bool(false); idd.leading = as_v_num(0.0); idd_init = 1; } dflt = &idd; }');
     this.line('TextFormat* fmt = dflt;');
-    this.line('double size = fmt->size;');
-    this.line('int bold = fmt->bold ? 1 : 0;');
-    this.line('int italic = fmt->italic ? 1 : 0;');
-    this.line('double leading = fmt->leading;');
+    this.line('double size = as_v_num_val(fmt->size);');
+    this.line('int bold = as_v_bool_val(fmt->bold) ? 1 : 0;');
+    this.line('int italic = as_v_bool_val(fmt->italic) ? 1 : 0;');
+    this.line('double leading = as_v_num_val(fmt->leading);');
     // textColor (default 0 = black) overrides defaultTextFormat.color for plain
     // text; a field keeps fmt->color when textColor is left at its default.
-    this.line('unsigned color = (tf->textColor != 0u) ? tf->textColor : fmt->color;');
+    this.line('unsigned color = (tf->textColor != 0u) ? tf->textColor : (unsigned)as_v_num_val(fmt->color);');
     // wordWrap wraps whenever a positive width is set, independent of multiline
     // (AIR wraps a wordWrap=true field even when multiline stays false — the
     // official wordWrap example sets only wordWrap). multiline instead controls
@@ -19998,11 +20014,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('runs[i].start = (unsigned)b;');
     this.line('runs[i].end = (unsigned)e;');
     this.line('runs[i].family = rf->font;');
-    this.line('runs[i].size = rf->size;');
-    this.line('runs[i].bold = rf->bold ? 1 : 0;');
-    this.line('runs[i].italic = rf->italic ? 1 : 0;');
-    this.line('runs[i].color = rf->color;');
-    this.line('runs[i].leading = rf->leading;');
+    this.line('runs[i].size = as_v_num_val(rf->size);');
+    this.line('runs[i].bold = as_v_bool_val(rf->bold) ? 1 : 0;');
+    this.line('runs[i].italic = as_v_bool_val(rf->italic) ? 1 : 0;');
+    this.line('runs[i].color = (unsigned)as_v_num_val(rf->color);');
+    this.line('runs[i].leading = as_v_num_val(rf->leading);');
     this.indent--;
     this.line('}');
     // The field's own default style: AIR lays out everything the runs do NOT
@@ -20099,8 +20115,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (n > 0 && h > 0.0) return h / (double)n;');
     this.indent--;
     this.line('}');
-    this.line('double size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
-    this.line('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;');
+    this.line('double size = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->size) : 12.0;');
+    this.line('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;');
     this.line('if (lead < 0.0) lead = 0.0;');
     this.line('return size * 1.2 + lead;');
     this.indent--;
@@ -20246,7 +20262,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // box, so it has to be dropped explicitly.
     this.line('if (as_skia_textlayout_line_count(para) == 0) return 0.0;');
     this.line('double h = as_skia_textlayout_height(para);');
-    this.line('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;');
+    this.line('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;');
     this.line('if (lead != 0.0 && as_skia_textlayout_line_count(para) > 1) h -= lead;');
     this.line('return h * as_tf_scale_ratio(tf);');
     this.indent--;
@@ -20257,8 +20273,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // not of the text backend.
     this.line('const char* t = as_tf_layout_text(tf);');
     this.line('if (t == NULL || t[0] == 0) return 0.0;');
-    this.line('double size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
-    this.line('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;');
+    this.line('double size = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->size) : 12.0;');
+    this.line('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;');
     this.line('if (lead < 0.0) lead = 0.0;');
     this.line('return (double)as_tf_line_count(tf) * (size * 1.2 + lead) * as_tf_scale_ratio(tf);');
     this.indent--;
@@ -20284,11 +20300,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('int starts[AS_TF_MAX_LINES];');
     this.line('int n = as_tf_line_table(tf, starts, NULL, NULL, AS_TF_MAX_LINES);');
     this.line('if (index < 0 || index >= n) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return NULL; }');
-    this.line('double lead = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->leading : 0.0;');
-    this.line('double size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
+    this.line('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;');
+    this.line('double size = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->size) : 12.0;');
     this.line('char* fam = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->font : NULL;');
-    this.line('int bold = (tf->defaultTextFormat != NULL && tf->defaultTextFormat->bold) ? 1 : 0;');
-    this.line('int italic = (tf->defaultTextFormat != NULL && tf->defaultTextFormat->italic) ? 1 : 0;');
+    this.line('int bold = (tf->defaultTextFormat != NULL && as_v_bool_val(tf->defaultTextFormat->bold)) ? 1 : 0;');
+    this.line('int italic = (tf->defaultTextFormat != NULL && as_v_bool_val(tf->defaultTextFormat->italic)) ? 1 : 0;');
     this.line('double asc = 0.0, desc = 0.0, left = 0.0, w = 0.0;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para != NULL) as_skia_textlayout_line_box(para, index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);');
@@ -20700,8 +20716,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('char* out = as_str_alloc(n + 1);');
     this.line('int opos = 0;');
     this.line('char* face = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->font : NULL;');
-    this.line('double size = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->size : 12.0;');
-    this.line('unsigned color = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->color : 0x000000u;');
+    this.line('double size = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->size) : 12.0;');
+    this.line('unsigned color = (tf->defaultTextFormat != NULL) ? (unsigned)as_v_num_val(tf->defaultTextFormat->color) : 0x000000u;');
     this.line('bool bold = false, italic = false, underline = false;');
     this.line('int runStart = 0;');
     this.line('int i = 0;');
@@ -20867,14 +20883,109 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // composes, so entering a scene with HTML text silently re-sized every
     // plain-text label drawn afterwards (textHeight 29 -> 38 at the same font).
     // `_runs` is a GC array, so dropping the reference is enough to retire it.
-    // getTextFormat(): AIR returns the formatting in effect over a range. This
-    // subset stores ONE format per field, so the field's defaultTextFormat IS the
-    // answer for any range; beginIndex/endIndex are accepted and ignored.
+    // getTextFormat(): AIR answers with the formatting IN EFFECT over the range.
+    // The range has ONE answer when every character in it carries the same format
+    // (the covering run, or the field default in a gap) and an EMPTY TextFormat
+    // -- every modelled field null -- when it straddles a change or is empty.
+    // Measured on adl 51.4.1, 30 cells, asaotui/probes/g21-gettextformat:
+    //   * no runs at all            -> defaultTextFormat for any non-empty range
+    //   * fully inside one run      -> that run's format
+    //   * spans a boundary          -> empty TextFormat (also: reversed, empty)
+    //   * (0,0), empty text, b >= length or e > length -> RangeError #2006,
+    //     while an EMPTY range inside the text such as (3,3) answers empty;
+    //   * a -1 bound means "not supplied": it is never bounds-checked
+    //     ((-1,-1) on empty text answers empty, (0,0) throws).
+    // Equality is by VALUE, not by run identity: two adjacent runs carrying the
+    // same numbers answer that format (probe case 27).
+    // The returned object is a COPY -- AIR hands out a fresh TextFormat, so a
+    // caller mutating it cannot rewrite the field. [g21]
+    this.line('static bool as_tf_fmt_eq(TextFormat* a, TextFormat* b) {');
+    this.indent++;
+    this.line('if (a == b) return true;');
+    this.line('if (a == NULL || b == NULL) return false;');
+    this.line('if ((a->font == NULL) != (b->font == NULL)) return false;');
+    this.line('if (a->font != NULL && strcmp(a->font, b->font) != 0) return false;');
+    this.line('if ((a->align == NULL) != (b->align == NULL)) return false;');
+    this.line('if (a->align != NULL && strcmp(a->align, b->align) != 0) return false;');
+    this.line('if (!as_v_eq(a->size, b->size)) return false;');
+    this.line('if (!as_v_eq(a->color, b->color)) return false;');
+    this.line('if (!as_v_eq(a->bold, b->bold)) return false;');
+    this.line('if (!as_v_eq(a->italic, b->italic)) return false;');
+    this.line('if (!as_v_eq(a->underline, b->underline)) return false;');
+    this.line('if (!as_v_eq(a->leading, b->leading)) return false;');
+    this.line('if (!as_v_eq(a->kerning, b->kerning)) return false;');
+    this.line('if (!as_v_eq(a->letterSpacing, b->letterSpacing)) return false;');
+    this.line('if (!as_v_eq(a->leftMargin, b->leftMargin)) return false;');
+    this.line('if (!as_v_eq(a->rightMargin, b->rightMargin)) return false;');
+    this.line('return true;');
+    this.indent--;
+    this.line('}');
+    this.line('static TextFormat* as_tf_fmt_clone(TextFormat* src) {');
+    this.indent++;
+    this.line('TextFormat* o = TextFormat_new(NULL, 0.0, 0u, false, false, 0.0);');
+    this.line('o->font = src->font; o->align = src->align;');
+    this.line('o->size = src->size; o->color = src->color; o->bold = src->bold; o->italic = src->italic;');
+    this.line('o->underline = src->underline; o->leading = src->leading; o->kerning = src->kerning;');
+    this.line('o->letterSpacing = src->letterSpacing; o->leftMargin = src->leftMargin; o->rightMargin = src->rightMargin;');
+    this.line('gc_write_barrier((void*)src->font); gc_write_barrier((void*)src->align);');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    this.line('static TextFormat* as_tf_fmt_empty(void) {');
+    this.indent++;
+    this.line('TextFormat* o = TextFormat_new(NULL, 0.0, 0u, false, false, 0.0);');
+    this.line('o->size = as_v_null(); o->color = as_v_null(); o->bold = as_v_null(); o->italic = as_v_null();');
+    this.line('o->underline = as_v_null(); o->leading = as_v_null(); o->kerning = as_v_null();');
+    this.line('o->letterSpacing = as_v_null(); o->leftMargin = as_v_null(); o->rightMargin = as_v_null();');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
     this.line('TextFormat* TextField_getTextFormat(void* _this, int beginIndex, int endIndex) {');
     this.indent++;
-    this.line('(void)beginIndex; (void)endIndex;');
     this.line('TextField* tf = (TextField*)_this;');
-    this.line('return (tf != NULL) ? tf->defaultTextFormat : NULL;');
+    this.line('if (tf == NULL) return NULL;');
+    this.line('int len = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
+    this.line('int noArgs = (beginIndex < 0 && endIndex < 0);');
+    this.line('int b = (beginIndex < 0) ? 0 : beginIndex;');
+    this.line('int e = (endIndex < 0) ? len : endIndex;');
+    this.line('if (!noArgs && (len == 0 || (b == 0 && e == 0) || b >= len || e > len)) {');
+    this.indent++;
+    this.line('as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006));');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('if (b >= e) return as_tf_fmt_empty();');
+    this.line('TextFormat* dflt = tf->defaultTextFormat;');
+    this.line('if (dflt == NULL) {');
+    this.indent++;
+    this.line('static TextFormat idd; static int idd_init = 0;');
+    this.line('if (!idd_init) { idd.font = (char*)"_sans"; idd.size = as_v_num(12.0); idd.color = as_v_num(0.0); idd.bold = as_v_bool(false); idd.italic = as_v_bool(false); idd.underline = as_v_bool(false); idd.leading = as_v_num(0.0); idd.kerning = as_v_bool(false); idd.letterSpacing = as_v_num(0.0); idd.leftMargin = as_v_num(0.0); idd.rightMargin = as_v_num(0.0); idd_init = 1; }');
+    this.line('dflt = &idd;');
+    this.indent--;
+    this.line('}');
+    this.line('int n = (tf->_runs != NULL) ? (int)(tf->_runs->length / 3) : 0;');
+    this.line('int pos = b; int i = 0;');
+    this.line('TextFormat* first = NULL;');
+    this.line('while (pos < e) {');
+    this.indent++;
+    this.line('while (i < n && as_v_int_val(tf->_runs->data[i * 3 + 1]) <= pos) i++;');
+    this.line('TextFormat* use = dflt;');
+    this.line('int segEnd = e;');
+    this.line('if (i < n) {');
+    this.indent++;
+    this.line('int s0 = as_v_int_val(tf->_runs->data[i * 3]);');
+    this.line('int s1 = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
+    this.line('if (s0 <= pos) { use = (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]); if (s1 < segEnd) segEnd = s1; }');
+    this.line('else if (s0 < segEnd) segEnd = s0;');
+    this.indent--;
+    this.line('}');
+    this.line('if (use == NULL) use = dflt;');
+    this.line('if (first == NULL) first = use;');
+    this.line('else if (!as_tf_fmt_eq(first, use)) return as_tf_fmt_empty();');
+    this.line('pos = segEnd;');
+    this.indent--;
+    this.line('}');
+    this.line('return as_tf_fmt_clone((first != NULL) ? first : dflt);');
     this.indent--;
     this.line('}');
     this.line('void TextField_set_text(void* _this, char* value) {'),
@@ -23446,8 +23557,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (tf->defaultTextFormat != NULL) {');
     this.indent++;
     this.line('TextFormat* f = tf->defaultTextFormat;');
-    this.line('h = as_fp_ptr(h, f->font); h = as_fp_dbl(h, f->size); h = as_fp_u32(h, f->color);');
-    this.line('h = as_fp_bool(h, f->bold); h = as_fp_bool(h, f->italic); h = as_fp_dbl(h, f->leading);');
+    this.line('h = as_fp_ptr(h, f->font); h = as_fp_dbl(h, as_v_num_val(f->size)); h = as_fp_u32(h, (uint32_t)as_v_num_val(f->color));');
+    this.line('h = as_fp_bool(h, as_v_bool_val(f->bold)); h = as_fp_bool(h, as_v_bool_val(f->italic)); h = as_fp_dbl(h, as_v_num_val(f->leading));');
     // align is an input too: as_tf_paragraph folds it into layoutAlign (the
     // paragraph cache re-lays out when it moves), so a horizontalAlign toggle
     // must invalidate the bake.
@@ -24196,7 +24307,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('double kcx = 0.0, kcy = 0.0, kch = 0.0;');
     this.line('if (as_tf_caret_on() && as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, as_tf_caret(tf)), &kcx, &kcy, &kch)) {');
     this.indent++;
-    this.line('unsigned kcol = (tf->textColor != 0u) ? tf->textColor : tf->defaultTextFormat->color;');
+    this.line('unsigned kcol = (tf->textColor != 0u) ? tf->textColor : (unsigned)as_v_num_val(tf->defaultTextFormat->color);');
     // 1 device pixel wide, like the border rule: the canvas already carries the
     // device ratio * ancestor scale * own scale, so divide the caller's total scale
     // out (the bake pass publishes the DESTINATION scale in ASC_bake_ctm_*).
@@ -24227,8 +24338,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, as_tf_caret(tf)), &ccx, &ccy, &cch)) {');
     this.indent++;
     this.line('TextFormat* cf = tf->defaultTextFormat;');
-    this.line('unsigned ccol = (tf->textColor != 0u) ? tf->textColor : cf->color;');
-    this.line('void* cpara = as_skia_textlayout_new_leading(tf->_comp, cf->font, cf->size, cf->bold ? 1 : 0, cf->italic ? 1 : 0, ccol, cf->leading, 0.0, 0, 1);');
+    this.line('unsigned ccol = (tf->textColor != 0u) ? tf->textColor : (unsigned)as_v_num_val(cf->color);');
+    this.line('void* cpara = as_skia_textlayout_new_leading(tf->_comp, cf->font, as_v_num_val(cf->size), as_v_bool_val(cf->bold) ? 1 : 0, as_v_bool_val(cf->italic) ? 1 : 0, ccol, as_v_num_val(cf->leading), 0.0, 0, 1);');
     this.line('if (cpara != NULL) {');
     this.indent++;
     this.line('double px = 2.0 + alignDx - scrollX + ccx;');

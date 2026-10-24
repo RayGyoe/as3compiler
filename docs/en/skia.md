@@ -1021,10 +1021,16 @@ Regressions: `examples/settextformat-runs.as` (12 assertions, including "repeate
 not change the width" and "a narrower range splits a long run") and `unit: text/settextformat` (15
 source-level pins, including the ordering pin "the insert sits between the two halves").
 
-> Adjacent deviation NOT fixed here: `TextField.getTextFormat()` still answers with `defaultTextFormat`
-> and ignores the run table (AIR returns the format **in effect** over the range). Cases 10/11 of the same
-> probe keep measuring it as a **registered deviation** (AIR `true` / ours `false`); it is logged as G21
-> (measured, unfixed) in `asaotui/compiler-gaps.md` and deliberately kept out of this stage.
+> **The adjacent deviation is now fixed (stage 270)**: `TextField.getTextFormat()` used to answer with
+> `defaultTextFormat` unconditionally and ignore the run table (AIR returns the format **in effect** over the
+> range). It now follows the 30 cells measured on adl 51.4.1: a range carrying one uniform format answers that
+> format (a **copy**), a range straddling a run boundary / reversed / empty answers an **all-null empty
+> TextFormat**, `(0,0)` / empty text / out-of-bounds throw `RangeError #2006`, and a `-1` endpoint means "not
+> supplied". The structural prerequisite is that TextFormat's `Object` fields are boxed -- otherwise "unset"
+> is unrepresentable. Cases 10/11 of the same probe therefore moved from a **registered deviation** to a plain
+> assertion, and the `known` exemption was deleted from `expect.json`. Regressions:
+> `asaotui/probes/g21-gettextformat/` (30 cells on both runtimes, 0 disagreements; `mutation.cjs` 5/5),
+> `examples/gettextformat.as` (11 assertion groups) and `unit: text/getTextFormat` (31 pins).
 
 ### 8.1 `flash.text.StyleSheet` and HTML's **block-level** model (stage one-hundred-forty-eight)
 
