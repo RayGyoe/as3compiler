@@ -173,7 +173,11 @@ switches. Precedence:
 `--gpu-backend` > the value persisted in the previous manifest > `ASC_GPU_BACKEND` (prototype alias, says so when it
 loses) = `auto`. Five impossible combinations (no `--air-app`, web, non-Windows host, descriptor compiles no GPU
 window, Stage3D) are **refused at build time** rather than looking honoured. Details in
-[`compile.md`](docs/en/compile.md) and [`win32.md`](docs/en/win32.md) §3.1.1.
+[`compile.md`](docs/en/compile.md) and [`win32.md`](docs/en/win32.md) §3.1.1. **Win7 scope** (stage
+two-hundred-seventy-two): the GL build's import table is measured clean (13 DLLs / 408 symbols, no `d3d12.dll`/
+`dxgi.dll`/`d3dcompiler_47.dll`, subsystem 6.0) and re-checkable with `node scripts/win7-imports.ts <exe>`; **that
+covers the loader and import surface only — it has never been run on real Win7 hardware**, and the full list of
+what is and is not proven is in [`win32.md`](docs/en/win32.md) §6.
 
 **ANE loading (stage one-hundred-seventy-eight)**: `--ane` / the manifest's `ane-paths` switch on `ASC_HAVE_FRE` and wire in the host FRE runtime.
 Each entry may be an `.ane` package **or an unpacked directory** (`extension.xml` + `<platform key>/<native library>`, i.e. `adt`'s staging layout) —

@@ -175,7 +175,10 @@ error 103，而异命名空间的元素/属性四种写法**全部**报 103；`a
 `--gpu-backend` > 上次清单里的值 > `ASC_GPU_BACKEND` 环境变量（原型期别名，输给钉住的值时会明确说）= `auto`。
 五种无效组合（非 `--air-app`、web、非 Windows 宿主、描述符没编进 GPU 窗口、Stage3D）都是**构建期拒绝**，
 不会「开了但什么都不变」。详见 [`compile.md`](docs/zh-cn/compile.md) §3.4.6 与
-[`win32.md`](docs/zh-cn/win32.md) §3.1.1。
+[`win32.md`](docs/zh-cn/win32.md) §3.1.1。**Win7 口径**（阶段二百七十二）：GL 构建的导入表已实测干净
+（13 个 DLL / 408 个符号，无 `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`，subsystem 6.0），用
+`node scripts/win7-imports.ts <exe>` 可复核；**但这个结论只覆盖「加载器与导入面」，真机仍未跑过**，
+清单与未测项见 [`win32.md`](docs/zh-cn/win32.md) §6。
 
 **ANE 加载（阶段一百七十八）**：`--ane` / 清单 `ane-paths` 打开 `ASC_HAVE_FRE` 并接上宿主 FRE 运行时。
 每一项可以是 `.ane` 包，也可以是**解包后的目录**（`extension.xml` + `<平台键>/<原生库>`，即 `adt` 的暂存布局）——

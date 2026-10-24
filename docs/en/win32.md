@@ -449,7 +449,7 @@ and the **step-by-step procedure for migrating an existing ANE into AOT** are in
 | Descriptor | Macros | Extra source | Extra link | Semantics |
 |---|---|---|---|---|
 | `direct` / `gpu` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_D3D=1` | `d3d_glue.cc` | `d3d12` `dxgi` `d3dcompiler` `d3d12allocator` | full-frame GPU compositing per frame (D3D12, **the default**) |
-| `direct` / `gpu` + `--gpu-backend gl` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_GL=1` | `gl_glue.cc` | the same **+** `opengl32` | full-frame GPU compositing per frame (WGL/OpenGL, §3.1.1) |
+| `direct` / `gpu` + `--gpu-backend gl` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_GL=1` | `gl_glue.cc` | `d3d12` `d3dcompiler` **+** `opengl32` | full-frame GPU compositing per frame (WGL/OpenGL, §3.1.1) |
 | `cpu` / `auto` | — | — | — | CPU raster + SDL streaming texture blit |
 
 The macOS-only `metal_glue.mm` / `objc` / Cocoa `framework` entries are all dropped on Windows; `src/build.ts`'s
@@ -482,13 +482,30 @@ reason it does not go through ARB's `wglChoosePixelFormatARB`: the legacy `Choos
 no GL backend for Stage3D). So `auto`'s **fallback order** is `D3D12 → GL → CPU`, and deleting D3D12 has to wait
 until GL is no worse than it on every machine and the code is a net reduction.
 
-**One link fact that is easy to get wrong**: a `gl` build **still** needs the `d3d12`/`dxgi`/`d3dcompiler` import
-libraries. The reason is that `vendor/skia/lib/windows-x64/skia.lib` is built with `skia_use_direct3d=true`, and
-`GrDirectContexts::MakeGL` sits in the **same TU** as `MakeDirect3D`, so pulling one drags in the other's symbols.
-After `/OPT:REF` though, the artifact's **import table is clean**: measured, it lists only `OPENGL32` + system
-DLLs, with no `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`, subsystem 6.0. ⇒ **a link-time dependency is not a
-runtime dependency**, and the same distinction applies to the Win7 question — “it compiles” is not “it links
-clean”.
+**One link fact that is easy to get wrong**: a `gl` build **still** needs the `d3d12` and `d3dcompiler` import
+libraries (`dxgi` and `d3d12allocator` are **not** needed). The reason is **not** “the factories share a TU” —
+`MakeGL` lives in `gpu.GrGLDirectContext.obj` and `MakeDirect3D` in `gpu.GrDirectContext.obj`, two different
+objects. The measured chain is:
+
+1. `MakeGL` calls the `GrDirectContext::GrDirectContext(GrBackendApi, …)` constructor, which is defined in
+   `gpu.GrDirectContext.obj` ⇒ that object is loaded (**the GL path needs it anyway**);
+2. `MakeDirect3D`, in the same object, references `GrD3DGpu::Make`;
+3. lld-link pulls archive members for every undefined symbol of every object it has loaded, and only **then**
+   runs `/OPT:REF` ⇒ `GrD3DGpu.obj` and its `D3DCompile` / `D3D12SerializeRootSignature` must be resolved
+   before the dead code can be dropped.
+
+Measured item by item: dropping both libraries fails on **exactly** those two symbols; adding `-Wl,/OPT:REF`
+changes nothing; `-Wl,/verbose` names the step (`Loaded skia.lib(gpu.GrD3DGpu.obj) for … GrD3DGpu::Make`).
+Dropping either `dxgi` or `d3d12allocator` still links, to a **byte-identical** binary (11,126,272 B, same
+sha256) — they belong to the D3D12 backend proper.
+
+**Nothing of it reaches the product**: the two-library and four-library links are the same bytes, and the import
+table lists only `OPENGL32` + system DLLs, subsystem 6.0, with **no** `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`.
+Re-check with `node scripts/win7-imports.ts <exe>` (it reads the PE import directory and decides per symbol; a
+whole-file string scan is not evidence — the static archive keeps D3D names only as debug strings).
+⇒ **A link-time dependency is not a runtime dependency.** Removing the last two libraries would need a separate
+`skia_use_direct3d=false` Skia build (a full rebuild per bit width, ~+36 MB each) for a build-machine-only
+benefit, while the runtime artifact is already provably clean — so it is not done at this stage.
 
 **Untested items, listed as such**: only run on Win11 26200 + RTX 4090 D (`4.6.0 NVIDIA 610.88`) + a single
 display; WGL behaviour on old Intel/AMD drivers, Remote Desktop and VMs, the availability of fast paths like
@@ -1080,7 +1097,63 @@ backend files must implement the five neutral names (`unit: backendparity`).
 
 ---
 
-## 6. Follow-ups
+## 6. Windows 7: What Can Be Proven, and What Cannot
+
+Win7 is the one platform conclusion in this project with **no real hardware** behind it, so this section is split
+into “there is evidence” and “there is no evidence yet”. No promissory notes.
+
+### 6.1 Evidence: the import surface of both builds
+
+| Build | Import table (measured with `node scripts/win7-imports.ts <exe>`) | Conclusion |
+|---|---|---|
+| `--gpu-backend gl` | 13 DLLs / 408 symbols, including `OPENGL32`; **no** `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll` | No Win8+ dependency on the loader or import side |
+| default (D3D12) | 15 DLLs, including `d3d12.dll` and `D3DCOMPILER_47.dll` | **Cannot** start on Win7 (D3D12 itself needs Win10 1507 + WDDM 2.0) |
+
+Both carry subsystem version **6.0** (Vista), which the Win7 loader accepts — it only rejects > 6.1, which is
+exactly how ANGLE/Chromium M110 (`,10.0`) lost Win7.
+
+The tool's two tables are maintained knowledge, not a heuristic: **DLLs absent from Win7 SP1** (`d3d12.dll`,
+`d3dcompiler_47.dll`, `dxcompiler.dll`, `shcore.dll`, `ucrtbase.dll`, …) and **Win8+ symbols**
+(`user32!GetDpiForWindow`, `kernel32!SetThreadDescription`, `kernel32!CreateFile2`, `ole32!RoInitialize`, …).
+`test/unit/win7.ts` pins the decision logic against synthesised PE metadata, so emptying a table or breaking a
+rule goes red on CI (macOS arm64).
+
+### 6.2 Evidence: with no driver the failure is **explained**, not a black window
+
+The WGL contract only guarantees OpenGL 1.1, and that is precisely what a fresh Win7 install (or a VM without
+guest additions) runs: Microsoft's software rasteriser, `Microsoft Corporation | GDI Generic | 1.1.0`. Ganesh
+needs 2.0 (GLSL 1.10 + FBOs). `vendor/gl_glue.cc` therefore parses `GL_VERSION` right after creating the context
+and refuses below 2.0, saying that a real GPU driver is required and to switch the descriptor to
+`<renderMode>cpu</renderMode>` or install the driver; it then tears the context down along the same path as every
+other init failure in that file. It does **not** fall back to CPU: a GPU build has no CPU raster path compiled in
+(`sk_window_show_gpu` treats a failed attach as a failure), so a “fallback” would only produce a window that never
+paints.
+
+### 6.3 No evidence (listed as such; do not quote as conclusions)
+
+- **No real machine.** Every “it will run” inference in 6.1 comes from the import surface, the subsystem version
+  and API availability — not from a run.
+- **The below-1.1 refusal branch has never run against a real 1.1 context**: this box only has the RTX 4090's 4.6
+  context, so that code was compiled and reviewed, not exercised.
+- Win7-era Intel/AMD drivers usually offer GL 3.x–4.x, but that is **untested**; so is the availability of fast
+  paths such as `glTexStorage2D` under a compat profile.
+- Under Remote Desktop or in a VM, `wglCreateContext` may only give 1.1 (RDP disables acceleration) — exactly the
+  case 6.2 is there for, and equally unrecorded.
+- Whether AIR itself runs on Win7 is out of scope; this section only speaks about **our artifact's** loading and
+  API surface.
+
+### 6.4 Acceptance procedure once a Win7 SP1 machine is available
+
+1. `node scripts/win7-imports.ts <exe>` → must PASS. This step needs no Win7 box and can be run any time.
+2. Install the vendor GPU driver (not the Basic Display Adapter), run with `ASC_GPU_TRACE=1`, and confirm the
+   version in `gl_glue: window 0 on <vendor> | <renderer> | <version>` is ≥ 2.0.
+3. If step 2 yields only 1.1: record vendor/renderer and confirm the process exits with the 6.2 message instead of
+   showing a black window.
+4. Run with `ASC_GPU_STATS=1` for a while, compare against the Win11 numbers in
+   [`compile.md`](compile.md) §3.4.6, and record frame time plus graphics work.
+5. Paste those three outputs back into this section and delete the “unverified” wording.
+
+## 7. Follow-ups
 
 - **A new window-creation path must install the listener + run `sk_pump_frame`** (§2.8): during a drag/resize the
   loop is blocked, so frames can only be driven by the `SDL_AddEventWatch` listener — and it must call the shared

@@ -367,6 +367,42 @@ int sk_gpu_init(int win_id, void* native_handle) {
     fflush(stderr);
   }
 
+  // GL version floor, checked BEFORE Skia is handed the context.
+  //
+  // The WGL contract only guarantees OpenGL 1.1, and that is not hypothetical
+  // here: a Windows install with no vendor driver (a fresh Windows 7 image, a VM
+  // without guest additions, a server-style minimal install) runs Microsoft's
+  // software rasteriser, which reports "Microsoft Corporation | GDI Generic |
+  // 1.1.0". Ganesh needs 2.0 (GLSL 1.10 + FBOs); handed a 1.1 context it fails
+  // deep inside Skia with a black window and no explanation, which on the one OS
+  // class this backend exists for is the worst possible failure mode.
+  //
+  // So refuse here, with the numbers the line above already printed and the
+  // action the user can take. Returning 0 makes the caller report "WGL backend
+  // init failed" and abort window creation: a build whose descriptor asked for
+  // renderMode=direct/gpu has no CPU raster path compiled in, so a "fallback"
+  // here would be a window that never paints.
+  {
+    const char* version = (const char*)glGetString(GL_VERSION);
+    int glMajor = 0, glMinor = 0;
+    const bool parsed = version != NULL && sscanf(version, "%d.%d", &glMajor, &glMinor) == 2;
+    if (!parsed || glMajor < 2) {
+      fprintf(stderr,
+              "gl_glue: OpenGL %s is below the 2.0 floor Ganesh requires; this "
+              "backend needs a real GPU driver (Microsoft's \"GDI Generic\" 1.1 "
+              "means none is installed). Rebuild with <renderMode>cpu</renderMode> "
+              "in the descriptor, or install the vendor driver.\n",
+              version != NULL ? version : "(unreadable)");
+      fflush(stderr);
+      wglMakeCurrent(NULL, NULL);
+      wglDeleteContext(w->hglrc);
+      w->hglrc = NULL;
+      ReleaseDC(hwnd, w->hdc);
+      w->hdc = NULL;
+      return 0;
+    }
+  }
+
   gl_set_swap_interval(1);
 
   // A GrDirectContext per GL context (Skia's rule), created while this context is

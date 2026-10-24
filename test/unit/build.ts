@@ -2457,6 +2457,18 @@ function checkGpuBackend(): string[] {
     gl['gpu-backend'] === 'gl' && auto['gpu-backend'] === undefined && d3d['gpu-backend'] === 'd3d12');
   check('the shared GPU-window define is backend-neutral (both builds carry it)',
     defs(gl).includes('ASC_RENDER_WINGPU=1') && defs(auto).includes('ASC_RENDER_WINGPU=1'));
+  // The link line is the one place where "GL only" is not literally true, so the
+  // exact set is pinned rather than described. Measured by dropping one library at
+  // a time from a real WGL link: `dxgi` and `d3d12allocator` are not needed at all
+  // (dropping either still links, to the same bytes), while `d3d12` and
+  // `d3dcompiler` are — the vendored skia.lib is a skia_use_direct3d=true build and
+  // lld-link loads an archive member's undefined symbols before /OPT:REF can drop
+  // the dead D3D12 factory. Neither reaches the import table.
+  check('gl links opengl32 plus exactly the two D3D libraries lld forces',
+    libs(gl).includes('opengl32') && libs(gl).includes('d3d12') && libs(gl).includes('d3dcompiler'));
+  check('...and not dxgi / d3d12allocator, which belong to the D3D12 backend',
+    !libs(gl).includes('dxgi') && !libs(gl).includes('d3d12allocator')
+    && libs(d3d).includes('dxgi') && libs(d3d).includes('d3d12allocator'));
 
   // (2) Every impossible combination is refused by name.
   const webMsg = thrown(() => man('gl', { web: true }));

@@ -743,21 +743,39 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
       // newer than 1.1 (FBOs, shader objects, VAOs) reaches the driver through
       // wglGetProcAddress, which Skia's GrGLMakeNativeInterface resolves itself.
       linkLibs.push('opengl32');
-      // The four D3D import libraries below are a LINK-TIME-ONLY requirement of
-      // the vendored skia.lib, not a runtime dependency of this backend. That
-      // archive is built with skia_use_direct3d=true, and Ganesh puts every
-      // backend factory in one translation unit (GrDirectContext.cpp), so pulling
-      // GrDirectContexts::MakeGL also pulls GrDirectContext::MakeDirect3D and its
-      // D3D12 references. lld resolves them before dead-stripping; /OPT:REF then
-      // removes the sections, and the import table of the resulting binary
-      // confirms it: the WGL build imports opengl32/USER32/GDI32/… and NOT
-      // d3d12.dll, dxgi.dll or d3dcompiler_47.dll. (Verified with a PE import-table
-      // reader, not a whole-file string scan -- the latter reports D3D names that
-      // are only static-archive debug strings.)
-      // A shipping GL-only build should instead link a skia.lib built with
-      // skia_use_direct3d=false, which drops this entirely; that needs a Skia
-      // rebuild and is why it is not done here.
-      linkLibs.push('d3dcompiler', 'd3d12', 'dxgi', 'd3d12allocator');
+      // The two D3D import libraries below are a LINK-TIME-ONLY requirement of
+      // the vendored skia.lib, not a runtime dependency of this backend — and
+      // they are the measured minimum, not a guess.
+      //
+      // Why any at all: windows-x64/skia.lib is built with skia_use_direct3d=true,
+      // so `GrDirectContext::MakeDirect3D` is compiled into gpu.GrDirectContext.obj
+      // — an object this backend loads anyway, because it also holds ordinary
+      // GrDirectContext members the GL path calls. lld-link loads an archive member
+      // for every undefined symbol of every object it has loaded, and only THEN
+      // runs /OPT:REF, so MakeDirect3D's D3D references are resolved before the
+      // now-dead section can be discarded. Measured, not inferred:
+      //   * dropping the libs fails on exactly `D3DCompile` and
+      //     `D3D12SerializeRootSignature`;
+      //   * adding -Wl,/OPT:REF explicitly changes nothing;
+      //   * `-Wl,/verbose` names the edge: "Loaded skia.lib(gpu.GrD3DGpu.obj) for
+      //     public: ... GrD3DGpu::Make(...)", reached from gpu.GrDirectContext.obj.
+      // `dxgi` and `d3d12allocator` are NOT needed: dropping either still links,
+      // and the resulting binary is byte-identical to the four-library one
+      // (11,126,272 B, same sha256) — they belong to the D3D12 backend proper.
+      //
+      // None of it reaches the product: the two- and four-library links are the
+      // same bytes, and the import table carries opengl32 plus system DLLs only
+      // (no d3d12.dll, dxgi.dll or d3dcompiler_47.dll). That absence is exactly
+      // what makes this backend the answer below D3D12's Win10 floor — check it
+      // with `node scripts/win7-imports.ts <exe>`, a PE import-directory reader
+      // (a whole-file string scan is not evidence: the static archive still
+      // contains D3D names as debug strings).
+      //
+      // The only way past the two remaining libs is a skia.lib built with
+      // skia_use_direct3d=false, i.e. a second full Skia build per bit width
+      // (~+36 MB each) for a build-machine-only benefit. Not worth it while the
+      // runtime artifact is already provably clean; see docs/zh-cn/win32.md §6 (Win7).
+      linkLibs.push('d3d12', 'd3dcompiler');
     } else if (onWin) {
       defines.push('ASC_RENDER_D3D=1');
       sources.push(d3dSrc);

@@ -16028,13 +16028,86 @@ rightMargin` 由具体 C 类型改为**装箱**（`any`）—— AIR 把这些�
 
 **五、如实报明**
 
-① 链接期**仍需** `d3d12`/`dxgi`/`d3dcompiler`：`skia.lib` 按 `skia_use_direct3d=true` 编，`MakeGL` 与
-`MakeDirect3D` 在同一 TU，拉一个带进另一个的符号（已写进 `compile.md` §3.4.6 与 `win32.md` §3.1.1）。
+① ~~链接期**仍需** `d3d12`/`dxgi`/`d3dcompiler`：`skia.lib` 按 `skia_use_direct3d=true` 编，`MakeGL` 与
+`MakeDirect3D` 在同一 TU，拉一个带进另一个的符号~~ ⇒ **「同一 TU」是错的，已在阶段二百七十二 量清并更正**：
+两者是**两个** `.obj`，真实链条是 `MakeGL` → `GrDirectContext` 构造器（在 `gpu.GrDirectContext.obj`）→ 该对象里的
+`MakeDirect3D` → `GrD3DGpu::Make`，而 lld-link 先拉归档成员、后跑 `/OPT:REF`。收口后 GL 链接行只需
+`d3d12` + `d3dcompiler`（`dxgi`/`d3d12allocator` 删除后产物**逐字节相同**）。
 ② 只在 Win11 26200 + RTX 4090 D + 单显示器上跑过；Intel/AMD 老驱动、远程桌面、虚拟机下的 WGL、
 compat profile 下 `glTexStorage2D` 之类快路径、present 的实际合成延迟（需抓帧工具）**均未测**。
 ③ **GL 仍不是默认**：换后端提不了帧率，而 present 模型更贵（blt 必走 DWM）、Stage3D 没有 GL 后端、
 `auto` 的回退顺序定为 `D3D12 → GL → CPU`。④ Win7 上“能不能跑”**仍未真机验证**：代码事实是产物不导入
-`d3d12.dll`、无 Win8+ 符号、子系统 6.0，但“编得干净”不等于“真机跑得动”。
+`d3d12.dll`、无 Win8+ 符号、子系统 6.0，但“编得干净”不等于“真机跑得动”。**阶段二百七十二** 把这份判定做成了`scripts/win7-imports.ts`（见 `win32.md` §6.4 的验收清单），真机仍未跑。
+
+### 阶段二百七十二：两个遗留的收口 —— GL 的链接期依赖量清了、Win7 从「代码事实」变成可复核证据（v0.4.235 → v0.4.236）✅ 已完成
+
+阶段二百七十一 收尾时如实报明了两条遗留：① `gl` 构建的链接行里还留着 D3D 导入库；② Win7 只有代码事实、没有真机。
+这一阶段**不加功能**，只把这两条从「一句话」变成**可复核的东西**。
+
+**一、链接期依赖：原来说的机制是错的，量出来的链条是另一条**
+
+原报告的机制是「`MakeGL` 与 `MakeDirect3D` 在同一个 TU」。`llvm-nm` 逐个成员核过：`MakeGL` 在
+`obj/src/gpu/ganesh/gl/gpu.GrGLDirectContext.obj`、`MakeDirect3D` 在 `obj/src/gpu/ganesh/gpu.GrDirectContext.obj`
+——**两个对象**。真实链条三步：
+
+1. `MakeGL` 要调 `GrDirectContext::GrDirectContext(GrBackendApi, …)` 构造器；`GrGLDirectContext.obj` 的未定义表里
+   只有这一条能对上 `GrDirectContext.obj` 的定义 ⇒ 那个对象被加载（**GL 路径本来就需要它**）；
+2. 同一个对象里的 `MakeDirect3D` 引用 `GrD3DGpu::Make`；
+3. lld-link 先为「已加载对象的每个未定义符号」拉归档成员，**之后**才跑 `/OPT:REF` ⇒ `gpu.GrD3DGpu.obj` 及其
+   `D3DCompile` / `D3D12SerializeRootSignature` 在死代码被丢掉之前就必须解析。
+
+证据：不给任何 D3D 库时未定义符号**恰好**是 `D3DCompile` 与 `D3D12SerializeRootSignature` 两条；`-Wl,/verbose`
+直接点名那一步（`Loaded skia.lib(gpu.GrD3DGpu.obj) for … GrD3DGpu::Make`）；额外加 `-Wl,/OPT:REF` 或 `,ICF` 结果
+不变。逐库删除矩阵：去 `d3d12` ⇒ 失败、去 `d3dcompiler` ⇒ 失败、去 `dxgi` ⇒ 照样链、去 `d3d12allocator` ⇒ 照样链，
+且**两库与四库的产物逐字节相同**（11,126,272 B，sha256 一致）。
+⇒ `src/air-app.ts` 的 GL 分支从四个库收成 `d3d12` + `d3dcompiler`（+ `opengl32`），`dxgi`/`d3d12allocator`
+只留给 D3D12 后端；注释里写的是这条链条本身，不是结论。
+
+**二、没有另编一份 `skia_use_direct3d=false` 的 skia**（评估后否决，理由不是「编不过」）
+
+试过：`out/windows-x64-gl/args.gn`（`skia_use_direct3d = false`）+ `gn gen` 成功（89 targets），`ninja` 在
+dng_sdk/freetype 边上失败。否决的真实理由是**划不来**：位宽是一等参数（x64 + arm64），每种宽度都要多一份完整
+skia（约 +36 MB），换来的是**只在构建机**上少两个 `-l`——运行期产物两个库与四个库**是同一份字节**，导入表已经
+证明干净。将来真要断开，落点是 `vendor/provision/windows.ps1` 的 gn 参数集。
+
+**三、Win7：新增可复核的判定工具**
+
+`scripts/win7-imports.ts`：读 **PE 导入目录**，逐 DLL + **逐符号**判定，`--json` 可机读，退出码 0/1。
+两张表是要维护的**知识**而非启发式：**Win7 SP1 上不存在的 DLL**（`d3d12.dll`、`d3dcompiler_47.dll`、
+`dxcompiler.dll`、`shcore.dll`、`ucrtbase.dll`、`vcruntime140*`、`api-ms-win-core-path…`）与 **Win8+ 符号**
+（`user32!GetDpiForWindow`、`kernel32!SetThreadDescription`/`CreateFile2`、`ole32!RoInitialize`…），外加
+**subsystem ≤ 6.1** 与 2/3 两个合法子系统值——后者正是 ANGLE/Chromium M110 丢掉 Win7 的那道门（`,10.0`）。
+刻意**不做**整文件字符串扫描：静态档案里的 D3D 名字只是调试字符串，拿它当证据会得出反向结论。
+
+实测三份产物：`GalleryApp-gl.exe` **PASS**（13 DLL / 408 符号，subsystem 6.0，含 `OPENGL32`）、
+`gpufb.exe`（`--gpu-backend gl` 重建后）**PASS**、`GalleryApp-d3d.exe` **FAIL**（导入 `d3d12.dll` +
+`D3DCOMPILER_47.dll`）——最后一条是**预期失败**：D3D12 本身要求 Win10 1507，这正是「Win7 上 GL 是唯一 GPU 路径」
+的机器可读形式。
+
+**四、没有驱动时必须是**有说明**的失败，不是黑屏**
+
+WGL 契约只保证 OpenGL 1.1，而 Win7 全新装机（或没装 Guest Additions 的虚拟机）跑的正是 Microsoft 的软件光栅器
+（`Microsoft Corporation | GDI Generic | 1.1.0`），Ganesh 要 2.0（GLSL 1.10 + FBO）。`vendor/gl_glue.cc` 因此在
+建上下文后**立刻**解析 `GL_VERSION`，`< 2.0` 时拒绝并报明「需要真实显卡驱动」+「改 `<renderMode>cpu</renderMode>`
+或装驱动」，然后走该文件其它初始化失败同一条拆上下文路径（`wglMakeCurrent(0)` → `wglDeleteContext` →
+`ReleaseDC`）。**刻意不 fallback 到 CPU**：GPU 构建里根本没编进 CPU 光栅路径，假装回退只会得到一个永不刷新的窗口。
+
+**五、证据**
+
+| 项 | 结果 |
+|---|---|
+| `unit: platform/Win7ImportSurface` | **19/19**：合成 PE 元数据钉判定逻辑（`d3d12.dll`/`d3dcompiler_47.dll`/`GetDpiForWindow`/`SetThreadDescription`/`CreateFile2`/`RoInitialize` 逐条命中、同 DLL 的合法符号不误报、subsystem 10.0 拒 / 6.01 过）；钉版本门的存在与**顺序**（早于 `MakeGL`）与拆上下文；钉两份 win32 文档的 Win7 节 |
+| `unit: air-app/GpuBackend` | **31/31**（新增 2 条：`gl` 恰好 `opengl32`+`d3d12`+`d3dcompiler`；`gl` 不含 `dxgi`/`d3d12allocator`，而 `d3d12` 含） |
+| `node scripts/win7-imports.ts` | 三份产物 PASS / PASS / FAIL（最后一份是 D3D12，**预期失败**） |
+| 文档 | `win32.md` 新增 **§6「Windows 7：现在能证明什么、不能证明什么」**（中英）：6.1 导入面 · 6.2 无驱动时的失败 · 6.3 **没有证据的三条** · 6.4 拿到机器时的五步验收；§3.1.1 与 `compile.md` §3.4.6 的链接期段落按实测重写；`renderMode` 表的 GL 行改为 `d3d12 d3dcompiler` **+** `opengl32` |
+
+**六、仍然没有的**（照实列，不当结论用）
+
+Win7 **真机仍未跑**（本机没有机器）；`< 2.0` 的拒绝分支**没有在真实 1.1 上下文里跑过**（本机只有 RTX 4090 的
+4.6）；老 Intel/AMD 驱动的 Win7 表现、远程桌面/虚拟机下的 WGL 行为、compat profile 下 `glTexStorage2D` 快路径
+**均未测**。`win32.md` §6.4 写了拿到机器当天的五步验收清单，届时按它把 §6.3 的措辞改掉——**在那之前，Win7 的
+结论只有「加载器与导入面干净」，没有「跑得动」。**
+
 
 ### 遗留待开发
 > **2026-10-24 追加（阶段二百七十一：`--gpu-backend gl`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段新增的是**后端选择**，不是语义能力；GL 侧的未测项（Intel/AMD 老驱动、远程桌面/虚拟机、compat profile 下快路径可用性、present 实际合成延迟、Win7 真机）属**验证欠账**而非「`adl` 跑得对我们跑不出」，按 AGENTS §1.5 不占本表——已逐条写在阶段节的「五、如实报明」与 `compile.md` §3.4.6 的「已知边界」。同一条也适用于「GL 还不是默认」：那是**权衡**（换后端不提帧率、present 更贵），不是欠账。

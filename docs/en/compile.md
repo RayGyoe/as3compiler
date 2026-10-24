@@ -636,10 +636,13 @@ exe run twice differs by 114 px inside that same band (animation timing jitter),
   Desktop and VMs, and the availability of fast paths like `glTexStorage2D` under a compat profile are **all
   untested**.
 - Stage3D with GL is a **build-time refusal** (last row above), not “runs a bit worse”.
-- The link still needs `d3d12`/`dxgi`/`d3dcompiler`: `vendor/skia/lib/windows-x64/skia.lib` is built with
-  `skia_use_direct3d=true`, and `GrDirectContexts::MakeGL` sits in the same TU as `MakeDirect3D`. After `/OPT:REF`
-  the artifact's **import table is clean** (measured: only `OPENGL32` + system DLLs, **no** `d3d12.dll`/`dxgi.dll`/
-  `d3dcompiler_47.dll`), which is itself worth stating: **a link-time dependency is not a runtime dependency**.
+- The link still needs the `d3d12` and `d3dcompiler` import libraries (`dxgi` and `d3d12allocator` are not
+  needed): `vendor/skia/lib/windows-x64/skia.lib` is built with `skia_use_direct3d=true`, and lld-link pulls
+  archive members for an already-loaded object's undefined symbols **before** it runs `/OPT:REF`, so the two D3D
+  references of `MakeDirect3D` (same object) must be resolved first. Measurements and the byte-for-byte
+  comparison: [`win32.md`](win32.md) §3.1.1. The artifact's **import table is clean** (measured: only
+  `OPENGL32` + system DLLs, **no** `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`): **a link-time dependency is
+  not a runtime dependency**.
 - The context is **deliberately a compat profile**: the AGAL→GLSL generator emits ES 1.00 (`attribute`/`varying`/
   `texture2D`), and moving to core would touch the generator shared with the web backend — a much larger
   regression surface.

@@ -398,7 +398,7 @@ Windows-on-ARM 上**非 AIR 的产物**（不走 `--air-app` 的普通 `as-aot` 
 | 描述符 | 宏 | 额外源 | 额外链接 | 语义 |
 |---|---|---|---|---|
 | `direct` / `gpu` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_D3D=1` | `d3d_glue.cc` | `d3d12` `dxgi` `d3dcompiler` `d3d12allocator` | 每帧整帧 GPU 合成（D3D12，**缺省**） |
-| `direct` / `gpu` + `--gpu-backend gl` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_GL=1` | `gl_glue.cc` | 同上 **+** `opengl32` | 每帧整帧 GPU 合成（WGL/OpenGL，§3.1.1） |
+| `direct` / `gpu` + `--gpu-backend gl` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_GL=1` | `gl_glue.cc` | `d3d12` `d3dcompiler` **+** `opengl32` | 每帧整帧 GPU 合成（WGL/OpenGL，§3.1.1） |
 | `cpu` / `auto` | — | — | — | CPU 光栅 + SDL streaming texture blit |
 
 macOS 专属的 `metal_glue.mm` / `objc` / Cocoa `framework` 项在 Windows 上全部去掉；
@@ -428,11 +428,26 @@ Win7 上无解。而 WGL 从 Vista 起就在系统里。所以除了「能不能
 老驱动/远程桌面未测、Stage3D 没有 GL 后端）。所以 `auto` 的**回退顺序**是 `D3D12 → GL → CPU`，删掉
 D3D12 得等 GL 在每台机器上都不劣于它、且代码净减之后。
 
-**一条容易弄错的链接事实**：`gl` 构建**仍**需要 `d3d12`/`dxgi`/`d3dcompiler` 三个导入库。原因是
-`vendor/skia/lib/windows-x64/skia.lib` 是按 `skia_use_direct3d=true` 编的，`GrDirectContexts::MakeGL` 与
-`MakeDirect3D` 落在**同一个 TU**，拉一个就带进另一个的符号。但 `/OPT:REF` 之后产物**导入表是干净的**：
-实测只有 `OPENGL32` + 系统 DLL，不含 `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`，subsystem 6.0。
-⇒ **链接期依赖 ≠ 运行期依赖**：这条同样适用于 Win7 —— 「编得过」不等于「链得干净」。
+**一条容易弄错的链接事实**：`gl` 构建**仍**需要 `d3d12` 与 `d3dcompiler` 两个导入库（`dxgi` 与
+`d3d12allocator` **不需要**）。原因**不是**「工厂在同一个 TU」——`MakeGL` 在 `gpu.GrGLDirectContext.obj`、
+`MakeDirect3D` 在 `gpu.GrDirectContext.obj`，是两个对象。量出来的链条是：
+
+1. `GrGLDirectContext.obj` 里的 `MakeGL` 要调 `GrDirectContext::GrDirectContext(GrBackendApi, …)` 构造器，
+   那个构造器定义在 `gpu.GrDirectContext.obj` ⇒ 该对象被加载（**GL 路径本来就需要它**）；
+2. 同一个对象里的 `MakeDirect3D` 引用 `GrD3DGpu::Make`；
+3. lld-link 对「已加载对象的每个未定义符号」先拉归档成员，**之后**才跑 `/OPT:REF` ⇒ `GrD3DGpu.obj` 及其
+   `D3DCompile` / `D3D12SerializeRootSignature` 在死代码被丢掉之前就必须解析。
+
+逐项实测：去掉这两个库 ⇒ **恰好**这两条未定义；额外加 `-Wl,/OPT:REF` ⇒ 结果不变；`-Wl,/verbose` 直接点名
+那一步（`Loaded skia.lib(gpu.GrD3DGpu.obj) for … GrD3DGpu::Make`）。而 `dxgi` / `d3d12allocator` 去掉任一个
+都照样链得上，且产物与四个库时**逐字节相同**（11,126,272 B，sha256 一致）——它们只属于 D3D12 后端本身。
+
+**运行期没有任何痕迹**：两个库与四个库的产物是同一份字节，导入表只有 `OPENGL32` + 系统 DLL、subsystem 6.0，
+**不含** `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`。复核用 `node scripts/win7-imports.ts <exe>`（读 PE 导入
+目录、逐符号判定；整文件字符串扫描不算证据——静态档案里的 D3D 名字只是调试字符串）。
+⇒ **链接期依赖 ≠ 运行期依赖**。要彻底去掉这两个库，只能另有一个 `skia_use_direct3d=false` 的 skia 构建
+（每种位宽再全套编一次，约 +36 MB/位宽），换来的是**只在构建机**上的一点好处，而运行期产物已经被证明干净，
+所以现阶段不做。
 
 **未测项照实列**：只在 Win11 26200 + RTX 4090 D（`4.6.0 NVIDIA 610.88`）+ 单显示器上跑过；
 Intel/AMD 老驱动、远程桌面、虚拟机下的 WGL 行为、compat profile 下 `glTexStorage2D` 之类快路径的
@@ -962,7 +977,55 @@ seam 在 macOS 上零回归（最终 `npm test` **258/258 全绿**；但本阶�
 
 ---
 
-## 6. 后续
+## 6. Windows 7：现在能证明什么、不能证明什么
+
+Win7 是本项目唯一**没有实机**的平台结论，所以这一节只分「有证据的部分」与「还没有证据的部分」两类，
+不写结论性承诺。
+
+### 6.1 有证据：两种构建的导入面
+
+| 构建 | 导入表（`node scripts/win7-imports.ts <exe>` 实测） | 结论 |
+|---|---|---|
+| `--gpu-backend gl` | 13 个 DLL / 408 个符号，含 `OPENGL32`；**无** `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll` | 加载器与导入面侧无 Win8+ 依赖 |
+| 默认（D3D12） | 15 个 DLL，含 `d3d12.dll` 与 `D3DCOMPILER_47.dll` | Win7 上**必然**起不来（D3D12 本身要求 Win10 1507 + WDDM 2.0） |
+
+两者 subsystem 版本都是 **6.0**（Vista），Win7 加载器不拦（它拦的是 > 6.1 —— ANGLE/Chromium M110 就是被
+`,10.0` 拦死的）。
+
+工具里的两张表是要维护的知识，不是启发式：**Win7 SP1 上不存在的 DLL**（`d3d12.dll`、`d3dcompiler_47.dll`、
+`dxcompiler.dll`、`shcore.dll`、`ucrtbase.dll` …）与 **Win8+ 符号**（`user32!GetDpiForWindow`、
+`kernel32!SetThreadDescription`、`kernel32!CreateFile2`、`ole32!RoInitialize` …）。`test/unit/win7.ts` 用
+合成 PE 元数据钉住判定逻辑，表被清空或判定被改坏会在 CI（macOS arm64）上红。
+
+### 6.2 有证据：没有驱动时是**有说明的失败**，不是黑屏
+
+WGL 契约只保证 OpenGL 1.1，而 Win7 全新装机（或没装 Guest Additions 的虚拟机）跑的正是 Microsoft 的
+软件光栅器：`Microsoft Corporation | GDI Generic | 1.1.0`。Ganesh 要 2.0（GLSL 1.10 + FBO）。
+`vendor/gl_glue.cc` 在建上下文后**立刻**解析 `GL_VERSION`，`< 2.0` 时拒绝并报明「需要真实显卡驱动」以及
+「改 `<renderMode>cpu</renderMode>` 或装驱动」，然后走该文件其它初始化失败同一条拆上下文路径。
+它**不**回退到 CPU：GPU 构建里根本没编进 CPU 光栅路径（`sk_window_show_gpu` 的 attach 失败就是失败），
+假装回退只会得到一个永不刷新的窗口。
+
+### 6.3 没有证据（如实列，别当结论用）
+
+- **没有真机**。6.1 的「能跑」推论全部来自导入面 + subsystem + API 版本，不是运行结果。
+- **1.1 的拒绝分支没被真实 1.1 上下文跑过**：本机只有 RTX 4090 的 4.6 上下文，那段只做了编译与逻辑复核。
+- Win7 上的老 Intel/AMD 驱动通常给 GL 3.x–4.x，但**没测**；compat profile 下 `glTexStorage2D` 之类快路径
+  是否可用也没测。
+- 远程桌面/虚拟机里 `wglCreateContext` 可能只给 1.1（RDP 会禁加速）——那正是 6.2 那道门要接的情况，但同样
+  没有实机记录。
+- AIR 在 Win7 上能否运行与本项目无关；这里只声明**我们的产物**的加载与 API 面。
+
+### 6.4 拿到 Win7 SP1 机器时的验收步骤
+
+1. `node scripts/win7-imports.ts <exe>` → 必须 PASS。这一步不需要 Win7，任何时候都能跑。
+2. 装官方显卡驱动（别用系统自带的基本显示适配器），`ASC_GPU_TRACE=1` 启动，确认
+   `gl_glue: window 0 on <vendor> | <renderer> | <version>` 里版本 ≥ 2.0。
+3. 若第 2 步只拿到 1.1：记录 vendor/renderer，确认进程按 6.2 的文案退出，而不是黑屏。
+4. `ASC_GPU_STATS=1` 跑一段，与 Win11 的同机数据（[`compile.md`](compile.md) §3.4.6）对照，记帧时与图形工作耗时。
+5. 把这三条输出贴回本节，再把「未验证」的措辞改掉。
+
+## 7. 后续
 
 - **新开窗路径必须挂监听器 + 跑 `sk_pump_frame`**（§2.8）：拖动/缩放期间循环是被阻塞的，帧只能由
   `SDL_AddEventWatch` 的监听器驱动，而它必须调用共享 pump 而不是自己 tick 一次 —— 否则「多窗口」与

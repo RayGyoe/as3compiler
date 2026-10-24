@@ -592,10 +592,11 @@ AIR 描述符的 `<windows>` 里确实有同类先例 —— `<maxD3D>` 选择 D
 - **只在 Win11 26200 + RTX 4090 D + 单显示器上跑过**。Intel/AMD 老驱动、远程桌面、虚拟机下的 WGL 行为，
   以及 compat profile 下 `glTexStorage2D` 之类快路径的可用性，**均未测**。
 - Stage3D 与 GL 的组合是**构建期拒绝**（上表最后一行），不是「跑起来差一点」。
-- 链接期仍需 `d3d12`/`dxgi`/`d3dcompiler` 三个导入库：`vendor/skia/lib/windows-x64/skia.lib` 是按
-  `skia_use_direct3d=true` 编的，`GrDirectContexts::MakeGL` 与 `MakeDirect3D` 在同一个 TU。
-  `/OPT:REF` 之后产物导入表是干净的（实测只有 `OPENGL32` + 系统 DLL，**不含** `d3d12.dll`/`dxgi.dll`/
-  `d3dcompiler_47.dll`），这本身就是要报明的一条：**链接期依赖 ≠ 运行期依赖**。
+- 链接期仍需 `d3d12` 与 `d3dcompiler` 两个导入库（`dxgi`、`d3d12allocator` 不需要）：`vendor/skia/lib/
+  windows-x64/skia.lib` 按 `skia_use_direct3d=true` 编，而 lld-link 会为「已加载对象的未定义符号」先拉归档
+  成员、再跑 `/OPT:REF`，所以同对象里 `MakeDirect3D` 的两条 D3D 引用必须先被解析。逐项实测与逐字节对比见
+  [`win32.md`](win32.md) §3.1.1。产物**导入表是干净的**（实测只有 `OPENGL32` + 系统 DLL，**不含**
+  `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`）：**链接期依赖 ≠ 运行期依赖**。
 - 上下文**刻意建 compat profile**：AGAL→GLSL 生成器输出的是 ES 1.00（`attribute`/`varying`/`texture2D`），
   升到 core profile 要动 web 共用的那份生成器，回归面更大。
 
