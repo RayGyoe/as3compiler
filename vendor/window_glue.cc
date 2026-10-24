@@ -3019,6 +3019,11 @@ void sk_dock_bounce(int critical) {
   ((void (*)(void*, SEL, long))objc_msgSend)(sk_nsapp(), sel_registerName("requestUserAttention:"), critical ? 0 : 10);
 }
 #else
+// Same two hooks as the Cocoa branch, as explicit no-ops: the frame pump and the
+// event loop call them unconditionally, and this backend has no application menu
+// to keep authoritative (sk_menu_supported() is 0 and both installers refuse).
+static void sk_menu_flush(void) { }
+static void sk_menu_ensure(void) { }
 int sk_menu_supported(void) { return 0; }
 int sk_menu_install_app(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
   (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;

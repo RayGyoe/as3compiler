@@ -11305,8 +11305,8 @@ static void as_job_run(as_job* j) {
             char* pat = (char*)malloc(pn + 3);
             if (pat == NULL) { j->error = AS_JOB_ERR_IO; break; }
             memcpy(pat, j->path, pn);
-            for (size_t i = 0; i < pn; i++) if (pat[i] == '/') pat[i] = '\\';
-            pat[pn] = '\\'; pat[pn + 1] = '*'; pat[pn + 2] = '\0';
+            for (size_t i = 0; i < pn; i++) if (pat[i] == '/') pat[i] = '\\\\';
+            pat[pn] = '\\\\'; pat[pn + 1] = '*'; pat[pn + 2] = '\\0';
             WIN32_FIND_DATAA fd;
             HANDLE h = FindFirstFileA(pat, &fd);
             free(pat);

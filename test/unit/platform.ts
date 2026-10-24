@@ -1967,6 +1967,44 @@ function checkWindowsHostBackends(): string[] {
     && ex.includes('recordedPath(k)') && ex.includes('purge(payload)')
     && ex.includes('every recycled entry this run made is gone'));
 
+  // ---- 阶段二百六十五：两条只有 Windows 宿主才编译得到、因而 macOS CI 天生看不见的
+  //      「产物根本编不过 / 链不上」的缺陷 ----
+  // 它们不改变任何 AS3 语义，所以 examples 套件在 macOS 上永远是绿的；反过来，本机
+  // clang 的双态实测才是证据：改前 `clang -fsyntax-only` 在生成的 C 上**7 条 error**，
+  // 改前 lld-link 报 `undefined symbol: sk_menu_flush/sk_menu_ensure`。下面钉的是
+  // 那两处根因，故任何宿主都能跑。
+  //
+  // ① runtime.ts 是模板字符串，`\\` 只在 JS 层掉一层：想发射 C 的 `'\\'` 与 `'\0'`
+  //    就得在源码里写双份。少一层时 C 看到的是 `'\'`（反斜杠吞掉收尾引号，字面量
+  //    跨到行尾）与一个字面 NUL 字节（`\0` 被 JS 先解释掉了）。
+  const enumAt = c.indexOf('FindFirstFileA(pat,');
+  const enumBlock = enumAt < 0 ? '' : c.slice(Math.max(0, enumAt - 500), enumAt);
+  check('the emitted _WIN32 enumeration block exists at all', enumAt > 0);
+  // 反斜杠本身用 fromCharCode 拼：这条断言若再依赖模板/raw 的转义层数，就成了
+  // 「用同一类易错语法去证明那类语法没错」。
+  const BS = String.fromCharCode(92);
+  check('...and its separator/terminator escapes survive the template literal',
+    enumBlock.includes("pat[i] = '" + BS + BS + "';") && enumBlock.includes("pat[pn + 2] = '" + BS + "0';"));
+  // 字面 NUL 是同一处失误的另一半：它让 C 源码里出现裸 0 字节，clang 只报 warning 时
+  // 更危险（值恰好 0，看起来对），所以这里直接禁掉。
+  check('...with no raw NUL byte smuggled into the generated C', !enumBlock.includes('\u0000'));
+
+  // ② 事件泵与事件循环**无条件**调用这两个文件内静态钩子（sk_pump_frame / sk_run_loop），
+  //    而真身只在 Cocoa 那一支里 ⇒ 非 Cocoa 支（Windows）声明了、调用了、却没定义。
+  const glueW = readNorm(join(root, 'vendor', 'window_glue.cc'));
+  const menuAt = glueW.indexOf('int sk_menu_supported(void) { return 1; }');
+  const menuElse = glueW.indexOf('\n#else', menuAt);
+  const cocoaArm = menuAt < 0 ? '' : glueW.slice(menuAt, menuElse);
+  const otherArm = menuElse < 0 ? '' : glueW.slice(menuElse, glueW.indexOf('\n#endif', menuElse));
+  check('both arms of the menu seam are found (else this pin is vacuous)',
+    menuAt > 0 && menuElse > menuAt && otherArm.length > 0);
+  check('the Cocoa arm defines the two file-local hooks the shared loop calls',
+    cocoaArm.includes('static void sk_menu_flush(void) {') && cocoaArm.includes('static void sk_menu_ensure(void) {'));
+  check('the non-Cocoa arm defines them too, as explicit no-ops',
+    otherArm.includes('static void sk_menu_flush(void) { }') && otherArm.includes('static void sk_menu_ensure(void) { }'));
+  check('...and both call sites are still unconditional (they are why the stubs are required)',
+    /\n\s*sk_menu_ensure\(\);/.test(glueW) && /\n\s*sk_menu_flush\(\);/.test(glueW));
+
   console.log(`     [win-host] ${ok} check(s) passed`);
   return bad;
 }

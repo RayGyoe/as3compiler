@@ -15764,7 +15764,50 @@ ANE 仍留给 **G3**（卷总量/已用量）：那条 AIR **真没有**（`File
 > 故只在此记账：若将来要把那 1.3 s 也消掉，方向是让 `gc_alloc(GCT_STRING)` 便宜下来，或把 `files`
 > 的 `File` 构造摊到帧边界 —— 两者都要独立立项。
 
+### 阶段二百六十五：两条「只有 Windows 宿主才编译得到」的产物缺陷 —— 转义先掉一层 + 菜单钩子只有一支有定义（v0.4.228 → v0.4.229）✅ 已完成
+
+**一、性质：不是语义缺口，是产物在 Windows 上根本编不过 / 链不上**
+
+这两条在本工作树上已经带了几天本地补丁（`src/runtime.ts` + `vendor/window_glue.cc` 两个文件一直是 DIRTY），
+一直没被回归抓到，原因是**它们都待在「只有 Windows 才编译」的分支里**，而 CI 跑的是 arm64 macOS：
+
+| # | 症状 | 根因 | 谁能看见 |
+|---|---|---|---|
+| ① | `clang -fsyntax-only` 在生成的 C 上报 **7 条 error**（首条 `expected expression`，紧随其后 4 次 `fd` 未声明） | `src/runtime.ts` 是**模板字符串**，反斜杠在 JS 层先掉一层：源码里的双反斜杠发射成 C 的**单**反斜杠字符字面量 ⇒ **反斜杠吞掉收尾引号**，字面量一路跨到行尾；同一行的 `\0` 则被 JS 先解释掉，把**裸 NUL 字节**塞进 C 源码 | `#ifdef _WIN32` 那段（MSVC 没有 `dirent.h`，枚举走 `FindFirstFile`）⇒ 只有 Windows |
+| ② | `lld-link: undefined symbol: sk_menu_flush / sk_menu_ensure`（referenced by `sk_window_show` / `sk_pump_frame`） | 事件泵与事件循环**无条件**调这两个文件内静态钩子，而真身只写在 Cocoa 那一支；`#else` 支声明了、调用了，**从未定义** | 非 Cocoa 支 ⇒ 只有 Windows（macOS 走 Cocoa 支，天生看不见） |
+
+按 AGENTS §1.5：`adl` 跑得对，而我们在 Windows 上**根本产不出产物** ⇒ **遗留缺陷**，不是增强，故不入增强表。
+
+**二、修法（零 AS3 语义改动）**
+
+- ①：`src/runtime.ts` 那两行在 JS 层写双份 —— 掉一层后正好是 C 的 `'\\'`（一个反斜杠）与 `'\0'`。
+- ②：`vendor/window_glue.cc` 的 `#else` 支补两个**显式空桩**，并在注释里写明「为什么必须是空桩，而不是省掉」：
+  `sk_menu_supported()` 恒返 0、两个 installer 直接拒绝，空动作就是本后端的正确行为；省掉则链接期缺符号。
+  与阶段一百九十九 的 `as_window_*` 双分支同族：**共用的调用点无条件，实现就必须两支都在**。
+
+**三、验收（本机 clang 双态实测，不是「看起来对」）**
+
+| 检查 | 退回旧代码 | 修后 |
+|---|---|---|
+| `clang -fsyntax-only` 生成的 C | **7 error** | **0 error** |
+| `examples/swc-bitmap`（`ASC_USE_WINDOW=1`，真编真链） | `undefined symbol: sk_menu_flush/sk_menu_ensure` | `Build successful` |
+| `unit: platform/WindowsHostBackends` | 变异 2/2 命中 | **10 → 17 条，17/17 PASS** |
+
+新增 7 条钉子钉的是**根因**而不是某个字面串：4 条断言（`_WIN32` 枚举块存在、两处转义必须成双、**禁裸 NUL 字节**、
+菜单 seam 的两支都有定义）+ 3 条**反向自证**（两支找得到、两个无条件调用点仍在），免得钉子自己变成空话。
+变异脚本 `temp/g17/mutate.cjs`：M1 砍掉空桩 ⇒ **恰好**「non-Cocoa 支定义」那条红；M2 把 `src/runtime.ts` 整文件退回 HEAD
+⇒ **恰好**转义与裸 NUL 那两条红；两份源事后按 sha256 逐字节还原。
+
+> **如实报明 ①**：裸 NUL 那半在 clang 上是**静默**的（注释里的 NUL 连诊断都不给，字符字面量里的 NUL 取值恰为 0、结果「看起来对」），
+> 真正致命的是吞引号那半。两半同源，所以一起钉。
+> **如实报明 ②**：这次修的不是 AS3 行为 ⇒ **examples 套件在 macOS 上永远发现不了它**。同一类「只有另一端才编译得到」的
+> 缺陷（GPU seam、`as_window_*` 双分支、web 菜单 seam）历史上都是这么漏的 —— 凡新增跨端调用点，都必须当场问一句「另一支实现了吗」。
+> **如实报明 ③**：`RUNTIME_PREAMBLE` 里另有一处历史遗留的裸 NUL（来自引用 SQLite 文件头 `"SQLite format 3"` 的**注释**），
+> 落在注释里、clang 静默忽略，本轮**没有**顺手改（改掉注释里的引文会削弱「这行是从真实文件头抄来的」这个证据），不登记为缺口。
+
+
 ### 遗留待开发
+> **2026-10-24 追加（阶段二百六十五：两条只有 Windows 宿主才编译得到的产物缺陷）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段修的是**产物在 Windows 上编不过 / 链不上**（`src/runtime.ts` 模板字符串里反斜杠先掉一层；`vendor/window_glue.cc` 的 `#else` 支缺 `sk_menu_flush`/`sk_menu_ensure` 定义），既不改变任何 AS3 语义、也不对应 `adl` 上的行为分歧，故不入表；已在本阶段节内记账，并补 7 条源级钉子（macOS CI 天生编译不到那两支，非源级钉就无从回归）。
 > **2026-10-23 追加（阶段二百六十四：`File.getDirectoryListingAsync` 真异步化 —— 改写 1 行 + 新登记 2 行）**：**新登记 2 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **91 → 93 项**（`未开始` **71 → 72**、`部分完成` **19 → 20** / `调研完成·实现暂缓` 1）。**本阶段主体是补平差距，故不占表**：用户提议「用 ANE 做遍历异步化」，但根因不是缺 ARM 链接库（`lib/bin/macos-x86-64/libasaot.dylib` 本就是 **x86_64+arm64 通用二进制**，`macos-x86-64` 是 AIR 自己的平台键、不表架构），而是**该成员此前是同步假实现**（inline 调 `getDirectoryListing()` + 同一次调用内派发 `FileListEvent`，`cancel()` 因此恒为 no-op）——`adl` 上它是真异步，属 §1.5「`adl` 跑得对而我们跑不出」⇒ **遗留缺陷**且阶段内修净（新 `AS_JOB_DIR` 作业 + 完成 thunk + 真 `cancel`），故不入表。**改写的 1 行**是「空 `File` 的成员访问全线不抛 `#2037`」：其中 `getDirectoryListing`/`getDirectoryListingAsync` 两个成员本阶段已按 `adl` 补齐（见该行）。**新登记 2 行**都是本轮**量出来、但不在批准范围内修**的真分歧：① 基类 `EventDispatcher.parent`（一个 C 侧内部链接字段）在**动态读**里压过派生类的 getter；② `File` 其余三个 async 成员仍是 inline 完成。
 > **2026-10-23 追加（阶段二百六十三：AGAL 三条实测定案 —— 移出 3 行 + 收窄 1 行）**：**新登记 0 行 / 改写 1 行 / 移出 3 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **94 → 91 项**（`未开始` **74 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1 / `已记录` 1；`已修` 与 `已记录` 各自归零后仍为 0）。**移出 3 行**：① AGAL `nrm` 的归一化分量数 —— 像素探针定案**只归 `.xyz`**（`w` 既不参与模长也不被写），`src/runtime.ts` 已改并把含 w 的目的掩码按 `adl` 的 **#3628** 响亮拒绝；② 临时寄存器未初始化即被读 —— **不是「初值是多少」而是 upload 期错误**（**#3647**/**#3648**，用官方 `AGALMiniAssembler` 编的字节复现），故落地为 `agal_check_temp_writes` 逐分量线性扫描后**拒收**，而不是零初始化（零初始化会让一个 AIR 上跑不起来的程序在我们这里「碰巧有输出」，属 §2.5 明禁的静默降级）；③ 指针移出窗口不 roll-out —— **早已修**（`vendor/window_glue.cc` 的 `SDL_WINDOWEVENT_LEAVE` + 「仍严格在客户区内则不算离开」守卫），零代码下架。**改写 1 行**：原「`ROLL_OVER` / `ROLL_OUT` / `Stage.MOUSE_LEAVE` 事件完全不派发」**收窄**为只剩前者两个（外加冒泡的 `mouseOver`/`mouseOut`）—— `mouseLeave` 一直有发射点（`src/emit.ts` 的 `Event_new("mouseLeave", …)`，指针离开舞台时按 `mouseOut → rollOut(按钮) → mouseLeave(舞台)` 补一轮），把三条并记在一行会掩盖「已对齐两条」。**证据**：`temp/agalprobe/{out.txt,out-aot.txt}`（adl 与 AOT 逐字节相同）、`temp/metalshader/nrm*.{msl,metal,glsl}` + `glslcheck3.html`（Metal 2/2、WebGL 2/2 真编译；HLSL 本机无 `fxc`，只做文本钉）、`unit: stage3d/agal-nrm`（5 钉）+ `unit: stage3d/agal-temp-writes`（5 钉）+ `examples/stage80/82/83.as`。
 > **2026-10-23 追加（阶段二百六十二：`File.isSymbolicLink` —— `File` 谓词里唯一不跟随链接的那个）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 94 项**。本阶段是**补平差距**（`adl` 上该成员存在且行为明确，我们此前压根没登记）而非增强，按 §1.5 不入增强表。顺带量到的「空 `File` 的 `#2037` 在 `isSymbolicLink` 上同样成立」**并入**已有那行，不新开。
