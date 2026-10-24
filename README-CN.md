@@ -170,7 +170,8 @@ as-aot --air-app app.xml --gpu-backend gl
 `auto` 的回退顺序是 `D3D12 → GL → CPU`。这个选择**装不进 AIR 描述符**（`Descriptor.51.4.xsd` 的
 `<windows>` 是 `xs:all` 只四个子元素、全 XSD 无 `xs:any`；`adt -package` 对 `<gpuBackend>` 报
 error 103，而异命名空间的元素/属性四种写法**全部**报 103；`adl` 沉默不是 schema 接受），故走
-**我们自己的生成清单**字段 `gpu-backend`，AIR 从不读它——与 `features` 同一条路。优先级：
+**我们自己的生成清单**字段 `gpu-backend`，AIR 从不读它。它**不是**增强开关——`--features gl` 会按未知
+名字报错，只是**存法**与 `features` 相同（同一个文件、两套独立开关）。优先级：
 `--gpu-backend` > 上次清单里的值 > `ASC_GPU_BACKEND` 环境变量（原型期别名，输给钉住的值时会明确说）= `auto`。
 五种无效组合（非 `--air-app`、web、非 Windows 宿主、描述符没编进 GPU 窗口、Stage3D）都是**构建期拒绝**，
 不会「开了但什么都不变」。详见 [`compile.md`](docs/zh-cn/compile.md) §3.4.6 与

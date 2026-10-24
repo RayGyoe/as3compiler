@@ -16001,7 +16001,8 @@ rightMargin` 由具体 C 类型改为**装箱**（`any`）—— AIR 把这些�
 | 异命名空间元素（`<windows>` 内 / 顶层）、异命名空间属性（`<application>` 上） | **四种写法全部 error 103** |
 | `adl` 对这四种写法 | **均沉默** —— 但它也接受 `<maxD3D>abc</maxD3D>`（`adt` 拒）。`adl` 只做手写的子集检查，退出码 0/6/7/8 只覆盖“描述符找不到 / 缺 content / 缺 initialWindow”，**不构成合法性证据** |
 
-⇒ 载体改成**我们自己的生成清单**字段 `gpu-backend`（AIR 从不读，与 `features` 同一条路）。
+⇒ 载体改成**我们自己的生成清单**字段 `gpu-backend`（AIR 从不读）。注意这只与 `features` **存法**相同：
+它是一个**独立 CLI 开关**，不在 `--features` 里（`--features gl` 报 `unknown feature 'gl'`）。
 
 **三、落地形态**
 

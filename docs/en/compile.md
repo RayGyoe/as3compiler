@@ -138,6 +138,12 @@ Options:
                  library shared by several apps lives in one place (repeatable; paths
                  are cwd-relative; a class declared under two roots is an error, never
                  last-wins — see §3.5.2)
+  --gpu-backend <b>  --air-app: which native API composites the window: auto (default:
+                 D3D12 on Windows, Metal on macOS) | d3d12 | gl (WGL/OpenGL).
+                 Persisted in the generated manifest, so it survives later --air-app
+                 runs; `auto` clears it (see §3.4.6)
+  --features <list> enable an AIR-superset enhancement (comma-separated, repeatable;
+                 `none` clears). Default builds stay AIR-identical (see §3.4.2)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
   --cflag <f>    extra C compiler flag for every compile AND link step (repeatable;
@@ -360,6 +366,13 @@ as-aot app.as --air-app app.xml --features none     # clear (see below: this cle
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | `native` only | camera RAW / DNG (denied by default — see §3.4.3.1; the web-side Skia has no piex/dng_sdk archive, so it errors when the target is unsupported) |
 | `tray` | `ASC_USE_TRAY=1` | `native` only, **and the host must be macOS** | `SystemTrayIcon` behind a real `NSStatusItem` (see §3.4.5). AIR on macOS has no system tray at all (`supportsSystemTrayIcon=false`, `#2012`), hence off by default |
 
+This table is the **complete** list of named enhancement switches: `--features` only registers "AIR-superset
+capabilities" — off by default, and turning one on changes what the artifact means. The window GPU backend is
+**not** in it: `--features gl` reports an unknown name. The backend is its own switch, `--gpu-backend`
+(§3.4.6); the two merely **happen to be stored in the same generated manifest** (§3.4.2.1). On the CLI they are
+independent and do not share a clear-out spelling (`--features none` clears the enhancement set only,
+`--gpu-backend auto` clears the backend only).
+
 The same-named field in the manifest is a **string array** with CLI-identical semantics:
 
 ```json
@@ -396,9 +409,11 @@ could only be repeated on the command line every time — exactly the reason thi
 - `--features svg` writes `"features": ["svg"]` into the generated manifest; **the next run without the flag
   still takes effect**, and prints `enhancements carried over from ...: svg` (**not silent**).
 - To turn it off: `--features none` (clears and persists likewise).
-- Only `features` is inherited: the other fields are functions of the descriptor and the source, and
-  reviving a stale generated value (a macro that has been removed, an old link library) would be a silent
-  incorrect build.
+- Only `features` and `gpu-backend` (§3.4.6) are inherited: the other fields are functions of the descriptor and
+  the source, and reviving a stale generated value (a macro that has been removed, an old link library) would be
+  a silent incorrect build. These two exceptions express an **explicit user choice** rather than a derived fact
+  (the descriptor has no place to put them and the source cannot imply them), and each has its own clear-out:
+  `--features none` for the enhancement set, `--gpu-backend auto` for the backend.
 
 #### 3.4.3 Image decoding's SVG channel is also an opt-in macro (`ASC_USE_SVG`)
 
@@ -560,8 +575,10 @@ the descriptor **cannot** carry a third-party backend name. That is measured:
   check, and it equally accepts `<maxD3D>abc</maxD3D>` (which `adt` rejects). `adl`'s exit codes 0/6/7/8 only
   cover “descriptor not found / missing `content` / missing `initialWindow`”.
 
-So the choice travels in **our generated manifest** (the `gpu-backend` field, §4), which AIR never reads — the
-same road as `features` (§3.4.2.1).
+So the choice travels in **our generated manifest** (the `gpu-backend` field, §4), which AIR never reads. Note
+this is only the same **storage** as `features` (§3.4.2.1) — on the CLI it is an **independent switch**, not part
+of `--features` (`--features gl` reports an unknown name): an enhancement switch changes the capability, a
+backend switch changes which native API the same semantics are drawn through.
 
 ##### Precedence and persistence
 

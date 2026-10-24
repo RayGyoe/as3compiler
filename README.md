@@ -167,7 +167,9 @@ as-aot --air-app app.xml --gpu-backend gl
 `auto` falls back `D3D12 → GL → CPU`. The choice **cannot live in the AIR descriptor** (the XSD's `<windows>` is an
 `xs:all` of four elements with no `xs:any` anywhere; `adt -package` rejects `<gpuBackend>` with error 103, and four
 different foreign-namespace spellings all report 103 too; `adl` staying silent is not schema acceptance), so it travels
-in **our generated manifest** as `gpu-backend`, which AIR never reads — the same road as `features`. Precedence:
+in **our generated manifest** as `gpu-backend`, which AIR never reads. It is **not** an enhancement switch
+(`--features gl` reports an unknown name); only its **storage** matches `features` — one file, two independent
+switches. Precedence:
 `--gpu-backend` > the value persisted in the previous manifest > `ASC_GPU_BACKEND` (prototype alias, says so when it
 loses) = `auto`. Five impossible combinations (no `--air-app`, web, non-Windows host, descriptor compiles no GPU
 window, Stage3D) are **refused at build time** rather than looking honoured. Details in

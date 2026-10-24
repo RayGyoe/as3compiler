@@ -139,6 +139,12 @@ Options:
                  library shared by several apps lives in one place (repeatable; paths
                  are cwd-relative; a class declared under two roots is an error, never
                  last-wins — see §3.5.2)
+  --gpu-backend <b>  --air-app: which native API composites the window: auto (default:
+                 D3D12 on Windows, Metal on macOS) | d3d12 | gl (WGL/OpenGL).
+                 Persisted in the generated manifest, so it survives later --air-app
+                 runs; `auto` clears it (see §3.4.6)
+  --features <list> enable an AIR-superset enhancement (comma-separated, repeatable;
+                 `none` clears). Default builds stay AIR-identical (see §3.4.2)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
   --cflag <f>    extra C compiler flag for every compile AND link step (repeatable;
@@ -344,6 +350,11 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | 仅 `native` | 相机 RAW / DNG（默认拒绝——见 §3.4.3.1；web 侧 Skia 无 piex/dng_sdk 归档，故目标不支持时就报错） |
 | `tray` | `ASC_USE_TRAY=1` | 仅 `native`，**且宿主须为 macOS** | `SystemTrayIcon` 背后是真 `NSStatusItem`（见 §3.4.5）。AIR 在 macOS 上根本没有托盘（`supportsSystemTrayIcon=false`、`#2012`），故默认关闭 |
 
+这张表是**全部**的具名增强开关：`--features` 只登记「AIR 超集能力」——默认关、开后改变产物语义。
+窗口 GPU 后端**不在**表里：`--features gl` 会按未知名字报错。后端是**独立开关** `--gpu-backend`
+（§3.4.6），两者只是**恰好存进同一份生成清单**（§3.4.2.1）；CLI 上互不相干，清除手段也不共用
+（`--features none` 只清增强集合，`--gpu-backend auto` 只清后端）。
+
 清单里同名字段是一份**字符串数组**，语义与 CLI 一致：
 
 ```json
@@ -374,8 +385,10 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 - `--features svg` 会把 `"features": ["svg"]` 写进生成的清单；**下次不带参数运行仍然生效**，
   并打印 `enhancements carried over from ...: svg`（**不是静默**）。
 - 要关掉：`--features none`（清空并同样持久）。
-- 只有 `features` 会被继承：其它字段都是描述符与源码的函数，复活一个过期的生成值
-  （一个已被去掉的宏、一个旧的链接库）就是一次静默的错误构建。
+- **只有 `features` 与 `gpu-backend`（§3.4.6）这两个字段会被继承**：其它字段都是描述符与源码的函数，
+  复活一个过期的生成值（一个已被去掉的宏、一个旧的链接库）就是一次静默的错误构建。这两个例外表达的是
+  **用户的显式选择**、不是推导出来的事实（描述符里没有它们的位置，源码里也推不出来），且各自有独立的
+  清除手段：`--features none` 清增强集合，`--gpu-backend auto` 清后端。
 
 #### 3.4.3 图片解码的 SVG 通道也是 opt-in 宏（`ASC_USE_SVG`）
 
@@ -525,8 +538,9 @@ AIR 描述符的 `<windows>` 里确实有同类先例 —— `<maxD3D>` 选择 D
   `<maxD3D>abc</maxD3D>`（`adt` 会拒绝）。`adl` 的退出码 0/6/7/8 只覆盖「找不到描述符 / 缺 `content` /
   缺 `initialWindow`」三件事，不构成「描述符合法」的证据。
 
-所以选择走**我们自己的生成清单**（`gpu-backend` 字段，§4），AIR 从不读它 —— 与 `features` 的存法
-（§3.4.2.1）是同一条路。
+所以选择走**我们自己的生成清单**（`gpu-backend` 字段，§4），AIR 从不读它。注意这只是**存法**与
+`features`（§3.4.2.1）相同 —— CLI 上它是一个**独立开关**，不在 `--features` 里（`--features gl` 会按
+未知名字报错）：增强开关换的是能力语义，后端开关换的是同一份语义画在哪套原生 API 上。
 
 ##### 优先级与持久化
 

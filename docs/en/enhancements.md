@@ -89,6 +89,11 @@ error text both list them):
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | native | E4: camera RAW / DNG (web has no piex/dng_sdk archives) |
 | `tray` | `ASC_USE_TRAY=1` | native (**and the host must be macOS**) | E19: `SystemTrayIcon` behind a real `NSStatusItem` (AIR has no system tray on macOS at all) |
 
+**The window GPU backend is not an enhancement and is not in this table**: `--gpu-backend`
+([`compile.md`](compile.md) §3.4.6) changes *which native API draws the same semantics*; it changes no API
+behavior and unlocks no capability AIR refuses, so it does not fall under §1.2. It is an **independent switch**:
+`--features gl` reports `unknown feature 'gl' (known: formats, raw, svg, tray)`.
+
 **Default refusal (stage ninety-four · twenty-five)**: the E3/E4 channels were previously "usable with zero
 code" — our Skia already carries those codecs, so the **default output was wider than AIR**: AIR reports
 `#2124` for BMP/WebP/ICO/DNG uniformly, while we decoded them. This violates criterion (d) (the default output
@@ -100,7 +105,8 @@ and the build banner names it (never silent once opened).
 **Interaction with `--air-app`**: `--air-app` rewrites the generated `<filename>.build.json` wholesale on
 every run, so the choice must survive the rewrite — `--features svg` writes it into the manifest, so the
 **next run without arguments still takes effect** and prints a carry-over note (not silent); `--features none`
-turns it off. Only `features` is inherited; the other fields remain functions of the descriptor + sources.
+turns it off. Only `features` and `gpu-backend` (§3.4.6, **not** an enhancement switch) are inherited; the
+other fields remain functions of the descriptor + sources.
 
 The detailed rules are in [`compile.md`](compile.md) §3.4.2; the regression nails are in `test.ts`'s
 `[features]` group (24 items, including 4 reverse-control mutations: switch ineffective / enabled by default /

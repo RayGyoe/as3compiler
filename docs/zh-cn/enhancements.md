@@ -75,6 +75,10 @@ as-aot app.as --air-app app.xml --features svg     # 等于 -D ASC_USE_SVG=1
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | native | E4：相机 RAW / DNG（web 无 piex/dng_sdk 归档） |
 | `tray` | `ASC_USE_TRAY=1` | native（**且宿主须为 macOS**） | E19：`SystemTrayIcon` 背后是真 `NSStatusItem`（AIR 在 macOS 上根本没有托盘） |
 
+**窗口 GPU 后端不是增强，也不在这张表里**：`--gpu-backend`（[`compile.md`](compile.md) §3.4.6）换的是
+「同一套语义画在哪套原生 API 上」，不改变任何 API 行为、不解锁任何 AIR 拒绝的能力，因此不落在 §1.2 的
+判定范围内。它是**独立开关**：`--features gl` 会报 `unknown feature 'gl' (known: formats, raw, svg, tray)`。
+
 **默认拒绝（阶段九十四·二十五）**：E3/E4 的通道此前是「零代码可用」——我们的 Skia 本来就带这些
 codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `#2124`，我们却解出来了。这违反
 标准 (d)（默认产物须与 AIR 同构）与 §1.5，故两个通道改为**默认拒绝**：胶水层按魔数拦掉那几族
@@ -83,7 +87,8 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 
 **与 `--air-app` 的配合**：`--air-app` 每次运行都会整份重写生成的 `<filename>.build.json`，所以
 选择必须能挺过重写——`--features svg` 会把它写进清单，**下次不带参数仍然生效**并打印 carry-over
-提示（不静默）；`--features none` 关闭。只有 `features` 被继承，其它字段仍是描述符+源码的函数。
+提示（不静默）；`--features none` 关闭。只有 `features` 与 `gpu-backend`（§3.4.6，**不是**增强开关）两个
+字段会被继承，其它字段仍是描述符+源码的函数。
 
 详细规则见 [`compile.md`](compile.md) §3.4.2；回归钉子见 `test.ts` 的 `[features]` 组（24 项，含 4 个
 反向对照变异：开关不生效 / 默认被打开 / 持久化丢失 / 未知名字静默，全部被捕获）。

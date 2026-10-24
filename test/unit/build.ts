@@ -2486,6 +2486,21 @@ function checkGpuBackend(): string[] {
     /unknown GPU backend 'glx'/.test(typoMsg) && /auto, d3d12, gl/.test(typoMsg));
   check('the name is case- and space-insensitive (a shell cannot be trusted)',
     parseGpuBackend(' GL ') === 'gl' && parseGpuBackend('D3D12') === 'd3d12');
+  // A backend name is NOT an enhancement switch, and vice versa. This nail exists
+  // because the docs once described the manifest field as "the same road as
+  // `features`", which reads as "it is inside --features" — it is not.
+  const featMsg = thrown(() => validateFeatures(['gl'], 'native'));
+  check('a backend name is not a --features name (disjoint namespaces)',
+    /unknown feature 'gl'/.test(featMsg) && !knownFeatures().includes('gl'));
+  check('...and a feature name is not a backend name',
+    /unknown GPU backend 'svg'/.test(thrown(() => parseGpuBackend('svg'))));
+  const zhDoc = readFileSync(join(root, 'docs', 'zh-cn', 'compile.md'), 'utf8');
+  const enDoc = readFileSync(join(root, 'docs', 'en', 'compile.md'), 'utf8');
+  check('the docs say the flag is NOT inside --features (only its storage matches)',
+    /不在 `--features` 里/.test(zhDoc) && /`--features gl`/.test(zhDoc)
+    && /not part/.test(enDoc) && /--features gl/.test(enDoc));
+  check('both persistence rules name the second carried field',
+    zhDoc.includes('只有 `features` 与 `gpu-backend`') && enDoc.includes('Only `features` and `gpu-backend`'));
 
   // (3) Persistence: one `--gpu-backend gl` sticks across regenerations.
   const appDir = join(root, 'temp', 'gpu-backend-app');
