@@ -54,6 +54,10 @@
 extern "C" {
 
 int sk_surface_peek_pixels(void* surface, void** pixels, int* rowBytes);
+// Byte order of that buffer: 1 = R,G,B,A, 2 = B,G,R,A, 0 = not 32-bit RGBA/BGRA.
+// Skia decides this at build time per target platform (R,G,B,A on macOS, B,G,R,A on
+// Windows), so it must be asked, never assumed -- see sk_pixfmt_for_surface below.
+int sk_surface_pixel_order(void* surface);
 
 // Mouse pointer shape. The kinds mirror the AS_CURSOR_* block in runtime.ts and
 // the setter itself is defined with the other window exports further down; both
@@ -514,11 +518,28 @@ static int sk_id_from_window_id(Uint32 wid) {
 }
 
 // Blit the Skia pixel buffer into a persistent streaming texture and present it.
-// The pixel format note from sk_window_show below applies here too; the masks are
-// R/G/B/A = 0x000000FF/0x0000FF00/0x00FF0000/0xFF000000 (R in the low byte on
-// macOS). The texture is created once and updated in place each frame instead of
-// being created/destroyed per frame — that per-frame churn was the dominant cost
-// at high Stage.frameRate values.
+// The SDL pixel format for a Skia raster surface, derived from the surface's own
+// byte order instead of a per-platform guess. The masks here used to be hardcoded to
+// R/G/B/A = 0x000000FF/0x0000FF00/0x00FF0000/0xFF000000, which is what a macOS build
+// of Skia stores -- true there, WRONG on Windows, where Skia's kN32 is B,G,R,A
+// (include/core/SkTypes.h sets SK_R32_SHIFT=16 under SK_BUILD_FOR_WIN). Every
+// CPU-mode window on Windows was therefore blitted with red and blue exchanged: the
+// gallery's #2563EB blue button came out #EB6325 orange, whites went cream.
+// `order`: 1 = bytes R,G,B,A; 2 = bytes B,G,R,A. Anything else is refused rather
+// than guessed -- a wrong format is silent, while SDL_PIXELFORMAT_UNKNOWN makes the
+// caller report it (AGENTS.md 2.5: never fall back to a wrong semantic).
+static Uint32 sk_pixfmt_for_surface(void* surface) {
+  int order = sk_surface_pixel_order(surface);
+  Uint32 r, b;
+  if (order == 1)      { r = 0x000000FFu; b = 0x00FF0000u; }
+  else if (order == 2) { b = 0x000000FFu; r = 0x00FF0000u; }
+  else return SDL_PIXELFORMAT_UNKNOWN;
+  return SDL_MasksToPixelFormatEnum(32, r, 0x0000FF00u, b, 0xFF000000u);
+}
+
+// The texture is created once and updated in place each frame instead of being
+// created/destroyed per frame — that per-frame churn was the dominant cost at high
+// Stage.frameRate values.
 #if defined(__APPLE__)
 // Defined with the other transparency glue further down (it needs sk_nsrect).
 static void sk_mac_present_layer(WinCtx* c, void* pixels, int w, int h, int rowBytes);
@@ -591,6 +612,13 @@ static int do_resize(WinCtx* c) {
     if (ns != NULL) {
       c->surface = ns;
       if (!sk_surface_peek_pixels(c->surface, &c->pixels, &c->rowBytes)) return -1;
+      // The rebuilt surface is asked again rather than inheriting the old format:
+      // a resize must not be the one path that keeps a stale channel order.
+      c->pixfmt = sk_pixfmt_for_surface(c->surface);
+      if (c->pixfmt == SDL_PIXELFORMAT_UNKNOWN) {
+        fprintf(stderr, "window_glue: resized surface has an unsupported colour type\n");
+        return -1;
+      }
     }
   } else if (c->is_gpu) {
     c->pw = npw; c->ph = nph;
@@ -1957,7 +1985,11 @@ static int sk_open_window(int w, int h, const char* title, int decorated, int vi
   c->win = win;
   c->visible = visible;
   c->transparent = transparent;
-  c->pixfmt = SDL_MasksToPixelFormatEnum(32, 0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u);
+  // Deliberately not set here: the streaming texture's format is a property of the
+  // surface handed in later, and sk_window_attach_surface / sk_window_show derive it
+  // from that surface (sk_pixfmt_for_surface). Hardcoding it at window-creation time
+  // is what produced the red/blue swap on Windows.
+  c->pixfmt = SDL_PIXELFORMAT_UNKNOWN;
   sk_measure_borders(c, decorated);
   // NativeWindow.minSize/maxSize start at AIR's own defaults for this platform —
   // set HERE so both entry points (sk_window_show* for the app's initial window,
@@ -2068,6 +2100,11 @@ void sk_window_attach_surface(int id, void* surface, int pw, int ph) {
     fprintf(stderr, "window_glue: surface does not expose pixels (not CPU raster)\n");
     return;
   }
+  c->pixfmt = sk_pixfmt_for_surface(c->surface);
+  if (c->pixfmt == SDL_PIXELFORMAT_UNKNOWN) {
+    fprintf(stderr, "window_glue: surface has an unsupported colour type (need 32-bit RGBA/BGRA)\n");
+    return;
+  }
   if (c->tex != NULL) SDL_DestroyTexture(c->tex);
   c->tex = SDL_CreateTexture(c->ren, c->pixfmt, SDL_TEXTUREACCESS_STREAMING, c->pw, c->ph);
   if (c->tex != NULL) SDL_SetTextureBlendMode(c->tex, SDL_BLENDMODE_NONE);
@@ -2083,12 +2120,12 @@ void sk_window_attach_surface(int id, void* surface, int pw, int ph) {
 // at the window-relative coordinates); after each handled event `on_redraw` is
 // called so the AS3 tree re-renders, then the updated pixels are presented.
 //
-// Pixel format note: on little-endian macOS, Skia's kN32 premultiplied surface
-// stores pixels in memory as R,G,B,A bytes, so each pixel read back as a uint32
-// is 0xAABBGGRR (R in the low byte, B in the high byte). The explicit channel
-// masks below are therefore R/G/B/A = 0x000000FF/0x0000FF00/0x00FF0000/0xFF000000.
-// The naive 0xAARRGGBB ordering swaps red and blue, which a blue-rectangle
-// render exposed — so this ordering is load-bearing, not cosmetic.
+// Pixel format note: Skia's kN32 premultiplied surface stores either R,G,B,A or
+// B,G,R,A bytes depending on how Skia was BUILT for the target (macOS: R,G,B,A;
+// Windows: B,G,R,A), so the format is read from the surface itself via
+// sk_pixfmt_for_surface and never assumed. Getting it wrong is not cosmetic: it
+// swaps red and blue, which turned a blue button orange in a CPU-mode window on
+// Windows.
 // `w`/`h` are the logical window size (AIR's <width>/<height>); `pw`/`ph` are
 // the pixel dimensions of the surface handed in, which the caller sized using
 // sk_window_probe_scale. When they match the window's drawable size the blit is
@@ -2141,6 +2178,14 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   }
   if (!sk_surface_peek_pixels(surface, &c->pixels, &c->rowBytes)) {
     fprintf(stderr, "window_glue: surface does not expose pixels (not CPU raster)\n");
+    c->destroy_pending = 1;
+    sk_service_destroy();
+    SDL_Quit();
+    return 0;
+  }
+  c->pixfmt = sk_pixfmt_for_surface(surface);
+  if (c->pixfmt == SDL_PIXELFORMAT_UNKNOWN) {
+    fprintf(stderr, "window_glue: surface has an unsupported colour type (need 32-bit RGBA/BGRA)\n");
     c->destroy_pending = 1;
     sk_service_destroy();
     SDL_Quit();

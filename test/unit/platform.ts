@@ -2011,6 +2011,96 @@ function checkWindowsHostBackends(): string[] {
 
 registerGroup('unit: platform/WindowsHostBackends', checkWindowsHostBackends);
 
+// The CPU-raster window blit, and the one assumption that broke it (阶段二百七十三).
+//
+// Skia's kN32 is a BUILD-TIME property of the TARGET: include/core/SkTypes.h sets
+// SK_R32_SHIFT=16 (bytes B,G,R,A) under SK_BUILD_FOR_WIN and 0 (bytes R,G,B,A)
+// everywhere else, and SK_BUILD_FOR_WIN itself comes from _WIN32
+// (include/private/base/SkFeatures.h). window_glue.cc used to hardcode the macOS
+// answer for every host, so every CPU-mode window on Windows blitted its pixels with
+// red and blue exchanged -- measured on ui-demo/air-gallery: the accent #2563EB came
+// out #EB6325, whites went cream (temp/colorprobe/ links the vendored skia.lib and
+// prints the surface's own bytes: colorType 6 = BGRA_8888, `EB 63 25 FF` for that
+// colour).
+//
+// The fix is "ask the surface, never assume". What is pinned here is that shape: the
+// two header facts that make Windows differ (so a vendored-Skia bump that moves the
+// default is a red gate, not a silently orange app), and the rule that every path
+// creating the streaming texture derives its format from the surface instead of a
+// literal.
+function checkCpuPixelFormat(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [cpupix] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [cpupix] ${label}`); }
+  };
+
+  // ---- the fact this bug was made of, straight from the vendored Skia ----
+  const types = readNorm(join(root, 'vendor', 'skia', 'include', 'core', 'SkTypes.h'));
+  const feats = readNorm(join(root, 'vendor', 'skia', 'include', 'private', 'base', 'SkFeatures.h'));
+  check('windows really is the BGRA build (SkTypes.h: SK_R32_SHIFT=16 under SK_BUILD_FOR_WIN)',
+    /#elif defined\(SK_BUILD_FOR_WIN\)\n\s*#define SK_R32_SHIFT 16\n/.test(types));
+  check('...and SK_BUILD_FOR_WIN is derived from _WIN32, i.e. it holds for our own TUs',
+    /#if defined\(_WIN32\) \|\| defined\(__SYMBIAN32__\)\n\s*#define SK_BUILD_FOR_WIN\n/.test(feats));
+
+  // ---- the glue asks the surface ----
+  const glue = readNorm(join(root, 'vendor', 'window_glue.cc'));
+  const sk = readNorm(join(root, 'vendor', 'skia_glue.cc'));
+  const sliceFn = (src: string, sig: string): string => {
+    const i = src.indexOf(sig);
+    if (i < 0) return '';
+    const end = src.indexOf('\n}\n', i);
+    return end < 0 ? src.slice(i) : src.slice(i, end);
+  };
+
+  check('the macOS masks are gone: no SDL format is built from a literal RGBA order',
+    !glue.includes('SDL_MasksToPixelFormatEnum(32, 0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u)'));
+  const helper = sliceFn(glue, 'static Uint32 sk_pixfmt_for_surface(void* surface) {');
+  check('the format helper exists and maps both byte orders explicitly',
+    helper.includes('if (order == 1)      { r = 0x000000FFu; b = 0x00FF0000u; }')
+    && helper.includes('else if (order == 2) { b = 0x000000FFu; r = 0x00FF0000u; }'));
+  check('...and an unknown order is refused rather than guessed',
+    helper.includes('else return SDL_PIXELFORMAT_UNKNOWN;'));
+  check('the surface is asked for its own byte order (declared across the C boundary)',
+    glue.includes('int sk_surface_pixel_order(void* surface);'));
+  check('the Skia side answers from the SAME pixmap the blit is handed',
+    /int sk_surface_pixel_order\(void\* surface\) \{\n  SkPixmap pm;\n  if \(surface == nullptr \|\| !\(\(SkSurface\*\)surface\)->peekPixels\(&pm\)\) return 0;/
+      .test(sk)
+    && sk.includes('case kRGBA_8888_SkColorType: return 1;')
+    && sk.includes('case kBGRA_8888_SkColorType: return 2;'));
+
+  // ---- every path that creates the streaming texture derives the format ----
+  const calls = (glue.match(/sk_pixfmt_for_surface\(/g) || []).length;
+  check('all three texture paths derive the format (attach / show / resize)', calls === 4);
+  check('...attach: a NativeWindow creation',
+    sliceFn(glue, 'void sk_window_attach_surface(int id, void* surface, int pw, int ph) {')
+      .includes('c->pixfmt = sk_pixfmt_for_surface(c->surface);'));
+  check('...show: the app\'s initial window',
+    sliceFn(glue, 'int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* title,')
+      .includes('c->pixfmt = sk_pixfmt_for_surface(surface);'));
+  check('...resize: a rebuilt surface is asked again, not inherited',
+    sliceFn(glue, 'static int do_resize(WinCtx* c) {')
+      .includes('c->pixfmt = sk_pixfmt_for_surface(c->surface);'));
+  check('an unsupported surface is reported at every one of them (never a silent wrong blit)',
+    (glue.match(/if \(c->pixfmt == SDL_PIXELFORMAT_UNKNOWN\) \{/g) || []).length === 3
+    && (glue.match(/window_glue: .*unsupported colour type/g) || []).length === 3);
+
+  // ---- and nowhere else in the vendor tree re-derives it ----
+  let maskUsers: string[] = [];
+  for (const f of readdirSync(join(root, 'vendor'))) {
+    if (!/\.(cc|c|mm)$/.test(f)) continue;
+    if (readNorm(join(root, 'vendor', f)).includes('SDL_MasksToPixelFormatEnum')) maskUsers.push(f);
+  }
+  check('window_glue.cc is the only TU that builds an SDL pixel format at all',
+    maskUsers.length === 1 && maskUsers[0] === 'window_glue.cc');
+
+  console.log(`     [cpupix] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/CpuPixelFormat', checkCpuPixelFormat);
+
 // Windows per-character font fallback. GDI's manager has no system cascade at all:
 // SkFontMgrGDI::onMatchFamilyStyleCharacter is an unconditional `return nullptr`
 // (src/ports/SkFontHost_win.cpp ~2267), while SkParagraph asks the manager for a

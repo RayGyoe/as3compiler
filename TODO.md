@@ -16109,7 +16109,61 @@ Win7 **真机仍未跑**（本机没有机器）；`< 2.0` 的拒绝分支**没�
 结论只有「加载器与导入面干净」，没有「跑得动」。**
 
 
+### 阶段二百七十三：CPU 光栅窗口的红蓝互换 —— Skia 的 kN32 是**构建期属性**（v0.4.236 → v0.4.237）✅ 已完成
+
+**一、现象与定性**
+
+同一个 `asaotui/ui-demo/air-gallery`：`adl` 正确、AOT 的 GPU 模式（D3D12 / WGL）正确，**只有 AOT 的
+CPU 模式**整体偏橙 —— 强调色 `#2563EB` → `#EB6325`、白底（`#F5F6F8`）→ 米色、深灰文字变棕。
+两个色值**逐通道互换、绿通道不动** ⇒ 不是调色/抗锯齿差异，是 **R 与 B 换位**。
+
+**二、根因：我们把字节交给 SDL 时「声称的格式」错了，而不是我们画错了**
+
+`vendor/window_glue.cc` 曾写死
+`SDL_MasksToPixelFormatEnum(32, 0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u)`，旁边注释自述
+「little-endian macOS 上 Skia 的 kN32 按 R,G,B,A 存」。那句话在 macOS 上是真的，**但它描述的是构建期
+决定的平台差**：`vendor/skia/include/core/SkTypes.h` 写得很直白 ——
+`#elif defined(SK_BUILD_FOR_WIN)` 时 `SK_R32_SHIFT 16`（内存里 B,G,R,A），`#else` 才 `SK_R32_SHIFT 0`
+（R,G,B,A）；而 `SK_BUILD_FOR_WIN` 由 `include/private/base/SkFeatures.h:18` 从 `_WIN32` 推出 ⇒ 我们自己
+编的 TU 在 Windows 上必然命中。**我们声明 R 在低字节，实际 B 在低字节。**
+
+实证（`temp/colorprobe/`，直接链 `vendor/skia/lib/windows-x64/skia.lib`）：`SK_BUILD_FOR_WIN=1`、
+`SK_R32_SHIFT=16`、`SK_PMCOLOR_IS_BGRA=1`；`SkSurfaces::Raster(SkImageInfo::MakeN32Premul(4,4))`
+画 `#2563EB` 后 `peekPixels` 得到 **`colorType=6`（BGRA_8888）**、四字节 `EB 63 25 FF`。
+
+**三、修法：不猜平台，问那块 surface 自己**
+
+① `skia_glue.cc` 新增 `sk_surface_pixel_order(void*)`：从 `peekPixels` 拿到的**同一张 `SkPixmap`** 读
+`colorType()`（`kRGBA_8888`→1、`kBGRA_8888`→2、其它→0）。与 blit 的字节同源，故 `SK_R32_SHIFT` 被构建
+参数覆盖也不会打脸。② `window_glue.cc` 新增 `sk_pixfmt_for_surface`：`order==1` 给原来那组掩码、
+`order==2` 给镜像那组，**`0` 就不建纹理并明确报错**（AGENTS §2.5：不许 fallback 到「猜一个格式」）。
+③ 三条会建 streaming texture 的路径全部改成从 surface 取：窗口创建（`sk_window_attach_surface`）、
+首窗呈现（`sk_window_show`）、**缩放重建**（`do_resize`，新 surface 重新问、不继承旧值）；`sk_open_window`
+只把字段置 `SDL_PIXELFORMAT_UNKNOWN`。
+
+**刻意不用 `#ifdef _WIN32`**：那只是把同一个假设换一个地方写；surface 的 `colorType` 才是唯一既权威、
+又与字节同源的答案。（同理也没动 test 里的平台分支：不需要知道宿主是谁，只需要知道那块 surface 是什么。）
+
+**四、验收**
+
+| 检查 | 修前 | 修后 |
+|---|---|---|
+| `temp/colorprobe/verify.cjs` 量用户现场 CPU 截图（蓝族 / 橙族 / 主导饱和色） | 0 / 9823 / `#eb6325` | — |
+| 同尺量 CPU 重建后的真窗口（PrintWindow 抓取，不受遮挡影响） | — | **9269 / 0 / `#2563eb`** |
+| `unit: platform/CpuPixelFormat`（13 条：两个头文件事实 / 写死掩码已消失 / 三路取格式 / 未知即报 / 全树只有一个 TU 构造 SDL 格式） | — | **13/13** |
+| `node --test test/unit/*.ts` | 246 组（仅 `inline/StackCanary` 红，基线同源） | 247 组，**246 pass / 1 fail**（仍只有那条） |
+| `node test.ts` 全量 | 494 / 488 pass / 4 fail / 2 skip | **495 / 489 / 4 / 2**（四条红与基线同源：`socket.as` bind、`stage94d.as` UTF-16LE、`status-item.as` 需 darwin、`inline/StackCanary`） |
+| `window_glue.cc` + `skia_glue.cc` 三种 define 集（cpu / `ASC_RENDER_D3D` / `ASC_RENDER_GL`）单独 `-c` | — | **6/6 OK**（改动不带任何后端 `#ifdef`） |
+
+**五、如实报明**
+
+本机是 Windows，**macOS 未复测**：格式推导在 macOS 上给出与旧代码**完全相同**的掩码（`order==1` 分支就是
+原来那组常量），属「按构造逐字节不变」而非「已实测不变」。这条路径天生只有 Windows 宿主才跑得到
+（macOS 的 kN32 本来就是 RGBA，写死与推导结果无差）——这正是它能活到现在的原因。
+
+
 ### 遗留待开发
+> **2026-10-25 追加（阶段二百七十三：CPU 光栅窗口红蓝互换）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是「我们把 Skia 的字节原样交给 SDL，却按 macOS 的通道顺序声称格式」造成的**呈现缺陷**（`adl` 与我们的 GPU 后端都不经过这条路径，所以两端对比看不见它），不属于「`adl` 跑得对我们跑不出」的语义欠账，故不占本表；证据、复现命令与未测项见阶段节与 `win32.md` §2.12。
 > **2026-10-24 追加（阶段二百七十一：`--gpu-backend gl`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段新增的是**后端选择**，不是语义能力；GL 侧的未测项（Intel/AMD 老驱动、远程桌面/虚拟机、compat profile 下快路径可用性、present 实际合成延迟、Win7 真机）属**验证欠账**而非「`adl` 跑得对我们跑不出」，按 AGENTS §1.5 不占本表——已逐条写在阶段节的「五、如实报明」与 `compile.md` §3.4.6 的「已知边界」。同一条也适用于「GL 还不是默认」：那是**权衡**（换后端不提帧率、present 更贵），不是欠账。
 > **2026-10-24 追加（阶段二百六十九 ~ 二百七十：闭包静态读丢 `_cinit` 守卫 / `getTextFormat` 读 run 表）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。两条都是 `adl` 跑得对、我们跑不出的**语义实错**，且都在阶段内**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表）：① 闭包体内的静态字段读走另一条发射路径，裸读 `Cls_FIELD` 而不带 `(Cls_cinit(), …)` 守卫 ⇒ 只被闭包读的 `static const Array` 运行时仍是 `NULL`（`#1009`），根因是 `cinitClasses` 在闭包体发射之后才被填充；② `TextField.getTextFormat()` 恒返回 `defaultTextFormat`，忽略阶段二百六十八 建立起来的 run 表。两条都在 `asaotui/compiler-gaps.md` 记有完整证据（G22 / G21），此处只留指针。
 > **2026-10-24 追加（阶段二百六十六 ~ 二百六十八：三元 null 分支 / `drawRoundRect` / `setTextFormat`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。三条都是`adl` 跑得对而我们跑不出的**语义实错**，且在阶段内**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表）：① `cond ? null : X` 把 X 塌成结果类型的零值（`unifyType` 缺 null 家族规则）；② `Graphics.drawRoundRect` 的两个半径被 `(void)ew; (void)eh;` 就地吞掉、画出直角；③ `TextField.setTextFormat` 该替换区间却在追加 run，导致重复排版（宽度随重绘线性增长）。**未入表的新偏差 1 项**：`TextField.getTextFormat()` 忽略 run 表（G21），与 G15 同处理——先登记在 `asaotui/compiler-gaps.md`（已实测·未修），立项再占表。

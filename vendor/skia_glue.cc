@@ -566,6 +566,27 @@ int sk_surface_peek_pixels(void* surface, void** pixels, int* rowBytes) {
   return 1;
 }
 
+// The byte order of a raster surface's pixels, for a host that has to declare the
+// format to a 32-bit blitter. This is NOT a property of our code but of the Skia
+// BUILD: SkTypes.h defaults SK_R32_SHIFT to 16 (=> bytes B,G,R,A) on Windows and to
+// 0 (=> bytes R,G,B,A) everywhere else, and the vendored archive is a Windows build.
+// A caller that hardcodes the macOS answer therefore paints every Windows frame with
+// red and blue swapped -- measured: #2563EB blue arrived as #EB6325 orange in a
+// CPU-mode window (temp/colorprobe/, and the same surface reports colorType 6).
+// Derived from the same SkPixmap peeking hands out, so it cannot drift from the
+// buffer the caller is about to blit, even if SK_R32_SHIFT is overridden at build
+// time.
+// Returns 1 = bytes R,G,B,A; 2 = bytes B,G,R,A; 0 = not a 32-bit RGBA/BGRA raster.
+int sk_surface_pixel_order(void* surface) {
+  SkPixmap pm;
+  if (surface == nullptr || !((SkSurface*)surface)->peekPixels(&pm)) return 0;
+  switch (pm.colorType()) {
+    case kRGBA_8888_SkColorType: return 1;
+    case kBGRA_8888_SkColorType: return 2;
+    default: return 0;
+  }
+}
+
 void* sk_surface_make_snapshot(void* surface) {
   auto image = ((SkSurface*)surface)->makeImageSnapshot();
   return image.release();  // caller owns one ref

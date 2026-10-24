@@ -391,6 +391,58 @@ Windows-on-ARM 上**非 AIR 的产物**（不走 `--air-app` 的普通 `as-aot` 
 
 ---
 
+### 2.12 CPU 光栅窗口的**红蓝互换**：Skia 的 kN32 是**构建期属性**（阶段二百七十三）
+
+**现象**：同一个 `ui-demo/air-gallery`，`adl` 与 AOT 的 GPU 模式（D3D12 / WGL）都是对的蓝色，
+只有 AOT 的 **CPU 模式**整体偏橙——强调色 `#2563EB` 变成 `#EB6325`，白底变成米色，深灰文字变棕。
+**两个色值逐通道互换、绿通道不动**，这不是调色/渲染差异，是 **R 与 B 换位**。
+
+**根因不在我们的绘制，在「我们把字节交给 SDL 时声称的格式」**。`window_glue.cc` 曾写死
+`SDL_MasksToPixelFormatEnum(32, 0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u)`，旁边注释自述
+「little-endian macOS 上 Skia 的 kN32 按 R,G,B,A 存」。那句话在 macOS 上是真的，**但它描述的是
+构建期决定的平台差**：
+
+| 事实 | 出处 | 内容 |
+|---|---|---|
+| kN32 的缺省方向按目标平台分叉 | `vendor/skia/include/core/SkTypes.h` | `#elif defined(SK_BUILD_FOR_WIN)` → `#define SK_R32_SHIFT 16`（内存里 B,G,R,A）；`#else` → `#define SK_R32_SHIFT 0`（R,G,B,A） |
+| `SK_BUILD_FOR_WIN` 的来源 | `vendor/skia/include/private/base/SkFeatures.h:18` | `#if defined(_WIN32) …` ⇒ 我们自己编的 TU 在 Windows 上必然命中 |
+
+**实测**（`temp/colorprobe/`，直接链 `vendor/skia/lib/windows-x64/skia.lib`）：`SK_BUILD_FOR_WIN=1`、
+`SK_R32_SHIFT=16`、`SK_PMCOLOR_IS_BGRA=1`；`SkSurfaces::Raster(SkImageInfo::MakeN32Premul(4,4))`
+画 `#2563EB` 后 `peekPixels` 得到 **`colorType=6`（BGRA_8888）**、四字节 `EB 63 25 FF`。
+也就是说：**我们声明 R 在低字节，实际 B 在低字节** ⇒ SDL 把红蓝对调。
+
+**同一把尺量的两端像素**（`temp/colorprobe/verify.cjs` 统计饱和度够高的像素族）：
+
+| 抓图 | 蓝族 `#2563EB` | 橙族 `#EB6325` | 主导饱和色 |
+|---|---|---|---|
+| 修前（用户现场截图，CPU 模式） | 0 | 9823 | `#eb6325` |
+| 修后（CPU 重建 + PrintWindow 抓窗口） | 9269 | 0 | `#2563eb` |
+
+**修法：不猜平台，问那块 surface 自己。** `skia_glue.cc` 新增 `sk_surface_pixel_order(void*)`，从
+`peekPixels` 拿到的**同一张 `SkPixmap`** 读 `colorType()`（`kRGBA_8888`→1、`kBGRA_8888`→2、其它→0）；
+`window_glue.cc` 的 `sk_pixfmt_for_surface` 按 1/2 生成掩码，拿到 **0 就不建纹理并明确报错**
+（AGENTS §2.5：不许 fallback 到「猜一个格式」）。三条会建 streaming texture 的路径——窗口创建
+（`sk_window_attach_surface`）、首窗呈现（`sk_window_show`）、**缩放重建**（`do_resize`）——全部从
+surface 取格式；`sk_open_window` 只把字段置 `SDL_PIXELFORMAT_UNKNOWN` 等真值。
+
+**为什么不用 `#ifdef _WIN32`**：那只是把同一个假设换一个地方写。`SK_R32_SHIFT` 可以被构建参数覆盖，
+而 surface 的 `colorType` 是唯一不会被「将来重编一份 Skia」打脸的答案，且它与被 blit 的字节同源。
+
+**影响面**：只碰 CPU 光栅呈现。GPU 后端（D3D12 / WGL / Metal）自己声明 surface 的 color type
+（`d3d_glue.cc:796` 按 `DXGI_FORMAT` 选、`gl_glue.cc:237` 用 `kRGBA_8888`），从不经过这条掩码路径；
+web 侧 `web_glue.cc` 把字节直接塞进 `ImageData`（RGBA），而 wasm 构建下 kN32 本来就是 RGBA ⇒ 一致。
+`vendor/*.cc` 中只有 `window_glue.cc` 会构造 SDL 像素格式（钉子已钉住这一点）。
+
+**回归钉子**：`test/unit/platform.ts` 的 `unit: platform/CpuPixelFormat`（13 条）。其中两条钉的是
+**让 Windows 变成 BGRA 的那两个头文件事实**——将来把 vendored Skia 换成改了缺省方向的版本时，
+红的应当是钉子，而不是用户端一个橙色窗口。
+
+**如实报明**：本机是 Windows，**macOS 未复测**。格式推导在 macOS 上给出与旧代码**完全相同**的掩码
+（`order==1` 分支就是原来那组常量），属「按构造逐字节不变」而非「已实测不变」。
+
+---
+
 ## 3. 编译器侧接线
 
 ### 3.1 `<renderMode>` 在 Windows 上的两个分支
