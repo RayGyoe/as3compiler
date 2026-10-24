@@ -15806,7 +15806,105 @@ ANE 仍留给 **G3**（卷总量/已用量）：那条 AIR **真没有**（`File
 > 落在注释里、clang 静默忽略，本轮**没有**顺手改（改掉注释里的引文会削弱「这行是从真实文件头抄来的」这个证据），不登记为缺口。
 
 
+### 阶段二百六十六：`cond ? null : X` 把 X 塌成结果类型的零值 —— 三元组的类型合并缺一条 null 家族规则（v0.4.229 → v0.4.230）✅ 已完成
+
+**一、性质：语义实错（§2.5 红线区内的静默错误）**
+
+`unifyType` 在合并两个分支的类型时，对「一侧是 `null` 字面量、另一侧是具体值」没有任何专门规则，落到最后的
+`return a` 兜底：`null` 先出现就让整个三元组的静态类型变成 `null`，于是**条件为假时求值结果被丢掉**，
+表达式塌成**结果类型的零值**（object→`null`、Number→`0`、Boolean→`false`、int→`0`）。`String` 因字符串规则
+在更前面命中而免疫——这也是它最难被手写测试碰到的地方：`cond ? null : "x"` 一直是对的。
+
+**二、修法（只动类型合并，不动求值）**
+
+`src/emit.ts` 的 `unifyType`：在 `any` 规则**之前**插入 null 家族规则——`void` 侧返回对侧；标量对侧
+（`int`/`uint`/`int64`/`uint64`/`number`/`bool`/**`any`**）装箱成 `any`；指针型对侧保持具体类型（`Bitmap`
+仍是 `Bitmap*`，只是两个分支各自 `as_v_null()`/具体值给到同一个槽）。规则必须排在 `any` 规则**之前**：
+否则 `? null : <*>` 的 `*` 会先赢下合并，整条三元组又被类型化成 `null`。
+
+**三、验收**
+
+| 检查 | 修前 | 修后 |
+|---|---|---|
+| `asaotui/probes/g16-ternary-null/run.cjs`（20 格，双 runtime 并排） | AOT 12/20 偏离 | **20/20** |
+| 同一探针 `mutation.cjs` | — | **4/4 命中**，sha256 逐字节还原 |
+| `asaotui/tools/gates.cjs` §9b | 登记偏离集 12 格 | `G16_KNOWN = []`（**任何**偏离都算回归） |
+| `examples/ternary-null.as`（27 断言，object/Number/Boolean/int/String/反向 arm/无 null 控制组） | 编译不进（塌值断言红） | `ternary-null: all assertions passed` |
+| AIR 参照 A/B（`temp/g16g19g20/ab-g16.cjs`，同一份 27 格） | — | **27/27 与 adl 51.4.1 逐字节相同** |
+| `unit: ternary/null-join`（13 条源级钉） | — | **13/13**（含「null 规则在 any 规则之前」这条顺序钉子） |
+
+**如实报明**：探针的 20 格里，`cond ? null : X` 只是**形态之一**；真正被量化的是「THEN 槽是 null 字面量、
+ELSE 是任意非 String 表达式」这一整类。反向写法（`cond ? X : null`）修前就是对的，示例与单元都拿它做对照，
+避免把「三元组整体坏了」当结论。
+
+### 阶段二百六十七：`Graphics.drawRoundRect` 的两个半径被就地吞掉 —— 换成真的 `SkRRect` 圆角（v0.4.230 → v0.4.231）✅ 已完成
+
+**一、性质：实现是桩（不是口径偏差）**
+
+生成的 `Graphics_drawRoundRect` 正文是 `{ (void)ew; (void)eh; Graphics_drawRect(...); }`：两个半径参数被
+显式丢弃后转调直角矩形。任何 `drawRoundRect` 都画出直角框，而 `adl` 画的是四条椭圆圆角。
+
+**二、修法（三段各自最小）**
+
+| 层 | 改动 |
+|---|---|
+| `src/symbols.ts` | `drawRoundRect` 的 `ellipseHeight` 默认值由 `0` 改为 **`NaN`**（AS3 文档默认就是 `NaN`；旧值让 5 实参调用静默变成直角） |
+| `src/emit.ts` | `Graphics_drawRoundRect` 完整实现：`ew` 为 NaN ⇒ `ArgumentError #2004`；`eh` 为 NaN ⇒ 回退 `ew`；负 `w`/`h` 镜像盒子；`rx=ew*0.5, ry=eh*0.5`，负半径夹到 0、各自夹到半个盒子；尺寸为 0 走直角矩形路径，否则 `as_skia_path_add_rrect` |
+| `vendor/skia_glue.cc` | `sk_path_add_rrect`（`SkPath::addRRect(SkRRect::MakeRectXY(...))`）+ `#include "include/core/SkRRect.h"` |
+| `src/runtime.ts` | extern 声明 + **两条** inline 包装（真 Skia 支与 no-op 桩支），否则不画图的构建链接失败 |
+
+**三、验收**
+
+| 检查 | 结果 |
+|---|---|
+| AIR 参照 `temp/g16g19g20/ab-round.cjs`（9 个几何 case × 40 行 + 13 例参数契约） | **292 行逐字节相同 / 27 行在 AA 容差内 / 0 行分歧 / 40 行已登记（负半径）**，`RESULT: PASS` |
+| `examples/roundrect.as`（A–G 六段，23 条像素断言） | `roundrect: all assertions passed` |
+| `unit: graphics/roundrect`（16 条源级钉） | **16/16** |
+
+**实测到的 AIR 口径**（adl 51.4.1，写进代码注释）：半径 = 椭圆宽高的一半（两轴独立）；`ew=eh=80` 画在 40×40 上
+等于 `ew=eh=40`（各自夹到 20）；`eh` 省略或 NaN 回退 `ew`；`ew` NaN 抛 `#2004`；负 `w`/`h` 是镜像盒子；
+`w` 或 `h` 为 0 什么都不画。
+
+> **唯一登记偏差：负半径。** AIR 对它自己的 cubic 自交会把墨溢出盒子 1~2 px（e.g. `ew=eh=-8` 在 40×40 上的
+> 首行 span 是 `8,10,51,49`，即 −2..41），几何上不合理；我们把负半径夹到 0（直角）。行级对照在
+> `ab-round.cjs` 里记为 `known`，不参与 PASS 判定，也不会被静默忽略。
+> **如实报明**：`ew=20/eh=10` 这类两轴不等的情形，第 2/3 行恰好压在 50% alpha 阈值两侧，AIR 与我们的
+> 各差 1 px（距理想椭圆均 0.66 px）—— 这是各光栅器的舍入，不是形状口径。
+
+### 阶段二百六十八：`TextField.setTextFormat` 该替换区间却在叠加 —— 重绘一次就把字符排一遍（v0.4.231 → v0.4.232）✅ 已完成
+
+**一、性质：语义实错，且只在「重复施加」后才显形**
+
+AIR 的契约是**设置该范围内的格式**（同一区间施加两次 == 一次；全区间格式覆盖已有子区间格式）。我们此前
+无条件往 `TextField._runs` 追一条 `(begin, end, TextFormat)` 三元组，而排版侧
+`sk_textlayout_new_runs` 是「按 run 顺序把 `text[start..end)` 各拷一遍」——同一段字符被排 N 遍，
+**宽度随重绘次数线性增长**（应用侧症状：「输入过的字被复制了一遍」，`asaotui/probes/widgets/typing` 变异 M3）。
+
+**二、修法（`src/emit.ts` 的 `TextField_setTextFormat`）**
+
+重建整张 run 表：完全落在新区间之前的 run 原样保留；横跨边界的 run **切成两半**；被覆盖的部分丢弃；
+新 run 插在「第一条触及 `begin` 的 run」处。**有序性是硬要求**：排版循环的 `pos` 只前进，乱序会让同一段文字
+被再排一次，所以插入点必须在切分后的两半之间（这一条单独钉了一条单测）。空区间与 `format == null` 是 no-op；
+新表整体换上去并盖 `gc_write_barrier`，段落缓存照旧失效。顺带**治好**已经累积了重复项的字段。
+
+**三、验收**
+
+| 检查 | 修前 | 修后 |
+|---|---|---|
+| `asaotui/probes/g20-settextformat/run.cjs`（12 格**关系式**，双 runtime 并排 + 2 格已登记偏差） | AOT **7 格**红（同格式施加 1/2/3 次后 46.66 → 91.53 → 136.41 px；AIR 52/52/52） | **12/12 与 AIR 一致** |
+| 同一探针 `mutation.cjs` | — | **5/5 命中**（3 条改 `src/emit.ts`、2 条改探针/规则），sha256 逐字节还原 |
+| `examples/settextformat-runs.as`（12 条断言，含「反复 `BitmapData.draw` 宽度不变」「窄区间切开长 run」） | — | `settextformat-runs: … assertions passed` |
+| `unit: text/settextformat`（15 条源级钉，含插入点有序性） | — | **15/15** |
+
+**如实报明**：探针刻意只比**关系**（同进程两个字段互比），不比绝对值——AIR 与本实现用的是不同文本引擎，
+绝对宽度本来就不同（52 vs 46.66）。若某天两端绝对宽度意外相等，那是巧合，不是判据。
+
+> **新登记（未修、不夹带）：G21 = `TextField.getTextFormat()` 忽略 run 表**，恒返回 `defaultTextFormat`；
+> AIR 返回该区间**生效的**格式。同一探针的 case 10/11 持续测量它（AIR `true` / 我们 `false`），
+> 在 `asaotui/compiler-gaps.md` 记为「已实测·未修」，与 G15 同处理：先登记在工作区文档，立项再入表。
+
 ### 遗留待开发
+> **2026-10-24 追加（阶段二百六十六 ~ 二百六十八：三元 null 分支 / `drawRoundRect` / `setTextFormat`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。三条都是`adl` 跑得对而我们跑不出的**语义实错**，且在阶段内**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表）：① `cond ? null : X` 把 X 塌成结果类型的零值（`unifyType` 缺 null 家族规则）；② `Graphics.drawRoundRect` 的两个半径被 `(void)ew; (void)eh;` 就地吞掉、画出直角；③ `TextField.setTextFormat` 该替换区间却在追加 run，导致重复排版（宽度随重绘线性增长）。**未入表的新偏差 1 项**：`TextField.getTextFormat()` 忽略 run 表（G21），与 G15 同处理——先登记在 `asaotui/compiler-gaps.md`（已实测·未修），立项再占表。
 > **2026-10-24 追加（阶段二百六十五：两条只有 Windows 宿主才编译得到的产物缺陷）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段修的是**产物在 Windows 上编不过 / 链不上**（`src/runtime.ts` 模板字符串里反斜杠先掉一层；`vendor/window_glue.cc` 的 `#else` 支缺 `sk_menu_flush`/`sk_menu_ensure` 定义），既不改变任何 AS3 语义、也不对应 `adl` 上的行为分歧，故不入表；已在本阶段节内记账，并补 7 条源级钉子（macOS CI 天生编译不到那两支，非源级钉就无从回归）。
 > **2026-10-23 追加（阶段二百六十四：`File.getDirectoryListingAsync` 真异步化 —— 改写 1 行 + 新登记 2 行）**：**新登记 2 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **91 → 93 项**（`未开始` **71 → 72**、`部分完成` **19 → 20** / `调研完成·实现暂缓` 1）。**本阶段主体是补平差距，故不占表**：用户提议「用 ANE 做遍历异步化」，但根因不是缺 ARM 链接库（`lib/bin/macos-x86-64/libasaot.dylib` 本就是 **x86_64+arm64 通用二进制**，`macos-x86-64` 是 AIR 自己的平台键、不表架构），而是**该成员此前是同步假实现**（inline 调 `getDirectoryListing()` + 同一次调用内派发 `FileListEvent`，`cancel()` 因此恒为 no-op）——`adl` 上它是真异步，属 §1.5「`adl` 跑得对而我们跑不出」⇒ **遗留缺陷**且阶段内修净（新 `AS_JOB_DIR` 作业 + 完成 thunk + 真 `cancel`），故不入表。**改写的 1 行**是「空 `File` 的成员访问全线不抛 `#2037`」：其中 `getDirectoryListing`/`getDirectoryListingAsync` 两个成员本阶段已按 `adl` 补齐（见该行）。**新登记 2 行**都是本轮**量出来、但不在批准范围内修**的真分歧：① 基类 `EventDispatcher.parent`（一个 C 侧内部链接字段）在**动态读**里压过派生类的 getter；② `File` 其余三个 async 成员仍是 inline 完成。
 > **2026-10-23 追加（阶段二百六十三：AGAL 三条实测定案 —— 移出 3 行 + 收窄 1 行）**：**新登记 0 行 / 改写 1 行 / 移出 3 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **94 → 91 项**（`未开始` **74 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1 / `已记录` 1；`已修` 与 `已记录` 各自归零后仍为 0）。**移出 3 行**：① AGAL `nrm` 的归一化分量数 —— 像素探针定案**只归 `.xyz`**（`w` 既不参与模长也不被写），`src/runtime.ts` 已改并把含 w 的目的掩码按 `adl` 的 **#3628** 响亮拒绝；② 临时寄存器未初始化即被读 —— **不是「初值是多少」而是 upload 期错误**（**#3647**/**#3648**，用官方 `AGALMiniAssembler` 编的字节复现），故落地为 `agal_check_temp_writes` 逐分量线性扫描后**拒收**，而不是零初始化（零初始化会让一个 AIR 上跑不起来的程序在我们这里「碰巧有输出」，属 §2.5 明禁的静默降级）；③ 指针移出窗口不 roll-out —— **早已修**（`vendor/window_glue.cc` 的 `SDL_WINDOWEVENT_LEAVE` + 「仍严格在客户区内则不算离开」守卫），零代码下架。**改写 1 行**：原「`ROLL_OVER` / `ROLL_OUT` / `Stage.MOUSE_LEAVE` 事件完全不派发」**收窄**为只剩前者两个（外加冒泡的 `mouseOver`/`mouseOut`）—— `mouseLeave` 一直有发射点（`src/emit.ts` 的 `Event_new("mouseLeave", …)`，指针离开舞台时按 `mouseOut → rollOut(按钮) → mouseLeave(舞台)` 补一轮），把三条并记在一行会掩盖「已对齐两条」。**证据**：`temp/agalprobe/{out.txt,out-aot.txt}`（adl 与 AOT 逐字节相同）、`temp/metalshader/nrm*.{msl,metal,glsl}` + `glslcheck3.html`（Metal 2/2、WebGL 2/2 真编译；HLSL 本机无 `fxc`，只做文本钉）、`unit: stage3d/agal-nrm`（5 钉）+ `unit: stage3d/agal-temp-writes`（5 钉）+ `examples/stage80/82/83.as`。

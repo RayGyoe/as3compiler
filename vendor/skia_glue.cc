@@ -38,6 +38,7 @@
 
 #include "include/core/SkSurface.h"
 #include "include/core/SkCanvas.h"
+#include "include/core/SkRRect.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPath.h"
 #include "include/core/SkStrokeRec.h"
@@ -775,6 +776,17 @@ void sk_path_add_circle(void* path, double cx, double cy, double r) {
 // oval is the same outline, so the caller normalizes before calling this.
 void sk_path_add_oval(void* path, double x, double y, double w, double h) {
   ((SkPath*)path)->addOval(SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)w, (SkScalar)h));
+}
+// Graphics.drawRoundRect: the four corners are quarter ellipses with radii
+// (rx, ry) INSIDE the (x, y, w, h) rectangle -- SkRRect's MakeRectXY is exactly
+// that. The radius clamp (each pair to half the box) and the swap for a negative
+// w/h happen in the caller, because AIR's clamping is part of the AS3 contract
+// and must hold on the no-Skia path too (where this function does not exist).
+void sk_path_add_rrect(void* path, double x, double y, double w, double h,
+                       double rx, double ry) {
+  ((SkPath*)path)->addRRect(SkRRect::MakeRectXY(
+      SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)w, (SkScalar)h),
+      (SkScalar)rx, (SkScalar)ry));
 }
 void sk_path_close(void* path) { ((SkPath*)path)->close(); }
 // Close EVERY contour of a path. A SWF shape outline is a closed figure by

@@ -9035,6 +9035,7 @@ extern void sk_path_quad_to(void* path, double cx, double cy, double x, double y
 extern void sk_path_add_rect(void* path, double x, double y, double w, double h);
 extern void sk_path_add_circle(void* path, double cx, double cy, double r);
 extern void sk_path_add_oval(void* path, double x, double y, double w, double h);
+extern void sk_path_add_rrect(void* path, double x, double y, double w, double h, double rx, double ry);
 extern void sk_path_close(void* path);
 // Closes every contour (Skia's AA clipper drops an unclosed contour, so a clip
 // path must be built from closed figures -- see vendor/skia_glue.cc).
@@ -9184,6 +9185,7 @@ static inline void as_skia_path_quad_to(void* p, double cx, double cy, double x,
 static inline void as_skia_path_add_rect(void* p, double x, double y, double w, double h) { sk_path_add_rect(p, x, y, w, h); }
 static inline void as_skia_path_add_circle(void* p, double cx, double cy, double r) { sk_path_add_circle(p, cx, cy, r); }
 static inline void as_skia_path_add_oval(void* p, double x, double y, double w, double h) { sk_path_add_oval(p, x, y, w, h); }
+static inline void as_skia_path_add_rrect(void* p, double x, double y, double w, double h, double rx, double ry) { sk_path_add_rrect(p, x, y, w, h, rx, ry); }
 static inline void as_skia_path_close(void* p) { sk_path_close(p); }
 static inline void as_skia_path_close_all(void* p) { sk_path_close_all(p); }
 static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { return sk_path_get_bounds(p, l, t, r, b); }
@@ -9945,6 +9947,7 @@ static inline void as_skia_path_quad_to(void* p, double cx, double cy, double x,
 static inline void as_skia_path_add_rect(void* p, double x, double y, double w, double h) { (void)p; (void)x; (void)y; (void)w; (void)h; }
 static inline void as_skia_path_add_circle(void* p, double cx, double cy, double r) { (void)p; (void)cx; (void)cy; (void)r; }
 static inline void as_skia_path_add_oval(void* p, double x, double y, double w, double h) { (void)p; (void)x; (void)y; (void)w; (void)h; }
+static inline void as_skia_path_add_rrect(void* p, double x, double y, double w, double h, double rx, double ry) { (void)p; (void)x; (void)y; (void)w; (void)h; (void)rx; (void)ry; }
 static inline void as_skia_path_close(void* p) { (void)p; }
 static inline void as_skia_path_close_all(void* p) { (void)p; }
 static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { (void)p; (void)l; (void)t; (void)r; (void)b; return 0; }

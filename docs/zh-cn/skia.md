@@ -198,7 +198,7 @@ skia::textlayout::StrutStyle::StrutStyle()`），只给最终二进制加 `-dead
 | `Graphics.beginFill(color, alpha)` | `SkPaint` fill 风格 + `setColor`/`setAlpha` | `endFill` 后 `drawPath(path, paint)` |
 | `Graphics.lineStyle(thickness, color, alpha)` | `SkPaint` stroke 风格 + `setStrokeWidth` + `setStrokeMiter/Cap/Join` | 描边属性逐项对齐 |
 | `Graphics.beginGradientFill(...)` | `SkGradientShader::MakeLinear/MakeRadial` → `SkPaint::setShader` | linear/radial 两类 |
-| `Graphics.drawCircle/drawRect/drawRoundRect` | `SkCanvas::drawCircle/drawRect/drawRRect` | 快捷几何 |
+| `Graphics.drawCircle/drawRect/drawRoundRect` | `SkCanvas::drawCircle/drawRect/drawRRect` | 快捷几何（`drawRoundRect` 的两个半径按 AIR 口径折成 `SkRRect` 椭圆角，见阶段二百六十七） |
 | `Bitmap.bitmapData` / `BitmapData` | `SkBitmap`/`SkImage` + `drawImage` | `BitmapData` 是像素缓冲，`Bitmap` 是显示节点 |
 | `BitmapData.setPixel/getPixel` | `SkBitmap::setPixel/getColor`（或 `SkPixmap`） | CPU 读写像素 |
 | `BitmapData.draw(source)` | `SkCanvas::drawImage/drawSurface`（离屏 surface 合成） | 位图间拷贝/合成 |
@@ -687,7 +687,8 @@ as_skia_canvas_restore(canvas);                    // 只够关掉「对象自�
 
 SkParagraph 的富文本能力（`htmlText`、多 `TextFormat` 区间样式、对齐/字间距/多段落）均已落地：`htmlText`
 解析 `<font>`/`<b>`/`<i>`/`<u>`/`<p>`/`<br>` 子集并生成「字节区间 + `TextFormat`」run 列表，`setTextFormat`
-以同样机制追加 run；`sk_textlayout_new_runs` 按 run 顺序 `pushStyle`/`addText`/`pop`，run 之间的间隙回落到
+写的是**同一张 run 表但按「替换该区间」的语义**（阶段二百六十八，见 §8.5）；`sk_textlayout_new_runs` 按 run
+顺序 `pushStyle`/`addText`/`pop`，run 之间的间隙回落到
 段落默认样式（= `runs[0]` 的字体/字号，颜色取自 `defaultTextFormat`）。`autoSize`/`scrollH`+`maxScrollH`（AIR 没有 `hscroll` 开关，见 `flash-text.md` §11）/`selectable`/`leading`
 亦已落地，断言式回归见 `examples/textrich.as`（`examples/textflow.as` 为布局基线）。
 
@@ -842,6 +843,28 @@ CoreText）/ 8 处原样委托 / 工厂与降级 / macOS 分支未动 / 反向�
 
 回归：上面的 16 钉已含本节四项（字族名的翻译与回问 GDI 的**顺序**、`<族> <样式词>` 基名重拼、
 未安装族 → Times、macOS 仍问 CoreText）。像素级验证：`temp/fontprobe` 10 行与 adl 逐格相同。
+
+### 8.5 `setTextFormat` 是「替换该区间」，不是「再叠一条 run」（阶段二百六十八）
+
+AIR 文档（ActionScript 3.0 语言参考，`TextField.setTextFormat`）的语义是**设置该范围内的格式**：同一区间
+施加两次 == 施加一次，把全区间格式施加在已存在的子区间格式上会**覆盖**它。我们此前每次都往 `_runs` 后面
+**追加**一条三元组（`begin`/`end`/`TextFormat`），而 `sk_textlayout_new_runs` 的循环是「按 run 顺序把
+`text[start..end)` 各拷一遍」——于是同一段字符被排了 N 遍：一个在重绘路径里重设格式的字段，宽度随重绘次数
+**线性增长**（应用侧看到的就是「输入过的字被复制了一遍」，`asaotui/probes/widgets/typing` 变异 M3 抓到）。
+
+修法（`src/emit.ts` 的 `TextField_setTextFormat`）：重建整张 run 表——完全落在新区间之前的 run 原样保留、
+横跨边界的 run **切成两半**、被覆盖的部分丢弃，新 run 插在「第一条触及 `begin` 的 run」的位置（这样表始终
+按 `start` 有序；排版循环的 `pos` 游标只会前进，乱序会让同一段文字被再排一次）；空区间与 `format == null`
+为 no-op。新表整体换上去并盖 `gc_write_barrier`，段落缓存照旧失效。
+
+判据：`adl 51.4.1` 与我们的**关系式**双端对照（`asaotui/probes/g20-settextformat/`，12 格：不比绝对值，
+因为两端文本引擎不同；同一格式对 `1111` 施加 1/2/3 次，AIR 量到 52/52/52 px，修前我们是 46.66/91.53/136.41）。
+回归：`examples/settextformat-runs.as`（12 条断言，含「反复 `BitmapData.draw` 宽度不变」与「窄区间切开长 run」）、
+`unit: text/settextformat`（15 条源级钉子，含「插入点在两半之间」这条有序性钉子）。
+
+> 未修的相邻偏差：`TextField.getTextFormat()` 仍返回 `defaultTextFormat`，不读 run 表（AIR 返回该区间
+> **生效的**格式）。同一探针的 case 10/11 把它作为**已登记偏差**持续测量（AIR `true` / 我们 `false`），
+> 在 `asaotui/compiler-gaps.md` 记为 G21（已实测·未修），本轮不夹带。
 
 ### 8.1 `flash.text.StyleSheet` 与 HTML 的**块级**模型（阶段一百四十八）
 

@@ -5620,7 +5620,13 @@ export class SymbolTable {
           gnum('focalPointRatio', 0),
         ])],
         ['drawRect', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('width', 'Number'), greq('height', 'Number')])],
-        ['drawRoundRect', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('width', 'Number'), greq('height', 'Number'), greq('ellipseWidth', 'Number'), gnum('ellipseHeight', 0)])],
+        // AIR: Graphics.drawRoundRect(x, y, width, height, ellipseWidth,
+        // ellipseHeight = NaN) — the documented default is NaN, and AIR treats a NaN
+        // ellipseHeight as "use ellipseWidth" while a NaN ellipseWidth is
+        // ArgumentError #2004 (both measured, temp/g16g19g20/RoundArgs.as). The old
+        // `gnum(..., 0)` default made the omitted-argument call a SQUARE rect: the
+        // five-argument sweep row was 0,0..39,39 against AIR's 4,2,1,1,... corner.
+        ['drawRoundRect', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('width', 'Number'), greq('height', 'Number'), greq('ellipseWidth', 'Number'), { name: 'ellipseHeight', type: 'Number', defaultValue: { kind: 'Num', value: NaN, isInt: false }, isRest: false }])],
         ['drawCircle', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('radius', 'Number')])],
         // AIR's drawEllipse(x, y, width, height): the oval inscribed in that rect.
         ['drawEllipse', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number'), greq('width', 'Number'), greq('height', 'Number')])],

@@ -997,6 +997,35 @@ Regression: the same 16 nails above cover this section's four items (the ORDER o
 `<family> <style word>` base re-spelling, uninstalled -> Times, macOS still asking CoreText). Pixel proof:
 `temp/fontprobe`'s 10 rows now match adl cell for cell.
 
+### 8.5 `setTextFormat` REPLACES a range, it does not stack another run (stage 268)
+
+The AIR reference (ActionScript 3.0 Language Reference, `TextField.setTextFormat`) defines the call as
+**setting the format of the range**: applying the same format twice equals applying it once, and a
+whole-string format **replaces** any narrower formatting already there. This build used to append a
+(begin, end, TextFormat) triple to `_runs` on every call, while the `sk_textlayout_new_runs` loop copies
+`text[start..end)` once PER run -- so the same characters were laid out N times: a field that re-applied
+its format inside a repaint path grew **linearly** with the repaint count (in the app this showed up as
+"the text I typed got copied once more"; caught by `asaotui/probes/widgets/typing` mutation M3).
+
+The fix (`TextField_setTextFormat` in `src/emit.ts`) rebuilds the table: runs entirely before the new
+range are kept, runs straddling a boundary are **split in two**, the covered part is dropped, and the new
+run is inserted where the first run that reaches past `begin` sits -- which keeps the table sorted by
+`start`. That ordering is load-bearing: the layout loop only moves a `pos` cursor forward, so an
+out-of-order run is laid out a second time. An empty range and a null format are no-ops. The fresh table
+is swapped in behind a `gc_write_barrier`, and the paragraph cache is invalidated as before.
+
+Evidence: a **relational** two-arm comparison against `adl 51.4.1` (`asaotui/probes/g20-settextformat/`,
+12 cases; absolute widths are not comparable because the two text engines differ -- one format applied
+1/2/3 times measures 52/52/52 px on AIR and measured 46.66/91.53/136.41 here before the fix).
+Regressions: `examples/settextformat-runs.as` (12 assertions, including "repeated `BitmapData.draw` does
+not change the width" and "a narrower range splits a long run") and `unit: text/settextformat` (15
+source-level pins, including the ordering pin "the insert sits between the two halves").
+
+> Adjacent deviation NOT fixed here: `TextField.getTextFormat()` still answers with `defaultTextFormat`
+> and ignores the run table (AIR returns the format **in effect** over the range). Cases 10/11 of the same
+> probe keep measuring it as a **registered deviation** (AIR `true` / ours `false`); it is logged as G21
+> (measured, unfixed) in `asaotui/compiler-gaps.md` and deliberately kept out of this stage.
+
 ### 8.1 `flash.text.StyleSheet` and HTML's **block-level** model (stage one-hundred-forty-eight)
 
 `StyleSheet` was upgraded in stage one-hundred-forty-eight from a "reports but does nothing" shell into a **real class**

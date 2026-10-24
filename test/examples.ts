@@ -37,14 +37,37 @@ mkdirSync(trashHome, { recursive: true });
 // cycle that is the difference between a guarded walk and one that runs away.
 const symHome = join(root, 'temp', 'sym-home');
 const symFx = join(symHome, 'fx');
+// WINDOWS ACCOUNT CAPABILITY, not a missing build step: creating a symlink needs
+// Developer Mode or SeCreateSymbolicLinkPrivilege, and a plain (non-elevated, non-dev-mode)
+// account gets `EPERM` on every call. This used to be fatal at MODULE LOAD, so one EPERM
+// took all ~190 example units down with it -- the suite reported nothing about the other
+// examples, which is a worse outcome than two loudly skipped units. The two units that
+// read a tree of links now skip with the reason (see SYMLINK_NEEDS_FIXTURE below); every
+// other unit is unaffected, and on any host that CAN create links (macOS CI, a Windows box
+// with Developer Mode) nothing changes.
+let symlinkSkipReason: string | null = null;
+function tryLink(target: string, path: string): void {
+  if (symlinkSkipReason !== null) return;
+  try { symlinkSync(target, path); }
+  catch (e) {
+    const code = (e as { code?: string }).code || String(e);
+    symlinkSkipReason = `this host's account cannot create symlinks (${code}): Windows needs Developer Mode
+         or SeCreateSymbolicLinkPrivilege`;
+    console.log('NOTE  unable to build the symlink fixture: ' + symlinkSkipReason);
+  }
+}
 rmSync(symFx, { recursive: true, force: true });
 mkdirSync(join(symFx, 'sub'), { recursive: true });
 writeFileSync(join(symFx, 'real.txt'), 'hello');       // 5 bytes
 writeFileSync(join(symFx, 'sub', 'inner.txt'), 'xyz'); // 3 bytes
-symlinkSync('real.txt', join(symFx, 'link-file.txt'));
-symlinkSync('sub', join(symFx, 'link-dir'));
-symlinkSync('nope', join(symFx, 'dangling'));
-symlinkSync('.', join(symFx, 'loop'));
+tryLink('real.txt', join(symFx, 'link-file.txt'));
+tryLink('sub', join(symFx, 'link-dir'));
+tryLink('nope', join(symFx, 'dangling'));
+tryLink('.', join(symFx, 'loop'));
+
+// The example units whose assertions count entries in a tree of LINKS. They need the
+// fixture above, so they are the only ones the capability gate below may skip.
+const SYMLINK_NEEDS_FIXTURE = new Set(['file-symlink.as', 'file-listing-async.as']);
 
 // The fixture that `file-listing-async.as` runs against (EXAMPLE_ENV points HOME here for
 // the same reason as file-symlink: the example reaches the tree through File.userDirectory).
@@ -66,7 +89,7 @@ mkdirSync(listingNoread, { recursive: true });
 writeFileSync(join(listingFx, 'a.txt'), 'a');
 writeFileSync(join(listingFx, 'b.txt'), 'bb');
 writeFileSync(join(listingFx, 'sub', 'inner.txt'), 'xyz');
-symlinkSync('a.txt', join(listingFx, 'link-file.txt'));
+tryLink('a.txt', join(listingFx, 'link-file.txt'));
 chmodSync(listingNoread, 0o000);
 after(() => { try { chmodSync(listingNoread, 0o755); } catch { /* already gone */ } });
 
@@ -284,6 +307,10 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   'autobake-origin.as': ['--manifest', join(dir, 'autobake-origin.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
+  // roundrect.as（阶段二百六十七 · G19）断言的也是**像素**：drawRoundRect 的两个半径必须
+  // 真的变成四条椭圆圆角（旧实现是 `(void)ew; (void)eh; drawRect(...)`）。纯 C 构建没有光栅
+  // 后端，故与 draw-over.as 一样链 Skia。
+  'roundrect.as': ['--manifest', join(dir, 'roundrect.build.json')],
   // alpha-sibling.as（阶段二百一十四）断言「半透明子件不能把父对象的位移留给同帧里
   // 之后画的东西」：Skia 的 save/restore 是一叠栈，漏一次 restore 会被父对象的 restore
   // 顶掉，于是半透明兄弟之后的**所有**内容都被平移到它的位置上。真应用里这是「拖列表
@@ -294,6 +321,10 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 「反复 `BitmapData.draw` 后字段宽度不得自噬」，两者都只在 Skia 文本后端下存在，
   // 故与 bakecrisp.as 一样链 Skia（阶段一百六十八的 autoSize/字族兜底回归）。
   'autosize-metrics.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
+  // settextformat-runs.as（阶段二百六十八 · G20）断言的是 setTextFormat 对同一范围是**替换**
+  // 而不是叠加：判据全是 Skia 文本后端下的关系式（textWidth / 墨迹宽），修前「每重绘一次就把
+  // 字符排一遍」。故与 autosize-metrics.as 共用同一份 Skia 清单。
+  'settextformat-runs.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
   // tf-scale-metrics.as 断言的是**字体度量 + 字形光栅**（缩放字段的 textWidth/textHeight 口径，
   // 以及「字形按 scaleY 整体缩放、scaleX 不拉宽」的 ink 宽），两者都只在 Skia 文本后端下存在，
   // 故与 bakecrisp.as 一样链 Skia（阶段一百六十九的缩放口径回归）。
@@ -504,6 +535,11 @@ describe(`examples (jobs=${JOBS})`, { concurrency: JOBS }, () => {
       const required = EXAMPLE_REQUIRES[e.name];
       const out = scratchOut(e.name);
       test(`example: ${e.name}`, async (t) => {
+        if (SYMLINK_NEEDS_FIXTURE.has(e.name) && symlinkSkipReason !== null) {
+          console.log(`SKIP  ${e.name} (${symlinkSkipReason})`);
+          t.skip(symlinkSkipReason);
+          return;
+        }
         if (required && !existsSync(required)) {
           console.log(`SKIP  ${e.name} (needs ${resolve(required)}, not present)`);
           t.skip(`needs ${resolve(required)}, not present`);

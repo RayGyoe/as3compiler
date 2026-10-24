@@ -18183,7 +18183,53 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('void Graphics_drawRect(void* _this, double x, double y, double w, double h) { Graphics* g = (Graphics*)_this; as_skia_path_add_rect(g->path, x, y, w, h); as_gpath_rect(g, x, y, w, h); as_gclosed(g, x, y); }');
-    this.line('void Graphics_drawRoundRect(void* _this, double x, double y, double w, double h, double ew, double eh) { (void)ew; (void)eh; Graphics_drawRect(_this, x, y, w, h); }');
+    // drawRoundRect(x, y, w, h, ellipseWidth, ellipseHeight): AIR's rounded rect.
+    // Every branch below is measured on adl 51.4.1 (temp/g16g19g20/ab-round.cjs +
+    // RoundArgs.as: 10 geometry cases x 40 rows, plus the argument matrix):
+    //   * the corner ellipse is ellipseWidth x ellipseHeight, so the radii are
+    //     (ew/2, eh/2) and they are INDEPENDENT -- ew=20, eh=10 on a 40x40 box gives
+    //     radius 10 horizontally and 5 vertically, which the sweep sees as a left
+    //     edge of 6,3,2,0,... instead of the 4,2,1,1,... of a 6/6 corner;
+    //   * each radius is clamped to half the box (ew=eh=80 on 40x40 -> 20,20);
+    //   * ellipseHeight may be NaN or omitted (the AS3 default IS NaN) and then takes
+    //     ellipseWidth's value; ellipseWidth NaN is ArgumentError #2004;
+    //   * a negative w/h is the same box mirrored (normalized like drawEllipse);
+    //   * a NEGATIVE radius is not what it looks like: AIR accepts it and inks OUTSIDE
+    //     the box (measured: ew=-8 on 40x40 inks x -2..41 on the first row), which is
+    //     its cubic corners self-intersecting, not a documented shape. We clamp to a
+    //     square corner instead -- the only reading of a negative radius that has a
+    //     defined geometry. This is the ONE place drawRoundRect differs from AIR, it
+    //     is reported in asaotui/compiler-gaps.md G19 and pinned as a known deviation
+    //     in temp/g16g19g20/ab-round.cjs.
+    this.line('void Graphics_drawRoundRect(void* _this, double x, double y, double w, double h, double ew, double eh) {');
+    this.indent++;
+    this.line('Graphics* g = (Graphics*)_this;');
+    this.line('if (isnan(ew)) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }');
+    this.line('if (isnan(eh)) eh = ew;');
+    this.line('if (w < 0) { x += w; w = -w; }');
+    this.line('if (h < 0) { y += h; h = -h; }');
+    this.line('double rx = ew * 0.5, ry = eh * 0.5;');
+    // Clamp the magnitude (which also tames +inf); a negative radius becomes 0.
+    this.line('if (rx < 0) rx = 0;');
+    this.line('if (ry < 0) ry = 0;');
+    this.line('if (rx > w * 0.5) rx = w * 0.5;');
+    this.line('if (ry > h * 0.5) ry = h * 0.5;');
+    this.line('if (rx == 0.0 || ry == 0.0 || w == 0.0 || h == 0.0) {');
+    this.indent++;
+    this.line('as_skia_path_add_rect(g->path, x, y, w, h);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('as_skia_path_add_rrect(g->path, x, y, w, h, rx, ry);');
+    this.indent--;
+    this.line('}');
+    // Bounds and pen follow drawRect: the declared rectangle is the shape's extent
+    // (the negative-radius bulge is rasterizer ink, not part of the declared box), and
+    // the pen rests where the top edge starts.
+    this.line('as_gpath_rect(g, x, y, w, h);');
+    this.line('as_gclosed(g, x + rx, y);');
+    this.indent--;
+    this.line('}');
     this.line('void Graphics_drawCircle(void* _this, double x, double y, double r) { Graphics* g = (Graphics*)_this; as_skia_path_add_circle(g->path, x, y, r); as_gpath_rect(g, x - r, y - r, 2.0 * r, 2.0 * r); as_gclosed(g, x - r, y); }');
     // drawEllipse(x, y, width, height): the oval inscribed in that rectangle (AIR,
     // Flash Player 10+). A negative width/height mirrors the rectangle, which for a
@@ -20422,10 +20468,55 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (begin < 0) begin = 0;');
     this.line('if (end < 0 || end > len) end = len;');
     this.line('if (begin > end) { int t = begin; begin = end; end = t; }');
-    this.line('if (tf->_runs == NULL) tf->_runs = as_array_new();');
-    this.line('as_array_push(tf->_runs, as_v_num((double)begin));');
-    this.line('as_array_push(tf->_runs, as_v_num((double)end));');
-    this.line('as_array_push(tf->_runs, as_v_obj((void*)format));');
+    // setTextFormat REPLACES the formatting of the range; it does not stack a second
+    // one on top (ActionScript 3.0 reference, TextField.setTextFormat: "sets the
+    // format of the text in the range"). This used to append a run unconditionally,
+    // and _runs is a flat table of (begin, end, TextFormat) triples that
+    // sk_textlayout_new_runs walks while it COPIES text[start..end) once per run --
+    // so a range formatted twice laid its characters out twice. Measured against adl
+    // 51.4.1 (asaotui/probes/g20-settextformat, relational cases only, because the
+    // two engines' absolute metrics differ): one format applied 1/2/3 times to
+    // "1111" measures 52/52/52 px on AIR and used to measure 46.66/91.53/136.41
+    // here, i.e. a repaint path that re-applied its format grew the field linearly
+    // (reported as "the typed text got copied once more"). Rebuilding the table also
+    // HEALS a field that already accumulated duplicates.
+    //
+    // The rebuild has to keep the table sorted by start: the layout loop carries a
+    // `pos` cursor forward and only copies gaps when s > pos, so an out-of-order run
+    // would be laid out AND duplicated. Hence the insert point is "the first existing
+    // run that reaches past `begin`", placed between that run's two halves.
+    this.line('if (begin >= end) return;');
+    this.line('as_array* out = as_array_new();');
+    this.line('int n = (tf->_runs != NULL) ? tf->_runs->length / 3 : 0;');
+    this.line('int placed = 0;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('int b = as_v_int_val(tf->_runs->data[i * 3]);');
+    this.line('int e = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
+    this.line('as_value f = tf->_runs->data[i * 3 + 2];');
+    this.line('if (e <= begin) { as_array_push(out, as_v_num((double)b)); as_array_push(out, as_v_num((double)e)); as_array_push(out, f); continue; }');
+    this.line('if (b < begin) { as_array_push(out, as_v_num((double)b)); as_array_push(out, as_v_num((double)begin)); as_array_push(out, f); }');
+    this.line('if (!placed) {');
+    this.indent++;
+    this.line('as_array_push(out, as_v_num((double)begin));');
+    this.line('as_array_push(out, as_v_num((double)end));');
+    this.line('as_array_push(out, as_v_obj((void*)format));');
+    this.line('placed = 1;');
+    this.indent--;
+    this.line('}');
+    this.line('if (b >= end) { as_array_push(out, as_v_num((double)b)); as_array_push(out, as_v_num((double)e)); as_array_push(out, f); continue; }');
+    this.line('if (e > end) { as_array_push(out, as_v_num((double)end)); as_array_push(out, as_v_num((double)e)); as_array_push(out, f); }');
+    this.indent--;
+    this.line('}');
+    this.line('if (!placed) {');
+    this.indent++;
+    this.line('as_array_push(out, as_v_num((double)begin));');
+    this.line('as_array_push(out, as_v_num((double)end));');
+    this.line('as_array_push(out, as_v_obj((void*)format));');
+    this.indent--;
+    this.line('}');
+    this.line('tf->_runs = out;');
+    this.line('gc_write_barrier((void*)out);');
     this.line('tf->_runs_gen++;');
     this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL;');
     this.indent--;
@@ -29905,6 +29996,32 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
       return a;
     }
     if (a.kind === 'string' || b.kind === 'string') return { kind: 'string' };
+    // A null literal joined with a value: the null LITERAL is just a value, so the
+    // condition alone decides which arm runs and the result must be able to hold
+    // either one (AS3 language reference, conditional operator). Falling through
+    // to the `return a` fallback below typed the whole ternary `null` whenever the
+    // null sat in the THEN slot, and `convert` then emitted the null branch as a
+    // constant -- `x == null ? null : Bitmap(x)` returned NULL, `? null : 42`
+    // returned 0, `? null : true` returned false (compiler-gaps G16; the String
+    // arm was immune only because the rule above fires first).
+    //   * Pointer-shaped families already carry null as NULL, so the concrete type
+    //     is kept -- that is what keeps case 2 (`? Bitmap(x) : null`) working and
+    //     what makes the THEN-null cases return the live object.
+    //   * Numbers and booleans have NO null in their C representation: honouring the
+    //     null arm needs a box, otherwise `cond ? null : 5` would answer 0 when the
+    //     condition is TRUE. `any` is the one type that can hold both arms -- and a
+    //     `*` on the other side is that same boxed slot (`box.list[0]`), so it wins
+    //     over the concrete type here; keeping `null` instead was what made case 8
+    //     of the probe still answer NULL.
+    // This rule sits BEFORE the `any` rule so `null : <any>` lands on the box too.
+    if (a.kind === 'null' || b.kind === 'null') {
+      const other = a.kind === 'null' ? b : a;
+      const scalar = other.kind === 'int' || other.kind === 'uint' || other.kind === 'int64'
+        || other.kind === 'uint64' || other.kind === 'number' || other.kind === 'bool'
+        || other.kind === 'any';
+      if (other.kind === 'void') return a;  // `cond ? null : voidCall()` has no value either way
+      return scalar ? { kind: 'any' } : other;
+    }
     if (a.kind === 'any' || b.kind === 'any') {
       if (a.kind === 'any' && b.kind === 'any') return { kind: 'any' };
       // `any` unboxes to the concrete branch's type at runtime (e.g. a record
