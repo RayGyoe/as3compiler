@@ -12,7 +12,8 @@ import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
 import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
-import { airManifest, prepareAirApp, parseAirApp } from '../../src/air-app.ts';
+import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
+import type { GpuBackend } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
@@ -2402,6 +2403,166 @@ function checkAirAppOffscreenLinkSet(): string[] {
 }
 
 registerGroup('unit: air-app/OffscreenLinkSet', checkAirAppOffscreenLinkSet);
+
+// --- GPU window backend selection (`--gpu-backend` / manifest `gpu-backend`) ---
+// Pins the three ways this switch can be wrong, in the order they can happen:
+//   1. it does not actually swap anything (a build that ignores the flag looks
+//      honoured and composites exactly like the default);
+//   2. a combination that cannot work is accepted instead of refused (web,
+//      non-Windows, no GPU window, Stage3D — all four are refuses by name);
+//   3. the choice does not survive manifest regeneration, which is the only reason
+//      it is persisted at all — and `auto` must clear it.
+// `ASC_GPU_BACKEND` is the prototype-era alias: kept, lowest precedence, and it
+// says so when it loses.
+function checkGpuBackend(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [gpu-backend] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [gpu-backend] ${label}`); }
+  };
+  const realPlatform = process.platform;
+  const asWin = <T>(fn: () => T): T => {
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try { return fn(); } finally {
+      Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+    }
+  };
+  const man = (backend: GpuBackend, o: { renderMode?: string; web?: boolean; stage3d?: boolean } = {}): Record<string, unknown> =>
+    airManifest('vendor', true, true, true, o.web === true, o.renderMode ?? 'direct', o.stage3d === true, false,
+      [], [], [], [], false, false, '64', [], undefined, backend) as Record<string, unknown>;
+  const thrown = (fn: () => void): string => {
+    try { fn(); return ''; } catch (e) { return (e as Error).message; }
+  };
+  const defs = (m: Record<string, unknown>): string[] => (m['defines'] as string[]) ?? [];
+  const srcs = (m: Record<string, unknown>): string[] => (m['sources'] as string[]) ?? [];
+  const libs = (m: Record<string, unknown>): string[] => (m['link-libs'] as string[]) ?? [];
+
+  // (1) The switch really swaps the backend, and `auto` is the pre-existing line.
+  const auto = asWin(() => man('auto'));
+  const gl = asWin(() => man('gl'));
+  const d3d = asWin(() => man('d3d12'));
+  check('auto and d3d12 are the same D3D12 build (naming it changes nothing)',
+    JSON.stringify(auto['defines']) === JSON.stringify(d3d['defines'])
+    && JSON.stringify(auto['sources']) === JSON.stringify(d3d['sources'])
+    && JSON.stringify(auto['link-libs']) === JSON.stringify(d3d['link-libs']));
+  check('auto links the D3D12 glue and its two import libraries, not opengl32',
+    srcs(auto).some((s) => s.endsWith('d3d_glue.cc')) && !srcs(auto).some((s) => s.endsWith('gl_glue.cc'))
+    && libs(auto).includes('d3d12') && libs(auto).includes('dxgi') && !libs(auto).includes('opengl32'));
+  check('gl swaps in the WGL glue, its define and opengl32',
+    srcs(gl).some((s) => s.endsWith('gl_glue.cc')) && !srcs(gl).some((s) => s.endsWith('d3d_glue.cc'))
+    && defs(gl).includes('ASC_RENDER_WINGPU=1') && defs(gl).includes('ASC_RENDER_GL=1')
+    && !defs(gl).includes('ASC_RENDER_D3D=1') && libs(gl).includes('opengl32'));
+  check('...and records the choice, while auto records nothing',
+    gl['gpu-backend'] === 'gl' && auto['gpu-backend'] === undefined && d3d['gpu-backend'] === 'd3d12');
+  check('the shared GPU-window define is backend-neutral (both builds carry it)',
+    defs(gl).includes('ASC_RENDER_WINGPU=1') && defs(auto).includes('ASC_RENDER_WINGPU=1'));
+
+  // (2) Every impossible combination is refused by name.
+  const webMsg = thrown(() => man('gl', { web: true }));
+  check('a web build refuses a native backend name, and says why',
+    /web build/.test(webMsg) && /WebGL2/.test(webMsg));
+  const stageMsg = thrown(() => man('gl', { stage3d: true }));
+  check('Stage3D + gl is refused before it can become a black stage',
+    /no Stage3D backend/.test(stageMsg) && /stage3d_d3d\.cc/.test(stageMsg));
+  const autoModeMsg = thrown(() => man('gl', { renderMode: 'auto' }));
+  check('a descriptor that compiles no GPU backend refuses the flag (auto/cpu)',
+    /does not ask for one/.test(autoModeMsg) && /renderMode>direct/.test(autoModeMsg));
+  const cpuModeMsg = thrown(() => man('gl', { renderMode: 'cpu' }));
+  check('...cpu too (the check is "is a GPU window compiled in", not "is it auto")',
+    /does not ask for one/.test(cpuModeMsg));
+  // The non-Windows refusal cannot be exercised on a Windows host without faking,
+  // so it is faked: this is the one branch the macOS CI runner WOULD hit for real.
+  const darwinMsg = (() => {
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    try { return thrown(() => man('gl')); } finally {
+      Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+    }
+  })();
+  check('a non-Windows host refuses both names (macOS has Metal, not a choice)',
+    /Windows-only/.test(darwinMsg) && /metal_glue\.mm/.test(darwinMsg));
+  const typoMsg = thrown(() => parseGpuBackend('glx'));
+  check('a typo lists the real names instead of falling back to auto',
+    /unknown GPU backend 'glx'/.test(typoMsg) && /auto, d3d12, gl/.test(typoMsg));
+  check('the name is case- and space-insensitive (a shell cannot be trusted)',
+    parseGpuBackend(' GL ') === 'gl' && parseGpuBackend('D3D12') === 'd3d12');
+
+  // (3) Persistence: one `--gpu-backend gl` sticks across regenerations.
+  const appDir = join(root, 'temp', 'gpu-backend-app');
+  mkdirSync(join(appDir, 'src'), { recursive: true });
+  writeFileSync(join(appDir, 'app.xml'),
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<application xmlns="http://ns.adobe.com/air/application/51.0">\n' +
+    '  <id>temp.gpu.backend</id><versionNumber>1.0</versionNumber><filename>gpu-backend</filename>\n' +
+    '  <initialWindow><content>main.swf</content><width>400</width><height>300</height>\n' +
+    '    <renderMode>direct</renderMode></initialWindow>\n</application>\n');
+  writeFileSync(join(appDir, 'src', 'Main.as'),
+    'package {\n  import flash.display.Sprite;\n  public class Main extends Sprite {}\n}\n');
+  const appXml = join(appDir, 'app.xml');
+  const vendorAbs = resolve(root, 'vendor');
+  const prep = (b: GpuBackend | null): Prepared => asWin(() =>
+    prepareAirApp(appXml, 'Main', vendorAbs, false, null, null, false, [], [], b));
+  type Prepared = { manifestPath: string; warnings: string[] };
+  const readBack = (p: Prepared): Record<string, unknown> => JSON.parse(readFileSync(p.manifestPath, 'utf8')) as Record<string, unknown>;
+
+  const first = prep('gl');
+  check('--gpu-backend gl writes the choice into the generated manifest',
+    readBack(first)['gpu-backend'] === 'gl' && defs(readBack(first)).includes('ASC_RENDER_GL=1'));
+  check('...and the NEXT run keeps it without repeating the flag',
+    readBack(prep(null))['gpu-backend'] === 'gl');
+  const cleared = prep('auto');
+  check('--gpu-backend auto clears it (absent = auto, so it cannot go stale)',
+    readBack(cleared)['gpu-backend'] === undefined && defs(readBack(cleared)).includes('ASC_RENDER_D3D=1'));
+
+  // The environment alias: honoured where nothing is pinned, reported when it loses.
+  const savedEnv = process.env.ASC_GPU_BACKEND;
+  try {
+    process.env.ASC_GPU_BACKEND = 'gl';
+    check('ASC_GPU_BACKEND still selects a backend when nothing is pinned',
+      readBack(prep(null))['gpu-backend'] === 'gl');
+    const pinned = prep('d3d12');
+    check('...but never overrides a pinned value', readBack(pinned)['gpu-backend'] === 'd3d12');
+    check('...and says out loud that it was ignored, naming the flag that won',
+      pinned.warnings.some((w) => /ASC_GPU_BACKEND=gl is ignored/.test(w) && /--gpu-backend was given/.test(w)));
+    // Same conflict with no flag in sight: the message must name the FILE, since
+    // that is the thing the user has to edit.
+    const pinnedOnly = prep(null);
+    check('...or the manifest that pinned it, when there is no flag to blame',
+      readBack(pinnedOnly)['gpu-backend'] === 'd3d12'
+      && pinnedOnly.warnings.some((w) => /ASC_GPU_BACKEND=gl is ignored/.test(w) && /pins gpu-backend d3d12/.test(w)));
+    const badEnv = (() => {
+      process.env.ASC_GPU_BACKEND = 'nope';
+      try { return thrown(() => prep(null)); } finally { process.env.ASC_GPU_BACKEND = 'gl'; }
+    })();
+    check('a bad value in the alias is an error, not a silent auto', /unknown GPU backend 'nope'/.test(badEnv));
+  } finally {
+    if (savedEnv === undefined) delete process.env.ASC_GPU_BACKEND;
+    else process.env.ASC_GPU_BACKEND = savedEnv;
+  }
+  // (4) The manifest field is VERIFIED, never re-derived: a hand edit that
+  // disagrees with `defines` has to fail, because otherwise one side silently wins
+  // and the user who edited the field believes they changed the backend.
+  const apply = (extra: Record<string, unknown>): string => thrown(() => {
+    applyManifest(defaultBuildConfig(), extra as unknown as Manifest, join(appDir, 'hand.json'));
+  });
+  check('a manifest whose backend matches its defines is accepted',
+    apply({ 'gpu-backend': 'gl', defines: ['ASC_RENDER_GL=1'] }) === ''
+    && apply({ 'gpu-backend': 'auto' }) === '');
+  const noMacro = apply({ 'gpu-backend': 'gl', defines: ['ASC_RENDER_D3D=1'] });
+  check('a backend the defines do not carry is an error naming the macro',
+    /does not carry ASC_RENDER_GL/.test(noMacro) && /--gpu-backend gl/.test(noMacro));
+  const twoMacros = apply({ 'gpu-backend': 'gl', defines: ['ASC_RENDER_GL=1', 'ASC_RENDER_D3D=1'] });
+  check('two window GPU backends in one binary is an error, not last-wins',
+    /also carries ASC_RENDER_D3D/.test(twoMacros) && /one window GPU backend/.test(twoMacros));
+  const badField = apply({ 'gpu-backend': 'glx' });
+  check('an unknown backend name in a manifest is an error too',
+    /'gpu-backend' must be "auto", "d3d12" or "gl"/.test(badField));
+
+  check('the platform fake was undone', process.platform === realPlatform);
+  console.log(`     [gpu-backend] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: air-app/GpuBackend', checkGpuBackend);
 // --- vendor/skia 本地补丁的出处守卫（阶段一百六十七）------------------------
 // The macOS arm64 libskia.a we ship is NOT the upstream prebuilt: it is compiled
 // from build-tools/skia-src with the patch below applied. Nothing in this repo can

@@ -287,6 +287,25 @@ function checkArgErrors(): string[] {
       legit.code === 0 && legit.out.includes('-O3') && legit.out.includes('FOO=-1'));
   });
 
+  // ---- --gpu-backend: a name that means nothing must not build something ----
+  // Three ways to get it wrong, each answered by name rather than by building the
+  // default and looking honoured (§2.5).
+  const noApp = run(['x.as', '--gpu-backend', 'gl']);
+  check('--gpu-backend without --air-app is refused (it would change nothing)',
+    noApp.err.includes('only applies to --air-app') && noApp.code === 1);
+  // `--flag=value` is not this tool's spelling anywhere, and the suggestion
+  // machinery sees only the whole token -- so the token needs its own answer.
+  const eqForm = run(['x.as', '--air-app', 'a.xml', '--gpu-backend=gl']);
+  check('`--gpu-backend=gl` is answered with the real spelling, not "unknown flag"',
+    eqForm.err.includes('--gpu-backend gl') && eqForm.err.includes("a space, not '='"));
+  const typo = run(['x.as', '--air-app', 'a.xml', '--gpu-backend', 'glx']);
+  check('an unknown backend name lists the real ones',
+    typo.err.includes("unknown GPU backend 'glx'") && typo.err.includes('auto, d3d12, gl'));
+  // ...and it is parsed before the descriptor is ever read, so a nonsense name is
+  // reported as a naming problem rather than as a missing file.
+  check('...before the descriptor is read (no file-not-found noise)',
+    !typo.err.includes('a.xml') && typo.code === 1);
+  check('the help documents it', run(['--help']).out.includes('--gpu-backend <b>'));
   // ---- one list, read by both features ----------------------------------
   // The suggestion and the missing-value check share KNOWN_FLAGS. A second copy
   // would drift from the parser the first time a flag is added, and the failure

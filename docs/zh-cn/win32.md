@@ -397,12 +397,47 @@ Windows-on-ARM 上**非 AIR 的产物**（不走 `--air-app` 的普通 `as-aot` 
 
 | 描述符 | 宏 | 额外源 | 额外链接 | 语义 |
 |---|---|---|---|---|
-| `direct` / `gpu` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_D3D=1` | `d3d_glue.cc` | `d3d12` `dxgi` `d3dcompiler` `d3d12allocator` | 每帧整帧 GPU 合成（D3D12） |
+| `direct` / `gpu` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_D3D=1` | `d3d_glue.cc` | `d3d12` `dxgi` `d3dcompiler` `d3d12allocator` | 每帧整帧 GPU 合成（D3D12，**缺省**） |
+| `direct` / `gpu` + `--gpu-backend gl` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_GL=1` | `gl_glue.cc` | 同上 **+** `opengl32` | 每帧整帧 GPU 合成（WGL/OpenGL，§3.1.1） |
 | `cpu` / `auto` | — | — | — | CPU 光栅 + SDL streaming texture blit |
 
 macOS 专属的 `metal_glue.mm` / `objc` / Cocoa `framework` 项在 Windows 上全部去掉；
 `src/build.ts` 的 `-lm`/`-lz` 在 win32 归零（`m.lib`/`z.lib` 在 Windows 不存在）；
 `AS_HAVE_ICONV=0`（`<iconv.h>` 不在 CRT 里，非 UTF 字符集**响亮**抛错，与 wasm 口径一致）。
+
+### 3.1.1 第二个窗口后端：WGL/OpenGL（`--gpu-backend gl`）
+
+D3D12 是**平台下限**问题：它要求 Win10 1507 + WDDM 2.0 + FL 11_0（`vendor/d3d_glue.cc` 只用 RTM API），
+Win7 上无解。而 WGL 从 Vista 起就在系统里。所以除了「能不能不依赖 D3D12」这个平台问题，还有一个
+**能不能只用系统自带的东西**的问题——这一节就是后者的落地。
+
+| 项 | D3D12 | WGL |
+|---|---|---|
+| 上下文创建 | `D3D12CreateDevice` + 每窗 3 帧槽交换链 | `wglCreateContext`（**刻意 compat profile**，见下）+ `SwapBuffers` |
+| 交换模型 | `FLIP_DISCARD`（Win10+ 唯一能进 independent flip 的） | blt 模型，窗口模式**必经 DWM 合成** |
+| Skia 接入 | `GrDirectContexts::MakeDirect3D` | `GrDirectContexts::MakeGL` + `GrGLMakeNativeInterface` |
+| 后端表面 | `GrD3DBackendSurfaceInfo` | FBO 0 + `GR_GL_RGBA8` + `kBottomLeft`（套 Skia 自己的 `GLWindowContext` 契约） |
+| 运行期依赖 | `d3d12.dll` / `dxgi.dll` / `d3dcompiler_47.dll` | `opengl32.dll`（系统自带） |
+
+**为什么刻意用 compat profile**：AGAL→GLSL 生成器输出的是 **ES 1.00**（`attribute`/`varying`/`texture2D`，
+无 `#version`），core profile 下这些当场失效。要升到 core 得改那份 **web 共用的**生成器，回归面比一个
+窗口后端大得多。同理没走 ARB 的 `wglChoosePixelFormatARB`：传统 `ChoosePixelFormat` 在每台机器上都有。
+
+**为什么它**还不是**默认**：换后端提不了帧率（实测数据见 [`compile.md`](compile.md) §3.4.6 的表：
+三后端帧时都是 42.00 ms，GL 省下的是 1.1–1.3 ms/帧的**提交路径**），而风险不是 0（present 模型更贵、
+老驱动/远程桌面未测、Stage3D 没有 GL 后端）。所以 `auto` 的**回退顺序**是 `D3D12 → GL → CPU`，删掉
+D3D12 得等 GL 在每台机器上都不劣于它、且代码净减之后。
+
+**一条容易弄错的链接事实**：`gl` 构建**仍**需要 `d3d12`/`dxgi`/`d3dcompiler` 三个导入库。原因是
+`vendor/skia/lib/windows-x64/skia.lib` 是按 `skia_use_direct3d=true` 编的，`GrDirectContexts::MakeGL` 与
+`MakeDirect3D` 落在**同一个 TU**，拉一个就带进另一个的符号。但 `/OPT:REF` 之后产物**导入表是干净的**：
+实测只有 `OPENGL32` + 系统 DLL，不含 `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`，subsystem 6.0。
+⇒ **链接期依赖 ≠ 运行期依赖**：这条同样适用于 Win7 —— 「编得过」不等于「链得干净」。
+
+**未测项照实列**：只在 Win11 26200 + RTX 4090 D（`4.6.0 NVIDIA 610.88`）+ 单显示器上跑过；
+Intel/AMD 老驱动、远程桌面、虚拟机下的 WGL 行为、compat profile 下 `glTexStorage2D` 之类快路径的
+可用性、以及 present 的实际合成延迟（需抓帧工具）**均未测**。Stage3D + GL 是**构建期拒绝**，
+不是「跑起来差一点」。
 
 ### 3.2 `-l` 名：Windows 归档**没有** `lib` 前缀
 
@@ -428,7 +463,8 @@ ASC_RENDER_WINGPU=1, ASC_RENDER_D3D=1, ASC_HAVE_CURL=1`。64 位只换三处 ven
 ### 3.3 后端中立的 GPU seam
 
 `ASC_RENDER_WINGPU` 的含义是**「本窗口的 Skia 合成跑在 GPU 上」**，具体后端由
-`ASC_RENDER_METAL`(macOS) / `ASC_RENDER_D3D`(Windows) 指名（`ASC_RENDER_GPU` 已被 web 的 Ganesh 路径占用）。
+`ASC_RENDER_METAL`(macOS) / `ASC_RENDER_D3D` 或 `ASC_RENDER_GL`(Windows，§3.1.1) 指名
+（`ASC_RENDER_GPU` 已被 web 的 Ganesh 路径占用）。
 生成 C 与 runtime 只用中性名：`sk_gpu_init` / `sk_gpu_destroy` / `sk_gpu_begin_frame` / `sk_gpu_flush` /
 `sk_gpu_draw_texture`、`sk_window_show_gpu`、`as_skia_gpu_*`、`w->is_gpu`。**唯一**出现后端分支的地方是
 `vendor/window_glue.cc`（`sk_attach_gpu` 按宏分派、`sk_window_show_gpu` 按宏实现），所以同一条 AS3
@@ -809,7 +845,11 @@ interface (UI) language…used for all menus, dialog boxes, error messages, and 
 **不含 user32 静态依赖** / 理由留档）+ `examples/stage65.as`（Windows 上断言 `os` 能 `split(" ")` 出非空版本号，
 macOS 自动跳过）。
 
-## 4. 运行形态（D3D12 直连）
+## 4. 运行形态（D3D12 直连，缺省）
+
+> WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +
+> 每帧 begin/flush」，只是进程级是 `wglCreateContext` + `GrGLMakeNativeInterface`、窗口级是 FBO 0、
+> 每帧末是 `SwapBuffers` 而不是 fence + `Present`。下文只说 D3D12 这条（它才是缺省路径）。
 
 `vendor/d3d_glue.cc` 与 `vendor/metal_glue.mm` **结构同形**（一帧的目标是一次性资源，只有 begin/draw/present
 循环），差别只在「一次性资源」是什么：

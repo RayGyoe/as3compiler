@@ -448,12 +448,52 @@ and the **step-by-step procedure for migrating an existing ANE into AOT** are in
 
 | Descriptor | Macros | Extra source | Extra link | Semantics |
 |---|---|---|---|---|
-| `direct` / `gpu` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_D3D=1` | `d3d_glue.cc` | `d3d12` `dxgi` `d3dcompiler` `d3d12allocator` | full-frame GPU compositing per frame (D3D12) |
+| `direct` / `gpu` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_D3D=1` | `d3d_glue.cc` | `d3d12` `dxgi` `d3dcompiler` `d3d12allocator` | full-frame GPU compositing per frame (D3D12, **the default**) |
+| `direct` / `gpu` + `--gpu-backend gl` | `ASC_RENDER_WINGPU=1` `ASC_RENDER_GL=1` | `gl_glue.cc` | the same **+** `opengl32` | full-frame GPU compositing per frame (WGL/OpenGL, §3.1.1) |
 | `cpu` / `auto` | — | — | — | CPU raster + SDL streaming texture blit |
 
 The macOS-only `metal_glue.mm` / `objc` / Cocoa `framework` entries are all dropped on Windows; `src/build.ts`'s
 `-lm`/`-lz` go to zero on win32 (`m.lib`/`z.lib` do not exist on Windows); `AS_HAVE_ICONV=0` (`<iconv.h>` is
 not in the CRT, so non-UTF charsets **loudly** throw, the same contract as wasm).
+
+### 3.1.1 The Second Window Backend: WGL/OpenGL (`--gpu-backend gl`)
+
+D3D12 is a **platform-floor** problem: it needs Win10 1507 + WDDM 2.0 + FL 11_0 (`vendor/d3d_glue.cc` only uses
+RTM APIs), and there is no answer for it on Win7. WGL, on the other hand, has shipped since Vista. So beyond
+"can we avoid depending on D3D12", there is a second question — "can we get by with only what the OS ships" —
+and this section is the answer to that one.
+
+| Item | D3D12 | WGL |
+|---|---|---|
+| Context creation | `D3D12CreateDevice` + a 3-slot swap chain per window | `wglCreateContext` (**deliberately a compat profile**, see below) + `SwapBuffers` |
+| Swap model | `FLIP_DISCARD` (the only Win10+ model that reaches independent flip) | the blt model, so windowed mode **always goes through DWM compositing** |
+| Skia hookup | `GrDirectContexts::MakeDirect3D` | `GrDirectContexts::MakeGL` + `GrGLMakeNativeInterface` |
+| Backend surface | `GrD3DBackendSurfaceInfo` | FBO 0 + `GR_GL_RGBA8` + `kBottomLeft` (Skia's own `GLWindowContext` contract) |
+| Runtime deps | `d3d12.dll` / `dxgi.dll` / `d3dcompiler_47.dll` | `opengl32.dll` (ships with the OS) |
+
+**Why deliberately a compat profile**: the AGAL→GLSL generator emits **ES 1.00** (`attribute`/`varying`/`texture2D`,
+no `#version`), which stops working immediately under a core profile. Upgrading to core means touching that
+generator **shared with the web backend**, a far larger regression surface than one window backend. For the same
+reason it does not go through ARB's `wglChoosePixelFormatARB`: the legacy `ChoosePixelFormat` exists everywhere.
+
+**Why it is** not **the default (yet)**: switching backends does not raise the frame rate (measured table in
+[`compile.md`](compile.md) §3.4.6: all three backends sit at 42.00 ms, and GL saves 1.1–1.3 ms/frame of
+**submission path**), and the risk is not zero (a pricier present model, untested old drivers / Remote Desktop,
+no GL backend for Stage3D). So `auto`'s **fallback order** is `D3D12 → GL → CPU`, and deleting D3D12 has to wait
+until GL is no worse than it on every machine and the code is a net reduction.
+
+**One link fact that is easy to get wrong**: a `gl` build **still** needs the `d3d12`/`dxgi`/`d3dcompiler` import
+libraries. The reason is that `vendor/skia/lib/windows-x64/skia.lib` is built with `skia_use_direct3d=true`, and
+`GrDirectContexts::MakeGL` sits in the **same TU** as `MakeDirect3D`, so pulling one drags in the other's symbols.
+After `/OPT:REF` though, the artifact's **import table is clean**: measured, it lists only `OPENGL32` + system
+DLLs, with no `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`, subsystem 6.0. ⇒ **a link-time dependency is not a
+runtime dependency**, and the same distinction applies to the Win7 question — “it compiles” is not “it links
+clean”.
+
+**Untested items, listed as such**: only run on Win11 26200 + RTX 4090 D (`4.6.0 NVIDIA 610.88`) + a single
+display; WGL behaviour on old Intel/AMD drivers, Remote Desktop and VMs, the availability of fast paths like
+`glTexStorage2D` under a compat profile, and the real compositing latency of present (needs a frame-capture tool)
+are **all untested**. Stage3D + GL is a **build-time refusal**, not “runs a bit worse”.
 
 ### 3.2 `-l` Names: Windows Archives Have **No** `lib` Prefix
 
@@ -480,8 +520,8 @@ ASC_RENDER_WINGPU=1, ASC_RENDER_D3D=1, ASC_HAVE_CURL=1`. For 64-bit, only three 
 ### 3.3 The Backend-Neutral GPU Seam
 
 `ASC_RENDER_WINGPU` means **"this window's Skia compositing runs on the GPU"**, and the concrete backend is
-named by `ASC_RENDER_METAL` (macOS) / `ASC_RENDER_D3D` (Windows) (`ASC_RENDER_GPU` is already taken by web's
-Ganesh path). The generated C and runtime use only neutral names: `sk_gpu_init` / `sk_gpu_destroy` /
+named by `ASC_RENDER_METAL` (macOS) / `ASC_RENDER_D3D` or `ASC_RENDER_GL` (Windows, §3.1.1) (`ASC_RENDER_GPU` is
+already taken by web's Ganesh path). The generated C and runtime use only neutral names: `sk_gpu_init` / `sk_gpu_destroy` /
 `sk_gpu_begin_frame` / `sk_gpu_flush` / `sk_gpu_draw_texture`, `sk_window_show_gpu`, `as_skia_gpu_*`, `w->is_gpu`.
 The **only** place a backend branch appears is `vendor/window_glue.cc` (`sk_attach_gpu` dispatches by macro, and
 `sk_window_show_gpu` is implemented by macro), so the same AS3 source differs between the two ends only in the
@@ -916,7 +956,12 @@ Pins: `unit: platform/CapabilitiesOs` (all 18 returnable names present / the `bu
 `wProductType` split / **no static user32 dependency** / the rationale on record) and `examples/stage65.as` (on
 Windows it asserts `os` splits into a non-empty version token; macOS skips it automatically).
 
-## 4. Runtime Form (D3D12 Direct)
+## 4. Runtime Form (D3D12 Direct, the Default)
+
+> The WGL file (`vendor/gl_glue.cc`, §3.1.1) is **isomorphic** to this one: also “a process-level
+> `GrDirectContext` + a window-level surface + begin/flush per frame”, except the process level is
+> `wglCreateContext` + `GrGLMakeNativeInterface`, the window level is FBO 0, and each frame ends with
+> `SwapBuffers` rather than a fence + `Present`. What follows covers the D3D12 one (the default path).
 
 `vendor/d3d_glue.cc` and `vendor/metal_glue.mm` are **structurally isomorphic** (a frame's target is one-shot
 resources, with only a begin/draw/present loop); the difference is only in what the "one-shot resources" are:

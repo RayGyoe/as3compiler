@@ -432,6 +432,45 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
   return lines.join('\n');
 }
 
+// ---- GPU window backend (--gpu-backend) ---------------------------------------
+//
+// Which native API composites the window. `auto` is the behaviour every build had
+// before this switch existed: the platform's own backend, D3D12 on Windows and
+// Metal on macOS. The other two names exist for one reason — D3D12 cannot run
+// below Windows 10 1507 (WDDM 2.0 + feature level 11_0 are hard requirements of
+// device creation), while `gl` goes through the WGL context opengl32.dll has
+// provided since XP, which makes it the only GPU-accelerated option on Windows
+// 7/8.x. See the header of vendor/gl_glue.cc for what that costs.
+//
+// This is deliberately NOT read from app.xml. AIR's descriptor offers no extension
+// point at all: <windows> is an xs:all of UseWebView2/maxD3D/localAppData/
+// useDirectDrawFonts (Descriptor.51.4.xsd:435) and the schema has no xs:any
+// anywhere, so `adt -package` refuses any extra element BY NAME — measured:
+// `<windows><gpuBackend>gl</gpuBackend></windows>` yields
+// `error 103: application.windows.gpuBackend is an unexpected element/attribute`,
+// and a foreign-namespace element or attribute is refused the same way
+// (temp/descext/, all four variants). `adl` stays silent, which is NOT schema
+// acceptance but adl's own hand-rolled subset check: it also accepts
+// `<maxD3D>abc</maxD3D>`, which adt rejects as error 105. Since one descriptor
+// usually has to package for real AIR as well, the choice travels in the
+// generated build manifest (`gpu-backend`) instead, which AIR never reads.
+export const GPU_BACKENDS = ['auto', 'd3d12', 'gl'] as const;
+export type GpuBackend = (typeof GPU_BACKENDS)[number];
+
+// Accept only a name that is actually implemented. Not a silent fallback: a typo
+// would otherwise build the DEFAULT backend while the user believes they asked
+// for another one — the "compiles, but wrong" outcome §2.5 forbids.
+export function parseGpuBackend(raw: string): GpuBackend {
+  const v = raw.trim().toLowerCase();
+  for (const b of GPU_BACKENDS) if (b === v) return b;
+  throw new AirAppError(
+    `unknown GPU backend '${raw}' (known: ${GPU_BACKENDS.join(', ')})\n` +
+    `  auto  — the platform's own backend: D3D12 on Windows 10 1507+, Metal on macOS\n` +
+    `  d3d12 — force Direct3D 12 (Windows only)\n` +
+    `  gl    — force WGL/OpenGL (Windows only; the only GPU option on Windows 7/8.x)`
+  );
+}
+
 // Build the manifest object (kebab-case fields, matching build.ts's Manifest).
 // `vendorRel` is the path from the manifest's directory to as3compiler/vendor,
 // so all Skia/SDL2 paths resolve correctly regardless of where the app.xml lives.
@@ -447,7 +486,40 @@ export function generateBootstrap(info: AirAppInfo, mainClass: string): string {
 // mirrors the values for the NativeWindow getters) and window_glue.cc (which puts them
 // on the real window), and both must agree. It defaults to AIR's own defaults, so a
 // caller that has no descriptor in hand asks for nothing.
-export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, depthAndStencil: boolean, fonts: EmbedFont[], preloadPaths: string[], preloadExcludes: string[], appFontUrls: string[], usesNetworking: boolean, usesAudio: boolean, architecture: string, features: string[] = [], style: InitialWindowStyle = { maximizable: true, minimizable: true, systemChrome: 'standard', transparent: false }): Record<string, unknown> {
+export function airManifest(vendorRel: string, visible: boolean, resizable: boolean, highDpi: boolean, web: boolean, renderMode: string, usesStage3D: boolean, depthAndStencil: boolean, fonts: EmbedFont[], preloadPaths: string[], preloadExcludes: string[], appFontUrls: string[], usesNetworking: boolean, usesAudio: boolean, architecture: string, features: string[] = [], style: InitialWindowStyle = { maximizable: true, minimizable: true, systemChrome: 'standard', transparent: false }, gpuBackend: GpuBackend = 'auto'): Record<string, unknown> {
+  // A named backend must be one this build can actually compile in. Checked
+  // BEFORE the web/native split, because a web build returns early and would
+  // otherwise accept `--gpu-backend gl` and composite on WebGL2 anyway. Each
+  // refusal says what to do instead: all four ways to get this wrong would
+  // otherwise produce a build that succeeds and composites exactly like the
+  // default (§2.5) — the flag would look honoured and change nothing.
+  if (gpuBackend !== 'auto') {
+    if (web) {
+      throw new AirAppError(
+        `--gpu-backend ${gpuBackend} selects a native window backend, but this is a web build:\n` +
+        `  a browser page composites on WebGL2 (ASC_RENDER_GPU) and has no choice here\n` +
+        `  drop --gpu-backend, or build for --target native`
+      );
+    }
+    if (process.platform !== 'win32') {
+      throw new AirAppError(
+        `--gpu-backend ${gpuBackend} is Windows-only; this host is ${process.platform}:\n` +
+        `  macOS composites on Metal through vendor/metal_glue.mm, which is the platform's\n` +
+        `  only window GPU backend and has no WGL/D3D12 counterpart to switch to\n` +
+        `  drop --gpu-backend to get the platform's own backend`
+      );
+    }
+    if (!visible || (renderMode !== 'direct' && renderMode !== 'gpu')) {
+      throw new AirAppError(
+        `--gpu-backend ${gpuBackend} needs a GPU-composited window, but this descriptor does not ask for one:\n` +
+        `  it requires <visible>true</visible> (the default) plus <renderMode>direct</renderMode>\n` +
+        `  or <renderMode>gpu</renderMode> under <initialWindow>; this one says "${renderMode}"\n` +
+        (visible ? '' : `  and <visible>false</visible>\n`) +
+        `  which compiles NO window GPU backend at all — the backend name would be\n` +
+        `  silently ignored (§2.5)`
+      );
+    }
+  }
   // Browser backend: skia_glue.cc + web_glue.cc, the wasm Skia library set, no
   // SDL2/Cocoa/frameworks. Mirrors examples/web/hello-web.build.json. The wasm
   // Skia build omits the native-only animation/image codecs (skottie/svg/...), so
@@ -537,6 +609,10 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   const winSrc = `${vendorRel}/window_glue.cc`;
   const mtlSrc = `${vendorRel}/metal_glue.mm`;
   const d3dSrc = `${vendorRel}/d3d_glue.cc`;
+  // The WGL backend (gl_glue.cc) — the third native window-GPU backend, selected
+  // by ASC_GPU_BACKEND=gl on Windows. It exists because D3D12 cannot run below
+  // Windows 10 1507; see the header of vendor/gl_glue.cc.
+  const glSrc = `${vendorRel}/gl_glue.cc`;
   const sources = visible ? [skiaSrc, winSrc] : [skiaSrc];
   // The menu-bar status item (阶段二百六十) is Cocoa-only AND opt-in: with
   // `--features tray` the generated C calls sk_tray_*, so the translation unit has
@@ -652,9 +728,37 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // (see window_glue.cc): no ASC_RENDER_WINGPU means the GPU path is not compiled
   // in at all.
   const gpu = renderMode === 'direct' || renderMode === 'gpu';
+  // Which Windows GPU backend this build links: the WGL one (vendor/gl_glue.cc)
+  // or D3D12 (vendor/d3d_glue.cc). `auto` keeps D3D12, so a build that names no
+  // backend is byte-for-byte what it was before the switch existed. The
+  // platform/window refusals above already ruled out every other pairing.
+  const glWindowBackend = gpuBackend === 'gl';
   if (visible && gpu) {
     defines.push('ASC_RENDER_WINGPU=1');
-    if (onWin) {
+    if (onWin && glWindowBackend) {
+      defines.push('ASC_RENDER_GL=1');
+      sources.push(glSrc);
+      // opengl32.dll ships with Windows (GL 1.1 + WGL 1.1) and its import
+      // library comes with the SDK, so this adds no redistributable. Everything
+      // newer than 1.1 (FBOs, shader objects, VAOs) reaches the driver through
+      // wglGetProcAddress, which Skia's GrGLMakeNativeInterface resolves itself.
+      linkLibs.push('opengl32');
+      // The four D3D import libraries below are a LINK-TIME-ONLY requirement of
+      // the vendored skia.lib, not a runtime dependency of this backend. That
+      // archive is built with skia_use_direct3d=true, and Ganesh puts every
+      // backend factory in one translation unit (GrDirectContext.cpp), so pulling
+      // GrDirectContexts::MakeGL also pulls GrDirectContext::MakeDirect3D and its
+      // D3D12 references. lld resolves them before dead-stripping; /OPT:REF then
+      // removes the sections, and the import table of the resulting binary
+      // confirms it: the WGL build imports opengl32/USER32/GDI32/… and NOT
+      // d3d12.dll, dxgi.dll or d3dcompiler_47.dll. (Verified with a PE import-table
+      // reader, not a whole-file string scan -- the latter reports D3D names that
+      // are only static-archive debug strings.)
+      // A shipping GL-only build should instead link a skia.lib built with
+      // skia_use_direct3d=false, which drops this entirely; that needs a Skia
+      // rebuild and is why it is not done here.
+      linkLibs.push('d3dcompiler', 'd3d12', 'dxgi', 'd3d12allocator');
+    } else if (onWin) {
       defines.push('ASC_RENDER_D3D=1');
       sources.push(d3dSrc);
       // Skia's Ganesh D3D12 backend lists these three as its own link libraries
@@ -769,6 +873,19 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   // WebGL2 through stage3d_webgl.cc on the web target (wired in the `web` branch
   // above).
   if (usesStage3D) {
+    // A WGL window cannot be paired with Stage3D: stage3d_d3d.cc speaks D3D12
+    // (HLSL through D3DCompile) and stage3d_webgl.cc is Emscripten-only, so there
+    // is no GL backend to link. Linking one anyway would leave Context3D a
+    // software no-op state machine — a black stage with no diagnostic, the silent
+    // wrong result AGENTS.md §1.5 forbids. So the combination is refused by name,
+    // at build time, and the message says what to do instead.
+    if (onWin && glWindowBackend) {
+      throw new AirAppError(
+        '--gpu-backend gl has no Stage3D backend on Windows: stage3d_d3d.cc targets ' +
+        'D3D12 and stage3d_webgl.cc is wasm-only. Drop --gpu-backend to build the ' +
+        'D3D12 backend, or drop flash.display3D usage from this app.',
+      );
+    }
     // Each backend consumes the AGAL translator's own dialect: MSL for Metal (the
     // default target 0), GLSL ES for WebGL2 (ASC_S3D_GLSL -> 1) and HLSL for D3D12
     // (ASC_S3D_HLSL -> 2). Defining the dialect is what keeps stage3d_d3d.cc from
@@ -837,6 +954,12 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
     frameworks,
     defines,
     features,
+    // Recorded, not acted on: `defines`/`sources`/`link-libs` above are what the
+    // compiler reads, and this field is how the choice survives the next
+    // `--air-app` run (the manifest is regenerated in full every time) and stays
+    // visible in the file instead of being implied by two macros. Omitted for
+    // `auto` — an absent field is the default and cannot go stale.
+    ...(gpuBackend === 'auto' ? {} : { 'gpu-backend': gpuBackend }),
     objects: [],
   };
 }
@@ -984,7 +1107,12 @@ export interface PreparedAirApp {
 // which is otherwise invisible to the reachability closure.
 // `extDirOpts` is `--extdir <dir>`, repeated: the directories to locate the
 // descriptor's `<extensions>` packages in, overriding DEFAULT_EXT_DIRS.
-export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean, features: string[] | null = null, outputPath: string | null = null, includeThirdParty = false, extDirOpts: readonly string[] = [], asClassPaths: readonly string[] = []): PreparedAirApp {
+// `gpuBackend` is `--gpu-backend <auto|d3d12|gl>`: `null` means the flag was
+// absent, so the value the previous manifest recorded is kept (this is what makes
+// one `--gpu-backend gl` stick across regenerations); `--gpu-backend auto`
+// explicitly clears it. The environment alias ASC_GPU_BACKEND applies only when
+// neither said anything, and is reported when it loses — see below.
+export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, vendorAbs: string, web: boolean, features: string[] | null = null, outputPath: string | null = null, includeThirdParty = false, extDirOpts: readonly string[] = [], asClassPaths: readonly string[] = [], gpuBackend: GpuBackend | null = null): PreparedAirApp {
   const xml = readFileSync(appXmlPath, 'utf8');
   const info = parseAirApp(xml);
   const dir = dirname(resolve(appXmlPath));
@@ -1184,16 +1312,49 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // the descriptor and sources, and resurrecting a stale generated value (a
   // dropped define, an old link lib) would be a silent wrong build.
   let persistedFeatures: string[] = [];
+  // `gpu-backend` is the second carried field, and for the same reason: the
+  // manifest is regenerated in full every run, so the only memory of a
+  // `--gpu-backend` choice is the file it was written to. It cannot be derived
+  // from the descriptor the way the OTHER fields are, because AIR's descriptor
+  // has no extension point (see the GPU_BACKENDS block above).
+  let persistedGpuBackend: GpuBackend = 'auto';
+  let prevManifest: unknown = null;
   try {
-    const prev = JSON.parse(readFileSync(manifestPath, 'utf8')) as { features?: unknown };
-    if (Array.isArray(prev.features)) persistedFeatures = prev.features.filter((f): f is string => typeof f === 'string');
+    prevManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   } catch {
     // No readable previous manifest (first run, or it was deleted): nothing to keep.
+  }
+  if (prevManifest !== null && typeof prevManifest === 'object') {
+    const prev = prevManifest as { features?: unknown; 'gpu-backend'?: unknown };
+    if (Array.isArray(prev.features)) persistedFeatures = prev.features.filter((f): f is string => typeof f === 'string');
+    // Parsed strictly rather than trusted-then-coerced: a value this file wrote
+    // itself should never be invalid, and quietly reverting to `auto` would build
+    // a different backend than the manifest on disk claims (§2.5).
+    if (typeof prev['gpu-backend'] === 'string') persistedGpuBackend = parseGpuBackend(prev['gpu-backend']);
   }
   const effectiveFeatures = features ?? persistedFeatures;
   const keptFromManifest = features === null && persistedFeatures.length > 0;
 
-  const generated = airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures, info.style);
+  // Backend precedence: --gpu-backend (this invocation) > what the previous
+  // manifest pinned > ASC_GPU_BACKEND > auto. The environment variable is the
+  // prototype-era switch, kept only as a lowest-precedence alias so an A/B run
+  // needs no manifest edit; when it loses, say so — a switch that the user just
+  // set and that is not in effect is exactly the silent kind of wrong (§2.5).
+  const envRaw = process.env.ASC_GPU_BACKEND;
+  const envGpuBackend = envRaw === undefined || envRaw.trim() === '' ? null : parseGpuBackend(envRaw);
+  const effectiveGpuBackend: GpuBackend = gpuBackend
+    ?? (persistedGpuBackend !== 'auto' ? persistedGpuBackend : (envGpuBackend ?? 'auto'));
+  if (envGpuBackend !== null && effectiveGpuBackend !== envGpuBackend) {
+    const loser = gpuBackend !== null
+      ? '--gpu-backend was given on the command line'
+      : `${basename(manifestPath)} pins gpu-backend ${persistedGpuBackend}`;
+    warnings.push(
+      `ASC_GPU_BACKEND=${envGpuBackend} is ignored: ${loser}\n` +
+      `  remove that to let the environment switch decide (the flag is the supported way)`
+    );
+  }
+
+  const generated = airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures, info.style, effectiveGpuBackend);
   // Native extensions. The descriptor names them by ID and never by path — AIR is
   // the same, locating the packages through `-extdir` — so the two halves are put
   // together here and written into the manifest as resolved paths.

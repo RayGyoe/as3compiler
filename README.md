@@ -155,7 +155,23 @@ as-aot examples/hello.as --target wasm --dry
 
 # Keep debug info: all three backends add -g, and wasm's default DWARF stripping is turned off (source-level debugging in DevTools)
 as-aot examples/wasm-native/fib.as --target wasm --debug-info
+
+# Window GPU backend (Windows only, and only for a window compiled with <renderMode>direct/gpu):
+# auto (default) = D3D12, gl switches to WGL/OpenGL (system opengl32, no d3d12.dll). Frame time is the
+# same either way (the submission path is what GL saves, ~1.1-1.3 ms/frame); `auto` clears a persisted choice
+as-aot --air-app app.xml --gpu-backend gl
 ```
+
+**Window GPU backend (`--gpu-backend`, stage 271)**: Windows has two window compositing backends — the default **D3D12**
+(needs Win10 1507 + WDDM 2.0, no answer on Win7) and the newly landed **WGL/OpenGL** (system `opengl32.dll`).
+`auto` falls back `D3D12 → GL → CPU`. The choice **cannot live in the AIR descriptor** (the XSD's `<windows>` is an
+`xs:all` of four elements with no `xs:any` anywhere; `adt -package` rejects `<gpuBackend>` with error 103, and four
+different foreign-namespace spellings all report 103 too; `adl` staying silent is not schema acceptance), so it travels
+in **our generated manifest** as `gpu-backend`, which AIR never reads — the same road as `features`. Precedence:
+`--gpu-backend` > the value persisted in the previous manifest > `ASC_GPU_BACKEND` (prototype alias, says so when it
+loses) = `auto`. Five impossible combinations (no `--air-app`, web, non-Windows host, descriptor compiles no GPU
+window, Stage3D) are **refused at build time** rather than looking honoured. Details in
+[`compile.md`](docs/en/compile.md) and [`win32.md`](docs/en/win32.md) §3.1.1.
 
 **ANE loading (stage one-hundred-seventy-eight)**: `--ane` / the manifest's `ane-paths` switch on `ASC_HAVE_FRE` and wire in the host FRE runtime.
 Each entry may be an `.ane` package **or an unpacked directory** (`extension.xml` + `<platform key>/<native library>`, i.e. `adt`'s staging layout) —

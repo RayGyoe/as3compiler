@@ -522,6 +522,113 @@ as-aot app.as --air-app app.xml --features tray
 Manifest field: `{ "features": ["tray"] }`; `examples/status-item.as` + `examples/status-item.build.json` are
 the minimal working example.
 
+#### 3.4.6 Window GPU backend (`--gpu-backend`, Windows)
+
+Windows has **two** window compositing backends: the default **D3D12** (`vendor/d3d_glue.cc`, stage
+one-hundred-twenty-six) and **WGL/OpenGL** (`vendor/gl_glue.cc`). Both are “Skia draws straight into the swap
+chain”; the only difference is the layer that hands the frame to the compositor.
+
+```bash
+# default auto: D3D12 on Windows, Metal on macOS
+as-aot --air-app app.xml
+
+# pin it explicitly (byte-for-byte the same artifact as auto; the choice is just recorded)
+as-aot --air-app app.xml --gpu-backend d3d12
+
+# switch to WGL: same source, same Skia tree, through opengl32
+as-aot --air-app app.xml --gpu-backend gl
+```
+
+| Value | Windows | macOS | Notes |
+|---|---|---|---|
+| `auto` (default) | D3D12 | Metal | **byte-for-byte identical** to before this switch existed |
+| `d3d12` | D3D12 | — | pinned, so it will not drift if `auto` later means something else |
+| `gl` | WGL / OpenGL | — | see every constraint in this section |
+
+##### Why it is NOT in `app.xml` (measured, not assumed)
+
+The AIR descriptor's `<windows>` does have a precedent of the same kind — `<maxD3D>` picks the D3D version. But
+the descriptor **cannot** carry a third-party backend name. That is measured:
+
+- In `Descriptor.51.4.xsd`, `<windows>` is an `xs:all` whose children are exactly `UseWebView2` / `maxD3D` /
+  `localAppData` / `useDirectDrawFonts`; the **whole XSD contains no `xs:any`**, i.e. there is no extension point.
+- Measured with `adt -package` (fixtures in `temp/descext/`, self-signed `test.p12`): adding `<gpuBackend>` gives
+  `FAIL(12): error 103: application.windows.gpuBackend is an unexpected element/attribute`; replacing it with a
+  **foreign-namespace** element (one inside `<windows>`, one top-level) or a foreign-namespace **attribute** on
+  `<application>` — all four spellings give **error 103**.
+- `adl` stays silent on all four, but that is **not** schema acceptance — `adl` only does a hand-rolled subset
+  check, and it equally accepts `<maxD3D>abc</maxD3D>` (which `adt` rejects). `adl`'s exit codes 0/6/7/8 only
+  cover “descriptor not found / missing `content` / missing `initialWindow`”.
+
+So the choice travels in **our generated manifest** (the `gpu-backend` field, §4), which AIR never reads — the
+same road as `features` (§3.4.2.1).
+
+##### Precedence and persistence
+
+```
+--gpu-backend (this invocation) > the gpu-backend in the previously generated manifest > ASC_GPU_BACKEND env > auto
+```
+
+- `--gpu-backend gl` **writes the choice into `<filename>.build.json`**, so rerunning without the flag keeps it
+  (otherwise every incremental build would have to remember a flag).
+- `--gpu-backend auto` **clears** the field — “absent” *is* `auto`, so no stale value can survive.
+- `ASC_GPU_BACKEND` is the prototype-era switch, **kept** as a lowest-precedence alias (existing scripts should
+  not break overnight), but when it loses to a pinned value it prints a warning saying which one won — it never
+  gives way silently.
+
+##### Five combinations are **refused**, not “honoured but ineffective”
+
+Per [`AGENTS.md`](../../../AGENTS.md) §1.5/§2.5: a switch that looks honoured and changes nothing is worse than no
+switch at all.
+
+| Situation | Error says |
+|---|---|
+| `--gpu-backend` without `--air-app` | `only applies to --air-app` (a bare `.as` build has no descriptor to read; `-D` decides there) |
+| `--target wasm --package web` | `a web build has no window backend to choose` (browsers only have WebGL2) |
+| host is not Windows | `Windows-only`, and names `metal_glue.mm` as the macOS counterpart |
+| the descriptor compiles no GPU window (`<renderMode>` is `auto`/`cpu`, or `visible=false`) | `does not ask for one`, and says to use `renderMode>direct` |
+| `--gpu-backend gl` + Stage3D | `no Stage3D backend` (`vendor/stage3d_d3d.cc` is HLSL/`vs_5_1` and cannot run on GL; refused rather than linked in to become a black stage) |
+
+The manifest's `gpu-backend` and `defines` are **cross-checked** by `applyManifest`, never re-derived: `gl` must
+carry `ASC_RENDER_GL=1`, `d3d12` must carry `ASC_RENDER_D3D=1`, and both macros at once is
+`one binary links one window GPU backend`. Whoever hand-edits a manifest therefore cannot believe a one-line edit
+switched the backend.
+
+##### Measured: switching backends **does not raise the frame rate**
+
+Same `GalleryApp` (1500×1050 @150% DPI, Win11 26200, RTX 4090 D), reading “graphics work per frame” with
+`ASC_GPU_STATS=1` (blocks on vsync excluded):
+
+| Backend | Frame time | fps | Graphics work | With auto-bake off |
+|---|---|---|---|---|
+| `cpu` (CPU raster + `SDL_UpdateTexture`) | 42.00 ms | 23.8 | — | — |
+| `d3d12` | 42.00 ms | 24.0 | 1.28 ms | 2.30 ms |
+| `gl` | 42.00 ms | 24.1 | **0.55 ms** | 1.00 ms |
+
+Stated plainly: **all three have the same frame time**; the bottleneck is the AS3/layout side (graphics is only
+1.3–5.5%). What GL saves is the **submission path** (~1.1–1.3 ms/frame), not total frame time. Pixel equivalence
+was measured too: the same frame differs by 1026 px (0.067%), all inside a 9–10 px band at y=84..92 — and the same
+exe run twice differs by 114 px inside that same band (animation timing jitter), so it is not a backend difference.
+
+##### Known limits (untested items listed as such)
+
+- **Different present model**: D3D12 uses `FLIP_DISCARD` (the only swap model on Win10+ that can reach independent
+  flip); WGL's `SwapBuffers` is the blt model, so windowed mode **always goes through DWM compositing**. Frame time
+  showed no difference, but compositing latency was not measured (needs a frame-capture tool).
+- **Only run on Win11 26200 + RTX 4090 D + a single display.** WGL behaviour on old Intel/AMD drivers, Remote
+  Desktop and VMs, and the availability of fast paths like `glTexStorage2D` under a compat profile are **all
+  untested**.
+- Stage3D with GL is a **build-time refusal** (last row above), not “runs a bit worse”.
+- The link still needs `d3d12`/`dxgi`/`d3dcompiler`: `vendor/skia/lib/windows-x64/skia.lib` is built with
+  `skia_use_direct3d=true`, and `GrDirectContexts::MakeGL` sits in the same TU as `MakeDirect3D`. After `/OPT:REF`
+  the artifact's **import table is clean** (measured: only `OPENGL32` + system DLLs, **no** `d3d12.dll`/`dxgi.dll`/
+  `d3dcompiler_47.dll`), which is itself worth stating: **a link-time dependency is not a runtime dependency**.
+- The context is **deliberately a compat profile**: the AGAL→GLSL generator emits ES 1.00 (`attribute`/`varying`/
+  `texture2D`), and moving to core would touch the generator shared with the web backend — a much larger
+  regression surface.
+
+Platform trade-offs and Windows-specific details: [`win32.md`](win32.md) §3.1.1.
+
 ### 3.5 AIR Application Descriptor (--air-app)
 
 Parse an AIR `app.xml`, automatically generate bootstrap startup code + build manifest, and migrate a
@@ -873,6 +980,7 @@ kebab-case.
 | `defines` | string[] | Preprocessor macros (→ `-D`) |
 | `c-flags` | string[] | Flags forwarded **verbatim** to the C/C++ compiler (the manifest form of `--cflag <f>` / `-w`). They land on **every** compile step and the link step (C source, C++ glue, link), positioned **before** the objects and `-l` libraries (link flags such as `-Wl,--as-needed` are order sensitive). There is **no allow-list**: a flag the compiler does not understand must fail the build loudly — that is the only proof the flag really reached the compiler. Empty by default, so a build that names none is byte-for-byte what it was. Top level appends (so CLI and manifest can coexist); a `targets.<target>` block replaces (§4.1's rule) |
 | `features` | string[] | **Named enhancement switches** (§3.4.2), e.g. `["svg"]`. Empty by default. An unknown name is an error; when on, the build banner names it, and when off the artifact matches `adl`. On the CLI `--features` **replaces** the whole set (`-D` is the one that appends) |
+| `gpu-backend` | `"auto" \| "d3d12" \| "gl"` | Windows' **window GPU backend** (§3.4.6); absent = `auto` (D3D12). Written by `--air-app --gpu-backend`, and **top level only** (inside a `targets.<target>` block it is an error: the backend is decided by the descriptor plus the host, not a per-target quantity). Builds without the field are **byte-for-byte unchanged**. It is **cross-checked** against `defines`: `gl` must carry `ASC_RENDER_GL=1`, `d3d12` must carry `ASC_RENDER_D3D=1`, and both macros at once is a hard error |
 | `objects` | string[] | Precompiled `.o` added directly to the link |
 | `frameworks` | string[] | macOS frameworks (→ `-framework X`, needed for Skia's CoreText/CoreGraphics backend) |
 | `font-urls` | string[] | Font byte-stream URL list (`--package web` writes it into `index.html`, network-loaded and injected into Skia at runtime; see [`html5-web.md`](html5-web.md) §4) |
@@ -1378,12 +1486,18 @@ source.
 > | Macro | Meaning | Defined by |
 > |---|---|---|
 > | `ASC_RENDER_METAL` | **window compositing** goes through Metal: `metal_glue.mm`'s `CAMetalLayer` + Ganesh, compositing the whole frame on the GPU (for 2D on-screen). **One state per window** (slotted by window id, sharing only device/queue/context); both the main window and a runtime `NativeWindow` use it (the latter unless `renderMode="cpu"`) | `air-app.ts` adds it under `<renderMode>direct/gpu` + a visible window |
+> | `ASC_RENDER_WINGPU` | **window compositing on Windows**, a **backend-neutral** switch: it only says “this window runs on the GPU”, not which one. `window_glue.cc` calls `sk_attach_gpu()` because of it, and that function dispatches to `d3d_glue.cc` (`ASC_RENDER_D3D`) or `gl_glue.cc` (`ASC_RENDER_GL`) | `air-app.ts` adds it under the same conditions, on a Windows host |
 > | `ASC_RENDER_STAGE3D` | **Stage3D's `Context3D` connected to the real GPU**: links `stage3d_glue.mm`, and the `as_s3d_*` wrappers change from no-ops to real Metal calls | the build manifest (`air-app.ts` adds it when `usesStage3D`) |
 >
 > The two are **mutually independent**: defining only the former leaves `Context3D` a pure C state machine
 > (`driverInfo` returns `"Software (state machine)"`); defining only the latter leaves the window on CPU
 > raster (e.g. `examples/stage82.build.json`). A project that is both a GPU window and uses Stage3D (Starling,
 > shmup) needs both.
+
+> **Which backend Windows uses is decided by `--gpu-backend`** (§3.4.6): `ASC_RENDER_D3D` and `ASC_RENDER_GL` are
+> **mutually exclusive**, and both present is a **build-time** error (`one binary links one window GPU backend`) —
+> rather than letting the linker or preprocessor pick one for you. With no `ASC_RENDER_WINGPU` neither is added and
+> the window goes back to CPU raster (exactly as before stage one-hundred-twenty-six).
 
 **Frame-rate diagnostic knobs** (appended with `-D`, not compiled into the artifact by default):
 

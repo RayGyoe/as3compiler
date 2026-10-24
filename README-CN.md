@@ -158,7 +158,23 @@ as-aot examples/hello.as --target wasm --dry
 
 # 保留调试信息：三种后端均加 -g，且 wasm 默认的 DWARF 剥离被关掉（可用 DevTools 源码级调试）
 as-aot examples/wasm-native/fib.as --target wasm --debug-info
+
+# 窗口 GPU 后端（仅 Windows，且有 <renderMode>direct/gpu 的窗口）：auto（缺省）= D3D12，
+# --gpu-backend gl 换成 WGL/OpenGL（系统自带的 opengl32，不依赖 d3d12.dll）。两者帧时相同，
+# GL 省的是提交路径（约 1.1–1.3 ms/帧）；--gpu-backend auto 清掉已记在清单里的选择
+as-aot --air-app app.xml --gpu-backend gl
 ```
+
+**窗口 GPU 后端（`--gpu-backend`，阶段二百七十一）**：Windows 上并存两个窗口合成后端——缺省的 **D3D12**
+（要求 Win10 1507 + WDDM 2.0，Win7 上无解）与新落地的 **WGL/OpenGL**（`opengl32.dll` 系统自带）。
+`auto` 的回退顺序是 `D3D12 → GL → CPU`。这个选择**装不进 AIR 描述符**（`Descriptor.51.4.xsd` 的
+`<windows>` 是 `xs:all` 只四个子元素、全 XSD 无 `xs:any`；`adt -package` 对 `<gpuBackend>` 报
+error 103，而异命名空间的元素/属性四种写法**全部**报 103；`adl` 沉默不是 schema 接受），故走
+**我们自己的生成清单**字段 `gpu-backend`，AIR 从不读它——与 `features` 同一条路。优先级：
+`--gpu-backend` > 上次清单里的值 > `ASC_GPU_BACKEND` 环境变量（原型期别名，输给钉住的值时会明确说）= `auto`。
+五种无效组合（非 `--air-app`、web、非 Windows 宿主、描述符没编进 GPU 窗口、Stage3D）都是**构建期拒绝**，
+不会「开了但什么都不变」。详见 [`compile.md`](docs/zh-cn/compile.md) §3.4.6 与
+[`win32.md`](docs/zh-cn/win32.md) §3.1.1。
 
 **ANE 加载（阶段一百七十八）**：`--ane` / 清单 `ane-paths` 打开 `ASC_HAVE_FRE` 并接上宿主 FRE 运行时。
 每一项可以是 `.ane` 包，也可以是**解包后的目录**（`extension.xml` + `<平台键>/<原生库>`，即 `adt` 的暂存布局）——

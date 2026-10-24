@@ -15981,7 +15981,62 @@ rightMargin` 由具体 C 类型改为**装箱**（`any`）—— AIR 把这些�
 改动而不是纯语义改动；收益是「未设置」终于可表达，代价是所有读写点都必须显式取值。若将来有人把某个字段改回
 具体类型，空格式路径会静默退化成 `0`/`false`，单测里「空格式十字段全 null」那十条就是为这个写的。
 
+### 阶段二百七十一：Windows 第二个窗口 GPU 后端（`--gpu-backend gl`）——“描述符装不下它”是量出来的（v0.4.234 → v0.4.235）✅ 已完成
+
+**一、起因**
+
+上一轮平台边界评估得出两条结论：D3D12 的**下限**是 Win10 1507 + WDDM 2.0 + FL 11_0（`vendor/d3d_glue.cc`
+只用 RTM API），Win7 上无解；而 `vendor/skia/lib/windows-x64/skia.lib` 里 **GL 后端早就编好了**
+（`GrGLGpu` 684 / `GrGLMakeNativeInterface` 7 / `wglGetProcAddress` 1），`MakeWebGL` 为 0 ⇒ 不需要重编 Skia、
+不需要 ANGLE。也就是说“把窗口合成从 D3D12 换成 WGL”**只差一层窗口胶水**。本阶段把那层胶水做成正式开关。
+
+**二、“写进 app.xml”这条路是堵的（实测，不是判断）**
+
+用户的原始提议是照 `<maxD3D>` 的样子在描述符里加个 `<gpuBackend>`。逐层查下来堵在三处：
+
+| 检查 | 结果 |
+|---|---|
+| `Descriptor.51.4.xsd:435` 的 `<windows>` | 是 `xs:all`，子元素只有 `UseWebView2`/`maxD3D`/`localAppData`/`useDirectDrawFonts`；**整份 XSD 无任何 `xs:any`** ⇒ 不存在扩展点 |
+| `adt -package` + `<windows><gpuBackend>gl</gpuBackend></windows>` | `FAIL(12): error 103: application.windows.gpuBackend is an unexpected element/attribute` |
+| 异命名空间元素（`<windows>` 内 / 顶层）、异命名空间属性（`<application>` 上） | **四种写法全部 error 103** |
+| `adl` 对这四种写法 | **均沉默** —— 但它也接受 `<maxD3D>abc</maxD3D>`（`adt` 拒）。`adl` 只做手写的子集检查，退出码 0/6/7/8 只覆盖“描述符找不到 / 缺 content / 缺 initialWindow”，**不构成合法性证据** |
+
+⇒ 载体改成**我们自己的生成清单**字段 `gpu-backend`（AIR 从不读，与 `features` 同一条路）。
+
+**三、落地形态**
+
+| 项 | 实现 |
+|---|---|
+| `vendor/gl_glue.cc`（新，666 行） | 每窗一 GL 上下文 + 一 `GrDirectContext`：`GetDC` → 传统 `ChoosePixelFormat`（不用 ARB）→ `SetPixelFormat` → `wglCreateContext`（**刻意 compat profile**）→ `WGL_EXT_swap_control` vsync(1) → `GrGLMakeNativeInterface` + `MakeGL` → `gl_build_surface`（FBO 0 / `SK_GL_RGBA8` / `kBottomLeft`，套 Skia `GLWindowContext` 契约）。`sk_gpu_flush` = `flushAndSubmit(kNo)` + `SwapBuffers` |
+| `vendor/window_glue.cc` | 5 处：前向声明、销毁钩子、新增 `sk_attach_gl`、`sk_attach_gpu` 加 `#elif ASC_RENDER_GL`、`sk_window_show_gpu` 同 `\|\|` |
+| `src/air-app.ts` | `GPU_BACKENDS`/`parseGpuBackend`；优先级 = `--gpu-backend` > 上次清单 > `ASC_GPU_BACKEND` > `auto`；**四处拒绝**（非 `--air-app` / web / 非 Windows 宿主 / 描述符没编进 GPU 窗口）+ Stage3D 拒绝 |
+| `src/build.ts` | 清单字段 `gpu-backend`（**只允许顶层**）；`applyManifest` **交叉校验** `defines`：`gl` 须 `ASC_RENDER_GL=1`、`d3d12` 须 `ASC_RENDER_D3D=1`，两宏同在报 `one binary links one window GPU backend` |
+| `src/index.ts` | `--gpu-backend` 进 `KNOWN_FLAGS`；`--gpu-backend=gl` 单独回一句（“a space, not '='”） |
+
+**四、验收**
+
+| 检查 | 结果 |
+|---|---|
+| `unit: air-app/GpuBackend`（25 条：换真后端 / `auto` 与 `d3d12` 逐字同构 / 四种拒绝 / 清单↔defines 四向 / 持久化与清除 / 环境变量丢给钉住值时有明说） | **25/25** |
+| `unit: cli/ArgErrors` 新增 5 条（非 --air-app / `=` 写法 / 拼错列名 / **先于描述符读取** / `--help`）+ `KNOWN_FLAGS ↔ 解析链`双向钉子 | **21/21** |
+| 默认构建 | **一字节未变**（不设 flag 仍是 `ASC_RENDER_D3D=1` + `d3d_glue.cc`） |
+| GL 真跑 | `NVIDIA GeForce RTX 4090 D \| 4.6.0 NVIDIA 610.88`，1500×1020（DPI 1.5×） |
+| 像素等价性（GL vs D3D12 同帧） | **1026 px（0.067%）**，全在 y=84..92 一条 9–10px 横带；同 exe 连跑两次在同一带内也差 114 px ⇒ 示例动画时序抖动，非后端差异 |
+| 三后端帧时（`GalleryApp` 1500×1050 @150%） | cpu 42.00 ms / d3d12 42.00 ms（图形 1.28 ms）/ **gl 42.00 ms（图形 0.55 ms）** ⇒ **帧时相同**，GL 省的是提交路径（1.1–1.3 ms/帧） |
+| 产物导入表（`/OPT:REF` 后） | 只有 **`OPENGL32` + 系统 DLL**，**无** `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`，subsystem 6.0 ⇒ **链接期依赖 ≠ 运行期依赖** |
+
+**五、如实报明**
+
+① 链接期**仍需** `d3d12`/`dxgi`/`d3dcompiler`：`skia.lib` 按 `skia_use_direct3d=true` 编，`MakeGL` 与
+`MakeDirect3D` 在同一 TU，拉一个带进另一个的符号（已写进 `compile.md` §3.4.6 与 `win32.md` §3.1.1）。
+② 只在 Win11 26200 + RTX 4090 D + 单显示器上跑过；Intel/AMD 老驱动、远程桌面、虚拟机下的 WGL、
+compat profile 下 `glTexStorage2D` 之类快路径、present 的实际合成延迟（需抓帧工具）**均未测**。
+③ **GL 仍不是默认**：换后端提不了帧率，而 present 模型更贵（blt 必走 DWM）、Stage3D 没有 GL 后端、
+`auto` 的回退顺序定为 `D3D12 → GL → CPU`。④ Win7 上“能不能跑”**仍未真机验证**：代码事实是产物不导入
+`d3d12.dll`、无 Win8+ 符号、子系统 6.0，但“编得干净”不等于“真机跑得动”。
+
 ### 遗留待开发
+> **2026-10-24 追加（阶段二百七十一：`--gpu-backend gl`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段新增的是**后端选择**，不是语义能力；GL 侧的未测项（Intel/AMD 老驱动、远程桌面/虚拟机、compat profile 下快路径可用性、present 实际合成延迟、Win7 真机）属**验证欠账**而非「`adl` 跑得对我们跑不出」，按 AGENTS §1.5 不占本表——已逐条写在阶段节的「五、如实报明」与 `compile.md` §3.4.6 的「已知边界」。同一条也适用于「GL 还不是默认」：那是**权衡**（换后端不提帧率、present 更贵），不是欠账。
 > **2026-10-24 追加（阶段二百六十九 ~ 二百七十：闭包静态读丢 `_cinit` 守卫 / `getTextFormat` 读 run 表）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。两条都是 `adl` 跑得对、我们跑不出的**语义实错**，且都在阶段内**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表）：① 闭包体内的静态字段读走另一条发射路径，裸读 `Cls_FIELD` 而不带 `(Cls_cinit(), …)` 守卫 ⇒ 只被闭包读的 `static const Array` 运行时仍是 `NULL`（`#1009`），根因是 `cinitClasses` 在闭包体发射之后才被填充；② `TextField.getTextFormat()` 恒返回 `defaultTextFormat`，忽略阶段二百六十八 建立起来的 run 表。两条都在 `asaotui/compiler-gaps.md` 记有完整证据（G22 / G21），此处只留指针。
 > **2026-10-24 追加（阶段二百六十六 ~ 二百六十八：三元 null 分支 / `drawRoundRect` / `setTextFormat`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。三条都是`adl` 跑得对而我们跑不出的**语义实错**，且在阶段内**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表）：① `cond ? null : X` 把 X 塌成结果类型的零值（`unifyType` 缺 null 家族规则）；② `Graphics.drawRoundRect` 的两个半径被 `(void)ew; (void)eh;` 就地吞掉、画出直角；③ `TextField.setTextFormat` 该替换区间却在追加 run，导致重复排版（宽度随重绘线性增长）。**未入表的新偏差 1 项**：`TextField.getTextFormat()` 忽略 run 表（G21），与 G15 同处理——先登记在 `asaotui/compiler-gaps.md`（已实测·未修），立项再占表。
 > **2026-10-24 追加（阶段二百六十五：两条只有 Windows 宿主才编译得到的产物缺陷）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段修的是**产物在 Windows 上编不过 / 链不上**（`src/runtime.ts` 模板字符串里反斜杠先掉一层；`vendor/window_glue.cc` 的 `#else` 支缺 `sk_menu_flush`/`sk_menu_ensure` 定义），既不改变任何 AS3 语义、也不对应 `adl` 上的行为分歧，故不入表；已在本阶段节内记账，并补 7 条源级钉子（macOS CI 天生编译不到那两支，非源级钉就无从回归）。

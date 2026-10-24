@@ -72,12 +72,18 @@ void sk_window_set_cursor(int id, int kind);
 int sk_mtl_init(int id, void* layer);
 void sk_mtl_destroy(int id);
 #endif
-#ifdef ASC_RENDER_D3D
-// Native D3D12 GPU backend (d3d_glue.cc). Same per-window contract as the Metal
-// one above: the swapchain and its back buffers are per window (keyed by this
-// same id), the ID3D12Device / command queue / GrDirectContext are process-wide.
-// `native_handle` is the window's HWND — this file owns the SDL2 window and
-// hands the backend the one thing it needs from it.
+#if defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GL)
+// Native Windows GPU backend (d3d_glue.cc for ASC_RENDER_D3D, gl_glue.cc for
+// ASC_RENDER_GL). Same per-window entry points and the same `native_handle` = the
+// window's HWND, because both need the one thing this file owns and neither can
+// obtain for itself.
+//
+// What the two share and where they part: the seam is identical (an id-keyed
+// begin/draw/flush cycle over a frame-scoped canvas), and both create their GPU
+// state per window. They differ in lifetime — D3D shares one ID3D12Device and one
+// GrDirectContext across every window, while GL cannot: Skia requires one
+// GrDirectContext per GL context, and each window needs its own GL context
+// because its render target is that window's default framebuffer.
 int sk_gpu_init(int id, void* native_handle);
 void sk_gpu_destroy(int id);
 #endif
@@ -932,7 +938,7 @@ static void sk_service_destroy(void) {
       if (c->metal_view != NULL) SDL_Metal_DestroyView((SDL_MetalView)c->metal_view);
       c->metal_view = NULL;
 #endif
-#ifdef ASC_RENDER_D3D
+#if defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GL)
       sk_gpu_destroy(i);
 #endif
     }
@@ -2212,6 +2218,35 @@ static int sk_attach_d3d(WinCtx* c, int id) {
 }
 #endif  // ASC_RENDER_D3D
 
+#ifdef ASC_RENDER_GL
+// Attach a WGL context to a window. Identical shape to sk_attach_d3d above and
+// for the same reason: this file owns the SDL2 window, gl_glue.cc owns everything
+// GPU, and the only thing that crosses is the HWND. One extra requirement the
+// D3D path does not have: the window's DC must not already carry a pixel format
+// from another client, so the check below is about telling the two backends
+// apart rather than about validating the WM.
+static int sk_attach_gl(WinCtx* c, int id) {
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info)) {
+    fprintf(stderr, "window_glue: SDL_GetWindowWMInfo failed: %s\n", SDL_GetError());
+    return 0;
+  }
+  if (info.subsystem != SDL_SYSWM_WINDOWS) {
+    // Loud, not silent (AGENTS.md §1.5): a WGL build on a non-Windows WM is a
+    // backend mismatch, and falling back to the SDL CPU blit here would hide it.
+    fprintf(stderr, "window_glue: the WGL backend needs a native Windows window (subsystem %d)\n", (int)info.subsystem);
+    return 0;
+  }
+  if (!sk_gpu_init(id, (void*)info.info.win.window)) {
+    fprintf(stderr, "window_glue: WGL backend init failed\n");
+    return 0;
+  }
+  c->is_gpu = 1;
+  return 1;
+}
+#endif  // ASC_RENDER_GL
+
 // Backend-neutral GPU attach — the only name the rest of this file uses. Exactly
 // one branch is compiled in: ASC_RENDER_METAL on macOS (air-app.ts), ASC_RENDER_D3D
 // on Windows. With neither (a plain CPU build) no caller can reach this at all,
@@ -2222,6 +2257,8 @@ static int sk_attach_gpu(WinCtx* c, int id) {
   return sk_attach_metal(c, id);
 #elif defined(ASC_RENDER_D3D)
   return sk_attach_d3d(c, id);
+#elif defined(ASC_RENDER_GL)
+  return sk_attach_gl(c, id);
 #else
   (void)c; (void)id;
   fprintf(stderr, "window_glue: no GPU window backend is compiled in\n");
@@ -2327,7 +2364,10 @@ int sk_window_show_gpu(int w, int h, const char* title, int fullscreen,
   // rather than fork the two.
   return sk_window_show_metal(w, h, title, fullscreen, on_mouse, on_wheel, on_key,
                               on_redraw, on_frame, on_frame_delay, on_resize, on_close);
-#elif defined(ASC_RENDER_D3D)
+#elif defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GL)
+  // One loop for both native Windows backends: the event wiring, the initial
+  // resize report and the live-resize watch are backend-neutral, and only the
+  // attach step differs (hidden behind sk_attach_gpu).
   ensure_video();
   if (sk_video_init() != 0) {
     fprintf(stderr, "window_glue: SDL_Init failed: %s\n", SDL_GetError());

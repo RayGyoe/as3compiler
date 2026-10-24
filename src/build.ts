@@ -221,6 +221,15 @@ interface ManifestFields {
   defines?: string[];
   'c-flags'?: string[];
   features?: string[];
+  // GPU window backend name, recorded by `--air-app` from `--gpu-backend`. Not a
+  // switch: air-app.ts already turned it into `defines`/`sources`/`link-libs`,
+  // which is what the compiler reads, so this field is (a) how the choice
+  // survives manifest regeneration and (b) a consistency claim that applyManifest
+  // verifies against those defines. Top-level only (deliberately absent from
+  // TARGET_LAYER_FIELDS): the backend decides which glue file and which import
+  // library are linked, and a per-target overlay could only desynchronise that
+  // from the defines emitted for the shared default.
+  'gpu-backend'?: 'auto' | 'd3d12' | 'gl';
   objects?: string[];
   frameworks?: string[];
   exports?: string[];
@@ -284,6 +293,7 @@ const MANIFEST_FIELD_NAMES: Record<keyof ManifestFields | 'targets', true> = {
   defines: true,
   'c-flags': true,
   features: true,
+  'gpu-backend': true,
   objects: true,
   frameworks: true,
   exports: true,
@@ -453,6 +463,36 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m['link-libs']) next.linkLibs = [...cfg.linkLibs, ...T(m['link-libs'])];
   if (m['link-paths']) next.linkPaths = [...cfg.linkPaths, ...T(m['link-paths']).map((p) => resolveFromManifest(manifestPath, p))];
   if (m.defines) next.defines = [...cfg.defines, ...T(m.defines)];
+  // GPU window backend: VERIFIED against the defines, never re-derived. The
+  // backend is already fully expressed by `defines` + `sources` + `link-libs`
+  // (air-app.ts emits all three together), so deriving it again here would be a
+  // second implementation of the same rule — the thing this project keeps
+  // refusing. What the check buys is the hand edit: a manifest whose `gpu-backend`
+  // names one backend while its defines compile another would otherwise be
+  // accepted, with the defines silently winning (§2.5).
+  if (m['gpu-backend'] !== undefined) {
+    const b = m['gpu-backend'];
+    if (b !== 'auto' && b !== 'd3d12' && b !== 'gl') {
+      throw new Error(`manifest 'gpu-backend' must be "auto", "d3d12" or "gl" (got ${JSON.stringify(b)}) — ${manifestPath}`);
+    }
+    const macros = new Set(next.defines.map((d) => d.split('=')[0].trim()));
+    const want = b === 'gl' ? 'ASC_RENDER_GL' : b === 'd3d12' ? 'ASC_RENDER_D3D' : null;
+    const other = b === 'gl' ? 'ASC_RENDER_D3D' : b === 'd3d12' ? 'ASC_RENDER_GL' : null;
+    if (want !== null && !macros.has(want)) {
+      throw new Error(
+        `manifest 'gpu-backend' is "${b}" but 'defines' does not carry ${want} — ${manifestPath}\n` +
+        `  a backend is applied through its define + glue source + import library, so this field\n` +
+        `  cannot switch anything on its own: regenerate with --gpu-backend ${b} (via --air-app),\n` +
+        `  or add "${want}=1" to 'defines' yourself`
+      );
+    }
+    if (other !== null && macros.has(other)) {
+      throw new Error(
+        `manifest 'gpu-backend' is "${b}" but 'defines' also carries ${other} — ${manifestPath}\n` +
+        `  one binary links one window GPU backend; drop one of the two`
+      );
+    }
+  }
   // Flags have no path semantics, so they are passed through verbatim -- a
   // `-Wl,-rpath,/x` or `-fuse-ld=` would be mangled by any "resolve" step.
   if (m['c-flags']) next.cFlags = [...cfg.cFlags, ...T(m['c-flags'])];

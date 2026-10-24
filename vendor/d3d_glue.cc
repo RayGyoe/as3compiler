@@ -190,6 +190,33 @@ static sk_sp<GrDirectContext> g_context;
 static long g_d3d_frames = 0;
 static double g_d3d_t_first = 0.0;
 
+// ASC_GPU_STATS: how much CPU the frame costs, with the blocking present removed
+// from the measurement. The sk_stats block in sk_gpu_begin_frame above times whole
+// frame intervals, which under vsync reads 16.7 ms on every backend and so cannot
+// compare backends at all. This accumulator times only "record the frame and hand
+// it to the driver": from the end of sk_gpu_begin_frame (after the acquire wait) to
+// just before Present. It is CPU submit cost, NOT GPU time -- submit() is async, so
+// a GPU-bound frame still reads low here. Deliberately identical to the probe in
+// gl_glue.cc so the two backends produce comparable numbers.
+static int g_d3d_stats_on = -1;
+static double g_d3d_work_t0 = 0.0;
+static double g_d3d_work_sum = 0.0;
+static double g_d3d_work_max = 0.0;
+static long g_d3d_work_n = 0;
+
+static void d3d_stats_frame_done(void) {
+  if (g_d3d_stats_on <= 0) return;
+  const double dt = d3d_now_ms() - g_d3d_work_t0;
+  g_d3d_work_sum += dt;
+  if (dt > g_d3d_work_max) g_d3d_work_max = dt;
+  g_d3d_work_n++;
+  if (g_d3d_work_n % 120 == 0) {
+    fprintf(stderr, "gpu_stats frames=%ld work_avg=%.3f work_max=%.3f ms\n",
+            g_d3d_work_n, g_d3d_work_sum / (double)g_d3d_work_n, g_d3d_work_max);
+    fflush(stderr);
+  }
+}
+
 static D3DWin* d3d_slot(int win_id) {
   if (win_id < 0 || win_id >= SK_D3D_MAX_WINDOWS) return nullptr;
   return g_d3d[win_id].used ? &g_d3d[win_id] : nullptr;
@@ -570,6 +597,8 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
       fflush(stderr);
     }
   }
+  if (g_d3d_stats_on < 0) g_d3d_stats_on = getenv("ASC_GPU_STATS") != NULL ? 1 : 0;
+  if (g_d3d_stats_on > 0) g_d3d_work_t0 = d3d_now_ms();
   return (void*)s->getCanvas();
 }
 
@@ -716,6 +745,9 @@ void sk_gpu_flush(int win_id) {
   GrFlushInfo info;
   g_context->flush(s, SkSurfaces::BackendSurfaceAccess::kPresent, info);
   g_context->submit();
+
+  // Before Present below, which is where the frame blocks on the display.
+  d3d_stats_frame_done();
 
   d3d_dump_backbuffer(w);
 

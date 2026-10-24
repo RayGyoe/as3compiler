@@ -16,7 +16,7 @@ import type { Program, Stmt } from './ast.ts';
 import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { BuildConfig, Target, Package, Manifest } from './build.ts';
-import { generateBootstrap, prepareAirApp, airManifest } from './air-app.ts';
+import { generateBootstrap, prepareAirApp, airManifest, parseGpuBackend, type GpuBackend } from './air-app.ts';
 import { runDoctor, checkForUpdate } from './doctor.ts';
 import { computeReachable, prepareReachFiles, type ReachFile } from './reach.ts';
 import { generateXcodeProject } from './xcode-project.ts';
@@ -93,6 +93,13 @@ interface Options {
   // descriptor names extensions by ID, and the IDs are resolved into the manifest's
   // `ane-paths`), not while the build runs.
   extDirs: string[];
+  // `--gpu-backend <auto|d3d12|gl>`: --air-app only. Which native API composites
+  // the window (air-app.ts GPU_BACKENDS explains why `gl` exists at all). `null`
+  // means the flag was absent — NOT the same as `auto`, which explicitly clears a
+  // previously persisted choice. Not part of BuildConfig: it is consumed while the
+  // manifest is generated (it becomes defines + a glue source + an import
+  // library), not while the build runs.
+  gpuBackend: GpuBackend | null;
   overrides: Partial<BuildConfig>;
   // `as-aot doctor` (below). The subcommand is recognised by its own name as the
   // FIRST argument, before the flag loop, because otherwise `doctor` would be
@@ -115,7 +122,7 @@ interface Options {
 // (the `unit: cli/ArgErrors` group reads the chain and reddens if it does).
 const KNOWN_FLAGS: readonly string[] = [
   '-o', '--run', '--dry', '--cc', '--target', '--package', '--manifest', '--air-app',
-  '--main-class', '--all-sources', '--include-third-party', '--extdir', '--as-class-path', '--json', '--fix',
+  '--main-class', '--all-sources', '--include-third-party', '--extdir', '--as-class-path', '--gpu-backend', '--json', '--fix',
   '--check-update', '--verbose', '-v', '--opt', '--debug-info', '--lto', '--pgo', '--pgo-dir',
   '-I', '-L', '-l', '-D', '--features', '--framework', '--source', '--swc', '--ane',
   '--ane-platform', '--export', '--cflag', '-w', '--version', '-V', '--help', '-h',
@@ -153,7 +160,7 @@ function suggestFlag(arg: string): string {
 }
 
 function parseArgs(argv: string[], doctorMode = false): Options {
-  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, extDirs: [], asClassPaths: [], overrides: {}, doctor: doctorMode, doctorJson: false, doctorFix: false, doctorVerbose: false, doctorCheckUpdate: false };
+  const opts: Options = { inputs: [], output: null, run: false, manifest: null, airApp: null, mainClass: null, allSources: false, includeThirdParty: false, extDirs: [], asClassPaths: [], gpuBackend: null, overrides: {}, doctor: doctorMode, doctorJson: false, doctorFix: false, doctorVerbose: false, doctorCheckUpdate: false };
   const push = (key: 'includePaths' | 'linkLibs' | 'linkPaths' | 'defines' | 'cFlags' | 'features' | 'exports' | 'frameworks' | 'sources' | 'swcPaths' | 'anePaths', v: string): void => {
     (opts.overrides[key] ??= [] as string[]).push(v);
   };
@@ -248,6 +255,10 @@ function parseArgs(argv: string[], doctorMode = false): Options {
     else if (a === '--swc') push('swcPaths', value('--swc'));
     else if (a === '--ane') push('anePaths', value('--ane'));
     else if (a === '--ane-platform') opts.overrides.anePlatform = value('--ane-platform');
+    // --gpu-backend <auto|d3d12|gl>: which native API composites the window.
+    // Parsed (not just stored) so a typo fails here with the list of real names,
+    // instead of building the default backend and looking honoured.
+    else if (a === '--gpu-backend') opts.gpuBackend = parseGpuBackend(value('--gpu-backend'));
     else if (a === '--export') push('exports', value('--export'));
     // -V, not -v: -v is doctor's --verbose and has been in the help text since
     // then, so taking it over would be a breaking change for anyone using it.
@@ -265,6 +276,16 @@ function parseArgs(argv: string[], doctorMode = false): Options {
       // flag is worth guessing at (that is the whole failure mode this exists
       // for), while a flag nothing resembles is better answered with where the
       // full list is than with a guess.
+      //
+      // A third shape is answered first because neither guess fits it: this tool
+      // spells a value as a separate argument (`--target wasm`, `-D FOO=1`), so
+      // `--target=wasm` is not a typo — the flag is right there — but the
+      // suggestion machinery only sees the whole token and would say the flag
+      // does not exist. Name the real spelling instead.
+      const eq = a.indexOf('=');
+      if (eq > 2 && KNOWN_FLAGS.includes(a.slice(0, eq))) {
+        throw new Error(`unknown argument: ${a} — write \`${a.slice(0, eq)} ${a.slice(eq + 1)}\` (a space, not '=')`);
+      }
       const near = suggestFlag(a);
       throw new Error(near !== ''
         ? `unknown argument: ${a} (did you mean ${near}?)`
@@ -296,6 +317,12 @@ function parseArgs(argv: string[], doctorMode = false): Options {
   if (opts.asClassPaths.length > 0 && !opts.airApp) {
     throw new Error(`--as-class-path only applies to --air-app (it widens the main class's source roots); list the extra files as inputs instead`);
   }
+  // --gpu-backend picks which backend the generated manifest links; only --air-app
+  // generates one. On a plain run it would be accepted, change nothing, and build
+  // the default backend while claiming otherwise (§2.5).
+  if (opts.gpuBackend !== null && !opts.airApp) {
+    throw new Error(`--gpu-backend only applies to --air-app (the backend is compiled into the window glue the generated manifest links); put --gpu-backend in the manifest you build, or use --air-app`);
+  }
   return opts;
 }
 
@@ -321,6 +348,7 @@ function usage(): string {
     '                 Paths are working-directory relative; a class must not be declared',
     '                 under two roots (that is an error, not last-wins)',
     '  --all-sources  --air-app: compile every .as under src/ instead of the main class\n                 reachable closure (pre-阶段一百二十四 behaviour; see reach.ts)',
+    '  --gpu-backend <b>  --air-app: which native API composites the window:\n                 auto (default: D3D12 on Windows 10 1507+, Metal on macOS) | d3d12 |\n                 gl (WGL/OpenGL: does not need d3d12.dll, so it is the only GPU\n                 option below D3D12\'s Win10 1507 floor -- not yet run there).\n                 Persisted in the generated manifest, so it survives later\n                 --air-app runs; `auto` clears it. Windows-only, and needs a GPU\n                 window (<renderMode>direct</renderMode>); see docs/zh-cn/compile.md §3.4.6',
     '  -I <dir>       include path (repeatable)',
     '  -L <dir>       library search path (repeatable)',
     '  -l <lib>       link library (repeatable)',
@@ -478,7 +506,7 @@ async function runDoctorMode(opts: Options): Promise<number> {
     const air = prepareAirApp(
       opts.airApp, opts.mainClass, vendorDir,
       overrides.package === 'web', resolveFeatures(overrides.features),
-      opts.output, opts.includeThirdParty, opts.extDirs,
+      opts.output, opts.includeThirdParty, opts.extDirs, opts.asClassPaths, opts.gpuBackend,
     );
     process.stderr.write(`doctor: judged against the manifest generated from ${opts.airApp}\n`);
     Object.assign(cfg, applyManifest(cfg, loadManifest(air.manifestPath), air.manifestPath));
@@ -622,7 +650,7 @@ async function main(): Promise<void> {
     // window backend (SDL2/Cocoa) is native-only and cannot link under wasm-ld.
     // `opts.output` reaches the adapter because the web preload set must not sweep
     // this build's own output dir into the page's FS image (see findPreloadPaths).
-    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output, opts.includeThirdParty, opts.extDirs, opts.asClassPaths);
+    const air = prepareAirApp(opts.airApp, opts.mainClass, vendorAbs, opts.overrides.package === 'web', explicitFeatures, opts.output, opts.includeThirdParty, opts.extDirs, opts.asClassPaths, opts.gpuBackend);
     // The adapter reports what it can see but must not silently ship (e.g. a web
     // build whose text has no font to draw with). Yellow, not red: the build is
     // still usable, but the output would be wrong in a way the user cannot guess.

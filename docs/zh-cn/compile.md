@@ -488,6 +488,105 @@ as-aot app.as --air-app app.xml --features tray
 清单里同名字段：`{ "features": ["tray"] }`；`examples/status-item.as` + `examples/status-item.build.json`
 是最小可用例子。
 
+#### 3.4.6 窗口 GPU 后端（`--gpu-backend`，Windows）
+
+Windows 上有**两个**窗口合成后端：默认的 **D3D12**（`vendor/d3d_glue.cc`，阶段一百二十六）和
+**WGL/OpenGL**（`vendor/gl_glue.cc`）。两者都是「Skia 直接画进交换链」，区别只在把画面交给合成器的那一层。
+
+```bash
+# 默认 auto：Windows 上就是 D3D12，macOS 上是 Metal
+as-aot --air-app app.xml
+
+# 显式指定（与 auto 产物逐字相同，只是把选择写进清单）
+as-aot --air-app app.xml --gpu-backend d3d12
+
+# 换 WGL：同一份源码、同一棵 Skia，走 opengl32
+as-aot --air-app app.xml --gpu-backend gl
+```
+
+| 取值 | Windows | macOS | 说明 |
+|---|---|---|---|
+| `auto`（缺省） | D3D12 | Metal | 与引入本开关之前**逐字节相同** |
+| `d3d12` | D3D12 | — | 显式钉住，`auto` 的含义将来变了也不跟着漂 |
+| `gl` | WGL / OpenGL | — | 见本节全部约束 |
+
+##### 为什么它不在 `app.xml` 里（实测，不是判断）
+
+AIR 描述符的 `<windows>` 里确实有同类先例 —— `<maxD3D>` 选择 D3D 版本。但**描述符装不下第三方后端名**，
+这是量出来的：
+
+- `Descriptor.51.4.xsd` 里 `<windows>` 是 `xs:all`，子元素只有 `UseWebView2` / `maxD3D` / `localAppData` /
+  `useDirectDrawFonts` 四个；**整份 XSD 没有任何 `xs:any`**，即不存在扩展点。
+- 拿 `adt -package` 实测（夹具 `temp/descext/`，自签 `test.p12`）：加 `<gpuBackend>` 报
+  `FAIL(12): error 103: application.windows.gpuBackend is an unexpected element/attribute`；
+  换成**异命名空间**的元素（`<windows>` 内、顶层各一例）与 `<application>` 上的异命名空间**属性**，
+  四种写法**全部 error 103**。
+- `adl` 对上述四种写法都**沉默**，但这**不是** schema 接受 —— `adl` 只做手写的子集检查，它同样接受
+  `<maxD3D>abc</maxD3D>`（`adt` 会拒绝）。`adl` 的退出码 0/6/7/8 只覆盖「找不到描述符 / 缺 `content` /
+  缺 `initialWindow`」三件事，不构成「描述符合法」的证据。
+
+所以选择走**我们自己的生成清单**（`gpu-backend` 字段，§4），AIR 从不读它 —— 与 `features` 的存法
+（§3.4.2.1）是同一条路。
+
+##### 优先级与持久化
+
+```
+--gpu-backend（本次调用）> 上次生成的清单里的 gpu-backend > ASC_GPU_BACKEND 环境变量 > auto
+```
+
+- `--gpu-backend gl` 会把选择**写进 `<filename>.build.json`**，之后不带 flag 重跑仍然生效（否则每次
+  增量构建都要记住一个 flag）。
+- `--gpu-backend auto` **显式清除**清单里的字段 —— 「字段不存在」就是 `auto`，因此不会有陈旧值残留。
+- `ASC_GPU_BACKEND` 是原型期的临时开关，**保留**作最低优先级别名（现有脚本不至于一夜失效），但它输给
+  任何被钉住的值时会打印黄字说明谁赢了，**不会**静默让步。
+
+##### 五种情况会被**拒绝**，而不是「开了但什么都不变」
+
+按 [`../AGENTS.md`](../../../AGENTS.md) §1.5/§2.5：一个看起来生效、实际没生效的开关比没有开关更糟。
+
+| 情况 | 报错要点 |
+|---|---|
+| `--gpu-backend` 不带 `--air-app` | `only applies to --air-app`（裸 `.as` 构建没有描述符可读，后端由 `-D` 决定） |
+| `--target wasm --package web` | `a web build has no window backend to choose`（浏览器只有 WebGL2） |
+| 宿主不是 Windows | `Windows-only`；并指出 macOS 对应物是 `metal_glue.mm` |
+| 描述符没编进 GPU 窗口（`<renderMode>` 为 `auto`/`cpu` 或 `visible=false`） | `does not ask for one`，并指出要 `renderMode>direct` |
+| `--gpu-backend gl` + Stage3D | `no Stage3D backend`（`vendor/stage3d_d3d.cc` 是 HLSL/`vs_5_1`，GL 上跑不了；拒绝而不是链进去变成黑色舞台） |
+
+清单里的 `gpu-backend` 与 `defines` 由 `applyManifest` **交叉校验**，不重新推导：`gl` 必须带
+`ASC_RENDER_GL=1`、`d3d12` 必须带 `ASC_RENDER_D3D=1`，两个宏同时出现直接报
+`one binary links one window GPU backend`。这样手改清单的人不会以为改了一行就换了后端。
+
+##### 实测：换后端**不提帧率**
+
+同一个 `GalleryApp`（1500×1050 @150% DPI，Win11 26200，RTX 4090 D），`ASC_GPU_STATS=1` 读「每帧图形
+工作耗时」（已排除 vsync 阻塞）：
+
+| 后端 | 帧时 | fps | 图形工作 | 自动烘焙关闭后 |
+|---|---|---|---|---|
+| `cpu`（CPU 光栅 + `SDL_UpdateTexture`） | 42.00 ms | 23.8 | — | — |
+| `d3d12` | 42.00 ms | 24.0 | 1.28 ms | 2.30 ms |
+| `gl` | 42.00 ms | 24.1 | **0.55 ms** | 1.00 ms |
+
+结论要照实说：**帧时三者相同**，瓶颈在 AS3/布局侧（图形只占 1.3–5.5%）；GL 省下的是**提交路径**
+（约 1.1–1.3 ms/帧），不是总帧时。像素等价性也量过：同帧对比差 1026 px（0.067%），且全部落在 y=84..92
+一条 9–10px 横带内 —— 同一个 exe 连跑两次在同一带内也差 114 px（示例动画的时序抖动），故不是后端差异。
+
+##### 已知边界（未测项照实列）
+
+- **present 模型不同**：D3D12 走 `FLIP_DISCARD`（Win10+ 唯一能进 independent flip 的交换模型），WGL 的
+  `SwapBuffers` 是 blt 模型，窗口模式**必经 DWM 合成**。实测帧时没差，但合成延迟没测（需抓帧工具）。
+- **只在 Win11 26200 + RTX 4090 D + 单显示器上跑过**。Intel/AMD 老驱动、远程桌面、虚拟机下的 WGL 行为，
+  以及 compat profile 下 `glTexStorage2D` 之类快路径的可用性，**均未测**。
+- Stage3D 与 GL 的组合是**构建期拒绝**（上表最后一行），不是「跑起来差一点」。
+- 链接期仍需 `d3d12`/`dxgi`/`d3dcompiler` 三个导入库：`vendor/skia/lib/windows-x64/skia.lib` 是按
+  `skia_use_direct3d=true` 编的，`GrDirectContexts::MakeGL` 与 `MakeDirect3D` 在同一个 TU。
+  `/OPT:REF` 之后产物导入表是干净的（实测只有 `OPENGL32` + 系统 DLL，**不含** `d3d12.dll`/`dxgi.dll`/
+  `d3dcompiler_47.dll`），这本身就是要报明的一条：**链接期依赖 ≠ 运行期依赖**。
+- 上下文**刻意建 compat profile**：AGAL→GLSL 生成器输出的是 ES 1.00（`attribute`/`varying`/`texture2D`），
+  升到 core profile 要动 web 共用的那份生成器，回归面更大。
+
+平台侧的取舍与 Windows 专属细节见 [`win32.md`](win32.md) §3.1.1。
+
 ### 3.5 AIR 应用描述符（--air-app）
 
 解析 AIR `app.xml`，自动生成引导启动代码 + 构建清单，把纯 AS 的 AIR 项目一键迁移到 as-aot：
@@ -789,6 +888,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `defines` | string[] | 预处理宏（→ `-D`） |
 | `c-flags` | string[] | **原样透传**给 C/C++ 编译器的旗标（`--cflag <f>` / `-w` 的清单写法）。落在**每一个**编译步骤与链接步骤上（C 源、C++ 胶水层、链接），位置在对象与 `-l` 库**之前**（`-Wl,--as-needed` 这类链接旗标对顺序敏感）。**不做白名单**：编译器不认的旗标必须让构建**响亮的失败**——那正是「旗标真的到了编译器」的唯一证据。默认空 ⇒ 不写就与以前的产物逐字节相同。顶层 append（CLI 与清单可并存）、`targets.<目标>` 块 replace（按 §4.1 的规则） |
 | `features` | string[] | **具名增强开关**（§3.4.2），如 `["svg"]`。默认空。未知名字报错；开了会在构建横幅里点名，不开则产物与 `adl` 同构。`--features` 在 CLI 侧是**替换**整个集合（`-D` 才是追加） |
+| `gpu-backend` | `"auto" \| "d3d12" \| "gl"` | Windows 的**窗口 GPU 后端**（§3.4.6），缺省不写 = `auto`（D3D12）。由 `--air-app --gpu-backend` 写入，**只允许出现在顶层**（写进 `targets.<目标>` 块报错：后端由描述符与宿主共同决定，不是按目标分层的量）。不写该字段的构建**逐字节不变**。它与 `defines` **交叉校验**：`gl` 必须带 `ASC_RENDER_GL=1`、`d3d12` 必须带 `ASC_RENDER_D3D=1`，两个宏同时出现直接报错 |
 | `objects` | string[] | 预编译 `.o` 直接加入链接 |
 | `frameworks` | string[] | macOS 框架（→ `-framework X`，Skia 的 CoreText/CoreGraphics 后端需要）。**只在 `darwin` + `target=native` 上发射**：其他宿主静默丢弃（不报错），因此同一份清单可以同时写着 `Cocoa`/`Metal` 与 `gdi32`（后者走 `link-libs` 的 `${win:}`，见 §4.1.1）；以前在 Windows 上它们会被当成**输入文件**丢给链接器，报 `lld-link: could not open 'Cocoa'` |
 | `font-urls` | string[] | 字体字节流 URL 列表（`--package web` 时写入 `index.html`，运行时网络加载注入 Skia；见 [`html5-web.md`](html5-web.md) §4） |
@@ -1267,11 +1367,16 @@ no-op」（见下文 `runtime.ts` 的条件编译）。因此同一个 `.as` 换
 > | 宏 | 含义 | 由谁定义 |
 > |---|---|---|
 > | `ASC_RENDER_METAL` | **窗口合成**走 Metal：`metal_glue.mm` 的 `CAMetalLayer` + Ganesh，整帧在 GPU 上合成（2D 上屏用）。**每个窗口一份状态**（按窗口 id 分槽，只共享 device/queue/context），主窗口与运行期 `NativeWindow` 都走它（后者除非 `renderMode="cpu"`） | `air-app.ts` 在 `<renderMode>direct/gpu` + 可见窗口时加入 |
+> | `ASC_RENDER_WINGPU` | **Windows 的窗口合成**，一个**后端中立**的开关：只说「这扇窗走 GPU」，不说哪一套。`window_glue.cc` 据此调 `sk_attach_gpu()`，后者再按具体宏分派到 `d3d_glue.cc`（`ASC_RENDER_D3D`）或 `gl_glue.cc`（`ASC_RENDER_GL`） | `air-app.ts` 在同上条件且宿主为 Windows 时加入 |
 > | `ASC_RENDER_STAGE3D` | **Stage3D 的 `Context3D` 接到真实 GPU**：链接 `stage3d_glue.mm`，`as_s3d_*` 包装器从 no-op 变为真实 Metal 调用 | 构建清单（`usesStage3D` 时由 `air-app.ts` 加入） |
 >
 > 二者**互相独立**：只定义前者时 `Context3D` 仍是纯 C 状态机（`driverInfo` 返回 `"Software (state machine)"`）；
 > 只定义后者时窗口仍走 CPU raster（如 `examples/stage82.build.json`）。既是 GPU 窗口又用 Stage3D 的工程
 > （Starling、shmup）两个都要给。
+
+> **Windows 的具体后端由 `--gpu-backend` 决定**（§3.4.6）：`ASC_RENDER_D3D` 与 `ASC_RENDER_GL` **互斥**，
+> 同时出现会在**构建期**报 `one binary links one window GPU backend`——而不是让链接器/预处理器替你选一个。
+> 没定义 `ASC_RENDER_WINGPU` 时两个都不加，窗口回去走 CPU 光栅（与阶段一百二十六 之前的产物一致）。
 
 **帧率诊断旋钮**（用 `-D` 追加，默认不编译进产物）：
 
