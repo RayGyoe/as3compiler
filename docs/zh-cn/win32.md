@@ -1296,6 +1296,77 @@ t=8123 bake_drop o=0x1f2a3b40 w=1280 h=720 draw=1
 **未验证**：真机 32 位 exe 上「翻页不换图」是否就此消失 —— 要重编客户端再翻一遍。
 **这一处仍然一个字都没动内存峰值。**
 
+### 3.20 GC 回收对象时不归还它持有的 C++ 资源：每页漏 8.3 MB，翻到第 39 页地址空间见底（阶段二百八十三）
+
+§3.17 / §3.19 之后，中间页翻页正常了，真机只剩**最后一页**（这一副 pptx 的第 39 页）不换图。
+第三轮定位到一个与「换图」正交、但同样只在真机上才撞得到的形状：**内存**。
+
+日志里的直接证据（`temp/crashmon/latest.log`，同一次运行）：
+
+```
+out of memory: malloc failed for 8294416 bytes (gc heap 115.2 MB, 181 segments)
+sample ... responding=False ... 1149 MB
+```
+
+8294416 = 1920 x 1080 x 4（再对齐到段尺寸）—— 正好是**下一页的像素缓冲**。也就是说：进程把
+地址空间用光了，下一页的 `BitmapData` 分配在 `Loader` 的 `COMPLETE` 处理器里抛 `Error #1000`，
+于是图片永远不落地，画面停在上一页。用户看到的「翻到最后一页就不行了」是**第 39 页这次分配失败**，
+不是烘焙又冻住了。
+
+为什么 39 页能吃掉 300+ MB：渲染路径会给 `BitmapData` 缓存一个 SkImage 视图（`as_bmd_live_image`
+→ `_live_image`，全尺寸 ARGB）。SkImage 是 **malloc/C++ 内存**，不在 GC 堆里，代码里它只在
+`dispose()` 或换图时被 `as_skia_image_delete`。而应用每页的形状是：
+
+```as3
+var bd:BitmapData = new BitmapData(w, h, true, 0);   // ImageLoader
+bd.draw(loader);
+bitmap.bitmapData = bd;                               // 上一张直接丢掉，从不 dispose
+```
+
+对象被丢弃后 GC 只回收 GC 块，对那张 8.3 MB 的图**一无所知** ⇒ 每页漏一张。自动烘焙的表面快照
+（`DisplayObject._cache_image`，1280x720 ≈ 3.7 MB）是同一类对象：重建时旧的会删，最后一个随对象
+一起漏。
+
+修法是给清扫加一个终结器：**即将被回收的（白色）块按定义已不可达**，这正是运行 finalizer 的条件。
+
+```c
+/* runtime.ts: 登记表按「持有者地址」索引，释放即摘除，从不反解指针 */
+static void as_final_register(void* owner, void* res);
+static void as_final_release(void* owner, void* res);   /* 重建/dispose 前先摘 */
+static void as_final_on_free(void* owner);              /* 清扫时按地址释放 */
+
+/* gc_sweep_step */
+if (h->color == GC_WHITE) {
+    as_final_on_free((char*)h + sizeof(gc_header));   /* 载荷地址，即登记用的那个 */
+    ...
+}
+```
+
+登记/摘除点一共六处，覆盖「一个 BitmapData 得到一张图」的所有路径：`as_bmd_live_image`（活像素
+视图，重建时先 release 再 delete）、`dispose()`（两处 release）、`Loader` 的 `COMPLETE` 解码、
+`BitmapData.loadFile`、SWC/`[Embed]` 的 `adoptEncoded`，以及烘焙快照（`as_render_cached` 重建、
+`cacheAsBitmap = false`）。**删之前必须先摘**：漏摘 = 二次 `SkImage` 释放 = 崩溃，不是泄漏。
+
+**已验证**（`examples/gc-image-free.as`，`--manifest examples/gc-image-free.build.json`，
+39 页 1920x1080 全部「换掉不 dispose」）。同一份产物上 A/B：
+
+```
+ASC_NO_FINAL=1    Uncaught exception: FAIL: the dropped pages' SkImages were released
+                  (RSS +341 MB over 39 pages; ...)          <- 复现原缺陷
+（正常）           gc-image-free: p0=25030656 p1=66887680 ...  <- +42 MB，四条断言全过
+```
+
+第二条断言钉的是**正确性**：还活着的那张 `BitmapData` 在收集之后必须仍能画出原色（终结器错放
+活对象的图 ⇒ 读到垃圾或崩）。结构钉在 `test/unit/render.ts` 的 `ImageFinalizer` 组（16 条：
+清扫侧调用点与载荷地址、四处「先摘后删」、六个登记点、烘焙快照、`ASC_NO_FINAL` 开关）。
+
+诊断：`ASC_NO_FINAL=1` 关掉终结器即可在真机上把泄漏开/关，不必换产物。
+
+**未验证**：真机 32 位 exe 上「第 39 页不换图」是否就此消失（要重编客户端再翻一遍）。
+**也没解决**峰值本身：README 提到的 ~1000 MB 里，本节只交代了「每页 8.3 MB 的 SkImage」这一条
+确定性来源；arena/malloc 侧（闭包 env、`as_vector`、字节缓冲以外的散落分配）仍未纳入 GC，量级
+未测。今天能说的是：**每翻一页的确定性增长已经去掉**。
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +

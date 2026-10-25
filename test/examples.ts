@@ -327,6 +327,13 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 烘一次就永远重放那张图（真机：presenter 模式下大图 = pBitmapData.draw(skinView.view) 的
   // 输出，翻页不换图）。断言是像素、且要链 Skia，故同 bake-bitmap-swap.as。
   'bake-draw-cache.as': ['--manifest', join(dir, 'bake-draw-cache.build.json')],
+  // gc-image-free.as（阶段二百八十三）钉的是**被丢弃对象持有的 C++ 资源**：渲染路径给
+  // BitmapData 缓存的 SkImage 视图（8.3 MB/页，1920x1080）不在 GC 堆里，对象被直接丢弃
+  // （不 dispose，应用每页都这样）时没人释放它 —— 真机 39 页 × 8.3 MB 把 32 位地址空间
+  // 推到 1.1 GB，下一页的 gc_alloc 在 Loader COMPLETE 里抛 #1000，于是「翻到最后一页就不
+  // 换图」。断言是**进程常驻内存**（System.privateMemory），要有光栅后端才会真的建那张
+  // 视图，故同 bake-draw-cache.as 一样链 Skia。ASC_NO_FINAL=1 可让这条断言变红（A/B）。
+  'gc-image-free.as': ['--manifest', join(dir, 'gc-image-free.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
   // roundrect.as（阶段二百六十七 · G19）断言的也是**像素**：drawRoundRect 的两个半径必须

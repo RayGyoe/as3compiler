@@ -1035,8 +1035,13 @@ function checkSwcJpeg3Alpha(): string[] {
     c.includes('p[i] = (a << 24) | (c & 0x00ffffffu);'));
   check('a BitmapData is adopted through the alpha-aware helper with the plane + size',
     c.includes('BitmapData_adoptEncodedAlpha((BitmapData*)o, __res_probeArt, (size_t)21, __res_probeArt_a, 4, 4);'));
+  // 阶段二百八十三: the arm also registers the image with the collector's finalizer (a
+  // named-resource BitmapData that is dropped without dispose() would otherwise keep
+  // its 8.3 MB SkImage forever), so the arm is matched as a slice of its own.
   check('the composed pixels become the view (the encoded bytes would paint black)',
-    c.includes('if (alpha != NULL) { bd->image = as_skia_image_from_argb(gcpx, w, h); return; }'));
+    c.includes('if (alpha != NULL) { bd->image = as_skia_image_from_argb(gcpx, w, h);') &&
+    c.indexOf('if (alpha != NULL) { bd->image = as_skia_image_from_argb(gcpx, w, h);') <
+      c.indexOf('as_final_register(bd, bd->image);', c.indexOf('if (alpha != NULL) { bd->image = as_skia_image_from_argb(gcpx, w, h);')));
   check('no plane is still the plain adopt, i.e. the lazy Skia decode is kept',
     c.includes('static void BitmapData_adoptEncoded(BitmapData* bd, const unsigned char* bytes, size_t len) {') &&
     c.includes('BitmapData_adoptEncodedAlpha(bd, bytes, len, NULL, 0, 0);'));
@@ -1565,7 +1570,130 @@ function checkAlphaLayerBalance(): string[] {
 registerGroup('unit: render/DrawComposite', checkDrawComposite);
 registerGroup('unit: render/ScrollRectWindow', checkScrollRectWindow);
 registerGroup('unit: render/ScrollRectBake', checkScrollRectBakeInvalidation);
+// ---- 阶段二百八十三: a collected object must give back the C++ resources it owns ----
+//
+// The behavioural oracle is examples/gc-image-free.as (39 pages of 1920x1080, dropped
+// without dispose the way the meeting client drops them: RSS +341 MB with
+// ASC_NO_FINAL=1, +42 MB without). What a memory reading cannot show is the WIRING,
+// and the wiring is where this defect lived for as long as the renderer cached
+// anything: an SkImage is malloc'd/C++ memory, so the collector has no idea a dying
+// BitmapData still owns one.
+//
+// Pin the four halves that make the hook correct rather than merely present:
+//   1. the sweeper calls it for a WHITE (unreachable) block, with the payload address
+//      that owners register against;
+//   2. every delete of an owner-held image is preceded by as_final_release, so the
+//      owner's death cannot delete it a second time (a double SkImage release is a
+//      crash, not a leak);
+//   3. every creation site registers, so none of the four ways to give a BitmapData an
+//      image silently falls back to leaking;
+//   4. the baked surface snapshot (DisplayObject._cache_image) is on the same list.
+function checkImageFinalizer(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [imgfinal] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [imgfinal] ${label}`); }
+  };
+  const src = [
+    'import flash.display.Sprite;',
+    'import flash.display.Bitmap;',
+    'import flash.display.BitmapData;',
+    'var bd:BitmapData = new BitmapData(8, 8, false, 0x0000FF);',
+    'var b:Bitmap = new Bitmap(bd);',
+    'var s:Sprite = new Sprite();',
+    's.addChild(b);',
+    'bd.draw(s);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  // 1. the sweep-side hook
+  const swStart = c.indexOf('static bool gc_sweep_step(size_t budget) {');
+  const swEnd = swStart < 0 ? -1 : c.indexOf('\nstatic ', swStart + 10);
+  const sweep = swStart < 0 || swEnd < 0 ? '' : c.slice(swStart, swEnd);
+  check('the sweeper runs the finalizer before recycling a block',
+    sweep.includes('as_final_on_free((char*)h + sizeof(gc_header));'));
+  check('...only for a WHITE (unreachable) block, inside that branch',
+    sweep.indexOf('if (h->color == GC_WHITE) {') >= 0
+    && sweep.indexOf('if (h->color == GC_WHITE) {') < sweep.indexOf('as_final_on_free('));
+  check('...using the payload address, i.e. exactly what owners register',
+    sweep.includes('(char*)h + sizeof(gc_header)')
+    && c.includes('void* body = (void*)((char*)h + sizeof(gc_header));'));
+
+  // 2. the hook itself
+  check('the hook deletes the registered image and forgets the entry',
+    c.includes('static void as_final_on_free(void* owner) {') && c.includes('as_skia_image_delete(res);'));
+  check('...and is a no-op while nothing is registered (a hot path: one compare)',
+    c.includes('if (ASC_final_used == 0 || !as_final_on()) return;'));
+  check('the leak is reproducible on the same binary (ASC_NO_FINAL=1)',
+    c.includes('static int as_final_disabled = -1;') && c.includes('getenv("ASC_NO_FINAL")'));
+
+  // 3. every delete of an owner-held image releases first (no double free)
+  const liveStart = c.indexOf('as_bmd_live_image(');
+  const liveDef = c.lastIndexOf('static void* as_bmd_live_image(');
+  const liveEnd = liveDef < 0 ? -1 : c.indexOf('\nstatic ', liveDef + 10);
+  const live = liveDef < 0 || liveEnd < 0 ? '' : c.slice(liveDef, liveEnd);
+  check('as_bmd_live_image is emitted', liveStart >= 0 && live.length > 0);
+  check('...releases the old view before deleting it',
+    live.includes('as_final_release(bd, bd->_live_image)')
+    && live.indexOf('as_final_release(bd, bd->_live_image)') < live.indexOf('as_skia_image_delete(bd->_live_image)'));
+  check('...and registers the new one', live.includes('as_final_register(bd, bd->_live_image);'));
+
+  const disStart = c.indexOf('void BitmapData_dispose(void* _this) {');
+  const disEnd = disStart < 0 ? -1 : c.indexOf('\nstatic ', disStart + 10);
+  const dispose = disStart < 0 || disEnd < 0 ? '' : c.slice(disStart, disEnd);
+  check('BitmapData.dispose releases both registrations before deleting',
+    dispose.includes('as_final_release(bd, bd->image)')
+    && dispose.includes('as_final_release(bd, bd->_live_image)')
+    && dispose.indexOf('as_final_release(bd, bd->image)') < dispose.indexOf('as_skia_image_delete(bd->image)')
+    && dispose.indexOf('as_final_release(bd, bd->_live_image)') < dispose.indexOf('as_skia_image_delete(bd->_live_image)'));
+
+  // Each creation site lives in its own emitted function, so pin the function rather
+  // than a global count: the Loader body registers ONCE for both of its arms (bytes and
+  // file), which is correct and would look like a missing site under a 1:1 count.
+  // Skip forward declarations: the emitted C declares the loaders before defining
+  // them, so the first "name(" is a prototype whose "{" belongs to another function.
+  const fnBody = (name: string): string => {
+    let at = c.indexOf(name + '(');
+    while (at >= 0) {
+      const open = c.indexOf('{', at);
+      const semi = c.indexOf(';', at);
+      if (open >= 0 && (semi < 0 || open < semi)) {
+        const close = c.indexOf('\n}', open);
+        return close < 0 ? '' : c.slice(open, close);
+      }
+      at = c.indexOf(name + '(', at + 1);
+    }
+    return '';
+  };
+  const loader = fnBody('Loader__imageFinish');
+  check('the Loader COMPLETE decode registers the view it just decoded',
+    loader.includes('bd->image = as_skia_image_from_') && loader.includes('as_final_register(bd, bd->image);'));
+  const loadFile = fnBody('BitmapData_loadFile');
+  check('the local loadFile decode registers too',
+    loadFile.includes('bd->image = as_skia_image_from_file(path);') && loadFile.includes('as_final_register(bd, bd->image);'));
+  check('the embedded/SWC adopt path registers (when that emitter is present)',
+    c.indexOf('BitmapData_adoptEncodedAlpha') < 0
+    || fnBody('BitmapData_adoptEncodedAlpha').includes('as_final_register(bd, bd->image);'));
+  // 4. the baked surface snapshot
+  const bakeStart = c.indexOf('static void as_render_cached(void* canvas, DisplayObject* o) {');
+  const bakeEnd = bakeStart < 0 ? -1 : c.indexOf('\nstatic ', bakeStart + 10);
+  const bake = bakeStart < 0 || bakeEnd < 0 ? '' : c.slice(bakeStart, bakeEnd);
+  check('a bake registers its surface snapshot with the finalizer',
+    bake.includes('as_final_register(o, o->_cache_image);'));
+  check('...and releases the previous one before replacing it',
+    bake.includes('as_final_release(o, o->_cache_image)')
+    && bake.indexOf('as_final_release(o, o->_cache_image)') < bake.indexOf('o->_cache_image = as_skia_surface_make_snapshot(surface);'));
+  check('cacheAsBitmap = false releases its registration too',
+    /void DisplayObject_set_cacheAsBitmap[\s\S]{0,600}as_final_release\(o, o->_cache_image\)/.test(c));
+
+  console.log(`[imgfinal] ${ok} image-finalizer checks passed`);
+  return bad;
+}
+
 registerGroup('unit: render/SvgChannel', checkSvgChannel);
+registerGroup('unit: render/ImageFinalizer', checkImageFinalizer);
 registerGroup('unit: render/FontMetrics', checkFontMetrics);
 registerGroup('unit: render/TextWrap', checkTextWrap);
 registerGroup('unit: render/BorderWidth', checkBorderWidth);

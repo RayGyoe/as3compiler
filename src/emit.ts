@@ -8031,10 +8031,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // pixels: the encoded bytes are the opaque JPEG, which paints black wherever
     // the artwork is transparent. Without a plane the bytes stay the direct view,
     // keeping Skia's lazy decode.
-    this.line('if (alpha != NULL) { bd->image = as_skia_image_from_argb(gcpx, w, h); return; }');
+    this.line('if (alpha != NULL) { bd->image = as_skia_image_from_argb(gcpx, w, h); as_final_register(bd, bd->image); return; }');
     this.indent--;
     this.line('}');
-    this.line('bd->image = as_skia_image_from_bytes(bytes, len);');
+    this.line('bd->image = as_skia_image_from_bytes(bytes, len); as_final_register(bd, bd->image);');
     this.indent--;
     this.line('}');
     this.line('static void BitmapData_adoptEncoded(BitmapData* bd, const unsigned char* bytes, size_t len) {');
@@ -11437,7 +11437,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('DisplayObject* o = (DisplayObject*)_this;');
     this.line('if (o->_cache_flag == value) return;');
     this.line('o->_cache_flag = value;');
-    this.line('if (o->_cache_image != NULL) { as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('o->_cache_valid = 0;');
     this.indent--;
     this.line('}');
@@ -13561,6 +13561,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('unsigned enc_len = as_job_len(job);');
     this.line('if (enc != NULL && enc_len > 0) bd->image = as_skia_image_from_bytes(enc, enc_len);');
     this.line('else if (li->url != NULL) bd->image = as_skia_image_from_file(li->url);');
+    this.line('as_final_register(bd, bd->image);');
     this.line('Bitmap* bmp = Bitmap_new(bd, (char*)"auto", false);');
     this.line('o->content = (DisplayObject*)bmp;');
     this.line('gc_write_barrier((void*)bmp);');
@@ -18714,8 +18715,13 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('if (bd == NULL || bd->pixels == NULL || bd->width <= 0 || bd->height <= 0) return NULL;');
     this.line('if (bd->_live_image != NULL && bd->_live_ver == bd->_px_ver) return bd->_live_image;');
-    this.line('if (bd->_live_image != NULL) { as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
+    this.line('if (bd->_live_image != NULL) { as_final_release(bd, bd->_live_image); as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
     this.line('bd->_live_image = as_skia_image_from_argb(bd->pixels, bd->width, bd->height);');
+    // Hand the image to the collector's finalizer list: this BitmapData may be
+    // dropped without ever being dispose()d (the slide viewer replaces
+    // bitmap.bitmapData on every page), and an SkImage left in a collected
+    // object's field is unreachable memory that nothing else can free.
+    this.line('as_final_register(bd, bd->_live_image);');
     this.line('bd->_live_ver = bd->_px_ver;');
     this.line('return bd->_live_image;');
     this.indent--;
@@ -18788,6 +18794,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (px != NULL) { unsigned* gcpx = (unsigned*)gc_alloc(GCT_BYTES, sizeof(unsigned) * (size_t)(w * h)); memcpy(gcpx, px, sizeof(unsigned) * (size_t)(w * h)); free(px); bd->pixels = (void*)gcpx; gc_write_barrier(bd->pixels); bd->width = w; bd->height = h; }');
     // Keep the SkImage view for the display-list Bitmap render path as well.
     this.line('bd->image = as_skia_image_from_file(path);');
+    this.line('as_final_register(bd, bd->image);');
     this.indent--;
     this.line('}');
     // fillRect: fill a rectangular region with an ARGB color. The color's alpha is
@@ -19260,8 +19267,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // on the GC heap now (free() on it would corrupt the GC's free list). AIR
     // releases the memory immediately; here the next collection reclaims it.
     this.line('bd->pixels = NULL;');
-    this.line('if (bd->image != NULL) { as_skia_image_delete(bd->image); bd->image = NULL; }');
-    this.line('if (bd->_live_image != NULL) { as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
+    this.line('if (bd->image != NULL) { as_final_release(bd, bd->image); as_skia_image_delete(bd->image); bd->image = NULL; }');
+    this.line('if (bd->_live_image != NULL) { as_final_release(bd, bd->_live_image); as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
     this.line('bd->_px_ver++;');
     this.indent--;
     this.line('}');
@@ -24182,7 +24189,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('{ double _otx = 0.0, _oty = 0.0; as_skia_canvas_total_translate(canvas, &_otx, &_oty); if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "t=%.0f bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f bxo=%.5f byo=%.5f otx=%.5f oty=%.5f bpx=%.5f bpy=%.5f\\n", as_now_ms(), (void*)o, bl, bt, lw, lh, pw, ph, sx, sy, bxo, byo, _otx, _oty, bpx, bpy); }');
     this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { double _tx = 0.0, _ty = 0.0; as_skia_canvas_total_scale(canvas, &_tx, &_ty); double _ex = (_tx > 0.0) ? fabs((double)pw / ((double)lw * _tx) - 1.0) : 0.0; if (_ex > 0.002 || _tx != _ty) fprintf(stderr, "t=%.0f bake_anis o=%p lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f ctx=%.5f cty=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, lh, pw, ph, sx, sy, _tx, _ty, _ex); }');
-    this.line('if (o->_cache_image != NULL) { as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('void* surface = as_skia_surface_bake_new(pw, ph);');
     this.line('if (surface != NULL) {');
     this.indent++;
@@ -24198,6 +24205,9 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('else as_render_object_content(c2, o);');
     this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by;');
     this.line('o->_cache_image = as_skia_surface_make_snapshot(surface);');
+    // A baked object that leaves the stage has its Snapshot collected with it;
+    // the finalizer is what returns the surface memory to the allocator.
+    this.line('as_final_register(o, o->_cache_image);');
     this.line('as_skia_surface_delete(surface);');
     this.line('o->_cache_w = (double)pw; o->_cache_h = (double)ph;');
     this.line('o->_cache_phx = bpx; o->_cache_phy = bpy;');

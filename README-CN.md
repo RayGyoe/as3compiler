@@ -448,6 +448,15 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   10 fps 把 `skinView.view`（`ViewControl`，即 `cacheAsBitmap`）画进 1280x720 的 `BitmapData` 再显示，
   翻页因此不换图。修法是 draw 前先 `as_render_fp(src)`（在临时的源变换归零之前调用，两条路径必须
   哈希同一组字段）。需 `examples/bake-draw-cache.build.json` 链 Skia
+- `examples/gc-image-free.as` — 被丢弃对象必须归还它持有的 C++ 资源（阶段二百八十三）：渲染路径给
+  `BitmapData` 缓存的 SkImage 视图（1920x1080 = 8.3 MB）**不在 GC 堆里**，只在 `dispose()`／换图时
+  才删；应用每页 `new BitmapData(...)` 再换掉 `bitmap.bitmapData`（从不 `dispose`），于是每页漏一张。
+  真机 39 页 ≈ +325 MB，32 位进程爬到 1.1 GB 后下一页的 `gc_alloc` 在 `Loader` COMPLETE 里抛
+  `Error #1000`（真机那条 `malloc failed for 8294416 bytes`），表现就是「翻到最后一页就不换图」。
+  修法是 GC 的清扫在回收不可达块之前调用终结器 `as_final_on_free()`，把登记在该块地址上的 SkImage
+  释放掉（`BitmapData.image`／`_live_image`／`DisplayObject._cache_image` 三处登记，重建/dispose 先
+  `as_final_release` 再删，避免二次释放）。`ASC_NO_FINAL=1` 关掉终结器即可在同一份产物上复现泄漏
+  （实测 +341 MB；修好 +42 MB）。需 `examples/gc-image-free.build.json` 链 Skia（无后端时会自检跳过）
 - `examples/bakecrisp.as` — 烘焙分辨率与 `BitmapData.draw` 几何口径（对齐 `adl`）
 - `examples/bitmap-smoothing.as` — `Bitmap.smoothing` 采样模式（阶段二百三十）：默认 `false` 是最近邻、`true` 是双线性；
   同一张 16x1 黑白位图按 0.25 缩到 4x1，最近邻只会给出纯 0x00/0xFF、双线性必然混出中间灰。此前渲染分支恒用

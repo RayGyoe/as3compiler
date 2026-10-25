@@ -1301,6 +1301,86 @@ two entries at the top of this section.
 **Not verified**: whether the real 32-bit exe stops freezing on page turns (needs a rebuild and
 another pass through the deck). **This change still touches nothing about the memory peak.**
 
+### 3.20 Collected objects never gave back the C++ resources they hold: 8.3 MB per page, address space gone by page 39 (stage 283)
+
+After §3.17 / §3.19 the middle pages finally followed the deck, and the real machine still froze on
+**the last page only** (page 39 of this 39-page pptx). The third round found a defect orthogonal to
+"swapping the picture", one that only a real machine can hit: **memory**.
+
+The log says it directly (`temp/crashmon/latest.log`, same session):
+
+```
+out of memory: malloc failed for 8294416 bytes (gc heap 115.2 MB, 181 segments)
+sample ... responding=False ... 1149 MB
+```
+
+8294416 = 1920 x 1080 x 4 (rounded up to a segment) — the **pixel buffer of the next page**. The
+process had run out of address space, so the next `BitmapData` allocation raised `Error #1000` inside
+the `Loader` `COMPLETE` handler, the image never landed, and the view stayed on the previous page.
+"The last page does not change" was **page 39's allocation failing**, not another frozen bake.
+
+Why 39 pages cost 300+ MB: the render path caches an SkImage view of each `BitmapData`
+(`as_bmd_live_image` → `_live_image`, full-resolution ARGB). An SkImage is **malloc/C++ memory**, it is
+not on the GC heap, and the code only deletes it on `dispose()` or when the image is replaced. The
+application's per-page shape is:
+
+```as3
+var bd:BitmapData = new BitmapData(w, h, true, 0);   // ImageLoader
+bd.draw(loader);
+bitmap.bitmapData = bd;                               // the previous one is simply dropped
+```
+
+The collector reclaims the GC block and knows **nothing** about the 8.3 MB image ⇒ one leaked image per
+page. The auto-bake surface snapshot (`DisplayObject._cache_image`, 1280x720 ≈ 3.7 MB) is the same kind
+of object: a rebuild deletes the previous one, the last one leaks with its owner.
+
+The fix is a finalizer in the sweep: **a block about to be recycled is unreachable by definition**,
+which is exactly the condition for running one.
+
+```c
+/* runtime.ts: the table is keyed on the OWNER ADDRESS; release unregisters; no pointer is ever re-read */
+static void as_final_register(void* owner, void* res);
+static void as_final_release(void* owner, void* res);   /* unregister before a rebuild/dispose */
+static void as_final_on_free(void* owner);              /* release by address during the sweep */
+
+/* gc_sweep_step */
+if (h->color == GC_WHITE) {
+    as_final_on_free((char*)h + sizeof(gc_header));   /* the payload address owners register */
+    ...
+}
+```
+
+Six register/release sites cover every way a `BitmapData` gets an image: `as_bmd_live_image` (the live
+pixel view; release before delete on a rebuild), `dispose()` (both images), the `Loader` `COMPLETE`
+decode, `BitmapData.loadFile`, the SWC/`[Embed]` `adoptEncoded` path, and the bake snapshot
+(`as_render_cached` rebuild, `cacheAsBitmap = false`). **Release before delete**: a missed unregister is
+a double `SkImage` release, i.e. a crash rather than a leak.
+
+**Verified** (`examples/gc-image-free.as`, `--manifest examples/gc-image-free.build.json`, 39 pages of
+1920x1080 all "replaced without dispose"). A/B on one binary:
+
+```
+ASC_NO_FINAL=1    Uncaught exception: FAIL: the dropped pages' SkImages were released
+                  (RSS +341 MB over 39 pages; ...)          <- the original defect
+(default)         gc-image-free: p0=25030656 p1=66887680 ...  <- +42 MB, all four assertions pass
+```
+
+The second assertion pins **correctness**: a *live* `BitmapData` must still paint its colour after the
+collections (a finalizer that released a live owner's image would read garbage or crash). The structural
+pins live in `test/unit/render.ts` (`ImageFinalizer` group, 16 checks: the sweep-side call and its
+payload address, the four "release before delete" sites, the six registrations, the bake snapshot, the
+`ASC_NO_FINAL` switch).
+
+Diagnostics: `ASC_NO_FINAL=1` turns the finalizer off, so the leak can be switched on and off on the
+real machine without a rebuild.
+
+**Not verified**: whether the real 32-bit exe stops freezing on page 39 (needs a client rebuild and
+another pass through the deck). **Nor does this fix the peak**: of the ~1000 MB in the README, this
+section only accounts for one deterministic source (8.3 MB of SkImage per page turn); the arena/malloc
+side (closure environments, `as_vector`, the scattered allocations outside byte buffers) is still
+outside the GC and its magnitude is unmeasured. What can be said today: **the deterministic growth per
+page turn is gone**.
+
 ## 4. Runtime Form (D3D12 Direct, the Default)
 
 > The WGL file (`vendor/gl_glue.cc`, §3.1.1) is **isomorphic** to this one: also “a process-level

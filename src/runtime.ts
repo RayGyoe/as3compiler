@@ -7262,6 +7262,87 @@ static void gc_mark_drain(void) {
     }
 }
 
+// ---------- finalizing C++ resources owned by a GC block ----------
+//
+// The collector reclaims GC blocks; it knows nothing about resources a block
+// owns through a POINTER into malloc'd / C++ memory. The renderer has three
+// such owners, all of them measured leaks before this hook existed:
+//
+//   BitmapData._live_image  the SkImage view of a bitmap's own ARGB pixels
+//   BitmapData.image        the decoded / encoded view of a loaded bitmap
+//   DisplayObject._cache_image  the cacheAsBitmap / auto-bake surface snapshot
+//
+// Each is deleted on an explicit dispose(), a rebuild or a setter that turns the
+// cache off -- and never when the owner is simply collected, because the GC has
+// no finalizer. A 1920x1080 slide bitmap therefore left its 8.3 MB SkImage
+// behind forever: measured on the meeting client (ASC_GAUGE of the process
+// working set, temp/crashmon), flipping through a 39-page deck walked the
+// 32-bit process up to 1.1 GB and the next 8.3 MB gc_alloc for the following
+// page's pixel buffer raised Error #1000 inside the Loader COMPLETE handler, so
+// the page never reached the screen -- "it stops changing when I reach the last
+// page".
+//
+// A block the sweeper is about to recycle is unreachable BY DEFINITION, which is
+// exactly the condition for running a finalizer. as_final_on_free() is that
+// hook: the sweep calls it with the dying payload address and every resource
+// registered under that address is released. Registration is keyed on the owner
+// ADDRESS and an entry is dropped the moment its resource is released, so this
+// table never dereferences a freed pointer -- it only compares addresses.
+#define ASC_FINAL_SLOTS 4096
+static void* ASC_final_owner[ASC_FINAL_SLOTS];
+static void* ASC_final_res[ASC_FINAL_SLOTS];
+static int ASC_final_used = 0;
+static int ASC_final_released_n = 0;
+static void as_skia_image_delete(void* img);
+static void as_final_register(void* owner, void* res) {
+    if (owner == NULL || res == NULL) return;
+    if (ASC_final_used >= ASC_FINAL_SLOTS) {
+        static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "[as3-aot] finalizer table full (%d); C++ resources will leak\\n", ASC_FINAL_SLOTS); }
+        return;
+    }
+    ASC_final_owner[ASC_final_used] = owner;
+    ASC_final_res[ASC_final_used] = res;
+    ASC_final_used++;
+}
+// Release ONE resource of an owner (a rebuild replaces an image): the caller has
+// already deleted it, this only forgets the registration so the owner's death
+// does not delete it a second time.
+static void as_final_release(void* owner, void* res) {
+    for (int i = 0; i < ASC_final_used; i++) {
+        if (ASC_final_owner[i] == owner && (res == NULL || ASC_final_res[i] == res)) {
+            ASC_final_owner[i] = ASC_final_owner[ASC_final_used - 1];
+            ASC_final_res[i] = ASC_final_res[ASC_final_used - 1];
+            ASC_final_used--;
+            return;
+        }
+    }
+}
+// ASC_NO_FINAL=1 turns the hook off: the leak then reproduces exactly as it was
+// before this stage, which is how the fix is A/B-tested on one binary
+// (examples/gc-image-free.as grows by ~8.3 MB per dropped 1920x1080 page).
+static int as_final_disabled = -1;
+static int as_final_on(void) {
+    if (as_final_disabled < 0) as_final_disabled = getenv("ASC_NO_FINAL") != NULL;
+    return as_final_disabled == 0;
+}
+// The sweep hook. Called once per recycled block with its payload address.
+static void as_final_on_free(void* owner) {
+    if (ASC_final_used == 0 || !as_final_on()) return;
+    for (int i = 0; i < ASC_final_used; ) {
+        if (ASC_final_owner[i] == owner) {
+            void* res = ASC_final_res[i];
+            ASC_final_owner[i] = ASC_final_owner[ASC_final_used - 1];
+            ASC_final_res[i] = ASC_final_res[ASC_final_used - 1];
+            ASC_final_used--;
+            as_skia_image_delete(res);
+            ASC_final_released_n++;
+        } else {
+            i++;
+        }
+    }
+}
+
 // Sweep a budget of the all-objects list: white objects return to the free-list,
 // black objects reset to white for the next cycle. Returns true when the walk is
 // complete. gc_all is stable during the walk because in-cycle allocations go to
@@ -7272,6 +7353,10 @@ static bool gc_sweep_step(size_t budget) {
         if (gc_audit_mode_cache != 0) gc_audit_gate("sweep cursor", h);
         gc_header* next = h->next;
         if (h->color == GC_WHITE) {
+            // Release the C++ resources this block owns (see as_final_on_free).
+            // The payload address is the block's body, which is what owners
+            // register: gc_alloc returns (char*)h + sizeof(gc_header).
+            as_final_on_free((char*)h + sizeof(gc_header));
             if (gc_inc.sweep_prev) gc_inc.sweep_prev->next = next; else gc_all = next;
             gc_all_bytes -= sizeof(gc_header) + h->size;
             gc_header** fl = gc_free_list_for(h->size);
