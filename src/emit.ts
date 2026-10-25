@@ -2066,6 +2066,11 @@ export class Emitter {
     this.line('return NULL;');
     this.indent--;
     this.line('}');
+    // Out of memory (runtime as_gc_oom) raises Error #1000, the same catchable
+    // error AIR raises for an allocation it cannot satisfy. The runtime preamble
+    // can only declare this hook: the Error constructor lives here, after the
+    // class is emitted.
+    this.line('static void* as_error_new_oom(const char* m, int id) { return Error_new((char*)m, id); }');
     this.line('static void* as_v_req_array(as_value v, const char* fqn) {');
     this.indent++;
     this.line('if (v.tag == 0 || v.tag == 5) return NULL;');

@@ -261,6 +261,10 @@ const EXAMPLE_ENV: Record<string, Record<string, string>> = {
   // one additionally needs a directory it cannot OPEN, since an unreadable directory is the
   // input that separates "empty listing" from "ioError" (see the fixture comment above).
   'file-listing-async.as': { HOME: listingHome, USERPROFILE: listingHome },
+  // The out-of-memory path needs a 32-bit address space that has actually run out,
+  // which no CI runner and no fresh test process has. Making the segment carve fail
+  // on request is the only way this unit can assert the same thing everywhere.
+  'oom-error.as': { ASC_FORCE_OOM_MIN: '4194304' },
 };
 
 // Per-example extra CLI arguments. The SWC example needs a resource library on

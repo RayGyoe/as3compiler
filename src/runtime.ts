@@ -310,6 +310,11 @@ static bool gc_audit_on(void);
 // the preamble -- tests it directly (see the note on gc_audit_gate below).
 static int gc_audit_mode_cache = -1;
 
+// Allocation failure (definition sits below the GC segment helpers, next to the
+// allocator that uses it). Declared up here because as_alloc, which is emitted
+// first, must raise instead of storing a NULL buffer.
+static _Noreturn void as_gc_oom(size_t need);
+
 #define AS_ARENA_SEG_CAP (1u << 22)
 typedef struct as_arena_seg { struct as_arena_seg* next; size_t used; char* buf; } as_arena_seg;
 static as_arena_seg* as_arena_head = NULL;
@@ -332,10 +337,19 @@ static char* as_alloc(size_t n) {
                 (double)n / 1048576.0, as_dbg_sym, as_dbg_off);
         fflush(stderr);
     }
-    if (n > AS_ARENA_SEG_CAP) { as_heap_bytes += n; return (char*)malloc(n); }  // single oversized allocation
+    if (n > AS_ARENA_SEG_CAP) {  // single oversized allocation
+        char* big = (char*)malloc(n);
+        if (big == NULL) as_gc_oom(n);
+        as_heap_bytes += n;
+        return big;
+    }
     if (as_arena_head == NULL || as_arena_head->used + n > AS_ARENA_SEG_CAP) {
+        // A 4 MiB segment is the same unguarded store as the GC one below; on a
+        // 32-bit process it is a routine outcome under pressure, not a corner case.
         as_arena_seg* s = (as_arena_seg*)malloc(sizeof(as_arena_seg));
-        s->buf = (char*)malloc(AS_ARENA_SEG_CAP);
+        char* sbuf = (char*)malloc(AS_ARENA_SEG_CAP);
+        if (s == NULL || sbuf == NULL) { free(s); free(sbuf); as_gc_oom(AS_ARENA_SEG_CAP); }
+        s->buf = sbuf;
         s->used = 0;
         s->next = as_arena_head;
         as_arena_head = s;
@@ -713,8 +727,13 @@ static void gc_seg_range_add(gc_seg* seg) {
     // the shift below renumbers entries (the cache is a pointer into it).
     gc_seg_cache = NULL;
     if (gc_seg_range_n == gc_seg_range_cap) {
-        gc_seg_range_cap = gc_seg_range_cap == 0 ? 64 : gc_seg_range_cap * 2;
-        gc_seg_ranges = (gc_seg_range*)realloc(gc_seg_ranges, gc_seg_range_cap * sizeof(gc_seg_range));
+        size_t new_cap = gc_seg_range_cap == 0 ? 64 : gc_seg_range_cap * 2;
+        // Never assign realloc result straight back: on failure it returns NULL and
+        // the original table would be lost, leaving gc_seg_find reading NULL.
+        gc_seg_range* grown = (gc_seg_range*)realloc(gc_seg_ranges, new_cap * sizeof(gc_seg_range));
+        if (grown == NULL) as_gc_oom(new_cap * sizeof(gc_seg_range));
+        gc_seg_ranges = grown;
+        gc_seg_range_cap = new_cap;
     }
     size_t i = gc_seg_range_n++;
     while (i > 0 && gc_seg_ranges[i - 1].base > base) {
@@ -785,6 +804,54 @@ static void gc_grey_push(gc_header* h);
 // after the mark/sweep code as well, so they need the same treatment.
 static size_t gc_trigger(void);
 static void gc_collect(void);
+
+// ---------- allocation failure ----------
+// Both allocators used to store malloc result straight into a struct field and
+// dereference it. That is a real crash, not a formality: a 32-bit process runs
+// out of ADDRESS SPACE long before it runs out of RAM. The stage-278 dumps are
+// exactly this -- gc_alloc carving a 3.6 MB BitmapData buffer whose segment base
+// had come back NULL, faulting on the NEXT statement (movl edi,0xc(eax) with
+// eax = 0, i.e. the fresh->size store); as_alloc has the same shape for its 4 MiB
+// arena segments.
+//
+// AIR answers an allocation it cannot satisfy with Error #1000 (avmplus
+// kOutOfMemoryError), which ActionScript can catch, so that is what we raise
+// instead of faulting. One stop-the-world collection is attempted first: the
+// free lists can hold plenty of bytes while no single block is big enough, and a
+// sweep is what turns the former into the latter. gc_in_gc keeps the collector
+// from re-entering itself (collect does allocate: gc_grey_push grows its stack).
+static int gc_in_gc = 0;
+static int as_oom_active = 0;
+// ASC_FORCE_OOM_MIN=<bytes>: fail every segment carve at least that big. Unset
+// means off (-1 sentinel is resolved on the first carve, never on the hot path).
+// This exists so the Error #1000 path is testable where memory is not short.
+static size_t as_oom_force_min = (size_t)-1;
+static void* as_error_new_oom(const char* msg, int id);  // emitted with the Error class
+static _Noreturn void as_throw(void* e);
+
+static _Noreturn void as_gc_oom(size_t need) {
+    // The numbers are the report: they say whether the address space is gone or
+    // the free lists are just too fragmented, which are fixed very differently.
+    size_t seg_total = 0, seg_free = 0;
+    int seg_n = 0;
+    for (gc_seg* s = gc_segs; s != NULL; s = s->next) {
+        seg_n++;
+        seg_total += s->size;
+        seg_free += s->free_bytes;
+    }
+    fprintf(stderr, "[as3-aot] out of memory: malloc failed for %lu bytes "
+                    "(gc heap %.1f MB in %d segments, %.1f MB free, arena %.1f MB)\\n",
+            (unsigned long)need, (double)seg_total / 1048576.0, seg_n,
+            (double)seg_free / 1048576.0, (double)as_heap_bytes / 1048576.0);
+    fflush(stderr);
+    if (!as_oom_active) {
+        as_oom_active = 1;
+        as_throw(as_error_new_oom("Error #1000: The system is out of memory.", 1000));
+    }
+    // The Error object itself could not be allocated: there is nothing left to
+    // raise, so stop here rather than recursing back into this function.
+    exit(1);
+}
 
 // Allocate a GC object of the given type. Returns the object body (header hidden
 // before it). The body is zeroed so uninitialized array slots read as tag 0
@@ -924,8 +991,31 @@ static void* gc_alloc(int type, size_t size) {
     if (size > seg_size - sizeof(gc_header)) {
         seg_size = sizeof(gc_header) + size;
     }
-    gc_seg* s = (gc_seg*)malloc(sizeof(gc_seg));
-    s->base = (char*)malloc(seg_size);
+    // Carve the segment. Both mallocs can return NULL (see as_gc_oom): retry once
+    // after a collection, then raise Error #1000 -- never store NULL and write
+    // through it on the next line, which is how this used to die.
+    if (as_oom_force_min == (size_t)-1) {
+        const char* oom_env = getenv("ASC_FORCE_OOM_MIN");
+        as_oom_force_min = (oom_env != NULL && atoi(oom_env) > 0) ? (size_t)atoi(oom_env) : 0;
+    }
+    int oom_forced = as_oom_force_min != 0 && seg_size >= as_oom_force_min;
+    gc_seg* s = oom_forced ? NULL : (gc_seg*)malloc(sizeof(gc_seg));
+    char* seg_base = oom_forced ? NULL : (char*)malloc(seg_size);
+    if ((s == NULL || seg_base == NULL) && gc_in_gc == 0) {
+        free(s);
+        free(seg_base);
+        gc_collect();
+        // The forced failure survives the retry on purpose: the point is to see
+        // the Error #1000 raise, not to watch a retry succeed.
+        s = oom_forced ? NULL : (gc_seg*)malloc(sizeof(gc_seg));
+        seg_base = oom_forced ? NULL : (char*)malloc(seg_size);
+    }
+    if (s == NULL || seg_base == NULL) {
+        free(s);
+        free(seg_base);
+        as_gc_oom(seg_size);
+    }
+    s->base = seg_base;
     s->size = seg_size;
     s->free_bytes = seg_size;   // one free block covering the whole segment
     s->reap = 0;
@@ -6481,8 +6571,11 @@ static _Noreturn void as_throw(void* e) {
 // Push a grey object onto the mark work stack, growing it on demand.
 static void gc_grey_push(gc_header* h) {
     if (gc_inc.grey_top == gc_inc.grey_cap) {
-        gc_inc.grey_cap = gc_inc.grey_cap == 0 ? 256 : gc_inc.grey_cap * 2;
-        gc_inc.grey = (gc_header**)realloc(gc_inc.grey, (size_t)gc_inc.grey_cap * sizeof(gc_header*));
+        int new_cap = gc_inc.grey_cap == 0 ? 256 : gc_inc.grey_cap * 2;
+        gc_header** grown = (gc_header**)realloc(gc_inc.grey, (size_t)new_cap * sizeof(gc_header*));
+        if (grown == NULL) as_gc_oom((size_t)new_cap * sizeof(gc_header*));
+        gc_inc.grey = grown;
+        gc_inc.grey_cap = new_cap;
     }
     gc_inc.grey[gc_inc.grey_top++] = h;
 }
@@ -7353,13 +7446,14 @@ static void gc_step(void) {
     // its bounded per-frame pause -- the right one for this program. From here on
     // gc_alloc stops triggering its own stop-the-world collections.
     gc_frame_driven = true;
+    gc_in_gc = 1;
     if (gc_inc.state == GC_IDLE) {
         // Segment release / allocator trim is rate-limited and idempotent, so it
         // also runs here (every frame) rather than only at a cycle end: a scene
         // that stopped allocating never ends another cycle, and RSS would then
         // stay at the high-water mark forever after the ramp is over.
         gc_release_empty_segs();
-        if (gc_bytes_allocated < gc_trigger()) return;
+        if (gc_bytes_allocated < gc_trigger()) { gc_in_gc = 0; return; }
         gc_inc.state = GC_MARK;
         gc_inc.grey_top = 0;  // fresh mark; a previous cycle drains to empty first
         gc_mark_roots();
@@ -7380,6 +7474,7 @@ static void gc_step(void) {
     if (gc_inc.state == GC_SWEEP) {
         if (gc_sweep_step(gc_budget())) gc_finish_cycle();
     }
+    gc_in_gc = 0;
 }
 
 
@@ -7390,6 +7485,7 @@ static void gc_step(void) {
 // gc_all. To get a correct result we first fold gc_new into gc_all, reset every
 // object to WHITE, and mark the true live set from scratch.
 static void gc_collect(void) {
+    gc_in_gc = 1;
     if (gc_new != NULL) {
         gc_header* t = gc_new;
         while (t->next != NULL) t = t->next;
@@ -7407,6 +7503,7 @@ static void gc_collect(void) {
     gc_inc.sweep_cursor = gc_all;
     gc_sweep_step((size_t)-1);
     gc_finish_cycle();
+    gc_in_gc = 0;
 }
 
 // ---------- integer base conversion (toString(radix)) ----------

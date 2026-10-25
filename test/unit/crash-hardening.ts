@@ -21,6 +21,14 @@
 //     (0xC0000005), or the loop spun on a dead swapchain until AppHangB1. Measured:
 //     252+172+140 failed Presents over 30 s, then a hang.
 //
+//  4. malloc() returning NULL. gc_alloc stored the fresh segment base and wrote
+//     through it on the NEXT statement; as_alloc had the same shape for its 4 MiB
+//     arena segments, and both realloc() sites dropped the old pointer. After both
+//     earlier fixes the app still died at exe+0x699e with params 0x1/0xc -- a write
+//     to 0xc, i.e. `fresh->size` through a null base -- so this was the real cause
+//     of the 0xC0000005 the first round had blamed on D3D. AIR raises a catchable
+//     Error #1000 (kOutOfMemoryError) here; so do we.
+//
 // Source-level pins, not behavioural: all three are fatals whose only observable is
 // "the process died", and d3d_glue.cc cannot be compiled on a non-Windows host.
 //
@@ -125,6 +133,40 @@ function checkCrashHardening(): string[] {
     (d3d.match(/CreateSwapChainForHwnd\(/g) ?? []).length === 1);
   check('rebuild retries back off instead of spinning on D3D12CreateDevice every frame',
     /g_d3d_retry_ms = g_d3d_retry_ms \* 2 > 4000 \? 4000 : g_d3d_retry_ms \* 2;/.test(d3d));
+
+  // ---- 4. an allocation failure raises Error #1000, it does not fault --------
+  // avmplus core/ErrorConstants.{h,cpp}: kOutOfMemoryError = 1000,
+  // "The system is out of memory." -- the message is pinned verbatim, because an
+  // app that switches on the text must see the same string AIR gives it.
+  check('allocation failure raises Error #1000 with the AIR message',
+    rt.includes('static _Noreturn void as_gc_oom(size_t need)') &&
+    rt.includes('as_throw(as_error_new_oom("Error #1000: The system is out of memory.", 1000));'));
+  check('...and the hook is emitted next to the Error class (the runtime can only declare it)',
+    rt.includes('static void* as_error_new_oom(const char* msg, int id);') &&
+    em.includes("static void* as_error_new_oom(const char* m, int id) { return Error_new((char*)m, id); }"));
+  const segAt = rt.indexOf('static void* gc_alloc(int type, size_t size) {');
+  const segBody = segAt >= 0 ? rt.slice(segAt, segAt + 9000) : '';
+  check('gc_alloc never stores a malloc result before testing it',
+    segBody.includes('char* seg_base = oom_forced ? NULL : (char*)malloc(seg_size);') &&
+    segBody.includes('if (s == NULL || seg_base == NULL) {') &&
+    segBody.includes('as_gc_oom(seg_size);') &&
+    !/s->base = \(char\*\)malloc\(/.test(rt));
+  check('...retrying once after a collection, but never re-entering the collector',
+    segBody.includes('if ((s == NULL || seg_base == NULL) && gc_in_gc == 0) {') &&
+    rt.includes('gc_in_gc = 1;') &&
+    rt.includes('gc_in_gc = 0;'));
+  check('as_alloc guards both the oversized block and the 4 MiB arena segment',
+    rt.includes('if (big == NULL) as_gc_oom(n);') &&
+    rt.includes('char* sbuf = (char*)malloc(AS_ARENA_SEG_CAP);') &&
+    rt.includes('if (s == NULL || sbuf == NULL) { free(s); free(sbuf); as_gc_oom(AS_ARENA_SEG_CAP); }'));
+  check('both realloc sites grow through a temporary (failure must not drop the old block)',
+    rt.includes('gc_seg_range* grown = (gc_seg_range*)realloc(') &&
+    rt.includes('gc_header** grown = (gc_header**)realloc(') &&
+    !/gc_seg_ranges = \(gc_seg_range\*\)realloc\(/.test(rt) &&
+    !/gc_inc\.grey = \(gc_header\*\*\)realloc\(/.test(rt));
+  check('the forced-failure probe is opt-in and only read on the segment path',
+    rt.includes('getenv("ASC_FORCE_OOM_MIN")') &&
+    rt.includes('int oom_forced = as_oom_force_min != 0 && seg_size >= as_oom_force_min;'));
 
   if (ok > 0) console.log(`[crash] ${ok} crash-hardening checks passed`);
   return bad;

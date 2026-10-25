@@ -973,6 +973,87 @@ Pins: `unit: platform/CapabilitiesOs` (all 18 returnable names present / the `bu
 `wProductType` split / **no static user32 dependency** / the rationale on record) and `examples/stage65.as` (on
 Windows it asserts `os` splits into a non-empty version token; macOS skips it automatically).
 
+### 3.15 An allocation failure raises a catchable `Error #1000`, never a null dereference (stage 279)
+
+The three fixes from the previous stage shipped, the app was rebuilt, and the crash **did not go away** -- it
+settled into one reproducible shape: two runs died after 98.2 s and 92.1 s with `0xC0000005`. With a full WER
+dump the fault is the same offset with the same parameters both times:
+
+```
+EXCEPTION  code 0xc0000005  fault TalkMED Meeting.exe+0x699e
+params 0x1, 0xc                      <- write (1) to address 0xc
+regs    eax=0x0  esi=0x5fd08ef0  edi=0x384000
+```
+
+Disassembling that offset (image base `0x400000`):
+
+```asm
+406994: 8b 46 04    movl 0x4(%esi),%eax     ; eax = seg->base
+40699e: 89 78 0c    movl %edi,0xc(%eax)     ; eax == 0 -> writes 0xc, exactly the params
+```
+
+`esi` is a `gc_seg`, `0x4(%esi)` is its `base`, and `edi` is `seg_size - sizeof(gc_header)`. Exactly one
+source line matches:
+
+```c
+gc_seg* s = (gc_seg*)malloc(sizeof(gc_seg));
+s->base = (char*)malloc(seg_size);            // <- returned NULL here
+...
+gc_header* fresh = (gc_header*)s->base;
+fresh->size = seg_size - sizeof(gc_header);   // <- writes null+0xc, process dies on the spot
+```
+
+So **the first round blamed D3D for the `0xC0000005` and was wrong**: the `Present failed 0x887A0005` line was a
+sibling symptom of the same memory pressure, while the actual cause was the allocator storing NULL and carrying
+on. A dump is the only evidence that separates the two -- without one, the last line in the log is a false lead.
+
+**Why 32-bit hits it.** Memory sampling in the same window goes 208 MB -> 1000 MB (141 threads) -> 495 MB and
+then it dies. The refused requests were `0x384010` bytes (3.6 MB, one 950x950 `BitmapData`) and `0x7e9010`
+(8.3 MB). A 32-bit process has a 2 GB user-mode address space, and loaded DLLs, thread stacks and GC segment
+fragmentation all compete for it: **what runs out first is address space, not RAM**, so gigabytes of free
+physical memory change nothing here.
+
+**AIR raises, it does not crash.** [avmplus `core/ErrorConstants.h`](https://github.com/adobe/avmplus/blob/master/core/ErrorConstants.h)
+defines `kOutOfMemoryError = 1000` and [`ErrorConstants.cpp`](https://github.com/adobe/avmplus/blob/master/core/ErrorConstants.cpp)
+carries the message in four languages (en `"The system is out of memory."`). It is an ordinary **`Error` that
+ActionScript can catch**, the same class of outcome as `#1009` -- not a process abort.
+
+All five allocation sites now test the result. On failure:
+
+1. **One stop-the-world collection** (`gc_collect()`), then one retry. The reason is concrete: the free lists can
+   hold plenty of bytes while no single contiguous block is big enough, and a sweep is exactly what turns the
+   former into the latter. `gc_in_gc` blocks re-entry -- `gc_collect` allocates too (`gc_grey_push` grows its
+   stack), so without the flag this recurses forever.
+2. Still failing -> print one diagnosable line, then `as_throw(Error #1000)`:
+
+```
+[as3-aot] out of memory: malloc failed for 8388632 bytes (gc heap 0.1 MB in 1 segments, 0.1 MB free, arena 0.0 MB)
+```
+
+Those three numbers are what distinguishes "address space is gone" from "the free lists are shredded"; the two
+are fixed very differently, and without numbers there is only guessing.
+
+| Site | Old behaviour | Now |
+|---|---|---|
+| `gc_alloc` new segment (`gc_seg` + `base`) | stored NULL, faulted on the next line | null test + collect retry + `#1000` |
+| `as_alloc` oversized block (`malloc(n)`) | same | null test + `#1000` |
+| `as_alloc` 4 MiB arena segment (`as_arena_seg` + `buf`) | same | same |
+| `gc_seg_range_add` `realloc` | failure dropped the old table pointer | grows through a temporary, else `#1000` |
+| `gc_grey_push` `realloc` | same | same |
+
+**Reproducibility.** Real 32-bit exhaustion cannot be staged on a 64-bit CI runner, and a test that only runs on
+the machine that crashed is not a regression test. Hence one switch, read once on the segment path only:
+`ASC_FORCE_OOM_MIN=<bytes>` fails every segment carve at least that big (the retry fails too -- otherwise only
+the retry is exercised). The hot path costs nothing: `getenv` runs on the rare occasions a new segment is needed.
+
+**Verified:** `examples/oom-error.as` (with `ASC_FORCE_OOM_MIN=4194304`, requesting 8 MB) prints
+`caught #1000: Error #1000: The system is out of memory.` and stays alive; the uncaught form prints
+`Uncaught exception: Error #1000: ...` and exits 1. Group 4 of `test/unit/crash-hardening.ts` (7 source-level
+pins) makes sure no later edit lets a `malloc`/`realloc` result land without a null test.
+
+**Not verified:** the full on-device chain -- address space actually exhausted, `#1000` raised, the app catching
+it and continuing -- still needs the four scenarios from the first round replayed on the 32-bit build.
+
 ## 4. Runtime Form (D3D12 Direct, the Default)
 
 > The WGL file (`vendor/gl_glue.cc`, §3.1.1) is **isomorphic** to this one: also “a process-level

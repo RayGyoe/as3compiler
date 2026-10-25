@@ -998,6 +998,86 @@ Uncaught exception: Error #1009: Cannot access a property or method of a null ob
 `temp/crashfix/uncaught-storm.as`（50 次抛错 → 4 行报告，计数合计恰好 50）。
 Windows 实机上的 `0xC0000409` 本身由第一轮崩溃日志证实，修复后的第二次复现尚未跑。
 
+### 3.15 分配失败必须抛可捕获的 `Error #1000`，不能把 NULL 存进结构再解引用（阶段二百七十九）
+
+上一节的三处修复落地、应用重编之后，崩溃**没有消失**，只是换了一个稳定的样子：两次运行
+分别在 98.2 s 与 92.1 s 以 `0xC0000005` 退出，退出码相同、存活时间相近。这次有 WER 全量
+dump，现场是同一个偏移、同样的参数：
+
+```
+EXCEPTION  code 0xc0000005  fault TalkMED Meeting.exe+0x699e
+params 0x1, 0xc                      <- 写（1），地址 0xc
+regs    eax=0x0  esi=0x5fd08ef0  edi=0x384000
+```
+
+反汇编该偏移（image base `0x400000`）：
+
+```asm
+406994: 8b 46 04    movl 0x4(%esi),%eax     ; eax = seg->base
+40699e: 89 78 0c    movl %edi,0xc(%eax)     ; eax == 0 -> 写 0xc，正是 params
+```
+
+`esi` 是一个 `gc_seg`，`0x4(%esi)` 就是它的 `base`；`edi` 是
+`seg_size - sizeof(gc_header)`。对应源码只有一处：
+
+```c
+gc_seg* s = (gc_seg*)malloc(sizeof(gc_seg));
+s->base = (char*)malloc(seg_size);            // ← 这里返回了 NULL
+...
+gc_header* fresh = (gc_header*)s->base;
+fresh->size = seg_size - sizeof(gc_header);   // ← 写 null+0xc，进程当场死
+```
+
+所以**第一轮把 `0xC0000005` 归给 D3D 是错的**：那次 `Present failed 0x887A0005` 只是同一
+时刻内存压力的伴生现象，真正的死因是分配器拿到 NULL 之后照常往下写。dump 是唯一能分清
+这两件事的证据 —— 第一轮没有 dump，日志里能看到的最后一句话是错的线索。
+
+**为什么 32 位容易撞上。** 同一段里的内存采样从 208 MB 冲到 1000 MB（线程 141 个）、再回落
+到 495 MB，紧接着就崩。崩溃时的请求是 `0x384010` 字节（3.6 MB，一张 950×950 的
+`BitmapData`）与 `0x7e9010`（8.3 MB）。32 位进程的用户态地址空间上限 2 GB，已加载的
+DLL、线程栈、GC 段碎片都在抢同一块地方 —— **先耗尽的是地址空间，不是物理内存**，
+所以"还有几 GB 空闲内存"完全不影响这里 `malloc` 失败。
+
+**AIR 的语义是抛错，不是崩。** [avmplus `core/ErrorConstants.h`](https://github.com/adobe/avmplus/blob/master/core/ErrorConstants.h)
+里 `kOutOfMemoryError = 1000`，[`ErrorConstants.cpp`](https://github.com/adobe/avmplus/blob/master/core/ErrorConstants.cpp)
+给出四语言的文案（en `"The system is out of memory."` / zh `"系统内存不足。"`）。这是一个
+**普通 `Error`，ActionScript 可以 catch**，与 `#1009` 同类，而不是中止进程。
+
+现在五处分配点全部判空，失败时：
+
+1. **先尝试一次 stop-the-world 回收**（`gc_collect()`）再重试一次。理由很具体：空闲链表里
+   可能有大量字节却没有**一个**足够大的连续块，而一次 sweep 正好把前者变成后者。重入由
+   `gc_in_gc` 挡住 —— `gc_collect` 自己会分配（`gc_grey_push` 要长栈），不挡就是无限递归。
+2. 仍然失败 → 打印一行可判断的诊断，然后 `as_throw(Error #1000)`：
+
+```
+[as3-aot] out of memory: malloc failed for 8388632 bytes (gc heap 0.1 MB in 1 segments, 0.1 MB free, arena 0.0 MB)
+```
+
+这行的三个数字是用来区分"地址空间没了"和"空闲链表被切碎"的 —— 两者的修法完全不同，
+没有数字就只剩猜。
+
+| 位置 | 旧行为 | 现在 |
+|---|---|---|
+| `gc_alloc` 新段（`gc_seg` + `base`） | 存 NULL，下一行写崩 | 判空 + 回收重试 + `#1000` |
+| `as_alloc` 超大单块（`malloc(n)`） | 同上 | 判空 + `#1000` |
+| `as_alloc` 4 MiB arena 段（`as_arena_seg` + `buf`） | 同上 | 同上 |
+| `gc_seg_range_add` 的 `realloc` | 失败即丢原表指针，后续查表读 NULL | 走临时变量，失败 `#1000` |
+| `gc_grey_push` 的 `realloc` | 同上 | 同上 |
+
+**可复现性。** 真实的 32 位耗尽在 64 位 CI 上造不出来，而"只在那台崩过的机器上能跑"的测试
+不是回归测试。所以有一个**只在段分配路径上读一次**的开关：`ASC_FORCE_OOM_MIN=<字节>` 让每个
+≥ 该值的段分配必然失败（重试也一样，否则只能测到重试成功）。热路径零成本 —— 它只在需要
+新段的极少数时刻才 `getenv` 一次。
+
+**已验证：** `examples/oom-error.as`（配合 `ASC_FORCE_OOM_MIN=4194304`，请求 8 MB）打印
+`caught #1000: Error #1000: The system is out of memory.` 后进程存活；未捕获形态打印
+`Uncaught exception: Error #1000: ...` 并以 1 退出。`test/unit/crash-hardening.ts` 第 4 组
+7 条源级钉守住"没有哪个 `malloc`/`realloc` 结果可以不经判空落地"。
+
+**未验证：** 真机上"地址空间真的没了 → 抛 `#1000` → 应用 catch 后继续运行"这一整条业务
+链路，仍要按第一轮那四个现场复现一次才作数。
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +
