@@ -9130,12 +9130,18 @@ static inline void as_skia_surface_save_png(void* s, const char* path) {
 static inline void* as_skia_paint_fill(unsigned rgb, double alpha) {
     void* p = sk_paint_new();
     sk_paint_set_color(p, rgb); sk_paint_set_alpha(p, alpha); sk_paint_set_fill(p);
+    // AIR always anti-aliases vector shapes (SkPaint defaults to AA off). Leaving it
+    // off made every diagonal edge a staircase and every 1px stroke 1-2 device rows
+    // thinner than AIR's -- measured on temp/g242526 Pix6/Pix8 (44 partial pixels on
+    // an AIR triangle edge vs 0 here) and on the 150% bake probe.
+    sk_paint_set_antialias(p, 1);
     return p;
 }
 static inline void* as_skia_paint_stroke(unsigned rgb, double alpha, double width) {
     void* p = sk_paint_new();
     sk_paint_set_color(p, rgb); sk_paint_set_alpha(p, alpha); sk_paint_set_stroke(p);
     sk_paint_set_stroke_width(p, width);
+    sk_paint_set_antialias(p, 1);   // see as_skia_paint_fill: AIR anti-aliases strokes too
     return p;
 }
 static inline void as_skia_paint_delete(void* p) { sk_paint_delete(p); }

@@ -16162,6 +16162,71 @@ CPU 模式**整体偏橙 —— 强调色 `#2563EB` → `#EB6325`、白底（`#F
 （macOS 的 kN32 本来就是 RGBA，写死与推导结果无差）——这正是它能活到现在的原因。
 
 
+### 阶段二百七十五：G24 / G25 / G26 三条运行时契约 —— `setChildIndex` 判据顺序、roll-over 事件对、`drawPath`/`cubicCurveTo`（v0.4.238 → v0.4.239）✅ 已完成
+
+**一、现象与定性**
+
+`asaotui/compiler-gaps.md` 的 G24 / G25 / G26 是同一类缺陷：**API 在 AIR 里都有，我们的实现却在语义上不同**。
+三条都不是「少一个方法」那么简单，靠读文档或凭直觉都会写错，其中 G24 的判据顺序**反直觉**、G25 是**完全不派发**、
+G26 的包围盒口径与我们旧注释**正好相反**。因此本阶段的第一件事不是写代码，是拿 `adl` 51.4.1 把三条契约逐条量出来
+（`temp/g242526/`：`AirSem.as` / `AirSem2.as` / `AirBounds.as` / `AirMouse2.as`（真光标）/ `Pix2..Pix8.as`）。
+
+**二、三条契约（实测，非文档推导）**
+
+| 缺口 | AIR 的真实行为 | 决定性证据 |
+|---|---|---|
+| G24 | `setChildIndex` 依次判 **null → 索引 → 是否我的孩子**：`#2007` / `#2006` / `#2025`；索引按**当前** `numChildren` 判，空容器任意索引都越界 | `setChildIndex(nonchild, 99)` 报 **`#2006`** 而不是 `#2025` ⇒ 索引判定在孩子判定之前 |
+| G25 | 进入 `rollOver`(`bubbles=false`,phase 2,逐个向祖先) → `mouseOver`(冒泡)；离开 `mouseOut`(冒泡) → `rollOut`(不冒泡,自内向外)；**目标不变零事件**；链止于 Stage；窗口退出坐标 `-1,-1`；移除后**下一拍**仍投递 leave | 真光标驱动（posted `WM_MOUSEMOVE` 会被物理光标重推），108 行事件序列 |
+| G26 | `cubicCurveTo`(6 参) / `drawPath`(3 参,默认 `evenOdd`) / `GraphicsPathCommand.NO_OP=0` / `GraphicsPathWinding` 常量袋；非法 winding `#2008`、奇数长度 `#2004`（**都在画之前**）；**包围盒是曲线紧包围盒**不是控制点凸包 | `moveTo(10,50)+cubicCurveTo(10,0,90,0,90,50)` ⇒ **80x37.5**（凸包会报 80x50） |
+
+**三、修法（全在发射侧 / 符号层）**
+
+1. **G24**：`DisplayObjectContainer_setChildIndex` 换成上述三条判据 + 顺序，删掉夹紧；三条判据都在任何写入之前。
+2. **G25**：新增 `as_hover_target` 状态 + 六个助手（`as_hover_holds` / `as_hover_fire` / `as_hover_next` /
+   `as_hover_move` / `as_hover_flush` / `as_hover_on_remove`），挂在五处：`mouseLeave` 分支、普通指针通知、
+   `removeChild`、`Stage_dispatchFrame`（帧边界补发）、`gc_mark_user_roots`（**两个永久根**：应用可能已丢掉最后一个引用）。
+   `as_hover_flush` 的实现是「在记录的指针位置**重跑一次普通 transition**」，因此「移除后同一拍给新目标 `mouseOver`」自然成立。
+3. **G26**：`Graphics_cubicCurveTo` / `Graphics_drawPath`（含命令解释器）+ `GraphicsPathWinding` 类 + `NO_OP`；
+   Skia 桥补 `sk_path_cubic_to` / `as_skia_path_cubic_to`；包围盒改走**导数零点**（`as_gpath_quad` / `as_gpath_cubic`，
+   二次解一次方程、三次解 `A t²+B t+C`，只取 `t∈(0,1)`），纯 C 构建与 Skia 构建因此得出同一个盒子。
+4. **顺带修掉的根因（不在三条缺口里，但是它们的像素残差的共同来源）**：`as_skia_paint_fill` / `as_skia_paint_stroke`
+   **从未调用 `sk_paint_set_antialias`**，而 `SkPaint` 的 AA **默认关闭** ⇒ 所有矢量斜边是阶梯、所有细斜描边偏细。
+   绘制路径上其它自建 paint 的地方（位图填充、渐变、SWC 烘焙面）都显式开了，只有这两个漏了。
+
+**四、验收**
+
+| 检查 | 结果 |
+|---|---|
+| `examples/child-index-errors.as`（7 个负例逐条比对 `name`+`errorID`+**原文文案**，再验两次合法移动 + 一次空操作） | **OK** |
+| `examples/roll-over.as`（14 段：首入 / 进兄弟子树 / 钻两层 / 同目标零事件 / 逐层退 / 退回背景 / 换兄弟 / 跳最深处 / 按住拖动 / 移除补离开 / 离开窗口 / 重新进入） | **OK** |
+| `examples/graphics-path.as`（常量表 / `drawPath`==平 API 且 **80x37.5** / 二次曲线 **80x25** / `NO_OP` 与未知命令截断 / `WIDE_*` / 两种 winding + `#2008` / `#2004` / 扩展当前组） | **OK** |
+| AOT vs AIR 事件序列（`MouseAot.as` + `cmpmouse.cjs`，同一棵树同一条坐标序列） | **AIR 108 行 / AOT 108 行，事件顺序·type·target·currentTarget·bubbles·phase 全同**，仅 4 行坐标差（见五） |
+| AOT vs AIR 像素（`Pix6` 六格 / `Pix7` 五格 / `Pix8` 七格，`cmpcell.cjs` 阈值无关 coverage 积分） | 平 API 孪生格全部在 **1% 内**；`drawPath` 单段曲线一格按五·①登记为**已知分歧** |
+| 开 AA 前后（Pix8 未闭合三角形斜边） | 241230 → **246862**，与 AIR 248226 的距离从 **−2.8% 收到 −0.55%** |
+| `test/unit/g242526.ts`：`display/SetChildIndex` 7 条 + `display/RollOverContract` 12 条 + `render/GraphicsPath` 13 条 + `render/GfxAntialias` 3 条 | **35/35** |
+| `node --test test/unit/*.ts` 全量 | 只剩 1 条基线红（`inline/StackCanary`）；**顺带修掉一条陈旧的假绿**：`text-input/DoubleClick` 的 900 字符窗口在 HEAD 上已量到 932 字符（`struct InteractiveObject` 增长所致），改成**按大括号取结构体正文**后转绿 |
+| `node test.ts` 全量（examples + units） | 只剩 4 条基线红：`socket.as` bind、`stage94d.as` UTF-16LE、`status-item.as` 需 darwin、`inline/StackCanary` |
+| `asaotui/ui-demo/run-gallery.cjs`（8 页、5544 节点、overlay/toast/slider/聚焦） | **PASS**（开 AA 后 PNG 字节数变大，符合「边缘多了部分覆盖」） |
+| `temp/jitter/probe.as` 烘焙态 vs 活态（阶段二百七十四 的 17 px 残余） | 开 AA 后 `on-live vs on-baked` **IDENTICAL**；`off` 对 **仍 17 px / bbox 逐值相同** ⇒ 该残余与 AA 无关（见 skia.md §6.12 的复测注） |
+
+**五、如实报明（量过、不复制、不藏）**
+
+1. **`drawPath` 的「单段曲线不填」怪癖不复刻**。Pix8 七格把规则量清了：`[MOVE,LINE,LINE]` **未闭合**三角形填充 248226
+   ⇒ AIR **会**填未闭合轮廓（推翻了「未闭合不填」的猜测）；`[MOVE,CUBIC,CUBIC]` 填充 232198；只有「整条命令表 = `MOVE_TO` +
+   **一段**曲线」是 **0 ink**，而**同一份几何走平 API 会填**（Pix8 cell6 = 293240）⇒ 这是 `drawPath` 独有的指令流怪癖，
+   不是渲染器规则。要复刻得把填充路径与描边路径拆开（描边要画、填充要跳，实测描边 236 ink），为一段退化输入重写绘制路径
+   的代价与回归面不成比例 ⇒ **明确选择不复刻**，这一格我们多填（295577）。
+2. **曲线描边 coverage 低 6.9%**（47510 → 44215）：曲线的**平顶处两侧都精确量到 2.00 设备像素宽**，缺口全在陡峭段的
+   逐列剖面上 ⇒ 是 Flash 把细斜描边略微「喂胖」的光栅器风格差，不是几何或笔宽错。
+3. **G25 的 4 行坐标差**：AIR 对「已脱离节点的补发离开对」报 `stageX/Y = 3,3`（既不等于最后的窗内坐标，也不等于移除位置，
+   AIR 自身无解释），我们报**真实指针位置** `60,60`。取可解释的那个，不模仿。
+4. **`cubicCurveTo` 的紧包围盒**推翻本项目旧注释（「控制点入包围盒，同 `SkPath::getBounds()`」）——旧口径在曲线段上会
+   把盒子放大到凸包（80x50 vs AIR 的 80x37.5）。
+
+**未测**：macOS/Linux 未复核（本机只有 Windows；三条契约都是平台无关的运行时逻辑，但真机像素未量）；
+`asaotui/tools/air-sweep.cjs`（唯一跑参考运行时的门）本轮未跑（它测的是库侧，G24 的库侧修法在阶段二百六十九 已验收）。
+
+
 ### 阶段二百七十四：烘焙面必须落在**落点画布**的设备像素栅格上（v0.4.237 → v0.4.238）✅ 已完成
 
 **一、现象与定性**
@@ -16233,6 +16298,7 @@ icon 顶边第 2 设备行的 7 列（live `37,99,235` / baked `255,255,255`，b
 GL/D3D 后端下的烘焙贴回未单独复量（贴回走同一张 raster `SkImage`，与呈现后端正交）。
 
 ### 遗留待开发
+> **2026-10-25 追加（阶段二百七十五：G24 / G25 / G26 三条运行时契约）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。三条都是「`adl` 跑得对、我们跑不出」的**语义实错**，且都在本阶段**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表），证据与复现见阶段节与 `asaotui/compiler-gaps.md` G24/G25/G26。**两处刻意不复刻的分歧已如实登记**（`drawPath` 单段曲线不填、曲线描边 coverage 6.9%），一条不可解释的 AIR 行为（`3,3`）明确选择不模仿。
 > **2026-10-25 追加（阶段二百七十四：烘焙面的设备像素栅格）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是**我们自己发明的优化**（自动烘焙在 AIR 里没有对应物）兑现不了自己的承诺（「烘焙态 == 活态」）造成的**呈现缺陷**，`adl` 根本不经过这条路径 ⇒ 不属 §1.5「`adl` 跑得对我们跑不出」，故不占本表；三条根因（设备空间吸附 / 描边纳入包围盒 / 缓存按相位失效）、17 px 残余的量化与未测项见阶段节与 `docs/zh-cn/skia.md` §6.12。
 > **2026-10-25 追加（阶段二百七十三：CPU 光栅窗口红蓝互换）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是「我们把 Skia 的字节原样交给 SDL，却按 macOS 的通道顺序声称格式」造成的**呈现缺陷**（`adl` 与我们的 GPU 后端都不经过这条路径，所以两端对比看不见它），不属于「`adl` 跑得对我们跑不出」的语义欠账，故不占本表；证据、复现命令与未测项见阶段节与 `win32.md` §2.12。
 > **2026-10-24 追加（阶段二百七十一：`--gpu-backend gl`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段新增的是**后端选择**，不是语义能力；GL 侧的未测项（Intel/AMD 老驱动、远程桌面/虚拟机、compat profile 下快路径可用性、present 实际合成延迟、Win7 真机）属**验证欠账**而非「`adl` 跑得对我们跑不出」，按 AGENTS §1.5 不占本表——已逐条写在阶段节的「五、如实报明」与 `compile.md` §3.4.6 的「已知边界」。同一条也适用于「GL 还不是默认」：那是**权衡**（换后端不提帧率、present 更贵），不是欠账。

@@ -63,8 +63,22 @@ function checkDoubleClick(): string[] {
   check('a gated double click dispatches "doubleClick", else a plain "click"',
     c.includes('dce ? (char*)"doubleClick" : (char*)"click"'));
   // (3) The flag and the constant exist as modelled.
+  // Read the struct BODY instead of a fixed-size window: a window is a proxy that
+  // breaks every time DisplayObject grows a field (it did, at 932 characters), while
+  // brace matching keeps asserting the real claim.
+  const iobjBody = (() => {
+    const at = c.indexOf('struct InteractiveObject {');
+    if (at < 0) return '';
+    const open = c.indexOf('{', at);
+    let depth = 0;
+    for (let i = open; i < c.length; i++) {
+      if (c[i] === '{') depth++;
+      else if (c[i] === '}' && --depth === 0) return c.slice(open + 1, i);
+    }
+    return '';
+  })();
   check('InteractiveObject declares doubleClickEnabled',
-    /struct InteractiveObject \{[\s\S]{0,900}?bool doubleClickEnabled;/.test(c));
+    iobjBody.includes('bool doubleClickEnabled;'));
   check('doubleClickEnabled defaults to false in the ctor',
     c.includes('o->doubleClickEnabled = false;'));
   check('MouseEvent.DOUBLE_CLICK exists as "doubleClick"',

@@ -856,6 +856,11 @@ export class SymbolTable {
       fields: new Map(),
       methods: new Map(),
       staticFields: new Map([
+        // NO_OP (0) is the placeholder AIR documents for a command slot that draws
+        // nothing and consumes no data (measured on adl 51.4.1, temp/g242526/
+        // air-sem.txt: NO_OP=0 MOVE_TO=1 LINE_TO=2 CURVE_TO=3 WIDE_MOVE_TO=4
+        // WIDE_LINE_TO=5 CUBIC_CURVE_TO=6).
+        ['NO_OP', { type: { kind: 'int' }, init: { kind: 'Num', value: 0, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
         ['MOVE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 1, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
         ['LINE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 2, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
         ['CURVE_TO', { type: { kind: 'int' }, init: { kind: 'Num', value: 3, isInt: true }, visibility: 'public', owner: 'GraphicsPathCommand', isStatic: true, isConst: true }],
@@ -869,6 +874,27 @@ export class SymbolTable {
       constructor: { params: [] },
       superClass: 'Object',
       isFinal: false,
+      implements: [],
+    });
+    // flash.display.GraphicsPathWinding: the two accepted `winding` values of
+    // Graphics.drawPath (and GraphicsPath's last constructor parameter). Measured
+    // on adl 51.4.1 (temp/g242526/air-sem.txt): EVEN_ODD = "evenOdd", NON_ZERO =
+    // "nonZero", and any other value is ArgumentError #2008 ("Parameter winding
+    // must be one of the accepted values."). No constructor: AIR's own is not
+    // public, so the class only ever appears as a bag of constants.
+    this.classMap.set('GraphicsPathWinding', {
+      fields: new Map(),
+      methods: new Map(),
+      staticFields: new Map([
+        ['EVEN_ODD', { type: { kind: 'string' }, init: { kind: 'Str', value: 'evenOdd' }, visibility: 'public', owner: 'GraphicsPathWinding', isStatic: true, isConst: true }],
+        ['NON_ZERO', { type: { kind: 'string' }, init: { kind: 'Str', value: 'nonZero' }, visibility: 'public', owner: 'GraphicsPathWinding', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: true,
       implements: [],
     });
     // inject the built-in Error class (used by throw/catch).
@@ -5579,6 +5605,15 @@ export class SymbolTable {
         ['moveTo', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number')])],
         ['lineTo', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number')])],
         ['curveTo', gpm({ kind: 'void' }, [greq('controlX', 'Number'), greq('controlY', 'Number'), greq('anchorX', 'Number'), greq('anchorY', 'Number')])],
+        // AIR: cubicCurveTo(controlX1, controlY1, controlX2, controlY2, anchorX,
+        // anchorY) -- six parameters, so `cubicCurveTo.length` is 6 (measured on
+        // adl 51.4.1). The call itself never throws, not even for NaN or as the
+        // first command of an empty path (also measured).
+        ['cubicCurveTo', gpm({ kind: 'void' }, [
+          greq('controlX1', 'Number'), greq('controlY1', 'Number'),
+          greq('controlX2', 'Number'), greq('controlY2', 'Number'),
+          greq('anchorX', 'Number'), greq('anchorY', 'Number'),
+        ])],
         ['beginFill', gpm({ kind: 'void' }, [greq('color', 'uint'), gnum('alpha', 1)])],
         // AIR: beginBitmapFill(bitmap:BitmapData, matrix:Matrix = null,
         // repeat:Boolean = true, smooth:Boolean = false). A null matrix is the
@@ -5639,6 +5674,16 @@ export class SymbolTable {
           { name: 'indices', type: 'Vector.<int>', defaultValue: { kind: 'Null' }, isRest: false },
           { name: 'uvtData', type: 'Vector.<Number>', defaultValue: { kind: 'Null' }, isRest: false },
           { name: 'culling', type: 'String', defaultValue: { kind: 'Str', value: 'none' }, isRest: false },
+        ])],
+        // AIR: drawPath(commands:Vector.<int>, data:Vector.<Number>,
+        // winding:String = GraphicsPathWinding.EVEN_ODD) -- three parameters,
+        // so `drawPath.length` is 3 (measured). The interpreter lives in
+        // Graphics_drawPath; its reference behaviour is pinned in
+        // docs/zh-cn/as3-semantics.md and temp/g242526 (G26).
+        ['drawPath', gpm({ kind: 'void' }, [
+          { name: 'commands', type: 'Vector.<int>', defaultValue: null, isRest: false },
+          { name: 'data', type: 'Vector.<Number>', defaultValue: null, isRest: false },
+          { name: 'winding', type: 'String', defaultValue: { kind: 'Str', value: 'evenOdd' }, isRest: false },
         ])],
         ['clear', gpm({ kind: 'void' }, [])],
       ]),

@@ -7,6 +7,7 @@ import './unit/lexer.ts';
 import './unit/build.ts';
 import './unit/transport.ts';
 import './unit/render.ts';
+import './unit/g242526.ts';
 import './unit/display.ts';
 import './unit/text-input.ts';
 import './unit/ime.ts';

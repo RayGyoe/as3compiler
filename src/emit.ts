@@ -5807,6 +5807,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // The focused DisplayObject: nothing else references it, so it has to be a
     // permanent root (Stage_set_focus / a click can leave it live across frames).
     this.line('gc_mark_ptr((void*)as_focus_obj);');
+    // The roll target and a queued leave point at objects nothing else has to keep
+    // alive: the detached subtree a leave is deferred to is exactly the case where
+    // the app may already have dropped its last reference to it (G25).
+    this.line('gc_mark_ptr(as_hover_target);');
+    this.line('gc_mark_ptr(as_hover_pending);');
     this.line('gc_mark_ptr((void*)as_tab_anchor);');
     this.line('gc_mark_ptr((void*)ASC_native_app);');
     // The flash.desktop icon family and the menus an app installs are reached ONLY
@@ -11548,6 +11553,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return child;');
     this.indent--;
     this.line('}');
+    this.line('static void as_hover_on_remove(void* container, DisplayObject* child);');
     this.line('DisplayObject* DisplayObjectContainer_removeChild(void* _this, DisplayObject* child) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
@@ -11573,6 +11579,9 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('if (child->parent == (Object*)_this) child->parent = NULL;');
+    // G25 contract 1: a hovered subtree that leaves the list still gets its
+    // mouseOut/rollOut, on the next beat, on the detached node.
+    this.line('as_hover_on_remove((void*)_this, child);');
     this.line('if (was_on_stage) as_disp_stage_walk(child, (char*)"removedFromStage");');
     this.line('return child;');
     this.indent--;
@@ -11641,15 +11650,28 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return false;');
     this.indent--;
     this.line('}');
+    // setChildIndex(child, index): AIR validates in a fixed order that is NOT the
+    // obvious one -- the INDEX is range-checked first, the "is this really my child"
+    // check second, and the null check before both. Measured on adl 51.4.1
+    // (temp/g242526/air-sem.txt):
+    //   * index == numChildren, index > numChildren, index < 0, or ANY index on an
+    //     empty container -> RangeError #2006;
+    //   * a non-child at an IN-RANGE index -> ArgumentError #2025, but a non-child at
+    //     an OUT-OF-RANGE index still reports #2006, which is what proves the order;
+    //   * a null child -> TypeError #2007 "Parameter child must be non-null."
+    //     (reported even when the index is also bad).
+    // The old body clamped the index and silently returned for a non-child, so an
+    // out-of-range addChildAt-style move quietly landed at the front instead of
+    // failing. A rejected call leaves the order untouched, as in AIR.
     this.line('void DisplayObjectContainer_setChildIndex(void* _this, DisplayObject* child, int index) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
-    this.line('if (c->children == NULL) return;');
+    this.line('int n = (c->children == NULL) ? 0 : c->children->length;');
+    this.line('if (child == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter child must be non-null.", 2007)); return; }');
+    this.line('if (index < 0 || index >= n) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return; }');
     this.line('int cur = -1;');
-    this.line('for (int i = 0; i < c->children->length; i++) if ((DisplayObject*)as_v_obj_val(c->children->data[i]) == child) { cur = i; break; }');
-    this.line('if (cur < 0) return;');
-    this.line('if (index < 0) index = 0;');
-    this.line('if (index >= c->children->length) index = c->children->length - 1;');
+    this.line('for (int i = 0; i < n; i++) if ((DisplayObject*)as_v_obj_val(c->children->data[i]) == child) { cur = i; break; }');
+    this.line('if (cur < 0) { as_throw(ArgumentError_new((char*)"Error #2025: The supplied DisplayObject must be a child of the caller.", 2025)); return; }');
     this.line('if (cur == index) return;');
     this.line('as_value v = c->children->data[cur];');
     this.line('if (cur < index) { for (int i = cur; i < index; i++) c->children->data[i] = c->children->data[i + 1]; }');
@@ -17759,6 +17781,124 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('static int ASC_drag_lock = 0;');
     this.line('static Rectangle* ASC_drag_bounds = NULL;');
     this.line('static double ASC_drag_off_x = 0.0, ASC_drag_off_y = 0.0;');
+    // ---- object-level roll-over / roll-out (G25) ----
+    // AIR keeps ONE roll target per Stage: the topmost interactive object under the
+    // pointer. Every pointer notification re-evaluates it, and a CHANGE dispatches,
+    // in this order (measured on adl 51.4.1 by walking a REAL cursor over
+    // bg > outer > inner > leaf, temp/g242526/drivemouse2.cjs -> mouse2-air.txt):
+    //   1. mouseOut on the OLD target (bubbles through its ancestors, Stage included);
+    //   2. rollOut on every object of the OLD chain (target..root Sprite, innermost
+    //      first) that does not hold the NEW target, bubbles=false,
+    //      target == currentTarget == that object;
+    //   3. rollOver on every object of the NEW chain (innermost first) that did not
+    //      hold the OLD target;
+    //   4. mouseOver on the NEW target (bubbles).
+    // The Stage only ever sees the bubbling pair: wiring the stage logged mouseOut/
+    // mouseOver at it but no rollOut/rollOver, so the chain stops at the topmost
+    // DisplayObject. A move that keeps the same target dispatches NOTHING, and
+    // mouseDown/mouseUp do not re-fire the roll pair (both measured).
+    //
+    // contract 2 of the gap entry -- "while a button is held the pointer belongs to
+    // the pressed target, so no leave is delivered" -- does NOT reproduce on adl
+    // 51.4.1: pressing the leaf and dragging to inner/outer/bg delivered
+    // mouseOut+rollOut at every step (mouse2-air.txt, the down/move/up run). The
+    // implementation therefore follows the measurement, not that older claim.
+    this.line('static void* as_hover_target = NULL;');
+    this.line('static Stage* as_hover_stage = NULL;');
+    // Deferred leave (contract 1): when the hovered subtree leaves the display list,
+    // AIR still delivers its mouseOut/rollOut -- one beat later, on the already
+    // DETACHED node. Measured (mouse2-air.txt, REMOVE inner while the pointer rested
+    // on leaf): mouseOut leaf bubbling through the DETACHED leaf->inner path only,
+    // then rollOut leaf and rollOut inner, then mouseOver outer for the new target in
+    // the same beat. Delivering this synchronously inside removeChild would instead
+    // run the app leave handler while the node is still attached.
+    this.line('static void* as_hover_pending = NULL;');
+    this.line('static void* as_hover_pending_anchor = NULL;');
+    this.line('static Stage* as_hover_pending_stage = NULL;');
+    this.line('static double as_hover_px = 0.0, as_hover_py = 0.0;');
+    // Is t the object o, or a descendant of it?
+    this.line('static bool as_hover_holds(void* o, void* t) {');
+    this.indent++;
+    this.line('if (o == NULL || t == NULL) return false;');
+    this.line('for (DisplayObject* p = (DisplayObject*)t; p != NULL; p = (DisplayObject*)p->parent) if ((void*)p == o) return true;');
+    this.line('return false;');
+    this.indent--;
+    this.line('}');
+    // One roll/mouse event with obj as the target. bub is false for the roll
+    // pair (AIR dispatches those per object, phase 2, no bubbling).
+    this.line('static void as_hover_fire(void* obj, char* type, bool bub, double x, double y) {');
+    this.indent++;
+    this.line('DisplayObject* o = (DisplayObject*)obj;');
+    this.line('if (o == NULL) return;');
+    this.line('double lx = 0.0, ly = 0.0;');
+    this.line('as_local_point(o, x, y, &lx, &ly);');
+    this.line('MouseEvent* evt = MouseEvent_new(type, bub, false, lx, ly, NULL, false, false, false, false, 0.0);');
+    this.line('evt->stageX = x;');
+    this.line('evt->stageY = y;');
+    this.line('EventDispatcher_dispatchEvent(obj, (Event*)evt);');
+    this.indent--;
+    this.line('}');
+    // The next object of a chain, or NULL at its end. The topmost DisplayObject is
+    // the Stage child: the roll pair never reaches the Stage itself.
+    this.line('static DisplayObject* as_hover_next(DisplayObject* p) {');
+    this.indent++;
+    this.line('if (p == NULL) return NULL;');
+    this.line('DisplayObject* par = (DisplayObject*)p->parent;');
+    this.line('if (par == NULL) return NULL;');
+    this.line('if (par->vtable != NULL && strcmp(par->vtable->cls_name, "Stage") == 0) return NULL;');
+    this.line('return par;');
+    this.indent--;
+    this.line('}');
+    // Deliver the transition from the current roll target to the new one.
+    this.line('static void as_hover_move(Stage* st, void* next, double x, double y, void* anchor) {');
+    this.indent++;
+    this.line('void* prev = as_hover_target;');
+    // The pointer position is recorded even when the target did not change: the
+    // deferred removal leave reports the last position it saw.
+    this.line('as_hover_px = x; as_hover_py = y;');
+    this.line('as_hover_stage = st;');
+    this.line('if (prev == next) return;');
+    this.line('if (prev != NULL) {');
+    this.indent++;
+    this.line('as_hover_fire(prev, (char*)"mouseOut", true, x, y);');
+    this.line('for (DisplayObject* p = (DisplayObject*)prev; p != NULL; p = as_hover_next(p)) if (!as_hover_holds((void*)p, next)) as_hover_fire((void*)p, (char*)"rollOut", false, x, y);');
+    this.indent--;
+    this.line('}');
+    this.line('if (next != NULL) {');
+    this.indent++;
+    this.line('for (DisplayObject* p = (DisplayObject*)next; p != NULL; p = as_hover_next(p)) if (!as_hover_holds((void*)p, prev) && (anchor == NULL || !as_hover_holds((void*)p, anchor))) as_hover_fire((void*)p, (char*)"rollOver", false, x, y);');
+    this.line('as_hover_fire(next, (char*)"mouseOver", true, x, y);');
+    this.indent--;
+    this.line('}');
+    this.line('as_hover_target = next;');
+    this.indent--;
+    this.line('}');
+    // Deliver a leave queued by a removal, then re-evaluate the target from the
+    // recorded pointer position -- the pointer never moved, so whatever is under it
+    // now becomes the target in the same beat (measured: mouseOver outer follows the
+    // leave of the removed leaf).
+    this.line('static void as_hover_flush(void) {');
+    this.indent++;
+    this.line('if (as_hover_pending == NULL) return;');
+    this.line('Stage* st = as_hover_pending_stage;');
+    this.line('void* anchor = as_hover_pending_anchor;');
+    this.line('as_hover_pending = NULL;');
+    this.line('as_hover_pending_anchor = NULL;');
+    this.line('as_hover_pending_stage = NULL;');
+    this.line('if (st != NULL) as_hover_move(st, as_pick_hit((void*)st, as_hover_px, as_hover_py), as_hover_px, as_hover_py, anchor);');
+    this.indent--;
+    this.line('}');
+    // A container lost child: hand the hovered run over to the deferred leave so
+    // the handler runs on the detached tree, one beat later, exactly like AIR.
+    this.line('static void as_hover_on_remove(void* container, DisplayObject* child) {');
+    this.indent++;
+    this.line('if (as_hover_target == NULL) return;');
+    this.line('if (!as_hover_holds((void*)child, as_hover_target)) return;');
+    this.line('as_hover_pending = as_hover_target;');
+    this.line('as_hover_pending_anchor = container;');
+    this.line('as_hover_pending_stage = as_hover_stage;');
+    this.indent--;
+    this.line('}');
     this.line('void Stage_dispatchMouse(void* _this, double x, double y, char* type) {');
     this.indent++;
     // Record the live pointer before dispatching: a SimpleButton picks which of its
@@ -17779,6 +17919,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('if (mst != NULL && !ASC_mouse_down) {');
     this.indent++;
+    // AIR sends the per-object leave pair BEFORE the Stage event (measured in
+    // temp/mouse2w: mouseOut -> rollOut on the button -> "mouseLeave" on the stage),
+    // and it keeps the last in-window coordinates rather than zeroing them.
+    this.line('as_hover_flush();');
+    this.line('as_hover_move(mst, NULL, -1.0, -1.0, NULL);');
     this.line('mst->_mouse_in = false;');
     this.line('EventDispatcher_dispatchEvent((void*)mst, (Event*)Event_new((char*)"mouseLeave", false, false));');
     this.indent--;
@@ -17795,6 +17940,12 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (strcmp(type, "mouseDown") == 0) ASC_mouse_down = 1;');
     this.line('else if (strcmp(type, "mouseUp") == 0) ASC_mouse_down = 0;');
     this.line('void* target = as_pick_hit(_this, x, y);');
+    // G25: the roll-target bookkeeping runs BEFORE the event that caused it, which is
+    // the order measured on adl (mouseOut/rollOut/rollOver/mouseOver all precede the
+    // mouseMove/down/up of the same notification). A same-target move dispatches
+    // nothing, so this is free on the common path.
+    this.line('as_hover_flush();');
+    this.line('as_hover_move(mst, target, x, y, NULL);');
     // Roll-over target for the MovieClip button states, and the press latch: AIR
     // latches `_down` to the object the press STARTED on (temp/btnprobe p5/p7 --
     // press outside then drag in shows only `_over`, press here then drag off keeps
@@ -18016,6 +18167,48 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (y > g->_bb) g->_bb = y;');
     this.indent--;
     this.line('}');
+    // Exact bounds of a quadratic / cubic arc (G26). AIR reports width/height from the
+    // CURVE, not from the control hull: moveTo(10,50) + cubicCurveTo(10,0, 90,0, 90,50)
+    // is 80x37.5 and moveTo(10,50) + curveTo(10,0, 90,50) is 80x25, while the hull
+    // would answer 80x50 for both (measured, temp/g242526/bounds-air.txt). The box
+    // therefore takes the curve extrema -- where the parameterised derivative is zero
+    // -- and never the control points, which keeps width/height (and the bake surface
+    // built from them) the same in a Skia build and a pure-C one.
+    this.line('static void as_gpath_quad(Graphics* g, double p0x, double p0y, double cx, double cy, double ax, double ay) {');
+    this.indent++;
+    this.line('as_gpath_pt(g, ax, ay);');
+    this.line('double dx = p0x - 2.0 * cx + ax;');
+    this.line('if (dx != 0.0) { double t = (p0x - cx) / dx; if (t > 0.0 && t < 1.0) { double u = 1.0 - t; as_gpath_pt(g, u * u * p0x + 2.0 * u * t * cx + t * t * ax, u * u * p0y + 2.0 * u * t * cy + t * t * ay); } }');
+    this.line('double dy = p0y - 2.0 * cy + ay;');
+    this.line('if (dy != 0.0) { double t = (p0y - cy) / dy; if (t > 0.0 && t < 1.0) { double u = 1.0 - t; as_gpath_pt(g, u * u * p0x + 2.0 * u * t * cx + t * t * ax, u * u * p0y + 2.0 * u * t * cy + t * t * ay); } }');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_gpath_cubic(Graphics* g, double p0x, double p0y, double c1x, double c1y, double c2x, double c2y, double ax, double ay) {');
+    this.indent++;
+    this.line('as_gpath_pt(g, ax, ay);');
+    // B(t) is cubic in t, so its derivative is the quadratic
+    //   3 [ A t^2 + B t + C ],  A = p3 - 3p2 + 3p1 - p0, B = 2 (p0 - 2p1 + p2), C = p1 - p0
+    // per axis; a real root strictly inside (0,1) is a curve extremum on that axis.
+    this.line('for (int axis = 0; axis < 2; axis++) {');
+    this.indent++;
+    this.line('double q0 = axis ? p0y : p0x, q1 = axis ? c1y : c1x, q2 = axis ? c2y : c2x, q3 = axis ? ay : ax;');
+    this.line('double A = q3 - 3.0 * q2 + 3.0 * q1 - q0, B = 2.0 * (q0 - 2.0 * q1 + q2), C = q1 - q0;');
+    this.line('double ts[2]; int n = 0;');
+    this.line('if (fabs(A) < 1e-12) { if (fabs(B) > 1e-12) ts[n++] = -C / B; }');
+    this.line('else { double disc = B * B - 4.0 * A * C; if (disc >= 0.0) { double sq = sqrt(disc); ts[n++] = (-B + sq) / (2.0 * A); ts[n++] = (-B - sq) / (2.0 * A); } }');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('double t = ts[i];');
+    this.line('if (!(t > 0.0 && t < 1.0)) continue;');
+    this.line('double u = 1.0 - t;');
+    this.line('as_gpath_pt(g, u * u * u * p0x + 3.0 * u * u * t * c1x + 3.0 * u * t * t * c2x + t * t * t * ax,');
+    this.line('               u * u * u * p0y + 3.0 * u * u * t * c1y + 3.0 * u * t * t * c2y + t * t * t * ay);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.line('static void as_gpath_rect(Graphics* g, double x, double y, double w, double h) {');
     this.indent++;
     this.line('as_gpath_pt(g, x, y); as_gpath_pt(g, x + w, y); as_gpath_pt(g, x, y + h); as_gpath_pt(g, x + w, y + h);');
@@ -18094,9 +18287,14 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('}');
     this.line('void Graphics_moveTo(void* _this, double x, double y) { Graphics* g = (Graphics*)_this; as_skia_path_move_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); }');
     this.line('void Graphics_lineTo(void* _this, double x, double y) { Graphics* g = (Graphics*)_this; as_skia_path_line_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); }');
-    // A quadratic curve is inside the convex hull of control+anchor, so both
-    // points go into the box -- the same rule SkPath::getBounds() uses.
-    this.line('void Graphics_curveTo(void* _this, double cx, double cy, double ax, double ay) { Graphics* g = (Graphics*)_this; as_skia_path_quad_to(g->path, cx, cy, ax, ay); as_gpath_pt(g, cx, cy); as_gpath_pt(g, ax, ay); as_gpen(g, ax, ay); }');
+    // The CPU-side box takes the CURVE extrema, not the control points (see
+    // as_gpath_quad): AIR answers 80x25 for a curve whose control sits at y=0 over a
+    // chord at y=50.
+    this.line('void Graphics_curveTo(void* _this, double cx, double cy, double ax, double ay) { Graphics* g = (Graphics*)_this; as_skia_path_quad_to(g->path, cx, cy, ax, ay); as_gpath_quad(g, g->_lastx, g->_lasty, cx, cy, ax, ay); as_gpen(g, ax, ay); }');
+    // Same rule as curveTo with the second control point added (G26): the extrema of
+    // the cubic join the box, so a control hull that sticks out does not inflate
+    // width/height -- and a pure-C build (every Skia stub inert) agrees with AIR.
+    this.line('void Graphics_cubicCurveTo(void* _this, double c1x, double c1y, double c2x, double c2y, double ax, double ay) { Graphics* g = (Graphics*)_this; as_skia_path_cubic_to(g->path, c1x, c1y, c2x, c2y, ax, ay); as_gpath_cubic(g, g->_lastx, g->_lasty, c1x, c1y, c2x, c2y, ax, ay); as_gpen(g, ax, ay); }');
     this.line('void Graphics_beginFill(void* _this, unsigned color, double alpha) {');
     this.indent++;
     this.line('Graphics* g = (Graphics*)_this;');
@@ -18301,6 +18499,88 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('double hy = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);');
     this.line('as_gpath_rect(g, lx, ly, hx - lx, hy - ly);');
     this.line('as_gclosed(g, cx, cy);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // drawPath(commands:Vector.<int>, data:Vector.<Number>, winding:String).
+    //
+    // AIR's reference behaviour, all measured on adl 51.4.1 with per-cell ink counts
+    // (temp/g242526: Pix2/Pix3/Pix6/Pix7 + air-sem.txt / air-sem2.txt):
+    //   * the path it builds is EXACTLY what moveTo/lineTo/curveTo/cubicCurveTo would
+    //     build -- [MOVE,LINE,CURVE] fills to the same 1635 pixels as the plain API
+    //     and [MOVE,CUBIC,LINE] to the same 1172, curve bulges included;
+    //   * NO_OP (0) draws nothing and consumes no data (a NO_OP between two real
+    //     commands is transparent);
+    //   * an unknown command value drops the REST of the list but keeps the geometry
+    //     already built ([MOVE,LINE,9,LINE] still paints its triangle);
+    //   * a command whose numbers run out is skipped the same way -- a short data
+    //     vector is not an error, so [MOVE,CUBIC] with 6 numbers simply draws nothing;
+    //     (AIR itself reads PAST the end of the Vector there, which is undefined
+    //     behaviour: [MOVE,LINE,CUBIC,LINE] given 10 of its 12 numbers painted 1895
+    //     pixels -- the shape with a phantom lineTo(0,0). We stop instead of reading
+    //     out of bounds; that divergence is documented in compiler-gaps.md G26.)
+    //   * an ODD data length is ArgumentError #2004 "One of the parameters is invalid."
+    //     and is rejected before anything is drawn (measured over n0..n9, wide
+    //     commands included);
+    //   * a winding other than "evenOdd"/"nonZero" is ArgumentError #2008 "Parameter
+    //     winding must be one of the accepted values."; the two real values pick the
+    //     fill rule -- two nested squares in one path paint 1920 px (hollow centre)
+    //     with evenOdd and the full 2704 px with nonZero, and the evenOdd result
+    //     matches two plain drawRect calls;
+    //   * WIDE_MOVE_TO/WIDE_LINE_TO (4/5) paint NOTHING in AIR even when the data is
+    //     plenty -- [WIDE_MOVE_TO,WIDE_LINE_TO,WIDE_LINE_TO] with 12 numbers is 0 ink
+    //     against the plain triangle's 990 -- so they end the run like an unknown
+    //     command instead of being silently reinterpreted as their narrow twins.
+    //
+    // The fill rule is set on the group path being built and inherited by the groups
+    // that follow (as_gflush re-applies `_even_odd`), i.e. winding behaves like the
+    // other Graphics state rather than being scoped to this one call. Mixing two
+    // windings inside ONE group is unmeasured; the last one wins for that group.
+    this.line('void Graphics_drawPath(void* _this, as_vector_int* commands, as_vector_number* data, char* winding) {');
+    this.indent++;
+    this.line('Graphics* g = (Graphics*)_this;');
+    this.line('int even_odd;');
+    this.line('if (winding == NULL || strcmp(winding, "evenOdd") == 0) even_odd = 1;');
+    this.line('else if (strcmp(winding, "nonZero") == 0) even_odd = 0;');
+    this.line('else { as_throw(ArgumentError_new((char*)"Error #2008: Parameter winding must be one of the accepted values.", 2008)); return; }');
+    this.line('int nc = (commands == NULL) ? 0 : commands->length;');
+    this.line('int nd = (data == NULL) ? 0 : data->length;');
+    this.line('if ((nd & 1) != 0) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }');
+    this.line('if (even_odd != g->_even_odd) { as_skia_path_set_even_odd(g->path, even_odd); g->_even_odd = even_odd; }');
+    this.line('int ci = 0, di = 0;');
+    this.line('while (ci < nc) {');
+    this.indent++;
+    this.line('int cmd = commands->data[ci++];');
+    this.line('if (cmd == 0) continue;  // NO_OP: no geometry, no numbers');
+    this.line('if (cmd == 1 || cmd == 2) {');
+    this.indent++;
+    this.line('if (di + 2 > nd) break;');
+    this.line('double x = data->data[di], y = data->data[di + 1];');
+    this.line('di += 2;');
+    this.line('if (cmd == 1) as_skia_path_move_to(g->path, x, y); else as_skia_path_line_to(g->path, x, y);');
+    this.line('as_gpath_pt(g, x, y);');
+    this.line('as_gpen(g, x, y);');
+    this.indent--;
+    this.line('} else if (cmd == 3) {');
+    this.indent++;
+    this.line('if (di + 4 > nd) break;');
+    this.line('double cx = data->data[di], cy = data->data[di + 1], ax = data->data[di + 2], ay = data->data[di + 3];');
+    this.line('di += 4;');
+    this.line('as_skia_path_quad_to(g->path, cx, cy, ax, ay);');
+    this.line('as_gpath_quad(g, g->_lastx, g->_lasty, cx, cy, ax, ay);');
+    this.line('as_gpen(g, ax, ay);');
+    this.indent--;
+    this.line('} else if (cmd == 6) {');
+    this.indent++;
+    this.line('if (di + 6 > nd) break;');
+    this.line('double c1x = data->data[di], c1y = data->data[di + 1], c2x = data->data[di + 2], c2y = data->data[di + 3], ax2 = data->data[di + 4], ay2 = data->data[di + 5];');
+    this.line('di += 6;');
+    this.line('as_skia_path_cubic_to(g->path, c1x, c1y, c2x, c2y, ax2, ay2);');
+    this.line('as_gpath_cubic(g, g->_lastx, g->_lasty, c1x, c1y, c2x, c2y, ax2, ay2);');
+    this.line('as_gpen(g, ax2, ay2);');
+    this.indent--;
+    this.line('} else break;  // unknown OR wide command: keep what is built, drop the rest');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -22739,6 +23019,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // (AssetManager chains) reacts to by queueing the next load. Doing it first
     // means a job that completed while the last frame was rendering is visible
     // to listeners in this frame, matching AIR's "as soon as possible" delivery.
+    // G25 contract 1: a leave queued by a removal is delivered at the first frame
+    // boundary after it, which is the "one beat later" AIR uses. Nothing else has run
+    // yet this frame, so a listener sees the tree in the state AIR would show it.
+    this.line('as_hover_flush();');
     this.line('as_async_tick();');
     // Fire due setTimeout/clearTimeout timers first (AIR drives timers on the
     // same frame clock as ENTER_FRAME), then advance playing MovieClips, then

@@ -216,6 +216,75 @@ DisplayObject`，不是 `InteractiveObject`）自己不可能是目标，事件�
 
 ---
 
+### 3.5 三条运行时契约：`setChildIndex` 判据顺序 / roll-over 对 / `drawPath` 解释器（阶段二百七十五 · adl 51.4.1 实测）
+
+三条都是「API 在 AIR 里存在、我们的实现却在**语义**上不同」的缺陷（登记为 `asaotui/compiler-gaps.md` 的
+G24 / G25 / G26）。它们的共同点是：**只有拿真 AIR 逐条量过，才知道正确的判据长什么样**——靠读文档
+或凭直觉都会写错，其中 G24 的顺序甚至是**反直觉**的。
+
+**① `DisplayObjectContainer.setChildIndex(child, index)` 的判据与顺序。**
+实测（`temp/g242526/air-sem.txt`，探针 `AirSem.as`）三条错误**依次**是：
+
+| 情形 | 抛出的错误 |
+|---|---|
+| `child == null` | `TypeError #2007`「Error #2007: Parameter child must be non-null.」 |
+| `index < 0`、`index >= numChildren`（**空容器任意索引都算**） | `RangeError #2006`「Error #2006: The supplied index is out of bounds.」 |
+| `child` 不是调用者的孩子 | `ArgumentError #2025`「Error #2025: The supplied DisplayObject must be a child of the caller.」 |
+
+**顺序是 null → 索引 → 是否我的孩子**。决定性证据有两条：`setChildIndex(nonchild, 99)` 报的是
+`#2006` 而**不是** `#2025` ⇒ 索引判定在孩子判定之前；`setChildIndex(null, 0)` 报 `#2007` ⇒ null 判定
+在最前。另外 `getChildIndex(nonchild)` ⇒ `#2025`、`getChildAt(-1)` / `removeChildAt(-1)` ⇒ `#2006`，
+与上表同源。三条判据都必须在**任何写入之前**：被拒绝的调用绝不改变子件顺序。
+
+**为什么这条重要**：夹紧越界索引的实现「恰好」把最后一个孩子放到正确位置，画面**逐像素相同**，
+所以任何截图门、任何 AOT 探针都看不见差别；只有真 AIR 会抛。见 `asaotui/reviews/air-sweep-2026-10-24.md`。
+
+**② roll-over 事件对（`rollOver`/`rollOut`）与 mouse 对（`mouseOver`/`mouseOut`）的差别。**
+用**真光标**驱动 `adl`（posted `WM_MOUSEMOVE` 会被物理光标重推，测不准）得到的契约：
+
+- 进入：先 `rollOver`（`bubbles = false`、`eventPhase = 2`，从命中目标**逐个向祖先**发），再 `mouseOver`
+  （`bubbles = true`，**从目标向外冒泡**，`currentTarget` 逐层换成祖先）；
+- 离开：先 `mouseOut`（冒泡），再 `rollOut`（不冒泡，自内向外）；
+- **目标不变则一个事件都不发**；
+- **不发多余的 leave/enter**：只对「指针已不在其子树内」的节点发 `rollOut`，只对「指针原先不在其子树内」
+  的节点发 `rollOver`。这条在「子件被摘出显示树」时尤其关键——AIR 是拿**移除之前的那条链**做抑制判定，
+  所以我们把「刚被移出的容器」作为 `anchor` 参与判定，而不是把旧目标置空（置空会让祖先误以为指针是新进来的）；
+- 链**止于 Stage**：Stage 只收到冒泡的那一对，不参与 roll 对；
+- handle 从显示树摘掉的**下一拍**仍要对那个（已脱离的）节点投递 leave ⇒ 需要一个帧边界补发点，且该目标必须是
+  **永久 GC 根**（应用可能已丢掉最后一个引用）；
+- 窗口退出时离开对的坐标是 **`-1,-1`**（不是最后那个窗内坐标）。
+
+**已知分歧**：对「已脱离节点的补发离开对」，AIR 报 `stageX/stageY = 3,3`——既不等于最后的窗内坐标，
+也不等于移除位置，AIR 自身无法解释；我们报**真实指针位置**（如 `60,60`）。取可解释的那个，不模仿。
+逐行对照：`temp/g242526/mouse2-air.txt` vs `mouse_aot.txt`（108 行，事件类型/顺序/target/currentTarget/
+bubbles/phase 全同，仅上述坐标差 4 行）。
+
+**③ `Graphics.drawPath(commands, data, winding)` 的解释器口径。**
+
+| 情形 | AIR 行为 |
+|---|---|
+| 常量表 | `NO_OP=0 MOVE_TO=1 LINE_TO=2 CURVE_TO=3 WIDE_MOVE_TO=4 WIDE_LINE_TO=5 CUBIC_CURVE_TO=6` |
+| `winding` 非法 | `ArgumentError #2008`「Error #2008: Parameter winding must be one of the accepted values.」 |
+| `data.length` 为奇数 | `ArgumentError #2004`「Error #2004: One of the parameters is invalid.」（**在画之前**） |
+| 短数据 / 空数据 / `null` 向量 / 未知命令值 / `NO_OP` | 不抛 |
+| 命令表**只有** `MOVE_TO` + 一段曲线 | **不产生填充面**（0 ink），但**描边照画**（236 ink）。**这是 `drawPath` 独有的怪癖**：同一份几何走平 API（`moveTo` + `cubicCurveTo`）**会填** |
+
+`cubicCurveTo.length == 6`、`drawPath.length == 3`（第三参默认 `evenOdd`），自身永不抛（NaN、作为首命令
+都不抛）。`GraphicsPathWinding` 是**常量袋**（构造器不 public）：`EVEN_ODD="evenOdd"` / `NON_ZERO="nonZero"`，
+winding 是**组级状态**（记在 `Graphics` 上，`endFill` 时重放）。
+
+**「单段曲线不填」不是「未闭合不填」**（Pix8 七格实测）：`[MOVE_TO, LINE_TO, LINE_TO]` 的**未闭合**三角形填充 **248226**（平 API 同样 248226）；`[MOVE_TO, CUBIC_CURVE_TO, CUBIC_CURVE_TO]` 填充 **232198**；只有「正好一整条命令表 = `MOVE_TO` + 一段曲线」是 0。所以规则是**段数 ≥ 2 才填**，且**只在 `drawPath` 上成立**。我们这一格**不复刻**（会多填一块），理由与量值见 `compiler-gaps.md` G26。
+
+**紧包围盒**（推翻本项目旧注释「控制点入包围盒，同 `SkPath::getBounds()`」）：AIR 的 `width/height` 是
+**曲线的紧包围盒**。`moveTo(10,50) + cubicCurveTo(10,0, 90,0, 90,50)` ⇒ **80x37.5**（凸包会给 80x50）；
+`curveTo(10,0, 90,50)` ⇒ **80x25**（凸包 50）。实现取**导数零点**（二次解一次方程、三次解 `A t²+B t+C`，
+只有 `t∈(0,1)` 才取），于是纯 C 构建与 Skia 构建量到同一个盒子（`as_gpath_quad` / `as_gpath_cubic`）。
+
+**已知残差**：`drawPath` 画出的三次曲线**描边** coverage 我们比 AIR 低约 7%（笔宽/AA 采样口径不同，未定位），
+其余各格在 1% 内（AA 阈值，非几何差）；两条都不产生可见结构差异，登记在 `compiler-gaps.md` G26。
+
+---
+
 ## 4. 保真与增强原则
 
 §2 的红线与 §3 的分歧点都在回答「**怎么和 AIR 对齐**」。本节补上另一半：**对齐之外，什么算「增强」**。

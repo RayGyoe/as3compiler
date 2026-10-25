@@ -669,6 +669,11 @@ as_skia_canvas_restore(canvas);                    // 只够关掉「对象自�
 同一场景的填充、字形、行条、卡片边框逐像素相同；把描边改成 `lineStyle(2)`（3 设备像素，
 不再卡在半像素）剩 **2 px**。这是半像素平局本身，不是放置或缩放口径错。
 
+**2026-10-25 复测（阶段二百七十五 打开 Graphics 抗锯齿之后）**：`node cmpq.cjs off-live.png off-baked.png` 仍是 **17 px / 0.006%，bbox 56,67-72,67，worst=394，与 AA 之前逐值相同**。
+（AA 改的是 `as_skia_paint_fill`/`as_skia_paint_stroke` 的 `setAntiAlias`，而这一行像素两侧
+都是**整数覆盖**——live 全蓝、baked 全白，没有中间值可被 AA 变成部分覆盖。）⇒ 这条残余与
+抗锯齿无关，归因不作改动。
+
 验收：
 
 - 真应用（`asaotui/ui-demo/air-gallery`，1500x1050）在**开烘焙**与 `ASC_NO_AUTO_BAKE=1` 两种
@@ -677,6 +682,30 @@ as_skia_canvas_restore(canvas);                    // 只够关掉「对象自�
   `%.5f` 打印精度）；
 - 源级钉子 `unit: render/BakeResolution`（13 项：设备吸附公式、相位键、描边包围盒、胶水三态）；
 - 像素钉子 `examples/autobake-origin.as`（分数原点上的反走样容器，烘焙前后签名必须相同）。
+
+### 6.13 Graphics 的填充与描边必须开抗锯齿（阶段二百七十五）
+
+`SkPaint` 的抗锯齿**默认是关的**。运行时里凡是自建 `SkPaint` 的地方都显式 `setAntiAlias`
+（位图填充、渐变、SWC 烘焙面），唯独 `as_skia_paint_fill` / `as_skia_paint_stroke` 两个
+`beginFill` / `lineStyle` 用的构造器漏了——于是**所有矢量图形的斜边都成了阶梯，所有细斜描边
+都比 AIR 细一截**。它不是布局或几何问题，所以逐点对照表上的偏差一直被当成「光栅化风格」看待。
+
+发现方式：G26 的像素探针 `temp/g242526/Pix8.as`（同一条曲线，AIR 填充 293240、我们 296310）
+在剖面里露了馅——AIR 的三角形斜边上带 **44 个部分覆盖像素**，我们是 **0 个**。
+
+| 场景 | 关 AA | 开 AA | AIR |
+|---|---|---|---|
+| Pix8 `[MOVE,LINE,LINE]` 未闭合三角形（斜边） | 241230 | **246862** | 248226（−0.55%） |
+| Pix6 平 API 圆角三角形填充 | 410805 | 410718 | 413264（−0.6%） |
+| Pix6 曲线描边 `lineStyle(2)` | 43860 | 44215 | 47510（−6.9%） |
+
+斜边那格从 **−2.8% 收到 −0.55%**，其余各格不动（说明原来的偏差里只有斜边那部分来自 AA）。
+描边那 6.9% 的缺口**不是** AA：曲线的平顶处两侧都精确量到 **2.00 设备像素宽**，缺口全部
+出现在陡峭段的逐列剖面上（Flash 的 AA 会把细斜描边略微「喂胖」），属光栅器风格差，已登记。
+
+钉子：`unit: render/GfxAntialias`（两个构造器都必须 `sk_paint_set_antialias(p, 1)`，且胶水
+确实暴露 `setAntiAlias`）。回归面：打开后 `node test.ts` 全量只剩 4 条基线红，
+`asaotui/ui-demo/run-gallery.cjs` 8 页仍 PASS（PNG 字节数变大，符合「边缘多了部分覆盖」）。
 
 ## 7. 多目标：native 与 wasm
 
