@@ -1190,9 +1190,14 @@ function checkPresentScale(): string[] {
     resizeBlock.indexOf('return nullptr;') > 0 &&
     resizeBlock.indexOf('return nullptr;') < resizeBlock.indexOf('surfaces[i].reset()') &&
     resizeBlock.indexOf('surfaces[i].reset()') < resizeBlock.indexOf('ResizeBuffers('));
+  // Two legal sites since the device-lost rebuild: the per-frame read in
+  // sk_gpu_begin_frame, and the one in d3d_create_swapchain (first bind and every
+  // rebuild -- a freshly created swapchain has no ledger to corrupt, since
+  // d3d_create_swapchain resets every fence value to the base). The RESIZE path is
+  // the one that must never re-read it, and that is still asserted on resizeBlock.
   check('...and the resize path never re-reads the back-buffer index',
     resizeBlock.length > 0 && !/w->buffer_index\s*=/.test(resizeBlock) &&
-    (d3d.match(/w->buffer_index = w->swapchain->GetCurrentBackBufferIndex\(\);/g) ?? []).length === 1);
+    (d3d.match(/w->buffer_index = w->swapchain->GetCurrentBackBufferIndex\(\);/g) ?? []).length === 2);
   if (ok > 0) console.log(`[presentscale] ${ok} presentation-scaling checks passed`);
   return bad;
 }

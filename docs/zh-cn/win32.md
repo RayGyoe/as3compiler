@@ -912,6 +912,92 @@ interface (UI) language…used for all menus, dialog boxes, error messages, and 
 **不含 user32 静态依赖** / 理由留档）+ `examples/stage65.as`（Windows 上断言 `os` 能 `split(" ")` 出非空版本号，
 macOS 自动跳过）。
 
+### 3.13 设备丢失：`DXGI_ERROR_DEVICE_REMOVED` 之后**不能继续出帧**（阶段二百七十八）
+
+`D3D_OK_OR_WARN` 从来只打印 HRESULT。Present 返回 `0x887A0005` 时打印一行、
+接着照常 `Signal` 帧栅栏，下一帧继续拿同一个 `ID3D12Device` / swapchain / Ganesh
+context 出图 —— 而 device 已经没了。Skia 的 `SkSurface` 指向失效资源，访问违例；
+或者循环在死的 swapchain 上空转，界面不响应。
+
+**实测（`temp/crashmon/session-A-20261025-2232.log`，同一应用，Windows 11 / D3D12）：**
+
+| 现场 | 存活 | 退出码 | 崩溃前最后证据 |
+|---|---|---|---|
+| 1 | 107 s | `0xC0000005` | 623 条 `#1009` → `Present failed 0x887A0005` → **386 ms 后 AV** |
+| 3 | 47 s | `0xC0000005` | 内存 691 M 触发一遍 GC → **27 ms 后** Present 失败 → AV |
+| 4 | 189 s | `0x1` + AppHangB1 | Present 连续失败 **252+172+140 次**（30 秒），`ResizeBuffers`/`GetBuffer` 同样失败 |
+
+`0x887A0005` 是 `DXGI_ERROR_DEVICE_REMOVED`；`0x887A0001` 是
+`DXGI_ERROR_INVALID_CALL`（我们自己的调用错，不是设备问题，两者不能混判）。
+
+**修法（`vendor/d3d_glue.cc`）：**
+
+1. **每帧闸门。** `sk_gpu_begin_frame` 开头查 `ID3D12Device::GetDeviceRemovedReason()`——
+   这是本地查询，不提交任何命令，每帧一次调用的代价可忽略，但能在 Present/ResizeBuffers
+   失败**之前**发现设备已丢。这两次失败之间正是旧代码撞进 Skia 的窗口期。
+2. **三处失败入口统一走 lost 路径。** `Present`、`GetBuffer`、`ResizeBuffers` 的 HRESULT
+   经 `d3d_hr_is_device_lost()` 判定（只认 REMOVED / RESET / DRIVER_INTERNAL_ERROR），
+   命中则 `d3d_mark_lost()` 并**立刻返回**——Present 失败后不再 `Signal` 一个死队列永远
+   到不了的栅栏值。非设备类失败（如 `DXGI_ERROR_INVALID_CALL`）只跳这一帧，不销毁状态。
+3. **销毁用 `abandonContext()`，不是 `reset()`。** 被移除的设备无法正常释放，
+   `GrDirectContext::reset()` 会回到一个已经不存在的东西上；`abandonContext()` 是 Skia
+   给这种情况的唯一入口。窗口槽只清 swapchain / back buffer / 栅栏，`used`/`hwnd`/尺寸
+   保留——窗口还在，重建要按同一尺寸来。
+4. **重建 + 退避。** `d3d_create_swapchain()` 被抽出来，初始化和重建共用同一条路径；
+   重建失败按 250 → 500 → … → **4000 ms** 退避，不在每一帧上重试 `D3D12CreateDevice`。
+   重建成功、失败都打一行 stderr，失败不静默。
+5. **期间跳帧。** `sk_gpu_begin_frame` 返回 `nullptr`，生成 C 侧本来就把这当作"本帧没有
+   画布"跳过，不需要新的约定。
+
+**未测（如实列）：** 修复后还没有在实机上跑通「设备被移除 → 自动重建 → 画面恢复」的
+完整链路——复现需要真实的显存压力或 TDR，而它的**诱因**本身仍然没有证实（现场 3 是
+691 M 时发生，现场 4 到 1244 M；显存压力、TDR、驱动三者都未排除）。能确定的是：
+设备丢失后进程不再访问失效资源。
+
+### 3.14 `printf("%s", NULL)` 直接杀进程：ucrt 的无效参数走 `__fastfail`（阶段二百七十八）
+
+**这是 Windows 独有的致死路径**，POSIX 上多半只是打印 `(null)`：ucrt 把 `%s` 收到空指针
+当作 invalid parameter，回调默认处理器 `_invalid_parameter` → `__fastfail` → 进程以
+**`0xC0000409`** 退出，没有异常、没有 dump（除非先 `SetErrorMode(0)`，见崩溃取证链）。
+
+而 ES3 的 `ToString(null)` 是文本 `"null"`，所以这不只是"没打印对"，是**语义正确性**
+顺带保住了进程。实测（`temp/crashmon/session-A-20261025-2232.log` 现场 2）：388 条抛出的
+`#1009` 之后进程以 `0xC0000409` 退出，日志里一行 D3D 报错都没有 —— 死因不是渲染。
+
+**任何可能为空指针的 C 字符串都不能直接递给 `%s`。** 覆盖清单（全部已修）：
+
+| 生产点 | 为什么会空 | 处理 |
+|---|---|---|
+| `as_v_str_val` tag 3 | 手工构造的 boxed String 可以是 tag 3 + 空 ptr | 返回 `"null"` |
+| `as_obj_to_str` proxy 分支 | 代理的 `callProperty("toString")` 返回 null | 同上 |
+| `as_obj_to_str` toString 分支 | 用户 `toString():String { return null; }` | 同上 |
+| `emitTrace` 的每个 `%s` 分支 | 静态 `String` 槽可以真的持有 C `NULL` | 生成侧统一包 `as_str_or_null(...)` |
+| 未捕获错误打印 | 异常对象的 `message` 槽可以是 null | 同上 |
+
+`as_str_or_null(const char* s)` 就是 `s != NULL ? s : "null"`，代价是一次比较。
+`trace` 不在热路径上，但 `as_v_str_val` 在（字符串拼接、比较都会经过它），所以那里是
+就地判空、不额外包一层函数。
+
+**定位用构建开关 `ASC_NULL_TRACE=1`。** 打开后 `as_req_obj`（空接收者守卫）变成宏，
+每次调用带上 `__FILE__`/`__LINE__`，`#1009` 的消息末尾追加 `[<生成的 C 文件>:<行>]`：
+
+```
+Uncaught exception: Error #1009: Cannot access a property or method of a null object reference. [Main.exe.c:52806]
+```
+
+生成 C 的那一行就是**哪个类的哪个成员访问**。这是把一个 623 条的匿名风暴变成一条可定位
+记录的唯一办法。**默认关闭**：它在程序里最热的守卫（每一次成员访问）上多传两个实参，
+每一处调用点都会变长，是诊断构建而不是发布构建。
+
+```jsonc
+// 构建清单里加一项即可（命令行没有 -D，宏统一走清单）：
+{ "defines": ["ASC_NULL_TRACE=1"] }
+```
+
+**已验证：** `examples/null-string.as`（5 条 NULL 路径全部打印 `null`、进程存活）与
+`temp/crashfix/uncaught-storm.as`（50 次抛错 → 4 行报告，计数合计恰好 50）。
+Windows 实机上的 `0xC0000409` 本身由第一轮崩溃日志证实，修复后的第二次复现尚未跑。
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +

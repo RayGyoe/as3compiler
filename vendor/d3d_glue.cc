@@ -107,6 +107,34 @@
     }                                                                   \
   } while (0)
 
+// --- device-lost recovery --------------------------------------------------
+// DXGI takes the device away (driver update, TDR, VRAM pressure) and every object
+// created from it -- the swapchain, its back buffers, and the Skia Ganesh context
+// that wraps them -- is invalid from that instant. Continuing to use them is an
+// access violation, which is exactly what a real app did: one
+// "Present failed 0x887A0005" (DXGI_ERROR_DEVICE_REMOVED, which D3D_OK_OR_WARN
+// only PRINTS) and 386 ms later the process died inside Skia, having drawn several
+// more frames into a device that no longer existed. The same failure without the
+// crash is worse in another way: Present returns immediately, the frame loop spins
+// and the window stops answering (AppHangB1).
+//
+// The recovery below is the DXGI contract: drop every GPU object, rebuild the
+// device/context and each live window's swapchain, and until that succeeds let
+// sk_gpu_begin_frame return NULL so the AS3 side skips the frame (it already
+// treats NULL as "nothing to draw into").
+static int g_d3d_lost = 0;
+static double g_d3d_retry_at = 0.0;
+static int g_d3d_retry_ms = 250;
+static int g_d3d_rebuilds = 0;
+
+// The HRESULTs that mean "this device is gone". Anything else (a bad argument, an
+// occluded present) leaves the swapchain usable, so it must not trigger a rebuild.
+static int d3d_hr_is_device_lost(HRESULT hr) {
+  return hr == DXGI_ERROR_DEVICE_REMOVED ||
+         hr == DXGI_ERROR_DEVICE_RESET ||
+         hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+
 static double d3d_now_ms(void) {
   // std::chrono would be finer, but this file is deliberately C++-light: the only
   // C++ it needs is Skia's own types.
@@ -222,6 +250,53 @@ static D3DWin* d3d_slot(int win_id) {
   return g_d3d[win_id].used ? &g_d3d[win_id] : nullptr;
 }
 
+// Release every GPU object. Used by the lost path (the objects are already
+// invalid) and by a failed rebuild (a partial set must not outlive the attempt).
+//
+// abandonContext, NOT reset: GrDirectContext's destructor flushes whatever is still
+// pending, which is precisely the operation that must not happen on a removed
+// device. abandonContext() is Skia's contract for "the backend context is gone" --
+// it drops every resource without submitting anything.
+static void d3d_drop_gpu_state(void) {
+  for (int i = 0; i < SK_D3D_MAX_WINDOWS; ++i) {
+    D3DWin* w = &g_d3d[i];
+    for (int b = 0; b < SK_D3D_NUM_FRAMES; ++b) {
+      w->surfaces[b].reset();
+      w->buffers[b].reset();
+    }
+    if (w->fence_event != NULL) CloseHandle(w->fence_event);
+    w->fence_event = NULL;
+    w->fence.reset();
+    w->swapchain.reset();
+    // used/hwnd/width/height are deliberately kept: the WINDOW still exists, so a
+    // rebuild re-creates its swapchain at the same size instead of treating it as
+    // closed (sk_gpu_destroy is the only path that clears `used`).
+  }
+  if (g_context != nullptr) {
+    g_context->abandonContext();
+    g_context.reset();
+  }
+  g_queue.reset();
+  g_device.reset();
+  g_adapter.reset();
+}
+
+// Enter the lost state. Must run BEFORE anything else touches Skia after a failing
+// call: the Present/ResizeBuffers failure is only the symptom, and the next flush()
+// would go on to record into the removed device.
+static void d3d_mark_lost(const char* what, HRESULT hr) {
+  if (g_d3d_lost) return;
+  g_d3d_lost = 1;
+  g_d3d_retry_ms = 250;
+  g_d3d_retry_at = d3d_now_ms() + (double)g_d3d_retry_ms;
+  fprintf(stderr,
+          "d3d_glue: GPU device lost (%s, 0x%08lx): dropping every GPU object; "
+          "frames are skipped and the device is rebuilt in %d ms\n",
+          what, (unsigned long)hr, g_d3d_retry_ms);
+  fflush(stderr);
+  d3d_drop_gpu_state();
+}
+
 // Progress trace for the backend's init sequence. Without it a hang inside
 // d3d_init_shared prints NOTHING at all (the window exists and the app never reaches
 // its event loop), which is indistinguishable from a hang in the window layer.
@@ -310,8 +385,15 @@ static int d3d_setup_surfaces(D3DWin* w) {
     w->surfaces[i].reset();
     w->buffers[i].reset();
 
-    D3D_OK_OR_WARN(w->swapchain->GetBuffer((UINT)i, IID_PPV_ARGS(&w->buffers[i])));
-    if (w->buffers[i].get() == nullptr) return 0;
+    HRESULT ghr = w->swapchain->GetBuffer((UINT)i, IID_PPV_ARGS(&w->buffers[i]));
+    if (FAILED(ghr)) {
+      fprintf(stderr, "d3d_glue: GetBuffer(%d) failed: 0x%08lx\n", i, (unsigned long)ghr);
+      fflush(stderr);
+      // Return immediately after marking: dropping the state reset w->swapchain,
+      // so the next iteration must not dereference it.
+      if (d3d_hr_is_device_lost(ghr)) d3d_mark_lost("GetBuffer", ghr);
+      return 0;
+    }
 
     // GrD3DTextureResourceInfo(resource, alloc, state, format, sampleCount,
     // levelCount, sampleQualityLevel, protected). `alloc` is null because the
@@ -340,6 +422,96 @@ static int d3d_setup_surfaces(D3DWin* w) {
     }
   }
   return 1;
+}
+
+// Create (or re-create) one window's swapchain, back buffers, SkSurfaces and frame
+// fence. Called by sk_gpu_init for the first bind and by d3d_rebuild_all after a
+// device-lost, which is why the size is a parameter: a rebuild must land at the
+// size the AS3 side last asked for, not re-read a window that may be mid-resize.
+static int d3d_create_swapchain(D3DWin* w, HWND hwnd, int cw, int ch) {
+  if (cw <= 0 || ch <= 0) { cw = 1; ch = 1; }
+
+  gr_cp<IDXGIFactory4> factory;
+  D3D_OK_OR_WARN(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
+  if (factory.get() == nullptr) return 0;
+
+  DXGI_SWAP_CHAIN_DESC1 sd = {};
+  sd.BufferCount = SK_D3D_NUM_FRAMES;
+  sd.Width = (UINT)cw;
+  sd.Height = (UINT)ch;
+  sd.Format = SK_D3D_SWAPCHAIN_FORMAT;
+  sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+  sd.Scaling = DXGI_SCALING_NONE;
+  sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  sd.SampleDesc.Count = 1;
+
+  gr_cp<IDXGISwapChain1> swapchain;
+  D3D_OK_OR_WARN(factory->CreateSwapChainForHwnd(g_queue.get(), hwnd, &sd, nullptr,
+                                                 nullptr, &swapchain));
+  if (swapchain.get() == nullptr) {
+    fprintf(stderr, "d3d_glue: CreateSwapChainForHwnd failed\n");
+    return 0;
+  }
+  D3D_OK_OR_WARN(factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER));
+  D3D_OK_OR_WARN(swapchain->QueryInterface(IID_PPV_ARGS(&w->swapchain)));
+  if (w->swapchain.get() == nullptr) return 0;
+
+  w->hwnd = hwnd;
+  w->width = cw;
+  w->height = ch;
+  w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
+
+  if (!d3d_setup_surfaces(w)) { w->swapchain.reset(); return 0; }
+
+  // Fence values start high so they stand out in a PIX capture (Skia's reference
+  // does the same); only their ordering matters.
+  for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) w->fence_values[i] = 10000;
+  D3D_OK_OR_WARN(g_device->CreateFence(w->fence_values[w->buffer_index],
+                                       D3D12_FENCE_FLAG_NONE,
+                                       IID_PPV_ARGS(&w->fence)));
+  if (w->fence.get() == nullptr) return 0;
+  w->fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+  if (w->fence_event == NULL) return 0;
+  return 1;
+}
+
+// Rebuild everything the device carried. Returns 1 only when the whole set is back;
+// a partial success is dropped again so the next attempt starts clean (a window
+// holding a swapchain against a device about to be discarded would be the same bug
+// one level down).
+static int d3d_rebuild_all(void) {
+  if (!d3d_init_shared()) { d3d_drop_gpu_state(); return 0; }
+  for (int i = 0; i < SK_D3D_MAX_WINDOWS; ++i) {
+    if (!g_d3d[i].used) continue;
+    if (!d3d_create_swapchain(&g_d3d[i], g_d3d[i].hwnd, g_d3d[i].width, g_d3d[i].height)) {
+      d3d_drop_gpu_state();
+      return 0;
+    }
+  }
+  return 1;
+}
+
+// The throttled rebuild attempt. A device that vanished under VRAM pressure can be
+// taken away again right after being recreated, so retries back off to 4 s instead
+// of calling D3D12CreateDevice on every skipped frame.
+static int d3d_try_recover(void) {
+  const double now = d3d_now_ms();
+  if (now < g_d3d_retry_at) return 0;
+  if (d3d_rebuild_all()) {
+    g_d3d_lost = 0;
+    g_d3d_rebuilds++;
+    g_d3d_retry_ms = 250;
+    fprintf(stderr, "d3d_glue: GPU device rebuilt (attempt %d); rendering resumed\n",
+            g_d3d_rebuilds);
+    fflush(stderr);
+    return 1;
+  }
+  g_d3d_retry_ms = g_d3d_retry_ms * 2 > 4000 ? 4000 : g_d3d_retry_ms * 2;
+  g_d3d_retry_at = now + (double)g_d3d_retry_ms;
+  fprintf(stderr, "d3d_glue: GPU device rebuild failed; next attempt in %d ms\n",
+          g_d3d_retry_ms);
+  fflush(stderr);
+  return 0;
 }
 
 // --- shipping the backend to the Stage3D glue ------------------------------
@@ -373,6 +545,10 @@ extern "C" {
 int sk_gpu_init(int win_id, void* native_handle) {
   HWND hwnd = (HWND)native_handle;
   if (hwnd == NULL || win_id < 0 || win_id >= SK_D3D_MAX_WINDOWS) return 0;
+  // A window created while the device is lost must not be the one that gets a
+  // swapchain against a dead device: try the rebuild first (throttled; on failure
+  // the caller refuses the window rather than binding it to nothing).
+  if (g_d3d_lost && !d3d_try_recover()) return 0;
   // One init per window: the glue frees the slot before an id can be reused, so a
   // second init here would mean the two sides disagree about which HWND the id
   // names — refuse rather than silently rebind (same rule as sk_mtl_init).
@@ -384,78 +560,15 @@ int sk_gpu_init(int win_id, void* native_handle) {
   // to be a sensible starting point.
   RECT rc;
   GetClientRect(hwnd, &rc);
-  int cw = (int)(rc.right - rc.left);
-  int ch = (int)(rc.bottom - rc.top);
-  if (cw <= 0 || ch <= 0) { cw = 1; ch = 1; }
-
-  gr_cp<IDXGIFactory4> factory;
-  D3D_OK_OR_WARN(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
-  if (factory.get() == nullptr) return 0;
-
-  DXGI_SWAP_CHAIN_DESC1 sd = {};
-  sd.BufferCount = SK_D3D_NUM_FRAMES;
-  sd.Width = (UINT)cw;
-  sd.Height = (UINT)ch;
-  sd.Format = SK_D3D_SWAPCHAIN_FORMAT;
-  sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-  // FLIP_DISCARD is the only modern presentation model (and the only one that gets
-  // independent flip on Windows 10+); the swapchain is created on our own command
-  // queue so that a Present can be ordered against the Signal below.
-  // No scaling: DXGI must present the back buffer 1:1, never stretch it to the
-  // window. This is both the value the flip model requires (DXGI_SCALING_STRETCH
-  // is defined for bitblt swapchains; NONE is the flip-model value) and the exact
-  // counterpart of the CAMetalLayer's kCAGravityTopLeft in metal_glue.mm: the
-  // presented frame lands un-scaled and top-left anchored.
-  //
-  // Leaving `Scaling` at its zero-initialised default means DXGI_SCALING_STRETCH,
-  // and then every frame whose back buffer size disagrees with the client rect --
-  // which is EVERY frame of a live drag, because the window keeps growing after
-  // the frame was drawn -- is rescaled to the client rect: the whole picture
-  // visibly doubles/ghosts and keeps doing so through the queued frames, which is
-  // the Windows half of the resize jitter (the macOS half was the same defect on
-  // the Metal layer, measured at 5 of 30 frames of a fast drag).
-  sd.Scaling = DXGI_SCALING_NONE;
-  sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-  sd.SampleDesc.Count = 1;
-
-  gr_cp<IDXGISwapChain1> swapchain;
-  D3D_OK_OR_WARN(factory->CreateSwapChainForHwnd(g_queue.get(), hwnd, &sd, nullptr,
-                                                 nullptr, &swapchain));
-  if (swapchain.get() == nullptr) {
-    fprintf(stderr, "d3d_glue: CreateSwapChainForHwnd failed\n");
-    return 0;
-  }
-  // Alt+Enter must not tear the swapchain out from under Skia: this backend has no
-  // fullscreen transition (the AS3 side drives displayState through SDL instead).
-  D3D_OK_OR_WARN(factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER));
-  D3D_OK_OR_WARN(swapchain->QueryInterface(IID_PPV_ARGS(&g_d3d[win_id].swapchain)));
-  if (g_d3d[win_id].swapchain.get() == nullptr) return 0;
-  gpu_trace("swapchain");
-
-  g_d3d[win_id].hwnd = hwnd;
-  g_d3d[win_id].width = cw;
-  g_d3d[win_id].height = ch;
-  g_d3d[win_id].buffer_index = g_d3d[win_id].swapchain->GetCurrentBackBufferIndex();
-
-  if (!d3d_setup_surfaces(&g_d3d[win_id])) {
-    g_d3d[win_id].swapchain.reset();
+  if (!d3d_create_swapchain(&g_d3d[win_id], hwnd,
+                            (int)(rc.right - rc.left), (int)(rc.bottom - rc.top))) {
     return 0;
   }
   gpu_trace("surfaces");
 
-  // Fence values start high so they stand out in a PIX capture (Skia's reference
-  // does the same); only their ordering matters.
-  for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) g_d3d[win_id].fence_values[i] = 10000;
-  D3D_OK_OR_WARN(g_device->CreateFence(g_d3d[win_id].fence_values[g_d3d[win_id].buffer_index],
-                                       D3D12_FENCE_FLAG_NONE,
-                                       IID_PPV_ARGS(&g_d3d[win_id].fence)));
-  if (g_d3d[win_id].fence.get() == nullptr) return 0;
-  g_d3d[win_id].fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-  if (g_d3d[win_id].fence_event == NULL) return 0;
-
   g_d3d[win_id].used = 1;
   fprintf(stderr, "d3d_glue: window %d bound to %dx%d R8G8B8A8 swapchain\n",
-          win_id, cw, ch);
+          win_id, g_d3d[win_id].width, g_d3d[win_id].height);
   return 1;
 }
 
@@ -503,6 +616,15 @@ void sk_gpu_destroy(int win_id) {
 // Returns NULL when the frame cannot start, so the render loop skips the frame
 // instead of drawing into a resource DXGI has taken away.
 void* sk_gpu_begin_frame(int win_id, int width, int height) {
+  // THE device-lost gate. GetDeviceRemovedReason() is a local query (nothing is
+  // submitted), so asking it every frame costs one call and catches the removal
+  // BEFORE Present/ResizeBuffers have to fail -- the frames between those two
+  // events are the ones that used to crash inside Skia.
+  if (!g_d3d_lost && g_device.get() != nullptr) {
+    HRESULT removed = g_device->GetDeviceRemovedReason();
+    if (FAILED(removed)) d3d_mark_lost("GetDeviceRemovedReason", removed);
+  }
+  if (g_d3d_lost && !d3d_try_recover()) return nullptr;
   D3DWin* w = d3d_slot(win_id);
   if (w == nullptr || g_context == nullptr) return nullptr;
   if (width <= 0 || height <= 0) return nullptr;
@@ -546,8 +668,19 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
       w->surfaces[i].reset();
       w->buffers[i].reset();
     }
-    D3D_OK_OR_WARN(w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
-                                               SK_D3D_SWAPCHAIN_FORMAT, 0));
+    HRESULT rhr = w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
+                                              SK_D3D_SWAPCHAIN_FORMAT, 0);
+    if (FAILED(rhr)) {
+      fprintf(stderr, "d3d_glue: ResizeBuffers to %dx%d failed: 0x%08lx\n",
+              width, height, (unsigned long)rhr);
+      fflush(stderr);
+      // Lost: drop everything and let the recovery path rebuild at the new size.
+      // Any other failure leaves the old swapchain usable -- abandon this frame and
+      // retry on the next one (the size stays unchanged, so the next begin_frame
+      // enters this branch again), exactly like the drain timeout above.
+      if (d3d_hr_is_device_lost(rhr)) d3d_mark_lost("ResizeBuffers", rhr);
+      return nullptr;
+    }
     w->width = width;
     w->height = height;
     if (!d3d_setup_surfaces(w)) return nullptr;
@@ -751,7 +884,17 @@ void sk_gpu_flush(int win_id) {
 
   d3d_dump_backbuffer(w);
 
-  D3D_OK_OR_WARN(w->swapchain->Present(1, 0));
+  // NOT D3D_OK_OR_WARN: a failed Present is the one place the old
+  // print-and-continue behaviour killed the process (frames kept being recorded
+  // into a removed device). Report, then enter the lost path -- which drops every
+  // GPU object before the next frame can touch Skia -- and do not signal a fence
+  // the dead queue will never reach.
+  HRESULT phr = w->swapchain->Present(1, 0);
+  if (FAILED(phr)) {
+    fprintf(stderr, "d3d_glue: Present failed: 0x%08lx\n", (unsigned long)phr);
+    fflush(stderr);
+    if (d3d_hr_is_device_lost(phr)) { d3d_mark_lost("Present", phr); return; }
+  }
   // Mark this frame's completion on the queue so the next begin_frame for this
   // buffer index can wait for it (see above). Signaling AFTER Present is what
   // makes the wait meaningful: the fence reaching this value means DXGI has

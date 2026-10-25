@@ -1271,14 +1271,25 @@ static char* as_obj_to_str(void* obj) {
     // A Proxy receiver is stringified through its callProperty("toString")
     // override, not the class name (measured on adl 51.4.1: 'String(p)' calls
     // callProperty with "toString"; a proxy without it throws #2090).
-    if (((as_vtable_header*)vt)->is_proxy) return as_proxy_to_str(obj);
+    if (((as_vtable_header*)vt)->is_proxy) {
+        // A Proxy override that returns null (or a proxy without one) must not
+        // hand a null pointer to printf("%s"): ES3 ToString(null) == "null".
+        char* r = as_proxy_to_str(obj);
+        return r != NULL ? r : (char*)"null";
+    }
     // AS3's implicit string conversion calls the virtual toString(): a class
     // override wins, and the no-override slot is Object's default, which renders
     // the AIR '[object X]' text (see as_obj_default_str). Without this, away3d's
     // ShaderRegisterElement -- whose toString() returns the register name --
     // stringified as its C class name and the generated AGAL failed to assemble.
     char* (*toStr)(void*) = ((as_vtable_header*)vt)->toString;
-    if (toStr != NULL) return toStr(obj);
+    if (toStr != NULL) {
+        // A user toString() may return the AS3 null String, and AIR renders that
+        // as "null" (ES3 ToString). Measured death without this: the app printed
+        // the value through trace() and ucrt fastfailed with 0xC0000409.
+        char* r = toStr(obj);
+        return r != NULL ? r : (char*)"null";
+    }
     return as_obj_default_str(obj);
 }
 
@@ -2057,7 +2068,12 @@ static char* as_class_display_name(const char* fqn) {
 }
 static char* as_v_str_val(as_value v) {
     switch (v.tag) {
-        case 3: return (char*)v.ptr;
+        // A boxed String can carry the AS3 null String (C NULL) -- as_v_str
+        // normalises at the boxing site, but a hand-built as_value can still be
+        // tag 3 with a null ptr. The DISPLAY form is what reaches printf("%s"),
+        // and ucrt kills the process with 0xC0000409 on a null %s, so normalise
+        // here too (ES3 ToString(null) is the text "null").
+        case 3: return v.ptr != NULL ? (char*)v.ptr : (char*)"null";
         case 1: return as_str_from_double(v.num);
         case 2: return as_str_from_bool(v.num != 0.0);
         case 0: return "null";
@@ -6348,6 +6364,69 @@ static ASC_TLS int as_frame_guard = 0;
 static const char* as_error_message(void* e) {
     return e ? ((as_error_view*)e)->message : "unknown";
 }
+
+// Uncaught-error reporting throttle.
+//
+// An uncaught error inside a frame is recovered at the frame boundary, so a
+// repeating bug (a null receiver in a frame callback or a mouse handler) throws
+// once per call and, without this, writes one stderr line per throw: measured on
+// a real app, 623 identical "#1009" lines in 40 s, which pushed every other
+// diagnostic out of the log window. The first occurrence of a message is always
+// printed; repeats of the SAME message are counted and folded into the next
+// line, at most one line per second. The count is preserved, so the storm is
+// still visible as a number -- only the repetition is gone.
+//
+// Per-thread (ASC_TLS): errors can be thrown from the frame thread and from IO
+// callbacks at the same time, and two threads sharing one "last message" buffer
+// would truncate each other's text mid-write.
+static ASC_TLS double as_uncaught_last_ms = 0.0;
+static ASC_TLS unsigned long as_uncaught_suppressed = 0;
+static ASC_TLS char as_uncaught_last_msg[192];
+static ASC_TLS int as_uncaught_flush_armed = 0;
+
+// Print whatever the throttle is still holding. Registered with atexit on the
+// first report: a storm that fits inside one second would otherwise end with its
+// count dropped, so the log would claim one error where there were fifty.
+// (TLS: this flushes the exiting thread's counters. Other threads' pending counts
+// are lost at exit -- they are diagnostic only, and a per-thread exit hook would
+// cost more than the information is worth.)
+static void as_uncaught_flush(void) {
+    if (as_uncaught_suppressed != 0) {
+        fprintf(stderr, "Uncaught exception: %s (%lu more of the same)\\n",
+                as_uncaught_last_msg[0] != 0 ? as_uncaught_last_msg : "unknown",
+                as_uncaught_suppressed);
+        fflush(stderr);
+        as_uncaught_suppressed = 0;
+    }
+}
+static void as_report_uncaught(const char* m) {
+    const char* s = as_str_or_null(m);
+    const double now = as_now_ms();
+    const int same = as_uncaught_last_msg[0] != 0 && strcmp(as_uncaught_last_msg, s) == 0;
+    if (!as_uncaught_flush_armed) {
+        as_uncaught_flush_armed = 1;
+        atexit(as_uncaught_flush);
+    }
+    // Fold repeats of the SAME message, but never more than 20 in a row: a storm
+    // that is denser than one per second still shows its count, and the cap is what
+    // makes the accounting independent of how long the program runs.
+    if (same) {
+        // Count FIRST, then decide: the throw that trips the cap is itself one of the
+        // repeats, so checking before the increment under-reported by one per line.
+        as_uncaught_suppressed++;
+        if (now - as_uncaught_last_ms < 1000.0 && as_uncaught_suppressed <= 20) return;
+    }
+    if (as_uncaught_suppressed != 0) {
+        fprintf(stderr, "Uncaught exception: %s (%lu more of the same)\\n",
+                s, as_uncaught_suppressed);
+        as_uncaught_suppressed = 0;
+    } else {
+        fprintf(stderr, "Uncaught exception: %s\\n", s);
+    }
+    fflush(stderr);
+    snprintf(as_uncaught_last_msg, sizeof as_uncaught_last_msg, "%s", s);
+    as_uncaught_last_ms = now;
+}
 static char* as_v_str_val(as_value v);
 // Throw an arbitrary boxed value (the throw-statement path). Kept separate from
 // as_throw(void*) so the ~36 internal runtime-error throws stay byte-identical;
@@ -6359,17 +6438,15 @@ static _Noreturn void as_throw_val(as_value v) {
         // Internal errors keep the historical wording (an object's reflective
         // message); a non-object thrown value has no message slot, so stringify
         // it. (The adl-exact uncaught format is a separate, still-open item.)
-        const char* m = (v.tag == 4 && v.ptr != NULL) ? as_error_message(v.ptr) : as_v_str_val(v);
+        const char* m = as_str_or_null((v.tag == 4 && v.ptr != NULL) ? as_error_message(v.ptr) : as_v_str_val(v));
         // An uncaught error inside a frame is recovered at the frame boundary
         // (see as_frame_jmp): report it and let the loop carry on.
         if (as_frame_guard != 0) {
-            fprintf(stderr, "Uncaught exception: %s\\n", m);
-            fflush(stderr);
+            as_report_uncaught(m);
             as_frame_guard = 0;
             longjmp(as_frame_jmp, 1);
         }
-        fprintf(stderr, "Uncaught exception: %s\\n", m);
-        fflush(stderr);
+        as_report_uncaught(m);
         exit(1);
     }
     longjmp(*as_jmp_stack[as_jmp_depth - 1], 1);
@@ -6389,13 +6466,11 @@ static _Noreturn void as_throw(void* e) {
     if (as_jmp_depth == 0) {
         // Recover at the frame boundary when a frame is on the stack.
         if (as_frame_guard != 0) {
-            fprintf(stderr, "Uncaught exception: %s\\n", as_error_message(e));
-            fflush(stderr);
+            as_report_uncaught(as_error_message(e));
             as_frame_guard = 0;
             longjmp(as_frame_jmp, 1);
         }
-        fprintf(stderr, "Uncaught exception: %s\\n", as_error_message(e));
-        fflush(stderr);
+        as_report_uncaught(as_error_message(e));
         exit(1);
     }
     longjmp(*as_jmp_stack[as_jmp_depth - 1], 1);

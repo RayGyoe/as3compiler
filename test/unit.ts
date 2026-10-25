@@ -24,6 +24,7 @@ import './unit/gettextformat.ts';
 import './unit/roundrect.ts';
 import './unit/settextformat-runs.ts';
 import './unit/platform.ts';
+import './unit/crash-hardening.ts';
 import './unit/win7.ts';
 import './unit/stage3d.ts';
 import './unit/emit.ts';

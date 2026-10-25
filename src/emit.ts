@@ -2092,6 +2092,30 @@ export class Emitter {
     this.line('return p;');
     this.indent--;
     this.line('}');
+    // Optional call-site reporting for the SAME guard (build flag ASC_NULL_TRACE).
+    // Without it a runaway null access reports hundreds of identical #1009 lines
+    // and no way to tell WHICH member access on WHICH class (measured: 623 lines
+    // in 40 s from one app, unattributable). With the flag on, every as_req_obj
+    // call carries its generated-C file/line and the message names it -- which is
+    // one class and one member access in the generated source. Off by default: the
+    // site is two extra arguments on the hottest guard in the program (one per
+    // member access), so it is a diagnostic build, not a shipping one.
+    this.line('#ifdef ASC_NULL_TRACE');
+    this.line('static void* as_req_obj_at(void* p, const char* file, int line) {');
+    this.indent++;
+    this.line('if (p == NULL) {');
+    this.indent++;
+    this.line('char msg[320];');
+    this.line('snprintf(msg, sizeof msg, "Error #1009: Cannot access a property or method of a null object reference. [%s:%d]", file, line);');
+    this.line('as_throw(TypeError_new(msg, 1009));');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('return p;');
+    this.indent--;
+    this.line('}');
+    this.line('#define as_req_obj(p) as_req_obj_at((p), __FILE__, __LINE__)');
+    this.line('#endif');
     // Boxed (`*`) receiver variant: null (tag 0) and undefined (tag 5) throw
     // before the tag dispatch reaches as_any_get/as_any_set.
     this.line('static as_value as_req_box(as_value v) {');
@@ -27109,7 +27133,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('as_jmp_pop();');
     this.line('as_value m = as_exception_boxed ? as_exception_v : as_v_obj(as_exception);');
     this.line('as_exception = NULL; as_exception_boxed = 0;');
-    this.line('fprintf(stderr, "Uncaught exception in StatusEvent handler: %s\\n", as_v_str_val(m));');
+    this.line('fprintf(stderr, "Uncaught exception in StatusEvent handler: %s\\n", as_str_or_null(as_v_str_val(m)));');
     this.line('fflush(stderr);');
     this.line('return;');
     this.indent--;
@@ -31948,27 +31972,33 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     if (args.length === 0) return 'printf("\\n")';
     const formats: string[] = [];
     const vals: string[] = [];
+    // Every %s argument goes through as_str_or_null: ucrt treats a null pointer for
+    // %s as an invalid parameter and __fastfail()s the process (0xC0000409), while
+    // ES3 ToString(null) is the text "null". A user toString() returning null and a
+    // boxed null String are both reachable, so no branch may rely on its helper
+    // never returning NULL.
+    const s9 = (code: string) => `as_str_or_null(${code})`;
     for (const a of args) {
       const e = this.emitExpr(a);
       switch (e.type.kind) {
         case 'int': formats.push('%d'); vals.push(e.code); break;
         case 'uint': formats.push('%u'); vals.push(e.code); break;
-        case 'number': formats.push('%s'); vals.push(`as_str_from_double(${e.code})`); break;
+        case 'number': formats.push('%s'); vals.push(s9(`as_str_from_double(${e.code})`)); break;
         // 64-bit integers print their exact decimal text (as_str_from_i64/u64),
         // never a lossy double: trace(big) must show every digit.
-        case 'int64': formats.push('%s'); vals.push(`as_str_from_i64(${e.code})`); break;
-        case 'uint64': formats.push('%s'); vals.push(`as_str_from_u64(${e.code})`); break;
-        case 'bool': formats.push('%s'); vals.push(`as_str_from_bool(${e.code})`); break;
+        case 'int64': formats.push('%s'); vals.push(s9(`as_str_from_i64(${e.code})`)); break;
+        case 'uint64': formats.push('%s'); vals.push(s9(`as_str_from_u64(${e.code})`)); break;
+        case 'bool': formats.push('%s'); vals.push(s9(`as_str_from_bool(${e.code})`)); break;
         // A String-typed slot can hold AS3 null (C NULL): trace(null) must print
         // "null" (String(null)), and printf("%s") on a null pointer is a fatal
         // invalid-parameter fastfail on Windows ucrt.
-        case 'string': formats.push('%s'); vals.push(`as_str_or_null(${e.code})`); break;
-        case 'array': formats.push('%s'); vals.push(`as_array_join(${e.code}, ",")`); break;
+        case 'string': formats.push('%s'); vals.push(s9(e.code)); break;
+        case 'array': formats.push('%s'); vals.push(s9(`as_array_join(${e.code}, ",")`)); break;
         case 'vector': formats.push('%s'); vals.push(`${e.code} == NULL ? (char*)"null" : as_vector_${this.vectorCName(e.type.elem)}_join(${e.code}, ",")`); break;
-        case 'any': formats.push('%s'); vals.push(`as_v_str_val(${e.code})`); break;
+        case 'any': formats.push('%s'); vals.push(s9(`as_v_str_val(${e.code})`)); break;
         case 'record': formats.push('%s'); vals.push('"[object Object]"'); break;
-        case 'object': formats.push('%s'); vals.push(`as_obj_to_str((void*)(${e.code}))`); break;
-        case 'interface': formats.push('%s'); vals.push(`as_obj_to_str(${e.code}.obj)`); break;
+        case 'object': formats.push('%s'); vals.push(s9(`as_obj_to_str((void*)(${e.code}))`)); break;
+        case 'interface': formats.push('%s'); vals.push(s9(`as_obj_to_str(${e.code}.obj)`)); break;
         case 'function': formats.push('%s'); vals.push(`${e.code} == NULL ? (char*)"null" : (char*)"function Function() {}"`); break;
         case 'null': formats.push('%s'); vals.push('"null"'); break;
         case 'void': formats.push('%s'); vals.push('""'); break;
