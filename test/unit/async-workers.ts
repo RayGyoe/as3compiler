@@ -85,6 +85,23 @@ export function checkAsyncWorkerPool(): string[] {
   //    with four workers the stderr table interleaves into noise.
   has('curl_easy_setopt(h, CURLOPT_NOPROGRESS, 1L)', 'CURLOPT_NOPROGRESS is set');
 
+  // 8. The pool is a FIXED four workers and claiming is first-come, so a deep
+  //    queue (the meeting client prefetches every slide) delays a job without
+  //    ever failing it. That is invisible from AS3 -- the app reports a timeout
+  //    off its own 25 s setTimeout and never looks at the transfer -- so the
+  //    diagnostic has to live here: ASC_NET_TRACE stamps each job when a worker
+  //    claims it (with the queue depth behind it), when the transfer finishes,
+  //    and when the AS3 thunk finally runs.
+  has('static int as_net_trace(void)', 'the ASC_NET_TRACE gate exists');
+  has('getenv("ASC_NET_TRACE")', 'ASC_NET_TRACE is read from the environment');
+  has('static int as_job_queued_locked(void)', 'the queue depth is measurable at claim time');
+  has('[as3-aot] net start kind=%d queued=%d', 'a claim logs the kind and the queue depth');
+  has('[as3-aot] net done  kind=%d ms=%.1f err=%d len=%lu', 'a finished transfer logs its own duration');
+  has('[as3-aot] net fire  kind=%d lag=%.1f', 'the frame-boundary dispatch logs how long AS3 waited');
+  has('double t_done;', 'the job records when it finished, so the dispatch lag is real');
+  has('#define AS_ASYNC_WORKERS 4', 'the pool size is still the documented four');
+  has('#ifndef AS_ASYNC_WORKERS', 'the pool size is a build knob, not a hard-coded four');
+
   return bad;
 }
 

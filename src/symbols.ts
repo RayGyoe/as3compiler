@@ -5760,6 +5760,15 @@ export class SymbolTable {
         ['_live_image', bdf({ kind: 'null' })],
         ['_px_ver', bdf({ kind: 'uint' })],
         ['_live_ver', bdf({ kind: 'uint' })],
+        // Per-instance identity for the render fingerprint (阶段二百八十一). The
+        // fingerprint hashed only `image` + `_px_ver`, and those are IDENTICAL
+        // for two bitmaps built the same way: `new BitmapData(w, h, true, 0)`
+        // plus one draw() leaves image == NULL and _px_ver == 1 both times. So
+        // handing a Bitmap the NEXT image's bitmapData never moved the hash, and
+        // a baked ancestor replayed the previous picture forever (measured on the
+        // meeting client: every slide after the first one froze). A monotonic id,
+        // unlike a pointer, cannot be re-used by a later allocation.
+        ['_uid', bdf({ kind: 'uint' })],
       ]),
       methods: new Map([
         ['getPixel', bdm({ kind: 'uint' }, [

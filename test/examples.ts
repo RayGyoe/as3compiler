@@ -317,6 +317,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 它要靠 `stage.render` 跑每帧指纹 pass 才会真的进入烘焙态，而且断言是像素 —— 纯 C 构建没有
   // 光栅后端，故同样链 Skia。
   'autobake-origin.as': ['--manifest', join(dir, 'autobake-origin.build.json')],
+  // bake-bitmap-swap.as（阶段二百八十一）断言的是**换 BitmapData 之后的像素**：祖先烘焙后把
+  // bitmap.bitmapData 换成同尺寸、同造法的另一张图，探针必须变色（真机症状＝幻灯片停在第
+  // 一页，只有 resize 才动）。断言是像素、且要靠 stage.render 跑指纹 pass，故同
+  // autobake-origin.as 一样链 Skia。
+  'bake-bitmap-swap.as': ['--manifest', join(dir, 'bake-bitmap-swap.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
   // roundrect.as（阶段二百六十七 · G19）断言的也是**像素**：drawRoundRect 的两个半径必须

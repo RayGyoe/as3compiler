@@ -18663,11 +18663,17 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return o->_graphics;');
     this.indent--;
     this.line('}');
+    // Monotonic identity handed to every BitmapData in its constructor. The
+    // render fingerprint needs to tell two bitmaps apart that look identical to
+    // every other hashed field (see `_uid` in symbols.ts), and an address cannot
+    // do that job: the collector hands the same address to the next allocation.
+    this.line('static unsigned as_bd_uid_next = 0;');
     this.line('void BitmapData_ctor(BitmapData* o, int width, int height, bool transparent, unsigned fillColor) {');
     this.indent++;
     this.line('o->width = width; o->height = height; o->transparent = transparent;');
     this.line('o->image = NULL; o->pixels = NULL;');
     this.line('o->_live_image = NULL; o->_px_ver = 0; o->_live_ver = 0;');
+    this.line('o->_uid = ++as_bd_uid_next;');
     this.line('if (width > 0 && height > 0) {');
     this.indent++;
     // GC heap, not malloc: `pixels` is a GC-traced field (the props table tags it
@@ -23888,7 +23894,15 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // pixels change: `image` stays NULL/constant on that path, so the version
     // counter is the only input that moves. Without it a cacheAsBitmap video view
     // froze on its first frame.
-    this.line('if (bd != NULL) h = as_fp_u32(h, bd->_px_ver);');
+    //
+    // The version counter alone is NOT enough, because it is per-BitmapData:
+    // swapping WHICH bitmap is displayed (`bitmap.bitmapData = next` in a slide
+    // viewer, the ImageLoader path in the meeting client) replaces the object,
+    // and the replacement starts life exactly like the old one -- image == NULL,
+    // _px_ver == 1 after its single draw(). Hashing the instance id closes that
+    // hole: `_uid` is unique per BitmapData and never recycled, so a change of
+    // which bitmap is on screen always moves the hash.
+    this.line('if (bd != NULL) { h = as_fp_u32(h, bd->_px_ver); h = as_fp_u32(h, bd->_uid); }');
     this.indent--;
     this.line('} else if (as_is(o, &TextField_vt)) {');
     this.indent++;
@@ -23987,8 +24001,17 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // exactly reaches the threshold and the object has deterministic bounds, mark
     // it auto-baked; objects without bounds (empty containers) reset so they only
     // retry the bounds probe every ASC_AUTO_BAKE_FRAMES frames, not every frame.
+    //
+    // A moved fingerprint drops the bake for an EXPLICIT cacheAsBitmap too
+    // (`_cache_flag`), not just for an auto-bake. AIR's cache is not a snapshot:
+    // the player regenerates the bitmap when the object or its children change,
+    // and it is the only invalidation the AS3 side cannot see. Ours used to be
+    // driven by the setter alone, so an explicitly cached subtree froze at
+    // whatever it looked like when `cacheAsBitmap = true` ran -- measured on the
+    // meeting client, whose buttons/labels/thumbnails/rows all opt in through
+    // `cacheAsBitmapAndMatrix()` and then change their text and bitmaps.
     this.line('if (h == o->_auto_fp) { o->_auto_still++; }');
-    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked) { o->_auto_baked = 0; o->_cache_valid = 0; } }');
+    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked || o->_cache_flag) { o->_auto_baked = 0; o->_cache_valid = 0; } }');
     this.line('if (getenv("ASC_NO_AUTO_BAKE") == NULL && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');

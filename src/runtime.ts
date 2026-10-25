@@ -10577,6 +10577,12 @@ typedef struct as_job {
     int sent_status;
     unsigned marks_sent;
     unsigned last_progress;
+    // Wall-clock (as_now_ms) at which this job reached AS_JOB_DONE. Read only by
+    // the ASC_NET_TRACE diagnostic, where "when did the worker finish" against
+    // "when did the AS3 thunk run" is the whole question: an event that fires
+    // long after its transfer finished means the frame boundary starved, while a
+    // late transfer means the worker pool did.
+    double t_done;
 } as_job;
 
 static as_job** as_jobs = NULL;
@@ -10584,6 +10590,32 @@ static int as_job_count = 0;
 static int as_job_cap = 0;
 // Guards against a thunk re-entering the frame boundary (see as_async_tick).
 static int as_async_in_tick = 0;
+
+// ASC_NET_TRACE=1: one stderr line per transfer at each stage -- claimed by a
+// worker (with the number of jobs still queued behind it), finished, and handed
+// to AS3. This exists because "请求超时" alone cannot be attributed: the meeting
+// client TKURLLoader reports a timeout off a 25 s setTimeout and never looks
+// at the transfer, so the same message covers a saturated pool, a slow server and
+// a starved frame boundary -- three different bugs. Resolved once; the hot path
+// only pays a branch on a cached flag.
+static int as_net_trace(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("ASC_NET_TRACE");
+        on = (e != NULL && e[0] != '0' && e[0] != '\0') ? 1 : 0;
+    }
+    return on;
+}
+
+// Requires the job lock held.
+static int as_job_queued_locked(void) {
+    int n = 0;
+    for (int i = 0; i < as_job_count; i++) {
+        as_job* q = as_jobs[i];
+        if (q != NULL && q->state == AS_JOB_QUEUED && !q->dead) n++;
+    }
+    return n;
+}
 
 static char* as_job_strdup(const char* s) {
     if (s == NULL) return NULL;
@@ -11647,7 +11679,15 @@ static void as_job_run(as_job* j) {
 // Four workers: enough that the asset fan-out of a loader queue overlaps, small
 // enough not to oversubscribe a laptop. Claiming is first-come; there is no
 // priority, matching AIR's internal queue.
+//
+// The count is a BUILD knob (-D AS_ASYNC_WORKERS=N via the manifest's defines),
+// not a runtime one: a queue that is deep because the app prefetches every slide
+// delays a job without ever failing it, and the app only sees its own timer fire
+// (ASC_NET_TRACE prints the queue depth behind each claim so that is measurable).
+// Raising it is the app's call -- these jobs are I/O-bound.
+#ifndef AS_ASYNC_WORKERS
 #define AS_ASYNC_WORKERS 4
+#endif
 
 #ifdef _WIN32
 // _beginthreadex, not CreateThread: the workers malloc, fopen and call libcurl,
@@ -11696,10 +11736,22 @@ static void as_job_worker_loop(void) {
             AS_JOB_WAIT(&as_job_wake, &as_job_lock);
             j = as_job_claim_locked();
         }
+        int queued = as_net_trace() ? as_job_queued_locked() : 0;
         AS_JOB_UNLOCK(&as_job_lock);
+        const double t_start = as_now_ms();
+        if (as_net_trace()) {
+            fprintf(stderr, "[as3-aot] net start kind=%d queued=%d %s\\n", j->kind, queued, (j->path != NULL) ? j->path : "-");
+            fflush(stderr);
+        }
         as_job_run(j);
+        const double t_took = as_now_ms() - t_start;
+        if (as_net_trace()) {
+            fprintf(stderr, "[as3-aot] net done  kind=%d ms=%.1f err=%d len=%lu %s\\n", j->kind, t_took, j->error, (unsigned long)j->len, (j->path != NULL) ? j->path : "-");
+            fflush(stderr);
+        }
         AS_JOB_LOCK(&as_job_lock);
         j->state = AS_JOB_DONE;
+        j->t_done = as_now_ms();
         AS_JOB_WAKE_ALL(&as_job_wake);
         AS_JOB_UNLOCK(&as_job_lock);
     }
@@ -11781,7 +11833,7 @@ static int as_job_publish(as_job* j) {
     // stays RUNNING until the JS pump delivers the response at a later frame,
     // otherwise the thunk would run on a job with no status and no body.
     as_job_run(j);
-    if (!j->pending_async) j->state = AS_JOB_DONE;
+    if (!j->pending_async) { j->state = AS_JOB_DONE; j->t_done = as_now_ms(); }
 #endif
     return 1;
 }
@@ -12590,6 +12642,10 @@ static int as_async_tick_with(int sock_wait_ms) {
 
         // Phase 2 (lock released): publish the staged results.
         for (int i = 0; i < n; i++) {
+            if (as_net_trace() && ready[i]->t_done > 0.0) {
+                fprintf(stderr, "[as3-aot] net fire  kind=%d lag=%.1f %s\\n", ready[i]->kind, as_now_ms() - ready[i]->t_done, (ready[i]->path != NULL) ? ready[i]->path : "-");
+                fflush(stderr);
+            }
             if (ready[i]->finish != NULL) ready[i]->finish((void*)ready[i]);
         }
 

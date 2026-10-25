@@ -1359,8 +1359,23 @@ function checkScrollRectBakeInvalidation(): string[] {
   check('as_render_cached bakes the CONTENT only (clip/translate stay outside the bake)',
     cache.includes('as_render_object_content(c2, o)') && !cache.includes('clip_rect(canvas, 0.0, 0.0, o->_scroll_rect'));
 
+  // 阶段二百八十一: the guard now also covers an EXPLICIT cacheAsBitmap, so a
+  // cached subtree expires on content change the way AIR's does. It used to be
+  // driven by the setter alone (set cacheAsBitmap once, freeze forever), which
+  // is the meeting client's cacheAsBitmapAndMatrix() path.
   check('a moved fingerprint drops the bake',
-    c.includes('if (o->_auto_baked) { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+    c.includes('if (o->_auto_baked || o->_cache_flag) { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+  check('...including an explicit cacheAsBitmap, not just an auto-bake',
+    c.includes('o->_cache_flag) { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+
+  // 阶段二百八十一: BitmapData identity. Without it a Bitmap whose bitmapData is
+  // swapped to another bitmap built the same way hashes identically (image ==
+  // NULL, _px_ver == 1 both times) and a baked ancestor replays the old picture.
+  check('BitmapData carries a per-instance id', c.includes('unsigned int _uid;'));
+  check('...assigned from a monotonic counter in the constructor',
+    c.includes('static unsigned as_bd_uid_next = 0;') && c.includes('o->_uid = ++as_bd_uid_next;'));
+  check('as_render_fp hashes the BitmapData identity, not just its version',
+    fp.includes('h = as_fp_u32(h, bd->_uid)'));
 
   console.log(`[scrollrectbake] ${ok} scrollRect bake-invalidation checks passed`);
   return bad;

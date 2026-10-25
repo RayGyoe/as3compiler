@@ -436,6 +436,12 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/cacheasbitmap.as` — `cacheAsBitmap` 渲染验证（开关两态逐像素一致）
 - `examples/autobake.as` — 增量重绘自动 `cacheAsBitmap`（静止触发烘焙、移动失效重烘焙）
 - `examples/autobake-origin.as` — 烘焙原点对齐设备像素栅格（抗锯齿圆在小数原点：修前与实时绘制差 1 物理像素、修后逐位相同；需 `examples/autobake-origin.build.json` 链 Skia）
+- `examples/bake-bitmap-swap.as` — 烘焙指纹必须认得「换了一张 `BitmapData`」（阶段二百八十一）：真机症状是
+  幻灯片预览被自动烘焙后在某个分辨率下**翻页不再更新**，只有把窗口改回烘焙前那个尺寸才刷新。根因是
+  `as_render_fp` 的 Bitmap 分支只哈希 `image` + `_px_ver`，而应用里每一页都是 `new BitmapData(w,h,true,0)`
+  加一次 `draw` ⇒ 两值逐页相同 ⇒ 祖宗烘焙永不过期；resize 只是让 `_cache_w/_cache_h` 不匹配、顺带重建一次。
+  修法是 `BitmapData._uid`（构造器单调自增）参与哈希，并让显式 `cacheAsBitmap` 与自动烘焙走同一条失效判据
+  （内容一变即过期，AIR 行为）。需 `examples/bake-bitmap-swap.build.json` 链 Skia
 - `examples/bakecrisp.as` — 烘焙分辨率与 `BitmapData.draw` 几何口径（对齐 `adl`）
 - `examples/bitmap-smoothing.as` — `Bitmap.smoothing` 采样模式（阶段二百三十）：默认 `false` 是最近邻、`true` 是双线性；
   同一张 16x1 黑白位图按 0.25 缩到 4x1，最近邻只会给出纯 0x00/0xFF、双线性必然混出中间灰。此前渲染分支恒用

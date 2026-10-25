@@ -1137,6 +1137,97 @@ need replaying (join a meeting -> screen-share picker -> delete files / scroll t
 idle for 30 minutes). **What this fix guarantees is a catchable error when memory runs out, not that it
 stops running out**: the 1000 MB peak is untouched.
 
+### 3.17 The bake cache does not know you swapped the BitmapData (stage 281)
+
+Reported on the real thing (TalkMED meeting client, 32-bit AOT): after the slide preview in
+the middle of the window got auto-baked at a given resolution, paging through slides stopped
+updating the picture, and only restoring the window to the size it had *before* the bake
+brought it back.
+
+The cause is the Bitmap branch of `as_render_fp`, which hashed two values that are identical
+by construction:
+
+```c
+if (bd != NULL) { h = as_fp_ptr(h, bd->image); h = as_fp_u32(h, bd->_px_ver); }
+```
+
+Every slide in the app comes from `cn.edoctor.utils.ImageLoader`: `new BitmapData(w, h, true, 0)`
+and one `draw(loader)`. So *every* slide has `image == NULL` and `_px_ver == 1`: swapping
+`bitmap.bitmapData` for the next slide moves no hash input at all, the ancestor's bake never
+expires, and the picture stays on the frame it was baked at.
+
+"Only a resize shakes it loose" is not a second bug: `as_render_cached` only hits when
+`_cache_w/_cache_h` match the destination surface, so a resize misses the cache and rebuilds
+once (which looks correct until it freezes at the new size), and restoring the old size merely
+misses it again. **The size was never an invalidation condition — it just happened to force a
+rebuild.**
+
+The fix is a monotonic per-instance id: `struct BitmapData` gains `unsigned int _uid;`,
+`BitmapData_ctor` assigns `o->_uid = ++as_bd_uid_next;`, and the fingerprint hashes it.
+**An address cannot do this job** — the collector hands the same address to a later allocation.
+A second defect of the same shape is fixed alongside it: an explicit `cacheAsBitmap = true` was
+invalidated by its setter alone, so a content change never rebuilt it (AIR rebuilds), and it now
+takes the same guard as an auto-bake:
+
+```c
+if (o->_auto_baked || o->_cache_flag) { o->_auto_baked = 0; o->_cache_valid = 0; }
+```
+
+**Verified** with `examples/bake-bitmap-swap.as` (manifest `examples/bake-bitmap-swap.build.json`).
+A/B: reverting both halves makes the example **red** with the reported symptom,
+
+```
+Uncaught exception: FAIL: swapping bitmapData must invalidate the ancestor's bake:
+probe reads 0xff0000, want the new bitmap (0xff00)
+```
+
+and with the fix all four assertions pass: the swap shows within one frame, a re-bake after
+several still frames captures the new bitmap (not "temporarily right"), swapping back works, and
+an explicit `cacheAsBitmap` expires when its content changes. Structural pins live in
+`test/unit/render.ts` (the `scrollrectbake` group, 9 checks).
+
+**Not verified:** that the symptom is gone on the real 32-bit exe — the client has to be rebuilt
+and walked through "page through slides + resize the window" again. This fixes the invalidation
+rule; it does not touch the memory peak.
+
+### 3.18 "Request timed out" may never have been transferred: the pool is four fixed workers (stage 281)
+
+The symptom is every network request stalling the UI and then failing, with the app printing its
+own `请求超时:https://…`.
+
+The facts (both readable from the code and measured): since stage 230 Windows has a real worker
+pool (`_beginthreadex` × `AS_ASYNC_WORKERS`), HTTP goes through libcurl, and finished jobs are
+dispatched on the frame boundary by `as_async_tick`. **The pool is four, claiming is first-come,
+and there is no priority.** So when the app prefetches 43 slides at once, the request at position
+five has to wait for four transfers to *finish* before it even starts, while its own 25 s
+`setTimeout` fires and reports a timeout. AS3 cannot see any of that (a `URLLoader` is never told
+"you are still queued"), so the runtime has to say it:
+
+```
+ASC_NET_TRACE=1
+[as3-aot] net start kind=1 queued=6 temp/slide-38.png    <- queue depth at claim time
+[as3-aot] net done  kind=1 ms=812.3 err=0 len=184320 temp/slide-38.png
+[as3-aot] net fire  kind=1 lag=17.1 temp/slide-38.png    <- frame-boundary dispatch lag
+```
+
+- `queued=` on `net start` draws the line between "queued" and "slow": a large `queued` means the
+  pool is short or the prefetch is too eager, a large `ms` means the transfer itself is slow, and a
+  large `lag` means the main thread was busy (nothing to do with the network).
+- `AS_ASYNC_WORKERS` is now a **build knob** (`-D AS_ASYNC_WORKERS=8`, i.e. the manifest's
+  `defines`); the default stays 4 to match AIR's feel and to keep a laptop usable. These jobs are
+  pure I/O waits, so raising it is safe — but *whether* to raise it is the app's call, since only
+  the app knows which requests come first.
+
+**Two things stated plainly:**
+
+1. The `threads=137` seen just before the crash was **not** these four workers. Ours are a fixed
+   four created once by `as_async_start_workers`; nothing creates a thread per request. The rest
+   belongs to the third-party SDKs in the link (the log tail is full of
+   `ANEQcloudRTC:sendCustomVideoDataByteFrame`, i.e. Agora RTC) and was **not enumerated**;
+   proving it needs `!threads` / ETW. Reading that number as "out of threads" is a misdiagnosis.
+2. The other half of the frozen UI has nothing to do with the pool: see §3.17, the picture itself
+   had stopped updating.
+
 ## 4. Runtime Form (D3D12 Direct, the Default)
 
 > The WGL file (`vendor/gl_glue.cc`, §3.1.1) is **isomorphic** to this one: also “a process-level

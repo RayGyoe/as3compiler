@@ -1151,6 +1151,83 @@ _abort+0x29
 屏幕选择器 → 删文件/滚列表 → 翻到 38/43 页 → 长留 30 分钟）。**这条修复保证的是"耗尽时抛
 可捕获的错"，不是"不再耗尽"**：1000 MB 的峰值本身没动。
 
+### 3.17 烘焙缓存不认「换了一张 BitmapData」：指纹少了一个实例号（阶段二百八十一）
+
+真机症状（TalkMED 会议客户端，32 位 AOT）：中间那块幻灯片预览在**某些分辨率**下被自动烘焙
+之后，翻页就再也不变；把窗口恢复成「烘焙前那个尺寸」，画面才更新。
+
+根因在 `as_render_fp` 的 Bitmap 分支 —— 它只哈希了两个**按构造就相同**的量：
+
+```c
+if (bd != NULL) { h = as_fp_ptr(h, bd->image); h = as_fp_u32(h, bd->_px_ver); }
+```
+
+应用里每一页幻灯片都是 `cn.edoctor.utils.ImageLoader` 造的：`new BitmapData(w, h, true, 0)`
+之后 `draw(loader)` 一次。于是**每一页**都是 `image == NULL` + `_px_ver == 1` —— 把
+`bitmap.bitmapData` 换成另一页，不改变任何一个哈希输入，祖宗的烘焙永不过期，画面停在
+烘焙那一刻那一页。
+
+「只有 resize 才能让它动」不是另一个 bug：`as_render_cached` 命中缓存要求 `_cache_w/_cache_h`
+等于目标表面尺寸，resize 让尺寸不匹配 ⇒ 重建一次 ⇒ 画面「对」了，随后又按新尺寸冻住；
+恢复原尺寸同样只是「再一次不匹配」。所以用户看到的是「必须恢复到 cache 之前的大小」——
+**尺寸从来不是失效条件，它只是恰好能触发一次重建。**
+
+修法：`BitmapData` 带一个单调实例号。`struct BitmapData` 新增 `unsigned int _uid;`，
+`BitmapData_ctor` 里 `o->_uid = ++as_bd_uid_next;`，指纹一起哈希。**地址做不到这件事** ——
+回收器会把同一个地址发给下一次分配。同源的第二处缺陷：显式 `cacheAsBitmap = true` 的缓存
+只由 setter 失效，内容变化不重建（AIR 是自动失效），现在与自动烘焙走同一条判据：
+
+```c
+if (o->_auto_baked || o->_cache_flag) { o->_auto_baked = 0; o->_cache_valid = 0; }
+```
+
+**已验证**（`examples/bake-bitmap-swap.as`，`--manifest examples/bake-bitmap-swap.build.json`）。
+A/B 实测：把上面两处回退后重编，示例**红**，且报的正是真机症状 ——
+
+```
+Uncaught exception: FAIL: swapping bitmapData must invalidate the ancestor's bake:
+probe reads 0xff0000, want the new bitmap (0xff00)
+```
+
+修复后 4 条断言全过：换图 ⇒ 一帧内变色；再静止几帧重烘焙 ⇒ 仍是新图（不是「暂时对」）；
+换回去同样变；显式 `cacheAsBitmap` 内容一变即过期。结构钉在 `test/unit/render.ts`
+（`scrollrectbake` 组，9 条）。
+
+**未验证**：真机 32 位 exe 上的症状是否就此消失 —— 要重编客户端再走一遍「翻页 + 改窗口
+尺寸」。**这一处修的是失效判据，一个字都没动内存峰值。**
+
+### 3.18 「请求超时」可能根本没在传输：池是 4 个固定 worker，队列深度对 AS3 不可见（阶段二百八十一）
+
+症状：网络请求全部表现为「UI 卡一下，然后失败」，日志里是应用自己的 `请求超时:https://…`。
+
+事实（代码可查 + 实测）：Windows 自阶段二百三十起是真 worker 池（`_beginthreadex` ×
+`AS_ASYNC_WORKERS`），HTTP 走 libcurl，完成的 job 在帧边界 `as_async_tick` 派发。
+**池大小 4，领取先来先得，没有优先级。** 于是应用一次预取 43 页幻灯片时，排在第 5 位的请求
+要等前面 4 个传输**结束**才「开始」；应用自己的 25 s `setTimeout` 到点就报「超时」，而那个
+传输可能一次都没 start。AS3 侧看不到这件事（`URLLoader` 不会被告知「你还在排队」），所以
+只能由运行时打出来：
+
+```
+ASC_NET_TRACE=1
+[as3-aot] net start kind=1 queued=6 temp/slide-38.png    ← 领取时的队列深度
+[as3-aot] net done  kind=1 ms=812.3 err=0 len=184320 temp/slide-38.png
+[as3-aot] net fire  kind=1 lag=17.1 temp/slide-38.png    ← 帧边界派发延迟
+```
+
+- `net start` 的 `queued=` 是「排队造成的延迟」与「传输本身慢」的分界线：`queued` 大 ⇒ 池不够
+  用或预取过猛；`ms` 大 ⇒ 传输慢；`lag` 大 ⇒ 主线程在忙（帧边界来晚了），与网络无关。
+- `AS_ASYNC_WORKERS` 现在是**构建期旋钮**（`-D AS_ASYNC_WORKERS=8`，构建清单的 `defines` 即可），
+  缺省仍是 4 —— 对齐 AIR 的观感，也不把开发机压满。这些 job 是纯 I/O 等待，调大是安全的；
+  但**要不要调大是应用的决定**：它最清楚哪些请求「先要」。
+
+**如实报明两件事：**
+
+1. 崩溃前的 `threads=137` **不是**这 4 个 worker 造成的。我们的池固定 4 个、不存在「每次请求
+   新建线程」（`as_async_start_workers` 只在 `main` 之后跑一次）。其余部分来自链进来的第三方
+   SDK（日志尾部满是 `ANEQcloudRTC:sendCustomVideoDataByteFrame`，即 Agora RTC），
+   **没有逐个枚举**——要坐实得抓 `!threads` / ETW。把它当「线程用光」是误判。
+2. UI「卡住」的另一半与池无关：见 §3.17，画面本身已经冻住了。
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +
