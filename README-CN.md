@@ -442,6 +442,12 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   加一次 `draw` ⇒ 两值逐页相同 ⇒ 祖宗烘焙永不过期；resize 只是让 `_cache_w/_cache_h` 不匹配、顺带重建一次。
   修法是 `BitmapData._uid`（构造器单调自增）参与哈希，并让显式 `cacheAsBitmap` 与自动烘焙走同一条失效判据
   （内容一变即过期，AIR 行为）。需 `examples/bake-bitmap-swap.build.json` 链 Skia
+- `examples/bake-draw-cache.as` — `BitmapData.draw` 也是一条渲染路径（阶段二百八十二）：窗口绘制与
+  `Stage.render` 都会在画之前刷新渲染指纹，而 `draw` 曾经直接画 —— 于是只经由 `draw` 进入渲染的子树
+  （离屏、从未上过显示列表）烘一次就永远重放那张图。真机形状：`FilePreviewView.drawTimeEvent()` 用
+  10 fps 把 `skinView.view`（`ViewControl`，即 `cacheAsBitmap`）画进 1280x720 的 `BitmapData` 再显示，
+  翻页因此不换图。修法是 draw 前先 `as_render_fp(src)`（在临时的源变换归零之前调用，两条路径必须
+  哈希同一组字段）。需 `examples/bake-draw-cache.build.json` 链 Skia
 - `examples/bakecrisp.as` — 烘焙分辨率与 `BitmapData.draw` 几何口径（对齐 `adl`）
 - `examples/bitmap-smoothing.as` — `Bitmap.smoothing` 采样模式（阶段二百三十）：默认 `false` 是最近邻、`true` 是双线性；
   同一张 16x1 黑白位图按 0.25 缩到 4x1，最近邻只会给出纯 0x00/0xFF、双线性必然混出中间灰。此前渲染分支恒用

@@ -1363,10 +1363,16 @@ function checkScrollRectBakeInvalidation(): string[] {
   // cached subtree expires on content change the way AIR's does. It used to be
   // driven by the setter alone (set cacheAsBitmap once, freeze forever), which
   // is the meeting client's cacheAsBitmapAndMatrix() path.
+  //
+  // 阶段二百八十二: the branch also carries an `ASC_BAKE_TRACE` `bake_drop` line
+  // now, so the guard and the two clears are matched as one slice instead of one
+  // literal run (a trace has to be able to say WHERE a frozen bake lives).
+  const guardAt = c.indexOf('if (o->_auto_baked || o->_cache_flag) {');
+  const guard = guardAt < 0 ? '' : c.slice(guardAt, guardAt + 800);
   check('a moved fingerprint drops the bake',
-    c.includes('if (o->_auto_baked || o->_cache_flag) { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+    guardAt >= 0 && guard.includes('o->_auto_baked = 0; o->_cache_valid = 0;'));
   check('...including an explicit cacheAsBitmap, not just an auto-bake',
-    c.includes('o->_cache_flag) { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+    guardAt >= 0 && (guard.match(/o->_auto_baked = 0; o->_cache_valid = 0;/g) || []).length === 1);
 
   // 阶段二百八十一: BitmapData identity. Without it a Bitmap whose bitmapData is
   // swapped to another bitmap built the same way hashes identically (image ==
@@ -1376,6 +1382,35 @@ function checkScrollRectBakeInvalidation(): string[] {
     c.includes('static unsigned as_bd_uid_next = 0;') && c.includes('o->_uid = ++as_bd_uid_next;'));
   check('as_render_fp hashes the BitmapData identity, not just its version',
     fp.includes('h = as_fp_u32(h, bd->_uid)'));
+
+  // 阶段二百八十二: BitmapData.draw is a rendering PATH of its own. The window pass
+  // and Stage.render both refresh the fingerprint before drawing, and that walk is
+  // the only thing that ever drops a bake -- so a subtree reachable ONLY through
+  // draw() baked once and replayed that image forever (measured: an off-stage
+  // cacheAsBitmap Sprite, swap its bitmapData, the second `bd.draw` still读了旧图).
+  // The meeting client is exactly this shape: FilePreviewView.drawTimeEvent()
+  // rasterizes skinView.view (a ViewControl => cacheAsBitmap) into a 1280x720
+  // BitmapData at 10 fps and hands that BitmapData to previewPpt.Render(), i.e.
+  // what the presenter sees on screen IS the draw path's output.
+  // Two occurrences: a forward declaration (it is called from the Texture/Starling
+  // helpers earlier in the file) and the definition — the body is the last one.
+  const drawStart = c.lastIndexOf('void BitmapData_draw(');
+  // 12k chars is comfortably longer than the body of BitmapData_draw and short
+  // enough that the slice cannot reach the next definition (the generated C is
+  // one file, and every runtime helper is a top-level definition).
+  const draw = drawStart < 0 ? '' : c.slice(drawStart, drawStart + 12000);
+  check('BitmapData.draw refreshes the fingerprint of a DisplayObject source',
+    draw.includes('as_render_fp(sdo);'));
+  check('...declared before it, since the definition comes much later in the file',
+    c.indexOf('static uint32_t as_render_fp(DisplayObject* o);') >= 0
+    && c.indexOf('static uint32_t as_render_fp(DisplayObject* o);') < drawStart);
+  check('...and before the source transform is zeroed for the raster, so both paths hash the same fields',
+    draw.indexOf('as_render_fp(sdo);') >= 0
+    && draw.indexOf('as_render_fp(sdo);') < draw.indexOf('sdo->x = 0.0;'));
+  check('...and the path is flagged so ASC_BAKE_TRACE can tell draw from the window pass',
+    c.includes('static int ASC_draw_path = 0;') && draw.includes('ASC_draw_path = 1;'));
+  check('...with a bake_drop trace line naming the path',
+    fp.includes('bake_drop') && fp.includes('ASC_draw_path'));
 
   console.log(`[scrollrectbake] ${ok} scrollRect bake-invalidation checks passed`);
   return bad;

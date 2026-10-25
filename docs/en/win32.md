@@ -1228,6 +1228,79 @@ ASC_NET_TRACE=1
 2. The other half of the frozen UI has nothing to do with the pool: see §3.17, the picture itself
    had stopped updating.
 
+### 3.19 `BitmapData.draw` is a rendering path too: no fingerprint refresh, so the bake never expires (stage 282)
+
+After §3.17 fixed "the fingerprint does not know you swapped the BitmapData", the real app **still**
+froze on page turns. The second round found the other half of the same gap.
+
+Rendering has **two entries**: the window composition pass and `Stage.render` (the screenshot hook).
+Both call `as_render_fp(root)` before drawing. `BitmapData.draw` went straight to
+
+```c
+as_skia_canvas_scale(canvas, rs, rs);
+as_render_object(canvas, sdo);
+```
+
+and **never hashed anything**. Expiring a bake is exactly what that walk does: it alone writes
+`_auto_fp`/`_auto_still`, it alone clears `_auto_baked`/`_cache_valid`, and it alone starts an
+auto-bake. So any subtree that is entered **only through draw()**:
+
+- never starts an auto-bake — which is the half that hid the bug;
+- keeps its explicit `cacheAsBitmap` (`_cache_flag`) bake forever, because the setter is its only
+  invalidation source. The image baked by the first draw is replayed indefinitely.
+
+The app has exactly this shape (`FilePreviewView.drawTimeEvent()`, a 10 fps `Timer`):
+
+```as3
+pBitmapData.draw(skinView.view, matrix, null, BlendMode.NORMAL, null, true);
+previewPpt.Render(pBitmapData);       // this is the big slide the presenter sees
+```
+
+and `skinView.view` is a `com.vsdevelop.proxy.ViewControl`, whose constructor calls
+`cacheAsBitmapAndMatrix()`, i.e. `cacheAsBitmap = true`. It bakes once and every later page is that
+first picture — until `pw/ph` changes, which is the user's "I have to resize the window back to the
+size it had before it cached".
+
+Fix: `BitmapData_draw` calls `as_render_fp(sdo)` **before** handing the source to
+`as_render_object`, and **before** the source transform is zeroed. draw() zeroes the source's own
+x/y/rotation/scale so its scale does not participate; the fingerprint covers those fields, so
+calling it after the zeroing would make the two paths hash different values forever and drop each
+other's bake every frame.
+
+```c
+DisplayObject* sdo = (DisplayObject*)src;
+as_render_fp(sdo);                    /* stage 282 */
+sdo->x = 0.0; sdo->y = 0.0; ...
+ASC_draw_path = 1; as_render_object(canvas, sdo); ASC_draw_path = 0;
+```
+
+**Verified** (`examples/bake-draw-cache.as`, `--manifest examples/bake-draw-cache.build.json`).
+A/B: with `as_render_fp(sdo)` removed the example goes red —
+
+```
+Uncaught exception: FAIL: BitmapData.draw must re-render a cacheAsBitmap subtree
+after its content changed: reads 0xff0000, want 0xff00 (frozen = the draw path
+never refreshes the fingerprint)
+```
+
+With the fix all four assertions pass: off-stage + explicit `cacheAsBitmap` follows a swapped
+bitmap, off-stage auto-bake does too, and the on-display-list path does not regress. Structural pins
+live in `test/unit/render.ts` (`scrollrectbake` group, 14 checks).
+
+Diagnostics: `ASC_BAKE_TRACE=1` now emits a `bake_drop` line whose `draw=` says which path the
+invalidation came from —
+
+```
+t=8123 bake_drop o=0x1f2a3b40 w=1280 h=720 draw=1
+```
+
+`draw=1` is the 10 fps `BitmapData.draw`, `draw=0` is the window pass. If a page turn produces **no**
+`bake_drop` at all, that subtree is not being fingerprinted by either entry point — go back to the
+two entries at the top of this section.
+
+**Not verified**: whether the real 32-bit exe stops freezing on page turns (needs a rebuild and
+another pass through the deck). **This change still touches nothing about the memory peak.**
+
 ## 4. Runtime Form (D3D12 Direct, the Default)
 
 > The WGL file (`vendor/gl_glue.cc`, §3.1.1) is **isomorphic** to this one: also “a process-level

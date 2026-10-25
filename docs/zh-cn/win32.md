@@ -1228,6 +1228,74 @@ ASC_NET_TRACE=1
    **没有逐个枚举**——要坐实得抓 `!threads` / ETW。把它当「线程用光」是误判。
 2. UI「卡住」的另一半与池无关：见 §3.17，画面本身已经冻住了。
 
+### 3.19 `BitmapData.draw` 也是一条渲染路径：不刷新指纹 ⇒ 烘焙永不失效（阶段二百八十二）
+
+§3.17 修好「指纹不认换图」之后，真机上**仍然**翻页不换图。第二轮定位到另一处，而且是同一类
+缺口的两半之一。
+
+渲染有**两条入口**：窗口合成 pass 与 `Stage.render`（截图钩子），两者都在画之前调用
+`as_render_fp(root)`。而 `BitmapData.draw` 直接
+
+```c
+as_skia_canvas_scale(canvas, rs, rs);
+as_render_object(canvas, sdo);
+```
+
+就画了，**一次指纹都不算**。而「让烘焙过期」这件事**只有那次遍历会做**：`_auto_fp`/`_auto_still`
+只有它写，`_auto_baked`/`_cache_valid` 只有它清，自动烘焙也只有它置位。于是凡是**只经由 draw
+进入渲染**的子树：
+
+- 自动烘焙永远不启动 —— 这一半恰好把问题掩盖了；
+- 显式 `cacheAsBitmap`（`_cache_flag`）照烘不误，而它唯一的失效来源是 setter ⇒ 第一次 draw
+  烘出来的那张图被**无限重放**。
+
+应用里正是这个形状（`FilePreviewView.drawTimeEvent()`，10 fps 的 `Timer`）：
+
+```as3
+pBitmapData.draw(skinView.view, matrix, null, BlendMode.NORMAL, null, true);
+previewPpt.Render(pBitmapData);       // presenter 屏幕上那块大图就是它
+```
+
+而 `skinView.view` 是 `com.vsdevelop.proxy.ViewControl`，构造即 `cacheAsBitmapAndMatrix()`
+⇒ `cacheAsBitmap = true`。它烘一次，之后翻多少页都是第一张，除非 `pw/ph` 变化 —— 正是用户说的
+「必须恢复 cache 之前的窗口大小」。
+
+修法：`BitmapData_draw` 把源对象交给 `as_render_object` **之前**先 `as_render_fp(sdo)`，且
+**必须放在源变换归零之前**。draw 为了让「源自身的 scale 不参与」会临时把 `sdo` 的
+x/y/rotation/scale 置零；指纹包含这些字段，若在归零之后调用，两条路径会永远算出不同的哈希、
+每帧互相踢掉对方的烘焙。
+
+```c
+DisplayObject* sdo = (DisplayObject*)src;
+as_render_fp(sdo);                    /* 阶段二百八十二 */
+sdo->x = 0.0; sdo->y = 0.0; ...
+ASC_draw_path = 1; as_render_object(canvas, sdo); ASC_draw_path = 0;
+```
+
+**已验证**（`examples/bake-draw-cache.as`，`--manifest examples/bake-draw-cache.build.json`）。
+A/B 实测：去掉 `as_render_fp(sdo)` 后重编，示例**红** ——
+
+```
+Uncaught exception: FAIL: BitmapData.draw must re-render a cacheAsBitmap subtree
+after its content changed: reads 0xff0000, want 0xff00 (frozen = the draw path
+never refreshes the fingerprint)
+```
+
+修复后四条断言全过：离屏 + 显式 `cacheAsBitmap` 换图即变、离屏自动烘焙换图即变、显示列表
+上的老路径不回归。结构钉在 `test/unit/render.ts`（`scrollrectbake` 组，14 条）。
+
+诊断：`ASC_BAKE_TRACE=1` 新增 `bake_drop` 行，`draw=` 说明这次失效来自哪条路径 ——
+
+```
+t=8123 bake_drop o=0x1f2a3b40 w=1280 h=720 draw=1
+```
+
+`draw=1` = 10 fps 的 `BitmapData.draw`，`draw=0` = 窗口合成 pass。翻页时**一条 `bake_drop` 都
+没有**，说明那个对象所在的子树压根没被指纹遍历覆盖，回到本节开头的两条入口去查。
+
+**未验证**：真机 32 位 exe 上「翻页不换图」是否就此消失 —— 要重编客户端再翻一遍。
+**这一处仍然一个字都没动内存峰值。**
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +

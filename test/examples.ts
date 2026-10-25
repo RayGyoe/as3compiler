@@ -322,6 +322,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 一页，只有 resize 才动）。断言是像素、且要靠 stage.render 跑指纹 pass，故同
   // autobake-origin.as 一样链 Skia。
   'bake-bitmap-swap.as': ['--manifest', join(dir, 'bake-bitmap-swap.build.json')],
+  // bake-draw-cache.as（阶段二百八十二）钉的是**draw 这条渲染路径自己**：离屏子树只经由
+  // `BitmapData.draw` 进入渲染时，窗口绘制的指纹遍历根本不覆盖它，于是显式 cacheAsBitmap
+  // 烘一次就永远重放那张图（真机：presenter 模式下大图 = pBitmapData.draw(skinView.view) 的
+  // 输出，翻页不换图）。断言是像素、且要链 Skia，故同 bake-bitmap-swap.as。
+  'bake-draw-cache.as': ['--manifest', join(dir, 'bake-draw-cache.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
   // roundrect.as（阶段二百六十七 · G19）断言的也是**像素**：drawRoundRect 的两个半径必须

@@ -18841,6 +18841,22 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('static void as_render_object_content(void* canvas, DisplayObject* o);');
     this.line('static void as_disp_chain_scale(DisplayObject* o, double* ox, double* oy);');
     this.line('static void as_render_object(void* canvas, DisplayObject* o);');
+    // BitmapData.draw is a rendering PATH of its own (阶段二百八十二). The window
+    // paint and Stage.render both call as_render_fp() before drawing, and that walk
+    // is the ONLY thing that ever drops a stale bake: it writes _auto_fp/_auto_still,
+    // clears _auto_baked/_cache_valid, and starts an auto-bake. draw() rasterizes
+    // through the SAME as_render_object/as_render_cached but used to skip the walk,
+    // so a subtree that is only ever seen through draw() stayed frozen at the frame
+    // in which it first baked (and an auto-bake could not even start there).
+    // Measured, examples/bake-draw-cache.as: an off-stage Sprite with
+    // `cacheAsBitmap = true`, `bd.draw(sprite)`, then `bmp.bitmapData = <new bd>`
+    // -- the second draw still read the FIRST bitmap (0xff0000). The meeting client
+    // hits exactly this: FilePreviewView.drawTimeEvent() rasterizes skinView.view
+    // (a ViewControl, i.e. cacheAsBitmap via cacheAsBitmapAndMatrix()) into a
+    // 1280x720 BitmapData at 10 fps and shows that BitmapData on screen, so the
+    // slide the presenter sees is the DRAW path's output, not the window pass.
+    this.line('static uint32_t as_render_fp(DisplayObject* o);');
+    this.line('static int ASC_draw_path = 0;');
     this.line('static void as_tf_apply_autosize(TextField* tf);');
     // BitmapData.draw() composites the source OVER the destination (SourceOver): it
     // never erases what it does not paint. Measured on adl 51.4.1 (temp/drawprobe/,
@@ -18972,13 +18988,21 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // children) still applies, so the transform fields are zeroed for the duration
     // of the raster and restored right after instead of skipping as_render_object.
     this.line('DisplayObject* sdo = (DisplayObject*)src;');
+    // Refresh the fingerprint BEFORE the source transform is zeroed for the
+    // raster: the hash covers the object's own x/y/rotation/scale plus its whole
+    // subtree, and the window pass hashes the same fields. Doing it afterwards
+    // would hash the temporary identity transform, so the two paths would never
+    // agree on the value and each would drop the other's bake every frame.
+    this.line('as_render_fp(sdo);');
     this.line('double sx_kx = sdo->x, sx_ky = sdo->y, sx_kr = sdo->rotation, sx_ksx = sdo->scaleX, sx_ksy = sdo->scaleY;');
     this.line('Matrix* sx_km = (sdo->transform != NULL) ? sdo->transform->matrix : NULL;');
     this.line('sdo->x = 0.0; sdo->y = 0.0; sdo->rotation = 0.0; sdo->scaleX = 1.0; sdo->scaleY = 1.0;');
     this.line('double _bdt0 = as_now_ms();');
     this.line('if (sdo->transform != NULL) sdo->transform->matrix = NULL;');
     this.line('as_skia_canvas_scale(canvas, rs, rs);');
+    this.line('ASC_draw_path = 1;');
     this.line('as_render_object(canvas, sdo);');
+    this.line('ASC_draw_path = 0;');
     this.line('sdo->x = sx_kx; sdo->y = sx_ky; sdo->rotation = sx_kr; sdo->scaleX = sx_ksx; sdo->scaleY = sx_ksy;');
     this.line('if (sdo->transform != NULL) sdo->transform->matrix = sx_km;');
     this.line('owned = (unsigned*)malloc(sizeof(unsigned) * (size_t)(sw * sh));');
@@ -24011,7 +24035,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // meeting client, whose buttons/labels/thumbnails/rows all opt in through
     // `cacheAsBitmapAndMatrix()` and then change their text and bitmaps.
     this.line('if (h == o->_auto_fp) { o->_auto_still++; }');
-    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked || o->_cache_flag) { o->_auto_baked = 0; o->_cache_valid = 0; } }');
+    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked || o->_cache_flag) { if (getenv("ASC_BAKE_TRACE") != NULL && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path); o->_auto_baked = 0; o->_cache_valid = 0; } }');
     this.line('if (getenv("ASC_NO_AUTO_BAKE") == NULL && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
