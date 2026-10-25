@@ -3,21 +3,27 @@
 > **状态：体积部分全部落地——第一步拆分（阶段二百二十一，`v0.4.195 → v0.4.196`）+
 > 两刀收尾（阶段二百二十二，`v0.4.196 → v0.4.197`）；只有"换 Rust 引擎"仍是评估，未实施、无版本号。**
 >
-> 本文回答两个问题，顺序不能颠倒：
+> 本文回答三个问题，顺序不能颠倒：
 >
 > 1. **能不能让程序只为它真正用到的部分付链接钱？** ——**能，已做，已实测**：
 >    ① 把文本 glue 拆成独立源文件 / 独立对象，构建层按程序是否用到 `flash.text` 决定链不链它
 >    （**19.43 MB → 6.53 MB**）；② 链接期 `-Wl,-dead_strip -Wl,-x`（**→ 3.55 MB**，全构建生效）；
 >    ③ 把 ICU 数据从桌面整份（10.19 MB）换成 Skia 自己给 wasm 用的那份（0.80 MB）
 >    ⇒ **画文字的构建 19.43 MB → 6.05 MB（−69%）**，语义零改动。
-> 2. **要不要把排版引擎换成纯 Rust（cosmic-text + swash + rustybuzz）？** ——**接点现成
+> 2. **要不要把排版引擎换成纯 Rust（cosmic-text + swash + harfrust）？** ——**接点现成
 >   （15 个函数的不透明接缝），但值得做的场景极窄**：桌面与 web 不值得，唯一算得过账的是
 >   移动端 + 体积硬约束，且真正的成本不是链接，是把 `adl` 逐值校准出来的排版口径在一个
 >   算法完全不同的引擎上**重做一遍**（§9）。
+> 3. **验收口径（2026-10-25 修订）：文字渲染不再逐值对齐 `adl`** ——只要 API 面与自洽性对齐，
+>    每个字的宽度、断行落点、行高取整由我们自己的排版引擎决定（§12）。它使 §9 的 B1/B2 降级、
+>    §11 多出一条与体积无关的前置分支，也给 markdown 之类的上层能力留出空间。
 >
 > 两处修订改变了本文的结构：旧稿（2026-10-20）把"拆成独立对象"写成"换引擎的前置条件"，
 > 实际上它**本身就是收益**；而阶段二百二十二之后连"文本栈剩下的 13 MB"也不成立了——
 > 882 KB 的数据选择 + 两条链接旗标就吃掉了其中 12.4 MB（§3、§10）。
+>
+> **第三次修订（2026-10-25）**：验收口径从"与 `adl` 逐值相等"改为"API 面对齐、度量自定"（§12）。
+> 因此 §9 的 B1/B2 从 🔴 降为 🟠、§11 的决策树多出一条前置分支，并新增 §13（GPUI 的文本栈旁证）。
 
 ---
 
@@ -48,9 +54,9 @@ Skia 的整体集成与 Metal 后端（见 [`skia.md`](skia.md)）；SWC 静态�
 ① 生成的可读 C        as_tf_*  /  TextField_*        （emit.ts 发射，唯一接触 C 字符串的地方）
         │  调用
 ② runtime.ts 的 inline 转发层   as_skia_text_measure / as_skia_textlayout_*
-        │  runtime.ts:8927+（ASC_USE_SKIA + ASC_HAVE_TEXT）
-        │  runtime.ts:9592+（无 Skia 或未链文本引擎：全 0 桩）
-③ C 接缝（extern，15 个函数）   src/runtime.ts:8763–8789
+        │  runtime.ts:9260+（ASC_USE_SKIA + ASC_HAVE_TEXT）
+        │  runtime.ts:9992+（无 Skia 或未链文本引擎：全 0 桩）
+③ C 接缝（extern，15 个函数）   src/runtime.ts:9068–9083
         │
 ④ 胶水实现            vendor/skia_text_glue.cc（695 行，阶段二百二十一拆出）
         │              SkParagraph / SkFontMgr / SkTypeface / HarfBuzz / ICU
@@ -61,8 +67,8 @@ Skia 的整体集成与 Metal 后端（见 [`skia.md`](skia.md)）；SWC 静态�
 
 | 组 | 函数 | 位置 |
 |---|---|---|
-| 单行测量（2） | `sk_text_measure` / `sk_text_measure_n` | `runtime.ts:8767–8768` |
-| 段落排版（13） | `sk_textlayout_new` / `_new_leading` / `_new_runs` / `_height` / `_max_width` / `_line_metrics` / `_line_box` / `_line_count` / `_paint` / `_delete` / `_glyph_position_at` / `_rects_for_range` / `_caret_rect` | `runtime.ts:8769–8789` |
+| 单行测量（2） | `sk_text_measure` / `sk_text_measure_n` | `runtime.ts:9068–9069` |
+| 段落排版（13） | `sk_textlayout_new` / `_new_leading` / `_new_runs` / `_height` / `_max_width` / `_line_metrics` / `_line_box` / `_line_count` / `_paint` / `_delete` / `_glyph_position_at` / `_rects_for_range` / `_caret_rect` | `runtime.ts:9070–9083` |
 
 段落是一个**不透明句柄**（`void*`），C 侧只通过上面 13 个函数查询（高/宽/行数/行盒/光标/
 区间矩形）与绘制（`_paint(para, canvas, x, y)`）。**没有一处 C 结构体暴露 SkParagraph 的类型。**
@@ -168,7 +174,7 @@ function usesTextEngine(texts: string[]): boolean {
 
 ### 2.4 运行时接缝：`ASC_HAVE_TEXT` 两态，且不静默降级
 
-`src/runtime.ts:8927` 起的接缝转发层现在是三段：
+`src/runtime.ts:9260` 起的接缝转发层现在是三段：
 
 | 分支 | 内容 |
 |---|---|
@@ -333,14 +339,14 @@ clang++: error: linker command failed with exit code 1
 
 | crate | 职责 | 对应现在是谁 | 备注 |
 |---|---|---|---|
-| `rustybuzz` | **整形（shaping）** | HarfBuzz | **是 HarfBuzz 的 Rust 移植** ⇒ 整形行为同源、迁移风险低，但"去掉 HarfBuzz"实际上是"换成 HarfBuzz 的 Rust 版" |
+| `harfrust`（原 `rustybuzz`） | **整形（shaping）** | HarfBuzz | rustybuzz 的下一代；**`cosmic-text 0.19` 已经用它**（`Cargo.lock` 实证，见 §13.1）。语义仍与 HarfBuzz 同源、迁移风险低，但"去掉 HarfBuzz"实际上是"换成 HarfBuzz 的 Rust 版" |
 | `ttf-parser` | 字体解析 / cmap / 度量 | FreeType + SkTypeface | |
-| `swash` | **光栅化 + 字形缓存** | SkScalerContext + SkGlyphCache | 彩色 emoji（CBDT/sbix）支持偏弱 |
+| `swash` | **光栅化 + 字形缓存** | SkScalerContext + SkGlyphCache | `0.2.x` 内核已换成 `skrifa`/`zeno`/`yazi`（§13.1）；彩色 emoji（CBDT/sbix）支持偏弱 |
 | `fontdb` | 字体枚举 / 家族匹配 | `SkFontMgr` | 三端平台字体管理器已覆盖，见 §1.3 |
 | `cosmic-text` | **断行 + 段落 + 缓存** | SkParagraph（UAX#14） | 依赖以上全部 |
 | `parley`（备选） | 断行 + 段落 | SkParagraph | 与 `swash` 同属 linebender，更活跃 |
 
-**关键取舍**：整形用 `rustybuzz` 意味着"语义同源"（对 AIR 对齐有利），但**省不掉整形逻辑本身**；
+**关键取舍**：整形用 `harfrust`（`rustybuzz` 的后继）意味着"语义同源"（对 AIR 对齐有利），但**省不掉整形逻辑本身**；
 而"去掉 ICU 的数据表"这件事**已经不需要换引擎了**（L2a 已把 10.19 MB 换成 0.80 MB）——所以换 Rust
 真正能省的只剩 **HarfBuzz + SkParagraph 那份 C++ 实现，约 2.7 MB**（§3 表 L5 行）。
 
@@ -466,7 +472,7 @@ codegen-units = 1
 | **Windows native** | ✅ 已上线 | GDI + DirectWrite 双回退 + Uniscribe 整形 | 体积 ~4.9 MB + 10.19 MB ICU 数据（Windows 尚未 port L2a，见 §10） | 要自建 DirectWrite 等价回退链；emoji（Segoe UI Emoji） | ❌ 不做 |
 | **Linux native** | ⛔ 未 provision | —（`vendor/skia/lib/` 无 linux） | — | — | ⛔ 无对象 |
 | **web (emcc)** | ✅ 已上线 | `SkFontMgr_New_Custom_Data` + 运行时注入 `font-urls` | 体积（wasm 文本栈归档 22.1 MB；`.wasm` 首屏体积可省 ~7 MB 量级） | 字体注入契约要重做；但**首屏体积收益相对量级最大** | ⚠️ **最有价值的一档** |
-| **WASI (raw)** | ✅ 已上线（无 GUI） | **无**（`as_skia_*` 全 0 桩，`runtime.ts:9592+`） | 0 | 0 | ⛔ 不涉及 |
+| **WASI (raw)** | ✅ 已上线（无 GUI） | **无**（`as_skia_*` 全 0 桩，`runtime.ts:9992+`） | 0 | 0 | ⛔ 不涉及 |
 | **iOS**（规划） | ❌ 未开始 | 计划 CoreText（补丁已覆盖 iOS 分支） | 体积 + 纯静态库形态**天然适配**（iOS 无 `dlopen` 问题） | 需先有 target、有 Skia 的 ios 构建 | ⏸ 随 target 一起评估 |
 | **Android**（规划） | ❌ 未开始（`--package android-project` 直接报错，`index.ts:1060`） | 计划 `SkFontMgr_New_Android` | 体积（APK 敏感）+ 不必自建 `fonts.xml` 解析 | 同 iOS | ⏸ 随 target 一起评估 |
 
@@ -519,7 +525,7 @@ codegen-units = 1
 ### 7.5 WASI（`--target wasm --package raw`）
 
 - **不涉及**：WASI 产物是无 GUI 的命令行模块，不含渲染。纯 C 分支下所有
-  `as_skia_text_*` 都是**返回 0/NULL 的 inline 桩**（`runtime.ts:9592+`）。
+  `as_skia_text_*` 都是**返回 0/NULL 的 inline 桩**（`runtime.ts:9992+`）。
 - 换任何文本引擎都不影响 WASI。**0 收益、0 代价。**
 
 ### 7.6 iOS（规划）
@@ -551,7 +557,7 @@ codegen-units = 1
 | A2 | **砍掉 skunicode + harfbuzz + skshaper + paragraph** | 合计 ≈2.7 MB（拆分实测：省下的 12.90 − ICU 数据 10.19；L2a 只动数据、不动这段代码）——**这是 L5 现在唯一还站得住的收益**（Skia 的画布/光栅化仍在，换引擎拿不走） | 全端 |
 | A3 | **纯 Rust 无 C++ 依赖** | 消除 `SK_TRIVIAL_ABI` / `-std=c++17` / MSVC ABI 互链等约束（`html5-web.md` §5.1、`provision/README.md`） | 全端 |
 | A4 | **静态库形态适配移动端** | iOS 无 `dlopen`，静态链是唯一形态 | iOS / Android |
-| A5 | **整形语义同源** | `rustybuzz` 是 HarfBuzz 的 Rust 移植 ⇒ 迁移风险低于换一门新整形器 | 全端 |
+| A5 | **整形语义同源** | `harfrust`/`rustybuzz` 都是 HarfBuzz 的 Rust 移植（`cosmic-text 0.19` 用前者，§13.1）⇒ 迁移风险低于换一门新整形器 | 全端 |
 | A6 | **单一引擎跨全端** | 现在 macOS/Windows/web 是**三套**字体管理器 + 两条整形路径 | 全端 |
 | A7 | **`cargo` 可复现构建** | 对比 `build-tools/skia-src` 的 gn+ninja 重编（`skia.md` §6.1） | 全端 |
 | A8 | **链接图已经就位** | 阶段二百二十一把文本段独立成 `vendor/skia_text_glue.cc`：换引擎 = 换这一个翻译单元，图形半边不受影响 | 全端（本次拆分的副产品） |
@@ -560,17 +566,21 @@ codegen-units = 1
 
 | # | 代价 | 具体是什么 | 严重度 |
 |---|---|---|---|
-| B1 | **`adl` 校准全部重做** | `flash-text.md` §2 的 D-T1…D-T21 + `skia.md` §8 那一整段：断行阈值恒 `ceil(ink+4)`、`autoSize` 只 `wordWrap=false` 才改宽、`textWidth` 尾空格口径、字段被缩放时 `textWidth/Height` 的 `sy/sx` 口径、字形只按累积 `scaleY` 缩放……这些**全部钉在 SkParagraph 的行为上** | 🔴 **最贵** |
-| B2 | **行盒模型要重推** | `sk_air_line_metrics` + `sk_round_half` + `sk_set_air_strut`（`skia_text_glue.cc:123–168`）——AIR 是 `rhalf(ascent)+rhalf(descent)+leading(px)`、**永不加 line gap**；Skia 是 `ceil(ascent+descent+lineGap)`。这套换算对九个具名字体逐值命中，换引擎后要从零重推 | 🔴 |
+| B1 | **`adl` 校准全部重做** | `flash-text.md` §2 的 D-T1…D-T21 + `skia.md` §8 那一整段：断行阈值恒 `ceil(ink+4)`、`autoSize` 只 `wordWrap=false` 才改宽、`textWidth` 尾空格口径、字段被缩放时 `textWidth/Height` 的 `sy/sx` 口径、字形只按累积 `scaleY` 缩放……这些**全部钉在 SkParagraph 的行为上** | 🟠 **最贵**（2026-10-25 降级，见 §12） |
+| B2 | **行盒模型要重推** | `sk_air_line_metrics` + `sk_round_half` + `sk_set_air_strut`（`skia_text_glue.cc:123–168`）——AIR 是 `rhalf(ascent)+rhalf(descent)+leading(px)`、**永不加 line gap**；Skia 是 `ceil(ascent+descent+lineGap)`。这套换算对九个具名字体逐值命中，换引擎后要从零重推 | 🟠（见 §12） |
 | B3 | **字体别名语义** | `sk_family_alias`（`skia_text_glue.cc:225`）：`_sans→Helvetica`、`_serif→Times New Roman`、`_typewriter→Monaco`、`NULL→Times`，以及"**未安装的字族回落到平台默认脸**"（`D-T17`，实测差 6 px） | 🟠 |
 | B4 | **彩色 emoji** | `swash` 在 CBDT/sbix 位图彩色字体上偏弱；而 CoreText（macOS）、DirectWrite（Windows）都现成支持 | 🟠 |
 | B5 | **可装上的字体 ≠ 可枚举的字体** | web 侧的注入契约要重做（§7.4）；native 侧要重建平台回退链 | 🟠 |
 | B6 | **丢字形缓存/性能** | 现在 `SkGlyphCache` + Skia 的 glyph atlas 是免费的；Rust 侧要自建（`swash` 有 `scale::Scaler`，但缓存要自己管） | 🟡 |
 | B7 | **`skia.md` §6.9 的补丁收益消失** | 那条补丁修的换脸问题在 Rust 侧换一种形式重现（要自己处理"同族同 PS 名"） | 🟡 |
 | B8 | **工具链进 CI** | 当前**本机没有 Rust 工具链**（`rustc`/`cargo`/`rustup` 均 `command not found`）；CI 要加 5~6 个 target 的交叉编译 | 🟡 |
-| B9 | **许可证核对** | Skia=BSD-3、ICU=Unicode License；Rust 侧 `cosmic-text`/`swash`/`fontdb`/`rustybuzz`/`ttf-parser` 的许可证需逐项核对后再定（**本文未核对**，落地前必查） | 🟡 |
+| B9 | **许可证核对** | Skia=BSD-3、ICU=Unicode License；Rust 侧 `cosmic-text`/`swash`/`fontdb`/`harfrust`/`skrifa`/`ttf-parser` 的许可证需逐项核对后再定（**本文未核对**，落地前必查） | 🟡 |
 | B10 | **双后端期体积最大** | 档 3（A/B 并行）时期，两份字体栈同时在二进制里 | 🟡 |
 | B11 | **全套回归要重跑** | 200+ 示例 + `textfield` 双端报告 + `[textwrap]` 等结构钉 | 🟡 |
+
+> **2026-10-25 修订**：B1/B2 已从 🔴 降为 🟠——验收口径改为"API 面对齐、度量自定"（§12）。
+> 它们不再是换引擎的阻断项，只在"仍想与 `adl` 逐值对拍"时才需要重做；`flash-text.md` 的
+> D-T 系列随之从**语义契约**降级为**当前实现的基线快照**。
 
 ### 9.1 B1/B2 的实证：这些口径是什么样子
 
@@ -633,6 +643,14 @@ skia_enable_skshaper = true
 
 ## 11. 触发条件与决策树
 
+**前置分支（2026-10-25 增补）**：
+
+```
+需要 flash.text 给不了的排版能力（markdown / 富文本 / 自定义换行）？
+├─ 是 ──► 先做**上层**（run 扩展 + 解析器），不换引擎：见 §12.4
+└─ 否 ──► 才进入下面的体积判断
+```
+
 ```
 体积是硬约束？
 ├─ 否 ──────────────────────────► 不做 L5。L0/L1/L2a 已经自动生效，什么都不用做。
@@ -656,13 +674,127 @@ skia_enable_skshaper = true
 3. L0/L1/L2a 在该 target 上**已生效**（含把 ICU 数据换成 0.80 MB 那份）；
 4. 仍然超标，并留下实测数据。
 
+> **另有第二类触发（与体积无关）**：若将来要做"跨端完全一致的文字度量"（服务端排版校验、
+> 三端截图比对流水线），则"每端委派给系统文本 API"本身成为障碍（§13.1 结论一），cosmic-text
+> 才获得第二个理由。它与体积触发互不替代，也不改变本文"桌面不做"的结论。
+
 ---
 
-## 12. 附录
+## 12. 验收口径：API 面对齐，度量自定（2026-10-25 决定）
+
+> 这一节重算了本文 §9 的代价与 §11 的决策树。口径变更只有一句：**文字渲染不再要求逐值对齐
+> `adl`**，只要求 `flash.text` 的 **API 面**（形状、行为、错误、自洽性）对齐；每个字的 advance、
+> 断行落点、`ascent`/`descent` 如何取整，由我们自己的排版引擎决定。理由是 AIR 的文本呈现
+> 已经严重落后（没有 markdown、没有 CSS 布局），把它当像素 oracle 会让我们永久继承一个过时的
+> 排版模型——**AIR 落后在 API 面，不落后在排版内核**（§12.4）。
+
+### 12.1 三类东西，归属不同
+
+| 类别 | 内容 | 归谁 | 怎么验 |
+|---|---|---|---|
+| **A. API 面（逐字对齐 AIR）** | 类/方法/属性的形状与默认值；常量值（`GraphicsPathCommand`、`TextFormatAlign`…）；参数非法时的错误号与文案（`#2008`/`#2004`/`#2007`…）；状态机触发关系（`autoSize` 只在 `wordWrap=false` 时改宽、`htmlText` 往返、`appendText` 与光标）；`scrollV`/`maxScrollV` 的钳制；`text` 与 `htmlText` 的规范化 | AIR（`adl`） | 精确断言：`test/unit/` 钉文案与常量，示例钉行为 |
+| **B. 自洽性（必须成立，数值我们定）** | `numLines == getLineMetrics().length`；`Σ getLineMetrics(i).height == textHeight`；`getCharBoundaries(i)` 落在 `[0, textWidth]`；`getLineIndexAtPoint` 与行盒互逆；光标矩形落在行盒内；选区矩形按行单调；`textWidth` 等于最长行宽 | 我们 | 结构性断言：只钉关系，不抄像素 |
+| **C. 绝对度量（我们定）** | 每个字形的 advance；断行落点（因此 `numLines` 可能与 AIR 不同）；行高是否含字体自身 line gap；ink 包围盒 vs 排版盒；亚像素定位与 AA 强度 | 我们 | 只进**报表**（§12.2 的 Tier 2） |
+
+一句话：**形状照 AIR，数字照我们**，且数字必须自洽。
+
+### 12.2 两层验收（Tier 2 必须落盘，否则就是静默差异）
+
+| 层 | 内容 | 拦 CI 吗 |
+|---|---|---|
+| **Tier 1（gate）** | A 类全部 + B 类全部 | 是 |
+| **Tier 2（report）** | 同一批探针在 `adl` 与我们的产物上的 C 类差异：行数、`textWidth`/`textHeight`、逐行 `ascent`/`descent`、`getCharBoundaries` 首末点 | 否，但**每次改排版就出一张表**进 `docs/`（`flash-text.md` §5 的双端报告格式可直接复用） |
+
+为什么 Tier 2 不能省：C 类差异在程序里是**可见结构**（`if (tf.numLines > 3)` 是真实写法），
+不是"长得不一样"。不落盘就等于让读者从"AIR 对齐"的旧叙述里读出错误预期，违反 AGENTS §1.5
+（如实报明差异，不静默）。
+
+### 12.3 随之降级的东西
+
+- §9 的 **B1**（D-T1…D-T21 全部重做）与 **B2**（行盒换算重推）从 🔴 降为 🟠：它们仍然是
+  "想和 `adl` 逐值对拍时"的成本，不再是把换引擎钉死的理由。
+- `flash-text.md` §2 的 D-T 系列从**语义契约**降级为**当前实现的基线快照**：它记录的是现在这套
+  SkParagraph 口径，换引擎后要能**解释**差异，而不是必须**复现**。
+- **没降级**的是 A/B 两类：它们不依赖任何字体，仍可精确断言。
+
+### 12.4 这条政策**不**构成换引擎的理由
+
+一个常见推论是"AIR 落后（没有 markdown）⇒ 该换排版引擎"。这一步不成立，因为 **markdown 是上层，
+不是内核**：
+
+```c
+// src/runtime.ts:8831 —— 富文本 run 已经支持逐段样式
+typedef struct { unsigned start; unsigned end; const char* family; double size;
+                 int bold; int italic; unsigned color; double leading; } sk_text_run;
+```
+
+`sk_textlayout_new_runs` 把这些 run 交给 `ParagraphBuilder`，所以 markdown 的粗体/斜体/行内代码
+（换 `family`/`size`）/标题/颜色**全部落在现有 13 个函数的能力内**；缺的只是 run 上的
+`underline`、`strikethrough`、`background`、`link` 几个字段（我们自己控制的 C 结构体，加字段即可）
+与一个 markdown → run 的解析器。
+
+也就是说：受限的是**我们自己的封装没往上长**，不是 SkParagraph 的能力。它背后是 HarfBuzz + ICU，
+整形能力本身不弱于任何候选 Rust 栈。
+
+于是换引擎仍然只为两件事：**体积**（约 2.7 MB，§3 表 L5 行）与**去掉 C++/ICU 依赖**；代价则从
+"重做校准"变成"断行/光标/选区/命中四类自研"（若走 §13.2 的字形级接缝）。**用自研换 2.7 MB，
+谈判条件没变。**
+
+> 若 markdown 之类的能力真要落地，按 AGENTS §1.5 应作为 `asaot.ui.*` 的新能力或 opt-in 开关，
+> **不得改写 `flash.text` 已定义的行为**。
+
+---
+
+## 13. 旁证：GPUI（Zed）的文本栈——每端一个后端
+
+> 调研对象：本工作区的 `asaotui/gpui-src/`（Zed `5447804`，2026-10-21，`gpui 0.2.2`）。
+> 用在这里的目的只有一个：看一个**生产级、但不背 AIR 对齐义务**的框架如何切文本栈。
+> 本节全部是**源码与 `Cargo.lock` 的代码事实**——没有在本机构建或运行 Zed，所以"它选了谁"
+> 是可验证的，"它排得好不好看"不在本节主张范围内。
+
+### 13.1 它没有"一个"引擎
+
+接缝是 `pub trait PlatformTextSystem`（`crates/gpui/src/platform.rs:1503`），返回
+`LineLayout { width, ascent, descent, runs: [ShapedRun{font_id, glyphs:[ShapedGlyph{id, position,
+index, is_emoji}]}] }`（`crates/gpui/src/text_system/line_layout.rs:19`）。实现在六个平台 crate 里：
+
+| 端 | 整形 | 字体 | 光栅 |
+|---|---|---|---|
+| macOS / iOS（`gpui_apple/src/text_system.rs`） | **CoreText** `CTLine::new_with_attributed_string`（`:583`） | `font-kit` + CTFontCollection | **CoreGraphics** bitmap context + `CTFont::draw_glyphs`（`:444`），灰度；emoji 走 RGBA |
+| Windows（`gpui_windows/src/direct_write.rs`） | **DirectWrite** `CreateTextFormat` → `CreateTextLayout` → `IDWriteTextRenderer::Draw`（`:524`–`:645`） | DirectWrite collection（含内存字体 loader） | `IDWriteGlyphRunAnalysis` → ClearType 3×1 / aliased 纹理；COLR/PNG/JPEG/SVG 彩色字形另取图像 |
+| Linux（`gpui_linux/src/linux/text_system.rs`，**全文一行**） | **cosmic-text** | fontdb | **swash** |
+| web / wasm（`gpui_web/src/text_system.rs`） | cosmic-text（外叠一层 Canvas2D 回退测量） | 注入字节进 fontdb | swash |
+
+`cosmic-text 0.19.0` 的真实依赖（`Cargo.lock`）：整形 **`harfrust 0.5`**（rustybuzz 的下一代；
+`rustybuzz 0.20` 在该 lock 里只被 `usvg` 拉）、光栅 **`swash 0.2.6`**（内核已换成
+`skrifa` + `zeno` + `yazi`）、度量/轮廓 `skrifa 0.40`/`read-fonts`、枚举 `fontdb 0.23`
+（`ttf-parser 0.25`）、断行/分段 `unicode-bidi`/`unicode-linebreak`/`unicode-script`/
+`unicode-segmentation`。`font-kit` 在 cosmic 臂里只用于"最优匹配"（`cosmic_text_system.rs:1177`）。
+
+**结论一**：GPUI 只在"没有权威系统文本 API"的两条臂（Linux、浏览器）上用 Rust 栈；桌面两臂与我们
+同为"委派给 OS"。这是 §7.0 那两条"❌ 不做"的同构旁证。
+
+**结论二**（对我们更要紧）：GPUI **不把断行外包**——UAX#14 换行在框架侧
+（`crates/gpui/src/text_system/line_wrapper.rs`），后端只整形**一行**
+（`ShapeLine::new(…, Shaping::Advanced)` + `Wrap::None`，`cosmic_text_system.rs:748`）。
+这与我们"把断行一起外包给 SkParagraph"正好相反，也是 §13.2 那笔自研成本的来源。
+
+### 13.2 能借的、不能借的
+
+| | 内容 | 判断 |
+|---|---|---|
+| 可借 | **字形级接缝**：后端只出 glyph id + 位置，光栅是独立函数、结果进 atlas（`metal_atlas`/`directx_atlas`/`wgpu_atlas`） | 让"双后端 A/B"（§5 档 3）变成"共用同一份 `LineLayout`、只换 rasterizer"。代价是断行/行盒/光标/选区四类自研——也就是我们现在**白拿**的那部分 |
+| 可借 | **每端一个后端** | 我们在字体匹配上已经这么做（§1.3）。但把**整形**也按端委派，等于"一处校准、全端一致"变成"三处校准"，与 §12.2 的 Tier 2 报表口径冲突 ⇒ **不采纳** |
+| 不能借 | "省掉校准" | GPUI 没有 `adl` 这样的 oracle：`ascent`/`descent` 直接吃平台给的数（Windows 取 `DWRITE_LINE_METRICS.baseline` 与 `height - baseline`，`:583`–`:591`），不存在 B2 那套 `rhalf(ascent)+rhalf(descent)+leading` 的换算。它的成本单里**没有 B1/B2**，所以"GPUI 在用 cosmic-text"不能给我们的迁移风险打折 |
+| 参考 | 平台细节要复刻的量级 | macOS 臂固定 `TextRenderingMode::Grayscale`，并按前景亮度做字体膨胀 `glyph_dilation_for_color`（`:224`，注释明说是"复刻 CoreGraphics 按亮度加粗"）；Windows 看系统设置决定 ClearType/灰度；cosmic 恒 Subpixel。这类细节正是 B1 的实例 |
+
+---
+
+## 14. 附录
 
 ### A. 15 个接缝函数（现状全清单）
 
-接缝声明：`src/runtime.ts:8763–8789`；实现：`vendor/skia_text_glue.cc`（`ASC_HAVE_TEXT` 才进链接）。
+接缝声明：`src/runtime.ts:9068–9083`；实现：`vendor/skia_text_glue.cc`（`ASC_HAVE_TEXT` 才进链接）。
 
 | # | 函数 | 签名要点 | 实现位置 |
 |---|---|---|---|
@@ -682,7 +814,7 @@ skia_enable_skshaper = true
 | 14 | `sk_textlayout_rects_for_range` | 区间 → 矩形集合（选区/下划线） | 同文件 |
 | 15 | `sk_textlayout_caret_rect` | 光标矩形 | 同文件 |
 
-> 另有 **`sk_text_run` 结构体**（`runtime.ts:8594–8596`）**无条件定义**（纯 C 构建也要用）；
+> 另有 **`sk_text_run` 结构体**（`runtime.ts:8831`）**无条件定义**（纯 C 构建也要用）；
 > 以及 `sk_canvas_draw_text` / `sk_canvas_draw_text_n` 两条**直接绘制**路径
 > （`skia_text_glue.cc:291` / `:300`），它们绕过 SkParagraph，只做单行。
 

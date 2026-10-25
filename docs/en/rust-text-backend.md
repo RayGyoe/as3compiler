@@ -4,7 +4,7 @@
 > `v0.4.195 → v0.4.196`), plus the two closing cuts (stage 222, `v0.4.196 → v0.4.197`). Only "swap in
 > a Rust engine" is still an evaluation: not implemented, no version number.**
 >
-> This document answers two questions, in an order that cannot be swapped:
+> This document answers three questions, in an order that cannot be swapped:
 >
 > 1. **Can a program pay only for what it actually uses?** — **Yes. Done, and measured**:
 >    ① the text half of the glue is now its own source file / object, and the build layer decides
@@ -14,16 +14,26 @@
 >    for wasm (0.80 MB) ⇒ **a text-drawing build goes 19.43 MB → 6.05 MB (−69%)**, zero semantic
 >    change.
 > 2. **Should the layout engine be replaced with a pure-Rust stack (cosmic-text + swash +
->    rustybuzz)?** — **The seam already exists** (15 opaque functions), **but the set of situations
+>    harfrust)?** — **The seam already exists** (15 opaque functions), **but the set of situations
 >    where it pays off is very narrow**: not desktop, not web. The only account that balances is a
 >    mobile target with a hard size constraint, and the real cost is not linking — it is re-deriving
 >    every layout convention calibrated value-by-value against `adl` on a completely different
 >    engine (§9).
 >
+> 3. **Acceptance policy (2026-10-25 revision): text rendering is no longer matched to `adl`
+>    value by value** — the API surface and self-consistency have to line up, while each glyph's
+>    width, the break positions and the line-height rounding are decided by our own engine (§12).
+>    That downgrades B1/B2 in §9, adds a size-independent pre-branch to §11, and leaves room for
+>    upper-layer capabilities such as markdown.
+>
 > Two revisions changed the structure of this document. The old one (2026-10-20) filed "split it
 > into an independent object" as a *precondition for swapping engines* — the split **is itself the
 > win** and needs no engine swap. And after stage 222 the "remaining 13 MB of text stack" is gone
 > too: **882 KB of data selection plus two link flags** removed 12.4 MB of it (§3, §10).
+>
+> **Third revision (2026-10-25)**: acceptance moves from "equal to `adl` value by value" to "API
+> surface aligned, metrics ours" (§12). So B1/B2 in §9 drop from 🔴 to 🟠, §11 gains a pre-branch,
+> and §13 (GPUI's text stack) is new.
 
 ---
 
@@ -56,9 +66,9 @@ value-by-value against `adl` (AGENTS §1.5).
 ① generated, readable C        as_tf_*  /  TextField_*   (emitted by emit.ts, the only place that touches C strings)
         │  calls
 ② runtime.ts inline forwarders as_skia_text_measure / as_skia_textlayout_*
-        │  runtime.ts:8927+  (ASC_USE_SKIA + ASC_HAVE_TEXT)
-        │  runtime.ts:9592+  (no Skia, or no text engine linked: all-zero stubs)
-③ the C seam (extern, 15 fns)  src/runtime.ts:8763–8789
+        │  runtime.ts:9260+  (ASC_USE_SKIA + ASC_HAVE_TEXT)
+        │  runtime.ts:9992+  (no Skia, or no text engine linked: all-zero stubs)
+③ the C seam (extern, 15 fns)  src/runtime.ts:9068–9083
         │
 ④ the glue implementation      vendor/skia_text_glue.cc (695 lines, split out in stage 221)
         │                      SkParagraph / SkFontMgr / SkTypeface / HarfBuzz / ICU
@@ -69,8 +79,8 @@ value-by-value against `adl` (AGENTS §1.5).
 
 | Group | Functions | Location |
 |---|---|---|
-| single-line measurement (2) | `sk_text_measure` / `sk_text_measure_n` | `runtime.ts:8767–8768` |
-| paragraph layout (13) | `sk_textlayout_new` / `_new_leading` / `_new_runs` / `_height` / `_max_width` / `_line_metrics` / `_line_box` / `_line_count` / `_paint` / `_delete` / `_glyph_position_at` / `_rects_for_range` / `_caret_rect` | `runtime.ts:8769–8789` |
+| single-line measurement (2) | `sk_text_measure` / `sk_text_measure_n` | `runtime.ts:9068–9069` |
+| paragraph layout (13) | `sk_textlayout_new` / `_new_leading` / `_new_runs` / `_height` / `_max_width` / `_line_metrics` / `_line_box` / `_line_count` / `_paint` / `_delete` / `_glyph_position_at` / `_rects_for_range` / `_caret_rect` | `runtime.ts:9070–9083` |
 
 A paragraph is an **opaque handle** (`void*`); the C side can only query it through those 13
 functions (height / width / line count / line box / caret / range rectangles) and draw it
@@ -184,7 +194,7 @@ The verdict is printed during the build; nothing is silent:
 
 ### 2.4 The runtime seam: `ASC_HAVE_TEXT` has two states, and neither is silent
 
-The seam forwarders starting at `src/runtime.ts:8927` are now three blocks:
+The seam forwarders starting at `src/runtime.ts:9260` are now three blocks:
 
 | Branch | Contents |
 |---|---|
@@ -422,14 +432,14 @@ exits), so the source tree keeps only inputs.
 
 | crate | Role | Who does it today | Note |
 |---|---|---|---|
-| `rustybuzz` | **shaping** | HarfBuzz | **a Rust port of HarfBuzz** ⇒ same shaping behaviour, low migration risk — but "removing HarfBuzz" actually means "swapping in HarfBuzz's Rust version" |
+| `harfrust` (was `rustybuzz`) | **shaping** | HarfBuzz | rustybuzz's successor; **`cosmic-text 0.19` already uses it** (`Cargo.lock` evidence in §13.1). Same-origin with HarfBuzz, low migration risk — but "removing HarfBuzz" still means "swapping in HarfBuzz's Rust version" |
 | `ttf-parser` | font parsing / cmap / metrics | FreeType + SkTypeface | |
-| `swash` | **rasterization + glyph cache** | SkScalerContext + SkGlyphCache | weak on colour emoji (CBDT/sbix) |
+| `swash` | **rasterization + glyph cache** | SkScalerContext + SkGlyphCache | `0.2.x` runs on `skrifa`/`zeno`/`yazi` (§13.1); weak on colour emoji (CBDT/sbix) |
 | `fontdb` | font enumeration / family matching | `SkFontMgr` | already covered by three platform font managers, see §1.3 |
 | `cosmic-text` | **line breaking + paragraphs + cache** | SkParagraph (UAX#14) | depends on all of the above |
 | `parley` (alternative) | line breaking + paragraphs | SkParagraph | from linebender like `swash`, more active |
 
-**The key trade-off**: shaping with `rustybuzz` keeps the semantics "same-origin" (good for `adl`
+**The key trade-off**: shaping with `harfrust` (`rustybuzz`'s successor) keeps the semantics "same-origin" (good for `adl`
 alignment), but **does not remove the shaping logic itself**; and "drop ICU's unicode data tables"
 **no longer needs an engine swap** (L2a already took 10.19 MB down to 0.80 MB) — what an engine swap
 actually removes is the C++ HarfBuzz + SkParagraph implementation, about 2.7 MB (the L5 row in §3).
@@ -561,7 +571,7 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
 | **Windows native** | ✅ shipped | GDI + DirectWrite two-tier fallback + Uniscribe shaping | size ~4.9 MB + 10.19 MB ICU data (L2a not yet ported to Windows, see §10) | must rebuild an equivalent DirectWrite fallback chain; emoji (Segoe UI Emoji) | ❌ don't |
 | **Linux native** | ⛔ not provisioned | — (`vendor/skia/lib/` has no linux) | — | — | ⛔ nothing to analyse |
 | **web (emcc)** | ✅ shipped | `SkFontMgr_New_Custom_Data` + runtime injection of `font-urls` | size (wasm text stack archive 22.1 MB; the `.wasm` first-load payload could shed on the order of ~7 MB) | the font-injection contract must be redone; but the **relative** first-load gain is the largest | ⚠️ **the most valuable tier** |
-| **WASI (raw)** | ✅ shipped (no GUI) | **none** (all `as_skia_*` are zero stubs, `runtime.ts:9592+`) | 0 | 0 | ⛔ not involved |
+| **WASI (raw)** | ✅ shipped (no GUI) | **none** (all `as_skia_*` are zero stubs, `runtime.ts:9992+`) | 0 | 0 | ⛔ not involved |
 | **iOS** (planned) | ❌ not started | CoreText planned (the patch already covers the iOS branch) | size + a pure-static-library shape that **natively fits** (iOS has no `dlopen` problem) | needs the target and an iOS Skia build first | ⏸ evaluate together with the target |
 | **Android** (planned) | ❌ not started (`--package android-project` throws today, `index.ts:1060`) | `SkFontMgr_New_Android` planned | size (APK-sensitive) + no need to write `fonts.xml` parsing ourselves | as iOS | ⏸ evaluate together with the target |
 
@@ -621,7 +631,7 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
 ### 7.5 WASI (`--target wasm --package raw`)
 
 - **Not involved**: the WASI artifact is a GUI-less command-line module with no rendering. In the pure-C
-  branch every `as_skia_text_*` is an inline stub **returning 0/NULL** (`runtime.ts:9592+`).
+  branch every `as_skia_text_*` is an inline stub **returning 0/NULL** (`runtime.ts:9992+`).
 - Swapping in any text engine does not affect WASI. **Zero gain, zero cost.**
 
 ### 7.6 iOS (planned)
@@ -656,7 +666,7 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
 | A2 | **Drops skunicode + harfbuzz + skshaper + paragraph** | ≈2.7 MB together (measured by the split: 12.90 saved − 10.19 of ICU data; L2a only touched data, not this code) — **the only L5 benefit still standing** (Skia's canvas/raster still stays; an engine swap cannot take it) | all |
 | A3 | **Pure Rust, no C++ dependency** | removes the `SK_TRIVIAL_ABI` / `-std=c++17` / MSVC ABI interlink constraints (`html5-web.md` §5.1, `provision/README.md`) | all |
 | A4 | **Static-library shape suits mobile** | iOS has no `dlopen`; static linking is the only shape | iOS / Android |
-| A5 | **Same shaping semantics** | `rustybuzz` is a Rust port of HarfBuzz ⇒ lower migration risk than a genuinely new shaper | all |
+| A5 | **Same shaping semantics** | `harfrust`/`rustybuzz` are both Rust ports of HarfBuzz (`cosmic-text 0.19` uses the former, §13.1) ⇒ lower migration risk than a genuinely new shaper | all |
 | A6 | **One engine across all platforms** | today macOS/Windows/web are **three** font managers plus two shaping paths | all |
 | A7 | **Reproducible builds via `cargo`** | compared with rebuilding through gn+ninja in `build-tools/skia-src` (`skia.md` §6.1) | all |
 | A8 | **The link graph is already in place** | stage 221 made the text section its own `vendor/skia_text_glue.cc`: swapping engines = swapping this one translation unit, with the graphics half unaffected | all (a by-product of step 1) |
@@ -665,17 +675,22 @@ One `.a` per target, mirroring the `vendor/skia/lib/{macos-arm64,wasm,windows-x6
 
 | # | Cost | What it actually is | Severity |
 |---|---|---|---|
-| B1 | **All `adl` calibration redone** | `flash-text.md` §2's D-T1…D-T21 plus the whole of `skia.md` §8: the break threshold is exactly `ceil(ink+4)`, `autoSize` only changes width when `wordWrap=false`, the trailing-space convention for `textWidth`, the `sy/sx` convention for `textWidth/Height` on a scaled field, glyphs scaled only by cumulative `scaleY`… all of it is **pinned to SkParagraph's behaviour** | 🔴 **most expensive** |
-| B2 | **Line-box model re-derived** | `sk_air_line_metrics` + `sk_round_half` + `sk_set_air_strut` (`skia_text_glue.cc:123–168`) — AIR is `rhalf(ascent)+rhalf(descent)+leading(px)` and **never adds the line gap**; Skia is `ceil(ascent+descent+lineGap)`. That conversion matches nine named faces exactly; on a new engine it must be re-derived from scratch | 🔴 |
+| B1 | **All `adl` calibration redone** | `flash-text.md` §2's D-T1…D-T21 plus the whole of `skia.md` §8: the break threshold is exactly `ceil(ink+4)`, `autoSize` only changes width when `wordWrap=false`, the trailing-space convention for `textWidth`, the `sy/sx` convention for `textWidth/Height` on a scaled field, glyphs scaled only by cumulative `scaleY`… all of it is **pinned to SkParagraph's behaviour** | 🟠 **most expensive** (downgraded 2026-10-25, §12) |
+| B2 | **Line-box model re-derived** | `sk_air_line_metrics` + `sk_round_half` + `sk_set_air_strut` (`skia_text_glue.cc:123–168`) — AIR is `rhalf(ascent)+rhalf(descent)+leading(px)` and **never adds the line gap**; Skia is `ceil(ascent+descent+lineGap)`. That conversion matches nine named faces exactly; on a new engine it must be re-derived from scratch | 🟠 (§12) |
 | B3 | **Family alias semantics** | `sk_family_alias` (`skia_text_glue.cc:225`): `_sans→Helvetica`, `_serif→Times New Roman`, `_typewriter→Monaco`, `NULL→Times`, plus "**an uninstalled family falls back to the platform default face**" (`D-T17`, measured 6 px difference) | 🟠 |
 | B4 | **Colour emoji** | `swash` is weak on CBDT/sbix bitmap colour fonts; CoreText (macOS) and DirectWrite (Windows) both support them out of the box | 🟠 |
 | B5 | **Installed fonts ≠ enumerable fonts** | the web injection contract must be redone (§7.4); on native the platform fallback chain must be rebuilt | 🟠 |
 | B6 | **Losing the glyph cache / performance** | `SkGlyphCache` and Skia's glyph atlas are free today; the Rust side must build its own (`swash` has `scale::Scaler`, but the cache is ours to manage) | 🟡 |
 | B7 | **`skia.md` §6.9's patch benefit disappears** | the face-swap problem that patch fixes reappears in a different form on the Rust side (same family, same PostScript name) | 🟡 |
 | B8 | **Toolchain into CI** | there is currently **no Rust toolchain on this machine** (`rustc`/`cargo`/`rustup` all `command not found`); CI would need cross-compilation for 5–6 targets | 🟡 |
-| B9 | **Licence review** | Skia=BSD-3, ICU=Unicode License; the Rust side's `cosmic-text`/`swash`/`fontdb`/`rustybuzz`/`ttf-parser` licences must be reviewed item by item before deciding (**not reviewed in this document**; must be checked before landing) | 🟡 |
+| B9 | **Licence review** | Skia=BSD-3, ICU=Unicode License; the Rust side's `cosmic-text`/`swash`/`fontdb`/`harfrust`/`skrifa`/`ttf-parser` licences must be reviewed item by item before deciding (**not reviewed in this document**; must be checked before landing) | 🟡 |
 | B10 | **Two backends is the largest option** | during tier 3 (A/B), two font stacks sit in the binary at once | 🟡 |
 | B11 | **The whole suite must be re-run** | 200+ examples + the two-sided `textfield` report + structural nails such as `[textwrap]` | 🟡 |
+
+> **2026-10-25 revision**: B1/B2 drop from 🔴 to 🟠 — acceptance is now "API surface aligned,
+> metrics ours" (§12). They no longer block an engine swap; they are the cost of "staying
+> value-by-value comparable with `adl`". `flash-text.md`'s D-T series accordingly moves from
+> **semantic contract** to **a snapshot of the current implementation**.
 
 ### 9.1 Evidence for B1/B2: what these conventions look like
 
@@ -744,6 +759,14 @@ skia_enable_skshaper = true
 
 ## 11. Trigger conditions and decision tree
 
+**Pre-branch (added 2026-10-25)**:
+
+```
+Do we need layout capability flash.text cannot give (markdown / rich text / custom wrapping)?
+├─ Yes ──► do the **upper layer** first (extend the runs + a parser); no engine swap: see §12.4
+└─ No  ──► then fall through to the size question below
+```
+
 ```
 Is size a hard constraint?
 ├─ No ──────────────────────────► Don't do L5. L0/L1/L2a already apply automatically.
@@ -767,13 +790,141 @@ Is size a hard constraint?
 3. L0/L1/L2a **are in effect on that target** (including the 0.80 MB ICU data set);
 4. it is still over budget, with measured data on record.
 
+> **A second, size-independent trigger**: if we ever need "identical text metrics on every
+> platform" (a server-side layout checker, a three-platform screenshot diff), then "delegate to
+> each system text API" becomes the obstacle (§13.1, conclusion 1) and cosmic-text gains a second
+> motive. It neither replaces nor weakens the size trigger, and it does not change this
+> document's "not on desktop" verdict.
+
 ---
 
-## 12. Appendices
+## 12. Acceptance policy: the API surface is aligned, the metrics are ours (2026-10-25 decision)
+
+> This section re-prices §9 and the decision tree in §11. The change is one sentence: **text
+> rendering no longer has to match `adl` value by value.** Only `flash.text`'s **API surface**
+> (shape, behaviour, errors, self-consistency) must line up; advance widths, break positions and how
+> `ascent`/`descent` round are decided by our own layout engine. The reason: AIR's text presentation
+> is badly dated (no markdown, no CSS layout), and treating it as a pixel oracle would make us
+> inherit an obsolete layout model forever — **AIR lags in its API surface, not in its layout core**
+> (§12.4).
+
+### 12.1 Three kinds of thing, three owners
+
+| Kind | Contents | Owner | How it is checked |
+|---|---|---|---|
+| **A. API surface (matched to AIR, literally)** | class/method/property shapes and defaults; constant values (`GraphicsPathCommand`, `TextFormatAlign`…); error ids and texts for invalid parameters (`#2008`/`#2004`/`#2007`…); state-machine trigger relations (`autoSize` only changes width when `wordWrap=false`, `htmlText` round-trip, `appendText` and the caret); `scrollV`/`maxScrollV` clamping; normalisation of `text` vs `htmlText` | AIR (`adl`) | exact assertions: `test/unit/` nails the texts and constants, examples nail the behaviour |
+| **B. Self-consistency (must hold; the numbers are ours)** | `numLines == getLineMetrics().length`; `Σ getLineMetrics(i).height == textHeight`; `getCharBoundaries(i)` inside `[0, textWidth]`; `getLineIndexAtPoint` inverse to the line boxes; the caret rect inside its line box; selection rects monotone by line; `textWidth` equals the widest line | us | structural assertions: relations only, never copied pixels |
+| **C. Absolute metrics (ours)** | per-glyph advances; break positions (so `numLines` may differ from AIR); whether line height includes the font's own line gap; ink bounds vs layout bounds; subpixel positioning and AA strength | us | report-only (§12.2 tier 2) |
+
+One line: **the shape follows AIR, the numbers follow us**, and the numbers must be self-consistent.
+
+### 12.2 Two-tier acceptance (tier 2 must be written down, or the difference is silent)
+
+| Tier | Contents | Gate? |
+|---|---|---|
+| **Tier 1 (gate)** | all of A + all of B | yes |
+| **Tier 2 (report)** | the same probes run on `adl` and on our build: line count, `textWidth`/`textHeight`, per-line `ascent`/`descent`, first/last points of `getCharBoundaries` | no — but **every layout change produces a table** that lands in `docs/` (`flash-text.md` §5's two-sided report format is reusable) |
+
+Why tier 2 cannot be skipped: class-C differences are **visible structure** to a program
+(`if (tf.numLines > 3)` is a real thing people write), not just "it looks different". Leaving them
+unwritten lets readers infer the wrong expectation from the older "matches AIR" narrative, which
+violates AGENTS §1.5 (state differences honestly, never silently).
+
+### 12.3 What this downgrades
+
+- **B1** (all of D-T1…D-T21 redone) and **B2** (line-box conversion re-derived) in §9 drop from 🔴
+  to 🟠: they are still the cost of "staying value-by-value comparable with `adl`", but they no
+  longer pin an engine swap shut.
+- `flash-text.md` §2's D-T series goes from **semantic contract** to **a snapshot of the current
+  implementation**: it records today's SkParagraph conventions; a new engine has to **explain** the
+  difference, not **reproduce** it.
+- **Not** downgraded: A and B above. They do not depend on any font and stay exactly assertable.
+
+### 12.4 This policy is **not** a reason to swap the engine
+
+A common inference is "AIR is behind (no markdown) ⇒ swap the layout engine". That step does not
+follow, because **markdown is an upper layer, not the core**:
+
+```c
+// src/runtime.ts:8831 — rich-text runs already carry per-run styling
+typedef struct { unsigned start; unsigned end; const char* family; double size;
+                 int bold; int italic; unsigned color; double leading; } sk_text_run;
+```
+
+`sk_textlayout_new_runs` hands those runs to `ParagraphBuilder`, so markdown's bold / italic /
+inline code (family+size) / headings / colour **all land inside the existing 13 functions**; what is
+missing is only `underline`, `strikethrough`, `background` and `link` on the run (a plain C struct
+we own — add fields) plus a markdown → run parser.
+
+In other words: the limit is **our own wrapper not growing upward**, not SkParagraph's capability.
+Behind it sit HarfBuzz and ICU; its shaping is not weaker than any candidate Rust stack.
+
+So an engine swap still buys exactly two things: **size** (~2.7 MB, the L5 row in §3) and **dropping
+the C++/ICU dependency**. The cost moves from "redo the calibration" to "write line breaking, caret,
+selection and hit-testing yourself" (if we adopt the glyph-level seam in §13.2). **Self-built code
+for 2.7 MB is the same bargain as before.**
+
+> If something like markdown is actually wanted, AGENTS §1.5 says it must arrive as a new
+> `asaot.ui.*` capability or an opt-in switch, and **must not rewrite any behaviour `flash.text`
+> already defines**.
+
+---
+
+## 13. Cross-check: GPUI's (Zed's) text stack — one backend per platform
+
+> Source studied: `asaotui/gpui-src/` in this workspace (Zed `5447804`, 2026-10-21, `gpui 0.2.2`).
+> Its only purpose here is to see how a **production framework that carries no AIR-alignment
+> obligation** slices a text stack. Everything below is a **code fact from source and `Cargo.lock`** —
+> Zed was not built or run on this machine, so "who it picked" is verifiable while "how good its
+> typography looks" is outside this section's claims.
+
+### 13.1 There is no single engine
+
+The seam is `pub trait PlatformTextSystem` (`crates/gpui/src/platform.rs:1503`), returning
+`LineLayout { width, ascent, descent, runs: [ShapedRun{font_id, glyphs:[ShapedGlyph{id, position,
+index, is_emoji}]}] }` (`crates/gpui/src/text_system/line_layout.rs:19`). Implementations live in six
+platform crates:
+
+| Platform | Shaping | Fonts | Rasterization |
+|---|---|---|---|
+| macOS / iOS (`gpui_apple/src/text_system.rs`) | **CoreText** `CTLine::new_with_attributed_string` (`:583`) | `font-kit` + CTFontCollection | **CoreGraphics** bitmap context + `CTFont::draw_glyphs` (`:444`), grayscale; RGBA for emoji |
+| Windows (`gpui_windows/src/direct_write.rs`) | **DirectWrite** `CreateTextFormat` → `CreateTextLayout` → `IDWriteTextRenderer::Draw` (`:524`–`:645`) | DirectWrite collection (plus an in-memory font loader) | `IDWriteGlyphRunAnalysis` → ClearType 3×1 / aliased textures; COLR/PNG/JPEG/SVG colour glyphs fetched separately |
+| Linux (`gpui_linux/src/linux/text_system.rs`, **one line in total**) | **cosmic-text** | fontdb | **swash** |
+| web / wasm (`gpui_web/src/text_system.rs`) | cosmic-text (with a Canvas2D fallback measurement layer) | bytes injected into fontdb | swash |
+
+`cosmic-text 0.19.0`'s real dependencies (`Cargo.lock`): shaping **`harfrust 0.5`** (rustybuzz's
+successor; `rustybuzz 0.20` is only pulled in by `usvg` there), rasterization **`swash 0.2.6`**
+(its kernel has moved to `skrifa` + `zeno` + `yazi`), metrics/outlines `skrifa 0.40`/`read-fonts`,
+enumeration `fontdb 0.23` (`ttf-parser 0.25`), breaking/segmentation `unicode-bidi`/
+`unicode-linebreak`/`unicode-script`/`unicode-segmentation`. `font-kit` is used in the cosmic arm
+only for "best match" (`cosmic_text_system.rs:1177`).
+
+**Conclusion 1**: GPUI uses the Rust stack only on the two arms where no authoritative system text
+API exists (Linux, browser); the two desktop arms delegate to the OS, exactly like us. That is a
+structural cross-check for the two "❌ don't do it" rows in §7.0.
+
+**Conclusion 2** (more important for us): GPUI **does not outsource line breaking** — UAX#14 lives in
+the framework (`crates/gpui/src/text_system/line_wrapper.rs`) and the backend shapes **one line**
+(`ShapeLine::new(…, Shaping::Advanced)` + `Wrap::None`, `cosmic_text_system.rs:748`). That is the
+opposite of us outsourcing breaking to SkParagraph, and it is where the self-built cost in §13.2
+comes from.
+
+### 13.2 What can be borrowed, what cannot
+
+| | Contents | Verdict |
+|---|---|---|
+| Borrowable | **Glyph-level seam**: the backend emits glyph ids + positions; rasterization is a separate function whose output lands in an atlas (`metal_atlas`/`directx_atlas`/`wgpu_atlas`) | Turns the two-backend A/B (§5 tier 3) into "share one `LineLayout`, swap the rasterizer". The price is writing line breaking, line boxes, caret and selection ourselves — the part we currently get for free |
+| Borrowable | **One backend per platform** | We already do this for font matching (§1.3). Delegating **shaping** per platform too would turn "calibrate once, agree everywhere" into "calibrate three times", which conflicts with §12.2's tier-2 report ⇒ **not adopted** |
+| Not borrowable | "It saves the calibration" | GPUI has no `adl` oracle: `ascent`/`descent` come straight from the platform (Windows reads `DWRITE_LINE_METRICS.baseline` and `height - baseline`, `:583`–`:591`); there is no `rhalf(ascent)+rhalf(descent)+leading` conversion of the B2 kind. Its cost sheet contains **no B1/B2**, so "GPUI uses cosmic-text" cannot discount our migration risk |
+| Reference | The magnitude of platform detail that must be reproduced | The macOS arm pins `TextRenderingMode::Grayscale` and dilates glyphs by foreground luminance (`glyph_dilation_for_color`, `:224`, whose comment says it replicates CoreGraphics' luminance-dependent thickening); Windows picks ClearType or grayscale from the system setting; cosmic is always Subpixel. Details of this kind are exactly what B1 is made of |
+
+---
+
+## 14. Appendices
 
 ### A. The 15 seam functions (complete current inventory)
 
-Declarations: `src/runtime.ts:8763–8789`; implementation: `vendor/skia_text_glue.cc` (linked only when
+Declarations: `src/runtime.ts:9068–9083`; implementation: `vendor/skia_text_glue.cc` (linked only when
 `ASC_HAVE_TEXT` is set).
 
 | # | Function | Signature essentials | Implementation |
@@ -794,7 +945,7 @@ Declarations: `src/runtime.ts:8763–8789`; implementation: `vendor/skia_text_gl
 | 14 | `sk_textlayout_rects_for_range` | range → rectangles (selection/underline) | same file |
 | 15 | `sk_textlayout_caret_rect` | caret rectangle | same file |
 
-> There is also the **`sk_text_run` struct** (`runtime.ts:8594–8596`), defined **unconditionally**
+> There is also the **`sk_text_run` struct** (`runtime.ts:8831`), defined **unconditionally**
 > (pure-C builds need it too); and the two **direct drawing** paths `sk_canvas_draw_text` /
 > `sk_canvas_draw_text_n` (`skia_text_glue.cc:291` / `:300`), which bypass SkParagraph and do
 > single-line work only.

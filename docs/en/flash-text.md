@@ -81,6 +81,15 @@ table below is the **pre-work inventory**, so we do not redo capabilities that a
 IDs `D-T*` cross-reference the report's `D*`. Where `adl` runs it right and we cannot ⇒ **legacy
 defect** (AGENTS §1.5).
 
+> **2026-10-25 acceptance revision**: the **functional** entries in this table (D-T1…D-T4 of family A:
+> text never baked, whole lines missing, per-byte masking, falling back to the wrong face) remain
+> **legacy defects** — `adl` has them, we do not, and that has nothing to do with font metrics. The
+> **metric-only** entries (`ceil(ink+4)` break threshold, `rhalf` line-height rounding and "never add
+> the line gap", the trailing-space convention for `textWidth`, the `sy/sx` conversion) are
+> downgraded to **a snapshot of the current implementation**: acceptance is now "API surface aligned
+> + self-consistency holds + differences from `adl` written down as a table" — see
+> [`rust-text-backend.md`](rust-text-backend.md) §12.
+
 ### A. SWC static text and `TextFormat` (the biggest mountain)
 
 | # | Symptom (adl vs us) | Root cause | Code location | Evidence |
