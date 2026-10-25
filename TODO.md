@@ -1482,7 +1482,7 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 `sk_measure_borders()` 把 SDL 的装饰量原样存进 `b_top/b_left/b_bottom/b_right`；而读它的六处
 （`bounds`、`NativeWindow.width/height`、`globalToScreen`、`SDL_SetWindowPosition/Size`、`startMove`、
 `minSize/maxSize`）全在**逻辑点**空间。150% 屏上把 22×56 物理像素从 614×436 点里减掉 ⇒ 客户区
-**592×380**，AIR 的算术是 **598×397**。分享窗口的 skin 固定 **600×400**，少掉的 20 点正好砍在底部按钮条上：
+**592×380**；按 `adl` 实测装饰量（左右 8、上 31）**推算**应为 **598×397**（2 点残差未在 `adl` 上逐项复核）。分享窗口的 skin 固定 **600×400**，少掉的 20 点正好砍在底部按钮条上：
 `y=363..391` 的下半截既不画也点不到，`refbtn`（`y=378..411`）33 点里只有 2 点在 stage 内。
 
 **三、实测（复现 + 验收）**

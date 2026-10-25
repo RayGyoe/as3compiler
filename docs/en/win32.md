@@ -1435,7 +1435,9 @@ verbatim into `b_top/b_left/b_bottom/b_right`, and that API answers in **physica
 while all six readers are in **logical points** (`bounds` is AIR's outer frame rect, `NativeWindow.width/`
 `height`, `globalToScreen`, `SDL_SetWindowPosition/Size`, `startMove`, `minSize/maxSize`). On a 150%
 panel the 22x56 **physical** frame was therefore subtracted from a 614x436 **point** frame, giving a
-**592x380** client where AIR's own arithmetic gives **598x397** -- 6x17 points of every window gone.
+**592x380** client; the decorations `adl` reported (8 either side, 31 top) **imply** **598x397** -- 6x17
+points of every window gone (the 2-point residual is not re-checked against `adl` item by item yet,
+see the end of this section).
 
 The share window's skin is a fixed **600x400**, so the missing 20 points landed exactly on the bottom
 button bar:
@@ -1460,7 +1462,9 @@ that the division exists and that nobody divides again).
 **Boundaries**: macOS takes the `NSWindow` frame/content rects (already in points) and returns before
 this code; at 100% scaling `bs == 1.0` skips it too. Decorations change with DPI when a window is
 moved to another display -- this section fixes the unit only, **not** the re-measurement on a
-cross-display move, which is still unmeasured.
+cross-display move, which is still unmeasured. Also, the post-fix stage is **600x399**, **2 points** more
+than the 598x397 implied by `adl`'s decorations (= a difference in how the two measure/round them);
+that residual is **not** aligned against `adl` item by item -- do not read it as a conclusion.
 
 ## 4. Runtime Form (D3D12 Direct, the Default)
 
