@@ -14775,11 +14775,12 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('return;');
     this.line('}');
-    // A file:// URL (File.url) is opened from the local filesystem: strip the
-    // scheme so fopen sees a plain path (e.g. "file://./assets/x.png" ->
-    // "./assets/x.png").
-    this.line('const char* path = url;');
-    this.line('if (strncmp(path, "file://", 7) == 0) path += 7;');
+    // A local URL (File.url) is opened through the one URL -> path mapping, so
+    // "app-storage:/x", "app:/x" and "file:///C:/x" all reach the same file. This
+    // used to strip only the "file://" prefix, which is how this loader and the
+    // image job drifted apart: one file was readable by name and unreadable by
+    // the URL the File handed out.
+    this.line('const char* path = as_local_path_from_url(url);');
     // The read runs on a worker thread (native) or inline (web/WASI), but either
     // way the payload is staged and published only by URLLoader__finish at a
     // frame boundary, so several load() calls issued in one frame overlap.
@@ -14916,11 +14917,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return;');
     this.indent--;
     this.line('}');
-    // A file:// URL (File.url) is opened from the filesystem: strip the scheme so
-    // fopen sees a plain path. Any other scheme is a local read too, which is what
-    // adl does for a relative path.
-    this.line('const char* path = url;');
-    this.line('if (strncmp(path, "file://", 7) == 0) path += 7;');
+    // Same URL -> path mapping as Loader/URLLoader (app-storage:, app:,
+    // file:///C:/...); a bare path passes through, which is what adl does for a
+    // relative one.
+    this.line('const char* path = as_local_path_from_url(url);');
     this.line('void* j = as_async_submit(AS_JOB_READ_BYTES, (void*)o, Sound__finish, path, NULL, 1);');
     this.line('if (j != NULL) as_job_set_net_events(j);');
     this.indent--;
@@ -15904,12 +15904,27 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('#endif');
     this.indent--;
     this.line('}');
+    this.line('static char* as_path_norm(const char* p) {');
+    this.line('#ifdef _WIN32');
+    this.indent++;
+    this.line('if (p == NULL) return NULL;');
+    this.line('int n = (int)strlen(p);');
+    this.line('char* r = as_str_alloc((size_t)n + 1);');
+    this.line('for (int i = 0; i < n; i++) r[i] = (p[i] == \'/\') ? \'\\\\\' : p[i];');
+    this.line('r[n] = \'\\0\';');
+    this.line('return r;');
+    this.indent--;
+    this.line('#else');
+    this.indent++;
+    this.line('return (char*)p;');
+    this.indent--;
+    this.line('#endif');
+    this.line('}');
     this.line('static char* as_path_join(const char* a, const char* b) {');
     this.indent++;
     this.line('if (a == NULL || *a == \'\\0\') return (char*)(b ? b : "");');
     this.line('if (b == NULL || *b == \'\\0\') return (char*)a;');
-    this.line('char* tmp = as_str_concat(a, "/");');
-    this.line('return as_str_concat(tmp, b);');
+    this.line('return as_path_norm(as_str_concat(as_str_concat(a, "/"), b));');
     this.indent--;
     this.line('}');
     // AIR File static directory shortcuts, resolved from the process environment.
@@ -16108,15 +16123,119 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('');
-    // File: a filesystem path bundle. url is "file://" + nativePath.
+    this.line('// ---- URL <-> native path: ONE mapping for every local read -------------');
+    this.line('//');
+    this.line('// AIR\'s File.url is a URL, not a path, and four entry points hand that string');
+    this.line('// straight back to the filesystem: Loader.load, URLLoader.load, Sound.load and');
+    this.line('// the File constructor. The shapes are measured on AIR SDK 51.4.1');
+    this.line('// (temp/urlprobe/, adl side):');
+    this.line('//');
+    this.line('//   applicationStorageDirectory -> "app-storage:/urlprobe/plain.png"');
+    this.line('//   applicationDirectory        -> "app:/x%20y.png"');
+    this.line('//   documentsDirectory          -> "file:///C:/Users/<u>/Documents/a%20b.txt"');
+    this.line('//');
+    this.line('// The path part is percent-encoded with encodeURIComponent\'s safe set, plus');
+    this.line('// exactly two extra characters: \'/\' (separators) and \':\' (the drive letter).');
+    this.line('// Measured per character: space %20, # %23, ? %3F, & %26, % %25, + %2B,');
+    this.line('// [ %5B, ] %5D, @ %40, $ %24, , %2C, ; %3B, = %3D, ^ %5E, { %7B, } %7D,');
+    this.line('// | %7C, < %3C, > %3E, quote %22, non-ASCII UTF-8 triplets; left alone:');
+    this.line('// letters, digits, - _ . ! ~ * \' ( ).');
+    this.line('//');
+    this.line('// Before this existed File_get_url said "file://" + nativePath, i.e.');
+    this.line('// "file://C:\\Users\\...\\Local Store\\x.png", and the image job fopen()\'d that');
+    this.line('// literal string. A file downloaded into the app storage directory and then');
+    this.line('// shown through File.url failed with #2035 "URL Not Found" while the very same');
+    this.line('// path loaded by name decoded fine. The TalkMED gift list is exactly that');
+    this.line('// pattern (JSON small_img -> DownLoader into the storage dir ->');
+    this.line('// cn.edoctor.controls.Image loads download.targetFile.url), so every gift icon');
+    this.line('// stayed a blank cell under its title text.');
+    this.line('static char* as_file_url_encode(const char* s) {');
+    this.indent++;
+    this.line('int n = (int)strlen(s);');
+    this.line('char* fwd = as_str_alloc((size_t)n + 1);');
+    this.line('for (int i = 0; i < n; i++) fwd[i] = (s[i] == \'\\\\\') ? \'/\' : s[i];');
+    this.line('fwd[n] = \'\\0\';');
+    this.line('return as_uri_encode(fwd, "-_.!~*\'()/:");');
+    this.indent--;
+    this.line('}');
+    this.line('// Is path inside root, with a separator (or the end) after it? Windows compares');
+    this.line('// case-insensitively, which is how the OS resolves the path.');
+    this.line('static int as_path_under(const char* path, const char* root) {');
+    this.indent++;
+    this.line('if (path == NULL || root == NULL || root[0] == \'\\0\') return 0;');
+    this.line('int n = (int)strlen(root);');
+    this.indent--;
+    this.line('#ifdef _WIN32');
+    this.indent++;
+    this.line('if (_strnicmp(path, root, (size_t)n) != 0) return 0;');
+    this.indent--;
+    this.line('#else');
+    this.indent++;
+    this.line('if (strncmp(path, root, (size_t)n) != 0) return 0;');
+    this.indent--;
+    this.line('#endif');
+    this.indent++;
+    this.line('return path[n] == \'\\0\' || path[n] == \'/\' || path[n] == \'\\\\\';');
+    this.indent--;
+    this.line('}');
+    this.line('// The inverse of the above, and the only place a URL becomes a path. A string');
+    this.line('// that names none of the three schemes is already a native path (absolute or');
+    this.line('// relative) and is returned as-is, which keeps every existing caller -- and the');
+    this.line('// documented deviation that allows a relative nativePath -- working.');
+    this.line('static char* as_local_path_from_url(const char* url) {');
+    this.indent++;
+    this.line('if (url == NULL) return NULL;');
+    this.line('const char* rest = NULL;');
+    this.line('char* root = NULL;');
+    this.line('if (strncmp(url, "app-storage:", 12) == 0) { root = as_app_storage_dir(); rest = url + 12; }');
+    this.line('else if (strncmp(url, "app:", 4) == 0) { root = as_app_dir(); rest = url + 4; }');
+    this.line('else if (strncmp(url, "file://", 7) == 0) { rest = url + 7; }');
+    this.line('else return (char*)url;');
+    this.line('char* tail = as_uri_decode(rest);');
+    this.line('if (root == NULL) {');
+    this.indent++;
+    this.line('// "file:///C:/x": that third slash belongs to the URL, not to the path.');
+    this.line('if (tail[0] == \'/\' && ((tail[1] >= \'A\' && tail[1] <= \'Z\') || (tail[1] >= \'a\' && tail[1] <= \'z\')) && tail[2] == \':\') return as_path_norm(tail + 1);');
+    this.line('return as_path_norm(tail);');
+    this.indent--;
+    this.line('}');
+    this.line('while (tail[0] == \'/\') tail++;');
+    this.line('return as_path_join(root, tail);');
+    this.indent--;
+    this.line('}');
+    // File: a filesystem path bundle. url is AIR's URL form (written above).
     this.line('void File_ctor(File* o, char* path) {');
     this.indent++;
     this.line('EventDispatcher_ctor((EventDispatcher*)o, NULL);');
+    // AIR's constructor takes a URL as well as a native path -- measured on 51.4.1:
+    // new File(file.url) round-trips "app-storage:/..." back to the same nativePath,
+    // and "file:///..." likewise. A bare path is stored verbatim, which is also
+    // where this build's documented deviation lives (AIR rejects a relative path
+    // with #2004, we keep it).
+    this.line('if (path != NULL && (strncmp(path, "file://", 7) == 0 || strncmp(path, "app-storage:", 12) == 0 || strncmp(path, "app:", 4) == 0)) path = as_local_path_from_url(path);');
     this.line('o->nativePath = path; gc_write_barrier((void*)path);');
     this.indent--;
     this.line('}');
     this.line('File* File_new(char* path) { File* o = (File*)gc_alloc(GCT_CLASS, sizeof(File)); o->vtable = &File_vt; File_ctor(o, path); return o; }');
-    this.line('char* File_get_url(void* _this) { File* o = (File*)_this; return (o->nativePath == NULL) ? (char*)"file://" : as_str_concat((char*)"file://", o->nativePath); }');
+    // The two app roots become their own schemes, everything else "file:///".
+    // as_app_storage_dir() is asked on every read rather than cached in a static:
+    // its result is a GC string and a plain C static is not a GC root, so a cached
+    // prefix could be collected out from under the next comparison.
+    this.line('char* File_get_url(void* _this) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('const char* path = o->nativePath;');
+    this.line('if (path == NULL) return (char*)"file://";');
+    this.line('char* store = as_app_storage_dir();');
+    this.line('if (as_path_under(path, store)) { const char* rel = path + strlen(store); while (rel[0] == \'/\' || rel[0] == \'\\\\\') rel++; return as_str_concat((char*)"app-storage:/", as_file_url_encode(rel)); }');
+    this.line('char* appdir = as_app_dir();');
+    this.line('if (as_path_under(path, appdir)) { const char* rel = path + strlen(appdir); while (rel[0] == \'/\' || rel[0] == \'\\\\\') rel++; return as_str_concat((char*)"app:/", as_file_url_encode(rel)); }');
+    this.line('if (path[0] == \'/\') return as_str_concat((char*)"file://", as_file_url_encode(path));');
+    this.line('if (((path[0] >= \'A\' && path[0] <= \'Z\') || (path[0] >= \'a\' && path[0] <= \'z\')) && path[1] == \':\') return as_str_concat((char*)"file:///", as_file_url_encode(path));');
+    this.line('return as_str_concat((char*)"file://", as_file_url_encode(path));');
+    this.indent--;
+    this.line('}');
+    this.line();
     this.line('bool File_get_exists(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_exists(o->nativePath); }');
     this.line('bool File_get_isDirectory(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_is_dir(o->nativePath); }');
     // isSymbolicLink: about the link, not its target (AIR 1.0). A path that does not

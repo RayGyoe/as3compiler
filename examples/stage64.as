@@ -46,7 +46,8 @@ inp.close();
 
 // --- File: resolvePath + directory create/delete ---
 var child:File = f.resolvePath("subdir");
-check(child.nativePath == "temp/stage64_test.txt/subdir", "resolvePath joins with /");
+check(child.nativePath == ["temp", "stage64_test.txt", "subdir"].join(File.separator),
+      "resolvePath joins with the host separator");
 var d:File = new File("temp/stage64_dir");
 d.createDirectory();
 check(d.exists && d.isDirectory, "createDirectory makes a directory");

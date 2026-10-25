@@ -289,3 +289,94 @@ cd temp/trashprobe && cc -O1 -Wall -Wextra -o trash_impl trash_impl.c && HOME=/t
 `examples/file-listing-async.as`（运行时，由 `test/examples.ts` 的 `EXAMPLE_ENV` 把 `HOME` 分别指到
 `temp/trash-home`、`temp/sym-home`、`temp/listing-home`，避免污染开发机的废纸篓；软链与目录列举
 两套夹具都由该文件用 `node:fs` 现造，其中 `noread/` 的 `chmod 000` 在套件收尾时改回）。
+---
+
+## 11. `File.url` 是 URL，不是路径（阶段二百八十四）
+
+> 真值来源：`adl 51.4.1`（Windows 10 26200）双端探针 `temp/urlprobe/`。同一份
+> `UrlProbeTop.as` 由 `mxmlc`+`adl` 与我们的 AOT 各跑一遍，日志写文件（`adl` 的 stdout
+> 不可用）；AIR 侧结果落在 `%APPDATA%/probe.url/Local Store/urlprobe-result.txt`，AOT 侧落在
+> 包内同名文件。**下表每一行都是实测值**，不是从参考文档转述的。
+
+### 11.1 实测形状
+
+| 表达式 | `adl 51.4.1` | 我方（修复后） |
+|---|---|---|
+| `File.applicationStorageDirectory.url` | `app-storage:/` | 同 |
+| `File.applicationDirectory.url` | `app:/` | 同 |
+| `<storage>/urlprobe/plain.png` 的 `.url` | `app-storage:/urlprobe/plain.png` | 同 |
+| `<storage>/a b/中文 name.png` 的 `.url` | `app-storage:/a%20b/%E4%B8%AD%E6%96%87%20name.png` | 同 |
+| `File.documentsDirectory.url` | `file:///C:/Users/<u>/Documents` | 同 |
+| `new File(<上面那个 url>).nativePath` | 原生路径（反斜杠） | 同 |
+| `Loader.load(<那个 url>)` | `COMPLETE`，`content` 是 `Bitmap` | 同 |
+| `new File("relative.txt")` | 抛 `Error #2004` | **保留字符串**（见 §11.5 偏差） |
+
+**编码规则**（逐字符实测）：路径部分用 `encodeURIComponent` 的安全集，另加两个字符——
+`/`（分隔符，保留）与 `:`（盘符，保留）。实测被编码：空格 `%20`、`#` `?` `&` `%` `+`
+`[` `]` `@` `$` `,` `;` `=` `^` `{` `}` `|` `<` `>` `"`，以及每个非 ASCII 字节的
+UTF-8 三元组；实测**不**编码：字母、数字、`- _ . ! ~ * ' ( )`。
+
+**nativePath 的拼写**：AIR 用宿主 OS 自己的形态——Windows 全反斜杠。我们的 `as_path_join`
+过去无条件用 `/`，于是绝对路径成了混排（`C:\Users\u\AppData\Roaming/as3aot/Local Store`），
+也让「url → `new File(url).nativePath`」与原始路径不相等。现在 `as_path_join` 统一过
+`as_path_norm()`（Windows 把 `/` 换 `\`，其余平台原样返回），一处收口，顺带把
+`FindFirstFile` 之前需要就地换分隔符的补丁变成多余。
+
+### 11.2 修复前的形状，就是那个 bug
+
+`File_get_url` 曾返回 `"file://" + nativePath`，即
+`file://C:\Users\rayle\AppData\Roaming/cn.edoctor.windows.meeting.talkmed/Local Store/assets/cache//<hash>/x.png`
+（反斜杠、未编码、还带 `//`）。这个字符串随后被**当作字面路径** `fopen`：
+
+- `Loader.load(那个 url)` → `IOError #2035 URL Not Found`（文件确实存在）；
+- 同一个文件按 `nativePath` 加载却能走到解码器（纯 C 构建报 `#2124`，Skia 构建出图）。
+
+于是「下载进 `applicationStorageDirectory`，再按 `File.url` 显示」这一族用法全线空白。
+真机上就是 **TalkMED 的礼物列表**：JSON 里的 `small_img` 由 `DownLoader` 下到存储目录，
+`cn.edoctor.controls.Image` 里 `loader.load(download.targetFile['url'])` —— 每个礼物图标都只剩
+标题文字。
+
+修法不是「在 Loader 里再 strip 一次 scheme」，而是**把映射收成唯一一处**：
+
+| 位置 | 之前 | 现在 |
+|---|---|---|
+| `File_get_url` | `"file://" + nativePath` | 两个 app 根各自成 scheme（`app-storage:`/`app:`），其余 `file:///` + 百分号编码 |
+| `File_ctor` | 原样存储 | 认 URL：`file://`/`app-storage:`/`app:` 先解码回原生路径 |
+| `URLLoader_load`（`Loader.load` 共用） | `if (strncmp(path,"file://",7)==0) path += 7;` | `as_local_path_from_url(url)` |
+| `Sound_load` | 同上 | 同上 |
+| 图像 job（`as_async_submit_image`） | 原样当路径 `fopen` | 远端（http/https）走传输，其余先 `as_local_path_from_url` |
+
+`as_local_path_from_url()` 是唯一的 scheme→路径转换点：`app-storage:/x`、`app:/x` 各拼回
+对应根，`file:///C:/x` 的第 3 个斜杠属于 URL 不属于路径，其余字符串（绝对或相对原生路径）
+原样透传。它定义在 `File` 一侧（需要两个根），`runtime.ts` 里的图像 job 通过前置声明使用它。
+
+### 11.3 为什么不缓存根路径
+
+`as_app_storage_dir()` 每次读都重新问，不缓存进 `static`：它返回的是 **GC 字符串**，而普通 C
+静态变量不是 GC 根 —— 缓存下来的前缀可能被回收器释放，下一次比较就是悬空读。
+
+### 11.4 复现
+
+```sh
+# adl 侧（结果写 %APPDATA%/probe.url/Local Store/urlprobe-result.txt）
+node temp/urlprobe/run-air.cjs
+
+# AOT 侧（Skia 清单，才能真正解码出 Bitmap；纯 C 构建只会到 #2124）
+PATH="$PWD/temp/ccbin:$PATH" node src/index.ts temp/urlprobe/UrlProbeTop.as \
+  -o temp/urlprobe/UrlProbeSkia.exe --manifest temp/urlprobe/win.build.json
+temp/urlprobe/UrlProbeSkia.exe
+```
+
+两侧三行 `load(...)` 都必须是 `COMPLETE content=[object Bitmap] w=8`。
+
+**回归钉**：`examples/file-url.as`（形状、编码、往返、把 URL 当句柄真读一个文件、以及 §11.5
+的偏差）；`unit: file-url/mapping` + `unit: file-url/preamble`（16 条源级结构钉，其中
+「不再有 `path += 7`」是防漂移的那一条）。
+
+### 11.5 唯一保留的偏差：相对路径
+
+AIR 在构造器里就拒绝相对路径（`#2004`）。我们保留字符串（`stage64.as` 自阶段六十四起就钉着
+`new File("temp/x.txt").nativePath == "temp/x.txt"`），因此这种 File 的 `url` 是
+`file://` + 路径。AIR 造不出这个对象，所以这不是「我们对 AIR 已有行为的改写」，而是**AIR
+没有对应物**的那一类；它同时是 `examples/file-url.as` 的一条显式断言，不是为了好看。
+

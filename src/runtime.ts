@@ -11995,8 +11995,17 @@ static void* as_async_submit_http(void* obj, void (*finish)(void*), const char* 
 // that guesses. Redirects are followed and the process-wide cookie jar applies,
 // both matching what AIR's Loader does (an image URL that 301s is normal, and the
 // image request belongs to the same session as the app's other requests).
+// Defined with File (emit.ts) because it needs the app and storage roots.
+static char* as_local_path_from_url(const char* url);
+
 static void* as_async_submit_image(void* obj, void (*finish)(void*), const char* url) {
-    if (!as_job_is_remote_url(url)) return as_async_submit(AS_JOB_IMAGE, obj, finish, url, NULL, 0);
+    // A local image load is a URL, not a path: AIR hands File.url straight to
+    // Loader.load and that string is "app-storage:/x", "app:/x" or
+    // "file:///C:/x" (measured on 51.4.1). Reading it as a literal path found
+    // nothing, so a file that had already downloaded into the app storage
+    // directory reported #2035 "URL Not Found" -- the TalkMED gift icons, whose
+    // bitmap never arrived and left the list as bare titles.
+    if (!as_job_is_remote_url(url)) return as_async_submit(AS_JOB_IMAGE, obj, finish, as_local_path_from_url(url), NULL, 0);
     as_job* j = as_job_alloc(AS_JOB_IMAGE_URL, obj, finish);
     if (j == NULL) return NULL;  // out of memory: nothing was started, no event fires
     j->path = as_job_strdup(url);

@@ -31,6 +31,7 @@ import './unit/emit.ts';
 import './unit/logical.ts';
 import './unit/inline.ts';
 import './unit/embed.ts';
+import './unit/file-url.ts';
 import './unit/audio-example.ts';
 import './unit/reach.ts';
 import './unit/doctor.ts';

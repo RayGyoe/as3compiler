@@ -338,3 +338,108 @@ Pins: `unit: emit/FileMoveToTrash` (17 source-level checks);
 `temp/sym-home` and `temp/listing-home` respectively so the suite never fills the developer's
 trash — both fixture trees are built with `node:fs` by that same file, and `listing-home`'s
 `noread/` directory has its `chmod 000` restored when the suite ends).
+---
+
+## 11. `File.url` is a URL, not a path (stage two hundred and eighty-four)
+
+> Source of truth: `adl 51.4.1` (Windows 10 26200), dual-side probe in `temp/urlprobe/`.
+> The same `UrlProbeTop.as` runs under `mxmlc`+`adl` and under our AOT; both write a log file
+> (`adl`'s stdout is unusable). The AIR side lands in
+> `%APPDATA%/probe.url/Local Store/urlprobe-result.txt`, ours in the same file inside the app
+> storage directory. **Every row below is measured**, not transcribed from the reference.
+
+### 11.1 The measured shapes
+
+| Expression | `adl 51.4.1` | Ours (after the fix) |
+|---|---|---|
+| `File.applicationStorageDirectory.url` | `app-storage:/` | same |
+| `File.applicationDirectory.url` | `app:/` | same |
+| `.url` of `<storage>/urlprobe/plain.png` | `app-storage:/urlprobe/plain.png` | same |
+| `.url` of `<storage>/a b/中文 name.png` | `app-storage:/a%20b/%E4%B8%AD%E6%96%87%20name.png` | same |
+| `File.documentsDirectory.url` | `file:///C:/Users/<u>/Documents` | same |
+| `new File(<that url>).nativePath` | the native path (backslashes) | same |
+| `Loader.load(<that url>)` | `COMPLETE`, `content` is a `Bitmap` | same |
+| `new File("relative.txt")` | throws `Error #2004` | **keeps the string** (§11.5) |
+
+**Encoding rule** (measured per character): the path part uses `encodeURIComponent`'s safe set
+plus exactly two characters — `/` (separators, kept) and `:` (the drive letter, kept). Measured
+as encoded: space `%20`, `#` `?` `&` `%` `+` `[` `]` `@` `$` `,` `;` `=` `^` `{` `}`
+`|` `<` `>` `"`, and the UTF-8 triplet of every non-ASCII byte. Measured as left alone:
+letters, digits, `- _ . ! ~ * ' ( )`.
+
+**The spelling of nativePath**: AIR uses the host OS's own form — all backslashes on Windows.
+`as_path_join` used to emit `/` unconditionally, so an absolute path came out mixed
+(`C:\Users\u\AppData\Roaming/as3aot/Local Store`) and "url → `new File(url).nativePath`" did
+not equal the path it came from. It now goes through `as_path_norm()` (Windows turns `/` into
+`\`; every other platform returns the string untouched) — one choke point, which also makes
+the old in-place separator swap the `FindFirstFile` branch needed redundant.
+
+### 11.2 The pre-fix shape was the bug
+
+`File_get_url` returned `"file://" + nativePath`, i.e.
+
+```
+file://C:\Users\rayle\AppData\Roaming/cn.edoctor.windows.meeting.talkmed/Local Store/assets/cache//<hash>/x.png
+```
+
+(backslashes, no encoding, and a doubled `//`), and that string was then `fopen`'d **as a literal
+path**:
+
+- `Loader.load(that url)` → `IOError #2035 URL Not Found` even though the file existed;
+- the same file loaded by `nativePath` reached the decoder (a pure-C build reports `#2124`, a
+  Skia build produces the bitmap).
+
+So the whole family of "download into `applicationStorageDirectory`, then display by
+`File.url`" usages came out blank. On the real machine that is **TalkMED's gift list**: the JSON's
+`small_img` is downloaded by `DownLoader` into the storage directory and
+`cn.edoctor.controls.Image` calls `loader.load(download.targetFile['url'])` — every gift icon was
+left as bare title text.
+
+The fix is not "strip the scheme once more, in the Loader" but **one mapping, in one place**:
+
+| Site | Before | Now |
+|---|---|---|
+| `File_get_url` | `"file://" + nativePath` | the two app roots become their own schemes (`app-storage:` / `app:`), everything else `file:///` + percent-encoded path |
+| `File_ctor` | stored verbatim | accepts a URL: `file://` / `app-storage:` / `app:` are decoded back to a native path |
+| `URLLoader_load` (shared with `Loader.load`) | `if (strncmp(path,"file://",7)==0) path += 7;` | `as_local_path_from_url(url)` |
+| `Sound_load` | same | same |
+| the image job (`as_async_submit_image`) | `fopen`'d the string as a path | http/https stays on the transport, everything else goes through `as_local_path_from_url` first |
+
+`as_local_path_from_url()` is the single scheme→path conversion: `app-storage:/x` and `app:/x`
+are joined back onto their root, the third slash of `file:///C:/x` belongs to the URL rather than
+the path, and any other string (an absolute or relative native path) passes through unchanged. It
+is defined on the `File` side (it needs both roots); the image job in `runtime.ts` uses it through
+a forward declaration.
+
+### 11.3 Why the roots are not cached
+
+`as_app_storage_dir()` is asked again on every read instead of being cached in a `static`: it
+returns a **GC string**, and a plain C static is not a GC root — a cached prefix could be freed by
+the collector, leaving the next comparison reading dangling memory.
+
+### 11.4 Reproduce
+
+```sh
+# adl side (the result lands in %APPDATA%/probe.url/Local Store/urlprobe-result.txt)
+node temp/urlprobe/run-air.cjs
+
+# AOT side (the Skia manifest, otherwise there is no decoder and it stops at #2124)
+PATH="$PWD/temp/ccbin:$PATH" node src/index.ts temp/urlprobe/UrlProbeTop.as \
+  -o temp/urlprobe/UrlProbeSkia.exe --manifest temp/urlprobe/win.build.json
+temp/urlprobe/UrlProbeSkia.exe
+```
+
+Both sides must print `COMPLETE content=[object Bitmap] w=8` for all three `load(...)` lines.
+
+**Pins**: `examples/file-url.as` (the shapes, the encoding, the round-trip, reading a real file
+through the URL, and the deviation in §11.5); `unit: file-url/mapping` + `unit: file-url/preamble`
+(16 source-level checks, of which "no `path += 7` survives" is the anti-drift one).
+
+### 11.5 The one remaining deviation: a relative path
+
+AIR rejects a relative path in the constructor (`#2004`). We keep the string (`stage64.as` has
+pinned `new File("temp/x.txt").nativePath == "temp/x.txt"` since stage sixty-four), so such a
+`File`'s `url` is `file://` + the path. AIR cannot construct that object at all, so this is the
+"AIR has no counterpart" kind rather than a rewrite of defined AIR behaviour; it is asserted
+explicitly in `examples/file-url.as` so it stays a decision rather than an accident.
+
