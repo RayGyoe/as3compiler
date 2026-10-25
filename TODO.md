@@ -1470,7 +1470,40 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 - [ ] **Window**/**NativeWindow**（对应 `window_glue.cc` 的多窗口/原生窗口管理，**2026-10-02 已实现**——多窗口运行时注册表、每窗独立 `Stage` 与 `Event.CLOSE` 见 **阶段八十九·七十一**，其关闭窗口崩溃的布局缺陷见 **阶段八十九·七十二**；`Window`（`flash.desktop` 的包装）仍延后）
 - [x] **File**/**FileStream**（`open`/`openAsync`（异步 PROGRESS+COMPLETE）/`read`/`write`，POSIX 文件 IO；静态目录 `applicationDirectory`/`desktopDirectory`/`documentsDirectory`/`userDirectory`）/ **FileMode**（常量）
-- [ ] **SQLConnection**/**SQLStatement**（依赖 SQLite 链接，延后）—— **2026-10-12 选型已定**：引擎链接**官方 SQLite amalgamation**（实测锁定：AIR 的**明文**库就是标准 SQLite 文件、加密库是私有格式），**加密不做**（传密钥时**响亮报明**，绝不静默写明文）。分阶段路线与全部双端实测证据见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md)。**前置**：先修「**`Class` 值的静态 getter 分派缺失**」（否则目标应用的 SQLite 分支**永不进入** + 可达 `#1009`），见 `TODO.md` 的 `### 遗留待开发`
+- [ ] **SQLConnection**/**SQLStatement**（依赖 SQLite 链接，延后）—— **2026-10-12 选型已定**：引擎链接**官方 SQLite amalgamation**（实测锁定：AIR 的**明文**库就是标准 SQLite 文件、加密库是私有格式），**加密不做**（传密钥时**响亮报明**，绝不静默写明文）。分阶段路线与全部双端实测证据见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md)。**前置**：先修「**`Class` 值的静态 getter 分派缺失**」（否则目标应用的 SQLite 分支**永不进入** + 可达 `#1009`），见 `TODO.md` 的 `### 阶段二百八十六：窗口装饰量是**物理像素**、`bounds` 是**逻辑点** —— 150% 屏上每个窗口少 6×17 点（v0.4.248 → v0.4.249）✅ 已完成
+
+**一、现象**
+
+用户截图（分享屏幕窗口）：底部那一排（刷新 / 采集系统声音开关 / 开始共享）被**横切一刀**，切线以下全黑，
+问「这下面的按钮每一个都不能用是什么问题」。
+
+**二、根因（`SDL_GetWindowBordersSize` 回答物理像素，六个读者都在逻辑点）**
+
+`sk_measure_borders()` 把 SDL 的装饰量原样存进 `b_top/b_left/b_bottom/b_right`；而读它的六处
+（`bounds`、`NativeWindow.width/height`、`globalToScreen`、`SDL_SetWindowPosition/Size`、`startMove`、
+`minSize/maxSize`）全在**逻辑点**空间。150% 屏上把 22×56 物理像素从 614×436 点里减掉 ⇒ 客户区
+**592×380**，AIR 的算术是 **598×397**。分享窗口的 skin 固定 **600×400**，少掉的 20 点正好砍在底部按钮条上：
+`y=363..391` 的下半截既不画也点不到，`refbtn`（`y=378..411`）33 点里只有 2 点在 stage 内。
+
+**三、实测（复现 + 验收）**
+
+`temp/shwin/Metrics.as` 用应用的原样数字（`600+14 × 400+36`、`NO_SCALE`、`TOP_LEFT`、不可 resize/max/min）
+开副窗口、装**真** `skin.swc` 的 `desktopshareskin`：修前 stage **592×380**（PrintWindow 截图与用户截图一样被横切），
+修后 stage **600×399**、整条完整；真鼠标点击 `(38,394)`→`refbtn`、`(532,377)`→`startsharebtn`、
+`(191,379)`→`is_system_audio`（帧 1→2）全部命中。`ASC_MOUSE_TRACE=1` 同时给出
+`lw=600 lh=399 sw=600 sh=399 scale=1.5000 cx=1.0 cy=1.0` —— 点→逻辑映射是恒等的。
+
+**四、修法**
+
+`sk_measure_borders()` 在写入 `b_*` 之前归一一次：`b / sk_window_backing_scale(win)`（1.5 → 15 / 37）。
+刻意不做「每个读者各换一次」——六个消费点里只要有一处写成另一种单位就重新漂。单测 `unit: platform`
+两条钉住（归一存在、别处不再除）。macOS 走 `NSWindow` 的 frame/content 矩形（本来就在点空间，提前 return），
+100% 缩放下 `bs == 1.0` 也不经过。
+
+**未测**：跨显示器拖动后装饰量随 DPI 变，本节只统一了单位，**没有**处理「拖到另一块屏之后重新取装饰」；
+真机复测（分享窗口整条是否恢复、其它窗口底部控件）待用户跑一次。
+
+### 遗留待开发`
 
 **验收**：`examples/stage64.as`（离屏）断言 `File` 路径束与 `exists`/`isDirectory`/`resolvePath`/`createDirectory`/`deleteFile`/`deleteDirectory` + 静态目录、
 `FileStream` `open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` 读写回环与只读 `position`/`bytesAvailable`、`FileMode` 常量。✅（73 passed / 0 failed；

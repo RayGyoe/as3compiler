@@ -1403,6 +1403,39 @@ owner 那个类上 → `stage + MyTip` 是否紧跟着出现。三者缺哪一�
 
 **未验证**：本节只新增诊断，没有改动任何行为；上述三问的真机答案要等一份带 trace 的运行日志。
 
+### 3.22 窗口装饰量是**物理像素**、`bounds` 是**逻辑点**：150% 屏上每个窗口少 6×17 点（阶段二百八十六）
+
+现象（真机截图）：分享屏幕窗口底部那一排（刷新 / 采集系统声音开关 / 开始共享）被**横切一刀**，
+切线以下是黑的，用户报「这下面的按钮每一个都不能用」。
+
+**根因**：`vendor/window_glue.cc` 的 `sk_measure_borders()` 把 `SDL_GetWindowBordersSize()` 的结果
+**原样**存进 `b_top/b_left/b_bottom/b_right`，而该 API 在 Windows 上回答的是**物理像素**；读它的六处
+全是**逻辑点**（`bounds` 是 AIR 的外框矩形、`NativeWindow.width/height`、`globalToScreen`、
+`SDL_SetWindowPosition/Size`、`startMove`、`minSize/maxSize`）。150% 屏上于是把 22×56 **物理**像素
+当成点从一个 614×436 **点**的外框里减掉，客户区成了 **592×380**，而 AIR 自己的算术是 **598×397** ——
+每个窗口凭空少 6×17 点。
+
+分享窗口的 skin 是固定 **600×400**，所以少掉的那 20 点直接砍在底部按钮条上：
+
+| | stage | 底部条 `y=363..391` | `refbtn` `y=378..411` |
+|---|---|---|---|
+| 修前 | 592×380 | 380 以下 11 点既不画也点不到 | 33 点里只有 **2 点** 在 stage 内 |
+| 修后 | **600×399** | 整条在 stage 内 | 21 点可点 |
+
+**复现与验收**（`temp/shwin/Metrics.as` + `measure.ps1`）：用应用的原样数字（`600+14 × 400+36`、
+`NO_SCALE`、`TOP_LEFT`、`systemChrome=STANDARD`、不可 resize/max/min）开副窗口，装**真**
+`skin.swc` 的 `desktopshareskin`，`PrintWindow` 截图与真鼠标（`SetCursorPos` + `mouse_event`）点击：
+修前那条被横切（与用户截图一致），修后整条完整，且 `(38,394)`→`refbtn`、`(532,377)`→
+`startsharebtn`、`(191,379)`→`is_system_audio`（帧 1→2）全部命中。
+
+**修法**：在 `b_*` 被写入之前**归一一次** —— `b / sk_window_backing_scale(win)`（1.5 → 22/1.5=15、
+56/1.5=37）。刻意不在读取端逐个换算：六个消费点里只要有一处写成另一种单位就会重新漂，
+而「只在一处归一」是可断言的（`unit: platform` 两条：归一存在、别处不再除）。
+
+**边界**：macOS 走的是 `NSWindow` frame/content 矩形（本来就在点空间），`#if __APPLE__` 分支提前
+`return`，不经过这段；100% 缩放下 `bs == 1.0` 也不经过。跨显示器时装饰量会随 DPI 变，本节只修了
+单位，**没有**处理「窗口被拖到另一块 DPI 的屏之后重新量装饰」——那条仍未取证。
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +

@@ -2705,6 +2705,19 @@ function checkInitialWindowStyle(): string[] {
     /SDL_SetWindowPosition\(c->win, c->sys_x \+ dx \+ c->b_left, c->sys_y \+ dy \+ c->b_top\);/.test(glueWin)
     && /SDL_SetWindowPosition\(c->win, x \+ c->b_left, y \+ c->b_top\);/.test(glueWin)
     && /SDL_GetWindowPosition\(c->win, &px, &py\);[\s\S]{0,700}if \(x\) \*x = px - c->b_left;/.test(glueWin));
+  // UNIT OF THE BORDER MEASUREMENT (阶段二百八十六). SDL_GetWindowBordersSize answers
+  // in PHYSICAL pixels while bounds/NativeWindow.width/globalToScreen/SDL's own
+  // sizing calls are all LOGICAL points, so on a 150% display the old code took 22x56
+  // px off a 614x436 DIP frame: 592x380 of client instead of AIR's 598x397, and the
+  // share window's fixed 600x400 skin was cut through its bottom button bar
+  // (measured: temp/shwin/metrics.log). The pin is that the division happens ONCE,
+  // in sk_measure_borders, before the numbers are stored in b_* -- a per-consumer
+  // conversion is what would drift, because six call sites read them.
+  check('the measured frame borders are converted from physical pixels to logical points once',
+    /const double bs = sk_window_backing_scale\(c->win\);\n    if \(bs > 0\.0 && bs != 1\.0\) \{\n      t = \(int\)\(\(double\)t \/ bs \+ 0\.5\);/.test(glueWin)
+    && /c->b_top = t; c->b_left = l; c->b_bottom = b; c->b_right = r;\n  \}\n\}/.test(glueWin));
+  check('...and no other site divides them again (the seam stays in points)',
+    !/b_left \/ bs|b_top \/ bs|b_left \/ scale|b_top \/ scale/.test(glueWin));
 
   // The generated C half: the AS3 table mirrors the same values so the getters answer
   // what the window was built with, and the AS3 seed is applied only to slot 0.

@@ -1424,6 +1424,44 @@ tip attach). `chain[n] … me=0` is the signature of an ancestor absorbing the h
 **Not verified**: this section adds diagnostics only, no behaviour change; the real-machine answer to
 the three questions needs a run with the trace on.
 
+### 3.22 Frame decorations are **physical pixels** while `bounds` is **logical points**: every window loses 6x17 points on a 150% display (stage 286)
+
+Symptom (real-machine screenshot): the bottom row of the screen-share window (refresh / capture-system-
+audio switch / start-sharing) was **sliced in half**, black below the cut, reported as "every one of
+these buttons does nothing".
+
+**Root cause**: `sk_measure_borders()` in `vendor/window_glue.cc` stored `SDL_GetWindowBordersSize()`
+verbatim into `b_top/b_left/b_bottom/b_right`, and that API answers in **physical pixels** on Windows,
+while all six readers are in **logical points** (`bounds` is AIR's outer frame rect, `NativeWindow.width/`
+`height`, `globalToScreen`, `SDL_SetWindowPosition/Size`, `startMove`, `minSize/maxSize`). On a 150%
+panel the 22x56 **physical** frame was therefore subtracted from a 614x436 **point** frame, giving a
+**592x380** client where AIR's own arithmetic gives **598x397** -- 6x17 points of every window gone.
+
+The share window's skin is a fixed **600x400**, so the missing 20 points landed exactly on the bottom
+button bar:
+
+| | stage | bar `y=363..391` | `refbtn` `y=378..411` |
+|---|---|---|---|
+| before | 592x380 | the 11 points below 380 neither painted nor clickable | only **2 of 33** points on stage |
+| after | **600x399** | the whole bar on stage | 21 points clickable |
+
+**Reproduction and acceptance** (`temp/shwin/Metrics.as` + `measure.ps1`): a secondary window built
+with the app's own numbers (`600+14 x 400+36`, `NO_SCALE`, `TOP_LEFT`, `systemChrome=STANDARD`, not
+resizable/maximizable/minimizable), carrying the **real** `desktopshareskin` from `skin.swc`; a
+`PrintWindow` capture plus real mouse clicks (`SetCursorPos` + `mouse_event`). Before the fix the bar
+is sliced exactly like the user's screenshot; after it the bar is whole and `(38,394)`->`refbtn`,
+`(532,377)`->`startsharebtn`, `(191,379)`->`is_system_audio` (frame 1->2) all hit.
+
+**Fix**: normalise **once**, before `b_*` is written -- `b / sk_window_backing_scale(win)` (1.5 ->
+22/1.5=15, 56/1.5=37). Deliberately not per-reader: one of the six call sites written in the other unit
+is enough to reintroduce the drift, while "one place converts" is assertable (`unit: platform` pins
+that the division exists and that nobody divides again).
+
+**Boundaries**: macOS takes the `NSWindow` frame/content rects (already in points) and returns before
+this code; at 100% scaling `bs == 1.0` skips it too. Decorations change with DPI when a window is
+moved to another display -- this section fixes the unit only, **not** the re-measurement on a
+cross-display move, which is still unmeasured.
+
 ## 4. Runtime Form (D3D12 Direct, the Default)
 
 > The WGL file (`vendor/gl_glue.cc`, §3.1.1) is **isomorphic** to this one: also “a process-level

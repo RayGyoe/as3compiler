@@ -803,6 +803,29 @@ static void sk_measure_borders(WinCtx* c, int decorated) {
   }
 #endif
   if (SDL_GetWindowBordersSize(c->win, &t, &l, &b, &r) == 0) {
+    // UNIT OF THE MEASUREMENT: SDL_GetWindowBordersSize answers in PHYSICAL pixels,
+    // while every consumer of b_* works in LOGICAL points --
+    //   sk_window_set_bounds / sk_window_get_bounds   bounds is AIR's frame rect in DIP
+    //   NativeWindow_globalToScreen                   screen coords are DIP
+    //   SDL_SetWindowPosition / SDL_SetWindowSize, startMove, min/max size   SDL is logical
+    // Mixing them costs the client area a slice of the frame on any display above
+    // 100%. Measured on this 150% panel (temp/shwin/metrics.log, plus adl for the
+    // same bounds): the frame is 22x56 PHYSICAL px, so subtracting it from a
+    // 614x436 DIP frame gave a 592x380 client where AIR's own arithmetic gives
+    // 598x397 -- 17 points of client height gone, and the share window's fixed
+    // 600x400 skin was cut at y=380, right through its bottom button bar (the bar
+    // is 363..391, so its lower 11 points and the whole refresh button at 378..411
+    // fell outside the stage: painted nowhere, and unreachable by the mouse).
+    // Normalising ONCE, here, is what keeps the other call sites honest: a
+    // per-consumer conversion would drift the moment one of them is written in the
+    // other unit, and there are six of them.
+    const double bs = sk_window_backing_scale(c->win);
+    if (bs > 0.0 && bs != 1.0) {
+      t = (int)((double)t / bs + 0.5);
+      l = (int)((double)l / bs + 0.5);
+      b = (int)((double)b / bs + 0.5);
+      r = (int)((double)r / bs + 0.5);
+    }
     c->b_top = t; c->b_left = l; c->b_bottom = b; c->b_right = r;
   }
 }
@@ -2672,8 +2695,10 @@ void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h) {
   if (h) *h = ch + c->b_top + c->b_bottom;
 }
 
-// Frame borders of a chrome-decorated window, in physical pixels: top, left,
-// bottom, right. The counterparts of the b_* fields sk_measure_borders fills in.
+// Frame borders of a chrome-decorated window, in LOGICAL points: top, left,
+// bottom, right. The counterparts of the b_* fields sk_measure_borders fills in
+// (which divides SDL's physical measurement by the window's backing scale, see the
+// comment there).
 // NativeWindow.globalToScreen is the caller that needs them -- AIR's bounds is
 // the OUTER frame rect while globalToScreen counts from the CLIENT area's
 // top-left, so the border has to be added back. Measured on adl 51.4.1: bounds
