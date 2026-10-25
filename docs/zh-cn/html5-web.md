@@ -59,7 +59,7 @@ as-aot examples/web/hello-web.as \
   --manifest examples/web/hello-web.build.json
 ```
 
-产物生成在 `examples/web/` 下：`hello-web.html` + `hello-web.js` + `hello-web.wasm`。
+> **Windows**：`EMSDK_HOME` 同样指向 emsdk 根目录，但那份 `emcc` 是 `#!/bin/sh` 脚本，Windows,> 上编译器选的是同目录的 `emcc.bat` 并经 `cmd.exe` 启动，`PATH` 用 `;` 拼，SDK 自带 python,> 与 `.emscripten` 时自动补 `EMSDK_PYTHON` / `EM_CONFIG`（阶段二百七十六）。设置变量的写法：,> `$env:EMSDK_HOME='C:\emsdk'`（PowerShell）或 `set EMSDK_HOME=C:\emsdk`（cmd）。,> `asaotui/ui-demo` 里那份 PE 转发器（`tools/emcc-launcher.c` + `.scratch/emcc-shim`）已不再需要。,,产物生成在 `examples/web/` 下：`hello-web.html` + `hello-web.js` + `hello-web.wasm`。
 浏览器不能 `file://` 直接加载 wasm，需经 HTTP 服务（`python3 -m http.server` 等），
 打开 `hello-web.html` 即可看到蓝色矩形 + `TextField` 文字。
 

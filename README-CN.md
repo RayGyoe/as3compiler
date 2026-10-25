@@ -70,7 +70,8 @@ ActionScript 源码 (.as)
 `--target wasm` 需 WASI SDK（`WASI_SDK_HOME` 指向 SDK 根，或自带 wasm32 后端的 LLVM clang），
 且运行产物需支持异常处理提案的运行时（wasmtime/wasmer，见 `docs/zh-cn/compile.md` §2）；
 `--target wasm --package web` 需 Emscripten SDK（`EMSDK_HOME` 指向 emsdk 根目录，见
-`docs/zh-cn/html5-web.md`）。
+`docs/zh-cn/html5-web.md`；**Windows 上用的是同目录的 `emcc.bat`**，经 `cmd.exe` 启动，`PATH` 用 `;` 拼——
+POSIX 那份 `emcc` 是 `#!/bin/sh` 脚本，Windows 起不来）。
 
 编不动时先跑 **`as-aot doctor`**：它把构建路径上所有「缺什么」的检查汇总成一份只读报告
 （`--air-app app.xml` 按该应用真实触碰的功能裁剪，`--json` 给机器读，`--fix` 只做秒级幂等修复，

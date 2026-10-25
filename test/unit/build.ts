@@ -6,17 +6,17 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readdirSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, existsSync, copyFileSync, rmSync, statSync, utimesSync } from 'node:fs';
-import { join, dirname, resolve, sep, basename } from 'node:path';
+import { join, dirname, resolve, sep, basename, delimiter } from 'node:path';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
 import type { GpuBackend } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
-import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS, readNorm } from '../harness.ts';
 import { generateXcodeProject } from '../../src/xcode-project.ts';
 import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, currentAnePlatform, parseExtensionXml, resolveAneDescriptors, resolveExtensionPackages } from '../../src/ane.ts';
 import type { AneResolution } from '../../src/ane.ts';
@@ -3403,7 +3403,118 @@ function checkIcuDataDeploy(): string[] {
   return bad;
 }
 
+// ---- web toolchain launch (阶段二百七十六, G27) ----
+// `--target wasm --package web` shells emcc out through src/build.ts, and three
+// platform facts decide whether that works at all. Each was wrong on Windows,
+// while macOS was unaffected -- which is exactly why none of the three was ever
+// noticed until someone built the gallery page there:
+//
+//   1. The SDK's POSIX entry point `upstream/emscripten/emcc` is a `#!/bin/sh`
+//      script. CreateProcess cannot start it. Measured on emsdk 3.1.44:
+//      spawnSync(emcc) => ENOENT, spawnSync(emcc.bat) => EINVAL,
+//      spawnSync(emcc.py) => EFTYPE, while `cmd /c emcc.bat --version` prints
+//      `emcc 3.1.44`. So Windows must select `emcc.bat` AND launch it through
+//      cmd.exe -- changing only the name is not enough.
+//   2. PATH must be joined with `path.delimiter`. A ':'-joined PATH is ONE
+//      unparsable entry on Windows (the drive colon splits it), so every emcc
+//      child ran with no usable PATH at all.
+//   3. The child environment must KEEP the inherited one. Handing over `{ PATH }`
+//      drops SystemRoot (cmd.exe will not start without it) and USERPROFILE
+//      (emcc's cache lives in ~/.emscripten_cache).
+//
+// 1 and 3 are behavioural here -- `process.platform` is overridden the same way
+// checkIcuDataDeploy below does, so the branch actually runs rather than being a
+// regex about it. What a pin cannot cover is the launch itself, so the parts that
+// only exist for Windows (the cmd.exe argv shape and the verbatim quoting) are
+// asserted on source text, and the real proof lives in the gate: a full
+// `--air-app ... --target wasm --package web` build on Windows with no shim.
+function checkWebToolchain(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [web-toolchain] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [web-toolchain] ${label}`); }
+  };
+  const src = readNorm(join(root, 'src', 'build.ts'));
+  const doctor = readNorm(join(root, 'src', 'checks.ts'));
+  const savedHome = process.env.EMSDK_HOME;
+  const savedEm = process.env.EMSDK;
+  let savedPy: string | undefined;
+  let savedCfg: string | undefined;
+  const realPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const asPlatform = function (p: NodeJS.Platform, fn: () => string | null): string | null {
+    Object.defineProperty(process, 'platform', { value: p, configurable: true });
+    try { return fn(); } finally { Object.defineProperty(process, 'platform', realPlatform as PropertyDescriptor); }
+  };
+  const slashed = (p: string): string => p.split('\\').join('/');
+
+  try {
+    // The path is built with the HOST's separator, so compare on the tail only.
+    process.env.EMSDK_HOME = join(root, 'temp', 'web-toolchain-fake-emsdk');
+    process.env.EMSDK = '';
+    check('Windows selects the SDK batch entry point',
+      slashed(asPlatform('win32', () => emccPath()) ?? '').endsWith('upstream/emscripten/emcc.bat'));
+    check('POSIX selects the sh wrapper',
+      slashed(asPlatform('darwin', () => emccPath()) ?? '').endsWith('upstream/emscripten/emcc'));
+
+    delete process.env.EMSDK_HOME;
+    check('with no SDK configured, Windows still looks for the batch entry point',
+      asPlatform('win32', () => emccPath()) === 'emcc.bat');
+    check('with no SDK configured, POSIX looks for "emcc"',
+      asPlatform('linux', () => emccPath()) === 'emcc');
+
+    // ---- the environment handed to every emcc child ----
+    process.env.EMSDK_HOME = join(root, 'temp', 'web-toolchain-fake-emsdk');
+    process.env.EMSDK = '';
+    const savedPy = process.env.EMSDK_PYTHON;
+    const savedCfg = process.env.EM_CONFIG;
+    delete process.env.EMSDK_PYTHON;
+    delete process.env.EM_CONFIG;
+    const env = webCompileStepsEnv();
+    check('a configured SDK yields an environment at all', env !== undefined);
+    if (env) {
+      check('PATH is joined with the platform delimiter (a ":"-joined PATH is one bad entry on Windows)',
+        env.PATH.split(delimiter).length >= 3);
+      check('exactly one PATH spelling, so the child block carries no duplicate',
+        Object.keys(env).filter((k) => /^path$/i.test(k)).length === 1);
+      const inherited = Object.keys(process.env).filter((k) => !/^path$/i.test(k) && process.env[k] !== undefined);
+      check('the inherited environment survives (cmd.exe needs SystemRoot, emcc its cache dir)',
+        inherited.length > 0 && inherited.every((k) => env[k] === process.env[k]));
+      // The fake root has neither a bundled python nor a .emscripten file: both
+      // are optional accelerators, and guessing at them would be the silent
+      // fallback this project forbids.
+      check('EMSDK_PYTHON / EM_CONFIG are not invented when the SDK has neither',
+        env.EMSDK_PYTHON === undefined && env.EM_CONFIG === undefined);
+    }
+
+    // ---- diagnostics: "not there" vs "there but cannot start" ----
+    const notFound = asPlatform('win32', () => webToolchainError()) ?? '';
+    check('an absent SDK at an absolute path reports "not found", not "not usable"',
+      notFound.indexOf('emcc not found: ') === 0);
+    check('and the message names the program it looked for', notFound.endsWith('emcc.bat'));
+
+    // ---- what only a Windows launch can show, pinned as source facts ----
+    check('a batch program is launched through cmd.exe, never handed to CreateProcess',
+      /if \(!isBatchFile\(argv\[0\]\)\)/.test(src) && /windowsVerbatimArguments: true/.test(src));
+    check('cmd runs with /d /s /c (AutoRun off, the outer quote pair stripped)',
+      /'\/d', '\/s', '\/c'/.test(src));
+    check('the doctor check prints the program we launch instead of a hardcoded POSIX path',
+      !/upstream\/emscripten\/emcc`/.test(doctor) && /emccPath\(\)/.test(doctor));
+  } finally {
+    if (savedHome === undefined) delete process.env.EMSDK_HOME; else process.env.EMSDK_HOME = savedHome;
+    if (savedEm === undefined) delete process.env.EMSDK; else process.env.EMSDK = savedEm;
+    if (savedPy === undefined) delete process.env.EMSDK_PYTHON; else process.env.EMSDK_PYTHON = savedPy;
+    if (savedCfg === undefined) delete process.env.EM_CONFIG; else process.env.EM_CONFIG = savedCfg;
+    Object.defineProperty(process, 'platform', realPlatform as PropertyDescriptor);
+  }
+
+  if (ok > 0) console.log(`[web-toolchain] ${ok} web toolchain checks passed`);
+  return bad;
+}
+
 registerGroup('unit: build/IcuDataDeploy', checkIcuDataDeploy);
+
+registerGroup('unit: build/WebToolchain', checkWebToolchain);
 
 // Remove every scratch directory this test process created under $TMPDIR/as-aot-obj.
 // The checks drive the real command builder, so they name real directories; the build

@@ -26,7 +26,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { nonWindowsVendorKey, wasmToolchainError, webToolchainError, type BuildConfig } from './build.ts';
+import { nonWindowsVendorKey, wasmToolchainError, webToolchainError, emccPath, type BuildConfig } from './build.ts';
 import { aneHostDirName, aneHostLibName, anePlatformForBuild } from './ane.ts';
 
 export type CheckKind = 'hard' | 'warn' | 'info';
@@ -498,7 +498,7 @@ export const CHECKS: Check[] = [
         );
       }
       const home = process.env.EMSDK_HOME || process.env.EMSDK;
-      return ok(home ? `${home}/upstream/emscripten/emcc` : 'emcc on PATH (no EMSDK_HOME set)');
+      return ok(home ? emccPath() : `${emccPath()} on PATH (no EMSDK_HOME set)`);
     },
   },
 

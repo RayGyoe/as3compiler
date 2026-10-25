@@ -9,8 +9,8 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync, statSync, renameSync } from 'node:fs';
-import { resolve, dirname, join, basename } from 'node:path';
+import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync } from 'node:fs';
+import { resolve, dirname, join, basename, delimiter, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -1675,13 +1675,44 @@ export function ensureOutDir(argv: string[]): void {
   if (outAt >= 0 && argv[outAt + 1]) mkdirSync(dirname(argv[outAt + 1]), { recursive: true });
 }
 
+// A batch file cannot be handed to CreateProcess: Node surfaces EINVAL and
+// nothing runs. The Emscripten SDK's Windows entry point is exactly that
+// (`emcc.bat`), so those are launched THROUGH cmd.exe — the same thing a user's
+// shell does, and the only way to run them without reimplementing the driver.
+//
+// `/d` skips AutoRun, `/s` makes cmd strip the single outer quote pair we add,
+// and `windowsVerbatimArguments` stops Node from re-quoting a command line whose
+// arguments already carry their own quotes (double quoting breaks paths with
+// spaces). Known limit shared with the SDK's own .bat: cmd expands `%NAME%`
+// inside an argument. Compiler flags and file paths contain no `%`.
+function isBatchFile(p: string): boolean {
+  return process.platform === 'win32' && /\.(bat|cmd)$/i.test(p);
+}
+
+function winQuoteArg(a: string): string {
+  return /[\s"&|<>^()]/.test(a) ? '"' + a.split('"').join('\\"') + '"' : a;
+}
+
+// The single place a toolchain program is spawned. Everything else (native cc,
+// wasi clang, adl probes) goes through here too, so the Windows batch-file
+// handling lives in one branch rather than at each call site.
+function spawnTool(argv: string[], env: NodeJS.ProcessEnv | Record<string, string> | undefined) {
+  if (!isBatchFile(argv[0])) return spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', env });
+  const line = argv.map(winQuoteArg).join(' ');
+  return spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', '"' + line + '"'], {
+    encoding: 'utf8',
+    env,
+    windowsVerbatimArguments: true,
+  });
+}
+
 // Run the compiler and propagate failure. Returns true on success. `extraEnv`
 // (e.g. the Emscripten toolchain's PATH) is merged over the inherited
 // environment rather than replacing it, so unrelated env vars survive.
 export function runCompile(argv: string[], extraEnv?: Record<string, string>): boolean {
   ensureOutDir(argv);
   const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
-  const res = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', env });
+  const res = spawnTool(argv, env);
   if (res.stderr) process.stderr.write(res.stderr);
   if (res.error) {
     const code = (res.error as NodeJS.ErrnoException).code;
@@ -1722,29 +1753,84 @@ function emsdkHome(): string | null {
   return process.env.EMSDK_HOME || process.env.EMSDK || null;
 }
 
-function emccPath(): string {
+// The SDK ships both entry points side by side: `upstream/emscripten/emcc` is a
+// `#!/bin/sh` wrapper (POSIX only) and `emcc.bat` is the Windows one. The sh
+// script cannot be started on Windows at all — measured on emsdk 3.1.44:
+// spawnSync(emcc) => ENOENT, spawnSync(emcc.bat) => EINVAL, spawnSync(emcc.py)
+// => EFTYPE, while `cmd /c emcc.bat --version` prints `emcc 3.1.44`. Asking for
+// the POSIX name there used to fail with "emcc not found", pointing the reader at
+// the path instead of at the missing shell.
+export function emccPath(): string {
   const home = emsdkHome();
-  return home ? `${home}/upstream/emscripten/emcc` : 'emcc';
+  const exe = process.platform === 'win32' ? 'emcc.bat' : 'emcc';
+  return home ? join(home, 'upstream', 'emscripten', exe) : exe;
+}
+
+// emcc.bat runs `%EMSDK_PYTHON%` and falls back to a bare `python` lookup —
+// which on Windows often resolves to the Microsoft Store stub rather than an
+// interpreter. Point it at the SDK's own bundled python when there is exactly
+// one (emsdk installs one per version, so that is the normal case); an ambiguous
+// layout is left to the SDK's own default instead of guessed at.
+function emsdkPython(home: string): string | null {
+  const dir = join(home, 'python');
+  try {
+    const found = readdirSync(dir).filter((v) => existsSync(join(dir, v, 'python.exe')));
+    return found.length === 1 ? join(dir, found[0], 'python.exe') : null;
+  } catch {
+    return null;
+  }
 }
 
 // emcc is a Python driver that shells out to clang/node; those live in the
-// emsdk's bin dir, so prepend it (and the emscripten dir) to PATH for the
-// child process. Returns undefined when no SDK is configured (then emcc must
-// already be on PATH).
+// emsdk's bin dir, so prepend it (and the emscripten dir) to PATH for the child
+// process. Returns undefined when no SDK is configured (then emcc must already
+// be on PATH).
+//
+// Two Windows-specific corrections, both measured:
+//   1. PATH is joined with `path.delimiter`. A ':'-joined PATH is ONE unparsable
+//      entry on Windows (the drive colon splits it), so every emcc child ran with
+//      no usable PATH.
+//   2. The inherited environment is KEPT. Handing over `{ PATH }` alone dropped
+//      SystemRoot (cmd.exe needs it to start) and USERPROFILE (emcc's cache lives
+//      in ~/.emscripten_cache), so even a correctly launched driver would fail.
+//      Any pre-existing PATH spelling is dropped first: Windows env names are
+//      case-insensitive but a JS object is not, and two PATH keys in one block is
+//      undefined behaviour.
 function webCompileEnv(): Record<string, string> | undefined {
   const home = emsdkHome();
   if (!home) return undefined;
-  const emccDir = `${home}/upstream/emscripten`;
-  const binDir = `${home}/upstream/bin`;
-  return { PATH: `${emccDir}:${binDir}:${process.env.PATH || ''}` };
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !/^path$/i.test(key)) env[key] = value;
+  }
+  const emccDir = join(home, 'upstream', 'emscripten');
+  const binDir = join(home, 'upstream', 'bin');
+  env.PATH = [emccDir, binDir, process.env.PATH || ''].join(delimiter);
+  const python = emsdkPython(home);
+  if (python) env.EMSDK_PYTHON = python;
+  const config = join(home, '.emscripten');
+  if (existsSync(config)) env.EM_CONFIG = config;
+  return env;
 }
 
 // Probe whether the Emscripten toolchain is usable: emcc must exist and be able
 // to run its version check (which fails without a working node/python driver).
 export function webToolchainError(): string | null {
   const cc = emccPath();
-  const res = spawnSync(cc, ['--version'], { encoding: 'utf8', env: webCompileEnv() });
-  if (res.error) return `emcc not found: ${cc}`;
+  // An absolute program that is not there needs no spawn to diagnose. On Windows
+  // emcc is a batch file, so cmd.exe reports a missing path as the generic "The
+  // system cannot find the path specified." with a nonzero exit, which used to be
+  // read as "emcc not usable" -- i.e. as if the SDK were present but broken.
+  if (isAbsolute(cc) && !existsSync(cc)) return `emcc not found: ${cc}`;
+  const res = spawnTool([cc, '--version'], webCompileEnv());
+  if (res.error) {
+    // Two different situations used to share one sentence. "not found" sends the
+    // reader to the path; "present but could not be launched" is a permissions
+    // problem or, on Windows, the POSIX wrapper (ENOENT/EINVAL/EFTYPE).
+    const code = (res.error as NodeJS.ErrnoException).code || 'unknown';
+    if (code === 'ENOENT') return `emcc not found: ${cc}`;
+    return `emcc could not be launched (${code}): ${cc}`;
+  }
   if (res.status !== 0) {
     const first = (res.stderr || '').trim().split('\n')[0];
     return `emcc not usable${first ? ` — ${first}` : ''}`;

@@ -1346,7 +1346,7 @@ as-aot examples/web/hello-web.as \
 
 实现要点（`src/build.ts` 的 `buildWebCompileSteps()` + `src/index.ts` 的 `writeWebIndex()`）：
 
-- **emcc 定位**：`EMSDK_HOME` 指向 emsdk 根目录，emcc 为其 `upstream/emscripten/emcc`。
+- **emcc 定位**：`EMSDK_HOME` 指向 emsdk 根目录，POSIX 上 emcc 是 `upstream/emscripten/emcc`，,  **Windows 上是同目录的 `emcc.bat` 并经 `cmd.exe` 启动**（阶段二百七十六）：那份 `emcc` 是,  `#!/bin/sh` 脚本，Windows 没有 `/bin/sh`，直接 spawn 得 `ENOENT`；`.bat` 又不能直接交给,  `CreateProcess`（`EINVAL`），所以走 `cmd /d /s /c`。同时 `PATH` 用 `path.delimiter` 拼,  （Windows 是 `;`），子进程环境**继承宿主环境**再替换 `PATH`——只交 `PATH` 会丢掉 `SystemRoot`,  （`cmd.exe` 起不来）与 `USERPROFILE`（emcc 的缓存目录）。SDK 自带 python 与 `.emscripten`,  时自动补 `EMSDK_PYTHON` / `EM_CONFIG`。
 - **C/C++ 分层**：生成的 `.c` 走 C 路径；`skia_glue.cc`/`web_glue.cc` 走 `-std=c++17`。
 - **`SK_TRIVIAL_ABI` 匹配**：wasm 版 `libskia.a` 以 `is_trivial_abi=true` 编译，C++ 胶水层必须带
   `-D SK_TRIVIAL_ABI=[[clang::trivial_abi]]`，否则运行期 `unreachable` 崩溃（`build.ts` 已自动加）。
