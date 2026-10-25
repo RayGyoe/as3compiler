@@ -1367,6 +1367,42 @@ ASC_NO_FINAL=1    Uncaught exception: FAIL: the dropped pages' SkImages were rel
 确定性来源；arena/malloc 侧（闭包 env、`as_vector`、字节缓冲以外的散落分配）仍未纳入 GC，量级
 未测。今天能说的是：**每翻一页的确定性增长已经去掉**。
 
+### 3.21 hover 提示只在个别位置出现：把「指针有没有落到它身上」变成日志（阶段二百八十五）
+
+现象（真机）：`cn.edoctor.controls.ToolTips` 注册的提示文本，只有会议头部那个按钮会弹出，
+其它按钮（翻页箭头、清晰度、设置页说明……）一个都不出现，而且**先弹出一个之后别处就再也不弹**。
+
+**机制本身已排除**（`temp/tip2w/`、`temp/tipexact/`）：把应用里那份 `ToolTips.as` 原样拷出来，
+在 `new Stage()` 与真实副窗口 `NativeWindow` 的 stage 上各注册三个 owner，用
+`Stage.dispatchMouse` 驱动 —— `MOUSE_OVER → addChild(tip) → ADDED_TO_STAGE → MOUSE_MOVE 定位
+→ visible=true` 全部走通，再用 `BitmapData.draw` 读像素确认提示框**真的被画出来**（深色背景 +
+owner 上方的落点），移开再回来仍能弹。所以问题不在「副窗口里的 tooltip 机制」。
+
+剩下两种可能都只能靠**运行期**证据分开：① 指针根本没落到那个 owner 上（被遮挡、被祖先的
+`mouseEnabled=false` 吸收、命中测试与绘制不一致）；② 落到了、`Create` 也跑了，但 tip 没被加到
+stage 上（或加了却停在 `visible=false`）。阶段二百八十五在 `ASC_MOUSE_TRACE` 下补了三类打印：
+
+| 打印 | 判读 |
+|---|---|
+| `hover <prev> -> <next> \| over=N move=N out=N` | 悬停目标发生变化。`next` 是新落点的类名；`over=0` = 这个对象上**没有任何 `mouseOver` 监听**（应用没在这里注册 tip）；`move=0` = tip 定位所依赖的 `mouseMove` 也没人听 |
+| `stage + <class> (n=N)` | 有对象被加到 stage 上。`stage + MyTip` 出现 = tip 确实被加上了（`n` 是加上之后的子件数） |
+| `stage - <class> (n=N)` | 从 stage 摘掉（`n` 是摘掉之后的子件数） |
+
+用法（`ASC_MOUSE_TRACE=2` 会同时给出命中对象 `pick=` 与祖先链 `chain[n] … me/mc/vis`；
+全部只需环境变量，不必重编）：
+
+```
+set ASC_MOUSE_TRACE=2
+"TalkMED Meeting.exe" 2> mouse-trace.txt
+```
+
+判读顺序：`mouse mouseMove … hit=<类>` 说明指针事件进了这个窗口 → `hover … over=N` 是否落在
+owner 那个类上 → `stage + MyTip` 是否紧跟着出现。三者缺哪一条，问题就归到哪一侧（命中测试 /
+应用没注册 / tip 没加上）。`chain[n] … me=0` 是被祖先吸收的典型形状，`pick` 与 `content`
+不同则是「有东西不可见地盖在上面」。
+
+**未验证**：本节只新增诊断，没有改动任何行为；上述三问的真机答案要等一份带 trace 的运行日志。
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +

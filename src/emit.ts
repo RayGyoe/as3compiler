@@ -11522,6 +11522,29 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('  while (o->parent != NULL) o = (DisplayObject*)o->parent;');
     this.line('  return o->vtable != NULL && strcmp(o->vtable->cls_name, "Stage") == 0;');
     this.line('}');
+    // ASC_MOUSE_TRACE only: name an object by class (the run-time log has no symbols)
+    // and count its listeners for one event type. A hover that lands on an object with
+    // over=0 means nothing is listening there -- i.e. the app never registered a tip --
+    // while a landing on the wrong class means the hit test, not the tip, is at fault.
+    this.line('static const char* as_cls_of(void* o) {');
+    this.line('if (o == NULL) return "-";');
+    this.line('as_vtable_header* vt = (as_vtable_header*)((as_object_header*)o)->vtable;');
+    this.line('if (vt == NULL) return "?";');
+    this.line('if (vt->fqn != NULL && vt->fqn[0] != 0) return vt->fqn;');
+    this.line('return (vt->name != NULL) ? vt->name : "?";');
+    this.line('}');
+    this.line('static int as_cls_is_stage(void* o) {');
+    this.line('if (o == NULL) return 0;');
+    this.line('DisplayObject* d = (DisplayObject*)o;');
+    this.line('return (d->vtable != NULL && d->vtable->cls_name != NULL && strcmp(d->vtable->cls_name, "Stage") == 0) ? 1 : 0;');
+    this.line('}');
+    this.line('static int as_hover_listener_n(void* obj, const char* type) {');
+    this.line('if (obj == NULL) return 0;');
+    this.line('EventDispatcher* d = (EventDispatcher*)obj;');
+    this.line('if (d->listeners == NULL) return 0;');
+    this.line('as_value v = as_listeners_get(d->listeners, type, false);');
+    this.line('return (v.tag == 6) ? ((as_array*)v.ptr)->length : 0;');
+    this.line('}');
     // ADDED_TO_STAGE / REMOVED_FROM_STAGE are dispatched on the object AND on every
     // descendant, parent first, one per object in display order. Measured on adl
     // 51.4.1 (temp/dlprobe/): adding or removing a populated subtree reports exactly
@@ -11556,6 +11579,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // `kid:addedToStage b=0 p=2`.
     this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"added", true, false));');
     this.line('if (as_on_stage((DisplayObject*)_this)) as_disp_stage_walk(child, (char*)"addedToStage");');
+    this.line('if (getenv("ASC_MOUSE_TRACE") != NULL && as_cls_is_stage((void*)_this)) fprintf(stderr, "    stage + %s (n=%d)\\n", as_cls_of((void*)child), c->children->length);');
     this.line('return child;');
     this.indent--;
     this.line('}');
@@ -11579,6 +11603,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('child->parent = (Object*)_this;');
     this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"added", true, false));');
     this.line('if (as_on_stage((DisplayObject*)_this)) as_disp_stage_walk(child, (char*)"addedToStage");');
+    this.line('if (getenv("ASC_MOUSE_TRACE") != NULL && as_cls_is_stage((void*)_this)) fprintf(stderr, "    stage + %s (n=%d)\\n", as_cls_of((void*)child), c->children->length);');
     this.line('return child;');
     this.indent--;
     this.line('}');
@@ -11612,6 +11637,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // mouseOut/rollOut, on the next beat, on the detached node.
     this.line('as_hover_on_remove((void*)_this, child);');
     this.line('if (was_on_stage) as_disp_stage_walk(child, (char*)"removedFromStage");');
+    this.line('if (getenv("ASC_MOUSE_TRACE") != NULL && as_cls_is_stage((void*)_this)) fprintf(stderr, "    stage - %s (n=%d)\\n", as_cls_of((void*)child), c->children->length);');
     this.line('return child;');
     this.indent--;
     this.line('}');
@@ -18007,6 +18033,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('as_hover_px = x; as_hover_py = y;');
     this.line('as_hover_stage = st;');
     this.line('if (prev == next) return;');
+    this.line('if (getenv("ASC_MOUSE_TRACE") != NULL) fprintf(stderr, "    hover %s -> %s | over=%d move=%d out=%d\\n", as_cls_of(prev), as_cls_of(next), as_hover_listener_n(next, "mouseOver"), as_hover_listener_n(next, "mouseMove"), as_hover_listener_n(prev, "mouseOut"));');
     this.line('if (prev != NULL) {');
     this.indent++;
     this.line('as_hover_fire(prev, (char*)"mouseOut", true, x, y);');

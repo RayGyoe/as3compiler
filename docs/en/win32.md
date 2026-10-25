@@ -1381,6 +1381,49 @@ side (closure environments, `as_vector`, the scattered allocations outside byte 
 outside the GC and its magnitude is unmeasured. What can be said today: **the deterministic growth per
 page turn is gone**.
 
+### 3.21 A hover tip that appears in one place only: turn "did the pointer land on it?" into a log (stage 285)
+
+Observed on the real machine: the tips registered through `cn.edoctor.controls.ToolTips` pop up for
+exactly one button (the meeting header) and for no other button (page arrows, quality selector, the
+notes on the setup page, ...), and **once one tip has appeared, no other tip ever does**.
+
+**The mechanism itself is ruled out** (`temp/tip2w/`, `temp/tipexact/`): the app's own
+`ToolTips.as` was copied verbatim and driven on a `new Stage()` and on a real secondary
+`NativeWindow` stage with three owners each, through `Stage.dispatchMouse` --
+`MOUSE_OVER → addChild(tip) → ADDED_TO_STAGE → MOUSE_MOVE positioning → visible=true` completes on
+both, and `BitmapData.draw` pixel reads confirm the tip box is **really painted** (dark background,
+at the expected offset), including after moving away and back. So "tooltips inside a secondary
+window" is not the defect.
+
+That leaves two possibilities, and only a **run-time** log can separate them: (1) the pointer never
+lands on that owner (covered by a sibling, absorbed by an ancestor with `mouseEnabled=false`, or a
+hit test that disagrees with the paint); (2) it does land and `Create` did run, but the tip never
+reaches the stage (or stays at `visible=false`). Stage 285 adds three prints behind
+`ASC_MOUSE_TRACE`:
+
+| Line | Reading |
+|---|---|
+| `hover <prev> -> <next> \| over=N move=N out=N` | The hover target changed. `next` is the class of the new landing point; `over=0` means **nothing listens for `mouseOver` on that object** (the app registered no tip there); `move=0` means the `mouseMove` the tip positions itself from has no listener either |
+| `stage + <class> (n=N)` | An object was added to the stage. `stage + MyTip` means the tip really was attached (`n` is the child count afterwards) |
+| `stage - <class> (n=N)` | An object was removed from the stage (`n` is the child count afterwards) |
+
+Usage (`ASC_MOUSE_TRACE=2` additionally prints the picked object `pick=` and the ancestor chain
+`chain[n] … me/mc/vis`; environment variable only, no rebuild needed):
+
+```
+set ASC_MOUSE_TRACE=2
+"TalkMED Meeting.exe" 2> mouse-trace.txt
+```
+
+Read it in order: `mouse mouseMove … hit=<class>` shows pointer events reaching the window →
+`hover … over=N` shows which class the pointer landed on → `stage + MyTip` shows whether the tip
+followed. Whichever of the three is missing names the side at fault (hit test / app registration /
+tip attach). `chain[n] … me=0` is the signature of an ancestor absorbing the hit, and
+`pick` different from `content` means something invisible is drawn on top.
+
+**Not verified**: this section adds diagnostics only, no behaviour change; the real-machine answer to
+the three questions needs a run with the trace on.
+
 ## 4. Runtime Form (D3D12 Direct, the Default)
 
 > The WGL file (`vendor/gl_glue.cc`, §3.1.1) is **isomorphic** to this one: also “a process-level
