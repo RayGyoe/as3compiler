@@ -1078,6 +1078,79 @@ DLL、线程栈、GC 段碎片都在抢同一块地方 —— **先耗尽的是�
 **未验证：** 真机上"地址空间真的没了 → 抛 `#1000` → 应用 catch 后继续运行"这一整条业务
 链路，仍要按第一轮那四个现场复现一次才作数。
 
+### 3.16 C++ 侧的同一面墙：`operator new` 失败必须是 `Error #1000`，不能是 `std::terminate`（阶段二百八十）
+
+§3.15 那五处判空落地、应用重编之后，崩溃**又换了一次形态** —— 这次连 `0xC0000005` 都不是：
+
+```
+exit code=0xC0000409 (3221226505)   lifetime=193.8 s
+WER: BEX   P7=014bbab0   P8=c0000409   P9=00000007
+```
+
+`0xC0000409`（`STATUS_STACK_BUFFER_OVERRUN`）是 Windows 上所有 `__fastfail(code)` 共用的退出
+码，`P9=7` 即 `FAST_FAIL_FATAL_APP_EXIT`（`abort()`）。dump 的调用栈（`lld-link /map` 按最近
+符号解析，工具在 `temp/crashfix/`）：
+
+```
+_abort+0x29
+  <- _terminate+0x3b
+  <- __scrt_unhandled_exception_filter@4
+  <- __except_handler4
+  <- __CxxThrowException@8+0x67
+  <- _Xbad_alloc@std@@YAXXZ+0x1c
+  <- __TI2?AVbad_alloc@std@@
+  <- SkData::MakeUninitialized+0x1b
+  <- LogFontTypeface::onOpenStream+0x193      (fontmgr_win_gdi)
+  <- HomeView_updateLineView+0x180
+```
+
+即：**Skia 的一次分配失败抛了 `std::bad_alloc`，生成的 C 里没有任何人能 catch 一个 C++ 异常，
+它一路走到 `std::terminate`，而 Windows 的 terminate 就是 `abort()`。** 注意
+`__CxxThrowException` 与 `bad_alloc` 的 type descriptor 都还在栈上 —— `terminate` 是从
+"找 handler"那一步调用的，栈帧根本没被展开，这与"某个 handler 自己又崩了"完全是两回事。
+
+为什么这不该是崩溃：同一个位置上 AIR 抛的是 `Error #1000`（§3.15）。C++ 分配失败与 C 分配
+失败在 AS3 层面是**同一件事**，没有理由一条可 catch、一条杀进程。
+
+**落点选在 `vendor/skia_glue.cc`。** 它是整个程序里唯一链进 C++ 的地方（生成的 C 是纯 C），
+全局 `operator new` 覆盖放这里不会被第二处定义撞上：
+
+- `operator new` / `new[]` 走 `sk_cxx_alloc`：`malloc` 成功即返回；失败先问运行时钩子。
+  钩子回 1 = 刚做过一次回收，**重试**；钩子不返回 = 它已经抛了 `Error #1000`。
+- `delete` / `delete[]` 配 `free`（必须是同一对，混用即 UB）。
+- 钩子由运行时经 `sk_set_oom_hook` 装进来，`main` 开头 `as_oom_hook_install()` —— 位置在
+  `GC_NOTE_STACK_BASE()` 之后、任何 AS3 代码之前。
+- 没装钩子时（纯 C++ 链接，或 main 之前的分配）先打一行说明再 `abort()`：那里没有 AS3 可抛，
+  保持平台原样比假装有语义更诚实。
+
+**限流与回收。** 钩子最多每 250 ms 做一次 `gc_collect()` 就回答"重试"：刚回收完仍然失败，
+说明没释放出可用的块，再答"重试"就是在 `operator new` 里自旋。过了窗口就升级为 `#1000`。
+诊断行与 §3.15 同形，只多一个 `C++`：
+
+```
+[as3-aot] out of memory: C++ operator new failed for 16 bytes (gc heap 0.1 MB in 1 segments, 0.1 MB free, arena 0.0 MB)
+```
+
+**边界（如实）：** 只替换普通 `new`/`new[]`。C++17 的过对齐版本
+`operator new(size, align_val_t)` 与 nothrow 形态仍来自 CRT —— 这套链接里没有对齐超过
+`__STDCPP_DEFAULT_NEW_ALIGNMENT__` 的堆分配类型，而 nothrow new 在 CRT 里也从不返回空
+（失败即抛）。
+
+**已验证：**
+
+- 32 位合成探针（`temp/crashfix/new_override_probe.cc`）：`/MT` 静态 CRT 下自定义全局
+  `operator new` **不与 `libcpmt` 冲突**，分配失败时不抛、直接进钩子。
+- `examples/oom-cxx.as`（`ASC_FORCE_CXX_OOM=1`）→ `caught #1000: Error #1000: The system is
+  out of memory.` 后 `still running`，退出 0。
+- **真实应用**（`bin-aot/TalkMED Meeting.exe`，32 位）：带 `ASC_FORCE_CXX_OOM=1` 启动，第一条
+  C++ 分配（12 字节）被拒 → `[as3-aot] out of memory: C++ operator new failed for 12 bytes`
+  → `Uncaught exception: Error #1000: The system is out of memory.`。这条路径在修复前就是
+  `0xC0000409`。
+
+**未验证：** 真实 32 位耗尽下这一次崩溃是否就此消失 —— 仍要按原现场再跑一轮（入会 → 共享
+屏幕选择器 → 删文件/滚列表 → 翻到 38/43 页 → 长留 30 分钟）。**这条修复保证的是"耗尽时抛
+可捕获的错"，不是"不再耗尽"**：1000 MB 的峰值本身没动。
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +

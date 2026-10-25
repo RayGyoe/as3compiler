@@ -1054,6 +1054,89 @@ pins) makes sure no later edit lets a `malloc`/`realloc` result land without a n
 **Not verified:** the full on-device chain -- address space actually exhausted, `#1000` raised, the app catching
 it and continuing -- still needs the four scenarios from the first round replayed on the 32-bit build.
 
+### 3.16 The same wall from the C++ side: a failed `operator new` must raise `Error #1000`, never reach `std::terminate` (stage 280)
+
+After the five null tests of §3.15 landed and the app was rebuilt, the crash did not stop -- it changed
+shape again, and this time it is not even a `0xC0000005`:
+
+```
+exit code=0xC0000409 (3221226505)   lifetime=193.8 s
+WER: BEX   P7=014bbab0   P8=c0000409   P9=00000007
+```
+
+`0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`) is the exit code every `__fastfail(code)` shares on Windows,
+and `P9=7` is `FAST_FAIL_FATAL_APP_EXIT` -- `abort()`. The dump's call stack (resolved against an
+`lld-link /map` by nearest symbol; tools in `temp/crashfix/`):
+
+```
+_abort+0x29
+  <- _terminate+0x3b
+  <- __scrt_unhandled_exception_filter@4
+  <- __except_handler4
+  <- __CxxThrowException@8+0x67
+  <- _Xbad_alloc@std@@YAXXZ+0x1c
+  <- __TI2?AVbad_alloc@std@@
+  <- SkData::MakeUninitialized+0x1b
+  <- LogFontTypeface::onOpenStream+0x193      (fontmgr_win_gdi)
+  <- HomeView_updateLineView+0x180
+```
+
+That is: **a Skia allocation failed and threw `std::bad_alloc`; nothing in the generated C can catch a C++
+exception, so it reached `std::terminate`, and on Windows terminate is `abort()`.** Note that
+`__CxxThrowException` and the `bad_alloc` type descriptor are still on the stack -- terminate is called
+from the handler SEARCH, so the frames were never unwound. This is not "one of our handlers crashed
+again"; it is an unhandled C++ exception.
+
+Why this must not be a crash: AIR raises `Error #1000` at the same point (§3.15). A failed C++ allocation
+and a failed C allocation are the **same event** at the AS3 level, and there is no reason one of them
+should be catchable while the other kills the process.
+
+**Why the replacement lives in `vendor/skia_glue.cc`.** It is the only place C++ is linked into the
+program (the generated C is plain C), so the global `operator new` override there cannot collide with a
+second definition:
+
+- `operator new` / `new[]` go through `sk_cxx_alloc`: a successful `malloc` returns; a failure asks the
+  runtime hook. A `1` answer means a collection just ran, so **retry**; a hook that never returns has
+  already raised `Error #1000`.
+- `delete` / `delete[]` pair with `free` (they must be the same pair; mixing them is UB).
+- The runtime installs the hook through `sk_set_oom_hook`, from `as_oom_hook_install()` at the top of
+  `main` -- after `GC_NOTE_STACK_BASE()` and before any AS3 code can allocate.
+- With no hook installed (a C++-only link, or an allocation made before `main`) it prints one line and
+  aborts: there is no AS3 error to raise there, and keeping the platform behaviour is more honest than
+  pretending otherwise.
+
+**Throttling and collection.** The hook collects at most once per 250 ms and then answers "retry": a
+failure right after a collection means it freed nothing usable, and answering "retry" again would only
+spin inside `operator new`. Past that window it escalates to `#1000`. The diagnostic line has the same
+shape as §3.15, with one extra `C++`:
+
+```
+[as3-aot] out of memory: C++ operator new failed for 16 bytes (gc heap 0.1 MB in 1 segments, 0.1 MB free, arena 0.0 MB)
+```
+
+**Boundary, stated plainly:** only the ordinary `new`/`new[]` are replaced. The C++17 over-aligned form
+(`operator new(size, align_val_t)`) and the nothrow forms still come from the CRT -- nothing in this link
+set heap-allocates a type whose alignment exceeds `__STDCPP_DEFAULT_NEW_ALIGNMENT__`, and a nothrow new
+in the CRT never returns null either (it throws on failure).
+
+**Verified:**
+
+- A 32-bit standalone probe (`temp/crashfix/new_override_probe.cc`): with the static CRT (`/MT`) a custom
+  global `operator new` **does not collide with `libcpmt`**, and a refused allocation reaches the hook
+  without throwing.
+- `examples/oom-cxx.as` (with `ASC_FORCE_CXX_OOM=1`) prints
+  `caught #1000: Error #1000: The system is out of memory.`, then `still running`, exit 0.
+- **The real app** (`bin-aot/TalkMED Meeting.exe`, 32-bit): started with `ASC_FORCE_CXX_OOM=1`, its first
+  C++ allocation (12 bytes) is refused ->
+  `[as3-aot] out of memory: C++ operator new failed for 12 bytes` ->
+  `Uncaught exception: Error #1000: The system is out of memory.` That is the path that used to end in
+  `0xC0000409`.
+
+**Not verified:** whether this crash is gone under real 32-bit exhaustion -- the original scenarios still
+need replaying (join a meeting -> screen-share picker -> delete files / scroll the list -> page to 38/43 ->
+idle for 30 minutes). **What this fix guarantees is a catchable error when memory runs out, not that it
+stops running out**: the 1000 MB peak is untouched.
+
 ## 4. Runtime Form (D3D12 Direct, the Default)
 
 > The WGL file (`vendor/gl_glue.cc`, §3.1.1) is **isomorphic** to this one: also “a process-level

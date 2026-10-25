@@ -123,7 +123,73 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <new>
 #include <vector>
+
+// ---------- C++ allocation failure -> AS3 Error #1000 (阶段二百八十) ----------
+//
+// A 32-bit process runs out of ADDRESS SPACE long before it runs out of RAM, and
+// Skia/STL answer an allocation they cannot satisfy by throwing std::bad_alloc.
+// The generated C has no handler for a C++ exception, so it reaches
+// std::terminate -- which on Windows is abort(): __fastfail(7), exit code
+// 0xC0000409, no AS3 error, no chance to catch anything. That is exactly what the
+// stage-二百八十 dump shows (fault in _abort+0x29 with __CxxThrowException and the
+// std::bad_alloc type descriptor still on the stack, because terminate runs from
+// the handler search and never unwinds the frames).
+//
+// This file is the only place C++ is linked into the program, so the replacement
+// belongs here: the global operator new asks the runtime what to do instead of
+// throwing. The runtime answers with a collection-and-retry (1) or by raising
+// Error #1000 (never returns) -- AIR's kOutOfMemoryError, which AS3 can catch.
+//
+// Boundary, deliberately: only the ordinary new/new[] are replaced. C++17
+// over-aligned allocation (operator new(size, align_val_t)) and the nothrow forms
+// still come from the CRT -- nothing in this link set heap-allocates a type whose
+// alignment exceeds __STDCPP_DEFAULT_NEW_ALIGNMENT__, and a nothrow new that
+// cannot fail never returns null (it either succeeds or the hook raises).
+static int (*g_cxx_oom_hook)(size_t) = NULL;
+// ASC_FORCE_CXX_OOM (read by sk_set_oom_hook) makes the first allocation after
+// startup fail on purpose, so the path can be tested where memory is plentiful.
+static int g_cxx_oom_force_left = 0;
+
+static void sk_cxx_oom_no_hook(size_t need) {
+    // No runtime hook: a C++-only link (unit probe) or an allocation made before
+    // main installed it. There is no AS3 error to raise, so report and stop --
+    // this is the abort the platform would have performed anyway, now with a
+    // message that names the cause.
+    fprintf(stderr, "[as3-aot] out of memory: C++ operator new failed for %lu bytes "
+                    "(no runtime OOM hook installed)\n", (unsigned long)need);
+    fflush(stderr);
+    abort();
+}
+
+static void* sk_cxx_alloc(size_t n) {
+    for (;;) {
+        if (g_cxx_oom_force_left > 0) {
+            g_cxx_oom_force_left--;
+        } else {
+            void* p = std::malloc(n != 0 ? n : 1);
+            if (p != NULL) return p;
+        }
+        if (g_cxx_oom_hook == NULL) sk_cxx_oom_no_hook(n);
+        if (g_cxx_oom_hook(n) == 0) sk_cxx_oom_no_hook(n);
+        // else: the runtime freed something, so try the allocation again
+    }
+}
+
+void* operator new(std::size_t n) { return sk_cxx_alloc(n); }
+void* operator new[](std::size_t n) { return sk_cxx_alloc(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+
+extern "C" void sk_set_oom_hook(int (*hook)(size_t)) {
+    g_cxx_oom_hook = hook;
+    const char* force = std::getenv("ASC_FORCE_CXX_OOM");
+    if (force != NULL && force[0] != '0') g_cxx_oom_force_left = 1;
+}
 
 // ---------- platform font manager (shared with the text engine) ----------
 

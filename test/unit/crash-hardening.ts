@@ -1,7 +1,8 @@
 // Unit checks: process-killing defects found by the crash monitor on a real
-// Windows AOT app (阶段二百七十八). Three independent failure modes, all of them
-// fatal-to-the-process rather than wrong-value, which is why they are pinned here
-// and exercised end-to-end by examples/null-string.as and examples/uncaught-storm.as.
+// Windows AOT app (阶段二百七十八…二百八十). Five independent failure modes, all of
+// them fatal-to-the-process rather than wrong-value, which is why they are pinned
+// here and exercised end-to-end by examples/null-string.as, examples/uncaught-storm.as,
+// examples/oom-error.as and examples/oom-cxx.as.
 //
 //  1. printf("%s", NULL). ucrt treats a null pointer for %s as an INVALID PARAMETER
 //     and calls __fastfail -> 0xC0000409. ES3 ToString(null) is the text "null", so
@@ -29,8 +30,17 @@
 //     of the 0xC0000005 the first round had blamed on D3D. AIR raises a catchable
 //     Error #1000 (kOutOfMemoryError) here; so do we.
 //
-// Source-level pins, not behavioural: all three are fatals whose only observable is
-// "the process died", and d3d_glue.cc cannot be compiled on a non-Windows host.
+//  5. A refused C++ allocation. Once the C side raised #1000, the crash moved: the
+//     app died at 0xC0000409 (BEX, __fastfail(7)) after 193 s, and the dump put
+//     _abort+0x29 under _terminate under __scrt_unhandled_exception_filter with
+//     __CxxThrowException and the std::bad_alloc descriptor still on the stack --
+//     Skia's SkData::MakeUninitialized threw bad_alloc, nothing in the generated C
+//     catches C++ exceptions, and Windows' terminate is abort(). vendor/skia_glue.cc
+//     now replaces the global operator new and asks the runtime instead: collect and
+//     retry, or raise the same catchable #1000 the C side raises.
+//
+// Source-level pins, not behavioural: all of them are fatals whose only observable
+// is "the process died", and d3d_glue.cc cannot be compiled on a non-Windows host.
 //
 //   node --test --test-name-pattern='crash/' test/unit/*.ts
 import { readFileSync } from 'node:fs';
@@ -167,6 +177,45 @@ function checkCrashHardening(): string[] {
   check('the forced-failure probe is opt-in and only read on the segment path',
     rt.includes('getenv("ASC_FORCE_OOM_MIN")') &&
     rt.includes('int oom_forced = as_oom_force_min != 0 && seg_size >= as_oom_force_min;'));
+
+  // ---- 5. a refused C++ allocation raises Error #1000, it does not abort ----
+  // The stage-二百八十 dump: exe+0x14bbab0 is `_abort+0x29`, reached from
+  // `_terminate` <- `__scrt_unhandled_exception_filter` <- `__except_handler4`
+  // with `__CxxThrowException` and the `std::bad_alloc` type descriptor still on
+  // the stack, and `SkData::MakeUninitialized` at the bottom of the allocating
+  // chain. exit code 0xC0000409 = __fastfail(7) from abort(). No AS3 error, nothing
+  // catchable: the 32-bit app died on the one failure AIR reports as Error #1000.
+  const glue = read('vendor/skia_glue.cc');
+  check('the Skia glue replaces the global operator new and new[]',
+    glue.includes('void* operator new(std::size_t n) { return sk_cxx_alloc(n); }') &&
+    glue.includes('void* operator new[](std::size_t n) { return sk_cxx_alloc(n); }') &&
+    glue.includes('void operator delete(void* p, std::size_t) noexcept { std::free(p); }'));
+  check('...never throwing std::bad_alloc itself (that is what reached terminate)',
+    !/operator new[\s\S]{0,200}throw std::bad_alloc/.test(glue) &&
+    glue.includes('if (g_cxx_oom_hook(n) == 0) sk_cxx_oom_no_hook(n);'));
+  check('...retrying only after the runtime reports that a collection ran',
+    glue.includes('        if (g_cxx_oom_hook(n) == 0) sk_cxx_oom_no_hook(n);\n' +
+                  '        // else: the runtime freed something, so try the allocation again'));
+  check('...and reporting before aborting when no hook was installed (a C++-only link)',
+    glue.includes('if (g_cxx_oom_hook == NULL) sk_cxx_oom_no_hook(n);') &&
+    glue.includes('(no runtime OOM hook installed)\\n'));
+  check('the runtime funnels both allocation paths through one raise',
+    rt.includes('static _Noreturn void as_oom_raise(void) {') &&
+    rt.includes('static int as_oom_from_cxx(size_t need) {') &&
+    // as_gc_oom must delegate, not duplicate: two copies of the kOutOfMemoryError
+    // raise is how the C++ path would drift away from the C path.
+    /static _Noreturn void as_gc_oom\(size_t need\) \{[\s\S]{0,1200}?as_oom_raise\(\);/.test(rt) &&
+    rt.split('as_error_new_oom("Error #1000').length - 1 === 1);
+  check('...collecting at most once per 250 ms before escalating (no spin in operator new)',
+    rt.includes('now - as_cxx_oom_last_ms > 250.0') &&
+    /if \(!as_cxx_oom_forced && !gc_in_gc && gc_segs != NULL/.test(rt));
+  check('the hook is installed only in a Skia build, and installed from main',
+    rt.includes('#ifdef ASC_USE_SKIA\nextern void sk_set_oom_hook(int (*hook)(size_t));') &&
+    rt.includes('    sk_set_oom_hook(as_oom_from_cxx);') &&
+    em.includes("this.line('as_oom_hook_install();');"));
+  check('the forced-refusal probe is opt-in (ASC_FORCE_CXX_OOM) and read once',
+    glue.includes('const char* force = std::getenv("ASC_FORCE_CXX_OOM");') &&
+    rt.includes('getenv("ASC_FORCE_CXX_OOM")'));
 
   if (ok > 0) console.log(`[crash] ${ok} crash-hardening checks passed`);
   return bad;

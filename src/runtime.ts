@@ -829,6 +829,19 @@ static size_t as_oom_force_min = (size_t)-1;
 static void* as_error_new_oom(const char* msg, int id);  // emitted with the Error class
 static _Noreturn void as_throw(void* e);
 
+// Raise Error #1000 the way AIR does (avmplus kOutOfMemoryError): a catchable
+// Error, never a fault, and never exit() while an Error can still be raised. The
+// one process-wide guard keeps a failed raise from recursing back into itself.
+static _Noreturn void as_oom_raise(void) {
+    if (!as_oom_active) {
+        as_oom_active = 1;
+        as_throw(as_error_new_oom("Error #1000: The system is out of memory.", 1000));
+    }
+    // The Error object itself could not be allocated: there is nothing left to
+    // raise, so stop here rather than recursing back into this function.
+    exit(1);
+}
+
 static _Noreturn void as_gc_oom(size_t need) {
     // The numbers are the report: they say whether the address space is gone or
     // the free lists are just too fragmented, which are fixed very differently.
@@ -844,13 +857,61 @@ static _Noreturn void as_gc_oom(size_t need) {
             (unsigned long)need, (double)seg_total / 1048576.0, seg_n,
             (double)seg_free / 1048576.0, (double)as_heap_bytes / 1048576.0);
     fflush(stderr);
-    if (!as_oom_active) {
-        as_oom_active = 1;
-        as_throw(as_error_new_oom("Error #1000: The system is out of memory.", 1000));
+    as_oom_raise();
+}
+
+// ---------- C++ allocation failure (operator new) ----------
+// The same 32-bit address-space wall has a second face, and it is the one the
+// stage-二百八十 dump shows: an unsatisfied C++ allocation throws std::bad_alloc,
+// nothing in the generated C can catch it, and the exception reaches
+// std::terminate -- which on Windows is abort(), i.e. __fastfail(7) and exit code
+// 0xC0000409 with no AS3 error at all (fault in _abort+0x29, with
+// __CxxThrowException and the std::bad_alloc type descriptor still on the stack:
+// terminate is called from the handler SEARCH, so the frames were never unwound).
+//
+// vendor/skia_glue.cc -- the only place C++ is linked into the program -- therefore
+// overrides the global operator new and calls this function instead of throwing.
+// Returning 1 tells it to retry the allocation (a collection just ran); never
+// returning is the "nothing can be freed" answer, which escalates to Error #1000.
+static double as_cxx_oom_last_ms = -1.0;
+static int as_cxx_oom_forced = -1;
+static int as_oom_from_cxx(size_t need) {
+    // ASC_FORCE_CXX_OOM=1: skip the collection and escalate, so the whole chain
+    // (failed operator new -> this hook -> catchable Error #1000) is exercised on
+    // a machine with memory to spare. The refusal itself is injected by the glue.
+    if (as_cxx_oom_forced < 0) {
+        const char* f = getenv("ASC_FORCE_CXX_OOM");
+        as_cxx_oom_forced = (f != NULL && f[0] != '0') ? 1 : 0;
     }
-    // The Error object itself could not be allocated: there is nothing left to
-    // raise, so stop here rather than recursing back into this function.
-    exit(1);
+    size_t seg_total = 0, seg_free = 0;
+    int seg_n = 0;
+    for (gc_seg* s = gc_segs; s != NULL; s = s->next) {
+        seg_n++;
+        seg_total += s->size;
+        seg_free += s->free_bytes;
+    }
+    double now = as_now_ms();
+    // One collection per 250 ms: a second refusal inside that window means the
+    // collection did not free anything usable, and answering "retry" again would
+    // only spin inside operator new.
+    if (!as_cxx_oom_forced && !gc_in_gc && gc_segs != NULL
+        && (as_cxx_oom_last_ms < 0.0 || now - as_cxx_oom_last_ms > 250.0)) {
+        as_cxx_oom_last_ms = now;
+        fprintf(stderr, "[as3-aot] out of memory: C++ operator new failed for %lu bytes, "
+                        "collecting (gc heap %.1f MB in %d segments, %.1f MB free, arena %.1f MB)\\n",
+                (unsigned long)need, (double)seg_total / 1048576.0, seg_n,
+                (double)seg_free / 1048576.0, (double)as_heap_bytes / 1048576.0);
+        fflush(stderr);
+        gc_collect();
+        return 1;
+    }
+    fprintf(stderr, "[as3-aot] out of memory: C++ operator new failed for %lu bytes "
+                    "(gc heap %.1f MB in %d segments, %.1f MB free, arena %.1f MB)\\n",
+            (unsigned long)need, (double)seg_total / 1048576.0, seg_n,
+            (double)seg_free / 1048576.0, (double)as_heap_bytes / 1048576.0);
+    fflush(stderr);
+    as_oom_raise();
+    return 0;  // unreachable: as_oom_raise never returns
 }
 
 // Allocate a GC object of the given type. Returns the object body (header hidden
@@ -9113,6 +9174,23 @@ static inline void sk_dock_bounce(int critical) { (void)critical; }
 static inline void sk_dock_set_icon_image(const void* argb, int w, int h) { (void)argb; (void)w; (void)h; }
 static inline void sk_window_set_auto_exit(int on) { (void)on; }
 #endif
+// The C++ half of the allocation-failure story lives in vendor/skia_glue.cc: it
+// overrides the global operator new and hands a refused allocation to
+// as_oom_from_cxx through this hook. A build with no Skia glue links no C++ at
+// all, so there the installer has nothing to install.
+#ifdef ASC_USE_SKIA
+extern void sk_set_oom_hook(int (*hook)(size_t));
+#endif
+static void as_oom_hook_install(void) {
+#ifdef ASC_USE_SKIA
+    sk_set_oom_hook(as_oom_from_cxx);
+#else
+    // Keep as_oom_from_cxx referenced so a C-only build does not warn about an
+    // unused static function (this is the only thing that could use it).
+    (void)&as_oom_from_cxx;
+#endif
+}
+
 #ifdef ASC_USE_SKIA
 extern void* sk_surface_raster_new(int w, int h);
 extern int sk_surface_peek_pixels(void* surface, void** pixels, int* rowBytes);

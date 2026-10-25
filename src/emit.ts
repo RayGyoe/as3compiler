@@ -27169,6 +27169,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // AS3 code (System.gc()) conservatively treats everything between the
     // scanning frame and here as roots (see gc_mark_stack in the preamble).
     this.line('GC_NOTE_STACK_BASE();');
+    // The C++ glue overrides operator new (vendor/skia_glue.cc) and needs the
+    // runtime's allocation-failure hook before any AS3 code can allocate through
+    // it; see as_oom_from_cxx in the preamble.
+    this.line('as_oom_hook_install();');
     // Install the AMF3 codec's generated hooks (class member tables, registry
     // lookup, Date/ByteArray bridges) before any AS3 code runs.
     this.line('as_amf_wire();');

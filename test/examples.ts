@@ -265,6 +265,11 @@ const EXAMPLE_ENV: Record<string, Record<string, string>> = {
   // which no CI runner and no fresh test process has. Making the segment carve fail
   // on request is the only way this unit can assert the same thing everywhere.
   'oom-error.as': { ASC_FORCE_OOM_MIN: '4194304' },
+  // The C++ half of the same wall (阶段二百八十): Skia and the STL answer a
+  // refused allocation by throwing std::bad_alloc, which reached std::terminate
+  // and aborted with 0xC0000409. Forcing the first operator new after startup to
+  // fail is what makes that path assertable where memory is plentiful.
+  'oom-cxx.as': { ASC_FORCE_CXX_OOM: '1' },
 };
 
 // Per-example extra CLI arguments. The SWC example needs a resource library on
@@ -297,6 +302,9 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // /边框线宽/`pixdiff`），而纯 C 构建没有光栅后端（draw 是空桩 ⇒ 墨迹 0x0），故必须链 Skia。
   // 与 autobake.as 的区别正在此：那个只 trace、不做像素断言，三种构建下都能「过」。
   'bakecrisp.as': ['--manifest', join(dir, 'bakecrisp.build.json')],
+  // oom-cxx.as needs a C++ allocation to refuse, i.e. the Skia glue -- the only
+  // place C++ enters the link -- so it takes the same manifest shape as bakecrisp.
+  'oom-cxx.as': ['--manifest', join(dir, 'oom-cxx.build.json')],
   // scrollrect-clip.as 断言的也是**像素**（scrollRect 窗口的着色包围盒与窗口左上角
   // 色条），纯 C 构建没有光栅后端（draw 是空桩），故与 bakecrisp.as 一样链 Skia。
   'scrollrect-clip.as': ['--manifest', join(dir, 'scrollrect-clip.build.json')],
