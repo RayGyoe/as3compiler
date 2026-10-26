@@ -444,6 +444,42 @@ Quartz 合成的快拖并发）：
 把两处改动回退成修前形状后其中 **5 条当场变红**。探针：`temp/resizeprobe/{fast.py,fastdump.py,measure.py,drive.py,drag.py}`。
 Windows 侧同源缺陷见 [`win32.md`](win32.md) §2.10。
 
+#### 6.7.1 透明窗是另一条呈现路径，同一行也必须钉（阶段二百八十七）
+
+**背景**：上面钉的是 `CAMetalLayer`。但 **透明窗口根本不走 Metal** —— `window_glue.cc` 的
+`present_frame()` 在 `c->transparent` 时直接调 `sk_mac_present_layer()`，把这一帧做成 `CGImage`
+交给一个 layer-hosting `NSView` 的 `CALayer`（`setContents:`）。那块 layer **不是** Metal 那块，
+阶段一百三十三的钉子**从未覆盖它**，而 `CALayer` 的 `contentsGravity` **默认同样是 `kCAGravityResize`**。
+
+**症状**（TalkMED 桌面端的形态：透明圆角面板随内容长高/拉宽）：**每次窗口几何先动、下一帧还没到**
+时，上一帧被**拉伸铺满新的 bounds** —— 而且因为拉伸不看宽高比，画面会**横向拉长/压扁**（比 Metal 那条
+更难看）。live resize 时每个拖动帧都会命中。
+
+**实测**（`temp/transjitter/`，探针自缩放：透明窗 400↔700 pt 每 300 ms 切换，`requestedDisplayResolution=high`，
+2x 屏；量尺是 40x40 逻辑 = **80x80 设备像素**的红方块）：
+
+| 形状 | 采样 | 方块实测尺寸 | 被重采样帧 |
+|---|---|---|---|
+| `contentsGravity = resize`（默认，修前） | 151 帧 | `(80,80)`×136、`(45,80)`×8、`(140,80)`×7 | **15 / 151** |
+| `contentsGravity = topLeft`（修后） | 155 帧 | `(80,80)`×155 | **0 / 155** |
+
+- `140/80 = 1.75`（窗宽 700 显示 400 宽的旧帧）、`45/80 = 0.5625`（窗宽 400 显示 700 宽的旧帧），
+  **纵向恒 80** ⇒ 确认是「整幅按 bounds 拉伸、纵横比不管」而非局部扰动。
+- 修后新露出的区域（窗口比这一帧大时）显示的是**透明**而不是被拉伸的内容，与 AIR 的 `NO_SCALE`
+  一致：内容保持自身尺寸、锚在左上，**宁可裁/留白，绝不重采样**。
+- 采样手法：`CGWindowListCreateImage` 忽略窗口图形但**读合成后的结果**，所以量到的是「合成器看到
+  什么」——这正是这条缺陷的可观测面（读进程内 buffer 会漏掉它）。
+
+**修法**：`sk_mac_ensure_transparent()` 建 host layer 时加一行
+`SK_SET_OBJ(hl, "setContentsGravity:", sk_nsstring("topLeft"));`（与 Metal 那条对称）。
+**回归钉子**：`unit: platform/PresentScale` 新增 4 条（钉住「确实设了 gravity」「是 topLeft 且只有一处」
+「设在 host layer 上且在第一帧之前」「图像仍按 surface 自身尺寸构建，代码里没有缩放」）。
+
+**顺带确认（本机实机，同日）**：**普通（不透明）窗口路径未复现抖动** —— 重建 `examples/air-native`
+后按其 §6.7 的同一套快拖 harness 采样：marker 恒 `88x88`、原点恒 `(1120,1020)`，**0 帧被重采样**；
+`ASC_FRAME_STATS=1` 四个拖拽循环 `p50 = 8.17~8.30 ms`（约 120 fps）、`over17ms = 0~5`、`worstgc = 0.00`。
+即 macOS 的 `CAMetalLayer` 与设备倍率两条主路径**已经修好**，剩下的未覆盖面只有透明窗这一条。
+
 ---
 
 ### 6.8 drawable 必须允许被当作纹理采样（高级混合模式，阶段一百六十）

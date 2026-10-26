@@ -16330,7 +16330,111 @@ icon 顶边第 2 设备行的 7 列（live `37,99,235` / baked `255,255,255`，b
 **未测**：macOS/Linux 上未复核（本机只有 Windows；这条路径的算术与平台无关，但真机像素未量）；
 GL/D3D 后端下的烘焙贴回未单独复量（贴回走同一张 raster `SkImage`，与呈现后端正交）。
 
+### 阶段二百八十七：透明窗的两个平台缺陷 —— 呈现层没钉 1:1（`CALayer` 默认重力）+ 覆盖视图吞掉全部点击（v0.4.249 → v0.4.250）✅ 已完成
+
+**一、现象与定性**
+
+Windows 那次「resize 时画面抖动」的修复（阶段一百三十三：`CAMetalLayer.contentsGravity` 钉
+`kCAGravityTopLeft`、`DXGI_SWAP_CHAIN_DESC1.Scaling` 钉 `DXGI_SCALING_NONE`；阶段二百二十四：设备倍率
+改成问 `NSWindow.backingScaleFactor`）之后，macOS 上仍能看到同类抖动。先复核 macOS 的**主**路径是否
+真的修到位（本机实机，2026-10-26）：重建 `examples/air-native` 后用 skia.md §6.7 的同一套快拖 harness
+采样，marker 恒 `88x88`、原点恒 `(1120,1020)`、**0 帧被重采样**；`ASC_FRAME_STATS=1` 四个拖拽循环
+`p50 = 8.17~8.30 ms`、`over17ms = 0~5`、`worstgc = 0.00`。⇒ **Metal 与设备倍率两条主路径确实已修好**。
+
+于是逐条排查「还有哪条呈现路径没被这两条钉子覆盖」，找到唯一一条：**透明窗口**。
+
+**二、根因（代码事实）**
+
+`vendor/window_glue.cc` 的 `present_frame()`：非透明走向 SDL 纹理 + `SDL_RenderCopy`，且 dst 显式写成
+`{0,0,w,h}`（注释明确写「NULL 会让 SDL 拉伸」——即这条路径早被钉过）；**透明**分支直接
+`sk_mac_present_layer()`，把这一帧做成 `CGImage` 交给 layer-hosting `NSView` 的 `CALayer`
+（`SK_SET_OBJ(hl, "setContents:", img)`）。那块 layer **不是** Metal 那块，**从未设过 `contentsGravity`**，
+而 `CALayer` 的默认值**就是 `kCAGravityResize`**。全仓 grep 确认：修前只有 `metal_glue.mm` 一处设 gravity。
+
+⇒ 与阶段一百三十三**完全同族**：只要「layer 的几何先动、下一帧还没到」，上一帧就被拉伸铺满新 bounds。
+比 Metal 那条更难看的一点是：拉伸**不看宽高比**，所以画面会横向拉长/压扁。
+
+**三、修法与实测（单行 A/B，同一探针同一机器）**
+
+| 改动 | 采样 | 量尺实测尺寸 | 被重采样帧 |
+|---|---|---|---|
+| `contentsGravity = resize`（默认，修前形状） | 151 帧 | `(80,80)`×136、`(45,80)`×8、`(140,80)`×7 | **15 / 151** |
+| `contentsGravity = topLeft`（修后） | 155 帧 | `(80,80)`×155 | **0 / 155** |
+
+- 量尺：`temp/transjitter/`（透明窗 400x300、`<transparent>true</transparent>`、
+  `requestedDisplayResolution=high` ⇒ 2x 屏、40x40 逻辑 = **80x80 设备像素**红方块；窗口每 300 ms 在
+  400↔700 pt 间切换，由程序自己写 `nativeWindow.width`）。
+- `140/80 = 1.75`、`45/80 = 0.5625`，**纵向恒 80** ⇒ 确证是「整幅按 bounds 拉伸，纵横比不管」，
+  而非局部扰动。
+- 采样用 `CGWindowListCreateImage`（读**合成后**结果）：这正是该缺陷的唯一可观测面，读进程内 buffer 会漏掉。
+- 修后窗口比这一帧大的时候，多出的区域是**透明**而不是被拉伸的画面 —— 即 AIR 的 `NO_SCALE`：
+  内容保持自身尺寸锚在左上，帧没跟上就**裁/留白，绝不重采样**。
+
+修法只有一行（`sk_mac_ensure_transparent()` 建 host layer 处）：
+
+`SK_SET_OBJ(hl, "setContentsGravity:", sk_nsstring("topLeft"));`
+
+**四、验收**
+
+| 检查 | 结果 |
+|---|---|
+| `unit: platform/PresentScale` | **24 条全绿**（原 20 条 + 新增 4 条：确实设了 gravity / 是 topLeft 且仅此一处 / 设在 host layer 上且在第一帧之前 / 图像仍按 surface 自身尺寸构建） |
+| `temp/transjitter` A/B（151 vs 155 帧） | 15 帧被重采样 → **0** |
+| 普通窗（`examples/air-native` 快拖） | **0 帧被重采样**（本来就已修，本轮只复核，未改代码） |
+| 全量 `node test.ts` | 见提交说明 |
+
+**五、如实报明**
+
+1. **没能在 macOS 上用鼠标拖动来触发这条窗的 resize**：该探针窗（以及非透明对照窗）拖右边缘 / 右下角 /
+   双击标题栏都**不改变 bounds**（实测恒 `400x332`），原因本轮未查清（`<resizable>true</resizable>`
+   已写、`sk_open_window` 的 `resizable` 分支也确认会加 `SDL_WINDOW_RESIZABLE`）。因此改由**程序内写
+   `nativeWindow.width`** 触发 resize。两者差别只在「谁发起」，而缺陷成立的条件（窗口几何先变、
+   合成器手上还是旧帧）完全相同 —— 数据也证明修前确实命中。
+2. **未测 Windows 的透明窗路径**（本机无 Windows）：D3D 侧透明窗呈现是不是同一种「拉伸」，未量不做断言。
+3. 本节只改 `CALayer` 的重力，没有动 stage 尺寸、设备倍率或帧节奏。
+
+**六、同一条透明窗路径上的第二个平台缺陷：覆盖视图吞掉了全部点击**
+
+修完重力之后在 Prune 面板（`ASC_WINDOW_VIBRANT` + `<transparent>true</transparent>`）上做点击验收，
+发现**一次点击都到不了 AS3**：面板上的勾选框、行、按钮全是死的。
+
+根因在 `vendor/window_glue.cc` 的 `sk_mac_ensure_transparent()`：为了替换 SDL 的不透明 backing store，
+这里在 **SDL 自己的 NSView 之上**加了两个子视图（`NSVisualEffectView` 背板 + 承载帧的 host view），
+而 host view 是最后加进去的 ⇒ 它成了窗口的 hit view。AppKit 于是把 `mouseDown:` 交给它，而一个普通
+`NSView` 不会转发 ⇒ SDL 的鼠标驱动**根本没跑**。hover 却照常工作，因为 SDL 的 mouse-moved 走的是
+**本地事件监视器**（不经视图路由）—— 这正是「控件全死但命中测试看着没问题」这个假象的来源。
+
+修法：用 ObjC 运行时（本文件是纯 C++，不能 include Cocoa，理由与 `SKMenuTarget` 同一个）建两个子类
+`SKFrameEffectView`（基类 `NSVisualEffectView`）与 `SKFrameHostView`（基类 `NSView`），各加一个返回
+`nil` 的 `hitTest:`，于是点穿透到下面 SDL 的视图；`sk_inert_view_class()` 幂等，类建不出来时**大声报**
+（`window_glue: SKFrameHostView unavailable, clicks will be lost`），绝不静默退化。
+
+**七、`ASC_TRACE_INPUT`（诊断开关，保留）**
+
+`ASC_TRACE_INPUT=1` 逐条打印 `trace-input: type=%d win=%u`。它就是把这条缺陷定死成「事件没到」而不是
+「命中测试错」的工具：注入合成点击时只看到 `SDL_MOUSEMOTION`（1024），没有 `SDL_MOUSEBUTTONDOWN`（1025）。
+顺带记下 SDL 事件号以便下次排查：`512` WINDOWEVENT、`1024/1025/1026` MOTION/BUTTONDOWN/BUTTONUP、
+`768/769/771` KEYDOWN/KEYUP/TEXTINPUT。
+
+**八、验收（本节两部分）**
+
+| 检查 | 结果 |
+|---|---|
+| `unit: platform/PresentScale` | **24 条全绿**（重力部分，见四） |
+| `unit: platform/TransparentPointer` | **5 条全绿**（新增：`hitTest:` 返回 nil / 两个覆盖视图都走惰性子类 / 只在工厂失败时回落且必须报明 / 环境变量只读一次） |
+| Prune 面板真机点击 | 修前 0 次到达 AS3；修后勾选框、行、chevron、按钮全部可点（`prune/shots/design/` 的 51/60/71 序列） |
+| `temp/transjitter` A/B | 15/151 → 0/155（重力部分） |
+
+**九、如实报明**
+
+4. **未测 Windows / Linux**：`sk_mac_ensure_transparent` 只在 macOS 编译（`#if defined(__APPLE__)`），
+   Windows 的透明窗走的是 D3D 交换链，不受本节影响；但也**没有**在 Windows 上验过透明窗点击。
+5. **合成点击需要一个"真的进入窗口"的前置动作**：`CGEvent` 注入的点击若跳过了指针进入窗口（`mouseEntered`），
+   SDL 只把它当 motion —— 这是 SDL 的路由方式（按键事件投给持有 mouse focus 的窗口），不是本节的缺陷。
+   真机用鼠标点击没有这个问题。
+
 ### 遗留待开发
+> **2026-10-26 追加（阶段二百八十七：透明窗的呈现层 1:1）**：**新登记 0 行 / 改写 0 行 / 移出 0 行**（表内项数不变）。这是**呈现路径**缺陷（`CALayer` 默认重力把旧帧拉满新 bounds），不是 `adl` 跑得对我们跑不出的语义缺口 ⇒ 不占本表；同一阶段的点击吞噬（覆盖视图成了窗口 hit view）同样是**平台接线**缺陷、且已修净，一并不入本表；它与阶段一百三十三同族、同一条修法，根因、单行 A/B 实测（15/151 → 0/155）与未测项见阶段节与 `docs/zh-cn/skia.md` §6.7.1。
 > **2026-10-25 追加（阶段二百七十五：G24 / G25 / G26 三条运行时契约）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。三条都是「`adl` 跑得对、我们跑不出」的**语义实错**，且都在本阶段**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表），证据与复现见阶段节与 `asaotui/compiler-gaps.md` G24/G25/G26。**两处刻意不复刻的分歧已如实登记**（`drawPath` 单段曲线不填、曲线描边 coverage 6.9%），一条不可解释的 AIR 行为（`3,3`）明确选择不模仿。
 > **2026-10-25 追加（阶段二百七十四：烘焙面的设备像素栅格）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是**我们自己发明的优化**（自动烘焙在 AIR 里没有对应物）兑现不了自己的承诺（「烘焙态 == 活态」）造成的**呈现缺陷**，`adl` 根本不经过这条路径 ⇒ 不属 §1.5「`adl` 跑得对我们跑不出」，故不占本表；三条根因（设备空间吸附 / 描边纳入包围盒 / 缓存按相位失效）、17 px 残余的量化与未测项见阶段节与 `docs/zh-cn/skia.md` §6.12。
 > **2026-10-25 追加（阶段二百七十三：CPU 光栅窗口红蓝互换）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是「我们把 Skia 的字节原样交给 SDL，却按 macOS 的通道顺序声称格式」造成的**呈现缺陷**（`adl` 与我们的 GPU 后端都不经过这条路径，所以两端对比看不见它），不属于「`adl` 跑得对我们跑不出」的语义欠账，故不占本表；证据、复现命令与未测项见阶段节与 `win32.md` §2.12。

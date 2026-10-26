@@ -1082,6 +1082,35 @@ function checkPresentScale(): string[] {
   check('...so the drawable size stays what SDL reported (the gravity is the only change)',
     /m->layer\.drawableSize = CGSizeMake\(\(CGFloat\)width, \(CGFloat\)height\);/.test(mtl));
 
+  // ---- The transparent-window present path (macOS CALayer contents) ----
+  // A transparent window does not use the CAMetalLayer: present_frame() hands the
+  // frame to a layer-hosting NSView's CALayer via setContents: (sk_mac_present_layer).
+  // That layer is NOT the Metal one, so the stage-133 gravity pin above never covered
+  // it, and a CALayer's default contentsGravity is still kCAGravityResize.
+  //
+  // Measured on macOS (temp/transjitter, 2026-10-26): a transparent window carrying a
+  // 40x40 logical red square (80x80 device px at 2x) toggled between 400 and 700 pt
+  // every 300 ms shows the square at 140x80 and 45x80 on the frames that follow each
+  // resize -- the previous frame stretched 1.75x horizontally, aspect and all, while
+  // the vertical axis stays put. After the pin: 0/155 frames resampled, 15/151 before.
+  // AIR's NO_SCALE means a frame whose size has not caught up is shown 1:1 (clipped or
+  // padded), never resampled -- the same rule the Metal path already follows.
+  const wg = strip(read('window_glue.cc'));
+  const iHostLayer = wg.indexOf('void* hl = SK_OBJ(host, "layer");');
+  const iGravity = wg.indexOf('setContentsGravity:');
+  const iContents = wg.indexOf('SK_SET_OBJ(hl, "setContents:"');
+  check('the transparent CALayer path pins a contents gravity (it does not keep the default)',
+    iGravity >= 0);
+  check('...to top-left, so a stale frame is shown 1:1 instead of stretched to the bounds',
+    // Exactly one assignment, and it is the top-left one: any second assignment (or a
+    // different name) would be a scale-to-fit gravity sneaking back in.
+    (wg.match(/setContentsGravity:/g) ?? []).length === 1
+    && /SK_SET_OBJ\(hl, "setContentsGravity:", sk_nsstring\("topLeft"\)\);/.test(wg));
+  check('...on the transparent host layer, before that layer ever receives a frame',
+    iHostLayer >= 0 && iGravity > iHostLayer && iContents > iGravity);
+  check('...and the image is still built at the surface\'s own size (no scaling in our code)',
+    /CGImageCreate\(\(size_t\)w, \(size_t\)h, 8, 32, \(size_t\)rowBytes,/.test(wg));
+
   // ---- The device scale must not be read out of two SDL size queries ----
   // Measured on macOS (temp/resizeprobe, 2026-10-21) while dragging a window edge:
   // SDL_GetWindowSize reads SDL's CACHED logical size (written from the resize
@@ -2745,3 +2774,54 @@ function checkInitialWindowStyle(): string[] {
 }
 
 registerGroup('unit: platform/InitialWindowStyle', checkInitialWindowStyle);
+
+// A TRANSPARENT WINDOW MUST STILL RECEIVE CLICKS. The layer tree that replaces
+// SDL's backing store adds two subviews ON TOP of SDL's own view (an
+// NSVisualEffectView backdrop and the frame host). Being on top makes them the
+// window's hit view, and a plain NSView forwards nothing -- AppKit then never
+// reaches SDL's view, so SDL's mouse driver never runs. The failure mode is nasty
+// because hover keeps working (SDL reads mouse-moved from a local event monitor,
+// not through the view), which reads on screen as "the widgets are dead but the
+// hit test is fine". Measured on the Prune panel (ASC_WINDOW_VIBRANT +
+// transparent, 2026-10-26): before, not one click reached AS3; ASC_TRACE_INPUT
+// showed SDL_MOUSEMOTION arriving with no SDL_MOUSEBUTTONDOWN; after, both arrive.
+function checkTransparentPointer(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [transpptr] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [transpptr] ${label}`); }
+  };
+  const wg = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
+  const code = wg.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  // The subclass factory: ObjC runtime because this file is plain C++ and cannot
+  // include Cocoa. The signature string must match the real method type or AppKit
+  // would call it with the wrong ABI.
+  check('a runtime-built subclass makes a view pointer-inert (hitTest: returns nil)',
+    /static void\* sk_inert_hit_test\(void\* self, SEL _cmd, sk_nspoint pt\)/.test(code)
+    && /class_addMethod\(cls, sel_registerName\("hitTest:"\), \(IMP\)sk_inert_hit_test, "@@:\{CGPoint=dd\}"\);/.test(code)
+    && /if \(cls != NULL\) return \(void\*\)cls;/.test(code));   // idempotent
+
+  // Both overlay views must be built through it, and the check must be reachable
+  // for each: the backdrop under SK_VIBRANT, the frame host always.
+  check('the backdrop and the frame host are both created as inert subclasses',
+    /void\* effcls = sk_inert_view_class\("SKFrameEffectView", "NSVisualEffectView"\);/.test(code)
+    && /void\* hostcls = sk_inert_view_class\("SKFrameHostView", "NSView"\);/.test(code));
+  check('...and each only falls back to the plain class when the factory failed',
+    /\(effcls != NULL\) \? SK_ALLOC\("SKFrameEffectView"\) : SK_ALLOC\("NSVisualEffectView"\)/.test(code)
+    && /\(hostcls != NULL\) \? SK_ALLOC\("SKFrameHostView"\) : SK_ALLOC\("NSView"\)/.test(code));
+  check('...and a failed factory is reported instead of silently eating input',
+    /if \(hostcls == NULL\) fprintf\(stderr, "window_glue: SKFrameHostView unavailable, clicks will be lost\\n"\);/.test(code));
+
+  // Diagnostics that made the diagnosis possible: the flag is read ONCE, lazily.
+  check('ASC_TRACE_INPUT dumps every SDL event type, reading the env once',
+    /static int sk_trace_input = -1;/.test(code)
+    && /if \(sk_trace_input < 0\) sk_trace_input = \(getenv\("ASC_TRACE_INPUT"\) != NULL\) \? 1 : 0;/.test(code)
+    && /if \(sk_trace_input\) fprintf\(stderr, "trace-input: type=%d win=%u\\n", \(int\)e\.type, \(unsigned\)e\.window\.windowID\);/.test(code));
+
+  console.log(`     [transpptr] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/TransparentPointer', checkTransparentPointer);

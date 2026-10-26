@@ -2474,13 +2474,18 @@ function checkGpuBackend(): string[] {
   const webMsg = thrown(() => man('gl', { web: true }));
   check('a web build refuses a native backend name, and says why',
     /web build/.test(webMsg) && /WebGL2/.test(webMsg));
-  const stageMsg = thrown(() => man('gl', { stage3d: true }));
+  // These three refusals are all keyed on the HOST being Windows, and the ones below
+  // fake `darwin` on purpose -- so the host must be faked to `win32` here, or the
+  // non-Windows refusal fires first and the assertion reads the wrong message. It
+  // was written on a Windows box, where the fake was unnecessary and its absence
+  // went unnoticed; on any other host (CI is arm64 macOS) this group went red.
+  const stageMsg = thrown(() => asWin(() => man('gl', { stage3d: true })));
   check('Stage3D + gl is refused before it can become a black stage',
     /no Stage3D backend/.test(stageMsg) && /stage3d_d3d\.cc/.test(stageMsg));
-  const autoModeMsg = thrown(() => man('gl', { renderMode: 'auto' }));
+  const autoModeMsg = thrown(() => asWin(() => man('gl', { renderMode: 'auto' })));
   check('a descriptor that compiles no GPU backend refuses the flag (auto/cpu)',
     /does not ask for one/.test(autoModeMsg) && /renderMode>direct/.test(autoModeMsg));
-  const cpuModeMsg = thrown(() => man('gl', { renderMode: 'cpu' }));
+  const cpuModeMsg = thrown(() => asWin(() => man('gl', { renderMode: 'cpu' })));
   check('...cpu too (the check is "is a GPU window compiled in", not "is it auto")',
     /does not ask for one/.test(cpuModeMsg));
   // The non-Windows refusal cannot be exercised on a Windows host without faking,

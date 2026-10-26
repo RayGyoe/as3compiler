@@ -1314,6 +1314,9 @@ static void sk_sys_drag_step(WinCtx* c) {
 // The shared event loop. Every window is polled, paced and presented from here;
 // the loop runs until no window is left (AIR's NativeApplication.autoExit
 // behaviour, which is what SDL's own "quit on last window close" matches).
+// Lazily-read ASC_TRACE_INPUT flag (see the event loop below).
+static int sk_trace_input = -1;
+
 static void sk_run_loop(void) {
   // Anything the app installed before the window opened is applied NOW (see
   // sk_pending_menu): NSApp only exists once video is up.
@@ -1342,6 +1345,12 @@ static void sk_run_loop(void) {
 
     // 2. Poll input, routing each event to the window that owns it.
     while (SDL_PollEvent(&e)) {
+      // ASC_TRACE_INPUT=1 prints every SDL event type. It exists because a
+      // synthetic click (CGEvent) that skipped the pointer's entry into the window
+      // reached us as motion only -- SDL routes buttons through the window that
+      // holds mouse focus, which mouseEntered is what sets.
+      if (sk_trace_input < 0) sk_trace_input = (getenv("ASC_TRACE_INPUT") != NULL) ? 1 : 0;
+      if (sk_trace_input) fprintf(stderr, "trace-input: type=%d win=%u\n", (int)e.type, (unsigned)e.window.windowID);
       if (e.type == SDL_QUIT) {
         // SDL posts QUIT only once the LAST window is gone, so this is the same
         // condition sk_any_open() tests; retiring everything keeps the two in
@@ -1778,6 +1787,40 @@ static void sk_cg_provider_release(void* info, const void* data, size_t size) {
   free((void*)data);
 }
 
+// A DISPLAY-ONLY VIEW. The frame host and the backdrop are subviews added ON TOP
+// of SDL's own view, which makes them the window's hit view: AppKit then sends
+// mouseDown to a plain NSView that forwards nothing, so SDL's mouse driver never
+// runs and EVERY click in a transparent window was swallowed. Hover still worked,
+// because SDL reads mouse-moved from a local event monitor (not view-routed),
+// which made the symptom look like "the widgets are dead but the hit test is
+// fine". Returning nil from hitTest: takes both views out of hit testing, so the
+// window falls through to SDL's view underneath. Measured on the Prune panel
+// (ASC_WINDOW_VIBRANT + transparent): before, no click ever reached AS3.
+//
+// Built through the ObjC runtime because this file is plain C++ and cannot
+// include Cocoa (same reason as SKMenuTarget below).
+typedef struct { double x, y; } sk_nspoint;
+
+static void* sk_inert_hit_test(void* self, SEL _cmd, sk_nspoint pt) {
+  (void)self; (void)_cmd; (void)pt;
+  return NULL;
+}
+
+// One subclass of `base` whose instances ignore the pointer. Idempotent.
+static void* sk_inert_view_class(const char* name, const char* base) {
+  Class cls = objc_getClass(name);
+  if (cls != NULL) return (void*)cls;
+  cls = objc_allocateClassPair((Class)objc_getClass(base), name, 0);
+  if (cls == NULL) return NULL;
+  class_addMethod(cls, sel_registerName("hitTest:"), (IMP)sk_inert_hit_test, "@@:{CGPoint=dd}");
+  objc_registerClassPair(cls);
+  return (void*)cls;
+}
+
+// Defined further down (the NSString helper used by the menu/dock code); declared
+// here because the transparent host layer needs it to name its contents gravity.
+static void* sk_nsstring(const char* s);
+
 // Build the layer tree that replaces SDL's opaque backing store. Idempotent, and a
 // no-op on a non-transparent window.
 static void sk_mac_ensure_transparent(WinCtx* c) {
@@ -1814,7 +1857,8 @@ static void sk_mac_ensure_transparent(WinCtx* c) {
   }
 
 #if SK_VIBRANT
-  void* eff = SK_ALLOC("NSVisualEffectView");
+  void* effcls = sk_inert_view_class("SKFrameEffectView", "NSVisualEffectView");
+  void* eff = (effcls != NULL) ? SK_ALLOC("SKFrameEffectView") : SK_ALLOC("NSVisualEffectView");
   if (eff != NULL) {
     eff = ((void* (*)(void*, SEL, sk_nsrect))objc_msgSend)(eff, sel_registerName("initWithFrame:"), bounds);
     // Material 6 = popover, blending 0 = behindWindow (blurs what is BEHIND the
@@ -1834,8 +1878,13 @@ static void sk_mac_ensure_transparent(WinCtx* c) {
   }
 #endif
 
-  // The frame host is added LAST so it composites above the backdrop.
-  void* host = SK_ALLOC("NSView");
+  // The frame host is added LAST so it composites above the backdrop. It must be
+  // pointer-inert (see sk_inert_view_class) or it steals every click.
+  void* hostcls = sk_inert_view_class("SKFrameHostView", "NSView");
+  // No silent breakage if the runtime class cannot be created: that fallback
+  // DOES swallow input, so say so instead of looking healthy.
+  if (hostcls == NULL) fprintf(stderr, "window_glue: SKFrameHostView unavailable, clicks will be lost\n");
+  void* host = (hostcls != NULL) ? SK_ALLOC("SKFrameHostView") : SK_ALLOC("NSView");
   if (host == NULL) return;
   host = ((void* (*)(void*, SEL, sk_nsrect))objc_msgSend)(host, sel_registerName("initWithFrame:"), bounds);
   SK_SET_BOOL(host, "setWantsLayer:", 1);
@@ -1844,6 +1893,25 @@ static void sk_mac_ensure_transparent(WinCtx* c) {
   void* hl = SK_OBJ(host, "layer");
   if (hl != NULL) {
     SK_SET_BOOL(hl, "setOpaque:", 0);
+    // The frame is presented by handing a CGImage to this layer's contents
+    // (sk_mac_present_layer), and a CALayer's default contentsGravity is
+    // kCAGravityResize: it STRETCHES the image to fill the layer's bounds. In the
+    // steady state bounds*contentsScale == image size, so that is invisible -- but
+    // every path where the layer's geometry moves before the next image arrives
+    // (a live resize, and above all a programmatic nativeWindow.width/height write)
+    // shows the PREVIOUS frame resampled to the new bounds, non-uniformly (the
+    // aspect ratio changes whenever the image's aspect no longer matches).
+    //
+    // Measured on this box with temp/transjitter (transparent, high resolution, a
+    // 40x40 logical red square = 80x80 device px, window toggled 400 -> 700 pt every
+    // 300 ms): the square reads 140x80 on the frames that follow a resize and 45x80
+    // on the way back -- i.e. the picture is scaled 1.75x horizontally and left
+    // untouched vertically. This is the same defect class the Metal path pinned away
+    // in stage 133 (kCAGravityTopLeft); the transparent path simply never got the
+    // same line. AIR's NO_SCALE semantics are "content keeps its size, anchored
+    // top-left": a frame whose size has not caught up must be shown 1:1 and clipped
+    // (or padded), never resampled.
+    SK_SET_OBJ(hl, "setContentsGravity:", sk_nsstring("topLeft"));
 #if SK_VIBRANT
     SK_SET_DBL(hl, "setCornerRadius:", SK_PANEL_RADIUS);
     SK_SET_BOOL(hl, "setMasksToBounds:", 1);

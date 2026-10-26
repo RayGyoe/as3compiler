@@ -530,6 +530,51 @@ files); reverting both fixes to their pre-fix shape turns **5 of them red on the
 `temp/resizeprobe/{fast.py,fastdump.py,measure.py,drive.py,drag.py}`. The same defect on Windows is in
 [`win32.md`](win32.md) §2.10.
 
+#### 6.7.1 The transparent window is a second present path, and it needs the same line (stage two-hundred-eighty-seven)
+
+**Background**: the pin above covers the `CAMetalLayer`. A **transparent window never touches Metal**:
+`present_frame()` in `window_glue.cc` sends the frame straight to `sk_mac_present_layer()` when
+`c->transparent`, which builds a `CGImage` and hands it to a layer-hosting `NSView`'s `CALayer`
+(`setContents:`). That layer is **not** the Metal one, so the stage-133 pin never covered it -- and a
+`CALayer`'s default `contentsGravity` is `kCAGravityResize` just the same.
+
+**Symptom** (the shape the AcmeApp desktop app has: a transparent rounded panel that grows with its
+content): whenever the window geometry moves **before the next frame arrives**, the previous frame is
+**stretched to fill the new bounds** -- and because the stretch ignores the aspect ratio the picture is also
+**squashed/stretched horizontally**, which looks worse than the Metal case. Every frame of a live resize hits it.
+
+**Measured** (`temp/transjitter/`, self-resizing probe: a transparent window toggled 400<->700 pt every
+300 ms, `requestedDisplayResolution=high`, 2x display; the ruler is a 40x40 logical = **80x80 device px** red
+square):
+
+| Shape | Samples | Ruler size seen | Resampled frames |
+|---|---|---|---|
+| `contentsGravity = resize` (default, before) | 151 | `(80,80)`x136, `(45,80)`x8, `(140,80)`x7 | **15 / 151** |
+| `contentsGravity = topLeft` (after) | 155 | `(80,80)`x155 | **0 / 155** |
+
+- `140/80 = 1.75` (a 700 pt wide window showing the old 400 pt frame) and `45/80 = 0.5625` (a 400 pt window
+  showing the old 700 pt frame), with the **vertical size always 80** -- proof that the whole picture is
+  stretched to the bounds and the aspect ratio is ignored, not that something moved locally.
+- After the fix, the area a larger window exposes shows **transparency** instead of a stretched picture,
+  which is AIR's `NO_SCALE` rule: the content keeps its own size anchored top-left, and a frame that has not
+  caught up is **clipped or padded, never resampled**.
+- Sampling: `CGWindowListCreateImage` ignores the window's shadow but reads the **composited** result, i.e.
+  what the compositor actually shows -- which is the only place this defect is observable (reading the
+  in-process buffer misses it).
+
+**Fix**: one line in `sk_mac_ensure_transparent()` when the host layer is created --
+`SK_SET_OBJ(hl, "setContentsGravity:", sk_nsstring("topLeft"));` (the mirror of the Metal line).
+**Regression nails**: 4 new checks in `unit: platform/PresentScale` (a gravity is set at all; it is top-left
+and appears exactly once; it is set on the host layer before the first frame; the image is still built at the
+surface's own size).
+
+**Also confirmed on the same box, same day**: the **ordinary (opaque) window path does NOT reproduce the
+jitter** -- rebuilding `examples/air-native` and sampling it with the §6.7 fast-drag harness keeps the marker
+at `88x88` and the origin at `(1120,1020)` with **0 resampled frames**, and `ASC_FRAME_STATS=1` reports
+`p50 = 8.17~8.30 ms` (~120 fps), `over17ms = 0~5`, `worstgc = 0.00` across four drag cycles. So on macOS the
+two main paths (the `CAMetalLayer` 1:1 pin and the device-scale query) are already fixed; the only uncovered
+path left was the transparent one.
+
 ---
 
 ### 6.8 The drawable must be allowed to be sampled as a texture (advanced blend modes, stage one-hundred-sixty)
