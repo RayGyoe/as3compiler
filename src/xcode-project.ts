@@ -15,7 +15,7 @@
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import type { BuildConfig } from './build.ts';
-import { platformFrameworks, platformLinkLibs, fpFlags, perfFlags, debugInfoFlags, effectiveDefines, writeIcuAssembly } from './build.ts';
+import { platformFrameworks, platformLinkLibs, fpFlags, perfFlags, debugInfoFlags, effectiveDefines, exportDynamicFlags, writeIcuAssembly } from './build.ts';
 import { parsePlist, serializePlist, asDict, asArray, scalarText, dictEntry, type PlistValue } from './pbxproj.ts';
 
 // A .xcodeproj is a directory containing project.pbxproj plus an optional
@@ -437,6 +437,12 @@ function pushTargetConfig(
   // __APPLE__ (runtime.ts AS_HAVE_ICONV=1): `Undefined symbol: _iconv` for any
   // app whose charset path survives -O2.
   const ldflags: string[] = ['-lm', '-lz'];
+  // The raw link's export-dynamic flag, for the same reason it exists there: a
+  // Stage3D build adopts Skia's MTLCommandQueue by NAME at runtime, and a main
+  // executable's globals are invisible to dlsym unless the link asks for them
+  // (see build.ts exportDynamicFlags). Xcode does not ask for them either, so an
+  // .app built without this line would flicker exactly like the raw build did.
+  for (const f of exportDynamicFlags(cfg)) ldflags.push(f);
   for (const l of platformLinkLibs()) ldflags.push(`-l${l}`);
   for (const l of cfg.linkLibs) ldflags.push(`-l${l}`);
   for (const o of cfg.objects) ldflags.push(resolve(o));

@@ -463,9 +463,17 @@ rather than creating its own. Key points:
 
 - That queue is **held until process exit and never released** (`sk_mtl_destroy` only sets `g_queue = nil`): a live
   Stage3D context is still using it, and the next window must get **the same one**;
-- `stage3d_glue.mm` declares it with `__attribute__((weak_import))` — **a headless Stage3D build links
-  `stage3d_glue.mm` without linking `metal_glue.mm`** (no window ⇒ no Ganesh), where the symbol does not exist and
-  the context falls back to creating its own (always +1, balanced with `s3d_destroy`'s release);
+- `stage3d_glue.mm` looks it up **by name** (`dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")`, see §9.13) — **a
+  headless Stage3D build links `stage3d_glue.mm` without linking `metal_glue.mm`** (no window ⇒ no Ganesh), where
+  the symbol does not exist and the context falls back to creating its own (always +1, balanced with
+  `s3d_destroy`'s release). **A by-name lookup only finds it if the link exports it** (stage two-hundred-eighty-eight):
+  `dlsym(RTLD_DEFAULT, …)` searches the DYNAMIC symbol table, and a main executable keeps its own globals out of it
+  unless the link names them for export (`-exported_symbol` / `-export_dynamic`). It never did, so the lookup returned NULL in *windowed* builds too, the
+  fallback above ran there, and the race came back as a composited frame holding only the target's background pass
+  (measured on `air-starling-demo`: 51 of 82 benchmark frames). `exportDynamicFlags()` in `src/build.ts` now emits
+  `-Wl,-exported_symbol,_sk_mtl_shared_queue` (ELF: `-Wl,--export-dynamic`; Windows: nothing, a PE exports through
+  `dllexport`) for every build that links `metal_glue.mm` — both link paths and the `--package xcode-project`
+  `OTHER_LDFLAGS` — pinned by `build/ExportDynamic`;
 - The target texture itself needs no change: `MTLStorageModeShared` + `usage = RenderTarget|ShaderRead` + the
   default `MTLHazardTrackingModeTracked` is exactly the precondition for same-queue hazard tracking to take
   effect;
@@ -639,6 +647,14 @@ symbol** ⇒ a headless Stage3D build (linking `stage3d_glue` without `metal_glu
 one-hundred-twenty-eight changed it to a lazy `dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")` lookup (a cached
 function pointer, falling back to its own queue if unavailable), so an ordinary manifest links. The nail is
 `stage3d/gpu-queue-sharing`.
+
+**Stage two-hundred-eighty-eight filled in the half that change missed**: dlsym searches the dynamic symbol table,
+and a main executable's globals are not in it by default — so the "if unavailable, fall back" branch was active in
+**windowed** builds as well and the shared queue never actually took effect (stage one-hundred-fourteen's acceptance
+numbers were taken while both sides were in one TU / on one queue, which hid it). The build now passes
+`-Wl,-exported_symbol,_sk_mtl_shared_queue` (`-Wl,--export-dynamic` for ELF) for every build that links the Metal
+glue, and the `build/ExportDynamic` pins hold both halves: that the switch appears *only* there (a headless Stage3D
+build has no symbol to export, and naming it fails the link), and that both link paths carry it.
 
 ## 10. The Windows / Direct3D 12 Backend (landed, stage one-hundred-thirty-two)
 

@@ -40,6 +40,16 @@ extern "C" {
 // failed outright ("Undefined symbols: _sk_mtl_shared_queue", 2026-10-09);
 // dlsym resolves to NULL at runtime when nothing defines it, which is exactly
 // the documented fallback.
+//
+// A dlsym hit is NOT free: RTLD_DEFAULT searches the DYNAMIC symbol table, and a
+// main executable keeps its own globals out of it unless the link asks otherwise
+// (ld64 -export_dynamic). It was never asked -- so the lookup returned NULL in
+// every build, the two-queue fallback ran in the windowed app too, and the race
+// above came back as "画面闪烁消失" on examples/air-starling-demo: with the queues
+// split, a measured 51 of 82 benchmark frames composited the target right after
+// its background pass and showed NO objects (sky and 2D overlay only), which is
+// the flicker. build.ts's exportDynamicFlags() now passes the flag for every
+// Stage3D build; keep it there, and keep the unit pin that guards it.
 #include <dlfcn.h>
 typedef id<MTLCommandQueue> (*SkMtlSharedQueueFn)(void);
 static SkMtlSharedQueueFn sk_mtl_shared_queue_lookup(void) {

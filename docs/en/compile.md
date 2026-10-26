@@ -1235,6 +1235,19 @@ even allow `target`/`package`.
 > manifest's `targets` block (§4.1) — one manifest then covers several backends from the table above, with no
 > need to maintain one manifest per target.
 
+**A build that links `vendor/metal_glue.mm` also carries one extra link flag,
+`-Wl,-exported_symbol,_sk_mtl_shared_queue`** (ELF spelling `-Wl,--export-dynamic`; Windows does not get it — a PE
+exports through `dllexport`). It is not an optional
+optimization: the Metal Stage3D backend adopts Skia's `MTLCommandQueue` **by name** at runtime
+(`dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")`; one queue is what gives Metal's hazard tracking, otherwise the 2D
+composite samples a half-written Stage3D pass), and a main executable's globals are **not** in the dynamic symbol
+table by default ⇒ without the export the lookup always fails and silently falls back to a private queue. It is
+gated to builds that actually link the Metal glue: every other artifact therefore stays byte-for-byte identical, and
+a headless Stage3D build (no glue, hence no symbol to export) does not fail the link on a named-undefined symbol.
+**darwin names only that one symbol instead of exporting every global**: the broad form works too but pushes
+Skia/ICU globals into the export table (measured on `air-starling-demo`: 11,319,104 B → 12,202,688 B), while the
+named export costs 8 KB. `--package xcode-project` puts the same flag on `OTHER_LDFLAGS`. Pin: `build/ExportDynamic`.
+
 Platform coupling points are isolated in `runtime.ts`'s `RUNTIME_PREAMBLE`, using `#ifdef __wasi__`
 conditional compilation. The only current platform difference is `as_now_ms()`:
 

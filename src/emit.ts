@@ -25471,7 +25471,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // a cpu-mode window in the same build draws nothing — which is the documented
     // AIR behaviour, not a silent gap.
     this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D)');
-    this.line('if (getenv("ASC_S3D_TRACE") != NULL) { static int n = 0; if (n++ % 120 == 0) fprintf(stderr, "s3d_trace composite: is_gpu=%d ready=%d tex=%p w=%d h=%d lw=%d lh=%d\\n", w->is_gpu, ASC_stage3d_ready, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, ASC_stage3d_lw, ASC_stage3d_lh); }');
+    this.line('if (getenv("ASC_S3D_TRACE") != NULL) { static int n = 0; if (n++ % 120 == 0) fprintf(stderr, "s3d_trace composite: is_gpu=%d ready=%d tex=%p w=%d h=%d lw=%d lh=%d scale=%.4f win lw=%d lh=%d pw=%d ph=%d\\n", w->is_gpu, ASC_stage3d_ready, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, ASC_stage3d_lw, ASC_stage3d_lh, w->scale, w->lw, w->lh, w->pw, w->ph); }');
     this.line('if (w->is_gpu && ASC_stage3d_ready && ASC_stage3d_tex != NULL) {');
     this.indent++;
     // Source rect = the real render target (device pixels when wantsBestResolution
@@ -25960,6 +25960,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('as_frame_guard = 1;');
     this.line('if (w == NULL || lw <= 0 || lh <= 0 || pw <= 0 || ph <= 0) { if (planted) as_frame_guard = 0; return NULL; }');
     this.line('if (scale <= 0.0) scale = 1.0;');
+    this.line('if (getenv("ASC_S3D_TRACE") != NULL) fprintf(stderr, "s3d_trace resize id=%d lw=%d lh=%d pw=%d ph=%d scale=%.4f old lw=%d lh=%d pw=%d ph=%d scale=%.4f\\n", id, lw, lh, pw, ph, scale, (w!=NULL)?w->lw:0, (w!=NULL)?w->lh:0, (w!=NULL)?w->pw:0, (w!=NULL)?w->ph:0, (w!=NULL)?w->scale:0.0);');
     this.line('#ifdef ASC_RENDER_WINGPU');
     // GPU window: there is no persistent surface to rebuild — the frame canvas is
     // re-acquired per frame and sized in sk_gpu_begin_frame from the window's

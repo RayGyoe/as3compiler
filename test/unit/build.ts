@@ -10,7 +10,7 @@ import { join, dirname, resolve, sep, basename, delimiter } from 'node:path';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
 import type { GpuBackend } from '../../src/air-app.ts';
@@ -2984,6 +2984,118 @@ function checkLinkTrim(): string[] {
 }
 
 registerGroup('unit: build/LinkTrim', checkLinkTrim);
+
+// ---- export-dynamic: the queue Stage3D must adopt (阶段二百八十八) ---------------
+// The symptom was "画面闪烁消失" on examples/air-starling-demo: while the benchmark ran,
+// roughly half of the frames showed the sky plus the 2D overlay and NO Stage3D content
+// (measured in-process: 51 of 82 benchmark frames read back cream=33 against the render
+// target's ~1900 on the very same frame). Root cause was NOT the renderer: vendor/stage3d_glue.mm
+// adopts Skia's MTLCommandQueue by NAME (dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")) so
+// that Metal's single-queue hazard tracking orders the 3D pass against the 2D composite,
+// but a main executable keeps its own globals OUT of the dynamic symbol table unless the
+// link asks for them. It never asked, the lookup returned NULL, the two-queue fallback
+// ran in the windowed app, and the composite sampled the target mid-pass. With the flag
+// the two pointers are one queue and 148/148 sampled frames matched the target exactly.
+//
+// Three things must therefore stay true, and all three are invisible at compile time:
+// the flag is emitted only for a Stage3D build (it exports every global, so a plain
+// build keeps its byte-for-byte link line), it reaches BOTH link paths (the single
+// command and the multi-step C++ one the AIR app takes), and the by-name lookup plus
+// the C-linkage definition are still there to be found.
+function checkExportDynamic(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [exportdyn] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [exportdyn] ${label}`); }
+  };
+  const expected = (): string[] => {
+    // darwin names the ONE symbol (exporting every global also works but cost the
+    // demo 883 KB of Skia/ICU symbols: 11,319,104 B -> 12,202,688 B, versus 8 KB
+    // for the named export). ELF keeps the broad flag: --export-dynamic-symbol
+    // needs GNU ld >= 2.35 / lld and this host cannot tell which linker the user
+    // has. Windows: a PE has no dlsym; the D3D glue exports by dllexport.
+    if (process.platform === 'darwin') return ['-Wl,-exported_symbol,_sk_mtl_shared_queue'];
+    if (process.platform === 'win32') return [];
+    return ['-Wl,--export-dynamic'];
+  };
+  // Either spelling, for the "must NOT be there" pins.
+  const isExportFlag = (a: string): boolean =>
+    a.includes('export_dynamic') || a.includes('-exported_symbol');
+  const s3d = (over: Partial<BuildConfig> = {}): BuildConfig => ({
+    ...defaultBuildConfig(),
+    cCompiler: 'clang++',
+    sources: [join(root, 'vendor', 'stage3d_glue.mm'), join(root, 'vendor', 'metal_glue.mm')],
+    defines: ['ASC_USE_SKIA=1', 'ASC_RENDER_METAL=1', 'ASC_RENDER_STAGE3D=1'],
+    linkLibs: ['skia'],
+    ...over,
+  });
+
+  // (1) The flag itself, on every host: this is not "macOS only" knowledge to be
+  // skipped elsewhere -- ELF needs --export-dynamic for the same dlsym to work, and a
+  // host that emits the darwin spelling is a hard link error.
+  check(`the darwin/ELF spelling matches this host`,
+    JSON.stringify(exportDynamicFlags(s3d())) === JSON.stringify(expected()));
+  check('a build with no Stage3D backend keeps its link line byte-for-byte',
+    JSON.stringify(exportDynamicFlags({ ...defaultBuildConfig() })) === JSON.stringify([]));
+  check('wasm never asks for it (no dynamic loader, and the flag is not a wasm-ld flag)',
+    JSON.stringify(exportDynamicFlags(s3d({ target: 'wasm' }))) === JSON.stringify([]));
+  check('the feature-macro spelling counts too',
+    JSON.stringify(exportDynamicFlags(s3d({ defines: ['ASC_RENDER_STAGE3D'] }))) === JSON.stringify(expected()));
+
+  // (2) Both link paths. The AIR app demo takes the multi-step C++ one, which is
+  // exactly where a flags-list edit is easiest to miss.
+  const single = buildCompileCommand(s3d(), 'x.c', 'x.out');
+  check('the single-command link carries it',
+    expected().every((f) => single.includes(f)));
+  check('the single-command link of a non-Stage3D build does not',
+    !buildCompileCommand({ ...defaultBuildConfig(), cCompiler: 'clang' }, 'x.c', 'x.out').some(isExportFlag));
+  // The gate is "does this build link the Metal glue at all", not "is Stage3D
+  // enabled": a headless Stage3D build (examples/stage83.build.json links
+  // stage3d_glue.mm alone) defines ASC_RENDER_STAGE3D but has no symbol to export,
+  // and `-exported_symbol` on an undefined symbol is a hard link error
+  // ("Undefined symbols: _sk_mtl_shared_queue", reproduced on this host).
+  const headless = buildCompileCommand(
+    s3d({ sources: [join(root, 'vendor', 'stage3d_glue.mm')] }), 'x.c', 'x.out');
+  check('a headless Stage3D build gets no export flag (nothing to export, and naming an undefined symbol fails the link)',
+    !headless.some(isExportFlag));
+  check('metal_glue without Stage3D still cannot happen (the flag keys off the source list)',
+    !buildCompileCommand({ ...defaultBuildConfig(), cCompiler: 'clang++', sources: [join(root, 'vendor', 'metal_glue.mm')] }, 'x.c', 'x.out').some(isExportFlag));
+  const steps = buildCompileSteps(s3d(), 'x.c', 'x.out');
+  const linkStep = steps[steps.length - 1];
+  check('the multi-step C++ link carries it',
+    expected().every((f) => linkStep.includes(f)));
+
+  // (3) The generated .app must not reintroduce the race: Xcode has its own flag
+  // surface and does not export the executable's globals either.
+  const outDir = join(root, 'temp', 'unit-xcode-exportdyn');
+  rmSync(outDir, { recursive: true, force: true });
+  mkdirSync(outDir, { recursive: true });
+  const cPath = join(outDir, 'ExportDyn.c');
+  writeFileSync(cPath, 'int main(void) { return 0; }\n');
+  const proj = generateXcodeProject({ ...s3d(), package: 'xcode-project' }, cPath, outDir, 'ExportDyn');
+  const pbx = readFileSync(join(proj.projectPath, 'project.pbxproj'), 'utf8');
+  check('the Xcode project puts it on OTHER_LDFLAGS',
+    expected().length === 0 || pbx.includes(expected()[0]));
+
+  // (4) The mechanism the flag exists for: a by-NAME lookup on the Skia side and a
+  // C-linkage definition on the glue side. Either one disappearing makes the flag
+  // moot (and the two-queue race silently return).
+  const stage3d = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
+  const metal = readFileSync(join(root, 'vendor', 'metal_glue.mm'), 'utf8');
+  check('Stage3D still looks the shared queue up by name',
+    stage3d.includes('dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")'));
+  const cLinkage = /extern "C" \{[\s\S]{0,40000}?sk_mtl_shared_queue\(void\)/.test(metal);
+  check('metal_glue still defines sk_mtl_shared_queue with C linkage (a C++ TU would mangle it)',
+    cLinkage);
+  check('the adoption is still unconditional at create time',
+    /sk_mtl_shared_queue_lookup\(\)/.test(stage3d) && /sharedQueue != nil/.test(stage3d));
+
+  if (ok > 0) console.log(`[exportdyn] ${ok} export-dynamic checks passed`);
+  return bad;
+}
+
+registerGroup('unit: build/ExportDynamic', checkExportDynamic);
 
 // ---- per-config object paths (阶段二百二十三) ----------------------------------
 // Two faces of one defect. The first is silent: two builds that disagree on a flag

@@ -694,6 +694,43 @@ export function linkTrimFlags(cfg: BuildConfig): string[] {
   return flags;
 }
 
+// Export ONE symbol into the executable's DYNAMIC symbol table, so that
+// dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue") finds it at runtime (阶段二百八十八).
+//
+// This is not cosmetic. Stage3D's Metal glue adopts the very MTLCommandQueue that
+// Skia's Ganesh context submits its canvas work on, and it finds that queue by
+// NAME (vendor/stage3d_glue.mm's sk_mtl_shared_queue_lookup): the same file also
+// links into a headless build that has no metal_glue at all, so the accessor
+// cannot be a direct reference. Metal only tracks resource hazards within ONE
+// queue, so when the lookup fails and Stage3D silently falls back to a private
+// queue, the 2D composite (which samples the Stage3D render target) reads it
+// while the 3D pass writes it. Measured on examples/air-starling-demo: 51 of 82
+// benchmark frames composited a target that held only its background pass --
+// sky and 2D overlay, no objects, the user's "画面闪烁消失" -- and 0 of 148 once
+// the queues were actually one. A main executable's globals are NOT in the
+// dynamic symbol table unless the link names them, so the lookup failed in
+// *windowed* builds too, no matter how the glue was written.
+//
+// Named rather than broad because `-export_dynamic` exports every global: on that
+// demo it pushed Skia/ICU symbols into the table and grew the artifact
+// 11,319,104 B -> 12,202,688 B, while naming this one costs 8 KB.
+export function exportDynamicFlags(cfg: BuildConfig): string[] {
+  if (cfg.target === 'wasm') return [];
+  if (process.platform === 'win32') return [];  // a PE exports by dllexport (see d3d_glue.cc)
+  // The gate is "does this build link the Metal glue", not "is Stage3D enabled":
+  // -exported_symbol names a symbol, so a headless Stage3D build
+  // (examples/stage83.build.json links stage3d_glue.mm alone) has nothing there
+  // and fails to link outright ("Undefined symbols: _sk_mtl_shared_queue").
+  const defines = effectiveDefines(cfg);
+  if (!defines.some((d) => d === 'ASC_RENDER_STAGE3D' || d === 'ASC_RENDER_STAGE3D=1')) return [];
+  if (!cfg.sources.some((s) => /(^|[/\\])metal_glue\.mm$/.test(s))) return [];
+  if (process.platform === 'darwin') return ['-Wl,-exported_symbol,_sk_mtl_shared_queue'];
+  // ELF's mirror image would be --export-dynamic-symbol, but that only exists in
+  // GNU ld >= 2.35 / lld and this host cannot tell which linker a user has, so
+  // the universal broad flag stays.
+  return ['-Wl,--export-dynamic'];
+}
+
 // ---- ICU data: link the 0.80 MB blob, not the 10.19 MB default ---------------
 //
 // vendor/skia/lib/macos-arm64/{libskunicode.a,libicu.a} each carry a one-member
@@ -1358,7 +1395,8 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
       ...perfFlags(cfg),
       ...fpFlags(cfg),
       ...debugInfoFlags(cfg),
-      ...linkTrimFlags(cfg)
+      ...linkTrimFlags(cfg),
+      ...exportDynamicFlags(cfg)
     );
     for (const l of posixLinkLibs()) args.push(l);
     for (const l of platformLinkLibs()) args.push('-l', l);
@@ -1575,6 +1613,7 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
     ...fpFlags(cfg),
     ...debugInfoFlags(cfg),
     ...linkTrimFlags(cfg),
+    ...exportDynamicFlags(cfg),
     '-o',
     outPath,
   ];

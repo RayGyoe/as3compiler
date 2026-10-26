@@ -443,6 +443,14 @@ Stage3D 的离屏目标（`ASC_stage3d_tex`）是**同一帧内被先生后读**
 - **不要**用「提交时让 CPU 等 GPU」（Ganesh `GrSyncCpu::kYes`）代替共用队列：那会把每帧的
   CPU/GPU 串行化，正好吃掉阶段一百零四 用批量提交省下的 ~0.6 ms/帧。`MTLSharedEvent` 也不
   可行 —— 它需要一个「合成已读完」的可靠信号，而 Ganesh 给不出。
+- **这条队列是"按名字"取到的，所以链接必须先把它导出**（阶段二百八十八）：`dlsym(RTLD_DEFAULT, …)`
+  查的是**动态符号表**，而主可执行文件自己的全局符号默认**不在**里面（ld64 需要
+  `-exported_symbol`/`-export_dynamic` 才会把符号放进导出表）。此前从没加过这个开关 ⇒ 查找**每次都返回 NULL** ⇒ 窗口应用也一直在走
+  "自建队列"的回落分支，于是本节描述的竞态以「合成读到本帧只画完背景的目标纹理」的形式复活
+  （`air-starling-demo` 上实测：82 个基准帧里 **51 帧**只剩天空和 2D 覆盖层）。`src/build.ts` 的
+  `exportDynamicFlags()` 现在给**链接了 `metal_glue.mm` 的**构建加 `-Wl,-exported_symbol,_sk_mtl_shared_queue`
+  （ELF 用 `-Wl,--export-dynamic`；Windows 不加，PE 走 `dllexport`），两条链接路径 + `--package
+  xcode-project` 的 `OTHER_LDFLAGS` 都带，钉子 `build/ExportDynamic`。**改这条队列的取得方式前先读它**。
 
 **验收**（`temp/ringdiag/cap.py`：窗口定位 + 光标预停窗口中心冻结相机 + 区域截屏连拍）：共用队列后
 **390 帧零切割**（修复前 25 帧里 11 帧被切，`adl` 60 帧零撕裂）。
@@ -570,6 +578,13 @@ bindtex=1679 cube=1 uptex=0 mipbuild=0 mipdrop=0`，截图 204748/204800 像素�
 Stage3D 构建（链 `stage3d_glue` 而不链 `metal_glue`）会链接失败；阶段一百二十八 改成
 `dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")` 惰性查找（函数指针缓存，取不到用自有队列），
 普通清单即可链接。钉子在 `stage3d/gpu-queue-sharing`。
+
+**阶段二百八十八 补上了这次改动漏掉的一半**：dlsym 查的是动态符号表，而主可执行文件的全局
+符号默认不在那张表里 —— 所以"取不到就回落"这条分支在**窗口应用里也一直在生效**，共用队列从未
+真正生效（阶段一百一十四 的验收数据是在两者同处一个 TU/同一队列的条件下量的，掩盖了它）。
+现在由构建侧 `-Wl,-exported_symbol,_sk_mtl_shared_queue`（ELF 为 `-Wl,--export-dynamic`）保证符号
+可见，钉子 `build/ExportDynamic` 同时钉住"开关只出现在链接了 `metal_glue.mm` 的构建里"（headless
+Stage3D 构建导出未定义符号会**链接失败**）与"两条链接路径都带它"。
 
 ### 9.14 纹理尺寸上限与 `Context3D.ignoreResourceLimits`（阶段二百二十七）
 

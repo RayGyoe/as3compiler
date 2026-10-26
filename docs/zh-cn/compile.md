@@ -1135,6 +1135,14 @@ build manifest: unknown field 'link-lib' (did you mean 'link-libs'?)
 > 需要按目标区分链接库/宏（如 native 链接 curl、wasm 不能）时，用清单的 `targets` 块
 > （§4.1）——一份清单即可覆盖上表多个后端，不必为每个目标维护一份清单。
 
+**链接了 `vendor/metal_glue.mm` 的构建还会多一枚链接旗标 `-Wl,-exported_symbol,_sk_mtl_shared_queue`**
+（ELF 写法 `-Wl,--export-dynamic`；Windows 不加，PE 走 `dllexport` 导出表）。它不是可选的优化项：Stage3D 的
+Metal 后端要在运行时用 `dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")` **按名字**采纳 Skia 那条
+`MTLCommandQueue`（同一队列才有 Metal 的冒险跟踪，否则 2D 合成会读到 3D 通道的半成品），而主可执行
+文件的全局符号默认**不在**动态符号表里 ⇒ 不导出就**恒查找失败**、静默回落到自建队列。只在
+Stage3D 构建里加，是为了让普通产物保持逐字节不变（导出全部全局会让产物变大）。`--package
+xcode-project` 的 `OTHER_LDFLAGS` 同样带这枚旗标。钉子：`build/ExportDynamic`。
+
 平台耦合点已隔离到 `runtime.ts` 的 `RUNTIME_PREAMBLE`，用 `#ifdef __wasi__` 条件编译。
 当前唯一的平台差异是 `as_now_ms()`：
 
