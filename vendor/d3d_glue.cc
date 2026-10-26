@@ -127,6 +127,13 @@ static double g_d3d_retry_at = 0.0;
 static int g_d3d_retry_ms = 250;
 static int g_d3d_rebuilds = 0;
 
+// ASC_GPU_LOSE_AT=<frame>: remove the device on purpose (ID3D12Device5::RemoveDevice)
+// to exercise the recovery path. -1 means "the env has not been read yet", 0 means
+// off. Only a genuinely removed device makes Skia's teardown unsafe, so a simulated
+// loss would prove nothing -- this hook asks DXGI to remove the real one.
+static long g_d3d_lose_at = -1;
+static long g_d3d_frames_seen = 0;
+
 // The HRESULTs that mean "this device is gone". Anything else (a bad argument, an
 // occluded present) leaves the swapchain usable, so it must not trigger a rebuild.
 static int d3d_hr_is_device_lost(HRESULT hr) {
@@ -250,6 +257,15 @@ static D3DWin* d3d_slot(int win_id) {
   return g_d3d[win_id].used ? &g_d3d[win_id] : nullptr;
 }
 
+// Is the device actually gone? Only that makes Skia's teardown unsafe -- a failed
+// rebuild may well have installed a HEALTHY device (the swapchain then failed for an
+// unrelated reason) which must be destroyed the normal way. GetDeviceRemovedReason()
+// is a local query: nothing is submitted.
+static int d3d_device_gone(void) {
+  if (g_device.get() == nullptr) return 1;
+  return FAILED(g_device->GetDeviceRemovedReason());
+}
+
 // Release every GPU object. Used by the lost path (the objects are already
 // invalid) and by a failed rebuild (a partial set must not outlive the attempt).
 //
@@ -257,7 +273,24 @@ static D3DWin* d3d_slot(int win_id) {
 // pending, which is precisely the operation that must not happen on a removed
 // device. abandonContext() is Skia's contract for "the backend context is gone" --
 // it drops every resource without submitting anything.
-static void d3d_drop_gpu_state(void) {
+//
+// abandonContext is NECESSARY BUT NOT SUFFICIENT on a removed device, and that is
+// what "device lost then crash" turned out to be. GrGpu::disconnect() is an empty
+// default and GrD3DGpu does not override it, so abandoning drops the resources and
+// leaves fCurrentDirectCommandList in place; the context still has to be destroyed
+// after that, and ~GrDirectContext -> ~GrD3DGpu -> destroyResources() calls
+//   fCurrentDirectCommandList->close();   // submitResourceBarriers + ID3D12 Close
+//   waitForQueueCompletion();             // SetEventOnCompletion + INFINITE wait
+// -- i.e. exactly the two things that must not happen on a device DXGI took away.
+// Measured (temp/crashmon dumps, 0xc0000005 twice): the process dies inside
+//   ?close@GrD3DCommandList@@QAE_NXZ+0x2a
+//   <- ~GrDirectContext <- d3d_drop_gpu_state <- d3d_mark_lost("Present") <- sk_gpu_flush
+// and had the close been harmless, the fence wait right after it would have hung the
+// window instead (AppHangB1). GrDirectContext exposes no "destroy without teardown"
+// entry point, so on a lost device the context is PARKED: the last reference is
+// released without ever being freed. One loss costs one context (~KB; the resource
+// cache was emptied by abandonContext) and the rebuild below creates a fresh one.
+static void d3d_drop_gpu_state(int device_gone) {
   for (int i = 0; i < SK_D3D_MAX_WINDOWS; ++i) {
     D3DWin* w = &g_d3d[i];
     for (int b = 0; b < SK_D3D_NUM_FRAMES; ++b) {
@@ -274,7 +307,19 @@ static void d3d_drop_gpu_state(void) {
   }
   if (g_context != nullptr) {
     g_context->abandonContext();
-    g_context.reset();
+    if (device_gone) {
+      // Deliberate leak, for the reason spelled out above: the destructor would close
+      // a command list and wait on a fence of the removed device.
+      GrDirectContext* parked = g_context.release();
+      fprintf(stderr,
+              "d3d_glue: parking the lost GrDirectContext (%p) instead of destroying "
+              "it: its destructor closes a command list and waits on a fence of the "
+              "removed device\n",
+              (void*)parked);
+      fflush(stderr);
+    } else {
+      g_context.reset();
+    }
   }
   g_queue.reset();
   g_device.reset();
@@ -284,6 +329,26 @@ static void d3d_drop_gpu_state(void) {
 // Enter the lost state. Must run BEFORE anything else touches Skia after a failing
 // call: the Present/ResizeBuffers failure is only the symptom, and the next flush()
 // would go on to record into the removed device.
+// The removal reason DXGI reports, in words. GetDeviceRemovedReason() is the only
+// thing that distinguishes "the driver was reset under us" (DEVICE_RESET/DEVICE_HUNG,
+// a TDR: something -- ours or the compositor's -- held one submission too long) from
+// "we ran the GPU out of memory" (OUTOFMEMORY: a texture or buffer that is too big,
+// e.g. a shared-screen frame or a very large bitmap) from "the driver crashed"
+// (DRIVER_INTERNAL_ERROR). Without it the log says only 0x887A0005, which is the same
+// code for all of them.
+static const char* d3d_removed_reason_name(HRESULT reason) {
+  switch (reason) {
+    case S_OK: return "not removed";
+    case DXGI_ERROR_DEVICE_HUNG: return "DEVICE_HUNG (a submission did not finish in time)";
+    case DXGI_ERROR_DEVICE_REMOVED: return "DEVICE_REMOVED (hardware/driver reset)";
+    case DXGI_ERROR_DEVICE_RESET: return "DEVICE_RESET (bad command or driver reset)";
+    case DXGI_ERROR_DRIVER_INTERNAL_ERROR: return "DRIVER_INTERNAL_ERROR";
+    case E_OUTOFMEMORY: return "OUTOFMEMORY (video memory exhausted)";
+    case DXGI_ERROR_INVALID_CALL: return "INVALID_CALL";
+    default: return "unrecognised";
+  }
+}
+
 static void d3d_mark_lost(const char* what, HRESULT hr) {
   if (g_d3d_lost) return;
   g_d3d_lost = 1;
@@ -293,8 +358,17 @@ static void d3d_mark_lost(const char* what, HRESULT hr) {
           "d3d_glue: GPU device lost (%s, 0x%08lx): dropping every GPU object; "
           "frames are skipped and the device is rebuilt in %d ms\n",
           what, (unsigned long)hr, g_d3d_retry_ms);
+  // Asked BEFORE the device is released below.
+  if (g_device.get() != nullptr) {
+    const HRESULT reason = g_device->GetDeviceRemovedReason();
+    fprintf(stderr, "d3d_glue: device removed reason 0x%08lx: %s\n",
+            (unsigned long)reason, d3d_removed_reason_name(reason));
+  }
   fflush(stderr);
-  d3d_drop_gpu_state();
+  // The caller of d3d_mark_lost is by definition a call that failed because the
+  // device is gone, so the teardown must not go through Skia (see the note above
+  // d3d_drop_gpu_state).
+  d3d_drop_gpu_state(1);
 }
 
 // Progress trace for the backend's init sequence. Without it a hang inside
@@ -480,11 +554,14 @@ static int d3d_create_swapchain(D3DWin* w, HWND hwnd, int cw, int ch) {
 // holding a swapchain against a device about to be discarded would be the same bug
 // one level down).
 static int d3d_rebuild_all(void) {
-  if (!d3d_init_shared()) { d3d_drop_gpu_state(); return 0; }
+  // d3d_device_gone(), not 1: the context dropped here may be the fresh one just
+  // created by d3d_init_shared (the swapchain then failed for an unrelated reason),
+  // and destroying a context on a healthy device is the normal, freeing path.
+  if (!d3d_init_shared()) { d3d_drop_gpu_state(d3d_device_gone()); return 0; }
   for (int i = 0; i < SK_D3D_MAX_WINDOWS; ++i) {
     if (!g_d3d[i].used) continue;
     if (!d3d_create_swapchain(&g_d3d[i], g_d3d[i].hwnd, g_d3d[i].width, g_d3d[i].height)) {
-      d3d_drop_gpu_state();
+      d3d_drop_gpu_state(d3d_device_gone());
       return 0;
     }
   }
@@ -577,15 +654,21 @@ int sk_gpu_init(int win_id, void* native_handle) {
 // a device we are about to drop.
 void sk_gpu_destroy(int win_id) {
   D3DWin* w = d3d_slot(win_id);
+  // A device DXGI has taken away must not be flushed, waited on, or torn down through
+  // Skia (see the note above d3d_drop_gpu_state). d3d_device_gone() is a local query,
+  // so this also covers a window closed on the very frame the device went away --
+  // before any frame got the chance to mark the loss -- where the fence wait below
+  // would otherwise block forever on a queue that will never signal.
+  const int device_gone = d3d_device_gone();
   if (w != nullptr) {
     // The queue may still be executing the last present of this window; drain it
     // before anything it reads is released.
-    if (g_context != nullptr) {
+    if (!device_gone && g_context != nullptr) {
       g_context->flush();
       g_context->submit(GrSyncCpu::kYes);
     }
     for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) {
-      if (w->fence.get() != nullptr && w->fence_event != NULL &&
+      if (!device_gone && w->fence.get() != nullptr && w->fence_event != NULL &&
           w->fence->GetCompletedValue() < w->fence_values[i]) {
         D3D_OK_OR_WARN(w->fence->SetEventOnCompletion(w->fence_values[i], w->fence_event));
         WaitForSingleObjectEx(w->fence_event, INFINITE, FALSE);
@@ -604,6 +687,12 @@ void sk_gpu_destroy(int win_id) {
   for (int i = 0; i < SK_D3D_MAX_WINDOWS; ++i) {
     if (g_d3d[i].used) return;
   }
+  if (device_gone) {
+    // Same rule as the lost path: nothing Skia owns may be destroyed on a removed
+    // device. This is also what releases the shared device/queue/adapter.
+    d3d_drop_gpu_state(1);
+    return;
+  }
   g_context.reset();
   g_queue.reset();
   g_device.reset();
@@ -616,6 +705,30 @@ void sk_gpu_destroy(int win_id) {
 // Returns NULL when the frame cannot start, so the render loop skips the frame
 // instead of drawing into a resource DXGI has taken away.
 void* sk_gpu_begin_frame(int win_id, int width, int height) {
+  // ASC_GPU_LOSE_AT=<frame>: remove the device on purpose. ID3D12Device5::RemoveDevice()
+  // puts it into the same removed state a TDR does (GetDeviceRemovedReason() then
+  // answers DXGI_ERROR_DEVICE_REMOVED), which is what makes the recovery path testable
+  // at all: the whole reason it needs a test is that a mistake in it is an access
+  // violation inside Skia, and no synthetic flag reproduces that -- only a device that
+  // is really gone does.
+  if (g_d3d_lose_at < 0) {
+    const char* loseAt = getenv("ASC_GPU_LOSE_AT");
+    g_d3d_lose_at = loseAt != nullptr ? atol(loseAt) : 0;
+  }
+  if (g_d3d_lose_at > 0 && !g_d3d_lost && g_device.get() != nullptr &&
+      ++g_d3d_frames_seen == g_d3d_lose_at) {
+    gr_cp<ID3D12Device5> dev5;
+    if (SUCCEEDED(g_device->QueryInterface(IID_PPV_ARGS(&dev5))) && dev5.get() != nullptr) {
+      fprintf(stderr, "d3d_glue: ASC_GPU_LOSE_AT=%ld -- removing the device on purpose\n",
+              g_d3d_lose_at);
+      fflush(stderr);
+      dev5->RemoveDevice();
+      // Straight into the lost path: the reconcile logic further down would wait on a
+      // fence this device can no longer reach.
+      d3d_mark_lost("ASC_GPU_LOSE_AT", DXGI_ERROR_DEVICE_REMOVED);
+      return nullptr;
+    }
+  }
   // THE device-lost gate. GetDeviceRemovedReason() is a local query (nothing is
   // submitted), so asking it every frame costs one call and catches the removal
   // BEFORE Present/ResizeBuffers have to fail -- the frames between those two

@@ -2045,6 +2045,83 @@ function checkWindowsHostBackends(): string[] {
 
 registerGroup('unit: platform/WindowsHostBackends', checkWindowsHostBackends);
 
+// Device loss on the Windows GPU backend (阶段二百九十七). DXGI takes the device away
+// (TDR, driver update, VRAM pressure) and every object created from it dies with it.
+// The recovery itself is 阶段二百七十八; what this group pins is the part that made the
+// recovery crash: Skia's teardown of a REMOVED device.
+//
+// Measured (temp/crashmon, two dumps, both 0xc0000005):
+//   ?close@GrD3DCommandList@@QAE_NXZ+0x2a
+//   <- ~GrDirectContext <- d3d_drop_gpu_state <- d3d_mark_lost("Present") <- sk_gpu_flush
+// GrGpu::disconnect() is an empty default and GrD3DGpu does not override it, so
+// abandonContext() drops the resources but leaves fCurrentDirectCommandList alone; the
+// destructor that follows then runs destroyResources():
+//   fCurrentDirectCommandList->close();   // submitResourceBarriers + ID3D12 Close
+//   waitForQueueCompletion();             // SetEventOnCompletion + INFINITE wait
+// Both are calls into the removed device -- an access violation, or (if the close
+// happened to be harmless) a window that never answers again. Hence "park it".
+//
+// The recovery flow itself is exercised end to end with ASC_GPU_LOSE_AT=<frame>, which
+// asks DXGI for a real removal (ID3D12Device5::RemoveDevice) instead of flipping a
+// boolean: a merely-simulated loss leaves the user-mode driver alive and proves nothing.
+function checkDeviceLost(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [devicelost] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [devicelost] ${label}`); }
+  };
+  const read = (rel: string): string =>
+    readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
+  // Only real code: every comment below names the very calls being ruled out.
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const d3d = strip(read('d3d_glue.cc'));
+
+  // ---- the teardown branches on "is the device actually gone", and parks ----
+  check('the GPU-state drop takes "the device is gone" as an argument',
+    /static void d3d_drop_gpu_state\(int device_gone\)\s*\{/.test(d3d));
+  check('...it still abandons the context (dropping the resources without submitting)',
+    /abandonContext\(\);/.test(d3d));
+  check('...and on a gone device it PARKS the context instead of destroying it',
+    /if \(device_gone\) \{[\s\S]{0,900}?g_context\.release\(\);[\s\S]{0,900}?\} else \{[\s\S]{0,120}?g_context\.reset\(\);/.test(d3d));
+  // A parked context is a deliberate leak, so it must say so once per loss.
+  check('...reporting that it is parked, and why',
+    /parking the lost GrDirectContext/.test(d3d));
+
+  // ---- the three call sites ----
+  // mark_lost: by definition the device is gone, so never the destroying branch.
+  check('d3d_mark_lost drops through the lost branch unconditionally',
+    /static void d3d_mark_lost\(const char\* what, HRESULT hr\)[\s\S]{0,2400}?d3d_drop_gpu_state\(1\);/.test(d3d));
+  check('...after reporting WHY DXGI took the device (GetDeviceRemovedReason)',
+    /GetDeviceRemovedReason\(\)[\s\S]{0,300}?d3d_removed_reason_name\(reason\)/.test(d3d));
+  // A failed rebuild may already hold a HEALTHY device, which must be freed normally.
+  check('a failed rebuild asks the device instead of assuming, both times',
+    (d3d.match(/d3d_drop_gpu_state\(d3d_device_gone\(\)\)/g) ?? []).length === 2);
+  check('the rebuild path keeps destroying on a healthy device (no leak when nothing is lost)',
+    /static int d3d_device_gone\(void\) \{[\s\S]{0,300}?FAILED\(g_device->GetDeviceRemovedReason\(\)\)/.test(d3d));
+
+  // Closing a window on a lost device must not flush/await/destroy through Skia either.
+  const destroyAt = d3d.indexOf('void sk_gpu_destroy(int win_id) {');
+  const destroyBody = destroyAt < 0 ? '' : d3d.slice(destroyAt, d3d.indexOf('\n}\n', destroyAt));
+  check('sk_gpu_destroy asks whether the device is gone before touching Skia',
+    destroyAt > 0 && /const int device_gone = d3d_device_gone\(\);/.test(destroyBody));
+  check('...so the flush/submit and the per-buffer fence wait are both skipped',
+    /if \(!device_gone && g_context != nullptr\) \{/.test(destroyBody) &&
+    /if \(!device_gone && w->fence\.get\(\) != nullptr/.test(destroyBody));
+
+  // ---- the way to exercise all of the above on a real device ----
+  check('ASC_GPU_LOSE_AT removes the device for real, via ID3D12Device5::RemoveDevice',
+    /ASC_GPU_LOSE_AT/.test(d3d) && /dev5->RemoveDevice\(\);/.test(d3d));
+  check('...and goes straight into the lost path rather than on to the acquire wait',
+    /dev5->RemoveDevice\(\);[\s\S]{0,400}?d3d_mark_lost\("ASC_GPU_LOSE_AT"[\s\S]{0,120}?return nullptr;/.test(d3d));
+
+  if (ok > 0) console.log(`[devicelost] ${ok} checks passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/DeviceLost', checkDeviceLost);
+
 // The CPU-raster window blit, and the one assumption that broke it (阶段二百七十三).
 //
 // Skia's kN32 is a BUILD-TIME property of the TARGET: include/core/SkTypes.h sets

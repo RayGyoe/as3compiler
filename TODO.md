@@ -16966,7 +16966,66 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 **五、如实报明（新登记，不在本阶段范围）**
 同探针量到一条**独立**偏差：**输入进去的字符取 `defaultTextFormat`，而 AIR 取「插入点前一个字符的 run 格式」** —— 探针里 `adl` 提交的「框」是**黑色**（承前文 run），我们的是红色（`adc-commit.png` vs `q3-commit.png`）。它不影响光标取色（光标已按字符取色），但会让「正文格式 ≠ 默认格式」的字段里新输入的字符颜色/字号不对。已登记 `### 遗留待开发`。
 
+### 阶段二百九十七：D3D12 设备丢失后的收尾 —— 「恢复」本身把进程打死了（v0.4.259 → v0.4.260）✅ 已完成
+
+**一、起因**（用户报）：共享屏幕选完之后崩溃，日志最后一行是
+`d3d_glue: GPU device lost (Present, 0x887a0005): dropping every GPU object; frames are skipped and the device is rebuilt in 250 ms`。
+即阶段二百七十八 写的**恢复路径自己被走到了，然后在恢复里死掉**。
+
+**二、根因（两份 dump + Skia 源码）**
+
+`temp/crashmon` 的两份 dump 都是 `0xc0000005`，栈完全相同：
+
+```
+?close@GrD3DCommandList@@QAE_NXZ+0x2a
+  <- ~GrDirectContext <- d3d_drop_gpu_state <- d3d_mark_lost("Present") <- sk_gpu_flush
+```
+
+`abandonContext()` 不够，原因是它**根本管不到这一步**：
+
+1. `GrDirectContext::abandonContext()`（`GrDirectContext.cpp:135`）释放的是**资源**：
+   `fResourceProvider->abandon()` / `fResourceCache->abandonAll()` / `fGpu->disconnect(kAbandon)`。
+2. 而 `GrGpu::disconnect()` 是**空实现**（`GrGpu.cpp:52`），`GrD3DGpu` **没有覆写**它 ⇒
+   `fCurrentDirectCommandList` 原封不动留在 GPU 对象里。
+3. 于是紧接着的 `g_context.reset()` 走 `~GrDirectContext` → `~GrD3DGpu` →
+   `destroyResources()`（`GrD3DGpu.cpp:112`），它做的两件事都是**打向已被 DXGI 收走的设备**：
+   `fCurrentDirectCommandList->close()`（`submitResourceBarriers()` + `ID3D12 Close`）与
+   `waitForQueueCompletion()`（`SetEventOnCompletion` + **`WaitForSingleObject(INFINITE)`**）。
+
+换句话说：**close 那一步是 dump 里的 AV，close 若是侥幸成功，下一步的无界栅栏等待就是 AppHangB1**。
+两条路都不能走，而 `GrDirectContext` **没有**「析构但不收尾」的公开入口。
+
+**三、改动（`vendor/d3d_glue.cc`）**
+
+| # | 改动 | 为什么 |
+|---|---|---|
+| 1 | `d3d_drop_gpu_state(int device_gone)`：`device_gone` 时 `abandonContext()` 之后 **park**（`g_context.release()`，最后一根引用直接丢掉、永不释放），否则照旧 `reset()` | 上面第 3 步的析构是唯一崩溃点，park 是唯一能跳过它的做法；**这是刻意的内存泄漏**，每次设备丢失泄漏一个 context（`abandonContext` 已把资源缓存清空，残留只有 KB 级），并**每次都打印一行**说明，不是静默降级 |
+| 2 | 新增 `d3d_device_gone()`（`FAILED(GetDeviceRemovedReason())`，本地查询不提交），三个调用点按「设备是否真的没了」分支 | `d3d_mark_lost` 传 `1`（按定义设备已没）；**重建失败**时 `d3d_drop_gpu_state(d3d_device_gone())` —— 那里可能已经装上了一台**健康**设备（只是 swapchain 失败），必须正常释放，否则白漏 |
+| 3 | `d3d_mark_lost` 打印 `GetDeviceRemovedReason()` 的名字（HUNG / REMOVED / RESET / DRIVER_INTERNAL_ERROR / OUTOFMEMORY / INVALID_CALL） | `0x887A0005` 对以上原因**是同一个码**，只有这个查询能区分「被 TDR」和「显存被吃光」；下一次用户报同一句话时，日志就能直接指出方向 |
+| 4 | `sk_gpu_destroy` 先问 `d3d_device_gone()`，为真则跳过 `flush()`/`submit(kYes)` 与逐槽 `WaitForSingleObjectEx(INFINITE)`，最后走 `d3d_drop_gpu_state(1)` | 同一条铁律的第二个入口：**设备已收走但还没有任何一帧看见**（用户正好在丢失那一帧关窗）时，原来会在无界栅栏等待上挂死 |
+| 5 | 诊断钩子 `ASC_GPU_LOSE_AT=<帧>`：`ID3D12Device5::RemoveDevice()` 真的把设备移除，然后直接进 `d3d_mark_lost` | 恢复路径唯一的测法。**合成标志不行**：只翻一个 bool 的话设备仍然健康，`close()` 会正常成功，什么都测不到 |
+
+**四、实测（`temp/d3dlost`：`D3DLost.as` = 420×260 + `renderMode=direct` + 每帧移动的橙色圆 + 帧号字幕）**
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 修复后跑 `ASC_GPU_LOSE_AT=30` | 进程**活着**：`removing the device on purpose` → `GPU device lost` → `device removed reason 0x887a0005: DEVICE_REMOVED` → `parking the lost GrDirectContext (0000…)` → `GPU device rebuilt (attempt 1); rendering resumed` | `temp/d3dlost/fixed-30.err` / `verify2.err` |
+| 重建后**画面真的在动** | 两次截图间隔 600 ms，橙圆包围盒 `x365..489` → `x315..440`；字幕已经是 `frame 288`（丢失发生在第 30 帧） | `temp/d3dlost/afterA.png` / `afterB.png` + `disc.cjs` |
+| **对照**：同一探针、同一 `ASC_GPU_LOSE_AT`，只把 `d3d_drop_gpu_state` 的收尾换回阶段二百七十八 的写法（无条件 `g_context.reset()`） | 同样**没有**崩 —— 因为 `ID3D12Device5::RemoveDevice()` 是**用户态合成移除**，驱动对象仍然有效，`Close()` 只会返回失败码而不会 AV | `temp/d3dlost/before-30.err`（`D3DLost-before.exe`） |
+
+**五、如实报明**
+
+1. **AV 本身没能在本机复现**：合成移除只能走通「丢失→丢弃→重建→继续出帧」的**流程**，不能重放 `?close@GrD3DCommandList+0x2a` 那条 AV（真实 TDR 会连用户态驱动一起失效）。所以「park 掉析构」这一步的依据是**两份 dump 的栈 + Skia 源码**（`destroyResources` 无条件 `close()`），不是本机的二次复现 —— 按 §1.5 如实标注，不写成「已实测修复」。
+2. **跨端**：Metal（`metal_glue.mm`）与 WGL（`gl_glue.cc`）**完全没有设备丢失检测** —— 不查 `MTLCommandBuffer.status`、不查 `GL_CONTEXT_LOST`，连「丢了」都不知道，因此也不存在本阶段这条崩溃路径。按要求逐端查过（Windows 缺陷必须一次修完），但两端**都没有可对照的东西可修**，且本机是 Windows、`.mm`/GL 丢失都无法编译验证 ⇒ **登记**在 `### 遗留待开发`，不在这台机器上盲写。
+3. **park 是有意为之的泄漏**：每次丢失一个 `GrDirectContext`（+ 它对 device/queue 的引用）。设备丢失是罕见事件（TDR/驱动更新/显存耗尽），且每次都会打印一行 —— 换取的是「恢复路径绝不碰已死设备」。
+
+**六、回归**
+
+- `node test.ts`：523 例 / 517 过 / 4 红，与基线一致（`socket`、`stage94d`、`status-item`、`inline StackCanary`）。
+- 新增单元组 `unit: platform/DeviceLost`（12 条源级钉）：drop 的分支与 park、`mark_lost` 固定走丢失分支、`GetDeviceRemovedReason` 取名、重建失败走 `d3d_device_gone()`（两处）、`sk_gpu_destroy` 的两处跳过、`ASC_GPU_LOSE_AT` 走真移除并直达丢失路径。
+
 ### 遗留待开发
+> **2026-10-27 追加（阶段二百九十七：D3D12 设备丢失的收尾）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 本表 **98 → 99 项**（`未开始` **76 → 77** / `部分完成` 20 / `调研完成·实现暂缓` 1 / 已完成 1）。**本阶段修的那条不占表**：崩溃在 `adl` 上不存在对应物（它是我们自家 D3D12 后端的收尾），且同阶段落地。新登记的 1 行是**跨端**剩下的：Metal 与 WGL 后端**连设备丢失检测都没有**（本机是 Windows，`.mm`/GL 丢失两条都无法在本机编译验证，故只登记、不盲写）。
 > **2026-10-27 追加（阶段二百九十六：IME 合成与光标四条）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **97 → 98 项**（`未开始` **75 → 76** / `部分完成` 20 / `调研完成·实现暂缓` 1 / 已完成 1）。**本阶段修净的五条都不占表**（合成事件被路由到死窗、SDL 不画候选窗、光标取错色、静态画面不闪、合成期光标停在首字母）：它们在 `adl` 上都是「跑得对」、我们此前跑不出 ⇒ 属 §1.5 的**遗留缺陷**，但同阶段落地，按表头自述「已完成项一经落地即从本表移出」故不入表。新登记的 1 行是同探针**顺带量到**的独立偏差：输入字符的格式取 `defaultTextFormat` 而非「插入点前一个字符的 run 格式」。
 > **2026-10-27 追加（阶段二百九十五：`REMOVED_FROM_STAGE` 的派发时机）**：**新登记 1 行 / 改写 1 行 / 移出 0 行**（把「每条鼠标通知抛一次 `#1009`」改判已完成 ⇒ 净 0 行）。新登记的那行是 A/B 探针顺带量到的**真语义缺口**（不是本阶段要修的 tips 缺陷）：`DisplayObject_get_stage` 的 `ASC_root_stage` 兜底对所有孤立对象生效，`adl` 答 `null`。
 > **2026-10-27 追加（阶段二百九十四：`DisplayObject.parent` 的静态类型）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **95 → 96 项**（`未开始` **74 → 75** / `部分完成` 20 / `调研完成·实现暂缓` 1）。**本阶段修的 tips 缺陷不占表**：`adl` 跑得对（tip 正常显示）、我们此前跑不出 ⇒ 属 §1.5 的**遗留缺陷**，但阶段内已修净，按表头自述「已完成项一经落地即从本表移出」故不入表。新登记的 1 行是**顺带量到的全局隐患**：真机每条鼠标通知抛一次 `#1009`，触发点未定。
@@ -17133,6 +17192,7 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 >
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
+| **Metal 与 WGL 两个窗口 GPU 后端没有任何设备丢失检测**（`metal_glue.mm` 不看 `MTLCommandBuffer.status`、`gl_glue.cc` 不看 `GL_CONTEXT_LOST`/`glGetError()`；D3D12 侧阶段二百七十八 起有「丢弃+重建」，阶段二百九十七 修掉了它自己的崩溃） | 未开始（2026-10-27 阶段二百九十七 修 Windows 端时按「平台缺陷跨端一次修完」逐端查过；两端都**没有可对照的代码**可改，属既有缺口，非本轮引入） | 后果与 D3D12 不同，因为是**静默**的：Metal 上设备重启（Apple Silicon 上是 `MTLCommandBufferError` 的「innocent victim」）后帧照样编码、照样 `presentDrawable`，画面停在最后一帧且没有任何一行日志；WGL 上 `GL_CONTEXT_LOST` 之后每个 GL 调用都是 no-op，窗口冻住。两端都**不会崩**，所以一直没人报。 | 先做**检测+报明**（Metal：命令缓冲 `status == MTLCommandBufferStatusError` 且 `error.code` 属设备类时打一行并丢弃该帧；GL：每帧一个 `glGetError()==GL_CONTEXT_LOST` 检查），再决定要不要做重建（GL 的重建要重建整个 SDL GL 上下文，代价远大于 D3D12/Metal）。**必须在真机上做**：本机（Windows）编译不了 `.mm`，也无法制造 GL 上下文丢失。 |
 | **输入进 `TextField` 的字符取 `defaultTextFormat`，而非「插入点前一个字符的 run 格式」**（`as_tf_insert_payload` → `as_tf_splice` 不给新字节挂 run，排版时无 run 覆盖就落到 `defaultTextFormat`；`adl 51.4.1` 实测同一个字段（正文黑 run / `defaultTextFormat` 红）里提交的「框」是**黑色**，我们的是红色，见 `temp/imelive/adc-commit.png` vs `q3-commit.png`） | 未开始（2026-10-27 阶段二百九十六 做 IME 探针时量到；该阶段只修光标取色，未动插入的格式继承） | 只影响「正文格式 ≠ 默认格式」的字段：新输入字符的颜色/字号/字体全部回落到 `defaultTextFormat`（深色主题下会出现「跟随默认色而非正文色」的字符）。`as_tf_splice` 目前**既不克隆也不平移** run 表，插入/删除之后既有 run 的区间也不随文本移动 ⇒ 两件事要一起处理才能对齐 AIR。 | 在 `as_tf_splice` 里按 AIR 口径（插入点前一个字符的 run，无前置字符取后一个，都没有才 `defaultTextFormat`）克隆 `TextFormat` 挂新区间，同时平移插入点之后的 run 区间；改后重跑 `temp/editprobe` 的格式化对照 + `unit: text-input/*` |
 | **`DisplayObject.stage` 对「已不在显示列表上」的对象返回主窗 Stage 而非 `null`**（`DisplayObject_get_stage` 末尾 `return ASC_root_stage;` 对所有孤立对象兜底；`adl 51.4.1` 实测 `after stage=null`，我们答 `stage`，见 `temp/dispabort/`） | 未开始（2026-10-27 阶段二百九十五 做出 A/B 探针时量到；本阶段只修派发时机，未动兜底） | 兜底本身是为 document class **构造期**的 `stage` 非 null（Flash 语义），但它区分不了「document class 实例」与「任意孤立 Sprite」⇒ `if (obj.stage == null)` 这类守卫在对象被摘除后判错，`stage.removeChild(...)` 会打到**另一个窗口**的 Stage 上（找不到子件 ⇒ 返回 null，多数场景无害但语义错）。 | 加 `static void* ASC_doc_root`（窗口创建时指向 document class 实例），只在 `o == ASC_doc_root` 时兜底、其余返回 NULL；改后必须全量回归（`examples/` 里若有孤立对象读 `stage` 的会变红） |
 | **每条鼠标通知抛一次 `#1009`**（真机 talkmed-meeting 设置窗实测：空区 20 次移动 → 未捕获异常计数 +20，与是否有 tooltip 无关） | 已完成（2026-10-27 阶段二百九十五：根因是 `removedFromStage` 派发得太晚 —— tip 被摘除后监听器残留在设置窗 Stage 上，见该阶段节） | 在我们的（与 `adl` 对齐的）派发语义下，未捕获异常会**中断该次派发的剩余监听器** ⇒ 排在后面的监听器全都不执行；应用在 `adl` 上跑得对，故这条大概率是**我们的**空接收者守卫多报。证据：`temp/tipsetup/tips-trace2.txt`（`… #1009 (19 more of the same)` 与每次 `t=… mouse mouseMove` 一一对应） | 待定 |
