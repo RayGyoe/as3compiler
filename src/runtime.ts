@@ -9297,6 +9297,38 @@ static void as_oom_hook_install(void) {
 #endif
 }
 
+// Platform clipboard (flash.desktop.Clipboard + flash.system.System.setClipboard,
+// 阶段二百九十三). The text format is the one every backend carries (SDL text on
+// the window backends, nothing on a headless/web build); the other three translated
+// formats are asked for by name, and a backend that cannot carry one answers 0.
+//   has_fmt  : 1 when the OS clipboard currently holds that format
+//   get_fmt  : bytes written; with buf == NULL it returns the LENGTH instead, which
+//              is how the caller sizes its buffer
+//   set_fmt  : replaces just that format, leaving the others alone
+//   clear    : empties the whole clipboard; clear_fmt removes one format
+// Implemented by the window backend, so a skia build without a window (a PNG-only,
+// not-visible air app) gets the same no-op stubs as the pure-C build instead of an
+// unresolved link.
+#ifdef ASC_USE_WINDOW
+extern void sk_clipboard_set_text(const char* text);
+extern int sk_clipboard_get_text(char* buf, int cap);
+extern int sk_clipboard_available(void);
+extern int sk_clipboard_has_fmt(const char* fmt);
+extern void sk_clipboard_set_fmt(const char* fmt, const void* data, int len);
+extern int sk_clipboard_get_fmt(const char* fmt, char* buf, int cap);
+extern void sk_clipboard_clear_fmt(const char* fmt);
+extern void sk_clipboard_clear(void);
+#else
+static inline void sk_clipboard_set_text(const char* text) { (void)text; }
+static inline int sk_clipboard_get_text(char* buf, int cap) { (void)buf; (void)cap; return 0; }
+static inline int sk_clipboard_available(void) { return 0; }
+static inline int sk_clipboard_has_fmt(const char* fmt) { (void)fmt; return 0; }
+static inline void sk_clipboard_set_fmt(const char* fmt, const void* data, int len) { (void)fmt; (void)data; (void)len; }
+static inline int sk_clipboard_get_fmt(const char* fmt, char* buf, int cap) { (void)fmt; (void)buf; (void)cap; return 0; }
+static inline void sk_clipboard_clear_fmt(const char* fmt) { (void)fmt; }
+static inline void sk_clipboard_clear(void) { }
+#endif
+
 #ifdef ASC_USE_SKIA
 extern void* sk_surface_raster_new(int w, int h);
 extern int sk_surface_peek_pixels(void* surface, void** pixels, int* rowBytes);
@@ -9371,18 +9403,6 @@ extern void sk_paint_set_stroke(void* paint);
 extern void sk_paint_set_stroke_width(void* paint, double w);
 extern void sk_paint_set_antialias(void* paint, int on);
 extern void* sk_paint_black_keep_alpha(void);
-// Platform clipboard text flavour (flash.desktop.Clipboard). Set copies the
-// string (the caller may free its buffer immediately); the getter returns the number
-// of bytes written, 0 when the clipboard holds no text. Implemented by the window
-// backend, so a skia build without a window (a PNG-only, not-visible air app)
-// gets the same no-op stubs as the pure-C build instead of an unresolved link.
-#ifdef ASC_USE_WINDOW
-extern void sk_clipboard_set_text(const char* text);
-extern int sk_clipboard_get_text(char* buf, int cap);
-#else
-static inline void sk_clipboard_set_text(const char* text) { (void)text; }
-static inline int sk_clipboard_get_text(char* buf, int cap) { (void)buf; (void)cap; return 0; }
-#endif
 extern void* sk_path_new(void);
 extern void sk_path_delete(void* path);
 extern void sk_path_move_to(void* path, double x, double y);

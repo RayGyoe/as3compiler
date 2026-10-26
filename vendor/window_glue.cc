@@ -1112,15 +1112,315 @@ static void sk_key_map(SDL_Keycode sym, SDL_Keymod mod, int* keyCode, int* charC
   if (charCode) *charCode = cc;
 }
 
-// ---------- clipboard (flash.desktop.Clipboard text flavour) ----------
-// SDL owns the platform clipboard, so the text flavour is a direct pass-through;
-// the AS3 side never touches SDL. A copy is normally followed by the app being
-// closed (or by the user pasting into another app), so the text must live in the
-// OS clipboard, not in a heap buffer here.
+// ---------- clipboard (flash.desktop.Clipboard, 阶段二百九十三) ----------
+// The AS3 side (src/emit.ts emitClipboardClass) owns the data model: a set of
+// (format -> data) entries, the same set AIR documents. This file owns the
+// PLATFORM translation of the four standard formats AIR maps to native ones:
+//
+//   text     <-> CF_UNICODETEXT              / the SDL text clipboard
+//   html     <-> the "HTML Format" format    / not available on this backend
+//   richText <-> the "Rich Text Format" one  / not available on this backend
+//   url      <-> "UniformResourceLocatorW"   / not available on this backend
+//
+// A backend that cannot carry a format answers 0 from sk_clipboard_has_fmt, and
+// the AS3 side reports that the value stayed inside the application instead of
+// pretending it reached the system clipboard.
+//
+// The get/set pair is also the store behind TextField copy/paste (as_clipboard_
+// set_text / get_text in runtime.ts), so both paths see the same clipboard.
+#if defined(_WIN32)
+// The Win32 clipboard format behind one of our names (0 = not translated here).
+// The clipboard is a global, single-owner resource: while another application has
+// it open, OpenClipboard fails with ERROR_ACCESS_DENIED. That is transient (a
+// reader holds it for a few milliseconds), so retrying is what makes a copy
+// reliable instead of randomly reporting a failure.
+static BOOL sk_clip_open(void) {
+  for (int i = 0; i < 10; i++) {
+    if (OpenClipboard(NULL)) return TRUE;
+    Sleep(2);
+  }
+  return FALSE;
+}
+
+static UINT sk_clip_fmt_id(const char* fmt) {
+  if (fmt == NULL) return 0;
+  if (strcmp(fmt, "text") == 0) return CF_UNICODETEXT;
+  if (strcmp(fmt, "html") == 0) return RegisterClipboardFormatW(L"HTML Format");
+  if (strcmp(fmt, "richText") == 0) return RegisterClipboardFormatW(L"Rich Text Format");
+  if (strcmp(fmt, "url") == 0) return RegisterClipboardFormatW(L"UniformResourceLocatorW");
+  return 0;
+}
+
+// A clipboard allocation holding len bytes (zero terminated), or NULL. Moveable
+// memory is what SetClipboardData requires: the system takes ownership of it.
+static HGLOBAL sk_clip_blob(const void* data, int len) {
+  if (len < 0) len = 0;
+  HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (SIZE_T)len + 2);
+  if (h == NULL) return NULL;
+  void* p = GlobalLock(h);
+  if (p == NULL) { GlobalFree(h); return NULL; }
+  if (len > 0 && data != NULL) memcpy(p, data, (size_t)len);
+  GlobalUnlock(h);
+  return h;
+}
+
+// UTF-8 -> UTF-16 into a fresh allocation (NUL terminated). Used for the two
+// formats the platform stores as wide characters (text, url).
+static HGLOBAL sk_clip_wide(const char* s, int len) {
+  int n = (s != NULL && len > 0) ? MultiByteToWideChar(CP_UTF8, 0, s, len, NULL, 0) : 0;
+  HGLOBAL h = sk_clip_blob(NULL, (n > 0 ? n : 0) * 2);
+  if (h == NULL) return NULL;
+  wchar_t* w = (wchar_t*)GlobalLock(h);
+  if (w == NULL) { GlobalFree(h); return NULL; }
+  if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s, len, w, n);
+  w[n > 0 ? n : 0] = 0;
+  GlobalUnlock(h);
+  return h;
+}
+
+// CF_HTML is a plain byte payload behind a small ASCII header carrying four
+// absolute byte offsets. Ten fixed-width digits keep the header length constant,
+// so the offsets can be computed before the header is formatted.
+static HGLOBAL sk_clip_html(const char* frag, int fragLen) {
+  static const char* kPre = "<html><body><!--StartFragment-->";
+  static const char* kPost = "<!--EndFragment--></body></html>";
+  int preLen = (int)strlen(kPre);
+  int postLen = (int)strlen(kPost);
+  char head[256];
+  // Two passes: the first gives the exact header length (which is also StartHTML).
+  snprintf(head, sizeof(head),
+           "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\n"
+           "StartFragment:0000000000\r\nEndFragment:0000000000\r\n");
+  int headLen = (int)strlen(head);
+  int startFrag = headLen + preLen;
+  int endFrag = startFrag + (fragLen > 0 ? fragLen : 0);
+  int endHtml = endFrag + postLen;
+  snprintf(head, sizeof(head),
+           "Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\n"
+           "StartFragment:%010d\r\nEndFragment:%010d\r\n",
+           headLen, endHtml, startFrag, endFrag);
+  int headOut = (int)strlen(head);
+  if (headOut != headLen) return NULL;
+  HGLOBAL h = sk_clip_blob(NULL, headOut + preLen + endFrag - startFrag + postLen);
+  if (h == NULL) return NULL;
+  char* p = (char*)GlobalLock(h);
+  if (p == NULL) { GlobalFree(h); return NULL; }
+  char* w = p;
+  memcpy(w, head, (size_t)headOut); w += headOut;
+  memcpy(w, kPre, (size_t)preLen); w += preLen;
+  if (fragLen > 0 && frag != NULL) { memcpy(w, frag, (size_t)fragLen); w += fragLen; }
+  memcpy(w, kPost, (size_t)postLen);
+  GlobalUnlock(h);
+  return h;
+}
+
+static int sk_clip_atoi(const char* p) {
+  int v = 0;
+  while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+  return v;
+}
+
+// ClipboardFormats.HTML_FORMAT is the FRAGMENT, so the CF_HTML header is stripped
+// on read. A payload with no header is passed through unchanged: plenty of
+// applications put bare HTML on the clipboard.
+static int sk_clip_html_fragment(const char* all, int len, int* outStart) {
+  const char* sf = strstr(all, "StartFragment:");
+  const char* ef = strstr(all, "EndFragment:");
+  if (sf != NULL && ef != NULL) {
+    int s = sk_clip_atoi(sf + 14);
+    int e = sk_clip_atoi(ef + 12);
+    if (s >= 0 && e > s && e <= len) {
+      if (outStart != NULL) *outStart = s;
+      return e - s;
+    }
+  }
+  if (outStart != NULL) *outStart = 0;
+  return len;
+}
+
+// Replace one translated format, keeping the other three alive. Win32 only lets
+// the clipboard OWNER call SetClipboardData, and taking ownership means
+// EmptyClipboard first, so the survivors are copied out and written back.
+// A format this build cannot read (a bitmap, a file list) cannot survive the
+// rebuild; the AS3 side records that limitation once.
+static void sk_clip_rebuild(UINT setid, HGLOBAL blob, UINT drop) {
+  static const char* kNames[4] = { "text", "html", "richText", "url" };
+  UINT ids[4];
+  HGLOBAL keep[4];
+  int nkeep = 0;
+  if (!sk_clip_open()) { if (blob != NULL) GlobalFree(blob); return; }
+  for (int i = 0; i < 4; i++) {
+    UINT id = sk_clip_fmt_id(kNames[i]);
+    if (id == 0 || id == setid || id == drop) continue;
+    if (!IsClipboardFormatAvailable(id)) continue;
+    HANDLE h = GetClipboardData(id);
+    if (h == NULL) continue;
+    const void* p = GlobalLock(h);
+    if (p == NULL) continue;
+    HGLOBAL copy = sk_clip_blob(p, (int)GlobalSize(h));
+    GlobalUnlock(h);
+    if (copy != NULL) { ids[nkeep] = id; keep[nkeep] = copy; nkeep++; }
+  }
+  EmptyClipboard();
+  if (setid != 0 && blob != NULL) {
+    if (SetClipboardData(setid, blob) == NULL) GlobalFree(blob);
+  } else if (blob != NULL) {
+    GlobalFree(blob);
+  }
+  for (int i = 0; i < nkeep; i++) {
+    if (SetClipboardData(ids[i], keep[i]) == NULL) GlobalFree(keep[i]);
+  }
+  CloseClipboard();
+}
+
+void sk_clipboard_set_fmt(const char* fmt, const void* data, int len) {
+  if (data == NULL || len < 0) return;
+  UINT id = sk_clip_fmt_id(fmt);
+  if (id == 0) return;
+  HGLOBAL h;
+  if (id == CF_UNICODETEXT) h = sk_clip_wide((const char*)data, len);
+  else if (strcmp(fmt, "html") == 0) h = sk_clip_html((const char*)data, len);
+  else if (strcmp(fmt, "url") == 0) h = sk_clip_wide((const char*)data, len);
+  else h = sk_clip_blob(data, len);
+  sk_clip_rebuild(id, h, 0);
+}
+
+int sk_clipboard_get_fmt(const char* fmt, char* buf, int cap) {
+  UINT id = sk_clip_fmt_id(fmt);
+  if (id == 0) return 0;
+  if (!IsClipboardFormatAvailable(id)) return 0;
+  if (!sk_clip_open()) return 0;
+  int n = 0;
+  HANDLE h = GetClipboardData(id);
+  const void* p = (h != NULL) ? GlobalLock(h) : NULL;
+  if (p != NULL) {
+    int bytes = (int)GlobalSize(h);
+    if (id == CF_UNICODETEXT || strcmp(fmt, "url") == 0) {
+      int wlen = bytes / 2;
+      while (wlen > 0 && ((const wchar_t*)p)[wlen - 1] == 0) wlen--;
+      n = WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)p, wlen, NULL, 0, NULL, NULL);
+      if (buf != NULL && cap > 0) {
+        int room = (cap - 1 < n) ? cap - 1 : n;
+        if (room > 0) {
+          n = WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)p, wlen, buf, room, NULL, NULL);
+        } else {
+          n = 0;
+        }
+        buf[n] = 0;
+      }
+    } else if (strcmp(fmt, "html") == 0) {
+      int start = 0;
+      int frag = sk_clip_html_fragment((const char*)p, bytes, &start);
+      n = frag;
+      if (buf != NULL && cap > 0) {
+        int room = (cap - 1 < frag) ? cap - 1 : frag;
+        if (room > 0) memcpy(buf, (const char*)p + start, (size_t)room);
+        n = room;
+        buf[n] = 0;
+      }
+    } else {
+      n = bytes;
+      if (buf != NULL && cap > 0) {
+        int room = (cap - 1 < bytes) ? cap - 1 : bytes;
+        if (room > 0) memcpy(buf, p, (size_t)room);
+        n = room;
+        buf[n] = 0;
+      }
+    }
+    GlobalUnlock(h);
+  }
+  CloseClipboard();
+  return n;
+}
+
+void sk_clipboard_set_text(const char* text) {
+  // The text format goes through the same rebuild so an html/rtf/url payload set
+  // moments earlier survives (SDL_SetClipboardText would empty the clipboard).
+  sk_clipboard_set_fmt("text", text != NULL ? text : "", (int)strlen(text != NULL ? text : ""));
+}
+
+int sk_clipboard_get_text(char* buf, int cap) { return sk_clipboard_get_fmt("text", buf, cap); }
+
+int sk_clipboard_has_fmt(const char* fmt) {
+  UINT id = sk_clip_fmt_id(fmt);
+  if (id == 0) return 0;
+  return IsClipboardFormatAvailable(id) ? 1 : 0;
+}
+
+void sk_clipboard_clear_fmt(const char* fmt) {
+  UINT drop = sk_clip_fmt_id(fmt);
+  if (drop == 0) return;
+  if (!IsClipboardFormatAvailable(drop)) return;
+  sk_clip_rebuild(0, NULL, drop);
+}
+
+void sk_clipboard_clear(void) {
+  if (!sk_clip_open()) return;
+  EmptyClipboard();
+  CloseClipboard();
+}
+
+int sk_clipboard_available(void) { return 1; }
+#else
+// Everything except Windows: the SDL text clipboard is the only carrier. The
+// three remaining formats answer "not present" and the AS3 side reports that a
+// value set for one of them stayed inside the application (registered gap).
 void sk_clipboard_set_text(const char* text) {
   ensure_video();
   SDL_SetClipboardText(text != NULL ? text : "");
 }
+
+int sk_clipboard_get_text(char* buf, int cap) {
+  ensure_video();
+  if (buf == NULL) {
+    char* s = SDL_GetClipboardText();
+    int n = (s != NULL) ? (int)strlen(s) : 0;
+    if (s != NULL) SDL_free(s);
+    return n;
+  }
+  if (cap <= 0) return 0;
+  buf[0] = '\0';
+  char* s = SDL_GetClipboardText();
+  if (s == NULL) return 0;
+  int n = (int)strlen(s);
+  if (n > cap - 1) n = cap - 1;
+  memcpy(buf, s, (size_t)n);
+  buf[n] = '\0';
+  SDL_free(s);
+  return n;
+}
+
+int sk_clipboard_available(void) { return 1; }
+
+int sk_clipboard_has_fmt(const char* fmt) {
+  if (fmt == NULL || strcmp(fmt, "text") != 0) return 0;
+  ensure_video();
+  return SDL_HasClipboardText() ? 1 : 0;
+}
+
+void sk_clipboard_set_fmt(const char* fmt, const void* data, int len) {
+  if (fmt != NULL && strcmp(fmt, "text") == 0 && data != NULL && len >= 0) {
+    char* s = (char*)malloc((size_t)len + 1);
+    if (s == NULL) return;
+    memcpy(s, data, (size_t)len);
+    s[len] = '\0';
+    sk_clipboard_set_text(s);
+    free(s);
+  }
+}
+
+int sk_clipboard_get_fmt(const char* fmt, char* buf, int cap) {
+  if (fmt != NULL && strcmp(fmt, "text") == 0) return sk_clipboard_get_text(buf, cap);
+  return 0;
+}
+
+void sk_clipboard_clear_fmt(const char* fmt) {
+  if (fmt != NULL && strcmp(fmt, "text") == 0) sk_clipboard_set_text("");
+}
+
+void sk_clipboard_clear(void) { sk_clipboard_set_text(""); }
+#endif
+
 
 // Drains the composed text a window's SDL_TEXTINPUT just delivered (see
 // sk_key_cb). NUL-terminated, truncated to cap-1, and the pending buffer is
@@ -1182,23 +1482,6 @@ void sk_window_set_text_input_rect(int id, double x, double y, double w, double 
   r.w = (int)(w + 0.5);
   r.h = (int)(h + 0.5);
   SDL_SetTextInputRect(&r);
-}
-
-// Copies the clipboard's text into `buf` (NUL-terminated, truncated to cap-1)
-// and returns the number of bytes written, or 0 when the clipboard holds no
-// text. SDL_GetClipboardText hands back a fresh buffer the caller must free.
-int sk_clipboard_get_text(char* buf, int cap) {
-  ensure_video();
-  if (buf == NULL || cap <= 0) return 0;
-  buf[0] = '\0';
-  char* s = SDL_GetClipboardText();
-  if (s == NULL) return 0;
-  int n = (int)strlen(s);
-  if (n > cap - 1) n = cap - 1;
-  memcpy(buf, s, (size_t)n);
-  buf[n] = '\0';
-  SDL_free(s);
-  return n;
 }
 
 #if defined(__APPLE__)

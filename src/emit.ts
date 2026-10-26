@@ -9351,6 +9351,325 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   }
 
 
+  // flash.desktop.Clipboard (阶段二百九十三): the real thing, replacing a shell.
+  //
+  // AIR's model (Clipboard.html): a Clipboard object holds a set of
+  // (format -> data) entries. `Clipboard.generalClipboard` is that same set with
+  // the OPERATING SYSTEM clipboard behind it, so every read goes out to the
+  // platform and every write goes out too; a `new Clipboard()` (drag and drop)
+  // stays purely in the object. The three parallel arrays declared in symbols.ts
+  // are that set: format names, payloads, and the deferred handlers
+  // setDataHandler installs.
+  //
+  // Format translation, and what is NOT translated:
+  //   text     -> CF_UNICODETEXT / NSPasteboard string           (all backends)
+  //   html     -> the Windows "HTML Format" format                (win32 only)
+  //   richText -> the Windows "Rich Text Format" format           (win32 only)
+  //   url      -> the Windows "UniformResourceLocatorW" format    (win32 only)
+  //   bitmap / fileList / filePromiseList: no translation. They round-trip inside
+  //   the Clipboard object and the first attempt to hand one to the operating
+  //   system reports itself (as_shell_unsupported) instead of pretending the data
+  //   left the application. docs/zh-cn/desktop.md 7.10 lists every deviation.
+  private emitClipboardClass(): void {
+    const raw = (code: string): void => { for (const ln of code.split('\n')) this.line(ln); };
+    // The singleton behind generalClipboard has to survive a collection: it is a
+    // permanent root exactly like the shell-class singletons (see emitGCRoots).
+    this.shellSingletons.push('ASC_general_clipboard');
+    raw(`
+// ---- flash.desktop.Clipboard (阶段二百九十三) ----
+static Clipboard* ASC_general_clipboard = NULL;
+
+// Which of the four translated standard formats this name is: 1 text, 2 html,
+// 3 richText, 4 url, 0 anything else (a custom format, or bitmap/fileList).
+static int as_clip_kind(const char* f) {
+  if (f == NULL) return 0;
+  if (strcmp(f, "text") == 0) return 1;
+  if (strcmp(f, "html") == 0) return 2;
+  if (strcmp(f, "richText") == 0) return 3;
+  if (strcmp(f, "url") == 0) return 4;
+  return 0;
+}
+
+static bool as_clip_is_os(Clipboard* o) { return o != NULL && o == ASC_general_clipboard; }
+
+// Index of fmt in the object's entry list, or -1.
+static int as_clip_index(Clipboard* o, const char* fmt) {
+  if (o == NULL || fmt == NULL) return -1;
+  for (int i = 0; i < o->_fmts->length; i++) {
+    as_value v = o->_fmts->data[i];
+    if (v.tag == 3 && v.ptr != NULL && strcmp((const char*)v.ptr, fmt) == 0) return i;
+  }
+  return -1;
+}
+
+// Install (or replace) one format's entry. A null handler means "the payload is
+// the data"; a function means "render the data on read".
+static void as_clip_put(Clipboard* o, const char* fmt, as_value v, as_value h) {
+  int i = as_clip_index(o, fmt);
+  as_value f = as_v_str(as_str_dup(fmt));
+  if (i < 0) {
+    as_array_push(o->_fmts, f);
+    as_array_push(o->_vals, v);
+    as_array_push(o->_hdl, h);
+    return;
+  }
+  as_array_set(o->_fmts, i, f);
+  as_array_set(o->_vals, i, v);
+  as_array_set(o->_hdl, i, h);
+}
+
+static void as_clip_drop(Clipboard* o, int i) {
+  if (o == NULL || i < 0 || i >= o->_fmts->length) return;
+  as_array_removeAt(o->_fmts, i);
+  as_array_removeAt(o->_vals, i);
+  as_array_removeAt(o->_hdl, i);
+}
+
+// Empty the object's entry list. Fresh arrays rather than length=0: the old ones
+// become ordinary garbage, and every slot is re-installed through the barrier
+// because a sliced collection may already have marked this object black.
+static void as_clip_wipe(Clipboard* o) {
+  if (o == NULL) return;
+  o->_fmts = as_array_new(); gc_write_barrier((void*)o->_fmts);
+  o->_vals = as_array_new(); gc_write_barrier((void*)o->_vals);
+  o->_hdl = as_array_new(); gc_write_barrier((void*)o->_hdl);
+}
+
+// Does the operating system hold this format right now? generalClipboard IS the
+// OS clipboard, so there is no cache to invalidate: a copy made in another
+// application is visible on the very next read.
+static bool as_clip_os_has(int kind) {
+  if (kind == 1) return sk_clipboard_has_fmt("text") != 0;
+  if (kind == 2) return sk_clipboard_has_fmt("html") != 0;
+  if (kind == 3) return sk_clipboard_has_fmt("richText") != 0;
+  if (kind == 4) return sk_clipboard_has_fmt("url") != 0;
+  return false;
+}
+
+// A fresh String with the OS bytes of a string-shaped format (html, url).
+static char* as_clip_os_string(const char* fmt) {
+  int n = sk_clipboard_get_fmt(fmt, NULL, 0);
+  char* s = as_str_alloc((size_t)n + 1);
+  if (n > 0) sk_clipboard_get_fmt(fmt, s, n + 1);
+  s[n] = 0;
+  return s;
+}
+
+// Read one format out of the OS clipboard as the AS3 type AIR documents for it.
+static as_value as_clip_os_read(int kind) {
+  if (kind == 1) {
+    int n = sk_clipboard_get_text(NULL, 0);
+    char* s = as_str_alloc((size_t)n + 1);
+    if (n > 0) sk_clipboard_get_text(s, n + 1);
+    s[n] = 0;
+    return as_v_str(s);
+  }
+  if (kind == 2) return as_v_str(as_clip_os_string("html"));
+  if (kind == 4) return as_v_str(as_clip_os_string("url"));
+  if (kind == 3) {
+    int n = sk_clipboard_get_fmt("richText", NULL, 0);
+    ByteArray* ba = ByteArray_new();
+    as_ba_grow(ba, n);
+    if (n > 0) sk_clipboard_get_fmt("richText", (char*)ba->data, n);
+    ba->length = n;
+    ba->position = 0;
+    return as_v_obj((void*)ba);
+  }
+  return as_v_null();
+}
+
+// Hand one format to the operating system. false = this backend cannot carry it
+// (or this is a headless/web build), which the caller reports instead of
+// pretending the data is now pasteable in another application.
+static bool as_clip_os_write(int kind, as_value v) {
+  if (kind == 1) { sk_clipboard_set_text(as_v_str_val(v)); return as_clip_os_has(1); }
+  if (kind == 2) { char* s = as_v_str_val(v); sk_clipboard_set_fmt("html", s, (int)strlen(s)); return as_clip_os_has(2); }
+  if (kind == 4) { char* s = as_v_str_val(v); sk_clipboard_set_fmt("url", s, (int)strlen(s)); return as_clip_os_has(4); }
+  if (kind == 3) {
+    if (v.tag != 4 || v.ptr == NULL || *(void**)v.ptr != (void*)&ByteArray_vt) return false;
+    ByteArray* ba = (ByteArray*)v.ptr;
+    sk_clipboard_set_fmt("richText", ba->data, ba->length);
+    return as_clip_os_has(3);
+  }
+  return false;
+}
+
+void Clipboard_ctor(Clipboard* o) {
+  o->_fmts = as_array_new();
+  o->_vals = as_array_new();
+  o->_hdl = as_array_new();
+}
+
+Clipboard* Clipboard_new(void) {
+  Clipboard* o = (Clipboard*)gc_alloc(GCT_CLASS, sizeof(Clipboard));
+  o->vtable = &Clipboard_vt;
+  Clipboard_ctor(o);
+  return o;
+}
+
+// AIR creates generalClipboard automatically and refuses to let a program assign
+// another object to it, so this is a single lazily built instance.
+Clipboard* Clipboard_get_generalClipboard_static(void* _this) {
+  (void)_this;
+  if (ASC_general_clipboard == NULL) ASC_general_clipboard = Clipboard_new();
+  return ASC_general_clipboard;
+}
+
+// formats: the object's own entries first (custom formats live only there), then
+// every translated standard format the operating system has and the object has
+// not recorded itself. AIR's own order is the OS's; the content is what matters.
+as_array* Clipboard_get_formats(void* _this) {
+  Clipboard* o = (Clipboard*)_this;
+  as_array* a = as_array_new();
+  if (o == NULL) return a;
+  for (int i = 0; i < o->_fmts->length; i++) as_array_push(a, o->_fmts->data[i]);
+  if (as_clip_is_os(o)) {
+    static const char* names[4] = { "text", "html", "richText", "url" };
+    for (int k = 0; k < 4; k++) {
+      if (!as_clip_os_has(k + 1)) continue;
+      if (as_clip_index(o, names[k]) >= 0) continue;
+      as_array_push(a, as_v_str(as_str_dup(names[k])));
+    }
+  }
+  return a;
+}
+
+// File promises are a macOS-only OS feature this build does not implement on any
+// backend, so the honest answer is false everywhere (docs/zh-cn/desktop.md 7.10).
+bool Clipboard_get_supportsFilePromise(void* _this) { (void)_this; return false; }
+
+bool Clipboard_hasFormat(void* _this, char* format) {
+  Clipboard* o = (Clipboard*)_this;
+  if (o == NULL || format == NULL) return false;
+  // The operating system answers first for generalClipboard: another application
+  // may have replaced the clipboard since our own write, and AIR reads through to
+  // the platform rather than to a cache.
+  int kind = as_clip_kind(format);
+  if (kind != 0 && as_clip_is_os(o) && as_clip_os_has(kind)) return true;
+  return as_clip_index(o, format) >= 0;
+}
+
+as_value Clipboard_getData(void* _this, char* format, char* transferMode) {
+  Clipboard* o = (Clipboard*)_this;
+  if (o == NULL || format == NULL) return as_v_null();
+  const char* tm = transferMode != NULL ? transferMode : "originalPreferred";
+  bool clone_only = strcmp(tm, "cloneOnly") == 0;
+  bool known = clone_only || strcmp(tm, "clonePreferred") == 0
+            || strcmp(tm, "originalOnly") == 0 || strcmp(tm, "originalPreferred") == 0;
+  if (!known) {
+    // Clipboard.html lists this as a throw. The message is OURS: no Windows adl is
+    // available on this machine to measure AIR's text, and inventing AIR wording
+    // would be worse than saying plainly what was rejected (registered deviation).
+    as_throw_unsupported(as_str_concat("Clipboard.getData: invalid transferMode [", as_str_concat((char*)tm, "]")));
+    return as_v_null();
+  }
+  int kind = as_clip_kind(format);
+  int i = as_clip_index(o, format);
+  // A format installed with setDataHandler() renders on read -- that is the whole
+  // point of deferred rendering. The handler stays installed: AIR documents a
+  // second read as unspecified, and rendering again is the harmless half.
+  if (i >= 0 && o->_hdl->data[i].tag == 7) return as_fn_call_dyn(o->_hdl->data[i], NULL, 0, "setDataHandler");
+  // generalClipboard reads the platform first, so what another application copied
+  // is what comes back; every read is a fresh value, so cloneOnly is satisfied
+  // here instead of being answered with null.
+  if (kind != 0 && as_clip_is_os(o) && as_clip_os_has(kind)) return as_clip_os_read(kind);
+  if (i < 0) return as_v_null();
+  // Only the original representation is stored, so cloneOnly has nothing to hand
+  // back while the two preferred/original modes fall back to it (Clipboard.html).
+  if (clone_only && kind == 0) return as_v_null();
+  return o->_vals->data[i];
+}
+
+bool Clipboard_setData(void* _this, char* format, as_value data, bool serializable) {
+  (void)serializable;  // registered deviation: no serialized clone is produced
+  Clipboard* o = (Clipboard*)_this;
+  if (o == NULL) return false;
+  // Clipboard.html: TypeError when format or data is null. The text is the AVM2
+  // wording for a null parameter (#2007), the same one this runtime already uses.
+  if (format == NULL) {
+    as_throw(TypeError_new((char*)"Error #2007: Parameter format must be non-null.", 2007));
+    return false;
+  }
+  if (data.tag == 0) {
+    as_throw(TypeError_new((char*)"Error #2007: Parameter data must be non-null.", 2007));
+    return false;
+  }
+  int kind = as_clip_kind(format);
+  if (kind == 3 && (data.tag != 4 || data.ptr == NULL || *(void**)data.ptr != (void*)&ByteArray_vt)) {
+    // AIR's type table requires a ByteArray for richText. Storing anything else
+    // would make getData hand back a type the format does not promise.
+    as_shell_unsupported("Clipboard.setData(richText) with a value that is not a ByteArray");
+    return false;
+  }
+  // setData replaces the handler for the same format (AIR: when both are used for
+  // one format, the handler is never called).
+  as_clip_put(o, format, data, as_v_null());
+  if (!as_clip_is_os(o)) return true;
+  if (kind == 0) {
+    as_shell_unsupported("Clipboard.setData on a custom format (this build translates only text/html/richText/url to the operating system clipboard; the value stays in the Clipboard object)");
+    return true;
+  }
+  if (!as_clip_os_write(kind, data)) {
+    // Two causes, told apart as far as this build can: no backend at all, or a
+    // backend that refused the value (a format it does not translate, or the
+    // system clipboard stayed locked by another process after the retry).
+    as_shell_unsupported(sk_clipboard_available() != 0
+      ? "Clipboard.setData: the system clipboard did not take the value (this backend does not translate that format, or another application was holding the clipboard open); the value stays in the Clipboard object"
+      : "Clipboard.setData (this build has no clipboard backend; the value stays in the Clipboard object)");
+    return true;
+  }
+  // The platform now holds the value, so the object's own copy is dropped: keeping
+  // it would shadow the real clipboard once another application replaced it.
+  int i = as_clip_index(o, format);
+  if (i >= 0) as_clip_drop(o, i);
+  return true;
+}
+
+bool Clipboard_setDataHandler(void* _this, char* format, as_fn handler, bool serializable) {
+  (void)serializable;  // registered deviation: no serialized clone is produced
+  Clipboard* o = (Clipboard*)_this;
+  if (o == NULL) return false;
+  // Clipboard.html: TypeError when format or handler is null (#2007 wording).
+  if (format == NULL) {
+    as_throw(TypeError_new((char*)"Error #2007: Parameter format must be non-null.", 2007));
+    return false;
+  }
+  if (handler == NULL) {
+    as_throw(TypeError_new((char*)"Error #2007: Parameter handler must be non-null.", 2007));
+    return false;
+  }
+  as_clip_put(o, format, as_v_null(), as_v_fn((void*)handler));
+  return true;
+}
+
+void Clipboard_clearData(void* _this, char* format) {
+  Clipboard* o = (Clipboard*)_this;
+  if (o == NULL || format == NULL) return;
+  int kind = as_clip_kind(format);
+  int i = as_clip_index(o, format);
+  if (i >= 0) as_clip_drop(o, i);
+  if (as_clip_is_os(o) && kind != 0) sk_clipboard_clear_fmt(format);
+}
+
+void Clipboard_clear(void* _this) {
+  Clipboard* o = (Clipboard*)_this;
+  if (o == NULL) return;
+  as_clip_wipe(o);
+  if (as_clip_is_os(o)) sk_clipboard_clear();
+}
+
+// flash.system.System.setClipboard(str): "Replaces the contents of the Clipboard
+// with a specified text string" -- literally clear + setData(TEXT_FORMAT, str),
+// which is also what keeps the Clipboard object's own view consistent.
+void as_system_set_clipboard(char* s) {
+  Clipboard* c = Clipboard_get_generalClipboard_static(NULL);
+  Clipboard_clear((void*)c);
+  Clipboard_setData((void*)c, (char*)"text", as_v_str(s != NULL ? s : as_str_empty()), true);
+}
+`);
+  }
+
+
   // flash.desktop icon family + flash.display.NativeMenu (阶段二百五十五).
   //
   // Every error number, message and list rule below is MEASURED on adl 51.4.1 /
@@ -20313,6 +20632,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('');
+    this.emitClipboardClass();
     // ---- flash.text (stage 38) ----
     this.line('void TextFormat_ctor(TextFormat* o, char* font, double size, unsigned color, bool bold, bool italic, double leading) {');
     this.indent++;
@@ -32063,13 +32383,14 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
       if (isSystemClass && callee.property === 'pauseForGCIfCollectionImminent') {
         return { code: '(void)0', type: { kind: 'void' } };
       }
-      // System.setClipboard(str): a real Clipboard request on a real OS. This
-      // build has no clipboard backend (no OS clipboard binding in the runtime),
-      // so the call reports itself once and copies nothing — a silent no-op would
-      // make a "copied!" toast a lie.
+      // System.setClipboard(str): "Replaces the contents of the Clipboard with a
+      // specified text string" (System.html). Stage 293 made the clipboard real, so
+      // this is now that sentence: clear the clipboard, then set the text format on
+      // generalClipboard -- the same two calls a program would make by hand, and the
+      // same ones that also update the Clipboard object's own entries.
       if (isSystemClass && callee.property === 'setClipboard') {
-        const a = this.emitExpr(expr.args[0]);
-        return { code: `(void)(${a.code}), (as_shell_unsupported((char*)"flash.system.System.setClipboard"), (void)0)`, type: { kind: 'void' } };
+        const a = this.convert(this.emitExpr(expr.args[0]), { kind: 'string' });
+        return { code: `as_system_set_clipboard(${a})`, type: { kind: 'void' } };
       }
       // System.disposeXML(xml): AIR hint to release an XML object early. Our GC
       // reclaims XML automatically, so it is a no-op (the argument is still

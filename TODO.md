@@ -16785,7 +16785,68 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 
 需另立一个带边框探针判定。
 
+### 阶段二百九十三：`Clipboard` 从空替代升级为真实现 + `System.setClipboard`（v0.4.255 → v0.4.256）✅ 已完成
+
+**一、需求**（用户三件）：①`flash.system.System.setClipboard()` 要能用；②`flash.desktop.Clipboard`
+当时是**空替代**（构造得出、成员全空），要升级成真类；③盘点当年为了让 `talkmedmeeting` 编译通过，
+一共做过哪些类的空替代。
+
+**二、定性**：`Clipboard` 在 AIR 里不是「平台能力封装」，是**一个持有 `(格式 → 数据)` 条目表的对象**，
+`generalClipboard` 就是同一张表、由系统剪贴板承载。因此它不是「要不要接后端」的问题，而是
+**对象模型 + 后端**两件事都要做：模型留在生成侧（可反射、可 GC），后端走 seam。
+
+**三、落地**
+1. `src/symbols.ts`：`Clipboard` 由 `shell()` 改为 `classMap.set`，带 `reflectFqn: 'flash.desktop::Clipboard'`
+   （内建类标记）；三个平行 `Array` 字段 `_fmts`/`_vals`/`_hdl` 承载格式、载荷、延迟处理器 —— 用 `Array`
+   是为了让 GC 通过**类字段反射表**自然标记，不必给 GC 加新类型。另补 `ClipboardTransferMode` 类
+   （此前**整个类缺失**，`import` 直接编译失败）。
+2. `src/emit.ts` 的 `emitClipboardClass()`：单例 `ASC_general_clipboard`（推进 `shellSingletons` ⇒ GC 永久根）、
+   格式查找/落盘/搬移、8 个 OS 侧助手、`Clipboard_ctor/new`、`generalClipboard`、`formats`、
+   `supportsFilePromise`、`hasFormat/getData/setData/setDataHandler/clearData/clear`，以及
+   `as_system_set_clipboard()` = `clear()` + `setData(TEXT_FORMAT, s)`（`System.setClipboard` 的调用点改走它）。
+3. `vendor/window_glue.cc`：真平台实现 —— `CF_UNICODETEXT` / `HTML Format`（写 `CF_HTML` 头、读时剥头）/
+   `Rich Text Format` / `UniformResourceLocatorW` 四格式互译；`sk_clip_rebuild()` 在取得所有权
+   `EmptyClipboard()` 之后把其余格式搬回来；`sk_clip_open()` 重试（10 × `Sleep(2)`）。
+   `vendor/web_glue.cc` 补齐 8 个 seam 函数、`sk_clipboard_available()` 返回 0。
+
+**四、实测**（真 Windows，`temp/clip/`）
+1. 同进程四种格式：写后读回 `text=中文 clipboard 实测 abc` / `html=<b>bold-frag</b>` /
+   `url=https://example.com/a?b=c` / `rt={\rtf1 rtf-frag}`，`formats=text,html,richText,url`；
+   `clearData(HTML)` 后 `text`/`url` 仍在。
+2. 外部进程视角（PowerShell）：`text` 逐字相同；`HTML Format` 是合法 `CF_HTML`
+   （`StartHTML:0000000105 / EndHTML:0000000186 / StartFragment:0000000137 / EndFragment:0000000154`）；
+   `Rich Text Format={\rtf1 rtf-frag}`；`UniformResourceLocatorW` 是 `MEMSTREAM:58` 的 UTF-16。
+3. 反方向：PowerShell `Set-Clipboard` 写入后读回 `hasText=true text=external-app-wrote-this localHas=false`
+   ⇒「先问 OS、再问自身条目」这条顺序真的成立（否则旧影子副本会遮蔽）。
+4. 连续三次运行输出完全一致（`OpenClipboard` 不再偶发失败）。
+
+**五、验收**
+
+| 检查 | 结果 |
+|---|---|
+| `examples/clipboard.as`（八段，纯 C 与 Skia 两种构建） | `clipboard: ok` |
+| `test/unit/clipboard.ts` | **68 钉**（symbols 注册 / 7 常量 / 4 transferMode / 对象模型 / 单例与 GC 根 / OS 优先 / 影子副本删除 / 三条 `#2007` 文案 / `cloneOnly` / handler 读时渲染 / `setClipboard` / 8 seam 声明+桩 / 声明块在 skia 段之前 / Win32 格式映射与 `CF_HTML` 头 / `sk_clip_rebuild` / `sk_clip_open` 重试 / web `available()==0` / 示例覆盖点） |
+| `node test.ts` | 见提交说明（基线红 4 条） |
+
+**六、如实报明**
+1. `bitmap`/`fileList`/`filePromiseList` **不翻译**（`hasFormat` 不谎报、`setData` 报明后返回 `false`，值留在对象内）
+   ⇒ 已按 AGENTS §1.5 登记进「遗留待开发」（这三种在 `adl` 上可用）。
+2. `serializable` 参数被接受但**不产生序列化副本**，同样入表。
+3. `getData` 的非法 `transferMode` 文案是我方拟的（无 Windows `adl` 可测 AIR 原文），用方括号标注而非编造；
+   `setData` 的 `data` 在 `describeType` 里是 `*` 而非 `Object`（载荷必须仍装箱到达 C 层，否则 String 与
+   ByteArray 不可区分）——两条都写进 `docs/zh-cn/desktop.md` §7.10。
+4. 修的过程中撞出两个真 bug 并修净：① seam 声明块原先**落在 `#ifdef ASC_USE_SKIA` 段内**，纯 C 构建报
+   `call to undeclared function 'sk_clipboard_has_fmt'`；② 首个 `window_glue.cc` 补丁的结束标记误吞了
+   `sk_window_text_take`/`sk_window_text_edit_take`/`sk_window_set_text_input_rect` 三个函数（已从 HEAD 原样恢复 61 行）。
+
+**七、空替代盘点**（用户第三件）：`shell()` 注册 **20 个**类 —— 12 个是**数据载体**（字段与常量是真的，
+事件/选项对象能携带调用方给的数据，只是没有代码路径产生它们）、8 个是**真能力缺口**
+（`NativeProcess`/`NativeProcessStartupInfo`/`StageWebView`/`NativeDragManager`/`NetworkInterface`/
+`NetworkInfo`/`Microphone`/`LocalConnection`），外加成员级 `as_shell_unsupported` **26 条**。
+逐项「给得出 / 给不出」见 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md)（[EN](docs/en/stubs.md)）。
+
 ### 遗留待开发
+> **2026-10-27 追加（阶段二百九十三：`Clipboard` 真实现 + `System.setClipboard` + 空替代盘点）**：**新登记 2 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **93 → 95 项**（`未开始` **72 → 74** / `部分完成` 20 / `调研完成·实现暂缓` 1）。**新登记 2 行**：① 剪贴板的 `bitmap`/`fileList`/`filePromiseList` 三种格式不翻译（这三种 `adl` 都能用 ⇒ 遗留缺陷；我方 `hasFormat` 不谎报、`setData` 报明后返回 `false`）；② `serializable` 参数被接受但不产生序列化副本。**改写的 1 行**是「web 目标键盘与剪贴板未接线」—— 剪贴板那半边本阶段已接线（`vendor/web_glue.cc` 补齐 8 个 seam 函数、`sk_clipboard_available()` 返回 0 ⇒ AS3 侧**报明**「本构建没有剪贴板后端」，不是静默降级），`navigator.clipboard` 的异步 + 用户手势门控仍是**平台硬边界**（§1.5）；键盘那半边仍未接线，故状态维持「未开始」。**本阶段修净的两项不占表**：`Clipboard` 本体与 `System.setClipboard`（`adl` 跑得对、我们此前跑不出 ⇒ 遗留缺陷，但同阶段落地，按表头「已完成项一经落地即从本表移出」不入表）。**空替代盘点**落在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md)：`shell()` 20 个类逐项写明「给得出 / 给不出」（12 个数据载体 + 8 个真能力缺口），成员级 `as_shell_unsupported` 26 条也成表；本机的行为读数是 `temp/clip/t4.as`。
 > **2026-10-26 追加（阶段二百九十一：字形归一化的除数）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是**我们自己发明的自动烘焙**（AIR 没有对应物）兑现不了自己的承诺（「烘焙态 == 活态」）造成的**呈现缺陷**——`adl` 根本不经过烘焙路径，故不属 §1.5「`adl` 跑得对我们跑不出」，不占本表；页面级证据（121 帧逐帧 ink 包围盒、修前 119 / 修后 124）、根因与未测项见阶段节与 `docs/zh-cn/skia.md` §8.3。
 > **2026-10-26 追加（阶段二百九十：`ContextMenu` 的 Windows 实测）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段修的四处（菜单位置、重复 release、分隔线之后 tag 越界、`submenu` 静默丢失）在 `adl` 上都是「跑得对」的、我们此前跑不出 ⇒ 按 AGENTS §1.5 属**遗留缺陷**，但**已在同一阶段修净**，按表头「已完成项一经落地即从本表移出」不入表。`keyEquivalent` 在 Win32 上不显示不生效仍缺（需在 `TrackPopupMenu` 的模态循环里挂消息过滤器），属**实现欠账**而非拒绝实现，故记在阶段节的「如实报明」、不入表。
 > **2026-10-26 追加（阶段二百八十九：`flash.ui.ContextMenu` 右键菜单）**：**新登记 1 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **93 → 93 项**（`未开始` 不变）。
@@ -16973,7 +17034,7 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 | `X.transform.matrix` 的**访问链别名**（`var t = X.transform; t.matrix`）仍是残余槽的裸读写 | 未开始（2026-10-02 阶段八十九·七十六 主动登记的实现边界） | `X.transform.matrix` 本身读写已精确（合成/分解访问器对），但 `Transform` 结构体**没有指回属主的反指针**（加它要给每个 `DisplayObject` 挂一个反向引用字段并补 `gc_write_barrier`，风险面覆盖 GC 与全部显示对象）。故先取 `t` 再经 `t.matrix` 读写时，读到/写到的仍是 **skew 残余槽**（不含 `x/y/rotation/scaleX/scaleY`），与 adl 的「同源单一矩阵」不一致。探针 T5 实测 adl 的 getter 返回拷贝，故这个别名写法**在 AIR 里本来就是无效操作**（改了不动对象），我方目前是「改残余槽」——不报错但语义不同 | 立项时与「矩阵作唯一真源」的重构合并做：`Transform` 加 `owner` 反指针（或用 owner 侧懒查表），读写字面量 `t.matrix` 也走访问器对；**须整批回归** GC 审计（`ASC_GC_AUDIT`）+ Starling 12 场景 + 全部 GUI examples |
 | 两个矩阵的**分解字段**与 adl 不同（矩阵往返与渲染仍精确） | 未开始（2026-10-02 阶段八十九·七十六 探针实测） | ① 纯 flipX `[-1,0,0,1,5,6]`（T10）：adl 给 `rotation 0 / scaleX -1 / scaleY 1`，我方给 `rotation 180 / scaleX 1 / scaleY -1`；**证据**：adl 对结构相同的 `diag(-2,3)`（T19）却给 `rotation 180 / scaleX 2 / scaleY -3`，即 adl 的选择**不是所赋矩阵的函数**（纯 flipX 与 `diag(-1,1)` 是同一矩阵，adl 两者答案不同）。② `[0,0,1,1,5,6]`（T25，零首列且非零首行）：我方渲染链 `translate·rotate·scale·残余` 在 `scaleX=0` 时表示不出「首行非零」，故把线性部分整体寄存到残余（字段报 `scaleX/scaleY = 1`），adl 报 `scaleX 0 / scaleY 1.414`。两例的**矩阵读回与像素都精确**（T10/T25 反向对照：读回逐值等于所赋矩阵） | 收益极低（要改渲染合成顺序或引入 AIR 内部的双存储），暂不排期；若将来做 ①，先扩充 `temp/xformcmp/cmp_probe.py` 的 `KNOWN` 集合口径，并把两例的行为差异写进 `docs/zh-cn/as3-semantics.md` 决策分歧点 |
 | 光标形状是**进程级一个**（多窗口时跟随最后一个写入者） | 未开始（平台硬边界，2026-10-02 阶段八十九·七十六 落地时实测） | `SDL_SetCursor` 在 SDL2 里**没有 per-window 版本**（窗口参数被忽略），故第二个窗口写 `Mouse.cursor` 会改掉第一个窗口的指针形状；窗口数≥2 且各自需要不同光标时才可观测。指针离开窗口恢复箭头（`SDL_WINDOWEVENT_LEAVE`）已做，故不会把 I-beam 带到菜单栏 | 若要根治需绕开 SDL：macOS 走 `-[NSCursor set]` + `NSTrackingArea`（或在 `mouseMoved` 里按窗口决定）、Windows 走 `WM_SETCURSOR`；属平台耦合，按 §2.9 应隔离在 glue 内。优先级低（AIR 自身也多窗口共享系统光标） |
-| web 目标**键盘与剪贴板未接线**（native 已对齐 `adl`，含阶段九十四·七 的文本输入） | 未开始（2026-10-02 阶段八十九·七十七 主动登记，2026-10-03 阶段九十四·七 复查**依旧未接线**，属**明确的未支持**而非静默降级） | native 侧 SDL 键盘 → `KeyboardEvent` + `stage.focus` + `SDL_TEXTINPUT` → `TextEvent.TEXT_INPUT` + 加速键复制/剪切/粘贴已与 `adl` 逐项对齐（同一驱动两端实测一致）；`web` 侧 `vendor/web_glue.cc` **键盘整块被丢弃**（`(void)on_key;`，第 347 行）、剪贴板两个函数是空实现（`void sk_clipboard_set_text(const char*){(void)text;}` / `int sk_clipboard_get_text(char*,int){(void)buf;(void)cap;return 0;}`，第 422~423 行）——本轮新增的 `sk_window_text_take` 在 web 侧**同样没有对应物**：DOM 的 `keyCode`/`charCode` 与 AIR 的编号**不同族**（AIR 字母 keyCode 是大写 ASCII、Delete=46/charCode=127…），需一张 DOM→AIR 映射表并重建 DOM 焦点模型（`tabIndex`/`contentEditable` 那套与 AS3 显示列表焦点不是一回事）；文本输入还要把 DOM 的 `input`/`beforeinput` 事件泵到帧边界；剪贴板 API（`navigator.clipboard`）是**异步 + 用户手势门控**，而 AIR 的 `Clipboard` 是**同步**的——这是**平台硬边界**（§1.5），只能在帧边界做 pending 态并如实上报，不能假装同步成功 | 立项顺序：①键盘映射表 + DOM 焦点模型（可先支持「点击 canvas 即把焦点交给舞台」的最小模型）；②`input`/`beforeinput` → `sk_window_text_take` 的等价物（帧边界队列）；③剪贴板 pending 态（`Cmd+C` 时若无手势授权，按浏览器语义可能静默失败——须如实上报，不假装成功）。**注意**：emsdk 的 SDL2 port 未缓存，web 构建当前**离线不可复现** |
+| web 目标**键盘未接线**（剪贴板半边已按「报明未支持」接好）（native 已对齐 `adl`，含阶段九十四·七 的文本输入） | 未开始（2026-10-02 阶段八十九·七十七 主动登记，2026-10-03 阶段九十四·七 复查**依旧未接线**，属**明确的未支持**而非静默降级） | native 侧 SDL 键盘 → `KeyboardEvent` + `stage.focus` + `SDL_TEXTINPUT` → `TextEvent.TEXT_INPUT` + 加速键复制/剪切/粘贴已与 `adl` 逐项对齐（同一驱动两端实测一致）；`web` 侧 `vendor/web_glue.cc` **键盘整块被丢弃**（`(void)on_key;`，第 347 行）、剪贴板那半边**已接线但明确报明**（阶段二百九十三：`vendor/web_glue.cc` 补齐 8 个 seam 函数、`sk_clipboard_available()` 返回 0 ⇒ AS3 侧报「本构建没有剪贴板后端」，值留在对象内；键位映射仍缺）——本轮新增的 `sk_window_text_take` 在 web 侧**同样没有对应物**：DOM 的 `keyCode`/`charCode` 与 AIR 的编号**不同族**（AIR 字母 keyCode 是大写 ASCII、Delete=46/charCode=127…），需一张 DOM→AIR 映射表并重建 DOM 焦点模型（`tabIndex`/`contentEditable` 那套与 AS3 显示列表焦点不是一回事）；文本输入还要把 DOM 的 `input`/`beforeinput` 事件泵到帧边界；剪贴板 API（`navigator.clipboard`）是**异步 + 用户手势门控**，而 AIR 的 `Clipboard` 是**同步**的——这是**平台硬边界**（§1.5），只能在帧边界做 pending 态并如实上报，不能假装同步成功 | 立项顺序：①键盘映射表 + DOM 焦点模型（可先支持「点击 canvas 即把焦点交给舞台」的最小模型）；②`input`/`beforeinput` → `sk_window_text_take` 的等价物（帧边界队列）；③剪贴板 pending 态（`Cmd+C` 时若无手势授权，按浏览器语义可能静默失败——须如实上报，不假装成功）。**注意**：emsdk 的 SDL2 port 未缓存，web 构建当前**离线不可复现** |
 | 非 US 布局与 Option 组合字符的 `keyCode`/`charCode` 只按**基键**近似 | **部分完成**（2026-10-03 阶段九十四·七：**文本通道已按 `SDL_TEXTINPUT` 真实接线**——组合结果（`Option+e` → `"´"`、`Option+8` → `"•"`）会作为 `TextEvent.TEXT_INPUT` 的载荷送进字段，与 `adl` 双端对照一致；**剩下的缺口只在 keyDown 的 `charCode`**） | `SDL2` 不提供键盘布局查询、也不在 `SDL_KEYDOWN` 里给组合后的字符（组合字符走独立的 `SDL_TEXTINPUT`，已接线），故 `sk_us_char()` 按 US 布局的基键给 `charCode`：德语 `z`/`y` 互换、法语 AZERTY 的数字行、`Option+e` 变音符等的 **keyDown** 仍给出**基字母**而非实际字符（`adl 51.4.1` 实测 `Option+e` 的 keyDown 是 kc=0/cc=**180**，我们给基字母 `e`=101；`sk_air_keycode()` 在 `Option+字母` 时给 keyCode **0** 这一条已对齐）。**判据（§1.5）**：`adl` 给的是真实布局字符 ⇒ **遗留** | 立项：给 keyDown 补布局/组合字符——需在 `SDL_TEXTINPUT` 到达时回填**紧邻的那一次** keyDown 的 `charCode`（组合结果在 keyDown 之后到达，需要一个小的时间戳/待回填队列），布局相关 keyCode 需另查（SDL 只有 `SDL_GetKeyFromScancode` 的 US 假设）；验收用 `temp/editprobe/` 的同一驱动在**德语/法语布局**下与 `adl` 对照 |
 | 广色域显示器上的**用户可见**颜色一致性未经仪器验证（`screencapture` 无法区分） | 未开始（2026-10-04 阶段九十四·二十三 收窄登记；原「整条渲染管线色彩管理 sRGB→P3」行的根因已定位） | 阶段八十九·七十七 记的偏移（`0x3366FF→(64,101,246)` 等）本轮**追到了捕获段**：我们的离屏 CPU 光栅与提交前的 Metal drawable 都是**逐位精确**的 sRGB（`ASC_MTL_READBACK` 读回 `ff00ff00`），金属/CPU 两个后端截图**逐值相同**，而 `adl` **自己**的窗口截图同样偏移（`FF8000→FF7700`，−9 LSB；我们 `FF8002`）⇒ 是窗口服务器/显示色彩管理在**截图**上引入的，两端共有、程度不同。剩下来的真问题只有一个：在广色域屏上**肉眼观感**是否与 AIR 一致，这需要色度计或与系统取色器对比，截图测不出来 | 立项：用系统取色器（Digital Color Meter）在两端窗口上读同一块纯色，比较**显示值**；若不同则说明 `CAMetalLayer` 的 sRGB 声明（已加，见 `metal_glue.mm` `sk_mtl_init`）与 AIR 的实际声明仍有差别。成本低（人工比对），但需真实广色域屏与人眼/仪器 |
 | 上下移动的列位口径是**字符列**而非**像素 X goal** | 未开始（2026-10-04 阶段九十四·十五 主动登记；**精化项，非已知差异**） | 阶段九十四·十五 的 `Up`/`Down`/`PageUp`/`PageDown` 全部按**字符列**（`caret - lineStart`）保留列位，实测的英文等宽探针（`_typewriter`，行内全为单宽字符）下与 AIR 的「像素 X 换算回字符索引」**逐值一致**。但比例字体 + 混排（宽窄字符、制表符、内联图片 `getImageReference`）下，AIR 的 goal 是**像素 X**（同一 X 落在不同字符宽度的行上会换算出不同的字符列），字符列模型会偏移（Air 侧未做比例字体探针，故记为**口径待精化**而非「已知差异」）。**判据（§1.5）**：等宽下两者等价 ⇒ 不是「adl 能跑对我们跑不出」，而是「未实测比例字体口径」 | 立项：先写一个比例字体（`_sans`）+ 宽窄混排的 `adl` 探针（`AAAA...` 对 `iiii...` 交替行），实测 goal 是像素 X 还是字符列；若确为像素 X，则把 `_goal_col` 改存像素 X、由 `sk_textlayout_glyph_position_at`（或逐行 `getGlyphPositionAtCoordinate`）换算回字符索引 |
@@ -17041,6 +17102,8 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 | **`File` 的其余三个 async 成员仍是 inline 完成**（`moveToTrashAsync`/`deleteFileAsync`/`deleteDirectoryAsync`） | 未开始（2026-10-23 阶段二百六十四 登记；本阶段只把 `getDirectoryListingAsync` 真异步化，这三条**如实报明**） | `adl` 在自己的 IO 线程上完成再派发（实测「调用后立刻查 `exists` 仍为 `true`」），我们则**在同一次调用内**做完并派发 ⇒ 大盘（如递归删除几万个条目的目录）会照样把 AS3 线程卡住，且 `File.cancel()` 对它们没有可取消的作业（调用返回时作业已退休）。三者的 `#2037`/`#3003` 等**错误口径**已与 `adl` 一致（阶段二百四十三 已量），缺的只是**投递时机**与可取消性 | 与 `AS_JOB_DIR` 同法：各加一个作业类型（`AS_JOB_TRASH`/`AS_JOB_DELETE_FILE`/`AS_JOB_DELETE_DIR`）+ 完成 thunk（在 AS3 线程上派发 `COMPLETE`/`IOErrorEvent`），`File.cancel()` 已经按「按目标对象找在飞作业」实现，接上即可。注意 `moveToTrash` 在 Windows 走 `SHFileOperationW`，作业体里要保留同一条回退链 |
 | **`Event` 的只读访问器在我们这里是可写字段**（`type` / `bubbles` / `cancelable` / `target` / `currentTarget` …） | 未开始（2026-10-23 阶段二百五十八 实测登记） | 阶段二百五十八 量动态写只读 trait 时顺手量出来的：`adl 51.4.1` 上 `(new ScreenMouseEvent("x") as Object)["type"] = 1` 抛 **`#1074`**（`type`/`bubbles`/`cancelable`/`target`/`clickCount` 全抛，且报文写的是**接收者的类**而不是声明者），`toString`/`clone` 这类方法名抛 **`#1037`**，只有真正不存在的名字才是 `#1056`；我方 `as_dyn_set` 本轮已按此补齐 `#1074`/`#1037` 两条，但 `type`/`bubbles`/`target` 在 `Event` 里是**普通字段**（`FieldInfo`），于是动态写会**照收**、静态写也编得过 ⇒ 与 `adl` 不一致。成因是 `Event` 从阶段三十五 就是「字段 + 直接访问」，改成访问器要动 `Event_ctor`/AMF 成员表/`X_props` 布局与全部派发点 | 先把 `type`/`target`/`bubbles`/`cancelable`/`currentTarget`/`eventPhase` 从字段改成 `X_get_*` 访问器（只读者不给 setter，写路径自然走 `#1074` 与编译错），同步 AMF 成员表与反射表；`Event_ctor` 与内置派发改用内部写入口。风险面较大（`Event` 是全部事件的基类），需先跑一遍全量回归确定零行为漂移再改 |
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
+| **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
+| **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |
 
 
 

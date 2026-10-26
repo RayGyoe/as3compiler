@@ -467,6 +467,15 @@ int sk_window_create(int w, int h, const char* title, int resizable, int maximiz
 // on web a copy silently does nothing rather than copying something else.
 void sk_clipboard_set_text(const char* text) { (void)text; }
 int sk_clipboard_get_text(char* buf, int cap) { (void)buf; (void)cap; return 0; }
+// The rest of the clipboard seam (stage 293). available() answers 0, so the AS3
+// side reports "this build has no clipboard backend" instead of claiming the value
+// reached the system clipboard; has_fmt/get_fmt answer "nothing there".
+int sk_clipboard_available(void) { return 0; }
+int sk_clipboard_has_fmt(const char* fmt) { (void)fmt; return 0; }
+void sk_clipboard_set_fmt(const char* fmt, const void* data, int len) { (void)fmt; (void)data; (void)len; }
+int sk_clipboard_get_fmt(const char* fmt, char* buf, int cap) { (void)fmt; (void)buf; (void)cap; return 0; }
+void sk_clipboard_clear_fmt(const char* fmt) { (void)fmt; }
+void sk_clipboard_clear(void) { }
 void sk_window_attach_surface(int id, void* surface, int pw, int ph) { (void)id; (void)surface; (void)pw; (void)ph; }
 void sk_window_set_visible(int id, int visible) { (void)id; (void)visible; }
 // Cursor shape is the page's business on web (the CSS cursor follows the DOM

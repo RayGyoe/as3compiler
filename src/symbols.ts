@@ -4633,18 +4633,63 @@ export class SymbolTable {
       [['getMicrophone', shObj('Microphone'), [shIntP('index', -1)]],
        ['getEnhancedMicrophone', shObj('Microphone'), [shIntP('index', -1)]]],
       [['names', { kind: 'array' }]], ['isSupported']);
-    // flash.desktop.Clipboard: AIR's system clipboard. The project only reaches it
-    // through NativeDragEvent.clipboard / NativeDragManager, so the shape here is
-    // the drag-and-drop subset (hasFormat/getData/clear).
-    shell('Clipboard', 'flash.desktop::Clipboard', 'Object',
-      [['formats', { kind: 'array' }]], [], [],
-      [['clear', { kind: 'void' }, []],
-       ['clearData', { kind: 'void' }, [shReq('mimeType', 'String')]],
-       ['getData', { kind: 'any' }, [{ name: 'format', type: 'String', defaultValue: null, isRest: false },
-         { name: 'transferMode', type: 'String', defaultValue: { kind: 'Str', value: 'originalPreferred' }, isRest: false }]],
-       ['hasFormat', { kind: 'bool' }, [shReq('format', 'String')]],
-       ['setData', { kind: 'bool' }, [shReq('format', 'String'), shReq('data', 'Object'), shBoolP('serializable', true)]]],
-      [], [['generalClipboard', shObj('Clipboard')]]);
+    // flash.desktop.Clipboard (阶段二百九十三): a REAL clipboard, not a shell. AIR's
+    // model (Clipboard.html) is one object holding a set of (format -> data)
+    // entries, with `generalClipboard` being that same set backed by the operating
+    // system clipboard. The three parallel arrays below ARE that set: the format
+    // names, the payloads, and the deferred handlers setDataHandler installs (a
+    // non-null handler entry means "render this format on read", and getData calls
+    // it instead of returning the payload). They are Arrays rather than a C list so
+    // the GC marks them through the ordinary class field reflection table.
+    //
+    // The C bodies are hand-written in emit.ts (emitClipboardClass) because the
+    // platform half is a real translation, not a stub: see
+    // docs/zh-cn/desktop.md 7.10 for the format/type table and the deviations.
+    const clf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Clipboard', isStatic: false, isConst: false });
+    const clget = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Clipboard', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const clm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Clipboard', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    this.classMap.set('Clipboard', {
+      fields: new Map([
+        ['_fmts', clf({ kind: 'array' })],
+        ['_vals', clf({ kind: 'array' })],
+        ['_hdl', clf({ kind: 'array' })],
+      ]),
+      methods: new Map([
+        ['clear', clm({ kind: 'void' }, [])],
+        // The parameter NAME is `mimeType`, not `format`: that is what AIR's own
+        // playerglobal declares, and `unit: builtin/Arity` pins it against mxmlc
+        // (the other Clipboard methods really do say `format`).
+        ['clearData', clm({ kind: 'void' }, [shReq('mimeType', 'String')])],
+        ['getData', clm({ kind: 'any' }, [
+          { name: 'format', type: 'String', defaultValue: null, isRest: false },
+          { name: 'transferMode', type: 'String', defaultValue: { kind: 'Str', value: 'originalPreferred' }, isRest: false },
+        ])],
+        ['hasFormat', clm({ kind: 'bool' }, [shReq('format', 'String')])],
+        // `data` is typed * and not Object on purpose: the payload must reach the
+        // C body still boxed, otherwise a String (char*) and a ByteArray (vtable
+        // pointer) would arrive as indistinguishable void*. AIR declares Object;
+        // the describeType difference is a recorded deviation (desktop.md 7.10).
+        ['setData', clm({ kind: 'bool' }, [shReq('format', 'String'), shReq('data', 'any'), shBoolP('serializable', true)])],
+        ['setDataHandler', clm({ kind: 'bool' }, [shReq('format', 'String'), shReq('handler', 'Function'), shBoolP('serializable', true)])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['formats', clget({ kind: 'array' })],
+        ['supportsFilePromise', clget({ kind: 'bool' })],
+      ]),
+      setters: new Map(),
+      staticGetters: new Map([
+        ['generalClipboard', { returnType: shObj('Clipboard'), params: [], owner: 'Clipboard', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false } as MethodInfo],
+      ]),
+      constructor: { params: [] },
+      superClass: 'Object',
+      isFinal: false,
+      implements: [],
+      // `reflectFqn`, not `fqn`: that is the marker the emitter uses for BUILT-IN
+      // classes whose C constructor is hand-written (ByteArray, Sprite, ...).
+      reflectFqn: 'flash.desktop::Clipboard',
+    });
     // flash.desktop.NativeDragManager: AIR declares acceptDragDrop/doDrag as
     // STATIC methods and dropAction/isSupported as static read-only properties
     // (they were registered in the instance-method slot by mistake, which made a
@@ -4665,6 +4710,16 @@ export class SymbolTable {
        ['URL_FORMAT', 'url'], ['BITMAP_FORMAT', 'bitmap'], ['RICH_TEXT_FORMAT', 'richText'],
        ['FILE_PROMISE_LIST_FORMAT', 'filePromiseList']],
       []);
+    // flash.desktop.ClipboardTransferMode (阶段二百九十三): the four transferMode names
+    // getData accepts. It was missing entirely, so `import flash.desktop.
+    // ClipboardTransferMode` (the documented spelling of the four constants) did
+    // not compile at all; the values are the constant strings AIR compares against.
+    constClass('ClipboardTransferMode', {
+      CLONE_ONLY: 'cloneOnly',
+      CLONE_PREFERRED: 'clonePreferred',
+      ORIGINAL_ONLY: 'originalOnly',
+      ORIGINAL_PREFERRED: 'originalPreferred',
+    });
     // flash.events.ProgressEvent also carries the three NativeProcess pipe events
     // (AIR declares them here, not on NativeProcess).
     {

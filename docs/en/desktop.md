@@ -367,6 +367,95 @@ headers) and must be re-checked when the SDL version is bumped; the `SDL_MOUSEBU
 swallowed by `g_synth_right_up`, so AS3 only ever sees the pair the emitter replays.
 
 
+### 7.10 Clipboard: four formats really translated, three not
+
+Stage 293. `flash.desktop.Clipboard` used to be an **empty substitute** (`shell()`: it could be
+constructed, every member did nothing) and `System.setClipboard` reported "not implemented by
+this build". Both are real now: a `Clipboard` object holds a `(format → data)` entry table, and
+`generalClipboard`'s table **is** the operating-system clipboard.
+
+#### Model
+
+AIR's model (`Clipboard.html`) is one object holding a set of entries, with `generalClipboard`
+being that same set carried by the system clipboard. We copy that shape: three parallel `Array`
+fields — `_fmts` (format names), `_vals` (payloads), `_hdl` (deferred handlers installed by
+`setDataHandler`). They are `Array`s rather than a C list so the GC marks them through the
+ordinary **class field reflection table**, with no new GC type. A non-null `_hdl` slot means the
+format is **rendered on read** (`getData` calls it); writing the same format with `setData`
+clears that slot.
+
+#### Formats and types
+
+| Constant | String | AIR payload type | Us | Platform representation (Windows) |
+|---|---|---|---|---|
+| `TEXT_FORMAT` | `text` | `String` | done | `CF_UNICODETEXT` |
+| `HTML_FORMAT` | `html` | `String` | done | `RegisterClipboardFormatW("HTML Format")`, header stripped on read |
+| `RICH_TEXT_FORMAT` | `richText` | `ByteArray` | done | `"Rich Text Format"` (RTF bytes moved verbatim) |
+| `URL_FORMAT` | `url` | `String` | done | `"UniformResourceLocatorW"` |
+| `BITMAP_FORMAT` | `bitmap` | `BitmapData` | reported | — |
+| `FILE_LIST_FORMAT` | `fileList` | `Array` of `File` | reported | — |
+| `FILE_PROMISE_LIST_FORMAT` | `filePromiseList` | `Array` of `IFilePromise` | reported | — |
+
+For the three untranslated formats `hasFormat` returns `false` (no lying) and `setData` calls
+`as_shell_unsupported(...)`, keeps the value **in the object**, then returns `false` (self round
+trip still works, cross-application does not). These are **remaining defects**, not enhancements:
+AIR supports all three. They are listed under "remaining work" in `TODO.md`.
+
+#### Three ordering rules (all forced by measurement)
+
+| Rule | Why |
+|---|---|
+| `hasFormat` / `getData` ask the **OS first**, own entries second | `generalClipboard` is the platform clipboard. Asking our own shadow copy first would let a stale value we wrote earlier mask what another application just copied |
+| `setData` deletes its own shadow copy **after** the OS write succeeds | same; otherwise `getData` can return something older than what we just handed the system |
+| before writing, `EmptyClipboard()` and then **move the other three formats back** (`sk_clip_rebuild`) | on Win32 only the clipboard owner may call `SetClipboardData`, and taking ownership necessarily clears it. Without the move-back, "copy a piece of text" would silently wipe the image the user copied |
+| `sk_clip_open()` retries up to 10 times × `Sleep(2)` | `OpenClipboard` is routinely held briefly by another process (PowerShell's `Clipboard.GetDataObject`, clipboard managers). Failing immediately makes copy flaky — which is exactly why the first external verification reported "not translated" for everything |
+
+`sk_clipboard_set_text()` also goes through `set_fmt("text")` instead of SDL's
+`SDL_SetClipboardText`: the latter clears every other format, so `System.setClipboard()` would
+take `html`/`url` down with it.
+
+#### Deviations from AIR (one by one)
+
+| Deviation | Kind | Note |
+|---|---|---|
+| `bitmap` / `fileList` / `filePromiseList` not translated | **remaining defect** | see the table; `hasFormat` does not lie |
+| `serializable` is accepted but produces **no serialized copy** | remaining defect | AIR serializes when the flag is `true` and the data cannot cross processes; we only carry native formats across, so there is no copy to make |
+| an invalid `getData` `transferMode` reports `Clipboard.getData: invalid transferMode [xxx]` | wording of our own | no Windows `adl` exists to measure AIR's text; bracket-marking is better than inventing AIR copy |
+| `setData`'s `data` parameter is `*` rather than `Object` in `describeType` | deviation | the payload must arrive at the C layer **still boxed**: a `String` is a `char*` and a `ByteArray` a vtable pointer, and collapsing both into `Object` makes them indistinguishable |
+| `supportsFilePromise` is always `false` | truthful | AIR is `false` on Windows too, and with no `filePromiseList` implementation reporting `true` would be the lie |
+| web / no-window builds return `sk_clipboard_available()==0` | truthful | the AS3 side then reports "this build has no clipboard backend"; the value stays in the object and a self round trip still works |
+
+`setData`/`setDataHandler` `#2007` text matches AIR word for word:
+`Error #2007: Parameter format must be non-null.` / `... data must be non-null.` /
+`... handler must be non-null.` A non-`ByteArray` `richText` value is reported and `false`
+returned (AIR's type table requires a `ByteArray`; storing anything else would make `getData`
+hand back a type the format does not promise). `clearData`'s parameter name is `mimeType` (the
+other four say `format`) — not a deviation, that is how AIR's playerglobal declares it, and
+`unit: builtin/Arity` pins it against mxmlc.
+
+#### Evidence
+
+- **Four formats in-process** (`temp/clip/t2.as`, Skia manifest): reading back gives
+  `text=中文 clipboard 实测 abc` / `html=<b>bold-frag</b>` / `url=https://example.com/a?b=c` /
+  `rt={\rtf1 rtf-frag}` and `formats=text,html,richText,url`; after `clearData(HTML)`,
+  `text`/`url` are still there.
+- **External process view** (`temp/clip/ps-read.ps1`, PowerShell reading the system clipboard):
+  `text=中文 clipboard 实测 abc`; `HTML Format` is valid `CF_HTML`
+  (`Version:0.9` plus `StartHTML:0000000105 / EndHTML:0000000186 / StartFragment:0000000137 /
+  EndFragment:0000000154` and `<html><body><!--StartFragment--><b>final-frag</b><!--EndFragment--></body></html>`);
+  `Rich Text Format={\rtf1 rtf-frag}`; `UniformResourceLocatorW` is a `MEMSTREAM:58` UTF-16 stream.
+- **The other direction**: PowerShell `Set-Clipboard -Value "external-app-wrote-this"`, then
+  `temp/clip/t3.as` reads `hasText=true text=external-app-wrote-this fmts=text localHas=false`
+  (OS first, and the shadow copy did not mask it).
+- **Three consecutive runs produced identical output** (no intermittent `OpenClipboard` failure).
+- `examples/clipboard.as` has eight sections (container semantics / format coexistence /
+  `richText` must be a `ByteArray` and read after `position=0` / `cloneOnly` / a handler rendered
+  on read and replaced by `setData` / `clear` / `generalClipboard` + `System.setClipboard` /
+  survives `System.gc()`) and passes on both the plain-C and Skia builds; `test/unit/clipboard.ts`
+  holds 68 source-level pins.
+
+---
+
 ## 8. Verification and evidence
 
 | Item | Evidence |

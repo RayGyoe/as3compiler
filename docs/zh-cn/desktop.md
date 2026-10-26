@@ -336,6 +336,86 @@ API（公开头文件没有），升级 SDL 时需复核；它造出来的 `SDL_
 只看到发射器补发的那一对。
 
 
+### 7.10 剪贴板：四种格式真翻译，三种格式不做
+
+阶段二百九十三。`flash.desktop.Clipboard` 之前是**空替代**（`shell()`：构造得出、成员全空），
+`System.setClipboard` 直接报「本构建不实现」。现在两者都是真实现：`Clipboard` 对象持有一张
+`(格式 → 数据)` 条目表，`generalClipboard` 那张表**直通操作系统剪贴板**。
+
+#### 模型
+
+AIR 的模型（`Clipboard.html`）是一个对象持有一组条目，`generalClipboard` 就是同一组条目、由
+系统剪贴板承载。我们的实现照抄这个形状：类里三个平行 `Array` —— `_fmts`（格式名）、`_vals`
+（载荷）、`_hdl`（`setDataHandler` 装的延迟处理器）。用 `Array` 而不是 C 链表，是为了让 GC
+通过普通的**类字段反射表**标记它们，不必给 GC 加新类型。`_hdl` 某格非空 ⇒ 该格式**读时渲染**
+（`getData` 调它取返回值），`setData` 写同一格式会把该格的处理器清掉。
+
+#### 格式与类型
+
+| 格式常量 | 字符串 | AIR 的载荷类型 | 我们 | 平台表示（Windows） |
+|---|---|---|---|---|
+| `TEXT_FORMAT` | `text` | `String` | ✅ 翻译 | `CF_UNICODETEXT` |
+| `HTML_FORMAT` | `html` | `String` | ✅ 翻译 | `RegisterClipboardFormatW("HTML Format")`，读时剥掉 `CF_HTML` 头 |
+| `RICH_TEXT_FORMAT` | `richText` | `ByteArray` | ✅ 翻译 | `"Rich Text Format"`（RTF 字节原样搬运） |
+| `URL_FORMAT` | `url` | `String` | ✅ 翻译 | `"UniformResourceLocatorW"` |
+| `BITMAP_FORMAT` | `bitmap` | `BitmapData` | ❌ 报明 | — |
+| `FILE_LIST_FORMAT` | `fileList` | `Array`（`File`） | ❌ 报明 | — |
+| `FILE_PROMISE_LIST_FORMAT` | `filePromiseList` | `Array`（`IFilePromise`） | ❌ 报明 | — |
+
+未翻译的三种：`hasFormat` 返回 `false`（不谎报），`setData` 调 `as_shell_unsupported(...)`
+并把值**留在对象里**后返回 `false`（自读自回仍然成立，跨应用不行）。这是**遗留缺陷**、不是
+增强 —— AIR 在这三种格式上是能用的，已登记 `TODO.md` 的「遗留待开发」。
+
+#### 三条顺序规则（都是实测逼出来的）
+
+| 规则 | 为什么 |
+|---|---|
+| `hasFormat` / `getData` **先问 OS，再问自身条目** | `generalClipboard` 直通平台。反过来先查自身影子副本，会让「别的应用刚复制的内容」被我们上次写下的旧值遮蔽 |
+| `setData` 写 OS **成功后删掉自身影子副本** | 同上；否则 `getData` 会读出比自己刚写进系统的更旧的值 |
+| 写 OS 前先 `EmptyClipboard()`，再把**其余三种格式搬回来**（`sk_clip_rebuild`） | Win32 只有剪贴板所有者能 `SetClipboardData`，取所有权必然清空。不搬回来就是「复制一段文字顺手抹掉用户复制的图片」 |
+| `sk_clip_open()` 最多试 10 次 × `Sleep(2)` | `OpenClipboard` 被别的进程短暂占用是常态（PowerShell 的 `Clipboard.GetDataObject`、各种剪贴板管理器）。直接失败会让「复制」随机失灵 —— 这正是首次外部验证全部报「未翻译」的原因 |
+
+`sk_clipboard_set_text()` 也走 `set_fmt("text")`，不用 SDL 的 `SDL_SetClipboardText`：
+后者会清空其他格式，`System.setClipboard()` 就等于顺手毁掉 `html`/`url`。
+
+#### 与 AIR 的差异（逐条登记）
+
+| 差异 | 归属 | 说明 |
+|---|---|---|
+| `bitmap` / `fileList` / `filePromiseList` 不翻译 | **遗留缺陷** | 见上表；`hasFormat` 不谎报 |
+| `serializable` 参数被接受但**不产生序列化副本** | 遗留缺陷 | AIR 在该参数为 `true` 且数据不可跨进程时做序列化；我们跨进程只走原生格式，故没有副本可分 |
+| `getData` 的 `transferMode` 非法时报 `Clipboard.getData: invalid transferMode [xxx]` | 措辞自拟 | 无 Windows `adl` 可测 AIR 原文；宁可用方括号标注而不是编一句 AIR 文案 |
+| `setData` 的 `data` 参数在 `describeType` 里是 `*` 而非 `Object` | 偏差 | 载荷必须**仍然装箱**地到达 C 层：`String` 是 `char*`、`ByteArray` 是 vtable 指针，统一成 `Object` 会让两者不可区分 |
+| `supportsFilePromise` 恒 `false` | 如实 | Windows 上 AIR 也是 `false`；没有 `filePromiseList` 实现，报 `true` 才是谎报 |
+| Web / 无窗口构建 `sk_clipboard_available()==0` | 如实 | AS3 侧据此报「本构建没有剪贴板后端」，值留在对象内，`hasFormat` 自读自回仍成立 |
+
+`setData`/`setDataHandler` 的 `#2007` 文案逐字对齐 AIR：
+`Error #2007: Parameter format must be non-null.` / `... data must be non-null.` /
+`... handler must be non-null.`；`richText` 收到非 `ByteArray` 时报明并返回 `false`
+（AIR 的类型表要求 `ByteArray`，存别的会让 `getData` 交回不符承诺的类型）。`clearData` 的形参名是
+`mimeType`（`getData`/`setData`/`setDataHandler`/`hasFormat` 都叫 `format`）—— 不是偏差，AIR 的
+playerglobal 就是这么声明的，`unit: builtin/Arity` 用 mxmlc 对照钉着。
+
+#### 证据
+
+- **同进程四种格式**（`temp/clip/t2.as`，Skia 清单）：写入后读回
+  `text=中文 clipboard 实测 abc` / `html=<b>bold-frag</b>` / `url=https://example.com/a?b=c` /
+  `rt={\rtf1 rtf-frag}`，`formats=text,html,richText,url`；`clearData(HTML)` 后 `text`/`url` 仍在。
+- **外部进程视角**（`temp/clip/ps-read.ps1`，PowerShell 读系统剪贴板）：
+  `text=中文 clipboard 实测 abc`；`HTML Format` 是合法 `CF_HTML`
+  （`Version:0.9` + `StartHTML:0000000105 / EndHTML:0000000186 / StartFragment:0000000137 /
+  EndFragment:0000000154` + `<html><body><!--StartFragment--><b>final-frag</b><!--EndFragment--></body></html>`）；
+  `Rich Text Format={\rtf1 rtf-frag}`；`UniformResourceLocatorW` 是 `MEMSTREAM:58` 的 UTF-16。
+- **反方向**：PowerShell `Set-Clipboard -Value "external-app-wrote-this"` ⇒ `temp/clip/t3.as` 读回
+  `hasText=true text=external-app-wrote-this fmts=text localHas=false`（即 OS 优先、影子副本没有遮蔽）。
+- **连续三次运行输出完全一致**（无 `OpenClipboard` 偶发失败）。
+- `examples/clipboard.as` 八段（容器语义 / 多格式共存 / `richText` 必须是 `ByteArray` 且
+  `position=0` 后读 / `cloneOnly` / handler 读时渲染且被 `setData` 取代 / `clear` /
+  `generalClipboard` + `System.setClipboard` / `System.gc()` 后存活）在纯 C 与 Skia 两种构建上都通过；
+  `test/unit/clipboard.ts` 68 条源级钉。
+
+---
+
 ## 8. 验收与证据
 
 | 项 | 证据 |
