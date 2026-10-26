@@ -11658,6 +11658,13 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return o;');
     this.indent--;
     this.line('}');
+    // parent: the display parent, NULL for an object that is not in a display list
+    // (and for the Stage itself). AIR types it DisplayObjectContainer and makes it
+    // READ-ONLY; the storage is the EventDispatcher `parent` pointer the display
+    // list already maintains, so this body only re-states the static type -- which is
+    // the whole point: without the accessor, `obj.parent.mouseX` is a dynamic
+    // lookup on an Object-typed field and yields NaN (see symbols.ts).
+    this.line('DisplayObjectContainer* DisplayObject_get_parent(void* _this) { return (DisplayObjectContainer*)(((DisplayObject*)_this)->parent); }');
     // root: walk parent links to the topmost object; stage: same object (the
     // outermost container is the Stage in this subset).
     this.line('DisplayObject* DisplayObject_get_root(void* _this) {');

@@ -16845,7 +16845,60 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 `NetworkInfo`/`Microphone`/`LocalConnection`），外加成员级 `as_shell_unsupported` **26 条**。
 逐项「给得出 / 给不出」见 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md)（[EN](docs/en/stubs.md)）。
 
+### 阶段二百九十四：`DisplayObject.parent` 的静态类型（v0.4.256 → v0.4.257）✅ 已完成
+
+**一、起因**（用户报）：talkmed-meeting 设置窗「常规」页里三个 **i** 图标的 tips「只能显示一个」。
+
+**二、定位**（真机 trace + 生成的 C 两路互证，产物在 `temp/tipsetup/` 与 `temp/tipfix/`）
+1. 三个图标**都能拾取、都能挂上 tip**：`ASC_MOUSE_TRACE=2` 横扫在 stage y=316 的 x∈[266,270]∪[274,278]、
+   y=277 的 x∈[272,376]、y=237 的 x∈[350,378] 命中 16×16 的 `MovieClip`，且每次都能看到
+   `hover … -> … | over=1` 与 `stage + cn_edoctor_controls_ToolTips::MyTip (n=2)` ⇒ 三次
+   `ToolTips.Create` 的 `showToolFunction` 都跑了，**不是「只有一个是好的」**。
+2. 图标正中点不中是 **SWF 几何**：`shape#981` 是 even-odd **圆环**（外圆 r=8 + i 点/i 竖两条**洞**），
+   只有约 4 px 宽的环可命中。AIR 用同一份 SWF，因此这是**口径一致**，不是我们的偏差。
+3. tip **一次都没上屏**：`PrintWindow` 抓图逐像素扫（`tip_note1b.png`，tip 应落在 stage (273,286)
+   ≈ 图像 (420,474)）整片空白；把指针跳到 tip 应在的位置时拾取答案是 `setupskin` 而不是 `MyTip`。
+4. 生成 C 里找到了断点：`bin-aot/TalkMED Meeting.c` 的 `cn_edoctor_controls_ToolTips_MyTip_onMouseMove`
+   把 `this.parent.mouseX` 编成
+   `as_v_to_number(as_dyn_get((void*)((Object*)as_req_obj((void*)((this->parent)))), "mouseX"))`
+   —— **动态查表**，于是 `mousex/mousey` 是 `NaN`，tip 被摆到 `(NaN,NaN)`：`visible=true`、
+   画不出来、也点不到。
+
+**三、根因**：`DisplayObject.parent` **没有登记成访问器**。`x.parent` 于是命中 `EventDispatcher` 里
+那个存显示树父指针的内部**字段**（静态类型 `Object`），成员读退化成动态查表。AIR 的声明是
+`parent:DisplayObjectContainer`（只读）—— 也是 mxmlc 下这段应用代码能成立的唯一原因。
+
+**四、落地**
+1. `src/symbols.ts`：`DisplayObject` 的 getters 表加
+   `['parent', dog({ kind: 'object', className: 'DisplayObjectContainer' })]`，**不加 setter**（AIR 只读）；
+   `shadowedForRead` 让这个访问器遮住继承来的字段（AS3「最近声明胜」）。
+2. `src/emit.ts`：`DisplayObjectContainer* DisplayObject_get_parent(void* _this)`，返回显示树父指针
+   （存储仍是 `EventDispatcher.parent` 那个槽，改的只是**静态类型**）。
+3. `examples/parent-mouse.as` + `test/unit/display.ts` 的 `unit: display/ParentAccessor`（7 钉：
+   访问器登记 / 无 setter / C 体 / vtable `get_parent` 槽 / `parent.mouseX` 走访问器链 /
+   **不是** `as_dyn_get` / 反射表带容器类型）。
+
+**五、实测**
+
+| 检查 | 结果 |
+|---|---|
+| `temp/tipfix/ProbeParent.exe`（headless） | `sameParent=true px=7 pmy=4 pmx=4 typed=true stageChildParentIsStage=true stageChildMouseX=11 orphanNull=true` |
+| 生成 C 的读点 | `vtable->get_parent(…) -> vtable->get_mouseX(…)`；反射表 `{ "parent", …, "flash.display::DisplayObjectContainer" }` |
+| `examples/parent-mouse.as` | `parent-mouse: ok` |
+| `node test.ts` | 见提交说明（基线红 4 条不变） |
+
+**六、如实报明**
+1. 这条修复要**重编应用 exe** 才在图上看得出；本轮没有重编（`bin-aot/TalkMED Meeting.exe` 仍是旧产物，
+   27,648,000 B / mtime 2026-10-26T16:26:59Z），真机 tips 的重测留给下次构建。
+2. 顺带量到、但**不属本阶段**的一个隐患：真机上**每一条鼠标通知恰好抛一次 `#1009`**（空区 20 次移动
+   → 未捕获异常计数 +20，与 tip 是否存在无关）。在我们的（与 `adl` 对齐的）派发语义下，这类未捕获
+   异常会**中断该次派发的剩余监听器**，所以它虽然与本 tip 无关（tip 的监听器即使被打断也只是不定位），
+   仍是全局隐患；触发点未定，已在「遗留待开发」登记（需 `-DASC_NULL_TRACE` 诊断构建才能指名）。
+3. `ToolTips` 的 `relistener` 在 `REMOVED_FROM_STAGE` 里做 `stage.removeEventListener(...)`，
+   而那一刻 `stage` 已为 null —— AIR 里同样会抛 `#1009`，属**应用侧写法**，不改。
+
 ### 遗留待开发
+> **2026-10-27 追加（阶段二百九十四：`DisplayObject.parent` 的静态类型）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **95 → 96 项**（`未开始` **74 → 75** / `部分完成` 20 / `调研完成·实现暂缓` 1）。**本阶段修的 tips 缺陷不占表**：`adl` 跑得对（tip 正常显示）、我们此前跑不出 ⇒ 属 §1.5 的**遗留缺陷**，但阶段内已修净，按表头自述「已完成项一经落地即从本表移出」故不入表。新登记的 1 行是**顺带量到的全局隐患**：真机每条鼠标通知抛一次 `#1009`，触发点未定。
 > **2026-10-27 追加（阶段二百九十三：`Clipboard` 真实现 + `System.setClipboard` + 空替代盘点）**：**新登记 2 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **93 → 95 项**（`未开始` **72 → 74** / `部分完成` 20 / `调研完成·实现暂缓` 1）。**新登记 2 行**：① 剪贴板的 `bitmap`/`fileList`/`filePromiseList` 三种格式不翻译（这三种 `adl` 都能用 ⇒ 遗留缺陷；我方 `hasFormat` 不谎报、`setData` 报明后返回 `false`）；② `serializable` 参数被接受但不产生序列化副本。**改写的 1 行**是「web 目标键盘与剪贴板未接线」—— 剪贴板那半边本阶段已接线（`vendor/web_glue.cc` 补齐 8 个 seam 函数、`sk_clipboard_available()` 返回 0 ⇒ AS3 侧**报明**「本构建没有剪贴板后端」，不是静默降级），`navigator.clipboard` 的异步 + 用户手势门控仍是**平台硬边界**（§1.5）；键盘那半边仍未接线，故状态维持「未开始」。**本阶段修净的两项不占表**：`Clipboard` 本体与 `System.setClipboard`（`adl` 跑得对、我们此前跑不出 ⇒ 遗留缺陷，但同阶段落地，按表头「已完成项一经落地即从本表移出」不入表）。**空替代盘点**落在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md)：`shell()` 20 个类逐项写明「给得出 / 给不出」（12 个数据载体 + 8 个真能力缺口），成员级 `as_shell_unsupported` 26 条也成表；本机的行为读数是 `temp/clip/t4.as`。
 > **2026-10-26 追加（阶段二百九十一：字形归一化的除数）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是**我们自己发明的自动烘焙**（AIR 没有对应物）兑现不了自己的承诺（「烘焙态 == 活态」）造成的**呈现缺陷**——`adl` 根本不经过烘焙路径，故不属 §1.5「`adl` 跑得对我们跑不出」，不占本表；页面级证据（121 帧逐帧 ink 包围盒、修前 119 / 修后 124）、根因与未测项见阶段节与 `docs/zh-cn/skia.md` §8.3。
 > **2026-10-26 追加（阶段二百九十：`ContextMenu` 的 Windows 实测）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段修的四处（菜单位置、重复 release、分隔线之后 tag 越界、`submenu` 静默丢失）在 `adl` 上都是「跑得对」的、我们此前跑不出 ⇒ 按 AGENTS §1.5 属**遗留缺陷**，但**已在同一阶段修净**，按表头「已完成项一经落地即从本表移出」不入表。`keyEquivalent` 在 Win32 上不显示不生效仍缺（需在 `TrackPopupMenu` 的模态循环里挂消息过滤器），属**实现欠账**而非拒绝实现，故记在阶段节的「如实报明」、不入表。
@@ -17009,6 +17062,7 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 >
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
+| **每条鼠标通知抛一次 `#1009`**（真机 talkmed-meeting 设置窗实测：空区 20 次移动 → 未捕获异常计数 +20，与是否有 tooltip 无关） | 未开始（2026-10-27 阶段二百九十四 追 tooltip 缺陷时量到；触发点**未定位**，需 `-DASC_NULL_TRACE` 诊断构建把 `as_req_obj` 的**生成 C 行号**打出来） | 在我们的（与 `adl` 对齐的）派发语义下，未捕获异常会**中断该次派发的剩余监听器** ⇒ 排在后面的监听器全都不执行；应用在 `adl` 上跑得对，故这条大概率是**我们的**空接收者守卫多报。证据：`temp/tipsetup/tips-trace2.txt`（`… #1009 (19 more of the same)` 与每次 `t=… mouse mouseMove` 一一对应） | 待定 |
 | **`ExtensionContext` 还有 4 个 AIR 50 成员未建模**（`functions` / `knownExtensions` / `getExtensionInfo` / `loadExtension`） | 未开始（2026-10-17 阶段一百七十八·二 逐项查 AIR 参考时登记） | 已落地的 A 面是 `createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` / `actionScriptData` + `StatusEvent`（与 `ANEWinCore` 的真实用量完全覆盖）。**`loadExtension` 不是小修**：它是**延迟加载**——扩展在**首次 `call` 时**才 `LoadLibrary` + initializer，要把 C 面的加载时机从「构造 `ExtensionContext` 时」移到「首次调用时」并缓存；`functions`/`knownExtensions`/`getExtensionInfo` 是只读反射面。（另：`extensionID` **已删** —— AIR 没有这个属性，`mxmlc` 拒绝 + `adl` 报 `#1069`，已按 AIR 对齐，不入本表） | 先补 `adl` 实测采集这四个成员的真实形态（`functions` 是 `Object` 还是数组、未知 id 时是 `null` 还是空表），再按实测落地；`loadExtension` 独立立项（它要动 C 面时序） |
 | **iOS 上的 ANE 没有（也不会有同样形态的）宿主库** —— FRE 宿主运行时 `asaot` 已出 Windows 两个位宽与 **macOS**（`lib/bin/macos-x86-64/libasaot.dylib`，通用二进制，阶段二百零七）；`ios-arm64/` 仍不存在 | **部分完成**（macOS 端 2026-10-20 阶段二百零七 落地并实测；iOS 端未开始） | macOS 端**已完成**：`lib/build-asaot.sh` 出通用 dylib、`src/fre.ts` 有 POSIX 分支（`dlopen`/`dlsym`/`_NSGetExecutablePath`/递归锁/pthread）、`lib/asaot.h` 的 POSIX 侧补齐 `ASAOT_HOST` 三态、`examples/ane`+`ane-app` 在 macOS 上真跑（46 条断言）、宿主库名收成 `aneHostLibName()` 一处。**iOS 不是把同一件事重做一遍**：iOS 把扩展**静态链进应用镜像**，没有 `dlopen` 这一步，`asaot` 会是一份静态库、initializer 由**直接符号引用**到达 ⇒ 落地起点是定「**谁调用 initializer**」（应用侧还是运行时侧的启动钩子），而不是重编一遍宿主库。当前行为仍是**响亮抛错并说明原因**（`aneHostLibName()` 对 `iPhone-ARM` 抛），不静默降级。 | iOS 端：先定 initializer 的调用方，再出 `lib/bin/ios-arm64/` 的静态库形态
 | `extends <内建类型>`（含 **`extends Array`**）不支持 —— 闭包内 **2 个文件**用它（`src/com/hurlant/util/der/Sequence.as`、`src/com/fiCharts/utils/graphic/StyleManager.as`），AIR 合法 | **部分完成**（2026-10-08 阶段一百一十八 重评估闭包时实测登记；**2026-10-11 阶段一百三十六**：`extends Array` 已落地——`ClassInfo.arrayBacked` + 隐藏 `as_array* _arr` 槽承担全部 Array 操作，C 侧超类记 `Object` 保指针布局兼容，`arrayBacked` 沿超链传递；**`String`/`Number`/`int`/`XML`/`Function` 等内建仍响亮报错**） | `resolveType('Array')` 给 `{kind:'array'}`、**无 `className`** ⇒ 旧码盲取 `.className` 报一字面的 `unknown superclass 'undefined' of 'Sequence'`（离原因很远）。现按 kind 分派：接口 ⇒ `cannot extend interface 'I'`；其余非类 ⇒ `unsupported superclass 'Array' of 'E': subclassing built-in types is not implemented`（带行列号）。**AIR 接受 `extends Array`**（mxmlc 51.4.1 实测），故这是**遗留缺陷**而非增强：子类数组需真实运行期支持（元素存储 / `length` / 全部 Array 方法在子类上的行为、`Vector` 与 `Array` 的元数据、`is Array` 沿链判定） | 立项前先量清面上：用 `adl` 实测「子类数组」的全部可观测差异（`a.length`、索引、`push` 等方法返回的是子类还是 `Array`、`getQualifiedClassName`、`is Array`/`is E`），再决定是「真做子类存储」还是「仅报精确错误 + 建议改写」。**先实测再动**（不得凭直觉定语义） |

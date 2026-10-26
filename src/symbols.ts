@@ -1567,6 +1567,18 @@ export class SymbolTable {
         // position in the object's own space (C bodies in emit.ts).
         ['mouseX', dog({ kind: 'number' })],
         ['mouseY', dog({ kind: 'number' })],
+        // DisplayObject.parent (AIR: `parent:DisplayObjectContainer`, read-only).
+        // This MUST be an accessor, not just the EventDispatcher `parent` field the
+        // display list already keeps: reading that field types the expression as
+        // Object, so `obj.parent.mouseX` became a DYNAMIC lookup
+        // (as_dyn_get(parent, "mouseX") -> null -> NaN) instead of the static
+        // DisplayObject_get_mouseX. Measured on the talkmed-meeting AOT build
+        // (bin-aot/TalkMED Meeting.c, MyTip.onMouseMove): mousex/mousey were NaN,
+        // so every tooltip was moved to (NaN,NaN) -- visible=true, painted nowhere,
+        // never hittable -- which is why the three "i" icons in the settings window
+        // showed at most a flicker of a tip. shadowedForRead() lets this accessor
+        // shadow the inherited field (nearest declaration wins, as in AS3).
+        ['parent', dog({ kind: 'object', className: 'DisplayObjectContainer' })],
       ]),
       setters: new Map([
         ['filters', dos('Array')],

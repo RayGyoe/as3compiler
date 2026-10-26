@@ -1191,7 +1191,50 @@ function checkWindowSlotReuse(): string[] {
   return bad;
 }
 
-registerGroup('unit: display/HitShape', checkHitShape);
+// unit: display/ParentAccessor — DisplayObject.parent 必须是 DisplayObjectContainer
+// 访问器（阶段二百九十四）。现场：talkmed-meeting 设置窗三个 i 图标的 tooltip 只闪不显，
+// 因为 MyTip.onMouseMove 的 `this.parent.mouseX` 读的是 EventDispatcher 的父指针**字段**
+// （静态类型 Object）→ 动态查表 → null → NaN → 提示框被摆到 (NaN,NaN)（visible=true、
+// 画不出、点不到）。本组钉三件最容易再丢的事：
+//   ① parent 在 DisplayObject 的**访问器**表里，返回类型是容器；
+//   ② C 体返回显示树父指针（只读，没有 setter）；
+//   ③ 生成的 C 里 `parent.mouseX` 是静态访问器链，不是 as_dyn_get。
+function checkParentAccessor(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [parent] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [parent] ${label}`); }
+  };
+  const symbolsSource = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+
+  // ① 访问器登记（不是字段：字段那条路会把表达式定型成 Object）
+  check('DisplayObject registers parent as a DisplayObjectContainer getter',
+    /\['parent', dog\(\{ kind: 'object', className: 'DisplayObjectContainer' \}\)\]/.test(symbolsSource));
+  check('parent has no setter (AIR: read-only)',
+    !/\['parent', dos\(/.test(symbolsSource));
+
+  // ② C 体：返回显示树父指针
+  check('the getter body returns the display parent pointer',
+    emitSource.includes("this.line('DisplayObjectContainer* DisplayObject_get_parent(void* _this) { return (DisplayObjectContainer*)(((DisplayObject*)_this)->parent); }');"));
+
+  // ③ 生成 C：parent.mouseX 是静态访问器链
+  const gen = generateC(parse('import flash.display.Sprite;\nvar p:Sprite = new Sprite();\nvar q:Sprite = new Sprite();\np.addChild(q);\nvar a:Number = q.parent.x;\nvar b:Number = q.parent.mouseX;\n')).c;
+  check('the vtable carries a get_parent slot',
+    gen.includes('DisplayObjectContainer* (*get_parent)(void* _this);'));
+  check('parent.mouseX reads through the accessor chain',
+    gen.includes('->vtable->get_parent(') && gen.includes('->vtable->get_mouseX('));
+  check('parent.mouseX is NOT a dynamic property lookup',
+    !/as_dyn_get\([^;]*"mouseX"/.test(gen));
+  check('the reflection table exposes the accessor with its container type',
+    gen.includes('{ "parent", DisplayObject_get_parent__dyn, 0, "flash.display::DisplayObjectContainer" }'));
+
+  if (ok > 0) console.log(`[parent] ${ok} DisplayObject.parent checks passed`);
+  return bad;
+}
+
+registerGroup('unit: display/HitShape', checkHitShape);registerGroup('unit: display/ParentAccessor', checkParentAccessor);
 registerGroup('unit: swc/TextChildOrigin', checkSwcTextChildOrigin);
 registerGroup('unit: display/McButtonState', checkMcButtonState);
 registerGroup('unit: display/PerStagePointer', checkPerStagePointer);
