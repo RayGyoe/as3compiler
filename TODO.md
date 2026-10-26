@@ -16444,6 +16444,92 @@ Windows 那次「resize 时画面抖动」的修复（阶段一百三十三：`C
    SDL 只把它当 motion —— 这是 SDL 的路由方式（按键事件投给持有 mouse focus 的窗口），不是本节的缺陷。
    真机用鼠标点击没有这个问题。
 
+### 阶段二百八十八：Stage3D 与 2D 合成从未共用同一条队列 —— 主可执行文件没导出 `sk_mtl_shared_queue`（v0.4.250 → v0.4.251）✅ 已完成
+
+**一、现象与定性**
+
+用户报 `examples/air-starling-demo`「画面闪烁消失」，并澄清两条关键信息：**背景（天空）不会消失**，
+消失的是**前景/Stage3D 内容**；出现时机是 **Benchmark 跑起来、物体在动的时候**。同批反馈的另一条
+「FPS 文字 + 拖窗口改大小 ⇒ 整程序缩放错乱」经确认在阶段二百八十七 之后已明显改善，本节只做复核
+（见五），不改代码。
+
+外部截屏探针先试过：12 s / 357 样本（cream 比例恒 0.4344）、20 s / 792 帧（帧间差中位数 39.31、
+**0 个尖峰**）、15 s / 607 样本（均值 207.76、min=max）—— 都看不到异常。这与用户描述一致：不是
+「整窗黑掉」，而是**部分帧的内容缺失**，2.7 Hz 的 `screencapture` 抓不住。
+
+**二、进程内探针：问题在合成，不在 3D 通道**
+
+改 `vendor/stage3d_glue.mm` 以 `s3d_clear()` 为帧边界做逐帧普查（`S3DFRAME f=N draws=D drops=D
+nostream=D`，计数在 `s3d_draw`）：30 s 内 `draws=4~8`、**`drops=0`、`nostream=0`** ⇒ 没有任何一次 draw
+被丢（mip-drop 分支 `asc_tr_mipdrop` 从未触发）。
+
+再改 `vendor/metal_glue.mm`，在合成之后读画布、**同帧**读合成用的那张目标纹理（同一组 8 行、同一个
+cream 判据），基准期得到：**82 个采样帧里 51 帧画布 cream=33（只剩天空）而纹理 cream≈1900**。整幅
+转储证实：画布 = 天空 + 2D 覆盖层（HUD/按钮都在），纹理 = 完整物体 ⇒ **合成读到的目标纹理是"本帧
+只画完背景 pass"的中间态**。
+
+**三、根因**
+
+`vendor/stage3d_glue.mm` 用 `dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue")` 采纳 Skia/Ganesh 那条
+`MTLCommandQueue`（阶段一百一十四 的设计：一条队列才有 Metal 的冒险跟踪，2D 合成读、3D pass 写才
+有序）。但 `dlsym(RTLD_DEFAULT)` 查的是**动态符号表**，而主可执行文件自己的全局符号**默认不进**那张
+表（ld64 要 `-export_dynamic`/`-exported_symbol` 才导出），构建侧从来没加过 ⇒ 查找**每次都拿到 NULL**
+⇒ "取不到就自建一条"的回落分支在**窗口应用里也一直在跑** ⇒ 两条队列之间无冒险跟踪 ⇒ 合成与 3D
+pass 竞争，命中时读到只画完背景的纹理。
+
+一次性的打印证实（临时加在 `s3d_create`/`sk_mtl_init`）：修前 `sharedFn=0x0 sharedQueue=0x0
+using=0x87248c000` 而 `metal_glue: g_queue=0x105cf1490`（**两个不同对象**）；加上导出后
+`sharedFn=0x102c48504 sharedQueue=0x1037d49d0 using=0x1037d49d0`，且 `g_queue=0x1037d49d0`
+（**同一指针**）。
+
+**四、修法**
+
+`src/build.ts` 新增 `exportDynamicFlags(cfg)`，挂在**两条**链接路径上（单命令 `buildCompileCommand`
+与多步 C++ 的 `buildCompileSteps` 尾步），`src/xcode-project.ts` 另把同一枚旗标放进 `OTHER_LDFLAGS`
+（Xcode 也不导出主可执行文件的全局符号，否则打包成 `.app` 后同样的闪烁会回来）：
+
+- darwin：`-Wl,-exported_symbol,_sk_mtl_shared_queue` —— **只点名这一个符号**；
+- ELF：`-Wl,--export-dynamic`（`--export-dynamic-symbol` 要 GNU ld ≥ 2.35 / lld，本机无法判断用户装的是哪个）；
+- Windows：不加（PE 无 `dlsym`；D3D 侧本来就靠 `__declspec(dllexport)` + `GetProcAddress(GetModuleHandleA(NULL))`）。
+- **门是"这个构建真的链接了 `vendor/metal_glue.mm`"**，不是"开了 Stage3D"：`-exported_symbol` 点名一个
+  未定义符号是**硬链接错误**（实测 `node src/index.ts examples/stage83.as --manifest
+  examples/stage83.build.json` → `Undefined symbols: _sk_mtl_shared_queue`，因为 headless Stage3D 构建只链
+  `stage3d_glue.mm`）。
+
+为什么不在 darwin 用宽版 `-export_dynamic`：它把**所有**全局（含 Skia/ICU）塞进导出表，`air-starling-demo`
+实测 **11,319,104 B → 12,202,688 B**（+883 KB）；点名版只花 8 KB（11,279,112 B）。
+
+**五、实测（A/B，同一台机器、同一个 demo、同一个判据）**
+
+| 量尺 | 修前（两条队列） | 修后（共用队列） |
+|---|---|---|
+| `s3d_create` 拿到的队列 | `sharedFn=0x0`，`using≠g_queue` | `sharedFn≠0`，`using==g_queue` |
+| 同一帧「画布 cream vs 纹理 cream」（基准期） | **51/82 帧**画布=33 vs 纹理≈1900 | **148/148 帧完全相等**（`canvas==tex` 逐条相同） |
+| 窗口连拍（0.45~0.5 s × 6，cream 像素） | 3 张**完全相同**（6232）＝画面冻结在基准早期 | 188761 / 186697 / 188357 / 185872 / 186596 / 190038（持续变化，物体在动） |
+| 屏幕目视 | 天空 + HUD，无物体 | 2 万~5 万个鸡蛋 + HUD + Back，`fps=119~123` |
+| `dyld_info -exports` | 无 `sk_mtl_shared_queue` | `_sk_mtl_shared_queue 0x00224D48` |
+| headless Stage3D（`examples/stage83.build.json`） | 链接通过 | **链接通过**（无旗标，见四） |
+| `unit: build/ExportDynamic` | — | **13/13** |
+
+**六、顺带复核 bug ②（resize 后整体缩放）—— 未复现，未改代码**
+
+原生可执行文件拖窗口边缘（320→620 pt，120 步快拖）下：`s3d_trace resize` 触发正确；背缓冲恒
+**640x1160**（不随窗口重配）；合成 `w=640 h=1160 lw=320 lh=580 scale=2.0000`，best-fit 在 0.8~3.0
+区间取 **1.00**（1:1 平均差 2.65）；连接期间内容框恒 `(0,70,180,76)`、从不移动或拉伸。根因在 demo
+自身而非呈现层：`Demo.as` 把 `stageWidth/Height` 钉成 `stage.fullScreenWidth/Height`（1800x1169），
+viewport 固定，`updateViewPort()` 提前返回，`configureBackBuffer` 永远看不到新尺寸。为用户后续定位，
+`ASC_S3D_TRACE` 下补了两行（resize 的 `lw/lh/pw/ph/scale` 新旧值、composite 行的 `scale/win lw/lh/pw/ph`），
+都受同一环境变量门控、默认零输出。
+
+**七、如实报明**
+
+- **Windows 未实测**（本机只有 macOS）：D3D 侧的按名查找走 `__declspec(dllexport)` + `GetProcAddress`，
+  代码在 `vendor/d3d_glue.cc:532-533`，代码面自洽，但真机未验。
+- `--package xcode-project` 只验证了生成物：`project.pbxproj` 的 `OTHER_LDFLAGS` 两套配置都带旗标；
+  **没有**跑 `xcodebuild` 起 `.app` 复核运行时队列是否真的共用。
+- 阶段一百一十四 当初的验收数据是在"两者同处一个 TU/同一条队列"的条件下量的，因此这个回落分支
+  从来没被那段验收覆盖到 —— 本节补的钉子 `build/ExportDynamic` 就是为了让这个洞不再静默。
+
 ### 遗留待开发
 > **2026-10-26 追加（阶段二百八十七：透明窗的呈现层 1:1）**：**新登记 0 行 / 改写 0 行 / 移出 0 行**（表内项数不变）。这是**呈现路径**缺陷（`CALayer` 默认重力把旧帧拉满新 bounds），不是 `adl` 跑得对我们跑不出的语义缺口 ⇒ 不占本表；同一阶段的点击吞噬（覆盖视图成了窗口 hit view）同样是**平台接线**缺陷、且已修净，一并不入本表；它与阶段一百三十三同族、同一条修法，根因、单行 A/B 实测（15/151 → 0/155）与未测项见阶段节与 `docs/zh-cn/skia.md` §6.7.1。
 > **2026-10-25 追加（阶段二百七十五：G24 / G25 / G26 三条运行时契约）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。三条都是「`adl` 跑得对、我们跑不出」的**语义实错**，且都在本阶段**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表），证据与复现见阶段节与 `asaotui/compiler-gaps.md` G24/G25/G26。**两处刻意不复刻的分歧已如实登记**（`drawPath` 单段曲线不填、曲线描边 coverage 6.9%），一条不可解释的 AIR 行为（`3,3`）明确选择不模仿。
@@ -16753,7 +16839,7 @@ Windows 那次「resize 时画面抖动」的修复（阶段一百三十三：`C
 
 ---
 
-### macOS 清理工具 demo 能力缺口（评估落点；余 G3/G4a/G4b/G5/G7/G8 待排期）
+### macOS 清理工具 demo 能力缺口（评估落点；余 G5/G8 待排期）
 
 > **本节是评估落点，既不是欠账表、也不是增益表** —— 与上面「UI 工具链待定项（未排期）」同一形态与口径。产物是 [`../prune/mac-cleaner-demo-plan.md`](../prune/mac-cleaner-demo-plan.md)（产品 + 技术方案）。
 > **该方案已于 2026-10-23 移出本仓库**（原 `docs/projects/` 目录已撤），现位于**工作区根 `prune/`**（与 `asaotui/` 同级，后续单独建 git 仓库），以免本软件信息与编译器交错。
@@ -16775,6 +16861,11 @@ Windows 那次「resize 时画面抖动」的修复（阶段一百三十三：`C
 >   「看着开了、实际没编进去」）；四项都还没开工，故**暂不登记进 `### 增强待做`**，与相邻「UI 工具链待定项」
 >   节对 U1~U5 的处置同口径。待开关真的落地时，再按 `### 增强待做` 的入库标准补登记。
 >
+>   **2026-10-26 更正（只改 G3 的交付方式，判定「增强」不变）**：G3 **没有**走 `--features` 开关，
+>   而是做成了**产品仓库里的 ANE**（见下方「已落地」的 G3 条目）。`--features` 那条路的隐含代价是
+>   「把平台 API 写进语言实现」——一个只有 macOS 用得上、AIR 又没有的 `File` 成员；而 ANE 是 AIR
+>   自己给第三方扩展准备的门，平台 API 留在产品仓库、可被审计。G4b/G5/G8 的判定与路径**不变**。
+>
 > **⚠️ 编号撞车提醒**：本节的 `G1~G8` 是**方案自用的缺口编号**，与 **阶段二百四十七 / 二百四十八 / 二百四十九**
 > 使用的 `G8`/`G9`/`G13`（另一套缺口表）**同名不同义** —— 引用时务必带「demo 的」或直接引方案节号。
 
@@ -16789,17 +16880,19 @@ Windows 那次「resize 时画面抖动」的修复（阶段一百三十三：`C
   **自定义 Dock 图标**（PNG 素材直接给 `bitmaps`）+ Dock 右键菜单 + `autoExit=false`，零新平台胶水。
   口径 [`docs/zh-cn/desktop.md`](docs/zh-cn/desktop.md)。
 - **G2** ~~`File.getSpaceAvailable`~~ ⇒ 真名是 **`File.spaceAvailable`（属性）** —— ✅ **原登记是误记**：`getSpaceAvailable` 在 AIR 里**根本不存在**（`adl 51.4.1`：`'getSpaceAvailable' in f` = `false`、取它抛 `#1069`），而 `f.spaceAvailable` **从阶段六十四 起就已落地**（真实 `statvfs`/`GetDiskFreeSpaceExA`）。阶段二百四十三 只**校正作用域**：普通文件也作答（跟随其卷）、不存在路径与**设备**（`/dev/null`）回 `0`。
+- **G7** 目录遍历**异步化** —— ✅ **阶段二百六十四**（v0.4.228）：`File.getDirectoryListingAsync` 从"同步假异步"改成**真异步**（job 池新增 `AS_JOB_DIR`，worker 线程 opendir/readdir，帧边界派发；`cancel()` 真能取消，重入 `#2037`、路径不存在 `IOErrorEvent`/`3003`、路径是文件回空列表——逐条对 `adl 51.4.1` 实测）。证据 `examples/file-listing-async.as`（17 钉）+ `docs/zh-cn/filesystem.md` §7。
+- **G3** 卷**总量** —— ✅ **2026-10-26 由产品侧以 ANE 交付，本仓库零改动、无版本号**：AIR 无对应 API 这一点**没变**，但交付方式从"`--features` 具名开关 + 编译器内建"改判为"**原生扩展**"（`prune/native/PruneVolume.c` 的 `statvfs` + `prune/src/prune/Volume.as`，`--air-app` 按描述符解析）。理由：编译器内建等于把一个只有 macOS 用得上、AIR 又没有的成员塞进语言实现；而 ANE 正是 AIR 给第三方扩展准备的同一扇门，平台 API 留在产品仓库可被审计。口径与实测（`volumeTotal` 与 `df -k` 差 0、`volumeFree` 与 `spaceAvailable` 逐字节相等）见 `../prune/TODO.md` 〇之一。**这条同时是本仓库 FRE/ANE 宿主（阶段一百七十二）的第一次"产品级"使用**：宿主、描述符、`ext-aot/` 解析、运行期 `extensions/` 落盘全链路一次跑通。
+
 
 | # | 缺口 | 现状（grep/读码核实） | 归属判定（AGENTS §1.5） | 预留阶段 |
 |---|---|---|---|---|
-| **G3** | 卷**总量/已用量** | 无对应 API（AIR 的 `File` 只给 `spaceAvailable`），容量条要它 | **增强**（AIR 无对应物）⇒ 走 `--features` 具名开关 | 二百五十五 |
 | **G4a** | `flash.desktop` **图标族**：`Icon` / `InteractiveIcon` / `DockIcon` / `SystemTrayIcon` + `NativeApplication.icon` / `supportsDockIcon` / `supportsSystemTrayIcon` / `supportsMenu` / `menu`，以及 `DockIcon.menu` 依赖的 `flash.display.NativeMenu` 子系统 | **零命中**：`grep -cE "DockIcon\|SystemTrayIcon\|InteractiveIcon\|supportsDockIcon\|supportsSystemTrayIcon" src/symbols.ts src/emit.ts` 每项均 **0**；`NativeApplication` 只声明 `nativeApplication`/`exit`/`activeWindow`/`openedWindows`/`applicationDescriptor`/`systemIdleMode`（`src/symbols.ts:1290-1350`），**无 `icon`**；`NativeMenu` 类**根本没声明**（`src/emit.ts:6136` 自述「本运行时没有 `NativeMenu` 子系统」）⇒ 照 AIR 写这行代码**编不过**。而 **AIR 有完整一等公民实现**（`adl 51.4.1`/macOS 实测：`supportsDockIcon`=`true`、`supportsSystemTrayIcon`=`false`、`supportsMenu`=`true`、`icon`=`[flash.desktop::DockIcon]`、`dockIcon.menu` 可设可读回、`new DockIcon()` 抛 `#2012`、`bitmaps` 赋非 `BitmapData` 抛 `#2005`；证据 `temp/desktopprobe/`） | **遗留欠账**（AIR 有、我们跑不出 ⇒ §1.5 硬判据）⇒ **正常阶段 + 版本号**，**不给 `--features` 开关**。**✅ 已清偿（阶段二百五十五，v0.4.219）** —— 图标族与 `NativeMenu` 子系统全部落地，口径 [`docs/zh-cn/desktop.md`](docs/zh-cn/desktop.md)，证据 `unit: emit/NativeMenu` 38 项 + `examples/native-menu.as` 66 断言 + `temp/G4App.app` 真机点击；落地时登记的三条后端残余里，**Dock 位图上屏已于阶段二百五十六（v0.4.220）清偿**，余下**修饰键/模态菜单**两条仍在 `遗留待开发` | 二百五十五 ✅ |
 | **G4b** | **macOS 菜单栏状态项**（`NSStatusItem`） | **零命中** + **AIR 在 macOS 上没有对应物**：实测 `supportsSystemTrayIcon` = **`false`**、`icon` 是 `DockIcon`、`new SystemTrayIcon()` 抛 **`#2012`**；SDL2 亦无托盘 API ⇒ 需新 `vendor/statusitem_glue.mm` 并接进 `vendor/window_glue.cc` 的事件泵 | **增强**（AIR **在 macOS 上**无对应物）⇒ 必须 opt-in、默认产物与现状同构、缺能力时**报明**不静默降级 | 二百五十五 |
 | **G5** | accessory app（`LSUIElement=1`：无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键**；AIR 描述符里也没有这个开关 | **增强** ⇒ 构建清单新字段（如 `agent-app`），默认关 | 二百五十五 |
-| **G7** | 目录遍历的**异步**化 | job 池无 `DIR`/`STAT` 类 job（`src/runtime.ts:9878-9898` 全清单：`READ_TEXT`/`READ_BYTES`/`IMAGE`/`FS_OPEN`/`DECODE`/`HTTP`/`HTTP_STREAM`/`UNSUPPORTED`/`IMAGE_URL`） | demo 先用**同步遍历 + 分帧回填**顶住；不够再补 job 类 | 二百五十五之后 |
 | **G8** | **一条命令出已签名 `.app` / `.dmg`** | `--package` 合法值只有 `raw \| xcode-project \| android-project \| web`（`src/index.ts:291`、`:798`）；**无 `app`/`dmg`**；`grep -n "codesign\|hdiutil" src/build.ts` = **0 命中**；且 `--package xcode-project` **只生成工程不构建**（`src/index.ts:1034-1057` 自述「是『生成工程』步骤，不做 cc」） | **增强**（工程化便利，非 AIR 语义） | 二百五十五 |
 
-> **当前判断（2026-10-23 更正）**：真正要补的是上表 **6 项**，且**必须分两类走**：
+> **当前判断（2026-10-26 刷新）**：上表只剩 **4 项**（G4a 已清偿、G3 已以 ANE 交付、G7 已在阶段二百六十四落地），
+> 其中 **G5 / G8 仍待排期**；下面这段 2026-10-23 的排期判断保留原文（G4a→G4b 的顺序已被执行）：
 >
 > - **G4a 是地基**（AIR 原生图标族 + `NativeMenu` 子系统）：按 §1.5 是**遗留欠账**，阶段内修净、**不占本表**，
 >   而且它一落地就直接交出一个**退路形态** —— Dock 图标常驻 + `dockIcon.menu` 右键菜单 + `autoExit=false`，
