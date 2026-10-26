@@ -95,6 +95,23 @@ say("restored=" + mutable.enabled + "," + mutable.visible);
 menu.removeAllItems();
 say("afterRemoveAll=" + menu.numItems);                                          // 0
 
+// A separator ITEM, which is a different thing from ContextMenuItem.separatorBefore:
+// `new NativeMenuItem("", true)` makes the item ITSELF the line, with no row of its
+// own, and it still counts towards numItems. This is how the meeting app builds the
+// divider in its user-list menu (修改昵称 / line / 截图上传); 阶段二百九十二 taught the
+// popup to draw it as a line instead of an empty, clickable row.
+var sepMenu:ContextMenu = new ContextMenu();
+var sepBefore:NativeMenuItem = new NativeMenuItem("Before");
+var sepLine:NativeMenuItem = new NativeMenuItem("", true);
+var sepAfter:NativeMenuItem = new NativeMenuItem("After");
+sepMenu.addItem(sepBefore);
+sepMenu.addItem(sepLine);
+sepMenu.addItem(sepAfter);
+say("sepIsSeparator=" + sepLine.isSeparator);                                    // true
+say("sepLabelLen=" + sepLine.label.length);                                      // 0
+say("sepCountsAsItem=" + sepMenu.numItems + "," + sepMenu.items.length);         // 3,3
+say("sepOrder=" + sepMenu.getItemAt(0).label + "," + sepMenu.getItemAt(1).label + "," + sepMenu.getItemAt(2).label);
+
 // A standalone NativeMenu DOES find items by name -- the contrast with the
 // ContextMenu above is the whole point of the two behaviours.
 var nm:NativeMenu = new NativeMenu();

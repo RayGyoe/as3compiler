@@ -126,6 +126,42 @@ function checkContextMenuModel(): string[] {
   check('glue (win): submenus are attached with the SUBMENU HANDLE (MF_POPUP)',
     glue.includes('AppendMenuW(menu, MF_POPUP | MF_STRING, (UINT_PTR)sub, wlabel)') &&
     glue.includes('static HMENU sk_win_menu_build('));
+
+  // --- 阶段二百九十二: two defects this app's own user-list menu exposed on a real
+  // 150% box (temp/ctxpos). The menu is built as 修改昵称 / new NativeMenuItem("", true)
+  // / 截图上传.
+  //
+  // (a) A separator ITEM is not a separatorBefore. `new NativeMenuItem("", true)`
+  //     makes the item ITSELF the line (no row of its own); only
+  //     ContextMenuItem.separatorBefore was honoured, so the popup drew an empty,
+  //     clickable row in the middle instead of a line (menuA2.bmp). The
+  //     application-menu path (as_menu_fill) always read _sep: this was the only
+  //     place that did not.
+  check('emit: NativeMenuItem.isSeparator is read as a separator',
+    /static int as_ctxmenu_is_sep\(NativeMenuItem\* it\) \{[\s\S]{0,120}?return it->_sep \? 1 : 0;/.test(c));
+  check('emit: a separator item takes ONE flat slot, kind=1, and no popup tag',
+    /if \(as_ctxmenu_is_sep\(it\)\) \{[\s\S]{0,260}?c->items\[k\]\.kind = 1;[\s\S]{0,260}?c->items\[k\]\.tag = 0;[\s\S]{0,80}?continue;/.test(c) &&
+    !/if \(as_ctxmenu_is_sep\(it\)\) \{[\s\S]{0,400}?as_array_push\(ASC_popup_tags/.test(c));
+  check('emit: the separator item counts as one slot, never slot+row',
+    c.includes('if (as_ctxmenu_is_sep(it)) { n++; continue; }'));
+  check('emit: the submenu patch-up skips the separator slot',
+    c.includes('if (as_ctxmenu_is_sep(it)) { pos++; continue; }'));
+  //
+  // (b) The popup point is DIP (stage, NativeWindow.bounds and SDL's window/mouse
+  //     positions all are); TrackPopupMenu in a per-monitor-DPI-aware process wants
+  //     PHYSICAL pixels. Measured: a right click on the user row at physical
+  //     (3516,1245) put the 206x111 popup at (2344,830) = exactly the click / 1.5.
+  //     The temp/ctxwin probe missed it because the DPI-unaware PowerShell that
+  //     measured it divided every coordinate by the same 1.5.
+  check('glue (win): the popup point is scaled by the window DPI factor',
+    glue.includes('double bk = sk_window_backing_scale(c->win);') &&
+    glue.includes('pt.x = (LONG)(x * bk + (x >= 0.0 ? 0.5 : -0.5));') &&
+    glue.includes('pt.y = (LONG)(y * bk + (y >= 0.0 ? 0.5 : -0.5));'));
+  check('glue (win): the dismissal point is converted back to DIP for the replayed stage coords',
+    glue.includes('*outx = (double)g.x / bk;') &&
+    glue.includes('*outy = (double)g.y / bk;'));
+  check('example: pins the separator-item contract',
+    src.includes('sepIsSeparator=') && src.includes('new NativeMenuItem("", true)'));
   // --- the example stays behaviourally meaningful (it is the diffed contract).
   check('example: pins the measured quirks (name lookup, setItemIndex, duplicate add)',
     src.includes('getItemByName(alphaItem)="') && src.includes('setIndex threw') && src.includes('afterDupAdd='));

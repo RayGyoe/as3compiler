@@ -305,6 +305,31 @@ Windows 侧将来接 `HWND` 菜单栏是**独立阶段**的事；wasm 没有原�
 `#32768` 窗口 `[1668,1133,1890,1208]`（截图 `temp/ctxwin/sub2.png`：`More ▸ Sub One / Sub Two`），
 `Down`+`Enter` 选中 `Sub Two`；日志里只有**一对** `rightMouseUp`/`rightClick`，且都在选中事件之前。
 
+### 7.9 Windows 两处回归（150% 面板下才暴露）：DPI 倍率与「分隔符条目」
+
+§7.8 的探针是**DPI 未感知**的 PowerShell 驱动的：`SetCursorPos` 与 `GetWindowRect` 都在虚拟坐标里，
+整条坐标链统一乘/除同一个倍率，于是「弹出点少乘 1.5」被自己抵消掉，测出一个假的「菜单就在指针处」。
+换成真应用（`TalkMED Meeting.exe`，窗口 2200×1319、client 2167×1263）+ `SetProcessDPIAware()` 的驱动
+（`temp/ctxpos/`）后，两个缺陷都当场现形：
+
+| 缺陷 | 现象（修前） | 根因 | 修法 |
+|---|---|---|---|
+| 菜单还是开错地方 | 物理点 `(3516,1245)`，206×111 的菜单出现在 `(2344,830)` —— 恰好是**点 ÷ 1.5** | 上游全是 DIP（stage、`NativeWindow.bounds`、SDL 的鼠标坐标），而 per-monitor-DPI-aware 进程里的 `TrackPopupMenu` 吃的是**物理像素**；`sk_menu_popup` 的老注释还明确写着「不需要乘倍率」 | 弹窗前 `bk = sk_window_backing_scale(c->win)`，`pt.x/pt.y` 各乘 `bk`（四舍五入） |
+| 关掉菜单时回放点错位 | 在 `(2562,947)` 点空白处关菜单，回放的舞台事件落在 `(150,600)`（stage 只有 720×480） | `GetCursorPos` 回填的 `outx/outy` 是物理像素，却被当成 DIP 喂回舞台 | `*outx = g.x / bk`、`*outy = g.y / bk` |
+| 分隔符画成一个空菜单项 | 菜单里「修改昵称 / 空行 / 截图上传」，空行**可点**，AIR 那里是一条**不可点的线** | 应用建分隔线用的是 `new NativeMenuItem("", true)`（`isSeparator`），**不是** `ContextMenuItem.separatorBefore`；`as_ctxmenu_sep()` 只认后者，于是每个 `isSeparator` 条目都掉进正常分支，变成 enabled 的空行 | 新增 `as_ctxmenu_is_sep()` 读 `_sep`，在 `as_ctxmenu_count`/`as_ctxmenu_fill` 的两趟里**先**判它：占一个扁平槽（`kind=1`、空 label、`enabled=0`、`tag=0`）、不 push `ASC_popup_tags` |
+
+修后实测（同一驱动，`temp/ctxpos/`）：真应用右键 → `#32768` 矩形 `[3101,1146,3307,1233]` 与光标逐像素相同
+（`menuB2.bmp`：修改昵称 / —— 线 —— / 截图上传）；左键点那条线的位置，菜单**不关**也不派发任何事件；
+点线下面的「截图上传」菜单正常关闭。探针 `temp/ctxpos/Probe292.as`（`Alpha / 分隔线 / Bravo`）把三件事一次钉死：
+右键 `(2862,647)` ⇒ 菜单 `[2862,647,3060,736]`（198×89）；点 `Bravo` 得到 `SELECT target=item(Bravo)`（条目级）→
+`SELECT target=item(Bravo)`（菜单级，target 仍是条目）→ `MENU_ITEM_SELECT`，即**分隔线之后的 tag 没有错位**；
+点窗外 `(2562,947)` 关掉菜单，回放的 `stageClick` 落在 `100,400`（= 物理点按 client 原点 `(2412,347)`、倍率 1.5 反算），
+不再落到 stage 之外。
+
+**为什么 §7.8 没抓到**：旧驱动既没 `SetProcessDPIAware()`，也没核对「点 → 弹出矩形」这条等式，
+只看「菜单在点附近」。教训写在这里：Windows 上的坐标类缺陷，驱动**必须**是 DPI 感知的，
+且断言要写成等式（弹出矩形左上角 == 点击点），不能写成「看起来在旁边」。
+
 **一处内部依赖**：`sk_resync_right_button()` 调 `SDL_SendMouseButton()` 清掉 SDL 以为「右键还按着」的掩码——
 不这么做**第二次右键不派发任何事件**（弹窗吃掉了真 release，SDL 的掩码永远停在按下）。该符号是 SDL 的**内部**
 API（公开头文件没有），升级 SDL 时需复核；它造出来的 `SDL_MOUSEBUTTONUP` 由 `g_synth_right_up` 吞掉，AS3 侧
@@ -318,6 +343,7 @@ API（公开头文件没有），升级 SDL 时需复核；它造出来的 `SDL_
 | **`ContextMenu` 对象模型 26 行**（与 `adl` 逐字节相同） | `examples/context-menu.as`（AOT `--run`）× `temp/ctxprobe/api/ApiEx.as`（同一段程序的 `adl` 版）：26/26 行一致；配套 `test/unit/context-menu.ts` 的 `unit: context-menu/Model`（25 钉）钉住一份列表、三条独有规则、`#2007` 文案与弹窗顺序 |
 | **右键弹窗 7 步真机**（macOS） | `temp/ctxmenu/drv.py` 的 `open`/`pick0`/`pick1`/`twice`/`esc`/`outside`/`nul`：LR 与 `adl` 逐字段相同（`rightMouseDown → MENU_SELECT → rightMouseUp → rightClick → 三个选中事件`），回放坐标 = 消失点（项上 148,111 / 按下点 116,98 / 窗外点 348,259）；截图 `temp/ctxmenu/{m5-inv,crop-inv}.png` 证明 `visible=false` 不渲染、`enabled=false` 灰色、`separatorBefore` 画线 |
 | **右键弹窗 Windows 真机** | `temp/ctxwin/`：`CtxWin.as` + `drive6.ps1`（真 `SetCursorPos`/`mouse_event`/`keybd_event`）。菜单矩形 `[1481,1020,1678,1175]` 挂在点击点 `(1480,1020)`；`sub2.png` 证明 `More ▸ Sub One/Sub Two` 展开；日志 `SELECT item(Sub Two)` + 菜单级 `SELECT`；一次右键只有一对 `rightMouseUp`/`rightClick`；`test/unit/context-menu.ts` 31 钉含 4 条 Win32 钉（无 `ScreenToClient`、吞队列 release、`MF_POPUP` 传句柄、tag 取 `ASC_popup_tags` 下标） |
+| **右键弹窗 Windows 真应用（150%，DPI 感知驱动）** | `temp/ctxpos/`：真应用右键 → `#32768` `[3101,1146,3307,1233]` **等于光标**（修前是光标 ÷ 1.5）；`menuB2.bmp` 里两条目之间是**线**、点它菜单不关；`Probe292.exe` 的 `probe.log`：`rightMouseDown stage=300,200`（物理 `(2862,647)`、client 原点 `(2412,347)`）→ `SELECT target=item(Bravo)` 三层顺序 → 点窗外关掉时 `stageClick=100,400`；`test/unit/context-menu.ts` 38 钉含 7 条（`as_ctxmenu_is_sep`、分隔符占一个槽、两趟都让位、tag 不 push、倍率乘、回放除） |
 | 模型层 69 条断言（纯 C 构建，无窗口后端） | `examples/native-menu.as` → `native-menu: 69 checks passed` |
 | 生成 C 的 39 条源级钉 + 上屏 16 条 | `test/unit/emit.ts` 的 `unit: emit/NativeMenu` 与 `unit: emit/DockIconImage` |
 | **选图规则 8 轮** | `temp/dockprobe/`：`{32,96,256}→96`、`{16,512}→16`、`{129,127}→129`、`{128×400, 200×200}→200×200` …（§3.1 表） |

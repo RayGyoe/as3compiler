@@ -25781,6 +25781,22 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return ((ContextMenuItem*)it)->separatorBefore ? 1 : 0;');
     this.indent--;
     this.line('}');
+    // A line can come from either class, and the two say it differently:
+    // ContextMenuItem's `separatorBefore` puts the line IN FRONT of its own row,
+    // while NativeMenuItem's `isSeparator` (`new NativeMenuItem("", true)`, which
+    // is how this app builds its user-list menu) makes the item ITSELF the line and
+    // gives it no row at all. Only the first kind was honoured, so every
+    // isSeparator item came up as an empty, clickable row: measured on the meeting
+    // window's user row the menu read 修改昵称 / a blank row / 截图上传 with no line
+    // anywhere (temp/ctxpos/menuA2.bmp), against AIR's 修改昵称 / line / 截图上传.
+    // The application-menu path (as_menu_fill) always read _sep; this is the only
+    // place that did not.
+    this.line('static int as_ctxmenu_is_sep(NativeMenuItem* it) {');
+    this.indent++;
+    this.line('if (it == NULL) return 0;');
+    this.line('return it->_sep ? 1 : 0;');
+    this.indent--;
+    this.line('}');
     this.line('static int as_ctxmenu_count(as_array* items, int depth) {');
     this.indent++;
     this.line('if (items == NULL || depth > 8) return 0;');
@@ -25791,6 +25807,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (v.tag != 4 || v.ptr == NULL) continue;');
     this.line('NativeMenuItem* it = (NativeMenuItem*)v.ptr;');
     this.line('if (!as_ctxmenu_visible(it)) continue;');
+    this.line('if (as_ctxmenu_is_sep(it)) { n++; continue; }');
     this.line('if (as_ctxmenu_sep(it)) n++;');
     this.line('n++;');
     this.line('if (it->_submenu != NULL) n += as_ctxmenu_count(it->_submenu->_items, depth + 1);');
@@ -25817,6 +25834,17 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (v.tag != 4 || v.ptr == NULL) continue;');
     this.line('NativeMenuItem* it = (NativeMenuItem*)v.ptr;');
     this.line('if (!as_ctxmenu_visible(it)) continue;');
+    this.line('if (as_ctxmenu_is_sep(it)) {');
+    this.indent++;
+    this.line('int k = c->nitems++;');
+    this.line('c->items[k].kind = 1; c->items[k].label = (char*)"";');
+    this.line('c->items[k].enabled = 0; c->items[k].checked = 0;');
+    this.line('c->items[k].key = (char*)""; c->items[k].mods = 0;');
+    this.line('c->items[k].submenu = -1; c->items[k].tag = 0;');
+    this.line('c->menus[idx].count++;');
+    this.indent--;
+    this.line('continue;');
+    this.line('}');
     this.line('if (as_ctxmenu_sep(it)) {');
     this.indent++;
     this.line('int k = c->nitems++;');
@@ -25856,6 +25884,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (v.tag != 4 || v.ptr == NULL) continue;');
     this.line('NativeMenuItem* it = (NativeMenuItem*)v.ptr;');
     this.line('if (!as_ctxmenu_visible(it)) continue;');
+    this.line('if (as_ctxmenu_is_sep(it)) { pos++; continue; }');
     this.line('if (as_ctxmenu_sep(it)) pos++;');
     this.line('if (it->_submenu != NULL) c->items[pos].submenu = as_ctxmenu_fill(it->_submenu->_items, c, depth + 1);');
     this.line('pos++;');

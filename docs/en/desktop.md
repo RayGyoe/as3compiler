@@ -331,6 +331,35 @@ opens a second `#32768` window at `[1668,1133,1890,1208]` (screenshot `temp/ctxw
 `More ▸ Sub One / Sub Two`) and `Down`+`Enter` picks `Sub Two`; the log holds **one** `rightMouseUp`/`rightClick`
 pair, both before the selection events.
 
+### 7.9 Two Windows regressions that only a 150% panel exposes: the DPI factor and the "separator item"
+
+The §7.8 probe was driven by a **DPI-unaware** PowerShell: `SetCursorPos` and `GetWindowRect` both work in
+virtual coordinates, so the whole chain multiplied and divided by the same 1.5 and cancelled the "popup point
+never got scaled" bug out — producing a false "the menu is right at the pointer". Against the real app
+(`TalkMED Meeting.exe`, window 2200×1319, client 2167×1263) with a `SetProcessDPIAware()` driver
+(`temp/ctxpos/`), both defects show up immediately:
+
+| Defect | Symptom (before) | Cause | Fix |
+|---|---|---|---|
+| The menu is still in the wrong place | physical click `(3516,1245)`, the 206×111 popup appears at `(2344,830)` — exactly the click **÷ 1.5** | everything upstream is DIP (stage, `NativeWindow.bounds`, SDL mouse positions) while `TrackPopupMenu` in a per-monitor-DPI-aware process wants **physical** pixels; the old comment in `sk_menu_popup` even claimed no factor was needed | before the popup, `bk = sk_window_backing_scale(c->win)` and `pt.x`/`pt.y` are multiplied by `bk` (rounded) |
+| The replay point of a dismissal is off | dismissing at `(2562,947)` replayed the stage event at `(150,600)` — outside a 720×480 stage | `GetCursorPos` fills `outx/outy` with physical pixels, which were fed back as DIP | `*outx = g.x / bk`, `*outy = g.y / bk` |
+| A separator is drawn as an empty row | the menu reads 修改昵称 / blank row / 截图上传, and the blank row is **clickable**; AIR draws an **unclickable line** there | the app builds its divider with `new NativeMenuItem("", true)` (`isSeparator`), **not** `ContextMenuItem.separatorBefore`; `as_ctxmenu_sep()` only knew the latter, so every `isSeparator` item fell through to the normal branch and became an enabled empty row | new `as_ctxmenu_is_sep()` reads `_sep` and both passes of `as_ctxmenu_count`/`as_ctxmenu_fill` test it **first**: it takes one flat slot (`kind=1`, empty label, `enabled=0`, `tag=0`) and pushes nothing onto `ASC_popup_tags` |
+
+Measured after the fix (same driver, `temp/ctxpos/`): right-clicking the real app gives a `#32768` rect of
+`[3101,1146,3307,1233]`, pixel-identical to the cursor (`menuB2.bmp`: 修改昵称 / —— line —— / 截图上传); a left
+click on that line neither closes the menu nor dispatches anything, while clicking 截图上传 below it closes it
+normally. Probe `temp/ctxpos/Probe292.as` (`Alpha / separator / Bravo`) pins all three facts at once: a
+right-click at `(2862,647)` produces the menu `[2862,647,3060,736]` (198×89); picking `Bravo` logs
+`SELECT target=item(Bravo)` (item level) → `SELECT target=item(Bravo)` (menu level, target still the item) →
+`MENU_ITEM_SELECT`, so **the tag after a separator does not shift**; dismissing outside at `(2562,947)` replays
+`stageClick` at `100,400` (the physical point minus the client origin `(2412,347)`, divided by 1.5) instead of
+somewhere off-stage.
+
+**Why §7.8 missed it**: the old driver was neither DPI aware nor checking the equation "click point → popup
+rect"; it only asked whether the menu looked like it was near the pointer. The lesson is recorded here: for
+coordinate defects on Windows the driver **must** be DPI aware, and the assertion must be an equation (popup
+top-left == click point), never "looks about right".
+
 **One internal dependency**: `sk_resync_right_button()` calls `SDL_SendMouseButton()` to clear the SDL mask
 that thinks the right button is still held down — without it the **second right-click delivers nothing** (the
 popup ate the real release, so SDL's mask stays set). That symbol is SDL **internal** (absent from the public
@@ -344,6 +373,7 @@ swallowed by `g_synth_right_up`, so AS3 only ever sees the pair the emitter repl
 |---|---|
 | **`ContextMenu` object model, 26 lines** (byte-identical to `adl`) | `examples/context-menu.as` (AOT `--run`) × `temp/ctxprobe/api/ApiEx.as` (the same program, `adl` build): 26/26 lines agree; `test/unit/context-menu.ts` (`unit: context-menu/Model`, 25 pins) pins the single list, the three ContextMenu-only rules, the `#2007` message and the popup ordering |
 | **Right-click popup, 7 live steps** (macOS) | `temp/ctxmenu/drv.py`: `open`/`pick0`/`pick1`/`twice`/`esc`/`outside`/`nul` — the LR matches `adl` field by field (`rightMouseDown → MENU_SELECT → rightMouseUp → rightClick → the three selection events`), replay coordinates land at the dismissal point (item 148,111 / press 116,98 / outside 348,259); `temp/ctxmenu/{m5-inv,crop-inv}.png` show `visible=false` not rendered, `enabled=false` greyed, `separatorBefore` drawn |
+| **Right-click popup on the real Windows app (150%, DPI-aware driver)** | `temp/ctxpos/`: right-clicking the app gives a `#32768` at `[3101,1146,3307,1233]`, **equal to the cursor** (before the fix it was the cursor ÷ 1.5); `menuB2.bmp` shows a **line** between the two items that does not close the menu when clicked; `Probe292.exe` `probe.log`: `rightMouseDown stage=300,200` (physical `(2862,647)`, client origin `(2412,347)`) → the three `SELECT`/`MENU_ITEM_SELECT` lines with `target=item(Bravo)` → `stageClick=100,400` when dismissed outside; `test/unit/context-menu.ts` is at 38 pins, 7 of them for this stage (the `_sep` reader, one slot per separator, both passes yielding, no tag push, the multiply and the divide) |
 | **Right-click popup on Windows** | `temp/ctxwin/`: `CtxWin.as` + `drive6.ps1` (real `SetCursorPos`/`mouse_event`/`keybd_event`). Menu rect `[1481,1020,1678,1175]` under the click point `(1480,1020)`; `sub2.png` shows `More ▸ Sub One/Sub Two`; log `SELECT item(Sub Two)` plus the menu-level `SELECT`; one `rightMouseUp`/`rightClick` pair per click; `test/unit/context-menu.ts` (31 pins, 4 of them Win32) |
 | 69 model assertions (pure-C build, no window backend) | `examples/native-menu.as` → `native-menu: 69 checks passed` |
 | 39 source-level pins + 16 painting pins | `unit: emit/NativeMenu` and `unit: emit/DockIconImage` in `test/unit/emit.ts` |

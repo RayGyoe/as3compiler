@@ -3417,28 +3417,38 @@ int sk_menu_popup(int win, const sk_menu_t* menus, int nmenus, const sk_menu_ite
   if (hwnd == NULL) return 0;
   HMENU menu = sk_win_menu_build(menus, nmenus, items, nitems, root);
   if (menu == NULL) return 0;
-  // SCREEN coordinates, and NOT converted to the client area: TrackPopupMenu places
-  // the menu in the same space NativeWindow.globalToScreen reports, and this process
-  // is SYSTEM-DPI-aware (SDL sets that), so Win32's virtual pixel space and the
-  // model's DIP space are the same numbers -- no scale factor, and above all no
-  // ScreenToClient. Measured on this 150% box (temp/ctxwin): with the conversion the
-  // menu landed at the click's CLIENT point -- a click at physical (1480,1020) put
-  // the menu at (101,101) physical, i.e. exactly the window origin subtracted (the
-  // window sat at 1380,920). Without it the menu opens under the cursor, which is
-  // what AIR does.
+  // SCREEN coordinates (never the client area -- ScreenToClient put the menu at the
+  // click's CLIENT point, measured at (101,101) for a click at (1480,1020)), and in
+  // PHYSICAL pixels rather than the DIP the model works in. Everything upstream is
+  // DIP: the stage is DIP (the canvas is scaled by w->scale), NativeWindow.bounds is
+  // DIP, and SDL reports window/mouse positions in DIP as well. TrackPopupMenu, in a
+  // per-monitor-DPI-aware process, wants physical pixels, so the point has to be
+  // scaled by the window's DPI factor. Measured on this 150% box (temp/ctxpos), on
+  // the meeting window at physical (1605,1049) 2200x1319 with the client origin at
+  // (1616,1094): a right click on the user row at physical (3516,1245) put the
+  // 206x111 popup at (2344,830), which is exactly the click divided by 1.5. The
+  // earlier temp/ctxwin probe looked correct only because the PowerShell that
+  // measured it was DPI-unaware, so every number it compared had been divided by
+  // the same 1.5 -- see docs/zh-cn/desktop.md.
+  double bk = sk_window_backing_scale(c->win);
+  if (!(bk > 0.0)) bk = 1.0;
   POINT pt;
-  pt.x = (LONG)x; pt.y = (LONG)y;
+  pt.x = (LONG)(x * bk + (x >= 0.0 ? 0.5 : -0.5));
+  pt.y = (LONG)(y * bk + (y >= 0.0 ? 0.5 : -0.5));
   // The modal pump below queues the real right release; see g_popup_up_swallow.
   g_popup_up_swallow = 1;
   int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
   DestroyMenu(menu);
   if (tag != NULL && cmd > 0 && cmd - 1 < nitems) *tag = items[cmd - 1].tag;
-  // Same contract as Cocoa: the pointer at dismissal, not the press point.
+  // Same contract as Cocoa: the pointer at dismissal, not the press point -- and
+  // back in DIP, because the caller turns it into stage coordinates for the
+  // replayed rightMouseUp/rightClick (ASC_window_on_mouse divides by the stage
+  // scale, so a physical answer here would be off by bk).
   if (outx != NULL || outy != NULL) {
     POINT g;
     if (GetCursorPos(&g)) {
-      if (outx != NULL) *outx = (double)g.x;
-      if (outy != NULL) *outy = (double)g.y;
+      if (outx != NULL) *outx = (double)g.x / bk;
+      if (outy != NULL) *outy = (double)g.y / bk;
     }
   }
   return 1;

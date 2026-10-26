@@ -16734,7 +16734,56 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
    `(2,1)`/`(0.5,1)` 的 ink 宽与 `(1,1)` **相同**、`(1,2)` 翻倍），本页的 live 态与之同口径。
 3. `ASC_TF_TRACE` 是**临时插桩**，落地前已删除（不带进产物）；`temp/loginfx/` 的探针脚本留档。
 4. 顺带观测、本轮未动：同一段代码里 1px 边框/光标在**非均匀** canvas 下的设备像素数仍有 1 个 dpr 的
-   口径存疑（本页页签无边框，量不到），需另立一个带边框探针判定。
+   口径存疑（本页页签无边框，量不到），### 阶段二百九十二：右键菜单在 150% 面板上的两处回归 —— DPI 倍率与「分隔符条目」（v0.4.254 → v0.4.255）✅ 已完成
+
+**一、现象**（用户报，附截图）：真应用 `TalkMED Meeting.exe` 里 ①右键菜单弹出的**位置还是不对**；
+②两个菜单项之间 AIR 画的是**不可点的分隔线**，我们画成**一个没有文字、可点的空菜单项**。
+
+**二、取证**（`temp/ctxpos/`，全部真鼠标 + `SetProcessDPIAware()` 驱动）：
+①位置：窗口 `2200×1319`、client `2167×1263`，在物理点 `(3516,1245)` 右键，206×111 的 `#32768` 出现在
+`(2344,830)` —— 恰好是点 ÷ 1.5。②分隔符：菜单读作「修改昵称 / 空行 / 截图上传」，空行可点；
+源码 `cn/edoctor/view/renderers/UserItemRenderers.as:208` 用的是 `new NativeMenuItem("", true)`。
+
+**三、根因**
+1. **倍率**：上游全是 DIP（stage、`NativeWindow.bounds`、SDL 鼠标坐标），而 per-monitor-DPI-aware 进程里
+   `TrackPopupMenu` 吃**物理像素**；`sk_menu_popup` 的旧注释还明确写着「不需要乘倍率」。同一处还有第二半：
+   关菜单时 `GetCursorPos` 回填的 `outx/outy` 是物理像素，却被当 DIP 回放进舞台。
+2. **分隔符**：分隔符是**条目本身**（`isSeparator`），不是 `ContextMenuItem.separatorBefore`；`as_ctxmenu_sep()`
+   只认后者 ⇒ 每个 `isSeparator` 条目掉进正常分支，变成 enabled、空 label、带 tag 的可点行。
+   （`as_menu_fill` 那路一直读 `_sep`，只有 `ContextMenu` 这条路漏了。）
+
+**四、修法**
+1. `vendor/window_glue.cc` `sk_menu_popup`：弹窗前 `bk = sk_window_backing_scale(c->win)`，`pt.x/pt.y` 各乘 `bk`
+   （四舍五入）；`*outx = g.x / bk`、`*outy = g.y / bk`。
+2. `src/emit.ts`：新增 `as_ctxmenu_is_sep()` 读 `_sep`；`as_ctxmenu_count` / `as_ctxmenu_fill` **两趟都先判它**，
+   占一个扁平槽（`kind=1`、空 label、`enabled=0`、`tag=0`）且不 push `ASC_popup_tags` —— 这样分隔线之后的项
+   tag 不会错位。
+
+**五、验收**
+
+| 检查 | 结果 |
+|---|---|
+| 真应用右键（修后） | `#32768` 矩形 `[3101,1146,3307,1233]`，与光标**逐像素相同**；`menuB2.bmp` 中间是一条**线** |
+| 点那条线 | 菜单**不关**、不派发任何事件（AIR 的「不可点」） |
+| 点线下面的「截图上传」 | 菜单正常关闭 ⇒ 分隔线之后的 tag 没错位 |
+| 探针 `temp/ctxpos/Probe292.as`（`Alpha / 分隔线 / Bravo`） | 右键物理 `(2862,647)`（client 原点 `(2412,347)`、倍率 1.5）⇒ 菜单 `[2862,647,3060,736]` 198×89；日志 `rightMouseDown stage=300,200` |
+| 同上，点 `Bravo` | `SELECT target=item(Bravo)`（条目）→ `SELECT target=item(Bravo)`（菜单，target 仍是条目）→ `MENU_ITEM_SELECT` |
+| 同上，点窗外 `(2562,947)` 关菜单 | 回放 `stageClick=100,400`（= 物理点反算 DIP），不再落到 stage 之外 |
+| `test/unit/context-menu.ts` | 31 → **38 钉**（新增 7 条：`_sep` 读取、分隔符占一槽、两趟让位、不 push tag、乘倍率、除倍率） |
+| `examples/context-menu.as` | 新增 `sepIsSeparator / sepLabelLen / sepCountsAsItem / sepOrder` 四行，`--run` 实测 `true / 0 / 3,3 / Before,,After` |
+| `node test.ts` | 见提交说明（基线红 4 条） |
+
+**六、如实报明**
+1. **阶段二百九十的 Windows 验证为什么没抓到位置问题**：旧驱动 `temp/ctxwin/drive6.ps1` **没有** `SetProcessDPIAware()`，
+   `SetCursorPos` 与 `GetWindowRect` 都在虚拟坐标里，整条链乘/除同一个倍率把误差抵消了；而且断言只写「菜单在点附近」，
+   没写成等式「弹出矩形左上角 == 点击点」。本阶段把驱动改成 DPI 感知 + 等式断言（`temp/ctxpos/rclick.ps1`），
+   并写进 `docs/zh-cn/desktop.md` §7.9 的教训里。
+2. **修后点「修改昵称」/「截图上传」在本机看不到反应**：探针证明派发本身正确（`SELECT target=item(Bravo)` 三层齐全），
+   应用侧那两条分支要 `NativeApplication.activeWindow` 非空（`Alert.editUserInfo`）或走网络/文档模块
+   （`TKEvents.SNAPSHOT`），本机这次点下去没有可见变化 —— 属**应用侧链路**未验证，不是本阶段改动的回归，留给下一轮。
+3. **`keyEquivalent` 在 Win32 上仍不显示不生效**（§7.8 已登记的实现欠账），本阶段没动。
+
+需另立一个带边框探针判定。
 
 ### 遗留待开发
 > **2026-10-26 追加（阶段二百九十一：字形归一化的除数）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是**我们自己发明的自动烘焙**（AIR 没有对应物）兑现不了自己的承诺（「烘焙态 == 活态」）造成的**呈现缺陷**——`adl` 根本不经过烘焙路径，故不属 §1.5「`adl` 跑得对我们跑不出」，不占本表；页面级证据（121 帧逐帧 ink 包围盒、修前 119 / 修后 124）、根因与未测项见阶段节与 `docs/zh-cn/skia.md` §8.3。
