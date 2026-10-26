@@ -158,6 +158,20 @@ static int sk_video_init(void) {
   SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
 #endif
 #endif
+  // The SDL Windows IME backend defaults to UILess (TSF) mode, and in that mode the IME
+  // does NOT draw its own candidate window: the application is expected to render the
+  // candidate list itself through SDL_VideoData::IME_Present(), which no public API in
+  // SDL 2.32 ever calls (IME_Present has no caller anywhere in the tree). Measured on
+  // Windows 11 + Microsoft Pinyin: the marked text appeared inline at the caret while the
+  // candidate list never showed (temp/imelive/q2-type2.png). With this hint the backend
+  // keeps the native IMM32 UI alive and the candidate window appears under the caret,
+  // positioned by the same ImmSetCandidateWindow call that follows our text-input rect
+  // (temp/imelive/q1-type2.png). Set BEFORE SDL_Init: the hint is latched when the video
+  // driver brings up the keyboard backend. Guarded because older SDL headers (before
+  // 2.0.14) do not define the hint name at all.
+#ifdef SDL_HINT_IME_SHOW_UI
+  SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
+#endif
   return SDL_Init(SDL_INIT_VIDEO);
 }
 
@@ -1688,6 +1702,13 @@ static void sk_run_loop(void) {
           e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP ? e.button.windowID :
           e.type == SDL_MOUSEWHEEL ? e.wheel.windowID :
           e.type == SDL_TEXTINPUT ? e.text.windowID :
+          // SDL_TEXTEDITING (the IME marked text) carries its windowID too. Without this
+          // branch it fell through to the 0 default, sk_id_from_window_id() answered -1
+          // and the whole composition event was dropped before the switch: the field
+          // never saw a marked character, so nothing was previewed at the caret and
+          // sk_window_set_text_input_rect() was never called either (measured: temp/
+          // imelive, 15 x SDL_TEXTEDITING while the app dispatched none).
+          e.type == SDL_TEXTEDITING ? e.edit.windowID :
           e.type == SDL_KEYDOWN || e.type == SDL_KEYUP ? e.key.windowID : 0);
       if (id < 0) continue;
       WinCtx* c = &g_wins[id];

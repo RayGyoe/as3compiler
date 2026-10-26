@@ -12363,6 +12363,38 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return units;');
     this.indent--;
     this.line('}');
+    // The colour the field actually PAINTS at a byte offset (阶段二百九十七). AIR's
+    // insertion caret takes the colour of the character it sits on, NOT the field's
+    // default format: measured on the TalkMED setup window (AOT), a field whose text
+    // is black through setTextFormat runs but whose defaultTextFormat is white drew a
+    // WHITE caret between the black glyphs. Resolution matches the glyph pass -- the
+    // run covering the index wins, defaultTextFormat is the fallback, and a non-zero
+    // TextField.textColor overrides both (0 means unset, the convention the paint pass
+    // has always used). A caret AT THE END takes the last character's colour, which is
+    // what AIR shows while typing at the end of a field.
+    this.line('static unsigned as_tf_color_at(TextField* tf, int byteIndex) {');
+    this.indent++;
+    this.line('if (tf == NULL) return 0u;');
+    this.line('TextFormat* dflt = tf->defaultTextFormat;');
+    this.line('int len = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
+    this.line('int at = byteIndex;');
+    this.line('if (at < 0) at = 0;');
+    this.line('if (at >= len) at = (len > 0) ? len - 1 : 0;');
+    this.line('TextFormat* use = NULL;');
+    this.line('int n = (tf->_runs != NULL) ? (int)(tf->_runs->length / 3) : 0;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('int s0 = as_v_int_val(tf->_runs->data[i * 3]);');
+    this.line('int s1 = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
+    this.line('if (s0 <= at && at < s1) { use = (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]); break; }');
+    this.indent--;
+    this.line('}');
+    this.line('if (use == NULL) use = dflt;');
+    this.line('if (tf->textColor != 0u) return tf->textColor;');
+    this.line('if (use == NULL) return 0u;');
+    this.line('return (unsigned)as_v_num_val(use->color);');
+    this.indent--;
+    this.line('}');
     // The inverse of as_tf_utf16_index: a paragraph (Skia) code-unit index back to a
     // byte index. Needed because Skia's line table speaks UTF-16 code units while
     // every caret/selection index in this runtime is a byte offset -- comparing the
@@ -12986,6 +13018,12 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // window; the whole composition gets one underline when it is painted.
     this.line('static void as_tf_set_comp(TextField* tf, const char* text, int start, int length) {');
     this.indent++;
+    // ASC_IME_TRACE: the composition entry point. It sits at the TOP of the function
+    // on purpose -- an empty composition still prints, which is what distinguishes
+    // "the marked text never reached the field" (silent, and the bug this was written
+    // for: SDL_TEXTEDITING arrived but was routed to a dead window slot, so nothing was
+    // previewed and no candidate window was ever positioned) from "it arrived empty".
+    this.line('if (getenv("ASC_IME_TRACE") != NULL) fprintf(stderr, "ime_set text=\\"%s\\" start=%d len=%d\\n", (text != NULL) ? text : "(null)", start, length);');
     this.line('free(tf->_comp);');
     this.line('tf->_comp = NULL;');
     this.line('tf->_comp_start = -1;');
@@ -13039,6 +13077,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('ASC_ime_roi_valid = 0;');
     this.line('TextField* tf = NULL;');
     this.line('if (as_focus_obj != NULL && as_is((void*)as_focus_obj, &TextField_vt)) tf = (TextField*)as_focus_obj;');
+    // Same trace one level up: reports WHY the composition stops here (no focus, the
+    // focus is not a TextField, it is not an input field) instead of leaving a silent
+    // early return that looks identical to "the platform sent nothing".
+    this.line('if (getenv("ASC_IME_TRACE") != NULL) fprintf(stderr, "ime_disp text=\\"%s\\" focus=%p tf=%p input=%d\\n", (text != NULL) ? text : "(null)", (void*)as_focus_obj, (void*)tf, (tf != NULL) ? (as_tf_is_input(tf) ? 1 : 0) : -1);');
     this.line('if (tf == NULL || !as_tf_is_input(tf)) return;');
     this.line('as_tf_set_comp(tf, text, start, length);');
     this.line('if (tf->_comp == NULL) return;');
@@ -24514,6 +24556,15 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // (preview x position, masked layout string) without touching anything above.
     this.line('h = as_fp_str(h, tf->_comp);');
     this.line('h = as_fp_i32(h, tf->_sel_caret);');
+    // The blink PHASE, and only while THIS field owns the caret. The caret is painted
+    // into whatever snapshot is current, so a window with nothing else moving
+    // auto-bakes its stage after a few idle frames and then keeps blitting that
+    // snapshot with the bar burnt in: MEASURED temp/imelive, 14 CopyFromScreen frames
+    // over 1.5 s byte-identical while the field was focused, and the very same build
+    // blinked as soon as one other object changed every frame and kept the stage out
+    // of the bake. With the phase in the key the bake drops on each flip, the field
+    // renders live (a focused TextField never comes from a bake) and the bar blinks.
+    this.line('if (as_focus_obj == (void*)tf && tf->selectable && as_tf_is_input(tf)) h = as_fp_i32(h, as_tf_caret_on());');
     this.line('h = as_fp_bool(h, tf->displayAsPassword);');
     // Rich-text run table identity + size (a setTextFormat/htmlText rebuild replaces
     // the array; in-place mutation of a run's TextFormat is still cached).
@@ -25273,9 +25324,32 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable && as_tf_is_input(tf)) {');
     this.indent++;
     this.line('double kcx = 0.0, kcy = 0.0, kch = 0.0;');
-    this.line('if (as_tf_caret_on() && as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, as_tf_caret(tf)), &kcx, &kcy, &kch)) {');
+    // The phase and the rect are computed separately so ASC_CARET_TRACE can report a
+    // caret that is blinking-off apart from one whose rect cannot be derived -- those
+    // two look identical on screen (no bar) and used to be indistinguishable.
+    this.line('int kon = as_tf_caret_on();');
+    this.line('int krect = as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, as_tf_caret(tf)), &kcx, &kcy, &kch);');
+    this.line('if (getenv("ASC_CARET_TRACE") != NULL) fprintf(stderr, "caret idx=%d utf16=%d on=%d rect=%d x=%.2f y=%.2f h=%.2f\\n", as_tf_caret(tf), as_tf_utf16_index(tf, as_tf_caret(tf)), kon, krect, kcx, kcy, kch);');
+    this.line('if (kon && krect) {');
     this.indent++;
-    this.line('unsigned kcol = (tf->textColor != 0u) ? tf->textColor : (unsigned)as_v_num_val(tf->defaultTextFormat->color);');
+    this.line('unsigned kcol = as_tf_color_at(tf, as_tf_caret(tf));');
+    // While an IME composition is active the caret belongs at the END of the marked
+    // text, not at its start: the composition occupies the slot the caret would sit
+    // in, and AIR moves the bar along as the string grows. Measured on adl 51.4.1
+    // (temp/imelive/adz-blink2.png: the caret sits right after "kuang" while the
+    // underlined composition is still uncommitted); before this the bar stayed on the
+    // first composed letter, which looked wrong as soon as the pinyin was longer than
+    // one character. The advance is measured with the same paragraph the preview
+    // below builds, so caret and preview always agree even if the font metrics differ
+    // from AIR's.
+    this.line('double kdx = 0.0;');
+    this.line('if (tf->_comp != NULL && tf->_comp[0] != 0) {');
+    this.indent++;
+    this.line('TextFormat* kcf = tf->defaultTextFormat;');
+    this.line('void* kcp = as_skia_textlayout_new_leading(tf->_comp, kcf->font, as_v_num_val(kcf->size), as_v_bool_val(kcf->bold) ? 1 : 0, as_v_bool_val(kcf->italic) ? 1 : 0, 0u, as_v_num_val(kcf->leading), 0.0, 0, 1);');
+    this.line('if (kcp != NULL) { kdx = as_tf_longest_line(kcp); as_skia_textlayout_delete(kcp); }');
+    this.indent--;
+    this.line('}');
     // 1 device pixel wide, like the border rule: the canvas already carries the
     // device ratio * ancestor scale * own scale, so divide the caller's total scale
     // out (the bake pass publishes the DESTINATION scale in ASC_bake_ctm_*).
@@ -25285,7 +25359,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('double kw = ASC_render_scale / ksx;');
     this.line('if (kw <= 0.0) kw = 1.0;');
     this.line('void* kp = as_skia_paint_fill(kcol, 1.0);');
-    this.line('as_skia_canvas_draw_rect(canvas, 2.0 + alignDx - scrollX + kcx, 2.0 - scrollY + kcy, kw, kch, kp);');
+    this.line('as_skia_canvas_draw_rect(canvas, 2.0 + alignDx - scrollX + kcx + kdx, 2.0 - scrollY + kcy, kw, kch, kp);');
     this.line('as_skia_paint_delete(kp);');
     this.indent--;
     this.line('}');
@@ -25306,7 +25380,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, as_tf_caret(tf)), &ccx, &ccy, &cch)) {');
     this.indent++;
     this.line('TextFormat* cf = tf->defaultTextFormat;');
-    this.line('unsigned ccol = (tf->textColor != 0u) ? tf->textColor : (unsigned)as_v_num_val(cf->color);');
+    this.line('unsigned ccol = as_tf_color_at(tf, as_tf_caret(tf));');
+    // The paint side: the geometry and colour the preview is drawn with, which is what
+    // a caret/preview mismatch in the field is diagnosed against.
+    this.line('if (getenv("ASC_IME_TRACE") != NULL) fprintf(stderr, "ime_paint comp=\\"%s\\" caret=%d x=%.2f y=%.2f h=%.2f col=%06x\\n", tf->_comp, as_tf_caret(tf), ccx, ccy, cch, ccol);');
     this.line('void* cpara = as_skia_textlayout_new_leading(tf->_comp, cf->font, as_v_num_val(cf->size), as_v_bool_val(cf->bold) ? 1 : 0, as_v_bool_val(cf->italic) ? 1 : 0, ccol, as_v_num_val(cf->leading), 0.0, 0, 1);');
     this.line('if (cpara != NULL) {');
     this.indent++;
@@ -26587,7 +26664,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // the same exit(1)/freeze fate as an input handler. Planting here covers the
     // poll sweep and the frame in one place; Stage_dispatchFrame then sees the
     // guard already held and does not plant a second one.
-    this.line('static void ASC_window_on_frame(int id) {');
+    this.line('static void ASC_window_on_frame(int id) {')
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
     this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');

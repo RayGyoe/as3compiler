@@ -16938,7 +16938,36 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 **七、顺带清掉一行遗留**
 `### 遗留待开发` 里「每条鼠标通知抛一次 `#1009`」（阶段二百九十四 登记）就是本缺陷的第 3 步，随本次修复一起消失 ⇒ 该行改判「已完成」。
 
+### 阶段二百九十六：IME 合成与光标四条 —— 合成事件被路由到死窗、SDL 不画候选窗、光标取错色/不闪、合成期光标停在首字母（v0.4.258 → v0.4.259）✅ 已完成
+
+**一、起因**（用户报三件）：① `TextField` 里输入中文**看不到输入法的提示框**（只有拼音字母进输入框，候选窗根本不出现）；② 光标竖线**颜色不对**（白色会闪、黑色字不闪动）；③ **输入后光标位置不对**。
+
+**二、五条根因与实测**（同一份探针 `temp/imelive/app/src/IMELive.as`，`adl 51.4.1` 作 oracle；字段底色白、正文黑 run、`defaultTextFormat` 故意设红，绿方块作「画面是否在重绘」的标记物）
+
+| # | 现象 | 根因 | 证据 |
+|---|---|---|---|
+| 1 | 合成串完全不预览、候选窗也不出 | `vendor/window_glue.cc` 的窗口 id 解析链（喂给 `sk_id_from_window_id` 的三元链）**漏了 `SDL_TEXTEDITING`**，事件落到 `0` 默认分支 ⇒ `sk_id_from_window_id(0)` 答 `-1` ⇒ 在 `switch` 之前就 `continue`，整条合成被**静默丢弃** | `ASC_TRACE_INPUT=1` 量到 **15 次 `type=770`**，而 `ASC_IME_TRACE` 的 `ime_disp` / `ime_set` 一行也没有（`temp/imelive/trace5.txt`）；补上分支后立刻出现 `ime_disp … input=1` 与 `ime_paint comp="k"`（`trace7.txt`） |
+| 2 | 有内联合成串，但**没有候选窗** | SDL 的 Windows IME 后端默认走 UILess(TSF) 模式：候选窗由 `SDL_VideoData::IME_Present()` 负责画，而 SDL 2.32 全树**没有任何调用者**（公开 API 也没暴露）⇒ 谁都不画 | 同机 A/B：不设 hint 只有内联合成（`q2-type2.png`）；`SDL_IME_SHOW_UI=1` 时候选窗出现在光标下方（`q1-type2.png`），与 `adl` 的形态一致（`ad-type2.png`） |
+| 3 | 光标是**白**竖线 | `kcol` 取的是 `defaultTextFormat.color`；应用那个字段正文是 `setTextFormat` 的黑色 run、`defaultTextFormat` 是白色 ⇒ 白光标压在黑字之间 | 探针把正文设黑 run、`defaultTextFormat` 设红：修前抠图**每帧都有红像素**（红光标），改用 `as_tf_color_at` 后 `red=0`、竖条列 `[267,294] ↔ [267]` 交替（`temp/imelive/caretcount.cjs`） |
+| 4 | 画面静止时光标**冻住不闪** | blink 相位原本不进 `as_render_fp`：静态画面几帧后自动烘焙成快照，冻结的光标被烧进快照，`as_render_cached` 直接贴图 | STATIC 标记物：修前 14 帧 MD5 全同、竖条 14 帧不动（`j-blink*.png`）；相位进 fp 后 `dark=1344 ↔ 1309` 按 ~500 ms 交替（`t-blink*.png`） |
+| 5 | 合成时竖线压在被组的**第一个字母**上 | AIR 在合成期把光标放在**合成串末尾**（合成本身占着光标原本的位置） | `adl`：竖线紧跟 `kuang` 右侧（`adz-blink2.png`，变化列 639）；修前我们在合成起点（`q5-blink*.png`，变化列 554）；加上合成串 advance 后落在 652..654（`q6-blink*.png`）——15 px 差值只是自家字体 advance 与 AIR 的既定差异（§1.5 度量类例外） |
+
+**三、改动**
+- `vendor/window_glue.cc`：① id 解析链补 `e.type == SDL_TEXTEDITING ? e.edit.windowID :`；② `sk_video_init` 在 `SDL_Init` **之前** `SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1")`（`#ifdef` 守卫，老 SDL 头没有该名字）。两条都平台中立地写在共享胶水里，macOS/X11 走各自的 IME 后端、不受影响。
+- `src/emit.ts`：③ 新增 `as_tf_color_at(tf, byteIndex)`（run 覆盖优先 → `defaultTextFormat` 兜底 → 非零 `textColor` 覆盖，光标在末端取末字符），光标 `kcol` 与合成预览 `ccol` 都改走它；④ `as_render_fp` 的 TextField 分支并入 `as_tf_caret_on()`（仅当焦点字段自己持光标）；⑤ 光标 x 加上**合成串 advance**，且用**预览同一个** paragraph 量，保证光标与预览永不脱节。
+- 诊断：新增 `ASC_IME_TRACE` 三个发射点（`ime_disp` 入口为何停下 / `ime_set` 合成到达 / `ime_paint` 预览几何与颜色），「为什么打在这儿」写进生成 C 的注释（不是事后回忆）。
+
+**四、回归与验收**
+- `node test.ts`：**523 例 / 517 过 / 4 红**，与基线完全一致（`socket`、`stage94d`、`status-item`、`inline StackCanary`）。
+- `test/unit/text-input.ts`：新增 **3 条**源级钉（id 解析链含 `SDL_TEXTEDITING`、`sk_video_init` 设候选窗 hint、光标带合成 advance），改 **2 条**（`dispatchTextEditing` 的窗口放宽、caret 矩形 `+ kdx`）；`unit: text-input/*` **52 项全绿**。
+- A/B：同一份 `IMELive.as` 在 `adl 51.4.1` 与 AOT 上逐项对照 —— 内联合成、候选窗位置、光标颜色/闪烁/位置、提交后的文本与 `caretIndex=24`（`run.log`：`t9 caret=24 len=24 sel=24,24 focus=tf text="输入法的提示框框"`）。
+- 真机验证待产品侧重编（本机只有探针）；`bin-aot/build-aot.bat` 重编后按同一流程复核。
+
+**五、如实报明（新登记，不在本阶段范围）**
+同探针量到一条**独立**偏差：**输入进去的字符取 `defaultTextFormat`，而 AIR 取「插入点前一个字符的 run 格式」** —— 探针里 `adl` 提交的「框」是**黑色**（承前文 run），我们的是红色（`adc-commit.png` vs `q3-commit.png`）。它不影响光标取色（光标已按字符取色），但会让「正文格式 ≠ 默认格式」的字段里新输入的字符颜色/字号不对。已登记 `### 遗留待开发`。
+
 ### 遗留待开发
+> **2026-10-27 追加（阶段二百九十六：IME 合成与光标四条）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **97 → 98 项**（`未开始` **75 → 76** / `部分完成` 20 / `调研完成·实现暂缓` 1 / 已完成 1）。**本阶段修净的五条都不占表**（合成事件被路由到死窗、SDL 不画候选窗、光标取错色、静态画面不闪、合成期光标停在首字母）：它们在 `adl` 上都是「跑得对」、我们此前跑不出 ⇒ 属 §1.5 的**遗留缺陷**，但同阶段落地，按表头自述「已完成项一经落地即从本表移出」故不入表。新登记的 1 行是同探针**顺带量到**的独立偏差：输入字符的格式取 `defaultTextFormat` 而非「插入点前一个字符的 run 格式」。
 > **2026-10-27 追加（阶段二百九十五：`REMOVED_FROM_STAGE` 的派发时机）**：**新登记 1 行 / 改写 1 行 / 移出 0 行**（把「每条鼠标通知抛一次 `#1009`」改判已完成 ⇒ 净 0 行）。新登记的那行是 A/B 探针顺带量到的**真语义缺口**（不是本阶段要修的 tips 缺陷）：`DisplayObject_get_stage` 的 `ASC_root_stage` 兜底对所有孤立对象生效，`adl` 答 `null`。
 > **2026-10-27 追加（阶段二百九十四：`DisplayObject.parent` 的静态类型）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **95 → 96 项**（`未开始` **74 → 75** / `部分完成` 20 / `调研完成·实现暂缓` 1）。**本阶段修的 tips 缺陷不占表**：`adl` 跑得对（tip 正常显示）、我们此前跑不出 ⇒ 属 §1.5 的**遗留缺陷**，但阶段内已修净，按表头自述「已完成项一经落地即从本表移出」故不入表。新登记的 1 行是**顺带量到的全局隐患**：真机每条鼠标通知抛一次 `#1009`，触发点未定。
 > **2026-10-27 追加（阶段二百九十三：`Clipboard` 真实现 + `System.setClipboard` + 空替代盘点）**：**新登记 2 行 / 改写 1 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **93 → 95 项**（`未开始` **72 → 74** / `部分完成` 20 / `调研完成·实现暂缓` 1）。**新登记 2 行**：① 剪贴板的 `bitmap`/`fileList`/`filePromiseList` 三种格式不翻译（这三种 `adl` 都能用 ⇒ 遗留缺陷；我方 `hasFormat` 不谎报、`setData` 报明后返回 `false`）；② `serializable` 参数被接受但不产生序列化副本。**改写的 1 行**是「web 目标键盘与剪贴板未接线」—— 剪贴板那半边本阶段已接线（`vendor/web_glue.cc` 补齐 8 个 seam 函数、`sk_clipboard_available()` 返回 0 ⇒ AS3 侧**报明**「本构建没有剪贴板后端」，不是静默降级），`navigator.clipboard` 的异步 + 用户手势门控仍是**平台硬边界**（§1.5）；键盘那半边仍未接线，故状态维持「未开始」。**本阶段修净的两项不占表**：`Clipboard` 本体与 `System.setClipboard`（`adl` 跑得对、我们此前跑不出 ⇒ 遗留缺陷，但同阶段落地，按表头「已完成项一经落地即从本表移出」不入表）。**空替代盘点**落在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md)：`shell()` 20 个类逐项写明「给得出 / 给不出」（12 个数据载体 + 8 个真能力缺口），成员级 `as_shell_unsupported` 26 条也成表；本机的行为读数是 `temp/clip/t4.as`。
@@ -17104,6 +17133,7 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 >
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
+| **输入进 `TextField` 的字符取 `defaultTextFormat`，而非「插入点前一个字符的 run 格式」**（`as_tf_insert_payload` → `as_tf_splice` 不给新字节挂 run，排版时无 run 覆盖就落到 `defaultTextFormat`；`adl 51.4.1` 实测同一个字段（正文黑 run / `defaultTextFormat` 红）里提交的「框」是**黑色**，我们的是红色，见 `temp/imelive/adc-commit.png` vs `q3-commit.png`） | 未开始（2026-10-27 阶段二百九十六 做 IME 探针时量到；该阶段只修光标取色，未动插入的格式继承） | 只影响「正文格式 ≠ 默认格式」的字段：新输入字符的颜色/字号/字体全部回落到 `defaultTextFormat`（深色主题下会出现「跟随默认色而非正文色」的字符）。`as_tf_splice` 目前**既不克隆也不平移** run 表，插入/删除之后既有 run 的区间也不随文本移动 ⇒ 两件事要一起处理才能对齐 AIR。 | 在 `as_tf_splice` 里按 AIR 口径（插入点前一个字符的 run，无前置字符取后一个，都没有才 `defaultTextFormat`）克隆 `TextFormat` 挂新区间，同时平移插入点之后的 run 区间；改后重跑 `temp/editprobe` 的格式化对照 + `unit: text-input/*` |
 | **`DisplayObject.stage` 对「已不在显示列表上」的对象返回主窗 Stage 而非 `null`**（`DisplayObject_get_stage` 末尾 `return ASC_root_stage;` 对所有孤立对象兜底；`adl 51.4.1` 实测 `after stage=null`，我们答 `stage`，见 `temp/dispabort/`） | 未开始（2026-10-27 阶段二百九十五 做出 A/B 探针时量到；本阶段只修派发时机，未动兜底） | 兜底本身是为 document class **构造期**的 `stage` 非 null（Flash 语义），但它区分不了「document class 实例」与「任意孤立 Sprite」⇒ `if (obj.stage == null)` 这类守卫在对象被摘除后判错，`stage.removeChild(...)` 会打到**另一个窗口**的 Stage 上（找不到子件 ⇒ 返回 null，多数场景无害但语义错）。 | 加 `static void* ASC_doc_root`（窗口创建时指向 document class 实例），只在 `o == ASC_doc_root` 时兜底、其余返回 NULL；改后必须全量回归（`examples/` 里若有孤立对象读 `stage` 的会变红） |
 | **每条鼠标通知抛一次 `#1009`**（真机 talkmed-meeting 设置窗实测：空区 20 次移动 → 未捕获异常计数 +20，与是否有 tooltip 无关） | 已完成（2026-10-27 阶段二百九十五：根因是 `removedFromStage` 派发得太晚 —— tip 被摘除后监听器残留在设置窗 Stage 上，见该阶段节） | 在我们的（与 `adl` 对齐的）派发语义下，未捕获异常会**中断该次派发的剩余监听器** ⇒ 排在后面的监听器全都不执行；应用在 `adl` 上跑得对，故这条大概率是**我们的**空接收者守卫多报。证据：`temp/tipsetup/tips-trace2.txt`（`… #1009 (19 more of the same)` 与每次 `t=… mouse mouseMove` 一一对应） | 待定 |
 | **`ExtensionContext` 还有 4 个 AIR 50 成员未建模**（`functions` / `knownExtensions` / `getExtensionInfo` / `loadExtension`） | 未开始（2026-10-17 阶段一百七十八·二 逐项查 AIR 参考时登记） | 已落地的 A 面是 `createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` / `actionScriptData` + `StatusEvent`（与 `ANEWinCore` 的真实用量完全覆盖）。**`loadExtension` 不是小修**：它是**延迟加载**——扩展在**首次 `call` 时**才 `LoadLibrary` + initializer，要把 C 面的加载时机从「构造 `ExtensionContext` 时」移到「首次调用时」并缓存；`functions`/`knownExtensions`/`getExtensionInfo` 是只读反射面。（另：`extensionID` **已删** —— AIR 没有这个属性，`mxmlc` 拒绝 + `adl` 报 `#1069`，已按 AIR 对齐，不入本表） | 先补 `adl` 实测采集这四个成员的真实形态（`functions` 是 `Object` 还是数组、未知 id 时是 `null` 还是空表），再按实测落地；`loadExtension` 独立立项（它要动 C 面时序） |

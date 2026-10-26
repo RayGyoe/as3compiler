@@ -428,6 +428,22 @@ function checkTextInput(): string[] {
     glue.indexOf('case SDL_TEXTEDITING:') < glue.indexOf('case SDL_TEXTINPUT:'));
   check('SDL_TEXTEDITING is delivered through the reserved textEditing key type',
     /case SDL_TEXTEDITING:[\s\S]{0,1200}?on_key\(id, "textEditing", 0, 0, 0\)/.test(glue));
+  // The routing chain in front of the switch must resolve SDL_TEXTEDITING too. It did
+  // not, so the event fell through to the 0 default, sk_id_from_window_id(0) answered
+  // -1 and the whole composition was dropped BEFORE the switch: measured on Windows 11
+  // + Microsoft Pinyin (temp/imelive, trace5: 15 x type=770 with zero dispatch lines)
+  // the field never showed marked text and sk_window_set_text_input_rect was never
+  // called, so there was no preview and no candidate window either.
+  check('the window-id chain routes SDL_TEXTEDITING (it is not the 0 default)',
+    glue.includes('e.type == SDL_TEXTEDITING ? e.edit.windowID :'));
+  // SDL defaults its Windows IME backend to UILess (TSF), where the native candidate
+  // window is suppressed and the app is expected to draw the candidate list itself --
+  // through IME_Present(), which no public API in SDL 2.32 exposes (no caller in the
+  // tree). Measured A/B on the same probe: without the hint only the inline marked text
+  // appears (q2-type2.png); with it the candidate list shows under the caret
+  // (q1-type2.png), which is what adl 51.4.1 does (ad-type2.png).
+  check('the video init asks SDL for the native IME candidate window',
+    /static int sk_video_init\(void\) \{[\s\S]*?SDL_SetHint\(SDL_HINT_IME_SHOW_UI, "1"\);[\s\S]*?return SDL_Init\(SDL_INIT_VIDEO\);/.test(glue));
   check('the glue keeps the composition in its own buffer (text + start + length)',
     glue.includes('char edit_text[256];') && glue.includes('int edit_start;') && glue.includes('int edit_len;'));
   check('window_glue exposes sk_window_text_edit_take',
@@ -453,7 +469,7 @@ function checkTextInput(): string[] {
   check('an empty composition means "composition ended" and clears the preview',
     /static void as_tf_set_comp\(TextField\* tf, const char\* text, int start, int length\) \{[\s\S]{0,400}?if \(text == NULL \|\| text\[0\] == 0\) return;/.test(c));
   check('Stage.dispatchTextEditing targets the focused editable field only',
-    /static void Stage_dispatchTextEditing\(void\* _this, char\* text, int start, int length\) \{[\s\S]{0,260}?as_is\(\(void\*\)as_focus_obj, &TextField_vt\)[\s\S]{0,160}?!as_tf_is_input\(tf\)\) return;/.test(c));
+    /static void Stage_dispatchTextEditing\(void\* _this, char\* text, int start, int length\) \{[\s\S]{0,260}?as_is\(\(void\*\)as_focus_obj, &TextField_vt\)[\s\S]{0,400}?!as_tf_is_input\(tf\)\) return;/.test(c));
   const dte = /static void Stage_dispatchTextEditing\(void\* _this, char\* text, int start, int length\) \{[\s\S]*?\n\}\n/.exec(c)?.[0] ?? '';
   check('the composition leaves .text alone (it is only stored, never spliced)',
     dte.length > 0 && !dte.includes('as_tf_splice') && !dte.includes('as_tf_insert_text'));
@@ -601,7 +617,13 @@ function checkCaret(): string[] {
   check('the caret is gated on the window pass, on focused + selectable, and on INPUT',
     c.includes('if (ASC_caret_pass && as_focus_obj == (void*)tf && tf->selectable && as_tf_is_input(tf)) {'));
   check('the caret bar is a 1-device-pixel fill rect at the caret box, in the text colour',
-    /if \(ASC_caret_pass && as_focus_obj == \(void\*\)tf && tf->selectable && as_tf_is_input\(tf\)\) \{[\s\S]{0,900}?as_skia_textlayout_caret_rect\(para, as_tf_utf16_index\(tf, as_tf_caret\(tf\)\), &kcx, &kcy, &kch\)[\s\S]{0,520}?as_skia_paint_fill\(kcol, 1\.0\)[\s\S]{0,180}?as_skia_canvas_draw_rect\(canvas, 2\.0 \+ alignDx - scrollX \+ kcx, 2\.0 - scrollY \+ kcy, kw, kch, kp\)/.test(c));
+    /if \(ASC_caret_pass && as_focus_obj == \(void\*\)tf && tf->selectable && as_tf_is_input\(tf\)\) \{[\s\S]{0,900}?as_skia_textlayout_caret_rect\(para, as_tf_utf16_index\(tf, as_tf_caret\(tf\)\), &kcx, &kcy, &kch\)[\s\S]{0,1400}?as_skia_paint_fill\(kcol, 1\.0\)[\s\S]{0,180}?as_skia_canvas_draw_rect\(canvas, 2\.0 \+ alignDx - scrollX \+ kcx \+ kdx, 2\.0 - scrollY \+ kcy, kw, kch, kp\)/.test(c));
+  // adl 51.4.1 keeps the caret AFTER the marked text while composing (temp/imelive/
+  // adz-blink2.png: the bar sits right of "kuang" with the underlined composition
+  // still uncommitted), so the bar is offset by the composition advance -- measured
+  // with the same paragraph the preview draws, so the two never disagree.
+  check('the caret moves to the end of the IME composition while one is active',
+    /if \(ASC_caret_pass && as_focus_obj == \(void\*\)tf[\s\S]{0,1200}?double kdx = 0\.0;[\s\S]{0,400}?kdx = as_tf_longest_line\(kcp\);[\s\S]{0,400}?as_skia_canvas_draw_rect\(canvas, 2\.0 \+ alignDx - scrollX \+ kcx \+ kdx/.test(c));
   check('the caret width is one DEVICE pixel (scale divided out), like the border',
     /double kw = ASC_render_scale \/ ksx;/.test(c));
   // (4) the window compose pass switches it on; Stage.render (the screenshot hook)
