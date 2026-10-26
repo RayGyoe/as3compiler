@@ -16621,8 +16621,8 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 
 **八、如实报明（未测/未做）**
 
-1. **Windows 未在本机验证**：`vendor/window_glue.cc` 的 Win32 `sk_menu_popup` 分支（`TrackPopupMenuEx` + `GetCursorPos`）只到
-   「能编译」的把握，本机无 Windows；`window_glue.cc` 的 Windows 支随 CI 编译。
+1. ~~**Windows 未在本机验证**~~ —— **已在阶段二百九十真机验证并修掉三处 Windows 专有缺陷 + 一处静默降级**
+   （菜单位置、重复的 release、分隔线之后项 tag 越界、`NativeMenuItem.submenu` 整棵丢失），见下一条。
 2. **web 只做编译检查**：`emcc -std=c++17 -c vendor/web_glue.cc -I vendor/skia -DASC_USE_SKIA=1 -DASC_USE_WINDOW=1` 干净通过，
    但**没有**在真浏览器里点过；web 的弹窗是 DOM 覆盖层 + 异步 `sk_menu_popup_take`，因此**事件顺序与 mac 不同**（`MENU_SELECT`
    与选中事件跨帧），差异写在 `vendor/web_glue.cc` 的注释里；web 上**不支持**嵌套子菜单，只弹根菜单。
@@ -16633,7 +16633,53 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
    本轮 `temp/ctxprobe/api/out6.txt`（`threw 2004`，且该进程随后未继续）。**本轮不改 `NativeMenu`**（不在范围内，且改动会波及
    应用菜单），只记录矛盾；`ContextMenu` 侧口径明确（允许重复），按后者落地。
 
+### 阶段二百九十：`flash.ui.ContextMenu` 的 Windows 实测（三处缺陷 + 一处静默降级）（v0.4.252 → v0.4.253）✅ 已完成
+
+**一、起点**：阶段二百八十九把 Windows 分支写成「同构但本机未验证」，并且诚实登记了两个已知缺口
+（`keyEquivalent` 不显示不生效、`submenu` 被忽略）。本轮在 **Windows 11 / 150% 面板**上用真鼠标 + 真键盘
+把它跑通，并用 `temp/ctxwin/` 的探针把每一个结论量出来。
+
+**二、探针**：`temp/ctxwin/CtxWin.as`（720×480 窗口，蓝底 500×340 的 `Sprite` 挂 4 项 `ContextMenu`：
+`One` / `Two` / 分隔线 / `Three` / `More ▸ Sub One, Sub Two`，所有事件与几何写 `ctxwin.log`）；
+驱动 `drive6.ps1`（`SetCursorPos` + `mouse_event` + `keybd_event`，枚举类名 `#32768` 的菜单窗口取矩形，截图）。
+`examples/context-menu.as` 是**纯 API 面**、不建窗口，验不了弹窗通路，所以必须另写窗口探针。
+
+**三、四处缺陷（前三处 Windows 专有，第四处 tag 越界是跨平台的）**
+
+| 缺陷 | 修前实测 | 根因 | 修法 |
+|---|---|---|---|
+| 菜单开错地方 | 点物理 `(1480,1020)`，菜单出现在 `(101,101)` | 弹窗前对 `GetCursorPos` 的结果做了 `ScreenToClient`，把窗口原点 `(1380,920)` 减掉；`TrackPopupMenu` 要**屏幕**坐标 | 删掉 `ScreenToClient` |
+| 一次右键两对事件 | `rightMouseUp`/`rightClick` 各两次，第二对在选中事件**之后** | AppKit 的 tracking loop **吃掉** release（mac 才需要 `sk_resync_right_button` 造一个）；Win32 的模态泵把真 `WM_RBUTTONUP` **投进 SDL 队列**，菜单关闭后才处理，而发射器已在消失点回放过 | `g_popup_up_swallow`：真跑过 `TrackPopupMenu` 就置位，`SDL_MOUSEBUTTONUP` 的右键分支先于 `g_synth_right_up` 吞掉；新的右键按下清位（键盘取消时 release 可能在菜单关闭后才到） |
+| 分隔线之后的项点了没反应 | 选 `Three` 菜单关掉、**什么都不派发**（跨平台，macOS 同样中招） | `as_ctxmenu_fill` 用**扁平下标**当 tag（`c->items[k].tag = c->nitems`），而 `ASC_popup_tags` 只 push 真条目 ⇒ tag 越过表尾、取回 NULL | tag 改为 `ASC_popup_tags->length`（1 基）；`as_menu_fill` 本来就自洽（`tag_base + k + 1` 且每个槽都 push），未动 |
+| 子菜单**静默丢失** | 带 `submenu` 的项没有箭头、右方向键无反应、子条目根本不存在 | ① Win32 分支从未建子菜单；② `AppendMenuW` 的 `MF_POPUP` 第一版传的是 **id**（Windows 静默当普通命令项），实测「箭头不出现」后才定位 | `sk_win_menu_build()` 递归建 `HMENU`，`AppendMenuW(menu, MF_POPUP \| MF_STRING, (UINT_PTR)sub, label)` —— 与 Cocoa 侧 `sk_menu_build` 一一对应 |
+
+**四、修后实测（同一驱动脚本，逐项都是打印出来的）**
+
+- 菜单位置：点击 `(1480,1020)` ⇒ 菜单窗口矩形 `[1481,1020,1678,1175]`（挂在指针处）；
+- 事件对数：一次右键**只有一对** `rightMouseUp`/`rightClick`，且都在选中事件之前 ⇒
+  LR = `rightMouseDown → MENU_SELECT → rightMouseUp → rightClick → SELECT(item) → SELECT(menu) → MENU_ITEM_SELECT`；
+- 连续使用：第二次右键照弹（`sk_resync_right_button` 在 Windows 上走「OS 说按钮已松」的同一路径）；
+- 分隔线之后的项：`SELECT target=item(Three)` + 菜单级 `SELECT` + `MENU_ITEM_SELECT` 全发；
+- 子菜单：`Right` 展开第二个 `#32768` 窗口 `[1668,1133,1890,1208]`（截图 `sub2.png`：`More ▸ Sub One / Sub Two`），
+  `Down`+`Enter` ⇒ `SELECT item(Sub Two)` + `SELECT(menu)`。
+
+**五、钉子**：`test/unit/context-menu.ts` 的 `unit: context-menu/Model` **25 → 31 钉**，新增 4 条 Win32 钉
+（无 `ScreenToClient`、`g_popup_up_swallow` 置位/吞/清位、`MF_POPUP` 传句柄）与 2 条 tag 钉
+（`ASC_popup_tags` 下标 ＋ `as_menu_fill` 自洽）。同时把 macOS「SDL 造出来的 up 被吞」那条钉的窗口
+从 300 放宽到 900 字符 —— 新的 Windows 分支插在它上面，钉的语义（顺序与吞事件）没变。
+
+**六、如实报明（仍缺）**
+
+1. **`keyEquivalent` 在 Windows 上既不上屏也不生效**：Win32 菜单要在 `TrackPopupMenu` 的模态循环里挂
+   消息过滤器才能吃加速键；本轮未做，右键菜单的条目只显示标签。macOS 侧照旧（`NSMenuItem` 原生支持）。
+2. **应用菜单栏**（`NativeApplication.menu` → `SetMenu`）仍未接，属独立阶段，与右键通路无关。
+3. **未在 adl（Windows 版）上跑同一探针对照**：本机只有 macOS 的 `adl 51.4.1`；Windows 侧的顺序口径来自
+   macOS `adl` 的实测 + 我们与它一致的末端实现，不是 Windows `adl` 直读。
+
+---
+
 ### 遗留待开发
+> **2026-10-26 追加（阶段二百九十：`ContextMenu` 的 Windows 实测）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。本阶段修的四处（菜单位置、重复 release、分隔线之后 tag 越界、`submenu` 静默丢失）在 `adl` 上都是「跑得对」的、我们此前跑不出 ⇒ 按 AGENTS §1.5 属**遗留缺陷**，但**已在同一阶段修净**，按表头「已完成项一经落地即从本表移出」不入表。`keyEquivalent` 在 Win32 上不显示不生效仍缺（需在 `TrackPopupMenu` 的模态循环里挂消息过滤器），属**实现欠账**而非拒绝实现，故记在阶段节的「如实报明」、不入表。
 > **2026-10-26 追加（阶段二百八十九：`flash.ui.ContextMenu` 右键菜单）**：**新登记 1 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **93 → 93 项**（`未开始` 不变）。
 > - **移出 1 行**：``NativeMenu.display() 没有模态菜单后端``。本阶段给 Cocoa 后端接了真模态弹窗（``sk_menu_popup`` 用 ``popUpMenuPositioningItem:atLocation:inView:`` 跑嵌套 tracking loop，阻塞到选中/取消），``NativeMenu.display`` 与 ``ContextMenu.display`` 都改走它 ⇒ 该行已收尾，按「已完成项一经落地即从本表移出」下架。
 > - **新登记 1 行**：``NativeMenu.addItem`` 的**重复项**行为在两份自家实测里互相矛盾（``temp/deskprobe2/probe-plain.txt`` 静默忽略 ``num=1`` vs ``temp/ctxprobe/api/out5.txt``/``out6.txt`` 抛 ``#2004``）。矛盾未定案前**不动** ``NativeMenu``（改动会波及应用菜单）；``ContextMenu`` 侧口径明确（允许重复 ``A,B,A``），已按实测落地。解密需在干净 SDK/机器上重测。

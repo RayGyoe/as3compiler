@@ -25827,8 +25827,17 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('c->items[k].key = it->_keyeq != NULL ? it->_keyeq : (char*)"";');
     this.line('c->items[k].mods = as_menu_mods(it);');
     this.line('c->items[k].submenu = -1;');
-    this.line('c->items[k].tag = c->nitems;   // 1-based index into ASC_popup_tags');
-    this.line('if (ASC_popup_tags != NULL) as_array_push(ASC_popup_tags, v);');
+    // The tag is the 1-based index into ASC_popup_tags, NOT the flat item index.
+    // Separators take flat slots of their own but are never pushed, so numbering by
+    // the flat index (this used to be c->nitems) pushed every item AFTER a separator
+    // in the same menu past the end of the table: as_menu_popup_finish then found no
+    // entry and dispatched nothing at all. Measured on Windows (temp/ctxwin) with a
+    // three-item menu whose third item had separatorBefore: selecting the third item
+    // closed the popup and produced no SELECT, no MENU SELECT and no MENU_ITEM_SELECT.
+    // The application menu path (as_menu_fill) is self-consistent because it pushes
+    // EVERY slot, separators included -- this is the only place that skips them.
+    this.line('if (ASC_popup_tags != NULL) { as_array_push(ASC_popup_tags, v); c->items[k].tag = ASC_popup_tags->length; }');
+    this.line('else c->items[k].tag = 0;');
     this.line('c->menus[idx].count++;');
     this.indent--;
     this.line('}');

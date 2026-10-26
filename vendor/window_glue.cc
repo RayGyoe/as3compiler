@@ -1334,6 +1334,16 @@ static int sk_trace_input = -1;
 extern "C" int SDL_SendMouseButton(SDL_Window *, Sint32, Uint8, Uint8);
 
 static int g_synth_right_up = 0;
+// Set by the Win32 popup when TrackPopupMenu really ran (see sk_menu_popup). The
+// two window backends differ in exactly one way that matters here: AppKit's
+// tracking loop CONSUMES the release, so SDL never sees it and sk_resync_right_button
+// has to manufacture one; Win32's modal pump DELIVERS it, so SDL queues a real
+// SDL_MOUSEBUTTONUP behind our back and it reaches the branch below after the menu
+// is gone. The emitter has already replayed that release at the dismissal point
+// (AIR's order), so the queued copy is a duplicate: measured on this box, one
+// right-click that opened a menu produced two full rightMouseUp/rightClick pairs,
+// the second one after the selection events. Swallow it.
+static int g_popup_up_swallow = 0;
 
 static void sk_resync_right_button(SDL_Window *win) {
   if (!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_RMASK)) return;
@@ -1469,6 +1479,10 @@ static void sk_run_loop(void) {
           // Cocoa menu is tracking it owns the event stream, so the matching up/click
           // is consumed by AppKit (identical to AIR's modal behaviour).
           if (e.button.button == SDL_BUTTON_RIGHT && c->on_mouse) {
+            // A new press supersedes any swallow still pending from an earlier popup
+            // (the release can arrive after the menu closed when it was dismissed
+            // from the keyboard).
+            g_popup_up_swallow = 0;
             c->on_mouse(id, (double)e.button.x, (double)e.button.y, "rightMouseDown");
             c->dirty = 1;
             // That call may have popped up a context menu, which eats this press's
@@ -1497,6 +1511,13 @@ static void sk_run_loop(void) {
           // The left-button drag latch is cleared first: it is independent of what
           // the right button does, and the right-button branches below all break.
           if (e.button.button == SDL_BUTTON_LEFT) c->sys_drag = 0;
+          if (e.button.button == SDL_BUTTON_RIGHT && g_popup_up_swallow) {
+            // The release the Win32 modal pump queued while the menu was up: AS3
+            // already got the replayed pair at the dismissal point, so reporting
+            // this one would be a second rightMouseUp/rightClick for one click.
+            g_popup_up_swallow = 0;
+            break;
+          }
           if (e.button.button == SDL_BUTTON_RIGHT && g_synth_right_up) {
             // The release sk_resync_right_button manufactured: its only job was
             // resetting SDL's button mask (AS3 already got the rightMouseUp from the
@@ -3334,16 +3355,53 @@ int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_
 // needed. Command ids are 1-based positions inside the flattened array (separators
 // take positions of their own), and the AS3 tag is carried separately.
 //
-// NOT VERIFIED ON WINDOWS: this machine has no Windows target, so the code is
-// written against the documented Win32/SDL contracts and registered as unverified
-// in TODO.md. Two known gaps: keyEquivalent is neither displayed nor wired (that
-// needs an accelerator table), and submenus are not attached (NativeMenuItem.submenu
-// is ignored on Windows).
+// MEASURED ON WINDOWS (Windows 11 / 150% panel, temp/ctxwin, real mouse + keyboard
+// input driven by drive.ps1): the popup opens under the cursor, closes with a pick,
+// the emitted event order matches AIR's (rightMouseDown -> MENU_SELECT -> replayed
+// rightMouseUp/rightClick -> item SELECT -> menu SELECT -> MENU_ITEM_SELECT), a second
+// right-click pops again, and submenus open and select. Two things that bit and are
+// fixed: the coordinates used to be pushed through ScreenToClient (see below), and
+// the release the modal pump queues had to be swallowed (see g_popup_up_swallow).
+// Remaining Windows-only gap: keyEquivalent is neither displayed nor wired up, so a
+// menu item shows its label only (a Win32 menu needs a message filter to honour an
+// accelerator during TrackPopupMenu).
 static void sk_utf8_to_wide(const char* s, wchar_t* out, int cap) {
   if (cap <= 0) return;
   out[0] = 0;
   if (s == NULL) return;
   if (MultiByteToWideChar(CP_UTF8, 0, s, -1, out, cap) <= 0) out[0] = 0;
+}
+// One HMENU (and, recursively, its submenus) out of the flattened model -- the exact
+// counterpart of sk_menu_build on the Cocoa side, so a nested NativeMenu behaves the
+// same on both. Attaching submenus is not optional: a ContextMenu with a submenu used
+// to lose those items entirely and silently.
+// Command ids stay "flat index + 1" so the tag lookup below is unchanged. A submenu
+// parent gets an id from a separate high range: MF_POPUP's id is never returned as a
+// command, but keeping the two namespaces apart costs nothing.
+static HMENU sk_win_menu_build(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root) {
+  if (menus == NULL || root < 0 || root >= nmenus) return NULL;
+  HMENU menu = CreatePopupMenu();
+  if (menu == NULL) return NULL;
+  int first = menus[root].first;
+  for (int i = 0; i < menus[root].count; i++) {
+    int k = first + i;
+    if (k < 0 || k >= nitems) break;
+    if (items[k].kind == 1) { AppendMenuW(menu, MF_SEPARATOR, 0, NULL); continue; }
+    wchar_t wlabel[512];
+    sk_utf8_to_wide(items[k].label, wlabel, 512);
+    if (items[k].submenu >= 0) {
+      HMENU sub = sk_win_menu_build(menus, nmenus, items, nitems, items[k].submenu);
+      // MF_POPUP takes the SUBMENU HANDLE in uIDNewItem and the label in lpNewItem --
+      // not an id. Passing an id here silently turns the parent into a plain command
+      // (measured: the arrow beside it never opened anything and Right did nothing).
+      if (sub != NULL) { AppendMenuW(menu, MF_POPUP | MF_STRING, (UINT_PTR)sub, wlabel); continue; }
+    }
+    UINT flags = MF_STRING;
+    if (!items[k].enabled) flags |= MF_GRAYED;
+    if (items[k].checked) flags |= MF_CHECKED;
+    AppendMenuW(menu, flags, (UINT_PTR)(k + 1), wlabel);
+  }
+  return menu;
 }
 int sk_menu_popup(int win, const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, double x, double y, int* tag, double* outx, double* outy) {
   if (tag != NULL) *tag = 0;
@@ -3357,23 +3415,21 @@ int sk_menu_popup(int win, const sk_menu_t* menus, int nmenus, const sk_menu_ite
   if (!SDL_GetWindowWMInfo(c->win, &info)) return 0;
   HWND hwnd = info.info.win.window;
   if (hwnd == NULL) return 0;
-  HMENU menu = CreatePopupMenu();
+  HMENU menu = sk_win_menu_build(menus, nmenus, items, nitems, root);
   if (menu == NULL) return 0;
-  int first = menus[root].first;
-  for (int i = 0; i < menus[root].count; i++) {
-    int k = first + i;
-    if (k < 0 || k >= nitems) break;
-    if (items[k].kind == 1) { AppendMenuW(menu, MF_SEPARATOR, 0, NULL); continue; }
-    wchar_t wlabel[512];
-    sk_utf8_to_wide(items[k].label, wlabel, 512);
-    UINT flags = MF_STRING;
-    if (!items[k].enabled) flags |= MF_GRAYED;
-    if (items[k].checked) flags |= MF_CHECKED;
-    AppendMenuW(menu, flags, (UINT_PTR)(k + 1), wlabel);
-  }
+  // SCREEN coordinates, and NOT converted to the client area: TrackPopupMenu places
+  // the menu in the same space NativeWindow.globalToScreen reports, and this process
+  // is SYSTEM-DPI-aware (SDL sets that), so Win32's virtual pixel space and the
+  // model's DIP space are the same numbers -- no scale factor, and above all no
+  // ScreenToClient. Measured on this 150% box (temp/ctxwin): with the conversion the
+  // menu landed at the click's CLIENT point -- a click at physical (1480,1020) put
+  // the menu at (101,101) physical, i.e. exactly the window origin subtracted (the
+  // window sat at 1380,920). Without it the menu opens under the cursor, which is
+  // what AIR does.
   POINT pt;
   pt.x = (LONG)x; pt.y = (LONG)y;
-  ScreenToClient(hwnd, &pt);
+  // The modal pump below queues the real right release; see g_popup_up_swallow.
+  g_popup_up_swallow = 1;
   int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
   DestroyMenu(menu);
   if (tag != NULL && cmd > 0 && cmd - 1 < nitems) *tag = items[cmd - 1].tag;

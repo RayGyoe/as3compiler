@@ -36,7 +36,8 @@
 | `supportsDockIcon` / `supportsMenu` | ✅ | `true` only under `ASC_USE_WINDOW && __APPLE__` (§2) |
 | `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ always `false` (`supportsSystemTrayIcon` is `true` under `--features tray`) | matches what this backend actually implements by default (§2); the tray switch is in [`compile.md`](compile.md) §3.4.5 |
 | `NativeMenu` / `NativeMenuItem` | ✅ all members | list semantics, error codes and copy semantics match `adl` (§4, §5) |
-| `NativeMenu.display()` | ⚠️ reported | no modal native menu runner in this backend (§7.3) |
+| `NativeMenu.display()` / `ContextMenu.display()` | ✅ | modal on macOS (nested tracking loop) and on Windows (`TrackPopupMenu`), async on web (§7.3, §7.7, §7.8) |
+| `ContextMenu` / `ContextMenuItem` | ✅ right-click popup | object model matches `adl` item by item, including the three rules that are the **opposite** of the base class (§7.7) |
 | `keyEquivalentModifiers` | ✅ mapped | `15..20` measured one by one, then translated to `NSEventModifierFlags` (§7.2) |
 
 ---
@@ -303,8 +304,32 @@ item → `ContextMenuEvent.MENU_ITEM_SELECT` on the item). With `contextMenu = n
    own context menu is suppressed by a DOM `contextmenu` listener calling `preventDefault()` (emsdk 3.1.44 has
    **no** `emscripten_set_contextmenu_callback`). On the web **only the root menu** pops up; nested submenus
    are not implemented.
-2. **Windows**: the Win32 branch of `vendor/window_glue.cc` uses `TrackPopupMenuEx` + `GetCursorPos`, mirroring
-   Cocoa, but **there is no Windows machine here, so it is unverified** beyond "it compiles".
+2. **Windows**: the Win32 branch of `vendor/window_glue.cc` mirrors Cocoa (`TrackPopupMenu` blocks +
+   `GetCursorPos`) and is now **measured on a real box** (Windows 11 / 150% panel, `temp/ctxwin/`, driven with a
+   real mouse and keyboard): the menu opens under the pointer (click at `(1480,1020)` ⇒ window rect
+   `[1481,1020,1678,1175]`), one right-click produces **exactly one** `rightMouseUp`/`rightClick` pair, a second
+   right-click pops again, and picking an item — including one **after a separator** and one **inside a submenu** —
+   dispatches the same event order as macOS. Three Windows-only defects and one silent degradation were found and
+   fixed on the way (§7.8). Two things remain: `keyEquivalent` is neither displayed nor wired (Win32 needs a
+   message filter inside `TrackPopupMenu`'s modal loop to honour an accelerator), and the `NativeMenu`
+   **application menu bar** is not `SetMenu`'d yet (a stage of its own, unrelated to the right-click path).
+
+### 7.8 Windows popup: three measured defects and one silent degradation
+
+Reproduced and verified with real input on Windows 11 (150% panel); probe `temp/ctxwin/CtxWin.as`, driver
+`drive6.ps1`:
+
+| Defect | Symptom (before) | Cause | Fix |
+|---|---|---|---|
+| Menu opens in the wrong place | click `(1480,1020)`, menu appears at `(101,101)` | the `GetCursorPos` result was pushed through `ScreenToClient` before `TrackPopupMenu`, subtracting the window origin `(1380,920)`; `TrackPopupMenu` wants **screen** coordinates | drop the `ScreenToClient` |
+| Two event pairs per right-click | `rightMouseUp`/`rightClick` twice, the second pair **after** the selection events | AppKit's tracking loop **consumes** the release (which is why macOS needs `sk_resync_right_button` to manufacture one); Win32's modal pump instead **queues the real `WM_RBUTTONUP`** into SDL, where it is processed after the menu closes — while the emitter already replayed it at the dismissal point | `g_popup_up_swallow`: raised once `TrackPopupMenu` really ran, swallows the queued release in `SDL_MOUSEBUTTONUP` before the `g_synth_right_up` branch; a new right press clears it (a keyboard dismissal can let the release arrive after the menu is gone) |
+| Items after a separator do nothing | picking "Three" (after a `separatorBefore`) closes the menu and dispatches **nothing** | `as_ctxmenu_fill` used the **flat index** as the tag (`c->items[k].tag = c->nitems`) while `ASC_popup_tags` only holds real items ⇒ the tag ran past the end and resolved to NULL | the tag is now the `ASC_popup_tags` index (1-based); `as_menu_fill` was already self-consistent (`tag_base + k + 1`, every slot pushed) and is untouched |
+| Submenus vanish (**silent degradation**) | an item with a `submenu` has no arrow, Right does nothing, the children do not exist at all | the Win32 branch never built submenus; and `AppendMenuW`'s `MF_POPUP` was first given an **id** instead of the **submenu handle** (Windows silently treats that as a plain command item) | `sk_win_menu_build()` builds the `HMENU` recursively and passes the handle: `AppendMenuW(menu, MF_POPUP \| MF_STRING, (UINT_PTR)sub, label)` — the exact counterpart of `sk_menu_build` on the Cocoa side |
+
+Measured after the fix with the same driver: `menus=[1481,1020,1678,1175]` sits under the click point; `Right`
+opens a second `#32768` window at `[1668,1133,1890,1208]` (screenshot `temp/ctxwin/sub2.png`:
+`More ▸ Sub One / Sub Two`) and `Down`+`Enter` picks `Sub Two`; the log holds **one** `rightMouseUp`/`rightClick`
+pair, both before the selection events.
 
 **One internal dependency**: `sk_resync_right_button()` calls `SDL_SendMouseButton()` to clear the SDL mask
 that thinks the right button is still held down — without it the **second right-click delivers nothing** (the
@@ -319,6 +344,7 @@ swallowed by `g_synth_right_up`, so AS3 only ever sees the pair the emitter repl
 |---|---|
 | **`ContextMenu` object model, 26 lines** (byte-identical to `adl`) | `examples/context-menu.as` (AOT `--run`) × `temp/ctxprobe/api/ApiEx.as` (the same program, `adl` build): 26/26 lines agree; `test/unit/context-menu.ts` (`unit: context-menu/Model`, 25 pins) pins the single list, the three ContextMenu-only rules, the `#2007` message and the popup ordering |
 | **Right-click popup, 7 live steps** (macOS) | `temp/ctxmenu/drv.py`: `open`/`pick0`/`pick1`/`twice`/`esc`/`outside`/`nul` — the LR matches `adl` field by field (`rightMouseDown → MENU_SELECT → rightMouseUp → rightClick → the three selection events`), replay coordinates land at the dismissal point (item 148,111 / press 116,98 / outside 348,259); `temp/ctxmenu/{m5-inv,crop-inv}.png` show `visible=false` not rendered, `enabled=false` greyed, `separatorBefore` drawn |
+| **Right-click popup on Windows** | `temp/ctxwin/`: `CtxWin.as` + `drive6.ps1` (real `SetCursorPos`/`mouse_event`/`keybd_event`). Menu rect `[1481,1020,1678,1175]` under the click point `(1480,1020)`; `sub2.png` shows `More ▸ Sub One/Sub Two`; log `SELECT item(Sub Two)` plus the menu-level `SELECT`; one `rightMouseUp`/`rightClick` pair per click; `test/unit/context-menu.ts` (31 pins, 4 of them Win32) |
 | 69 model assertions (pure-C build, no window backend) | `examples/native-menu.as` → `native-menu: 69 checks passed` |
 | 39 source-level pins + 16 painting pins | `unit: emit/NativeMenu` and `unit: emit/DockIconImage` in `test/unit/emit.ts` |
 | **8 selection-rule runs** | `temp/dockprobe/`: `{32,96,256}→96`, `{16,512}→16`, `{129,127}→129`, `{128×400, 200×200}→200×200` … (§3.1) |

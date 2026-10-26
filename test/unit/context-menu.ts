@@ -78,7 +78,7 @@ function checkContextMenuModel(): string[] {
   check('glue: the release the menu swallowed is replayed by the emitter, so the SDL up it manufactures is swallowed',
     glue.includes('static int g_synth_right_up = 0;') &&
     /g_synth_right_up = 1;[\s\S]{0,300}?SDL_SendMouseButton/.test(glue) &&
-    /SDL_MOUSEBUTTONUP:[\s\S]{0,300}?g_synth_right_up\) \{[\s\S]{0,600}?break;/.test(glue));
+    /SDL_MOUSEBUTTONUP:[\s\S]{0,900}?g_synth_right_up\) \{[\s\S]{0,600}?break;/.test(glue));
   check('glue: the resync only fires when the OS says the button is up',
     /static void sk_resync_right_button[\s\S]{0,400}?SDL_GetGlobalMouseState\(NULL, NULL\) & SDL_BUTTON_RMASK\) return;/.test(glue));
   check('glue: right button maps to rightMouseDown / rightMouseUp + rightClick',
@@ -92,6 +92,40 @@ function checkContextMenuModel(): string[] {
     /extern int sk_menu_popup\(int win, const sk_menu\* menus, int nmenus, const sk_menu_item\* items, int nitems, int root, double x, double y, int\* tag, double\* outx, double\* outy\);/.test(runtime) &&
     runtime.includes('extern int sk_menu_popup_take(int* tag);'));
 
+  // --- Windows branch (阶段二百九十: measured on a real Windows box, temp/ctxwin).
+  // A popup tag is the 1-based index into ASC_popup_tags, never the flat item index:
+  // separators take flat slots but are not pushed, so the old formula resolved every
+  // item after a separator to a NULL entry and the pick dispatched nothing.
+  check('emit: the popup tag is the ASC_popup_tags index, not the flat item index',
+    c.includes('as_array_push(ASC_popup_tags, v); c->items[k].tag = ASC_popup_tags->length;') &&
+    !c.includes('c->items[k].tag = c->nitems;'));
+  const fillTag = c.indexOf('c->items[k].tag = c->tag_base + k + 1;');
+  check('emit: as_menu_fill tags every slot and pushes that same slot (self-consistent)',
+    fillTag > 0 && c.indexOf('as_array_push(ASC_menu_tags, v);', fillTag) > fillTag);
+  check('glue (win): TrackPopupMenu gets SCREEN coordinates, not client ones',
+    !glue.includes('ScreenToClient(hwnd, &pt);') &&
+    glue.includes('int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);'));
+  // The release Win32's modal pump queues arrives after the menu is gone, on top of
+  // the pair the emitter replayed at the dismissal point: one right-click produced
+  // TWO rightMouseUp/rightClick pairs before this. The flag is raised just before
+  // TrackPopupMenu and cleared either by that queued release or by a new press.
+  const swUp = glue.indexOf('g_popup_up_swallow) {');
+  check('glue (win): the queued popup release is swallowed in MOUSEBUTTONUP',
+    glue.includes('static int g_popup_up_swallow = 0;') &&
+    glue.indexOf('g_popup_up_swallow = 1;') > 0 &&
+    glue.indexOf('g_popup_up_swallow = 1;') < glue.indexOf('int cmd = (int)TrackPopupMenu(') &&
+    swUp > 0 &&
+    glue.indexOf('g_popup_up_swallow = 0;', swUp) > swUp &&
+    glue.indexOf('break;', swUp) > glue.indexOf('g_popup_up_swallow = 0;', swUp));
+  const bdown = glue.indexOf('case SDL_MOUSEBUTTONDOWN:');
+  const rdown = glue.indexOf('"rightMouseDown"');
+  check('glue (win): a new right press clears a pending swallow before dispatching rightMouseDown',
+    bdown > 0 && rdown > bdown &&
+    glue.indexOf('g_popup_up_swallow = 0;', bdown) > bdown &&
+    glue.indexOf('g_popup_up_swallow = 0;', bdown) < rdown);
+  check('glue (win): submenus are attached with the SUBMENU HANDLE (MF_POPUP)',
+    glue.includes('AppendMenuW(menu, MF_POPUP | MF_STRING, (UINT_PTR)sub, wlabel)') &&
+    glue.includes('static HMENU sk_win_menu_build('));
   // --- the example stays behaviourally meaningful (it is the diffed contract).
   check('example: pins the measured quirks (name lookup, setItemIndex, duplicate add)',
     src.includes('getItemByName(alphaItem)="') && src.includes('setIndex threw') && src.includes('afterDupAdd='));

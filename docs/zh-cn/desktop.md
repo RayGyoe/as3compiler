@@ -37,7 +37,7 @@
 | `supportsDockIcon` / `supportsMenu` | ✅ | 只在 `ASC_USE_WINDOW && __APPLE__` 报 `true`（§2） |
 | `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ 恒 `false`（`supportsSystemTrayIcon` 在 `--features tray` 下为 `true`） | 默认与本后端实际能力一致（§2）；托盘开关见 [`compile.md`](compile.md) §3.4.5 |
 | `NativeMenu` / `NativeMenuItem` | ✅ 全成员 | 列表语义、错误号、拷贝语义逐项对 `adl`（§4、§5） |
-| `NativeMenu.display()` / `ContextMenu.display()` | ✅ 实现（macOS 真模态；web 异步） | Cocoa 侧跑嵌套 tracking loop，阻塞到选中/取消；web 见 §7.7 |
+| `NativeMenu.display()` / `ContextMenu.display()` | ✅ 实现（macOS / Windows 真模态；web 异步） | Cocoa 走嵌套 tracking loop、Win32 走 `TrackPopupMenu`，都阻塞到选中/取消；三端差异与 Windows 实测见 §7.7、§7.8 |
 | `ContextMenu` / `ContextMenuItem` | ✅ 实现（右键弹窗） | 对象模型逐条对 `adl`，含三条**与基类相反**的独有规则（§8） |
 | `keyEquivalentModifiers` | ✅ 已映射 | `15..20` 逐值实测后译成 `NSEventModifierFlags`（§7.2） |
 
@@ -282,8 +282,28 @@ Windows 侧将来接 `HWND` 菜单栏是**独立阶段**的事；wasm 没有原�
    ⇒ `MENU_SELECT` 与选中事件**跨帧**，且**没有** release 回放（那是模态的产物）。浏览器原生右键菜单用
    DOM `contextmenu` 监听器 `preventDefault()` 抑制（emsdk 3.1.44 **没有** `emscripten_set_contextmenu_callback`）。
    web 上**只弹根菜单**，嵌套子菜单未实现。
-2. **Windows**：`vendor/window_glue.cc` 的 Win32 分支用 `TrackPopupMenuEx` + `GetCursorPos`，与 Cocoa 同构；
-   **本机无 Windows，未真机验证**，只到「能编译」的把握。
+2. **Windows**：`vendor/window_glue.cc` 的 Win32 分支与 Cocoa 同构（`TrackPopupMenu` 同步阻塞 + `GetCursorPos`），
+   **已真机实测**（Windows 11 / 150% 面板，`temp/ctxwin/`，真鼠标 + 真键盘驱动）：菜单开在指针处
+   （点 `(1480,1020)` ⇒ 窗口矩形 `[1481,1020,1678,1175]`）、一次右键**只**出一对 `rightMouseUp`/`rightClick`、
+   连按两次第二次照弹、选中项（含**分隔线之后**的项与**子菜单**里的项）的事件顺序与 mac 逐项一致。
+   实测查出并修掉三处 Windows 专有缺陷 + 一处静默降级，见 §7.8。
+   仍缺两项：`keyEquivalent` 既不上屏也不生效（Win32 要在 `TrackPopupMenu` 的模态循环里挂消息过滤器才能吃加速键）；
+   `NativeMenu` 的**应用菜单栏**仍未 `SetMenu`（独立阶段，不是右键通路）。
+
+### 7.8 Windows 弹窗：三处实测缺陷 + 一处静默降级
+
+全部在 Windows 11（150% 面板）上用真输入复现并验证修复，探针 `temp/ctxwin/CtxWin.as` + 驱动 `drive6.ps1`：
+
+| 缺陷 | 现象（修前） | 根因 | 修法 |
+|---|---|---|---|
+| 菜单开错地方 | 点 `(1480,1020)`，菜单出现在 `(101,101)` | 弹窗前对 `GetCursorPos` 的结果做了 `ScreenToClient`，把窗口原点 `(1380,920)` 减掉了；`TrackPopupMenu` 要的是**屏幕**坐标 | 删掉 `ScreenToClient` |
+| 一次右键两对事件 | `rightMouseUp`/`rightClick` 各出现两次，第二对在选中事件**之后** | AppKit 的 tracking loop 会**吃掉** release（mac 才需要 `sk_resync_right_button` 自己造一个）；Win32 的模态泵把真 `WM_RBUTTONUP` **投进 SDL 队列**，菜单关闭后才被处理，而发射器已在消失点回放过一次 | `g_popup_up_swallow`：真跑过 `TrackPopupMenu` 就置位，`SDL_MOUSEBUTTONUP` 的右键分支先于 `g_synth_right_up` 吞掉；新的右键按下清位（键盘取消时 release 可能在菜单关闭后才到） |
+| 分隔线之后的项点了没反应 | 选 "Three"（`separatorBefore` 之后）菜单关掉但**什么都不派发** | `as_ctxmenu_fill` 用**扁平下标**当 tag（`c->items[k].tag = c->nitems`），而 `ASC_popup_tags` 只 push 真条目 ⇒ tag 越过表尾，取回 NULL | tag 改为 `ASC_popup_tags->length`（1 基）；`as_menu_fill` 本来就自洽（`tag_base + k + 1` 且每个槽都 push），不动 |
+| 子菜单整棵丢失（**静默降级**） | 带 `submenu` 的项没有箭头，右方向键无反应，子条目根本不存在 | Win32 分支根本没建子菜单；且 `AppendMenuW` 的 `MF_POPUP` 我最初传的是 **id** 而不是**子菜单句柄**（Windows 静默当成普通命令项） | `sk_win_menu_build()` 递归建 `HMENU`，`AppendMenuW(menu, MF_POPUP \| MF_STRING, (UINT_PTR)sub, label)` —— 与 Cocoa 侧 `sk_menu_build` 一一对应 |
+
+修后实测（同一驱动脚本）：`menus=[1481,1020,1678,1175]` 落在点击点下方；`Right` 展开出第二个
+`#32768` 窗口 `[1668,1133,1890,1208]`（截图 `temp/ctxwin/sub2.png`：`More ▸ Sub One / Sub Two`），
+`Down`+`Enter` 选中 `Sub Two`；日志里只有**一对** `rightMouseUp`/`rightClick`，且都在选中事件之前。
 
 **一处内部依赖**：`sk_resync_right_button()` 调 `SDL_SendMouseButton()` 清掉 SDL 以为「右键还按着」的掩码——
 不这么做**第二次右键不派发任何事件**（弹窗吃掉了真 release，SDL 的掩码永远停在按下）。该符号是 SDL 的**内部**
@@ -297,6 +317,7 @@ API（公开头文件没有），升级 SDL 时需复核；它造出来的 `SDL_
 |---|---|
 | **`ContextMenu` 对象模型 26 行**（与 `adl` 逐字节相同） | `examples/context-menu.as`（AOT `--run`）× `temp/ctxprobe/api/ApiEx.as`（同一段程序的 `adl` 版）：26/26 行一致；配套 `test/unit/context-menu.ts` 的 `unit: context-menu/Model`（25 钉）钉住一份列表、三条独有规则、`#2007` 文案与弹窗顺序 |
 | **右键弹窗 7 步真机**（macOS） | `temp/ctxmenu/drv.py` 的 `open`/`pick0`/`pick1`/`twice`/`esc`/`outside`/`nul`：LR 与 `adl` 逐字段相同（`rightMouseDown → MENU_SELECT → rightMouseUp → rightClick → 三个选中事件`），回放坐标 = 消失点（项上 148,111 / 按下点 116,98 / 窗外点 348,259）；截图 `temp/ctxmenu/{m5-inv,crop-inv}.png` 证明 `visible=false` 不渲染、`enabled=false` 灰色、`separatorBefore` 画线 |
+| **右键弹窗 Windows 真机** | `temp/ctxwin/`：`CtxWin.as` + `drive6.ps1`（真 `SetCursorPos`/`mouse_event`/`keybd_event`）。菜单矩形 `[1481,1020,1678,1175]` 挂在点击点 `(1480,1020)`；`sub2.png` 证明 `More ▸ Sub One/Sub Two` 展开；日志 `SELECT item(Sub Two)` + 菜单级 `SELECT`；一次右键只有一对 `rightMouseUp`/`rightClick`；`test/unit/context-menu.ts` 31 钉含 4 条 Win32 钉（无 `ScreenToClient`、吞队列 release、`MF_POPUP` 传句柄、tag 取 `ASC_popup_tags` 下标） |
 | 模型层 69 条断言（纯 C 构建，无窗口后端） | `examples/native-menu.as` → `native-menu: 69 checks passed` |
 | 生成 C 的 39 条源级钉 + 上屏 16 条 | `test/unit/emit.ts` 的 `unit: emit/NativeMenu` 与 `unit: emit/DockIconImage` |
 | **选图规则 8 轮** | `temp/dockprobe/`：`{32,96,256}→96`、`{16,512}→16`、`{129,127}→129`、`{128×400, 200×200}→200×200` …（§3.1 表） |
