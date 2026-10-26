@@ -16896,6 +16896,47 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
    仍是全局隐患；触发点未定，已在「遗留待开发」登记（需 `-DASC_NULL_TRACE` 诊断构建才能指名）。
 3. `ToolTips` 的 `relistener` 在 `REMOVED_FROM_STAGE` 里做 `stage.removeEventListener(...)`，
    而那一刻 `stage` 已为 null —— AIR 里同样会抛 `#1009`，属**应用侧写法**，不改。
+   > **更正（阶段二百九十五，实测推翻）**：`adl 51.4.1` 在 `REMOVED_FROM_STAGE` 派发时子件**仍挂在旧父上**
+   > （`parent` 非 null、旧父 `numChildren` 仍计、`stage` 可达），`removeEventListener` 是能成功的。
+   > 是我们**先摘除再派发**，才让 `stage` 落到主窗兜底、监听器残留在设置窗 Stage 上 —— 这是编译器缺陷，不是应用写法问题。
+
+### 阶段二百九十五：`REMOVED_FROM_STAGE` 的派发时机 —— tips 只出第一个的真根因（v0.4.257 → v0.4.258）✅ 已完成
+
+**一、起因**（用户续报）：阶段二百九十四 把 `DisplayObject.parent` 补成访问器之后，设置窗三个 **i** 图标的 tips **仍然只出第一个**（第二个、第三个 hover 时什么都不显示）。
+
+**二、真根因：`REMOVED_FROM_STAGE` 派发得太晚**（A/B 探针 `temp/dispabort/`：同一份源码分别跑 `adl 51.4.1` 与 AOT）
+
+| 在 `REMOVED_FROM_STAGE` 处理函数里观测 | `adl 51.4.1` | 修前 AOT | 修后 AOT |
+|---|---|---|---|
+| `child.parent == null` | false | **true** | false |
+| 旧父 `numChildren`（应仍含该子件） | 1 | **0** | 1 |
+| 旧父 `contains(child)` / `getChildIndex(child)` | true / 0 | false / 抛 | true / 0 |
+| 派发与摘除的先后 | `removed` → `removedFromStage` → 再摘除 | `removed` → **先摘除** → `removedFromStage` | 与 `adl` 同 |
+
+**三、它怎么变成「只出一个」**（应用侧临时加日志后重编，日志在 `temp/tipsetup/app-tip.log`）
+1. `cn.edoctor.controls.ToolTips.MyTip.relistener` 是 `Event.REMOVED_FROM_STAGE` 的处理函数，里面调 `stage.removeEventListener(MouseEvent.MOUSE_MOVE, onMouseMove)`。`adl` 里此时 `stage` 仍可达 ⇒ 移除成功。
+2. 修前的 AOT 里该节点**已经被摘下来了**，`stage` 只能落到 `DisplayObject_get_stage` 的 `ASC_root_stage` 兜底 —— 那是**主窗**的 Stage。于是这次 `removeEventListener` 挂到了**错的窗口**，设置窗 Stage 上的监听器留了下来。
+3. 此后每一条 `mouseMove` 都会调用那个已摘除 tip 的 `onMouseMove`；它读 `this.parent.mouseX`，`parent` 已是 null ⇒ `TypeError #1009`。
+4. 未捕获异常会**中断该次派发的剩余监听器**（同一次 A/B 里量到：抛错监听器之后的那个 `secondRan=0`）⇒ 排在后面的**第二个 tip 的 `onMouseMove` 永远不执行** ⇒ 只有第一个 tip 会被摆位并 `visible = true`。
+5. 三个 tip 的**创建、上 stage、监听挂载都正常**（`create done idx=0/1/2`、`addedToStage idx=*`、三次 `stage + MyTip (n=2)` 都在），缺的只是「第二个以后的摆位」。
+
+**四、上一阶段为什么没修好**
+阶段二百九十四 只修了「`parent.mouseX` 的静态类型丢失」（那是个真实且独立的缺陷），但把 `relistener` 里 `stage` 为 null 判成「AIR 里同样会抛 `#1009`，属应用侧写法，不改」—— **这条实测结论是错的**：`adl` 在那一刻 `parent` 与 `stage` 都还非 null，`removeEventListener` 是能做到的。另外 `#1009` 被 `as_uncaught_flush` 节流成「每秒至多一行」，看起来像背景噪声，掩盖了「它是派发中断源」这一事实。
+
+**五、改动**
+- `src/emit.ts`：`DisplayObjectContainer_removeChild` 把 `removedFromStage` 的子树遍历从「摘除之后」移到「`removed` 派发之后、摘除之前」，逐字对齐 AIR 实测（处理函数里 parent / numChildren / index / stage 全部可用）。
+- `examples/displaylist-events.as`：新增断言 —— 在 `removedFromStage` 里读 `kid.parent`、`box.numChildren`、`kid.stage`，必须得到 `parentNull=0 num=1 stageNull=0`。
+- `test/unit/display.ts`：`unit: display/ListEvents` 增加第 7 条**顺序钉**（`removed` 的发射行 → `removedFromStage` 的发射行 → `child->parent = NULL` 的发射行，索引必须严格递增）。
+
+**六、实测证据**
+- A/B：`temp/dispabort/probe-air-a.txt`（`adl`）与 `probe-aot-a.txt`（修后 AOT）**逐字相同**；修前为 `parentNull=true boxNum=0 boxContains=false idx=0(仍返回值)`。
+- 真机：`ASC_MOUSE_TRACE=2`，设置窗里 hover 三个 i 再空白扫动，共 **71 次鼠标移动 → 未捕获异常 0 条 / `#1009` 0 次**（修前同一窗口 231 次移动 / 97 次 `#1009`，见 `temp/tipsetup/trace3.txt` 与 `trace5.txt`）。
+- 视觉：i#1、i#2、i#3 的 tip 都能上屏（`temp/tipsetup/P2.png` 里「开启双路视频上行(高清+标清)，提供给其它端智能选择」；`V1.png` / `V3t.png` 同）。
+- 回归：`node test.ts` 523 例 / 517 过 / 4 红，与基线**完全一致**（`socket`、`stage94d`、`status-item`、`inline StackCanary`）。
+- 附注：i#3 的 tip 恰好落在指针附近，测试脚本的 ±2 px 抖动会让指针进出 tip 从而 show/hide 交替（`plus 7 / minus 7`）；指针静止时稳定（`Moves=1` 后 2 秒内没有 `stage -`）。这是应用几何，`adl` 同构，不是编译器缺陷。
+
+**七、顺带清掉一行遗留**
+`### 遗留待开发` 里「每条鼠标通知抛一次 `#1009`」（阶段二百九十四 登记）就是本缺陷的第 3 步，随本次修复一起消失 ⇒ 该行改判「已完成」。
 
 ### 遗留待开发
 > **2026-10-27 追加（阶段二百九十四：`DisplayObject.parent` 的静态类型）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **95 → 96 项**（`未开始` **74 → 75** / `部分完成` 20 / `调研完成·实现暂缓` 1）。**本阶段修的 tips 缺陷不占表**：`adl` 跑得对（tip 正常显示）、我们此前跑不出 ⇒ 属 §1.5 的**遗留缺陷**，但阶段内已修净，按表头自述「已完成项一经落地即从本表移出」故不入表。新登记的 1 行是**顺带量到的全局隐患**：真机每条鼠标通知抛一次 `#1009`，触发点未定。
@@ -17062,7 +17103,7 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 >
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
-| **每条鼠标通知抛一次 `#1009`**（真机 talkmed-meeting 设置窗实测：空区 20 次移动 → 未捕获异常计数 +20，与是否有 tooltip 无关） | 未开始（2026-10-27 阶段二百九十四 追 tooltip 缺陷时量到；触发点**未定位**，需 `-DASC_NULL_TRACE` 诊断构建把 `as_req_obj` 的**生成 C 行号**打出来） | 在我们的（与 `adl` 对齐的）派发语义下，未捕获异常会**中断该次派发的剩余监听器** ⇒ 排在后面的监听器全都不执行；应用在 `adl` 上跑得对，故这条大概率是**我们的**空接收者守卫多报。证据：`temp/tipsetup/tips-trace2.txt`（`… #1009 (19 more of the same)` 与每次 `t=… mouse mouseMove` 一一对应） | 待定 |
+| **每条鼠标通知抛一次 `#1009`**（真机 talkmed-meeting 设置窗实测：空区 20 次移动 → 未捕获异常计数 +20，与是否有 tooltip 无关） | 已完成（2026-10-27 阶段二百九十五：根因是 `removedFromStage` 派发得太晚 —— tip 被摘除后监听器残留在设置窗 Stage 上，见该阶段节） | 在我们的（与 `adl` 对齐的）派发语义下，未捕获异常会**中断该次派发的剩余监听器** ⇒ 排在后面的监听器全都不执行；应用在 `adl` 上跑得对，故这条大概率是**我们的**空接收者守卫多报。证据：`temp/tipsetup/tips-trace2.txt`（`… #1009 (19 more of the same)` 与每次 `t=… mouse mouseMove` 一一对应） | 待定 |
 | **`ExtensionContext` 还有 4 个 AIR 50 成员未建模**（`functions` / `knownExtensions` / `getExtensionInfo` / `loadExtension`） | 未开始（2026-10-17 阶段一百七十八·二 逐项查 AIR 参考时登记） | 已落地的 A 面是 `createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` / `actionScriptData` + `StatusEvent`（与 `ANEWinCore` 的真实用量完全覆盖）。**`loadExtension` 不是小修**：它是**延迟加载**——扩展在**首次 `call` 时**才 `LoadLibrary` + initializer，要把 C 面的加载时机从「构造 `ExtensionContext` 时」移到「首次调用时」并缓存；`functions`/`knownExtensions`/`getExtensionInfo` 是只读反射面。（另：`extensionID` **已删** —— AIR 没有这个属性，`mxmlc` 拒绝 + `adl` 报 `#1069`，已按 AIR 对齐，不入本表） | 先补 `adl` 实测采集这四个成员的真实形态（`functions` 是 `Object` 还是数组、未知 id 时是 `null` 还是空表），再按实测落地；`loadExtension` 独立立项（它要动 C 面时序） |
 | **iOS 上的 ANE 没有（也不会有同样形态的）宿主库** —— FRE 宿主运行时 `asaot` 已出 Windows 两个位宽与 **macOS**（`lib/bin/macos-x86-64/libasaot.dylib`，通用二进制，阶段二百零七）；`ios-arm64/` 仍不存在 | **部分完成**（macOS 端 2026-10-20 阶段二百零七 落地并实测；iOS 端未开始） | macOS 端**已完成**：`lib/build-asaot.sh` 出通用 dylib、`src/fre.ts` 有 POSIX 分支（`dlopen`/`dlsym`/`_NSGetExecutablePath`/递归锁/pthread）、`lib/asaot.h` 的 POSIX 侧补齐 `ASAOT_HOST` 三态、`examples/ane`+`ane-app` 在 macOS 上真跑（46 条断言）、宿主库名收成 `aneHostLibName()` 一处。**iOS 不是把同一件事重做一遍**：iOS 把扩展**静态链进应用镜像**，没有 `dlopen` 这一步，`asaot` 会是一份静态库、initializer 由**直接符号引用**到达 ⇒ 落地起点是定「**谁调用 initializer**」（应用侧还是运行时侧的启动钩子），而不是重编一遍宿主库。当前行为仍是**响亮抛错并说明原因**（`aneHostLibName()` 对 `iPhone-ARM` 抛），不静默降级。 | iOS 端：先定 initializer 的调用方，再出 `lib/bin/ios-arm64/` 的静态库形态
 | `extends <内建类型>`（含 **`extends Array`**）不支持 —— 闭包内 **2 个文件**用它（`src/com/hurlant/util/der/Sequence.as`、`src/com/fiCharts/utils/graphic/StyleManager.as`），AIR 合法 | **部分完成**（2026-10-08 阶段一百一十八 重评估闭包时实测登记；**2026-10-11 阶段一百三十六**：`extends Array` 已落地——`ClassInfo.arrayBacked` + 隐藏 `as_array* _arr` 槽承担全部 Array 操作，C 侧超类记 `Object` 保指针布局兼容，`arrayBacked` 沿超链传递；**`String`/`Number`/`int`/`XML`/`Function` 等内建仍响亮报错**） | `resolveType('Array')` 给 `{kind:'array'}`、**无 `className`** ⇒ 旧码盲取 `.className` 报一字面的 `unknown superclass 'undefined' of 'Sequence'`（离原因很远）。现按 kind 分派：接口 ⇒ `cannot extend interface 'I'`；其余非类 ⇒ `unsupported superclass 'Array' of 'E': subclassing built-in types is not implemented`（带行列号）。**AIR 接受 `extends Array`**（mxmlc 51.4.1 实测），故这是**遗留缺陷**而非增强：子类数组需真实运行期支持（元素存储 / `length` / 全部 Array 方法在子类上的行为、`Vector` 与 `Array` 的元数据、`is Array` 沿链判定） | 立项前先量清面上：用 `adl` 实测「子类数组」的全部可观测差异（`a.length`、索引、`push` 等方法返回的是子类还是 `Array`、`getQualifiedClassName`、`is Array`/`is E`），再决定是「真做子类存储」还是「仅报精确错误 + 建议改写」。**先实测再动**（不得凭直觉定语义） |

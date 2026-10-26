@@ -72,6 +72,25 @@ check("nested removeChild", "grand:removed b=1 p=2 grand:removed b=1 p=3 grand:r
 reset(); box.removeChild(kid);
 check("removeChild", "kid:removed b=1 p=2 kid:removed b=1 p=3 kid:removedFromStage b=0 p=2 ");
 
+// REMOVED_FROM_STAGE fires while the child is STILL attached (adl 51.4.1,
+// temp/dispabort): the handler still sees parent != null, the old parent still
+// counts the child, and stage is reachable through it. The TalkMED tooltip
+// relistener calls stage.removeEventListener from this very event; detaching
+// first pointed that call at the other window Stage, so the handler stayed
+// behind, threw #1009 on every mouseMove and aborted the dispatch before the
+// next tooltip handler could run -- only the first of three tooltips showed.
+var attached:String = "";
+kid.addEventListener("removedFromStage", function(e:Event):void {
+  attached = "parentNull=" + (kid.parent == null ? 1 : 0)
+    + " num=" + box.numChildren
+    + " stageNull=" + (kid.stage == null ? 1 : 0);
+});
+box.addChild(kid);
+reset(); attached = "";
+box.removeChild(kid);
+if (attached != "parentNull=0 num=1 stageNull=0") throw new Error("FAIL removedFromStage-attached\n  got [" + attached + "]");
+trace("removedFromStage sees the child attached ok");
+
 box.addChild(kid); kid.addChild(grand); reset(); box.removeChildAt(0);
 check("removeChildAt", "kid:removed b=1 p=2 kid:removed b=1 p=3 kid:removedFromStage b=0 p=2 grand:removedFromStage b=0 p=2 ");
 

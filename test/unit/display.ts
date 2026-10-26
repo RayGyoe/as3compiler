@@ -726,6 +726,20 @@ function checkListEvents(): string[] {
     emitted.includes('if (child->parent == (Object*)_this) child->parent = NULL;') &&
     emitted.includes('return DisplayObjectContainer_removeChild(_this, (DisplayObject*)as_v_obj_val(c->children->data[index]));'));
 
+  // Order matters, not just presence: AIR walks REMOVED_FROM_STAGE while the
+  // child is still in the old parent, so the handler can read parent,
+  // numChildren, index and stage -- measured in temp/dispabort. Detaching first
+  // sent a tooltip relistener to the wrong Stage, which left the handler alive
+  // to throw #1009 on every mouseMove and abort the dispatch before the next
+  // tooltip handler ran.
+  {
+    const iRemoved = emitted.indexOf('EventDispatcher_dispatchEvent(child, Event_new((char*)"removed", true, false));');
+    const iStage = emitted.indexOf('as_disp_stage_walk(child, (char*)"removedFromStage");');
+    const iDetach = emitted.indexOf('if (child->parent == (Object*)_this) child->parent = NULL;');
+    check('REMOVED_FROM_STAGE is dispatched while the child is still attached',
+      iRemoved > 0 && iStage > iRemoved && iDetach > iStage);
+  }
+
   check('addChild implicitly re-parents through the old parent first',
     (emitted.match(/if \(child->parent != NULL\) DisplayObjectContainer_removeChild\(\(void\*\)child->parent, child\);/g) ?? []).length === 2);
 

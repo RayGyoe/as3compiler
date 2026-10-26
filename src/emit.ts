@@ -11977,6 +11977,16 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // the event bubbles up to the parent. Detaching first would cut the parent out
     // of the bubble path.
     this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"removed", true, false));');
+    // AIR fires REMOVED_FROM_STAGE while the child is STILL attached: measured on
+    // adl 51.4.1 (temp/dispabort), the handler sees parent != NULL, the old parent
+    // still counts it (numChildren=1, contains=true, index 0) and stage != NULL.
+    // MyTip.relistener relies on exactly that -- it calls
+    // stage.removeEventListener from REMOVED_FROM_STAGE. Detaching first made the
+    // node fall back to the main window's Stage, so the listener stayed on the
+    // settings window's Stage, threw #1009 on every mouseMove and aborted the
+    // dispatch before the next tooltip's handler could run (only the first tip
+    // ever showed).
+    this.line('if (was_on_stage) as_disp_stage_walk(child, (char*)"removedFromStage");');
     // A "removed" handler may itself re-parent the child (the vsdevelop
     // ViewControl disposes the view from this very event), so re-find it instead of
     // trusting idx, and only clear the back-pointer while it is still ours.
@@ -11992,7 +12002,6 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // G25 contract 1: a hovered subtree that leaves the list still gets its
     // mouseOut/rollOut, on the next beat, on the detached node.
     this.line('as_hover_on_remove((void*)_this, child);');
-    this.line('if (was_on_stage) as_disp_stage_walk(child, (char*)"removedFromStage");');
     this.line('if (getenv("ASC_MOUSE_TRACE") != NULL && as_cls_is_stage((void*)_this)) fprintf(stderr, "    stage - %s (n=%d)\\n", as_cls_of((void*)child), c->children->length);');
     this.line('return child;');
     this.indent--;
