@@ -124,6 +124,9 @@ as-aot app.as --manifest examples/skia-link.build.example.json
 # （实测 19.43 MB → 6.53 MB，阶段二百二十一；构建时打印 + / - 判定）
 # 链接期固定带 -Wl,-dead_strip -Wl,-x（--debug-info 保留符号），ICU 数据只取 0.80 MB 那份：
 # 不画字 3.55 MB / 画字 6.05 MB（阶段二百二十二）
+# 链接了 metal_glue.mm 的构建再多一枚 -Wl,-exported_symbol,_sk_mtl_shared_queue（阶段二百八十八）：
+# Stage3D 要靠 dlsym 按名字采纳 Skia 那条 MTLCommandQueue，不导出就会静默回落到两条队列，
+# 合成读到半成品 ⇒ 画面闪烁（+8 KB）
 as-aot notxt.as --manifest examples/draw-over.build.json
 
 # 加载 AIR 原生扩展（ANE，阶段一百七十八）：宿主 FRE 运行时接进来，

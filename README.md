@@ -124,7 +124,10 @@ as-aot app.as --manifest examples/skia-link.build.example.json
 # The text layout stack is linked only when the program uses flash.text; a program that draws no text
 # automatically drops the whole SkParagraph/HarfBuzz/ICU chain (measured 19.43 MB -> 6.53 MB, stage 221;
 # the build prints the + / - verdict). Links also carry -Wl,-dead_strip -Wl,-x (symbols kept under
-# --debug-info), and ICU data is the 0.80 MB set: 3.55 MB text-free / 6.05 MB with text (stage 222)
+# --debug-info), and ICU data is the 0.80 MB set: 3.55 MB text-free / 6.05 MB with text (stage 222).
+# A build that links metal_glue.mm also gets -Wl,-exported_symbol,_sk_mtl_shared_queue (stage 288):
+# Stage3D adopts Skia's MTLCommandQueue by name via dlsym, and without the export it silently falls
+# back to two queues, so the composite reads a half-written pass and the picture flickers (+8 KB)
 as-aot notxt.as --manifest examples/draw-over.build.json
 
 # Load AIR native extensions (ANE, stage one-hundred-seventy-eight): the host FRE runtime is wired in,
