@@ -16424,6 +16424,17 @@ Windows 那次「resize 时画面抖动」的修复（阶段一百三十三：`C
 | `unit: platform/TransparentPointer` | **5 条全绿**（新增：`hitTest:` 返回 nil / 两个覆盖视图都走惰性子类 / 只在工厂失败时回落且必须报明 / 环境变量只读一次） |
 | Prune 面板真机点击 | 修前 0 次到达 AS3；修后勾选框、行、chevron、按钮全部可点（`prune/shots/design/` 的 51/60/71 序列） |
 | `temp/transjitter` A/B | 15/151 → 0/155（重力部分） |
+| 全量 `node test.ts` | **516 passed / 0 failed**（含顺带修好的 `unit: inline/StackCanary`，见下） |
+
+**八·补：顺带修好的一处测试框架缺陷（不是产品代码）**
+
+跑全量时 `unit: inline/StackCanary` 的两条**前向**断言红了。根因不在运行时：`test/unit/inline.ts` 的
+`functionBody()` 靠 `^名:$` 找函数边界，而本机 clang 把符号名写成**行尾注释**
+（`_as_v_req_inst:                         ; @as_v_req_inst`），于是「函数名」一个都匹配不上，
+切片一路吃到几千行之后的跳转表标签 `lJTI18_0:` —— 前向断言（as_v_req_inst 里不该有 canary）
+被别的函数带进来的 canary 判红，而**反向**断言（退回自动数组后 canary 该回来）则变成**永远为真**的空断言。
+修法：边界正则允许行尾注释，并把汇编器自己的 `l` 前缀局部符号（`lJTI*`、`l_*.str`）与 `.L*`/`L*` 一起排除。
+修后前向两条转绿，反向两条仍然是真断言（对退化的 C 重新编译确实能把 canary 带回来）。
 
 **九、如实报明**
 

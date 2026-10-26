@@ -91,7 +91,15 @@ function functionBody(asm: string, symbol: string): string | null {
   const header = new RegExp(`^_?${symbol}:`);
   const start = lines.findIndex((l) => header.test(l));
   if (start < 0) return null;
-  const fnLabel = /^(?!\.?L)[_A-Za-z][A-Za-z0-9_]*:$/;
+  // BOUNDARY. A clang on this box prints the symbol name as a trailing comment on
+  // the same line (`_as_v_req_inst:                         ; @as_v_req_inst`), so a
+  // bare `name:$` test matches NO function at all and the slice below ran on to the
+  // first bare label it could find -- `lJTI18_0:`, a jump table THOUSANDS of lines
+  // later. That made the forward assertion (no canary) fail on a correct build and,
+  // worse, made the REVERSE assertion pass vacuously (any 7000-line slice contains
+  // some function's canary). Hence: allow the trailing comment, and exclude the
+  // assembler's own `l`-prefixed locals (`lJTI*`, `l_*.str`) alongside `.L*`/`L*`.
+  const fnLabel = /^(?!\.?[Ll](?:JTI|_)?)(?:_|[A-Za-z])[A-Za-z0-9_$.]*:\s*(?:;.*)?$/;
   let end = lines.length;
   for (let j = start + 1; j < lines.length; j++) { if (fnLabel.test(lines[j])) { end = j; break; } }
   return lines.slice(start, end).join('\n');
