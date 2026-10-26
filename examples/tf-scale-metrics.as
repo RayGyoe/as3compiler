@@ -96,6 +96,22 @@ function inkOfChain(sx:Number, sy:Number):Number {
   return inkWidth(bd, 1200, 120);
 }
 
+// 同一判据必须也在 cacheAsBitmap 烘焙路径下成立（阶段二百九十一），而且**缩放要挂在字段
+// 自己身上**：bake 发布的是「容器」的落点 CTM，里面**不含**字段自身的 scaleX（TalkMED 登录页
+// 两个页签正是 SWC placement 给文本子件 scaleX 0.9594、父皮肤被烘焙）。曾经的归一化除数取
+// 那个落点 CTM ⇒ 比值恒 1 ⇒ 字形被自己的 scaleX 拉宽/压窄，live 与 bake 差 4%，每次焦点切换
+// 祖先 bake 掉一帧，肉眼就是「页签文字抖一下再回来」。
+function inkOfBakedField(sx:Number, sy:Number):Number {
+  var cont:Sprite = new Sprite();
+  var mid:Sprite = new Sprite();
+  mid.cacheAsBitmap = true;
+  mid.addChild(field(sx, sy));
+  cont.addChild(mid);
+  var bd:BitmapData = new BitmapData(1200, 120, true, 0x00FFFFFF);
+  bd.draw(cont);
+  return inkWidth(bd, 1200, 120);
+}
+
 var probe:TextField = new TextField();
 probe.text = 'x';
 if (probe.textWidth <= 0) {
@@ -148,6 +164,17 @@ if (probe.textWidth <= 0) {
   near(w21, w11, 2, 'scaleX=2 不得把字形横向拉宽（ink 宽应与 scale 1 相同）');
   near(w051, w11, 2, 'scaleX=0.5 不得把字形压窄（ink 宽应与 scale 1 相同）');
   near(w12, w11 * 2, 3, 'scaleY=2 时字形整体放大一倍（ink 宽翻倍）');
+
+  // ②b 烘焙路径与 live 必须同口径：父容器 cacheAsBitmap、字段自带 scaleX。
+  var wb11:Number = inkOfBakedField(1, 1);
+  var wb21:Number = inkOfBakedField(2, 1);
+  var wb051:Number = inkOfBakedField(0.5, 1);
+  var wb12:Number = inkOfBakedField(1, 2);
+  check(wb11 > 0, '烘焙路径的 ink 宽也必须量得到');
+  near(wb11, w11, 2, 'cacheAsBitmap 不得改变 scale 1 的字形（烘焙与 live 同口径）');
+  near(wb21, w11, 2, '烘焙下字段自身 scaleX=2 也不得拉宽字形（曾用 bake 落点 CTM 归一，宽了一倍）');
+  near(wb051, w11, 2, '烘焙下字段自身 scaleX=0.5 也不得压窄字形');
+  near(wb12, w11 * 2, 3, '烘焙下字段自身 scaleY=2 仍要整体放大一倍');
 
   // ③ 打字时字段自动滚动（阶段二百四十二）。adl 51.4.1 实测：wordWrap=false 的
   //    字段一旦溢出就有正的 maxScrollH（trunc(textWidth + 4 - width)），打字把字符推到

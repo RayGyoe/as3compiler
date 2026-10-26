@@ -864,16 +864,35 @@ scaleX、高度除 scaleY」——`scaleY=2` 时高度也**翻倍**（`24.00`）
 （`width` = 本地宽 × scaleX）。实现是在 TextField 绘制的字形 pass 里把 CTM 后乘 `scale(sy/sx, 1)`：
 非均匀 CTM `M = R(θ)·S(sx,sy)·…` 后乘 `S(sy/sx,1)` 恰好得到 `R(θ)·S(sy,sy)·…`，即「同一旋转、均匀
 scaleY」。**必须夹在 `clipRect` 之后**：Skia 的 `clipRect` 按调用时的 CTM 映射，而可见盒是**要**跟着
-scaleX 走的（阶段一百六十二的 D29 就是栽在这个映射上）。比值取「**最终落点 CTM**」
-（`ASC_bake_ctm_*`，与 1px 边框同口径），于是：
+scaleX 走的（阶段一百六十二的 D29 就是栽在这个映射上）。
 
-- 正常窗口渲染：CTM 含对象的累积变换 ⇒ 比值 = 累积 `sy/sx`；
-- `cacheAsBitmap`/过滤器烘焙：canvas 只有烘焙分辨率，`ASC_bake_ctm_*` 给出落点比值；
+**比值必须取「画布的实际缩放」`as_skia_canvas_total_scale(canvas)`，不能取 `ASC_bake_ctm_*`
+（烘焙落点 CTM —— 那是 1px 边框与插入光标的口径）。** 理由：烘焙时的 canvas 就是离屏表面，它的
+逐轴分辨率**本身就是落点缩放**，而落点缩放里**已经含字段自身的 `scaleX`**，拿它当除数等于把这条
+归一化要消除的拉伸原样留下。实测（阶段二百九十一，TalkMED 登录页两个页签：SWC placement
+`scaleX = 0.9594`、dpr 1.5 ⇒ canvas `1.439072 × 1.5`，`ASC_TF_TRACE` 逐 pass 打印）：
+
+| 渲染态 | canvas | `ASC_bake_ctm_*` | 旧比值 | 旧字形 x 缩放 | ink 宽 |
+|---|---|---|---|---|---|
+| live（无烘焙） | 1.439072×1.5 | 0（退回 canvas） | 1.0423 | 1.5 ✓ | 124 |
+| 字段自己的 bake | 1.439072×1.5 | 1.439072×1.5 | **1.0** | **1.439072（窄 4%）** | 119 |
+| 嵌套 bake（祖先已烘） | 1.439072×1.5 | 1.5×1.5 | **0.96** | **1.3815（窄 8%）** | — |
+
+于是「烘焙态」与「活态」差 4%，而**每次切换输入焦点**都会掉掉祖先烘焙一帧（输入框的 `_sel_*` 进
+`as_render_fp` 指纹）⇒ 那一帧回到正确宽度，两个页签右跳 3-4 px 再回来（用户报的「抖动」）。
+改成画布缩放后两遍渲染是**同一个数**（烘焙被封顶时两轴同乘 `f`，比值不变），121 帧逐帧同一签名。
+
+- 正常窗口 pass / `cacheAsBitmap`/过滤器烘焙 / 嵌套烘焙：画布缩放在三处同值 ⇒ live 与 bake 一致；
 - `BitmapData.draw(字段)`：这一路是**本地空间**重栅格，且 `adl` 实测 `draw()` **忽略被画对象自身的
-transform**（scaleY=2 的字段画出来与未缩放**逐字节相同**）⇒ 比值自动退化为 1，正是该路要的。
+transform**（scaleY=2 的字段画出来与未缩放**逐字节相同**）⇒ canvas 均匀、比值 1，正是该路要的。
 
-回归：`examples/tf-scale-metrics.as`（度量 6 组相对断言 + `draw(容器)` 的 ink 宽 3 组，链 Skia）+
-`unit: display/TfScaleMetrics`（10 钉，含两处反向 mutation 验证）。
+**两个轴各管一件事**：可见盒（含 `clipRect`）跟着 `scaleX`，字形只跟 `scaleY`；1px 边框与光标仍取
+`ASC_bake_ctm_*`，因为它们要的是「落到**目标**画布的 1 个设备像素」，被放大的是落点而不是表面。
+
+回归：`examples/tf-scale-metrics.as`（度量 6 组相对断言 + `draw(容器)` 的 ink 宽 3 组 +
+**父容器 `cacheAsBitmap`、缩放挂在字段自身的烘焙 4 组**，链 Skia；后者对着旧代码必红：
+`want 168.00 got 336.00`）+`unit: display/TfScaleMetrics`（10 钉，含反向 mutation，其中一条是
+`!emitted.includes('double tsx = ASC_bake_ctm_x')`）。
 
 ### 8.4 Windows 的逐字符字体回退：GDI 主语 + DirectWrite 兜底（阶段一百九十一）
 

@@ -24834,18 +24834,26 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // normalised. Without this the TalkMED subtitle skin's `ctime` (placement
     // scaleX 1.2246) painted its runs 22% wider than adl (阶段一百六十九).
     //
-    // The factor comes from the CTM the content will FINALLY land on, using the
-    // same ASC_bake_ctm_* idiom as the border above: inside a cacheAsBitmap/filter
-    // bake the canvas carries the bake resolution rather than the object, so the
-    // destination scale is the only honest measure. A TextField's own
-    // BitmapData.draw rebuilds it in LOCAL space (measured on adl 51.4.1 via
+    // The factor is measured on the CANVAS, never on ASC_bake_ctm_* (the
+    // destination scale the hairline border below needs). Inside a bake the canvas
+    // is the offscreen surface, whose per-axis resolution IS the destination
+    // scale -- and that scale already contains the field's own scaleX, so dividing
+    // by it would leave exactly the stretch this line exists to remove. Measured
+    // on the TalkMED login tab labels (SWC placement scaleX 0.9594 under dpr 1.5
+    // => canvas 1.439072 x 1.5): the live pass normalised to 1.5, while the baked
+    // pass normalised to the surface 1.439072 and painted the labels 4% narrow, so
+    // every focus switch -- which drops the ancestor bake for one frame -- made
+    // both tab labels jump 3-4 px right and back; a nested bake (ctm 1.5 x 1.5)
+    // was 8% narrow. The canvas scale is the same number in both passes (a capped
+    // bake multiplies both axes by the same factor, so the ratio is invariant),
+    // which is what makes the two passes agree.
+    // A TextField's own BitmapData.draw rebuilds it in LOCAL space (adl 51.4.1,
     // temp/tfswc case ⑯c: `bmd.draw(tf)` dumps the identical raster for a plain
-    // field and for scaleY=2, i.e. AIR ignores the object's own transform there),
-    // and there ASC_bake_ctm_* is 0 so the canvas' uniform bake scale yields
-    // ratio 1 -- exactly what that path needs.
-    this.line('double tsx = ASC_bake_ctm_x, tsy = ASC_bake_ctm_y;');
-    this.line('if (tsx <= 0.0 || tsy <= 0.0) as_skia_canvas_total_scale(canvas, &tsx, &tsy);');
-    this.line('if (tsx > 0.0 && fabs(tsy / tsx - 1.0) > 1e-9) as_skia_canvas_scale(canvas, tsy / tsx, 1.0);');
+    // field and for scaleY=2, i.e. AIR ignores the object's own transform there);
+    // that canvas is uniform, so the ratio is 1 -- exactly what that path needs.
+    this.line('double tsx = 0.0, tsy = 0.0;');
+    this.line('as_skia_canvas_total_scale(canvas, &tsx, &tsy);');
+    this.line('if (tsx > 0.0 && tsy > 0.0 && fabs(tsy / tsx - 1.0) > 1e-9) as_skia_canvas_scale(canvas, tsy / tsx, 1.0);');
     // Selection highlight (drawn behind the glyphs, paragraph-relative).
     // Selection highlight. Two measured rules (SelFocus probe, adl 51.4.1):
     //   1. it is drawn ONLY on the FOCUSED field — setSelection on an unfocused

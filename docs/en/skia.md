@@ -925,18 +925,42 @@ while its **box** still follows scaleX (`width` = local width × scaleX). The im
 `scale(sy/sx, 1)` onto the CTM in the TextField glyph pass: a non-uniform `M = R(θ)·S(sx,sy)·…` times
 `S(sy/sx,1)` is exactly `R(θ)·S(sy,sy)·…`, i.e. the same rotation with a uniform scaleY. It **must** be
 issued **after** the `clipRect`: Skia maps a clip through the CTM in force at clip time, and the visible box
-*is* supposed to follow scaleX (stage 162's D29 was bitten by exactly that mapping). The ratio is read from the
-**destination CTM** (`ASC_bake_ctm_*`, the same idiom as the 1px border), so:
+*is* supposed to follow scaleX (stage 162's D29 was bitten by exactly that mapping).
 
-- a normal window pass: the CTM carries the object's accumulated transform ⇒ ratio = accumulated `sy/sx`;
-- a `cacheAsBitmap`/filter bake: the canvas only holds the bake resolution, and `ASC_bake_ctm_*` supplies the
-  destination ratio;
+**The ratio must be read from the CANVAS scale (`as_skia_canvas_total_scale(canvas)`), never from
+`ASC_bake_ctm_*` (the bake's destination CTM -- that is the idiom of the 1px border and the caret).** Inside a
+bake the canvas *is* the offscreen surface, whose per-axis resolution is the destination scale, and that scale
+already contains the field's own `scaleX`: dividing by it leaves exactly the stretch this line exists to
+remove. Measured (stage 291, the two TalkMED login tabs — SWC placement `scaleX = 0.9594`, dpr 1.5 ⇒ canvas
+`1.439072 × 1.5`, printed per pass by `ASC_TF_TRACE`):
+
+| pass | canvas | `ASC_bake_ctm_*` | old ratio | old glyph x | ink width |
+|---|---|---|---|---|---|
+| live (no bake) | 1.439072×1.5 | 0 (falls back to canvas) | 1.0423 | 1.5 ✓ | 124 |
+| the field's own bake | 1.439072×1.5 | 1.439072×1.5 | **1.0** | **1.439072 (4% narrow)** | 119 |
+| nested bake (ancestor baked) | 1.439072×1.5 | 1.5×1.5 | **0.96** | **1.3815 (8% narrow)** | — |
+
+So "baked" differed from "live" by 4%, and **every input-focus switch** drops the ancestor bake for one frame
+(the input fields' `_sel_*` is part of the `as_render_fp` fingerprint) ⇒ that frame went back to the correct
+width and both tabs jumped 3-4 px right and back — the jitter the user reported. With the canvas scale both
+passes compute **the same number** (a capped bake multiplies both axes by the same `f`, so the ratio is
+invariant) and all 121 captured frames carry one signature.
+
+- a normal window pass / a `cacheAsBitmap`/filter bake / a nested bake: the canvas scale is the same value in
+  all three ⇒ live and baked agree;
 - `BitmapData.draw(field)`: that path re-rasterises in **local** space, and `adl` measurably **ignores the
-  source's own transform** in `draw()` (a scaleY=2 field dumps a **byte-identical** raster) ⇒ the ratio
-  degrades to 1, which is exactly what that path needs.
+  source's own transform** in `draw()` (a scaleY=2 field dumps a **byte-identical** raster) ⇒ the canvas is
+  uniform, ratio 1, which is exactly what that path needs.
+
+**Each axis owns one thing**: the visible box (including `clipRect`) follows `scaleX`, the glyphs follow only
+`scaleY`. The 1px border and the caret still read `ASC_bake_ctm_*`, because what they need is "one device
+pixel on the DESTINATION canvas", and what gets magnified is the destination, not the surface.
 
 Regression: `examples/tf-scale-metrics.as` (6 relative metric assertions + 3 ink-width assertions through
-`draw(container)`, links Skia) + `unit: display/TfScaleMetrics` (10 nails, two reverse-mutation verified).
+`draw(container)` + **4 through a `cacheAsBitmap` parent with the scale on the field itself**, links Skia;
+the last group is red against the old code: `want 168.00 got 336.00`) + `unit: display/TfScaleMetrics`
+(10 nails, reverse-mutation verified, one of them being
+`!emitted.includes('double tsx = ASC_bake_ctm_x')`).
 
 ### 8.4 Windows per-character font fallback: GDI primary + DirectWrite fallback (stage one-hundred-ninety-one)
 

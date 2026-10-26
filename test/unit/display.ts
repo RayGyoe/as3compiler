@@ -835,11 +835,19 @@ function checkTfScaleMetrics(): string[] {
   check('textHeight is scaled by the ratio (pure-C path)',
     emitted.includes('return (double)as_tf_line_count(tf) * (size * 1.2 + lead) * as_tf_scale_ratio(tf);'));
 
-  // ③ 绘制前把 CTM 归一成 scaleY 的均匀缩放，且用「最终落点 CTM」而不是当前 canvas 盲读
+  // ③ 绘制前把 CTM 归一成 scaleY 的均匀缩放；基准必须是**画布实际缩放**。
+  //
+  // 曾经用 ASC_bake_ctm_*（bake 的「最终落点」缩放，边界线/caret 需要它），但那个值
+  // **已经含字段自身的 scaleX**，拿它当除数等于把要消除的拉伸又留下：TalkMED 登录页
+  // 两个页签（SWC placement scaleX 0.9594、dpr 1.5 ⇒ canvas 1.439072 x 1.5）在 bake 里
+  // 只归一化到 1.439072，比 live 的 1.5 窄 4%；每次焦点切换祖先 bake 掉一帧，两个页签
+  // 就右跳 3-4 px 再回来。画布缩放在两遍渲染里是同一个数（bake 被封顶时两轴同乘 f，
+  // 比值不变），所以只有它能让 live 与 bake 一致。
   check('the glyph paint normalises the CTM to a uniform scaleY',
-    emitted.includes('if (tsx > 0.0 && fabs(tsy / tsx - 1.0) > 1e-9) as_skia_canvas_scale(canvas, tsy / tsx, 1.0);'));
-  check('the normalisation measures the destination CTM (bake-aware)',
-    emitted.includes('double tsx = ASC_bake_ctm_x, tsy = ASC_bake_ctm_y;'));
+    emitted.includes('if (tsx > 0.0 && tsy > 0.0 && fabs(tsy / tsx - 1.0) > 1e-9) as_skia_canvas_scale(canvas, tsy / tsx, 1.0);'));
+  check('the normalisation measures the CANVAS scale, not the published bake CTM',
+    emitted.includes('as_skia_canvas_total_scale(canvas, &tsx, &tsy);') &&
+    !emitted.includes('double tsx = ASC_bake_ctm_x, tsy = ASC_bake_ctm_y;'));
 
   // ④ 行为型回归必须存在并被套件跑到（链 Skia，否则度量恒 0、draw 是空桩）
   check('examples/tf-scale-metrics.as asserts both the metric and the glyph rules',
@@ -847,7 +855,8 @@ function checkTfScaleMetrics(): string[] {
     example.includes('scaleX=2 时 textHeight 也减半（同除 scaleX）') &&
     example.includes('父容器 scaleX=2 时子字段 textWidth 减半') &&
     example.includes('scaleX=2 不得把字形横向拉宽') &&
-    example.includes('scaleY=2 时字形整体放大一倍'));
+    example.includes('scaleY=2 时字形整体放大一倍') &&
+    example.includes('烘焙下字段自身 scaleX=2 也不得拉宽字形'));
   check('the example is registered with its Skia manifest',
     registry.includes("'tf-scale-metrics.as': ['--manifest', join(dir, 'tf-scale-metrics.build.json')]"));
 
