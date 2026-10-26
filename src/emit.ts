@@ -2522,6 +2522,14 @@ export class Emitter {
     // The drag follower (defined with the drag state, AFTER Sprite/startDrag's body
     // which calls it to place the object at the press point).
     this.line('static void as_drag_follow(double x, double y);');
+    // The ContextMenu popup (阶段二百八十九): defined with the window table (it needs
+    // ASC_wins to turn a stage point into a screen point), but the
+    // NativeMenu.display / ContextMenu.display bodies that call it are emitted long
+    // before that, as is the right-click path's popup trigger.
+    this.line('static void as_menu_popup_stage(as_array* items, void* menu, void* mouseTarget, void* owner, int win, double sx, double sy, int fromPress);');
+    this.line('static void ASC_window_on_mouse(int id, double x, double y, const char* type);');
+    this.line('static int as_stage_window_id(Stage* st);');
+    this.line('static void as_menu_popup_pump(void);');
     // Class-value dispatch (see emitClassRegistry): the class objects and the
     // static-member helpers are referenced by anonymous-function bodies, which are
     // emitted BEFORE the registry. The class objects get tentative definitions
@@ -5856,6 +5864,15 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('gc_mark_ptr((void*)ASC_dock_menu);');
     this.line('gc_mark_ptr((void*)ASC_tray_menu);');
     this.line('gc_mark_ptr((void*)ASC_menu_tags);');
+    // An OPEN context-menu popup (阶段二百八十九): the item list, the menu whose
+    // listeners will hear the selection, and the mouseTarget/contextMenuOwner pair
+    // the MENU_ITEM_SELECT must carry. On the asynchronous backends they outlive the
+    // frame that opened the menu by many frames, so a collection in between would
+    // leave the popup pointing at reclaimed items.
+    this.line('gc_mark_ptr((void*)ASC_popup_tags);');
+    this.line('gc_mark_ptr(ASC_popup_menu);');
+    this.line('gc_mark_ptr(ASC_popup_target);');
+    this.line('gc_mark_ptr(ASC_popup_owner);');
     // An in-flight startDrag(): the dragged object and its bounds rectangle are held
     // only by these C statics, and a drag outlives the event that started it.
     this.line('gc_mark_ptr(ASC_drag_obj);');
@@ -9356,9 +9373,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
 //     same item is #2004; removeItem of a foreign item is #2006.
 //   * clone() copies the tree but NOT the item data field.
 //   * a menu-bar click dispatches select on the ITEM and on its containing MENU
-//     with bubbles=false cancelable=false (temp/deskprobe2/probe4-log.txt).
-static bool ASC_menu_reported_unsupported = false;
-
+//     with bubbles=false cancelable=false (temp/deskprobe2/probe4-log.txt), and the
+//     menu-relayed event keeps the ITEM as its target (阶段二百八十九, see
+//     as_menu_select_on).
 static void as_menu_sync(NativeMenu* from);
 // Portable modifier bits handed to the backend glue (see as_menu_mods below).
 #define AS_KEM_CMD   1
@@ -9626,13 +9643,13 @@ void NativeMenu_setItemIndex(void* _this, NativeMenuItem* item, int index) {
   as_menu_sync(m);
 }
 void NativeMenu_display(void* _this, Stage* stage, double x, double y) {
-  (void)_this; (void)stage; (void)x; (void)y;
-  // AIR opens a modal native menu here; this backend has no modal menu loop, so
-  // say so once instead of pretending a menu appeared.
-  if (!ASC_menu_reported_unsupported) {
-    ASC_menu_reported_unsupported = true;
-    as_shell_unsupported((char*)"flash.display.NativeMenu.display (this backend cannot run a modal native menu)");
-  }
+  NativeMenu* m = (NativeMenu*)_this;
+  // AIR's call is MODAL: it blocks until the menu closes, and the selection is
+  // delivered before it returns. The Cocoa backend reproduces that exactly
+  // (popUpMenuPositioningItem: runs a nested tracking loop), which is why the
+  // popup entry point reports whether it already resolved.
+  if (stage == NULL) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }
+  as_menu_popup_stage(m->_items, (void*)m, NULL, NULL, as_stage_window_id(stage), x, y, 0);
 }
 NativeMenu* NativeMenu_clone(void* _this) {
   NativeMenu* m = (NativeMenu*)_this;
@@ -9649,6 +9666,19 @@ NativeMenu* NativeMenu_clone(void* _this) {
 as_value NativeMenu_dispatchContextMenuSelect(void* _this, Object* mouseEvent) {
   (void)_this; (void)mouseEvent;
   return as_v_undefined();  // measured: adl answers undefined
+}
+// The menu-level SELECT carries the ITEM as its target even though the MENU is the
+// dispatcher (measured on adl 51.4.1, temp/ctxprobe/out2.txt: a listener on the
+// ContextMenu sees target=[the ContextMenuItem] and currentTarget=[the menu]).
+// dispatchEvent would overwrite target with the dispatcher, so the menu's own
+// AT_TARGET listeners are run directly with the target pinned.
+static void as_menu_select_on(void* disp, NativeMenuItem* item) {
+  if (disp == NULL) return;
+  Event* e = Event_new((char*)"select", false, false);
+  e->target = (Object*)item;
+  as_disp_depth++;
+  as_disp_target(e, disp);
+  as_disp_depth--;
 }
 
 // ---- the native description handed to the window glue ----
@@ -9716,7 +9746,7 @@ static void as_menu_click_cb(int tag) {
   // measured (temp/deskprobe2/probe4-log.txt): the item and its containing menu
   // both receive select, with bubbles=false cancelable=false.
   EventDispatcher_dispatchEvent((EventDispatcher*)it, (Event*)Event_new((char*)"select", false, false));
-  if (it->_menu != NULL) EventDispatcher_dispatchEvent((EventDispatcher*)it->_menu, (Event*)Event_new((char*)"select", false, false));
+  if (it->_menu != NULL) as_menu_select_on((void*)it->_menu, it);
 }
 static void as_menu_sync(NativeMenu* from) {
   (void)from;
@@ -13123,11 +13153,13 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('void ContextMenuEvent_ctor(ContextMenuEvent* o, char* type, bool bubbles, bool cancelable, InteractiveObject* mouseTarget, InteractiveObject* contextMenuOwner) { Event_ctor((Event*)o, type, bubbles, cancelable); o->mouseTarget = mouseTarget; gc_write_barrier((void*)mouseTarget); o->contextMenuOwner = contextMenuOwner; gc_write_barrier((void*)contextMenuOwner); }');
     this.line('ContextMenuEvent* ContextMenuEvent_new(char* type, bool bubbles, bool cancelable, InteractiveObject* mouseTarget, InteractiveObject* contextMenuOwner) { ContextMenuEvent* o = (ContextMenuEvent*)gc_alloc(GCT_CLASS, sizeof(ContextMenuEvent)); o->vtable = &ContextMenuEvent_vt; ContextMenuEvent_ctor(o, type, bubbles, cancelable, mouseTarget, contextMenuOwner); return o; }');
     this.emitDesktopMenus();
-    // ---- flash.ui.ContextMenu family (stage 110) ----
-    // Faithful data model (temp/constprobe on adl 51.4.1): a fresh menu owns an
-    // empty customItems array and a ContextMenuBuiltInItems instance, and a display
-    // object's contextMenu starts null and round-trips by identity. No native menu
-    // is ever shown here, so MENU_SELECT / MENU_ITEM_SELECT never fire.
+    // ---- flash.ui.ContextMenu family (stage 110; native popup 阶段二百八十九) ----
+    // Measured data model (temp/constprobe + temp/ctxprobe on adl 51.4.1): a fresh
+    // menu owns an empty customItems array and a ContextMenuBuiltInItems instance, a
+    // display object's contextMenu starts null and round-trips by identity, and
+    // ContextMenu IS a NativeMenu whose item storage is its own `customItems` list
+    // (see symbols.ts). The native popup itself lives further down, in the
+    // "context-menu popup" block.
     this.line('void ContextMenuBuiltInItems_ctor(ContextMenuBuiltInItems* o) { Object_ctor((Object*)o); }');
     this.line('ContextMenuBuiltInItems* ContextMenuBuiltInItems_new(void) { ContextMenuBuiltInItems* o = (ContextMenuBuiltInItems*)gc_alloc(GCT_CLASS, sizeof(ContextMenuBuiltInItems)); o->vtable = &ContextMenuBuiltInItems_vt; ContextMenuBuiltInItems_ctor(o); return o; }');
     // ContextMenuItem extends NativeMenuItem in AIR: `caption` is the AS3 name of the
@@ -13142,93 +13174,110 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('ContextMenuItem* ContextMenuItem_new(char* caption, bool separatorBefore, bool enabled, bool visible) { ContextMenuItem* o = (ContextMenuItem*)gc_alloc(GCT_CLASS, sizeof(ContextMenuItem)); o->vtable = &ContextMenuItem_vt; ContextMenuItem_ctor(o, caption, separatorBefore, enabled, visible); return o; }');
+    // ContextMenu extends NativeMenu (measured: `new ContextMenu() is NativeMenu` is
+    // true on adl 51.4.1). The items live in the INHERITED `_items` list -- measured:
+    // after addItem x3 `items.length` is 3, `items[0]` is the added object and
+    // `numItems == items.length` -- so every item operation is inherited unchanged.
+    // Only the three members below differ on a ContextMenu (all measured on
+    // adl 51.4.1, temp/ctxprobe/api/out2.txt + out3.txt):
+    //   * getItemByName answers null even for a matching name (a ContextMenuItem in a
+    //     plain NativeMenu IS found, so the rule belongs to ContextMenu);
+    //   * setItemIndex throws RangeError #2006 for EVERY index, in range or not;
+    //   * display(null, ...) is #2007 "Parameter stage must be non-null.".
     this.line('void ContextMenu_ctor(ContextMenu* o) {');
     this.indent++;
-    this.line('EventDispatcher_ctor((EventDispatcher*)o, NULL);');
-    this.line('o->customItems = as_array_new(); gc_write_barrier((void*)o->customItems);');
+    this.line('NativeMenu_ctor((NativeMenu*)o);');
     this.line('o->builtInItems = ContextMenuBuiltInItems_new(); gc_write_barrier((void*)o->builtInItems);');
     this.indent--;
     this.line('}');
     this.line('ContextMenu* ContextMenu_new(void) { ContextMenu* o = (ContextMenu*)gc_alloc(GCT_CLASS, sizeof(ContextMenu)); o->vtable = &ContextMenu_vt; ContextMenu_ctor(o); return o; }');
+    this.line('bool ContextMenu_get_isSupported_static(void* _this) { (void)_this; return true; }');
+    // hideBuiltInItems: a no-op that MATCHES AIR rather than a stub. Measured on
+    // adl 51.4.1: AIR has no built-in context-menu items at all (a fresh menu's
+    // numItems is 0 and all eight ContextMenuBuiltInItems flags already read false),
+    // so there is nothing to hide -- the documentation says so explicitly ("In AIR,
+    // there are no built-in items and no standard context menu").
     this.line('void ContextMenu_hideBuiltInItems(void* _this) { (void)_this; }');
-    // addItem appends unless the item is already present (the measured AIR behaviour
-    // was ArgumentError #2004 for a duplicate, which is the closest thing to a
-    // documented contract); removeItem/containsItem scan customItems by identity.
-    this.line('static int as_ctxmenu_index(ContextMenu* o, NativeMenuItem* item) {');
+    // customItems: the documented synonym of `items`, i.e. the same live list. The
+    // getter hands the array itself (not a copy) so a caller that mutates it changes
+    // the menu; the setter is NativeMenu's, which validates and re-parents.
+    this.line('as_array* ContextMenu_get_customItems(void* _this) {');
     this.indent++;
-    this.line('int i;');
-    this.line('if (o->customItems == NULL || item == NULL) return -1;');
-    this.line('for (i = 0; i < o->customItems->length; i++) { as_value v = o->customItems->data[i]; if (v.tag == 4 && v.ptr == (void*)item) return i; }');
-    this.line('return -1;');
+    this.line('NativeMenu* m = (NativeMenu*)_this;');
+    this.line('if (m->_items == NULL) { m->_items = as_array_new(); gc_write_barrier((void*)m->_items); }');
+    this.line('return m->_items;');
     this.indent--;
     this.line('}');
+    this.line('void ContextMenu_set_customItems(void* _this, as_array* value) { NativeMenu_set_items(_this, value); }');
+    // measured (temp/ctxprobe/api/out5.txt): the ContextMenu list carries NO duplicate
+    // check -- addItem(a) on a menu that already holds a leaves A,B,A, and addItemAt
+    // of a present item inserts a second entry. NativeMenu rejects both with #2004, so
+    // these two are overridden while everything else is inherited.
     this.line('NativeMenuItem* ContextMenu_addItem(void* _this, NativeMenuItem* item) {');
     this.indent++;
-    this.line('ContextMenu* o = (ContextMenu*)_this;');
-    this.line('if (item == NULL) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return NULL; }');
-    this.line('if (as_ctxmenu_index(o, item) >= 0) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return NULL; }');
-    this.line('as_array_push(o->customItems, as_v_obj((void*)item));');
+    this.line('NativeMenu* m = (NativeMenu*)_this;');
+    this.line('if (item == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter item must be non-null.", 2007)); return NULL; }');
+    this.line('as_array_push(m->_items, as_v_obj((void*)item));');
+    this.line('item->_menu = m;');
+    this.line('if (item->_submenu != NULL) { item->_submenu->_parent = m; gc_write_barrier((void*)m); }');
+    this.line('as_menu_sync(m);');
     this.line('return item;');
     this.indent--;
     this.line('}');
-    this.line('NativeMenuItem* ContextMenu_removeItem(void* _this, NativeMenuItem* item) {');
+    this.line('NativeMenuItem* ContextMenu_addItemAt(void* _this, NativeMenuItem* item, int index) {');
     this.indent++;
-    this.line('ContextMenu* o = (ContextMenu*)_this;');
-    this.line('int i = as_ctxmenu_index(o, item);');
-    this.line('if (i < 0) return NULL;');
-    this.line('as_array_removeAt(o->customItems, i);');
+    this.line('NativeMenu* m = (NativeMenu*)_this;');
+    this.line('if (item == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter item must be non-null.", 2007)); return NULL; }');
+    this.line('int n = (m->_items == NULL) ? 0 : m->_items->length;');
+    this.line('if (index < 0 || index > n) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return NULL; }');
+    this.line('as_array_insertAt(m->_items, index, as_v_obj((void*)item));');
+    this.line('item->_menu = m;');
+    this.line('if (item->_submenu != NULL) { item->_submenu->_parent = m; gc_write_barrier((void*)m); }');
+    this.line('as_menu_sync(m);');
     this.line('return item;');
     this.indent--;
     this.line('}');
-    this.line('bool ContextMenu_containsItem(void* _this, NativeMenuItem* item) { return as_ctxmenu_index((ContextMenu*)_this, item) >= 0; }');
-    // getItemAt(index): the custom item at that position (ContextMenuItem), or
-    // null when out of range -- AIR's documented behaviour. numItems counts the
-    // custom items only, matching this list.
-    // numItems: AIR counts the built-in items AND the custom ones; this build
-    // models no built-in menu items at all (hideBuiltInItems above is a no-op),
-    // so the count is exactly the list getItemAt() indexes. A caller that only
-    // asks "does this menu have items" (UserItemRenderers.getContextMenu) and a
-    // caller that asks for the last one (numItems - 1) both get the same answer
-    // they would from AIR, because the last custom item is last in both models.
-    this.line('int ContextMenu_get_numItems(void* _this) {');
+    // measured: never found, whatever name is stored on the item.
+    this.line('NativeMenuItem* ContextMenu_getItemByName(void* _this, char* name) {');
     this.indent++;
-    this.line('ContextMenu* o = (ContextMenu*)_this;');
-    this.line('return (o->customItems == NULL) ? 0 : o->customItems->length;');
+    this.line('(void)_this;');
+    this.line('if (name == NULL) as_throw(ArgumentError_new((char*)"Error #2007: Parameter name must be non-null.", 2007));');
+    this.line('return NULL;');
     this.indent--;
     this.line('}');
-    // `items` IS `customItems` in AIR ("Using this property is equivalent to using
-    // the customItems property"), so both accessors are exactly the `customItems`
-    // slot -- no second list is kept.
-    this.line('as_array* ContextMenu_get_items(void* _this) {');
+    // measured: RangeError for every index, in range or not (the AIR ContextMenu
+    // implementation does not support re-ordering at all).
+    this.line('void ContextMenu_setItemIndex(void* _this, NativeMenuItem* item, int index) {');
     this.indent++;
-    this.line('ContextMenu* o = (ContextMenu*)_this;');
-    this.line('if (o->customItems == NULL) { o->customItems = as_array_new(); gc_write_barrier((void*)o->customItems); }');
-    this.line('return o->customItems;');
-    this.indent--;
-    this.line('}');
-    this.line('void ContextMenu_set_items(void* _this, as_array* value) {');
-    this.indent++;
-    this.line('ContextMenu* o = (ContextMenu*)_this;');
-    this.line('if (value == NULL) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }');
-    this.line('o->customItems = value; gc_write_barrier((void*)value);');
-    this.indent--;
-    this.line('}');
-    this.line('NativeMenuItem* ContextMenu_getItemAt(void* _this, int index) {');
-    this.indent++;
-    this.line('ContextMenu* o = (ContextMenu*)_this;');
-    this.line('if (o->customItems == NULL || index < 0 || index >= o->customItems->length) return NULL;');
-    this.line('as_value v = o->customItems->data[index];');
-    this.line('return (v.tag == 4) ? (NativeMenuItem*)v.ptr : NULL;');
+    this.line('(void)_this; (void)item; (void)index;');
+    this.line('as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006));');
     this.indent--;
     this.line('}');
     this.line('ContextMenu* ContextMenu_clone(void* _this) {');
     this.indent++;
-    this.line('ContextMenu* o = (ContextMenu*)_this;');
+    this.line('NativeMenu* m = (NativeMenu*)_this;');
     this.line('ContextMenu* c = ContextMenu_new();');
-    this.line('int i;');
-    this.line('for (i = 0; i < o->customItems->length; i++) as_array_push(c->customItems, o->customItems->data[i]);');
-    this.line('c->builtInItems = o->builtInItems; gc_write_barrier((void*)o->builtInItems);');
+    this.line('for (int i = 0; m->_items != NULL && i < m->_items->length; i++) {');
+    this.indent++;
+    this.line('as_value v = m->_items->data[i];');
+    this.line('if (v.tag != 4 || v.ptr == NULL) continue;');
+    this.line('NativeMenuItem* it = NativeMenuItem_clone((NativeMenuItem*)v.ptr);');
+    this.line('as_array_push(c->_items, as_v_obj((void*)it));');
+    this.line('it->_menu = (NativeMenu*)c;');
+    this.indent--;
+    this.line('}');
+    this.line('c->builtInItems = ((ContextMenu*)_this)->builtInItems; gc_write_barrier((void*)c->builtInItems);');
     this.line('return c;');
+    this.indent--;
+    this.line('}');
+    // display(stage, x, y): the same modal popup as NativeMenu.display, over the
+    // inherited item list and positioned at a STAGE point.
+    this.line('void ContextMenu_display(void* _this, Stage* stage, double x, double y) {');
+    this.indent++;
+    this.line('ContextMenu* o = (ContextMenu*)_this;');
+    // measured: ArgumentError #2007 "Parameter stage must be non-null."
+    this.line('if (stage == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter stage must be non-null.", 2007)); return; }');
+    this.line('as_menu_popup_stage(((NativeMenu*)o)->_items, (void*)o, NULL, NULL, as_stage_window_id(stage), x, y, 0);');
     this.indent--;
     this.line('}');
     // ---- flash.display.Shader / ShaderData / ShaderJob (stage 110) ----
@@ -18231,7 +18280,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('DisplayObject* o = (DisplayObject*)target;');
     this.line('double tlx = x - o->x, tly = y - o->y;');
     this.line('as_local_point(o, x, y, &tlx, &tly);');
-    this.line('MouseEvent* evt = MouseEvent_new(type, true, false, tlx, tly, NULL, false, false, false, false, 0.0);');
+    this.line('MouseEvent* evt = MouseEvent_new(type, true, false, tlx, tly, NULL, false, false, false, strcmp(type, "rightMouseDown") == 0, 0.0);');
     this.line('evt->stageX = x;');
     this.line('evt->stageY = y;');
     this.line('EventDispatcher_dispatchEvent(target, (Event*)evt);');
@@ -23226,6 +23275,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // notifications on its own clock (a socket's status codes, a device's
     // hotplug) with no call in flight.
     this.line('as_fre_pump();');
+    // A popup menu on a backend that cannot block (web) resolves from a frame: the
+    // click on the DOM overlay only records the tag, and the AS3 events must go out
+    // from a frame boundary so they land with the same ordering guarantees as any
+    // other dispatched event. No-op on the native backends (nothing pends there).
+    this.line('as_menu_popup_pump();');
     // Collect finished asynchronous IO/decode jobs before anything else this
     // frame: their finish thunks dispatch PROGRESS/COMPLETE, which user code
     // (AssetManager chains) reacts to by queueing the next load. Doing it first
@@ -25658,6 +25712,261 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('}');
     this.indent--;
     this.line('}');
+    // ---- flash.ui.ContextMenu popup (阶段二百八十九) ----
+    // Measured contract (adl 51.4.1 / macOS, temp/ctxprobe/out2.txt):
+    //   * a right click on an object that (or whose nearest ANCESTOR) has a
+    //     contextMenu dispatches MENU_SELECT on the ContextMenu itself -- target and
+    //     currentTarget are the MENU, bubbles=false, cancelable=false (so
+    //     preventDefault does nothing), mouseTarget is the object the pointer was
+    //     over and contextMenuOwner is the ancestor that owns the menu;
+    //   * the popup is MODAL: the pointer's rightMouseUp/rightClick are deferred
+    //     until it closes, and the selection arrives first;
+    //   * choosing an item fires, in this order, Event.SELECT on the item,
+    //     Event.SELECT on the menu (target still the item) and
+    //     ContextMenuEvent.MENU_ITEM_SELECT on the item with the same
+    //     mouseTarget/contextMenuOwner pair;
+    //   * an item with visible=false is not shown at all, and a ContextMenuItem's
+    //     separatorBefore puts a separator ABOVE the item.
+    this.line('static as_array* ASC_popup_tags = NULL;');
+    this.line('static void* ASC_popup_menu = NULL;');
+    this.line('static void* ASC_popup_target = NULL;');
+    this.line('static void* ASC_popup_owner = NULL;');
+    this.line('static int ASC_popup_pending = 0;');
+    // The flattened description is REUSED across popups (grown on demand). The
+    // app/Dock menus can afford a per-sync arena allocation; a context menu opens on
+    // every right click, so an arena allocation here would be an unbounded leak in a
+    // long-running app.
+    this.line('static sk_menu* ASC_popup_menus = NULL;');
+    this.line('static sk_menu_item* ASC_popup_descs = NULL;');
+    this.line('static int ASC_popup_cap = 0;');
+    this.line('static void as_popup_ensure(int n) {');
+    this.indent++;
+    this.line('if (n <= ASC_popup_cap) return;');
+    this.line('int cap = ASC_popup_cap > 0 ? ASC_popup_cap : 16;');
+    this.line('while (cap < n) cap *= 2;');
+    this.line('ASC_popup_menus = (sk_menu*)realloc(ASC_popup_menus, sizeof(sk_menu) * (size_t)cap);');
+    this.line('ASC_popup_descs = (sk_menu_item*)realloc(ASC_popup_descs, sizeof(sk_menu_item) * (size_t)cap);');
+    this.line('ASC_popup_cap = cap;');
+    this.indent--;
+    this.line('}');
+    // The window a Stage belongs to, so a stage point can be turned into the screen
+    // point the backend wants.
+    this.line('static int as_stage_window_id(Stage* st) {');
+    this.indent++;
+    this.line('int i;');
+    this.line('for (i = 0; i < ASC_MAX_WINDOWS; i++) if (ASC_wins[i].stage == st) return i;');
+    this.line('return -1;');
+    this.indent--;
+    this.line('}');
+    // `visible` belongs to ContextMenuItem only: a plain NativeMenuItem has no such
+    // flag and is never hidden.
+    this.line('static int as_ctxmenu_visible(NativeMenuItem* it) {');
+    this.indent++;
+    this.line('if (it == NULL) return 0;');
+    this.line('if (as_is((void*)it, &ContextMenuItem_vt)) return ((ContextMenuItem*)it)->visible ? 1 : 0;');
+    this.line('return 1;');
+    this.indent--;
+    this.line('}');
+    this.line('static int as_ctxmenu_sep(NativeMenuItem* it) {');
+    this.indent++;
+    this.line('if (it == NULL || !as_is((void*)it, &ContextMenuItem_vt)) return 0;');
+    this.line('return ((ContextMenuItem*)it)->separatorBefore ? 1 : 0;');
+    this.indent--;
+    this.line('}');
+    this.line('static int as_ctxmenu_count(as_array* items, int depth) {');
+    this.indent++;
+    this.line('if (items == NULL || depth > 8) return 0;');
+    this.line('int n = 0;');
+    this.line('for (int i = 0; i < items->length; i++) {');
+    this.indent++;
+    this.line('as_value v = items->data[i];');
+    this.line('if (v.tag != 4 || v.ptr == NULL) continue;');
+    this.line('NativeMenuItem* it = (NativeMenuItem*)v.ptr;');
+    this.line('if (!as_ctxmenu_visible(it)) continue;');
+    this.line('if (as_ctxmenu_sep(it)) n++;');
+    this.line('n++;');
+    this.line('if (it->_submenu != NULL) n += as_ctxmenu_count(it->_submenu->_items, depth + 1);');
+    this.indent--;
+    this.line('}');
+    this.line('return n;');
+    this.indent--;
+    this.line('}');
+    // Same two-pass shape as as_menu_fill (a menu's own items must stay contiguous in
+    // the flat array), with the ContextMenu-only rules folded in: an invisible item is
+    // skipped, a separator is inserted BEFORE an item whose separatorBefore is set, and
+    // only real items get a tag (separators never come back from a click).
+    this.line('static int as_ctxmenu_fill(as_array* items, as_menu_ctx* c, int depth) {');
+    this.indent++;
+    this.line('int idx = c->nmenus++;');
+    this.line('c->menus[idx].title = (char*)"";');
+    this.line('c->menus[idx].first = c->nitems;');
+    this.line('c->menus[idx].count = 0;');
+    this.line('if (items == NULL || depth > 8) return idx;');
+    this.line('int base = c->nitems;');
+    this.line('for (int i = 0; i < items->length; i++) {');
+    this.indent++;
+    this.line('as_value v = items->data[i];');
+    this.line('if (v.tag != 4 || v.ptr == NULL) continue;');
+    this.line('NativeMenuItem* it = (NativeMenuItem*)v.ptr;');
+    this.line('if (!as_ctxmenu_visible(it)) continue;');
+    this.line('if (as_ctxmenu_sep(it)) {');
+    this.indent++;
+    this.line('int k = c->nitems++;');
+    this.line('c->items[k].kind = 1; c->items[k].label = (char*)"";');
+    this.line('c->items[k].enabled = 0; c->items[k].checked = 0;');
+    this.line('c->items[k].key = (char*)""; c->items[k].mods = 0;');
+    this.line('c->items[k].submenu = -1; c->items[k].tag = 0;');
+    this.line('c->menus[idx].count++;');
+    this.indent--;
+    this.line('}');
+    this.line('int k = c->nitems++;');
+    this.line('c->items[k].kind = 0;');
+    this.line('c->items[k].label = it->label != NULL ? it->label : (char*)"";');
+    this.line('c->items[k].enabled = it->enabled ? 1 : 0;');
+    this.line('c->items[k].checked = it->checked ? 1 : 0;');
+    this.line('c->items[k].key = it->_keyeq != NULL ? it->_keyeq : (char*)"";');
+    this.line('c->items[k].mods = as_menu_mods(it);');
+    this.line('c->items[k].submenu = -1;');
+    this.line('c->items[k].tag = c->nitems;   // 1-based index into ASC_popup_tags');
+    this.line('if (ASC_popup_tags != NULL) as_array_push(ASC_popup_tags, v);');
+    this.line('c->menus[idx].count++;');
+    this.indent--;
+    this.line('}');
+    this.line('int pos = base;');
+    this.line('for (int i = 0; i < items->length; i++) {');
+    this.indent++;
+    this.line('as_value v = items->data[i];');
+    this.line('if (v.tag != 4 || v.ptr == NULL) continue;');
+    this.line('NativeMenuItem* it = (NativeMenuItem*)v.ptr;');
+    this.line('if (!as_ctxmenu_visible(it)) continue;');
+    this.line('if (as_ctxmenu_sep(it)) pos++;');
+    this.line('if (it->_submenu != NULL) c->items[pos].submenu = as_ctxmenu_fill(it->_submenu->_items, c, depth + 1);');
+    this.line('pos++;');
+    this.indent--;
+    this.line('}');
+    this.line('return idx;');
+    this.indent--;
+    this.line('}');
+    // The popup RESOLVED with `tag` (0 = dismissed): deliver the selection in the
+    // measured order. The state is cleared only at the end, because the dispatches
+    // below run user code that must not see a dangling tag table (the items are held
+    // alive by it) and a collection can run inside a listener.
+    this.line('static void as_menu_popup_finish(int tag) {');
+    this.indent++;
+    this.line('ASC_popup_pending = 0;');
+    this.line('NativeMenuItem* item = NULL;');
+    this.line('if (ASC_popup_tags != NULL && tag > 0 && tag <= ASC_popup_tags->length) {');
+    this.indent++;
+    this.line('as_value v = ASC_popup_tags->data[tag - 1];');
+    this.line('if (v.tag == 4) item = (NativeMenuItem*)v.ptr;');
+    this.indent--;
+    this.line('}');
+    this.line('void* menu = ASC_popup_menu;');
+    this.line('void* mt = ASC_popup_target;');
+    this.line('void* ow = ASC_popup_owner;');
+    this.line('if (item != NULL) {');
+    this.indent++;
+    this.line('EventDispatcher_dispatchEvent((EventDispatcher*)item, (Event*)Event_new((char*)"select", false, false));');
+    this.line('if (menu != NULL) as_menu_select_on(menu, item);');
+    this.line('EventDispatcher_dispatchEvent((EventDispatcher*)item, (Event*)ContextMenuEvent_new((char*)"menuItemSelect", false, false, (InteractiveObject*)mt, (InteractiveObject*)ow));');
+    this.indent--;
+    this.line('}');
+    this.line('ASC_popup_tags = NULL;');
+    this.line('ASC_popup_menu = NULL;');
+    this.line('ASC_popup_target = NULL;');
+    this.line('ASC_popup_owner = NULL;');
+    this.indent--;
+    this.line('}');
+    // Show `items` at a STAGE point. On a backend that can block (Cocoa) the whole
+    // thing -- including the selection dispatches -- happens before this returns,
+    // exactly like AIR; on one that cannot (web) the menu is on screen, the state is
+    // remembered and as_menu_popup_pump resolves it from a later frame.
+    this.line('static void as_menu_popup_stage(as_array* items, void* menu, void* mouseTarget, void* owner, int win, double sx, double sy, int fromPress) {');
+    this.indent++;
+    this.line('int wx = 0, wy = 0, ww = 0, wh = 0, bt = 0, bl = 0, bb = 0, br = 0;');
+    this.line('if (win >= 0) {');
+    this.indent++;
+    this.line('as_window_get_bounds(win, &wx, &wy, &ww, &wh);');
+    this.line('as_window_get_borders(win, &bt, &bl, &bb, &br);');
+    this.indent--;
+    this.line('}');
+    this.line('(void)ww; (void)wh; (void)bb; (void)br;');
+    this.line('int n = as_ctxmenu_count(items, 0);');
+    this.line('if (n <= 0) return;   // measured: an empty ContextMenu never comes up');
+    this.line('as_popup_ensure(n + 2);');
+    this.line('ASC_popup_tags = as_array_new(); gc_write_barrier((void*)ASC_popup_tags);');
+    this.line('as_menu_ctx c;');
+    this.line('c.menus = ASC_popup_menus; c.nmenus = 0; c.capmenus = ASC_popup_cap;');
+    this.line('c.items = ASC_popup_descs; c.nitems = 0; c.capitems = ASC_popup_cap;');
+    this.line('c.tag_base = 0;');
+    this.line('int root = as_ctxmenu_fill(items, &c, 0);');
+    this.line('ASC_popup_menu = menu;');
+    this.line('ASC_popup_target = mouseTarget;');
+    this.line('ASC_popup_owner = owner;');
+    this.line('int tag = 0;');
+    this.line('double gx = 0.0, gy = 0.0;');
+    // Screen point: the client origin is the window origin plus its frame border,
+    // the same arithmetic NativeWindow.globalToScreen uses (measured: bounds (26,26)
+    // with borders (8,31) answers globalToScreen(0,0) = (34,57)).
+    this.line('if (sk_menu_popup(win, c.menus, c.nmenus, c.items, c.nitems, root, (double)(wx + bl) + sx, (double)(wy + bt) + sy, &tag, &gx, &gy)) {');
+    this.indent++;
+    // AIR delivers the right release that ENDED the press BEFORE the selection: a
+    // menu opened by the right button has the release swallowed by its tracking
+    // loop, and adl 51.4.1 replays it (rightMouseUp then rightClick) as soon as the
+    // menu is gone, with the coordinates of the pointer at DISMISSAL time -- the
+    // item's position, not the press point. Measured in temp/ctxprobe/out2.txt:
+    // down at stage 400,243 -> up/click at 460,256 -> item SELECT -> menu SELECT ->
+    // MENU_ITEM_SELECT. Hence the replay here, before as_menu_popup_finish.
+    // display() has no press behind it, so a programmatic popup replays nothing.
+    this.line('if (fromPress) {');
+    this.indent++;
+    this.line('double ux = gx - (double)(wx + bl);');
+    this.line('double uy = gy - (double)(wy + bt);');
+    this.line('ASC_window_on_mouse(win, ux, uy, "rightMouseUp");');
+    this.line('ASC_window_on_mouse(win, ux, uy, "rightClick");');
+    this.indent--;
+    this.line('}');
+    this.line('as_menu_popup_finish(tag);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('ASC_popup_pending = 1;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // Per-frame poll for the asynchronous backends; a no-op on the native ones.
+    this.line('static void as_menu_popup_pump(void) {');
+    this.indent++;
+    this.line('if (!ASC_popup_pending) return;');
+    this.line('int tag = 0;');
+    this.line('if (sk_menu_popup_take(&tag)) as_menu_popup_finish(tag);');
+    this.indent--;
+    this.line('}');
+    // The right-click path: MENU_SELECT on the menu (when the hit object or its
+    // nearest ANCESTOR owns one), then the modal popup. AIR dispatches the mouse
+    // event FIRST (rightMouseDown reaches the target before MENU_SELECT) -- the
+    // caller does that, this is the second half.
+    this.line('static void as_ctxmenu_show(Stage* st, int win, double sx, double sy) {');
+    this.indent++;
+    this.line('void* hit = as_pick_hit((void*)st, sx, sy);');
+    this.line('void* owner = NULL;');
+    this.line('void* p = hit;');
+    this.line('while (p != NULL) {');
+    this.indent++;
+    this.line('if (as_is(p, &InteractiveObject_vt) && ((InteractiveObject*)p)->_contextMenu != NULL) { owner = p; break; }');
+    this.line('p = ((DisplayObject*)p)->parent;');
+    this.indent--;
+    this.line('}');
+    // Nothing on the chain owns a menu: AIR shows its own default menu (the text
+    // editing one on a TextField); this build has none, so the click is just the
+    // mouse event that already went out.
+    this.line('if (owner == NULL) return;');
+    this.line('ContextMenu* menu = (ContextMenu*)((InteractiveObject*)owner)->_contextMenu;');
+    this.line('EventDispatcher_dispatchEvent((EventDispatcher*)menu, (Event*)ContextMenuEvent_new((char*)"menuSelect", false, false, (InteractiveObject*)hit, (InteractiveObject*)owner));');
+    this.line('as_menu_popup_stage(((NativeMenu*)menu)->_items, (void*)menu, hit, owner, win, sx, sy, 1);');
+    this.indent--;
+    this.line('}');
     this.line('static void ASC_window_on_mouse(int id, double x, double y, const char* type) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
@@ -25759,6 +26068,21 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('void* hit = as_pick_hit((void*)w->stage, sx, sy);');
     this.line('int dce = (hit != NULL && as_is(hit, &InteractiveObject_vt)) ? ((InteractiveObject*)hit)->doubleClickEnabled : 0;');
     this.line('Stage_dispatchMouse((void*)w->stage, sx, sy, dce ? (char*)"doubleClick" : (char*)"click");');
+    this.line('if (planted) as_frame_guard = 0;');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    // Right button (阶段二百八十九). AIR dispatches the ordinary MouseEvent first
+    // -- rightMouseDown reaches the target with buttonDown=true -- and only THEN
+    // puts up the menu, so a listener that swaps the contextMenu on rightMouseDown
+    // still gets to decide what pops up. The popup is modal on the Cocoa backend,
+    // which is why the dispatch and the popup share one frame guard here: the
+    // release below happens after the menu closes, exactly as if the event had been
+    // handled synchronously.
+    this.line('if (strcmp(type, "rightMouseDown") == 0) {');
+    this.indent++;
+    this.line('Stage_dispatchMouse((void*)w->stage, sx, sy, (char*)"rightMouseDown");');
+    this.line('as_ctxmenu_show((void*)w->stage, id, sx, sy);');
     this.line('if (planted) as_frame_guard = 0;');
     this.line('return;');
     this.indent--;

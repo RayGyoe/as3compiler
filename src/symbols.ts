@@ -4471,7 +4471,13 @@ export class SymbolTable {
       ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
-      isFinal: true,
+      // AIR declares this class final, but flash.ui.ContextMenu derives from it
+      // (measured: `new ContextMenu() is NativeMenu` is true on adl 51.4.1, and the
+      // inherited display/addItemAt/removeItemAt/removeAllItems/getItemIndex/
+      // setItemIndex/parent members compile on a ContextMenu under mxmlc), so
+      // finality is left off here; the only observable difference is that
+      // `class X extends NativeMenu` compiles here and is rejected by mxmlc.
+      isFinal: false,
       isDynamic: true,
       implements: [],
       fqn: 'flash.display::NativeMenu',
@@ -5382,39 +5388,65 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // AIR: `ContextMenu extends NativeMenu` (measured: `new ContextMenu() is
+    // NativeMenu` answers true on adl 51.4.1, and mxmlc resolves the inherited
+    // members -- display/addItemAt/removeAllItems/getItemIndex/setItemIndex/
+    // removeItemAt/parent all compile on a ContextMenu).
+    //
+    // The item STORAGE is the INHERITED NativeMenu list, not a second one. Measured
+    // on adl 51.4.1 (temp/ctxprobe/api/out2.txt): after addItem x3 the inherited
+    // `items` reads 3 and `items[0]` is the very object that was added, and
+    // `numItems == items.length`; `customItems` is documented as the same list
+    // ("Using this property is equivalent to using the customItems property") and is
+    // modelled as an alias here. So every item operation is INHERITED -- only the
+    // three members below behave differently on a ContextMenu:
+    //   * getItemByName always answers null (measured: a ContextMenuItem AND a
+    //     NativeMenuItem inside a ContextMenu both miss, while the same
+    //     ContextMenuItem inside a plain NativeMenu IS found -- so this is a
+    //     ContextMenu-side rule, not a name-storage quirk);
+    //   * setItemIndex always throws RangeError #2006 (measured: every index,
+    //     including plainly in-range ones and a foreign item, throws -- the AIR
+    //     ContextMenu implementation does not support the call at all);
+    //   * display(null, ...) throws ArgumentError #2007, not the #1009 a null
+    //     dereference would give.
     this.classMap.set('ContextMenu', {
       fields: new Map([
-        ['customItems', cmiF('ContextMenu', { kind: 'array' })],
         ['builtInItems', cmiF('ContextMenu', { kind: 'object', className: 'ContextMenuBuiltInItems' })],
       ]),
       methods: new Map([
         ['hideBuiltInItems', cmiM('ContextMenu', { kind: 'void' }, [])],
-        // AIR types every item-slot method on NativeMenuItem (ContextMenuItem is the
-        // subclass) and returns the item, not void -- the app passes the
-        // NativeMenuItem instances it constructs, so the wide type is the correct one.
+        // Inherited-shape overrides (see the note above); the signatures are AIR's.
+        // addItem/addItemAt are overridden for the opposite reason: AIR's ContextMenu
+        // has NO duplicate check (measured: addItem(a) twice leaves A,B,A and
+        // addItemAt(a, 1) on a present item succeeds), while NativeMenu answers #2004.
         ['addItem', cmiM('ContextMenu', { kind: 'object', className: 'NativeMenuItem' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
-        ['removeItem', cmiM('ContextMenu', { kind: 'object', className: 'NativeMenuItem' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
-        ['containsItem', cmiM('ContextMenu', { kind: 'bool' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }])],
-        ['getItemAt', cmiM('ContextMenu', { kind: 'object', className: 'NativeMenuItem' }, [{ name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        ['addItemAt', cmiM('ContextMenu', { kind: 'object', className: 'NativeMenuItem' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }, { name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        ['getItemByName', cmiM('ContextMenu', { kind: 'object', className: 'NativeMenuItem' }, [{ name: 'name', type: 'String', defaultValue: null, isRest: false }])],
+        ['setItemIndex', cmiM('ContextMenu', { kind: 'void' }, [{ name: 'item', type: 'NativeMenuItem', defaultValue: null, isRest: false }, { name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        // display(stage, x, y) pops this menu up at a STAGE point. AIR's call is
+        // modal (blocks until the menu closes); that contract and its measured
+        // event sequence live in emit.ts's context-menu block.
+        ['display', cmiM('ContextMenu', { kind: 'void' }, [{ name: 'stage', type: 'Stage', defaultValue: null, isRest: false }, { name: 'x', type: 'Number', defaultValue: null, isRest: false }, { name: 'y', type: 'Number', defaultValue: null, isRest: false }])],
         ['clone', cmiM('ContextMenu', { kind: 'object', className: 'ContextMenu' }, [])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
+      // ContextMenu.isSupported is a STATIC read answered true on adl 51.4.1
+      // (measured), the same shape as NativeMenu.isSupported.
+      staticGetters: new Map([
+        ['isSupported', { returnType: { kind: 'bool' }, params: [], owner: 'ContextMenu', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
       getters: new Map([
-        // numItems is read-only in AIR. Our ContextMenu models no built-in items
-        // (hideBuiltInItems is a no-op), so the count is exactly the list
-        // getItemAt() indexes -- see the body comment in emit.ts.
-        ['numItems', { returnType: { kind: 'int' }, params: [], owner: 'ContextMenu', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
-        // AIR: `items` is a synonym of `customItems` ("Using this property is
-        // equivalent to using the customItems property"). Both accessors below alias
-        // the same array.
-        ['items', { returnType: { kind: 'array' }, params: [], owner: 'ContextMenu', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // customItems is the same list `items` names -- the live one, so a caller
+        // that mutates it sees the menu change, which is what made it a synonym in
+        // the first place. (numItems/items are inherited from NativeMenu.)
+        ['customItems', { returnType: { kind: 'array' }, params: [], owner: 'ContextMenu', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       setters: new Map([
-        ['items', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Array', defaultValue: null, isRest: false }], owner: 'ContextMenu', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['customItems', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'Array', defaultValue: null, isRest: false }], owner: 'ContextMenu', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
       ]),
       constructor: { params: [] },
-      superClass: 'EventDispatcher',
+      superClass: 'NativeMenu',
       isFinal: false,
       implements: [],
     });

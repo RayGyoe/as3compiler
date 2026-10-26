@@ -229,11 +229,20 @@ modifiers cannot produce it, which reproduces both observables — "shows `S`" a
 internally is **not observable**; only those two outcomes were measured).
 (The `DockIcon.bitmaps` gap that used to sit here was paid off in stage 256 — see §3.1.)
 
-### 7.3 `NativeMenu.display()` has no modal backend
+### 7.3 The modal contract of `NativeMenu.display()`
 
-`display(stage, x, y)` shows a **modal** native menu in AIR. This backend's loop is a non-blocking event
-pump with no nestable modal runner ⇒ **reported** and returns `undefined` (it does not pretend to have
-shown anything).
+`display(stage, x, y)` shows a **modal** native menu in AIR: it **blocks until the menu is picked or
+dismissed**, and the selection event is delivered before it returns. Cocoa gets this for free from
+`-[NSMenu popUpMenuPositioningItem:atLocation:inView:]`, which runs a nested tracking loop, so this backend
+does **not** need a nestable modal pump in its main loop. `sk_menu_popup` therefore reports two things:
+`tag` (which item was picked) and **sync vs async** (Cocoa/Win32 are synchronous; web is not, and
+`sk_menu_popup_take` samples it frame by frame).
+
+The pointer position **at the moment the menu disappears** comes back through `sk_menu_popup`'s `outx/outy`
+out-params (Cocoa `SDL_GetGlobalMouseState`, Win32 `GetCursorPos`): that is where AIR **replays** the
+`rightMouseUp`/`rightClick` the popup swallowed — at the dismissal point (the item / the outside click), not
+at the press point. The **emitter** performs that replay (only it knows the selection order), and it happens
+**before** the selection events.
 
 ### 7.4 macOS renames the first top-level item (**platform behaviour, not a defect**)
 
@@ -277,10 +286,39 @@ reproducing it would mean deliberately shipping a darkening bug (visible as dark
 corners of an icon). Opaque pixels are **byte-identical** on both sides, so ordinary icons look the same; the
 difference only shows on pixels with alpha. **Registered in `TODO.md` (遗留待开发)** — not silent.
 
+### 7.7 Right-click menus: what `contextMenu` binds, and what cannot be matched
+
+The `DisplayObject.contextMenu` right-click path is implemented: `rightMouseDown` → walk the ancestor chain
+to the nearest object owning the menu → `ContextMenuEvent.MENU_SELECT` (dispatched on the **menu**,
+`mouseTarget` is the hit display object, `preventDefault()` is a **no-op**) → popup → replay of the swallowed
+release → selection events (`Event.SELECT` on the item → `Event.SELECT` on the menu with `target` still the
+item → `ContextMenuEvent.MENU_ITEM_SELECT` on the item). With `contextMenu = null` there is **no**
+`MENU_SELECT`, but the right-button events still fire.
+
+**Two divergences that must be stated up front**:
+
+1. **web**: the popup is a DOM overlay; `sk_menu_popup` returns "pending" immediately and the result is
+   collected by `sk_menu_popup_take` on a later frame ⇒ `MENU_SELECT` and the selection events land on
+   **different frames**, and there is **no** release replay (that is an artefact of modality). The browser's
+   own context menu is suppressed by a DOM `contextmenu` listener calling `preventDefault()` (emsdk 3.1.44 has
+   **no** `emscripten_set_contextmenu_callback`). On the web **only the root menu** pops up; nested submenus
+   are not implemented.
+2. **Windows**: the Win32 branch of `vendor/window_glue.cc` uses `TrackPopupMenuEx` + `GetCursorPos`, mirroring
+   Cocoa, but **there is no Windows machine here, so it is unverified** beyond "it compiles".
+
+**One internal dependency**: `sk_resync_right_button()` calls `SDL_SendMouseButton()` to clear the SDL mask
+that thinks the right button is still held down — without it the **second right-click delivers nothing** (the
+popup ate the real release, so SDL's mask stays set). That symbol is SDL **internal** (absent from the public
+headers) and must be re-checked when the SDL version is bumped; the `SDL_MOUSEBUTTONUP` it manufactures is
+swallowed by `g_synth_right_up`, so AS3 only ever sees the pair the emitter replays.
+
+
 ## 8. Verification and evidence
 
 | Item | Evidence |
 |---|---|
+| **`ContextMenu` object model, 26 lines** (byte-identical to `adl`) | `examples/context-menu.as` (AOT `--run`) × `temp/ctxprobe/api/ApiEx.as` (the same program, `adl` build): 26/26 lines agree; `test/unit/context-menu.ts` (`unit: context-menu/Model`, 25 pins) pins the single list, the three ContextMenu-only rules, the `#2007` message and the popup ordering |
+| **Right-click popup, 7 live steps** (macOS) | `temp/ctxmenu/drv.py`: `open`/`pick0`/`pick1`/`twice`/`esc`/`outside`/`nul` — the LR matches `adl` field by field (`rightMouseDown → MENU_SELECT → rightMouseUp → rightClick → the three selection events`), replay coordinates land at the dismissal point (item 148,111 / press 116,98 / outside 348,259); `temp/ctxmenu/{m5-inv,crop-inv}.png` show `visible=false` not rendered, `enabled=false` greyed, `separatorBefore` drawn |
 | 69 model assertions (pure-C build, no window backend) | `examples/native-menu.as` → `native-menu: 69 checks passed` |
 | 39 source-level pins + 16 painting pins | `unit: emit/NativeMenu` and `unit: emit/DockIconImage` in `test/unit/emit.ts` |
 | **8 selection-rule runs** | `temp/dockprobe/`: `{32,96,256}→96`, `{16,512}→16`, `{129,127}→129`, `{128×400, 200×200}→200×200` … (§3.1) |

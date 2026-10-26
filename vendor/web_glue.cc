@@ -236,6 +236,19 @@ static void main_loop(void) {
 static EM_BOOL on_mouse_evt(int eventType, const EmscriptenMouseEvent* e, void* ud) {
   (void)ud;
   if (g_on_mouse == nullptr) return EM_TRUE;
+  // Right button (阶段二百八十九): the popup opens from rightMouseDown, exactly as on
+  // the native backends. Unlike Cocoa the browser keeps delivering the matching up
+  // event, so rightMouseUp/rightClick arrive immediately -- BEFORE the menu's
+  // selection, because this backend cannot block (see sk_menu_popup).
+  if (e->button == 2) {
+    if (eventType == EMSCRIPTEN_EVENT_MOUSEDOWN) {
+      g_on_mouse(0, (double)e->targetX, (double)e->targetY, "rightMouseDown");
+    } else if (eventType == EMSCRIPTEN_EVENT_MOUSEUP) {
+      g_on_mouse(0, (double)e->targetX, (double)e->targetY, "rightMouseUp");
+      g_on_mouse(0, (double)e->targetX, (double)e->targetY, "rightClick");
+    }
+    return EM_TRUE;
+  }
   if (eventType == EMSCRIPTEN_EVENT_MOUSEDOWN && e->button == 0) {
     g_on_mouse(0, (double)e->targetX, (double)e->targetY, "mouseDown");
   } else if (eventType == EMSCRIPTEN_EVENT_MOUSEUP && e->button == 0) {
@@ -395,6 +408,18 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   emscripten_set_mousemove_callback("#canvas", nullptr, EM_FALSE, on_mouse_evt);
   emscripten_set_mouseleave_callback("#canvas", nullptr, EM_FALSE, on_mouse_evt);
   emscripten_set_wheel_callback("#canvas", nullptr, EM_FALSE, on_wheel_evt);
+  // Suppress the BROWSER's own context menu on the canvas: a right click belongs to
+  // the AS3 side (阶段二百八十九). There is no emscripten_set_contextmenu_callback in
+  // emsdk 3.1.44 (checked: system/include/emscripten/html5.h has no "contextmenu"),
+  // so the listener is attached directly and preventDefault() keeps the browser menu
+  // away. Idempotent: sk_window_show may run again for a re-created stage.
+  EM_ASM({
+    var el = Module.canvas;
+    if (el && !el.__skNoCtxMenu) {
+      el.__skNoCtxMenu = true;
+      el.addEventListener('contextmenu', function(ev) { ev.preventDefault(); });
+    }
+  });
 
   // Initial frame (the surface is already rasterized by Stage_showWindow).
   present_frame();
@@ -556,11 +581,143 @@ int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_
   (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
 }
 void sk_dock_bounce(int critical) { (void)critical; }
-// DockIcon.bitmaps: a browser tab has no Dock icon. Exists only so a build that
-// flips ASC_HAS_DOCK_IMAGE later still links.
-void sk_dock_set_icon_image(const void* argb, int w, int h) { (void)argb; (void)w; (void)h; }
+// ---- context-menu popup (阶段二百八十九) ----
+// A browser page has no native popup menu, and no thread to block on: the popup is
+// a DOM overlay and the selection comes back asynchronously, so
+// sk_menu_popup answers 0 (pending) and the generated C polls
+// sk_menu_popup_take once per frame. That is a REAL cross-platform difference
+// against AIR, where the menu is modal: on the web the rightMouseUp/rightClick that
+// follow the menu arrive BEFORE the selection instead of after it. Only the ROOT
+// menu's items are rendered (an item whose NativeMenuItem.submenu is set shows as a
+// plain, inert row) -- nested popups are registered as a web divergence in TODO.md.
+//
+// The picked tag lives in window.__skMenu (a plain JS object) so no C function has to
+// be exported back to JS: `done`/`result` are the handshake, result -1 = dismissed.
+
+static void sk_menu_dom_init(void) {
+  // Plain emscripten_run_script with a raw string, not EM_ASM: EM_ASM stringifies its
+  // one macro argument, so a top-level comma (an object or array literal, e.g.
+  // { items: [], done: 0 }) splits the JS into extra macro arguments and the build
+  // fails with "use of undeclared identifier" (measured with emsdk 3.1.44). Commas
+  // inside parentheses/strings are safe, top-level ones are not.
+  emscripten_run_script(R"SKJS(
+(function () {
+  if (window.__skMenu) return;
+  var m = {};
+  m.items = [];
+  m.done = 0;
+  m.result = -1;
+  m.el = null;
+  m.outside = null;
+  window.__skMenu = m;
+  function close() {
+    if (m.outside) { document.removeEventListener('mousedown', m.outside, true); m.outside = null; }
+    if (m.el && m.el.parentNode) m.el.parentNode.removeChild(m.el);
+    m.el = null;
+  }
+  m.open = function (x, y) {
+    close();
+    m.items = [];
+    m.done = 0;
+    m.result = -1;
+    var el = document.createElement('div');
+    el.style.cssText = 'position:fixed;z-index:2147483647;background:#f5f5f5;border:1px solid #a8a8a8;' +
+      'border-radius:5px;box-shadow:0 5px 14px rgba(0,0,0,.28);padding:4px 0;' +
+      'font:13px -apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;color:#111;' +
+      'min-width:130px;user-select:none;-webkit-user-select:none;';
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
+    el.addEventListener('contextmenu', function (ev) { ev.preventDefault(); });
+    document.body.appendChild(el);
+    m.el = el;
+  };
+  m.add = function (label, enabled, checked, tag) {
+    if (!m.el) return;
+    var row = document.createElement('div');
+    row.textContent = (checked ? '\u2713 ' : '') + label;
+    row.style.cssText = 'padding:4px 22px 4px 16px;white-space:nowrap;cursor:default;' +
+      (enabled ? '' : 'opacity:.4;');
+    if (enabled) {
+      row.addEventListener('mousedown', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        m.done = 1;
+        m.result = tag;
+        close();
+      });
+    }
+    m.el.appendChild(row);
+  };
+  m.sep = function () {
+    if (!m.el) return;
+    var hr = document.createElement('div');
+    hr.style.cssText = 'height:1px;background:#c8c8c8;margin:4px 0;';
+    m.el.appendChild(hr);
+  };
+  m.show = function () {
+    if (!m.el) return;
+    // Keep the menu inside the viewport: AppKit does the same on the native side.
+    var r = m.el.getBoundingClientRect();
+    if (r.right > window.innerWidth) m.el.style.left = Math.max(0, window.innerWidth - r.width) + 'px';
+    if (r.bottom > window.innerHeight) m.el.style.top = Math.max(0, window.innerHeight - r.height) + 'px';
+    // The press that opened the menu is still in flight: an outside-click listener
+    // installed now would fire for it, so install it on the next turn.
+    setTimeout(function () {
+      if (!m.el) return;
+      m.outside = function (ev) {
+        if (m.el && m.el.contains(ev.target)) return;
+        m.done = 1;
+        m.result = -1;
+        close();
+      };
+      document.addEventListener('mousedown', m.outside, true);
+    }, 0);
+  };
+})();
+)SKJS");
+}
+
+int sk_menu_popup(int win, const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, double x, double y, int* tag, double* outx, double* outy) {
+  // A page owns one canvas: the window id is always 0 and unused here.
+  (void)win; (void)menus; (void)nmenus;
+  if (tag != NULL) *tag = 0;
+  // Never used: this backend answers "pending", so the dismissal point the emitter
+  // replays the right release at is not asked for here. The browser has already
+  // delivered rightMouseUp/rightClick by then (that is the documented divergence).
+  if (outx != NULL) *outx = x;
+  if (outy != NULL) *outy = y;
+  if (items == NULL || root < 0 || root >= nmenus) return 0;
+  sk_menu_dom_init();
+  EM_ASM({ window.__skMenu.open($0, $1); }, x, y);
+  int first = menus[root].first;
+  for (int i = 0; i < menus[root].count; i++) {
+    int k = first + i;
+    if (k < 0 || k >= nitems) break;
+    if (items[k].kind == 1) { EM_ASM({ window.__skMenu.sep(); }); continue; }
+    EM_ASM({ window.__skMenu.add(UTF8ToString($0), $1, $2, $3); },
+           items[k].label != NULL ? items[k].label : "", items[k].enabled, items[k].checked, items[k].tag);
+  }
+  EM_ASM({ window.__skMenu.show(); });
+  return 0;  // pending: resolved by sk_menu_popup_take from a later frame
+}
+
+int sk_menu_popup_take(int* tag) {
+  if (tag != NULL) *tag = 0;
+  // -2 = "not open / still open", anything else is the outcome.
+  int code = EM_ASM_INT({
+    if (!window.__skMenu || !window.__skMenu.done) return -2;
+    return window.__skMenu.result | 0;
+  });
+  if (code == -2) return 0;
+  EM_ASM({ window.__skMenu.done = 0; window.__skMenu.result = -1; });
+  if (tag != NULL) *tag = code > 0 ? code : 0;
+  return 1;
+}
 // autoExit: a page cannot "exit", and the requestAnimationFrame loop is owned by
 // the host, so there is nothing to keep alive here. Accepted and ignored.
 void sk_window_set_auto_exit(int on) { (void)on; }
+// DockIcon.bitmaps: a browser tab has no Dock icon. Exists only so a build that
+// flips ASC_HAS_DOCK_IMAGE later still links.
+void sk_dock_set_icon_image(const void* argb, int w, int h) { (void)argb; (void)w; (void)h; }
 
 }  // extern "C"

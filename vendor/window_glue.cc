@@ -1317,6 +1317,35 @@ static void sk_sys_drag_step(WinCtx* c) {
 // Lazily-read ASC_TRACE_INPUT flag (see the event loop below).
 static int sk_trace_input = -1;
 
+// The OS release that ends the press which opened a context menu is swallowed by the
+// modal menu itself (AppKit's tracking loop owns the event stream while it is up), so
+// SDL's cached button mask keeps RIGHT pressed. SDL then DROPS the next right press
+// because it looks like a duplicate of a button that never came up: measured on macOS,
+// right-click -> pick an item -> right-click again delivered no rightMouseDown at all,
+// and only that second click's own release got through (temp/ctxmenu, aot.log + the
+// ASC_TRACE_INPUT trace, which shows 1025 right-down, then 1026 with no 1025 before it).
+// Feed SDL the release it missed once the OS says the button is really up: SDL clears
+// the mask AND queues the SDL_MOUSEBUTTONUP, which is exactly the deferred
+// rightMouseUp/rightClick AIR delivers after a menu closes (measured on adl 51.4.1).
+// SDL_SendMouseButton is not in the public headers we ship, but it is the only way to
+// put the mouse state machine straight -- pushing an event with SDL_PushEvent would
+// bypass the state update that is the whole problem.
+// (SDL_MouseID is internal-only in 2.32's public headers; it is a Sint32.)
+extern "C" int SDL_SendMouseButton(SDL_Window *, Sint32, Uint8, Uint8);
+
+static int g_synth_right_up = 0;
+
+static void sk_resync_right_button(SDL_Window *win) {
+  if (!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_RMASK)) return;
+  if (SDL_GetGlobalMouseState(NULL, NULL) & SDL_BUTTON_RMASK) return;
+  // The event this queues is NOT the AS3 rightMouseUp: the emitter replays that one
+  // itself (at the dismissal point, before the selection events, exactly the order
+  // adl 51.4.1 produces). This call exists only to clear SDL's mask, so the up it
+  // produces is swallowed in the MOUSEBUTTONUP case.
+  g_synth_right_up = 1;
+  SDL_SendMouseButton(win, 0, SDL_RELEASED, SDL_BUTTON_RIGHT);
+}
+
 static void sk_run_loop(void) {
   // Anything the app installed before the window opened is applied NOW (see
   // sk_pending_menu): NSApp only exists once video is up.
@@ -1435,6 +1464,18 @@ static void sk_run_loop(void) {
           }
           break;
         case SDL_MOUSEBUTTONDOWN:
+          // Right button (阶段二百八十九): only the down event reaches AS3 from here --
+          // the context menu pops up right after it, inside the same call, and while a
+          // Cocoa menu is tracking it owns the event stream, so the matching up/click
+          // is consumed by AppKit (identical to AIR's modal behaviour).
+          if (e.button.button == SDL_BUTTON_RIGHT && c->on_mouse) {
+            c->on_mouse(id, (double)e.button.x, (double)e.button.y, "rightMouseDown");
+            c->dirty = 1;
+            // That call may have popped up a context menu, which eats this press's
+            // release -- see sk_resync_right_button.
+            sk_resync_right_button(c->win);
+            break;
+          }
           if (e.button.button == SDL_BUTTON_LEFT && c->on_mouse) {
             c->on_mouse(id, (double)e.button.x, (double)e.button.y, "mouseDown");
             // Second press of a double click: AIR extends the selection to the whole
@@ -1453,7 +1494,22 @@ static void sk_run_loop(void) {
           }
           break;
         case SDL_MOUSEBUTTONUP:
+          // The left-button drag latch is cleared first: it is independent of what
+          // the right button does, and the right-button branches below all break.
           if (e.button.button == SDL_BUTTON_LEFT) c->sys_drag = 0;
+          if (e.button.button == SDL_BUTTON_RIGHT && g_synth_right_up) {
+            // The release sk_resync_right_button manufactured: its only job was
+            // resetting SDL's button mask (AS3 already got the rightMouseUp from the
+            // popup path). Report nothing and clear the flag.
+            g_synth_right_up = 0;
+            break;
+          }
+          if (e.button.button == SDL_BUTTON_RIGHT && c->on_mouse) {
+            c->on_mouse(id, (double)e.button.x, (double)e.button.y, "rightMouseUp");
+            c->on_mouse(id, (double)e.button.x, (double)e.button.y, "rightClick");
+            c->dirty = 1;
+            break;
+          }
           if (e.button.button == SDL_BUTTON_LEFT && c->on_mouse) {
             c->on_mouse(id, (double)e.button.x, (double)e.button.y, "mouseUp");
             // Second click of a double click: AIR REPLACES that click with a
@@ -2917,6 +2973,11 @@ typedef struct sk_menu_t { const char* title; int first; int count; } sk_menu_t;
 
 #if defined(__APPLE__)
 static void (*g_menu_cb)(int) = NULL;
+// Context-menu popup state (阶段二百八十九). popUpMenuPositioningItem: runs a nested
+// tracking loop, so the selection is known when the call returns; this is how the
+// action (which AppKit sends from inside that loop) finds its way back out.
+static int g_popup_mode = 0;
+static int g_popup_tag = 0;
 // Kept in statics so ARC-less retain counts never reach zero while the menu is
 // still on screen; both are replaced wholesale on the next install.
 static void* g_app_nsmenu = NULL;
@@ -3008,6 +3069,9 @@ void sk_dock_set_icon_image(const void* argb, int w, int h) {
 
 static void sk_menu_fired(void* self, SEL _cmd, void* sender) {
   (void)self; (void)_cmd;
+  // A popup's menu is not the app/Dock menu: its action must land in the popup's own
+  // tag, not in the installed menu's callback (the tag tables are different).
+  if (g_popup_mode) { g_popup_tag = sk_send_int(sender, "tag"); return; }
   if (g_menu_cb != NULL) g_menu_cb(sk_send_int(sender, "tag"));
 }
 // The Dock asks the app DELEGATE (SDL installs its own) for the Dock menu.
@@ -3196,6 +3260,58 @@ void sk_dock_bounce(int critical) {
   if (sk_nsapp() == NULL) return;
   ((void (*)(void*, SEL, long))objc_msgSend)(sk_nsapp(), sel_registerName("requestUserAttention:"), critical ? 0 : 10);
 }
+
+// ---- context-menu popup (阶段二百八十九) ----
+// AppKit screen coordinates are BOTTOM-UP from the main display, while the model's
+// screen space (NativeWindow.globalToScreen, sk_window_get_bounds) is SDL's: top-LEFT
+// origin, y downward, measured in the same points. SDL_GetDisplayBounds(0) is that
+// main display in exactly those units, so its height is the flip constant.
+static double sk_screen_flip_y(double y) {
+  SDL_Rect r;
+  if (SDL_GetDisplayBounds(0, &r) != 0 || r.h <= 0) return y;
+  return (double)r.h - y;
+}
+
+// Pop the menu up and BLOCK until it closes -- the same modality AIR has: the
+// tracking loop inside popUpMenuPositioningItem: owns the event stream, so the
+// pending rightMouseUp/rightClick stay queued until the menu is gone. Returns 1
+// (resolved synchronously) with *tag = the chosen tag, or 0 for a dismissal.
+int sk_menu_popup(int win, const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, double x, double y, int* tag, double* outx, double* outy) {
+  if (tag != NULL) *tag = 0;
+  // Default answer: the opening point. Replaced below with where the pointer really
+  // was when the menu closed, which is what AIR replays the right release at.
+  if (outx != NULL) *outx = x;
+  if (outy != NULL) *outy = y;
+  if (sk_nsapp() == NULL) return 0;
+  void* menu = sk_menu_build(menus, nmenus, items, nitems, root);
+  if (menu == NULL) return 0;
+  g_popup_tag = 0;
+  g_popup_mode = 1;
+  // inView:nil means `atLocation:` is already in screen coordinates. With a nil
+  // item the menu's TOP-LEFT corner goes to that point, which is what the model
+  // measured for AIR (the menu opens down-right of the cursor).
+  ((signed char (*)(void*, SEL, void*, double, double, void*))objc_msgSend)(
+      menu, sel_registerName("popUpMenuPositioningItem:atLocation:inView:"),
+      NULL, x, sk_screen_flip_y(y), NULL);
+  g_popup_mode = 0;
+  if (tag != NULL) *tag = g_popup_tag;
+  // The tracking loop is over, so the pointer sits where the user picked or clicked
+  // the menu away -- the dismissal point air replays the swallowed right release
+  // at. SDL_GetGlobalMouseState answers in the same top-left screen space as x/y.
+  if (outx != NULL || outy != NULL) {
+    int gx = 0, gy = 0;
+    SDL_GetGlobalMouseState(&gx, &gy);
+    if (outx != NULL) *outx = (double)gx;
+    if (outy != NULL) *outy = (double)gy;
+  }
+  return 1;
+}
+
+// Cocoa resolves inside sk_menu_popup, so nothing is ever pending here.
+int sk_menu_popup_take(int* tag) {
+  if (tag != NULL) *tag = 0;
+  return 0;
+}
 #else
 // Same two hooks as the Cocoa branch, as explicit no-ops: the frame pump and the
 // event loop call them unconditionally, and this backend has no application menu
@@ -3209,6 +3325,87 @@ int sk_menu_install_app(const sk_menu_t* menus, int nmenus, const sk_menu_item_t
 int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
   (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
 }
+#if defined(_WIN32)
+// ---- context-menu popup (阶段二百八十九) ----
+// TrackPopupMenu is MODAL the same way Cocoa's popUpMenuPositioningItem: is: it runs
+// its own message pump, so the pending rightMouseUp/rightClick stay queued until the
+// menu closes -- the order AIR produces. TPM_RETURNCMD makes the call answer the
+// chosen command id instead of posting WM_COMMAND, so no callback plumbing is
+// needed. Command ids are 1-based positions inside the flattened array (separators
+// take positions of their own), and the AS3 tag is carried separately.
+//
+// NOT VERIFIED ON WINDOWS: this machine has no Windows target, so the code is
+// written against the documented Win32/SDL contracts and registered as unverified
+// in TODO.md. Two known gaps: keyEquivalent is neither displayed nor wired (that
+// needs an accelerator table), and submenus are not attached (NativeMenuItem.submenu
+// is ignored on Windows).
+static void sk_utf8_to_wide(const char* s, wchar_t* out, int cap) {
+  if (cap <= 0) return;
+  out[0] = 0;
+  if (s == NULL) return;
+  if (MultiByteToWideChar(CP_UTF8, 0, s, -1, out, cap) <= 0) out[0] = 0;
+}
+int sk_menu_popup(int win, const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, double x, double y, int* tag, double* outx, double* outy) {
+  if (tag != NULL) *tag = 0;
+  if (outx != NULL) *outx = x;
+  if (outy != NULL) *outy = y;
+  if (menus == NULL || items == NULL || root < 0 || root >= nmenus) return 0;
+  WinCtx* c = sk_slot(win);
+  if (c == NULL || c->win == NULL) return 0;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info)) return 0;
+  HWND hwnd = info.info.win.window;
+  if (hwnd == NULL) return 0;
+  HMENU menu = CreatePopupMenu();
+  if (menu == NULL) return 0;
+  int first = menus[root].first;
+  for (int i = 0; i < menus[root].count; i++) {
+    int k = first + i;
+    if (k < 0 || k >= nitems) break;
+    if (items[k].kind == 1) { AppendMenuW(menu, MF_SEPARATOR, 0, NULL); continue; }
+    wchar_t wlabel[512];
+    sk_utf8_to_wide(items[k].label, wlabel, 512);
+    UINT flags = MF_STRING;
+    if (!items[k].enabled) flags |= MF_GRAYED;
+    if (items[k].checked) flags |= MF_CHECKED;
+    AppendMenuW(menu, flags, (UINT_PTR)(k + 1), wlabel);
+  }
+  POINT pt;
+  pt.x = (LONG)x; pt.y = (LONG)y;
+  ScreenToClient(hwnd, &pt);
+  int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+  DestroyMenu(menu);
+  if (tag != NULL && cmd > 0 && cmd - 1 < nitems) *tag = items[cmd - 1].tag;
+  // Same contract as Cocoa: the pointer at dismissal, not the press point.
+  if (outx != NULL || outy != NULL) {
+    POINT g;
+    if (GetCursorPos(&g)) {
+      if (outx != NULL) *outx = (double)g.x;
+      if (outy != NULL) *outy = (double)g.y;
+    }
+  }
+  return 1;
+}
+int sk_menu_popup_take(int* tag) {
+  if (tag != NULL) *tag = 0;
+  return 0;
+}
+#else
+// No popup on this backend: report "resolved, nothing chosen" so the caller never
+// waits for a menu that will not appear.
+int sk_menu_popup(int win, const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, double x, double y, int* tag, double* outx, double* outy) {
+  (void)win; (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root;
+  if (tag != NULL) *tag = 0;
+  if (outx != NULL) *outx = x;
+  if (outy != NULL) *outy = y;
+  return 1;
+}
+int sk_menu_popup_take(int* tag) {
+  if (tag != NULL) *tag = 0;
+  return 0;
+}
+#endif
 void sk_dock_bounce(int critical) { (void)critical; }
 // No Dock on the other window backends either, and the generated C only calls this
 // when ASC_HAS_DOCK_IMAGE is 1 (Cocoa). Defined anyway so a future backend that

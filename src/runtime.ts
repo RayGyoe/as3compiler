@@ -9235,6 +9235,23 @@ typedef struct { const char* title; int first; int count; } sk_menu;
 extern int sk_menu_supported(void);
 extern void sk_menu_install_app(const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, void (*cb)(int));
 extern void sk_menu_install_dock(const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, void (*cb)(int));
+// ---- right-click / ContextMenu.display popup (阶段二百八十九) ----
+// The description is the SAME flattened model the app/Dock/status menus use, so a
+// backend builds the popup with the code it already has. x/y are SCREEN points in
+// the model's own space (top-left origin, y downward, the space
+// NativeWindow.globalToScreen answers in) -- the glue flips them for AppKit.
+// Returns 1 when the popup already RESOLVED synchronously (a native backend runs a
+// modal tracking loop, so the call blocks exactly like AIR and *tag holds the
+// chosen 1-based tag, 0 = dismissed) and 0 when the backend cannot block (web):
+// then the menu is on screen and sk_menu_popup_take must be polled per frame.
+// *outx/*outy answer the pointer's position in the SAME space as x/y when the menu
+// closed -- AIR replays the swallowed right release at the dismissal point, not at
+// the press point (measured: down at stage 400,243, up/click at 460,256, the item's
+// position). Untouched backends just echo the opening point.
+extern int sk_menu_popup(int win, const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, double x, double y, int* tag, double* outx, double* outy);
+// Non-zero once a popup opened asynchronously has RESOLVED; *tag then carries the
+// 1-based tag, 0 for a dismissal. Answers 0 while the menu is still open.
+extern int sk_menu_popup_take(int* tag);
 extern void sk_dock_bounce(int critical);
 // Straight ARGB (0xAARRGGBB) rows, top-down -- i.e. BitmapData.pixels verbatim. Pass
 // NULL/0/0 to restore the bundle icon. Returns nothing: the glue queues the image if
@@ -9255,6 +9272,10 @@ extern void sk_window_set_auto_exit(int on);
 static inline int sk_menu_supported(void) { return 0; }
 static inline void sk_menu_install_app(const sk_menu* m, int nm, const sk_menu_item* i, int ni, int root, void (*cb)(int)) { (void)m; (void)nm; (void)i; (void)ni; (void)root; (void)cb; }
 static inline void sk_menu_install_dock(const sk_menu* m, int nm, const sk_menu_item* i, int ni, int root, void (*cb)(int)) { (void)m; (void)nm; (void)i; (void)ni; (void)root; (void)cb; }
+// No window backend means no pointer and no screen: report "resolved, nothing
+// chosen" so the caller never waits on a popup that was never shown.
+static inline int sk_menu_popup(int win, const sk_menu* m, int nm, const sk_menu_item* i, int ni, int root, double x, double y, int* tag, double* outx, double* outy) { (void)win; (void)m; (void)nm; (void)i; (void)ni; (void)root; if (tag != NULL) *tag = 0; if (outx != NULL) *outx = x; if (outy != NULL) *outy = y; return 1; }
+static inline int sk_menu_popup_take(int* tag) { if (tag != NULL) *tag = 0; return 0; }
 static inline void sk_dock_bounce(int critical) { (void)critical; }
 static inline void sk_dock_set_icon_image(const void* argb, int w, int h) { (void)argb; (void)w; (void)h; }
 static inline void sk_window_set_auto_exit(int on) { (void)on; }

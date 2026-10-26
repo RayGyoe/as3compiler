@@ -16557,7 +16557,87 @@ viewport 固定，`updateViewPort()` 提前返回，`configureBackBuffer` 永远
 证据：`temp/starl/{ab60,ab120,now-verify,fix-run,ramp}.log`（`ramp.log` 是修前 60 Hz 节奏、目标 60 的
 97,024，属第三方口径，仅作对照）。
 
+### 阶段二百八十九：`flash.ui.ContextMenu` 右键菜单（对象模型 + macOS 弹窗，web 编译通过）（v0.4.251 → v0.4.252）✅ 已完成
+
+**一、范围与口径**
+
+用户立项：按 [NativeMenu 文档](https://airsdk.dev/reference/actionscript/3.0/flash/display/NativeMenu.html) 实现 `ContextMenu`
+右键菜单，**mac + web 一起做**，Windows「能写就写，不实现就记录」。绑定方式**只做 `contextMenu` 右键**（不做 `DisplayObject.menu`
+的窗口菜单），mac 上真模态、web 上异步（差异显式记录）。**一律先量 `adl 51.4.1` 再写代码**：本轮一共 5 个探针程序
+（`temp/ctxprobe/Ctx.as` 事件契约、`Ctx2.as` 吞掉的 release 回放点、`api/Api.as`…`Api5.as` 数据模型），**每一个结论都是探针
+打印出来的，不是文档抄的**。
+
+**二、对象模型：`ContextMenu extends NativeMenu`，且只有一份列表**
+
+文档说 `customItems` 是「本菜单自有的项」，历史实现据此给了 `ContextMenu` **第二份** `customItems` 列表、`NativeMenu._items` 留空。
+探针推翻了它（`temp/ctxprobe/api/out2.txt`）：`items.length == numItems == 3` 且 `items[0] === a` ⇒ **同一份列表**。
+改法：`ContextMenu` 的 `superClass` 仍为 `NativeMenu`，删掉私有 `customItems` 字段，改由 `ContextMenu_get_customItems`
+**返回 `m->_items` 别名**；`ContextMenu_ctor` 只补建 `builtInItems`。弹窗装配（`as_ctxmenu_fill`）与 `display()` 都从
+`((NativeMenu*)o)->_items` 取项。
+
+**三、三条 ContextMenu 独有规则（全都与基类相反，逐条实测）**
+
+| 调用 | `ContextMenu` | `NativeMenu` | 落地 |
+|---|---|---|---|
+| `getItemByName(name)` | **恒 `null`**（即使名字匹配） | 命中返回该项 | 覆盖为 `return NULL`（同一条目在纯 `NativeMenu` 里能找到 ⇒ 规则属菜单、不属条目类） |
+| `setItemIndex(item, i)` | **任何 index 都 `#2006`**（含合法值、`-1`、外来项） | 正常移动 | 覆盖为无条件抛 `RangeError #2006` |
+| `addItem` / `addItemAt` 重复项 | **允许**（`A,B,A`；`addItemAt(a,1)` 成功并留下 4→3 项） | `addItem` 重复 ⇒ `#2004` | 覆盖为先判空 `#2007` + 判界 `#2006`，**不查重** |
+
+另外实测：`display(null, …)` 抛 **ArgumentError `#2007`「Parameter stage must be non-null.」**（不是 `#1009`）；
+`ContextMenu.isSupported == NativeMenu.isSupported == true`（静态）；`ContextMenuItem`/`NativeMenuItem` **非动态类**（动态写 `#1056`）；
+条目默认 `enabled=true, visible=true, separatorBefore=false, checked=false`；`removeItem` 只删**第一个**匹配项、不存在抛 `#2006`。
+`getItemAt` 越界、`removeItemAt` 越界同样是 `#2006`；空菜单上 `removeAllItems` 仍是合法 no-op。
+
+**四、事件契约（探针 `temp/ctxprobe/out2.txt` 逐行）**
+
+`MENU_SELECT` 派发在 **`ContextMenu` 自身**（`bubbles=false cancelable=false`，`mouseTarget` = 命中的显示对象，
+`contextMenuOwner` = 祖先链上最近的那个持有该菜单的对象），时机在 `rightMouseDown` **之后**、弹窗**之前**；
+对它 `preventDefault()` **无效**；`contextMenu = null` ⇒ **不派发**。选中一项的顺序是
+`Event.SELECT`（target=entry）→ `Event.SELECT`（currentTarget=menu、target 仍是 entry）→ `ContextMenuEvent.MENU_ITEM_SELECT`。
+
+**五、被弹窗吞掉的 release：AIR 在「消失点」回放，顺序在选中事件之前**
+
+真模态弹窗吃掉了 `rightMouseUp`/`rightClick`，但 `adl` 并没有丢它们——它在菜单消失那一刻**补发**，且**先于**选中事件：
+按下在 `(400,243)`、松手在 `(460,256)` ⇒ 回放坐标就是**该项的位置**。Escape 取消回放到**按下点**，点窗外取消回放到**窗外的那个点**。
+落地方式：`sk_menu_popup()` 增加 `double* outx, double* outy` 出参（Cocoa 用 `SDL_GetGlobalMouseState`、Win32 用
+`GetCursorPos` 取消失瞬间的指针，web 回显开局点），**同步弹窗且 `fromPress==1`** 时由发射器在选中事件之前调用
+`ASC_window_on_mouse(win, ux, uy, "rightMouseUp")` 再 `"rightClick"`；`display()` 调用点传 `fromPress=0`（没有「按下」可回放）。
+于是 LR = `rightMouseDown → MENU_SELECT → rightMouseUp → rightClick → ITEM-GENERIC-SELECT → MENU-GENERIC-SELECT → MENU_ITEM_SELECT`，
+与 `adl` 逐字段相同（坐标、`buttonDown`、`target`/`currentTarget`/`mouseTarget`/`contextMenuOwner` 全部对上）。
+
+**六、真机验收（macOS，`temp/ctxmenu/`，驱动脚本 `drv.py`）**
+
+`open` / `pick0` / `pick1`（连续两次，验证第二次仍能弹）/ `esc` / `outside` / `twice` / `nul` 七步全绿：
+选中回放坐标 `(148,111)`（项上）、Escape 回放 `(116,98)`（按下点）、点窗外回放 `stage=(348,259)`（窗外点）、
+`contextMenu = null` 时**无** `MENU_SELECT` 而右键事件照发；`visible=false` 的项**不渲染**、`enabled=false` 灰色、
+`separatorBefore=true` 画出分隔线（截图 `temp/ctxmenu/m5-inv.png` → `crop-inv.png`）。
+
+**七、`examples/context-menu.as`（26 行，与 `adl` 逐字节相同）**
+
+同一份程序写两遍（AOT `--run` 与 `adl` 探针 `temp/ctxprobe/api/ApiEx.as`），输出**26/26 行完全一致**。配套
+`test/unit/context-menu.ts` 的 `unit: context-menu/Model`（25 钉）钉住：一份列表（`customItems` 别名）、三条独有规则、
+`#2007` 文案、弹窗的 `MENU_SELECT → 回放 → 选中` 顺序、`fromPress` 守卫、glue 里 `g_synth_right_up` 的吞事件口径、
+web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_contextmenu_callback`，已核实 `html5.h` 无此符号）。
+
+**八、如实报明（未测/未做）**
+
+1. **Windows 未在本机验证**：`vendor/window_glue.cc` 的 Win32 `sk_menu_popup` 分支（`TrackPopupMenuEx` + `GetCursorPos`）只到
+   「能编译」的把握，本机无 Windows；`window_glue.cc` 的 Windows 支随 CI 编译。
+2. **web 只做编译检查**：`emcc -std=c++17 -c vendor/web_glue.cc -I vendor/skia -DASC_USE_SKIA=1 -DASC_USE_WINDOW=1` 干净通过，
+   但**没有**在真浏览器里点过；web 的弹窗是 DOM 覆盖层 + 异步 `sk_menu_popup_take`，因此**事件顺序与 mac 不同**（`MENU_SELECT`
+   与选中事件跨帧），差异写在 `vendor/web_glue.cc` 的注释里；web 上**不支持**嵌套子菜单，只弹根菜单。
+3. **`SDL_SendMouseButton` 是 SDL 内部 API**（`vendor/window_glue.cc` 自声明 `extern "C" int SDL_SendMouseButton(SDL_Window*, Sint32, Uint8, Uint8)`）：
+   公开头文件里没有它，用于清掉 SDL 以为「右键还按着」的掩码，否则**第二次右键不派发任何事件**。若将来升级 SDL 版本需复核该符号；
+   它造出来的 `SDL_MOUSEBUTTONUP` 由 `g_synth_right_up` 吞掉，AS3 只看到发射器补发的那一对。
+4. **`NativeMenu.addItem` 的重复项行为出现两份互相矛盾的实测记录**：`temp/deskprobe2/probe-plain.txt`（`num=1`，静默忽略）与
+   本轮 `temp/ctxprobe/api/out6.txt`（`threw 2004`，且该进程随后未继续）。**本轮不改 `NativeMenu`**（不在范围内，且改动会波及
+   应用菜单），只记录矛盾；`ContextMenu` 侧口径明确（允许重复），按后者落地。
+
 ### 遗留待开发
+> **2026-10-26 追加（阶段二百八十九：`flash.ui.ContextMenu` 右键菜单）**：**新登记 1 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **93 → 93 项**（`未开始` 不变）。
+> - **移出 1 行**：``NativeMenu.display() 没有模态菜单后端``。本阶段给 Cocoa 后端接了真模态弹窗（``sk_menu_popup`` 用 ``popUpMenuPositioningItem:atLocation:inView:`` 跑嵌套 tracking loop，阻塞到选中/取消），``NativeMenu.display`` 与 ``ContextMenu.display`` 都改走它 ⇒ 该行已收尾，按「已完成项一经落地即从本表移出」下架。
+> - **新登记 1 行**：``NativeMenu.addItem`` 的**重复项**行为在两份自家实测里互相矛盾（``temp/deskprobe2/probe-plain.txt`` 静默忽略 ``num=1`` vs ``temp/ctxprobe/api/out5.txt``/``out6.txt`` 抛 ``#2004``）。矛盾未定案前**不动** ``NativeMenu``（改动会波及应用菜单）；``ContextMenu`` 侧口径明确（允许重复 ``A,B,A``），已按实测落地。解密需在干净 SDK/机器上重测。
+> - **刻意不入表的分歧**（`adl` 没有对应路径或属验证欠账）：web 的弹窗是 DOM 覆盖层 + 异步 ``sk_menu_popup_take``，事件顺序与 mac 天然不同、且只弹根菜单（不支持嵌套子菜单）；Windows 的 ``TrackPopupMenuEx`` 分支本机无 Windows 未验证；``SDL_SendMouseButton`` 是 SDL 内部 API（公开头文件无此符号，用于清「右键还按着」的掩码，否则第二次右键不派发事件）。
 > **2026-10-26 追加（阶段二百八十七：透明窗的呈现层 1:1）**：**新登记 0 行 / 改写 0 行 / 移出 0 行**（表内项数不变）。这是**呈现路径**缺陷（`CALayer` 默认重力把旧帧拉满新 bounds），不是 `adl` 跑得对我们跑不出的语义缺口 ⇒ 不占本表；同一阶段的点击吞噬（覆盖视图成了窗口 hit view）同样是**平台接线**缺陷、且已修净，一并不入本表；它与阶段一百三十三同族、同一条修法，根因、单行 A/B 实测（15/151 → 0/155）与未测项见阶段节与 `docs/zh-cn/skia.md` §6.7.1。
 > **2026-10-25 追加（阶段二百七十五：G24 / G25 / G26 三条运行时契约）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。三条都是「`adl` 跑得对、我们跑不出」的**语义实错**，且都在本阶段**修净**（按表头自述「已完成项一经落地即从本表移出」，故不入表），证据与复现见阶段节与 `asaotui/compiler-gaps.md` G24/G25/G26。**两处刻意不复刻的分歧已如实登记**（`drawPath` 单段曲线不填、曲线描边 coverage 6.9%），一条不可解释的 AIR 行为（`3,3`）明确选择不模仿。
 > **2026-10-25 追加（阶段二百七十四：烘焙面的设备像素栅格）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数**保持 93 项**。这是**我们自己发明的优化**（自动烘焙在 AIR 里没有对应物）兑现不了自己的承诺（「烘焙态 == 活态」）造成的**呈现缺陷**，`adl` 根本不经过这条路径 ⇒ 不属 §1.5「`adl` 跑得对我们跑不出」，故不占本表；三条根因（设备空间吸附 / 描边纳入包围盒 / 缓存按相位失效）、17 px 残余的量化与未测项见阶段节与 `docs/zh-cn/skia.md` §6.12。
@@ -16805,8 +16885,8 @@ viewport 固定，`updateViewPort()` 提前返回，`configureBackBuffer` 永远
 | **空 `File`（`new File()`）的成员访问全线不抛 `#2037`**（`nativePath`/`url`/`size`/`exists`/`isDirectory`/`name`/`extension`/`parent`/`spaceAvailable`） | **部分完成**（2026-10-22 阶段二百四十三 实测登记：`adl 51.4.1` 上这十个成员全部抛 `#2037`，连 `nativePath` getter 本身都抛；**2026-10-23 阶段二百六十四 两个目录列举成员已补齐**） | 我方 `File` 把 `nativePath` 当**普通字段**（`NULL` 原样返回、`url` 拼出 `"file://"`、`size`/`spaceAvailable` 回 `0`、`exists`/`isDirectory` 回 `false`、`parent` 回 `NULL`）。**已对齐的两个**：`getDirectoryListing()`（空 `File` → `#2037`，顺带补齐 `#3003` 缺失 / `#3007` 非目录 / 不可读目录回空表三条实测口径）与 `getDirectoryListingAsync()`（空 `File` 与「上一次还在飞」共用 `#2037`）。**仍缺的八个**是上述 getter：族级修复要先把 `nativePath` 从字段改成访问器（牵动 AMF 成员表、结构体布局、codegen 的字段访问），不是单点补丁 | 先把 `nativePath` 变访问器（`File_get_nativePath` 抛 `#2037`），再给其余八个成员各加同一守卫；每个成员配一条 `examples/` 断言 + 一条 `unit:` 源级钉。**注意**：`nativePath` 是 AMF 成员名，改成访问器时要同步 `File_amf_members` 与反射表 |
 | **基类 `EventDispatcher.parent` 字段在动态读里压过派生类 getter**（`f["parent"]` 恒回 `null`，含 `File` 这种**有** `parent` getter 的类） | 未开始（2026-10-23 阶段二百六十四 实测登记；顺带发现、与异步化无关） | `adl 51.4.1`：`new File("…/a.txt")["parent"]` → `[object File]`、`typeof` 为 `"object"`、`"parent" in f` 为 `true`；我们同一个对象 `f.parent`（静态）正确而 **`f["parent"]` 回 `null`**（`typeof` 也是 `"object"` ⇒ 不是 `undefined`）。根因在 `as_dyn_get`（`src/runtime.ts:5335`）：它把**整条 super 链的 props（字段）表走完**，才轮到 getters 表 ⇒ 基类**字段**永远优先于派生类 **getter**；而 `EventDispatcher_props[]` 把 C 侧内部链接 `parent`（`offsetof(EventDispatcher, parent)`，`vis=0` 即「公开成员」）列了出来。`adl` 的 `EventDispatcher` **没有任何 accessor/variable**（`describeType` 实测为空表），所以这个字段本就不该是反射可见成员 | 两条路选一：① `EventDispatcher` 的 `parent` 链接**不进** `_props`（置 `vis=1`，与 `_arr`/`_runs` 那些 C-runtime-only 槽同口径），派生类的 getter 自然胜出；② 让 `as_dyn_get` 按**类层次**逐级解析（每级先看 props+getters 再看基类），与 AS3「派生遮蔽基类」一致。证据：`temp/listingprobe/{Shadow,DynParent}.as` + `adlshadow.txt`（`adl` 侧）| 先按 ① 改（一行 `vis`，改动面最小），再用 `for-in`/`JSON` 双端对照补验「该字段是否还从别的反射口漏出」；② 是更彻底的口径修复，但会动动态读的解析顺序，需全量回归 |
 | **`File` 的其余三个 async 成员仍是 inline 完成**（`moveToTrashAsync`/`deleteFileAsync`/`deleteDirectoryAsync`） | 未开始（2026-10-23 阶段二百六十四 登记；本阶段只把 `getDirectoryListingAsync` 真异步化，这三条**如实报明**） | `adl` 在自己的 IO 线程上完成再派发（实测「调用后立刻查 `exists` 仍为 `true`」），我们则**在同一次调用内**做完并派发 ⇒ 大盘（如递归删除几万个条目的目录）会照样把 AS3 线程卡住，且 `File.cancel()` 对它们没有可取消的作业（调用返回时作业已退休）。三者的 `#2037`/`#3003` 等**错误口径**已与 `adl` 一致（阶段二百四十三 已量），缺的只是**投递时机**与可取消性 | 与 `AS_JOB_DIR` 同法：各加一个作业类型（`AS_JOB_TRASH`/`AS_JOB_DELETE_FILE`/`AS_JOB_DELETE_DIR`）+ 完成 thunk（在 AS3 线程上派发 `COMPLETE`/`IOErrorEvent`），`File.cancel()` 已经按「按目标对象找在飞作业」实现，接上即可。注意 `moveToTrash` 在 Windows 走 `SHFileOperationW`，作业体里要保留同一条回退链 |
-| `NativeMenu.display()` **没有模态菜单后端** | 未开始（2026-10-23 阶段二百五十五） | AIR 的 `display(stage, x, y)` 弹一个**模态**原生菜单（阻塞到选中/取消）；本后端是**非阻塞**事件泵，没有可嵌套的模态运行器 ⇒ 现在**报明**并返回 `undefined`（不假装弹过）。`dispatchContextMenuSelect` 同样回 `undefined`（那一条与 `adl` 一致，不是缺口） | 要落地得给 run loop 加一层「嵌套模态泵」：进 `display()` 后跑一个局部 `NSModalSession`/嵌套 `SDL_PumpEvents`（只处理本菜单、吞掉其余输入），返回后恢复；风险是重入整个帧循环（计时器/事件/窗口结算都会停），须先证明普通 AIR 应用不会因此死锁。优先级低——菜单栏与 Dock 右键两条路已覆盖 demo 需求 |
 | **`Event` 的只读访问器在我们这里是可写字段**（`type` / `bubbles` / `cancelable` / `target` / `currentTarget` …） | 未开始（2026-10-23 阶段二百五十八 实测登记） | 阶段二百五十八 量动态写只读 trait 时顺手量出来的：`adl 51.4.1` 上 `(new ScreenMouseEvent("x") as Object)["type"] = 1` 抛 **`#1074`**（`type`/`bubbles`/`cancelable`/`target`/`clickCount` 全抛，且报文写的是**接收者的类**而不是声明者），`toString`/`clone` 这类方法名抛 **`#1037`**，只有真正不存在的名字才是 `#1056`；我方 `as_dyn_set` 本轮已按此补齐 `#1074`/`#1037` 两条，但 `type`/`bubbles`/`target` 在 `Event` 里是**普通字段**（`FieldInfo`），于是动态写会**照收**、静态写也编得过 ⇒ 与 `adl` 不一致。成因是 `Event` 从阶段三十五 就是「字段 + 直接访问」，改成访问器要动 `Event_ctor`/AMF 成员表/`X_props` 布局与全部派发点 | 先把 `type`/`target`/`bubbles`/`cancelable`/`currentTarget`/`eventPhase` 从字段改成 `X_get_*` 访问器（只读者不给 setter，写路径自然走 `#1074` 与编译错），同步 AMF 成员表与反射表；`Event_ctor` 与内置派发改用内部写入口。风险面较大（`Event` 是全部事件的基类），需先跑一遍全量回归确定零行为漂移再改 |
+| **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 
 
 

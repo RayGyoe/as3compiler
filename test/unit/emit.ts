@@ -2557,8 +2557,14 @@ function checkEntryPointRecovery(): string[] {
   // The callbacks are handed to the native layer by these exact names, so no
   // _impl/body split may reappear: both halves would have to be installed, and a
   // missed rename leaves the window with a dead handler.
+  // The slice starts at the DEFINITION (the forward declaration above it matches
+  // `static void ASC_window_on_mouse(int id, double x, double y, const char* type);`
+  // too, and cutting there would span half the file).
+  const mouseBody = c.slice(
+    c.indexOf('static void ASC_window_on_mouse(int id, double x, double y, const char* type) {'),
+    c.indexOf('static double ASC_window_on_frame_delay('));
   check('no entry point is split into a helper the glue does not know about',
-    !/_impl\b/.test(c.slice(c.indexOf('static void ASC_window_on_mouse('), c.indexOf('static double ASC_window_on_frame_delay('))));
+    mouseBody.length > 1000 && !/_impl\b/.test(mouseBody));
   console.log(`     [entry] ${ok} entry-point recovery check(s) passed`);
   return bad;
 }
@@ -3777,9 +3783,14 @@ function checkEmitNativeMenu(): string[] {
     && fill[1].indexOf('Pass 2:') > fill[1].lastIndexOf('c->menus[idx].count++'));
   check('the click tag is 1-based into the tag table',
     c.includes('c->items[k].tag = c->tag_base + k + 1;'));
+  // The menu-level dispatch goes through as_menu_select_on so that the MENU is the
+  // currentTarget while the ITEM stays the target (measured on adl 51.4.1: the
+  // handler sees cur=menu, tgt=item). A plain dispatchEvent on the menu would make
+  // the menu its own target.
   check('a click dispatches select on the item AND its menu',
     c.includes('EventDispatcher_dispatchEvent((EventDispatcher*)it, (Event*)Event_new((char*)"select", false, false));')
-    && c.includes('if (it->_menu != NULL) EventDispatcher_dispatchEvent((EventDispatcher*)it->_menu, (Event*)Event_new((char*)"select", false, false));'));
+    && c.includes('if (it->_menu != NULL) as_menu_select_on((void*)it->_menu, it);')
+    && /static void as_menu_select_on\(void\* disp, NativeMenuItem\* item\) \{[\s\S]{0,300}?e->target = \(Object\*\)item;/.test(c));
 
   // ---- capability flags answer for the backend ------------------------------
   const pre = RUNTIME_PREAMBLE;
@@ -3812,8 +3823,12 @@ function checkEmitNativeMenu(): string[] {
     c.includes('flash.desktop.NativeApplication.menu = null (adl crashes on this; the menu is left unchanged)'));
   check('autoExit reaches the shared run loop',
     c.includes('sk_window_set_auto_exit(value ? 1 : 0);'));
-  check('display() reports the missing modal backend instead of pretending',
-    c.includes('flash.display.NativeMenu.display (this backend cannot run a modal native menu)'));
+  // 阶段二百八十九: the modal backend EXISTS now (Cocoa runs a nested tracking
+  // loop inside popUpMenuPositioningItem:), so display() must pop up rather than
+  // report, and the old "unsupported" string must be gone.
+  check('display() pops a real menu instead of reporting a missing backend',
+    !c.includes('cannot run a modal native menu')
+    && /void NativeMenu_display\(void\* _this, Stage\* stage, double x, double y\) \{[\s\S]{0,600}?as_menu_popup_stage\(/.test(c));
   check('startAtLogin throws #2014 like adl',
     c.includes('as_throw(IllegalOperationError_new') && c.includes('2014'));
   // keyEquivalentModifiers is MAPPED now, not reported away. The table in the

@@ -37,7 +37,8 @@
 | `supportsDockIcon` / `supportsMenu` | ✅ | 只在 `ASC_USE_WINDOW && __APPLE__` 报 `true`（§2） |
 | `supportsSystemTrayIcon` / `supportsStartAtLogin` / `supportsDefaultApplication` | ✅ 恒 `false`（`supportsSystemTrayIcon` 在 `--features tray` 下为 `true`） | 默认与本后端实际能力一致（§2）；托盘开关见 [`compile.md`](compile.md) §3.4.5 |
 | `NativeMenu` / `NativeMenuItem` | ✅ 全成员 | 列表语义、错误号、拷贝语义逐项对 `adl`（§4、§5） |
-| `NativeMenu.display()` | ⚠️ 报明 | 本后端跑不了模态原生菜单（§7.3） |
+| `NativeMenu.display()` / `ContextMenu.display()` | ✅ 实现（macOS 真模态；web 异步） | Cocoa 侧跑嵌套 tracking loop，阻塞到选中/取消；web 见 §7.7 |
+| `ContextMenu` / `ContextMenuItem` | ✅ 实现（右键弹窗） | 对象模型逐条对 `adl`，含三条**与基类相反**的独有规则（§8） |
 | `keyEquivalentModifiers` | ✅ 已映射 | `15..20` 逐值实测后译成 `NSEventModifierFlags`（§7.2） |
 
 ---
@@ -220,10 +221,16 @@ NativeMenu/NativeMenuItem  →  sk_menu[] + sk_menu_item[]（dfs 展平，子菜
 于是「显示 `S` 但永不触发」两个可观测结果同时成立（AIR 内部怎么做的**不可观测**，量到的只是这两条）。
 （上一轮同在这里的「`DockIcon.bitmaps` 不上屏」已于阶段二百五十六清偿，见 §3.1。）
 
-### 7.3 `NativeMenu.display()` 没有模态菜单后端
+### 7.3 `NativeMenu.display()` 的模态语义
 
-`display(stage, x, y)` 在 AIR 里弹一个**模态**原生菜单。本后端的循环是非阻塞事件泵，没有可嵌套的
-模态运行器 ⇒ **报明**并返回 `undefined`（不假装弹过）。
+`display(stage, x, y)` 在 AIR 里弹一个**模态**原生菜单：**阻塞到选中/取消**，选中事件在返回前派发。
+Cocoa 侧用 `-[NSMenu popUpMenuPositioningItem:atLocation:inView:]` 实现——它自己跑嵌套 tracking loop，
+天然满足「阻塞」语义，所以本后端**不需要**给主循环加可重入的模态泵。`sk_menu_popup` 因此有两个返回值
+维度：`tag`（选中了哪一项）与**同步/异步**（Cocoa/Win32 同步，web 异步 ⇒ 由 `sk_menu_popup_take` 逐帧取样）。
+
+弹窗**消失那一刻**的指针位置由 `sk_menu_popup` 的 `outx/outy` 出参报告（Cocoa `SDL_GetGlobalMouseState`、
+Win32 `GetCursorPos`）：AIR 在此时**补发**被弹窗吞掉的 `rightMouseUp`/`rightClick`，坐标取消失点（选中项/
+窗外点）而不是按下点。这段回放由**发射器**做（只有它知道选中事件的顺序），且发生在选中事件**之前**。
 
 ### 7.4 主菜单第一个顶级项会被 macOS 改名（**平台行为，非缺陷**）
 
@@ -262,10 +269,34 @@ Windows 侧将来接 `HWND` 菜单栏是**独立阶段**的事；wasm 没有原�
 故意实现一个变暗 bug（图标圆角的抗锯齿边会出现暗边）。不透明像素两边**逐字节相同**，所以普通图标
 看不出差别；差异只出现在带 alpha 的像素上。**如实登记在 `TODO.md` 遗留表**，不静默。
 
+### 7.7 右键菜单：`contextMenu` 的绑定与无法对齐的地方
+
+`DisplayObject.contextMenu` 的右键通路已实现：`rightMouseDown` → 在祖先链上找最近一个持有该菜单的对象 →
+`ContextMenuEvent.MENU_SELECT`（派发在**菜单**上，`mouseTarget` 是命中的显示对象，`preventDefault()` **无效**）→
+弹窗 → 回放被吞的 release → 选中事件（`Event.SELECT` 在条目 → `Event.SELECT` 在菜单且 `target` 仍是条目 →
+`ContextMenuEvent.MENU_ITEM_SELECT` 在条目）。`contextMenu = null` 时**不派发** `MENU_SELECT`，但右键事件照发。
+
+**两处必须报明的差异**：
+
+1. **web**：弹窗是 DOM 覆盖层，`sk_menu_popup` 立即返回「未决」，结果由 `sk_menu_popup_take` 在后续帧取回
+   ⇒ `MENU_SELECT` 与选中事件**跨帧**，且**没有** release 回放（那是模态的产物）。浏览器原生右键菜单用
+   DOM `contextmenu` 监听器 `preventDefault()` 抑制（emsdk 3.1.44 **没有** `emscripten_set_contextmenu_callback`）。
+   web 上**只弹根菜单**，嵌套子菜单未实现。
+2. **Windows**：`vendor/window_glue.cc` 的 Win32 分支用 `TrackPopupMenuEx` + `GetCursorPos`，与 Cocoa 同构；
+   **本机无 Windows，未真机验证**，只到「能编译」的把握。
+
+**一处内部依赖**：`sk_resync_right_button()` 调 `SDL_SendMouseButton()` 清掉 SDL 以为「右键还按着」的掩码——
+不这么做**第二次右键不派发任何事件**（弹窗吃掉了真 release，SDL 的掩码永远停在按下）。该符号是 SDL 的**内部**
+API（公开头文件没有），升级 SDL 时需复核；它造出来的 `SDL_MOUSEBUTTONUP` 由 `g_synth_right_up` 吞掉，AS3 侧
+只看到发射器补发的那一对。
+
+
 ## 8. 验收与证据
 
 | 项 | 证据 |
 |---|---|
+| **`ContextMenu` 对象模型 26 行**（与 `adl` 逐字节相同） | `examples/context-menu.as`（AOT `--run`）× `temp/ctxprobe/api/ApiEx.as`（同一段程序的 `adl` 版）：26/26 行一致；配套 `test/unit/context-menu.ts` 的 `unit: context-menu/Model`（25 钉）钉住一份列表、三条独有规则、`#2007` 文案与弹窗顺序 |
+| **右键弹窗 7 步真机**（macOS） | `temp/ctxmenu/drv.py` 的 `open`/`pick0`/`pick1`/`twice`/`esc`/`outside`/`nul`：LR 与 `adl` 逐字段相同（`rightMouseDown → MENU_SELECT → rightMouseUp → rightClick → 三个选中事件`），回放坐标 = 消失点（项上 148,111 / 按下点 116,98 / 窗外点 348,259）；截图 `temp/ctxmenu/{m5-inv,crop-inv}.png` 证明 `visible=false` 不渲染、`enabled=false` 灰色、`separatorBefore` 画线 |
 | 模型层 69 条断言（纯 C 构建，无窗口后端） | `examples/native-menu.as` → `native-menu: 69 checks passed` |
 | 生成 C 的 39 条源级钉 + 上屏 16 条 | `test/unit/emit.ts` 的 `unit: emit/NativeMenu` 与 `unit: emit/DockIconImage` |
 | **选图规则 8 轮** | `temp/dockprobe/`：`{32,96,256}→96`、`{16,512}→16`、`{129,127}→129`、`{128×400, 200×200}→200×200` …（§3.1 表） |
