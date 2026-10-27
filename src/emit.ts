@@ -12033,18 +12033,33 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return DisplayObjectContainer_removeChild(_this, (DisplayObject*)as_v_obj_val(c->children->data[index]));');
     this.indent--;
     this.line('}');
-    // removeChildren(beginIndex = 0, endIndex = 0x7FFFFFFF): AIR removes beginIndex
-    // up to -- but NOT including -- endIndex. Removing from the top down keeps the
-    // indices below the cursor stable while the array shrinks; endIndex is clamped
-    // to the current length so the documented default (0x7FFFFFFF) means "to the
-    // end" without the caller knowing the count.
+    // removeChildren(beginIndex = 0, endIndex = 0x7FFFFFFF): measured on adl 51.4.1
+    // (temp/dlorder/Probe.as + adl-range.txt, four children A..D):
+    //   removeChildren()        -> removed A, B, C, D
+    //   removeChildren(0, 2)    -> removed A, B, C  (left D)
+    //   removeChildren(1, 3)    -> removed B, C, D  (left A)
+    //   removeChildren(0, 0)    -> removed A        (left B, C, D)
+    //   removeChildren(2, 2)    -> removed C        (left A, B, D)
+    // so endIndex is INCLUSIVE and the walk is ASCENDING from beginIndex (always the
+    // child that begins the range, so later indices shift down by one). Both halves
+    // matter: descending order is what broke the meeting window's close path --
+    // VideoRootView.removeStage() does `upBtn.parent.removeChild(upBtn)` and upBtn is
+    // a SIBLING added to the same parent after the view itself. Removing top-down took
+    // upBtn out first, so by the time the view's own REMOVED_FROM_STAGE handler ran,
+    // upBtn.parent was NULL, #1009 aborted the whole close chain (diag log:
+    // TalkMED Meeting diag.c:304715 right after the websocket close). AIR removes the
+    // view first, and upBtn is still attached inside its handler.
     this.line('void DisplayObjectContainer_removeChildren(void* _this, int beginIndex, int endIndex) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
     this.line('if (c->children == NULL) return;');
     this.line('if (beginIndex < 0) beginIndex = 0;');
-    this.line('if (endIndex > c->children->length) endIndex = c->children->length;');
-    this.line('for (int i = endIndex - 1; i >= beginIndex; i--) DisplayObjectContainer_removeChildAt(_this, i);');
+    this.line('if (endIndex >= c->children->length) endIndex = c->children->length - 1;');
+    // Count first: every removal shrinks the array, so the range is walked by always
+    // taking the child at beginIndex. removeChildAt() re-finds by value and returns
+    // NULL for an out-of-range index, so a handler that disposes siblings first is safe.
+    this.line('int n = endIndex - beginIndex + 1;');
+    this.line('for (int i = 0; i < n; i++) DisplayObjectContainer_removeChildAt(_this, beginIndex);');
     this.indent--;
     this.line('}');
     // getChildIndex(child): the child's position. AIR throws ArgumentError #2025
@@ -19601,6 +19616,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     // the measured behaviour -- it ignores `visible` and, for a button, answers false
     // (Ed24 §2..§4).
     this.line('if (pick && !o->visible) return false;');
+    // DisplayObject.scrollRect clips the MOUSE region of this object's own art and its
+    // whole subtree, with the window anchored to this object's box (0,0,w,h) and the
+    // content slid by -x/-y -- the same split the renderer and as_pick_hit_m use. Without
+    // it a scrolled list's region reaches into the clipped-away rows: the real app's
+    // 分享屏幕 window has a 576x332 scroll view whose items continue to y=590.9, and the
+    // region test claimed stage y 344..400 -- exactly the band holding 采集系统声音/开始共享
+    // -- so those buttons never received a click even though they were the topmost
+    // PAINTED objects there (diag log: pick=MHIOSScrollBar while content=SimpleButton).
+    //
+    // pick-only: hitTestPoint(x, y, true) is UNCLIPPED in AIR -- measured on adl 51.4.1
+    // (temp/dlorder/Xcheck.as: a 100x300 child under a (0,0,100,100) scrollRect answers
+    // true at stage y 250 and 390, i.e. below the window). Only the mouse pick clips.
+    this.line('if (pick && o->_scroll_rect != NULL) {');
+    this.indent++;
+    this.line('Rectangle* sr = o->_scroll_rect;');
+    this.line('if (lx < 0 || ly < 0 || lx > sr->width || ly > sr->height) return false;');
+    this.line('lx += sr->x; ly += sr->y;');
+    this.indent--;
+    this.line('}');
     // A SimpleButton draws its STATES but owns no shape of its own (the four states
     // are separate DisplayObjects, per the SimpleButton docs). So its shapeFlag=true
     // region is EMPTY: adl answers false for hitTestPoint(x, y, true) on a button

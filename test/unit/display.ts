@@ -115,6 +115,37 @@ function checkHitShape(): string[] {
   check('upState==NULL paints nothing',
     emitted.includes('if (b->upState == NULL) return NULL;'));
 
+  // ---- scrollRect 裁的是**鼠标**命中区（阶段三百）----
+  //
+  // 真应用症状：分享屏幕窗口底部按钮（采集系统声音 / 开始共享 / 刷新）全点不动，
+  // ASC_MOUSE_TRACE=2 显示 `pick=MHIOSScrollBar` 而 `content=SimpleButton/TextField`：
+  // 那个 576x332 的滚动视图里 items 画到 y=590.9，旧命中区不认 scrollRect，于是滚动条
+  // 把「自己一格像素都没有」的下方整条区域（stage y 344..400）当成命中目标，而它按添加
+  // 顺序压在按钮之上。
+  //
+  // 但只能裁 `pick` 那一版：adl 实测 hitTestPoint(x, y, true) **不**看 scrollRect
+  // （temp/dlorder/Xcheck.as：100x300 子件挂在 (0,0,100,100) 的 scrollRect 下，stage
+  // y=250 / y=390 仍答 true）。两条路不得给成同一个答案。
+  {
+    // 只看这个函数体：渲染/指纹里也有 `o->_scroll_rect != NULL`，全局否定会误伤。
+    const at = emitted.indexOf('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly, int pick) {');
+    const body = emitted.slice(at, emitted.indexOf(String.fromCharCode(10) + '}', at));
+    check('the PICK region is clipped by scrollRect (window + content shift)',
+      body.includes('if (pick && o->_scroll_rect != NULL) {')
+      && body.includes('if (lx < 0 || ly < 0 || lx > sr->width || ly > sr->height) return false;')
+      && body.includes('lx += sr->x; ly += sr->y;')
+      && !body.includes('if (o->_scroll_rect != NULL) {'));
+  }
+  check('hitTestPoint(shapeFlag=true) is NOT clipped by scrollRect (adl-measured)',
+    emitted.includes('return as_obj_region_hit_local(o, lx, ly, 0);')
+    && emitted.includes('return as_obj_region_hit_local(o, lx, ly, 1);'));
+  // 行为跟钉在 examples/displaylist-removechildren.as（末端三条 hitTestPoint 断言）；
+  // 鼠标侧的真值证据在 temp/pickclip（剔除 scrollRect 后同一击变成 `CLICK bar(bug)`）。
+  const rcExample = readFileSync(join(root, 'examples', 'displaylist-removechildren.as'), 'utf8');
+  check('the example pins the unclipped shapeFlag region',
+    rcExample.includes('if (!clip.hitTestPoint(150, 250, true)) throw new Error("FAIL scroll: belowClip(150,250)");') &&
+    rcExample.includes('if (clip.hitTestPoint(90, 150, true)) throw new Error("FAIL scroll: left(90,150)");'));
+
   if (ok > 0) console.log(`[hitshape] ${ok} hit-region checks passed`);
   return bad;
 }
@@ -742,6 +773,24 @@ function checkListEvents(): string[] {
 
   check('addChild implicitly re-parents through the old parent first',
     (emitted.match(/if \(child->parent != NULL\) DisplayObjectContainer_removeChild\(\(void\*\)child->parent, child\);/g) ?? []).length === 2);
+
+  // ---- removeChildren(): ASCENDING from beginIndex, endIndex INCLUSIVE ----
+  //
+  // 阶段三百（temp/dlorder，adl 51.4.1 四种子件 A..D 实测）：
+  //   removeChildren()     -> A B C D ；removeChildren(0,2) -> A B C（剩 D）
+  //   removeChildren(1,3)  -> B C D ；removeChildren(0,0) -> A（剩 BCD）
+  // 顺序是硬语义，不是实现细节：真应用关闭会议时
+  // ViewControl.removeChildall() 调 removeChildren()，而被摘掉的 VideoRootView 在自己的
+  // REMOVED_FROM_STAGE 里做 `upBtn.parent.removeChild(upBtn)` —— upBtn 是同一个父容器的
+  // **后加兄弟**。降序（旧实现从 endIndex-1 往下）会先摘掉 upBtn，等视图的 handler 跑时
+  // upBtn.parent 已是 NULL，#1009 打断整条关闭链（diag.log：紧接 #1009 的就是 websocket close）。
+  check('removeChildren walks ASCENDING from beginIndex (one removal per slot)',
+    emitted.includes('if (endIndex >= c->children->length) endIndex = c->children->length - 1;') &&
+    emitted.includes('int n = endIndex - beginIndex + 1;') &&
+    emitted.includes('for (int i = 0; i < n; i++) DisplayObjectContainer_removeChildAt(_this, beginIndex);') &&
+    !/for \(int i = endIndex - 1; i >= beginIndex; i--\)/.test(emitted));
+  check('a re-entrant handler cannot walk removeChildAt out of range',
+    /DisplayObjectContainer_removeChildAt\(void\* _this, int index\) \{[\s\S]{0,200}?index >= c->children->length\) return NULL;/.test(emitted));
 
   // The behaviour itself is pinned by the example (run by test/examples.ts).
   const example = readFileSync(join(root, 'examples', 'displaylist-events.as'), 'utf8');

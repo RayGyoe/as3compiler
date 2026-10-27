@@ -479,6 +479,7 @@ The full 19-item list (the rest being Lottie, native shaders, FFI, server-side r
 - `examples/stage94q.as` — escape decoding in string literals
 - `examples/stage94r.as` — the `TextField` border is a 1px screen-space line (not polluting local metrics)
 - `examples/stage94s.as` — `hitTestPoint`'s `true` branch is the content area (not the bounding box)
+- `examples/displaylist-removechildren.as` — AIR's `removeChildren()`: **ascending** from `beginIndex`, `endIndex` **inclusive** (adl-measured, four children A..D over five ranges), plus removing a later sibling from inside a `removedFromStage` handler still works (what the real app's `VideoRootView.removeStage()` does while closing a meeting); the tail also pins that `hitTestPoint(…, true)` is **not** clipped by `scrollRect`
 - `examples/stage94t.as` — `int64`/`uint64` 64-bit integers (enhancement, see `docs/en/enhancements.md` §4.7)
 - `examples/textline.as` — `TextField.getLineMetrics` / `TextLineMetrics`
 - `examples/bytearray-index.as` — the full semantics of the `ByteArray` index form
