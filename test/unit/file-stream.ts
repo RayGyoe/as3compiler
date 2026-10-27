@@ -20,6 +20,7 @@
 //   * FileFilter must not grow back the invented winType/name/clone members.
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
+import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
 import { registerGroup } from '../harness.ts';
 
 // The smallest program that drags in every member pinned below.
@@ -61,6 +62,9 @@ var roots:Array = File.getRootDirectories();
 var ps:String = File.permissionStatus;
 var ic:Object = f.icon;
 var cw:File = File.workingDirectory;
+var cd:File = File.cacheDirectory;
+f.copyTo(new File("/tmp/z"), true);
+var par:File = f.parent;
 
 var vol:StorageVolume = new StorageVolume(f, "n", true, false, "apfs", "/");
 var ev:StorageVolumeChangeEvent = new StorageVolumeChangeEvent(StorageVolumeChangeEvent.STORAGE_VOLUME_MOUNT, false, false, f, vol);
@@ -179,4 +183,86 @@ function checkSurface(): string[] {
   return bad;
 }
 
+// The Windows half of the same batch. Stages 298/299 were measured on adl/macOS
+// only, and every pin below is a place where the POSIX answer had been hard-coded
+// while the Windows answer differs -- measured on adl 51.4.1 / Windows 10
+// (temp/winfile/adl-win*.txt). They are source pins rather than example assertions
+// because the Windows arm of each #ifdef must hold even where the suite runs
+// (macOS, i.e. CI), and no example can reach a Windows-only branch from there.
+function checkWindows(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const count = (n: string): number => c0.split(n).length - 1;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [filestream-win] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [filestream-win] ${label}`); }
+  };
+  const c0 = generateC(parse(PROG)).c;
+
+  // ---- cacheDirectory is the TEMP directory, not a Caches folder ------------
+  check('the Windows cacheDirectory is the OS temp directory',
+    c0.includes('char* t = as_file_temp_dir();') && c0.includes('return (t != NULL) ? as_path_norm(t) : as_home_dir();'));
+  check('the Windows cacheDirectory no longer invents a Caches folder',
+    !c0.includes('as_path_join(e, "Caches")') && !c0.includes('AppData/Local/Caches'));
+  check('as_file_temp_dir asks the OS instead of reading three env vars',
+    c0.includes('DWORD tlen = GetTempPathA((DWORD)sizeof(tmpdir), tmpdir);'));
+  check('...and refuses a buffer that is too small rather than truncating',
+    c0.includes('if (tlen == 0 || tlen >= (DWORD)sizeof(tmpdir)) return NULL;'));
+
+  // ---- drive-relative paths: kept verbatim, ONE separator appended ----------
+  check('a drive-relative path with no separator is not parsed as components',
+    c0.includes('int j = 2;') && c0.includes('else drive_rel = 1;'));
+  check('...it is copied verbatim and closed with a separator',
+    c0.includes('memcpy(out + o, src + 2, (size_t)(n - 2));'));
+  check('a drive-relative first component takes no separator of its own',
+    c0.includes('!(drive_rel && o == 2)'));
+  check('".." cannot pop the drive of a drive-relative path',
+    c0.includes('} else if (o == root_len || (o >= 2 && out[o - 1] == ' + "'" + '.' + "'"));
+
+  // ---- parent(): the root keeps its separator ------------------------------
+  check('parent of a drive-root child is the drive root itself',
+    c0.includes("if (cut == 2 && s[1] == ':') { char* d = as_str_alloc(4); d[0] = s[0];"));
+  check('a root-relative path keeps its leading separator in parent()',
+    c0.includes('if (cut == 0) { char* d = as_str_alloc(2); d[0] = s[0];'));
+  check('the separator scan reaches index 0 (a trailing separator no longer hides the root)',
+    c0.includes('for (int i = n - 1; i >= 0; i--) if (s[i] =='));
+
+  // ---- getRelativePath: separator-aware, forward slashes, root-gated --------
+  check('getRelativePath splits on BOTH separators',
+    c0.includes('while (*pa ==' + " '" + '/' + "'" + ' || *pa =='));
+  check('...and answers null across two different roots',
+    c0.includes('roa = as_path_root_len(a);')
+    && c0.includes('if (roa != rob || strncmp(a, b, roa) != 0) return NULL;')
+    && c0.includes('pb = b + rob;'));
+  check('...and joins the answer with forward slashes on every host',
+    c0.includes("? '/' : rest[i];"));
+
+  // ---- a case-only difference is the SAME file ----------------------------
+  check('copyTo/moveTo judge sameness through as_path_under (case-insensitive on Windows)',
+    count('as_path_under(dst, src)') === 2 && count('return 3014;') === 2 && !c0.includes('strcmp(dst, src) == 0'));
+
+  // ---- FileStream: 64-bit offsets and APPEND at EOF ------------------------
+  check('stream offsets go through one 64-bit pair',
+    c0.includes('static long long as_fs_tell(FILE* f) {')
+    && c0.includes('static int as_fs_seek(FILE* f, long long pos, int whence) {'));
+  check('the Windows arm is the UCRT 64-bit form',
+    c0.includes('return (long long)_ftelli64(f);') && c0.includes('return _fseeki64(f, pos, whence);'));
+  check('no 32-bit ftell is left in the position/truncate family',
+    !c0.includes('p = ftell((FILE*)o->_handle);') && !c0.includes('pos = ftell((FILE*)o->_handle);'));
+  check('bytesAvailable is a 64-bit subtraction',
+    c0.includes('static long long as_fs_avail(FileStream* o) {') && c0.includes('  long long cur, end;'));
+  check('APPEND opens at EOF, not at 0',
+    c0.includes('if (mc == 3) as_fs_seek(f, 0, SEEK_END);'));
+
+  // ---- the async opener has the same two rules ----------------------------
+  check('openAsync also starts APPEND at EOF',
+    RUNTIME_PREAMBLE.includes("if (mode[0] == 'a') fseek((FILE*)h, 0, SEEK_END);"));
+  check('openAsync measures the size with the 64-bit form on Windows',
+    RUNTIME_PREAMBLE.includes('__int64 cur = _ftelli64((FILE*)h);'));
+
+  if (ok > 0) console.log(`[filestream-win] ${ok} emit checks passed`);
+  return bad;
+}
+
 registerGroup('unit: file-stream/contract', checkSurface);
+registerGroup('unit: file-stream/windows', checkWindows);

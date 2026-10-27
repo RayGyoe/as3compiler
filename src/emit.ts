@@ -16413,7 +16413,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
 static char* as_path_norm(const char* p) {
   if (p == NULL) return NULL;
   int n = (int)strlen(p);
-  int i, k = 0, o = 0, root_len = 0, abs = 0;
+  int i, k = 0, o = 0, root_len = 0, abs = 0, drive_rel = 0;
   char* src = as_str_alloc((size_t)n + 1);
   char* out = as_str_alloc((size_t)n + 4);
 #ifdef _WIN32
@@ -16434,10 +16434,27 @@ static char* as_path_norm(const char* p) {
   src[n] = '\\0';
 #ifdef _WIN32
   if (n >= 2 && src[1] == ':') {
-    // Drive-qualified. "C:x" is drive-RELATIVE on Windows, so it is not abs.
+    // Drive-qualified. "C:x" is drive-RELATIVE on Windows, so it is NOT abs.
+    int j = 2;
+    while (src[j] != '\\0' && src[j] != sep) j++;
+    if (src[j] == '\\0') {
+      // AIR does not parse a drive-relative path whose remainder has no separator:
+      // it keeps the text after the colon verbatim and appends ONE separator
+      // (measured: "C:foo" -> "C:foo\\", "C:." -> "C:.\\", "C:.." -> "C:..\\", and
+      // "C:" -> "C:\\"). Treating it as "drive + component" instead would produce
+      // the ABSOLUTE "C:\\foo" -- a different file -- and would let a ".." pop the
+      // drive and collapse the whole path to "".
+      out[o++] = src[0]; out[o++] = ':';
+      memcpy(out + o, src + 2, (size_t)(n - 2));
+      o += n - 2;
+      out[o++] = sep;
+      out[o] = '\\0';
+      return out;
+    }
     out[o++] = src[0]; out[o++] = ':';
     k = 2;
     if (src[2] == sep) { out[o++] = sep; k = 3; abs = 1; }
+    else drive_rel = 1;
   } else if (src[0] == sep && src[1] == sep) {
     // UNC "\\\\server\\share\\...": the two name components are the root and are
     // copied verbatim, because ".." must never pop the share.
@@ -16470,9 +16487,11 @@ static char* as_path_norm(const char* p) {
           while (o > root_len && out[o - 1] != sep) o--;
           if (o > root_len) o--;
         }
-      } else if (o == 0 || (o >= 2 && out[o - 1] == '.' && out[o - 2] == '.' && (o == 2 || out[o - 3] == sep))) {
-        // A relative path keeps a leading "..": it cancels only real names.
-        if (o > 0) out[o++] = sep;
+      } else if (o == root_len || (o >= 2 && out[o - 1] == '.' && out[o - 2] == '.' && (o == 2 || out[o - 3] == sep))) {
+        // A relative path keeps a leading "..": it cancels only real names, and for
+        // a drive-relative path (o == root_len, i.e. right after "C:") the drive is
+        // not a name either -- "C:..\\x" must not become "..\\x".
+        if (o > 0 && out[o - 1] != sep) out[o++] = sep;
         out[o++] = '.'; out[o++] = '.';
       } else {
         while (o > 0 && out[o - 1] != sep) o--;
@@ -16480,7 +16499,9 @@ static char* as_path_norm(const char* p) {
       }
       continue;
     }
-    if (o > 0 && out[o - 1] != sep) out[o++] = sep;
+    // A drive-relative path's first component follows the colon with no separator
+    // of its own ("C:foo\\bar").
+    if (o > 0 && out[o - 1] != sep && !(drive_rel && o == 2)) out[o++] = sep;
     memcpy(out + o, src + s, (size_t)len);
     o += len;
   }
@@ -16496,7 +16517,12 @@ static char* as_path_norm(const char* p) {
     if (p[i] == '/' || p[i] == '\\\\') { cut = i; break; }
   }
   if (cut < 0) return (char*)"";
-  if (cut == 0) return (char*)"/";
+  if (cut == 0) {
+    // A root-relative path keeps ITS OWN separator: "\\a" -> "\\", not "/".
+    char* root = as_str_alloc(2);
+    root[0] = p[0]; root[1] = '\\0';
+    return root;
+  }
 #ifdef _WIN32
   if (cut == 2 && p[1] == ':') {
     char* drive = as_str_alloc(4);
@@ -16623,11 +16649,21 @@ static char* as_path_norm(const char* p) {
     // Measured on adl 51.4.1 (temp/fileaudit2/af.txt): cacheDirectory is
     // ~/Library/Caches on macOS, workingDirectory is the process CWD, and
     // permissionStatus is "granted" because macOS does not gate access per-file.
+    // as_file_temp_dir is defined further down (it also backs createTempFile). The
+    // forward declaration keeps "where does the OS put scratch files" answered in
+    // ONE place -- which is what AIR does: on Windows cacheDirectory IS the temp
+    // directory, not a Caches folder beside the app data.
+    this.line('static char* as_file_temp_dir(void);');
     this.cblock(`static char* as_file_cache_dir(void) {
 #ifdef _WIN32
-  const char* e = getenv("LOCALAPPDATA");
-  if (e != NULL && e[0] != 0) return as_path_join(e, "Caches");
-  return as_path_join(as_home_dir(), "AppData/Local/Caches");
+  // Measured on adl 51.4.1 / Windows 10: the answer is the OS temp directory
+  // (C:\\Users\\<user>\\AppData\\Local\\Temp on this host). The previous branch
+  // invented a "Caches" folder under LOCALAPPDATA -- a macOS layout extrapolated
+  // to Windows without a probe, so every cache lookup missed.
+  {
+    char* t = as_file_temp_dir();
+    return (t != NULL) ? as_path_norm(t) : as_home_dir();
+  }
 #elif defined(__APPLE__)
   return as_path_join(as_home_dir(), "Library/Caches");
 #else
@@ -16640,7 +16676,16 @@ static char* as_path_norm(const char* p) {
 }
 static char* as_file_working_dir(void) {
   char buf[4096];
+#ifdef _WIN32
+  // getcwd() is a POSIX name: MSVC declares only _getcwd (in <direct.h>) and has
+  // no getcwd at all, which under C99 is an undeclared function -- the whole
+  // translation unit failed to compile on Windows before this branch existed.
+  // GetCurrentDirectoryA is the kernel32 form of the same query and needs no
+  // extra header, the route as_mkdir_one and as_app_dir already take.
+  if (GetCurrentDirectoryA((DWORD)sizeof(buf), buf) == 0) return as_home_dir();
+#else
   if (getcwd(buf, sizeof(buf)) == NULL) return as_home_dir();
+#endif
   return as_path_norm(buf);
 }`);
     // systemCharset: AIR reports the OS's LEGACY encoding here (measured: the
@@ -17026,8 +17071,13 @@ static char* as_file_working_dir(void) {
     this.line('int n = (int)strlen(s);');
     this.line('while (n > 1 && (s[n - 1] == \'/\' || s[n - 1] == \'\\\\\')) n--;');
     this.line('int cut = -1;');
-    this.line('for (int i = n - 1; i > 0; i--) if (s[i] == \'/\' || s[i] == \'\\\\\') { cut = i; break; }');
-    this.line('if (cut <= 0) return NULL;');
+    this.line('for (int i = n - 1; i >= 0; i--) if (s[i] == \'/\' || s[i] == \'\\\\\') { cut = i; break; }');
+    this.line('if (cut < 0) return NULL;');
+    this.line('// The root keeps its separator: parent("C:\\\\a") is "C:\\\\", NOT the drive-');
+    this.line('// relative "C:" a plain prefix would give, and parent("\\\\a") is "\\\\"');
+    this.line('// (measured on adl 51.4.1 / Windows).');
+    this.line('if (cut == 2 && s[1] == \':\') { char* d = as_str_alloc(4); d[0] = s[0]; d[1] = \':\'; d[2] = \'\\\\\'; d[3] = \'\\0\'; return File_new(d); }');
+    this.line('if (cut == 0) { char* d = as_str_alloc(2); d[0] = s[0]; d[1] = \'\\0\'; return File_new(d); }');
     this.line('char* out = as_str_alloc((size_t)cut + 1);');
     this.line('memcpy(out, s, (size_t)cut);');
     this.line('out[cut] = \'\\0\';');
@@ -17355,16 +17405,39 @@ static void as_file_set_downloaded(const char* p, int on) {
     // (`parent.getRelativePath(child)` is "child", `child.getRelativePath(parent)`
     // is ".."), the empty string for the same path, and NULL -- not an exception --
     // when a ".." would be needed while useDotDot is false.
-    this.cblock(`static char* as_file_relpath(const char* a, const char* b, int useDotDot) {
+    // The root prefix of a normalised path: a drive ("C:\\"), a UNC share
+    // ("\\\\server\\share\\") or the single separator. Two paths only have a relative
+    // answer when their roots agree.
+    this.cblock(`static size_t as_path_root_len(const char* p) {
+  size_t n = strlen(p), i;
+  if (n >= 2 && p[1] == ':') return (n >= 3 && (p[2] == '/' || p[2] == '\\\\')) ? 3 : 2;
+  if (n >= 2 && (p[0] == '/' || p[0] == '\\\\') && (p[1] == '/' || p[1] == '\\\\')) {
+    int seps = 0;
+    for (i = 2; i < n; i++) {
+      if (p[i] == '/' || p[i] == '\\\\') { if (++seps == 2) return i + 1; }
+    }
+    return n;
+  }
+  return (n >= 1 && (p[0] == '/' || p[0] == '\\\\')) ? 1 : 0;
+}
+static char* as_file_relpath(const char* a, const char* b, int useDotDot) {
   const char* pa = a;
   const char* pb = b;
+  size_t roa, rob;
   if (a == NULL || b == NULL) return NULL;
+  // No relative path exists between two different roots, and AIR answers null
+  // rather than a ".." chain across them (measured: C:\\a\\b -> D:\\x\\y is null).
+  roa = as_path_root_len(a);
+  rob = as_path_root_len(b);
+  if (roa != rob || strncmp(a, b, roa) != 0) return NULL;
+  pa = a + roa;
+  pb = b + rob;
   for (;;) {
     size_t la = 0, lb = 0;
-    while (*pa == '/') pa++;
-    while (*pb == '/') pb++;
-    while (pa[la] != 0 && pa[la] != '/') la++;
-    while (pb[lb] != 0 && pb[lb] != '/') lb++;
+    while (*pa == '/' || *pa == '\\\\') pa++;
+    while (*pb == '/' || *pb == '\\\\') pb++;
+    while (pa[la] != 0 && pa[la] != '/' && pa[la] != '\\\\') la++;
+    while (pb[lb] != 0 && pb[lb] != '/' && pb[lb] != '\\\\') lb++;
     if (la == 0 || lb == 0) break;
     if (la != lb || strncmp(pa, pb, la) != 0) break;
     pa += la;
@@ -17378,12 +17451,12 @@ static void as_file_set_downloaded(const char* p, int on) {
     char* out;
     size_t w = 0;
     for (;;) {
-      while (*q == '/') q++;
+      while (*q == '/' || *q == '\\\\') q++;
       if (*q == 0) break;
       ups++;
-      while (*q != 0 && *q != '/') q++;
+      while (*q != 0 && *q != '/' && *q != '\\\\') q++;
     }
-    while (*rest == '/') rest++;
+    while (*rest == '/' || *rest == '\\\\') rest++;
     if (ups > 0 && !useDotDot) return NULL;
     n = (size_t)ups * 3 + strlen(rest) + 1;
     out = as_str_alloc(n);
@@ -17393,10 +17466,11 @@ static void as_file_set_downloaded(const char* p, int on) {
       out[w++] = '.';
     }
     if (rest[0] != 0) {
+      // AIR joins the answer with FORWARD slashes even on Windows (measured:
+      // C:\\a\\b -> C:\\a\\b\\c\\d.txt is "c/d.txt"), so the tail is mapped.
       size_t rl = strlen(rest);
       if (w > 0) out[w++] = '/';
-      memcpy(out + w, rest, rl);
-      w += rl;
+      for (size_t i = 0; i < rl; i++) out[w++] = (rest[i] == '\\\\') ? '/' : rest[i];
     }
     out[w] = 0;
     return out;
@@ -17408,10 +17482,15 @@ static void as_file_set_downloaded(const char* p, int on) {
     // exactly that shape, so the name differs per run just as AIR's does.
     this.cblock(`static char* as_file_temp_dir(void) {
 #ifdef _WIN32
-  const char* e = getenv("TEMP");
-  if (e == NULL || e[0] == 0) e = getenv("TMP");
-  if (e == NULL || e[0] == 0) e = getenv("USERPROFILE");
-  return (char*)e;
+  // GetTempPathA is the OS answer (it consults TMP, then TEMP, then the profile,
+  // i.e. the same order AIR follows), so adl and this build name the same folder
+  // without this side hard-coding one env var. The old three-getenv chain ended at
+  // USERPROFILE: a temp file dropped straight into the profile ROOT whenever TEMP
+  // and TMP were unset, which is a writable-looking but wrong answer.
+  static char tmpdir[4096];
+  DWORD tlen = GetTempPathA((DWORD)sizeof(tmpdir), tmpdir);
+  if (tlen == 0 || tlen >= (DWORD)sizeof(tmpdir)) return NULL;
+  return tmpdir;
 #else
   const char* e = getenv("TMPDIR");
   if (e == NULL || e[0] == 0) e = "/tmp";
@@ -17630,12 +17709,17 @@ static char* as_file_temp_path(int isDir) {
   if (!as_path_exists_l(src)) return 3003;
   if (as_path_exists_l(dst)) {
     if (!overwrite) return 3012;
-    if (strcmp(dst, src) == 0 || as_path_under(dst, src)) return 3014;
+    // as_path_under also answers "the two paths are the same", and it compares
+    // case-insensitively on Windows -- which matters beyond tidiness: a case-only
+    // difference would otherwise be judged "a different target", the overwrite
+    // branch would DELETE the destination (which IS the source) and the copy would
+    // then fail with #3003 after destroying the file.
+    if (as_path_under(dst, src)) return 3014;
     {
       int rm = as_remove_any(dst);
       if (rm != 0) return rm;
     }
-  } else if (strcmp(dst, src) == 0) {
+  } else if (as_path_under(dst, src)) {
     return 3014;
   }
   parent = as_path_dirname(dst);
@@ -18458,6 +18542,24 @@ static int as_fs_open_err(const char* path, int mc) {
   if (as_path_is_dir(path)) return 3006;
   return 0;
 }
+// 64-bit stream offsets. long is 32 bits on Windows, so plain ftell/fseek cap a
+// FileStream at 2 GB there (and the position goes NEGATIVE past that, which
+// truncate() would then hand to _chsize_s). The UCRT's _i64 forms are the same
+// functions with a 64-bit offset; POSIX hosts in this project have a 64-bit long.
+static long long as_fs_tell(FILE* f) {
+#ifdef _WIN32
+  return (long long)_ftelli64(f);
+#else
+  return (long long)ftell(f);
+#endif
+}
+static int as_fs_seek(FILE* f, long long pos, int whence) {
+#ifdef _WIN32
+  return _fseeki64(f, pos, whence);
+#else
+  return fseek(f, (long)pos, whence);
+#endif
+}
 // Adopt an already-decided mode on the handle: the one place fopen() happens, so
 // the sync open and the async finish thunk cannot drift apart.
 static int as_fs_begin(FileStream* o, const char* path, int mc) {
@@ -18471,6 +18573,11 @@ static int as_fs_begin(FileStream* o, const char* path, int mc) {
   else cm = "r+b";
   f = fopen(path, cm);
   if (f == NULL) return 2038;
+  // APPEND starts at EOF -- AIR reports position == file length right after open
+  // (measured: position 6 on a 6-byte file, the next write extending it to 8).
+  // MSVC's "ab" only seeks to the end on the first WRITE, so without this the
+  // position reads 0 and a following writeUTFBytes lands at the wrong offset.
+  if (mc == 3) as_fs_seek(f, 0, SEEK_END);
   // Unbuffered writes: AIR's FileStream makes each writeUTFBytes observable in the
   // file right away (the adl-vs-AOT probes read the log while the app is still
   // running), while stdio would hold the bytes in a 4 KB buffer until fclose.
@@ -18534,14 +18641,14 @@ static void as_fs_w32(FileStream* o, unsigned v) {
 }
 // Bytes still ahead of the position, or 0 when the handle is not readable -- the
 // callers have already reported #2029 in that case.
-static long as_fs_avail(FileStream* o) {
-  long cur, end;
+static long long as_fs_avail(FileStream* o) {
+  long long cur, end;
   if (o->_handle == NULL) return 0;
-  cur = ftell((FILE*)o->_handle);
+  cur = as_fs_tell((FILE*)o->_handle);
   if (cur < 0) cur = 0;
-  fseek((FILE*)o->_handle, 0, SEEK_END);
-  end = ftell((FILE*)o->_handle);
-  fseek((FILE*)o->_handle, cur, SEEK_SET);
+  as_fs_seek((FILE*)o->_handle, 0, SEEK_END);
+  end = as_fs_tell((FILE*)o->_handle);
+  as_fs_seek((FILE*)o->_handle, cur, SEEK_SET);
   return (end > cur) ? (end - cur) : 0;
 }`);
     this.cblock(`void FileStream_ctor(FileStream* o) {
@@ -18621,9 +18728,9 @@ static long as_fs_avail(FileStream* o) {
     // read-only handle).
     this.cblock(`void FileStream_truncate(void* _this) {
   FileStream* o = (FileStream*)_this;
-  long pos;
+  long long pos;
   if (!as_fs_writable(o)) { as_fs_no_stream(); return; }
-  pos = ftell((FILE*)o->_handle);
+  pos = as_fs_tell((FILE*)o->_handle);
   if (pos < 0) pos = 0;
   fflush((FILE*)o->_handle);
 #ifdef _WIN32
@@ -18634,9 +18741,9 @@ static long as_fs_avail(FileStream* o) {
 }`);
     this.cblock(`double FileStream_get_position(void* _this) {
   FileStream* o = (FileStream*)_this;
-  long p;
+  long long p;
   if (o->_handle == NULL) { as_fs_no_stream(); return 0.0; }
-  p = ftell((FILE*)o->_handle);
+  p = as_fs_tell((FILE*)o->_handle);
   return (p < 0) ? 0.0 : (double)p;
 }
 void FileStream_set_position(void* _this, double value) {
@@ -18644,11 +18751,11 @@ void FileStream_set_position(void* _this, double value) {
   if (o->_handle == NULL) { as_fs_no_stream(); return; }
   if (o->_mode == 3) { as_file_throw(2037); return; }
   if (value < 0.0 || !(value == value)) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return; }
-  fseek((FILE*)o->_handle, (long)value, SEEK_SET);
+  as_fs_seek((FILE*)o->_handle, (long long)value, SEEK_SET);
 }
 unsigned FileStream_get_bytesAvailable(void* _this) {
   FileStream* o = (FileStream*)_this;
-  long n;
+  long long n;
   if (!as_fs_readable(o)) { as_fs_no_stream(); return 0u; }
   n = as_fs_avail(o);
   return (n > 0) ? (unsigned)n : 0u;
@@ -18815,7 +18922,7 @@ void FileStream_writeMultiByte(void* _this, char* value, char* charSet) {
   if (bytes == NULL) return;
   if (!as_fs_readable(o)) { as_fs_no_stream(); return; }
   if (length == 0) {
-    long avail = as_fs_avail(o);
+    long long avail = as_fs_avail(o);
     length = (avail > 0) ? (unsigned)avail : 0u;
   }
   as_ba_grow(bytes, (int)(offset + length));
@@ -18837,7 +18944,7 @@ void FileStream_writeBytes(void* _this, ByteArray* bytes, unsigned offset, unsig
 as_value FileStream_readObject(void* _this) {
   FileStream* o = (FileStream*)_this;
   static const unsigned char as_fs_empty[1] = { 0 };
-  long avail;
+  long long avail;
   unsigned char* buf;
   size_t used = 0;
   as_amf_err err;
@@ -18854,7 +18961,7 @@ as_value FileStream_readObject(void* _this) {
   free(buf);
   // readObject consumes exactly the bytes the value occupied, so the stream is
   // repositioned rather than left at EOF.
-  fseek((FILE*)o->_handle, -(long)(avail - (long)used), SEEK_CUR);
+  as_fs_seek((FILE*)o->_handle, -(long long)(avail - (long long)used), SEEK_CUR);
   if (err.code != 0) as_amf_throw_err(&err);
   (void)as_fs_empty;
   return v;

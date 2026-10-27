@@ -380,6 +380,31 @@ AIR 在构造器里就拒绝相对路径（`#2004`）。我们保留字符串（
 `file://` + 路径。AIR 造不出这个对象，所以这不是「我们对 AIR 已有行为的改写」，而是**AIR
 没有对应物**的那一类；它同时是 `examples/file-url.as` 的一条显式断言，不是为了好看。
 
+### 11.6 Windows 宿主上的实测差异（阶段三百）
+
+阶段二百九十八 / 二百九十九 的行为都是在 macOS 的 `adl` 上量的，而 `File` 家族几乎每个成员
+都碰宿主路径规则。补测（`adl 51.4.1` / Windows 10 19045，探针 `temp/winfile/adl/`，读数
+`adl-win{,2,3}.txt`）分出六处**宿主分叉**，均已按实测落地：
+
+| 面 | Windows 实测 | 修前 |
+|---|---|---|
+| `File.cacheDirectory` | **操作系统临时目录**（`%TEMP%\`，与 `File.createTempFile` 同根） | `%LOCALAPPDATA%\Caches`（把 macOS 的 `~/Library/Caches` 布局外推） |
+| 盘符相对路径 `C:foo` | 原样保留盘符后的文本并**补一个分隔符** ⇒ `C:foo\`；`C:.` ⇒ `C:.\`、`C:..` ⇒ `C:..\` | 按「盘符 + 组件」解析 ⇒ `C:\foo`（**另一个文件**），且 `..` 会把整串弹空 |
+| `parent` | `C:\a` ⇒ `C:\`（**根保留自己的分隔符**）、`\a` ⇒ `\`、`C:\` ⇒ `null` | `C:\a` ⇒ `C:`（盘符相对形式，语义不同）、`\a` ⇒ `/`（换成 POSIX 分隔符） |
+| `getRelativePath` | 答案用**正斜杠**；两端根不同（跨盘）⇒ `null`；大小写敏感 | 只认 `/`，且不比较根 ⇒ 跨盘给出无意义的相对串 |
+| `copyTo` / `moveTo` 的「同一文件」判定 | 大小写**不**敏感（`a.txt` 与 `A.TXT` 是同一文件） | `strcmp` ⇒ 判成「不同目标」，覆盖分支先 `DELETE` 掉目标（**就是源**）再复制 ⇒ `#3003` 且文件已毁 |
+| `FileStream` 偏移 | 走 **64 位**（`_ftelli64`/`_fseeki64`）；`APPEND` 打开即 EOF（`position == size`） | 32 位 `ftell`/`fseek`（>2 GB 时 `position` 转负，再交给 `_chsize_s`）；`APPEND` 打开在 0（MSVC 的 `"ab"` 只在首次**写**时 seek） |
+
+两条**只有 Windows 才会撞到**的补充：
+
+- **删掉一个仍被 `FileStream` 打开的文件会失败**（`#2038`）。POSIX 允许 `unlink` 打开中的文件，
+  Windows 不允许 —— `adl` 在 Windows 上同样报这个错，所以这不是偏差，而是我们自己的示例写错了
+  （`examples/file-audit.as` 的 READ 流从未 `close()`，收尾删目录必然失败）。示例已改为显式
+  `close()`。
+- `getRootDirectories()` 在 Windows 交出的是 **8 个 `File`**（不是 `StorageVolume`；`as StorageVolume`
+  得 `null`）。`StorageVolume` 只能从 `StorageVolumeChangeEvent` 里拿到，而 Windows 上插拔卷并不
+  派发该事件（`adl` 实测未触发），故这条路径在本后端是**数据类**而不是能力。
+
 
 ---
 
@@ -519,7 +544,7 @@ A 批（§12）之后接着做 B 批与 C 批。**每一条都先在 `adl 51.4.1
 | `downloaded` | 新文件 `false`；置 `true` 打 quarantine；**置 `false` 不会清掉**（读回仍 `true`） | 同（`com.apple.quarantine` xattr） |
 | `creator`/`data` | `null` | 同 |
 | `icon` | `[object Icon]`；但 `bitmapDatas` 在 51.4 里 **`#1069`**（不可读） | 给空 `Icon` 并**报明**「本构建没有图标提取」；`bitmapDatas` 回空数组（AIR 那边根本读不到） |
-| `cacheDirectory`/`workingDirectory`/`systemCharset`/`applicationRemovableStorageDirectory` | `~/Library/Caches`；进程 CWD；**`x-mac-chinesesimp`**（宿主语言设置）；`null` | `$XDG_CACHE_HOME`/`~/Library/Caches`/`%LOCALAPPDATA%\Caches`；`getcwd`；**`"UTF-8"` 并在 TODO 登记这条偏差**；`null` |
+| `cacheDirectory`/`workingDirectory`/`systemCharset`/`applicationRemovableStorageDirectory` | `~/Library/Caches`；进程 CWD；**`x-mac-chinesesimp`**（宿主语言设置）；`null` | `$XDG_CACHE_HOME`/`~/Library/Caches`/**Windows 的 `%TEMP%`（`GetTempPathA`，§11.6）**；`getcwd`（Windows `GetCurrentDirectoryA`）；**`"UTF-8"` 并在 TODO 登记这条偏差**；`null` |
 
 ### 13.3 四个新类（C 批）
 

@@ -443,6 +443,31 @@ pinned `new File("temp/x.txt").nativePath == "temp/x.txt"` since stage sixty-fou
 "AIR has no counterpart" kind rather than a rewrite of defined AIR behaviour; it is asserted
 explicitly in `examples/file-url.as` so it stays a decision rather than an accident.
 
+### 11.6 Host-split measured on Windows (stage 300)
+
+Stages 298/299 measured every behaviour on macOS `adl`, and almost every `File` member touches
+host path rules. A Windows round (`adl 51.4.1` / Windows 10 19045; probes in `temp/winfile/adl/`,
+readings in `adl-win{,2,3}.txt`) separated six host-split answers, all now implemented as measured:
+
+| Surface | Measured on Windows | Before |
+|---|---|---|
+| `File.cacheDirectory` | the **OS temp directory** (`%TEMP%\`, the same root as `File.createTempFile`) | `%LOCALAPPDATA%\Caches` (macOS's `~/Library/Caches` layout, extrapolated) |
+| drive-relative `C:foo` | kept verbatim after the drive **plus one separator** ⇒ `C:foo\`; `C:.` ⇒ `C:.\`, `C:..` ⇒ `C:..\` | parsed as "drive + components" ⇒ `C:\foo` (**a different file**), and `..` emptied the whole string |
+| `parent` | `C:\a` ⇒ `C:\` (the root **keeps its own separator**), `\a` ⇒ `\`, `C:\` ⇒ `null` | `C:\a` ⇒ `C:` (drive-relative, a different path), `\a` ⇒ `/` (POSIX separator) |
+| `getRelativePath` | the answer uses **forward slashes**; different roots (another drive) ⇒ `null`; case-sensitive | only recognised `/` and never compared roots ⇒ a meaningless string across drives |
+| `copyTo`/`moveTo` same-file test | case-**in**sensitive (`a.txt` and `A.TXT` are one file) | `strcmp` ⇒ judged "a different target", the overwrite branch deleted the destination (**which is the source**) and then failed with `#3003`, file destroyed |
+| `FileStream` offsets | **64-bit** (`_ftelli64`/`_fseeki64`); `APPEND` opens at EOF (`position == size`) | 32-bit `ftell`/`fseek` (a negative `position` past 2 GB, handed to `_chsize_s`); `APPEND` opened at 0 (MSVC's `"ab"` only seeks on the first **write**) |
+
+Two more that only Windows can hit:
+
+- **Deleting a file a `FileStream` still holds open fails** (`#2038`). POSIX lets you `unlink` an open
+  file, Windows does not — `adl` reports the same error, so this is not a deviation but a bug in our
+  own example (`examples/file-audit.as` never closed its READ stream, so the cleanup `deleteDirectory`
+  failed). The example now closes it explicitly.
+- `getRootDirectories()` yields **eight `File` objects** on Windows (not `StorageVolume`; `as StorageVolume`
+  is `null`). `StorageVolume` only arrives through `StorageVolumeChangeEvent`, and Windows does not
+  dispatch it for volume changes (`adl` never fired it), so that path is a data class here, not a capability.
+
 
 ---
 
@@ -592,7 +617,7 @@ a writable **`Number`**, and `endian`/`objectEncoding`/`readAhead` exist.
 | `downloaded` | `false` for a new file; setting `true` applies the quarantine attribute; setting `false` does **not** clear it | same (`com.apple.quarantine` xattr) |
 | `creator`/`data` | `null` | same |
 | `icon` | `[object Icon]`, but `bitmapDatas` throws **`#1069`** in a 51.4 app | an empty `Icon` plus a loud "no icon extraction in this build"; `bitmapDatas` answers an empty array (unreadable on AIR anyway) |
-| `cacheDirectory`/`workingDirectory`/`systemCharset`/`applicationRemovableStorageDirectory` | `~/Library/Caches`; the process CWD; **`x-mac-chinesesimp`** (a host locale setting); `null` | `$XDG_CACHE_HOME`/`~/Library/Caches`/`%LOCALAPPDATA%\Caches`; `getcwd`; **`"UTF-8"`, registered as a deliberate deviation**; `null` |
+| `cacheDirectory`/`workingDirectory`/`systemCharset`/`applicationRemovableStorageDirectory` | `~/Library/Caches`; the process CWD; **`x-mac-chinesesimp`** (a host locale setting); `null` | `$XDG_CACHE_HOME`/`~/Library/Caches`/**the Windows `%TEMP%` (`GetTempPathA`, §11.6)**; `getcwd` (Windows `GetCurrentDirectoryA`); **`"UTF-8"`, registered as a deliberate deviation**; `null` |
 
 ### 13.3 The four new classes (batch C)
 

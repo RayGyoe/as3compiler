@@ -18,9 +18,13 @@
 //   * The classes that did not exist at all: FileReference (File's superclass),
 //     StorageVolume and StorageVolumeChangeEvent.
 //
-// Paths come from File.userDirectory, which reads HOME; test/examples.ts points
-// HOME at a scratch directory for exactly that reason (the example creates and
-// removes its own work/ tree, and dies on a half-finished one otherwise).
+// Paths come from File.userDirectory, which reads HOME (USERPROFILE on Windows);
+// test/examples.ts points both at a scratch directory for exactly that reason
+// (the example creates and removes its own work/ tree, and dies on a
+// half-finished one otherwise). Nothing below spells an absolute path of its own:
+// the url round-trip is built from the receiver's own url, and the two path
+// constants are checked as the matched pair AIR documents rather than as the
+// POSIX spelling, so the same file passes on macOS and on Windows.
 import flash.filesystem.File;
 import flash.filesystem.FileStream;
 import flash.filesystem.FileMode;
@@ -107,6 +111,10 @@ eq(r.readUTF(), "héllo", "readUTF round-trips UTF-8");
 eq(r.readBoolean(), true, "readBoolean round-trips");
 eq(r.readUnsignedInt(), 4000000000, "readUnsignedInt round-trips a value above int.MAX");
 eq(r.bytesAvailable, 0, "the stream is drained");
+// Close every reader: Windows refuses to delete a file that still has an open
+// handle (POSIX would let the unlink through), so a leaked reader would make the
+// final deleteDirectory(true) fail with #2038 on Windows only.
+r.close();
 
 // Endianness applies to the multi-byte members only (af.txt 10).
 var endianFile:File = work.resolvePath("endian.bin");
@@ -129,6 +137,8 @@ threw(function():void { er2.readUTFBytes(1000); }, 2030, "an over-long readUTFBy
 
 // position: negative is #2006, APPEND refuses it with #2037 (af.txt 13-16).
 threw(function():void { er.position = -1; }, 2006, "a negative position is #2006");
+er.close();
+er2.close();
 var ap:File = work.resolvePath("append.bin");
 var aw:FileStream = new FileStream();
 aw.open(ap, FileMode.WRITE); aw.writeUTFBytes("abcdef"); aw.close();
@@ -160,8 +170,8 @@ eq(ap.size, 2, "truncate() cuts the file at the position");
 threw(function():void {
   var q:FileStream = new FileStream();
   q.open(work.resolvePath("w2.bin"), FileMode.WRITE);
-  var v:* = q.bytesAvailable;
-  q.close();
+  // #2029 comes from the READ, so the close belongs in a finally.
+  try { var v:* = q.bytesAvailable; } finally { q.close(); }
 }, 2029, "bytesAvailable on a WRITE handle is #2029");
 
 // The open() contract (af.txt 18-23): a directory is #3006 "Not a file.", "" is
@@ -307,14 +317,16 @@ if (File.separator == "/") eq(roots[0].nativePath, "/", "POSIX has exactly one r
 
 // The url setter (af.txt 56-61): file: is decoded, app: resolves against the
 // application directory, and null/""/http are all #2004.
-var u:File = new File("/tmp/zzz.txt");
-u.url = "file:///tmp/aaa%20b.txt";
-eq(u.nativePath, "/tmp/aaa b.txt", "url decodes percent escapes");
+var uDir:File = work.resolvePath("urlset");
+uDir.createDirectory();
+var u:File = uDir.resolvePath("zzz.txt");
+u.url = uDir.url + "/aaa%20b.txt";
+eq(u.nativePath, uDir.resolvePath("aaa b.txt").nativePath, "url decodes percent escapes");
 threw(function():void { u.url = null; }, 2004, "url = null is #2004");
 threw(function():void { u.url = ""; }, 2004, "url = \"\" is #2004");
 threw(function():void { u.url = "http://x/y.txt"; }, 2004, "url = http: is #2004");
 u.url = "app:/q.txt";
-check(endsWith(u.nativePath, "/q.txt"), "url = app:/ resolves against the app directory");
+check(endsWith(u.nativePath, File.separator + "q.txt"), "url = app:/ resolves against the app directory");
 
 // The FileReference-shaped reads on a real File (af.txt 62-66).
 eq(src.creator, null, "creator is null for a real file");
@@ -326,11 +338,18 @@ eq(src.downloaded, false, "a file we just wrote is not quarantined");
 check(src.icon != null, "icon is an Icon object (this build has no artwork to put in it)");
 
 // File's static system reads (af.txt 67-72).
-eq(File.separator, "/", "POSIX separator");
-eq(File.lineEnding, "\n", "POSIX line ending");
-eq(File.permissionStatus, "granted", "file access is not gated on macOS");
+// The separator and the line ending are a MATCHED PAIR (AIR documents CRLF
+// exactly where the separator is a backslash), which is the host-neutral claim;
+// the concrete spelling is checked per host below.
+eq(File.separator.length, 1, "the separator is one character");
+check(File.separator == "/" || File.separator == "\\", "the separator is one of the two path separators");
+eq(File.lineEnding == "\r\n", File.separator == "\\", "lineEnding is CRLF exactly where the separator is a backslash");
+eq(File.permissionStatus, "granted", "file access is not gated per-file on either desktop host");
 check(File.systemCharset != null && File.systemCharset.length > 0, "systemCharset is a string");
-check(endsWith(File.cacheDirectory.nativePath, "Library/Caches"), "cacheDirectory is ~/Library/Caches");
+// cacheDirectory is host-specific and was measured on both: ~/Library/Caches on
+// macOS, the OS temp directory (the same folder createTempFile uses) on Windows.
+if (File.separator == "/") check(endsWith(File.cacheDirectory.nativePath, "Library/Caches"), "cacheDirectory is ~/Library/Caches");
+else check(File.cacheDirectory.isDirectory, "cacheDirectory is an existing directory (the OS temp dir on Windows)");
 eq(File.applicationRemovableStorageDirectory, null, "there is no removable-storage directory here");
 
 // ============================================================== FileReference
@@ -367,20 +386,23 @@ eq(listEvent.files.length, 1, "FileListEvent.files");
 // =================================================== StorageVolume + event
 // The constructor takes (rootDirectory, name, isWritable, isRemovable,
 // fileSystemType, drive) — measured by reading the six getters back (AF.as).
-var vol:StorageVolume = new StorageVolume(new File("/"), "Macintosh HD", true, false, "apfs", "/");
-eq(vol.rootDirectory.nativePath, "/", "StorageVolume.rootDirectory");
+// The root is spelled from File.separator, not as "/": the class is a plain
+// six-field record and the host root is what the volume really reports.
+var rootDir:File = new File(File.separator);
+var vol:StorageVolume = new StorageVolume(rootDir, "Macintosh HD", true, false, "apfs", File.separator);
+eq(vol.rootDirectory.nativePath, File.separator, "StorageVolume.rootDirectory");
 eq(vol.name, "Macintosh HD", "StorageVolume.name");
 eq(vol.isWritable, true, "StorageVolume.isWritable");
 eq(vol.isRemovable, false, "StorageVolume.isRemovable");
 eq(vol.fileSystemType, "apfs", "StorageVolume.fileSystemType");
-eq(vol.drive, "/", "StorageVolume.drive");
+eq(vol.drive, File.separator, "StorageVolume.drive");
 
 var ev:StorageVolumeChangeEvent = new StorageVolumeChangeEvent(
-  StorageVolumeChangeEvent.STORAGE_VOLUME_MOUNT, false, false, new File("/"), vol);
+  StorageVolumeChangeEvent.STORAGE_VOLUME_MOUNT, false, false, rootDir, vol);
 eq(StorageVolumeChangeEvent.STORAGE_VOLUME_MOUNT, "storageVolumeMount", "STORAGE_VOLUME_MOUNT");
 eq(StorageVolumeChangeEvent.STORAGE_VOLUME_UNMOUNT, "storageVolumeUnmount", "STORAGE_VOLUME_UNMOUNT");
 eq(ev.type, "storageVolumeMount", "the event keeps its type");
-eq(ev.rootDirectory.nativePath, "/", "the event carries the root directory");
+eq(ev.rootDirectory.nativePath, File.separator, "the event carries the root directory");
 eq(ev.storageVolume.name, "Macintosh HD", "the event carries the volume");
 var ev2:StorageVolumeChangeEvent = ev.clone() as StorageVolumeChangeEvent;
 eq(ev2.type, "storageVolumeMount", "clone() keeps the type");

@@ -83,7 +83,9 @@ check(target.exists == false, "cleanup removed the test file");
 // AIR throws #2004 in the constructor; this build keeps the string (stage64.as
 // pins the same behaviour for nativePath), so its url is "file://" + path.
 var rel:File = new File("temp/file-url-rel.txt");
-check(rel.nativePath == "temp/file-url-rel.txt", "relative nativePath kept verbatim");
+// The separators inside a relative path follow the host (Windows stores it with a
+// backslash); the path is still relative, which is the point of the deviation.
+check(rel.nativePath == "temp" + File.separator + "file-url-rel.txt", "relative nativePath kept verbatim");
 check(rel.url == "file://temp/file-url-rel.txt", "relative url is file:// + path (deviation, AIR throws #2004)");
 
 trace("file-url: all File.url assertions passed");

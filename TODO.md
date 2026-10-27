@@ -17198,7 +17198,67 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 `systemCharset` 在 `adl` 上是宿主语言设置（本机 `x-mac-chinesesimp`），我们回 `"UTF-8"` 并单列登记；
 Windows 分支只做编译面推导（本机无环境）；AMF0 **写**仍是既有缺口。
 
+### 阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测 —— 三处编译阻断 + 六处宿主分叉（v0.4.262 → v0.4.263）✅ 已完成
+
+阶段二百九十八（`File` 家族 A 批）与二百九十九（`FileStream` 全表 + 四个新类）的所有读数都来自
+macOS 的 `adl`。本轮在 **Windows 10 19045 + `adl 51.4.1`** 上补测（`temp/winfile/adl/` 三轮探针，
+读数 `adl-win{,2,3}.txt`），先回答「Windows 上到底有没有问题」，再逐条按实测修。
+
+**一、三处编译阻断（产物在 Windows 上根本编不出来）**
+
+`getcwd` / `S_ISREG` / `_chsize_s` 三个符号在 MSVC 下不在默认可见范围：`S_ISREG` 是 POSIX 宏、
+`_chsize_s` 要 `<io.h>`、`getcwd` 走 `<direct.h>` 且在某些 SDK 里被同名宏改写。补 `S_ISREG` 宏 +
+`#include <io.h>`（`src/runtime.ts`），`as_file_working_dir` 的 Windows 分支改走
+`GetCurrentDirectoryA`（`src/emit.ts`）。这三条**在 macOS 上永远编译不到**，故只能靠源级钉 +
+Windows 本机实跑覆盖。
+
+**二、六处宿主分叉（同一份 AS 源码，两端不同答案）**
+
+| 面 | `adl` / Windows 实测 | 修前 | 性质 |
+|---|---|---|---|
+| `cacheDirectory` | `%TEMP%\` | `%LOCALAPPDATA%\Caches` | 把 macOS 布局外推 |
+| 盘符相对 `C:foo` | `C:foo\`（原文 + 补分隔符） | `C:\foo` = **另一个文件** | 归一化规则错 |
+| `parent` | `C:\a` ⇒ `C:\`、`\a` ⇒ `\` | `C:`、`/` | 根丢了分隔符 |
+| `getRelativePath` | 正斜杠；跨盘 `null` | 只认 `/`；跨盘给无意义串 | 少了根比较 |
+| copy/move 同文件判定 | 大小写不敏感 | `strcmp` ⇒ 先删**源**再复制，`#3003` | **毁数据** |
+| `FileStream` 偏移 / APPEND | 64 位；打开即 EOF | 32 位；打开在 0 | >2 GB 转负 |
+
+**三、两处 Windows 独有**
+
+① 删掉仍被 `FileStream` 打开的文件必然失败（`#2038`）—— POSIX 可以 `unlink` 打开中的文件、Windows
+不行；`adl` 同样报错 ⇒ 这一条**不是偏差**，是 `examples/file-audit.as` 自己没 `close()`（已修三处，
+异步 opener 侧的 APPEND 与 64 位 size 同轮改齐）。
+② `getRootDirectories()` 在 Windows 交出的 8 个元素是 **`File`** 而非 `StorageVolume`。
+
+**四、钉与回归**
+
+- `test/unit/file-stream.ts` 新增 `checkWindows()` / `unit: file-stream/windows`（19 钉：`%TEMP%` 来源、
+  `GetTempPathA` 与缓冲区不足拒答、盘符相对原样 + 补分隔符、首组件不插分隔符、`..` 不弹盘符、`parent`
+  两种根、双分隔符扫描、`getRelativePath` 的根门与正斜杠、`as_path_under` 两处、64 位 `as_fs_tell` /
+  `as_fs_seek`、`bytesAvailable`、APPEND 起于 EOF、异步 opener 同两条规则）。为什么是源级钉而不是示例
+  断言：这些都住在 `#ifdef _WIN32` 里，而套件跑在 macOS（CI 也是），从那边**够不到** Windows 分支。
+- 示例改成平台中立的断言（`file-audit.as` 的 url 往返改用 `uDir.url + "/aaa%20b.txt"`、`app:/` 与
+  `separator` / `lineEnding` 改配对断言、`cacheDirectory` 分平台、`StorageVolume` 用
+  `new File(File.separator)`；`file-url.as` / `stage64.as` 的相对路径用 `"temp" + File.separator`）：
+  **不是放宽，是改成对两端都成立**。
+- `node test.ts`：**529 例 / 522 pass / 4 fail / 3 skipped**，四个红与基线**同集合**
+  （`socket.as`、`stage94d.as`、`status-item.as`、`unit: inline/StackCanary`）；`file-audit` / `file-url` /
+  `stage64` 全 PASS。
+
+**五、如实报明**
+
+- `examples/file-ops.as` 的断言仍是 POSIX 形态（`/tmp` 22 处、「反斜杠是合法文件名字节」）。它与
+  `file-symlink.as` / `file-listing-async.as` 都需要软链夹具，而**本机账号建软链报 `EPERM`**（要开
+  Windows 的 Developer Mode）⇒ 三例在本机一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级
+  回归。已登记进 `### 遗留待开发`。
+- `StorageVolumeChangeEvent` 在 Windows 上不会因插拔卷而派发（`adl` 实测未触发），故 `StorageVolume`
+  在这端是**数据类**：能 `new`、能读字段，但没有「正在变化的卷」这个来源。
+- 本机 `mklink /J` 的 junction 读数（`isSymbolicLink == true`、`deleteFile()` 报 `#3001`、
+  `deleteDirectory(false)` 删掉 junction）来自探针，未进示例（同一条 `EPERM` 门）。
+
 ### 遗留待开发
+> **2026-10-27 追加（阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **101 → 102 项**（`未开始` **80 → 81**）。这两批的行为原先全在 macOS 的 `adl` 上量，而 `File` 家族几乎每个成员都碰宿主路径规则；在 Windows 10 + `adl 51.4.1` 上补测（探针 `temp/winfile/adl/`、读数 `adl-win{,2,3}.txt`）分出**六处宿主分叉 + 两处 Windows 独有**，全部**本轮修净**（按表头「已完成项一经落地即从本表移出」故不入表）：`cacheDirectory` 是 `%TEMP%` 而非 `%LOCALAPPDATA%\Caches`；盘符相对路径 `C:foo` 原样保留 + 补分隔符（旧解析得到**绝对**路径 `C:\foo`，是另一个文件）；`parent` 的根保留自己的分隔符（`C:\a` ⇒ `C:\`、`\a` ⇒ `\`）；`getRelativePath` 用正斜杠、跨盘 `null`；同一文件判定改走大小写不敏感的 `as_path_under`（旧的 `strcmp` 会把只有大小写差异的目标当「另一个文件」，覆盖分支先 `DELETE` 掉**源**再复制 ⇒ `#3003` 且文件已毁）；`FileStream` 偏移全改 64 位、`APPEND` 打开即 EOF。两处 Windows 独有：删掉仍被 `FileStream` 打开的文件在 Windows 上必然失败（`adl` 同样报错 ⇒ 是我们示例没 `close()`，已修）、`getRootDirectories()` 交出 8 个 `File` 而非 `StorageVolume`。另有**三处编译阻断**只有 Windows 宿主才撞到（`S_ISREG` 未定义、`_chsize_s` 未声明、`getcwd` 在 MSVC 的 `<direct.h>` 之外），同轮补齐。**新登记的 1 行**是剩余**验证欠账**：`examples/file-ops.as` 的断言写死了 `/tmp`（14 处）与「反斜杠是合法文件名字节」，而它与 `file-symlink.as`/`file-listing-async.as` 都要软链夹具 —— 本机账号建软链报 `EPERM`，三例一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级回归。钉子在 `test/unit/file-stream.ts` 的 `unit: file-stream/windows`（19 钉）+ 既有的 `file-url`/`file-ops` 组；口径写在 `docs/zh-cn/filesystem.md` §11.6（对照 `docs/en/filesystem.md` §11.6）。
+
 > **2026-10-27 追加（阶段二百九十九：`File` 家族 B/C 批）**：**新登记 0 行 / 改写 2 行 / 移出 2 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **102 → 101 项**（`未开始` 80 / `部分完成` 20 / `调研完成·实现暂缓` 1）。**移出 2 行**：`FileStream` 既不 `implements IDataInput` 也不 `implements IDataOutput`（23 个方法 + 三个访问器 + 可写 `Number` 的 `position` 全部落地，`docs/zh-cn/as3-semantics.md` 里「`FileStream` 是空替代」的说法随之作废）、`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent` 四个类不存在 + `FileFilter.clone` 报明（四个类都成了真类，`FileFilter` 按 AIR 只有三个字段；`FileListEvent` 的 5 参数构造器与自造 `directory` 一并修正）。**改写 2 行**：「`File` 的成员面只覆盖 AIR 的一部分」收窄成「两个卷粒度 static 方法缺失」（14 方法 / 8 属性 / 5 静态常量 / `getRootDirectories` 全部落地），原四个类那行改写成「原生对话框与卷枚举仍缺」（类与成员的语义都按 `adl` 实测落地了，剩下的 `browseFor*`/`FileReference.browse`/`getVolumeByDrive`/`getVolumeByPath` 是**后端**活，没有对话框就永远填不满 `fileList`/`data`，故 `browse()` 报明后返回 `false`，**不假装用户点了取消**）。**本阶段修净的一处不占表**：`File` 继承 `FileReference` 后 `cancel()` 落到父类 no-op（`file-listing-async.as` 变红），属 §1.5 遗留缺陷但同阶段修净。**如实报明**：`systemCharset` 在 `adl` 上是宿主语言设置（本机 `x-mac-chinesesimp`），我们回 `"UTF-8"`，属有意偏差；Windows 分支只做编译面推导；AMF0 **写**仍是既有缺口。
 > **2026-10-27 追加（阶段二百六十 补记：菜单栏状态项的多档位图与右键弹菜单）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数不变。两条都是**我们自己那条 macOS 增强通道（E19，opt-in `--features tray`）的后端收口**，`adl` 上根本没有对应路径（默认构建仍 `#2012`），故不属 §1.5「`adl` 跑得对我们跑不出」，不占本表；也**不改任何 AS3 语义**（`SystemTrayIcon` 的成员、事件、错误码一字未动），按阶段二百六十三之后的先例**不升版本号**。① **`bitmaps` 从「取第一张」改为「全部交出去」**（`sk_tray_set_image` → `sk_tray_set_images`，最多 4 张，每张一个 `NSImage` representation）：AIR 文档里这个数组的用途就是「放不同尺寸以适配不同显示分辨率」，而在 macOS 上尺寸只能意味着密度 —— 菜单栏恒 22pt，22px 高的位图是 1x、44px 的是 2x。**只给 2x 会让非 Retina 屏上的图标被 AppKit 降采样**：15pt 的图里 1.5pt 的描边被平均成雾（本机 2560×1440 副屏实测，对比见 `prune/shots/menubar/`）。② **菜单只在右键弹**（`sk_tray_fired` 里 `kind == 1` 才 `popUpStatusItemMenu:`），且**先派发 `RIGHT_CLICK` 再弹** ——「左右键都弹菜单」是 AppKit 的惯例，但那样左键就永远不能表示别的东西；派发在前则 AS3 能在回调里把勾选状态刷成最新的。**已知边界（已写进 `docs/zh-cn/enhancements.md` §4.11）**：位图被标成 template image（RGB 只贡献 alpha，**不做彩色图标**）；左键弹菜单这条惯例被有意放弃。**证据**：`unit: emit/SystemTrayIcon`（33 → 38 条，新增多档交出的钉与非 Cocoa 端的同名桩）、`examples/status-item.as` 无改动仍全过、真机双屏（主 1800×1169 @2x + 副 2560×1440 @1x）逐屏截图确认两档各自清晰。
 > **2026-10-27 追加（阶段二百九十七：D3D12 设备丢失的收尾）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 本表 **98 → 99 项**（`未开始` **76 → 77** / `部分完成` 20 / `调研完成·实现暂缓` 1 / 已完成 1）。**本阶段修的那条不占表**：崩溃在 `adl` 上不存在对应物（它是我们自家 D3D12 后端的收尾），且同阶段落地。新登记的 1 行是**跨端**剩下的：Metal 与 WGL 后端**连设备丢失检测都没有**（本机是 Windows，`.mm`/GL 丢失两条都无法在本机编译验证，故只登记、不盲写）。
@@ -17469,6 +17529,7 @@ Windows 分支只做编译面推导（本机无环境）；AMF0 **写**仍是既
 | **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |
 | **`File` 的两个卷粒度 static 方法缺失**：`getVolumeByDrive(drive:String)` / `getVolumeByPath(path:String)` | 未开始（2026-10-27 阶段二百九十九：B/C 批收窄——成员面其余 14 方法 / 8 属性 / 5 常量 / `getRootDirectories` 均已落地） | 这两个要**卷枚举**（POSIX `getmntinfo`/`statfs`，Windows `GetLogicalDrives` + `GetVolumeInformation`）才能回答「这个路径在哪个卷上」；`StorageVolume` 的构造器和六个 getter 已按实测实现，缺的只是「谁来造它」。当前 `File.getRootDirectories()` 会造出根卷（POSIX `["/"]`、Windows 盘符），但反查没有 | 与「原生对话框」同一批后端活；两条一起做能在真机上一次性验证 `StorageVolumeChangeEvent` |
 | **`File` 家族的原生对话框与卷粒度查询仍缺**：`FileReference.browse`/`load`/`save`/`download`/`upload`、`FileReferenceList.browse`、`File.browseFor*` 只报明（`as_shell_unsupported`，返回 `false`）；两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)` 未落地 | 未开始（2026-10-27 阶段二百九十九：C 批把四个**类**与它们的成员面补齐了，剩下的全是**后端**活） | 类与成员现在都在（`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent`，`FileFilter` 三个字段，`File` 的 14 方法/8 属性/5 static 常量/`getRootDirectories`），**读的语义也按 `adl` 实测**（见阶段二百九十九）。缺的只有两件：① 平台对话框（macOS `NSOpenPanel`/`NSSavePanel`，Windows `IFileOpenDialog`）——没有它，`fileList`/`data`/`name` 这些「选择结果」字段永远为空，所以 `browse()` **报明后返回 `false`**，绝不假装用户点了「取消」；② 卷枚举（`statfs`/`GetDiskFreeSpaceExA`）——`StorageVolume` 的构造器与六个 getter 已按实测实现，但目前只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查 | 两条都是后端活，且都要在真机上验证（Windows 分支本机无环境）。做对话框时应顺手把 `File.browseForOpenMultiple` 的 `FileListEvent` 派发接上——类与事件已完成，只差调用点 |
+| **`examples/file-ops.as` 的路径断言是 POSIX 形态**（`/tmp` 字面量 22 处、「反斜杠是合法文件名字节」），`file-symlink.as` / `file-listing-async.as` 亦未在 Windows 实跑 | 未开始（2026-10-27 阶段三百：这三例都要软链夹具，而本机账号建软链报 `EPERM` ⇒ 一直在 `test/examples.ts` 里 `SKIP`，Windows 侧只有 `adl` 探针读数） | 两端 | 待排期（要一台开了 Developer Mode 的 Windows） |
 
 
 

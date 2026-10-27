@@ -18,7 +18,7 @@ check(FileMode.APPEND == "append" && FileMode.UPDATE == "update", "FileMode APPE
 // relative path here lands in the checkout itself.
 var f:File = new File("temp/stage64_test.txt");
 check(f is File && f is EventDispatcher, "File is EventDispatcher");
-check(f.nativePath == "temp/stage64_test.txt", "File nativePath stored");
+check(f.nativePath == "temp" + File.separator + "stage64_test.txt", "File nativePath stored");
 check(f.url == "file://temp/stage64_test.txt", "File url is file:// + path");
 // A leftover from an earlier run that threw mid-way (this example deletes its
 // file at the end, so an aborted run leaves one behind) would fail the

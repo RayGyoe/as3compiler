@@ -28,6 +28,13 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
 #endif
+// The same gap for S_ISREG(): File.size uses it to answer 0 for a directory
+// instead of the directory's own st_size, and MSVC's <sys/stat.h> defines
+// _S_IFREG but no S_ISREG macro (C99 then rejects the implicit declaration, so
+// every program that links flash.filesystem failed to build on Windows).
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
 // dirent.h (opendir/readdir/closedir) is POSIX-only: MSVC ships no such header,
 // and Windows directory enumeration goes through FindFirstFile/FindNextFile
 // (the File.getDirectoryListing body in emit.ts). WASI ships dirent.h, so this
@@ -84,6 +91,10 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #define NOGDI
 #include <windows.h>
 #include <psapi.h>
+// <io.h> is the UCRT/MinGW home of the low-level file API. FileStream.truncate
+// calls _chsize_s(), which <stdio.h> does not declare at all, so without this
+// include the call is an undeclared function and the TU does not compile.
+#include <io.h>
 #elif !defined(__wasi__)
 #include <sys/resource.h>
 #endif
@@ -11713,10 +11724,26 @@ static void as_job_run(as_job* j) {
             void* h = (void*)fopen(j->path, mode);
             if (h == NULL) { j->error = AS_JOB_ERR_IO; break; }
             j->handle = h;
-            long cur = ftell((FILE*)h);
-            fseek((FILE*)h, 0, SEEK_END);
-            j->total = (unsigned)ftell((FILE*)h);
-            fseek((FILE*)h, cur, SEEK_SET);
+            // APPEND opens at EOF (AIR: position == file length right after open);
+            // MSVC's "ab" only seeks on the first write.
+            if (mode[0] == 'a') fseek((FILE*)h, 0, SEEK_END);
+#ifdef _WIN32
+            // long is 32 bits here, so both the >2 GB size and the restored
+            // position need the UCRT's 64-bit forms.
+            {
+              __int64 cur = _ftelli64((FILE*)h);
+              _fseeki64((FILE*)h, 0, SEEK_END);
+              j->total = (unsigned)_ftelli64((FILE*)h);
+              _fseeki64((FILE*)h, cur, SEEK_SET);
+            }
+#else
+            {
+              long cur = ftell((FILE*)h);
+              fseek((FILE*)h, 0, SEEK_END);
+              j->total = (unsigned)ftell((FILE*)h);
+              fseek((FILE*)h, cur, SEEK_SET);
+            }
+#endif
             break;
         }
         case AS_JOB_DIR: {
