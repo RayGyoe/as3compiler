@@ -31,8 +31,14 @@ typedef struct sk_menu_t { const char* title; int first; int count; } sk_menu_t;
 
 extern "C" {
 
-// Straight ARGB rows (BitmapData.pixels verbatim); NULL/0/0 clears the image.
-void sk_tray_set_image(const void* argb, int w, int h);
+// Up to SK_TRAY_MAX_REPS renderings of the SAME icon at different pixel densities,
+// each as straight ARGB rows (BitmapData.pixels verbatim); n <= 0 clears the image.
+// One image, several representations: the menu bar is 22pt, so a 22px-tall bitmap is
+// the 1x rep and a 44px one the 2x rep, and AppKit then draws the right one on
+// whichever display the item is on. Passing only the 2x bitmap makes a 1x display
+// downscale it -- at a 15pt glyph that averages a 1.5pt stroke into haze.
+#define SK_TRAY_MAX_REPS 4
+void sk_tray_set_images(const void* const* argbs, const int* ws, const int* hs, int n);
 void sk_tray_set_tooltip(const char* text);
 int sk_tray_set_menu(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int));
 // kind: 0 = left click, 1 = right click. mods bits: 1 command, 2 control, 4 option,
@@ -62,8 +68,10 @@ extern id NSApp;
 // objects could have been collected.
 static void* g_tray_item = NULL;         // NSStatusItem (retained for the process)
 static void* g_tray_image = NULL;        // NSImage currently on the button
-static unsigned* g_tray_pixels = NULL;   // our own copy of the ARGB rows
-static int g_tray_pw = 0, g_tray_ph = 0;
+// Our own copies of the ARGB rows, one per representation (see sk_tray_set_images).
+static unsigned* g_tray_rep_px[SK_TRAY_MAX_REPS];
+static int g_tray_rep_w[SK_TRAY_MAX_REPS], g_tray_rep_h[SK_TRAY_MAX_REPS];
+static int g_tray_nreps = 0;
 static char g_tray_tip[1024];
 static int g_tray_have_tip = 0;
 static void* g_tray_nsmenu = NULL;       // NSMenu the button pops
@@ -182,7 +190,12 @@ static void sk_tray_fired(void* self, SEL _cmd, void* sender) {
     }
   }
   if (g_tray_cb != NULL) g_tray_cb(kind, m.x, primaryH - m.y, mods);
-  if (g_tray_nsmenu != NULL && g_tray_item != NULL) {
+  // RIGHT click only. A status item with a menu usually pops it on either button,
+  // but then a left click could never mean anything else -- and the product that
+  // needed this channel (净扫) uses left to open its panel. The event has already
+  // been dispatched above, so AS3 has refreshed the menu's checked state by the
+  // time it opens.
+  if (kind == 1 && g_tray_nsmenu != NULL && g_tray_item != NULL) {
     // Deprecated since 10.14 in favour of the `menu` property — but `menu` is
     // exactly the property that swallows the action (see the note above).
     sk_send_void_obj(g_tray_item, "popUpStatusItemMenu:", g_tray_nsmenu);
@@ -278,7 +291,7 @@ static void* sk_tray_menu_build(const sk_menu_t* menus, int nmenus, const sk_men
 // comes out too bright and a fully transparent one paints its colour. Multiply
 // once here — the same rule the Dock icon uses (sk_dock_set_icon_image in
 // window_glue.cc), and deliberately NOT the double-multiply AIR's Dock icon does.
-static void* sk_tray_nsimage(const unsigned* argb, int w, int h) {
+static void* sk_tray_nsrep(const unsigned* argb, int w, int h) {
   void* rep = sk_send_obj((void*)objc_getClass("NSBitmapImageRep"), "alloc");
   if (rep == NULL) return NULL;
   rep = ((void* (*)(void*, SEL, void*, long, long, long, long, signed char, signed char, void*, long, long))objc_msgSend)(
@@ -305,9 +318,46 @@ static void* sk_tray_nsimage(const unsigned* argb, int w, int h) {
       row[x * 4 + 3] = (unsigned char)a;
     }
   }
+  return rep;
+}
+
+// Builds the NSImage from every representation handed over. Two rules beyond the
+// pixels themselves, both of them what a native menu-bar icon does and therefore
+// what this channel has to do to look like one:
+//
+//  1. POINT SIZE IS THE MENU BAR'S, NOT THE BITMAP'S. `NSImage size` is in points
+//     and AppKit derives each rep's scale as repPixels/points, so the item's height
+//     is fixed at 22pt (StatusBar's height) and the WIDTH comes from the largest
+//     rep (all reps describe the same artwork, so their aspect ratios agree).
+//     A single 2x bitmap therefore still lands at 22pt exactly as before; adding a
+//     1x bitmap no longer means "the item is 22px tall", it means "one more scale".
+//  2. TEMPLATE. The menu bar can be light (a white glyph disappears) or dark (a
+//     black one does), and macOS answers that by re-drawing a TEMPLATE image in
+//     the current label colour. One artwork therefore works in both appearances,
+//     which is the behaviour every menu-bar app ships; the supplied RGB is only
+//     used for its ALPHA. A user who needs colour art cannot have it here -- and
+//     is told so in docs/zh-cn/enhancements.md §4.11 rather than silently losing
+//     the colour.
+static void* sk_tray_nsimage(void) {
+  int pick = -1;
+  for (int i = 0; i < g_tray_nreps; i++) {
+    if (g_tray_rep_px[i] == NULL || g_tray_rep_w[i] <= 0 || g_tray_rep_h[i] <= 0) continue;
+    if (pick < 0 || g_tray_rep_h[i] > g_tray_rep_h[pick]) pick = i;
+  }
+  if (pick < 0) return NULL;
+  // The tallest rep decides how many pixels a point is worth. A bitmap shorter than
+  // 22px would make the item smaller than the menu bar, so the floor is 22 as well.
+  int baseH = g_tray_rep_h[pick] > 22 ? g_tray_rep_h[pick] : 22;
+  double ptH = 22.0;
+  double ptW = (double)g_tray_rep_w[pick] * (ptH / (double)baseH);
   void* img = sk_send_obj((void*)objc_getClass("NSImage"), "alloc");
-  img = ((void* (*)(void*, SEL, double, double))objc_msgSend)(img, sel_registerName("initWithSize:"), (double)w, (double)h);
-  sk_send_void_obj(img, "addRepresentation:", rep);
+  img = ((void* (*)(void*, SEL, double, double))objc_msgSend)(img, sel_registerName("initWithSize:"), ptW, ptH);
+  for (int i = 0; i < g_tray_nreps; i++) {
+    if (g_tray_rep_px[i] == NULL || g_tray_rep_w[i] <= 0 || g_tray_rep_h[i] <= 0) continue;
+    void* rep = sk_tray_nsrep(g_tray_rep_px[i], g_tray_rep_w[i], g_tray_rep_h[i]);
+    if (rep != NULL) sk_send_void_obj(img, "addRepresentation:", rep);
+  }
+  sk_send_void_bool(img, "setTemplate:", 1);
   return img;
 }
 
@@ -316,12 +366,10 @@ static void sk_tray_apply(void) {
   if (g_tray_item == NULL) return;
   void* btn = sk_send_obj(g_tray_item, "button");
   if (btn == NULL) return;
-  if (g_tray_pixels != NULL && g_tray_pw > 0 && g_tray_ph > 0) {
-    void* img = sk_tray_nsimage(g_tray_pixels, g_tray_pw, g_tray_ph);
-    if (img != NULL) {
-      g_tray_image = img;
-      sk_send_void_obj(btn, "setImage:", img);
-    }
+  void* img = sk_tray_nsimage();
+  if (img != NULL) {
+    g_tray_image = img;
+    sk_send_void_obj(btn, "setImage:", img);
   } else {
     g_tray_image = NULL;
     sk_send_void_obj(btn, "setImage:", NULL);
@@ -388,15 +436,22 @@ static void sk_tray_launched(void* self, SEL _cmd, void* note) {
   sk_tray_apply_menu();
 }
 
-void sk_tray_set_image(const void* argb, int w, int h) {
-  if (g_tray_pixels != NULL) { free(g_tray_pixels); g_tray_pixels = NULL; }
-  g_tray_pw = 0; g_tray_ph = 0;
-  if (argb != NULL && w > 0 && h > 0) {
-    size_t n = (size_t)w * (size_t)h;
-    unsigned* copy = (unsigned*)malloc(n * sizeof(unsigned));
-    if (copy != NULL) {
-      memcpy(copy, argb, n * sizeof(unsigned));
-      g_tray_pixels = copy; g_tray_pw = w; g_tray_ph = h;
+void sk_tray_set_images(const void* const* argbs, const int* ws, const int* hs, int n) {
+  for (int i = 0; i < g_tray_nreps; i++) {
+    if (g_tray_rep_px[i] != NULL) free(g_tray_rep_px[i]);
+    g_tray_rep_px[i] = NULL; g_tray_rep_w[i] = 0; g_tray_rep_h[i] = 0;
+  }
+  g_tray_nreps = 0;
+  if (argbs != NULL && ws != NULL && hs != NULL) {
+    for (int i = 0; i < n && g_tray_nreps < SK_TRAY_MAX_REPS; i++) {
+      if (argbs[i] == NULL || ws[i] <= 0 || hs[i] <= 0) continue;
+      size_t px = (size_t)ws[i] * (size_t)hs[i];
+      unsigned* copy = (unsigned*)malloc(px * sizeof(unsigned));
+      if (copy == NULL) continue;
+      memcpy(copy, argbs[i], px * sizeof(unsigned));
+      int k = g_tray_nreps;
+      g_tray_rep_px[k] = copy; g_tray_rep_w[k] = ws[i]; g_tray_rep_h[k] = hs[i];
+      g_tray_nreps = k + 1;
     }
   }
   sk_tray_flush();
@@ -449,7 +504,7 @@ void sk_tray_set_callback(void (*cb)(int kind, double sx, double sy, int mods)) 
 // off, but the definitions exist so a build that flips the macro cannot fail to
 // link for a reason that has nothing to do with the real problem.
 extern "C" {
-void sk_tray_set_image(const void* argb, int w, int h) { (void)argb; (void)w; (void)h; }
+void sk_tray_set_images(const void* const* argbs, const int* ws, const int* hs, int n) { (void)argbs; (void)ws; (void)hs; (void)n; }
 void sk_tray_set_tooltip(const char* text) { (void)text; }
 int sk_tray_set_menu(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
   (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;

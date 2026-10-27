@@ -9259,8 +9259,17 @@ extern void sk_dock_bounce(int critical);
 extern void sk_dock_set_icon_image(const void* argb, int w, int h);
 // ---- flash.desktop.SystemTrayIcon (阶段二百六十, --features tray) ----
 // Straight ARGB rows, exactly like the Dock icon (the glue premultiplies once).
-// The menu crosses as the same flattened sk_menu model the app/Dock menus use.
-extern void sk_tray_set_image(const void* argb, int w, int h);
+//
+// sk_tray_set_images takes up to 4 RENDERINGS OF THE SAME ICON at different pixel
+// densities (SystemTrayIcon.bitmaps is an array for exactly that reason, and AIR's
+// documentation for it says so). Each becomes one NSImage representation, so a
+// status item is crisp on a 1x external display AND on a Retina one; handing AppKit
+// only the 2x bitmap makes it downscale there, and at 15pt a halved 1.5pt stroke
+// turns to mush -- measured on this machine's 2560x1440 secondary display.
+// The item's point height is the menu bar's 22; each rep keeps its own pixel size.
+// NULL/0/NULL clears the image. The menu crosses as the same flattened sk_menu
+// model the app/Dock menus use.
+extern void sk_tray_set_images(const void* const* argbs, const int* ws, const int* hs, int n);
 extern void sk_tray_set_tooltip(const char* text);
 extern int sk_tray_set_menu(const sk_menu* menus, int nmenus, const sk_menu_item* items, int nitems, int root, void (*cb)(int));
 // kind: 0 = left click, 1 = right click. mods bits: 1 command, 2 control, 4 option,

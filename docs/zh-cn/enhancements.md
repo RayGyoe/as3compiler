@@ -526,12 +526,20 @@ C 侧 `hand.c`/`hand_small.c` 与 AS3 侧 `saxpy.as`/`saxpy_fn.as` **同规模�
   是本机可执行文件，所以这条能前置校验；在别的宿主上直接报
   `feature 'tray' needs a darwin host`（而不是给一个什么都不做的开关）。
 - **默认（不开开关）**：`supportsSystemTrayIcon` 仍为 `false`，`new SystemTrayIcon()` 仍抛 `#2012`，**菜单栏不出现任何东西**。
-  钉在 `unit: emit/SystemTrayIcon`（33 条）。
+  钉在 `unit: emit/SystemTrayIcon`（38 条）。
 - **开了之后的行为**（全部为实测，证据见本节末尾）：
-  - 构造即安装一个 `NSStatusItem`（`NSVariableStatusItemLength`），`bitmaps` 第一张有效位图作图标（**直通 ARGB、
-    由胶水层预乘一次**，与 Dock 图标同一条规则），`tooltip` 原样上屏，`menu` 展平成 `NSMenu` 挂到状态项上。
+  - 构造即安装一个 `NSStatusItem`（`NSVariableStatusItemLength`），**`bitmaps` 里的每一张有效位图都是一个
+    `NSImage` representation**（最多 4 张；**直通 ARGB、由胶水层预乘一次**，与 Dock 图标同一条规则），`tooltip`
+    原样上屏，`menu` 展平成 `NSMenu` 挂在状态项上。
+  - **多档位图 = 多分辨率**：AIR 对 `SystemTrayIcon.bitmaps` 的说明就是「放不同尺寸以适配不同显示分辨率」，而
+    macOS 上尺寸只能意味着密度（菜单栏恒 22pt）：22px 高的位图是 1x、44px 的是 2x，由 AppKit 按状态项所在的
+    那块屏自己挑。**只给 2x 是错的**——非 Retina 屏上就只剩 AppKit 的一次降采样，15pt 的图里 1.5pt 的描边会被
+    平均成雾（本机 2560×1440 副屏实测如此，`temp/` 与 `prune` 侧的截图对照）。
   - **点击派发 `ScreenMouseEvent`**：左键 `MouseEvent.CLICK`、右键 `MouseEvent.RIGHT_CLICK`，`screenX/screenY` 是
     **点击点**的屏幕坐标（左上原点、point），`commandKey/controlKey/altKey/shiftKey` 取自当时的修饰键，`isRelatedObjectInaccessible=false`。
+  - **菜单只在右键弹出**：状态项挂了 `menu` 之后，AppKit 的常规做法是左右键都弹菜单；那样左键就永远不能表示
+    别的东西了。这里的选择是**左键留给应用**（派发 `click` 给 AS3）、**右键弹菜单**，且**先派发事件再弹**——
+    AS3 在回调里刷新勾选状态，用户看到的就是刷新后的那份。
   - **菜单项点击**走 `as_menu_click_cb`，即与 App 菜单 / Dock 菜单**同一条 tag 通道**：`NativeMenuItem` 与其所在
     `NativeMenu` 各收一次 `Event.SELECT`。三个安装目标共用一张 tag 表，托盘的那段从 `appItems + dockItems` 之后开始。
 - **跨端差异（显式列出）**：同一段 AS3 在 `adl`（macOS）上抛 `#2012`，在本构建上拿到真状态项 —— 这是**有意的分歧**，
@@ -541,10 +549,14 @@ C 侧 `hand.c`/`hand_small.c` 与 AS3 侧 `saxpy.as`/`saxpy_fn.as` **同规模�
     即「最后构造的那个图标拥有它」。AIR 在 macOS 上没有行为可抄，Windows 侧未实测，故按最保守的语义固定并文档化。
   - **`icon.menu` 的键盘等价键（`keyEquivalent`）未映射修饰键**：与 App/Dock 菜单同一条既有口径，见 `TODO.md` 遗留表。
   - **不显示 Windows 那种气泡通知**（`SystemTrayIcon` 的 balloon 系列 AIR 本来就没有）。
+  - **图标不做彩色**：`NSImage` 被标成 **template image**，由系统按当前菜单栏的明暗用标签色重绘（白色图标在浅色
+    菜单栏上会消失，反之亦然）。所以位图的 RGB 只贡献 alpha —— 需要彩色图标的场景在本通道上做不到，明说而不是静默丢色。
+  - **左键不弹菜单**（见上一条）：这是与 AppKit 惯例的有意分歧，理由是左键在真实产品里另有含义；`menu` 仍然在，
+    只是入口是右键。
 - **证据**：真机验收 —— 状态项出现在菜单栏（`menubar.png`）、`ScreenMouseEvent` 的 `screenX/screenY` 与 AX 报告的
   状态项位置逐点吻合（AX `(1110,7) 40×24` vs 点击 `(1130,19)`）、右键 `rightClick`、菜单项点击收到 `Event.SELECT`
   （`temp/trayprobe/live-log.txt`：`CLICK` / `RIGHT_CLICK` / `MENU SELECT from Open Panel`）；
-  示例 `examples/status-item.as`（23 断言，带 `features: ["tray"]` 清单）；单元 `unit: emit/SystemTrayIcon`（33 条）
+  示例 `examples/status-item.as`（23 断言，带 `features: ["tray"]` 清单）；单元 `unit: emit/SystemTrayIcon`（38 条）
   与 `[features]` 组的 8 条（含「默认构建不链 `statusitem_glue.cc`」「非 macOS 宿主拒绝」两个反向对照）。
 
 ---

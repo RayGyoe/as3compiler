@@ -4055,9 +4055,17 @@ function checkEmitSystemTrayIcon(): string[] {
   // happen is the ON arm falling outside the guard.
   check('...with the inert arm being the #else of the real one',
     sync.indexOf('#if ASC_HAS_TRAY') >= 0
-    && sync.indexOf('#if ASC_HAS_TRAY') < sync.indexOf('sk_tray_set_image(img')
-    && sync.indexOf('sk_tray_set_image(img') < sync.indexOf('#else')
+    && sync.indexOf('#if ASC_HAS_TRAY') < sync.indexOf('sk_tray_set_images(')
+    && sync.indexOf('sk_tray_set_images(') < sync.indexOf('#else')
     && sync.slice(sync.indexOf('#else')).includes('(void)o;'));
+  // A status item is 22pt on every display, but a display may be 1x or 2x: the
+  // array hands over one rendering per density and the glue adds one NSImage
+  // representation each. Emitting only `bitmaps[0]` (the old rule) makes AppKit
+  // downscale the 2x art on a 1x panel, which at a 15pt glyph averages a 1.5pt
+  // stroke into haze -- measured on a 2560x1440 secondary display.
+  check('every bitmap is handed over as its own representation, up to 4',
+    sync.includes('sk_tray_set_images(n > 0 ? argbs : NULL, n > 0 ? ws : NULL, n > 0 ? hs : NULL, n);')
+    && sync.includes('const void* argbs[4];') && sync.includes('n < 4'));
   check('the click dispatcher lives inside the same guard',
     c.includes('#if ASC_HAS_TRAY\n// A click on the status item.'));
 
@@ -4164,8 +4172,16 @@ function checkEmitSystemTrayIcon(): string[] {
     && !winGlue.includes('not mapped to NSEventModifierFlags yet'));
 
   check('the non-Cocoa build still defines all four seams',
-    /void sk_tray_set_image\(const void\* argb, int w, int h\) \{ \(void\)argb; \(void\)w; \(void\)h; \}/.test(glue)
+    /void sk_tray_set_images\(const void\* const\* argbs, const int\* ws, const int\* hs, int n\) \{ \(void\)argbs; \(void\)ws; \(void\)hs; \(void\)n; \}/.test(glue)
     && glue.includes('void sk_tray_set_tooltip(const char* text) { (void)text; }'));
+  // The multi-representation rule itself: one NSImage, a representation per bitmap,
+  // and the point size fixed by the MENU BAR rather than by whichever bitmap came
+  // first. `setTemplate:` last, so both appearances of the bar are covered.
+  check('the image is one NSImage with a rep per bitmap and a template flag',
+    glue.includes('static void* sk_tray_nsimage(void) {')
+    && (glue.match(/addRepresentation:/g) ?? []).length === 1
+    && glue.includes('sk_send_void_bool(img, "setTemplate:", 1);')
+    && glue.includes('double ptH = 22.0;'));
 
   console.log(`     [tray] ${ok} check(s) passed`);
   return bad;

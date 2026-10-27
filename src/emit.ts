@@ -10286,22 +10286,33 @@ ScreenMouseEvent* ScreenMouseEvent_new(char* type, bool bubbles, bool cancelable
 #endif
 static void as_tray_sync(SystemTrayIcon* o) {
 #if ASC_HAS_TRAY
-  // Which bitmap the status item paints: the FIRST valid entry. AIR has no macOS
-  // status item, so there is no measured rule to match the way the Dock icon's
-  // "closest to 128" pick was measured -- a single-bitmap array is the shape both
-  // AIR's own examples and this demo use, and picking element 0 is the only rule
-  // that needs no invented metric. An empty list clears the image.
-  BitmapData* img = NULL;
+  // Which bitmaps the status item paints: EVERY valid entry, up to 4, as separate
+  // NSImage representations. That is what the array is FOR (AIR's SystemTrayIcon.
+  // bitmaps documents "different sizes to support different display resolutions"),
+  // and on macOS the density is the only thing the sizes can mean: the menu bar is
+  // 22pt, so a 22px rendering is 1x and a 44px one is 2x. Handing over one 2x
+  // bitmap instead makes AppKit downscale it on a non-Retina display, where a
+  // 15pt glyph's 1.5pt strokes average down to mush (measured, 2560x1440 display).
+  //
+  // Order is the array's order; the glue needs no "pick one" rule because it shows
+  // them all. Same-element duplicates are harmless but skipped (a rep must be
+  // distinct to be usable). An empty list clears the image.
+  const void* argbs[4];
+  int ws[4], hs[4];
+  int n = 0;
   if (o->_bitmaps != NULL) {
-    for (int i = 0; i < o->_bitmaps->length; i++) {
+    for (int i = 0; i < o->_bitmaps->length && n < 4; i++) {
       as_value e = o->_bitmaps->data[i];
       if (e.tag != 4 || e.ptr == NULL || !as_is(e.ptr, &BitmapData_vt)) continue;
-      img = (BitmapData*)e.ptr;
-      break;
+      BitmapData* b = (BitmapData*)e.ptr;
+      if (b->pixels == NULL || b->width <= 0 || b->height <= 0) continue;
+      int dup = 0;
+      for (int j = 0; j < n; j++) if (ws[j] == b->width && hs[j] == b->height) dup = 1;
+      if (dup) continue;
+      argbs[n] = b->pixels; ws[n] = b->width; hs[n] = b->height; n++;
     }
   }
-  if (img == NULL || img->pixels == NULL || img->width <= 0 || img->height <= 0) sk_tray_set_image(NULL, 0, 0);
-  else sk_tray_set_image(img->pixels, img->width, img->height);
+  sk_tray_set_images(n > 0 ? argbs : NULL, n > 0 ? ws : NULL, n > 0 ? hs : NULL, n);
   sk_tray_set_tooltip(o->_tooltip);
   sk_tray_set_callback(as_tray_click);
 #else
