@@ -17277,6 +17277,17 @@ Windows 本机实跑覆盖。
   注入一次健康设备 `E_OUTOFMEMORY`，日志出现 `window swapchain recreated`，组合 `ASC_GPU_LOSE_AT=20` 后正常退出、
   零 `Present failed`。`unit: crash/hardening` 增 3 钉，全量 531/524/4/3，红色仍为既有同集合。
 
+### 阶段三百零五：交换链重建前完成 GPU 与 fence 收尾（v0.4.267 → v0.4.268）
+
+- **真因**：真应用新日志在主窗口 `Present E_OUTOFMEMORY` 后，`CreateSwapChainForHwnd` 在 `E_ACCESSDENIED`
+  与偶发成功之间交替；旧实现未等待 GPU/旧 fence 就释放交换链，DXGI 仍在使用它。另一个由注入探针抓到的
+  死锁点是健康设备 `Present` 失败会跳过当前帧 fence Signal，下一次 acquire 永久等待这个不会到达的值。
+- **修复**：健康设备的 Present 失败先 retire 已提交帧的 fence；重建前统一 flush/submit 并有界等待所有
+  后缓冲 fence，超时不释放任何旧状态。创建失败按 250 ms 退避，不再每帧给同一 HWND 重建交换链。
+- **验收**：新增 `ASC_GPU_PRESENT_FAIL=1` 一次性注入；`temp/d3dresize` 分别通过 Present 注入及
+  Present + resize + 真设备丢失三重组合，均只重建预期次数、正常退出，零 `E_ACCESSDENIED` 和连续 OOM。
+  `unit: crash/hardening` 增 4 钉；全量 531/524/4/3，红色仍为既有同集合。
+
 ### 遗留待开发
 > **2026-10-27 追加（阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **101 → 102 项**（`未开始` **80 → 81**）。这两批的行为原先全在 macOS 的 `adl` 上量，而 `File` 家族几乎每个成员都碰宿主路径规则；在 Windows 10 + `adl 51.4.1` 上补测（探针 `temp/winfile/adl/`、读数 `adl-win{,2,3}.txt`）分出**六处宿主分叉 + 两处 Windows 独有**，全部**本轮修净**（按表头「已完成项一经落地即从本表移出」故不入表）：`cacheDirectory` 是 `%TEMP%` 而非 `%LOCALAPPDATA%\Caches`；盘符相对路径 `C:foo` 原样保留 + 补分隔符（旧解析得到**绝对**路径 `C:\foo`，是另一个文件）；`parent` 的根保留自己的分隔符（`C:\a` ⇒ `C:\`、`\a` ⇒ `\`）；`getRelativePath` 用正斜杠、跨盘 `null`；同一文件判定改走大小写不敏感的 `as_path_under`（旧的 `strcmp` 会把只有大小写差异的目标当「另一个文件」，覆盖分支先 `DELETE` 掉**源**再复制 ⇒ `#3003` 且文件已毁）；`FileStream` 偏移全改 64 位、`APPEND` 打开即 EOF。两处 Windows 独有：删掉仍被 `FileStream` 打开的文件在 Windows 上必然失败（`adl` 同样报错 ⇒ 是我们示例没 `close()`，已修）、`getRootDirectories()` 交出 8 个 `File` 而非 `StorageVolume`。另有**三处编译阻断**只有 Windows 宿主才撞到（`S_ISREG` 未定义、`_chsize_s` 未声明、`getcwd` 在 MSVC 的 `<direct.h>` 之外），同轮补齐。**新登记的 1 行**是剩余**验证欠账**：`examples/file-ops.as` 的断言写死了 `/tmp`（14 处）与「反斜杠是合法文件名字节」，而它与 `file-symlink.as`/`file-listing-async.as` 都要软链夹具 —— 本机账号建软链报 `EPERM`，三例一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级回归。钉子在 `test/unit/file-stream.ts` 的 `unit: file-stream/windows`（19 钉）+ 既有的 `file-url`/`file-ops` 组；口径写在 `docs/zh-cn/filesystem.md` §11.6（对照 `docs/en/filesystem.md` §11.6）。
 

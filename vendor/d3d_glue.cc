@@ -211,6 +211,9 @@ typedef struct {
   HANDLE fence_event;
   uint64_t fence_values[SK_D3D_NUM_FRAMES];
   int width, height;
+  // A failed swapchain rebuild must not be attempted on every frame: without GPU
+  // quiescence the old swapchain can make CreateSwapChainForHwnd fail repeatedly.
+  double recreate_retry_at;
 } D3DWin;
 
 static D3DWin g_d3d[SK_D3D_MAX_WINDOWS];
@@ -560,12 +563,40 @@ static int d3d_create_swapchain(D3DWin* w, HWND hwnd, int cw, int ch) {
   return 1;
 }
 
+// Wait until neither this window's GPU submissions nor its presented buffers are
+// still in flight. Releasing a live swapchain without this drain leaves DXGI with
+// an old swapchain for the HWND: CreateSwapChainForHwnd then alternates between
+// E_ACCESSDENIED and a short-lived replacement whose next Present runs out of
+// resources. A timeout leaves the old state intact so a later frame can retry.
+static int d3d_drain_window(D3DWin* w) {
+  if (g_context != nullptr) {
+    g_context->flush();
+    g_context->submit(GrSyncCpu::kYes);
+  }
+  for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) {
+    if (w->fence.get() != nullptr && w->fence_event != NULL &&
+        w->fence->GetCompletedValue() < w->fence_values[i]) {
+      D3D_OK_OR_WARN(w->fence->SetEventOnCompletion(w->fence_values[i], w->fence_event));
+      if (WaitForSingleObjectEx(w->fence_event, SK_D3D_DRAIN_MS, FALSE) != WAIT_OBJECT_0) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 // ResizeBuffers can fail even while the device remains healthy (the real app hits
 // E_OUTOFMEMORY after a device rebuild followed by minimize/restore). The old
 // buffers have already been released at that point, so retrying ResizeBuffers on
 // the same swapchain forever cannot make progress. Recreate only this window's
 // swapchain and fence; other windows and the shared device stay alive.
 static int d3d_recreate_window(D3DWin* w, int width, int height) {
+  const double now = d3d_now_ms();
+  if (now < w->recreate_retry_at) return 0;
+  if (!d3d_drain_window(w)) {
+    w->recreate_retry_at = now + (double)SK_D3D_DRAIN_MS;
+    return 0;
+  }
   for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) {
     w->surfaces[i].reset();
     w->buffers[i].reset();
@@ -575,14 +606,17 @@ static int d3d_recreate_window(D3DWin* w, int width, int height) {
   w->fence.reset();
   w->swapchain.reset();
   if (d3d_create_swapchain(w, w->hwnd, width, height)) {
+    w->recreate_retry_at = 0.0;
     fprintf(stderr, "d3d_glue: window swapchain recreated at %dx%d\n", width, height);
     fflush(stderr);
     return 1;
   }
   // A later begin_frame retries through the null-swapchain gate below. Keeping
-  // used/hwnd preserves the identity of the still-live SDL window.
+  // used/hwnd preserves the identity of the still-live SDL window. Back off instead
+  // of calling CreateSwapChainForHwnd again on every frame while DXGI is busy.
   w->width = 0;
   w->height = 0;
+  w->recreate_retry_at = now + 250.0;
   return 0;
 }
 
@@ -1052,7 +1086,16 @@ void sk_gpu_flush(int win_id) {
   // into a removed device). Report, then enter the lost path -- which drops every
   // GPU object before the next frame can touch Skia -- and do not signal a fence
   // the dead queue will never reach.
-  HRESULT phr = w->swapchain->Present(1, 0);
+  // ASC_GPU_PRESENT_FAIL=1 injects one healthy-device Present failure so the
+  // drain-before-recreate path is testable without waiting for a driver/TDR.
+  static int injectedPresentFailure = 0;
+  HRESULT phr;
+  if (!injectedPresentFailure && getenv("ASC_GPU_PRESENT_FAIL") != nullptr) {
+    injectedPresentFailure = 1;
+    phr = E_OUTOFMEMORY;
+  } else {
+    phr = w->swapchain->Present(1, 0);
+  }
   if (FAILED(phr)) {
     const HRESULT presentReason = g_device.get() != nullptr ? g_device->GetDeviceRemovedReason() : E_FAIL;
     fprintf(stderr, "d3d_glue: Present failed: 0x%08lx win=%d hwnd=%p hwndAlive=%d deviceReason=0x%08lx\n",
@@ -1062,6 +1105,10 @@ void sk_gpu_flush(int win_id) {
     if (d3d_hr_is_device_lost(phr)) {
       d3d_mark_lost("Present", phr);
     } else {
+      // The device and queue are still alive and this frame's GPU commands were
+      // already submitted. Retire its fence before draining: otherwise the next
+      // acquire waits forever for a value that the failed-Present return skipped.
+      D3D_OK_OR_WARN(g_queue->Signal(w->fence.get(), w->fence_values[w->buffer_index]));
       // A healthy device with a failed present has no reliable old swapchain to
       // keep submitting to. Recover this window instead of logging E_FAIL forever.
       d3d_recreate_window(w, w->width, w->height);

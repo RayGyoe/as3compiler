@@ -193,6 +193,11 @@ error 103，而异命名空间的元素/属性四种写法**全部**报 103；`a
 其他窗口和共享设备保持存活；重建失败由空交换链门在后续帧重试。`ASC_GPU_RESIZE_FAIL=1` 可注入一次该路径，
 `temp/d3dresize` 已验证「设备丢失重建 + 注入 resize 失败 + 最小化恢复」组合路径，恢复后零 `Present failed`。
 
+**D3D12 交换链重建的 GPU 收尾（阶段三百零五）**：健康设备上的 `Present` 失败先 retire 当前帧 fence，
+再等待 GPU 与已呈现后缓冲全部完成，最后才释放并重建交换链；不再让旧交换链仍被使用时给同一 HWND 建新链。
+失败重建带 250 ms 退避。`ASC_GPU_PRESENT_FAIL=1` 可注入一次该路径，`temp/d3dresize` 的 Present/resize/device-lost
+三重组合探针已验证恢复并正常退出。
+
 **ANE 加载（阶段一百七十八）**：`--ane` / 清单 `ane-paths` 打开 `ASC_HAVE_FRE` 并接上宿主 FRE 运行时。
 每一项可以是 `.ane` 包，也可以是**解包后的目录**（`extension.xml` + `<平台键>/<原生库>`，即 `adt` 的暂存布局）——
 后者是重编给 AOT 用的那份产物的默认形态：其原生库导入宿主库（Windows `asaot.dll` / macOS

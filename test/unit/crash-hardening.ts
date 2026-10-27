@@ -148,6 +148,16 @@ function checkCrashHardening(): string[] {
   check('a failed window recreation is retried through a null-swapchain gate',
     /w->width = 0;\s*w->height = 0;/.test(d3d) &&
     /if \(w->swapchain.get\(\) == nullptr && !d3d_recreate_window\(w, width, height\)\) return nullptr;/.test(d3d));
+  check('window recreation drains GPU and presented buffers before releasing the swapchain',
+    /static int d3d_drain_window\(D3DWin\* w\)/.test(d3d) &&
+    /if \(!d3d_drain_window\(w\)\) \{\s*w->recreate_retry_at[\s\S]*?w->surfaces\[i\]\.reset\(\);/.test(d3d));
+  check('failed window recreation backs off instead of rebuilding every frame',
+    /now < w->recreate_retry_at/.test(d3d) &&
+    /w->recreate_retry_at = now \+ 250\.0;/.test(d3d));
+  check('a healthy Present failure retires the submitted frame before the drain',
+    /Retire its fence before draining[\s\S]*?g_queue->Signal\(w->fence.get\(\), w->fence_values\[w->buffer_index\]\)[\s\S]*?d3d_recreate_window/.test(d3d));
+  check('the healthy-device Present failure path has an executable probe hook',
+    /ASC_GPU_PRESENT_FAIL/.test(d3d) && /injectedPresentFailure = 1;\s*phr = E_OUTOFMEMORY;/.test(d3d));
   check('the healthy-device resize failure path has an executable probe hook',
     /ASC_GPU_RESIZE_FAIL/.test(d3d) && /injectedResizeFailure = 1;\s*rhr = E_OUTOFMEMORY;/.test(d3d));
   check('rebuild retries back off instead of spinning on D3D12CreateDevice every frame',
