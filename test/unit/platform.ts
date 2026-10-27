@@ -1111,6 +1111,31 @@ function checkPresentScale(): string[] {
   check('...and the image is still built at the surface\'s own size (no scaling in our code)',
     /CGImageCreate\(\(size_t\)w, \(size_t\)h, 8, 32, \(size_t\)rowBytes,/.test(wg));
 
+  // ---- The transparent hierarchy's backing scale (cross-display) ----
+  // A layer-HOSTING view (setLayer: above) is by definition one whose backing AppKit
+  // no longer manages, so neither it nor its sublayers receive the contentsScale that
+  // -viewDidChangeBackingProperties would push. They therefore keep the scale of the
+  // display the window was CREATED on.
+  //
+  // Measured on this box (2x 1800x1169 built-in + 1x 2560x1440 external), Prune's
+  // 340x440 panel created on the Retina screen and then opened on the 1x one: the
+  // frame handed over was already correct (340x440 device px, do_resize had reported
+  // the new size) but the layer still said contentsScale 2.0, so CoreAnimation drew
+  // those pixels as 170x220 POINTS -- the whole panel at half size in the top-left
+  // quarter, the rest of the window empty. Re-presenting cannot fix a stale number,
+  // so the scale has to be re-read on every present.
+  const iSync = wg.indexOf('sk_mac_sync_layer_scales(c);');
+  check('the transparent present step re-pins the layer scale before it sets contents',
+    iSync >= 0 && iContents > iSync);
+  check('...from the window\'s LIVE backing scale, not from a value cached at creation',
+    /static double sk_window_live_scale\(SDL_Window\* win\) \{\n  return win != NULL \? sk_window_backing_scale\(win\) : 0\.0;/.test(wg)
+    && /static void sk_layer_sync_scale\(void\* layer, double bs\) \{/.test(wg)
+    && /SK_SET_DBL\(layer, "setContentsScale:", bs\);/.test(wg));
+  check('...and applies it to every layer this path owns (view, backdrop, frame host)',
+    /if \(view != NULL\) sk_layer_sync_scale\(SK_OBJ\(view, "layer"\), bs\);/.test(wg)
+    && /if \(c->vib_eff != NULL\) sk_layer_sync_scale\(SK_OBJ\(c->vib_eff, "layer"\), bs\);/.test(wg)
+    && /if \(c->vib_host != NULL\) sk_layer_sync_scale\(SK_OBJ\(c->vib_host, "layer"\), bs\);/.test(wg));
+
   // ---- The device scale must not be read out of two SDL size queries ----
   // Measured on macOS (temp/resizeprobe, 2026-10-21) while dragging a window edge:
   // SDL_GetWindowSize reads SDL's CACHED logical size (written from the resize

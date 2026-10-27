@@ -2202,6 +2202,33 @@ static void* sk_inert_view_class(const char* name, const char* base) {
 // here because the transparent host layer needs it to name its contents gravity.
 static void* sk_nsstring(const char* s);
 
+// Keep a CALayer's contentsScale equal to the backing scale of the display the
+// window is CURRENTLY on. This has to be re-read on every present, not set once:
+// sk_mac_ensure_transparent makes the content view LAYER-HOSTING with setLayer:,
+// and a layer-hosting view is by definition one whose backing AppKit no longer
+// manages -- so neither it nor its sublayers get the contentsScale update AppKit
+// would otherwise push on -viewDidChangeBackingProperties. The layers therefore
+// keep the scale of the display the window was CREATED on.
+//
+// Measured on this box (2x built-in 1800x1169 + 1x external 2560x1440), Prune's
+// 340x440 panel: it is created on the Retina screen (contentsScale 2.0), then
+// opened on the 1x screen. The frame handed over was correctly 340x440 device px
+// (do_resize had already reported the new size), but the layer still said 2.0, so
+// CoreAnimation drew those 340x440 px as 170x220 POINTS: the whole panel appeared
+// at half size in the top-left quarter, with the rest of the window empty. No
+// amount of re-presenting fixes it -- the number itself was stale.
+static void sk_layer_sync_scale(void* layer, double bs) {
+  if (layer == NULL || bs <= 0.0) return;
+  double cur = ((double (*)(void*, SEL))objc_msgSend)(layer, sel_registerName("contentsScale"));
+  if (cur != bs) SK_SET_DBL(layer, "setContentsScale:", bs);
+}
+
+// The backing scale of the display this window is on right now (live NSWindow
+// query, the same one sk_window_device_scale uses). 0.0 when it cannot be read.
+static double sk_window_live_scale(SDL_Window* win) {
+  return win != NULL ? sk_window_backing_scale(win) : 0.0;
+}
+
 // Build the layer tree that replaces SDL's opaque backing store. Idempotent, and a
 // no-op on a non-transparent window.
 static void sk_mac_ensure_transparent(WinCtx* c) {
@@ -2301,6 +2328,24 @@ static void sk_mac_ensure_transparent(WinCtx* c) {
   c->vib_host = host;
 }
 
+// Re-pin every layer this path owns to the LIVE backing scale. Called from the
+// present step (once per frame) rather than from a delegate callback: the whole
+// hierarchy hangs off a layer-HOSTING content view, so AppKit's automatic
+// -viewDidChangeBackingProperties propagation does not reach it (see
+// sk_layer_sync_scale for the measured cross-display failure).
+static void sk_mac_sync_layer_scales(WinCtx* c) {
+  double bs = sk_window_live_scale(c->win);
+  if (bs <= 0.0) return;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info)) return;
+  if (info.subsystem != SDL_SYSWM_COCOA || info.info.cocoa.window == NULL) return;
+  void* view = SK_OBJ((void*)info.info.cocoa.window, "contentView");
+  if (view != NULL) sk_layer_sync_scale(SK_OBJ(view, "layer"), bs);
+  if (c->vib_eff != NULL) sk_layer_sync_scale(SK_OBJ(c->vib_eff, "layer"), bs);
+  if (c->vib_host != NULL) sk_layer_sync_scale(SK_OBJ(c->vib_host, "layer"), bs);
+}
+
 // Copy the frame into a CGImage and hand it to the host layer. The copy is required:
 // the source buffer is Skia's surface, which is rewritten next frame while
 // CoreAnimation still holds the image.
@@ -2310,6 +2355,7 @@ static void sk_mac_ensure_transparent(WinCtx* c) {
 static void sk_mac_present_layer(WinCtx* c, void* pixels, int w, int h, int rowBytes) {
   sk_mac_ensure_transparent(c);
   if (c->vib_host == NULL || pixels == NULL || w <= 0 || h <= 0) return;
+  sk_mac_sync_layer_scales(c);
   size_t bytes = (size_t)rowBytes * (size_t)h;
   void* copy = malloc(bytes);
   if (copy == NULL) return;

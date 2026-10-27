@@ -480,6 +480,40 @@ Windows 侧同源缺陷见 [`win32.md`](win32.md) §2.10。
 `ASC_FRAME_STATS=1` 四个拖拽循环 `p50 = 8.17~8.30 ms`（约 120 fps）、`over17ms = 0~5`、`worstgc = 0.00`。
 即 macOS 的 `CAMetalLayer` 与设备倍率两条主路径**已经修好**，剩下的未覆盖面只有透明窗这一条。
 
+#### 6.7.2 跨屏时透明窗的 layer **不会**自己换 backing scale（阶段二百九十八）
+
+**背景**：6.7.1 修的是「同一块屏上、几何先动」的拉伸。跨屏还有第二件事：**倍率本身变了**。
+`sk_mac_ensure_transparent()` 为了拿到 alpha，把内容视图做成 **layer-hosting**（`[contentView setLayer:]`），
+而 layer-hosting 的定义就是「AppKit 不再管理它的 backing」—— 于是 `-viewDidChangeBackingProperties`
+那一套**不会**传导进来，这块 layer 及其子 layer 永远停在**窗口创建时那块屏**的 `contentsScale` 上。
+
+**症状**（净扫面板，2x 内建屏 1800x1169 + 1x 外接屏 2560x1440）：窗口在 Retina 屏上创建（`contentsScale = 2.0`），
+拖到 1x 屏上打开 —— **整块面板缩到窗口左上角四分之一，其余全是空白**。
+
+**为什么可以断定是「倍率过期」而不是「帧尺寸过期」**：帧是**对的**。`do_resize` 已经从
+`SDL_GetWindowSizeInPixels` 拿到 340x440 设备像素并报给 AS3，`CGImageCreate` 也照这个尺寸建图。
+如果帧是 680x880 而 layer 没缩放，观感会相反 —— 左上四分之一露出**放大的**局部（只有标题栏和半个列表）；
+实测看到的是**整块面板（含底部按钮）缩成一半**，那只可能是 340x440 px 被按 2.0 当成 170x220 **point** 画。
+重新上传帧没用：错的不是帧，是那个数。
+
+**实测**（`prune` 面板，同一份二进制，两屏各点一次菜单栏图标）：
+
+| 屏 | 面板逻辑尺寸 | 窗口 bounds | 捕获 png | 修前内容占位 | 修后内容占位 |
+|---|---|---|---|---|---|
+| 主屏 2x | 340x440 | `1448,45 340x440` | 680x880 | 满幅 | 满幅 |
+| 副屏 1x | 340x440 | `2208,-1404 340x440` | 340x440 | **170x220（左上四分之一）** | 满幅 |
+| 副屏 1x（展开） | 340x619 | `2208,-1404 340x619` | 340x619 | — | 满幅 |
+| 主屏 2x（展开） | 340x619 | `1448,45 340x619` | 680x1238 | — | 满幅 |
+
+**修法**：`sk_mac_present_layer()` 在 `setContents:` **之前**调 `sk_mac_sync_layer_scales(c)`：
+读一次 `NSWindow.backingScaleFactor`（`sk_window_live_scale`，与 `sk_window_device_scale` 同源、活查），
+对内容视图 / 毛玻璃背板 / 帧宿主三块 layer 逐个 `setContentsScale:`（值不同才写）。
+**必须每帧查**而不是「切屏时设一次」：没有可靠的跨屏回调可用（layer-hosting 已经把系统那条路切了），
+而一帧一次 objc 取值的代价远小于一次全帧 memcpy —— 本函数本来就在拷整帧。
+
+**回归钉子**：`unit: platform/PresentScale` 新增 3 条（同步调用在 `setContents:` **之前**；倍率是**活查**的
+`sk_window_backing_scale` 且真的发了 `setContentsScale:`；三块 layer 一个不漏）。
+
 ---
 
 ### 6.8 drawable 必须允许被当作纹理采样（高级混合模式，阶段一百六十）
