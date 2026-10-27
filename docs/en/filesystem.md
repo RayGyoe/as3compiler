@@ -443,3 +443,99 @@ pinned `new File("temp/x.txt").nativePath == "temp/x.txt"` since stage sixty-fou
 "AIR has no counterpart" kind rather than a rewrite of defined AIR behaviour; it is asserted
 explicitly in `examples/file-url.as` so it stays a decision rather than an accident.
 
+
+---
+
+## 12. Deletion / move / `size` / path normalisation — batch A (stage 298)
+
+After stage 290 (the `ContextMenu` Windows round) the `File` family got a **member-by-member** gap
+audit (`temp/fileaudit/matrix.sh`: one compile probe per member, measuring "does it exist";
+`temp/fileaudit/adl/Fp.as` + `out.txt` and `Av.as`/`Av2.as`/`Av3.as` + `av*.txt`, measuring "is it
+right"). The audit was split into batches A/B/C by cost; this section is **batch A** (low cost,
+the divergences real code trips over). Batch B (`FileStream`'s full `IDataInput`/`IDataOutput`
+surface) and batch C (new capability: `copyTo`/`canonicalize`/`getRelativePath`/`FileReference`/
+`StorageVolume`) are **not done** and are registered one by one in `TODO.md` → `### 遗留待开发`.
+
+### 12.1 The error table (synchronous members, measured on `adl 51.4.1` / macOS 26)
+
+| Call | Measured result |
+|---|---|
+| `deleteFile()`, path missing | `Error #3003: File or directory does not exist.` |
+| `deleteFile()`, target is a **real directory** | `Error #3006: Not a file.` (the directory stays) |
+| `deleteFile()`, entry inside a refused parent | `Error #3001: File or directory access denied.` |
+| `deleteDirectory()`, path missing | `#3003` |
+| `deleteDirectory()`, target is a file | `Error #3007: Not a directory.` |
+| `deleteDirectory(false)`, directory not empty | `Error #3010: Directory is not empty.` (it stays) |
+| `deleteDirectory(true)`, target is a **file** | **succeeds** — `recursive` means "recurse", not "must be a directory" |
+| `deleteDirectory(true)`, refused | `Error #2038: File I/O Error.` |
+| `moveTo(dest)`, source missing | `#3003` |
+| `moveTo(dest, false)`, `dest` exists | `Error #3012: Cannot delete file or directory.` (target untouched) |
+| `moveTo(null)` | `TypeError #2007`, message **`Error #2007: Parameter destination must be non-null.`** |
+| `moveTo`, parent of the destination missing | **created** (`mkdir -p` semantics) |
+| `moveTo` after success | **`nativePath` unchanged** (still the old location, `exists` turns `false`) — measured twice |
+| `moveTo` onto a directory | with `overwrite=true` the whole directory is replaced by the file |
+| any of the above on an empty `File` (`new File(null)`) | `#2037` |
+| `size`, path missing | `#3003` (**the old implementation returned 0 — that was wrong**, the comment claiming otherwise is gone) |
+| `size`, directory | **`0`** (not `st_size`) |
+| `size`, dangling symlink | `#3003` |
+
+**Symlinks**: `deleteFile`/`deleteDirectory`/`moveTo` move only the **link**, the target survives;
+a **dangling** link can be deleted; `deleteDirectory(link→dir, true)` deletes the link and does
+**not** recurse into the target. So the existence probe for a delete must be **`lstat`**
+(`as_path_exists_l`), never `stat` — otherwise "link to a directory" takes the recursive branch and
+deletes the target tree. Windows uses `GetFileAttributesA` (which does not follow reparse points).
+
+**Single implementation**: the three synchronous members share `as_file_delete_err(o, isDir,
+recursive)` and the asynchronous ones reuse the same result through `File__deleteDispatch` — the
+`errorID` is **identical** to the synchronous throw (`deleteFileAsync(dir)`=3006,
+`deleteDirectoryAsync(false)` non-empty=3010, missing=3003); success dispatches `COMPLETE`, and
+`#2037` still **throws synchronously**. That shared path is the bug batch A started from:
+`deleteDirectoryAsync(true)` used to dispatch `COMPLETE` without deleting anything.
+
+**Still missing**: a cross-volume `moveTo` fails in `rename` and then says so loudly
+("a cross-volume move is not implemented") instead of silently doing nothing or quietly
+substituting copy+delete.
+
+### 12.2 Path normalisation is LEXICAL, on both platforms
+
+Measured (`av.txt`, groups `E*`/`F*`/`G*`):
+
+| Input | `nativePath` |
+|---|---|
+| `/tmp//a/../b` | `/tmp/b` |
+| `/tmp/a/./b/` | `/tmp/a/b` (trailing separator dropped) |
+| `/tmp/a/../../..` | `/` (**clamped at the root**, never `/..`) |
+| `//tmp` | `/tmp` |
+| `/tmp/a\b` (POSIX) | `/tmp/a\b` — a backslash is a legal filename **byte**, not a separator |
+
+`resolvePath` uses the same rules plus two more: an **absolute argument replaces the base**
+(`"/tmp/z.txt"`.resolvePath(`"/abs/./q"`) = `/abs/q`), `""`/`"."` return the base itself, and
+`"~/x"` is **not** expanded (the base name `~` is copied verbatim). On Windows `as_path_norm` has
+extra drive/UNC/device-path branches (`\\?\`, `\\.\`), and a **device path passes through
+untouched** (its prefix is meaningful and must not be folded).
+
+There is no `url` setter (AIR has none either), but `nativePath` gained a real **setter** in this
+batch, with the measured rules: relative path / empty string / URL form ⇒ `#2004`, `null` ⇒
+`#2007` (message with the same **double space** as `moveTo`: `Error #2007: Parameter  must be
+non-null.` — the parameter name is the empty string). The **constructor still accepts a relative
+path** (the pre-existing deviation in §11.5), so the rejection applies to the setter only.
+
+### 12.3 Reproduce
+
+```sh
+# adl side (probes in temp/fileaudit/adl/, logs written to absolute-path av*.txt — adl prints nothing on stdout)
+#   run Av.as / Av2.as / Av3.as / Aw.as through mxmlc + adl
+
+# AOT side (the same cases in script form; the log goes to stdout)
+node src/index.ts temp/fileaudit/aot/probe.as  -o temp/fileaudit/aot/probe  --run
+node src/index.ts temp/fileaudit/aot/probe2.as -o temp/fileaudit/aot/probe2 --run
+```
+
+Both sides agree line for line (`probe.as` covers groups E/F/G/A/B/C/D, `probe2.as` covers the
+symlink K/N groups and the permission L group; fixtures are built by the shell, the L group needs
+`chmod 0555`). **Pins**: `examples/file-ops.as` (turns the tables above into assertions;
+`test/examples.ts` gives it a `HOME` fixture with an `fx/` subtree containing both a `linkdir` and
+a `dangle` link); `unit: file-ops/contract` (30 source-level structural checks: `moveTo` takes two
+parameters, sync and async share `as_file_delete_err`, `COMPLETE` is dispatched only when
+`err == 0`, `#3010` comes from `ENOTEMPTY`, `lstat` rather than `stat`, and `moveTo` does not
+rewrite `nativePath`).

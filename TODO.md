@@ -17024,6 +17024,106 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 - `node test.ts`：523 例 / 517 过 / 4 红，与基线一致（`socket`、`stage94d`、`status-item`、`inline StackCanary`）。
 - 新增单元组 `unit: platform/DeviceLost`（12 条源级钉）：drop 的分支与 park、`mark_lost` 固定走丢失分支、`GetDeviceRemovedReason` 取名、重建失败走 `d3d_device_gone()`（两处）、`sk_gpu_destroy` 的两处跳过、`ASC_GPU_LOSE_AT` 走真移除并直达丢失路径。
 
+### 阶段二百九十八：`File` 家族的 A 批 —— 删除/移动/`size`/路径归一化逐条对齐 `adl`（v0.4.260 → v0.4.261）✅ 已完成
+
+**一、起因**（用户）：「那先把 A 搞定」。前一轮已对 `flash.filesystem` 做了一次**逐成员**缺口审计，
+按成本分 A/B/C 三批。**A 批 = 低成本、真实世界最容易踩到的语义差**；本阶段只做 A 批，B 批
+（`FileStream` 的 `IDataInput`/`IDataOutput` 全表）与 C 批（新能力：`copyTo`/`canonicalize`/
+`getRelativePath`/`FileReference`/`StorageVolume`）**不动**，逐项入遗留表。
+
+审计产物：`temp/fileaudit/matrix.sh`（每个成员一条**编译**探针，量「有没有」）、
+`temp/fileaudit/adl/Fp.as` + `out.txt`、`Av.as`/`Av2.as`/`Av3.as`/`Aw.as` + `av*.txt`（量「对不对」）。
+
+**二、测到的差异（全部 `adl 51.4.1` / macOS 26 实测，探针同上）**
+
+| # | 成员 | 实测（AIR） | 本阶段之前 |
+|---|---|---|---|
+| 1 | `deleteDirectory` 签名 | **一个** `Boolean` 参数：`(true)` 递归、`(false)` 只删空目录 | **0 参数**，`deleteDirectory(true)` **编不过** |
+| 2 | `deleteDirectoryAsync(true)` | 递归删完才派 `COMPLETE` | **什么都没删就派 `COMPLETE`**，`exists` 仍 `true` |
+| 3 | `deleteFile` 路径不存在 | `#3003` | 静默 no-op |
+| 4 | `deleteFile` 目标是真实目录 | `#3006: Not a file.` | 静默 no-op |
+| 5 | `deleteFile` 被拒 | `#3001: File or directory access denied.` | 静默 no-op |
+| 6 | `deleteDirectory(false)` 非空 | `#3010: Directory is not empty.` | 静默 no-op |
+| 7 | `deleteDirectory()` 是文件 | `#3007: Not a directory.` | 静默 no-op |
+| 8 | `deleteDirectory(true)` 是文件 | **成功**（`recursive` = 递归，不是「必须是目录」） | 编不过（见 1） |
+| 9 | `moveTo(dest, false)` 且目标已存在 | `#3012: Cannot delete file or directory.` | 静默 no-op |
+| 10 | `moveTo` 缺父目录 | **自动创建**（`mkdir -p`） | `rename` 失败 ⇒ 静默 no-op |
+| 11 | `moveTo` 参数个数 | **2**（`mxmlc` 拒绝第三个：「要求不超过 2 个」） | 3（多了我们自己的 `force`） |
+| 12 | `moveTo(null)` | `TypeError #2007`「Parameter destination must be non-null.」 | 静默 no-op |
+| 13 | `moveTo(dest)` 源不存在 | `#3003` | 安静地报「未支持」 |
+| 14 | `moveTo` 成功后 `nativePath` | **不变**（仍指旧位置，`exists=false`） | **改成目标路径** |
+| 15 | `size` 路径不存在 | `#3003` | **返回 0**（`symbols.ts` 里那句「AIR 也回 0」的注释是**错的**） |
+| 16 | `size` 是目录 | **`0`** | 回 `st_size` |
+| 17 | `size` 是悬空软链 | `#3003` | 回 0 |
+| 18 | `resolvePath("a/../b")` | `/root/b` | `/root/a/../b` |
+| 19 | `resolvePath("../../..")` | `/`（根处夹紧） | `/tmp/../../..` |
+| 20 | `nativePath` setter | 相对路径/空串/URL ⇒ `#2004`、`null` ⇒ `#2007`、**词法归一化** | **没有 setter**（只有字段） |
+| 21 | 构造器 | 词法归一化：`//` 折叠、`.` 丢弃、`..` 消去（根处夹紧）、末尾分隔符丢弃；POSIX 下反斜杠是**合法文件名字节** | 原样保存 |
+
+**软链口径（顺带量全）**：`deleteFile`/`deleteDirectory`/`moveTo` 都只动**链接本身**、目标保留；
+**悬空链接可删**；`deleteDirectory(link→dir, true)` 删链接**不递归进目标**；`size(悬空链接)`= `#3003`。
+
+**三、改动**
+
+`src/emit.ts`（`flash.filesystem` 段）：
+
+| # | 改动 | 为什么 |
+|---|---|---|
+| 1 | 新增 emitter helper `cblock(code)`（多行 C 块按 `this.line` 逐行输出） | 这一段以前是「一行 C 一个超长 `this.line`」的墙，改不动也读不动 |
+| 2 | `as_path_is_abs` + **完整的词法** `as_path_norm`（Win32 分支处理盘符/UNC 与 `\\?\`、`\\.\` 设备路径**原样透传**；POSIX 只用 `/`）+ `as_path_dirname` + `as_path_join`（**绝对第二参数替换 base**） | 上表 18~21；旧 `as_path_norm` 只换分隔符，POSIX 上是**空操作** |
+| 3 | `File_ctor` 存 `as_path_norm(path)`；新增 `File_set_nativePath`（`#2004`/`#2007` + 归一化），`src/symbols.ts` 的 `setters` 由空 Map 改为声明 `nativePath` | 上表 20/21 |
+| 4 | `File_get_size` 三形态（不存在 `#3003`、非普通文件 `0`、其余 `st_size`） | 上表 15~17；旧注释（「AIR 也回 0」）已删除并改成实测口径 |
+| 5 | `as_path_exists_l`（`lstat` / `GetFileAttributesA`）、`as_remove_any`（递归，**只深入真实目录**）、`as_rmdir_empty`（`ENOTEMPTY`/`ERROR_DIR_NOT_EMPTY` ⇒ `#3010`）、`as_file_delete_err`、`as_file_err_text`、`as_file_throw` | 上表 3~8 与软链口径 |
+| 6 | `File_deleteFile` / `File_deleteDirectory(bool recursive)` / `File_moveTo(void*, File* target, bool overwrite)` 全部重写走上面那套；`moveTo` 补 `#2007`/`#3003`/`#3012`/自动建父目录、**不再改写 `nativePath`** | 上表 3~14；`force` 参数**删掉**（AIR 只有两个） |
+| 7 | 异步：`File__deleteDispatch(File*, int err)` —— `2037` 同步抛、`0` 派 `COMPLETE`、其余派带 `errorID` 的 `IOErrorEvent`；两个 `*Async` 改为「先算 `as_file_delete_err` 再交给它」 | 上表 2（**修的就是这一条**），并保证同步/异步的错误号**同源** |
+
+`src/symbols.ts`：`deleteDirectory` 补 `recursive` 形参、`moveTo` 去掉 `force`、`size` 的注释按实测改写、
+`File` 声明 `nativePath` setter。
+
+**四、验证**
+
+- **双端逐行对照**：`temp/fileaudit/adl/` 的 `av.txt`/`av2.txt`/`av3.txt`（`mxmlc` + `adl`，日志写
+  **绝对路径**）↔ `temp/fileaudit/aot/probe.as` / `probe2.as`（同一批用例的脚本形态，本编译器直接跑）。
+  覆盖 E/F/G（路径 15 条）、A/B（删除 8 条）、C（移动 7 条）、D（`size` 4 条）、K/N（软链 5 条）、
+  L（权限 2 条）—— **逐行相同，零差异**（含 `#2007` 那条**双空格**的文案）。
+- `examples/file-ops.as`：把上表逐条钉成断言（另加「递归不跟随链接」「悬空链接可删」「异步
+  `errorID` 与同步一致」「`#2037` 同步抛」），`test/examples.ts` 给它一个 `HOME` 夹具目录与
+  `fx/{dir,dir/inner.txt,linkdir→dir,dangle→nope}` 子树（每次重建），`HOME=… node src/index.ts
+  examples/file-ops.as -o … --run` ⇒ `file-ops: OK`。
+- **回归**：`node --test --test-name-pattern='stage64|move-to-trash|file-symlink|file-listing-async|file-ops'`
+  **5/5 绿**；`npm run test:unit` 全绿（含新增 `unit: file-ops/contract` 30 条与改写后的
+  `unit: file-url/mapping` 6 条）；全量 `node test.ts` 见下。
+
+**五、顺带修掉的一处示例缺陷**：`examples/file-symlink.as` 的「跟随链接」遍历会对**悬空链接**求
+`size`——`size` 现在按 AIR 抛 `#3003`，于是这个示例自己先红了。这不是回归，而是示例的
+「不受保护遍历」恰好演示了 AIR 的第二个代价：跟随链接不只是重复计数，还会**死在没有目标的
+链接上**。示例改为在该分支显式 `!c.exists` 归到 `links`，并把这条写进注释（受保护遍历的计数
+`4/4/8` 不变）。
+
+**六、如实报明**
+
+1. **B 批与 C 批未做**：`FileStream` 既不 `implements IDataInput` 也不 `implements IDataOutput`
+   （30 个方法里 23 个缺失，`endian`/`objectEncoding`/`readAhead` 没有、`position` 是 `uint` 而非
+   `Number`、`position` 不可写）；`File` 自身缺 14 个方法（含 `copyTo`/`clone`/`canonicalize`/
+   `getRelativePath`/**`creationDate`**/**`modificationDate`**）、8 个属性、5 个 static 常量、3 个
+   static 方法；`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent`
+   **四个类不存在**；`FileFilter.clone()` 只报明（返回 `null`）。全部逐项入遗留表。
+2. **跨卷 `moveTo` 仍未实现**：`rename` 失败后**响亮报明**「a cross-volume move is not
+   implemented」，不静默 no-op、也不悄悄用「复制+删除」顶替。
+3. **构造器仍接受相对路径**（AIR 抛 `#2004`）：这是既有偏差（§11.5），修它须同时改掉
+   `examples/stage64.as`/`sqlite-*.as` 里的相对路径写法，本阶段**只在 setter 上**落地 `#2004`。
+4. **Windows 分支只写未测**：`as_path_exists_l`/`as_remove_any`/`as_rmdir_empty` 的
+   `_WIN32` 分支（`GetFileAttributesA`、`RemoveDirectoryA`、`ERROR_DIR_NOT_EMPTY`）按 AIR 同号
+   映射写好，**本机是 macOS，无法验证**。
+5. **`defaultTextFormat` 之外的另一条**：`Aw.as` 里 `deleteDirectory(denied, true)` 实测是
+   `#2038` 而不是 `#3001`（`deleteFile` 的被拒是 `#3001`）—— 两者**不同号**，已按实测分别落地，
+   将来若有人「统一」这两个号就会错。
+
+**七、遗留表**：**新登记 3 行 / 改写 1 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，
+本表 **99 → 102 项**。新登记 = `File` 成员面缺 14 方法/8 属性/5 static/3 static 方法、`FileStream`
+的 `IDataInput`/`IDataOutput` 全表、四个类缺失 + `FileFilter.clone` 报明；改写 = 「`File` 的路径
+字符串契约」由**未开始**转 **部分完成**（setter 侧 `#2004` + 词法归一化已落地，构造器仍宽松）。
+
 ### 遗留待开发
 > **2026-10-27 追加（阶段二百六十 补记：菜单栏状态项的多档位图与右键弹菜单）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数不变。两条都是**我们自己那条 macOS 增强通道（E19，opt-in `--features tray`）的后端收口**，`adl` 上根本没有对应路径（默认构建仍 `#2012`），故不属 §1.5「`adl` 跑得对我们跑不出」，不占本表；也**不改任何 AS3 语义**（`SystemTrayIcon` 的成员、事件、错误码一字未动），按阶段二百六十三之后的先例**不升版本号**。① **`bitmaps` 从「取第一张」改为「全部交出去」**（`sk_tray_set_image` → `sk_tray_set_images`，最多 4 张，每张一个 `NSImage` representation）：AIR 文档里这个数组的用途就是「放不同尺寸以适配不同显示分辨率」，而在 macOS 上尺寸只能意味着密度 —— 菜单栏恒 22pt，22px 高的位图是 1x、44px 的是 2x。**只给 2x 会让非 Retina 屏上的图标被 AppKit 降采样**：15pt 的图里 1.5pt 的描边被平均成雾（本机 2560×1440 副屏实测，对比见 `prune/shots/menubar/`）。② **菜单只在右键弹**（`sk_tray_fired` 里 `kind == 1` 才 `popUpStatusItemMenu:`），且**先派发 `RIGHT_CLICK` 再弹** ——「左右键都弹菜单」是 AppKit 的惯例，但那样左键就永远不能表示别的东西；派发在前则 AS3 能在回调里把勾选状态刷成最新的。**已知边界（已写进 `docs/zh-cn/enhancements.md` §4.11）**：位图被标成 template image（RGB 只贡献 alpha，**不做彩色图标**）；左键弹菜单这条惯例被有意放弃。**证据**：`unit: emit/SystemTrayIcon`（33 → 38 条，新增多档交出的钉与非 Cocoa 端的同名桩）、`examples/status-item.as` 无改动仍全过、真机双屏（主 1800×1169 @2x + 副 2560×1440 @1x）逐屏截图确认两档各自清晰。
 > **2026-10-27 追加（阶段二百九十七：D3D12 设备丢失的收尾）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 本表 **98 → 99 项**（`未开始` **76 → 77** / `部分完成` 20 / `调研完成·实现暂缓` 1 / 已完成 1）。**本阶段修的那条不占表**：崩溃在 `adl` 上不存在对应物（它是我们自家 D3D12 后端的收尾），且同阶段落地。新登记的 1 行是**跨端**剩下的：Metal 与 WGL 后端**连设备丢失检测都没有**（本机是 Windows，`.mm`/GL 丢失两条都无法在本机编译验证，故只登记、不盲写）。
@@ -17263,7 +17363,7 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 | **web 端从文档类构造器请求 Stage3D 上下文不可用**，且 wasm 上胶水层抛的 JS 异常 AS3 `try/catch` **捕不到** | 未开始（2026-10-09 阶段一百二十八 实测发现，`temp/mipprobe/`） | web 侧的 WebGL2 上下文由 `Stage.showWindow` 创建，而文档类构造器里 `stage.stage3Ds[0].requestContext3D()` ⇒ `s3d_alloc_target` 的 `glGenFramebuffers(1, &c->fbo)` 读到未初始化的 GL 对象，抛 `TypeError: Cannot read properties of undefined (reading 'createFramebuffer')`。两层缺口：① **时机** —— AIR 允许「构造器里 requestContext3D、第一帧等 `CONTEXT3D_CREATE`」（native/adl 都能跑），web 上该形态必然失败（`Stage.showWindow` 后请求则正常）；② **可观测性** —— 该异常是 emscripten 帧里的 JS 抛错，**不经过 AS3 异常通道**，`try { requestContext3D(); } catch (e:Error) {}` 捕不到，用户只看到一个 unhandled rejection。探针因此改成「先 `showWindow`、再在第一帧请求」（三端一致）。 | 若要收口需两处：① web 侧把 Stage3D 目标的创建推迟到 canvas 就绪（`Stage.showWindow` 之后），并对「此前请求过」的 Context3D 补建（与 native 的「构造器即可请求」形态对齐）；② 给 glue 里所有会抛 JS 异常的入口加守卫，失败走 `as_throw` 而不是 JS throw（把不可捕获变成**响亮**的 AS3 错误）。**成本中**，且要保证 native 语义不变。 |
 | `TextField.textWidth` 的字形累进口径与 AIR 有残差 | 未开始（2026-10-09 阶段一百二十八 三端探针实测，`temp/bakeprobe/`） | 同字体同字号（`_typewriter` 12）同一串：`adl 51.4.1` 给 `14.5`，我们给 `14.40234375`（= 14 + 103/256，看着像 26.6 定点累加；`adl` 的 14.5 更接近其内部 twip/半像素口径）。与本表「`TextField.textWidth` 不含行尾空格（AIR 含）」是**同一族**（字形累进与度量舍入），但根因不同：那条是**取哪些字形**，这条是**每个字形的进位数**。像素影响仅限用 `textWidth` 做布局/换行的代码（本阶段探针的包围盒因字段宽度显式给出而不受影响）。 | 先扩大实测样本（多字号 × 多串 × 单字形）定 AIR 的进位舍入口径（是否 `ceil`/half-px/twip 取整），再决定是否复刻；与「设备字体度量表」那条同批评估更省。**成本低（测量）~中（复刻）**。 |
 | **`flash.data` 加密数据库未支持**（`open(path, mode, …, encryptionKey)`、`reencrypt()`、带密钥的 `attach`） | 未开始（2026-10-12 阶段一百三十九 落地 A–D 时按 §1.5 硬判据登记为**欠账**；同轮四个示例的三端验收见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md) §10.4） | **`adl 51.4.1` 实测**：带密钥建库后宿主机 `sqlite3` 打不开（首 16 字节 = 密文而非 `SQLite format 3\0`、报 `file is not a database`）；明文库与带密钥库的字节 16–23 **唯一差别是 byte 20 `0x00`→`0x20`** ⇒ AIR 加密 = **AES-CCM + 16 字节裸密钥 + 每页保留 32 B**（密钥来自 `writeUTFBytes(16 字符口令)`），与 SQLCipher（PBKDF2 + AES-256-CBC + HMAC + 明文 salt、保留 48 B）**密钥派生/算法/页布局三轴全不兼容**；我们现状：非空密钥一律 **`SQLError #3138` 响亮拒绝**（绝**不**静默写明文库） | 若要做：按 avmplus 的加密页编解码逐字节移植（每页 nonce/MAC 布局需逆向实证），或整体换 SQLCipher （**语义不等价**，等于换引擎）。**明确不做**的替代方案：静默忽略密钥 / 静默写明文 —— 那会把「安全属性丢失」变成无声的数据流失，违反 §1.5。**成本高、优先级低**（目标应用零 `import flash.data`、包装层不传密钥；本轮示例与 ADR 已把该缺口写死为「响亮报错」） |
-| **`File` 的路径字符串契约与 AIR 不符**（`new File(x)` 对**非绝对**的 `x` 应抛 `ArgumentError #2004`；`file://` 形式应解析成原生路径；**两个虚拟 scheme `app:`/`app-storage:` 未建模**） | 未开始（2026-10-12 阶段一百三十九 跑 AIR oracle 时**顺带撞出**；证据 `temp/relpath/`；**2026-10-19 阶段一百九十 复核追加**下面第三组口径，证据 `temp/fadir/`） | **`adl 51.4.1` 实测（第一组：`nativePath` 的校验）**：`new File("abc")` / `"temp/x.txt"` / `"./x.txt"` / `"file://relative/x.txt"` 一律 `ArgumentError #2004 One of the parameters is invalid.`（抛在 `flash.filesystem::File/set nativePath()`，栈由 `-debug=true` 取到）；`"file:///tmp/x.txt"` 与 `"/tmp/x.txt"` **都成功**且 `nativePath == "/tmp/x.txt"`、`url == "file:///tmp/x.txt"`（**归一化**）。**我们侧**：六个输入**全部成功**，`nativePath` 原样回、`url` 恒为 `file://` + 原串（`file:///tmp/x.txt` ⇒ `file://file:///tmp/x.txt`）。**第二组（2026-10-19 复核：`applicationDirectory` 早已实现，故原「运行时缺失」一行已移出本表）**：`as_app_dir()` 由**进程自身可执行文件路径**推目录（`src/emit.ts` 的 `File_new(as_app_dir())` 静态分支），`adl` 与 AOT 的 `appDir.nativePath` **逐字节相同**，`exists`/`isDirectory`/`name` 亦一致。**第三组（同批量出的 `url` 口径差）**：`adl` 的 `applicationDirectory.url == "app:/"`、`applicationStorageDirectory.url == "app-storage:/"`（**虚拟 scheme，不是 `file://`**），而 `desktopDirectory`/`documentsDirectory`/`userDirectory` 是 `file:///C:/Users/…`（**三斜杠 + 正斜杠**），`swf.url == "app:/Adl.swf"`、`swf.parent.url == "app:/"`；我方 `url` 是简化模型 `"file://" + nativePath`，故 `applicationDirectory.url` 给成 `file://C:\…\`（**方案错且少两个斜杠**）。另：`resolvePath` 的分隔符我方给 `/`、`adl` 给 `\` | 修法：在 `File` 的 setter/normalize 一处同时办三件——① 非绝对 ⇒ `#2004`；② 解析 `file://`（百分号解码）并归一化 `url`；③ `url` 按目录分两套（`applicationDirectory`/`applicationStorageDirectory` 回虚拟 scheme `app:`/`app-storage:`，其余回 `file:///` 归一化形式），`resolvePath` 分隔符随平台。**但**须同步改掉**依赖相对路径**的示例（`examples/stage64.as:16,41` 与四个 `examples/sqlite-*.as`，AIR 上的写法是 `File.applicationDirectory`/绝对路径，oracle harness 已如此改写）。**成本中、优先级低**（不影响 `flash.data` 主线：示例与 oracle 两侧都已按各自口径跑通） |
+| **`File` 的路径字符串契约与 AIR 不符**（`new File(x)` 对**非绝对**的 `x` 应抛 `ArgumentError #2004`；`file://` 形式应解析成原生路径；**两个虚拟 scheme `app:`/`app-storage:` 未建模**） | **部分完成**（2026-10-27 阶段二百九十八 收窄：**`nativePath` 的 setter 已按实测落地** —— 非绝对/空串/URL 形式 `#2004`、`null` `#2007`、写入即词法归一化；构造器**仍接受相对路径**（本行剩下的唯一偏差，修它须同步改 `examples/stage64.as` 与 `sqlite-*.as` 的相对路径写法）；`file://` 解析与两个虚拟 scheme **早已于阶段二百八十四 落地**，本轮已核实并从本行描述中划掉）（2026-10-12 阶段一百三十九 跑 AIR oracle 时**顺带撞出**；证据 `temp/relpath/`；**2026-10-19 阶段一百九十 复核追加**下面第三组口径，证据 `temp/fadir/`） | **`adl 51.4.1` 实测（第一组：`nativePath` 的校验）**：`new File("abc")` / `"temp/x.txt"` / `"./x.txt"` / `"file://relative/x.txt"` 一律 `ArgumentError #2004 One of the parameters is invalid.`（抛在 `flash.filesystem::File/set nativePath()`，栈由 `-debug=true` 取到）；`"file:///tmp/x.txt"` 与 `"/tmp/x.txt"` **都成功**且 `nativePath == "/tmp/x.txt"`、`url == "file:///tmp/x.txt"`（**归一化**）。**我们侧**：六个输入**全部成功**，`nativePath` 原样回、`url` 恒为 `file://` + 原串（`file:///tmp/x.txt` ⇒ `file://file:///tmp/x.txt`）。**第二组（2026-10-19 复核：`applicationDirectory` 早已实现，故原「运行时缺失」一行已移出本表）**：`as_app_dir()` 由**进程自身可执行文件路径**推目录（`src/emit.ts` 的 `File_new(as_app_dir())` 静态分支），`adl` 与 AOT 的 `appDir.nativePath` **逐字节相同**，`exists`/`isDirectory`/`name` 亦一致。**第三组（同批量出的 `url` 口径差）**：`adl` 的 `applicationDirectory.url == "app:/"`、`applicationStorageDirectory.url == "app-storage:/"`（**虚拟 scheme，不是 `file://`**），而 `desktopDirectory`/`documentsDirectory`/`userDirectory` 是 `file:///C:/Users/…`（**三斜杠 + 正斜杠**），`swf.url == "app:/Adl.swf"`、`swf.parent.url == "app:/"`；我方 `url` 是简化模型 `"file://" + nativePath`，故 `applicationDirectory.url` 给成 `file://C:\…\`（**方案错且少两个斜杠**）。另：`resolvePath` 的分隔符我方给 `/`、`adl` 给 `\` | 修法：在 `File` 的 setter/normalize 一处同时办三件——① 非绝对 ⇒ `#2004`；② 解析 `file://`（百分号解码）并归一化 `url`；③ `url` 按目录分两套（`applicationDirectory`/`applicationStorageDirectory` 回虚拟 scheme `app:`/`app-storage:`，其余回 `file:///` 归一化形式），`resolvePath` 分隔符随平台。**但**须同步改掉**依赖相对路径**的示例（`examples/stage64.as:16,41` 与四个 `examples/sqlite-*.as`，AIR 上的写法是 `File.applicationDirectory`/绝对路径，oracle harness 已如此改写）。**成本中、优先级低**（不影响 `flash.data` 主线：示例与 oracle 两侧都已按各自口径跑通） |
 | **编译期「隐式强制转换」检查缺失**（`mxmlc` 拒绝、我们照单收下）：`var st:String = <`Object` 静态类型值>;` 报「从静态类型为 Object 的值到可能不相关的类型 String 之间的隐式强制转换」；`var top:Function = String;` 报「从类型 String 的值到不相关类型 Function 之间的隐式强制转换」——两种我们都编译通过 | 未开始（2026-10-13 阶段一百四十四 跑 `adl` oracle 时**顺带撞出**：为了让 `adl` 收下同一份探针，不得不把 `var st:String = o;` 改写为 `var st:String = String(o);`、并删掉 `var top:Function = String;` 一行，证据 `temp/apv/adl/` 的两次 COMPILE FAIL 输出）。**方向是「比 AIR 宽松」**，因此**只影响本该被拒绝的程序**、不影响任何 `mxmlc` 能编译的程序 ⇒ **不属保真缺口**，与上一条「`File` 的路径字符串契约」同类（那条也是**更宽松**），如实登记、**优先级低**。修法：在赋值/传参/`return` 的静态类型收敛点补「不相关类型」检查（与现有的 `checkTypeAnnotation` 同层），失败响亮报 `行:列` |
 | **`Error` 家族实例的 `.message` 不做任何转换**（AIR 存**原值**） | 未开始（2026-10-14 阶段一百五十二 实测登记；「关闭应用即崩溃」修复的副产物） | `adl 51.4.1` 实测（`temp/errnull/`，Q1–Q11）：`Error(null).message === null`、`Error(undefined).message === undefined`、`Error(5).message === 5`（`typeof` 为 `"number"`）、`Error("").message === ""` **全为 true** —— AIR 把实参原样存进实例上**未类型化**的槽，只在**使用**时才字符串化（`5 + ""` → `"5"`、`{}` → `"[object Object]"`）。本构建的 `Error` 类把 `message` 定为 **`char*` String 槽**（构造期 `as_str_from_*` 转换，且 `NULL` → 字面 `"null"`）⇒ `Error(5).message` 我们 `"5"`（String ⇒ `=== 5` 为 false）、`Error(undefined).message` 我们 `"null"`（AIR `undefined`）；`new Error(x)` 形式**同样**（双端证据 `temp/errcall/` 的 E4/N4 两行）。**可观测面**＝严格相等、`typeof e.message`、以及把 `.message` 当动态值的分派 | 立项：把 `message`（连带核对 `name`/`errorID` 的槽形状）改成 **`as_value` 原值槽**，构造期**不**转换。代价：全仓 `e.message` 读点（catch 日志/UI 文案，真应用 talkmed 约百处）从静态 `String` 变成动态装箱（性能 + 新的 `#1009` 面），须与「`catch (e:*)` 的值保真」同批、并做全量回归。**当前有意不改** —— 保持 String 槽正是为了让 `e.message` 永不为 `NULL`（AIR 对 `null` 消息抛 `#1009`，我们若让槽可为 NULL 会把「类型错误」降级成 `strlen(NULL)` 的**内存错误**） |
 | **首页 tab 首标签偶尔掉第一个汉字**（`adl` 稳定 `打开网页`，我方**偶尔** `开网页`：首个汉字「打」整字消失、其余三字位置不变） | 未开始（2026-10-15 阶段一百六十五 巡检副产物，**间歇 1/6 次观测**；已排除与 C 名改写相关——同二进制重跑即正常、两版 C 规范化后逐字节相同 `temp/tkmeet-mac/ab.safe.diff`；复跑harness `temp/tkmeet-mac/labelprobe.py` 4/4 绿；待定方向：数据面（多字节串首部丢字节/BOM 误跳）vs 渲染面（字形图集缓存/GC 时序）；**修法**：加「数据到手即打印长度与首字符」探针 + 复现窗口） |
@@ -17292,6 +17392,9 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
 | **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |
+| **`File` 的成员面只覆盖 AIR 的一部分**（本阶段 A 批修的是**已实现成员**的语义；成员面缺口仍在） | 未开始（2026-10-27 阶段二百九十八 从 `temp/fileaudit/matrix.sh` 的逐成员编译探针量出，A 批未涉及） | 缺 **14 个方法**：`copyTo`/`copyToAsync`/`canonicalize`/`getRelativePath`/`clone`/`download`/`upload`/`uploadUnencoded`/`browseForSave`/`browseForOpenMultiple`/`browseForDirectory`（类名存在但走 shell 报明）/`getDirectoryListingAsync` 之外的 `moveToAsync`/`copyToAsync` 族、以及 `creationDate`/`modificationDate` 两个 getter（**探针里因此跳过 D4~D6 三条**）；缺 **8 个属性**（`creationDate`/`modificationDate`/`icon`/`type` 之外还缺 `url` setter 之外的 `isHidden` 语义完整度等，逐项见该脚本输出）；缺 **5 个 static 常量**（`documentsDirectory` 之外的 `lineEnding`/`separator` 已有，缺 `applicationDirectory` 之外的卷相关项）与 **3 个 static 方法**（`getRootDirectories`/`getVolumeByDrive`/`getVolumeByPath`） | C 批：新能力，逐条按 `adl` oracle 落地；`creationDate`/`modificationDate` 便宜，可先行（`stat` 的 `st_birthtime`/`st_mtime` 已有调用点） |
+| **`FileStream` 既不 `implements IDataInput` 也不 `implements IDataOutput`**（30 个方法里 23 个缺失） | 未开始（2026-10-27 阶段二百九十八 审计量出，B 批） | 现有：`open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` + 只读 `position`/`bytesAvailable`。缺的 23 个是 `IDataInput`/`IDataOutput` 的其余方法（`readBoolean`/`readByte`/`readBytes`/`readDouble`/`readFloat`/`readInt`/`readMultiByte`/`readObject`/`readShort`/`readUnsignedByte`/`readUnsignedInt`/`readUnsignedShort`/`readUTF` 与对应的 12 个 `write*`），另缺 `endian`/`objectEncoding`/`readAhead` 三个访问器；`position` 是 **`uint`** 而 AIR 是 **`Number`**，且**不可写** | B 批：机器活 —— `ByteArray` 已有全部实现，按 `FILE*` 后端逐个转写（`endian` 交换与 `objectEncoding` 走同一套 `as_ba_swap*`/AMF3 编解码器），并把 `position` 改成 `Number` 且可写（写即 `fseek`）。**注意**：`as3-semantics.md` 里「`FileStream` 是空替代」的说法将随之作废 |
+| **`FileReference` / `FileReferenceList` / `StorageVolume` / `StorageVolumeChangeEvent` 四个类不存在**；`FileFilter.clone()` 只报明（返回 `null`，接了会 `#1009`） | 未开始（2026-10-27 阶段二百九十八 审计量出，C 批） | `matrix.sh` 对这四个类都是 `unknown type`。`FileReference` 的 `browse`/`load`/`save` 三个流程要平台对话框（macOS `NSOpenPanel`/`NSSavePanel`，Windows `IFileOpenDialog`），`StorageVolume` 要 `statfs`/`GetDiskFreeSpaceExA` 的卷枚举（G3 的 ANE 交付与它无关：那是我们自己的通道，不是 `StorageVolume`）| C 批：先做 `FileReference` 的 browse+load（真实世界用得最多），`StorageVolume` 次之；`FileFilter.clone()` 随 `FileReference` 一起补（它的唯一用处就是传给 browse） |
 
 
 

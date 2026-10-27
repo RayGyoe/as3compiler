@@ -380,3 +380,90 @@ AIR 在构造器里就拒绝相对路径（`#2004`）。我们保留字符串（
 `file://` + 路径。AIR 造不出这个对象，所以这不是「我们对 AIR 已有行为的改写」，而是**AIR
 没有对应物**的那一类；它同时是 `examples/file-url.as` 的一条显式断言，不是为了好看。
 
+
+---
+
+## 12. 删除 / 移动 / `size` / 路径归一化 —— A 批实测（阶段二百九十八）
+
+阶段二百九十（`ContextMenu` 的 Windows 实测）之后，对 `File` 家族做了一次**逐成员**的缺口审计
+（`temp/fileaudit/matrix.sh`：每个成员一条编译探针，量「有没有」；`temp/fileaudit/adl/Fp.as` +
+`out.txt`、`Av.as`/`Av2.as`/`Av3.as` + `av*.txt`：量「对不对」）。审计按成本分 A/B/C 三批，
+本文这一节是 **A 批**（低成本、真实世界最容易踩到的语义差）的口径与落地。B 批（`FileStream` 的
+`IDataInput`/`IDataOutput` 全表）与 C 批（新能力：`copyTo`/`canonicalize`/`getRelativePath`/
+`FileReference`/`StorageVolume`）**未做**，逐项登记在 `TODO.md` 的 `### 遗留待开发`。
+
+### 12.1 错误表（同步成员，`adl 51.4.1` / macOS 26 实测）
+
+| 调用 | 实测结果 |
+|---|---|
+| `deleteFile()` 路径不存在 | `Error #3003: File or directory does not exist.` |
+| `deleteFile()` 目标是**真实目录** | `Error #3006: Not a file.`（目录**保留**） |
+| `deleteFile()` 目标是被拒的父目录下的项 | `Error #3001: File or directory access denied.` |
+| `deleteDirectory()` 路径不存在 | `#3003` |
+| `deleteDirectory()` 目标是文件 | `Error #3007: Not a directory.` |
+| `deleteDirectory(false)` 目录非空 | `Error #3010: Directory is not empty.`（目录**保留**） |
+| `deleteDirectory(true)` 目标是**文件** | **成功**——`recursive` 的含义是「递归」，不是「必须是目录」 |
+| `deleteDirectory(true)` 被拒 | `Error #2038: File I/O Error.` |
+| `moveTo(dest)` 源不存在 | `#3003` |
+| `moveTo(dest, false)` 且 `dest` 已存在 | `Error #3012: Cannot delete file or directory.`（目标**不动**） |
+| `moveTo(null)` | `TypeError #2007`，消息是 **`Error #2007: Parameter destination must be non-null.`** |
+| `moveTo` 的父目录不存在 | **自动创建**（`mkdir -p` 语义） |
+| `moveTo` 成功后接收者 | **`nativePath` 不变**（仍指旧位置，`exists` 转 `false`）——两次独立实测 |
+| `moveTo` 写目标时是目录 | `overwrite=true` 时**整个目录被文件替换** |
+| 空 `File`（`new File(null)`）调以上任一 | `#2037` |
+| `size` 路径不存在 | `#3003`（**旧实现返回 0 是错的**，`symbols.ts` 里那条注释已删） |
+| `size` 是目录 | **`0`**（不是 `st_size`） |
+| `size` 是悬空软链 | `#3003` |
+
+**软链**：`deleteFile`/`deleteDirectory`/`moveTo` 都只动**链接本身**，目标原样保留；**悬空链接
+可以删**；`deleteDirectory(link→dir, true)` 删链接**不递归进目标**。所以删除路径的存在性判定
+必须是 **`lstat`**（`as_path_exists_l`），不能用 `stat`——否则「软链指向目录」会走进递归分支，
+把目标树删掉。Windows 走 `GetFileAttributesA`（不跟随 reparse point）。
+
+**归位**：这三条同步成员共用 `as_file_delete_err(o, isDir, recursive)`，异步成员共用同一份结果
+再经 `File__deleteDispatch` 派发（`errorID` 与同步**完全一致**：`deleteFileAsync(目录)`=3006、
+`deleteDirectoryAsync(false)` 非空=3010、缺失=3003；成功派 `COMPLETE`；`#2037` 仍**同步抛出**）。
+这正是 A 批要修的原始 bug——`deleteDirectoryAsync(true)` 原先**什么都没删就派了 `COMPLETE`**。
+
+**仍未做**：跨卷 `moveTo` 走 `rename` 会失败，此时**响亮报明**「a cross-volume move is not
+implemented」（不静默 no-op，也不做「复制+删除」的静默替代）。
+
+### 12.2 路径归一化是**词法**的，两个平台都做
+
+实测（`av.txt` 的 `E*`/`F*`/`G*` 组）：
+
+| 输入 | `nativePath` |
+|---|---|
+| `/tmp//a/../b` | `/tmp/b` |
+| `/tmp/a/./b/` | `/tmp/a/b`（末尾分隔符丢弃） |
+| `/tmp/a/../../..` | `/`（**在根处夹紧**，不产生 `/..`） |
+| `//tmp` | `/tmp` |
+| `/tmp/a\b`（POSIX） | `/tmp/a\b` —— **反斜杠是合法文件名字节**，不是分隔符 |
+
+`resolvePath` 走同一套规则，另加两条：**绝对路径参数替换 base**（`"/tmp/z.txt"` 的
+`resolvePath("/abs/./q")` = `/abs/q`），`""`/`"."` 返回 base 本身，`"~/x"` **不展开**（基名
+`~` 照抄）。Windows 侧的 `as_path_norm` 另有盘符/UNC/设备路径（`\\?\`、`\\.\`）分支，**设备
+路径原样透传**（前缀有语义，不能折叠）。
+
+`url` 的 setter 不存在（AIR 也没有），`nativePath` 的 **setter** 则是本阶段新补的，且按实测：
+相对路径/空串/URL 形式 ⇒ `#2004`，`null` ⇒ `#2007`（消息与 `moveTo` 同样带**双空格**：
+`Error #2007: Parameter  must be non-null.` —— 参数名是空串）。**构造器仍接受相对路径**（见
+§11.5 的既有偏差），故这条只在 setter 上生效。
+
+### 12.3 复现
+
+```sh
+# adl 侧（探针在 temp/fileaudit/adl/，日志写绝对路径的 av*.txt —— adl 的 stdout 不出现）
+#   mxmlc + adl 各跑一遍 Av.as / Av2.as / Av3.as / Aw.as
+
+# AOT 侧（同一批用例的脚本形态，日志直接走 stdout）
+node src/index.ts temp/fileaudit/aot/probe.as  -o temp/fileaudit/aot/probe  --run
+node src/index.ts temp/fileaudit/aot/probe2.as -o temp/fileaudit/aot/probe2 --run
+```
+
+两侧逐行相同（`probe.as` 覆盖 E/F/G/A/B/C/D 七组，`probe2.as` 覆盖软链 K/N 组与权限 L 组；
+夹具由 shell 现造，`L` 组要 `chmod 0555`）。**回归钉**：`examples/file-ops.as`（把上面的表逐条
+钉成断言，`test/examples.ts` 给它一个 `HOME` 夹具目录 + `fx/` 子树，含 `linkdir`/`dangle` 两种
+链接）；`unit: file-ops/contract`（30 条源级结构钉：`moveTo` 的两个参数、同步/异步共用
+`as_file_delete_err`、`COMPLETE` 只在 `err == 0` 时派发、`#3010` 由 `ENOTEMPTY` 映射、
+`lstat` 而非 `stat`、`moveTo` 不改 `nativePath`）。

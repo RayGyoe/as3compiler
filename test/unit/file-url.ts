@@ -72,8 +72,17 @@ function checkMapping(): string[] {
   // ---- nativePath is the OS spelling, on the one join point ----
   check('as_path_join goes through the single normalizer',
     count('return as_path_norm(as_str_concat(as_str_concat(a, "/"), b));') === 1);
-  check('as_path_norm is a no-op off Windows',
-    c.includes('#else') && c.includes('return (char*)p;'));
+  // 阶段二百九十八: normalisation is LEXICAL and applies on BOTH platforms, so the old
+  // "off Windows it is a no-op" shape is gone. The rules pinned here are measured on
+  // adl 51.4.1 (temp/fileaudit/adl/av.txt): "." and empty components fold, ".."
+  // cancels and clamps at the root, a trailing separator drops, and a doubled root
+  // folds too. A POSIX backslash stays a filename byte, so only '/' may be `sep`.
+  check('as_path_norm is not a POSIX no-op', !c.includes('return (char*)p;'));
+  check('as_path_norm folds "." components', c.includes("if (len == 1 && src[s] == '.') continue;"));
+  check('as_path_norm clamps ".." at the root', c.includes('if (o > root_len) {'));
+  check('POSIX treats only "/" as a separator', c.includes("const char sep = '/';"));
+  check('an absolute join argument replaces the base',
+    c.includes('if (as_path_is_abs(b)) return as_path_norm(b);'));
 
   // ---- the decoder side of the mapping ----
   // Every local read hands the URL to the one helper: Loader/URLLoader (through

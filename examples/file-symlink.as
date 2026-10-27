@@ -63,6 +63,14 @@ function walk(root:File, followLinks:Boolean, cap:int):Object {
       } else if (c.isDirectory) {
         nodes++;
         stack.push(c);
+      } else if (!c.exists) {
+        // A DANGLING link dropped here: it is not a directory and it has no size to
+        // report. Since 阶段二百九十八 File.size THROWS #3003 for it, exactly as adl
+        // 51.4.1 does (measured in temp/fileaudit/adl/av3.txt N1), so a walk that
+        // descends into links meets a second cost beyond double-counting: it can
+        // die on a link whose target is gone. That is another reason the guarded
+        // walk asks isSymbolicLink BEFORE it asks for a size.
+        links++;
       } else {
         nodes++;
         bytes += c.size;

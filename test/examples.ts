@@ -67,7 +67,7 @@ tryLink('.', join(symFx, 'loop'));
 
 // The example units whose assertions count entries in a tree of LINKS. They need the
 // fixture above, so they are the only ones the capability gate below may skip.
-const SYMLINK_NEEDS_FIXTURE = new Set(['file-symlink.as', 'file-listing-async.as']);
+const SYMLINK_NEEDS_FIXTURE = new Set(['file-symlink.as', 'file-listing-async.as', 'file-ops.as']);
 
 // The fixture that `file-listing-async.as` runs against (EXAMPLE_ENV points HOME here for
 // the same reason as file-symlink: the example reaches the tree through File.userDirectory).
@@ -92,6 +92,21 @@ writeFileSync(join(listingFx, 'sub', 'inner.txt'), 'xyz');
 tryLink('a.txt', join(listingFx, 'link-file.txt'));
 chmodSync(listingNoread, 0o000);
 after(() => { try { chmodSync(listingNoread, 0o755); } catch { /* already gone */ } });
+
+// The fixture `file-ops.as` runs against (阶段二百九十八): the link shapes its deletion
+// assertions need. `linkdir` points at `dir`, which must still be there after the
+// link is deleted -- that is the whole difference between deleting a link and
+// following it. `work/` is NOT built here: the example creates and removes it on
+// its own, and a fresh one every run keeps a half-finished previous run from
+// making the assertions race.
+const fileOpsHome = join(root, 'temp', 'fileops-home');
+const fileOpsFx = join(fileOpsHome, 'fx');
+rmSync(fileOpsFx, { recursive: true, force: true });
+rmSync(join(fileOpsHome, 'work'), { recursive: true, force: true });
+mkdirSync(join(fileOpsFx, 'dir'), { recursive: true });
+writeFileSync(join(fileOpsFx, 'dir', 'inner.txt'), 'x');
+tryLink('dir', join(fileOpsFx, 'linkdir'));
+tryLink('nope', join(fileOpsFx, 'dangle'));
 
 const dir = join(root, 'examples');
 const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
@@ -261,6 +276,13 @@ const EXAMPLE_ENV: Record<string, Record<string, string>> = {
   // one additionally needs a directory it cannot OPEN, since an unreadable directory is the
   // input that separates "empty listing" from "ioError" (see the fixture comment above).
   'file-listing-async.as': { HOME: listingHome, USERPROFILE: listingHome },
+  // file-ops (阶段二百九十八) pins the DELETION rules, and the rule that needs a
+  // fixture is the link one: AIR deletes the LINK, never its target, so a link to
+  // a directory must survive as a target while the link itself goes away. The tree
+  // is rebuilt from scratch every run for the same reason as the other two, and it
+  // is its own home so the example's deletes cannot race another unit that walks
+  // temp/ concurrently.
+  'file-ops.as': { HOME: fileOpsHome, USERPROFILE: fileOpsHome },
   // The out-of-memory path needs a 32-bit address space that has actually run out,
   // which no CI runner and no fresh test process has. Making the segment carve fail
   // on request is the only way this unit can assert the same thing everywhere.

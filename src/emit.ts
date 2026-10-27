@@ -752,6 +752,13 @@ export class Emitter {
     this.out.push('  '.repeat(this.indent) + s);
   }
 
+  /** Emit a literal multi-line C block, indenting every line alike. Local
+   *  emissions that are pure C text (a helper family, a probe cluster) read far
+   *  better this way than as a wall of single-line this.line() calls. */
+  private cblock(code: string): void {
+    for (const ln of code.split('\n')) this.line(ln);
+  }
+
   private cTypeName(t: CType): string {
     switch (t.kind) {
       case 'int': return 'int';
@@ -16367,29 +16374,150 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('#endif');
     this.indent--;
     this.line('}');
-    this.line('static char* as_path_norm(const char* p) {');
-    this.line('#ifdef _WIN32');
-    this.indent++;
-    this.line('if (p == NULL) return NULL;');
-    this.line('int n = (int)strlen(p);');
-    this.line('char* r = as_str_alloc((size_t)n + 1);');
-    this.line('for (int i = 0; i < n; i++) r[i] = (p[i] == \'/\') ? \'\\\\\' : p[i];');
-    this.line('r[n] = \'\\0\';');
-    this.line('return r;');
-    this.indent--;
-    this.line('#else');
-    this.indent++;
-    this.line('return (char*)p;');
-    this.indent--;
-    this.line('#endif');
-    this.line('}');
-    this.line('static char* as_path_join(const char* a, const char* b) {');
-    this.indent++;
-    this.line('if (a == NULL || *a == \'\\0\') return (char*)(b ? b : "");');
-    this.line('if (b == NULL || *b == \'\\0\') return (char*)a;');
-    this.line('return as_path_norm(as_str_concat(as_str_concat(a, "/"), b));');
-    this.indent--;
-    this.line('}');
+    // ---- lexical path normalisation -----------------------------------------
+    // AIR normalises every path it STORES or RESOLVES, and it does so lexically --
+    // it never asks the filesystem. Measured on adl 51.4.1 (temp/fileaudit/adl/
+    // av.txt, av2.txt), one rule per line:
+    //
+    //   new File("/tmp//a/../b")  -> "/tmp/b"     empty components fold, "."
+    //                                             drops, ".." cancels
+    //   new File("/tmp/./")       -> "/tmp"       trailing separator drops
+    //   new File("/tmp/..")       -> "/"          ".." clamps at the root
+    //   new File("//tmp")         -> "/tmp"       a doubled root folds too
+    //   nativePath = "/tmp/a/"    -> "/tmp/a"     (the setter normalises too)
+    //   base.resolvePath("/abs")  -> "/abs"       an ABSOLUTE argument
+    //                                             REPLACES the base, not joins
+    //
+    // On POSIX a backslash is a legal filename byte, NOT a separator, and AIR
+    // keeps it that way (measured: "/tmp/a\\b" round-trips unchanged), so the
+    // separator is '/' there and '\\' on Windows (where '/' is also accepted).
+    //
+    // A relative path is normalised too -- ".." only cancels a real name, never
+    // another ".." -- which is what a host path expects even though AIR rejects
+    // such a path outright with #2004 (our acceptance of it is the registered
+    // deviation of TODO #240).
+    //
+    // The result is always a fresh GC string: callers keep it across further
+    // allocations. The output can never be longer than the input plus one byte
+    // (only "C:x" without a separator grows, by the separator the drive form
+    // needs), so n + 4 is safe.
+    this.cblock(`static bool as_path_is_abs(const char* p) {
+  if (p == NULL) return false;
+#ifdef _WIN32
+  if (p[0] == '/' || p[0] == '\\\\') return true;
+  return p[0] != '\\0' && p[1] == ':';
+#else
+  return p[0] == '/';
+#endif
+}
+static char* as_path_norm(const char* p) {
+  if (p == NULL) return NULL;
+  int n = (int)strlen(p);
+  int i, k = 0, o = 0, root_len = 0, abs = 0;
+  char* src = as_str_alloc((size_t)n + 1);
+  char* out = as_str_alloc((size_t)n + 4);
+#ifdef _WIN32
+  const char sep = '\\\\';
+  // Device paths (the long-path and device prefixes, i.e. a doubled backslash
+  // followed by '?' or '.') are parsed verbatim by the OS: rewriting one
+  // lexically would change its meaning, so they pass through untouched.
+  if (n >= 4 && p[0] == '\\\\' && p[1] == '\\\\' && (p[2] == '?' || p[2] == '.') && p[3] == '\\\\') {
+    for (i = 0; i < n; i++) src[i] = p[i];
+    src[n] = '\\0';
+    return src;
+  }
+  for (i = 0; i < n; i++) src[i] = (p[i] == '/') ? '\\\\' : p[i];
+#else
+  const char sep = '/';
+  for (i = 0; i < n; i++) src[i] = p[i];
+#endif
+  src[n] = '\\0';
+#ifdef _WIN32
+  if (n >= 2 && src[1] == ':') {
+    // Drive-qualified. "C:x" is drive-RELATIVE on Windows, so it is not abs.
+    out[o++] = src[0]; out[o++] = ':';
+    k = 2;
+    if (src[2] == sep) { out[o++] = sep; k = 3; abs = 1; }
+  } else if (src[0] == sep && src[1] == sep) {
+    // UNC "\\\\server\\share\\...": the two name components are the root and are
+    // copied verbatim, because ".." must never pop the share.
+    int j = 2, seps = 0;
+    while (src[j] != '\\0') { if (src[j] == sep && ++seps == 2) break; j++; }
+    out[o++] = sep; out[o++] = sep;
+    memcpy(out + o, src + 2, (size_t)(j - 2));
+    o += j - 2;
+    k = j;
+    if (src[k] == sep) { out[o++] = sep; k++; }
+    abs = 1;
+  } else if (src[0] == sep) {
+    out[o++] = sep; k = 1; abs = 1;
+  }
+#else
+  if (src[0] == sep) { out[o++] = sep; k = 1; abs = 1; }
+#endif
+  root_len = o;
+  while (src[k] != '\\0') {
+    while (src[k] == sep) k++;
+    if (src[k] == '\\0') break;
+    int s = k;
+    while (src[k] != '\\0' && src[k] != sep) k++;
+    int len = k - s;
+    if (len == 1 && src[s] == '.') continue;
+    if (len == 2 && src[s] == '.' && src[s + 1] == '.') {
+      if (abs) {
+        // Clamp at the root: never step above it.
+        if (o > root_len) {
+          while (o > root_len && out[o - 1] != sep) o--;
+          if (o > root_len) o--;
+        }
+      } else if (o == 0 || (o >= 2 && out[o - 1] == '.' && out[o - 2] == '.' && (o == 2 || out[o - 3] == sep))) {
+        // A relative path keeps a leading "..": it cancels only real names.
+        if (o > 0) out[o++] = sep;
+        out[o++] = '.'; out[o++] = '.';
+      } else {
+        while (o > 0 && out[o - 1] != sep) o--;
+        if (o > 0) o--;
+      }
+      continue;
+    }
+    if (o > 0 && out[o - 1] != sep) out[o++] = sep;
+    memcpy(out + o, src + s, (size_t)len);
+    o += len;
+  }
+  out[o] = '\\0';
+  return out;
+}`);
+    // The containing directory of an already-normalised path ("" when the path
+    // has no separator at all, which only a relative one can be).
+    this.cblock(`static char* as_path_dirname(const char* p) {
+  int n = (int)strlen(p);
+  int cut = -1;
+  for (int i = n - 1; i >= 0; i--) {
+    if (p[i] == '/' || p[i] == '\\\\') { cut = i; break; }
+  }
+  if (cut < 0) return (char*)"";
+  if (cut == 0) return (char*)"/";
+#ifdef _WIN32
+  if (cut == 2 && p[1] == ':') {
+    char* drive = as_str_alloc(4);
+    drive[0] = p[0]; drive[1] = ':'; drive[2] = '\\\\'; drive[3] = '\\0';
+    return drive;
+  }
+#endif
+  char* out = as_str_alloc((size_t)cut + 1);
+  memcpy(out, p, (size_t)cut);
+  out[cut] = '\\0';
+  return out;
+}`);
+    // Join = normalise the pair. An ABSOLUTE second argument replaces the base
+    // (measured: base.resolvePath("/abs") is "/abs", not base + "/abs"), and a
+    // blank one leaves the base alone.
+    this.cblock(`static char* as_path_join(const char* a, const char* b) {
+  if (a == NULL || *a == '\\0') return as_path_norm((b != NULL) ? b : "");
+  if (b == NULL || *b == '\\0') return as_path_norm(a);
+  if (as_path_is_abs(b)) return as_path_norm(b);
+  return as_path_norm(as_str_concat(as_str_concat(a, "/"), b));
+}`);
     // AIR File static directory shortcuts, resolved from the process environment.
     // userDirectory/desktopDirectory/documentsDirectory read $HOME and append the
     // standard sub-path; applicationDirectory is described at as_app_dir below.
@@ -16672,11 +16800,34 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('EventDispatcher_ctor((EventDispatcher*)o, NULL);');
     // AIR's constructor takes a URL as well as a native path -- measured on 51.4.1:
     // new File(file.url) round-trips "app-storage:/..." back to the same nativePath,
-    // and "file:///..." likewise. A bare path is stored verbatim, which is also
-    // where this build's documented deviation lives (AIR rejects a relative path
-    // with #2004, we keep it).
+    // and "file:///..." likewise. Either form is then normalised exactly like the
+    // setter below (measured: new File("/tmp//a/../b") is "/tmp/b"). A RELATIVE
+    // path is accepted and kept, which is where this build's documented deviation
+    // lives (AIR rejects one with #2004, see TODO #240); it is normalised too.
     this.line('if (path != NULL && (strncmp(path, "file://", 7) == 0 || strncmp(path, "app-storage:", 12) == 0 || strncmp(path, "app:", 4) == 0)) path = as_local_path_from_url(path);');
-    this.line('o->nativePath = path; gc_write_barrier((void*)path);');
+    this.line('o->nativePath = (path != NULL) ? as_path_norm(path) : NULL; gc_write_barrier((void*)o->nativePath);');
+    this.indent--;
+    this.line('}');
+    // nativePath setter. AIR exposes this as a PROPERTY but implements it as a
+    // setter: assigning normalises the string, and the argument must be an
+    // absolute NATIVE path. Measured on adl 51.4.1 (temp/fileaudit/adl/av.txt
+    // F1-F6): a relative path, an empty string or a URL raises ArgumentError
+    // #2004, null raises #2007 -- and AIR's own message for the null case really
+    // does read "Parameter  must be non-null." with an empty parameter name, so
+    // that double space is reproduced verbatim rather than tidied.
+    //
+    // The FIELD stays (reflection, GC scanning and the hand-written C bodies all
+    // go through it); the emitter's write path prefers a declared setter over a
+    // field, so every AS3-level assignment lands here. Note the asymmetry with
+    // the constructor above: relative paths still construct (registered #240
+    // deviation), they just cannot be ASSIGNED.
+    this.line('void File_set_nativePath(void* _this, char* path) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('if (path == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter  must be non-null.", 2007)); return; }');
+    this.line('if (path[0] == \'\\0\' || !as_path_is_abs(path)) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }');
+    this.line('o->nativePath = as_path_norm(path);');
+    this.line('gc_write_barrier((void*)o->nativePath);');
     this.indent--;
     this.line('}');
     this.line('File* File_new(char* path) { File* o = (File*)gc_alloc(GCT_CLASS, sizeof(File)); o->vtable = &File_vt; File_ctor(o, path); return o; }');
@@ -16706,10 +16857,21 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // resolving, so no extra existence gate is needed.
     this.line('bool File_get_isSymbolicLink(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_is_symlink(o->nativePath); }');
     // size: the length in bytes, measured with stat() (AIR's File.size is a
-    // Number). A path that does not exist reports 0, matching AIR; st_size is an
-    // off_t, so it is widened to double rather than truncated to int (a >2 GB file
-    // must not go negative).
-    this.line('double File_get_size(void* _this) { File* o = (File*)_this; if (o->nativePath == NULL) return 0.0; struct stat st; if (stat(o->nativePath, &st) != 0) return 0.0; return (double)st.st_size; }');
+    // Number). Measured on adl 51.4.1 (temp/fileaudit/adl/av.txt D1-D3), the
+    // three shapes are distinct and none of them is "0 for a missing path":
+    // a path that does not exist THROWS #3003 (the old comment here claimed AIR
+    // answers 0 -- that was wrong), a File with no nativePath throws #2037, and
+    // a DIRECTORY answers 0 rather than its own st_size. Only a regular file
+    // reports its byte count. st_size is an off_t, so it is widened to double
+    // rather than truncated to int (a >2 GB file must not go negative).
+    this.cblock(`double File_get_size(void* _this) {
+  File* o = (File*)_this;
+  if (o->nativePath == NULL) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return 0.0; }
+  struct stat st;
+  if (stat(o->nativePath, &st) != 0) { as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003)); return 0.0; }
+  if (!S_ISREG(st.st_mode)) return 0.0;
+  return (double)st.st_size;
+}`);
     // spaceAvailable: the free bytes on the volume that holds this path. AIR asks
     // the OS for it, so we do too -- GetDiskFreeSpaceExA on Windows, statvfs() on
     // POSIX (bavail*frsize is the space an unprivileged process may actually use,
@@ -16852,10 +17014,149 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return base[0] == \'.\';');
     this.indent--;
     this.line('}');
-    this.line('File* File_resolvePath(void* _this, char* path) { File* o = (File*)_this; return (o->nativePath == NULL) ? File_new(path) : File_new(as_path_join(o->nativePath, path)); }');
+    // resolvePath: a path-relative join, normalised. Measured: a File with no
+    // nativePath throws #2037, a null argument raises ArgumentError #2007 with
+    // AIR's empty parameter name, "" and "." return the base itself, ".." walks
+    // up, and an ABSOLUTE argument replaces the base (all in av.txt G1-G11).
+    this.cblock(`File* File_resolvePath(void* _this, char* path) {
+  File* o = (File*)_this;
+  if (o->nativePath == NULL) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return NULL; }
+  if (path == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter  must be non-null.", 2007)); return NULL; }
+  return File_new(as_path_join(o->nativePath, path));
+}`);
     this.line('void File_createDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) as_mkdirs(o->nativePath); }');
-    this.line('void File_deleteFile(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) remove(o->nativePath); }');
-    this.line('void File_deleteDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) as_rmdir_one(o->nativePath); }');
+    // ---- File deletion --------------------------------------------------------
+    // The contract, measured on adl 51.4.1 (temp/fileaudit/adl/av.txt, av3.txt):
+    //
+    //   deleteFile()             no path #2037 | missing #3003 | a REAL directory
+    //                            #3006 | denied #3001 | file or symlink -> unlink
+    //   deleteDirectory(false)   no path #2037 | missing #3003 | not a directory
+    //                            #3007 | non-empty #3010 | empty -> rmdir
+    //   deleteDirectory(true)    no path #2037 | missing #3003 | ANY shape ->
+    //                            remove it, recursively (a FILE is deleted too)
+    //
+    // The subtle part is LINKS. AIR deletes the LINK, never its target: deleteFile
+    // on a symlink to a directory SUCCEEDS and leaves the target intact, and so
+    // does deleteDirectory (whose "is it a directory" gate follows the link, so a
+    // link to a directory passes it). A dangling link therefore EXISTS for the
+    // delete family (deleteFile removes it) while stat() -- which is what
+    // File.exists and size use -- says it is gone. So existence here is lstat().
+    //
+    // Every id below is returned, not thrown, so the SYNC and ASYNC members can
+    // share one implementation: the sync member throws, the async one dispatches
+    // an ioError with the same id (measured: deleteFileAsync(dir) is an ioError
+    // #3006, deleteDirectoryAsync(false) on a non-empty directory #3010) --
+    // except #2037, which the async members throw synchronously as well.
+    this.cblock(`static bool as_path_exists_l(const char* p) {
+  if (p == NULL) return false;
+#ifdef _WIN32
+  // Attributes describe the link itself, so a link answers even when its target
+  // is gone. (An NTFS link is also reported when dangling; a POSIX lstat does.)
+  return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
+#else
+  struct stat st;
+  return lstat(p, &st) == 0;
+#endif
+}
+// Remove whatever sits at p, recursing through REAL directories only.
+// 0 ok, 3003 missing, 2038 filesystem refusal.
+static int as_remove_any(const char* p) {
+#ifdef _WIN32
+  DWORD a = GetFileAttributesA(p);
+  if (a == INVALID_FILE_ATTRIBUTES) return 3003;
+  if ((a & FILE_ATTRIBUTE_DIRECTORY) == 0 || (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    // A file, or a link/junction: never walk into it.
+    if (DeleteFileA(p) || RemoveDirectoryA(p)) return 0;
+    return 2038;
+  }
+  {
+    size_t n = strlen(p);
+    char* pat = (char*)malloc(n + 3);
+    int err = 0;
+    size_t i;
+    if (pat == NULL) return 2038;
+    memcpy(pat, p, n);
+    for (i = 0; i < n; i++) if (pat[i] == '/') pat[i] = '\\\\';
+    pat[n] = '\\\\'; pat[n + 1] = '*'; pat[n + 2] = '\\0';
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    free(pat);
+    if (h == INVALID_HANDLE_VALUE) return 2038;
+    do {
+      if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+      err = as_remove_any(as_path_join(p, fd.cFileName));
+      if (err != 0) break;
+    } while (FindNextFileA(h, &fd) != 0);
+    FindClose(h);
+    if (err != 0) return err;
+  }
+  return RemoveDirectoryA(p) ? 0 : 2038;
+#else
+  struct stat st;
+  if (lstat(p, &st) != 0) return 3003;
+  if (!S_ISDIR(st.st_mode)) return (remove(p) == 0) ? 0 : 2038;
+  {
+    DIR* d = opendir(p);
+    int err = 0;
+    if (d == NULL) return 2038;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL) {
+      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+      err = as_remove_any(as_path_join(p, e->d_name));
+      if (err != 0) break;
+    }
+    closedir(d);
+    if (err != 0) return err;
+  }
+  return (remove(p) == 0) ? 0 : 2038;
+#endif
+}
+// Non-recursive directory removal: the EMPTY case only, and the only place where
+// "not empty" (#3010) can arise.
+static int as_rmdir_empty(const char* p) {
+#ifdef _WIN32
+  if (RemoveDirectoryA(p)) return 0;
+  return (GetLastError() == ERROR_DIR_NOT_EMPTY) ? 3010 : 2038;
+#else
+  if (remove(p) == 0) return 0;
+  return (errno == ENOTEMPTY || errno == EEXIST) ? 3010 : 2038;
+#endif
+}
+// 0 ok, else the AIR error id. isDir picks the member; recursive is the flag.
+static int as_file_delete_err(File* o, int isDir, int recursive) {
+  if (o->nativePath == NULL) return 2037;
+  const char* p = o->nativePath;
+  if (!as_path_exists_l(p)) return 3003;
+  if (isDir) {
+    if (recursive) return as_remove_any(p);
+    // stat-based on purpose: a link to a directory passes (measured).
+    if (!as_path_is_dir(p)) return 3007;
+    return as_rmdir_empty(p);
+  }
+  // deleteFile: a REAL directory is #3006; a symlink to one is not.
+  if (as_path_is_dir(p) && !as_path_is_symlink(p)) return 3006;
+  return (remove(p) == 0) ? 0 : 3001;
+}
+static const char* as_file_err_text(int err) {
+  switch (err) {
+    case 2037: return "Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.";
+    case 3001: return "Error #3001: File or directory access denied.";
+    case 3003: return "Error #3003: File or directory does not exist.";
+    case 3006: return "Error #3006: Not a file.";
+    case 3007: return "Error #3007: Not a directory.";
+    case 3010: return "Error #3010: Directory is not empty.";
+    case 3012: return "Error #3012: Cannot delete file or directory.";
+    default:   return "Error #2038: File I/O Error.";
+  }
+}
+static void as_file_throw(int err) {
+  as_throw(Error_new((char*)as_file_err_text(err), err));
+}`);
+    this.line('void File_deleteFile(void* _this) { int err = as_file_delete_err((File*)_this, 0, 0); if (err != 0) as_file_throw(err); }');
+    // deleteDirectory(deleteDirectory = false): the flag is AIR's, and it means
+    // "recursive", not "must be a directory" -- with it set, a FILE path is
+    // deleted too (measured B3).
+    this.line('void File_deleteDirectory(void* _this, bool recursive) { int err = as_file_delete_err((File*)_this, 1, recursive ? 1 : 0); if (err != 0) as_file_throw(err); }');
     // ---- File.moveToTrash / moveToTrashAsync (AIR 2) ----
     this.line('// Measured against adl 51.4.1 on macOS 26 (temp/trashprobe/):');
     this.line('//   * moveToTrash() is declared VOID, not Boolean -- f.moveToTrash().toString()');
@@ -17151,23 +17452,43 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('  ev->errorID = (int)err;');
     this.line('  EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
     this.line('}');
-    // File.moveTo(newFile, overwrite = false, force = false): rename() the path.
-    // rename() is the real operation AIR performs (atomic within one volume); the two
-    // failure modes AIR raises IOError for are reported on stderr instead of thrown,
-    // because an IOError thrown here would unwind through the caller's event handler.
-    this.line('void File_moveTo(void* _this, File* target, bool overwrite, bool force) {');
+    // File.moveTo(newFile, overwrite = false): rename() the path. AIR declares
+    // EXACTLY two parameters (measured: mxmlc rejects a third -- "参数的数量不正确.
+    // 要求不超过 2 个"), so the old third parameter `force` is gone.
+    //
+    // Measured on adl 51.4.1 (temp/fileaudit/adl/av.txt C1-C7, av3.txt M2/M3):
+    //   newFile null .......... TypeError #2007 "Parameter destination must be
+    //                          non-null." (AIR's own parameter name is
+    //                          `destination`, not `newFile`)
+    //   no path on either side . #2037
+    //   source missing ........ #3003
+    //   target exists, !overwrite ... #3012, whether the target is a file or a
+    //                          directory, empty or not
+    //   target exists, overwrite .... delete it first (a NON-EMPTY directory is
+    //                          replaced by the file) then rename
+    //   target's parent missing ..... created automatically
+    //   success ..................... the receiver's nativePath is NOT rewritten --
+    //                          it still denotes the OLD location (measured twice),
+    //                          exactly like moveToTrash
+    this.line('void File_moveTo(void* _this, File* target, bool overwrite) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
-    this.line('if (target == NULL || o->nativePath == NULL || target->nativePath == NULL) return;');
-    this.line('if (!as_path_exists(o->nativePath)) { as_shell_unsupported("File.moveTo with a source path that does not exist (AIR throws IOError)"); return; }');
-    this.line('if (as_path_exists(target->nativePath) && !(overwrite || force)) { as_shell_unsupported("File.moveTo onto an existing path with overwrite/force false (AIR throws IOError)"); return; }');
-    // A cross-volume move makes rename() fail (Windows: EXDEV-style failure); it is
-    // reported rather than silently copied, so a caller is never told a move happened
-    // when the file is still at the old path.
-    this.line('if (rename(o->nativePath, target->nativePath) != 0) { as_shell_unsupported("File.moveTo across volumes (rename failed)"); return; }');
-    // AIR: the receiver now denotes the new location.
-    this.line('o->nativePath = target->nativePath;');
-    this.line('gc_write_barrier((void*)o->nativePath);');
+    this.line('if (target == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter destination must be non-null.", 2007)); return; }');
+    this.line('if (o->nativePath == NULL || target->nativePath == NULL) { as_file_throw(2037); return; }');
+    this.line('if (!as_path_exists_l(o->nativePath)) { as_file_throw(3003); return; }');
+    this.line('if (as_path_exists_l(target->nativePath)) {');
+    this.indent++;
+    this.line('if (!overwrite) { as_file_throw(3012); return; }');
+    this.line('int rm = as_remove_any(target->nativePath);');
+    this.line('if (rm != 0) { as_file_throw(rm); return; }');
+    this.indent--;
+    this.line('}');
+    this.line('char* parent = as_path_dirname(target->nativePath);');
+    this.line('if (parent != NULL && parent[0] != \'\\0\' && !as_path_is_dir(parent)) as_mkdirs(parent);');
+    // A cross-volume move makes rename() fail (EXDEV). AIR copies instead; this
+    // build has no tree-copy yet, so it REPORTS rather than leaving the caller to
+    // believe a move happened (registered in TODO.md).
+    this.line('if (rename(o->nativePath, target->nativePath) != 0) { as_shell_unsupported("File.moveTo could not rename (a cross-volume move is not implemented)"); return; }');
     this.indent--;
     this.line('}');
     // The async half of the File API. `getDirectoryListingAsync` is the one member
@@ -17245,10 +17566,25 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('as_async_submit(AS_JOB_DIR, (void*)o, File__dirFinish, o->nativePath, NULL, 0);');
     this.indent--;
     this.line('}');
+    // The async delete pair shares ONE implementation with the sync members and
+    // only differs in HOW the outcome is reported. Measured on adl 51.4.1
+    // (temp/fileaudit/adl/av.txt H0, av3.txt I0): a failure arrives as
+    // ioError carrying the SAME id and sentence the sync member throws
+    // (deleteFileAsync on a directory is #3006, deleteDirectoryAsync(false) on a
+    // non-empty directory #3010, either on a missing path #3003), success is
+    // Event.COMPLETE, and #2037 (no nativePath) still throws synchronously.
+    // The old bodies called the sync member and dispatched COMPLETE
+    // unconditionally, which reported success for a delete that never happened.
+    this.cblock(`static void File__deleteDispatch(File* o, int err) {
+  if (err == 2037) { as_throw(Error_new((char*)as_file_err_text(err), err)); return; }
+  if (err == 0) { EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false)); return; }
+  IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, (char*)as_file_err_text(err));
+  ev->errorID = err;
+  EventDispatcher_dispatchEvent((void*)o, (Event*)ev);
+}`);
     this.line('void File_deleteFileAsync(void* _this) {');
     this.indent++;
-    this.line('File_deleteFile(_this);');
-    this.line('EventDispatcher_dispatchEvent((void*)_this, Event_new((char*)"complete", false, false));');
+    this.line('File__deleteDispatch((File*)_this, as_file_delete_err((File*)_this, 0, 0));');
     this.indent--;
     this.line('}');
     // File.cancel(): cancels the pending directory listing (the only async member
@@ -17258,11 +17594,9 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // time they return, so for them -- and for a cancel() with nothing pending --
     // this stays a no-op, exactly as adl leaves it.
     this.line('void File_cancel(void* _this) { as_async_cancel((void*)_this); }');
-    this.line('void File_deleteDirectoryAsync(void* _this, bool deleteDirectory) {');
+    this.line('void File_deleteDirectoryAsync(void* _this, bool recursive) {');
     this.indent++;
-    this.line('(void)deleteDirectory;');
-    this.line('File_deleteDirectory(_this);');
-    this.line('EventDispatcher_dispatchEvent((void*)_this, Event_new((char*)"complete", false, false));');
+    this.line('File__deleteDispatch((File*)_this, as_file_delete_err((File*)_this, 1, recursive ? 1 : 0));');
     this.indent--;
     this.line('}');
     // No backend here: a native file dialog / the OS shell. These report

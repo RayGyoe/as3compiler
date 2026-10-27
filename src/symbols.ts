@@ -3477,16 +3477,19 @@ export class SymbolTable {
         ['resolvePath', filemeth({ kind: 'object', className: 'File' }, [{ name: 'path', type: 'String', defaultValue: null, isRest: false }])],
         ['createDirectory', filemeth({ kind: 'void' }, [])],
         ['deleteFile', filemeth({ kind: 'void' }, [])],
-        ['deleteDirectory', filemeth({ kind: 'void' }, [])],
-        // moveTo(newFile, overwrite = false, force = false): a real rename() (see the
-        // C body in emit.ts). rename() is atomic on one volume, which is the case
-        // AIR optimizes too; the two conditions AIR raises IOError for (a missing
-        // source, an existing target with overwrite/force false) are reported on
-        // stderr rather than thrown -- consistent with this class's other members.
+        // deleteDirectory(deleteDirectory = false). The flag means RECURSIVE, not
+        // "the path must be a directory": with it set, a file path is deleted too
+        // (measured on adl 51.4.1 -- see as_file_delete_err in emit.ts, which also
+        // carries the measured #2037/#3003/#3006/#3007/#3010 table).
+        ['deleteDirectory', filemeth({ kind: 'void' }, [{ name: 'deleteDirectory', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
+        // moveTo(newFile, overwrite = false): a real rename() (see the C body in
+        // emit.ts). AIR declares TWO parameters -- mxmlc rejects a third -- so the
+        // older `force` parameter is gone; the measured error table (#2007 for a
+        // null destination, #3003 for a missing source, #3012 for an existing
+        // target without overwrite) is in that body.
         ['moveTo', filemeth({ kind: 'void' }, [
           { name: 'newFile', type: 'File', defaultValue: null, isRest: false },
           { name: 'overwrite', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
-          { name: 'force', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
         ])],
         // moveToTrash(): move the item to the system trash (AIR 2). Measured on
         // adl 51.4.1: declared VOID (not Boolean -- `f.moveToTrash().toString()`
@@ -3556,10 +3559,12 @@ export class SymbolTable {
         // inflated size (measured: ~/Library/Caches 7.6 GB -> 124 GB).
         ['isSymbolicLink', filegetr({ kind: 'bool' })],
         ['isHidden', filegetr({ kind: 'bool' })],
-        // size: the file's length in bytes (AIR's File.size:Number). Measured stat()
-        // rather than cached, so a file that grows on disk is seen immediately; a
-        // missing path reports 0 (AIR returns 0 there too, and callers guard with
-        // `exists` first).
+        // size: the file's length in bytes (AIR's File.size:Number). Measured
+        // stat() rather than cached, so a file that grows on disk is seen
+        // immediately. Measured on adl 51.4.1: a missing path THROWS #3003 (it does
+        // NOT return 0 -- this comment said the opposite until the delete-alignment
+        // measurement), a File with no nativePath throws #2037, and a directory
+        // reports 0 rather than its own st_size.
         ['size', filegetr({ kind: 'number' })],
         // spaceAvailable: free bytes on the volume holding the path (AIR 2). Real
         // filesystem query -- GetDiskFreeSpaceExA / statvfs(), see as_file_space_available
@@ -3568,7 +3573,14 @@ export class SymbolTable {
         // a plain file reports its volume's figure).
         ['spaceAvailable', filegetr({ kind: 'number' })],
       ]),
-      setters: new Map(),
+      setters: new Map([
+        // nativePath stays a FIELD (reflection, GC scanning and every hand-written
+        // C body go through it); the declared setter only exists so an AS3-level
+        // assignment is NORMALISED and validated the way AIR does it. The emitter
+        // prefers a declared setter over the field on the write path, so
+        // `f.nativePath = x` reaches File_set_nativePath (see emit.ts).
+        ['nativePath', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'File', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
       constructor: { params: [
         { name: 'path', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
       ] },
