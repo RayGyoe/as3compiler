@@ -41,5 +41,29 @@ jobs:
         with:
           node-version: '24'
 
+      # `tee` so the failure step below can read what the suite printed. `pipefail`
+      # keeps node's exit code: bash on macOS is 3.2, where a pipeline's status is
+      # the LAST command's, and without this a red suite would be reported green.
       - name: Full regression (examples + unit groups)
-        run: node test.ts
+        run: |
+          set -o pipefail
+          node test.ts 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      # A red run used to be an opaque "exit code 1": the run log is admin-only
+      # over the REST API and node's spec reporter emits no `::error::` of its own,
+      # so from outside the repo the only visible fact was that something broke.
+      # Re-emit the failing case names as annotations -- those ARE readable
+      # anonymously from the check run (scripts/ci-failure-annotations.ts).
+      - name: Surface failures as annotations
+        if: failure()
+        run: node scripts/ci-failure-annotations.ts "$RUNNER_TEMP/test.log"
+
+      # Annotations say WHICH cases failed; the full log says why. Kept on failure
+      # only, so a green run downloads nothing.
+      - name: Keep the regression log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: ${{ runner.temp }}/test.log
+          if-no-files-found: warn
