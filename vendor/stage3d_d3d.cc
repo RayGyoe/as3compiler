@@ -790,6 +790,27 @@ static S3DTexture* s3d_make_texture(S3DContext* c, int w, int h, int mips, int f
   return t;
 }
 
+// A texture object outlives a shared-device rebuild at the AS3 level. Revive its
+// GPU resource lazily on the next bind/upload; the CPU-side contents are gone, as
+// they are after AIR's context loss, but no call may submit the old resource.
+static int s3d_revive_texture(S3DContext* c, S3DTexture* t) {
+  if (c == NULL || t == NULL || c->device == NULL) return 0;
+  ID3D12Device* owner = NULL;
+  const HRESULT hr = t->res != NULL ? t->res->GetDevice(__uuidof(ID3D12Device), (void**)&owner) : E_FAIL;
+  if (owner != NULL) owner->Release();
+  if (SUCCEEDED(hr) && owner == c->device) return 1;
+  S3DTexture* fresh = s3d_make_texture(c, t->width, t->height, t->mips, t->faces,
+                                      t->isRT, t->isDepth);
+  if (fresh == NULL) return 0;
+  t->res = fresh->res;
+  t->owner = c;
+  t->state = fresh->state;
+  t->rtvSlot = fresh->rtvSlot;
+  t->dsvSlot = fresh->dsvSlot;
+  free(fresh);
+  return 1;
+}
+
 static void s3d_free_texture(S3DContext* c, S3DTexture* t) {
   if (t == NULL) return;
   if (s3d_env("ASC_S3D_LIFE")) fprintf(stderr, "s3d(life) free_texture t=%p res=%p\n", (void*)t, (void*)t->res);
@@ -808,6 +829,7 @@ static void s3d_free_texture(S3DContext* c, S3DTexture* t) {
 static int s3d_upload_region(S3DContext* c, S3DTexture* t, int subres,
                              int w, int h, const uint32_t* src, int srcW) {
   if (t == NULL || src == NULL || w <= 0 || h <= 0 || srcW < w) return 0;
+  if (!s3d_revive_texture(c, t)) return 0;
   const UINT rowPitch = s3d_align256((UINT)w * 4u);
   const UINT bytes = rowPitch * (UINT)h;
 
@@ -1455,6 +1477,43 @@ void* s3d_create(int width, int height) {
   fprintf(stderr, "stage3d_d3d: context %dx%d ready (Direct3D 12)\n", c->width, c->height);
   fflush(stderr);
   return (void*)c;
+}
+
+// d3d_glue.cc calls these through GetProcAddress when the shared device dies and
+// when its replacement is ready. Old COM objects are deliberately parked: the
+// removed queue cannot retire them, and their CPU bookkeeping must not be used
+// during the recovery window either.
+__declspec(dllexport) void s3d_shared_device_lost(void) {
+  for (int i = 0; i < s3d_live_n; i++) {
+    S3DContext* c = s3d_live[i];
+    if (c->ownsBackend) continue;
+    c->listOpen = 0;
+    c->device = NULL;
+    c->queue = NULL;
+    c->list = NULL;
+    c->upList = NULL;
+    c->fence = NULL;
+  }
+}
+
+__declspec(dllexport) void s3d_shared_device_rebuilt(void) {
+  for (int i = 0; i < s3d_live_n; i++) {
+    S3DContext* c = s3d_live[i];
+    if (c->ownsBackend) continue;
+    S3DContext* fresh = (S3DContext*)s3d_create(c->width, c->height);
+    if (fresh == NULL) continue;
+    // Keep the address the generated Context3D holds, but replace every backend
+    // object. s3d_create registered the temporary address; unregister that alias
+    // after moving the state and reparenting its owned textures to the stable one.
+    *c = *fresh;
+    if (c->target != NULL) c->target->owner = c;
+    if (c->depth != NULL) c->depth->owner = c;
+    if (c->dummy != NULL) c->dummy->owner = c;
+    s3d_unregister_ctx(fresh);
+    free(fresh);
+    fprintf(stderr, "stage3d_d3d: context rebound to the rebuilt device\n");
+    fflush(stderr);
+  }
 }
 
 void s3d_destroy(void* ctx) {
@@ -2485,6 +2544,7 @@ void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil) {
   S3DContext* c = (S3DContext*)ctx;
   if (tex != NULL) {
     S3DTexture* t = (S3DTexture*)tex;
+    if (!s3d_revive_texture(c, t)) return;
     if (!t->isRT) {
       fprintf(stderr, "stage3d_d3d: setRenderToTexture: texture %dx%d has no render-target "
                       "usage -- pass ignored\n", t->width, t->height);
@@ -2511,6 +2571,7 @@ void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil) {
 int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
   if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX || tex == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
+  if (!s3d_revive_texture(c, (S3DTexture*)tex)) return 0;
   c->textures[unit] = (S3DTexture*)tex;
   c->texHasMips[unit] = hasChain ? 1 : 0;
   return 1;

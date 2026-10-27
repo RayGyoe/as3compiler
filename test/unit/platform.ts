@@ -2102,6 +2102,20 @@ function checkDeviceLost(): string[] {
   const strip = (s: string): string =>
     s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
   const d3d = strip(read('d3d_glue.cc'));
+  const s3d = strip(read('stage3d_d3d.cc'));
+
+  // ---- Stage3D shares the replacement device, not the removed queue ----
+  check('device loss and rebuild both notify the Stage3D backend',
+    /d3d_notify_stage3d\("s3d_shared_device_lost"\);[\s\S]{0,120}?d3d_drop_gpu_state\(1\);/.test(d3d) &&
+    /d3d_notify_stage3d\("s3d_shared_device_rebuilt"\);[\s\S]{0,120}?g_d3d_lost = 0;/.test(d3d));
+  check('Stage3D stops using the removed queue and rebinds at the stable context address',
+    /void s3d_shared_device_lost\(void\)[\s\S]{0,900}?c->queue = NULL;/.test(s3d) &&
+    /void s3d_shared_device_rebuilt\(void\)[\s\S]{0,1200}?\*c = \*fresh;/.test(s3d) &&
+    /s3d_unregister_ctx\(fresh\);/.test(s3d));
+  check('the composite and later texture uses reject or revive previous-device resources',
+    /res->GetDevice\(IID_PPV_ARGS\(&owner\)\)/.test(d3d) &&
+    /owner.get\(\) != g_device.get\(\)/.test(d3d) &&
+    (s3d.match(/s3d_revive_texture\(c,\s*/g) ?? []).length === 3);
 
   // ---- the teardown branches on "is the device actually gone", and parks ----
   check('the GPU-state drop takes "the device is gone" as an argument',

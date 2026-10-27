@@ -349,6 +349,16 @@ static const char* d3d_removed_reason_name(HRESULT reason) {
   }
 }
 
+// Stage3D borrows this device and queue. Notify it through the same by-name seam
+// it uses to find them: its frames must stop while lost, and its context must be
+// rebound after recovery instead of submitting into the removed queue forever.
+static void d3d_notify_stage3d(const char* name) {
+  HMODULE module = GetModuleHandleA(NULL);
+  if (module == NULL) return;
+  void (*notify)(void) = (void (*)(void))GetProcAddress(module, name);
+  if (notify != NULL) notify();
+}
+
 static void d3d_mark_lost(const char* what, HRESULT hr) {
   if (g_d3d_lost) return;
   g_d3d_lost = 1;
@@ -368,6 +378,7 @@ static void d3d_mark_lost(const char* what, HRESULT hr) {
   // The caller of d3d_mark_lost is by definition a call that failed because the
   // device is gone, so the teardown must not go through Skia (see the note above
   // d3d_drop_gpu_state).
+  d3d_notify_stage3d("s3d_shared_device_lost");
   d3d_drop_gpu_state(1);
 }
 
@@ -575,6 +586,7 @@ static int d3d_try_recover(void) {
   const double now = d3d_now_ms();
   if (now < g_d3d_retry_at) return 0;
   if (d3d_rebuild_all()) {
+    d3d_notify_stage3d("s3d_shared_device_rebuilt");
     g_d3d_lost = 0;
     g_d3d_rebuilds++;
     g_d3d_retry_ms = 250;
@@ -1004,7 +1016,10 @@ void sk_gpu_flush(int win_id) {
   // the dead queue will never reach.
   HRESULT phr = w->swapchain->Present(1, 0);
   if (FAILED(phr)) {
-    fprintf(stderr, "d3d_glue: Present failed: 0x%08lx\n", (unsigned long)phr);
+    const HRESULT presentReason = g_device.get() != nullptr ? g_device->GetDeviceRemovedReason() : E_FAIL;
+    fprintf(stderr, "d3d_glue: Present failed: 0x%08lx win=%d hwnd=%p hwndAlive=%d deviceReason=0x%08lx\n",
+            (unsigned long)phr, win_id, (void*)w->hwnd, w->hwnd != NULL && IsWindow(w->hwnd),
+            (unsigned long)presentReason);
     fflush(stderr);
     if (d3d_hr_is_device_lost(phr)) { d3d_mark_lost("Present", phr); return; }
   }
@@ -1041,6 +1056,21 @@ void sk_gpu_draw_texture(void* canvas, void* d3dTexture, int w, int h,
   if (canvas == nullptr || d3dTexture == nullptr || g_context == nullptr) return;
   if (w <= 0 || h <= 0) return;
   ID3D12Resource* res = (ID3D12Resource*)d3dTexture;
+
+  // Stage3D keeps its context across a window-device rebuild. Its old target must
+  // never be sampled by the new device: that cross-device submission is what turned
+  // one recovered DEVICE_HUNG into E_OUTOFMEMORY and then E_FAIL on every Present.
+  gr_cp<ID3D12Device> owner;
+  const HRESULT ownerHr = res->GetDevice(IID_PPV_ARGS(&owner));
+  if (FAILED(ownerHr) || owner.get() != g_device.get()) {
+    static int staleReported = 0;
+    if (!staleReported) {
+      staleReported = 1;
+      fprintf(stderr, "d3d_glue: skipping a Stage3D texture from the previous device\n");
+      fflush(stderr);
+    }
+    return;
+  }
 
   const D3D12_RESOURCE_DESC rd = res->GetDesc();
   if (getenv("ASC_S3D_TRACE") != nullptr) {
