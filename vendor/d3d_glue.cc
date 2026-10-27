@@ -560,6 +560,32 @@ static int d3d_create_swapchain(D3DWin* w, HWND hwnd, int cw, int ch) {
   return 1;
 }
 
+// ResizeBuffers can fail even while the device remains healthy (the real app hits
+// E_OUTOFMEMORY after a device rebuild followed by minimize/restore). The old
+// buffers have already been released at that point, so retrying ResizeBuffers on
+// the same swapchain forever cannot make progress. Recreate only this window's
+// swapchain and fence; other windows and the shared device stay alive.
+static int d3d_recreate_window(D3DWin* w, int width, int height) {
+  for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) {
+    w->surfaces[i].reset();
+    w->buffers[i].reset();
+  }
+  if (w->fence_event != NULL) CloseHandle(w->fence_event);
+  w->fence_event = NULL;
+  w->fence.reset();
+  w->swapchain.reset();
+  if (d3d_create_swapchain(w, w->hwnd, width, height)) {
+    fprintf(stderr, "d3d_glue: window swapchain recreated at %dx%d\n", width, height);
+    fflush(stderr);
+    return 1;
+  }
+  // A later begin_frame retries through the null-swapchain gate below. Keeping
+  // used/hwnd preserves the identity of the still-live SDL window.
+  w->width = 0;
+  w->height = 0;
+  return 0;
+}
+
 // Rebuild everything the device carried. Returns 1 only when the whole set is back;
 // a partial success is dropped again so the next attempt starts clean (a window
 // holding a swapchain against a device about to be discarded would be the same bug
@@ -753,6 +779,7 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
   D3DWin* w = d3d_slot(win_id);
   if (w == nullptr || g_context == nullptr) return nullptr;
   if (width <= 0 || height <= 0) return nullptr;
+  if (w->swapchain.get() == nullptr && !d3d_recreate_window(w, width, height)) return nullptr;
 
   // A resize invalidates every back buffer. This is where a live window drag
   // lands, and it is the D3D analogue of Metal's per-frame drawableSize update:
@@ -793,17 +820,28 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
       w->surfaces[i].reset();
       w->buffers[i].reset();
     }
-    HRESULT rhr = w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
-                                              SK_D3D_SWAPCHAIN_FORMAT, 0);
+    // ASC_GPU_RESIZE_FAIL=1 injects one healthy-device E_OUTOFMEMORY so the
+    // per-window recovery path is executable without waiting for a driver/TDR.
+    static int injectedResizeFailure = 0;
+    HRESULT rhr;
+    if (!injectedResizeFailure && getenv("ASC_GPU_RESIZE_FAIL") != nullptr) {
+      injectedResizeFailure = 1;
+      rhr = E_OUTOFMEMORY;
+    } else {
+      rhr = w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
+                                        SK_D3D_SWAPCHAIN_FORMAT, 0);
+    }
     if (FAILED(rhr)) {
       fprintf(stderr, "d3d_glue: ResizeBuffers to %dx%d failed: 0x%08lx\n",
               width, height, (unsigned long)rhr);
       fflush(stderr);
-      // Lost: drop everything and let the recovery path rebuild at the new size.
-      // Any other failure leaves the old swapchain usable -- abandon this frame and
-      // retry on the next one (the size stays unchanged, so the next begin_frame
-      // enters this branch again), exactly like the drain timeout above.
-      if (d3d_hr_is_device_lost(rhr)) d3d_mark_lost("ResizeBuffers", rhr);
+      if (d3d_hr_is_device_lost(rhr)) {
+        d3d_mark_lost("ResizeBuffers", rhr);
+      } else {
+        // The device is still alive. Do not spin on a swapchain whose old back
+        // buffers have just been released: replace it and resume on the next frame.
+        d3d_recreate_window(w, width, height);
+      }
       return nullptr;
     }
     w->width = width;
@@ -1021,7 +1059,14 @@ void sk_gpu_flush(int win_id) {
             (unsigned long)phr, win_id, (void*)w->hwnd, w->hwnd != NULL && IsWindow(w->hwnd),
             (unsigned long)presentReason);
     fflush(stderr);
-    if (d3d_hr_is_device_lost(phr)) { d3d_mark_lost("Present", phr); return; }
+    if (d3d_hr_is_device_lost(phr)) {
+      d3d_mark_lost("Present", phr);
+    } else {
+      // A healthy device with a failed present has no reliable old swapchain to
+      // keep submitting to. Recover this window instead of logging E_FAIL forever.
+      d3d_recreate_window(w, w->width, w->height);
+    }
+    return;
   }
   // Mark this frame's completion on the queue so the next begin_frame for this
   // buffer index can wait for it (see above). Signaling AFTER Present is what

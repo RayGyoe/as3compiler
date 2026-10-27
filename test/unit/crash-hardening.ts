@@ -134,13 +134,22 @@ function checkCrashHardening(): string[] {
     /d3d_mark_lost\("GetBuffer"/.test(d3d) &&
     /d3d_mark_lost\("ResizeBuffers"/.test(d3d));
   check('...and Present does not signal a fence the dead queue can never reach',
-    /if \(d3d_hr_is_device_lost\(phr\)\) \{ d3d_mark_lost\("Present", phr\); return; \}/.test(d3d));
+    /if \(d3d_hr_is_device_lost\(phr\)\) \{\s*d3d_mark_lost\("Present", phr\);/.test(d3d) &&
+    /d3d_recreate_window\(w, w->width, w->height\);\s*\}\s*return;/.test(d3d));
   check('the Ganesh context is abandoned, not reset (a removed device cannot be freed normally)',
     /g_context->abandonContext\(\);/.test(d3d) &&
     !/g_context->reset\(\);\s*\n\s*g_context\.reset\(\);/.test(d3d));
   check('one swapchain builder serves init and rebuild',
     /static int d3d_create_swapchain\(/.test(d3d) &&
     (d3d.match(/CreateSwapChainForHwnd\(/g) ?? []).length === 1);
+  check('a healthy-device resize failure recreates only the affected window',
+    /static int d3d_recreate_window\(D3DWin\* w, int width, int height\)/.test(d3d) &&
+    /else \{\s*\/\/ The device is still alive[\s\S]*?d3d_recreate_window\(w, width, height\);/.test(d3d));
+  check('a failed window recreation is retried through a null-swapchain gate',
+    /w->width = 0;\s*w->height = 0;/.test(d3d) &&
+    /if \(w->swapchain.get\(\) == nullptr && !d3d_recreate_window\(w, width, height\)\) return nullptr;/.test(d3d));
+  check('the healthy-device resize failure path has an executable probe hook',
+    /ASC_GPU_RESIZE_FAIL/.test(d3d) && /injectedResizeFailure = 1;\s*rhr = E_OUTOFMEMORY;/.test(d3d));
   check('rebuild retries back off instead of spinning on D3D12CreateDevice every frame',
     /g_d3d_retry_ms = g_d3d_retry_ms \* 2 > 4000 \? 4000 : g_d3d_retry_ms \* 2;/.test(d3d));
 

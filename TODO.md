@@ -17266,6 +17266,17 @@ Windows 本机实跑覆盖。
   `context rebound to the rebuilt device` 并继续渲染，零 `Present failed`；`unit: platform/DeviceLost` 新增 3 钉。
 - **边界**：设备丢失后的 CPU 纹理内容不保留，等 AS3 下次上传；Metal/WGL 的对应恢复仍是既有遗留项。
 
+### 阶段三百零四：健康设备下的交换链失败按窗口恢复（v0.4.266 → v0.4.267）
+
+- **真因**：真应用新日志先出现 `DEVICE_HUNG` 并成功重建；之后主窗口从最小化恢复，`ResizeBuffers(2667×1502)`
+  返回 `E_OUTOFMEMORY`，但 `GetDeviceRemovedReason()==S_OK`。旧代码已经释放后缓冲，却每帧重试同一个交换链，
+  随后 `Present` 从 `E_OUTOFMEMORY` 退化为持续 `E_FAIL`；这不是 Stage3D 旧设备纹理路径。
+- **修复**：非设备丢失的 `ResizeBuffers`/`Present` 失败只重建当前窗口的交换链、后缓冲与 fence，不重置共享设备；
+  若创建失败，空交换链门在后续帧按请求尺寸重试。设备丢失仍走阶段三百零三的整设备恢复。
+- **验收**：`temp/d3dresize` 真鼠标窗口探针覆盖最小化/恢复、大尺寸 resize 与双浮窗关闭；`ASC_GPU_RESIZE_FAIL=1`
+  注入一次健康设备 `E_OUTOFMEMORY`，日志出现 `window swapchain recreated`，组合 `ASC_GPU_LOSE_AT=20` 后正常退出、
+  零 `Present failed`。`unit: crash/hardening` 增 3 钉，全量 531/524/4/3，红色仍为既有同集合。
+
 ### 遗留待开发
 > **2026-10-27 追加（阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **101 → 102 项**（`未开始` **80 → 81**）。这两批的行为原先全在 macOS 的 `adl` 上量，而 `File` 家族几乎每个成员都碰宿主路径规则；在 Windows 10 + `adl 51.4.1` 上补测（探针 `temp/winfile/adl/`、读数 `adl-win{,2,3}.txt`）分出**六处宿主分叉 + 两处 Windows 独有**，全部**本轮修净**（按表头「已完成项一经落地即从本表移出」故不入表）：`cacheDirectory` 是 `%TEMP%` 而非 `%LOCALAPPDATA%\Caches`；盘符相对路径 `C:foo` 原样保留 + 补分隔符（旧解析得到**绝对**路径 `C:\foo`，是另一个文件）；`parent` 的根保留自己的分隔符（`C:\a` ⇒ `C:\`、`\a` ⇒ `\`）；`getRelativePath` 用正斜杠、跨盘 `null`；同一文件判定改走大小写不敏感的 `as_path_under`（旧的 `strcmp` 会把只有大小写差异的目标当「另一个文件」，覆盖分支先 `DELETE` 掉**源**再复制 ⇒ `#3003` 且文件已毁）；`FileStream` 偏移全改 64 位、`APPEND` 打开即 EOF。两处 Windows 独有：删掉仍被 `FileStream` 打开的文件在 Windows 上必然失败（`adl` 同样报错 ⇒ 是我们示例没 `close()`，已修）、`getRootDirectories()` 交出 8 个 `File` 而非 `StorageVolume`。另有**三处编译阻断**只有 Windows 宿主才撞到（`S_ISREG` 未定义、`_chsize_s` 未声明、`getcwd` 在 MSVC 的 `<direct.h>` 之外），同轮补齐。**新登记的 1 行**是剩余**验证欠账**：`examples/file-ops.as` 的断言写死了 `/tmp`（14 处）与「反斜杠是合法文件名字节」，而它与 `file-symlink.as`/`file-listing-async.as` 都要软链夹具 —— 本机账号建软链报 `EPERM`，三例一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级回归。钉子在 `test/unit/file-stream.ts` 的 `unit: file-stream/windows`（19 钉）+ 既有的 `file-url`/`file-ops` 组；口径写在 `docs/zh-cn/filesystem.md` §11.6（对照 `docs/en/filesystem.md` §11.6）。
 
