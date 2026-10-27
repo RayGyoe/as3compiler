@@ -526,7 +526,7 @@ C 侧 `hand.c`/`hand_small.c` 与 AS3 侧 `saxpy.as`/`saxpy_fn.as` **同规模�
   是本机可执行文件，所以这条能前置校验；在别的宿主上直接报
   `feature 'tray' needs a darwin host`（而不是给一个什么都不做的开关）。
 - **默认（不开开关）**：`supportsSystemTrayIcon` 仍为 `false`，`new SystemTrayIcon()` 仍抛 `#2012`，**菜单栏不出现任何东西**。
-  钉在 `unit: emit/SystemTrayIcon`（38 条）。
+  钉在 `unit: emit/SystemTrayIcon`（39 条）。
 - **开了之后的行为**（全部为实测，证据见本节末尾）：
   - 构造即安装一个 `NSStatusItem`（`NSVariableStatusItemLength`），**`bitmaps` 里的每一张有效位图都是一个
     `NSImage` representation**（最多 4 张；**直通 ARGB、由胶水层预乘一次**，与 Dock 图标同一条规则），`tooltip`
@@ -535,6 +535,11 @@ C 侧 `hand.c`/`hand_small.c` 与 AS3 侧 `saxpy.as`/`saxpy_fn.as` **同规模�
     macOS 上尺寸只能意味着密度（菜单栏恒 22pt）：22px 高的位图是 1x、44px 的是 2x，由 AppKit 按状态项所在的
     那块屏自己挑。**只给 2x 是错的**——非 Retina 屏上就只剩 AppKit 的一次降采样，15pt 的图里 1.5pt 的描边会被
     平均成雾（本机 2560×1440 副屏实测如此，`temp/` 与 `prune` 侧的截图对照）。
+    每张 representation 还必须**显式声明自己的 point 尺寸**（`setSize:`，= 图元尺寸 / 密度）：不声明的位图在
+    AppKit 眼里一律是「1 像素 == 1 point」，2x 那张就被当成「比 NSImage 大一倍、需要缩回去」的图，而 1x 那张
+    永远不会被当成 1x 变体选中 —— 结果是**两块屏上都糊**（实测：2x 主屏上 SVG 直译的扫把读成一根斜棒，1x 副屏
+    上整张图被重采样，连 11.5pt 的数字都发虚）。同一台机器、同一份代码，加上 `setSize:` 后两屏都回到 1:1 像素。
+    钉在 `unit: emit/SystemTrayIcon` 的「every tray rep declares the point size that fixes its scale」。
   - **点击派发 `ScreenMouseEvent`**：左键 `MouseEvent.CLICK`、右键 `MouseEvent.RIGHT_CLICK`，`screenX/screenY` 是
     **点击点**的屏幕坐标（左上原点、point），`commandKey/controlKey/altKey/shiftKey` 取自当时的修饰键，`isRelatedObjectInaccessible=false`。
   - **菜单只在右键弹出**：状态项挂了 `menu` 之后，AppKit 的常规做法是左右键都弹菜单；那样左键就永远不能表示
@@ -551,12 +556,17 @@ C 侧 `hand.c`/`hand_small.c` 与 AS3 侧 `saxpy.as`/`saxpy_fn.as` **同规模�
   - **不显示 Windows 那种气泡通知**（`SystemTrayIcon` 的 balloon 系列 AIR 本来就没有）。
   - **图标不做彩色**：`NSImage` 被标成 **template image**，由系统按当前菜单栏的明暗用标签色重绘（白色图标在浅色
     菜单栏上会消失，反之亦然）。所以位图的 RGB 只贡献 alpha —— 需要彩色图标的场景在本通道上做不到，明说而不是静默丢色。
+  - **位图是「像素」而不是「矢量」**：本通道只收 ARGB 像素（`BitmapData`），所以同一个图形必须在每种密度上**各画一次**、
+    而不是由系统重绘矢量。由此引出一条只能靠看图发现的限制：**15pt 上放不下的细节就是没有**。产品的扫把图标因此
+    有意偏离了设计稿的路径转写（设计稿里"头"与手柄等宽共线，15pt 上并成一根斜棒；改成"细手柄 + 张开的三片刷毛"，
+    姿态/位置/单色都照旧），1x 那张再把笔画加粗 25%（1px 的 45° 斜线被抗锯齿稀释后只剩一半的墨）。
+    这条属**美术适配**、不是语义分歧，但既然是"与设计稿不一致"，就写在这里而不是留给人猜。
   - **左键不弹菜单**（见上一条）：这是与 AppKit 惯例的有意分歧，理由是左键在真实产品里另有含义；`menu` 仍然在，
     只是入口是右键。
 - **证据**：真机验收 —— 状态项出现在菜单栏（`menubar.png`）、`ScreenMouseEvent` 的 `screenX/screenY` 与 AX 报告的
   状态项位置逐点吻合（AX `(1110,7) 40×24` vs 点击 `(1130,19)`）、右键 `rightClick`、菜单项点击收到 `Event.SELECT`
   （`temp/trayprobe/live-log.txt`：`CLICK` / `RIGHT_CLICK` / `MENU SELECT from Open Panel`）；
-  示例 `examples/status-item.as`（23 断言，带 `features: ["tray"]` 清单）；单元 `unit: emit/SystemTrayIcon`（38 条）
+  示例 `examples/status-item.as`（23 断言，带 `features: ["tray"]` 清单）；单元 `unit: emit/SystemTrayIcon`（39 条）
   与 `[features]` 组的 8 条（含「默认构建不链 `statusitem_glue.cc`」「非 macOS 宿主拒绝」两个反向对照）。
 
 ---

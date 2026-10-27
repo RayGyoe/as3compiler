@@ -4182,6 +4182,16 @@ function checkEmitSystemTrayIcon(): string[] {
     && (glue.match(/addRepresentation:/g) ?? []).length === 1
     && glue.includes('sk_send_void_bool(img, "setTemplate:", 1);')
     && glue.includes('double ptH = 22.0;'));
+  // Every rep must DECLARE its point size: that is the only thing that tells AppKit
+  // a bitmap's scale (pixels / points). Without it both reps claim "1px == 1pt", the
+  // 2x bitmap is taken for an image twice too large and resampled down, the 1x bitmap
+  // is never selected as the 1x variant, and the item arrives blurred on BOTH
+  // displays. Measured on a 2x main + 1x secondary pair; the 1x bar was mush.
+  check('every tray rep declares the point size that fixes its scale',
+    /static void\* sk_tray_nsrep\(const unsigned\* argb, int w, int h, double ptW, double ptH\)/.test(glue)
+    && glue.includes('sel_registerName("setSize:"), (sk_nssize){ptW, ptH});')
+    && /sk_tray_nsrep\(g_tray_rep_px\[i\], g_tray_rep_w\[i\], g_tray_rep_h\[i\], ptW, ptH\)/.test(glue)
+    && glue.includes('typedef struct { double w, h; } sk_nssize;'));
 
   console.log(`     [tray] ${ok} check(s) passed`);
   return bad;

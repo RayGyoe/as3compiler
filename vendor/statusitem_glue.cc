@@ -56,6 +56,7 @@ void sk_tray_set_callback(void (*cb)(int kind, double sx, double sy, int mods));
 // so a locally declared struct of the same shape receives what objc_msgSend
 // returns (window_glue.cc does exactly this with its own sk_nsrect).
 typedef struct { double x, y; } sk_nspoint;
+typedef struct { double w, h; } sk_nssize;
 typedef struct { sk_nspoint origin; sk_nspoint size; } sk_nsrect;
 
 extern "C" {
@@ -291,13 +292,20 @@ static void* sk_tray_menu_build(const sk_menu_t* menus, int nmenus, const sk_men
 // comes out too bright and a fully transparent one paints its colour. Multiply
 // once here — the same rule the Dock icon uses (sk_dock_set_icon_image in
 // window_glue.cc), and deliberately NOT the double-multiply AIR's Dock icon does.
-static void* sk_tray_nsrep(const unsigned* argb, int w, int h) {
+static void* sk_tray_nsrep(const unsigned* argb, int w, int h, double ptW, double ptH) {
   void* rep = sk_send_obj((void*)objc_getClass("NSBitmapImageRep"), "alloc");
   if (rep == NULL) return NULL;
   rep = ((void* (*)(void*, SEL, void*, long, long, long, long, signed char, signed char, void*, long, long))objc_msgSend)(
       rep, sel_registerName("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
       NULL, (long)w, (long)h, 8L, 4L, (signed char)1, (signed char)0,
       sk_nsstring("NSDeviceRGBColorSpace"), (long)w * 4L, 32L);
+  // Declare the rep's POINT size, which is what tells AppKit this bitmap's SCALE:
+  // scale = pixels / points. Without it every rep claims "1 pixel == 1 point", so a
+  // 2x rep looks like an image twice as large as the NSImage and gets resampled down
+  // -- and the 1x rep is never recognised as the 1x variant. Measured: the item then
+  // arrives blurred on BOTH displays (a 15pt glyph's 1.5pt stroke averages to haze on
+  // the 1x screen, and the whole bitmap is soft on the 2x one).
+  ((void (*)(void*, SEL, sk_nssize))objc_msgSend)(rep, sel_registerName("setSize:"), (sk_nssize){ptW, ptH});
   unsigned char* dst = (unsigned char*)sk_send_obj(rep, "bitmapData");
   if (dst == NULL) return NULL;
   long rb = (long)sk_send_int(rep, "bytesPerRow");
@@ -354,7 +362,7 @@ static void* sk_tray_nsimage(void) {
   img = ((void* (*)(void*, SEL, double, double))objc_msgSend)(img, sel_registerName("initWithSize:"), ptW, ptH);
   for (int i = 0; i < g_tray_nreps; i++) {
     if (g_tray_rep_px[i] == NULL || g_tray_rep_w[i] <= 0 || g_tray_rep_h[i] <= 0) continue;
-    void* rep = sk_tray_nsrep(g_tray_rep_px[i], g_tray_rep_w[i], g_tray_rep_h[i]);
+    void* rep = sk_tray_nsrep(g_tray_rep_px[i], g_tray_rep_w[i], g_tray_rep_h[i], ptW, ptH);
     if (rep != NULL) sk_send_void_obj(img, "addRepresentation:", rep);
   }
   sk_send_void_bool(img, "setTemplate:", 1);
