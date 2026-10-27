@@ -343,6 +343,9 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // scrollrect-clip.as 断言的也是**像素**（scrollRect 窗口的着色包围盒与窗口左上角
   // 色条），纯 C 构建没有光栅后端（draw 是空桩），故与 bakecrisp.as 一样链 Skia。
   'scrollrect-clip.as': ['--manifest', join(dir, 'scrollrect-clip.build.json')],
+  // scrollrect-coordinates.as 必须真的执行 stage.render，坐标 API 才会读到 AIR 的
+  // 「下一帧串接矩阵」；纯 C 的 surface 空桩会提前 return，故同链 Skia。
+  'scrollrect-coordinates.as': ['--manifest', join(dir, 'scrollrect-coordinates.build.json')],
   // autobake-scrollrect.as 断言的是**自动烘焙失效**后的像素（祖先烘焙 → 改 scrollRect →
   // draw 必须变），而且它要靠 `stage.render` 跑每帧指纹 pass 才会真的进入烘焙态，
   // 两者都只在 Skia 构建下存在，故同样链 Skia。

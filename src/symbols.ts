@@ -1525,6 +1525,12 @@ export class SymbolTable {
         // which is why it is a field rather than a codegen-side table entry. The
         // accessor stores its own copy (see emit.ts).
         ['_scroll_rect', { type: { kind: 'object', className: 'Rectangle' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // AIR keeps scrollRect's contribution to local/global coordinates in the
+        // last-rendered concatenated transform: assignment alone leaves the old
+        // answer until the next frame. These numeric slots snapshot that offset
+        // in as_render_object; as_to_stage_matrix consumes them, never the live rect.
+        ['_scroll_render_x', { type: { kind: 'number' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        ['_scroll_render_y', { type: { kind: 'number' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['getBounds', dom({ kind: 'object', className: 'Rectangle' }, [tfTarget()])],

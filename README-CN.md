@@ -553,6 +553,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/stage94r.as` — `TextField` 边框是屏幕空间 1px 线（不污染局部度量）
 - `examples/stage94s.as` — `hitTestPoint` 的 `true` 分支是内容区域（非包围盒）
 - `examples/displaylist-removechildren.as` — `removeChildren()` 的 AIR 口径：**从 beginIndex 升序**摘、`endIndex` **含**端点（adl 实测四子件 A..D 五种区间），以及在 `removedFromStage` 里摘后加兄弟仍然有效（真应用关闭会议时 `VideoRootView.removeStage()` 正是这么做）；末端另钉 `hitTestPoint(…, true)` **不**受 `scrollRect` 裁剪
+- `examples/scrollrect-coordinates.as` — `scrollRect` 对 `localToGlobal/globalToLocal/getBounds/getRect/hitTestPoint` 的自身与祖先平移在**下一帧渲染**生效，赋值当次仍读旧串接矩阵（adl 51.4.1 实测）
 - `examples/stage94t.as` — `int64`/`uint64` 64 位整数（增强，见 `docs/zh-cn/enhancements.md` §4.7）
 - `examples/textline.as` — `TextField.getLineMetrics` / `TextLineMetrics`
 - `examples/bytearray-index.as` — `ByteArray` 下标形式的完整语义

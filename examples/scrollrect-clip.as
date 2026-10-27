@@ -43,9 +43,10 @@ for (var i:int = 0; i < 30; i++) {
 }
 root.addChild(box);
 
-// localToGlobal 不认 scrollRect（air 实测：盒子在 (100,50)、inner 在 (5,10)、
-// scrollRect.y=30 时 inner(0,20) → (105,80)，即没有减掉那 30）。List 的回收逻辑
-// 正是靠这个口径，所以它不是「顺手修好的东西」，必须钉住。
+// 设置 scrollRect 后、下一帧渲染**之前**，localToGlobal 仍读旧的串接矩阵
+// （air 实测：盒子在 (100,50)、inner 在 (5,10)、scrollRect.y=30 时 inner(0,20)
+// → (105,80)，即尚未减掉那 30）。下一帧才计入偏移的完整口径另见
+// examples/scrollrect-coordinates.as；这里钉住的是不能被「提前生效」破坏的前半段。
 var inner:Sprite = new Sprite();
 inner.x = 5;
 inner.y = 10;

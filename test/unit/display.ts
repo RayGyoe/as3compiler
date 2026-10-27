@@ -280,6 +280,22 @@ function checkDisplayGeometry(): string[] {
   check('a null point throws TypeError #2007 in localToGlobal/globalToLocal',
     (c.match(/Error #2007: Parameter point must be non-null\./g) || []).length === 2);
 
+  // 阶段三百零二：AIR 把 scrollRect 的内容平折进「上一帧已渲染」的串接矩阵。
+  // 设置当次读取仍是旧值，ENTER_FRAME 后自身与祖先的偏移都生效（temp/srtest）；
+  // 真应用 List.updateItemIndex 靠它回收国家行，缺了就会在滚动后留下灰带。
+  const matrixAt = c.indexOf('static void as_to_stage_matrix(DisplayObject* o,');
+  const matrixBody = c.slice(matrixAt, c.indexOf('\nstatic int as_local_point', matrixAt));
+  check('local/global geometry folds self and ancestor RENDERED scroll offsets',
+    matrixBody.includes('*tx -= *a * o->_scroll_render_x + *c * o->_scroll_render_y;')
+    && matrixBody.includes('ptx -= pa * p->_scroll_render_x + pc * p->_scroll_render_y;')
+    && !matrixBody.includes('o->_scroll_rect') && !matrixBody.includes('p->_scroll_rect'));
+  const renderAt = c.indexOf('static void as_render_object(void* canvas, DisplayObject* o) {');
+  const snapshotAt = c.indexOf('o->_scroll_render_x = o->_scroll_rect != NULL ? o->_scroll_rect->x : 0.0;', renderAt);
+  const cacheAt = c.indexOf('} else if ((o->_cache_flag || o->_auto_baked)', renderAt);
+  check('the renderer snapshots both scroll axes before any cached-paint branch',
+    snapshotAt > renderAt && cacheAt > snapshotAt
+    && c.slice(snapshotAt, cacheAt).includes('o->_scroll_render_y = o->_scroll_rect != NULL ? o->_scroll_rect->y : 0.0;'));
+
   const preamble = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
   check('the pure-C Skia stubs still compile against the new geometry code',
     preamble.includes('static inline int as_skia_path_get_bounds(void* p, double* l, double* t, double* r, double* b) { (void)p;'));

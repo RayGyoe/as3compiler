@@ -19495,11 +19495,20 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void as_to_stage_matrix(DisplayObject* o, double* a, double* b, double* c, double* d, double* tx, double* ty) {');
     this.indent++;
     this.line('as_do_matrix(o, a, b, c, d, tx, ty);');
+    // scrollRect moves the rendered CONTENT inside the object's anchored window.
+    // AIR folds that translation into local/global coordinates only after a frame
+    // renders (temp/srtest: immediate reads keep the old answer, ENTER_FRAME reads
+    // include both the object's own and every ancestor's offset). Use the snapshot
+    // taken by as_render_object so the same frame boundary is preserved here.
+    this.line('*tx -= *a * o->_scroll_render_x + *c * o->_scroll_render_y;');
+    this.line('*ty -= *b * o->_scroll_render_x + *d * o->_scroll_render_y;');
     this.line('DisplayObject* p = (DisplayObject*)o->parent;');
     this.line('while (p != NULL) {');
     this.indent++;
     this.line('double pa, pb, pc, pd, ptx, pty;');
     this.line('as_do_matrix(p, &pa, &pb, &pc, &pd, &ptx, &pty);');
+    this.line('ptx -= pa * p->_scroll_render_x + pc * p->_scroll_render_y;');
+    this.line('pty -= pb * p->_scroll_render_x + pd * p->_scroll_render_y;');
     this.line('double na, nb, nc, nd, ntx, nty;');
     this.line('as_mat_mul(pa, pb, pc, pd, ptx, pty, *a, *b, *c, *d, *tx, *ty, &na, &nb, &nc, &nd, &ntx, &nty);');
     this.line('*a = na; *b = nb; *c = nc; *d = nd; *tx = ntx; *ty = nty;');
@@ -26447,6 +26456,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     // whole subtree is right for a sprite mask too — AIR renders it into the mask
     // buffer, never into the visible output.
     this.line('if (o->_mask_object) return;');
+    // Snapshot scrollRect's rendered translation for the coordinate APIs. This is
+    // deliberately before the cached-paint branch: a cache hit is still a rendered
+    // frame in AIR and must refresh the concatenated-transform answer.
+    this.line('o->_scroll_render_x = o->_scroll_rect != NULL ? o->_scroll_rect->x : 0.0;');
+    this.line('o->_scroll_render_y = o->_scroll_rect != NULL ? o->_scroll_rect->y : 0.0;');
     // clipDepth mask (swc.md §9 E-4): the mask is a SIBLING, so its region lives in
     // the PARENT's pixel space and must NOT follow this object as it moves. The clip
     // therefore goes on BEFORE the object's own translate/rotate/scale, and the baked
