@@ -47,13 +47,12 @@ So three different kinds of "empty" must be told apart:
 (`E:/Works/eDoctor/talkmed-meeting-windows/src`, 989 `.as` files) that mention the
 class name (counted in stage 293).
 
-### 2.1 Data carriers: fields and constants are real (12)
+### 2.1 Data carriers: fields and constants are real (11)
 
 | Class | Package | App refs | Delivers | Does not deliver |
 |---|---|---|---|---|
 | `ClipboardFormats` | `flash.desktop` | 3 | the 7 format-name constants (`text`/`html`/`richText`/`url`/`bitmap`/`fileList`/`filePromiseList`) | nothing missing (a constants class, **not a gap**) |
-| `FileFilter` | `flash.net` | 10 | `description` / `extension` / `macType` / `winType` really assigned | `clone()` reports and returns `null` (measured: reading `.description` on the result throws `#1009`) |
-| `FileListEvent` | `flash.events` | 2 | the `DIRECTORY_LISTING` constant, `directory`/`files` fields | the event is never dispatched (async listing fills results in directly) |
+| `FileListEvent` | `flash.events` | 2 | the `DIRECTORY_LISTING`/`SELECT_MULTIPLE` constants, `files`, the 4-argument constructor, `clone()` | nothing missing (stage 299: `directory` was our own invention and is gone; the event really is dispatched by `File.getDirectoryListingAsync`) |
 | `JPEGEncoderOptions` | `flash.display` | 2 | `quality` (default 50) | `BitmapData.encode` reports for JPEG (the vendored Skia has JPEG encoding off) |
 | `PNGEncoderOptions` | `flash.display` | 2 | `fastCompression` (default `false`) | same (and for WebP) |
 | `InvokeEvent` | `flash.events` | 1 | `INVOKE`, `arguments`/`currentDirectory`/`reason` | no "launched with a document" entry point, so the event never arrives |
@@ -98,8 +97,10 @@ deliberately does not do (`as_shell_unsupported`, complete as of stage 293):
 | `DisplayObject.mask` | the renderer does not apply masks (`clipDepth` masking is a different, implemented path) |
 | `Error.getStackTrace` | no AS3 frame model |
 | `ExtensionContext.createExtensionContext` / `.call` | no native-extension host (the `--air-app` ANE path is separate) |
-| `File.moveTo` (across volumes / target exists without overwrite / source missing) | AIR throws `IOError` for these; we report |
-| `File.browseForOpen` / `browseForDirectory` / `openWithDefaultApplication` / `upload` | no system file dialog / ShellExecute / HTTP upload |
+| `File.browseForOpen` / `browseForOpenMultiple` / `browseForSave` / `browseForDirectory` / `openWithDefaultApplication` / `upload` | no system file dialog / ShellExecute / HTTP upload (stage 299 added the two symbols that were missing outright, which used to be a LINK error) |
+| `FileReference.browse` / `load` / `save` / `download` / `upload` / `uploadUnencoded`, `FileReferenceList.browse` | same backends. They report themselves and return `false` rather than pretending the user cancelled — without a dialog, `fileList`/`data`/`name` can never be filled |
+| `File.icon` contents | no icon extraction (`NSWorkspace.iconForFile`). An empty `Icon` plus a loud report; `bitmapDatas` answers an empty array (reading it on AIR 51.4 itself throws `#1069`) |
+| `File.getVolumeByDrive` / `getVolumeByPath` | no volume enumeration (`getmntinfo`/`statfs`). `StorageVolume` itself is real and measured; what is missing is who constructs it |
 | `DockIcon.bitmaps` (painting) | that backend does not paint a Dock icon bitmap |
 | `NativeApplication.systemIdleMode` | this build never inhibits the system idle timer |
 | `Clipboard.setData(richText, non-ByteArray)` | `Clipboard.html`'s type table requires a `ByteArray`; storing anything else would make `getData` hand back a type the format does not promise |
@@ -113,6 +114,11 @@ deliberately does not do (`as_shell_unsupported`, complete as of stage 293):
 | `Clipboard` | 293 | **real**: a (format → data) entry table, with `generalClipboard` wired to the operating system (four formats translated on Windows, see [`desktop.md`](desktop.md) §7.10) |
 | `ClipboardTransferMode` | 293 | added (the class was **missing entirely**, so `import flash.desktop.ClipboardTransferMode` did not compile) |
 | `System.setClipboard` | 293 | real (`clear()` + `setData(TEXT_FORMAT, s)`) |
+| `FileFilter` | 299 | **real**: three fields; the invented `winType`/`name`/`clone()` are gone |
+| `FileReference` | 299 | **real** (`File`'s superclass): with nothing picked, every accessor is `#2037` except `data` (null); the interactive members report themselves |
+| `FileReferenceList` | 299 | **real**: `fileList` starts as `null` and is read-only (exactly as measured) |
+| `StorageVolume` / `StorageVolumeChangeEvent` | 299 | **real**: the measured constructor order, six read-only getters, two constants and `clone()` |
+| `FileStream` | 299 | **no longer a stub**: really `implements IDataInput, IDataOutput` (23 read/write members, `endian`/`objectEncoding`/`readAhead`, a writable `Number` `position`), see [`filesystem.md`](filesystem.md) §13.1 |
 
 ---
 

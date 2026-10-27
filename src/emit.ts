@@ -16618,6 +16618,37 @@ static char* as_path_norm(const char* p) {
     this.line('#endif');
     this.indent--;
     this.line('}');
+    // The three static system reads added in stage 299 read the HOST, not the
+    // source, so they are runtime helpers like separator/lineEnding above.
+    // Measured on adl 51.4.1 (temp/fileaudit2/af.txt): cacheDirectory is
+    // ~/Library/Caches on macOS, workingDirectory is the process CWD, and
+    // permissionStatus is "granted" because macOS does not gate access per-file.
+    this.cblock(`static char* as_file_cache_dir(void) {
+#ifdef _WIN32
+  const char* e = getenv("LOCALAPPDATA");
+  if (e != NULL && e[0] != 0) return as_path_join(e, "Caches");
+  return as_path_join(as_home_dir(), "AppData/Local/Caches");
+#elif defined(__APPLE__)
+  return as_path_join(as_home_dir(), "Library/Caches");
+#else
+  {
+    const char* e = getenv("XDG_CACHE_HOME");
+    if (e != NULL && e[0] != 0) return (char*)e;
+  }
+  return as_path_join(as_home_dir(), ".cache");
+#endif
+}
+static char* as_file_working_dir(void) {
+  char buf[4096];
+  if (getcwd(buf, sizeof(buf)) == NULL) return as_home_dir();
+  return as_path_norm(buf);
+}`);
+    // systemCharset: AIR reports the OS's LEGACY encoding here (measured: the
+    // string "x-mac-chinesesimp" on this Chinese-locale macOS host), which is a
+    // property of the host's language settings rather than of the file. This build
+    // answers "UTF-8" -- the charset every string in it actually uses -- and says so
+    // rather than pretending to know the legacy code page (registered in TODO.md).
+    this.line('static char* as_file_system_charset(void) { return (char*)"UTF-8"; }');
     this.line('static int as_mkdir_one(const char* p) {');
     this.indent++;
     this.line('#ifdef _WIN32');
@@ -17024,7 +17055,6 @@ static char* as_path_norm(const char* p) {
   if (path == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter  must be non-null.", 2007)); return NULL; }
   return File_new(as_path_join(o->nativePath, path));
 }`);
-    this.line('void File_createDirectory(void* _this) { File* o = (File*)_this; if (o->nativePath != NULL) as_mkdirs(o->nativePath); }');
     // ---- File deletion --------------------------------------------------------
     // The contract, measured on adl 51.4.1 (temp/fileaudit/adl/av.txt, av3.txt):
     //
@@ -17195,6 +17225,715 @@ static void as_file_throw(int err) {
     this.line('  return out;');
     this.line('}');
     this.line('');
+    // ---- File/FileReference helpers (stage 299) --------------------------------
+    // Everything here is measured on adl 51.4.1; the probe and its output are kept
+    // in temp/fileaudit2/ (AC.as -> ac.txt) and temp/fileaudit/adl/ (av*.txt).
+    //
+    // canonicalize(): AIR declares it VOID -- it rewrites the receiver's nativePath
+    // in place (mxmlc rejects `cl.canonicalize().nativePath`). The measured rule is
+    // "resolve the deepest EXISTING ancestor, keep the nonexistent tail": with only
+    // /tmp present, /tmp/x/y becomes /private/tmp/x/y, and a path whose existing
+    // part contains no link stays byte-identical. That is exactly realpath() on the
+    // longest existing prefix.
+    this.cblock(`static char* as_path_realpath(const char* p) {
+  if (p == NULL) return NULL;
+  {
+    char* norm = as_path_norm(p);
+    // Measured on adl 51.4.1 (temp/fileaudit2/AG.as): canonicalize() resolves links
+    // only when the WHOLE path exists -- "/tmp" -> "/private/tmp" and
+    // "/tmp/real.txt" -> "/private/tmp/real.txt", while
+    // "/tmp/real.txt/inner/x" (no such file) stays byte-identical INCLUDING the
+    // unresolved /tmp, and "/tmp/real.txt/../other.txt" becomes "/tmp/other.txt"
+    // (the ".." was folded, /tmp was not resolved). So: lexical normalisation
+    // always, realpath only for a path that is really there.
+#ifdef _WIN32
+    // No portable link resolution here; the normalised absolute path stands.
+    return norm;
+#else
+    char* res;
+    if (!as_path_exists_l(norm)) return norm;
+    res = realpath(norm, NULL);
+    if (res == NULL) return norm;
+    {
+      char* out = as_str_alloc(strlen(res) + 1);
+      strcpy(out, res);
+      free(res);
+      return out;
+    }
+#endif
+  }
+}`);
+    // creationDate / modificationDate. Measured (ac.txt, av.txt): a File with no
+    // nativePath throws #2037, a path that does not exist #3003, and the value is a
+    // real Date -- sub-second precision included (adl reported ...198 ms for a file
+    // written a moment earlier, i.e. nanoseconds truncated to milliseconds).
+    this.cblock(`static double as_stat_time_ms(const struct stat* st, int creation) {
+#ifdef __APPLE__
+  // The only two platforms with a birth time field: macOS/BSD (st_birthtime) and
+  // Windows (handled in as_file_time_ms). Everything else falls back below.
+  time_t sec = creation ? st->st_birthtimespec.tv_sec : st->st_mtimespec.tv_sec;
+  long nsec = creation ? st->st_birthtimespec.tv_nsec : st->st_mtimespec.tv_nsec;
+  return (double)sec * 1000.0 + (double)nsec / 1000000.0;
+#else
+  // No birth time in POSIX stat: creationDate falls back to the inode change time
+  // (documented deviation), and the whole-second fields are all that is portable.
+  return (double)(creation ? st->st_ctime : st->st_mtime) * 1000.0;
+#endif
+}
+static int as_file_time_ms(const char* p, int creation, double* out) {
+#ifdef _WIN32
+  WIN32_FILE_ATTRIBUTE_DATA fa;
+  if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return 0;
+  const FILETIME* ft = creation ? &fa.ftCreationTime : &fa.ftLastWriteTime;
+  ULARGE_INTEGER u;
+  u.LowPart = ft->dwLowDateTime;
+  u.HighPart = ft->dwHighDateTime;
+  // 100 ns ticks since 1601 -> ms since 1970.
+  *out = (double)u.QuadPart / 10000.0 - 11644473600000.0;
+  return 1;
+#else
+  struct stat st;
+  if (stat(p, &st) != 0) return 0;
+  *out = as_stat_time_ms(&st, creation);
+  return 1;
+#endif
+}
+static Date* as_file_date(File* o, int creation) {
+  if (o->nativePath == NULL) { as_file_throw(2037); return NULL; }
+  double ms = 0.0;
+  if (!as_file_time_ms(o->nativePath, creation, &ms)) { as_file_throw(3003); return NULL; }
+  return Date_new_ms(ms);
+}`);
+    // downloaded: AIR's "this file carries the quarantine flag" bit. On macOS that
+    // IS the com.apple.quarantine extended attribute, which is what Safari writes
+    // when it saves a download -- so it is read straight from the filesystem.
+    // Measured (ac.txt): assigning TRUE sets it, assigning FALSE leaves it set
+    // (AIR only ever adds the flag), and a File with no nativePath throws #2037 --
+    // that last guard lives in the getter wrapper below, not here.
+    this.line('// getxattr/setxattr live in sys/xattr.h, which the preamble does not pull in;');
+    this.line('// declaring the two prototypes keeps the include set unchanged (macOS forms).');
+    this.line('#ifdef __APPLE__');
+    this.line('extern ssize_t getxattr(const char*, const char*, void*, size_t, unsigned int, int);');
+    this.line('extern int setxattr(const char*, const char*, const void*, size_t, unsigned int, int);');
+    this.line('#endif');
+    this.cblock(`static bool as_file_downloaded(const char* p) {
+  if (p == NULL) return false;
+#ifdef __APPLE__
+  return getxattr(p, "com.apple.quarantine", NULL, 0, 0, 0) > 0;
+#else
+  // No quarantine concept on the other hosts, and no cross-platform xattr API.
+  return false;
+#endif
+}
+static void as_file_set_downloaded(const char* p, int on) {
+  if (p == NULL || !on) return;
+#ifdef __APPLE__
+  const char* v = "0081;00000000;as3compiler;00000000-0000-0000-0000-000000000000";
+  setxattr(p, "com.apple.quarantine", v, strlen(v), 0, 0);
+#else
+  (void)on;
+#endif
+}`);
+    // isPackage: "a directory the OS treats as a single document". Measured on adl
+    // (ac.txt): a DIRECTORY named x.app is true, a plain FILE named x.app is false,
+    // and .framework is not on the list. Extensions below are the macOS package
+    // set; a path that does not exist is false.
+    this.cblock(`static bool as_file_is_package(const char* p) {
+  if (p == NULL || !as_path_is_dir(p)) return false;
+  char* base = as_path_basename(p);
+  if (base == NULL) return false;
+  const char* dot = strrchr(base, '.');
+  if (dot == NULL) return false;
+  static const char* exts[] = { "app", "bundle", "plugin", "kext", "xpc", "appex",
+    "docset", "pkg", "prefpane", "saver", "wdgt", "workflow", "scptd",
+    "qlgenerator", "mdimporter", "action", "definition", "dst", "langprofile", NULL };
+  for (int i = 0; exts[i] != NULL; i++) if (strcmp(dot + 1, exts[i]) == 0) return true;
+  return false;
+}`);
+    // getRelativePath(from -> to), component-wise. Measured on adl 51.4.1
+    // (ac.txt / av.txt): the answer is the path FROM THE RECEIVER TO the argument
+    // (`parent.getRelativePath(child)` is "child", `child.getRelativePath(parent)`
+    // is ".."), the empty string for the same path, and NULL -- not an exception --
+    // when a ".." would be needed while useDotDot is false.
+    this.cblock(`static char* as_file_relpath(const char* a, const char* b, int useDotDot) {
+  const char* pa = a;
+  const char* pb = b;
+  if (a == NULL || b == NULL) return NULL;
+  for (;;) {
+    size_t la = 0, lb = 0;
+    while (*pa == '/') pa++;
+    while (*pb == '/') pb++;
+    while (pa[la] != 0 && pa[la] != '/') la++;
+    while (pb[lb] != 0 && pb[lb] != '/') lb++;
+    if (la == 0 || lb == 0) break;
+    if (la != lb || strncmp(pa, pb, la) != 0) break;
+    pa += la;
+    pb += lb;
+  }
+  {
+    int ups = 0;
+    const char* q = pa;
+    const char* rest = pb;
+    size_t n;
+    char* out;
+    size_t w = 0;
+    for (;;) {
+      while (*q == '/') q++;
+      if (*q == 0) break;
+      ups++;
+      while (*q != 0 && *q != '/') q++;
+    }
+    while (*rest == '/') rest++;
+    if (ups > 0 && !useDotDot) return NULL;
+    n = (size_t)ups * 3 + strlen(rest) + 1;
+    out = as_str_alloc(n);
+    for (int i = 0; i < ups; i++) {
+      if (w > 0) out[w++] = '/';
+      out[w++] = '.';
+      out[w++] = '.';
+    }
+    if (rest[0] != 0) {
+      size_t rl = strlen(rest);
+      if (w > 0) out[w++] = '/';
+      memcpy(out + w, rest, rl);
+      w += rl;
+    }
+    out[w] = 0;
+    return out;
+  }
+}`);
+    // createTempFile()/createTempDirectory(): AIR makes a real file in the OS temp
+    // directory with the prefix "FlashTmp." -- measured on adl 51.4.1 (ac.txt):
+    // /var/folders/.../T/FlashTmp.49Z7kd, and it EXISTS straight away. mkstemp gives
+    // exactly that shape, so the name differs per run just as AIR's does.
+    this.cblock(`static char* as_file_temp_dir(void) {
+#ifdef _WIN32
+  const char* e = getenv("TEMP");
+  if (e == NULL || e[0] == 0) e = getenv("TMP");
+  if (e == NULL || e[0] == 0) e = getenv("USERPROFILE");
+  return (char*)e;
+#else
+  const char* e = getenv("TMPDIR");
+  if (e == NULL || e[0] == 0) e = "/tmp";
+  return (char*)e;
+#endif
+}
+static char* as_file_temp_path(int isDir) {
+  char* dir = as_file_temp_dir();
+  if (dir == NULL) return NULL;
+#ifdef _WIN32
+  for (int i = 0; i < 1000; i++) {
+    char nm[64];
+    char* p;
+    snprintf(nm, sizeof(nm), "FlashTmp.%u", (unsigned)(GetTickCount() + (DWORD)i * 7919u));
+    p = as_path_join(dir, nm);
+    if (as_path_exists_l(p)) continue;
+    if (isDir) {
+      if (CreateDirectoryA(p, NULL)) return p;
+    } else {
+      HANDLE h = CreateFileA(p, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+      if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return p; }
+    }
+  }
+  return NULL;
+#else
+  {
+    char* tmpl = as_path_join(dir, "FlashTmp.XXXXXX");
+    char* buf = (char*)malloc(strlen(tmpl) + 1);
+    char* out;
+    if (buf == NULL) return NULL;
+    strcpy(buf, tmpl);
+    if (isDir) {
+      if (mkdtemp(buf) == NULL) { free(buf); return NULL; }
+    } else {
+      int fd = mkstemp(buf);
+      if (fd < 0) { free(buf); return NULL; }
+      close(fd);
+    }
+    out = as_str_alloc(strlen(buf) + 1);
+    strcpy(out, buf);
+    free(buf);
+    return out;
+  }
+#endif
+}`);
+    // The event an async member dispatches for its outcome: COMPLETE for 0, and an
+    // ioError carrying the SAME id and sentence the sync member throws. #2037 (a
+    // File with no path) is thrown synchronously instead -- measured for the whole
+    // async family on adl 51.4.1.
+    this.cblock(`static void as_file_io_dispatch(File* o, int err) {
+  if (err == 2037) { as_throw(Error_new((char*)as_file_err_text(err), err)); return; }
+  if (err == 0) { EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false)); return; }
+  {
+    IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, (char*)as_file_err_text(err));
+    ev->errorID = err;
+    EventDispatcher_dispatchEvent((void*)o, (Event*)ev);
+  }
+}`);
+    // #3014 is the one delete/copy id as_file_err_text does not carry (it has no
+    // sync delete counterpart), so its sentence is spelled out here.
+    this.line('static void as_file_throw_contained(void) { as_throw(Error_new((char*)"Error #3014: Cannot copy or move a file or directory to overwrite a containing directory.", 3014)); }');
+    // The path a FileReference-shaped argument denotes, or NULL. File extends
+    // FileReference in AIR, so members declared with a FileReference parameter
+    // (moveTo/copyTo/getRelativePath) can receive either; only a real File carries
+    // a nativePath, and File is final, so the vtable is an exact test.
+    this.line('static const char* as_file_path_of(void* obj) {');
+    this.indent++;
+    this.line('if (obj == NULL) return NULL;');
+    this.line('if (((void**)obj)[0] != (void*)&File_vt) return NULL;');
+    this.line('return ((File*)obj)->nativePath;');
+    this.indent--;
+    this.line('}');
+    // A recursive copy, used by copyTo/copyToAsync. The caller has already removed
+    // any existing destination, so `dst` names a free slot here. Links are copied
+    // AS LINKS (a link cycle must not become an infinite copy), directories
+    // recursively, everything else byte for byte. Returns an AIR error id or 0.
+    this.cblock(`static int as_file_copy_any(const char* src, const char* dst) {
+#ifdef _WIN32
+  DWORD attr = GetFileAttributesA(src);
+  if (attr == INVALID_FILE_ATTRIBUTES) return 3003;
+  if ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    FILE* in = fopen(src, "rb");
+    if (in == NULL) return 3001;
+    FILE* out = fopen(dst, "wb");
+    if (out == NULL) { fclose(in); return 3001; }
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
+    fclose(out);
+    fclose(in);
+    return 0;
+  }
+  if (!CreateDirectoryA(dst, NULL) && !as_path_is_dir(dst)) return 2038;
+  {
+    size_t len = strlen(src);
+    char* pat = (char*)malloc(len + 3);
+    int err = 0;
+    size_t i;
+    if (pat == NULL) return 2038;
+    memcpy(pat, src, len);
+    for (i = 0; i < len; i++) if (pat[i] == '/') pat[i] = 92;
+    pat[len] = 92; pat[len + 1] = '*'; pat[len + 2] = 0;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    free(pat);
+    if (h == INVALID_HANDLE_VALUE) return 2038;
+    do {
+      if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+      err = as_file_copy_any(as_path_join(src, fd.cFileName), as_path_join(dst, fd.cFileName));
+      if (err != 0) break;
+    } while (FindNextFileA(h, &fd) != 0);
+    FindClose(h);
+    if (err != 0) return err;
+  }
+  return 0;
+#else
+  struct stat st;
+  if (lstat(src, &st) != 0) return 3003;
+  if (S_ISLNK(st.st_mode)) {
+    char buf[4096];
+    ssize_t n = readlink(src, buf, sizeof(buf) - 1);
+    if (n <= 0) return 2038;
+    buf[n] = 0;
+    return (symlink(buf, dst) == 0) ? 0 : 2038;
+  }
+  if (S_ISDIR(st.st_mode)) {
+    if (mkdir(dst, st.st_mode & 07777) != 0 && !as_path_is_dir(dst)) return 2038;
+    DIR* d = opendir(src);
+    int err = 0;
+    if (d == NULL) return 3001;
+    {
+      struct dirent* e;
+      while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        err = as_file_copy_any(as_path_join(src, e->d_name), as_path_join(dst, e->d_name));
+        if (err != 0) break;
+      }
+    }
+    closedir(d);
+    return err;
+  }
+  {
+    FILE* in = fopen(src, "rb");
+    FILE* out;
+    unsigned char* buf;
+    size_t n;
+    if (in == NULL) return 3001;
+    out = fopen(dst, "wb");
+    if (out == NULL) { fclose(in); return 3001; }
+    buf = (unsigned char*)malloc(65536);
+    if (buf == NULL) { fclose(out); fclose(in); return 2038; }
+    while ((n = fread(buf, 1, 65536, in)) > 0) fwrite(buf, 1, n, out);
+    free(buf);
+    fclose(out);
+    fclose(in);
+    chmod(dst, st.st_mode & 07777);
+    return 0;
+  }
+#endif
+}`);
+    // createDirectory(): measured on adl 51.4.1 -- a deep path is created level by
+    // level, an existing directory is a no-op, a File with no nativePath throws
+    // #2037, and a path that names an existing FILE throws #3003 (not #3006).
+    this.cblock(`void File_createDirectory(void* _this) {
+  File* o = (File*)_this;
+  if (o->nativePath == NULL) { as_file_throw(2037); return; }
+  if (as_path_exists_l(o->nativePath) && !as_path_is_dir(o->nativePath)) { as_file_throw(3003); return; }
+  as_mkdirs(o->nativePath);
+}`);
+    // clone(): a new File for the same path (measured: equal nativePath, different
+    // object).
+    this.line('File* File_clone(void* _this) { File* o = (File*)_this; if (o->nativePath == NULL) { as_file_throw(2037); return NULL; } return File_new(o->nativePath); }');
+    // canonicalize(): rewrite the receiver IN PLACE (AIR declares it void).
+    this.cblock(`void File_canonicalize(void* _this) {
+  File* o = (File*)_this;
+  o->nativePath = as_path_realpath(o->nativePath);
+  gc_write_barrier((void*)o->nativePath);
+}`);
+    // getRelativePath(ref, useDotDot): from the receiver to `ref`. The argument is
+    // declared FileReference in AIR (File's superclass), so a plain FileReference --
+    // which has no path -- is #2037 here, the same way it is everywhere else on File.
+    this.cblock(`char* File_getRelativePath(void* _this, FileReference* ref, bool useDotDot) {
+  File* o = (File*)_this;
+  const char* to;
+  if (ref == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter ref must be non-null.", 2007)); return NULL; }
+  to = as_file_path_of((void*)ref);
+  if (o->nativePath == NULL || to == NULL) { as_file_throw(2037); return NULL; }
+  return as_file_relpath(o->nativePath, to, useDotDot ? 1 : 0);
+}`);
+    // copyTo / moveTo share one measured contract (temp/fileaudit2/AC.as,
+    // temp/fileaudit/adl/av3.txt C1-C7):
+    //   null destination ........... TypeError #2007 "Parameter destination must be
+    //                                non-null." (AIR throws this from the ASYNC
+    //                                member too, so it is reported separately)
+    //   no path on either side ..... #2037
+    //   source missing ............ #3003
+    //   target exists, !overwrite .. #3012
+    //   target is the source or lies inside it .. #3014
+    //   target's parent missing .... created automatically
+    //   copy overwrite ............. the old target is REMOVED first, not merged
+    //                                (measured: a sibling file inside the old
+    //                                directory is gone afterwards)
+    //   move overwrite ............ same, then rename (measured over a NON-empty
+    //                                directory: the file replaces it)
+    // A cross-volume move makes rename() fail with EXDEV; AIR copies and then
+    // deletes, and so does this now (as_file_copy_any + as_remove_any), so a move
+    // between volumes works instead of reporting that it cannot.
+    this.cblock(`static int as_file_transfer_err(File* o, FileReference* target, int overwrite, int* nullArg) {
+  const char* src = o->nativePath;
+  const char* dst;
+  char* parent;
+  *nullArg = 0;
+  if (target == NULL) { *nullArg = 1; return 2007; }
+  dst = as_file_path_of((void*)target);
+  if (src == NULL || dst == NULL) return 2037;
+  if (!as_path_exists_l(src)) return 3003;
+  if (as_path_exists_l(dst)) {
+    if (!overwrite) return 3012;
+    if (strcmp(dst, src) == 0 || as_path_under(dst, src)) return 3014;
+    {
+      int rm = as_remove_any(dst);
+      if (rm != 0) return rm;
+    }
+  } else if (strcmp(dst, src) == 0) {
+    return 3014;
+  }
+  parent = as_path_dirname(dst);
+  if (parent != NULL && parent[0] != 0 && !as_path_is_dir(parent)) as_mkdirs(parent);
+  return 0;
+}
+static void as_file_null_dest(void) {
+  as_throw(TypeError_new((char*)"Error #2007: Parameter destination must be non-null.", 2007));
+}`);
+    this.cblock(`void File_copyTo(void* _this, FileReference* newFile, bool overwrite) {
+  File* o = (File*)_this;
+  int nullArg = 0;
+  int err = as_file_transfer_err(o, newFile, overwrite ? 1 : 0, &nullArg);
+  if (nullArg) { as_file_null_dest(); return; }
+  if (err == 3014) { as_file_throw_contained(); return; }
+  if (err != 0) { as_file_throw(err); return; }
+  err = as_file_copy_any(o->nativePath, as_file_path_of((void*)newFile));
+  if (err == 3014) as_file_throw_contained();
+  else if (err != 0) as_file_throw(err);
+}
+void File_copyToAsync(void* _this, FileReference* newFile, bool overwrite) {
+  File* o = (File*)_this;
+  int nullArg = 0;
+  int err = as_file_transfer_err(o, newFile, overwrite ? 1 : 0, &nullArg);
+  if (nullArg) { as_file_null_dest(); return; }
+  if (err == 0) err = as_file_copy_any(o->nativePath, as_file_path_of((void*)newFile));
+  if (err == 3014) { as_throw(Error_new((char*)"Error #3014: Cannot copy or move a file or directory to overwrite a containing directory.", 3014)); return; }
+  as_file_io_dispatch(o, err);
+}
+void File_moveToAsync(void* _this, FileReference* newFile, bool overwrite) {
+  File* o = (File*)_this;
+  int nullArg = 0;
+  int err = as_file_transfer_err(o, newFile, overwrite ? 1 : 0, &nullArg);
+  if (nullArg) { as_file_null_dest(); return; }
+  if (err == 0) {
+    const char* dst = as_file_path_of((void*)newFile);
+    if (rename(o->nativePath, dst) != 0) {
+      err = as_file_copy_any(o->nativePath, dst);
+      if (err == 0) err = as_remove_any(o->nativePath);
+    }
+  }
+  if (err == 3014) { as_throw(Error_new((char*)"Error #3014: Cannot copy or move a file or directory to overwrite a containing directory.", 3014)); return; }
+  as_file_io_dispatch(o, err);
+}`);
+    // creationDate / modificationDate: real Dates off the filesystem (see
+    // as_file_date), #2037 without a path and #3003 for a path that is not there.
+    this.line('Date* File_get_creationDate(void* _this) { return as_file_date((File*)_this, 1); }');
+    this.line('Date* File_get_modificationDate(void* _this) { return as_file_date((File*)_this, 0); }');
+    // creator: the classic-Mac four-character type. Measured on adl 51.4.1: NULL for
+    // a real file (the field is dead on modern macOS) and #2037 without a path.
+    this.cblock(`char* File_get_creator(void* _this) {
+  File* o = (File*)_this;
+  if (o->nativePath == NULL) { as_file_throw(2037); return NULL; }
+  return NULL;
+}`);
+    // data: only a FileReference LOAD fills this, and File never loads -- measured
+    // null, and null without an exception even on a File with no path.
+    this.line('ByteArray* File_get_data(void* _this) { return (ByteArray*)((File*)_this)->_data; }');
+    // icon: an Icon whose bitmaps array is EMPTY. Extracting the artwork is
+    // LaunchServices' job and this build has no such integration, so the object is
+    // reported as unsupported ONCE on stderr rather than pretending to carry a
+    // thumbnail. (Measured on adl: a real file yields an Icon whose bitmapDatas a
+    // 51.4 app cannot even read -- `f.icon.bitmapDatas.length` threw #1069 there.)
+    this.cblock(`Icon* File_get_icon(void* _this) {
+  File* o = (File*)_this;
+  Icon* ic;
+  if (o->nativePath == NULL) { as_file_throw(2037); return NULL; }
+  ic = Icon_new();
+  ic->_bitmaps = as_array_new();
+  gc_write_barrier((void*)ic->_bitmaps);
+  as_shell_unsupported((char*)"flash.filesystem.File.icon (no icon extraction in this build)");
+  return ic;
+}`);
+    // downloaded / preventBackup: the quarantine flag and a stored bit (see
+    // as_file_downloaded and the _preventBackup field note in symbols.ts).
+    this.cblock(`bool File_get_downloaded(void* _this) {
+  File* o = (File*)_this;
+  if (o->nativePath == NULL) { as_file_throw(2037); return false; }
+  return as_file_downloaded(o->nativePath);
+}
+void File_set_downloaded(void* _this, bool value) {
+  File* o = (File*)_this;
+  if (o->nativePath == NULL) { as_file_throw(2037); return; }
+  as_file_set_downloaded(o->nativePath, value ? 1 : 0);
+}
+bool File_get_preventBackup(void* _this) { return ((File*)_this)->_preventBackup; }
+// Measured on adl 51.4.1 (temp/fileaudit2/af.txt): setting preventBackup = true and
+// reading it straight back answers FALSE, so AIR keeps no such flag here -- there is
+// no OS "exclude from backup" bit it could report. The setter therefore stores
+// nothing rather than inventing a state AIR does not have.
+void File_set_preventBackup(void* _this, bool value) { (void)_this; (void)value; }
+bool File_get_isPackage(void* _this) { return as_file_is_package(((File*)_this)->nativePath); }`);
+    // url setter: only the file/app/app-storage schemes are accepted, the value is
+    // percent-decoded and normalised, and everything else is #2004 -- measured on
+    // adl 51.4.1 (ac.txt): file:///tmp/a%20b.txt -> /tmp/a b.txt, app:/q.txt ->
+    // applicationDirectory/q.txt, while null, "" and http:// are all #2004.
+    this.cblock(`void File_set_url(void* _this, char* url) {
+  File* o = (File*)_this;
+  char* path;
+  if (url == NULL || url[0] == 0 || (strncmp(url, "file:", 5) != 0 && strncmp(url, "app:", 4) != 0 && strncmp(url, "app-storage:", 12) != 0)) {
+    as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004));
+    return;
+  }
+  path = as_local_path_from_url(url);
+  if (path == NULL || !as_path_is_abs(path)) {
+    as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004));
+    return;
+  }
+  o->nativePath = as_path_norm(path);
+  gc_write_barrier((void*)o->nativePath);
+}`);
+    // The File statics (the only three AIR declares: temp/fileaudit2/desc.txt).
+    this.line('File* File_createTempFile_static(void) { char* p = as_file_temp_path(0); if (p == NULL) { as_file_throw(2038); return NULL; } return File_new(p); }');
+    this.line('File* File_createTempDirectory_static(void) { char* p = as_file_temp_path(1); if (p == NULL) { as_file_throw(2038); return NULL; } return File_new(p); }');
+    this.cblock(`as_array* File_getRootDirectories_static(void) {
+  as_array* out = as_array_new();
+#ifdef _WIN32
+  DWORD mask = GetLogicalDrives();
+  for (int i = 0; i < 26; i++) {
+    if ((mask & (1u << i)) == 0) continue;
+    {
+      char root[4];
+      root[0] = (char)('A' + i);
+      root[1] = ':';
+      root[2] = '/';
+      root[3] = 0;
+      as_array_push(out, as_v_obj((void*)File_new(root)));
+    }
+  }
+#else
+  // Every POSIX host AIR supports reports exactly one root: "/" (measured on adl
+  // 51.4.1 for macOS). Mount points are not volumes to AIR either.
+  as_array_push(out, as_v_obj((void*)File_new((char*)"/")));
+#endif
+  return out;
+}`);
+    // ---- flash.net.FileReference ----------------------------------------------
+    // File's superclass. Measured on adl 51.4.1 (temp/fileaudit2/D.as + desc.txt):
+    // describeType reports it final although File extends it AND mxmlc compiles
+    // `class Mine extends FileReference` (fin.as), so our model keeps it open. A
+    // FileReference that has never browsed/loaded has no file: every accessor below
+    // then throws #2037, except `data`, which answers null.
+    this.cblock(`void FileReference_ctor(FileReference* o) {
+  EventDispatcher_ctor((EventDispatcher*)o, NULL);
+  o->_data = NULL;
+  o->_name = NULL;
+  o->_type = NULL;
+  o->_ext = NULL;
+  o->_creator = NULL;
+  o->_perm = NULL;
+  o->_size = 0.0;
+  o->_cdate = NULL;
+  o->_mdate = NULL;
+}
+FileReference* FileReference_new(void) {
+  FileReference* o = (FileReference*)gc_alloc(GCT_CLASS, sizeof(FileReference));
+  o->vtable = &FileReference_vt;
+  FileReference_ctor(o);
+  return o;
+}
+char* FileReference_get_name(void* _this) {
+  FileReference* o = (FileReference*)_this;
+  if (o->_name == NULL) { as_file_throw(2037); return NULL; }
+  return o->_name;
+}
+char* FileReference_get_type(void* _this) {
+  FileReference* o = (FileReference*)_this;
+  if (o->_type == NULL) { as_file_throw(2037); return NULL; }
+  return o->_type;
+}
+char* FileReference_get_extension(void* _this) {
+  FileReference* o = (FileReference*)_this;
+  if (o->_ext == NULL) { as_file_throw(2037); return NULL; }
+  return o->_ext;
+}
+char* FileReference_get_creator(void* _this) {
+  FileReference* o = (FileReference*)_this;
+  if (o->_creator == NULL) { as_file_throw(2037); return NULL; }
+  return o->_creator;
+}
+double FileReference_get_size(void* _this) {
+  FileReference* o = (FileReference*)_this;
+  if (o->_name == NULL) { as_file_throw(2037); return 0.0; }
+  return o->_size;
+}
+Date* FileReference_get_creationDate(void* _this) {
+  FileReference* o = (FileReference*)_this;
+  if (o->_cdate == NULL) { as_file_throw(2037); return NULL; }
+  return o->_cdate;
+}
+Date* FileReference_get_modificationDate(void* _this) {
+  FileReference* o = (FileReference*)_this;
+  if (o->_mdate == NULL) { as_file_throw(2037); return NULL; }
+  return o->_mdate;
+}
+ByteArray* FileReference_get_data(void* _this) { return (ByteArray*)((FileReference*)_this)->_data; }
+bool FileReference_browse(void* _this, as_array* typeFilter) {
+  (void)_this; (void)typeFilter;
+  as_shell_unsupported((char*)"flash.net.FileReference.browse (no native file dialog in this build)");
+  return false;
+}
+void FileReference_cancel(void* _this) { (void)_this; }`);
+    this.line('void FileReference_download(void* _this, URLRequest* request, char* defaultFileName) { (void)_this; (void)request; (void)defaultFileName; as_shell_unsupported((char*)"flash.net.FileReference.download (no HTTP download backend in this build)"); }');
+    this.line('void FileReference_load(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.net.FileReference.load (no native file dialog in this build)"); }');
+    this.line('void FileReference_requestPermission(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.net.FileReference.requestPermission (no native file dialog in this build)"); }');
+    this.line('void FileReference_save(void* _this, Object* data, char* defaultFileName) { (void)_this; (void)data; (void)defaultFileName; as_shell_unsupported((char*)"flash.net.FileReference.save (no native file dialog in this build)"); }');
+    this.line('void FileReference_upload(void* _this, URLRequest* request, char* uploadDataFieldName, bool testUpload) { (void)_this; (void)request; (void)uploadDataFieldName; (void)testUpload; as_shell_unsupported((char*)"flash.net.FileReference.upload (no HTTP upload backend in this build)"); }');
+    this.line('void FileReference_uploadUnencoded(void* _this, URLRequest* request) { (void)_this; (void)request; as_shell_unsupported((char*)"flash.net.FileReference.uploadUnencoded (no HTTP upload backend in this build)"); }');
+    // ---- flash.net.FileReferenceList -----------------------------------------
+    // Measured on adl 51.4.1 (temp/fileaudit2/AH.as): a fresh FileReferenceList has
+    // `fileList == null` (NOT an empty Array), `fileList` is read-only, there is no
+    // selectMultiple constant on this class (that one lives on FileListEvent), and
+    // browse() answers a Boolean. Only a real multi-select dialog would ever put
+    // something in fileList, and this build has no native dialog backend -- browse()
+    // reports that loudly and answers false rather than pretending a selection was
+    // cancelled.
+    this.cblock(`void FileReferenceList_ctor(FileReferenceList* o) {
+  EventDispatcher_ctor((EventDispatcher*)o, NULL);
+  o->_fileList = NULL;
+}
+FileReferenceList* FileReferenceList_new(void) {
+  FileReferenceList* o = (FileReferenceList*)gc_alloc(GCT_CLASS, sizeof(FileReferenceList));
+  o->vtable = &FileReferenceList_vt;
+  FileReferenceList_ctor(o);
+  return o;
+}
+as_array* FileReferenceList_get_fileList(void* _this) { return ((FileReferenceList*)_this)->_fileList; }
+bool FileReferenceList_browse(void* _this, as_array* typeFilter) {
+  (void)_this; (void)typeFilter;
+  as_shell_unsupported((char*)"flash.net.FileReferenceList.browse (no native file dialog in this build)");
+  return false;
+}`);
+    // ---- flash.filesystem.StorageVolume ---------------------------------------
+    // Constructed only by AIR itself (a volume-change event carries one); the
+    // constructor is public in the SDK and its six arguments are in the order
+    // measured with describeType (temp/fileaudit2/AB.as): rootDirectory, drive,
+    // isRemovable, isWritable, fileSystemType, name.
+    this.cblock(`void StorageVolume_ctor(StorageVolume* o, File* rootDirectory, char* name, bool isWritable, bool isRemovable, char* fileSystemType, char* drive) {
+  EventDispatcher_ctor((EventDispatcher*)o, NULL);
+  o->_rootDirectory = rootDirectory;
+  o->_drive = drive;
+  o->_removable = isRemovable;
+  o->_writable = isWritable;
+  o->_fsType = fileSystemType;
+  o->_name = name;
+  gc_write_barrier((void*)o->_rootDirectory);
+}
+StorageVolume* StorageVolume_new(File* rootDirectory, char* name, bool isWritable, bool isRemovable, char* fileSystemType, char* drive) {
+  StorageVolume* o = (StorageVolume*)gc_alloc(GCT_CLASS, sizeof(StorageVolume));
+  o->vtable = &StorageVolume_vt;
+  StorageVolume_ctor(o, rootDirectory, name, isWritable, isRemovable, fileSystemType, drive);
+  return o;
+}
+File* StorageVolume_get_rootDirectory(void* _this) { return ((StorageVolume*)_this)->_rootDirectory; }
+char* StorageVolume_get_drive(void* _this) { return ((StorageVolume*)_this)->_drive; }
+bool StorageVolume_get_isRemovable(void* _this) { return ((StorageVolume*)_this)->_removable; }
+bool StorageVolume_get_isWritable(void* _this) { return ((StorageVolume*)_this)->_writable; }
+char* StorageVolume_get_fileSystemType(void* _this) { return ((StorageVolume*)_this)->_fsType; }
+char* StorageVolume_get_name(void* _this) { return ((StorageVolume*)_this)->_name; }`);
+    // ---- flash.events.StorageVolumeChangeEvent --------------------------------
+    // The event a mount/unmount dispatch carries; both constant strings and the
+    // five-argument constructor order are measured (temp/fileaudit2/ab.txt).
+    this.cblock(`void StorageVolumeChangeEvent_ctor(StorageVolumeChangeEvent* o, char* type, bool bubbles, bool cancelable, File* rootDirectory, StorageVolume* storageVolume) {
+  Event_ctor((Event*)o, type, bubbles, cancelable);
+  o->_rootDirectory = rootDirectory;
+  o->_volume = storageVolume;
+  gc_write_barrier((void*)o->_rootDirectory);
+  gc_write_barrier((void*)o->_volume);
+}
+StorageVolumeChangeEvent* StorageVolumeChangeEvent_new(char* type, bool bubbles, bool cancelable, File* rootDirectory, StorageVolume* storageVolume) {
+  StorageVolumeChangeEvent* o = (StorageVolumeChangeEvent*)gc_alloc(GCT_CLASS, sizeof(StorageVolumeChangeEvent));
+  o->vtable = &StorageVolumeChangeEvent_vt;
+  StorageVolumeChangeEvent_ctor(o, type, bubbles, cancelable, rootDirectory, storageVolume);
+  return o;
+}
+Event* StorageVolumeChangeEvent_clone(void* _this) {
+  StorageVolumeChangeEvent* o = (StorageVolumeChangeEvent*)_this;
+  return (Event*)StorageVolumeChangeEvent_new(o->type, o->bubbles, o->cancelable, o->_rootDirectory, o->_volume);
+}
+File* StorageVolumeChangeEvent_get_rootDirectory(void* _this) { return ((StorageVolumeChangeEvent*)_this)->_rootDirectory; }
+StorageVolume* StorageVolumeChangeEvent_get_storageVolume(void* _this) { return ((StorageVolumeChangeEvent*)_this)->_volume; }`);
+    // ---- flash.net.FileFilter --------------------------------------------------
+    // Three public read-write String values and a three-argument constructor; AIR
+    // has NO clone() (mxmlc rejects it) and no winType/name member, both of which
+    // the old shell invented.
+    this.cblock(`void FileFilter_ctor(FileFilter* o, char* description, char* extension, char* macType) {
+  o->description = description;
+  o->extension = extension;
+  o->macType = macType;
+  gc_write_barrier((void*)o->description);
+}
+FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
+  FileFilter* o = (FileFilter*)gc_alloc(GCT_CLASS, sizeof(FileFilter));
+  o->vtable = &FileFilter_vt;
+  FileFilter_ctor(o, description, extension, macType);
+  return o;
+}`);
+
     this.line('// as_volume_root: the mount point that owns `path`. POSIX has no portable');
     this.line('// "which mount is this" call, so walk up while st_dev stays the same; the last');
     this.line('// directory that still shares the path\'s device is the volume root.');
@@ -17470,25 +18209,24 @@ static void as_file_throw(int err) {
     //   success ..................... the receiver's nativePath is NOT rewritten --
     //                          it still denotes the OLD location (measured twice),
     //                          exactly like moveToTrash
-    this.line('void File_moveTo(void* _this, File* target, bool overwrite) {');
+    this.line('void File_moveTo(void* _this, FileReference* newFile, bool overwrite) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
-    this.line('if (target == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter destination must be non-null.", 2007)); return; }');
-    this.line('if (o->nativePath == NULL || target->nativePath == NULL) { as_file_throw(2037); return; }');
-    this.line('if (!as_path_exists_l(o->nativePath)) { as_file_throw(3003); return; }');
-    this.line('if (as_path_exists_l(target->nativePath)) {');
+    this.line('int nullArg = 0;');
+    this.line('int err = as_file_transfer_err(o, newFile, overwrite ? 1 : 0, &nullArg);');
+    this.line('if (nullArg) { as_file_null_dest(); return; }');
+    this.line('if (err == 3014) { as_file_throw_contained(); return; }');
+    this.line('if (err != 0) { as_file_throw(err); return; }');
+    // A cross-volume move makes rename() fail (EXDEV). AIR copies and then deletes,
+    // and so does this: as_file_copy_any moves the whole tree, then the source goes.
+    this.line('if (rename(o->nativePath, as_file_path_of((void*)newFile)) != 0) {');
     this.indent++;
-    this.line('if (!overwrite) { as_file_throw(3012); return; }');
-    this.line('int rm = as_remove_any(target->nativePath);');
-    this.line('if (rm != 0) { as_file_throw(rm); return; }');
+    this.line('const char* dst = as_file_path_of((void*)newFile);');
+    this.line('err = as_file_copy_any(o->nativePath, dst);');
+    this.line('if (err == 0) err = as_remove_any(o->nativePath);');
+    this.line('if (err != 0) { as_file_throw(err); return; }');
     this.indent--;
     this.line('}');
-    this.line('char* parent = as_path_dirname(target->nativePath);');
-    this.line('if (parent != NULL && parent[0] != \'\\0\' && !as_path_is_dir(parent)) as_mkdirs(parent);');
-    // A cross-volume move makes rename() fail (EXDEV). AIR copies instead; this
-    // build has no tree-copy yet, so it REPORTS rather than leaving the caller to
-    // believe a move happened (registered in TODO.md).
-    this.line('if (rename(o->nativePath, target->nativePath) != 0) { as_shell_unsupported("File.moveTo could not rename (a cross-volume move is not implemented)"); return; }');
     this.indent--;
     this.line('}');
     // The async half of the File API. `getDirectoryListingAsync` is the one member
@@ -17549,7 +18287,7 @@ static void as_file_throw(int err) {
     // ('directory') that AIR's class does not have -- that over-declaration is a
     // registered divergence, so the receiver is passed there and 'files' keeps its
     // AIR position.
-    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)FileListEvent_new((char*)"directoryListing", false, false, o, files));');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)FileListEvent_new((char*)"directoryListing", false, false, files));');
     this.indent--;
     this.line('}');
     this.line('void File_getDirectoryListingAsync(void* _this) {');
@@ -17604,6 +18342,8 @@ static void as_file_throw(int err) {
     // depends on one is visibly stalled rather than mysteriously empty.
     this.line('void File_browseForDirectory(void* _this, char* title) { (void)_this; (void)title; as_shell_unsupported((char*)"flash.filesystem.File.browseForDirectory"); }');
     this.line('void File_browseForOpen(void* _this, char* title, as_array* typeFilter) { (void)_this; (void)title; (void)typeFilter; as_shell_unsupported((char*)"flash.filesystem.File.browseForOpen"); }');
+    this.line('void File_browseForOpenMultiple(void* _this, char* title, as_array* typeFilter) { (void)_this; (void)title; (void)typeFilter; as_shell_unsupported((char*)"flash.filesystem.File.browseForOpenMultiple"); }');
+    this.line('void File_browseForSave(void* _this, char* title) { (void)_this; (void)title; as_shell_unsupported((char*)"flash.filesystem.File.browseForSave"); }');
     this.line('void File_openWithDefaultApplication(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.filesystem.File.openWithDefaultApplication"); }');
     // File.upload(request, fieldName, testUpload): POST the file's contents as
     // multipart/form-data. There is no HTTP request backend in this build, so the
@@ -17668,116 +18408,470 @@ static void as_file_throw(int err) {
     this.indent--;
     this.line('}');
     this.line('');
-    // FileStream: a FILE* handle + open/close/read/write. AIR FileMode strings are
-    // mapped to C fopen modes.
-    this.line('void FileStream_ctor(FileStream* o) { EventDispatcher_ctor((EventDispatcher*)o, NULL); o->_handle = NULL; }');
+// ---- FileStream: IDataInput / IDataOutput over a stdio FILE* --------------
+    //
+    // AIR's FileStream implements both interfaces, and 51.4 declares the full set
+    // (23 read/write members plus endian/objectEncoding/readAhead/position -- see
+    // temp/fileaudit2/desc.txt). Every error below was measured on adl 51.4.1
+    // (temp/fileaudit2/t/u/x/y/z.txt):
+    //
+    //   * anything on an UNOPENED stream, or on the wrong side of one, is #2029
+    //     ("This URLStream object does not have a stream opened.") -- bytesAvailable
+    //     on a WRITE handle included. close() alone is a no-op.
+    //   * a read that runs past EOF is EOFError #2030, never a short read
+    //     (an over-long readUTFBytes included).
+    //   * position is settable on READ/WRITE/UPDATE (past EOF is allowed), a
+    //     negative value is ArgumentError #2006, and APPEND refuses the set with
+    //     #2037.
+    //   * truncate() needs a writable side; in READ it is #2029.
+    //   * open(f, null) behaves as READ, open(f, "") is #2004, and opening a
+    //     DIRECTORY is #3006 "Not a file.".
+    //   * openAsync in WRITE truncates at once, completes at position 0, and fires
+    //     NO event at all for WRITE/APPEND -- only READ/UPDATE report progress and
+    //     complete.
+    //
+    // The mode class in _mode is what makes the side checks possible: 0 none,
+    // 1 read, 2 write, 3 append, 4 update.
+    // as_host_little() is defined further down with the ByteArray codec, so the
+    // prototype comes first rather than duplicating the probe.
+    this.line('static int as_host_little(void);');
+    this.cblock(`static void as_fs_no_stream(void) {
+  as_throw(Error_new((char*)"Error #2029: This URLStream object does not have a stream opened.", 2029));
+}
+static int as_fs_readable(FileStream* o) { return o->_handle != NULL && (o->_mode == 1 || o->_mode == 4); }
+static int as_fs_writable(FileStream* o) { return o->_handle != NULL && (o->_mode == 2 || o->_mode == 3 || o->_mode == 4); }
+static int as_fs_mode_class(const char* m) {
+  if (m == NULL) return 1;
+  if (m[0] == 0) return 0;
+  if (strcmp(m, "read") == 0) return 1;
+  if (strcmp(m, "write") == 0) return 2;
+  if (strcmp(m, "append") == 0) return 3;
+  if (strcmp(m, "update") == 0) return 4;
+  return 0;
+}
+static int as_fs_open_err(const char* path, int mc) {
+  if (path == NULL) return 2037;
+  if (mc == 0) return 2004;
+  // WRITE and APPEND create the file, so only the two modes that need existing
+  // content raise #3003.
+  if ((mc == 1 || mc == 4) && !as_path_exists_l(path)) return 3003;
+  if (as_path_is_dir(path)) return 3006;
+  return 0;
+}
+// Adopt an already-decided mode on the handle: the one place fopen() happens, so
+// the sync open and the async finish thunk cannot drift apart.
+static int as_fs_begin(FileStream* o, const char* path, int mc) {
+  const char* cm;
+  FILE* f;
+  o->_handle = NULL;
+  o->_mode = 0;
+  if (mc == 1) cm = "rb";
+  else if (mc == 2) cm = "wb";
+  else if (mc == 3) cm = "ab";
+  else cm = "r+b";
+  f = fopen(path, cm);
+  if (f == NULL) return 2038;
+  // Unbuffered writes: AIR's FileStream makes each writeUTFBytes observable in the
+  // file right away (the adl-vs-AOT probes read the log while the app is still
+  // running), while stdio would hold the bytes in a 4 KB buffer until fclose.
+  setvbuf(f, NULL, _IONBF, 0);
+  o->_handle = (void*)f;
+  o->_mode = mc;
+  return 0;
+}
+static int as_fs_le(FileStream* o) { return o->_endian != NULL && strcmp(o->_endian, "littleEndian") == 0; }
+static int as_fs_read_raw(FileStream* o, unsigned char* buf, size_t n) {
+  if (!as_fs_readable(o)) { as_fs_no_stream(); return 0; }
+  if (n > 0 && fread(buf, 1, n, (FILE*)o->_handle) != n) { as_throw_eof(); return 0; }
+  return 1;
+}
+// A multi-byte read: pull the bytes, then normalise them to host order so the
+// caller can memcpy the value out. Doing it this way (rather than assembling the
+// word by hand) keeps float/double exact on either host byte order.
+static int as_fs_read_bits(FileStream* o, unsigned char* buf, size_t n) {
+  if (!as_fs_read_raw(o, buf, n)) return 0;
+  if ((as_fs_le(o) != 0) != (as_host_little() != 0)) {
+    size_t i;
+    for (i = 0; i < n / 2; i++) { unsigned char t = buf[i]; buf[i] = buf[n - 1 - i]; buf[n - 1 - i] = t; }
+  }
+  return 1;
+}
+// Bytes exactly as the caller built them (as_fs_w16/as_fs_w32 already chose the
+// AS3 order, so nothing is reordered here).
+static void as_fs_write_raw(FileStream* o, const unsigned char* buf, size_t n) {
+  if (!as_fs_writable(o)) { as_fs_no_stream(); return; }
+  if (n > 0) fwrite(buf, 1, n, (FILE*)o->_handle);
+}
+// A HOST-order value (float/double): flip only when the stream's endianness and the
+// machine's disagree, which is exactly what as_fs_read_bits undoes on the way in.
+static void as_fs_write_host_bits(FileStream* o, const unsigned char* buf, size_t n) {
+  unsigned char tmp[8];
+  memcpy(tmp, buf, n);
+  if ((as_fs_le(o) != 0) != (as_host_little() != 0)) {
+    size_t i;
+    for (i = 0; i < n / 2; i++) { unsigned char t = tmp[i]; tmp[i] = tmp[n - 1 - i]; tmp[n - 1 - i] = t; }
+  }
+  as_fs_write_raw(o, tmp, n);
+}
+static unsigned as_fs_u16(FileStream* o, const unsigned char* b) {
+  return as_fs_le(o) ? ((unsigned)b[0] | ((unsigned)b[1] << 8)) : (((unsigned)b[0] << 8) | (unsigned)b[1]);
+}
+static unsigned as_fs_u32(FileStream* o, const unsigned char* b) {
+  if (as_fs_le(o)) return (unsigned)b[0] | ((unsigned)b[1] << 8) | ((unsigned)b[2] << 16) | ((unsigned)b[3] << 24);
+  return ((unsigned)b[0] << 24) | ((unsigned)b[1] << 16) | ((unsigned)b[2] << 8) | (unsigned)b[3];
+}
+static void as_fs_w16(FileStream* o, unsigned v) {
+  unsigned char b[2];
+  if (as_fs_le(o)) { b[0] = (unsigned char)(v & 0xFF); b[1] = (unsigned char)((v >> 8) & 0xFF); }
+  else { b[0] = (unsigned char)((v >> 8) & 0xFF); b[1] = (unsigned char)(v & 0xFF); }
+  as_fs_write_raw(o, b, 2);
+}
+static void as_fs_w32(FileStream* o, unsigned v) {
+  unsigned char b[4];
+  if (as_fs_le(o)) { b[0] = (unsigned char)(v & 0xFF); b[1] = (unsigned char)((v >> 8) & 0xFF); b[2] = (unsigned char)((v >> 16) & 0xFF); b[3] = (unsigned char)((v >> 24) & 0xFF); }
+  else { b[0] = (unsigned char)((v >> 24) & 0xFF); b[1] = (unsigned char)((v >> 16) & 0xFF); b[2] = (unsigned char)((v >> 8) & 0xFF); b[3] = (unsigned char)(v & 0xFF); }
+  as_fs_write_raw(o, b, 4);
+}
+// Bytes still ahead of the position, or 0 when the handle is not readable -- the
+// callers have already reported #2029 in that case.
+static long as_fs_avail(FileStream* o) {
+  long cur, end;
+  if (o->_handle == NULL) return 0;
+  cur = ftell((FILE*)o->_handle);
+  if (cur < 0) cur = 0;
+  fseek((FILE*)o->_handle, 0, SEEK_END);
+  end = ftell((FILE*)o->_handle);
+  fseek((FILE*)o->_handle, cur, SEEK_SET);
+  return (end > cur) ? (end - cur) : 0;
+}`);
+    this.cblock(`void FileStream_ctor(FileStream* o) {
+  EventDispatcher_ctor((EventDispatcher*)o, NULL);
+  o->_handle = NULL;
+  o->_mode = 0;
+  // Measured defaults on adl 51.4.1: endian "bigEndian", objectEncoding 3,
+  // readAhead Infinity.
+  o->_endian = (char*)"bigEndian";
+  o->_enc = 3u;
+  o->_ra = INFINITY;
+}`);
     this.line('FileStream* FileStream_new(void) { FileStream* o = (FileStream*)gc_alloc(GCT_CLASS, sizeof(FileStream)); o->vtable = &FileStream_vt; FileStream_ctor(o); return o; }');
-    this.line('void FileStream_open(void* _this, File* file, char* fileMode) {');
-    this.indent++;
-    this.line('FileStream* o = (FileStream*)_this;');
-    this.line('if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; }');
-    this.line('if (file == NULL || file->nativePath == NULL) return;');
-    this.line('const char* mode = "rb";');
-    this.line('if (fileMode != NULL) {');
-    this.indent++;
-    this.line('if (strcmp(fileMode, "write") == 0) mode = "wb";');
-    this.line('else if (strcmp(fileMode, "append") == 0) mode = "ab";');
-    this.line('else if (strcmp(fileMode, "update") == 0) mode = "r+b";');
-    this.indent--;
-    this.line('}');
-    this.line('o->_handle = (void*)fopen(file->nativePath, mode);');
-    // Unbuffered writes: AIR's FileStream makes each writeUTFBytes observable in
-    // the file right away (the adl-vs-AOT probes read the log while the app is
-    // still running), while stdio would hold the bytes in a 4 KB buffer until
-    // fclose. Measured: an adl probe writing a log in /tmp is readable mid-run;
-    // the same source under as-aot left a 0-byte file until exit.
-    this.line('if (o->_handle != NULL) setvbuf((FILE*)o->_handle, NULL, _IONBF, 0);');
-    this.indent--;
-    this.line('}');
+    this.cblock(`void FileStream_open(void* _this, File* file, char* fileMode) {
+  FileStream* o = (FileStream*)_this;
+  int mc;
+  int err;
+  // AIR closes an already-open file before opening the new one.
+  if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; o->_mode = 0; }
+  if (file == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter file must be non-null.", 2007)); return; }
+  mc = as_fs_mode_class(fileMode);
+  err = as_fs_open_err(file->nativePath, mc);
+  if (err == 2004) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }
+  if (err != 0) { as_file_throw(err); return; }
+  err = as_fs_begin(o, file->nativePath, mc);
+  if (err != 0) as_file_throw(err);
+}`);
     // Completion thunk for openAsync, run on the AS3 thread inside a frame
-    // boundary: adopt the opened handle, then report the byte count via a
-    // ProgressEvent.PROGRESS followed by Event.COMPLETE (AIR reads the file into
-    // an input buffer asynchronously and fires both before the data is consumed).
-    // The handle is published here and not in openAsync(), so a read attempted
-    // before COMPLETE sees no bytes available - which is what AIR's unbuffered
-    // stream does too.
-    this.line('static void FileStream__openFinish(void* job) {');
-    this.indent++;
-    this.line('FileStream* o = (FileStream*)as_job_obj(job);');
-    this.line('if (as_job_failed(job)) { EventDispatcher_dispatchEvent((void*)o, (Event*)IOErrorEvent_new((char*)"ioError", false, false, (char*)"FileStream open failed")); return; }');
-    this.line('unsigned total = as_job_total(job);');
-    this.line('o->_handle = as_job_take_handle(job);');
-    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ProgressEvent_new((char*)"progress", false, false, total, total));');
-    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
-    this.indent--;
-    this.line('}');
-    this.line('void FileStream_openAsync(void* _this, File* file, char* fileMode) {');
-    this.indent++;
-    this.line('FileStream* o = (FileStream*)_this;');
-    // AIR closes an already-open file before opening the new one, and delivers no
-    // further events for it.
-    this.line('if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; }');
-    this.line('as_async_submit(AS_JOB_FS_OPEN, (void*)o, FileStream__openFinish, (file != NULL) ? file->nativePath : NULL, fileMode, 0);');
-    this.indent--;
-    this.line('}');
-    this.line('void FileStream_close(void* _this) { FileStream* o = (FileStream*)_this; if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; } }');
-    this.line('char* FileStream_readUTFBytes(void* _this, unsigned length) {');
-    this.indent++;
-    this.line('FileStream* o = (FileStream*)_this;');
-    this.line('FILE* f = (FILE*)o->_handle;');
-    this.line('if (f == NULL) return NULL;');
-    this.line('char* buf = as_str_alloc((size_t)length + 1);');
-    this.line('size_t n = fread(buf, 1, (size_t)length, f);');
-    this.line('buf[n] = \'\\0\';');
-    this.line('return buf;');
-    this.indent--;
-    this.line('}');
-    this.line('void FileStream_writeUTFBytes(void* _this, char* value) {');
-    this.indent++;
-    this.line('FileStream* o = (FileStream*)_this;');
-    this.line('FILE* f = (FILE*)o->_handle;');
-    this.line('if (f != NULL && value != NULL) fwrite(value, 1, strlen(value), f);');
-    this.indent--;
-    this.line('}');
-    this.line('unsigned FileStream_get_position(void* _this) { FileStream* o = (FileStream*)_this; FILE* f = (FILE*)o->_handle; return (f == NULL) ? 0u : (unsigned)ftell(f); }');
-    this.line('unsigned FileStream_get_bytesAvailable(void* _this) {');
-    this.indent++;
-    this.line('FileStream* o = (FileStream*)_this;');
-    this.line('FILE* f = (FILE*)o->_handle;');
-    this.line('if (f == NULL) return 0u;');
-    this.line('long cur = ftell(f);');
-    this.line('fseek(f, 0, SEEK_END);');
-    this.line('long end = ftell(f);');
-    this.line('fseek(f, cur, SEEK_SET);');
-    this.line('return (unsigned)(end - cur);');
-    this.indent--;
-    this.line('}');
-    this.line('void FileStream_readBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {');
-    this.indent++;
-    this.line('FileStream* o = (FileStream*)_this;');
-    this.line('FILE* f = (FILE*)o->_handle;');
-    this.line('if (f == NULL || bytes == NULL) return;');
-    this.line('if (length == 0) {');
-    this.indent++;
-    this.line('long cur = ftell(f); fseek(f, 0, SEEK_END); long end = ftell(f); fseek(f, cur, SEEK_SET);');
-    this.line('length = (unsigned)(end - cur);');
-    this.indent--;
-    this.line('}');
-    this.line('as_ba_grow(bytes, (int)(offset + length));');
-    this.line('size_t n = fread((unsigned char*)bytes->data + offset, 1, (size_t)length, f);');
-    this.line('if ((int)(offset + n) > bytes->length) bytes->length = (int)(offset + n);');
-    this.indent--;
-    this.line('}');
-    this.line('void FileStream_writeBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {');
-    this.indent++;
-    this.line('FileStream* o = (FileStream*)_this;');
-    this.line('FILE* f = (FILE*)o->_handle;');
-    this.line('if (f == NULL || bytes == NULL) return;');
-    this.line('if (length == 0) length = (unsigned)(bytes->length - (int)offset);');
-    this.line('if ((int)(offset + length) > bytes->length) length = (unsigned)(bytes->length - (int)offset);');
-    this.line('if (length > 0) fwrite((unsigned char*)bytes->data + offset, 1, (size_t)length, f);');
-    this.indent--;
-    this.line('}');
+    // boundary: adopt the opened handle and report. The handle is published HERE
+    // and not in openAsync(), so a read attempted before COMPLETE sees no bytes
+    // available -- which is what AIR's unbuffered stream does too. A failure is an
+    // ioError carrying the SAME id and sentence the sync open throws (measured:
+    // #3006 for a directory, #3003 for a missing path).
+    this.cblock(`static void FileStream__openFinish(void* job) {
+  FileStream* o = (FileStream*)as_job_obj(job);
+  const char* path = as_job_path(job);
+  int mc = as_fs_mode_class(as_job_mode(job));
+  if (as_job_failed(job)) {
+    int err = as_fs_open_err(path, mc);
+    size_t n;
+    char* msg;
+    IOErrorEvent* ev;
+    if (err == 0 || err == 2037) err = 2038;
+    n = strlen(as_file_err_text(err)) + strlen(path) + 10;
+    msg = as_str_alloc(n);
+    snprintf(msg, n, "%s file: %s", as_file_err_text(err), path);
+    ev = IOErrorEvent_new((char*)"ioError", false, false, msg);
+    ev->errorID = err;
+    EventDispatcher_dispatchEvent((void*)o, (Event*)ev);
+    return;
+  }
+  {
+    unsigned total = as_job_total(job);
+    o->_handle = as_job_take_handle(job);
+    o->_mode = mc;
+    if (o->_handle != NULL) setvbuf((FILE*)o->_handle, NULL, _IONBF, 0);
+    // Measured: WRITE and APPEND dispatch NOTHING; READ reports progress then
+    // complete, UPDATE completes.
+    if (mc == 1) {
+      EventDispatcher_dispatchEvent((void*)o, (Event*)ProgressEvent_new((char*)"progress", false, false, (double)total, (double)total));
+    }
+    if (mc == 1 || mc == 4) EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false));
+  }
+}`);
+    this.cblock(`void FileStream_openAsync(void* _this, File* file, char* fileMode) {
+  FileStream* o = (FileStream*)_this;
+  int mc;
+  if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; o->_mode = 0; }
+  if (file == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter file must be non-null.", 2007)); return; }
+  mc = as_fs_mode_class(fileMode);
+  if (mc == 0) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }
+  if (file->nativePath == NULL) { as_file_throw(2037); return; }
+  as_async_submit(AS_JOB_FS_OPEN, (void*)o, FileStream__openFinish, file->nativePath, fileMode, 0);
+}`);
+    this.line('void FileStream_close(void* _this) { FileStream* o = (FileStream*)_this; if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; } o->_mode = 0; }');
+    // truncate(): cut the file at the current position (measured: #2029 on a
+    // read-only handle).
+    this.cblock(`void FileStream_truncate(void* _this) {
+  FileStream* o = (FileStream*)_this;
+  long pos;
+  if (!as_fs_writable(o)) { as_fs_no_stream(); return; }
+  pos = ftell((FILE*)o->_handle);
+  if (pos < 0) pos = 0;
+  fflush((FILE*)o->_handle);
+#ifdef _WIN32
+  _chsize_s(_fileno((FILE*)o->_handle), pos);
+#else
+  ftruncate(fileno((FILE*)o->_handle), (off_t)pos);
+#endif
+}`);
+    this.cblock(`double FileStream_get_position(void* _this) {
+  FileStream* o = (FileStream*)_this;
+  long p;
+  if (o->_handle == NULL) { as_fs_no_stream(); return 0.0; }
+  p = ftell((FILE*)o->_handle);
+  return (p < 0) ? 0.0 : (double)p;
+}
+void FileStream_set_position(void* _this, double value) {
+  FileStream* o = (FileStream*)_this;
+  if (o->_handle == NULL) { as_fs_no_stream(); return; }
+  if (o->_mode == 3) { as_file_throw(2037); return; }
+  if (value < 0.0 || !(value == value)) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return; }
+  fseek((FILE*)o->_handle, (long)value, SEEK_SET);
+}
+unsigned FileStream_get_bytesAvailable(void* _this) {
+  FileStream* o = (FileStream*)_this;
+  long n;
+  if (!as_fs_readable(o)) { as_fs_no_stream(); return 0u; }
+  n = as_fs_avail(o);
+  return (n > 0) ? (unsigned)n : 0u;
+}
+char* FileStream_get_endian(void* _this) { return ((FileStream*)_this)->_endian; }
+void FileStream_set_endian(void* _this, char* value) {
+  FileStream* o = (FileStream*)_this;
+  if (value == NULL || (strcmp(value, "bigEndian") != 0 && strcmp(value, "littleEndian") != 0)) {
+    as_throw(ArgumentError_new((char*)"Error #2008: Parameter endian must be one of the accepted values.", 2008));
+    return;
+  }
+  o->_endian = value;
+  gc_write_barrier((void*)o->_endian);
+}
+unsigned FileStream_get_objectEncoding(void* _this) { return ((FileStream*)_this)->_enc; }
+void FileStream_set_objectEncoding(void* _this, unsigned value) {
+  FileStream* o = (FileStream*)_this;
+  if (value != 0u && value != 3u) {
+    as_throw(ArgumentError_new((char*)"Error #2008: Parameter objectEncoding must be one of the accepted values.", 2008));
+    return;
+  }
+  o->_enc = value;
+}
+double FileStream_get_readAhead(void* _this) { return ((FileStream*)_this)->_ra; }
+void FileStream_set_readAhead(void* _this, double value) { ((FileStream*)_this)->_ra = value; }`);
+    this.cblock(`int FileStream_readByte(void* _this) {
+  unsigned char b;
+  if (!as_fs_read_raw((FileStream*)_this, &b, 1)) return 0;
+  return (int)(signed char)b;
+}
+unsigned FileStream_readUnsignedByte(void* _this) {
+  unsigned char b;
+  if (!as_fs_read_raw((FileStream*)_this, &b, 1)) return 0u;
+  return (unsigned)b;
+}
+int FileStream_readShort(void* _this) {
+  unsigned char b[2];
+  FileStream* o = (FileStream*)_this;
+  if (!as_fs_read_raw(o, b, 2)) return 0;
+  return (int)(short)as_fs_u16(o, b);
+}
+unsigned FileStream_readUnsignedShort(void* _this) {
+  unsigned char b[2];
+  FileStream* o = (FileStream*)_this;
+  if (!as_fs_read_raw(o, b, 2)) return 0u;
+  return as_fs_u16(o, b);
+}
+int FileStream_readInt(void* _this) {
+  unsigned char b[4];
+  FileStream* o = (FileStream*)_this;
+  if (!as_fs_read_raw(o, b, 4)) return 0;
+  return (int)as_fs_u32(o, b);
+}
+unsigned FileStream_readUnsignedInt(void* _this) {
+  unsigned char b[4];
+  FileStream* o = (FileStream*)_this;
+  if (!as_fs_read_raw(o, b, 4)) return 0u;
+  return as_fs_u32(o, b);
+}
+double FileStream_readFloat(void* _this) {
+  unsigned char b[4];
+  float f;
+  if (!as_fs_read_bits((FileStream*)_this, b, 4)) return 0.0;
+  memcpy(&f, b, 4);
+  return (double)f;
+}
+double FileStream_readDouble(void* _this) {
+  unsigned char b[8];
+  double d;
+  if (!as_fs_read_bits((FileStream*)_this, b, 8)) return 0.0;
+  memcpy(&d, b, 8);
+  return d;
+}
+bool FileStream_readBoolean(void* _this) {
+  unsigned char b;
+  if (!as_fs_read_raw((FileStream*)_this, &b, 1)) return false;
+  return b != 0;
+}
+char* FileStream_readUTFBytes(void* _this, unsigned length) {
+  FileStream* o = (FileStream*)_this;
+  char* r;
+  if (length == 0) return as_str_empty();
+  if (!as_fs_readable(o)) { as_fs_no_stream(); return (char*)""; }
+  r = (char*)as_str_alloc((size_t)length + 1);
+  if (fread(r, 1, (size_t)length, (FILE*)o->_handle) != (size_t)length) { as_throw_eof(); return (char*)""; }
+  r[length] = 0;
+  return r;
+}
+char* FileStream_readUTF(void* _this) {
+  unsigned char b[2];
+  FileStream* o = (FileStream*)_this;
+  unsigned n;
+  char* r;
+  if (!as_fs_read_raw(o, b, 2)) return (char*)"";
+  n = as_fs_u16(o, b);
+  if (n == 0) return as_str_empty();
+  r = (char*)as_str_alloc((size_t)n + 1);
+  if (fread(r, 1, (size_t)n, (FILE*)o->_handle) != (size_t)n) { as_throw_eof(); return (char*)""; }
+  r[n] = 0;
+  return r;
+}
+char* FileStream_readMultiByte(void* _this, unsigned length, char* charSet) {
+  FileStream* o = (FileStream*)_this;
+  unsigned char* buf;
+  char* r;
+  if (length == 0) return as_str_empty();
+  if (!as_fs_readable(o)) { as_fs_no_stream(); return (char*)""; }
+  buf = (unsigned char*)malloc((size_t)length);
+  if (buf == NULL) { as_throw_eof(); return (char*)""; }
+  if (fread(buf, 1, (size_t)length, (FILE*)o->_handle) != (size_t)length) { free(buf); as_throw_eof(); return (char*)""; }
+  r = as_multibyte_decode(buf, length, charSet);
+  free(buf);
+  return r;
+}`);
+    this.cblock(`void FileStream_writeByte(void* _this, int v) {
+  unsigned char b = (unsigned char)(v & 0xFF);
+  as_fs_write_raw((FileStream*)_this, &b, 1);
+}
+void FileStream_writeShort(void* _this, int v) { as_fs_w16((FileStream*)_this, (unsigned)(v & 0xFFFF)); }
+void FileStream_writeInt(void* _this, int v) { as_fs_w32((FileStream*)_this, (unsigned)v); }
+void FileStream_writeUnsignedInt(void* _this, unsigned v) { as_fs_w32((FileStream*)_this, v); }
+void FileStream_writeFloat(void* _this, double v) {
+  unsigned char b[4];
+  float f = (float)v;
+  memcpy(b, &f, 4);
+  as_fs_write_host_bits((FileStream*)_this, b, 4);
+}
+void FileStream_writeDouble(void* _this, double v) {
+  unsigned char b[8];
+  memcpy(b, &v, 8);
+  as_fs_write_host_bits((FileStream*)_this, b, 8);
+}
+void FileStream_writeBoolean(void* _this, bool v) {
+  unsigned char b = v ? 1 : 0;
+  as_fs_write_raw((FileStream*)_this, &b, 1);
+}
+void FileStream_writeUTFBytes(void* _this, char* value) {
+  FileStream* o = (FileStream*)_this;
+  if (!as_fs_writable(o)) { as_fs_no_stream(); return; }
+  if (value != NULL) fwrite(value, 1, strlen(value), (FILE*)o->_handle);
+}
+void FileStream_writeUTF(void* _this, char* value) {
+  FileStream* o = (FileStream*)_this;
+  size_t n;
+  if (!as_fs_writable(o)) { as_fs_no_stream(); return; }
+  if (value == NULL) value = (char*)"";
+  n = strlen(value);
+  if (n > 65535) n = 65535;
+  as_fs_w16(o, (unsigned)n);
+  if (n > 0) fwrite(value, 1, n, (FILE*)o->_handle);
+}
+void FileStream_writeMultiByte(void* _this, char* value, char* charSet) {
+  FileStream* o = (FileStream*)_this;
+  unsigned n = 0;
+  unsigned char* b;
+  if (!as_fs_writable(o)) { as_fs_no_stream(); return; }
+  b = as_multibyte_encode(value, charSet, &n);
+  if (n > 0 && b != NULL) fwrite(b, 1, (size_t)n, (FILE*)o->_handle);
+  free(b);
+}`);
+    this.cblock(`void FileStream_readBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {
+  FileStream* o = (FileStream*)_this;
+  unsigned want;
+  if (bytes == NULL) return;
+  if (!as_fs_readable(o)) { as_fs_no_stream(); return; }
+  if (length == 0) {
+    long avail = as_fs_avail(o);
+    length = (avail > 0) ? (unsigned)avail : 0u;
+  }
+  as_ba_grow(bytes, (int)(offset + length));
+  want = length;
+  if (want > 0 && fread((unsigned char*)bytes->data + offset, 1, (size_t)want, (FILE*)o->_handle) != (size_t)want) {
+    as_throw_eof();
+    return;
+  }
+  if ((int)(offset + want) > bytes->length) bytes->length = (int)(offset + want);
+}
+void FileStream_writeBytes(void* _this, ByteArray* bytes, unsigned offset, unsigned length) {
+  FileStream* o = (FileStream*)_this;
+  if (bytes == NULL) return;
+  if (!as_fs_writable(o)) { as_fs_no_stream(); return; }
+  if (length == 0) length = (unsigned)(bytes->length - (int)offset);
+  if ((int)(offset + length) > bytes->length) length = (unsigned)(bytes->length - (int)offset);
+  if (length > 0) fwrite((unsigned char*)bytes->data + offset, 1, (size_t)length, (FILE*)o->_handle);
+}
+as_value FileStream_readObject(void* _this) {
+  FileStream* o = (FileStream*)_this;
+  static const unsigned char as_fs_empty[1] = { 0 };
+  long avail;
+  unsigned char* buf;
+  size_t used = 0;
+  as_amf_err err;
+  as_value v;
+  if (!as_fs_readable(o)) { as_fs_no_stream(); return as_v_null(); }
+  avail = as_fs_avail(o);
+  if (avail <= 0) { as_throw_eof(); return as_v_null(); }
+  buf = (unsigned char*)malloc((size_t)avail);
+  if (buf == NULL) { as_throw_eof(); return as_v_null(); }
+  if (fread(buf, 1, (size_t)avail, (FILE*)o->_handle) != (size_t)avail) { free(buf); as_throw_eof(); return as_v_null(); }
+  err.code = 0;
+  err.detail = 0;
+  v = as_amf_read_object(buf, (size_t)avail, &used, (int)o->_enc, &err);
+  free(buf);
+  // readObject consumes exactly the bytes the value occupied, so the stream is
+  // repositioned rather than left at EOF.
+  fseek((FILE*)o->_handle, -(long)(avail - (long)used), SEEK_CUR);
+  if (err.code != 0) as_amf_throw_err(&err);
+  (void)as_fs_empty;
+  return v;
+}
+void FileStream_writeObject(void* _this, as_value v) {
+  FileStream* o = (FileStream*)_this;
+  size_t n = 0;
+  as_amf_err err;
+  unsigned char* b;
+  if (!as_fs_writable(o)) { as_fs_no_stream(); return; }
+  err.code = 0;
+  err.detail = 0;
+  b = as_amf_write_object(v, (int)o->_enc, &n, &err);
+  if (err.code != 0) { free(b); as_amf_throw_err(&err); return; }
+  if (b != NULL && n > 0) fwrite(b, 1, n, (FILE*)o->_handle);
+  free(b);
+}`);
     this.line('');
     // ---- flash.net.SharedObject (stage 89·40) ----
     // Local shared objects, persisted in AIR's own container so the two runtimes
@@ -34922,6 +36016,16 @@ static void as_file_throw(int err) {
       // serves every target and the target picks the answer (see as_file_separator).
       case 'separator': return { code: 'as_file_separator()', type: { kind: 'string' } };
       case 'lineEnding': return { code: 'as_file_line_ending()', type: { kind: 'string' } };
+      // Stage 299: the five remaining static reads AIR declares on File.
+      case 'cacheDirectory': return { code: 'File_new(as_file_cache_dir())', type: { kind: 'object', className: 'File' } };
+      case 'workingDirectory': return { code: 'File_new(as_file_working_dir())', type: { kind: 'object', className: 'File' } };
+      case 'systemCharset': return { code: 'as_file_system_charset()', type: { kind: 'string' } };
+      // Measured "granted": macOS does not gate per-file access, so there is no
+      // honest other answer here.
+      case 'permissionStatus': return { code: '(char*)"granted"', type: { kind: 'string' } };
+      // Measured null on a desktop host: the member is about the app's removable
+      // storage, which does not exist here.
+      case 'applicationRemovableStorageDirectory': return { code: 'as_v_null()', type: { kind: 'any' } };
       default: return null;
     }
   }

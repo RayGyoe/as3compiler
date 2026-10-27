@@ -390,7 +390,7 @@ AIR 在构造器里就拒绝相对路径（`#2004`）。我们保留字符串（
 `out.txt`、`Av.as`/`Av2.as`/`Av3.as` + `av*.txt`：量「对不对」）。审计按成本分 A/B/C 三批，
 本文这一节是 **A 批**（低成本、真实世界最容易踩到的语义差）的口径与落地。B 批（`FileStream` 的
 `IDataInput`/`IDataOutput` 全表）与 C 批（新能力：`copyTo`/`canonicalize`/`getRelativePath`/
-`FileReference`/`StorageVolume`）**未做**，逐项登记在 `TODO.md` 的 `### 遗留待开发`。
+`FileReference`/`StorageVolume`）当时**未做**，其后由阶段二百九十九 落地，见本文 §13。
 
 ### 12.1 错误表（同步成员，`adl 51.4.1` / macOS 26 实测）
 
@@ -467,3 +467,84 @@ node src/index.ts temp/fileaudit/aot/probe2.as -o temp/fileaudit/aot/probe2 --ru
 链接）；`unit: file-ops/contract`（30 条源级结构钉：`moveTo` 的两个参数、同步/异步共用
 `as_file_delete_err`、`COMPLETE` 只在 `err == 0` 时派发、`#3010` 由 `ENOTEMPTY` 映射、
 `lstat` 而非 `stat`、`moveTo` 不改 `nativePath`）。
+
+---
+
+## 13. `FileStream` 的 `IDataInput`/`IDataOutput` 与 `File` 剩余成员 —— B/C 批实测（阶段二百九十九）
+
+A 批（§12）之后接着做 B 批与 C 批。**每一条都先在 `adl 51.4.1`（macOS 26）上量出结果，再写 C**：
+探针 `temp/fileaudit2/AF.as` → `af.txt`（`FileStream` 全表 + `File` 剩余成员）、`AG.as` → `ag.txt`
+（`canonicalize`）、`AH.as` → `ah.txt`（`FileReferenceList`）。行为回归是 `examples/file-audit.as`
+（一百余条断言，期望值逐条抄自上述输出），结构不变量钉在 `test/unit/file-stream.ts`。
+
+### 13.1 `FileStream`：真 `implements IDataInput, IDataOutput`
+
+之前 `FileStream` 只有 `open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes`，`position`/`bytesAvailable`
+只读且 `position` 是 `uint`；`IDataInput`/`IDataOutput` 的其余 23 个方法全缺。现在 23 个全有，
+`position` 是 **`Number` 且可写**（写即 `fseek`），并补 `endian`/`objectEncoding`/`readAhead` 三个访问器。
+
+| 口径 | 实测（`adl 51.4.1`） | 落地 |
+|---|---|---|
+| 默认值 | `endian == "bigEndian"`、`objectEncoding == 3`、`readAhead == Infinity` | 构造器同值（`readAhead` 可写） |
+| 未打开 / 用错方向 | `bytesAvailable`/`position`/`read*`/`write*`/`truncate` 一律 `Error #2029: This URLStream object does not have a stream opened.`；`close()` 是 no-op | 同一个 `as_fs_readable`/`as_fs_writable` 门；`#2029` 文案**逐字**照抄（AIR 在 `FileStream` 上也说 "URLStream"） |
+| 写句柄上读 `bytesAvailable` | `#2029` | 同 |
+| 读越界 | `EOFError #2030`（不是短读、不是 0） | `read*` 全部走 `as_throw_eof()` |
+| `position = -1` | `Error #2006` | 同 |
+| `position` 在 `APPEND` 上 | `Error #2037`（`APPEND` 恒在 EOF，不许回退） | 同 |
+| `position` 越过 EOF | **合法**（先写则文件被撑大） | 同（`fseek` 允许越界） |
+| `truncate()` | 从 `position` 截断；`READ` 上是 `#2029` | 同（`ftruncate`） |
+| 打开目录 | `Error #3006: Not a file.` | 同（先 `stat` 判目录） |
+| 模式为空串 / `null` | `""` ⇒ `#2004`；`null` **当 `READ`** | 同 |
+| 路径不存在 | `READ`/`UPDATE` ⇒ `#3003`；`WRITE`/`APPEND` **创建文件** | 同 |
+| 字节序 | 只影响多字节成员（`writeInt` 大端写 `01 02 03 04`、切 `littleEndian` 后 `04 03 02 01`） | `as_fs_w16/w32` 自己选字节序，`float`/`double` 走「宿主序 ↔ 流序」的 `as_fs_write_host_bits`（**只翻一次** —— 首版翻两次，症状是 `readInt` 回来是反的） |
+| `objectEncoding` | `writeObject`/`readObject` 跟它走 | AMF3 读写都通；**AMF0 写仍是本子集既有缺口**（编码器报明而非错写 AMF3 字节），见 `### 遗留待开发` |
+| `openAsync` 的事件 | `WRITE`/`APPEND` **不派任何事件**；`READ` 先 `progress` 再 `complete`；`UPDATE` 只 `complete` | 同（`AS_JOB_FS_OPEN`） |
+| `writeUTFBytes` 的可见性 | 写一半就 `close`，另一句柄**立即可读到** | `setvbuf(_IONBF)`：AIR 是不缓冲的，普通 stdio 会攒 4 KB |
+
+### 13.2 `File` 的剩余成员
+
+| 成员 | 实测 | 落地 |
+|---|---|---|
+| `creationDate`/`modificationDate` | 真 `Date`（`st_birthtime`/`st_mtim`）；无路径 `#2037`、路径不存在 `#3003` | 同 |
+| `clone()` | 新对象、同路径 | 同 |
+| `canonicalize()`（void，就地改） | **只有整条路径存在才解析链接**：`/tmp` ⇒ `/private/tmp`、`/tmp/real.txt` ⇒ `/private/tmp/real.txt`；`/tmp/real.txt/inner/x`（不存在）**原样不动，连 `/tmp` 都不解析**；`/tmp/real.txt/../other.txt` ⇒ `/tmp/other.txt`（`..` 被折掉、`/tmp` 仍未解析） | 词法归一化恒做，`realpath` 只在 `lstat` 命中时做。首版按「解析最深的已存在祖先」实现，被 `ag.txt` 推翻 |
+| `getRelativePath(other, useDotDot=false)` | 从**接收者指向参数**；子 ⇒ `"kid.txt"`；自己 ⇒ `""`；父 ⇒ 需 `useDotDot=true` 才给 `".."`，否则 `null`；无公共前缀 ⇒ `null`（**不抛**） | 同 |
+| `copyTo`/`copyToAsync`/`moveToAsync` | `#2007` 目标 null（**文字是 "Parameter destination must be non-null."**）、`#2037` 无路径、`#3003` 源不存在、`#3012` 目标已存在且未给 `overwrite`、`#3014` 目标在源内部；**自动建父目录**；目录递归复制（链接按链接复制） | 三者与 `moveTo` 共用 `as_file_transfer_err` + `as_file_copy_any`；`moveTo` 的跨卷（`EXDEV`）走「复制 + 删除」 |
+| `isPackage` | 目录 + bundle 后缀（`.app` true、`.framework` **false**）；**文件** `.app` false | 同（后缀白名单） |
+| `url` 的 setter | `file:///tmp/a%20b.txt` ⇒ `/tmp/a b.txt`；`null`/`""`/`http://…` ⇒ `#2004`；`app:/q.txt` ⇒ `applicationDirectory/q.txt` | 同 |
+| `createTempFile()`/`createTempDirectory()` | `/var/folders/…/FlashTmp.XXXXXX`，已存在 | `mkstemp`/`mkdtemp`，同前缀 |
+| `getRootDirectories()` | POSIX `["/"]`；Windows 盘符 | 同 |
+| `permissionStatus` | **静态** `"granted"`；**实例读取是编译错误** | 只有静态（实例读在我们这里也编不过） |
+| `preventBackup` | 可写，但**立刻读回 `false`**（macOS 上没有这个 OS 位） | setter **不存**任何状态 —— 不发明 AIR 没有的状态 |
+| `downloaded` | 新文件 `false`；置 `true` 打 quarantine；**置 `false` 不会清掉**（读回仍 `true`） | 同（`com.apple.quarantine` xattr） |
+| `creator`/`data` | `null` | 同 |
+| `icon` | `[object Icon]`；但 `bitmapDatas` 在 51.4 里 **`#1069`**（不可读） | 给空 `Icon` 并**报明**「本构建没有图标提取」；`bitmapDatas` 回空数组（AIR 那边根本读不到） |
+| `cacheDirectory`/`workingDirectory`/`systemCharset`/`applicationRemovableStorageDirectory` | `~/Library/Caches`；进程 CWD；**`x-mac-chinesesimp`**（宿主语言设置）；`null` | `$XDG_CACHE_HOME`/`~/Library/Caches`/`%LOCALAPPDATA%\Caches`；`getcwd`；**`"UTF-8"` 并在 TODO 登记这条偏差**；`null` |
+
+### 13.3 四个新类（C 批）
+
+| 类 | 实测要点 | 落地 |
+|---|---|---|
+| `flash.net.FileReference` | `File` 的父类。未选择过文件时**除 `data` 外全部 `#2037`**，`data == null`；`toString() == "[object FileReference]"`；`browse()` 回 **`Boolean`**（`File.browseFor*` 是 void） | 真类，`isFinal: false`（SDK 标 final 但 `mxmlc` 允许被继承 —— 不然我们自己的 `File extends FileReference` 编不过）；无对话框后端 ⇒ `browse`/`load`/`save`/`download`/`upload` **报明后返回 `false`** |
+| `flash.net.FileReferenceList` | `fileList` 初值是 **`null`（不是空数组）**且**只读**；这个类上**没有** `selectMultiple`（那是 `FileListEvent` 的常量）；`browse()` 回 `Boolean` | 真类，`fileList` 只读、恒 `null`（没有对话框就没人填）；`browse()` 报明 + `false` |
+| `flash.filesystem.StorageVolume` | 构造器参数序是 **`(rootDirectory, name, isWritable, isRemovable, fileSystemType, drive)`** —— **不是**字段序（`name` 第二、`drive` 最后，读回六个 getter 才认出来）；六个只读 getter | 同序真实现 |
+| `flash.events.StorageVolumeChangeEvent` | 常量 `storageVolumeMount`/`storageVolumeUnmount`；5 参数构造器（第 4/5 个是 `rootDirectory`/`storageVolume`）；`clone()` | 同 |
+| `flash.net.FileFilter` | 只有三个公开读写字段 `description`/`extension`/`macType`（**没有** `clone()`、没有 `winType`/`name`） | 把此前「空替代 + 自造成员」改成真类，删掉自造的 `clone`/`winType`/`name` |
+| `flash.events.FileListEvent` | 构造器 **4 参数** `(type, bubbles, cancelable, files)`；**没有** `directory` 成员；两个常量 | 已按此修正（此前构造器多一个参数、多一个自造成员） |
+
+### 13.4 顺带暴露的一个真 bug
+
+`File` 改成继承 `FileReference` 之后，`cancel()` 的 vtable 槽位落到了**父类**的 no-op 上
+（`FileReference_cancel`），于是 `file.cancel()` 什么也没取消 —— `examples/file-listing-async.as`
+的「cancel() 丢掉待派发的列举」当场变红。修法是让 `File` **显式声明** `cancel` 覆盖父类，
+指向已有的 `File_cancel`。这条不占遗留表：`adl` 上 `cancel()` 确实取消得了，属 §1.5 的**遗留缺陷**，
+且同阶段修净。
+
+### 13.5 没做到的（如实）
+
+- `systemCharset` 在 `adl` 上是**宿主语言设置**（本机 `x-mac-chinesesimp`），我们回 `"UTF-8"`。这是有意的
+  偏差：本构建里所有字符串本来就是 UTF-8，报一个我们并不使用的传统代码页才是撒谎。
+- 原生文件对话框（`browseFor*`/`FileReference.browse`）与卷枚举（`getVolumeByDrive`/`getVolumeByPath`）
+  未做，全部走 `as_shell_unsupported` 报明，见 `### 遗留待开发`。
+- `File.createTempFile()` 的文件留在 `TMPDIR`，由系统清理（与 AIR 一致）。
+- Windows 分支（`GetDiskFreeSpaceExA` 之外的 `as_file_cache_dir` 等）本机无环境，只做了编译面推导。

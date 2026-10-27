@@ -51,8 +51,10 @@ function checkContract(): string[] {
   // (Pinned on the DEFINITION, not the prototype: the prototype spells the
   // parameters with AIR's own names -- `newFile`, `deleteDirectory` -- so it
   // cannot tell the arity apart from the spelling.)
+  // Two parameters, and the first is typed FileReference -- which is what AIR
+  // declares, and what makes `f.moveTo(otherFile)` accept any FileReference.
   check('File_moveTo is defined with exactly two parameters',
-    c.includes('static void File_moveTo(void* _this, File* target, bool overwrite) {'));
+    c.includes('static void File_moveTo(void* _this, FileReference* newFile, bool overwrite) {'));
   // deleteDirectory gained its one parameter (the recursive flag).
   check('File_deleteDirectory takes the recursive flag',
     c.includes('static void File_deleteDirectory(void* _this, bool recursive) { int err ='));
@@ -104,19 +106,28 @@ function checkContract(): string[] {
     && c.includes('return (GetLastError() == ERROR_DIR_NOT_EMPTY) ? 3010 : 2038;'));
 
   // ---- moveTo --------------------------------------------------------------
+  // 阶段二百九十九 folded moveTo onto the SAME transfer validator copyToAsync and
+  // moveToAsync use (as_file_transfer_err), so the rules below are pinned there --
+  // one implementation, three entry points, exactly like the delete pair above.
   check('moveTo validates a null destination as AIR does (#2007 TypeError)',
-    c.includes('as_throw(TypeError_new((char*)"Error #2007: Parameter destination must be non-null.", 2007));'));
-  check('moveTo refuses an existing target without overwrite (#3012)',
-    c.includes('if (!overwrite) { as_file_throw(3012); return; }'));
-  check('moveTo creates the destination parent directories',
-    c.includes('if (parent != NULL && parent[0] != \'\\0\' && !as_path_is_dir(parent)) as_mkdirs(parent);'));
-  const moveBody = /void File_moveTo\(void\* _this, File\* target, bool overwrite\) \{([\s\S]*?)\n\}/.exec(c);
+    c.includes('as_file_null_dest();')
+    && c.includes('as_throw(TypeError_new((char*)"Error #2007: Parameter destination must be non-null.", 2007));'));
+  check('the shared transfer validator refuses an existing target without overwrite (#3012)',
+    c.includes('if (!overwrite) return 3012;'));
+  check('the shared transfer validator creates the destination parent directories',
+    c.includes('if (parent != NULL && parent[0] != 0 && !as_path_is_dir(parent)) as_mkdirs(parent);'));
+  // AIR declares moveTo(newFile:FileReference, overwrite:Boolean = false) -- the
+  // parameter is typed FileReference, because a File IS one.
+  const moveBody = /void File_moveTo\(void\* _this, FileReference\* newFile, bool overwrite\) \{([\s\S]*?)\n\}/.exec(c);
   // `nativePath =` alone would also match the `nativePath == NULL` guards, so the
   // pin has to name the assignment the old code made.
   check('moveTo leaves the receiver on its OLD path (measured)',
-    moveBody != null && !/o->nativePath\s*=\s*target/.test(moveBody[1]));
-  check('a cross-volume move is REPORTED, never silently skipped',
-    c.includes('File.moveTo could not rename (a cross-volume move is not implemented)'));
+    moveBody != null && !/o->nativePath\s*=\s*newFile/.test(moveBody[1]));
+  check('a cross-volume move copies and then deletes instead of giving up',
+    moveBody != null
+    && /rename\(o->nativePath, as_file_path_of\(\(void\*\)newFile\)\)/.test(moveBody[1])
+    && /err = as_file_copy_any\(o->nativePath, dst\);/.test(moveBody[1])
+    && /if \(err == 0\) err = as_remove_any\(o->nativePath\);/.test(moveBody[1]));
 
   // ---- size ----------------------------------------------------------------
   check('size throws #3003 for a missing path (the old 0 was wrong)',

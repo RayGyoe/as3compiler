@@ -12880,6 +12880,7 @@ static char* as_job_error_text(void* job, char* unsupported_text, char* generic_
 // fixed sentence per number and this is an EXTRA fact that sentence cannot carry.
 static char* as_job_err_detail(void* job) { return ((as_job*)job)->err_text; }
 static const char* as_job_path(void* job) { const char* p = ((as_job*)job)->path; return (p != NULL) ? p : ""; }
+static const char* as_job_mode(void* job) { const char* m = ((as_job*)job)->mode; return (m != NULL) ? m : ""; }
 // AIR attaches a NUMBER and a matching sentence to every internally generated
 // ioError, and AS3 code branches on the number (e.errorID == 2032). The pairs we
 // emit are MEASURED against adl 51.4.1 on the same failure matrix, because AIR's

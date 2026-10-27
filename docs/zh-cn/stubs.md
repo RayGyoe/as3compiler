@@ -39,13 +39,12 @@
 「应用引用」= `talkmedmeeting` 源码里出现该类名的文件数（`E:/Works/eDoctor/talkmed-meeting-windows/src`，
 989 个 `.as`，阶段二百九十三统计）。
 
-### 2.1 数据载体：字段与常量是真的（12 个）
+### 2.1 数据载体：字段与常量是真的（11 个）
 
 | 类 | 包 | 应用引用 | 真的给得出 | 给不出 |
 |---|---|---|---|---|
 | `ClipboardFormats` | `flash.desktop` | 3 | 7 个格式名常量（`text`/`html`/`richText`/`url`/`bitmap`/`fileList`/`filePromiseList`） | 无（纯常量类，**不是缺陷**） |
-| `FileFilter` | `flash.net` | 10 | `description` / `extension` / `macType` / `winType` 四字段真赋值 | `clone()` 报明后返回 `null`（实测：接着访问 `.description` 抛 `#1009`） |
-| `FileListEvent` | `flash.events` | 2 | `DIRECTORY_LISTING` 常量、`directory`/`files` 字段 | 事件本身不会派发（目录列举走 `File.getDirectoryListingAsync` 的同步回填） |
+| `FileListEvent` | `flash.events` | 2 | `DIRECTORY_LISTING`/`SELECT_MULTIPLE` 常量、`files` 字段、4 参数构造器、`clone()` | 无（阶段二百九十九修正：`directory` 是自造成员，已删；事件由 `File.getDirectoryListingAsync` 真派发） |
 | `JPEGEncoderOptions` | `flash.display` | 2 | `quality`（默认 50） | `BitmapData.encode` 对 JPEG 报明（vendored Skia 关了 JPEG 编码） |
 | `PNGEncoderOptions` | `flash.display` | 2 | `fastCompression`（默认 `false`） | 同上（WebP 亦然） |
 | `InvokeEvent` | `flash.events` | 1 | `INVOKE` 常量、`arguments`/`currentDirectory`/`reason` | 没有「用文档启动」的入口，事件不会来 |
@@ -88,8 +87,10 @@
 | `DisplayObject.mask` | 渲染器不施加 mask（`clipDepth` 遮罩是另一条已实现的路径） |
 | `Error.getStackTrace` | 无 AS3 栈帧模型 |
 | `ExtensionContext.createExtensionContext` / `.call` | 无原生扩展宿主（`--air-app` 的 ANE 路径是另一套） |
-| `File.moveTo`（跨卷 / 目标已存在且未 overwrite / 源不存在） | 该组合 AIR 抛 `IOError`，我方报明 |
-| `File.browseForOpen` / `browseForDirectory` / `openWithDefaultApplication` / `upload` | 未接系统文件对话框 / ShellExecute / HTTP 上传 |
+| `File.browseForOpen` / `browseForOpenMultiple` / `browseForSave` / `browseForDirectory` / `openWithDefaultApplication` / `upload` | 未接系统文件对话框 / ShellExecute / HTTP 上传（阶段二百九十九把缺的两个符号补齐成报明桩，此前是**链接失败**） |
+| `FileReference.browse` / `load` / `save` / `download` / `upload` / `uploadUnencoded`、`FileReferenceList.browse` | 同上：无原生对话框/HTTP 后端。它们**报明后返回 `false`**，不假装「用户点了取消」—— 没有对话框，`fileList`/`data`/`name` 这些「选择结果」字段永远为空 |
+| `File.icon` 的位图内容 | 无图标提取（macOS 走 `NSWorkspace.iconForFile`）。给空 `Icon` 并报明；`bitmapDatas` 回空数组（AIR 51.4 里读它本身就抛 `#1069`） |
+| `File.getVolumeByDrive` / `getVolumeByPath` | 无卷枚举（`getmntinfo`/`statfs`）。`StorageVolume` 的构造器与六个 getter 已按实测实现，缺的是「谁来造它」 |
 | `DockIcon.bitmaps`（上屏） | 该后端不画 Dock 图标位图 |
 | `NativeApplication.systemIdleMode` | 本构建不抑制系统空闲计时 |
 | `Clipboard.setData(richText, 非 ByteArray)` | `Clipboard.html` 的类型表要求 `ByteArray`，存别的会让 `getData` 交回不符承诺的类型 |
@@ -103,6 +104,11 @@
 | `Clipboard` | 二百九十三 | **真实现**：`(format → data)` 条目表 + `generalClipboard` 接操作系统（Windows 四格式互译，见 [`desktop.md`](desktop.md) §7.10） |
 | `ClipboardTransferMode` | 二百九十三 | 补齐（此前**整个类缺失**，`import flash.desktop.ClipboardTransferMode` 编译不过） |
 | `System.setClipboard` | 二百九十三 | 真实现（= `clear()` + `setData(TEXT_FORMAT, s)`） |
+| `FileFilter` | 二百九十九 | **真类**，三个字段；删掉自造的 `winType`/`name`/`clone()` |
+| `FileReference` | 二百九十九 | **真类**（`File` 的父类）：未选择过文件时除 `data`（null）外全部 `#2037`，`toString()` 与实测一致；交互成员报明 |
+| `FileReferenceList` | 二百九十九 | **真类**：`fileList` 初值 `null` 且只读（与 `adl` 实测一致） |
+| `StorageVolume` / `StorageVolumeChangeEvent` | 二百九十九 | **真类**：构造器按实测参数序、六个只读 getter、两个常量 + `clone()` |
+| `FileStream` | 二百九十九 | **不是空替代了**：真 `implements IDataInput, IDataOutput`（23 个读写成员 + `endian`/`objectEncoding`/`readAhead` + 可写 `Number` 的 `position`），见 [`filesystem.md`](filesystem.md) §13.1 |
 
 ---
 

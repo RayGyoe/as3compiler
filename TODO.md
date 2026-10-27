@@ -17124,7 +17124,82 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 的 `IDataInput`/`IDataOutput` 全表、四个类缺失 + `FileFilter.clone` 报明；改写 = 「`File` 的路径
 字符串契约」由**未开始**转 **部分完成**（setter 侧 `#2004` + 词法归一化已落地，构造器仍宽松）。
 
+### 阶段二百九十九：`File` 家族的 B/C 批 —— `FileStream` 的 `IDataInput`/`IDataOutput` 全表 + `File` 剩余成员 + 四个新类（v0.4.261 → v0.4.262）✅ 已完成
+
+**一、起因**（用户）：「搞定这些」。A 批（阶段二百九十八）只修了**已实现成员**的语义，审计里剩下的
+两块按成本分开：**B 批** = `FileStream` 的 `IDataInput`/`IDataOutput` 全表（机器活），**C 批** = 新能力
+（`File` 缺的方法/属性/静态项、四个**不存在**的类、`FileFilter` 的自造成员）。本阶段把 B、C 一起收口。
+
+**二、先量后写**：探针 `temp/fileaudit2/AF.as` → `af.txt`（`FileStream` 全表 + `File` 剩余成员）、
+`AG.as` → `ag.txt`（`canonicalize` 的四种形状）、`AH.as` → `ah.txt`（`FileReferenceList`）。三条探针的
+输出就是 `examples/file-audit.as` 里每一条断言的期望值。
+
+**三、B 批 —— `FileStream` 变成真的 `IDataInput`/`IDataOutput`**
+
+之前只有 `open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` + 只读 `position`/`bytesAvailable`，
+接口的 23 个方法全缺。现在 23 个全有、`position` 是**可写 `Number`**，并补 `endian`/`objectEncoding`/
+`readAhead`。口径（全部 `adl 51.4.1` 实测，详见 `docs/zh-cn/filesystem.md` §13.1）：
+
+| # | 口径 | 实测 |
+|---|---|---|
+| 1 | 默认值 | `bigEndian` / `objectEncoding 3` / `readAhead Infinity` |
+| 2 | 未打开或方向用错 | `#2029`（文案里写的是 "URLStream"，**照抄**）；`close()` 是 no-op |
+| 3 | 写句柄上读 `bytesAvailable` | `#2029` |
+| 4 | 读越界 | `EOFError #2030`（含 `readUTFBytes` 超长） |
+| 5 | `position = -1` | `#2006` |
+| 6 | `position` 在 `APPEND` 上 | `#2037` |
+| 7 | `position` 越过 EOF | 合法 |
+| 8 | `truncate()` | 从 `position` 截断；`READ` 上 `#2029` |
+| 9 | 打开目录 | `#3006` |
+| 10 | 模式 `""` / `null` | `#2004` / 当 `READ` |
+| 11 | 路径不存在 | `READ`/`UPDATE` 抛 `#3003`；`WRITE`/`APPEND` **建文件** |
+| 12 | 字节序 | 只影响多字节成员；`float`/`double` 走「宿主序 ↔ 流序」且**只翻一次** |
+| 13 | `openAsync` 的事件 | `WRITE`/`APPEND` **零事件**；`READ` `progress`+`complete`；`UPDATE` 只 `complete` |
+| 14 | `writeUTFBytes` 可见性 | 写一半即可被另一句柄读到（`setvbuf(_IONBF)`） |
+
+**四、C 批 —— `File` 的 14 个方法 / 8 个属性 / 5 个静态项 + 四个类**
+
+- **方法**：`copyTo`/`copyToAsync`/`moveToAsync`（与 `moveTo` 共用 `as_file_transfer_err`：`#2007` 目标
+  null、`#2037` 无路径、`#3003` 源不存在、`#3012` 目标已存在未给 `overwrite`、`#3014` 目标在源内部，
+  **自动建父目录**，目录递归复制）、`canonicalize`（**只有整条路径存在才 `realpath`** —— `ag.txt` 推翻了
+  首版「解析最深已存在祖先」的写法）、`getRelativePath`、`clone`、`createDirectory`、
+  `browseForOpenMultiple`/`browseForSave`（报明，此前连符号都没有 ⇒ 链接失败）。
+- **属性**：`creationDate`/`modificationDate`（真 `Date`，`st_birthtime`/`st_mtim`）、`creator`/`data`（null）、
+  `icon`（空 `Icon` + 报明）、`isPackage`、`spaceAvailable`、`url` 的 **setter**（`#2004` 四种坏输入 +
+  百分号解码 + `app:` 解析）、`downloaded`/`preventBackup` 的 get/set。
+- **静态**：`createTempFile`/`createTempDirectory`（真 `FlashTmp.XXXXXX`）、`getRootDirectories`、
+  `cacheDirectory`/`workingDirectory`/`systemCharset`/`permissionStatus`/`applicationRemovableStorageDirectory`。
+- **四个类**：`flash.net.FileReference`（`File` 的父类，`isFinal: false` —— SDK 标 final 但 `mxmlc` 允许被继承，
+  否则我们自己的 `File extends FileReference` 编不过）、`flash.net.FileReferenceList`（`fileList` 初值
+  **`null`** 且只读）、`flash.filesystem.StorageVolume`（构造器参数序是
+  **`(rootDirectory, name, isWritable, isRemovable, fileSystemType, drive)`**，**不是**字段序 —— 只有把六个
+  getter 读回来才发现）、`flash.events.StorageVolumeChangeEvent`（两个常量 + `clone`）。
+- **修正自造成员**：`FileFilter` 从「空替代 + 自造 `winType`/`name`/`clone`」改成真类（AIR 51.4 只有三个
+  字段，`mxmlc` **拒绝** `ff.clone()`）；`FileListEvent` 构造器从 5 参数改成 **4 参数**，删掉自造的 `directory`。
+
+**五、顺带撞出并修掉的真 bug**：`File` 改成继承 `FileReference` 之后，`cancel()` 的 vtable 槽位落到了
+**父类的 no-op**（`FileReference_cancel`），于是 `file.cancel()` 什么也没取消 ——
+`examples/file-listing-async.as` 的「cancel() 丢掉待派发的列举」当场变红。修法是让 `File` 显式声明并
+覆盖 `cancel`。这条不占遗留表（`adl` 取消得了 ⇒ §1.5 的遗留缺陷，同阶段修净）。
+
+**六、验收**：新增 `examples/file-audit.as`（一百余条断言，期望值逐条抄自 `af.txt`/`ag.txt`/`ah.txt`），
+`test/examples.ts` 给它一份独立 HOME（`temp/audit-home`，模板同 `file-ops.as`）；新增
+`test/unit/file-stream.ts`（钉结构：接口 vtable 槽位、字节序只翻一次、`StorageVolume` 的参数序、
+`File` 没有实例 `permissionStatus`、`preventBackup` 不存状态、`as_path_realpath` 的存在性门、
+`FileFilter`/`FileReferenceList` 的成员面）。**`node test.ts` 528/528 全绿**。
+
+**七、遗留表**：**新登记 0 行 / 改写 2 行 / 移出 2 行** ⇒ 按「项数以表内实际行数**为准**」重数，
+本表 **102 → 101 项**（`未开始` 80 / `部分完成` 20 / `调研完成·实现暂缓` 1）。**移出 2 行** =
+`FileStream` 的 `IDataInput`/`IDataOutput` 全表、四个类缺失 + `FileFilter.clone` 报明。
+**改写 2 行**：「`File` 的成员面只覆盖一部分」收窄成「两个卷粒度 static 方法缺失」；原四个类那行
+改写成「原生对话框与卷枚举仍缺」（类与成员都按实测落地了，剩下的 `browseFor*`/`FileReference.browse`/
+`getVolumeByDrive`/`getVolumeByPath` 是**后端**活）。没有新登记：两条剩余缺口都是既有行的收窄，
+不是新量出的偏差。**如实报明**：
+`systemCharset` 在 `adl` 上是宿主语言设置（本机 `x-mac-chinesesimp`），我们回 `"UTF-8"` 并单列登记；
+Windows 分支只做编译面推导（本机无环境）；AMF0 **写**仍是既有缺口。
+
 ### 遗留待开发
+> **2026-10-27 追加（阶段二百九十九：`File` 家族 B/C 批）**：**新登记 0 行 / 改写 2 行 / 移出 2 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **102 → 101 项**（`未开始` 80 / `部分完成` 20 / `调研完成·实现暂缓` 1）。**移出 2 行**：`FileStream` 既不 `implements IDataInput` 也不 `implements IDataOutput`（23 个方法 + 三个访问器 + 可写 `Number` 的 `position` 全部落地，`docs/zh-cn/as3-semantics.md` 里「`FileStream` 是空替代」的说法随之作废）、`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent` 四个类不存在 + `FileFilter.clone` 报明（四个类都成了真类，`FileFilter` 按 AIR 只有三个字段；`FileListEvent` 的 5 参数构造器与自造 `directory` 一并修正）。**改写 2 行**：「`File` 的成员面只覆盖 AIR 的一部分」收窄成「两个卷粒度 static 方法缺失」（14 方法 / 8 属性 / 5 静态常量 / `getRootDirectories` 全部落地），原四个类那行改写成「原生对话框与卷枚举仍缺」（类与成员的语义都按 `adl` 实测落地了，剩下的 `browseFor*`/`FileReference.browse`/`getVolumeByDrive`/`getVolumeByPath` 是**后端**活，没有对话框就永远填不满 `fileList`/`data`，故 `browse()` 报明后返回 `false`，**不假装用户点了取消**）。**本阶段修净的一处不占表**：`File` 继承 `FileReference` 后 `cancel()` 落到父类 no-op（`file-listing-async.as` 变红），属 §1.5 遗留缺陷但同阶段修净。**如实报明**：`systemCharset` 在 `adl` 上是宿主语言设置（本机 `x-mac-chinesesimp`），我们回 `"UTF-8"`，属有意偏差；Windows 分支只做编译面推导；AMF0 **写**仍是既有缺口。
 > **2026-10-27 追加（阶段二百六十 补记：菜单栏状态项的多档位图与右键弹菜单）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 表内项数不变。两条都是**我们自己那条 macOS 增强通道（E19，opt-in `--features tray`）的后端收口**，`adl` 上根本没有对应路径（默认构建仍 `#2012`），故不属 §1.5「`adl` 跑得对我们跑不出」，不占本表；也**不改任何 AS3 语义**（`SystemTrayIcon` 的成员、事件、错误码一字未动），按阶段二百六十三之后的先例**不升版本号**。① **`bitmaps` 从「取第一张」改为「全部交出去」**（`sk_tray_set_image` → `sk_tray_set_images`，最多 4 张，每张一个 `NSImage` representation）：AIR 文档里这个数组的用途就是「放不同尺寸以适配不同显示分辨率」，而在 macOS 上尺寸只能意味着密度 —— 菜单栏恒 22pt，22px 高的位图是 1x、44px 的是 2x。**只给 2x 会让非 Retina 屏上的图标被 AppKit 降采样**：15pt 的图里 1.5pt 的描边被平均成雾（本机 2560×1440 副屏实测，对比见 `prune/shots/menubar/`）。② **菜单只在右键弹**（`sk_tray_fired` 里 `kind == 1` 才 `popUpStatusItemMenu:`），且**先派发 `RIGHT_CLICK` 再弹** ——「左右键都弹菜单」是 AppKit 的惯例，但那样左键就永远不能表示别的东西；派发在前则 AS3 能在回调里把勾选状态刷成最新的。**已知边界（已写进 `docs/zh-cn/enhancements.md` §4.11）**：位图被标成 template image（RGB 只贡献 alpha，**不做彩色图标**）；左键弹菜单这条惯例被有意放弃。**证据**：`unit: emit/SystemTrayIcon`（33 → 38 条，新增多档交出的钉与非 Cocoa 端的同名桩）、`examples/status-item.as` 无改动仍全过、真机双屏（主 1800×1169 @2x + 副 2560×1440 @1x）逐屏截图确认两档各自清晰。
 > **2026-10-27 追加（阶段二百九十七：D3D12 设备丢失的收尾）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 本表 **98 → 99 项**（`未开始` **76 → 77** / `部分完成` 20 / `调研完成·实现暂缓` 1 / 已完成 1）。**本阶段修的那条不占表**：崩溃在 `adl` 上不存在对应物（它是我们自家 D3D12 后端的收尾），且同阶段落地。新登记的 1 行是**跨端**剩下的：Metal 与 WGL 后端**连设备丢失检测都没有**（本机是 Windows，`.mm`/GL 丢失两条都无法在本机编译验证，故只登记、不盲写）。
 > **2026-10-27 追加（阶段二百九十六：IME 合成与光标四条）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按表内实际行数（`|` 开头行 − 表头 − 分隔）重数，本表 **97 → 98 项**（`未开始` **75 → 76** / `部分完成` 20 / `调研完成·实现暂缓` 1 / 已完成 1）。**本阶段修净的五条都不占表**（合成事件被路由到死窗、SDL 不画候选窗、光标取错色、静态画面不闪、合成期光标停在首字母）：它们在 `adl` 上都是「跑得对」、我们此前跑不出 ⇒ 属 §1.5 的**遗留缺陷**，但同阶段落地，按表头自述「已完成项一经落地即从本表移出」故不入表。新登记的 1 行是同探针**顺带量到**的独立偏差：输入字符的格式取 `defaultTextFormat` 而非「插入点前一个字符的 run 格式」。
@@ -17392,9 +17467,8 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
 | **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |
-| **`File` 的成员面只覆盖 AIR 的一部分**（本阶段 A 批修的是**已实现成员**的语义；成员面缺口仍在） | 未开始（2026-10-27 阶段二百九十八 从 `temp/fileaudit/matrix.sh` 的逐成员编译探针量出，A 批未涉及） | 缺 **14 个方法**：`copyTo`/`copyToAsync`/`canonicalize`/`getRelativePath`/`clone`/`download`/`upload`/`uploadUnencoded`/`browseForSave`/`browseForOpenMultiple`/`browseForDirectory`（类名存在但走 shell 报明）/`getDirectoryListingAsync` 之外的 `moveToAsync`/`copyToAsync` 族、以及 `creationDate`/`modificationDate` 两个 getter（**探针里因此跳过 D4~D6 三条**）；缺 **8 个属性**（`creationDate`/`modificationDate`/`icon`/`type` 之外还缺 `url` setter 之外的 `isHidden` 语义完整度等，逐项见该脚本输出）；缺 **5 个 static 常量**（`documentsDirectory` 之外的 `lineEnding`/`separator` 已有，缺 `applicationDirectory` 之外的卷相关项）与 **3 个 static 方法**（`getRootDirectories`/`getVolumeByDrive`/`getVolumeByPath`） | C 批：新能力，逐条按 `adl` oracle 落地；`creationDate`/`modificationDate` 便宜，可先行（`stat` 的 `st_birthtime`/`st_mtime` 已有调用点） |
-| **`FileStream` 既不 `implements IDataInput` 也不 `implements IDataOutput`**（30 个方法里 23 个缺失） | 未开始（2026-10-27 阶段二百九十八 审计量出，B 批） | 现有：`open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` + 只读 `position`/`bytesAvailable`。缺的 23 个是 `IDataInput`/`IDataOutput` 的其余方法（`readBoolean`/`readByte`/`readBytes`/`readDouble`/`readFloat`/`readInt`/`readMultiByte`/`readObject`/`readShort`/`readUnsignedByte`/`readUnsignedInt`/`readUnsignedShort`/`readUTF` 与对应的 12 个 `write*`），另缺 `endian`/`objectEncoding`/`readAhead` 三个访问器；`position` 是 **`uint`** 而 AIR 是 **`Number`**，且**不可写** | B 批：机器活 —— `ByteArray` 已有全部实现，按 `FILE*` 后端逐个转写（`endian` 交换与 `objectEncoding` 走同一套 `as_ba_swap*`/AMF3 编解码器），并把 `position` 改成 `Number` 且可写（写即 `fseek`）。**注意**：`as3-semantics.md` 里「`FileStream` 是空替代」的说法将随之作废 |
-| **`FileReference` / `FileReferenceList` / `StorageVolume` / `StorageVolumeChangeEvent` 四个类不存在**；`FileFilter.clone()` 只报明（返回 `null`，接了会 `#1009`） | 未开始（2026-10-27 阶段二百九十八 审计量出，C 批） | `matrix.sh` 对这四个类都是 `unknown type`。`FileReference` 的 `browse`/`load`/`save` 三个流程要平台对话框（macOS `NSOpenPanel`/`NSSavePanel`，Windows `IFileOpenDialog`），`StorageVolume` 要 `statfs`/`GetDiskFreeSpaceExA` 的卷枚举（G3 的 ANE 交付与它无关：那是我们自己的通道，不是 `StorageVolume`）| C 批：先做 `FileReference` 的 browse+load（真实世界用得最多），`StorageVolume` 次之；`FileFilter.clone()` 随 `FileReference` 一起补（它的唯一用处就是传给 browse） |
+| **`File` 的两个卷粒度 static 方法缺失**：`getVolumeByDrive(drive:String)` / `getVolumeByPath(path:String)` | 未开始（2026-10-27 阶段二百九十九：B/C 批收窄——成员面其余 14 方法 / 8 属性 / 5 常量 / `getRootDirectories` 均已落地） | 这两个要**卷枚举**（POSIX `getmntinfo`/`statfs`，Windows `GetLogicalDrives` + `GetVolumeInformation`）才能回答「这个路径在哪个卷上」；`StorageVolume` 的构造器和六个 getter 已按实测实现，缺的只是「谁来造它」。当前 `File.getRootDirectories()` 会造出根卷（POSIX `["/"]`、Windows 盘符），但反查没有 | 与「原生对话框」同一批后端活；两条一起做能在真机上一次性验证 `StorageVolumeChangeEvent` |
+| **`File` 家族的原生对话框与卷粒度查询仍缺**：`FileReference.browse`/`load`/`save`/`download`/`upload`、`FileReferenceList.browse`、`File.browseFor*` 只报明（`as_shell_unsupported`，返回 `false`）；两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)` 未落地 | 未开始（2026-10-27 阶段二百九十九：C 批把四个**类**与它们的成员面补齐了，剩下的全是**后端**活） | 类与成员现在都在（`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent`，`FileFilter` 三个字段，`File` 的 14 方法/8 属性/5 static 常量/`getRootDirectories`），**读的语义也按 `adl` 实测**（见阶段二百九十九）。缺的只有两件：① 平台对话框（macOS `NSOpenPanel`/`NSSavePanel`，Windows `IFileOpenDialog`）——没有它，`fileList`/`data`/`name` 这些「选择结果」字段永远为空，所以 `browse()` **报明后返回 `false`**，绝不假装用户点了「取消」；② 卷枚举（`statfs`/`GetDiskFreeSpaceExA`）——`StorageVolume` 的构造器与六个 getter 已按实测实现，但目前只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查 | 两条都是后端活，且都要在真机上验证（Windows 分支本机无环境）。做对话框时应顺手把 `File.browseForOpenMultiple` 的 `FileListEvent` 派发接上——类与事件已完成，只差调用点 |
 
 
 

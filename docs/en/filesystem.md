@@ -454,7 +454,7 @@ audit (`temp/fileaudit/matrix.sh`: one compile probe per member, measuring "does
 right"). The audit was split into batches A/B/C by cost; this section is **batch A** (low cost,
 the divergences real code trips over). Batch B (`FileStream`'s full `IDataInput`/`IDataOutput`
 surface) and batch C (new capability: `copyTo`/`canonicalize`/`getRelativePath`/`FileReference`/
-`StorageVolume`) are **not done** and are registered one by one in `TODO.md` → `### 遗留待开发`.
+`StorageVolume`) were **not done at the time**; stage 299 landed them, see section 13 below.
 
 ### 12.1 The error table (synchronous members, measured on `adl 51.4.1` / macOS 26)
 
@@ -539,3 +539,87 @@ a `dangle` link); `unit: file-ops/contract` (30 source-level structural checks: 
 parameters, sync and async share `as_file_delete_err`, `COMPLETE` is dispatched only when
 `err == 0`, `#3010` comes from `ENOTEMPTY`, `lstat` rather than `stat`, and `moveTo` does not
 rewrite `nativePath`).
+
+---
+
+## 13. `FileStream`'s `IDataInput`/`IDataOutput` and the rest of `File` — batches B/C (stage 299)
+
+Batches B and C followed batch A (section 12). **Everything here was measured on `adl 51.4.1`
+(macOS 26) before any C was written**: `temp/fileaudit2/AF.as` → `af.txt` (the whole `FileStream`
+surface plus the remaining `File` members), `AG.as` → `ag.txt` (`canonicalize`), `AH.as` → `ah.txt`
+(`FileReferenceList`). The behavioural regression is `examples/file-audit.as` (100+ assertions, each
+expected value copied from those outputs); the structural invariants are pinned in
+`test/unit/file-stream.ts`.
+
+### 13.1 `FileStream` really implements `IDataInput, IDataOutput`
+
+It used to have only `open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` with a read-only
+`uint` `position`; the other 23 interface methods were missing. All 23 are there now, `position` is
+a writable **`Number`**, and `endian`/`objectEncoding`/`readAhead` exist.
+
+| Rule | Measured (`adl 51.4.1`) | Implementation |
+|---|---|---|
+| defaults | `endian == "bigEndian"`, `objectEncoding == 3`, `readAhead == Infinity` | same |
+| unopened / wrong side | `bytesAvailable`/`position`/`read*`/`write*`/`truncate` all throw `Error #2029: This URLStream object does not have a stream opened.`; `close()` is a no-op | one `as_fs_readable`/`as_fs_writable` gate; the `#2029` text is verbatim (AIR says "URLStream" even on a `FileStream`) |
+| read past EOF | `EOFError #2030` | `as_throw_eof()` |
+| `position = -1` | `Error #2006` | same |
+| `position` on `APPEND` | `Error #2037` (APPEND is pinned at EOF) | same |
+| `position` past EOF | **legal** | same (`fseek`) |
+| `truncate()` | cuts at `position`; `#2029` on `READ` | same (`ftruncate`) |
+| open a directory | `Error #3006: Not a file.` | same |
+| `""` / `null` mode | `""` → `#2004`; `null` behaves as `READ` | same |
+| missing path | `READ`/`UPDATE` → `#3003`; `WRITE`/`APPEND` **create** | same |
+| endianness | multi-byte members only (`writeInt` big-endian writes `01 02 03 04`, `littleEndian` `04 03 02 01`) | `as_fs_w16/w32` choose the byte order themselves; `float`/`double` go through the host-order variant, which flips **exactly once** (the first version flipped twice, and the only symptom was a byte-swapped `readInt`) |
+| `objectEncoding` | drives `writeObject`/`readObject` | AMF3 both ways; **AMF0 writing is a pre-existing gap** (the encoder reports itself), registered in `TODO.md` |
+| `openAsync` events | `WRITE`/`APPEND` dispatch **nothing**; `READ` sends `progress` then `complete`; `UPDATE` only `complete` | same |
+| `writeUTFBytes` visibility | a half-written file is readable from another handle immediately | `setvbuf(_IONBF)`: AIR does not buffer, and plain stdio would hold 4 KB |
+
+### 13.2 The remaining `File` members
+
+| Member | Measured | Implementation |
+|---|---|---|
+| `creationDate`/`modificationDate` | real `Date`s (`st_birthtime`/`st_mtim`); `#2037` without a path, `#3003` for a missing one | same |
+| `clone()` | new object, same path | same |
+| `canonicalize()` (void, in place) | resolves links **only when the whole path exists**: `/tmp` → `/private/tmp`, `/tmp/real.txt` → `/private/tmp/real.txt`; `/tmp/real.txt/inner/x` stays byte-identical **including the unresolved `/tmp`**; `/tmp/real.txt/../other.txt` → `/tmp/other.txt` | lexical normalisation always, `realpath` only when `lstat` hits. The first version resolved the deepest existing ancestor and `ag.txt` disproved it |
+| `getRelativePath(other, useDotDot=false)` | from the **receiver** to the argument; child → `"kid.txt"`, self → `""`, parent needs `useDotDot=true` else `null`, unrelated → `null` (no throw) | same |
+| `copyTo`/`copyToAsync`/`moveToAsync` | `#2007` null destination (**"Parameter destination must be non-null."**), `#2037` no path, `#3003` missing source, `#3012` existing target without `overwrite`, `#3014` target inside source; **parent directories are created**; directories copy recursively (links as links) | all three share `as_file_transfer_err` + `as_file_copy_any` with `moveTo`, whose cross-volume (`EXDEV`) path copies then deletes |
+| `isPackage` | a DIRECTORY with a bundle suffix (`.app` true, `.framework` **false**); a **file** named `.app` is false | same |
+| `url` setter | `file:///tmp/a%20b.txt` → `/tmp/a b.txt`; `null`/`""`/`http://…` → `#2004`; `app:/q.txt` → `applicationDirectory/q.txt` | same |
+| `createTempFile()`/`createTempDirectory()` | `/var/folders/…/FlashTmp.XXXXXX`, already existing | `mkstemp`/`mkdtemp`, same prefix |
+| `getRootDirectories()` | POSIX `["/"]`; drive letters on Windows | same |
+| `permissionStatus` | **static** `"granted"`; an instance read is a compile error | static only |
+| `preventBackup` | settable, but reading it straight back gives **`false`** (macOS has no such OS bit) | the setter stores nothing — AIR has no state to mirror |
+| `downloaded` | `false` for a new file; setting `true` applies the quarantine attribute; setting `false` does **not** clear it | same (`com.apple.quarantine` xattr) |
+| `creator`/`data` | `null` | same |
+| `icon` | `[object Icon]`, but `bitmapDatas` throws **`#1069`** in a 51.4 app | an empty `Icon` plus a loud "no icon extraction in this build"; `bitmapDatas` answers an empty array (unreadable on AIR anyway) |
+| `cacheDirectory`/`workingDirectory`/`systemCharset`/`applicationRemovableStorageDirectory` | `~/Library/Caches`; the process CWD; **`x-mac-chinesesimp`** (a host locale setting); `null` | `$XDG_CACHE_HOME`/`~/Library/Caches`/`%LOCALAPPDATA%\Caches`; `getcwd`; **`"UTF-8"`, registered as a deliberate deviation**; `null` |
+
+### 13.3 The four new classes (batch C)
+
+| Class | Measured | Implementation |
+|---|---|---|
+| `flash.net.FileReference` | `File`'s superclass. Until something is picked, every accessor is `#2037` except `data` (null); `toString()` is `"[object FileReference]"`; `browse()` returns **`Boolean`** (`File.browseFor*` are void) | a real class with `isFinal: false` (the SDK says final, but `mxmlc` compiles `extends FileReference` — and our own `File extends FileReference` needs it); no dialog backend, so `browse`/`load`/`save`/`download`/`upload` report themselves and return `false` |
+| `flash.net.FileReferenceList` | `fileList` starts as **`null` (not an empty Array)** and is read-only; there is **no** `selectMultiple` on this class (that is `FileListEvent`'s); `browse()` returns `Boolean` | a real class; `fileList` is read-only and stays `null` (nothing can fill it without a dialog); `browse()` reports itself and answers `false` |
+| `flash.filesystem.StorageVolume` | the constructor order is **`(rootDirectory, name, isWritable, isRemovable, fileSystemType, drive)`** — **not** the field order (`name` second, `drive` last; only reading the six getters back reveals it); six read-only getters | same order |
+| `flash.events.StorageVolumeChangeEvent` | constants `storageVolumeMount`/`storageVolumeUnmount`; 5-argument constructor (4th/5th are `rootDirectory`/`storageVolume`); `clone()` | same |
+| `flash.net.FileFilter` | exactly three public read-write fields `description`/`extension`/`macType` (there is **no** `clone()`, no `winType`/`name`) | the old "empty stub with invented members" became a real class; the invented `clone`/`winType`/`name` are gone |
+| `flash.events.FileListEvent` | a **4-argument** constructor `(type, bubbles, cancelable, files)`; there is **no** `directory` member; two constants | corrected (it used to take an extra argument and carry an invented member) |
+
+### 13.4 A real bug this exposed
+
+Once `File` started extending `FileReference`, the `cancel()` vtable slot resolved to the
+**superclass** no-op (`FileReference_cancel`), so `file.cancel()` cancelled nothing and
+`examples/file-listing-async.as` went red on "cancel() drops the pending listing". The fix is for
+`File` to declare `cancel` and override it with the existing `File_cancel`. It does not occupy a
+ledger row: AIR does cancel, so this was a §1.5 left-over defect, fixed in the same stage.
+
+### 13.5 What is not done (straight answer)
+
+- `systemCharset` reports the **host locale's legacy encoding** on `adl` (`x-mac-chinesesimp` here);
+  we answer `"UTF-8"`. Deliberate: every string in this build is UTF-8, and naming a code page we
+  never use would be a lie.
+- Native file dialogs (`browseFor*`, `FileReference.browse`) and volume enumeration
+  (`getVolumeByDrive`/`getVolumeByPath`) are not implemented; they report themselves through
+  `as_shell_unsupported`, see `TODO.md`.
+- `File.createTempFile()` files stay in `TMPDIR` for the OS to clean (same as AIR).
+- The Windows branch was reasoned through, not run: there is no Windows machine here.

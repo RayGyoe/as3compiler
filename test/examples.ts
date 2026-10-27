@@ -108,6 +108,15 @@ writeFileSync(join(fileOpsFx, 'dir', 'inner.txt'), 'x');
 tryLink('dir', join(fileOpsFx, 'linkdir'));
 tryLink('nope', join(fileOpsFx, 'dangle'));
 
+// The fixture `file-audit.as` runs against (阶段二百九十九): nothing but its own
+// HOME. The example creates and removes `audit-work/` under it, and it must not be
+// the repo's HOME or another unit's, because it copies trees around inside that
+// tree. It is rebuilt from scratch every run so a killed previous run cannot leave
+// a directory that makes `createDirectory()` throw #3003.
+const auditHome = join(root, 'temp', 'audit-home');
+rmSync(auditHome, { recursive: true, force: true });
+mkdirSync(auditHome, { recursive: true });
+
 const dir = join(root, 'examples');
 const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
 
@@ -283,6 +292,10 @@ const EXAMPLE_ENV: Record<string, Record<string, string>> = {
   // is its own home so the example's deletes cannot race another unit that walks
   // temp/ concurrently.
   'file-ops.as': { HOME: fileOpsHome, USERPROFILE: fileOpsHome },
+  // file-audit (阶段二百九十九) pins the FileStream IDataInput/IDataOutput surface and
+  // the File members that came with it, and it moves whole directory trees around;
+  // it gets a home of its own for the same reason file-ops does.
+  'file-audit.as': { HOME: auditHome, USERPROFILE: auditHome },
   // The out-of-memory path needs a 32-bit address space that has actually run out,
   // which no CI runner and no fresh test process has. Making the segment carve fail
   // on request is the only way this unit can assert the same thing everywhere.

@@ -3456,39 +3456,171 @@ export class SymbolTable {
         implements: [],
       });
     }
-    // flash.filesystem (stage 64): File / FileStream / FileMode. NativeWindow and
-    // SQLConnection/SQLStatement are deferred (native multi-window management and
-    // SQLite linking, respectively).
+    // flash.filesystem (stage 64; B/C batch of the File gap audit in stage 291):
+    // FileReference / File / FileStream / FileMode / StorageVolume.
     //
-    // File: a filesystem path object. nativePath holds the raw path; url is the
-    // "file://" form. exists/isDirectory are read-only *properties* (real AIR:
-    // getter access f.exists, not f.exists()) probing via stat(); createDirectory
-    // runs mkdir; deleteFile/deleteDirectory run remove(); resolvePath joins a
-    // child. applicationStorageDirectory (handled at codegen time like the other
-    // File static directory shortcuts) resolves a writable per-app storage dir.
-    const filefld = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'File', isStatic: false, isConst: false });
-    const filegetr = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'File', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
-    const filemeth = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'File', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
-    this.classMap.set('File', {
+    // AIR's hierarchy is FileReference (flash.net) ← File (flash.filesystem), and it
+    // is modelled as a REAL inheritance chain here so `var fr:FileReference = f` and
+    // `f is FileReference` behave as they do in AIR (a File is passed to any API
+    // declared against FileReference, e.g. NativeDragManager.doDrag).
+    //
+    // FileReference is the "chooser result" object: it carries the data a browse or
+    // load would have produced. Measured on adl 51.4.1: every one of its accessors
+    // throws #2037 until such a result exists, while `data` answers null and the
+    // three setter-less members (cancel/requestPermission) are no-ops.
+    const frField = (cls: string, t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner: cls, isStatic: false, isConst: false });
+    const frGet = (cls: string, ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: cls, visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+    const frSet = (cls: string, type: string): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type, defaultValue: null, isRest: false }], owner: cls, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+    const frMeth = (cls: string, ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: cls, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    const frStatic = (cls: string, ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: cls, visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false });
+    // The File/FileReference getters AIR declares, in the SDK's own spelling: the
+    // three `acc ro` members the chooser fills in are Date objects, `data` is a
+    // ByteArray, and `size` is a Number (NOT uint -- 4 GB+ files are legal).
+    const dateT: CType = { kind: 'object', className: 'Date' };
+    const baT: CType = { kind: 'object', className: 'ByteArray' };
+    const fileT: CType = { kind: 'object', className: 'File' };
+    /**
+     * flash.net.FileReference: the AIR class File derives from (measure: `describeType`,
+     * temp/fileaudit2/desc.txt). Its members mirror a file the user picked; with no
+     * pick/load behind them every accessor throws AIR's #2037 "called in incorrect
+     * sequence". `data` is read-only in the SDK (there is no setter), and the four
+     * interactive members (browse/load/download/save/upload/uploadUnencoded) have no
+     * dialog or HTTP backend here -- they report themselves loudly in emit.ts.
+     */
+    this.classMap.set('FileReference', {
       fields: new Map([
-        ['nativePath', filefld({ kind: 'string' })],
+        ['_data', frField('FileReference', baT)],
+        ['_name', frField('FileReference', { kind: 'string' })],
+        ['_type', frField('FileReference', { kind: 'string' })],
+        ['_ext', frField('FileReference', { kind: 'string' })],
+        ['_creator', frField('FileReference', { kind: 'string' })],
+        ['_perm', frField('FileReference', { kind: 'string' })],
+        ['_size', frField('FileReference', { kind: 'number' })],
+        ['_cdate', frField('FileReference', dateT)],
+        ['_mdate', frField('FileReference', dateT)],
       ]),
       methods: new Map([
-        ['resolvePath', filemeth({ kind: 'object', className: 'File' }, [{ name: 'path', type: 'String', defaultValue: null, isRest: false }])],
-        ['createDirectory', filemeth({ kind: 'void' }, [])],
-        ['deleteFile', filemeth({ kind: 'void' }, [])],
+        // browse() answers a Boolean (true = a dialog was opened), unlike the
+        // browseFor* members on File, which are void -- measured with describeType.
+        ['browse', frMeth('FileReference', { kind: 'bool' }, [
+          { name: 'typeFilter', type: 'Array', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        ['cancel', frMeth('FileReference', { kind: 'void' }, [])],
+        ['download', frMeth('FileReference', { kind: 'void' }, [
+          { name: 'request', type: 'URLRequest', defaultValue: null, isRest: false },
+          { name: 'defaultFileName', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        ['load', frMeth('FileReference', { kind: 'void' }, [])],
+        ['requestPermission', frMeth('FileReference', { kind: 'void' }, [])],
+        ['save', frMeth('FileReference', { kind: 'void' }, [
+          { name: 'data', type: 'Object', defaultValue: null, isRest: false },
+          { name: 'defaultFileName', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        ['upload', frMeth('FileReference', { kind: 'void' }, [
+          { name: 'request', type: 'URLRequest', defaultValue: null, isRest: false },
+          { name: 'uploadDataFieldName', type: 'String', defaultValue: { kind: 'Str', value: 'Filedata' }, isRest: false },
+          { name: 'testUpload', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
+        ['uploadUnencoded', frMeth('FileReference', { kind: 'void' }, [
+          { name: 'request', type: 'URLRequest', defaultValue: null, isRest: false },
+        ])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['creationDate', frGet('FileReference', dateT)],
+        ['creator', frGet('FileReference', { kind: 'string' })],
+        ['data', frGet('FileReference', baT)],
+        ['extension', frGet('FileReference', { kind: 'string' })],
+        ['modificationDate', frGet('FileReference', dateT)],
+        ['name', frGet('FileReference', { kind: 'string' })],
+        ['size', frGet('FileReference', { kind: 'number' })],
+        ['type', frGet('FileReference', { kind: 'string' })],
+      ]),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      // AIR's SDK reports `isFinal=true` for BOTH FileReference and File, yet File
+      // is declared as extending FileReference and mxmlc 51.4.1 happily compiles
+      // `class Mine extends FileReference` (measured: temp/fileaudit2/fin.as). The
+      // SDK's final flag is therefore not enforced for this class, and modelling it
+      // as final here would make our own `File extends FileReference` illegal -- so
+      // this model keeps it open, which is also what the measured compiler does.
+      isFinal: false,
+      implements: [],
+      fqn: 'flash.net::FileReference',
+    });
+    /**
+     * flash.net.FileReferenceList: the multi-select chooser. Measured on adl 51.4.1
+     * (temp/fileaudit2/AH.as): `fileList` starts out NULL -- not an empty Array --
+     * and is read-only; there is no `selectMultiple` constant on this class (that
+     * one belongs to FileListEvent); browse() answers a Boolean. Nothing can ever
+     * fill fileList in this build because there is no native dialog backend, so
+     * browse() reports itself and answers false (see emit.ts).
+     */
+    this.classMap.set('FileReferenceList', {
+      fields: new Map([
+        ['_fileList', frField('FileReferenceList', { kind: 'array' })],
+      ]),
+      methods: new Map([
+        ['browse', frMeth('FileReferenceList', { kind: 'bool' }, [
+          { name: 'typeFilter', type: 'Array', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+      ]),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['fileList', frGet('FileReferenceList', { kind: 'array' })],
+      ]),
+      setters: new Map(),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+      fqn: 'flash.net::FileReferenceList',
+    });
+    // File: a filesystem path object (AIR: File extends FileReference, and the path
+    // members it adds are nativePath / url / parent / exists / isDirectory /
+    // isHidden / isSymbolicLink / isPackage / spaceAvailable / downloaded /
+    // preventBackup / icon, plus the copy/move/clone/relative-path members).
+    //
+    // The nine FileReference accessors are OVERRIDDEN here with live filesystem
+    // answers -- measured: on a File they never throw #2037, they read the path.
+    this.classMap.set('File', {
+      fields: new Map([
+        // nativePath must stay PUBLICLY READABLE: AIR exposes it as a read-write
+        // property and existing code reads it (`f.nativePath`), while the write path
+        // is intercepted by the declared setter below. The field itself therefore
+        // stays public and the setter only adds the normalisation + validation.
+        ['nativePath', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'File', isStatic: false, isConst: false }],
+        // preventBackup is an ordinary stored flag: AIR accepts the assignment and
+        // then reads back FALSE on macOS (measured), so there is nothing to tell the
+        // OS here -- the field is the honest model, exactly as it was for the shell's
+        // downloadable counterpart.
+        ['_preventBackup', frField('File', { kind: 'bool' })],
+      ]),
+      methods: new Map([
+        // cancel() is INHERITED from FileReference in AIR, and File overrides it to
+        // cancel the async work in flight (a directory listing or a delete). Without
+        // this declaration the vtable slot kept FileReference's no-op body, so
+        // `file.cancel()` silently cancelled NOTHING and the pending listing still
+        // arrived -- caught by examples/file-listing-async.as.
+        ['cancel', frMeth('File', { kind: 'void' }, [])],
+        ['resolvePath', frMeth('File', fileT, [{ name: 'path', type: 'String', defaultValue: null, isRest: false }])],
+        ['createDirectory', frMeth('File', { kind: 'void' }, [])],
+        ['deleteFile', frMeth('File', { kind: 'void' }, [])],
         // deleteDirectory(deleteDirectory = false). The flag means RECURSIVE, not
         // "the path must be a directory": with it set, a file path is deleted too
         // (measured on adl 51.4.1 -- see as_file_delete_err in emit.ts, which also
         // carries the measured #2037/#3003/#3006/#3007/#3010 table).
-        ['deleteDirectory', filemeth({ kind: 'void' }, [{ name: 'deleteDirectory', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
+        ['deleteDirectory', frMeth('File', { kind: 'void' }, [{ name: 'deleteDirectory', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
         // moveTo(newFile, overwrite = false): a real rename() (see the C body in
         // emit.ts). AIR declares TWO parameters -- mxmlc rejects a third -- so the
         // older `force` parameter is gone; the measured error table (#2007 for a
         // null destination, #3003 for a missing source, #3012 for an existing
         // target without overwrite) is in that body.
-        ['moveTo', filemeth({ kind: 'void' }, [
-          { name: 'newFile', type: 'File', defaultValue: null, isRest: false },
+        ['moveTo', frMeth('File', { kind: 'void' }, [
+          { name: 'newFile', type: 'FileReference', defaultValue: null, isRest: false },
           { name: 'overwrite', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
         ])],
         // moveToTrash(): move the item to the system trash (AIR 2). Measured on
@@ -3496,82 +3628,152 @@ export class SymbolTable {
         // is a compile error), throws #3003 when the path does not exist, #2038
         // when the filesystem refuses, #2037 on a File with no nativePath, and
         // leaves nativePath untouched on success. See the C body in emit.ts.
-        ['moveToTrash', filemeth({ kind: 'void' }, [])],
+        ['moveToTrash', frMeth('File', { kind: 'void' }, [])],
         // moveToTrashAsync() reports the same failures as events instead of
         // throwing (measured: ioError with errorID 3003, or COMPLETE); only the
         // empty-File case throws #2037.
-        ['moveToTrashAsync', filemeth({ kind: 'void' }, [])],
-        ['getDirectoryListing', filemeth({ kind: 'array' }, [])],
+        ['moveToTrashAsync', frMeth('File', { kind: 'void' }, [])],
+        ['getDirectoryListing', frMeth('File', { kind: 'array' }, [])],
         // The async half of the File API (AIR delivers the result as an event).
-        // getDirectoryListingAsync is implemented for real (it lists now and
-        // dispatches FileListEvent.DIRECTORY_LISTING); the delete pair deletes and
-        // dispatches Event.COMPLETE; the four interactive/platform ones have no
-        // backend here and report themselves loudly (see emit.ts).
-        ['getDirectoryListingAsync', filemeth({ kind: 'void' }, [])],
-        ['deleteFileAsync', filemeth({ kind: 'void' }, [])],
-        ['deleteDirectoryAsync', filemeth({ kind: 'void' }, [{ name: 'deleteDirectory', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
-        ['browseForDirectory', filemeth({ kind: 'void' }, [{ name: 'title', type: 'String', defaultValue: null, isRest: false }])],
-        ['browseForOpen', filemeth({ kind: 'void' }, [
+        // getDirectoryListingAsync is implemented for real (it lists on the IO
+        // thread and dispatches FileListEvent.DIRECTORY_LISTING); the delete pair
+        // deletes and dispatches Event.COMPLETE; the four interactive/platform ones
+        // have no backend here and report themselves loudly (see emit.ts).
+        ['getDirectoryListingAsync', frMeth('File', { kind: 'void' }, [])],
+        ['deleteFileAsync', frMeth('File', { kind: 'void' }, [])],
+        ['deleteDirectoryAsync', frMeth('File', { kind: 'void' }, [{ name: 'deleteDirectory', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }])],
+        ['browseForDirectory', frMeth('File', { kind: 'void' }, [{ name: 'title', type: 'String', defaultValue: null, isRest: false }])],
+        ['browseForOpen', frMeth('File', { kind: 'void' }, [
           { name: 'title', type: 'String', defaultValue: null, isRest: false },
           { name: 'typeFilter', type: 'Array', defaultValue: { kind: 'Null' }, isRest: false },
         ])],
-        ['openWithDefaultApplication', filemeth({ kind: 'void' }, [])],
-        // cancel(): FileReference's "cancel the pending async operation". Every async
-        // member of this File (getDirectoryListingAsync, the delete pair) completes
-        // synchronously, so nothing is ever in flight and there is genuinely nothing
-        // to cancel -- a no-op rather than an unsupported report.
-        ['cancel', filemeth({ kind: 'void' }, [])],
-        // upload(request, uploadDataFieldName = null, testUpload = false): POST the
-        // file as multipart/form-data. No HTTP upload backend exists here; the body
-        // reports itself loudly and dispatches nothing (see emit.ts) so a caller
-        // waiting on DataEvent.UPLOAD_COMPLETE_DATA is not falsely told it finished.
-        ['upload', filemeth({ kind: 'void' }, [
-          { name: 'request', type: 'URLRequest', defaultValue: null, isRest: false },
-          { name: 'uploadDataFieldName', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
-          { name: 'testUpload', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ['browseForOpenMultiple', frMeth('File', { kind: 'void' }, [
+          { name: 'title', type: 'String', defaultValue: null, isRest: false },
+          { name: 'typeFilter', type: 'Array', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        ['browseForSave', frMeth('File', { kind: 'void' }, [
+          { name: 'title', type: 'String', defaultValue: null, isRest: false },
+        ])],
+        ['openWithDefaultApplication', frMeth('File', { kind: 'void' }, [])],
+        // clone(): a NEW File with the same path (measured: not the same object,
+        // equal nativePath). Throws #2037 on a File with no path, like every other
+        // member that needs one.
+        ['clone', frMeth('File', fileT, [])],
+        // canonicalize(): replace the path with its canonical form, i.e. resolve
+        // symlinks. Measured on adl 51.4.1 (temp/fileaudit2/AG.as): only a path that
+        // EXISTS is resolved ("/tmp" -> "/private/tmp"), while a path with a
+        // nonexistent tail is left exactly as written -- /tmp/x/y stays /tmp/x/y,
+        // NOT /private/tmp/x/y. #2037 on a File with no path.
+        ['canonicalize', frMeth('File', { kind: 'void' }, [])],
+        // copyTo(newFile, overwrite = false): copied from the same measured table as
+        // moveTo (#2007 null destination, #3003 missing source, #3012 existing
+        // target without overwrite, #3014 copying a directory into itself); parent
+        // directories of the destination are created, and a directory source is
+        // copied recursively.
+        ['copyTo', frMeth('File', { kind: 'void' }, [
+          { name: 'newFile', type: 'FileReference', defaultValue: null, isRest: false },
+          { name: 'overwrite', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
+        // The async pair completes with Event.COMPLETE / IOErrorEvent(ioError) and
+        // leaves the receiver's nativePath alone (measured for both directions).
+        ['copyToAsync', frMeth('File', { kind: 'void' }, [
+          { name: 'newFile', type: 'FileReference', defaultValue: null, isRest: false },
+          { name: 'overwrite', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
+        ['moveToAsync', frMeth('File', { kind: 'void' }, [
+          { name: 'newFile', type: 'FileReference', defaultValue: null, isRest: false },
+          { name: 'overwrite', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        ])],
+        // getRelativePath(ref, useDotDot = false): the path FROM THIS FILE TO `ref`
+        // (measured -- the documented "of this relative to ref" reads the other way
+        // but adl answers `p.getRelativePath(parent)` == ".."), component-wise and
+        // refused with null when a ".." would be needed and useDotDot is false.
+        ['getRelativePath', frMeth('File', { kind: 'string' }, [
+          { name: 'ref', type: 'FileReference', defaultValue: null, isRest: false },
+          { name: 'useDotDot', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
         ])],
       ]),
       staticFields: new Map(),
-      staticMethods: new Map(),
+      staticMethods: new Map([
+        // The three static methods AIR declares on File (temp/fileaudit2/desc.txt).
+        // getRootDirectories answers an Array of File, NOT of StorageVolume.
+        ['createTempDirectory', frStatic('File', fileT, [])],
+        ['createTempFile', frStatic('File', fileT, [])],
+        ['getRootDirectories', frStatic('File', { kind: 'array' }, [])],
+      ]),
       getters: new Map([
-        ['url', filegetr({ kind: 'string' })],
+        // url: "file://" + encoded nativePath, or the app:/app-storage: virtual
+        // schemes for paths inside those two roots (see File_get_url in emit.ts).
+        ['url', frGet('File', { kind: 'string' })],
         // name: the last path component (AIR's File.name), and parent: the containing
         // directory as a File (null at the filesystem root, like AIR). Both are real
         // path splits on '/' and '\\' (see emit.ts).
-        ['name', filegetr({ kind: 'string' })],
-        // extension: the text after the last dot of the name, or "" when there is
-        // none. A dot-file (".DS_Store") has NO extension in AIR, not "DS_Store".
-        ['extension', filegetr({ kind: 'string' })],
-        // type: AIR declares this on FileReference (File's superclass); we model the
-        // flattened File, so it lives here. On Windows/Linux AIR documents it as the
-        // file's extension, and the published AIR apps compare it as a
-        // dot-prefixed lower-case string (e.g. upLoadView's ['.ppt','.pptx','.pdf']),
-        // so it is emitted as "." + extension lower-cased, "" when there is none.
-        ['type', filegetr({ kind: 'string' })],
-        ['parent', filegetr({ kind: 'object', className: 'File' })],
-        ['exists', filegetr({ kind: 'bool' })],
-        ['isDirectory', filegetr({ kind: 'bool' })],
+        ['name', frGet('File', { kind: 'string' })],
+        // extension: the text after the last dot of the name. A dot-file
+        // (".DS_Store") has NO extension in AIR (but the filesystem root reports
+        // NULL, not "" -- measured).
+        ['extension', frGet('File', { kind: 'string' })],
+        // type: AIR declares this on FileReference (File's superclass); on
+        // Windows/Linux AIR documents it as the file's extension, and the published
+        // AIR apps compare it as a dot-prefixed lower-case string (e.g.
+        // upLoadView's ['.ppt','.pptx','.pdf']), so it is emitted as "." + extension
+        // lower-cased, "" when there is none.
+        ['type', frGet('File', { kind: 'string' })],
+        ['parent', frGet('File', fileT)],
+        ['exists', frGet('File', { kind: 'bool' })],
+        ['isDirectory', frGet('File', { kind: 'bool' })],
         // isSymbolicLink: lstat()/S_ISLNK on POSIX, FILE_ATTRIBUTE_REPARSE_POINT on
         // Windows (AIR reports true for NTFS junctions too). Note this is the ONE
         // File predicate that must NOT follow the link: isDirectory answers about
         // the TARGET, isSymbolicLink about the link itself. A recursive walk that
         // ignores it re-enters framework `Versions/Current` chains and reports an
         // inflated size (measured: ~/Library/Caches 7.6 GB -> 124 GB).
-        ['isSymbolicLink', filegetr({ kind: 'bool' })],
-        ['isHidden', filegetr({ kind: 'bool' })],
+        ['isSymbolicLink', frGet('File', { kind: 'bool' })],
+        ['isHidden', frGet('File', { kind: 'bool' })],
         // size: the file's length in bytes (AIR's File.size:Number). Measured
         // stat() rather than cached, so a file that grows on disk is seen
         // immediately. Measured on adl 51.4.1: a missing path THROWS #3003 (it does
         // NOT return 0 -- this comment said the opposite until the delete-alignment
         // measurement), a File with no nativePath throws #2037, and a directory
         // reports 0 rather than its own st_size.
-        ['size', filegetr({ kind: 'number' })],
+        ['size', frGet('File', { kind: 'number' })],
         // spaceAvailable: free bytes on the volume holding the path (AIR 2). Real
         // filesystem query -- GetDiskFreeSpaceExA / statvfs(), see as_file_space_available
         // in emit.ts. 0 when the OS cannot resolve the path, and 0 for a path that
         // is neither a regular file nor a directory (measured: /dev/null is 0 while
         // a plain file reports its volume's figure).
-        ['spaceAvailable', filegetr({ kind: 'number' })],
+        ['spaceAvailable', frGet('File', { kind: 'number' })],
+        // creationDate / modificationDate: Date objects built from the file's
+        // birth/modification time (milliseconds since the epoch, exactly st_birthtime
+        // / st_mtim on this platform -- measured against `stat -f %B`). A missing
+        // path throws #3003, a File with no path #2037. Directories answer too.
+        ['creationDate', frGet('File', dateT)],
+        ['modificationDate', frGet('File', dateT)],
+        // creator / data: both null on a File (measured), even for a file that
+        // exists: `creator` is the classic-Mac type and `data` is only filled by a
+        // FileReference load, which a File never performs.
+        ['creator', frGet('File', { kind: 'string' })],
+        ['data', frGet('File', baT)],
+        // icon: a flash.desktop.Icon for the file. This build has no icon
+        // EXTRACTION (that is LaunchServices/Cocoa artwork), so the object exists
+        // with an EMPTY bitmaps array and the member reports itself once on stderr
+        // -- see File_get_icon in emit.ts, which never pretends to have artwork.
+        ['icon', frGet('File', { kind: 'object', className: 'Icon' })],
+        // downloaded: the "came from the network" flag. AIR keeps it in the
+        // com.apple.quarantine xattr on macOS (measured: setting it makes a NEW File
+        // for the same path report true, and setting it back to false does NOT clear
+        // the flag), so this reads/writes that xattr.
+        ['downloaded', frGet('File', { kind: 'bool' })],
+        // isPackage / preventBackup (AIR macOS): a package is a directory
+        // LaunchServices treats as one. Measured extension set on adl 51.4.1 --
+        // .app/.bundle/.plugin/.kext/.xpc/.appex/.docset/.pkg are packages while
+        // .framework/.lproj are NOT -- so this is a directory whose extension is in
+        // that measured set (see as_file_is_package in emit.ts).
+        ['isPackage', frGet('File', { kind: 'bool' })],
+        // preventBackup: rw in AIR but a plain stored flag for us -- measured on
+        // adl/macOS, assigning true then reading back answers FALSE (AIR only
+        // honours the flag on iOS), so storing the value is the honest model.
+        ['preventBackup', frGet('File', { kind: 'bool' })],
       ]),
       setters: new Map([
         // nativePath stays a FIELD (reflection, GC scanning and every hand-written
@@ -3579,62 +3781,129 @@ export class SymbolTable {
         // assignment is NORMALISED and validated the way AIR does it. The emitter
         // prefers a declared setter over the field on the write path, so
         // `f.nativePath = x` reaches File_set_nativePath (see emit.ts).
-        ['nativePath', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'File', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        ['nativePath', frSet('File', 'String')],
+        // url = "file:///..." -- AIR accepts ONLY the file scheme, decodes
+        // percent-escapes (measured: file:///tmp/a%20b.txt -> /tmp/a b.txt), and
+        // throws #2004 for anything else (http:, a bare word, "").
+        ['url', frSet('File', 'String')],
+        ['downloaded', frSet('File', 'Boolean')],
+        ['preventBackup', frSet('File', 'Boolean')],
       ]),
       constructor: { params: [
         { name: 'path', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
       ] },
-      superClass: 'EventDispatcher',
-      isFinal: false,
+      superClass: 'FileReference',
+      isFinal: true,
       implements: [],
       // flash.filesystem::File must round-trip getQualifiedClassName so the
       // Starling AssetManager can distinguish it from unsupported asset types.
       fqn: 'flash.filesystem::File',
     });
-    // FileStream: a POSIX FILE* wrapper. open() maps an AIR FileMode string
-    // ("read"/"write"/"append"/"update") to a C fopen mode and keeps the handle
-    // (opaque void*, not GC-tracked). readUTFBytes/writeUTFBytes transfer UTF-8.
-    const fsfld = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'FileStream', isStatic: false, isConst: false });
-    const fsgetr = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'FileStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
-    const fsmeth = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'FileStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
+    // FileStream: a POSIX FILE* wrapper implementing the full IDataInput/IDataOutput
+    // pair (pass B of the gap audit -- it used to expose only 7 of 30 members and
+    // no interface at all).
+    //
+    // The measured adl 51.4.1 contract the C bodies follow (temp/fileaudit2/t.txt,
+    // u.txt, x.txt):
+    //   * endian = "bigEndian", objectEncoding = 3, readAhead = Infinity;
+    //   * every read/write/bytesAvailable/truncate on a stream that is not open, or
+    //     on the wrong side of it, throws Error #2029 ("This URLStream object does
+    //     not have a stream opened.") -- a WRITE or APPEND handle has no read side;
+    //   * position is settable on read/write/update (negative -> #2006) but #2037 on
+    //     an APPEND stream, which always opens at end-of-file;
+    //   * reads past EOF throw EOFError #2030 rather than returning a truncated
+    //     value (readUTFBytes included);
+    //   * truncate() cuts the file at `position` and needs a writable handle.
+    const fsField = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'FileStream', isStatic: false, isConst: false, isAccessor: true });
     this.classMap.set('FileStream', {
       fields: new Map([
-        ['_handle', fsfld({ kind: 'null' })],
+        ['_handle', { type: { kind: 'null' }, init: null, visibility: 'private', owner: 'FileStream', isStatic: false, isConst: false }],
+        // Mode class of the open handle: 0 none, 1 read, 2 write, 3 append, 4
+        // update. It decides which side of the stream is usable, which is what
+        // #2029 is about.
+        ['_mode', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'FileStream', isStatic: false, isConst: false }],
+        ['_endian', fsField({ kind: 'string' })],
+        ['_enc', fsField({ kind: 'uint' })],
+        ['_ra', fsField({ kind: 'number' })],
       ]),
       methods: new Map([
-        ['open', fsmeth({ kind: 'void' }, [
+        ['open', frMeth('FileStream', { kind: 'void' }, [
           { name: 'file', type: 'File', defaultValue: null, isRest: false },
           { name: 'fileMode', type: 'String', defaultValue: null, isRest: false },
         ])],
-        ['openAsync', fsmeth({ kind: 'void' }, [
+        ['openAsync', frMeth('FileStream', { kind: 'void' }, [
           { name: 'file', type: 'File', defaultValue: null, isRest: false },
           { name: 'fileMode', type: 'String', defaultValue: null, isRest: false },
         ])],
-        ['close', fsmeth({ kind: 'void' }, [])],
-        ['readUTFBytes', fsmeth({ kind: 'string' }, [{ name: 'length', type: 'uint', defaultValue: null, isRest: false }])],
-        ['writeUTFBytes', fsmeth({ kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
-        ['readBytes', fsmeth({ kind: 'void' }, [
+        ['close', frMeth('FileStream', { kind: 'void' }, [])],
+        // truncate(): cut the file at the current position (needs a writable side).
+        ['truncate', frMeth('FileStream', { kind: 'void' }, [])],
+        ['readBoolean', frMeth('FileStream', { kind: 'bool' }, [])],
+        ['readByte', frMeth('FileStream', { kind: 'int' }, [])],
+        ['readBytes', frMeth('FileStream', { kind: 'void' }, [
           { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
           { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
           { name: 'length', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         ])],
-        ['writeBytes', fsmeth({ kind: 'void' }, [
+        ['readDouble', frMeth('FileStream', { kind: 'number' }, [])],
+        ['readFloat', frMeth('FileStream', { kind: 'number' }, [])],
+        ['readInt', frMeth('FileStream', { kind: 'int' }, [])],
+        ['readMultiByte', frMeth('FileStream', { kind: 'string' }, [
+          { name: 'length', type: 'uint', defaultValue: null, isRest: false },
+          { name: 'charSet', type: 'String', defaultValue: null, isRest: false },
+        ])],
+        ['readObject', frMeth('FileStream', { kind: 'any' }, [])],
+        ['readShort', frMeth('FileStream', { kind: 'int' }, [])],
+        ['readUTF', frMeth('FileStream', { kind: 'string' }, [])],
+        ['readUTFBytes', frMeth('FileStream', { kind: 'string' }, [{ name: 'length', type: 'uint', defaultValue: null, isRest: false }])],
+        ['readUnsignedByte', frMeth('FileStream', { kind: 'uint' }, [])],
+        ['readUnsignedInt', frMeth('FileStream', { kind: 'uint' }, [])],
+        ['readUnsignedShort', frMeth('FileStream', { kind: 'uint' }, [])],
+        ['writeBoolean', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'Boolean', defaultValue: null, isRest: false }])],
+        ['writeByte', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'int', defaultValue: null, isRest: false }])],
+        ['writeBytes', frMeth('FileStream', { kind: 'void' }, [
           { name: 'bytes', type: 'ByteArray', defaultValue: null, isRest: false },
           { name: 'offset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
           { name: 'length', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         ])],
+        ['writeDouble', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }])],
+        ['writeFloat', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'Number', defaultValue: null, isRest: false }])],
+        ['writeInt', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'int', defaultValue: null, isRest: false }])],
+        ['writeMultiByte', frMeth('FileStream', { kind: 'void' }, [
+          { name: 'value', type: 'String', defaultValue: null, isRest: false },
+          { name: 'charSet', type: 'String', defaultValue: null, isRest: false },
+        ])],
+        // The parameter must be `any`: IDataOutput's slot takes an as_value, and the
+        // interface vtable stores ONE function-pointer type for every implementor.
+        ['writeObject', frMeth('FileStream', { kind: 'void' }, [{ name: 'object', type: 'any', defaultValue: null, isRest: false }])],
+        ['writeShort', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'int', defaultValue: null, isRest: false }])],
+        ['writeUTF', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
+        ['writeUTFBytes', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
+        ['writeUnsignedInt', frMeth('FileStream', { kind: 'void' }, [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }])],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map([
-        ['bytesAvailable', fsgetr({ kind: 'uint' })],
-        ['position', fsgetr({ kind: 'uint' })],
+        // bytesAvailable is uint on IDataInput; position/readAhead are Number on
+        // FileStream (NOT uint -- the old model had position:uint, which silently
+        // truncated >4 GB offsets).
+        ['bytesAvailable', frGet('FileStream', { kind: 'uint' })],
+        ['position', frGet('FileStream', { kind: 'number' })],
+        ['endian', frGet('FileStream', { kind: 'string' })],
+        ['objectEncoding', frGet('FileStream', { kind: 'uint' })],
+        ['readAhead', frGet('FileStream', { kind: 'number' })],
       ]),
-      setters: new Map(),
+      setters: new Map([
+        ['position', frSet('FileStream', 'Number')],
+        ['endian', frSet('FileStream', 'String')],
+        ['objectEncoding', frSet('FileStream', 'uint')],
+        ['readAhead', frSet('FileStream', 'Number')],
+      ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
-      isFinal: false,
-      implements: [],
+      isFinal: true,
+      implements: ['IDataInput', 'IDataOutput'],
+      fqn: 'flash.filesystem::FileStream',
     });
     // FileMode: constant strings passed to FileStream.open.
     const fmodec = (owner: string, value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true });
@@ -3654,6 +3923,86 @@ export class SymbolTable {
       superClass: 'Object',
       isFinal: false,
       implements: [],
+    });
+    // flash.filesystem.StorageVolume (NOT flash.desktop -- measured: the class lives
+    // in flash.filesystem and `flash.desktop.StorageVolume` throws #1065). It is a
+    // passive descriptor with six read-only members and a six-argument constructor
+    // whose order is measured from the SDK: (rootDirectory, drive, isRemovable,
+    // isWritable, fileSystemType, name).
+    this.classMap.set('StorageVolume', {
+      fields: new Map([
+        ['_rootDirectory', frField('StorageVolume', fileT)],
+        ['_drive', frField('StorageVolume', { kind: 'string' })],
+        ['_removable', frField('StorageVolume', { kind: 'bool' })],
+        ['_writable', frField('StorageVolume', { kind: 'bool' })],
+        ['_fsType', frField('StorageVolume', { kind: 'string' })],
+        ['_name', frField('StorageVolume', { kind: 'string' })],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['rootDirectory', frGet('StorageVolume', fileT)],
+        ['drive', frGet('StorageVolume', { kind: 'string' })],
+        ['isRemovable', frGet('StorageVolume', { kind: 'bool' })],
+        ['isWritable', frGet('StorageVolume', { kind: 'bool' })],
+        ['fileSystemType', frGet('StorageVolume', { kind: 'string' })],
+        ['name', frGet('StorageVolume', { kind: 'string' })],
+      ]),
+      setters: new Map(),
+      // The argument order is the DOCUMENTED one, and adl 51.4.1 answers it exactly
+      // (measured: temp/fileaudit2/AF.as constructs ("/", "/", false, true, "apfs",
+      // "Macintosh HD") and reads back drive "Macintosh HD", isRemovable true,
+      // isWritable false, fileSystemType "apfs", name "/") -- i.e. name and drive
+      // are the SECOND and LAST arguments, not the second and sixth the field order
+      // here might suggest.
+      constructor: { params: [
+        { name: 'rootDirectory', type: 'File', defaultValue: null, isRest: false },
+        { name: 'name', type: 'String', defaultValue: null, isRest: false },
+        { name: 'isWritable', type: 'Boolean', defaultValue: null, isRest: false },
+        { name: 'isRemovable', type: 'Boolean', defaultValue: null, isRest: false },
+        { name: 'fileSystemType', type: 'String', defaultValue: null, isRest: false },
+        { name: 'drive', type: 'String', defaultValue: null, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: true,
+      implements: [],
+      fqn: 'flash.filesystem::StorageVolume',
+    });
+    // flash.events.StorageVolumeChangeEvent: the volume mount/unmount event. AIR's
+    // constructor order and member set are measured (temp/fileaudit2/ab.txt):
+    // (type, bubbles = false, cancelable = false, rootDirectory = null,
+    // storageVolume = null), with the two constant strings below. `clone()` answers
+    // another StorageVolumeChangeEvent carrying the same five values.
+    this.classMap.set('StorageVolumeChangeEvent', {
+      fields: new Map([
+        ['_rootDirectory', frField('StorageVolumeChangeEvent', fileT)],
+        ['_volume', frField('StorageVolumeChangeEvent', { kind: 'object', className: 'StorageVolume' })],
+      ]),
+      methods: new Map([
+        ['clone', frMeth('StorageVolumeChangeEvent', { kind: 'object', className: 'Event' }, [])],
+      ]),
+      staticFields: new Map([
+        ['STORAGE_VOLUME_MOUNT', { type: { kind: 'string' }, init: { kind: 'Str', value: 'storageVolumeMount' }, visibility: 'public', owner: 'StorageVolumeChangeEvent', isStatic: true, isConst: true }],
+        ['STORAGE_VOLUME_UNMOUNT', { type: { kind: 'string' }, init: { kind: 'Str', value: 'storageVolumeUnmount' }, visibility: 'public', owner: 'StorageVolumeChangeEvent', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['rootDirectory', frGet('StorageVolumeChangeEvent', fileT)],
+        ['storageVolume', frGet('StorageVolumeChangeEvent', { kind: 'object', className: 'StorageVolume' })],
+      ]),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        { name: 'bubbles', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        { name: 'cancelable', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        { name: 'rootDirectory', type: 'File', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'storageVolume', type: 'StorageVolume', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: true,
+      implements: [],
+      fqn: 'flash.events::StorageVolumeChangeEvent',
     });
     // Stage 41 constant classes: pure static String constants (zero runtime
     // dependency), mirroring the AIR SDK values verbatim.
@@ -4281,17 +4630,43 @@ export class SymbolTable {
       [],
       [shBoolP('fastCompression', false)],
       []);
-    // flash.net.FileFilter: the chooser filter (description + extension list).
-    shell('FileFilter', 'flash.net::FileFilter', 'Object',
-      [['description', { kind: 'string' }], ['extension', { kind: 'string' }], ['macType', { kind: 'string' }], ['winType', { kind: 'string' }], ['name', { kind: 'string' }]],
-      [],
-      [shReq('description', 'String'), shReq('extension', 'String'), shNullP('macType', 'String'), shNullP('winType', 'String')],
-      [['clone', shObj('FileFilter'), []]]);
-    // flash.events.FileListEvent: File.getDirectoryListingAsync()'s result.
+    // flash.net.FileFilter: the file-chooser filter (a description plus a
+    // semicolon-separated extension list). A REAL class now, not a shell: adl's
+    // describeType shows exactly three read-write members (description, extension,
+    // macType) and a THREE-argument constructor -- the older shell also declared
+    // `winType` and `name`, and a `clone()` that AIR 51.4 does not have at all
+    // (mxmlc rejects `ff.clone()`: measured, temp/fileaudit2/AA.as). Both invented
+    // members are gone.
+    this.classMap.set('FileFilter', {
+      fields: new Map([
+        ['description', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'FileFilter', isStatic: false, isConst: false }],
+        ['extension', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'FileFilter', isStatic: false, isConst: false }],
+        ['macType', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'FileFilter', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map(),
+      staticMethods: new Map(),
+      getters: new Map(),
+      setters: new Map(),
+      constructor: { params: [
+        { name: 'description', type: 'String', defaultValue: null, isRest: false },
+        { name: 'extension', type: 'String', defaultValue: null, isRest: false },
+        { name: 'macType', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+      ] },
+      superClass: 'Object',
+      isFinal: true,
+      implements: [],
+      fqn: 'flash.net::FileFilter',
+    });
+    // flash.events.FileListEvent: File.getDirectoryListingAsync()'s result. AIR
+    // 51.4 declares exactly two constants and ONE member (`files:Array`); the
+    // `directory` accessor this shell used to declare is not in the 51.4 SDK at all
+    // (describeType: temp/fileaudit2/desc.txt), and the constructor takes four
+    // parameters, not five.
     shell('FileListEvent', 'flash.events::FileListEvent', 'Event',
-      [['directory', shObj('File')], ['files', { kind: 'array' }]],
-      [['DIRECTORY_LISTING', 'directoryListing']],
-      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNullP('directory', 'File'), shNullP('files', 'Array')],
+      [['files', { kind: 'array' }]],
+      [['DIRECTORY_LISTING', 'directoryListing'], ['SELECT_MULTIPLE', 'selectMultiple']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNullP('files', 'Array')],
       [['clone', shObj('Event'), []]]);
     // flash.events.NativeWindowBoundsEvent: NativeWindow move/resize.
     shell('NativeWindowBoundsEvent', 'flash.events::NativeWindowBoundsEvent', 'Event',
@@ -7670,7 +8045,10 @@ export class SymbolTable {
       IMEConversionMode: 'flash.system::IMEConversionMode',
       Security: 'flash.system::Security', LoaderContext: 'flash.system::LoaderContext',
       File: 'flash.filesystem::File', FileStream: 'flash.filesystem::FileStream',
-      FileMode: 'flash.filesystem::FileMode',
+      FileMode: 'flash.filesystem::FileMode', FileReference: 'flash.net::FileReference',
+    FileReferenceList: 'flash.net::FileReferenceList',
+      StorageVolume: 'flash.filesystem::StorageVolume',
+      StorageVolumeChangeEvent: 'flash.events::StorageVolumeChangeEvent',
       Clipboard: 'flash.desktop::Clipboard', NativeApplication: 'flash.desktop::NativeApplication',
       Mouse: 'flash.ui::Mouse', MouseCursor: 'flash.ui::MouseCursor', Keyboard: 'flash.ui::Keyboard',
       Multitouch: 'flash.ui::Multitouch', MultitouchInputMode: 'flash.ui::MultitouchInputMode',
