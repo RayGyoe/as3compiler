@@ -46,3 +46,5 @@ import './unit/fre.ts';
 import './unit/fqn-static.ts';
 import './unit/testinfra.ts';
 import './unit/async-workers.ts';
+import './unit/release.ts';
+import './unit/windows-release.ts';

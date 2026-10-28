@@ -92,6 +92,13 @@ as-aot examples/fib.as --run
 # Specify output name / specify the C compiler
 as-aot examples/class.as -o build/class --cc clang --run
 
+# Build a macOS .app directly (development/internal use, ad-hoc signed)
+as-aot --air-app app.xml --package app -o build/Main
+
+# macOS Developer ID + notarized DMG / Windows resource exe (on their respective hosts)
+as-aot --air-app app.xml --package dmg -o build/Main
+as-aot --air-app app.xml --cc clang --package exe -o build/Main
+
 # Generate a macOS .app Xcode project (--package xcode-project: open/build/debug in Xcode, product is an .app)
 as-aot src/Main.as --target native --package xcode-project -o build/Main
 
@@ -182,6 +189,14 @@ two-hundred-seventy-two): the GL build's import table is measured clean (13 DLLs
 covers the loader and import surface only — it has never been run on real Win7 hardware**, and the full list of
 what is and is not proven is in [`win32.md`](docs/en/win32.md) §6.
 
+**One-command release packaging (stages 306–308)**: `--package app` builds a macOS `.app` from AIR
+`<id>`/`<name>`/`<versionNumber>`/`<versionLabel>`/`<icon>` metadata and ad-hoc signs it. `--package dmg` signs
+nested native libraries and ANEs deepest-first with Developer ID + Hardened Runtime, then notarizes and staples
+the app and UDZO DMG and runs Gatekeeper checks. `--package exe` adds ICO, VERSIONINFO, a DPI/long-path
+application manifest and optional Authenticode on Windows. Credentials stay in non-secret manifest fields,
+environment variables and Keychain; password logs are redacted. `xcode-project` remains the IDE/debugging route.
+See [`release-packaging.md`](docs/en/release-packaging.md).
+
 **ANE loading (stage one-hundred-seventy-eight)**: `--ane` / the manifest's `ane-paths` switch on `ASC_HAVE_FRE` and wire in the host FRE runtime.
 Each entry may be an `.ane` package **or an unpacked directory** (`extension.xml` + `<platform key>/<native library>`, i.e. `adt`'s staging layout) —
 the latter is the default form of the artifact rebuilt for AOT: its native library imports the host library (`asaot.dll` on Windows, `libasaot.dylib` on macOS, which forwards into **the generated program's own table**),
@@ -225,8 +240,8 @@ only stubs are exported and they **report loudly** when called, never silently r
 A rebuilt product is a **staging directory tree** (`extension.xml` + `<platform>/<library>`, unpackaged); dropping it into `<appDir>/ext-aot/<extension id>/`
 makes it get picked up automatically, so `adl` keeps using the original ANE and the two paths do not interfere.
 
-Build manifest (JSON) fields: `target` (`native`/`wasm`), `package` (`raw`/`xcode-project`/`android-project`/`web`,
-default `raw`, see `compile.md` §6), `c-compiler`, `opt`, `debug-info` (keep debug info, default `false`, see below),
+Build manifest (JSON) fields: `target` (`native`/`wasm`), `package` (`raw`/`app`/`dmg`/`exe`/`xcode-project`/`android-project`/`web`,
+default `raw`, see `compile.md` §6 and `release-packaging.md`), `c-compiler`, `opt`, `debug-info` (keep debug info, default `false`, see below),
 `sources` (additional C/C++ sources),
 `include-paths`, `link-libs`, `link-paths`, `defines`, `c-flags` (flags handed verbatim to the C compiler; CLI spelling `--cflag <f>` / `-w`, applied to every compile and link step), `objects` (precompiled `.o`), `exports` (C symbols exported to the .wasm export table),
 `ane-paths` (a list of `.ane` paths to load, see "ANE loading" above), `ane-platform` (overrides the platform entry name,
@@ -240,7 +255,9 @@ and composited with the JPEG at runtime, without which its transparent area pain
 `agreebtn` whose "checked state lives in the skin" really does change frames under AOT —
 see `docs/en/swc.md` §5/§6/§9),
 `font-urls` (font byte-stream URL list for `--package web`, injected into Skia at runtime),
-plus the `xcode-project` app metadata `bundle-id`/`display-name`/`icon`/`deployment-target` (see `compile.md` §6.4). CLI arguments override manifest fields of the same name.
+plus release/project metadata `bundle-id`/`display-name`/`icon`/`air-icons`/`deployment-target`/`version`/
+`build-version`/`signing-identity`/`notary-profile`/`entitlements`/`timestamp-server` (see `compile.md` §6.4 and
+[`release-packaging.md`](docs/en/release-packaging.md)). CLI arguments override manifest fields of the same name.
 Path-like fields resolve relative to the manifest file's directory. Example at
 [`examples/skia-link.build.example.json`](examples/skia-link.build.example.json).
 

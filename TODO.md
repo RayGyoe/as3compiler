@@ -17288,6 +17288,37 @@ Windows 本机实跑覆盖。
   Present + resize + 真设备丢失三重组合，均只重建预期次数、正常退出，零 `E_ACCESSDENIED` 和连续 OOM。
   `unit: crash/hardening` 增 4 钉；全量 531/524/4/3，红色仍为既有同集合。
 
+### 阶段三百零六：AIR 元信息继承与一键 macOS `.app`（v0.4.268 → v0.4.269）
+
+- **实现**：新增 `--package app`，复用既有 C/链接管线并把可执行文件直接产到 `Contents/MacOS/`；继承
+  描述符 `<id>`/`<name>`/`<versionNumber>`/`<versionLabel>`/`<icon>`，显式清单值优先。PNG 校验尺寸后经
+  iconset/`iconutil` 生成 `.icns`，写出具体值 `Info.plist` 并 ad-hoc 签名；`raw` 与 `xcode-project` 不变。
+- **ANE 签名**：`Contents/MacOS/extensions/` 下的带点目录会被 codesign 当嵌套 bundle，打包器为其补最小
+  `BNDL` Info.plist，再逐个签 ANE 与外层 app，不使用 `--deep` 代替嵌套签名。
+- **验收**：`hello` `.app` 构建、运行、签名校验通过；Prune 的 ANE 布局与严格签名验证通过。新增
+  `unit: release/AppBundle`，覆盖元信息优先级、plist、图标拒绝、ANE bundle 与 dry-run。
+
+### 阶段三百零七：Developer ID、公证与 DMG 发布链路（v0.4.269 → v0.4.270）
+
+- **实现**：`--package dmg` 要求 Developer ID 与钥匙串 notary profile；对嵌套 dylib/framework/ANE 最深层
+  优先签名，启用 Hardened Runtime、secure timestamp 与可选 entitlements，再签外层并严格验证。
+- **发布编排**：app ZIP 提交公证且只接受 JSON `Accepted`，staple 后构造含 `/Applications` 的 UDZO DMG；
+  DMG 再签名、公证、staple，最后跑 `spctl`、`stapler validate` 与挂载后 app 验收。缺凭证、非 Accepted、
+  畸形公证输出或工具失败均中止，不产出冒充发布版的镜像。
+- **验收**：`unit: release/DmgPlan` 与完整 dry-run 命令链通过；Prune 的本机 Developer ID 嵌套签名实测通过。
+  **真实 Apple 网络公证未执行**：本机没有配置的 `prune-notary` 钥匙串 profile。
+
+### 阶段三百零八：Windows exe 资源与 Authenticode（v0.4.270 → v0.4.271）
+
+- **实现**：`--package exe` 在 Windows 宿主把 AIR PNG 组生成 PNG-compressed ICO，并生成 VERSIONINFO、
+  Windows 10 `supportedOS`、`longPathAware`、PerMonitorV2/V1 application manifest；`llvm-rc`/`rc.exe` 产出
+  `.res` 后加入既有链接，不复制编译管线。
+- **签名**：清单证书主题/指纹或 `ASC_WIN_CERT_FILE` 驱动 `signtool sign /fd sha256` 与 `/pa` 验证，支持
+  RFC 3161 时间戳；未配置时明确警告 exe 未签名，所有密码显示为脱敏文本。
+- **验收**：`unit: windows-release/*` 覆盖 ICO 字节、RC/manifest、资源接入与签名 argv；CI 新增 Windows
+  真实资源链接/运行冒烟；本机全量 `node test.ts` **537/537** 通过。本机非 Windows，**真实 PE 资源运行
+  与 Authenticode 未在本机验证**。
+
 ### 遗留待开发
 > **2026-10-27 追加（阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **101 → 102 项**（`未开始` **80 → 81**）。这两批的行为原先全在 macOS 的 `adl` 上量，而 `File` 家族几乎每个成员都碰宿主路径规则；在 Windows 10 + `adl 51.4.1` 上补测（探针 `temp/winfile/adl/`、读数 `adl-win{,2,3}.txt`）分出**六处宿主分叉 + 两处 Windows 独有**，全部**本轮修净**（按表头「已完成项一经落地即从本表移出」故不入表）：`cacheDirectory` 是 `%TEMP%` 而非 `%LOCALAPPDATA%\Caches`；盘符相对路径 `C:foo` 原样保留 + 补分隔符（旧解析得到**绝对**路径 `C:\foo`，是另一个文件）；`parent` 的根保留自己的分隔符（`C:\a` ⇒ `C:\`、`\a` ⇒ `\`）；`getRelativePath` 用正斜杠、跨盘 `null`；同一文件判定改走大小写不敏感的 `as_path_under`（旧的 `strcmp` 会把只有大小写差异的目标当「另一个文件」，覆盖分支先 `DELETE` 掉**源**再复制 ⇒ `#3003` 且文件已毁）；`FileStream` 偏移全改 64 位、`APPEND` 打开即 EOF。两处 Windows 独有：删掉仍被 `FileStream` 打开的文件在 Windows 上必然失败（`adl` 同样报错 ⇒ 是我们示例没 `close()`，已修）、`getRootDirectories()` 交出 8 个 `File` 而非 `StorageVolume`。另有**三处编译阻断**只有 Windows 宿主才撞到（`S_ISREG` 未定义、`_chsize_s` 未声明、`getcwd` 在 MSVC 的 `<direct.h>` 之外），同轮补齐。**新登记的 1 行**是剩余**验证欠账**：`examples/file-ops.as` 的断言写死了 `/tmp`（14 处）与「反斜杠是合法文件名字节」，而它与 `file-symlink.as`/`file-listing-async.as` 都要软链夹具 —— 本机账号建软链报 `EPERM`，三例一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级回归。钉子在 `test/unit/file-stream.ts` 的 `unit: file-stream/windows`（19 钉）+ 既有的 `file-url`/`file-ops` 组；口径写在 `docs/zh-cn/filesystem.md` §11.6（对照 `docs/en/filesystem.md` §11.6）。
 
@@ -17671,10 +17702,10 @@ Windows 本机实跑覆盖。
 | **G4a** | `flash.desktop` **图标族**：`Icon` / `InteractiveIcon` / `DockIcon` / `SystemTrayIcon` + `NativeApplication.icon` / `supportsDockIcon` / `supportsSystemTrayIcon` / `supportsMenu` / `menu`，以及 `DockIcon.menu` 依赖的 `flash.display.NativeMenu` 子系统 | **零命中**：`grep -cE "DockIcon\|SystemTrayIcon\|InteractiveIcon\|supportsDockIcon\|supportsSystemTrayIcon" src/symbols.ts src/emit.ts` 每项均 **0**；`NativeApplication` 只声明 `nativeApplication`/`exit`/`activeWindow`/`openedWindows`/`applicationDescriptor`/`systemIdleMode`（`src/symbols.ts:1290-1350`），**无 `icon`**；`NativeMenu` 类**根本没声明**（`src/emit.ts:6136` 自述「本运行时没有 `NativeMenu` 子系统」）⇒ 照 AIR 写这行代码**编不过**。而 **AIR 有完整一等公民实现**（`adl 51.4.1`/macOS 实测：`supportsDockIcon`=`true`、`supportsSystemTrayIcon`=`false`、`supportsMenu`=`true`、`icon`=`[flash.desktop::DockIcon]`、`dockIcon.menu` 可设可读回、`new DockIcon()` 抛 `#2012`、`bitmaps` 赋非 `BitmapData` 抛 `#2005`；证据 `temp/desktopprobe/`） | **遗留欠账**（AIR 有、我们跑不出 ⇒ §1.5 硬判据）⇒ **正常阶段 + 版本号**，**不给 `--features` 开关**。**✅ 已清偿（阶段二百五十五，v0.4.219）** —— 图标族与 `NativeMenu` 子系统全部落地，口径 [`docs/zh-cn/desktop.md`](docs/zh-cn/desktop.md)，证据 `unit: emit/NativeMenu` 38 项 + `examples/native-menu.as` 66 断言 + `temp/G4App.app` 真机点击；落地时登记的三条后端残余里，**Dock 位图上屏已于阶段二百五十六（v0.4.220）清偿**，余下**修饰键/模态菜单**两条仍在 `遗留待开发` | 二百五十五 ✅ |
 | **G4b** | **macOS 菜单栏状态项**（`NSStatusItem`） | **零命中** + **AIR 在 macOS 上没有对应物**：实测 `supportsSystemTrayIcon` = **`false`**、`icon` 是 `DockIcon`、`new SystemTrayIcon()` 抛 **`#2012`**；SDL2 亦无托盘 API ⇒ 需新 `vendor/statusitem_glue.mm` 并接进 `vendor/window_glue.cc` 的事件泵 | **增强**（AIR **在 macOS 上**无对应物）⇒ 必须 opt-in、默认产物与现状同构、缺能力时**报明**不静默降级 | 二百五十五 |
 | **G5** | accessory app（`LSUIElement=1`：无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键**；AIR 描述符里也没有这个开关 | **增强** ⇒ 构建清单新字段（如 `agent-app`），默认关 | 二百五十五 |
-| **G8** | **一条命令出已签名 `.app` / `.dmg`** | `--package` 合法值只有 `raw \| xcode-project \| android-project \| web`（`src/index.ts:291`、`:798`）；**无 `app`/`dmg`**；`grep -n "codesign\|hdiutil" src/build.ts` = **0 命中**；且 `--package xcode-project` **只生成工程不构建**（`src/index.ts:1034-1057` 自述「是『生成工程』步骤，不做 cc」） | **增强**（工程化便利，非 AIR 语义） | 二百五十五 |
+| **G8** | **一条命令出已签名 `.app` / `.dmg`** | **✅ 已落地（阶段三百零六～三百零八）**：`--package app`/`dmg`/`exe` 复用既有编译链接管线，支持 AIR 元信息/图标、macOS 签名公证 DMG 与 Windows 资源/Authenticode；口径见 [`docs/zh-cn/release-packaging.md`](docs/zh-cn/release-packaging.md) | **增强已完成**（工程化便利，非 AIR 语义） | 三百零六～三百零八 ✅ |
 
-> **当前判断（2026-10-26 刷新）**：上表只剩 **4 项**（G4a 已清偿、G3 已以 ANE 交付、G7 已在阶段二百六十四落地），
-> 其中 **G5 / G8 仍待排期**；下面这段 2026-10-23 的排期判断保留原文（G4a→G4b 的顺序已被执行）：
+> **当前判断（2026-10-28 刷新）**：**G8 已在阶段三百零六～三百零八落地**，上表只剩 **G5 仍待排期**
+> （G4a/G4b 已清偿、G3 已以 ANE 交付、G7 已在阶段二百六十四落地）；下面这段 2026-10-23 的排期判断保留原文：
 >
 > - **G4a 是地基**（AIR 原生图标族 + `NativeMenu` 子系统）：按 §1.5 是**遗留欠账**，阶段内修净、**不占本表**，
 >   而且它一落地就直接交出一个**退路形态** —— Dock 图标常驻 + `dockIcon.menu` 右键菜单 + `autoExit=false`，
@@ -17687,9 +17718,8 @@ Windows 本机实跑覆盖。
 > 底座已具备：文件系统（`File` 的 `exists`/`isDirectory`/`size`/`name`/`parent`/`getDirectoryListing`，
 > `src/emit.ts:15139-15241`、`:15331`）与**无边框 + 置顶窗**（`src/emit.ts:5866-5902`、`:6087-6101`）。
 
-> **⚠️ 更正一处文档与实现的落差**：`docs/zh-cn/compile.md:894` 以「`app` / `dmg` 走……一键产出最终产物」
-> 的口气描述打包，而该文件 `:949` 的表格自身把 `signing-identity` 标为「规划」；实测 `--package` 取值与
-> `build.ts` 里均**无** `app`/`dmg` 与 `codesign`/`hdiutil` ⇒ 该描述属**规划形态**，落地走 **G8**。
+> **✅ 文档与实现已收口（2026-10-28）**：`compile.md` 的包形态与清单字段已同步到实现，
+> `signing-identity` 不再是规划；G8 的正式使用口径见 `release-packaging.md`。
 
 > **明确不做**（防范围蔓延，全文见方案 §1.2）：不做特权 helper（`SMJobBless`、删 Time Machine 快照）；
 > **刻意不引入完全磁盘访问（FDA）** —— P0 四类目标（`~/Library/Caches`、`~/Library/Logs`、`$TMPDIR`、`~/.Trash`）

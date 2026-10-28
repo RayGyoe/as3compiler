@@ -67,3 +67,24 @@ jobs:
           name: test-log
           path: ${{ runner.temp }}/test.log
           if-no-files-found: warn
+
+      # Script-built .app smoke: the release path uses the SAME C/link pipeline,
+      # then signs ad-hoc (no Developer ID secret is needed on CI).
+      - name: macOS app package smoke
+        run: |
+          node src/index.ts examples/hello.as --package app -o "$RUNNER_TEMP/hello-app/Hello" --run
+          codesign --verify --verbose=2 "$RUNNER_TEMP/hello-app/Hello.app"
+
+  # The Windows release form needs no signing secret for its compile/run gate:
+  # llvm-rc adds VERSIONINFO + the DPI manifest, and the unsigned warning is
+  # intentional. Authenticode remains a local/release-machine verification.
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Windows exe resource + unsigned run smoke
+        run: node src/index.ts examples/hello.as --cc clang --package exe -o build/hello-exe/Hello --run

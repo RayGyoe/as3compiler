@@ -3,7 +3,7 @@
 // Pipeline: AS source -> tokenize -> parse -> generate C -> clang -> native
 // executable (or WASI .wasm with --target wasm).
 
-import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, resolve, basename, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,11 +15,14 @@ import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
 import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
-import type { BuildConfig, Target, Package, Manifest } from './build.ts';
+import type { Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp, airManifest, parseGpuBackend, type GpuBackend } from './air-app.ts';
 import { runDoctor, checkForUpdate } from './doctor.ts';
 import { computeReachable, prepareReachFiles, type ReachFile } from './reach.ts';
 import { generateXcodeProject } from './xcode-project.ts';
+import { createMacApp, adHocSignMacApp, macAppLayout } from './app-bundle.ts';
+import { packageMacDmg } from './release.ts';
+import { prepareWindowsResources, signWindowsExe } from './windows-release.ts';
 import {
   extractSwc,
   swcCompileInputs,
@@ -337,7 +340,7 @@ function usage(): string {
     '  --run          run the compiled output after building',
     '  --cc <name>    C compiler to use (default: cc)',
     '  --target <t>   native (default) | wasm (WASI)',
-    '  --package <p>  raw (default) | xcode-project (macOS .app) | android-project | web (browser page, needs --target wasm)',
+    '  --package <p>  raw (default) | app | dmg | exe | xcode-project | android-project | web (browser, needs --target wasm)',
     '  --manifest <f> build manifest JSON (extra sources / include / link libs)',
     '  --air-app <xml> AIR app descriptor: generate bootstrap + build manifest',
     '  --main-class <n> main class for --air-app (default: infer src/**/Main.as)',
@@ -510,6 +513,9 @@ async function runDoctorMode(opts: Options): Promise<number> {
     );
     process.stderr.write(`doctor: judged against the manifest generated from ${opts.airApp}\n`);
     Object.assign(cfg, applyManifest(cfg, loadManifest(air.manifestPath), air.manifestPath));
+    // An explicit manifest is the release overlay, not an alternative to the
+    // descriptor: signing paths and credentials must survive manifest regeneration.
+    if (opts.manifest) Object.assign(cfg, applyManifest(cfg, loadManifest(opts.manifest), opts.manifest));
   } else if (opts.manifest) {
     Object.assign(cfg, applyManifest(cfg, loadManifest(opts.manifest), opts.manifest));
   } else {
@@ -597,7 +603,7 @@ async function main(): Promise<void> {
   const cfg = defaultBuildConfig();
   let loadedManifest: Manifest | null = null;
   let loadedManifestPath: string | null = null;
-  if (opts.manifest) {
+  if (opts.manifest && !opts.airApp) {
     loadedManifest = loadManifest(opts.manifest);
     loadedManifestPath = opts.manifest;
     Object.assign(cfg, applyManifest(cfg, loadedManifest, opts.manifest));
@@ -658,6 +664,14 @@ async function main(): Promise<void> {
     loadedManifest = loadManifest(air.manifestPath);
     loadedManifestPath = air.manifestPath;
     Object.assign(cfg, applyManifest(cfg, loadedManifest, air.manifestPath));
+    // Explicit values win over descriptor-derived defaults. Apply this overlay
+    // AFTER --air-app writes its generated manifest; applying it only before this
+    // branch made --manifest look accepted while every release field was erased.
+    if (opts.manifest) {
+      loadedManifest = loadManifest(opts.manifest);
+      loadedManifestPath = opts.manifest;
+      Object.assign(cfg, applyManifest(cfg, loadedManifest, opts.manifest));
+    }
 
     program = { body: [], imports: [] };
     const bootSrc = generateBootstrap(air.info, air.mainClass);
@@ -847,7 +861,7 @@ async function main(): Promise<void> {
   // 立即报错，而不是静默 fallback 到 native——那会产出「编译过但结果错」的产物，
   // 违反 §2.5「禁止静默吞错 / 禁止 fallback 到错误语义」红线。
   const VALID_TARGETS: readonly string[] = ['native', 'wasm'];
-  const VALID_PACKAGES: readonly string[] = ['raw', 'xcode-project', 'android-project', 'web'];
+  const VALID_PACKAGES: readonly string[] = ['raw', 'xcode-project', 'android-project', 'web', 'app', 'dmg', 'exe'];
   if (!VALID_TARGETS.includes(cfg.target)) {
     throw new Error(`unknown --target '${cfg.target}' (expected: native | wasm; write \`wasm\` without a dot)`);
   }
@@ -855,7 +869,7 @@ async function main(): Promise<void> {
   // not as an unresolved-symbol dump from the linker.
   validateFeatures(cfg.features, cfg.target);
   if (!VALID_PACKAGES.includes(cfg.package)) {
-    throw new Error(`unknown --package '${cfg.package}' (expected: raw | xcode-project | android-project | web)`);
+    throw new Error(`unknown --package '${cfg.package}' (expected: raw | app | dmg | exe | xcode-project | android-project | web)`);
   }
 
   // Native extensions (阶段一百七十二). Each .ane is resolved to the native library
@@ -979,6 +993,7 @@ async function main(): Promise<void> {
     try { appDescriptorXml = readFileSync(opts.airApp, 'utf8'); } catch { appDescriptorXml = undefined; }
   }
   const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml, aneResolution?.descriptors ?? []);
+  mkdirSync(dirname(cPath), { recursive: true });
   writeFileSync(cPath, c);
 
   // ---- flash.data / SQLite engine wiring ----------------------------------
@@ -1056,12 +1071,21 @@ async function main(): Promise<void> {
   // file is ENOENT to it even though the same file runs fine from a shell). On
   // POSIX there is no extension convention: the Mach-O/ELF runs via execve no
   // matter its name, so `base` is left as-is.
-  const outPath =
+  let outPath =
     cfg.target === 'wasm'
       ? `${base}.wasm`
       : process.platform === 'win32' && !base.toLowerCase().endsWith('.exe')
         ? `${base}.exe`
         : base;
+  if (cfg.package === 'app' || cfg.package === 'dmg') {
+    if (cfg.target !== 'native' || process.platform !== 'darwin') {
+      throw new Error(`--package ${cfg.package} requires --target native on a macOS host`);
+    }
+    outPath = macAppLayout(cfg, base).binaryPath;
+  }
+  if (cfg.package === 'exe' && process.platform !== 'win32') {
+    throw new Error('--package exe requires a Windows build host');
+  }
 
   // Audio (flash.media) is delivered by a backend the build layer links, not by
   // the frontend: without it every playback entry point keeps answering honestly
@@ -1154,10 +1178,21 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cfg.package === 'exe') {
+    const resources = prepareWindowsResources(cfg, base, cfg.dry);
+    cfg.objects.push(resources.objectPath);
+  }
   const steps = buildCompileSteps(cfg, cPath, outPath);
 
   if (cfg.dry) {
     for (const s of steps) console.log(`[4/4] dry-run     ${s.join(' ')}`);
+    if (cfg.package === 'app' || cfg.package === 'dmg') {
+      const app = createMacApp(cfg, outPath, base, true);
+      if (cfg.package === 'app') adHocSignMacApp(app.appPath, true);
+      else console.log(`Dry-run DMG: ${packageMacDmg(cfg, base, app, true)}`);
+      if (cfg.package === 'app') console.log(`Dry-run app bundle: ${app.appPath}`);
+    }
+    if (cfg.package === 'exe') signWindowsExe(cfg, outPath, true);
     console.log(`Generated C kept at: ${cPath}`);
     writeExportManifest(base, exports);
     return;
@@ -1214,7 +1249,19 @@ async function main(): Promise<void> {
     for (const w of written) console.log(`                  extensions/${w}`);
   }
 
-  console.log(`Build successful: ${outPath}`);
+  let artifactPath = outPath;
+  if (cfg.package === 'exe') signWindowsExe(cfg, outPath);
+  if (cfg.package === 'app' || cfg.package === 'dmg') {
+    const app = createMacApp(cfg, outPath, base);
+    if (cfg.package === 'app') {
+      adHocSignMacApp(app.appPath);
+      artifactPath = app.appPath;
+    } else {
+      artifactPath = packageMacDmg(cfg, base, app);
+    }
+  }
+
+  console.log(`Build successful: ${artifactPath}`);
   console.log(`Generated C kept at: ${cPath}`);
 
   if (cfg.target === 'wasm' && exports.length > 0) {

@@ -110,7 +110,7 @@ Options:
   --run          run the compiled output after building
   --cc <name>    C compiler to use (default: cc)
   --target <t>   native (default) | wasm (WASI)
-  --package <p>  raw (default) | xcode-project (macOS .app) | android-project | web (browser)
+  --package <p>  raw (default) | app | dmg | exe | xcode-project | android-project | web (browser)
   --manifest <f> build manifest JSON (extra sources / include / link libs)
   --air-app <xml> AIR app descriptor: generate bootstrap + build manifest
   --main-class <n> main class for --air-app (default: infer src/**/Main.as)
@@ -866,6 +866,10 @@ as-aot doctor --check-update                    # 只读地问一次 registry �
   只有 `--target native` 才合成——`--target wasm --package raw` 是裸 WASI 模块、一个 vendor 库都不链，
   给它报 SDL2/Cocoa 就全是噪声。
 - **CLI 覆盖清单**（与编译时同规则）：`doctor --air-app app.xml --target wasm` 判的是 wasm 那份。
+- **Windows 的 Skia 构建额外核对 MSVC STL 二进制兼容性**：`host.msvc-stl` 从 `VCToolsInstallDir`
+  或 `clang -###` 找出实际工具集，并核对 `skia.lib` 引用的向量化 `__std_*` 符号是否存在于对应位宽的
+  `libcpmt.lib`。因此「文件都在、编译也过，最后 lld-link 才报未定义符号」会提前变成带版本号、
+  缺失符号和修复命令的检查失败；用本机旧工具集重编、已不再引用这些符号的 Skia 不会被误报。
 - **检查项分三档**：`ok` / `warn`（能编但产物是错的，例如 web 构建里的文本没有字体可画）/
   `fail`（编不过）。`--fix` 只处理秒级幂等项；依赖库本身怎么建，报告里直接给命令。
 - **`--air-app` 会写清单**（`<app>/<filename>.build.json`，与编译时同一个文件、同一次生成）——
@@ -888,7 +892,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `target` | `"native" \| "wasm"` | 目标平台，默认 `native` |
-| `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | 分发形态，默认 `raw`（§6）；`web` 要求 `target=wasm`，产出浏览器产物（见 [`html5-web.md`](html5-web.md)） |
+| `package` | `"raw" \| "app" \| "dmg" \| "exe" \| "xcode-project" \| "android-project" \| "web"` | 分发形态，默认 `raw`（§6）；`app`/`dmg` 要求 macOS 宿主，`exe` 要求 Windows 宿主（见 [`release-packaging.md`](release-packaging.md)）；`web` 要求 `target=wasm`（见 [`html5-web.md`](html5-web.md)） |
 | `architecture` | `"32" \| "64" \| "arm64"` | 目标位宽（Windows 专属，缺省按宿主）。决定依赖目录（`vendor/*/windows-xN`）与目标三元组（`i686-` / `x86_64-` / `aarch64-pc-windows-msvc`）；未知值**响亮报错**而不回退 x86_64。同时决定 `${host}` 展开成哪个依赖目录（§4.1.1）：`"32"` ⇒ `windows-x86`，`"64"`/`arm64` 或未设 ⇒ 按宿主。**`arm64` 只服务非 AIR 的 Windows-on-ARM 产物**：AIR 没有 Windows ARM64 运行时，故 `--air-app` 描述符的 `<architecture>` 仍只接受 `32`/`64`（见 [`win32.md`](win32.md) §1/§2.11） |
 | `c-compiler` | string | C 编译器，默认 `cc` |
 | `opt` | string | 优化标志，默认 `-O2` |
@@ -912,13 +916,20 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `font-urls` | string[] | 字体字节流 URL 列表（`--package web` 时写入 `index.html`，运行时网络加载注入 Skia；见 [`html5-web.md`](html5-web.md) §4） |
 | `preload-paths` | string[] | 打进 wasm FS 镜像的数据根，`src@dest` 或裸路径（`--package web` 专属；浏览器沙箱初始 FS 为空，`File`/`FileStream` 会一文件都看不到） |
 | `preload-excludes` | string[] | 从上述镜像里**排除**的宿主路径或 fnmatch 模式（→ `emcc --exclude-file`，同样是 `--package web` 专属）。emcc 的目录 preload 没有逐文件开关，只能反向命名要排除的文件；模式匹配的是 preload 遍历产出的**宿主路径**（绝对），故同样相对清单目录解析。**路径里含 `*?[` 时它是模式而非字面量**（`weird[1].png` 会排掉无关的 `weird1.png`），要按字面排除需转义为 `[[]` `[]]` `[*]` `[?]`；无命中的模式静默忽略。`--air-app` 用它把已由页面 `fetch` 的字体撤出 FS（见 [`html5-web.md`](html5-web.md) §6），并自动排除 `-o` 指向的**本次构建输出目录**——否则 `-o temp/<x>` 会把正在写的 `.c`/`.o`/产物自己也 preload 进镜像（Flappy-Starling 实测 1.9 MB → 36 MB）；未指定 `-o` 时不做任何猜测 |
-| `bundle-id` | string | 应用标识（`--package xcode-project` 填 `Info.plist` 的 `CFBundleIdentifier`，缺省 `com.example.<product>`） |
-| `display-name` | string | 应用显示名（填 `CFBundleName`，缺省取产物名） |
-| `icon` | string | 图标 `.icns` 路径（相对清单目录解析，拷入 `Resources` + 填 `CFBundleIconFile`） |
-| `deployment-target` | string | macOS 最低系统版本（填 `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） |
+| `bundle-id` | string | 应用标识（`app`/`dmg`/`xcode-project` 填 `CFBundleIdentifier`，缺省 `com.example.<product>`） |
+| `display-name` | string | 应用显示名（填 `CFBundleName` / Windows 资源，缺省取产物名） |
+| `icon` | string | 已完成的平台图标路径：macOS 为 `.icns`，Windows 为 `.ico`；相对清单目录解析 |
+| `air-icons` | `{ "imageNNxNN": string }` | AIR 描述符 PNG 图标组；`app`/`dmg` 转成 `.icns`，`exe` 转成 PNG-compressed ICO |
+| `deployment-target` | string | macOS 最低系统版本（填 `LSMinimumSystemVersion` / `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） |
+| `version` | string | 发布版本；`app`/`dmg` 填 `CFBundleShortVersionString`，`exe` 填 VERSIONINFO |
+| `build-version` | string | macOS `CFBundleVersion`；AIR `<versionLabel>` 提供缺省值 |
+| `signing-identity` | string | DMG 的 Developer ID，或 exe 的 Authenticode 证书主题/指纹；`ASC_SIGN_IDENTITY` 可覆盖 |
+| `notary-profile` | string | `notarytool` 钥匙串 profile；`ASC_NOTARY_PROFILE` 可覆盖 |
+| `entitlements` | string | DMG 签名使用的 entitlements plist，相对清单目录解析 |
+| `timestamp-server` | string | Authenticode RFC 3161 时间戳服务，默认 `http://timestamp.digicert.com` |
 | `targets` | `{ native?, wasm? }` | **按目标覆盖块**（§4.1）：顶层字段为公共默认，`targets.<目标>` 块对**匹配的目标**整体替换其声明的字段，使一份清单可服务链接集互斥的多目标 |
 
-路径类字段（`sources` / `swc-paths` / `include-paths` / `link-paths` / `objects` / `preload-excludes`）**相对清单文件所在目录解析**
+路径类字段（`sources` / `swc-paths` / `include-paths` / `link-paths` / `objects` / `preload-excludes` / `icon` / `air-icons` / `entitlements`）**相对清单文件所在目录解析**
 （与 TypePHP 的 YAML 路径规则一致）。示例见
 [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json)：
 
@@ -1132,6 +1143,8 @@ build manifest: unknown field 'link-lib' (did you mean 'link-libs'?)
 |---|---|---|
 | `native`（默认，`--package raw`） | `cc -O2 -lm -lz -o <out> <c> [sources] -I... -D... [objects] -L... -l... [-framework X]` | Mach-O / ELF / PE 可执行 |
 | `wasm`（`--package raw`） | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 [-g] -mllvm -wasm-use-legacy-eh=false [-Wl,--strip-debug] -o <out>.wasm <c> ... -lsetjmp` | WASI `.wasm`（默认剥调试段；`--debug-info` 则去掉 `-Wl,--strip-debug` 并加 `-g`，见 §4.3） |
+| `native` + `--package app` / `dmg` | 同一 native 编译链接，随后构造 bundle、签名；`dmg` 再公证并生成镜像 | macOS `.app` / 已签名、公证并 staple 的 `.dmg`（§6.1） |
+| `native` + `--package exe` | 同一 Windows native 链接，额外把 `llvm-rc` 生成的 `.res` 加入 objects | 带图标、VERSIONINFO 与 application manifest 的 `.exe` |
 | `native` + `--package xcode-project` | 生成 `.xcodeproj`（§6.5），由 Xcode/xcodebuild 驱动 | macOS `.app` bundle（`Contents/MacOS/<bin>` + `Info.plist`） |
 | `wasm` + `--package web` | `emcc`（Emscripten，需 `EMSDK_HOME`）编译 C/C++ 源 + 链接 wasm 版 Skia，`INVOKE_RUN=0` | `.wasm` + `.js` + `index.html`（浏览器 HTML5 渲染，见 [`html5-web.md`](html5-web.md)） |
 
@@ -1159,7 +1172,7 @@ xcode-project` 的 `OTHER_LDFLAGS` 同样带这枚旗标。钉子：`build/Expor
 
 > 本节回答一个问题：`--target native` 已经能产出裸可执行文件，那 `.app` / `.dmg` /
 > Windows `.exe` / Xcode 工程 / Android 工程该怎么做——是继续平铺成 `--target` 的一堆取值，
-> 还是拆开？结论：**拆成两个正交维度**。其中 `xcode-project` 已实现（§6.5），其余为规划。
+> 还是拆开？结论：**拆成两个正交维度**。`app`/`dmg`/`exe`、`xcode-project` 与 `web` 已实现；移动端工程仍为规划。
 
 现有管线的心智模型是「一份 AS → 一份可读 C → 一个裸可执行文件」。这些产物里，一半是
 「换编译后端」，另一半是「编译完之后怎么组织」，两者不应混在同一个 `--target` 里。
@@ -1185,19 +1198,17 @@ xcode-project` 的 `OTHER_LDFLAGS` 同样带这枚旗标。钉子：`build/Expor
 | 取值 | 产物 | 说明 | 状态 |
 |---|---|---|---|
 | `raw`（默认） | 裸可执行 / 裸 `.wasm` | 保持现状，零行为变化（CLI 快速验证、本地调试用） | 已实现 |
-| `xcode-project` | `.xcodeproj`（或 CMake 工程） | 生成 macOS application 工程骨架 + 构建脚本，交给 Xcode 构建/调试/签名 | **已实现（macOS application，§6.5）** |
+| `app` | macOS `.app` | 直接编译进 bundle，继承 AIR 元信息/图标并 ad-hoc 签名 | **已实现（阶段三百零六）** |
+| `dmg` | 签名、公证并 staple 的 `.app` + `.dmg` | Developer ID、Hardened Runtime、两轮公证与最终 Gatekeeper 验收 | **已实现（阶段三百零七）** |
+| `exe` | Windows `.exe` | ICO、VERSIONINFO、DPI/长路径 manifest，可选 Authenticode | **已实现（阶段三百零八）** |
+| `xcode-project` | `.xcodeproj` | 生成 macOS application 工程，交给 Xcode 构建与断点调试 | **已实现（macOS application，§6.5）** |
 | `android-project` | Gradle + NDK 工程 | 生成 `build.gradle` + `CMakeLists.txt` + JNI/native-activity 桥 | 规划 |
 | `web` | `.wasm` + `.js` + `index.html` | 用 emcc 产出浏览器 HTML5 渲染页面（`target=wasm`，见 §6.6 与 [`html5-web.md`](html5-web.md)） | **已实现（§6.6）** |
 
-**目标用户定位：`xcode-project` / `android-project` 只服务 IDE 开发者**，因此这两个形态
-**不提供 `app` / `dmg`**；`web` 与 `raw` 一样是「一次编译调用 + 后处理」（emcc 编译 + 生成
-`index.html`），面向直接产出浏览器可加载的最终产物。
-
-- `app` / `dmg` 走的是「`build.ts` 直接调 `cc/clang` + `codesign` + `hdiutil` 一键产出最终产物」的
-  **脚本路线**，面向 CI / 快速出包 / 无人工介入；`xcode-project` 走的是「生成工程，让 Xcode 驱动」
-  的 **IDE 路线**，面向长期开发、断点调试、签名上架。两者是**并列的两条路**，最终都通向 `.app`，
-  但不是「高级形态取代低级形态」的包含关系。
-- 既然只服务 IDE 开发者，脚本路线（`app` / `dmg`）整体砍掉，分发形态收敛为 `raw` + 两个工程生成器 + `web`。
+**`app` / `dmg` / `exe` 是脚本发布路线**：复用同一次 `cc/clang` 编译链接，再调用平台工具直接产出
+最终产物，面向 CI 与一键出包；完整命令、凭据与验收口径见 [`release-packaging.md`](release-packaging.md)。
+**`xcode-project` 是 IDE 路线**，保留给长期开发与断点调试，不再兼任发布入口；`web` 则直接产出
+浏览器可加载的最终产物。
 
 **`xcode-project` 当前产出 macOS application**：`--package xcode-project` 现阶段只支持
 `--target native`（macOS application）；iOS/Android 的工程生成器尚未实现。将来升到 multiplatform 时，
@@ -1209,11 +1220,9 @@ xcode-project` 的 `OTHER_LDFLAGS` 同样带这枚旗标。钉子：`build/Expor
 1. **`xcode-project` / `android-project` 不是「一次 cc 调用」，而是「生成工程文件」**。编译后端仍
    产出 Mach-O / ELF，工程生成器负责把编译命令 + 依赖库 + 资源组织成 `.xcodeproj` / Gradle 工程
    骨架。因此它们应作为 build 层**独立于编译命令的生成步骤**，而不是塞进 `cc/clang` 的编译参数。
-2. **Windows `.exe` 连新参数都不需要**。native 在 Windows 本来就是 PE 可执行文件，唯一的小坑是
-   曾经 `-o app` 不自动补 `.exe` 扩展名——已按 host OS 补默认扩展名（`process.platform === 'win32'` 时
-   native 产物自动带 `.exe` 后缀、POSIX 不补）。这不只是命名规范：Windows 的 `CreateProcessW` 只按
-   `.exe`/`.cmd`/`.bat`/`.com` 扩展名序列查找可执行文件，无扩展名的 PE 文件对 `spawnSync` 而言是
-   `ENOENT`，所以 `--run` 在 macOS 能启动、在 Windows 却静默起不来——补 `.exe` 后两者一致。不是新形态。
+2. **Windows `raw` 与 `exe` 共享同一个 PE 编译后端**。`raw` 仍是原来的裸可执行文件；需要图标、
+   VERSIONINFO、DPI/长路径 application manifest 或 Authenticode 时才选 `--package exe`，由资源编译器
+   生成 `.res` 加入既有链接。`-o app` 在 Windows 自动补 `.exe` 后缀的规则对两种形态一致。
 3. **工程元数据走 manifest，不平铺 CLI flag**。工程生成器需要大量元数据：bundle id、图标、
    签名证书、min SDK、权限、资源目录……这些**不是参数，是工程配置**。项目里已有对标 TypePHP
    `project.yml` 的 manifest 机制（见 §4），应扩展 manifest 承载这些字段，而非平铺成一堆 CLI flag。
@@ -1224,7 +1233,16 @@ xcode-project` 的 `OTHER_LDFLAGS` 同样带这枚旗标。钉子：`build/Expor
 # 现有行为不变
 as-aot examples/hello.as --run
 
-# macOS 工程（编译后端 native + 生成 .xcodeproj，已实现）
+# macOS 开发用 .app（直接出包 + ad-hoc 签名）
+as-aot --air-app app.xml --package app -o build/Main
+
+# macOS Developer ID + 公证 DMG（凭据见 release-packaging.md）
+as-aot --air-app app.xml --package dmg -o build/Main
+
+# Windows 资源与可选 Authenticode（Windows 宿主）
+as-aot --air-app app.xml --cc clang --package exe -o build/Main
+
+# macOS IDE 工程（生成 .xcodeproj，交给 Xcode 调试）
 as-aot src/Main.as --target native --package xcode-project --manifest macos.json
 
 # iOS 工程（换后端 + 生成工程，复杂元数据走 manifest；规划中）
@@ -1236,8 +1254,8 @@ as-aot src/Main.as --target android --package android-project --manifest android
 
 ### 6.4 manifest 扩展字段（部分已实现）
 
-复杂工程元数据在 `§4` 构建清单上追加（kebab-case，路径类字段相对清单目录解析）。macOS application
-（`xcode-project`）相关的四个字段已实现并用于 §6.5：
+复杂工程元数据在 `§4` 构建清单上追加（kebab-case，路径类字段相对清单目录解析）。脚本发布与
+Xcode 工程共用这些字段；`--air-app` 会从描述符提供缺省值，显式清单值优先：
 
 | 字段 | 说明 | 状态 |
 |---|---|---|
@@ -1248,10 +1266,13 @@ as-aot src/Main.as --target android --package android-project --manifest android
 | `permissions` | Android `AndroidManifest.xml` 权限 / iOS `Info.plist` 用途描述 | 规划 |
 | `resources` | 需拷贝进 bundle / 工程资源目录的额外文件 | 规划 |
 | `ndk-abi` | Android 目标 ABI 列表（如 `arm64-v8a`） | 规划 |
-| `signing-identity` | 代码签名证书（macOS/iOS 的 `codesign`，当前用 ad-hoc `-`） | 规划 |
+| `air-icons` | AIR PNG 图标组，发布时转成 `.icns` / ICO | ✅ 已实现 |
+| `version` / `build-version` | 发布版本与 macOS build version | ✅ 已实现 |
+| `signing-identity` | DMG Developer ID / exe Authenticode 证书 | ✅ 已实现 |
+| `notary-profile` / `entitlements` | Apple 公证钥匙串 profile / 签名 entitlements | ✅ 已实现 |
+| `timestamp-server` | Authenticode 时间戳服务 | ✅ 已实现 |
 
-落地顺序：`xcode-project`（macOS application）已完成 → 下一步 `android-project`（工程生成器最重）→
-再补 multiplatform destination 与正式签名。
+`xcode-project` 仍只用其 IDE 元数据子集；正式签名、公证与 DMG 走 `--package dmg`。
 
 ### 6.5 `xcode-project`（已实现，macOS application）
 
@@ -1287,8 +1308,8 @@ open build/…/Debug/Main.app                        # 双击/命令行启动正
   `MACOSX_DEPLOYMENT_TARGET`；`icon` 为绝对路径 file ref 加入 Resources phase，构建时拷入
   `Contents/Resources/`。
 - **ad-hoc 签名**：`CODE_SIGN_STYLE = Manual` + `CODE_SIGN_IDENTITY = "-"`，让 `xcodebuild` 无需
-  provisioning profile 或 Apple ID 即可产出可运行的 `.app`（ad-hoc 签名）；正式上架再在 manifest 加
-  `signing-identity`（§6.4 规划）。
+  provisioning profile 或 Apple ID 即可产出可运行的 `.app`（ad-hoc 签名）；正式 Developer ID、公证与
+  DMG 发布走 `--package dmg`，不改变这条 IDE 路径。
 - **编译配置镜像 raw 链接**：`OTHER_LDFLAGS` 恒含 `-lm -lz` + 平台自带库（macOS 上即
   `platformLinkLibs()` 的 `-liconv`；少了它，任何字符集路径过了 `-O2` 仍存活的 app 都会
   `Undefined symbol: _iconv`），再拼 manifest 的 `link-libs`/`objects`/`frameworks` 与
@@ -1490,8 +1511,8 @@ Retina 高清渲染（`ASC_DISPLAY_HIGH=1`）：
   示例见 `examples/wheel.as`（纯 C 回归，用 `stage.dispatchWheel(...)` 直接驱动）。
 
 > 窗口化产物在 `raw` 形态下仍是 Mach-O 可执行文件（可直接命令行运行并弹窗）；要“双击可运行”的
-> macOS `.app` 打包（`MyApp.app/Contents/MacOS/...` + `Info.plist`）用 `--package xcode-project`
-> 生成 application 工程（§6.5），由 Xcode 构建出 `.app` bundle。
+> macOS `.app` 打包（`MyApp.app/Contents/MacOS/...` + `Info.plist`）可直接用 `--package app`；需要
+> Xcode 断点调试时才用 `--package xcode-project` 生成 application 工程（§6.5）。
 
 ## 8. 相关文档
 
@@ -1499,6 +1520,7 @@ Retina 高清渲染（`ASC_DISPLAY_HIGH=1`）：
 - [`TODO.md`](../../TODO.md) — 分阶段路线图（阶段二十九为「构建清单 + 多目标后端」）
 - [`as3-semantics.md`](as3-semantics.md) — AS3 语义保真红线与规范来源
 - [`html5-web.md`](html5-web.md) — 浏览器渲染目标（`--target wasm --package web`）的实现与使用
+- [`release-packaging.md`](release-packaging.md) — `.app` / DMG / Windows `.exe` 发布打包、签名与公证
 - [`win32.md`](win32.md) — Windows 原生后端（`<architecture>` 位宽、`vendor/provision/windows.ps1`、Skia D3D12 直连 GPU、首跑核对清单）
 - [`skia.md`](skia.md) — 渲染后端（Skia 光栅化 + wasm 字体注入）
 - [`AGENTS.md`](../../../.talkmed-agentpilot/AGENTS.md) — 开发规范（§2.9 构建与链接）

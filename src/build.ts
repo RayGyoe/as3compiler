@@ -18,10 +18,10 @@ export type Target = 'native' | 'wasm';
 
 // 分发形态（§6 设计）：编译后端产出裸产物之后，如何组织成工程/包。与
 // `target`（机器码 ABI）正交——同一个 package 形态对所有 target 后端复用。
-// 只服务 IDE 开发者，故只有工程生成器（raw 保持现状），没有 app/dmg 脚本路线。
-// `web` 是浏览器页面（.wasm + .js 胶水 + index.html），与 `xcode-project`（macOS
-// 工程）同层级，都只是「如何组织产物」；它要求 target=wasm（emcc 后端）。
-export type Package = 'raw' | 'xcode-project' | 'android-project' | 'web';
+// `app`/`dmg`/`exe` 是一键脚本发布路线，`xcode-project` 保留给 IDE 调试。
+// `web` 是浏览器页面（.wasm + .js 胶水 + index.html），与其他形态同层级，
+// 都只是「如何组织产物」；它要求 target=wasm（emcc 后端）。
+export type Package = 'raw' | 'xcode-project' | 'android-project' | 'web' | 'app' | 'dmg' | 'exe';
 
 export interface BuildConfig {
   target: Target;
@@ -152,8 +152,18 @@ export interface BuildConfig {
   // configuration*, not CLI flags — carried by the build manifest.
   bundleId: string;          // e.g. com.example.app (fills CFBundleIdentifier)
   displayName: string;       // human-readable app name (fills CFBundleName)
-  icon: string | null;       // .icns path (fills CFBundleIconFile); null = none
+  icon: string | null;       // finished .icns/.ico path; null = use AIR icons or none
+  // AIR <icon> PNG files, keyed by their element name (image16x16, ...).
+  // Kept separate from `icon`: that field is an already-finished platform icon,
+  // while this set is converted by the packager selected for the current host.
+  airIcons: Record<string, string>;
   deploymentTarget: string;  // macOS minimum version (fills LSMinimumSystemVersion)
+  version: string;
+  buildVersion: string;
+  signingIdentity: string;
+  notaryProfile: string;
+  entitlements: string | null;
+  timestampServer: string;
   // AIR <architecture> bit width ("32" | "64"), carried by --air-app; a plain
   // manifest may also spell "arm64" for a Windows ARM64 native build. On a Windows
   // native build this is what selects the MSVC target triple (i686 vs x86_64 vs
@@ -192,7 +202,14 @@ export function defaultBuildConfig(): BuildConfig {
     bundleId: '',
     displayName: '',
     icon: null,
+    airIcons: {},
     deploymentTarget: '12.0',
+    version: '',
+    buildVersion: '',
+    signingIdentity: '',
+    notaryProfile: '',
+    entitlements: null,
+    timestampServer: 'http://timestamp.digicert.com',
     architecture: '',
     dry: false,
   };
@@ -204,7 +221,7 @@ export function defaultBuildConfig(): BuildConfig {
 // same kebab-case names as TypePHP where they overlap.
 interface ManifestFields {
   target?: 'native' | 'wasm';
-  package?: 'raw' | 'xcode-project' | 'android-project' | 'web';
+  package?: 'raw' | 'xcode-project' | 'android-project' | 'web' | 'app' | 'dmg' | 'exe';
   'c-compiler'?: string;
   opt?: string;
   'debug-info'?: boolean;
@@ -239,7 +256,14 @@ interface ManifestFields {
   'bundle-id'?: string;
   'display-name'?: string;
   icon?: string;
+  'air-icons'?: Record<string, string>;
   'deployment-target'?: string;
+  version?: string;
+  'build-version'?: string;
+  'signing-identity'?: string;
+  'notary-profile'?: string;
+  entitlements?: string;
+  'timestamp-server'?: string;
   architecture?: string;
 }
 
@@ -303,7 +327,14 @@ const MANIFEST_FIELD_NAMES: Record<keyof ManifestFields | 'targets', true> = {
   'bundle-id': true,
   'display-name': true,
   icon: true,
+  'air-icons': true,
   'deployment-target': true,
+  version: true,
+  'build-version': true,
+  'signing-identity': true,
+  'notary-profile': true,
+  entitlements: true,
+  'timestamp-server': true,
   architecture: true,
   targets: true,
 };
@@ -332,7 +363,9 @@ const TARGET_LAYER_FIELDS: ReadonlySet<string> = new Set([
   'debug-info', 'lto', 'pgo', 'pgo-dir',
   'swc-paths',
   'ane-paths', 'ane-platform',
-  'bundle-id', 'display-name', 'icon', 'deployment-target',
+  'bundle-id', 'display-name', 'icon', 'air-icons', 'deployment-target',
+  'version', 'build-version', 'signing-identity', 'notary-profile',
+  'entitlements', 'timestamp-server',
 ]);
 
 // Plain Levenshtein, two rows of state (no dependency, no per-cell allocation).
@@ -516,7 +549,16 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m['bundle-id']) next.bundleId = m['bundle-id'];
   if (m['display-name']) next.displayName = m['display-name'];
   if (m.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(m.icon, ht, manifestPath));
+  if (m['air-icons']) {
+    next.airIcons = Object.fromEntries(Object.entries(m['air-icons']).map(([k, p]) => [k, resolveFromManifest(manifestPath, p)]));
+  }
   if (m['deployment-target']) next.deploymentTarget = m['deployment-target'];
+  if (m.version) next.version = m.version;
+  if (m['build-version']) next.buildVersion = m['build-version'];
+  if (m['signing-identity']) next.signingIdentity = m['signing-identity'];
+  if (m['notary-profile']) next.notaryProfile = m['notary-profile'];
+  if (m.entitlements) next.entitlements = resolveFromManifest(manifestPath, m.entitlements);
+  if (m['timestamp-server']) next.timestampServer = m['timestamp-server'];
   return next;
 }
 
@@ -587,7 +629,16 @@ export function applyManifestOverlay(cfg: BuildConfig, m: Manifest, manifestPath
   if (L['bundle-id']) next.bundleId = L['bundle-id'];
   if (L['display-name']) next.displayName = L['display-name'];
   if (L.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(L.icon, ht, manifestPath));
+  if (L['air-icons']) {
+    next.airIcons = Object.fromEntries(Object.entries(L['air-icons']).map(([k, p]) => [k, resolveFromManifest(manifestPath, p)]));
+  }
   if (L['deployment-target']) next.deploymentTarget = L['deployment-target'];
+  if (L.version) next.version = L.version;
+  if (L['build-version']) next.buildVersion = L['build-version'];
+  if (L['signing-identity']) next.signingIdentity = L['signing-identity'];
+  if (L['notary-profile']) next.notaryProfile = L['notary-profile'];
+  if (L.entitlements) next.entitlements = resolveFromManifest(manifestPath, L.entitlements);
+  if (L['timestamp-server']) next.timestampServer = L['timestamp-server'];
   return next;
 }
 

@@ -91,6 +91,13 @@ as-aot examples/fib.as --run
 # 指定输出名 / 指定 C 编译器
 as-aot examples/class.as -o build/class --cc clang --run
 
+# 直接生成 macOS .app（开发/内部分发，ad-hoc 签名）
+as-aot --air-app app.xml --package app -o build/Main
+
+# macOS Developer ID + 公证 DMG / Windows 资源 exe（分别在对应宿主上）
+as-aot --air-app app.xml --package dmg -o build/Main
+as-aot --air-app app.xml --cc clang --package exe -o build/Main
+
 # 生成 macOS App 工程（--package xcode-project，交给 Xcode 打开/构建/调试，产物是 .app）
 as-aot src/Main.as --target native --package xcode-project -o build/Main
 
@@ -198,6 +205,13 @@ error 103，而异命名空间的元素/属性四种写法**全部**报 103；`a
 失败重建带 250 ms 退避。`ASC_GPU_PRESENT_FAIL=1` 可注入一次该路径，`temp/d3dresize` 的 Present/resize/device-lost
 三重组合探针已验证恢复并正常退出。
 
+**一键发布打包（阶段三百零六～三百零八）**：`--package app` 直接产出继承 AIR `<id>`/`<name>`/
+`<versionNumber>`/`<versionLabel>`/`<icon>` 的 macOS `.app` 并 ad-hoc 签名；`--package dmg` 对嵌套原生库与
+ANE 最深层优先做 Developer ID + Hardened Runtime 签名，依次完成 app/DMG 公证、staple、UDZO 镜像和
+Gatekeeper 验收；`--package exe` 在 Windows 上生成 ICO、VERSIONINFO、DPI/长路径 application manifest，
+并可选 Authenticode。凭据只从清单非密字段、环境变量与钥匙串读取，密码日志强制脱敏。`xcode-project`
+保留给 IDE 调试。完整命令与边界见 [`release-packaging.md`](docs/zh-cn/release-packaging.md)。
+
 **ANE 加载（阶段一百七十八）**：`--ane` / 清单 `ane-paths` 打开 `ASC_HAVE_FRE` 并接上宿主 FRE 运行时。
 每一项可以是 `.ane` 包，也可以是**解包后的目录**（`extension.xml` + `<平台键>/<原生库>`，即 `adt` 的暂存布局）——
 后者是重编给 AOT 用的那份产物的默认形态：其原生库导入宿主库（Windows `asaot.dll` / macOS
@@ -263,8 +277,8 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 重编产物是一棵**暂存目录树**（`extension.xml` + `<平台>/<库>`，不打包），放进 `<appDir>/ext-aot/<扩展 id>/`
 就会被自动选中，所以 `adl` 侧继续用原版 ANE、两条路互不干扰。
 
-构建清单（JSON）字段：`target`（`native`/`wasm`）、`package`（`raw`/`xcode-project`/`android-project`/`web`，
-默认 `raw`，见 `compile.md` §6）、`c-compiler`、`opt`、`debug-info`（保留调试信息，默认 `false`，见下）、
+构建清单（JSON）字段：`target`（`native`/`wasm`）、`package`（`raw`/`app`/`dmg`/`exe`/`xcode-project`/`android-project`/`web`，
+默认 `raw`，见 `compile.md` §6 与 `release-packaging.md`）、`c-compiler`、`opt`、`debug-info`（保留调试信息，默认 `false`，见下）、
 `sources`（额外 C/C++ 源）、
 `include-paths`、`link-libs`、`link-paths`、`defines`、`c-flags`（原样透传给 C 编译器的旗标，清单写法；CLI 是 `--cflag <f>` / `-w`，落在每个编译与链接步骤上）、`objects`（预编译 `.o`）、`exports`（导出到 .wasm 导出表的 C 符号）、
 `ane-paths`（要加载的 `.ane` 路径清单，见上「ANE 加载」）、`ane-platform`（覆盖平台条目名，
@@ -278,7 +292,9 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 故 `agreebtn` 这类“勾选态写在皮肤里”的控件在 AOT 里也真的会切帧——
 见 `docs/zh-cn/swc.md` §5/§6/§9）、
 `font-urls`（`--package web` 的字体字节流 URL 列表，运行时注入 Skia），
-以及 `xcode-project` 的应用元数据 `bundle-id`/`display-name`/`icon`/`deployment-target`（见 `compile.md` §6.4）。CLI 参数覆盖清单同名字段。
+以及发布/工程元数据 `bundle-id`/`display-name`/`icon`/`air-icons`/`deployment-target`/`version`/
+`build-version`/`signing-identity`/`notary-profile`/`entitlements`/`timestamp-server`（见 `compile.md` §6.4
+与 [`release-packaging.md`](docs/zh-cn/release-packaging.md)）。CLI 参数覆盖清单同名字段。
 路径类字段相对清单文件所在目录解析。示例见
 [`examples/skia-link.build.example.json`](examples/skia-link.build.example.json)。
 

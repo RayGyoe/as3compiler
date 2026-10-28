@@ -120,7 +120,7 @@ Options:
   --run          run the compiled output after building
   --cc <name>    C compiler to use (default: cc)
   --target <t>   native (default) | wasm (WASI)
-  --package <p>  raw (default) | xcode-project (macOS .app) | android-project | web (browser)
+  --package <p>  raw (default) | app | dmg | exe | xcode-project | android-project | web (browser)
   --manifest <f> build manifest JSON (extra sources / include / link libs)
   --air-app <xml> AIR app descriptor: generate bootstrap + build manifest
   --main-class <n> main class for --air-app (default: infer src/**/Main.as)
@@ -954,6 +954,11 @@ Worth knowing:
   SDL2/Cocoa for it would be pure noise.
 - **CLI beats the manifest**, the same rule compilation follows: `doctor --air-app app.xml --target wasm`
   judges the wasm shape.
+- **Windows Skia builds also check MSVC STL binary compatibility**: `host.msvc-stl` derives the selected
+  toolset from `VCToolsInstallDir` or `clang -###`, then checks that the vectorised `__std_*` imports in
+  `skia.lib` exist in the matching-architecture `libcpmt.lib`. An all-files-present build that would otherwise
+  fail only at `lld-link` now fails here with the toolset version, missing symbols and remedies. A Skia rebuilt
+  with the older local toolset, which no longer imports those symbols, is not rejected by a version-number floor.
 - **The report header carries the compiler version** (`as-aot doctor -- <version> darwin/arm64, node v24.14.1`,
   and `compiler: { name, version }` under `--json`). Same single source (`package.json`), so it can never
   disagree with `as-aot --version`.
@@ -982,7 +987,7 @@ kebab-case.
 | Field | Type | Description |
 |---|---|---|
 | `target` | `"native" \| "wasm"` | Target platform, default `native` |
-| `package` | `"raw" \| "xcode-project" \| "android-project" \| "web"` | Distribution form, default `raw` (§6); `web` requires `target=wasm`, producing browser artifacts (see [`html5-web.md`](html5-web.md)) |
+| `package` | `"raw" \| "app" \| "dmg" \| "exe" \| "xcode-project" \| "android-project" \| "web"` | Distribution form, default `raw` (§6); `app`/`dmg` require a macOS host and `exe` a Windows host (see [`release-packaging.md`](release-packaging.md)); `web` requires `target=wasm` (see [`html5-web.md`](html5-web.md)) |
 | `architecture` | `"32" \| "64" \| "arm64"` | Target bit width (Windows-only; defaults to the host). Decides the dependency directory (`vendor/*/windows-xN`) and the target triple (`i686-` / `x86_64-` / `aarch64-pc-windows-msvc`); an unknown value **errors loudly** instead of falling back to x86_64. **`arm64` serves only non-AIR Windows-on-ARM artifacts**: AIR has no Windows ARM64 runtime, so `--air-app`'s descriptor `<architecture>` still accepts only `32`/`64` (see [`win32.md`](win32.md) §1/§2.11) |
 | `c-compiler` | string | C compiler, default `cc` |
 | `opt` | string | Optimization flags, default `-O2` |
@@ -1006,13 +1011,20 @@ kebab-case.
 | `font-urls` | string[] | Font byte-stream URL list (`--package web` writes it into `index.html`, network-loaded and injected into Skia at runtime; see [`html5-web.md`](html5-web.md) §4) |
 | `preload-paths` | string[] | Data roots packed into the wasm FS image, `src@dest` or a bare path (`--package web` only; the browser sandbox starts with an empty FS, so `File`/`FileStream` would see nothing at all) |
 | `preload-excludes` | string[] | Host paths or fnmatch patterns **removed** from that image (→ `emcc --exclude-file`; also `--package web` only). A directory preload has no per-file opt-out, so files that must not ship are named here instead; patterns match the **host path** the preload walk yields (absolute), so they resolve relative to the manifest dir too. A path containing `*?[` is a PATTERN, not a literal (`weird[1].png` drops the unrelated `weird1.png`); escape it as `[[]` `[]]` `[*]` `[?]` to match literally. A pattern that matches nothing is silently ignored. `--air-app` uses it to pull the page-fetched fonts back out of the FS (see [`html5-web.md`](html5-web.md) §6), and automatically excludes the **current build's output directory** pointed to by `-o` — otherwise `-o temp/<x>` would preload the very `.c`/`.o`/artifact being written into the image (measured on Flappy-Starling: 1.9 MB → 36 MB); with no `-o` specified it makes no guesses at all |
-| `bundle-id` | string | app identifier (`--package xcode-project` fills `Info.plist`'s `CFBundleIdentifier`, default `com.example.<product>`) |
-| `display-name` | string | app display name (fills `CFBundleName`, default product name) |
-| `icon` | string | `.icns` path (relative to manifest dir, copied into `Resources` + fills `CFBundleIconFile`) |
-| `deployment-target` | string | macOS minimum version (fills `MACOSX_DEPLOYMENT_TARGET`, default `12.0`) |
+| `bundle-id` | string | App identifier (`app`/`dmg`/`xcode-project` fill `CFBundleIdentifier`, default `com.example.<product>`) |
+| `display-name` | string | App display name (fills `CFBundleName` / Windows resources, default product name) |
+| `icon` | string | Finished platform icon: `.icns` on macOS or `.ico` on Windows; relative to the manifest |
+| `air-icons` | `{ "imageNNxNN": string }` | AIR descriptor PNG set; converted to `.icns` for `app`/`dmg` or PNG-compressed ICO for `exe` |
+| `deployment-target` | string | macOS minimum version (`LSMinimumSystemVersion` / `MACOSX_DEPLOYMENT_TARGET`, default `12.0`) |
+| `version` | string | Release version; `CFBundleShortVersionString` on macOS, VERSIONINFO on Windows |
+| `build-version` | string | macOS `CFBundleVersion`; AIR `<versionLabel>` supplies the default |
+| `signing-identity` | string | DMG Developer ID or exe Authenticode subject/thumbprint; overridden by `ASC_SIGN_IDENTITY` |
+| `notary-profile` | string | `notarytool` Keychain profile; overridden by `ASC_NOTARY_PROFILE` |
+| `entitlements` | string | Entitlements plist for DMG signing, relative to the manifest |
+| `timestamp-server` | string | Authenticode RFC 3161 timestamp service, default `http://timestamp.digicert.com` |
 | `targets` | `{ native?, wasm? }` | **Per-target override block** (§4.1): top-level fields are the shared default, and the `targets.<target>` block **replaces wholesale** the fields it declares for the **matching target**, letting one manifest serve multiple targets with mutually exclusive link sets |
 
-Path-type fields (`sources` / `swc-paths` / `include-paths` / `link-paths` / `objects` / `preload-excludes`)
+Path-type fields (`sources` / `swc-paths` / `include-paths` / `link-paths` / `objects` / `preload-excludes` / `icon` / `air-icons` / `entitlements`)
 resolve **relative to the directory containing the manifest file** (same as TypePHP's YAML path rule). See
 [`examples/skia-link.build.example.json`](../../examples/skia-link.build.example.json):
 
@@ -1228,6 +1240,8 @@ even allow `target`/`package`.
 |---|---|---|
 | `native` (default, `--package raw`) | `cc -O2 -lm -lz -o <out> <c> [sources] -I... -D... [objects] -L... -l... [-framework X]` | Mach-O / ELF / PE executable |
 | `wasm` (`--package raw`) | `clang --target=wasm32-wasip1 [--sysroot=...] -mllvm -wasm-enable-sjlj -O2 [-g] -mllvm -wasm-use-legacy-eh=false [-Wl,--strip-debug] -o <out>.wasm <c> ... -lsetjmp` | WASI `.wasm` (debug section stripped by default; `--debug-info` removes `-Wl,--strip-debug` and adds `-g`, see §4.3) |
+| `native` + `--package app` / `dmg` | Same native compile/link, then bundle construction and signing; `dmg` also notarizes and creates the image | macOS `.app` / signed, notarized and stapled `.dmg` (§6.1) |
+| `native` + `--package exe` | Same Windows native link, with the `llvm-rc`-generated `.res` added to objects | `.exe` with icon, VERSIONINFO and application manifest |
 | `native` + `--package xcode-project` | generates `.xcodeproj` (§6.5), driven by Xcode/xcodebuild | macOS `.app` bundle (`Contents/MacOS/<bin>` + `Info.plist`) |
 | `wasm` + `--package web` | `emcc` (Emscripten, requires `EMSDK_HOME`) compiles C/C++ sources + links the wasm Skia, `INVOKE_RUN=0` | `.wasm` + `.js` + `index.html` (browser HTML5 rendering, see [`html5-web.md`](html5-web.md)) |
 
@@ -1261,8 +1275,8 @@ conditional compilation. The only current platform difference is `as_now_ms()`:
 
 > This section answers: `--target native` already produces a bare executable, so how should `.app` /
 > `.dmg` / Windows `.exe` / Xcode projects / Android projects be handled — by flattening them into more
-> `--target` values, or by splitting them out? Conclusion: **split into two orthogonal dimensions**. The
-> `xcode-project` form is implemented (§6.5); the rest are planned.
+> `--target` values, or by splitting them out? Conclusion: **split into two orthogonal dimensions**.
+> `app`/`dmg`/`exe`, `xcode-project` and `web` are implemented; mobile project generators remain planned.
 
 The current pipeline's mental model is "one AS → one readable C → one bare executable". Half of those
 artifacts are "switching the compile backend"; the other half are "how to organize after compiling". These
@@ -1289,21 +1303,18 @@ should not be conflated in a single `--target`.
 | Value | Artifact | Description | Status |
 |---|---|---|---|
 | `raw` (default) | bare executable / bare `.wasm` | unchanged, zero behavior change (quick CLI verification, local debugging) | implemented |
-| `xcode-project` | `.xcodeproj` (or CMake project) | generate a macOS application project skeleton + build script, handed to Xcode for build/debug/signing | **implemented (macOS application, §6.5)** |
+| `app` | macOS `.app` | Compile directly into the bundle, inherit AIR metadata/icons and ad-hoc sign | **implemented (stage 306)** |
+| `dmg` | signed, notarized and stapled `.app` + `.dmg` | Developer ID, Hardened Runtime, two notarization passes and final Gatekeeper checks | **implemented (stage 307)** |
+| `exe` | Windows `.exe` | ICO, VERSIONINFO, DPI/long-path manifest and optional Authenticode | **implemented (stage 308)** |
+| `xcode-project` | `.xcodeproj` | Generate a macOS application project for Xcode builds and breakpoint debugging | **implemented (macOS application, §6.5)** |
 | `android-project` | Gradle + NDK project | generate `build.gradle` + `CMakeLists.txt` + JNI/native-activity bridge | planned |
 | `web` | `.wasm` + `.js` + `index.html` | use emcc to produce a browser HTML5 rendering page (`target=wasm`, see §6.6 and [`html5-web.md`](html5-web.md)) | **implemented (§6.6)** |
 
-**Target audience: `xcode-project` / `android-project` serve IDE developers only**, so these two forms
-provide **no `app` / `dmg`**; `web`, like `raw`, is a "one compile call + post-processing" (emcc compile +
-`index.html` generation) that directly produces browser-loadable final artifacts.
-
-- `app` / `dmg` is the **script route** — `build.ts` directly invokes `cc/clang` + `codesign` + `hdiutil` to
-  produce the final artifact in one shot, aimed at CI / quick packaging / no human intervention; `xcode-project`
-  is the **IDE route** — "generate a project, let Xcode drive", aimed at long-term development, breakpoint
-  debugging, and signing for distribution. The two are **parallel routes** that both end at `.app`, but not an
-  inclusion relationship where the "advanced form replaces the low-level form".
-- Since they only serve IDE developers, the script route (`app` / `dmg`) is cut entirely, and the distribution
-  forms converge to `raw` + two project generators + `web`.
+**`app` / `dmg` / `exe` are the scripted release route**: they reuse the same `cc/clang` compile/link and then
+call platform tools to produce final artifacts for CI and one-command packaging. See
+[`release-packaging.md`](release-packaging.md) for commands, credentials and verification. **`xcode-project` is
+the IDE route**, retained for development and breakpoints rather than release packaging; `web` directly produces
+browser-loadable artifacts.
 
 **`xcode-project` currently produces a macOS application**: `--package xcode-project` only supports
 `--target native` for now (macOS application); the iOS/Android project generators are not yet implemented.
@@ -1317,13 +1328,10 @@ macOS-only today (the SDL2/Skia static libraries only have macOS arm64 builds).
    backend still produces Mach-O / ELF; the project generator organizes the compile command + dependencies +
    resources into an `.xcodeproj` / Gradle skeleton. So they are an independent generation step in the build
    layer, rather than being stuffed into `cc/clang`'s compile arguments.
-2. **Windows `.exe` needs no new argument at all**. `native` on Windows is already a PE executable; the only
-   small gap was that `-o app` did not auto-append `.exe` — the default extension is now appended by host OS
-   (with `process.platform === 'win32'` a native artifact gets the `.exe` suffix; POSIX does not). That is not
-   just a naming convention: Windows' `CreateProcessW` only looks an executable up along the
-   `.exe`/`.cmd`/`.bat`/`.com` extension sequence, and an extensionless PE file is `ENOENT` as far as
-   `spawnSync` is concerned — so `--run` started on macOS but silently failed to start on Windows; with `.exe`
-   appended the two agree. Not a new form.
+2. **Windows `raw` and `exe` share the same PE backend**. `raw` remains the original bare executable; choose
+   `--package exe` when you need an icon, VERSIONINFO, a DPI/long-path application manifest or Authenticode.
+   The resource compiler emits a `.res` for the existing link. Both forms retain the Windows rule that appends
+   `.exe` to `-o app`.
 3. **Project metadata goes into the manifest, not flattened into CLI flags**. The generator needs a lot of
    metadata: bundle id, icon, signing identity, min SDK, permissions, resource directory… these are **not
    arguments, they are project configuration**. The project already has a manifest mechanism analogous to
@@ -1336,7 +1344,16 @@ macOS-only today (the SDL2/Skia static libraries only have macOS arm64 builds).
 # unchanged behavior
 as-aot examples/hello.as --run
 
-# macOS application project (compile backend native + generate .xcodeproj; implemented)
+# macOS development .app (direct packaging + ad-hoc signing)
+as-aot --air-app app.xml --package app -o build/Main
+
+# macOS Developer ID + notarized DMG (credentials in release-packaging.md)
+as-aot --air-app app.xml --package dmg -o build/Main
+
+# Windows resources and optional Authenticode (Windows host)
+as-aot --air-app app.xml --cc clang --package exe -o build/Main
+
+# macOS IDE project (generate .xcodeproj for Xcode debugging)
 as-aot src/Main.as --target native --package xcode-project --manifest macos.json
 
 # iOS project (switch backend + generate project, complex metadata via manifest; planned)
@@ -1349,7 +1366,8 @@ as-aot src/Main.as --target android --package android-project --manifest android
 ### 6.4 manifest extension fields (partially implemented)
 
 Complex project metadata is added to the §4 build manifest (kebab-case, path-type fields resolve relative to
-the manifest directory). The four macOS application (`xcode-project`) fields are implemented and used in §6.5:
+the manifest directory). Scripted releases and Xcode projects share these fields; `--air-app` supplies descriptor
+defaults and explicit manifest values win:
 
 | Field | Description | Status |
 |---|---|---|
@@ -1360,10 +1378,14 @@ the manifest directory). The four macOS application (`xcode-project`) fields are
 | `permissions` | Android `AndroidManifest.xml` permissions / iOS `Info.plist` usage descriptions | planned |
 | `resources` | extra files to copy into the bundle / project resource directory | planned |
 | `ndk-abi` | Android target ABI list (e.g. `arm64-v8a`) | planned |
-| `signing-identity` | code-signing identity (`codesign` for macOS/iOS; currently ad-hoc `-`) | planned |
+| `air-icons` | AIR PNG set converted to `.icns` / ICO during packaging | ✅ implemented |
+| `version` / `build-version` | Release version and macOS build version | ✅ implemented |
+| `signing-identity` | DMG Developer ID / exe Authenticode certificate | ✅ implemented |
+| `notary-profile` / `entitlements` | Apple notary Keychain profile / signing entitlements | ✅ implemented |
+| `timestamp-server` | Authenticode timestamp service | ✅ implemented |
 
-Landing order: `xcode-project` (macOS application) is done → next `android-project` (the heaviest project
-generator) → then multiplatform destination and formal signing.
+`xcode-project` continues to consume its IDE metadata subset; formal signing, notarization and DMG creation use
+`--package dmg`.
 
 ### 6.5 `xcode-project` (implemented, macOS application)
 
@@ -1402,8 +1424,8 @@ Implementation notes (`src/xcode-project.ts`):
   `icon` (absolute-path file ref) is added to the Resources phase and copied into `Contents/Resources/` at
   build time.
 - **Ad-hoc signing**: `CODE_SIGN_STYLE = Manual` + `CODE_SIGN_IDENTITY = "-"`, so `xcodebuild` produces a
-  runnable `.app` with no provisioning profile or Apple ID (ad-hoc); formal distribution adds
-  `signing-identity` in the manifest (§6.4, planned).
+  runnable `.app` with no provisioning profile or Apple ID (ad-hoc). Formal Developer ID signing, notarization
+  and DMG creation use `--package dmg`, leaving this IDE path unchanged.
 - **Compile config mirrors the raw link**: `OTHER_LDFLAGS` always contains `-lm -lz` plus the platform's
   own native lib (macOS's `platformLinkLibs()` `-liconv`; without it any app whose charset path survives
   `-O2` fails with `Undefined symbol: _iconv`), then the manifest's `link-libs`/`objects`/`frameworks` and
@@ -1632,7 +1654,7 @@ Key implementation points:
 
 > The windowed artifact in `raw` form is still a Mach-O executable (runnable from the command line and pops a
 > window); for a "double-click-to-run" macOS `.app` (`MyApp.app/Contents/MacOS/...` + `Info.plist`), use
-> `--package xcode-project` to generate an application project (§6.5), and Xcode builds the `.app` bundle.
+> `--package app` directly, or `--package xcode-project` when Xcode breakpoint debugging is needed (§6.5).
 
 ## 8. Related Documents
 

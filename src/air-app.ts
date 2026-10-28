@@ -28,9 +28,15 @@ export interface EmbedFont {
 export interface AirAppInfo {
   id: string;
   versionNumber: string;
+  versionLabel: string;
   filename: string;
   content: string;
   title: string;
+  // Release metadata: <name> is the product's display name; <title> only names
+  // the initial window. Icons remain descriptor-relative until the generated
+  // manifest resolves them (the same rule as every other path field).
+  name: string;
+  icons: Record<string, string>;
   visible: boolean;
   resizable: boolean;
   width: number;
@@ -273,7 +279,19 @@ export function parseAirApp(xml: string): AirAppInfo {
   const doc = stripXmlComments(xml);
   const id = childText(doc, 'id') ?? '';
   const versionNumber = childText(doc, 'versionNumber') ?? '';
+  const versionLabel = childText(doc, 'versionLabel') ?? '';
   const filename = childText(doc, 'filename') ?? '';
+  const name = childText(doc, 'name') ?? '';
+  const icons: Record<string, string> = {};
+  const iconBlock = doc.match(/<icon\b[^>]*>([\s\S]*?)<\/icon>/);
+  if (iconBlock) {
+    const image = /<(image\d+x\d+)\b[^>]*>([\s\S]*?)<\/\1>/g;
+    let match: RegExpExecArray | null;
+    while ((match = image.exec(iconBlock[1])) !== null) {
+      const path = match[2].trim();
+      if (path) icons[match[1]] = path;
+    }
+  }
 
   const iw = doc.match(/<initialWindow\b[^>]*>([\s\S]*?)<\/initialWindow>/);
   const iwXml = iw ? iw[1] : '';
@@ -345,7 +363,7 @@ export function parseAirApp(xml: string): AirAppInfo {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     throw new AirAppError('air-app.xml <initialWindow> width/height must be positive integers');
   }
-  return { id, versionNumber, filename, content, title: title || filename, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, style, architecture: architectureStr, fonts, extensionIDs };
+  return { id, versionNumber, versionLabel, filename, content, title: title || filename, name: name || filename, icons, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, style, architecture: architectureStr, fonts, extensionIDs };
 }
 
 // <x>/<y> of <initialWindow>, both xs:int — so a negative coordinate is legal and means
@@ -1373,6 +1391,14 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   }
 
   const generated = airManifest(vendorRel, info.visible, info.resizable, info.displayResolution === 'high', web, info.renderMode, usesStage3D, info.depthAndStencil, info.fonts, preloadPaths, preloadExcludes, appFontUrls, usesNetworking, audioLinked, info.architecture, effectiveFeatures, info.style, effectiveGpuBackend);
+  // Packaging identity is derived from the descriptor, not maintained a second
+  // time in the generated build manifest. Explicit values in a hand-written
+  // manifest still win when that manifest is used without --air-app.
+  generated['bundle-id'] = info.id;
+  generated['display-name'] = info.name;
+  if (info.versionNumber) generated.version = info.versionNumber;
+  if (info.versionLabel) generated['build-version'] = info.versionLabel;
+  if (Object.keys(info.icons).length > 0) generated['air-icons'] = info.icons;
   // Native extensions. The descriptor names them by ID and never by path — AIR is
   // the same, locating the packages through `-extdir` — so the two halves are put
   // together here and written into the manifest as resolved paths.

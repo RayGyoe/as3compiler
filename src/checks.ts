@@ -502,6 +502,75 @@ export const CHECKS: Check[] = [
     },
   },
 
+  // ---- release packaging -------------------------------------------------
+  {
+    id: 'release.mac-tools',
+    title: 'macOS release tools',
+    kind: 'hard',
+    applies: (c) => (c.cfg.package === 'app' || c.cfg.package === 'dmg') && process.platform === 'darwin',
+    run: ({ cfg }) => {
+      const missing: string[] = [];
+      for (const tool of ['codesign', ...(cfg.package === 'dmg' ? ['hdiutil'] : []), ...(Object.keys(cfg.airIcons).length > 0 ? ['iconutil'] : [])]) {
+        const probe = spawnSync(tool, ['-h'], { encoding: 'utf8' });
+        if (probe.error) missing.push(tool);
+      }
+      if (cfg.package === 'dmg') {
+        const notary = spawnSync('xcrun', ['--find', 'notarytool'], { encoding: 'utf8' });
+        if (notary.error || notary.status !== 0) missing.push('xcrun notarytool');
+      }
+      return missing.length === 0
+        ? ok('codesign' + (cfg.package === 'dmg' ? ', hdiutil, notarytool' : '') + ' available')
+        : fail(`missing release tools: ${missing.join(', ')}`, 'Install Xcode or the Command Line Tools (`xcode-select --install`).');
+    },
+  },
+  {
+    id: 'release.identity',
+    title: 'Developer ID signing identity',
+    kind: 'hard',
+    applies: (c) => c.cfg.package === 'dmg' && process.platform === 'darwin',
+    run: ({ cfg }) => {
+      const identity = process.env.ASC_SIGN_IDENTITY || cfg.signingIdentity;
+      if (!identity) return fail('no signing-identity configured', 'Set manifest signing-identity or ASC_SIGN_IDENTITY to a Developer ID Application identity.');
+      const probe = spawnSync('security', ['find-identity', '-v', '-p', 'codesigning'], { encoding: 'utf8' });
+      if (probe.error || probe.status !== 0 || !(probe.stdout || '').includes(identity)) {
+        return fail(`identity not found in the login keychain: ${identity}`, 'Install the Developer ID Application certificate and its private key, or select another identity.');
+      }
+      return ok(identity);
+    },
+  },
+  {
+    id: 'release.notary-profile',
+    title: 'notarytool keychain profile',
+    kind: 'hard',
+    applies: (c) => c.cfg.package === 'dmg' && process.platform === 'darwin',
+    run: ({ cfg }) => {
+      const profile = process.env.ASC_NOTARY_PROFILE || cfg.notaryProfile;
+      if (!profile) return fail('no notary-profile configured', 'Run `xcrun notarytool store-credentials <profile> ...`, then set manifest notary-profile or ASC_NOTARY_PROFILE.');
+      // Offline keychain query; `notarytool history` would contact Apple and is
+      // deliberately not part of doctor's default, no-network checks.
+      const probe = spawnSync('security', ['find-generic-password', '-a', profile, '-s', 'com.apple.gke.notary.tool'], { encoding: 'utf8' });
+      if (probe.error || probe.status !== 0) {
+        return fail(`keychain profile not found: ${profile}`, 'Run `xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <team> --password <app-specific-password>`.');
+      }
+      return ok(`keychain profile ${profile}`);
+    },
+  },
+  {
+    id: 'release.windows-tools',
+    title: 'Windows resource/signing tools',
+    kind: 'hard',
+    applies: (c) => c.cfg.package === 'exe' && process.platform === 'win32',
+    run: ({ cfg }) => {
+      const rc = spawnSync('llvm-rc', ['--version'], { encoding: 'utf8' });
+      if (rc.error) return fail('llvm-rc not found on PATH', 'Install LLVM (or add its bin directory to PATH).');
+      if (cfg.signingIdentity || process.env.ASC_SIGN_IDENTITY || process.env.ASC_WIN_CERT_FILE) {
+        const sign = spawnSync('where', ['signtool'], { encoding: 'utf8' });
+        if (sign.error || sign.status !== 0) return fail('signtool not found on PATH', 'Install the Windows SDK and add its bin directory to PATH.');
+      }
+      return ok('llvm-rc available' + ((cfg.signingIdentity || process.env.ASC_WIN_CERT_FILE) ? ', signtool available' : ''));
+    },
+  },
+
   // ---- optional reference tools -----------------------------------------
   {
     id: 'airsdk.adl',
