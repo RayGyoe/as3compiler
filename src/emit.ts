@@ -2309,13 +2309,14 @@ export class Emitter {
     this.line('}');
     // IDataInput reads that run past the end of their buffer throw EOFError
     // #2030 (measured on adl 51.4.1: ByteArray.readBoolean/readMultiByte on an
-    // exhausted or short buffer). The VM-thrown EOFError reports name 'Error'
-    // with errorID 2030 -- the class does not override `name` -- so the message
-    // keeps the codebase's long descriptive form while the id carries the
-    // AIR-visible contract.
+    // exhausted or short buffer, and again on setPixels with a short pixel
+    // array -- temp/gdsetpixels/). The VM-thrown EOFError reports name 'Error'
+    // with errorID 2030 -- the class does not override `name` -- and its
+    // message is verbatim 'Error #2030: End of file was encountered.' WITH the
+    // final period, exactly as URLStream and Socket raise it.
     this.line('static void as_throw_eof(void) {');
     this.indent++;
-    this.line('as_throw(EOFError_new((char*)"Error #2030: End of file was encountered", 2030));');
+    this.line('as_throw(EOFError_new((char*)"Error #2030: End of file was encountered.", 2030));');
     this.indent--;
     this.line('}');
     this.line('');
@@ -21461,22 +21462,40 @@ void FileStream_writeObject(void* _this, as_value v) {
     // only the big-endian order honoured the camera preview came out channel
     // swapped and near-black (the alpha byte read was really the blue channel) --
     // see examples/bitmap-setpixels-endian.as.
+    //
+    // The words come from ByteArray.readUnsignedInt(), i.e. the array's own
+    // CURSOR drives them, and an array that runs out mid-rect is an ERROR, not
+    // a short copy. Measured on adl 51.4.1 (temp/gdsetpixels/, 2x2 rect):
+    //   16 bytes @position 0 -> 4 pixels, position ends at 16
+    //    6 bytes @position 0 -> 1 pixel written, position 4, EOFError #2030
+    //   16 bytes @position 4 -> pixels 2..4, position 16, EOFError #2030
+    //    0 bytes             -> nothing written, EOFError #2030
+    // So: start at `position`, advance 4 per rect cell, and when fewer than four
+    // bytes remain keep the cells already filled and throw EOFError #2030 there.
+    // Reading past `length` instead is not a benign over-read -- it is how the
+    // client process died: a short ANE video frame walked off a 1080p buffer into
+    // an unmapped page (exe+0x91a41, READ of 0x50d1c000). The throw is load
+    // bearing as well: ANEVideo.as wraps this call in try/catch, and its catch is
+    // the only thing between a truncated frame and the render path.
     this.line('void BitmapData_setPixels(void* _this, Rectangle* rect, ByteArray* ba) {');
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
-    this.line('if (bd == NULL || bd->pixels == NULL || rect == NULL || ba == NULL || ba->data == NULL) return;');
+    this.line('if (bd == NULL || bd->pixels == NULL || rect == NULL || ba == NULL) return;');
     this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
     this.line('int w = (int)rect->width, h = (int)rect->height;');
-    this.line('unsigned char* src = (unsigned char*)ba->data;');
     this.line('int le = ba->endian != NULL && strcmp(ba->endian, "littleEndian") == 0;');
     this.line('bd->_px_ver++;');
     this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
+    this.line('// One word per rect cell (in rect order) off the array cursor; a short');
+    this.line('// array keeps the cells already filled and throws #2030 right here.');
+    this.line('if (ba->data == NULL || ba->position < 0 || ba->position + 4 > ba->length) { as_throw_eof(); return; }');
+    this.line('unsigned char* src = (unsigned char*)ba->data + ba->position;');
+    this.line('ba->position += 4;');
     this.line('int px = x0 + x, py = y0 + y;');
     this.line('if (px < 0 || py < 0 || px >= bd->width || py >= bd->height) continue;');
-    this.line('int i = (y * w + x) * 4;');
     this.line('unsigned a, r, g, b;');
-    this.line('if (le) { a = src[i + 3]; r = src[i + 2]; g = src[i + 1]; b = src[i]; }');
-    this.line('else { a = src[i]; r = src[i + 1]; g = src[i + 2]; b = src[i + 3]; }');
+    this.line('if (le) { a = src[3]; r = src[2]; g = src[1]; b = src[0]; }');
+    this.line('else { a = src[0]; r = src[1]; g = src[2]; b = src[3]; }');
     this.line('((unsigned*)bd->pixels)[py * bd->width + px] = (a << 24) | (r << 16) | (g << 8) | b;');
     this.line('} }');
     this.indent--;

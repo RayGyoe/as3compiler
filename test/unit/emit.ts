@@ -2341,10 +2341,26 @@ function checkRenderBitmapLivePixels(): string[] {
   check('BitmapData_setPixels is emitted', sp.length > 0);
   check('setPixels reads ByteArray.endian', sp.includes('strcmp(ba->endian, "littleEndian") == 0'));
   check('littleEndian reads B,G,R,A (alpha last)',
-    sp.includes('if (le) { a = src[i + 3]; r = src[i + 2]; g = src[i + 1]; b = src[i]; }'));
+    sp.includes('if (le) { a = src[3]; r = src[2]; g = src[1]; b = src[0]; }'));
   check('bigEndian keeps reading A,R,G,B (alpha first)',
-    sp.includes('else { a = src[i]; r = src[i + 1]; g = src[i + 2]; b = src[i + 3]; }'));
+    sp.includes('else { a = src[0]; r = src[1]; g = src[2]; b = src[3]; }'));
   check('setPixels bumps the pixel version', sp.includes('bd->_px_ver++;'));
+
+  // 1b. The pixels come off the ByteArray CURSOR, and a short array is an
+  //     EOFError rather than an over-read: AIR fills the cells it can and then
+  //     throws #2030 (temp/gdsetpixels/, adl 51.4.1). Reading past `length` is
+  //     exactly how the client process died -- a truncated ANE video frame read
+  //     off a 1080p buffer into an unmapped page (exe+0x91a41, READ 0x50d1c000).
+  check('setPixels reads at the ByteArray position',
+    sp.includes('(unsigned char*)ba->data + ba->position'));
+  check('setPixels advances the ByteArray position per pixel',
+    sp.includes('ba->position += 4;'));
+  check('setPixels refuses to read past the ByteArray length',
+    sp.includes('ba->position + 4 > ba->length'));
+  check('setPixels raises EOFError #2030 on a shortfall',
+    sp.includes('{ as_throw_eof(); return; }'));
+  check('setPixels advances the cursor before the bitmap bounds clip',
+    sp.indexOf('ba->position += 4;') < sp.indexOf('px >= bd->width'));
 
   // 2. Every pixel mutator invalidates the cached view, or the screen freezes.
   const mutators = [

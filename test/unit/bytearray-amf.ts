@@ -44,7 +44,7 @@ function checkByteArrayAmf(): string[] {
     generateC(parse('var n:int = 1;\n')).c.includes('as_throw_charset_unsupported')
     && generateC(parse('var n:int = 1;\n')).c.includes('charset not supported on this backend'));
   check('the new reads throw EOFError #2030 (unlike the older silent reads)',
-    generateC(parse('var n:int = 1;\n')).c.includes('EOFError_new((char*)"Error #2030: End of file was encountered", 2030)'));
+    generateC(parse('var n:int = 1;\n')).c.includes('EOFError_new((char*)"Error #2030: End of file was encountered.", 2030)'));
   check('iconv is linked on macOS only, never for wasm/web',
     /function platformLinkLibs\(\): string\[\] \{[\s\S]{0,400}'iconv'/.test(readFileSync(join(root, 'src', 'build.ts'), 'utf8')));
 
