@@ -17377,7 +17377,61 @@ Windows 本机实跑覆盖。
   自己也想部署「一份 ICU 数据」，两边现在可以共存了，但**别指望我们的加载器去读别人的名字** ——
   回退到 `icudtl.dat` 只是给旧产物留的逃生口，且会打警告。
 
+### 阶段三百一十四：库层三处性能/语义实错（`sort` 归并 / `Number`→字符串二分 / 值类一元转型）（v0.4.274 → v0.4.275）
+
+背景：用户报「AOT 版比 AIR 版还卡」。本阶段把这个断言拆成三件事：真应用的卡、微基准里 AOT 输给 AIR 的项、
+以及旧基准自己造出来的「卡死」（事件日志 1002 挂在 `PerfBench.exe`/`Bench2.exe` 身上，不是主程序）。
+量法换成：**同一份 `.as` 分别跑 `adl` 与 AOT**、每帧只做有界工作单元、外部看门狗轮询 `IsHungAppWindow` +
+`SendMessageTimeout`（基准自己堵死 UI 线程时，它的数字一律作废）。探针与读数全部留在 `temp/perf-b3/`。
+
+- **真因一（卡死的直接形状）**：`as_array_sort_impl` 是**插入排序**，`sort` / `sortOn` / 比较器三种形态共用这一个核心。
+  实测成本是二次方指纹（`sort(Array.NUMERIC)` n=1000→8000：0.66→2.58→10.8→43.1 ms；`sortOn("k",NUMERIC)`
+  n=250→2000：0.62→2.75→12.6→62.2 ms），外推 n=50000 ≈ **39 s**，而它跑在**单个 `ENTER_FRAME`** 里 ——
+  旧基准 `sort_on` 相位就是这么被 Windows 判 App Hang 关掉的，应用里 GreenSock `LiquidStage.sortOn` 也在同一形状上。
+- **真因二**：`as_str_from_double` 为了求最短可往返十进制，**从 prec=0 线性试到 17**，每轮一次 `snprintf` + 一次
+  `strtod`（AIR 用原生 dtoa）。一次 `Number` 转字符串抬到 17.9 µs（AIR 2.7），而拼字符串在应用里随处可见。
+- **真因三**：`Point(o)` / `Rectangle(o)` / `Matrix(o)` 这类**值类一元转型**被 `emitGlobalCall` 的「不带 `new` 也能构造」
+  分支吞掉，生成 `Point_new(as_v_to_number(o), 0.0)` ⇒ `.x` 恒 `NaN`、`.y` 恒 `0`。判据是 `mxmlc` 自己报的
+  「参数的数量不正确。要求不超过 1 个」：一元形式永远是**转型**，构造必须带 `new`（口径入
+  `docs/zh-cn/as3-semantics.md` §3.3 第 5 条）。
+- **修复**：① 换成**自底向上稳定归并**（不能换 `qsort`/快排：相等键不交换是 AS3 语义，「先按名字排再按时间
+  `sortOn`」这种二级排序完全依赖它）；比较器是用户代码，可能 `push`/`splice` 同一个数组而 realloc `a->data`，
+  所以**每一趟重取 `a->data`**；趟数按入口长度固定；`malloc` 失败退回路就地插入排序（语义一致、只是慢）。
+  ② 精度搜索改 0..17 **二分**（谓词单调：p 位能读回则 p+1 位必能），**最多 5 轮**；同一谓词、同一格式串、
+  同一区间 ⇒ 输出逐字节一致。③ `emit.ts` 的 geom 分支在 `args.length === 1` 时 `return null` 让位给
+  `as_v_req_inst`（多元形式保留原有构造行为，那条宽容扩展不收回）。
+- **验收**：GeomProbe 与 `adl` **40 行零差异**（转型面，`geomprobe-{air,merged}.txt` 各 40 行）；Bench3 同表 AOT **反超 AIR**：`num_8000` 0.094 vs 0.313 µs/次、
+  `cmp_4000` 0.250 vs 0.938 µs/次，`dbl_1600` 17.9 → **5.2 µs/次**。`git stash` 把基线（`b25cd00`）单独编一次做
+  **基线 / 补丁 / `adl` 三方逐行比对**（`temp/perf-b3/cmp3.sh`）：新修好 0 / 新弄坏 0 / 62 处既存分歧**改前改后逐字相同**
+  （旧插入排序也是稳定的，所以 SemCheck 的行为面本就不该变，变的只有单价）。钉子：`unit: runtime/ArraySortMerge`（14）、
+  `unit: runtime/DoubleToStringBinary`（9）、`unit: emit/ValueClassCoercion`（12，含生成 C 层面 `as_v_req_inst` vs
+  `Point_new` 的直接断言）；全量 `node --test test/unit/*.ts` 在本机**默认 PATH** 下 **265 pass / 3 fail**，3 个红都是
+  `unit: inline/*`（本机 `cc` 默认搜不到 `zlib.h`）；补上 `CPATH=vendor/curl/include` 后变 **267 pass / 1 fail**，剩下
+  那条是 `inline/StackCanary` 的**反向对照**（`-fstack-protector` 何时插金丝雀本就随 clang 版本变）——用 `git stash` 回到
+  基线 `b25cd00` 并加同一条 CPATH，跑出的是**完全相同的 1 红** ⇒ 非本轮引入。**examples 全量在本机仍跑不出**：不带清单的
+  默认链接行里没有 vendor 的 zlib，**73 例**死在 `lld-link: undefined symbol: uncompress`（macOS 有系统 zlib ⇒ CI 绿）——
+  属本机工具链/构建层缺件，与本轮改动无关（本轮不盲改测试链接行）。
+- **合并后复跑（新 base `1c1914c` = 阶段三百一十，2026-10-29）**：三方门禁的「基线」换成新 base 重做——`SemCheck` 72 行里 `base↔adl` 62 处不同、`merged↔adl` 62 处不同、**新修好 0 / 新弄坏 0**；远端这 8 个提交**一行都没改到 `SemCheck` 可见面**（`semcheck-base-310.txt` 与旧的 `semcheck-base.txt`（`b25cd00`）逐字相同），而 `merged` 读数与修复当时的 `semcheck-patched.txt` **逐字相同**。`GeomProbe` 40 行与 `adl` 仍零差异；`RTProbe` 的分歧键集仍是同一组 7 个（`b3 c1 c3 e2 e3 e4 e7`）、值也逐字相同。unit 全量 **276 pass / 1 fail**，唯一那条红在**纯净 `origin/main` 工作树**上是同一条（`unit: inline/StackCanary` 的反向对照，用 `git worktree` 另开一份复算）。Bench3 合并臂逐项复算与昨天一致：`num_8000 0.094`、`cmp_4000 0.250`、`dbl_1600 5.078`、`int_8000 8.328` µs/次（今天 AIR 臂同表 `0.266 / 1.000 / 2.578`，昨天 `0.313 / 0.938 / 2.7`）⇒ 排序仍反超、dtoa 仍慢 AIR 约 2×；但**合并臂这轮没跑完整轮**：看门狗在 `pt_4000`（1.675 s 帧）判死，**同目录的合并前 exe 在同一相位同形状**——那正是本表 `gc_find_block()` 行的现形，不是本轮改动带出来的。
+- **推翻的一个自己之前的结论**：那 4.6 秒长帧**不是 GC**。`ASC_FRAME_STATS`/`ASC_GC_STATS` 同一行给出
+  `max=4642.00(worstgc=1.00) gcshare=0.1% freeblk=300026`；而 GeomPerf 的三段因果实验证明钱在
+  `gc_find_block()` 的**首次适配线性扫描**：干净堆 0.037 µs/次 → 只造 10 万个空闲块后全丢弃（存活集几乎不变）
+  **0.548 µs/次**，同相位读路径 `read_cast_frag` 仍 0.000 µs/次。已定量登记、**本轮未修**，口径见
+  `docs/zh-cn/gc.md` §6.17。
+- **如实报明（本轮量到、未修，全部入 `遗留待开发` 表）**：① `Array.sort(flag)` **把所有位标志都忽略**
+  （CI/DESCENDING/8/16/32 八种组合输出一模一样；`sortOn(key, flags)` 正常，所以 GreenSock 侥幸没事）；
+  ② **动态接收者**的 `Number.toString()`/`toFixed()` 返 `null`（类型化接收者正常；应用 157 处 `.toString(`
+  多数类型化 ⇒ 影响面有限但要抽查）；③ 定长小数分支的 17 位上限把 **round-trip 弄断**（`String(0.00001*12)`
+  我们交 `0.00012000000000000` 读回不等原值，AIR 交 `0.00012000000000000002`；RTProbe 逐值对照）；
+  ④ `toFixed` 的 `.5` 舍入方向不同（`(2.5).toFixed(0)`：AIR `3` / 我们 `2`）；⑤ 极值 `String()` 表示不同
+  （`5e-324`、DBL_MAX、`1.2e19`——其中 **DBL_MAX 与 `1e+100` 是 AIR 自己 round-trip 失败**，照抄会把错的抄进来）；
+  ⑥ 排序边角语义（稀疏数组排序后 `4 in a`：AIR `false` / 我们 `true`；`sortOn(null)`；比较器返 `NaN`）。
+- **刻意不入表的一条分歧**：并列项的次序——`big500` 自测稳定性违例 **AIR 259 / AOT 0**。AIR 在带并列键的
+  `sortOn`/带并列比较器上**并不是稳定的**，而 AS3 文档与作者期望都是稳定。复刻它等于故意实现一个不定序 bug，
+  故保持我们的严格稳定，只在此记录读数（`temp/perf-b3/semcheck-air.txt` vs `semcheck-patched.txt`）。
+
+
 ### 遗留待开发
+> **2026-10-28 追加（阶段三百一十四：库层三处性能/语义实错；rebase 后由「三百零六」改号）**：**新登记 7 行 / 改写 1 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**103 → 110 行**（`未开始` **79 → 86**，`未开始 / **D43b**` 1 行未变 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**仍报同一处口径差**：上一轮 note（阶段三百零九）标 `未开始` **82**，而按 `1c1914c` 实测是 **79 行 `未开始` + 1 行 `未开始/**D43b**` = 80**——**增量无争议，绝对标签差 2**，本轮继续按实测行数记账。**改号说明**：本节原记「阶段三百零六」；rebase 到 `origin/main`（`1c1914c`）时 三百零六～三百零八（一键发布打包）、三百零九（原生窗口句柄）、三百一十（`aot-icudtl.dat`）已占用，提交标题里的 三百一十二 / 三百一十三 也已用掉，故本轮顺延为 **三百一十四**、版本 **v0.4.274 → v0.4.275**；节内「基线」指改动落库前的 `b25cd00`，合并后另按新 base 复跑过门禁（见该节验收）。**本阶段修净的三处不占表**（插入排序核心、`Number`→字符串线性试精度、值类一元转型被打成构造函数）：都是 `adl` 跑得对、我们此前跑不出，按 §1.5 属遗留缺陷但同阶段落地。**改写 1 行**＝给 `gc_find_block()` 那行补上 2026-10-29 的复算证据（AOT 臂在 `pt_4000` 就被看门狗判死、同 exe 换 base 形状不变、adl 同相位 0 hang）。**新登记 7 行**全部是同两台差分门禁（`SemCheck` 72 行 + `RTProbe` 32 行）**量出来、但不在本轮批准范围内修**的真分歧：① `Array.sort(flag)` 忽略全部位标志；② 动态接收者的 `Number.toString()`/`toFixed()` 返 `null`；③ 定长小数 17 位上限弄断 round-trip；④ `toFixed` 的 `.5` 舍入方向；⑤ 极值 `String()` 表示（含两例 **AIR 自身 round-trip 失败**）；⑥ 排序边角语义（稀疏槽 `in` / `sortOn(null)` / 比较器返 `NaN`）；⑦ **`gc_find_block()` 首次适配线性扫描**——它是**我方性能缺口**而不是 `adl` 保真差（`adl` 没有对应「块选择」可见面），但与表内「`Vector` 逐元素守卫」同行同族：本表是本仓唯一保留「已量测、未修」的地方，而 4.6 s 长帧 + `gcshare=0.1%` + 三段因果实验（0.037→0.548 µs/次）需要一个不会被下次重推一遍的落点。**刻意不入表的一条**：并列项次序（`big500` 稳定性违例 AIR 259 / AOT 0）——AIR 自己不稳定，复刻它等于故意实现不定序 bug，详见该阶段节。
 > **2026-10-28 追加（阶段三百零九：`FREAcquire|ReleaseNativeWindowHandle` 落地）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **102 → 103 项**（`未开始` **81 → 82**）。D 面的状态变化（11 → 9 个延后）记在 [`docs/zh-cn/ane.md`](docs/zh-cn/ane.md) §2 / §3.8，不占本表 —— 落地的那一对按表头「已完成项一经落地即从本表移出」本就不该在表里。**新登记的 1 行**是同轮量到的时序差异（初始窗口晚于文档类构造器）：它已**响亮自报**、不是静默 null，但不在本阶段修。
 > **2026-10-27 追加（阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **101 → 102 项**（`未开始` **80 → 81**）。这两批的行为原先全在 macOS 的 `adl` 上量，而 `File` 家族几乎每个成员都碰宿主路径规则；在 Windows 10 + `adl 51.4.1` 上补测（探针 `temp/winfile/adl/`、读数 `adl-win{,2,3}.txt`）分出**六处宿主分叉 + 两处 Windows 独有**，全部**本轮修净**（按表头「已完成项一经落地即从本表移出」故不入表）：`cacheDirectory` 是 `%TEMP%` 而非 `%LOCALAPPDATA%\Caches`；盘符相对路径 `C:foo` 原样保留 + 补分隔符（旧解析得到**绝对**路径 `C:\foo`，是另一个文件）；`parent` 的根保留自己的分隔符（`C:\a` ⇒ `C:\`、`\a` ⇒ `\`）；`getRelativePath` 用正斜杠、跨盘 `null`；同一文件判定改走大小写不敏感的 `as_path_under`（旧的 `strcmp` 会把只有大小写差异的目标当「另一个文件」，覆盖分支先 `DELETE` 掉**源**再复制 ⇒ `#3003` 且文件已毁）；`FileStream` 偏移全改 64 位、`APPEND` 打开即 EOF。两处 Windows 独有：删掉仍被 `FileStream` 打开的文件在 Windows 上必然失败（`adl` 同样报错 ⇒ 是我们示例没 `close()`，已修）、`getRootDirectories()` 交出 8 个 `File` 而非 `StorageVolume`。另有**三处编译阻断**只有 Windows 宿主才撞到（`S_ISREG` 未定义、`_chsize_s` 未声明、`getcwd` 在 MSVC 的 `<direct.h>` 之外），同轮补齐。**新登记的 1 行**是剩余**验证欠账**：`examples/file-ops.as` 的断言写死了 `/tmp`（14 处）与「反斜杠是合法文件名字节」，而它与 `file-symlink.as`/`file-listing-async.as` 都要软链夹具 —— 本机账号建软链报 `EPERM`，三例一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级回归。钉子在 `test/unit/file-stream.ts` 的 `unit: file-stream/windows`（19 钉）+ 既有的 `file-url`/`file-ops` 组；口径写在 `docs/zh-cn/filesystem.md` §11.6（对照 `docs/en/filesystem.md` §11.6）。
 
@@ -17550,6 +17604,13 @@ Windows 本机实跑覆盖。
 >
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
+| **`Array.sort(flag)` 把所有位标志当没有**（`CASEINSENSITIVE` / `DESCENDING` / `UNIQUESORT` / `RETURNINDEXEDARRAY` / `NUMERIC` 以及手写的 4/8/16/32） | 未开始（2026-10-28 阶段三百一十四 的差分门禁量到；本阶段只换了排序核心，未动 options 解析） | `adl 51.3.2` 实测：CI / DESCENDING / 4 / 8 / 16 / 32 **八种组合输出六种不同**，而我们**八种完全一样**（`temp/perf-b3/semcheck-{air,patched}.txt` 的 `sort.ci`：AIR `/10/9/a/A/b/B/b/c//` vs 我们 `b/A/a/B//c//9/10//b`）。**`sortOn(key, flags)` 正常**（`as_cmp_sorton` 读了 16/2 两位），所以 GreenSock 的 `sortOn("level", NUMERIC\|DESCENDING)` 侥幸没事。根因未定位（本轮只量到症状） | 先补一份 `adl` 的 options 全表（五个位的 32 种组合 × `sort`/`sortOn`，含 `RETURNINDEXEDARRAY` 的返回形状与 `UNIQUESORT` 遇并列的 `#2004`），再按表把 `sort` 的 options 拆成「前缀位→比较器、后缀位→返回形状」两层；钉子直接接在 `unit: runtime/ArraySortMerge` 同一文件 |
+| **动态接收者的 `Number.toString()` / `toFixed()` 返 `null`**（类型化接收者完全正常） | 未开始（2026-10-28 阶段三百一十四 量到；一条缺陷污染了差分表 **46/72 行**，是「跟 AIR 不一致」计数里最大的一块） | `var vals:Array = [0.1, …]; vals[i].toString()` —— `adl` 交 `"0.1"`，我们交 `null`（`semcheck-air.txt` L24 起）；而同一行的 `String(vals[i])` 两端逐字相同 ⇒ **格式化本体没错，错在动态分派**。同一行的 `(vals[i] as String)` **两端都是 `null`** ⇒ 转型面已对齐。**影响面**：应用 157 处 `.toString(` 多数是类型化接收者，所以不是全局灾难，但从 `Array` / `*` / `Object` 取出来那一类会静默变 `null`（拼接时成为 `"null"`） | 先定位动态调用里 `toString`/`toFixed`/`toPrecision` 的分派点（不猜）；修完直接重跑 `cmp3.sh`，预期一次消掉 ≈43 行差异。抽查应用里 `box[0].toString()` 形态的调用点 |
+| **定长小数分支的 17 位上限把 round-trip 弄断**（`String(v)` 读不回原值） | 未开始（2026-10-28 阶段三百一十四 量到；本阶段只把线性试精度改成二分、输出逐字节不变，这个上限是**旧写法就有**的） | `RTProbe` 逐值对照（`temp/perf-b3/rt-{air,aot}.txt`）：`String(0.00001*12)` —— AIR `0.00012000000000000002` 且 `Number(...) == v` 为 **true**，我们 `0.00012000000000000` 且 **rt=false**（读回 1.2e-4）。根因：`as_str_from_double` 的二分区间是 **小数位数 0..17**，而定长记数法下「17 位小数」不等于「17 位有效数字」——`\|v\|` 在 1e-5 这一档需要 20 位小数才能往返。旁证：`1.0000000000000002e-5` **两端 rt 都是 false**（AIR 也不是全对） | 把二分上界按十进制量级放宽（仍单调，不改谓词与格式串），并把「rt 必须为 true」加为 `RTProbe` 32 值表的逐行断言。修完回敲 `SemCheck` 的 `concat` 行（预期转 OK） |
+| **`toFixed` 对 `.5` 的舍入方向与 AIR 不同** | 未开始（2026-10-28 阶段三百一十四 量到） | `SemCheck` 的 `toFixed` 行：`(2.5).toFixed(0)` —— AIR `3` / 我们 `2`；`(-1.25).toFixed(1)` —— AIR `-1.3` / 我们 `-1.2`。即我们走了 `printf` 的 **half-to-even**，AIR 是 **half-away-from-zero**。影响任何金额 / 百分比 / 上报格式（真应用里日志与列表行都有） | 自己算舍入而不是交给 `printf`，钉住 `.5` 的正负两侧；**先补 `adl` 实测**再定口径——尤其是「二进制里根本不是 `.5`」的那些值（如 `2.675.toFixed(2)`）到底舍还是入，没量过就不写 |
+| **极值的 `String()` 表示与 AIR 不同（其中两例是 **AIR 自己 round-trip 失败**）** | 未开始（2026-10-28 阶段三百一十四 量到；**口径待定，不盲抄**） | `RTProbe`：`5e-324` —— AIR `4.9406564584124654e-324` / 我们 `5e-324`（**都 rt=true**）；`12345678901234567890` —— AIR `12345678901234567000` / 我们 `12345678901234567168`（**都 rt=true**）；DBL_MAX —— AIR `1.79769313486231e+308` **rt=false** / 我们 `1.7976931348623157e+308` rt=true；`String(1e+100)` 两端**字面相同**但 AIR 的 `Number(...)` 读回 false。⇒ 这一格是「保真」与「正确」直接冲突：照抄会把 AIR 的丢位也实现进来 | **当前选择：保持可往返，不照抄。**逐例定案后写进 `docs/zh-cn/as3-semantics.md` §2 速查表（与 `docs/en/flash-net.md` §11 的「字面量→整数」条目同族：都是「可读性 vs 可逆性」的取舍） |
+| **排序的边角语义仍与 `adl` 分歧（稀疏槽 `in` / `sortOn(null)`）** | 未开始（2026-10-28 阶段三百一十四 量到） | `var a=[5,4,3]; a[10]=1; a.sort();` 后 **`4 in a`**：AIR `false` / 我们 `true`（`len=11` 两端相同、`join(",")` 输出也相同 ⇒ 差的是**空槽集合**而非可见元素）；`[10,9,1,100,-3,0.5,2,-0.5].sortOn(null)` —— AIR `-3,9,1,100,10,0.5,2,-0.5` / 我们 `10,9,1,100,-3,0.5,2,-0.5`（**两端都不是原序**）。归并核心只保证「同 key 保持原序」，不保证空槽搬运与无效键走位 | 先定口径（稀疏槽在 AIR 里到底何时存活、`sortOn(null)` 到底按什么排），再改 `as_array_sort_impl` 的空槽搬运；这两格无实测口径前**不动** |
+| **`gc_find_block()` 的首次适配是线性扫描：空闲块越多、每次分配越贵**（**我方性能缺口**，不是 `adl` 保真差） | 未开始（2026-10-28 阶段三百一十四 量到并用三段因果实验定案） | 真应用一帧 **4642 ms**，而同一行遥测给出 `gcshare=0.1%` / `worstgc=1.00 ms` / `freeblk=300026` ⇒ **不是 GC**。`temp/perf-b3/src/GeomPerf.as`：干净堆 **0.037 µs/次** → 只造 10 万个空闲块后全部丢弃（存活集几乎不变）**0.548 µs/次**（×15），另驻留 6 万对象 0.667 µs/次（×18）；同相位读路径 `read_cast_frag` **0.000 µs/次** ⇒ 不是「堆变慢」，是「分配变慢」。`gc_find_block()`（`src/runtime.ts:556`）从自己的尺寸类起沿**单向链表**逐节点找第一个够大的块，找不到还要向上爬所有更高的类。**这就是「打开/刷新列表就卡」的直接形状**：一次刷新几千次分配 × 几百 µs = 秒级冻结 | 把「挑一块」做成 **O(1)**（精确尺寸类分箱 / 每链「上次成功位置」游标 / 链内按大小有序），**不要动 GC 预算与切片**（`gcshare=0.1%` 已排除），也别用 `ASC_GC_THRESHOLD` 拖回收（只会让链更长）。口径与读数：`docs/zh-cn/gc.md` §6.17。**2026-10-29 复算（合并到新 base 后）**：AOT 臂在 `pt_4000` 就被外部看门狗判 3 次不响应杀掉（`per=338 µs/次`、`stalls=7`、`gapmax=1675 ms`），**合并前与合并后的 exe 同点位同形状**；同一时刻 adl 臂跑完整轮、同一相位 `per=0.271 µs/次`、0 hang ⇒ 「AOT 连基准都跑不完」本身就是这条的现形，与本轮三处修复无关（读数 `temp/perf-b3/bench3-aot-merged-report.txt` vs `bench3-air-report-1029.txt`）。**验收判据**：Bench3 的 `pt_8000` 相位从 4.6 s 降到 <50 ms 且 `ASC_FRAME_STATS` 的 `p99` 同跌 |
 | **Metal 与 WGL 两个窗口 GPU 后端没有任何设备丢失检测**（`metal_glue.mm` 不看 `MTLCommandBuffer.status`、`gl_glue.cc` 不看 `GL_CONTEXT_LOST`/`glGetError()`；D3D12 侧阶段二百七十八 起有「丢弃+重建」，阶段二百九十七 修掉了它自己的崩溃） | 未开始（2026-10-27 阶段二百九十七 修 Windows 端时按「平台缺陷跨端一次修完」逐端查过；两端都**没有可对照的代码**可改，属既有缺口，非本轮引入） | 后果与 D3D12 不同，因为是**静默**的：Metal 上设备重启（Apple Silicon 上是 `MTLCommandBufferError` 的「innocent victim」）后帧照样编码、照样 `presentDrawable`，画面停在最后一帧且没有任何一行日志；WGL 上 `GL_CONTEXT_LOST` 之后每个 GL 调用都是 no-op，窗口冻住。两端都**不会崩**，所以一直没人报。 | 先做**检测+报明**（Metal：命令缓冲 `status == MTLCommandBufferStatusError` 且 `error.code` 属设备类时打一行并丢弃该帧；GL：每帧一个 `glGetError()==GL_CONTEXT_LOST` 检查），再决定要不要做重建（GL 的重建要重建整个 SDL GL 上下文，代价远大于 D3D12/Metal）。**必须在真机上做**：本机（Windows）编译不了 `.mm`，也无法制造 GL 上下文丢失。 |
 | **输入进 `TextField` 的字符取 `defaultTextFormat`，而非「插入点前一个字符的 run 格式」**（`as_tf_insert_payload` → `as_tf_splice` 不给新字节挂 run，排版时无 run 覆盖就落到 `defaultTextFormat`；`adl 51.4.1` 实测同一个字段（正文黑 run / `defaultTextFormat` 红）里提交的「框」是**黑色**，我们的是红色，见 `temp/imelive/adc-commit.png` vs `q3-commit.png`） | 未开始（2026-10-27 阶段二百九十六 做 IME 探针时量到；该阶段只修光标取色，未动插入的格式继承） | 只影响「正文格式 ≠ 默认格式」的字段：新输入字符的颜色/字号/字体全部回落到 `defaultTextFormat`（深色主题下会出现「跟随默认色而非正文色」的字符）。`as_tf_splice` 目前**既不克隆也不平移** run 表，插入/删除之后既有 run 的区间也不随文本移动 ⇒ 两件事要一起处理才能对齐 AIR。 | 在 `as_tf_splice` 里按 AIR 口径（插入点前一个字符的 run，无前置字符取后一个，都没有才 `defaultTextFormat`）克隆 `TextFormat` 挂新区间，同时平移插入点之后的 run 区间；改后重跑 `temp/editprobe` 的格式化对照 + `unit: text-input/*` |
 | **`DisplayObject.stage` 对「已不在显示列表上」的对象返回主窗 Stage 而非 `null`**（`DisplayObject_get_stage` 末尾 `return ASC_root_stage;` 对所有孤立对象兜底；`adl 51.4.1` 实测 `after stage=null`，我们答 `stage`，见 `temp/dispabort/`） | 未开始（2026-10-27 阶段二百九十五 做出 A/B 探针时量到；本阶段只修派发时机，未动兜底） | 兜底本身是为 document class **构造期**的 `stage` 非 null（Flash 语义），但它区分不了「document class 实例」与「任意孤立 Sprite」⇒ `if (obj.stage == null)` 这类守卫在对象被摘除后判错，`stage.removeChild(...)` 会打到**另一个窗口**的 Stage 上（找不到子件 ⇒ 返回 null，多数场景无害但语义错）。 | 加 `static void* ASC_doc_root`（窗口创建时指向 document class 实例），只在 `o == ASC_doc_root` 时兜底、其余返回 NULL；改后必须全量回归（`examples/` 里若有孤立对象读 `stage` 的会变红） |

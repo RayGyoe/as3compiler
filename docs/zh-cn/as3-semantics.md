@@ -172,6 +172,7 @@ AIR 的内建方法形参表**不能凭文档抄**：AS3 参考页会漏掉真�
 2. `Object.hasOwnProperty()`/`propertyIsEnumerable()` 允许**空参**调用（`mxmlc` 不报错），故形参是「可省、默认 null」；二者在 `Object` 上声明一次、被全部类继承，早期审计把 145 份继承副本误读成 145 处独立缺陷（按声明处改一次即可）。
 3. `Stage3D.requestContext3D` 的形参名是 `context3DRenderMode`、默认 `"auto"`；AIR 还有第二形参 `profile = "baseline"`，本后端不消费（登记遗留）。
 4. **文档不是可选性 oracle**：默认值抄文档，可选性必须实测。同理，内建形参表**斜**（我们比 AIR 短或长）时，靠「按我们的形参个数造格」的扫描**发现不了**——D 类因此是「文档形参数 vs 我们的形参数」的交叉比对补出来的。
+5. **类值当函数用时，形参个数就是「构造 / 转型」的判据**（阶段三百一十四）。`flash.geom` 的 `Point`/`Rectangle`/`Matrix`/`ColorTransform`/`Transform` 在 AIR 里**不带 `new` 也能构造**（本编译器的宽容扩展），但**一元形式不是构造、是转型**：`mxmlc` 对 `Point(1, 2)` 报「参数的数量不正确。要求不超过 1 个」——一个类值当可调用对象用时**最多只收 1 个实参**，那一格就是 `Number(o)`/`String(o)` 式的转型。`adl 51.3.2` 实测 `Point(o).x` 读出的是**那个对象本身**的 `x`（探针 `temp/perf-b3/src/GeomProbe.as`，40 行与 AOT 逐字相同）；而旧写法把一元也喂给 `emitGeomConstructor`，生成 `Point_new(as_v_to_number(o), 0.0)` ⇒ `.x` 恒 `NaN`、`.y` 恒 `0`，**不报错、不警告**。钉子 `unit: emit/ValueClassCoercion`（12 条，其中 4 条直接断言生成的 C 里是 `as_v_req_inst(..., &Point_vt, "flash.geom::Point")` 而不是 `Point_new(...)`；`Point(o, 3)` 仍走构造，那条扩展不收回）。
 
 ---
 

@@ -197,6 +197,23 @@ application manifest and optional Authenticode on Windows. Credentials stay in n
 environment variables and Keychain; password logs are redacted. `xcode-project` remains the IDE/debugging route.
 See [`release-packaging.md`](docs/en/release-packaging.md).
 
+**Three library-layer perf/semantics defects (stage 314)**: measured, then fixed. ① The shared core of `Array.sort`/`sortOn` was an
+**insertion sort** (O(n²)) -- cost doubled every time n doubled, so a 50,000-row sort extrapolated to **~39 s inside a single
+`ENTER_FRAME`**, which is exactly how the old benchmark got flagged as an Application Hang by Windows. It is now a **bottom-up stable
+merge sort** (`qsort` was not an option: "equal keys do not swap" is AS3 semantics and secondary sorts depend on it), and AOT now beats
+AIR by 3-4x (`num_8000` 0.094 vs 0.313 us/op). ② `Number` -> string tried precisions **linearly from 0 to 17** (up to 18 `snprintf`+`strtod`
+rounds); it is now a **binary search over 0..17** with the same predicate, format string and range, so the output is byte-identical:
+17.9 -> **5.2 us/op**. ③ One-argument value-class casts (`Point(o)`) were compiled as constructor calls -- `Point_new(as_v_to_number(o), 0.0)`
+-- so `.x` was always `NaN` and `.y` always `0`, **silently** (rule: [`as3-semantics.md`](docs/en/as3-semantics.md) §3.3 item 5). ④ That 4.6 s
+long frame is **not GC**: the same telemetry line gives `gcshare=0.1%` / `worstgc=1.00 ms`; the cost is the **first-fit linear scan** in
+`gc_find_block()` (more free blocks => every allocation gets more expensive, independent of the live set: 0.037 -> 0.548 us/op) -- measured,
+registered, **not fixed** (see [`gc.md`](docs/en/gc.md) §6.17). All three fixes were gated by running **the same `.as` under `adl` and AOT and
+diffing line by line**, re-run after rebasing onto the new base (`1c1914c`): 0 newly fixed / 0 newly broken / the 62 pre-existing divergences
+byte-identical before and after. Pins: `unit: runtime/ArraySortMerge` + `unit: runtime/DoubleToStringBinary` + `unit: emit/ValueClassCoercion`.
+The 5 further divergences the gate surfaced (`Array.sort(flag)` ignores every bit flag, dynamic-receiver `Number.toString()` returns `null`,
+the 17-digit cap in the fixed-fraction branch breaks round-trips, extreme `String()` forms, `toFixed` half-way rounding direction) are each
+rowed in the `TODO.md` left-over table.
+
 **ANE loading (stage one-hundred-seventy-eight)**: `--ane` / the manifest's `ane-paths` switch on `ASC_HAVE_FRE` and wire in the host FRE runtime.
 Each entry may be an `.ane` package **or an unpacked directory** (`extension.xml` + `<platform key>/<native library>`, i.e. `adt`'s staging layout) —
 the latter is the default form of the artifact rebuilt for AOT: its native library imports the host library (`asaot.dll` on Windows, `libasaot.dylib` on macOS, which forwards into **the generated program's own table**),

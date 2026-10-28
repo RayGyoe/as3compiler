@@ -916,6 +916,30 @@ FPS overlay's own per-frame text, `"FPS: 121"`.
 
 **Related**: this is the marking-side sibling of §6.15 (interior pointers) and of the `gc_write_barrier` rule for box tags: any new box tag or pointer-carrying field has to be added on **all** sides (typeof / truthy / eq / str_val / mark / barrier), and a property-table tag is no different.
 
+### 6.17 Free-block Selection Is A First-fit Linear Scan (found in stage three hundred and fourteen, **not fixed**)
+
+The real application (the AOT build of talkmed-meeting) reports "the participants / files / chat list freezes for a moment when it opens or refreshes". Splitting one such frame apart with the telemetry switches described in §6.13 shows it has **nothing to do with the collector**:
+
+```
+FRAME n=512 p50=17.00 p95=200.00 p99=3643.00 max=4642.00(worstgc=1.00) over8ms=505 over17ms=110
+    | gcmax=12.00 gcavg=0.10 gcshare=0.1% | rss=91MB heaptotal=26MB inuse=13MB/219183obj
+    | segs=391 freeblk=300026
+```
+
+(`ASC_FRAME_STATS=1` + `ASC_GC_STATS=1` on a normally generated binary; `worstgc` is the cost of the single most expensive collection **inside** that frame, in ms.) A **4642 ms** frame with **1.00 ms** of GC and `gcshare=0.1%` -- the money is in the **allocation path**: `gc_find_block()` is **first-fit**, walking a **singly linked** list from its own size class node by node until a block is big enough, climbing through every higher class when that chain has none, and finally falling through the `mid`/`gc_free_big` chains. The more free blocks exist, the longer every allocation takes -- **regardless of how large the live set is**. Three-phase causal experiment (`temp/perf-b3/src/GeomPerf.as`, the same allocation loop measured at three points of one run, us per allocation):
+
+| Phase | us / allocation | What changed |
+|---|---|---|
+| `alloc_keep` (clean heap) | **0.037** | baseline |
+| `alloc_keep_big` (60,000 objects retained) | **0.667** | live set up => the chains get fragmented and the scan crosses more nodes |
+| `alloc_keep_frag` (create 100,000 free blocks, then **drop them all**) | **0.548** | the live set barely changes, **only the free list grows** => still 15x |
+
+The third row is the decisive one: after the garbage is swept back onto the free list, the cost stays **in the list**, not in marking. The control `read_cast_frag` is still **0.000 us/op** -- **reads are unaffected** -- so this is not "a slow heap", it is "a slow allocate"; `alloc_drop` (allocate then immediately discard) is also 0.000, because the block just freed sits at the head of its own class.
+
+**Direction of the fix (not done; registered in `TODO.md` under `left-over work`)**: make "pick a block" **O(1)** -- bin by exact size class (16 B granularity for small objects => a bounded number of classes), keep a "last success" cursor per chain, or keep each chain sorted by size. **Do not touch the collector's budget or slicing** (`gcshare=0.1%` already rules it out), and do not stretch the heap with `ASC_GC_THRESHOLD` -- that only accumulates more, longer chains. The two-chain split of §6.11 is the starting point on this road, not the end: it moved big payloads out of the small chain, but **within one size class it is still a single line**.
+
+**Re-measured (2026-10-29, after rebasing onto the new base)**: the gap now blocks the benchmark itself -- the AOT arm of Bench3 gets killed by the external watchdog at `pt_4000` (`per=338 us/op`, `stalls=7`, `gapmax=1675 ms`), and **the pre-merge exe sitting in the same directory dies at the same phase in the same shape**, while `adl` completes the whole run at the same moment with `per=0.271 us/op` and 0 hang samples. In other words "AOT cannot even finish the benchmark" *is* this section's symptom, not a regression introduced here (readings: `temp/perf-b3/bench3-aot-merged-report.txt` vs `bench3-air-report-1029.txt`).
+
 ## 7. Relationship with the Existing Reflection Tables (reuse, don't rebuild)
 
 | Existing facility | GC use |

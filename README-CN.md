@@ -212,6 +212,26 @@ Gatekeeper 验收；`--package exe` 在 Windows 上生成 ICO、VERSIONINFO、DP
 并可选 Authenticode。凭据只从清单非密字段、环境变量与钥匙串读取，密码日志强制脱敏。`xcode-project`
 保留给 IDE 调试。完整命令与边界见 [`release-packaging.md`](docs/zh-cn/release-packaging.md)。
 
+**库层三处性能/语义实错（阶段三百一十四）**：真应用「打开/刷新列表就卡」量下来以后，三处已修、一处已定性。
+① `Array.sort`/`sortOn` 的公共核心是**插入排序**（O(n²)）——n 每翻倍单价也翻倍（`sortOn` n=250→2000 是
+0.62→62.2 ms），外推 n=50000 约 **39 s** 且跑在**单个 `ENTER_FRAME` 里**，这就是旧基准被 Windows 判
+App Hang 的直接原因。换为**自底向上稳定归并**（不能换 `qsort`：相等键不交换是 AS3 语义，二级排序依赖它），
+现在 AOT **反超 AIR 3–4×**（`num_8000` 0.094 vs 0.313 µs/次）。② `Number` 转字符串原来是**从 0 到 17 线性
+试精度**（最多 18 轮 `snprintf`+`strtod`），改成 0..17 **二分**（同一谓词、同一格式串、同一区间，输出逐字节
+一致）：17.9 → **5.2 µs/次**（AIR 2.7）。③ `Point(o)` 这类**值类一元转型**被当成不带 `new` 的构造，生成
+`Point_new(as_v_to_number(o), 0.0)` ⇒ `.x` 恒 `NaN`、`.y` 恒 `0`，**不报错**（判据见
+[`as3-semantics.md`](docs/zh-cn/as3-semantics.md) §3.3 第 5 条）。④ 那 4.6 秒的长帧**不是 GC**：同一帧里
+`gcshare=0.1%`、`worstgc=1.00 ms`，钱在 `gc_find_block()` 的**首次适配线性扫描**（空闲块越多、每次分配越贵，
+与存活集无关：0.037 → 0.548 µs/次）——已定量登记、**未修**，口径见 [`gc.md`](docs/zh-cn/gc.md) §6.17。
+三处修复都用「**同一份 `.as` 分别跑 `adl` 与 AOT、逐行 diff**」的门禁验过：基线（`b25cd00`）单独编一次做
+三方比对 ⇒ 新修好 0 / 新弄坏 0 / 62 处既存分歧改前改后逐字相同（差分集 `temp/perf-b3/`，钉子
+`unit: runtime/ArraySortMerge` + `unit: runtime/DoubleToStringBinary` + `unit: emit/ValueClassCoercion`）。
+门禁顺带量出的 5 条既存分歧（`Array.sort(flag)` 把位标志全忽略、动态接收者的 `Number.toString()` 返 `null`、
+定长小数 17 位上限弄断 round-trip、次正规/DBL_MAX 表示、`toFixed` 平半舍入方向）已逐条入 `TODO.md` 遗留表。
+合并到 `v0.4.275` 后按新 base 复跑过一遍同一套门禁 ⇒ 新修好 0 / 新弄坏 0、读数与落库前逐字相同，
+性能读数也没动（`num_8000 0.094`、`cmp_4000 0.250`、`dbl_1600 5.078` µs/次）；唯一跑不完的是分配相位：
+看门狗在 `pt_4000`（1.675 s 帧）判死，而**同一个 exe 换到合并前的构建在同一相位同形状** ⇒ 属④那条，不是本轮带出来的。
+
 **ANE 加载（阶段一百七十八）**：`--ane` / 清单 `ane-paths` 打开 `ASC_HAVE_FRE` 并接上宿主 FRE 运行时。
 每一项可以是 `.ane` 包，也可以是**解包后的目录**（`extension.xml` + `<平台键>/<原生库>`，即 `adt` 的暂存布局）——
 后者是重编给 AOT 用的那份产物的默认形态：其原生库导入宿主库（Windows `asaot.dll` / macOS

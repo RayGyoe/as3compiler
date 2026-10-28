@@ -47,4 +47,5 @@ import './unit/fqn-static.ts';
 import './unit/testinfra.ts';
 import './unit/async-workers.ts';
 import './unit/release.ts';
+import './unit/sort-dtoa-cast.ts';
 import './unit/windows-release.ts';

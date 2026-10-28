@@ -1327,16 +1327,19 @@ static char* as_str_from_double(double v) {
     double av = fabs(v);
     bool sci = (av < 1e-6 || av >= 1e21);
     char buf[80];
-    for (int prec = 0; prec <= 17; prec++) {
-        snprintf(buf, sizeof(buf), sci ? "%.*e" : "%.*f", prec, v);
-        if (strtod(buf, NULL) == v) {
-            if (sci) as_norm_exp(buf);
-            char* r = as_str_alloc(strlen(buf) + 1);
-            strcpy(r, buf);
-            return r;
-        }
+    // “p 位能读回 v”是单调的：更多位是同一实数的更精确十进制展开，correctly-rounded
+    // 的解析只会离 v 更近；p 位已能得回 v 时 p+1 位必然也能。所以二分 0..17，最多 5 次
+    // snprintf+strtod，取代原来的线性试错（遇到 17 位小数要走 18 轮）。实测旧写法把一次
+    // double 转字符串抬到 20-24us（同一算法在 AIR 里 <2.5us），而拼字符串在应用里随处可见
+    // （日志上报、列表行、拼 URL）。
+    // 输出与旧写法逐字节一致：同一谓词、同一格式串、同一搜索区间。
+    int lo = 0, hi = 17;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        snprintf(buf, sizeof(buf), sci ? "%.*e" : "%.*f", mid, v);
+        if (strtod(buf, NULL) == v) hi = mid; else lo = mid + 1;
     }
-    snprintf(buf, sizeof(buf), sci ? "%.17e" : "%.17f", v);
+    snprintf(buf, sizeof(buf), sci ? "%.*e" : "%.*f", lo, v);
     if (sci) as_norm_exp(buf);
     char* r = as_str_alloc(strlen(buf) + 1);
     strcpy(r, buf);
@@ -3534,16 +3537,64 @@ static int as_cmp_cb(as_value a, as_value b, void* ctx) {
 
 // Stable insertion sort over the raw as_value buffer. O(n^2) worst case but
 // simple and dependency-free — sufficient for the teaching-compiler subset.
+// 稳定归并（自底向上），取代原来的插入排序。
+//
+// 为什么必须稳定：AS3 的 Array.sort / sortOn 是稳定排序（AIR 内部走归并），
+// 「相等键保持原相对次序」是作者依赖的语义 —— 先按名字排、再按时间 sortOn 这种
+// 二级排序完全靠它。所以不能换 qsort/快排（不稳定）。
+//
+// 为什么不能是插入排序：它是 O(n^2)。实测（Bench3，存活态、外部看门狗零「未响应」）
+// n 每翻倍单元素成本也翻倍，是二次方的指纹：
+//   sort(Array.NUMERIC)  n=1000 0.66ms -> n=2000 2.58 -> n=4000 10.8 -> n=8000 43.1ms
+//   sortOn("k",NUMERIC)  n=250  0.62 -> n=500 2.75 -> n=1000 12.6 -> n=2000 62.2ms
+// 外推到 n=50000：归并 ~3ms，插入排序 ~39s，而且它跑在单个 ENTER_FRAME 里 —— 那就是
+// 18:16 Bench2.exe 被 Windows 判 App Hang（事件 1002）关掉的直接原因，也是
+// 「打开参会人/文件/聊天列表就卡一下」的形状。
+//
+// 缓冲：tmp 是裸内存，装的是带 tag 的 as_value，不参与 GC 扫描。GC 不搬动对象本体
+// （见 gc_alloc 契约），但比较器是用户 AS3 代码，它可能 push/splice 同一个数组而使
+// data 被 realloc，因此每一趟归并都重新取 a->data；趟内的写回也走当时的 a->data。
 static void as_array_sort_impl(as_array* a, as_cmp_fn cmp, void* ctx) {
-    for (int i = 1; i < a->length; i++) {
-        as_value key = a->data[i];
-        int j = i - 1;
-        while (j >= 0 && cmp(a->data[j], key, ctx) > 0) {
-            a->data[j + 1] = a->data[j];
-            j--;
+    int n = a->length;
+    if (n < 2) return;
+    as_value* tmp = (as_value*)malloc((size_t)n * sizeof(as_value));
+    if (tmp == NULL) {
+        // 内存不够时退回就地插入排序：慢但语义一致，不能因为分配失败而改变排序结果。
+        for (int i = 1; i < a->length; i++) {
+            as_value key = a->data[i];
+            int j = i - 1;
+            while (j >= 0 && cmp(a->data[j], key, ctx) > 0) {
+                a->data[j + 1] = a->data[j];
+                j--;
+            }
+            a->data[j + 1] = key;
         }
-        a->data[j + 1] = key;
+        return;
     }
+    int n0 = n;  // 趟数按初始长度固定；比较器若改长则多余元素原样保留
+    int width;
+    // 第一趟从 a->data 归并进 tmp，以后交替 ping-pong。
+    int in_tmp = 0;   // 上一趟的结果现在在哪个缓冲：0=a->data, 1=tmp
+    for (width = 1; width < n0; width *= 2) {
+        as_value* src = in_tmp ? tmp : a->data;
+        as_value* dst = in_tmp ? a->data : tmp;
+        for (int i = 0; i < n0; i += width * 2) {
+            int lo = i;
+            int mid = i + width < n0 ? i + width : n0;
+            int hi = i + width * 2 < n0 ? i + width * 2 : n0;
+            int p = lo, q = mid, k = lo;
+            while (p < mid && q < hi) {
+                // <=0 取左边，这就是稳定性的来源（相等键不交换）。
+                dst[k++] = (cmp(src[p], src[q], ctx) <= 0) ? src[p++] : src[q++];
+            }
+            while (p < mid) dst[k++] = src[p++];
+            while (q < hi)  dst[k++] = src[q++];
+        }
+        in_tmp = !in_tmp;
+    }
+    // in_tmp==1 代表上一结把结果写进了 tmp，那就补一次整体回写；否则结果已在 a->data。
+    if (in_tmp) memcpy(a->data, tmp, (size_t)n0 * sizeof(as_value));
+    free(tmp);
 }
 
 // map(callback): apply callback(element, index, array) and collect the results.
@@ -3587,8 +3638,8 @@ static as_array* as_array_reverse(as_array* a) {
     return a;
 }
 
-// sort(): three flavors share one insertion-sort core. Default sorts by string
-// (AS3), Array.NUMERIC by numeric value, and a Function argument as comparator.
+// sort()：三种形态共用一个稳定归并核心。默认按字符串排（AS3），Array.NUMERIC 按数值，
+// 传 Function 则作比较器。
 static as_array* as_array_sort_str(as_array* a) { as_array_sort_impl(a, as_cmp_str, NULL); return a; }
 static as_array* as_array_sort_num(as_array* a) { as_array_sort_impl(a, as_cmp_num, NULL); return a; }
 static as_array* as_array_sort_cb(as_array* a, as_fn cb) { as_array_sort_impl(a, as_cmp_cb, (void*)cb); return a; }

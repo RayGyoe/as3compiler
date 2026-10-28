@@ -36598,12 +36598,19 @@ void FileStream_writeObject(void* _this, as_value v) {
           'the no-new Date(...) call (AIR: the current time as a String) is not modelled by this subset; ' +
           'use new Date() and its accessors instead'
         );
-      // flash.geom value types constructible without `new` (Point(x, y) etc.).
+      // flash.geom 值类型：`Point(x, y)` 不带 new 也能构造（本编译器的宽容扩展）。
+      // 但**一元形式不是构造，是转型**：mxmlc 把类值当一元转换函数看，
+      // `Point(1, 2)` 直接拒编（“参数的数量不正确。要求不超过 1 个”），
+      // 而 `Point(obj)` 在 AIR 里返回的是那个对象本身。实测（adl 51.3.2，
+      // temp/perf-b3/src/GeomProbe.as）：Rectangle(o.r).width=7、Point(o.p).x=5，
+      // 而旧写法把 `Point(o.p)` 编成 `Point_new(Number(o.p), 0.0)`，于是 .x=NaN/.y=0。
+      // 所以一元必让位给下面的 `Type(expr)` 转型规则；多元保持原有构造行为。
       case 'Point':
       case 'Rectangle':
       case 'Matrix':
       case 'ColorTransform':
       case 'Transform':
+        if (args.length === 1) return null;   // 交给 as_v_req_inst：转型，不是构造
         return this.emitGeomConstructor(name, args);
       case 'Object': {
         if (args.length === 0) return { code: 'as_object_new()', type: { kind: 'record' } };
