@@ -167,9 +167,10 @@ interface MsvcToolchainProbe {
 
 // Exported so the quoted Windows command-line shape is testable off Windows.
 export function msvcToolDirFromClangOutput(output: string): string {
-  const include = output.match(/["']-internal-isystem["']\s+["']([^"']*[\\/]VC[\\/]Tools[\\/]MSVC[\\/][^\\/"']+[\\/]include)["']/i)?.[1];
+  // clang 23 prints argv as escaped strings (C:\\path), unlike older releases.
+  const include = output.match(/["']-internal-isystem["']\s+["']([^"']*[\\/]+VC[\\/]+Tools[\\/]+MSVC[\\/]+[^\\/"']+[\\/]+include)["']/i)?.[1];
   if (include === undefined) return '';
-  return include.slice(0, include.length - 'include'.length).replace(/[\\/]+$/, '');
+  return include.slice(0, include.length - 'include'.length).replace(/\\\\/g, '\\').replace(/[\\/]+$/, '');
 }
 
 function selectedMsvcToolchain(cfg: BuildConfig): MsvcToolchainProbe {

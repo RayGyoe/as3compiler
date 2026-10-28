@@ -218,6 +218,11 @@ function checkWindowsMsvcStl(): string[] {
     + '"D:\\Software\\VS2022\\VC\\Tools\\MSVC\\14.43.34809\\include" "-internal-isystem" "C:\\SDK\\include"';
   check('a plain terminal derives the selected toolset from clang -###',
     msvcToolDirFromClangOutput(clangOutput) === 'D:\\Software\\VS2022\\VC\\Tools\\MSVC\\14.43.34809');
+  const escapedClangOutput = '"clang" "-cc1" "-internal-isystem" '
+    + '"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\VC\\\\Tools\\\\MSVC\\\\14.43.34808\\\\include"';
+  check('clang 23 escaped Windows paths are unescaped before filesystem checks',
+    msvcToolDirFromClangOutput(escapedClangOutput)
+      === 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.43.34808');
   check('unrelated clang output does not invent an MSVC toolset',
     msvcToolDirFromClangOutput('clang version 23.1.4') === '');
 
