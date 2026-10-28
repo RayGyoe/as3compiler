@@ -2156,6 +2156,15 @@ static void sk_view_clear_opaque(void* view, int on) {
 #define SK_VIBRANT 0
 #endif
 #define SK_PANEL_RADIUS 12.0
+// Optional transparent strip above the vibrant panel body (Cocoa is bottom-left,
+// so shortening the backdrop's height removes it at the TOP). A menu-bar popover
+// uses this for its arrow: the AS3 frame owns the arrow's alpha, and a full-height
+// NSVisualEffectView would otherwise draw a rectangular bright strip beside it.
+#if defined(ASC_WINDOW_VIBRANT_TOP_INSET)
+#define SK_VIBRANT_TOP_INSET ((double)ASC_WINDOW_VIBRANT_TOP_INSET)
+#else
+#define SK_VIBRANT_TOP_INSET 0.0
+#endif
 
 static CGColorSpaceRef sk_cg_device_rgb(void) {
   static CGColorSpaceRef cs = NULL;
@@ -2268,7 +2277,9 @@ static void sk_mac_ensure_transparent(WinCtx* c) {
   void* effcls = sk_inert_view_class("SKFrameEffectView", "NSVisualEffectView");
   void* eff = (effcls != NULL) ? SK_ALLOC("SKFrameEffectView") : SK_ALLOC("NSVisualEffectView");
   if (eff != NULL) {
-    eff = ((void* (*)(void*, SEL, sk_nsrect))objc_msgSend)(eff, sel_registerName("initWithFrame:"), bounds);
+    sk_nsrect effBounds = bounds;
+    effBounds.h -= SK_VIBRANT_TOP_INSET;
+    eff = ((void* (*)(void*, SEL, sk_nsrect))objc_msgSend)(eff, sel_registerName("initWithFrame:"), effBounds);
     // Material 6 = popover, blending 0 = behindWindow (blurs what is BEHIND the
     // window, which is what makes it read as a floating panel), state 1 = active.
     SK_SET_INT(eff, "setMaterial:", 6);

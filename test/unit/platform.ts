@@ -2794,6 +2794,12 @@ function checkInitialWindowStyle(): string[] {
     && /SK_SET_INT\(eff, "setMaterial:", 6\);/.test(glueWin)
     && /SK_SET_INT\(eff, "setBlendingMode:", 0\);/.test(glueWin)
     && /SK_SET_INT\(eff, "setState:", 1\);/.test(glueWin));
+  check('the optional popover arrow inset shortens only the vibrant backdrop, at its top',
+    /#if defined\(ASC_WINDOW_VIBRANT_TOP_INSET\)\n#define SK_VIBRANT_TOP_INSET \(\(double\)ASC_WINDOW_VIBRANT_TOP_INSET\)\n#else\n#define SK_VIBRANT_TOP_INSET 0\.0\n#endif/.test(glueWin)
+    && /sk_nsrect effBounds = bounds;\n    effBounds\.h -= SK_VIBRANT_TOP_INSET;/.test(glueWin)
+    && /sel_registerName\("initWithFrame:"\), effBounds\);/.test(glueWin)
+    // Cocoa is bottom-left: lowering the height at origin 0 removes a TOP strip.
+    && !/effBounds\.y\s*[+\-]=/.test(glueWin));
   // A selector literal without its trailing colon is an unrecognised-selector CRASH at
   // run time (-[SDLView setWantsLayer]), and it compiled cleanly twice while this block
   // was written -- the macros cannot catch it.

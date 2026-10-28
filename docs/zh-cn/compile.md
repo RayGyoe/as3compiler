@@ -759,6 +759,9 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
   （糊过的桌面）**而不是原样桌面 —— 这是**刻意的、已登记的后端差异**（AIR 显示原桌面），所以 **opt-in、
   默认关**，浮层面板类产品自己开。实测对照：同一个 50% 蓝矩形，开毛玻璃呈 `(31,29,152)`、不开呈
   `(104,104,228)`（原桌面透出）。证据 `temp/sdl_layer2.cc`、`temp/aottrans/`（`vib_crop.png` / `plain_crop.png`）。
+  菜单栏浮层若带顶部箭头，可再加 `-D ASC_WINDOW_VIBRANT_TOP_INSET=8`：毛玻璃背板在 Cocoa 坐标里缩短
+  8pt，让顶部箭头区域只由 AS3 帧的 alpha 决定；否则背板仍是一整块矩形，会在箭头两侧多出一条亮边。
+  该值只裁背板，不裁内容层，也不改变窗口或舞台尺寸；默认 0，现有透明窗行为不变。
   **平台面**：以上仅 macOS；Windows 与其它后端**没有实现**（要 `WS_EX_LAYERED` + 逐帧 alpha），故
   **响亮报明一次**而不是给一扇不透明的假透明窗；wasm 无桌面合成器，同为空桩。
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → 构建清单加 `ASC_DISPLAY_HIGH=1`，
