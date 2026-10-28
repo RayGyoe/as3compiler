@@ -19,12 +19,18 @@
 // WHAT IS DELIBERATELY NOT HERE (report section 4.4, "D face, deferred"):
 // FREGetRenderMode / FRESetRenderSource / FREMediaBufferLock|Unlock /
 // FREAcquire|ReleaseBitmapData[2] / FREInvalidateBitmapDataRect /
-// FREAcquire|ReleaseNativeWindowHandle / FREGetNativeContext3DHandle. Each
-// answers FRE_ILLEGAL_STATE **and reports itself** through the same capped
-// `[as3-aot] not implemented by this build: ...` channel every other gap uses.
-// A silent FRE_OK or a fabricated descriptor is exactly what AGENTS.md section
-// 1.5 forbids, and for a video ANE it is the difference between "the picture is
-// black" and "the build told you it cannot present video".
+// FREGetNativeContext3DHandle. Each answers FRE_ILLEGAL_STATE **and reports
+// itself** through the same capped `[as3-aot] not implemented by this build: ...`
+// channel every other gap uses. A silent FRE_OK or a fabricated descriptor is
+// exactly what AGENTS.md section 1.5 forbids, and for a video ANE it is the
+// difference between "the picture is black" and "the build told you it cannot
+// present video".
+//
+// FREAcquire|ReleaseNativeWindowHandle are NOT in that list any more: a window
+// HANDLE is a fact this build already owns (SDL creates the window, window_glue
+// answers its HWND / NSWindow*), so handing it out claims nothing about a render
+// pipeline. The presentation half of the D face stays deferred, because THAT is
+// the part that would have to pretend.
 //
 // Emission order in the generated translation unit (three independent `#ifdef
 // ASC_HAVE_FRE` blocks, so that a build without FRE compiles the whole thing out
@@ -98,6 +104,13 @@ export const FRE_HEAD = `
 
 // Defined with the class registry, further down this file.
 static as_value as_dyn_new_args(as_class* c, int argc, as_value* argv);
+
+// Defined next to the NativeWindow class (emit.ts emitNativeWindow reads that
+// struct). 1 = the value is a flash.display.NativeWindow instance or a subclass
+// and the out pointer received its window slot; 0 = it is not one. The slot may
+// be -1 for a window AS3 already closed -- the caller decides what that means,
+// because only it knows which FREResult the question deserves.
+static int as_native_window_id_of(as_value v, int* out);
 
 // One entry per extension the application descriptor declares. Codegen builds
 // the table from the .ane packages the build was given: extension.xml is parsed
@@ -968,22 +981,64 @@ static FREResult FREReleaseBitmapData(FREObject object) {
     return FRE_ILLEGAL_STATE;
 }
 
-static FREResult FREAcquireNativeWindowHandle(FREObject nativeWindow, FRENativeWindow* handle) {
-    (void)nativeWindow; (void)handle;
-    as_shell_unsupported("FREAcquireNativeWindowHandle (native window handles are out of scope for this build)");
-    return FRE_ILLEGAL_STATE;
-}
-
-static FREResult FREReleaseNativeWindowHandle(FREObject nativeWindow) {
-    (void)nativeWindow;
-    as_shell_unsupported("FREReleaseNativeWindowHandle (native window handles are out of scope for this build)");
-    return FRE_ILLEGAL_STATE;
-}
-
 static FREResult FREGetNativeContext3DHandle(FREObject context3D, void** handle) {
     (void)context3D; (void)handle;
     as_shell_unsupported("FREGetNativeContext3DHandle (the render pipeline is out of scope for this build)");
     return FRE_ILLEGAL_STATE;
+}
+
+// ---------- native window handles: the one D-face pair that is NOT deferred ----------
+//
+// Everything above is deferred because it would claim a presentation path. A window
+// HANDLE claims nothing of the sort: this build owns real OS windows (SDL creates
+// them, window_glue answers the platform object), so an extension that needs the
+// HWND to parent its own child window, install a hook or query the monitor can have
+// it. What it must NOT do is infer anything about presentation from it -- there is
+// still no render mode, no render source and no media buffer.
+//
+// Neither call retains anything. AIR's own header annotates the handle as "valid
+// only for duration of the call to a registered function", and the window keeps
+// owning its native object for its whole life: closing the NativeWindow still tears
+// the OS window down through ASC_window_on_close, exactly as without an extension.
+// That is also why FREReleaseNativeWindowHandle has no reference count to unwind --
+// but it still validates its argument, because an extension calling it with the
+// wrong object is a bug that should be visible rather than absorbed.
+
+static FREResult FREAcquireNativeWindowHandle(FREObject nativeWindow, FRENativeWindow* handle) {
+    if (handle == NULL) return FRE_INVALID_ARGUMENT;
+    *handle = (FRENativeWindow)0;
+    as_value v = as_fre_unbox(nativeWindow);
+    // AS3 null / undefined: a valid answer to "which window?" is FRE_INVALID_OBJECT,
+    // which is also what an extension passing a null handle gets from AIR.
+    if (v.tag == 0 || v.tag == 5) return FRE_INVALID_OBJECT;
+    // Anything else that is not a NativeWindow instance is a TYPE error, the same
+    // reading asaot.h takes for a primitive handle passed where an object belongs.
+    int id = -1;
+    if (!as_native_window_id_of(v, &id)) return FRE_TYPE_MISMATCH;
+    // A closed window has no OS window behind it: ASC_window_on_close sets _win = -1
+    // and the SLOT is recycled by the next window, so answering it would hand out
+    // somebody else's HWND. FRE_ILLEGAL_STATE, never a stale handle.
+    if (id < 0) return FRE_ILLEGAL_STATE;
+    void* h = as_window_native_handle(id);
+    if (h == NULL) {
+        // No window backend at all (web), or a slot SDL cannot describe. Report the
+        // gap: a fabricated pointer here is a crash inside the extension.
+        as_shell_unsupported("FREAcquireNativeWindowHandle (this build has no native window handle)");
+        return FRE_ILLEGAL_STATE;
+    }
+    *handle = (FRENativeWindow)h;
+    return FRE_OK;
+}
+
+static FREResult FREReleaseNativeWindowHandle(FREObject nativeWindow) {
+    as_value v = as_fre_unbox(nativeWindow);
+    if (v.tag == 0 || v.tag == 5) return FRE_INVALID_OBJECT;
+    int id = -1;
+    if (!as_native_window_id_of(v, &id)) return FRE_TYPE_MISMATCH;
+    // Nothing is retained (see above), so a RELEASE is always answerable once the
+    // operand is a NativeWindow -- including one the program already closed, whose
+    // teardown path must not be turned into a failure the extension cannot act on.
+    return FRE_OK;
 }
 
 // ---------- threading ----------

@@ -492,6 +492,12 @@ void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h) { (void)id; if
 void sk_window_get_borders(int id, int* top, int* left, int* bottom, int* right) {
   (void)id; if (top) *top = 0; if (left) *left = 0; if (bottom) *bottom = 0; if (right) *right = 0;
 }
+// A page has no platform window object: there is no HWND and no NSWindow, only a
+// canvas owned by the browser and unreachable from here. NULL is the honest
+// answer, and FREAcquireNativeWindowHandle turns it into a REPORTED
+// FRE_ILLEGAL_STATE (docs/zh-cn/ane.md 3.8) rather than handing an extension a
+// pointer it would dereference.
+void* sk_window_native_handle(int id) { (void)id; return 0; }
 void sk_window_close(int id) { (void)id; }
 int sk_window_is_closed(int id) { (void)id; return 1; }
 void sk_window_activate(int id) { (void)id; }

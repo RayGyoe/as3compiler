@@ -16,9 +16,11 @@
 >   name; **not one line of the ANE's own source tree changes**.
 > * **Section 4 is the heart of this file**: the complete procedure from "you have a `.ane`" to "the
 >   AOT product's `ctx.call` works", every verifiable checkpoint, and a **symptom → cause** table.
-> * **Face D (render pipeline / native window handles / Context3D) is not implemented in this phase**:
->   all 11 entry points return `FRE_ILLEGAL_STATE` **and report themselves on stderr** — no silent
->   success, no fabricated descriptor.
+> * **Face D (render pipeline / native window handles / Context3D) is deferred in this phase, with ONE
+>   exception**: `FREAcquire|ReleaseNativeWindowHandle` really work (§3.8), because a window HANDLE
+>   claims nothing about presentation — it is a fact the platform layer already owns. The other 9
+>   entry points return `FRE_ILLEGAL_STATE` **and report themselves on stderr** — no silent success,
+>   no fabricated descriptor.
 >
 > **Status (re-checked at v0.4.188)**: faces A/B/C are landed; the host platforms are **Windows x86 /
 > x86-64** (two widths) and **macOS x86-64 (a universal binary -- one key serves both architectures)**.
@@ -27,7 +29,7 @@
 > **statically into the application image** with no `dlopen` step, so it is not a loadable host library,
 > and `aneHostLibName()` **throws loudly with the reason** for it (any other platform without a host
 > library gets the same loud error quoting the missing path, see §5). End-to-end evidence: `examples/ane/`
-> (**all 46 assertions pass**, and it really runs on both Windows and macOS) and `examples/ane-app/` (**8**, the descriptor route),
+> (**all 48 assertions pass**, and it really runs on both Windows and macOS) and `examples/ane-app/` (**10**, the descriptor route),
 > `unit: ane/ExtensionContextSurface` in `test/unit/emit.ts`, and
 > `unit: ane/ExtensionXmlComments` / `unit: ane/PackageLayout` / `unit: ane/PlatformForBuild` /
 > `unit: ane/ExampleFixtureTrees` / `unit: ane/HostLibrary` / `build/AneHostLayout` /
@@ -68,17 +70,21 @@ The feasibility assessment cut this chain into four faces, and the implementatio
 | **Face A** | the AS3 side, `flash.external.ExtensionContext` (`createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` / `actionScriptData` + `StatusEvent`) | ✅ implemented |
 | **Face B** | the FRE object model: `FREObject ↔ as_value`, a per-call arena, **51 entry points** | ✅ implemented |
 | **Face C** | extension loading: the compile-time descriptor table, the platform loader, the `Initializer`/`ContextInitializer`/`Finalizer` protocol, function-table dispatch, `StatusEvent` delivery | ✅ implemented |
-| **Face D** | the render pipeline and native handles: `FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBufferLock\|Unlock` / `FREAcquire\|ReleaseBitmapData[2]` / `FREInvalidateBitmapDataRect` / `FREAcquire\|ReleaseNativeWindowHandle` / `FREGetNativeContext3DHandle` (**11 in total**) | ⛔ **not implemented this phase**, all `FRE_ILLEGAL_STATE` + self-report |
+| **Face D** | the render pipeline and native handles (**11 in total**): `FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBufferLock\|Unlock` / `FREAcquire\|ReleaseBitmapData[2]` / `FREInvalidateBitmapDataRect` / `FREAcquire\|ReleaseNativeWindowHandle` / `FREGetNativeContext3DHandle` | the handle pair (`FREAcquire\|ReleaseNativeWindowHandle`) ✅ **implemented** (§3.8); the other **9** ⛔ **not implemented this phase**, `FRE_ILLEGAL_STATE` + self-report |
 
 Why Face D is listed separately: it is not "forgotten", it is **deliberately deferred** — it requires
 the runtime to really have a presentation pipeline that can receive foreign frame buffers, interoperate
-with D3D/OpenGL and obtain a window HWND. That layer is not among this phase's goals, and **pretending
-to succeed is the worse choice**: for a video-class ANE, `FRE_OK` would make the extension believe "the
-picture has been presented", and the end phenomenon would be "a black screen with nobody reporting an
-error". So those 11 entry points go through the same **rate-limited** self-report channel,
+with D3D/OpenGL and composite them into the frame. That layer is not among this phase's goals, and
+**pretending to succeed is the worse choice**: for a video-class ANE, `FRE_OK` would make the extension
+believe "the picture has been presented", and the end phenomenon would be "a black screen with nobody
+reporting an error". So those 9 entry points go through the same **rate-limited** self-report channel,
 `[as3-aot] not implemented by this build: ...` (at most 5 lines per program, see
 `src/runtime.ts:2664`; the cap exists so the gap stays **visible** instead of turning the log into a
 running ledger).
+
+**The exception is the native window handle pair** (`FREAcquire|ReleaseNativeWindowHandle`): a handle is
+not a presentation capability but a fact this machine already owns (SDL creates the window, the glue
+answers its HWND / `NSWindow*`), so it is implemented with AIR's semantics — see §3.8.
 
 ---
 
@@ -329,6 +335,37 @@ than erroring just because the directory has not been created yet. Four things t
    **accepts all three** (the same forms `--ane` accepts); `ane-paths` may also hold an absolute path
    to the rebuilt product directly (e.g. `E:/…/aot-ane`), at the cost of the manifest no longer being
    self-contained.
+
+### 3.8 Native window handles: the one Face D pair that is implemented
+
+`FREAcquireNativeWindowHandle(nativeWindow, &handle)` hands out the window's platform object: `HWND` on
+Windows, `NSWindow*` on macOS (`FRENativeWindow` in `lib/asaot.h` is exactly that per-platform type).
+It claims **no** presentation capability, which is why it is not deferred: the handle is an existing fact
+that `sk_window_native_handle()` in `vendor/window_glue.cc` obtains from SDL.
+
+| Input / state | Result | Why |
+|---|---|---|
+| a `flash.display.NativeWindow` instance (or subclass) whose window is alive | `FRE_OK` + the platform object | the normal path; acquiring twice answers the same pointer (the handle belongs to the window, acquire retains nothing) |
+| AS3 `null` / `undefined` | `FRE_INVALID_OBJECT` (2) | the slot AIR's header reserves for it |
+| any other object (a `Point`, say) | `FRE_TYPE_MISMATCH` (3) | a valid FREObject that is simply not a window |
+| a window already `close()`d | `FRE_ILLEGAL_STATE` (8) | the slot is **recycled** by the next window, so answering it would hand out somebody else's HWND |
+| a build with no window backend at all (web / offscreen, `ASC_USE_WINDOW` undefined) | `FRE_ILLEGAL_STATE` (8) + self-report | never fabricate a pointer — that crashes inside the extension |
+| `FREReleaseNativeWindowHandle` | `FRE_OK` (same operand rules as above) | acquire retains nothing, so release has no state to unwind; closing the window is still `ASC_window_on_close`'s job |
+
+**Lifetime**: AIR's own header annotates the handle as "valid only for duration of the call to a
+registered function", and that is what this implements — nothing is retained, no ownership is taken, and
+the handle dies with the `NativeWindow`.
+
+**One known ordering difference** (registered in §5): this runtime opens the initial window from
+`Stage.showWindow`, i.e. **after** the document class is constructed (see the comment above
+`Stage_get_nativeWindow` in `src/emit.ts`), so acquiring `stage.nativeWindow` inside the document-class
+constructor answers `FRE_ILLEGAL_STATE`; AIR creates the window first. The two agree from the first frame
+on, which is where `examples/ane-app/src/Main.as` asserts it.
+
+**Evidence**: `examples/ane/` (offscreen build: the `Point` / `null` refusal paths, 48 assertions) +
+`examples/ane-app/` (windowed build: the extension itself checks the handle with `IsWindow` +
+`GetWindowThreadProcessId` — it must be a window of **this process** — and acquires twice to prove one
+slot answers one object; 10 assertions) + the structural pins in `unit: fre/NativeWindowHandle` (21).
 
 ---
 
@@ -725,7 +762,7 @@ Every AOT-side problem goes to stderr on **the same rate-limited self-report cha
 
 ### 4.9 The smallest runnable example: `examples/ane/` (two routes, one fixture)
 
-This repo has a complete, reproducibly generated minimal loop (**all 46 assertions pass**, and both
+This repo has a complete, reproducibly generated minimal loop (**all 48 assertions pass**, and both
 platforms run the *same* `driver.as`). **The rebuilt
 product is a staging directory tree, not a `.ane`** (§4.6 no longer packages), so the example
 directory's shape is the shape of the run-time `extensions/` directory —
@@ -766,8 +803,8 @@ example:
 
 | File | Role |
 |---|---|
-| `examples/ane-app/ane-app.xml` | the descriptor: `<extensions>` declaring **one** id; `<visible>false</visible>` (offscreen, so after building you can `--run` and exit) |
-| `examples/ane-app/src/Main.as` | the AS3 entry point (`extends Sprite`), 8 assertions: an undeclared id resolves to null, a declared one builds a context, `ping`/`addInt`/native data/`truthy('')`/`StatusEvent`/`dispose` |
+| `examples/ane-app/ane-app.xml` | the descriptor: `<extensions>` declaring **one** id; `<visible>true</visible>` (**windowed**, and the program calls `NativeApplication.exit()` at the end, so `--run` still returns) |
+| `examples/ane-app/src/Main.as` | the AS3 entry point (`extends Sprite`), 10 assertions: an undeclared id resolves to null, a declared one builds a context, `ping`/`addInt`/native data/`truthy('')`/`StatusEvent`/`dispose`, plus two **native window handle** checks (a program-created `NativeWindow`, and `stage.nativeWindow` on the first frame — the latter has to wait for the window to exist, see §3.8) |
 | `examples/ane-app/ext-aot/com.example.probe/` | **byte-for-byte identical** to `examples/ane/`'s staging tree (one script writes both — `build-ane.bat` on Windows, `build-ane.sh` on macOS — and a pin holds that identity, **one pin per platform**) |
 | `examples/ane-app/ane-app.build.json` | a by-product that `--air-app` **rewrites on every run** (`ane-paths` = `["ext-aot/com.example.probe"]`), so it is **not committed** |
 
@@ -778,7 +815,7 @@ How to run (`--air-app` writes `ane-paths` into the manifest and the loader then
 node src/index.ts --air-app examples/ane-app/ane-app.xml --main-class aneapp.Main --target native -o out/ane-app.exe --run
 ```
 
-The 8th assertion (an unknown id) prints the build-time self-report verbatim — `not implemented by this
+The first assertion (an unknown id) prints the build-time self-report verbatim — `not implemented by this
 build: no native extension with this ID … com.example.nope` — **which is the behaviour §1.5
 requires**: a missing capability is named out loud, never a silent null.
 
@@ -836,7 +873,8 @@ loudly + logged"** — not one of them is a silent degradation.
 
 | # | Gap | Phenomenon | Self-reported? | Path to landing it |
 |---|---|---|---|---|
-| 1 | **Face D render pipeline** (11 entry points) | a video/presentation-class extension gets no render mode, no media buffer, no window handle | ✅ `FRE_ILLEGAL_STATE` + self-report | needs a real presentation backend (Skia/D3D interop + exposing the window HWND), a separate project |
+| 1 | **Face D render pipeline** (**9** entry points; the window-handle pair is implemented, see §3.8) | a video/presentation-class extension gets no render mode and no media buffer | ✅ `FRE_ILLEGAL_STATE` + self-report | needs a real presentation backend (Skia/D3D interop + compositing foreign frame buffers), a separate project |
+| 1b | **the initial window is created after the document class runs** | acquiring `stage.nativeWindow` inside the document-class constructor answers `FRE_ILLEGAL_STATE` (**reported loudly**, not a silent null); AIR creates the window first, so it answers an HWND there. Not measured against `adl` for this FRE call (that needs the fixture rebuilt against AIR); the basis is each side's window-creation order | ✅ self-report | move the initial window's creation ahead of the document class; the cost is redefining the existing "who wins: the bounds/title written in the constructor" rule (see the comment above `Stage_get_nativeWindow` in `src/emit.ts`) |
 | 2 | **iOS has no (equivalent) host library** | `lib/bin/ios-arm64/` does not exist | ✅ `aneHostLibName()` throws and says why | This row is **not** "the macOS half is still to do" (that landed on 2026-10-20, see §5.1). iOS's platform model differs: an extension is **statically linked into the application image**, so there is no `dlopen` step, and `asaot` would become a **static library** reached through a **direct symbol reference** to the initializer rather than a name lookup at run time. Landing it starts with deciding *who calls the initializer* -- it is not a recompile |
 | 3 | **Windows ARM64 unverified** | guards exist (refuses to guess a key, demands an explicit 64-bit build), but the arm64 dependency chain has never been built (no MSVC arm64 toolset on this machine) | ✅ refuses and advises | needs an arm64 Windows machine + toolset |
 | 4 | **the extension is only partially unpacked** | each extension now has its own directory `<exe directory>/extensions/<extID>/<platform>/` (new here, §3.3), but **only the native library** is in it: the extension's other packaged files (data files, auxiliary DLLs) are not. So `getExtensionDirectory()` still only **self-reports** and does not return that directory | ✅ self-report | drop the **whole package** into `extensions/<extID>/` (half the layout work is done; the rest is unpacking all entries), after which `getExtensionDirectory()` can return a real directory |
@@ -885,8 +923,8 @@ people fix things in the wrong direction for a long time.
 
 | Evidence | Content | How to reproduce |
 |---|---|---|
-| `examples/ane/` | the end-to-end example, **all 46 assertions pass**, last line `RESULT passed=46 failed=0`. **Windows and macOS run the same `driver.as`, the same fixture source and the same assertions** (macOS loads a real `dlopen`ed `ProbeANE.dylib`) | `node --test --test-name-pattern='example: ane' test/examples.ts` |
-| `examples/ane-app/` | the end-to-end example, **the descriptor half**: `--air-app` resolves the descriptor's `<extensions>` into `ane-paths`, drops the library into `extensions/<extension id>/<platform>/` and runs it; **all 8 assertions pass**, last line `RESULT passed=8 failed=0` (plus one line of the undeclared-id self-report verbatim) | as above |
+| `examples/ane/` | the end-to-end example, **all 48 assertions pass**, last line `RESULT passed=48 failed=0`. **Windows and macOS run the same `driver.as`, the same fixture source and the same assertions** (macOS loads a real `dlopen`ed `ProbeANE.dylib`) | `node --test --test-name-pattern='example: ane' test/examples.ts` |
+| `examples/ane-app/` | the end-to-end example, **the descriptor half**: `--air-app` resolves the descriptor's `<extensions>` into `ane-paths`, drops the library into `extensions/<extension id>/<platform>/` and runs it; **all 10 assertions pass**, last line `RESULT passed=10 failed=0` (the window is real, so the program exits itself) (plus one line of the undeclared-id self-report verbatim) | as above |
 | `test/unit/emit.ts` → `unit: ane/ExtensionContextSurface` | 9 checks: in the **emitted C**, `getExtensionDirectory` must self-report, must still return a live `File`, and the self-report must **name this build's layout** and say that the directory does **not** hold the whole package; `actionScriptData` is a real member while `extensionID` **is not**; `call`'s "extension never loaded" self-report must be named | `node --test --test-name-pattern='ane/ExtensionContextSurface' test/unit/emit.ts` |
 | `test/unit/fre.ts` → `unit: fre/Utf8LengthContract` (8) | both directions of the FRE string boundary: `FREGetObjectAsUTF8`'s `length` must be `strlen` (**not** plus the terminator, and not some other count), `value` must be the string itself, and a non-String must stay `FRE_TYPE_MISMATCH`; in the reverse direction `FRENewObjectFromUTF8` must tolerate a caller-supplied terminator and must not count it as part of the string. Mutation 7/7 (`+1u`, `+1`, swap the `value` pointer, loosen the tag check, drop the tolerance, copy the terminator into the string, omit the terminating 0) | `node --test --test-name-pattern='fre/' test/unit.ts` |
 | `test/unit/build.ts` → `unit: ane/ExtensionXmlComments` | 9 checks: a comment must not invent a platform entry, must not swallow the real entry, and an unterminated comment must be rejected by package name | as above, with `test/unit/build.ts` |
@@ -911,7 +949,10 @@ paragraph used to say "that runner has no Windows host library, so both extensio
 and only the structural pins in `test/unit/` really run" -- **that no longer holds**: the macOS host
 library and the fixture product are both **committed** (`lib/bin/macos-x86-64/libasaot.dylib`, universal,
 and `ext-aot/.../MacOS-x86-64/ProbeANE.dylib`, also universal), so on that runner both examples **really
-run** (`skipped 0`), loading a genuine `dlopen`ed dylib, with the same 46 assertions. The only remaining
+run** (`skipped 0`), loading a genuine `dlopen`ed dylib, with the same 48 assertions. **One caveat**:
+stage 309 rebuilt only the **Windows** slice (this machine has no macOS toolchain) — the macOS slice
+needs one `examples/ane/build-ane.sh` run on a mac to gain the new `nativeWindowHandle` command, and
+until then that example goes **loudly red** on Intel macOS (not falsely green). The only remaining
 skip is **a host that has no host library** (today just the iOS family, where `aneHostLibName()` throws),
 and the reason line names the missing file -- that is not "skipped", that is "says exactly what is
 missing".

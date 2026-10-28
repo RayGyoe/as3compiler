@@ -266,14 +266,17 @@ install name 必须是可重定位的 `@executable_path/libasaot.dylib`（且两
 `ExtensionContext` 按 AIR 建模：`createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` /
 `actionScriptData` + `StatusEvent` 异步派发；AIR **没有** `extensionID` 属性（实测 `mxmlc` 拒绝、
 `adl` 报 `Error #1069`），本运行时同样没有——不为了「看起来更完整」凭空多出一个属性。
-渲染管线（`FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBuffer*` / 原生窗口句柄）**本期不实现**：
+渲染管线（`FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBuffer*`）**本期不实现**：
 只导出桩并在调用时**响亮报明**，绝不静默返回一个编造的渲染模式。
+**原生窗口句柄**（`FREAcquireNativeWindowHandle` / `FREReleaseNativeWindowHandle`）**已实现**：
+Windows 交 `HWND`、macOS 交 `NSWindow*`；窗口已关闭或构建没有窗口后端时返回 `FRE_ILLEGAL_STATE`
+并自报，绝不编造指针。
 
 **迁移一个现成 ANE 的完整流程**（双产物 + 重编换名、shim 头、三个工程属性、症状→病因对照表、
 以及全部缺口清单）见 [`docs/zh-cn/ane.md`](docs/zh-cn/ane.md)；最小可跑闭环见
-[`examples/ane/`](examples/ane)（46 条断言，命令行/清单直接指名包；**Windows 与 macOS 都真跑**，
+[`examples/ane/`](examples/ane)（48 条断言，命令行/清单直接指名包；**Windows 与 macOS 都真跑**，
 macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
-[`examples/ane-app/`](examples/ane-app)（8 条断言，走 `--air-app` + 描述符 `<extensions>`）。
+[`examples/ane-app/`](examples/ane-app)（10 条断言，走 `--air-app` + 描述符 `<extensions>`，其中两条钉住原生窗口句柄）。
 重编产物是一棵**暂存目录树**（`extension.xml` + `<平台>/<库>`，不打包），放进 `<appDir>/ext-aot/<扩展 id>/`
 就会被自动选中，所以 `adl` 侧继续用原版 ANE、两条路互不干扰。
 

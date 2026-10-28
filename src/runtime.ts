@@ -9774,6 +9774,10 @@ extern void sk_window_set_bounds(int id, int x, int y, int w, int h);
 extern void sk_window_get_bounds(int id, int* x, int* y, int* w, int* h);
 // Frame borders (title bar / edges), for NativeWindow.globalToScreen.
 extern void sk_window_get_borders(int id, int* top, int* left, int* bottom, int* right);
+// The window's platform handle (HWND on Windows, NSWindow* on macOS), for
+// FREAcquireNativeWindowHandle. NULL when this backend has none -- the FRE entry
+// point reports that instead of handing out a fabricated pointer.
+extern void* sk_window_native_handle(int id);
 // NativeApplication.exit(): end the event loop with windows still open.
 extern void sk_window_request_exit(void);
 extern void sk_window_close(int id);
@@ -10017,6 +10021,17 @@ static inline void as_window_get_borders(int id, int* top, int* left, int* botto
     sk_window_get_borders(id, top, left, bottom, right);
 #else
     (void)id; if (top) *top = 0; if (left) *left = 0; if (bottom) *bottom = 0; if (right) *right = 0;
+#endif
+}
+// The platform window object behind a window slot (HWND / NSWindow*), handed to a
+// native extension by FREAcquireNativeWindowHandle. The slot id is the SAME id
+// every other as_window_* call takes, so the main window (slot 0) and a
+// NativeWindow created by the program are addressed identically.
+static inline void* as_window_native_handle(int id) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_native_handle(id);
+#else
+    (void)id; return NULL;
 #endif
 }
 // NativeApplication.exit(): ask the event loop to end now, with every window
@@ -10472,6 +10487,7 @@ static inline int as_window_os_display_state(int id) { (void)id; return -1; }
 static inline int as_window_is_active(int id) { (void)id; return 0; }
 static inline void as_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
 static inline void as_window_set_transparent(int id, int on) { (void)id; (void)on; }
+static inline void* as_window_native_handle(int id) { (void)id; return NULL; }
 static inline void as_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh) {
     (void)id; if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
 }

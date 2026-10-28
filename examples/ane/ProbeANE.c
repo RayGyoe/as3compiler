@@ -22,6 +22,7 @@
  *   bumpStatus()                        -> FREDispatchStatusEventAsync
  *   arityCheck(v:*)                     -> FREGetObjectType
  *   stringInfo(v:String)                -> bytes/len/extra (the FRE string length contract)
+ *   nativeWindowHandle(win:NativeWindow) -> FREAcquire|ReleaseNativeWindowHandle
  *
  * Anything the host cannot do reports itself on stderr (as_shell_unsupported) and
  * returns FRE_ILLEGAL_STATE, which this fixture turns into a distinguishable
@@ -429,6 +430,52 @@ static FREObject probe_stringInfo(FREContext ctx, void* funcData, uint32_t argc,
     return out;
 }
 
+/* FREAcquire|ReleaseNativeWindowHandle -- the ONE D-face pair that is implemented.
+ * A non-null pointer is not evidence (a fabricated one passes that), so what gets
+ * asserted is that the handle describes THIS process's window: on Windows
+ * IsWindow() must accept it and GetWindowThreadProcessId() must name this process,
+ * and on both platforms two acquires of the same NativeWindow must answer the same
+ * object -- a recycled or mixed-up window slot answers two different ones.
+ *
+ * A wrong operand must come back as a FREResult, not as a crash: a Point is
+ * FRE_TYPE_MISMATCH (3) and AS3 null is FRE_INVALID_OBJECT (2). */
+static FREObject probe_nativeWindowHandle(FREContext ctx, void* funcData, uint32_t argc, FREObject argv[]) {
+    (void)ctx; (void)funcData;
+    FRENativeWindow h1 = (FRENativeWindow)0;
+    FRENativeWindow h2 = (FRENativeWindow)0;
+    FREResult r1 = FRE_INVALID_ARGUMENT;
+    FREResult r2 = FRE_INVALID_ARGUMENT;
+    FREResult rr = FRE_INVALID_ARGUMENT;
+    if (argc > 0) {
+        r1 = FREAcquireNativeWindowHandle(argv[0], &h1);
+        r2 = FREAcquireNativeWindowHandle(argv[0], &h2);
+        rr = FREReleaseNativeWindowHandle(argv[0]);
+    }
+    int live = 0;
+    int proc = 0;
+    int stable = (r1 == FRE_OK && r2 == FRE_OK && h1 == h2 && h1 != (FRENativeWindow)0) ? 1 : 0;
+#if defined(_WIN32)
+    HWND hw = (HWND)h1;
+    if (hw != NULL && IsWindow(hw)) {
+        live = 1;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hw, &pid);
+        proc = (pid == GetCurrentProcessId()) ? 1 : 0;
+    }
+#else
+    /* No IsWindow() equivalent is reachable from plain C on the other platform, so
+     * "live" is the handle being non-null there; "stable" carries the real check. */
+    live = (h1 != (FRENativeWindow)0) ? 1 : 0;
+    proc = live;
+#endif
+    char msg[96];
+    snprintf(msg, sizeof(msg), "acquire=%d release=%d live=%d sameProcess=%d stable=%d",
+             (int)r1, (int)rr, live, proc, stable);
+    FREObject out = NULL;
+    FRENewObjectFromUTF8((uint32_t)strlen(msg) + 1u, (const uint8_t*)msg, &out);
+    return out;
+}
+
 static FRENamedFunction probe_functions[] = {
     { (const uint8_t*)"ping",           NULL, probe_ping },
     { (const uint8_t*)"addInt",         NULL, probe_addInt },
@@ -453,6 +500,7 @@ static FRENamedFunction probe_functions[] = {
     { (const uint8_t*)"threading",      NULL, probe_threading },
     { (const uint8_t*)"throwingSet",    NULL, probe_throwingSet },
     { (const uint8_t*)"stringInfo",     NULL, probe_stringInfo },
+    { (const uint8_t*)"nativeWindowHandle", NULL, probe_nativeWindowHandle },
 };
 
 /* ---- the AIR protocol ----------------------------------------------------- */

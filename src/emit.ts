@@ -5922,6 +5922,22 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   // when a program never opens a second window (阶段七十八).
   private emitNativeWindow(): void {
     this.line('// ---- flash.display.NativeWindow (阶段八十九·七十一) ----');
+    // FREAcquireNativeWindowHandle takes an AS3 flash.display.NativeWindow and has
+    // to answer its window slot. Emitted HERE, not in fre.ts, because only this
+    // translation unit knows the struct; fre.ts forward-declares it (see FRE_HEAD).
+    // as_v_is_inst, not a bare vtable compare: a user SUBCLASS of NativeWindow is
+    // a window too, and a CLASS value carries the same vtable word without being
+    // an instance (see as_v_is_inst's note -- reading _win off the static class
+    // object would answer a garbage slot).
+    this.line('#ifdef ASC_HAVE_FRE');
+    this.line('static int as_native_window_id_of(as_value v, int* out) {');
+    this.indent++;
+    this.line('if (!as_v_is_inst(v, &NativeWindow_vt)) return 0;');
+    this.line('*out = ((NativeWindow*)as_v_obj_val(v))->_win;');
+    this.line('return 1;');
+    this.indent--;
+    this.line('}');
+    this.line('#endif // ASC_HAVE_FRE');
     // A Rectangle snapshot of the live bounds. AIR's `bounds` getter returns a
     // fresh Rectangle each time (unlike Screen.bounds, which is the same live
     // object), so this must not be cached.

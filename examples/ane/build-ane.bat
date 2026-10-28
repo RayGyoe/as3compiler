@@ -31,6 +31,10 @@ rem `clang` driver's -fms-runtime-lib=dynamic does NOT change that (the resultin
 rem imports neither CRT at all and is 147,456 B), so clang-cl is the driver used here,
 rem with /MD spelled the way the MSVC flag set spells it. clang-cl locates the MSVC
 rem toolchain by itself: no vcvars is needed for this step.
+rem user32.lib is what probe_nativeWindowHandle's IsWindow/GetWindowThreadProcessId
+rem calls need. The extension asks the OS whether the HWND it was handed really is a
+rem window of THIS process, which is the assertion a fabricated handle cannot pass --
+rem and a real ANE that touches an HWND links user32 for exactly the same reason.
 rem The width is
 rem fixed at x86_64 to match the platform key the descriptor declares; --ane-platform
 rem follows the manifest's `architecture`, and the two must agree (docs/zh-cn/ane.md
@@ -90,7 +94,7 @@ pushd "%SCRATCH%"
 %CC% /nologo /LD /O2 /MD ^
   /I "%EX%shim" /I "%REPO%\lib" ^
   "%EX%ProbeANE.c" /Fe:%DLL% ^
-  /link /LIBPATH:"%REPO%\lib\bin\windows-x64" /INCREMENTAL:NO /MACHINE:X64 asaot.lib
+  /link /LIBPATH:"%REPO%\lib\bin\windows-x64" /INCREMENTAL:NO /MACHINE:X64 asaot.lib user32.lib
 if errorlevel 1 (
   popd
   echo [ane] FAILED - compile/link

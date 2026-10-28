@@ -17319,7 +17319,33 @@ Windows 本机实跑覆盖。
   真实资源链接/运行冒烟；本机全量 `node test.ts` **537/537** 通过。本机非 Windows，**真实 PE 资源运行
   与 Authenticode 未在本机验证**。
 
+### 阶段三百零九：`FREAcquire|ReleaseNativeWindowHandle` 落地（v0.4.271 → v0.4.272）
+
+- **范围**：D 面 11 个入口点里，只有「原生窗口句柄」这一对**不是**呈现能力 —— 句柄是这台机器已经
+  拥有的事实（SDL 建窗，平台层回答 HWND / `NSWindow*`），所以按 AIR 语义真实现；其余 9 个仍
+  `FRE_ILLEGAL_STATE` + 限流自报（理由不变：`FRE_OK` 会让视频类扩展以为画面已呈现）。
+- **实现（四层）**：① `vendor/window_glue.cc` 新增 `sk_window_native_handle(id)`
+  （`SDL_GetWindowWMInfo` → `info.win.window` / `info.cocoa.window`，未知槽位或无句柄答 NULL）；
+  ② `src/runtime.ts` 的窗口 seam **两边都加** `as_window_native_handle()`（真身 + 无窗口桩，
+  缺桩会让无窗口构建在那一句上编不过）；③ `src/emit.ts` 在 `emitNativeWindow` 里发射
+  `as_native_window_id_of()`（用 `as_v_is_inst` 而非裸 `as_is`：子类算窗口，`Class` 值不算，
+  否则把静态类对象当实例读 `_win`）；④ `src/fre.ts` 实现两个入口点：操作数不合法给
+  `FRE_INVALID_OBJECT` / `FRE_TYPE_MISMATCH`，已关闭窗口（槽位会被下一个窗口复用）与「本构建没有
+  窗口后端」一律 `FRE_ILLEGAL_STATE` + 自报，绝不编造指针。
+- **回归**：`unit: fre/NativeWindowHandle`（21 钉，含 seam 两分支与 glue 双平台分支；两条变异验证：
+  删掉无窗口桩 → 恰好那条红；`as_v_is_inst` 换回 `as_is` → 恰好那条红）；`examples/ane/`
+  （离屏构建，钉住 `Point` / `null` 两条拒绝路径，46 → 48 条）；`examples/ane-app/`（改成**有窗口**
+  并在末尾 `NativeApplication.exit()`，8 → 10 条：程序自建 `NativeWindow` 与第一帧的
+  `stage.nativeWindow`，扩展自己用 `IsWindow` + `GetWindowThreadProcessId` 验明句柄属于**本进程**）。
+- **夹具**：`ProbeANE.c` 新增 `nativeWindowHandle` 命令，`build-ane.bat` 链接加 `user32.lib`
+  （真 ANE 碰 HWND 也要这条）；**只重编了 Windows 切片**（本机没有 macOS 工具链），macOS 切片需在
+  mac 上跑一次 `build-ane.sh` 才带上新命令 —— 在那之前 Intel macOS 上该示例会**响亮变红**，不是假绿。
+- **如实报明**：初始窗口在本运行时由 `Stage.showWindow` 在**文档类构造之后**创建，所以在文档类
+  构造器里对 `stage.nativeWindow` acquire 得到 `FRE_ILLEGAL_STATE`（AIR 先建窗）。第一帧之后两边一致。
+  已入 `docs/zh-cn/ane.md` §5（1b）与本表末行。
+
 ### 遗留待开发
+> **2026-10-28 追加（阶段三百零九：`FREAcquire|ReleaseNativeWindowHandle` 落地）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **102 → 103 项**（`未开始` **81 → 82**）。D 面的状态变化（11 → 9 个延后）记在 [`docs/zh-cn/ane.md`](docs/zh-cn/ane.md) §2 / §3.8，不占本表 —— 落地的那一对按表头「已完成项一经落地即从本表移出」本就不该在表里。**新登记的 1 行**是同轮量到的时序差异（初始窗口晚于文档类构造器）：它已**响亮自报**、不是静默 null，但不在本阶段修。
 > **2026-10-27 追加（阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **101 → 102 项**（`未开始` **80 → 81**）。这两批的行为原先全在 macOS 的 `adl` 上量，而 `File` 家族几乎每个成员都碰宿主路径规则；在 Windows 10 + `adl 51.4.1` 上补测（探针 `temp/winfile/adl/`、读数 `adl-win{,2,3}.txt`）分出**六处宿主分叉 + 两处 Windows 独有**，全部**本轮修净**（按表头「已完成项一经落地即从本表移出」故不入表）：`cacheDirectory` 是 `%TEMP%` 而非 `%LOCALAPPDATA%\Caches`；盘符相对路径 `C:foo` 原样保留 + 补分隔符（旧解析得到**绝对**路径 `C:\foo`，是另一个文件）；`parent` 的根保留自己的分隔符（`C:\a` ⇒ `C:\`、`\a` ⇒ `\`）；`getRelativePath` 用正斜杠、跨盘 `null`；同一文件判定改走大小写不敏感的 `as_path_under`（旧的 `strcmp` 会把只有大小写差异的目标当「另一个文件」，覆盖分支先 `DELETE` 掉**源**再复制 ⇒ `#3003` 且文件已毁）；`FileStream` 偏移全改 64 位、`APPEND` 打开即 EOF。两处 Windows 独有：删掉仍被 `FileStream` 打开的文件在 Windows 上必然失败（`adl` 同样报错 ⇒ 是我们示例没 `close()`，已修）、`getRootDirectories()` 交出 8 个 `File` 而非 `StorageVolume`。另有**三处编译阻断**只有 Windows 宿主才撞到（`S_ISREG` 未定义、`_chsize_s` 未声明、`getcwd` 在 MSVC 的 `<direct.h>` 之外），同轮补齐。**新登记的 1 行**是剩余**验证欠账**：`examples/file-ops.as` 的断言写死了 `/tmp`（14 处）与「反斜杠是合法文件名字节」，而它与 `file-symlink.as`/`file-listing-async.as` 都要软链夹具 —— 本机账号建软链报 `EPERM`，三例一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级回归。钉子在 `test/unit/file-stream.ts` 的 `unit: file-stream/windows`（19 钉）+ 既有的 `file-url`/`file-ops` 组；口径写在 `docs/zh-cn/filesystem.md` §11.6（对照 `docs/en/filesystem.md` §11.6）。
 
 > **2026-10-27 追加（阶段二百九十九：`File` 家族 B/C 批）**：**新登记 0 行 / 改写 2 行 / 移出 2 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **102 → 101 项**（`未开始` 80 / `部分完成` 20 / `调研完成·实现暂缓` 1）。**移出 2 行**：`FileStream` 既不 `implements IDataInput` 也不 `implements IDataOutput`（23 个方法 + 三个访问器 + 可写 `Number` 的 `position` 全部落地，`docs/zh-cn/as3-semantics.md` 里「`FileStream` 是空替代」的说法随之作废）、`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent` 四个类不存在 + `FileFilter.clone` 报明（四个类都成了真类，`FileFilter` 按 AIR 只有三个字段；`FileListEvent` 的 5 参数构造器与自造 `directory` 一并修正）。**改写 2 行**：「`File` 的成员面只覆盖 AIR 的一部分」收窄成「两个卷粒度 static 方法缺失」（14 方法 / 8 属性 / 5 静态常量 / `getRootDirectories` 全部落地），原四个类那行改写成「原生对话框与卷枚举仍缺」（类与成员的语义都按 `adl` 实测落地了，剩下的 `browseFor*`/`FileReference.browse`/`getVolumeByDrive`/`getVolumeByPath` 是**后端**活，没有对话框就永远填不满 `fileList`/`data`，故 `browse()` 报明后返回 `false`，**不假装用户点了取消**）。**本阶段修净的一处不占表**：`File` 继承 `FileReference` 后 `cancel()` 落到父类 no-op（`file-listing-async.as` 变红），属 §1.5 遗留缺陷但同阶段修净。**如实报明**：`systemCharset` 在 `adl` 上是宿主语言设置（本机 `x-mac-chinesesimp`），我们回 `"UTF-8"`，属有意偏差；Windows 分支只做编译面推导；AMF0 **写**仍是既有缺口。
@@ -17593,6 +17619,7 @@ Windows 本机实跑覆盖。
 | **`File` 的两个卷粒度 static 方法缺失**：`getVolumeByDrive(drive:String)` / `getVolumeByPath(path:String)` | 未开始（2026-10-27 阶段二百九十九：B/C 批收窄——成员面其余 14 方法 / 8 属性 / 5 常量 / `getRootDirectories` 均已落地） | 这两个要**卷枚举**（POSIX `getmntinfo`/`statfs`，Windows `GetLogicalDrives` + `GetVolumeInformation`）才能回答「这个路径在哪个卷上」；`StorageVolume` 的构造器和六个 getter 已按实测实现，缺的只是「谁来造它」。当前 `File.getRootDirectories()` 会造出根卷（POSIX `["/"]`、Windows 盘符），但反查没有 | 与「原生对话框」同一批后端活；两条一起做能在真机上一次性验证 `StorageVolumeChangeEvent` |
 | **`File` 家族的原生对话框与卷粒度查询仍缺**：`FileReference.browse`/`load`/`save`/`download`/`upload`、`FileReferenceList.browse`、`File.browseFor*` 只报明（`as_shell_unsupported`，返回 `false`）；两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)` 未落地 | 未开始（2026-10-27 阶段二百九十九：C 批把四个**类**与它们的成员面补齐了，剩下的全是**后端**活） | 类与成员现在都在（`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent`，`FileFilter` 三个字段，`File` 的 14 方法/8 属性/5 static 常量/`getRootDirectories`），**读的语义也按 `adl` 实测**（见阶段二百九十九）。缺的只有两件：① 平台对话框（macOS `NSOpenPanel`/`NSSavePanel`，Windows `IFileOpenDialog`）——没有它，`fileList`/`data`/`name` 这些「选择结果」字段永远为空，所以 `browse()` **报明后返回 `false`**，绝不假装用户点了「取消」；② 卷枚举（`statfs`/`GetDiskFreeSpaceExA`）——`StorageVolume` 的构造器与六个 getter 已按实测实现，但目前只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查 | 两条都是后端活，且都要在真机上验证（Windows 分支本机无环境）。做对话框时应顺手把 `File.browseForOpenMultiple` 的 `FileListEvent` 派发接上——类与事件已完成，只差调用点 |
 | **`examples/file-ops.as` 的路径断言是 POSIX 形态**（`/tmp` 字面量 22 处、「反斜杠是合法文件名字节」），`file-symlink.as` / `file-listing-async.as` 亦未在 Windows 实跑 | 未开始（2026-10-27 阶段三百：这三例都要软链夹具，而本机账号建软链报 `EPERM` ⇒ 一直在 `test/examples.ts` 里 `SKIP`，Windows 侧只有 `adl` 探针读数） | 两端 | 待排期（要一台开了 Developer Mode 的 Windows） |
+| **初始窗口的创建晚于文档类构造器**（`FREAcquireNativeWindowHandle(stage.nativeWindow)` 在文档类构造器里得到 `FRE_ILLEGAL_STATE`；`adl` 先建窗再跑构造器，那边拿得到 HWND。**已响亮自报，不是静默 null**；未在 `adl` 上实测这条 FRE 调用——需要把夹具重编回 AIR 版） | 未开始（2026-10-28 阶段三百零九 发现） | 根因是既有取舍：`Stage.showWindow` 在文档类之后建窗，构造器里写的 bounds/title 延后由它生效（`src/emit.ts` 的 `Stage_get_nativeWindow` 上方注释记录了这条约定） | 把初始窗口的创建挪到文档类之前，并重定「构造器里写的窗口属性由谁生效」；改窗口创建时序会波及窗口事件面，需独立阶段 |
 
 
 

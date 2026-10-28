@@ -27,12 +27,19 @@
 // next to this example; the test suite skips the unit and says why when it has
 // neither.
 package aneapp {
+    import flash.display.NativeWindow;
+    import flash.display.NativeWindowInitOptions;
+    import flash.desktop.NativeApplication;
     import flash.display.Sprite;
+    import flash.events.Event;
     import flash.events.StatusEvent;
     import flash.external.ExtensionContext;
 
     public class Main extends Sprite {
         private var passed:int = 0;
+        // Held in a field because the native-window assertions run on the first
+        // frame, not in the constructor -- see the handler below.
+        private var ctx:ExtensionContext;
 
         private function check(label:String, actual:*, expected:*):void {
             if (actual != expected) {
@@ -52,7 +59,7 @@ package aneapp {
             // The id the descriptor declared. This is the resolution under test:
             // the same call under adl reads the packed .ane in lib/, here it reads
             // the recompiled tree in ext-aot/, and neither knows about the other.
-            var ctx:ExtensionContext = ExtensionContext.createExtensionContext("com.example.probe", null);
+            ctx = ExtensionContext.createExtensionContext("com.example.probe", null);
             check("declared-id-resolves", ctx != null, true);
 
             // Status events are queued natively and pumped into AS3 by the host at
@@ -74,14 +81,50 @@ package aneapp {
             // AS3 truthiness applied by native code: `""` is false.
             check("truthy('')", ctx.call("truthy", "") as Boolean, false);
 
+            // Native window handles -- the one D-face pair that is implemented, and
+            // the reason THIS example is where the success path is asserted: it is
+            // windowed (--air-app defines ASC_USE_WINDOW), whereas examples/ane is a
+            // headless build that can only assert the refusal.
+            //
+            // The extension does not just return "non-null": it asks the OS whether
+            // the handle is a window of THIS process and acquires twice to prove the
+            // same slot answers the same object, so a fabricated or mis-slotted
+            // handle fails here rather than inside a real ANE.
+            check("nativeWindowHandle(NativeWindow)",
+                  ctx.call("nativeWindowHandle", new NativeWindow(new NativeWindowInitOptions())) as String,
+                  "acquire=0 release=0 live=1 sameProcess=1 stable=1");
+            // stage.nativeWindow is the case a video ANE actually asks for, and it
+            // is checked on the FIRST FRAME rather than here -- see onFirstFrame.
+            stage.addEventListener(Event.ENTER_FRAME, onFirstFrame);
+
             ctx.call("bumpStatus");
             check("status event reached AS3", gotCode, "probe-status");
+
+        }
+
+        // The initial window is opened AFTER the document class is constructed in
+        // this runtime (Stage.showWindow does it, then blocks on the event loop), so
+        // inside the constructor slot 0 has no OS window yet and the entry point
+        // correctly answers FRE_ILLEGAL_STATE. AIR's ordering is the opposite one
+        // (the window exists before the constructor), and that difference is
+        // registered in docs/zh-cn/ane.md section 5 -- asserting here is asserting
+        // what BOTH runtimes agree on: by the first frame a window exists.
+        private function onFirstFrame(e:Event):void {
+            stage.removeEventListener(Event.ENTER_FRAME, onFirstFrame);
+            check("nativeWindowHandle(stage)",
+                  ctx.call("nativeWindowHandle", stage.nativeWindow) as String,
+                  "acquire=0 release=0 live=1 sameProcess=1 stable=1");
 
             // Disposal is real: the extension's finalizer runs here.
             ctx.dispose();
             trace("ok   disposed");
 
             trace("RESULT passed=" + passed + " failed=0");
+
+            // The window is real, so the event loop is real: end it here or the run
+            // never returns. That self-exit is the whole cost of being windowed, and
+            // it buys the only end-to-end proof that a native HANDLE exists.
+            NativeApplication.nativeApplication.exit();
         }
     }
 }

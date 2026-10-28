@@ -149,6 +149,22 @@ if (ctx != null) {
     // than a fabricated render mode.
     check("renderMode (deferred)", ctx.call("renderMode") as String, "renderMode=8");
 
+    // Native window handles: the ONE piece of the D face that is implemented.
+    //
+    // This example is a HEADLESS build (its manifest names no window backend, so
+    // ASC_USE_WINDOW is off), which makes it the right place for the half that must
+    // stay honest there: no window backend means no handle, and the answer must be a
+    // REPORTED FRE_ILLEGAL_STATE -- never a fabricated pointer an extension would
+    // dereference. A wrong operand is a result code too, not a crash.
+    //
+    // The SUCCESS path needs a window, so it lives in examples/ane-app (--air-app
+    // defines ASC_USE_WINDOW); the two examples are the before/after pair for the
+    // same fixture, which is why the split is by capability rather than by taste.
+    check("nativeWindowHandle(Point) headless", ctx.call("nativeWindowHandle", new Point(1, 2)) as String,
+          "acquire=3 release=3 live=0 sameProcess=0 stable=0");
+    check("nativeWindowHandle(null) headless", ctx.call("nativeWindowHandle", null) as String,
+          "acquire=2 release=2 live=0 sameProcess=0 stable=0");
+
     ctx.dispose();
     check("disposed", true, true);
 }

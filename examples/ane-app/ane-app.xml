@@ -25,11 +25,14 @@
   <architecture>64</architecture>
   <initialWindow>
     <content>main.swf</content>
-    <!-- Offscreen: the app renders one frame to a PNG and exits. That is what
-         lets this example be a real --run instead of a compile-only check (a
-         visible window would never return), and it is why the offscreen link
-         set in src/air-app.ts is exercised here at all. -->
-    <visible>false</visible>
+    <!-- VISIBLE, and the app closes itself: NativeApplication.exit() at the end
+         of the document class. That is what makes this example the one place the
+         native-window-handle SUCCESS path can be asserted end to end -- a
+         windowless build has no NativeWindow at all, so examples/ane (whose
+         manifest names no window backend) can only assert the refusal. The
+         self-exit is what keeps `--run` terminating, which is why the earlier
+         shape of this example was offscreen. -->
+    <visible>true</visible>
     <width>400</width>
     <height>300</height>
   </initialWindow>

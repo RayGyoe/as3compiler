@@ -32,7 +32,10 @@
 // No example can catch any of this: nothing in examples/ observes what the native
 // side of FRE sees, and the defect is a length, not a value.
 import { FRE_BODY } from '../../src/fre.ts';
-import { registerGroup } from '../harness.ts';
+import { parse } from '../../src/parser.ts';
+import { generateC } from '../../src/codegen.ts';
+import { registerGroup, root, readNorm } from '../harness.ts';
+import { join } from 'node:path';
 
 // One top-level C function: from its signature to the first closing brace that
 // sits at column 0 (emitted functions are not indented).
@@ -198,3 +201,108 @@ function checkFrePlatformSplit(): string[] {
   return bad;
 }
 registerGroup('unit: fre/PlatformSplit', checkFrePlatformSplit);
+
+// --- native window handles: the one D-face pair that is NOT deferred (阶段三百零九) ---
+//
+// The claim being protected is not "a pointer comes back". It is the shape of the
+// answer at both ends of the capability range: with a window backend an extension
+// gets the REAL platform object, and without one it gets a reported
+// FRE_ILLEGAL_STATE. A fabricated pointer passes the first half and crashes inside
+// the extension, which is the failure mode AGENTS.md 1.5 exists for -- so the
+// refusal half is what gets pinned hardest here. The end-to-end half lives in
+// examples/ane (headless: refusal) and examples/ane-app (windowed: real HWND).
+function checkFreNativeWindowHandle(): string[] {
+  const failed: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) console.log('PASS  [frenwh] ' + label);
+    else { failed.push(label); console.log('FAIL  [frenwh] ' + label); }
+  };
+
+  const acquire = funcBody(FRE_BODY, 'FREResult FREAcquireNativeWindowHandle(');
+  const release = funcBody(FRE_BODY, 'FREReleaseNativeWindowHandle(');
+
+  check('acquire exists in the FRE body', acquire !== '');
+  check('release exists in the FRE body', release !== '');
+  // The stub this replaces: answering FRE_ILLEGAL_STATE from these two would
+  // silently restore "native window handles are out of scope".
+  check('acquire no longer reports itself as unimplemented',
+    acquire !== '' && !acquire.includes('not implemented by this build: FREAcquireNativeWindowHandle'));
+  check('release no longer reports itself as unimplemented',
+    release !== '' && !release.includes('as_shell_unsupported'));
+
+  // A null OUT pointer is a caller bug, not an AS3 error.
+  check('acquire rejects a null out pointer with FRE_INVALID_ARGUMENT',
+    acquire.includes('if (handle == NULL) return FRE_INVALID_ARGUMENT;'));
+  // The operand contract: null/undefined is INVALID_OBJECT, anything else that is
+  // not a NativeWindow is a TYPE error (the same reading asaot.h takes).
+  check('acquire separates null (INVALID_OBJECT) from a wrong type (TYPE_MISMATCH)',
+    acquire.includes('if (v.tag == 0 || v.tag == 5) return FRE_INVALID_OBJECT;')
+    && acquire.includes('if (!as_native_window_id_of(v, &id)) return FRE_TYPE_MISMATCH;'));
+  // A CLOSED window's slot is recycled, so answering it would hand out the NEXT
+  // window's handle -- the one case where "no answer" is the only right answer.
+  check('acquire refuses a closed window (recycled slot) with FRE_ILLEGAL_STATE',
+    acquire.includes('if (id < 0) return FRE_ILLEGAL_STATE;'));
+  // The handle comes from the seam, never from a Win32/Cocoa call made here: the
+  // platform split lives in window_glue, and this file must stay portable.
+  check('acquire takes the handle from the window seam',
+    acquire.includes('void* h = as_window_native_handle(id);'));
+  // No window backend at all (web) => report, do not return a pointer.
+  check('acquire reports a missing window backend instead of fabricating a handle',
+    acquire.includes('if (h == NULL) {')
+    && acquire.includes('as_shell_unsupported("FREAcquireNativeWindowHandle')
+    && acquire.includes('return FRE_ILLEGAL_STATE;'));
+  check('acquire hands back the seam pointer as FRE_OK',
+    acquire.includes('*handle = (FRENativeWindow)h;') && acquire.includes('return FRE_OK;'));
+  // Release is balanced against an acquire that retains nothing, but it still
+  // validates its operand -- silently accepting a Point would hide a caller bug.
+  check('release validates its operand and answers FRE_OK',
+    release.includes('if (v.tag == 0 || v.tag == 5) return FRE_INVALID_OBJECT;')
+    && release.includes('if (!as_native_window_id_of(v, &id)) return FRE_TYPE_MISMATCH;')
+    && release.includes('return FRE_OK;'));
+
+  // --- the hook emit.ts emits next to the NativeWindow class ---------------
+  const c = generateC(parse('var x:int = 1;\n')).c;
+  const hook = funcBody(c, 'static int as_native_window_id_of(as_value v, int* out) {');
+  check('a program emits the NativeWindow -> slot hook', hook !== '');
+  // as_v_is_inst, not as_is: a CLASS value carries the same vtable word and would
+  // otherwise be read as an instance, whose _win is not a window slot.
+  check('the hook rejects a NativeWindow CLASS value (as_v_is_inst)',
+    hook.includes('if (!as_v_is_inst(v, &NativeWindow_vt)) return 0;'));
+  check('the hook answers the slot from the object',
+    hook.includes('*out = ((NativeWindow*)as_v_obj_val(v))->_win;'));
+
+  // --- the window seam: BOTH branches, or a headless build stops compiling --
+  const preamble = readNorm(join(root, 'src', 'runtime.ts'));
+  check('the seam is declared for the window backend',
+    preamble.includes('extern void* sk_window_native_handle(int id);'));
+  const seam = [
+    'static inline void* as_window_native_handle(int id) {',
+    '#ifdef ASC_USE_WINDOW',
+    '    return sk_window_native_handle(id);',
+    '#else',
+    '    (void)id; return NULL;',
+    '#endif',
+    '}',
+  ].join('\n');
+  check('the seam forwards to the glue when a window backend exists', preamble.includes(seam));
+  // Both branches live in the SAME helper: a headless build reaches the FRE entry
+  // point too, so a missing stub is a compile error there and nowhere else.
+  check('the seam has a no-window stub as well (headless/web builds)',
+    preamble.includes('static inline void* as_window_native_handle(int id) { (void)id; return NULL; }'));
+
+  // --- the glue: one platform object per platform, and NULL for "no window" --
+  const glue = readNorm(join(root, 'vendor', 'window_glue.cc'));
+  const gl = funcBody(glue, 'void* sk_window_native_handle(int id) {');
+  check('the glue answers NULL for an unknown or unpublished slot',
+    gl.includes('if (c == NULL || c->win == NULL) return NULL;'));
+  check('the glue asks SDL for the platform object',
+    gl.includes('SDL_GetWindowWMInfo(c->win, &info)'));
+  check('the glue answers the HWND on Windows',
+    gl.includes('return (void*)info.info.win.window;'));
+  check('the glue answers the NSWindow on macOS',
+    gl.includes('return (void*)info.info.cocoa.window;'));
+
+  if (failed.length !== 0) console.log('     [frenwh] ' + failed.length + ' check(s) failed');
+  return failed;
+}
+registerGroup('unit: fre/NativeWindowHandle', checkFreNativeWindowHandle);

@@ -3117,6 +3117,36 @@ void sk_window_set_title(int id, const char* title) {
   if (c != NULL && c->win != NULL) SDL_SetWindowTitle(c->win, title ? title : "");
 }
 
+// The window's PLATFORM handle -- HWND on Windows, NSWindow* on macOS -- for
+// FREAcquireNativeWindowHandle. SDL is the only layer that knows it, and the two
+// platforms disagree about which union member holds it, so this is the one place
+// that asks and the one place that answers; the generated C never guesses a
+// layout and never includes windows.h for it.
+//
+// NULL means "this build has no such handle", and the FRE entry point turns that
+// into a REPORTED FRE_ILLEGAL_STATE rather than a fabricated pointer: an unknown
+// or already-destroyed slot, a window SDL cannot describe, and a backend that has
+// no handle at all (the web build has no second OS window) all land here. The
+// handle belongs to the window for its whole life -- nothing is retained, which is
+// why the matching FREReleaseNativeWindowHandle has no state to unwind.
+void* sk_window_native_handle(int id) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL || c->win == NULL) return NULL;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info)) return NULL;
+#if defined(_WIN32)
+  if (info.subsystem != SDL_SYSWM_WINDOWS) return NULL;
+  return (void*)info.info.win.window;
+#elif defined(__APPLE__)
+  if (info.subsystem != SDL_SYSWM_COCOA) return NULL;
+  return (void*)info.info.cocoa.window;
+#else
+  (void)info;
+  return NULL;
+#endif
+}
+
 // ---- mouse pointer shape -------------------------------------------------
 // AIR's TextField (and Mouse.cursor) decide the pointer shape; the generated C
 // computes the kind and calls sk_window_set_cursor with it. The kinds are

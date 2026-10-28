@@ -8,7 +8,18 @@ import { parseAirApp } from '../../src/air-app.ts';
 import { macAppSignCommands, nestedNativeImages, notaryAccepted, packageMacDmg, requireMacDmgCredentials } from '../../src/release.ts';
 import { registerGroup, root } from '../harness.ts';
 
+// Both groups below are macOS HOST tests: `macAppLayout` describes a .app bundle
+// (`<name>.app/Contents/MacOS/<name>`, POSIX separators) and `--package dmg` REFUSES a
+// non-macOS host outright ("requires --target native on a macOS host"). Run on
+// Windows they would assert the separators of a layout that does not exist there
+// and a command the CLI rejects by design, so the host says so loudly instead of
+// going red on a correct product -- the same shape as the CoreFoundation probe in
+// unit: platform/CapabilitiesLocale.
 registerGroup('release/AppBundle', () => {
+  if (process.platform !== 'darwin') {
+    console.log('SKIP  [release] macOS-only .app layout (this host is ' + process.platform + ')');
+    return [];
+  }
   const bad: string[] = [];
   const check = (label: string, condition: boolean): void => {
     if (condition) console.log(`PASS  [release] ${label}`);
@@ -98,6 +109,10 @@ registerGroup('release/AppBundle', () => {
 });
 
 registerGroup('release/DmgPlan', () => {
+  if (process.platform !== 'darwin') {
+    console.log('SKIP  [dmg] macOS-only packaging (this host is ' + process.platform + ')');
+    return [];
+  }
   const bad: string[] = [];
   const check = (label: string, condition: boolean): void => {
     if (condition) console.log(`PASS  [dmg] ${label}`);
