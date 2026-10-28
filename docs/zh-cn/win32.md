@@ -121,6 +121,12 @@ x86 侧还需 `Repair-SkiaX86Toolchain`：自动探测 `$winSdk\bin\SetEnv.cmd`�
   `#include <string>`（以前靠别的头间接带进来，新版 MSVC STL 不再提供）⇒ 补一行显式 include
   （IWYU 正解，纯声明可见性）。标记 `ASC-D3DUTIL-STRING-PATCH`。
 
+预编译 `skia.lib` 与本机 MSVC 工具集还有一层**二进制兼容性**：14.4x 的向量化算法实现由
+`libcpmt.lib` 提供，14.37 缺 `__std_search_1`、`__std_minmax_element_f` 等符号时，编译能过而
+`lld-link` 才报未定义符号。`as-aot doctor` 的 `host.msvc-stl` 因此在普通 Windows 终端也会通过
+`clang -###` 找到实际工具集，扫描当前 Skia 的真实引用并核对对应位宽的 `libcpmt.lib`；失败信息直接
+列出工具集版本、缺失符号，以及「升级最新 v143 工具集 / 用本机工具集重编依赖」两条修复路径。
+
 ### 2.5 Windows 的 `tar.exe` 建不了符号链接（已自愈）
 
 Windows 自带的 `tar.exe`（bsdtar）在未开「开发者模式」/没有「创建符号链接」特权时解不了归档里的符号

@@ -8,11 +8,13 @@
 // The single-source group asserts the throws are gone and the checks are actually
 // called; the behaviour group drives the checks directly, against an empty vendor
 // tree, so those assertions are about what the code DOES rather than how it reads.
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { root, registerGroup } from '../harness.ts';
-import { AUDIO_GLUE_HOSTS, checkFailure, requireCheck, type CheckCtx } from '../../src/checks.ts';
+import {
+  AUDIO_GLUE_HOSTS, checkFailure, msvcToolDirFromClangOutput, requireCheck, runChecks, type CheckCtx,
+} from '../../src/checks.ts';
 import { defaultBuildConfig, type BuildConfig } from '../../src/build.ts';
 
 const readSrc = (rel: string): string => readFileSync(join(root, rel), 'utf8').replace(/\r\n/g, '\n');
@@ -204,5 +206,75 @@ function checkCheckBehaviour(): string[] {
   return bad;
 }
 
+function checkWindowsMsvcStl(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [doctor] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [doctor] ${label}`); }
+  };
+
+  const clangOutput = '"clang" "-cc1" "-internal-isystem" '
+    + '"D:\\Software\\VS2022\\VC\\Tools\\MSVC\\14.43.34809\\include" "-internal-isystem" "C:\\SDK\\include"';
+  check('a plain terminal derives the selected toolset from clang -###',
+    msvcToolDirFromClangOutput(clangOutput) === 'D:\\Software\\VS2022\\VC\\Tools\\MSVC\\14.43.34809');
+  check('unrelated clang output does not invent an MSVC toolset',
+    msvcToolDirFromClangOutput('clang version 23.1.4') === '');
+
+  const sandbox = emptyDir();
+  const vendorDir = join(sandbox, 'vendor');
+  const skiaDir = join(vendorDir, 'skia', 'lib', 'windows-x86');
+  const toolDir = join(sandbox, 'VC', 'Tools', 'MSVC', '14.37.32822');
+  const crtDir = join(toolDir, 'lib', 'x86');
+  const skiaLib = join(skiaDir, 'skia.lib');
+  const libcpmt = join(crtDir, 'libcpmt.lib');
+  mkdirSync(skiaDir, { recursive: true });
+  mkdirSync(crtDir, { recursive: true });
+  const imports = [
+    '__std_find_last_trivial_1', '__std_find_last_trivial_2', '__std_max_element_f',
+    '__std_min_element_f', '__std_minmax_element_f', '__std_search_1',
+  ];
+  writeFileSync(skiaLib, imports.map((s) => `_${s}@16`).join('\0'));
+  const ctx = ctxWith({ linkLibs: ['skia'], architecture: '32' }, { vendorDir });
+  const realPlatform = process.platform;
+  const savedToolDir = process.env.VCToolsInstallDir;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    process.env.VCToolsInstallDir = toolDir;
+    writeFileSync(libcpmt, '__std_min_element_1\0__std_minmax_element_4');
+    const stale = requireCheck('host.msvc-stl', ctx) ?? '';
+    check('an older libcpmt fails before lld-link, naming its version and missing imports',
+      stale.includes('MSVC 14.37.32822') && stale.includes('__std_search_1')
+      && stale.includes('__std_minmax_element_f'));
+    check('the failure offers both the toolset update and a local dependency rebuild',
+      stale.includes('latest MSVC v143') && stale.includes('windows.ps1 -Arch x86'));
+
+    writeFileSync(libcpmt, imports.join('\0'));
+    const compatible = runChecks(ctx, ['host.msvc-stl'])[0];
+    check('a libcpmt carrying every import is green, with the measured count',
+      compatible.status === 'ok' && compatible.detail.includes('6 Skia STL import(s)'));
+
+    writeFileSync(skiaLib, 'locally rebuilt Skia without vectorised STL imports');
+    writeFileSync(libcpmt, '');
+    const rebuilt = runChecks(ctx, ['host.msvc-stl'])[0];
+    check('a Skia rebuilt without those imports is not rejected by a version-number floor',
+      rebuilt.status === 'ok' && rebuilt.detail.includes('0 Skia STL import(s)'));
+
+    rmSync(libcpmt);
+    const absent = requireCheck('host.msvc-stl', ctx) ?? '';
+    check('a missing architecture-specific libcpmt names the component to install',
+      absent.includes(libcpmt) && absent.includes('MSVC v143 C++ x86 build tools'));
+  } finally {
+    if (savedToolDir === undefined) delete process.env.VCToolsInstallDir;
+    else process.env.VCToolsInstallDir = savedToolDir;
+    Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+
+  if (ok > 0) console.log(`[doctor] ${ok} Windows MSVC STL checks passed`);
+  return bad;
+}
+
 registerGroup('unit: doctor/SingleSourceOfTruth', checkSingleSourceOfTruth);
 registerGroup('unit: doctor/CheckBehaviour', checkCheckBehaviour);
+registerGroup('unit: doctor/WindowsMsvcStl', checkWindowsMsvcStl);

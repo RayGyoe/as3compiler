@@ -132,6 +132,13 @@ minimal, marked patch in the touched source (re-entrant; it fails loudly if the 
   `<string>` (it used to arrive transitively; newer MSVC STL no longer provides it) ⇒ add the explicit
   include (the IWYU answer; pure declaration visibility). Marker `ASC-D3DUTIL-STRING-PATCH`.
 
+The prebuilt `skia.lib` and the local MSVC toolset must also be **binary compatible**. The 14.4x vectorised
+algorithm implementations live in `libcpmt.lib`; with 14.37, imports such as `__std_search_1` and
+`__std_minmax_element_f` compile but fail only at `lld-link`. The `host.msvc-stl` doctor check therefore uses
+`clang -###` in an ordinary Windows terminal to find the selected toolset, scans the current Skia archive's
+actual imports and checks the matching-architecture `libcpmt.lib`. Its failure names the version and missing
+symbols, and offers both remedies: update to the latest v143 toolset or rebuild the dependencies locally.
+
 ### 2.5 Windows `tar.exe` Cannot Create Symlinks (self-healed)
 
 Windows' bundled `tar.exe` (bsdtar) cannot extract symlinks when "Developer Mode" is off / there is no

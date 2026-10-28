@@ -24,9 +24,9 @@
 // vendor checks -- correctly, since it needs none of them.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { nonWindowsVendorKey, wasmToolchainError, webToolchainError, emccPath, type BuildConfig } from './build.ts';
+import { nonWindowsVendorKey, wasmToolchainError, webToolchainError, emccPath, windowsTargetTriple, type BuildConfig } from './build.ts';
 import { aneHostDirName, aneHostLibName, anePlatformForBuild } from './ane.ts';
 
 export type CheckKind = 'hard' | 'warn' | 'info';
@@ -145,6 +145,59 @@ const provisionHint = ((): string => {
   return '';
 })();
 
+// MSVC's vectorised algorithms live in libcpmt.lib, not in the headers. A
+// prebuilt Skia can therefore compile cleanly and fail only at lld-link when
+// the SELECTED toolset is older than the one that produced the archive. Probe
+// the archive's actual imports rather than imposing a version-number floor:
+// a Skia rebuilt with the older local toolset need not import these symbols.
+const SKIA_MSVC_STL_IMPORTS = [
+  '__std_find_last_trivial_1',
+  '__std_find_last_trivial_2',
+  '__std_max_element_f',
+  '__std_min_element_f',
+  '__std_minmax_element_f',
+  '__std_search_1',
+] as const;
+
+interface MsvcToolchainProbe {
+  dir: string;
+  version: string;
+  error: string;
+}
+
+// Exported so the quoted Windows command-line shape is testable off Windows.
+export function msvcToolDirFromClangOutput(output: string): string {
+  const include = output.match(/["']-internal-isystem["']\s+["']([^"']*[\\/]VC[\\/]Tools[\\/]MSVC[\\/][^\\/"']+[\\/]include)["']/i)?.[1];
+  if (include === undefined) return '';
+  return include.slice(0, include.length - 'include'.length).replace(/[\\/]+$/, '');
+}
+
+function selectedMsvcToolchain(cfg: BuildConfig): MsvcToolchainProbe {
+  const envDir = (process.env.VCToolsInstallDir ?? '').trim().replace(/[\\/]+$/, '');
+  const dirVersion = (dir: string): string => dir.match(/[\\/]MSVC[\\/]([^\\/]+)$/)?.[1] ?? '';
+  if (envDir !== '') return { dir: envDir, version: dirVersion(envDir), error: '' };
+
+  // A plain Windows terminal has no vcvars environment. Ask the very compiler
+  // the build will run which MSVC include tree it selected; this also handles
+  // multiple installed 14.x toolsets without guessing that the newest on disk
+  // is the one clang will use.
+  const probe = spawnSync(cfg.cCompiler, [
+    '-###', '-x', 'c++', '-',
+    `--target=${windowsTargetTriple(cfg.architecture)}`,
+    '-fms-runtime-lib=static',
+  ], { encoding: 'utf8' });
+  if (probe.error) return { dir: '', version: '', error: `'${cfg.cCompiler}' is not runnable (${probe.error.message})` };
+  const output = `${probe.stdout ?? ''}\n${probe.stderr ?? ''}`;
+  const dir = msvcToolDirFromClangOutput(output);
+  if (dir === '') {
+    return {
+      dir: '', version: '',
+      error: `could not determine the MSVC toolset selected by '${cfg.cCompiler}'`,
+    };
+  }
+  return { dir, version: dirVersion(dir), error: '' };
+}
+
 // ---------------------------------------------------------------------------
 // The checks.
 
@@ -208,6 +261,54 @@ export const CHECKS: Check[] = [
         );
       }
       return ok(probe);
+    },
+  },
+
+  {
+    id: 'host.msvc-stl',
+    title: 'MSVC STL / Skia compatibility',
+    kind: 'hard',
+    applies: (c) => isNative(c) && onWindows() && linksSkia(c),
+    run: (ctx) => {
+      const skiaDir = vendorLibDir(ctx, 'skia');
+      const skiaLib = join(skiaDir, 'skia.lib');
+      if (skiaDir === '' || !existsSync(skiaLib)) {
+        return skip('skia.lib is absent; vendor.skia reports that prerequisite');
+      }
+
+      const tool = selectedMsvcToolchain(ctx.cfg);
+      if (tool.error !== '') {
+        return fail(
+          tool.error,
+          'Install Visual Studio 2022 Build Tools with the MSVC v143 C++ toolset, or run from a '
+          + 'Developer Command Prompt so VCToolsInstallDir names the selected toolset.',
+        );
+      }
+      const libArch = ctx.cfg.architecture === '32' ? 'x86' : ctx.cfg.architecture === 'arm64' ? 'arm64' : 'x64';
+      const libcpmt = join(tool.dir, 'lib', libArch, 'libcpmt.lib');
+      const toolName = tool.version === '' ? tool.dir : `MSVC ${tool.version}`;
+      if (!existsSync(libcpmt)) {
+        return fail(
+          `missing ${libcpmt} (${toolName})`,
+          `Install the MSVC v143 C++ ${libArch} build tools in Visual Studio Installer, then rerun doctor.`,
+        );
+      }
+
+      // COFF decoration differs between x86 (___std_search_1@16) and x64
+      // (__std_search_1), so match the undecorated ASCII substring in both
+      // archives. Buffer.includes does the byte search without a UTF-8 decode.
+      const skiaBytes = readFileSync(skiaLib);
+      const crtBytes = readFileSync(libcpmt);
+      const required = SKIA_MSVC_STL_IMPORTS.filter((s) => skiaBytes.includes(s));
+      const missing = required.filter((s) => !crtBytes.includes(s));
+      if (missing.length > 0) {
+        return fail(
+          `${toolName} cannot satisfy skia.lib; ${libcpmt} lacks ${missing.join(', ')}`,
+          'Update Visual Studio 2022 and install the latest MSVC v143 C++ x64/x86 build tools, '
+          + `or rebuild the vendored dependencies with this toolset: \`vendor/provision/windows.ps1 -Arch ${libArch}\`.`,
+        );
+      }
+      return ok(`${toolName}: ${libcpmt} satisfies ${required.length} Skia STL import(s)`);
     },
   },
 
