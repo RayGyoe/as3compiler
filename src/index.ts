@@ -13,7 +13,7 @@ import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, r
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp, airManifest, parseGpuBackend, type GpuBackend } from './air-app.ts';
@@ -487,7 +487,7 @@ function repoPaths(): { repoDir: string; vendorDir: string } {
 }
 
 // The context the check table reads on the build path. `outDir` is null: only the
-// icudtl.dat deployment (a `doctor --fix` action) needs an output directory, and
+// ICU data deployment (a `doctor --fix` action) needs an output directory, and
 // a compile never invokes it.
 function buildCheckCtx(cfg: BuildConfig, appUses?: CheckCtx['appUses']): CheckCtx {
   return { ...repoPaths(), cfg, outDir: null, appUses };
@@ -1218,11 +1218,14 @@ async function main(): Promise<void> {
   // 同上：链接成功即回收对象，失败保留（见 build.ts::cleanObjectScratch）。
   cleanObjectScratch(cfg);
 
-  // Skia text shaping on a Windows native build needs icudtl.dat beside the exe
-  // (see deploySkiaIcuData). Deploy it after a successful link; a missing file
-  // would otherwise surface later as a SIGILL on the first text-shaping call.
-  if (deploySkiaIcuData(cfg, outPath)) {
-    console.log(`[4/4] data        icudtl.dat -> ${dirname(resolve(outPath))}`);
+  // Skia text shaping on a Windows native build needs ICU data beside the exe
+  // (see deploySkiaIcuData) -- under OUR name, `aot-icudtl.dat`, so the shared
+  // `icudtl.dat` a browser control's CEF runtime owns can stay exactly as it is.
+  // Deploy after a successful link; a missing file would otherwise surface later
+  // as a SIGILL on the first text-shaping call.
+  const icu = deploySkiaIcuData(cfg, outPath);
+  if (icu === 'deployed') {
+    console.log(`[4/4] data        ${ICU_DATA_NAME} -> ${dirname(resolve(outPath))}`);
   }
 
   // The recompiled ANE native libraries and the FRE host DLL go next to the

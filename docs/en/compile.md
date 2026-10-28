@@ -114,7 +114,7 @@ Usage: as-aot <input.as> [more.as ...] [options]
 
 Options:
   -o <path>      output path (native: executable; wasm: .wasm appended); also the base
-                 for every sibling artifact — the generated .c, the .o/.lib, icudtl.dat
+                 for every sibling artifact — the generated .c, the .o/.lib, aot-icudtl.dat
                  and the staged extensions/ all land beside it, so `-o bin-aot/App.exe`
                  keeps the source tree free of build output
   --run          run the compiled output after building
@@ -678,7 +678,7 @@ library root joins the compile surface through `--as-class-path <libroot>` inste
 GreenSock core now lives in `examples/as-library`, not copied into `src/`) →
 write `<filename>.build.json` in the same directory as app.xml (linking Skia + SDL2) →
 compile/link into the `<filename>` executable (**both the artifact name and the location of every
-artifact** are overridable with `-o`: `-o` decides `base`, so the generated `.c`, `icudtl.dat`
+artifact** are overridable with `-o`: `-o` decides `base`, so the generated `.c`, `aot-icudtl.dat`
 and the staged `extensions/` + `asaot.dll` all follow it — `-o bin-aot/App.exe` leaves the
 source tree free of build output. The `.o` files are the exception: they are **intermediates**, not
 artifacts, and since stage 223 they live in a scratch directory **private to one build**
@@ -942,7 +942,7 @@ as-aot doctor                                   # can this repository build its 
 as-aot doctor --air-app path/to/app.xml         # can this app build? (trimmed to what it actually touches)
 as-aot doctor --manifest hello.build.json       # can this manifest build?
 as-aot doctor --json                            # machine-readable output
-as-aot doctor --fix                             # only sub-second idempotent repairs (e.g. staging icudtl.dat)
+as-aot doctor --fix                             # only sub-second idempotent repairs (e.g. staging aot-icudtl.dat)
 as-aot doctor --check-update                    # read-only: ask the registry whether a newer release exists
 ```
 

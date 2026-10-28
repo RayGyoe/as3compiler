@@ -9,7 +9,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { resolve, dirname, join, basename, delimiter, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -1352,41 +1352,102 @@ function nativeTargetFlags(cfg: BuildConfig): string[] {
   return [`--target=${windowsTargetTriple(cfg.architecture)}`, '-fms-runtime-lib=static'];
 }
 
-// Skia's SkParagraph/SkUnicode (text shaping) needs the ICU data file
-// `icudtl.dat` at runtime. On Windows the native build is a static exe with no
-// DLL directory to fall back to, so SkLoadICU() (third_party/icu/SkLoadICU.cpp)
-// looks for icudtl.dat *beside the executable*. Without it the first text-shaping
-// call crashes with SIGILL: SkParagraph::Cluster::Cluster reads an out-of-bounds
-// index into the empty grapheme-property table and SK_ABORT()s to a `ud2` trap.
-// `vendor/provision/windows.ps1` already copies icudtl.dat next to the skia .lib; here
-// we mirror it next to the freshly linked exe (SkLoadICU only probes the exe and
-// library directories, so shipping it beside the .lib is not enough). Returns
-// true when the destination now holds the data (copied, or already identical).
+// Skia's SkParagraph/SkUnicode (text shaping) needs an ICU data file at runtime.
+// On Windows the native build is a static exe with no DLL directory to fall back
+// to, so the data has to sit beside the executable. Without it the first
+// text-shaping call crashes with SIGILL: SkParagraph::Cluster::Cluster reads an
+// out-of-bounds index into the empty grapheme-property table and SK_ABORT()s to a
+// `ud2` trap (measured: 0xC000001D, with `SkIcuLoader: no ICU data in <dir>` on
+// stderr). `vendor/provision/windows.ps1` already copies the data next to the skia
+// .lib; here we mirror it next to the freshly linked exe (the loader probes the exe
+// and library directories, so shipping it beside the .lib is not enough).
 //
 // Several builds CAN share one output directory (`node test.ts` links every Skia
 // example into the same temp/regress-out/ under a 6-wide pool), so this copy is
 // not exclusive: on Windows a plain CopyFile onto a destination another process
 // has open fails with `UNKNOWN: unknown error, copyfile ...` — and a running Skia
-// example *is* holding icudtl.dat open to read it. Hence: compare first (the
+// example *is* holding that file open to read it. Hence: compare first (the
 // overwhelmingly common case is "already deployed", costing one stat), and write
 // through a pid-suffixed temp name so a half-written file is never observable.
-export function deploySkiaIcuData(cfg: BuildConfig, outPath: string): boolean {
-  if (process.platform !== 'win32' || cfg.target !== 'native') return false;
-  if (cfg.architecture !== '32' && cfg.architecture !== '64' && cfg.architecture !== 'arm64') return false;
-  if (!cfg.linkLibs.includes('skia')) return false;
+//
+// THE FILE NAME IS OURS: `aot-icudtl.dat`, not `icudtl.dat`. `icudtl.dat` beside
+// the exe is a shared name — any Chromium-based runtime the program stages there
+// (a browser control's CEF, whose renderer subprocess maps that very path for its
+// own, older ICU) reads it too, and one file cannot serve two ICU generations.
+// Measured on this host against CEF 3.2987:
+//
+//   * Skia's ICU 69 data under the shared name -> every CEF renderer subprocess
+//     aborts ~250 ms after start (libcef+0x404d7c, FATAL "unreachable code",
+//     raised by a failed `NumberFormat::createInstance`), web view blank forever;
+//   * CEF's ICU 5x data under the shared name -> CEF renders, but OUR text loses
+//     glyph runs (the app's FPS overlay drew its first line and dropped the rest).
+//
+// Both symptoms are silent at build time, which is why the two data sets must not
+// share a path at all. vendor/skia_text_glue.cc defines SkLoadICU() itself and
+// reads `aot-icudtl.dat` (falling back to `icudtl.dat` for trees built before this
+// change), so nothing is ever overwritten in either direction.
+export type IcuDeployment =
+  | 'deployed' // copied Skia's data set beside the exe, under our own name
+  | 'up-to-date' // the file there already is ours, byte for byte
+  | 'absent'; // not a Windows native Skia build, or no data set to copy
+
+// The name our loader reads first (vendor/skia_text_glue.cc::SkLoadICU). Nothing
+// else on the platform uses it, which is the entire point: the shared `icudtl.dat`
+// stays available for another runtime staged beside the same exe.
+export const ICU_DATA_NAME = 'aot-icudtl.dat';
+
+// Bytes of UDataInfo that identify "an ICU common data package of our data format".
+// Only used for the cheap "already deployed" test: Skia's ICU 69 package and a
+// Chromium ICU 5x package agree on all 16 (measured: 9000da27 14000000 00000200
+// 436d6e44), so the header can never stand in for a real comparison.
+const ICU_HEADER_PROBE = 16;
+
+function readHead(path: string, n: number): Buffer | null {
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      const buf = Buffer.alloc(n);
+      const got = readSync(fd, buf, 0, n, 0);
+      return buf.subarray(0, got);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+// Same size AND same leading bytes: the cheap "we already deployed this" test.
+function sameIcuBytes(a: string, b: string): boolean {
+  try {
+    if (statSync(a).size !== statSync(b).size) return false;
+  } catch {
+    return false;
+  }
+  const ha = readHead(a, ICU_HEADER_PROBE);
+  const hb = readHead(b, ICU_HEADER_PROBE);
+  return ha !== null && hb !== null && ha.equals(hb);
+}
+
+export function deploySkiaIcuData(cfg: BuildConfig, outPath: string): IcuDeployment {
+  if (process.platform !== 'win32' || cfg.target !== 'native') return 'absent';
+  if (cfg.architecture !== '32' && cfg.architecture !== '64' && cfg.architecture !== 'arm64') return 'absent';
+  if (!cfg.linkLibs.includes('skia')) return 'absent';
+  const dst = join(dirname(resolve(outPath)), ICU_DATA_NAME);
   for (const p of cfg.linkPaths) {
     const src = join(p, 'icudtl.dat');
-    if (existsSync(src)) {
-      copyIcuData(src, join(dirname(resolve(outPath)), 'icudtl.dat'));
-      return true;
-    }
+    if (!existsSync(src)) continue;
+    if (existsSync(dst) && sameIcuBytes(src, dst)) return 'up-to-date';
+    copyIcuData(src, dst);
+    return 'deployed';
   }
-  return false;
+  return 'absent';
 }
 
 // Same bytes, or "built from the same vendor tree": size + not-older-than-source
-// is enough for a data file that only changes when ICU is upgraded, and it avoids
-// reading 0.8 MB on every build of every Skia example.
+// is enough for a data file that only changes when ICU is upgraded. Only the
+// lost-the-race path below needs it -- deploySkiaIcuData has already decided that a
+// copy is wanted before calling copyIcuData.
 function icuDataUpToDate(src: string, dst: string): boolean {
   try {
     const a = statSync(src);
@@ -1398,7 +1459,6 @@ function icuDataUpToDate(src: string, dst: string): boolean {
 }
 
 function copyIcuData(src: string, dst: string): void {
-  if (icuDataUpToDate(src, dst)) return;
   const tmp = `${dst}.${process.pid}.tmp`;
   copyFileSync(src, tmp);
   try {
@@ -1407,7 +1467,7 @@ function copyIcuData(src: string, dst: string): void {
     rmSync(tmp, { force: true });
     // Lost the race against a process that loaded the file between our stat and
     // our rename. If the destination ended up with the right bytes anyway, the
-    // build's requirement ("icudtl.dat beside the exe") is met, so this is not an
+    // build's requirement ("our ICU data beside the exe") is met, so this is not an
     // error; a genuinely different file must still fail loudly.
     if (!icuDataUpToDate(src, dst)) throw e;
   }
@@ -1474,7 +1534,6 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
       ...exportDynamicFlags(cfg),
       ...windowsLinkFlags(cfg)
     );
-
     for (const l of posixLinkLibs()) args.push(l);
     for (const l of platformLinkLibs()) args.push('-l', l);
     args.push('-o', outPath);
@@ -1693,7 +1752,6 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
     ...exportDynamicFlags(cfg),
     ...windowsLinkFlags(cfg),
     '-o',
-
     outPath,
   ];
   for (const f of cfg.cFlags) linkArgs.push(f);

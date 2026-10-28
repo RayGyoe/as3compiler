@@ -23,9 +23,9 @@
 // build-readiness, and a machine that merely cannot reach the registry is still
 // one that can build. A failed check is a reported status, never a throw.
 
-import { copyFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { BuildConfig } from './build.ts';
+import { deploySkiaIcuData, ICU_DATA_NAME, type BuildConfig, type IcuDeployment } from './build.ts';
 import { runChecks, vendorLibDir, type CheckCtx, type CheckResult } from './checks.ts';
 
 export interface DoctorOptions {
@@ -164,16 +164,17 @@ function describeConfig(cfg: BuildConfig): string {
 }
 
 // The single `--fix` action. Guarded on the same directory the check resolved,
-// so it cannot write somewhere the check did not look.
-function fixIcuData(ctx: CheckCtx, outDir: string | null): string | null {
+// so it cannot write somewhere the check did not look. It goes through
+// deploySkiaIcuData rather than copying here, so `doctor --fix` can only ever
+// write the name we own (`aot-icudtl.dat`) and never the shared `icudtl.dat` that
+// another runtime staged beside the exe reads for its own ICU.
+function fixIcuData(ctx: CheckCtx, outDir: string | null): { action: IcuDeployment; dest: string } | null {
   const dir = vendorLibDir(ctx, 'skia');
   if (dir === '') return null;
-  const src = join(dir, 'icudtl.dat');
-  if (!existsSync(src)) return null;
+  if (!existsSync(join(dir, 'icudtl.dat'))) return null;
   if (outDir === null) return null;
-  const dest = join(outDir, 'icudtl.dat');
-  copyFileSync(src, dest);
-  return dest;
+  const dest = join(outDir, ICU_DATA_NAME);
+  return { action: deploySkiaIcuData(ctx.cfg, join(outDir, 'as-aot-doctor-probe.exe')), dest };
 }
 
 export function runDoctor(opts: DoctorOptions): number {
@@ -194,11 +195,13 @@ export function runDoctor(opts: DoctorOptions): number {
     } else {
       for (const r of before) {
         if (r.id === 'vendor.skia.icu') {
-          const dest = fixIcuData(ctx, opts.outDir);
+          const fixed = fixIcuData(ctx, opts.outDir);
           if (!opts.json) {
-            console.log(dest === null
-              ? paint('33', `  could not fix ${r.id}: no -o <path> given, or no icudtl.dat in vendor/`)
-              : `  fixed ${r.id}: icudtl.dat -> ${dest}`);
+            if (fixed === null) {
+              console.log(paint('33', `  could not fix ${r.id}: no -o <path> given, or no icudtl.dat in vendor/`));
+            } else {
+              console.log(`  fixed ${r.id}: ${ICU_DATA_NAME} -> ${fixed.dest}`);
+            }
           }
         } else if (!opts.json) {
           // Nothing else is whitelisted: say so rather than pretending.

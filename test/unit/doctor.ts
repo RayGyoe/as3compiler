@@ -202,6 +202,38 @@ function checkCheckBehaviour(): string[] {
   check('a build that links no Skia is not asked for the archives',
     requireCheck('vendor.skia', ctxWith({})) === null);
 
+  // ---- vendor.skia.icu ---------------------------------------------------
+  // The check and the build read one name (build.ts::ICU_DATA_NAME), and it is
+  // OUR name: the shared `icudtl.dat` beside an exe belongs to whatever
+  // Chromium/CEF runtime is staged there too. So a foreign `icudtl.dat` sitting
+  // beside our output must be a NON-event here -- if the report ever starts
+  // complaining about it, builds will get "fixed" into a blank web view.
+  if (process.platform === 'win32') {
+    const sandbox = emptyDir();
+    const vendorSkia = join(sandbox, 'vendor', 'skia', 'lib', 'windows-x86');
+    const outDir = join(sandbox, 'out');
+    mkdirSync(vendorSkia, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(vendorSkia, 'icudtl.dat'), 'a'.repeat(64));
+    const icuCfg = { linkLibs: ['skia'], architecture: '32' as const, target: 'native' as const };
+    const withOut: CheckCtx = { ...ctxWith(icuCfg, { vendorDir: join(sandbox, 'vendor') }), outDir };
+
+    const notYet = requireCheck('vendor.skia.icu', withOut) ?? '';
+    check('the ICU data is required beside the exe, under our own name',
+      notYet.includes('aot-icudtl.dat'));
+
+    writeFileSync(join(outDir, 'aot-icudtl.dat'), 'a'.repeat(64));
+    writeFileSync(join(outDir, 'icudtl.dat'), 'b'.repeat(200));
+    check('a coexisting foreign icudtl.dat is not a doctor failure',
+      requireCheck('vendor.skia.icu', withOut) === null);
+
+    writeFileSync(join(outDir, 'aot-icudtl.dat'), 'short');
+    const stale = requireCheck('vendor.skia.icu', withOut) ?? '';
+    check('...but our own file at the wrong size is (it is a stale copy of ours)',
+      stale.includes('5 vs 64 bytes') && stale.includes('doctor --fix'));
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+
   if (ok > 0) console.log(`[doctor] ${ok} check-behaviour checks passed`);
   return bad;
 }

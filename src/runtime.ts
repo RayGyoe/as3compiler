@@ -902,7 +902,6 @@ static void as_oom_addrspace_report(void) {
 }
 
 static _Noreturn void as_oom_raise(void) {
-
     if (!as_oom_active) {
         as_oom_active = 1;
         as_throw(as_error_new_oom("Error #1000: The system is out of memory.", 1000));

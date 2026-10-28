@@ -257,9 +257,7 @@ function checkCrashHardening(): string[] {
   check('the definition precedes its callers (no implicit declaration)',
     rt.indexOf('static void as_oom_addrspace_report(void) {') <
     rt.indexOf('as_oom_addrspace_report();'));
-
   if (ok > 0) console.log(`[crash] ${ok} crash-hardening checks passed`);
-
   return bad;
 }
 registerGroup('unit: crash/hardening', checkCrashHardening);

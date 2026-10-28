@@ -48,8 +48,152 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// ICU data: loaded by US, under OUR file name.
+//
+// Skia's own loader (third_party/icu/SkLoadICU.cpp, compiled into libskunicode)
+// reads `icudtl.dat` beside the exe. That name is not ours to own: any
+// Chromium-based runtime staged beside the same exe reads it too -- a browser
+// control's CEF, whose renderer subprocess maps that exact path for its own,
+// older ICU -- and one file cannot serve both. Measured both ways on this host
+// (CEF 3.2987 vs Skia's ICU 69):
+//
+//   * Skia's 10,185,008 B set in that slot  -> every CEF renderer aborts ~250 ms
+//     after start (libcef+0x404d7c, FATAL "unreachable code", raised by a failed
+//     NumberFormat::createInstance) and the web view stays blank forever.
+//   * CEF's 10,130,464 B set in that slot   -> CEF renders, but our own text loses
+//     glyph runs (the FPS overlay draws its first line and drops the rest).
+//
+// So the data moves to `aot-icudtl.dat` (build.ts::deploySkiaIcuData) and this is
+// the only thing that reads it. Supplying the symbol ourselves is what makes that
+// work against PREBUILT archives: skunicode.lib's SkLoadICU.obj is pulled in only
+// while the symbol is undefined, and this object is linked before the archives.
+//
+// `icudtl.dat` is still accepted as a fallback -- a tree built before this change
+// deployed the data under the shared name -- but never preferred, and using it is
+// reported, because in a CEF staging directory it is the other runtime's data.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <cstdio>
+#include <io.h>
+
+// The two ICU entry points this loader needs, declared here instead of included
+// from <unicode/udata.h> because the vendored tree ships no ICU headers (the
+// archives are prebuilt). Signatures are ICU's, verbatim:
+//   void udata_setCommonData(const void* data, UErrorCode* err);
+//   void udata_setFileAccess(UDataFileAccess access, UErrorCode* status);
+// UErrorCode is an int-sized enum, so the ABI is (pointer, int*) and (int, int*).
+// UDATA_ONLY_PACKAGES == 1 (icu/source/common/unicode/udata.h).
+extern "C" void udata_setCommonData(const void* data, int* err);
+extern "C" void udata_setFileAccess(int access, int* status);
+
+static const int kUdataOnlyPackages = 1;
+
+static void* sk_aot_map_icu_data(const wchar_t* path) {
+  struct FileCloser { void operator()(FILE* f) const { if (f) fclose(f); } };
+  std::unique_ptr<FILE, FileCloser> stream(_wfopen(path, L"rb"));
+  if (!stream) return nullptr;
+  HANDLE file = (HANDLE)_get_osfhandle(_fileno(stream.get()));
+  if (file == INVALID_HANDLE_VALUE) return nullptr;
+  struct MapCloser { void operator()(HANDLE h) const { if (h) CloseHandle(h); } };
+  std::unique_ptr<void, MapCloser> mapping(
+      CreateFileMapping(file, nullptr, PAGE_READONLY, 0, 0, nullptr));
+  if (!mapping) return nullptr;
+  // Deliberately never unmapped: ICU keeps pointers into this range for the
+  // lifetime of the process (Skia's own loader leaks it the same way).
+  return MapViewOfFile(mapping.get(), FILE_MAP_READ, 0, 0, 0);
+}
+
+static bool sk_aot_init_icu(void* data) {
+  if (data == nullptr) return false;
+  int err = 0;  // U_ZERO_ERROR
+  udata_setCommonData(data, &err);
+  if (err > 0) {  // U_FAILURE(x) is (x) > U_ZERO_ERROR; negatives are warnings
+    fprintf(stderr, "SkIcuLoader: udata_setCommonData() returned %d.\n", err);
+    return false;
+  }
+  udata_setFileAccess(kUdataOnlyPackages, &err);
+  return err <= 0;
+}
+
+// Fills `out` with the directory part of the module's path (no trailing '\\').
+static bool sk_aot_module_dir(HMODULE module, std::wstring* out) {
+  wchar_t buf[MAX_PATH];
+  const DWORD n = GetModuleFileNameW(module, buf, (DWORD)MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return false;
+  wchar_t* slash = wcsrchr(buf, L'\\');
+  if (slash == nullptr) return false;
+  *slash = 0;
+  *out = buf;
+  return true;
+}
+
+static bool sk_aot_load_dir(const std::wstring& dir, bool report) {
+  // Our own name first; the historical shared name second, and loudly.
+  struct Candidate { const wchar_t* name; bool shared; };
+  static const Candidate kNames[] = { { L"\\aot-icudtl.dat", false }, { L"\\icudtl.dat", true } };
+  for (const Candidate& c : kNames) {
+    const std::wstring path = dir + c.name;
+    if (void* data = sk_aot_map_icu_data(path.c_str())) {
+      if (sk_aot_init_icu(data)) {
+        if (c.shared) {
+          // A legacy tree, or another runtime's data set in a shared directory.
+          // Say which, every time: silent here is a text engine running on data
+          // it was not built against.
+          fprintf(stderr, "SkIcuLoader: %ls (shared name -- a rebuild deploys aot-icudtl.dat)\n",
+                  path.c_str());
+        }
+        return true;
+      }
+    }
+  }
+  if (report) {
+    fprintf(stderr, "SkIcuLoader: no ICU data in %ls (tried aot-icudtl.dat, icudtl.dat).\n",
+            dir.c_str());
+  }
+  return false;
+}
+
+static std::wstring sk_aot_exe_dir() {
+  std::wstring dir;
+  return sk_aot_module_dir(GetModuleHandleW(nullptr), &dir) ? dir : std::wstring();
+}
+
+static std::wstring sk_aot_library_dir() {
+  HMODULE self = nullptr;
+  GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                     reinterpret_cast<LPCSTR>(&sk_aot_library_dir), &self);
+  std::wstring dir;
+  return sk_aot_module_dir(self, &dir) ? dir : std::wstring();
+}
+
+// Skia's own symbol (third_party/icu/SkLoadICU.h declares `bool SkLoadICU();` in
+// the global namespace). Identical signature => identical mangled name => this
+// definition wins and the archive's member is never read.
+bool SkLoadICU() {
+  static bool loaded = false;
+  static std::once_flag once;
+  std::call_once(once, []() {
+    const std::wstring exe = sk_aot_exe_dir();
+    if (!exe.empty() && sk_aot_load_dir(exe, true)) { loaded = true; return; }
+    const std::wstring lib = sk_aot_library_dir();
+    if (!lib.empty() && lib != exe && sk_aot_load_dir(lib, false)) loaded = true;
+  });
+  return loaded;
+}
+
+#endif  // _WIN32
 
 extern "C" {
 

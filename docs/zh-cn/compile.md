@@ -104,7 +104,7 @@ Usage: as-aot <input.as> [more.as ...] [options]
 
 Options:
   -o <path>      output path (native: executable; wasm: .wasm appended); also the base
-                 for every sibling artifact — the generated .c, the .o/.lib, icudtl.dat
+                 for every sibling artifact — the generated .c, the .o/.lib, aot-icudtl.dat
                  and the staged extensions/ all land beside it, so `-o bin-aot/App.exe`
                  keeps the source tree free of build output
   --run          run the compiled output after building
@@ -629,7 +629,7 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 见 §3.5.2——air-native 的 GreenSock 核心就在 `examples/as-library`，不再往 `src/` 里拷一份）→
 在 app.xml 同目录写出 `<filename>.build.json`（链接 Skia + SDL2）→ 编链出 `<filename>` 可执行
 （**产物名与全部产物的落点**都可用 `-o` 覆盖：`-o` 决定 `base`，故生成的 `.c`、
-`icudtl.dat`、暂存的 `extensions/` 与 `asaot.dll` 全跟着走 —— `-o bin-aot/App.exe` 即可让源码树
+`aot-icudtl.dat`、暂存的 `extensions/` 与 `asaot.dll` 全跟着走 —— `-o bin-aot/App.exe` 即可让源码树
 零产物。`.o` 例外：它是**中间产物**而非发行物，自阶段二百二十三 起落在**本次构建独占**的临时目录
 （`$TMPDIR/as-aot-obj/<配置指纹>-<构建进程 pid>/`，`--dry` 会打印真实路径），链接成功后整个目录
 被回收（失败则刻意保留，那才是事后分析想要的现场）。两道闸各自堵一类静默：对象内容是编译旗标
@@ -856,7 +856,7 @@ as-aot doctor                                   # 判断「这个仓库默认形
 as-aot doctor --air-app path/to/app.xml         # 判断「这个应用能不能编」（按它真实触碰的功能裁剪）
 as-aot doctor --manifest hello.build.json       # 判断「这份构建清单能不能编」
 as-aot doctor --json                            # 机器可读输出
-as-aot doctor --fix                             # 只做秒级幂等修复（如补齐 icudtl.dat）
+as-aot doctor --fix                             # 只做秒级幂等修复（如补齐 aot-icudtl.dat）
 as-aot doctor --check-update                    # 只读地问一次 registry 有没有新版本（不安装任何东西）
 ```
 

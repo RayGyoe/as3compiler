@@ -17344,6 +17344,39 @@ Windows 本机实跑覆盖。
   构造器里对 `stage.nativeWindow` acquire 得到 `FRE_ILLEGAL_STATE`（AIR 先建窗）。第一帧之后两边一致。
   已入 `docs/zh-cn/ane.md` §5（1b）与本表末行。
 
+### 阶段三百一十：`icudtl.dat` 名字冲突收口 —— 「webview 白屏」与「文字掉字形」是同一个 bug（v0.4.272 → v0.4.274）
+
+- **现象**：AOT 产物里浏览器控件（CEF 3.2987）的网页**永久白屏**；而同一个 exe 的文字渲染也**掉字形**
+  （应用里的 FPS 覆盖层只画出第一行）。两者看起来毫不相干，实际是同一个共享文件名的两个方向。
+- **测量链（无调试器，手写 minidump 读取器定位）**：① 窗口树里 `CefBrowserWindow` 与
+  `Chrome_WidgetWin_0` 都在，**`Chrome_RenderWidgetHostHWND` 永远不出现** ⇒ 不是窗口/句柄问题；
+  ② `--type=renderer` 子进程启动约 **241 ms** 后死，WER `Event ID 1001` / `BEX` / `c0000005`；
+  ③ 解析 `%LOCALAPPDATA%\CrashDumps\BrowserProcess.exe.*.dmp`：`thread=5888 code=0xc0000005 addr=0x0`、
+  `eip=0x0`（空间接调用），EBP 链 `libcef+0x3e4da3` ← `libcef+0x52f02f`；子进程里 libcef 重定位到
+  `0x0FC20000` ⇒ 真凶 RVA **`0x404d7c`**（`ja` 到一处 `pushl "unreachable code"` 的 `CHECK`/`int3`）；
+  ④ 邻接字符串同时出现 `v8\src\api-experimental.cc`、`conversions-inl.h` 与
+  **"Failed to create ICU number format, are ICU data files missing?"** ⇒ 指向 ICU 数据而非 V8 逻辑。
+- **决定性 A/B（同一份产物，只换 exe 旁的 `icudtl.dat`）**：放 Skia 的（10185008 B，ICU 69）⇒ 无
+  render widget、白屏、持续产生 dump；放 CEF 的（10130464 B，ICU 5x）⇒ `Chrome_RenderWidgetHostHWND
+  'Chrome Legacy Window' 528x888`，页面正常绘制。**但同一时刻我们的文字开始掉字形**（实测某行
+  106.000 → 106.143，FPS 覆盖层只剩第一行）—— 一份文件喂不了两代 ICU。
+- **修法（两手）**：① **不再共享路径**：构建期把 `vendor/skia/lib/windows-x{N}/icudtl.dat` 部署成产物
+  目录的 **`aot-icudtl.dat`**（`src/build.ts::ICU_DATA_NAME`），`vendor/skia_text_glue.cc` **自己定义
+  `SkLoadICU()`**（`_wfopen` + `CreateFileMapping` + mmap + `udata_setCommonData`，先试我们的名字，
+  回退共享名并在 stderr **大声报一行**），静态库里那份 `SkLoadICU.obj` 因此永不被拉进来；
+  ② 构建/诊断**永不写别人的文件**：`deploySkiaIcuData` 的落点只有我们自己的名字，`doctor --fix` 与
+  `checks.ts` 同口径（返回值简化为 `'deployed' | 'up-to-date' | 'absent'`）。
+- **回归**：`unit: build/IcuDataDeploy` **12 钉**（含「构建从不写共享 `icudtl.dat`」与两条**跨文件**
+  不变量：glue 必须自己定义 `SkLoadICU`、glue 读的文件名必须等于 `ICU_DATA_NAME`）；两条变异验证：
+  把 `ICU_DATA_NAME` 改回 `icudtl.dat` ⇒ 恰好 4 条红；把 glue 的 `SkLoadICU` 改名 ⇒ 恰好那条红。
+  真机四态实测（`temp/icuprobe/variants.cjs`，同一 exe 换文件）：只有我们那份 → 四行度量正常、无警告；
+  两份并存 → 与只放我们那份**逐字相同**；只剩 CEF 那份 → 回退可用但打警告且度量已偏；两份都没有 →
+  `0xC000001D`，stderr 指名两个候选。应用端复测：FPS 覆盖层四行齐全（`fps2-zoom.png`），点「打开网页」后
+  renderer 存活 >15 s、`Chrome_RenderWidgetHostHWND` 就位、页面绘制正常（`drive-1645.png`）。
+- **如实报明**：`aot-icudtl.dat` 这个新文件名是**我们单方面新增**的，别家工具不认识；若某个宿主程序
+  自己也想部署「一份 ICU 数据」，两边现在可以共存了，但**别指望我们的加载器去读别人的名字** ——
+  回退到 `icudtl.dat` 只是给旧产物留的逃生口，且会打警告。
+
 ### 遗留待开发
 > **2026-10-28 追加（阶段三百零九：`FREAcquire|ReleaseNativeWindowHandle` 落地）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **102 → 103 项**（`未开始` **81 → 82**）。D 面的状态变化（11 → 9 个延后）记在 [`docs/zh-cn/ane.md`](docs/zh-cn/ane.md) §2 / §3.8，不占本表 —— 落地的那一对按表头「已完成项一经落地即从本表移出」本就不该在表里。**新登记的 1 行**是同轮量到的时序差异（初始窗口晚于文档类构造器）：它已**响亮自报**、不是静默 null，但不在本阶段修。
 > **2026-10-27 追加（阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **101 → 102 项**（`未开始` **80 → 81**）。这两批的行为原先全在 macOS 的 `adl` 上量，而 `File` 家族几乎每个成员都碰宿主路径规则；在 Windows 10 + `adl 51.4.1` 上补测（探针 `temp/winfile/adl/`、读数 `adl-win{,2,3}.txt`）分出**六处宿主分叉 + 两处 Windows 独有**，全部**本轮修净**（按表头「已完成项一经落地即从本表移出」故不入表）：`cacheDirectory` 是 `%TEMP%` 而非 `%LOCALAPPDATA%\Caches`；盘符相对路径 `C:foo` 原样保留 + 补分隔符（旧解析得到**绝对**路径 `C:\foo`，是另一个文件）；`parent` 的根保留自己的分隔符（`C:\a` ⇒ `C:\`、`\a` ⇒ `\`）；`getRelativePath` 用正斜杠、跨盘 `null`；同一文件判定改走大小写不敏感的 `as_path_under`（旧的 `strcmp` 会把只有大小写差异的目标当「另一个文件」，覆盖分支先 `DELETE` 掉**源**再复制 ⇒ `#3003` 且文件已毁）；`FileStream` 偏移全改 64 位、`APPEND` 打开即 EOF。两处 Windows 独有：删掉仍被 `FileStream` 打开的文件在 Windows 上必然失败（`adl` 同样报错 ⇒ 是我们示例没 `close()`，已修）、`getRootDirectories()` 交出 8 个 `File` 而非 `StorageVolume`。另有**三处编译阻断**只有 Windows 宿主才撞到（`S_ISREG` 未定义、`_chsize_s` 未声明、`getcwd` 在 MSVC 的 `<direct.h>` 之外），同轮补齐。**新登记的 1 行**是剩余**验证欠账**：`examples/file-ops.as` 的断言写死了 `/tmp`（14 处）与「反斜杠是合法文件名字节」，而它与 `file-symlink.as`/`file-listing-async.as` 都要软链夹具 —— 本机账号建软链报 `EPERM`，三例一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级回归。钉子在 `test/unit/file-stream.ts` 的 `unit: file-stream/windows`（19 钉）+ 既有的 `file-url`/`file-ops` 组；口径写在 `docs/zh-cn/filesystem.md` §11.6（对照 `docs/en/filesystem.md` §11.6）。

@@ -196,13 +196,38 @@ the first a crash, the last two semantic gaps in `flash.filesystem` on Windows, 
 
 1. **Missing `icudtl.dat` → SIGILL (`ud2`)**. Skia's `SkParagraph` (`Cluster::Cluster` →
    `codeUnitHasProperty()`) relies on ICU to fill `fCodeUnitProperties`, and on Windows `SkIcuLoader` reads the
-   ICU data from the **exe directory** (stderr prints `SkIcuLoader: datafile missing: icudtl.dat`). With the
+   ICU data from the **exe directory** (stderr prints `SkIcuLoader: no ICU data in <dir>`). With the
    file missing that table is empty, `Cluster::Cluster` indexes out of bounds and triggers `SK_ABORT`'s `ud2`
    (exit 132). Fix: at build time **deploy `vendor/skia/lib/windows-x{N}/icudtl.dat` (10185008 bytes) into the
    output directory automatically** — `src/build.ts` gained `deploySkiaIcuData(cfg, outPath)` (active for
    win32+native+linked-against-skia), and `src/index.ts` calls it after a successful link
-   (`[4/4] data icudtl.dat -> ...`); `vendor/provision/windows.ps1` copies it alongside the artifacts too and
+   (`[4/4] data aot-icudtl.dat -> ...`); `vendor/provision/windows.ps1` copies it alongside the artifacts too and
    `Fail`s if missing.
+
+   > **2026-10-29 addendum: the data file's name is ours — `aot-icudtl.dat` (阶段二百七十五).** That path
+   > beside the exe, `icudtl.dat`, is a **shared name**: any Chromium/CEF runtime staged there (a browser
+   > control's renderer subprocess) reads the very same path for a **different ICU generation**. One file
+   > cannot feed two ICUs, and the wrong winner is silent at build time and fatal at run time. Measured both
+   > ways on this host against CEF 3.2987 (ICU 5x):
+   >
+   > * Skia's ICU 69 data under the shared name ⇒ **every renderer subprocess aborted ~250 ms after start** —
+   >   `libcef+0x404d7c` → `+0x3e4d9e` → FATAL "unreachable code", raised by a failed
+   >   `NumberFormat::createInstance` ("Failed to create ICU number format, are ICU data files missing?") —
+   >   and the web view stayed permanently blank (`CefBrowserWindow` present, no
+   >   `Chrome_RenderWidgetHostHWND` ever);
+   > * CEF's data under the shared name ⇒ the page renders, but **our text loses glyph runs** (one measured
+   >   line went 106.000 → 106.143 wide, and the app's FPS overlay drew only its first line of four).
+   >
+   > So the two data sets **no longer share a path**: (i) the deployment name is fixed at `aot-icudtl.dat`
+   > (`src/build.ts::ICU_DATA_NAME`, so the build prints `[4/4] data aot-icudtl.dat -> ...`); (ii)
+   > `vendor/skia_text_glue.cc` **defines `SkLoadICU()` itself** (`_wfopen` + `CreateFileMapping` + mmap +
+   > `udata_setCommonData`, trying `aot-icudtl.dat` first and falling back to the shared name while printing
+   > one loud stderr line), so the archive's own `SkLoadICU.obj` is never pulled in; (iii) a CEF runtime's
+   > `icudtl.dat` is entirely outside the build's view — never read, never written. Four states measured
+   > (`temp/icuprobe/variants.cjs`, one exe, swapped files): only `aot-icudtl.dat` → all four metrics correct,
+   > no warning; both files → byte-identical to ours alone (ours wins); CEF's alone → fallback works but warns
+   > and the metric has already drifted (106.143); neither → `0xC000001D`, with stderr naming both candidates.
+   > `deploySkiaIcuData`'s result type is now `'deployed' | 'up-to-date' | 'absent'`.
 2. **async FileStream `openAsync(…, FileMode.READ)` → `__fastfail`**. The async `AS_JOB_FS_OPEN` mode mapping
    was written as `mode = j->mode` (pass through whatever is non-empty), and `FileMode.READ` is the string
    `"read"` — so `fopen(path, "read")`. POSIX `fopen` merely returns `NULL` for an invalid mode (a soft

@@ -114,14 +114,18 @@ examples/stage12/Greeter
 examples/web/hello-web
 
 # Windows native build outputs (host-regenerated on every build): `--air-app` links
-# an `.exe` plus its import `.lib`, and deploys the Skia text-shaping data
-# `icudtl.dat` beside the executable. Scoped to examples/ on purpose: the vendor
+# an `.exe` plus its import `.lib`, and deploys the Skia text-shaping data beside the
+# executable. That data's name is OURS (`aot-icudtl.dat`, so it can never collide
+# with the shared `icudtl.dat` a browser control's CEF runtime needs); both names
+# are listed because trees built before the rename still carry the old one.
+# Scoped to examples/ on purpose: the vendor
 # trees ship tracked .lib build INPUTS (vendor/curl/lib/*, vendor/sdl2/lib/*), and a
 # directory-wide rule here is what keeps them out of a `*.lib` sweep -- there is no
 # global `*.lib` rule to fall back on.
 examples/**/*.exe
 examples/**/*.lib
 examples/**/icudtl.dat
+examples/**/aot-icudtl.dat
 benchmarks/**/*.exe
 
 # Local acceptance-test demo projects. These are EXTERNAL, read-only reference trees,

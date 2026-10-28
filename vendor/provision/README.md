@@ -117,7 +117,9 @@ powershell -ExecutionPolicy Bypass -File .\windows.ps1 -Arch x64 -Only curl -Ski
 ### 2. icudtl.dat 缺失 → 首跑文本整形时 SIGILL
 
 脚本收产物时会把 `icudtl.dat` 与 Skia 的 `.lib` 一起拷到 `vendor/skia/lib/windows-<arch>/`（缺失则 `Fail`）。
-编译侧（`src/build.ts` 的 `deploySkiaIcuData`）再把它拷到 exe 旁。两环缺一不可——缺了它，`SkParagraph` 首次
+编译侧（`src/build.ts` 的 `deploySkiaIcuData`）再把它拷到 exe 旁，但**落盘名是 `aot-icudtl.dat`**：exe 旁那个
+`icudtl.dat` 同时属于任何 Chromium/CEF 运行时（renderer 子进程读它），一份文件喂不了两代 ICU，而错的那一支
+构建期无症状、运行期必死（详见 `docs/zh-cn/win32.md` §2.7 的 2026-10-29 补）。两环缺一不可——缺了它，`SkParagraph` 首次
 整形会读空 grapheme 表越界 `SK_ABORT`（`ud2`，exit 132）。
 
 ### 3. 编译耗时正常，不是卡死
@@ -133,5 +135,5 @@ Skia 编一次 30~60 分钟（几千个 C++ 文件）。两套位宽是两棵独
 - 32 位与 64 位**不能混链**：`Capabilities.cpuAddressSize` / `supports32BitProcesses` 必须与所选三元组一致。
 - 更完整的 Windows 原生后端说明见 `docs/zh-cn/win32.md`。
 - 环境自检：不知道本机到底缺什么时，先跑 `as-aot doctor`（`--air-app app.xml` 可按该应用真实触碰的功能裁剪），
-  它把散落在构建路径各处的缺失检查汇总成一份只读报告；`--fix` 只能重铺 `icudtl.dat` 这类秒级幂等项，
+  它把散落在构建路径各处的缺失检查汇总成一份只读报告；`--fix` 只能重铺 `aot-icudtl.dat` 这类秒级幂等项，
   真正的依赖库构建仍需手跑本脚本。

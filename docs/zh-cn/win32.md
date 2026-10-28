@@ -177,14 +177,35 @@ Windows 自带的 `tar.exe`（bsdtar）在未开「开发者模式」/没有「�
 编译+链接过后 `air-native` 首跑仍逐个暴露三处**运行期**问题——前一处是崩溃，后两处是
 `flash.filesystem` 在 Windows 上的语义缺口，都与 AS3 无关：
 
-1. **缺 `icudtl.dat` → SIGILL（`ud2`）**。Skia 的 `SkParagraph`（`Cluster::Cluster` →
+1. **缺 ICU 数据 → SIGILL（`ud2`）**。Skia 的 `SkParagraph`（`Cluster::Cluster` →
    `codeUnitHasProperty()`）依赖 ICU 填充 `fCodeUnitProperties`，而 Windows 上 `SkIcuLoader`
-   从 **exe 目录**读 ICU 数据（stderr 打 `SkIcuLoader: datafile missing: icudtl.dat`）。缺文件时
+   从 **exe 目录**读 ICU 数据（stderr 打 `SkIcuLoader: no ICU data in <dir>`）。缺文件时
    该表为空，`Cluster::Cluster` 索引越界触发 `SK_ABORT` 的 `ud2`（exit 132）。修法：构建期把
    `vendor/skia/lib/windows-x{N}/icudtl.dat`（10185008 字节）**自动部署到产物目录**——
    `src/build.ts` 新增 `deploySkiaIcuData(cfg, outPath)`（win32+native+链接 skia 时生效），
-   `src/index.ts` 在 link 成功后调用（`[4/4] data icudtl.dat -> ...`）；`vendor/provision/windows.ps1`
+   `src/index.ts` 在 link 成功后调用；`vendor/provision/windows.ps1`
    收产物时同步复制、缺失则 `Fail`。
+   > **2026-10-29 补：数据文件名是我们自己的 `aot-icudtl.dat`（阶段二百七十五）**。exe 旁边那个
+   > `icudtl.dat` 是**共享文件名**：任何 Chromium/CEF 运行时（浏览器控件的 renderer 子进程）也读
+   > 这个路径，取的是**另一代 ICU** 的数据集——一份文件喂不了两个 ICU，而错的那一支
+   > **构建期毫无征兆、运行期才死**。两向都实测过（CEF 3.2987 / ICU 5x，本机）：
+   >
+   > * Skia 的 ICU 69 数据占住共享名 ⇒ **每个 renderer 子进程启动约 250 ms 后必崩**——
+   >   `libcef+0x404d7c` → `+0x3e4d9e` → FATAL「unreachable code」，触发点是一次
+   >   `NumberFormat::createInstance` 失败（"Failed to create ICU number format, are ICU data files
+   >   missing?"），网页永久白屏（`CefBrowserWindow` 在、`Chrome_RenderWidgetHostHWND` 永远不出现）；
+   > * CEF 的数据占住共享名 ⇒ 网页正常，但**我们的文字掉字形**（同一行实测宽 106.000 → 106.143，
+   >   应用里的 FPS 覆盖层只画出第一行、后三行消失）。
+   >
+   > 所以两个数据集**不再共享路径**：① 部署名固定为 `aot-icudtl.dat`（`src/build.ts::ICU_DATA_NAME`，
+   > 构建输出 `[4/4] data aot-icudtl.dat -> ...`）；② `vendor/skia_text_glue.cc` **自己定义
+   > `SkLoadICU()`**（`_wfopen` + `CreateFileMapping` + mmap + `udata_setCommonData`，先试
+   > `aot-icudtl.dat`，回退共享名并**在 stderr 大声报一行**），静态库里那份 `SkLoadICU.obj` 因此
+   > 永远不被拉进来；③ CEF 的 `icudtl.dat` 从此完全不在构建视野内——不读、更不写。
+   > 实测四态（`temp/icuprobe/variants.cjs`，同一 exe 换文件跑）：只有 `aot-icudtl.dat` → 四行度量正常、
+   > 无警告；两者并存 → 度量与只放我们那份**逐字相同**（我们那份胜出）；只剩 CEF 那份 → 回退可用但
+   > 打警告且度量已偏（106.143）；两份都没有 → `0xC000001D`，stderr 指明两个候选名。
+   > `deploySkiaIcuData` 的返回值随之简化为 `'deployed' | 'up-to-date' | 'absent'`。
 2. **async FileStream `openAsync(…, FileMode.READ)` → `__fastfail`**。异步 `AS_JOB_FS_OPEN`
    的 mode 映射写成了 `mode = j->mode`（非空即原样透传），而 `FileMode.READ` 是字符串
    `"read"`——于是 `fopen(path, "read")`。POSIX 的 `fopen` 对非法 mode 只回 `NULL`（软失败，

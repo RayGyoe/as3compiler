@@ -24,9 +24,9 @@
 // vendor checks -- correctly, since it needs none of them.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { nonWindowsVendorKey, wasmToolchainError, webToolchainError, emccPath, windowsTargetTriple, type BuildConfig } from './build.ts';
+import { nonWindowsVendorKey, wasmToolchainError, webToolchainError, emccPath, windowsTargetTriple, ICU_DATA_NAME, type BuildConfig } from './build.ts';
 import { aneHostDirName, aneHostLibName, anePlatformForBuild } from './ane.ts';
 
 export type CheckKind = 'hard' | 'warn' | 'info';
@@ -315,11 +315,13 @@ export const CHECKS: Check[] = [
 
   {
     id: 'vendor.skia.icu',
-    title: 'Skia ICU data (icudtl.dat)',
+    title: 'Skia ICU data (aot-icudtl.dat)',
     kind: 'hard',
     // Windows-only: on macOS ICU is reached through the vendored libicu.a, in
     // the same archive as everything else. A static Windows exe has no DLL
-    // directory to fall back to, so SkLoadICU() probes the exe's own directory.
+    // directory to fall back to, so our own SkLoadICU() (vendor/skia_text_glue.cc)
+    // probes the exe's own directory -- for `aot-icudtl.dat`, NOT the shared
+    // `icudtl.dat` a browser control's CEF runtime owns beside the same exe.
     applies: (c) => isNative(c) && onWindows() && linksSkia(c),
     run: (ctx) => {
       const dir = vendorLibDir(ctx, 'skia');
@@ -329,7 +331,8 @@ export const CHECKS: Check[] = [
         return fail(
           `missing ${src}`,
           'Re-run `vendor/provision/windows.ps1 -Only skia` -- it copies icudtl.dat next to the '
-          + 'Skia archives, and the compile-time step then deploys it beside the exe (build.ts::deploySkiaIcuData).',
+          + 'Skia archives, and the compile-time step then deploys it beside the exe as '
+          + 'aot-icudtl.dat (build.ts::deploySkiaIcuData).',
         );
       }
       if (ctx.outDir === null) {
@@ -338,7 +341,7 @@ export const CHECKS: Check[] = [
         // the path of.
         return ok(`${src} (deployed beside the exe at build time)`);
       }
-      const dest = join(ctx.outDir, 'icudtl.dat');
+      const dest = join(ctx.outDir, ICU_DATA_NAME);
       if (!existsSync(dest)) {
         return fail(
           `present in vendor/, but not yet beside the output: ${dest}`,
@@ -346,7 +349,16 @@ export const CHECKS: Check[] = [
           true,
         );
       }
-      return ok(dest);
+      // Our own name, so a size mismatch is not a stranger's data set -- it is a
+      // stale copy of ours (an older ICU upgrade, a crashed write). Deploying over
+      // it is exactly what `--fix`/the next build does, so failing is safe.
+      return statSync(dest).size === statSync(src).size
+        ? ok(dest)
+        : fail(
+          `${dest} is not the vendored data set (${statSync(dest).size} vs ${statSync(src).size} bytes)`,
+          'Rebuild, or run `as-aot doctor --fix` to redeploy it.',
+          true,
+        );
     },
   },
 

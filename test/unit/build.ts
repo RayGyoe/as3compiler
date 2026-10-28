@@ -10,7 +10,7 @@ import { join, dirname, resolve, sep, basename, delimiter } from 'node:path';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
 import type { GpuBackend } from '../../src/air-app.ts';
@@ -3508,12 +3508,22 @@ function checkExampleManifestHosts(): string[] {
 
 registerGroup('unit: build/ExampleManifestHosts', checkExampleManifestHosts);
 
-// `deploySkiaIcuData` copies icudtl.dat beside the exe, and several builds share one
-// output directory in practice (`node test.ts` links every Skia example into the same
-// temp/regress-out/ under a 6-wide pool). The copy therefore has to survive a
+// `deploySkiaIcuData` copies Skia's ICU data beside the exe, and several builds share
+// one output directory in practice (`node test.ts` links every Skia example into the
+// same temp/regress-out/ under a 6-wide pool). The copy therefore has to survive a
 // destination that already holds the file -- and that a *running* Skia example has it
 // open, which on Windows turns CopyFile into `UNKNOWN: unknown error, copyfile`.
 // Pinned from any host by faking win32, since the function is Windows-only.
+//
+// The other half is the NAME, and it is the whole point of the current shape:
+// `icudtl.dat` beside the exe is shared with any Chromium/CEF runtime the program
+// stages there, and two ICU generations cannot share one file. Measured both ways
+// against CEF 3.2987: Skia's data under the shared name aborted every renderer
+// (~250 ms, libcef+0x404d7c FATAL) and left the web view blank; CEF's data under it
+// made OUR text lose glyph runs (the app's FPS overlay dropped three of four lines).
+// So the deployment now writes `aot-icudtl.dat` and must never touch `icudtl.dat` --
+// and the loader (vendor/skia_text_glue.cc::SkLoadICU) has to read that same name,
+// otherwise the rename is a silent no-op that reintroduces the foreign-data path.
 function checkIcuDataDeploy(): string[] {
   const bad: string[] = [];
   let ok = 0;
@@ -3531,12 +3541,15 @@ function checkIcuDataDeploy(): string[] {
     mkdirSync(outDir, { recursive: true });
     const src = join(libDir, 'icudtl.dat');
     writeFileSync(src, 'a'.repeat(64));
-    const dst = join(outDir, 'icudtl.dat');
+    const dst = join(outDir, ICU_DATA_NAME);
+    const shared = join(outDir, 'icudtl.dat');
     const cfg = { ...defaultBuildConfig(), target: 'native', architecture: '64',
       linkLibs: ['skia'], linkPaths: [libDir] } as BuildConfig;
 
-    check('first build copies the data beside the exe',
-      deploySkiaIcuData(cfg, join(outDir, 'app.exe')) && readFileSync(dst, 'utf8').length === 64);
+    check('the deployment name is our own, not the shared icudtl.dat',
+      ICU_DATA_NAME !== 'icudtl.dat' && ICU_DATA_NAME.endsWith('-icudtl.dat'));
+    check('first build copies the data beside the exe under that name',
+      deploySkiaIcuData(cfg, join(outDir, 'app.exe')) === 'deployed' && readFileSync(dst, 'utf8').length === 64);
 
     // The point: a second build in the SAME output dir is a no-op, not a second
     // CopyFile. Same size + not-older-than-source is the up-to-date test, so the
@@ -3551,24 +3564,56 @@ function checkIcuDataDeploy(): string[] {
     const futures = new Date(Date.now() + 60_000);
     utimesSync(dst, futures, futures);
     const stamped = statSync(dst).mtimeMs;
-    deploySkiaIcuData(cfg, join(outDir, 'app.exe'));
+    check('a second build reports up-to-date', deploySkiaIcuData(cfg, join(outDir, 'app.exe')) === 'up-to-date');
     check('a second build does not rewrite an up-to-date file', statSync(dst).mtimeMs === stamped);
 
     // A stale/truncated destination IS replaced, otherwise a crashed build would
-    // poison the directory forever.
+    // poison the directory forever. Nothing else owns this file name, so there is
+    // no "is it somebody else's package?" question left to answer.
     writeFileSync(dst, 'stale');
     utimesSync(dst, futures, futures);
     deploySkiaIcuData(cfg, join(outDir, 'app.exe'));
     check('a destination with the wrong size is overwritten', readFileSync(dst, 'utf8').length === 64);
 
-    // No icudtl.dat in any -L dir (Skia absent, or a macOS-style tree) -> false, so
+    // The shared name is not ours: a browser runtime's data set sitting there must
+    // come out of a build byte-for-byte identical and with its mtime intact. This
+    // is the regression that cost a blank web view (and, in the other direction,
+    // three lines of the FPS overlay), so it is pinned from the build side too.
+    const foreign = 'b'.repeat(200);
+    writeFileSync(shared, foreign);
+    utimesSync(shared, futures, futures);
+    const foreignMtime = statSync(shared).mtimeMs;
+    deploySkiaIcuData(cfg, join(outDir, 'app.exe'));
+    check('the shared icudtl.dat is never written by a build',
+      readFileSync(shared, 'utf8') === foreign && statSync(shared).mtimeMs === foreignMtime);
+    check('both data sets coexist beside one exe',
+      statSync(dst).isFile() && statSync(shared).isFile() && statSync(dst).size !== statSync(shared).size);
+
+    // No data in any -L dir (Skia absent, or a macOS-style tree) -> 'absent', so
     // the caller prints nothing and a non-Skia build is untouched.
     const emptyLib = join(dir, 'nolib');
     mkdirSync(emptyLib, { recursive: true });
-    check('no icudtl.dat in the link dirs answers false',
-      deploySkiaIcuData({ ...cfg, linkPaths: [emptyLib] }, join(outDir, 'app.exe')) === false);
+    check('no icudtl.dat in the link dirs answers absent',
+      deploySkiaIcuData({ ...cfg, linkPaths: [emptyLib] }, join(outDir, 'app.exe')) === 'absent');
     check('a build that does not link skia is skipped',
-      deploySkiaIcuData({ ...cfg, linkLibs: [] }, join(outDir, 'app.exe')) === false);
+      deploySkiaIcuData({ ...cfg, linkLibs: [] }, join(outDir, 'app.exe')) === 'absent');
+
+    // Cross-file invariant: the deployer's name and the loader's name are two
+    // spellings of one contract. Skia's archive reads the literal `icudtl.dat`, so
+    // if the glue stops defining SkLoadICU the prebuilt loader takes over and the
+    // renamed file is simply never read -- a silent revert with the same symptom
+    // the rename exists to prevent.
+    const glue = readFileSync(join(root, 'vendor', 'skia_text_glue.cc'), 'utf8');
+    check('the glue defines SkLoadICU itself (prebuilt loader never linked)',
+      /^bool SkLoadICU\(\)/m.test(glue));
+    // The glue spells the name as a WIDE literal with a leading backslash, so the
+    // needle has to be built: `'\\'` is one backslash in JS, `'\\\\'` is two.
+    const wideName = 'L"\\\\' + ICU_DATA_NAME + '"';
+    const wideFallback = 'L"\\\\icudtl.dat"';
+    check('the glue reads the same file name the build deploys',
+      glue.includes(wideName));
+    check('the glue keeps the shared name only as a fallback',
+      glue.includes(wideFallback) && glue.indexOf(wideName) < glue.indexOf(wideFallback));
 
     rmSync(dir, { recursive: true, force: true });
   } finally {
