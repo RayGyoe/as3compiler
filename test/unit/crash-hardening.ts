@@ -236,7 +236,30 @@ function checkCrashHardening(): string[] {
     glue.includes('const char* force = std::getenv("ASC_FORCE_CXX_OOM");') &&
     rt.includes('getenv("ASC_FORCE_CXX_OOM")'));
 
+  // ---- 6. an OOM report must say where the address space went (阶段三百一十二) --
+  // The GC figures answer "are the free lists shredded"; they do not answer "is
+  // there a hole big enough in the process". A 32-bit run that died on an 8.29 MB
+  // carve printed "23.6 MB free", which reads like fragmentation and was actually
+  // address-space exhaustion. The missing half is the region walk plus the process
+  // commit/peak, and it must be reachable from BOTH raise paths.
+  check('the address-space report exists and runs before every #1000 raise',
+    rt.includes('static void as_oom_addrspace_report(void) {') &&
+    rt.split('as_oom_addrspace_report();').length - 1 === 2);
+  check('...with the free-region walk compiled out of a 64-bit build (128 TB of noise)',
+    /#if !defined\(_WIN64\)[\s\S]{0,900}?VirtualQuery\(p, &mbi, sizeof\(mbi\)\)/.test(rt) &&
+    rt.includes('#if defined(_WIN64)') &&
+    rt.includes('"[as3-aot] process: ws=%.0f MB commit=%.0f MB peak=%.0f MB'));
+  check('...reporting the largest single free region, which is what a big request needs',
+    rt.includes('if (sz > free_largest) free_largest = sz;') &&
+    rt.includes('largest region %.1f MB'));
+  check('...and the process commit/peak, so "address space" and "RAM" are told apart',
+    rt.includes('pmc.PagefileUsage') && rt.includes('pmc.PeakPagefileUsage'));
+  check('the definition precedes its callers (no implicit declaration)',
+    rt.indexOf('static void as_oom_addrspace_report(void) {') <
+    rt.indexOf('as_oom_addrspace_report();'));
+
   if (ok > 0) console.log(`[crash] ${ok} crash-hardening checks passed`);
+
   return bad;
 }
 registerGroup('unit: crash/hardening', checkCrashHardening);

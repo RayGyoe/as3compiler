@@ -745,6 +745,30 @@ export function linkTrimFlags(cfg: BuildConfig): string[] {
   return flags;
 }
 
+// 32-bit Windows builds opt into the 4 GB user address space
+// (`/LARGEADDRESSAWARE`). This is the same choice AIR itself makes, not a
+// micro-optimisation: the AIRSDK 51.4.1 `adl.exe` is x86 *with* the LAA bit set,
+// and so is the Chromium `libcef.dll` such a program usually embeds. Without the
+// bit a 32-bit process gets 2 GB of user address space no matter how much RAM the
+// machine has, and "out of memory" then arrives as a failed `malloc` while the
+// AS3 heap is still small.
+//
+// Measured on the TalkMED client (7 ANEs incl. CEF/RTC, D3D12 + Skia): it died at
+// `malloc failed for 8294416 bytes (gc heap 83.0 MB in 276 segments, 23.6 MB free,
+// arena 0.0 MB)` -- 8294416 is exactly one 1920x1080 RGBA frame plus the GC
+// header, and 83 MB is the whole AS3 heap. lld-link sets the bit only on request:
+// the PE characteristics word of the produced exe read 0x0102 (no 0x0020) before
+// this existed, i.e. a hard 2 GB ceiling for a program that maps CEF, D3D12 and
+// the Skia GPU backend.
+//
+// Link-only, and 32-bit-only: a compile step has no use for it, and x86_64 /
+// arm64 images are large-address-aware by definition.
+export function windowsLinkFlags(cfg: BuildConfig): string[] {
+  if (process.platform !== 'win32' || cfg.target !== 'native') return [];
+  if (cfg.architecture !== '32') return [];
+  return ['-Wl,/LARGEADDRESSAWARE'];
+}
+
 // Export ONE symbol into the executable's DYNAMIC symbol table, so that
 // dlsym(RTLD_DEFAULT, "sk_mtl_shared_queue") finds it at runtime (阶段二百八十八).
 //
@@ -1447,8 +1471,10 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
       ...fpFlags(cfg),
       ...debugInfoFlags(cfg),
       ...linkTrimFlags(cfg),
-      ...exportDynamicFlags(cfg)
+      ...exportDynamicFlags(cfg),
+      ...windowsLinkFlags(cfg)
     );
+
     for (const l of posixLinkLibs()) args.push(l);
     for (const l of platformLinkLibs()) args.push('-l', l);
     args.push('-o', outPath);
@@ -1665,7 +1691,9 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
     ...debugInfoFlags(cfg),
     ...linkTrimFlags(cfg),
     ...exportDynamicFlags(cfg),
+    ...windowsLinkFlags(cfg),
     '-o',
+
     outPath,
   ];
   for (const f of cfg.cFlags) linkArgs.push(f);

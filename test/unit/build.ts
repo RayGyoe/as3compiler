@@ -10,7 +10,7 @@ import { join, dirname, resolve, sep, basename, delimiter } from 'node:path';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
 import type { GpuBackend } from '../../src/air-app.ts';
@@ -3096,6 +3096,64 @@ function checkExportDynamic(): string[] {
 }
 
 registerGroup('unit: build/ExportDynamic', checkExportDynamic);
+
+// ---- 32-bit Windows builds and the 4 GB address space (阶段三百一十二) ------------
+// A 32-bit process that does not set the LAA bit gets 2 GB of user address space,
+// which is what the TalkMED client hit: it died at
+// `malloc failed for 8294416 bytes (gc heap 83.0 MB in 276 segments, 23.6 MB free,
+// arena 0.0 MB)` -- one 1920x1080 RGBA frame against an AS3 heap under 100 MB.
+// The flag is a LINK-only decision, it must reach BOTH native link paths, and it
+// must not leak onto 64-bit/arm64 images (LAA by definition) or onto a compile step
+// (where clang would report an unused link argument).
+//
+// AIR itself sets it: the AIRSDK 51.4.1 adl.exe and the Chromium libcef.dll such a
+// program embeds are both x86 WITH 0x0020. Host-independent in shape -- off win32
+// the contract is "empty, always", which this checks too.
+function checkWindowsLinkFlags(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [laa] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [laa] ${label}`); }
+  };
+  const cfg = (over: Partial<BuildConfig> = {}): BuildConfig =>
+    ({ ...defaultBuildConfig(), target: 'native', architecture: '32', ...over });
+
+  const onWin = process.platform === 'win32';
+  check('a 32-bit native build asks for it on win32, and off win32 the list is empty',
+    JSON.stringify(windowsLinkFlags(cfg())) === JSON.stringify(onWin ? ['-Wl,/LARGEADDRESSAWARE'] : []));
+  check('64-bit and arm64 images never ask (they are LAA by definition)',
+    JSON.stringify(windowsLinkFlags(cfg({ architecture: '64' }))) === JSON.stringify([]) &&
+    JSON.stringify(windowsLinkFlags(cfg({ architecture: 'arm64' }))) === JSON.stringify([]));
+  check('wasm never asks (there is no PE header to set a bit on)',
+    JSON.stringify(windowsLinkFlags(cfg({ target: 'wasm' }))) === JSON.stringify([]));
+  // The compile steps must stay untouched: that is the difference between "the
+  // linker got a bit" and "every TU printed a warning".
+  check('no compile step carries it',
+    JSON.stringify(buildCompileSteps(cfg(), 'a.c', 'a.exe').slice(0, -1))
+      .indexOf('LARGEADDRESSAWARE') === -1);
+  check('both native link paths carry it',
+    (() => {
+      const one = buildCompileCommand(cfg(), 'a.c', 'a.exe');
+      const steps = buildCompileSteps(cfg(), 'a.c', 'a.exe');
+      const many = steps[steps.length - 1];
+      const has = (a: string[]): boolean => a.some((x) => x.includes('LARGEADDRESSAWARE'));
+      return onWin ? (has(one) && has(many)) : (!has(one) && !has(many));
+    })());
+  check('the flag precedes the -o it modifies',
+    (() => {
+      if (!onWin) return true;
+      const a = buildCompileCommand(cfg(), 'a.c', 'a.exe');
+      const i = a.findIndex((x) => x.includes('LARGEADDRESSAWARE'));
+      const o = a.indexOf('-o');
+      return i >= 0 && o > i;
+    })());
+
+  if (ok > 0) console.log(`[laa] ${ok} window link-flag checks passed`);
+  return bad;
+}
+
+registerGroup('unit: build/WindowsLAA', checkWindowsLinkFlags);
 
 // ---- per-config object paths (阶段二百二十三) ----------------------------------
 // Two faces of one defect. The first is silent: two builds that disagree on a flag

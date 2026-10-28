@@ -843,7 +843,66 @@ static _Noreturn void as_throw(void* e);
 // Raise Error #1000 the way AIR does (avmplus kOutOfMemoryError): a catchable
 // Error, never a fault, and never exit() while an Error can still be raised. The
 // one process-wide guard keeps a failed raise from recursing back into itself.
+// Where did the address space go? The GC figures in the messages below answer
+// "are the free lists shredded"; this answers "is there room in the process at
+// all". They are different failures with different fixes, and the report used to
+// carry only the first half: a 32-bit run that died on an 8.29 MB carve printed
+// "23.6 MB free", which reads like fragmentation but was address-space
+// exhaustion -- those 23.6 MB sat inside existing 64 KiB / 1 MiB segments, and
+// the fresh 8.29 MB carve had nowhere in the process to land.
+//
+// largest is the number that matters: a request bigger than it cannot be served
+// however much total free space exists. On a 32-bit image that is also where a
+// missing LARGEADDRESSAWARE bit shows up as a hard 2 GB ceiling (see
+// windowsLinkFlags in build.ts).
+static void as_oom_addrspace_report(void) {
+#if defined(_WIN32)
+    // The region walk only says something where the address space is actually
+    // bounded. In a 64-bit process the "free" total is dominated by the 128 TB
+    // reserved-but-untouched range and reads as nonsense, so it is compiled out
+    // there and the process figures carry the message alone.
+    size_t free_total = 0, free_largest = 0, reserved = 0, committed = 0;
+#if !defined(_WIN64)
+    MEMORY_BASIC_INFORMATION mbi;
+    char* p = NULL;
+    while (VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        size_t sz = (size_t)mbi.RegionSize;
+        if (mbi.State == MEM_FREE) {
+            free_total += sz;
+            if (sz > free_largest) free_largest = sz;
+        } else {
+            reserved += sz;
+            if (mbi.State == MEM_COMMIT) committed += sz;
+        }
+        char* next = (char*)mbi.BaseAddress + sz;
+        if (next <= p) break;   /* never loop on a wrapped pointer */
+        p = next;
+    }
+#endif
+    PROCESS_MEMORY_COUNTERS pmc;
+    double ws = 0.0, commit_mb = 0.0, peak_mb = 0.0;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        ws = (double)pmc.WorkingSetSize / 1048576.0;
+        commit_mb = (double)pmc.PagefileUsage / 1048576.0;
+        peak_mb = (double)pmc.PeakPagefileUsage / 1048576.0;
+    }
+#if defined(_WIN64)
+    fprintf(stderr, "[as3-aot] process: ws=%.0f MB commit=%.0f MB peak=%.0f MB\\n",
+            ws, commit_mb, peak_mb);
+#else
+    fprintf(stderr, "[as3-aot] address space: %.0f MB free (largest region %.1f MB), "
+                    "%.0f MB reserved of which %.0f MB committed"
+                    " | process ws=%.0f MB commit=%.0f MB peak=%.0f MB\\n",
+            (double)free_total / 1048576.0, (double)free_largest / 1048576.0,
+            (double)reserved / 1048576.0, (double)committed / 1048576.0,
+            ws, commit_mb, peak_mb);
+#endif
+    fflush(stderr);
+#endif
+}
+
 static _Noreturn void as_oom_raise(void) {
+
     if (!as_oom_active) {
         as_oom_active = 1;
         as_throw(as_error_new_oom("Error #1000: The system is out of memory.", 1000));
@@ -868,6 +927,7 @@ static _Noreturn void as_gc_oom(size_t need) {
             (unsigned long)need, (double)seg_total / 1048576.0, seg_n,
             (double)seg_free / 1048576.0, (double)as_heap_bytes / 1048576.0);
     fflush(stderr);
+    as_oom_addrspace_report();
     as_oom_raise();
 }
 
@@ -921,6 +981,7 @@ static int as_oom_from_cxx(size_t need) {
             (unsigned long)need, (double)seg_total / 1048576.0, seg_n,
             (double)seg_free / 1048576.0, (double)as_heap_bytes / 1048576.0);
     fflush(stderr);
+    as_oom_addrspace_report();
     as_oom_raise();
     return 0;  // unreachable: as_oom_raise never returns
 }
