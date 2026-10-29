@@ -17456,7 +17456,67 @@ Windows 本机实跑覆盖。
 > `sh examples/ane/build-ane.sh` 重编（一次编译装两棵树）后两项转绿 —— 说明那两项红与 `src/` 无关。
 
 
+### 阶段三百一十五：渲染器每帧成本的三处实错（`alpha` 折叠 / `getenv` 出内循环 / 单图元不烘）（v0.4.275 → v0.4.276）
+
+背景：阶段三百一十四把库层的三处实错修完后，用户的原话「AOT 比 AIR 还卡」在**聊天面板**这一路上仍然成立。
+夹具 `output/perf/chat/`（同一份 `.as` 分别 `mxmlc`+`adl` 与 `as3compiler`，进程 CPU/帧为口径）量到的斜率是
+**AOT 20.0 µs/项/帧 vs AIR 2.9**，交叉点 ≈46 项；N=384 时 8.50 ms vs 2.71 ms（3.1×）。本阶段把它拆到具体语句，
+修了三处、每处都有同机配对 A/B 与像素 oracle：
+
+- **实错一（主因，占 3/4）：`alpha < 1` 的每个对象都开一次离屏 layer。**
+  `as_render_object` 对 `o->alpha < 1.0` 一律 `saveLayerAlpha`；AIR 没有对象级 alpha layer，它把 alpha **乘进画笔**。
+  真实源码 `ChatItemRenderers.as:53` 每条聊天记录都是 `shape.alpha = 0.1`（一个 `drawRect`），于是每条记录付一次
+  离屏 pass。实测**成本与面积无关**（340×56 与 34×56 都 ≈14.5 µs/项），只与 `alpha<1` 有关 ⇒ 是 per-layer 成本，
+  不是填充成本；不透明同形只要 2.0 µs。
+  修法：`as_single_primitive()`（子树只画 1 个图元、无 filters/mask/`opaqueBackground`、非 `TextField`）时
+  把 alpha 折进画笔（`sk_canvas_draw_{path,rect,image_rect}_mul`，对 paint **栈拷贝**乘 alpha，不污染 Graphics
+  共享 paint），否则仍走 layer。
+- **实错二（意外的大头）：调试开关的 `getenv()` 在每对象每帧的路径上。**
+  `as_render_fp` 的自动烘烤闸门里写着 `getenv("ASC_NO_AUTO_BAKE")`、`getenv("ASC_BAKE_TRACE")`；`getenv` 是
+  整个环境块的线性扫描（本机约 1.9 µs/次），而这一行每帧每个对象都要走。192 项的夹具里这是 **2.60 → 0.996 ms/帧**
+  （同一场景、同一批绘制、同一批烘烤决定，唯一差别就是把它提到静态量里）。这一条对**所有** AOT 应用生效，
+  与聊天面板无关。
+- **实错三：单图元节点也在自动烘烤。**
+  烘烤把 N 次绘制换成 1 次 blit，N == 1 只能亏；而 GPU 画布上贴一张 CPU-raster 快照比直接画图元贵得多。
+  实测 `panel_bmp_192`（192 行 = Sprite 包一张 Bitmap）**2.92 → 0.93 ms/帧**。闸门改为要求 `as_draw_count(o) > 1`
+  （每个对象额外一次递归计数，深度与显示树同阶）；**显式 `cacheAsBitmap` 仍然照烘**——那是应用自己要的。
+- **像素 oracle（不能跳的一步）**：`temp/alphafold/`（adl 与 AOT 同源码，`BitmapData.draw` 整棵树后逐点取样）。
+  它立刻抓到折叠引入的**取整差**：`setAlphaf(0.5)` 让 Skia 四舍五入成 128，而 AIR 的 8 位覆盖度是**截断**的 127 ⇒
+  所有半透明填充比 `adl` 亮一档（`ff800000` vs `ff7f0000`，`0.5×0.5` 嵌套是 `0x40` vs `0x3f`）。折叠前先量化成
+  `(int)(mul*255)/255`，10 个采样点 + 整帧加权和中 **9 点逐位相同、1 点不同**：容器里 **2 个重叠图元**时我们开
+  layer 隔离、AIR 逐图元混合（`ff7f7f00` vs `ff7f7f3f`）——这是**既存**分歧、与本阶段无关，已入遗留表。
+- **验收（同机配对，3 reps，进程 CPU/帧）**：
+
+  | 模式 | 改前 AOT | 改后 AOT | AIR | 改后 AOT/AIR |
+  |---|---|---|---|---|
+  | `panel_12` | 0.91 | 0.810 | 1.418 | 0.57 |
+  | `panel_96` | 2.75 | 0.955 | 1.649 | 0.58 |
+  | `panel_192` | 4.54 | 1.331 | 2.036 | 0.65 |
+  | `panel_384` | 8.50 | 1.736 | 2.302 | 0.75 |
+  | `panel_bmp_192` | 3.13 | 0.955 | 1.505 | 0.63 |
+  | `panel_shape_192` | 3.33 | 1.184 | 1.505 | 0.79 |
+  | `panel_text_192` | 3.99 | 1.271 | 1.806 | 0.70 |
+  | `panel_scroll_96` | 2.78 | 1.013 | 7.018 | 0.14 |
+
+  斜率 `(panel_384 − panel_empty_192)/384`：**AOT 2.56 µs/项 vs AIR 1.85**（改前 20.0 vs 2.9，6.9×），
+  且 AOT 的固定成本比 AIR 低 (0.75 vs 1.59 ms)，**交叉点从 ≈46 项推到 >1100 项**——即真实规模下不再输。
+  逐项对照仍留一条：`static`（无列表）AOT 0.579 vs AIR 0.058 ms/帧，即 AOT 的空场景底线高 **10×**，
+  已入遗留表（本轮不动，动它是另一种风险）。
+- **钉子**：`unit: render/AlphaFold`（16 条：谓词排除项、layer 与折叠共用同一条件、两条烘烤路径都把
+  `ASC_alpha_mul` 复位成 1.0 再恢复、三个 wrapper 的分派、glue 里 paint 是**拷贝**且量化到 8 位）；
+  另外把两条既有钉子改成新形状并**保留原意**：`unit: render/AlphaLayerBalance`（layer 现在只在「非单图元」时开）
+  与 `unit: emit/BitmapSmoothing`（wrapper 不再是单行，改为钉签名 + 保留的调用）。
+  全量 `node --test test/unit/*.ts`：**278 项 / 275 pass / 3 fail**，3 红全是 `unit: inline/*` 的
+  `cc -O2 -S` 探针卡在本机 `zlib.h` 缺失（与本轮无关，见阶段三百一十四同一条）。
+- **如实报明**：本轮**没有**修的两条（都已入表）：① 容器里 ≥2 个重叠图元时的 alpha 合成口径与 AIR 不同；
+  ② AOT 的每帧固定成本（`static` 场景 0.579 vs AIR 0.058）。另外本阶段做过的 `ASC_RPROF` 微秒探针
+  **已从代码里撤掉**：它给出的绝对值与进程 CPU 时间对不上（比值 ≈4×，原因未定位，只可用于相对比较），
+  一个读数不可信的探针留在预置代码里只会误导下一个人；本轮的分段结论全部来自「改一处、重测一次」的
+  同机配对 A/B。
+
+
 ### 遗留待开发
+> **2026-10-29 追加（阶段三百一十五：渲染器三处每帧实错）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**110 → 112 行**（`未开始` **86 → 88**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。上一轮 note（阶段三百一十四）标 110 行，按 `254cb13` 实测也是 **110 行**，本轮 110 + 2 = **112** 与实测一致。**新登记 2 行**：① 容器里 ≥2 个重叠图元且 `alpha<1` 时，我们的 layer 隔离口径与 AIR 的逐图元乘 alpha 不同（`temp/alphafold` 的 B1 采样点 `ff7f7f00` vs `ff7f7f3f`）——与本阶段修的折叠**无关**，折叠前就是这个值；② AOT 的每帧固定成本 `static` 场景 **0.579 vs 0.058 ms**（10×），属**我方性能缺口**而非保真差，本阶段只修了「每项成本」那一半。**本阶段修净的三处不占表**（alpha 折叠 / `getenv` 出内循环 / 单图元不自动烘）：都是「AIR 做对了、我们做错/多做」的实错，按 §1.5 同阶段落地。
 > **2026-10-28 追加（阶段三百一十四：库层三处性能/语义实错；rebase 后由「三百零六」改号）**：**新登记 7 行 / 改写 1 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**103 → 110 行**（`未开始` **79 → 86**，`未开始 / **D43b**` 1 行未变 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**仍报同一处口径差**：上一轮 note（阶段三百零九）标 `未开始` **82**，而按 `1c1914c` 实测是 **79 行 `未开始` + 1 行 `未开始/**D43b**` = 80**——**增量无争议，绝对标签差 2**，本轮继续按实测行数记账。**改号说明**：本节原记「阶段三百零六」；rebase 到 `origin/main`（`1c1914c`）时 三百零六～三百零八（一键发布打包）、三百零九（原生窗口句柄）、三百一十（`aot-icudtl.dat`）已占用，提交标题里的 三百一十二 / 三百一十三 也已用掉，故本轮顺延为 **三百一十四**、版本 **v0.4.274 → v0.4.275**；节内「基线」指改动落库前的 `b25cd00`，合并后另按新 base 复跑过门禁（见该节验收）。**本阶段修净的三处不占表**（插入排序核心、`Number`→字符串线性试精度、值类一元转型被打成构造函数）：都是 `adl` 跑得对、我们此前跑不出，按 §1.5 属遗留缺陷但同阶段落地。**改写 1 行**＝给 `gc_find_block()` 那行补上 2026-10-29 的复算证据（AOT 臂在 `pt_4000` 就被看门狗判死、同 exe 换 base 形状不变、adl 同相位 0 hang）。**新登记 7 行**全部是同两台差分门禁（`SemCheck` 72 行 + `RTProbe` 32 行）**量出来、但不在本轮批准范围内修**的真分歧：① `Array.sort(flag)` 忽略全部位标志；② 动态接收者的 `Number.toString()`/`toFixed()` 返 `null`；③ 定长小数 17 位上限弄断 round-trip；④ `toFixed` 的 `.5` 舍入方向；⑤ 极值 `String()` 表示（含两例 **AIR 自身 round-trip 失败**）；⑥ 排序边角语义（稀疏槽 `in` / `sortOn(null)` / 比较器返 `NaN`）；⑦ **`gc_find_block()` 首次适配线性扫描**——它是**我方性能缺口**而不是 `adl` 保真差（`adl` 没有对应「块选择」可见面），但与表内「`Vector` 逐元素守卫」同行同族：本表是本仓唯一保留「已量测、未修」的地方，而 4.6 s 长帧 + `gcshare=0.1%` + 三段因果实验（0.037→0.548 µs/次）需要一个不会被下次重推一遍的落点。**刻意不入表的一条**：并列项次序（`big500` 稳定性违例 AIR 259 / AOT 0）——AIR 自己不稳定，复刻它等于故意实现不定序 bug，详见该阶段节。
 > **2026-10-28 追加（阶段三百零九：`FREAcquire|ReleaseNativeWindowHandle` 落地）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **102 → 103 项**（`未开始` **81 → 82**）。D 面的状态变化（11 → 9 个延后）记在 [`docs/zh-cn/ane.md`](docs/zh-cn/ane.md) §2 / §3.8，不占本表 —— 落地的那一对按表头「已完成项一经落地即从本表移出」本就不该在表里。**新登记的 1 行**是同轮量到的时序差异（初始窗口晚于文档类构造器）：它已**响亮自报**、不是静默 null，但不在本阶段修。
 > **2026-10-27 追加（阶段三百：阶段二百九十八 / 二百九十九 的 Windows 补测）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，本表 **101 → 102 项**（`未开始` **80 → 81**）。这两批的行为原先全在 macOS 的 `adl` 上量，而 `File` 家族几乎每个成员都碰宿主路径规则；在 Windows 10 + `adl 51.4.1` 上补测（探针 `temp/winfile/adl/`、读数 `adl-win{,2,3}.txt`）分出**六处宿主分叉 + 两处 Windows 独有**，全部**本轮修净**（按表头「已完成项一经落地即从本表移出」故不入表）：`cacheDirectory` 是 `%TEMP%` 而非 `%LOCALAPPDATA%\Caches`；盘符相对路径 `C:foo` 原样保留 + 补分隔符（旧解析得到**绝对**路径 `C:\foo`，是另一个文件）；`parent` 的根保留自己的分隔符（`C:\a` ⇒ `C:\`、`\a` ⇒ `\`）；`getRelativePath` 用正斜杠、跨盘 `null`；同一文件判定改走大小写不敏感的 `as_path_under`（旧的 `strcmp` 会把只有大小写差异的目标当「另一个文件」，覆盖分支先 `DELETE` 掉**源**再复制 ⇒ `#3003` 且文件已毁）；`FileStream` 偏移全改 64 位、`APPEND` 打开即 EOF。两处 Windows 独有：删掉仍被 `FileStream` 打开的文件在 Windows 上必然失败（`adl` 同样报错 ⇒ 是我们示例没 `close()`，已修）、`getRootDirectories()` 交出 8 个 `File` 而非 `StorageVolume`。另有**三处编译阻断**只有 Windows 宿主才撞到（`S_ISREG` 未定义、`_chsize_s` 未声明、`getcwd` 在 MSVC 的 `<direct.h>` 之外），同轮补齐。**新登记的 1 行**是剩余**验证欠账**：`examples/file-ops.as` 的断言写死了 `/tmp`（14 处）与「反斜杠是合法文件名字节」，而它与 `file-symlink.as`/`file-listing-async.as` 都要软链夹具 —— 本机账号建软链报 `EPERM`，三例一直 `SKIP`，Windows 侧只有 `adl` 探针读数、没有示例级回归。钉子在 `test/unit/file-stream.ts` 的 `unit: file-stream/windows`（19 钉）+ 既有的 `file-url`/`file-ops` 组；口径写在 `docs/zh-cn/filesystem.md` §11.6（对照 `docs/en/filesystem.md` §11.6）。
@@ -17740,6 +17800,8 @@ Windows 本机实跑覆盖。
 | **`File` 家族的原生对话框与卷粒度查询仍缺**：`FileReference.browse`/`load`/`save`/`download`/`upload`、`FileReferenceList.browse`、`File.browseFor*` 只报明（`as_shell_unsupported`，返回 `false`）；两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)` 未落地 | 未开始（2026-10-27 阶段二百九十九：C 批把四个**类**与它们的成员面补齐了，剩下的全是**后端**活） | 类与成员现在都在（`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent`，`FileFilter` 三个字段，`File` 的 14 方法/8 属性/5 static 常量/`getRootDirectories`），**读的语义也按 `adl` 实测**（见阶段二百九十九）。缺的只有两件：① 平台对话框（macOS `NSOpenPanel`/`NSSavePanel`，Windows `IFileOpenDialog`）——没有它，`fileList`/`data`/`name` 这些「选择结果」字段永远为空，所以 `browse()` **报明后返回 `false`**，绝不假装用户点了「取消」；② 卷枚举（`statfs`/`GetDiskFreeSpaceExA`）——`StorageVolume` 的构造器与六个 getter 已按实测实现，但目前只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查 | 两条都是后端活，且都要在真机上验证（Windows 分支本机无环境）。做对话框时应顺手把 `File.browseForOpenMultiple` 的 `FileListEvent` 派发接上——类与事件已完成，只差调用点 |
 | **`examples/file-ops.as` 的路径断言是 POSIX 形态**（`/tmp` 字面量 22 处、「反斜杠是合法文件名字节」），`file-symlink.as` / `file-listing-async.as` 亦未在 Windows 实跑 | 未开始（2026-10-27 阶段三百：这三例都要软链夹具，而本机账号建软链报 `EPERM` ⇒ 一直在 `test/examples.ts` 里 `SKIP`，Windows 侧只有 `adl` 探针读数） | 两端 | 待排期（要一台开了 Developer Mode 的 Windows） |
 | **初始窗口的创建晚于文档类构造器**（`FREAcquireNativeWindowHandle(stage.nativeWindow)` 在文档类构造器里得到 `FRE_ILLEGAL_STATE`；`adl` 先建窗再跑构造器，那边拿得到 HWND。**已响亮自报，不是静默 null**；未在 `adl` 上实测这条 FRE 调用——需要把夹具重编回 AIR 版） | 未开始（2026-10-28 阶段三百零九 发现） | 根因是既有取舍：`Stage.showWindow` 在文档类之后建窗，构造器里写的 bounds/title 延后由它生效（`src/emit.ts` 的 `Stage_get_nativeWindow` 上方注释记录了这条约定） | 把初始窗口的创建挪到文档类之前，并重定「构造器里写的窗口属性由谁生效」；改窗口创建时序会波及窗口事件面，需独立阶段 |
+| **`alpha < 1` 且子树画 ≥2 个重叠图元时，我们开 layer 隔离、AIR 逐图元乘 alpha** | 未开始（2026-10-29 阶段三百一十五 的像素 oracle 量到；本阶段只把「只画 1 个图元」这一类改成折叠，容器这一类原样保留 layer） | `temp/alphafold/` 同一份 `.as` 分别 `adl` 与 AOT，`BitmapData.draw` 整棵树后逐点取样：一个 `alpha=0.5` 的 Sprite 里两个**重叠不透明矩形**，重叠点 AIR `ff7f7f3f`、我们 `ff7f7f00`——AIR 把 0.5 乘到每个元素上（蓝 127→黄叠上去留 63），我们把子树先合成再整体乘（黄不透明 ⇒ 蓝 0）。**9/10 采样点逐位相同**，这一条是唯一分歧，且**折叠前就是这个值**（与本阶段改动无关）。同一夹具里两条已对齐的分支正是本阶段修的：单图元 `alpha=0.5`（`ff7f0000`）与 `0.5×0.5` 嵌套（`ff3f3f3f`）改前分别是 `ff800000`/`ff404040` | 把对象级 layer 整体换成「逐图元乘 alpha」需要覆盖全部绘制入口（目前只有 `draw_path`/`draw_rect`/`draw_image_rect` 三个穿越 `_mul`，`draw_circle`、九宫格 `draw_image_src_rect`、文本、Stage3D 的 `draw_bgra`/`gl_draw_texture` 都还没有），漏一个就是整块不透明 ⇒ 先补齐入口并给每个入口补 oracle 采样点，再一次性切换；切换后本行可移出
+| **AOT 的每帧固定成本高于 AIR 10×**（`static` 场景 0.579 vs 0.058 ms/帧） | 未开始（2026-10-29 阶段三百一十五 量到；本阶段修的是「每项成本」，没有动固定成本） | 夹具 `static`（一个 FPS 文本 + 一张位图，**没有列表**）：AOT **0.579**、AIR **0.058 ms/帧**（3 reps，进程 CPU/帧）。同一份数据里 AOT 的**列表斜率已经反超**（2.56 vs 1.85 µs/项），所以固定成本是现在唯一还落后的量：384 项时的总差 0.5 ms 里，固定成本与斜率各占约一半。候选来源（**未拆**）：`as_render_fp` 整树哈希、窗口 pass 的若干 per-frame 准备、`ASC_pass`/`ASC_frame` 探针的残留检查 | 先给固定成本加分段探针（把 `as_render_fp` 单独关掉一次、把窗口 pass 的每帧准备工作分段计时），定位到具体语句后再改；`ASC_RPROF` 现有绝对值不可信（与进程 CPU 比值 ≈4×，原因未定位），只能做相对比较
 
 
 

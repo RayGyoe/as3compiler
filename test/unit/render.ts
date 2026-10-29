@@ -1551,12 +1551,23 @@ function checkAlphaLayerBalance(): string[] {
   const opens = body.match(/as_skia_canvas_save(?:_layer_\w+)?\(/g) ?? [];
   const closes = body.match(/as_skia_canvas_restore\(/g) ?? [];
   check('the object-level alpha layer is opened conditionally',
-    body.includes('if (o->alpha < 1.0) as_skia_canvas_save_layer_alpha(canvas, o->alpha);'));
+    body.includes('else if (alpha_on) as_skia_canvas_save_layer_alpha(canvas, o->alpha);'));
   check('...and its condition is remembered for the restore',
     body.includes('int alpha_on = (o->alpha < 1.0);'));
-  check('...and the layer is popped again', body.includes('if (alpha_on) as_skia_canvas_restore(canvas);'));
+  // 阶段三百一十五: a single-primitive object folds its alpha into the paint
+  // instead of opening a layer (see as_single_primitive). The fold must be decided
+  // from the SAME condition that gates the layer, and its multiplier must be
+  // restored on the same path that restores the canvas -- otherwise the next
+  // sibling inherits the dimming, which is the 阶段二百一十四 bug in a new dress.
+  check('...folded into the paint when the object draws exactly one primitive',
+    body.includes('int alpha_fold = (alpha_on && as_single_primitive(o));')
+    && body.includes('if (alpha_fold) ASC_alpha_mul = keep_alpha_mul * o->alpha;'));
+  check('...and the fold multiplier is saved and restored around the object',
+    body.includes('double keep_alpha_mul = ASC_alpha_mul;')
+    && body.indexOf('ASC_alpha_mul = keep_alpha_mul;') > body.indexOf('if (alpha_on && !alpha_fold) as_skia_canvas_restore(canvas);'));
+  check('...and the layer is popped again', body.includes('if (alpha_on && !alpha_fold) as_skia_canvas_restore(canvas);'));
   const blendPop = body.indexOf('if (blend_on) as_skia_canvas_restore(canvas);');
-  const alphaPop = body.indexOf('if (alpha_on) as_skia_canvas_restore(canvas);');
+  const alphaPop = body.indexOf('if (alpha_on && !alpha_fold) as_skia_canvas_restore(canvas);');
   check('...in reverse order, after blend/colour-transform/scrollRect',
     blendPop >= 0 && alphaPop > blendPop);
   check('...but before the last unconditional restore that closes the object',
@@ -1707,6 +1718,94 @@ registerGroup('unit: render/AirAppFonts', checkAirAppFonts);
 registerGroup('unit: render/SkiaAbi', checkSkiaAbi);
 registerGroup('unit: render/FrameCanvasHygiene', checkFrameCanvasHygiene);
 registerGroup('unit: render/AlphaLayerBalance', checkAlphaLayerBalance);
+
+// ---- 阶段三百一十五: a single-primitive object folds its alpha into the paint ----
+//
+// AIR has no alpha LAYER at the display-object level: it multiplies the alpha into
+// each paint, so a translucent row costs one extra blend there and one offscreen
+// surface here. Measured on the meeting client's chat list (output/perf/chat, 192
+// rows on the same machine, process CPU per frame): 14.5 us per translucent Shape
+// with the layer, 2.0 us once folded -- and the frame slope fell from 20.0 to
+// 8.1 us per row, which is the whole regression this stage is about.
+//
+// The fold is only legal where the subtree paints exactly ONE primitive: with two
+// overlapping primitives a layer isolates the group from the backdrop while
+// per-paint alpha double-blends the overlap. temp/alphafold/ is the pixel oracle
+// for both branches (adl vs AOT, sampled through BitmapData.draw); these checks
+// pin the C shape that makes that oracle reachable.
+function checkAlphaFold(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [alphafold] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [alphafold] ${label}`); }
+  };
+  const c = generateC(parse('var n:int = 1;\n')).c;
+  const pre = RUNTIME_PREAMBLE;
+  const glue = readGlue();
+
+  // 1. What qualifies. Every exclusion below was found the hard way: a mask has no
+  //    pixels of its own, a filter needs the isolated layer it composites through,
+  //    opaqueBackground already paints an opaque rect behind the content, and a
+  //    TextField draws one primitive per glyph run (overlapping AA coverage).
+  const at = c.indexOf('static int as_draw_count(DisplayObject* o) {');
+  const fn = at < 0 ? '' : c.slice(at, c.indexOf('\n}', at));
+  check('the fold predicate is emitted',
+    at >= 0 && c.includes('static int as_single_primitive(DisplayObject* o) { return as_draw_count(o) == 1; }'));
+  check('...and refuses masks, filters and opaqueBackground',
+    fn.includes('o->_mask_object') && fn.includes('o->filters != NULL') && fn.includes('as_v_is_number(o->opaqueBackground)'));
+  check('...and counts a Bitmap with a real image as ONE primitive',
+    fn.includes('&Bitmap_vt') && fn.includes('as_bmd_visible_image'));
+  check('...and counts the whole SUBTREE: own Graphics draws plus every child, capped at 2',
+    fn.includes('as_graphics_of(o)')
+    && fn.includes('n += as_draw_count((DisplayObject*)as_v_obj_val(c->children->data[i]));')
+    && fn.includes('return n > 1 ? 2 : n;'));
+  check('...and never folds a TextField (counted as 2)',
+    fn.includes('if (as_is((void*)o, &TextField_vt)) return 2;'));
+  check('...and assumes an unknown leaf paints through a path the fold cannot reach',
+    fn.includes('if (!as_is((void*)o, &Shape_vt) && !as_is((void*)o, &Sprite_vt)) return 2;'));
+
+  // 2. The renderer wires it to the SAME condition as the layer (see the
+  //    AlphaLayerBalance pins) and restores the multiplier on that path.
+  check('the renderer saves the incoming multiplier before deciding',
+    c.includes('double keep_alpha_mul = ASC_alpha_mul;') && c.includes('int alpha_fold = (alpha_on && as_single_primitive(o));'));
+
+  // 3. A bake snapshot must hold UNFOLDED content: the object's own alpha is
+  //    applied once, on the blit of the snapshot (or on its paints, when the bake
+  //    is skipped). Resetting it inside the bake is what keeps alpha from being
+  //    applied twice -- a baked 0.5 object with 0.5 folded into its content came
+  //    out at 0.25.
+  const bakeResets = (c.match(/ASC_alpha_mul = 1\.0;/g) ?? []).length;
+  check('both bake passes reset the multiplier to 1 (image-rect bake + nine-slice bake)',
+    bakeResets >= 2 && c.includes('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y, keep_am = ASC_alpha_mul;'));
+  check('...and restore it after the snapshot',
+    (c.match(/ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by; ASC_alpha_mul = keep_am;/g) ?? []).length >= 2);
+
+  // 4. The seam. Three primitives are reachable from a foldable object; each
+  //    wrapper must dispatch on the multiplier, and the no-Skia build must still
+  //    compile the same call sites.
+  for (const [name, fn] of [['rect', 'as_skia_canvas_draw_rect'], ['path', 'as_skia_canvas_draw_path'], ['image_rect', 'as_skia_canvas_draw_image_rect']]) {
+    check(`the ${name} wrapper dispatches on ASC_alpha_mul`, pre.includes(`if (ASC_alpha_mul < 1.0)`) && pre.includes(`sk_canvas_draw_${fn === 'as_skia_canvas_draw_image_rect' ? 'image_rect' : name}_mul(`));
+    check(`the glue has the folded ${name} entry point`, glue.includes(`void sk_canvas_draw_${fn === 'as_skia_canvas_draw_image_rect' ? 'image_rect' : name}_mul(`));
+  }
+  check('a build without Skia still declares the multiplier (one definition, both builds)',
+    (pre.match(/static double ASC_alpha_mul = 1\.0;/g) ?? []).length === 2);
+
+  // 5. The folded paint must be a COPY of the source paint, and the multiplier
+  //    must be quantized to AIR's 8-bit coverage. Both are pixel-visible:
+  //    mutating the source keeps a shared Graphics paint dimmed for every later
+  //    object, and setAlphaf's rounding turned every 0.5 fill one step brighter
+  //    than adl (0x80 vs 0x7f).
+  check('the folded entries copy the caller\'s paint instead of mutating it',
+    /void sk_canvas_draw_path_mul\(void\* canvas, void\* path, void\* paint, double mul\) \{\s*SkPaint p = \*\(const SkPaint\*\)paint;/.test(glue)
+    && /void sk_canvas_draw_rect_mul\([\s\S]{0,200}SkPaint p = \*\(const SkPaint\*\)paint;/.test(glue));
+  check('the multiplier is quantized to the 8-bit alpha AIR applies',
+    /static void sk_paint_mul_alpha\(SkPaint\* p, double mul\) \{[\s\S]{0,300}?\(int\)\(mul \* 255\.0\)/.test(glue));
+
+  console.log(`[alphafold] ${ok} alpha-fold checks passed`);
+  return bad;
+}
+registerGroup('unit: render/AlphaFold', checkAlphaFold);
 
 // ---- SWC symbol classes bound to a PROJECT base class (阶段一百九十一) ---------
 //

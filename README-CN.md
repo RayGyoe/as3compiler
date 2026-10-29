@@ -228,6 +228,21 @@ App Hang 的直接原因。换为**自底向上稳定归并**（不能换 `qsort
 `unit: runtime/ArraySortMerge` + `unit: runtime/DoubleToStringBinary` + `unit: emit/ValueClassCoercion`）。
 门禁顺带量出的 5 条既存分歧（`Array.sort(flag)` 把位标志全忽略、动态接收者的 `Number.toString()` 返 `null`、
 定长小数 17 位上限弄断 round-trip、次正规/DBL_MAX 表示、`toFixed` 平半舍入方向）已逐条入 `TODO.md` 遗留表。
+
+**渲染器三处每帧实错（阶段三百一十五）**：库层修完后，「AOT 比 AIR 还卡」在**聊天面板**这一路仍然成立
+（夹具 `output/perf/chat/`，同一份 `.as` 分别 `adl` 与 AOT，进程 CPU/帧为口径）：每项 **20.0 µs vs AIR 2.9**，
+交叉点 ≈46 项。三处已修：① `alpha < 1` 的对象**每个都开一次离屏 layer**，而 AIR 把 alpha **乘进画笔**
+（真实源码 `ChatItemRenderers.as:53` 每条聊天记录就是一个 `alpha=0.1` 的 `Shape` ⇒ 每条每帧一次离屏 pass）；
+现在「子树只画一个图元」时折叠进画笔（14.5 → 2.0 µs/项），折叠前先把 alpha **量化到 8 位**——否则 Skia 的
+四舍五入让每个半透明填充比 `adl` 亮一档（`127.5 → 128` vs AIR 的截断 **127**，由像素 oracle `temp/alphafold/`
+抓出）。② **`getenv()` 在每对象每帧的路径上**（`ASC_NO_AUTO_BAKE`/`ASC_BAKE_TRACE` 探测写在自动烘焙闸门里，
+`getenv` 是环境块的线性扫描）：192 项夹具 **2.60 → 0.996 ms/帧**，同一场景同一批绘制，唯一差别是把它提到静态量
+——这条对**所有** AOT 应用生效。③ **单图元节点不该自动烘焙**（烘焙把 N 次绘制换成 1 次 blit，N==1 只亏；
+GPU 画布上贴 CPU-raster 快照尤其贵）：`panel_bmp_192` **2.92 → 0.93 ms/帧**，显式 `cacheAsBitmap` 仍照烘。
+验收：`panel_192` **4.54 → 1.331**、`panel_384` **8.50 → 1.736** ms/帧，斜率 **20.0 → 2.56 µs/项**（AIR 1.85），
+交叉点推到 >1100 项；像素 oracle 10 个采样点 9 个逐位相同（唯一不同的是「容器里 ≥2 个重叠图元」这条**既存**
+分歧，已入 `TODO.md` 遗留表，口径见 [`skia.md`](docs/zh-cn/skia.md) §6.14 与
+[`as3-semantics.md`](docs/zh-cn/as3-semantics.md) §3.7）。钉子 `unit: render/AlphaFold`（16 项）。
 合并到 `v0.4.275` 后按新 base 复跑过一遍同一套门禁 ⇒ 新修好 0 / 新弄坏 0、读数与落库前逐字相同，
 性能读数也没动（`num_8000 0.094`、`cmp_4000 0.250`、`dbl_1600 5.078` µs/次）；唯一跑不完的是分配相位：
 看门狗在 `pt_4000`（1.675 s 帧）判死，而**同一个 exe 换到合并前的构建在同一相位同形状** ⇒ 属④那条，不是本轮带出来的。

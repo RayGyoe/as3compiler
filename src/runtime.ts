@@ -9605,6 +9605,17 @@ extern int sk_paint_set_gradient(void* paint, int kind, const double* lm, const 
 extern int sk_paint_set_bitmap_shader(void* paint, void* image, const double* lm, int repeat, int smooth);
 extern void sk_paint_set_stroke_params(void* paint, int cap, int join, double miter);
 extern void sk_paint_set_color_matrix(void* paint, const float* m20);
+// Alpha folded into the paint: the same three primitives, composited with the
+// source alpha multiplied (see as_alpha_foldable in the generated renderer).
+extern void sk_canvas_draw_path_mul(void* canvas, void* path, void* paint, double mul);
+extern void sk_canvas_draw_rect_mul(void* canvas, double x, double y, double w, double h, void* paint, double mul);
+extern void sk_canvas_draw_image_rect_mul(void* canvas, void* image, double dx, double dy, double dw, double dh, int smooth, double mul);
+
+// The alpha a single-primitive object folded into its paint, i.e. the product of
+// the alphas of the foldable ancestors currently being painted (1.0 = none). Set
+// and restored by as_render_object; read by the three draw wrappers below. A stack
+// of alpha-0.5 objects therefore composites 0.25 exactly like nested layers would.
+static double ASC_alpha_mul = 1.0;
 
 // as_skia_* semantic wrappers: the entry points DisplayObject.render() drives.
 // They are static inline so they emit no symbol unless actually called, keeping
@@ -9672,9 +9683,15 @@ static inline void as_clipboard_set_text(const char* t) { sk_clipboard_set_text(
 static inline int as_clipboard_get_text(char* buf, int cap) { return sk_clipboard_get_text(buf, cap); }
 static inline void as_skia_canvas_clear(void* c, unsigned rgb) { sk_canvas_clear(c, rgb); }
 static inline void as_skia_canvas_clear_transparent(void* c) { sk_canvas_clear_transparent(c); }
-static inline void as_skia_canvas_draw_rect(void* c, double x, double y, double w, double h, void* p) { sk_canvas_draw_rect(c, x, y, w, h, p); }
+static inline void as_skia_canvas_draw_rect(void* c, double x, double y, double w, double h, void* p) {
+    if (ASC_alpha_mul < 1.0) { sk_canvas_draw_rect_mul(c, x, y, w, h, p, ASC_alpha_mul); return; }
+    sk_canvas_draw_rect(c, x, y, w, h, p);
+}
 static inline void as_skia_canvas_draw_circle(void* c, double cx, double cy, double r, void* p) { sk_canvas_draw_circle(c, cx, cy, r, p); }
-static inline void as_skia_canvas_draw_path(void* c, void* path, void* paint) { sk_canvas_draw_path(c, path, paint); }
+static inline void as_skia_canvas_draw_path(void* c, void* path, void* paint) {
+    if (ASC_alpha_mul < 1.0) { sk_canvas_draw_path_mul(c, path, paint, ASC_alpha_mul); return; }
+    sk_canvas_draw_path(c, path, paint);
+}
 static inline void as_skia_canvas_clip_rect(void* c, double x, double y, double w, double h) { sk_canvas_clip_rect(c, x, y, w, h); }
 static inline void as_skia_canvas_clip_path(void* c, void* path, int aa) { sk_canvas_clip_path(c, path, aa); }
 static inline void as_skia_canvas_draw_image_src_rect(void* c, void* img, double sx, double sy, double sw, double sh, double dx, double dy, double dw, double dh) { sk_canvas_draw_image_src_rect(c, img, sx, sy, sw, sh, dx, dy, dw, dh); }
@@ -9734,7 +9751,10 @@ static inline void* as_skia_image_from_bytes(const void* data, size_t len) { ret
 static inline void* as_skia_image_decode_argb(const char* path, int* width, int* height) { return sk_image_decode_argb(path, width, height); }
 static inline void* as_skia_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) { return sk_image_decode_bytes_argb(data, len, width, height); }
 static inline int as_skia_surface_read_argb(void* s, uint32_t* dst, int w, int h) { return sk_surface_read_argb(s, dst, w, h); }
-static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh, int smooth) { sk_canvas_draw_image_rect(c, img, dx, dy, dw, dh, smooth); }
+static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh, int smooth) {
+    if (ASC_alpha_mul < 1.0) { sk_canvas_draw_image_rect_mul(c, img, dx, dy, dw, dh, smooth, ASC_alpha_mul); return; }
+    sk_canvas_draw_image_rect(c, img, dx, dy, dw, dh, smooth);
+}
 static inline void as_skia_canvas_draw_bgra(void* c, const uint8_t* bgra, int w, int h, double dx, double dy, double dw, double dh) { sk_canvas_draw_bgra(c, bgra, w, h, dx, dy, dw, dh); }
 // Composite the Stage3D render target straight from its GL texture — the web
 // counterpart of as_skia_gpu_draw_texture (no CPU readback, no re-upload).
@@ -10454,6 +10474,7 @@ static inline void as_skia_paint_set_style_stroke(void* p) { (void)p; }
 static inline void as_skia_paint_set_stroke_width(void* p, double w) { (void)p; (void)w; }
 static inline void as_skia_canvas_clear(void* c, unsigned rgb) { (void)c; (void)rgb; }
 static inline void as_skia_canvas_clear_transparent(void* c) { (void)c; }
+static double ASC_alpha_mul = 1.0;   // see the Skia block: folded single-primitive alpha
 static inline void as_skia_canvas_draw_rect(void* c, double x, double y, double w, double h, void* p) { (void)c; (void)x; (void)y; (void)w; (void)h; (void)p; }
 // No-Skia builds have no canvas to measure: report 1 (a 1:1 transform), which
 // makes the screen-space border fall back to one local unit -- the same thing the

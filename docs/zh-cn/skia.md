@@ -777,6 +777,55 @@ as_skia_canvas_restore(canvas);                    // 只够关掉「对象自�
 确实暴露 `setAntiAlias`）。回归面：打开后 `node test.ts` 全量只剩 4 条基线红，
 `asaotui/ui-demo/run-gallery.cjs` 8 页仍 PASS（PNG 字节数变大，符合「边缘多了部分覆盖」）。
 
+### 6.14 对象 alpha 应折进画笔，而不是每个对象开一层（阶段三百一十五）
+
+§6.11 修的是「开了图层要记得关」；这一节修的是**根本不该开**。`as_render_object` 原本对
+`alpha < 1.0` 的对象一律 `saveLayerAlpha`，而 **AIR 没有对象级 alpha 图层**：它把 alpha 乘进
+每一次绘制。差别在真实应用里是数量级：`ChatItemRenderers.as:53` 给每条聊天记录放了一个
+`alpha = 0.1` 的 `Shape`（就一个 `drawRect`），于是**每条记录每帧付一次离屏 pass**。
+
+实测（`output/perf/chat/`，192 行，进程 CPU/帧，同机配对）：同一形状只改 `alpha`，
+带图层 **14.5 µs/项**，折叠后 **2.0 µs/项**；而 AIR 0.7。图层成本**与面积无关**（340×56 与
+34×56 同价），也不看画的是什么（路径或图元同价）——这正是「per-layer 而非 per-fill」的判据。
+
+规则（`as_single_primitive()`，`src/emit.ts`）：**子树只画一个图元**时折叠，否则仍开图层。
+排除项各有实测理由：`filters` 本来就要隔离层；`_mask_object` 没有自己的像素；
+`opaqueBackground` 会多画一块不透明底（第二个图元）；`TextField` 的字形 run 内部 AA 覆盖会重叠；
+未知叶子（`Video` 等）按「会画 2 个」处理，因为它们的绘制入口还没接进折叠通道。
+
+两个必须写下来的细节：
+
+1. **乘的是画笔的拷贝**。`Graphics` 的填充/描边 `SkPaint` 是 AS3 对象里的**共享**对象，
+   就地 `setAlphaf` 会让一个 `alpha=0.1` 的形状之后一直保持暗淡。胶水层因此只在栈上
+   `SkPaint p = *(const SkPaint*)paint;` 之后改 `p`。
+2. **必须量化到 8 位**。`setAlphaf(0.5)` 让 Skia 四舍五入到 **128**，而 AIR 的覆盖度是**截断**
+   到 **127** —— 所有半透明填充会比 `adl` 亮一档。折叠前先算 `(int)(mul*255)/255` 再乘。
+   这条是像素 oracle 抓出来的，肉眼与逐项 A/B 都看不见：`temp/alphafold/` 同一份 `.as`
+   分别跑 `adl` 与 AOT，`BitmapData.draw` 整棵树后逐点取样，红块 `alpha=0.5` 修前
+   `ff800000`、`adl` `ff7f0000`，`0.5×0.5` 嵌套修前 `0x40`、`adl` `0x3f`。
+
+**顺带修的两条每帧实错**（同一阶段，都在 `as_render_fp`）：
+
+- `getenv("ASC_NO_AUTO_BAKE")` / `getenv("ASC_BAKE_TRACE")` 写在**每对象每帧**的闸门里。
+  `getenv` 是整个环境块的线性扫描（本机 ≈1.9 µs/次），192 项的夹具里就是 **2.60 → 0.996 ms/帧**，
+  同一场景、同一批绘制、同一批烘烤决定，唯一差别是把它提到静态量。这条对**所有** AOT 应用生效。
+- 自动烘焙对**单图元节点**是净亏：烘焙把 N 次绘制换成 1 次 blit，N == 1 时只多了「拍快照 + 贴回」
+  与缓存路径自己的记账；GPU 画布上贴一张 CPU-raster 快照尤其贵。闸门改为要求
+  `as_draw_count(o) > 1`，实测 `panel_bmp_192`（192 行 = Sprite 包一张 Bitmap）**2.92 → 0.93 ms/帧**。
+  **显式 `cacheAsBitmap` 仍然照烘**——那是应用自己要的，不是我们的优化。
+
+验收（同机配对，3 reps）：`panel_192` **4.54 → 1.331**、`panel_384` **8.50 → 1.736**、
+`panel_shape_192` **3.33 → 1.184**、`panel_text_192` **3.99 → 1.271** ms/帧；斜率
+`(panel_384 − panel_empty_192)/384` 从 **20.0 → 2.56 µs/项**（AIR 1.85），交叉点从 ≈46 项推到 >1100 项。
+钉子：`unit: render/AlphaFold`（16 项）＋改写保留原意的 `unit: render/AlphaLayerBalance`；
+像素 oracle：`temp/alphafold/`（adl 与 AOT 逐点对照，10 个采样点里 9 个逐位相同）。
+
+**已知残余（量过，没藏）**：容器里 **≥2 个重叠图元**且 `alpha<1` 时，我们仍开图层隔离、AIR 逐图元
+相乘，重叠处差一格（`ff7f7f00` vs `ff7f7f3f`）。要整体切到「逐图元乘 alpha」得先把
+`draw_circle`、九宫格、文本、Stage3D 的绘制入口都接进折叠通道——漏一个就是整块不透明，
+所以本轮只做「单图元」这一档，其余留给后续阶段（已入 `TODO.md` 遗留表）。
+
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

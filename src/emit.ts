@@ -8970,12 +8970,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_skia_canvas_scale(c2, sc, sc);');
     this.line('as_skia_canvas_translate(c2, -bl, -bt);');
     // Bitmap-fill shaders are anchored in device space, so the bake has to know
-    // its own CTM just like as_render_cached does.
-    this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y;');
+    // its own CTM just like as_render_cached does. Same for a folded object alpha:
+    // the snapshot under a 9-slice carries no opacity of its own.
+    this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y, keep_am = ASC_alpha_mul;');
+    this.line('ASC_alpha_mul = 1.0;');
     this.line('as_skia_canvas_total_scale(canvas, &ASC_bake_ctm_x, &ASC_bake_ctm_y);');
     this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(c2, o, o->filters, o->filters->length - 1);');
     this.line('else as_render_object_content(c2, o);');
-    this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by;');
+    this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by; ASC_alpha_mul = keep_am;');
     this.line('o->_s9_image = as_skia_surface_make_snapshot(surface);');
     this.line('as_skia_surface_delete(surface);');
     this.line('o->_s9_bw = (double)pw; o->_s9_bh = (double)ph;');
@@ -26052,10 +26054,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('static uint32_t as_render_fp(DisplayObject* o);');
+    this.line('static int as_single_primitive(DisplayObject* o);');
+    // Environment probes hoisted out of the per-object loops. getenv() is a linear
+    // scan of the whole environment block, and both of these gate a decision that
+    // runs once per object per frame -- measured on output/perf/chat, 192 image
+    // rows, process CPU/frame: 2.60 ms with the inline getenv, 0.996 ms with it
+    // hoisted (same scene, same draws, same bake decisions).
+    this.line('static int ASC_no_auto_bake = -1;');
+    this.line('static int ASC_bake_trace = -1;');
     this.line('static uint32_t as_render_fp(DisplayObject* o) {');
     this.indent++;
     this.line('uint32_t h = 2166136261u;');
     this.line('if (o == NULL) return h;');
+    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; }');
     // MovieClip button states are settled HERE as well as in as_render_object, and
     // this pass is the one that matters when an ANCESTOR is auto-baked: a baked
     // ancestor paints its cached image and never walks its descendants, so the
@@ -26253,11 +26264,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     // meeting client, whose buttons/labels/thumbnails/rows all opt in through
     // `cacheAsBitmapAndMatrix()` and then change their text and bitmaps.
     this.line('if (h == o->_auto_fp) { o->_auto_still++; }');
-    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked || o->_cache_flag) { if (getenv("ASC_BAKE_TRACE") != NULL && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path); o->_auto_baked = 0; o->_cache_valid = 0; } }');
-    this.line('if (getenv("ASC_NO_AUTO_BAKE") == NULL && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES) {');
+    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked || o->_cache_flag) { if (ASC_bake_trace && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path); o->_auto_baked = 0; o->_cache_valid = 0; } }');
+    this.line('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES && !as_single_primitive(o)) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
-    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "t=%.0f bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", as_now_ms(), (void*)o, bl, bt, br - bl, bb - bt); } else o->_auto_still = 0;');
+    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", as_now_ms(), (void*)o, bl, bt, br - bl, bb - bt); } else o->_auto_still = 0;');
     this.indent--;
     this.line('}');
     this.line('return h;');
@@ -26382,7 +26393,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_canvas_total_scale(canvas, &bdt_x, &bdt_y);');
     this.line('if (sx < bdt_x - 0.001 || sy < bdt_y - 0.001) {');
     this.indent++;
-    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { static int _bcapped = 0; if (_bcapped < 60) { _bcapped++; fprintf(stderr, "t=%.0f bake_capped o=%p lw=%d lh=%d sx=%.5f sy=%.5f dt=%.5f\\n", as_now_ms(), (void*)o, lw, lh, sx, sy, bdt_x); } }');
+    this.line('if (ASC_bake_trace) { static int _bcapped = 0; if (_bcapped < 60) { _bcapped++; fprintf(stderr, "t=%.0f bake_capped o=%p lw=%d lh=%d sx=%.5f sy=%.5f dt=%.5f\\n", as_now_ms(), (void*)o, lw, lh, sx, sy, bdt_x); } }');
     this.line('as_render_live(canvas, o);');
     this.line('return;');
     this.indent--;
@@ -26398,8 +26409,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (o->_cache_valid && o->_cache_image != NULL && (fabs(o->_cache_phx - bpx) > 0.001 || fabs(o->_cache_phy - bpy) > 0.001)) { as_render_live(canvas, o); return; }');
     this.line('if (!o->_cache_valid || o->_cache_image == NULL || o->_cache_w != (double)pw || o->_cache_h != (double)ph) {');
     this.indent++;
-    this.line('{ double _otx = 0.0, _oty = 0.0; as_skia_canvas_total_translate(canvas, &_otx, &_oty); if (getenv("ASC_BAKE_TRACE") != NULL) fprintf(stderr, "t=%.0f bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f bxo=%.5f byo=%.5f otx=%.5f oty=%.5f bpx=%.5f bpy=%.5f\\n", as_now_ms(), (void*)o, bl, bt, lw, lh, pw, ph, sx, sy, bxo, byo, _otx, _oty, bpx, bpy); }');
-    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { double _tx = 0.0, _ty = 0.0; as_skia_canvas_total_scale(canvas, &_tx, &_ty); double _ex = (_tx > 0.0) ? fabs((double)pw / ((double)lw * _tx) - 1.0) : 0.0; if (_ex > 0.002 || _tx != _ty) fprintf(stderr, "t=%.0f bake_anis o=%p lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f ctx=%.5f cty=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, lh, pw, ph, sx, sy, _tx, _ty, _ex); }');
+    this.line('{ double _otx = 0.0, _oty = 0.0; as_skia_canvas_total_translate(canvas, &_otx, &_oty); if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f bxo=%.5f byo=%.5f otx=%.5f oty=%.5f bpx=%.5f bpy=%.5f\\n", as_now_ms(), (void*)o, bl, bt, lw, lh, pw, ph, sx, sy, bxo, byo, _otx, _oty, bpx, bpy); }');
+    this.line('if (ASC_bake_trace) { double _tx = 0.0, _ty = 0.0; as_skia_canvas_total_scale(canvas, &_tx, &_ty); double _ex = (_tx > 0.0) ? fabs((double)pw / ((double)lw * _tx) - 1.0) : 0.0; if (_ex > 0.002 || _tx != _ty) fprintf(stderr, "t=%.0f bake_anis o=%p lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f ctx=%.5f cty=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, lh, pw, ph, sx, sy, _tx, _ty, _ex); }');
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('void* surface = as_skia_surface_bake_new(pw, ph);');
     this.line('if (surface != NULL) {');
@@ -26408,13 +26419,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_canvas_clear_transparent(c2);');
     this.line('as_skia_canvas_scale(c2, sx, sy);');
     this.line('as_skia_canvas_translate(c2, -bxo, -byo);');
-    this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y;');
+    // The bake surface must hold the UNFOLDED subtree: this object's alpha belongs on
+    // the blit below, not inside the snapshot, or a folded alpha would land twice.
+    this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y, keep_am = ASC_alpha_mul;');
+    this.line('ASC_alpha_mul = 1.0;');
     this.line('as_skia_canvas_total_scale(canvas, &ASC_bake_ctm_x, &ASC_bake_ctm_y);');
     this.line('if (ASC_bake_ctm_x <= 0.0) ASC_bake_ctm_x = sx;');
     this.line('if (ASC_bake_ctm_y <= 0.0) ASC_bake_ctm_y = sy;');
     this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(c2, o, o->filters, o->filters->length - 1);');
     this.line('else as_render_object_content(c2, o);');
-    this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by;');
+    this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by; ASC_alpha_mul = keep_am;');
     this.line('o->_cache_image = as_skia_surface_make_snapshot(surface);');
     // A baked object that leaves the stage has its Snapshot collected with it;
     // the finalizer is what returns the surface memory to the allocator.
@@ -26434,7 +26448,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('if (o->_cache_image != NULL) {');
     this.indent++;
-    this.line('if (getenv("ASC_BAKE_TRACE") != NULL) { static int _bc = 0; double _bx = 0.0, _by = 0.0; as_skia_canvas_total_scale(canvas, &_bx, &_by); double _ex2 = (_bx > 0.0) ? fabs((double)pw / ((double)lw * _bx) - 1.0) : 0.0; if (_bc < 80 && (_ex2 > 0.002 || _bx != _by)) { _bc++; fprintf(stderr, "t=%.0f bake_blit o=%p lw=%d pw=%d bx=%.5f by=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, pw, _bx, _by, _ex2); } }');
+    this.line('if (ASC_bake_trace) { static int _bc = 0; double _bx = 0.0, _by = 0.0; as_skia_canvas_total_scale(canvas, &_bx, &_by); double _ex2 = (_bx > 0.0) ? fabs((double)pw / ((double)lw * _bx) - 1.0) : 0.0; if (_bc < 80 && (_ex2 > 0.002 || _bx != _by)) { _bc++; fprintf(stderr, "t=%.0f bake_blit o=%p lw=%d pw=%d bx=%.5f by=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, pw, _bx, _by, _ex2); } }');
     // Blit 1:1 in device pixels: the surface's pixel grid has to land on the
     // destination's, i.e. each surface pixel covers exactly one device pixel. The
     // rect is therefore pw/sx logical units wide (sx = device pixels per logical
@@ -26479,6 +26493,66 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('m[14] = (float)(ct->blueOffset / 255.0); m[19] = (float)(ct->alphaOffset / 255.0);');
     this.indent--;
     this.line('}');
+    // Can this object's alpha be folded into the ONE primitive it paints instead of
+    // opening a saveLayer? For a single source-over primitive the two are the same
+    // picture: opacity multiplies the same source colour and there is no sibling to
+    // isolate from. The layer, on the other hand, costs a whole offscreen pass.
+    // Measured on the meeting client's chat list (192 rows, each
+    // `shape = new Shape(); shape.graphics.drawRect(0,0,250,10); shape.alpha = 0.1;`
+    // -- ChatItemRenderers.as:53): 14.5 us per row with the layer, 2.0 us with the
+    // alpha folded, while AIR (which folds) pays 0.7. The cost is FLAT in area and in
+    // what is painted (a 34x56 rect costs the same as a 340x56 one), which is what
+    // identified it as a per-layer cost rather than a fill cost.
+    //
+    // Deliberately conservative: only a leaf that paints exactly one path/rect/image
+    // qualifies. A TextField is excluded (its glyph runs overlap and would double
+    // darken under per-paint alpha), as is anything with filters, an
+    // opaqueBackground backing rect (a second primitive), or a clipDepth mask.
+    //
+    // The predicate is "the whole SUBTREE paints exactly one primitive", not "this
+    // object is a leaf": a chat row is a Sprite wrapping one Bitmap, and a bake of
+    // that row only replaces one drawImageRect with one blit-of-a-snapshot.
+    //
+    // The same count answers the other question the renderer asks: is a snapshot
+    // worth taking? A bake turns N draws into one blit, so N == 1 can only lose --
+    // and on a GPU canvas it measurably does. Measured (output/perf/chat, 192 rows,
+    // process CPU/frame): panel_bmp_192 2.92 -> 1.01 (bake refused) and
+    // panel_shape_192 3.13 -> 1.94. as_render_fp therefore refuses to auto-bake
+    // these; an EXPLICIT cacheAsBitmap is still honoured, because that is the
+    // application's own request.
+    this.line('static int as_draw_count(DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o == NULL || o->_mask_object || !o->visible) return 0;');
+    this.line('if (o->filters != NULL && o->filters->length > 0) return 2;');
+    this.line('if (as_v_is_number(o->opaqueBackground)) return 2;');
+    this.line('if (as_is((void*)o, &Bitmap_vt)) return as_bmd_visible_image(((Bitmap*)o)->bitmapData) != NULL ? 1 : 0;');
+    // A TextField is TWO: the field paints a background/border rect and then a glyph
+    // run whose AA coverage overlaps within a word, so it is neither one primitive
+    // nor safe under per-paint alpha.
+    this.line('if (as_is((void*)o, &TextField_vt)) return 2;');
+    this.line('if (as_is((void*)o, &SimpleButton_vt)) return 1;');
+    // Whitelist: anything else (Video, BitmapData-less Bitmap, a native overlay) is
+    // assumed to paint through a path the fold does not reach.
+    this.line('if (!as_is((void*)o, &Shape_vt) && !as_is((void*)o, &Sprite_vt)) return 2;');
+    this.line('int n = 0;');
+    this.line('Graphics* g = as_graphics_of(o);');
+    this.line('if (g != NULL) {');
+    this.indent++;
+    this.line('for (as_gdraw* d = (as_gdraw*)g->draws; d != NULL; d = d->next) { if (d->fill != NULL) n++; if (d->stroke != NULL) n++; }');
+    this.line('if (g->fill != NULL) n++;');
+    this.line('if (g->stroke != NULL) n++;');
+    this.indent--;
+    this.line('}');
+    this.line('if (as_is((void*)o, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('if (c->children != NULL) for (int i = 0; i < c->children->length; i++) { n += as_draw_count((DisplayObject*)as_v_obj_val(c->children->data[i])); if (n > 1) return 2; }');
+    this.indent--;
+    this.line('}');
+    this.line('return n > 1 ? 2 : n;');
+    this.indent--;
+    this.line('}');
+    this.line('static int as_single_primitive(DisplayObject* o) { return as_draw_count(o) == 1; }');
     this.line('static void as_render_object(void* canvas, DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL || !o->visible) return;');
@@ -26506,8 +26580,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_canvas_save(canvas);');
     this.line('int clip_on = (o->_clip_path != NULL);');
     this.line('if (clip_on) as_skia_canvas_clip_path(canvas, o->_clip_path, 1);');
-    this.line('if (o->alpha < 1.0) as_skia_canvas_save_layer_alpha(canvas, o->alpha);');
     this.line('int alpha_on = (o->alpha < 1.0);');
+    this.line('double keep_alpha_mul = ASC_alpha_mul;');
+    this.line('int alpha_fold = (alpha_on && as_single_primitive(o));');
+    this.line('if (alpha_fold) ASC_alpha_mul = keep_alpha_mul * o->alpha;');
+    this.line('else if (alpha_on) as_skia_canvas_save_layer_alpha(canvas, o->alpha);');
     this.line('as_skia_canvas_translate(canvas, o->x, o->y);');
     this.line('as_skia_canvas_rotate(canvas, o->rotation);');
     this.line('as_skia_canvas_scale(canvas, o->scaleX, o->scaleY);');
@@ -26643,7 +26720,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     // starts (the scrollbar flips mouseChildren off), and every card below the
     // list was then painted shifted down by that row's position until the list
     // was rebuilt -- "拖动列表后点刷新，上面的按钮跳下来再恢复".
-    this.line('if (alpha_on) as_skia_canvas_restore(canvas);');
+    this.line('if (alpha_on && !alpha_fold) as_skia_canvas_restore(canvas);');
+    this.line('ASC_alpha_mul = keep_alpha_mul;');
     this.line('as_skia_canvas_restore(canvas);');
     this.indent--;
     this.line('}');

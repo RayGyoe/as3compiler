@@ -2912,8 +2912,12 @@ function checkBitmapSmoothing(): string[] {
   //    skia and no-skia builds disagree about the signature.
   check('the extern declaration carries int smooth',
     pre.includes('extern void sk_canvas_draw_image_rect(void* canvas, void* image, double dx, double dy, double dw, double dh, int smooth);'));
+  // 阶段三百一十五: the wrapper body is no longer a one-liner -- it dispatches to
+  // the alpha-folded entry point when a partial alpha is in force -- so pin the
+  // SIGNATURE (what must agree between the two builds) and the plain call it keeps.
   check('the ASC_USE_SKIA wrapper carries int smooth',
-    /static inline void as_skia_canvas_draw_image_rect\(void\* c, void\* img, double dx, double dy, double dw, double dh, int smooth\) \{ sk_canvas_draw_image_rect\(c, img, dx, dy, dw, dh, smooth\); \}/.test(pre));
+    /static inline void as_skia_canvas_draw_image_rect\(void\* c, void\* img, double dx, double dy, double dw, double dh, int smooth\) \{/.test(pre)
+    && pre.includes('sk_canvas_draw_image_rect(c, img, dx, dy, dw, dh, smooth);'));
   check('the no-Skia stub carries int smooth',
     pre.includes('static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh, int smooth) { (void)c; (void)img; (void)dx; (void)dy; (void)dw; (void)dh; (void)smooth; }'));
 

@@ -1472,6 +1472,60 @@ void sk_canvas_draw_image_rect(void* canvas, void* image,
   ((SkCanvas*)canvas)->drawImageRect((SkImage*)image, dst, so);
 }
 
+// Same blit with a folded object alpha. This is the path a cached (cacheAsBitmap /
+// auto-bake) alpha object takes: the bake snapshot itself is opaque-normalized
+// content, so the opacity belongs on the blit.
+static void sk_paint_mul_alpha(SkPaint* p, double mul);   // defined below
+void sk_canvas_draw_image_rect_mul(void* canvas, void* image,
+                                   double dx, double dy, double dw, double dh, int smooth,
+                                   double mul) {
+  SkRect dst = SkRect::MakeXYWH((SkScalar)dx, (SkScalar)dy, (SkScalar)dw, (SkScalar)dh);
+  const SkSamplingOptions so =
+      smooth ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNearest)
+             : SkSamplingOptions(SkFilterMode::kNearest, SkMipmapMode::kNone);
+  SkPaint paint;
+  sk_paint_mul_alpha(&paint, mul);
+  ((SkCanvas*)canvas)->drawImageRect((SkImage*)image, dst, so, &paint);
+}
+
+// --- alpha folded into the paint (阶段三百一十五) ---
+//
+// A DisplayObject with alpha < 1 whose subtree paints exactly ONE primitive does
+// not need a saveLayer: multiplying the source alpha in the paint composites
+// identically, because a single source-over primitive has nothing to isolate.
+// The layer is what AIR skips and we did not -- measured on the meeting client's
+// chat list (192 rows, each `new Shape(); drawRect(0,0,250,10); alpha = 0.1`),
+// same rect, same paint, only alpha differing: 14.5 us per row with the layer,
+// 2.0 us without. See as_alpha_foldable() in the generated prelude for which
+// objects qualify.
+//
+// The multiplier is applied to a STACK COPY of the paint: the Graphics fill and
+// stroke paints live in the AS3 object and must not be clobbered (a shared
+// alpha-0.1 shape would otherwise stay dimmed after one folded paint).
+//
+// It is also QUANTIZED to the 8-bit coverage AIR uses, because setAlphaf() rounds
+// while AIR truncates: 0.5*255 = 127.5 became 128 here and 127 there, i.e. every
+// half-transparent fill came out one step brighter than adl (measured on
+// temp/alphafold: ff800000 vs ff7f0000 on a red rect at alpha .5 over black, and
+// 0x40 vs 0x3f for a 0.5x0.5 nested pair).
+static void sk_paint_mul_alpha(SkPaint* p, double mul) {
+  const float q = (float)((double)((int)(mul * 255.0)) / 255.0);
+  p->setAlphaf(p->getAlphaf() * q);
+}
+
+void sk_canvas_draw_path_mul(void* canvas, void* path, void* paint, double mul) {
+  SkPaint p = *(const SkPaint*)paint;
+  sk_paint_mul_alpha(&p, mul);
+  ((SkCanvas*)canvas)->drawPath(*(SkPath*)path, p);
+}
+
+void sk_canvas_draw_rect_mul(void* canvas, double x, double y, double w, double h,
+                             void* paint, double mul) {
+  SkPaint p = *(const SkPaint*)paint;
+  sk_paint_mul_alpha(&p, mul);
+  ((SkCanvas*)canvas)->drawRect(SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)w, (SkScalar)h), p);
+}
+
 // Draw one SUB-RECT of an image into a destination rect. Nine-slice scaling needs
 // this: the 8 border pieces reuse their source pixels unchanged while the middle
 // piece stretches, which a whole-image drawImageRect cannot express (swc.md §9 F).
