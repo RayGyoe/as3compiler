@@ -524,7 +524,7 @@ const ANE_FIXTURE = 'com.example.probe';
 // the lever is a parent suite, hence the `describe(…, { concurrency })` below.
 // Measured on 24 spread-out examples: 91.8 s at jobs=1 vs 13.6 s at jobs=8.
 //
-// Cap at 6 rather than the core count: each child is a `cc -O2` link over up to
+// Cap at 8 rather than the core count: each child is a `cc -O2` link over up to
 // ~20 MB of static libraries (Skia/SDL2/curl), so unbounded fan-out trades wall
 // time for memory pressure on the linker. `ASC_TEST_JOBS=1` restores the exact
 // original fully serial order (the fallback to reach for if a future red is ever
@@ -535,7 +535,7 @@ const JOBS = (() => {
     const n = Number(raw);
     if (Number.isInteger(n) && n >= 1) return n;
   }
-  return Math.min(availableParallelism(), 6);
+  return Math.min(availableParallelism(), 8);
 })();
 
 // Run one example unit: compile -> link -> run. node:test turns a non-zero exit

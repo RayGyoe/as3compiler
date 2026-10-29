@@ -353,7 +353,7 @@ An object is linked **whole** (§2.1) and its contents are a function of **the f
 with** — so "one path per source name" only holds while every build agrees on those flags, and they
 do not agree: `examples/swc-bitmap.build.json` compiles `vendor/window_glue.cc` without a GPU
 backend, the away3d / air-native manifests add `ASC_RENDER_METAL`, and those builds run
-**concurrently** (`test/examples.ts`, jobs = min(cores, 6)) — all writing `vendor/window_glue.o`.
+**concurrently** (`test/examples.ts`, jobs = min(cores, 8)) — all writing `vendor/window_glue.o`.
 Measured, same source two define sets: **29,216 vs 30,896 B** (`skia_glue.cc`: 33,416 vs 38,200). So
 whichever build finished last decided what the other one linked: either handing it a channel its
 manifest never asked for, or (when relinking leftover objects by hand) ending in

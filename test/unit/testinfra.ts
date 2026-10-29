@@ -34,8 +34,8 @@ function checkExampleDriverConcurrency(): string[] {
     /concurrency:\s*JOBS/.test(src));
   // The default must stay bounded by the core count — each child is a `cc -O2`
   // link over ~20 MB of static libraries, so unbounded fan-out is a memory bet.
-  check('the default job count is min(availableParallelism(), 6)',
-    /Math\.min\(availableParallelism\(\), 6\)/.test(src));
+  check('the default job count is min(availableParallelism(), 8)',
+    /Math\.min\(availableParallelism\(\), 8\)/.test(src));
   // The escape hatch is load-bearing for diagnosis: it is how a red suspected of
   // being concurrency-induced gets re-run against the exact pre-change order.
   check('the job count is overridable via ASC_TEST_JOBS (1 = original serial order)',

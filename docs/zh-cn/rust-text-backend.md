@@ -295,7 +295,7 @@ L2a 省的是"用文本的程序里读不到的数据"——三者互不叠加�
 
 **一、对象文件按「配置」分目录（`src/build.ts::objectDir`）**
 
-对象文件是**整份**参与链接的（§2.1），内容是**编译它的那组旗标**的函数——所以「一个源文件一个路径」只在所有构建都同意那组旗标时才成立，而它们不同意：示例套件里 `examples/swc-bitmap.build.json` 编 `vendor/window_glue.cc` 时不带 GPU 后端，away3d / air-native 那几张清单带 `ASC_RENDER_METAL`，而它们**并发**跑（`test/examples.ts`，jobs = min(核数, 6)），两条都写 `vendor/window_glue.o`。实测同一源文件两组宏的对象大小：**29,216 B vs 30,896 B**（`skia_glue.cc` 是 33,416 vs 38,200），⇒ 谁后编完谁说了算：另一条要么拿到自己没申请的通道，要么（手工重链残留对象时）以 `Undefined symbols: _sk_window_show_gpu` 收场。
+对象文件是**整份**参与链接的（§2.1），内容是**编译它的那组旗标**的函数——所以「一个源文件一个路径」只在所有构建都同意那组旗标时才成立，而它们不同意：示例套件里 `examples/swc-bitmap.build.json` 编 `vendor/window_glue.cc` 时不带 GPU 后端，away3d / air-native 那几张清单带 `ASC_RENDER_METAL`，而它们**并发**跑（`test/examples.ts`，jobs = min(核数, 8)），两条都写 `vendor/window_glue.o`。实测同一源文件两组宏的对象大小：**29,216 B vs 30,896 B**（`skia_glue.cc` 是 33,416 vs 38,200），⇒ 谁后编完谁说了算：另一条要么拿到自己没申请的通道，要么（手工重链残留对象时）以 `Undefined symbols: _sk_window_show_gpu` 收场。
 
 修法：对象落在 `$TMPDIR/as-aot-obj/<配置指纹>-<构建进程 pid>/<源路径指纹>-<基名><后缀>.o`，指纹覆盖编译器、target、`-O`、perf/fp/debug 旗标、defines、include 路径（**不排序**——`-I` 顺序决定哪个头文件赢）。**不做缓存**：每个源仍然每次重编，只是不再互相回答。阶段八十九·三十二 的 `.wasm.o` 后缀保留，作为可读的第二道闸。目录名里为什么还要 pid、以及成功后整个目录为什么被删掉，见下面的「三」。
 
