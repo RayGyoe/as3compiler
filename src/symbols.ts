@@ -1497,10 +1497,17 @@ export class SymbolTable {
         ['_tl_char', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
         // DisplayObject.mask: the object that masks this one. A private backing slot
         // (the accessor pair below is what AS3 sees), because the value must also be
-        // READ by the renderer to ever take effect -- and today it does not: see the
-        // loud report in DisplayObject_set_mask. Kept private so `c.mask` resolves
+        // READ by the renderer: as_mask_path turns the mask's ink into the stencil the
+        // masked object is clipped to. Kept private so `c.mask` resolves
         // to the accessor rather than to a raw field read, exactly like _mask_object.
         ['_mask_ref', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // "This object is somebody's mask" (阶段三百一十八). AIR never paints a mask
+        // object and never picks it off the mouse, wherever it hangs, so the paint and
+        // pick paths skip it exactly like a baked clipDepth mask (_mask_object) does.
+        // Kept as a flag on the MASK rather than a search of every sibling's _mask_ref:
+        // the renderer would otherwise walk the whole tree per object per frame. A
+        // plain bool, so it never holds a GC pointer and needs no write barrier.
+        ['_mask_user', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
         // DisplayObject.cacheAsBitmapMatrix: the Matrix the caller last set (NULL
         // when never set). A private backing slot for the same reason as _mask_ref --
         // the AS3-visible property is the accessor pair. Unlike _mask_ref this one

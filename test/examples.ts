@@ -372,6 +372,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 换图」。断言是**进程常驻内存**（System.privateMemory），要有光栅后端才会真的建那张
   // 视图，故同 bake-draw-cache.as 一样链 Skia。ASC_NO_FINAL=1 可让这条断言变红（A/B）。
   'gc-image-free.as': ['--manifest', join(dir, 'gc-image-free.build.json')],
+  // display-mask.as（阶段三百一十八）钉的是 DisplayObject.mask 的**像素**契约：遮罩对象是一块
+  // 二值模板（alpha 与 visible 都被忽略），按它**自己的**祖先链落在父空间，遮罩本身不绘制、
+  // 不参与命中，遮罩没有墨迹就什么都画不出来。adl 51.4.1 实测值（temp/mask/MaskProbe*.as）
+  // 逐条比对，故与 draw-over.as 一样必须链 Skia。
+  'display-mask.as': ['--manifest', join(dir, 'display-mask.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
   // roundrect.as（阶段二百六十七 · G19）断言的也是**像素**：drawRoundRect 的两个半径必须

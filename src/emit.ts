@@ -12005,22 +12005,25 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('}');
     this.line('as_array* DisplayObject_get_filters(void* _this) { return ((DisplayObject*)_this)->filters; }');
     this.line('void DisplayObject_set_filters(void* _this, as_array* value) { DisplayObject* o = (DisplayObject*)_this; o->filters = value; if (value != NULL) gc_write_barrier((void*)value); }');
-    // DisplayObject.mask: the property round-trips by identity (a program that sets
-    // it and reads it back sees its own object, exactly as in AIR), but THIS
-    // RENDERER DOES NOT APPLY MASKS: AIR uses the mask object's alpha channel as a
-    // per-pixel coverage mask for everything it covers, which needs a saveLayer +
-    // mask blend pass the renderer does not have (it only implements the SWC
-    // clipDepth path clip, a different mechanism). Silence would be a semantic lie,
-    // so the first few non-null assignments say so on stderr -- the same loud,
-    // capped report the shell classes use. See TODO.md ('mask')
-    // and docs/zh-cn/as3-semantics.md.
+    // DisplayObject.mask (阶段三百一十八). AIR stencils the object with the MASK's
+    // ink -- a binary clip, not an alpha composite (measured on adl 51.4.1,
+    // temp/mask/*.as: the mask's alpha and its `visible` flag are both ignored, a
+    // 0..1 alpha gradient mask leaves the object fully opaque). The renderer applies
+    // it as a path clip in as_render_object; this accessor keeps the two pieces of
+    // state that make that possible: the reference itself, and the "I am somebody's
+    // mask" flag on the mask object, which is what keeps the mask from being painted
+    // or picked (AIR never shows it). Clearing the old mask clears the flag, so
+    // `o.mask = null` puts the mask back on screen as an ordinary child -- measured,
+    // temp/mask/MaskProbe.as case C.
     this.line('DisplayObject* DisplayObject_get_mask(void* _this) { DisplayObject* o = (DisplayObject*)_this; if (o == NULL) return NULL; return o->_mask_ref; }');
     this.line('void DisplayObject_set_mask(void* _this, DisplayObject* value) {');
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)_this;');
     this.line('if (o == NULL) return;');
+    this.line('if (o->_mask_ref == value) return;');
+    this.line('if (o->_mask_ref != NULL) o->_mask_ref->_mask_user = false;');
     this.line('o->_mask_ref = value;');
-    this.line('if (value != NULL) { gc_write_barrier((void*)value); as_shell_unsupported("DisplayObject.mask (this renderer does not apply masks)"); }');
+    this.line('if (value != NULL) { gc_write_barrier((void*)value); value->_mask_user = true; }');
     this.indent--;
     this.line('}');
     // cacheAsBitmapMatrix: stored (AIR's getter hands back what was set) but not
@@ -19697,6 +19700,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void as_rect_to_stage(DisplayObject* o, double* l, double* t, double* r, double* b);');
     this.line('static void as_rect_from_stage(DisplayObject* o, double* l, double* t, double* r, double* b);');
     this.line('static bool as_obj_hit_local(DisplayObject* o, double lx, double ly);');
+    this.line('static void* as_mask_path(DisplayObject* o, DisplayObject* m);');
+    this.line('static bool as_mask_gate(DisplayObject* o, double lx, double ly);');
     // A SimpleButton's hit region comes from its hit STATE, so the region test must
     // delegate to the button helper. That helper lives next to the state machine
     // (below, with the paint path), hence this forward declaration.
@@ -19799,8 +19804,127 @@ void FileStream_writeObject(void* _this, as_value v) {
     // (measured, temp/editprobe/Ed24 §1: hits from x=5.75 for a fill spanning
     // 10..30 with a stroke reaching 6). A stroke-free box also made stroke-only
     // Shapes unpickable, which AIR never does.
+    // ---- DisplayObject.mask: the stencil (阶段三百一十八) ----
+    // AIR paints a masked object only where the MASK OBJECT'S INK covers it.
+    // Measured on adl 51.4.1 (temp/mask/MaskProbe.as, MaskProbe2.as, MaskProbe3.as):
+    //   * a 40x40 mask at (20,20) over a 100x100 box at (50,10) leaves x=50..59 on a
+    //     y=30 row -- the mask lands at its OWN transform, not the object's;
+    //   * the mask's alpha is IGNORED (alpha 0 / 0.25 / 0.5 and a 0..1 gradient mask
+    //     all leave the object fully opaque) and so is `visible` (an invisible mask
+    //     still clips), so this is a STENCIL, not an alpha-composited layer;
+    //   * a mask whose ink comes from CHILDREN works, holes included (two 20-wide
+    //     child rects at x=0 and x=60 light 0..19 and 60..79, the gap transparent);
+    //   * the mask is never painted, works even off the display list, and its stencil
+    //     follows the MASK's own ancestor chain (a mask inside a container translated
+    //     by +100 clipped at 100..139), not the masked object's parent;
+    //   * a mask with no ink clips everything away;
+    //   * getBounds/width/height ignore the mask, hitTestPoint(shapeFlag) respects it
+    //     ((55,30)=true where both cover, (80,30)=false object-only, (25,30)=false
+    //     mask-only).
+    // That is exactly SkCanvas::clipPath (there is no kDstIn in sk_paint_set_blend),
+    // so the mask becomes a clip: no layer, no blend mode.
+    this.line('static void as_mask_ink(DisplayObject* o, void* p, double a, double b, double c, double d, double tx, double ty) {');
+    this.indent++;
+    // `visible` is deliberately NOT consulted: an invisible mask still stencils.
+    this.line('if (o == NULL) return;');
+    this.line('Graphics* g = as_graphics_of(o);');
+    this.line('if (g != NULL) {');
+    this.indent++;
+    this.line('for (as_gdraw* dr = (as_gdraw*)g->draws; dr != NULL; dr = dr->next) as_skia_path_add_transformed(p, dr->path, a, b, c, d, tx, ty);');
+    this.line('if (g->path != NULL) as_skia_path_add_transformed(p, g->path, a, b, c, d, tx, ty);');
+    this.indent--;
+    this.line('}');
+    // A Bitmap/TextField mask has no vector outline. AIR stencils with its PIXELS; we
+    // can only offer its box, and a silently wrong stencil is worse than a reported
+    // one, so it names itself once through the capped shell report.
+    this.line('if (as_is((void*)o, &Bitmap_vt) || as_is((void*)o, &TextField_vt)) {');
+    this.indent++;
+    this.line('double bl, bt, br, bb;');
+    this.line('if (as_bounds_walk(o, 0, 0, &bl, &bt, &br, &bb)) {');
+    this.indent++;
+    this.line('void* box = as_skia_path_new();');
+    this.line('as_skia_path_add_rect(box, bl, bt, br - bl, bb - bt);');
+    this.line('as_skia_path_add_transformed(p, box, a, b, c, d, tx, ty);');
+    this.line('as_skia_path_delete(box);');
+    this.line('as_shell_unsupported("DisplayObject.mask whose mask is a Bitmap/TextField (stencilled by its box, not its pixels)");');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('if (as_is((void*)o, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* mc = (DisplayObjectContainer*)o;');
+    this.line('if (mc->children != NULL) {');
+    this.indent++;
+    this.line('for (int i = 0; i < mc->children->length; i++) {');
+    this.indent++;
+    this.line('DisplayObject* ch = (DisplayObject*)as_v_obj_val(mc->children->data[i]);');
+    this.line('if (ch == NULL) continue;');
+    this.line('double ca, cb, ccn, cd, ctx, cty;');
+    this.line('as_do_matrix(ch, &ca, &cb, &ccn, &cd, &ctx, &cty);');
+    this.line('double na, nb, nc, nd, ntx, nty;');
+    this.line('as_mat_mul(a, b, c, d, tx, ty, ca, cb, ccn, cd, ctx, cty, &na, &nb, &nc, &nd, &ntx, &nty);');
+    this.line('as_mask_ink(ch, p, na, nb, nc, nd, ntx, nty);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // The stencil in THIS object's PARENT space -- the space as_render_object clips in
+    // (the object's own translate/rotate/scale has not been applied yet there). The
+    // mask's chain is composed against the parent's chain, so a mask hanging under a
+    // different container still lands where AIR puts it.
+    this.line('static void* as_mask_path(DisplayObject* o, DisplayObject* m) {');
+    this.indent++;
+    this.line('double pa = 1.0, pb = 0.0, pc = 0.0, pd = 1.0, ptx = 0.0, pty = 0.0;');
+    this.line('if (o->parent != NULL) as_to_stage_matrix((DisplayObject*)o->parent, &pa, &pb, &pc, &pd, &ptx, &pty);');
+    this.line('double ia, ib, ic, id, itx, ity;');
+    this.line('if (!as_mat_invert(pa, pb, pc, pd, ptx, pty, &ia, &ib, &ic, &id, &itx, &ity)) return NULL;');
+    this.line('double ma, mb, mc, md, mtx, mty;');
+    this.line('as_to_stage_matrix(m, &ma, &mb, &mc, &md, &mtx, &mty);');
+    this.line('double a, b, c, d, tx, ty;');
+    this.line('as_mat_mul(ia, ib, ic, id, itx, ity, ma, mb, mc, md, mtx, mty, &a, &b, &c, &d, &tx, &ty);');
+    this.line('void* p = as_skia_path_new();');
+    this.line('as_mask_ink(m, p, a, b, c, d, tx, ty);');
+    this.line('as_skia_path_close_all(p);');
+    this.line('return p;');
+    this.indent--;
+    this.line('}');
+    // The hit-test side of the same stencil: the point arrives in THIS object's local
+    // space and has to end up in the MASK's local space, i.e. local -> parent ->
+    // stage -> mask. AIR answers (55,30)=true / (80,30)=false / (25,30)=false for the
+    // masked box above, so object-only and mask-only points are both misses.
+    // `as_mask_busy` bounds a mask that is itself masked (AIR accepts the assignment
+    // and does not chase cycles); one level of stencilling is all the app ever asks.
+    this.line('static int as_mask_busy = 0;');
+    this.line('static bool as_mask_gate(DisplayObject* o, double lx, double ly) {');
+    this.indent++;
+    this.line('DisplayObject* m = o->_mask_ref;');
+    this.line('if (m == NULL) return true;');
+    this.line('if (as_mask_busy) return true;');
+    this.line('double oa, ob, oc, od, otx, oty;');
+    this.line('as_do_matrix(o, &oa, &ob, &oc, &od, &otx, &oty);');
+    this.line('double px = oa * lx + oc * ly + otx, py = ob * lx + od * ly + oty;');
+    this.line('double pa = 1.0, pb = 0.0, pc = 0.0, pd = 1.0, ptx = 0.0, pty = 0.0;');
+    this.line('if (o->parent != NULL) as_to_stage_matrix((DisplayObject*)o->parent, &pa, &pb, &pc, &pd, &ptx, &pty);');
+    this.line('double gx = pa * px + pc * py + ptx, gy = pb * px + pd * py + pty;');
+    this.line('double ma, mb, mc, md, mtx, mty;');
+    this.line('as_to_stage_matrix(m, &ma, &mb, &mc, &md, &mtx, &mty);');
+    this.line('double ja, jb, jc, jd, jtx, jty;');
+    this.line('if (!as_mat_invert(ma, mb, mc, md, mtx, mty, &ja, &jb, &jc, &jd, &jtx, &jty)) return true;');
+    this.line('double mx = ja * gx + jc * gy + jtx, my = jb * gx + jd * gy + jty;');
+    this.line('as_mask_busy = 1;');
+    this.line('bool hit = as_obj_region_hit_local(m, mx, my, 0);');
+    this.line('as_mask_busy = 0;');
+    this.line('return hit;');
+    this.indent--;
+    this.line('}');
     this.line('static bool as_obj_hit_local(DisplayObject* o, double lx, double ly) {');
     this.indent++;
+    this.line('if (!as_mask_gate(o, lx, ly)) return false;');
     this.line('double l, t, r, b;');
     this.line('if (!as_bounds_walk(o, 1, 0, &l, &t, &r, &b)) return false;');
     this.line('return lx >= l && lx <= r && ly >= t && ly <= b;');
@@ -19883,6 +20007,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly, int pick) {');
     this.indent++;
+    // DisplayObject.mask clips the region as well as the pixels (measured).
+    this.line('if (!as_mask_gate(o, lx, ly)) return false;');
     // `pick` selects the mouse-pick flavour of the same region: an invisible subtree
     // is not a target (AIR never dispatches into one), and a SimpleButton contributes
     // its HIT state instead of nothing. hitTestPoint(shapeFlag=true) passes 0 and keeps
@@ -19963,7 +20089,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)obj;');
     this.line('if (o == NULL || !o->visible) return NULL;');
-    this.line('if (o->_mask_object) return NULL; // a mask object is not a hit target either');
+    this.line('if (o->_mask_object || o->_mask_user) return NULL; // a mask object is not a hit target either');
     this.line('double ia, ib, ic, id, itx, ity;');
     this.line('if (!as_mat_invert(a, b, c, d, tx, ty, &ia, &ib, &ic, &id, &itx, &ity)) return NULL;');
     this.line('double lx = ia * x + ic * y + itx, ly = ib * x + id * y + ity;');
@@ -26776,7 +26902,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // application's own request.
     this.line('static int as_draw_count(DisplayObject* o) {');
     this.indent++;
-    this.line('if (o == NULL || o->_mask_object || !o->visible) return 0;');
+    this.line('if (o == NULL || o->_mask_object || o->_mask_user || !o->visible) return 0;');
     this.line('if (o->filters != NULL && o->filters->length > 0) return 2;');
     this.line('if (as_v_is_number(o->opaqueBackground)) return 2;');
     this.line('if (as_is((void*)o, &Bitmap_vt)) return as_bmd_visible_image(((Bitmap*)o)->bitmapData) != NULL ? 1 : 0;');
@@ -26818,7 +26944,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // outline became the clip path of the siblings in its depth range. Skipping the
     // whole subtree is right for a sprite mask too — AIR renders it into the mask
     // buffer, never into the visible output.
-    this.line('if (o->_mask_object) return;');
+    this.line('if (o->_mask_object || o->_mask_user) return;');
     // Snapshot scrollRect's rendered translation for the coordinate APIs. This is
     // deliberately before the cached-paint branch: a cache hit is still a rendered
     // frame in AIR and must refresh the concatenated-transform answer.
@@ -26834,6 +26960,17 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_canvas_save(canvas);');
     this.line('int clip_on = (o->_clip_path != NULL);');
     this.line('if (clip_on) as_skia_canvas_clip_path(canvas, o->_clip_path, 1);');
+    // DisplayObject.mask stencils the object with the mask's ink, in the same PARENT
+    // space and at the same point in the pipeline as the clipDepth clip above (see the
+    // measurement table in as_mask_path): a mask is a sibling, so it must not follow
+    // the object's transform. The path is per-frame scratch (SkCanvas::clipPath copies
+    // it), hence the delete.
+    this.line('if (o->_mask_ref != NULL) {');
+    this.indent++;
+    this.line('void* mp = as_mask_path(o, o->_mask_ref);');
+    this.line('if (mp != NULL) { as_skia_canvas_clip_path(canvas, mp, 1); as_skia_path_delete(mp); }');
+    this.indent--;
+    this.line('}');
     this.line('int alpha_on = (o->alpha < 1.0);');
     this.line('double keep_alpha_mul = ASC_alpha_mul;');
     this.line('int alpha_fold = (alpha_on && as_single_primitive(o));');

@@ -1319,7 +1319,90 @@ function checkParentAccessor(): string[] {
   return bad;
 }
 
-registerGroup('unit: display/HitShape', checkHitShape);registerGroup('unit: display/ParentAccessor', checkParentAccessor);
+// ---- DisplayObject.mask: the stencil (阶段三百一十八) ----
+//
+// AIR uses the mask object as a BINARY STENCIL, and every detail of that showed up
+// in the adl measurements (temp/mask/MaskProbe*.as): the mask's alpha and its
+// `visible` flag are ignored, its ink comes from its own graphics AND its children
+// (holes kept), the stencil sits in the mask's own ancestor chain rather than the
+// masked object's local pixels, and the mask itself is never painted, never counted
+// as a primitive and never picked. The PIXELS are pinned by examples/display-mask.as
+// (a real Skia build); what a source-level test can pin is the SHAPE of the emitted
+// code, which is where a silent regression would hide.
+function checkDisplayObjectMask(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [mask] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [mask] ${label}`); }
+  };
+
+  const c = generateC(parse('import flash.display.Sprite;\nimport flash.display.Shape;\n' +
+    'var p:Sprite = new Sprite();\nvar box:Sprite = new Sprite();\nvar m:Shape = new Shape();\n' +
+    'p.addChild(box);\np.addChild(m);\nbox.mask = m;\n')).c;
+
+  // The backing field that says "I am somebody's mask" lives on DisplayObject ...
+  check('DisplayObject carries the _mask_user flag', /bool _mask_user;/.test(c));
+  // ... and the accessor pair maintains it (mask=null must put the mask back on
+  // screen as an ordinary child -- measured, MaskProbe case C).
+  check('set_mask clears the flag on the old mask and sets it on the new one',
+    c.includes('if (o->_mask_ref != NULL) o->_mask_ref->_mask_user = false;') &&
+    c.includes('{ gc_write_barrier((void*)value); value->_mask_user = true; }'));
+  check('set_mask no longer reports the property as unimplemented',
+    !c.includes('as_shell_unsupported("DisplayObject.mask (this renderer does not apply masks)")'));
+  check('get_mask still round-trips by identity', c.includes('return o->_mask_ref;'));
+
+  // The paint path: a clip in the object's PARENT space, issued after the save and
+  // BEFORE the object's own translate (a mask is a sibling and must not travel).
+  check('as_render_object clips to the mask stencil',
+    c.includes('if (o->_mask_ref != NULL) {\n    void* mp = as_mask_path(o, o->_mask_ref);\n    if (mp != NULL) { as_skia_canvas_clip_path(canvas, mp, 1); as_skia_path_delete(mp); }'));
+  const renderBody = c.slice(c.indexOf('static void as_render_object(void* canvas, DisplayObject* o) {'));
+  const iSave = renderBody.indexOf('as_skia_canvas_save(canvas);');
+  const iMask = renderBody.indexOf('void* mp = as_mask_path(o, o->_mask_ref);');
+  const iXlate = renderBody.indexOf('as_skia_canvas_translate(canvas, o->x, o->y);');
+  check('the mask clip lands between the save and the object transform',
+    iSave >= 0 && iMask > iSave && iXlate > iMask);
+
+  // The stencil itself: own graphics + descendants (a union that keeps holes), and
+  // the mask's own ancestor chain composed against this object's parent chain.
+  check('the stencil collects the mask draws and its legacy path',
+    c.includes('for (as_gdraw* dr = (as_gdraw*)g->draws; dr != NULL; dr = dr->next) as_skia_path_add_transformed(p, dr->path, a, b, c, d, tx, ty);') &&
+    c.includes('if (g->path != NULL) as_skia_path_add_transformed(p, g->path, a, b, c, d, tx, ty);'));
+  check('the stencil recurses into the mask children (union, holes preserved)',
+    c.includes('as_mask_ink(ch, p, na, nb, nc, nd, ntx, nty);'));
+  const inkBody = c.slice(c.indexOf('static void as_mask_ink(DisplayObject* o, void* p'), c.indexOf('static void* as_mask_path(DisplayObject* o, DisplayObject* m) {'));
+  check('the stencil ignores the mask visible flag (measured: an invisible mask still clips)',
+    inkBody.length > 0 && !inkBody.includes('->visible'));
+  check('the stencil is built in the parent space from the mask own chain',
+    c.includes('if (o->parent != NULL) as_to_stage_matrix((DisplayObject*)o->parent, &pa, &pb, &pc, &pd, &ptx, &pty);\n  double ia, ib, ic, id, itx, ity;\n  if (!as_mat_invert(pa, pb, pc, pd, ptx, pty, &ia, &ib, &ic, &id, &itx, &ity)) return NULL;'));
+  check('a Bitmap/TextField mask falls back to its box and says so once',
+    c.includes('as_shell_unsupported("DisplayObject.mask whose mask is a Bitmap/TextField (stencilled by its box, not its pixels)");'));
+
+  // Hit testing consults the same stencil, on both flavours (the box test behind
+  // hitTestPoint(x, y, false) and the region test behind shapeFlag=true and the
+  // mouse pick).
+  check('both hit-test flavours consult the mask gate',
+    c.includes('static bool as_obj_hit_local(DisplayObject* o, double lx, double ly) {\n  if (!as_mask_gate(o, lx, ly)) return false;') &&
+    c.includes('static bool as_obj_region_hit_local(DisplayObject* o, double lx, double ly, int pick) {\n  if (!as_mask_gate(o, lx, ly)) return false;'));
+  check('the gate maps local -> parent -> stage -> mask',
+    c.includes('double gx = pa * px + pc * py + ptx, gy = pb * px + pd * py + pty;') &&
+    c.includes('bool hit = as_obj_region_hit_local(m, mx, my, 0);'));
+  check('the gate is cycle safe (as_mask_busy)',
+    c.includes('static int as_mask_busy = 0;') && c.includes('if (as_mask_busy) return true;'));
+
+  // A mask object is not a painter, not a draw-count primitive and not a hit target.
+  check('a mask object is skipped by the paint path',
+    c.includes('if (o->_mask_object || o->_mask_user) return;'));
+  check('a mask object is skipped by the draw counter (alpha folding)',
+    c.includes('if (o == NULL || o->_mask_object || o->_mask_user || !o->visible) return 0;'));
+  check('a mask object is not a hit target',
+    c.includes('if (o->_mask_object || o->_mask_user) return NULL;'));
+
+  if (ok > 0) console.log(`[mask] ${ok} DisplayObject.mask checks passed`);
+  return bad;
+}
+
+registerGroup('unit: display/HitShape', checkHitShape);registerGroup('unit: display/DisplayObjectMask', checkDisplayObjectMask);registerGroup('unit: display/ParentAccessor', checkParentAccessor);
 registerGroup('unit: swc/TextChildOrigin', checkSwcTextChildOrigin);
 registerGroup('unit: display/McButtonState', checkMcButtonState);
 registerGroup('unit: display/PerStagePointer', checkPerStagePointer);

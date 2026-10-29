@@ -826,6 +826,54 @@ as_skia_canvas_restore(canvas);                    // 只够关掉「对象自�
 所以本轮只做「单图元」这一档，其余留给后续阶段（已入 `TODO.md` 遗留表）。
 
 
+### 6.15 `DisplayObject.mask` 是**二值模板**，不是 alpha 合成（阶段三百一十八）
+
+`DisplayObject.mask` 此前只存不生效（`set_mask` 里一句 `as_shell_unsupported` 响亮上报）。
+这一节记的是把它真正接进渲染管线时必须先知道的口径 —— 因为「遮罩」在 Flash 圈里常被当成
+「alpha 通道相乘」，而 **AIR 不是**。
+
+**adl 51.4.1 实测**（三个探针，`temp/mask/MaskProbe.as` / `MaskProbe2.as` / `MaskProbe3.as`，
+全部用 `BitmapData.draw` 逐像素取样，探针各自独立的容器，互不干扰）：
+
+| 问题 | adl 的答案 | 推论 |
+|---|---|---|
+| 遮罩的 alpha 参与合成吗？ | `alpha` = 0 / 0.25 / 0.5 / 0.75、以及 alpha 0→1 的**渐变填充**遮罩，被遮对象**全部**保持 `0xFF…` 实心 | 遮罩是**模板（stencil）**，等价于 `clipPath`；不是 `kDstIn` |
+| 遮罩的 `visible` 参与吗？ | `mask.visible = false` 的对象**照样被裁**，且露出的是**自己的**颜色 | `visible` 被忽略；遮罩不上屏 |
+| 覆盖范围取谁的变换？ | 40×40 遮罩 @(20,20) 裁 100×100 对象 @(50,10) ⇒ y=30 行只剩 `x=50..59` | 取**遮罩自己的**变换，落在两者共同的父空间 |
+| 遮罩在**别的容器**里呢？ | 遮罩挂在 `x=100` 的容器里 ⇒ 裁剪区 = `100..139`（对象在 `50..149`） | 取遮罩**自己的祖先链**（舞台空间），不是「当成对象的子件」 |
+| 遮罩可以有子件吗？ | 两个 20 宽子矩形（x=0/x=60）⇒ `0..19` 与 `60..79` 亮、中间是洞 | 子件参与，**并集保洞**（多轮廓路径） |
+| 遮罩不在显示列表呢？ | 照样生效 | 不需要 `parent` |
+| 遮罩没有墨迹呢？ | 什么都不画 | 空路径裁剪 = 全裁 |
+| 影响 `getBounds`/`width`/`height` 吗？ | 不影响（`(50,10,100,100)` / `100×100`） | 只动像素 |
+| 影响命中测试吗？ | `hitTestPoint(55,30,true)=true`（都覆盖）、`(80,30)=false`（只有对象）、`(25,30)=false`（只有遮罩） | 框测与区域测都要查遮罩 |
+
+**实现**（`src/emit.ts`）：
+
+- `as_mask_ink(o, path, a..ty)`：把遮罩对象的**墨迹**累进一条 `SkPath` —— `Graphics` 的每个
+  draw 与历史 `g->path`，容器则递归（子件的 `as_do_matrix` 左乘进来，天然是并集且保洞）。
+  刻意**不看 `o->visible`**（实测不参与）。
+- `as_mask_path(o, m)`：`T = inverse(chain(parent(o))) ∘ chain(m)`（都用 `as_to_stage_matrix`），
+  于是路径落在 `as_render_object` **裁剪那一刻的父空间**里。
+- `as_render_object`：在 clipDepth 的 `_clip_path` 之后、对象的 `translate/rotate/scale` **之前**
+  `sk_canvas_clip_path`（兄弟节点，不能跟着对象跑 —— 同 §3.4⑦ 的教训），用完 `sk_path_delete`。
+- `as_mask_gate(o, lx, ly)`：把点 `local(o) → parent → stage → local(m)` 后问
+  `as_obj_region_hit_local(m, …, 0)`；挂在 `as_obj_hit_local`（`hitTestPoint(false)` 的框）
+  与 `as_obj_region_hit_local`（`shapeFlag=true` 与鼠标 pick）的入口。`as_mask_busy` 兜住
+  「遮罩自己也有遮罩」的环。
+- `DisplayObject._mask_user`（`src/symbols.ts`）：遮罩对象自己带一枚「我是别人的遮罩」标记，
+  于是 `as_render_object` / `as_draw_count` / `as_pick_hit_m` 三处像 `_mask_object` 一样整体跳过。
+  `set_mask` 负责置/清它 —— 也正因为会清，`o.mask = null` 能把遮罩当普通子件放回画面（实测）。
+
+**已知缺口（刻意报明，不静默降级）**：
+
+- 遮罩是 `Bitmap` / `TextField` 时没有矢量轮廓，退回**它的包围盒**，并用 `as_shell_unsupported`
+  报一次（AIR 是按像素模板裁的）。
+- 只有描边没有填充的遮罩：`clipPath` 只认填充区域 ⇒ 描边带不进模板。
+- 遮罩自己带 `filters` / `blendMode` 时，模板只取几何（实测未覆盖这一档）。
+
+验收：`examples/display-mask.as`（A~F 六组，数值逐条来自上表）＋ `unit: display/DisplayObjectMask`
+（17 条发射形态断言）；变异 7/7 全红（`temp/mask/mutate.cjs`：不裁剪 / 忽略遮罩祖先链 / 区域测
+不查遮罩 / 遮罩照样绘制 / `mask=null` 不摘标记 / 不递归子件 / 把 `visible` 计入）。
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

@@ -701,7 +701,7 @@ function checkSwcTimeline(): string[] {
   // The window (rather than an exact-adjacency regex) is deliberate: statements may be
   // inserted between the save and the translate (e.g. the `alpha_on` local that pairs
   // with the saveLayerAlpha restore) without changing what this pin is about.
-  const clipBlock = /as_skia_canvas_save\(canvas\);[\s\S]{0,400}?as_skia_canvas_translate\(canvas, o->x, o->y\);/.exec(c);
+  const clipBlock = /as_skia_canvas_save\(canvas\);[\s\S]{0,1200}?as_skia_canvas_translate\(canvas, o->x, o->y\);/.exec(c);
   check('the clipDepth clip is applied BEFORE the object transform',
     !!clipBlock && clipBlock[0].includes('if (clip_on) as_skia_canvas_clip_path(canvas, o->_clip_path, 1);'));
   // The MovieClip runtime calls as_swc_bind long before the bake defines it, and a

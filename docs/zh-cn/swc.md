@@ -488,7 +488,7 @@ error: class 'mx.core.BitmapAsset' is only available as AVM2 bytecode inside
 **⑥ 与位图方案的关系**：73 处位图填充引用的正是那 59 个位图 tag 中的 39 张——**矢量与位图是同一条
 通道的两半，不能只做一半**。运行时侧的缺口与体积量级见 §5.3。
 
-#### 3.4⑦ `DefineMorphShape`/`2`（morph）：两套几何 + `Ratio` 插值（阶段三百一十四，v0.4.278）
+#### 3.4⑦ `DefineMorphShape`/`2`（morph）：两套几何 + `Ratio` 插值（阶段三百一十七，v0.4.278）
 
 morph 就是「同一条矢量在两端之间的线性插值」。SWF 规范要求两套几何的点与曲线**逐点对应**，
 所以它天然是逐点 `lerp`，不需要任何形状匹配算法。本库只有 6 个（tag 46 ×4、tag 84 ×2），
@@ -1845,7 +1845,7 @@ vtable 由 `… NULL, -1, "AIAsrComBox", 0, 0, 0, …` 变为
 | `DefineBitsJPEG4`（tag 90） | 实测 `examples/embed-assets/skin.swc` 无；与 JPEG3 同族（tag 35 **已支持**，§3.2③），随手支持即可。**注意**：`CHARACTER_TAG_KINDS` 已把它归为 `bitmap`，但提取器只处理 20/21/35/36 ⇒ 真遇到 tag 90 会在 `swcBakePlan` 的位图分支上以一句**误导性**的 `bitmap fill references missing bitmap #N` 失败（应按 JPEG4 报明） |
 | ~~九宫格缩放（`DefineScalingGrid`，实测 22 个）~~ **已实现**（§9 F/§9.2 F1）；但 **AS3 侧的 `DisplayObject.scale9Grid` 属性尚未实现** | 工程只从 SWF tag 烘焙九宫格，运行时**没有**可读写的 `scale9Grid` 属性（AIR 有）。即：SWF 皮肤里的缩放不会糊，但用户代码无法自己设置/查询它。 已按 §1.5 记入 `TODO.md` 的 `### 遗留待开发` |
 | `BitmapData.draw(source, matrix)` 对 source **自身变换**的处理与 AIR 不同 | 实测 `adl`：给被绘对象设 `o.scaleX = 2` 在 `draw(source, matrix)` 中**无效**（只受 `matrix` 参量影响）； 我们的实现会应用它。探针因此统一改为先包一层容器再 draw。**未定案**，记入 `### 遗留待开发` |
-| ~~形变 shape（`DefineMorphShape`/`2`，实测 6 个）~~ **已实现**（§3.4⑦，阶段三百一十四，v0.4.278） | 两端几何逐点插值 + `PlaceObject2.Ratio` 驱动；显示盒按 AIR 实测钉在**起始形**。**剩余缺口**：morph 当 `clipDepth` 遮罩、帧尾「删旧换新」都依赖逐帧遮罩记录 ⇒ 归阶段三，现状是一句 `notes` 报明 + 少一个子件 |
+| ~~形变 shape（`DefineMorphShape`/`2`，实测 6 个）~~ **已实现**（§3.4⑦，阶段三百一十七，v0.4.278） | 两端几何逐点插值 + `PlaceObject2.Ratio` 驱动；显示盒按 AIR 实测钉在**起始形**。**剩余缺口**：morph 当 `clipDepth` 遮罩、帧尾「删旧换新」都依赖逐帧遮罩记录 ⇒ 归阶段三，现状是一句 `notes` 报明 + 少一个子件 |
 | ~~按钮四态（`DefineButton2`，实测 29 个）~~ **已实现**（§9 F/§9.2 F2） | `ButtonRecord.states` 位掩码 + 绘制时状态机（`as_sbtn_state`）；离屏与 `adl` 逐像素一致 |
 | 时间轴动画（`DefineSprite` 多帧 + `FrameLabel`）~~ **已实现**（§9.2 F6，v0.4.68） | 逐帧差值（增/替/改/删）在编译期烘焙，`gotoAndStop`/`nextFrame`/`prevFrame`/`currentLabels` 与 `adl` 逐项一致（68 行 0 差异）；79 个多帧 sprite / 514 个 op / 89 条 `FrameLabel`；回到旧帧按「同一 (父, 深度, 角色) 复用子件」对齐（阶段一百七十二，D43）。**残留**：① 时间轴子件的 `name` 恒 `null`（AIR 自动命名 `instanceN`，SWF 记录里没有 `Name` 字段）；② 帧脚本（DoABC）**自 v0.4.127 起由编译期解码并真的执行**（§3.3 收口）—— 皮肤符号里的 `stop()` 就是文件里写着的，执行它才是对齐 AIR（此前「一律停在第 1 帧」的那条旧描述已作废）；③ morph 时间轴的 `Ratio` 记录被丢弃（morph 是空占位子件）；④ 前进方向「`Move` + 新字符」AIR 保留原对象身份而我方换新对象（D43b，烘培类一个角色一个类所致） |
 | MovieClip 按钮态的**结算时机** | 三种按钮态在**绘制/指纹 pass** 结算（与 `as_sbtn_state` 同一口径），因此一个从不 `render`、也没有窗口的离屏程序里，`dispatchMouse` 之后 `currentFrame` 不会自己变；真实 App（窗口每帧走这条 pass）与 `stage.render` 下行为与 `adl` 逐档一致（§9.2 F8） |
