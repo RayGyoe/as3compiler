@@ -17757,7 +17757,48 @@ Windows 本机实跑覆盖。
 **验收**：`as-aot examples/s3d-upload-bounds.as --run` ⇒ `s3d-upload-bounds: OK`；
 `node --test --test-name-pattern='stage3d/'` ⇒ 63 pass / 0 fail；全量回归见下。
 
+### 阶段三百二十一：封闭编译面的叶子类普通方法去虚化（v0.4.281 → v0.4.282）
+
+**范围与证明**：按 [`docs/zh-cn/devirtualization.md`](docs/zh-cn/devirtualization.md) 的阶段 A 落地，
+不做访问器、`final` 或 private 的顺手扩面。符号收集完成后，从完整 `SymbolTable` 的 `superClass`
+链接做一次 O(类数) 遍历，得到本次编译真正包含的内建、用户与 SWC/Embed 合成类中的 `leafClasses`。
+静态接收者是叶子类时，普通实例方法直调 nearest-wins 解析结果 `m.owner` 的实现——`Leaf extends Base`
+且未覆盖 `Base.inherited` 时生成 `Base_inherited(leaf)`，不会虚构 `Leaf_inherited`；基类引用仍必须
+经 vtable 到达真实 override。
+
+**发射面**：显式 `obj.method()`、隐式 `this.method()` 与 sealed `with` 中解析到同一普通方法的
+调用共用 `instanceMethodCallCode()`。private 与 `flash_proxy` 被显式排除；动态、接口、`super`、
+static、访问器与方法值 bound thunk 原路径不变。接收者与参数仍复用原发射结果，`as_req_obj`、
+单次求值和求值顺序不改。`adl 51.4.1` 对照还确认：null 接收者的参数**先求值**再抛 `#1009`，
+测试按这个实测口径断言，没有凭 C 直觉改运行时。
+
+**回归**：新 `examples/devirtualization.as` 覆盖祖先 owner、隐式 this、真实 override、动态/接口/Proxy、
+`super`、sealed `with`、接收者/参数单次求值与 null 异常；同构 AIR 文档类探针和 AOT 均输出
+`devirtualization: OK`。新 `unit: devirtualization/LeafOrdinaryMethods`（14 钉）同时钉直调形态与
+保留路径；既有 `unit: builtin/Arity` 与 `unit: render/SwcTimeline` 的旧 vtable 形态钉改为等价的
+owner 直调形态，默认参数、时间轴 `stop` 等语义断言不减弱。
+
+**真实应用同 HEAD 对照**（同一 TalkMED 源码、描述符、SWC、后端与参数；两份 C 均 408,776 行）：
+
+| 指标 | HEAD | 本阶段 | 变化 |
+|---|---:|---:|---:|
+| 调用形态 `->vtable->name(` | 18,707 | 12,129 | **-6,578（-35.2%）** |
+| 生成 C 字节数 | 30,614,788 | 30,370,810 | -243,978（-0.80%） |
+| 原生二进制字节数 | 23,343,536 | 23,343,520 | -16（约 0%） |
+| 单次完整构建墙钟 | 97.20 s | 91.35 s | 单点读数，不作结论 |
+
+三轮交替的「启动 + 登录窗口空闲 15 秒」进程 CPU 均值：HEAD **1.270215 s**、本阶段
+**1.306662 s**（样本均值高 2.9%，运行有波动且应用网络活动不固定）。因此只报告
+**该场景未观察到稳定加速**，不把 35.2% 静态覆盖换算成性能收益，也不据此宣称全局回退。
+后续动态 profile 需要无网络、固定输入的独立基准。
+
+**文档与版本**：中英文 `devirtualization.md` 改为阶段 A 实施记录，补同 HEAD 静态/体积与
+限定场景动态数据；README 中英文同步；版本 **v0.4.282**。
+
+**全量验收**：`node test.ts` ⇒ **556 passed / 0 failed**。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百二十一：叶子类普通方法去虚化）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表仍 **115 项**。本阶段只改变有封闭编译面证明的 C 调用形态，不改 AS3 可见语义；访问器、`final`、private 与方法值 thunk 属设计文档中既定的后续独立阶段，不作为本轮新遗留重复登记。
 > **2026-10-30 追加（阶段三百二十：Stage3D 六个上传入口的边界契约）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表（`遗留项|状态|说明|建议`）行数 **114 → 115**（`未开始` 按列二含该词重数 **92 → 93**；上一轮 note 标 90，与实测差 2，本轮按实测记账，与阶段三百一十四/三百一十五 记过的同类偏差同因）。**本阶段修净的全都不占表**：`uploadFromByteArray` 的静默截断、负目标的越界写、短数组错报 `#2004`、`Texture.uploadFromByteArray` 的 `miplevel > 0` 报明、`uploadFromVector` 按 `startVertex` 起读、`uploadFromBitmapData` 越界 level 静默 `return` —— 六处都是「`adl` 跑得对我们跑不出/跑错」，属 §1.5 遗留缺陷，但同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**新登记 1 行**＝`CubeTexture.uploadFromByteArray`（仍是响亮 stub；`adl` 支持逐面从 ByteArray 上传，本轮未测它的字节布局与 `side` 语义，故只登记不改）。**顺带修掉一处文档错位**：阶段三百一十九 的章节此前被错插在阶段六十四 的正文里（还留下一行带反引号的 `### 遗留待开发`），本次搬回本节序列尾部。口径与实测表见 `docs/zh-cn/display3d.md` §9.15。
 > **2026-10-29 追加（阶段三百一十九：逐帧 `clipDepth` 遮罩）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**113 → 114 行**（`未开始` **89 → 90**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**本阶段修净的四条不占表**：morph 遮罩被裁空、sprite 遮罩无裁剪、帧尾换字符少一个子件、以及「遮罩 stencil 混进零宽描边组」——前两条此前是 `notes` 报明的**响亮缺口**、后两条是实错，均同阶段落地（`docs/zh-cn/swc.md` §9.2 F12）。**新登记 1 行**是唯一**刻意保留的偏差**：AIR 的 `clipDepth` stencil 对 morph 遮罩**不跟随 ratio**（f1..f99 同框，只有帧 100 换字符才变），我们跟随当前几何，两侧像素因此在 morph 动画期间不同 —— 复刻路径已探明（`_mdecl` 声明盒），但要不要复刻属产品判断。
 > **2026-10-29 追加（阶段三百一十八：`DisplayObject.mask` 真实现）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**112 → 113 行**（`未开始` **88 → 89**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**本阶段修净的不占表**：`DisplayObject.mask` 此前根本不生效（`set_mask` 里一句 `as_shell_unsupported`），按 §1.5 属「`adl` 跑得对、我们跑不出」的遗留缺陷，但同阶段落地 ⇒ 不入表；落地的口径（二值模板、遮罩自己的祖先链、子件并集保洞、离屏遮罩、不看 `alpha`/`visible`、不影响 `getBounds` 但影响命中）逐条来自 `adl` 实测，见 `docs/zh-cn/skia.md` §6.15。**新登记 1 行**是非矢量遮罩那三档（`Bitmap`/`TextField` 遮罩只到包围盒、纯描边遮罩、遮罩自带滤镜/混合）——它们既未实测也未实现，且我们现在是**响亮**回退而不是静默。

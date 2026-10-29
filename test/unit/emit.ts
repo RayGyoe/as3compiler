@@ -2153,15 +2153,15 @@ function checkBuiltinArity(): string[] {
   const callLine = (needle: string, nth = 0): string =>
     c.split('\n').filter((l) => l.includes(needle))[nth] ?? '<<no such call>>';
   check('drawTriangles(ib) emits the AIR defaults (idx 0, triangles -1)',
-    callLine('->drawTriangles(').trim().endsWith('ib, 0, -1));'));
+    callLine('Context3D_drawTriangles(((Context3D*)').trim().endsWith('ib, 0, -1));'));
   check('drawTrianglesInstanced(ib, 3) fills numInstances (NOT firstIndex) with 3',
-    callLine('->drawTrianglesInstanced(').trim().endsWith('ib, 3, 0, -1));'));
+    callLine('Context3D_drawTrianglesInstanced(((Context3D*)').trim().endsWith('ib, 3, 0, -1));'));
   check('…and a three-argument call fills firstIndex after numInstances',
-    callLine('->drawTrianglesInstanced(', 1).trim().endsWith('ib, 3, 1, -1));'));
+    callLine('Context3D_drawTrianglesInstanced(((Context3D*)', 1).trim().endsWith('ib, 3, 1, -1));'));
   check('configureBackBuffer(1,1,0) emits depth/stencil true and both resolution flags false',
-    callLine('->configureBackBuffer(').trim().endsWith('((unsigned int)(0)), true, false, false));'));
+    callLine('Context3D_configureBackBuffer(((Context3D*)').trim().endsWith('((unsigned int)(0)), true, false, false));'));
   check('setProgramConstantsFromMatrix(..., 0, m) emits transposedMatrix false',
-    callLine('->setProgramConstantsFromMatrix(').trim().endsWith('"vertex", 0, m, false));'));
+    callLine('Context3D_setProgramConstantsFromMatrix(((Context3D*)').trim().endsWith('"vertex", 0, m, false));'));
   // The C helper signature must use the SAME order as the AS3 parameter list --
   // otherwise the call above would compile and silently swap the two ints.
   check('the C helper takes the AIR order too (numInstances before firstIndex)',

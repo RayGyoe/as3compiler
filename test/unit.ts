@@ -49,3 +49,4 @@ import './unit/async-workers.ts';
 import './unit/release.ts';
 import './unit/sort-dtoa-cast.ts';
 import './unit/windows-release.ts';
+import './unit/devirtualization.ts';

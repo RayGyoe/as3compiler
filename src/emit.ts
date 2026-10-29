@@ -472,6 +472,13 @@ export class Emitter {
   // them; a built-in with all-optional params keeps the NULL factory.
   private userClasses = new Set<string>();
 
+  // Closed-world leaf classes in THIS compilation. A leaf-typed receiver cannot
+  // hold a subclass instance, so a resolved public/protected/internal method may
+  // call its owner's implementation directly. The set includes built-ins and all
+  // synthesized source classes because it is derived from the completed symbols,
+  // not from a second scan of the input files.
+  private leafClasses = new Set<string>();
+
   // C names whose argument-carrying ctor thunk (`X_ctorfn`) was actually emitted
   // into the getDefinitionByName registry, so the SWC alias entries can only
   // reference one that exists.
@@ -556,6 +563,13 @@ export class Emitter {
     // answered an empty version and the update check compared nothing).
     this.appDescriptorXml = appDescriptorXml;
     this.aneDescriptors = aneDescriptors;
+    const subclassed = new Set<string>();
+    for (const info of this.symbols.classes.values()) {
+      if (info.superClass !== null) subclassed.add(info.superClass);
+    }
+    for (const name of this.symbols.classes.keys()) {
+      if (!subclassed.has(name)) this.leafClasses.add(name);
+    }
   }
 
   // ---------- top level ----------
@@ -2525,6 +2539,20 @@ export class Emitter {
     // one in emitClassRegistry.
     for (const n of Object.keys(Emitter.CORE_CLASS_VT)) this.line(`static as_class as_corecls_${n};`);
     if (this.symbols.classes.size > 0) this.line('');
+  }
+
+  // Emit an ordinary instance-method call. Only a closed-world leaf receiver
+  // proves there can be no override; the target still comes from the existing
+  // nearest-wins resolution (`m.owner`), so Leaf extends Base without an
+  // override calls Base_m, never a fabricated Leaf_m. Private and flash_proxy
+  // methods are deliberately outside this first devirtualization slice.
+  // Receiver and argument code are reused verbatim, preserving the existing
+  // null guard, evaluation order and single evaluation.
+  private instanceMethodCallCode(receiverClass: string, m: MethodInfo, name: string, objCode: string, callArgs: string): string {
+    if (this.leafClasses.has(receiverClass) && m.visibility !== 'private' && !m.isProxyNs) {
+      return `(${m.owner}_${name}(${objCode}${callArgs}))`;
+    }
+    return `(${objCode}->vtable->${this.cIdent(name)}(${objCode}${callArgs}))`;
   }
 
   // Function-pointer field declaration for a vtable slot. The receiver is a
@@ -31715,7 +31743,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         if (m && !m.isProxyNs) {
           const args = this.emitArgs(m.params, expr.args, this.declAliasOf(m.owner));
           const callArgs = args ? ', ' + args : '';
-          return { code: `(${cid}->vtable->${this.cIdent(name)}(${cid}${callArgs}))`, type: m.returnType };
+          return { code: this.instanceMethodCallCode(sc.className!, m, name, cid, callArgs), type: m.returnType };
         }
         // A field/getter holding a Function value: AIR calls it with the object as
         // `this` (`with (cb) { fn() }` === `cb.fn()`, measured on adl 51.4.1 in
@@ -35085,7 +35113,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       const args = this.emitArgs(m.params, expr.args, this.declAliasOf(m.owner));
       const callArgs = args ? ', ' + args : '';
       return {
-        code: `(${obj.code}->vtable->${this.cIdent(callee.property)}(${obj.code}${callArgs}))`,
+        code: this.instanceMethodCallCode(obj.type.className, m, callee.property, obj.code, callArgs),
         type: m.returnType,
       };
     }
@@ -35113,7 +35141,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           // The receiver is `this` normally, or `env->this` when this call site
           // lives inside a closure that captured the enclosing `this`.
           const self = this.emitVar('this').code;
-          return { code: `(${self}->vtable->${this.cIdent(callee.name)}(${self}${callArgs}))`, type: m.returnType };
+          return { code: this.instanceMethodCallCode(this.currentClass, m, callee.name, self, callArgs), type: m.returnType };
         }
       }
       // An Array method called on `this` inside a `class X extends Array`

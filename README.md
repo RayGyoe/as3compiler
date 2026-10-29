@@ -214,6 +214,16 @@ The 5 further divergences the gate surfaced (`Array.sort(flag)` ignores every bi
 the 17-digit cap in the fixed-fraction branch breaks round-trips, extreme `String()` forms, `toFixed` half-way rounding direction) are each
 rowed in the `TODO.md` left-over table.
 
+**Leaf-class ordinary-method devirtualization (stage 321)**: within the closed compilation set, an ordinary
+instance-method call whose static receiver has no subclasses now calls the nearest-wins `m.owner` implementation
+directly; inherited methods never invent a `Leaf_method`. Explicit calls, implicit `this`, and sealed `with` are
+covered. Base-class polymorphism, dynamic/interface/Proxy dispatch, private members, accessors, and method-value
+thunks retain their existing paths. In a same-HEAD TalkMED comparison, call-shaped `->vtable->name(` occurrences
+fell **18,707 → 12,129 (-35.2%)**, generated C shrank by 0.80%, and the binary by only 16 bytes. Three launch-plus-
+15-second-idle A/B rounds showed no stable speedup. [`examples/devirtualization.as`](examples/devirtualization.as)
+and 14 structural pins cover owner selection, evaluation counts, null `#1009`, and retained paths; see
+[`devirtualization.md`](docs/en/devirtualization.md) for the design and measurements.
+
 **ANE loading (stage one-hundred-seventy-eight)**: `--ane` / the manifest's `ane-paths` switch on `ASC_HAVE_FRE` and wire in the host FRE runtime.
 Each entry may be an `.ane` package **or an unpacked directory** (`extension.xml` + `<platform key>/<native library>`, i.e. `adt`'s staging layout) —
 the latter is the default form of the artifact rebuilt for AOT: its native library imports the host library (`asaot.dll` on Windows, `libasaot.dylib` on macOS, which forwards into **the generated program's own table**),

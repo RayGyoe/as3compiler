@@ -248,6 +248,14 @@ GPU 画布上贴 CPU-raster 快照尤其贵）：`panel_bmp_192` **2.92 → 0.93
 性能读数也没动（`num_8000 0.094`、`cmp_4000 0.250`、`dbl_1600 5.078` µs/次）；唯一跑不完的是分配相位：
 看门狗在 `pt_4000`（1.675 s 帧）判死，而**同一个 exe 换到合并前的构建在同一相位同形状** ⇒ 属④那条，不是本轮带出来的。
 
+**叶子类普通方法去虚化（阶段三百二十一）**：在封闭编译面内，静态接收者没有子类时，普通实例方法
+直接调用 nearest-wins 解析出的 `m.owner` 实现；继承自祖先的方法不会虚构 `Leaf_method`。显式调用、
+隐式 `this` 与 sealed `with` 已接入；基类多态、动态/接口/Proxy、private、访问器和方法值 thunk 保持原路径。
+同 HEAD 的 TalkMED 对照中，调用形态 `->vtable->name(` **18,707 → 12,129（-35.2%）**，生成 C 减少 0.80%，
+二进制仅少 16 字节；登录窗口启动后空闲 15 秒的三轮 A/B 未观察到稳定加速。示例
+[`examples/devirtualization.as`](examples/devirtualization.as) 与 14 条结构钉覆盖 owner、求值次数、null `#1009`
+及保留路径；设计与实测见 [`devirtualization.md`](docs/zh-cn/devirtualization.md)。
+
 **ANE 加载（阶段一百七十八）**：`--ane` / 清单 `ane-paths` 打开 `ASC_HAVE_FRE` 并接上宿主 FRE 运行时。
 每一项可以是 `.ane` 包，也可以是**解包后的目录**（`extension.xml` + `<平台键>/<原生库>`，即 `adt` 的暂存布局）——
 后者是重编给 AOT 用的那份产物的默认形态：其原生库导入宿主库（Windows `asaot.dll` / macOS

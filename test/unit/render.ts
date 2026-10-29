@@ -742,7 +742,7 @@ function checkSwcTimeline(): string[] {
   // 且第 1 帧脚本真的执行 stop + buttonMode，与那个勾选框的脚本原文一致）：
   check('the DoABC frame scripts of checkbom are decoded and translated',
     c.includes('static as_value checkbom_frame1(void* _this) {') &&
-    /checkbom\* this = \(checkbom\*\)_this;\s*\(this->vtable->stop\(this\)\);\s*\(\(this->buttonMode\) = true\);/.test(c));
+    /checkbom\* this = \(checkbom\*\)_this;\s*\(MovieClip_stop\(this\)\);\s*\(\(this->buttonMode\) = true\);/.test(c));
   check('a frame-2 script is decoded too and its ternary survives translation',
     c.includes('static as_value checkbom_frame2(void* _this) {') &&
     c.includes('as_any_set_v(as_req_box(as_dyn_get((void*)(this), "label")), "text",') &&
