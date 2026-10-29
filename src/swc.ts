@@ -134,6 +134,8 @@ export interface SwcLibrary {
   bitmaps: SwcBitmap[];
   /** Every `DefineShape`/`2`/`3`/`4` vector character (swc.md §3.4). */
   shapes: SwcShape[];
+  /** Every `DefineMorphShape`/`DefineMorphShape2` character (swc.md §3.4⑦). */
+  morphs: SwcMorphShape[];
   /** Every `DefineSprite` timeline container (first frame is what static skins use). */
   sprites: SwcSprite[];
   /** Every `DefineButton`/`DefineButton2` four-state button. */
@@ -676,6 +678,65 @@ export interface SwcShape {
   subpaths: SwcSubPath[];
 }
 
+/**
+ * One edge of a morph geometry, paired with its ratio-1 counterpart.
+ *
+ * DefineMorphShape/2 stores TWO geometries, and the SWF spec requires that "all
+ * the points and control points of both shapes must match" -- that invariant is
+ * what makes a morph a plain linear blend, so the parser THROWS when the two
+ * geometries disagree instead of inventing a pairing. Only the START geometry
+ * carries style references; the end geometry is drawn with the same style ids,
+ * which is why the style tables are stored as start/end pairs.
+ */
+export interface SwcMorphEdge extends SwcEdge {
+  /** End-geometry position (ratio 1). */
+  xE: number;
+  yE: number;
+  /** End-geometry control point, present exactly when cx/cy are. */
+  cxE?: number;
+  cyE?: number;
+}
+
+/** A maximal run of morph edges sharing one (layer, fill0, fill1, line) tuple. */
+export interface SwcMorphSubPath {
+  layer: number;
+  fill0: number;
+  fill1: number;
+  line: number;
+  /** Pen position when the run started (start geometry). */
+  start: SwcEdge;
+  /** The same pen position in the END geometry. */
+  startE: SwcEdge;
+  moveToFirst: boolean;
+  pts: SwcMorphEdge[];
+}
+
+/** A style table whose every entry is a start/end PAIR (index 0 = "no style"). */
+export interface SwcMorphStyleLayer {
+  fills: { start: SwcFillStyle; end: SwcFillStyle }[];
+  lines: { start: SwcLineStyle; end: SwcLineStyle }[];
+}
+
+/**
+ * A parsed DefineMorphShape (tag 46) / DefineMorphShape2 (tag 84).
+ *
+ * AIR instantiates these as `MorphShape`, a Shape subclass whose geometry is the
+ * ratio blend of the two stored shapes (measured: fileitemskin c2 has 4 children
+ * in AIR, one of them a MorphShape, and 270 PlaceObject records in this library
+ * animate that ratio). The bake turns each one into two full shapes so the
+ * emitter can interpolate point by point.
+ */
+export interface SwcMorphShape {
+  id: number;
+  version: 1 | 2;
+  /** StartBounds (twips) -- the geometry at ratio 0. */
+  bounds: SwcRect;
+  /** EndBounds (twips) -- the geometry at ratio 1. */
+  endBounds: SwcRect;
+  layers: SwcMorphStyleLayer[];
+  subpaths: SwcMorphSubPath[];
+}
+
 /** One `PlaceObject*` record on a sprite timeline. */
 export interface SwcPlacement {
   depth: number;
@@ -722,7 +783,8 @@ export interface SwcPlacement {
   visibleFlag: boolean | null;
   /**
    * `PlaceObject2` Ratio: the morph ratio applied to the morph shape at this
-   * depth. Kept so the timeline bake can report it (morphs are placeholders).
+   * depth, 0..65535 for ratio 0..1. The bake turns it into a frame op that
+   * rebuilds the morph geometry at that blend (see `SwcBakeFrameOp.ratio`).
    */
   ratio: number | null;
   /**
@@ -1412,6 +1474,387 @@ function parseSwfShape(body: Buffer, tag: SwfTag): SwcShape {
   return { id, version, bounds, winding, layers, subpaths };
 }
 
+/**
+ * One MORPHFILLSTYLE -> a start/end SwcFillStyle pair (swc.md §3.4⑦).
+ *
+ * A morph fill doubles every field that can differ between the two shapes: a
+ * solid colour carries TWO RGBA records, a gradient two MATRIX records plus, per
+ * stop, a second ratio/colour pair under a SINGLE gradient flags byte (both
+ * geometries share the stop COUNT, which is why only one count nibble exists),
+ * and a bitmap fill two MATRIX records around one shared BitmapId. Reading only
+ * the start half desyncs the whole tag -- the tell-tale is the next style count
+ * coming out as 0x62 instead of a small number.
+ *
+ * A morph colour ALWAYS has alpha, whatever the tag version: the spec's
+ * MORPHFILLSTYLE lists RGBA, not RGB, so readSwfColor(r, true) is required even
+ * for tag 46 (whose plain DefineShape fills would be RGB).
+ */
+function readSwfMorphFill(r: SwfReader): { start: SwcFillStyle; end: SwcFillStyle } {
+  const type = r.u8();
+  if (type === 0x00) {
+    const rgba = readSwfColor(r, true);
+    const rgbaEnd = readSwfColor(r, true);
+    return { start: { type, rgba }, end: { type, rgba: rgbaEnd } };
+  }
+  if (type === 0x10 || type === 0x12 || type === 0x13) {
+    const matrix = readSwfMatrix(r);
+    const matrixEnd = readSwfMatrix(r);
+    const flags = r.u8();
+    const n = flags & 0x0f;
+    const stops: SwcGradientStop[] = [];
+    const stopsEnd: SwcGradientStop[] = [];
+    for (let i = 0; i < n; i++) {
+      const ratio = r.u8();
+      const rgba = readSwfColor(r, true);
+      const ratioEnd = r.u8();
+      const rgbaEnd = readSwfColor(r, true);
+      stops.push({ ratio, rgba });
+      stopsEnd.push({ ratio: ratioEnd, rgba: rgbaEnd });
+    }
+    const gradKind: 'linear' | 'radial' | 'focal' = type === 0x10 ? 'linear' : type === 0x12 ? 'radial' : 'focal';
+    const spread = (flags >> 6) & 3;
+    const interp = (flags >> 4) & 3;
+    // A focal point is stored ONCE (the spec's MORPHFILLSTYLE keeps a single
+    // FOCALPOINT), so the two ends share it. Not exercised by this library: a
+    // wrong guess here would desync and be caught by the tag-end self-check.
+    const focal = type === 0x13 ? r.i16() / 256 : undefined;
+    return {
+      start: { type, gradKind, matrix, stops, spread, interp, focal },
+      end: { type, gradKind, matrix: matrixEnd, stops: stopsEnd, spread, interp, focal },
+    };
+  }
+  if (type >= 0x40 && type <= 0x43) {
+    // ONE BitmapId for both geometries (only the matrix morphs), then the two
+    // fill matrices.
+    const bitmapId = r.u16();
+    const matrix = readSwfMatrix(r);
+    const matrixEnd = readSwfMatrix(r);
+    const repeating = (type & 1) === 0;
+    const smoothed = (type & 2) === 0;
+    return {
+      start: { type, bitmapId, matrix, repeating, smoothed },
+      end: { type, bitmapId, matrix: matrixEnd, repeating, smoothed },
+    };
+  }
+  throw new Error(`SWC: unknown SWF morph fill style type 0x${type.toString(16)}`);
+}
+
+/**
+ * One MORPHLINESTYLE -> a start/end SwcLineStyle pair.
+ *
+ * DefineMorphShape (46) always stores the plain form: width/width_morph, then
+ * the two RGBA records. DefineMorphShape2 (84) stores a LINESTYLE2 between the
+ * two widths -- flags, then (miter join only) a miter limit, then either a whole
+ * MORPHFILLSTYLE or the two RGBA records.
+ */
+function readSwfMorphLine(r: SwfReader, version: 1 | 2): { start: SwcLineStyle; end: SwcLineStyle } {
+  const width = r.u16();
+  const widthEnd = r.u16();
+  if (version === 1) {
+    const rgba = readSwfColor(r, true);
+    const rgbaEnd = readSwfColor(r, true);
+    return { start: { width, rgba }, end: { width: widthEnd, rgba: rgbaEnd } };
+  }
+  // LINESTYLE2 flags are MSB-first (swc.md §3.4⑤): reading them little-endian
+  // desyncs the record, and a miter limit that is not ~4.0 is the tell-tale.
+  const flags = r.ub(16);
+  const startCap = (flags >> 14) & 3;
+  const join = (flags >> 12) & 3;
+  const hasFill = (flags >> 11) & 1;
+  const noHScale = (flags >> 10) & 1;
+  const noVScale = (flags >> 9) & 1;
+  const endCap = flags & 3;
+  const start: SwcLineStyle = { width, startCap, join, endCap, noHScale, noVScale };
+  const end: SwcLineStyle = { width: widthEnd, startCap, join, endCap, noHScale, noVScale };
+  if (join === 2) {
+    const miter = r.i16();
+    start.miter = miter;
+    end.miter = miter;
+  }
+  if (hasFill) {
+    const f = readSwfMorphFill(r);
+    start.fillStyle = f.start;
+    end.fillStyle = f.end;
+  } else {
+    start.rgba = readSwfColor(r, true);
+    end.rgba = readSwfColor(r, true);
+  }
+  return { start, end };
+}
+
+/** A morph style table: every entry is a start/end pair; index 0 = "no style". */
+function readSwfMorphStyles(
+  r: SwfReader,
+  version: 1 | 2
+): { fills: SwcMorphStyleLayer['fills']; lines: SwcMorphStyleLayer['lines']; numFillBits: number; numLineBits: number } {
+  let nf = r.u8();
+  if (nf === 0xff) nf = r.u16();
+  const fills: SwcMorphStyleLayer['fills'] = [{ start: { type: -1 }, end: { type: -1 } }];
+  for (let i = 0; i < nf; i++) fills.push(readSwfMorphFill(r));
+  let nl = r.u8();
+  if (nl === 0xff) nl = r.u16();
+  const lines: SwcMorphStyleLayer['lines'] = [{ start: { width: 0 }, end: { width: 0 } }];
+  for (let i = 0; i < nl; i++) lines.push(readSwfMorphLine(r, version));
+  const bits = r.u8();
+  return { fills, lines, numFillBits: bits >> 4, numLineBits: bits & 0x0f };
+}
+
+/**
+ * Parse one DefineMorphShape (46) / DefineMorphShape2 (84) (swc.md §3.4⑦).
+ *
+ * Section order, PROVEN by the two self-checks below (all six morph tags in the
+ * TalkMED skin land within 7 bits of their tag end, and OffsetToEndEdges points
+ * exactly at the end-geometry header):
+ *
+ *   CharacterId(16) StartBounds RECT EndBounds RECT
+ *   [84] StartEdgeBounds RECT EndEdgeBounds RECT Flags(8)
+ *   OffsetToEndEdges(32)     <- measured distance from AFTER this field
+ *   MORPHFILLSTYLEARRAY MORPHLINESTYLEARRAY FillBits(4) LineBits(4)
+ *   <start shape records> EndShapeRecord align
+ *   FillBits(4) LineBits(4)          <- the end geometry's own (unused) widths
+ *   <end shape records> EndShapeRecord align
+ *
+ * OffsetToEndEdges comes BEFORE the style arrays. Reading it after them (the
+ * order the structs are often written in) desyncs immediately: the first fill
+ * count comes out as 0x62.
+ */
+function parseSwfMorph(body: Buffer, tag: SwfTag): SwcMorphShape {
+  const version: 1 | 2 = tag.code === 46 ? 1 : 2;
+  const r = new SwfReader(body, tag.start, tag.start + tag.length);
+  const id = r.u16();
+  const bounds = readSwfRect(r);
+  const endBounds = readSwfRect(r);
+  if (version === 2) {
+    readSwfRect(r); // StartEdgeBounds (the shape without its strokes)
+    readSwfRect(r); // EndEdgeBounds
+    // One flags byte whose low bit is UsesScalingStrokes (measured: #113's stroke
+    // grows 20 -> 40 twips and the byte is 0x01). DefineMorphShape2 has no
+    // fill-winding bit, so DefineShape's even-odd default stays.
+    r.u8();
+  }
+  // OffsetToEndEdges is measured from the byte AFTER the field (measured: #113
+  // stores 98 with the field ending at byte 31, and the start geometry really does
+  // end at 129 -- walking its 16 edges lands exactly there). Counting from the
+  // field's own start would be 4 bytes short.
+  const offsetBaseByte = (r.pos >> 3) + 4;
+  const offsetToEnd = r.u32();
+
+  const styles = readSwfMorphStyles(r, version);
+  const layers: SwcMorphStyleLayer[] = [{ fills: styles.fills, lines: styles.lines }];
+  let numFillBits = styles.numFillBits;
+  let numLineBits = styles.numLineBits;
+
+  // --- start geometry: the only half that carries style references -----------
+  let layer = 0;
+  let fill0 = 0;
+  let fill1 = 0;
+  let line = 0;
+  let x = 0;
+  let y = 0;
+  const subpaths: SwcMorphSubPath[] = [];
+  let cur: SwcMorphSubPath | null = null;
+  const open = (): SwcMorphSubPath => {
+    const sp: SwcMorphSubPath = {
+      layer,
+      fill0,
+      fill1,
+      line,
+      start: { x, y },
+      startE: { x: 0, y: 0 }, // filled in by the pairing pass below
+      moveToFirst: false,
+      pts: [],
+    };
+    subpaths.push(sp);
+    return sp;
+  };
+  for (;;) {
+    const isEdge = r.ub(1);
+    if (isEdge) {
+      const straight = r.ub(1);
+      const n = r.ub(4) + 2;
+      if (!cur) cur = open();
+      if (straight) {
+        const axisAligned = !r.ub(1);
+        const vertical = axisAligned ? r.ub(1) === 1 : false;
+        const dx = !axisAligned || !vertical ? r.sb(n) : 0;
+        const dy = !axisAligned || vertical ? r.sb(n) : 0;
+        x += dx;
+        y += dy;
+        cur.pts.push({ x, y, xE: 0, yE: 0 });
+      } else {
+        const cdx = r.sb(n);
+        const cdy = r.sb(n);
+        const adx = r.sb(n);
+        const ady = r.sb(n);
+        const cx = x + cdx;
+        const cy = y + cdy;
+        x += cdx + adx;
+        y += cdy + ady;
+        cur.pts.push({ x, y, cx, cy, xE: 0, yE: 0, cxE: 0, cyE: 0 });
+      }
+      continue;
+    }
+    const flags = r.ub(5);
+    if (flags === 0) break; // EndShapeRecord
+    let moved = false;
+    if (flags & 1) {
+      // An ABSOLUTE twips position, not a delta (see parseSwfShape).
+      const nb = r.ub(5);
+      x = r.sb(nb);
+      y = r.sb(nb);
+      moved = true;
+    }
+    if (flags & 2) fill0 = r.ub(numFillBits);
+    if (flags & 4) fill1 = r.ub(numFillBits);
+    if (flags & 8) line = r.ub(numLineBits);
+    if (flags & 0x10) {
+      r.align();
+      const ns = readSwfMorphStyles(r, version);
+      layers.push({ fills: ns.fills, lines: ns.lines });
+      layer = layers.length - 1;
+      fill0 = 0;
+      fill1 = 0;
+      line = 0;
+      numFillBits = ns.numFillBits;
+      numLineBits = ns.numLineBits;
+    }
+    cur = open();
+    cur.moveToFirst = moved;
+    if (moved) cur.pts.push({ x, y, xE: 0, yE: 0 });
+  }
+  r.align();
+  // Self-check ①: the tag's own OffsetToEndEdges must be exactly where the start
+  // geometry (styles included) ends. Any desync above lands somewhere else.
+  const endHeadByte = r.pos >> 3;
+  if (endHeadByte !== offsetBaseByte + offsetToEnd) {
+    throw new Error(
+      `SWC: DefineMorphShape #${id} end geometry starts at byte ${endHeadByte} but OffsetToEndEdges says ` +
+        `${offsetBaseByte + offsetToEnd}`
+    );
+  }
+  const endBits = r.u8();
+  const endFillBits = endBits >> 4;
+  const endLineBits = endBits & 0x0f;
+
+  // --- end geometry: the same edges, with no style references ----------------
+  // `slots` keeps moves and edges in RECORD order, each with the pen position it
+  // started from, so a start run that has no move of its own can still learn the
+  // end pen (that is what makes startE exact for a mid-run style change).
+  const slots: { move: boolean; x: number; y: number; cx?: number; cy?: number; penX: number; penY: number }[] = [];
+  let ex = 0;
+  let ey = 0;
+  for (;;) {
+    const isEdge = r.ub(1);
+    if (isEdge) {
+      const straight = r.ub(1);
+      const n = r.ub(4) + 2;
+      const penX = ex;
+      const penY = ey;
+      if (straight) {
+        const axisAligned = !r.ub(1);
+        const vertical = axisAligned ? r.ub(1) === 1 : false;
+        const dx = !axisAligned || !vertical ? r.sb(n) : 0;
+        const dy = !axisAligned || vertical ? r.sb(n) : 0;
+        ex += dx;
+        ey += dy;
+        slots.push({ move: false, x: ex, y: ey, penX, penY });
+      } else {
+        const cdx = r.sb(n);
+        const cdy = r.sb(n);
+        const adx = r.sb(n);
+        const ady = r.sb(n);
+        const cx = ex + cdx;
+        const cy = ey + cdy;
+        ex += cdx + adx;
+        ey += cdy + ady;
+        slots.push({ move: false, x: ex, y: ey, cx, cy, penX, penY });
+      }
+      continue;
+    }
+    const flags = r.ub(5);
+    if (flags === 0) break;
+    if (flags & 0x10) {
+      // The end geometry cannot carry a style table -- it has no style ids for one
+      // to be indexed by. A library that wrote one needs a parser change, not a
+      // guess, so say so instead of reading a table that is not there.
+      throw new Error(
+        `SWC: DefineMorphShape #${id} end geometry carries a NewStyles record, which the SWF format does not define`
+      );
+    }
+    if (flags & 1) {
+      const nb = r.ub(5);
+      const penX = ex;
+      const penY = ey;
+      ex = r.sb(nb);
+      ey = r.sb(nb);
+      slots.push({ move: true, x: ex, y: ey, penX, penY });
+    }
+    if (flags & 2) r.ub(endFillBits);
+    if (flags & 4) r.ub(endFillBits);
+    if (flags & 8) r.ub(endLineBits);
+  }
+  r.align();
+  // Self-check ②: a correct parse lands exactly on the tag end (modulo <1 byte of
+  // bit padding); a desync "runs" but leaves bytes behind.
+  const leftover = tag.length * 8 - r.pos;
+  if (leftover < 0 || leftover > 7) {
+    throw new Error(`SWC: DefineMorphShape #${id} did not consume its tag (leftover ${leftover} bits)`);
+  }
+
+  // --- pair the two geometries edge by edge ---------------------------------
+  let si = 0;
+  for (const sp of subpaths) {
+    if (sp.moveToFirst) {
+      const s = slots[si];
+      if (s === undefined || !s.move) {
+        throw new Error(
+          `SWC: DefineMorphShape #${id} end geometry has no move for the start run at ` +
+            `(${sp.start.x}, ${sp.start.y}) — the two geometries cannot be interpolated`
+        );
+      }
+      sp.startE = { x: s.x, y: s.y };
+      sp.pts[0].xE = s.x;
+      sp.pts[0].yE = s.y;
+      si++;
+    } else {
+      // The run continues the previous one, so its end pen is where the next end
+      // record starts drawing.
+      const next = slots[si];
+      sp.startE = next === undefined ? { x: ex, y: ey } : { x: next.penX, y: next.penY };
+    }
+    for (let i = sp.moveToFirst ? 1 : 0; i < sp.pts.length; i++) {
+      const s = slots[si];
+      if (s === undefined) {
+        throw new Error(`SWC: DefineMorphShape #${id} end geometry is short: it has no edge for start edge #${si}`);
+      }
+      const p = sp.pts[i];
+      p.xE = s.x;
+      p.yE = s.y;
+      if (p.cx !== undefined) {
+        if (s.cx === undefined) {
+          throw new Error(
+            `SWC: DefineMorphShape #${id} edge #${si} is a curve at ratio 0 but a line at ratio 1 — ` +
+              `the two geometries must have matching control points`
+          );
+        }
+        p.cxE = s.cx;
+        p.cyE = s.cy;
+      } else if (s.cx !== undefined) {
+        throw new Error(
+          `SWC: DefineMorphShape #${id} edge #${si} is a line at ratio 0 but a curve at ratio 1 — ` +
+            `the two geometries must have matching control points`
+        );
+      }
+      si++;
+    }
+  }
+  if (si !== slots.length) {
+    throw new Error(
+      `SWC: DefineMorphShape #${id} end geometry has ${slots.length - si} edge(s) the start geometry does not`
+    );
+  }
+  return { id, version, bounds, endBounds, layers, subpaths };
+}
 /** Parse one `PlaceObject*` record. */
 function readSwfPlacement(r: SwfReader, version: number): SwcPlacement {
   if (version === 1) {
@@ -1448,9 +1891,8 @@ function readSwfPlacement(r: SwfReader, version: number): SwcPlacement {
   if (hasClassName || (hasImage && !hasChar)) name = r.asciiZ();
   // PlaceObject Ratio: the morph ratio of the DefineMorphShape sitting at this
   // depth. Only morph timelines carry it (skin.swc: `#215`/`#388`/`#476` animate
-  // nothing else for up to 100 frames). Morph shapes are baked as empty
-  // placeholders, so the ratio cannot be applied -- but it is a real record the
-  // timeline uses, so it is reported (swc.md §10), never swallowed.
+  // nothing else for up to 100 frames), and it is the ONLY field on those records,
+  // so the bake must turn it into a frame op of its own (swc.md §3.4⑦).
   let ratio: number | null = null;
   const charId = hasChar ? r.u16() : null;
   const matrix = hasMatrix ? readSwfMatrix(r) : null;
@@ -1603,6 +2045,56 @@ export interface SwcBakeShape {
   groups: SwcBakeGroup[];
 }
 
+/** A morph geometry point in pixels: both ratios in one record. */
+export interface SwcBakeMorphPoint {
+  x: number;
+  y: number;
+  /** The same point at ratio 1. */
+  xE: number;
+  yE: number;
+  /** Ratio-0 control point, present exactly when the edge is a curve. */
+  cx?: number;
+  cy?: number;
+  /** Ratio-1 control point. */
+  cxE?: number;
+  cyE?: number;
+}
+
+export interface SwcBakeMorphPath {
+  start: SwcBakeMorphPoint;
+  pts: SwcBakeMorphPoint[];
+  closed: boolean;
+}
+
+/**
+ * One draw group of a morph, with every paintable field as a start/end pair. The
+ * emitter blends the pair with the instance's current ratio, so `t = 0` reproduces
+ * the authored ratio-0 shape exactly and `t = 1` the ratio-1 shape.
+ */
+export interface SwcBakeMorphGroup {
+  fill: { start: SwcFillStyle; end: SwcFillStyle } | null;
+  line: { start: SwcLineStyle; end: SwcLineStyle } | null;
+  paths: SwcBakeMorphPath[];
+}
+
+/**
+ * A baked `DefineMorphShape`/`2` in pixels: one geometry pair plus the paints to
+ * blend. AIR hands these out as `MorphShape` instances whose `ratio` the timeline
+ * animates, so the emitter turns this into a builder that takes `t` in [0, 1].
+ */
+export interface SwcBakeMorph {
+  id: number;
+  /** Union of StartBounds and EndBounds in px: the clip rect to draw inside. */
+  bounds: { x: number; y: number; w: number; h: number };
+  /**
+   * StartBounds in px: the box AIR REPORTS for the morph. A `MorphShape` caches
+   * the start shape's bounds, so `width`/`height`/`getBounds`/`getRect` answer
+   * this rect at every ratio (measured on adl 51.4.1, temp/morph/adl/).
+   */
+  decl: { x: number; y: number; w: number; h: number };
+  groups: SwcBakeMorphGroup[];
+}
+
 export interface SwcBakePlacement {
   /**
    * The Flash DEPTH this child sits at. The emitter stores it on the child
@@ -1617,6 +2109,12 @@ export interface SwcBakePlacement {
   /** `PlaceObject3` BitmapCached -> `DisplayObject.cacheAsBitmap`. */
   bitmapCached?: boolean;
   charId: number;
+  /**
+   * `PlaceObject2` `Ratio` (0..65535): the morph ratio the record applies to the
+   * MorphShape at this depth. Only a morph character consumes it; AIR ignores it
+   * elsewhere, and so does the emitter.
+   */
+  ratio?: number;
   /**
    * The `PlaceObject2/3` instance `Name`. AIR exposes every named child of a
    * symbol's timeline as a PROPERTY of the symbol instance (`upLoadView extends
@@ -1732,6 +2230,8 @@ export interface SwcBakeCharacter {
   labels?: SwcFrameLabel[];
   button?: SwcBakeButton;
   bitmapId?: number;
+  /** Morph characters only: the paired geometry the emitter blends by ratio. */
+  morph?: SwcBakeMorph;
   /**
    * `DefineScalingGrid` (tag 78): the 9-slice splitter in the character's OWN
    * local pixels. Present only on characters the author gave a scaling grid, so
@@ -1774,6 +2274,8 @@ export interface SwcBakeFrameOp {
   hidden?: boolean;
   /** The record says Visible = 1: show the object at this depth again. */
   visible?: boolean;
+  /** `PlaceObject2` `Ratio`: re-morph the MorphShape at this depth. */
+  ratio?: number;
   filters?: SwcFilter[];
   blendMode?: string;
   bitmapCached?: boolean;
@@ -1857,6 +2359,7 @@ export interface SwcBakeUnsupported {
  */
 export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], classChars: readonly SwcCharacterClass[] = []): SwcBake {
   const shapeById = new Map(lib.shapes.map((s) => [s.id, s]));
+  const morphById = new Map(lib.morphs.map((m) => [m.id, m]));
   const spriteById = new Map(lib.sprites.map((s) => [s.id, s]));
   const textById = new Map(lib.texts.map((t) => [t.id, t]));
   const buttonById = new Map(lib.buttons.map((b) => [b.id, b]));
@@ -1929,8 +2432,25 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       continue;
     }
     if (ch.kind === 'morph') {
-      // Built as an empty Shape placeholder so the display list keeps AIR's child
-      // count and index order. The geometry is not decoded — announced below.
+      // A morph fill can reference a bitmap exactly like a shape fill does, and the
+      // same "only referenced styles count" rule keeps Flash's placeholder entries
+      // out. The geometry itself needs no further walk: a morph has no children.
+      const m = morphById.get(id);
+      if (m === undefined) throw new Error(`SWC: morph character #${id} was not parsed`);
+      const usedByLayer = new Map<number, Set<number>>();
+      for (const sp of m.subpaths) {
+        let u = usedByLayer.get(sp.layer);
+        if (u === undefined) { u = new Set<number>(); usedByLayer.set(sp.layer, u); }
+        if (sp.fill0 > 0) u.add(sp.fill0);
+        if (sp.fill1 > 0) u.add(sp.fill1);
+      }
+      m.layers.forEach((l, li) => {
+        for (const fi of usedByLayer.get(li) ?? []) {
+          for (const f of [l.fills[fi]?.start, l.fills[fi]?.end]) {
+            if (f !== undefined && f.type >= 0x40 && f.bitmapId !== undefined) wantBitmaps.add(f.bitmapId);
+          }
+        }
+      });
       continue;
     }
     if (ch.kind === 'text') {
@@ -2045,6 +2565,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
         if (prev && p.filters.length > 0) prev.filters = p.filters;
         if (prev && p.blendMode !== null) prev.blendMode = swfBlendModeName(p.blendMode) ?? undefined;
         if (prev && p.bitmapCached) prev.bitmapCached = true;
+        if (prev && p.ratio !== null) prev.ratio = p.ratio;
         continue;
       }
       if (p.clipDepth !== null) {
@@ -2059,6 +2580,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       }
       byDepth.set(p.depth, {
         charId: p.charId, matrix: pxMatrix(p.matrix), cxform: p.cxform, hidden: p.hidden,
+        ratio: p.ratio ?? undefined,
         name: p.name ?? undefined,
         filters: p.filters.length > 0 ? p.filters : undefined,
         blendMode: p.blendMode === null ? undefined : (swfBlendModeName(p.blendMode) ?? undefined),
@@ -2167,14 +2689,15 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
           if (p.filters.length > 0) op.filters = p.filters;
           if (p.blendMode !== null) op.blendMode = swfBlendModeName(p.blendMode) ?? 'normal';
           if (p.bitmapCached) op.bitmapCached = true;
-          if (p.ratio !== null) ratioOps++;
-          // A record that carries nothing we can apply (in this library: a Move
-          // whose only field is the morph Ratio) must not produce an op: the
-          // object is already alive from an earlier frame, so a no-op op would
+          // A morph timeline animates NOTHING but the ratio for up to 100 frames
+          // (skin.swc `#215`/`#388`/`#476`), so this field alone must produce an op.
+          if (p.ratio !== null) { op.ratio = p.ratio; ratioOps++; }
+          // A record that carries no field we can apply must not produce an op:
+          // the object is already alive from an earlier frame, so a no-op op would
           // only bloat the emitted applier.
           if (op.matrix === undefined && op.cxform === undefined && op.hidden === undefined &&
               op.visible === undefined && op.filters === undefined && op.blendMode === undefined &&
-              op.bitmapCached === undefined && op.name === undefined) {
+              op.bitmapCached === undefined && op.name === undefined && op.ratio === undefined) {
             byDepth.delete(p.depth);
             continue;
           }
@@ -2191,6 +2714,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
         byDepth.set(p.depth, {
           depth: p.depth, charId: p.charId, replace: prev !== undefined || undefined, matrix,
           cxform: p.cxform,
+          ratio: p.ratio ?? undefined,
           name: p.name ?? undefined,
           hidden: p.hidden || undefined,
           visible: p.visibleFlag === true || undefined,
@@ -2203,6 +2727,53 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       if (ops.length > 0) frames.push({ frame: f, ops });
     }
     return frames;
+  };
+
+/**
+   * Group a parsed morph by style into start/end path pairs.
+   *
+   * The grouping is deliberately the same walk `bakeShape` does (per layer, fills
+   * in style-id order, then strokes) so a morph paints in AIR's order. The two
+   * geometries are paired at PARSE time, so a point always carries both ratios and
+   * the emitter never has to guess which end point belongs to which start point.
+   */
+  const bakeMorph = (m: SwcMorphShape): SwcBakeMorph => {
+    const pxp = (p: SwcBakeMorphPoint): SwcBakeMorphPoint =>
+      p.cx === undefined
+        ? { x: px(p.x), y: px(p.y), xE: px(p.xE), yE: px(p.yE) }
+        : { x: px(p.x), y: px(p.y), xE: px(p.xE), yE: px(p.yE), cx: px(p.cx), cy: px(p.cy as number), cxE: px(p.cxE as number), cyE: px(p.cyE as number) };
+    // One pass in RECORD order to freeze each run's start/closed flag (same rule as
+    // bakeShape: regrouping by style must not depend on the pen state).
+    const runs = m.subpaths.map((sp) => {
+      const start: SwcBakeMorphPoint = { x: sp.start.x, y: sp.start.y, xE: sp.startE.x, yE: sp.startE.y };
+      const pts = sp.moveToFirst ? sp.pts.slice(1) : sp.pts;
+      const last = pts.length > 0 ? pts[pts.length - 1] : null;
+      const closed = last !== null && last.x === sp.start.x && last.y === sp.start.y;
+      return { sp, path: { start: pxp(start), pts: pts.map(pxp), closed } as SwcBakeMorphPath };
+    });
+    const groups: SwcBakeMorphGroup[] = [];
+    m.layers.forEach((layer, li) => {
+      for (let fi = 1; fi < layer.fills.length; fi++) {
+        const paths = runs.filter((r) => r.sp.layer === li && (r.sp.fill0 === fi || r.sp.fill1 === fi)).map((r) => r.path);
+        if (paths.length > 0) groups.push({ fill: layer.fills[fi], line: null, paths });
+      }
+      for (let li2 = 1; li2 < layer.lines.length; li2++) {
+        const paths = runs.filter((r) => r.sp.layer === li && r.sp.line === li2).map((r) => r.path);
+        if (paths.length > 0) groups.push({ fill: null, line: layer.lines[li2], paths });
+      }
+    });
+    // An interpolated point always lies inside the convex hull of the two authored
+    // points, so the union of the bounds is a safe clip rect for every ratio.
+    const x0 = Math.min(m.bounds.xmin, m.endBounds.xmin);
+    const y0 = Math.min(m.bounds.ymin, m.endBounds.ymin);
+    const x1 = Math.max(m.bounds.xmax, m.endBounds.xmax);
+    const y1 = Math.max(m.bounds.ymax, m.endBounds.ymax);
+    return {
+      id: m.id,
+      bounds: { x: px(x0), y: px(y0), w: px(x1 - x0), h: px(y1 - y0) },
+      decl: { x: px(m.bounds.xmin), y: px(m.bounds.ymin), w: px(m.bounds.xmax - m.bounds.xmin), h: px(m.bounds.ymax - m.bounds.ymin) },
+      groups,
+    };
   };
 
   const characters: SwcBakeCharacter[] = [];
@@ -2224,7 +2795,9 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
     // them and the placement code skips the child.
     if (unsupportedIds.has(id)) continue;
     if (lib.characters.get(id)?.kind === 'morph') {
-      characters.push({ id, kind: 'morph' });
+      const m = morphById.get(id);
+      if (m === undefined) throw new Error(`SWC: morph character #${id} was not parsed`);
+      characters.push({ id, kind: 'morph', morph: bakeMorph(m) });
       continue;
     }
     const text = textById.get(id);
@@ -2354,12 +2927,21 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       `UNCLIPPED (swc.md §10)`
     );
   }
-  const morphPlaceholders = characters.filter((c) => c.kind === 'morph').length;
-  if (morphPlaceholders > 0) {
+  const morphChars = characters.filter((c) => c.kind === 'morph');
+  if (morphChars.length > 0) {
+    // A POSITIVE statement now: the geometry is decoded and the ratio applies. It
+    // stays because "how many edges morph" is the number that tells a reader the
+    // bake really walked both geometries (it used to report the gap instead).
+    const morphEdges = morphChars.reduce(
+      (n, c) => n + (c.morph?.groups ?? []).reduce((k, g) => k + g.paths.reduce((j, p) => j + p.pts.length, 0), 0),
+      0
+    );
     notes.push(
-      `${morphPlaceholders} DefineMorphShape/DefineMorphShape2 character(s) are baked as EMPTY Shape placeholders: ` +
-      `AIR builds a MorphShape there (a Shape subclass) whose two geometries and morph ratio are not decoded, so ` +
-      `the child keeps its place in the display list but paints nothing (swc.md §10)`
+      `${morphChars.length} DefineMorphShape/DefineMorphShape2 character(s) are baked as morphing Shapes ` +
+      `(${morphEdges} morphing edge(s)): AIR builds a MorphShape whose geometry is the ratio blend of the two ` +
+      `stored shapes, and the emitted builder interpolates geometry and paint from PlaceObject2 Ratio ` +
+      `(swc.md §3.4⑦). AIR reports those children as MorphShape; this backend builds a Shape, the closest ` +
+      `construct it has, so the pixels match while the class name does not`
     );
   }
   const textChars = characters.filter((c) => c.kind === 'text');
@@ -2401,9 +2983,8 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
   for (const n of frameNotes) notes.push(n);
   if (ratioOps > 0) {
     notes.push(
-      `${ratioOps} PlaceObject record(s) carry only a morph Ratio (up to 100 frames of a morph animation): ` +
-      `the ratio cannot be applied because DefineMorphShape is baked as an empty placeholder, so those frames ` +
-      `paint nothing where AIR morphs between two geometries (swc.md §10)`
+      `${ratioOps} PlaceObject record(s) carry a morph Ratio; the timeline re-morphs the shape at that depth ` +
+      `on each of those frames (swc.md §3.4⑦)`
     );
   }
   const classOf = new Map<number, string>();
@@ -2776,6 +3357,7 @@ export function extractSwc(path: string): SwcLibrary {
   // self-checking (a placement that names an unknown id means a desync), and the
   // emitter wants the whole closure up front to emit factories bottom-up.
   const shapes: SwcShape[] = [];
+  const morphs: SwcMorphShape[] = [];
   const sprites: SwcSprite[] = [];
   const buttons: SwcButton[] = [];
   const texts: SwcText[] = [];
@@ -2817,6 +3399,12 @@ export function extractSwc(path: string): SwcLibrary {
       const button = parseSwfButton(body, t);
       buttons.push(button);
       characters.set(button.id, { id: button.id, kind: 'button', tag: t.code });
+    } else if (t.code === 46 || t.code === 84) {
+      const morph = parseSwfMorph(body, t);
+      morphs.push(morph);
+      // CHARACTER_TAG_KINDS already classifies these as morph; re-stating it here
+      // keeps the tag code next to the parse that produced the geometry.
+      characters.set(morph.id, { id: morph.id, kind: 'morph', tag: t.code });
     } else if (t.code === 78) {
       // DefineScalingGrid: characterId u16 | RECT splitter.
       const id = body.readUInt16LE(t.start);
@@ -2858,7 +3446,7 @@ export function extractSwc(path: string): SwcLibrary {
   }
 
   return {
-    source: path, bitmaps, shapes, sprites, buttons, texts, fonts, scalingGrids,
+    source: path, bitmaps, shapes, morphs, sprites, buttons, texts, fonts, scalingGrids,
     classNames, characters, scripts: scriptsDecoded, bases: scriptBases,
   };
 }

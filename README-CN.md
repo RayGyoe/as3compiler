@@ -122,6 +122,7 @@ as-aot app.as -I vendor/include -L vendor/lib -l skia -D USE_SKIA=1
 # 嵌入 SWC 里的位图资源类与皮肤文本（阶段九十五 / 一百四十九）：命名资源变成 BitmapData 子类，
 # 源码可直接 `new logo(0, 0)`，也可 getDefinitionByName("logo") 反射后 new；
 # DefineEditText 文本字符烘成真 TextField（初始文本 + 字体/字号/颜色/对齐/缩进/leading 与各标志）
+# DefineMorphShape 形变字符按 PlaceObject2 的 Ratio 逐帧插值（显示盒按 AIR 语义钉在起始形）
 as-aot app.as --swc assets/skin.swc
 
 # 构建清单（JSON，路径相对清单目录解析）

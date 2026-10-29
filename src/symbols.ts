@@ -6092,6 +6092,15 @@ export class SymbolTable {
         // `_clip` = 0 for every Graphics built through the AS3 API.
         ['_clip', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
         ['_clx', gpf2()], ['_cly', gpf2()], ['_clw', gpf2()], ['_clh', gpf2()],
+        // A baked MORPH shape reports a box that does NOT follow its geometry:
+        // AIR caches the start shape's bounds on a MorphShape, so `width`,
+        // `height`, `getBounds` and `getRect` all keep answering the ratio-0 box
+        // while the drawn geometry slides to the end shape. Measured on adl
+        // 51.4.1 (temp/morph/adl/, skin.swc #70): frames 1..99 report
+        // 92.90x41.65 at (-92.90,-10.00) at every ratio. `_mdecl` is 0 for every
+        // other Graphics, so `_clip` keeps deciding for plain shapes.
+        ['_mdecl', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
+        ['_ml', gpf2()], ['_mt', gpf2()], ['_mw', gpf2()], ['_mh', gpf2()],
       ]),
       methods: new Map([
         ['moveTo', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number')])],

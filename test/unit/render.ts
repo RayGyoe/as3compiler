@@ -1052,6 +1052,7 @@ function checkSwcJpeg3Alpha(): string[] {
   // Built as a SwcLibrary value: no SWF shape encoding is needed to reach it.
   const fillLib: SwcLibrary = {
     source: 'probe',
+    morphs: [],
     bitmaps: [{ tagId: 7, className: null, format: 'jpeg', width: 4, height: 4, encoded: Buffer.alloc(21), alpha: quad }],
     shapes: [{
       id: 9, version: 1, winding: 'evenOdd',
@@ -1903,7 +1904,7 @@ function checkSwcBaseClass(): string[] {
   const mkLib = (bases: [number, string, boolean][]): SwcLibrary =>
     ({
       source: 'probe.swc',
-      bitmaps: [], shapes: [],
+      bitmaps: [], shapes: [], morphs: [],
       sprites: [
         { id: 230, frames: 1, placements: [], frameStarts: [0], labels: [] },
         { id: 231, frames: 1, placements: [], frameStarts: [0], labels: [] },
@@ -2026,3 +2027,130 @@ function checkSwcBaseClass(): string[] {
   return bad;
 }
 registerGroup('unit: swc/BaseClassBinding', checkSwcBaseClass);
+
+// ---------------------------------------------------------------------------
+// unit: render/SwcMorph -- DefineMorphShape bake + emit shape.
+//
+// The example `examples/swc-morph.as` pins the display-box contract against the
+// real skin.swc, but AIR gives no AS3-readable outlet for "which ratio is the
+// geometry at" (the only one is pixels, and every morph in that library is a
+// clipDepth mask), so the interpolation itself can only be pinned here, on the
+// emitted C. The library is a hand-built SwcLibrary value: the bake reads the
+// parse result, so no SWF encoding is needed to reach it.
+// ---------------------------------------------------------------------------
+function checkSwcMorphEmit(): string[] {
+  const bad: string[] = [];
+  const lib = {
+    source: 'probe',
+    bitmaps: [],
+    shapes: [],
+    // Twips: the start shape is 100x40 at (0,0), the end shape slides +10 px.
+    morphs: [{
+      id: 70,
+      version: 1,
+      bounds: { xmin: 0, xmax: 2000, ymin: 0, ymax: 800 },
+      endBounds: { xmin: 200, xmax: 2200, ymin: 0, ymax: 800 },
+      layers: [{
+        // Index 0 is the "no style" slot, exactly as a parsed shape stores it.
+        fills: [{ start: { type: 0 }, end: { type: 0 } }, { start: { type: 0 }, end: { type: 0 } }],
+        lines: [],
+      }],
+      subpaths: [{
+        layer: 0, fill0: 1, fill1: 1, line: 0, moveToFirst: true,
+        start: { x: 0, y: 0 }, startE: { x: 200, y: 0 },
+        pts: [
+          { x: 2000, y: 0, xE: 2200, yE: 0 },
+          { x: 2000, y: 800, xE: 2200, yE: 800 },
+          { x: 0, y: 800, xE: 200, yE: 800 },
+          { x: 0, y: 0, xE: 200, yE: 0 },
+        ],
+      }],
+    }],
+    sprites: [{
+      id: 74, frames: 2, frameStarts: [1, 2], labels: [],
+      placements: [
+        // Frame 1 places the morph with NO ratio record (the SWF default is 0).
+        {
+          depth: 1, charId: 70, move: false, name: null, matrix: [1, 0, 0, 1, 0, 0], cxform: null,
+          clipDepth: null, hidden: false, visibleFlag: null, ratio: null, filters: [], skippedFilters: [],
+        },
+        // Frame 2 only carries the Ratio -- a "modify" record.
+        {
+          depth: 1, charId: null, move: true, name: null, matrix: null, cxform: null,
+          clipDepth: null, hidden: false, visibleFlag: null, ratio: 32768, filters: [], skippedFilters: [],
+        },
+      ],
+    }],
+    buttons: [],
+    texts: [],
+    fonts: new Map(),
+    scalingGrids: new Map(),
+    classNames: new Map([[74, 'probeMorphClip']]),
+    characters: new Map([[70, { kind: 'morph' }], [74, { kind: 'sprite' }]]),
+    scripts: new Map(),
+    bases: new Map(),
+  } as unknown as SwcLibrary;
+
+  const inputs = swcCompileInputs(lib);
+  const bake = swcBakePlan(lib, inputs.specs, inputs.chars);
+  const prog = parse('var _pad:int = 0;\n');
+  prog.body.push(...inputs.decls);
+  const c = generateC(prog, [], inputs.specs, bake).c;
+  const check = (label: string, cond: boolean): void => { if (!cond) bad.push(label); };
+
+  // ---- bake: two boxes, and they are NOT the same one ----
+  const baked = bake.characters.find((ch) => ch.kind === 'morph') as { morph?: { bounds: { x: number; y: number; w: number; h: number }; decl: { x: number; y: number; w: number; h: number }; groups: unknown[] } } | undefined;
+  const m = baked?.morph;
+  check('the morph bakes to a real geometry (not an empty placeholder)',
+    m !== undefined && m.groups.length > 0);
+  check('the raster clip is the UNION of both shapes (110x40)', m !== undefined && m.bounds.w === 110 && m.bounds.h === 40);
+  check('the reported box is the START shape only (100x40) -- what AIR pins to a MorphShape',
+    m !== undefined && m.decl.w === 100 && m.decl.h === 40 && m.decl.x === 0 && m.decl.y === 0);
+
+  // ---- emit: the two boxes reach two different fields ----
+  check('the builder clips to the union and records the start box separately',
+    c.includes('as_swc_clip(g, 0.0, 0.0, 110.0, 40.0);') &&
+    c.includes('as_swc_morph_decl(g, 0.0, 0.0, 100.0, 40.0);'));
+  check('_mdecl is a Graphics field, not a reuse of _clip (a plain Shape still answers _clip)',
+    c.includes('int _mdecl;') && c.includes('{ "_mdecl", 4, offsetof(Graphics, _mdecl), NULL, NULL, 1, 0, 0 }'));
+  check('as_bounds_walk answers the morph box for decl 1/2 but keeps raw geometry for hit tests',
+    c.includes('if (g->_mdecl && decl != 0) {') &&
+    c.includes('if (!as_bounds_walk(o, 0, 2, &l, &t, &r, &b)) return Rectangle_new(0.0, 0.0, 0.0, 0.0);'));
+
+  // ---- emit: real interpolation, endpoint by endpoint ----
+  check('every morphing coordinate is interpolated from BOTH stored positions',
+    c.includes('as_swc_move_to(g, as_swc_lerp(0.0, 10.0, t), 0.0);') &&
+    c.includes('as_swc_line_to(g, as_swc_lerp(100.0, 110.0, t), 40.0);'));
+  // The one line that does the work: a lerp that ignored t would still emit both
+  // endpoints and pass every text assertion above, and no AS3 API can read a
+  // MorphShape.s geometry (see the header). So pin the helper body itself.
+  check('as_swc_lerp actually blends (a + (b - a) * t)',
+    c.includes('static double as_swc_lerp(double a, double b, double t) { return a + (b - a) * t; }'));
+  check('a coordinate the two shapes agree on stays a constant (no pointless lerp)',
+    c.includes('as_swc_move_to(g, as_swc_lerp(0.0, 10.0, t), 0.0);') &&
+    !c.includes('as_swc_lerp(0.0, 0.0, t)'));
+
+  // ---- emit: the ratio reaches the geometry, and a rewind resets it ----
+  check('as_swc_morph_ratio clears then rebuilds at t = ratio/65535',
+    c.includes(' Graphics_clear(g);\n  build(g, (double)ratio / 65535.0);'));
+  check('the dispatcher knows the character',
+    c.includes('case 70: as_swc_morph_ratio(o, as_swc_morph_70, ratio); break;'));
+  check('the factory starts a morph at ratio 0',
+    c.includes('case 70: { Shape* s = Shape_new(); as_swc_morph_70(s->graphics, 0.0); return (DisplayObject*)s; }'));
+  // The frame-1 builder is also the REWIND path (as_swc_tl_rewind -> as_swc_bind)
+  // and it reuses the object that is already at that depth -- without this reset
+  // a rewind kept the last frame's geometry (measured: rect.x stayed -4.95).
+  check('a frame-1 placement of a morph applies ratio 0 even with no Ratio record',
+    c.includes('DisplayObject* c0 = as_swc_tl_new(o, 1, 70);\n  as_swc_morph_apply(c0, 0);'));
+  check('a Ratio-only record re-morphs that depth on its own frame',
+    c.includes('as_swc_morph_apply(f2_0, 32768);'));
+
+  // ---- the note tells the truth about the one deliberate deviation ----
+  check('the notes report the baked morphs and name the MorphShape -> Shape deviation',
+    bake.notes.some((n) => /MorphShape/.test(n) && /class name does not/.test(n)));
+  check('the notes report the animated ratios',
+    bake.notes.some((n) => /carry a morph Ratio/.test(n)));
+
+  return bad;
+}
+registerGroup('unit: render/SwcMorph', checkSwcMorphEmit);

@@ -59,7 +59,7 @@
 | stage header | `nbits=15` → RECT 9 B + `frameRate`/`frameCount` = **13 B**（24 fps / 12 帧） |
 | 导出符号 | **35**（`catalog.xml` scripts × `SymbolClass` × `DoABC` 三者一致）：**34 个符号类 + 1 个位图资源类 `desktopicon`**；本次导出的 `SymbolClass` **不含 `#0`**（文档类条目），所以不会踩到「导出字符无定义」那条报错 |
 | 位图资源 | **15 个 tag**（`DefineBitsLossless2`×13 + `DefineBitsJPEG3`×2），其中**只有 1 个是命名资源类 `desktopicon`(342×194)**，其余 14 个是无名内嵌位图（`DefineBitsLossless` tag 20 **一个都没有**） |
-| shape | `DefineShape`×54 + `DefineShape2`×10 + `DefineShape3`×4 + `DefineShape4`×22 = **90 个字符**；另有 `DefineMorphShape`×1（烘成空占位） |
+| shape | `DefineShape`×54 + `DefineShape2`×10 + `DefineShape3`×4 + `DefineShape4`×22 = **90 个字符**；另有 `DefineMorphShape`×1（烘焙为真实几何 + `Ratio` 插值，§3.4⑦） |
 | 影片剪辑 | `DefineSprite`×**66**（其中 **21 个是多帧**）、`DefineButton2`×4、`DefineScalingGrid`×5（九宫格） |
 | 文本 | `DefineEditText`×56（带 InitialText，烘成 `TextField`）+ `DefineText`×2（字形需内嵌字体的 CodeTable，烘成空框）；`DefineFont3`×5 |
 | 时间轴 | `FrameLabel`×36（其中 11 个多帧剪辑带 `_up/_over/_down`）、`PlaceObject2`×403 + `PlaceObject3`×18、`RemoveObject2`×4 |
@@ -488,6 +488,76 @@ error: class 'mx.core.BitmapAsset' is only available as AVM2 bytecode inside
 **⑥ 与位图方案的关系**：73 处位图填充引用的正是那 59 个位图 tag 中的 39 张——**矢量与位图是同一条
 通道的两半，不能只做一半**。运行时侧的缺口与体积量级见 §5.3。
 
+#### 3.4⑦ `DefineMorphShape`/`2`（morph）：两套几何 + `Ratio` 插值（阶段三百一十四，v0.4.278）
+
+morph 就是「同一条矢量在两端之间的线性插值」。SWF 规范要求两套几何的点与曲线**逐点对应**，
+所以它天然是逐点 `lerp`，不需要任何形状匹配算法。本库只有 6 个（tag 46 ×4、tag 84 ×2），
+但**界面就在它上面**：`skin_fla.元件77_50` 的一个 morph 有 98 条 `Ratio` 记录（帧 2..99，
+662 … 64874），字幕条（#190 `aisubtitlesetup`）与文件行高亮（#384 `fileitemskin`）同理。
+
+**① 二进制布局**（`temp/morph/probe.cjs` 逐字节往返、6/6 全中）
+
+| 段 | 内容 |
+|---|---|
+| `CharacterId` | `UI16` |
+| `StartBounds` / `EndBounds` | 各 4×`RECT`（twips） |
+| （仅 tag 84） | `StartEdgeBounds` + `EndEdgeBounds` + `UI32 flags` |
+| （仅 tag 84） | `UI32 OffsetToEndEdges`——**从本字段之后起算**，基准 = `(位流位置>>3) + 4`（#113: 31 + 98 = 129）。按「从 tag 头起算」解会整体错位，而且**恰好**能读出看似合理的垃圾 |
+| 样式表 | `MORPHFILLSTYLEARRAY` + `MORPHLINESTYLEARRAY`：每个条目是 **start/end 成对**（索引 0 = 无样式） |
+| 起始几何 | `NumFillBits`/`NumLineBits`（各 4 bit，打包成 `fillBits<<4 \| lineBits`）+ 记录的连续位流 |
+| 分界 | `EndShapeRecords` 前的**字节对齐**，之后是结束几何的位流 |
+
+实测踩过的三个坑：① 渐变填充的**每个 stop** 是四个字段（ratio + color + …），不是「一个 flags
+字节 + 共享」；② `LINESTYLE2` 的 16 位 flags 是 **MSB-first**（与 §3.4⑤ 同一条）；③
+`axisAligned = !readUB(1)`。
+
+**② 解析自证（不成立就抛，不许静默）**
+
+`parseSwfMorph` 除逐点配对（`start.xE/yE` 与 `start.x/y` 必须成对，`cxE/cyE` 与 `cx/cy`
+同现同缺，不一致直接抛）外还有两道**结构**自检：`endHeadByte` 必须等于
+`OffsetToEndEdges` 推出的头尾位置；结束几何读完后**剩余位 ∈ [0, 7]**（即恰好字节对齐）。
+本库 6/6 通过；任一不成立说明段序读错了，宁可抛也不要产出错位的几何。
+
+**③ 烘焙（`swc.ts` 的 `SwcBakeMorph`）**
+
+- 两端几何各成为一组路径，**逐坐标成对存**，emit 期只做插值——配对工作全部留在解析期。
+- `bounds` = 两端的**并集**（光栅裁剪用）；`decl` = **`StartBounds`**（显示盒用）。两者必须分开，
+  理由见 ⑤。
+- `PlaceObject2` 的 `Ratio` 记录**单独即可**产生一条 frame op（它可以不带字符、不带矩阵），
+  所以 `SwcBakeFrameOp.ratio` 与 `SwcBakePlacement.ratio` 是两个独立字段。
+
+**④ 发射（`emit.ts`）**
+
+`as_swc_morph_<id>(Graphics* g, double t)`：`as_swc_fill_rule` → `as_swc_clip(并集)` →
+`as_swc_morph_decl(起始盒)` → 逐 group 绘制；每个坐标 `as_swc_lerp(start, end, t)`，两端相同的
+坐标保持常量（不插值）。填充/描边的**跨端一致性**（type、渐变种类/spread/interpolation、stop 数、
+位图 id、线帽/连接/斜接比）在 emit 期校验，不一致直接抛——那是解析 bug，不是可降级项。
+`as_swc_morph_ratio(o, build, ratio)` 钳 0..65535 → `Graphics_clear` → 重建。
+
+**⑤ AIR 契约（adl 51.4.1 实测，`temp/morph/adl/`）**
+
+- `MorphShape` 的 `width` / `height` / `getBounds` / `getRect` **不随 ratio 变**，恒等于
+  **ratio 0 的起始盒**（#70：`92.90×41.65 @ -92.90,-10.00`，帧 1/2/25/50/75/99 全同），
+  尽管实际几何在同一批帧里从 `x=-92.90` 滑到 `x=-4.05`。布局代码依赖这一点，跟错了整块界面位移。
+  实现上因此新增 `Graphics._mdecl/_ml/_mt/_mw/_mh`，而**不复用** `_clip`（`_clip` 仍被渲染裁剪
+  与普通 shape 的显示盒共用）；`as_bounds_walk` 的 `decl` 由 bool 变三态：`0` 几何（命中测试，
+  morph 必须按实际绘制位置可点）、`1` 显示盒（`getBounds`/`width`/`height`）、`2` `getRect`。
+- 类名是 `flash.display::MorphShape`。本后端给 `Shape`（最近的既有构造），像素一致、类名不同，
+  由 `notes` 明说（§10 同一行）。
+- 帧 1 的 `PlaceObject` 没有 `Ratio` ⇒ 按 **0** 处理。这条对**回退**尤其重要：`as_swc_bind` 既建
+  帧 1 也是回退路径，它会复用同 `(depth, 字符)` 的对象；不重置就残留末帧几何（修复前
+  `gotoAndStop(99)` 再回 `1`，`getRect.x` 停在 `-4.95` 而不是 `-92.90`）。
+
+**⑥ 已知缺口（明确不是「已完成」的部分）**
+
+- 帧尾把某个 depth 换成**另一个字符**（本库帧 100 把 morph 换成 `char73`）依赖**逐帧 clipDepth
+  遮罩**记录，属阶段三；当前是「删掉旧子件、不补新子件」，`numChildren` 会少 1。
+- morph 当 `clipDepth` 遮罩时仍无法表达为路径裁剪，一句 `notes` 报明，同属阶段三。
+- **AIR 侧没有 AS3 出口能读到当前 ratio**（唯一出口是像素），而本库的 morph 全是遮罩，因此
+  `examples/swc-morph.as` 只能钉显示盒契约；插值本身由 `test/unit/render.ts` 的
+  `unit: render/SwcMorph` 逐条钉发射形态（含 `as_swc_lerp` 的实现体，因为「lerp 忽略 t」在
+  文本上不可见）。像素对照靠 `temp/morph/MIso.as` + `ASC_MORPH_PAINT_MASK=1` 的诊断构建：
+  帧 99 单画 morph `2816 px / ff0066ff`、回到帧 1 归 `0`，与几何插值的方向一致。
 ---
 
 ## 4. 编译期提取链路（已端到端复验）
@@ -1775,7 +1845,7 @@ vtable 由 `… NULL, -1, "AIAsrComBox", 0, 0, 0, …` 变为
 | `DefineBitsJPEG4`（tag 90） | 实测 `examples/embed-assets/skin.swc` 无；与 JPEG3 同族（tag 35 **已支持**，§3.2③），随手支持即可。**注意**：`CHARACTER_TAG_KINDS` 已把它归为 `bitmap`，但提取器只处理 20/21/35/36 ⇒ 真遇到 tag 90 会在 `swcBakePlan` 的位图分支上以一句**误导性**的 `bitmap fill references missing bitmap #N` 失败（应按 JPEG4 报明） |
 | ~~九宫格缩放（`DefineScalingGrid`，实测 22 个）~~ **已实现**（§9 F/§9.2 F1）；但 **AS3 侧的 `DisplayObject.scale9Grid` 属性尚未实现** | 工程只从 SWF tag 烘焙九宫格，运行时**没有**可读写的 `scale9Grid` 属性（AIR 有）。即：SWF 皮肤里的缩放不会糊，但用户代码无法自己设置/查询它。 已按 §1.5 记入 `TODO.md` 的 `### 遗留待开发` |
 | `BitmapData.draw(source, matrix)` 对 source **自身变换**的处理与 AIR 不同 | 实测 `adl`：给被绘对象设 `o.scaleX = 2` 在 `draw(source, matrix)` 中**无效**（只受 `matrix` 参量影响）； 我们的实现会应用它。探针因此统一改为先包一层容器再 draw。**未定案**，记入 `### 遗留待开发` |
-| 形变 shape（`DefineMorphShape`/`2`，实测 6 个） | 需两套几何 + 插值；本库仅 6 个，价值低故延后。**现状**：已烘成**空 `Shape` 占位子件**（§9.2 F5）⇒ 树形对齐、不画错像素，几何与插值仍是缺口；其时间轴的 `Ratio` 记录（本库 270 条）被丢弃并报明（§9.2 F6） |
+| ~~形变 shape（`DefineMorphShape`/`2`，实测 6 个）~~ **已实现**（§3.4⑦，阶段三百一十四，v0.4.278） | 两端几何逐点插值 + `PlaceObject2.Ratio` 驱动；显示盒按 AIR 实测钉在**起始形**。**剩余缺口**：morph 当 `clipDepth` 遮罩、帧尾「删旧换新」都依赖逐帧遮罩记录 ⇒ 归阶段三，现状是一句 `notes` 报明 + 少一个子件 |
 | ~~按钮四态（`DefineButton2`，实测 29 个）~~ **已实现**（§9 F/§9.2 F2） | `ButtonRecord.states` 位掩码 + 绘制时状态机（`as_sbtn_state`）；离屏与 `adl` 逐像素一致 |
 | 时间轴动画（`DefineSprite` 多帧 + `FrameLabel`）~~ **已实现**（§9.2 F6，v0.4.68） | 逐帧差值（增/替/改/删）在编译期烘焙，`gotoAndStop`/`nextFrame`/`prevFrame`/`currentLabels` 与 `adl` 逐项一致（68 行 0 差异）；79 个多帧 sprite / 514 个 op / 89 条 `FrameLabel`；回到旧帧按「同一 (父, 深度, 角色) 复用子件」对齐（阶段一百七十二，D43）。**残留**：① 时间轴子件的 `name` 恒 `null`（AIR 自动命名 `instanceN`，SWF 记录里没有 `Name` 字段）；② 帧脚本（DoABC）**自 v0.4.127 起由编译期解码并真的执行**（§3.3 收口）—— 皮肤符号里的 `stop()` 就是文件里写着的，执行它才是对齐 AIR（此前「一律停在第 1 帧」的那条旧描述已作废）；③ morph 时间轴的 `Ratio` 记录被丢弃（morph 是空占位子件）；④ 前进方向「`Move` + 新字符」AIR 保留原对象身份而我方换新对象（D43b，烘培类一个角色一个类所致） |
 | MovieClip 按钮态的**结算时机** | 三种按钮态在**绘制/指纹 pass** 结算（与 `as_sbtn_state` 同一口径），因此一个从不 `render`、也没有窗口的离屏程序里，`dispatchMouse` 之后 `currentFrame` 不会自己变；真实 App（窗口每帧走这条 pass）与 `stage.render` 下行为与 `adl` 逐档一致（§9.2 F8） |

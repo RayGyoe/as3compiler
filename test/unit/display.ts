@@ -265,15 +265,21 @@ function checkDisplayGeometry(): string[] {
     c.includes('as_rect_to_stage(o, &l, &t, &r, &b); as_rect_from_stage(target, &l, &t, &r, &b);')
     && c.includes('if (target != NULL && target != o) {')
     && c.includes('if (!as_bounds_walk(o, 1, 1, &l, &t, &r, &b)) return Rectangle_new(0.0, 0.0, 0.0, 0.0);')
-    && c.includes('if (!as_bounds_walk(o, 0, 0, &l, &t, &r, &b)) return Rectangle_new(0.0, 0.0, 0.0, 0.0);'));
+    && c.includes('if (!as_bounds_walk(o, 0, 2, &l, &t, &r, &b)) return Rectangle_new(0.0, 0.0, 0.0, 0.0);'));
   // SWC 矢量：AIR 报的 Shape 包围盒 = 角色自己声明的 SWF ShapeBounds（也等于
   // 路径并集 + 描边，实测 #210/#212/#214 三者完全相等），而不是我们运行时那套
   // 路径点累积盒（它在若干角色上会偏）。命中测试刻意仍用绘制区域（decl 0）。
   check('a display getter reports a baked shape box as its declared ShapeBounds',
-    c.includes('if (decl && g->_clip) {')
+    c.includes('} else if (decl == 1 && g->_clip) {')
     && c.includes('*l = g->_clx; *t = g->_cly; *r = g->_clx + g->_clw; *b = g->_cly + g->_clh;')
     && c.includes('static int as_bounds_walk(DisplayObject* o, int with_stroke, int decl,')
     && c.includes('if (!as_bounds_walk(ch, with_stroke, decl, &cl, &ct, &cr, &cb)) continue;'));
+  // morph（阶段三百一十四）：显示盒单独一个字段，且只有 decl != 0（显示盒/getRect）
+  // 才答它；decl 0（命中测试）仍走实际几何，形变中的 morph 必须按当前形状可点。
+  check('a morph answers its START box for both reporting modes and its geometry for hit tests',
+    c.includes('if (g->_mdecl && decl != 0) {')
+    && c.includes('*l = g->_ml; *t = g->_mt; *r = g->_ml + g->_mw; *b = g->_mt + g->_mh;')
+    && !c.includes('if (decl && g->_clip) {'));
   check('hitTestObject intersects stroke-inclusive stage boxes and rejects empties',
     c.includes('return l1 <= r2 && l2 <= r1 && t1 <= b2 && t2 <= b1;')
     && c.includes('if (!as_bounds_walk(o, 1, 1, &l1, &t1, &r1, &b1)) return false;'));

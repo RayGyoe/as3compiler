@@ -6,7 +6,7 @@ import { RUNTIME_PREAMBLE } from './runtime.ts';
 import { FRE_BODY, FRE_HEAD, FRE_STUBS, type AneDescriptor } from './fre.ts';
 import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, sanitizeFileCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
-import type { SwcResourceSpec, SwcBake } from './swc.ts';
+import type { SwcResourceSpec, SwcBake, SwcBakeMorph, SwcBakeMorphGroup } from './swc.ts';
 import type { EmbedResourceSpec } from './embed.ts';
 
 // [temp instrumentation] AS3_MEMBERGAPS=1 makes every "undefined member" site
@@ -538,6 +538,8 @@ export class Emitter {
    * character kind, whose placement translation lands in x/y unchanged.
    */
   private swcTextOrigin = new Map<number, { ox: number; oy: number }>();
+  /** Baked morph character ids: a frame-1 placement of one must reset its ratio. */
+  private swcMorphIds = new Set<number>();
   private swcCharClass: Map<string, number>;
   /** charId -> the exported symbol's synthesized class (cname, kind, frame scripts). */
   private swcCharInfo: Map<number, { cname: string; kind: 'sprite' | 'button'; frames: readonly { frame: number; method: string }[] }>;
@@ -8212,12 +8214,14 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     }
     this.emitSwcPaintHelpers();
     this.emitSwcPathHelpers();
+    this.emitSwcMorphHelpers();
     // Forward declarations: the builders and factories form a cycle (a sprite
     // builds its children through as_swc_new, which dispatches back into a shape
     // or sprite builder), and C99 rejects an implicit declaration outright.
     for (const ch of bake.characters) {
       if (ch.kind === 'shape') this.line(`static void as_swc_shape_${ch.id}(Graphics* g);`);
-      else if (ch.kind !== 'bitmap' && ch.kind !== 'text' && ch.kind !== 'morph') this.line(`static void as_swc_build_${ch.id}(DisplayObject* o);`);
+      else if (ch.kind === 'morph') this.line(`static void as_swc_morph_${ch.id}(Graphics* g, double t);`);
+      else if (ch.kind !== 'bitmap' && ch.kind !== 'text') this.line(`static void as_swc_build_${ch.id}(DisplayObject* o);`);
     }
     this.line('static void* as_swc_image(int id);');
     this.line('static DisplayObject* as_swc_new_char(int charId);');
@@ -8246,6 +8250,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     for (const ch of bake.characters) {
       if (ch.kind === 'shape' && ch.shape !== undefined) this.emitSwcShapeBuilder(ch.shape);
     }
+    const morphChars = bake.characters.filter((c) => c.kind === 'morph' && c.morph !== undefined);
+    this.swcMorphIds = new Set(morphChars.map((c) => c.id));
+    for (const ch of morphChars) this.emitSwcMorphBuilder(ch.morph as SwcBakeMorph);
+    this.emitSwcMorphApply(morphChars.map((c) => ({ id: c.id })));
     for (const m of masks) this.emitSwcMaskBuilder(m);
     for (const ch of bake.characters) {
       if (ch.kind === 'sprite' || ch.kind === 'button') this.emitSwcCharBuilder(ch, maskSymbol);
@@ -8553,6 +8561,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         filters: op.filters,
         blendMode: op.blendMode,
         bitmapCached: op.bitmapCached,
+        ratio: op.ratio,
       };
       this.emitSwcPlacement(name, p);
       this.emitSwcPlacementAttrs(name, p, 0);
@@ -8588,6 +8597,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     }
     if (op.hidden) this.line(`${name}->visible = false;`);
     if (op.visible) this.line(`${name}->visible = true;`);
+    // The morph ratio is the whole content of those frames (up to 100 of them),
+    // so it is applied to the instance the timeline placed at this depth.
+    if (op.ratio !== undefined) this.line(`as_swc_morph_apply(${name}, ${op.ratio});`);
     // A modify record can (re)name the object at this depth: the parent's
     // property follows, exactly as for a placement record.
     if (op.name !== undefined) this.emitSwcChildName(name, { charId: op.modCharId ?? 0, matrix: null, cxform: null, hidden: false, name: op.name }, 'o');
@@ -8692,6 +8704,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // are in the shape's own local space, which is exactly the space the render
     // walk has already concatenated by the time it paints this Graphics.
     this.line('static void as_swc_clip(Graphics* g, double x, double y, double w, double h) { g->_clip = 1; g->_clx = x; g->_cly = y; g->_clw = w; g->_clh = h; }');
+    // A morph shape REPORTS its start bounds at every ratio while its rasterisation
+    // clip stays the union of both ends (see the Graphics `_mdecl` field).
+    this.line('static void as_swc_morph_decl(Graphics* g, double x, double y, double w, double h) { g->_mdecl = 1; g->_ml = x; g->_mt = y; g->_mw = w; g->_mh = h; }');
     // clipDepth mask (swc.md §9 E-4): copy a shape's outline into a fresh SkPath,
     // transformed into the masked object's local pixels. The bake plan already
     // composed inverse(childMatrix) * maskMatrix, so the renderer clips with the
@@ -8716,6 +8731,53 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('');
   }
 
+/**
+   * Morph helpers (swc.md §3.4⑦).
+   *
+   * A `DefineMorphShape`/`2` is a LINEAR BLEND of two authored geometries: Flash
+   * stores the shapes at ratio 0 and ratio 1 and guarantees matching control
+   * points, so the shape at any ratio is `start + (end - start) * t` point by
+   * point, colour by colour. The builder therefore takes `t` instead of baking one
+   * static outline, and `PlaceObject2`'s `Ratio` field is all a morph animation is.
+   */
+  private emitSwcMorphHelpers(): void {
+    this.line('// ---- SWC morph shapes (swc.md §3.4⑦) ----');
+    this.line('static double as_swc_lerp(double a, double b, double t) { return a + (b - a) * t; }');
+    // One channel at a time: blending the packed word would let alpha bleed into
+    // the colour channels. `+ 0.5` rounds, so t == 0 and t == 1 reproduce the two
+    // authored colours EXACTLY (a plain double round-trip can land 1 short).
+    this.line('static unsigned as_swc_lerp_argb(unsigned a, unsigned b, double t) {');
+    this.indent++;
+    this.line('unsigned out = 0;');
+    this.line('for (int sh = 0; sh < 32; sh += 8) {');
+    this.indent++;
+    this.line('double ca = (double)((a >> sh) & 0xffu);');
+    this.line('double cb = (double)((b >> sh) & 0xffu);');
+    this.line('unsigned v = (unsigned)(ca + (cb - ca) * t + 0.5);');
+    this.line('if (v > 255u) v = 255u;');
+    this.line('out |= v << sh;');
+    this.indent--;
+    this.line('}');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    // Rebuild a morph's geometry at a new ratio. `Ratio` is a 16-bit value over
+    // 0..1, and these timeline frames carry nothing else, so this IS the animation.
+    // A zero-size clip or a cleared path is not a fallback here: `Graphics_clear`
+    // followed by the builder reproduces exactly what AIR shows at that ratio.
+    this.line('static void as_swc_morph_ratio(DisplayObject* o, void (*build)(Graphics*, double), int ratio) {');
+    this.indent++;
+    this.line('if (o == NULL || build == NULL) return;');
+    this.line('Graphics* g = as_graphics_of(o);');
+    this.line('if (g == NULL) return;');
+    this.line('if (ratio < 0) ratio = 0;');
+    this.line('if (ratio > 65535) ratio = 65535;');
+    this.line('Graphics_clear(g);');
+    this.line('build(g, (double)ratio / 65535.0);');
+    this.indent--;
+    this.line('}');
+    this.line('');
+  }
   /** One `Graphics` builder per shape character: its groups, then their subpaths. */
   private emitSwcShapeBuilder(shape: SwcBakeShape): void {
     this.line(`// SWC shape character #${shape.id}: ${shape.groups.length} draw group(s), ` +
@@ -8812,6 +8874,179 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     return `as_swc_paint_gradient(${kind}, lm, ${f.spread ?? 0}, stops, pos, ${argbs.length}, ${this.formatDouble(f.focal ?? 0)})`;
   }
 
+/**
+   * One `Graphics` builder per morph character, parameterised by the ratio `t`.
+   *
+   * The clip rect is the UNION of both bounds: an interpolated point always lies
+   * inside the convex hull of the two authored points, so the union bounds every
+   * ratio, and AIR clips a shape's rasterisation to its own bounds box.
+   */
+  private emitSwcMorphBuilder(m: SwcBakeMorph): void {
+    const edges = m.groups.reduce((n, g) => n + g.paths.reduce((k, p) => k + p.pts.length, 0), 0);
+    this.line(
+      `// SWC morph character #${m.id}: ${m.groups.length} draw group(s), ${edges} morphing edge(s), ` +
+        `${m.bounds.w.toFixed(2)}x${m.bounds.h.toFixed(2)} px (union of both ratios).`
+    );
+    this.line(`static void as_swc_morph_${m.id}(Graphics* g, double t) {`);
+    this.indent++;
+    // A morph carries no winding flag: DefineMorphShape is even-odd, like the
+    // DefineShape1/2 it descends from (only DefineShape4 may say non-zero).
+    this.line('as_swc_fill_rule(g, 1);');
+    this.line(
+      `as_swc_clip(g, ${this.formatDouble(m.bounds.x)}, ${this.formatDouble(m.bounds.y)}, ` +
+        `${this.formatDouble(m.bounds.w)}, ${this.formatDouble(m.bounds.h)});`
+    );
+    // What the display APIs answer: the START shape, not the current one.
+    this.line(
+      `as_swc_morph_decl(g, ${this.formatDouble(m.decl.x)}, ${this.formatDouble(m.decl.y)}, ` +
+        `${this.formatDouble(m.decl.w)}, ${this.formatDouble(m.decl.h)});`
+    );
+    for (const grp of m.groups) {
+      const pre: string[] = [];
+      const paint = this.swcMorphPaintExpr(grp, pre);
+      let call: string;
+      if (grp.fill !== null) {
+        call = `as_swc_fill(g, ${paint});`;
+      } else {
+        const l0 = (grp.line as { start: SwcLineStyle; end: SwcLineStyle }).start;
+        const l1 = (grp.line as { start: SwcLineStyle; end: SwcLineStyle }).end;
+        // Caps/join/miter come from the style, not from the ratio: the two ends of
+        // one MORPHLINESTYLE share them by construction, so a disagreement means a
+        // parse bug and must not be smoothed over.
+        if (l0.startCap !== l1.startCap || l0.join !== l1.join || l0.endCap !== l1.endCap || l0.miter !== l1.miter) {
+          throw new Error(`emit: morph #${m.id} stroke style differs between its two ratios (cap/join/miter)`);
+        }
+        call =
+          `as_swc_stroke(g, ${paint}, ` +
+          `as_swc_lerp(${this.formatDouble(l0.width / 20)}, ${this.formatDouble(l1.width / 20)}, t), ` +
+          `${l0.startCap ?? 0}, ${l0.join ?? 0}, ${this.swcMiter(l0)});`;
+      }
+      this.line('{');
+      this.indent++;
+      for (const s of pre) this.line(s);
+      this.line(call);
+      for (const p of grp.paths) {
+        this.line(`as_swc_move_to(g, ${this.lerp2(p.start.x, p.start.xE)}, ${this.lerp2(p.start.y, p.start.yE)});`);
+        for (const e of p.pts) {
+          if (e.cx === undefined) this.line(`as_swc_line_to(g, ${this.lerp2(e.x, e.xE)}, ${this.lerp2(e.y, e.yE)});`);
+          else {
+            const me = e as { cx: number; cy: number; x: number; y: number; cxE?: number; cyE?: number; xE: number; yE: number };
+            const cxE = me.cxE === undefined ? me.cx : me.cxE;
+            const cyE = me.cyE === undefined ? me.cy : me.cyE;
+            this.line(
+              `as_swc_quad_to(g, ${this.lerp2(me.cx, cxE)}, ${this.lerp2(me.cy, cyE)}, ` +
+                `${this.lerp2(me.x, me.xE)}, ${this.lerp2(me.y, me.yE)});`
+            );
+          }
+        }
+        if (p.closed && grp.fill === null) this.line('as_swc_close(g);');
+      }
+      this.indent--;
+      this.line('}');
+    }
+    this.indent--;
+    this.line('}');
+    this.line('');
+  }
+
+  /**
+   * Emit a coordinate for a morph path. `x` is the ratio-0 value; because this is
+   * called for morph paths only, the caller passes both ratios and an identical
+   * pair collapses to a constant so the output stays readable.
+   */
+  private lerp2(x: number, xE: number): string {
+    return x === xE ? this.formatDouble(x) : `as_swc_lerp(${this.formatDouble(x)}, ${this.formatDouble(xE)}, t)`;
+  }
+
+  /**
+   * The C expression for a morph group's paint, pushing the array declarations a
+   * runtime blend needs into `pre`.
+   *
+   * Both ends of one MORPHFILLSTYLE have the same fill TYPE by construction (the
+   * style table carries one type byte), so a type mismatch is a parse bug, not a
+   * case to paper over. A gradient's local matrix, stop colours and stop positions
+   * all blend; a bitmap fill keeps its single BitmapId and blends only the matrix.
+   */
+  private swcMorphPaintExpr(grp: SwcBakeMorphGroup, pre: string[]): string {
+    const l0 = grp.line?.start;
+    const l1 = grp.line?.end;
+    const f0: SwcFillStyle | null =
+      grp.fill?.start ?? l0?.fillStyle ?? (l0?.rgba !== undefined ? { type: 0, rgba: l0.rgba } : null);
+    const f1: SwcFillStyle | null =
+      grp.fill?.end ?? l1?.fillStyle ?? (l1?.rgba !== undefined ? { type: 0, rgba: l1.rgba } : null);
+    const argb = (v: number): string => `0x${(v >>> 0).toString(16).padStart(8, '0')}u`;
+    if (f0 === null || f1 === null) return `as_swc_paint_solid(${argb(f0?.rgba ?? f1?.rgba ?? 0xff000000)})`;
+    if (f0.type !== f1.type) {
+      throw new Error(`emit: morph fill type changed between ratios (0x${f0.type.toString(16)} -> 0x${f1.type.toString(16)})`);
+    }
+    if (f0.type === 0 || f0.type === -1) {
+      const a = f0.rgba ?? 0xff000000;
+      const b = f1.rgba ?? 0xff000000;
+      return `as_swc_paint_solid(${a === b ? argb(a) : `as_swc_lerp_argb(${argb(a)}, ${argb(b)}, t)`})`;
+    }
+    const m0 = f0.matrix ?? [1, 0, 0, 1, 0, 0];
+    const m1 = f1.matrix ?? [1, 0, 0, 1, 0, 0];
+    // Same rule as the static shapes: the SWF fill matrix maps its SOURCE space
+    // (gradient twips / bitmap pixels) onto shape TWIPS, so every entry is /20.
+    pre.push('double lm[6];');
+    for (let i = 0; i < 6; i++) pre.push(`lm[${i}] = ${this.lerp2(m0[i] / 20, m1[i] / 20)};`);
+    if (f0.type >= 0x40) {
+      if ((f0.bitmapId ?? 0) !== (f1.bitmapId ?? 0)) {
+        throw new Error(`emit: morph bitmap fill changed its BitmapId (${f0.bitmapId} -> ${f1.bitmapId})`);
+      }
+      const repeat = (f0.type & 1) === 0 ? 1 : 0;
+      const smooth = (f0.type & 2) === 0 ? 1 : 0;
+      return `as_swc_paint_bitmap(as_swc_image(${f0.bitmapId ?? 0}), lm, ${repeat}, ${smooth})`;
+    }
+    if (f0.gradKind !== f1.gradKind || f0.spread !== f1.spread || f0.interp !== f1.interp) {
+      throw new Error(`emit: morph gradient changed kind/spread/interp between ratios`);
+    }
+    const s0 = f0.stops ?? [];
+    const s1 = f1.stops ?? [];
+    if (s0.length !== s1.length) {
+      throw new Error(`emit: morph gradient has ${s0.length} stop(s) at ratio 0 but ${s1.length} at ratio 1`);
+    }
+    const kind = f0.gradKind === 'radial' ? 1 : f0.gradKind === 'focal' ? 2 : 0;
+    const n = Math.max(s0.length, 1);
+    pre.push(`unsigned stops[${n}];`);
+    pre.push(`double pos[${n}];`);
+    for (let i = 0; i < s0.length; i++) {
+      const a = s0[i].rgba;
+      const b = s1[i].rgba;
+      pre.push(`stops[${i}] = ${a === b ? argb(a) : `as_swc_lerp_argb(${argb(a)}, ${argb(b)}, t)`};`);
+      pre.push(`pos[${i}] = ${this.lerp2(s0[i].ratio / 255, s1[i].ratio / 255)};`);
+    }
+    if (s0.length === 0) {
+      // as_swc_paint_gradient rejects a table with < 2 stops by returning NULL,
+      // which paints nothing -- the same hole a shape with a broken gradient leaves.
+      pre.push('stops[0] = 0u;');
+      pre.push('pos[0] = 0.0;');
+    }
+    return `as_swc_paint_gradient(${kind}, lm, ${f0.spread ?? 0}, stops, pos, ${s0.length}, ${this.formatDouble(f0.focal ?? 0)})`;
+  }
+
+  /**
+   * The one ratio dispatcher. `DisplayObject._tl_char` is the character an
+   * instance was built from (`as_swc_new` stamps it), so a `Ratio` record can find
+   * the right builder without the emitter having to know, at every call site, which
+   * character the timeline put at that depth.
+   */
+  private emitSwcMorphApply(morphs: { id: number }[]): void {
+    if (morphs.length === 0) return;
+    this.line('// Apply a PlaceObject2 morph Ratio to whichever morph sits on the object.');
+    this.line('static void as_swc_morph_apply(DisplayObject* o, int ratio) {');
+    this.indent++;
+    this.line('if (o == NULL) return;');
+    this.line('switch (o->_tl_char) {');
+    this.indent++;
+    for (const m of morphs) this.line(`case ${m.id}: as_swc_morph_ratio(o, as_swc_morph_${m.id}, ratio); break;`);
+    this.line('default: break;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('');
+  }
   /**
    * One clipDepth mask: build the mask shape's outline once, transformed into the
    * PARENT's pixels by the mask's own placement matrix. `matrix` comes straight
@@ -9108,6 +9343,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   }
 
   private emitSwcPlacement(child: string, p: SwcBakePlacement): void {
+    // A `PlaceObject2` Ratio record morphs the shape at this depth. The dispatcher
+    // keys off the instance's own character id, so a record that carries a ratio
+    // for a non-morph character is a no-op here exactly as it is in AIR.
+    if (p.ratio !== undefined) this.line(`as_swc_morph_apply(${child}, ${p.ratio});`);
+    else if (p.charId !== null && this.swcMorphIds.has(p.charId)) {
+      // Frame 1 (and every rewind) re-places the character from scratch: an
+      // omitted Ratio means 0, not "keep whatever the last frame left".
+      this.line(`as_swc_morph_apply(${child}, 0);`);
+    }
+
     const m = p.matrix;
     const origin = p.charId === null ? undefined : this.swcTextOrigin.get(p.charId);
     // The SWF matrix is split between the child's own fields and `transform.matrix`,
@@ -9234,10 +9479,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         this.line(`case ${ch.id}: { BitmapData* bd = BitmapData_new(0, 0, true, 0u); ${adopt}; return (DisplayObject*)Bitmap_new(bd, (char*)"auto", false); }`);
       } else if (ch.kind === 'morph') {
         // AIR's class here is MorphShape (a Shape subclass). We have no MorphShape
-        // class, and the child reports "Shape" — part of the registered child-class
-        // identity gap — but the tree shape (count + index) is AIR's, and an empty
-        // Shape paints nothing, so no wrong pixels are introduced.
-        this.line(`case ${ch.id}: { return (DisplayObject*)Shape_new(); }`);
+        // class, so the instance reports "Shape" — a registered-class-name gap that
+        // `notes` states. The GEOMETRY is real now: built at ratio 0, which is the
+        // ratio an instance starts at, and rebuilt by every PlaceObject2 Ratio.
+        this.line(`case ${ch.id}: { Shape* s = Shape_new(); as_swc_morph_${ch.id}(s->graphics, 0.0); return (DisplayObject*)s; }`);
       } else if (ch.kind === 'text') {
         // AIR instantiates DefineText/DefineEditText as TextFields, sized by the
         // character's own RECT. For DefineEditText the WHOLE field is stamped here:
@@ -19852,7 +20097,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // `getRect` keeps the stroke-EXCLUSIVE box (with_stroke 0 ⇒ decl 0): AIR's
     // declared ShapeBounds folds the stroke in, and only the display-oriented
     // getters (width/height/getBounds) report that stroke-inclusive box.
-    this.line('if (!as_bounds_walk(o, 0, 0, &l, &t, &r, &b)) return Rectangle_new(0.0, 0.0, 0.0, 0.0);');
+    this.line('if (!as_bounds_walk(o, 0, 2, &l, &t, &r, &b)) return Rectangle_new(0.0, 0.0, 0.0, 0.0);');
     this.line('if (target != NULL && target != o) { as_rect_to_stage(o, &l, &t, &r, &b); as_rect_from_stage(target, &l, &t, &r, &b); }');
     this.line('return Rectangle_new(l, t, r - l, b - t);');
     this.indent--;
@@ -25521,7 +25766,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('Graphics* g = as_graphics_of(o);');
     this.line('if (g != NULL && g->_has_b) {');
     this.indent++;
-    this.line('if (decl && g->_clip) {');
+    // `decl`: 0 = the geometry itself (hit testing: a morph must stay pickable
+    // where it is actually drawn), 1 = the display box (getBounds/width/height,
+    // where a baked plain shape answers its ShapeBounds) and 2 = getRect (a
+    // plain shape answers its bare path). A morph answers its START box in both
+    // reporting modes, because that is what AIR caches on a MorphShape.
+    this.line('if (g->_mdecl && decl != 0) {');
+    this.indent++;
+    this.line('*l = g->_ml; *t = g->_mt; *r = g->_ml + g->_mw; *b = g->_mt + g->_mh;');
+    this.indent--;
+    this.line('} else if (decl == 1 && g->_clip) {');
     this.indent++;
     // A baked SWC shape always carries its ShapeBounds clip (as_swc_clip), which is
     // the box AIR reports for the Shape. No stroke expansion: the declared rect

@@ -409,6 +409,10 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 只在 Skia 构建下存在，故链 swc-bitmap.build.json（它已经带上了 examples/embed-assets/skin.swc，与 swc-shape.as
   // 的渲染层变体同一路子）。
   'swc-mc-button.as': ['--manifest', join(dir, 'swc-bitmap.build.json')],
+  // swc-morph.as（阶段三百一十四）钉的是 morph（DefineMorphShape）烘焙后的**显示盒**契约：
+  // AIR 把 MorphShape 的 width/height/getBounds/getRect 钉在 ratio 0 的起始形上（实测），
+  // 而几何本身随 Ratio 插值。它同样要读 skin.swc，故与 swc-bitmap.as 用同一份清单。
+  'swc-morph.as': ['--manifest', join(dir, 'swc-bitmap.build.json')],
   // bitmap-setpixels-endian.as（阶段二百一十六）断言两件事：setPixels 必须按
   // `ByteArray.endian` 解析 32 位字（真应用 ANEVideo 的摄像头帧是 libyuv 的
   // B,G,R,A，靠 littleEndian 声明），以及「`new BitmapData` + setPixels 填出来的
@@ -442,6 +446,7 @@ const EXAMPLE_REQUIRES: Record<string, string> = {
   'swc-bitmap.as': join(dir, 'embed-assets', 'skin.swc'),
   'swc-shape.as': join(dir, 'embed-assets', 'skin.swc'),
   'swc-mc-button.as': join(dir, 'embed-assets', 'skin.swc'),
+  'swc-morph.as': join(dir, 'embed-assets', 'skin.swc'),
 };
 
 // Why the extension-bearing example units (`ane/`, `ane-app/`) are skipped instead
