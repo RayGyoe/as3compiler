@@ -248,15 +248,22 @@ The key prerequisite: **the ANE must be the version rebuilt against `asaot`** (i
 `Adobe AIR.dll` — the latter is the module name AIR's own import library records and must not be used as our product's name); nothing about this affects `adl`, which keeps using the original ANE, and the two do not interfere.
 `ExtensionContext` is modelled on AIR: `createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` /
 `actionScriptData` + asynchronous `StatusEvent` dispatch; AIR has **no** `extensionID` property (measured: `mxmlc` rejects it, `adl` reports `Error #1069`), and this runtime has none either — we do not invent an extra property just to "look more complete".
-The rendering pipeline (`FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBuffer*`) is **not implemented in this phase**:
+**Bitmap pixel access** (`FREAcquireBitmapData` / `FREAcquireBitmapData2` / `FREInvalidateBitmapDataRect` /
+`FREReleaseBitmapData`) **is implemented**: `bits32` is `BitmapData.pixels` (straight ARGB, tightly packed),
+and release/invalidate bump the version counter so the frame really refreshes; a non-BitmapData answers
+`FRE_TYPE_MISMATCH`, a `dispose()`d one answers `FRE_INVALID_OBJECT`. This is the cheapest copy path for a
+video-class extension (one full-frame copy per frame, against two for `getVideoData(ByteArray)` + `setPixels`).
+The rendering pipeline proper (`FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBuffer*` /
+`FREGetNativeContext3DHandle`) is **not implemented in this phase**:
 only stubs are exported and they **report loudly** when called, never silently returning a fabricated render mode.
 **Native window handles** (`FREAcquireNativeWindowHandle` / `FREReleaseNativeWindowHandle`) **are implemented**:
 `HWND` on Windows and `NSWindow*` on macOS; a closed window or a build without a window backend answers
 `FRE_ILLEGAL_STATE` with a self-report rather than a fabricated pointer.
 
 **The complete procedure for migrating an existing ANE** (dual products + rebuild-with-renaming, the shim header, the three project properties, a symptom→cause table, and the full list of gaps) is in
-[`docs/en/ane.md`](docs/en/ane.md); the smallest runnable loop is in [`examples/ane/`](examples/ane) (48 assertions, naming the package on the command line / in a manifest; **it really runs on both Windows and macOS**, and on macOS it loads a genuine `dlopen`ed `ProbeANE.dylib`) and
-[`examples/ane-app/`](examples/ane-app) (10 assertions, going through `--air-app` + the descriptor's `<extensions>`, two of them pinning the native window handle).
+[`docs/en/ane.md`](docs/en/ane.md); the smallest runnable loop is in [`examples/ane/`](examples/ane) (56 assertions, naming the package on the command line / in a manifest; **it really runs on both Windows and macOS**, and on macOS it loads a genuine `dlopen`ed `ProbeANE.dylib`) and
+[`examples/ane-app/`](examples/ane-app) (13 assertions, going through `--air-app` + the descriptor's `<extensions>`, two of them pinning the native window handle and
+two pinning that a second frame really replaces the first).
 A rebuilt product is a **staging directory tree** (`extension.xml` + `<platform>/<library>`, unpackaged); dropping it into `<appDir>/ext-aot/<extension id>/`
 makes it get picked up automatically, so `adl` keeps using the original ANE and the two paths do not interfere.
 

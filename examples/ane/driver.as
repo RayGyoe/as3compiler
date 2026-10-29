@@ -13,6 +13,8 @@
 
 import flash.external.ExtensionContext;
 import flash.events.StatusEvent;
+import flash.display.BitmapData;
+import flash.geom.Point;
 
 var passed:int = 0;
 
@@ -164,6 +166,40 @@ if (ctx != null) {
           "acquire=3 release=3 live=0 sameProcess=0 stable=0");
     check("nativeWindowHandle(null) headless", ctx.call("nativeWindowHandle", null) as String,
           "acquire=2 release=2 live=0 sameProcess=0 stable=0");
+
+    // BitmapData: the pixel handoff a video ANE is built on (acquire -> memcpy into
+    // bits32 -> release, which is all ANEVideoRander::getVideoBitmapData does).
+    //
+    // `same=1` is the assertion that stings: the two descriptor versions differ in
+    // the middle (v2 inserts isInvertedY before bits32), so a host that answered one
+    // with a memcpy of the other would pass a viable pointer with a corrupted
+    // stride -- and this fixture acquires BOTH on the same object and compares them.
+    var bmd:BitmapData = new BitmapData(8, 4, false, 0);
+    check("writeBitmapData", ctx.call("writeBitmapData", bmd, uint(0xFF336699)) as String,
+          "acq=0 acq2=0 w=8 h=4 stride=8 alpha=0 premul=0 inverted=0 same=1 inv=0 rel=0");
+    // And the write really landed in the bitmap AS3 holds: two opposite corners, so a
+    // wrong height or stride (which leaves part of the surface unwritten) shows up.
+    check("ANE-written pixel(0,0)", bmd.getPixel32(0, 0), 0xFF336699);
+    check("ANE-written pixel(7,3)", bmd.getPixel32(7, 3), 0xFF336699);
+    // `hasAlpha` follows `transparent`, and the alpha byte an extension writes is
+    // NOT forced to 0xFF (only setPixel32 does that on an opaque bitmap).
+    var bmdT:BitmapData = new BitmapData(4, 2, true, 0x00000000);
+    check("writeBitmapData(transparent)", ctx.call("writeBitmapData", bmdT, uint(0x80010203)) as String,
+          "acq=0 acq2=0 w=4 h=2 stride=4 alpha=1 premul=0 inverted=0 same=1 inv=0 rel=0");
+    check("alpha survives", bmdT.getPixel32(3, 1), 0x80010203);
+
+    // The failure half is a FREResult, never a crash: a Point is a type error (3),
+    // AS3 null is a missing object (2), a NULL out-pointer is a bad argument (5) --
+    // and a DISPOSED BitmapData is 2 as well, because it is still a BitmapData that
+    // simply has no pixels left (AIR's reading, and the alternative would hand out a
+    // descriptor whose bits32 an extension would memcpy into).
+    check("bitmapDataErrors(Point)", ctx.call("bitmapDataErrors", new Point(1, 2)) as String,
+          "acq=3 acq2=3 acqnull=5 acq2null=5 inv=3 rel=3");
+    check("bitmapDataErrors(null)", ctx.call("bitmapDataErrors", null) as String,
+          "acq=2 acq2=2 acqnull=5 acq2null=5 inv=2 rel=2");
+    bmd.dispose();
+    check("bitmapDataErrors(disposed)", ctx.call("bitmapDataErrors", bmd) as String,
+          "acq=2 acq2=2 acqnull=5 acq2null=5 inv=2 rel=2");
 
     ctx.dispose();
     check("disposed", true, true);

@@ -13,15 +13,16 @@
 >   **ANE 自身源码树一字不改**。
 > * **本文第 4 节是重点**：从「拿到一个 `.ane`」到「AOT 产物里能 `ctx.call` 通」的完整流程、
 >   每一个可验证的检查点，以及**症状 → 病因**对照表。
-> * **D 面（渲染管线 / 原生窗口句柄 / Context3D）本期基本不实现**：11 个入口点里只有
->   `FREAcquire|ReleaseNativeWindowHandle` 真的落地（§3.8），其余 9 个一律返回
->   `FRE_ILLEGAL_STATE` **并在 stderr 自报**，不静默成功、不编造描述符。
+> * **D 面（渲染管线 / 原生窗口句柄 / Context3D）本期大部分不实现**：11 个入口点里有 6 个真的落地——
+>   `FREAcquire|ReleaseNativeWindowHandle`（§3.8）与**视频类扩展真正在用的那四个**
+>   `FREAcquireBitmapData[2]` / `FREInvalidateBitmapDataRect` / `FREReleaseBitmapData`（§3.9）；
+>   其余 5 个一律返回 `FRE_ILLEGAL_STATE` **并在 stderr 自报**，不静默成功、不编造描述符。
 >
 > **状态（v0.4.188 复核）**：A/B/C 三面已落地，宿主平台有 **Windows x86 / x86-64** 两个位宽与
 > **macOS x86-64（通用二进制，一个键服务两种架构）** —— macOS 那一半于 2026-10-20（阶段二百零七）落地，
 > 含宿主库、C 面的 POSIX 分支、夹具与示例（见 §5.1）。仍未做的只有 **iOS**：它把扩展**静态链进应用镜像**、
 > 没有 `dlopen` 这一步，故不是一个可加载的宿主库，`aneHostLibName()` 对它**响亮抛错并说明原因**
-> （其余任何没有宿主库的平台，`--ane` 同样响亮报错并给出缺失路径，见 §5）。端到端证据：`examples/ane/`（**48 条断言全过**，Windows 与 macOS 都真跑）与 `examples/ane-app/`（**10 条**，描述符那条路）、`test/unit/emit.ts` 的
+> （其余任何没有宿主库的平台，`--ane` 同样响亮报错并给出缺失路径，见 §5）。端到端证据：`examples/ane/`（**56 条断言全过**，Windows 与 macOS 都真跑）与 `examples/ane-app/`（**13 条**，描述符那条路）、`test/unit/emit.ts` 的
 > `unit: ane/ExtensionContextSurface`、`test/unit/build.ts` 的 `unit: ane/ExtensionXmlComments`
 > / `unit: ane/PackageLayout` / `unit: ane/PlatformForBuild` / `unit: ane/ExampleFixtureTrees` /
 > `unit: ane/HostLibrary` / `build/AneHostLayout` / `build/WindowsArch`、`test/unit/fre.ts` 的
@@ -59,12 +60,13 @@ AIR 里一个原生扩展由三件东西组成，理解这三件东西的分工�
 | **A 面** | AS3 侧 `flash.external.ExtensionContext`（`createExtensionContext` / `call` / `dispose` / `getExtensionDirectory` / `actionScriptData` + `StatusEvent`） | ✅ 已实现 |
 | **B 面** | FRE 对象模型：`FREObject ↔ as_value`、按调用作用域的 arena、**51 个入口点** | ✅ 已实现 |
 | **C 面** | 扩展加载：编译期描述符表、平台加载器、`Initializer`/`ContextInitializer`/`Finalizer` 协议、函数表分派、`StatusEvent` 投递 | ✅ 已实现 |
-| **D 面** | 渲染管线与原生句柄（**共 11 个**）：`FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBufferLock\|Unlock` / `FREAcquire\|ReleaseBitmapData[2]` / `FREInvalidateBitmapDataRect` / `FREAcquire\|ReleaseNativeWindowHandle` / `FREGetNativeContext3DHandle` | 窗口句柄那一对（`FREAcquire\|ReleaseNativeWindowHandle`）✅ **已实现**（语义见 §3.8）；其余 **9 个** ⛔ **本期不实现**，`FRE_ILLEGAL_STATE` + 自报 |
+| **D 面** | 渲染管线与原生句柄（**共 11 个**）：`FREGetRenderMode` / `FRESetRenderSource` / `FREMediaBufferLock\|Unlock` / `FREAcquire\|ReleaseBitmapData[2]` / `FREInvalidateBitmapDataRect` / `FREAcquire\|ReleaseNativeWindowHandle` / `FREGetNativeContext3DHandle` | 窗口句柄那一对（`FREAcquire\|ReleaseNativeWindowHandle`）✅ **已实现**（语义见 §3.8）；BitmapData 那四个（`FREAcquire\|Acquire2\|Invalidate\|Release`）✅ **已实现**（语义见 §3.9）；其余 **5 个** ⛔ **本期不实现**，`FRE_ILLEGAL_STATE` + 自报 |
 
-D 面为什么单列：它不是「漏了」，是**决定延后**——它要求运行时真的有一条能收外来帧缓冲、
-能与 D3D/OpenGL 互操作、能把外来帧合成进画面的呈现管线。这一层不在本阶段的目标里，而**假装
-成功是更坏的选择**：对视频类 ANE 来说，`FRE_OK` 会让扩展以为「画面已经呈现」，最终现象是
-「黑屏但没人报错」。所以这 9 个入口点走的是同一条**限流**的自报通道
+D 面为什么单列：它不是「漏了」，是**分两半决定**——句柄与位图像素**本来就是这个运行时已经拥有的东西**
+（窗口是 SDL 的、`BitmapData.pixels` 是自己的 GC 缓冲），把它们交出去不需要任何呈现后端；
+而「收外来帧缓冲、与 D3D/OpenGL 互操作、把外来帧合成进画面」需要真正的呈现管线，那一层不在本阶段目标里。
+**假装成功是更坏的选择**：对视频类 ANE 来说，`FRE_OK` 会让扩展以为「画面已经呈现」，最终现象是
+「黑屏但没人报错」。所以剩下这 5 个入口点走的是同一条**限流**的自报通道
 `[as3-aot] not implemented by this build: ...`（每程序最多 5 条，见 `src/runtime.ts:2664`；
 上限的目的是让缺口**可见**而不是把日志写成流水账）。
 
@@ -308,9 +310,52 @@ macOS 是 `NSWindow*`（`lib/asaot.h` 里 `FRENativeWindow` 就是按平台选�
 `stage.nativeWindow` 调 acquire 会得到 `FRE_ILLEGAL_STATE`；AIR 是先建窗再跑构造器。第一帧之后两边
 一致，`examples/ane-app/src/Main.as` 正是在第一帧断言的。
 
-**证据**：`examples/ane/`（离屏构建，钉住 `Point` / `null` 两条拒绝路径，48 条断言）+
+**证据**：`examples/ane/`（离屏构建，钉住 `Point` / `null` 两条拒绝路径，56 条断言）+
 `examples/ane-app/`（窗口构建，扩展自己用 `IsWindow` + `GetWindowThreadProcessId` 校验句柄属于**本进程**，
-并连 acquire 两次证明同一个槽位答同一个对象，10 条断言）+ 结构钉 `unit: fre/NativeWindowHandle`（21 条）。
+并连 acquire 两次证明同一个槽位答同一个对象，13 条断言）+ 结构钉 `unit: fre/NativeWindowHandle`（21 条）。
+
+### 3.9 BitmapData 直接像素访问：视频类扩展的真正通道（阶段三百一十六）
+
+四个入口点：`FREAcquireBitmapData` / `FREAcquireBitmapData2` / `FREInvalidateBitmapDataRect` / `FREReleaseBitmapData`。
+它们交出去的东西**就是 `BitmapData.pixels`**——这个运行时自己的 GC 缓冲，不是某张纹理的临时映射。
+
+为什么这条通道比首选的 ByteArray 通道更值钱：`getVideoData(ByteArray)` + AS3 `setPixels` 是每帧
+**两次**全帧拷贝（原生池 → ByteArray，ByteArray → pixels），而 acquire → memcpy → release 只有**一次**。
+本机 720p 实测（`temp/pixprobe`）：`setPixels` **1.06–1.30 ms**、纯 memcpy 基线 **0.32 ms**。
+走这条通道后 `setPixels` 这一整趟消失（主线程每帧 **2.34 → 1.28 ms**，再叠加 R2 可到 **0.65 ms**），
+每帧全帧拷贝数 **5 → 3**，**低于 AIR 的 4**。数字与推导见仓根 `video-frame-copy-chain-analysis.md` §3 / §5。
+
+| 输入 / 状态 | 结果 | 为什么 |
+|---|---|---|
+| `flash.display.BitmapData` 实例（含子类 `extends BitmapData`） | `FRE_OK` + 描述符（`bits32` 指向 `pixels`） | `as_is(p, &BitmapData_vt)`，与 AS3 的类型判定同一个口径 |
+| AS3 `null` / `undefined` | `FRE_INVALID_OBJECT`（2） | 缺失的对象 |
+| 其他任何对象（如 `Point`） | `FRE_TYPE_MISMATCH`（3） | 合法的 FREObject，只是不是 BitmapData |
+| 已经 `dispose()` 的 BitmapData | `FRE_INVALID_OBJECT`（2） | 仍是 BitmapData，只是**没有像素了**；答一个 `bits32 == NULL` 的描述符会让扩展往空指针 memcpy |
+| 输出指针为 `NULL` | `FRE_INVALID_ARGUMENT`（5） | 调用方 bug，不是 AS3 错误 |
+| `FREReleaseBitmapData` / `FREInvalidateBitmapDataRect` | `FRE_OK`（操作数不合法时同上） | 没有锁要解，见下 |
+
+**描述符说什么**：`width`/`height` 取 `BitmapData` 自己的；`lineStride32 = width`（`pixels` 是紧排的）;
+`hasAlpha = transparent`；`isPremultiplied = 0`——`pixels` 存的是 **straight** `0xAARRGGBB`
+（`sk_image_from_argb` 用 `kUnpremul` 就是这个事实的另一面）；`isInvertedY = 0`（行0在上）。
+**v1 与 v2 不是同一个结构体**：v2 在 `bits32` 前插了 `isInvertedY`，所以 v1 的描述符是**逐字段**填的，
+一次 `memcpy` 会把指针放到 v1 客户端读 `lineStride32` 的位置上。
+
+**与 AIR 契约的关系**：AIR 头文件说指针「只在本次调用期间有效」、并且**非主线程 acquire 返回
+`FRE_WRONG_THREAD`**。两条在这里都成立：所有入口点都经由 `as_ext_call`（AS3 线程）到达；
+而「只在调用期间有效」的理由（要把一张 tiled 纹理 pin 住再解 pin）在这里不存在——`pixels` 本来就是
+紧排的，且 GC 是 mark-sweep **不移动**、对象在整个调用期间被扩展的实参参照着，地址不会变。
+
+**唯一必须显式做的事是失效**：扩展的写**不经过** `BitmapData` 自己的任何 mutator，所以没有人会推动版本计数器。
+于是 `FREReleaseBitmapData` 与 `FREInvalidateBitmapDataRect` **都把 `_px_ver` 加一**——
+那正是 `as_bmd_live_image` 缓存 SkImage 所看的计数器（`_live_ver == _px_ver` 就复用旧图）。
+少了这一个自增，**画面会永远停在第 1 帧**，而且一句错误都没有。
+`FREInvalidateBitmapDataRect` 的矩形参数被忽略、整面置脏：AIR 用它把上传缩到一个矩形，
+这里全量上传是同一个答案的更多工作，不是错的答案。
+
+**证据**：`examples/ane/`（`writeBitmapData` 逐行写满整面，再由 AS3 `getPixel32` 读两个对角像素；
+两版描述符同时 acquire 并比对 `bits32`/`lineStride32` 一致；`bitmapDataErrors` 钉住 Point/null/disposed/NULL 四个结果码）+
+`examples/ane-app/`（真 Skia 渲染：两帧两种颜色经 `Bitmap.draw` 读回，**第二帧必须顶掉第一帧**——
+去掉那个自增，这条断言实测变红）+ 结构钉 `unit: fre/BitmapDataAcquire`（25 条）。
 
 ---
 
@@ -656,13 +701,13 @@ this build: ...`。按症状查：
 | `extension Initializer set no ContextInitializer: <Name>` | 扩展的 Initializer 没设置 `ctxInit` | 扩展实现问题（AIR 同样会 null） |
 | `the extension publishes no function named <fn>` | 名字拼错，或该函数不在发布的函数表里 | 对上扩展的 `FRENamedFunction[]` |
 | `the extension published no function table` | `ContextInitializer` 返回时 `numFunctions=0` | 扩展实现问题 |
-| `FREGetRenderMode (the render pipeline is out of scope for this build)` 等 11 条 | 命中了 **D 面** | 见 §5 缺陷 1；视频/呈现类功能本期没有 |
+| `FREGetRenderMode (the render pipeline is out of scope for this build)` 等 5 条 | 命中了 **D 面**里仍未实现的那 5 个 | 见 §5 缺陷 1；视频/呈现类功能本期没有 |
 | `ExtensionContext.getExtensionDirectory (this build stages only the native library, under extensions/<extensionID>/<platform>; the rest of the package is not unpacked)` | 扩展在找自己携带的资源文件 | 见 §5 缺陷 4 |
 | 整个程序不报错但 `createExtensionContext` 返回 null | **不应该出现**——如果出现就是缺陷，请连同 stderr 一起报 | —— |
 
 ### 4.9 最小可跑示例：`examples/ane/`（两条路子，同一个夹具）
 
-本仓有一个完整、可重复生成的最小闭环（**48 条断言全过**，两端同一份 `driver.as`）。
+本仓有一个完整、可重复生成的最小闭环（**56 条断言全过**，两端同一份 `driver.as`）。
 **重编产物是暂存目录树，不是 `.ane`**
 （§4.6 已不再打包），所以示例目录的形状就是运行期 `extensions/` 的形状——`<扩展 id>/<平台>/<库>`：
 
@@ -699,7 +744,7 @@ node --test --test-name-pattern='example: ane' test/examples.ts
 | 文件 | 作用 |
 |---|---|
 | `examples/ane-app/ane-app.xml` | 描述符：`<extensions>` 声明 **一个** id；`<visible>true</visible>`（**有窗口**，程序自己在末尾 `NativeApplication.exit()`，所以 `--run` 照样会返回） |
-| `examples/ane-app/src/Main.as` | AS3 入口（`extends Sprite`），10 条断言：未声明的 id 解析为 null、声明的能建 context、`ping`/`addInt`/原生数据/`truthy('')`/`StatusEvent`/`dispose`，以及两条**原生窗口句柄**（程序自建的 `NativeWindow`、第一帧的 `stage.nativeWindow`——后者必须等窗口真的建好，见 §3.8 的时序差异） |
+| `examples/ane-app/src/Main.as` | AS3 入口（`extends Sprite`），13 条断言：未声明的 id 解析为 null、声明的能建 context、`ping`/`addInt`/原生数据/`truthy('')`/`StatusEvent`/`dispose`，以及两条**原生窗口句柄**（程序自建的 `NativeWindow`、第一帧的 `stage.nativeWindow`——后者必须等窗口真的建好，见 §3.8 的时序差异） |
 | `examples/ane-app/ext-aot/com.example.probe/` | 与 `examples/ane/` 的暂存树**逐字节相同**（同一份脚本写两处——Windows 用 `build-ane.bat`、macOS 用 `build-ane.sh`——并有钉子钉住这份同一性，**两个平台的产物各钉一条**） |
 | `examples/ane-app/ane-app.build.json` | `--air-app` 每次跑**自动重写**的副产物（`ane-paths` = `["ext-aot/com.example.probe"]`），所以**不入库** |
 
@@ -754,7 +799,7 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 
 | # | 缺口 | 现象 | 是否自报 | 落地路径 |
 |---|---|---|---|---|
-| 1 | **D 面渲染管线**（**9 个**入口点；窗口句柄那一对已实现，见 §3.8） | 视频/呈现类扩展拿不到渲染模式、拿不到媒体缓冲 | ✅ `FRE_ILLEGAL_STATE` + 自报 | 需要真正的呈现后端（Skia/D3D 互操作 + 外来帧缓冲合成），独立工程 |
+| 1 | **D 面渲染管线**（**5 个**入口点；窗口句柄那一对与 BitmapData 那四个已实现，见 §3.8 / §3.9） | 视频/呈现类扩展拿不到渲染模式、拿不到媒体缓冲 | ✅ `FRE_ILLEGAL_STATE` + 自报 | 需要真正的呈现后端（Skia/D3D 互操作 + 外来帧缓冲合成），独立工程 |
 | 1b | **初始窗口的创建晚于文档类构造器** | 在文档类构造器里对 `stage.nativeWindow` 调 `FREAcquireNativeWindowHandle` 得到 `FRE_ILLEGAL_STATE`（**响亮自报**，不是静默 null）；AIR 是先建窗再跑构造器，所以那边拿得到 HWND。未在 `adl` 上实测这条 FRE 调用（需要把夹具重编回 AIR 版），依据是两边各自的窗口创建时序 | ✅ 自报 | 把初始窗口的创建挪到文档类之前；代价是「构造器里写的 bounds/title 由谁生效」这条既有约定要重定（见 `src/emit.ts` 里 `Stage_get_nativeWindow` 上方注释） |
 | 2 | **iOS 没有（也不会有同样的）宿主库** | `lib/bin/ios-arm64/` 不存在 | ✅ `aneHostLibName()` 直接抛并说明原因 | 这一行**不是**「macOS 那一半还没做」（那半已于 2026-10-20 落地，见 §5.1）。iOS 的平台模型不一样：扩展被**静态链进应用镜像**，没有 `dlopen` 这一步，于是 `asaot` 会成为一份**静态库**、initializer 由**直接符号引用**到达，而不是运行期按名字查。要落地得先定「谁调用 initializer」这件事，不是重编一遍 |
 | 3 | **Windows ARM64 未验证** | 有守卫（拒绝猜键、要求显式 64 位），但 arm64 依赖链从未构建过（本机没有 MSVC arm64 工具集） | ✅ 拒绝并给建议 | 需要一台 arm64 Windows + 工具集 |
@@ -801,8 +846,8 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 
 | 证据 | 内容 | 怎么复现 |
 |---|---|---|
-| `examples/ane/` | 端到端示例，**48 条断言全过**，末行 `RESULT passed=48 failed=0`。**Windows 与 macOS 跑的是同一份 `driver.as`、同一个夹具源码、同一组断言**（macOS 侧加载的是真 `dlopen` 的 `ProbeANE.dylib`） | `node --test --test-name-pattern='example: ane' test/examples.ts` |
-| `examples/ane-app/` | 端到端示例·**描述符那一半**：`--air-app` 把描述符里的 `<extensions>` 解析成 `ane-paths`、把库落到 `extensions/<扩展 id>/<平台>/`，再运行；**10 条断言全过**，末行 `RESULT passed=10 failed=0`（窗口真的存在，所以程序自己 `exit()` 收尾）（另有一行是未声明 id 的自报原文） | 同上 |
+| `examples/ane/` | 端到端示例，**56 条断言全过**，末行 `RESULT passed=56 failed=0`。**Windows 与 macOS 跑的是同一份 `driver.as`、同一个夹具源码、同一组断言**（macOS 侧加载的是真 `dlopen` 的 `ProbeANE.dylib`） | `node --test --test-name-pattern='example: ane' test/examples.ts` |
+| `examples/ane-app/` | 端到端示例·**描述符那一半**：`--air-app` 把描述符里的 `<extensions>` 解析成 `ane-paths`、把库落到 `extensions/<扩展 id>/<平台>/`，再运行；**13 条断言全过**，末行 `RESULT passed=13 failed=0`（窗口真的存在，所以程序自己 `exit()` 收尾）（另有一行是未声明 id 的自报原文） | 同上 |
 | `test/unit/emit.ts` → `unit: ane/ExtensionContextSurface` | 9 条：钉**发射出来的 C** 里 `getExtensionDirectory` 必须自报、必须仍返回活着的 `File`、自报必须**点名本构建的布局**并说清那个目录里**没有**整包、`actionScriptData` 是真成员而 `extensionID` **不是**、`call` 的「扩展从未加载」自报必须具名 | `node --test --test-name-pattern='ane/ExtensionContextSurface' test/unit/emit.ts` |
 | `test/unit/fre.ts` → `unit: fre/Utf8LengthContract`（8 条） | FRE 字符串边界的两向契约：`FREGetObjectAsUTF8` 的 `length` 必须是 `strlen`（**不得**加上终止符，也不得变成别的计数）、`value` 必须是字符串本身、非 String 仍须 `FRE_TYPE_MISMATCH`；反方向 `FRENewObjectFromUTF8` 必须容忍调用方传入的终止符，且不得把它算进字符串。变异 7/7（`+1u`、`+1`、换掉 `value` 指针、放开 tag 判定、去掉容忍、把终止符拷进字符串、不写结尾 0） | `node --test --test-name-pattern='fre/' test/unit.ts` |
 | `test/unit/build.ts` → `unit: ane/ExtensionXmlComments` | 9 条：注释不得凭空造出平台条目、不得吞掉真实条目、未闭合注释必须拒绝并指名包 | 同上换成 `test/unit/build.ts` |
@@ -826,7 +871,7 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 「那里没有 Windows 宿主库，所以两个扩展示例会响亮 skip，真正跑的只有 `test/unit/` 的结构钉」——
 现在**不成立了**：macOS 宿主库与夹具产物都是**入库**的（`lib/bin/macos-x86-64/libasaot.dylib`
 通用二进制、`ext-aot/…/MacOS-x86-64/ProbeANE.dylib` 同为通用），所以在那个运行器上两个示例是
-**真跑**（`skipped 0`），加载的是经 `dlopen` 的真 dylib，48 条断言照旧。**一处要注意**：
+**真跑**（`skipped 0`），加载的是经 `dlopen` 的真 dylib，56 条断言照旧。**一处要注意**：
 阶段三百零九 只重编了 **Windows** 切片（本机没有 macOS 工具链）——macOS 切片要在 mac 上跑一次
 `examples/ane/build-ane.sh` 才带上新增的 `nativeWindowHandle` 命令，在那之前 Intel macOS 上这条
 会**响亮变红**（不是假绿）。仍然 skip 的情形只有一种：

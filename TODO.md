@@ -17514,6 +17514,47 @@ Windows 本机实跑覆盖。
   一个读数不可信的探针留在预置代码里只会误导下一个人；本轮的分段结论全部来自「改一处、重测一次」的
   同机配对 A/B。
 
+### 阶段三百一十六：`FREAcquire|ReleaseBitmapData` 四件套落地 —— 视频类扩展的直通像素通道（v0.4.276 → v0.4.277）
+
+> 版本号 `0.4.276 → 0.4.277`。本节初稿写在 rebase 之前：当时线上**阶段三百一十五**（`326394b`, v0.4.276）尚未合入本工作树，故曾按「跳过 `0.4.276`」记账；rebase 到 `origin/main` 后已回到正常递增，无跳号。
+
+背景：D 面 11 个入口点里，渲染管线本身确实要等一个真正的呈现后端，但**「把一张 BitmapData 的像素交给扩展」并不需要**
+—— 那块内存本来就是我们自己的 GC 缓冲。而它恰好是视频类扩展真正落脚的地方：本机把整条拷贝链量完之后
+（仓根 `video-frame-copy-chain-analysis.md`），`getVideoData(ByteArray)` + AS3 `setPixels` 这条路每帧要**两次**
+全帧拷贝，`getVideoBitmapData` 只要**一次**。四件套实现之前，ANE 里那条已经写好的路
+（`getVideoBitmapData`）在我们构建里根本不可用，而 AIR 里是正常的 ⇒ 按 §1.5 硬判据属**遗留缺陷**，不是增强。
+
+- **实现**（`src/fre.ts`）：`FREAcquireBitmapData` / `FREAcquireBitmapData2` / `FREInvalidateBitmapDataRect` /
+  `FREReleaseBitmapData` 从 `as_shell_unsupported` 桩换成真实现。形状沿用已落地的
+  `FREAcquire|ReleaseNativeWindowHandle`：`FRE_BODY` 在类结构体之前发射、叫不出 `BitmapData`，所以走
+  **两个钩子**（`as_fre_bmd_desc_hook` / `as_fre_bmd_dirty_hook`），由 `as_fre_wire_classes()` 接上
+  （与 `as_fre_ba_data_hook` / `as_fre_status_hook` 同一个理由）。
+- **描述符口径**：`width/height` 取位图自己的；`lineStride32 = width`（`pixels` 紧排）；`hasAlpha = transparent`；
+  `isPremultiplied = 0` —— `pixels` 存的是 **straight** `0xAARRGGBB`（`sk_image_from_argb` 用 `kUnpremul` 是同一事实的另一面）。
+  谎称预乘会让消费者反预乘，把每条边都洗白。**v1 与 v2 不是同一个结构体**（v2 在 `bits32` 前插了 `isInvertedY`），
+  故 v1 的描述符**逐字段**填 —— 一次 `memcpy` 会把指针放到 v1 客户端读 `lineStride32` 的位置上。
+- **唯一必须显式做的事是失效**：扩展的写不经过任何 `BitmapData` mutator，没人推动版本计数器。所以
+  `FREReleaseBitmapData` **与** `FREInvalidateBitmapDataRect` 都抬 `_px_ver` —— 正是 `as_bmd_live_image` 缓存
+  SkImage 所看的那个计数器（`_live_ver == _px_ver` 即复用旧图）。少了这一个自增，**画面永远停在第 1 帧且一句错误都没有**。
+  矩形参数被忽略、整面置脏：AIR 用它把上传缩到一个矩形，全量上传是同一个答案的更多工作，不是错的答案。
+- **错误码分层**：非 BitmapData ⇒ `FRE_TYPE_MISMATCH`（3）；`null`/**已 dispose** ⇒ `FRE_INVALID_OBJECT`（2）——
+  已释放的位图**仍是** BitmapData，只是没有像素了，答一个 `bits32 == NULL` 的描述符会让扩展往空指针 memcpy；
+  输出指针为 `NULL` ⇒ `FRE_INVALID_ARGUMENT`（5，调用方 bug）。
+- **与 AIR 契约的关系**：头文件说指针「只在本次调用期间有效」、非主线程 acquire 返 `FRE_WRONG_THREAD`。两条都成立：
+  入口全经 `as_ext_call`（AS3 线程）；而「只在调用期间有效」的理由（AIR 要 pin 一张 tiled 纹理再解 pin）在这里不存在
+  —— `pixels` 本就紧排，GC 是 mark-sweep **不移动**，对象在整个调用期间被扩展的实参参照着，地址不会变。
+- **夹具与验收**：`examples/ane/ProbeANE.c` 新增 `writeBitmapData`（同一对象上同时 acquire v1/v2 比对
+  `bits32`/`lineStride32`，逐行写满整面，再 invalidate + release）与 `bitmapDataErrors`（Point/null/disposed/NULL 四个结果码）；
+  `driver.as` 用 `getPixel32` 读两个对角像素、并验一张透明位图的 alpha 原样存活 ⇒ **56 条断言**（原 48）。
+  `examples/ane-app/src/Main.as` 加**两帧渲染钉子**：两帧两种颜色经 `Bitmap.draw` 读回，**第二帧必须顶掉第一帧**
+  ⇒ **13 条断言**（原 10）。结构钉 `unit: fre/BitmapDataAcquire`（25 条，含「脏钩子抬的正是图像缓存看的那个计数器」的跨文件不变量）。
+- **变异验证（§2.7）**：5 个具名变异（去掉 `_px_ver` 自增 / v1 改成结构体拷贝 / invalidate 不置脏 / disposed 答 3 / 步长写错），
+  每个**恰好**打红 1 条钉子，跑完自动回滚（`temp/mutate-frebmd.cjs` + `temp/run-mutations.cjs`）。其中去掉自增那一个，
+  `ane-app` 报 `FAIL bitmapData frame2 replaces frame1 = 4294901760 (expected 4278190335)` —— 正是「视频卡在第一帧」的现形。
+- **文档**：`docs/{zh-cn,en}/ane.md` 新增 §3.9（D 面从「9 个延后」改写为「5 个延后 + 已实现两组」，并说明拆分的依据：
+  窗口句柄与位图像素是运行时**已经拥有**的东西，而「接收外来帧缓冲并合成」才是那个独立工程）。
+- **不在本阶段**：AS3 侧 `RENDMODEL` 仍留在 `PIXELS`（切到 `BITMAPDATA` 是产品侧的开关，本仓不改客户源码）；
+  I420 直通（R4）与「交出 TRTC 纹理」（R5）仍在 `遗留待开发`。
 
 ### 遗留待开发
 > **2026-10-29 追加（阶段三百一十五：渲染器三处每帧实错）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**110 → 112 行**（`未开始` **86 → 88**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。上一轮 note（阶段三百一十四）标 110 行，按 `254cb13` 实测也是 **110 行**，本轮 110 + 2 = **112** 与实测一致。**新登记 2 行**：① 容器里 ≥2 个重叠图元且 `alpha<1` 时，我们的 layer 隔离口径与 AIR 的逐图元乘 alpha 不同（`temp/alphafold` 的 B1 采样点 `ff7f7f00` vs `ff7f7f3f`）——与本阶段修的折叠**无关**，折叠前就是这个值；② AOT 的每帧固定成本 `static` 场景 **0.579 vs 0.058 ms**（10×），属**我方性能缺口**而非保真差，本阶段只修了「每项成本」那一半。**本阶段修净的三处不占表**（alpha 折叠 / `getenv` 出内循环 / 单图元不自动烘）：都是「AIR 做对了、我们做错/多做」的实错，按 §1.5 同阶段落地。

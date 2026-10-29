@@ -29844,11 +29844,53 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_jmp_pop();');
     this.indent--;
     this.line('}');
+    // ---- BitmapData direct pixel access (the FRE half a video ANE is built on) ----
+    //
+    // Three facts about the generated struct are needed by FREAcquireBitmapData:
+    // whether the value IS a BitmapData, where the pixels are, and how big they
+    // are. All three are emitted here and reached through the hooks fre.ts
+    // declares (see its "hooks into generated class code" block).
+    this.line('static int as_fre_bmd_desc_impl(void* p, FREBitmapData2* out) {');
+    this.indent++;
+    // as_is, not a tag test: a BitmapData SUBCLASS is one too (the meeting client
+    // subclasses nothing here, but the rule is the runtime's, not the client's).
+    this.line('if (p == NULL || !as_is(p, &BitmapData_vt)) return 0;');
+    this.line('BitmapData* bd = (BitmapData*)p;');
+    // Disposed, not "wrong type": the object is still a BitmapData, it just has no
+    // pixels left (`dispose` drops them), and AIR answers FRE_INVALID_OBJECT.
+    this.line('if (bd->pixels == NULL) return -1;');
+    this.line('out->width = (uint32_t)bd->width;');
+    this.line('out->height = (uint32_t)bd->height;');
+    this.line('out->hasAlpha = bd->transparent ? 1u : 0u;');
+    // `pixels` holds STRAIGHT (un-premultiplied) 0xAARRGGBB: setPixel32 stores the
+    // alpha it was given, getPixel32 hands it back untouched, and the compositor
+    // premultiplies only on the way to the canvas. Claiming otherwise would make a
+    // consumer un-premultiply a straight buffer and wash every edge out.
+    this.line('out->isPremultiplied = 0u;');
+    this.line('out->lineStride32 = (uint32_t)bd->width;');
+    this.line('out->isInvertedY = 0u;');
+    this.line('out->bits32 = (uint32_t*)bd->pixels;');
+    this.line('return 1;');
+    this.indent--;
+    this.line('}');
+    // The invalidation an extension's write needs. `_px_ver` is exactly what every
+    // AS3 mutator bumps (setPixel32, fillRect, setPixels, draw, ...): as_bmd_live_image
+    // rebuilds its SkImage when the version moves, and as_render_fp hashes it, so one
+    // increment both refreshes the pixels and breaks any cached frame.
+    this.line('static void as_fre_bmd_dirty_impl(void* p) {');
+    this.indent++;
+    this.line('BitmapData* bd = (BitmapData*)p;');
+    this.line('if (bd == NULL || bd->pixels == NULL) return;');
+    this.line('bd->_px_ver++;');
+    this.indent--;
+    this.line('}');
     this.line('static void as_fre_wire_classes(void) {');
     this.indent++;
     this.line('as_fre_ba_data_hook = as_fre_ba_data_impl;');
     this.line('as_fre_ba_new_hook = as_fre_ba_new_impl;');
     this.line('as_fre_status_hook = as_fre_status_impl;');
+    this.line('as_fre_bmd_desc_hook = as_fre_bmd_desc_impl;');
+    this.line('as_fre_bmd_dirty_hook = as_fre_bmd_dirty_impl;');
     this.indent--;
     this.line('}');
     this.line('#endif // ASC_HAVE_FRE');

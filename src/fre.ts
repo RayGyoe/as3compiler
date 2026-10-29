@@ -18,7 +18,6 @@
 //
 // WHAT IS DELIBERATELY NOT HERE (report section 4.4, "D face, deferred"):
 // FREGetRenderMode / FRESetRenderSource / FREMediaBufferLock|Unlock /
-// FREAcquire|ReleaseBitmapData[2] / FREInvalidateBitmapDataRect /
 // FREGetNativeContext3DHandle. Each answers FRE_ILLEGAL_STATE **and reports
 // itself** through the same capped `[as3-aot] not implemented by this build: ...`
 // channel every other gap uses. A silent FRE_OK or a fabricated descriptor is
@@ -26,11 +25,21 @@
 // difference between "the picture is black" and "the build told you it cannot
 // present video".
 //
-// FREAcquire|ReleaseNativeWindowHandle are NOT in that list any more: a window
-// HANDLE is a fact this build already owns (SDL creates the window, window_glue
-// answers its HWND / NSWindow*), so handing it out claims nothing about a render
-// pipeline. The presentation half of the D face stays deferred, because THAT is
-// the part that would have to pretend.
+// Three pieces are NOT in that list any more, and the reason is the same for all
+// three: they hand out something this build already owns rather than something it
+// would have to invent.
+//
+//   * FREAcquire|ReleaseNativeWindowHandle -- SDL creates the window and
+//     window_glue answers its HWND / NSWindow*, so a HANDLE claims nothing.
+//   * FREAcquireBitmapData / FREAcquireBitmapData2 / FREInvalidateBitmapDataRect /
+//     FREReleaseBitmapData -- a BitmapData's pixel buffer is `pixels`, a plain
+//     ARGB array this runtime allocates and already renders from. Handing out ITS
+//     address is not a promise about a render pipeline; it is the address of the
+//     thing the pipeline reads (see the BitmapData section below).
+//
+// The render pipeline PROPER stays deferred, because THAT is the part that would
+// have to pretend: listing composited frames as a media buffer, or naming a GPU
+// render mode this build's compositor is not in.
 //
 // Emission order in the generated translation unit (three independent `#ifdef
 // ASC_HAVE_FRE` blocks, so that a build without FRE compiles the whole thing out
@@ -366,6 +375,17 @@ static as_value as_fre_unbox(FREObject o) {
 static void* (*as_fre_ba_data_hook)(void* ba, unsigned* len) = NULL;
 static void* (*as_fre_ba_new_hook)(unsigned len) = NULL;
 static void  (*as_fre_status_hook)(void* as3ctx, const char* code, const char* level) = NULL;
+// BitmapData: whether a given as_value IS one is a vtable question, and where its
+// pixel buffer lives is a struct-layout question -- both belong to the emitter, so
+// the four BitmapData entry points reach the generated struct through these two.
+// \`desc\` answers 0 = not a BitmapData, 1 = described, -1 = disposed (the pixels
+// are gone, which AIR reports as FRE_INVALID_OBJECT and never as a type error).
+static int  (*as_fre_bmd_desc_hook)(void* bd, FREBitmapData2* out) = NULL;
+// The dirty half: whatever an extension wrote through \`bits32\`, it is visible to
+// the renderer no sooner than the buffer's version moves (the Skia view of a
+// BitmapData is cached against that version -- see as_bmd_live_image), so both
+// RELEASE and INVALIDATE come through here.
+static void (*as_fre_bmd_dirty_hook)(void* bd) = NULL;
 static void as_fre_wire_classes(void);
 
 // ---------- extension contexts ----------
@@ -928,7 +948,100 @@ static FREResult FRESetArrayElementAt(FREObject arrayOrVector, uint32_t index, F
     return FRE_TYPE_MISMATCH;
 }
 
-// ---------- deferred: the D face (report section 4.4) ----------
+// ---------- BitmapData direct pixel access ----------
+//
+// This is the pair a video ANE is actually built around: acquire the caller's
+// BitmapData, memcpy the decoded frame into \`bits32\`, release. (The shape is not
+// hypothetical -- ANEQcloudLive's ANEVideoRander::getVideoBitmapData is exactly
+// those three statements, and its alternative, handing the frame over as a
+// ByteArray for AS3's setPixels to copy, costs one extra full-frame copy per
+// frame: measured 1.06 ms of a 2.34 ms 720p frame budget on this machine.)
+//
+// WHY THIS IS LEGAL HERE AND NOT UNDER AIR: AIR's contract is that the pixel
+// pointer is "valid only for duration of the call" (FlashRuntimeExtensions.h
+// :419) and that acquiring from a non-main thread is FRE_WRONG_THREAD. Both hold:
+// every FRE entry point below is reached from as_ext_call, i.e. from the AS3
+// thread; and the pointer is not a transient mapping of a tiled texture but
+// \`pixels\`, this runtime's own ARGB buffer. Mark-sweep never MOVES an object, so
+// the address cannot shift under the extension either, and the BitmapData is
+// roots-reachable for the whole call because the extension holds it as an
+// argument.
+//
+// What this does NOT do is what AIR's acquire/release does internally: AIR pins a
+// texture's tiling and has to undo it, which is why IT needs the pair. Here there
+// is nothing to unwind -- \`release\` exists to say "I am done writing", and that is
+// precisely the moment the write must become visible. So RELEASE marks the whole
+// surface dirty, and so does INVALIDATE (which AIR only uses to narrow the upload
+// to one rect; a full-surface upload is the same answer, more work).
+//
+// The one thing left to the caller is what AIR also leaves to it: \`width\` and
+// \`height\` are the BitmapData's, and an extension that memcpys a LARGER frame than
+// the bitmap it was given writes past the end of the buffer. That is the
+// extension's bug in both runtimes; the descriptor reports the true geometry so
+// the check is possible.
+
+static FREResult as_fre_bmd_describe(FREObject object, FREBitmapData2* out) {
+    out->width = 0; out->height = 0; out->hasAlpha = 0; out->isPremultiplied = 0;
+    out->lineStride32 = 0; out->isInvertedY = 0; out->bits32 = NULL;
+    as_value v = as_fre_unbox(object);
+    // AS3 null/undefined and a primitive are different failures to an extension:
+    // the first is a missing object, the second is a value of the wrong kind (the
+    // same split FREAcquireNativeWindowHandle makes).
+    if (v.tag != 4 || v.ptr == NULL) return FRE_INVALID_OBJECT;
+    if (as_fre_bmd_desc_hook == NULL) {
+        as_shell_unsupported("FREAcquireBitmapData (flash.display.BitmapData is not part of this build)");
+        return FRE_ILLEGAL_STATE;
+    }
+    int st = as_fre_bmd_desc_hook(v.ptr, out);
+    if (st == 0) return FRE_TYPE_MISMATCH;
+    // A disposed BitmapData still exists as an object; it just has no pixels. AIR
+    // answers FRE_INVALID_OBJECT rather than a descriptor pointing at freed memory.
+    if (st < 0) return FRE_INVALID_OBJECT;
+    return FRE_OK;
+}
+
+static FREResult FREAcquireBitmapData(FREObject object, FREBitmapData* descriptorToSet) {
+    if (descriptorToSet == NULL) return FRE_INVALID_ARGUMENT;
+    // Fill the v1 descriptor field by field rather than memcpy-ing the v2 one: the
+    // two agree up to lineStride32 and then diverge (v2 inserts isInvertedY before
+    // bits32), so a struct copy would put the pointer where a v1 client reads y.
+    FREBitmapData2 d;
+    FREResult r = as_fre_bmd_describe(object, &d);
+    descriptorToSet->width = d.width;
+    descriptorToSet->height = d.height;
+    descriptorToSet->hasAlpha = d.hasAlpha;
+    descriptorToSet->isPremultiplied = d.isPremultiplied;
+    descriptorToSet->lineStride32 = d.lineStride32;
+    descriptorToSet->bits32 = d.bits32;
+    return r;
+}
+
+static FREResult FREAcquireBitmapData2(FREObject object, FREBitmapData2* descriptorToSet) {
+    if (descriptorToSet == NULL) return FRE_INVALID_ARGUMENT;
+    return as_fre_bmd_describe(object, descriptorToSet);
+}
+
+// Both of these answer FRE_OK for any live BitmapData and nothing else: there is
+// no lock to unwind here (see the section comment), and an extension calling them
+// with the wrong object has a bug that must show up as FRE_TYPE_MISMATCH.
+static FREResult FREInvalidateBitmapDataRect(FREObject object, uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+    (void)x; (void)y; (void)width; (void)height;
+    FREBitmapData2 d;
+    FREResult r = as_fre_bmd_describe(object, &d);
+    if (r != FRE_OK) return r;
+    as_fre_bmd_dirty_hook(as_fre_unbox(object).ptr);
+    return FRE_OK;
+}
+
+static FREResult FREReleaseBitmapData(FREObject object) {
+    FREBitmapData2 d;
+    FREResult r = as_fre_bmd_describe(object, &d);
+    if (r != FRE_OK) return r;
+    as_fre_bmd_dirty_hook(as_fre_unbox(object).ptr);
+    return FRE_OK;
+}
+
+// ---------- still deferred: the render pipeline proper (report section 4.4) ----------
 //
 // Each of these reports itself and answers FRE_ILLEGAL_STATE. FRE_OK here would
 // let a video extension believe a frame was presented when nothing was drawn.
@@ -954,30 +1067,6 @@ static FREResult FREMediaBufferLock(FREContext ctx, FREObject mediaBuffer, uint8
 static FREResult FREMediaBufferUnlock(FREContext ctx, FREObject mediaBuffer, uint32_t bUpdate) {
     (void)ctx; (void)mediaBuffer; (void)bUpdate;
     as_shell_unsupported("FREMediaBufferUnlock (the render pipeline is out of scope for this build)");
-    return FRE_ILLEGAL_STATE;
-}
-
-static FREResult FREAcquireBitmapData(FREObject object, FREBitmapData* descriptorToSet) {
-    (void)object; (void)descriptorToSet;
-    as_shell_unsupported("FREAcquireBitmapData (the render pipeline is out of scope for this build)");
-    return FRE_ILLEGAL_STATE;
-}
-
-static FREResult FREAcquireBitmapData2(FREObject object, FREBitmapData2* descriptorToSet) {
-    (void)object; (void)descriptorToSet;
-    as_shell_unsupported("FREAcquireBitmapData2 (the render pipeline is out of scope for this build)");
-    return FRE_ILLEGAL_STATE;
-}
-
-static FREResult FREInvalidateBitmapDataRect(FREObject object, uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
-    (void)object; (void)x; (void)y; (void)width; (void)height;
-    as_shell_unsupported("FREInvalidateBitmapDataRect (the render pipeline is out of scope for this build)");
-    return FRE_ILLEGAL_STATE;
-}
-
-static FREResult FREReleaseBitmapData(FREObject object) {
-    (void)object;
-    as_shell_unsupported("FREReleaseBitmapData (the render pipeline is out of scope for this build)");
     return FRE_ILLEGAL_STATE;
 }
 

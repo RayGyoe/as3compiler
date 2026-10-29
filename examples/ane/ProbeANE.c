@@ -23,6 +23,8 @@
  *   arityCheck(v:*)                     -> FREGetObjectType
  *   stringInfo(v:String)                -> bytes/len/extra (the FRE string length contract)
  *   nativeWindowHandle(win:NativeWindow) -> FREAcquire|ReleaseNativeWindowHandle
+ *   writeBitmapData(bmd, argb)          -> FREAcquire|Invalidate|ReleaseBitmapData
+ *   bitmapDataErrors(v:*)               -> the FREResult each call answers for a bad operand
  *
  * Anything the host cannot do reports itself on stderr (as_shell_unsupported) and
  * returns FRE_ILLEGAL_STATE, which this fixture turns into a distinguishable
@@ -476,6 +478,81 @@ static FREObject probe_nativeWindowHandle(FREContext ctx, void* funcData, uint32
     return out;
 }
 
+/* FREAcquire|Invalidate|ReleaseBitmapData -- the pixel handoff a video ANE is built
+ * around (ANEQcloudLive's ANEVideoRander::getVideoBitmapData is acquire, memcpy into
+ * bits32, release, and nothing else).
+ *
+ * The extension writes through the pointer the HOST hands it, which is the whole
+ * contract, so filling every row of the surface is the assertion: a descriptor with
+ * a wrong stride, a wrong height or a pointer into a COPY leaves part of the bitmap
+ * unwritten and the AS3-side readback below shows it.
+ *
+ * Both descriptor versions are acquired on the same object, because they differ in
+ * the middle (v2 inserts isInvertedY before bits32) and a host that filled them with
+ * one memcpy would put the pointer where a v1 client reads stride -- `same` reports
+ * whether both agree on the buffer, and the driver asserts the whole string. */
+static FREObject probe_writeBitmapData(FREContext ctx, void* funcData, uint32_t argc, FREObject argv[]) {
+    (void)ctx; (void)funcData;
+    if (argc != 2) return NULL;
+    uint32_t argb = 0xFF00FF00u;
+    if (FREGetObjectAsUint32(argv[1], &argb) != FRE_OK) return NULL;
+    FREBitmapData b1;
+    FREBitmapData2 b2;
+    memset(&b1, 0, sizeof(b1));
+    memset(&b2, 0, sizeof(b2));
+    FREResult r1 = FREAcquireBitmapData(argv[0], &b1);
+    FREResult r2 = FREAcquireBitmapData2(argv[0], &b2);
+    int same = 0;
+    FREResult ri = FRE_ILLEGAL_STATE;
+    FREResult rr = FRE_ILLEGAL_STATE;
+    if (r1 == FRE_OK && r2 == FRE_OK && b1.bits32 != NULL && b1.width > 0 && b1.height > 0) {
+        same = (b1.bits32 == b2.bits32 && b1.lineStride32 == b2.lineStride32) ? 1 : 0;
+        uint32_t stride = b1.lineStride32;
+        for (uint32_t y = 0; y < b1.height; y++) {
+            uint32_t* row = b1.bits32 + (size_t)y * stride;
+            for (uint32_t x = 0; x < b1.width; x++) row[x] = argb;
+        }
+        ri = FREInvalidateBitmapDataRect(argv[0], 0, 0, b1.width, b1.height);
+        rr = FREReleaseBitmapData(argv[0]);
+    }
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "acq=%d acq2=%d w=%u h=%u stride=%u alpha=%u premul=%u inverted=%u same=%d inv=%d rel=%d",
+             (int)r1, (int)r2, (unsigned)b1.width, (unsigned)b1.height,
+             (unsigned)b1.lineStride32, (unsigned)b1.hasAlpha,
+             (unsigned)b1.isPremultiplied, (unsigned)b2.isInvertedY,
+             same, (int)ri, (int)rr);
+    FREObject out = NULL;
+    FRENewObjectFromUTF8((uint32_t)strlen(msg) + 1u, (const uint8_t*)msg, &out);
+    return out;
+}
+
+/* The failure half, reported as the FREResult each entry point answers -- never as
+ * a crash and never as a fabricated success. A Point is FRE_TYPE_MISMATCH (3); AS3
+ * null is FRE_INVALID_OBJECT (2); a disposed BitmapData is 2 as well, because it is
+ * still a BitmapData that simply has no pixels left; and a NULL out-pointer is
+ * FRE_INVALID_ARGUMENT (5) whatever the object is. */
+static FREObject probe_bitmapDataErrors(FREContext ctx, void* funcData, uint32_t argc, FREObject argv[]) {
+    (void)ctx; (void)funcData;
+    if (argc != 1) return NULL;
+    FREBitmapData b;
+    FREBitmapData2 b2;
+    memset(&b, 0, sizeof(b));
+    memset(&b2, 0, sizeof(b2));
+    FREResult acq = FREAcquireBitmapData(argv[0], &b);
+    FREResult acq2 = FREAcquireBitmapData2(argv[0], &b2);
+    FREResult acqNull = FREAcquireBitmapData(argv[0], NULL);
+    FREResult acq2Null = FREAcquireBitmapData2(argv[0], NULL);
+    FREResult inv = FREInvalidateBitmapDataRect(argv[0], 0, 0, 1, 1);
+    FREResult rel = FREReleaseBitmapData(argv[0]);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "acq=%d acq2=%d acqnull=%d acq2null=%d inv=%d rel=%d",
+             (int)acq, (int)acq2, (int)acqNull, (int)acq2Null, (int)inv, (int)rel);
+    FREObject out = NULL;
+    FRENewObjectFromUTF8((uint32_t)strlen(msg) + 1u, (const uint8_t*)msg, &out);
+    return out;
+}
+
 static FRENamedFunction probe_functions[] = {
     { (const uint8_t*)"ping",           NULL, probe_ping },
     { (const uint8_t*)"addInt",         NULL, probe_addInt },
@@ -501,6 +578,8 @@ static FRENamedFunction probe_functions[] = {
     { (const uint8_t*)"throwingSet",    NULL, probe_throwingSet },
     { (const uint8_t*)"stringInfo",     NULL, probe_stringInfo },
     { (const uint8_t*)"nativeWindowHandle", NULL, probe_nativeWindowHandle },
+    { (const uint8_t*)"writeBitmapData", NULL, probe_writeBitmapData },
+    { (const uint8_t*)"bitmapDataErrors", NULL, probe_bitmapDataErrors },
 };
 
 /* ---- the AIR protocol ----------------------------------------------------- */

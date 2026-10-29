@@ -306,3 +306,138 @@ function checkFreNativeWindowHandle(): string[] {
   return failed;
 }
 registerGroup('unit: fre/NativeWindowHandle', checkFreNativeWindowHandle);
+
+// --- BitmapData direct pixel access: the four entry points a video ANE is built on
+//
+// The contract being protected is NOT "a pointer comes back". It is:
+//
+//   * the pointer is the BitmapData's OWN `pixels` buffer (a copy would look right
+//     to `getPixel32` and be invisible to the renderer);
+//   * a write through it becomes VISIBLE, which in this runtime means the version
+//     counter as_bmd_live_image caches on must move -- an extension's write is not a
+//     call through BitmapData's own mutators, so nothing else will move it;
+//   * the two descriptor versions stay distinguishable (v2 inserts isInvertedY
+//     before bits32), so a shared struct copy would hand a v1 client the pointer
+//     where it reads stride;
+//   * a bad operand is a FREResult and never a crash -- including a DISPOSED
+//     BitmapData, whose `pixels` is NULL.
+//
+// The behaviour itself is pinned end-to-end by examples/ane (write-through, both
+// descriptor versions, the error codes) and examples/ane-app (two frames through a
+// real Bitmap: the second must replace the first). These checks exist because the
+// example suite only runs builds that must SUCCEED -- it cannot see a hook that
+// silently stops invalidating.
+function checkFreBitmapDataAcquire(): string[] {
+  const failed: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) console.log('PASS  [frebmd] ' + label);
+    else { failed.push(label); console.log('FAIL  [frebmd] ' + label); }
+  };
+
+  const describe = funcBody(FRE_BODY, 'static FREResult as_fre_bmd_describe(');
+  const acq = funcBody(FRE_BODY, 'static FREResult FREAcquireBitmapData(');
+  const acq2 = funcBody(FRE_BODY, 'static FREResult FREAcquireBitmapData2(');
+  const inv = funcBody(FRE_BODY, 'static FREResult FREInvalidateBitmapDataRect(');
+  const rel = funcBody(FRE_BODY, 'static FREResult FREReleaseBitmapData(');
+
+  check('all four entry points exist in the FRE body',
+    describe !== '' && acq !== '' && acq2 !== '' && inv !== '' && rel !== '');
+  // The stubs this replaces: FRE_ILLEGAL_STATE here is what makes an extension's
+  // acquire fail on every frame, which is the state RENDMODEL=BITMAPDATA must not
+  // fall back to.
+  check('none of the four reports itself as unimplemented',
+    !acq.includes('as_shell_unsupported') && !acq2.includes('as_shell_unsupported')
+    && !inv.includes('as_shell_unsupported') && !rel.includes('as_shell_unsupported'));
+
+  // A null OUT pointer is a caller bug, not an AS3 error.
+  check('acquire (v1) rejects a null out pointer with FRE_INVALID_ARGUMENT',
+    acq.includes('if (descriptorToSet == NULL) return FRE_INVALID_ARGUMENT;'));
+  check('acquire (v2) rejects a null out pointer with FRE_INVALID_ARGUMENT',
+    acq2.includes('if (descriptorToSet == NULL) return FRE_INVALID_ARGUMENT;'));
+
+  // v1 vs v2: the layouts diverge in the middle, so the v1 answer is assembled
+  // field by field. A memcpy between them is the defect this pins.
+  check('acquire (v1) copies the fields instead of memcpy-ing the v2 struct',
+    acq.includes('descriptorToSet->bits32 = d.bits32;') && !acq.includes('memcpy(descriptorToSet'));
+  // The v1 descriptor has no isInvertedY field at all, so no assignment may target
+  // one (the function's own comment mentions the field by name, hence the
+  // assignment shape rather than a bare word search).
+  check('acquire (v1) never writes isInvertedY (a v1 client has no such field)',
+    !/descriptorToSet->isInvertedY\s*=/.test(acq));
+
+  // The operand split: AS3 null/undefined is a missing object, a primitive or an
+  // object of the wrong class is a type error, a disposed bitmap is a missing object.
+  check('describe separates null (INVALID_OBJECT) from a wrong class (TYPE_MISMATCH)',
+    describe.includes('if (v.tag != 4 || v.ptr == NULL) return FRE_INVALID_OBJECT;')
+    && describe.includes('if (st == 0) return FRE_TYPE_MISMATCH;'));
+  check('describe reports a disposed BitmapData as FRE_INVALID_OBJECT (not a type error)',
+    describe.includes('if (st < 0) return FRE_INVALID_OBJECT;'));
+  // A build whose BitmapData is not part of it must REPORT the gap, never deref a
+  // NULL hook (the same reading as AGENTS.md 1.5).
+  check('describe reports a missing BitmapData class instead of calling a null hook',
+    describe.includes('if (as_fre_bmd_desc_hook == NULL) {')
+    && describe.includes('as_shell_unsupported("FREAcquireBitmapData')
+    && describe.includes('return FRE_ILLEGAL_STATE;'));
+
+  // The invalidation half. This is the check that keeps a video frame from freezing
+  // on frame 1: both "I am done writing" and "this rect changed" must go through the
+  // dirty hook, because an extension's write does not pass through BitmapData's own
+  // mutators and therefore moves no version counter by itself.
+  check('release marks the surface dirty', rel.includes('as_fre_bmd_dirty_hook('));
+  check('invalidate marks the surface dirty', inv.includes('as_fre_bmd_dirty_hook('));
+  check('invalidate/release still answer FRE_OK after a valid describe',
+    rel.includes('if (r != FRE_OK) return r;') && rel.includes('return FRE_OK;')
+    && inv.includes('if (r != FRE_OK) return r;') && inv.includes('return FRE_OK;'));
+
+  // Both hooks are null-initialised in the body: a build that instantiates no
+  // BitmapData must reach the report above, not a jump through NULL.
+  check('the descriptor hook is declared and null-initialised',
+    /static int\s+\(\*as_fre_bmd_desc_hook\)\(void\* bd, FREBitmapData2\* out\) = NULL;/.test(FRE_BODY));
+  check('the dirty hook is declared and null-initialised',
+    /static void \(\*as_fre_bmd_dirty_hook\)\(void\* bd\) = NULL;/.test(FRE_BODY));
+
+  // --- the emitter half: the hooks, and what the descriptor actually says -------
+  const c = generateC(parse('var x:int = 1;\n')).c;
+  const desc = funcBody(c, 'static int as_fre_bmd_desc_impl(void* p, FREBitmapData2* out) {');
+  const dirty = funcBody(c, 'static void as_fre_bmd_dirty_impl(void* p) {');
+  const live = funcBody(c, 'static void* as_bmd_live_image(BitmapData* bd) {');
+
+  check('a program emits the BitmapData -> descriptor hook', desc !== '');
+  check('a program emits the BitmapData -> dirty hook', dirty !== '');
+  // as_is, not a tag test: a BitmapData SUBCLASS is one too, and a Bitmap is not.
+  check('the descriptor hook identifies a BitmapData by vtable', desc.includes('!as_is(p, &BitmapData_vt)'));
+  check('the descriptor hook answers 0 (not a BitmapData) instead of a descriptor',
+    desc.includes('return 0;'));
+  // Disposed: still a BitmapData, no pixels. -1 is the "missing object" answer.
+  check('the descriptor hook answers -1 for a disposed bitmap',
+    desc.includes('if (bd->pixels == NULL) return -1;'));
+  // The pointer IS the live buffer, and nothing else: a copy here would make the
+  // write visible to getPixel32 and invisible to the renderer.
+  check('the descriptor points at the bitmap own pixel buffer',
+    desc.includes('out->bits32 = (uint32_t*)bd->pixels;'));
+  check('the descriptor reports the true geometry and a tight stride',
+    desc.includes('out->width = (uint32_t)bd->width;')
+    && desc.includes('out->height = (uint32_t)bd->height;')
+    && desc.includes('out->lineStride32 = (uint32_t)bd->width;')
+    && desc.includes('out->isInvertedY = 0u;'));
+  // `pixels` holds STRAIGHT 0xAARRGGBB (sk_image_from_argb makes the SkImage with
+  // kUnpremul), and hasAlpha follows the AS3 `transparent` flag.
+  check('the descriptor says straight alpha, and takes hasAlpha from transparent',
+    desc.includes('out->isPremultiplied = 0u;')
+    && desc.includes('out->hasAlpha = bd->transparent ? 1u : 0u;'));
+  // Cross-file invariant: the counter the dirty hook moves must be the one the
+  // image cache watches. If either side renames or re-keys, a video frame stops
+  // being re-snapshotted and the picture freezes with no error at all.
+  check('the dirty hook moves the version counter the image cache watches',
+    dirty.includes('bd->_px_ver++;')
+    && live.includes('bd->_live_ver == bd->_px_ver'));
+  check('the dirty hook ignores a bitmap with no pixels left',
+    dirty.includes('if (bd == NULL || bd->pixels == NULL) return;'));
+  check('both hooks are wired at startup',
+    c.includes('as_fre_bmd_desc_hook = as_fre_bmd_desc_impl;')
+    && c.includes('as_fre_bmd_dirty_hook = as_fre_bmd_dirty_impl;'));
+
+  if (failed.length !== 0) console.log('     [frebmd] ' + failed.length + ' check(s) failed');
+  return failed;
+}
+registerGroup('unit: fre/BitmapDataAcquire', checkFreBitmapDataAcquire);

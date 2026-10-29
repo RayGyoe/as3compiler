@@ -30,6 +30,8 @@ package aneapp {
     import flash.display.NativeWindow;
     import flash.display.NativeWindowInitOptions;
     import flash.desktop.NativeApplication;
+    import flash.display.Bitmap;
+    import flash.display.BitmapData;
     import flash.display.Sprite;
     import flash.events.Event;
     import flash.events.StatusEvent;
@@ -96,6 +98,28 @@ package aneapp {
             // stage.nativeWindow is the case a video ANE actually asks for, and it
             // is checked on the FIRST FRAME rather than here -- see onFirstFrame.
             stage.addEventListener(Event.ENTER_FRAME, onFirstFrame);
+
+            // BitmapData handoff -- the OTHER half of the FRE pair, the one that needs
+            // a renderer and therefore lives in this windowed example.
+            //
+            // Writing through bits32 is only half the contract; the frame has to reach
+            // the screen. Our BitmapData keeps a cached SkImage view keyed on a version
+            // counter, so a host that hands out the pixel pointer WITHOUT invalidating
+            // it draws the FIRST frame forever -- which is exactly the "video freezes on
+            // frame 1" failure a video ANE hits. Two frames, two colours, drawn through
+            // a real Bitmap: the second readback must differ from the first.
+            var src:BitmapData = new BitmapData(16, 8, false, 0);
+            var shot:BitmapData = new BitmapData(16, 8, false, 0);
+            var bmp:Bitmap = new Bitmap(src);
+            ctx.call("writeBitmapData", src, uint(0xFFFF0000));
+            shot.draw(bmp);
+            check("bitmapData frame1 visible", shot.getPixel32(8, 4), 0xFFFF0000);
+            ctx.call("writeBitmapData", src, uint(0xFF0000FF));
+            shot.draw(bmp);
+            check("bitmapData frame2 replaces frame1", shot.getPixel32(8, 4), 0xFF0000FF);
+            // And through the readback path AS3 owns, so a stride or geometry defect
+            // cannot hide behind the renderer's own scaling.
+            check("bitmapData pixels as AS3 sees them", src.getPixel32(15, 7), 0xFF0000FF);
 
             ctx.call("bumpStatus");
             check("status event reached AS3", gotCode, "probe-status");
