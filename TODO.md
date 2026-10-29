@@ -1505,39 +1505,6 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 ---
 
-### 阶段三百一十九：逐帧 `clipDepth` 遮罩 —— 遮罩是**活对象引用**，stencil 每帧重建（v0.4.279 → v0.4.280）
-
-背景：`clipDepth` 遮罩此前在**烘焙期**算成静态轮廓 `_clip_path`，只能表达「帧 1 的遮罩、那个位置、那个几何」。
-`lib/skin.swc` 里三种真形态因此全错：morph 当遮罩（`skin_fla.元件77_50` depth 2 = `char70`，`clipDepth=4`）
-以前一句 `notes` 报明后**整块被裁空**；sprite 当遮罩（`char127`）无裁剪；帧 100 把 depth 2 换成 `char73`
-的记录被 `continue` 丢掉 ⇒ 既不换字符也不重武装遮罩，`numChildren` 4→3。
-
-- **做法**：烘焙只记**深度**（`SwcBakePlacement.mask = { charId, depth }`、`SwcBakeFrameOp.mask/maskOff`、
-  区间表 `maskRanges` 逐 sprite）；帧 1 装配后 `emitSwcMaskWiring` 把 `child->_clip_src = 遮罩对象`
-  （`DisplayObject*`，进 props 表并配 `gc_write_barrier`）；帧 2..N 走
-  `as_swc_tl_mask(parent, maskDepth, clipDepth)`，区间按 SWF 规范 `(maskDepth, clipDepth]`，
-  `clipDepth <= 0` = 退订；渲染侧在 `save` 之后、对象 `translate` **之前**取
-  `as_clip_path(o->_clip_src)`（`as_do_matrix` + `as_mask_ink` + `as_skia_path_close_all`），
-  遮罩活在父空间（它是被遮对象的兄弟）。
-- **「整块被裁空」的真根因**：morph `#70` 的 `Graphics` 里除填充组外还有一组 `stroke` 宽度 0、
-  轮廓与填充**完全重合**，两条等高轮廓在 stencil 里互相抵消（even-odd 无条件抵消；改 nonzero 实测也
-  **没救**）⇒ stencil 为空 ⇒ 被遮兄弟全消失。修法：`as_mask_ink` 只收 `fill != NULL || stroke_width > 0`
-  的组（顶层 `g->path` 同守卫），每组至多加一次。
-- **实测（`adl` 51.4.1 vs AOT，按遮罩子件独有 teal `0x00948c` 计数）**：`loginskin` ink 两端都是
-  `177000 px`；`元件77_50` 帧 1 遮罩 `x=0` 两端都 `0`、`x=40` 露出量同为 88 宽窗口内的一档；
-  帧 100 `numChildren` 两端都是 `4`、遮罩 `x=100` 两端都 `0`。
-- **★ 已知偏差（如实报明）**：`adl` 的 stencil 对 **morph 遮罩不跟随 ratio** —— `Teal2` 探针
-  `gotoAndStop` 到 1/2/3/5/10/20/50/80/99 的 teal 分布**逐字节相同**，只有帧 100 换字符才变；
-  而 AIR 自己**画**该 morph 时按当前 ratio 画。我们让 stencil 跟**当前**几何走（遮罩与画面自洽），
-  故 AOT 帧 99 与帧 1 不同。复刻 AIR 的做法已探明（morph 分支换用 `_mdecl` 声明盒
-  `[-92.9,-10 .. 0.0,31.6]`，与 `adl` 帧 1 的 `clipdbg` 一致），已登记进遗留表。
-- **回归**：新 `examples/swc-mask-frames.as`（真 `skin.swc`：帧 1/99/100 × 遮罩平移 + `loginskin` 177000）；
-  新 `unit: render/SwcClipMaskPerFrame`（14 钉）；6 条变异**全红**（`temp/mask3/mutate.cjs`：
-  不闭合轮廓 / 区间改闭 / 退订不清引用 / 恢复零宽描边组 / `maskOff` 不发 / 帧 1 不 wire）。
-  顺带把 `test/unit/render.ts` 里两条 `_clip_path` 时代的旧钉（闭合、裁剪点位）改到新发射形态。
-- **文档**：`docs/zh-cn/swc.md` §9.2 F12（新）+ §3.4⑦⑥ + §10 表；`README-CN.md` 示例一行。
-### 遗留待开发`
-
 **验收**：`examples/stage64.as`（离屏）断言 `File` 路径束与 `exists`/`isDirectory`/`resolvePath`/`createDirectory`/`deleteFile`/`deleteDirectory` + 静态目录、
 `FileStream` `open`/`openAsync`/`close`/`readUTFBytes`/`writeUTFBytes` 读写回环与只读 `position`/`bytesAvailable`、`FileMode` 常量。✅（73 passed / 0 failed；
 `NativeWindow`/`Window` 与 `SQLConnection`/`SQLStatement` 延后（原生多窗口管理/SQLite 链接），README 已注明）
@@ -2205,7 +2172,7 @@ HUD `457 created 1720 reused FPS 80`，且 `sprite.rotation += 0.1` 复合成赋
 | `setStencilReferenceValue` | `(referenceValue:uint, readMask:uint=255, writeMask:uint=255)` | 记录 8-bit reference（`referenceValue & 0xFF`）；readMask/writeMask 接受但暂不落地 |
 | `setScissorRectangle` | `(rectangle:Rectangle)`（null 禁用） | 记录 `scissorOn/x/y/w/h`；`setScissorRect` GPU 延后 |
 | `maxBackBufferWidth`/`Height` getter | `:int`（平台上限，AIR 桌面 16384） | 返回 16384（`configureBackBuffer` 钳制到该上限） |
-| `VertexBuffer3D.uploadFromByteArray` | `(data:ByteArray, byteArrayOffset:uint, startVertex:int, numVertices:int)` | 读 `ByteArray` 小端 float32（按 `endian` 标志），宽化进 `as_vector_number` 复用 submit 路径 |
+| `VertexBuffer3D.uploadFromByteArray` | `(data:ByteArray, byteArrayOffset:uint, startVertex:int, numVertices:int)` | 读 `ByteArray` 小端 float32（**当初写的「按 `endian` 标志」是错的**：`adl` 实测忽略该标志，阶段三百二十 起只按宿主字节序，见 `docs/zh-cn/display3d.md` §9.15），宽化进 `as_vector_number` 复用 submit 路径 |
 | `IndexBuffer3D.uploadFromByteArray` | `(data:ByteArray, byteArrayOffset:uint, startIndex:int, numIndices:int)` | 读小端 uint16（INDEX_SIZE=2），宽化成 uint32 复用 `MTLIndexTypeUInt32` submit 路径 |
 
 - [x] **P0：`setStencilActions`/`setScissorRectangle`/`setStencilReferenceValue`**——`symbols.ts` 补 3 方法（含 AIR 默认值），
@@ -2215,7 +2182,7 @@ HUD `457 created 1720 reused FPS 80`，且 `sprite.rotation += 0.1` 复合成赋
       `emit.ts` 补 `Context3D_get_maxBackBufferWidth/Height`。
 - [x] **P0：`VertexBuffer3D.uploadFromByteArray` / `IndexBuffer3D.uploadFromByteArray`**——`symbols.ts` 补 2 方法签名，`emit.ts` 补
       两 C 函数：从 `ByteArray.data + byteArrayOffset` 按 `as_ba_little()` 端序读 float32（顶点）或 uint16（索引），宽化进
-      `as_vector_number`/`as_vector_uint`，与 `uploadFromVector` 共用 submit 路径；`position` 不动、按 `data->length` 截断越界。
+      `as_vector_number`/`as_vector_uint`，与 `uploadFromVector` 共用 submit 路径；`position` 不动；**越界处理在阶段三百二十 改掉了**：旧行为「按 `data->length` 截断」是静默错答案，现在是 `#2007`/`#3669`/`#3674` 三铸造器（§9.15）。
 - [x] **P1（顺带补齐）：`createVertexBuffer`/`createIndexBuffer` 的 `bufferUsage` 可选参**——Starling 的 `VertexData.createVertexBuffer`
       /`IndexData.createIndexBuffer` 传第 3/2 参 `bufferUsage`（`STATIC_DRAW`/`DYNAMIC_DRAW`），此前建模漏了该参 → 一编译就
       `too many arguments`；补默认参 `"staticDraw"`（`symbols.ts` + `emit.ts` 的 C 签名 `(void)bufferUsage`），使 TODO 中「`create*`
@@ -2225,7 +2192,7 @@ HUD `457 created 1720 reused FPS 80`，且 `sprite.rotation += 0.1` 复合成赋
 - `uploadFromByteArray` 的数据源是 `ByteArray` 的**原始字节**，不是 `Vector`；Starling 的 `VertexData`/`IndexData` 用小端 float32
   /uint16 存储（`writeFloat`/`writeShort` + `endian=Endian.LITTLE_ENDIAN`），故 C 函数按 `as_ba_little()` 分支读 4 字节/2 字节，
   宽化成 double/uint32 与 `uploadFromVector` 对齐——**不能**直接 `memcpy` 到 `as_vector`（元素宽度不同）。
-- `byteArrayOffset`/`numVertices` 越界要按 `data->length` 截断（AS3 静默截断或按可读字节数裁剪），不能读越界；`position` 不推进
+- ~~`byteArrayOffset`/`numVertices` 越界要按 `data->length` 截断（AS3 静默截断或按可读字节数裁剪）~~ —— **这条是错的**：`adl` 实测抛 `RangeError #3669`，阶段三百二十 已按实测改（§9.15）；`position` 不推进
   （Starling 传 `byteArrayOffset=0`、自行维护 offset，`position` 与 `uploadFromByteArray` 无关）。
 - 5 个方法全部落在「已有 Metal 管线加状态」的 CPU 侧；真正的 GPU stencil/scissor（`MTLDepthStencilState` + `setScissorRect`）与
   `setStencilReferenceValue` 的 read/write mask 延后到深度/模板附件落地，与阶段八十一~八十三的「状态机 → GPU 延后上传」模式一致。
@@ -17665,7 +17632,133 @@ Windows 本机实跑覆盖。
   只取几何（这三档 adl 侧都未实测）。
 - **文档**：`docs/zh-cn/skia.md` §6.15（实测表 + 实现 + 缺口）；顺带修 `docs/zh-cn/swc.md`
   §3.4⑦ 与 §10 表里把阶段号写成「三百一十四」的笔误（应为三百一十七）。
+### 阶段三百一十九：逐帧 `clipDepth` 遮罩 —— 遮罩是**活对象引用**，stencil 每帧重建（v0.4.279 → v0.4.280）
+
+背景：`clipDepth` 遮罩此前在**烘焙期**算成静态轮廓 `_clip_path`，只能表达「帧 1 的遮罩、那个位置、那个几何」。
+`lib/skin.swc` 里三种真形态因此全错：morph 当遮罩（`skin_fla.元件77_50` depth 2 = `char70`，`clipDepth=4`）
+以前一句 `notes` 报明后**整块被裁空**；sprite 当遮罩（`char127`）无裁剪；帧 100 把 depth 2 换成 `char73`
+的记录被 `continue` 丢掉 ⇒ 既不换字符也不重武装遮罩，`numChildren` 4→3。
+
+- **做法**：烘焙只记**深度**（`SwcBakePlacement.mask = { charId, depth }`、`SwcBakeFrameOp.mask/maskOff`、
+  区间表 `maskRanges` 逐 sprite）；帧 1 装配后 `emitSwcMaskWiring` 把 `child->_clip_src = 遮罩对象`
+  （`DisplayObject*`，进 props 表并配 `gc_write_barrier`）；帧 2..N 走
+  `as_swc_tl_mask(parent, maskDepth, clipDepth)`，区间按 SWF 规范 `(maskDepth, clipDepth]`，
+  `clipDepth <= 0` = 退订；渲染侧在 `save` 之后、对象 `translate` **之前**取
+  `as_clip_path(o->_clip_src)`（`as_do_matrix` + `as_mask_ink` + `as_skia_path_close_all`），
+  遮罩活在父空间（它是被遮对象的兄弟）。
+- **「整块被裁空」的真根因**：morph `#70` 的 `Graphics` 里除填充组外还有一组 `stroke` 宽度 0、
+  轮廓与填充**完全重合**，两条等高轮廓在 stencil 里互相抵消（even-odd 无条件抵消；改 nonzero 实测也
+  **没救**）⇒ stencil 为空 ⇒ 被遮兄弟全消失。修法：`as_mask_ink` 只收 `fill != NULL || stroke_width > 0`
+  的组（顶层 `g->path` 同守卫），每组至多加一次。
+- **实测（`adl` 51.4.1 vs AOT，按遮罩子件独有 teal `0x00948c` 计数）**：`loginskin` ink 两端都是
+  `177000 px`；`元件77_50` 帧 1 遮罩 `x=0` 两端都 `0`、`x=40` 露出量同为 88 宽窗口内的一档；
+  帧 100 `numChildren` 两端都是 `4`、遮罩 `x=100` 两端都 `0`。
+- **★ 已知偏差（如实报明）**：`adl` 的 stencil 对 **morph 遮罩不跟随 ratio** —— `Teal2` 探针
+  `gotoAndStop` 到 1/2/3/5/10/20/50/80/99 的 teal 分布**逐字节相同**，只有帧 100 换字符才变；
+  而 AIR 自己**画**该 morph 时按当前 ratio 画。我们让 stencil 跟**当前**几何走（遮罩与画面自洽），
+  故 AOT 帧 99 与帧 1 不同。复刻 AIR 的做法已探明（morph 分支换用 `_mdecl` 声明盒
+  `[-92.9,-10 .. 0.0,31.6]`，与 `adl` 帧 1 的 `clipdbg` 一致），已登记进遗留表。
+- **回归**：新 `examples/swc-mask-frames.as`（真 `skin.swc`：帧 1/99/100 × 遮罩平移 + `loginskin` 177000）；
+  新 `unit: render/SwcClipMaskPerFrame`（14 钉）；6 条变异**全红**（`temp/mask3/mutate.cjs`：
+  不闭合轮廓 / 区间改闭 / 退订不清引用 / 恢复零宽描边组 / `maskOff` 不发 / 帧 1 不 wire）。
+  顺带把 `test/unit/render.ts` 里两条 `_clip_path` 时代的旧钉（闭合、裁剪点位）改到新发射形态。
+- **文档**：`docs/zh-cn/swc.md` §9.2 F12（新）+ §3.4⑦⑥ + §10 表；`README-CN.md` 示例一行。
+
+### 阶段三百二十：Stage3D 六个上传入口的边界契约 —— AIR **不钳制**，短就是错误（v0.4.280 → v0.4.281）
+
+**背景（用户点名的「三处裸读」，查下去是六个入口）**：`uploadFromByteArray` 一族是
+「应用的字节流 → GPU 缓冲/纹理」的唯一通道。旧实现与 `BitmapData.setPixels` 的越界读同族：
+
+1. **按 `data->length` 静默截断**——数组短了就少传几个顶点/索引，一句不报（`TODO` 当时
+   甚至把这写成了「AS3 静默截断」的正确做法，实测**根本不是**：AIR 抛 `#3669`）。
+2. **负 `startVertex`/`startIndex` 让目标指针跑到缓冲区之前** ⇒ 越界**写**；
+   负 `byteArrayOffset` 则读越界（它是 `uint` 形参，被传成巨大无符号数）。
+3. **短数组报 `#2004 "One of the parameters is invalid."`**——错号与文案都不对。
+4. **`Texture.uploadFromByteArray` 把 `miplevel > 0` 报成「本后端不支持」**，而 AIR 是真上传
+   （away3d 的 `MipmapGenerator` 逐级上传，我们这条路上一直是响亮的缺口）。
+5. **`uploadFromVector` 的源按 `data[startVertex * stride]` 取**——既越界读，又与 AIR 不符。
+
+**先量后改**（`adl 51.4.1`，`temp/s3dupload/`）：`UploadProbe.as` 逐条问 89 个用例，
+`ChainProbe.as` 专问 mip 链；AOT 侧用**同一份用例表**（`examples/dbg-s3dupload.as`）跑出来的
+报告与 `adl` **逐行 89/89 相同**（`out-upload.txt` vs `aot.txt`，唯一多出的一行是 `adl`
+的 `vb null off=-1` 复述）。
+
+| 输入 | AIR 的答案（实测，`docs/zh-cn/display3d.md` §9.15 有全表） |
+|---|---|
+| `data == null` | `TypeError #2007: Parameter data must be non-null.`（**优先于一切**，含 `miplevel` 越界） |
+| 数组不够长 / 偏移越界 / 负下标 | `RangeError #3669: Bad input size.`（所有尺寸错共用这一句） |
+| `numVertices == 0` / `numIndices == 0` | **成功**，但同一次调用的偏移仍要合法（`off == len, n = 0` 仍 `#3669`） |
+| `miplevel` 越过 mip 链 | `ArgumentError #3674: Miplevel too large.`（**先于**字节数检查） |
+
+**核心决策：AIR 不钳制，短就是错误**。「能拷多少拷多少」不是容错而是静默错答案（§2.5）；
+且负偏移会把写指针推到缓冲区之前，那是内存安全问题而不是语义问题。
+
+**七条只能实测出来、且直接决定实现形状的细节**（详见 §9.15）：
+
+1. **null 优先**：`null + miplevel = 9` 报 #2007 而不是 #3674 ⇒ 六条入口第一行都是 null 判定。
+2. **所有尺寸错共用 #3669**：不必逐个报不同的错，一条合取式即可。
+3. **`startVertex + numVertices` 校验的是 `createVertexBuffer3D` 给的尺寸**，不是本次上传的
+   长度（4 顶点缓冲拒 `start = 3, n = 4`，哪怕 64 字节够）。⇒ `symbols.ts` 给
+   `VertexBuffer3D`/`IndexBuffer3D` 各加独立字段 **`capacity`**：`numVertices`/`numIndices`
+   每次上传都会被覆写成「这次传了多少」，当不了上限。比较写成
+   `startVertex > capacity - numVertices`（**不是** `start + n > capacity`，后者在
+   `numVertices` 接近 `INT_MAX` 时溢出）。
+4. **源与目标不对称**：`byteArrayOffset` 决定源从哪连续读，`startVertex`/`startIndex` 只决定
+   **写到哪**（`off = 16, n = 2` 在 64 字节数组上成功）。`uploadFromVector` 更明确：源**恒从
+   `data[0]` 读**——1 个顶点的 Vector 配 `startVertex = 1, n = 1` 也成功 ⇒ 源改成
+   `const double* src = data->data`，`startVertex` 只参与目标偏移。
+5. **Vector 的长度只与 `numVertices` 比**，不与 `startVertex + numVertices` 比。
+6. **`data.endian` 被刻意忽略**：参考文档要求小端，`adl` 却接受 `bigEndian` 且照样按小端读
+   ⇒ 只有**宿主**字节序参与判断（`as_ba_little` 从这条路径上删掉）。尊重该标志等于把 AIR
+   原样透传的数据翻个个儿。
+7. **mip 链长 = `1 + floor(log2(max(w, h)))`**，与 `createTexture` 的 `mipmapped` 标志**无关**
+   （非 mipmapped 纹理照样接受 `level > 0`）：4×4 → 3 级、8×8 → 4 级、**8×2 与 2×8 也是 4 级**
+   （按 `max` 不按 `min`）；每级字节数按**该级自己的尺寸**算（8×8 的 level 1 = 64 B、2 = 16 B、
+   3 = 4 B）。**顺带修掉同族的第二处静默**：`uploadFromBitmapData` 的越界 level 原先
+   `return` 掉了，实测同样抛 #3674 —— 改成抛错，并把链检查提到「GPU 句柄还没建」短路**之前**
+   （AIR 没有惰性句柄，答案不该取决于我方 GPU 状态；纯 CPU 构建也必须给同一个答案）。
+
+**实现**（`src/emit.ts`）：三个铸造器 `as_s3d_null_data` / `as_s3d_bad_input` /
+`as_s3d_mip_too_large`；六条入口（VB×2、IB×2、`Texture`、`RectangleTexture` 共享的
+`as_tex_argb_from_byte_array`）全部走同一套判定顺序（null → 负数 → capacity 窗口 → 字节数；
+纹理是 null → mip 链 → 级别字节数）。纹理按**字节**装配成规范 ARGB 字（`bgra` 是 `B,G,R,A`、
+`rgba` 是 `R,G,B,A`），只有「偏移 4 字节对齐 **且** 宿主小端 **且** `bgra`」这一档才原地取
+指针——非对齐 `uint32_t*` 解引用是 UB，而 `adl` 确实接受奇数偏移（IB 的 `off = 1` 实测通过）。
+`numVertices == 0` 的合法上传**不改动**缓冲区自己的窗口，否则后续 `drawTriangles` 会拿到 0 个顶点。
+
+**回归**：
+
+- 新示例 `examples/s3d-upload-bounds.as`（真 `Context3D`）：VB/IB × ByteArray/Vector 的空、
+  越界、负、零长、边界恰好；`capacity` 窗口（4 顶点缓冲拒 `start = 3, n = 4`）；
+  「被拒调用不许改动缓冲区」（`numVertices` 保持上一次值）；源/目标分离（`off = 12,
+  startVertex = 1, n = 2` 断言读的是 `raw[3..9)`）；**bigEndian 被忽略**
+  （bytes `00 11 22 33` 读成 `0x33221100`）；`uploadFromBitmapData` 的 #3674；
+  8×2 非正方形链长（level 2 要 8 B，level 4 → #3674）。
+- 单元组 `unit: stage3d/upload-bounds`（**24 钉**）：三个铸造器的文案与 id、`capacity` 字段与
+  ctor/创建点、六条入口都先判 null、三处 capacity 窗口、**不再有 `maxCount` 截断**、源连续读、
+  Vector 只比 count、mip 真实现、级别尺寸驱动字节数、短数组是 #3669 不是 #2004、对齐守卫、
+  endian 被忽略。既有的 `unit: stage3d/mip-semantics` 那条「越界 level 静默 return」的旧钉
+  随之改成 #3674 形态。
+- **变异 12/12 全红**（`temp/s3dupload/mutate2.cjs` 11 条 + `mutate3.cjs` 1 条）：目标偏移 /
+  源偏移 / 源改回 `data[startVertex*stride]` / VB capacity / IB capacity / 链检查 / 整幅尺寸 /
+  尊重 endian / null 换错号 / VB、IB 长度改按 `start + count`。**一条曾被我误判为变异**：
+  只把 `if (as_host_little())` 改到 `else` 分支而两支都按小端装配，在小端主机上与 `memcpy`
+  **完全等价** ⇒ 那不是变异，必须让 `else` 真按大端装配才测得出来（`mutate3.cjs` 的形态）。
+
+**未做（如实报明）**：`CubeTexture.uploadFromByteArray` 仍是**响亮**的
+`as_shell_unsupported`（六面必须一次齐备，`createCubeTexture` 不给 `ctx` ⇒ 面上传无法增量落地；
+本轮**未测**它的字节布局与 `side` 语义，故只登记不改）；非 8 位纹理格式
+（`compressed`/float）报明「本构建不支持」而不是按错的步长读；`level > 0` 在**惰性 GPU 句柄
+还没建**时（先传 level 1 再传 level 0）会被跳过——AIR 上不存在这个状态，是本后端惰性句柄的
+内部差别，已写进生成代码的注释。
+
+**文档**：`docs/zh-cn/display3d.md` **§9.15**（实测表 + 七条细节 + 实现 + 缺口）。
+
+**验收**：`as-aot examples/s3d-upload-bounds.as --run` ⇒ `s3d-upload-bounds: OK`；
+`node --test --test-name-pattern='stage3d/'` ⇒ 63 pass / 0 fail；全量回归见下。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百二十：Stage3D 六个上传入口的边界契约）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表（`遗留项|状态|说明|建议`）行数 **114 → 115**（`未开始` 按列二含该词重数 **92 → 93**；上一轮 note 标 90，与实测差 2，本轮按实测记账，与阶段三百一十四/三百一十五 记过的同类偏差同因）。**本阶段修净的全都不占表**：`uploadFromByteArray` 的静默截断、负目标的越界写、短数组错报 `#2004`、`Texture.uploadFromByteArray` 的 `miplevel > 0` 报明、`uploadFromVector` 按 `startVertex` 起读、`uploadFromBitmapData` 越界 level 静默 `return` —— 六处都是「`adl` 跑得对我们跑不出/跑错」，属 §1.5 遗留缺陷，但同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**新登记 1 行**＝`CubeTexture.uploadFromByteArray`（仍是响亮 stub；`adl` 支持逐面从 ByteArray 上传，本轮未测它的字节布局与 `side` 语义，故只登记不改）。**顺带修掉一处文档错位**：阶段三百一十九 的章节此前被错插在阶段六十四 的正文里（还留下一行带反引号的 `### 遗留待开发`），本次搬回本节序列尾部。口径与实测表见 `docs/zh-cn/display3d.md` §9.15。
 > **2026-10-29 追加（阶段三百一十九：逐帧 `clipDepth` 遮罩）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**113 → 114 行**（`未开始` **89 → 90**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**本阶段修净的四条不占表**：morph 遮罩被裁空、sprite 遮罩无裁剪、帧尾换字符少一个子件、以及「遮罩 stencil 混进零宽描边组」——前两条此前是 `notes` 报明的**响亮缺口**、后两条是实错，均同阶段落地（`docs/zh-cn/swc.md` §9.2 F12）。**新登记 1 行**是唯一**刻意保留的偏差**：AIR 的 `clipDepth` stencil 对 morph 遮罩**不跟随 ratio**（f1..f99 同框，只有帧 100 换字符才变），我们跟随当前几何，两侧像素因此在 morph 动画期间不同 —— 复刻路径已探明（`_mdecl` 声明盒），但要不要复刻属产品判断。
 > **2026-10-29 追加（阶段三百一十八：`DisplayObject.mask` 真实现）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**112 → 113 行**（`未开始` **88 → 89**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**本阶段修净的不占表**：`DisplayObject.mask` 此前根本不生效（`set_mask` 里一句 `as_shell_unsupported`），按 §1.5 属「`adl` 跑得对、我们跑不出」的遗留缺陷，但同阶段落地 ⇒ 不入表；落地的口径（二值模板、遮罩自己的祖先链、子件并集保洞、离屏遮罩、不看 `alpha`/`visible`、不影响 `getBounds` 但影响命中）逐条来自 `adl` 实测，见 `docs/zh-cn/skia.md` §6.15。**新登记 1 行**是非矢量遮罩那三档（`Bitmap`/`TextField` 遮罩只到包围盒、纯描边遮罩、遮罩自带滤镜/混合）——它们既未实测也未实现，且我们现在是**响亮**回退而不是静默。
 > **2026-10-29 追加（阶段三百一十五：渲染器三处每帧实错）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**110 → 112 行**（`未开始` **86 → 88**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。上一轮 note（阶段三百一十四）标 110 行，按 `254cb13` 实测也是 **110 行**，本轮 110 + 2 = **112** 与实测一致。**新登记 2 行**：① 容器里 ≥2 个重叠图元且 `alpha<1` 时，我们的 layer 隔离口径与 AIR 的逐图元乘 alpha 不同（`temp/alphafold` 的 B1 采样点 `ff7f7f00` vs `ff7f7f3f`）——与本阶段修的折叠**无关**，折叠前就是这个值；② AOT 的每帧固定成本 `static` 场景 **0.579 vs 0.058 ms**（10×），属**我方性能缺口**而非保真差，本阶段只修了「每项成本」那一半。**本阶段修净的三处不占表**（alpha 折叠 / `getenv` 出内循环 / 单图元不自动烘）：都是「AIR 做对了、我们做错/多做」的实错，按 §1.5 同阶段落地。
@@ -17956,6 +18049,7 @@ Windows 本机实跑覆盖。
 | **`alpha < 1` 且子树画 ≥2 个重叠图元时，我们开 layer 隔离、AIR 逐图元乘 alpha** | 未开始（2026-10-29 阶段三百一十五 的像素 oracle 量到；本阶段只把「只画 1 个图元」这一类改成折叠，容器这一类原样保留 layer） | `temp/alphafold/` 同一份 `.as` 分别 `adl` 与 AOT，`BitmapData.draw` 整棵树后逐点取样：一个 `alpha=0.5` 的 Sprite 里两个**重叠不透明矩形**，重叠点 AIR `ff7f7f3f`、我们 `ff7f7f00`——AIR 把 0.5 乘到每个元素上（蓝 127→黄叠上去留 63），我们把子树先合成再整体乘（黄不透明 ⇒ 蓝 0）。**9/10 采样点逐位相同**，这一条是唯一分歧，且**折叠前就是这个值**（与本阶段改动无关）。同一夹具里两条已对齐的分支正是本阶段修的：单图元 `alpha=0.5`（`ff7f0000`）与 `0.5×0.5` 嵌套（`ff3f3f3f`）改前分别是 `ff800000`/`ff404040` | 把对象级 layer 整体换成「逐图元乘 alpha」需要覆盖全部绘制入口（目前只有 `draw_path`/`draw_rect`/`draw_image_rect` 三个穿越 `_mul`，`draw_circle`、九宫格 `draw_image_src_rect`、文本、Stage3D 的 `draw_bgra`/`gl_draw_texture` 都还没有），漏一个就是整块不透明 ⇒ 先补齐入口并给每个入口补 oracle 采样点，再一次性切换；切换后本行可移出
 | **AOT 的每帧固定成本高于 AIR 10×**（`static` 场景 0.579 vs 0.058 ms/帧） | 未开始（2026-10-29 阶段三百一十五 量到；本阶段修的是「每项成本」，没有动固定成本） | 夹具 `static`（一个 FPS 文本 + 一张位图，**没有列表**）：AOT **0.579**、AIR **0.058 ms/帧**（3 reps，进程 CPU/帧）。同一份数据里 AOT 的**列表斜率已经反超**（2.56 vs 1.85 µs/项），所以固定成本是现在唯一还落后的量：384 项时的总差 0.5 ms 里，固定成本与斜率各占约一半。候选来源（**未拆**）：`as_render_fp` 整树哈希、窗口 pass 的若干 per-frame 准备、`ASC_pass`/`ASC_frame` 探针的残留检查 | 先给固定成本加分段探针（把 `as_render_fp` 单独关掉一次、把窗口 pass 的每帧准备工作分段计时），定位到具体语句后再改；`ASC_RPROF` 现有绝对值不可信（与进程 CPU 比值 ≈4×，原因未定位），只能做相对比较
 | **`DisplayObject.mask` 的非矢量遮罩只有包围盒精度**（`Bitmap`/`TextField` 当遮罩时 AIR 按**像素**模板裁剪，我们退回它的包围盒并 `as_shell_unsupported` 报一次；纯描边遮罩的描边带、遮罩自带 `filters`/`blendMode` 的呈现同样只取几何） | 未开始（2026-10-29 阶段三百一十八 落地二值模板时登记；本阶段把矢量遮罩（含子件并集、离屏遮罩、别的容器）逐条对齐了 adl，这三档 adl 侧未实测、实现上也还没接） | `docs/zh-cn/skia.md` §6.15 的实测表是已对齐的九条；缺的三档分别是「遮罩是 `Bitmap`/`TextField`」「遮罩只有描边」「遮罩自身带滤镜/混合」 | 先按 §6.15 的探针套路（`temp/mask/MaskProbe*.as`）补测这三档的 adl 口径，再把 `as_mask_ink` 的路径收集扩到像素模板（`SkImage` → `SkShader` 裁剪或 `saveLayer` + `kDstIn`），并把报明换成真实现 |
+| **`CubeTexture.uploadFromByteArray` 只报明、不落地**（`as_shell_unsupported`，立方体一个面都传不进去） | 未开始（2026-10-30 阶段三百二十 把六个上传入口的边界契约对齐时分离出来的：`adl` 支持逐面从 ByteArray 上传，本轮**未测**它的字节布局与 `side` 语义，故只登记） | 我们的立方体六面必须**一次性**齐备（`as_s3d_upload_cube_texture` 一次收六个快照），而 `createCubeTexture` 不给 `ctx` 句柄、面上传无法增量落地；`CubeTexture.uploadFromBitmapData` 是**可用**的（away3d 天空盒走它） | 先按 `temp/s3dupload/UploadProbe.as` 的形状补一面探针（六面逐面传 + 只传一面就读），再决定是「逐面快照 + 齐备才上传」还是「单面即时上传」 |
 
 
 

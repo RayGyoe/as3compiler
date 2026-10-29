@@ -196,8 +196,12 @@ function checkStage3dMipSemantics(): string[] {
     /o->mips = 1;/.test(emitted));
   check('a level 0 upload resets o->mips = 0 (the chain no longer matches the content)',
     /o->mips = 0;/.test(emitted));
-  check('levels beyond max(w,h) are rejected (MTLTexture would fault on a missing level)',
-    /if \(\(int\)miplevel >= nlv\) return;/.test(emitted));
+  // 阶段三百二十：越界 level 从「静默 return」改成 AIR 的 #3674 —— adl 51.4.1 实测
+  // （temp/s3dupload/ChainProbe.as）：4x4 的 level 2（1x1）成功，level 3 与 level 9
+  // 都抛 ArgumentError #3674 "Miplevel too large."。检查也提到 gpu 检查之前，
+  // 因为 AIR 没有惰性纹理句柄，答案不能取决于我方 GPU 状态。
+  check('levels beyond max(w,h) are rejected with AIR #3674 (MTLTexture would fault on a missing level)',
+    /if \(\(int\)miplevel >= nlv\) \{ as_s3d_mip_too_large\(\); return; \}/.test(emitted));
   // Layout: Context3D_submit reads a RectangleTexture through Texture*, so the
   // trailing field must exist in BOTH structs at the same offset.
   const symbols = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
@@ -1365,3 +1369,137 @@ function checkStage3dTextureLimits(): string[] {
 }
 
 registerGroup('stage3d/texture-size-limits', checkStage3dTextureLimits);
+// uploadFromVector / uploadFromByteArray 的边界契约（阶段三百二十）。
+//
+// 这四个入口以前是「能拷多少拷多少，拷不到就静默返回」——与 AIR 抛 RangeError 相反，
+// 且 startVertex/startIndex 为负时目标指针会走到缓冲区之前，即一次越界写（与
+// BitmapData.setPixels 的越界读同族）。契约全部来自 adl 51.4.1 实测
+// （temp/s3dupload/：89 条用例逐行对齐 + ChainProbe 的 mip 链）：
+//
+//   data == null                TypeError      #2007 "Parameter data must be non-null."
+//   尺寸 / 下标越界              RangeError     #3669 "Bad input size."
+//   miplevel 超出 mip 链         ArgumentError  #3674 "Miplevel too large."
+//
+// 两条容易写错、且注释里必须留下痕迹的语义：
+//   * uploadFromVector 的源从 data[0] 读，startVertex/startIndex 只决定**写到哪**
+//     （实测：只有 1 个顶点的 Vector，start=1/n=1 也能成功）；
+//   * Vector 的长度对照 numVertices，不是 startVertex + numVertices（实测：
+//     2 个元素的 Vector，start=1/count=2 成功）。
+function checkStage3dUploadBounds(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const emitted = emittedLines();
+  const body = (name: string, next: string): string => {
+    const i = emitted.indexOf(name);
+    if (i < 0) return '';
+    const j = emitted.indexOf(next, i);
+    return emitted.slice(i, j < 0 ? undefined : j);
+  };
+
+  // 1. 一套错误铸造器，三处文案与 errorID 必须逐字对齐 AIR。
+  check('#2007 null-data helper carries AIR text and id',
+    emitted.includes('static void as_s3d_null_data(void) {')
+    && emitted.includes('as_throw(TypeError_new((char*)"Error #2007: Parameter data must be non-null.", 2007))'));
+  check('#3669 bad-input helper carries AIR text and id',
+    emitted.includes('static void as_s3d_bad_input(void) {')
+    && emitted.includes('as_throw(RangeError_new((char*)"Error #3669: Bad input size.", 3669))'));
+  check('#3674 mip-level helper carries AIR text and id',
+    emitted.includes('static void as_s3d_mip_too_large(void) {')
+    && emitted.includes('as_throw(ArgumentError_new((char*)"Error #3674: Miplevel too large.", 3674))'));
+
+  // 2. 校验的是 createVertexBuffer3D/createIndexBuffer3D 给的尺寸，不是本次上传的
+  //    长度 —— uploadFromByteArray 会把 numVertices/numIndices 覆盖成上传的那一段。
+  const symbolsSrc = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  check('VertexBuffer3D keeps a separate capacity field',
+    symbolsSrc.includes("['capacity', vbf({ kind: 'int' })]"));
+  check('IndexBuffer3D keeps a separate capacity field',
+    symbolsSrc.includes("['capacity', ibf({ kind: 'int' })]"));
+  check('ctors zero the capacity',
+    emitted.includes('o->numVertices = 0; o->capacity = 0;')
+    && emitted.includes('o->numIndices = 0; o->capacity = 0;'));
+  check('createVertexBuffer/createIndexBuffer record the capacity',
+    emitted.includes('b->numVertices = numVertices; b->capacity = numVertices; b->data32PerVertex = data32PerVertex;')
+    && emitted.includes('b->numIndices = numIndices; b->capacity = numIndices;'));
+
+  // 3. 四个入口都必须先判 null（实测 null 优先于其它一切拒绝原因：null+mip=9 报 #2007）。
+  const vbBa = body('void VertexBuffer3D_uploadFromByteArray(', 'void VertexBuffer3D_dispose(');
+  const vbVec = body('void VertexBuffer3D_uploadFromVector(', 'void VertexBuffer3D_uploadFromByteArray(');
+  const ibBa = body('void IndexBuffer3D_uploadFromByteArray(', 'CubeTexture_');
+  const ibVec = body('void IndexBuffer3D_uploadFromVector(', 'void IndexBuffer3D_uploadFromByteArray(');
+  const texBa = body('void Texture_uploadFromByteArray(', 'void Texture_uploadFromBitmapData(');
+  const texHelper = body('static const uint32_t* as_tex_argb_from_byte_array(', 'void Texture_uploadFromByteArray(');
+
+  for (const [label, b] of [
+    ['VertexBuffer3D.uploadFromByteArray', vbBa],
+    ['VertexBuffer3D.uploadFromVector', vbVec],
+    ['IndexBuffer3D.uploadFromByteArray', ibBa],
+    ['IndexBuffer3D.uploadFromVector', ibVec],
+    ['Texture.uploadFromByteArray', texBa],
+    ['as_tex_argb_from_byte_array', texHelper],
+  ] as const) {
+    check(`${label} rejects null data with #2007`, b.includes('as_s3d_null_data();'));
+  }
+
+  // 4. 尺寸校验：-1 / 越界 / 差一个字节都必须同一条 #3669，且不再有「截断到可用长度」。
+  check('VB byte-array upload validates the offset, the capacity window and the byte count',
+    vbBa.includes('off >= data->length') && vbBa.includes('as_s3d_bad_input();')
+    && vbBa.includes('startVertex > o->capacity - numVertices')
+    && vbBa.includes('numVertices * (long long)stride * 4LL > (long long)(data->length - off)'));
+  check('IB byte-array upload validates the same three things at 2 bytes/index',
+    ibBa.includes('off >= data->length')
+    && ibBa.includes('startIndex > o->capacity - numIndices')
+    && ibBa.includes('numIndices * 2LL > (long long)(data->length - off)'));
+  check('no upload entry point silently clamps to the available bytes any more',
+    !/maxCount/.test(emitted) && !emitted.includes('if (count > maxCount) count = maxCount;'));
+
+  // 5. 源与目标是两件事：源自偏移/数组头部连续读，startVertex 只决定写到哪。
+  //    「从 data[startVertex*stride] 读」既是越界读也是与 AIR 不符的形状。
+  check('uploadFromByteArray reads the source contiguously from the offset',
+    vbBa.includes('const unsigned char* src = (const unsigned char*)data->data + off;')
+    && vbBa.includes('unsigned* out = dst + (size_t)startVertex * (size_t)stride;'));
+  check('uploadFromVector reads the source from data[0], not data[startVertex*stride]',
+    vbVec.includes('const double* src = data->data;')
+    && !vbVec.includes('data->data + (size_t)startVertex * (size_t)stride')
+    && ibVec.includes('o->data->data[startIndex + i] = data->data[i];'));
+  check('uploadFromVector compares the VECTOR length with the count alone',
+    vbVec.includes('(long long)numVertices * (long long)stride > (long long)data->length')
+    && ibVec.includes('(long long)numIndices > (long long)data->length'));
+
+  // 6. Texture：miplevel 是真实现的（旧代码把 level>0 直接报 unsupported），
+  //    链长按 max(w,h)，级别尺寸决定字节数，超链 #3674。非 mipmapped 纹理照样接受
+  //    level>0（实测），所以这守卫不能挂在 mips 标志上。
+  check('Texture.uploadFromByteArray honours miplevel instead of reporting it unsupported',
+    !emitted.includes('Texture.uploadFromByteArray (mip level > 0)')
+    && texBa.includes('int dim = o->width > o->height ? o->width : o->height;')
+    && texBa.includes('while (dim > 1) { dim >>= 1; nlv++; }')
+    && texBa.includes('as_s3d_mip_too_large();'));
+  check('the mip level dimensions drive the byte-count check',
+    texBa.includes('int lw = o->width >> lv; if (lw < 1) lw = 1;')
+    && texBa.includes('int lh = o->height >> lv; if (lh < 1) lh = 1;')
+    && texBa.includes('as_tex_argb_from_byte_array(data, byteArrayOffset, lw, lh, o->format, &sw)'));
+  check('a short ByteArray is #3669, not the old #2004 "parameters is invalid"',
+    texHelper.includes('as_s3d_bad_input();')
+    && !texHelper.includes('Error #2004'));
+  // 目标字指针必须能安全解引用：非 4 字节对齐的偏移走逐字节装配（IB 实测接受 off=1，
+  // 纹理同理），否则 uint32_t* 解引用是 UB。
+  check('the in-place texel fast path is guarded by alignment and host byte order',
+    texHelper.includes('if ((off & 3u) == 0u && as_host_little() && strcmp(format, "bgra") == 0) return (const uint32_t*)src;')
+    && texHelper.includes('unsigned r = isbgra ? b2 : b0, b = isbgra ? b0 : b2;'));
+
+  // 7. data.endian 被刻意忽略：参考文档要求小端 ByteArray，adl 却接受 bigEndian 且
+  //    按小端读 —— 尊重该标志会字节翻转 AIR 原样透传的数据。
+  check('ByteArray.endian is deliberately ignored (AIR reads the bytes as little-endian)',
+    !vbBa.includes('as_ba_little(') && !ibBa.includes('as_ba_little(')
+    && vbBa.includes('if (as_host_little()) {') && ibBa.includes("(unsigned int)src[i*2+1] << 8"));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/upload-bounds', checkStage3dUploadBounds);
+

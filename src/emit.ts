@@ -24390,7 +24390,40 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('');
     // ===== flash.display3D (stage 81): resource classes + Context3D state machine
     // + Stage3D slot. CPU-side only; the GPU upload/draw lands in stage 82. =====
-    this.line('void VertexBuffer3D_ctor(VertexBuffer3D* o) { Object_ctor((Object*)o); o->numVertices = 0; o->data32PerVertex = 0; o->raw = NULL; o->startVertex = 0; }');
+    // ---- Stage3D upload validation (阶段三百二十) ----
+    //
+    // ONE error contract shared by every upload entry point, measured on adl
+    // 51.4.1 (temp/s3dupload/, 60 probes over the four classes):
+    //
+    //   data == null                        TypeError      #2007 "Parameter data must be non-null."
+    //   any size/index out of range         RangeError     #3669 "Bad input size."
+    //   miplevel past the mip chain         ArgumentError  #3674 "Miplevel too large."
+    //
+    // The point of the contract is that AIR does NOT clamp: a ByteArray that is a
+    // few bytes short is an ERROR, not a short upload. The previous code here did
+    // "copy what fits and return", which is a silent wrong answer (§2.5) -- and,
+    // worse, with a negative startVertex/startIndex the destination pointer walked
+    // BEFORE the buffer, i.e. a write out of bounds (same family as the setPixels
+    // over-read fixed in 阶段三百一十六).
+    //
+    // Three measured details decide the SHAPE of the checks and are not in the
+    // reference text:
+    //   * every bad-size case reports the SAME #3669, so one conjunction suffices;
+    //   * the offset is checked even when the count is 0 (`off=len, n=0` throws,
+    //     while `n=0` on a good offset does not);
+    //   * `startVertex + numVertices` is validated against the size given to
+    //     createVertexBuffer3D/createIndexBuffer3D -- hence the separate `capacity`
+    //     field, because an upload overwrites numVertices/numIndices with the
+    //     uploaded extent;
+    //   * uploadFromVector reads the source from data[0], NOT from
+    //     data[start*stride] (`short3, start=1, n=1` succeeds although the vector
+    //     is only one vertex long), while the DESTINATION starts at start*stride.
+    //   * the null check wins over every other rejection (null data + miplevel 9
+    //     reports #2007).
+    this.line('static void as_s3d_bad_input(void) { as_throw(RangeError_new((char*)"Error #3669: Bad input size.", 3669)); }');
+    this.line('static void as_s3d_null_data(void) { as_throw(TypeError_new((char*)"Error #2007: Parameter data must be non-null.", 2007)); }');
+    this.line('static void as_s3d_mip_too_large(void) { as_throw(ArgumentError_new((char*)"Error #3674: Miplevel too large.", 3674)); }');
+    this.line('void VertexBuffer3D_ctor(VertexBuffer3D* o) { Object_ctor((Object*)o); o->numVertices = 0; o->capacity = 0; o->data32PerVertex = 0; o->raw = NULL; o->startVertex = 0; }');
     this.line('VertexBuffer3D* VertexBuffer3D_new(void) { VertexBuffer3D* o = (VertexBuffer3D*)gc_alloc(GCT_CLASS, sizeof(VertexBuffer3D)); o->vtable = &VertexBuffer3D_vt; VertexBuffer3D_ctor(o); return o; }');
     // Vertex payload storage: one 32-bit word per component, in the order the
     // upload produced them (absolute vertex index * stride + component offset).
@@ -24406,74 +24439,104 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return o->raw->data;');
     this.indent--;
     this.line('}');
+    // Same contract as uploadFromByteArray below (the doc lists the same
+    // RangeErrors and the probe confirms they are the same #3669). Note the two
+    // offsets are NOT symmetric: `startVertex` selects where in the BUFFER the
+    // copy lands, while the source is read from the front of the Vector
+    // (measured: a one-vertex Vector uploaded with startVertex=1 and
+    // numVertices=1 succeeds). Reading from `data[startVertex * stride]` -- what
+    // this used to do -- both diverges from AIR and reads past the end of a short
+    // Vector.
     this.line('void VertexBuffer3D_uploadFromVector(void* _this, as_vector_number* data, int startVertex, int numVertices) {');
     this.indent++;
     this.line('VertexBuffer3D* o = (VertexBuffer3D*)_this;');
-    this.line('if (data == NULL || numVertices <= 0) return;');
+    this.line('if (data == NULL) { as_s3d_null_data(); return; }');
     this.line('int stride = o->data32PerVertex;');
     this.line('if (stride <= 0) return;');
-    // Clamp to the source vector: both indices are absolute vertex indices into
-    // the caller's Vector (uploadFromByteArray works the same way).
-    this.line('int avail = (data->length - startVertex * stride) / stride;');
-    this.line('if (avail < numVertices) numVertices = avail;');
-    this.line('if (numVertices <= 0) return;');
-    this.line('unsigned* dst = VertexBuffer3D_words(o, startVertex * stride + numVertices * stride);');
-    this.line('double* src = data->data + (size_t)startVertex * (size_t)stride;');
+    this.line('if (startVertex < 0 || numVertices < 0) { as_s3d_bad_input(); return; }');
+    // `startVertex > capacity - numVertices` rather than startVertex + numVertices >
+    // capacity: the same test, but it cannot overflow for numVertices near INT_MAX.
+    this.line('if (startVertex > o->capacity - numVertices) { as_s3d_bad_input(); return; }');
+    this.line('if ((long long)numVertices * (long long)stride > (long long)data->length) { as_s3d_bad_input(); return; }');
     this.line('int n = numVertices * stride;');
-    this.line('for (int i = 0; i < n; i++) {');
+    // An empty (but legal) upload leaves the buffer's own window untouched, like
+    // AIR: a later draw keeps sampling whatever the previous upload put there.
+    this.line('if (n > 0) {');
     this.indent++;
-    this.line('float f = (float)src[i];');
-    this.line('memcpy(dst + startVertex * stride + i, &f, 4);');
+    this.line('unsigned* dst = VertexBuffer3D_words(o, startVertex * stride + n);');
+    this.line('const double* src = data->data;');
+    this.line('unsigned* out = dst + (size_t)startVertex * (size_t)stride;');
+    this.line('for (int i = 0; i < n; i++) { float f = (float)src[i]; memcpy(out + i, &f, 4); }');
+    this.line('o->startVertex = startVertex;');
+    this.line('o->numVertices = numVertices;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('void VertexBuffer3D_dispose(void* _this) { VertexBuffer3D* o = (VertexBuffer3D*)_this; o->raw = NULL; }');
+    // uploadFromByteArray (stage 87): Starling's VertexData stores vertices as
+    // little-endian float32 in a ByteArray (not Vector.<Number>). Copy the words
+    // straight out of the ByteArray (a single memcpy) -- no per-element float
+    // decode, because the submit path interprets the word according to the
+    // attribute format chosen at setVertexBufferAt.
+    //
+    // `data.endian` is deliberately IGNORED: the reference requires a
+    // little-endian ByteArray, and adl accepts a bigEndian one without a word of
+    // complaint, i.e. AIR reads the raw bytes as little-endian regardless. Honouring
+    // the flag (what this used to do) byte-swaps data AIR reads straight through.
+    // Only the HOST's byte order matters here.
+    this.line('void VertexBuffer3D_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, int startVertex, int numVertices) {');
+    this.indent++;
+    this.line('VertexBuffer3D* o = (VertexBuffer3D*)_this;');
+    this.line('if (data == NULL) { as_s3d_null_data(); return; }');
+    this.line('int stride = o->data32PerVertex;');
+    this.line('if (stride <= 0) return;');
+    // AIR declares byteArrayOffset as int here (unlike Texture's uint): a negative
+    // offset is "bad input size", not a huge unsigned one.
+    this.line('int off = (int)byteArrayOffset;');
+    this.line('if (data->data == NULL || off < 0 || off >= data->length) { as_s3d_bad_input(); return; }');
+    this.line('if (startVertex < 0 || numVertices < 0) { as_s3d_bad_input(); return; }');
+    this.line('if (startVertex > o->capacity - numVertices) { as_s3d_bad_input(); return; }');
+    this.line('if ((long long)numVertices * (long long)stride * 4LL > (long long)(data->length - off)) { as_s3d_bad_input(); return; }');
+    this.line('int n = numVertices * stride;');
+    this.line('if (n > 0) {');
+    this.indent++;
+    // The source is contiguous from `off`; startVertex only selects the DESTINATION
+    // window (measured: off=16/numVertices=2 succeeds on a 64-byte array).
+    this.line('unsigned* dst = VertexBuffer3D_words(o, startVertex * stride + n);');
+    this.line('const unsigned char* src = (const unsigned char*)data->data + off;');
+    this.line('unsigned* out = dst + (size_t)startVertex * (size_t)stride;');
+    this.line('if (as_host_little()) {');
+    this.indent++;
+    this.line('memcpy(out, src, (size_t)n * 4);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('for (int i = 0; i < n; i++) out[i] = (unsigned)src[i*4] | ((unsigned)src[i*4+1] << 8) | ((unsigned)src[i*4+2] << 16) | ((unsigned)src[i*4+3] << 24);');
     this.indent--;
     this.line('}');
     this.line('o->startVertex = startVertex;');
     this.line('o->numVertices = numVertices;');
     this.indent--;
     this.line('}');
-    this.line('void VertexBuffer3D_dispose(void* _this) { VertexBuffer3D* o = (VertexBuffer3D*)_this; o->raw = NULL; }');
-    // uploadFromByteArray (stage 87): Starling's VertexData stores vertices as
-    // little-endian float32 in a ByteArray (not Vector.<Number>). Copy the words
-    // straight out of the ByteArray (a single memcpy when its endianness matches
-    // the host's) -- no per-element float decode, because the submit path now
-    // interprets the word according to the attribute format.
-    this.line('void VertexBuffer3D_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, int startVertex, int numVertices) {');
-    this.indent++;
-    this.line('VertexBuffer3D* o = (VertexBuffer3D*)_this;');
-    this.line('if (data == NULL || data->data == NULL) return;');
-    this.line('int stride = o->data32PerVertex;');
-    this.line('if (stride <= 0) return;');
-    this.line('int count = numVertices * stride;');
-    this.line('int avail = data->length - (int)byteArrayOffset;');
-    this.line('int maxCount = avail >= 0 ? avail / 4 : 0;');
-    this.line('if (count > maxCount) count = maxCount;');
-    this.line('if (count <= 0) return;');
-    this.line('int uploaded = count / stride;');
-    this.line('if (uploaded <= 0) return;');
-    this.line('unsigned* dst = VertexBuffer3D_words(o, startVertex * stride + count);');
-    this.line('unsigned char* src = (unsigned char*)data->data + byteArrayOffset;');
-    this.line('unsigned* out = dst + (size_t)startVertex * (size_t)stride;');
-    this.line('if (as_ba_little(data) == as_host_little()) {');
-    this.indent++;
-    this.line('memcpy(out, src, (size_t)count * 4);');
-    this.indent--;
-    this.line('} else {');
-    this.indent++;
-    this.line('for (int i = 0; i < count; i++) out[i] = ((unsigned)src[i*4] << 24) | ((unsigned)src[i*4+1] << 16) | ((unsigned)src[i*4+2] << 8) | (unsigned)src[i*4+3];');
     this.indent--;
     this.line('}');
-    this.line('o->startVertex = startVertex;');
-    this.line('o->numVertices = uploaded;');
-    this.indent--;
-    this.line('}');
-    this.line('void IndexBuffer3D_ctor(IndexBuffer3D* o) { Object_ctor((Object*)o); o->numIndices = 0; o->data = NULL; o->startIndex = 0; }');
+    this.line('void IndexBuffer3D_ctor(IndexBuffer3D* o) { Object_ctor((Object*)o); o->numIndices = 0; o->capacity = 0; o->data = NULL; o->startIndex = 0; }');
     this.line('IndexBuffer3D* IndexBuffer3D_new(void) { IndexBuffer3D* o = (IndexBuffer3D*)gc_alloc(GCT_CLASS, sizeof(IndexBuffer3D)); o->vtable = &IndexBuffer3D_vt; IndexBuffer3D_ctor(o); return o; }');
     this.line('void IndexBuffer3D_uploadFromVector(void* _this, as_vector_uint* data, int startIndex, int numIndices) {');
     this.indent++;
     this.line('IndexBuffer3D* o = (IndexBuffer3D*)_this;');
-    this.line('if (data == NULL || numIndices <= 0) return;');
+    this.line('if (data == NULL) { as_s3d_null_data(); return; }');
+    this.line('if (startIndex < 0 || numIndices < 0) { as_s3d_bad_input(); return; }');
+    this.line('if (startIndex > o->capacity - numIndices) { as_s3d_bad_input(); return; }');
+    // AIR compares the VECTOR's length with count, not with startIndex + count
+    // (measured: a 2-element Vector uploads with startIndex=1/count=2).
+    this.line('if ((long long)numIndices > (long long)data->length) { as_s3d_bad_input(); return; }');
     // AS3 copies the data into the buffer; aliasing the caller's Vector would let a
     // later in-place upload mutate an object the AS3 program still owns. Keep our
     // own copy, indexed by absolute index like uploadFromByteArray.
+    this.line('if (numIndices > 0) {');
+    this.indent++;
     this.line('if (o->data == NULL) { o->data = as_vector_uint_new(); gc_write_barrier((void*)o->data); }');
     this.line('int need = startIndex + numIndices;');
     this.line('if (o->data->length < need) as_vector_uint_setLength(o->data, need);');
@@ -24482,34 +24545,39 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->numIndices = numIndices;');
     this.indent--;
     this.line('}');
+    this.indent--;
+    this.line('}');
     this.line('void IndexBuffer3D_dispose(void* _this) { IndexBuffer3D* o = (IndexBuffer3D*)_this; o->data = NULL; }');
     // uploadFromByteArray (stage 87): Starling's IndexData stores indices as
     // little-endian uint16 (INDEX_SIZE=2) in a ByteArray; widen to uint32 so the
     // submit path (MTLIndexTypeUInt32) reads the same layout as uploadFromVector.
     // Reused across uploads for the same reason as the vertex buffer.
+    //
+    // Validation is the shared contract (see as_s3d_bad_input): a short ByteArray
+    // is #3669, not a shorter upload. The 16-bit words are read little-endian
+    // whatever `data.endian` says -- the reference requires LE and adl accepts a
+    // bigEndian array without complaint.
     this.line('void IndexBuffer3D_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, int startIndex, int numIndices) {');
     this.indent++;
     this.line('IndexBuffer3D* o = (IndexBuffer3D*)_this;');
-    this.line('if (data == NULL || data->data == NULL) return;');
-    this.line('int count = numIndices;');
-    this.line('int avail = data->length - (int)byteArrayOffset;');
-    this.line('int maxCount = avail >= 0 ? avail / 2 : 0;');
-    this.line('if (count > maxCount) count = maxCount;');
-    this.line('if (count <= 0) return;');
-    this.line('int need = startIndex + count;');
+    this.line('if (data == NULL) { as_s3d_null_data(); return; }');
+    this.line('int off = (int)byteArrayOffset;');
+    this.line('if (data->data == NULL || off < 0 || off >= data->length) { as_s3d_bad_input(); return; }');
+    this.line('if (startIndex < 0 || numIndices < 0) { as_s3d_bad_input(); return; }');
+    this.line('if (startIndex > o->capacity - numIndices) { as_s3d_bad_input(); return; }');
+    this.line('if ((long long)numIndices * 2LL > (long long)(data->length - off)) { as_s3d_bad_input(); return; }');
+    this.line('if (numIndices > 0) {');
+    this.indent++;
+    this.line('int need = startIndex + numIndices;');
     this.line('if (o->data == NULL) { o->data = as_vector_uint_new(); gc_write_barrier((void*)o->data); }');
     this.line('if (o->data->length < need) as_vector_uint_setLength(o->data, need);');
-    this.line('unsigned char* src = (unsigned char*)data->data + byteArrayOffset;');
-    this.line('int little = as_ba_little(data);');
+    this.line('const unsigned char* src = (const unsigned char*)data->data + off;');
     this.line('unsigned int* dst = o->data->data + startIndex;');
-    this.line('for (int i = 0; i < count; i++) {');
-    this.indent++;
-    this.line('unsigned v = little ? ((unsigned)src[i*2] | ((unsigned)src[i*2+1] << 8)) : (((unsigned)src[i*2] << 8) | (unsigned)src[i*2+1]);');
-    this.line('dst[i] = (unsigned int)v;');
+    this.line('for (int i = 0; i < numIndices; i++) dst[i] = (unsigned int)src[i*2] | ((unsigned int)src[i*2+1] << 8);');
+    this.line('o->startIndex = startIndex;');
+    this.line('o->numIndices = numIndices;');
     this.indent--;
     this.line('}');
-    this.line('o->startIndex = startIndex;');
-    this.line('o->numIndices = count;');
     this.indent--;
     this.line('}');
     this.line('void Program3D_ctor(Program3D* o) { Object_ctor((Object*)o); o->vertexProgram = NULL; o->fragmentProgram = NULL; o->samplerUsed = 0; o->samplerFlags = 0; }');
@@ -24553,11 +24621,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     // must be real -- a stub would leave every video texture empty.
     this.line('static const uint32_t* as_tex_argb_from_byte_array(ByteArray* data, unsigned int off, int w, int h, char* format, int* out_swizzled) {');
     this.indent++;
-    this.line('int n = w * h;');
-    this.line('if (n < 0) n = 0;');
     this.line('if (out_swizzled != NULL) *out_swizzled = 0;');
     // AIR throws TypeError #2007 for a null ByteArray.
-    this.line('if (data == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter data must be non-null.", 2007)); return NULL; }');
+    this.line('if (data == NULL) { as_s3d_null_data(); return NULL; }');
     // Only 8-bit RGBA/BGRA is consumed. The packed (2 bytes/texel) and float
     // (4 bytes/component) formats would need a different stride, so they are
     // reported loudly rather than read at the wrong stride.
@@ -24567,17 +24633,35 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return NULL;');
     this.indent--;
     this.line('}');
-    this.line('if ((size_t)off >= (size_t)data->length || (size_t)data->length - (size_t)off < (size_t)n * 4) {');
-    this.indent++;
-    this.line('as_throw(RangeError_new((char*)"Error #2004: One of the parameters is invalid.", 2004));');
-    this.line('return NULL;');
-    this.indent--;
-    this.line('}');
-    this.line('const uint32_t* src = (const uint32_t*)((const unsigned char*)data->data + off);');
-    this.line('if (strcmp(format, "bgra") == 0) return src;');
+    // The size check is the shared contract (as_s3d_bad_input -> RangeError
+    // #3669). It used to raise #2004 "One of the parameters is invalid", which is
+    // a RangeError carrying the WRONG error id AND the wrong text: adl 51.4.1
+    // answers every short-byte-array case with "Error #3669: Bad input size."
+    // (measured, temp/s3dupload).
+    this.line('long long n = (long long)w * (long long)h;');
+    this.line('if (n <= 0) return NULL;');
+    this.line('if (data->data == NULL || (long long)off >= (long long)data->length) { as_s3d_bad_input(); return NULL; }');
+    this.line('if ((long long)data->length - (long long)off < n * 4LL) { as_s3d_bad_input(); return NULL; }');
+    this.line('const unsigned char* src = (const unsigned char*)data->data + off;');
+    // Byte-order-free fast path: 0xAARRGGBB in memory reads B,G,R,A on a
+    // little-endian host, i.e. exactly the "bgra" texel layout, so the words can
+    // be sampled in place -- provided the offset is word aligned (a misaligned
+    // uint32_t* would be UB to dereference, and adl accepts off=1 for the index
+    // buffer, so odd offsets are legal input).
+    this.line('if ((off & 3u) == 0u && as_host_little() && strcmp(format, "bgra") == 0) return (const uint32_t*)src;');
+    this.line('int isbgra = strcmp(format, "bgra") == 0;');
     this.line('uint32_t* out = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)n);');
     this.line('if (out == NULL) return NULL;');
-    this.line('for (int i = 0; i < n; i++) { uint32_t v = src[i]; out[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16); }');
+    // Assemble each texel from its BYTES so the copy is correct on either host
+    // byte order and at any alignment: bgra is B,G,R,A and rgba is R,G,B,A, both
+    // landing in the canonical ARGB word.
+    this.line('for (long long i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('unsigned b0 = src[i*4], b1 = src[i*4+1], b2 = src[i*4+2], b3 = src[i*4+3];');
+    this.line('unsigned r = isbgra ? b2 : b0, b = isbgra ? b0 : b2;');
+    this.line('out[i] = (b3 << 24) | (r << 16) | (b1 << 8) | b;');
+    this.indent--;
+    this.line('}');
     this.line('if (out_swizzled != NULL) *out_swizzled = 1;');
     this.line('return out;');
     this.indent--;
@@ -24606,13 +24690,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     // draw exactly like the flag-off one, so the upload pattern IS the rule.
     this.line('if (miplevel != 0) {');
     this.indent++;
-    this.line('if (o->gpu == NULL || bitmapData == NULL || bitmapData->pixels == NULL) return;');
     // The chain extends while max(w,h) >> level >= 1; a level index past it does
-    // not exist (MTLTexture would fault, GL would silently accept an extra level),
-    // so it is rejected here where both backends agree.
+    // not exist. AIR answers ArgumentError #3674 "Miplevel too large." here --
+    // measured, and identical to the uploadFromByteArray rule (temp/s3dupload/
+    // ChainProbe.as: 4x4 bitmap, level 2 = 1x1 succeeds, level 3 and 9 both #3674).
+    // The check therefore sits BEFORE the "nothing to write into yet" guard below:
+    // AIR has no lazy texture handle, so the answer must not depend on our GPU
+    // state, and a pure-CPU build has to report the same error.
     this.line('int nlv = 1, dim = (o->width > o->height) ? o->width : o->height;');
     this.line('while (dim > 1) { dim >>= 1; nlv++; }');
-    this.line('if ((int)miplevel >= nlv) return;');
+    this.line('if ((int)miplevel >= nlv) { as_s3d_mip_too_large(); return; }');
+    // Internal-only short circuit: our texture handle is created lazily by the
+    // level-0 upload, so a level arriving first has nothing to write into.
+    this.line('if (o->gpu == NULL || bitmapData == NULL || bitmapData->pixels == NULL) return;');
     this.line('int lw = o->width >> miplevel; if (lw < 1) lw = 1;');
     this.line('int lh = o->height >> miplevel; if (lh < 1) lh = 1;');
     // A source smaller than the level would be read out of bounds; AIR has the
@@ -24647,13 +24737,38 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void Texture_uploadFromByteArray(void* _this, ByteArray* data, unsigned int byteArrayOffset, unsigned int miplevel) {');
     this.indent++;
     this.line('Texture* o = (Texture*)_this;');
-    // A level > 0 carries its own (smaller) image and would need its own size
-    // validation (the full-texture check above is NOT sufficient for the level's
-    // row stride), so it is reported rather than read out of bounds.
-    this.line('if (miplevel != 0) { as_shell_unsupported("Texture.uploadFromByteArray (mip level > 0)"); return; }');
+    // The null check comes FIRST: adl reports #2007 for null data even when the
+    // mip level is also illegal (measured).
+    this.line('if (data == NULL) { as_s3d_null_data(); return; }');
+    // Mip levels ARE honoured here (adl accepts level > 0 on a non-mipmapped
+    // texture too, so the createTexture flag is not part of the rule). The chain
+    // length is the same one uploadFromBitmapData uses: 1 + floor(log2(max(w,h))).
+    // A level past the end is ArgumentError #3674 "Miplevel too large." -- and that
+    // check runs BEFORE the byte-count check (measured: level 4 on an 8x8 texture
+    // reports #3674 while the array is also too short).
+    this.line('int dim = o->width > o->height ? o->width : o->height;');
+    this.line('int nlv = 1;');
+    this.line('while (dim > 1) { dim >>= 1; nlv++; }');
+    this.line('if (miplevel >= (unsigned int)nlv) { as_s3d_mip_too_large(); return; }');
+    this.line('int lv = (int)miplevel;');
+    this.line('int lw = o->width >> lv; if (lw < 1) lw = 1;');
+    this.line('int lh = o->height >> lv; if (lh < 1) lh = 1;');
     this.line('int sw = 0;');
-    this.line('const uint32_t* px = as_tex_argb_from_byte_array(data, byteArrayOffset, o->width, o->height, o->format, &sw);');
+    // The level's own dimensions drive both the byte-count check and the decode:
+    // level l needs max(w>>l,1) * max(h>>l,1) texels (measured: 8x8 level 1 wants
+    // 64 bytes, level 2 wants 16, level 3 wants 4).
+    this.line('const uint32_t* px = as_tex_argb_from_byte_array(data, byteArrayOffset, lw, lh, o->format, &sw);');
     this.line('if (px == NULL) return;');
+    this.line('if (lv != 0) {');
+    this.indent++;
+    // A sub-level only writes into an EXISTING chain; without a GPU texture there
+    // is nothing to write into (AIR would have uploaded into the GPU object it
+    // always has -- our handle is lazy, so the level is simply not stored).
+    this.line('if (o->ctx != NULL && o->gpu != NULL) { o->mips = 1; as_s3d_texture_upload_level(o->ctx, o->gpu, lv, lw, lh, px, lw); }');
+    this.line('if (sw) free((void*)px);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
     this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
     this.line('o->mips = 0;');
     // The pixel source is not a BitmapData, so drop any previous one: otherwise
@@ -25166,7 +25281,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('(void)_this; (void)bufferUsage;');
     this.line('VertexBuffer3D* b = VertexBuffer3D_new();');
-    this.line('b->numVertices = numVertices; b->data32PerVertex = data32PerVertex;');
+    this.line('b->numVertices = numVertices; b->capacity = numVertices; b->data32PerVertex = data32PerVertex;');
     this.line('return b;');
     this.indent--;
     this.line('}');
@@ -25174,7 +25289,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('(void)_this; (void)bufferUsage;');
     this.line('IndexBuffer3D* b = IndexBuffer3D_new();');
-    this.line('b->numIndices = numIndices;');
+    this.line('b->numIndices = numIndices; b->capacity = numIndices;');
     this.line('return b;');
     this.indent--;
     this.line('}');

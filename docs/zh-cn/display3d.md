@@ -653,6 +653,82 @@ AGENTS.md §1.5 登记为增强（`TODO.md`「增强待做」与该文件的 E17
 `#3683` → `#3684` 的类型变化、复位后恢复）；`test/unit/stage3d.ts` 的
 `stage3d/texture-size-limits` 10 条源级钉子（含「零/幂次检查必须在旗标分支之前」）。
 
+### 9.15 上传入口的边界契约：**不够长就抛错**，不是「能拷多少拷多少」（阶段三百二十）
+
+**这是什么 bug**：`VertexBuffer3D`/`IndexBuffer3D`/`Texture`/`RectangleTexture` 的
+`uploadFromByteArray` 原先都是「按 `data->length` 截断越界」——ByteArray 短了就少传几个顶点、
+少传几个索引，**一句都不报**。这是 §2.5 明禁的静默降级（调用者拿到的是半截几何，画面只是
+「有点不对」）；更糟的是 `startVertex`/`startIndex` 为负时目标指针会走到缓冲区**之前**，
+即一次**越界写**（与 `BitmapData.setPixels` 的越界读同族，阶段三百一十六）。同一个家族还有
+两处：短数组报的是 `#2004 "One of the parameters is invalid."`（错误号与文案都不对），
+以及 `Texture.uploadFromByteArray` 把 `miplevel > 0` 直接报成「本后端不支持」，而 AIR 是真上传。
+
+**先量后改**（`adl 51.4.1`，`temp/s3dupload/`）：`UploadProbe.as` 逐条问 89 个用例，
+`ChainProbe.as` 专问 mip 链。AOT 侧用**同一份用例表**（`examples/dbg-s3dupload.as`）跑出来的
+报告与 `adl` 的报告**逐行 89/89 相同**（`out-upload.txt` vs `aot.txt`）。
+
+| 输入 | AIR 的答案（实测） |
+|---|---|
+| `data == null` | `TypeError #2007`：`Error #2007: Parameter data must be non-null.` |
+| 数组不够长 / 偏移越界 / 负下标 | `RangeError #3669`：`Error #3669: Bad input size.` |
+| `numVertices == 0` / `numIndices == 0` | **成功**（但同一次调用的偏移仍要合法：`off == len, n = 0` 抛 #3669） |
+| `miplevel` 越过 mip 链 | `ArgumentError #3674`：`Error #3674: Miplevel too large.` |
+
+七条不在参考文档里的细节，全部是实测出来的，也全都决定了实现的**形状**：
+
+1. **null 优先于一切**：`null + miplevel = 9` 报 #2007 而不是 #3674，`null + off = -1` 也是 #2007。
+   所以每个入口的第一行就是 null 判定。
+2. **所有尺寸错共用同一个 #3669**（错号与文案都不区分是哪一项），故一条合取式即可，
+   不必逐个报不同的错。
+3. **`startVertex + numVertices` 校验的是 `createVertexBuffer3D` 给的尺寸**，
+   不是本次上传的长度：4 个顶点的缓冲区拒绝 `start = 3, n = 4`，哪怕字节数够（64 字节）。
+   因此 `symbols.ts` 给两个类各加了一个独立的 `capacity` 字段——
+   `numVertices`/`numIndices` 每次上传都会被覆盖成「这次传了多少」，不能拿来当上限。
+   比较写成 `startVertex > capacity - numVertices`（而不是 `startVertex + numVertices > capacity`），
+   这样 `numVertices` 接近 `INT_MAX` 时不会溢出。
+4. **源与目标不对称**：`byteArrayOffset` 决定源从哪里连续读，`startVertex`/`startIndex`
+   只决定**写到哪里**（`off = 16, n = 2` 在 64 字节数组上成功）。`uploadFromVector` 同理，
+   而且更明显：源**恒从 `data[0]` 读**——只有 1 个顶点的 Vector 配 `startVertex = 1, n = 1`
+   也成功。旧实现按 `data[startVertex * stride]` 起读，既是越界读又与 AIR 不符。
+5. **Vector 的长度对照 `numVertices`，不是 `startVertex + numVertices`**：
+   2 个元素的 Vector 配 `startIndex = 1, n = 2` 成功。
+6. **`data.endian` 被刻意忽略**：参考文档要求小端 ByteArray，而 `adl` 接受 `bigEndian`
+   且照样按小端读字节——所以只有**宿主**字节序参与判断，尊重该标志等于把 AIR 原样透传的
+   数据翻个个儿。
+7. **mip 链长 = `1 + floor(log2(max(w, h)))`**，且**与 `createTexture` 的 `mipmapped` 标志无关**
+   （非 mipmapped 纹理照样接受 `level > 0`）：4×4 有 3 级（level 2 要 1×1×4 = 4 字节）、
+   8×8 有 4 级、8×2 与 2×8 也是 4 级（按 `max` 取，不是 `min`）。每个 level 需要的字节数
+   按**该级自己的尺寸**算（8×8 的 level 1 要 64 字节、level 2 要 16、level 3 要 4），
+   链检查**先于**字节数检查。`uploadFromBitmapData` 用的是同一条链规则，越界同样抛 #3674
+   （这条原先也是静默 `return`，本轮一并改掉，并且检查提到「GPU 句柄还没建」的短路之前——
+   AIR 没有惰性句柄，答案不该取决于我方 GPU 状态）。
+
+**实现**（`src/emit.ts`）：三个铸造器 `as_s3d_null_data` / `as_s3d_bad_input` /
+`as_s3d_mip_too_large`，六条入口（VB×2、IB×2、`Texture`、`RectangleTexture` 共享的
+`as_tex_argb_from_byte_array`）全部走同一套判定。纹理按字节装配成 ARGB 字（`bgra` 是
+`B,G,R,A`、`rgba` 是 `R,G,B,A`），只有「偏移 4 字节对齐 + 宿主小端 + `bgra`」这一档才原地
+取指针——非对齐的 `uint32_t*` 解引用是 UB，而 `adl` 确实接受奇数偏移。
+`0` 长度的合法上传**不改动**缓冲区自己的窗口（`startVertex`/`numVertices` 保持上一次的值），
+否则后续 `drawTriangles` 会拿到 0 个顶点。
+
+**回归钉**：`examples/s3d-upload-bounds.as`（4 个类 × 越界/空/零长/边界恰好，加两条语义：
+`startVertex` 只影响目标、`bigEndian` 被忽略，覆盖上面第 3～7 条的边界值）；
+`unit: stage3d/upload-bounds`（24 钉，钉的是「每个入口都调同一个铸造器」这个**结构**，
+因为同一语义在 `emit.ts` 里有六个独立分支，示例只能覆盖其中一部分输入）。
+
+**变异验证 12/12 全红**（`temp/s3dupload/mutate2.cjs` + `mutate3.cjs`）：目标偏移 /
+源偏移 / 源改回 `data[startVertex*stride]` / VB 的 capacity 窗口 / IB 的 capacity 窗口 /
+texture 的链检查 / 用整幅尺寸算 level 字节数 / 尊重 `endian` / null 换成别的错号 /
+VB、IB 的长度改成按 `start + count` 校验。**其中一条曾被误判**：把 `if (as_host_little())`
+改成 `else` 分支仍按小端装配，在小端主机上与 `memcpy` **完全等价**，那不是变异——
+必须让 `else` 真按大端装配才测得出来（`mutate3.cjs` 的形状）。
+
+**未做（如实报明）**：`CubeTexture.uploadFromByteArray` 仍是**响亮**的
+`as_shell_unsupported`（立方体六面必须一次性齐备，`createCubeTexture` 不给 `ctx` 句柄）；
+非 8 位纹理格式（`compressed`/float）报明「本构建不支持」而不是按错的步长读；
+`level > 0` 的上传在**惰性 GPU 句柄还没建**时（先传 level 1 再传 level 0）会被静默跳过——
+AIR 上不存在这个状态（它创建时就有 GPU 纹理），这是本后端惰性句柄的内部差别，已写进注释。
+
 ## 10. Windows / Direct3D 12 后端（阶段一百三十二 落地）
 
 第三份后端 `vendor/stage3d_d3d.cc`（~2,290 行）与 `stage3d_glue.mm`（Metal）/**结构同形**：同一套 `s3d_*` ABI、

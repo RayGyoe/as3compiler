@@ -7456,6 +7456,15 @@ export class SymbolTable {
       this.classMap.set('VertexBuffer3D', {
         fields: new Map([
           ['numVertices', vbf({ kind: 'int' })],
+          // Size passed to createVertexBuffer3D, kept SEPARATE from numVertices:
+          // an upload rewrites numVertices with the uploaded extent, while AIR
+          // validates `startVertex + numVertices` against the CREATED size
+          // (measured, temp/s3dupload: a 4-vertex buffer rejects
+          // startVertex=3/numVertices=4 with RangeError #3669 even though the
+          // byte count is sufficient). Without this field there is nothing to
+          // validate against -- which is how a negative startVertex used to walk
+          // the destination pointer BEFORE the buffer.
+          ['capacity', vbf({ kind: 'int' })],
           ['data32PerVertex', vbf({ kind: 'int' })],
           // Vertex payload as raw 32-bit GPU words (Vector.<uint>), one per
           // component. A vertex buffer is bytes on the GPU: the attribute format
@@ -7492,6 +7501,11 @@ export class SymbolTable {
       this.classMap.set('IndexBuffer3D', {
         fields: new Map([
           ['numIndices', ibf({ kind: 'int' })],
+          // Same reason as VertexBuffer3D.capacity: AIR rejects
+          // `startIndex + numIndices > createIndexBuffer3D(numIndices)` with
+          // RangeError #3669 (measured), and numIndices itself is overwritten by
+          // every upload.
+          ['capacity', ibf({ kind: 'int' })],
           ['data', ibf({ kind: 'vector', elem: { kind: 'uint' } })],
           ['startIndex', ibf({ kind: 'int' })],
         ]),

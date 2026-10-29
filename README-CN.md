@@ -544,6 +544,10 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   必须真的画出像素、改像素后跟着变」（纯 C 构建用 `TextField` 探针判断有无光栅后端，无则跳过显示列表段；需
   `examples/bitmap-setpixels-endian.build.json` 链 Skia）
 - `examples/stage83.as` — Stage3D 对齐加固（CubeTexture/RectangleTexture、render-to-texture 像素断言、实例化绘制）
+- `examples/s3d-upload-bounds.as` — 六个上传入口的边界契约（实测对齐 `adl`：`data == null` →
+  `TypeError #2007`、尺寸/偏移/负数越界 → `RangeError #3669`、`miplevel` 越过链 → `ArgumentError #3674`，
+  零长度合法但偏移仍校验；`startVertex` 只决定**写到哪**、源恒从 `byteArrayOffset`/`data[0]` 读；
+  `capacity` 对照 `createVertexBuffer3D` 的尺寸而不是本次长度；`data.endian` 实测被 AIR 忽略）
 - `examples/stage3d-profile.as` — `Stage3D.requestContext3D(context3DRenderMode, profile)` 两参签名与 7 个 `Context3DProfile`
   常量（含 `ENHANCED`）；非法 `renderMode`/`profile` 是**同步** `#2008`（AIR 文案逐字，且 `renderMode` 先于 `profile`
   校验）；回读 `profile` 报本构建真正能兑现的最高档（现为 `"baselineExtended"`），外加 `createTexture`/
