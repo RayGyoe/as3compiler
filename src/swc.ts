@@ -2131,15 +2131,19 @@ export interface SwcBakePlacement {
   matrix: number[] | null;
   cxform: number[] | null;
   /**
-   * The clipDepth mask that clips this child, as the mask's own placement in the
-   * PARENT's pixel space. The mask is a sibling of the objects it clips, so its
-   * region does not follow them: the renderer applies this path before the child's
-   * own transform (see Emitter.emitRenderWalk).
+   * The clipDepth mask that clips this child: the DEPTH of the mask object, a
+   * SIBLING in the same parent (the mask is itself a child in AIR -- it is never
+   * painted, but it IS in the display list, which is what keeps our child count
+   * and index order equal to AIR's).
    *
-   * The mask character itself is never painted (AIR hides the mask object) and
-   * therefore never appears in `children`. Absent/null = the child is not masked.
-   */
-  mask?: { charId: number; matrix: number[] } | null;
+   * Only the reference is baked; the geometry is NOT. The renderer builds the
+   * stencil from the LIVE mask object every frame, which is the whole point of
+   * 阶段三百一十九: a MorphShape mask follows its PlaceObject2 Ratio, a sprite
+   * mask contributes the union of its children (holes kept), and a mask the
+   * timeline moves carries its clip along. A baked outline could do none of the
+   * three -- it froze the frame-1 geometry, so every animated mask was stuck.
+   *
+   * Absent/null = the child is not masked.  mask?: { charId: number; depth: number } | null;
   /**
    * The placement carries `PlaceObject3` `Visible = 0`, so AIR creates the object
    * but leaves it hidden. Measured on `adl 51.4.1` (`temp/vishidden/`):
@@ -2276,6 +2280,20 @@ export interface SwcBakeFrameOp {
   visible?: boolean;
   /** `PlaceObject2` `Ratio`: re-morph the MorphShape at this depth. */
   ratio?: number;
+  /**
+   * The record declares a `clipDepth` mask at this depth: from this frame on the
+   * object at `depth` clips the siblings in (`depth`, `clipDepth`]. The mask
+   * object itself is placed by the SAME record (it is an ordinary child in AIR),
+   * so the applier re-points the covered siblings at it once the placement is in
+   * the list.
+   */
+  mask?: { depth: number; clipDepth: number };
+  /**
+   * The depth USED to hold a mask and no longer does (its character was replaced
+   * by a record without ClipDepth, or the depth was removed): the siblings it
+   * clipped must stop being stencilled.
+   */
+  maskOff?: number;
   filters?: SwcFilter[];
   blendMode?: string;
   bitmapCached?: boolean;
@@ -2540,16 +2558,15 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
    *  placement at the same depth, then sort by depth (Flash paints depth order).
    *
    *  A `clipDepth` record is a MASK: AIR does not paint it, and it clips the
-   *  siblings inside its depth range. The mask is therefore kept out of the
-   *  children list and attached to each child it covers instead, with its matrix
-   *  already composed into that child's local space. */
-  /** Mask shapes we cannot express as a path clip: charId -> its kind. */
-  const maskNotes = new Map<number, string>();
+   *  siblings inside its depth range. The mask object STAYS in the children list
+   *  (AIR reports it as a child) and each covered child is told which DEPTH masks
+   *  it, so the renderer builds the stencil from the live object every frame
+   *  (阶段三百一十九). */
   const spriteChildren = (sp: SwcSprite): SwcBakePlacement[] => {
     const firstFrameEnd = sp.frameStarts.length > 0 ? sp.frameStarts[0] : sp.placements.length;
     const byDepth = new Map<number, SwcBakePlacement>();
-    /** depth -> the mask record sitting at that depth (charId + matrix in px). */
-    const masks = new Map<number, { charId: number; clipDepth: number; matrix: number[] | null }>();
+    /** depth -> the mask record declared at that depth, and what it clips. */
+    const masks = new Map<number, { charId: number; clipDepth: number }>();
     for (let i = 0; i < firstFrameEnd; i++) {
       const p = sp.placements[i];
       if (p.charId === null) {
@@ -2569,7 +2586,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
         continue;
       }
       if (p.clipDepth !== null) {
-        masks.set(p.depth, { charId: p.charId, clipDepth: p.clipDepth, matrix: pxMatrix(p.matrix) });
+        masks.set(p.depth, { charId: p.charId, clipDepth: p.clipDepth });
         // The mask record is ALSO a child: AIR keeps the mask object in the display
         // list with `visible == true` and its own bounds, it simply does not paint
         // it (measured, temp/childfx: loginskin has 9 children in AIR / 8 without
@@ -2594,31 +2611,18 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       child.depth = depth;
       // The innermost (last-written) mask covering this depth wins, matching the
       // "a later record overrides" rule the rest of the frame follows.
-      let mask: { charId: number; matrix: number[] | null } | null = null;
-      for (const [md, m] of masks) if (md < depth && depth <= m.clipDepth) mask = m;
+      let mask: { charId: number; depth: number } | null = null;
+      for (const [md, m] of masks) if (md < depth && depth <= m.clipDepth) mask = { charId: m.charId, depth: md };
       if (mask !== null) {
-        if (shapeById.has(mask.charId)) {
-          // The clip path is the mask's outline in the PARENT's pixel space (the
-          // mask's own placement matrix, nothing more). A clipDepth mask is a
-          // sibling of the objects it clips, so it stays put while they move;
-          // composing it into the child's local pixels instead (bake-time
-          // `inverse(childMatrix) * maskMatrix`) made the mask travel with the
-          // child -- the TalkMED login ticker, whose fixed mask is supposed to
-          // reveal the slide the film has slid to, showed only the first slide
-          // (local == parent only while the film is at x=0) and blank afterwards.
-          // The renderer sets this path BEFORE the object's own transform.
-          child.mask = { charId: mask.charId, matrix: mask.matrix === null ? [1, 0, 0, 1, 0, 0] : mask.matrix };
-        } else if (!maskNotes.has(mask.charId)) {
-          // A mask that is a sprite or a morph shape cannot be turned into a path
-          // clip here (AIR uses the mask's rendered alpha, which our path clip
-          // cannot express). Report it loudly — but as a NOTE, not by marking the
-          // character unsupported: the mask object is still a child (see above), and
-          // marking it unsupported would drop the character entirely, including from
-          // every other place the same character is used as an ordinary child.
-          maskNotes.set(mask.charId, lib.characters.get(mask.charId)?.kind ?? '?');
-        }
+        // The clip is the mask's LIVE ink, so no character kind is excluded any
+        // more: a shape, a morph (阶段三百一十七) and a sprite all work, because
+        // the renderer walks whatever the mask object currently draws. What used
+        // to be reported as "cannot be expressed as a path clip" was the baked
+        // outline, which is gone.
+        child.mask = { charId: mask.charId, depth: mask.depth };
       }
       out.push(child);
+
     }
     return out;
   };
@@ -2642,8 +2646,19 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
    */
   const frameNotes: string[] = [];
   let ratioOps = 0;
+  /**
+   * depth -> clipDepth, as currently declared by the frames walked so far. Seeded
+   * from frame 1 (which `spriteChildren` bakes) and updated by every later mask
+   * record, so a place record that does NOT redeclare the mask can retire it.
+   *
+   * A clipDepth declaration is not a per-record decoration: it changes which
+   * siblings the mask object clips, so the applier needs it as an op of its own
+   * (see `as_swc_tl_mask`).
+   */
   const spriteFrames = (sp: SwcSprite): SwcBakeFrame[] => {
     const firstFrameEnd = sp.frameStarts.length > 0 ? sp.frameStarts[0] : sp.placements.length;
+    /** depth -> clipDepth for THIS sprite (see the comments out there). */
+    const maskRanges = new Map<number, number>();
     /** depth -> the character placed there and the transform it currently has. */
     const state = new Map<number, { charId: number; matrix: number[] | null }>();
     for (let i = 0; i < firstFrameEnd; i++) {
@@ -2654,6 +2669,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       }
       const prev = state.get(p.depth);
       state.set(p.depth, { charId: p.charId, matrix: p.matrix !== null ? pxMatrix(p.matrix) : (prev?.matrix ?? null) });
+      if (p.clipDepth !== null) maskRanges.set(p.depth, p.clipDepth);
     }
     const frames: SwcBakeFrame[] = [];
     for (let f = 2; f <= sp.frames; f++) {
@@ -2664,18 +2680,13 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       const byDepth = new Map<number, SwcBakeFrameOp>();
       for (let i = start; i < end; i++) {
         const p = sp.placements[i];
-        if (p.clipDepth !== null) {
-          frameNotes.push(
-            `sprite #${sp.id} frame ${f}: a clipDepth mask record appears after frame 1; only frame-1 masks are ` +
-            `baked, so the depth-${p.depth} mask object is not applied to its sibling range (swc.md §10)`
-          );
-          continue;
-        }
         if (p.charId === null) {
           if (!p.move) {
-            // Remove: the depth goes empty from this frame on.
+            // Remove: the depth goes empty from this frame on. If that depth held
+            // a mask, the siblings it clipped are released (there is nothing left
+            // to stencil with).
             state.delete(p.depth);
-            byDepth.set(p.depth, { depth: p.depth, del: true });
+            byDepth.set(p.depth, { depth: p.depth, del: true, maskOff: maskRanges.delete(p.depth) ? p.depth : undefined });
             continue;
           }
           const op = byDepth.get(p.depth) ?? { depth: p.depth, modCharId: state.get(p.depth)?.charId };
@@ -2692,12 +2703,17 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
           // A morph timeline animates NOTHING but the ratio for up to 100 frames
           // (skin.swc `#215`/`#388`/`#476`), so this field alone must produce an op.
           if (p.ratio !== null) { op.ratio = p.ratio; ratioOps++; }
+          // A modify may also (re)declare the clipDepth range. Like a place record
+          // it is a field in its own right: a mask that only changes its range
+          // carries nothing else, so this must survive the no-op guard below.
+          if (p.clipDepth !== null) { op.mask = { depth: p.depth, clipDepth: p.clipDepth }; maskRanges.set(p.depth, p.clipDepth); }
           // A record that carries no field we can apply must not produce an op:
           // the object is already alive from an earlier frame, so a no-op op would
           // only bloat the emitted applier.
           if (op.matrix === undefined && op.cxform === undefined && op.hidden === undefined &&
               op.visible === undefined && op.filters === undefined && op.blendMode === undefined &&
-              op.bitmapCached === undefined && op.name === undefined && op.ratio === undefined) {
+              op.bitmapCached === undefined && op.name === undefined && op.ratio === undefined &&
+              op.mask === undefined) {
             byDepth.delete(p.depth);
             continue;
           }
@@ -2711,8 +2727,22 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
         // A replace inherits the transform/cxform the record omits (see above).
         const matrix = p.matrix !== null ? pxMatrix(p.matrix) : (prev?.matrix ?? null);
         state.set(p.depth, { charId: p.charId, matrix });
+        /**
+         * A place record that carries ClipDepth is a MASK DECLARATION, and it also
+         * places its character: AIR puts the mask object in the display list like
+         * any other child and clips (depth, clipDepth] with it. Dropping the record
+         * (which is what 阶段三百一十七 had to do) lost the object as well -- the
+         * frame-100 swap of `skin_fla.元件77_50` left the clip one child short.
+         */
+        const maskDecl = p.clipDepth !== null
+          ? { mask: { depth: p.depth, clipDepth: p.clipDepth } }
+          : maskRanges.has(p.depth)
+            ? { maskOff: p.depth }
+            : {};
+        if (p.clipDepth !== null) maskRanges.set(p.depth, p.clipDepth);
+        else maskRanges.delete(p.depth);
         byDepth.set(p.depth, {
-          depth: p.depth, charId: p.charId, replace: prev !== undefined || undefined, matrix,
+          depth: p.depth, charId: p.charId, replace: prev !== undefined || undefined, matrix, ...maskDecl,
           cxform: p.cxform,
           ratio: p.ratio ?? undefined,
           name: p.name ?? undefined,
@@ -2917,16 +2947,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
     );
   }
 
-  // The placeholders are a tree-shape match, not text rendering: say so once,
-  // loudly, instead of letting an empty label look like a decoding bug.
-  for (const [mid, kind] of maskNotes) {
-    notes.push(
-      `clipDepth mask character #${mid} (${kind}) cannot be expressed as a path clip: AIR masks with the ` +
-      `rendered alpha of a ${kind}, which our path clip cannot reproduce. The mask object itself keeps its ` +
-      `place in the display list (not painted, matching AIR), but the siblings in its depth range are drawn ` +
-      `UNCLIPPED (swc.md §10)`
-    );
-  }
+
   const morphChars = characters.filter((c) => c.kind === 'morph');
   if (morphChars.length > 0) {
     // A POSITIVE statement now: the geometry is decoded and the ratio applies. It

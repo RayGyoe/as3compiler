@@ -548,11 +548,16 @@ morph 就是「同一条矢量在两端之间的线性插值」。SWF 规范要�
   帧 1 也是回退路径，它会复用同 `(depth, 字符)` 的对象；不重置就残留末帧几何（修复前
   `gotoAndStop(99)` 再回 `1`，`getRect.x` 停在 `-4.95` 而不是 `-92.90`）。
 
-**⑥ 已知缺口（明确不是「已完成」的部分）**
+**⑥ 逐帧 `clipDepth` 遮罩（阶段三百一十九，v0.4.280）**
 
-- 帧尾把某个 depth 换成**另一个字符**（本库帧 100 把 morph 换成 `char73`）依赖**逐帧 clipDepth
-  遮罩**记录，属阶段三；当前是「删掉旧子件、不补新子件」，`numChildren` 会少 1。
-- morph 当 `clipDepth` 遮罩时仍无法表达为路径裁剪，一句 `notes` 报明，同属阶段三。
+上面两条曾经是缺口，现由 §9.2 F12 收口：遮罩不再是烘焙期算好的静态轮廓，而是**每帧从活着的
+遮罩兄弟对象重建** `as_clip_path(_clip_src)`，因此
+
+- 帧尾把某个 depth 换成**另一个字符**（本库帧 100 把 morph 换成 `char73`）会**照常补上**
+  新子件并重新武装遮罩区间，`numChildren` 两端都是 4（与 `adl` 一致）；
+- morph 当遮罩可用（轮廓即它**当前** ratio 的绘制几何，见 F12 的偏差说明）；
+- sprite 当遮罩取**子件并集**（洞保留），时间轴移动遮罩时裁剪区跟着走。
+
 - **AIR 侧没有 AS3 出口能读到当前 ratio**（唯一出口是像素），而本库的 morph 全是遮罩，因此
   `examples/swc-morph.as` 只能钉显示盒契约；插值本身由 `test/unit/render.ts` 的
   `unit: render/SwcMorph` 逐条钉发射形态（含 `as_swc_lerp` 的实现体，因为「lerp 忽略 t」在
@@ -1821,6 +1826,59 @@ vtable 由 `… NULL, -1, "AIAsrComBox", 0, 0, 0, …` 变为
 6 条两态变异全部命中（`temp/task4/mutate.cjs`），`src/swc.ts`/`abc.ts`/`emit.ts`/`runtime.ts`
 还原后 sha256 逐一一致。
 
+### 9.2 F12 逐帧 `clipDepth` 遮罩：活对象引用 + 每帧重建 stencil（阶段三百一十九，v0.4.280）
+
+**问题**：`clipDepth` 遮罩此前在**烘焙期**被算成一条静态轮廓 `_clip_path`（子件局部像素），
+只能表达「帧 1 的那个遮罩、那个位置、那个几何」。`skin.swc` 里三种真形态因此全错：
+
+| 形态 | 例（`lib/skin.swc`） | 旧行为 |
+|---|---|---|
+| morph 当遮罩 | `skin_fla.元件77_50` depth 2 = `char70`(morph) `clipDepth=4` | 一句 `notes` 报明 ⇒ **整块被裁空**（stencil 为空），同深度兄弟全消失 |
+| sprite 当遮罩 | `char127`(sprite) `clipDepth=5` | `notes` 报明 ⇒ 无裁剪 |
+| 帧尾换字符 | 同上 sprite 帧 100 把 depth 2 换成 `char73`(shape)，`clipDepth` 仍是 4 | 记录被 `continue` 丢掉 ⇒ **既不换字符也不重建遮罩**，`numChildren` 4→3 |
+
+**做法**（`src/swc.ts` → `src/emit.ts` → `src/symbols.ts`）：
+
+1. 烘焙只记**深度**：`SwcBakePlacement.mask = { charId, depth }`（`placement.mask` 不再带矩阵），
+   `SwcBakeFrameOp` 增加 `mask?: { depth, clipDepth }` / `maskOff?: number`；区间表
+   `maskRanges` 改为**每个 sprite 一份**（放进 `spriteFrames` 函数体）。
+2. 帧 1 装配后，`emitSwcMaskWiring` 在**子件全部建好之后**再走一遍，把
+   `child->_clip_src = <遮罩对象>; gc_write_barrier(child);`（`_clip_src` 是 `DisplayObject*`，
+   进 props 反射表 ⇒ GC 会走它）。帧 2..N 由 `as_swc_tl_mask(parent, maskDepth, clipDepth)` 改写，
+   区间按 SWF 规范 `(maskDepth, clipDepth]`，`clipDepth <= 0` = 退订（换字符/删除都走这里）。
+3. 渲染侧 `as_render_object` 在 `save` 之后、对象 `translate` **之前**取
+   `as_clip_path(o->_clip_src)`：`as_do_matrix(mask)` + `as_mask_ink` + `as_skia_path_close_all`。
+   遮罩活在**父空间**（它是被遮对象的兄弟），所以只用遮罩自己的 placement 矩阵。
+
+**根因二（才是「整块被裁空」的真凶）**：stencil 必须只是遮罩**会上色**的几何。morph `#70` 的
+`Graphics` 里除填充组外还有一组`stroke` 宽度为 0 的描边，轮廓与填充**完全重合**；两条等高轮廓在
+stencil 里互相抵消（even-odd 无条件抵消；改成 nonzero 也**没有**救回来，实测），于是 stencil 变空
+⇒ 被遮兄弟全被裁掉。修法：`as_mask_ink` 只收集 `fill != NULL || stroke_width > 0` 的组（顶层
+`g->path` 同守卫），每组至多加一次。
+
+**实测（`adl` 51.4.1 vs AOT，像素签名为遮罩子件独有的 teal `0x00948c` 计数）**
+
+| 探针 | `adl` | AOT（修后） |
+|---|---|---|
+| `loginskin`（纯 shape 遮罩）整块 ink | `177000 px` | `177000 px`，bbox 差 1px 抗锯齿 |
+| `元件77_50` 帧 1，遮罩 `x=0` / `x=40` | `0` / `0`（`x=40` 时窗口露出 `88` 宽） | `0` / `194`（同样随 `x` 平移 `10 px / 20 px`） |
+| 帧 1 vs 帧 99（morph ratio 0 → 1） | **两者相同**（只有帧 100 换 `char73` 才变） | 帧 99 窗口右移（比例 64874/65535） |
+| 帧 100 `numChildren` / 遮罩 `x=100` | `4` / `0 px` | `4` / `0 px` |
+
+**★ 已知偏差（如实报明，不静默）**：`adl` 的 `clipDepth` stencil 对 **morph 遮罩不跟随 ratio** ——
+`Teal2` 探针里 `gotoAndStop` 到 1/2/3/5/10/20/50/80/99 的 teal 分布**逐字节相同**，只有帧 100
+换字符后才变；而 AIR 自己**画**这个 morph 时是按当前 ratio 画的（阶段三百一十七的像素对照）。
+我们选择让 stencil 跟**当前**几何走（遮罩与画面自洽）。同一探针的 AOT 侧因此帧 99 与帧 1 不同。
+若将来要复刻 AIR 的「冻结起始形」，做法是给 `as_clip_path` 的 morph 分支换用 `_mdecl` 声明盒
+矩形 `[-92.9,-10 .. 0.0,31.6]`（`as_swc_morph_70` 的 `as_swc_clip` 一侧），实测该矩形与 `adl`
+帧 1 的 `clipdbg` 完全一致。
+
+**回归**：`examples/swc-mask-frames.as`（真 `skin.swc`，帧 1/99/100 × 遮罩平移 + `loginskin`
+`177000 px`）＋ `test/unit/render.ts` 的 `unit: render/SwcClipMaskPerFrame`（14 钉：烘焙只记深度、
+`maskOff`/重武装两路、`_clip_src` 与 GC barrier、区间 `(maskDepth, clipDepth]`、退订清引用、
+`as_clip_path` 的矩阵/闭合、`_clip_path` 彻底消失、`as_mask_ink` 的「只收上色组」）。
+6 条变异全部命中（`temp/mask3/mutate.cjs`：不闭合轮廓 / 区间改闭 / 退订不清引用 / 恢复零宽描边组 /
+`maskOff` 不发 / 帧 1 不 wire）。
 ## 10. 明确延后 / 限制
 
 | 项 | 原因 |
@@ -1845,7 +1903,7 @@ vtable 由 `… NULL, -1, "AIAsrComBox", 0, 0, 0, …` 变为
 | `DefineBitsJPEG4`（tag 90） | 实测 `examples/embed-assets/skin.swc` 无；与 JPEG3 同族（tag 35 **已支持**，§3.2③），随手支持即可。**注意**：`CHARACTER_TAG_KINDS` 已把它归为 `bitmap`，但提取器只处理 20/21/35/36 ⇒ 真遇到 tag 90 会在 `swcBakePlan` 的位图分支上以一句**误导性**的 `bitmap fill references missing bitmap #N` 失败（应按 JPEG4 报明） |
 | ~~九宫格缩放（`DefineScalingGrid`，实测 22 个）~~ **已实现**（§9 F/§9.2 F1）；但 **AS3 侧的 `DisplayObject.scale9Grid` 属性尚未实现** | 工程只从 SWF tag 烘焙九宫格，运行时**没有**可读写的 `scale9Grid` 属性（AIR 有）。即：SWF 皮肤里的缩放不会糊，但用户代码无法自己设置/查询它。 已按 §1.5 记入 `TODO.md` 的 `### 遗留待开发` |
 | `BitmapData.draw(source, matrix)` 对 source **自身变换**的处理与 AIR 不同 | 实测 `adl`：给被绘对象设 `o.scaleX = 2` 在 `draw(source, matrix)` 中**无效**（只受 `matrix` 参量影响）； 我们的实现会应用它。探针因此统一改为先包一层容器再 draw。**未定案**，记入 `### 遗留待开发` |
-| ~~形变 shape（`DefineMorphShape`/`2`，实测 6 个）~~ **已实现**（§3.4⑦，阶段三百一十七，v0.4.278） | 两端几何逐点插值 + `PlaceObject2.Ratio` 驱动；显示盒按 AIR 实测钉在**起始形**。**剩余缺口**：morph 当 `clipDepth` 遮罩、帧尾「删旧换新」都依赖逐帧遮罩记录 ⇒ 归阶段三，现状是一句 `notes` 报明 + 少一个子件 |
+| ~~形变 shape（`DefineMorphShape`/`2`，实测 6 个）~~ **已实现**（§3.4⑦，阶段三百一十七，v0.4.278） | 两端几何逐点插值 + `PlaceObject2.Ratio` 驱动；显示盒按 AIR 实测钉在**起始形**。morph 当 `clipDepth` 遮罩与帧尾「删旧换新」已由**逐帧遮罩记录**收口（§9.2 F12，v0.4.280）。**唯一已知偏差**：AIR 的遮罩 stencil 对 morph **不跟随 ratio**（f1..f99 同框，只有帧 100 换字符才变；实测见 F12），我们跟随当前 ratio —— 见下条 |
 | ~~按钮四态（`DefineButton2`，实测 29 个）~~ **已实现**（§9 F/§9.2 F2） | `ButtonRecord.states` 位掩码 + 绘制时状态机（`as_sbtn_state`）；离屏与 `adl` 逐像素一致 |
 | 时间轴动画（`DefineSprite` 多帧 + `FrameLabel`）~~ **已实现**（§9.2 F6，v0.4.68） | 逐帧差值（增/替/改/删）在编译期烘焙，`gotoAndStop`/`nextFrame`/`prevFrame`/`currentLabels` 与 `adl` 逐项一致（68 行 0 差异）；79 个多帧 sprite / 514 个 op / 89 条 `FrameLabel`；回到旧帧按「同一 (父, 深度, 角色) 复用子件」对齐（阶段一百七十二，D43）。**残留**：① 时间轴子件的 `name` 恒 `null`（AIR 自动命名 `instanceN`，SWF 记录里没有 `Name` 字段）；② 帧脚本（DoABC）**自 v0.4.127 起由编译期解码并真的执行**（§3.3 收口）—— 皮肤符号里的 `stop()` 就是文件里写着的，执行它才是对齐 AIR（此前「一律停在第 1 帧」的那条旧描述已作废）；③ morph 时间轴的 `Ratio` 记录被丢弃（morph 是空占位子件）；④ 前进方向「`Move` + 新字符」AIR 保留原对象身份而我方换新对象（D43b，烘培类一个角色一个类所致） |
 | MovieClip 按钮态的**结算时机** | 三种按钮态在**绘制/指纹 pass** 结算（与 `as_sbtn_state` 同一口径），因此一个从不 `render`、也没有窗口的离屏程序里，`dispatchMouse` 之后 `currentFrame` 不会自己变；真实 App（窗口每帧走这条 pass）与 `stage.render` 下行为与 `adl` 逐档一致（§9.2 F8） |

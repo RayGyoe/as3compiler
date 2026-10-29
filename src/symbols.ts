@@ -1508,6 +1508,16 @@ export class SymbolTable {
         // the renderer would otherwise walk the whole tree per object per frame. A
         // plain bool, so it never holds a GC pointer and needs no write barrier.
         ['_mask_user', { type: { kind: 'bool' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
+        // The clipDepth mask that clips this object (阶段三百一十九): a SIBLING in the
+        // same parent, whose ink becomes this object's stencil. A baked outline used
+        // to live here instead (_clip_path, a non-GC SkPath); a reference to the LIVE
+        // mask object replaces it so a MorphShape mask follows its PlaceObject2 Ratio,
+        // a sprite mask contributes the union of its children, and a mask the
+        // timeline moves drags its clip along. Declared as a DisplayObject pointer
+        // (not `void*`) on purpose: the props table is what the GC scans, so the mask
+        // is marked through this field, and every write site pairs it with
+        // gc_write_barrier.
+        ['_clip_src', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'DisplayObject', isStatic: false, isConst: false }],
         // DisplayObject.cacheAsBitmapMatrix: the Matrix the caller last set (NULL
         // when never set). A private backing slot for the same reason as _mask_ref --
         // the AS3-visible property is the accessor pair. Unlike _mask_ref this one

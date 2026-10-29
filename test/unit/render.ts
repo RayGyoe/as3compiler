@@ -693,9 +693,10 @@ function checkSwcTimeline(): string[] {
   // OPEN. Skia fills an open contour implicitly but its AA clipper drops it, so a
   // clipDepth mask built straight from that path clipped the whole region away (the
   // TalkMED login banner painted blank). Every contour must be closed first.
+  // 阶段三百一十九 replaced the bake-time outline with a per-frame stencil built
+  // from the LIVE mask object, so the closing step moved into as_clip_path.
   check('a clipDepth mask path closes every contour before becoming a clip',
-    c.includes('static void* as_swc_clip_path_new(void* src, double a, double b, double c, double d, double tx, double ty) {') &&
-    /void\* p = as_skia_path_new\(\);\s*as_skia_path_add_transformed\(p, src, a, b, c, d, tx, ty\);\s*as_skia_path_close_all\(p\);/.test(c));
+    /static void\* as_clip_path\(DisplayObject\* m\) \{[\s\S]{0,400}?as_mask_ink\(m, p, a, b, c, d, tx, ty\);\s*as_skia_path_close_all\(p\);/.test(c));
   // A clipDepth mask is a SIBLING of what it clips, so it must not travel with it:
   // the clip is set before the object's translate/rotate/scale (parent space).
   // The window (rather than an exact-adjacency regex) is deliberate: statements may be
@@ -703,7 +704,8 @@ function checkSwcTimeline(): string[] {
   // with the saveLayerAlpha restore) without changing what this pin is about.
   const clipBlock = /as_skia_canvas_save\(canvas\);[\s\S]{0,1200}?as_skia_canvas_translate\(canvas, o->x, o->y\);/.exec(c);
   check('the clipDepth clip is applied BEFORE the object transform',
-    !!clipBlock && clipBlock[0].includes('if (clip_on) as_skia_canvas_clip_path(canvas, o->_clip_path, 1);'));
+    !!clipBlock && clipBlock[0].includes('if (o->_clip_src != NULL) {') &&
+    clipBlock[0].includes('as_skia_canvas_clip_path(canvas, cclip, 1);'));
   // The MovieClip runtime calls as_swc_bind long before the bake defines it, and a
   // build with NO swc has no bake to define it: the stub is what keeps it linking.
   const plain = generateC(parse('import flash.display.MovieClip;\nvar m:MovieClip = new MovieClip();\nm.gotoAndStop(2);\n')).c;
@@ -2154,3 +2156,120 @@ function checkSwcMorphEmit(): string[] {
   return bad;
 }
 registerGroup('unit: render/SwcMorph', checkSwcMorphEmit);
+// ---------------------------------------------------------------------------
+// unit: render/SwcClipMaskPerFrame -- clipDepth masks are LIVE per frame.
+//
+// Before 阶段三百一十九 the baker froze frame 1's mask outline into a static
+// `_clip_path`, which could not express three things the skin actually uses: a MORPH
+// mask (its geometry follows PlaceObject2's Ratio), a SPRITE mask (the union of its
+// children), and a mask the timeline moves or replaces. The baker now records only the
+// mask's DEPTH; the renderer rebuilds the stencil from the live object every frame.
+//
+// The pixel contract lives in `examples/swc-mask-frames.as` (real skin.swc against
+// adl 51.4.1); this group pins the wiring that makes it work.
+// ---------------------------------------------------------------------------
+function checkSwcClipMaskPerFrame(): string[] {
+  const bad: string[] = [];
+  // Three frames: depth 2 masks depths 3..4 with shape 70, frame 2 REPLACES depth 2
+  // with a plain shape (the mask is retired), frame 3 puts the mask back.
+  const place = (depth: number, charId: number | null, move: boolean, clipDepth: number | null) => ({
+    depth, charId, move, name: null, matrix: charId === null ? null : [1, 0, 0, 1, 0, 0],
+    cxform: null, clipDepth, hidden: false, visibleFlag: null, ratio: null, filters: [], skippedFilters: [],
+  });
+  const lib = {
+    source: 'probe',
+    bitmaps: [],
+    shapes: [69, 70, 71, 73].map((id) => ({
+      id, version: 4, bounds: { xmin: 0, xmax: 200, ymin: 0, ymax: 100 }, winding: false,
+      layers: [{ fills: [{ type: 0 }, { type: 0 }], lines: [] }],
+      subpaths: [{
+        layer: 0, fill0: 1, fill1: 1, line: 0, moveToFirst: true,
+        start: { x: 0, y: 0 },
+        pts: [{ x: 0, y: 0 }, { x: 200, y: 0 }, { x: 200, y: 100 }, { x: 0, y: 100 }, { x: 0, y: 0 }],
+      }],
+    })),
+    morphs: [],
+    sprites: [{
+      id: 74,
+      frames: 3,
+      labels: [],
+      frameStarts: [3, 4, 5],
+      placements: [
+        place(1, 69, false, null),
+        place(2, 70, false, 4),
+        place(3, 71, false, null),
+        place(2, 73, false, null),
+        place(2, 73, false, 4),
+      ],
+    }],
+    buttons: [],
+    texts: [],
+    fonts: new Map(),
+    scalingGrids: new Map(),
+    classNames: new Map([[74, 'probeFrameMask']]),
+    characters: new Map([[69, { kind: 'shape' }], [70, { kind: 'shape' }], [71, { kind: 'shape' }], [73, { kind: 'shape' }], [74, { kind: 'sprite' }]]),
+    scripts: new Map(),
+    bases: new Map(),
+  } as unknown as SwcLibrary;
+
+  const inputs = swcCompileInputs(lib);
+  const bake = swcBakePlan(lib, inputs.specs, inputs.chars);
+  const prog = parse('var _pad:int = 0;\n');
+  prog.body.push(...inputs.decls);
+  const c = generateC(prog, [], inputs.specs, bake).c;
+  const check = (label: string, cond: boolean): void => { if (!cond) bad.push(label); };
+
+  // ---- bake: the frame-1 wiring knows the mask's DEPTH, not its geometry ----
+  const sprite = bake.characters.find((ch) => ch.kind === 'sprite' && ch.id === 74) as
+    { children?: { depth: number; mask?: { charId: number; depth: number } | null }[]; frames?: { ops: unknown[] }[] } | undefined;
+  const masked = sprite?.children?.find((ch) => ch.depth === 3);
+  check('the frame-1 child records the mask as { charId, depth } (no baked outline)',
+    masked !== undefined && masked.mask !== undefined && masked.mask !== null &&
+    masked.mask.depth === 2 && masked.mask.charId === 70 && !('matrix' in masked.mask));
+  const frames = (sprite?.frames ?? []) as { ops: { mask?: { depth: number; clipDepth: number }; maskOff?: number; del?: boolean }[] }[];
+  const f2 = frames[0]?.ops ?? [];
+  const f3 = frames[1]?.ops ?? [];
+  check('a later frame that drops the clipDepth releases the range (maskOff)',
+    f2.some((op) => op.maskOff === 2) && !f2.some((op) => op.mask !== undefined));
+  check('a later frame that re-declares it re-arms the range (mask)',
+    f3.some((op) => op.mask !== undefined && op.mask.depth === 2 && op.mask.clipDepth === 4));
+
+  // ---- emit: the frame-1 child is wired straight to its sibling object ----
+  check('the sprite builder points the clipped child at the mask OBJECT (GC-barriered)',
+    c.includes('// sprite-74: depth 3 is clipped by the mask object at depth 2.') &&
+    c.includes('{ c2->_clip_src = c1; gc_write_barrier((void*)c2); }'));
+  check('a mask is never painted itself', c.includes('c1->_mask_object = true;'));
+  check('the timeline re-arms and retires the range through as_swc_tl_mask',
+    c.includes('as_swc_tl_mask((DisplayObject*)o, 2, 4);') && c.includes('as_swc_tl_mask((DisplayObject*)o, 2, 0);'));
+  // The SWF range is the OPEN-LOW interval (maskDepth, clipDepth]: the mask itself is
+  // in it neither as a stencilled object nor as a stencil target.
+  check('as_swc_tl_mask uses the (maskDepth, clipDepth] range of the SWF spec',
+    c.includes('if (m != NULL && c->_tl_depth > maskDepth && c->_tl_depth <= clipDepth) { c->_clip_src = m; gc_write_barrier((void*)c); }'));
+  check('as_swc_tl_mask releases only the stencil that belonged to that depth',
+    c.includes('else if (c->_clip_src != NULL && c->_clip_src->_tl_depth == maskDepth) c->_clip_src = NULL;'));
+  check('retiring the mask finds the depth first (clipDepth <= 0 means "no mask")',
+    c.includes('DisplayObject* m = clipDepth > 0 ? as_swc_tl_find(p, maskDepth) : NULL;'));
+
+  // ---- emit: the stencil is rebuilt from the live object ----
+  check('as_clip_path maps the mask into parent space and closes the contours',
+    /static void\* as_clip_path\(DisplayObject\* m\) \{[\s\S]{0,400}?as_do_matrix\(m, &a, &b, &c, &d, &tx, &ty\);/.test(c) &&
+    /static void\* as_clip_path\(DisplayObject\* m\) \{[\s\S]{0,400}?as_mask_ink\(m, p, a, b, c, d, tx, ty\);\s*as_skia_path_close_all\(p\);/.test(c));
+  // 'sk_canvas_clip_path' is the GLUE entry point and stays: what must be gone is the
+  // baked field and its builder.
+  check('the baked static outline is gone (no _clip_path field survives)',
+    !c.includes('o->_clip_path') && !c.includes('as_swc_clip_path_new'));
+  check('_clip_src is a DisplayObject* prop (so the GC walks it)',
+    c.includes('{ "_clip_src", 11, offsetof(DisplayObject, _clip_src), (void*)&DisplayObject_vt, "flash.display::DisplayObject", 1, 0, 0 }'));
+
+  // ---- the stencil is the mask's PAINTED geometry ----
+  // Measured on skin.swc #74: the morph mask carries a second group that strokes the
+  // same rectangle with width 0, and adding that invisible outline as well made the
+  // stencil empty -- the masked sibling went blank while adl kept it.
+  check('as_mask_ink only collects groups that actually paint',
+    c.includes('if (dr->fill == NULL && (dr->stroke == NULL || dr->stroke_width <= 0.0)) continue;'));
+  check('as_mask_ink adds the open tail group only when it paints too',
+    c.includes('if (g->fill != NULL || (g->stroke != NULL && g->strokeWidth > 0.0)) as_skia_path_add_transformed(p, g->path, a, b, c, d, tx, ty);'));
+
+  return bad;
+}
+registerGroup('unit: render/SwcClipMaskPerFrame', checkSwcClipMaskPerFrame);

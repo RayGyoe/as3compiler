@@ -630,6 +630,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/displaylist-removechildren.as` — `removeChildren()` 的 AIR 口径：**从 beginIndex 升序**摘、`endIndex` **含**端点（adl 实测四子件 A..D 五种区间），以及在 `removedFromStage` 里摘后加兄弟仍然有效（真应用关闭会议时 `VideoRootView.removeStage()` 正是这么做）；末端另钉 `hitTestPoint(…, true)` **不**受 `scrollRect` 裁剪
 - `examples/scrollrect-coordinates.as` — `scrollRect` 对 `localToGlobal/globalToLocal/getBounds/getRect/hitTestPoint` 的自身与祖先平移在**下一帧渲染**生效，赋值当次仍读旧串接矩阵（adl 51.4.1 实测）
 - `examples/display-mask.as` — `DisplayObject.mask` 是**二值模板**：遮罩的 `alpha` 与 `visible` 都被忽略、覆盖取遮罩自己的祖先链、子件并集保洞、遮罩本身不上屏也不参与命中、不影响 `getBounds` 却影响 `hitTestPoint`（adl 51.4.1 实测，`docs/zh-cn/skia.md` §6.15）
+- `examples/swc-mask-frames.as` — `clipDepth` 遮罩是**活对象引用**、stencil 每帧从遮罩兄弟对象重建：morph 遮罩随 `PlaceObject2.Ratio` 变形、sprite 遮罩取子件并集、时间轴移动/替换遮罩都跟着走（帧 100 换字符后 `numChildren` 仍是 4，与 adl 一致；morph 遮罩跟随 ratio 是**刻意保留**的偏差，见 `docs/zh-cn/swc.md` §9.2 F12）
 - `examples/stage94t.as` — `int64`/`uint64` 64 位整数（增强，见 `docs/zh-cn/enhancements.md` §4.7）
 - `examples/textline.as` — `TextField.getLineMetrics` / `TextLineMetrics`
 - `examples/bytearray-index.as` — `ByteArray` 下标形式的完整语义

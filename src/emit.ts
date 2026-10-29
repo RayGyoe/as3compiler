@@ -19,45 +19,7 @@ export function as3Gap(kind: string, what: string): boolean {
   return true;
 }
 
-/** One baked clipDepth mask the emitter must emit: a mask shape plus the affine
- *  that maps its local pixels into the masked object's local pixels. */
-interface SwcMaskRef {
-  symbol: string;
-  charId: number;
-  matrix: number[];
-}
 
-/** Identity of a mask: the same shape + matrix is emitted (and cached) once. */
-const swcMaskKey = (charId: number, matrix: number[]): string => `${charId}|${matrix.join(',')}`;
-
-/**
- * Every clipDepth mask a baked tree uses, in a deterministic order. Collected up
- * front because each needs a forward declaration before the character builders
- * that reference it (C99: no implicit declarations) and one definition shared by
- * all the placements that use it.
- */
-function collectSwcMasks(bake: SwcBake): SwcMaskRef[] {
-  const out: SwcMaskRef[] = [];
-  const byKey = new Map<string, SwcMaskRef>();
-  for (const ch of bake.characters) {
-    const lists = ch.kind === 'sprite'
-      ? [ch.children ?? []]
-      : ch.kind === 'button'
-        ? [ch.button?.up ?? [], ch.button?.over ?? [], ch.button?.down ?? [], ch.button?.hit ?? []]
-        : [];
-    for (const list of lists) {
-      for (const p of list) {
-        if (!p.mask) continue;
-        const key = swcMaskKey(p.mask.charId, p.mask.matrix);
-        if (byKey.has(key)) continue;
-        const ref: SwcMaskRef = { symbol: `as_swc_mask_${p.mask.charId}_${out.length}`, charId: p.mask.charId, matrix: p.mask.matrix };
-        byKey.set(key, ref);
-        out.push(ref);
-      }
-    }
-  }
-  return out;
-}
 
 // Declarations owned by the module (top-level script) scope: AS3 hoists every
 // `var`/`const` written anywhere in the top-level statement tree — including one
@@ -1759,11 +1721,9 @@ export class Emitter {
           this.line('uint32_t _auto_fp;');
           this.line('int _auto_still;');
           this.line('int _auto_baked;');
-          // clipDepth mask path (SkPath*, non-GC) in THIS object's local pixels:
-          // a DefineSprite may mask a child with another character's outline
-          // (swc.md §9 E-4). NULL = unmasked. Non-AS3-visible, C-runtime only,
-          // emitted here so the offset is identical in every subclass.
-          this.line('void* _clip_path;');
+          // The clipDepth stencil needs no field here: the masked object points at
+          // the mask SIBLING through `_clip_src` (declared in the DisplayObject
+          // symbol table, so the GC marks it) and the path is rebuilt per frame.
           // DefineScalingGrid (swc.md §9 F). `_s9_on` is 1 only on characters the
           // author gave a 9-slice splitter; the rect is in the object's own local
           // pixels. `_s9_image` caches the object's natural-size bake so the 9
@@ -8234,19 +8194,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       // fires during a backward navigation, but the call sites are unconditional).
       this.line('static DisplayObject* as_swc_tl_new(DisplayObject* parent, int depth, int charId);');
       this.line('static void as_swc_tl_link(DisplayObject* parentD, DisplayObject* c, int depth);');
-    }    // Every clipDepth mask (one per mask shape + matrix). Prototypes first because
-    // the character builders below call them and C99 rejects an implicit
-    // declaration.
-    const masks = collectSwcMasks(bake);
-    const maskKey = new Map<string, string>();
-    for (const m of masks) maskKey.set(swcMaskKey(m.charId, m.matrix), m.symbol);
-    const maskSymbol = (m: { charId: number; matrix: number[] }): string => {
-      const sym = maskKey.get(swcMaskKey(m.charId, m.matrix));
-      if (sym === undefined) throw new Error(`emit: mask #${m.charId} was not collected`);
-      return sym;
-    };
-    for (const m of masks) this.line(`static void* ${m.symbol}(void);`);
-    this.line('');
+    }
     for (const ch of bake.characters) {
       if (ch.kind === 'shape' && ch.shape !== undefined) this.emitSwcShapeBuilder(ch.shape);
     }
@@ -8254,9 +8202,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.swcMorphIds = new Set(morphChars.map((c) => c.id));
     for (const ch of morphChars) this.emitSwcMorphBuilder(ch.morph as SwcBakeMorph);
     this.emitSwcMorphApply(morphChars.map((c) => ({ id: c.id })));
-    for (const m of masks) this.emitSwcMaskBuilder(m);
     for (const ch of bake.characters) {
-      if (ch.kind === 'sprite' || ch.kind === 'button') this.emitSwcCharBuilder(ch, maskSymbol);
+      if (ch.kind === 'sprite' || ch.kind === 'button') this.emitSwcCharBuilder(ch);
     }
     this.emitSwcFactories(bake);
     this.emitSwcTimelineHelpers(bake);
@@ -8321,6 +8268,31 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('int at = p->children->length;');
     this.line('for (int i = 0; i < p->children->length; i++) { DisplayObject* s = (DisplayObject*)as_v_obj_val(p->children->data[i]); if (s != NULL && s->_tl_depth > depth) { at = i; break; } }');
     this.line('DisplayObjectContainer_addChildAt((void*)p, c, at);');
+    this.indent--;
+    this.line('}');
+    // A clipDepth DECLARATION, as a timeline op. The mask object sits at `maskDepth`
+    // and clips exactly the siblings whose Flash depth is in (maskDepth, clipDepth]
+    // -- the SWF spec's range, and what AIR does. `clipDepth <= 0` retires the
+    // declaration: the depth was replaced by a plain character or removed, so the
+    // siblings it used to clip must stop being stencilled.
+    //
+    // Only the REFERENCE is (re)pointed here; the stencil is rebuilt from the live
+    // object at paint time (as_clip_path), so a mask that is itself a morph keeps
+    // tracking its ratio.
+    this.line('static void as_swc_tl_mask(DisplayObject* parentD, int maskDepth, int clipDepth) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* p = (DisplayObjectContainer*)parentD;');
+    this.line('if (p == NULL || p->children == NULL) return;');
+    this.line('DisplayObject* m = clipDepth > 0 ? as_swc_tl_find(p, maskDepth) : NULL;');
+    this.line('if (m != NULL) m->_mask_object = true;');
+    this.line('for (int i = 0; i < p->children->length; i++) {');
+    this.indent++;
+    this.line('DisplayObject* c = (DisplayObject*)as_v_obj_val(p->children->data[i]);');
+    this.line('if (c == NULL || c->_tl_depth == 0) continue;');
+    this.line('if (m != NULL && c->_tl_depth > maskDepth && c->_tl_depth <= clipDepth) { c->_clip_src = m; gc_write_barrier((void*)c); }');
+    this.line('else if (c->_clip_src != NULL && c->_clip_src->_tl_depth == maskDepth) c->_clip_src = NULL;');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('static void as_swc_tl_del(DisplayObject* parentD, int depth) {');
@@ -8545,6 +8517,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   private emitSwcTimelineOp(name: string, op: SwcBakeFrameOp): void {
     if (op.del) {
       this.line(`as_swc_tl_del(o, ${op.depth});`);
+      if (op.maskOff !== undefined) this.line(`as_swc_tl_mask((DisplayObject*)o, ${op.maskOff}, 0);`);
       return;
     }
     if (op.charId !== undefined) {
@@ -8571,6 +8544,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.line(`if (${name} != NULL) as_swc_tl_put(o, ${name}, ${op.depth});`);
       this.indent--;
       this.line('}');
+      // AFTER the placement is in the list: the mask record places its own character
+      // (a mask object is an ordinary child in AIR), and the range it clips is
+      // expressed against the depths that now exist.
+      if (op.mask !== undefined) this.line(`as_swc_tl_mask((DisplayObject*)o, ${op.mask.depth}, ${op.mask.clipDepth});`);
+      else if (op.maskOff !== undefined) this.line(`as_swc_tl_mask((DisplayObject*)o, ${op.maskOff}, 0);`);
       return;
     }
     // Modify: only the fields the record carries, applied to the object the
@@ -8612,6 +8590,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.indent--;
     this.line('}');
+    // A MODIFY can redeclare the range too (it needs no character of its own).
+    if (op.mask !== undefined) this.line(`as_swc_tl_mask((DisplayObject*)o, ${op.mask.depth}, ${op.mask.clipDepth});`);
+    else if (op.maskOff !== undefined) this.line(`as_swc_tl_mask((DisplayObject*)o, ${op.maskOff}, 0);`);
   }
 
   /** Paint constructors + the two group setters every shape builder calls. */
@@ -8707,28 +8688,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // A morph shape REPORTS its start bounds at every ratio while its rasterisation
     // clip stays the union of both ends (see the Graphics `_mdecl` field).
     this.line('static void as_swc_morph_decl(Graphics* g, double x, double y, double w, double h) { g->_mdecl = 1; g->_ml = x; g->_mt = y; g->_mw = w; g->_mh = h; }');
-    // clipDepth mask (swc.md §9 E-4): copy a shape's outline into a fresh SkPath,
-    // transformed into the masked object's local pixels. The bake plan already
-    // composed inverse(childMatrix) * maskMatrix, so the renderer clips with the
-    // result verbatim. The path lives as long as the program (one per mask+matrix),
-    // which is why the caller caches it in a function-local static.
-    //
-    // The contours must be CLOSED before the path becomes a clip (阶段一百四十六). A
-    // SWF outline expresses its closure only as "the last point coincides with the
-    // first" -- there is no close verb in the edge records -- and Skia fills such a
-    // contour implicitly, so fills always looked right. Its AA clipper does not:
-    // an open contour contributes no area, so a clip path built from one clipped the
-    // ENTIRE region away and every clipDepth-masked sibling of the TalkMED login
-    // skin (banner included) painted blank white.
-    this.line('static void* as_swc_clip_path_new(void* src, double a, double b, double c, double d, double tx, double ty) {');
-    this.indent++;
-    this.line('void* p = as_skia_path_new();');
-    this.line('as_skia_path_add_transformed(p, src, a, b, c, d, tx, ty);');
-    this.line('as_skia_path_close_all(p);');
-    this.line('return p;');
-    this.indent--;
-    this.line('}');
-    this.line('');
+    // clipDepth masks no longer get a baked path here: the stencil is built from
+    // the LIVE mask object by `as_clip_path` at paint time (阶段三百一十九), which
+    // is what lets a morph mask follow its Ratio and a sprite mask contribute the
+    // union of its children. `as_skia_path_close_all` moved there with it.
   }
 
 /**
@@ -9047,28 +9010,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('');
   }
-  /**
-   * One clipDepth mask: build the mask shape's outline once, transformed into the
-   * PARENT's pixels by the mask's own placement matrix. `matrix` comes straight
-   * from the baker (the mask record's own placement), and the renderer sets the
-   * result BEFORE the masked object's transform, so the region stays fixed while
-   * the object moves underneath it. Cached in a function-local static: a mask is
-   * constant for the lifetime of the program, and `as_swc_shape_*` allocates a
-   * Graphics.
-   */
-  private emitSwcMaskBuilder(m: SwcMaskRef): void {
-    this.line(`// clipDepth mask: shape #${m.charId} clips the siblings inside its depth range.`);
-    this.line(`static void* ${m.symbol}(void) {`);
-    this.indent++;
-    this.line('static void* p = NULL;');
-    this.line(`if (p == NULL) { Graphics* mg = Graphics_new(); as_swc_shape_${m.charId}(mg);`);
-    const mm = m.matrix.map((v) => this.formatDouble(v)).join(', ');
-    this.line(`  p = as_swc_clip_path_new(mg->path, ${mm}); }`);
-    this.line('return p;');
-    this.indent--;
-    this.line('}');
-    this.line('');
-  }
+
 
   /** A sprite/button character: build its frame-1 children (button: four states). */
   /**
@@ -9086,7 +9028,37 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line(`as_swc_child_name((void*)(${parent}), "${this.escapeCString(p.name)}", (void*)${child});`);
   }
 
-  private emitSwcCharBuilder(ch: SwcBakeCharacter, maskSymbol: (m: { charId: number; matrix: number[] }) => string): void {
+  /**
+   * Point every masked child at the mask SIBLING that clips it.
+   *
+   * Only the REFERENCE is wired here. The stencil is built at paint time from the
+   * live mask object (`as_clip_path`), so a MorphShape mask follows its Ratio, a
+   * sprite mask contributes the union of its children (holes kept), and a mask the
+   * timeline moves drags its clip along — three things a baked outline could not
+   * do, because it froze the frame-1 geometry of one character.
+   *
+   * The mask sits at a LOWER depth than the objects it clips, and the builder has
+   * already emitted every child variable, so this is a second pass: both ends of
+   * the assignment exist by then.
+   */
+  private emitSwcMaskWiring(list: SwcBakePlacement[], varOf: (i: number) => string, tag: string): void {
+    const idxByDepth = new Map<number, number>();
+    list.forEach((p, i) => { if (p.depth !== undefined) idxByDepth.set(p.depth, i); });
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (!p.mask) continue;
+      const mi = idxByDepth.get(p.mask.depth);
+      // No child at the mask's depth means its character could not be instantiated;
+      // the bake notes already say so, and there is nothing to stencil with.
+      if (mi === undefined) continue;
+      const o = varOf(i);
+      const m = varOf(mi);
+      this.line(`// ${tag}: depth ${p.depth ?? 0} is clipped by the mask object at depth ${p.mask.depth}.`);
+      this.line(`if (${o} != NULL && ${m} != NULL) { ${o}->_clip_src = ${m}; gc_write_barrier((void*)${o}); }`);
+    }
+  }
+
+  private emitSwcCharBuilder(ch: SwcBakeCharacter): void {
     this.line(`// SWC ${ch.kind} character #${ch.id}.`);
     this.line(`static void as_swc_build_${ch.id}(DisplayObject* o) {`);
     this.indent++;
@@ -9112,9 +9084,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           this.line(`DisplayObject* ${state}_${i} = as_swc_new(${p.charId});`);
           this.emitSwcPlacement(`${state}_${i}`, p);
           this.emitSwcChildName(`${state}_${i}`, p, state);
-          if (p.mask) this.line(`if (${state}_${i} != NULL) ${state}_${i}->_clip_path = ${maskSymbol(p.mask)}();`);
           this.line(`if (${state}_${i} != NULL) DisplayObjectContainer_addChild((void*)${state}, ${state}_${i});`);
         });
+        // A clipDepth mask is a SIBLING: point each covered child at the LIVE mask
+        // object instead of at a baked outline (which froze frame 1's geometry).
+        this.emitSwcMaskWiring(list, (i) => `${state}_${i}`, `state-${state}`);
       }
       this.line('SimpleButton* b = (SimpleButton*)o;');
       this.line('b->upState = (DisplayObject*)up; gc_write_barrier((void*)up);');
@@ -9143,7 +9117,6 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.emitSwcPlacement(`c${i}`, p);
       this.emitSwcPlacementAttrs(`c${i}`, p, i);
       this.emitSwcChildName(`c${i}`, p, 'o');
-      if (p.mask) this.line(`if (c${i} != NULL) c${i}->_clip_path = ${maskSymbol(p.mask)}();`);
       // The Flash depth the child was placed at: a later frame's timeline op
       // addresses the object by depth, exactly like AIR (item ③).
       if (depth !== undefined) this.line(`if (c${i} != NULL) c${i}->_tl_depth = ${depth};`);
@@ -9154,6 +9127,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       if (p.hidden) this.line(`if (c${i} != NULL) c${i}->visible = false;`);
       this.line(`if (c${i} != NULL) ${reuseHere ? `as_swc_tl_link(o, c${i}, ${depth})` : `DisplayObjectContainer_addChild((void*)o, c${i})`};`);
     }
+    this.emitSwcMaskWiring(ch.children ?? [], (i) => `c${i}`, `sprite-${ch.id}`);
     this.indent--;
     this.line('}');
     this.line('');
@@ -11925,7 +11899,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_auto_fp = 0;');
     this.line('o->_auto_still = 0;');
     this.line('o->_auto_baked = 0;');
-    this.line('o->_clip_path = NULL;');
+    this.line('o->_clip_src = NULL;');
     this.line('o->_s9_on = 0;');
     this.line('o->_s9_apply = 0;');
     this.line('o->_s9x = 0.0; o->_s9y = 0.0; o->_s9w = 0.0; o->_s9h = 0.0;');
@@ -19830,8 +19804,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('Graphics* g = as_graphics_of(o);');
     this.line('if (g != NULL) {');
     this.indent++;
-    this.line('for (as_gdraw* dr = (as_gdraw*)g->draws; dr != NULL; dr = dr->next) as_skia_path_add_transformed(p, dr->path, a, b, c, d, tx, ty);');
-    this.line('if (g->path != NULL) as_skia_path_add_transformed(p, g->path, a, b, c, d, tx, ty);');
+    // Only groups that PAINT contribute: a group with no fill and no (or a
+    // zero-width) stroke is invisible, and adding its outline anyway made the
+    // stencil wrong rather than merely redundant. Measured on skin.swc sprite #74,
+    // whose morph mask #70 carries a second group that strokes the same rectangle
+    // with width 0: the two coincident contours CANCEL (even-odd does so
+    // unconditionally, and a nonzero fill rule did not rescue it either --
+    // measured), so the stencil came out empty and every masked sibling was clipped
+    // away (the clipDepth banner went blank while adl kept it). The rule is
+    // therefore "the stencil is the mask's PAINTED pixels", which is what AIR paints.
+    //
+    // A group is added at most once regardless of how many of its two channels
+    // paint, so a real stroke plus a fill on one path still contributes one outline.
+    this.line('for (as_gdraw* dr = (as_gdraw*)g->draws; dr != NULL; dr = dr->next) {');
+    this.indent++;
+    this.line('if (dr->fill == NULL && (dr->stroke == NULL || dr->stroke_width <= 0.0)) continue;');
+    this.line('as_skia_path_add_transformed(p, dr->path, a, b, c, d, tx, ty);');
+    this.indent--;
+    this.line('}');
+    this.line('if (g->fill != NULL || (g->stroke != NULL && g->strokeWidth > 0.0)) as_skia_path_add_transformed(p, g->path, a, b, c, d, tx, ty);');
     this.indent--;
     this.line('}');
     // A Bitmap/TextField mask has no vector outline. AIR stencils with its PIXELS; we
@@ -19846,7 +19837,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_path_add_rect(box, bl, bt, br - bl, bb - bt);');
     this.line('as_skia_path_add_transformed(p, box, a, b, c, d, tx, ty);');
     this.line('as_skia_path_delete(box);');
-    this.line('as_shell_unsupported("DisplayObject.mask whose mask is a Bitmap/TextField (stencilled by its box, not its pixels)");');
+    this.line('as_shell_unsupported("a Bitmap/TextField used as a mask (stencilled by its box, not its pixels)");');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -19887,6 +19878,33 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_to_stage_matrix(m, &ma, &mb, &mc, &md, &mtx, &mty);');
     this.line('double a, b, c, d, tx, ty;');
     this.line('as_mat_mul(ia, ib, ic, id, itx, ity, ma, mb, mc, md, mtx, mty, &a, &b, &c, &d, &tx, &ty);');
+    this.line('void* p = as_skia_path_new();');
+    this.line('as_mask_ink(m, p, a, b, c, d, tx, ty);');
+    this.line('as_skia_path_close_all(p);');
+    this.line('return p;');
+    this.indent--;
+    this.line('}');
+    // The clipDepth stencil (swc.md §9 E-4), in the PARENT space `as_render_object`
+    // clips in. Both the mask and the masked object are children of one container,
+    // so the mask's own local transform is the whole mapping -- no chain inversion
+    // is needed here (unlike DisplayObject.mask, whose mask may hang elsewhere).
+    //
+    // It is built from the LIVE mask object every frame, which is the point of
+    // 阶段三百一十九: a sprite mask contributes the union of its children (holes
+    // kept), a mask the timeline moves carries its clip along, and one the timeline
+    // replaces stencils with the NEW character. A morph mask therefore follows its
+    // PlaceObject2 Ratio -- a deliberate, measured deviation: adl 51.4.1 keeps the
+    // ratio-0 outline for the stencil (Teal2: frames 1..99 identical under
+    // gotoAndStop, only the frame-100 replacement changed the window) even though
+    // AIR paints the morph itself at the current ratio. See swc.md §10. The contours must be CLOSED before the
+    // path becomes a clip (阶段一百四十六): a SWF outline expresses closure only as
+    // "last point == first point", and Skia's AA clipper ignores an open contour, so
+    // an unclosed mask erased the whole region instead of clipping it.
+    this.line('static void* as_clip_path(DisplayObject* m) {');
+    this.indent++;
+    this.line('if (m == NULL) return NULL;');
+    this.line('double a, b, c, d, tx, ty;');
+    this.line('as_do_matrix(m, &a, &b, &c, &d, &tx, &ty);');
     this.line('void* p = as_skia_path_new();');
     this.line('as_mask_ink(m, p, a, b, c, d, tx, ty);');
     this.line('as_skia_path_close_all(p);');
@@ -26952,14 +26970,23 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->_scroll_render_y = o->_scroll_rect != NULL ? o->_scroll_rect->y : 0.0;');
     // clipDepth mask (swc.md §9 E-4): the mask is a SIBLING, so its region lives in
     // the PARENT's pixel space and must NOT follow this object as it moves. The clip
-    // therefore goes on BEFORE the object's own translate/rotate/scale, and the baked
-    // path is the mask's placement in that same parent space (阶段一百四十六).
+    // therefore goes on BEFORE the object's own translate/rotate/scale (阶段一百四十六).
     // Composing it into the object's local pixels instead made the mask travel with
     // the object -- the TalkMED login ticker (banner x = -(index-1)*354 under a fixed
     // mask) showed only the first slide and blank afterwards.
+    //
+    // The path is REBUILT here from the live mask object (阶段三百一十九) rather than
+    // read from a bake-time outline, so a morph mask tracks its ratio and a mask the
+    // timeline moves takes its clip with it. It is scratch: SkCanvas::clipPath copies
+    // it, hence the delete.
     this.line('as_skia_canvas_save(canvas);');
-    this.line('int clip_on = (o->_clip_path != NULL);');
-    this.line('if (clip_on) as_skia_canvas_clip_path(canvas, o->_clip_path, 1);');
+    this.line('if (o->_clip_src != NULL) {');
+    this.indent++;
+    this.line('void* cclip = as_clip_path(o->_clip_src);');
+
+    this.line('if (cclip != NULL) { as_skia_canvas_clip_path(canvas, cclip, 1); as_skia_path_delete(cclip); }');
+    this.indent--;
+    this.line('}');
     // DisplayObject.mask stencils the object with the mask's ink, in the same PARENT
     // space and at the same point in the pipeline as the clipDepth clip above (see the
     // measurement table in as_mask_path): a mask is a sibling, so it must not follow

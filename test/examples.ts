@@ -418,6 +418,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // AIR 把 MorphShape 的 width/height/getBounds/getRect 钉在 ratio 0 的起始形上（实测），
   // 而几何本身随 Ratio 插值。它同样要读 skin.swc，故与 swc-bitmap.as 用同一份清单。
   'swc-morph.as': ['--manifest', join(dir, 'swc-bitmap.build.json')],
+  // swc-mask-frames.as（阶段三百一十九）钉的是 clipDepth 遮罩的**逐帧**契约：遮罩不再是
+  // 烘焙期算好的静态轮廓，而是每帧从活着的遮罩兄弟对象重建 —— 所以 morph 当遮罩会随
+  // PlaceObject2 的 Ratio 变形，帧 100 换字符后新遮罩照样生效，且换字符那一帧不再丢掉
+  // 一个子件（AIR 两端都是 4 个子件）。它读 skin.swc，复用 swc-bitmap.as 的清单。
+  'swc-mask-frames.as': ['--manifest', join(dir, 'swc-bitmap.build.json')],
   // bitmap-setpixels-endian.as（阶段二百一十六）断言两件事：setPixels 必须按
   // `ByteArray.endian` 解析 32 位字（真应用 ANEVideo 的摄像头帧是 libyuv 的
   // B,G,R,A，靠 littleEndian 声明），以及「`new BitmapData` + setPixels 填出来的
@@ -452,6 +457,7 @@ const EXAMPLE_REQUIRES: Record<string, string> = {
   'swc-shape.as': join(dir, 'embed-assets', 'skin.swc'),
   'swc-mc-button.as': join(dir, 'embed-assets', 'skin.swc'),
   'swc-morph.as': join(dir, 'embed-assets', 'skin.swc'),
+  'swc-mask-frames.as': join(dir, 'embed-assets', 'skin.swc'),
 };
 
 // Why the extension-bearing example units (`ane/`, `ane-app/`) are skipped instead

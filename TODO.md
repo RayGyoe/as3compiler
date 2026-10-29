@@ -1505,6 +1505,37 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 
 ---
 
+### 阶段三百一十九：逐帧 `clipDepth` 遮罩 —— 遮罩是**活对象引用**，stencil 每帧重建（v0.4.279 → v0.4.280）
+
+背景：`clipDepth` 遮罩此前在**烘焙期**算成静态轮廓 `_clip_path`，只能表达「帧 1 的遮罩、那个位置、那个几何」。
+`lib/skin.swc` 里三种真形态因此全错：morph 当遮罩（`skin_fla.元件77_50` depth 2 = `char70`，`clipDepth=4`）
+以前一句 `notes` 报明后**整块被裁空**；sprite 当遮罩（`char127`）无裁剪；帧 100 把 depth 2 换成 `char73`
+的记录被 `continue` 丢掉 ⇒ 既不换字符也不重武装遮罩，`numChildren` 4→3。
+
+- **做法**：烘焙只记**深度**（`SwcBakePlacement.mask = { charId, depth }`、`SwcBakeFrameOp.mask/maskOff`、
+  区间表 `maskRanges` 逐 sprite）；帧 1 装配后 `emitSwcMaskWiring` 把 `child->_clip_src = 遮罩对象`
+  （`DisplayObject*`，进 props 表并配 `gc_write_barrier`）；帧 2..N 走
+  `as_swc_tl_mask(parent, maskDepth, clipDepth)`，区间按 SWF 规范 `(maskDepth, clipDepth]`，
+  `clipDepth <= 0` = 退订；渲染侧在 `save` 之后、对象 `translate` **之前**取
+  `as_clip_path(o->_clip_src)`（`as_do_matrix` + `as_mask_ink` + `as_skia_path_close_all`），
+  遮罩活在父空间（它是被遮对象的兄弟）。
+- **「整块被裁空」的真根因**：morph `#70` 的 `Graphics` 里除填充组外还有一组 `stroke` 宽度 0、
+  轮廓与填充**完全重合**，两条等高轮廓在 stencil 里互相抵消（even-odd 无条件抵消；改 nonzero 实测也
+  **没救**）⇒ stencil 为空 ⇒ 被遮兄弟全消失。修法：`as_mask_ink` 只收 `fill != NULL || stroke_width > 0`
+  的组（顶层 `g->path` 同守卫），每组至多加一次。
+- **实测（`adl` 51.4.1 vs AOT，按遮罩子件独有 teal `0x00948c` 计数）**：`loginskin` ink 两端都是
+  `177000 px`；`元件77_50` 帧 1 遮罩 `x=0` 两端都 `0`、`x=40` 露出量同为 88 宽窗口内的一档；
+  帧 100 `numChildren` 两端都是 `4`、遮罩 `x=100` 两端都 `0`。
+- **★ 已知偏差（如实报明）**：`adl` 的 stencil 对 **morph 遮罩不跟随 ratio** —— `Teal2` 探针
+  `gotoAndStop` 到 1/2/3/5/10/20/50/80/99 的 teal 分布**逐字节相同**，只有帧 100 换字符才变；
+  而 AIR 自己**画**该 morph 时按当前 ratio 画。我们让 stencil 跟**当前**几何走（遮罩与画面自洽），
+  故 AOT 帧 99 与帧 1 不同。复刻 AIR 的做法已探明（morph 分支换用 `_mdecl` 声明盒
+  `[-92.9,-10 .. 0.0,31.6]`，与 `adl` 帧 1 的 `clipdbg` 一致），已登记进遗留表。
+- **回归**：新 `examples/swc-mask-frames.as`（真 `skin.swc`：帧 1/99/100 × 遮罩平移 + `loginskin` 177000）；
+  新 `unit: render/SwcClipMaskPerFrame`（14 钉）；6 条变异**全红**（`temp/mask3/mutate.cjs`：
+  不闭合轮廓 / 区间改闭 / 退订不清引用 / 恢复零宽描边组 / `maskOff` 不发 / 帧 1 不 wire）。
+  顺带把 `test/unit/render.ts` 里两条 `_clip_path` 时代的旧钉（闭合、裁剪点位）改到新发射形态。
+- **文档**：`docs/zh-cn/swc.md` §9.2 F12（新）+ §3.4⑦⑥ + §10 表；`README-CN.md` 示例一行。
 ### 遗留待开发`
 
 **验收**：`examples/stage64.as`（离屏）断言 `File` 路径束与 `exists`/`isDirectory`/`resolvePath`/`createDirectory`/`deleteFile`/`deleteDirectory` + 静态目录、
@@ -9823,8 +9854,9 @@ if (o->_scroll_rect != NULL) { h = as_fp_dbl(h, o->_scroll_rect->x); h = as_fp_d
 
 **顺带复核（不动的项，理由写进代码注释旁）**：`opaqueBackground`/`blendMode`/`_clip_path` 都在
 `as_render_object` 里、**烘焙之外**就地生效（填充/图层/裁剪先于 cached 分支，且 `as_render_cached`
-只调 `as_render_object_content`）⇒ 它们变化本就无需让烘焙失效；`DisplayObject.mask` 目前是
-**响亮**未支持（`DisplayObject_set_mask` 上报），不在本判据内。
+只调 `as_render_object_content`）⇒ 它们变化本就无需让烘焙失效；`DisplayObject.mask` 当时还是**响亮**未支持，不在本判据内
+（**该句已过期**：阶段三百一十八起它是真实现的二值模板，见 `docs/zh-cn/skia.md` §6.15）；`_clip_path` 亦已
+由阶段三百一十九换成活对象 `_clip_src`（`docs/zh-cn/swc.md` §9.2 F12）。
 
 **四、验收**
 
@@ -17634,6 +17666,7 @@ Windows 本机实跑覆盖。
 - **文档**：`docs/zh-cn/skia.md` §6.15（实测表 + 实现 + 缺口）；顺带修 `docs/zh-cn/swc.md`
   §3.4⑦ 与 §10 表里把阶段号写成「三百一十四」的笔误（应为三百一十七）。
 ### 遗留待开发
+> **2026-10-29 追加（阶段三百一十九：逐帧 `clipDepth` 遮罩）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**113 → 114 行**（`未开始` **89 → 90**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**本阶段修净的四条不占表**：morph 遮罩被裁空、sprite 遮罩无裁剪、帧尾换字符少一个子件、以及「遮罩 stencil 混进零宽描边组」——前两条此前是 `notes` 报明的**响亮缺口**、后两条是实错，均同阶段落地（`docs/zh-cn/swc.md` §9.2 F12）。**新登记 1 行**是唯一**刻意保留的偏差**：AIR 的 `clipDepth` stencil 对 morph 遮罩**不跟随 ratio**（f1..f99 同框，只有帧 100 换字符才变），我们跟随当前几何，两侧像素因此在 morph 动画期间不同 —— 复刻路径已探明（`_mdecl` 声明盒），但要不要复刻属产品判断。
 > **2026-10-29 追加（阶段三百一十八：`DisplayObject.mask` 真实现）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**112 → 113 行**（`未开始` **88 → 89**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**本阶段修净的不占表**：`DisplayObject.mask` 此前根本不生效（`set_mask` 里一句 `as_shell_unsupported`），按 §1.5 属「`adl` 跑得对、我们跑不出」的遗留缺陷，但同阶段落地 ⇒ 不入表；落地的口径（二值模板、遮罩自己的祖先链、子件并集保洞、离屏遮罩、不看 `alpha`/`visible`、不影响 `getBounds` 但影响命中）逐条来自 `adl` 实测，见 `docs/zh-cn/skia.md` §6.15。**新登记 1 行**是非矢量遮罩那三档（`Bitmap`/`TextField` 遮罩只到包围盒、纯描边遮罩、遮罩自带滤镜/混合）——它们既未实测也未实现，且我们现在是**响亮**回退而不是静默。
 > **2026-10-29 追加（阶段三百一十五：渲染器三处每帧实错）**：**新登记 2 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**110 → 112 行**（`未开始` **86 → 88**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。上一轮 note（阶段三百一十四）标 110 行，按 `254cb13` 实测也是 **110 行**，本轮 110 + 2 = **112** 与实测一致。**新登记 2 行**：① 容器里 ≥2 个重叠图元且 `alpha<1` 时，我们的 layer 隔离口径与 AIR 的逐图元乘 alpha 不同（`temp/alphafold` 的 B1 采样点 `ff7f7f00` vs `ff7f7f3f`）——与本阶段修的折叠**无关**，折叠前就是这个值；② AOT 的每帧固定成本 `static` 场景 **0.579 vs 0.058 ms**（10×），属**我方性能缺口**而非保真差，本阶段只修了「每项成本」那一半。**本阶段修净的三处不占表**（alpha 折叠 / `getenv` 出内循环 / 单图元不自动烘）：都是「AIR 做对了、我们做错/多做」的实错，按 §1.5 同阶段落地。
 > **2026-10-28 追加（阶段三百一十四：库层三处性能/语义实错；rebase 后由「三百零六」改号）**：**新登记 7 行 / 改写 1 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**103 → 110 行**（`未开始` **79 → 86**，`未开始 / **D43b**` 1 行未变 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**仍报同一处口径差**：上一轮 note（阶段三百零九）标 `未开始` **82**，而按 `1c1914c` 实测是 **79 行 `未开始` + 1 行 `未开始/**D43b**` = 80**——**增量无争议，绝对标签差 2**，本轮继续按实测行数记账。**改号说明**：本节原记「阶段三百零六」；rebase 到 `origin/main`（`1c1914c`）时 三百零六～三百零八（一键发布打包）、三百零九（原生窗口句柄）、三百一十（`aot-icudtl.dat`）已占用，提交标题里的 三百一十二 / 三百一十三 也已用掉，故本轮顺延为 **三百一十四**、版本 **v0.4.274 → v0.4.275**；节内「基线」指改动落库前的 `b25cd00`，合并后另按新 base 复跑过门禁（见该节验收）。**本阶段修净的三处不占表**（插入排序核心、`Number`→字符串线性试精度、值类一元转型被打成构造函数）：都是 `adl` 跑得对、我们此前跑不出，按 §1.5 属遗留缺陷但同阶段落地。**改写 1 行**＝给 `gc_find_block()` 那行补上 2026-10-29 的复算证据（AOT 臂在 `pt_4000` 就被看门狗判死、同 exe 换 base 形状不变、adl 同相位 0 hang）。**新登记 7 行**全部是同两台差分门禁（`SemCheck` 72 行 + `RTProbe` 32 行）**量出来、但不在本轮批准范围内修**的真分歧：① `Array.sort(flag)` 忽略全部位标志；② 动态接收者的 `Number.toString()`/`toFixed()` 返 `null`；③ 定长小数 17 位上限弄断 round-trip；④ `toFixed` 的 `.5` 舍入方向；⑤ 极值 `String()` 表示（含两例 **AIR 自身 round-trip 失败**）；⑥ 排序边角语义（稀疏槽 `in` / `sortOn(null)` / 比较器返 `NaN`）；⑦ **`gc_find_block()` 首次适配线性扫描**——它是**我方性能缺口**而不是 `adl` 保真差（`adl` 没有对应「块选择」可见面），但与表内「`Vector` 逐元素守卫」同行同族：本表是本仓唯一保留「已量测、未修」的地方，而 4.6 s 长帧 + `gcshare=0.1%` + 三段因果实验（0.037→0.548 µs/次）需要一个不会被下次重推一遍的落点。**刻意不入表的一条**：并列项次序（`big500` 稳定性违例 AIR 259 / AOT 0）——AIR 自己不稳定，复刻它等于故意实现不定序 bug，详见该阶段节。
@@ -17919,6 +17952,7 @@ Windows 本机实跑覆盖。
 | **`File` 家族的原生对话框与卷粒度查询仍缺**：`FileReference.browse`/`load`/`save`/`download`/`upload`、`FileReferenceList.browse`、`File.browseFor*` 只报明（`as_shell_unsupported`，返回 `false`）；两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)` 未落地 | 未开始（2026-10-27 阶段二百九十九：C 批把四个**类**与它们的成员面补齐了，剩下的全是**后端**活） | 类与成员现在都在（`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent`，`FileFilter` 三个字段，`File` 的 14 方法/8 属性/5 static 常量/`getRootDirectories`），**读的语义也按 `adl` 实测**（见阶段二百九十九）。缺的只有两件：① 平台对话框（macOS `NSOpenPanel`/`NSSavePanel`，Windows `IFileOpenDialog`）——没有它，`fileList`/`data`/`name` 这些「选择结果」字段永远为空，所以 `browse()` **报明后返回 `false`**，绝不假装用户点了「取消」；② 卷枚举（`statfs`/`GetDiskFreeSpaceExA`）——`StorageVolume` 的构造器与六个 getter 已按实测实现，但目前只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查 | 两条都是后端活，且都要在真机上验证（Windows 分支本机无环境）。做对话框时应顺手把 `File.browseForOpenMultiple` 的 `FileListEvent` 派发接上——类与事件已完成，只差调用点 |
 | **`examples/file-ops.as` 的路径断言是 POSIX 形态**（`/tmp` 字面量 22 处、「反斜杠是合法文件名字节」），`file-symlink.as` / `file-listing-async.as` 亦未在 Windows 实跑 | 未开始（2026-10-27 阶段三百：这三例都要软链夹具，而本机账号建软链报 `EPERM` ⇒ 一直在 `test/examples.ts` 里 `SKIP`，Windows 侧只有 `adl` 探针读数） | 两端 | 待排期（要一台开了 Developer Mode 的 Windows） |
 | **初始窗口的创建晚于文档类构造器**（`FREAcquireNativeWindowHandle(stage.nativeWindow)` 在文档类构造器里得到 `FRE_ILLEGAL_STATE`；`adl` 先建窗再跑构造器，那边拿得到 HWND。**已响亮自报，不是静默 null**；未在 `adl` 上实测这条 FRE 调用——需要把夹具重编回 AIR 版） | 未开始（2026-10-28 阶段三百零九 发现） | 根因是既有取舍：`Stage.showWindow` 在文档类之后建窗，构造器里写的 bounds/title 延后由它生效（`src/emit.ts` 的 `Stage_get_nativeWindow` 上方注释记录了这条约定） | 把初始窗口的创建挪到文档类之前，并重定「构造器里写的窗口属性由谁生效」；改窗口创建时序会波及窗口事件面，需独立阶段 |
+| **`clipDepth` 遮罩的 stencil 对 morph 跟随 ratio，而 AIR 冻结在起始形** | 未开始（2026-10-29 阶段三百一十九 的像素 oracle 量到；本阶段刻意保留「跟当前几何」这一侧，因为它与被遮画面自洽） | `temp/mask3/Teal2.as`（adl）对 `skin_fla.元件77_50` 的 morph 遮罩做逐帧 teal 计数：帧 1/2/3/5/10/20/50/80/99 **逐字节相同**，只有帧 100（换成 `char73`）变；同一探针的 AOT 侧帧 99 窗口已右移到 ratio≈0.99 的位置。AIR 自己**画**该 morph 时是按当前 ratio 画的（阶段三百一十七），所以这是「stencil 冻结、画面不冻结」的 AIR 内部不一致 | 复刻只需在 `as_clip_path` 的 morph 分支换用 `Graphics._mdecl` 声明盒矩形（`as_swc_morph_<id>` 的 `as_swc_clip` 一侧，本库为 `-92.9,-10 .. 0.0,31.6`，与 `adl` 帧 1 的 `clipdbg` 逐位一致）；先与产品确认「遮罩跟画面」与「遮罩冻结」哪个才是要的呈现，再改并补一条 oracle |
 | **`alpha < 1` 且子树画 ≥2 个重叠图元时，我们开 layer 隔离、AIR 逐图元乘 alpha** | 未开始（2026-10-29 阶段三百一十五 的像素 oracle 量到；本阶段只把「只画 1 个图元」这一类改成折叠，容器这一类原样保留 layer） | `temp/alphafold/` 同一份 `.as` 分别 `adl` 与 AOT，`BitmapData.draw` 整棵树后逐点取样：一个 `alpha=0.5` 的 Sprite 里两个**重叠不透明矩形**，重叠点 AIR `ff7f7f3f`、我们 `ff7f7f00`——AIR 把 0.5 乘到每个元素上（蓝 127→黄叠上去留 63），我们把子树先合成再整体乘（黄不透明 ⇒ 蓝 0）。**9/10 采样点逐位相同**，这一条是唯一分歧，且**折叠前就是这个值**（与本阶段改动无关）。同一夹具里两条已对齐的分支正是本阶段修的：单图元 `alpha=0.5`（`ff7f0000`）与 `0.5×0.5` 嵌套（`ff3f3f3f`）改前分别是 `ff800000`/`ff404040` | 把对象级 layer 整体换成「逐图元乘 alpha」需要覆盖全部绘制入口（目前只有 `draw_path`/`draw_rect`/`draw_image_rect` 三个穿越 `_mul`，`draw_circle`、九宫格 `draw_image_src_rect`、文本、Stage3D 的 `draw_bgra`/`gl_draw_texture` 都还没有），漏一个就是整块不透明 ⇒ 先补齐入口并给每个入口补 oracle 采样点，再一次性切换；切换后本行可移出
 | **AOT 的每帧固定成本高于 AIR 10×**（`static` 场景 0.579 vs 0.058 ms/帧） | 未开始（2026-10-29 阶段三百一十五 量到；本阶段修的是「每项成本」，没有动固定成本） | 夹具 `static`（一个 FPS 文本 + 一张位图，**没有列表**）：AOT **0.579**、AIR **0.058 ms/帧**（3 reps，进程 CPU/帧）。同一份数据里 AOT 的**列表斜率已经反超**（2.56 vs 1.85 µs/项），所以固定成本是现在唯一还落后的量：384 项时的总差 0.5 ms 里，固定成本与斜率各占约一半。候选来源（**未拆**）：`as_render_fp` 整树哈希、窗口 pass 的若干 per-frame 准备、`ASC_pass`/`ASC_frame` 探针的残留检查 | 先给固定成本加分段探针（把 `as_render_fp` 单独关掉一次、把窗口 pass 的每帧准备工作分段计时），定位到具体语句后再改；`ASC_RPROF` 现有绝对值不可信（与进程 CPU 比值 ≈4×，原因未定位），只能做相对比较
 | **`DisplayObject.mask` 的非矢量遮罩只有包围盒精度**（`Bitmap`/`TextField` 当遮罩时 AIR 按**像素**模板裁剪，我们退回它的包围盒并 `as_shell_unsupported` 报一次；纯描边遮罩的描边带、遮罩自带 `filters`/`blendMode` 的呈现同样只取几何） | 未开始（2026-10-29 阶段三百一十八 落地二值模板时登记；本阶段把矢量遮罩（含子件并集、离屏遮罩、别的容器）逐条对齐了 adl，这三档 adl 侧未实测、实现上也还没接） | `docs/zh-cn/skia.md` §6.15 的实测表是已对齐的九条；缺的三档分别是「遮罩是 `Bitmap`/`TextField`」「遮罩只有描边」「遮罩自身带滤镜/混合」 | 先按 §6.15 的探针套路（`temp/mask/MaskProbe*.as`）补测这三档的 adl 口径，再把 `as_mask_ink` 的路径收集扩到像素模板（`SkImage` → `SkShader` 裁剪或 `saveLayer` + `kDstIn`），并把报明换成真实现 |
@@ -18022,7 +18056,7 @@ Windows 本机实跑覆盖。
   **自定义 Dock 图标**（PNG 素材直接给 `bitmaps`）+ Dock 右键菜单 + `autoExit=false`，零新平台胶水。
   口径 [`docs/zh-cn/desktop.md`](docs/zh-cn/desktop.md)。
 - **G2** ~~`File.getSpaceAvailable`~~ ⇒ 真名是 **`File.spaceAvailable`（属性）** —— ✅ **原登记是误记**：`getSpaceAvailable` 在 AIR 里**根本不存在**（`adl 51.4.1`：`'getSpaceAvailable' in f` = `false`、取它抛 `#1069`），而 `f.spaceAvailable` **从阶段六十四 起就已落地**（真实 `statvfs`/`GetDiskFreeSpaceExA`）。阶段二百四十三 只**校正作用域**：普通文件也作答（跟随其卷）、不存在路径与**设备**（`/dev/null`）回 `0`。
-- **G7** 目录遍历**异步化** —— ✅ **阶段二百六十四**（v0.4.228）：`File.getDirectoryListingAsync` 从"同步假异步"改成**真异步**（job 池新增 `AS_JOB_DIR`，worker 线程 opendir/readdir，帧边界派发；`cancel()` 真能取消，重入 `#2037`、路径不存在 `IOErrorEvent`/`3003`、路径是文件回空列表——逐条对 `adl 51.4.1` 实测）。证据 `examples/file-listing-async.as`（17 钉）+ `docs/zh-cn/filesystem.md` §7。
+- **G7** 目录遍历**异步化** —— ✅ **阶段二百六十四**（v0.4.228）：`File.getDirectoryListingAsync` 从"同步假异步"改成**真异步**（job 池新增 `AS_JOB_DIR`，worker 线程 opendir/readdir，帧边界派发；`cancel()` 真能取消，重入 `#2037`、路径不存在 `IOErrorEvent`/`3003`、路径是文件回空列表——逐条对 `adl 51.4.1` 实测）。证据 `examples/file-listing-async.as`（14 钉）+ `docs/zh-cn/filesystem.md` §7。
 - **G3** 卷**总量** —— ✅ **2026-10-26 由产品侧以 ANE 交付，本仓库零改动、无版本号**：AIR 无对应 API 这一点**没变**，但交付方式从"`--features` 具名开关 + 编译器内建"改判为"**原生扩展**"（`prune/native/PruneVolume.c` 的 `statvfs` + `prune/src/prune/Volume.as`，`--air-app` 按描述符解析）。理由：编译器内建等于把一个只有 macOS 用得上、AIR 又没有的成员塞进语言实现；而 ANE 正是 AIR 给第三方扩展准备的同一扇门，平台 API 留在产品仓库可被审计。口径与实测（`volumeTotal` 与 `df -k` 差 0、`volumeFree` 与 `spaceAvailable` 逐字节相等）见 `../prune/TODO.md` 〇之一。**这条同时是本仓库 FRE/ANE 宿主（阶段一百七十二）的第一次"产品级"使用**：宿主、描述符、`ext-aot/` 解析、运行期 `extensions/` 落盘全链路一次跑通。
 
 

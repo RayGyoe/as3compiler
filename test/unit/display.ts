@@ -1365,9 +1365,13 @@ function checkDisplayObjectMask(): string[] {
 
   // The stencil itself: own graphics + descendants (a union that keeps holes), and
   // the mask's own ancestor chain composed against this object's parent chain.
+  // 阶段三百一十九: only groups that PAINT contribute. A group with no fill and a
+  // zero-width stroke still carries the same outline, and two coincident contours
+  // cancel each other inside the stencil (measured on skin.swc's morph mask #70).
   check('the stencil collects the mask draws and its legacy path',
-    c.includes('for (as_gdraw* dr = (as_gdraw*)g->draws; dr != NULL; dr = dr->next) as_skia_path_add_transformed(p, dr->path, a, b, c, d, tx, ty);') &&
-    c.includes('if (g->path != NULL) as_skia_path_add_transformed(p, g->path, a, b, c, d, tx, ty);'));
+    c.includes('if (dr->fill == NULL && (dr->stroke == NULL || dr->stroke_width <= 0.0)) continue;') &&
+    c.includes('as_skia_path_add_transformed(p, dr->path, a, b, c, d, tx, ty);') &&
+    c.includes('if (g->fill != NULL || (g->stroke != NULL && g->strokeWidth > 0.0)) as_skia_path_add_transformed(p, g->path, a, b, c, d, tx, ty);'));
   check('the stencil recurses into the mask children (union, holes preserved)',
     c.includes('as_mask_ink(ch, p, na, nb, nc, nd, ntx, nty);'));
   const inkBody = c.slice(c.indexOf('static void as_mask_ink(DisplayObject* o, void* p'), c.indexOf('static void* as_mask_path(DisplayObject* o, DisplayObject* m) {'));
@@ -1376,7 +1380,7 @@ function checkDisplayObjectMask(): string[] {
   check('the stencil is built in the parent space from the mask own chain',
     c.includes('if (o->parent != NULL) as_to_stage_matrix((DisplayObject*)o->parent, &pa, &pb, &pc, &pd, &ptx, &pty);\n  double ia, ib, ic, id, itx, ity;\n  if (!as_mat_invert(pa, pb, pc, pd, ptx, pty, &ia, &ib, &ic, &id, &itx, &ity)) return NULL;'));
   check('a Bitmap/TextField mask falls back to its box and says so once',
-    c.includes('as_shell_unsupported("DisplayObject.mask whose mask is a Bitmap/TextField (stencilled by its box, not its pixels)");'));
+    c.includes('as_shell_unsupported("a Bitmap/TextField used as a mask (stencilled by its box, not its pixels)");'));
 
   // Hit testing consults the same stencil, on both flavours (the box test behind
   // hitTestPoint(x, y, false) and the region test behind shapeFlag=true and the
